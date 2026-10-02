@@ -25,7 +25,18 @@
 //! * the request body for one choice question is byte for byte the v4 driver's
 //!   (9 ledger fixtures of `cortiq-decision`, sent over HTTP);
 //! * the key comes only from the environment and its bytes are in no response,
-//!   log line or state file (child process).
+//!   log line or state file (child process);
+//! * auto-skills (0.8.6): an untrained 3-label contract is learned from a
+//!   keyword-consistent mock into `auto-…`, activated at the trigger
+//!   (`auto_start`), answered locally (`exact`, `certified: false`), its
+//!   subset `subset`, a variant sharing two ids another contract, an
+//!   ambiguous one not learned, two runs byte-identical; a random oracle is
+//!   rejected (`auto_agreement`) and a consistent contract promoted; a refit
+//!   (`auto_refit`) promoted and a regressing one rejected; rollback, restart,
+//!   materialize, verify and `decide --labels`; the limits (`auto_max_labels`,
+//!   `auto_max_skills`, `auto_skills: false`, score/noul, a key without
+//!   `learning_allowed`, `/v1/route` without `taxonomy_id`); the `auto_tau`
+//!   floor; a rare label quarantined, probability 0, still taught.
 //!
 //! Every request of [`Srv`] carries `x-cmf-extensions: 1`, so router-surface
 //! answers include the opt-in `cmf` diagnostics (the exact default router
@@ -2405,4 +2416,1042 @@ async fn the_implicit_open_mode_with_the_oracle_never_teaches() {
     let l = srv.learning().await;
     assert_eq!(l["examples_added"], 1, "{l}");
     assert_eq!(l["buffer"]["examples"], 1, "{l}");
+}
+
+// ------------------------------------------------------------------ auto-skills (0.8.6)
+
+/// The pool of a label the auto-skill tests use, `None` for any other option.
+fn pool_of(label: &str) -> Option<&'static [&'static str]> {
+    matches!(
+        label,
+        "Weather" | "billing" | "cards" | "travel" | "food" | "cruise"
+    )
+    .then(|| pool(label))
+}
+
+/// An oracle that answers a choice with the first option whose pool holds a
+/// word of the state text (else the first option): consistent by keyword.
+fn keyword_mock() -> MockOracle {
+    MockOracle::start(|req| {
+        let text = req.state().as_str().unwrap_or("").to_string();
+        answer_reply(
+            req,
+            move |_, opts| {
+                let words: Vec<&str> = text.split(' ').collect();
+                for o in opts {
+                    if pool_of(o).is_some_and(|p| p.iter().any(|w| words.contains(w))) {
+                        return json!(o);
+                    }
+                }
+                json!(opts[0])
+            },
+            1e-5,
+        )
+    })
+}
+
+/// `n` texts of `label` with cos φ_P < `max_cos` to every text whose φ_P is
+/// in `seen` (and to each other): no cache hit across the labels of one
+/// contract, whose answers would otherwise cross over. Extends `seen`.
+fn texts_apart(
+    label: &str,
+    n: usize,
+    seed: u64,
+    tag: &str,
+    max_cos: f32,
+    seen: &mut Vec<Vec<f32>>,
+) -> Vec<String> {
+    let p = pool(label);
+    let mut rng = Lcg(seed);
+    let mut out: Vec<String> = Vec::new();
+    let mut tries = 0;
+    while out.len() < n {
+        tries += 1;
+        assert!(
+            tries < 100_000,
+            "could not find {n} distinct '{label}' texts"
+        );
+        let mut words = Vec::new();
+        for _ in 0..3 + rng.below(2) {
+            words.push(p[rng.below(p.len())]);
+        }
+        words.push(FILLER[rng.below(FILLER.len())]);
+        let t = format!("{} {tag}{}", words.join(" "), out.len());
+        let f = phi_p(&t);
+        if seen.iter().all(|q| cos(q, &f) < max_cos) {
+            seen.push(f);
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// Up to `n` paraphrases of `text` (its words in another order, another
+/// filler): cos φ_P ≥ 0.97 to `text`, < 0.995 to each other (not duplicates).
+fn near_variants(text: &str, n: usize, seed: u64, tag: &str) -> Vec<String> {
+    let mut words: Vec<&str> = text.split(' ').collect();
+    words.pop(); // the tag
+    let orig = phi_p(text);
+    let mut rng = Lcg(seed);
+    let mut out: Vec<String> = Vec::new();
+    let mut phis: Vec<Vec<f32>> = Vec::new();
+    for k in 0..400 {
+        if out.len() >= n {
+            break;
+        }
+        let mut w = words.clone();
+        for i in (1..w.len()).rev() {
+            w.swap(i, rng.below(i + 1));
+        }
+        if rng.below(2) == 0 {
+            w.push(FILLER[rng.below(FILLER.len())]);
+        }
+        let t = format!("{} {tag}{k}", w.join(" "));
+        let f = phi_p(&t);
+        if cos(&orig, &f) >= 0.97 && phis.iter().all(|q| cos(q, &f) < 0.995) {
+            phis.push(f);
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// The lessons of a contract: `n` texts per label, pairwise cos φ_P < 0.97
+/// across every label (the oracle's answer to one is never cached for
+/// another).
+fn lessons_of(labels: &[(&'static str, u64, &str)], n: usize) -> Vec<(&'static str, Vec<String>)> {
+    let mut seen = Vec::new();
+    labels
+        .iter()
+        .map(|&(l, seed, tag)| (l, texts_apart(l, n, seed, tag, 0.97, &mut seen)))
+        .collect()
+}
+
+/// The id of the auto-skill of a contract.
+fn auto_id(labels: &[&str]) -> String {
+    cortiq_decision::manifest::auto_skill_id(labels)
+}
+
+/// Decide `text` under the contract `q` (question id `task`).
+async fn ask(srv: &Srv, q: &Value, text: &str) -> Resp {
+    let r = srv
+        .decide(&body(json!(text), json!({"task": q.clone()}), None))
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    r
+}
+
+/// Teach the contract `q` with the lessons interleaved (one text of each
+/// label in turn) until the first promotion; the answers must be the oracle's
+/// (or the cache's) and name the lesson's label. Returns the texts decided.
+async fn teach_contract(srv: &Srv, q: &Value, lessons: &[(&str, Vec<String>)]) -> usize {
+    let longest = lessons.iter().map(|l| l.1.len()).max().unwrap_or(0);
+    let mut n = 0;
+    for i in 0..longest {
+        for (label, ts) in lessons {
+            let Some(t) = ts.get(i) else { continue };
+            let r = ask(srv, q, t).await;
+            n += 1;
+            assert!(
+                r.action() == "oracle" || r.action() == "cache",
+                "{}",
+                r.text
+            );
+            assert_eq!(r.body["answers"]["task"]["choice"], *label, "{}", r.text);
+            if srv.learning().await["promotions"].as_u64().unwrap_or(0) >= 1 {
+                return n;
+            }
+        }
+    }
+    panic!("no promotion after {n} texts: {}", srv.learning().await);
+}
+
+fn food_travel_cruise() -> &'static [(&'static str, Vec<String>)] {
+    static L: OnceLock<Vec<(&'static str, Vec<String>)>> = OnceLock::new();
+    L.get_or_init(|| {
+        lessons_of(
+            &[
+                ("food", 41, "af"),
+                ("travel", 43, "av"),
+                ("cruise", 47, "ac"),
+            ],
+            25,
+        )
+    })
+}
+
+impl Srv {
+    /// Close the server, keeping the state directory.
+    fn close(mut self) -> (tempfile::TempDir, PathBuf) {
+        self.app.take();
+        self.server.take().unwrap().close().unwrap();
+        let base = self.base.clone();
+        let dir = std::mem::replace(&mut self.dir, tempfile::tempdir().unwrap());
+        (dir, base)
+    }
+}
+
+#[tokio::test]
+async fn an_untrained_contract_becomes_an_auto_skill_and_answers_locally() {
+    let labels = ["food", "travel", "cruise"];
+    let q = choice(&labels);
+    let id = auto_id(&labels);
+    let lessons = food_travel_cruise();
+    let lessons = lessons.to_vec();
+    // Without an oracle the contract is 422, as before.
+    let mock = keyword_mock();
+    let mut off = stand_config(&mock.url());
+    off.oracle.enabled = false;
+    let r = Srv::new(&off)
+        .decide(&body(
+            json!(lessons[0].1[0]),
+            json!({"task": q.clone()}),
+            None,
+        ))
+        .await;
+    assert_eq!(r.error(), (422, "UNSUPPORTED_QUESTION".into()));
+
+    let cfg = stand_config(&mock.url());
+    let srv = Srv::new(&cfg);
+    let before = srv.learning().await;
+    assert_eq!(before["auto_contracts"], 0);
+    let r = ask(&srv, &q, &lessons[0].1[0]).await;
+    assert_eq!(r.action(), "oracle");
+    assert_eq!(r.q("task")["match"], "untrained");
+    assert_eq!(r.q("task")["skill"], Value::Null);
+    let l = srv.learning().await;
+    assert_eq!(l["auto_contracts"], 1);
+    assert_eq!(l["auto_skills"][0]["id"], id);
+    assert_eq!(l["auto_skills"][0]["labels"], json!(labels));
+    assert_eq!(l["auto_skills"][0]["served"], Value::Null);
+    assert_eq!(l["buffer"]["labels"][0]["skill"], id);
+
+    // The rest of the lessons (the first food text was taught above).
+    let mut rest = lessons.clone();
+    rest[0].1.remove(0);
+    let taught = 1 + teach_contract(&srv, &q, &rest).await;
+    let calls = mock.hits();
+    assert_eq!(calls, taught, "every taught text was an oracle call");
+    let l = srv.learning().await;
+    assert_eq!(l["promotions"], 1, "{l}");
+    assert_eq!(l["generation"], 1);
+    assert_eq!(l["isolation_violations"], 0);
+    let rec = &l["recent"][0];
+    assert_eq!(rec["kind"], "auto_start");
+    assert_eq!(rec["outcome"], "promoted");
+    assert_eq!(rec["skill"], id);
+    assert_eq!(rec["auto"]["eligible"], json!(["cruise", "food", "travel"]));
+    assert_eq!(rec["auto"]["quarantined"], json!([]));
+    assert!(rec["auto"]["agreement"]["macro"].as_f64().unwrap() >= 0.8);
+    assert_eq!(rec["gate_after"]["certified"], false);
+    assert_eq!(l["auto_skills"][0]["served"]["generation"], 1);
+    assert_eq!(
+        l["auto_skills"][0]["served"]["active"],
+        json!(["cruise", "food", "travel"])
+    );
+    assert_eq!(l["skills"][&id]["taxonomy_version"], 2);
+    eprintln!(
+        "auto_start after {taught} texts ({calls} oracle calls): {}",
+        rec["auto"]
+    );
+
+    // Listings.
+    let s = srv.get("/v1/skills").await.body;
+    let sk = s["skills"].as_array().unwrap();
+    assert_eq!(sk.len(), 3);
+    assert_eq!(sk[0]["id"], "topics");
+    assert_eq!(sk[0]["auto"], false);
+    assert_eq!(sk[2]["id"], id);
+    assert_eq!(sk[2]["auto"], true);
+    assert_eq!(sk[2]["labels"], json!(["cruise", "food", "travel"]));
+    assert_eq!(sk[2]["active_labels"], 3);
+    assert_eq!(sk[2]["quarantined_labels"], json!([]));
+    assert_eq!(sk[2]["examples"].as_u64().unwrap() as usize, taught);
+    assert_eq!(sk[2]["certified"], false);
+    assert_eq!(sk[2]["has_rubric"], true);
+    let one = srv.get(&format!("/v1/skills/{id}")).await.body;
+    assert_eq!(one["rubric"]["instructions"], "Which topic?");
+    assert_eq!(one["rubric"]["criteria"]["food"], "about food");
+    for t in one["tasks"].as_array().unwrap() {
+        assert_eq!(
+            (t["origin"].as_str(), t["state"].as_str()),
+            (Some("cold_start"), Some("active"))
+        );
+    }
+    let h = srv.get("/healthz").await.body;
+    assert_eq!(
+        (h["skills"].as_u64(), h["auto_skills"].as_u64()),
+        (Some(3), Some(1))
+    );
+    let g = srv.admin("GET", "/v1/admin/generations", None).await.body;
+    assert_eq!(g["current"], 1);
+    assert_eq!(g["generations"][0]["auto_skills"], json!([id]));
+
+    // The same contract: exact, the auto-skill, never certified; a fresh text
+    // of each label is local at least once (θ of a young skill is weak: the
+    // others may abstain and teach, DESIGN A13).
+    let hits = mock.hits();
+    let mut local = 0;
+    let mut escalated = 0;
+    for (label, seed, tag) in [
+        ("food", 97, "zf"),
+        ("travel", 98, "zv"),
+        ("cruise", 99, "zc"),
+    ] {
+        let mut local_here = 0;
+        for t in distinct_texts(label, 4, seed, tag, 0.995) {
+            let r = ask(&srv, &q, &t).await;
+            assert_eq!(r.q("task")["match"], "exact", "{}", r.text);
+            assert_eq!(r.q("task")["skill"], id);
+            assert_eq!(r.q("task")["certified"], false);
+            assert_eq!(r.body["answers"]["task"]["choice"], label, "{}", r.text);
+            if r.action() == "local" {
+                assert_eq!(r.q("task")["decision_path"], "router:uncertified");
+                assert!(r.q("task")["gate"]["p_top"].as_f64().unwrap() >= 0.9);
+                local_here += 1;
+            } else if r.action() == "oracle" {
+                escalated += 1;
+            } else {
+                assert_eq!(r.action(), "cache", "{}", r.text);
+            }
+        }
+        assert!(local_here >= 1, "no local answer of a fresh {label} text");
+        local += local_here;
+    }
+    assert_eq!(mock.hits() - hits, escalated);
+    eprintln!("fresh texts: {local} local, {escalated} escalated");
+    // A subset of the contract.
+    let r = ask(&srv, &choice(&["food", "travel"]), &lessons[0].1[0]).await;
+    assert_eq!(r.q("task")["match"], "subset");
+    assert_eq!(r.q("task")["skill"], id);
+    // A variant sharing two ids: another contract, another auto-skill.
+    let variant = ["food", "travel", "Weather", "cards"];
+    let r = ask(&srv, &choice(&variant), &lessons[1].1[0]).await;
+    assert_eq!(r.q("task")["match"], "untrained");
+    assert_eq!(r.action(), "oracle");
+    let l = srv.learning().await;
+    assert_eq!(l["auto_contracts"], 2);
+    assert_ne!(auto_id(&variant), id);
+    let ids: Vec<&str> = l["auto_skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["id"].as_str().unwrap())
+        .collect();
+    let vid = auto_id(&variant);
+    let mut want = vec![id.as_str(), vid.as_str()];
+    want.sort_unstable();
+    assert_eq!(ids, want, "contracts listed by id");
+    // An ambiguous contract (a subset of two data skills) is not learned.
+    let r = ask(&srv, &choice(&["billing", "cards"]), &lessons[0].1[1]).await;
+    assert_eq!(r.q("task")["match"], "untrained");
+    assert!(
+        r.q("task")["reason"]
+            .as_str()
+            .unwrap()
+            .contains("ambiguous")
+    );
+    assert_eq!(srv.learning().await["auto_contracts"], 2);
+
+    // Determinism: the same lesson on a second server writes the same bytes.
+    let sha1 =
+        cortiq_decision::generation::file_sha256(&srv.state_root().join("generations/g000001.cmf"))
+            .unwrap();
+    let again = Srv::new(&cfg);
+    ask(&again, &q, &lessons[0].1[0]).await;
+    teach_contract(&again, &q, &rest).await;
+    let sha2 = cortiq_decision::generation::file_sha256(
+        &again.state_root().join("generations/g000001.cmf"),
+    )
+    .unwrap();
+    assert_eq!(sha1, sha2);
+}
+
+/// The newest attempt of `GET /v1/admin/learning` (`recent` is oldest first).
+fn latest(l: &Value) -> &Value {
+    l["recent"].as_array().unwrap().last().unwrap()
+}
+
+/// Teach `food_travel_cruise` to a fresh server until the auto-skill is
+/// promoted; returns the server and the number of texts taught.
+async fn activated(cfg: &Config) -> (Srv, usize) {
+    let srv = Srv::new(cfg);
+    let q = choice(&["food", "travel", "cruise"]);
+    let n = teach_contract(&srv, &q, food_travel_cruise()).await;
+    assert_eq!(srv.learning().await["generation"], 1);
+    (srv, n)
+}
+
+#[tokio::test]
+async fn a_random_oracle_is_rejected_and_a_consistent_contract_is_promoted() {
+    // Contract X answered at random (by the parity of the text's sha256):
+    // the agreement on C stays far below 0.8.
+    let mock = MockOracle::start(|req| {
+        let text = req.state().as_str().unwrap_or("").to_string();
+        let flip = sha256_hex(text.as_bytes()).as_bytes()[0] % 2 == 0;
+        answer_reply(req, move |_, opts| json!(opts[usize::from(flip)]), 1e-5)
+    });
+    let cfg = stand_config(&mock.url());
+    let srv = Srv::new(&cfg);
+    let x = choice(&["food", "cruise"]);
+    let xid = auto_id(&["food", "cruise"]);
+    let mut seen = Vec::new();
+    let mut lesson = Vec::new();
+    for (l, seed, tag) in [
+        ("food", 61, "rf"),
+        ("cruise", 63, "rc"),
+        ("travel", 65, "rv"),
+    ] {
+        lesson.extend(texts_apart(l, 30, seed, tag, 0.97, &mut seen));
+    }
+    let mut attempts = 0;
+    for t in &lesson {
+        let r = ask(&srv, &x, t).await;
+        assert_eq!(r.action(), "oracle", "{}", r.text);
+        let l = srv.learning().await;
+        if l["attempts"].as_u64().unwrap() >= 1 {
+            attempts = l["attempts"].as_u64().unwrap();
+            break;
+        }
+    }
+    assert_eq!(attempts, 1, "{}", srv.learning().await);
+    let l = srv.learning().await;
+    assert_eq!(l["rejections"], 1);
+    assert_eq!(l["promotions"], 0);
+    assert_eq!(l["generation"], 0);
+    let rec = &l["recent"][0];
+    assert_eq!(rec["skill"], xid);
+    assert_eq!(rec["kind"], "auto_start");
+    assert_eq!(rec["outcome"], "rejected");
+    assert_eq!(rec["reason"], "auto_agreement");
+    let agreement = rec["auto"]["agreement"]["macro"].as_f64().unwrap();
+    assert!(agreement < 0.8, "{rec}");
+    eprintln!(
+        "random oracle: agreement {agreement:.3} on {} C rows",
+        rec["auto"]["rows"]["calibration"]
+    );
+    // The trigger label's counter was reset; the examples stay.
+    let trigger = rec["label"].as_str().unwrap();
+    let lab = l["buffer"]["labels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["skill"] == xid && c["label"] == trigger)
+        .unwrap();
+    assert_eq!(lab["new"], 0);
+    assert!(lab["examples"].as_u64().unwrap() >= 25);
+    assert!(!srv.state_root().join("generations/g000001.cmf").exists());
+    assert_eq!(
+        srv.get("/v1/skills").await.body["skills"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Contract Y with a consistent oracle: promoted at its trigger.
+    mock.set(|req| {
+        let text = req.state().as_str().unwrap_or("").to_string();
+        answer_reply(
+            req,
+            move |_, opts| {
+                let words: Vec<&str> = text.split(' ').collect();
+                for o in opts {
+                    if pool_of(o).is_some_and(|p| p.iter().any(|w| words.contains(w))) {
+                        return json!(o);
+                    }
+                }
+                json!(opts[0])
+            },
+            1e-5,
+        )
+    });
+    let y = choice(&["travel", "cruise"]);
+    let yl = lessons_of(&[("travel", 71, "yv"), ("cruise", 73, "yc")], 25);
+    teach_contract(&srv, &y, &yl).await;
+    let l = srv.learning().await;
+    assert_eq!(
+        (l["promotions"].as_u64(), l["generation"].as_u64()),
+        (Some(1), Some(1))
+    );
+    assert_eq!(latest(&l)["skill"], auto_id(&["travel", "cruise"]));
+    assert_eq!(latest(&l)["kind"], "auto_start");
+    let g = srv.admin("GET", "/v1/admin/generations", None).await.body;
+    assert_eq!(
+        g["generations"][0]["auto_skills"],
+        json!([auto_id(&["travel", "cruise"])])
+    );
+}
+
+#[tokio::test]
+async fn an_auto_skill_is_refitted_and_a_regressing_challenger_is_rejected() {
+    let mock = keyword_mock();
+    let mut cfg = stand_config(&mock.url());
+    cfg.learning.auto_k = 16;
+    let (srv, _) = activated(&cfg).await;
+    let labels = ["food", "travel", "cruise"];
+    let q = choice(&labels);
+    let id = auto_id(&labels);
+    // 25 more food examples: a local answer is confirmed by feedback (weight
+    // 3), an abstention is answered by the oracle; either way one example.
+    let mut seen = Vec::new();
+    let more = texts_apart("food", 40, 51, "nf", 0.995, &mut seen);
+    let attempts0 = srv.learning().await["attempts"].as_u64().unwrap();
+    let mut taught = 0;
+    for t in &more {
+        let r = ask(&srv, &q, t).await;
+        assert_eq!(r.q("task")["skill"], id);
+        if r.action() == "local" {
+            let fb = json!({"id": r.body["id"], "question": "task", "label": "food"});
+            let f = srv.post("/v1/feedback", None, &fb).await;
+            assert_eq!(f.status, 200, "{}", f.text);
+            assert_eq!(f.body["known_label"], true);
+            taught += usize::from(f.body["learned"] == true);
+        } else {
+            taught += 1;
+        }
+        if srv.learning().await["attempts"].as_u64().unwrap() > attempts0 {
+            break;
+        }
+    }
+    let l = srv.learning().await;
+    assert_eq!(l["attempts"].as_u64().unwrap(), attempts0 + 1, "{l}");
+    assert!(taught >= 25);
+    let rec = latest(&l);
+    assert_eq!(rec["kind"], "auto_refit", "{rec}");
+    assert_eq!(rec["label"], "food");
+    assert_eq!(rec["outcome"], "promoted", "{rec}");
+    assert_eq!(rec["holdout"]["gated"], true);
+    assert_eq!(rec["holdout"]["passed"], true);
+    assert_eq!(l["generation"], 2);
+    assert_eq!(l["promotions"], 2);
+    let s = srv.get(&format!("/v1/skills/{id}")).await.body;
+    assert_eq!(
+        s["examples"].as_u64().unwrap(),
+        rec["auto"]["rows"]["total"].as_u64().unwrap()
+    );
+    assert_eq!(s["taxonomy_version"], 2, "the active set did not change");
+    eprintln!("auto_refit: {}", rec["holdout"]);
+
+    // A regressing challenger: the oracle (and the feedback) now label
+    // paraphrases of cruise texts as `food` — the ones of the cruise rows in
+    // C, so that the refitted food topology claims those C rows from cruise
+    // and the macro agreement on C drops below the champion's.
+    mock.set(|req| answer_reply(req, |_, opts| pick(opts, "food"), 1e-5));
+    let cruise_c: Vec<&String> = food_travel_cruise()[2]
+        .1
+        .iter()
+        .filter(|t| cortiq_decision::certify::auto_row_key(&phi_p(t)).1)
+        .collect();
+    assert!(cruise_c.len() >= 2, "{} cruise rows in C", cruise_c.len());
+    let mut flipped = Vec::new();
+    for (i, t) in cruise_c.iter().enumerate() {
+        flipped.extend(near_variants(t, 16, 53 + i as u64, "ff"));
+    }
+    assert!(flipped.len() >= 15, "{} paraphrases", flipped.len());
+    // Plain food texts make up the trigger count; the paraphrases carry the regression.
+    flipped.extend(texts_apart("food", 15, 55, "fg", 0.995, &mut seen));
+    for t in &flipped {
+        let r = ask(&srv, &q, t).await;
+        if r.action() == "local" {
+            let fb = json!({"id": r.body["id"], "question": "task", "label": "food"});
+            assert_eq!(srv.post("/v1/feedback", None, &fb).await.status, 200);
+        }
+        if srv.learning().await["attempts"].as_u64().unwrap() > attempts0 + 1 {
+            break;
+        }
+    }
+    let l = srv.learning().await;
+    assert_eq!(l["attempts"].as_u64().unwrap(), attempts0 + 2, "{l}");
+    let rec = latest(&l);
+    assert_eq!(rec["kind"], "auto_refit", "{rec}");
+    assert_eq!(rec["label"], "food");
+    assert_eq!(rec["outcome"], "rejected", "{rec}");
+    assert_eq!(rec["reason"], "holdout_regression");
+    assert_eq!(rec["holdout"]["passed"], false);
+    assert_eq!(l["generation"], 2);
+    assert_eq!(l["rejections"], 1);
+    eprintln!("regression: {}", rec["holdout"]);
+}
+
+#[tokio::test]
+async fn rollback_restart_materialize_and_verify_with_an_auto_skill() {
+    let mock = keyword_mock();
+    let cfg = stand_config(&mock.url());
+    let (srv, _) = activated(&cfg).await;
+    let labels = ["food", "travel", "cruise"];
+    let q = choice(&labels);
+    let id = auto_id(&labels);
+    let fresh = distinct_texts("food", 6, 97, "zf", 0.995);
+    let local = |r: &Resp| r.action() == "local" && r.q("task")["skill"] == id;
+    let served_local = {
+        let mut v = None;
+        for t in &fresh {
+            if local(&ask(&srv, &q, t).await) {
+                v = Some(t.clone());
+                break;
+            }
+        }
+        v.expect("a fresh food text decided locally")
+    };
+
+    // Restart: the generation, the contract registry and the buffer come back.
+    let srv = srv.restart(&cfg);
+    let l = srv.learning().await;
+    assert_eq!(
+        (l["generation"].as_u64(), l["auto_contracts"].as_u64()),
+        (Some(1), Some(1))
+    );
+    assert_eq!(l["auto_skills"][0]["served"]["generation"], 1);
+    assert!(l["buffer"]["examples"].as_u64().unwrap() >= 71);
+    let r = ask(&srv, &q, &served_local).await;
+    assert!(local(&r), "{}", r.text);
+    assert_eq!(srv.get("/healthz").await.body["auto_skills"], 1);
+
+    // Rollback to the base: the contract is untrained again (the oracle), the
+    // examples are kept and would start it over at the next trigger.
+    let rb = srv
+        .admin(
+            "POST",
+            "/v1/admin/rollback",
+            Some(&json!({"generation": 0})),
+        )
+        .await;
+    assert_eq!(rb.status, 200, "{}", rb.text);
+    assert_eq!(rb.body["buffer_kept"], true);
+    let r = ask(&srv, &q, &served_local).await;
+    assert_eq!(r.q("task")["match"], "untrained");
+    assert!(
+        r.action() == "oracle" || r.action() == "cache",
+        "{}",
+        r.text
+    );
+    assert_eq!(
+        srv.get("/v1/skills").await.body["skills"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let l = srv.learning().await;
+    assert_eq!(l["auto_contracts"], 1);
+    assert_eq!(l["auto_skills"][0]["served"], Value::Null);
+    // Forward again, and over a restart.
+    let rb = srv
+        .admin(
+            "POST",
+            "/v1/admin/rollback",
+            Some(&json!({"generation": 1})),
+        )
+        .await;
+    assert_eq!(rb.status, 200, "{}", rb.text);
+    let srv = srv.restart(&cfg);
+    let hits = mock.hits();
+    let r = ask(&srv, &q, &served_local).await;
+    assert!(local(&r), "{}", r.text);
+    assert_eq!(mock.hits(), hits + usize::from(r.action() == "oracle"));
+
+    // Materialize the served generation (as `cortiq decision materialize`),
+    // verify it (`verify`), decide from the file by labels (`decide --labels`).
+    let (dir, base) = srv.close();
+    let state = cortiq_decision::statedir::StateDir::open(dir.path().join("state")).unwrap();
+    let served = cortiq_decision::generation::open_served(&base, &state, Verify::Full).unwrap();
+    assert_eq!(served.verify_full().unwrap().skills, 3);
+    let out = dir.path().join("materialised.cmf");
+    cortiq_decision::container::materialize(&served, &out).unwrap();
+    let full = DecisionModel::open(&out, Verify::Full).unwrap();
+    assert!(full.skill(&id).unwrap().manifest.is_auto());
+    assert_eq!(full.rows(&id).unwrap().rows.len(), 0);
+    assert!(full.rows_learned(&id).unwrap().unwrap().rows.len() >= 71);
+    let loaded = cortiq_decision::service::LoadedModel::new(full).unwrap();
+    assert_eq!(
+        cortiq_decision::matching::skill_for_labels(
+            &loaded.skill_labels(),
+            &["cruise", "food", "travel"]
+        )
+        .unwrap(),
+        id
+    );
+    assert_eq!(
+        cortiq_decision::matching::skill_for_labels(&loaded.skill_labels(), &["food", "travel"])
+            .unwrap(),
+        id
+    );
+    // The file alone needs `--skill` for an unnamed decision (two data skills).
+    assert!(cortiq_decision::eval::select_skill(loaded.model(), None).is_err());
+    assert_eq!(
+        cortiq_decision::eval::select_skill(loaded.model(), Some(&id)).unwrap(),
+        id
+    );
+    drop(loaded);
+    // Served from the materialised file: the contract is exact and local.
+    let srv = Srv::open_on(&out, tempfile::tempdir().unwrap(), &cfg, test_key());
+    let r = ask(&srv, &q, &served_local).await;
+    assert!(local(&r), "{}", r.text);
+    assert_eq!(r.q("task")["certified"], false);
+    assert_eq!(srv.get("/healthz").await.body["auto_skills"], 1);
+    assert_eq!(
+        srv.learning().await["auto_contracts"],
+        0,
+        "a fresh state directory"
+    );
+    // The offline rollback of the CLI on the closed state directory.
+    let cur = cortiq_decision::generation::rollback_state(&state, 0, Some(&base)).unwrap();
+    assert_eq!(cur.generation, 0);
+}
+
+#[tokio::test]
+async fn auto_skill_limits_and_who_teaches() {
+    let mock = keyword_mock();
+    let labels = ["food", "travel", "cruise"];
+    let q = choice(&labels);
+    let text = &food_travel_cruise()[0].1[0];
+    let none = |l: &Value| {
+        assert_eq!(l["examples_added"], 0, "{l}");
+        assert_eq!(l["auto_contracts"], 0, "{l}");
+        assert_eq!(l["attempts"], 0, "{l}");
+    };
+    // auto_max_labels: a wider contract is answered and not learned.
+    let mut cfg = stand_config(&mock.url());
+    cfg.learning.auto_max_labels = 2;
+    let srv = Srv::new(&cfg);
+    let r = ask(&srv, &q, text).await;
+    assert_eq!(r.action(), "oracle");
+    let l = srv.learning().await;
+    none(&l);
+    assert_eq!(l["auto_skipped"], 1, "{l}");
+    let r = ask(&srv, &choice(&["food", "cruise"]), text).await;
+    assert_eq!(r.action(), "oracle");
+    assert_eq!(srv.learning().await["auto_contracts"], 1);
+    drop(srv);
+    // auto_max_skills: the second contract is not learned.
+    let mut cfg = stand_config(&mock.url());
+    cfg.learning.auto_max_skills = 1;
+    let srv = Srv::new(&cfg);
+    ask(&srv, &q, text).await;
+    ask(&srv, &choice(&["food", "cruise"]), text).await;
+    let l = srv.learning().await;
+    assert_eq!(
+        (l["auto_contracts"].as_u64(), l["auto_skipped"].as_u64()),
+        (Some(1), Some(1))
+    );
+    assert_eq!(l["examples_added"], 1);
+    drop(srv);
+    // auto_skills: false — the oracle answers, nothing is recorded.
+    let mut cfg = stand_config(&mock.url());
+    cfg.learning.auto_skills = false;
+    let srv = Srv::new(&cfg);
+    let r = ask(&srv, &q, text).await;
+    assert_eq!(r.action(), "oracle");
+    let l = srv.learning().await;
+    none(&l);
+    assert_eq!(l["auto_skipped"], 0);
+    drop(srv);
+    // Score and noul questions stay oracle-only; a key without
+    // `learning_allowed` creates no contract and no example.
+    let cfg = stand_config(&mock.url());
+    let srv = Srv::new(&cfg);
+    let r = srv.decide(&untrained_body()).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.q("u")["action"], "oracle");
+    let r = srv
+        .decide(&body(
+            json!(text),
+            json!({"n": {"type": "noul", "instructions": "Is it about food?"}}),
+            None,
+        ))
+        .await;
+    assert_eq!(r.q("n")["action"], "oracle", "{}", r.text);
+    none(&srv.learning().await);
+    drop(srv);
+    // A key without `learning_allowed` creates no contract and no example
+    // (keys make the server keyed: the open caller is checked first).
+    let srv = Srv::new(&cfg);
+    let key = srv
+        .admin(
+            "POST",
+            "/v1/admin/keys",
+            Some(&json!({"account": "guest", "rate_per_min": 0, "oracle_allowed": true})),
+        )
+        .await;
+    let key = key.body["key"].as_str().unwrap().to_string();
+    let r = srv
+        .post(
+            "/v1/decisions",
+            Some(&key),
+            &body(json!(text), json!({"task": q.clone()}), None),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.action(), "oracle");
+    let l = srv.learning().await;
+    none(&l);
+    assert_eq!(l["auto_skipped"], 0);
+    // A key with it teaches the same contract.
+    let owner = srv
+        .admin(
+            "POST",
+            "/v1/admin/keys",
+            Some(&json!({"account": "owner", "rate_per_min": 0, "oracle_allowed": true, "learning_allowed": true})),
+        )
+        .await;
+    let owner = owner.body["key"].as_str().unwrap().to_string();
+    let r = srv
+        .post(
+            "/v1/decisions",
+            Some(&owner),
+            &body(
+                json!(food_travel_cruise()[1].1[0]),
+                json!({"task": q.clone()}),
+                None,
+            ),
+        )
+        .await;
+    assert_eq!(r.action(), "oracle", "{}", r.text);
+    let l = srv.learning().await;
+    assert_eq!(
+        (l["auto_contracts"].as_u64(), l["examples_added"].as_u64()),
+        (Some(1), Some(1))
+    );
+    drop(srv);
+
+    // `/v1/route` without `taxonomy_id` on a single-skill file keeps working
+    // once an auto-skill is served (it names no implicit taxonomy).
+    let single = toy().path.parent().unwrap().join("s1.cmf");
+    let srv = Srv::open_on(&single, tempfile::tempdir().unwrap(), &cfg, test_key());
+    let route = json!({"input": {"text": rejected()[0]}});
+    let r = srv.post("/v1/route", None, &route).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    teach_contract(&srv, &q, food_travel_cruise()).await;
+    assert_eq!(srv.get("/healthz").await.body["skills"], 2);
+    let r = srv.post("/v1/route", None, &route).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert!(
+        r.body["meta"]["taxonomy_version"]
+            .as_str()
+            .unwrap()
+            .starts_with("topics@"),
+        "{}",
+        r.text
+    );
+    let tx = srv.get("/v1/taxonomies").await.body;
+    assert_eq!(tx["taxonomies"].as_array().map(Vec::len), Some(2), "{tx}");
+    // Named, the auto-skill routes too.
+    let id = auto_id(&labels);
+    let r = srv
+        .post(
+            "/v1/route",
+            None,
+            &json!({"taxonomy_id": id, "input": {"text": food_travel_cruise()[0].1[0]}}),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["decision"]["task_label"], "food");
+}
+
+#[tokio::test]
+async fn auto_tau_floors_a_local_answer_of_an_auto_skill() {
+    // A noisy oracle (one text in eight gets the next option): the agreement
+    // still passes, and T fitted on a C with wrong rows keeps p_top below 1
+    // (a clean C drives T to its lower bound and every p_top to 1, DESIGN A13).
+    let mock = MockOracle::start(|req| {
+        let text = req.state().as_str().unwrap_or("").to_string();
+        let noisy = sha256_hex(text.as_bytes()).as_bytes()[1] % 8 == 0;
+        answer_reply(
+            req,
+            move |_, opts| {
+                let words: Vec<&str> = text.split(' ').collect();
+                let hit = opts
+                    .iter()
+                    .position(|o| pool_of(o).is_some_and(|p| p.iter().any(|w| words.contains(w))))
+                    .unwrap_or(0);
+                json!(opts[if noisy { (hit + 1) % opts.len() } else { hit }])
+            },
+            1e-5,
+        )
+    });
+    let cfg = stand_config(&mock.url());
+    let srv = Srv::new(&cfg);
+    let labels = ["food", "travel", "cruise"];
+    let q = choice(&labels);
+    let mut seen = Vec::new();
+    let lessons: Vec<(&str, Vec<String>)> = [
+        ("food", 41, "af"),
+        ("travel", 43, "av"),
+        ("cruise", 47, "ac"),
+    ]
+    .iter()
+    .map(|&(l, seed, tag)| (l, texts_apart(l, 30, seed, tag, 0.97, &mut seen)))
+    .collect();
+    let longest = 30;
+    let mut n = 0;
+    'teach: for i in 0..longest {
+        for (_, ts) in &lessons {
+            ask(&srv, &q, &ts[i]).await;
+            n += 1;
+            if srv.learning().await["promotions"].as_u64().unwrap_or(0) >= 1 {
+                break 'teach;
+            }
+        }
+    }
+    let l = srv.learning().await;
+    let rec = latest(&l);
+    assert_eq!(rec["outcome"], "promoted", "{rec}");
+    eprintln!(
+        "noisy oracle: promoted after {n} texts, agreement {}, T {}",
+        rec["auto"]["agreement"]["macro"], rec["gate_after"]["temperature"]
+    );
+    // The least confident local answer among fresh texts of every label.
+    let mut least: Option<(String, f64)> = None;
+    for (label, seed, tag) in [
+        ("food", 97, "zf"),
+        ("travel", 98, "zv"),
+        ("cruise", 99, "zc"),
+    ] {
+        for t in distinct_texts(label, 4, seed, tag, 0.995) {
+            let r = ask(&srv, &q, &t).await;
+            if r.action() == "local" {
+                let p = r.q("task")["gate"]["p_top"].as_f64().unwrap();
+                assert!(p >= 0.9);
+                if least.as_ref().is_none_or(|(_, q)| p < *q) {
+                    least = Some((t.clone(), p));
+                }
+            }
+        }
+    }
+    let (text, p_top) = least.expect("a local answer");
+    eprintln!("least confident local answer: p_top {p_top}");
+    assert!(
+        p_top < 1.0,
+        "no local answer below p_top 1: the floor cannot be exercised"
+    );
+    let l0 = srv.learning().await;
+    // Below the default floor the same text abstains: `auto_tau: 0.5` serves it.
+    // Under cost-saver the floor does not apply (θ-only, spec §4.7b).
+    let r = srv
+        .decide(&body(
+            json!(text),
+            json!({"task": q.clone()}),
+            Some(json!({"profile": "cost-saver"})),
+        ))
+        .await;
+    assert_eq!(r.action(), "local", "{}", r.text);
+    // Restart with the floor above that answer: it abstains, escalates and teaches.
+    let mut high = cfg.clone();
+    high.learning.auto_tau = (p_top as f32 + 1e-3).min(1.0);
+    let srv = srv.restart(&high);
+    let hits = mock.hits();
+    let r = ask(&srv, &q, &text).await;
+    assert_eq!(r.q("task")["match"], "exact");
+    assert_eq!(r.q("task")["gate"]["accepted"], false, "{}", r.text);
+    assert_eq!(r.action(), "oracle", "{}", r.text);
+    assert_eq!(r.q("task")["decision_path"], "escalate→oracle");
+    assert_eq!(mock.hits(), hits + 1);
+    let l = srv.learning().await;
+    assert_eq!(
+        l["examples_added"].as_u64().unwrap(),
+        1,
+        "one example since the restart: {l}"
+    );
+    assert!(l0["examples_added"].as_u64().unwrap() >= 60);
+}
+
+#[tokio::test]
+async fn a_rare_label_stays_quarantined_and_keeps_teaching() {
+    let mock = keyword_mock();
+    let cfg = stand_config(&mock.url());
+    let srv = Srv::new(&cfg);
+    let labels = ["food", "travel", "cruise"];
+    let q = choice(&labels);
+    let id = auto_id(&labels);
+    let mut seen = Vec::new();
+    let food = texts_apart("food", 25, 41, "af", 0.97, &mut seen);
+    let travel = texts_apart("travel", 25, 43, "av", 0.97, &mut seen);
+    let cruise = texts_apart("cruise", 8, 47, "ac", 0.97, &mut seen);
+    let lessons = vec![
+        ("food", food),
+        ("travel", travel),
+        ("cruise", cruise[..2].to_vec()),
+    ];
+    teach_contract(&srv, &q, &lessons).await;
+    let l = srv.learning().await;
+    let rec = latest(&l);
+    assert_eq!(rec["kind"], "auto_start");
+    assert_eq!(rec["outcome"], "promoted", "{rec}");
+    assert_eq!(rec["auto"]["eligible"], json!(["food", "travel"]));
+    assert_eq!(rec["auto"]["quarantined"], json!(["cruise"]));
+    assert!(rec["auto"]["coverage"].as_f64().unwrap() >= 0.8);
+    let s = srv.get(&format!("/v1/skills/{id}")).await.body;
+    assert_eq!(s["labels"], json!(["food", "travel"]));
+    assert_eq!(s["quarantined_labels"], json!(["cruise"]));
+    assert_eq!(s["active_labels"], 2);
+    assert_eq!(s["tasks"][0]["state"], "quarantined");
+    assert_eq!(
+        l["quarantine"],
+        json!([{"skill": id, "label": "cruise", "examples": 2, "new": 2}])
+    );
+
+    // The whole contract is exact over the active labels; a quarantined
+    // option gets probability 0; a text of it abstains and keeps teaching it.
+    let mut local_food = None;
+    for t in distinct_texts("food", 4, 97, "zf", 0.995) {
+        let r = ask(&srv, &q, &t).await;
+        assert_eq!(r.q("task")["match"], "exact", "{}", r.text);
+        assert_eq!(r.q("task")["skill"], id);
+        if r.action() == "local" {
+            assert_eq!(r.body["answers"]["task"]["probabilities"]["cruise"], 0.0);
+            local_food = Some(r);
+            break;
+        }
+    }
+    assert!(local_food.is_some());
+    let mut taught = 0;
+    for t in &cruise[2..] {
+        let r = ask(&srv, &q, t).await;
+        assert_eq!(r.q("task")["match"], "exact");
+        if r.action() == "oracle" {
+            assert_eq!(r.body["answers"]["task"]["choice"], "cruise");
+            taught += 1;
+        }
+    }
+    assert!(taught >= 1, "no cruise text escalated");
+    let l = srv.learning().await;
+    let cq = l["quarantine"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["label"] == "cruise")
+        .unwrap();
+    assert_eq!(cq["examples"].as_u64().unwrap(), 2 + taught);
+    // Feedback with the quarantined label teaches it too (a contract id).
+    let r = local_food.unwrap();
+    let fb = json!({"id": r.body["id"], "question": "task", "label": "cruise"});
+    let f = srv.post("/v1/feedback", None, &fb).await;
+    assert_eq!(f.status, 200, "{}", f.text);
+    assert_eq!(
+        (f.body["learned"].as_bool(), f.body["known_label"].as_bool()),
+        (Some(true), Some(true))
+    );
+    // A superset request over the auto-skill is answered by the oracle; its
+    // label outside the contract is refused by the closed label set.
+    let sup = choice(&["food", "travel", "cruise", "Weather"]);
+    let weather = distinct_texts("Weather", 1, 5, "w", 0.97).remove(0);
+    let r = ask(&srv, &sup, &weather).await;
+    assert_eq!(r.q("task")["match"], "superset", "{}", r.text);
+    assert_eq!(r.q("task")["unknown_options"], json!(["cruise", "Weather"]));
+    assert_eq!(r.action(), "oracle");
+    assert_eq!(r.body["answers"]["task"]["choice"], "Weather");
+    let l2 = srv.learning().await;
+    assert_eq!(
+        l2["examples_added"].as_u64().unwrap(),
+        l["examples_added"].as_u64().unwrap() + 1,
+        "the feedback only: {l2}"
+    );
+    assert!(
+        !l2["buffer"]["labels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["label"] == "Weather")
+    );
 }
