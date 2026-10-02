@@ -46,6 +46,33 @@ pub const THETA_CAP: f32 = 0.999;
 /// The halves rule, as recorded in a skill manifest.
 pub const HALVES_RULE: &str =
     "calibration rows sorted by sha256(utf8 text) hex; even -> T,theta; odd -> gate";
+/// The halves rule of an auto-skill (no build rows, 0.8.6): its calibration
+/// subset C is a property of each learned row, never stored — a row is in C
+/// iff the first 8 bytes of `sha256(phi_P as f32 little-endian)` read as a
+/// little-endian u64 give 4 modulo 5 (≈ 20 %), so a row never moves between
+/// the fit and C as more rows arrive (a positional carve-out would, and the
+/// champion would be scored on rows it fitted). Inside C the halves follow
+/// [`halves`] over the same hex keys. [`auto_row_key`] computes both.
+pub const HALVES_RULE_AUTO: &str = "learned rows: in C iff u64le(sha256(phi_P f32le)[..8]) % 5 == 4; C sorted by that sha256 hex; even -> T,theta; odd -> gate";
+/// The modulus of [`HALVES_RULE_AUTO`] (one row in five is calibration).
+pub const AUTO_CAL_EVERY: u64 = 5;
+
+/// The key of a learned row under [`HALVES_RULE_AUTO`]: the hex sha256 of its
+/// φ_P as little-endian f32 bytes, and whether the row is in the calibration
+/// subset C. Text-free (the buffer holds vectors only) and deterministic.
+pub fn auto_row_key(phi_p: &[f32]) -> (String, bool) {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    for v in phi_p {
+        h.update(v.to_le_bytes());
+    }
+    let digest = h.finalize();
+    let head = u64::from_le_bytes(digest[..8].try_into().expect("8 bytes"));
+    (
+        format!("{digest:x}"),
+        head % AUTO_CAL_EVERY == AUTO_CAL_EVERY - 1,
+    )
+}
 
 /// `0.05 / 14`.
 pub fn alpha() -> f64 {
@@ -358,6 +385,37 @@ mod tests {
         let (even, odd) = halves(&keys);
         assert_eq!(even, vec![1, 0, 4]);
         assert_eq!(odd, vec![3, 2]);
+    }
+
+    /// The auto calibration membership is a function of the row alone (the
+    /// same φ_P gives the same key and answer in any order and population)
+    /// and lands close to one row in five over a large sample.
+    #[test]
+    fn auto_row_key_is_deterministic_and_about_a_fifth() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut vec = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    x = x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    (x >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+                })
+                .collect()
+        };
+        let rows: Vec<Vec<f32>> = (0..20_000).map(|_| vec(16)).collect();
+        let first: Vec<(String, bool)> = rows.iter().map(|r| auto_row_key(r)).collect();
+        let again: Vec<(String, bool)> = rows.iter().rev().map(|r| auto_row_key(r)).collect();
+        assert!(first.iter().eq(again.iter().rev()));
+        assert!(first.iter().all(|(k, _)| k.len() == 64));
+        let in_c = first.iter().filter(|(_, c)| *c).count();
+        let share = in_c as f64 / rows.len() as f64;
+        assert!((0.18..=0.22).contains(&share), "share in C {share}");
+        // Keys are the hex sha256 of the little-endian bytes.
+        let (k, _) = auto_row_key(&[1.0, -2.5]);
+        let mut bytes = Vec::new();
+        for v in [1.0f32, -2.5] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(k, crate::manifest::sha256_hex(&bytes));
     }
 
     #[test]
