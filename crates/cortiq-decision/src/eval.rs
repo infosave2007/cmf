@@ -444,8 +444,10 @@ pub fn read_input(path: impl AsRef<Path>) -> Result<Vec<EvalInput>> {
     parse_input(&path.display().to_string(), &bytes)
 }
 
-/// The skill of a batch run: `--skill`, else the only skill of the file, else
-/// an error listing the skills (spec §4.1).
+/// The skill of a batch run: `--skill`, else the only data skill of the file
+/// (an auto-skill learned at runtime does not make a single-skill file
+/// ambiguous; name it with `--skill`), else an error listing the skills
+/// (spec §4.1).
 pub fn select_skill(model: &DecisionModel, skill: Option<&str>) -> Result<String> {
     let ids: Vec<&str> = model.skills().iter().map(|s| s.id()).collect();
     match skill {
@@ -458,15 +460,23 @@ pub fn select_skill(model: &DecisionModel, skill: Option<&str>) -> Result<String
             );
             Ok(id.to_string())
         }
-        None => match ids.as_slice() {
-            [one] => Ok(one.to_string()),
-            [] => bail!("this file has no skill"),
-            _ => bail!(
-                "this file has {} skills; choose one with --skill ({})",
-                ids.len(),
-                ids.join(", ")
-            ),
-        },
+        None => {
+            let data: Vec<&str> = model
+                .skills()
+                .iter()
+                .filter(|s| !s.manifest.is_auto())
+                .map(|s| s.id())
+                .collect();
+            match data.as_slice() {
+                [one] => Ok(one.to_string()),
+                [] if ids.is_empty() => bail!("this file has no skill"),
+                _ => bail!(
+                    "this file has {} skills; choose one with --skill ({})",
+                    ids.len(),
+                    ids.join(", ")
+                ),
+            }
+        }
     }
 }
 

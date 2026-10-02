@@ -47,6 +47,25 @@
 //! not tasks of it yet (pending cold starts); an example past either limit is
 //! refused (`full`).
 //!
+//! **Auto-skills** (0.8.6, DESIGN D1–D3, A4, A5, A7): a choice question no
+//! skill fits (`match: untrained`, not ambiguous, no `cmf.skill`) is a
+//! *contract*; when the caller's key has `learning_allowed` (only that key
+//! teaches an auto-skill, before and after its activation — the rubric rule
+//! of `teaches` does not apply to `auto-` ids, since the stored rubric is the
+//! contract itself) and `learning.auto_skills` is on, the oracle's answer
+//! becomes an example of the auto-skill `auto-<sha12 of the sorted ids>`
+//! ([`crate::manifest::auto_skill_id`]). The contract is registered once,
+//! under the buffer lock, as a [`LogRecord::Contract`] written before its
+//! first example; a contract with fewer than 2 or more than
+//! `learning.auto_max_labels` ids, or past `learning.auto_max_skills`
+//! contracts, is answered by the oracle and not recorded (`auto_skipped`).
+//! The labels of an auto-skill are closed: an example whose label is not one
+//! of the contract's ids is refused (`full`), so a superset request or a
+//! router feedback can never grow it; the pending-labels cap does not apply
+//! to it, `learning.auto_max_examples_per_label` replaces the per-label cap.
+//! The trigger is the same counter; the attempt is [`crate::learn`]'s
+//! whole-skill one.
+//!
 //! **Admin** (spec §5b): oracle status and switches, learning status (buffer,
 //! cache, quarantine, attempts, task hashes), generations and rollback (the
 //! buffer is kept, the counters restart).
@@ -56,12 +75,15 @@
 //! `learn.log` and the budget from `oracle.jsonl`.
 
 use crate::answer::OracleAnswer;
-use crate::buffer::{AddOutcome, Example, LearnLog, LearningBuffer, LogRecord, dot};
+use crate::buffer::{
+    AddOutcome, Contract, ContractRegistry, Example, LearnLog, LearningBuffer, LogRecord, dot,
+};
 use crate::cache::{CacheEntry, SemanticCache, scope_of};
 use crate::config::Config;
 use crate::container::{DecisionModel, Verify};
 use crate::generation;
 use crate::learn::{self, AttemptReport, Books, LearnContext, Outcome};
+use crate::manifest;
 use crate::matching::MatchKind;
 use crate::metering::Usd;
 use crate::oracle::{CallOutcome, Caller, KeyLookup, OracleClient, process_env};
@@ -73,7 +95,7 @@ use crate::service::{
     OracleUsage, Pending, Principal, RefusalReason, Resolution, Resolved,
 };
 use crate::statedir::StateDir;
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use parking_lot::{Condvar, Mutex};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
@@ -93,6 +115,8 @@ pub const LEARNING_NOT_ALLOWED: &str = "learning_not_allowed";
 pub const MAX_EXAMPLES_PER_LABEL: usize = 5_000;
 /// Most labels per skill in the buffer that are not tasks of the skill yet.
 pub const MAX_PENDING_NEW_LABELS: usize = 32;
+/// How often a WARN names a contract that was not learned (`auto_skipped`).
+pub const AUTO_SKIPPED_LOG_EVERY: Duration = Duration::from_secs(3600);
 
 /// Options of [`Cascade::open_with`].
 #[derive(Clone)]
@@ -213,6 +237,10 @@ struct Stats {
     rollbacks: u64,
     examples: u64,
     feedback: u64,
+    /// Untrained contracts not learned (too many or too few ids, the
+    /// registry full).
+    auto_skipped: u64,
+    auto_skipped_logged: Option<Instant>,
     recent: VecDeque<Value>,
 }
 
@@ -225,6 +253,8 @@ struct Inner {
     buffer: Mutex<LearningBuffer>,
     log: LearnLog,
     books: Mutex<Books>,
+    /// The contracts of the auto-skills (restored from `learn.log` first).
+    contracts: Mutex<ContractRegistry>,
     bases: Mutex<HashMap<String, Arc<Rows>>>,
     flights: Mutex<Vec<Flight>>,
     next_flight: AtomicU64,
@@ -283,17 +313,37 @@ impl Cascade {
         let (log, replayed) = LearnLog::open(&state.learn_log_path())?;
         let mut cache = SemanticCache::new(cfg.cache.threshold, cfg.cache.cap);
         let mut buffer = LearningBuffer::new(cfg.learning.dedup);
+        let mut contracts = ContractRegistry::default();
+        let mut orphans = 0u64;
         for r in &replayed.records {
             match r {
                 LogRecord::CachePut(e) => {
                     cache.put(e.clone());
                 }
+                LogRecord::Contract(c) => {
+                    contracts.insert(c.clone());
+                }
+                // An example of an auto-skill whose contract is not in the log
+                // (cannot happen in a consistent log: the contract record
+                // precedes the first example) has no rubric to learn under.
+                LogRecord::Example(x)
+                    if manifest::is_auto_skill_id(&x.skill) && !contracts.contains(&x.skill) =>
+                {
+                    orphans += 1;
+                }
                 other => buffer.apply(other),
             }
+        }
+        if orphans > 0 {
+            tracing::warn!(
+                examples = orphans,
+                "learn.log: examples of auto-skills without a contract record were dropped"
+            );
         }
         tracing::info!(
             cache = cache.len(),
             examples = buffer.len(),
+            contracts = contracts.len(),
             dropped_bytes = replayed.dropped_bytes,
             "cascade state restored from learn.log"
         );
@@ -306,6 +356,7 @@ impl Cascade {
             buffer: Mutex::new(buffer),
             log,
             books: Mutex::new(Books::default()),
+            contracts: Mutex::new(contracts),
             bases: Mutex::new(HashMap::new()),
             flights: Mutex::new(Vec::new()),
             next_flight: AtomicU64::new(1),
@@ -351,6 +402,11 @@ impl Cascade {
     /// Examples of the learning buffer.
     pub fn buffer_len(&self) -> usize {
         self.inner.buffer.lock().len()
+    }
+
+    /// The contracts learned so far (auto-skills, served or not).
+    pub fn contracts(&self) -> Vec<Contract> {
+        self.inner.contracts.lock().iter().cloned().collect()
     }
 
     /// Examples of (skill, label) kept and added since its last attempt.
@@ -418,14 +474,42 @@ fn learnable_label(label: &str) -> bool {
 /// Whether the oracle's answer to a pending question may become an example of
 /// the shared `skill` (see the module notes): the caller may teach, or the
 /// question is an exact match asking exactly the skill's own question — except
-/// for the implicit open mode of a loopback address, which never teaches.
+/// for the implicit open mode of a loopback address, which never teaches. An
+/// auto-skill's rubric is the contract its callers send, so the rubric rule
+/// would let every key teach it: only `learning_allowed` does (DESIGN A7).
 fn teaches(e: &Escalation<'_>, p: &Pending<'_>, skill: &str) -> bool {
     e.principal.learning_allowed
         || (!e.principal.implicit_open
+            && !manifest::is_auto_skill_id(skill)
             && p.matched.kind == MatchKind::Exact
             && e.model
                 .skill(skill)
                 .is_some_and(|s| s.follows_rubric(p.question)))
+}
+
+/// The contract of a pending untrained choice question that may be learned
+/// into an auto-skill (DESIGN D1/D2): no skill fits (not ambiguous), no
+/// `cmf.skill`, the caller may teach, 2..=`auto_max_labels` option ids. The
+/// registry cap is checked when the contract is registered.
+fn auto_contract(cfg: &Config, e: &Escalation<'_>, p: &Pending<'_>) -> Option<Contract> {
+    if !cfg.learning.auto_skills
+        || !e.principal.learning_allowed
+        || e.request.cmf.skill.is_some()
+        || p.question.kind != QuestionKind::Choice
+        || !p.matched.is_foreign()
+    {
+        return None;
+    }
+    let ids = p.question.options();
+    if ids.len() < 2 || ids.len() > cfg.learning.auto_max_labels {
+        return None;
+    }
+    Some(Contract::new(
+        &ids,
+        &p.question.instructions,
+        p.question.criteria.as_ref().unwrap_or(&Value::Null),
+        now_unix(),
+    ))
 }
 
 impl Inner {
@@ -462,8 +546,14 @@ impl Inner {
     }
 
     /// Add an example (dedup), log it; the (skill, label) to consider for
-    /// learning when it reached the threshold.
-    fn add_example(&self, ex: Example) -> Result<(AddOutcome, Option<(String, String)>)> {
+    /// learning when it reached the threshold. `contract` is the contract of an
+    /// untrained question's auto-skill (registered here, before the example,
+    /// when it is new; `Err` when the registry is full — the caller counts it).
+    fn add_example(
+        &self,
+        ex: Example,
+        contract: Option<&Contract>,
+    ) -> Result<(AddOutcome, Option<(String, String)>)> {
         let model = self.handle.current();
         let stored = self.stored_phi(model.model(), &ex.skill, &ex.label)?;
         let refs: Vec<&[f32]> = stored.iter().map(Vec::as_slice).collect();
@@ -474,12 +564,44 @@ impl Inner {
                 .skill(&ex.skill)
                 .is_some_and(|s| s.manifest.task_of(label).is_some())
         };
+        let auto = manifest::is_auto_skill_id(&ex.skill);
         let mut b = self.buffer.lock();
+        if auto {
+            // The registry is written under the buffer lock, so the contract
+            // record precedes the first example of its auto-skill in
+            // `learn.log` and two first sightings cannot race (DESIGN A4).
+            let mut reg = self.contracts.lock();
+            if let Some(c) = contract
+                && !reg.contains(&c.skill)
+            {
+                ensure!(
+                    reg.len() < self.cfg.learning.auto_max_skills,
+                    "the auto-skill registry holds {} contracts (learning.auto_max_skills)",
+                    reg.len()
+                );
+                self.log.append(&LogRecord::Contract(c.clone()))?;
+                reg.insert(c.clone());
+            }
+            // Closed label set: a label outside the contract (a superset
+            // request, a router feedback) is refused (DESIGN A5).
+            let allowed = reg.get(&ex.skill).is_some_and(|c| c.has_label(&ex.label));
+            if !allowed {
+                return Ok((AddOutcome::Full, None));
+            }
+        }
         let held = b.examples(&ex.skill, &ex.label).len();
-        if held >= MAX_EXAMPLES_PER_LABEL {
+        let cap = if auto {
+            self.cfg
+                .learning
+                .auto_max_examples_per_label
+                .min(MAX_EXAMPLES_PER_LABEL)
+        } else {
+            MAX_EXAMPLES_PER_LABEL
+        };
+        if held >= cap {
             return Ok((AddOutcome::Full, None));
         }
-        if held == 0 && !is_task(&ex.label) {
+        if held == 0 && !auto && !is_task(&ex.label) {
             let pending_new = b
                 .labels()
                 .iter()
@@ -498,6 +620,27 @@ impl Inner {
         self.stats.lock().examples += 1;
         let due = b.new_count(&key.0, &key.1) >= self.cfg.learning.refit_min_new;
         Ok((AddOutcome::Stored, due.then_some(key)))
+    }
+
+    /// An untrained contract the oracle answered that is not learned (ids
+    /// outside 2..=`auto_max_labels`, or the registry full): counted, and
+    /// named by its size in a WARN at most once an hour (never its ids).
+    fn note_auto_skipped(&self, ids: usize) {
+        let mut st = self.stats.lock();
+        st.auto_skipped += 1;
+        let due = st
+            .auto_skipped_logged
+            .is_none_or(|t| t.elapsed() >= AUTO_SKIPPED_LOG_EVERY);
+        if due {
+            st.auto_skipped_logged = Some(Instant::now());
+            tracing::warn!(
+                ids,
+                skipped = st.auto_skipped,
+                max_labels = self.cfg.learning.auto_max_labels,
+                max_skills = self.cfg.learning.auto_max_skills,
+                "an untrained contract is answered by the oracle but not learned (auto-skill limits)"
+            );
+        }
     }
 
     fn maybe_learn(&self, skill: &str, label: &str) {
@@ -526,6 +669,7 @@ impl Inner {
             buffer: &self.buffer,
             log: &self.log,
             books: &self.books,
+            contracts: &self.contracts,
             cfg: &self.cfg.learning,
             base_rows: &base_rows,
             threads: self.threads,
@@ -583,6 +727,47 @@ impl Inner {
         }
         let total = b.len();
         let dups = b.duplicates();
+        // Every contract learned so far: its labels, the examples per label
+        // (served learned rows + buffer), what the served model has of it.
+        let auto_skills: Vec<Value> = self
+            .contracts
+            .lock()
+            .iter()
+            .map(|c| {
+                let served = model.skill(&c.skill);
+                let mut examples = serde_json::Map::new();
+                let served_n = |label: &str| -> u64 {
+                    served
+                        .and_then(|s| s.manifest().task_of(label))
+                        .map_or(0, |t| served.map_or(0, |s| s.manifest().tasks[t].n_train))
+                };
+                for l in &c.ids {
+                    let n = b.examples(&c.skill, l).len() as u64 + served_n(l);
+                    examples.insert(l.clone(), json!(n));
+                }
+                // Active labels in task order (the listing's order).
+                let active: Vec<&str> = served.map_or_else(Vec::new, |s| {
+                    s.manifest()
+                        .tasks
+                        .iter()
+                        .filter(|t| t.is_active())
+                        .map(|t| t.label.as_str())
+                        .collect()
+                });
+                json!({
+                    "id": c.skill,
+                    "labels": c.ids,
+                    "examples": examples,
+                    "created_unix": c.created_unix,
+                    "served": served.map(|s| json!({
+                        "generation": model.generation(),
+                        "taxonomy_version": s.manifest().taxonomy_version,
+                        "active": active,
+                    })),
+                })
+            })
+            .collect();
+        let auto_contracts = self.contracts.lock().len();
         drop(b);
         let c = self.cache.lock();
         let cache = json!({"entries": c.len(), "hits": c.hits(), "lookups": c.lookups(),
@@ -625,6 +810,9 @@ impl Inner {
             "cold_starts": st.cold_starts, "skipped": st.skipped, "errors": st.errors,
             "isolation_violations": st.isolation_violations, "rollbacks": st.rollbacks,
             "examples_added": st.examples, "feedback": st.feedback,
+            "auto_contracts": auto_contracts,
+            "auto_skipped": st.auto_skipped,
+            "auto_skills": auto_skills,
             "recent": st.recent.iter().cloned().collect::<Vec<_>>(),
             "skills": Value::Object(tasks),
         })
@@ -807,23 +995,45 @@ impl Escalator for Cascade {
                             }
                         }
                         let p = &e.pending[i];
-                        if let (true, Some(skill), OracleAnswer::Choice(label)) =
-                            (cfg.learning.enabled, &p.matched.skill, &v)
-                            && teaches(e, p, skill)
-                        {
-                            let ex = Example::from_features(
-                                skill,
-                                label,
-                                Source::Oracle,
-                                e.features,
-                                ts,
-                            );
-                            match inner.add_example(ex) {
-                                Ok((_, Some(job))) => learn_jobs.push(job),
-                                Ok(_) => {}
-                                Err(err) => {
-                                    tracing::error!(error = %format!("{err:#}"), "learning buffer")
+                        if !cfg.learning.enabled {
+                            continue;
+                        }
+                        let OracleAnswer::Choice(label) = &v else {
+                            continue;
+                        };
+                        // A matched skill learns under `teaches`; an untrained
+                        // contract learns into its auto-skill (see the module
+                        // notes), its contract registered with the example.
+                        let (skill, contract) = match &p.matched.skill {
+                            Some(skill) if teaches(e, p, skill) => (skill.clone(), None),
+                            Some(_) => continue,
+                            None => match auto_contract(cfg, e, p) {
+                                Some(c) => (c.skill.clone(), Some(c)),
+                                None => {
+                                    if cfg.learning.auto_skills
+                                        && e.principal.learning_allowed
+                                        && p.matched.is_foreign()
+                                        && e.request.cmf.skill.is_none()
+                                    {
+                                        inner.note_auto_skipped(p.question.options().len());
+                                    }
+                                    continue;
                                 }
+                            },
+                        };
+                        let ex =
+                            Example::from_features(&skill, label, Source::Oracle, e.features, ts);
+                        match inner.add_example(ex, contract.as_ref()) {
+                            Ok((_, Some(job))) => learn_jobs.push(job),
+                            Ok(_) => {}
+                            Err(err) if contract.is_some() => {
+                                // The registry is full: the oracle answered, the
+                                // contract is not learned (counted, rate-limited).
+                                tracing::debug!(error = %format!("{err:#}"), "auto-skill");
+                                inner.note_auto_skipped(p.question.options().len());
+                            }
+                            Err(err) => {
+                                tracing::error!(error = %format!("{err:#}"), "learning buffer")
                             }
                         }
                     }
@@ -950,7 +1160,7 @@ impl Escalator for Cascade {
             h_idx: entry.state.h_idx.clone(),
             h_val: entry.state.h_val.clone(),
         };
-        let (added, job) = inner.add_example(ex).map_err(|e| {
+        let (added, job) = inner.add_example(ex, None).map_err(|e| {
             tracing::error!(
                 error = %learn::redact_label(&format!("{e:#}"), &fb.label),
                 "feedback example"

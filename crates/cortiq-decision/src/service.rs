@@ -273,15 +273,30 @@ impl LoadedModel {
         self.model.representation_id()
     }
 
-    /// The active labels of every skill (the matcher's view).
+    /// The labels of every skill as the matcher sees them: the active ones
+    /// (candidates) and, for an auto-skill, its whole contract as known.
     pub fn skill_labels(&self) -> Vec<SkillLabels<'_>> {
         self.skills
             .iter()
-            .map(|s| SkillLabels {
-                id: s.id(),
-                active: s.scorer.labels(),
+            .map(|s| {
+                let active = s.scorer.labels();
+                if s.manifest.is_auto() {
+                    SkillLabels {
+                        id: s.id(),
+                        active,
+                        known: &s.manifest.labels,
+                        auto: true,
+                    }
+                } else {
+                    SkillLabels::data(s.id(), active)
+                }
             })
             .collect()
+    }
+
+    /// Served auto-skills.
+    pub fn auto_skills(&self) -> usize {
+        self.skills.iter().filter(|s| s.manifest.is_auto()).count()
     }
 }
 
@@ -1507,7 +1522,7 @@ impl DecisionService {
             signal: st,
             mut locals,
             resonance,
-        } = local_stage(&model, req, &matches)?;
+        } = local_stage(&model, req, &matches, self.cfg.learning.auto_tau)?;
 
         // Undetermined questions.
         let pending_idx: Vec<usize> = (0..matches.len())
@@ -1738,7 +1753,7 @@ impl DecisionService {
         let model = self.handle.current();
         check_pinned(&model, req)?;
         let matches = match_questions(&model, req)?;
-        let stage = local_stage(&model, req, &matches)?;
+        let stage = local_stage(&model, req, &matches, self.cfg.learning.auto_tau)?;
         let timings = RequestTimings {
             tokenize: stage.signal.tokenize,
             encode: stage.signal.encode,
@@ -2104,6 +2119,7 @@ impl DecisionService {
             "model_sha": model.model_sha(),
             "generation": model.generation(),
             "skills": model.skills().len(),
+            "auto_skills": model.auto_skills(),
             "inflight": self.inflight(),
             "encoder_device": model.encoder().encoder().device_name(),
             "metal_encoder_submissions": model.encoder().encoder().metal_submissions(),
@@ -2298,6 +2314,7 @@ fn local_stage(
     model: &LoadedModel,
     req: &DecisionRequest,
     matches: &[SkillMatch],
+    auto_tau: f32,
 ) -> Result<LocalStage, ApiError> {
     let mut indices = Vec::new();
     for m in matches.iter().filter(|m| m.kind.is_local()) {
@@ -2338,6 +2355,7 @@ fn local_stage(
                 &skill_errors[&si],
                 req.cmf.profile,
                 req.state.is_text(),
+                auto_tau,
             )
             .map_err(internal)?,
         ));
@@ -2351,12 +2369,17 @@ fn local_stage(
 }
 
 /// The local decision of an exact or subset question over its candidates.
+/// `auto_tau` is the confidence floor of an auto-skill (`learning.auto_tau`,
+/// DESIGN D5/A8): its gate's τ stays 0 while uncertified, so `balanced` and
+/// `quality-first` additionally require `p_top ≥ auto_tau` (`cost-saver` is
+/// θ-only by spec §4.7b); an abstention escalates and teaches as any other.
 fn local_decision(
     s: &SkillRuntime,
     m: &SkillMatch,
     all_errors: &[f32],
     profile: Profile,
     state_is_text: bool,
+    auto_tau: f32,
 ) -> Result<LocalDecision> {
     let scorer = &s.scorer;
     let gate = scorer.gate();
@@ -2381,10 +2404,12 @@ fn local_decision(
     };
     let decision = decide_errors(&errors, &stats, gate.temperature)?;
     let gate_accepted = decision.accepted(gate.tau, gate.novelty_theta);
+    let floor = !s.manifest.is_auto() || decision.p_top >= auto_tau;
     let accepted = match profile {
-        Profile::Balanced => gate_accepted,
+        Profile::Balanced => gate_accepted && floor,
         Profile::QualityFirst => {
             gate_accepted
+                && floor
                 && decision.margin >= QUALITY_FIRST_MARGIN
                 && decision.novelty <= gate.novelty_theta.min(QUALITY_FIRST_NOVELTY)
         }
@@ -2531,17 +2556,31 @@ fn untrained_error(
     ApiError::new(worst, message).with_detail("questions", Value::Object(details))
 }
 
+/// `GET /v1/skills` entry (keys append-only: clients index the listing by
+/// position). `auto`, `active_labels`, `quarantined_labels` and `examples`
+/// (learned rows) are 0.8.6 additions, present for every skill.
 fn skill_summary(s: &SkillRuntime) -> Value {
     let g = s.gate();
+    let m = &s.manifest;
+    let quarantined: Vec<&str> = m
+        .tasks
+        .iter()
+        .filter(|t| !t.is_active())
+        .map(|t| t.label.as_str())
+        .collect();
     json!({
         "id": s.id(),
-        "taxonomy_version": s.manifest.taxonomy_version,
+        "taxonomy_version": m.taxonomy_version,
         "labels": s.scorer.labels(),
         "certified": g.certified,
         "tau": f32_json(g.tau),
         "theta": f32_json(g.novelty_theta),
         "temperature": f32_json(g.temperature),
-        "has_rubric": s.manifest.rubric.is_some(),
+        "has_rubric": m.rubric.is_some(),
+        "auto": m.is_auto(),
+        "active_labels": s.scorer.labels().len(),
+        "quarantined_labels": quarantined,
+        "examples": m.rows_learned.as_ref().map_or(0, |r| r.n),
     })
 }
 
