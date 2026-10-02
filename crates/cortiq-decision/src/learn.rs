@@ -771,6 +771,11 @@ fn attempt_inner(ctx: &LearnContext<'_>, skill: &str, label: &str) -> Result<Att
     let threads = resolve_threads(ctx.threads);
     let loaded = ctx.handle.current();
     let model = loaded.model();
+    // Phase B (DESIGN A10): the auto-skill branch forks HERE, before this
+    // served-skill lookup, on `manifest::is_auto_skill_id(skill) &&
+    // cfg.auto_skills` — the first attempt of a contract (and every attempt
+    // after a rollback that dropped the auto-skill) finds no served skill, so
+    // a branch placed after the lookup would never see them.
     let Some(sk) = model.skill(skill) else {
         return Ok(AttemptReport::skipped(
             skill,

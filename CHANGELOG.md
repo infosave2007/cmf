@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A 0.8.5 binary refuses a generation that carries an auto-skill ("is not in
   the base file"); generations are local state and are never shipped. Never
   run an older binary on a 0.8.6 state directory.
+- The skill id prefix `auto-` is now reserved: a decision file built by an
+  older release with a *user* skill whose id starts with `auto-` (for example
+  `cortiq decision train --skill auto-triage …`) no longer opens — `serve`,
+  `verify`, `info`, `decide` and `learn` refuse it with "the 'auto-' id prefix
+  is reserved for auto-skills". Rebuild that skill under another id. The id is
+  the discriminator the learner relies on, so the file is not read leniently.
 
 ## [0.8.5] - 2026-10-01
 

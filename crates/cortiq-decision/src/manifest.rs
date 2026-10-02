@@ -1475,10 +1475,16 @@ impl SkillManifest {
         );
         ensure!(valid_skill_id(&self.id), "invalid skill id '{}'", self.id);
         // The prefix is reserved: with build rows it is a user skill in disguise
-        // and the derived `is_auto()` would disagree with the id.
+        // and the derived `is_auto()` would disagree with the id. This is a
+        // deliberate load-time break for a pre-0.8.6 file whose user skill was
+        // built under the prefix (0.8.5 accepted any valid id): the id is the
+        // discriminator the learner and the server rely on (contract keys,
+        // isolation, who teaches), so such a file is rebuilt under another id
+        // rather than read leniently (CHANGELOG, Compatibility).
         ensure!(
             !is_auto_skill_id(&self.id) || self.data.train.n == 0,
-            "the '{AUTO_SKILL_PREFIX}' id prefix is reserved for auto-skills (no build rows)"
+            "the '{AUTO_SKILL_PREFIX}' id prefix is reserved for auto-skills (no build rows); \
+             a user skill built under it is rebuilt under another id"
         );
         let auto = self.is_auto();
         ensure!(self.taxonomy_version >= 1, "taxonomy_version starts at 1");

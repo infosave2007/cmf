@@ -2469,3 +2469,36 @@ fn overlay_born_skill_refusals() {
         "{r}"
     );
 }
+
+/// A file an older release built with a *user* skill under the reserved
+/// prefix (0.8.5 accepted any valid id) is refused at open — a documented
+/// compatibility break (CHANGELOG `[Unreleased]`, Compatibility): the id is the
+/// discriminator the learner relies on, so the loader is not lenient. Written
+/// by hand since no 0.8.6 builder produces such a file.
+#[test]
+fn a_pre_086_user_skill_under_the_auto_prefix_is_refused_at_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = toy_file(dir.path());
+    let from = manifest::skill_manifest_tensor("alpha");
+    let to = manifest::skill_manifest_tensor("auto-alpha");
+    let p = dir.path().join("auto-user.cmf");
+    rewrite(&base, &p, |_, t| {
+        let s = spec_mut(t, &from);
+        let mut v: Value = canonical::parse(&s.data).unwrap();
+        v["id"] = json!("auto-alpha");
+        s.name = to.clone();
+        s.data = canonical::to_vec(&v);
+        s.shape = vec![s.data.len()];
+        let sha = sha(&s.data);
+        edit_manifest(t, false, |m| {
+            m["skills"][0]["id"] = json!("auto-alpha");
+            m["skills"][0]["manifest_sha256"] = json!(sha);
+        });
+    });
+    let r = refused(&p, Verify::Light);
+    assert!(
+        matches!(&r, Refusal::Skill { skill, reason }
+            if skill == "auto-alpha" && reason.contains("reserved")),
+        "{r}"
+    );
+}
