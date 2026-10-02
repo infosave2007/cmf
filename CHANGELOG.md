@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Decision format: a generation overlay may carry a skill the base file does
+  not have — an *auto-skill* (reserved id prefix `auto-`, no build rows,
+  `data.calibration.source: "learned"`, every row in `rows.learned`). The
+  loader, `verify`, `info`, `materialize`, generation listing (`auto_skills`)
+  and `OverlayBuilder::add_skill` handle it; a materialised file with an
+  auto-skill reads with cortiq ≥ 0.8.6. `cortiq decision train`/`add-skill`
+  refuse the reserved prefix. Groundwork for learning untrained choice
+  contracts from oracle answers (the serving side follows).
+
+### Compatibility
+- A 0.8.5 binary refuses a generation that carries an auto-skill ("is not in
+  the base file"); generations are local state and are never shipped. Never
+  run an older binary on a 0.8.6 state directory.
+
 ## [0.8.5] - 2026-10-01
 
 ### Added

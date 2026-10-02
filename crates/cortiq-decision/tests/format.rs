@@ -2,19 +2,24 @@
 //! canonical JSON against Python, the rows blob, a toy full file round trip with
 //! every manifest field, the refusals of §2.8, the no-clobber writer, byte
 //! determinism under `SOURCE_DATE_EPOCH`, zero-forgetting `add-skill`, overlay
-//! generations (precedence, cumulative load, materialise) and their refusals.
+//! generations (precedence, cumulative load, materialise) and their refusals,
+//! and overlay-born auto-skills (0.8.6: a generation that carries a skill the
+//! base does not have — load, verify, isolation, materialise, refusals).
 //!
 //! The toy encoder has the release layout at hidden 8 (2 layers, vocab 12), so
 //! the signal is `8 + 4096 = 4104` wide; every tensor is generated in the test.
 
 use cortiq_core::{CmfHeader, CmfModel, TensorDtype, TensorSpec};
+use cortiq_decision::build::{self, TrainOptions};
 use cortiq_decision::canonical;
 use cortiq_decision::certify;
 use cortiq_decision::container::{
     DecisionModel, FileBuilder, LearnedRows, NewSkill, OutputExists, OverlayBuilder, Refusal,
     Verify, materialize,
 };
+use cortiq_decision::eval::SkillScorer;
 use cortiq_decision::hashfeat;
+use cortiq_decision::learn::isolation_violations;
 use cortiq_decision::manifest::{
     self, CalibrationEvidence, DataRecord, DevRecord, EncoderConfig, EncoderRecord, EncoderSource,
     EvenEvidence, Evidence, Gate, GateRule, GridEntry, InputPart, LearnedRecord, OddEvidence,
@@ -2025,4 +2030,442 @@ fn overlay_refusals() {
     ));
     let r = DecisionModel::open_with_overlay(&base, Some(&base), Verify::Light).unwrap_err();
     assert!(matches!(r, Refusal::Profile { .. }), "{r}");
+}
+
+// ------------------------------------------------------------------ overlay-born auto-skills (0.8.6)
+
+/// An auto-skill as the learner writes it after its first fit: contract
+/// `{travel, food, cruise}` (labels in sorted order), `food` and `travel`
+/// active (k 1, 12 rows each), `cruise` quarantined (3 rows, no topology); the
+/// build blob empty, every row in `rows.learned` (split learned, source oracle).
+fn toy_auto(seed: u64) -> (NewSkill, Rows) {
+    let mut rng = Rng(seed);
+    let ids = ["travel", "food", "cruise"];
+    let mut criteria = serde_json::Map::new();
+    for l in ids {
+        criteria.insert(
+            l.to_string(),
+            json!(format!("The customer asks about {l}.")),
+        );
+    }
+    let mut m =
+        SkillManifest::auto_skeleton(&ids, Some(Rubric::new("Pick the topic.", criteria)), 8);
+    assert_eq!(m.labels, ["cruise", "food", "travel"]);
+    let mut topologies = vec![None, None, None];
+    for i in 1..3 {
+        m.tasks[i].state = TaskState::Active;
+        m.tasks[i].k = 1;
+        m.tasks[i].n_train = 12;
+        m.tasks[i].err_mean = 0.2 + i as f64 * 0.01;
+        m.tasks[i].err_std = 0.05;
+        topologies[i] = Some(Topology {
+            mean: rng.vec(SIGNAL),
+            basis: rng.vec(SIGNAL),
+        });
+    }
+    let mut lw = RowsWriter::new(TOY_HIDDEN, DIM_H).unwrap();
+    for (t, n) in [(0u32, 3usize), (1, 12), (2, 12)] {
+        for _ in 0..n {
+            lw.push(&random_row(
+                &mut rng,
+                t,
+                Split::Learned,
+                0,
+                Source::Oracle,
+                10,
+            ))
+            .unwrap();
+        }
+    }
+    let learned = lw.finish();
+    let rows = Rows::decode(&learned).unwrap();
+    (
+        NewSkill {
+            manifest: m,
+            topologies,
+            rows: Rows::empty_blob(TOY_HIDDEN, DIM_H).unwrap(),
+            rows_learned: Some(learned),
+        },
+        rows,
+    )
+}
+
+/// An auto-skill no label of which is fitted yet: no tensors at all.
+fn toy_auto_quiet() -> NewSkill {
+    NewSkill {
+        manifest: SkillManifest::auto_skeleton(&["yes", "no"], None, 8),
+        topologies: vec![None, None],
+        rows: Rows::empty_blob(TOY_HIDDEN, DIM_H).unwrap(),
+        rows_learned: None,
+    }
+}
+
+#[test]
+fn an_auto_skill_is_born_in_a_generation_and_materialises() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = toy_file(dir.path());
+    let m0 = DecisionModel::open(&base, Verify::Full).unwrap();
+    let (auto, learned) = toy_auto(404);
+    let id = auto.manifest.id.clone();
+    assert!(manifest::is_auto_skill_id(&id) && manifest::valid_skill_id(&id));
+    let quiet = toy_auto_quiet();
+    let qid = quiet.manifest.id.clone();
+    let mut autos = vec![id.clone(), qid.clone()];
+    autos.sort();
+
+    // Generation 1: two skills the base does not have.
+    let g1 = dir.path().join("g000001.cmf");
+    let mut ob = OverlayBuilder::new(&m0, 1).unwrap();
+    ob.set_created_unix(0);
+    let sealed = ob.add_skill(auto.clone()).unwrap();
+    assert!(sealed.is_auto());
+    assert_eq!(sealed.representation_id, m0.representation_id());
+    assert_eq!(
+        (
+            sealed.rows.n_train,
+            sealed.rows.n_calibration,
+            sealed.rows.n_learned
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(sealed.rows_learned.as_ref().unwrap().n, 27);
+    assert!(sealed.tasks[1].mean_sha256.is_some() && sealed.tasks[0].mean_sha256.is_none());
+    ob.add_skill(quiet.clone()).unwrap();
+    ob.push_event(
+        &id,
+        "food",
+        "auto_start",
+        json!({"agreement": 0.9}),
+        json!(null),
+    );
+    ob.write(&g1).unwrap();
+    // Determinism: the same builder writes the same bytes.
+    let g1b = dir.path().join("g1-again.cmf");
+    ob.write(&g1b).unwrap();
+    assert_eq!(sha_file(&g1), sha_file(&g1b));
+    // The generation carries everything of the new skills and nothing else.
+    let names: Vec<String> = CmfModel::open(&g1)
+        .unwrap()
+        .tensors
+        .iter()
+        .map(|e| e.name.clone())
+        .collect();
+    let mut want = vec![
+        manifest::OVERLAY_MANIFEST_TENSOR.to_string(),
+        manifest::rows_tensor(&id),
+        manifest::rows_learned_tensor(&id),
+        manifest::rows_tensor(&qid),
+    ];
+    for i in 1..3 {
+        want.push(manifest::task_mean_tensor(&id, i));
+        want.push(manifest::task_basis_tensor(&id, i));
+    }
+    for n in &want {
+        assert!(names.contains(n), "{n} missing from g1: {names:?}");
+    }
+    assert_eq!(names.len(), want.len(), "{names:?}");
+
+    // Load: appended after the base's skills, overlay-born, served from the overlay.
+    let m1 = DecisionModel::open_with_overlay(&base, Some(&g1), Verify::Full).unwrap();
+    assert_eq!(m1.generation(), 1);
+    let ids: Vec<&str> = m1.skills().iter().map(|s| s.id()).collect();
+    assert_eq!(ids, ["alpha", "beta-2", &autos[0], &autos[1]]);
+    let s = m1.skill(&id).unwrap();
+    assert!(s.from_overlay && s.manifest.is_auto() && m1.overlay_born(&id));
+    assert!(m1.overlay_born(&qid) && !m1.overlay_born("alpha"));
+    assert_eq!(s.manifest, sealed);
+    let empty = m1.rows(&id).unwrap();
+    assert_eq!(
+        (empty.dim_p, empty.dim_h, empty.rows.len()),
+        (TOY_HIDDEN, DIM_H, 0)
+    );
+    assert_eq!(m1.rows_learned(&id).unwrap().unwrap(), learned);
+    assert_eq!(m1.rows(&qid).unwrap().rows.len(), 0);
+    assert_eq!(m1.rows_learned(&qid).unwrap(), None);
+    assert!(m1.topology(&id, 0).unwrap().is_none());
+    let t1 = m1.topology(&id, 1).unwrap().unwrap();
+    assert_eq!(
+        bits(&t1.mean),
+        bits(&auto.topologies[1].as_ref().unwrap().mean)
+    );
+    assert_eq!(
+        bits(&t1.basis),
+        bits(&auto.topologies[1].as_ref().unwrap().basis)
+    );
+    // `verify --state`: the overlay-born skills are checked too.
+    let v = m1.verify_full().unwrap();
+    assert_eq!((v.generation, v.skills), (1, 4));
+    // Every other skill is byte-identical and still the base's.
+    for other in ["alpha", "beta-2"] {
+        let (a, b) = (m1.skill(other).unwrap(), m0.skill(other).unwrap());
+        assert_eq!(a.bytes, b.bytes);
+        assert!(!a.from_overlay);
+    }
+    // Isolation: a skill may appear only as the changed skill of the attempt.
+    assert_eq!(
+        isolation_violations(&m0, &m1, &id, 0),
+        vec![format!("skill '{qid}' appeared")]
+    );
+    assert_eq!(isolation_violations(&m0, &m1, "alpha", 0).len(), 2);
+    // Served: a scorer over the active labels; an empty scorer (no active
+    // label, invisible to the matcher) for the one that has none.
+    let sc = SkillScorer::from_model(&m1, &id).unwrap();
+    assert_eq!(sc.labels(), ["food", "travel"]);
+    let sq = SkillScorer::from_model(&m1, &qid).unwrap();
+    assert!(sq.is_empty() && sq.labels().is_empty());
+
+    // Generation 2 from base + g1: the auto-skill refitted as a whole (task 1
+    // new values, `cruise` activated, rows replaced) and alpha's task 0; g1's
+    // skills are carried (the quiet one byte for byte).
+    let g2 = dir.path().join("g000002.cmf");
+    let mut ob = OverlayBuilder::new(&m1, 2).unwrap();
+    ob.set_created_unix(0);
+    assert_eq!(
+        ob.manifest()
+            .unwrap()
+            .skills
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        autos
+    );
+    let mut rng = Rng(505);
+    let mut man2 = sealed.clone();
+    man2.taxonomy_version += 1;
+    man2.tasks[0].state = TaskState::Active;
+    man2.tasks[0].k = 1;
+    man2.tasks[0].n_train = 10;
+    man2.tasks[0].err_mean = 0.3;
+    man2.tasks[0].err_std = 0.06;
+    man2.tasks[1].err_mean += 0.1;
+    let topo0 = Topology {
+        mean: rng.vec(SIGNAL),
+        basis: rng.vec(SIGNAL),
+    };
+    let topo1 = Topology {
+        mean: rng.vec(SIGNAL),
+        basis: rng.vec(SIGNAL),
+    };
+    let mut lw = RowsWriter::new(TOY_HIDDEN, DIM_H).unwrap();
+    for t in 0..3u32 {
+        for _ in 0..10 {
+            lw.push(&random_row(
+                &mut rng,
+                t,
+                Split::Learned,
+                0,
+                Source::Oracle,
+                9,
+            ))
+            .unwrap();
+        }
+    }
+    let learned2 = lw.finish();
+    ob.set_skill(
+        man2,
+        BTreeMap::from([(0, Some(topo0.clone())), (1, Some(topo1.clone()))]),
+        LearnedRows::Replace(learned2.clone()),
+    )
+    .unwrap();
+    let (mana, topoa) = refit(&m1.skill("alpha").unwrap().manifest, 0, 606);
+    ob.set_skill(mana, topoa, LearnedRows::Keep).unwrap();
+    ob.push_event(&id, "cruise", "auto_refit", json!(null), json!(null));
+    ob.write(&g2).unwrap();
+    let m2 = DecisionModel::open_with_overlay(&base, Some(&g2), Verify::Full).unwrap();
+    assert_eq!(m2.verify_full().unwrap().skills, 4);
+    assert!(m2.overlay_born(&id) && m2.overlay_born(&qid));
+    assert_eq!(
+        bits(&m2.topology(&id, 0).unwrap().unwrap().mean),
+        bits(&topo0.mean)
+    );
+    assert_eq!(
+        bits(&m2.topology(&id, 1).unwrap().unwrap().basis),
+        bits(&topo1.basis)
+    );
+    assert_eq!(
+        m2.topology(&id, 2).unwrap().unwrap(),
+        m1.topology(&id, 2).unwrap().unwrap()
+    );
+    assert_eq!(m2.rows(&id).unwrap().rows.len(), 0);
+    assert_eq!(
+        m2.rows_learned(&id).unwrap().unwrap(),
+        Rows::decode(&learned2).unwrap()
+    );
+    assert_eq!(m2.skill(&qid).unwrap().bytes, m1.skill(&qid).unwrap().bytes);
+    assert_eq!(m2.rows_learned(&qid).unwrap(), None);
+    // Isolation: an auto-skill may change every task in one attempt; alpha's
+    // refit is then the only violation. With alpha as the changed skill the
+    // auto-skill's two changed tasks are reported.
+    assert_eq!(
+        isolation_violations(&m1, &m2, &id, 0),
+        vec!["skill 'alpha' task 0 changed".to_string()]
+    );
+    let viol = isolation_violations(&m1, &m2, "alpha", 0);
+    assert_eq!(viol.len(), 2, "{viol:?}");
+    assert!(viol.contains(&format!("skill '{id}' task 0 changed")));
+    assert!(viol.contains(&format!("skill '{id}' task 1 changed")));
+
+    // Materialise base + g2: the auto-skills become ordinary skills of the file.
+    let full = dir.path().join("materialized.cmf");
+    materialize(&m2, &full).unwrap();
+    let mm = DecisionModel::open(&full, Verify::Full).unwrap();
+    assert_eq!((mm.generation(), mm.skills().len()), (2, 4));
+    let s = mm.skill(&id).unwrap();
+    assert!(!s.from_overlay && !mm.overlay_born(&id) && s.manifest.is_auto());
+    for s in m2.skills() {
+        let t = mm.skill(s.id()).unwrap();
+        assert_eq!(t.bytes, s.bytes);
+        for i in 0..s.manifest.tasks.len() {
+            assert_eq!(
+                mm.topology(s.id(), i).unwrap(),
+                m2.topology(s.id(), i).unwrap()
+            );
+        }
+        assert_eq!(mm.rows(s.id()).unwrap(), m2.rows(s.id()).unwrap());
+        assert_eq!(
+            mm.rows_learned(s.id()).unwrap(),
+            m2.rows_learned(s.id()).unwrap()
+        );
+    }
+    // The base's tensors byte for byte, except alpha's refitted task 0 (and
+    // the manifests that record it).
+    let c0 = CmfModel::open(&base).unwrap();
+    let cm = CmfModel::open(&full).unwrap();
+    let skip = [
+        manifest::MANIFEST_TENSOR.to_string(),
+        manifest::skill_manifest_tensor("alpha"),
+        manifest::task_mean_tensor("alpha", 0),
+        manifest::task_basis_tensor("alpha", 0),
+    ];
+    for e in c0.tensors.iter().filter(|e| !skip.contains(&e.name)) {
+        assert_eq!(
+            cm.tensor_bytes(&e.name).unwrap(),
+            c0.entry_bytes(e),
+            "{}",
+            e.name
+        );
+    }
+    // A generation on the materialised file refits the auto-skill like any
+    // base skill (its empty build blob stays the base's); the id is taken.
+    let g3 = dir.path().join("g000003.cmf");
+    let mut ob = OverlayBuilder::new(&mm, 3).unwrap();
+    ob.set_created_unix(0);
+    assert!(ob.manifest().unwrap().skills.is_empty());
+    let err = ob.add_skill(auto.clone()).unwrap_err();
+    assert!(err.to_string().contains("set_skill"), "{err}");
+    let (man3, topo3) = refit(&mm.skill(&id).unwrap().manifest, 1, 707);
+    ob.set_skill(man3, topo3, LearnedRows::Keep).unwrap();
+    ob.write(&g3).unwrap();
+    let m3 = DecisionModel::open_with_overlay(&full, Some(&g3), Verify::Full).unwrap();
+    assert!(m3.skill(&id).unwrap().from_overlay && !m3.overlay_born(&id));
+    assert_eq!(m3.rows(&id).unwrap().rows.len(), 0);
+    assert_eq!(
+        m3.rows_learned(&id).unwrap().unwrap(),
+        Rows::decode(&learned2).unwrap()
+    );
+    assert_eq!(m3.verify_full().unwrap().skills, 4);
+    assert!(isolation_violations(&mm, &m3, &id, 1).is_empty());
+
+    // Rollback: the base alone has no auto-skill; base + g1 serves g1's.
+    let again0 = DecisionModel::open(&base, Verify::Light).unwrap();
+    assert!(again0.skill(&id).is_none() && again0.skills().len() == 2);
+    let again1 = DecisionModel::open_with_overlay(&base, Some(&g1), Verify::Light).unwrap();
+    assert!(again1.topology(&id, 0).unwrap().is_none());
+    assert_eq!(again1.rows_learned(&id).unwrap().unwrap(), learned);
+}
+
+#[test]
+fn overlay_born_skill_refusals() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = toy_file(dir.path());
+    let m0 = DecisionModel::open(&base, Verify::Full).unwrap();
+    let (auto, _) = toy_auto(404);
+    let id = auto.manifest.id.clone();
+
+    // Only an auto-skill can be born in a generation.
+    let gamma = toy_skill("gamma", &["a", "b"], 1, false, 33).skill;
+    let err = OverlayBuilder::new(&m0, 1)
+        .unwrap()
+        .add_skill(gamma)
+        .unwrap_err();
+    assert!(err.to_string().contains("only an auto-skill"), "{err}");
+    // The prefix is reserved: a skill with build rows never gets it — not in a
+    // generation, not in a full file, not from the offline builder, and
+    // `validate` itself refuses the manifest.
+    let fake = toy_skill("auto-user", &["a", "b"], 1, false, 34).skill;
+    let err = OverlayBuilder::new(&m0, 1)
+        .unwrap()
+        .add_skill(fake.clone())
+        .unwrap_err();
+    assert!(err.to_string().contains("only an auto-skill"), "{err}");
+    let err = toy_builder(7).add_skill(fake.clone()).unwrap_err();
+    assert!(err.to_string().contains("reserved"), "{err}");
+    let err = fake
+        .manifest
+        .validate(m0.representation_id(), SIGNAL)
+        .unwrap_err();
+    assert!(err.to_string().contains("reserved"), "{err}");
+    let opts = TrainOptions::new("auto-user", vec![dir.path().join("none.jsonl")]);
+    let err = build::add_skill(&base, &opts, &dir.path().join("out.cmf")).unwrap_err();
+    assert!(err.to_string().contains("reserved"), "{err}");
+    // An auto-skill keeps every row in `rows.learned`: a build blob with rows
+    // is refused.
+    let mut bad = auto.clone();
+    bad.rows = bad.rows_learned.clone().unwrap();
+    let err = OverlayBuilder::new(&m0, 1)
+        .unwrap()
+        .add_skill(bad)
+        .unwrap_err();
+    assert!(err.to_string().contains("rows.learned"), "{err}");
+    // Added twice.
+    let mut ob = OverlayBuilder::new(&m0, 1).unwrap();
+    ob.set_created_unix(0);
+    ob.add_skill(auto.clone()).unwrap();
+    let err = ob.add_skill(auto.clone()).unwrap_err();
+    assert!(err.to_string().contains("already added"), "{err}");
+    let g1 = dir.path().join("g1.cmf");
+    ob.write(&g1).unwrap();
+
+    // A new skill must carry every tensor it names: no base to fall back on.
+    for name in [
+        manifest::task_mean_tensor(&id, 1),
+        manifest::task_basis_tensor(&id, 2),
+        manifest::rows_tensor(&id),
+        manifest::rows_learned_tensor(&id),
+    ] {
+        let p = dir
+            .path()
+            .join(format!("g1-without-{}.cmf", name.replace('.', "_")));
+        rewrite(&g1, &p, |_, t| t.retain(|s| s.name != name));
+        let r = DecisionModel::open_with_overlay(&base, Some(&p), Verify::Light).unwrap_err();
+        assert_eq!(r, Refusal::MissingTensor(name.clone()));
+    }
+    // A tampered tensor of the new skill under full verification.
+    let p = dir.path().join("g1-tampered.cmf");
+    let mean1 = manifest::task_mean_tensor(&id, 1);
+    rewrite(&g1, &p, |_, t| spec_mut(t, &mean1).data[4] ^= 0x10);
+    assert!(DecisionModel::open_with_overlay(&base, Some(&p), Verify::Light).is_ok());
+    let r = DecisionModel::open_with_overlay(&base, Some(&p), Verify::Full).unwrap_err();
+    assert!(
+        matches!(&r, Refusal::Sha { name, .. } if *name == mean1),
+        "{r}"
+    );
+    // A skill the base does not have that is not an auto-skill (alpha's
+    // manifest under another id, written by hand): the pre-0.8.6 refusal.
+    let p = dir.path().join("g1-gamma.cmf");
+    rewrite(&g1, &p, |_, t| {
+        let s = spec_mut(t, manifest::OVERLAY_MANIFEST_TENSOR);
+        let mut v: Value = canonical::parse(&s.data).unwrap();
+        let mut g = serde_json::to_value(&m0.skill("alpha").unwrap().manifest).unwrap();
+        g["id"] = json!("gamma");
+        g["rows"]["tensor"] = json!(manifest::rows_tensor("gamma"));
+        v["skills"]["gamma"] = g;
+        s.data = canonical::to_vec(&v);
+        s.shape = vec![s.data.len()];
+    });
+    let r = DecisionModel::open_with_overlay(&base, Some(&p), Verify::Light).unwrap_err();
+    assert!(
+        matches!(&r, Refusal::Overlay(m) if m.contains("not in the base file")),
+        "{r}"
+    );
 }
