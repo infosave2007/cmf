@@ -28,12 +28,13 @@
 //! competes with it for the same memory. Copying straight out of the
 //! mapping is also the fastest hit (~20 GB/s from mapped resident pages;
 //! a buffered `pread` plus a copy measured 7x slower per expert at a 12 GB
-//! budget). So the default hands the arena slices of the mapping, after
-//! `MADV_WILLNEED` over the expert's bytes: on a miss the kernel then
-//! reads the whole expert as one asynchronous request instead of a chain
-//! of 128 KiB read-arounds, one per page fault. The n-gram table gets
-//! random-access advice. The explicit RAM tier, buffered `pread` and
-//! direct I/O stay available for hosts where they measure better.
+//! budget). So the default hands the arena slices of the mapping, and the
+//! n-gram table gets random-access advice. `MADV_WILLNEED` ahead of each
+//! copy (`CMF_QWEN_WILLNEED=1`) turns a miss into one asynchronous request
+//! for the whole expert, but on resident pages its page-cache walk cost
+//! more than it saved there (12 GB budget: 24.8 against 31.4 tok/s), so it
+//! is opt-in. The explicit RAM tier, buffered `pread` and direct I/O stay
+//! available for hosts where they measure better.
 //!
 //! Knobs: `CMF_QWEN_IO` (`mmap` default | `pread` | `direct`),
 //! `CMF_QWEN_RAM_TIER_MB` (unset/`0` off, `auto` = what is free minus a
@@ -836,7 +837,9 @@ impl ExpertStore {
         for (i, p) in loc.parts.iter().enumerate() {
             parts[i] = bytes.get(p.abs as usize..p.abs as usize + p.len)?;
         }
-        will_need(bytes, loc);
+        if willneed_on() {
+            will_need(bytes, loc);
+        }
         let out = f(parts);
         let s = &self.stats;
         s.file_reads.fetch_add(1, Ordering::Relaxed);
@@ -851,7 +854,7 @@ impl ExpertStore {
     /// winners, before the parallel copies start): every miss then joins
     /// one deep I/O queue instead of waiting its turn behind a page fault.
     pub(crate) fn prefetch(&self, layer: usize, experts: &[usize]) {
-        if self.reader.mode() != IoMode::Mmap {
+        if self.reader.mode() != IoMode::Mmap || !willneed_on() {
             return;
         }
         let bytes = self.reader.model.primary_bytes();
@@ -1069,8 +1072,14 @@ fn split<'a>(buf: &'a [u8], r: &Ranges) -> [&'a [u8]; 3] {
     [p(0), p(1), p(2)]
 }
 
+/// `CMF_QWEN_WILLNEED=1`: read-ahead advice before mapped copies.
+fn willneed_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_QWEN_WILLNEED").as_deref() == Ok("1"))
+}
+
 /// `MADV_WILLNEED` over an expert's three ranges of the mapping (unix;
-/// advisory, cheap when the pages are resident).
+/// advisory; walks the page cache even when the pages are resident).
 fn will_need(bytes: &[u8], loc: &ExpertLoc) {
     #[cfg(unix)]
     {
