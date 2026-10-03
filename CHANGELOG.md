@@ -52,9 +52,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/v1/systemone`: an oracle or cache choice answer carries the one-hot
   distribution (`probabilities` over every option, the chosen one 1;
   `confidence: 1`) — Jev's schema requires one, and the Decision Index
-  validator rejected every such answer; `/v1/decisions` keeps `{type,
-  choice}`. The model name `default` (the kit's `http` engine default) is
+  validator rejected every such answer (with the oracle probabilities below
+  both surfaces carry the oracle's distribution). The model name `default` (the kit's `http` engine default) is
   accepted there like the Jev aliases (API.md §3a).
+- Lead-in line: a state-less question whose instructions' first line ends
+  with `:` and continue with text is read by the local model as that text
+  alone (`"Classify the banking intent of this user request:\n<text>"` →
+  `<text>`); the oracle still gets the instructions verbatim, contract keys
+  and cache scopes are unchanged. On the published model the Decision Index
+  BANKING77 rows go from macro-F1 0.854 to 0.933 (API.md §3.1).
+- Matching by descriptions: a choice question whose option ids match no
+  skill reaches a data skill when every description normalizes (trimmed,
+  lowercase, `_`/`-`/whitespace runs as one space) to a distinct label of
+  exactly one data skill — positional ids `option_N` with the label names as
+  descriptions. Exact or subset as with ids, answered in the question's ids,
+  `cmf.questions.<id>.by: "descriptions"`. One none option ("out of scope…",
+  "none of…") makes the question decided over every label and answers a
+  gate rejection locally with it (`decision_path: router:none_option`, never
+  escalated, p = 1 − p_top): CLINC150+OOS macro-F1 0.929 on the published
+  model with no threshold tuned. Oracle answers and feedback of such a
+  question teach the option's label; auto-skills are never matched this way,
+  and in a state-less request a data skill's descriptions outrank an
+  auto-skill's contract (API.md §3.2, ORACLE.md).
+- Oracle probabilities (`oracle.probabilities`, on): the oracle answers each
+  question with a distribution (the ≤ 5 most likely choice ids, one value
+  per score level, p(true) for a noul), normalized by the server (listed
+  mass kept, renormalized above 1, the rest spread over the unlisted; the
+  verdict is the argmax, a tie to the stated one). Oracle and cache answers
+  carry `probabilities` and `confidence` = p(choice) on every endpoint; the
+  cache and `learn.log` keep the distribution (`CachePutP`), and 0.8.7 cache
+  records replay one-hot. `oracle.probability_tokens_per_question` (128,
+  measured 57–87 for five ids) is added to `max_tokens` per question
+  (API.md §3.3, §6; ORACLE.md "Probabilities").
+- Oracle reasoning: `oracle.reasoning` (`off` | `low` | `medium` | `high`)
+  sends OpenRouter `reasoning: {effort, exclude: true}`, adds
+  `oracle.reasoning_max_tokens` (4096) to each call's `max_tokens` and
+  reservation and `oracle.reasoning_deadline_s` (60) to its deadline; the
+  reasoning tokens (billed in `usage.cost`) are shown in the ledger and in
+  `cmf.usage.oracle.reasoning_tokens` (ORACLE.md "Reasoning").
 
 ### Changed
 - Oracle egress redaction (`oracle.redact_pii`, unless `cmf.allow_pii_egress`)
@@ -71,6 +106,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `learn.log` rebuilds the index.
 - `GET /v1/models` lists `hugging_face_id: "infosave/cmf-decision"`, the
   published repository (the old `infosave/cortiq-decision` redirects to it).
+- Oracle and cache answers on `/v1/decisions` add `probabilities` and
+  `confidence` (choice, score) and `probability` (noul, next to the
+  unchanged verdict) — an additive change; a verdict without a distribution
+  is one-hot. `usage.output_tokens` counts their `probabilities` like a local
+  answer's (it counted 1). On `/v1/systemone` a noul answer is p(true).
+  The oracle request body asks for the distribution (`oracle.probabilities:
+  false` sends the 0.8.7 body, byte for byte the v4 driver's).
 - `/v1/decisions` no longer refuses an empty `state` (`""`, `{}`, `[]`) or a
   `null` one with 400: it is a state-less request. Requests with a non-empty
   state are read exactly as in 0.8.6 and 0.8.7.
@@ -78,7 +120,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Compatibility
 - A 0.8.7 (or 0.8.6) binary truncates a 0.8.8 `learn.log` at the first state-less
   contract record and refuses a generation whose auto-skill rubric carries
-  `input`; never run an older binary on a newer state directory.
+  `input`, and stops replaying at the first cache put that carries a
+  distribution (`CachePutP`); never run an older binary on a newer state
+  directory.
 
 ## [0.8.7] - 2026-10-03
 
