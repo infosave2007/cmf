@@ -330,6 +330,7 @@ impl Escalator for Mock {
                 calls: 1,
                 input_tokens: 1234,
                 output_tokens: 5,
+                reasoning_tokens: 0,
                 cost: Usd::from_f64(self.cost).unwrap(),
             }
         } else {

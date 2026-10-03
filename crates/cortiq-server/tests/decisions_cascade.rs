@@ -5067,3 +5067,64 @@ async fn oracle_distributions_reach_every_surface_and_the_cache() {
     assert_eq!(r.body["answers"]["task"], *a);
     assert_eq!(mock.hits(), 2);
 }
+
+// ------------------------------------------------------------------ oracle reasoning (C4)
+
+/// `oracle.reasoning` (DESIGN C4): the request enables OpenRouter's
+/// reasoning with the effort (the text excluded) and raises `max_tokens` by
+/// `reasoning_max_tokens` — the mock inspects the body —, the reservation
+/// follows it, and the reasoning tokens the usage reports reach the ledger
+/// and `cmf.usage.oracle`, the cost being OpenRouter's `usage.cost`.
+#[tokio::test]
+async fn reasoning_effort_is_sent_and_accounted() {
+    let mock = MockOracle::start(|req| {
+        let v = req.json();
+        // Only a reasoning request is answered.
+        if v["reasoning"] != json!({"effort": "high", "exclude": true})
+            || v["max_tokens"] != json!(64 + 128 + 2048)
+        {
+            return raw_reply(400, r#"{"error":{"message":"not the expected body"}}"#);
+        }
+        let content = verdicts(req, |_, o| pick(o, "travel")).to_string();
+        let body = serde_json::to_vec(&json!({
+            "id": "gen-mock", "model": ORACLE_MODEL, "provider": "Mock",
+            "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": content}}],
+            "usage": {"prompt_tokens": 1200, "completion_tokens": 812, "cost": 4.2e-4,
+                      "completion_tokens_details": {"reasoning_tokens": 800}},
+        }))
+        .unwrap();
+        MockReply {
+            status: 200,
+            body,
+            delay: Duration::ZERO,
+        }
+    });
+    let mut cfg = stand_config(&mock.url());
+    cfg.oracle.reasoning = "high".into();
+    cfg.oracle.reasoning_max_tokens = 2048;
+    let srv = Srv::new(&cfg);
+    let r = srv.decide(&topics_body(&rejected()[0])).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.action(), "oracle", "{}", r.text);
+    assert_eq!(r.body["answers"]["task"]["choice"], "travel");
+    let u = &r.body["cmf"]["usage"]["oracle"];
+    assert_eq!(
+        (
+            &u["output_tokens"],
+            &u["reasoning_tokens"],
+            u["cost"].as_f64()
+        ),
+        (&json!(812), &json!(800), Some(4.2e-4)),
+        "{u}"
+    );
+    let ledger = srv.ledger();
+    assert_eq!(ledger[0]["max_tokens"], 64 + 128 + 2048);
+    let reserved = ledger[0]["reserved_usd"].as_f64().unwrap();
+    let body_len = mock.requests()[0].body.len();
+    let expect = cortiq_decision::oracle::reservation_usd(body_len, 64 + 128 + 2048, (0.1, 0.5));
+    assert!((reserved - expect).abs() < 1e-12, "{reserved} {expect}");
+    assert_eq!(ledger[1]["reasoning_tokens"], 800);
+    assert_eq!(ledger[1]["cost_usd"].as_f64(), Some(4.2e-4));
+    let st = srv.admin("GET", "/v1/admin/oracle", None).await;
+    assert_eq!(st.body["reasoning"], "high", "{}", st.text);
+}

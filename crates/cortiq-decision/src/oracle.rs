@@ -33,6 +33,17 @@
 //! content is invalid (`invalid_probability`); the server normalizes them
 //! ([`crate::answer::Verdict::normalize`]).
 //!
+//! **Reasoning** (0.8.8, DESIGN C4, `oracle.reasoning`: `off` by default):
+//! with an effort (`low`, `medium`, `high`) the body's `reasoning` is
+//! `{"effort": E, "exclude": true}` instead of `{"enabled": false}` (the
+//! verdicts are still the final message; the reasoning text is not
+//! returned), `max_tokens` grows by `oracle.reasoning_max_tokens` (one
+//! allowance per call, so the reservation covers it) and the deadline by
+//! `oracle.reasoning_deadline_s`. `usage.cost` already includes the
+//! reasoning tokens; `usage.completion_tokens_details.reasoning_tokens` is
+//! kept as `reasoning_tokens` in the settled ledger line and in
+//! `cmf.usage.oracle`.
+//!
 //! **Call** ([`OracleClient::call`]): POST `{base_url}/chat/completions` with
 //! `Authorization: Bearer <key>`, `Content-Type: application/json` and `X-Title`;
 //! one total deadline (`deadline_s`, the ureq request timeout, which also bounds
@@ -168,7 +179,19 @@ pub fn call_max_tokens(cfg: &OracleConfig, questions: usize) -> u32 {
     if cfg.probabilities {
         t += max_tokens(cfg.probability_tokens_per_question, questions);
     }
+    if cfg.reasoning_effort().is_some() {
+        t = t.saturating_add(cfg.reasoning_max_tokens);
+    }
     t
+}
+
+/// The body's `reasoning` object: disabled, or the configured effort with
+/// the reasoning text excluded from the response (DESIGN C4).
+fn reasoning_value(cfg: &OracleConfig) -> Value {
+    match cfg.reasoning_effort() {
+        None => json!({"enabled": false}),
+        Some(effort) => json!({"effort": effort, "exclude": true}),
+    }
 }
 
 /// The structured-output schema of one question's bare verdict.
@@ -238,7 +261,7 @@ pub fn request_value(cfg: &OracleConfig, questions: &[&Question], state: &Value)
         "model": cfg.model,
         "temperature": 0,
         "max_tokens": call_max_tokens(cfg, questions.len()),
-        "reasoning": {"enabled": false},
+        "reasoning": reasoning_value(cfg),
         "stream": false,
         "provider": cfg.provider_value(),
         "messages": [
@@ -320,6 +343,9 @@ pub struct CallUsage {
     pub output_tokens: u64,
     /// `usage.prompt_tokens_details.cached_tokens`.
     pub cached_tokens: Option<u64>,
+    /// `usage.completion_tokens_details.reasoning_tokens` (counted in
+    /// `output_tokens` and in `cost`, DESIGN C4).
+    pub reasoning_tokens: Option<u64>,
 }
 
 /// A parsed response body.
@@ -359,6 +385,10 @@ fn usage_of(body: &Map<String, Value>) -> Option<CallUsage> {
             .get("prompt_tokens_details")
             .and_then(Value::as_object)
             .and_then(|d| non_negative_int(d.get("cached_tokens"))),
+        reasoning_tokens: u
+            .get("completion_tokens_details")
+            .and_then(Value::as_object)
+            .and_then(|d| non_negative_int(d.get("reasoning_tokens"))),
     })
 }
 
@@ -1358,7 +1388,7 @@ impl OracleClient {
             None => OracleState::default(),
         };
         let agent = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs_f64(cfg.deadline_s))
+            .timeout(Duration::from_secs_f64(cfg.call_deadline_s()))
             .redirects(0)
             .build();
         Ok(Self {
@@ -1747,6 +1777,7 @@ impl OracleClient {
             "input_tokens": usage.map(|u| u.input_tokens),
             "output_tokens": usage.map(|u| u.output_tokens),
             "cached_tokens": usage.and_then(|u| u.cached_tokens),
+            "reasoning_tokens": usage.and_then(|u| u.reasoning_tokens),
             "latency_ms": latency.as_secs_f64() * 1e3, "http_status": http_status, "error": error,
         });
         if let Err(e) = write_line(&mut inner.ledger, &line) {
@@ -1936,6 +1967,8 @@ impl OracleClient {
             "consecutive_errors": inner.state.consecutive_errors,
             "max_errors": self.cfg.max_errors,
             "deadline_s": self.cfg.deadline_s,
+            "probabilities": self.cfg.probabilities,
+            "reasoning": self.cfg.reasoning,
             "redact_pii": self.cfg.redact_pii,
             "max_price": {"prompt": self.max_price.0, "completion": self.max_price.1},
             // The least budget a call needs: the smallest possible call's
@@ -2209,6 +2242,47 @@ mod tests {
             props["n"]["properties"]["p_true"],
             json!({"type": "number"})
         );
+    }
+
+    /// `oracle.reasoning` (DESIGN C4): off is the 0.8.7 `{"enabled": false}`;
+    /// an effort asks for it with the text excluded, adds
+    /// `reasoning_max_tokens` to `max_tokens` (so to the reservation) and
+    /// `reasoning_deadline_s` to the deadline; anything else is refused.
+    #[test]
+    fn reasoning_raises_max_tokens_and_the_deadline() {
+        let c = q("c", QuestionKind::Choice, json!({"a": "A", "b": "B"}));
+        let off = OracleConfig::default();
+        let v = request_value(&off, &[&c], &json!("x"));
+        assert_eq!(v["reasoning"], json!({"enabled": false}));
+        assert_eq!(off.call_deadline_s(), 30.0);
+        let on = OracleConfig {
+            reasoning: "medium".into(),
+            ..OracleConfig::default()
+        };
+        let v = request_value(&on, &[&c], &json!("x"));
+        assert_eq!(v["reasoning"], json!({"effort": "medium", "exclude": true}));
+        assert_eq!(v["max_tokens"], json!(64 + 128 + 4096));
+        assert_eq!(call_max_tokens(&on, 2), 128 + 256 + 4096);
+        assert_eq!(on.call_deadline_s(), 90.0);
+        let mut cfg = crate::config::Config::default();
+        cfg.oracle.reasoning = "extreme".into();
+        assert!(cfg.validate().is_err());
+        cfg.oracle.reasoning = "high".into();
+        cfg.oracle.reasoning_max_tokens = 0;
+        assert!(cfg.validate().is_err());
+        cfg.oracle.reasoning_max_tokens = 8192;
+        cfg.validate().unwrap();
+        // The reasoning tokens of the usage are kept.
+        let body = serde_json::to_vec(&json!({
+            "model": "m", "choices": [{"finish_reason": "stop",
+                "message": {"role": "assistant", "content": r#"{"c":"a"}"#}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 900, "cost": 0.001,
+                      "completion_tokens_details": {"reasoning_tokens": 870}},
+        }))
+        .unwrap();
+        let p = parse_response(&body, &[&c], "m");
+        assert_eq!(p.usage.unwrap().reasoning_tokens, Some(870));
+        assert!(p.verdicts.is_ok());
     }
 
     /// Verdicts with distributions are parsed and normalized; the bare 0.8.7
