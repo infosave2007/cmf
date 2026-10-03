@@ -6130,6 +6130,52 @@ impl Stager {
     }
 }
 
+/// Upload one expert's (gate, up, down) bytes into arena `slot` of the
+/// model's global bank: through the staging ring when there is one with
+/// room, else (part by part) straight through the queue.
+pub(crate) fn upload_expert_parts(
+    st: Option<&Stager>,
+    model: &Arc<CmfModel>,
+    slot: usize,
+    parts: [&[u8]; 3],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let Some(b) = c.dsv4_global_moe.lock().unwrap().get(&model.uid()).cloned() else {
+        return false;
+    };
+    if slot >= b.capacity
+        || parts[0].len() != b.gu_len
+        || parts[1].len() != b.gu_len
+        || parts[2].len() != b.d_len
+    {
+        return false;
+    }
+    let seg = slot / b.segment_slots;
+    let local = slot % b.segment_slots;
+    let dst = [
+        (&b.gate[seg], (local * b.gu_len) as u64),
+        (&b.up[seg], (local * b.gu_len) as u64),
+        (&b.down[seg], (local * b.d_len) as u64),
+    ];
+    for (part, (buf, off)) in parts.iter().zip(dst) {
+        if !st.is_some_and(|s| s.put(buf, off, part)) {
+            c.queue.write_buffer(buf, off, part);
+        }
+    }
+    true
+}
+
+/// Hand the queue's pending `write_buffer` data to the GPU and wait, so
+/// its staging memory is released (a bulk upload would otherwise hold all
+/// of it until the next frame).
+pub(crate) fn flush_writes() {
+    if let Some(c) = ctx() {
+        note_submit(c);
+        c.queue.submit(std::iter::empty());
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+    }
+}
+
 /// Stage one expert's three matrices into arena `slot` of the model's
 /// global bank. False when the ring cannot take it (nothing was staged
 /// that a direct upload would not simply repeat).
