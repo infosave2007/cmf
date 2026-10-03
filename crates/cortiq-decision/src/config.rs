@@ -12,7 +12,8 @@
 //!  "oracle":{"enabled":false,"default_per_request":true,"base_url":"https://openrouter.ai/api/v1","api_key_env":"OPENROUTER_API_KEY",
 //!   "model":"deepseek/deepseek-v4.1-flash","provider":{"sort":"price","require_parameters":true,"allow_fallbacks":true,"max_price":{"prompt":0.1,"completion":0.5}},
 //!   "max_tokens_per_question":64,"deadline_s":30,"budget_usd":1.0,"max_calls":10000,"max_errors":30,"redact_pii":true,"title":"cortiq-decision","data_collection":null,
-//!   "probabilities":true,"probability_tokens_per_question":128},
+//!   "probabilities":true,"probability_tokens_per_question":128,"reasoning":"off","reasoning_max_tokens":4096,
+//!   "reasoning_deadline_s":60},
 //!  "cache":{"enabled":true,"threshold":0.97,"cap":50000},
 //!  "learning":{"enabled":true,"refit_min_new":25,"dedup":0.995,"cold_start":true,"synchronous":false,
 //!   "auto_skills":true,"auto_min_rows":10,"auto_k":8,"auto_tau":0.9,"auto_min_agreement":0.8,
@@ -67,6 +68,10 @@ pub const MAX_ORACLE_TOKENS: u32 = 4096;
 /// `option_N`, BANKING77 label ids of 25–48 bytes), a 10-level score 39, a
 /// noul 10 — 128 leaves room for a provider's wider tokenizer.
 pub const DEFAULT_PROBABILITY_TOKENS: u32 = 128;
+/// `oracle.reasoning` values (DESIGN C4): `off`, or an OpenRouter effort.
+pub const REASONING_EFFORTS: [&str; 4] = ["off", "low", "medium", "high"];
+/// The largest `oracle.reasoning_max_tokens`.
+pub const MAX_REASONING_TOKENS: u32 = 65_536;
 /// The only rounding `response.round` / `cmf.round` accept (hundredths, spec §4.7).
 pub const ROUND_HUNDREDTHS: u8 = 2;
 
@@ -288,6 +293,16 @@ pub struct OracleConfig {
     /// Tokens per question added to `max_tokens` for the distribution when
     /// `probabilities` is on (`min(·q, 4096)`).
     pub probability_tokens_per_question: u32,
+    /// The oracle's reasoning effort (0.8.8, DESIGN C4): `off` (the request
+    /// disables reasoning, as before), `low`, `medium` or `high` (OpenRouter
+    /// `reasoning: {effort, exclude: true}`; the verdicts stay the final
+    /// message). An accuracy / latency / cost trade.
+    pub reasoning: String,
+    /// Tokens added to a call's `max_tokens` for the reasoning when it is on
+    /// (one allowance per call; reserved, so the budget accounts for it).
+    pub reasoning_max_tokens: u32,
+    /// Seconds added to `deadline_s` when the reasoning is on.
+    pub reasoning_deadline_s: f64,
 }
 
 impl Default for OracleConfig {
@@ -318,6 +333,9 @@ impl Default for OracleConfig {
             data_collection: None,
             probabilities: true,
             probability_tokens_per_question: DEFAULT_PROBABILITY_TOKENS,
+            reasoning: "off".into(),
+            reasoning_max_tokens: 4096,
+            reasoning_deadline_s: 60.0,
         }
     }
 }
@@ -343,6 +361,22 @@ impl OracleConfig {
             Ok(v)
         };
         Ok((get("prompt")?, get("completion")?))
+    }
+
+    /// The reasoning effort of a call, `None` when `reasoning` is `off`
+    /// (DESIGN C4).
+    pub fn reasoning_effort(&self) -> Option<&str> {
+        (self.reasoning != "off").then_some(self.reasoning.as_str())
+    }
+
+    /// The deadline of one call: `deadline_s`, plus `reasoning_deadline_s`
+    /// when the reasoning is on.
+    pub fn call_deadline_s(&self) -> f64 {
+        if self.reasoning_effort().is_some() {
+            self.deadline_s + self.reasoning_deadline_s
+        } else {
+            self.deadline_s
+        }
     }
 
     /// The `provider` object of a request body: the preferences plus
@@ -898,6 +932,20 @@ impl Config {
         ensure!(
             o.deadline_s.is_finite() && o.deadline_s > 0.0,
             "oracle.deadline_s must be positive"
+        );
+        ensure!(
+            REASONING_EFFORTS.contains(&o.reasoning.as_str()),
+            "oracle.reasoning must be one of {}, got '{}'",
+            REASONING_EFFORTS.join(", "),
+            o.reasoning
+        );
+        ensure!(
+            (1..=MAX_REASONING_TOKENS).contains(&o.reasoning_max_tokens),
+            "oracle.reasoning_max_tokens must be in 1..={MAX_REASONING_TOKENS}"
+        );
+        ensure!(
+            o.reasoning_deadline_s.is_finite() && o.reasoning_deadline_s >= 0.0,
+            "oracle.reasoning_deadline_s must be finite and non-negative"
         );
         ensure!(
             o.budget_usd.is_finite() && o.budget_usd >= 0.0,

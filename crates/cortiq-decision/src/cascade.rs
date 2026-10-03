@@ -1232,6 +1232,7 @@ impl Escalator for Cascade {
                         calls: 1,
                         input_tokens: a.usage.input_tokens,
                         output_tokens: a.usage.output_tokens,
+                        reasoning_tokens: a.usage.reasoning_tokens.unwrap_or(0),
                         cost: Usd::from_f64(a.usage.cost).unwrap_or_else(|_| {
                             tracing::error!("oracle cost not representable");
                             Usd::from_units(0).expect("zero")
@@ -1347,7 +1348,7 @@ impl Escalator for Cascade {
         drop(guard);
 
         // Followers wait for their leader.
-        let wait = Duration::from_secs_f64(cfg.oracle.deadline_s) + FOLLOWER_GRACE;
+        let wait = Duration::from_secs_f64(cfg.oracle.call_deadline_s()) + FOLLOWER_GRACE;
         for (i, slot) in followers {
             let r = match slot.wait(wait) {
                 Some(Resolution::Oracle(a)) => Resolution::Cache(a),

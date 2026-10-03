@@ -823,7 +823,10 @@ impl Resolved {
 pub struct OracleUsage {
     pub calls: u64,
     pub input_tokens: u64,
+    /// Completion tokens, the reasoning's included.
     pub output_tokens: u64,
+    /// The reasoning's share of `output_tokens` (DESIGN C4; 0 without it).
+    pub reasoning_tokens: u64,
     /// Σ `usage.cost` of the successful calls.
     pub cost: Usd,
 }
@@ -2047,6 +2050,7 @@ impl DecisionService {
                         "calls": metered.oracle.calls,
                         "input_tokens": metered.oracle.input_tokens,
                         "output_tokens": metered.oracle.output_tokens,
+                        "reasoning_tokens": metered.oracle.reasoning_tokens,
                         "cost": metered.oracle.cost.to_f64(),
                         "billed": c.oracle_billed.to_f64(),
                         "passthrough": self.rates.oracle_passthrough,
