@@ -1793,7 +1793,7 @@ pub fn learn_offline(
                     match cl.call_body(&caller, &[&question], &body) {
                         CallOutcome::Answered(a) => {
                             live += 1;
-                            match a.verdicts.first() {
+                            match a.verdicts.first().map(|v| &v.answer) {
                                 Some(crate::answer::OracleAnswer::Choice(c)) => Some(c.clone()),
                                 _ => None,
                             }

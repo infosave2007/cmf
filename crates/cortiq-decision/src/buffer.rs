@@ -30,7 +30,8 @@
 //! restores the cache, the buffer, the counters and the contract registry.
 //! A record of a kind this binary does not know ends the replay the same way
 //! (a 0.8.5 binary on a 0.8.6 state directory truncates the log at its first
-//! contract record — never run an older binary on it).
+//! contract record, a 0.8.7 binary on a 0.8.8 one at its first cache put
+//! with a distribution — never run an older binary on it).
 
 use crate::cache::CacheEntry;
 use crate::canonical;
@@ -56,6 +57,10 @@ const KIND_ATTEMPT: u8 = 3;
 const KIND_ROLLBACK: u8 = 4;
 /// 0.8.6: the contract of an auto-skill (a 0.8.5 binary stops replaying here).
 const KIND_CONTRACT: u8 = 5;
+/// 0.8.8: a cache put whose verdict carries the oracle's distribution
+/// (DESIGN C3; a 0.8.7 binary stops replaying here). A one-hot verdict is
+/// still written as [`KIND_CACHE_PUT`], which replays as one-hot.
+const KIND_CACHE_PUT_P: u8 = 6;
 
 // ------------------------------------------------------------------ codec
 
@@ -482,9 +487,13 @@ impl LogRecord {
     fn encode(&self) -> (u8, Vec<u8>) {
         let mut e = Enc::default();
         let kind = match self {
-            LogRecord::CachePut(c) => {
+            LogRecord::CachePut(c) if c.answer.is_one_hot() => {
                 c.encode(&mut e);
                 KIND_CACHE_PUT
+            }
+            LogRecord::CachePut(c) => {
+                c.encode_with_probabilities(&mut e);
+                KIND_CACHE_PUT_P
             }
             LogRecord::Example(x) => {
                 x.encode(&mut e);
@@ -513,6 +522,7 @@ impl LogRecord {
         let mut d = Dec::new(payload);
         let r = match kind {
             KIND_CACHE_PUT => LogRecord::CachePut(CacheEntry::decode(&mut d)?),
+            KIND_CACHE_PUT_P => LogRecord::CachePut(CacheEntry::decode_with_probabilities(&mut d)?),
             KIND_EXAMPLE => LogRecord::Example(Example::decode(&mut d)?),
             KIND_ATTEMPT => LogRecord::Attempt(AttemptRecord {
                 skill: d.str()?,
@@ -816,7 +826,7 @@ impl LearningBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::answer::OracleAnswer;
+    use crate::answer::{OracleAnswer, Verdict};
 
     fn ex(label: &str, v: [f32; 3]) -> Example {
         Example {
@@ -859,8 +869,17 @@ mod tests {
             LogRecord::CachePut(CacheEntry {
                 scope: "skill:s:x".into(),
                 phi_p: vec![1.0, 0.0],
-                answer: OracleAnswer::Score(3),
+                answer: OracleAnswer::Score(3).into(),
                 ts: 9,
+            }),
+            LogRecord::CachePut(CacheEntry {
+                scope: "contract:c".into(),
+                phi_p: vec![0.0, 1.0],
+                answer: Verdict {
+                    answer: OracleAnswer::Choice("b".into()),
+                    probabilities: vec![("a".into(), 0.25), ("b".into(), 0.75)],
+                },
+                ts: 10,
             }),
             LogRecord::Attempt(AttemptRecord {
                 skill: "s".into(),
@@ -894,7 +913,45 @@ mod tests {
         bytes[good - 3] ^= 0xff;
         std::fs::write(&p, &bytes).unwrap();
         let (_, rep) = LearnLog::open(&p).unwrap();
-        assert_eq!(rep.records.len(), 3);
+        assert_eq!(rep.records.len(), 4);
+    }
+
+    /// A cache put keeps the 0.8.7 record (kind 1) for a one-hot verdict and
+    /// replays it as one-hot; a distribution goes into a `CachePutP` record
+    /// (kind 6) and comes back whole (DESIGN C3).
+    #[test]
+    fn cache_puts_with_and_without_a_distribution() {
+        let entry = |answer: Verdict| CacheEntry {
+            scope: "contract:c".into(),
+            phi_p: vec![0.6, 0.8],
+            answer,
+            ts: 7,
+        };
+        let one_hot = LogRecord::CachePut(entry(OracleAnswer::Choice("x".into()).into()));
+        let f = one_hot.frame();
+        assert_eq!(f[8], KIND_CACHE_PUT);
+        // The 0.8.7 payload, byte for byte: scope, type 0, the id, ts, φ_P.
+        let mut old = Enc::default();
+        old.str("contract:c")
+            .u8(0)
+            .str("x")
+            .u64(7)
+            .f32s(&[0.6, 0.8]);
+        assert_eq!(&f[9..f.len() - 4], old.0.as_slice());
+        let (recs, n) = read_records(&f);
+        assert_eq!((recs, n), (vec![one_hot.clone()], f.len()));
+        let LogRecord::CachePut(c) = &read_records(&f).0[0] else {
+            unreachable!()
+        };
+        assert!(c.answer.is_one_hot());
+        assert_eq!(c.answer.probability("x"), 1.0);
+        let dist = LogRecord::CachePut(entry(Verdict {
+            answer: OracleAnswer::Noul(true),
+            probabilities: vec![("true".into(), 0.875)],
+        }));
+        let f = dist.frame();
+        assert_eq!(f[8], KIND_CACHE_PUT_P);
+        assert_eq!(read_records(&f).0, vec![dist]);
     }
 
     fn object(v: Value) -> Map<String, Value> {

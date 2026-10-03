@@ -1319,6 +1319,8 @@ pub fn test_call(oracle: &crate::config::OracleConfig, key: KeyLookup) -> Result
     let mut cfg = oracle.clone();
     cfg.enabled = true;
     cfg.max_tokens_per_question = TEST_CALL_MAX_TOKENS;
+    // The bare verdict: the tiniest call that proves the structured output.
+    cfg.probabilities = false;
     cfg.budget_usd = TEST_CALL_BUDGET_USD;
     cfg.max_calls = 1;
     cfg.max_errors = 1;
@@ -1356,7 +1358,7 @@ pub fn test_call(oracle: &crate::config::OracleConfig, key: KeyLookup) -> Result
     let body = crate::oracle::request_body(&cfg, &[&q], &json!(TEST_CALL_STATE));
     let reserved_usd = reservation_usd(
         body.len(),
-        max_tokens(cfg.max_tokens_per_question, 1),
+        crate::oracle::call_max_tokens(&cfg, 1),
         cfg.max_price()?,
     );
     let (outcome, stop) = outcome?;

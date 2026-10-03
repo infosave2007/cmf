@@ -11,7 +11,8 @@
 //!  "response":{"round":null},
 //!  "oracle":{"enabled":false,"default_per_request":true,"base_url":"https://openrouter.ai/api/v1","api_key_env":"OPENROUTER_API_KEY",
 //!   "model":"deepseek/deepseek-v4.1-flash","provider":{"sort":"price","require_parameters":true,"allow_fallbacks":true,"max_price":{"prompt":0.1,"completion":0.5}},
-//!   "max_tokens_per_question":64,"deadline_s":30,"budget_usd":1.0,"max_calls":10000,"max_errors":30,"redact_pii":true,"title":"cortiq-decision","data_collection":null},
+//!   "max_tokens_per_question":64,"deadline_s":30,"budget_usd":1.0,"max_calls":10000,"max_errors":30,"redact_pii":true,"title":"cortiq-decision","data_collection":null,
+//!   "probabilities":true,"probability_tokens_per_question":128},
 //!  "cache":{"enabled":true,"threshold":0.97,"cap":50000},
 //!  "learning":{"enabled":true,"refit_min_new":25,"dedup":0.995,"cold_start":true,"synchronous":false,
 //!   "auto_skills":true,"auto_min_rows":10,"auto_k":8,"auto_tau":0.9,"auto_min_agreement":0.8,
@@ -57,8 +58,15 @@ pub const DEFAULT_ORACLE_BASE_URL: &str = "https://openrouter.ai/api/v1";
 pub const DEFAULT_ORACLE_KEY_ENV: &str = "OPENROUTER_API_KEY";
 /// Default oracle model.
 pub const DEFAULT_ORACLE_MODEL: &str = "deepseek/deepseek-v4.1-flash";
-/// The largest `max_tokens` of one oracle call (spec §5.3: `64·q (≤4096)`).
+/// The largest `max_tokens` of one oracle call (spec §5.3: `64·q (≤4096)`);
+/// the probabilities' allowance (DESIGN C3) is bounded alike, apart.
 pub const MAX_ORACLE_TOKENS: u32 = 4096;
+/// Default `oracle.probability_tokens_per_question` (DESIGN C3): measured
+/// with the o200k tokenizer, a choice verdict with 5 listed probabilities
+/// costs 57–87 tokens more than the bare verdict (letters, the kit's
+/// `option_N`, BANKING77 label ids of 25–48 bytes), a 10-level score 39, a
+/// noul 10 — 128 leaves room for a provider's wider tokenizer.
+pub const DEFAULT_PROBABILITY_TOKENS: u32 = 128;
 /// The only rounding `response.round` / `cmf.round` accept (hundredths, spec §4.7).
 pub const ROUND_HUNDREDTHS: u8 = 2;
 
@@ -272,6 +280,14 @@ pub struct OracleConfig {
     pub redact_pii: bool,
     pub title: String,
     pub data_collection: Option<String>,
+    /// Ask for a distribution with every verdict (0.8.8, DESIGN C3): choice
+    /// the ≤ 5 most likely option ids with their probabilities, score one
+    /// per level, noul p(true). `false` sends the 0.8.7 body (the v4
+    /// driver's) and answers one-hot.
+    pub probabilities: bool,
+    /// Tokens per question added to `max_tokens` for the distribution when
+    /// `probabilities` is on (`min(·q, 4096)`).
+    pub probability_tokens_per_question: u32,
 }
 
 impl Default for OracleConfig {
@@ -300,6 +316,8 @@ impl Default for OracleConfig {
             redact_pii: true,
             title: "cortiq-decision".into(),
             data_collection: None,
+            probabilities: true,
+            probability_tokens_per_question: DEFAULT_PROBABILITY_TOKENS,
         }
     }
 }
@@ -872,6 +890,10 @@ impl Config {
         ensure!(
             (1..=MAX_ORACLE_TOKENS).contains(&o.max_tokens_per_question),
             "oracle.max_tokens_per_question must be in 1..={MAX_ORACLE_TOKENS}"
+        );
+        ensure!(
+            (1..=MAX_ORACLE_TOKENS).contains(&o.probability_tokens_per_question),
+            "oracle.probability_tokens_per_question must be in 1..={MAX_ORACLE_TOKENS}"
         );
         ensure!(
             o.deadline_s.is_finite() && o.deadline_s > 0.0,

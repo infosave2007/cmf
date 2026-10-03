@@ -315,11 +315,13 @@ impl Escalator for Mock {
             .iter()
             .map(|p| {
                 Resolved::new(match mode {
-                    Mode::Answer => Resolution::Oracle(verdict(p.question)),
-                    Mode::Cache => Resolution::Cache(verdict(p.question)),
+                    Mode::Answer => Resolution::Oracle(verdict(p.question).into()),
+                    Mode::Cache => Resolution::Cache(verdict(p.question).into()),
                     Mode::Refuse(r) => Resolution::Refused(r),
                     Mode::Fail => Resolution::Failed("mock failure".into()),
-                    Mode::WrongOption => Resolution::Oracle(OracleAnswer::Choice("nope".into())),
+                    Mode::WrongOption => {
+                        Resolution::Oracle(OracleAnswer::Choice("nope".into()).into())
+                    }
                 })
             })
             .collect();
@@ -723,7 +725,12 @@ fn multitype_request_is_422_without_oracle_and_200_with_a_mock() {
     let d = run(&svc, &b).unwrap();
     assert_eq!(mock.calls(), 1, "one call for all undetermined questions");
     let a = &d.response["answers"];
-    assert_eq!(a["team"], json!({"type": "choice", "choice": "account"}));
+    // A verdict without a distribution: one-hot (DESIGN C3).
+    assert_eq!(
+        a["team"],
+        json!({"type": "choice", "choice": "account",
+               "probabilities": {"billing": 0, "technical": 0, "account": 1}, "confidence": 1})
+    );
     assert_eq!(a["urgency"]["type"], "score");
     assert_eq!(a["urgency"]["score"], 1);
     assert_eq!(
@@ -732,14 +739,15 @@ fn multitype_request_is_422_without_oracle_and_200_with_a_mock() {
     );
     assert_eq!(
         a["refund"],
-        json!({"type": "noul", "noul": 1, "value_semantics": "boolean_verdict_not_probability"})
+        json!({"type": "noul", "noul": 1, "value_semantics": "boolean_verdict_not_probability", "probability": 1})
     );
     for q in ["team", "urgency", "refund"] {
         assert_eq!(d.response["cmf"]["questions"][q]["action"], "oracle");
         assert_eq!(d.response["cmf"]["questions"][q]["certified"], false);
     }
-    // Output tokens: one per oracle answer.
-    assert_eq!(d.metered.output_tokens, 3);
+    // Output tokens: the size of each answer's `probabilities` (0.8.8, DESIGN
+    // C3: 3 options, 3 levels), 1 for the noul.
+    assert_eq!(d.metered.output_tokens, 7);
     assert_eq!(mock.observed.load(Ordering::SeqCst), 1);
 }
 
@@ -822,10 +830,8 @@ fn abstentions_escalate_only_with_consent() {
     assert_eq!(mock.calls(), calls0 + 1);
     let o = &d.questions[0];
     assert_eq!(o.action, Action::Oracle);
-    assert_eq!(
-        d.response["answers"]["task"],
-        json!({"type": "choice", "choice": "travel"})
-    );
+    assert_eq!(d.response["answers"]["task"]["choice"], "travel");
+    assert_eq!(d.response["answers"]["task"]["probabilities"]["travel"], 1);
     let cq = &d.response["cmf"]["questions"]["task"];
     assert_eq!(cq["source"], "oracle");
     assert_eq!(cq["decision_path"], "escalate→oracle");

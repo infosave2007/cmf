@@ -73,7 +73,7 @@
 //! does not exist and `router:uncertified_subset` is for subset matches, so that
 //! answer is `router:uncertified` (the closest correct name, the same prefix).
 
-use crate::answer::{self, OracleAnswer, Rounding};
+use crate::answer::{self, OracleAnswer, Rounding, Verdict};
 use crate::certify;
 use crate::config::Config;
 use crate::container::DecisionModel;
@@ -789,12 +789,12 @@ pub const FLAG_ORACLE_UNAVAILABLE: &str = "oracle_unavailable";
 pub const FLAG_EXPLORE: &str = "explore";
 
 /// What happened to one undetermined question.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Resolution {
-    /// A fresh oracle verdict.
-    Oracle(OracleAnswer),
+    /// A fresh oracle verdict (with its distribution, DESIGN C3).
+    Oracle(Verdict),
     /// A cached oracle verdict (no call).
-    Cache(OracleAnswer),
+    Cache(Verdict),
     /// Not sent.
     Refused(RefusalReason),
     /// Sent and failed (transport, status, parse, schema); the text is for
@@ -803,7 +803,7 @@ pub enum Resolution {
 }
 
 /// One resolution and extra flags (e.g. `pii_redacted`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Resolved {
     pub resolution: Resolution,
     pub flags: Vec<String>,
@@ -829,7 +829,7 @@ pub struct OracleUsage {
 }
 
 /// The escalator's answer: one [`Resolved`] per pending question, in order.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct EscalationResult {
     pub resolved: Vec<Resolved>,
     pub usage: OracleUsage,
@@ -1561,13 +1561,13 @@ impl DecisionService {
                 e
             })?;
         let mut decided = self.decide(&req, p)?;
-        // Oracle and cache choice verdicts get the one-hot distribution on
-        // this surface only (Jev's schema requires one; the native bytes and
-        // the metered usage stay those of `/v1/decisions`).
+        // Jev's forms on this surface only (DESIGN C3): a noul answer is
+        // p(true); a choice verdict without a distribution gets the one-hot
+        // one (the metered usage stays that of `/v1/decisions`).
         if let Some(Value::Object(answers)) = decided.response.get_mut("answers") {
             for q in &req.questions {
                 if let Some(a) = answers.get_mut(&q.id) {
-                    answer::complete_choice(a, q);
+                    answer::systemone_answer(a, q);
                 }
             }
         }
@@ -1943,14 +1943,14 @@ impl DecisionService {
                 match r.resolution {
                     Resolution::Oracle(a) => (
                         Action::Oracle,
-                        Some(a.clone()),
-                        a.to_answer(q),
+                        Some(a.answer.clone()),
+                        a.to_answer(q, rounding),
                         "escalate→oracle",
                     ),
                     Resolution::Cache(a) => (
                         Action::Cache,
-                        Some(a.clone()),
-                        a.to_answer(q),
+                        Some(a.answer.clone()),
+                        a.to_answer(q, rounding),
                         "escalate→cache",
                     ),
                     Resolution::Refused(reason) => {
