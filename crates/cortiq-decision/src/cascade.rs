@@ -13,9 +13,12 @@
 //! 3. **single flight**: a question whose scope is in flight in another request
 //!    with cos φ_P ≥ `cache.threshold` waits for that call and reuses its answer
 //!    (as a cache answer); the others lead;
-//! 4. **one call** for every leading question ([`crate::oracle`]); the state is
-//!    PII-redacted when `oracle.redact_pii` is on and the request did not set
-//!    `cmf.allow_pii_egress` (flag `pii_redacted`);
+//! 4. **one call** for every leading question ([`crate::oracle`]); the state,
+//!    the questions' instructions and their criteria's descriptions (0.8.8,
+//!    DESIGN B4; never the option ids) are PII-redacted when
+//!    `oracle.redact_pii` is on and the request did not set
+//!    `cmf.allow_pii_egress` (flag `pii_redacted`); the cache scope, the
+//!    contract key and the learned example keep the question as asked;
 //! 5. **success**: the answers are cached (and logged; the scope holds the
 //!    question's contract, so an answer is reused only for the same
 //!    instructions and criteria), and a choice answer of a question matched
@@ -1055,9 +1058,12 @@ impl Escalator for Cascade {
         };
         // The state and the questions as they would leave for the oracle (PII
         // redacted unless the request allows its egress), and whether
-        // anything was redacted. A state-less question's instructions are its
-        // input: redacted like a state (DESIGN A19.3); everything else is
-        // sent as asked.
+        // anything was redacted. Every question's instructions (a state-less
+        // question's input, DESIGN A19.3) and its criteria's descriptions are
+        // redacted like a state (DESIGN B4) — the option ids, `true`/`false`
+        // and a level's position are object keys and indices, never touched.
+        // Only the egress copy changes: the scopes, the contract keys and the
+        // examples use the question as asked.
         let redact = cfg.oracle.redact_pii && !e.request.cmf.allow_pii_egress;
         let egress = |idx: &[usize]| -> (Value, Vec<Question>, bool) {
             let raw = e.request.state.to_value();
@@ -1070,11 +1076,17 @@ impl Escalator for Cascade {
                 .iter()
                 .map(|&i| {
                     let q = e.pending[i].question;
-                    if redact && e.request.reads_instructions(q) {
+                    if redact {
                         let (instructions, changed) = redact_value(&q.instructions);
                         redacted |= changed;
+                        let criteria = q.criteria.as_ref().map(|c| {
+                            let (c, changed) = redact_value(c);
+                            redacted |= changed;
+                            c
+                        });
                         Question {
                             instructions,
+                            criteria,
                             ..q.clone()
                         }
                     } else {

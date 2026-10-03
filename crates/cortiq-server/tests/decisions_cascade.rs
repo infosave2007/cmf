@@ -4598,6 +4598,115 @@ async fn capacity_errors_carry_the_kit_marker() {
     );
 }
 
+/// The question `task` as the oracle request carried it (the system
+/// message's last line).
+fn asked_question(req: &MockRequest) -> Value {
+    let v = req.json();
+    let system = v["messages"][0]["content"].as_str().unwrap();
+    let qs: Value = serde_json::from_str(system.rsplit('\n').next().unwrap()).unwrap();
+    qs["questions"]["task"].clone()
+}
+
+/// PII in a question's instructions and in its criteria's descriptions is
+/// redacted in the oracle request (DESIGN B4) — the option ids are intact —
+/// while the cache scope and the auto-skill key are those of the question as
+/// asked: the same question with `allow_pii_egress` (nothing redacted) hits
+/// the cache entry of the redacted call, and the registered auto-skill is the
+/// original contract's, stateful and state-less alike.
+#[tokio::test]
+async fn pii_in_instructions_and_descriptions_is_redacted_on_egress_only() {
+    let text = "cruise ship yacht harbor";
+    let q = json!({"type": "choice",
+                   "instructions": "Which topic? Escalations go to ops.lead@example.com",
+                   "criteria": {"food": "about food (chef@example.com)",
+                                "cruise": "about cruise, call +1 (555) 123-4567"}});
+    let mock = MockOracle::answering("cruise");
+    let srv = Srv::new(&stand_config(&mock.url()));
+    let r = srv
+        .decide(&body(json!(text), json!({"task": q.clone()}), None))
+        .await;
+    assert_eq!(r.action(), "oracle", "{}", r.text);
+    assert_eq!(r.flags(), json!(["pii_redacted"]));
+    assert_eq!(r.body["answers"]["task"]["choice"], "cruise", "{}", r.text);
+    let sent = &mock.requests()[0];
+    assert_eq!(sent.state(), json!(text));
+    let asked = asked_question(sent);
+    assert_eq!(
+        asked["instructions"],
+        json!("Which topic? Escalations go to [REDACTED]")
+    );
+    assert_eq!(
+        asked["criteria"],
+        json!({"food": "about food ([REDACTED])", "cruise": "about cruise, call [REDACTED]"})
+    );
+    let mut ids: Vec<&String> = asked["criteria"].as_object().unwrap().keys().collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["cruise", "food"]);
+    let raw = String::from_utf8_lossy(&sent.body);
+    assert!(
+        !raw.contains("example.com") && !raw.contains("4567"),
+        "{raw}"
+    );
+    // The learning key is the original contract's.
+    let l = srv.learning().await;
+    assert_eq!(l["auto_skills"][0]["id"], json!(auto_id_of(&q)), "{l}");
+    // The cache scope too: the unredacted question finds the entry.
+    let r = srv
+        .decide(&body(
+            json!(text),
+            json!({"task": q.clone()}),
+            Some(json!({"allow_pii_egress": true})),
+        ))
+        .await;
+    assert_eq!(r.action(), "cache", "{}", r.text);
+    assert_eq!(r.flags(), json!([]));
+    assert_eq!(mock.hits(), 1);
+    // With `allow_pii_egress` nothing is redacted.
+    let mut cfg = stand_config(&mock.url());
+    cfg.cache.enabled = false;
+    let srv = Srv::new(&cfg);
+    let r = srv
+        .decide(&body(
+            json!(text),
+            json!({"task": q.clone()}),
+            Some(json!({"allow_pii_egress": true})),
+        ))
+        .await;
+    assert_eq!(r.flags(), json!([]));
+    let asked = asked_question(&mock.requests()[1]);
+    assert_eq!(
+        (&asked["instructions"], &asked["criteria"]),
+        (&q["instructions"], &q["criteria"])
+    );
+
+    // State-less: the descriptions are redacted as well, the key is the
+    // original criteria's.
+    let mut once = stand_config(&mock.url());
+    once.learning.auto_min_sightings = 1;
+    let srv = Srv::new(&once);
+    let mut sl = q.clone();
+    sl["instructions"] = json!(format!("{SL_PREFIX}{text}"));
+    let r = srv
+        .decide(&body(json!({}), json!({"task": sl.clone()}), None))
+        .await;
+    assert_eq!(r.action(), "oracle", "{}", r.text);
+    assert_eq!(r.flags(), json!(["pii_redacted"]));
+    let asked = asked_question(&mock.requests()[2]);
+    assert_eq!(asked["instructions"], json!(format!("{SL_PREFIX}{text}")));
+    assert_eq!(
+        asked["criteria"],
+        json!({"food": "about food ([REDACTED])", "cruise": "about cruise, call [REDACTED]"})
+    );
+    let l = srv.learning().await;
+    assert_eq!(
+        l["auto_skills"][0]["id"],
+        json!(cortiq_decision::manifest::stateless_auto_skill_id(
+            q["criteria"].as_object().unwrap()
+        )),
+        "{l}"
+    );
+}
+
 /// A state-less request's instructions are its input: PII in them is
 /// redacted in the oracle request like a state (DESIGN A19.3), unless the
 /// request allows its egress; the state `{}` is sent as is.

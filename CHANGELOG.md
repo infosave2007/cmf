@@ -57,6 +57,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accepted there like the Jev aliases (API.md §3a).
 
 ### Changed
+- Oracle egress redaction (`oracle.redact_pii`, unless `cmf.allow_pii_egress`)
+  also covers every question's `instructions` and its criteria's
+  descriptions, with the state's heuristic; the option ids, `true`/`false`
+  and the score levels' positions are never touched, and `pii_redacted` is
+  set when anything changed. Only the oracle request changes: the cache
+  scope, the contract key and the learned examples use the question as
+  asked (ORACLE.md "What leaves the machine").
 - The semantic cache keeps an index of its entries per scope next to the
   ring, so a lookup and a put's dedup scan only the entries of the
   question's scope instead of all of them (up to `cache.cap`) under one lock;
