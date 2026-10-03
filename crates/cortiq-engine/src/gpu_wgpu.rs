@@ -27,6 +27,8 @@ pub(crate) mod qi21_vae;
 // MiMo-V2 expert-bank frame — child module, `gpu_wgpu/mimo_bank.rs`.
 #[doc(hidden)]
 pub mod mimo_bank;
+/// Qwen3.8-Flash-Next device-resident token path.
+pub(crate) mod qwen4;
 
 /// Workgroup limit per dimension (WebGPU minimum; lm_head has more
 /// rows — we use grid-stride in the shader).
@@ -18021,6 +18023,8 @@ struct Ctx {
         Option<wgpu::ComputePipeline>,
         Option<wgpu::ComputePipeline>,
     )>,
+    /// The Qwen3.8-Flash-Next frame kernels, compiled on first use.
+    qwen4_pipes: std::sync::OnceLock<Option<qwen4::Pipes>>,
     moe_down_q4tp_b2: wgpu::ComputePipeline,
     moe_down_q4tp_part: wgpu::ComputePipeline,
     moe_down_q4tp_b4: wgpu::ComputePipeline,
@@ -18185,6 +18189,7 @@ struct Ctx {
     /// keeps them off the per-token encode critical path.
     uniforms: Mutex<HashMap<[u32; 4], wgpu::Buffer>>,
     uniforms8: Mutex<HashMap<[u32; 8], wgpu::Buffer>>,
+    qwen4_uni16: Mutex<HashMap<[u32; 16], wgpu::Buffer>>,
     /// Immutable norm/small weight buffers cached by (data ptr, len), each
     /// carrying a content fingerprint — the ~200 per-layer norm uploads per
     /// token are token-invariant, but the ADDRESS is not a stable identity:
@@ -20468,6 +20473,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         dsv4_global_dn_s16,
         dsv4_global_s16_capable: s16_capable,
         dsv4_global_s16_lazy: std::sync::OnceLock::new(),
+        qwen4_pipes: std::sync::OnceLock::new(),
         moe_down_q4tp_b2,
         moe_down_q4tp_part,
         moe_down_q4tp_b4,
@@ -20536,6 +20542,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         res_clock: std::sync::atomic::AtomicU64::new(0),
         uniforms: Mutex::new(HashMap::new()),
         uniforms8: Mutex::new(HashMap::new()),
+        qwen4_uni16: Mutex::new(HashMap::new()),
         const_bufs: Mutex::new(HashMap::new()),
         gemm_w_bufs: Mutex::new(HashMap::new()),
         dit_pool: Mutex::new(HashMap::new()),
@@ -54351,13 +54358,24 @@ pub fn dsv4_global_slot_fill(model: &Arc<CmfModel>, slot: usize, t: (usize, usiz
         }
         let key = (model.uid() as usize, idx);
         let tier = host_tier_get(key);
+        // One memcpy, straight into the queue's staging view: `write_buffer`
+        // copies the slice into staging itself, which for an expert-sized
+        // block measured as the larger half of an admission.
+        let upload = |src: &[u8]| {
+            match std::num::NonZeroU64::new(src.len() as u64)
+                .and_then(|n| c.queue.write_buffer_with(buf, off as u64, n))
+            {
+                Some(mut view) => view.copy_from_slice(src),
+                None => c.queue.write_buffer(buf, off as u64, src),
+            }
+        };
         let src: &[u8] = if let Some(v) = tier.as_deref() {
             if v.len() != plen {
                 return false;
             }
             v
         } else if let Some(v) = pread_range(model, abs, plen) {
-            c.queue.write_buffer(buf, off as u64, &v);
+            upload(&v);
             host_tier_put(key, Arc::new(v));
             return true;
         } else {
@@ -54366,7 +54384,7 @@ pub fn dsv4_global_slot_fill(model: &Arc<CmfModel>, slot: usize, t: (usize, usiz
             };
             src
         };
-        c.queue.write_buffer(buf, off as u64, src);
+        upload(src);
         // `host_tier_put` is a no-op when CMF_RAM_TIER_MB is unset/zero.
         // Check that admission is possible before cloning the full mapped
         // tensor; this path runs for every global-bank miss and otherwise

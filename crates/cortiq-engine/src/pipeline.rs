@@ -4143,16 +4143,18 @@ impl Pipeline {
             && pos < input_ids.len()
             && !self.cancel.load(std::sync::atomic::Ordering::Relaxed)
         {
-            let token_id = input_ids[pos];
-            let want_logits = pos + 1 == input_ids.len();
+            // The device path takes several prompt tokens per layer frame;
+            // the host path runs them one by one inside the same call.
+            let end = (pos + crate::qwen4_exp::prefill_chunk()).min(input_ids.len());
+            let want_logits = end == input_ids.len();
             let mut lg = Vec::new();
             if let Some(b) = &mut self.qwen4_exp {
-                crate::qwen4_exp::forward_token(
+                crate::qwen4_exp::forward_tokens(
                     &b.0,
                     &b.1,
                     &b.2,
                     &mut b.3,
-                    token_id,
+                    &input_ids[pos..end],
                     pos,
                     &self.inv_freq,
                     self.pool.as_deref(),
@@ -4163,7 +4165,7 @@ impl Pipeline {
             if want_logits {
                 self.graph_logits = Some(lg);
             }
-            pos += 1;
+            pos = end;
             hidden.fill(0.0);
         }
         while self.dsv4.is_some()
@@ -5110,6 +5112,52 @@ impl Pipeline {
                         self.graph_logits = Some(r.logits);
                         continue 'decode;
                     }
+                }
+            }
+            // ── Qwen3.8-Flash-Next draft head: k greedy drafts from the MTP
+            //    sidecar, one batched verify window on the device ──
+            #[cfg(feature = "gpu")]
+            if self.speculative
+                && self.qwen4_exp.is_some()
+                && task_mask.is_none()
+                && self.sampler_config.temperature < 1e-6
+                && generated + 1 < max_tokens
+                && next_pos > 0
+                && std::env::var("CMF_QWEN_MTP").as_deref() != Ok("0")
+            {
+                let r = match &mut self.qwen4_exp {
+                    Some(b) => crate::qwen4_exp::spec_round(
+                        &b.0,
+                        &b.1,
+                        &b.2,
+                        &mut b.3,
+                        next_pos,
+                        &all_ids,
+                        &self.inv_freq,
+                        self.pool.as_deref(),
+                    ),
+                    None => None,
+                };
+                if let Some(r) = r {
+                    drafted += r.drafted;
+                    accepted += r.accepted.len();
+                    let mut stopped = false;
+                    for &id in &r.accepted {
+                        if self.confidence_on {
+                            confidence.push(0.0);
+                        }
+                        if !commit!(id) {
+                            stopped = true;
+                            break;
+                        }
+                    }
+                    if stopped {
+                        break 'decode;
+                    }
+                    next_pos += r.accepted.len() + 1;
+                    hidden.fill(0.0);
+                    self.graph_logits = Some(r.logits);
+                    continue 'decode;
                 }
             }
             match &mut mtp {

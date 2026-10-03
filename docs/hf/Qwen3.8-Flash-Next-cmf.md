@@ -48,16 +48,117 @@ The file requires the dedicated `qwen4_exp` runtime added alongside this
 conversion; older packaged binaries reject the new architecture instead of
 silently running an approximate Transformer path.
 
+## Device token path (cortiq ≥ 0.8.6)
+
+Starting with cortiq 0.8.6 the same q2tp file runs a different decode path on
+Vulkan cards: the whole token stays on the GPU. The four-stream
+hyper-connection state, the GDN recurrent state, the QSA key/value and
+indexer caches, the PLE history and every skeleton projection (q8_2f and f16)
+are resident; routing happens on the card; resident experts come from the
+global segmented arena; the only traffic per layer is the list of routed
+experts the arena does not hold (admitted immediately and computed on the
+card in the next frame) and one hidden vector. A frame carries up to eight
+tokens with one dispatch per stage, so prefill runs in chunks of eight and a
+speculative window verifies four positions in one pass. The old host path
+remains the reference and the fallback (`CMF_QWEN_DEVICE=0`).
+
+Measured on an RTX 4090 (RunPod, EPYC 7702, Vulkan, driver 580.159.04),
+`cortiq bench --tokens 120 --core`, 41-token prompt, steady decode, arena
+warmed from the routing profile. The host is a container with a 62 GB memory
+cgroup, so the 77 GB file is never fully page-cached there and every
+cold-expert admission that misses the cache is a disk read; the 12 GB and
+16 GB rows are bound by that, not by the card.
+
+| budget | plain decode | MTP decode | prefill (frames of 8) |
+|---|---:|---:|---:|
+| 21.5 GB (full card) | **41.9 tok/s** (33.9 over 300 tokens) | 41.4 tok/s | 47.9 tok/s |
+| `CMF_GPU_VRAM_MB=16000` | 27.2 tok/s | 26.6 tok/s | 25.4 tok/s |
+| `CMF_GPU_VRAM_MB=12000` | 16.3 tok/s | 15.2 tok/s | 19.2 tok/s |
+
+On a 200-token story prompt (34 % draft acceptance) the full card gives
+28.5 tok/s plain and 26.2 with MTP; on a 200-token Python task (69 %) 25.0
+plain and 29.4 with MTP. Steady-state cold experts per token: 11 / 47 / 150 at
+the three budgets; admitting them costs 3–4 / 12 / 35 ms per token on this
+host (disk-bound under its 62 GB cgroup — the same 12 GB budget measured
+24.4 tok/s two days earlier on the same pod with more of the file cached;
+a host whose RAM holds the file admits at memcpy speed).
+
+"Plain" is one token per frame; "MTP" is speculative decoding with the
+multi-token-prediction head (below). On free-form text the MTP acceptance is
+~34 % and the two are even; on code (~69 %) and on repetitive continuations
+(~89 %) MTP is faster, because one window shares its expert admissions
+between four positions.
+
+The arena holds 8 304 experts at the full budget (all 8 163 of the profile),
+5 080 at 16 GB and 2 680 at 12 GB (out of 24 576), plus 80 staging slots for
+the in-frame cold passes; the skeleton takes 4.57 GB of it.
+
+### Routing profile
+
+A routing profile warms the arena from the first token:
+
+```bash
+# record one (any representative prompts), then start from it
+CMF_QWEN_PROFILE_SAVE=flashnext.profile cortiq run qwen38-flash-next-q2tp.cmf --prompt "..."
+CMF_QWEN_PROFILE=flashnext.profile cortiq serve qwen38-flash-next-q2tp.cmf --port 8080
+```
+
+`flashnext.profile` in this repository was recorded on English chat prompts;
+it is a ranking of (layer, expert) hits, not weights, and does not change the
+model's output.
+
+### Multi-token prediction (speculative decoding)
+
+The checkpoint ships an MTP head (`model.mtp.*`, one QSA+MoE layer with its
+own mixer, 5.2 GB in bf16). cortiq converts it into a sidecar next to the
+main file and uses it automatically when present:
+
+```bash
+# fetch only the 31 MTP tensors from the HF checkpoint (HTTP range requests)
+python tools/qwen4_mtp_fetch.py --out ./mtp-src
+# convert them into qwen38-flash-next-q2tp.mtp.cmf (1.08 GB)
+cortiq convert --model ./mtp-src --quant q2tp --output qwen38-flash-next-q2tp.cmf --mtp-sidecar
+```
+
+Each round drafts `k = 3` tokens (`CMF_QWEN_MTP_K`), verifies them in one
+four-position frame of the main model and keeps the longest accepted prefix;
+greedy output is identical to plain decoding (checked token by token).
+`CMF_QWEN_MTP=0` turns it off.
+
+### Knobs
+
+| variable | default | meaning |
+|---|---|---|
+| `CMF_GPU_VRAM_MB` | the card | weight budget; the arena takes what the skeleton leaves |
+| `CMF_QWEN_PROFILE` / `CMF_QWEN_PROFILE_SAVE` | — | warm start from / record a routing profile |
+| `CMF_QWEN_PREFILL_CHUNK` | 8 | tokens per prefill frame (1–8) |
+| `CMF_QWEN_MTP` | on when the sidecar exists | speculative decoding with the MTP head |
+| `CMF_QWEN_MTP_K` | 3 | drafts per round (≤ 7) |
+| `CMF_QWEN_KV_RESERVE_MB` | 768 | VRAM kept free for caches and staging |
+| `CMF_QWEN_STAGE_MB` | 256 | pinned staging ring per buffer for expert uploads (0 = plain `write_buffer`) |
+| `CMF_MMAP_POPULATE` | 0 | fault the whole file in at open (hosts whose RAM holds it) |
+| `CMF_QWEN_PROF` | 0 | one profile line per token (frame time, cold experts, admissions) |
+| `CMF_QWEN_DEVICE_CHECK` | 0 | run the host path alongside and print logit cosine / argmax |
+
+Parity: `CMF_QWEN_DEVICE_CHECK=1` runs both paths on every token and prints
+the logits' cosine and argmax; over 160 positions of a free-form prompt the
+cosine stays at 0.996–0.9995 and the argmax matches at every sampled
+position (f32 accumulation on the card against f64 on the host).
+
 ## File
 
 | file | quantization | size | tested decode |
 |---|---|---:|---:|
 | `qwen38-flash-next-q4tp.cmf` | mixed q4tp + q8_2f + f16 | 97.12 GB (90.45 GiB) | 4.71 tok/s core steady with the auto plan at a 16 GB GPU budget |
-| `qwen38-flash-next-q2tp.cmf` | mixed q2tp + q4tp + q8_2f + f16 | 76.95 GB (71.66 GiB) | 7.13 tok/s at a 16 GB budget; 6.60 tok/s at a 32 GB budget (core steady, RTX 5090) |
+| `qwen38-flash-next-q2tp.cmf` | mixed q2tp + q4tp + q8_2f + f16 | 76.95 GB (71.66 GiB) | device token path above; 7.13 tok/s at a 16 GB budget on the 0.8.5 host path |
+| `qwen38-flash-next-q2tp.mtp.cmf` | MTP head sidecar (same profile, `fc_embedding`/`fc_hidden` q8_2f) | 1.08 GB | speculative decoding; optional, picked up by name |
+| `flashnext.profile` | routing profile (layer, expert) hit ranking | 98 KB | warm start of the expert arena, `CMF_QWEN_PROFILE` |
 
 SHA-256 (q4tp): `601474afd6c7144dcfaf8e084cb2d2e786e06b4aeee3f20310ee0cae07224dfd`
 
 SHA-256 (q2tp): `e84cb832124bf4df8b6c9b3e5daa1e8b0caa47187a240f3b45d72173fce9935b`
+
+SHA-256 (q2tp MTP sidecar): `a9cc9760d57db47d7365efcb21bdc13bdfc910947f3a547832d1945f0b56350a`
 
 This is a quality-oriented **q4tp profile**, not a uniform four-bit dump. The
 memory wall (routed/shared MoE matrices and the large PLE n-gram embeddings)
@@ -249,8 +350,16 @@ VRAM — `CMF_GPU_VRAM_MB`, доля запроса пула — `CMF_QWEN_POOL_
 не ускоряет один короткий поток декодирования.
 
 Реализованы именно новые Gated Residual, GDN, QSA, PLE и MoE из `qwen4_exp`.
-Vision-башня и новая 4B MTP-голова в этот текстовый релиз не входят; старая
-MTP-реализация к ним намеренно не применяется.
+Vision-башня в этот текстовый релиз не входит.
+
+С cortiq 0.8.6 q2tp-файл на Vulkan-картах исполняется целиком на карте
+(device-путь, раздел «Device token path» выше): гипер-состояние, рекуррентное
+состояние GDN, кэши QSA и история PLE резидентны, роутинг на карте, кадр
+несёт до восьми токенов. MTP-голова (4B) конвертируется в sidecar
+`qwen38-flash-next-q2tp.mtp.cmf` и даёт спекулятивный декод с тем же жадным
+ответом; выигрыш зависит от доли принятых черновиков (код — около 69 %,
+свободный текст — около 34 %). `flashnext.profile` прогревает арену
+экспертов с первого токена. Цифры — в таблице выше.
 
 CMF runtime and format source: [infosave2007/cmf](https://github.com/infosave2007/cmf).
 The original model remains subject to the

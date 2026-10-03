@@ -856,12 +856,22 @@ fn quant_for_tensor(arch: &ModelArch, name: &str, base: Quant) -> Quant {
     let recurrent_skeleton = name.contains(".linear_attn.")
         || name.contains(".self_attn.")
         || (name.contains(".ple.")
-            && (name.ends_with("key_proj.weight") || name.ends_with("value_proj.weight")));
+            && (name.ends_with("key_proj.weight") || name.ends_with("value_proj.weight")))
+        // the MTP head's two input projections: every draft traverses them
+        || (name.starts_with("model.mtp.")
+            && (name.ends_with("fc_embedding.weight") || name.ends_with("fc_hidden.weight")));
     if recurrent_skeleton || vocabulary_edges {
         Quant::Q8_2f
     } else {
         base
     }
+}
+
+/// `cortiq convert --mtp-sidecar` on a Qwen3.8-Flash-Next source: the walk
+/// keeps `model.mtp.*` (and nothing else is expected to be there — the
+/// source is the 31-tensor directory `tools/qwen4_mtp_fetch.py` builds).
+pub(crate) fn qwen4_mtp_sidecar() -> bool {
+    std::env::var("CMF_CONVERT_QWEN4_MTP").as_deref() == Ok("1")
 }
 
 /// User per-tensor quantization overrides (`cortiq convert --tensor-quant
@@ -6039,14 +6049,16 @@ pub fn run_convert_multi_towers(
                 continue;
             }
             if arch.qwen4_exp.is_some()
-                && (name.starts_with("model.mtp.")
+                && ((name.starts_with("model.mtp.") && !qwen4_mtp_sidecar())
                     || name.ends_with("ple_embedding.layer_multipliers")
                     || name.ends_with("ple_embedding.ngram_heads_offsets")
                     || name.ends_with("ple_embedding.ngram_heads_vocab_sizes"))
             {
-                // qwen4 MTP is speculative-only and uses a different stack.
-                // PLE's integer hash tables are deterministic from the header
-                // and are recomputed by the runtime, avoiding lossy casts.
+                // qwen4 MTP is speculative-only and uses a different stack; it
+                // goes to its own sidecar file (`--mtp-sidecar`), never into
+                // the main file. PLE's integer hash tables are deterministic
+                // from the header and are recomputed by the runtime, avoiding
+                // lossy casts.
                 continue;
             }
             // Kimi: KDA layers share the `self_attn.` vendor prefix with

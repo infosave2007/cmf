@@ -117,7 +117,11 @@ fn lock_exclusive(file: &File, path: &Path) -> Result<(), CmfError> {
                 return Err(CmfError::Parse(format!(
                     "{}: another writer holds the append lock{}",
                     path.display(),
-                    if busy { String::new() } else { format!(" ({err})") }
+                    if busy {
+                        String::new()
+                    } else {
+                        format!(" ({err})")
+                    }
                 )));
             }
             std::thread::sleep(std::time::Duration::from_millis(40));
