@@ -161,6 +161,11 @@ pub struct State {
     picks_prev: Vec<Vec<usize>>,
     /// The device path refused once (setup or mid-token); stay on the host.
     device_off: bool,
+    /// Positions the host-side caches (`layers`) hold. The device path
+    /// advances `pos` and `token_history` but keeps its caches on the card,
+    /// so after it turns off mid-sequence this lags `pos` and the host path
+    /// replays the history first.
+    host_pos: usize,
     #[cfg(feature = "gpu")]
     profile: Option<ExpertProfile>,
     /// The next device forward is a verify window: snapshot the recurrent
@@ -249,6 +254,7 @@ impl State {
             dev: None,
             picks_prev: vec![Vec::new(); n_layers],
             device_off: false,
+            host_pos: 0,
             #[cfg(feature = "gpu")]
             profile: None,
             verify_window: false,
@@ -263,6 +269,7 @@ impl State {
         self.hyper.clear();
         self.token_history.clear();
         self.pos = 0;
+        self.host_pos = 0;
         for st in &mut self.layers {
             *st = LayerState::default();
         }
@@ -2201,6 +2208,27 @@ pub fn forward_token(
     if position == 0 || state.pos != position {
         state.reset();
     }
+    if state.host_pos != position && state.token_history.len() == position {
+        // The device path ran positions host_pos..position and then turned
+        // off (a refused frame): the host's K/V, GDN and PLE caches never
+        // saw them, and attention would index keys that were never stored.
+        // Rebuild them from the token history (slow, but the text stays
+        // that of the device path).
+        tracing::warn!(
+            "qwen4: host caches rebuilt over {position} tokens after the device path turned off"
+        );
+        if std::env::var_os("CMF_QWEN_PROF").is_some() {
+            eprintln!("qwen4: replaying {position} tokens on the host path");
+        }
+        let history = std::mem::take(&mut state.token_history);
+        state.reset();
+        for (p, &id) in history.iter().enumerate() {
+            let mut lg = Vec::new();
+            forward_token(
+                globals, layers, cfg, state, id, p, inv_freq, pool, &mut lg, false,
+            );
+        }
+    }
     // Every token starts from its own embedding. Only recurrent/KV/PLE
     // caches cross token boundaries; carrying the prior token's final hyper
     // state here would turn the Transformer residual into an accidental RNN.
@@ -2301,6 +2329,7 @@ pub fn forward_token(
     let head_dt = head_t0.elapsed();
     state.token_history.push(token_id);
     state.pos = position + 1;
+    state.host_pos = position + 1;
     if prof {
         eprintln!(
             "qwen-prof pos={position} total={:.3}s ple={:.3}s attn_hc={:.3}s mixer={:.3}s mlp_hc={:.3}s moe={:.3}s head={:.3}s",
@@ -2808,10 +2837,24 @@ fn forward_tokens_device(
             } else {
                 (budget / 10).clamp(2 << 30, 4 << 30)
             });
+        // The verify window's recurrent-state snapshots (`ensure_snaps`,
+        // one row per window position on every GDN and PLE layer) are
+        // allocated later, out of the reserve. The 768 MiB default held the
+        // four rows of the default k = 3 on the test cards; a longer window
+        // (k up to 7, eight rows) reserves its extra rows on top.
+        let window = state.mtp.as_ref().map_or(0, |h| h.k + 1);
+        let snap_extra = {
+            let kinds: Vec<(bool, bool)> = layers
+                .iter()
+                .map(|l| (matches!(l.mixer, Mixer::Gdn(_)), l.ple.is_some()))
+                .collect();
+            q4::Dev::snap_bytes(&g, &kinds, window.saturating_sub(MTP_MEASURED_WINDOW))
+        };
         let free = budget
             .saturating_sub(resident)
             .saturating_sub(reserve_mb << 20)
-            .saturating_sub(workspace);
+            .saturating_sub(workspace)
+            .saturating_sub(snap_extra);
         let slots = (free / per as u64) as usize;
         let n_layers = layers.len();
         // staging for the cold passes: one slot per token slot and rank
@@ -2830,11 +2873,12 @@ fn forward_tokens_device(
         };
         if prof {
             eprintln!(
-                "qwen4-device: budget {} MB, skeleton resident {} MB, reserve {} MB, workspace {} MB, arena request {} slots ({} MB), got {} slots",
+                "qwen4-device: budget {} MB, skeleton resident {} MB, reserve {} MB, workspace {} MB, window snapshots beyond {MTP_MEASURED_WINDOW} rows {} MB, arena request {} slots ({} MB), got {} slots",
                 budget >> 20,
                 resident >> 20,
                 reserve_mb,
                 workspace >> 20,
+                snap_extra >> 20,
                 slots,
                 (slots as u64 * per as u64) >> 20,
                 arena.owner.len()
@@ -2927,6 +2971,24 @@ fn forward_tokens_device(
     let mut failed: Option<&'static str> = None;
     let head_hc = device_hc_w(&globals.head_hc);
     let lm_head_idx = globals.lm_head_idx.unwrap_or(usize::MAX);
+    // The readback stage of a chain holds its layer frames and, on the
+    // head, the logits of the last token, or of every position of a verify
+    // window. A 248k vocabulary is ~0.95 MiB a row: the initial 4 MiB stage
+    // holds a window of four (MTP k = 3); five rows (k = 4) overran it.
+    let logit_rows = match (want_logits, snapshot) {
+        (false, _) => 0,
+        (true, false) => 1,
+        (true, true) => ntok,
+    };
+    let stage_need = q4::chain_stage_bytes(
+        chain_len.min(n),
+        frame_bytes,
+        logit_rows,
+        q4::head_stride(&model, lm_head_idx).unwrap_or(0),
+    );
+    if !dev.ensure_stage(stage_need) {
+        failed = Some("readback stage allocation");
+    }
     for (t, &id) in ids.iter().enumerate() {
         let mut emb = vec![0.0f32; cfg.hidden];
         if (id as usize) < globals.embed.rows() {
@@ -3002,7 +3064,10 @@ fn forward_tokens_device(
                     )
                     .ok_or("head frame declined")?;
                     let bytes = ((ntok - first) * ls) as u64;
-                    q4::copy_to_stage(&mut enc, dev, &lb, (first * ls) as u64, stage_off, bytes);
+                    if !q4::copy_to_stage(&mut enc, dev, &lb, (first * ls) as u64, stage_off, bytes)
+                    {
+                        return Err("logits overrun the readback stage");
+                    }
                     logits_off = Some(stage_off as usize);
                     *vocab_out = vocab;
                     lstride = ls;
@@ -3044,15 +3109,18 @@ fn forward_tokens_device(
                     snapshot,
                 )
                 .ok_or("layer frame declined")?;
-                q4::copy_to_stage(&mut enc, dev, &out.cold, 0, stage_off, (ntok * cs) as u64);
-                q4::copy_to_stage(
-                    &mut enc,
-                    dev,
-                    &out.x2,
-                    0,
-                    stage_off + cold_part as u64,
-                    (ntok * hidden_bytes) as u64,
-                );
+                if !q4::copy_to_stage(&mut enc, dev, &out.cold, 0, stage_off, (ntok * cs) as u64)
+                    || !q4::copy_to_stage(
+                        &mut enc,
+                        dev,
+                        &out.x2,
+                        0,
+                        stage_off + cold_part as u64,
+                        (ntok * hidden_bytes) as u64,
+                    )
+                {
+                    return Err("layer frame overruns the readback stage");
+                }
                 stage_off += frame_bytes as u64;
             }
             dev.arm_chain(lo, hi);
@@ -3462,6 +3530,24 @@ fn device_hc_w(g: &GatedResidual) -> Option<crate::gpu_wgpu::qwen4::HcW<'_>> {
     })
 }
 
+/// The verify window (k + 1 positions) the 768 MiB default of
+/// `CMF_QWEN_KV_RESERVE_MB` was measured with: MTP k = 3.
+#[cfg(feature = "gpu")]
+const MTP_MEASURED_WINDOW: usize = 4;
+
+/// Drafts per MTP round from `CMF_QWEN_MTP_K` (default 3), and whether the
+/// value had to be clamped. The verify window, the last accepted token plus
+/// k drafts, is one device frame, so k + 1 <= TMAX: k in 1..=7.
+#[cfg(feature = "gpu")]
+fn mtp_k(raw: Option<&str>) -> (usize, bool) {
+    let max = crate::gpu_wgpu::qwen4::TMAX - 1;
+    match raw.map(|v| v.trim().parse::<usize>()) {
+        None => (3, false),
+        Some(Ok(v)) => (v.clamp(1, max), !(1..=max).contains(&v)),
+        Some(Err(_)) => (3, true),
+    }
+}
+
 /// One speculative round's outcome, in the shape the generation loop
 /// consumes: the drafts the model confirmed, the logits the loop samples
 /// its own next token from, how many were drafted.
@@ -3603,11 +3689,16 @@ impl MtpHead {
         skeleton.push(ix.router);
         skeleton.extend(ix.shared_gate);
         skeleton.extend([fc_e, fc_h]);
-        let k = std::env::var("CMF_QWEN_MTP_K")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(3)
-            .clamp(1, crate::gpu_wgpu::qwen4::TMAX - 1);
+        let raw = std::env::var("CMF_QWEN_MTP_K").ok();
+        let (k, clamped) = mtp_k(raw.as_deref());
+        if clamped {
+            tracing::warn!(
+                "CMF_QWEN_MTP_K={} is outside 1..={}: the verify window (k + 1 positions) is one device frame of at most {} tokens; using k = {k}",
+                raw.as_deref().unwrap_or(""),
+                crate::gpu_wgpu::qwen4::TMAX - 1,
+                crate::gpu_wgpu::qwen4::TMAX
+            );
+        }
         tracing::info!("qwen4 MTP: draft head from {} (k = {k})", path.display());
         Some(Self {
             side,
@@ -3714,6 +3805,15 @@ pub fn spec_round(
         let main_dev = state.dev.as_ref()?;
         let main_model = e0.gate_proj.model_arc()?;
         let lm_head = globals.lm_head_idx?;
+        // a host round trip reads one logits row per cell back
+        if !mdev.ensure_stage(q4::chain_stage_bytes(
+            0,
+            0,
+            1,
+            q4::head_stride(&main_model, lm_head)?,
+        )) {
+            return None;
+        }
         let mut drafts: Vec<u32> = Vec::with_capacity(k);
         let tok_in = all_ids[next_pos];
         // ── the whole chain in one submit: each cell's argmax is re-embedded
@@ -3797,7 +3897,9 @@ pub fn spec_round(
                     )?;
                     q4::encode_argmax(&mut enc, mdev, &lb, vocab, &ids_buf, j + 1)?;
                 }
-                q4::copy_to_stage(&mut enc, mdev, &ids_buf, 4, 0, (k * 4) as u64);
+                if !q4::copy_to_stage(&mut enc, mdev, &ids_buf, 4, 0, (k * 4) as u64) {
+                    return None;
+                }
                 drop(merge);
                 let bytes = q4::submit_chain(mdev, enc, (k * 4) as u64)?.wait()?;
                 Some(
@@ -3875,7 +3977,9 @@ pub fn spec_round(
                     false,
                     1,
                 )?;
-                q4::copy_to_stage(&mut enc, mdev, &lb, 0, 0, (vocab * 4) as u64);
+                if !q4::copy_to_stage(&mut enc, mdev, &lb, 0, 0, (vocab * 4) as u64) {
+                    return None;
+                }
                 drop(merge);
                 let bytes = q4::submit_chain(mdev, enc, (vocab * 4) as u64)?.wait()?;
                 let mut best = (0usize, f32::NEG_INFINITY);
@@ -3968,6 +4072,20 @@ pub fn spec_round(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn mtp_k_parses_and_clamps_to_the_frame() {
+        assert_eq!(mtp_k(None), (3, false));
+        for k in 1..=7 {
+            assert_eq!(mtp_k(Some(&k.to_string())), (k, false));
+        }
+        assert_eq!(mtp_k(Some("0")), (1, true));
+        assert_eq!(mtp_k(Some("8")), (7, true));
+        assert_eq!(mtp_k(Some("four")), (3, true));
+        // every accepted k leaves a window that fits one frame
+        assert!(mtp_k(Some("99")).0 < crate::gpu_wgpu::qwen4::TMAX);
+    }
 
     #[test]
     fn dynamic_pool_percent_is_bounded_per_policy() {
