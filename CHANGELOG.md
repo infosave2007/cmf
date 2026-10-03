@@ -5,6 +5,51 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.7] - 2026-10-03
+
+### Added
+- State-less requests: a decisions request whose `state` is empty (`""`,
+  `{}`, `[]`, `null`) reads each question's `instructions` as its text (a
+  string as is, an object or array as canonical JSON; the encoder runs once
+  per distinct text) — the shape benchmark kits such as the Decision Index
+  send (`state: {}`, the item in the instructions). Its auto-skill contract
+  is `{type, input: "instructions", criteria}` (the instructions are data),
+  so every item of a classification set under the same options is learned
+  as one skill and then answered locally; the same criteria under a
+  non-empty state are another contract. The cache and single flight use the
+  instructions' φ under that contract; the instructions leave for the
+  oracle PII-redacted like a state; each is limited to `limits.state_bytes`;
+  state-less answers are never `certified`. The rubric of such a skill
+  stores `instructions: null` and `input: "instructions"`
+  (`Rubric::stateless`); `learn.log` records it with the unchanged contract
+  record (the id tells it apart). Both `/v1/decisions` and `/v1/systemone`
+  (API.md §3.1, §3.2, §3a; ORACLE.md "Auto-skills").
+- Sightings gate: a state-less contract is registered and learned only from
+  its `learning.auto_min_sightings`-th sighting (2), counted in an in-memory
+  LRU of `learning.auto_sightings_cap` (100000) contracts, so one-off
+  contracts (multiple-choice items whose descriptions change per question)
+  never reach `learn.log` nor use up `auto_max_skills`. `GET
+  /v1/admin/learning` adds `auto_sightings`, `auto_registered` and
+  `stateless` per auto-skill (API.md §6).
+- Capacity errors: a request over a size limit (body, state, a state-less
+  question's instructions, a description, the options, the questions) says
+  `maximum context length` in its message with `details.capacity: true` —
+  the marker the Decision Index `http` engine reads as an unsupported item;
+  the status stays 400/413 on `/v1/decisions` and is 422 on `/v1/systemone`.
+  An oracle refusal because the prompt exceeds its context is the failure
+  `context_length`: an untrained question gets 422 `UNSUPPORTED_QUESTION`
+  with the marker, and it does not count toward `oracle.max_errors`.
+
+### Changed
+- `/v1/decisions` no longer refuses an empty `state` (`""`, `{}`, `[]`) or a
+  `null` one with 400: it is a state-less request. Requests with a non-empty
+  state are read exactly as in 0.8.6.
+
+### Compatibility
+- A 0.8.6 binary truncates a 0.8.7 `learn.log` at the first state-less
+  contract record and refuses a generation whose auto-skill rubric carries
+  `input`; never run an older binary on a newer state directory.
+
 ## [0.8.6] - 2026-10-02
 
 ### Added

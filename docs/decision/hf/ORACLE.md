@@ -155,6 +155,29 @@ goes to the oracle on every new text and, until 0.8.5, was never learned. Since
   skill's rubric (the id is recomputed from it), visible through
   `/v1/skills/{id}` to every key. The contract is written to `learn.log`
   before its first example, so a restart rebuilds it.
+* **State-less requests (0.8.7).** A request with an empty `state` (`""`,
+  `{}`, `[]`, `null`) — a benchmark kit that writes `state: {}` and the item
+  into the instructions — is read through each question's instructions
+  (canonical JSON for an object or array). The contract of such a question
+  is `{type, input: "instructions", criteria}`: the instructions are its
+  data, not part of the key, so every item under the same options and
+  descriptions teaches one auto-skill, and the same criteria under a
+  non-empty state are another contract. The cache and single flight use the
+  φ of the instructions text under that contract. The rubric of such a skill
+  stores `instructions: null` and `input: "instructions"`; `learn.log` tells
+  the contract apart by its id (the record format is unchanged). Because a
+  contract that is seen only once is useless to learn — a multiple-choice
+  item whose option descriptions change with every question is its own
+  contract — a state-less contract is registered only at its
+  `learning.auto_min_sightings`-th sighting (2; an escalation of one of its
+  learnable questions, whatever answers it), counted in an in-memory LRU of
+  `learning.auto_sightings_cap` (100000) contracts that a restart clears;
+  before that its answers are served and cached but not learned, nothing is
+  written to `learn.log` and it takes no slot of `auto_max_skills`. Stateful
+  contracts register at their first sighting, as in 0.8.6. State-less
+  answers are never `certified`. A state-less auto-skill answers state-less
+  requests only: its rubric has no instructions, so `/v1/route` and
+  `cortiq decide --skill` (which read a text as the state) do not reach it.
 * **Who teaches.** Only a caller whose key has `learning_allowed` (the explicit
   open mode `auth.require: false` has it; the implicit open mode of a loopback
   address never teaches). The rule "a question that is exactly the skill's own
@@ -240,8 +263,10 @@ goes to the oracle on every new text and, until 0.8.5, was never learned. Since
 * **Admin.** `GET /v1/admin/learning` lists `auto_skills` (id, labels,
   `examples` per label — the rows the next attempt fits: the served learned
   rows of the label plus the buffer examples not among them, each row once,
-  so their sum is the attempt's `rows.total` — what is served),
-  `auto_contracts` and `auto_skipped`;
+  so their sum is the attempt's `rows.total` — what is served, `stateless`),
+  `auto_contracts`, `auto_skipped`, `auto_sightings` (state-less contracts
+  seen and not registered yet) and `auto_registered` (contracts this process
+  registered);
   attempts carry `kind: auto_start | auto_refit` and an `auto` block with the
   eligible and quarantined labels, the rows and the agreement. `/healthz`
   adds `auto_skills`. Rollback to an earlier generation drops the skill from
@@ -253,6 +278,8 @@ goes to the oracle on every new text and, until 0.8.5, was never learned. Since
   older binary on a newer state directory). The cache scope of a contract
   changes from the contract to the skill at its activation, so its first
   requests after that miss the cache (they are answered locally anyway).
+  A 0.8.6 binary truncates a 0.8.7 `learn.log` at the first state-less
+  contract record and refuses a manifest whose rubric carries `input`.
 
 ## Budget and stop rules
 
@@ -275,7 +302,12 @@ goes to the oracle on every new text and, until 0.8.5, was never learned. Since
   --oracle-resume` on a state directory no server holds): HTTP 401, 402 or
   403 from OpenRouter; a returned model that is not the configured one; a
   cost above the reservation; `max_errors` failures in a row (counted across
-  restarts and `cortiq decide` runs).
+  restarts and `cortiq decide` runs). An upstream refusal that the prompt
+  does not fit the model's context (a 400/413/422 whose body names the
+  context length) is the failure `context_length`: the question gets a 422
+  whose message says `maximum context length` (a trained one abstains), it
+  does not count toward `max_errors` — a run of long items must not stop a
+  working oracle — and its reservation counts as likely unbilled.
 * `GET /v1/admin/oracle` shows spent, reserved, remaining, calls, failures and
   the stop reason; `POST /v1/admin/oracle` can switch the oracle and lower
   `budget_usd` / `max_calls` within the configured values.
@@ -283,7 +315,9 @@ goes to the oracle on every new text and, until 0.8.5, was never learned. Since
 ## What leaves the machine
 
 * **Sent**, only for undetermined questions with the oracle permitted: the
-  `state` and the `instructions` and `criteria` of those questions. Receivers:
+  `state` and the `instructions` and `criteria` of those questions. In a
+  state-less request (empty `state`) the instructions are the input and are
+  redacted like a state (below). Receivers:
   OpenRouter and the provider it routes to (`provider.sort: price`,
   fallbacks allowed; set `oracle.data_collection: "deny"` to exclude providers
   that store data).
@@ -292,8 +326,8 @@ goes to the oracle on every new text and, until 0.8.5, was never learned. Since
   a letter) and numbers of 9 or more digits — also when their digit groups
   are separated by spaces, dashes, dots, slashes or parentheses, as in
   `4111 1111 1111 1111`, `+1 (555) 123-4567` or a spaced IBAN — in every
-  string of the state are replaced by `[REDACTED]` and the question gets the
-  flag `pii_redacted`. It is a heuristic: names, postal addresses, numbers
+  string of the state — and of a state-less question's instructions — are
+  replaced by `[REDACTED]` and the question gets the flag `pii_redacted`. It is a heuristic: names, postal addresses, numbers
   written in words and identifiers with letters between short digit groups
   are not detected. A request can opt out with `cmf.allow_pii_egress`
   (router: `options.allow_pii_egress`).
