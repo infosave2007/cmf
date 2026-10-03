@@ -257,7 +257,7 @@ The response of `POST /v1/admin/keys` is the only place the raw key appears.
 | Field | Rules |
 |---|---|
 | `model` | `"cortiq/decision"` or `"cortiq/decision@<12 hex>"` of the served generation; anything else, a Jev name included, is 404 `MODEL_NOT_FOUND` |
-| `state` | non-empty string, object or array; an object or array is used as its canonical JSON and the answers are then not certified; at most 32 KiB |
+| `state` | string, object or array; an object or array is used as its canonical JSON and the answers are then not certified; at most 32 KiB. Empty (`""`, `{}`, `[]`, `null`): a *state-less* request, each question's `instructions` are its input ([section 3.2](#32-skill-matching-and-certified)) |
 | `questions` | object of 1–32 questions in request order; ids up to 128 characters |
 | question | `{type, instructions, criteria}`; `type` is `choice`, `score` or `noul`; `instructions` is required |
 | choice `criteria` | object of 2–255 options; option ids 1–256 bytes; each description a string, object, array or `null` up to 24000 bytes; key order is kept |
@@ -267,7 +267,12 @@ The response of `POST /v1/admin/keys` is the only place the raw key appears.
 | `cmf` | extension, all optional: `skill`, `oracle` (bool), `allow_pii_egress` (bool), `round` (`2` or `null`), `explain` (bool), `profile` (`balanced`, `quality-first`, `cost-saver`) |
 
 Any other key at the top level or inside `cmf`, or a key repeated inside any
-object, is 400. The body is at most 1 MiB (413) and must be
+object, is 400. A request over a size limit — the body, the state, a
+state-less question's instructions, a description, the options of a choice,
+the questions — is a *capacity* error: its status and reason stay (413 / 400)
+and its message contains `maximum context length` (with
+`details.capacity: true`), the phrase clients such as the Decision Index kit
+read as "the input does not fit". The body is at most 1 MiB (413) and must be
 `Content-Type: application/json` (parameters such as `charset` allowed):
 any other content type, or none, is 400 `INVALID_REQUEST` on this API (the
 router paths of [section 4](#4-cortiq-router-api-schema-11) answer it with
@@ -409,6 +414,40 @@ Limits, who teaches and the state directory's compatibility:
 [ORACLE.md](ORACLE.md#auto-skills). When a data skill and auto-skills fit a
 question equally, the data skill answers.
 
+**State-less requests (0.8.7).** Many benchmark and batch clients send
+`state: {}` and put the item's text inside the question's instructions
+(`"Classify the banking intent of this user request:\n<text>"`). A request
+whose `state` is empty (`""`, `{}`, `[]`, `null`) is *state-less*: for each
+question the local model reads that question's `instructions` (a string as
+is, an object or array as its canonical JSON; a question without
+instructions reads the state's text as before), the encoder running once
+per distinct instructions text. Data skills are matched by their ids as
+always. The auto-skill contract of a state-less question is `{type, input:
+"instructions", criteria}` — the criteria with their descriptions, without
+the instructions, which are the data: every item of a classification set
+under the same options is one contract, learned and then answered locally,
+and never the same contract as a request with a non-empty state over the
+same criteria (whose contract includes its instructions). Its cache scope is
+that contract too, with the φ of the instructions text, so a near-identical
+text under the same criteria is a cache hit. The instructions of a
+state-less question are its input: they leave for the oracle PII-redacted
+like a state (unless `allow_pii_egress`), the oracle request otherwise
+unchanged (`state` sent as `{}`). Each one is limited to `limits.state_bytes`
+(a capacity error past it); state-less answers are never `certified`. A
+state-less contract is registered and learned only from its second sighting
+(`learning.auto_min_sightings`; sightings counted in memory, at most
+`learning.auto_sightings_cap` contracts, lost on restart): a one-off contract
+— a multiple-choice item whose option descriptions change with every
+question — is answered by the oracle and never written to the state
+directory nor counted against `auto_max_skills`; the answer at the first
+sighting is not learned. Requests with a non-empty state behave exactly as
+in 0.8.6 (their contracts register at the first sighting). The same rules
+hold on `/v1/systemone` ([section 3a](#3a-system-one-request-adapter-jev-compatible)).
+`/v1/skills/{id}` of a state-less auto-skill shows `rubric.instructions:
+null` and `rubric.input: "instructions"`; `GET /v1/admin/learning` lists it
+with `stateless: true` and counts `auto_sightings` (contracts seen, not
+registered) and `auto_registered` (contracts this process registered).
+
 `cmf.skill` names the skill and skips the search (an unknown id is 400). An
 answer is `certified: true` only for an exact match on a string `state`, the
 `balanced` or `quality-first` profile, a skill whose gate is certified, and a
@@ -525,14 +564,17 @@ with cortiq-router's codes.
 | 402 | `QUOTA_EXCEEDED` | decision or token quota, credit |
 | 404 | `MODEL_NOT_FOUND`, `INVALID_REQUEST`, `ADMIN_DISABLED` | unknown model; feedback target not found; admin token not configured |
 | 413 | `PAYLOAD_TOO_LARGE` | body over `limits.body_bytes` |
-| 422 | `UNSUPPORTED_QUESTION` | untrained question and the oracle not allowed |
+| 422 | `UNSUPPORTED_QUESTION` | untrained question and the oracle not allowed; untrained question whose oracle call the upstream refused as over its context (message with `maximum context length`, `details.capacity`) |
 | 429 | `RATE_LIMITED`, `OVERLOADED` | the minute window; more than `max_inflight` requests (`Retry-After`) |
 | 500 | `INTERNAL` | |
 | 502 | `ORACLE_UNAVAILABLE` | untrained question, the oracle call failed |
 | 503 | `ORACLE_BUDGET_EXHAUSTED`, `ORACLE_DISABLED` | untrained question, no budget or a stop rule |
 
 A trained question whose oracle call fails is never an error: it is answered
-locally with `action: abstain` and the flag `oracle_unavailable`.
+locally with `action: abstain` and the flag `oracle_unavailable`. Capacity
+errors (a size limit, or the oracle's context) say `maximum context length`
+in their message; an oracle refusal of that kind is the code `context_length`
+in `oracle.jsonl` and does not count toward `oracle.max_errors`.
 
 ```bash
 # Jev's model id is not served here
@@ -616,7 +658,7 @@ native server. It does **not** load Jev weights or present itself as Jev.
 | Field | Adapter rule |
 |---|---|
 | `model` | optional. Omitted, `jev-latest`, `jev-preview`, `jev-1.13.0`, the `typesafe/jev-1.13` selector series, and `cmf-decision-0.8.5` select the current local CMF decision model at this endpoint only. |
-| `state` | a string, object, array or `null`. |
+| `state` | a string, object, array or `null`; empty (`""`, `{}`, `[]`, `null`) makes the request state-less ([section 3.2](#32-skill-matching-and-certified)). |
 | `questions` | an object of `choice`, `score` or `noul` questions. `instructions` may be omitted or `null`, matching System One clients. |
 
 For example, a client that omits `model` can send a small local choice:
@@ -661,7 +703,10 @@ format in adapter mode. Its `models` array contains the canonical
 `cmf-decision-0.8.5` entry and transport aliases such as `jev-latest`; each
 alias describes itself as a route to the local CMF model. Requests use the same
 Cortiq key policy as the rest of the server. System One errors use
-`{"error":{"type", "message", "code", "request_id"}}`.
+`{"error":{"type", "message", "code", "request_id"}}`. Schema errors and
+capacity errors (a size limit, the body included, or the oracle's context)
+are 422 here, the latter with `maximum context length` in the message — the
+marker the Decision Index `http` engine treats as an unsupported item.
 
 The adapter is deliberately isolated: `/api/alpha/decisions` and
 `/v1/decisions` keep their stricter native model rules and continue to reject
@@ -857,7 +902,8 @@ unknown key is an error. The defaults:
                "auto_skills": true, "auto_min_rows": 10, "auto_k": 8, "auto_tau": 0.9,
                "auto_min_agreement": 0.8, "auto_min_coverage": 0.8, "auto_max_skills": 256,
                "auto_max_labels": 64, "auto_max_examples_per_label": 1000,
-               "auto_temperature_min": 0.02, "auto_explore_every": 8},
+               "auto_temperature_min": 0.02, "auto_explore_every": 8,
+               "auto_min_sightings": 2, "auto_sightings_cap": 100000},
   "feedback": {"pending_cap": 50000},
   "complexity_weights": {"base": 0.4, "ambiguity": 0.25, "novelty": 0.15, "margin": 0.1, "length": 0.1},
   "complexity_tiers": [{"tier": "low", "max": 0.33}, {"tier": "medium", "max": 0.66}, {"tier": "high", "max": 1.0}],
@@ -886,7 +932,11 @@ per-label buffer cap for auto-skills; `auto_temperature_min` (0..1) floors
 the gate temperature an attempt records (0: the fitted T, whose lower bound
 makes every `p_top` 1); `auto_explore_every` (an integer, 0 = off) explores
 one text in that many while a label is quarantined — the one case in which a
-gate-accepted question reaches the oracle, auto-skills only. `cortiq serve --oracle MODEL` and its companions
+gate-accepted question reaches the oracle, auto-skills only;
+`auto_min_sightings` (≥ 1) is the sighting of a state-less contract from
+which it is registered and learned (1: at once, like a stateful one) and
+`auto_sightings_cap` (≥ 1) how many unregistered state-less contracts the
+in-memory sightings LRU tracks. `cortiq serve --oracle MODEL` and its companions
 override the `oracle` section (and `--no-oracle-learning` sets
 `learning.enabled` false); a file that sets `oracle.provider` keeps its
 `max_price` unless `--oracle-max-price` is given.
