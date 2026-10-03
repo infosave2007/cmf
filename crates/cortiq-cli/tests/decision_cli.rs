@@ -504,7 +504,13 @@ fn completion_for(body: &[u8], label: &str) -> Vec<u8> {
     let mut verdicts = Map::new();
     for q in schema["required"].as_array().unwrap() {
         let qid = q.as_str().unwrap();
+        // 0.8.8 (DESIGN C3): the verdict sits beside its distribution; a
+        // bare verdict is still read (one-hot).
         let p = &schema["properties"][qid];
+        let p = ["choice", "score", "noul"]
+            .iter()
+            .find_map(|k| p["properties"].get(*k))
+            .unwrap_or(p);
         let a = match p["type"].as_str().unwrap() {
             "string" => {
                 let opts = p["enum"].as_array().unwrap();
@@ -2496,11 +2502,18 @@ fn learn_asks_the_mock_oracle_only_about_abstentions() {
     );
 
     // A driver ledger answering the first 3 cruise texts (by body sha256).
+    // The v4 driver hashed the 0.8.7 body (no distributions): the config
+    // keeps the 0.8.8 default `probabilities: true`, and the ledger is still
+    // found.
     let cfg = Config::load(&cfg_path).unwrap();
+    assert!(cfg.oracle.probabilities);
+    let mut driver = cfg.oracle.clone();
+    driver.probabilities = false;
     let q = learn::rubric_question(&model.skill("topics").unwrap().manifest).unwrap();
     let mut ledger = vec![json!({"record_type": "run"})];
     for c in &cruise[..3] {
-        let b = oracle::request_body(&cfg.oracle, &[&q], &json!(c));
+        let b = oracle::request_body(&driver, &[&q], &json!(c));
+        assert_ne!(b, oracle::request_body(&cfg.oracle, &[&q], &json!(c)));
         ledger.push(json!({"record_type": "oracle_call",
                            "request_sha256": format!("{:x}", Sha256::digest(&b)),
                            "oracle": {"choice": "travel"}}));
@@ -4117,8 +4130,8 @@ fn decide_oracle_batch_respects_its_budget_cap_per_run() {
     let t = toy();
     let dir = tempfile::tempdir().unwrap();
     let d = dir.path();
-    // $0.00025 a call; a reservation is about $0.00035, so $0.0008 admits
-    // exactly two calls.
+    // $0.00025 a call; a reservation is about $0.00045 (0.8.8: the
+    // distribution's tokens, DESIGN C3), so $0.0008 admits exactly two calls.
     let mock = MockOpenRouter::start("travel", 0.00025);
     let base = mock.base();
     let state = d.join("state");
@@ -4235,7 +4248,7 @@ fn decide_oracle_batch_respects_its_budget_cap_per_run() {
     let hint = o["hint"].as_str().unwrap();
     assert!(
         hint.starts_with(
-            "the oracle budget of this run is used up ($0.0005 of $0.0008 spent, 2 of 10000 calls; the next call reserves $0.0003"
+            "the oracle budget of this run is used up ($0.0005 of $0.0008 spent, 2 of 10000 calls; the next call reserves $0.0004"
         ) && hint.ends_with(", which does not fit): pass a larger --oracle-budget"),
         "{o}"
     );
@@ -4320,7 +4333,7 @@ fn decide_oracle_batch_respects_its_budget_cap_per_run() {
     );
     let hint = sum["oracle"]["hint"].as_str().unwrap();
     assert!(
-        hint.starts_with(&format!("{budget_limit}the next call reserves $0.0003")),
+        hint.starts_with(&format!("{budget_limit}the next call reserves $0.0004")),
         "{sum}"
     );
     // Room for calls: the ready line shows the admin limits too (rows the

@@ -13,9 +13,12 @@
 //! 3. **single flight**: a question whose scope is in flight in another request
 //!    with cos φ_P ≥ `cache.threshold` waits for that call and reuses its answer
 //!    (as a cache answer); the others lead;
-//! 4. **one call** for every leading question ([`crate::oracle`]); the state is
-//!    PII-redacted when `oracle.redact_pii` is on and the request did not set
-//!    `cmf.allow_pii_egress` (flag `pii_redacted`);
+//! 4. **one call** for every leading question ([`crate::oracle`]); the state,
+//!    the questions' instructions and their criteria's descriptions (0.8.8,
+//!    DESIGN B4; never the option ids) are PII-redacted when
+//!    `oracle.redact_pii` is on and the request did not set
+//!    `cmf.allow_pii_egress` (flag `pii_redacted`); the cache scope, the
+//!    contract key and the learned example keep the question as asked;
 //! 5. **success**: the answers are cached (and logged; the scope holds the
 //!    question's contract, so an answer is reused only for the same
 //!    instructions and criteria), and a choice answer of a question matched
@@ -64,8 +67,9 @@
 //! state directory, a lost `learn.log`) is registered from its manifest at
 //! open and after a rollback, so it keeps learning. A contract with fewer
 //! than 2 or more than `learning.auto_max_labels` ids, or past
-//! `learning.auto_max_skills` contracts, is answered by the oracle and not
-//! recorded (`auto_skipped`).
+//! `learning.auto_max_skills` stateful (`auto_max_stateless_skills`
+//! state-less) contracts, is answered by the oracle and not recorded
+//! (`auto_skipped`).
 //! The labels of an auto-skill are closed: an example whose label is not one
 //! of the contract's ids is refused (`full`), so a superset request or a
 //! router feedback can never grow it; the pending-labels cap does not apply
@@ -79,6 +83,25 @@
 //! the oracle, so a label the gate confidently misnames still collects its
 //! examples.
 //!
+//! **State-less contracts** (0.8.8, DESIGN A19/A20): a question of a request
+//! with an empty `state` reads its own instructions
+//! ([`crate::protocol::DecisionRequest::reads_instructions`]): its φ_P is its
+//! instructions' (the cache, single flight and its example use it), its cache
+//! scope and its auto-skill hash the criteria alone
+//! ([`crate::cache::scope_of_as`], [`Contract::stateless`]), and its
+//! instructions leave for the oracle PII-redacted like a state. Such a
+//! contract is registered only from its `learning.auto_min_sightings`-th
+//! sighting (an escalation of a learnable question of it; counted in a
+//! bounded in-memory LRU of `learning.auto_sightings_cap` contracts, lost on
+//! restart), so one-off contracts — a multiple-choice benchmark whose options
+//! change with every item — never reach `learn.log` nor use up
+//! `learning.auto_max_stateless_skills`; the answers before that are not
+//! learned. Stateful contracts register at their
+//! `learning.auto_min_sightings_stateful`-th sighting (1 by default: the
+//! first, as in 0.8.6; DESIGN B2; counted in the same LRU, the contract id
+//! tells the kinds apart), against their own cap `learning.auto_max_skills`,
+//! so stateful one-offs never crowd a repeated state-less contract out.
+//!
 //! **Admin** (spec §5b): oracle status and switches, learning status (buffer,
 //! cache, quarantine, attempts, task hashes), generations and rollback (the
 //! buffer is kept, the counters restart).
@@ -91,13 +114,13 @@ use crate::answer::OracleAnswer;
 use crate::buffer::{
     AddOutcome, Contract, ContractRegistry, Example, LearnLog, LearningBuffer, LogRecord, dot,
 };
-use crate::cache::{CacheEntry, SemanticCache, scope_of};
+use crate::cache::{CacheEntry, SemanticCache, scope_of_as};
 use crate::config::Config;
 use crate::container::{DecisionModel, Verify};
 use crate::generation;
 use crate::learn::{self, AttemptReport, Books, LearnContext, Outcome};
 use crate::manifest;
-use crate::matching::MatchKind;
+use crate::matching::{DescriptionMap, MatchKind};
 use crate::metering::Usd;
 use crate::oracle::{CallOutcome, Caller, KeyLookup, OracleClient, process_env};
 use crate::pii::{FLAG_PII_REDACTED, redact_value};
@@ -233,6 +256,9 @@ struct PendingEntry {
     account: String,
     skill: String,
     options: Vec<String>,
+    /// A description match's option labels (DESIGN C2): feedback names an
+    /// option id, the example its label.
+    by_descriptions: Option<DescriptionMap>,
     state: Arc<SparseState>,
 }
 
@@ -253,8 +279,77 @@ struct Stats {
     /// Untrained contracts not learned (too many or too few ids, the
     /// registry full).
     auto_skipped: u64,
+    /// Contracts this process registered (DESIGN A20).
+    auto_registered: u64,
     auto_skipped_logged: Option<Instant>,
     recent: VecDeque<Value>,
+}
+
+/// How often each contract under a sightings gate was seen before it was
+/// registered (DESIGN A20, B2): a bounded LRU of contract ids, oldest touched
+/// evicted first. A state-less and a stateful contract never share an id.
+#[derive(Debug, Default)]
+pub struct Sightings {
+    cap: usize,
+    tick: u64,
+    counts: HashMap<String, (u32, u64)>,
+    order: std::collections::BTreeMap<u64, String>,
+}
+
+impl Sightings {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            cap: cap.max(1),
+            ..Self::default()
+        }
+    }
+
+    /// Count one sighting of `key` (it becomes the most recent); the count
+    /// after it. Past `cap` keys the least recently seen is forgotten.
+    pub fn see(&mut self, key: &str) -> u32 {
+        self.tick += 1;
+        let tick = self.tick;
+        let n = match self.counts.get_mut(key) {
+            Some((n, t)) => {
+                self.order.remove(t);
+                *n = n.saturating_add(1);
+                *t = tick;
+                *n
+            }
+            None => {
+                self.counts.insert(key.to_string(), (1, tick));
+                1
+            }
+        };
+        self.order.insert(tick, key.to_string());
+        while self.counts.len() > self.cap {
+            let Some((_, oldest)) = self.order.pop_first() else {
+                break;
+            };
+            self.counts.remove(&oldest);
+        }
+        n
+    }
+
+    /// The sightings of `key` (0 when unseen or forgotten).
+    pub fn count(&self, key: &str) -> u32 {
+        self.counts.get(key).map_or(0, |c| c.0)
+    }
+
+    /// Forget `key` (registered: its sightings no longer matter).
+    pub fn forget(&mut self, key: &str) {
+        if let Some((_, t)) = self.counts.remove(key) {
+            self.order.remove(&t);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.counts.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.counts.is_empty()
+    }
 }
 
 struct Inner {
@@ -268,6 +363,8 @@ struct Inner {
     books: Mutex<Books>,
     /// The contracts of the auto-skills (restored from `learn.log` first).
     contracts: Mutex<ContractRegistry>,
+    /// Sightings of gated contracts not registered yet (DESIGN A20, B2).
+    sightings: Mutex<Sightings>,
     bases: Mutex<HashMap<String, Arc<Rows>>>,
     flights: Mutex<Vec<Flight>>,
     next_flight: AtomicU64,
@@ -372,6 +469,7 @@ impl Cascade {
             log,
             books: Mutex::new(Books::default()),
             contracts: Mutex::new(contracts),
+            sightings: Mutex::new(Sightings::new(cfg.learning.auto_sightings_cap)),
             bases: Mutex::new(HashMap::new()),
             flights: Mutex::new(Vec::new()),
             next_flight: AtomicU64::new(1),
@@ -519,11 +617,13 @@ fn auto_contract(cfg: &Config, e: &Escalation<'_>, p: &Pending<'_>) -> Option<Co
     if criteria.len() < 2 || criteria.len() > cfg.learning.auto_max_labels {
         return None;
     }
-    Some(Contract::new(
-        &p.question.instructions,
-        criteria,
-        now_unix(),
-    ))
+    // A state-less question's instructions are its text: its contract is
+    // the criteria alone (DESIGN A19.1).
+    Some(if e.request.reads_instructions(p.question) {
+        Contract::stateless(criteria, now_unix())
+    } else {
+        Contract::new(&p.question.instructions, criteria, now_unix())
+    })
 }
 
 /// Register the contracts of the served auto-skills the registry lacks, read
@@ -630,13 +730,24 @@ impl Inner {
             if let Some(c) = contract
                 && !reg.contains(&c.skill)
             {
+                // Each kind has its own cap: stateful contracts register at
+                // their first sighting, so their one-offs must not take the
+                // slots of the repeated state-less ones (DESIGN A20).
+                let l = &self.cfg.learning;
+                let (cap, key) = if c.stateless {
+                    (l.auto_max_stateless_skills, "auto_max_stateless_skills")
+                } else {
+                    (l.auto_max_skills, "auto_max_skills")
+                };
+                let held = reg.count(c.stateless);
                 ensure!(
-                    reg.len() < self.cfg.learning.auto_max_skills,
-                    "the auto-skill registry holds {} contracts (learning.auto_max_skills)",
-                    reg.len()
+                    held < cap,
+                    "the auto-skill registry holds {held} such contracts (learning.{key})"
                 );
                 self.log.append(&LogRecord::Contract(c.clone()))?;
                 reg.insert(c.clone());
+                self.stats.lock().auto_registered += 1;
+                self.sightings.lock().forget(&c.skill);
             }
             // Closed label set: a label outside the contract (a superset
             // request, a router feedback) is refused (DESIGN A5). A served
@@ -702,6 +813,7 @@ impl Inner {
                 skipped = st.auto_skipped,
                 max_labels = self.cfg.learning.auto_max_labels,
                 max_skills = self.cfg.learning.auto_max_skills,
+                max_stateless_skills = self.cfg.learning.auto_max_stateless_skills,
                 "an untrained contract is answered by the oracle but not learned (auto-skill limits)"
             );
         }
@@ -825,6 +937,7 @@ impl Inner {
                 json!({
                     "id": c.skill,
                     "labels": c.ids,
+                    "stateless": c.stateless,
                     "examples": examples,
                     "created_unix": c.created_unix,
                     "served": served.map(|s| json!({
@@ -836,6 +949,7 @@ impl Inner {
             })
             .collect();
         let auto_contracts = self.contracts.lock().len();
+        let auto_sightings = self.sightings.lock().len();
         drop(b);
         let c = self.cache.lock();
         let cache = json!({"entries": c.len(), "hits": c.hits(), "lookups": c.lookups(),
@@ -880,6 +994,8 @@ impl Inner {
             "examples_added": st.examples, "feedback": st.feedback,
             "auto_contracts": auto_contracts,
             "auto_skipped": st.auto_skipped,
+            "auto_sightings": auto_sightings,
+            "auto_registered": st.auto_registered,
             "auto_skills": auto_skills,
             "recent": st.recent.iter().cloned().collect::<Vec<_>>(),
             "skills": Value::Object(tasks),
@@ -943,22 +1059,54 @@ impl Escalator for Cascade {
             key_budget_usd: e.principal.oracle_budget_usd.map(Usd::to_f64),
             credit_left_usd: e.oracle_credit_usd,
         };
-        // The state as it would leave for the oracle (PII redacted unless
-        // the request allows its egress), and whether it was redacted.
-        let egress_state = || {
+        // The state and the questions as they would leave for the oracle (PII
+        // redacted unless the request allows its egress), and whether
+        // anything was redacted. Every question's instructions (a state-less
+        // question's input, DESIGN A19.3) and its criteria's descriptions are
+        // redacted like a state (DESIGN B4) — the option ids, `true`/`false`
+        // and a level's position are object keys and indices, never touched.
+        // Only the egress copy changes: the scopes, the contract keys and the
+        // examples use the question as asked.
+        let redact = cfg.oracle.redact_pii && !e.request.cmf.allow_pii_egress;
+        let egress = |idx: &[usize]| -> (Value, Vec<Question>, bool) {
             let raw = e.request.state.to_value();
-            if cfg.oracle.redact_pii && !e.request.cmf.allow_pii_egress {
+            let (state, mut redacted) = if redact {
                 redact_value(&raw)
             } else {
                 (raw, false)
-            }
+            };
+            let qs = idx
+                .iter()
+                .map(|&i| {
+                    let q = e.pending[i].question;
+                    if redact {
+                        let (instructions, changed) = redact_value(&q.instructions);
+                        redacted |= changed;
+                        let criteria = q.criteria.as_ref().map(|c| {
+                            let (c, changed) = redact_value(c);
+                            redacted |= changed;
+                            c
+                        });
+                        Question {
+                            instructions,
+                            criteria,
+                            ..q.clone()
+                        }
+                    } else {
+                        q.clone()
+                    }
+                })
+                .collect();
+            (state, qs, redacted)
         };
         if let Err(r) = inner.oracle.permission(&caller) {
             if r == RefusalReason::Budget {
                 // Refused before a body was built: the status and the hints
                 // name what this request's call would reserve.
-                let qs: Vec<&Question> = e.pending.iter().map(|p| p.question).collect();
-                inner.oracle.note_budget_refusal(&qs, &egress_state().0);
+                let all: Vec<usize> = (0..n).collect();
+                let (state, qs, _) = egress(&all);
+                let qs: Vec<&Question> = qs.iter().collect();
+                inner.oracle.note_budget_refusal(&qs, &state);
             }
             return EscalationResult {
                 resolved: (0..n)
@@ -967,19 +1115,56 @@ impl Escalator for Cascade {
                 usage: OracleUsage::default(),
             };
         }
-        let phi = &e.features.phi_p;
+        // φ_P and scope of each question: the state's and its contract, or
+        // in a state-less request its instructions' and the criteria's
+        // (DESIGN A19.4).
+        let phis: Vec<&Vec<f32>> = e
+            .pending
+            .iter()
+            .map(|p| &e.features_of(p.index).phi_p)
+            .collect();
         let scopes: Vec<String> = e
             .pending
             .iter()
-            .map(|p| scope_of(p.question, p.matched))
+            .map(|p| {
+                scope_of_as(
+                    p.question,
+                    p.matched,
+                    e.request.reads_instructions(p.question),
+                )
+            })
             .collect();
         let mut out: Vec<Option<Resolved>> = vec![None; n];
+
+        // Sightings of the gated contracts not registered yet (DESIGN A20,
+        // B2: every state-less one, a stateful one when
+        // `auto_min_sightings_stateful` > 1), one per contract and request,
+        // whatever answers them next.
+        let mut seen: HashMap<String, u32> = HashMap::new();
+        if cfg.learning.enabled {
+            for p in &e.pending {
+                let Some(c) = auto_contract(cfg, e, p) else {
+                    continue;
+                };
+                // State-less contracts are always counted (the admin
+                // `auto_sightings` of 0.8.7), stateful ones only when gated.
+                let gated = c.stateless || cfg.learning.auto_min_sightings_stateful > 1;
+                if !gated || seen.contains_key(&c.skill) {
+                    continue;
+                }
+                let registered = inner.contracts.lock().contains(&c.skill);
+                if !registered {
+                    let k = inner.sightings.lock().see(&c.skill);
+                    seen.insert(c.skill, k);
+                }
+            }
+        }
 
         // 2. Cache.
         if cfg.cache.enabled {
             let mut c = inner.cache.lock();
             for i in 0..n {
-                if let Some((a, _)) = c.get(&scopes[i], phi) {
+                if let Some((a, _)) = c.get(&scopes[i], phis[i]) {
                     out[i] = Some(Resolved::new(Resolution::Cache(a)));
                 }
             }
@@ -998,6 +1183,7 @@ impl Escalator for Cascade {
                 if out[i].is_some() {
                     continue;
                 }
+                let phi = phis[i];
                 let found = fl.iter().find(|f| {
                     f.scope == scopes[i]
                         && f.phi_p.len() == phi.len()
@@ -1032,8 +1218,8 @@ impl Escalator for Cascade {
         let mut usage = OracleUsage::default();
         let mut learn_jobs: Vec<(String, String)> = Vec::new();
         if !leaders.is_empty() {
-            let (state, redacted) = egress_state();
-            let qs: Vec<&Question> = leaders.iter().map(|&i| e.pending[i].question).collect();
+            let (state, qs, redacted) = egress(&leaders);
+            let qs: Vec<&Question> = qs.iter().collect();
             let outcome = inner.oracle.call(&caller, &qs, &state);
             let flags: Vec<String> = if redacted {
                 vec![FLAG_PII_REDACTED.to_string()]
@@ -1046,6 +1232,7 @@ impl Escalator for Cascade {
                         calls: 1,
                         input_tokens: a.usage.input_tokens,
                         output_tokens: a.usage.output_tokens,
+                        reasoning_tokens: a.usage.reasoning_tokens.unwrap_or(0),
                         cost: Usd::from_f64(a.usage.cost).unwrap_or_else(|_| {
                             tracing::error!("oracle cost not representable");
                             Usd::from_units(0).expect("zero")
@@ -1062,7 +1249,7 @@ impl Escalator for Cascade {
                         if cfg.cache.enabled {
                             let entry = CacheEntry {
                                 scope: scopes[i].clone(),
-                                phi_p: phi.clone(),
+                                phi_p: phis[i].clone(),
                                 answer: v.clone(),
                                 ts,
                             };
@@ -1077,7 +1264,13 @@ impl Escalator for Cascade {
                         if !cfg.learning.enabled {
                             continue;
                         }
-                        let OracleAnswer::Choice(label) = &v else {
+                        let OracleAnswer::Choice(id) = &v.answer else {
+                            continue;
+                        };
+                        // A description match names the skill's label by
+                        // the option's description; its none option names
+                        // no label and teaches nothing (DESIGN C2).
+                        let Some(label) = p.matched.label_of(id) else {
                             continue;
                         };
                         // A matched skill learns under `teaches`; an untrained
@@ -1087,6 +1280,17 @@ impl Escalator for Cascade {
                             Some(skill) if teaches(e, p, skill) => (skill.clone(), None),
                             Some(_) => continue,
                             None => match auto_contract(cfg, e, p) {
+                                // A contract seen fewer than its kind's
+                                // `auto_min_sightings*` times is not
+                                // registered yet: its answer is not learned
+                                // (DESIGN A20, B2).
+                                Some(c)
+                                    if seen.get(&c.skill).is_some_and(|&k| {
+                                        k < cfg.learning.min_sightings(c.stateless)
+                                    }) =>
+                                {
+                                    continue;
+                                }
                                 Some(c) => (c.skill.clone(), Some(c)),
                                 None => {
                                     if cfg.learning.auto_skills
@@ -1100,8 +1304,13 @@ impl Escalator for Cascade {
                                 }
                             },
                         };
-                        let ex =
-                            Example::from_features(&skill, label, Source::Oracle, e.features, ts);
+                        let ex = Example::from_features(
+                            &skill,
+                            label,
+                            Source::Oracle,
+                            e.features_of(p.index),
+                            ts,
+                        );
                         match inner.add_example(ex, contract.as_ref()) {
                             Ok((_, Some(job))) => learn_jobs.push(job),
                             Ok(_) => {}
@@ -1139,7 +1348,7 @@ impl Escalator for Cascade {
         drop(guard);
 
         // Followers wait for their leader.
-        let wait = Duration::from_secs_f64(cfg.oracle.deadline_s) + FOLLOWER_GRACE;
+        let wait = Duration::from_secs_f64(cfg.oracle.escalation_deadline_s()) + FOLLOWER_GRACE;
         for (i, slot) in followers {
             let r = match slot.wait(wait) {
                 Some(Resolution::Oracle(a)) => Resolution::Cache(a),
@@ -1212,10 +1421,26 @@ impl Escalator for Cascade {
             }
             ring.remove(pos).ok_or_else(not_found)?
         };
+        // Under a description match the option names the skill's label; the
+        // none option names none (DESIGN C2): consumed, nothing to learn.
+        let label = match &entry.by_descriptions {
+            Some(d) if !fb.any_label => match d.label_of(&fb.label) {
+                Some(l) => l.to_string(),
+                None => {
+                    inner.stats.lock().feedback += 1;
+                    return Ok(json!({
+                        "id": fb.id, "question": fb.question, "skill": entry.skill,
+                        "label": fb.label, "accepted": false, "learned": false,
+                        "reason": "the none option names no label of the skill",
+                    }));
+                }
+            },
+            _ => fb.label.clone(),
+        };
         let model = inner.handle.current();
         let known = model
             .skill(&entry.skill)
-            .and_then(|s| s.manifest().task_of(&fb.label))
+            .and_then(|s| s.manifest().task_of(&label))
             .is_some();
         if !principal.learning_allowed {
             // The entry is consumed, as a learned feedback's is; nothing is
@@ -1231,7 +1456,7 @@ impl Escalator for Cascade {
         }
         let ex = Example {
             skill: entry.skill.clone(),
-            label: fb.label.clone(),
+            label: label.clone(),
             source: Source::ClientFeedback,
             weight: Source::ClientFeedback.default_weight(),
             ts: now_unix(),
@@ -1241,7 +1466,7 @@ impl Escalator for Cascade {
         };
         let (added, job) = inner.add_example(ex, None).map_err(|e| {
             tracing::error!(
-                error = %learn::redact_label(&format!("{e:#}"), &fb.label),
+                error = %learn::redact_label(&format!("{e:#}"), &label),
                 "feedback example"
             );
             ApiError::internal("the feedback could not be stored")
@@ -1250,8 +1475,8 @@ impl Escalator for Cascade {
         let (total, new) = {
             let b = inner.buffer.lock();
             (
-                b.examples(&entry.skill, &fb.label).len(),
-                b.new_count(&entry.skill, &fb.label),
+                b.examples(&entry.skill, &label).len(),
+                b.new_count(&entry.skill, &label),
             )
         };
         let mut learning = Value::Null;
@@ -1316,9 +1541,11 @@ impl Escalator for Cascade {
         if !inner.cfg.learning.enabled {
             return;
         }
-        let mut shared: Option<Arc<SparseState>> = None;
+        // One sparse copy per input text (the state's, or each state-less
+        // question's instructions', DESIGN A19).
+        let mut shared: Vec<(*const crate::signal::Features, Arc<SparseState>)> = Vec::new();
         let mut new = Vec::new();
-        for q in o.questions {
+        for (index, q) in o.questions.iter().enumerate() {
             let Some(skill) = &q.matched.skill else {
                 continue;
             };
@@ -1328,21 +1555,28 @@ impl Escalator for Cascade {
             let Some(question) = o.request.question(&q.id) else {
                 continue;
             };
-            let st = shared.get_or_insert_with(|| {
-                let (h_idx, h_val) = crate::rows::sparse_from_dense(&o.features.phi_h);
-                Arc::new(SparseState {
-                    phi_p: o.features.phi_p.clone(),
-                    h_idx,
-                    h_val,
-                })
-            });
+            let f = o.features_of(index);
+            let st = match shared.iter().find(|(k, _)| std::ptr::eq(*k, f)) {
+                Some((_, st)) => Arc::clone(st),
+                None => {
+                    let (h_idx, h_val) = crate::rows::sparse_from_dense(&f.phi_h);
+                    let st = Arc::new(SparseState {
+                        phi_p: f.phi_p.clone(),
+                        h_idx,
+                        h_val,
+                    });
+                    shared.push((f, Arc::clone(&st)));
+                    st
+                }
+            };
             new.push(PendingEntry {
                 request_id: o.request_id.to_string(),
                 question: q.id.clone(),
                 account: o.principal.account.clone(),
                 skill: skill.clone(),
                 options: question.options().into_iter().map(str::to_string).collect(),
-                state: Arc::clone(st),
+                by_descriptions: q.matched.by_descriptions.clone(),
+                state: st,
             });
         }
         if new.is_empty() {
@@ -1356,5 +1590,32 @@ impl Escalator for Cascade {
             }
             ring.push_back(p);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sightings LRU (DESIGN A20) counts per contract, evicts the least
+    /// recently seen past its cap and forgets a registered contract.
+    #[test]
+    fn sightings_are_a_bounded_lru() {
+        let mut s = Sightings::new(2);
+        assert_eq!(s.see("a"), 1);
+        assert_eq!(s.see("b"), 1);
+        assert_eq!(s.see("a"), 2);
+        // "b" is now the least recently seen: "c" evicts it.
+        assert_eq!(s.see("c"), 1);
+        assert_eq!((s.len(), s.count("a"), s.count("b")), (2, 2, 0));
+        assert_eq!(s.see("b"), 1, "an evicted contract starts again");
+        assert_eq!(s.count("a"), 0, "a was the oldest then");
+        s.forget("b");
+        assert_eq!((s.len(), s.count("b")), (1, 0));
+        assert!(!s.is_empty());
+        let mut one = Sightings::new(0);
+        one.see("x");
+        one.see("y");
+        assert_eq!(one.len(), 1, "the cap is at least 1");
     }
 }

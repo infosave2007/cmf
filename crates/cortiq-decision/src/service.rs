@@ -14,7 +14,13 @@
 //!    the call is not allowed the request fails with 422 before any work;
 //! 4. the encoder and the hash run once on the state text; each exact or subset
 //!    question is decided by its skill (the errors of a skill are computed once
-//!    per request), and the gate of the profile decides `local` or not;
+//!    per request), and the gate of the profile decides `local` or not. A
+//!    **state-less** request (empty `state`, 0.8.8, DESIGN A19) runs them once
+//!    per distinct instructions text instead: each question is read through
+//!    its own instructions ([`DecisionRequest::input_text`]), matched to an
+//!    auto-skill by its state-less contract, cached and escalated with the φ
+//!    of its text, its instructions redacted for the oracle like a state —
+//!    and never certified;
 //! 5. undetermined questions (gate rejected, untrained) go to the escalator in
 //!    one call when the oracle is allowed (spec §5.1: `oracle.enabled`, the
 //!    key's `oracle_allowed` and `cmf.oracle` / `default_per_request`; the
@@ -67,7 +73,7 @@
 //! does not exist and `router:uncertified_subset` is for subset matches, so that
 //! answer is `router:uncertified` (the closest correct name, the same prefix).
 
-use crate::answer::{self, OracleAnswer, Rounding};
+use crate::answer::{self, OracleAnswer, Rounding, Verdict};
 use crate::certify;
 use crate::config::Config;
 use crate::container::DecisionModel;
@@ -75,11 +81,12 @@ use crate::eval::{SkillScorer, TOP_ERRORS, f32_json, jev_confidence};
 use crate::keys::{AuthFailure, KeyRecord, KeyStore, NewKey, RateLimiter, now_unix};
 use crate::ledger::{Actions, Totals, UsageLedger, UsageRecord};
 use crate::manifest::{GateParams, SkillManifest, TaskOrigin};
-use crate::matching::{MatchKind, SkillLabels, SkillMatch, match_question};
+use crate::matching::{MatchKind, SkillLabels, SkillMatch, match_question_as};
 use crate::metering::{self, Cost, Rates, TokenCache, Usd};
 use crate::protocol::{
-    ApiError, DecisionRequest, FeedbackRequest, MODEL_ID, ModelRef, PROVIDER, Profile, Question,
-    QuestionKind, Reason, RequestLimits, model_name, new_request_id, parse_feedback, parse_request,
+    ApiError, DecisionRequest, FeedbackRequest, HUGGING_FACE_ID, MODEL_ID, ModelRef, PROVIDER,
+    Profile, Question, QuestionKind, Reason, RequestLimits, model_name, new_request_id,
+    parse_feedback, parse_request,
 };
 use crate::resonance::{Decision, decide as decide_errors};
 use crate::signal::{Features, SignalEncoder};
@@ -782,12 +789,12 @@ pub const FLAG_ORACLE_UNAVAILABLE: &str = "oracle_unavailable";
 pub const FLAG_EXPLORE: &str = "explore";
 
 /// What happened to one undetermined question.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Resolution {
-    /// A fresh oracle verdict.
-    Oracle(OracleAnswer),
+    /// A fresh oracle verdict (with its distribution, DESIGN C3).
+    Oracle(Verdict),
     /// A cached oracle verdict (no call).
-    Cache(OracleAnswer),
+    Cache(Verdict),
     /// Not sent.
     Refused(RefusalReason),
     /// Sent and failed (transport, status, parse, schema); the text is for
@@ -796,7 +803,7 @@ pub enum Resolution {
 }
 
 /// One resolution and extra flags (e.g. `pii_redacted`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Resolved {
     pub resolution: Resolution,
     pub flags: Vec<String>,
@@ -816,13 +823,16 @@ impl Resolved {
 pub struct OracleUsage {
     pub calls: u64,
     pub input_tokens: u64,
+    /// Completion tokens, the reasoning's included.
     pub output_tokens: u64,
+    /// The reasoning's share of `output_tokens` (DESIGN C4; 0 without it).
+    pub reasoning_tokens: u64,
     /// Σ `usage.cost` of the successful calls.
     pub cost: Usd,
 }
 
 /// The escalator's answer: one [`Resolved`] per pending question, in order.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct EscalationResult {
     pub resolved: Vec<Resolved>,
     pub usage: OracleUsage,
@@ -849,12 +859,28 @@ pub struct Escalation<'a> {
     pub principal: &'a Principal,
     pub model: &'a Arc<LoadedModel>,
     pub request: &'a DecisionRequest,
+    /// The features of the state (of the first question's input in a
+    /// state-less request); per question: [`Escalation::features_of`].
     pub features: &'a Features,
+    /// The features of each question's input text, by request position
+    /// (DESIGN A19): all the state's in a stateful request.
+    pub question_features: &'a [&'a Features],
     pub pending: Vec<Pending<'a>>,
     /// The most the oracle may cost this request (the provider's own USD)
     /// before the caller's `credit_usd` is used up (see
     /// [`DecisionService::oracle_credit_left`]); `None`: no such limit.
     pub oracle_credit_usd: Option<f64>,
+}
+
+impl Escalation<'_> {
+    /// The features of question `index`'s input (the state's, or its
+    /// instructions' in a state-less request).
+    pub fn features_of(&self, index: usize) -> &Features {
+        self.question_features
+            .get(index)
+            .copied()
+            .unwrap_or(self.features)
+    }
 }
 
 /// Admin operations served by the escalator (spec §5b).
@@ -880,7 +906,19 @@ pub struct Observation<'a> {
     pub model: &'a Arc<LoadedModel>,
     pub request: &'a DecisionRequest,
     pub features: &'a Features,
+    /// As [`Escalation::question_features`].
+    pub question_features: &'a [&'a Features],
     pub questions: &'a [QuestionOutcome],
+}
+
+impl Observation<'_> {
+    /// As [`Escalation::features_of`].
+    pub fn features_of(&self, index: usize) -> &Features {
+        self.question_features
+            .get(index)
+            .copied()
+            .unwrap_or(self.features)
+    }
 }
 
 /// The oracle cascade seen from the service (spec §10). Implemented by
@@ -968,12 +1006,23 @@ pub struct LocalDecision {
     /// rule of spec §5.1; the oracle's answer is served (`action: oracle` /
     /// `cache`, flag `explore`), a refused or failed call leaves this answer.
     pub explore: bool,
+    /// The none option of a description match (DESIGN C2) when it is the
+    /// answer: the gate rejected the text, or its winner is not one of the
+    /// listed labels. Such a question is answered locally (`router:none_option`),
+    /// never escalated, never certified.
+    pub none: Option<String>,
     pub certified: bool,
     pub gate: GateParams,
     pub profile: Profile,
 }
 
 impl LocalDecision {
+    /// Not answered locally: the gate of the profile rejected the text and
+    /// no none option answers it (the question then goes to the oracle).
+    pub fn undetermined(&self) -> bool {
+        !self.accepted && self.none.is_none()
+    }
+
     pub fn is_novel(&self) -> bool {
         self.decision.is_novel(self.gate.novelty_theta)
     }
@@ -1507,12 +1556,25 @@ impl DecisionService {
     pub fn decide_systemone_body(&self, body: &[u8], p: &Principal) -> Result<Decided, ApiError> {
         let req =
             crate::protocol::parse_systemone_request(body, &self.limits).map_err(|mut e| {
-                if e.reason == crate::protocol::Reason::InvalidRequest {
+                // A capacity error is 422 here too (DESIGN A21): the System
+                // One clients read 422 + the marker as "does not fit".
+                if e.reason == crate::protocol::Reason::InvalidRequest || e.is_capacity() {
                     e.status = 422;
                 }
                 e
             })?;
-        self.decide(&req, p)
+        let mut decided = self.decide(&req, p)?;
+        // Jev's forms on this surface only (DESIGN C3): a noul answer is
+        // p(true); a choice verdict without a distribution gets the one-hot
+        // one (the metered usage stays that of `/v1/decisions`).
+        if let Some(Value::Object(answers)) = decided.response.get_mut("answers") {
+            for q in &req.questions {
+                if let Some(a) = answers.get_mut(&q.id) {
+                    answer::systemone_answer(a, q);
+                }
+            }
+        }
+        Ok(decided)
     }
 
     /// Decide a request (see the module notes).
@@ -1556,15 +1618,22 @@ impl DecisionService {
             0
         };
         let LocalStage {
-            features,
+            inputs,
+            input_of,
             signal: st,
             mut locals,
             resonance,
         } = local_stage(&model, req, &matches, learning.auto_tau, explore_every)?;
+        let question_features: Vec<&Features> = input_of.iter().map(|&k| &inputs[k]).collect();
+        let features = &inputs[0];
 
         // Undetermined questions, and the explored ones.
         let pending_idx: Vec<usize> = (0..matches.len())
-            .filter(|&i| locals[i].as_ref().is_none_or(|l| !l.accepted || l.explore))
+            .filter(|&i| {
+                locals[i]
+                    .as_ref()
+                    .is_none_or(|l| l.undetermined() || l.explore)
+            })
             .collect();
         let mut resolved: Vec<Option<Resolved>> = vec![None; matches.len()];
         let mut oracle_usage = OracleUsage::default();
@@ -1586,7 +1655,8 @@ impl DecisionService {
                         principal: p,
                         model: &model,
                         request: req,
-                        features: &features,
+                        features,
+                        question_features: &question_features,
                         pending,
                         oracle_credit_usd: self.oracle_credit_left(p),
                     };
@@ -1692,7 +1762,13 @@ impl DecisionService {
 
         // Metering.
         let tokenizer = model.encoder().encoder().tokenizer();
-        let mut input_tokens = metering::state_tokens(tokenizer, &req.state_text, st.tokens);
+        // A state-less request's texts are its instructions, metered with the
+        // contracts below: its state counts as the empty text it is.
+        let mut input_tokens = if req.is_stateless() {
+            metering::text_tokens(tokenizer, &req.state_text)
+        } else {
+            metering::state_tokens(tokenizer, &req.state_text, st.tokens)
+        };
         for q in &req.questions {
             input_tokens += self.tokens.contract_tokens(
                 tokenizer,
@@ -1763,7 +1839,8 @@ impl DecisionService {
                 principal: p,
                 model: &model,
                 request: req,
-                features: &features,
+                features,
+                question_features: &question_features,
                 questions: &outcomes,
             });
         }
@@ -1853,8 +1930,10 @@ impl DecisionService {
             (Some(l), None) => (
                 Action::Local,
                 None,
-                local_answer(q, l, rounding),
-                if l.certified {
+                local_answer(q, &m, l, rounding),
+                if l.none.is_some() {
+                    "router:none_option"
+                } else if l.certified {
                     "router:certified"
                 } else if m.kind == MatchKind::Subset {
                     "router:uncertified_subset"
@@ -1867,14 +1946,14 @@ impl DecisionService {
                 match r.resolution {
                     Resolution::Oracle(a) => (
                         Action::Oracle,
-                        Some(a.clone()),
-                        a.to_answer(q),
+                        Some(a.answer.clone()),
+                        a.to_answer(q, rounding),
                         "escalate→oracle",
                     ),
                     Resolution::Cache(a) => (
                         Action::Cache,
-                        Some(a.clone()),
-                        a.to_answer(q),
+                        Some(a.answer.clone()),
+                        a.to_answer(q, rounding),
                         "escalate→cache",
                     ),
                     Resolution::Refused(reason) => {
@@ -1882,7 +1961,7 @@ impl DecisionService {
                         (
                             Action::Abstain,
                             None,
-                            local_answer_or_null(q, local.as_ref(), rounding),
+                            local_answer_or_null(q, &m, local.as_ref(), rounding),
                             "escalate→disabled",
                         )
                     }
@@ -1891,7 +1970,7 @@ impl DecisionService {
                         (
                             Action::Abstain,
                             None,
-                            local_answer_or_null(q, local.as_ref(), rounding),
+                            local_answer_or_null(q, &m, local.as_ref(), rounding),
                             "escalate→oracle_unavailable",
                         )
                     }
@@ -1971,6 +2050,7 @@ impl DecisionService {
                         "calls": metered.oracle.calls,
                         "input_tokens": metered.oracle.input_tokens,
                         "output_tokens": metered.oracle.output_tokens,
+                        "reasoning_tokens": metered.oracle.reasoning_tokens,
                         "cost": metered.oracle.cost.to_f64(),
                         "billed": c.oracle_billed.to_f64(),
                         "passthrough": self.rates.oracle_passthrough,
@@ -1986,6 +2066,9 @@ impl DecisionService {
         m.insert("source".into(), json!(o.action.source()));
         m.insert("skill".into(), json!(o.matched.skill));
         m.insert("match".into(), json!(o.matched.kind.as_str()));
+        if o.matched.by_descriptions.is_some() {
+            m.insert("by".into(), json!("descriptions"));
+        }
         m.insert("certified".into(), json!(o.certified));
         let (gate, errors) = match &o.local {
             Some(l) => {
@@ -2113,7 +2196,7 @@ impl DecisionService {
                 "context_length": tokenizer.max_length(),
                 "max_output_length": crate::protocol::MAX_CHOICE_OPTIONS,
                 "quantization": "fp32",
-                "hugging_face_id": "infosave/cortiq-decision",
+                "hugging_face_id": HUGGING_FACE_ID,
                 "pricing": {
                     "prompt": self.rates.input_per_1m.per_token_string(),
                     "completion": self.rates.output_per_1m.per_token_string(),
@@ -2156,7 +2239,13 @@ impl DecisionService {
         v["tasks"] = Value::Array(tasks);
         v["rubric"] = match &s.manifest.rubric {
             Some(r) => {
-                json!({"instructions": r.instructions, "criteria": Value::Object(r.ordered_criteria())})
+                let mut j = json!({"instructions": r.instructions, "criteria": Value::Object(r.ordered_criteria())});
+                // A state-less contract (DESIGN A19.1): its questions' text is
+                // their instructions (key added only then).
+                if let Some(input) = &r.input {
+                    j["input"] = json!(input);
+                }
+                j
             }
             None => Value::Null,
         };
@@ -2351,14 +2440,26 @@ fn match_questions(
     let labels = model.skill_labels();
     req.questions
         .iter()
-        .map(|q| match_question(&labels, q, req.cmf.skill.as_deref()))
+        .map(|q| {
+            match_question_as(
+                &labels,
+                q,
+                req.cmf.skill.as_deref(),
+                req.reads_instructions(q),
+            )
+        })
         .collect()
 }
 
-/// The encoder and hash of a request (once) and the local decision of each
-/// exact or subset question (the errors of a skill once per request).
+/// The encoder and hash of a request's input texts and the local decision of
+/// each exact or subset question (the errors of a skill once per text).
+/// `inputs` holds the features of each distinct input text in first-seen
+/// order, `input_of` the text of each question: one text — the state's — for
+/// a request with a state, exactly as before; one per distinct instructions
+/// text for a state-less request (DESIGN A19).
 struct LocalStage {
-    features: Features,
+    inputs: Vec<Features>,
+    input_of: Vec<usize>,
     signal: crate::signal::Timings,
     locals: Vec<Option<LocalDecision>>,
     resonance: Duration,
@@ -2371,33 +2472,68 @@ fn local_stage(
     auto_tau: f32,
     explore_every: u64,
 ) -> Result<LocalStage, ApiError> {
-    let mut indices = Vec::new();
-    for m in matches.iter().filter(|m| m.kind.is_local()) {
+    // The distinct texts and, per text, the skills its local questions need
+    // (a stateful request: the state alone, every local skill).
+    let mut texts: Vec<String> = Vec::new();
+    let mut input_of = Vec::with_capacity(matches.len());
+    let mut indices: Vec<Vec<usize>> = Vec::new();
+    for (q, m) in req.questions.iter().zip(matches) {
+        let text = req.input_text(q);
+        let k = match texts.iter().position(|t| *t == text) {
+            Some(k) => k,
+            None => {
+                texts.push(text);
+                indices.push(Vec::new());
+                texts.len() - 1
+            }
+        };
+        input_of.push(k);
+        if !m.kind.is_local() {
+            continue;
+        }
         let sid = m.skill.as_deref().unwrap_or_default();
         let si = model
             .skill_index(sid)
             .ok_or_else(|| internal(format!("matched skill '{sid}' is missing")))?;
-        if !indices.contains(&si) {
-            indices.push(si);
+        if !indices[k].contains(&si) {
+            indices[k].push(si);
         }
     }
-    let packed: Vec<_> = indices
-        .iter()
-        .map(|&i| model.skills[i].scorer.packed())
-        .collect();
-    let scored = model
-        .encoder()
-        .score_timed(&req.state_text, &packed)
-        .map_err(internal)?;
-    let features = scored.features;
-    let signal = scored.timings;
+    let mut inputs = Vec::with_capacity(texts.len());
+    let mut signal = crate::signal::Timings::default();
+    let mut resonance = Duration::ZERO;
+    let mut skill_errors: Vec<HashMap<usize, Vec<f32>>> = Vec::with_capacity(texts.len());
+    for (text, idx) in texts.iter().zip(indices) {
+        let packed: Vec<_> = idx
+            .iter()
+            .map(|&i| model.skills[i].scorer.packed())
+            .collect();
+        let scored = model
+            .encoder()
+            .score_timed(text, &packed)
+            .map_err(internal)?;
+        let t = scored.timings;
+        signal.tokenize += t.tokenize;
+        signal.encode += t.encode;
+        signal.gpu += t.gpu;
+        signal.hash += t.hash;
+        signal.tokens += t.tokens;
+        resonance += scored.resonance;
+        inputs.push(scored.features);
+        skill_errors.push(idx.into_iter().zip(scored.errors).collect());
+    }
     let tr = Instant::now();
-    // Exploration is a property of the text (one hash per request, DESIGN
+    // Exploration is a property of the text (one hash per input text, DESIGN
     // A16); which questions it reaches is decided per auto-skill below.
-    let explore = certify::auto_explores(&features.phi_p, explore_every);
-    let skill_errors: HashMap<usize, Vec<f32>> = indices.into_iter().zip(scored.errors).collect();
+    let explore: Vec<bool> = inputs
+        .iter()
+        .map(|f| certify::auto_explores(&f.phi_p, explore_every))
+        .collect();
+    // A19.5: a state-less request has no string state, so nothing it
+    // answers is certified.
+    let state_is_text = req.state.is_text() && !req.is_stateless();
     let mut locals: Vec<Option<LocalDecision>> = Vec::with_capacity(matches.len());
-    for m in matches {
+    for (m, &k) in matches.iter().zip(&input_of) {
         if !m.kind.is_local() {
             locals.push(None);
             continue;
@@ -2410,20 +2546,21 @@ fn local_stage(
             local_decision(
                 &model.skills[si],
                 m,
-                &skill_errors[&si],
+                &skill_errors[k][&si],
                 req.cmf.profile,
-                req.state.is_text(),
+                state_is_text,
                 auto_tau,
-                explore,
+                explore[k],
             )
             .map_err(internal)?,
         ));
     }
     Ok(LocalStage {
-        features,
+        inputs,
+        input_of,
         signal,
         locals,
-        resonance: scored.resonance + tr.elapsed(),
+        resonance: resonance + tr.elapsed(),
     })
 }
 
@@ -2488,12 +2625,19 @@ fn local_decision(
         let c = if exact { w } else { m.candidates[w] };
         scorer.origins()[c] == TaskOrigin::Data
     });
+    let choice = decision.winner.map(|w| labels[w].clone());
+    // A description match with a none option (DESIGN C2): a rejected text,
+    // or a winner the question does not list, is answered with it.
+    let none = m.none_option().and_then(|id| {
+        let listed = choice.as_deref().is_some_and(|c| m.id_of(c).is_some());
+        (!accepted || !listed).then(|| id.to_string())
+    });
     let certified = exact
         && state_is_text
         && profile != Profile::CostSaver
         && gate.certified
-        && winner_from_data;
-    let choice = decision.winner.map(|w| labels[w].clone());
+        && winner_from_data
+        && none.is_none();
     let confidence = if decision.winner.is_some() {
         jev_confidence(decision.p_top, labels.len())
     } else {
@@ -2510,6 +2654,7 @@ fn local_decision(
         gate_accepted,
         accepted,
         explore,
+        none,
         certified,
         gate,
         profile,
@@ -2517,22 +2662,79 @@ fn local_decision(
 }
 
 /// The choice answer of a local decision: every option in request order.
-fn local_answer(q: &Question, l: &LocalDecision, rounding: Rounding) -> Value {
+/// Under a description match (DESIGN C2) the options are the question's ids
+/// with their labels' probabilities; a none option holds the mass of the
+/// labels the question does not list, and when it is the answer (`l.none`)
+/// after a rejection, `1 − p_top` with the listed options scaled to the rest.
+fn local_answer(q: &Question, m: &SkillMatch, l: &LocalDecision, rounding: Rounding) -> Value {
     let options = q.options();
-    let probs: Vec<(&str, f32)> = options
+    let Some(none_id) = m.none_option() else {
+        let probs: Vec<(&str, f32)> = options
+            .iter()
+            .map(|o| {
+                let p = m.label_of(o).and_then(|lab| l.probability(lab));
+                (*o, p.unwrap_or(0.0))
+            })
+            .collect();
+        let choice = l.choice.as_deref().unwrap_or_default();
+        return answer::choice_answer(
+            &probs,
+            m.id_of(choice).unwrap_or(choice),
+            answer::answer_confidence(l.decision.p_top, options.len()),
+            rounding,
+        );
+    };
+    let mut probs: Vec<(&str, f32)> = options
         .iter()
-        .map(|o| (*o, l.probability(o).unwrap_or(0.0)))
+        .map(|o| {
+            let p = m.label_of(o).and_then(|lab| l.probability(lab));
+            (*o, p.unwrap_or(0.0))
+        })
         .collect();
+    let listed: f32 = probs.iter().map(|(_, p)| p).sum();
+    let mut p_none = (1.0 - listed).max(0.0);
+    if l.none.is_some() && !l.accepted {
+        // Rejected: the none option takes 1 − p_top of the rejected winner,
+        // the listed options share the rest in their proportions.
+        let p_top = l.decision.p_top.clamp(0.0, 1.0);
+        let scale = if listed > 0.0 { p_top / listed } else { 0.0 };
+        for (_, p) in &mut probs {
+            *p *= scale;
+        }
+        p_none = 1.0 - p_top;
+    }
+    for (o, p) in &mut probs {
+        if *o == none_id {
+            *p = p_none;
+        }
+    }
+    let choice = match &l.none {
+        Some(id) => id.as_str(),
+        None => l
+            .choice
+            .as_deref()
+            .and_then(|c| m.id_of(c))
+            .unwrap_or_default(),
+    };
+    let p_choice = probs
+        .iter()
+        .find(|(o, _)| *o == choice)
+        .map_or(0.0, |(_, p)| *p);
     answer::choice_answer(
         &probs,
-        l.choice.as_deref().unwrap_or_default(),
-        answer::answer_confidence(l.decision.p_top, options.len()),
+        choice,
+        answer::answer_confidence(p_choice, options.len()),
         rounding,
     )
 }
 
-fn local_answer_or_null(q: &Question, l: Option<&LocalDecision>, rounding: Rounding) -> Value {
-    l.map_or(Value::Null, |l| local_answer(q, l, rounding))
+fn local_answer_or_null(
+    q: &Question,
+    m: &SkillMatch,
+    l: Option<&LocalDecision>,
+    rounding: Rounding,
+) -> Value {
+    l.map_or(Value::Null, |l| local_answer(q, m, l, rounding))
 }
 
 /// `"<a> leads <b> by <Δscore> score"` (router `api.rs:1141-1165`).
@@ -2567,9 +2769,19 @@ fn untrained_error(
         Reason::OracleDisabled => 1,
         _ => 0,
     };
+    // The oracle said the prompt does not fit its context (DESIGN A21): a
+    // capacity error (422 with the marker), not an outage.
+    let mut overflow = false;
     for (i, res) in unresolved {
         let m = &matches[*i];
         let (reason, oracle) = match res {
+            Resolution::Failed(code) if code == crate::oracle::CONTEXT_LENGTH_CODE => {
+                overflow = true;
+                (
+                    Reason::UnsupportedQuestion,
+                    "the question does not fit the oracle's context",
+                )
+            }
             Resolution::Failed(_) => (Reason::OracleUnavailable, "the oracle call failed"),
             Resolution::Refused(RefusalReason::Budget) => (
                 Reason::OracleBudgetExhausted,
@@ -2623,6 +2835,14 @@ fn untrained_error(
         }
         _ => "the local model cannot answer these questions and the oracle is not allowed",
     };
+    if overflow {
+        return ApiError::capacity(
+            Reason::UnsupportedQuestion,
+            None,
+            "the local model cannot answer these questions and they do not fit the oracle's context",
+        )
+        .with_detail("questions", Value::Object(details));
+    }
     ApiError::new(worst, message).with_detail("questions", Value::Object(details))
 }
 

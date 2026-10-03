@@ -191,15 +191,10 @@ pub fn contract_ids(ids: &[&str]) -> Vec<String> {
 /// of their criteria are one contract; any difference in the instructions or
 /// in a description is another contract.
 pub fn contract_value(instructions: &Value, criteria: &Map<String, Value>) -> Value {
-    let sorted: BTreeSet<&String> = criteria.keys().collect();
-    let mut c = Map::new();
-    for k in sorted {
-        c.insert(k.clone(), criteria[k].clone());
-    }
     let mut m = Map::new();
     m.insert("type".into(), Value::String("choice".into()));
     m.insert("instructions".into(), instructions.clone());
-    m.insert("criteria".into(), Value::Object(c));
+    m.insert("criteria".into(), sorted_criteria(criteria));
     Value::Object(m)
 }
 
@@ -215,6 +210,49 @@ pub fn auto_skill_id(instructions: &Value, criteria: &Map<String, Value>) -> Str
     format!(
         "{AUTO_SKILL_PREFIX}{}",
         &contract_sha256(instructions, criteria)[..AUTO_SKILL_ID_HEX]
+    )
+}
+
+/// The `input` marker of a state-less contract (DESIGN A19.1): the local
+/// model reads each question's instructions, so they are data, not part of
+/// the contract.
+pub const INPUT_INSTRUCTIONS: &str = "instructions";
+
+/// The canonical form of a state-less choice contract (DESIGN A19.1):
+/// `{"type":"choice","input":"instructions","criteria":{…}}` — the criteria
+/// as in [`contract_value`] (keys sorted, descriptions kept), no
+/// instructions: a request whose `state` is empty carries its text in the
+/// instructions, which differ with every text. The `input` key keeps it
+/// apart from any stateful contract over the same criteria (whose canonical
+/// form always has an `instructions` key and never an `input` one).
+pub fn stateless_contract_value(criteria: &Map<String, Value>) -> Value {
+    let mut m = Map::new();
+    m.insert("type".into(), Value::String("choice".into()));
+    m.insert("input".into(), Value::String(INPUT_INSTRUCTIONS.into()));
+    m.insert("criteria".into(), sorted_criteria(criteria));
+    Value::Object(m)
+}
+
+fn sorted_criteria(criteria: &Map<String, Value>) -> Value {
+    let sorted: BTreeSet<&String> = criteria.keys().collect();
+    let mut c = Map::new();
+    for k in sorted {
+        c.insert(k.clone(), criteria[k].clone());
+    }
+    Value::Object(c)
+}
+
+/// sha256 of a state-less choice contract ([`stateless_contract_value`]).
+pub fn stateless_contract_sha256(criteria: &Map<String, Value>) -> String {
+    canonical::sha256_hex(&stateless_contract_value(criteria))
+}
+
+/// The id of the auto-skill of a state-less choice contract: `auto-` + the
+/// first 12 hex characters of [`stateless_contract_sha256`].
+pub fn stateless_auto_skill_id(criteria: &Map<String, Value>) -> String {
+    format!(
+        "{AUTO_SKILL_PREFIX}{}",
+        &stateless_contract_sha256(criteria)[..AUTO_SKILL_ID_HEX]
     )
 }
 
@@ -1279,6 +1317,13 @@ pub struct Rubric {
     /// JSON sorts keys; the oracle's schema enum follows this order).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub criteria_order: Vec<String>,
+    /// [`INPUT_INSTRUCTIONS`] for the auto-skill of a state-less contract
+    /// (DESIGN A19.1, 0.8.8): its contract is the criteria alone
+    /// ([`stateless_contract_sha256`]) and `instructions` is `null`; absent
+    /// (and never written) for every other rubric, so older manifests keep
+    /// their bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
 }
 
 impl Rubric {
@@ -1290,19 +1335,43 @@ impl Rubric {
             instructions: instructions.into(),
             criteria,
             criteria_order: if sorted { Vec::new() } else { keys },
+            input: None,
         }
+    }
+
+    /// The rubric of a state-less contract (DESIGN A19.1): the criteria in
+    /// their request order, `instructions` `null`, `input` marked.
+    pub fn stateless(criteria: Map<String, Value>) -> Self {
+        Self {
+            input: Some(INPUT_INSTRUCTIONS.into()),
+            ..Self::new(Value::Null, criteria)
+        }
+    }
+
+    /// The rubric of a state-less contract ([`Rubric::stateless`]).
+    pub fn is_stateless(&self) -> bool {
+        self.input.is_some()
     }
 
     /// The contract sha of the rubric as a choice contract
     /// ([`contract_sha256`]): instructions and criteria verbatim, the key
-    /// order ignored.
+    /// order ignored; the criteria alone for a state-less contract
+    /// ([`stateless_contract_sha256`]).
     pub fn contract_sha256(&self) -> String {
-        contract_sha256(&self.instructions, &self.criteria)
+        if self.is_stateless() {
+            stateless_contract_sha256(&self.criteria)
+        } else {
+            contract_sha256(&self.instructions, &self.criteria)
+        }
     }
 
-    /// The auto-skill id of the rubric's contract ([`auto_skill_id`]).
+    /// The auto-skill id of the rubric's contract ([`auto_skill_id`],
+    /// [`stateless_auto_skill_id`]).
     pub fn auto_skill_id(&self) -> String {
-        auto_skill_id(&self.instructions, &self.criteria)
+        format!(
+            "{AUTO_SKILL_PREFIX}{}",
+            &self.contract_sha256()[..AUTO_SKILL_ID_HEX]
+        )
     }
 
     /// Criteria keys in the question file's order.
@@ -1622,6 +1691,17 @@ impl SkillManifest {
                 other => canonical::to_string(other).len(),
             };
             ensure!(instructions_len <= 1 << 20, "rubric instructions too long");
+            if let Some(input) = &r.input {
+                // Only the auto-skill of a state-less contract reads its
+                // instructions as input (DESIGN A19.1); its rubric has none.
+                ensure!(
+                    input == INPUT_INSTRUCTIONS
+                        && r.instructions.is_null()
+                        && is_auto_skill_id(&self.id)
+                        && self.data.train.n == 0,
+                    "rubric input is '{INPUT_INSTRUCTIONS}' only on a state-less auto-skill (instructions null)"
+                );
+            }
             for k in r.criteria.keys() {
                 ensure!(
                     seen.contains(k.as_str()),
@@ -1903,6 +1983,90 @@ mod tests {
         // The rubric reproduces the id whatever its key order.
         assert_eq!(Rubric::new(which.clone(), cba).auto_skill_id(), a);
         assert_eq!(contract_ids(&["b", "a", "b"]), ["a", "b"]);
+    }
+
+    /// A state-less contract (DESIGN A19.1) is `{type, input:
+    /// "instructions", criteria}`: the instructions are not in it, the
+    /// criteria order is not, a description is; it never equals a stateful
+    /// contract over the same criteria (`null` instructions included), and a
+    /// state-less rubric reproduces it and validates only on an auto-skill.
+    #[test]
+    fn a_stateless_contract_key_has_the_input_marker() {
+        let d = |l: &str| Value::String(format!("about {l}"));
+        let ab = criteria(&[("B", d("B")), ("A", d("A"))]);
+        let ba = criteria(&[("A", d("A")), ("B", d("B"))]);
+        let sha = stateless_contract_sha256(&ab);
+        assert_eq!(sha, stateless_contract_sha256(&ba));
+        assert_eq!(
+            sha,
+            canonical::sha256_hex(&serde_json::json!({
+                "type": "choice", "input": "instructions",
+                "criteria": {"A": "about A", "B": "about B"},
+            }))
+        );
+        for instructions in [
+            Value::Null,
+            Value::String(String::new()),
+            Value::String("x".into()),
+        ] {
+            assert_ne!(sha, contract_sha256(&instructions, &ab));
+        }
+        let mut changed = ab.clone();
+        changed.insert("A".into(), Value::String("other".into()));
+        assert_ne!(sha, stateless_contract_sha256(&changed));
+        let r = Rubric::stateless(ab.clone());
+        assert!(r.is_stateless() && r.instructions.is_null());
+        assert_eq!(r.contract_sha256(), sha);
+        assert_eq!(r.auto_skill_id(), stateless_auto_skill_id(&ab));
+        assert_eq!(r.order(), ["B", "A"]);
+        // Serialised with the marker; a plain rubric stays byte-identical.
+        let j = serde_json::to_value(&r).unwrap();
+        assert_eq!(j["input"], "instructions");
+        assert!(
+            serde_json::to_value(Rubric::new("Pick.", ab.clone()))
+                .unwrap()
+                .get("input")
+                .is_none()
+        );
+        let mut m = SkillManifest::auto_skeleton(&r, 8);
+        m.representation_id = RID.into();
+        m.rows = RowsRecord {
+            tensor: rows_tensor(&m.id),
+            layout: rows::LAYOUT.into(),
+            n_train: 0,
+            n_calibration: 0,
+            n_learned: 0,
+            sha256: sha256_hex(b"empty"),
+        };
+        assert_eq!(m.id, stateless_auto_skill_id(&ab));
+        assert_eq!(m.data.train.sha256, sha);
+        m.validate(RID, 4104).unwrap();
+        // The marker with instructions, or another value: refused.
+        let mut bad = m.clone();
+        bad.rubric.as_mut().unwrap().instructions = Value::String("x".into());
+        assert!(
+            bad.validate(RID, 4104)
+                .unwrap_err()
+                .to_string()
+                .contains("rubric input")
+        );
+        let mut bad = m.clone();
+        bad.rubric.as_mut().unwrap().input = Some("state".into());
+        assert!(
+            bad.validate(RID, 4104)
+                .unwrap_err()
+                .to_string()
+                .contains("rubric input")
+        );
+        // Dropping the marker changes the contract: the id no longer matches.
+        let mut bad = m;
+        bad.rubric.as_mut().unwrap().input = None;
+        assert!(
+            bad.validate(RID, 4104)
+                .unwrap_err()
+                .to_string()
+                .contains("hash of its contract")
+        );
     }
 
     fn skeleton() -> SkillManifest {
