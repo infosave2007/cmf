@@ -26,6 +26,14 @@
 //! (50,000) the oldest entry leaves (a ring). The cache is consulted only when a
 //! question is escalated; its puts are kept in `learn.log` and replayed at start.
 //!
+//! **Distributions** (0.8.8, DESIGN C3): an entry keeps the oracle's verdict
+//! with its normalized distribution ([`Verdict`]), so a hit answers with it.
+//! An entry without one (a one-hot verdict) is logged as the `CachePut`
+//! record of 0.8.7; an entry with one as a `CachePutP` record (the same
+//! payload, then the distribution) — a 0.8.7 binary stops its replay at the
+//! first such record. Two answers are "the same" for the put's dedup when
+//! their verdicts are, whatever their distributions.
+//!
 //! **Scope index** (0.8.8, DESIGN B3): next to the global ring, each scope
 //! keeps the sequence numbers of its entries in insertion order, so a lookup
 //! and a put's dedup scan only that scope's entries — the same entries in the
@@ -33,7 +41,7 @@
 //! answers, ties and evictions. The index is derived from the ring (a replay
 //! of `learn.log` rebuilds it through [`SemanticCache::put`]).
 
-use crate::answer::OracleAnswer;
+use crate::answer::{OracleAnswer, Verdict};
 use crate::buffer::{Dec, Enc, dot};
 use crate::canonical;
 use crate::matching::SkillMatch;
@@ -50,14 +58,15 @@ pub const PUT_DEDUP: f32 = 0.999;
 pub struct CacheEntry {
     pub scope: String,
     pub phi_p: Vec<f32>,
-    pub answer: OracleAnswer,
+    pub answer: Verdict,
     pub ts: u64,
 }
 
 impl CacheEntry {
+    /// The `CachePut` payload (the verdict, not its distribution).
     pub(crate) fn encode(&self, e: &mut Enc) {
         e.str(&self.scope);
-        match &self.answer {
+        match &self.answer.answer {
             OracleAnswer::Choice(c) => {
                 e.u8(0).str(c);
             }
@@ -71,6 +80,29 @@ impl CacheEntry {
         e.u64(self.ts).f32s(&self.phi_p);
     }
 
+    /// The `CachePutP` payload: the `CachePut` one, then the distribution
+    /// (`u32` count, then `str` key and `f32` probability each).
+    pub(crate) fn encode_with_probabilities(&self, e: &mut Enc) {
+        self.encode(e);
+        e.u32(self.answer.probabilities.len() as u32);
+        for (k, p) in &self.answer.probabilities {
+            e.str(k).f32(*p);
+        }
+    }
+
+    /// Decode a `CachePutP` payload.
+    pub(crate) fn decode_with_probabilities(d: &mut Dec<'_>) -> Result<Self> {
+        let mut entry = Self::decode(d)?;
+        let n = d.u32()? as usize;
+        let mut probabilities = Vec::with_capacity(n.min(1024));
+        for _ in 0..n {
+            probabilities.push((d.str()?, d.f32()?));
+        }
+        entry.answer.probabilities = probabilities;
+        Ok(entry)
+    }
+
+    /// Decode a `CachePut` payload (a one-hot verdict).
     pub(crate) fn decode(d: &mut Dec<'_>) -> Result<Self> {
         let scope = d.str()?;
         let answer = match d.u8()? {
@@ -85,7 +117,7 @@ impl CacheEntry {
         };
         Ok(Self {
             scope,
-            answer,
+            answer: Verdict::one_hot(answer),
             ts: d.u64()?,
             phi_p: d.f32s()?,
         })
@@ -192,7 +224,7 @@ impl SemanticCache {
     }
 
     /// A hit: the answer and its cos (counted in the statistics).
-    pub fn get(&mut self, scope: &str, phi_p: &[f32]) -> Option<(OracleAnswer, f32)> {
+    pub fn get(&mut self, scope: &str, phi_p: &[f32]) -> Option<(Verdict, f32)> {
         self.lookups += 1;
         let found = self
             .nearest(scope, phi_p)
@@ -206,7 +238,7 @@ impl SemanticCache {
 
     /// A second lookup of the same question (e.g. under the single-flight lock):
     /// a hit is counted, the lookup is not (it was counted by [`SemanticCache::get`]).
-    pub fn recheck(&mut self, scope: &str, phi_p: &[f32]) -> Option<(OracleAnswer, f32)> {
+    pub fn recheck(&mut self, scope: &str, phi_p: &[f32]) -> Option<(Verdict, f32)> {
         let found = self
             .nearest(scope, phi_p)
             .filter(|(_, c)| *c >= self.threshold)
@@ -220,7 +252,7 @@ impl SemanticCache {
     /// Store an answer; `false` when a near-identical entry already holds it.
     pub fn put(&mut self, entry: CacheEntry) -> bool {
         let dup = self.scope_entries(&entry.scope).any(|e| {
-            e.answer == entry.answer
+            e.answer.answer == entry.answer.answer
                 && e.phi_p.len() == entry.phi_p.len()
                 && dot(&e.phi_p, &entry.phi_p) >= PUT_DEDUP
         });
@@ -285,7 +317,7 @@ mod tests {
         c.put(CacheEntry {
             scope: scope.into(),
             phi_p: unit(v),
-            answer: OracleAnswer::Choice(label.into()),
+            answer: OracleAnswer::Choice(label.into()).into(),
             ts: 0,
         })
     }
@@ -296,7 +328,7 @@ mod tests {
         assert!(put(&mut c, "a", &[1.0, 0.0, 0.0], "x"));
         assert_eq!(
             c.get("a", &unit(&[0.99, 0.05, 0.0])).map(|(a, _)| a),
-            Some(OracleAnswer::Choice("x".into()))
+            Some(OracleAnswer::Choice("x".into()).into())
         );
         assert!(c.get("a", &unit(&[0.0, 1.0, 0.0])).is_none());
         assert!(c.get("b", &unit(&[1.0, 0.0, 0.0])).is_none());
@@ -340,7 +372,7 @@ mod tests {
             best
         }
 
-        fn get(&self, scope: &str, phi_p: &[f32]) -> Option<(OracleAnswer, f32)> {
+        fn get(&self, scope: &str, phi_p: &[f32]) -> Option<(Verdict, f32)> {
             self.nearest(scope, phi_p)
                 .filter(|(_, c)| *c >= self.threshold)
                 .map(|(e, c)| (e.answer.clone(), c))
@@ -349,7 +381,7 @@ mod tests {
         fn put(&mut self, entry: CacheEntry) -> bool {
             let dup = self.entries.iter().any(|e| {
                 e.scope == entry.scope
-                    && e.answer == entry.answer
+                    && e.answer.answer == entry.answer.answer
                     && e.phi_p.len() == entry.phi_p.len()
                     && dot(&e.phi_p, &entry.phi_p) >= PUT_DEDUP
             });
@@ -398,7 +430,7 @@ mod tests {
                     let e = CacheEntry {
                         scope,
                         phi_p: v,
-                        answer: OracleAnswer::Choice(format!("l{}", next(3))),
+                        answer: OracleAnswer::Choice(format!("l{}", next(3))).into(),
                         ts: step,
                     };
                     assert_eq!(

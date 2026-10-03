@@ -1263,7 +1263,7 @@ impl Escalator for Cascade {
                         if !cfg.learning.enabled {
                             continue;
                         }
-                        let OracleAnswer::Choice(id) = &v else {
+                        let OracleAnswer::Choice(id) = &v.answer else {
                             continue;
                         };
                         // A description match names the skill's label by

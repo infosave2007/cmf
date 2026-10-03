@@ -519,7 +519,13 @@ fn verdicts(req: &MockRequest, choose: impl Fn(&str, &[String]) -> Value) -> Val
     let mut out = Map::new();
     for q in schema["required"].as_array().unwrap() {
         let qid = q.as_str().unwrap();
+        // 0.8.8 (DESIGN C3): the verdict sits beside its distribution; a
+        // bare verdict is still read (one-hot).
         let p = &schema["properties"][qid];
+        let p = ["choice", "score", "noul"]
+            .iter()
+            .find_map(|k| p["properties"].get(*k))
+            .unwrap_or(p);
         let a = match p["type"].as_str().unwrap() {
             "string" => {
                 let opts: Vec<String> = p["enum"]
@@ -824,9 +830,11 @@ async fn abstain_goes_to_the_oracle_then_the_cache_over_both_apis() {
     assert_eq!(r.q("task")["certified"], false);
     assert_eq!(r.q("task")["gate"]["accepted"], false);
     assert_eq!(r.q("task")["decision_path"], "escalate→oracle");
+    // A verdict without a distribution: one-hot (DESIGN C3).
     assert_eq!(
         r.body["answers"]["task"],
-        json!({"type": "choice", "choice": "travel"})
+        json!({"type": "choice", "choice": "travel",
+               "probabilities": {"Weather": 0, "billing": 0, "cards": 0, "travel": 1}, "confidence": 1})
     );
     let u = &r.body["cmf"]["usage"]["oracle"];
     assert_eq!(
@@ -1667,6 +1675,8 @@ async fn one_choice_bodies_on_the_wire_equal_the_driver_for_nine_ledger_calls() 
     });
     let mut cfg = stand_config(&mock.url());
     cfg.cache.enabled = false;
+    // The driver's body: no distribution asked (DESIGN C3).
+    cfg.oracle.probabilities = false;
     let srv = Srv::new(&cfg);
     for (i, (q, row)) in cases.iter().enumerate() {
         let mut question = q.as_object().unwrap().clone();
@@ -1676,10 +1686,9 @@ async fn one_choice_bodies_on_the_wire_equal_the_driver_for_nine_ledger_calls() 
             .await;
         assert_eq!(r.status, 200, "row {i}: {}", r.text);
         assert_eq!(r.action(), "oracle", "row {i}");
-        assert_eq!(
-            r.body["answers"]["task"],
-            json!({"type": "choice", "choice": row["oracle"]["choice"]})
-        );
+        let a = &r.body["answers"]["task"];
+        assert_eq!(a["choice"], row["oracle"]["choice"]);
+        assert_eq!(a["probabilities"][a["choice"].as_str().unwrap()], 1);
         assert_eq!(
             r.body["usage"]["cost"].as_f64(),
             row["oracle"]["usage"]["cost"].as_f64()
@@ -4469,8 +4478,9 @@ fn kit_valid_choice(q: &Value, a: &Value) {
 }
 
 /// System One oracle and cache choice answers carry the one-hot distribution
-/// (the chosen option 1, the others 0, confidence 1), so the Decision Index
-/// kit's validator accepts them; the native answer stays `{type, choice}`.
+/// (the chosen option 1, the others 0, confidence 1) when the oracle gives
+/// none, so the Decision Index kit's validator accepts them; the native
+/// answer is the same (0.8.8, DESIGN C3).
 /// The kit's default model name `default` is accepted on System One.
 #[tokio::test]
 async fn systemone_oracle_answers_carry_the_one_hot_distribution() {
@@ -4506,13 +4516,10 @@ async fn systemone_oracle_answers_carry_the_one_hot_distribution() {
     assert_eq!(mock.hits(), 1, "{}", r.text);
     kit_valid_choice(&q, &r.body["answers"]["task"]);
     assert_eq!(r.body["answers"]["task"], *a);
-    // The native surface keeps the oracle schema's answer.
+    // The native surface answers alike (0.8.8, DESIGN C3).
     let r = ask(&srv, &q, text).await;
     assert_eq!(r.action(), "cache", "{}", r.text);
-    assert_eq!(
-        r.body["answers"]["task"],
-        json!({"type": "choice", "choice": chosen})
-    );
+    assert_eq!(r.body["answers"]["task"], *a);
 }
 
 /// Capacity errors (DESIGN A21): a state-less request whose instructions
@@ -4940,4 +4947,123 @@ async fn kit_rows_reach_data_skills_through_their_descriptions() {
     assert_eq!(n.q("q1")["match"], "untrained", "{}", n.text);
     assert_eq!(n.q("q1")["action"], "oracle");
     assert!(n.q("q1").get("by").is_none());
+}
+
+// ------------------------------------------------------------------ oracle distributions (C3)
+
+/// An oracle answering with distributions (DESIGN C3): a choice states its
+/// first option but lists the last at 0.6 and the first at 0.3; a score
+/// states level 0 and lists 0.1/0.7/0.2; a noul states true with p 0.8.
+fn distribution_mock() -> MockOracle {
+    MockOracle::start(|req| {
+        let v = req.json();
+        let schema = &v["response_format"]["json_schema"]["schema"];
+        let mut out = Map::new();
+        for q in schema["required"].as_array().unwrap() {
+            let qid = q.as_str().unwrap();
+            let p = &schema["properties"][qid]["properties"];
+            let a = if let Some(c) = p.get("choice") {
+                let opts = c["enum"].as_array().unwrap();
+                let (first, last) = (&opts[0], &opts[opts.len() - 1]);
+                json!({"choice": first, "probabilities": [{"id": last, "p": 0.6}, {"id": first, "p": 0.3}]})
+            } else if p.get("score").is_some() {
+                json!({"score": 0, "probabilities": [0.1, 0.7, 0.2]})
+            } else {
+                json!({"noul": true, "p_true": 0.8})
+            };
+            out.insert(qid.to_string(), a);
+        }
+        MockReply {
+            status: 200,
+            body: completion(&Value::Object(out).to_string(), json!(2e-5), ORACLE_MODEL),
+            delay: Duration::ZERO,
+        }
+    })
+}
+
+/// Oracle distributions end to end (DESIGN C3): normalized (the argmax wins
+/// over the stated verdict, the unlisted share the rest), on System One in
+/// Jev's forms that the kit's validator accepts (a noul is p(true)), on
+/// `/v1/decisions` with `probabilities` and `confidence` = p(choice) beside
+/// the documented verdicts; the cache answers a repeat with the stored
+/// distribution, also after a restart (replayed from `learn.log`); the
+/// example learned is the argmax label.
+#[tokio::test]
+async fn oracle_distributions_reach_every_surface_and_the_cache() {
+    let mock = distribution_mock();
+    let cfg = stand_config(&mock.url());
+    let jev = |o: &mut ServeOptions| o.jev_compatible = true;
+    let srv = Srv::open_with(
+        &toy().path,
+        tempfile::tempdir().unwrap(),
+        &cfg,
+        test_key(),
+        jev,
+    );
+    let task = choice(&TOPICS);
+    let noul = json!({"type": "noul", "instructions": "Is it urgent?"});
+    let text = &rejected()[0];
+    let s1 = json!({"model": "default", "state": text, "questions": {"task": task.clone(), "urgent": noul}});
+    let r = srv.post("/v1/systemone", None, &s1).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(mock.hits(), 1);
+    let sent = mock.requests()[0].json();
+    assert!(
+        sent["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with(cortiq_decision::oracle::SYSTEM_TYPED_P)
+    );
+    let a = &r.body["answers"]["task"];
+    kit_valid_choice(&task, a);
+    assert_eq!(a["choice"], "travel", "the argmax, not the stated Weather");
+    assert_eq!(a["confidence"].as_f64(), Some(0.6), "{a}");
+    assert_eq!(a["probabilities"]["Weather"].as_f64(), Some(0.3));
+    assert_eq!(a["probabilities"]["billing"].as_f64(), Some(0.05), "{a}");
+    assert_eq!(
+        r.body["answers"]["urgent"],
+        json!({"type": "noul", "noul": 0.8})
+    );
+
+    // The native surface: the same distribution, the noul verdict beside it,
+    // a score with its levels' probabilities. A cache answer for the choice
+    // and the noul (the same text and contracts), the oracle for the score.
+    let score =
+        json!({"type": "score", "instructions": "How urgent?", "criteria": ["low", "mid", "high"]});
+    let native = body(
+        json!(text),
+        json!({"task": task.clone(), "urgent": json!({"type": "noul", "instructions": "Is it urgent?"}), "level": score}),
+        None,
+    );
+    let r = srv.decide(&native).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(mock.hits(), 2);
+    assert_eq!(r.q("task")["action"], "cache");
+    assert_eq!(r.body["answers"]["task"], *a);
+    assert_eq!(
+        r.body["answers"]["urgent"],
+        json!({"type": "noul", "noul": 1, "value_semantics": "boolean_verdict_not_probability", "probability": 0.8})
+    );
+    let l = &r.body["answers"]["level"];
+    assert_eq!(l["score"], 1, "{l}");
+    assert_eq!(l["probabilities"]["1"].as_f64(), Some(0.7), "{l}");
+    assert_eq!(l["confidence"].as_f64(), Some(0.7), "{l}");
+
+    // The example is the argmax label.
+    let learning = srv.learning().await;
+    assert!(
+        learning["buffer"]["labels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["skill"] == "topics" && x["label"] == "travel"),
+        "{learning}"
+    );
+
+    // A restart replays the cache with its distributions.
+    let srv = srv.restart(&cfg);
+    let r = srv.decide(&topics_body(text)).await;
+    assert_eq!(r.action(), "cache", "{}", r.text);
+    assert_eq!(r.body["answers"]["task"], *a);
+    assert_eq!(mock.hits(), 2);
 }
