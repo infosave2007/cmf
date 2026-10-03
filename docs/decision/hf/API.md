@@ -257,7 +257,7 @@ The response of `POST /v1/admin/keys` is the only place the raw key appears.
 | Field | Rules |
 |---|---|
 | `model` | `"cortiq/decision"` or `"cortiq/decision@<12 hex>"` of the served generation; anything else, a Jev name included, is 404 `MODEL_NOT_FOUND` |
-| `state` | string, object or array; an object or array is used as its canonical JSON and the answers are then not certified; at most 32 KiB. Empty (`""`, `{}`, `[]`, `null`): a *state-less* request, each question's `instructions` are its input ([section 3.2](#32-skill-matching-and-certified)) |
+| `state` | string, object or array; an object or array is used as its canonical JSON and the answers are then not certified; at most 32 KiB. Empty (`""`, `{}`, `[]`, `null`): a *state-less* request, each question's `instructions` are its input — past a lead-in line: when the first line ends with `:` and text follows, that text alone (0.8.8) ([section 3.2](#32-skill-matching-and-certified)) |
 | `questions` | object of 1–32 questions in request order; ids up to 128 characters |
 | question | `{type, instructions, criteria}`; `type` is `choice`, `score` or `noul`; `instructions` is required |
 | choice `criteria` | object of 2–255 options; option ids 1–256 bytes; each description a string, object, array or `null` up to 24000 bytes; key order is kept |
@@ -354,8 +354,9 @@ curl -s "$CORTIQ/api/alpha/decisions" \
 
 ### 3.2 Skill matching and `certified`
 
-The local model looks only at the option ids (instructions and descriptions
-matter to the oracle alone). With L = the option ids of a choice question:
+The local model looks at the option ids first (instructions matter to the
+oracle alone; descriptions only through the description match below). With
+L = the option ids of a choice question:
 
 | Match | When | Decided by |
 |---|---|---|
@@ -363,6 +364,33 @@ matter to the oracle alone). With L = the option ids of a choice question:
 | `subset` | L is a strict subset (at least 2) of one skill's labels | argmin, softmax, margin and novelty over L only; the same T, θ, τ; never certified |
 | `superset` | one skill's labels plus labels it does not know | the oracle only; its answer teaches that skill only for a key with `learning_allowed` |
 | `untrained` | anything else, and every `score` / `noul` question | the oracle only; without it the request is 422 |
+
+**Matching by descriptions (0.8.8).** A choice question whose ids relate to
+no skill (or, in a state-less request, only to an auto-skill's contract — a
+data skill outranks it) is related to a *data* skill through its option
+descriptions: when every description is a string that normalizes (trimmed,
+lowercase, `_`, `-` and runs of whitespace as one space) to a distinct label
+of exactly one data skill, labels normalized alike. That is the shape of
+benchmark kits with positional ids: BANKING77 rows (`option_0`…`option_76`,
+the label names as descriptions) reach `banking77`, CLINC150 rows (the
+labels with spaces) reach `clinc150`. The relation is `exact` or `subset`
+as with ids, the answer is given in the question's option ids (its
+`probabilities` mapped back), and `cmf.questions.<id>` adds `"by":
+"descriptions"`. Besides the mapped options at most one **none option** is
+allowed — a description starting with "out of scope" or "none of" (CLINC's
+"out of scope: none of the listed intents"): the text is then decided over
+all the skill's labels, and when the gate rejects it (or its winner is not
+listed) the answer is that none option, locally — `action: local`,
+`decision_path: router:none_option`, never escalated, never certified; its
+probability is 1 − p_top of the rejected winner, the listed options sharing
+the rest. Without a none option a rejected text goes to the oracle as
+usual; its answer, and a feedback naming an option, teach the skill the
+option's label (the none option teaches nothing). Two skills fitting the
+descriptions is no description match; auto-skills are never matched this
+way. On the published model, the kit's rows read this way (the lead-in
+line dropped, section 3.1): BANKING77 macro-F1 0.933 (0.854 with the
+lead-in), CLINC150+OOS 0.929 with the gate's rejections as out of scope
+(0.384 with the lead-in); no threshold tuned on those rows.
 
 **Auto-skills (0.8.6).** A choice question no skill fits (`untrained` because
 of its options, not an ambiguous one and not one forced with `cmf.skill`) is
@@ -492,27 +520,35 @@ curl -s "$CORTIQ/v1/skills/banking77" -H "Authorization: Bearer $KEY" \
   `confidence = (N·p_max − 1)/(N − 1)` (Jev's formula). Numbers are the
   shortest f32 form; `cmf.round: 2` (or `response.round: 2`) rounds to
   hundredths and prints 0 and 1 as integers, as Jev does.
-* **choice from the oracle or the cache** — `{type, choice}`; on
-  `/v1/systemone` it carries the one-hot distribution too (`probabilities`:
-  the chosen option 1, every other 0, in request order; `confidence: 1`),
-  since Jev's schema requires one.
-* **score** (oracle only) — `{type, score, legend}` with the level index.
+* **choice from the oracle or the cache** — `{type, choice, probabilities,
+  confidence}` (0.8.8; before: `{type, choice}`, an additive change): the
+  oracle's distribution over every option in request order (it lists the at
+  most 5 most likely ids; the rest of the mass is spread uniformly over the
+  others, a listed mass above 1 renormalized), `choice` its argmax (a tie
+  to the oracle's stated verdict) and `confidence` = p(choice). A verdict
+  without a distribution (`oracle.probabilities: false`, a 0.8.7 cache
+  entry) is one-hot: the chosen option 1, every other 0, `confidence: 1`.
+  The same on `/v1/systemone` (Jev's schema requires the distribution).
+* **score** (oracle only) — `{type, score, legend, probabilities,
+  confidence}` with the level index; `probabilities` per level index.
 * **noul** (oracle only) — `{type, noul: 1 | 0, value_semantics:
-  "boolean_verdict_not_probability"}`.
+  "boolean_verdict_not_probability", probability}` with `probability` =
+  p(true) (0.8.8, additive); on `/v1/systemone` Jev's `{type, noul:
+  p(true)}`.
 
 `cmf.questions.<id>` explains each answer:
 
 | Field | Meaning |
 |---|---|
 | `action` | `local` (gate accepted), `abstain` (gate rejected and no oracle answer), `cache`, `oracle` |
-| `source`, `skill`, `match`, `certified` | where the answer came from; section 3.2 |
+| `source`, `skill`, `match`, `certified` | where the answer came from; section 3.2 (`by: "descriptions"` next to `match` for a description match) |
 | `gate` | `accepted`, `p_top` and `tau`, `novelty` and `theta`, `is_novel`, `margin`, `profile` |
 | `errors` | reconstruction errors of the 5 best labels (all of them with `cmf.explain`) |
 | `flags` | e.g. `oracle_disabled`, `no_key` (with `oracle_disabled`: the key variable is not set), `bad_key` (with `oracle_disabled`: it holds something that is not a key), `consent_off`, `budget`, `stopped`, `oracle_unavailable`, `pii_redacted`, `explore` (a gate-accepted question of an auto-skill answered by the oracle for exploration, section 3.2) |
 | `confident` | the answer can be used as is (gate accepted and not novel, or a valid oracle answer) |
 | `complexity` | `{score, tier, factors: {base, ambiguity, novelty, margin, length}}`, the cortiq-router formula |
 | `routing` | `{target, reason}` when `routing_tiers` maps the tier |
-| `decision_path` | `router:certified`, `router:uncertified`, `router:uncertified_subset`, `escalate→cache`, `escalate→oracle`, `escalate→oracle_unavailable`, `escalate→disabled` |
+| `decision_path` | `router:certified`, `router:uncertified`, `router:uncertified_subset`, `router:none_option` (a description match's none option answered a rejected text, section 3.2), `escalate→cache`, `escalate→oracle`, `escalate→oracle_unavailable`, `escalate→disabled` |
 | `explanation` | with `cmf.explain`: `{top1_vs_top2, decision_path}` |
 
 When a trained question abstains because the oracle is not ready (flags
@@ -554,8 +590,10 @@ curl -s "$CORTIQ/api/alpha/decisions" -H "Authorization: Bearer $KEY" \
   and `criteria` (keys and values). An exact question over a 77-label rubric
   therefore counts thousands of tokens although the encoder reads only the
   state; `cmf.usage.local.processed_tokens` is what the encoder read.
-* `usage.output_tokens` is the number of values in `probabilities` (1 for an
-  oracle, cache or noul answer).
+* `usage.output_tokens` is the number of values in `probabilities` (1 for a
+  noul answer; since 0.8.8 an oracle or cache answer has them too, before it
+  counted 1). `cmf.usage.oracle.reasoning_tokens` is the oracle's reasoning
+  share of its `output_tokens` (`oracle.reasoning`, section 6).
 * `usage.cost = input·input_usd_per_1m/1e6 + output·output_usd_per_1m/1e6 +
   request_usd + [oracle passthrough] oracle cost × markup`. **All prices are
   `"0"` by default**, so local answers cost 0 and oracle answers cost what
@@ -907,7 +945,9 @@ unknown key is an error. The defaults:
              "provider": {"sort": "price", "require_parameters": true, "allow_fallbacks": true,
                           "max_price": {"prompt": 0.1, "completion": 0.5}},
              "max_tokens_per_question": 64, "deadline_s": 30, "budget_usd": 1.0, "max_calls": 10000,
-             "max_errors": 30, "redact_pii": true, "title": "cortiq-decision", "data_collection": null},
+             "max_errors": 30, "redact_pii": true, "title": "cortiq-decision", "data_collection": null,
+             "probabilities": true, "probability_tokens_per_question": 128,
+             "reasoning": "off", "reasoning_max_tokens": 4096, "reasoning_deadline_s": 60},
   "cache": {"enabled": true, "threshold": 0.97, "cap": 50000},
   "learning": {"enabled": true, "refit_min_new": 25, "dedup": 0.995, "cold_start": true, "synchronous": false,
                "auto_skills": true, "auto_min_rows": 10, "auto_k": 8, "auto_tau": 0.9,
@@ -952,7 +992,17 @@ which it is registered and learned (1: at once, like a stateful one),
 sightings LRU tracks, `auto_max_stateless_skills` (≥ 1) how many state-less
 contracts are learned at most and `auto_min_sightings_stateful` (≥ 1, 0.8.8)
 the sighting of a stateful contract from which it is registered (1: at once,
-as in 0.8.6). `cortiq serve --oracle MODEL` and its companions
+as in 0.8.6). The 0.8.8 `oracle` keys: `probabilities` asks the oracle for
+a distribution with every verdict (off: the 0.8.7 request and one-hot
+answers) and `probability_tokens_per_question` (1..4096) is what each
+question adds to `max_tokens` for it (measured: 57–87 tokens for five
+listed ids, 128 leaves room for a wider tokenizer); `reasoning` (`off`,
+`low`, `medium`, `high`) turns on the oracle model's reasoning at that
+effort — an accuracy / latency / cost trade: `reasoning_max_tokens`
+(1..65536) is added to every call's `max_tokens` and so to its
+reservation, `reasoning_deadline_s` (≥ 0) to its deadline, and the
+reasoning tokens are billed in OpenRouter's `usage.cost`
+([ORACLE.md](ORACLE.md#reasoning)). `cortiq serve --oracle MODEL` and its companions
 override the `oracle` section (and `--no-oracle-learning` sets
 `learning.enabled` false); a file that sets `oracle.provider` keeps its
 `max_price` unless `--oracle-max-price` is given.
