@@ -17,7 +17,7 @@
 //!   "auto_skills":true,"auto_min_rows":10,"auto_k":8,"auto_tau":0.9,"auto_min_agreement":0.8,
 //!   "auto_min_coverage":0.8,"auto_max_skills":256,"auto_max_labels":64,"auto_max_examples_per_label":1000,
 //!   "auto_temperature_min":0.02,"auto_explore_every":8,"auto_min_sightings":5,"auto_sightings_cap":100000,
-//!   "auto_max_stateless_skills":256},
+//!   "auto_max_stateless_skills":256,"auto_min_sightings_stateful":1},
 //!  "feedback":{"pending_cap":50000}}
 //! ```
 //!
@@ -423,10 +423,11 @@ pub struct LearningConfig {
     /// `auto_max_stateless_skills`. On the Decision Index suite's state-less
     /// rows 2 registered 756 contracts, 3 registered 168, 5 registered 20
     /// (the intent sets, VAST, CLadder and a few repeated items). 1
-    /// registers at the first sighting, as stateful contracts always are.
+    /// registers at the first sighting, as stateful contracts do by default.
     pub auto_min_sightings: u32,
-    /// State-less contracts whose sightings are counted (an in-memory LRU,
-    /// lost on restart).
+    /// Contracts whose sightings are counted (an in-memory LRU, lost on
+    /// restart; the state-less ones and, when `auto_min_sightings_stateful`
+    /// is above 1, the stateful ones).
     pub auto_sightings_cap: usize,
     /// State-less contracts learned at most, counted apart from the stateful
     /// ones: stateful contracts register at their first sighting, and a run
@@ -434,6 +435,13 @@ pub struct LearningConfig {
     /// request) would otherwise fill `auto_max_skills` before a repeated
     /// state-less contract is seen.
     pub auto_max_stateless_skills: usize,
+    /// The sighting of a stateful contract (a request with a non-empty
+    /// `state`) from which it is registered and learned (DESIGN B2). 1, the
+    /// default, registers at the first sighting (0.8.6); a larger value keeps
+    /// one-off stateful contracts — benchmark items, a rubric per question —
+    /// out of `learn.log` and `auto_max_skills`, at the price of the answers
+    /// before that sighting, which are not learned.
+    pub auto_min_sightings_stateful: u32,
 }
 
 impl Default for LearningConfig {
@@ -458,6 +466,19 @@ impl Default for LearningConfig {
             auto_min_sightings: 5,
             auto_sightings_cap: 100_000,
             auto_max_stateless_skills: 256,
+            auto_min_sightings_stateful: 1,
+        }
+    }
+}
+
+impl LearningConfig {
+    /// The sighting from which a contract of this kind is registered
+    /// (DESIGN A20, B2).
+    pub fn min_sightings(&self, stateless: bool) -> u32 {
+        if stateless {
+            self.auto_min_sightings
+        } else {
+            self.auto_min_sightings_stateful
         }
     }
 }
@@ -909,6 +930,10 @@ impl Config {
             "learning.auto_min_sightings must be positive"
         );
         ensure!(
+            l.auto_min_sightings_stateful >= 1,
+            "learning.auto_min_sightings_stateful must be positive"
+        );
+        ensure!(
             l.auto_sightings_cap >= 1,
             "learning.auto_sightings_cap must be positive"
         );
@@ -1011,6 +1036,7 @@ mod tests {
         assert_eq!((l.auto_temperature_min, l.auto_explore_every), (0.02, 8));
         assert_eq!((l.auto_min_sightings, l.auto_sightings_cap), (5, 100_000));
         assert_eq!(l.auto_max_stateless_skills, 256);
+        assert_eq!(l.auto_min_sightings_stateful, 1);
         let ok = |j: &str| Config::from_json(format!(r#"{{"learning":{{{j}}}}}"#).as_bytes());
         assert!(ok(r#""auto_skills":false,"auto_min_rows":2,"auto_k":1,"auto_tau":0,"auto_max_labels":255"#).is_ok());
         // 0 = no floor / exploration off; the floor may reach 1.
@@ -1018,6 +1044,7 @@ mod tests {
         assert!(ok(r#""auto_temperature_min":1"#).is_ok());
         assert!(ok(r#""auto_min_sightings":1,"auto_sightings_cap":1"#).is_ok());
         assert!(ok(r#""auto_max_stateless_skills":1"#).is_ok());
+        assert!(ok(r#""auto_min_sightings_stateful":3"#).is_ok());
         for (j, what) in [
             (r#""auto_min_rows":1"#, "auto_min_rows"),
             (r#""auto_k":0"#, "auto_k"),
@@ -1035,6 +1062,10 @@ mod tests {
             (r#""auto_temperature_min":1.5"#, "auto_temperature_min"),
             (r#""auto_min_sightings":0"#, "auto_min_sightings"),
             (r#""auto_sightings_cap":0"#, "auto_sightings_cap"),
+            (
+                r#""auto_min_sightings_stateful":0"#,
+                "auto_min_sightings_stateful",
+            ),
             (
                 r#""auto_max_stateless_skills":0"#,
                 "auto_max_stateless_skills",

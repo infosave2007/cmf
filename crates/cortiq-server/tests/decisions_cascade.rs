@@ -3965,7 +3965,11 @@ async fn a_rare_label_stays_quarantined_and_keeps_teaching() {
     // of none.
     let mut more = texts_apart("cruise", 24, 53, "ac2", 0.97, &mut seen).into_iter();
     let mut asked = 0;
-    for t in cruise[2..].iter().cloned().chain(std::iter::from_fn(|| more.next())) {
+    for t in cruise[2..]
+        .iter()
+        .cloned()
+        .chain(std::iter::from_fn(|| more.next()))
+    {
         let r = ask(&srv, &q, &t).await;
         assert_eq!(r.q("task")["match"], "exact");
         if r.action() == "oracle" {
@@ -4396,6 +4400,54 @@ async fn a_one_off_stateless_contract_is_never_registered() {
     assert_eq!(r.action(), "oracle", "{}", r.text);
     let l = srv.learning().await;
     assert_eq!(counts(&l), (Some(2), Some(2), Some(2)), "{l}");
+}
+
+/// Stateful sightings gate (DESIGN B2): by default (`auto_min_sightings_stateful:
+/// 1`) a stateful contract registers at its first sighting, as in 0.8.6, and
+/// is never counted; at 3 it is counted, its first two answers are not
+/// learned and it registers (and leaves the LRU) at the third.
+#[tokio::test]
+async fn stateful_sightings_gate_delays_registration() {
+    let mock = keyword_mock();
+    let cfg = stand_config(&mock.url());
+    assert_eq!(cfg.learning.auto_min_sightings_stateful, 1);
+    let q = choice(&["food", "cruise"]);
+    let texts = distinct_texts("cruise", 3, 281, "sg", 0.97);
+    let counts = |l: &Value| {
+        (
+            l["auto_contracts"].as_u64(),
+            l["auto_sightings"].as_u64(),
+            l["examples_added"].as_u64(),
+        )
+    };
+    let srv = Srv::new(&cfg);
+    assert_eq!(ask(&srv, &q, &texts[0]).await.action(), "oracle");
+    let l = srv.learning().await;
+    assert_eq!(counts(&l), (Some(1), Some(0), Some(1)), "{l}");
+    drop(srv);
+
+    let mut gated = cfg.clone();
+    gated.learning.auto_min_sightings_stateful = 3;
+    let srv = Srv::new(&gated);
+    // `auto_sightings` counts contracts in the LRU, not their sightings.
+    for t in &texts[..2] {
+        assert_eq!(ask(&srv, &q, t).await.action(), "oracle");
+        let l = srv.learning().await;
+        assert_eq!(counts(&l), (Some(0), Some(1), Some(0)), "{l}");
+    }
+    let log = std::fs::read(srv.state_root().join("learn.log")).unwrap_or_default();
+    let (recs, _) = cortiq_decision::buffer::read_records(&log);
+    assert!(
+        recs.iter().all(|r| !matches!(
+            r,
+            cortiq_decision::buffer::LogRecord::Contract(_)
+                | cortiq_decision::buffer::LogRecord::Example(_)
+        )),
+        "{recs:?}"
+    );
+    assert_eq!(ask(&srv, &q, &texts[2]).await.action(), "oracle");
+    let l = srv.learning().await;
+    assert_eq!(counts(&l), (Some(1), Some(0), Some(1)), "{l}");
 }
 
 /// The kit's validator (`decision_index/engines/base.py` `validate`) on a

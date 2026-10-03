@@ -36,6 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them out. `GET
   /v1/admin/learning` adds `auto_sightings`, `auto_registered` and
   `stateless` per auto-skill (API.md §6).
+- Stateful sightings gate: `learning.auto_min_sightings_stateful` (1 = the
+  first sighting, as before) registers a stateful contract only at that
+  sighting when larger, counted in the same LRU, so a deployment can keep
+  one-off stateful contracts (benchmark items, a rubric per question) out of
+  `learn.log` and `auto_max_skills` (API.md §3.2, §6; ORACLE.md).
 - Capacity errors: a request over a size limit (body, state, a state-less
   question's instructions, a description, the options, the questions) says
   `maximum context length` in its message with `details.capacity: true` —
