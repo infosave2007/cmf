@@ -15,7 +15,7 @@
 //! 4. the encoder and the hash run once on the state text; each exact or subset
 //!    question is decided by its skill (the errors of a skill are computed once
 //!    per request), and the gate of the profile decides `local` or not. A
-//!    **state-less** request (empty `state`, 0.8.7, DESIGN A19) runs them once
+//!    **state-less** request (empty `state`, 0.8.8, DESIGN A19) runs them once
 //!    per distinct instructions text instead: each question is read through
 //!    its own instructions ([`DecisionRequest::input_text`]), matched to an
 //!    auto-skill by its state-less contract, cached and escalated with the φ

@@ -17,7 +17,7 @@
 //! * `state`: a string, object or array; a string is used as is, an object or
 //!   array as its canonical JSON (answers are then not certified); at most
 //!   `limits.state_bytes` (32 KiB) of that text. An EMPTY state (`""`, `{}`,
-//!   `[]`, or `null`) makes the request **state-less** (0.8.7, DESIGN A19):
+//!   `[]`, or `null`) makes the request **state-less** (0.8.8, DESIGN A19):
 //!   the text the local model reads for a question is then that question's
 //!   `instructions` ([`DecisionRequest::input_text`]), each at most
 //!   `limits.state_bytes` too, and its auto-skill contract is the criteria
@@ -39,7 +39,7 @@
 //! codes: `{"error":{"code":<HTTP>,"message":"…","metadata":{"reason":"<code>",
 //! "retriable":bool,"request_id":"…","details":{}}}}`. A request over a size
 //! limit (body, state, a state-less question's instructions, a description,
-//! options, questions) is a **capacity** error ([`ApiError::capacity`], 0.8.7,
+//! options, questions) is a **capacity** error ([`ApiError::capacity`], 0.8.8,
 //! DESIGN A21): its status and reason stay (413 / 400 here), its message
 //! carries [`CAPACITY_MARKER`] (the phrase clients such as the Decision Index
 //! kit recognise as "the input does not fit") and `details.capacity` is

@@ -430,7 +430,7 @@ pub fn parse_response(body: &[u8], questions: &[&Question], model: &str) -> Pars
 pub const UNKNOWN_CODE: &str = "unknown_code";
 
 /// The code of a call the upstream refused because the prompt does not fit
-/// its context ([`context_overflow`], 0.8.7, DESIGN A21): the request is
+/// its context ([`context_overflow`], 0.8.8, DESIGN A21): the request is
 /// answered 422 with [`crate::protocol::CAPACITY_MARKER`], the failure does
 /// not count toward `max_errors` (the input, not the oracle, is at fault) and
 /// its reservation is counted as likely unbilled.
