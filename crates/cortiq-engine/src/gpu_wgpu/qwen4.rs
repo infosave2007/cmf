@@ -2179,6 +2179,10 @@ pub(crate) struct Dev {
     /// Indirect dispatch sizes of the cold-expert pass, written when the
     /// cold list is known — after the frame was encoded.
     cold_args: wgpu::Buffer,
+    /// What `finalize_pending` last wrote to `cold_args` and `inj_flags`:
+    /// most frames repeat it (no cold winner), and two queue writes per
+    /// layer sit on the path between one frame's fence and the next submit.
+    fin_last: std::cell::Cell<Option<([u32; 8], u32)>>,
     /// Every dispatch of a layer reads its workgroup count from `args_live`,
     /// which the layer's gate kernel fills from `args_tpl` — or with zeros
     /// once an earlier layer of the chain routed to a cold expert. The host
@@ -2475,6 +2479,7 @@ impl Dev {
                 usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
+            fin_last: std::cell::Cell::new(None),
             args_tpl: c.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("qwen4-args-tpl"),
                 size: (rows * SLOTS * 16) as u64,
@@ -3597,14 +3602,40 @@ pub(crate) fn submit_chain(
     enc: wgpu::CommandEncoder,
     total: u64,
 ) -> Option<Pending> {
+    submit_frame(dev, None, finish_frame(enc), total)
+}
+
+/// Finish a frame's encoder into a command buffer. wgpu records the real
+/// (HAL) commands here, replaying every dispatch of the frame, so the
+/// driver finishes the frame it encodes ahead right away, while the card
+/// still runs the previous one, instead of on the critical path between
+/// that frame's fence and this frame's submit.
+pub(crate) fn finish_frame(enc: wgpu::CommandEncoder) -> wgpu::CommandBuffer {
+    finish_enc(enc)
+}
+
+/// Submit a finished frame (after `pre`, the staged expert copies, in the
+/// same queue submission) and map its readback stage.
+pub(crate) fn submit_frame(
+    dev: &mut Dev,
+    pre: Option<wgpu::CommandBuffer>,
+    cb: wgpu::CommandBuffer,
+    total: u64,
+) -> Option<Pending> {
     let c = ctx()?;
     let stage = dev.stages[dev.stage_ix].clone();
     dev.stage_ix ^= 1;
     let total = total.div_ceil(16) * 16;
     if total > stage.size() {
+        // the frame is refused, but the arena already counts the staged
+        // experts as resident: their copies must still land
+        if let Some(pre) = pre {
+            submit(c, pre);
+        }
         return None;
     }
-    submit(c, finish_enc(enc));
+    note_submit(c);
+    c.queue.submit(pre.into_iter().chain(std::iter::once(cb)));
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let d2 = done.clone();
     stage
@@ -5540,12 +5571,12 @@ pub(crate) fn finalize_pending(
             bytemuck::cast_slice(&wt),
         );
     }
-    let blocked = c
-        .dsv4_global_moe
-        .lock()
-        .unwrap()
-        .get(&dev.uid)
-        .is_some_and(|b| blocked_experts(g, b.segments));
+    let blocked = any_dev
+        && c.dsv4_global_moe
+            .lock()
+            .unwrap()
+            .get(&dev.uid)
+            .is_some_and(|b| blocked_experts(g, b.segments));
     let div = if blocked { 4 } else { 1 };
     let args: [u32; 8] = if any_dev {
         [
@@ -5561,8 +5592,14 @@ pub(crate) fn finalize_pending(
     } else {
         [0; 8]
     };
-    c.queue
-        .write_buffer(&dev.cold_args, 0, bytemuck::cast_slice(&args));
+    let flags = u32::from(any_host) | (u32::from(any_dev) << 1);
+    if dev.fin_last.get() != Some((args, flags)) {
+        c.queue
+            .write_buffer(&dev.cold_args, 0, bytemuck::cast_slice(&args));
+        c.queue
+            .write_buffer(&dev.inj_flags, 0, bytemuck::cast_slice(&[flags, 0, 0, 0]));
+        dev.fin_last.set(Some((args, flags)));
+    }
     if any_host {
         let coldvec = tbuf(c, T_COLDVEC, g.hidden * 4, true);
         let zeros = vec![0.0f32; g.hidden];
@@ -5578,9 +5615,6 @@ pub(crate) fn finalize_pending(
             );
         }
     }
-    let flags = u32::from(any_host) | (u32::from(any_dev) << 1);
-    c.queue
-        .write_buffer(&dev.inj_flags, 0, bytemuck::cast_slice(&[flags, 0, 0, 0]));
     true
 }
 
@@ -5972,6 +6006,8 @@ pub(crate) struct Stager {
     ready: [std::sync::Arc<std::sync::atomic::AtomicBool>; 2],
     copies: std::sync::Mutex<Vec<(u64, wgpu::Buffer, u64, u64)>>,
     pub(crate) staged: std::sync::atomic::AtomicU64,
+    /// `take` handed out copies whose ring half `rearm` has to remap
+    armed: bool,
 }
 
 impl Stager {
@@ -5999,6 +6035,7 @@ impl Stager {
             ready: [flag(), flag()],
             copies: std::sync::Mutex::new(Vec::new()),
             staged: std::sync::atomic::AtomicU64::new(0),
+            armed: false,
         })
     }
 
@@ -6039,15 +6076,25 @@ impl Stager {
     /// Submit the pending copies ahead of the next frame, hand the buffer
     /// to the card and start mapping it again; the other one fills next.
     pub(crate) fn flush(&mut self) {
-        use std::sync::atomic::Ordering;
         let Some(c) = ctx() else { return };
+        if let Some(cb) = self.take() {
+            submit(c, cb);
+            self.rearm();
+        }
+    }
+
+    /// The staged copies as one command buffer, for the caller to submit
+    /// (ahead of its frame, in the same queue submission); `rearm` must
+    /// follow that submit. `None` when nothing was staged.
+    pub(crate) fn take(&mut self) -> Option<wgpu::CommandBuffer> {
+        use std::sync::atomic::Ordering;
+        let c = ctx()?;
         let copies = std::mem::take(&mut *self.copies.lock().unwrap());
         if copies.is_empty() {
             self.used.store(0, Ordering::Release);
-            return;
+            return None;
         }
-        let cur = self.cur;
-        let buf = self.bufs[cur].clone();
+        let buf = self.bufs[self.cur].clone();
         buf.unmap();
         let mut enc = c
             .device
@@ -6057,14 +6104,27 @@ impl Stager {
         for (so, dst, doff, len) in &copies {
             enc.copy_buffer_to_buffer(&buf, *so, dst, *doff, *len);
         }
-        submit(c, enc.finish());
+        self.armed = true;
+        Some(enc.finish())
+    }
+
+    /// Map the ring half whose copies were just submitted for the next
+    /// round of writes, and switch to the other half.
+    pub(crate) fn rearm(&mut self) {
+        use std::sync::atomic::Ordering;
+        if !std::mem::take(&mut self.armed) {
+            return;
+        }
+        let cur = self.cur;
         let flag = self.ready[cur].clone();
         flag.store(false, Ordering::Release);
-        buf.slice(..).map_async(wgpu::MapMode::Write, move |r| {
-            if r.is_ok() {
-                flag.store(true, Ordering::Release);
-            }
-        });
+        self.bufs[cur]
+            .slice(..)
+            .map_async(wgpu::MapMode::Write, move |r| {
+                if r.is_ok() {
+                    flag.store(true, Ordering::Release);
+                }
+            });
         self.cur ^= 1;
         self.used.store(0, Ordering::Release);
     }
