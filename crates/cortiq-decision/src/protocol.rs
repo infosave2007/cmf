@@ -19,7 +19,9 @@
 //!   `limits.state_bytes` (32 KiB) of that text. An EMPTY state (`""`, `{}`,
 //!   `[]`, or `null`) makes the request **state-less** (0.8.8, DESIGN A19):
 //!   the text the local model reads for a question is then that question's
-//!   `instructions` ([`DecisionRequest::input_text`]), each at most
+//!   `instructions` ([`DecisionRequest::input_text`]; past a lead-in line
+//!   such as `"Classify the intent of this request:\n<text>"`, the text
+//!   alone, [`after_lead_in`], DESIGN C1), each at most
 //!   `limits.state_bytes` too, and its auto-skill contract is the criteria
 //!   alone ([`crate::manifest::stateless_contract_sha256`]); a request with a
 //!   non-empty state is read exactly as before;
@@ -614,16 +616,37 @@ impl DecisionRequest {
     }
 
     /// The text the local model reads for `q` (DESIGN A19): its instructions
-    /// when [`DecisionRequest::reads_instructions`], else the state's text
+    /// when [`DecisionRequest::reads_instructions`] — past a lead-in line
+    /// ([`after_lead_in`], DESIGN C1) — else the state's text
     /// ([`DecisionRequest::state_text`]) — always so for a non-empty state.
     pub fn input_text(&self, q: &Question) -> String {
         if self.is_stateless()
             && let Some(t) = q.instructions_text()
         {
-            return t;
+            return match after_lead_in(&t) {
+                Some(text) => text.to_string(),
+                None => t,
+            };
         }
         self.state_text.clone()
     }
+}
+
+/// The text after a lead-in line (0.8.8, DESIGN C1): when the first line of
+/// `instructions` ends with `:` (trailing whitespace aside) and non-empty
+/// text follows on the next lines, that text (surrounding whitespace
+/// trimmed) — what a state-less question's local model reads, e.g. the
+/// request of `"Classify the banking intent of this user request:\n<text>"`;
+/// `None` otherwise (the whole instructions are the text, as in A19). The
+/// oracle still receives the instructions verbatim; contract keys and cache
+/// scopes never change with it.
+pub fn after_lead_in(instructions: &str) -> Option<&str> {
+    let (first, rest) = instructions.split_once('\n')?;
+    if !first.trim_end().ends_with(':') {
+        return None;
+    }
+    let rest = rest.trim();
+    (!rest.is_empty()).then_some(rest)
 }
 
 fn type_name(v: &Value) -> &'static str {
