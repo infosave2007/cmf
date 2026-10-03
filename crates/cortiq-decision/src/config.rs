@@ -16,7 +16,8 @@
 //!  "learning":{"enabled":true,"refit_min_new":25,"dedup":0.995,"cold_start":true,"synchronous":false,
 //!   "auto_skills":true,"auto_min_rows":10,"auto_k":8,"auto_tau":0.9,"auto_min_agreement":0.8,
 //!   "auto_min_coverage":0.8,"auto_max_skills":256,"auto_max_labels":64,"auto_max_examples_per_label":1000,
-//!   "auto_temperature_min":0.02,"auto_explore_every":8,"auto_min_sightings":2,"auto_sightings_cap":100000},
+//!   "auto_temperature_min":0.02,"auto_explore_every":8,"auto_min_sightings":5,"auto_sightings_cap":100000,
+//!   "auto_max_stateless_skills":256},
 //!  "feedback":{"pending_cap":50000}}
 //! ```
 //!
@@ -390,7 +391,8 @@ pub struct LearningConfig {
     /// Share of a contract's examples the active labels must hold at the
     /// activation (so that the quarantined labels are genuinely rare).
     pub auto_min_coverage: f32,
-    /// Contracts learned at most.
+    /// Stateful contracts learned at most (state-less ones have their own
+    /// cap, `auto_max_stateless_skills`).
     pub auto_max_skills: usize,
     /// Option ids a learned contract may have at most.
     pub auto_max_labels: usize,
@@ -412,15 +414,26 @@ pub struct LearningConfig {
     /// itself names inconsistently never activated). 0 turns it off.
     pub auto_explore_every: u64,
     /// The sighting of a state-less contract (a request with an empty
-    /// `state`, DESIGN A20) from which it is registered and learned (2: a
-    /// contract seen once — a multiple-choice item whose options change with
-    /// every question — never reaches `learn.log` nor uses up
-    /// `auto_max_skills`); 1 registers at the first sighting, as stateful
-    /// contracts always are.
+    /// `state`, DESIGN A20) from which it is registered and learned. 5: a
+    /// contract cannot activate before `auto_min_rows` (10) examples of each
+    /// of its ≥ 2 labels, so the four answers not learned cost a learnable
+    /// contract little, while a contract seen a few times — a multiple-choice
+    /// item whose options change with every question, the twin sentences of
+    /// a WinoGrande pair — never reaches `learn.log` nor takes a slot of
+    /// `auto_max_stateless_skills`. On the Decision Index suite's state-less
+    /// rows 2 registered 756 contracts, 3 registered 168, 5 registered 20
+    /// (the intent sets, VAST, CLadder and a few repeated items). 1
+    /// registers at the first sighting, as stateful contracts always are.
     pub auto_min_sightings: u32,
     /// State-less contracts whose sightings are counted (an in-memory LRU,
     /// lost on restart).
     pub auto_sightings_cap: usize,
+    /// State-less contracts learned at most, counted apart from the stateful
+    /// ones: stateful contracts register at their first sighting, and a run
+    /// of stateful one-offs (per-row instructions, a tool catalogue per
+    /// request) would otherwise fill `auto_max_skills` before a repeated
+    /// state-less contract is seen.
+    pub auto_max_stateless_skills: usize,
 }
 
 impl Default for LearningConfig {
@@ -442,8 +455,9 @@ impl Default for LearningConfig {
             auto_max_examples_per_label: 1000,
             auto_temperature_min: 0.02,
             auto_explore_every: 8,
-            auto_min_sightings: 2,
+            auto_min_sightings: 5,
             auto_sightings_cap: 100_000,
+            auto_max_stateless_skills: 256,
         }
     }
 }
@@ -898,6 +912,10 @@ impl Config {
             l.auto_sightings_cap >= 1,
             "learning.auto_sightings_cap must be positive"
         );
+        ensure!(
+            l.auto_max_stateless_skills >= 1,
+            "learning.auto_max_stateless_skills must be positive"
+        );
         // Any positive f32-exact `T` is a valid gate (`Gate::validate`); the
         // floor is bounded by 1 only so that a typo cannot flatten the softmax.
         check_unit(
@@ -991,13 +1009,15 @@ mod tests {
         assert_eq!((l.auto_max_skills, l.auto_max_labels), (256, 64));
         assert_eq!(l.auto_max_examples_per_label, 1000);
         assert_eq!((l.auto_temperature_min, l.auto_explore_every), (0.02, 8));
-        assert_eq!((l.auto_min_sightings, l.auto_sightings_cap), (2, 100_000));
+        assert_eq!((l.auto_min_sightings, l.auto_sightings_cap), (5, 100_000));
+        assert_eq!(l.auto_max_stateless_skills, 256);
         let ok = |j: &str| Config::from_json(format!(r#"{{"learning":{{{j}}}}}"#).as_bytes());
         assert!(ok(r#""auto_skills":false,"auto_min_rows":2,"auto_k":1,"auto_tau":0,"auto_max_labels":255"#).is_ok());
         // 0 = no floor / exploration off; the floor may reach 1.
         assert!(ok(r#""auto_temperature_min":0,"auto_explore_every":0"#).is_ok());
         assert!(ok(r#""auto_temperature_min":1"#).is_ok());
         assert!(ok(r#""auto_min_sightings":1,"auto_sightings_cap":1"#).is_ok());
+        assert!(ok(r#""auto_max_stateless_skills":1"#).is_ok());
         for (j, what) in [
             (r#""auto_min_rows":1"#, "auto_min_rows"),
             (r#""auto_k":0"#, "auto_k"),
@@ -1015,6 +1035,10 @@ mod tests {
             (r#""auto_temperature_min":1.5"#, "auto_temperature_min"),
             (r#""auto_min_sightings":0"#, "auto_min_sightings"),
             (r#""auto_sightings_cap":0"#, "auto_sightings_cap"),
+            (
+                r#""auto_max_stateless_skills":0"#,
+                "auto_max_stateless_skills",
+            ),
             // A u64: serde names the value, not the key.
             (r#""auto_explore_every":-1"#, "invalid value"),
             (r#""auto_unknown":1"#, "unknown field"),

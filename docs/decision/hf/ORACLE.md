@@ -169,12 +169,19 @@ goes to the oracle on every new text and, until 0.8.5, was never learned. Since
   contract that is seen only once is useless to learn — a multiple-choice
   item whose option descriptions change with every question is its own
   contract — a state-less contract is registered only at its
-  `learning.auto_min_sightings`-th sighting (2; an escalation of one of its
+  `learning.auto_min_sightings`-th sighting (5; an escalation of one of its
   learnable questions, whatever answers it), counted in an in-memory LRU of
   `learning.auto_sightings_cap` (100000) contracts that a restart clears;
   before that its answers are served and cached but not learned, nothing is
-  written to `learn.log` and it takes no slot of `auto_max_skills`. Stateful
-  contracts register at their first sighting, as in 0.8.6. State-less
+  written to `learn.log` and it takes no slot of the registry. 5, because a
+  contract cannot activate before `auto_min_rows` (10) examples of each of
+  its labels anyway, while items seen two or three times (WinoGrande twin
+  sentences, a repeated MuSR question) are not worth a skill: on the
+  Decision Index suite's state-less rows 2 registered 756 contracts, 5
+  registered 20. Stateful contracts register at their first sighting, as in
+  0.8.6, against `auto_max_skills`; state-less ones have their own cap
+  `auto_max_stateless_skills` (256), so stateful one-offs (per-row
+  instructions, a tool catalogue per request) never take their slots. State-less
   answers are never `certified`. A state-less auto-skill answers state-less
   requests only: its rubric has no instructions, so `/v1/route` and
   `cortiq decide --skill` (which read a text as the state) do not reach it.
@@ -241,9 +248,13 @@ goes to the oracle on every new text and, until 0.8.5, was never learned. Since
   consented, learning and `auto_skills` on, a key with `learning_allowed`;
   data skills, `cortiq decide`, shadow mode and `/v1/route` never explore.
 * **Limits.** A contract is learned only with 2..`auto_max_labels` (64) option
-  ids and while fewer than `auto_max_skills` (256) contracts are registered;
+  ids and while fewer than `auto_max_skills` (256) stateful, or
+  `auto_max_stateless_skills` (256) state-less, contracts are registered;
   otherwise the oracle answers and nothing is recorded (`auto_skipped` in
-  `GET /v1/admin/learning`, one warning an hour, never the ids). Every
+  `GET /v1/admin/learning`, one warning an hour, never the ids). Intent
+  suites have more options than the default: BANKING77 sends 77 ids and
+  CLINC150 151 (with out-of-scope), so a gateway meant to learn them sets
+  `learning.auto_max_labels` to 255. Every
   generation re-carries every auto-skill's rows: with many contracts run
   `cortiq decision materialize` from time to time and serve the materialised
   file (it holds the auto-skills as ordinary skills; `decide --labels` and

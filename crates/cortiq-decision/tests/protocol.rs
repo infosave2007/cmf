@@ -746,12 +746,13 @@ fn systemone_parser_keeps_the_native_boundary_strict() {
     );
 
     // Every documented adapter alias maps to the locally served CMF model;
-    // callers never get an answer that claims to be Jev.
-    for model in SYSTEMONE_MODEL_ALIASES
-        .iter()
-        .copied()
-        .chain(["typesafe/jev-1.13", SYSTEMONE_MODEL_ID])
-    {
+    // callers never get an answer that claims to be Jev. `default` is the
+    // Decision Index kit's http engine placeholder (0.8.7).
+    for model in SYSTEMONE_MODEL_ALIASES.iter().copied().chain([
+        "typesafe/jev-1.13",
+        SYSTEMONE_MODEL_ID,
+        "default",
+    ]) {
         let r = parse_systemone_request(
             &serde_json::to_vec(&json!({
                 "model": model,
@@ -764,6 +765,19 @@ fn systemone_parser_keeps_the_native_boundary_strict() {
         .unwrap();
         assert_eq!(r.model, ModelRef::Latest, "{model}");
     }
+
+    // ... on the System One dialect only.
+    let e = parse_request(
+        &serde_json::to_vec(&json!({
+            "model": "default",
+            "state": "refund request",
+            "questions": {"task": {"type": "noul", "instructions": "refund?"}},
+        }))
+        .unwrap(),
+        &limits,
+    )
+    .unwrap_err();
+    assert_eq!((e.status, e.reason), (404, Reason::ModelNotFound));
 
     let e = parse_systemone_request(
         &serde_json::to_vec(&json!({

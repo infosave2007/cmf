@@ -41,12 +41,16 @@
 //!   `learning_allowed`, `/v1/route` without `taxonomy_id`); the `auto_tau`
 //!   floor; a rare label quarantined, probability 0, still taught;
 //! * state-less requests (0.8.7): a `state: {}` contract whose text is in the
-//!   instructions is registered at its second sighting, learned, answered
-//!   locally over `/v1/decisions` and `/v1/systemone`, apart from the stateful
-//!   contract of the same criteria and kept over a restart; a one-off contract
-//!   is never registered; capacity errors carry the Decision Index marker
-//!   (422 on System One, the oracle's context overflow 422 everywhere, not a
-//!   stop); PII in state-less instructions is redacted for the oracle.
+//!   instructions is registered at its `auto_min_sightings`-th sighting,
+//!   learned, answered locally over `/v1/decisions` and `/v1/systemone`, apart
+//!   from the stateful contract of the same criteria and kept over a restart;
+//!   a one-off contract is never registered, and stateful one-offs do not
+//!   take the state-less contracts' slots; capacity errors carry the Decision
+//!   Index marker (422 on System One, the oracle's context overflow 422
+//!   everywhere, not a stop); PII in state-less instructions is redacted for
+//!   the oracle; System One oracle and cache choice answers carry the one-hot
+//!   distribution the kit's validator requires, and its `default` model name
+//!   is accepted.
 //!
 //! Every request of [`Srv`] carries `x-cmf-extensions: 1`, so router-surface
 //! answers include the opt-in `cmf` diagnostics (the exact default router
@@ -4138,6 +4142,8 @@ async fn a_stateless_contract_is_learned_from_its_instructions() {
     let mock = instructions_keyword_mock();
     let mut cfg = stand_config(&mock.url());
     cfg.cache.enabled = false;
+    // Registered at the second sighting (the default is 5).
+    cfg.learning.auto_min_sightings = 2;
     let jev = |o: &mut ServeOptions| o.jev_compatible = true;
     let srv = Srv::open_with(
         &toy().path,
@@ -4293,7 +4299,9 @@ async fn a_stateless_contract_is_learned_from_its_instructions() {
 /// One-off state-less contracts (DESIGN A20) — a multiple-choice item whose
 /// option descriptions change with every question — are answered by the
 /// oracle and never registered: no `learn.log` record, no example, no slot of
-/// `auto_max_skills`; `auto_min_sightings: 1` registers at once.
+/// `auto_max_stateless_skills`; `auto_min_sightings: 1` registers at once.
+/// Each kind has its own cap: stateful one-offs (registered at their first
+/// sighting) filling `auto_max_skills` leave the state-less slots free.
 #[tokio::test]
 async fn a_one_off_stateless_contract_is_never_registered() {
     let item = |i: usize, text: &str| {
@@ -4355,6 +4363,103 @@ async fn a_one_off_stateless_contract_is_never_registered() {
         (l["auto_contracts"].as_u64(), l["examples_added"].as_u64()),
         (Some(1), Some(1)),
         "{l}"
+    );
+    drop(srv);
+
+    let mut caps = once.clone();
+    caps.learning.auto_max_skills = 1;
+    caps.learning.auto_max_stateless_skills = 1;
+    let srv = Srv::new(&caps);
+    let counts = |l: &Value| {
+        (
+            l["auto_contracts"].as_u64(),
+            l["auto_skipped"].as_u64(),
+            l["examples_added"].as_u64(),
+        )
+    };
+    // Two stateful contracts: the first fills `auto_max_skills`.
+    ask(&srv, &choice(&["food", "cruise"]), &texts[1]).await;
+    ask(&srv, &choice(&["food", "travel"]), &texts[2]).await;
+    let l = srv.learning().await;
+    assert_eq!(counts(&l), (Some(1), Some(1), Some(1)), "{l}");
+    // A state-less contract still registers, into its own slot ...
+    let r = srv
+        .decide(&body(json!({}), json!({"task": item(7, &texts[3])}), None))
+        .await;
+    assert_eq!(r.action(), "oracle", "{}", r.text);
+    let l = srv.learning().await;
+    assert_eq!(counts(&l), (Some(2), Some(1), Some(2)), "{l}");
+    // ... and the next one finds `auto_max_stateless_skills` full.
+    let r = srv
+        .decide(&body(json!({}), json!({"task": item(8, &texts[4])}), None))
+        .await;
+    assert_eq!(r.action(), "oracle", "{}", r.text);
+    let l = srv.learning().await;
+    assert_eq!(counts(&l), (Some(2), Some(2), Some(2)), "{l}");
+}
+
+/// The kit's validator (`decision_index/engines/base.py` `validate`) on a
+/// choice answer: the chosen id is an option, and `probabilities` holds every
+/// option, each in [0, 1], summing to 1 within 0.01.
+fn kit_valid_choice(q: &Value, a: &Value) {
+    let criteria = q["criteria"].as_object().unwrap();
+    assert_eq!(a["type"], "choice", "{a}");
+    assert!(criteria.contains_key(a["choice"].as_str().unwrap()), "{a}");
+    let p = a["probabilities"].as_object().expect("probabilities");
+    let keys: Vec<&String> = p.keys().collect();
+    assert_eq!(keys, criteria.keys().collect::<Vec<_>>(), "{a}");
+    let sum: f64 = p.values().map(|v| v.as_f64().unwrap()).sum();
+    assert!(
+        p.values()
+            .all(|v| (0.0..=1.0).contains(&v.as_f64().unwrap()))
+    );
+    assert!((sum - 1.0).abs() <= 0.01, "{a}");
+}
+
+/// System One oracle and cache choice answers carry the one-hot distribution
+/// (the chosen option 1, the others 0, confidence 1), so the Decision Index
+/// kit's validator accepts them; the native answer stays `{type, choice}`.
+/// The kit's default model name `default` is accepted on System One.
+#[tokio::test]
+async fn systemone_oracle_answers_carry_the_one_hot_distribution() {
+    let mock = keyword_mock();
+    let cfg = stand_config(&mock.url());
+    let jev = |o: &mut ServeOptions| o.jev_compatible = true;
+    let srv = Srv::open_with(
+        &toy().path,
+        tempfile::tempdir().unwrap(),
+        &cfg,
+        test_key(),
+        jev,
+    );
+    let q = choice(&["food", "travel", "cruise"]);
+    let text = &fresh()[0];
+    let ask_s1 = |model: &'static str| {
+        let req = json!({"model": model, "state": text, "questions": {"task": q.clone()}});
+        let srv = &srv;
+        async move { srv.post("/v1/systemone", None, &req).await }
+    };
+    // The oracle's answer.
+    let r = ask_s1("default").await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(mock.hits(), 1);
+    let a = &r.body["answers"]["task"];
+    kit_valid_choice(&q, a);
+    assert_eq!(a["confidence"], 1, "{a}");
+    let chosen = a["choice"].as_str().unwrap();
+    assert_eq!(a["probabilities"][chosen], 1, "{a}");
+    // The same item again: the cache's answer, completed alike.
+    let r = ask_s1("jev-latest").await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(mock.hits(), 1, "{}", r.text);
+    kit_valid_choice(&q, &r.body["answers"]["task"]);
+    assert_eq!(r.body["answers"]["task"], *a);
+    // The native surface keeps the oracle schema's answer.
+    let r = ask(&srv, &q, text).await;
+    assert_eq!(r.action(), "cache", "{}", r.text);
+    assert_eq!(
+        r.body["answers"]["task"],
+        json!({"type": "choice", "choice": chosen})
     );
 }
 

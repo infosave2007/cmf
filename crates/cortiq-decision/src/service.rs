@@ -1548,7 +1548,18 @@ impl DecisionService {
                 }
                 e
             })?;
-        self.decide(&req, p)
+        let mut decided = self.decide(&req, p)?;
+        // Oracle and cache choice verdicts get the one-hot distribution on
+        // this surface only (Jev's schema requires one; the native bytes and
+        // the metered usage stay those of `/v1/decisions`).
+        if let Some(Value::Object(answers)) = decided.response.get_mut("answers") {
+            for q in &req.questions {
+                if let Some(a) = answers.get_mut(&q.id) {
+                    answer::complete_choice(a, q);
+                }
+            }
+        }
+        Ok(decided)
     }
 
     /// Decide a request (see the module notes).
