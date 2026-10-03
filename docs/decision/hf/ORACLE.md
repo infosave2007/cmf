@@ -329,8 +329,9 @@ goes to the oracle on every new text and, until 0.8.5, was never learned. Since
 
 * **Sent**, only for undetermined questions with the oracle permitted: the
   `state` and the `instructions` and `criteria` of those questions. In a
-  state-less request (empty `state`) the instructions are the input and are
-  redacted like a state (below). Receivers:
+  state-less request (empty `state`) the instructions are the input; since
+  0.8.8 every question's instructions and its criteria's descriptions are
+  redacted like a state (below), the option ids never. Receivers:
   OpenRouter and the provider it routes to (`provider.sort: price`,
   fallbacks allowed; set `oracle.data_collection: "deny"` to exclude providers
   that store data).
@@ -339,8 +340,12 @@ goes to the oracle on every new text and, until 0.8.5, was never learned. Since
   a letter) and numbers of 9 or more digits — also when their digit groups
   are separated by spaces, dashes, dots, slashes or parentheses, as in
   `4111 1111 1111 1111`, `+1 (555) 123-4567` or a spaced IBAN — in every
-  string of the state — and of a state-less question's instructions — are
-  replaced by `[REDACTED]` and the question gets the flag `pii_redacted`. It is a heuristic: names, postal addresses, numbers
+  string of the state and, since 0.8.8, of each question's instructions and
+  criteria descriptions (object keys — the option ids — and a score level's
+  position are kept) are replaced by `[REDACTED]` and the question gets the
+  flag `pii_redacted`. Only the copy sent is redacted: the cache scope and
+  the auto-skill contract are those of the question as asked, so caching and
+  learning do not change. It is a heuristic: names, postal addresses, numbers
   written in words and identifiers with letters between short digit groups
   are not detected. A request can opt out with `cmf.allow_pii_egress`
   (router: `options.allow_pii_egress`).

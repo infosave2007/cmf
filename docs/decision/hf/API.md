@@ -431,8 +431,10 @@ same criteria (whose contract includes its instructions). Its cache scope is
 that contract too, with the φ of the instructions text, so a near-identical
 text under the same criteria is a cache hit. The instructions of a
 state-less question are its input: they leave for the oracle PII-redacted
-like a state (unless `allow_pii_egress`), the oracle request otherwise
-unchanged (`state` sent as `{}`). Each one is limited to `limits.state_bytes`
+like a state (unless `allow_pii_egress`; since 0.8.8 so do every question's
+instructions and criteria descriptions, never the option ids — ORACLE.md
+"What leaves the machine"), the oracle request otherwise unchanged (`state`
+sent as `{}`). Each one is limited to `limits.state_bytes`
 (a capacity error past it); state-less answers are never `certified`. A
 state-less contract is registered and learned only from its fifth sighting
 (`learning.auto_min_sightings`; sightings counted in memory, at most
