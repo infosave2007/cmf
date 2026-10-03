@@ -84,8 +84,9 @@ use crate::manifest::{GateParams, SkillManifest, TaskOrigin};
 use crate::matching::{MatchKind, SkillLabels, SkillMatch, match_question_as};
 use crate::metering::{self, Cost, Rates, TokenCache, Usd};
 use crate::protocol::{
-    ApiError, DecisionRequest, FeedbackRequest, MODEL_ID, ModelRef, PROVIDER, Profile, Question,
-    QuestionKind, Reason, RequestLimits, model_name, new_request_id, parse_feedback, parse_request,
+    ApiError, DecisionRequest, FeedbackRequest, HUGGING_FACE_ID, MODEL_ID, ModelRef, PROVIDER,
+    Profile, Question, QuestionKind, Reason, RequestLimits, model_name, new_request_id,
+    parse_feedback, parse_request,
 };
 use crate::resonance::{Decision, decide as decide_errors};
 use crate::signal::{Features, SignalEncoder};
@@ -2171,7 +2172,7 @@ impl DecisionService {
                 "context_length": tokenizer.max_length(),
                 "max_output_length": crate::protocol::MAX_CHOICE_OPTIONS,
                 "quantization": "fp32",
-                "hugging_face_id": "infosave/cortiq-decision",
+                "hugging_face_id": HUGGING_FACE_ID,
                 "pricing": {
                     "prompt": self.rates.input_per_1m.per_token_string(),
                     "completion": self.rates.output_per_1m.per_token_string(),

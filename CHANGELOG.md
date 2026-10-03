@@ -69,6 +69,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   question's scope instead of all of them (up to `cache.cap`) under one lock;
   answers, ties, dedup and evictions are unchanged, and the replay of
   `learn.log` rebuilds the index.
+- `GET /v1/models` lists `hugging_face_id: "infosave/cmf-decision"`, the
+  published repository (the old `infosave/cortiq-decision` redirects to it).
 - `/v1/decisions` no longer refuses an empty `state` (`""`, `{}`, `[]`) or a
   `null` one with 400: it is a state-less request. Requests with a non-empty
   state are read exactly as in 0.8.6 and 0.8.7.
