@@ -5,6 +5,21 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- Qwen3.8-Flash-Next q4tp files (gate/up in q4tp, not q2tp) take the
+  row-blocked resident expert kernels too: `q4_gu_q4tp4` (four rows a
+  workgroup over q4tp gate/up planes; the bindings, uniform, dispatch and
+  output of `q4_gu_q2tp4`) with `q4_dn_q4tp4`, in the resident pass, the
+  cold pass and the MTP head. Until now the blocked path required q2tp
+  gate/up, so a q4tp file ran both projections on the one-row arena kernels,
+  which re-read the whole 10 KB input per output row. `CMF_QWEN_EXPERT4=0`
+  still keeps the one-row kernels. The ignored device test
+  `expert4_q4tp_matches_one_row_kernels` checks the blocked chain against
+  the one-row one and the host decode on a synthetic bank of the model's
+  expert shape.
+
 ## [0.8.8] - 2026-10-03
 
 ### Added
