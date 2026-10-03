@@ -429,6 +429,34 @@ pub fn parse_response(body: &[u8], questions: &[&Question], model: &str) -> Pars
 /// What a code outside [`FIXED_CODES`] is shown as.
 pub const UNKNOWN_CODE: &str = "unknown_code";
 
+/// The code of a call the upstream refused because the prompt does not fit
+/// its context ([`context_overflow`], 0.8.7, DESIGN A21): the request is
+/// answered 422 with [`crate::protocol::CAPACITY_MARKER`], the failure does
+/// not count toward `max_errors` (the input, not the oracle, is at fault) and
+/// its reservation is counted as likely unbilled.
+pub const CONTEXT_LENGTH_CODE: &str = "context_length";
+
+/// Whether an upstream rejection says the prompt does not fit the model's
+/// context: a 400, 413 or 422 (or a 200 that is only an `error`) whose body
+/// names it in one of the phrasings OpenRouter and its providers use. Only
+/// this verdict is kept, never the body's text.
+pub fn context_overflow(status: u16, body: &[u8]) -> bool {
+    if !matches!(status, 200 | 400 | 413 | 422) {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&body[..body.len().min(64 * 1024)]).to_ascii_lowercase();
+    [
+        "maximum context length",
+        "context_length_exceeded",
+        "context length",
+        "context window",
+        "prompt is too long",
+        "too many tokens",
+    ]
+    .iter()
+    .any(|m| text.contains(m))
+}
+
 /// Every fixed error, stop and refusal code this crate writes to
 /// `oracle.state`, a ledger or a message (besides `http_NNN`, a status of
 /// three digits): the transport and read codes ([`transport_code`],
@@ -477,6 +505,7 @@ pub const FIXED_CODES: &[&str] = &[
     "unsettled_at_start",
     "cost_above_reservation",
     "max_errors",
+    CONTEXT_LENGTH_CODE,
     "no_key",
     "bad_key",
     "oracle_disabled",
@@ -1410,10 +1439,14 @@ impl OracleClient {
                 }),
                 None,
             ),
-            Ok((status, _)) if status != 200 => (
+            Ok((status, bytes)) if status != 200 => (
                 CallOutcome::Failed(FailedCall {
                     call_id: Some(call_id.clone()),
-                    error: format!("http_{status}"),
+                    error: if context_overflow(status, &bytes) {
+                        CONTEXT_LENGTH_CODE.to_string()
+                    } else {
+                        format!("http_{status}")
+                    },
                     status: Some(status),
                     billed: None,
                 }),
@@ -1451,7 +1484,11 @@ impl OracleClient {
                     (Err(code), usage) => (
                         CallOutcome::Failed(FailedCall {
                             call_id: Some(call_id.clone()),
-                            error: code,
+                            error: if code == "error_body" && context_overflow(200, &bytes) {
+                                CONTEXT_LENGTH_CODE.to_string()
+                            } else {
+                                code
+                            },
                             status: Some(200),
                             billed: usage,
                         }),
@@ -1535,9 +1572,10 @@ impl OracleClient {
             let t = &mut inner.totals;
             t.inflight = (t.inflight - res).max(0.0);
             t.spent += charged;
+            let overflow = error.as_deref() == Some(CONTEXT_LENGTH_CODE);
             if status == LEDGER_FAILED_UNKNOWN {
                 t.unknown_cost += charged;
-                if likely_unbilled(http_status) {
+                if likely_unbilled(http_status) || overflow {
                     t.refused_cost += charged;
                 }
             }
@@ -1554,10 +1592,14 @@ impl OracleClient {
         let last_before = inner.state.last_error.clone();
         if let CallOutcome::Failed(f) = outcome {
             inner.last_error = Some(f.error.clone());
-            inner.state.last_error = Some(f.error.clone());
-            inner.state.consecutive_errors = errors_before.saturating_add(1);
-            if inner.state.consecutive_errors >= self.cfg.max_errors {
-                stop = stop.or_else(|| Some("max_errors".into()));
+            if f.error != CONTEXT_LENGTH_CODE {
+                // A prompt over the context is the input's fault: a run of
+                // long benchmark items must not stop a working oracle.
+                inner.state.last_error = Some(f.error.clone());
+                inner.state.consecutive_errors = errors_before.saturating_add(1);
+                if inner.state.consecutive_errors >= self.cfg.max_errors {
+                    stop = stop.or_else(|| Some("max_errors".into()));
+                }
             }
         } else {
             inner.state.consecutive_errors = 0;
@@ -1897,6 +1939,27 @@ pub fn read_answer_ledgers(paths: &[PathBuf]) -> Result<HashMap<String, String>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The upstream's "prompt does not fit" in the phrasings OpenRouter and
+    /// its providers use is told from other rejections (DESIGN A21); the
+    /// code is in the closed set.
+    #[test]
+    fn a_context_overflow_is_told_from_other_rejections() {
+        let or = br#"{"error":{"message":"This endpoint's maximum context length is 163840 tokens. However, you requested about 200513 tokens","code":400}}"#;
+        assert!(context_overflow(400, or));
+        assert!(context_overflow(413, b"Prompt is too long"));
+        assert!(context_overflow(
+            200,
+            br#"{"error":{"code":"context_length_exceeded"}}"#
+        ));
+        assert!(!context_overflow(
+            400,
+            br#"{"error":{"message":"invalid model"}}"#
+        ));
+        assert!(!context_overflow(502, or));
+        assert!(!context_overflow(429, or));
+        assert!(is_known_code(CONTEXT_LENGTH_CODE));
+    }
 
     fn q(id: &str, kind: QuestionKind, criteria: Value) -> Question {
         Question {

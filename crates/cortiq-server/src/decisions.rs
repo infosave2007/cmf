@@ -833,11 +833,14 @@ fn require_json(headers: &HeaderMap) -> Result<(), HttpError> {
     }
 }
 
+/// A capacity error (DESIGN A21): the marker in the message,
+/// `details.capacity`, 413 here and 422 on the System One surface.
 fn too_large(limit: usize) -> HttpError {
-    HttpError::reason(
+    HttpError::from(ApiError::capacity(
         Reason::PayloadTooLarge,
+        None,
         format!("request body is larger than {limit} bytes"),
-    )
+    ))
     .with_detail("limit", json!(limit))
 }
 
@@ -1657,7 +1660,14 @@ async fn decide_http(st: &Arc<DecisionState>, headers: &HeaderMap, body: Body) -
 }
 
 async fn systemone_http(st: &Arc<DecisionState>, headers: &HeaderMap, body: Body) -> Handled {
-    let (p, bytes) = keyed_body(st, headers, body).await?;
+    // A body over the limit is a capacity error: 422 + the marker here
+    // (DESIGN A21), as every other capacity error of this surface.
+    let (p, bytes) = keyed_body(st, headers, body).await.map_err(|mut e| {
+        if e.status == 413 {
+            e.status = 422;
+        }
+        e
+    })?;
     let account = p.account.clone();
     let guard = st
         .svc
@@ -2438,6 +2448,7 @@ impl DecisionState {
                 model,
                 request: &req,
                 features: &features,
+                question_features: &[&features],
                 questions: std::slice::from_ref(&outcome),
             });
             self.link(request_id, request_id);

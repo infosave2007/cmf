@@ -16,7 +16,7 @@
 //!  "learning":{"enabled":true,"refit_min_new":25,"dedup":0.995,"cold_start":true,"synchronous":false,
 //!   "auto_skills":true,"auto_min_rows":10,"auto_k":8,"auto_tau":0.9,"auto_min_agreement":0.8,
 //!   "auto_min_coverage":0.8,"auto_max_skills":256,"auto_max_labels":64,"auto_max_examples_per_label":1000,
-//!   "auto_temperature_min":0.02,"auto_explore_every":8},
+//!   "auto_temperature_min":0.02,"auto_explore_every":8,"auto_min_sightings":2,"auto_sightings_cap":100000},
 //!  "feedback":{"pending_cap":50000}}
 //! ```
 //!
@@ -411,6 +411,16 @@ pub struct LearningConfig {
     /// four kept 36 % of the traffic at the oracle while a label the oracle
     /// itself names inconsistently never activated). 0 turns it off.
     pub auto_explore_every: u64,
+    /// The sighting of a state-less contract (a request with an empty
+    /// `state`, DESIGN A20) from which it is registered and learned (2: a
+    /// contract seen once — a multiple-choice item whose options change with
+    /// every question — never reaches `learn.log` nor uses up
+    /// `auto_max_skills`); 1 registers at the first sighting, as stateful
+    /// contracts always are.
+    pub auto_min_sightings: u32,
+    /// State-less contracts whose sightings are counted (an in-memory LRU,
+    /// lost on restart).
+    pub auto_sightings_cap: usize,
 }
 
 impl Default for LearningConfig {
@@ -432,6 +442,8 @@ impl Default for LearningConfig {
             auto_max_examples_per_label: 1000,
             auto_temperature_min: 0.02,
             auto_explore_every: 8,
+            auto_min_sightings: 2,
+            auto_sightings_cap: 100_000,
         }
     }
 }
@@ -878,6 +890,14 @@ impl Config {
             l.auto_max_examples_per_label >= 1,
             "learning.auto_max_examples_per_label must be positive"
         );
+        ensure!(
+            l.auto_min_sightings >= 1,
+            "learning.auto_min_sightings must be positive"
+        );
+        ensure!(
+            l.auto_sightings_cap >= 1,
+            "learning.auto_sightings_cap must be positive"
+        );
         // Any positive f32-exact `T` is a valid gate (`Gate::validate`); the
         // floor is bounded by 1 only so that a typo cannot flatten the softmax.
         check_unit(
@@ -971,11 +991,13 @@ mod tests {
         assert_eq!((l.auto_max_skills, l.auto_max_labels), (256, 64));
         assert_eq!(l.auto_max_examples_per_label, 1000);
         assert_eq!((l.auto_temperature_min, l.auto_explore_every), (0.02, 8));
+        assert_eq!((l.auto_min_sightings, l.auto_sightings_cap), (2, 100_000));
         let ok = |j: &str| Config::from_json(format!(r#"{{"learning":{{{j}}}}}"#).as_bytes());
         assert!(ok(r#""auto_skills":false,"auto_min_rows":2,"auto_k":1,"auto_tau":0,"auto_max_labels":255"#).is_ok());
         // 0 = no floor / exploration off; the floor may reach 1.
         assert!(ok(r#""auto_temperature_min":0,"auto_explore_every":0"#).is_ok());
         assert!(ok(r#""auto_temperature_min":1"#).is_ok());
+        assert!(ok(r#""auto_min_sightings":1,"auto_sightings_cap":1"#).is_ok());
         for (j, what) in [
             (r#""auto_min_rows":1"#, "auto_min_rows"),
             (r#""auto_k":0"#, "auto_k"),
@@ -991,6 +1013,8 @@ mod tests {
             ),
             (r#""auto_temperature_min":-0.01"#, "auto_temperature_min"),
             (r#""auto_temperature_min":1.5"#, "auto_temperature_min"),
+            (r#""auto_min_sightings":0"#, "auto_min_sightings"),
+            (r#""auto_sightings_cap":0"#, "auto_sightings_cap"),
             // A u64: serde names the value, not the key.
             (r#""auto_explore_every":-1"#, "invalid value"),
             (r#""auto_unknown":1"#, "unknown field"),

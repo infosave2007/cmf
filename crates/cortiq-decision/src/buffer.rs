@@ -270,6 +270,14 @@ pub struct Contract {
     /// The first request's `criteria` object (descriptions kept, `null` too).
     pub criteria: Value,
     pub created_unix: u64,
+    /// A state-less contract (DESIGN A19.1, 0.8.7): the questions of
+    /// requests with an empty `state`, whose instructions are the text the
+    /// model reads — the contract is the criteria alone
+    /// ([`manifest::stateless_contract_sha256`]) and `instructions` is
+    /// `null`. Not a field of the record: the record's id tells it (the
+    /// stateful id of `null` instructions and the state-less id of the same
+    /// criteria differ), so the record format is unchanged.
+    pub stateless: bool,
 }
 
 impl Contract {
@@ -282,6 +290,20 @@ impl Contract {
             instructions: instructions.clone(),
             criteria: Value::Object(criteria.clone()),
             created_unix,
+            stateless: false,
+        }
+    }
+
+    /// The contract of a choice question of a state-less request (DESIGN
+    /// A19.1): its criteria alone, the ids in the request's order.
+    pub fn stateless(criteria: &Map<String, Value>, created_unix: u64) -> Self {
+        Self {
+            skill: manifest::stateless_auto_skill_id(criteria),
+            ids: criteria.keys().cloned().collect(),
+            instructions: Value::Null,
+            criteria: Value::Object(criteria.clone()),
+            created_unix,
+            stateless: true,
         }
     }
 
@@ -300,7 +322,11 @@ impl Contract {
             return None;
         }
         let r = m.rubric.as_ref()?;
-        let c = Self::new(&r.instructions, &r.ordered_criteria(), created_unix);
+        let c = if r.is_stateless() {
+            Self::stateless(&r.ordered_criteria(), created_unix)
+        } else {
+            Self::new(&r.instructions, &r.ordered_criteria(), created_unix)
+        };
         (c.skill == m.id).then_some(c)
     }
 
@@ -325,7 +351,11 @@ impl Contract {
                 )
             })
             .collect();
-        Rubric::new(self.instructions.clone(), criteria)
+        if self.stateless {
+            Rubric::stateless(criteria)
+        } else {
+            Rubric::new(self.instructions.clone(), criteria)
+        }
     }
 
     fn encode(&self, e: &mut Enc) {
@@ -356,8 +386,13 @@ impl Contract {
             ids.len() == object.len() && ids.iter().all(|i| object.contains_key(i)),
             "contract record: the option ids are not the criteria keys"
         );
+        // The id tells a state-less contract (0.8.7) from a stateful one:
+        // `null` instructions hash to another id than the criteria alone.
+        let stateless = skill != manifest::auto_skill_id(&instructions, object)
+            && instructions.is_null()
+            && skill == manifest::stateless_auto_skill_id(object);
         ensure!(
-            skill == manifest::auto_skill_id(&instructions, object),
+            stateless || skill == manifest::auto_skill_id(&instructions, object),
             "contract record: the skill id does not match its contract"
         );
         Ok(Self {
@@ -366,6 +401,7 @@ impl Contract {
             instructions,
             criteria,
             created_unix,
+            stateless,
         })
     }
 }
@@ -932,5 +968,44 @@ mod tests {
         assert_eq!(reg.get(&o.skill), Some(&o));
         let ids: Vec<&str> = reg.iter().map(|c| c.skill.as_str()).collect();
         assert!(ids.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// A state-less contract (DESIGN A19.1) is the criteria alone: its id is
+    /// neither the id of `null` instructions nor of any instructions over the
+    /// same criteria, the record round-trips with the flag recovered from the
+    /// id, and the rubric (input marked, instructions null) reproduces it.
+    #[test]
+    fn a_stateless_contract_is_the_criteria_and_round_trips() {
+        let c = object(serde_json::json!({"B": "two", "A": "one"}));
+        let s = Contract::stateless(&c, 4);
+        assert!(s.stateless && s.instructions.is_null());
+        assert_eq!(s.ids, ["B", "A"]);
+        assert_eq!(s.skill, manifest::stateless_auto_skill_id(&c));
+        assert_ne!(s.skill, Contract::new(&Value::Null, &c, 4).skill);
+        assert_ne!(
+            s.skill,
+            Contract::new(&serde_json::json!("Pick"), &c, 4).skill
+        );
+        // The criteria order is not part of it; a description is.
+        let reordered = object(serde_json::json!({"A": "one", "B": "two"}));
+        assert_eq!(Contract::stateless(&reordered, 5).skill, s.skill);
+        let described = object(serde_json::json!({"A": "uno", "B": "two"}));
+        assert_ne!(Contract::stateless(&described, 5).skill, s.skill);
+        let r = s.rubric();
+        assert!(r.is_stateless() && r.instructions.is_null());
+        assert_eq!(r.order(), ["B", "A"]);
+        assert_eq!(r.auto_skill_id(), s.skill);
+        let frame = LogRecord::Contract(s.clone()).frame();
+        let (recs, _) = read_records(&frame);
+        assert_eq!(recs, vec![LogRecord::Contract(s.clone())]);
+        // A stateful record of null instructions stays stateful.
+        let n = Contract::new(&Value::Null, &c, 4);
+        let (recs, _) = read_records(&LogRecord::Contract(n.clone()).frame());
+        assert_eq!(recs, vec![LogRecord::Contract(n)]);
+        // A record whose id is neither form is refused.
+        let mut bad = s;
+        bad.skill = "auto-000000000000".into();
+        let (recs, _) = read_records(&LogRecord::Contract(bad).frame());
+        assert!(recs.is_empty());
     }
 }

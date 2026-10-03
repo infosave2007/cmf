@@ -245,6 +245,21 @@ pub fn match_question(
     q: &Question,
     forced: Option<&str>,
 ) -> Result<SkillMatch, ApiError> {
+    match_question_as(skills, q, forced, false)
+}
+
+/// [`match_question`] for a question whose instructions may be its input
+/// (`reads_instructions`, a state-less request, DESIGN A19.2): data skills
+/// are matched by ids as always; an auto-skill only by the question's
+/// state-less contract sha then (criteria alone), and by its stateful one
+/// otherwise — the two never equal, so a state-less question never reaches
+/// a stateful auto-skill nor the reverse.
+pub fn match_question_as(
+    skills: &[SkillLabels<'_>],
+    q: &Question,
+    forced: Option<&str>,
+    reads_instructions: bool,
+) -> Result<SkillMatch, ApiError> {
     let pool: Vec<SkillLabels<'_>> = match forced {
         Some(id) => {
             let Some(s) = skills.iter().find(|s| s.id == id) else {
@@ -266,7 +281,7 @@ pub fn match_question(
         )));
     }
     let options = q.options();
-    let contract = q.contract_sha256();
+    let contract = q.contract_sha256_as(reads_instructions);
     let m = match_labels(&pool, &options, contract.as_deref());
     if m.kind == MatchKind::Untrained
         && let Some(id) = forced
@@ -441,6 +456,51 @@ mod tests {
         assert_eq!(m.skill.as_deref(), Some("auto-1"));
         let m = match_question(&[auto, auto_u], &urgent, None).unwrap();
         assert_eq!(m.skill.as_deref(), Some("auto-2"));
+    }
+
+    /// A state-less question (DESIGN A19.2) reaches an auto-skill only
+    /// through its state-less contract (criteria alone, whatever the
+    /// instructions — they are its text); the same question read with a
+    /// state reaches only the stateful contract; data skills match by ids
+    /// either way.
+    #[test]
+    fn a_stateless_question_matches_only_the_stateless_contract() {
+        let all = labels(&["cruise", "food", "travel"]);
+        let a = question(
+            json!("Classify: I want pasta"),
+            &["food", "travel", "cruise"],
+        );
+        let b = question(
+            json!("Classify: a cheap ferry"),
+            &["food", "travel", "cruise"],
+        );
+        let sl = a.contract_sha256_as(true).unwrap();
+        assert_eq!(sl, b.contract_sha256_as(true).unwrap());
+        assert_ne!(sl, a.contract_sha256().unwrap());
+        assert_eq!(a.contract_sha256_as(false), a.contract_sha256());
+        let stateless = SkillLabels::auto("auto-s", &all, &all, &sl);
+        let sf = a.contract_sha256().unwrap();
+        let stateful = SkillLabels::auto("auto-f", &all, &all, &sf);
+        let m = match_question_as(&[stateless, stateful], &b, None, true).unwrap();
+        assert_eq!(
+            (m.kind, m.skill.as_deref()),
+            (MatchKind::Exact, Some("auto-s"))
+        );
+        let m = match_question_as(&[stateless, stateful], &a, None, false).unwrap();
+        assert_eq!(m.skill.as_deref(), Some("auto-f"));
+        assert!(
+            match_question_as(&[stateless], &a, None, false)
+                .unwrap()
+                .is_foreign()
+        );
+        assert!(
+            match_question_as(&[stateful], &b, None, true)
+                .unwrap()
+                .is_foreign()
+        );
+        let data = SkillLabels::data("d", &all);
+        let m = match_question_as(&[data], &b, None, true).unwrap();
+        assert_eq!((m.kind, m.skill.as_deref()), (MatchKind::Exact, Some("d")));
     }
 
     #[test]

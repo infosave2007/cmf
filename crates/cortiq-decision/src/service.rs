@@ -14,7 +14,13 @@
 //!    the call is not allowed the request fails with 422 before any work;
 //! 4. the encoder and the hash run once on the state text; each exact or subset
 //!    question is decided by its skill (the errors of a skill are computed once
-//!    per request), and the gate of the profile decides `local` or not;
+//!    per request), and the gate of the profile decides `local` or not. A
+//!    **state-less** request (empty `state`, 0.8.7, DESIGN A19) runs them once
+//!    per distinct instructions text instead: each question is read through
+//!    its own instructions ([`DecisionRequest::input_text`]), matched to an
+//!    auto-skill by its state-less contract, cached and escalated with the φ
+//!    of its text, its instructions redacted for the oracle like a state —
+//!    and never certified;
 //! 5. undetermined questions (gate rejected, untrained) go to the escalator in
 //!    one call when the oracle is allowed (spec §5.1: `oracle.enabled`, the
 //!    key's `oracle_allowed` and `cmf.oracle` / `default_per_request`; the
@@ -75,7 +81,7 @@ use crate::eval::{SkillScorer, TOP_ERRORS, f32_json, jev_confidence};
 use crate::keys::{AuthFailure, KeyRecord, KeyStore, NewKey, RateLimiter, now_unix};
 use crate::ledger::{Actions, Totals, UsageLedger, UsageRecord};
 use crate::manifest::{GateParams, SkillManifest, TaskOrigin};
-use crate::matching::{MatchKind, SkillLabels, SkillMatch, match_question};
+use crate::matching::{MatchKind, SkillLabels, SkillMatch, match_question_as};
 use crate::metering::{self, Cost, Rates, TokenCache, Usd};
 use crate::protocol::{
     ApiError, DecisionRequest, FeedbackRequest, MODEL_ID, ModelRef, PROVIDER, Profile, Question,
@@ -849,12 +855,28 @@ pub struct Escalation<'a> {
     pub principal: &'a Principal,
     pub model: &'a Arc<LoadedModel>,
     pub request: &'a DecisionRequest,
+    /// The features of the state (of the first question's input in a
+    /// state-less request); per question: [`Escalation::features_of`].
     pub features: &'a Features,
+    /// The features of each question's input text, by request position
+    /// (DESIGN A19): all the state's in a stateful request.
+    pub question_features: &'a [&'a Features],
     pub pending: Vec<Pending<'a>>,
     /// The most the oracle may cost this request (the provider's own USD)
     /// before the caller's `credit_usd` is used up (see
     /// [`DecisionService::oracle_credit_left`]); `None`: no such limit.
     pub oracle_credit_usd: Option<f64>,
+}
+
+impl Escalation<'_> {
+    /// The features of question `index`'s input (the state's, or its
+    /// instructions' in a state-less request).
+    pub fn features_of(&self, index: usize) -> &Features {
+        self.question_features
+            .get(index)
+            .copied()
+            .unwrap_or(self.features)
+    }
 }
 
 /// Admin operations served by the escalator (spec §5b).
@@ -880,7 +902,19 @@ pub struct Observation<'a> {
     pub model: &'a Arc<LoadedModel>,
     pub request: &'a DecisionRequest,
     pub features: &'a Features,
+    /// As [`Escalation::question_features`].
+    pub question_features: &'a [&'a Features],
     pub questions: &'a [QuestionOutcome],
+}
+
+impl Observation<'_> {
+    /// As [`Escalation::features_of`].
+    pub fn features_of(&self, index: usize) -> &Features {
+        self.question_features
+            .get(index)
+            .copied()
+            .unwrap_or(self.features)
+    }
 }
 
 /// The oracle cascade seen from the service (spec §10). Implemented by
@@ -1507,7 +1541,9 @@ impl DecisionService {
     pub fn decide_systemone_body(&self, body: &[u8], p: &Principal) -> Result<Decided, ApiError> {
         let req =
             crate::protocol::parse_systemone_request(body, &self.limits).map_err(|mut e| {
-                if e.reason == crate::protocol::Reason::InvalidRequest {
+                // A capacity error is 422 here too (DESIGN A21): the System
+                // One clients read 422 + the marker as "does not fit".
+                if e.reason == crate::protocol::Reason::InvalidRequest || e.is_capacity() {
                     e.status = 422;
                 }
                 e
@@ -1556,11 +1592,14 @@ impl DecisionService {
             0
         };
         let LocalStage {
-            features,
+            inputs,
+            input_of,
             signal: st,
             mut locals,
             resonance,
         } = local_stage(&model, req, &matches, learning.auto_tau, explore_every)?;
+        let question_features: Vec<&Features> = input_of.iter().map(|&k| &inputs[k]).collect();
+        let features = &inputs[0];
 
         // Undetermined questions, and the explored ones.
         let pending_idx: Vec<usize> = (0..matches.len())
@@ -1586,7 +1625,8 @@ impl DecisionService {
                         principal: p,
                         model: &model,
                         request: req,
-                        features: &features,
+                        features,
+                        question_features: &question_features,
                         pending,
                         oracle_credit_usd: self.oracle_credit_left(p),
                     };
@@ -1692,7 +1732,13 @@ impl DecisionService {
 
         // Metering.
         let tokenizer = model.encoder().encoder().tokenizer();
-        let mut input_tokens = metering::state_tokens(tokenizer, &req.state_text, st.tokens);
+        // A state-less request's texts are its instructions, metered with the
+        // contracts below: its state counts as the empty text it is.
+        let mut input_tokens = if req.is_stateless() {
+            metering::text_tokens(tokenizer, &req.state_text)
+        } else {
+            metering::state_tokens(tokenizer, &req.state_text, st.tokens)
+        };
         for q in &req.questions {
             input_tokens += self.tokens.contract_tokens(
                 tokenizer,
@@ -1763,7 +1809,8 @@ impl DecisionService {
                 principal: p,
                 model: &model,
                 request: req,
-                features: &features,
+                features,
+                question_features: &question_features,
                 questions: &outcomes,
             });
         }
@@ -2156,7 +2203,13 @@ impl DecisionService {
         v["tasks"] = Value::Array(tasks);
         v["rubric"] = match &s.manifest.rubric {
             Some(r) => {
-                json!({"instructions": r.instructions, "criteria": Value::Object(r.ordered_criteria())})
+                let mut j = json!({"instructions": r.instructions, "criteria": Value::Object(r.ordered_criteria())});
+                // A state-less contract (DESIGN A19.1): its questions' text is
+                // their instructions (key added only then).
+                if let Some(input) = &r.input {
+                    j["input"] = json!(input);
+                }
+                j
             }
             None => Value::Null,
         };
@@ -2351,14 +2404,26 @@ fn match_questions(
     let labels = model.skill_labels();
     req.questions
         .iter()
-        .map(|q| match_question(&labels, q, req.cmf.skill.as_deref()))
+        .map(|q| {
+            match_question_as(
+                &labels,
+                q,
+                req.cmf.skill.as_deref(),
+                req.reads_instructions(q),
+            )
+        })
         .collect()
 }
 
-/// The encoder and hash of a request (once) and the local decision of each
-/// exact or subset question (the errors of a skill once per request).
+/// The encoder and hash of a request's input texts and the local decision of
+/// each exact or subset question (the errors of a skill once per text).
+/// `inputs` holds the features of each distinct input text in first-seen
+/// order, `input_of` the text of each question: one text — the state's — for
+/// a request with a state, exactly as before; one per distinct instructions
+/// text for a state-less request (DESIGN A19).
 struct LocalStage {
-    features: Features,
+    inputs: Vec<Features>,
+    input_of: Vec<usize>,
     signal: crate::signal::Timings,
     locals: Vec<Option<LocalDecision>>,
     resonance: Duration,
@@ -2371,33 +2436,68 @@ fn local_stage(
     auto_tau: f32,
     explore_every: u64,
 ) -> Result<LocalStage, ApiError> {
-    let mut indices = Vec::new();
-    for m in matches.iter().filter(|m| m.kind.is_local()) {
+    // The distinct texts and, per text, the skills its local questions need
+    // (a stateful request: the state alone, every local skill).
+    let mut texts: Vec<String> = Vec::new();
+    let mut input_of = Vec::with_capacity(matches.len());
+    let mut indices: Vec<Vec<usize>> = Vec::new();
+    for (q, m) in req.questions.iter().zip(matches) {
+        let text = req.input_text(q);
+        let k = match texts.iter().position(|t| *t == text) {
+            Some(k) => k,
+            None => {
+                texts.push(text);
+                indices.push(Vec::new());
+                texts.len() - 1
+            }
+        };
+        input_of.push(k);
+        if !m.kind.is_local() {
+            continue;
+        }
         let sid = m.skill.as_deref().unwrap_or_default();
         let si = model
             .skill_index(sid)
             .ok_or_else(|| internal(format!("matched skill '{sid}' is missing")))?;
-        if !indices.contains(&si) {
-            indices.push(si);
+        if !indices[k].contains(&si) {
+            indices[k].push(si);
         }
     }
-    let packed: Vec<_> = indices
-        .iter()
-        .map(|&i| model.skills[i].scorer.packed())
-        .collect();
-    let scored = model
-        .encoder()
-        .score_timed(&req.state_text, &packed)
-        .map_err(internal)?;
-    let features = scored.features;
-    let signal = scored.timings;
+    let mut inputs = Vec::with_capacity(texts.len());
+    let mut signal = crate::signal::Timings::default();
+    let mut resonance = Duration::ZERO;
+    let mut skill_errors: Vec<HashMap<usize, Vec<f32>>> = Vec::with_capacity(texts.len());
+    for (text, idx) in texts.iter().zip(indices) {
+        let packed: Vec<_> = idx
+            .iter()
+            .map(|&i| model.skills[i].scorer.packed())
+            .collect();
+        let scored = model
+            .encoder()
+            .score_timed(text, &packed)
+            .map_err(internal)?;
+        let t = scored.timings;
+        signal.tokenize += t.tokenize;
+        signal.encode += t.encode;
+        signal.gpu += t.gpu;
+        signal.hash += t.hash;
+        signal.tokens += t.tokens;
+        resonance += scored.resonance;
+        inputs.push(scored.features);
+        skill_errors.push(idx.into_iter().zip(scored.errors).collect());
+    }
     let tr = Instant::now();
-    // Exploration is a property of the text (one hash per request, DESIGN
+    // Exploration is a property of the text (one hash per input text, DESIGN
     // A16); which questions it reaches is decided per auto-skill below.
-    let explore = certify::auto_explores(&features.phi_p, explore_every);
-    let skill_errors: HashMap<usize, Vec<f32>> = indices.into_iter().zip(scored.errors).collect();
+    let explore: Vec<bool> = inputs
+        .iter()
+        .map(|f| certify::auto_explores(&f.phi_p, explore_every))
+        .collect();
+    // A19.5: a state-less request has no string state, so nothing it
+    // answers is certified.
+    let state_is_text = req.state.is_text() && !req.is_stateless();
     let mut locals: Vec<Option<LocalDecision>> = Vec::with_capacity(matches.len());
-    for m in matches {
+    for (m, &k) in matches.iter().zip(&input_of) {
         if !m.kind.is_local() {
             locals.push(None);
             continue;
@@ -2410,20 +2510,21 @@ fn local_stage(
             local_decision(
                 &model.skills[si],
                 m,
-                &skill_errors[&si],
+                &skill_errors[k][&si],
                 req.cmf.profile,
-                req.state.is_text(),
+                state_is_text,
                 auto_tau,
-                explore,
+                explore[k],
             )
             .map_err(internal)?,
         ));
     }
     Ok(LocalStage {
-        features,
+        inputs,
+        input_of,
         signal,
         locals,
-        resonance: scored.resonance + tr.elapsed(),
+        resonance: resonance + tr.elapsed(),
     })
 }
 
@@ -2567,9 +2668,19 @@ fn untrained_error(
         Reason::OracleDisabled => 1,
         _ => 0,
     };
+    // The oracle said the prompt does not fit its context (DESIGN A21): a
+    // capacity error (422 with the marker), not an outage.
+    let mut overflow = false;
     for (i, res) in unresolved {
         let m = &matches[*i];
         let (reason, oracle) = match res {
+            Resolution::Failed(code) if code == crate::oracle::CONTEXT_LENGTH_CODE => {
+                overflow = true;
+                (
+                    Reason::UnsupportedQuestion,
+                    "the question does not fit the oracle's context",
+                )
+            }
             Resolution::Failed(_) => (Reason::OracleUnavailable, "the oracle call failed"),
             Resolution::Refused(RefusalReason::Budget) => (
                 Reason::OracleBudgetExhausted,
@@ -2623,6 +2734,14 @@ fn untrained_error(
         }
         _ => "the local model cannot answer these questions and the oracle is not allowed",
     };
+    if overflow {
+        return ApiError::capacity(
+            Reason::UnsupportedQuestion,
+            None,
+            "the local model cannot answer these questions and they do not fit the oracle's context",
+        )
+        .with_detail("questions", Value::Object(details));
+    }
     ApiError::new(worst, message).with_detail("questions", Value::Object(details))
 }
 
