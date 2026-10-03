@@ -883,9 +883,8 @@ fn a_lead_in_line_is_not_part_of_the_local_input() {
     };
     let lead = body("Classify the banking intent of this user request:\nmy card is late");
     let bare = body("Classify: my card is late");
-    let parse = |v: &Value| {
-        parse_systemone_request(&serde_json::to_vec(v).unwrap(), &limits).unwrap()
-    };
+    let parse =
+        |v: &Value| parse_systemone_request(&serde_json::to_vec(v).unwrap(), &limits).unwrap();
     let (a, b) = (parse(&lead), parse(&bare));
     assert_eq!(a.input_text(&a.questions[0]), "my card is late");
     assert_eq!(b.input_text(&b.questions[0]), "Classify: my card is late");

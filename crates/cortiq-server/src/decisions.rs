@@ -268,7 +268,7 @@ use cortiq_decision::eval::{f32_json, jev_confidence};
 use cortiq_decision::generation;
 use cortiq_decision::keys::{AuthFailure, KeyStore, now_unix};
 use cortiq_decision::ledger::{Actions, FLUSH_EVERY, Flusher, UsageLedger, UsageRecord};
-use cortiq_decision::matching::{MatchKind, SkillMatch};
+use cortiq_decision::matching::SkillMatch;
 use cortiq_decision::metering::{Rates, Usd};
 use cortiq_decision::protocol::{
     ApiError, CmfOptions, DecisionRequest, ModelRef, Profile, Question, QuestionKind, Reason,
@@ -2286,6 +2286,7 @@ impl DecisionState {
             accepted,
             // `/v1/route` never explores (DESIGN A16 is the decisions API's).
             explore: false,
+            none: None,
             certified: false,
             gate,
             profile: r.profile,
@@ -2407,14 +2408,7 @@ impl DecisionState {
         let outcome = QuestionOutcome {
             id: ROUTE_QUESTION_ID.to_string(),
             kind: QuestionKind::Choice,
-            matched: SkillMatch {
-                kind: MatchKind::Exact,
-                skill: Some(s.id().to_string()),
-                candidates: (0..local.labels.len()).collect(),
-                unknown: Vec::new(),
-                reason: None,
-                ambiguous: false,
-            },
+            matched: SkillMatch::exact(s.id(), local.labels.len()),
             action,
             local: Some(local.clone()),
             oracle: None,

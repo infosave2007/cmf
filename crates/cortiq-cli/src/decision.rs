@@ -78,8 +78,8 @@ use cortiq_decision::protocol::{
 };
 use cortiq_decision::service::{
     Action, AdminCommand, Decided, DecisionService, Escalation, EscalationResult, Escalator,
-    LoadedModel, ModelHandle, OracleStatus, Principal, QuestionOutcome, RefusalReason, Resolution,
-    Resolved,
+    LoadedModel, LocalDecision, ModelHandle, OracleStatus, Principal, QuestionOutcome,
+    RefusalReason, Resolution, Resolved,
 };
 use cortiq_decision::shadow::{SHADOW_LOG_FILE, upstream_base};
 use cortiq_decision::signal::SignalEncoder;
@@ -1919,7 +1919,7 @@ fn decide_one(model: DecisionModel, a: &DecideArgs, oracle: Option<&OracleFlags>
         .map_err(api_error)?
         .questions
         .iter()
-        .any(|(_, l)| l.as_ref().is_none_or(|l| !l.accepted));
+        .any(|(_, l)| l.as_ref().is_none_or(LocalDecision::undetermined));
     if !undetermined {
         // The gate accepted every question: the oracle is not asked (no
         // network, no state directory).

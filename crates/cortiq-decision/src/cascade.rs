@@ -120,7 +120,7 @@ use crate::container::{DecisionModel, Verify};
 use crate::generation;
 use crate::learn::{self, AttemptReport, Books, LearnContext, Outcome};
 use crate::manifest;
-use crate::matching::MatchKind;
+use crate::matching::{DescriptionMap, MatchKind};
 use crate::metering::Usd;
 use crate::oracle::{CallOutcome, Caller, KeyLookup, OracleClient, process_env};
 use crate::pii::{FLAG_PII_REDACTED, redact_value};
@@ -256,6 +256,9 @@ struct PendingEntry {
     account: String,
     skill: String,
     options: Vec<String>,
+    /// A description match's option labels (DESIGN C2): feedback names an
+    /// option id, the example its label.
+    by_descriptions: Option<DescriptionMap>,
     state: Arc<SparseState>,
 }
 
@@ -1260,7 +1263,13 @@ impl Escalator for Cascade {
                         if !cfg.learning.enabled {
                             continue;
                         }
-                        let OracleAnswer::Choice(label) = &v else {
+                        let OracleAnswer::Choice(id) = &v else {
+                            continue;
+                        };
+                        // A description match names the skill's label by
+                        // the option's description; its none option names
+                        // no label and teaches nothing (DESIGN C2).
+                        let Some(label) = p.matched.label_of(id) else {
                             continue;
                         };
                         // A matched skill learns under `teaches`; an untrained
@@ -1411,10 +1420,26 @@ impl Escalator for Cascade {
             }
             ring.remove(pos).ok_or_else(not_found)?
         };
+        // Under a description match the option names the skill's label; the
+        // none option names none (DESIGN C2): consumed, nothing to learn.
+        let label = match &entry.by_descriptions {
+            Some(d) if !fb.any_label => match d.label_of(&fb.label) {
+                Some(l) => l.to_string(),
+                None => {
+                    inner.stats.lock().feedback += 1;
+                    return Ok(json!({
+                        "id": fb.id, "question": fb.question, "skill": entry.skill,
+                        "label": fb.label, "accepted": false, "learned": false,
+                        "reason": "the none option names no label of the skill",
+                    }));
+                }
+            },
+            _ => fb.label.clone(),
+        };
         let model = inner.handle.current();
         let known = model
             .skill(&entry.skill)
-            .and_then(|s| s.manifest().task_of(&fb.label))
+            .and_then(|s| s.manifest().task_of(&label))
             .is_some();
         if !principal.learning_allowed {
             // The entry is consumed, as a learned feedback's is; nothing is
@@ -1430,7 +1455,7 @@ impl Escalator for Cascade {
         }
         let ex = Example {
             skill: entry.skill.clone(),
-            label: fb.label.clone(),
+            label: label.clone(),
             source: Source::ClientFeedback,
             weight: Source::ClientFeedback.default_weight(),
             ts: now_unix(),
@@ -1440,7 +1465,7 @@ impl Escalator for Cascade {
         };
         let (added, job) = inner.add_example(ex, None).map_err(|e| {
             tracing::error!(
-                error = %learn::redact_label(&format!("{e:#}"), &fb.label),
+                error = %learn::redact_label(&format!("{e:#}"), &label),
                 "feedback example"
             );
             ApiError::internal("the feedback could not be stored")
@@ -1449,8 +1474,8 @@ impl Escalator for Cascade {
         let (total, new) = {
             let b = inner.buffer.lock();
             (
-                b.examples(&entry.skill, &fb.label).len(),
-                b.new_count(&entry.skill, &fb.label),
+                b.examples(&entry.skill, &label).len(),
+                b.new_count(&entry.skill, &label),
             )
         };
         let mut learning = Value::Null;
@@ -1549,6 +1574,7 @@ impl Escalator for Cascade {
                 account: o.principal.account.clone(),
                 skill: skill.clone(),
                 options: question.options().into_iter().map(str::to_string).collect(),
+                by_descriptions: q.matched.by_descriptions.clone(),
                 state: st,
             });
         }
