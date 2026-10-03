@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.9] - 2026-10-03
+
+### Fixed
+- The iOS FFI library builds again: the expert store's page-cache advice
+  (`madvise`) is compiled only where the engine links `libc` (Linux, Android,
+  macOS). 0.8.8's `cfg(unix)` also matched iOS, where the crate has no `libc`
+  dependency, and the `aarch64-apple-ios` release job failed.
+
 ## [0.8.8] - 2026-10-03
 
 ### Added

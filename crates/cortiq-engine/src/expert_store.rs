@@ -1081,7 +1081,7 @@ fn willneed_on() -> bool {
 /// `MADV_WILLNEED` over an expert's three ranges of the mapping (unix;
 /// advisory; walks the page cache even when the pages are resident).
 fn will_need(bytes: &[u8], loc: &ExpertLoc) {
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     {
         let base = bytes.as_ptr() as usize;
         let page = 4096usize;
@@ -1094,7 +1094,7 @@ fn will_need(bytes: &[u8], loc: &ExpertLoc) {
             }
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     let _ = (bytes, loc);
 }
 
@@ -1103,7 +1103,7 @@ fn will_need(bytes: &[u8], loc: &ExpertLoc) {
 /// read-around that turns each ~0.5 KiB row lookup into a large disk read
 /// when the table is not in the page cache. Unix only; advisory.
 pub(crate) fn advise_random(model: &CmfModel, pred: impl Fn(&str) -> bool) -> usize {
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
     {
         let base = model.primary_bytes().as_ptr() as usize;
         let map_len = model.primary_bytes().len();
@@ -1129,7 +1129,7 @@ pub(crate) fn advise_random(model: &CmfModel, pred: impl Fn(&str) -> bool) -> us
         }
         advised
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {
         let _ = (model, pred);
         0
