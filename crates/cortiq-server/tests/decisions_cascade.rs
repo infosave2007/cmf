@@ -4743,3 +4743,201 @@ async fn pii_in_stateless_instructions_is_redacted() {
         format!("{SL_PREFIX}{text}")
     );
 }
+
+// ------------------------------------------------------------------ description matching (C2)
+
+/// A Decision Index kit row (`layout.py choice_row`): `state: {}`, the text
+/// after a lead-in line in the instructions, positional ids `option_N` and
+/// the descriptions given.
+fn kit_row(lead_in: &str, text: &str, descriptions: &[&str]) -> Value {
+    let mut c = Map::new();
+    for (i, d) in descriptions.iter().enumerate() {
+        c.insert(format!("option_{i}"), json!(d));
+    }
+    json!({"type": "choice", "instructions": format!("{lead_in}:\n{text}"), "criteria": c})
+}
+
+/// The id of the option of `q` described by `description`.
+fn option_of(q: &Value, description: &str) -> String {
+    q["criteria"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, d)| d.as_str() == Some(description))
+        .map(|(id, _)| id.clone())
+        .unwrap_or_else(|| panic!("no option '{description}' in {q}"))
+}
+
+/// Dev texts of `topics` its gate accepts, with their labels.
+async fn accepted_dev(srv: &Srv, n: usize) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (t, l) in &toy().dev {
+        let mut b = topics_body(t);
+        b["cmf"] = json!({"oracle": false});
+        let r = srv.decide(&b).await;
+        if r.action() == "local" && r.body["answers"]["task"]["choice"] == json!(l) {
+            out.push((t.clone(), l.clone()));
+            if out.len() == n {
+                break;
+            }
+        }
+    }
+    assert_eq!(out.len(), n, "not enough accepted dev texts");
+    out
+}
+
+/// Kit-format BANKING77/CLINC rows (DESIGN C1/C2) reach the data skill whose
+/// labels their descriptions name: answered LOCALLY in the row's option ids
+/// (no oracle call) on System One and the native surface alike, the kit's
+/// validator satisfied; a row with the out-of-scope option is answered with
+/// it, locally, when the gate rejects the text; without such an option a
+/// rejected text goes to the oracle and its answer teaches the skill the
+/// option's label, never the option id; descriptions two skills share are no
+/// match (the oracle answers).
+#[tokio::test]
+async fn kit_rows_reach_data_skills_through_their_descriptions() {
+    let mock = MockOracle::answering("unused");
+    let mut cfg = stand_config(&mock.url());
+    cfg.cache.enabled = false;
+    let jev = |o: &mut ServeOptions| o.jev_compatible = true;
+    let srv = Srv::open_with(
+        &toy().path,
+        tempfile::tempdir().unwrap(),
+        &cfg,
+        test_key(),
+        jev,
+    );
+    // The row on System One (the kit's request) and on the native surface
+    // (its diagnostics): the answers, and the native question block.
+    let ask_both = |q: &Value| {
+        let s1 = json!({"model": "default", "state": {}, "questions": {"q1": q.clone()}});
+        let native = body(json!({}), json!({"q1": q.clone()}), None);
+        let srv = &srv;
+        async move {
+            let a = srv.post("/v1/systemone", None, &s1).await;
+            assert_eq!(a.status, 200, "{}", a.text);
+            let n = srv.decide(&native).await;
+            assert_eq!(n.status, 200, "{}", n.text);
+            (a.body["answers"]["q1"].clone(), n)
+        }
+    };
+    // BANKING77-style: the label names as descriptions, in another order.
+    let banking = ["travel", "Weather", "cards", "billing"];
+    for (text, label) in accepted_dev(&srv, 4).await {
+        let q = kit_row(
+            "Classify the banking intent of this user request",
+            &text,
+            &banking,
+        );
+        let (a, n) = ask_both(&q).await;
+        kit_valid_choice(&q, &a);
+        assert_eq!(a["choice"], json!(option_of(&q, &label)), "{a}");
+        assert_eq!(n.body["answers"]["q1"], a);
+        let m = n.q("q1");
+        assert_eq!(
+            (&m["action"], &m["match"], &m["by"], &m["skill"]),
+            (
+                &json!("local"),
+                &json!("exact"),
+                &json!("descriptions"),
+                &json!("topics")
+            ),
+            "{m}"
+        );
+        assert_eq!(m["certified"], false, "a state-less row is never certified");
+    }
+    assert_eq!(mock.hits(), 0);
+
+    // CLINC-style: the labels with spaces and the out-of-scope option.
+    let oos = "out of scope: none of the listed intents";
+    let clinc = ["weather", "billing", oos, "cards", "travel"];
+    let lead = "Classify the intent of this user request, or choose out of scope if none applies";
+    let (text, label) = accepted_dev(&srv, 1).await.remove(0);
+    let q = kit_row(lead, &text, &clinc);
+    let (a, n) = ask_both(&q).await;
+    kit_valid_choice(&q, &a);
+    assert_eq!(a["choice"], json!(option_of(&q, &label.to_lowercase())));
+    assert_eq!(n.q("q1")["decision_path"], "router:uncertified");
+    // A text the gate rejects: the none option, locally, never escalated.
+    for text in &rejected()[..3] {
+        let q = kit_row(lead, text, &clinc);
+        let (a, n) = ask_both(&q).await;
+        kit_valid_choice(&q, &a);
+        assert_eq!(a["choice"], json!(option_of(&q, oos)), "{a}");
+        let m = n.q("q1");
+        assert_eq!(
+            (&m["action"], &m["decision_path"], &m["certified"]),
+            (&json!("local"), &json!("router:none_option"), &json!(false)),
+            "{m}"
+        );
+        assert_eq!(m["gate"]["accepted"], false, "{m}");
+        // The none option holds 1 − p_top of the rejected winner.
+        let p_top = m["gate"]["p_top"].as_f64().unwrap();
+        let p_none = a["probabilities"][option_of(&q, oos)].as_f64().unwrap();
+        assert!((p_none - (1.0 - p_top)).abs() < 1e-4, "{a} {m}");
+    }
+    assert_eq!(mock.hits(), 0, "the none option never reaches the oracle");
+
+    // No none option: a rejected text escalates; the oracle answers in the
+    // row's ids and the example is the option's label.
+    let q = kit_row(lead, &rejected()[3], &banking);
+    let (a, n) = ask_both(&q).await;
+    assert_eq!(n.q("q1")["action"], "oracle", "{}", n.text);
+    kit_valid_choice(&q, &a);
+    assert_eq!(a["choice"], "option_0");
+    assert_eq!(mock.hits(), 2);
+    let l = srv.learning().await;
+    let taught = l["buffer"]["labels"].as_array().unwrap();
+    assert!(
+        taught
+            .iter()
+            .any(|x| x["skill"] == "topics" && x["label"] == "travel"),
+        "{l}"
+    );
+    assert!(
+        taught
+            .iter()
+            .all(|x| !x["label"].as_str().unwrap().starts_with("option_")),
+        "{l}"
+    );
+
+    // Feedback names an option id: the example is its label; the none
+    // option teaches nothing.
+    let q = kit_row(lead, &rejected()[5], &clinc);
+    let (_, n) = ask_both(&q).await;
+    assert_eq!(n.q("q1")["decision_path"], "router:none_option");
+    let id = n.request_id().to_string();
+    let fb = |label: String| json!({"id": id, "question": "q1", "label": label});
+    let r = srv
+        .post("/v1/feedback", None, &fb(option_of(&q, oos)))
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(
+        (&r.body["learned"], &r.body["accepted"]),
+        (&json!(false), &json!(false))
+    );
+    let (_, n) = ask_both(&q).await;
+    let id = n.request_id().to_string();
+    let fb = |label: String| json!({"id": id, "question": "q1", "label": label});
+    let r = srv
+        .post("/v1/feedback", None, &fb(option_of(&q, "cards")))
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["learned"], true, "{}", r.text);
+    let l = srv.learning().await;
+    assert!(
+        l["buffer"]["labels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["skill"] == "topics" && x["label"] == "cards"),
+        "{l}"
+    );
+
+    // Descriptions two skills share (billing, cards): no description match.
+    let q = kit_row(lead, &rejected()[4], &["billing", "cards"]);
+    let (_, n) = ask_both(&q).await;
+    assert_eq!(n.q("q1")["match"], "untrained", "{}", n.text);
+    assert_eq!(n.q("q1")["action"], "oracle");
+    assert!(n.q("q1").get("by").is_none());
+}

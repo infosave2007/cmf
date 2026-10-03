@@ -1003,12 +1003,23 @@ pub struct LocalDecision {
     /// rule of spec §5.1; the oracle's answer is served (`action: oracle` /
     /// `cache`, flag `explore`), a refused or failed call leaves this answer.
     pub explore: bool,
+    /// The none option of a description match (DESIGN C2) when it is the
+    /// answer: the gate rejected the text, or its winner is not one of the
+    /// listed labels. Such a question is answered locally (`router:none_option`),
+    /// never escalated, never certified.
+    pub none: Option<String>,
     pub certified: bool,
     pub gate: GateParams,
     pub profile: Profile,
 }
 
 impl LocalDecision {
+    /// Not answered locally: the gate of the profile rejected the text and
+    /// no none option answers it (the question then goes to the oracle).
+    pub fn undetermined(&self) -> bool {
+        !self.accepted && self.none.is_none()
+    }
+
     pub fn is_novel(&self) -> bool {
         self.decision.is_novel(self.gate.novelty_theta)
     }
@@ -1615,7 +1626,11 @@ impl DecisionService {
 
         // Undetermined questions, and the explored ones.
         let pending_idx: Vec<usize> = (0..matches.len())
-            .filter(|&i| locals[i].as_ref().is_none_or(|l| !l.accepted || l.explore))
+            .filter(|&i| {
+                locals[i]
+                    .as_ref()
+                    .is_none_or(|l| l.undetermined() || l.explore)
+            })
             .collect();
         let mut resolved: Vec<Option<Resolved>> = vec![None; matches.len()];
         let mut oracle_usage = OracleUsage::default();
@@ -1912,8 +1927,10 @@ impl DecisionService {
             (Some(l), None) => (
                 Action::Local,
                 None,
-                local_answer(q, l, rounding),
-                if l.certified {
+                local_answer(q, &m, l, rounding),
+                if l.none.is_some() {
+                    "router:none_option"
+                } else if l.certified {
                     "router:certified"
                 } else if m.kind == MatchKind::Subset {
                     "router:uncertified_subset"
@@ -1941,7 +1958,7 @@ impl DecisionService {
                         (
                             Action::Abstain,
                             None,
-                            local_answer_or_null(q, local.as_ref(), rounding),
+                            local_answer_or_null(q, &m, local.as_ref(), rounding),
                             "escalate→disabled",
                         )
                     }
@@ -1950,7 +1967,7 @@ impl DecisionService {
                         (
                             Action::Abstain,
                             None,
-                            local_answer_or_null(q, local.as_ref(), rounding),
+                            local_answer_or_null(q, &m, local.as_ref(), rounding),
                             "escalate→oracle_unavailable",
                         )
                     }
@@ -2045,6 +2062,9 @@ impl DecisionService {
         m.insert("source".into(), json!(o.action.source()));
         m.insert("skill".into(), json!(o.matched.skill));
         m.insert("match".into(), json!(o.matched.kind.as_str()));
+        if o.matched.by_descriptions.is_some() {
+            m.insert("by".into(), json!("descriptions"));
+        }
         m.insert("certified".into(), json!(o.certified));
         let (gate, errors) = match &o.local {
             Some(l) => {
@@ -2601,12 +2621,19 @@ fn local_decision(
         let c = if exact { w } else { m.candidates[w] };
         scorer.origins()[c] == TaskOrigin::Data
     });
+    let choice = decision.winner.map(|w| labels[w].clone());
+    // A description match with a none option (DESIGN C2): a rejected text,
+    // or a winner the question does not list, is answered with it.
+    let none = m.none_option().and_then(|id| {
+        let listed = choice.as_deref().is_some_and(|c| m.id_of(c).is_some());
+        (!accepted || !listed).then(|| id.to_string())
+    });
     let certified = exact
         && state_is_text
         && profile != Profile::CostSaver
         && gate.certified
-        && winner_from_data;
-    let choice = decision.winner.map(|w| labels[w].clone());
+        && winner_from_data
+        && none.is_none();
     let confidence = if decision.winner.is_some() {
         jev_confidence(decision.p_top, labels.len())
     } else {
@@ -2623,6 +2650,7 @@ fn local_decision(
         gate_accepted,
         accepted,
         explore,
+        none,
         certified,
         gate,
         profile,
@@ -2630,22 +2658,79 @@ fn local_decision(
 }
 
 /// The choice answer of a local decision: every option in request order.
-fn local_answer(q: &Question, l: &LocalDecision, rounding: Rounding) -> Value {
+/// Under a description match (DESIGN C2) the options are the question's ids
+/// with their labels' probabilities; a none option holds the mass of the
+/// labels the question does not list, and when it is the answer (`l.none`)
+/// after a rejection, `1 − p_top` with the listed options scaled to the rest.
+fn local_answer(q: &Question, m: &SkillMatch, l: &LocalDecision, rounding: Rounding) -> Value {
     let options = q.options();
-    let probs: Vec<(&str, f32)> = options
+    let Some(none_id) = m.none_option() else {
+        let probs: Vec<(&str, f32)> = options
+            .iter()
+            .map(|o| {
+                let p = m.label_of(o).and_then(|lab| l.probability(lab));
+                (*o, p.unwrap_or(0.0))
+            })
+            .collect();
+        let choice = l.choice.as_deref().unwrap_or_default();
+        return answer::choice_answer(
+            &probs,
+            m.id_of(choice).unwrap_or(choice),
+            answer::answer_confidence(l.decision.p_top, options.len()),
+            rounding,
+        );
+    };
+    let mut probs: Vec<(&str, f32)> = options
         .iter()
-        .map(|o| (*o, l.probability(o).unwrap_or(0.0)))
+        .map(|o| {
+            let p = m.label_of(o).and_then(|lab| l.probability(lab));
+            (*o, p.unwrap_or(0.0))
+        })
         .collect();
+    let listed: f32 = probs.iter().map(|(_, p)| p).sum();
+    let mut p_none = (1.0 - listed).max(0.0);
+    if l.none.is_some() && !l.accepted {
+        // Rejected: the none option takes 1 − p_top of the rejected winner,
+        // the listed options share the rest in their proportions.
+        let p_top = l.decision.p_top.clamp(0.0, 1.0);
+        let scale = if listed > 0.0 { p_top / listed } else { 0.0 };
+        for (_, p) in &mut probs {
+            *p *= scale;
+        }
+        p_none = 1.0 - p_top;
+    }
+    for (o, p) in &mut probs {
+        if *o == none_id {
+            *p = p_none;
+        }
+    }
+    let choice = match &l.none {
+        Some(id) => id.as_str(),
+        None => l
+            .choice
+            .as_deref()
+            .and_then(|c| m.id_of(c))
+            .unwrap_or_default(),
+    };
+    let p_choice = probs
+        .iter()
+        .find(|(o, _)| *o == choice)
+        .map_or(0.0, |(_, p)| *p);
     answer::choice_answer(
         &probs,
-        l.choice.as_deref().unwrap_or_default(),
-        answer::answer_confidence(l.decision.p_top, options.len()),
+        choice,
+        answer::answer_confidence(p_choice, options.len()),
         rounding,
     )
 }
 
-fn local_answer_or_null(q: &Question, l: Option<&LocalDecision>, rounding: Rounding) -> Value {
-    l.map_or(Value::Null, |l| local_answer(q, l, rounding))
+fn local_answer_or_null(
+    q: &Question,
+    m: &SkillMatch,
+    l: Option<&LocalDecision>,
+    rounding: Rounding,
+) -> Value {
+    l.map_or(Value::Null, |l| local_answer(q, m, l, rounding))
 }
 
 /// `"<a> leads <b> by <Δscore> score"` (router `api.rs:1141-1165`).
