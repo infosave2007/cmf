@@ -1348,7 +1348,7 @@ impl Escalator for Cascade {
         drop(guard);
 
         // Followers wait for their leader.
-        let wait = Duration::from_secs_f64(cfg.oracle.call_deadline_s()) + FOLLOWER_GRACE;
+        let wait = Duration::from_secs_f64(cfg.oracle.escalation_deadline_s()) + FOLLOWER_GRACE;
         for (i, slot) in followers {
             let r = match slot.wait(wait) {
                 Some(Resolution::Oracle(a)) => Resolution::Cache(a),

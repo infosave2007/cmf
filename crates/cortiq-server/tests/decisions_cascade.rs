@@ -5128,3 +5128,52 @@ async fn reasoning_effort_is_sent_and_accounted() {
     let st = srv.admin("GET", "/v1/admin/oracle", None).await;
     assert_eq!(st.body["reasoning"], "high", "{}", st.text);
 }
+
+/// A reasoning call cut by its token allowance (`finish_length`, billed) is
+/// asked once more without reasoning (DESIGN C5): the question is answered
+/// by the direct call, both calls are in the ledger, and the stop rules see
+/// the answered one last (no consecutive error is left).
+#[tokio::test]
+async fn a_reasoning_call_cut_by_length_is_answered_without_reasoning() {
+    let mock = MockOracle::start(|req| {
+        let v = req.json();
+        let body = if v["reasoning"] == json!({"effort": "low", "exclude": true}) {
+            json!({
+                "id": "gen-mock", "model": ORACLE_MODEL, "provider": "Mock",
+                "choices": [{"finish_reason": "length", "message": {"role": "assistant", "content": ""}}],
+                "usage": {"prompt_tokens": 900, "completion_tokens": 2048, "cost": 3.0e-4,
+                          "completion_tokens_details": {"reasoning_tokens": 2048}},
+            })
+        } else if v["reasoning"] == json!({"enabled": false}) && v["max_tokens"] == json!(64 + 128) {
+            let content = verdicts(req, |_, o| pick(o, "travel")).to_string();
+            json!({
+                "id": "gen-mock", "model": ORACLE_MODEL, "provider": "Mock",
+                "choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": content}}],
+                "usage": {"prompt_tokens": 900, "completion_tokens": 12, "cost": 1.0e-5},
+            })
+        } else {
+            return raw_reply(400, r#"{"error":{"message":"not the expected body"}}"#);
+        };
+        MockReply {
+            status: 200,
+            body: serde_json::to_vec(&body).unwrap(),
+            delay: Duration::ZERO,
+        }
+    });
+    let mut cfg = stand_config(&mock.url());
+    cfg.oracle.reasoning = "low".into();
+    cfg.oracle.reasoning_max_tokens = 2048;
+    let srv = Srv::new(&cfg);
+    let r = srv.decide(&topics_body(&rejected()[0])).await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.action(), "oracle", "{}", r.text);
+    assert_eq!(r.body["answers"]["task"]["choice"], "travel");
+    assert_eq!(mock.requests().len(), 2, "one reasoning call, one direct call");
+    let ledger = srv.ledger();
+    let statuses: Vec<&str> = ledger.iter().map(|l| l["status"].as_str().unwrap()).collect();
+    assert_eq!(statuses, ["reserved", "failed_billed", "reserved", "settled"], "{ledger:?}");
+    assert_eq!(ledger[1]["error"], "finish_length");
+    assert_eq!(ledger[2]["max_tokens"], 64 + 128);
+    let st = srv.admin("GET", "/v1/admin/oracle", None).await;
+    assert_eq!(st.body["consecutive_errors"], 0, "{}", st.text);
+}
