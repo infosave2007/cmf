@@ -852,6 +852,55 @@ fn an_empty_state_makes_the_instructions_the_input() {
     assert_eq!(r.input_text(&r.questions[0]), "{}");
 }
 
+/// The lead-in line (DESIGN C1): a state-less question whose instructions'
+/// first line ends with ':' and continue with text reads that text alone (the
+/// Decision Index rows "<lead-in>:\n<text>"); anything else reads the whole
+/// instructions, and the contract keys never change with it.
+#[test]
+fn a_lead_in_line_is_not_part_of_the_local_input() {
+    use cortiq_decision::protocol::after_lead_in;
+    assert_eq!(
+        after_lead_in("Classify the banking intent of this user request:\nmy card is late"),
+        Some("my card is late")
+    );
+    assert_eq!(after_lead_in("Q: \r\n  two\nlines \n"), Some("two\nlines"));
+    for whole in [
+        "Classify: my card is late",
+        "Classify this:\n   \n",
+        "Which one?\nmy card is late",
+        "no lead-in at all",
+        "",
+    ] {
+        assert_eq!(after_lead_in(whole), None, "{whole:?}");
+    }
+    let limits = RequestLimits::default();
+    let body = |instructions: &str| {
+        json!({
+            "state": {},
+            "questions": {"q1": {"type": "choice", "instructions": instructions,
+                                 "criteria": {"A": "card arrival", "B": "exchange rate"}}},
+        })
+    };
+    let lead = body("Classify the banking intent of this user request:\nmy card is late");
+    let bare = body("Classify: my card is late");
+    let parse = |v: &Value| {
+        parse_systemone_request(&serde_json::to_vec(v).unwrap(), &limits).unwrap()
+    };
+    let (a, b) = (parse(&lead), parse(&bare));
+    assert_eq!(a.input_text(&a.questions[0]), "my card is late");
+    assert_eq!(b.input_text(&b.questions[0]), "Classify: my card is late");
+    // The contract (state-less: the criteria) is that of the question.
+    assert_eq!(
+        a.questions[0].contract_sha256_as(true),
+        b.questions[0].contract_sha256_as(true)
+    );
+    // Under a state the instructions are not the input at all.
+    let mut stateful = lead.clone();
+    stateful["state"] = json!("the state");
+    let r = parse(&stateful);
+    assert_eq!(r.input_text(&r.questions[0]), "the state");
+}
+
 /// Capacity errors (DESIGN A21) keep their status and reason and carry the
 /// marker the Decision Index kit reads, with `details.capacity`.
 #[test]
