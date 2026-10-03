@@ -1714,6 +1714,16 @@ pub fn learn_offline(
     let inputs = eval::parse_input(&opts.traffic.display().to_string(), &traffic_bytes)?;
     let labelled = inputs.iter().filter(|r| r.label.is_some()).count();
     let answers = oracle::read_answer_ledgers(&opts.answers)?;
+    // The v4 driver hashed the 0.8.7 body: no distributions, no reasoning.
+    // A ledger line is found by the sha256 of the body this run sends, or
+    // of that one (0.8.8 defaults `oracle.probabilities` on, which changes
+    // the body, DESIGN C3).
+    let driver_oracle = {
+        let mut o = opts.oracle.clone();
+        o.probabilities = false;
+        o.reasoning = "off".into();
+        o
+    };
     let client = match (&opts.ledger, opts.oracle.enabled) {
         (Some(l), true) => {
             // Refused up front (before the ledger is created): a run that was
@@ -1777,7 +1787,11 @@ pub fn learn_offline(
             let answer = if let Some(a) = asked.get(&sha) {
                 a.clone()
             } else {
-                let a = if let Some(c) = answers.get(&sha) {
+                let stored = answers.get(&sha).or_else(|| {
+                    let driver = oracle::request_body(&driver_oracle, &[&question], &state);
+                    answers.get(&sha256_hex(&driver))
+                });
+                let a = if let Some(c) = stored {
                     reused += 1;
                     Some(c.clone())
                 } else if let Some(cl) = &client {

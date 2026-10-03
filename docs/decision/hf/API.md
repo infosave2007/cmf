@@ -1105,7 +1105,9 @@ cortiq decide data-assistant.cmf -p "Write a Python function that merges two sor
 
 **Pre-training through the oracle** on unlabelled traffic: only the texts the
 gate rejects are asked; answers already in driver ledgers are reused by
-request sha256 (`--answers`). Each label with new examples is refitted,
+request sha256 (`--answers`; the sha256 of the body sent, or of the 0.8.7
+body — `oracle.probabilities: false`, `reasoning: off` — that the v4
+driver hashed). Each label with new examples is refitted,
 checked on the holdout, and the gate is re-certified; if the certified gate
 would be lost every promotion of the skill is undone. The effect measured on
 the three public sets was neutral ([ORACLE.md](ORACLE.md#measured-effect)).
