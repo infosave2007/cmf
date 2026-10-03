@@ -132,6 +132,10 @@ Long code, one request: the [3D aquarium example](examples/3d-aquarium/README.md
 
 ![The generated aquarium page](examples/3d-aquarium/screenshot.jpg)
 
+The same prompt with the q4tp file: [`aquarium-q4tp.html`](examples/3d-aquarium/aquarium-q4tp.html).
+
+![The q4tp aquarium page](examples/3d-aquarium/screenshot-q4tp.jpg)
+
 ### RTX 5090, q4tp file, cortiq 0.8.9
 
 Same card and host as above; `qwen38-flash-next-q4tp.cmf` with `flashnext-q4tp.profile` (the 12 GB row with `flashnext.profile`), `cortiq bench --tokens 120 --core --ignore-eos` (greedy; without `--ignore-eos` this file's answer to the bench prompt ends after one token), tok/s:

@@ -8,6 +8,7 @@ A single generation by `qwen38-flash-next-q2tp.cmf` on one RTX 5090, kept as pro
 | [`response.md`](response.md) | the model's full answer: the HTML in a code block, then its notes |
 | [`aquarium.html`](aquarium.html) | the code block of the answer, saved as a file (762 lines, Three.js 0.160 from unpkg) |
 | `screenshot.jpg`, `screenshot-orbit.jpg` | the page in a Chromium-based browser, default view and after orbiting |
+| [`aquarium-q4tp.html`](aquarium-q4tp.html), `screenshot-q4tp.jpg` | the same prompt with `qwen38-flash-next-q4tp.cmf` (8,166 tokens, 33.4 tok/s) |
 
 ## How it was generated
 
@@ -32,3 +33,7 @@ cortiq 0.8.8, the MTP sidecar beside the model (speculative decoding, 3 drafts p
 - What falls short of the prompt: the fish's white bands are faint at the default exposure, and the bodies read more bronze than bright orange.
 
 The model is quantized to 2 bits in its experts. Long code can come out with a slip: two other greedy runs of the same prompt through `cortiq serve` (with and without speculative decoding; the server formats the chat slightly differently, so its text differs) each produced a page with one JavaScript syntax error. Run the page or a linter before using generated code.
+
+## With the q4tp file
+
+![The q4tp page](screenshot-q4tp.jpg)
