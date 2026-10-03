@@ -686,6 +686,10 @@ impl QwenGpuPool {
             .iter()
             .filter_map(|(_, p)| p.filter(|&(_, e)| e != usize::MAX))
             .collect();
+        if let Some(store) = self.store.as_ref() {
+            let es: Vec<usize> = uploads.iter().map(|&(_, e)| e).collect();
+            store.prefetch(layer, &es);
+        }
         let me = &*self;
         let results: Vec<bool> = if uploads.len() <= 1 {
             uploads

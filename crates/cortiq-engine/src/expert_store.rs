@@ -22,9 +22,25 @@
 //!   speed and the page cache is left to the n-gram rows. Elsewhere a plain
 //!   positioned read (one call per expert, no page faults).
 //!
-//! Knobs: `CMF_QWEN_RAM_TIER_MB` (`0` off, `N` MiB, default: what is free
-//! minus a reserve), `CMF_QWEN_IO` (`auto` | `direct` | `pread` | `mmap`),
-//! `CMF_QWEN_TIER_THREADS` (background loaders, default 2).
+//! Measured on a RunPod RTX 5090 (overlay filesystem, 62 GB memory cgroup)
+//! the OS page cache, driven well, beats an explicit RAM tier there: it
+//! already holds most of the file, and a tier filled with direct reads
+//! competes with it for the same memory. Copying straight out of the
+//! mapping is also the fastest hit (~20 GB/s from mapped resident pages;
+//! a buffered `pread` plus a copy measured 7x slower per expert at a 12 GB
+//! budget). So the default hands the arena slices of the mapping, after
+//! `MADV_WILLNEED` over the expert's bytes: on a miss the kernel then
+//! reads the whole expert as one asynchronous request instead of a chain
+//! of 128 KiB read-arounds, one per page fault. The n-gram table gets
+//! random-access advice. The explicit RAM tier, buffered `pread` and
+//! direct I/O stay available for hosts where they measure better.
+//!
+//! Knobs: `CMF_QWEN_IO` (`mmap` default | `pread` | `direct`),
+//! `CMF_QWEN_RAM_TIER_MB` (unset/`0` off, `auto` = what is free minus a
+//! reserve, `N` MiB), `CMF_QWEN_TIER_THREADS` (background loaders,
+//! default 2), `CMF_QWEN_CACHE_HINTS=1` (page-cache mode: release an
+//! expert's file pages once it sits in VRAM, read it back ahead of time
+//! when the arena evicts it).
 
 use cortiq_core::CmfModel;
 use std::cell::RefCell;
@@ -157,7 +173,7 @@ fn pread_full(f: &std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<us
 /// Non-blocking read from the page cache: the bytes it could take without
 /// waiting for the device (0 when nothing is cached).
 #[cfg(target_os = "linux")]
-fn pread_cached(f: &std::fs::File, buf: &mut [u8], off: u64) -> usize {
+fn pread_cached(f: &std::fs::File, buf: &mut [u8], off: u64) -> Result<usize, ()> {
     use std::os::unix::io::AsRawFd;
     let mut done = 0usize;
     while done < buf.len() {
@@ -175,12 +191,21 @@ fn pread_cached(f: &std::fs::File, buf: &mut [u8], off: u64) -> usize {
                 libc::RWF_NOWAIT,
             )
         };
-        if n <= 0 {
+        if n < 0 {
+            let e = std::io::Error::last_os_error().raw_os_error();
+            // EAGAIN: not cached; ENOTSUP/EOPNOTSUPP/EINVAL: the flag itself
+            // is not supported here
+            if matches!(e, Some(libc::EOPNOTSUPP) | Some(libc::EINVAL)) {
+                return Err(());
+            }
+            break;
+        }
+        if n == 0 {
             break;
         }
         done += n as usize;
     }
-    done
+    Ok(done)
 }
 
 pub(crate) struct FileReader {
@@ -191,6 +216,9 @@ pub(crate) struct FileReader {
     direct: Option<std::fs::File>,
     /// O_DIRECT failed once (filesystem without support): buffered from then on
     direct_broken: AtomicBool,
+    /// RWF_NOWAIT works on this filesystem (overlayfs answers ENOTSUP):
+    /// without it, page residency is asked of the mapping (mincore)
+    nowait_ok: AtomicBool,
 }
 
 impl FileReader {
@@ -206,29 +234,14 @@ impl FileReader {
                 .ok()
         };
         let want = std::env::var("CMF_QWEN_IO").unwrap_or_default();
+        #[cfg(target_os = "linux")]
+        let direct_ok = direct.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let direct_ok = false;
         let mode = match want.as_str() {
-            "mmap" => IoMode::Mmap,
+            "direct" if direct_ok && file.is_some() => IoMode::Direct,
             "pread" if file.is_some() => IoMode::Pread,
-            _ => {
-                #[cfg(target_os = "linux")]
-                {
-                    if direct.is_some() && file.is_some() {
-                        IoMode::Direct
-                    } else if file.is_some() {
-                        IoMode::Pread
-                    } else {
-                        IoMode::Mmap
-                    }
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    if file.is_some() {
-                        IoMode::Pread
-                    } else {
-                        IoMode::Mmap
-                    }
-                }
-            }
+            _ => IoMode::Mmap,
         };
         Self {
             model: model.clone(),
@@ -237,6 +250,7 @@ impl FileReader {
             #[cfg(target_os = "linux")]
             direct,
             direct_broken: AtomicBool::new(false),
+            nowait_ok: AtomicBool::new(true),
         }
     }
 
@@ -295,7 +309,22 @@ impl FileReader {
         let file = self.file.as_ref()?;
         #[cfg(target_os = "linux")]
         if self.mode == IoMode::Direct && !self.direct_broken.load(Ordering::Relaxed) {
-            let got = pread_cached(file, &mut buf[shift..shift + len], s);
+            let got = if self.nowait_ok.load(Ordering::Relaxed) {
+                match pread_cached(file, &mut buf[shift..shift + len], s) {
+                    Ok(n) => n,
+                    Err(()) => {
+                        self.nowait_ok.store(false, Ordering::Relaxed);
+                        0
+                    }
+                }
+            } else if self.resident(s, len) {
+                // the page cache has it all: copy it out of the mapping
+                let src = &self.model.primary_bytes()[s as usize..s as usize + len];
+                buf[shift..shift + len].copy_from_slice(src);
+                len
+            } else {
+                0
+            };
             if got == len {
                 return Some(true);
             }
@@ -321,6 +350,25 @@ impl FileReader {
             Ok(k) if k == len => Some(false),
             _ => None,
         }
+    }
+
+    /// Every page of file bytes [s, s+len) is in the page cache (mincore
+    /// over the mapping; Linux).
+    #[cfg(target_os = "linux")]
+    fn resident(&self, s: u64, len: usize) -> bool {
+        let bytes = self.model.primary_bytes();
+        let page = 4096usize;
+        let base = bytes.as_ptr() as usize;
+        let a = (base + s as usize) & !(page - 1);
+        let end = base + s as usize + len;
+        if s as usize + len > bytes.len() {
+            return false;
+        }
+        let n = (end - a).div_ceil(page);
+        let mut vec = vec![0u8; n];
+        // SAFETY: a page-aligned range inside our mapping, one byte per page.
+        let rc = unsafe { libc::mincore(a as *mut libc::c_void, end - a, vec.as_mut_ptr()) };
+        rc == 0 && vec.iter().all(|&v| v & 1 != 0)
     }
 
     fn read_mmap(&self, loc: &ExpertLoc, buf: &mut [u8]) -> Option<Ranges> {
@@ -571,6 +619,9 @@ pub(crate) struct ExpertStore {
     bg_cv: Condvar,
     /// foreground reads in flight: background loaders back off meanwhile
     fg_reads: AtomicU64,
+    /// page-cache mode: release / prefetch file pages as the arena moves
+    hints: bool,
+    file: Option<std::fs::File>,
 }
 
 /// Counts a foreground read for its lifetime.
@@ -669,17 +720,15 @@ impl ExpertStore {
         let reader = FileReader::open(model);
 
         // How many experts the RAM tier may hold.
-        let want = std::env::var("CMF_QWEN_RAM_TIER_MB")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok());
-        let cap_bytes = match want {
-            Some(mb) => mb << 20,
-            None => host_available_bytes().map_or(0, |avail| {
+        let want = std::env::var("CMF_QWEN_RAM_TIER_MB").unwrap_or_default();
+        let cap_bytes = match want.as_str() {
+            "auto" => host_available_bytes().map_or(0, |avail| {
                 // leave room for the OS, the page cache the n-gram rows and
                 // the skeleton live in, and the process itself
                 let reserve = (avail / 6).max(6 << 30);
                 avail.saturating_sub(reserve)
             }),
+            v => v.parse::<u64>().map_or(0, |mb| mb << 20),
         };
         // never more slots than experts the arena cannot hold, plus room
         // for the copies that make a miss on a just-evicted expert cheap
@@ -702,6 +751,8 @@ impl ExpertStore {
             }),
             bg_cv: Condvar::new(),
             fg_reads: AtomicU64::new(0),
+            hints: std::env::var("CMF_QWEN_CACHE_HINTS").as_deref() == Ok("1"),
+            file: std::fs::File::open(&model.path).ok(),
         });
         tracing::info!(
             "qwen4 expert store: io {:?}, RAM tier {} experts ({} MiB max)",
@@ -737,6 +788,11 @@ impl ExpertStore {
         let key = self.key(layer, expert);
         let loc = (*self.locs.get(key)?)?;
         let _fg = Foreground::enter(&self.fg_reads);
+        // the mapping itself, when nothing has to be kept in the tier
+        let mmap_direct = self.reader.mode() == IoMode::Mmap && (self.tier.is_none() || !keep);
+        if mmap_direct && self.tier.as_ref().is_none_or(|t| !t.holds(key)) {
+            return self.with_mapped(&loc, f);
+        }
         if let Some(t) = self.tier.as_ref() {
             if let Some((slot, r)) = t.lookup_pin(key) {
                 let p = t.slot_ptr(slot)?;
@@ -771,6 +827,41 @@ impl ExpertStore {
         })
     }
 
+    /// `f` over slices of the mapping, after asking the kernel to read the
+    /// expert's pages ahead (a no-op for resident pages).
+    fn with_mapped<R>(&self, loc: &ExpertLoc, f: impl FnOnce([&[u8]; 3]) -> R) -> Option<R> {
+        let bytes = self.reader.model.primary_bytes();
+        let t0 = std::time::Instant::now();
+        let mut parts: [&[u8]; 3] = [&[], &[], &[]];
+        for (i, p) in loc.parts.iter().enumerate() {
+            parts[i] = bytes.get(p.abs as usize..p.abs as usize + p.len)?;
+        }
+        will_need(bytes, loc);
+        let out = f(parts);
+        let s = &self.stats;
+        s.file_reads.fetch_add(1, Ordering::Relaxed);
+        s.file_bytes
+            .fetch_add(loc.total() as u64, Ordering::Relaxed);
+        s.file_ns
+            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        Some(out)
+    }
+
+    /// Ask the kernel to start reading these experts now (the frame's cold
+    /// winners, before the parallel copies start): every miss then joins
+    /// one deep I/O queue instead of waiting its turn behind a page fault.
+    pub(crate) fn prefetch(&self, layer: usize, experts: &[usize]) {
+        if self.reader.mode() != IoMode::Mmap {
+            return;
+        }
+        let bytes = self.reader.model.primary_bytes();
+        for &e in experts {
+            if let Some(loc) = self.locs.get(self.key(layer, e)).copied().flatten() {
+                will_need(bytes, &loc);
+            }
+        }
+    }
+
     fn read_file(&self, loc: &ExpertLoc, buf: &mut [u8]) -> Option<Ranges> {
         let t0 = std::time::Instant::now();
         let (r, cached) = self.reader.read(loc, buf)?;
@@ -789,8 +880,15 @@ impl ExpertStore {
     /// The arena took (`true`) or dropped (`false`) this expert. A dropped
     /// expert the tier does not hold is read back in the background.
     pub(crate) fn note_vram(&self, layer: usize, expert: usize, resident: bool) {
-        let Some(t) = self.tier.as_ref() else { return };
         let key = self.key(layer, expert);
+        let Some(t) = self.tier.as_ref() else {
+            if self.hints
+                && let Some(loc) = self.locs.get(key).copied().flatten()
+            {
+                self.advise(&loc, resident);
+            }
+            return;
+        };
         let held = {
             let mut m = t.meta.lock().unwrap();
             if let Some(v) = m.in_vram.get_mut(key) {
@@ -805,6 +903,34 @@ impl ExpertStore {
                 self.bg_cv.notify_one();
             }
         }
+    }
+
+    /// Page-cache hints for one expert: once it sits in VRAM its file
+    /// pages may go (DONTNEED); when the arena drops it they are read back
+    /// asynchronously (WILLNEED). Linux; advisory.
+    fn advise(&self, loc: &ExpertLoc, in_vram: bool) {
+        #[cfg(target_os = "linux")]
+        if let Some(f) = self.file.as_ref() {
+            use std::os::unix::io::AsRawFd;
+            let advice = if in_vram {
+                libc::POSIX_FADV_DONTNEED
+            } else {
+                libc::POSIX_FADV_WILLNEED
+            };
+            for p in &loc.parts {
+                // SAFETY: plain fd + numeric range; advisory by contract.
+                unsafe {
+                    libc::posix_fadvise(
+                        f.as_raw_fd(),
+                        p.abs as libc::off_t,
+                        p.len as libc::off_t,
+                        advice,
+                    );
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (loc, in_vram);
     }
 
     /// Start the background loaders on `order` (keys, most wanted first).
@@ -941,6 +1067,26 @@ impl Drop for ExpertStore {
 fn split<'a>(buf: &'a [u8], r: &Ranges) -> [&'a [u8]; 3] {
     let p = |i: usize| &buf[r[i].0 as usize..(r[i].0 + r[i].1) as usize];
     [p(0), p(1), p(2)]
+}
+
+/// `MADV_WILLNEED` over an expert's three ranges of the mapping (unix;
+/// advisory, cheap when the pages are resident).
+fn will_need(bytes: &[u8], loc: &ExpertLoc) {
+    #[cfg(unix)]
+    {
+        let base = bytes.as_ptr() as usize;
+        let page = 4096usize;
+        for p in &loc.parts {
+            let s = (base + p.abs as usize) & !(page - 1);
+            let e = base + p.abs as usize + p.len;
+            // SAFETY: a range inside our read-only mapping; advice only.
+            unsafe {
+                libc::madvise(s as *mut libc::c_void, e - s, libc::MADV_WILLNEED);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (bytes, loc);
 }
 
 /// Random-access advice for tensors whose name passes `pred` (the n-gram
