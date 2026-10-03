@@ -1534,7 +1534,8 @@ async fn models_shape_prices_healthz_readyz_metrics_and_no_cors() {
     assert!(d["context_length"].as_u64().unwrap() >= 8);
     assert_eq!(d["max_output_length"], 255);
     assert_eq!(d["quantization"], "fp32");
-    assert_eq!(d["hugging_face_id"], "infosave/cortiq-decision");
+    // The published repository (the old `infosave/cortiq-decision` redirects).
+    assert_eq!(d["hugging_face_id"], "infosave/cmf-decision");
     assert_eq!(
         d["pricing"],
         json!({"prompt": "0", "completion": "0", "request": "0", "image": "0"})

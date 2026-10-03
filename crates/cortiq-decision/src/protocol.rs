@@ -57,6 +57,9 @@ use serde_json::{Map, Value, json};
 
 /// The public model id (spec §4.4).
 pub const MODEL_ID: &str = "cortiq/decision";
+/// The Hugging Face repository of the published model, listed by `GET
+/// /v1/models` (the former `infosave/cortiq-decision` redirects to it).
+pub const HUGGING_FACE_ID: &str = "infosave/cmf-decision";
 /// The model identity returned by the TypeSafe/Jev System One compatibility
 /// endpoint.  It is deliberately a Cortiq name: accepting a Jev wire request
 /// must never make a CMF server claim to be the Jev model.
