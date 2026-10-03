@@ -2502,11 +2502,18 @@ fn learn_asks_the_mock_oracle_only_about_abstentions() {
     );
 
     // A driver ledger answering the first 3 cruise texts (by body sha256).
+    // The v4 driver hashed the 0.8.7 body (no distributions): the config
+    // keeps the 0.8.8 default `probabilities: true`, and the ledger is still
+    // found.
     let cfg = Config::load(&cfg_path).unwrap();
+    assert!(cfg.oracle.probabilities);
+    let mut driver = cfg.oracle.clone();
+    driver.probabilities = false;
     let q = learn::rubric_question(&model.skill("topics").unwrap().manifest).unwrap();
     let mut ledger = vec![json!({"record_type": "run"})];
     for c in &cruise[..3] {
-        let b = oracle::request_body(&cfg.oracle, &[&q], &json!(c));
+        let b = oracle::request_body(&driver, &[&q], &json!(c));
+        assert_ne!(b, oracle::request_body(&cfg.oracle, &[&q], &json!(c)));
         ledger.push(json!({"record_type": "oracle_call",
                            "request_sha256": format!("{:x}", Sha256::digest(&b)),
                            "oracle": {"choice": "travel"}}));
