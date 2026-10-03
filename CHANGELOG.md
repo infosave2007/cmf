@@ -57,6 +57,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accepted there like the Jev aliases (API.md §3a).
 
 ### Changed
+- The semantic cache keeps an index of its entries per scope next to the
+  ring, so a lookup and a put's dedup scan only the entries of the
+  question's scope instead of all of them (up to `cache.cap`) under one lock;
+  answers, ties, dedup and evictions are unchanged, and the replay of
+  `learn.log` rebuilds the index.
 - `/v1/decisions` no longer refuses an empty `state` (`""`, `{}`, `[]`) or a
   `null` one with 400: it is a state-less request. Requests with a non-empty
   state are read exactly as in 0.8.6 and 0.8.7.

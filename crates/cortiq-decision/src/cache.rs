@@ -25,6 +25,13 @@
 //! the same scope and answer with cos ≥ 0.999 makes the put a no-op; at capacity
 //! (50,000) the oldest entry leaves (a ring). The cache is consulted only when a
 //! question is escalated; its puts are kept in `learn.log` and replayed at start.
+//!
+//! **Scope index** (0.8.8, DESIGN B3): next to the global ring, each scope
+//! keeps the sequence numbers of its entries in insertion order, so a lookup
+//! and a put's dedup scan only that scope's entries — the same entries in the
+//! same order as a scan of the whole ring filtered by scope, hence the same
+//! answers, ties and evictions. The index is derived from the ring (a replay
+//! of `learn.log` rebuilds it through [`SemanticCache::put`]).
 
 use crate::answer::OracleAnswer;
 use crate::buffer::{Dec, Enc, dot};
@@ -33,7 +40,7 @@ use crate::matching::SkillMatch;
 use crate::protocol::Question;
 use anyhow::{Result, bail};
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 /// cos φ_P above which a put of the same scope and answer is skipped.
 pub const PUT_DEDUP: f32 = 0.999;
@@ -134,7 +141,12 @@ pub fn scope_of_as(q: &Question, m: &SkillMatch, reads_instructions: bool) -> St
 /// The cache (see the module notes).
 #[derive(Debug)]
 pub struct SemanticCache {
+    /// The ring, oldest first; `entries[i]` has the sequence number `base + i`.
     entries: VecDeque<CacheEntry>,
+    /// The sequence number of `entries[0]`.
+    base: u64,
+    /// The sequence numbers of each scope's entries, oldest first.
+    index: HashMap<String, VecDeque<u64>>,
     threshold: f32,
     cap: usize,
     hits: u64,
@@ -145,6 +157,8 @@ impl SemanticCache {
     pub fn new(threshold: f32, cap: usize) -> Self {
         Self {
             entries: VecDeque::new(),
+            base: 0,
+            index: HashMap::new(),
             threshold,
             cap: cap.max(1),
             hits: 0,
@@ -152,11 +166,21 @@ impl SemanticCache {
         }
     }
 
+    /// The entries of `scope`, oldest first.
+    fn scope_entries<'a>(&'a self, scope: &str) -> impl Iterator<Item = &'a CacheEntry> + 'a {
+        let base = self.base;
+        self.index
+            .get(scope)
+            .into_iter()
+            .flatten()
+            .map(move |&seq| &self.entries[(seq - base) as usize])
+    }
+
     /// The best entry of `scope` and its cos, hit or not.
     pub fn nearest(&self, scope: &str, phi_p: &[f32]) -> Option<(&CacheEntry, f32)> {
         let mut best: Option<(&CacheEntry, f32)> = None;
-        for e in &self.entries {
-            if e.scope != scope || e.phi_p.len() != phi_p.len() {
+        for e in self.scope_entries(scope) {
+            if e.phi_p.len() != phi_p.len() {
                 continue;
             }
             let c = dot(&e.phi_p, phi_p);
@@ -195,18 +219,32 @@ impl SemanticCache {
 
     /// Store an answer; `false` when a near-identical entry already holds it.
     pub fn put(&mut self, entry: CacheEntry) -> bool {
-        let dup = self.entries.iter().any(|e| {
-            e.scope == entry.scope
-                && e.answer == entry.answer
+        let dup = self.scope_entries(&entry.scope).any(|e| {
+            e.answer == entry.answer
                 && e.phi_p.len() == entry.phi_p.len()
                 && dot(&e.phi_p, &entry.phi_p) >= PUT_DEDUP
         });
         if dup {
             return false;
         }
-        if self.entries.len() >= self.cap {
-            self.entries.pop_front();
+        if self.entries.len() >= self.cap
+            && let Some(old) = self.entries.pop_front()
+        {
+            // The globally oldest entry is the oldest of its scope.
+            if let Some(seqs) = self.index.get_mut(&old.scope) {
+                debug_assert_eq!(seqs.front(), Some(&self.base));
+                seqs.pop_front();
+                if seqs.is_empty() {
+                    self.index.remove(&old.scope);
+                }
+            }
+            self.base += 1;
         }
+        let seq = self.base + self.entries.len() as u64;
+        self.index
+            .entry(entry.scope.clone())
+            .or_default()
+            .push_back(seq);
         self.entries.push_back(entry);
         true
     }
@@ -278,6 +316,111 @@ mod tests {
         assert_eq!(c.len(), 2);
         assert!(c.get("s", &unit(&[1.0, 0.0])).is_none());
         assert!(c.get("s", &unit(&[0.0, 1.0])).is_some());
+    }
+
+    /// The pre-0.8.8 cache: one scan of the whole ring per lookup and put.
+    struct Linear {
+        entries: VecDeque<CacheEntry>,
+        threshold: f32,
+        cap: usize,
+    }
+
+    impl Linear {
+        fn nearest(&self, scope: &str, phi_p: &[f32]) -> Option<(&CacheEntry, f32)> {
+            let mut best: Option<(&CacheEntry, f32)> = None;
+            for e in &self.entries {
+                if e.scope != scope || e.phi_p.len() != phi_p.len() {
+                    continue;
+                }
+                let c = dot(&e.phi_p, phi_p);
+                if best.is_none_or(|(_, b)| c > b) {
+                    best = Some((e, c));
+                }
+            }
+            best
+        }
+
+        fn get(&self, scope: &str, phi_p: &[f32]) -> Option<(OracleAnswer, f32)> {
+            self.nearest(scope, phi_p)
+                .filter(|(_, c)| *c >= self.threshold)
+                .map(|(e, c)| (e.answer.clone(), c))
+        }
+
+        fn put(&mut self, entry: CacheEntry) -> bool {
+            let dup = self.entries.iter().any(|e| {
+                e.scope == entry.scope
+                    && e.answer == entry.answer
+                    && e.phi_p.len() == entry.phi_p.len()
+                    && dot(&e.phi_p, &entry.phi_p) >= PUT_DEDUP
+            });
+            if dup {
+                return false;
+            }
+            if self.entries.len() >= self.cap {
+                self.entries.pop_front();
+            }
+            self.entries.push_back(entry);
+            true
+        }
+    }
+
+    /// The indexed cache answers, dedups and evicts exactly like the linear
+    /// one (DESIGN B3) on random operations: few scopes and answers, coarse
+    /// vectors (exact duplicates make ties and dedup hits), two dimensions
+    /// (a φ of another length is never compared), small rings (evictions).
+    #[test]
+    fn indexed_cache_equals_the_linear_one() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for round in 0..40 {
+            let cap = 1 + next(24) as usize;
+            let mut fast = SemanticCache::new(0.97, cap);
+            let mut slow = Linear {
+                entries: VecDeque::new(),
+                threshold: 0.97,
+                cap,
+            };
+            let scopes = 1 + next(5);
+            for step in 0..600 {
+                let scope = format!("s{}", next(scopes));
+                let dim = if next(10) == 0 { 2 } else { 3 };
+                let v: Vec<f32> = (0..dim).map(|_| next(4) as f32 - 1.0).collect();
+                if v.iter().all(|x| *x == 0.0) {
+                    continue;
+                }
+                let v = unit(&v);
+                if next(2) == 0 {
+                    let e = CacheEntry {
+                        scope,
+                        phi_p: v,
+                        answer: OracleAnswer::Choice(format!("l{}", next(3))),
+                        ts: step,
+                    };
+                    assert_eq!(
+                        fast.put(e.clone()),
+                        slow.put(e),
+                        "round {round} step {step}"
+                    );
+                } else {
+                    let want = slow.get(&scope, &v);
+                    let near = slow.nearest(&scope, &v).map(|(e, c)| (e.ts, c));
+                    assert_eq!(
+                        fast.nearest(&scope, &v).map(|(e, c)| (e.ts, c)),
+                        near,
+                        "round {round} step {step}"
+                    );
+                    assert_eq!(fast.get(&scope, &v), want, "round {round} step {step}");
+                }
+                assert!(fast.entries.iter().eq(slow.entries.iter()));
+                let held: usize = fast.index.values().map(VecDeque::len).sum();
+                assert_eq!(held, fast.len());
+            }
+        }
     }
 
     #[test]
