@@ -44,6 +44,8 @@ hf download infosave/Qwen3.8-Flash-Next-cmf flashnext.profile --local-dir .
 CMF_QWEN_PROFILE=flashnext.profile cortiq run qwen38-flash-next-q2tp.cmf --prompt "Explain quicksort in three sentences." --no-think --greedy
 ```
 
+For the 4-bit file take `qwen38-flash-next-q4tp.cmf`, `qwen38-flash-next-q4tp.mtp.cmf` and `flashnext-q4tp.profile` instead (cortiq 0.8.9 or later; see Which file).
+
 Use cortiq 0.8.8 or later (0.8.7 runs the GPU path at about 60 % of the speed); prebuilt binaries for Linux, macOS and Windows are on the [releases page](https://github.com/infosave2007/cmf/releases). The engine picks the GPU and its VRAM budget itself. `--no-think` asks for a direct answer; without it the model reasons first, so raise `--max-tokens` (default 256). `--greedy` enables speculative decoding with the sidecar; sampled runs decode one token at a time. The sidecar and the profile are optional: without them everything still runs, without speculative decoding and with a cold expert cache for the first tokens. The sidecar takes about 0.9 GB of VRAM whenever it sits beside the model, sampled runs included; for sampled chat set `CMF_QWEN_MTP=0`. The first run compiles the GPU pipelines and is slower; later runs reuse the cache. For chat, keep the model loaded with `cortiq serve` (see OpenAI-compatible server): each `cortiq run` loads the model and fills the expert cache again, about 10–30 s before the first token.
 
 If `cortiq gpu` lists no adapter on headless Linux, install `libglvnd0 libgl1 libegl1 libvulkan1 vulkan-tools` ([`tools/runpod_vulkan_setup.sh`](https://github.com/infosave2007/cmf/blob/master/tools/runpod_vulkan_setup.sh) does that and probes the adapter) and export `XDG_RUNTIME_DIR=/tmp` in the shell for every `run`, `bench` and `serve`: without it Vulkan can fail to load and the engine silently falls back to the CPU.
@@ -55,7 +57,7 @@ If `cortiq gpu` lists no adapter on headless Linux, install `libglvnd0 libgl1 li
 | a Vulkan GPU (NVIDIA, AMD, Intel) with 16 GB of VRAM or more and 77 GB of RAM or more | `qwen38-flash-next-q2tp.cmf` + sidecar + profile | RTX 5090: 81.7 tok/s, 108.6 with speculative decoding; RTX 4090: 41.9 (0.8.7). The 12/16 GB rows below were measured as `CMF_GPU_VRAM_MB` caps on a larger card; a real 16 GB card gets a default budget of about 13.5 GiB. AMD and Intel not measured |
 | a 12 GB card | `qwen38-flash-next-q2tp.cmf`, sidecar off (`CMF_QWEN_MTP=0`) | the default budget is about 9.5 GiB, below the smallest measured cap; the GPU path starts if the skeleton and reserve fit, speed not measured |
 | the same GPU, less RAM than the file | `qwen38-flash-next-q2tp.cmf` | runs; experts the cache lacks are read from disk, which slows the 12–16 GB budgets (see Performance) |
-| 97 GB of RAM or more and you want 4-bit experts | `qwen38-flash-next-q4tp.cmf` | accepted by the GPU path but not measured there; no sidecar, so no speculative decoding; 4.71 tok/s on the 0.6.3 host path |
+| you want the better quality and have 97 GB of RAM or more | `qwen38-flash-next-q4tp.cmf` + `qwen38-flash-next-q4tp.mtp.cmf` + `flashnext-q4tp.profile` | RTX 5090, cortiq 0.8.9: 40.3 tok/s, 44.4 with speculative decoding (bench). Each expert is 2.6 MB instead of 1.75, so VRAM holds about a third fewer; with less RAM than the 97 GB file it slows down a lot (11–20 tok/s on realistic prompts with 62 GB) |
 | CPU only | `qwen38-flash-next-q2tp.cmf` with `CMF_GPU=0` | 3.6 tok/s on an AMD EPYC 7702 (cortiq 0.8.5) |
 | Apple silicon, DX12 | either file | not measured; see Limits |
 
@@ -64,9 +66,11 @@ If `cortiq gpu` lists no adapter on headless Linux, install `libglvnd0 libgl1 li
 | file | contents | size | recommended for |
 |---|---|---:|---|
 | `qwen38-flash-next-q2tp.cmf` | experts: 2-bit gate/up, 4-bit down; skeleton and vocabulary 8-bit | 76.95 GB | **default**: the file measured on the GPU path |
-| `qwen38-flash-next-q4tp.cmf` | experts 4-bit; skeleton and vocabulary 8-bit | 97.12 GB | highest expert precision; see Which file |
-| `qwen38-flash-next-q2tp.mtp.cmf` | the model's multi-token-prediction head, quantized like the q2tp file | 1.08 GB | speculative decoding under greedy sampling; optional |
-| `flashnext.profile` | routing profile: hit counts per (layer, expert) recorded on English chat prompts; not weights | 98 KB | warm start of the expert arena; optional, does not change the output |
+| `qwen38-flash-next-q4tp.cmf` | experts 4-bit; skeleton and vocabulary 8-bit | 97.12 GB | better quality (code perplexity 4.11 against 4.76), slower; see Which file |
+| `qwen38-flash-next-q2tp.mtp.cmf` | the model's multi-token-prediction head, quantized like the q2tp file | 1.08 GB | speculative decoding with the q2tp file; optional |
+| `qwen38-flash-next-q4tp.mtp.cmf` | the same head quantized like the q4tp file | 1.50 GB | speculative decoding with the q4tp file; optional |
+| `flashnext.profile` | routing profile: hit counts per (layer, expert) recorded with the q2tp file on English chat prompts; not weights | 98 KB | warm start of the expert arena; optional, does not change the output |
+| `flashnext-q4tp.profile` | the same, recorded with the q4tp file (its routing differs slightly) | 98 KB | warm start with the q4tp file |
 
 SHA-256 (the Hugging Face LFS object id is the same digest):
 
@@ -74,9 +78,17 @@ SHA-256 (the Hugging Face LFS object id is the same digest):
 e84cb832124bf4df8b6c9b3e5daa1e8b0caa47187a240f3b45d72173fce9935b  qwen38-flash-next-q2tp.cmf
 601474afd6c7144dcfaf8e084cb2d2e786e06b4aeee3f20310ee0cae07224dfd  qwen38-flash-next-q4tp.cmf
 a9cc9760d57db47d7365efcb21bdc13bdfc910947f3a547832d1945f0b56350a  qwen38-flash-next-q2tp.mtp.cmf
+3a2c2fd90c8cfe309ef236418147a838663f3de0c13637a47428823f032d67f8  qwen38-flash-next-q4tp.mtp.cmf
 ```
 
-Both model files are quantized directly from the bf16 checkpoint; perplexity was not measured for either. The sidecar must sit next to the main file as `<main file without .cmf>.mtp.cmf`; the runtime finds it by that name. The profile is passed by path (`CMF_QWEN_PROFILE`).
+Both model files are quantized directly from the bf16 checkpoint. Perplexity (`cortiq ppl`, 1,536 tokens, cortiq 0.8.9 on the GPU path):
+
+| text | q2tp | q4tp |
+|---|---:|---:|
+| Rust source (`crates/cortiq-engine/src/expert_store.rs`) | 4.763 | **4.111** |
+| *Alice's Adventures in Wonderland*, chapter I on | 1.138 | **1.097** |
+
+The book is in the training data (perplexity near 1), so the code row is the informative one. Against the CPU reference on single-token checks the q4tp logits reach cosine 0.994–0.996, q2tp 0.986–0.989. The sidecar must sit next to the main file as `<main file without .cmf>.mtp.cmf`; the runtime finds it by that name. The profile is passed by path (`CMF_QWEN_PROFILE`).
 
 ## Requirements
 
@@ -119,6 +131,20 @@ Where the 0.8.8 gain over 0.8.7 comes from on this card (same bench, plain decod
 Long code, one request: the [3D aquarium example](examples/3d-aquarium/README.md) — a 2,151-token prompt, a 10,930-token answer (a working single-file Three.js page) at 67.8 tok/s with speculative decoding.
 
 ![The generated aquarium page](examples/3d-aquarium/screenshot.jpg)
+
+The same prompt with the q4tp file gave an 8,166-token answer at 33.4 tok/s whose scene is closer to the brief (bright orange fish with white, black-edged bands), but one variable name slipped (`userData.pect` read where `userData.pects` was stored), so the page stops at its loading screen until those four characters are fixed. Both outputs are in the example folder.
+
+### RTX 5090, q4tp file, cortiq 0.8.9
+
+Same card and host as above; `qwen38-flash-next-q4tp.cmf` with `flashnext-q4tp.profile` (the 12 GB row with `flashnext.profile`), `cortiq bench --tokens 120 --core --ignore-eos` (greedy; without `--ignore-eos` this file's answer to the bench prompt ends after one token), tok/s:
+
+| VRAM budget | decode | decode with speculative MTP |
+|---|---:|---:|
+| full card (9,376 expert slots) | 40.3 | 44.4 |
+| 16 GB | 27.5 | — |
+| 12 GB | 23.2 | — |
+
+A single-token pass takes 13.6–15.0 ms of GPU time (q2tp: 10.4). 0.8.9 runs the q4tp experts on four-row kernels as well (0.8.8: one-row, 17.4–18.9 ms). The rest of each token here is reading 46–53 missing experts of 2.6 MB from a 97 GB file through a 62 GB container: realistic prompts through `cortiq serve` run at 11–20 tok/s on this host. With RAM for the whole file those reads become memory copies.
 
 ### RTX 4090, cortiq 0.8.7
 
@@ -270,6 +296,7 @@ Upstream context is 262,144 tokens. The GPU path serves positions up to about 16
 | `CMF_QWEN_DYNAMIC_MOE` | auto | host | host-path GPU expert cache: auto = q2tp and a budget ≥ 14 GB; `1` forces, `0` disables; no effect on the GPU path |
 | `CMF_QWEN_POOL_PCT` | 75 | host | host-path arena request, 25–85 % of the budget; ignored on the GPU path (as is `CMF_QWEN_EXPERT_SLOTS`) |
 | `CMF_QWEN_HC_V3` | on (devices with 32-wide subgroups) | GPU | `0` = the 0.8.7 hyper-connection kernels |
+| `CMF_QWEN_EXPERT4` | on | GPU | `0` = one-row expert kernels (q2tp and, since 0.8.9, q4tp use four-row ones) |
 | `CMF_QWEN_CHECKED` | unset | GPU | `1` = shader runtime checks and workgroup zero-init back on (slower; for debugging) |
 | `CMF_QWEN_IO` | `mmap` | GPU | how a missing expert is read: copied from the memory map; `pread` = one buffered read; `direct` = page cache if resident, else O_DIRECT (Linux) |
 | `CMF_QWEN_RAM_TIER_MB` | unset (off) | GPU | explicit RAM tier: `auto` = free RAM minus a reserve, or a size in MiB; drops copies of arena experts first, reloads evicted ones in the background |
@@ -299,7 +326,7 @@ The q2tp file holds 49,248 q2tp, 24,752 q4tp, 172 q8_2f and 751 f16 tensors; the
 
 - **Accuracy.** `cortiq verify` checks all 74,923 per-tensor hashes of a model file. GPU against the CPU reference: layer intermediates at cosine 0.9998–0.99999 and identical argmax on single-token checks (logit cosine 0.98–0.985); over 160 positions with the 0.8.7 defaults (`CMF_QWEN_DEVICE_CHECK=1`), cosine 0.996–0.9995 with identical argmax at every position (`CMF_QWEN_DEVICE_CHECK=1 CMF_QWEN_PREFILL_CHUNK=1` repeats the comparison on any prompt; the check compares single-token frames only). The card accumulates in f32 and the host in f64, so a long greedy run can diverge from the host reference after about 40 tokens. Speculative output equals plain greedy decoding except at floating-point near-ties (see Speculative decoding). The 0.8.8 hyper-connection kernels match the 0.8.7 ones to about 1e-7 on the RTX 5090, and greedy text is byte-identical between them. Perplexity and task benchmarks were not measured.
 - The full Qwen3.8-Flash-Next text architecture runs natively (`qwen4_exp`): four-stream gated residual, 36 Gated DeltaNet and 12 Qwen Sparse Attention layers with the block indexer (4 query heads, 1 shared key, 2048-token budget), 512-expert MoE with top-10 routing plus the shared expert, bigram/trigram PLE lookup, partial RoPE (64 of 256 dimensions). The vision tower is omitted: the upstream repository is image-text-to-text, this one is text-generation. The MTP head ships as the optional sidecar above.
-- GPU path: measured on two cards (RTX 5090 and RTX 4090, Vulkan, NVIDIA) with the `q2tp` file; DX12 and Metal-via-wgpu are not excluded by the code and not measured. The `q4tp` file is accepted by the same code but has no 0.8.7 measurement and no sidecar.
+- GPU path: measured on two cards (RTX 5090 and RTX 4090, Vulkan, NVIDIA), the `q2tp` file on both and the `q4tp` file on the RTX 5090; DX12 and Metal-via-wgpu are not excluded by the code and not measured.
 - Apple silicon: the native Metal backend has no GPU token path for this architecture; the model runs the host path there. No Mac measurement exists.
 - `cortiq info` does not list the sidecar; it is detected by name at run time. Several concurrent `cortiq serve` slots on the GPU path were not measured.
 
@@ -331,6 +358,8 @@ CMF_QWEN_PROFILE=flashnext.profile cortiq run qwen38-flash-next-q2tp.cmf --promp
 ```
 
 Скорость (один поток, `cortiq bench --tokens 120 --core`, файл q2tp, профиль маршрутизации): RTX 5090 32 ГБ, cortiq 0.8.8 — 81,7 ток/с на всей карте, 108,6 со спекулятивным декодированием, обработка промпта 88–95 ток/с, 50,5 при `CMF_GPU_VRAM_MB=16000`, 31,4 при 12 ГБ; RTX 4090 24 ГБ, cortiq 0.8.7 — 41,9 / 27,2 / 16,3. На реальных запросах через `cortiq serve` (рассказ, код, объяснение, текст на русском, SQL) RTX 5090 даёт 47–63 ток/с и 54–65 со спекулятивным декодированием. Пример длинного кода — [3D-аквариум](examples/3d-aquarium/README.md): ответ на 10 930 токенов, рабочая HTML-страница на Three.js, 67,8 ток/с.
+
+Файл q4tp (эксперты 4 бита, 97 ГБ) качественнее: перплексия на коде 4,11 против 4,76 у q2tp, совпадение с эталоном на CPU 0,994–0,996 против 0,986–0,989. Для него есть свой MTP-файл `qwen38-flash-next-q4tp.mtp.cmf` (1,50 ГБ) и профиль `flashnext-q4tp.profile`. На RTX 5090 с cortiq 0.8.9 — 40,3 ток/с, 44,4 со спекулятивным декодированием; эксперт весит 2,6 МБ вместо 1,75, в видеопамять их помещается примерно на треть меньше, и без оперативной памяти под весь файл (97 ГБ) он заметно медленнее: 11–20 ток/с на реальных запросах при 62 ГБ.
 
 Где лежат эксперты: самые горячие — в видеопамяти (на карте 32 ГБ — 13 808 из 24 576), недостающие движок копирует прямо из отображения файла, кэш страниц ОС служит вторым уровнем, диск — третьим. Если видеопамять и оперативная память вместе больше файла, после прогрева диск не читается. Явный RAM-кэш и прямое чтение с диска включаются переменными `CMF_QWEN_RAM_TIER_MB` и `CMF_QWEN_IO` — на тестовой машине кэш страниц ОС оказался быстрее, поэтому по умолчанию они выключены.
 
