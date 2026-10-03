@@ -5,6 +5,49 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.7] - 2026-10-03
+
+### Added
+- Qwen3.8-Flash-Next (`qwen4_exp`) runs the whole token on the card on the
+  wgpu/Vulkan path: the four-stream hyper-connection state, the GDN recurrent
+  state, the QSA key/value and indexer caches, the PLE history and every
+  skeleton projection are resident, routing happens on the device, resident
+  experts come from the global segmented arena and cold winners are admitted
+  at once and computed on the card in the next frame. A frame carries up to
+  eight tokens with one dispatch per stage (token-strided frame buffers;
+  token-wide norm, f16 pair, up-fold, q8_2f matvec, inject, GDN norm and
+  routing kernels; position-looped GDN conv and step with in-kernel
+  snapshots; token-wide QSA over a per-frame token table), so prefill runs in
+  chunks of eight (`CMF_QWEN_PREFILL_CHUNK`). RTX 4090, the 77 GB q2tp file,
+  120-token steady decode: 41.9 tok/s at the full budget (0.8.5 host
+  skeleton: 2.7), 27.2 at `CMF_GPU_VRAM_MB=16000`, 16.3 at 12 GB on a host
+  whose memory cgroup cannot cache the file; prefill 47.9 tok/s.
+  `CMF_QWEN_DEVICE=0` keeps the host path; `CMF_QWEN_DEVICE_CHECK=1` runs
+  both and prints the logits' cosine and argmax (0.996–0.9995 over 160
+  positions, argmax identical). Report: `docs/QWEN38_FLASH_NEXT_DEVICE.ru.md`.
+- Expert arena warm start from a routing profile: `CMF_QWEN_PROFILE_SAVE=<path>`
+  records (layer, expert) hits, `CMF_QWEN_PROFILE=<path>` prefills the arena
+  at start. The HF model repository ships `flashnext.profile`.
+- Multi-token prediction for Qwen3.8-Flash-Next: `tools/qwen4_mtp_fetch.py`
+  pulls the 31 `mtp.*` tensors from the HF checkpoint with HTTP range
+  requests, `cortiq convert … --mtp-sidecar` writes `<stem>.mtp.cmf` (1.08 GB
+  for q2tp; `fc_embedding`/`fc_hidden` kept in q8_2f), and decode drafts
+  `CMF_QWEN_MTP_K` (3) tokens a round, verifies them in one four-position
+  frame and rolls the recurrent state back by snapshot. Greedy output equals
+  plain decoding. The sidecar is picked up by name; `CMF_QWEN_MTP=0` turns it
+  off. It pays where acceptance is high (code ~69 %, repetitive
+  continuations ~89 %) and shares expert admissions across the window; on
+  free text (~34 %) it is even with plain decoding.
+- Resident expert kernels with four rows per workgroup (`q4_gu_q2tp4`,
+  `q4_dn_q4tp4`; `CMF_QWEN_EXPERT4=0` keeps the arena's one-row kernels): the
+  eight-token frame 187 → 34 ms, the single token 28 → 22 ms of card time.
+- Expert uploads: the lazy prefetch uploads in parallel; a pinned staging ring
+  (`CMF_QWEN_STAGE_MB`, 256 MB × 2; 0 = plain `write_buffer`) and
+  `CMF_MMAP_POPULATE=1` (MAP_POPULATE at open) for hosts whose RAM holds the
+  file. The per-token profile line (`CMF_QWEN_PROF=1`) reports the fills and
+  their summed time next to the admission wall time, which says whether the
+  uploads overlap.
+
 ## [0.8.6] - 2026-10-02
 
 ### Added
