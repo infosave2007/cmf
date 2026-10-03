@@ -132,8 +132,6 @@ Long code, one request: the [3D aquarium example](examples/3d-aquarium/README.md
 
 ![The generated aquarium page](examples/3d-aquarium/screenshot.jpg)
 
-The same prompt with the q4tp file gave an 8,166-token answer at 33.4 tok/s whose scene is closer to the brief (bright orange fish with white, black-edged bands), but one variable name slipped (`userData.pect` read where `userData.pects` was stored), so the page stops at its loading screen until those four characters are fixed. Both outputs are in the example folder.
-
 ### RTX 5090, q4tp file, cortiq 0.8.9
 
 Same card and host as above; `qwen38-flash-next-q4tp.cmf` with `flashnext-q4tp.profile` (the 12 GB row with `flashnext.profile`), `cortiq bench --tokens 120 --core --ignore-eos` (greedy; without `--ignore-eos` this file's answer to the bench prompt ends after one token), tok/s:
