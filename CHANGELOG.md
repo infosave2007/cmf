@@ -5,6 +5,60 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.8] - 2026-10-03
+
+### Changed
+- Qwen3.8-Flash-Next on the RTX 5090 (32 GB, Vulkan, the q2tp file,
+  120-token steady decode): 81.7 tok/s at the full card (0.8.7 on the same
+  card: 49.0), 108.6 with speculative decoding (55.0), prefill 88-95 tok/s
+  (57), 50.5 at `CMF_GPU_VRAM_MB=16000` (40.4), 31.4 at 12 GB (28.8). A
+  single-token pass takes 10.4 ms of GPU time (14.6). Greedy text is
+  byte-identical across the new and old kernels and across 2-7 drafts.
+- Hyper-connection mixer (97 blocks a token) rewritten: two dispatches a
+  block instead of three, subgroup reductions, 16-byte weight loads, the norm
+  and the pending MoE inject fused in (`HC3_WGSL`; `CMF_QWEN_HC_V3=0` keeps
+  the previous kernels). Devices without `Features::SUBGROUP` or with
+  subgroups narrower than 32 keep the previous kernels.
+- The qwen4 shader modules are created trusted (no runtime bounds checks)
+  and their pipelines skip workgroup zero-initialisation after an audit of
+  every workgroup array; `CMF_QWEN_CHECKED=1` restores both.
+- wgpu indirect-call validation is off outside DX12: it put a validation
+  dispatch, a pipeline switch and barriers in front of every indirect
+  dispatch (the cold-expert passes). `WGPU_VALIDATION_INDIRECT_CALL=1`
+  restores it; the 4 GiB `max_buffer_size` cap it implied is kept.
+- The device path finishes the frame it encodes ahead into a command buffer
+  while the card runs the current one, submits staged expert uploads in the
+  frame's own queue submission and skips per-layer writes that repeat the
+  previous frame's.
+- The device-path expert arena no longer reserves the generic allocator's
+  workspace (2-4 GiB it never used) at budgets of 24 GiB and up: about 1,700
+  more experts on a 32 GB card (`CMF_QWEN_WORKSPACE_MB` overrides).
+- PLE n-gram rows of a frame are read in parallel on the thread pool, and the
+  n-gram table is advised random-access: on a host whose page cache cannot
+  hold the file the serial row reads cost tens of milliseconds a token.
+- The routing-profile arena prefill reads and uploads in parallel.
+
+### Added
+- `expert_store`: the host side of the qwen4 expert cache, behind the VRAM
+  arena. Default: experts are copied straight out of the memory map (the
+  page cache is the RAM tier; on the test host it held most of the file and
+  beat every alternative). Opt-in, for hosts where they measure better: an
+  explicit RAM tier sized from free memory with container limits taken into
+  account (`CMF_QWEN_RAM_TIER_MB=auto|<MiB>`; it drops copies of experts the
+  arena holds first and reloads evicted ones in the background),
+  `CMF_QWEN_IO=pread|direct` (direct I/O falls back to page-residency checks
+  where `RWF_NOWAIT` is unsupported, as on overlayfs), page-cache hints
+  (`CMF_QWEN_CACHE_HINTS=1`) and read-ahead advice (`CMF_QWEN_WILLNEED=1`).
+  `CMF_QWEN_STORE=0` bypasses it.
+- The per-token profile line (`CMF_QWEN_PROF=1`) splits the frame loop into
+  encode, finish, spin, post and PLE time and reports the store's counters.
+
+### Fixed
+- MTP with more than three drafts (`CMF_QWEN_MTP_K=4..7`): the readback stage
+  is sized for the verify window's logits rows. It was a fixed 4 MiB, one
+  row short at k = 4; v0.8.7 then turned the device path off and the host
+  path read caches it had never filled.
+
 ## [0.8.7] - 2026-10-03
 
 ### Added
