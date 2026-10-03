@@ -2253,9 +2253,12 @@ fn build_hc3(c: &Ctx) -> Option<Hc3> {
         );
         return None;
     }
-    let sc = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let si = c.device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let sv = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
     let module = qwen_module(c, "qwen4-hc3", HC3_WGSL);
-    if let Some(e) = pollster::block_on(sc.pop()) {
+    let ev = pollster::block_on(sv.pop());
+    let ei = pollster::block_on(si.pop());
+    if let Some(e) = ev.or(ei) {
         tracing::warn!("qwen4 HC v3 module rejected: {e}");
         let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
         return None;
@@ -2278,7 +2281,12 @@ fn hc3_pipe(c: &Ctx, h: &Hc3, down: bool, k: u32) -> Option<wgpu::ComputePipelin
     } else {
         ("hc3_upfold", "H3_KU")
     };
-    let sc = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    // Validation and Internal both: a shader the translator or the driver
+    // turns down (`CreateComputePipelineError::Internal`) is not a
+    // validation error, and outside a scope that takes it wgpu's default
+    // handler panics instead of letting this mix fall back.
+    let si = c.device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let sv = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
     let p = c
         .device
         .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -2292,7 +2300,10 @@ fn hc3_pipe(c: &Ctx, h: &Hc3, down: bool, k: u32) -> Option<wgpu::ComputePipelin
             },
             cache: c.pipeline_cache.as_ref(),
         });
-    let p = match pollster::block_on(sc.pop()) {
+    // scopes pop in reverse order
+    let ev = pollster::block_on(sv.pop());
+    let ei = pollster::block_on(si.pop());
+    let p = match ev.or(ei) {
         None => Some(p),
         Some(e) => {
             tracing::warn!("qwen4 HC v3 pipeline {ep} ({knob} = {k}) rejected: {e}");
@@ -7169,13 +7180,21 @@ mod hc3_device_tests {
         }
     }
 
+    /// Written over every output buffer before each run, so a value a
+    /// kernel failed to write cannot pass for the other arm's.
+    const POISON: f32 = 7.7e30;
+
     /// max |a - b| over the first `n` floats of `nt` rows at `stride`,
-    /// relative to max |b|
+    /// relative to max |b|; infinite where either side kept the poison
+    /// the run wrote first (a value the kernel never produced) or is not finite
     fn rel(a: &[f32], b: &[f32], nt: usize, stride: usize, n: usize) -> f32 {
         let (mut d, mut m) = (0.0f32, 0.0f32);
         for t in 0..nt {
             for i in 0..n {
                 let (x, y) = (a[t * stride + i], b[t * stride + i]);
+                if !x.is_finite() || !y.is_finite() || x == POISON || y == POISON {
+                    return f32::INFINITY;
+                }
                 d = d.max((x - y).abs());
                 m = m.max(y.abs());
             }
@@ -7265,7 +7284,14 @@ mod hc3_device_tests {
         let y_old = upload(c, "hc3-test-inj-old", &zeros(TMAX * gsd));
         let y_new = upload(c, "hc3-test-inj-new", &zeros(TMAX * gsd));
         let nw = const_buf(c, bytemuck::cast_slice(&norm));
-        let low = tbuf(c, T_LOW, lr * 4, false);
+        // one `low` per arm (the frame pool's would carry the reference
+        // arm's values into the v3 readback wherever v3 did not write)
+        let low_old = upload(c, "hc3-test-low-old", &zeros(TMAX * ls));
+        let low_new = upload(c, "hc3-test-low-new", &zeros(TMAX * ls));
+        let poison = |b: &wgpu::Buffer, n: usize| {
+            c.queue
+                .write_buffer(b, 0, bytemuck::cast_slice(&vec![POISON; n]));
+        };
         let f32s = |b: &[u8]| -> Vec<f32> { bytemuck::cast_slice(b).to_vec() };
         let mut worst = 0.0f32;
         for nt in [1usize, 2, 3, 4, 5, 8] {
@@ -7288,11 +7314,14 @@ mod hc3_device_tests {
                     let run = |v3: bool| -> Vec<Vec<f32>> {
                         c.queue
                             .write_buffer(&dev.hyper, 0, bytemuck::cast_slice(&h0));
-                        let (x, y) = if v3 {
-                            (&x_new, &y_new)
+                        let (x, y, low) = if v3 {
+                            (&x_new, &y_new, &low_new)
                         } else {
-                            (&x_old, &y_old)
+                            (&x_old, &y_old, &low_old)
                         };
+                        poison(x, TMAX * os);
+                        poison(y, TMAX * gsd);
+                        poison(low, TMAX * ls);
                         let mut enc = new_encoder("hc3-test").expect("encoder");
                         {
                             let mut pass = begin_pass(&mut enc);
@@ -7308,7 +7337,7 @@ mod hc3_device_tests {
                                     b,
                                     &dev.hyper,
                                     x,
-                                    &low,
+                                    low,
                                     y,
                                     pre.as_ref(),
                                     nt,
@@ -7321,8 +7350,8 @@ mod hc3_device_tests {
                                     inject_pre(c, p, &mut pass, &g, &dev.hyper, q, nt, bc);
                                 }
                                 encode_hc_old(
-                                    c, p, &mut pass, &g, &nw, &down, &up, b, &dev.hyper, x, &low,
-                                    y, nt, bc, 100,
+                                    c, p, &mut pass, &g, &nw, &down, &up, b, &dev.hyper, x, low, y,
+                                    nt, bc, 100,
                                 )
                                 .expect("pre-v3 mix");
                             }
@@ -7331,7 +7360,7 @@ mod hc3_device_tests {
                             enc,
                             &[
                                 (x, (TMAX * os * 4) as u64),
-                                (&low, (TMAX * ls * 4) as u64),
+                                (low, (TMAX * ls * 4) as u64),
                                 (y, (TMAX * gsd * 4) as u64),
                                 (&dev.hyper, (TMAX * hs * 4) as u64),
                             ],
