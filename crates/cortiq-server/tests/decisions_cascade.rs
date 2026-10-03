@@ -40,7 +40,7 @@
 //!   `auto_max_skills`, `auto_skills: false`, score/noul, a key without
 //!   `learning_allowed`, `/v1/route` without `taxonomy_id`); the `auto_tau`
 //!   floor; a rare label quarantined, probability 0, still taught;
-//! * state-less requests (0.8.7): a `state: {}` contract whose text is in the
+//! * state-less requests (0.8.8): a `state: {}` contract whose text is in the
 //!   instructions is registered at its `auto_min_sightings`-th sighting,
 //!   learned, answered locally over `/v1/decisions` and `/v1/systemone`, apart
 //!   from the stateful contract of the same criteria and kept over a restart;
@@ -4027,7 +4027,7 @@ async fn a_rare_label_stays_quarantined_and_keeps_teaching() {
     assert_eq!(weather_of, [sup_id.as_str()], "{l2}");
 }
 
-// ------------------------------------------------------------------ state-less requests (0.8.7)
+// ------------------------------------------------------------------ state-less requests (0.8.8)
 
 /// The Decision Index kit's rendering of a classification item: `state: {}`
 /// and the item text inside the instructions after a fixed prefix — a short

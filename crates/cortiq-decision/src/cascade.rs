@@ -80,7 +80,7 @@
 //! the oracle, so a label the gate confidently misnames still collects its
 //! examples.
 //!
-//! **State-less contracts** (0.8.7, DESIGN A19/A20): a question of a request
+//! **State-less contracts** (0.8.8, DESIGN A19/A20): a question of a request
 //! with an empty `state` reads its own instructions
 //! ([`crate::protocol::DecisionRequest::reads_instructions`]): its φ_P is its
 //! instructions' (the cache, single flight and its example use it), its cache

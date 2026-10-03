@@ -270,7 +270,7 @@ pub struct Contract {
     /// The first request's `criteria` object (descriptions kept, `null` too).
     pub criteria: Value,
     pub created_unix: u64,
-    /// A state-less contract (DESIGN A19.1, 0.8.7): the questions of
+    /// A state-less contract (DESIGN A19.1, 0.8.8): the questions of
     /// requests with an empty `state`, whose instructions are the text the
     /// model reads — the contract is the criteria alone
     /// ([`manifest::stateless_contract_sha256`]) and `instructions` is
@@ -386,7 +386,7 @@ impl Contract {
             ids.len() == object.len() && ids.iter().all(|i| object.contains_key(i)),
             "contract record: the option ids are not the criteria keys"
         );
-        // The id tells a state-less contract (0.8.7) from a stateful one:
+        // The id tells a state-less contract (0.8.8) from a stateful one:
         // `null` instructions hash to another id than the criteria alone.
         let stateless = skill != manifest::auto_skill_id(&instructions, object)
             && instructions.is_null()

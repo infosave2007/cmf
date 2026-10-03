@@ -331,7 +331,7 @@ fn cases() -> Vec<Case> {
             BAD,
         ),
         case("state missing", without(base(), &["state"]), BAD),
-        // An empty state is a state-less request since 0.8.7 (DESIGN A19:
+        // An empty state is a state-less request since 0.8.8 (DESIGN A19:
         // each question's instructions are its input), no longer a 400.
         case("empty state", with(base(), &["state"], json!("")), OK),
         case(
@@ -747,7 +747,7 @@ fn systemone_parser_keeps_the_native_boundary_strict() {
 
     // Every documented adapter alias maps to the locally served CMF model;
     // callers never get an answer that claims to be Jev. `default` is the
-    // Decision Index kit's http engine placeholder (0.8.7).
+    // Decision Index kit's http engine placeholder (0.8.8).
     for model in SYSTEMONE_MODEL_ALIASES.iter().copied().chain([
         "typesafe/jev-1.13",
         SYSTEMONE_MODEL_ID,

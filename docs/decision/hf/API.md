@@ -414,7 +414,7 @@ Limits, who teaches and the state directory's compatibility:
 [ORACLE.md](ORACLE.md#auto-skills). When a data skill and auto-skills fit a
 question equally, the data skill answers.
 
-**State-less requests (0.8.7).** Many benchmark and batch clients send
+**State-less requests (0.8.8).** Many benchmark and batch clients send
 `state: {}` and put the item's text inside the question's instructions
 (`"Classify the banking intent of this user request:\n<text>"`). A request
 whose `state` is empty (`""`, `{}`, `[]`, `null`) is *state-less*: for each

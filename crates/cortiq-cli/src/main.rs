@@ -2747,7 +2747,25 @@ async fn main() -> anyhow::Result<()> {
             mimo_towers,
         } => {
             let towers = convert::parse_mimo_towers(&mimo_towers)?;
-            if mtp_sidecar {
+            // Qwen3.8-Flash-Next: the MTP head is a hyper-connected hybrid
+            // layer with its own 512 experts; it converts through the normal
+            // walk (expert split, skeleton policy) from the 31-tensor source
+            // directory `tools/qwen4_mtp_fetch.py` builds, into `<stem>.mtp.cmf`.
+            let qwen4_mtp = mtp_sidecar
+                && std::fs::read_to_string(std::path::Path::new(&model).join("config.json"))
+                    .ok()
+                    .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+                    .is_some_and(|c| c.get("model_type").and_then(|m| m.as_str()) == Some("qwen4_exp"));
+            let output = if qwen4_mtp {
+                // SAFETY: single-threaded here — before any pipeline/pool spawn.
+                unsafe { std::env::set_var("CMF_CONVERT_QWEN4_MTP", "1") };
+                cortiq_core::mtp_sidecar_path(std::path::Path::new(&output))
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                output
+            };
+            if mtp_sidecar && !qwen4_mtp {
                 let q = match quant.as_deref() {
                     None => "q8_2f",
                     Some(q) if q.eq_ignore_ascii_case(convert::AUTO_QUANT) => "q8_2f",

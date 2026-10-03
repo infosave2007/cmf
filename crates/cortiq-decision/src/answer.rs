@@ -94,7 +94,7 @@ pub fn choice_answer(
 }
 
 /// Give a choice verdict without a distribution (the oracle's or the cache's)
-/// the one-hot one, for the System One surface (0.8.7): every option of `q` in
+/// the one-hot one, for the System One surface (0.8.8): every option of `q` in
 /// request order, the chosen one 1 and the others 0, confidence 1 — the
 /// verdict as Jev writes a certain answer. Clients validating Jev's schema
 /// (the Decision Index kit) otherwise reject every oracle answer. A local

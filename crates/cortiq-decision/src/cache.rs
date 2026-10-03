@@ -14,7 +14,7 @@
 //!   near-identical text under the same contract;
 //! * **φ_P** is the encoder's unit vector of the state (the router's embedding,
 //!   cortiq-router `cache.rs:66-78`), so cos is the dot product;
-//! * a question of a **state-less** request (0.8.7, DESIGN A19.4) reads its
+//! * a question of a **state-less** request (0.8.8, DESIGN A19.4) reads its
 //!   instructions: its φ_P is theirs and its scope hashes the state-less
 //!   contract `{type, input: "instructions", criteria}` instead
 //!   ([`scope_of_as`]) — the text is in φ_P, not in the scope.

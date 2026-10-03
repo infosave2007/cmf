@@ -22,9 +22,9 @@
 
 use crate::hash::hash64;
 pub use crate::knowledge::{
-    ExpertAppend, GenomeInfo, GenomeParent, LineageEvent, LookupInfo, PhiSpec, RouterPolicy, Segment,
-    SkillBound, SkillOverride, StateEffect, expert_append_state_effect, ffn_replace_state_effect,
-    trunk_hash,
+    ExpertAppend, GenomeInfo, GenomeParent, LineageEvent, LookupInfo, PhiSpec, RouterPolicy,
+    Segment, SkillBound, SkillOverride, StateEffect, expert_append_state_effect,
+    ffn_replace_state_effect, trunk_hash,
 };
 use crate::mask::{MaskCatalog, TaskMask, decode_masks_section, encode_masks_section};
 use crate::quant::expected_nbytes;
@@ -661,7 +661,16 @@ impl CmfModel {
         let file = File::open(&path)?;
         let file_len = file.metadata()?.len();
 
-        let backing = match unsafe { memmap2::MmapOptions::new().map(&file) } {
+        // `CMF_MMAP_POPULATE=1`: fault the whole file in at open (MAP_POPULATE)
+        // — for hosts whose RAM holds the file, so a device path that
+        // re-reads cold experts from the mapping every token never pays a
+        // page fault inside the token. Costs the read time once, up front.
+        let populate = std::env::var("CMF_MMAP_POPULATE").as_deref() == Ok("1");
+        let mut opts = memmap2::MmapOptions::new();
+        if populate {
+            opts.populate();
+        }
+        let backing = match unsafe { opts.map(&file) } {
             Ok(m) => {
                 // Decode touches every weight page each token, so tell
                 // the kernel up front: WillNeed front-loads readahead
@@ -789,7 +798,11 @@ impl CmfModel {
         if bounded_declared != bounded_bit {
             return Err(CmfError::Parse(format!(
                 "anchor_core record ({}) and BOUNDED_STATE feature bit ({}) disagree",
-                if bounded_declared { "present" } else { "absent" },
+                if bounded_declared {
+                    "present"
+                } else {
+                    "absent"
+                },
                 if bounded_bit { "set" } else { "clear" }
             )));
         }

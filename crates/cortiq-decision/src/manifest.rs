@@ -1318,7 +1318,7 @@ pub struct Rubric {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub criteria_order: Vec<String>,
     /// [`INPUT_INSTRUCTIONS`] for the auto-skill of a state-less contract
-    /// (DESIGN A19.1, 0.8.7): its contract is the criteria alone
+    /// (DESIGN A19.1, 0.8.8): its contract is the criteria alone
     /// ([`stateless_contract_sha256`]) and `instructions` is `null`; absent
     /// (and never written) for every other rubric, so older manifests keep
     /// their bytes.

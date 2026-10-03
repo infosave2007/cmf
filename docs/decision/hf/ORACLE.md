@@ -155,7 +155,7 @@ goes to the oracle on every new text and, until 0.8.5, was never learned. Since
   skill's rubric (the id is recomputed from it), visible through
   `/v1/skills/{id}` to every key. The contract is written to `learn.log`
   before its first example, so a restart rebuilds it.
-* **State-less requests (0.8.7).** A request with an empty `state` (`""`,
+* **State-less requests (0.8.8).** A request with an empty `state` (`""`,
   `{}`, `[]`, `null`) — a benchmark kit that writes `state: {}` and the item
   into the instructions — is read through each question's instructions
   (canonical JSON for an object or array). The contract of such a question
@@ -289,7 +289,7 @@ goes to the oracle on every new text and, until 0.8.5, was never learned. Since
   older binary on a newer state directory). The cache scope of a contract
   changes from the contract to the skill at its activation, so its first
   requests after that miss the cache (they are answered locally anyway).
-  A 0.8.6 binary truncates a 0.8.7 `learn.log` at the first state-less
+  A 0.8.7 or older binary truncates a 0.8.8 `learn.log` at the first state-less
   contract record and refuses a manifest whose rubric carries `input`.
 
 ## Budget and stop rules
