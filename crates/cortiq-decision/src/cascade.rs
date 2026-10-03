@@ -64,8 +64,9 @@
 //! state directory, a lost `learn.log`) is registered from its manifest at
 //! open and after a rollback, so it keeps learning. A contract with fewer
 //! than 2 or more than `learning.auto_max_labels` ids, or past
-//! `learning.auto_max_skills` contracts, is answered by the oracle and not
-//! recorded (`auto_skipped`).
+//! `learning.auto_max_skills` stateful (`auto_max_stateless_skills`
+//! state-less) contracts, is answered by the oracle and not recorded
+//! (`auto_skipped`).
 //! The labels of an auto-skill are closed: an example whose label is not one
 //! of the contract's ids is refused (`full`), so a superset request or a
 //! router feedback can never grow it; the pending-labels cap does not apply
@@ -91,8 +92,10 @@
 //! bounded in-memory LRU of `learning.auto_sightings_cap` contracts, lost on
 //! restart), so one-off contracts — a multiple-choice benchmark whose options
 //! change with every item — never reach `learn.log` nor use up
-//! `learning.auto_max_skills`; the answers before that are not learned.
-//! Stateful contracts register at the first sighting, as in 0.8.6.
+//! `learning.auto_max_stateless_skills`; the answers before that are not
+//! learned. Stateful contracts register at the first sighting, as in 0.8.6,
+//! against their own cap `learning.auto_max_skills`, so stateful one-offs
+//! never crowd a repeated state-less contract out.
 //!
 //! **Admin** (spec §5b): oracle status and switches, learning status (buffer,
 //! cache, quarantine, attempts, task hashes), generations and rollback (the
@@ -718,10 +721,19 @@ impl Inner {
             if let Some(c) = contract
                 && !reg.contains(&c.skill)
             {
+                // Each kind has its own cap: stateful contracts register at
+                // their first sighting, so their one-offs must not take the
+                // slots of the repeated state-less ones (DESIGN A20).
+                let l = &self.cfg.learning;
+                let (cap, key) = if c.stateless {
+                    (l.auto_max_stateless_skills, "auto_max_stateless_skills")
+                } else {
+                    (l.auto_max_skills, "auto_max_skills")
+                };
+                let held = reg.count(c.stateless);
                 ensure!(
-                    reg.len() < self.cfg.learning.auto_max_skills,
-                    "the auto-skill registry holds {} contracts (learning.auto_max_skills)",
-                    reg.len()
+                    held < cap,
+                    "the auto-skill registry holds {held} such contracts (learning.{key})"
                 );
                 self.log.append(&LogRecord::Contract(c.clone()))?;
                 reg.insert(c.clone());
@@ -794,6 +806,7 @@ impl Inner {
                 skipped = st.auto_skipped,
                 max_labels = self.cfg.learning.auto_max_labels,
                 max_skills = self.cfg.learning.auto_max_skills,
+                max_stateless_skills = self.cfg.learning.auto_max_stateless_skills,
                 "an untrained contract is answered by the oracle but not learned (auto-skill limits)"
             );
         }

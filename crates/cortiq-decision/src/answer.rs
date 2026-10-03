@@ -16,7 +16,9 @@
 //! * **Oracle and cache answers** (the OpenRouter schema makes probabilities and
 //!   confidence optional): choice `{type, choice}`; score `{type, score: level,
 //!   legend: {"0": level 0, …}}`; noul `{type, noul: 1|0, value_semantics:
-//!   "boolean_verdict_not_probability"}`.
+//!   "boolean_verdict_not_probability"}`. On `/v1/systemone` a choice verdict
+//!   is given the one-hot distribution ([`complete_choice`]): Jev's schema,
+//!   and the Decision Index validator, require a probability for every option.
 
 use crate::eval::{f32_json, jev_confidence};
 use crate::protocol::{Question, QuestionKind};
@@ -89,6 +91,33 @@ pub fn choice_answer(
         "probabilities": Value::Object(p),
         "confidence": number(confidence, rounding),
     })
+}
+
+/// Give a choice verdict without a distribution (the oracle's or the cache's)
+/// the one-hot one, for the System One surface (0.8.7): every option of `q` in
+/// request order, the chosen one 1 and the others 0, confidence 1 — the
+/// verdict as Jev writes a certain answer. Clients validating Jev's schema
+/// (the Decision Index kit) otherwise reject every oracle answer. A local
+/// answer (it has `probabilities`) and any other answer are left as they are.
+pub fn complete_choice(answer: &mut Value, q: &Question) {
+    if answer.get("type").and_then(Value::as_str) != Some("choice")
+        || answer.get("probabilities").is_some()
+    {
+        return;
+    }
+    let Some(choice) = answer.get("choice").and_then(Value::as_str) else {
+        return;
+    };
+    let options = q.options();
+    if !options.contains(&choice) {
+        return;
+    }
+    let one_hot: Vec<(&str, f32)> = options
+        .iter()
+        .map(|&o| (o, if o == choice { 1.0 } else { 0.0 }))
+        .collect();
+    let choice = choice.to_string();
+    *answer = choice_answer(&one_hot, &choice, 1.0, Rounding::Hundredths);
 }
 
 /// A verdict of the oracle (or of the cache of its answers).
@@ -187,6 +216,31 @@ mod tests {
         assert_eq!(round2(0.125).to_string(), "0.13"); // exact half: away from zero
         assert_eq!(round2(0.5).to_string(), "0.5");
         assert_eq!(number(0.97, Rounding::Exact).to_string(), "0.97");
+    }
+
+    #[test]
+    fn a_choice_verdict_gets_the_one_hot_distribution() {
+        let q = Question {
+            id: "q".into(),
+            kind: QuestionKind::Choice,
+            instructions: json!("pick"),
+            criteria: Some(json!({"b": "B", "a": "A", "c": "C"})),
+        };
+        let mut a = OracleAnswer::Choice("a".into()).to_answer(&q);
+        complete_choice(&mut a, &q);
+        assert_eq!(
+            a.to_string(),
+            r#"{"type":"choice","choice":"a","probabilities":{"b":0,"a":1,"c":0},"confidence":1}"#
+        );
+        // A local answer keeps its distribution; a noul verdict is untouched.
+        let p = [("b", 0.25), ("a", 0.5), ("c", 0.25)];
+        let local = choice_answer(&p, "a", 0.25, Rounding::Exact);
+        let mut l = local.clone();
+        complete_choice(&mut l, &q);
+        assert_eq!(l, local);
+        let mut n = json!({"type": "noul", "noul": 1});
+        complete_choice(&mut n, &q);
+        assert_eq!(n, json!({"type": "noul", "noul": 1}));
     }
 
     #[test]

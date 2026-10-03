@@ -425,6 +425,15 @@ impl ContractRegistry {
         self.contracts.len()
     }
 
+    /// The contracts of one kind (state-less or stateful): each kind has its
+    /// own cap (`learning.auto_max_stateless_skills`, `auto_max_skills`).
+    pub fn count(&self, stateless: bool) -> usize {
+        self.contracts
+            .values()
+            .filter(|c| c.stateless == stateless)
+            .count()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.contracts.is_empty()
     }

@@ -25,10 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   record (the id tells it apart). Both `/v1/decisions` and `/v1/systemone`
   (API.md §3.1, §3.2, §3a; ORACLE.md "Auto-skills").
 - Sightings gate: a state-less contract is registered and learned only from
-  its `learning.auto_min_sightings`-th sighting (2), counted in an in-memory
+  its `learning.auto_min_sightings`-th sighting (5), counted in an in-memory
   LRU of `learning.auto_sightings_cap` (100000) contracts, so one-off
-  contracts (multiple-choice items whose descriptions change per question)
-  never reach `learn.log` nor use up `auto_max_skills`. `GET
+  contracts (multiple-choice items whose descriptions change per question,
+  WinoGrande twins) never reach `learn.log` nor take a registry slot: on the
+  Decision Index suite's state-less rows 2 would register 756 contracts, 5
+  registers 20. State-less contracts have their own cap
+  `learning.auto_max_stateless_skills` (256), so stateful one-offs, which
+  register at their first sighting against `auto_max_skills`, never crowd
+  them out. `GET
   /v1/admin/learning` adds `auto_sightings`, `auto_registered` and
   `stateless` per auto-skill (API.md §6).
 - Capacity errors: a request over a size limit (body, state, a state-less
@@ -39,6 +44,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   An oracle refusal because the prompt exceeds its context is the failure
   `context_length`: an untrained question gets 422 `UNSUPPORTED_QUESTION`
   with the marker, and it does not count toward `oracle.max_errors`.
+- `/v1/systemone`: an oracle or cache choice answer carries the one-hot
+  distribution (`probabilities` over every option, the chosen one 1;
+  `confidence: 1`) — Jev's schema requires one, and the Decision Index
+  validator rejected every such answer; `/v1/decisions` keeps `{type,
+  choice}`. The model name `default` (the kit's `http` engine default) is
+  accepted there like the Jev aliases (API.md §3a).
 
 ### Changed
 - `/v1/decisions` no longer refuses an empty `state` (`""`, `{}`, `[]`) or a

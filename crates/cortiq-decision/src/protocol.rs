@@ -69,6 +69,11 @@ pub const SYSTEMONE_MODEL_ALIAS: &str = "jev-latest";
 /// [`parse_systemone_request`].  They are useful when migrating an existing
 /// TypeSafe client, but never appear as the identity in a response.
 pub const SYSTEMONE_MODEL_ALIASES: &[&str] = &[SYSTEMONE_MODEL_ALIAS, "jev-preview", "jev-1.13.0"];
+/// The model name the Decision Index kit's http engine sends unless told
+/// otherwise (`HttpSystemOne(model="default")`): accepted by
+/// [`parse_systemone_request`] like the aliases, but not listed in discovery
+/// (it names no model, it is a client placeholder).
+pub const SYSTEMONE_DEFAULT_MODEL: &str = "default";
 /// `provider` of every response.
 pub const PROVIDER: &str = "Cortiq";
 /// Hex characters of the model sha in a pinned model id.
@@ -970,6 +975,7 @@ fn parse_systemone_model(v: Option<&Value>) -> Result<ModelRef, ApiError> {
         return Err(ApiError::invalid_field("model", "model must be a string"));
     };
     if SYSTEMONE_MODEL_ALIASES.contains(&name.as_str())
+        || name == SYSTEMONE_DEFAULT_MODEL
         || name == SYSTEMONE_MODEL_ID
         || ModelRule::Jev.matches(name)
     {

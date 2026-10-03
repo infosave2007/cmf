@@ -434,14 +434,16 @@ state-less question are its input: they leave for the oracle PII-redacted
 like a state (unless `allow_pii_egress`), the oracle request otherwise
 unchanged (`state` sent as `{}`). Each one is limited to `limits.state_bytes`
 (a capacity error past it); state-less answers are never `certified`. A
-state-less contract is registered and learned only from its second sighting
+state-less contract is registered and learned only from its fifth sighting
 (`learning.auto_min_sightings`; sightings counted in memory, at most
 `learning.auto_sightings_cap` contracts, lost on restart): a one-off contract
 — a multiple-choice item whose option descriptions change with every
 question — is answered by the oracle and never written to the state
-directory nor counted against `auto_max_skills`; the answer at the first
-sighting is not learned. Requests with a non-empty state behave exactly as
-in 0.8.6 (their contracts register at the first sighting). The same rules
+directory nor counted against the registry; the answers before that
+sighting are not learned. State-less contracts are capped by
+`learning.auto_max_stateless_skills`, apart from the stateful ones'
+`auto_max_skills`. Requests with a non-empty state behave exactly as in
+0.8.6 (their contracts register at the first sighting). The same rules
 hold on `/v1/systemone` ([section 3a](#3a-system-one-request-adapter-jev-compatible)).
 `/v1/skills/{id}` of a state-less auto-skill shows `rubric.instructions:
 null` and `rubric.input: "instructions"`; `GET /v1/admin/learning` lists it
@@ -484,7 +486,10 @@ curl -s "$CORTIQ/v1/skills/banking77" -H "Authorization: Bearer $KEY" \
   `confidence = (N·p_max − 1)/(N − 1)` (Jev's formula). Numbers are the
   shortest f32 form; `cmf.round: 2` (or `response.round: 2`) rounds to
   hundredths and prints 0 and 1 as integers, as Jev does.
-* **choice from the oracle or the cache** — `{type, choice}`.
+* **choice from the oracle or the cache** — `{type, choice}`; on
+  `/v1/systemone` it carries the one-hot distribution too (`probabilities`:
+  the chosen option 1, every other 0, in request order; `confidence: 1`),
+  since Jev's schema requires one.
 * **score** (oracle only) — `{type, score, legend}` with the level index.
 * **noul** (oracle only) — `{type, noul: 1 | 0, value_semantics:
   "boolean_verdict_not_probability"}`.
@@ -657,7 +662,7 @@ native server. It does **not** load Jev weights or present itself as Jev.
 
 | Field | Adapter rule |
 |---|---|
-| `model` | optional. Omitted, `jev-latest`, `jev-preview`, `jev-1.13.0`, the `typesafe/jev-1.13` selector series, and `cmf-decision-0.8.5` select the current local CMF decision model at this endpoint only. |
+| `model` | optional. Omitted, `jev-latest`, `jev-preview`, `jev-1.13.0`, the `typesafe/jev-1.13` selector series, `cmf-decision-<version>` and `default` (the Decision Index kit's placeholder; not listed by discovery) select the current local CMF decision model at this endpoint only. |
 | `state` | a string, object, array or `null`; empty (`""`, `{}`, `[]`, `null`) makes the request state-less ([section 3.2](#32-skill-matching-and-certified)). |
 | `questions` | an object of `choice`, `score` or `noul` questions. `instructions` may be omitted or `null`, matching System One clients. |
 
@@ -903,7 +908,8 @@ unknown key is an error. The defaults:
                "auto_min_agreement": 0.8, "auto_min_coverage": 0.8, "auto_max_skills": 256,
                "auto_max_labels": 64, "auto_max_examples_per_label": 1000,
                "auto_temperature_min": 0.02, "auto_explore_every": 8,
-               "auto_min_sightings": 2, "auto_sightings_cap": 100000},
+               "auto_min_sightings": 5, "auto_sightings_cap": 100000,
+               "auto_max_stateless_skills": 256},
   "feedback": {"pending_cap": 50000},
   "complexity_weights": {"base": 0.4, "ambiguity": 0.25, "novelty": 0.15, "margin": 0.1, "length": 0.1},
   "complexity_tiers": [{"tier": "low", "max": 0.33}, {"tier": "medium", "max": 0.66}, {"tier": "high", "max": 1.0}],
@@ -925,18 +931,20 @@ confidence floor of a local answer (0..1; a serving parameter — `cortiq
 decide` uses the default); `auto_min_agreement` the macro agreement with the
 oracle required to activate and `auto_min_coverage` the share of the
 contract's examples its active labels must hold (both 0..1); `auto_max_skills`
-how many contracts are learned at most and `auto_max_labels` (2..255) how
-many options one may have — a contract past either is answered by the
-oracle and not learned; `auto_max_examples_per_label` (≤ 5000) replaces the
+how many stateful contracts are learned at most and `auto_max_labels`
+(2..255) how many options one may have — a contract past either is answered
+by the oracle and not learned (intent suites need more than 64: BANKING77
+has 77 ids, CLINC150 151); `auto_max_examples_per_label` (≤ 5000) replaces the
 per-label buffer cap for auto-skills; `auto_temperature_min` (0..1) floors
 the gate temperature an attempt records (0: the fitted T, whose lower bound
 makes every `p_top` 1); `auto_explore_every` (an integer, 0 = off) explores
 one text in that many while a label is quarantined — the one case in which a
 gate-accepted question reaches the oracle, auto-skills only;
 `auto_min_sightings` (≥ 1) is the sighting of a state-less contract from
-which it is registered and learned (1: at once, like a stateful one) and
+which it is registered and learned (1: at once, like a stateful one),
 `auto_sightings_cap` (≥ 1) how many unregistered state-less contracts the
-in-memory sightings LRU tracks. `cortiq serve --oracle MODEL` and its companions
+in-memory sightings LRU tracks and `auto_max_stateless_skills` (≥ 1) how
+many state-less contracts are learned at most. `cortiq serve --oracle MODEL` and its companions
 override the `oracle` section (and `--no-oracle-learning` sets
 `learning.enabled` false); a file that sets `oracle.provider` keeps its
 `max_price` unless `--oracle-max-price` is given.
