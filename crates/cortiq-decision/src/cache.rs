@@ -13,7 +13,11 @@
 //!   scopes. A `cache` answer does tell its caller that some account asked a
 //!   near-identical text under the same contract;
 //! * **φ_P** is the encoder's unit vector of the state (the router's embedding,
-//!   cortiq-router `cache.rs:66-78`), so cos is the dot product.
+//!   cortiq-router `cache.rs:66-78`), so cos is the dot product;
+//! * a question of a **state-less** request (0.8.7, DESIGN A19.4) reads its
+//!   instructions: its φ_P is theirs and its scope hashes the state-less
+//!   contract `{type, input: "instructions", criteria}` instead
+//!   ([`scope_of_as`]) — the text is in φ_P, not in the scope.
 //!
 //! **Lookup** ([`SemanticCache::get`]): an exhaustive scan of the entries of the
 //! same scope; the best cos wins (the earliest entry on a tie) and is a hit when
@@ -100,9 +104,30 @@ pub fn contract_scope(q: &Question) -> String {
 
 /// The scope of a question (see the module notes).
 pub fn scope_of(q: &Question, m: &SkillMatch) -> String {
+    scope_of_as(q, m, false)
+}
+
+/// [`scope_of`] for a question whose instructions may be its input
+/// (DESIGN A19.4): then the contract hashed is the state-less one
+/// ([`Question::stateless_contract`], the instructions left out — they are
+/// the text, whose φ_P the entry carries), so a near-identical text under
+/// the same criteria hits; otherwise exactly [`scope_of`].
+pub fn scope_of_as(q: &Question, m: &SkillMatch, reads_instructions: bool) -> String {
+    if !reads_instructions {
+        return match &m.skill {
+            Some(s) => skill_scope(s, q),
+            None => contract_scope(q),
+        };
+    }
+    let contract = canonical::sha256_hex(&q.stateless_contract());
     match &m.skill {
-        Some(s) => skill_scope(s, q),
-        None => contract_scope(q),
+        Some(s) => {
+            let mut ids: Vec<&str> = q.options();
+            ids.sort_unstable();
+            let v = Value::Array(ids.into_iter().map(|s| Value::String(s.into())).collect());
+            format!("skill:{s}:{}:{contract}", canonical::sha256_hex(&v))
+        }
+        None => format!("contract:{contract}"),
     }
 }
 

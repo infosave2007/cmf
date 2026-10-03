@@ -14,9 +14,15 @@
 //! * `model`: `"cortiq/decision"` or `"cortiq/decision@<12 lowercase hex>"`
 //!   (the served model's `model_sha[..12]`, checked by the service); anything
 //!   else, a Jev name included → 404 `MODEL_NOT_FOUND`;
-//! * `state`: a non-empty string, object or array; a string is used as is, an
-//!   object or array as its canonical JSON (answers are then not certified);
-//!   at most `limits.state_bytes` (32 KiB) of that text;
+//! * `state`: a string, object or array; a string is used as is, an object or
+//!   array as its canonical JSON (answers are then not certified); at most
+//!   `limits.state_bytes` (32 KiB) of that text. An EMPTY state (`""`, `{}`,
+//!   `[]`, or `null`) makes the request **state-less** (0.8.7, DESIGN A19):
+//!   the text the local model reads for a question is then that question's
+//!   `instructions` ([`DecisionRequest::input_text`]), each at most
+//!   `limits.state_bytes` too, and its auto-skill contract is the criteria
+//!   alone ([`crate::manifest::stateless_contract_sha256`]); a request with a
+//!   non-empty state is read exactly as before;
 //! * `questions`: an object of 1..`limits.questions` (32) questions in request
 //!   order, ids 1..128 characters; a question is `{type, instructions,
 //!   criteria}` with `type` ∈ {choice, score, noul} and `instructions` a
@@ -31,7 +37,13 @@
 //!
 //! **Errors** ([`ApiError`]) have OpenRouter's body with cortiq-router reason
 //! codes: `{"error":{"code":<HTTP>,"message":"…","metadata":{"reason":"<code>",
-//! "retriable":bool,"request_id":"…","details":{}}}}`.
+//! "retriable":bool,"request_id":"…","details":{}}}}`. A request over a size
+//! limit (body, state, a state-less question's instructions, a description,
+//! options, questions) is a **capacity** error ([`ApiError::capacity`], 0.8.7,
+//! DESIGN A21): its status and reason stay (413 / 400 here), its message
+//! carries [`CAPACITY_MARKER`] (the phrase clients such as the Decision Index
+//! kit recognise as "the input does not fit") and `details.capacity` is
+//! `true`; the System One surface answers it 422.
 //!
 //! **Validator** ([`validate_decisions_response`]): a line-by-line port of
 //! `openrouter_bench.validate_oracle_response` (`openrouter_bench.py:155-199`),
@@ -72,6 +84,10 @@ pub const MAX_SCORE_LEVELS: usize = 10;
 pub const MAX_OPENROUTER_STRING_CHARS: usize = 256;
 /// Feedback labels (the label rule of the training data).
 pub const MAX_LABEL_BYTES: usize = 256;
+/// The phrase of every capacity error's message ([`ApiError::capacity`]): the
+/// marker the Decision Index `http` engine (and OpenAI-style clients) read as
+/// "the input does not fit", not as a failure.
+pub const CAPACITY_MARKER: &str = "maximum context length";
 
 const TOP_KEYS: [&str; 8] = [
     "model",
@@ -195,6 +211,33 @@ impl ApiError {
     /// 400 `INVALID_REQUEST` naming the offending field.
     pub fn invalid_field(field: &str, message: impl Into<String>) -> Self {
         Self::invalid(message).with_detail("field", json!(field))
+    }
+
+    /// A size limit exceeded (DESIGN A21): `reason` and its status as
+    /// before, the message suffixed with [`CAPACITY_MARKER`] and
+    /// `details.capacity: true` (what the System One surface answers 422).
+    pub fn capacity(reason: Reason, field: Option<&str>, message: impl Into<String>) -> Self {
+        let e = Self::new(
+            reason,
+            format!(
+                "{} (exceeds the {CAPACITY_MARKER} of this server)",
+                message.into()
+            ),
+        )
+        .with_detail("capacity", Value::Bool(true));
+        match field {
+            Some(f) => e.with_detail("field", json!(f)),
+            None => e,
+        }
+    }
+
+    /// A capacity error ([`ApiError::capacity`]).
+    pub fn is_capacity(&self) -> bool {
+        self.details
+            .as_deref()
+            .and_then(|d| d.get("capacity"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
     }
 
     /// 404 `INVALID_REQUEST` (a feedback decision or a skill that does not exist).
@@ -330,6 +373,17 @@ impl State {
         matches!(self, State::Text(_))
     }
 
+    /// `""`, `{}`, `[]` or `null`: the request is state-less (DESIGN A19).
+    pub fn is_empty(&self) -> bool {
+        match self {
+            State::Text(s) => s.is_empty(),
+            State::Json(Value::Null) => true,
+            State::Json(Value::Object(m)) => m.is_empty(),
+            State::Json(Value::Array(a)) => a.is_empty(),
+            State::Json(_) => false,
+        }
+    }
+
     /// The text the model reads: the string, or canonical JSON.
     pub fn text(&self) -> String {
         match self {
@@ -428,6 +482,49 @@ impl Question {
             _ => None,
         }
     }
+
+    /// The contract of a question whose instructions are its input (a
+    /// state-less request, DESIGN A19.1/A19.4): `{type, input:
+    /// "instructions", criteria?}` — the instructions are data, not part of
+    /// it. For a choice its sha is
+    /// [`crate::manifest::stateless_contract_sha256`].
+    pub fn stateless_contract(&self) -> Value {
+        let mut m = Map::new();
+        m.insert("type".into(), Value::String(self.kind.as_str().into()));
+        m.insert(
+            "input".into(),
+            Value::String(crate::manifest::INPUT_INSTRUCTIONS.into()),
+        );
+        if let Some(c) = &self.criteria {
+            m.insert("criteria".into(), c.clone());
+        }
+        Value::Object(m)
+    }
+
+    /// [`Question::contract_sha256`], or the state-less contract's sha when
+    /// the question's instructions are its input (`reads_instructions`).
+    pub fn contract_sha256_as(&self, reads_instructions: bool) -> Option<String> {
+        if !reads_instructions {
+            return self.contract_sha256();
+        }
+        match (&self.kind, &self.criteria) {
+            (QuestionKind::Choice, Some(Value::Object(c))) => {
+                Some(crate::manifest::stateless_contract_sha256(c))
+            }
+            _ => None,
+        }
+    }
+
+    /// The instructions as the text a model reads: a string as is, an object
+    /// or array as its canonical JSON; `None` when null or empty (DESIGN A19).
+    pub fn instructions_text(&self) -> Option<String> {
+        let t = match &self.instructions {
+            Value::Null => return None,
+            Value::String(s) => s.clone(),
+            other => canonical::to_string(other),
+        };
+        (!t.is_empty()).then_some(t)
+    }
 }
 
 /// The policy profile (spec §4.7b).
@@ -493,6 +590,32 @@ impl DecisionRequest {
     pub fn question(&self, id: &str) -> Option<&Question> {
         self.questions.iter().find(|q| q.id == id)
     }
+
+    /// The state is empty (`""`, `{}`, `[]`, `null`): the request is
+    /// state-less (DESIGN A19).
+    pub fn is_stateless(&self) -> bool {
+        self.state.is_empty()
+    }
+
+    /// Whether the local model reads `q`'s instructions instead of the
+    /// state: a state-less request and instructions that are not empty. A
+    /// question of a state-less request without instructions (the System One
+    /// dialect allows none) reads the state's text as before.
+    pub fn reads_instructions(&self, q: &Question) -> bool {
+        self.is_stateless() && q.instructions_text().is_some()
+    }
+
+    /// The text the local model reads for `q` (DESIGN A19): its instructions
+    /// when [`DecisionRequest::reads_instructions`], else the state's text
+    /// ([`DecisionRequest::state_text`]) — always so for a non-empty state.
+    pub fn input_text(&self, q: &Question) -> String {
+        if self.is_stateless()
+            && let Some(t) = q.instructions_text()
+        {
+            return t;
+        }
+        self.state_text.clone()
+    }
 }
 
 fn type_name(v: &Value) -> &'static str {
@@ -525,8 +648,9 @@ fn check_description(field: &str, v: &Value, allow_null: bool) -> Result<(), Api
         }
     };
     if bytes > MAX_DESCRIPTION_BYTES {
-        return Err(ApiError::invalid_field(
-            field,
+        return Err(ApiError::capacity(
+            Reason::InvalidRequest,
+            Some(field),
             format!("{field} is {bytes} bytes (at most {MAX_DESCRIPTION_BYTES})"),
         ));
     }
@@ -608,7 +732,17 @@ fn parse_question(id: &str, v: &Value, dialect: RequestDialect) -> Result<Questi
                     ),
                 ));
             };
-            if !(MIN_CHOICE_OPTIONS..=MAX_CHOICE_OPTIONS).contains(&m.len()) {
+            if m.len() > MAX_CHOICE_OPTIONS {
+                return Err(ApiError::capacity(
+                    Reason::InvalidRequest,
+                    Some(&cfield),
+                    format!(
+                        "a choice has {MIN_CHOICE_OPTIONS}..{MAX_CHOICE_OPTIONS} options per choice, {cfield} has {}",
+                        m.len()
+                    ),
+                ));
+            }
+            if m.len() < MIN_CHOICE_OPTIONS {
                 return Err(ApiError::invalid_field(
                     &cfield,
                     format!(
@@ -869,8 +1003,9 @@ fn parse_request_dialect(
     dialect: RequestDialect,
 ) -> Result<DecisionRequest, ApiError> {
     if body.len() > limits.body_bytes {
-        return Err(ApiError::new(
+        return Err(ApiError::capacity(
             Reason::PayloadTooLarge,
+            None,
             format!(
                 "request body is {} bytes (at most {})",
                 body.len(),
@@ -930,15 +1065,11 @@ fn parse_request_dialect(
         (RequestDialect::SystemOne, None) => {
             return Err(ApiError::invalid_field("state", "state is required"));
         }
-        (RequestDialect::Cortiq, Some(Value::String(s))) if !s.is_empty() => State::Text(s.clone()),
-        (RequestDialect::Cortiq, Some(v @ Value::Object(m))) if !m.is_empty() => {
+        // An empty string, object or array, or null, is a state-less request
+        // (DESIGN A19): each question's instructions are its input.
+        (RequestDialect::Cortiq, Some(Value::String(s))) => State::Text(s.clone()),
+        (RequestDialect::Cortiq, Some(v @ (Value::Object(_) | Value::Array(_) | Value::Null))) => {
             State::Json(v.clone())
-        }
-        (RequestDialect::Cortiq, Some(v @ Value::Array(a))) if !a.is_empty() => {
-            State::Json(v.clone())
-        }
-        (RequestDialect::Cortiq, Some(Value::String(_) | Value::Object(_) | Value::Array(_))) => {
-            return Err(ApiError::invalid_field("state", "state must not be empty"));
         }
         (RequestDialect::Cortiq, Some(other)) => {
             return Err(ApiError::invalid_field(
@@ -955,8 +1086,9 @@ fn parse_request_dialect(
     };
     let state_text = state.text();
     if state_text.len() > limits.state_bytes {
-        return Err(ApiError::invalid_field(
-            "state",
+        return Err(ApiError::capacity(
+            Reason::InvalidRequest,
+            Some("state"),
             format!(
                 "state is {} bytes (at most {})",
                 state_text.len(),
@@ -970,7 +1102,18 @@ fn parse_request_dialect(
             "questions must be an object {id: question}",
         ));
     };
-    if qs.is_empty() || qs.len() > limits.questions {
+    if qs.len() > limits.questions {
+        return Err(ApiError::capacity(
+            Reason::InvalidRequest,
+            Some("questions"),
+            format!(
+                "a request has 1..{} questions, this one {}",
+                limits.questions,
+                qs.len()
+            ),
+        ));
+    }
+    if qs.is_empty() {
         return Err(ApiError::invalid_field(
             "questions",
             format!(
@@ -990,6 +1133,26 @@ fn parse_request_dialect(
             ));
         }
         questions.push(parse_question(id, q, dialect)?);
+    }
+    // A state-less request's instructions are the text the model reads: the
+    // state's limit is theirs (DESIGN A19/A21).
+    if state.is_empty() {
+        for q in &questions {
+            if let Some(t) = q.instructions_text()
+                && t.len() > limits.state_bytes
+            {
+                let field = format!("questions.{}.instructions", q.id);
+                return Err(ApiError::capacity(
+                    Reason::InvalidRequest,
+                    Some(&field),
+                    format!(
+                        "{field} is {} bytes, the input of a state-less request (at most {})",
+                        t.len(),
+                        limits.state_bytes
+                    ),
+                ));
+            }
+        }
     }
     let cmf = parse_cmf(top.get("cmf"))?;
     Ok(DecisionRequest {

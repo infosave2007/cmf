@@ -39,7 +39,14 @@
 //!   materialize, verify and `decide --labels`; the limits (`auto_max_labels`,
 //!   `auto_max_skills`, `auto_skills: false`, score/noul, a key without
 //!   `learning_allowed`, `/v1/route` without `taxonomy_id`); the `auto_tau`
-//!   floor; a rare label quarantined, probability 0, still taught.
+//!   floor; a rare label quarantined, probability 0, still taught;
+//! * state-less requests (0.8.7): a `state: {}` contract whose text is in the
+//!   instructions is registered at its second sighting, learned, answered
+//!   locally over `/v1/decisions` and `/v1/systemone`, apart from the stateful
+//!   contract of the same criteria and kept over a restart; a one-off contract
+//!   is never registered; capacity errors carry the Decision Index marker
+//!   (422 on System One, the oracle's context overflow 422 everywhere, not a
+//!   stop); PII in state-less instructions is redacted for the oracle.
 //!
 //! Every request of [`Srv`] carries `x-cmf-extensions: 1`, so router-surface
 //! answers include the opt-in `cmf` diagnostics (the exact default router
@@ -4014,4 +4021,459 @@ async fn a_rare_label_stays_quarantined_and_keeps_teaching() {
         .map(|c| c["skill"].as_str().unwrap())
         .collect();
     assert_eq!(weather_of, [sup_id.as_str()], "{l2}");
+}
+
+// ------------------------------------------------------------------ state-less requests (0.8.7)
+
+/// The Decision Index kit's rendering of a classification item: `state: {}`
+/// and the item text inside the instructions after a fixed prefix — a short
+/// one here: the toy encoder reads 20 tokens, so a kit-length prefix would
+/// leave no room for the text.
+const SL_PREFIX: &str = "Q:\n";
+
+/// A state-less choice question over `labels` (the descriptions of
+/// [`choice`]) whose instructions carry `text`.
+fn sl_question(labels: &[&str], text: &str) -> Value {
+    let mut q = choice(labels);
+    q["instructions"] = json!(format!("{SL_PREFIX}{text}"));
+    q
+}
+
+/// The auto-skill id of the state-less contract over `labels` (DESIGN
+/// A19.1: the criteria alone).
+fn sl_auto_id(labels: &[&str]) -> String {
+    cortiq_decision::manifest::stateless_auto_skill_id(
+        choice(labels)["criteria"].as_object().unwrap(),
+    )
+}
+
+/// Decide `text` state-less (`state: {}`) under the criteria of `labels`.
+async fn ask_sl(srv: &Srv, labels: &[&str], text: &str) -> Resp {
+    let r = srv
+        .decide(&body(
+            json!({}),
+            json!({"task": sl_question(labels, text)}),
+            None,
+        ))
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    r
+}
+
+/// An oracle that answers the `task` choice by the keywords of its
+/// instructions (where a state-less request carries its text).
+fn instructions_keyword_mock() -> MockOracle {
+    MockOracle::start(|req| {
+        let text = asked_instructions(req);
+        answer_reply(
+            req,
+            move |_, opts| {
+                let words: Vec<&str> = text.split([' ', '\n']).collect();
+                for o in opts {
+                    if pool_of(o).is_some_and(|p| p.iter().any(|w| words.contains(w))) {
+                        return json!(o);
+                    }
+                }
+                json!(opts[0])
+            },
+            1e-5,
+        )
+    })
+}
+
+/// `n` texts of `label` whose state-less input (prefix + text) has cos φ_P
+/// < 0.995 to every text in `seen` (never a duplicate of the buffer). The
+/// shared prefix pulls the toy encoder's texts above the cache's 0.97, so
+/// the learning test runs without the cache (the state-less cache scope is
+/// pinned by the one-off test).
+fn sl_texts_apart(
+    label: &str,
+    n: usize,
+    seed: u64,
+    tag: &str,
+    seen: &mut Vec<Vec<f32>>,
+) -> Vec<String> {
+    let p = pool(label);
+    let mut rng = Lcg(seed);
+    let mut out: Vec<String> = Vec::new();
+    let mut tries = 0;
+    while out.len() < n {
+        tries += 1;
+        assert!(tries < 20_000, "could not find {n} '{label}' texts");
+        let mut words = Vec::new();
+        for _ in 0..3 + rng.below(2) {
+            words.push(p[rng.below(p.len())]);
+        }
+        words.push(FILLER[rng.below(FILLER.len())]);
+        let t = format!("{} {tag}{}", words.join(" "), out.len());
+        let f = phi_p(&format!("{SL_PREFIX}{t}"));
+        if seen.iter().all(|q| cos(q, &f) < 0.995) {
+            seen.push(f);
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// A state-less 3-label contract (DESIGN A19/A20): the oracle answers by the
+/// instructions' keywords; the contract is registered at its second sighting
+/// (the first answer is not learned), promoted, and then fresh state-less
+/// texts are answered locally — over `/v1/decisions` (the OpenRouter
+/// adapter's path) and `/v1/systemone`; the same criteria under a non-empty
+/// state are another contract; the auto-skill survives a restart.
+#[tokio::test]
+async fn a_stateless_contract_is_learned_from_its_instructions() {
+    let labels = ["food", "travel", "cruise"];
+    let sid = sl_auto_id(&labels);
+    assert_ne!(sid, auto_id(&labels));
+    let mut seen = Vec::new();
+    let lessons: Vec<(&str, Vec<String>)> = [
+        ("food", 241, "lf"),
+        ("travel", 243, "lv"),
+        ("cruise", 247, "lc"),
+    ]
+    .iter()
+    .map(|&(l, seed, tag)| (l, sl_texts_apart(l, 26, seed, tag, &mut seen)))
+    .collect();
+    let mock = instructions_keyword_mock();
+    let mut cfg = stand_config(&mock.url());
+    cfg.cache.enabled = false;
+    let jev = |o: &mut ServeOptions| o.jev_compatible = true;
+    let srv = Srv::open_with(
+        &toy().path,
+        tempfile::tempdir().unwrap(),
+        &cfg,
+        test_key(),
+        jev,
+    );
+
+    // First sighting: the oracle answers, nothing is registered or learned.
+    let r = ask_sl(&srv, &labels, &lessons[0].1[0]).await;
+    assert_eq!(r.action(), "oracle", "{}", r.text);
+    assert_eq!(r.q("task")["match"], "untrained");
+    assert_eq!(r.body["answers"]["task"]["choice"], "food");
+    let l = srv.learning().await;
+    assert_eq!(
+        (
+            l["auto_contracts"].as_u64(),
+            l["auto_sightings"].as_u64(),
+            l["auto_registered"].as_u64(),
+            l["examples_added"].as_u64()
+        ),
+        (Some(0), Some(1), Some(0), Some(0)),
+        "{l}"
+    );
+    // The second sighting registers it (the sighting is forgotten) and its
+    // answer is the first example.
+    let r = ask_sl(&srv, &labels, &lessons[1].1[0]).await;
+    assert_eq!(r.action(), "oracle", "{}", r.text);
+    let l = srv.learning().await;
+    assert_eq!(
+        (
+            l["auto_contracts"].as_u64(),
+            l["auto_sightings"].as_u64(),
+            l["auto_registered"].as_u64(),
+            l["examples_added"].as_u64()
+        ),
+        (Some(1), Some(0), Some(1), Some(1)),
+        "{l}"
+    );
+    assert_eq!(l["auto_skills"][0]["id"], sid);
+    assert_eq!(l["auto_skills"][0]["stateless"], true);
+
+    // Teach the rest, interleaved, until the promotion.
+    let mut taught = 2;
+    'teach: for i in 0..26 {
+        for (k, (label, ts)) in lessons.iter().enumerate() {
+            if i == 0 && k < 2 {
+                continue; // asked above
+            }
+            let t = &ts[i];
+            let r = ask_sl(&srv, &labels, t).await;
+            taught += 1;
+            assert!(
+                r.action() == "oracle" || r.action() == "cache",
+                "{}",
+                r.text
+            );
+            assert_eq!(r.body["answers"]["task"]["choice"], *label, "{}", r.text);
+            if srv.learning().await["promotions"].as_u64().unwrap_or(0) >= 1 {
+                break 'teach;
+            }
+        }
+    }
+    let l = srv.learning().await;
+    assert_eq!(l["promotions"], 1, "no promotion after {taught} texts: {l}");
+    let rec = latest(&l);
+    assert_eq!(
+        (rec["kind"].as_str(), rec["skill"].as_str()),
+        (Some("auto_start"), Some(sid.as_str()))
+    );
+    eprintln!(
+        "state-less auto_start after {taught} texts: {}",
+        rec["auto"]
+    );
+    let one = srv.get(&format!("/v1/skills/{sid}")).await.body;
+    assert_eq!(one["rubric"]["instructions"], Value::Null, "{one}");
+    assert_eq!(one["rubric"]["input"], "instructions", "{one}");
+    assert_eq!(one["rubric"]["criteria"]["food"], "about food");
+
+    // Fresh state-less texts: the auto-skill, exact, never certified, local
+    // at least once per label (A13: a young θ may still abstain and teach).
+    let mut fresh_seen = seen.clone();
+    let hits = mock.hits();
+    let mut escalated = 0;
+    for (label, seed, tag) in [
+        ("food", 251, "zf"),
+        ("travel", 253, "zv"),
+        ("cruise", 257, "zc"),
+    ] {
+        let mut local = 0;
+        for t in sl_texts_apart(label, 4, seed, tag, &mut fresh_seen) {
+            let r = ask_sl(&srv, &labels, &t).await;
+            assert_eq!(r.q("task")["match"], "exact", "{}", r.text);
+            assert_eq!(r.q("task")["skill"], sid);
+            assert_eq!(r.q("task")["certified"], false);
+            assert_eq!(r.body["answers"]["task"]["choice"], label, "{}", r.text);
+            match r.action() {
+                "local" => local += 1,
+                "oracle" => escalated += 1,
+                other => assert_eq!(other, "cache", "{}", r.text),
+            }
+        }
+        assert!(
+            local >= 1,
+            "no local answer of a fresh state-less {label} text"
+        );
+    }
+    assert_eq!(mock.hits() - hits, escalated);
+    // The System One surface: the same request shape, the same skill.
+    let food = sl_texts_apart("food", 1, 259, "so", &mut fresh_seen).remove(0);
+    let r = srv
+        .post(
+            "/v1/systemone",
+            None,
+            &json!({"state": {}, "questions": {"task": sl_question(&labels, &food)}}),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.body["answers"]["task"]["choice"], "food", "{}", r.text);
+
+    // The same criteria under a non-empty state: another contract (the
+    // stateful key includes the instructions), untrained, registered at its
+    // first sighting as in 0.8.6.
+    let r = ask(&srv, &sl_question(&labels, &food), &food).await;
+    assert_eq!(r.q("task")["match"], "untrained", "{}", r.text);
+    assert_eq!(r.action(), "oracle");
+    let l = srv.learning().await;
+    assert_eq!(l["auto_contracts"], 2, "{l}");
+    let r = ask(&srv, &choice(&labels), &food).await;
+    assert_eq!(r.q("task")["match"], "untrained", "{}", r.text);
+
+    // Restart from learn.log and the generation: the registry knows the
+    // contract is state-less, the skill is served.
+    let srv = srv.restart(&cfg);
+    let l = srv.learning().await;
+    let mine = l["auto_skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == sid)
+        .cloned()
+        .unwrap();
+    assert_eq!(mine["stateless"], true, "{l}");
+    let travel = sl_texts_apart("travel", 1, 261, "rs", &mut fresh_seen).remove(0);
+    let r = ask_sl(&srv, &labels, &travel).await;
+    assert_eq!(
+        (r.q("task")["match"].as_str(), r.q("task")["skill"].as_str()),
+        (Some("exact"), Some(sid.as_str()))
+    );
+}
+
+/// One-off state-less contracts (DESIGN A20) — a multiple-choice item whose
+/// option descriptions change with every question — are answered by the
+/// oracle and never registered: no `learn.log` record, no example, no slot of
+/// `auto_max_skills`; `auto_min_sightings: 1` registers at once.
+#[tokio::test]
+async fn a_one_off_stateless_contract_is_never_registered() {
+    let item = |i: usize, text: &str| {
+        json!({"type": "choice", "instructions": format!("Question: {text}\nAnswer:"),
+               "criteria": {"A": format!("answer {i}a"), "B": format!("answer {i}b"),
+                            "C": format!("answer {i}c"), "D": format!("answer {i}d")}})
+    };
+    let mock = keyword_mock();
+    let mut cfg = stand_config(&mock.url());
+    cfg.learning.auto_max_skills = 2;
+    let srv = Srv::new(&cfg);
+    let texts = distinct_texts("cruise", 5, 271, "oo", 0.97);
+    for (i, t) in texts.iter().enumerate() {
+        let r = srv
+            .decide(&body(json!({}), json!({"task": item(i, t)}), None))
+            .await;
+        assert_eq!(r.status, 200, "{}", r.text);
+        assert_eq!(r.action(), "oracle");
+        let l = srv.learning().await;
+        assert_eq!(
+            (
+                l["auto_contracts"].as_u64(),
+                l["auto_sightings"].as_u64(),
+                l["examples_added"].as_u64(),
+                l["auto_skipped"].as_u64()
+            ),
+            (Some(0), Some(i as u64 + 1), Some(0), Some(0)),
+            "{l}"
+        );
+    }
+    // The cache scope of a state-less question is its criteria with the φ
+    // of its instructions (DESIGN A19.4): the same item again is a hit.
+    let hits = mock.hits();
+    let r = srv
+        .decide(&body(json!([]), json!({"task": item(0, &texts[0])}), None))
+        .await;
+    assert_eq!(r.action(), "cache", "{}", r.text);
+    assert_eq!(mock.hits(), hits);
+    let log = std::fs::read(srv.state_root().join("learn.log")).unwrap_or_default();
+    let (recs, _) = cortiq_decision::buffer::read_records(&log);
+    assert!(
+        recs.iter().all(|r| !matches!(
+            r,
+            cortiq_decision::buffer::LogRecord::Contract(_)
+                | cortiq_decision::buffer::LogRecord::Example(_)
+        )),
+        "{recs:?}"
+    );
+    // With `auto_min_sightings: 1` the first sighting registers.
+    let mut once = cfg.clone();
+    once.learning.auto_min_sightings = 1;
+    let srv = Srv::new(&once);
+    let r = srv
+        .decide(&body(json!(""), json!({"task": item(9, &texts[0])}), None))
+        .await;
+    assert_eq!(r.action(), "oracle", "{}", r.text);
+    let l = srv.learning().await;
+    assert_eq!(
+        (l["auto_contracts"].as_u64(), l["examples_added"].as_u64()),
+        (Some(1), Some(1)),
+        "{l}"
+    );
+}
+
+/// Capacity errors (DESIGN A21): a state-less request whose instructions
+/// exceed the state limit is 422 with the Decision Index kit's marker on the
+/// System One surface and keeps 400 (with the marker) on `/v1/decisions`;
+/// an oracle that says the prompt does not fit its context answers 422 with
+/// the marker on both, and a run of such calls does not stop the oracle.
+#[tokio::test]
+async fn capacity_errors_carry_the_kit_marker() {
+    const MARKER: &str = "maximum context length";
+    let overflow = r#"{"error":{"message":"This endpoint's maximum context length is 163840 tokens. However, you requested about 200513 tokens (200449 of text input, 64 of tool input).","code":400}}"#;
+    let mock = MockOracle::start(move |_| raw_reply(400, overflow));
+    let mut cfg = stand_config(&mock.url());
+    cfg.limits.state_bytes = 1024;
+    cfg.oracle.max_errors = 2;
+    let jev = |o: &mut ServeOptions| o.jev_compatible = true;
+    let srv = Srv::open_with(
+        &toy().path,
+        tempfile::tempdir().unwrap(),
+        &cfg,
+        test_key(),
+        jev,
+    );
+    let big = "word ".repeat(400);
+    let q = sl_question(&["food", "travel"], &big);
+    let s1 = srv
+        .post(
+            "/v1/systemone",
+            None,
+            &json!({"state": {}, "questions": {"task": q.clone()}}),
+        )
+        .await;
+    assert_eq!(s1.status, 422, "{}", s1.text);
+    assert!(s1.text.contains(MARKER), "{}", s1.text);
+    assert_eq!(s1.body["error"]["code"], "INVALID_REQUEST");
+    let native = srv
+        .decide(&body(json!({}), json!({"task": q.clone()}), None))
+        .await;
+    assert_eq!(native.error(), (400, "INVALID_REQUEST".into()));
+    assert!(native.text.contains(MARKER), "{}", native.text);
+    assert_eq!(
+        native.body["error"]["metadata"]["details"]["capacity"],
+        true
+    );
+    // The same instructions under a state: no limit of theirs (as 0.8.6);
+    // the oracle then says the prompt is too long.
+    assert_eq!(mock.hits(), 0);
+    for i in 0..3 {
+        let r = srv
+            .decide(&body(
+                json!(format!("text {i}")),
+                json!({"task": q.clone()}),
+                None,
+            ))
+            .await;
+        assert_eq!(
+            r.error(),
+            (422, "UNSUPPORTED_QUESTION".into()),
+            "{}",
+            r.text
+        );
+        assert!(r.text.contains(MARKER), "{}", r.text);
+    }
+    assert_eq!(mock.hits(), 3);
+    let st = srv.oracle_state();
+    assert!(st.is_null() || st["stop_reason"].is_null(), "{st}");
+    assert_eq!(status(&srv).await, "ready");
+    let small = sl_question(&["food", "travel"], "a short one");
+    let s2 = srv
+        .post(
+            "/v1/systemone",
+            None,
+            &json!({"state": {}, "questions": {"task": small}}),
+        )
+        .await;
+    assert_eq!(s2.status, 422, "{}", s2.text);
+    assert!(s2.text.contains(MARKER), "{}", s2.text);
+    assert_eq!(s2.body["error"]["code"], "UNSUPPORTED_QUESTION");
+    let ledger = srv.ledger();
+    assert!(
+        ledger.iter().any(|l| l["error"] == "context_length"),
+        "{ledger:?}"
+    );
+}
+
+/// A state-less request's instructions are its input: PII in them is
+/// redacted in the oracle request like a state (DESIGN A19.3), unless the
+/// request allows its egress; the state `{}` is sent as is.
+#[tokio::test]
+async fn pii_in_stateless_instructions_is_redacted() {
+    let text = "cruise ship yacht harbor mail john.doe@example.com call +15551234567";
+    let mock = MockOracle::answering("travel");
+    let mut cfg = stand_config(&mock.url());
+    cfg.cache.enabled = false;
+    let srv = Srv::new(&cfg);
+    let q = sl_question(&["food", "travel"], text);
+    let r = srv
+        .decide(&body(json!({}), json!({"task": q.clone()}), None))
+        .await;
+    assert_eq!(r.action(), "oracle", "{}", r.text);
+    assert_eq!(r.flags(), json!(["pii_redacted"]));
+    let sent = &mock.requests()[0];
+    assert_eq!(sent.state(), json!({}));
+    assert_eq!(
+        asked_instructions(sent),
+        format!("{SL_PREFIX}cruise ship yacht harbor mail [REDACTED] call [REDACTED]")
+    );
+    assert!(!String::from_utf8_lossy(&sent.body).contains("john.doe"));
+    let r = srv
+        .decide(&body(
+            json!({}),
+            json!({"task": q}),
+            Some(json!({"allow_pii_egress": true})),
+        ))
+        .await;
+    assert_eq!(r.flags(), json!([]));
+    assert_eq!(
+        asked_instructions(&mock.requests()[1]),
+        format!("{SL_PREFIX}{text}")
+    );
 }

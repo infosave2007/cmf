@@ -17,9 +17,9 @@
 use cortiq_decision::answer::{self, Rounding};
 use cortiq_decision::canonical;
 use cortiq_decision::protocol::{
-    self, ApiError, CmfOptions, ModelRef, ModelRule, Profile, QuestionKind, Reason, RequestLimits,
-    SYSTEMONE_MODEL_ALIASES, SYSTEMONE_MODEL_ID, State, parse_feedback, parse_request,
-    parse_systemone_request, validate_decisions_response,
+    self, ApiError, CAPACITY_MARKER, CmfOptions, ModelRef, ModelRule, Profile, QuestionKind,
+    Reason, RequestLimits, SYSTEMONE_MODEL_ALIASES, SYSTEMONE_MODEL_ID, State, parse_feedback,
+    parse_request, parse_systemone_request, validate_decisions_response,
 };
 use serde_json::{Map, Value, json};
 use std::path::PathBuf;
@@ -331,16 +331,35 @@ fn cases() -> Vec<Case> {
             BAD,
         ),
         case("state missing", without(base(), &["state"]), BAD),
-        case("empty state", with(base(), &["state"], json!("")), BAD),
+        // An empty state is a state-less request since 0.8.7 (DESIGN A19:
+        // each question's instructions are its input), no longer a 400.
+        case("empty state", with(base(), &["state"], json!("")), OK),
         case(
             "empty object state",
             with(base(), &["state"], json!({})),
+            OK,
+        ),
+        case("empty array state", with(base(), &["state"], json!([])), OK),
+        case("null state", with(base(), &["state"], Value::Null), OK),
+        // A state-less request's instructions are its text: the state's
+        // limit is theirs; the same instructions under a state are not.
+        case(
+            "state-less instructions over 32 KiB",
+            with(
+                with(base(), &["state"], json!({})),
+                &["questions", "task", "instructions"],
+                json!("x".repeat(32 * 1024 + 1)),
+            ),
             BAD,
         ),
         case(
-            "empty array state",
-            with(base(), &["state"], json!([])),
-            BAD,
+            "instructions over 32 KiB under a state",
+            with(
+                base(),
+                &["questions", "task", "instructions"],
+                json!("x".repeat(32 * 1024 + 1)),
+            ),
+            OK,
         ),
         case("numeric state", with(base(), &["state"], json!(42)), BAD),
         case(
@@ -771,6 +790,120 @@ fn systemone_parser_keeps_the_native_boundary_strict() {
     )
     .unwrap_err();
     assert_eq!((e.status, e.reason), (400, Reason::InvalidRequest));
+}
+
+/// State-less detection (DESIGN A19): an empty state (`""`, `{}`, `[]`,
+/// `null`) on either surface makes each question read its instructions (a
+/// string as is, an object as canonical JSON); a question without
+/// instructions, and every question under a non-empty state, read the state.
+#[test]
+fn an_empty_state_makes_the_instructions_the_input() {
+    let limits = RequestLimits::default();
+    let body = |state: Value| {
+        json!({
+            "model": "cortiq/decision",
+            "state": state,
+            "questions": {
+                "a": {"type": "choice", "instructions": "Classify: my card is late", "criteria": {"A": "x", "B": "y"}},
+                "b": {"type": "choice", "instructions": {"text": "lost pin", "lang": "en"}, "criteria": {"A": "x", "B": "y"}},
+            },
+        })
+    };
+    for state in [json!(""), json!({}), json!([]), Value::Null] {
+        let bytes = serde_json::to_vec(&body(state.clone())).unwrap();
+        for r in [
+            parse_request(&bytes, &limits).unwrap(),
+            parse_systemone_request(&bytes, &limits).unwrap(),
+        ] {
+            assert!(r.state.is_empty() && r.is_stateless(), "{state}");
+            let (a, b) = (&r.questions[0], &r.questions[1]);
+            assert!(r.reads_instructions(a) && r.reads_instructions(b));
+            assert_eq!(r.input_text(a), "Classify: my card is late");
+            assert_eq!(r.input_text(b), r#"{"lang":"en","text":"lost pin"}"#);
+            // The state-less contract is the criteria alone.
+            assert_eq!(a.contract_sha256_as(true), b.contract_sha256_as(true));
+            assert_ne!(a.contract_sha256_as(true), a.contract_sha256());
+        }
+    }
+    for state in [json!("s"), json!({"t": ""}), json!([0])] {
+        let r = parse_request(&serde_json::to_vec(&body(state)).unwrap(), &limits).unwrap();
+        assert!(!r.is_stateless());
+        assert!(!r.reads_instructions(&r.questions[0]));
+        assert_eq!(r.input_text(&r.questions[0]), r.state_text);
+    }
+    // System One without instructions: the state's text, as before.
+    let bare = json!({"state": {}, "questions": {"n": {"type": "noul"}}});
+    let r = parse_systemone_request(&serde_json::to_vec(&bare).unwrap(), &limits).unwrap();
+    assert!(r.is_stateless() && !r.reads_instructions(&r.questions[0]));
+    assert_eq!(r.input_text(&r.questions[0]), "{}");
+}
+
+/// Capacity errors (DESIGN A21) keep their status and reason and carry the
+/// marker the Decision Index kit reads, with `details.capacity`.
+#[test]
+fn capacity_errors_carry_the_marker() {
+    let limits = RequestLimits {
+        body_bytes: 64 * 1024,
+        state_bytes: 64,
+        questions: 2,
+    };
+    let check = |v: Value, status: u16, reason: Reason| {
+        let e = parse_request(&serde_json::to_vec(&v).unwrap(), &limits).unwrap_err();
+        assert_eq!((e.status, e.reason), (status, reason), "{e}");
+        assert!(e.message.contains(CAPACITY_MARKER), "{e}");
+        assert!(e.is_capacity());
+        e
+    };
+    check(
+        with(base(), &["state"], json!("s".repeat(65))),
+        400,
+        Reason::InvalidRequest,
+    );
+    let e = check(
+        with(
+            with(base(), &["state"], json!({})),
+            &["questions", "task", "instructions"],
+            json!("i".repeat(65)),
+        ),
+        400,
+        Reason::InvalidRequest,
+    );
+    assert_eq!(e.details.unwrap()["field"], "questions.task.instructions");
+    check(
+        with(
+            base(),
+            &["questions", "task", "criteria", "opt0"],
+            json!("d".repeat(24_001)),
+        ),
+        400,
+        Reason::InvalidRequest,
+    );
+    check(
+        with(base(), &["questions", "task"], choice_q(256)),
+        400,
+        Reason::InvalidRequest,
+    );
+    let mut three = Map::new();
+    for i in 0..3 {
+        three.insert(format!("q{i}"), choice_q(2));
+    }
+    check(
+        with(base(), &["questions"], Value::Object(three)),
+        400,
+        Reason::InvalidRequest,
+    );
+    check(
+        with(base(), &["user"], json!("u".repeat(70 * 1024))),
+        413,
+        Reason::PayloadTooLarge,
+    );
+    // Not capacity: a malformed request keeps its plain message.
+    let e = parse_request(
+        &serde_json::to_vec(&with(base(), &["questions", "task"], choice_q(1))).unwrap(),
+        &limits,
+    )
+    .unwrap_err();
+    assert!(!e.is_capacity() && !e.message.contains(CAPACITY_MARKER));
 }
 
 #[test]
