@@ -24,6 +24,26 @@ pub struct GatedResidual {
     down: QTensor,
     up: QTensor,
     inject: Option<QTensor>,
+    /// Directory indices of the same three matrices: the device frame binds
+    /// the file bytes directly (f16/f32/q8_2f), the host path keeps the
+    /// dequantized `QTensor` views above.
+    down_idx: Option<usize>,
+    up_idx: Option<usize>,
+    inject_idx: Option<usize>,
+}
+
+/// Directory indices of every skeleton matrix the device frame binds for
+/// one layer. `None` when a tensor is missing from the file: the device
+/// path then stays off and the host path runs as before.
+struct LayerIdx {
+    /// qkv, z, a, b, out
+    gdn: Option<[usize; 5]>,
+    /// q, k, v, o, index_qk
+    qsa: Option<[usize; 5]>,
+    /// key_proj, value_proj
+    ple: Option<(usize, usize)>,
+    router: usize,
+    shared_gate: Option<usize>,
 }
 
 pub struct QsaWeights {
@@ -72,12 +92,19 @@ pub struct Layer {
     /// geometry as a routed expert but owns a pinned cache line, exactly as
     /// the established dynamic DSV4 pool does for its shared branch.
     shared_ids: Option<(usize, usize, usize)>,
+    idx: Option<LayerIdx>,
 }
 
 pub struct Globals {
     embed: QTensor,
     lm_head: QTensor,
     head_hc: GatedResidual,
+    lm_head_idx: Option<usize>,
+    /// The embedding table, re-read on the card by the MTP draft chain.
+    embed_idx: Option<usize>,
+    /// Every skeleton matrix the device frame reads, for the one-time
+    /// upload-and-pin before the expert arena takes the rest of the card.
+    skeleton_idxs: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -124,9 +151,52 @@ pub struct State {
     token_history: Vec<u32>,
     gpu_pool: Option<QwenGpuPool>,
     pub pos: usize,
+    /// Device-resident token path (`gpu_wgpu::qwen4`): the hyper state,
+    /// GDN/QSA/PLE caches and the frame scratch live on the card.
+    #[cfg(feature = "gpu")]
+    dev: Option<crate::gpu_wgpu::qwen4::Dev>,
+    /// Routed winners per layer from the previous token: the arena admits
+    /// experts one token late, because the route is decided on the card
+    /// and only read back with the cold list.
+    picks_prev: Vec<Vec<usize>>,
+    /// The device path refused once (setup or mid-token); stay on the host.
+    device_off: bool,
+    #[cfg(feature = "gpu")]
+    profile: Option<ExpertProfile>,
+    /// The next device forward is a verify window: snapshot the recurrent
+    /// state per token and return every token's logits in `window_logits`.
+    verify_window: bool,
+    window_logits: Vec<Vec<f32>>,
+    #[cfg(feature = "gpu")]
+    mtp: Option<MtpHead>,
+    mtp_tried: bool,
+}
+
+/// Summed wall time and count of expert uploads (every thread), for the
+/// per-token profile line: against the admission wall time it says whether
+/// the uploads overlap.
+pub(crate) static FILL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static FILL_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `CMF_QWEN_FILL_TRACE=1`: one line per admission (caller, layer, expert, slot).
+fn fill_trace() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("CMF_QWEN_FILL_TRACE").as_deref() == Ok("1"))
 }
 
 pub(crate) struct QwenGpuPool {
+    /// Layers whose remap is encoded in a frame that has not run yet: no
+    /// admission may evict their experts until that frame is done.
+    pub(crate) hold_layers: [Option<usize>; 2],
+    /// The last `staging` slots never enter the LRU: a frame's cold winners
+    /// are uploaded there (token slot × rank) and read by the next frame's
+    /// cold pass, so no admission or eviction can touch them in between.
+    staging_base: usize,
+    staging: usize,
+    /// The pinned staging ring admissions go through (flushed before every
+    /// frame submit); None uploads directly.
+    #[cfg(feature = "gpu")]
+    stager: Option<crate::gpu_wgpu::qwen4::Stager>,
     pub(crate) segment_slots: usize,
     floor: usize,
     n_experts: usize,
@@ -175,6 +245,17 @@ impl State {
             token_history: Vec::new(),
             gpu_pool: None,
             pos: 0,
+            #[cfg(feature = "gpu")]
+            dev: None,
+            picks_prev: vec![Vec::new(); n_layers],
+            device_off: false,
+            #[cfg(feature = "gpu")]
+            profile: None,
+            verify_window: false,
+            window_logits: Vec::new(),
+            #[cfg(feature = "gpu")]
+            mtp: None,
+            mtp_tried: false,
         }
     }
 
@@ -212,6 +293,423 @@ impl QwenGpuPool {
             "CMF_QWEN_EXPERT_SLOTS",
             "CMF_QWEN_FETCH_MAX",
             "CMF_QWEN_FETCH_MIN_SEEN",
+            None,
+            0,
+        )
+    }
+
+    /// The device token path sizes the arena itself: the skeleton is already
+    /// resident and pinned, so the slot count is whatever the budget still
+    /// holds after it and a cache reserve, not a percentage of the card.
+    pub(crate) fn create_explicit(
+        model: &Arc<CmfModel>,
+        inter: usize,
+        hidden: usize,
+        n_layers: usize,
+        n_experts: usize,
+        gu_q2: bool,
+        slots: usize,
+        staging: usize,
+    ) -> Option<Self> {
+        Self::create_with_policy(
+            model,
+            inter,
+            hidden,
+            n_layers,
+            n_experts,
+            gu_q2,
+            "CMF_QWEN_POOL_PCT",
+            75,
+            25,
+            85,
+            "CMF_QWEN_EXPERT_SLOTS",
+            "CMF_QWEN_FETCH_MAX",
+            "CMF_QWEN_FETCH_MIN_SEEN",
+            Some(slots),
+            staging,
+        )
+        .map(|mut pool| {
+            // admissions go through a pinned staging ring (CMF_QWEN_STAGE_MB
+            // per buffer, 0 = straight through the queue)
+            let stage_mb = std::env::var("CMF_QWEN_STAGE_MB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(256);
+            pool.stager = crate::gpu_wgpu::qwen4::Stager::new(stage_mb);
+            // A cold expert costs the host hundreds of microseconds; the
+            // device path admits on the first miss and fetches at least a
+            // handful per layer and token. Both stay operator-tunable.
+            pool.fetch_min_seen = std::env::var("CMF_QWEN_FETCH_MIN_SEEN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
+            pool.fetch_quota = std::env::var("CMF_QWEN_FETCH_MAX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(pool.fetch_quota.max(16));
+            pool
+        })
+    }
+
+    /// The MTP head's own bank: exactly `slots` slots (whole segments), no
+    /// carve-out — it is sized before the main arena, which leaves the
+    /// reserve.
+    pub(crate) fn create_exact(
+        model: &Arc<CmfModel>,
+        inter: usize,
+        hidden: usize,
+        n_experts: usize,
+        gu_q2: bool,
+        slots: usize,
+    ) -> Option<Self> {
+        Self::create_with_policy(
+            model,
+            inter,
+            hidden,
+            1,
+            n_experts,
+            gu_q2,
+            "CMF_QWEN_MTP_BANK",
+            75,
+            25,
+            85,
+            "CMF_QWEN_MTP_BANK_SLOTS",
+            "CMF_QWEN_FETCH_MAX",
+            "CMF_QWEN_FETCH_MIN_SEEN",
+            Some(slots),
+            0,
+        )
+    }
+
+    /// Bytes one routed expert occupies in the arena (gate + up + down).
+    pub(crate) fn per_expert_bytes(inter: usize, hidden: usize, gu_q2: bool) -> Option<usize> {
+        let gu = cortiq_core::quant::expected_nbytes(
+            if gu_q2 {
+                TensorDtype::Q2TiledP
+            } else {
+                TensorDtype::Q4TiledP
+            },
+            &[inter, hidden],
+        )?;
+        let dn = cortiq_core::quant::expected_nbytes(TensorDtype::Q4TiledP, &[hidden, inter])?;
+        2usize.checked_mul(gu)?.checked_add(dn)
+    }
+
+    /// A free slot, else the least recently used slot of a layer above its
+    /// working-set floor, else one of this layer's own, never a shared slot
+    /// or one of `protect` (this layer's current winners).
+    fn victim(&mut self, layer: usize, protect: &[usize]) -> Option<usize> {
+        if let Some(s) = self.free.pop() {
+            return Some(s);
+        }
+        let hold = self.hold_layers;
+        let eligible = |owner: (usize, usize)| {
+            owner.1 != usize::MAX
+                && (owner.0 != layer || !protect.contains(&owner.1))
+                // a frame already encoded against this layer's remap is in
+                // flight: its slots must stay what the remap says
+                && !hold.contains(&Some(owner.0))
+        };
+        // Preserve a per-layer working set. A plain global LRU collapses
+        // under the deterministic 0..47 layer sweep: late layers evict early
+        // ones immediately before their next visit (the same failure
+        // measured in DSV4).
+        self.owner
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, &o)| {
+                o.filter(|&x| {
+                    eligible(x) && self.occupancy.get(x.0).copied().unwrap_or(0) > self.floor
+                })
+                .map(|_| slot)
+            })
+            .min_by_key(|&slot| self.last[slot])
+            .or_else(|| {
+                self.owner
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, &o)| {
+                        o.filter(|&x| eligible(x) && x.0 == layer).map(|_| slot)
+                    })
+                    .min_by_key(|&slot| self.last[slot])
+            })
+            .or_else(|| {
+                self.owner
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(slot, &o)| o.filter(|&x| eligible(x)).map(|_| slot))
+                    .min_by_key(|&slot| self.last[slot])
+            })
+    }
+
+    /// Admit one expert right now (a routed winner the arena did not hold),
+    /// regardless of the admission hysteresis. Returns its slot.
+    pub(crate) fn admit_now(
+        &mut self,
+        model: &Arc<CmfModel>,
+        layer: usize,
+        expert: usize,
+        triples: &[(usize, usize, usize)],
+        protect: &[usize],
+    ) -> Option<u32> {
+        if expert >= self.n_experts || triples.len() != self.n_experts {
+            return None;
+        }
+        let key = layer * self.n_experts + expert;
+        if self.slot_for[key] != u32::MAX {
+            return Some(self.slot_for[key]);
+        }
+        let victim = self.victim(layer, protect)?;
+        if !self.fill_slot(model, victim, triples[expert]) {
+            if self.owner[victim].is_none() {
+                self.free.push(victim);
+            }
+            return None;
+        }
+        if let Some(old) = self.owner[victim] {
+            if old.1 == usize::MAX {
+                self.shared_slot[old.0] = u32::MAX;
+            } else {
+                self.slot_for[old.0 * self.n_experts + old.1] = u32::MAX;
+                self.occupancy[old.0] = self.occupancy[old.0].saturating_sub(1);
+            }
+        }
+        self.clock = self.clock.saturating_add(1);
+        self.owner[victim] = Some((layer, expert));
+        self.slot_for[key] = victim as u32;
+        self.occupancy[layer] += 1;
+        self.seen[key] = self.seen[key].max(1);
+        self.last[victim] = self.clock;
+        Some(victim as u32)
+    }
+
+    /// Upload one expert into `slot`: through the staging ring when there
+    /// is one with room, else straight through the queue.
+    #[cfg(feature = "gpu")]
+    fn fill_slot(&self, model: &Arc<CmfModel>, slot: usize, triple: (usize, usize, usize)) -> bool {
+        let t0 = std::time::Instant::now();
+        let ok = if let Some(st) = self.stager.as_ref()
+            && crate::gpu_wgpu::qwen4::stage_expert(st, model, slot, triple)
+        {
+            true
+        } else {
+            crate::gpu_wgpu::dsv4_global_slot_fill(model, slot, triple)
+        };
+        FILL_NS.fetch_add(
+            t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        FILL_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ok
+    }
+
+    /// Submit what the staging ring holds ahead of the next frame.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn flush_uploads(&mut self) {
+        if let Some(st) = self.stager.as_mut() {
+            st.flush();
+        }
+    }
+
+    /// Upload a frame's cold winners into the staging slots of token slot
+    /// `tok` (rank `j` each), outside the LRU. Returns the slot per expert,
+    /// `None` where the upload failed or no staging exists.
+    pub(crate) fn stage_cold(
+        &self,
+        model: &Arc<CmfModel>,
+        tok: usize,
+        experts: &[usize],
+        triples: &[(usize, usize, usize)],
+        top_k: usize,
+    ) -> Vec<Option<u32>> {
+        if self.staging == 0 || (tok + 1) * top_k > self.staging || triples.len() != self.n_experts
+        {
+            return vec![None; experts.len()];
+        }
+        let base = self.staging_base + tok * top_k;
+        if fill_trace() {
+            eprintln!("fill staging tok={tok} experts={experts:?}");
+        }
+        let jobs: Vec<(usize, usize)> = experts
+            .iter()
+            .enumerate()
+            .filter(|&(_, &e)| e < self.n_experts)
+            .map(|(j, &e)| (base + j, e))
+            .collect();
+        let me = &*self;
+        let ok: Vec<bool> = if jobs.len() <= 1 {
+            jobs.iter()
+                .map(|&(slot, e)| me.fill_slot(model, slot, triples[e]))
+                .collect()
+        } else {
+            std::thread::scope(|scope| {
+                let hs: Vec<_> = jobs
+                    .iter()
+                    .map(|&(slot, e)| {
+                        let model = model.clone();
+                        let triple = triples[e];
+                        scope.spawn(move || me.fill_slot(&model, slot, triple))
+                    })
+                    .collect();
+                hs.into_iter().map(|h| h.join().unwrap_or(false)).collect()
+            })
+        };
+        let mut out = vec![None; experts.len()];
+        let mut ji = 0;
+        for (j, &e) in experts.iter().enumerate() {
+            if e < self.n_experts {
+                if ok[ji] {
+                    out[j] = Some(jobs[ji].0 as u32);
+                }
+                ji += 1;
+            }
+        }
+        out
+    }
+
+    /// `admit_now` for a layer's whole cold list: slots are reserved in
+    /// order, the uploads (a 1.7 MB memcpy each) run on parallel threads.
+    /// Returns one slot per expert, `None` where the arena could not take it.
+    pub(crate) fn admit_many(
+        &mut self,
+        model: &Arc<CmfModel>,
+        layer: usize,
+        experts: &[usize],
+        triples: &[(usize, usize, usize)],
+        protect: &[usize],
+    ) -> Vec<Option<u32>> {
+        if triples.len() != self.n_experts {
+            return vec![None; experts.len()];
+        }
+        // phase 1: reserve
+        let mut plan: Vec<(usize, Option<(usize, usize)>)> = Vec::with_capacity(experts.len());
+        for &expert in experts {
+            if expert >= self.n_experts {
+                plan.push((expert, None));
+                continue;
+            }
+            let key = layer * self.n_experts + expert;
+            if self.slot_for[key] != u32::MAX {
+                plan.push((expert, Some((self.slot_for[key] as usize, usize::MAX))));
+                continue;
+            }
+            let Some(victim) = self.victim(layer, protect) else {
+                plan.push((expert, None));
+                continue;
+            };
+            // take the slot now so a later expert of this list cannot pick it
+            let old = self.owner[victim].take();
+            if let Some(old) = old {
+                if old.1 == usize::MAX {
+                    self.shared_slot[old.0] = u32::MAX;
+                } else {
+                    self.slot_for[old.0 * self.n_experts + old.1] = u32::MAX;
+                    self.occupancy[old.0] = self.occupancy[old.0].saturating_sub(1);
+                }
+            }
+            self.owner[victim] = Some((layer, expert));
+            self.slot_for[key] = victim as u32;
+            self.occupancy[layer] += 1;
+            self.seen[key] = self.seen[key].max(1);
+            self.clock = self.clock.saturating_add(1);
+            self.last[victim] = self.clock;
+            if fill_trace() {
+                eprintln!("fill cold layer={layer} expert={expert} slot={victim}");
+            }
+            plan.push((expert, Some((victim, expert))));
+        }
+        // phase 2: upload the new ones in parallel
+        let uploads: Vec<(usize, usize)> = plan
+            .iter()
+            .filter_map(|(_, p)| p.filter(|&(_, e)| e != usize::MAX))
+            .collect();
+        let me = &*self;
+        let results: Vec<bool> = if uploads.len() <= 1 {
+            uploads
+                .iter()
+                .map(|&(slot, e)| me.fill_slot(model, slot, triples[e]))
+                .collect()
+        } else {
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = uploads
+                    .iter()
+                    .map(|&(slot, e)| {
+                        let model = model.clone();
+                        let triple = triples[e];
+                        scope.spawn(move || me.fill_slot(&model, slot, triple))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or(false))
+                    .collect()
+            })
+        };
+        let mut failed: Vec<usize> = Vec::new();
+        for (&(slot, e), ok) in uploads.iter().zip(&results) {
+            if !ok {
+                // roll the reservation back: the slot holds nothing usable now
+                self.owner[slot] = None;
+                self.slot_for[layer * self.n_experts + e] = u32::MAX;
+                self.occupancy[layer] = self.occupancy[layer].saturating_sub(1);
+                self.free.push(slot);
+                failed.push(e);
+            }
+        }
+        plan.into_iter()
+            .map(|(expert, p)| match p {
+                Some((slot, _)) if !failed.contains(&expert) => Some(slot as u32),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Fill free slots with the given `(layer, expert)` pairs in order, the
+    /// hottest first, until the arena is full. Returns how many went in.
+    pub(crate) fn prefill(
+        &mut self,
+        model: &Arc<CmfModel>,
+        ranked: &[(usize, usize)],
+        triples: &[Vec<(usize, usize, usize)>],
+    ) -> usize {
+        let mut n = 0;
+        for &(layer, expert) in ranked {
+            if self.free.is_empty() {
+                break;
+            }
+            if layer >= triples.len() || expert >= self.n_experts {
+                continue;
+            }
+            let key = layer * self.n_experts + expert;
+            if self.slot_for[key] != u32::MAX {
+                continue;
+            }
+            let Some(&triple) = triples[layer].get(expert) else {
+                continue;
+            };
+            let Some(slot) = self.free.pop() else { break };
+            if !crate::gpu_wgpu::dsv4_global_slot_fill(model, slot, triple) {
+                self.free.push(slot);
+                break;
+            }
+            self.owner[slot] = Some((layer, expert));
+            self.slot_for[key] = slot as u32;
+            self.occupancy[layer] += 1;
+            self.seen[key] = self.seen[key].max(1);
+            self.clock = self.clock.saturating_add(1);
+            self.last[slot] = self.clock;
+            n += 1;
+        }
+        n
+    }
+
+    /// The live `(layer, expert) → slot` row and the layer's pinned shared
+    /// slot, without admitting anything.
+    pub(crate) fn remap_snapshot(&self, layer: usize) -> (Vec<u32>, u32) {
+        let base = layer * self.n_experts;
+        (
+            self.slot_for[base..base + self.n_experts].to_vec(),
+            self.shared_slot.get(layer).copied().unwrap_or(u32::MAX),
         )
     }
 
@@ -241,6 +739,8 @@ impl QwenGpuPool {
             "CMF_DSV41_EXPERT_SLOTS",
             "CMF_DSV41_FETCH_MAX",
             "CMF_DSV41_FETCH_MIN_SEEN",
+            None,
+            0,
         )
     }
 
@@ -273,6 +773,8 @@ impl QwenGpuPool {
             "CMF_GLM_EXPERT_SLOTS",
             "CMF_GLM_FETCH_MAX",
             "CMF_GLM_FETCH_MIN_SEEN",
+            None,
+            0,
         )
     }
 
@@ -290,6 +792,8 @@ impl QwenGpuPool {
         slots_env: &str,
         fetch_max_env: &'static str,
         fetch_min_env: &'static str,
+        explicit_slots: Option<usize>,
+        staging: usize,
     ) -> Option<Self> {
         if !crate::gpu_wgpu::dsv4_global_moe_supported() {
             return None;
@@ -344,15 +848,22 @@ impl QwenGpuPool {
         // recreating pod-7's physical OOM.  Qwen retains its established
         // operator-controlled slot override semantics.
         let bounded_override = pct_env == "CMF_GLM_POOL_PCT" || pct_env == "CMF_DSV41_POOL_PCT";
-        let requested = bounded_pool_slots(
-            std::env::var(slots_env).ok().as_deref(),
-            safe_requested,
-            bounded_override,
-        );
+        let requested = match explicit_slots {
+            Some(n) => n.max(1),
+            None => bounded_pool_slots(
+                std::env::var(slots_env).ok().as_deref(),
+                safe_requested,
+                bounded_override,
+            ),
+        };
         let (capacity, segment_slots) = if pct_env == "CMF_DSV41_POOL_PCT" {
             crate::gpu_wgpu::dsv4_global_moe_create_for_dsv41(
                 model, requested, inter, hidden, gu_q2,
             )?
+        } else if pct_env == "CMF_QWEN_MTP_BANK" {
+            // the draft head's bank: exactly its experts, no workspace
+            // carve-out (the main arena already left the card's reserve)
+            crate::gpu_wgpu::dsv4_global_moe_create_slots(model, requested, inter, hidden, gu_q2)?
         } else {
             // Generic Qwen/GLM/DSV4 callers keep the established S8 bank.
             crate::gpu_wgpu::dsv4_global_moe_create(model, requested, inter, hidden, gu_q2)?
@@ -390,9 +901,16 @@ impl QwenGpuPool {
                 if gu_q2 { "q2tp" } else { "q4tp" }
             );
         }
+        let staging = staging.min(capacity / 2);
+        let staging_base = capacity - staging;
         Some(Self {
+            hold_layers: [None, None],
+            staging_base,
+            staging,
+            #[cfg(feature = "gpu")]
+            stager: None,
             segment_slots,
-            floor: (capacity / n_layers.max(1)).max(2),
+            floor: (staging_base / n_layers.max(1)).max(2),
             n_experts,
             fetch_quota,
             fetch_min_seen,
@@ -403,7 +921,7 @@ impl QwenGpuPool {
             shared_slot: vec![u32::MAX; n_layers],
             seen: vec![0; n_layers.checked_mul(n_experts)?],
             seen_epoch: vec![0; n_layers.checked_mul(n_experts)?],
-            free: (0..capacity).rev().collect(),
+            free: (0..staging_base).rev().collect(),
             occupancy: vec![0; n_layers.max(1)],
             last: vec![0; capacity],
             clock: 0,
@@ -491,58 +1009,17 @@ impl QwenGpuPool {
             .ok()
             .and_then(|v| v.parse::<u16>().ok())
             .unwrap_or(self.fetch_min_seen);
-        let mut fetched = 0usize;
+        // phase 1: reserve a slot per prefetch (the bookkeeping is serial)
+        let mut plan: Vec<(usize, usize)> = Vec::new();
         for &expert in picks {
             let key = base + expert;
-            if self.slot_for[key] != u32::MAX || fetched >= quota || self.seen[key] < min_seen {
+            if self.slot_for[key] != u32::MAX || plan.len() >= quota || self.seen[key] < min_seen {
                 continue;
             }
-            let triple = *triples.get(expert)?;
-            let eligible = |owner: (usize, usize)| {
-                owner.1 != usize::MAX && (owner.0 != layer || !picks.contains(&owner.1))
-            };
-            let victim = self
-                .free
-                .pop()
-                .or_else(|| {
-                    // Preserve a per-layer working set. A plain global LRU
-                    // collapses under the deterministic 0..47 layer sweep:
-                    // late layers evict early ones immediately before their
-                    // next visit (the same failure measured in DSV4).
-                    self.owner
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(slot, &o)| {
-                            o.filter(|&x| {
-                                eligible(x)
-                                    && self.occupancy.get(x.0).copied().unwrap_or(0) > self.floor
-                            })
-                            .map(|_| slot)
-                        })
-                        .min_by_key(|&slot| self.last[slot])
-                })
-                .or_else(|| {
-                    self.owner
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(slot, &o)| {
-                            o.filter(|&x| eligible(x) && x.0 == layer).map(|_| slot)
-                        })
-                        .min_by_key(|&slot| self.last[slot])
-                })
-                .or_else(|| {
-                    self.owner
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(slot, &o)| o.filter(|&x| eligible(x)).map(|_| slot))
-                        .min_by_key(|&slot| self.last[slot])
-                })?;
-            if !crate::gpu_wgpu::dsv4_global_slot_fill(model, victim, triple) {
-                if self.owner[victim].is_none() {
-                    self.free.push(victim);
-                }
+            if triples.get(expert).is_none() {
                 return None;
             }
+            let victim = self.victim(layer, picks)?;
             if let Some(old) = self.owner[victim] {
                 if old.1 == usize::MAX {
                     self.shared_slot[old.0] = u32::MAX;
@@ -555,9 +1032,45 @@ impl QwenGpuPool {
             self.slot_for[key] = victim as u32;
             self.occupancy[layer] += 1;
             self.last[victim] = now;
-            fetched += 1;
+            if fill_trace() {
+                eprintln!(
+                    "fill prefetch layer={layer} expert={expert} slot={victim} seen={}",
+                    self.seen[key]
+                );
+            }
+            plan.push((victim, expert));
         }
-        if triples.len() != self.n_experts {
+        // phase 2: the uploads, in parallel (they were one after another:
+        // at a 12 GB budget that was the larger half of every token)
+        let me = &*self;
+        let ok: Vec<bool> = if plan.len() <= 1 {
+            plan.iter()
+                .map(|&(slot, e)| me.fill_slot(model, slot, triples[e]))
+                .collect()
+        } else {
+            std::thread::scope(|scope| {
+                let hs: Vec<_> = plan
+                    .iter()
+                    .map(|&(slot, e)| {
+                        let model = model.clone();
+                        let triple = triples[e];
+                        scope.spawn(move || me.fill_slot(&model, slot, triple))
+                    })
+                    .collect();
+                hs.into_iter().map(|h| h.join().unwrap_or(false)).collect()
+            })
+        };
+        let mut failed = false;
+        for (&(slot, e), ok) in plan.iter().zip(&ok) {
+            if !ok {
+                self.owner[slot] = None;
+                self.slot_for[base + e] = u32::MAX;
+                self.occupancy[layer] = self.occupancy[layer].saturating_sub(1);
+                self.free.push(slot);
+                failed = true;
+            }
+        }
+        if failed || triples.len() != self.n_experts {
             return None;
         }
         let remap = self.slot_for[base..base + self.n_experts].to_vec();
@@ -585,6 +1098,65 @@ fn load_hc(model: &Arc<CmfModel>, prefix: &str, inject: bool) -> Result<GatedRes
         inject: inject
             .then(|| t(model, &format!("{prefix}block_inject_weight.weight")))
             .transpose()?,
+        down_idx: model.tensor_index(&format!("{prefix}input_mix_weight_down.weight")),
+        up_idx: model.tensor_index(&format!("{prefix}input_mix_weight_up.weight")),
+        inject_idx: inject
+            .then(|| model.tensor_index(&format!("{prefix}block_inject_weight.weight")))
+            .flatten(),
+    })
+}
+
+impl GatedResidual {
+    fn idxs(&self) -> Vec<usize> {
+        let mut v = Vec::new();
+        v.extend(self.down_idx);
+        v.extend(self.up_idx);
+        v.extend(self.inject_idx);
+        v
+    }
+}
+
+/// Resolve the device frame's matrices for one layer by name.
+fn layer_idx(model: &CmfModel, p: &str, is_gdn: bool, has_ple: bool) -> Option<LayerIdx> {
+    let ix = |n: String| model.tensor_index(&n);
+    let gdn = if is_gdn {
+        let q = format!("{p}linear_attn.");
+        Some([
+            ix(format!("{q}in_proj_qkv.weight"))?,
+            ix(format!("{q}in_proj_z.weight"))?,
+            ix(format!("{q}in_proj_a.weight"))?,
+            ix(format!("{q}in_proj_b.weight"))?,
+            ix(format!("{q}out_proj.weight"))?,
+        ])
+    } else {
+        None
+    };
+    let qsa = if !is_gdn {
+        let q = format!("{p}self_attn.");
+        Some([
+            ix(format!("{q}q_proj.weight"))?,
+            ix(format!("{q}k_proj.weight"))?,
+            ix(format!("{q}v_proj.weight"))?,
+            ix(format!("{q}o_proj.weight"))?,
+            ix(format!("{q}indexer.index_qk_proj.weight"))?,
+        ])
+    } else {
+        None
+    };
+    let ple = if has_ple {
+        Some((
+            ix(format!("{p}ple.key_proj.weight"))?,
+            ix(format!("{p}ple.value_proj.weight"))?,
+        ))
+    } else {
+        None
+    };
+    Some(LayerIdx {
+        gdn,
+        qsa,
+        ple,
+        router: ix(format!("{p}mlp.gate.weight"))?,
+        shared_gate: ix(format!("{p}mlp.shared_expert_gate.weight")),
     })
 }
 
@@ -782,11 +1354,26 @@ pub fn load(
         return Err(err("unsupported QSA head grouping"));
     }
 
-    let globals = Globals {
-        embed: t(model, "model.embed_tokens.weight")?,
-        lm_head: t(model, "lm_head.weight")?,
-        head_hc: load_hc(model, "model.hyper_connection_mixer.", false)?,
-    };
+    let head_hc = load_hc(model, "model.hyper_connection_mixer.", false)?;
+    let lm_head_idx = model.tensor_index("lm_head.weight");
+    let embed_idx = model.tensor_index("model.embed_tokens.weight");
+    let mut skeleton_idxs: Vec<usize> = head_hc.idxs();
+    skeleton_idxs.extend(lm_head_idx);
+    // with an MTP sidecar the draft chain re-embeds on the card: the table
+    // joins the skeleton so the expert arena is sized around it
+    if std::env::var("CMF_QWEN_MTP").as_deref() != Ok("0")
+        && std::env::var("CMF_QWEN_MTP_DEVICE_DRAFT").as_deref() == Ok("1")
+    {
+        let side = cortiq_core::mtp_sidecar_path(&model.path);
+        if side != model.path && side.exists() {
+            skeleton_idxs.extend(embed_idx);
+        }
+    }
+    let globals_partial = (
+        t(model, "model.embed_tokens.weight")?,
+        t(model, "lm_head.weight")?,
+        head_hc,
+    );
     let mut layers = Vec::with_capacity(arch.num_layers);
     let mut ple_index = 0usize;
     for li in 0..arch.num_layers {
@@ -831,16 +1418,39 @@ pub fn load(
                 ))
             })
             .ok_or_else(|| err(format!("layer {li} shared expert is not mmap-backed")))?;
+        let attn_hc = load_hc(model, &format!("{p}attn_hyper_connection."), true)?;
+        let mlp_hc = load_hc(model, &format!("{p}mlp_hyper_connection."), true)?;
+        let idx = layer_idx(model, &p, matches!(mixer, Mixer::Gdn(_)), ple.is_some());
+        skeleton_idxs.extend(attn_hc.idxs());
+        skeleton_idxs.extend(mlp_hc.idxs());
+        if let Some(ix) = &idx {
+            skeleton_idxs.extend(ix.gdn.iter().flatten().copied());
+            skeleton_idxs.extend(ix.qsa.iter().flatten().copied());
+            if let Some((k, v)) = ix.ple {
+                skeleton_idxs.extend([k, v]);
+            }
+            skeleton_idxs.push(ix.router);
+            skeleton_idxs.extend(ix.shared_gate);
+        }
         layers.push(Layer {
-            attn_hc: load_hc(model, &format!("{p}attn_hyper_connection."), true)?,
-            mlp_hc: load_hc(model, &format!("{p}mlp_hyper_connection."), true)?,
+            attn_hc,
+            mlp_hc,
             mixer,
             moe,
             ple,
             expert_ids,
             shared_ids: Some(shared_ids),
+            idx,
         });
     }
+    let globals = Globals {
+        embed: globals_partial.0,
+        lm_head: globals_partial.1,
+        head_hc: globals_partial.2,
+        lm_head_idx,
+        embed_idx,
+        skeleton_idxs,
+    };
     let state = State::new(layers.len());
     Ok((globals, layers, cfg, state))
 }
@@ -975,7 +1585,21 @@ fn dump_values(label: &str, li: usize, position: usize, values: &[f32]) {
     );
 }
 
+/// `CMF_QWEN_DEVICE_TAP=<layer>`: the host path's intermediates of that
+/// layer, kept for the device path to compare against (check mode).
+static TAP: std::sync::Mutex<Vec<(String, usize, usize, Vec<f32>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn tap_layer() -> Option<usize> {
+    std::env::var("CMF_QWEN_DEVICE_TAP").ok()?.parse().ok()
+}
+
 fn observe(label: &str, li: usize, position: usize, values: &[f32]) {
+    if tap_layer() == Some(li) && position < 3 {
+        TAP.lock()
+            .unwrap()
+            .push((label.to_string(), li, position, values.to_vec()));
+    }
     trace_stats(label, li, position, values);
     dump_values(label, li, position, values);
 }
@@ -1439,6 +2063,21 @@ pub fn forward_token(
     logits: &mut Vec<f32>,
     want_logits: bool,
 ) {
+    #[cfg(feature = "gpu")]
+    if forward_token_device(
+        globals,
+        layers,
+        cfg,
+        state,
+        token_id,
+        position,
+        inv_freq,
+        pool,
+        logits,
+        want_logits,
+    ) {
+        return;
+    }
     let prof = std::env::var_os("CMF_QWEN_PROF").is_some();
     #[cfg(target_arch = "x86_64")]
     if position == 0
@@ -1604,6 +2243,1600 @@ pub fn forward_token(
             );
         }
     }
+}
+
+#[cfg(feature = "gpu")]
+fn device_geom(cfg: &Cfg, moe: &MoeFfn, gu_q2: bool) -> crate::gpu_wgpu::qwen4::Geom {
+    use crate::gpu_wgpu::qwen4::{GdnGeom, Geom};
+    Geom {
+        hidden: cfg.hidden,
+        hc: cfg.hc,
+        eps: cfg.eps as f32,
+        n_heads: cfg.n_heads,
+        n_kv_heads: cfg.n_kv_heads,
+        head_dim: cfg.head_dim,
+        rotary_dim: cfg.rotary_dim,
+        index_heads: cfg.index_heads,
+        index_dim: cfg.index_dim,
+        index_budget: cfg.index_budget,
+        compress_ratio: cfg.compress_ratio,
+        gdn: GdnGeom {
+            nv: cfg.gdn.num_v_heads,
+            nk: cfg.gdn.num_k_heads,
+            dk: cfg.gdn.key_head_dim,
+            dv: cfg.gdn.value_head_dim,
+            kk: cfg.gdn.conv_kernel,
+        },
+        ple_kernel: cfg.ple_kernel,
+        ple_dilation: cfg.ple_dilation,
+        top_k: moe.top_k,
+        n_experts: moe.experts.len(),
+        inter: moe.experts.first().map_or(0, |e| e.gate_proj.rows()),
+        gu_q2,
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn device_layer_w<'a>(
+    layer: &'a Layer,
+    ix: &LayerIdx,
+) -> Option<crate::gpu_wgpu::qwen4::LayerW<'a>> {
+    use crate::gpu_wgpu::qwen4::{HcW, LayerW, MixerW, PleW};
+    let hc = |g: &'a GatedResidual| -> Option<HcW<'a>> {
+        Some(HcW {
+            norm: &g.norm,
+            down: g.down_idx?,
+            up: g.up_idx?,
+            inject: g.inject_idx,
+        })
+    };
+    let mixer = match &layer.mixer {
+        Mixer::Gdn(w) => {
+            let [qkv, z, a, b, out] = ix.gdn?;
+            MixerW::Gdn {
+                qkv,
+                z,
+                a,
+                b,
+                out,
+                conv1d: &w.conv1d,
+                a_log: &w.a_log,
+                dt_bias: &w.dt_bias,
+                norm: &w.norm,
+            }
+        }
+        Mixer::Qsa(w) => {
+            let [q, k, v, o, index_qk] = ix.qsa?;
+            MixerW::Qsa {
+                q,
+                k,
+                v,
+                o,
+                index_qk,
+                q_norm: &w.q_norm,
+                k_norm: &w.k_norm,
+                iq_norm: &w.index_q_norm,
+                ik_norm: &w.index_k_norm,
+            }
+        }
+    };
+    let ple = match (&layer.ple, ix.ple) {
+        (Some(w), Some((key_proj, value_proj))) => Some(PleW {
+            key_proj,
+            value_proj,
+            norm_key: &w.norm_key,
+            norm_query: &w.norm_query,
+            norm_conv: &w.norm_conv,
+            conv: &w.conv,
+        }),
+        (None, None) => None,
+        _ => return None,
+    };
+    Some(LayerW {
+        attn_hc: hc(&layer.attn_hc)?,
+        mlp_hc: hc(&layer.mlp_hc)?,
+        mixer,
+        ple,
+        router: ix.router,
+        shared_gate: ix.shared_gate,
+    })
+}
+
+#[cfg(feature = "gpu")]
+#[allow(clippy::type_complexity)]
+static DEV_TAP: std::sync::Mutex<Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(feature = "gpu")]
+fn tap_compare(label: &str, host: &[f32], dev: &[f32]) {
+    let n = host.len().min(dev.len());
+    let mut max_abs = 0.0f32;
+    let mut at = 0usize;
+    let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+    for i in 0..n {
+        let d = (host[i] - dev[i]).abs();
+        if d > max_abs {
+            max_abs = d;
+            at = i;
+        }
+        dot += host[i] as f64 * dev[i] as f64;
+        na += host[i] as f64 * host[i] as f64;
+        nb += dev[i] as f64 * dev[i] as f64;
+    }
+    eprintln!(
+        "qwen4-tap {label:>10}: cos={:.6} max_abs={max_abs:.4} at {at} (host {:.4} dev {:.4}) |host|={:.3} |dev|={:.3} n={n}",
+        dot / (na.sqrt() * nb.sqrt()).max(1e-30),
+        host.get(at).copied().unwrap_or(0.0),
+        dev.get(at).copied().unwrap_or(0.0),
+        na.sqrt(),
+        nb.sqrt()
+    );
+}
+
+/// Routing hits per `(layer, expert)` observed by the device path, and the
+/// sidecar that carries them between runs (`CMF_QWEN_PROFILE`): a warm arena
+/// from the first token instead of a few hundred tokens of LRU learning.
+#[cfg(feature = "gpu")]
+struct ExpertProfile {
+    n_layers: usize,
+    n_experts: usize,
+    counts: Vec<u32>,
+    tokens: u64,
+}
+
+#[cfg(feature = "gpu")]
+impl ExpertProfile {
+    const MAGIC: &'static [u8; 8] = b"CMFQ4PF\0";
+
+    fn new(n_layers: usize, n_experts: usize) -> Self {
+        Self {
+            n_layers,
+            n_experts,
+            counts: vec![0; n_layers * n_experts],
+            tokens: 0,
+        }
+    }
+
+    fn load(path: &str, n_layers: usize, n_experts: usize) -> Option<Self> {
+        let bytes = std::fs::read(path).ok()?;
+        if bytes.len() < 24 || &bytes[..8] != Self::MAGIC {
+            return None;
+        }
+        let rd = |o: usize| u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+        let (nl, ne) = (rd(8) as usize, rd(16) as usize);
+        if nl != n_layers || ne != n_experts || bytes.len() < 32 + nl * ne * 4 {
+            return None;
+        }
+        let tokens = rd(24);
+        let counts = bytes[32..32 + nl * ne * 4]
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        Some(Self {
+            n_layers,
+            n_experts,
+            counts,
+            tokens,
+        })
+    }
+
+    fn save(&self, path: &str) {
+        let mut out = Vec::with_capacity(32 + self.counts.len() * 4);
+        out.extend_from_slice(Self::MAGIC);
+        out.extend_from_slice(&(self.n_layers as u64).to_le_bytes());
+        out.extend_from_slice(&(self.n_experts as u64).to_le_bytes());
+        out.extend_from_slice(&self.tokens.to_le_bytes());
+        for &c in &self.counts {
+            out.extend_from_slice(&c.to_le_bytes());
+        }
+        if let Err(e) = std::fs::write(path, out) {
+            tracing::warn!("expert profile not saved to {path}: {e}");
+        }
+    }
+
+    fn note(&mut self, layer: usize, picks: &[usize]) {
+        for &e in picks {
+            if let Some(c) = self.counts.get_mut(layer * self.n_experts + e) {
+                *c = c.saturating_add(1);
+            }
+        }
+    }
+
+    /// `(layer, expert)` pairs, hottest first, zero counts left out.
+    fn ranked(&self) -> Vec<(usize, usize)> {
+        let mut v: Vec<(u32, usize, usize)> = self
+            .counts
+            .iter()
+            .enumerate()
+            .filter(|&(_, &c)| c > 0)
+            .map(|(i, &c)| (c, i / self.n_experts, i % self.n_experts))
+            .collect();
+        v.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        v.into_iter().map(|(_, l, e)| (l, e)).collect()
+    }
+}
+
+/// Token-level profile of the device path (`CMF_QWEN_PROF`).
+#[cfg(feature = "gpu")]
+#[derive(Default)]
+struct DevProf {
+    encode: std::time::Duration,
+    wait: std::time::Duration,
+    cold_cpu: std::time::Duration,
+    admit: std::time::Duration,
+    head: std::time::Duration,
+    cold_experts: usize,
+    cold_dev: usize,
+    layers_with_cold: usize,
+    chains: usize,
+    aborted: usize,
+}
+
+/// The whole token on the card. Returns `false` when the device path is
+/// not available (the caller then runs the host path); a refusal after
+/// the first token of a sequence is reported once and turns the path off.
+/// Tokens one device frame carries; the prompt is fed in chunks of this many.
+#[cfg(feature = "gpu")]
+pub fn prefill_chunk() -> usize {
+    std::env::var("CMF_QWEN_PREFILL_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(crate::gpu_wgpu::qwen4::TMAX)
+        .clamp(1, crate::gpu_wgpu::qwen4::TMAX)
+}
+
+#[cfg(not(feature = "gpu"))]
+pub fn prefill_chunk() -> usize {
+    1
+}
+
+/// Several consecutive tokens (`ids` at `pos0..`), logits of the last one
+/// when `want_logits`. The device path runs them in one frame per layer;
+/// otherwise each token takes the host path.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_tokens(
+    globals: &Globals,
+    layers: &[Layer],
+    cfg: &Cfg,
+    state: &mut State,
+    ids: &[u32],
+    pos0: usize,
+    inv_freq: &[f32],
+    pool: Option<&Pool>,
+    logits: &mut Vec<f32>,
+    want_logits: bool,
+) {
+    #[cfg(feature = "gpu")]
+    if !ids.is_empty()
+        && ids.len() <= crate::gpu_wgpu::qwen4::TMAX
+        && forward_tokens_device(
+            globals,
+            layers,
+            cfg,
+            state,
+            ids,
+            pos0,
+            inv_freq,
+            pool,
+            logits,
+            want_logits,
+        )
+    {
+        return;
+    }
+    for (i, &id) in ids.iter().enumerate() {
+        let last = i + 1 == ids.len();
+        let mut lg = Vec::new();
+        forward_token(
+            globals,
+            layers,
+            cfg,
+            state,
+            id,
+            pos0 + i,
+            inv_freq,
+            pool,
+            &mut lg,
+            want_logits && last,
+        );
+        if last {
+            *logits = lg;
+        }
+    }
+}
+
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+fn forward_token_device(
+    globals: &Globals,
+    layers: &[Layer],
+    cfg: &Cfg,
+    state: &mut State,
+    token_id: u32,
+    position: usize,
+    inv_freq: &[f32],
+    pool: Option<&Pool>,
+    logits: &mut Vec<f32>,
+    want_logits: bool,
+) -> bool {
+    forward_tokens_device(
+        globals,
+        layers,
+        cfg,
+        state,
+        &[token_id],
+        position,
+        inv_freq,
+        pool,
+        logits,
+        want_logits,
+    )
+}
+
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+fn forward_tokens_device(
+    globals: &Globals,
+    layers: &[Layer],
+    cfg: &Cfg,
+    state: &mut State,
+    ids: &[u32],
+    pos0: usize,
+    inv_freq: &[f32],
+    pool: Option<&Pool>,
+    logits: &mut Vec<f32>,
+    want_logits: bool,
+) -> bool {
+    use crate::gpu_wgpu::qwen4 as q4;
+    let ntok = ids.len();
+    if ntok == 0 || ntok > q4::TMAX {
+        return false;
+    }
+    let position = pos0;
+    let token_id = ids[0];
+    if state.device_off
+        || std::env::var("CMF_QWEN_DEVICE").as_deref() == Ok("0")
+        || !crate::gpu::enabled_here()
+    {
+        return false;
+    }
+    fn off(state: &mut State, why: &str) -> bool {
+        if !state.device_off {
+            tracing::warn!("qwen4 device path off: {why}");
+            if std::env::var_os("CMF_QWEN_PROF").is_some() {
+                eprintln!("qwen4-device: off ({why})");
+            }
+        }
+        state.device_off = true;
+        false
+    }
+    if !q4::available() {
+        return off(state, "kernels or the global expert arena unavailable");
+    }
+    let Some(first) = layers.first() else {
+        return off(state, "no layers");
+    };
+    let Some(e0) = first.moe.experts.first() else {
+        return off(state, "no experts");
+    };
+    let Some(model) = e0.gate_proj.model_arc() else {
+        return off(state, "experts are not mmap-backed");
+    };
+    let gu_q2 = e0.gate_proj.model_dtype() == Some(TensorDtype::Q2TiledP);
+    if !gu_q2 && e0.gate_proj.model_dtype() != Some(TensorDtype::Q4TiledP) {
+        return off(state, "expert gate/up are neither q2tp nor q4tp");
+    }
+    if first.moe.router_sigmoid
+        || !first.moe.norm_topk_prob
+        || first.moe.route_tau.is_some()
+        || first.moe.mask.is_some()
+        || (first.moe.routed_scaling - 1.0).abs() > 1e-9
+    {
+        return off(state, "non-Qwen routing settings");
+    }
+    let g = device_geom(cfg, &first.moe, gu_q2);
+    let prof = std::env::var_os("CMF_QWEN_PROF").is_some();
+    let check = std::env::var("CMF_QWEN_DEVICE_CHECK").as_deref() == Ok("1");
+    let t_token = std::time::Instant::now();
+
+    // ── first use: device state, resident skeleton, the expert arena ──
+    if state.dev.is_none() {
+        if layers.iter().any(|l| l.idx.is_none()) || globals.lm_head_idx.is_none() {
+            return off(state, "skeleton tensors missing from the directory");
+        }
+        let kinds: Vec<(bool, bool)> = layers
+            .iter()
+            .map(|l| (matches!(l.mixer, Mixer::Gdn(_)), l.ple.is_some()))
+            .collect();
+        let Some(dev) = q4::Dev::new(model.uid(), &g, &kinds) else {
+            return off(state, "device state allocation refused");
+        };
+        let t0 = std::time::Instant::now();
+        let Some(bytes) = q4::prewarm(&model, &globals.skeleton_idxs) else {
+            return off(state, "skeleton does not fit the VRAM budget");
+        };
+        tracing::info!(
+            "qwen4 device: {} skeleton tensors resident ({} MB) in {:.2}s",
+            globals.skeleton_idxs.len(),
+            bytes >> 20,
+            t0.elapsed().as_secs_f64()
+        );
+        if prof {
+            eprintln!(
+                "qwen4-device: skeleton {} MB resident in {:.2}s",
+                bytes >> 20,
+                t0.elapsed().as_secs_f64()
+            );
+        }
+        state.dev = Some(dev);
+        state.picks_prev = vec![Vec::new(); layers.len()];
+    }
+    if state.gpu_pool.is_none() {
+        // The draft head's skeleton and its 512-expert bank come first, so
+        // the main arena is sized from what is left.
+        if state.mtp.is_none() && !state.mtp_tried {
+            state.mtp_tried = true;
+            state.mtp = MtpHead::load(&model, model.arch());
+            if let Some(head) = state.mtp.as_mut()
+                && let Err(why) = head.setup(&g, gu_q2)
+            {
+                tracing::warn!("qwen4 MTP off: {why}");
+                state.mtp = None;
+            }
+        }
+        let Some(budget) = q4::vram_budget() else {
+            return off(state, "no VRAM budget");
+        };
+        let resident = q4::resident_bytes();
+        let Some(per) = QwenGpuPool::per_expert_bytes(g.inter, g.hidden, gu_q2) else {
+            return off(state, "expert geometry");
+        };
+        let reserve_mb = std::env::var("CMF_QWEN_KV_RESERVE_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            // 768 MiB beside the allocator's own driver reserve covers the
+            // frame scratch and f32 K/V to ~16k context; raise it for longer
+            // sequences (`CMF_QWEN_KV_RESERVE_MB`), lower it for more experts.
+            .unwrap_or(768);
+        let free = budget
+            .saturating_sub(resident)
+            .saturating_sub(reserve_mb << 20);
+        let slots = (free / per as u64) as usize;
+        let n_layers = layers.len();
+        // staging for the cold passes: one slot per token slot and rank
+        let staging = q4::TMAX * g.top_k;
+        let Some(arena) = QwenGpuPool::create_explicit(
+            &model,
+            g.inter,
+            g.hidden,
+            n_layers,
+            g.n_experts,
+            gu_q2,
+            slots,
+            staging,
+        ) else {
+            return off(state, "expert arena allocation refused");
+        };
+        if prof {
+            eprintln!(
+                "qwen4-device: budget {} MB, skeleton resident {} MB, arena request {} slots ({} MB), got {} slots",
+                budget >> 20,
+                resident >> 20,
+                slots,
+                (slots as u64 * per as u64) >> 20,
+                arena.owner.len()
+            );
+        }
+        let (cap_slots, cap_staging) = (arena.staging_base, arena.staging);
+        state.gpu_pool = Some(arena);
+        let pinned = {
+            let arena = state.gpu_pool.as_mut().unwrap();
+            layers.iter().enumerate().all(|(li, l)| {
+                arena
+                    .ensure(&model, li, &[], &l.expert_ids, l.shared_ids)
+                    .is_some_and(|(_, s)| s != u32::MAX)
+            })
+        };
+        if !pinned {
+            return off(state, "shared expert could not be pinned");
+        }
+        let n_experts = g.n_experts;
+        let mut profile = std::env::var("CMF_QWEN_PROFILE")
+            .ok()
+            .and_then(|path| ExpertProfile::load(&path, layers.len(), n_experts));
+        if let Some(pr) = profile.as_ref() {
+            let ranked = pr.ranked();
+            let triples: Vec<Vec<(usize, usize, usize)>> =
+                layers.iter().map(|l| l.expert_ids.clone()).collect();
+            let t0 = std::time::Instant::now();
+            let n = state
+                .gpu_pool
+                .as_mut()
+                .map_or(0, |a| a.prefill(&model, &ranked, &triples));
+            tracing::info!(
+                "qwen4 device: arena prefilled with {n} of {} profiled experts ({} tokens of history) in {:.2}s",
+                ranked.len(),
+                pr.tokens,
+                t0.elapsed().as_secs_f64()
+            );
+            if prof {
+                eprintln!(
+                    "qwen4-device: arena prefilled with {n} of {} profiled experts in {:.2}s (capacity {} slots, {} staging)",
+                    ranked.len(),
+                    t0.elapsed().as_secs_f64(),
+                    cap_slots,
+                    cap_staging
+                );
+            }
+        }
+        if std::env::var_os("CMF_QWEN_PROFILE_SAVE").is_some() && profile.is_none() {
+            profile = Some(ExpertProfile::new(layers.len(), n_experts));
+        }
+        state.profile = profile;
+    }
+    if position == 0 || state.pos != position {
+        state.reset();
+        let ok = state.dev.as_mut().is_some_and(|d| d.reset());
+        if !ok {
+            return off(state, "device reset failed");
+        }
+    }
+    let dev = state.dev.as_mut().unwrap();
+    let arena = state.gpu_pool.as_mut().unwrap();
+
+    // ── the tokens ──
+    let mut pf = DevProf::default();
+    let cold_on_device = std::env::var("CMF_QWEN_COLD_DEVICE").as_deref() != Ok("0");
+    // Several tokens per frame rule the gated chain out (one frame per layer).
+    let chain_len = if ntok > 1 {
+        1
+    } else {
+        std::env::var("CMF_QWEN_CHAIN")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1)
+    };
+    let n = layers.len();
+    let top_k = g.top_k;
+    // a layer frame's readback: the cold lists of every token, then the
+    // MoE inputs of every token
+    let cs = q4::cold_stride(&g);
+    let hidden_bytes = cfg.hidden * 4;
+    let cold_part = (ntok * cs).div_ceil(16) * 16;
+    let frame_bytes = cold_part + (ntok * hidden_bytes).div_ceil(16) * 16;
+    let snapshot = state.verify_window;
+    if snapshot {
+        dev.ensure_snaps(&g, ntok);
+    }
+    let mut cold_vec: Vec<Option<Vec<f32>>> = vec![None; ntok];
+    let mut cold_slots: Vec<Vec<(u32, f32)>> = vec![Vec::with_capacity(top_k); ntok];
+    let mut failed: Option<&'static str> = None;
+    let head_hc = device_hc_w(&globals.head_hc);
+    let lm_head_idx = globals.lm_head_idx.unwrap_or(usize::MAX);
+    for (t, &id) in ids.iter().enumerate() {
+        let mut emb = vec![0.0f32; cfg.hidden];
+        if (id as usize) < globals.embed.rows() {
+            globals.embed.row_f32(id as usize, &mut emb);
+        }
+        dev.seed(t, &emb, cfg.hc);
+    }
+    // the PLE rows of every token of the chunk, against its own history
+    let mut hist: Vec<u32> = state.token_history.clone();
+    let ple_rows: Vec<Vec<Vec<f32>>> = layers
+        .iter()
+        .map(|l| match l.ple.as_ref() {
+            Some(pw) => {
+                let mut rows = Vec::with_capacity(ntok);
+                hist.truncate(state.token_history.len());
+                for &id in ids {
+                    rows.push(ple_embedding(pw, cfg, &hist, id));
+                    hist.push(id);
+                }
+                rows
+            }
+            None => Vec::new(),
+        })
+        .collect();
+    // Frames 0..n are the layers, frame n the head. A chain of frames goes
+    // out in one submission; its layers are gated on the card so that a
+    // cold expert in one of them leaves every later frame unexecuted, and
+    // the chain resumes after the miss once the arena admitted it.
+    let frames_total = if want_logits { n + 1 } else { n };
+    dev.gated = chain_len > 1;
+    let mut fi = 0usize;
+    let mut vocab_out = 0usize;
+    // Single-frame chains are encoded one frame ahead, while the card runs
+    // the current one: with one frame per chain the next chain always
+    // starts at the next frame, miss or not.
+    let mut prepared: Option<(wgpu::CommandEncoder, u64, Option<usize>, usize)> = None;
+    // the row stride of the head's logits in the stage (bytes)
+    let mut lstride_out = 0usize;
+    while fi < frames_total && failed.is_none() {
+        let hi = (fi + chain_len).min(frames_total);
+        let t0 = std::time::Instant::now();
+        let encode_chain = |lo: usize,
+                            hi: usize,
+                            dev: &mut q4::Dev,
+                            arena: &mut QwenGpuPool,
+                            picks_prev: &[Vec<usize>],
+                            pf: &mut DevProf,
+                            vocab_out: &mut usize|
+         -> Result<
+            (wgpu::CommandEncoder, u64, Option<usize>, usize),
+            &'static str,
+        > {
+            let mut enc = q4::new_encoder("qwen4-chain").ok_or("encoder")?;
+            let merge = q4::merge_guard(&enc);
+            // chain head: the previous frame's MoE output with its cold winners
+            if !q4::encode_pending(&mut enc, dev, &g, ntok) {
+                return Err("pending inject");
+            }
+            q4::pending_done(dev);
+            let mut stage_off = 0u64;
+            let mut logits_off = None;
+            let mut lstride = 0usize;
+            for f in lo..hi {
+                let inject_prev = f > lo;
+                if f == n {
+                    // the last position's final hyper state, for the MTP's next cell
+                    dev.keep_r(&mut enc, ntok - 1);
+                    let hw = head_hc.as_ref().ok_or("head hyper-connection indices")?;
+                    // logits of the chunk's last token; of every token in a
+                    // verify window
+                    let first = if snapshot { 0 } else { ntok - 1 };
+                    let (lb, vocab, ls) = q4::encode_head(
+                        &mut enc,
+                        dev,
+                        &model,
+                        &g,
+                        hw,
+                        lm_head_idx,
+                        inject_prev,
+                        ntok,
+                    )
+                    .ok_or("head frame declined")?;
+                    let bytes = ((ntok - first) * ls) as u64;
+                    q4::copy_to_stage(&mut enc, dev, &lb, (first * ls) as u64, stage_off, bytes);
+                    logits_off = Some(stage_off as usize);
+                    *vocab_out = vocab;
+                    lstride = ls;
+                    stage_off += bytes.div_ceil(16) * 16;
+                    continue;
+                }
+                let layer = &layers[f];
+                let ix = layer.idx.as_ref().ok_or("layer index")?;
+                let w = device_layer_w(layer, ix).ok_or("layer weights")?;
+                let ta = std::time::Instant::now();
+                let (remap, shared_slot) = match arena.ensure(
+                    &model,
+                    f,
+                    &picks_prev[f],
+                    &layer.expert_ids,
+                    layer.shared_ids,
+                ) {
+                    Some(r) => r,
+                    None => arena.remap_snapshot(f),
+                };
+                pf.admit += ta.elapsed();
+                if shared_slot == u32::MAX {
+                    return Err("shared expert slot");
+                }
+                let out = q4::encode_layer(
+                    &mut enc,
+                    dev,
+                    &model,
+                    &g,
+                    &w,
+                    f,
+                    pos0,
+                    ntok,
+                    inv_freq,
+                    &remap,
+                    shared_slot,
+                    &ple_rows[f],
+                    inject_prev,
+                    snapshot,
+                )
+                .ok_or("layer frame declined")?;
+                q4::copy_to_stage(&mut enc, dev, &out.cold, 0, stage_off, (ntok * cs) as u64);
+                q4::copy_to_stage(
+                    &mut enc,
+                    dev,
+                    &out.x2,
+                    0,
+                    stage_off + cold_part as u64,
+                    (ntok * hidden_bytes) as u64,
+                );
+                stage_off += frame_bytes as u64;
+            }
+            dev.arm_chain(lo, hi);
+            drop(merge);
+            Ok((enc, stage_off, logits_off, lstride))
+        };
+        let (enc, stage_off, logits_off, ls) = match prepared.take() {
+            Some(p) => p,
+            None => match encode_chain(
+                fi,
+                hi,
+                dev,
+                arena,
+                &state.picks_prev,
+                &mut pf,
+                &mut vocab_out,
+            ) {
+                Ok(r) => r,
+                Err(why) => {
+                    failed = Some(why);
+                    break;
+                }
+            },
+        };
+        if ls != 0 {
+            lstride_out = ls;
+        }
+        pf.encode += t0.elapsed();
+        // the chain head's pending inject gets the previous frame's cold data
+        if !q4::finalize_pending(dev, &g, ntok, &cold_vec, &cold_slots) {
+            failed = Some("finalize");
+            break;
+        }
+        let t0 = std::time::Instant::now();
+        // staged admissions land before the frame that reads their slots
+        arena.flush_uploads();
+        let Some(pend) = q4::submit_chain(dev, enc, stage_off) else {
+            failed = Some("submit");
+            break;
+        };
+        // one frame per chain: the next frame is encoded while this one runs
+        arena.hold_layers = [None, None];
+        if chain_len == 1 && hi < frames_total {
+            let te = std::time::Instant::now();
+            match encode_chain(
+                hi,
+                hi + 1,
+                dev,
+                arena,
+                &state.picks_prev,
+                &mut pf,
+                &mut vocab_out,
+            ) {
+                Ok(r) => prepared = Some(r),
+                Err(why) => {
+                    failed = Some(why);
+                    break;
+                }
+            }
+            pf.encode += te.elapsed();
+            // its remap is now fixed: the admissions below must not evict
+            // that layer's experts, nor this layer's own winners of the frame
+            arena.hold_layers = [(hi < n).then_some(hi), (fi < n).then_some(fi)];
+        }
+        let Some(bytes) = pend.wait() else {
+            failed = Some("readback");
+            break;
+        };
+        pf.wait += t0.elapsed();
+        pf.chains += 1;
+        // the first frame of the chain that routed to a cold expert
+        let mut miss_at: Option<usize> = None;
+        let mut off = 0usize;
+        'frames: for f in fi..hi {
+            if f == n {
+                break;
+            }
+            let layer = &layers[f];
+            dev.commit(f);
+            if let Ok(dir) = std::env::var("CMF_QWEN_DUMP_HYPER")
+                && let Some(rows) = q4::read_hyper(dev, ntok, cfg.hc * cfg.hidden)
+            {
+                let _ = std::fs::create_dir_all(&dir);
+                for (t, row) in rows.iter().enumerate() {
+                    let path = std::path::Path::new(&dir)
+                        .join(format!("pos{:05}_layer{f:02}.f32", pos0 + t));
+                    let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let _ = std::fs::write(path, bytes);
+                }
+            }
+            let mut any_cold_in_frame = false;
+            let frame_off = off;
+            off += frame_bytes;
+            for t in 0..ntok {
+                let w_off = frame_off + t * cs;
+                let words: Vec<u32> = bytes[w_off..w_off + 4 * top_k * 4]
+                    .chunks_exact(4)
+                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+                let x_off = frame_off + cold_part + t * hidden_bytes;
+                let picks: Vec<usize> = (0..top_k)
+                    .map(|j| words[2 * top_k + 2 * j])
+                    .filter(|&e| e != u32::MAX && (e as usize) < g.n_experts)
+                    .map(|e| e as usize)
+                    .collect();
+                if let Some(pr) = state.profile.as_mut() {
+                    pr.note(f, &picks);
+                }
+                if check && ntok == 1 && tap_layer() == Some(f) && position < 3 && f + 1 == hi {
+                    // the frame's scratch is still the layer's own: read it
+                    let bufs = q4::tap_bufs(dev, &g);
+                    let h = cfg.hidden;
+                    let parts: Vec<(&wgpu::Buffer, u64)> = vec![
+                        (&bufs[0], (h * 4) as u64),
+                        (&bufs[1], (h * 4) as u64),
+                        (&bufs[2], (h * 4) as u64),
+                        (&bufs[3], (h * 4) as u64),
+                        (&bufs[4], (cfg.hc * h * 4) as u64),
+                    ];
+                    if let Some(enc) = q4::new_encoder("qwen4-tap")
+                        && let Some(tb) = q4::submit_readback(enc, &parts)
+                    {
+                        let fl = |o: usize, cnt: usize| -> Vec<f32> {
+                            tb[o..o + cnt * 4]
+                                .chunks_exact(4)
+                                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                                .collect()
+                        };
+                        let al = |cnt: usize| ((cnt * 4) as u64).div_ceil(16) as usize * 16;
+                        let mut o = 0;
+                        let x = fl(o, h);
+                        o += al(h);
+                        let blk = fl(o, h);
+                        o += al(h);
+                        let x2v = fl(o, h);
+                        o += al(h);
+                        let mo = fl(o, h);
+                        o += al(h);
+                        let hyper = fl(o, cfg.hc * h);
+                        DEV_TAP
+                            .lock()
+                            .unwrap()
+                            .push((position, x, blk, x2v, mo, hyper));
+                    }
+                }
+                let any_cold = (0..top_k).any(|j| words[2 * j] != u32::MAX);
+                if t + 1 == ntok {
+                    state.picks_prev[f] = picks.clone();
+                }
+                cold_slots[t].clear();
+                cold_vec[t] = None;
+                if !any_cold {
+                    continue;
+                }
+                any_cold_in_frame = true;
+                // Cold winners: admitted to the arena right away and computed
+                // by the card at the head of the next chain; only what the
+                // arena cannot take is completed on the host.
+                let ta = std::time::Instant::now();
+                let x2: Vec<f32> = bytes[x_off..x_off + cfg.hidden * 4]
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+                let mut jobs: Vec<(&crate::pipeline::DenseFfn, f32)> = Vec::new();
+                let cold_list: Vec<(usize, f32)> = (0..top_k)
+                    .filter_map(|j| {
+                        let e = words[2 * j];
+                        (e != u32::MAX && (e as usize) < layer.moe.experts.len())
+                            .then(|| (e as usize, f32::from_bits(words[2 * j + 1])))
+                    })
+                    .collect();
+                let eids: Vec<usize> = cold_list.iter().map(|&(e, _)| e).collect();
+                // into the arena when it has room (the next token then finds
+                // them warm), the rest into this token slot's staging slots
+                let slots = if cold_on_device {
+                    let mut s = arena.admit_many(&model, f, &eids, &layer.expert_ids, &picks);
+                    if s.iter().any(Option::is_none) {
+                        let rest: Vec<usize> = eids
+                            .iter()
+                            .zip(&s)
+                            .filter(|(_, x)| x.is_none())
+                            .map(|(&e, _)| e)
+                            .collect();
+                        let mut staged = arena
+                            .stage_cold(&model, t, &rest, &layer.expert_ids, top_k)
+                            .into_iter();
+                        for x in s.iter_mut().filter(|x| x.is_none()) {
+                            *x = staged.next().flatten();
+                        }
+                    }
+                    s
+                } else {
+                    vec![None; eids.len()]
+                };
+                for (&(e, wgt), slot) in cold_list.iter().zip(slots) {
+                    match slot {
+                        Some(sl) => cold_slots[t].push((sl, wgt)),
+                        None => jobs.push((&layer.moe.experts[e], wgt)),
+                    }
+                }
+                pf.admit += ta.elapsed();
+                pf.cold_experts += cold_slots[t].len() + jobs.len();
+                pf.cold_dev += cold_slots[t].len();
+                if !jobs.is_empty() {
+                    let tc = std::time::Instant::now();
+                    cold_vec[t] = Some(crate::pipeline::moe_cold_experts_cpu(&jobs, &x2, pool));
+                    pf.cold_cpu += tc.elapsed();
+                }
+                if check
+                    && ntok == 1
+                    && tap_layer() == Some(f)
+                    && position < 3
+                    && let Some(cv) = cold_vec[t].as_ref()
+                    && let Some(last) = DEV_TAP.lock().unwrap().last_mut()
+                {
+                    for (m, c) in last.4.iter_mut().zip(cv) {
+                        *m += c;
+                    }
+                }
+            }
+            if any_cold_in_frame {
+                pf.layers_with_cold += 1;
+                miss_at = Some(f);
+                break 'frames;
+            }
+        }
+        match miss_at {
+            Some(j) => {
+                // frames after the miss did not run: the chain resumes there
+                dev.discard(j + 1, hi);
+                pf.aborted += hi - (j + 1);
+                fi = j + 1;
+            }
+            None => {
+                if let Some(lo) = logits_off {
+                    let stride = lstride_out;
+                    let read = |o: usize| -> Vec<f32> {
+                        bytes[o..o + vocab_out * 4]
+                            .chunks_exact(4)
+                            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                            .collect()
+                    };
+                    if snapshot {
+                        state.window_logits = (0..ntok).map(|t| read(lo + t * stride)).collect();
+                        *logits = state.window_logits.last().cloned().unwrap_or_default();
+                    } else {
+                        *logits = read(lo);
+                    }
+                }
+                fi = hi;
+            }
+        }
+    }
+    arena.flush_uploads();
+    if let Some(why) = failed {
+        return off(state, why);
+    }
+    // A token boundary never carries an injection: the next token reseeds
+    // the hyper state from its embedding. (A chain that ends with the head
+    // leaves the flag set by its layers; without this the next token's
+    // first chain would inject this token's last MoE output.)
+    dev.clear_pending();
+    if !want_logits {
+        logits.clear();
+    }
+    if !check {
+        state.token_history.extend_from_slice(ids);
+        state.pos = pos0 + ntok;
+    }
+    if let Some(d) = state.dev.as_mut() {
+        d.pos = pos0 + ntok;
+    }
+    if let (Some(pr), Ok(path)) = (
+        state.profile.as_mut(),
+        std::env::var("CMF_QWEN_PROFILE_SAVE"),
+    ) {
+        pr.tokens += ntok as u64;
+        if pr.tokens % 32 < ntok as u64 {
+            pr.save(&path);
+        }
+    }
+    if prof {
+        let fill_ns = FILL_NS.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let fill_n = FILL_N.swap(0, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "qwen4-device pos={position} ntok={ntok} total={:.1}ms encode={:.1}ms wait={:.1}ms cold_cpu={:.1}ms admit={:.1}ms chains={} aborted_frames={} cold={} experts ({} on device) in {} layers fills={fill_n} fill_sum={:.1}ms",
+            t_token.elapsed().as_secs_f64() * 1e3,
+            pf.encode.as_secs_f64() * 1e3,
+            pf.wait.as_secs_f64() * 1e3,
+            pf.cold_cpu.as_secs_f64() * 1e3,
+            pf.admit.as_secs_f64() * 1e3,
+            pf.chains,
+            pf.aborted,
+            pf.cold_experts,
+            pf.cold_dev,
+            pf.layers_with_cold,
+            fill_ns as f64 / 1e6,
+        );
+    }
+    if check && ntok == 1 {
+        // The host path keeps its own state; run it on every token (its
+        // caches must see the whole sequence) and compare the logits where
+        // both produced them.
+        let dev_logits = logits.clone();
+        let mut host = Vec::new();
+        state.device_off = true;
+        forward_token(
+            globals,
+            layers,
+            cfg,
+            state,
+            token_id,
+            position,
+            inv_freq,
+            pool,
+            &mut host,
+            want_logits,
+        );
+        state.device_off = false;
+        if let Some(tl) = tap_layer() {
+            let dev_taps = std::mem::take(&mut *DEV_TAP.lock().unwrap());
+            let host_taps = std::mem::take(&mut *TAP.lock().unwrap());
+            for (pos, x, blk, x2, mo, hyper) in &dev_taps {
+                let find = |lab: &str| {
+                    host_taps
+                        .iter()
+                        .find(|(l, li, p, _)| l == lab && *li == tl && p == pos)
+                        .map(|(_, _, _, v)| v.as_slice())
+                };
+                eprintln!("qwen4-tap layer {tl} pos {pos}:");
+                if let Some(h) = find("attn_in") {
+                    tap_compare("attn_in", h, x);
+                }
+                if let Some(h) = find("attn_out") {
+                    tap_compare("attn_out", h, blk);
+                }
+                if let Some(h) = find("post_attn") {
+                    tap_compare("post_attn", h, hyper);
+                }
+                if let Some(h) = find("moe_in") {
+                    tap_compare("moe_in", h, x2);
+                }
+                if let Some(h) = find("moe_out") {
+                    tap_compare("moe_res", h, mo);
+                }
+            }
+        }
+        if !want_logits {
+            return true;
+        }
+        let n = host.len().min(dev_logits.len());
+        let mut max_abs = 0.0f32;
+        let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+        for i in 0..n {
+            max_abs = max_abs.max((host[i] - dev_logits[i]).abs());
+            dot += host[i] as f64 * dev_logits[i] as f64;
+            na += host[i] as f64 * host[i] as f64;
+            nb += dev_logits[i] as f64 * dev_logits[i] as f64;
+        }
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |a, (i, &x)| {
+                    if x > a.1 { (i, x) } else { a }
+                })
+                .0
+        };
+        eprintln!(
+            "qwen4-check pos={position} cos={:.6} max_abs={max_abs:.4} argmax host={} dev={}",
+            dot / (na.sqrt() * nb.sqrt()).max(1e-30),
+            argmax(&host),
+            argmax(&dev_logits)
+        );
+        *logits = dev_logits;
+    }
+    true
+}
+
+#[cfg(feature = "gpu")]
+fn device_hc_w(g: &GatedResidual) -> Option<crate::gpu_wgpu::qwen4::HcW<'_>> {
+    Some(crate::gpu_wgpu::qwen4::HcW {
+        norm: &g.norm,
+        down: g.down_idx?,
+        up: g.up_idx?,
+        inject: g.inject_idx,
+    })
+}
+
+/// One speculative round's outcome, in the shape the generation loop
+/// consumes: the drafts the model confirmed, the logits the loop samples
+/// its own next token from, how many were drafted.
+#[cfg(feature = "gpu")]
+pub struct SpecRound {
+    pub accepted: Vec<u32>,
+    pub logits: Vec<f32>,
+    pub drafted: usize,
+}
+
+/// The Qwen3.8-Flash-Next multi-token-prediction head from the sidecar
+/// `<stem>.mtp.cmf`: one hyper-connected hybrid layer (QSA attention, its
+/// own 512 routed experts and shared expert) between a fused input and a
+/// final mixer, sharing the main model's embedding and lm_head.
+///
+///   e = fc_embedding(rms(embed(tok))·(1+w_e))
+///   h = fc_hidden(rms_{hc·hidden}(R)·(1+w_h)) per stream
+///   R' = h + e → attention HC → QSA → MLP HC → MoE → inject → mixer → head
+///
+/// Cell i pairs the main model's final hyper state at position i with the
+/// token at i+1 (rope position i) and predicts the token at i+2; its own
+/// state feeds the next draft of a chain. Drafts only propose: the verify
+/// window decides every emitted token.
+#[cfg(feature = "gpu")]
+pub struct MtpHead {
+    side: Arc<CmfModel>,
+    layer: Layer,
+    enorm: Vec<f32>,
+    hnorm: Vec<f32>,
+    fc_e: usize,
+    fc_h: usize,
+    mixer: GatedResidual,
+    skeleton: Vec<usize>,
+    dev: Option<crate::gpu_wgpu::qwen4::Dev>,
+    arena: Option<QwenGpuPool>,
+    pub k: usize,
+    pub drafted: u64,
+    pub accepted: u64,
+    pub rounds: u64,
+}
+
+#[cfg(feature = "gpu")]
+impl MtpHead {
+    /// Open the sidecar beside the main file, when there is one that fits.
+    pub fn load(main: &Arc<CmfModel>, arch: &ModelArch) -> Option<Self> {
+        if std::env::var("CMF_QWEN_MTP").as_deref() == Ok("0") {
+            return None;
+        }
+        let path = cortiq_core::mtp_sidecar_path(&main.path);
+        if path == main.path || !path.exists() {
+            return None;
+        }
+        let side = match CmfModel::open(&path) {
+            Ok(m) => Arc::new(m),
+            Err(e) => {
+                tracing::warn!("qwen4 MTP sidecar {}: {e}", path.display());
+                return None;
+            }
+        };
+        let sa = side.arch();
+        if sa.arch_name != arch.arch_name
+            || sa.hidden_size != arch.hidden_size
+            || sa.vocab_size != arch.vocab_size
+        {
+            tracing::warn!(
+                "qwen4 MTP sidecar {}: geometry differs from the backbone",
+                path.display()
+            );
+            return None;
+        }
+        let p = "model.mtp.layers.0.";
+        let build =
+            || -> Result<(Layer, GatedResidual, Vec<f32>, Vec<f32>, usize, usize), CmfError> {
+                let mixer = Mixer::Qsa(load_qsa(&side, &format!("{p}self_attn."))?);
+                let moe = match build_ffn_at(&side, sa, p, false, &Overlay::None)? {
+                    FfnKind::Moe(m) => m,
+                    _ => return Err(err("MTP layer is not MoE")),
+                };
+                let expert_ids: Vec<_> = moe
+                    .experts
+                    .iter()
+                    .map(|e| {
+                        Some((
+                            e.gate_proj.model_idx()?,
+                            e.up_proj.model_idx()?,
+                            e.down_proj.model_idx()?,
+                        ))
+                    })
+                    .collect::<Option<_>>()
+                    .ok_or_else(|| err("MTP experts are not mmap-backed"))?;
+                let shared_ids = moe
+                    .shared
+                    .as_ref()
+                    .and_then(|(e, _)| {
+                        Some((
+                            e.gate_proj.model_idx()?,
+                            e.up_proj.model_idx()?,
+                            e.down_proj.model_idx()?,
+                        ))
+                    })
+                    .ok_or_else(|| err("MTP shared expert is not mmap-backed"))?;
+                let attn_hc = load_hc(&side, &format!("{p}attn_hyper_connection."), true)?;
+                let mlp_hc = load_hc(&side, &format!("{p}mlp_hyper_connection."), true)?;
+                let idx = layer_idx(&side, p, false, false);
+                let layer = Layer {
+                    attn_hc,
+                    mlp_hc,
+                    mixer,
+                    moe,
+                    ple: None,
+                    expert_ids,
+                    shared_ids: Some(shared_ids),
+                    idx,
+                };
+                let mixer_hc = load_hc(&side, "model.mtp.hyper_connection_mixer.", false)?;
+                let enorm = f(&side, "model.mtp.enorm.weight")?;
+                let hnorm = f(&side, "model.mtp.hnorm.weight")?;
+                let fc_e = side
+                    .tensor_index("model.mtp.fc_embedding.weight")
+                    .ok_or_else(|| err("fc_embedding"))?;
+                let fc_h = side
+                    .tensor_index("model.mtp.fc_hidden.weight")
+                    .ok_or_else(|| err("fc_hidden"))?;
+                Ok((layer, mixer_hc, enorm, hnorm, fc_e, fc_h))
+            };
+        let (layer, mixer, enorm, hnorm, fc_e, fc_h) = match build() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("qwen4 MTP sidecar {}: {e}", path.display());
+                return None;
+            }
+        };
+        let ix = layer.idx.as_ref()?;
+        let mut skeleton: Vec<usize> = Vec::new();
+        skeleton.extend(layer.attn_hc.idxs());
+        skeleton.extend(layer.mlp_hc.idxs());
+        skeleton.extend(mixer.idxs());
+        skeleton.extend(ix.qsa.iter().flatten().copied());
+        skeleton.push(ix.router);
+        skeleton.extend(ix.shared_gate);
+        skeleton.extend([fc_e, fc_h]);
+        let k = std::env::var("CMF_QWEN_MTP_K")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(3)
+            .clamp(1, crate::gpu_wgpu::qwen4::TMAX - 1);
+        tracing::info!("qwen4 MTP: draft head from {} (k = {k})", path.display());
+        Some(Self {
+            side,
+            layer,
+            enorm,
+            hnorm,
+            fc_e,
+            fc_h,
+            mixer,
+            skeleton,
+            dev: None,
+            arena: None,
+            k,
+            drafted: 0,
+            accepted: 0,
+            rounds: 0,
+        })
+    }
+
+    /// Resident skeleton, all 512 experts in their own arena bank.
+    fn setup(&mut self, g: &crate::gpu_wgpu::qwen4::Geom, gu_q2: bool) -> Result<(), &'static str> {
+        use crate::gpu_wgpu::qwen4 as q4;
+        if self.dev.is_some() && self.arena.is_some() {
+            return Ok(());
+        }
+        let dev = q4::Dev::new(self.side.uid(), g, &[(false, false)]).ok_or("MTP device state")?;
+        q4::prewarm(&self.side, &self.skeleton).ok_or("MTP skeleton does not fit")?;
+        let n_exp = self.layer.moe.experts.len();
+        // whole segments of 8: the shared expert needs one slot beyond the 512
+        let mut arena =
+            QwenGpuPool::create_exact(&self.side, g.inter, g.hidden, n_exp, gu_q2, n_exp + 8)
+                .ok_or("MTP expert bank")?;
+        arena
+            .ensure(
+                &self.side,
+                0,
+                &[],
+                &self.layer.expert_ids,
+                self.layer.shared_ids,
+            )
+            .filter(|(_, s)| *s != u32::MAX)
+            .ok_or("MTP shared expert")?;
+        let all: Vec<(usize, usize)> = (0..n_exp).map(|e| (0, e)).collect();
+        let got = arena.prefill(
+            &self.side,
+            &all,
+            std::slice::from_ref(&self.layer.expert_ids),
+        );
+        if got < n_exp {
+            return Err("MTP experts do not all fit their bank");
+        }
+        self.dev = Some(dev);
+        self.arena = Some(arena);
+        Ok(())
+    }
+}
+
+/// One speculative round: `k` greedy drafts from the MTP head, verified in
+/// one batched forward of the main model (`all_ids[next_pos]` plus the
+/// drafts at `next_pos..`). Returns `None` when the device path or the
+/// head is unavailable; the caller then decodes plainly.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn spec_round(
+    globals: &Globals,
+    layers: &[Layer],
+    cfg: &Cfg,
+    state: &mut State,
+    next_pos: usize,
+    all_ids: &[u32],
+    inv_freq: &[f32],
+    pool: Option<&Pool>,
+) -> Option<SpecRound> {
+    use crate::gpu_wgpu::qwen4 as q4;
+    if state.device_off || state.dev.is_none() || next_pos == 0 || all_ids.len() != next_pos + 1 {
+        return None;
+    }
+    if state.mtp.is_none() && !state.mtp_tried {
+        state.mtp_tried = true;
+        let model = layers.first()?.moe.experts.first()?.gate_proj.model_arc()?;
+        state.mtp = MtpHead::load(&model, model.arch());
+    }
+    let first = layers.first()?;
+    let e0 = first.moe.experts.first()?;
+    let gu_q2 = e0.gate_proj.model_dtype() == Some(TensorDtype::Q2TiledP);
+    let g = device_geom(cfg, &first.moe, gu_q2);
+    let prof = std::env::var_os("CMF_QWEN_PROF").is_some();
+    let t_round = std::time::Instant::now();
+    // ── drafts ──
+    let (k, drafts) = {
+        let head = state.mtp.as_mut()?;
+        if let Err(why) = head.setup(&g, gu_q2) {
+            tracing::warn!("qwen4 MTP off: {why}");
+            state.mtp = None;
+            return None;
+        }
+        let k = head.k;
+        let mdev = head.dev.as_mut()?;
+        let arena = head.arena.as_mut()?;
+        let (remap, shared_slot) = arena.remap_snapshot(0);
+        let ix = head.layer.idx.as_ref()?;
+        let w = device_layer_w(&head.layer, ix)?;
+        let mixer_w = device_hc_w(&head.mixer)?;
+        let main_dev = state.dev.as_ref()?;
+        let main_model = e0.gate_proj.model_arc()?;
+        let lm_head = globals.lm_head_idx?;
+        let mut drafts: Vec<u32> = Vec::with_capacity(k);
+        let tok_in = all_ids[next_pos];
+        // ── the whole chain in one submit: each cell's argmax is re-embedded
+        // on the card for the next; the host reads k ids, not k×vocab logits ──
+        // opt-in: it pins the 0.6 GB embedding table, which costs the arena
+        // more than the host round trips cost the round
+        let device_chain = std::env::var("CMF_QWEN_MTP_DEVICE_DRAFT").as_deref() == Ok("1");
+        let mut chained = false;
+        if device_chain
+            && let Some(embed_idx) = globals.embed_idx
+            && let Some(ids_buf) = q4::draft_ids(tok_in)
+        {
+            let mut run = || -> Option<Vec<u32>> {
+                let mut enc = q4::new_encoder("qwen4-mtp-draft")?;
+                let merge = q4::merge_guard(&enc);
+                for j in 0..k {
+                    let cell = next_pos - 1 + j;
+                    // the cells share one submit: each gets its own frame salt
+                    // so its position uniforms and bind groups are its own
+                    let _salt = q4::frame_salt(j);
+                    let r = if j == 0 {
+                        q4::whole(&main_dev.r_last)
+                    } else {
+                        mdev.hyper(0)
+                    };
+                    q4::encode_draft_gather(
+                        &mut enc,
+                        mdev,
+                        &main_model,
+                        &g,
+                        embed_idx,
+                        &ids_buf,
+                        j,
+                    )?;
+                    if !q4::encode_mtp_input(
+                        &mut enc,
+                        mdev,
+                        &head.side,
+                        &g,
+                        None,
+                        &head.enorm,
+                        &head.hnorm,
+                        head.fc_e,
+                        head.fc_h,
+                        r,
+                    ) {
+                        return None;
+                    }
+                    q4::encode_layer(
+                        &mut enc,
+                        mdev,
+                        &head.side,
+                        &g,
+                        &w,
+                        0,
+                        cell,
+                        1,
+                        inv_freq,
+                        &remap,
+                        shared_slot,
+                        &[],
+                        false,
+                        false,
+                    )?;
+                    if !q4::encode_pending(&mut enc, mdev, &g, 1)
+                        || !q4::finalize_pending(mdev, &g, 1, &[None], &[Vec::new()])
+                    {
+                        return None;
+                    }
+                    q4::pending_done(mdev);
+                    let (lb, vocab, _) = q4::encode_head_with(
+                        &mut enc,
+                        mdev,
+                        &head.side,
+                        &main_model,
+                        &g,
+                        &mixer_w,
+                        lm_head,
+                        false,
+                        1,
+                    )?;
+                    q4::encode_argmax(&mut enc, mdev, &lb, vocab, &ids_buf, j + 1)?;
+                }
+                q4::copy_to_stage(&mut enc, mdev, &ids_buf, 4, 0, (k * 4) as u64);
+                drop(merge);
+                let bytes = q4::submit_chain(mdev, enc, (k * 4) as u64)?.wait()?;
+                Some(
+                    bytes[..k * 4]
+                        .chunks_exact(4)
+                        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect(),
+                )
+            };
+            if let Some(d) = run() {
+                drafts = d;
+                chained = true;
+            }
+        }
+        if !chained {
+            // host round trip per cell (the embedding table is not on the card)
+            let mut tok_in = tok_in;
+            for j in 0..k {
+                let cell = next_pos - 1 + j;
+                let mut emb = vec![0.0f32; cfg.hidden];
+                if (tok_in as usize) < globals.embed.rows() {
+                    globals.embed.row_f32(tok_in as usize, &mut emb);
+                }
+                let r = if j == 0 {
+                    q4::whole(&main_dev.r_last)
+                } else {
+                    mdev.hyper(0)
+                };
+                let mut enc = q4::new_encoder("qwen4-mtp-draft")?;
+                let merge = q4::merge_guard(&enc);
+                if !q4::encode_mtp_input(
+                    &mut enc,
+                    mdev,
+                    &head.side,
+                    &g,
+                    Some(&emb),
+                    &head.enorm,
+                    &head.hnorm,
+                    head.fc_e,
+                    head.fc_h,
+                    r,
+                ) {
+                    return None;
+                }
+                q4::encode_layer(
+                    &mut enc,
+                    mdev,
+                    &head.side,
+                    &g,
+                    &w,
+                    0,
+                    cell,
+                    1,
+                    inv_freq,
+                    &remap,
+                    shared_slot,
+                    &[],
+                    false,
+                    false,
+                )?;
+                if !q4::encode_pending(&mut enc, mdev, &g, 1)
+                    || !q4::finalize_pending(mdev, &g, 1, &[None], &[Vec::new()])
+                {
+                    return None;
+                }
+                q4::pending_done(mdev);
+                let (lb, vocab, _) = q4::encode_head_with(
+                    &mut enc,
+                    mdev,
+                    &head.side,
+                    &main_model,
+                    &g,
+                    &mixer_w,
+                    lm_head,
+                    false,
+                    1,
+                )?;
+                q4::copy_to_stage(&mut enc, mdev, &lb, 0, 0, (vocab * 4) as u64);
+                drop(merge);
+                let bytes = q4::submit_chain(mdev, enc, (vocab * 4) as u64)?.wait()?;
+                let mut best = (0usize, f32::NEG_INFINITY);
+                for (i, ch) in bytes[..vocab * 4].chunks_exact(4).enumerate() {
+                    let v = f32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]);
+                    if v > best.1 {
+                        best = (i, v);
+                    }
+                }
+                drafts.push(best.0 as u32);
+                tok_in = best.0 as u32;
+            }
+        }
+        (k, drafts)
+    };
+    let t_draft = t_round.elapsed();
+    // ── verify: the window through the main model, every token's logits ──
+    let mut ids = Vec::with_capacity(k + 1);
+    ids.push(all_ids[next_pos]);
+    ids.extend_from_slice(&drafts);
+    state.verify_window = true;
+    let mut last_logits = Vec::new();
+    let ok = forward_tokens_device(
+        globals,
+        layers,
+        cfg,
+        state,
+        &ids,
+        next_pos,
+        inv_freq,
+        pool,
+        &mut last_logits,
+        true,
+    );
+    state.verify_window = false;
+    if !ok || state.window_logits.len() != k + 1 {
+        return None;
+    }
+    let argmax = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |a, (i, &x)| {
+                if x > a.1 { (i, x) } else { a }
+            })
+            .0
+    };
+    let mut a = 0usize;
+    while a < k && argmax(&state.window_logits[a]) == drafts[a] as usize {
+        a += 1;
+    }
+    let logits = std::mem::take(&mut state.window_logits).swap_remove(a);
+    // ── roll back what the rejected drafts changed ──
+    if a < k {
+        let dev = state.dev.as_mut()?;
+        if !dev.restore(&g, a + 1) {
+            return None;
+        }
+        let keep = state.token_history.len() - (k - a);
+        state.token_history.truncate(keep);
+        state.pos = next_pos + a + 1;
+        dev.pos = state.pos;
+        // the last accepted position's R for the next round's first cell
+        if let Some(mut enc) = q4::new_encoder("qwen4-keep-r") {
+            dev.keep_r(&mut enc, a);
+            q4::submit_only(enc);
+        }
+    }
+    if let Some(head) = state.mtp.as_mut() {
+        head.rounds += 1;
+        head.drafted += k as u64;
+        head.accepted += a as u64;
+        if prof {
+            eprintln!(
+                "qwen4-mtp round={} drafted={k} accepted={a} draft={:.1}ms total={:.1}ms (acceptance {:.1}%) ids={:?}",
+                head.rounds,
+                t_draft.as_secs_f64() * 1e3,
+                t_round.elapsed().as_secs_f64() * 1e3,
+                head.accepted as f64 * 100.0 / head.drafted.max(1) as f64,
+                drafts
+            );
+        }
+    }
+    Some(SpecRound {
+        accepted: drafts[..a].to_vec(),
+        logits,
+        drafted: k,
+    })
 }
 
 #[cfg(test)]
