@@ -25,8 +25,10 @@
 //!
 //! [`redact_value`] applies [`redact`] to every string leaf of a JSON state
 //! (object keys are kept). The cascade redacts when `oracle.redact_pii` is on and
-//! the request did not set `cmf.allow_pii_egress`; a redacted question carries
-//! the flag [`FLAG_PII_REDACTED`].
+//! the request did not set `cmf.allow_pii_egress` — the state and, since 0.8.8
+//! (DESIGN B4), each question's instructions and criteria (the option ids are
+//! keys, so they are kept); a redacted question carries the flag
+//! [`FLAG_PII_REDACTED`].
 
 use serde_json::{Map, Value};
 

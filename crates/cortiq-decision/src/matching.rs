@@ -32,10 +32,29 @@
 //! expected to abstain on novelty and keep teaching it. When exactly one data
 //! skill and any number of auto-skills hit the best kind, the data skill wins
 //! (no ambiguity); several data skills, or auto-skills alone, stay ambiguous.
+//!
+//! **Matching by descriptions** (0.8.8, DESIGN C2). A choice question whose
+//! option ids relate to no skill (untrained, not ambiguous — or, in a
+//! state-less request, an exact auto-skill contract: a data skill wins over
+//! an auto-skill as in the tie rule above) is related to a DATA skill
+//! through its option descriptions ([`match_descriptions`]): every
+//! description a string that normalizes ([`normalize_description`]: trimmed,
+//! lowercase, `_`, `-` and runs of whitespace → one space) to a distinct
+//! active label of the skill, the labels normalized alike — an id→label map
+//! ([`DescriptionMap`]). The relation is exact or subset exactly as with
+//! ids, and the answer is given in the question's option ids. Besides the
+//! mapped options at most one **none option** is allowed (a description
+//! that maps to no label and normalizes to a text starting with
+//! "out of scope" or "none of"): the question is then decided over every
+//! active label of the skill, and a text the gate rejects, or whose winner is
+//! not a listed label, is answered locally with the none option. The
+//! relation must hold for exactly one data skill (two → no description
+//! match); auto-skills are never matched this way. The match reports `"by":
+//! "descriptions"` next to its kind.
 
 use crate::protocol::{ApiError, Question, QuestionKind};
-use serde_json::json;
-use std::collections::HashSet;
+use serde_json::{Value, json};
+use std::collections::{HashMap, HashSet};
 
 /// The labels of one skill, as the matcher sees them.
 #[derive(Clone, Copy, Debug)]
@@ -103,6 +122,52 @@ impl MatchKind {
     }
 }
 
+/// The option ids of a question mapped to a data skill's labels through
+/// their descriptions (DESIGN C2).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DescriptionMap {
+    /// (option id, skill label) of the mapped options, in request order.
+    pub pairs: Vec<(String, String)>,
+    /// The none option ("out of scope…", "none of…"), when the question has
+    /// one: the answer to a text the gate rejects.
+    pub none: Option<String>,
+}
+
+impl DescriptionMap {
+    /// The skill label of option `id` (`None` for the none option).
+    pub fn label_of(&self, id: &str) -> Option<&str> {
+        self.pairs
+            .iter()
+            .find(|(i, _)| i == id)
+            .map(|(_, l)| l.as_str())
+    }
+
+    /// The option id of skill label `label`, when it is listed.
+    pub fn id_of(&self, label: &str) -> Option<&str> {
+        self.pairs
+            .iter()
+            .find(|(_, l)| l == label)
+            .map(|(i, _)| i.as_str())
+    }
+}
+
+/// A description or label as description matching compares them (DESIGN
+/// C2): trimmed, lowercase, `_` and `-` as spaces, every run of whitespace
+/// one space.
+pub fn normalize_description(s: &str) -> String {
+    let lower = s.to_lowercase();
+    let spaced: String = lower
+        .chars()
+        .map(|c| if c == '_' || c == '-' { ' ' } else { c })
+        .collect();
+    spaced.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A normalized description of the none option.
+fn is_none_description(norm: &str) -> bool {
+    norm.starts_with("out of scope") || norm.starts_with("none of")
+}
+
 /// The match of one question.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkillMatch {
@@ -120,6 +185,9 @@ pub struct SkillMatch {
     /// Untrained because several skills fit (the structural form of the
     /// reason: such a contract is not learned into an auto-skill, DESIGN A9).
     pub ambiguous: bool,
+    /// Matched through the option descriptions (DESIGN C2): the option ids'
+    /// labels and the none option. `None` for a match by ids or contract.
+    pub by_descriptions: Option<DescriptionMap>,
 }
 
 impl SkillMatch {
@@ -131,7 +199,46 @@ impl SkillMatch {
             unknown: Vec::new(),
             reason: Some(reason.into()),
             ambiguous: false,
+            by_descriptions: None,
         }
+    }
+
+    /// An exact match of `skill` by ids over all its `n` active labels (the
+    /// router's question).
+    pub fn exact(skill: &str, n: usize) -> Self {
+        Self {
+            kind: MatchKind::Exact,
+            skill: Some(skill.to_string()),
+            candidates: (0..n).collect(),
+            unknown: Vec::new(),
+            reason: None,
+            ambiguous: false,
+            by_descriptions: None,
+        }
+    }
+
+    /// The skill label an option id of the question names: the id itself,
+    /// or its mapped label under a description match (`None` for the none
+    /// option).
+    pub fn label_of<'a>(&'a self, id: &'a str) -> Option<&'a str> {
+        match &self.by_descriptions {
+            Some(d) => d.label_of(id),
+            None => Some(id),
+        }
+    }
+
+    /// The option id that names skill label `label` (the label itself
+    /// without a description match).
+    pub fn id_of<'a>(&'a self, label: &'a str) -> Option<&'a str> {
+        match &self.by_descriptions {
+            Some(d) => d.id_of(label),
+            None => Some(label),
+        }
+    }
+
+    /// The none option of a description match (DESIGN C2).
+    pub fn none_option(&self) -> Option<&str> {
+        self.by_descriptions.as_ref()?.none.as_deref()
     }
 
     /// Learnable into an auto-skill: untrained because no skill fits (not
@@ -197,6 +304,89 @@ fn relate(
         unknown,
         reason: None,
         ambiguous: false,
+        by_descriptions: None,
+    })
+}
+
+/// The description match of a choice question (DESIGN C2, see the module
+/// notes) against the data skills of `skills`; `None` when the descriptions
+/// map onto no data skill or onto several.
+pub fn match_descriptions(skills: &[SkillLabels<'_>], q: &Question) -> Option<SkillMatch> {
+    if q.kind != QuestionKind::Choice {
+        return None;
+    }
+    let criteria = q.criteria.as_ref()?.as_object()?;
+    let mut options: Vec<(&str, String)> = Vec::with_capacity(criteria.len());
+    for (id, d) in criteria {
+        let Value::String(d) = d else {
+            return None;
+        };
+        options.push((id.as_str(), normalize_description(d)));
+    }
+    let mut found: Option<SkillMatch> = None;
+    for s in skills
+        .iter()
+        .filter(|s| !s.is_auto() && !s.active.is_empty())
+    {
+        let Some(m) = relate_descriptions(&options, s) else {
+            continue;
+        };
+        if found.is_some() {
+            return None;
+        }
+        found = Some(m);
+    }
+    found
+}
+
+/// [`match_descriptions`] against one data skill.
+fn relate_descriptions(options: &[(&str, String)], s: &SkillLabels<'_>) -> Option<SkillMatch> {
+    // Normalized label → active index; a form two labels share maps to none.
+    let mut by_form: HashMap<String, Option<usize>> = HashMap::new();
+    for (i, l) in s.active.iter().enumerate() {
+        by_form
+            .entry(normalize_description(l))
+            .and_modify(|e| *e = None)
+            .or_insert(Some(i));
+    }
+    let mut pairs = Vec::new();
+    let mut used: HashSet<usize> = HashSet::new();
+    let mut none: Option<String> = None;
+    for (id, form) in options {
+        match by_form.get(form) {
+            Some(Some(i)) if used.insert(*i) => {
+                pairs.push((id.to_string(), s.active[*i].clone()));
+            }
+            None if is_none_description(form) && none.is_none() => {
+                none = Some(id.to_string());
+            }
+            _ => return None,
+        }
+    }
+    let covers = used.len() == s.active.len();
+    let kind = match (covers, none.is_some()) {
+        (true, _) => MatchKind::Exact,
+        (false, true) if !used.is_empty() => MatchKind::Subset,
+        (false, false) if used.len() >= 2 => MatchKind::Subset,
+        _ => return None,
+    };
+    // With a none option the text is decided over every label of the skill
+    // (a winner outside the listed ones is answered with the none option).
+    let candidates: Vec<usize> = if covers || none.is_some() {
+        (0..s.active.len()).collect()
+    } else {
+        let mut c: Vec<usize> = used.into_iter().collect();
+        c.sort_unstable();
+        c
+    };
+    Some(SkillMatch {
+        kind,
+        skill: Some(s.id.to_string()),
+        candidates,
+        unknown: Vec::new(),
+        reason: None,
+        ambiguous: false,
+        by_descriptions: Some(DescriptionMap { pairs, none }),
     })
 }
 
@@ -245,6 +435,21 @@ pub fn match_question(
     q: &Question,
     forced: Option<&str>,
 ) -> Result<SkillMatch, ApiError> {
+    match_question_as(skills, q, forced, false)
+}
+
+/// [`match_question`] for a question whose instructions may be its input
+/// (`reads_instructions`, a state-less request, DESIGN A19.2): data skills
+/// are matched by ids as always; an auto-skill only by the question's
+/// state-less contract sha then (criteria alone), and by its stateful one
+/// otherwise — the two never equal, so a state-less question never reaches
+/// a stateful auto-skill nor the reverse.
+pub fn match_question_as(
+    skills: &[SkillLabels<'_>],
+    q: &Question,
+    forced: Option<&str>,
+    reads_instructions: bool,
+) -> Result<SkillMatch, ApiError> {
     let pool: Vec<SkillLabels<'_>> = match forced {
         Some(id) => {
             let Some(s) = skills.iter().find(|s| s.id == id) else {
@@ -266,8 +471,21 @@ pub fn match_question(
         )));
     }
     let options = q.options();
-    let contract = q.contract_sha256();
-    let m = match_labels(&pool, &options, contract.as_deref());
+    let contract = q.contract_sha256_as(reads_instructions);
+    let mut m = match_labels(&pool, &options, contract.as_deref());
+    // No skill by ids (or, state-less, only an auto-skill's contract, which
+    // a data skill outranks): the descriptions may name a data skill's
+    // labels (DESIGN C2).
+    let auto_only = reads_instructions
+        && m.kind == MatchKind::Exact
+        && pool
+            .iter()
+            .any(|s| s.is_auto() && Some(s.id) == m.skill.as_deref());
+    if (m.is_foreign() || auto_only)
+        && let Some(d) = match_descriptions(&pool, q)
+    {
+        m = d;
+    }
     if m.kind == MatchKind::Untrained
         && let Some(id) = forced
     {
@@ -441,6 +659,196 @@ mod tests {
         assert_eq!(m.skill.as_deref(), Some("auto-1"));
         let m = match_question(&[auto, auto_u], &urgent, None).unwrap();
         assert_eq!(m.skill.as_deref(), Some("auto-2"));
+    }
+
+    /// A state-less question (DESIGN A19.2) reaches an auto-skill only
+    /// through its state-less contract (criteria alone, whatever the
+    /// instructions — they are its text); the same question read with a
+    /// state reaches only the stateful contract; data skills match by ids
+    /// either way.
+    #[test]
+    fn a_stateless_question_matches_only_the_stateless_contract() {
+        let all = labels(&["cruise", "food", "travel"]);
+        let a = question(
+            json!("Classify: I want pasta"),
+            &["food", "travel", "cruise"],
+        );
+        let b = question(
+            json!("Classify: a cheap ferry"),
+            &["food", "travel", "cruise"],
+        );
+        let sl = a.contract_sha256_as(true).unwrap();
+        assert_eq!(sl, b.contract_sha256_as(true).unwrap());
+        assert_ne!(sl, a.contract_sha256().unwrap());
+        assert_eq!(a.contract_sha256_as(false), a.contract_sha256());
+        let stateless = SkillLabels::auto("auto-s", &all, &all, &sl);
+        let sf = a.contract_sha256().unwrap();
+        let stateful = SkillLabels::auto("auto-f", &all, &all, &sf);
+        let m = match_question_as(&[stateless, stateful], &b, None, true).unwrap();
+        assert_eq!(
+            (m.kind, m.skill.as_deref()),
+            (MatchKind::Exact, Some("auto-s"))
+        );
+        let m = match_question_as(&[stateless, stateful], &a, None, false).unwrap();
+        assert_eq!(m.skill.as_deref(), Some("auto-f"));
+        assert!(
+            match_question_as(&[stateless], &a, None, false)
+                .unwrap()
+                .is_foreign()
+        );
+        assert!(
+            match_question_as(&[stateful], &b, None, true)
+                .unwrap()
+                .is_foreign()
+        );
+        let data = SkillLabels::data("d", &all);
+        let m = match_question_as(&[data], &b, None, true).unwrap();
+        assert_eq!((m.kind, m.skill.as_deref()), (MatchKind::Exact, Some("d")));
+    }
+
+    /// A question whose criteria map `ids` to `descriptions`.
+    fn described(instructions: &str, pairs: &[(&str, &str)]) -> Question {
+        let mut c = serde_json::Map::new();
+        for (id, d) in pairs {
+            c.insert(id.to_string(), json!(d));
+        }
+        Question {
+            id: "q1".into(),
+            kind: QuestionKind::Choice,
+            instructions: json!(instructions),
+            criteria: Some(Value::Object(c)),
+        }
+    }
+
+    /// Matching by descriptions (DESIGN C2): positional ids whose
+    /// descriptions are a data skill's labels (normalized) relate to it as
+    /// exact or subset; one none option makes it decided over every label;
+    /// two skills, a description outside the labels, two none options, a
+    /// repeated label or a non-string description are no description match;
+    /// auto-skills never match this way, and an id match keeps precedence.
+    #[test]
+    fn descriptions_name_a_data_skill() {
+        assert_eq!(
+            normalize_description("  Card_Arrival -  soon\t"),
+            "card arrival soon"
+        );
+        let bank = labels(&["card_arrival", "exchange_rate", "Refund_not_showing_up"]);
+        let shop = labels(&["exchange_rate", "food"]);
+        let skills = [
+            SkillLabels::data("bank", &bank),
+            SkillLabels::data("shop", &shop),
+        ];
+        // Exact, BANKING77-style (descriptions = label names).
+        let q = described(
+            "Classify:\nmy card",
+            &[
+                ("option_0", "Refund_not_showing_up"),
+                ("option_1", "card_arrival"),
+                ("option_2", "exchange_rate"),
+            ],
+        );
+        let m = match_question_as(&skills, &q, None, true).unwrap();
+        assert_eq!(
+            (m.kind, m.skill.as_deref()),
+            (MatchKind::Exact, Some("bank"))
+        );
+        assert_eq!(m.candidates, vec![0, 1, 2]);
+        let d = m.by_descriptions.as_ref().unwrap();
+        assert_eq!(d.label_of("option_0"), Some("Refund_not_showing_up"));
+        assert_eq!(m.id_of("card_arrival"), Some("option_1"));
+        assert_eq!(m.none_option(), None);
+        // CLINC-style: labels with spaces plus the none option.
+        let q = described(
+            "Classify:\nx",
+            &[
+                ("option_0", "card arrival"),
+                ("option_1", "exchange rate"),
+                ("option_2", "Out of scope: none of the listed intents"),
+                ("option_3", "refund not showing up"),
+            ],
+        );
+        let m = match_question_as(&skills, &q, None, true).unwrap();
+        assert_eq!(m.kind, MatchKind::Exact);
+        assert_eq!(m.none_option(), Some("option_2"));
+        assert_eq!(m.label_of("option_2"), None);
+        // A part of the labels and a none option: subset, decided over all.
+        let q = described("x", &[("a", "card arrival"), ("b", "none of these")]);
+        let m = match_question_as(&skills, &q, None, false).unwrap();
+        assert_eq!(
+            (m.kind, m.candidates.clone()),
+            (MatchKind::Subset, vec![0, 1, 2])
+        );
+        // A part without a none option: subset over the listed labels.
+        let q = described(
+            "x",
+            &[("a", "refund not showing up"), ("b", "card arrival")],
+        );
+        let m = match_question_as(&skills, &q, None, false).unwrap();
+        assert_eq!(
+            (m.kind, m.candidates.clone()),
+            (MatchKind::Subset, vec![0, 2])
+        );
+        // Not a description match.
+        for pairs in [
+            // both skills have the label
+            vec![("a", "exchange rate"), ("b", "none of them")],
+            // a description outside the labels
+            vec![
+                ("a", "card arrival"),
+                ("b", "exchange rate"),
+                ("c", "pizza"),
+            ],
+            // two none options
+            vec![
+                ("a", "card arrival"),
+                ("b", "none of it"),
+                ("c", "out of scope"),
+            ],
+            // a label twice
+            vec![("a", "card arrival"), ("b", "Card_Arrival")],
+            // one label of a subset is not enough
+            vec![("a", "card arrival"), ("b", "pizza")],
+        ] {
+            let m = match_question_as(&skills, &described("x", &pairs), None, false).unwrap();
+            assert!(m.is_foreign(), "{pairs:?}: {m:?}");
+        }
+        let mut q = described("x", &[("a", "card arrival"), ("b", "exchange rate")]);
+        q.criteria.as_mut().unwrap()["b"] = Value::Null;
+        assert!(match_question(&skills, &q, None).unwrap().is_foreign());
+        // Ids that match keep their match (no description map).
+        let q = described(
+            "x",
+            &[("card_arrival", "exchange rate"), ("exchange_rate", "x")],
+        );
+        let m = match_question(&skills, &q, None).unwrap();
+        assert!(m.kind == MatchKind::Subset && m.by_descriptions.is_none());
+        // Auto-skills are never matched by descriptions; in a state-less
+        // request a data skill's descriptions outrank an auto-skill's
+        // contract, under a state the contract keeps it.
+        let q = described(
+            "Classify:\nx",
+            &[
+                ("A", "card arrival"),
+                ("B", "exchange rate"),
+                ("C", "refund not showing up"),
+            ],
+        );
+        let ids = labels(&["A", "B", "C"]);
+        let sl = q.contract_sha256_as(true).unwrap();
+        let sf = q.contract_sha256().unwrap();
+        let auto_sl = SkillLabels::auto("auto-sl", &ids, &ids, &sl);
+        let auto_sf = SkillLabels::auto("auto-sf", &ids, &ids, &sf);
+        let m = match_question_as(&[auto_sl], &q, None, true).unwrap();
+        assert_eq!(m.skill.as_deref(), Some("auto-sl"));
+        let m = match_question_as(&[auto_sl, skills[0]], &q, None, true).unwrap();
+        assert_eq!(m.skill.as_deref(), Some("bank"));
+        let m = match_question_as(&[auto_sf, skills[0]], &q, None, false).unwrap();
+        assert_eq!(m.skill.as_deref(), Some("auto-sf"));
+        // `cmf.skill` names the skill the descriptions must match.
+        let m = match_question_as(&skills, &q, Some("bank"), true).unwrap();
+        assert_eq!(m.skill.as_deref(), Some("bank"));
+        let m = match_question_as(&skills, &q, Some("shop"), true).unwrap();
+        assert_eq!(m.kind, MatchKind::Untrained);
     }
 
     #[test]

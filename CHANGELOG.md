@@ -5,6 +5,134 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.8] - 2026-10-03
+
+### Added
+- State-less requests: a decisions request whose `state` is empty (`""`,
+  `{}`, `[]`, `null`) reads each question's `instructions` as its text (a
+  string as is, an object or array as canonical JSON; the encoder runs once
+  per distinct text) — the shape benchmark kits such as the Decision Index
+  send (`state: {}`, the item in the instructions). Its auto-skill contract
+  is `{type, input: "instructions", criteria}` (the instructions are data),
+  so every item of a classification set under the same options is learned
+  as one skill and then answered locally; the same criteria under a
+  non-empty state are another contract. The cache and single flight use the
+  instructions' φ under that contract; the instructions leave for the
+  oracle PII-redacted like a state; each is limited to `limits.state_bytes`;
+  state-less answers are never `certified`. The rubric of such a skill
+  stores `instructions: null` and `input: "instructions"`
+  (`Rubric::stateless`); `learn.log` records it with the unchanged contract
+  record (the id tells it apart). Both `/v1/decisions` and `/v1/systemone`
+  (API.md §3.1, §3.2, §3a; ORACLE.md "Auto-skills").
+- Sightings gate: a state-less contract is registered and learned only from
+  its `learning.auto_min_sightings`-th sighting (5), counted in an in-memory
+  LRU of `learning.auto_sightings_cap` (100000) contracts, so one-off
+  contracts (multiple-choice items whose descriptions change per question,
+  WinoGrande twins) never reach `learn.log` nor take a registry slot: on the
+  Decision Index suite's state-less rows 2 would register 756 contracts, 5
+  registers 20. State-less contracts have their own cap
+  `learning.auto_max_stateless_skills` (256), so stateful one-offs, which
+  register at their first sighting against `auto_max_skills`, never crowd
+  them out. `GET
+  /v1/admin/learning` adds `auto_sightings`, `auto_registered` and
+  `stateless` per auto-skill (API.md §6).
+- Stateful sightings gate: `learning.auto_min_sightings_stateful` (1 = the
+  first sighting, as before) registers a stateful contract only at that
+  sighting when larger, counted in the same LRU, so a deployment can keep
+  one-off stateful contracts (benchmark items, a rubric per question) out of
+  `learn.log` and `auto_max_skills` (API.md §3.2, §6; ORACLE.md).
+- Capacity errors: a request over a size limit (body, state, a state-less
+  question's instructions, a description, the options, the questions) says
+  `maximum context length` in its message with `details.capacity: true` —
+  the marker the Decision Index `http` engine reads as an unsupported item;
+  the status stays 400/413 on `/v1/decisions` and is 422 on `/v1/systemone`.
+  An oracle refusal because the prompt exceeds its context is the failure
+  `context_length`: an untrained question gets 422 `UNSUPPORTED_QUESTION`
+  with the marker, and it does not count toward `oracle.max_errors`.
+- `/v1/systemone`: an oracle or cache choice answer carries the one-hot
+  distribution (`probabilities` over every option, the chosen one 1;
+  `confidence: 1`) — Jev's schema requires one, and the Decision Index
+  validator rejected every such answer (with the oracle probabilities below
+  both surfaces carry the oracle's distribution). The model name `default` (the kit's `http` engine default) is
+  accepted there like the Jev aliases (API.md §3a).
+- Lead-in line: a state-less question whose instructions' first line ends
+  with `:` and continue with text is read by the local model as that text
+  alone (`"Classify the banking intent of this user request:\n<text>"` →
+  `<text>`); the oracle still gets the instructions verbatim, contract keys
+  and cache scopes are unchanged. On the published model the Decision Index
+  BANKING77 rows go from macro-F1 0.854 to 0.933 (API.md §3.1).
+- Matching by descriptions: a choice question whose option ids match no
+  skill reaches a data skill when every description normalizes (trimmed,
+  lowercase, `_`/`-`/whitespace runs as one space) to a distinct label of
+  exactly one data skill — positional ids `option_N` with the label names as
+  descriptions. Exact or subset as with ids, answered in the question's ids,
+  `cmf.questions.<id>.by: "descriptions"`. One none option ("out of scope…",
+  "none of…") makes the question decided over every label and answers a
+  gate rejection locally with it (`decision_path: router:none_option`, never
+  escalated, p = 1 − p_top): CLINC150+OOS macro-F1 0.929 on the published
+  model with no threshold tuned. Oracle answers and feedback of such a
+  question teach the option's label; auto-skills are never matched this way,
+  and in a state-less request a data skill's descriptions outrank an
+  auto-skill's contract (API.md §3.2, ORACLE.md).
+- Oracle probabilities (`oracle.probabilities`, on): the oracle answers each
+  question with a distribution (the ≤ 5 most likely choice ids, one value
+  per score level, p(true) for a noul), normalized by the server (listed
+  mass kept, renormalized above 1, the rest spread over the unlisted; the
+  verdict is the argmax, a tie to the stated one). Oracle and cache answers
+  carry `probabilities` and `confidence` = p(choice) on every endpoint; the
+  cache and `learn.log` keep the distribution (`CachePutP`), and 0.8.7 cache
+  records replay one-hot. `oracle.probability_tokens_per_question` (128,
+  measured 57–87 for five ids) is added to `max_tokens` per question
+  (API.md §3.3, §6; ORACLE.md "Probabilities"). The schema bounds each
+  probability to [0, 1]; a malformed distribution beside a valid verdict
+  (a percent, a null, an unknown or repeated id, too many levels) is dropped
+  and the verdict kept one-hot — the paid call is not failed and does not
+  count toward `max_errors`.
+- Oracle reasoning: `oracle.reasoning` (`off` | `low` | `medium` | `high`)
+  sends OpenRouter `reasoning: {effort, exclude: true}`, adds
+  `oracle.reasoning_max_tokens` (4096) to each call's `max_tokens` and
+  reservation and `oracle.reasoning_deadline_s` (60) to its deadline; the
+  reasoning tokens (billed in `usage.cost`) are shown in the ledger and in
+  `cmf.usage.oracle.reasoning_tokens` (ORACLE.md "Reasoning").
+  A reasoning call cut by its token allowance or its deadline is asked
+  once more without reasoning, so the question is still answered.
+
+### Changed
+- Oracle egress redaction (`oracle.redact_pii`, unless `cmf.allow_pii_egress`)
+  also covers every question's `instructions` and its criteria's
+  descriptions, with the state's heuristic; the option ids, `true`/`false`
+  and the score levels' positions are never touched, and `pii_redacted` is
+  set when anything changed. Only the oracle request changes: the cache
+  scope, the contract key and the learned examples use the question as
+  asked (ORACLE.md "What leaves the machine").
+- The semantic cache keeps an index of its entries per scope next to the
+  ring, so a lookup and a put's dedup scan only the entries of the
+  question's scope instead of all of them (up to `cache.cap`) under one lock;
+  answers, ties, dedup and evictions are unchanged, and the replay of
+  `learn.log` rebuilds the index.
+- `GET /v1/models` lists `hugging_face_id: "infosave/cmf-decision"`, the
+  published repository (the old `infosave/cortiq-decision` redirects to it).
+- Oracle and cache answers on `/v1/decisions` add `probabilities` and
+  `confidence` (choice, score) and `probability` (noul, next to the
+  unchanged verdict) — an additive change; a verdict without a distribution
+  is one-hot. `usage.output_tokens` counts their `probabilities` like a local
+  answer's (it counted 1). On `/v1/systemone` a noul answer is p(true).
+  The oracle request body asks for the distribution (`oracle.probabilities:
+  false` sends the 0.8.7 body, byte for byte the v4 driver's).
+  `cortiq decision learn --answers` finds a driver ledger line by the sha256
+  of the body it sends or of that 0.8.7 body, so the v4 ledgers are still
+  reused with the defaults.
+- `/v1/decisions` no longer refuses an empty `state` (`""`, `{}`, `[]`) or a
+  `null` one with 400: it is a state-less request. Requests with a non-empty
+  state are read exactly as in 0.8.6 and 0.8.7.
+
+### Compatibility
+- A 0.8.7 (or 0.8.6) binary truncates a 0.8.8 `learn.log` at the first state-less
+  contract record and refuses a generation whose auto-skill rubric carries
+  `input`, and stops replaying at the first cache put that carries a
+  distribution (`CachePutP`); never run an older binary on a newer state
+  directory.
+
 ## [0.8.7] - 2026-10-03
 
 ### Added
