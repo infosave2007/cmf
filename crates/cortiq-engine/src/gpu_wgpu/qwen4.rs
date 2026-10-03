@@ -1855,6 +1855,285 @@ fn q4_dn_q4tp4(@builtin(workgroup_id) wid: vec3<u32>,
 }
 "#;
 
+/// HC v3: one hyper-connection mix in two subgroup kernels (`hc3_down`:
+/// group RMS norm folded into the down projection and the injection gate,
+/// `hc3_upfold`: up-projection and sigmoid fold). Every 16-byte weight word
+/// is fetched once per frame and multiplied into all `nt` token rows; token
+/// rows past `nt` are never loaded. With `flags` bit 1 the pending block of
+/// the previous sub-layer enters the state on the fly (h + 2σ(g/hc)·blk, the
+/// `q4t_inject` arithmetic), and the up-fold writes the new hyper value back
+/// in place: the separate inject dispatch goes.
+///
+/// Its own module, built only on devices with `Features::SUBGROUP` (and no
+/// `enable subgroups;`: naga 30 rejects the directive, the device feature is
+/// what admits the builtins). Host conditions (`encode_hc_v3`): hc == 4,
+/// hidden % 8 == 0, low % 8 == 0, nt <= 8, subgroups of >= 32 lanes laid out
+/// linearly over the local index (`hc3_subgroups_ok`).
+pub(crate) const HC3_WGSL: &str = r#"
+fn h2_dot8(w: vec4<u32>, a: vec4<f32>, b: vec4<f32>) -> f32 {
+    return dot(vec4<f32>(unpack2x16float(w.x), unpack2x16float(w.y)), a)
+         + dot(vec4<f32>(unpack2x16float(w.z), unpack2x16float(w.w)), b);
+}
+
+// Pipeline-overridable chunk counts: 0 = take them from the uniform; the
+// engine specializes them (ceil(cols/2048) and ceil(low/64): 5 and 5 for
+// Qwen3.8-Flash-Next) so every loop below has a constant trip count.
+override H3_KD: u32 = 0u;
+override H3_KU: u32 = 0u;
+struct H3dP { cols: u32, rows_a: u32, rows_b: u32, hidden: u32,
+              eps: f32, inv_hc: f32, nt: u32, hs4: u32,
+              yas: u32, ybs: u32, flags: u32, bs4: u32,
+              gs: u32, _a: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<storage, read>       h3d_a   : array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read>       h3d_b   : array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read>       h3d_h   : array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read>       h3d_w   : array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read_write> h3d_ya  : array<f32>;
+@group(0) @binding(5) var<storage, read_write> h3d_yb  : array<f32>;
+@group(0) @binding(6) var<storage, read_write> h3d_inv : array<f32>;
+@group(0) @binding(7) var<uniform>             h3d_p   : H3dP;
+@group(0) @binding(8) var<storage, read>       h3d_blk : array<vec4<f32>>;
+@group(0) @binding(9) var<storage, read>       h3d_g   : array<f32>;
+// Every slot read below is written earlier in the same dispatch (the
+// pipelines run without workgroup zero-init): h3d_ss[t*32 + sg] by each
+// subgroup's lane 0 for t < nt, sg < 256/ssz; h3d_sc[t*4 + s] (and the
+// gates at 32 + t*4 + s when flagged) by lanes < 4·nt; h3d_red[sg*4 + 0..3]
+// by each subgroup's lane 0.
+var<workgroup> h3d_ss  : array<vec4<f32>, 256>;  // [t][sg] per-stream sums
+var<workgroup> h3d_sc  : array<f32, 64>;          // [t][s]: inv, then [32 + t*4+s]: gate
+var<workgroup> h3d_red : array<vec4<f32>, 128>;  // [sg][lo0, hi0, lo1, hi1]
+
+// token t's chunk q (8 floats), the pending inject applied when flagged;
+// `bo` is the chunk's column within its stream in vec4 units (q·2 − s·hidden/4)
+fn h3d_row(t: u32, q: u32, s: u32, bo: u32) -> array<vec4<f32>, 2> {
+    var a = h3d_h[t * h3d_p.hs4 + 2u * q];
+    var b = h3d_h[t * h3d_p.hs4 + 2u * q + 1u];
+    if ((h3d_p.flags & 1u) != 0u) {
+        let gs = h3d_sc[32u + t * 4u + s];
+        let o = t * h3d_p.bs4 + bo;
+        a = a + gs * h3d_blk[o];
+        b = b + gs * h3d_blk[o + 1u];
+    }
+    return array<vec4<f32>, 2>(a, b);
+}
+
+// the two row dots of token t's normalized chunk
+fn h3d_dots(t: u32, q: u32, s: u32, bo: u32, wa: vec4<u32>, wb: vec4<u32>, ga: vec4<f32>, gb: vec4<f32>) -> vec2<f32> {
+    let v = h3d_row(t, q, s, bo);
+    let iv = h3d_sc[t * 4u + s];
+    let na = v[0] * iv * ga;
+    let nb = v[1] * iv * gb;
+    return vec2<f32>(h2_dot8(wa, na, nb), h2_dot8(wb, na, nb));
+}
+
+// grid ((rows_a + rows_b) / 2): workgroup w owns rows 2w and 2w+1 of [A; B]
+@compute @workgroup_size(256)
+fn hc3_down(@builtin(workgroup_id) wid: vec3<u32>,
+            @builtin(local_invocation_index) lid: u32,
+            @builtin(subgroup_invocation_id) sgi: u32,
+            @builtin(subgroup_size) ssz: u32) {
+    let nch = h3d_p.cols >> 3u;
+    let hidden = h3d_p.hidden;
+    let nt = h3d_p.nt;
+    let nsg = 256u / ssz;
+    let sg = lid / ssz;
+    let total = h3d_p.rows_a + h3d_p.rows_b;
+    let g0 = wid.x * 2u;
+    let g1 = g0 + 1u;
+    let kd = select((nch + 255u) >> 8u, H3_KD, H3_KD != 0u);
+    if (lid < 4u * nt && (h3d_p.flags & 1u) != 0u) {
+        let t = lid >> 2u;
+        h3d_sc[32u + lid] = 2.0 / (1.0 + exp(-h3d_g[t * h3d_p.gs + (lid & 3u)] * h3d_p.inv_hc));
+    }
+    workgroupBarrier();
+    // pass 1: per-token, per-stream sums of squares
+    for (var t = 0u; t < nt; t = t + 1u) {
+        var ss = vec4<f32>(0.0);
+        for (var k = 0u; k < kd; k = k + 1u) {
+            let q = lid + 256u * k;
+            if (q >= nch) { break; }
+            let s = (q * 8u) / hidden;
+            let v = h3d_row(t, q, s, 2u * q - s * (hidden >> 2u));
+            let e = dot(v[0], v[0]) + dot(v[1], v[1]);
+            ss = ss + select(vec4<f32>(0.0), vec4<f32>(e), vec4<u32>(0u, 1u, 2u, 3u) == vec4<u32>(s));
+        }
+        ss = subgroupAdd(ss);
+        if (sgi == 0u) { h3d_ss[t * 32u + sg] = ss; }
+    }
+    workgroupBarrier();
+    if (lid < 4u * nt) {
+        let t = lid >> 2u;
+        var tot = 0.0;
+        for (var i = 0u; i < nsg; i = i + 1u) { tot = tot + h3d_ss[t * 32u + i][lid & 3u]; }
+        let inv = inverseSqrt(tot / f32(hidden) + h3d_p.eps);
+        h3d_sc[lid] = inv;
+        if (wid.x == 0u) { h3d_inv[lid] = inv; }
+    }
+    workgroupBarrier();
+    // pass 2: each weight word once, every token row against it
+    var lo0 = vec4<f32>(0.0);
+    var hi0 = vec4<f32>(0.0);
+    var lo1 = vec4<f32>(0.0);
+    var hi1 = vec4<f32>(0.0);
+    let ra = g0 < h3d_p.rows_a;
+    let rb = g1 < h3d_p.rows_a;
+    for (var k = 0u; k < kd; k = k + 1u) {
+        let q = lid + 256u * k;
+        if (q >= nch) { break; }
+        let s = (q * 8u) / hidden;
+        let bo = 2u * q - s * (hidden >> 2u);
+        var wa = vec4<u32>(0u);
+        var wb = vec4<u32>(0u);
+        if (ra) { wa = h3d_a[g0 * nch + q]; } else if (g0 < total) { wa = h3d_b[(g0 - h3d_p.rows_a) * nch + q]; }
+        if (rb) { wb = h3d_a[g1 * nch + q]; } else if (g1 < total) { wb = h3d_b[(g1 - h3d_p.rows_a) * nch + q]; }
+        let ga = vec4<f32>(1.0) + h3d_w[2u * q];
+        let gb = vec4<f32>(1.0) + h3d_w[2u * q + 1u];
+        var d = h3d_dots(0u, q, s, bo, wa, wb, ga, gb);
+        lo0.x = lo0.x + d.x; lo1.x = lo1.x + d.y;
+        if (nt > 1u) { d = h3d_dots(1u, q, s, bo, wa, wb, ga, gb); lo0.y = lo0.y + d.x; lo1.y = lo1.y + d.y; }
+        if (nt > 2u) { d = h3d_dots(2u, q, s, bo, wa, wb, ga, gb); lo0.z = lo0.z + d.x; lo1.z = lo1.z + d.y; }
+        if (nt > 3u) { d = h3d_dots(3u, q, s, bo, wa, wb, ga, gb); lo0.w = lo0.w + d.x; lo1.w = lo1.w + d.y; }
+        if (nt > 4u) {
+            d = h3d_dots(4u, q, s, bo, wa, wb, ga, gb); hi0.x = hi0.x + d.x; hi1.x = hi1.x + d.y;
+            if (nt > 5u) { d = h3d_dots(5u, q, s, bo, wa, wb, ga, gb); hi0.y = hi0.y + d.x; hi1.y = hi1.y + d.y; }
+            if (nt > 6u) { d = h3d_dots(6u, q, s, bo, wa, wb, ga, gb); hi0.z = hi0.z + d.x; hi1.z = hi1.z + d.y; }
+            if (nt > 7u) { d = h3d_dots(7u, q, s, bo, wa, wb, ga, gb); hi0.w = hi0.w + d.x; hi1.w = hi1.w + d.y; }
+        }
+    }
+    lo0 = subgroupAdd(lo0);
+    lo1 = subgroupAdd(lo1);
+    if (nt > 4u) {
+        hi0 = subgroupAdd(hi0);
+        hi1 = subgroupAdd(hi1);
+    }
+    if (sgi == 0u) {
+        h3d_red[sg * 4u] = lo0;
+        h3d_red[sg * 4u + 1u] = hi0;
+        h3d_red[sg * 4u + 2u] = lo1;
+        h3d_red[sg * 4u + 3u] = hi1;
+    }
+    workgroupBarrier();
+    if (lid < 2u * nt) {
+        let r = lid / nt;
+        let t = lid % nt;
+        var v = 0.0;
+        let slot = r * 2u + (t >> 2u);
+        for (var i = 0u; i < nsg; i = i + 1u) { v = v + h3d_red[i * 4u + slot][t & 3u]; }
+        let g = g0 + r;
+        if (g < h3d_p.rows_a) {
+            let z = v * h3d_p.inv_hc;
+            h3d_ya[t * h3d_p.yas + g] = z / (1.0 + exp(-z));
+        } else if (g < total) {
+            h3d_yb[t * h3d_p.ybs + g - h3d_p.rows_a] = v;
+        }
+    }
+}
+
+struct H3uP { hidden: u32, low: u32, nt: u32, inv_hc: f32, ls4: u32, hs: u32, os: u32, flags: u32,
+              bs: u32, gs: u32, _a: u32, _b: u32, _c: u32, _d: u32, _e: u32, _f: u32 };
+@group(0) @binding(0) var<storage, read>       h3u_w   : array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read>       h3u_low : array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> h3u_h   : array<f32>;
+@group(0) @binding(3) var<storage, read>       h3u_nw  : array<f32>;
+@group(0) @binding(4) var<storage, read>       h3u_inv : array<f32>;
+@group(0) @binding(5) var<storage, read_write> h3u_out : array<f32>;
+@group(0) @binding(6) var<uniform>             h3u_p   : H3uP;
+@group(0) @binding(7) var<storage, read>       h3u_blk : array<f32>;
+@group(0) @binding(8) var<storage, read>       h3u_g   : array<f32>;
+
+fn h3u_dot(wq: vec4<u32>, t: u32, c: u32) -> f32 {
+    let lb = t * h3u_p.ls4 + 2u * c;
+    return h2_dot8(wq, h3u_low[lb], h3u_low[lb + 1u]);
+}
+
+// σ-fold value of token t at (s, d), the hyper value updated in place when flagged
+fn h3u_fold(t: u32, s: u32, o: u32, dd: u32, m: f32, nw1: f32, write_h: bool) -> f32 {
+    var hv = h3u_h[t * h3u_p.hs + o];
+    if ((h3u_p.flags & 1u) != 0u) {
+        let gs = 2.0 / (1.0 + exp(-h3u_g[t * h3u_p.gs + s] * h3u_p.inv_hc));
+        hv = hv + gs * h3u_blk[t * h3u_p.bs + dd];
+        if (write_h) { h3u_h[t * h3u_p.hs + o] = hv; }
+    }
+    let n = hv * h3u_inv[t * 4u + s] * nw1;
+    return n * h3u_p.inv_hc / (1.0 + exp(-m));
+}
+
+// grid (hidden / 8): a 32-lane group owns one output column d, lanes
+// 8s..8s+7 the row s·hidden+d of `up`; xor 1/2/4 sums the octet, xor 8/16
+// the four streams (subgroups of >= 32 lanes, linear over the local index)
+@compute @workgroup_size(256)
+fn hc3_upfold(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_index) lid: u32) {
+    let hidden = h3u_p.hidden;
+    let nt = h3u_p.nt;
+    let lane = lid & 31u;
+    let s = lane >> 3u;
+    let j = lane & 7u;
+    let d = wid.x * 8u + (lid >> 5u);
+    let dd = min(d, hidden - 1u);
+    let lc = h3u_p.low >> 3u;
+    let o = s * hidden + dd;
+    let base = o * lc;
+    var lo = vec4<f32>(0.0);
+    var hi = vec4<f32>(0.0);
+    let ku = select((lc + 7u) >> 3u, H3_KU, H3_KU != 0u);
+    for (var k = 0u; k < ku; k = k + 1u) {
+        let c = j + 8u * k;
+        if (c >= lc) { break; }
+        let wq = h3u_w[base + c];
+        lo.x = lo.x + h3u_dot(wq, 0u, c);
+        if (nt > 1u) { lo.y = lo.y + h3u_dot(wq, 1u, c); }
+        if (nt > 2u) { lo.z = lo.z + h3u_dot(wq, 2u, c); }
+        if (nt > 3u) { lo.w = lo.w + h3u_dot(wq, 3u, c); }
+        if (nt > 4u) {
+            hi.x = hi.x + h3u_dot(wq, 4u, c);
+            if (nt > 5u) { hi.y = hi.y + h3u_dot(wq, 5u, c); }
+            if (nt > 6u) { hi.z = hi.z + h3u_dot(wq, 6u, c); }
+            if (nt > 7u) { hi.w = hi.w + h3u_dot(wq, 7u, c); }
+        }
+    }
+    lo = lo + subgroupShuffleXor(lo, 1u);
+    lo = lo + subgroupShuffleXor(lo, 2u);
+    lo = lo + subgroupShuffleXor(lo, 4u);
+    if (nt > 4u) {
+        hi = hi + subgroupShuffleXor(hi, 1u);
+        hi = hi + subgroupShuffleXor(hi, 2u);
+        hi = hi + subgroupShuffleXor(hi, 4u);
+    }
+    let nw1 = 1.0 + h3u_nw[o];
+    let wh = j == 0u && d < hidden;
+    // one lane per (stream, column) folds: it alone reads (and, with the
+    // fused inject, rewrites) h[t,s,d]; the other seven contribute zero
+    var vlo = vec4<f32>(0.0);
+    var vhi = vec4<f32>(0.0);
+    if (j == 0u) {
+        vlo.x = h3u_fold(0u, s, o, dd, lo.x, nw1, wh);
+        if (nt > 1u) { vlo.y = h3u_fold(1u, s, o, dd, lo.y, nw1, wh); }
+        if (nt > 2u) { vlo.z = h3u_fold(2u, s, o, dd, lo.z, nw1, wh); }
+        if (nt > 3u) { vlo.w = h3u_fold(3u, s, o, dd, lo.w, nw1, wh); }
+        if (nt > 4u) {
+            vhi.x = h3u_fold(4u, s, o, dd, hi.x, nw1, wh);
+            if (nt > 5u) { vhi.y = h3u_fold(5u, s, o, dd, hi.y, nw1, wh); }
+            if (nt > 6u) { vhi.z = h3u_fold(6u, s, o, dd, hi.z, nw1, wh); }
+            if (nt > 7u) { vhi.w = h3u_fold(7u, s, o, dd, hi.w, nw1, wh); }
+        }
+    }
+    vlo = vlo + subgroupShuffleXor(vlo, 8u);
+    vlo = vlo + subgroupShuffleXor(vlo, 16u);
+    if (nt > 4u) {
+        vhi = vhi + subgroupShuffleXor(vhi, 8u);
+        vhi = vhi + subgroupShuffleXor(vhi, 16u);
+    }
+    if (lane == 0u && d < hidden) {
+        for (var t = 0u; t < nt; t = t + 1u) {
+            var v = vlo[t & 3u];
+            if (t >= 4u) { v = vhi[t & 3u]; }
+            h3u_out[t * h3u_p.os + d] = v;
+        }
+    }
+}
+"#;
+
 pub(crate) struct Pipes {
     group_rmsnorm: wgpu::ComputePipeline,
     f16_matvec: wgpu::ComputePipeline,
@@ -1885,18 +2164,190 @@ pub(crate) struct Pipes {
     t_topk: wgpu::ComputePipeline,
     t_idx_build: wgpu::ComputePipeline,
     t_attend: wgpu::ComputePipeline,
+    /// HC v3 (`HC3_WGSL`), where the device takes it; None keeps every
+    /// hyper-connection mix on the kernels above.
+    hc3: Option<Hc3>,
 }
 
+/// The HC v3 module and its pipelines, specialized on first use per loop
+/// count (`H3_KD` for the down kernel, `H3_KU` for the up-fold).
+pub(crate) struct Hc3 {
+    module: wgpu::ShaderModule,
+    pipes: std::sync::Mutex<HashMap<(bool, u32), Option<wgpu::ComputePipeline>>>,
+}
+
+/// `CMF_QWEN_CHECKED=1`: build the qwen4 modules with naga's runtime checks
+/// (bounds clamping, loop bounding, division guards) and zero-initialized
+/// workgroup memory, as wgpu does by default. Off, they are trusted: every
+/// index is in range by construction (the host guards in `Dev::new` and
+/// the frame encoders, the audit notes on `build_pipes`) and every
+/// workgroup slot a kernel reads is written earlier in the same dispatch.
+fn qwen_checked() -> bool {
+    static S: OnceLock<bool> = OnceLock::new();
+    *S.get_or_init(|| std::env::var("CMF_QWEN_CHECKED").as_deref() == Ok("1"))
+}
+
+/// `CMF_QWEN_HC_V3=0`: every hyper-connection mix on the pre-v3 kernels
+/// (group norm + `q4t_f16_pair` + `q4t_hc_upfold`, or `CMF_QWEN_HC_FUSE=1`'s
+/// pair), the pending block injected by its own dispatch. The A/B arm.
+fn hc_v3_env() -> bool {
+    static S: OnceLock<bool> = OnceLock::new();
+    *S.get_or_init(|| std::env::var("CMF_QWEN_HC_V3").as_deref() != Ok("0"))
+}
+
+/// `CMF_QWEN_HC_V3_INJECT=0`: v3 mixes, but the pending block still enters
+/// the state through `q4t_inject` in front of them (isolates the fusion).
+fn hc_v3_inject_env() -> bool {
+    static S: OnceLock<bool> = OnceLock::new();
+    *S.get_or_init(|| std::env::var("CMF_QWEN_HC_V3_INJECT").as_deref() != Ok("0"))
+}
+
+/// A shader module for the qwen4 kernels: trusted (no injected runtime
+/// checks) unless `CMF_QWEN_CHECKED=1`.
+fn qwen_module(c: &Ctx, label: &str, src: &str) -> wgpu::ShaderModule {
+    let desc = wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    };
+    if qwen_checked() {
+        c.device.create_shader_module(desc)
+    } else {
+        // SAFETY: see `qwen_checked` — the kernels index only inside the
+        // buffers and workgroup tables their callers size for them, every
+        // loop has a finite, uniform-bounded trip count, and no divisor is
+        // zero (the shapes are checked on the host before a frame is built).
+        unsafe {
+            c.device
+                .create_shader_module_trusted(desc, wgpu::ShaderRuntimeChecks::unchecked())
+        }
+    }
+}
+
+/// Does the adapter guarantee what `hc3_upfold` assumes of a subgroup: at
+/// least 32 lanes (its xor-8/16 shuffles), at most 128 (`hc3_down`'s
+/// per-subgroup tables), laid out linearly over the local index? Vulkan and
+/// DX12 report the range the driver may pick from (NVIDIA: 32..32). Metal
+/// reports a blanket 4..64, but Apple GPUs run 32-wide SIMD-groups.
+fn hc3_subgroups_ok(c: &Ctx) -> bool {
+    if !c.device.features().contains(wgpu::Features::SUBGROUP) {
+        return false;
+    }
+    let i = &c.adapter_info;
+    (i.subgroup_min_size >= 32 && i.subgroup_max_size <= 128)
+        || (i.backend == wgpu::Backend::Metal && i.name.starts_with("Apple"))
+}
+
+/// The HC v3 module, in isolation: a rejection here must leave the qwen4
+/// module and the older mixes untouched.
+fn build_hc3(c: &Ctx) -> Option<Hc3> {
+    if !hc_v3_env() {
+        return None;
+    }
+    if !hc3_subgroups_ok(c) {
+        tracing::info!(
+            "qwen4 HC v3 off: subgroup feature {} / sizes {}..{} on {:?}",
+            c.device.features().contains(wgpu::Features::SUBGROUP),
+            c.adapter_info.subgroup_min_size,
+            c.adapter_info.subgroup_max_size,
+            c.adapter_info.backend
+        );
+        return None;
+    }
+    let si = c.device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let sv = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let module = qwen_module(c, "qwen4-hc3", HC3_WGSL);
+    let ev = pollster::block_on(sv.pop());
+    let ei = pollster::block_on(si.pop());
+    if let Some(e) = ev.or(ei) {
+        tracing::warn!("qwen4 HC v3 module rejected: {e}");
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        return None;
+    }
+    Some(Hc3 {
+        module,
+        pipes: std::sync::Mutex::new(HashMap::new()),
+    })
+}
+
+/// `hc3_down` (`down`) or `hc3_upfold` with its loop count fixed at `k`,
+/// built on first use; None (remembered) when the device rejects it.
+fn hc3_pipe(c: &Ctx, h: &Hc3, down: bool, k: u32) -> Option<wgpu::ComputePipeline> {
+    let mut m = h.pipes.lock().ok()?;
+    if let Some(p) = m.get(&(down, k)) {
+        return p.clone();
+    }
+    let (ep, knob) = if down {
+        ("hc3_down", "H3_KD")
+    } else {
+        ("hc3_upfold", "H3_KU")
+    };
+    // Validation and Internal both: a shader the translator or the driver
+    // turns down (`CreateComputePipelineError::Internal`) is not a
+    // validation error, and outside a scope that takes it wgpu's default
+    // handler panics instead of letting this mix fall back.
+    let si = c.device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let sv = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let p = c
+        .device
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(ep),
+            layout: None,
+            module: &h.module,
+            entry_point: Some(ep),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &[(knob, f64::from(k))],
+                zero_initialize_workgroup_memory: qwen_checked(),
+            },
+            cache: c.pipeline_cache.as_ref(),
+        });
+    // scopes pop in reverse order
+    let ev = pollster::block_on(sv.pop());
+    let ei = pollster::block_on(si.pop());
+    let p = match ev.or(ei) {
+        None => Some(p),
+        Some(e) => {
+            tracing::warn!("qwen4 HC v3 pipeline {ep} ({knob} = {k}) rejected: {e}");
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+            None
+        }
+    };
+    m.insert((down, k), p.clone());
+    p
+}
+
+// Workgroup-memory audit for the trusted, non-zero-initialized build (every
+// `var<workgroup>` of QWEN4_WGSL / QWEN4T_WGSL; HC3_WGSL notes its own):
+// - tree reductions (gn_part, hm_part, pm_part, uf_part, pg_part, bk_red,
+//   qa_red, go_red, tg_part, tp_lo/hi, tu_lo/hi, tq_lo/hi, tn_red, th_lo/hi,
+//   tv_lo/hi, rq2_red, ix2_red, qa2_red, gq_pg/pu, gv_pt): every lane of the
+//   workgroup stores its slot before the first barrier; the tree reads
+//   lid + s < size only. No partial fill.
+// - th_ilo/th_ihi[8]: written for st < hc by lane 0, read for st < hc;
+//   the encoder takes that kernel only with hc <= 8.
+// - tr_used[64]: zeroed for lid < top_k, then rank < top_k set, read for
+//   j < top_k (Dev::new: top_k <= 64). tr_sc[1024]: written and read for
+//   i < n_experts (Dev::new: n_experts <= 1024).
+// - tk2_keep[4096]: written and read for i < complete blocks (the frame
+//   declines past MAX_INDEX_BLOCKS = 4096).
+// - qa_w / qa2_w[2112]: written and read for i < m attended positions (the
+//   frame declines past MAX_ATTEND = 2112). qa_qs / qa2_qs[256]: written for
+//   lid < head_dim, read for k < head_dim (Dev::new: head_dim <= 256).
+// - rq2_head[256] and the private xv[8]: written for d < hd, the RoPE reads
+//   d < rotary dims <= hd (Dev::new: head_dim, index_dim <= 256, rotary_dim
+//   <= head_dim; the indexer's rotary dims are min(rd, idim)).
+// - bk_k[256]: every lane writes it; the RoPE reads d + rd/2 < rd <= idim.
+// Nothing relied on the zero fill or on clamped indices.
 fn build_pipes(c: &Ctx) -> Option<Pipes> {
     let scope = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let module = c.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("qwen4"),
-        source: wgpu::ShaderSource::Wgsl(format!("{QWEN4_WGSL}{QWEN4T_WGSL}").into()),
-    });
+    let module = qwen_module(c, "qwen4", &format!("{QWEN4_WGSL}{QWEN4T_WGSL}"));
     if let Some(e) = pollster::block_on(scope.pop()) {
         tracing::warn!("qwen4 shader module rejected: {e}");
         return None;
     }
+    let opts = || wgpu::PipelineCompilationOptions {
+        constants: &[],
+        zero_initialize_workgroup_memory: qwen_checked(),
+    };
     let pipe = |ep: &str| {
         c.device
             .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1904,7 +2355,7 @@ fn build_pipes(c: &Ctx) -> Option<Pipes> {
                 layout: None,
                 module: &module,
                 entry_point: Some(ep),
-                compilation_options: Default::default(),
+                compilation_options: opts(),
                 cache: c.pipeline_cache.as_ref(),
             })
     };
@@ -1982,7 +2433,7 @@ fn build_pipes(c: &Ctx) -> Option<Pipes> {
                 layout: Some(layout),
                 module: &module,
                 entry_point: Some(ep),
-                compilation_options: Default::default(),
+                compilation_options: opts(),
                 cache: c.pipeline_cache.as_ref(),
             })
     };
@@ -2016,6 +2467,7 @@ fn build_pipes(c: &Ctx) -> Option<Pipes> {
         t_topk: pipe("q4t_topk"),
         t_idx_build: pipe("q4t_idx_build"),
         t_attend: pipe("q4t_attend"),
+        hc3: build_hc3(c),
     })
 }
 
@@ -2449,6 +2901,33 @@ impl Dev {
         let rows = kinds.len() + 1;
         let hh = g.hc * g.hidden;
         if (hh * 4) % 256 != 0 {
+            return None;
+        }
+        // The workgroup tables the kernels size statically (and index without
+        // runtime checks, see `qwen_checked`): a head of <= 256 lanes in the
+        // RoPE / attention kernels, <= 1024 router scores, <= 64 winners, a
+        // GQA group of at least one query head per KV head. Shapes outside
+        // them were never computed right on the card; keep them on the host.
+        if g.head_dim == 0
+            || g.head_dim > 256
+            || g.rotary_dim > g.head_dim
+            || g.index_dim > 256
+            || g.n_experts > 1024
+            || g.top_k > 64
+            || g.n_kv_heads == 0
+            || g.n_heads < g.n_kv_heads
+        {
+            tracing::warn!(
+                "qwen4 device path: shape outside the kernels' tables (head_dim {}, rotary {}, \
+                 index_dim {}, experts {}, top_k {}, heads {}/{})",
+                g.head_dim,
+                g.rotary_dim,
+                g.index_dim,
+                g.n_experts,
+                g.top_k,
+                g.n_heads,
+                g.n_kv_heads
+            );
             return None;
         }
         let hyper = storage_buf(c, "qwen4-hyper", (TMAX * hh * 4) as u64);
@@ -3221,19 +3700,60 @@ fn pair_t(
         Some(i) => Some(weight(c, model, i)?),
         None => None,
     };
+    pair_w(
+        c,
+        p,
+        pass,
+        &a,
+        b.as_ref(),
+        x,
+        xs,
+        ya,
+        yas,
+        yb,
+        ybs,
+        act,
+        inv,
+        yb_off,
+        nt,
+        bc,
+        step,
+    )
+}
+
+/// `pair_t` on matrices already resident.
+#[allow(clippy::too_many_arguments)]
+fn pair_w(
+    c: &Ctx,
+    p: &Pipes,
+    pass: &mut wgpu::ComputePass<'_>,
+    a: &WeightRef,
+    b: Option<&WeightRef>,
+    x: &wgpu::Buffer,
+    xs: u32,
+    ya: &wgpu::Buffer,
+    yas: u32,
+    yb: &wgpu::Buffer,
+    ybs: u32,
+    act: u32,
+    inv: f32,
+    yb_off: usize,
+    nt: usize,
+    bc: Bc,
+    step: u16,
+) -> Option<()> {
     if a.dtype != TensorDtype::F16
         || a.cols % 2 != 0
-        || b.as_ref()
-            .is_some_and(|b| b.dtype != TensorDtype::F16 || b.cols != a.cols)
+        || b.is_some_and(|b| b.dtype != TensorDtype::F16 || b.cols != a.cols)
     {
         return None;
     }
-    let rows_b = b.as_ref().map_or(0, |b| b.rows);
+    let rows_b = b.map_or(0, |b| b.rows);
     let total = a.rows + rows_b;
     if total > MAX_WG as usize {
         return None;
     }
-    let bbuf = b.as_ref().map_or_else(|| a.buf.clone(), |b| b.buf.clone());
+    let bbuf = b.map_or_else(|| a.buf.clone(), |b| b.buf.clone());
     dispatch(
         c,
         pass,
@@ -3421,9 +3941,67 @@ fn inject_t(
     );
 }
 
-/// One hyper-connection mix over `nt` tokens: normed streams → low-rank
-/// (down + injection gate in one dispatch) → up-projection and fold.
-/// Needs the f16 mixer weights the converter emits; None otherwise.
+/// The pending block of the previous sub-layer, entering the hyper state
+/// in front of a mix: h[t,s,d] += 2σ(gate[t,s]/hc)·blk[t,d] (`q4t_inject`
+/// with no cold parts). A v3 mix applies it inside its kernels; in front of
+/// the older kernels it is its own dispatch, at the site (`step`) it always had.
+#[derive(Clone, Copy)]
+struct PreInject<'a> {
+    blk: &'a wgpu::Buffer,
+    /// `blk` row stride, floats.
+    bs: u32,
+    /// The raw injection-gate logits (the B rows of the mix that made `blk`).
+    gate: &'a wgpu::Buffer,
+    /// `gate` row stride, floats.
+    gs: u32,
+    step: u16,
+}
+
+/// `pre` as its own `q4t_inject` dispatch.
+#[allow(clippy::too_many_arguments)]
+fn inject_pre(
+    c: &Ctx,
+    p: &Pipes,
+    pass: &mut wgpu::ComputePass<'_>,
+    g: &Geom,
+    hyper: &wgpu::Buffer,
+    pre: &PreInject,
+    nt: usize,
+    bc: Bc,
+) {
+    let zero = zero_buf(c);
+    inject_t(
+        c,
+        p,
+        pass,
+        g,
+        hyper,
+        pre.blk,
+        pre.bs,
+        pre.gate,
+        pre.gs,
+        (&zero, 0),
+        (&zero, 0),
+        0,
+        &zero,
+        nt,
+        bc,
+        pre.step,
+    );
+}
+
+/// Do the mixes of this device take the pending inject into their kernels
+/// (HC v3 built, `CMF_QWEN_HC_V3_INJECT` not 0)? A mix whose shape v3 does
+/// not take still injects first, through `inject_pre`.
+fn hc_v3_fuses(p: &Pipes) -> bool {
+    p.hc3.is_some() && hc_v3_inject_env()
+}
+
+/// One hyper-connection mix over `nt` tokens, `pre` injected first: normed
+/// streams → low-rank (down + injection gate) → up-projection and fold.
+/// HC v3 where the device and the shape take it, the older kernels
+/// otherwise. Needs the f16 mixer weights the converter emits; None
+/// otherwise.
 #[allow(clippy::too_many_arguments)]
 fn encode_hc_t(
     c: &Ctx,
@@ -3435,45 +4013,287 @@ fn encode_hc_t(
     hyper: &wgpu::Buffer,
     x: &wgpu::Buffer,
     inj: Option<&wgpu::Buffer>,
+    pre: Option<PreInject>,
+    nt: usize,
+    bc: Bc,
+    base: u16,
+) -> Option<()> {
+    let down = weight(c, model, hc.down)?;
+    let up = weight(c, model, hc.up)?;
+    let inj_w = match hc.inject.filter(|_| inj.is_some()) {
+        Some(i) => Some(weight(c, model, i)?),
+        None => None,
+    };
+    encode_hc_w(
+        c,
+        p,
+        pass,
+        g,
+        hc.norm,
+        &down,
+        &up,
+        inj_w.as_ref(),
+        hyper,
+        x,
+        inj,
+        pre,
+        nt,
+        bc,
+        base,
+    )
+}
+
+/// `encode_hc_t` on matrices already resident (`norm`: the hc·hidden
+/// stream weights).
+#[allow(clippy::too_many_arguments)]
+fn encode_hc_w(
+    c: &Ctx,
+    p: &Pipes,
+    pass: &mut wgpu::ComputePass<'_>,
+    g: &Geom,
+    norm: &[f32],
+    down: &WeightRef,
+    up: &WeightRef,
+    inj_w: Option<&WeightRef>,
+    hyper: &wgpu::Buffer,
+    x: &wgpu::Buffer,
+    inj: Option<&wgpu::Buffer>,
+    pre: Option<PreInject>,
     nt: usize,
     bc: Bc,
     base: u16,
 ) -> Option<()> {
     let hh = g.hc * g.hidden;
-    let nw = const_buf(c, bytemuck::cast_slice(&hc.norm[..hh]));
-    let down = weight(c, model, hc.down)?;
-    let up = weight(c, model, hc.up)?;
     if down.dtype != TensorDtype::F16
         || down.rows % 2 != 0
         || up.dtype != TensorDtype::F16
         || up.cols != down.rows
         || up.rows != hh
+        || norm.len() < hh
     {
         return None;
     }
+    let nw = const_buf(c, bytemuck::cast_slice(&norm[..hh]));
     let low = tbuf(c, T_LOW, down.rows * 4, false);
     let zero = zero_buf(c);
     let injb = inj.cloned().unwrap_or_else(|| zero.clone());
+    if encode_hc_v3(
+        c,
+        p,
+        pass,
+        g,
+        &nw,
+        down,
+        up,
+        inj_w,
+        hyper,
+        x,
+        &low,
+        &injb,
+        pre.as_ref(),
+        nt,
+        bc,
+        base,
+    )
+    .is_some()
+    {
+        return Some(());
+    }
+    if let Some(q) = &pre {
+        inject_pre(c, p, pass, g, hyper, q, nt, bc);
+    }
+    encode_hc_old(
+        c, p, pass, g, &nw, down, up, inj_w, hyper, x, &low, &injb, nt, bc, base,
+    )
+}
+
+/// The v3 mix: `hc3_down` (stream norms, down rows and injection-gate rows
+/// of every token, `pre` applied on the fly) then `hc3_upfold`
+/// (up-projection and fold; with `pre` the injected state is written back
+/// in place, which is what the separate inject would have left). Cache
+/// slots `base + 1..=4`. None, with nothing encoded, where the device or the
+/// shape does not take it.
+#[allow(clippy::too_many_arguments)]
+fn encode_hc_v3(
+    c: &Ctx,
+    p: &Pipes,
+    pass: &mut wgpu::ComputePass<'_>,
+    g: &Geom,
+    nw: &wgpu::Buffer,
+    down: &WeightRef,
+    up: &WeightRef,
+    inj_w: Option<&WeightRef>,
+    hyper: &wgpu::Buffer,
+    x: &wgpu::Buffer,
+    low: &wgpu::Buffer,
+    injb: &wgpu::Buffer,
+    pre: Option<&PreInject>,
+    nt: usize,
+    bc: Bc,
+    base: u16,
+) -> Option<()> {
+    let h3 = p.hc3.as_ref()?;
+    let hh = g.hc * g.hidden;
+    let lr = down.rows;
+    if g.hc != 4
+        || g.hidden % 8 != 0
+        || lr % 8 != 0
+        || down.cols != hh
+        || nt == 0
+        || nt > TMAX
+        || inj_w.is_some_and(|b| b.dtype != TensorDtype::F16 || b.cols != hh)
+        || pre.is_some_and(|q| q.bs % 4 != 0)
+    {
+        return None;
+    }
+    let rows_b = inj_w.map_or(0, |b| b.rows);
+    let groups = (lr + rows_b).div_ceil(2);
+    if groups > MAX_WG as usize || g.hidden / 8 > MAX_WG as usize {
+        return None;
+    }
+    // loop counts: 8-column chunks per lane (256 lanes), low/8 words per octet lane
+    let pd = hc3_pipe(c, h3, true, (hh / 8).div_ceil(256) as u32)?;
+    let pu = hc3_pipe(c, h3, false, (lr / 8).div_ceil(8) as u32)?;
+    // the per-token stream inverses, [t·4 + s], from workgroup 0 of the down
+    let hinv = tbuf_exact(c, T_HINV, g.hc * 4, false);
+    let inv = (1.0 / g.hc as f32).to_bits();
+    let flags = u32::from(pre.is_some());
+    // No pending block: the inject bindings are never read. The stream
+    // weights stand in (read-only in both kernels, so no usage conflict with
+    // the up-fold's read-write hyper state or the down's outputs).
+    let (blk, bs, gate, gs) = match pre {
+        Some(q) => (q.blk.clone(), q.bs, q.gate.clone(), q.gs),
+        None => (nw.clone(), 0, nw.clone(), 0),
+    };
+    let bbuf = inj_w.map_or_else(|| down.buf.clone(), |b| b.buf.clone());
+    // the uniforms and the bindings differ with and without the inject
+    let (s_down, s_up) = if pre.is_some() {
+        (base + 3, base + 4)
+    } else {
+        (base + 1, base + 2)
+    };
+    let (ls, hs, os) = (es(lr * 4), es(hh * 4), es(g.hidden * 4));
+    dispatch(
+        c,
+        pass,
+        &pd,
+        bc,
+        s_down,
+        "qwen4t-hc3-down",
+        || {
+            vec![
+                down.buf.clone(),
+                bbuf,
+                hyper.clone(),
+                nw.clone(),
+                low.clone(),
+                injb.clone(),
+                hinv.clone(),
+                uniform_u32x16(
+                    c,
+                    [
+                        hh as u32,
+                        lr as u32,
+                        rows_b as u32,
+                        g.hidden as u32,
+                        g.eps.to_bits(),
+                        inv,
+                        nt as u32,
+                        hs / 4,
+                        ls,
+                        es(g.hc * 4),
+                        flags,
+                        bs / 4,
+                        gs,
+                        0,
+                        0,
+                        0,
+                    ],
+                ),
+                blk.clone(),
+                gate.clone(),
+            ]
+        },
+        (groups as u32, 1, 1),
+    );
+    dispatch(
+        c,
+        pass,
+        &pu,
+        bc,
+        s_up,
+        "qwen4t-hc3-upfold",
+        || {
+            vec![
+                up.buf.clone(),
+                low.clone(),
+                hyper.clone(),
+                nw.clone(),
+                hinv.clone(),
+                x.clone(),
+                uniform_u32x16(
+                    c,
+                    [
+                        g.hidden as u32,
+                        lr as u32,
+                        nt as u32,
+                        inv,
+                        ls / 4,
+                        hs,
+                        os,
+                        flags,
+                        bs,
+                        gs,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                ),
+                blk,
+                gate,
+            ]
+        },
+        ((g.hidden / 8) as u32, 1, 1),
+    );
+    Some(())
+}
+
+/// The pre-v3 mixes: group norm + `q4t_f16_pair` + `q4t_hc_upfold` (three
+/// dispatches), or with `CMF_QWEN_HC_FUSE=1` the norm folded into
+/// `q4t_hc_down` + `q4t_hc_upfold2` (two).
+#[allow(clippy::too_many_arguments)]
+fn encode_hc_old(
+    c: &Ctx,
+    p: &Pipes,
+    pass: &mut wgpu::ComputePass<'_>,
+    g: &Geom,
+    nw: &wgpu::Buffer,
+    down: &WeightRef,
+    up: &WeightRef,
+    inj_w: Option<&WeightRef>,
+    hyper: &wgpu::Buffer,
+    x: &wgpu::Buffer,
+    low: &wgpu::Buffer,
+    injb: &wgpu::Buffer,
+    nt: usize,
+    bc: Bc,
+    base: u16,
+) -> Option<()> {
+    let hh = g.hc * g.hidden;
     if hc_fused() && g.hc <= 8 && g.hidden % 2 == 0 {
         // the norm folded into both kernels: two dispatches a mix
-        let inj_w = match hc.inject.filter(|_| inj.is_some()) {
-            Some(i) => Some(weight(c, model, i)?),
-            None => None,
-        };
-        if inj_w
-            .as_ref()
-            .is_some_and(|b| b.dtype != TensorDtype::F16 || b.cols != hh)
-        {
+        if inj_w.is_some_and(|b| b.dtype != TensorDtype::F16 || b.cols != hh) {
             return None;
         }
-        let rows_b = inj_w.as_ref().map_or(0, |b| b.rows);
+        let rows_b = inj_w.map_or(0, |b| b.rows);
         let total = down.rows + rows_b;
         if total > MAX_WG as usize {
             return None;
         }
-        let bbuf = inj_w
-            .as_ref()
-            .map_or_else(|| down.buf.clone(), |b| b.buf.clone());
+        let bbuf = inj_w.map_or_else(|| down.buf.clone(), |b| b.buf.clone());
         let hinv = tbuf_exact(c, T_HINV, g.hc * 4, false);
         let inv = 1.0 / g.hc as f32;
         dispatch(
@@ -3558,7 +4378,7 @@ fn encode_hc_t(
         pass,
         hyper,
         es(hh * 4),
-        &nw,
+        nw,
         &normed,
         es(hh * 4),
         g.hc,
@@ -3568,18 +4388,17 @@ fn encode_hc_t(
         bc,
         base,
     );
-    pair_t(
+    pair_w(
         c,
         p,
         pass,
-        model,
-        hc.down,
-        hc.inject.filter(|_| inj.is_some()),
+        down,
+        inj_w,
         &normed,
         es(hh * 4),
-        &low,
+        low,
         es(down.rows * 4),
-        &injb,
+        injb,
         es(g.hc * 4),
         1,
         1.0 / g.hc as f32,
@@ -3921,10 +4740,16 @@ pub(crate) fn encode_layer(
     let mut ple_pushes = 0usize;
     // (token slot, head, rows) of the PLE snapshots taken in this frame
     let mut ple_snapped: Vec<(usize, usize, usize)> = Vec::new();
+    // Does the PLE pass below read and update the hyper rows?
+    let ple_runs =
+        w.ple.is_some() && d.layers[li].ple.is_some() && !skip("ple") && !ple_rows.is_empty();
+    // The previous frame's MoE output rides in the attention mix's kernels
+    // (HC v3) when nothing reads the state in between, i.e. no PLE pass.
+    let defer_inject = inject_prev && !ple_runs && hc_v3_fuses(p);
     {
         let mut pass = begin_pass(enc);
         encode_gate(c, p, &mut pass, d, li);
-        if inject_prev {
+        if inject_prev && !defer_inject {
             // the previous frame's MoE output enters the state here (gated
             // with this frame: a miss before it stops the chain)
             inject_t(
@@ -4087,6 +4912,13 @@ pub(crate) fn encode_layer(
 
     // ── attention half ──
     let mut pass = begin_pass(enc);
+    let pre_attn = defer_inject.then_some(PreInject {
+        blk: &mo,
+        bs: hs,
+        gate: &inj_mlp,
+        gs: is,
+        step: 2,
+    });
     if !skip("hc") {
         encode_hc_t(
             c,
@@ -4098,10 +4930,13 @@ pub(crate) fn encode_layer(
             hyper,
             &x,
             Some(&inj_attn),
+            pre_attn,
             nt,
             bc,
             100,
         )?;
+    } else if let Some(q) = &pre_attn {
+        inject_pre(c, p, &mut pass, g, hyper, q, nt, bc);
     }
     match &w.mixer {
         MixerW::Gdn {
@@ -5001,24 +5836,19 @@ pub(crate) fn encode_layer(
             }
         }
     }
-    inject_t(
-        c,
-        p,
-        &mut pass,
-        g,
-        hyper,
-        &blk,
-        hs,
-        &inj_attn,
-        is,
-        (&zero, 0),
-        (&zero, 0),
-        0,
-        &zero,
-        nt,
-        bc,
-        600,
-    );
+    // the attention block enters the state: inside the MoE mix's kernels
+    // (HC v3), or by its own dispatch in front of it
+    let attn_blk = PreInject {
+        blk: &blk,
+        bs: hs,
+        gate: &inj_attn,
+        gs: is,
+        step: 600,
+    };
+    let fuse_attn = !skip("hc") && hc_v3_fuses(p);
+    if !fuse_attn {
+        inject_pre(c, p, &mut pass, g, hyper, &attn_blk, nt, bc);
+    }
 
     // ── MoE half ──
     if !skip("hc") {
@@ -5032,6 +5862,7 @@ pub(crate) fn encode_layer(
             hyper,
             &x2,
             Some(&inj_mlp),
+            fuse_attn.then_some(attn_blk),
             nt,
             bc,
             200,
@@ -5367,33 +6198,25 @@ pub(crate) fn encode_head_with(
     let hid = tbuf(c, T_HID, g.hidden * 4, false);
     let head = weight(c, lm_model, lm_head)?;
     let logits = tbuf(c, T_LMLOGITS, head.rows * 4, false);
-    let zero = zero_buf(c);
     let mut pass = begin_pass(enc);
     encode_gate(c, p, &mut pass, dev, dev.rows - 1);
-    if inject_prev {
-        let mo = tbuf(c, T_MO, g.hidden * 4, false);
-        let inj_mlp = tbuf(c, T_INJ_MLP, g.hc * 4, false);
-        inject_t(
-            c,
-            p,
-            &mut pass,
-            g,
-            &dev.hyper,
-            &mo,
-            es(g.hidden * 4),
-            &inj_mlp,
-            es(g.hc * 4),
-            (&zero, 0),
-            (&zero, 0),
-            0,
-            &zero,
-            nt,
-            bc,
-            2,
-        );
+    // the last layer's MoE output: inside the final mix's kernels (HC v3),
+    // or by its own dispatch in front of it
+    let mo = tbuf(c, T_MO, g.hidden * 4, false);
+    let inj_mlp = tbuf(c, T_INJ_MLP, g.hc * 4, false);
+    let mut pre = inject_prev.then_some(PreInject {
+        blk: &mo,
+        bs: es(g.hidden * 4),
+        gate: &inj_mlp,
+        gs: es(g.hc * 4),
+        step: 2,
+    });
+    if let Some(q) = pre.filter(|_| !hc_v3_fuses(p)) {
+        inject_pre(c, p, &mut pass, g, &dev.hyper, &q, nt, bc);
+        pre = None;
     }
     encode_hc_t(
-        c, p, &mut pass, model, g, head_hc, &dev.hyper, &hid, None, nt, bc, 300,
+        c, p, &mut pass, model, g, head_hc, &dev.hyper, &hid, None, pre, nt, bc, 300,
     )?;
     if !skip("head")
         && !q82_t(
@@ -6370,6 +7193,343 @@ mod shader_tests {
                 "entry point {ep} missing"
             );
         }
+    }
+
+    /// HC v3, its own module: it validates once the subgroup capability is
+    /// there (no `enable subgroups;`), not without it, and again after the
+    /// override specialization its pipelines get (`H3_KD` / `H3_KU`: 5 / 5
+    /// for Qwen3.8-Flash-Next's cols 10240 and low 320).
+    #[test]
+    fn qwen4_hc3_shaders_validate() {
+        use wgpu::naga;
+        let flags = naga::valid::ValidationFlags::all();
+        let module = naga::front::wgsl::parse_str(super::HC3_WGSL).expect("HC3 WGSL parses");
+        let info = naga::valid::Validator::new(flags, naga::valid::Capabilities::all())
+            .validate(&module)
+            .expect("HC3 WGSL validates");
+        for ep in ["hc3_down", "hc3_upfold"] {
+            assert!(
+                module.entry_points.iter().any(|e| e.name == ep),
+                "entry point {ep} missing"
+            );
+        }
+        for knob in ["H3_KD", "H3_KU"] {
+            assert!(
+                module
+                    .overrides
+                    .iter()
+                    .any(|(_, o)| o.name.as_deref() == Some(knob)),
+                "override {knob} missing"
+            );
+        }
+        let no_sg = naga::valid::Capabilities::all() - naga::valid::Capabilities::SUBGROUP;
+        assert!(
+            naga::valid::Validator::new(flags, no_sg)
+                .validate(&module)
+                .is_err(),
+            "HC3 must need the subgroup capability"
+        );
+        for (ep, knob) in [("hc3_down", "H3_KD"), ("hc3_upfold", "H3_KU")] {
+            for k in [0.0, 1.0, 5.0, 8.0] {
+                let mut pc = naga::back::PipelineConstants::default();
+                pc.insert(knob.to_string(), k);
+                let (m2, _) = naga::back::pipeline_constants::process_overrides(
+                    &module,
+                    &info,
+                    Some((naga::ShaderStage::Compute, ep)),
+                    &pc,
+                )
+                .unwrap_or_else(|e| panic!("{ep} with {knob} = {k}: {e:?}"));
+                naga::valid::Validator::new(flags, naga::valid::Capabilities::all())
+                    .validate(&m2)
+                    .unwrap_or_else(|e| panic!("{ep} with {knob} = {k} validates: {e:?}"));
+            }
+        }
+    }
+}
+
+/// HC v3 against the pre-v3 kernels through the frame encoders themselves
+/// (bindings, uniforms, row strides, cache slots), on synthetic f16 weights
+/// of Qwen3.8-Flash-Next's shape, for 1..8 token rows, with and without the
+/// injection-gate rows and the fused pending inject. Needs a card that
+/// admits HC v3:
+/// `cargo test --release -p cortiq-engine --features gpu hc3_matches -- --ignored --nocapture`
+#[cfg(test)]
+mod hc3_device_tests {
+    use super::*;
+
+    fn f2h(f: f32) -> u16 {
+        // round-to-nearest-even into f16 (the values here stay normal)
+        let x = f.to_bits();
+        let sign = ((x >> 16) & 0x8000) as u16;
+        let e = ((x >> 23) & 0xff) as i32 - 127 + 15;
+        let m = x & 0x7f_ffff;
+        if e <= 0 {
+            return sign;
+        }
+        if e >= 31 {
+            return sign | 0x7c00;
+        }
+        let mut h = (((e as u32) << 10) | (m >> 13)) as u16;
+        let rem = m & 0x1fff;
+        if rem > 0x1000 || (rem == 0x1000 && (h & 1) == 1) {
+            h += 1;
+        }
+        sign | h
+    }
+
+    struct Rnd(u64);
+    impl Rnd {
+        fn n(&mut self) -> f32 {
+            // sum of four uniforms, centred: close enough to a normal
+            let mut s = 0.0f32;
+            for _ in 0..4 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                s += (self.0 >> 40) as f32 / (1u64 << 24) as f32;
+            }
+            (s - 2.0) * 1.7
+        }
+    }
+
+    fn upload(c: &Ctx, label: &str, bytes: &[u8]) -> wgpu::Buffer {
+        let b = storage_buf(c, label, bytes.len() as u64);
+        c.queue.write_buffer(&b, 0, bytes);
+        b
+    }
+
+    fn f16_weight(c: &Ctx, r: &mut Rnd, rows: usize, cols: usize, scale: f32) -> WeightRef {
+        let h: Vec<u16> = (0..rows * cols).map(|_| f2h(r.n() * scale)).collect();
+        WeightRef {
+            buf: upload(c, "hc3-test-w", bytemuck::cast_slice(&h)),
+            dtype: TensorDtype::F16,
+            rows,
+            cols,
+        }
+    }
+
+    /// Written over every output buffer before each run, so a value a
+    /// kernel failed to write cannot pass for the other arm's.
+    const POISON: f32 = 7.7e30;
+
+    /// max |a - b| over the first `n` floats of `nt` rows at `stride`,
+    /// relative to max |b|; infinite where either side kept the poison
+    /// the run wrote first (a value the kernel never produced) or is not finite
+    fn rel(a: &[f32], b: &[f32], nt: usize, stride: usize, n: usize) -> f32 {
+        let (mut d, mut m) = (0.0f32, 0.0f32);
+        for t in 0..nt {
+            for i in 0..n {
+                let (x, y) = (a[t * stride + i], b[t * stride + i]);
+                if !x.is_finite() || !y.is_finite() || x == POISON || y == POISON {
+                    return f32::INFINITY;
+                }
+                d = d.max((x - y).abs());
+                m = m.max(y.abs());
+            }
+        }
+        d / m.max(1e-30)
+    }
+
+    #[test]
+    #[ignore = "needs a GPU that admits HC v3"]
+    fn hc3_matches_pre_v3_kernels() {
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu device: skipped");
+            return;
+        };
+        let Some(p) = pipes(c) else {
+            eprintln!("qwen4 kernels unavailable on this adapter: skipped");
+            return;
+        };
+        if p.hc3.is_none() {
+            eprintln!("HC v3 not admitted on {}: skipped", c.adapter_info.name);
+            return;
+        }
+        let (hidden, hc, lr) = (2560usize, 4usize, 320usize);
+        let hh = hc * hidden;
+        let g = Geom {
+            hidden,
+            hc,
+            eps: 1e-6,
+            n_heads: 16,
+            n_kv_heads: 2,
+            head_dim: 256,
+            rotary_dim: 64,
+            index_heads: 4,
+            index_dim: 128,
+            index_budget: 2048,
+            compress_ratio: 4,
+            gdn: GdnGeom {
+                nv: 32,
+                nk: 16,
+                dk: 128,
+                dv: 128,
+                kk: 4,
+            },
+            ple_kernel: 4,
+            ple_dilation: 1,
+            top_k: 10,
+            n_experts: 512,
+            inter: 512,
+            gu_q2: true,
+        };
+        let dev = Dev::new(0xC3C3_0001, &g, &[]).expect("device state");
+        let mut r = Rnd(0x9E37_79B9_7F4A_7C15);
+        let down = f16_weight(c, &mut r, lr, hh, 0.02);
+        let inj_w = f16_weight(c, &mut r, hc, hh, 0.02);
+        let up = f16_weight(c, &mut r, hh, lr, 0.3);
+        let norm: Vec<f32> = (0..hh).map(|_| r.n() * 0.1).collect();
+        let (hs, ls, os) = (
+            es(hh * 4) as usize,
+            es(lr * 4) as usize,
+            es(hidden * 4) as usize,
+        );
+        let gsd = es(hc * 4) as usize;
+        let scales = [1.0f32, 2.0, 0.5, 3.0];
+        let mut h0 = vec![0.0f32; TMAX * hs];
+        for t in 0..TMAX {
+            for i in 0..hh {
+                h0[t * hs + i] = r.n() * scales[i / hidden];
+            }
+        }
+        let mut blk0 = vec![0.0f32; TMAX * os];
+        for t in 0..TMAX {
+            for i in 0..hidden {
+                blk0[t * os + i] = r.n();
+            }
+        }
+        let mut gate0 = vec![0.0f32; TMAX * gsd];
+        for t in 0..TMAX {
+            for s in 0..hc {
+                gate0[t * gsd + s] = r.n() * 2.0;
+            }
+        }
+        let blk = upload(c, "hc3-test-blk", bytemuck::cast_slice(&blk0));
+        let gate = upload(c, "hc3-test-gate", bytemuck::cast_slice(&gate0));
+        let zeros = |n: usize| vec![0u8; n * 4];
+        let x_old = upload(c, "hc3-test-x-old", &zeros(TMAX * os));
+        let x_new = upload(c, "hc3-test-x-new", &zeros(TMAX * os));
+        let y_old = upload(c, "hc3-test-inj-old", &zeros(TMAX * gsd));
+        let y_new = upload(c, "hc3-test-inj-new", &zeros(TMAX * gsd));
+        let nw = const_buf(c, bytemuck::cast_slice(&norm));
+        // one `low` per arm (the frame pool's would carry the reference
+        // arm's values into the v3 readback wherever v3 did not write)
+        let low_old = upload(c, "hc3-test-low-old", &zeros(TMAX * ls));
+        let low_new = upload(c, "hc3-test-low-new", &zeros(TMAX * ls));
+        let poison = |b: &wgpu::Buffer, n: usize| {
+            c.queue
+                .write_buffer(b, 0, bytemuck::cast_slice(&vec![POISON; n]));
+        };
+        let f32s = |b: &[u8]| -> Vec<f32> { bytemuck::cast_slice(b).to_vec() };
+        let mut worst = 0.0f32;
+        for nt in [1usize, 2, 3, 4, 5, 8] {
+            for with_b in [true, false] {
+                for with_pre in [false, true] {
+                    let bc = Bc {
+                        dev: &dev,
+                        li: usize::from(with_b),
+                        tok: TW + nt,
+                        direct: true,
+                    };
+                    let pre = with_pre.then_some(PreInject {
+                        blk: &blk,
+                        bs: os as u32,
+                        gate: &gate,
+                        gs: gsd as u32,
+                        step: 2,
+                    });
+                    let b = with_b.then_some(&inj_w);
+                    let run = |v3: bool| -> Vec<Vec<f32>> {
+                        c.queue
+                            .write_buffer(&dev.hyper, 0, bytemuck::cast_slice(&h0));
+                        let (x, y, low) = if v3 {
+                            (&x_new, &y_new, &low_new)
+                        } else {
+                            (&x_old, &y_old, &low_old)
+                        };
+                        poison(x, TMAX * os);
+                        poison(y, TMAX * gsd);
+                        poison(low, TMAX * ls);
+                        let mut enc = new_encoder("hc3-test").expect("encoder");
+                        {
+                            let mut pass = begin_pass(&mut enc);
+                            if v3 {
+                                encode_hc_v3(
+                                    c,
+                                    p,
+                                    &mut pass,
+                                    &g,
+                                    &nw,
+                                    &down,
+                                    &up,
+                                    b,
+                                    &dev.hyper,
+                                    x,
+                                    low,
+                                    y,
+                                    pre.as_ref(),
+                                    nt,
+                                    bc,
+                                    100,
+                                )
+                                .expect("HC v3 takes this shape");
+                            } else {
+                                if let Some(q) = &pre {
+                                    inject_pre(c, p, &mut pass, &g, &dev.hyper, q, nt, bc);
+                                }
+                                encode_hc_old(
+                                    c, p, &mut pass, &g, &nw, &down, &up, b, &dev.hyper, x, low, y,
+                                    nt, bc, 100,
+                                )
+                                .expect("pre-v3 mix");
+                            }
+                        }
+                        let out = submit_readback(
+                            enc,
+                            &[
+                                (x, (TMAX * os * 4) as u64),
+                                (low, (TMAX * ls * 4) as u64),
+                                (y, (TMAX * gsd * 4) as u64),
+                                (&dev.hyper, (TMAX * hs * 4) as u64),
+                            ],
+                        )
+                        .expect("readback");
+                        let mut parts = Vec::new();
+                        let mut o = 0usize;
+                        for n in [TMAX * os, TMAX * ls, TMAX * gsd, TMAX * hs] {
+                            parts.push(f32s(&out[o..o + n * 4]));
+                            o += (n * 4).div_ceil(16) * 16;
+                        }
+                        parts
+                    };
+                    let old = run(false);
+                    let new = run(true);
+                    let ex = rel(&new[0], &old[0], nt, os, hidden);
+                    let el = rel(&new[1], &old[1], nt, ls, lr);
+                    let ei = if with_b {
+                        rel(&new[2], &old[2], nt, gsd, hc)
+                    } else {
+                        0.0
+                    };
+                    let eh = rel(&new[3], &old[3], nt, hs, hh);
+                    eprintln!(
+                        "nt {nt} gate rows {with_b:5} inject {with_pre:5}: x {ex:.2e} low {el:.2e} \
+                         gate {ei:.2e} hyper {eh:.2e}"
+                    );
+                    worst = worst.max(ex).max(el).max(ei).max(eh);
+                    // the rows past nt stay as they were
+                    for t in nt..TMAX {
+                        assert_eq!(
+                            &new[3][t * hs..t * hs + hh],
+                            &h0[t * hs..t * hs + hh],
+                            "hyper row {t} past nt = {nt} touched"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(worst < 1e-4, "HC v3 departs from the pre-v3 mix: {worst:e}");
     }
 }
 
