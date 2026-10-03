@@ -91,7 +91,11 @@ fn score_question() -> Value {
 #[test]
 fn bodies_equal_the_driver_for_nine_ledger_calls() {
     let fx = fixtures();
-    let cfg = OracleConfig::default();
+    // The driver's body: no distribution asked (DESIGN C3).
+    let cfg = OracleConfig {
+        probabilities: false,
+        ..OracleConfig::default()
+    };
     let max_price = cfg.max_price().unwrap();
     let mut n = 0;
     for (ds, d) in fx["datasets"].as_object().unwrap() {
@@ -125,7 +129,10 @@ fn a_rubric_stored_in_a_skill_manifest_rebuilds_the_driver_body() {
     // (canonical JSON: sorted criteria plus `criteria_order`) it must rebuild the
     // driver's body for the same text, so the v4 dev ledgers can be reused.
     let fx = fixtures();
-    let cfg = OracleConfig::default();
+    let cfg = OracleConfig {
+        probabilities: false,
+        ..OracleConfig::default()
+    };
     for d in fx["datasets"].as_object().unwrap().values() {
         let q = &d["question"];
         let rubric = Rubric::new(
@@ -181,6 +188,7 @@ fn bodies_on_the_wire_equal_the_driver_and_replay_the_ledger() {
     // cache is off so that every row is a call.
     let mut cfg = stand_config(&mock.url());
     cfg.cache.enabled = false;
+    cfg.oracle.probabilities = false;
     let st = Stand::new(&cfg);
     for (i, (q, r)) in cases.iter().enumerate() {
         let mut question = q.as_object().unwrap().clone();
@@ -189,10 +197,9 @@ fn bodies_on_the_wire_equal_the_driver_and_replay_the_ledger() {
         let d = st.decide(&b).unwrap();
         let o = &d.questions[0];
         assert_eq!(o.action, Action::Oracle, "row {i}");
-        assert_eq!(
-            d.response["answers"]["task"],
-            json!({"type": "choice", "choice": r["oracle"]["choice"]})
-        );
+        let a = &d.response["answers"]["task"];
+        assert_eq!(a["choice"], r["oracle"]["choice"]);
+        assert_eq!(a["probabilities"][a["choice"].as_str().unwrap()], 1);
         let cost = r["oracle"]["usage"]["cost"].as_f64().unwrap();
         assert_eq!(
             d.response["cmf"]["usage"]["oracle"]["cost"].as_f64(),
@@ -230,10 +237,8 @@ fn abstain_goes_to_the_oracle_with_usage_and_passthrough_cost() {
     assert_eq!(q.action, Action::Oracle);
     assert!(!q.certified);
     assert_eq!(q.decision_path, "escalate→oracle");
-    assert_eq!(
-        d.response["answers"]["task"],
-        json!({"type": "choice", "choice": "travel"})
-    );
+    assert_eq!(d.response["answers"]["task"]["choice"], "travel");
+    assert_eq!(d.response["answers"]["task"]["confidence"], 1);
     let cq = &d.response["cmf"]["questions"]["task"];
     assert_eq!(cq["source"], "oracle");
     assert_eq!(cq["gate"]["accepted"], false, "the local gate rejected it");
@@ -275,7 +280,8 @@ fn abstain_goes_to_the_oracle_with_usage_and_passthrough_cost() {
     assert_eq!(lines[1]["cost_usd"].as_f64(), Some(1.3e-5));
     assert_eq!(lines[1]["request_id"], json!(d.id));
     let res = lines[0]["reserved_usd"].as_f64().unwrap();
-    let expect = oracle::reservation_usd(sent.body.len(), 64, (0.1, 0.5));
+    // 64 for the verdict, 128 for its distribution (DESIGN C3).
+    let expect = oracle::reservation_usd(sent.body.len(), 64 + 128, (0.1, 0.5));
     assert_eq!(res, expect);
     let t = st.cascade.oracle().totals();
     assert_eq!(
@@ -319,7 +325,7 @@ fn gate_accepted_questions_never_reach_the_oracle() {
         sent["messages"][0]["content"]
             .as_str()
             .unwrap()
-            .starts_with(oracle::SYSTEM_TYPED)
+            .starts_with(oracle::SYSTEM_TYPED_P)
     );
 }
 
@@ -1159,9 +1165,11 @@ fn multitype_request_is_answered_through_the_mock() {
         sent["response_format"]["json_schema"]["schema"]["required"],
         json!(["team", "urgency", "refund"])
     );
-    assert_eq!(sent["max_tokens"], 192);
+    // 64 per verdict, 128 per distribution (DESIGN C3).
+    assert_eq!(sent["max_tokens"], 576);
     let a = &d.response["answers"];
-    assert_eq!(a["team"], json!({"type": "choice", "choice": "billing"}));
+    assert_eq!(a["team"]["choice"], "billing");
+    assert_eq!(a["team"]["probabilities"]["billing"], 1);
     assert_eq!(a["urgency"]["score"], 0);
     assert_eq!(
         a["urgency"]["legend"]["2"],
@@ -1169,7 +1177,7 @@ fn multitype_request_is_answered_through_the_mock() {
     );
     assert_eq!(
         a["refund"],
-        json!({"type": "noul", "noul": 1, "value_semantics": "boolean_verdict_not_probability"})
+        json!({"type": "noul", "noul": 1, "value_semantics": "boolean_verdict_not_probability", "probability": 1})
     );
     for q in ["team", "urgency", "refund"] {
         assert_eq!(d.response["cmf"]["questions"][q]["action"], "oracle");

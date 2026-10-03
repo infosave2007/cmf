@@ -54,11 +54,14 @@ says first whether it is ready — [Check your setup](#check-your-setup)).
    scope, cosine ≥ 0.97) waits for that call instead of making its own.
 5. **One call** carries all remaining questions of the request: `POST
    {base_url}/chat/completions` with a strict JSON-schema answer (an enum of
-   the option ids for choice, an integer level for score, a boolean for noul),
-   `temperature 0`, reasoning off, `max_tokens` 64 per question. The system
-   prompt tells the model that the state is untrusted data, not instructions.
+   the option ids for choice, an integer level for score, a boolean for noul)
+   and, since 0.8.8, a distribution beside each verdict ([Probabilities](#probabilities)),
+   `temperature 0`, reasoning off unless `oracle.reasoning` sets an effort
+   ([Reasoning](#reasoning)), `max_tokens` 64 per question plus 128 per
+   question for the distribution. The system prompt tells the model that the
+   state is untrusted data, not instructions.
 6. **Result.** A valid answer is `action: oracle` with its cost in
-   `usage` and is stored in the cache. For a choice question matched to a
+   `usage` and is stored in the cache (with its distribution). For a choice question matched to a
    skill it becomes a learning example of that skill — which every account
    is served — when the caller's key has `learning_allowed`, or when the
    question is exactly the skill's own (its rubric's instructions and
@@ -69,6 +72,17 @@ says first whether it is ready — [Check your setup](#check-your-setup)).
    answers are cached but never learned. A failed call never becomes an error for a trained
    question: it is answered locally with `action: abstain` and the flag
    `oracle_unavailable` (an untrained question gets 502).
+
+A question whose ids no skill has but whose option descriptions name one
+data skill's labels (positional ids `option_0…`, the label names as
+descriptions — the Decision Index's BANKING77 and CLINC150 rows) is decided
+by that skill ([API.md §3.2](API.md#32-skill-matching-and-certified),
+"Matching by descriptions"): locally when its gate accepts; a rejected text
+is answered locally with the question's none option ("out of scope…",
+"none of…") when it has one, else it goes to the oracle, whose answer
+teaches the skill the option's label. In a state-less request the text after
+a lead-in line ("Classify the intent of this request:\n<text>") is what the
+local model reads; the oracle gets the instructions verbatim.
 
 Superset questions (a skill's labels plus new ones) are decided by the oracle
 only; for a caller with `learning_allowed` the answer teaches that skill, and
@@ -155,6 +169,38 @@ goes to the oracle on every new text and, until 0.8.5, was never learned. Since
   skill's rubric (the id is recomputed from it), visible through
   `/v1/skills/{id}` to every key. The contract is written to `learn.log`
   before its first example, so a restart rebuilds it.
+* **State-less requests (0.8.8).** A request with an empty `state` (`""`,
+  `{}`, `[]`, `null`) — a benchmark kit that writes `state: {}` and the item
+  into the instructions — is read through each question's instructions
+  (canonical JSON for an object or array). The contract of such a question
+  is `{type, input: "instructions", criteria}`: the instructions are its
+  data, not part of the key, so every item under the same options and
+  descriptions teaches one auto-skill, and the same criteria under a
+  non-empty state are another contract. The cache and single flight use the
+  φ of the instructions text under that contract. The rubric of such a skill
+  stores `instructions: null` and `input: "instructions"`; `learn.log` tells
+  the contract apart by its id (the record format is unchanged). Because a
+  contract that is seen only once is useless to learn — a multiple-choice
+  item whose option descriptions change with every question is its own
+  contract — a state-less contract is registered only at its
+  `learning.auto_min_sightings`-th sighting (5; an escalation of one of its
+  learnable questions, whatever answers it), counted in an in-memory LRU of
+  `learning.auto_sightings_cap` (100000) contracts that a restart clears;
+  before that its answers are served and cached but not learned, nothing is
+  written to `learn.log` and it takes no slot of the registry. 5, because a
+  contract cannot activate before `auto_min_rows` (10) examples of each of
+  its labels anyway, while items seen two or three times (WinoGrande twin
+  sentences, a repeated MuSR question) are not worth a skill: on the
+  Decision Index suite's state-less rows 2 registered 756 contracts, 5
+  registered 20. Stateful contracts register at their first sighting, as in
+  0.8.6 (from 0.8.8 at their `learning.auto_min_sightings_stateful`-th, 1 by
+  default, counted in the same LRU), against `auto_max_skills`; state-less
+  ones have their own cap
+  `auto_max_stateless_skills` (256), so stateful one-offs (per-row
+  instructions, a tool catalogue per request) never take their slots. State-less
+  answers are never `certified`. A state-less auto-skill answers state-less
+  requests only: its rubric has no instructions, so `/v1/route` and
+  `cortiq decide --skill` (which read a text as the state) do not reach it.
 * **Who teaches.** Only a caller whose key has `learning_allowed` (the explicit
   open mode `auth.require: false` has it; the implicit open mode of a loopback
   address never teaches). The rule "a question that is exactly the skill's own
@@ -218,9 +264,13 @@ goes to the oracle on every new text and, until 0.8.5, was never learned. Since
   consented, learning and `auto_skills` on, a key with `learning_allowed`;
   data skills, `cortiq decide`, shadow mode and `/v1/route` never explore.
 * **Limits.** A contract is learned only with 2..`auto_max_labels` (64) option
-  ids and while fewer than `auto_max_skills` (256) contracts are registered;
+  ids and while fewer than `auto_max_skills` (256) stateful, or
+  `auto_max_stateless_skills` (256) state-less, contracts are registered;
   otherwise the oracle answers and nothing is recorded (`auto_skipped` in
-  `GET /v1/admin/learning`, one warning an hour, never the ids). Every
+  `GET /v1/admin/learning`, one warning an hour, never the ids). Intent
+  suites have more options than the default: BANKING77 sends 77 ids and
+  CLINC150 151 (with out-of-scope), so a gateway meant to learn them sets
+  `learning.auto_max_labels` to 255. Every
   generation re-carries every auto-skill's rows: with many contracts run
   `cortiq decision materialize` from time to time and serve the materialised
   file (it holds the auto-skills as ordinary skills; `decide --labels` and
@@ -240,8 +290,10 @@ goes to the oracle on every new text and, until 0.8.5, was never learned. Since
 * **Admin.** `GET /v1/admin/learning` lists `auto_skills` (id, labels,
   `examples` per label — the rows the next attempt fits: the served learned
   rows of the label plus the buffer examples not among them, each row once,
-  so their sum is the attempt's `rows.total` — what is served),
-  `auto_contracts` and `auto_skipped`;
+  so their sum is the attempt's `rows.total` — what is served, `stateless`),
+  `auto_contracts`, `auto_skipped`, `auto_sightings` (state-less contracts
+  seen and not registered yet) and `auto_registered` (contracts this process
+  registered);
   attempts carry `kind: auto_start | auto_refit` and an `auto` block with the
   eligible and quarantined labels, the rows and the agreement. `/healthz`
   adds `auto_skills`. Rollback to an earlier generation drops the skill from
@@ -253,6 +305,61 @@ goes to the oracle on every new text and, until 0.8.5, was never learned. Since
   older binary on a newer state directory). The cache scope of a contract
   changes from the contract to the skill at its activation, so its first
   requests after that miss the cache (they are answered locally anyway).
+  A 0.8.7 or older binary truncates a 0.8.8 `learn.log` at the first state-less
+  contract record and refuses a manifest whose rubric carries `input`.
+
+## Probabilities
+
+Since 0.8.8 (`oracle.probabilities`, on by default) the oracle answers each
+question with its verdict and a distribution: for a choice the at most 5 most
+likely option ids with their probabilities, for a score one probability per
+level, for a noul p(true). The server checks it (finite numbers in [0, 1],
+which the schema also states, ids of the question, each once, at most one
+per level; a malformed distribution is dropped and the valid verdict kept as
+one-hot, so the call neither fails nor counts toward `max_errors`) and
+normalizes it: the listed options keep their mass (renormalized when it
+is above 1), the rest is spread uniformly over the unlisted ones, and the
+verdict becomes the argmax (a tie goes to the stated verdict; a noul is true
+above 0.5). Every surface answers with it — `probabilities` and `confidence`
+= p(choice) on `/v1/decisions` and `/v1/systemone` (a native noul keeps its
+verdict and adds `probability`; System One's noul is p(true)) — and the
+cache keeps it: a cache answer carries the stored distribution, also after a
+restart. The learning example is the argmax label, as before. A verdict
+without a distribution (a bare one, or `probabilities: false`, which sends
+the 0.8.7 request) is one-hot. Each question adds
+`oracle.probability_tokens_per_question` (128) to `max_tokens`: measured with
+the o200k tokenizer, five listed ids cost 57–87 tokens more than the bare
+verdict, a 10-level score 39, a noul 10.
+
+`learn.log` keeps a cache entry with a distribution as a new `CachePutP`
+record; an entry without one keeps the 0.8.7 `CachePut` record, and every
+0.8.7 `CachePut` replays as one-hot. A 0.8.7 binary stops replaying at the
+first `CachePutP`: never run an older binary on a newer state directory.
+
+## Reasoning
+
+`oracle.reasoning` (`off` by default; `low`, `medium`, `high`) lets the
+oracle model reason before it answers, at that OpenRouter effort
+(`reasoning: {effort, exclude: true}`: the reasoning text is not returned,
+the verdicts are still the final message). It is a trade of accuracy against
+latency and cost: every call's `max_tokens` grows by
+`oracle.reasoning_max_tokens` (4096) — which the reservation, and so the
+budget, accounts for — its deadline by `oracle.reasoning_deadline_s` (60 s,
+on top of `deadline_s`), and the reasoning tokens are billed: OpenRouter's
+`usage.cost` includes them, the ledger's `settled` line and
+`cmf.usage.oracle.reasoning_tokens` show how many there were. Measure it on
+your own traffic before turning it on; the provider must support reasoning
+(`provider.require_parameters: true` keeps OpenRouter from routing to one
+that does not, but not from one that accepts the parameter and ignores it:
+check that the ledger shows reasoning tokens, and list such a provider in
+`provider.ignore`).
+
+A reasoning call that outgrows its token allowance (`finish_length`) or its
+deadline (`read_timeout`, `transport_timeout`) is asked once more without
+reasoning, so the question still gets the oracle's direct answer. Both calls
+are in the ledger (the first one is billed when the provider bills it), the
+stop rules count the second one's outcome, and a follower waiting for the
+same question waits for both.
 
 ## Budget and stop rules
 
@@ -275,7 +382,12 @@ goes to the oracle on every new text and, until 0.8.5, was never learned. Since
   --oracle-resume` on a state directory no server holds): HTTP 401, 402 or
   403 from OpenRouter; a returned model that is not the configured one; a
   cost above the reservation; `max_errors` failures in a row (counted across
-  restarts and `cortiq decide` runs).
+  restarts and `cortiq decide` runs). An upstream refusal that the prompt
+  does not fit the model's context (a 400/413/422 whose body names the
+  context length) is the failure `context_length`: the question gets a 422
+  whose message says `maximum context length` (a trained one abstains), it
+  does not count toward `max_errors` — a run of long items must not stop a
+  working oracle — and its reservation counts as likely unbilled.
 * `GET /v1/admin/oracle` shows spent, reserved, remaining, calls, failures and
   the stop reason; `POST /v1/admin/oracle` can switch the oracle and lower
   `budget_usd` / `max_calls` within the configured values.
@@ -283,7 +395,10 @@ goes to the oracle on every new text and, until 0.8.5, was never learned. Since
 ## What leaves the machine
 
 * **Sent**, only for undetermined questions with the oracle permitted: the
-  `state` and the `instructions` and `criteria` of those questions. Receivers:
+  `state` and the `instructions` and `criteria` of those questions. In a
+  state-less request (empty `state`) the instructions are the input; since
+  0.8.8 every question's instructions and its criteria's descriptions are
+  redacted like a state (below), the option ids never. Receivers:
   OpenRouter and the provider it routes to (`provider.sort: price`,
   fallbacks allowed; set `oracle.data_collection: "deny"` to exclude providers
   that store data).
@@ -292,8 +407,12 @@ goes to the oracle on every new text and, until 0.8.5, was never learned. Since
   a letter) and numbers of 9 or more digits — also when their digit groups
   are separated by spaces, dashes, dots, slashes or parentheses, as in
   `4111 1111 1111 1111`, `+1 (555) 123-4567` or a spaced IBAN — in every
-  string of the state are replaced by `[REDACTED]` and the question gets the
-  flag `pii_redacted`. It is a heuristic: names, postal addresses, numbers
+  string of the state and, since 0.8.8, of each question's instructions and
+  criteria descriptions (object keys — the option ids — and a score level's
+  position are kept) are replaced by `[REDACTED]` and the question gets the
+  flag `pii_redacted`. Only the copy sent is redacted: the cache scope and
+  the auto-skill contract are those of the question as asked, so caching and
+  learning do not change. It is a heuristic: names, postal addresses, numbers
   written in words and identifiers with letters between short digit groups
   are not detected. A request can opt out with `cmf.allow_pii_egress`
   (router: `options.allow_pii_egress`).

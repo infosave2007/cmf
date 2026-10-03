@@ -14,8 +14,8 @@ rust-version.workspace = true
 
 # CPU remains the runtime default; Metal and Vulkan require explicit selection.
 [dependencies]
-cortiq-core = { path = "../cortiq-core", version = "0.8.7" }
-cortiq-engine = { path = "../cortiq-engine", version = "0.8.7" }
+cortiq-core = { path = "../cortiq-core", version = "0.8.8" }
+cortiq-engine = { path = "../cortiq-engine", version = "0.8.8" }
 serde = { workspace = true }
 # Canonical JSON and the Jev criteria order need insertion-ordered maps.
 serde_json = { workspace = true, features = ["preserve_order"] }

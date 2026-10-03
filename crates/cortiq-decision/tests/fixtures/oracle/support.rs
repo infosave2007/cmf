@@ -468,7 +468,13 @@ pub fn verdicts(req: &MockRequest, choose: impl Fn(&str, &[String]) -> Value) ->
     let mut out = Map::new();
     for q in schema["required"].as_array().unwrap() {
         let qid = q.as_str().unwrap();
+        // 0.8.8 (DESIGN C3): the verdict sits beside its distribution; a
+        // bare verdict is still read (one-hot).
         let p = &schema["properties"][qid];
+        let p = ["choice", "score", "noul"]
+            .iter()
+            .find_map(|k| p["properties"].get(*k))
+            .unwrap_or(p);
         let a = match p["type"].as_str().unwrap() {
             "string" => {
                 let opts: Vec<String> = p["enum"]
