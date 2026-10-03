@@ -511,6 +511,18 @@ impl QwenGpuPool {
         }
     }
 
+    /// The staged uploads as a command buffer to submit ahead of a frame
+    /// in the same queue submission; `rearm_uploads` follows the submit.
+    pub(crate) fn take_uploads(&mut self) -> Option<wgpu::CommandBuffer> {
+        self.stager.as_mut().and_then(|st| st.take())
+    }
+
+    pub(crate) fn rearm_uploads(&mut self) {
+        if let Some(st) = self.stager.as_mut() {
+            st.rearm();
+        }
+    }
+
     /// Upload a frame's cold winners into the staging slots of token slot
     /// `tok` (rank `j` each), outside the LRU. Returns the slot per expert,
     /// `None` where the upload failed or no staging exists.
@@ -858,6 +870,12 @@ impl QwenGpuPool {
         };
         let (capacity, segment_slots) = if pct_env == "CMF_DSV41_POOL_PCT" {
             crate::gpu_wgpu::dsv4_global_moe_create_for_dsv41(
+                model, requested, inter, hidden, gu_q2,
+            )?
+        } else if explicit_slots.is_some() && pct_env == "CMF_QWEN_POOL_PCT" {
+            // the device path: the caller already left its reserve and the
+            // workspace (see the arena sizing in `forward_tokens_device`)
+            crate::gpu_wgpu::dsv4_global_moe_create_s8_exact(
                 model, requested, inter, hidden, gu_q2,
             )?
         } else if pct_env == "CMF_QWEN_MTP_BANK" {
@@ -1806,6 +1824,25 @@ fn shifted_token(history: &[u32], current: u32, shift: usize, eos: u32) -> u32 {
 }
 
 fn ple_embedding(w: &PleWeights, cfg: &Cfg, history: &[u32], token: u32) -> Vec<f32> {
+    let ids = ple_row_ids(w, cfg, history, token);
+    let mut out = vec![0.0f32; ids.len() * w.row_dim];
+    for (hi, &id) in ids.iter().enumerate() {
+        ple_row(w, id, &mut out[hi * w.row_dim..(hi + 1) * w.row_dim]);
+    }
+    out
+}
+
+/// One n-gram table row, dequantized into `dst` (`row_dim` long).
+fn ple_row(w: &PleWeights, id: i64, dst: &mut [f32]) {
+    let global = id as usize;
+    let shard = global / w.rows_per_shard;
+    let local = global % w.rows_per_shard;
+    debug_assert!(shard < w.shards.len());
+    w.shards[shard].row_f32(local, dst);
+}
+
+/// The table rows a token's n-gram heads read, in head order.
+fn ple_row_ids(w: &PleWeights, cfg: &Cfg, history: &[u32], token: u32) -> Vec<i64> {
     let shifted: Vec<i64> = (0..cfg.ngram_size)
         .map(|s| shifted_token(history, token, s, cfg.eos) as i64)
         .collect();
@@ -1820,15 +1857,65 @@ fn ple_embedding(w: &PleWeights, cfg: &Cfg, history: &[u32], token: u32) -> Vec<
             ids.push(mixed.rem_euclid(w.vocab_sizes[hi]) + w.offsets[hi]);
         }
     }
-    let mut out = vec![0.0f32; ids.len() * w.row_dim];
-    let mut row = vec![0.0f32; w.row_dim];
-    for (hi, &id) in ids.iter().enumerate() {
-        let global = id as usize;
-        let shard = global / w.rows_per_shard;
-        let local = global % w.rows_per_shard;
-        debug_assert!(shard < w.shards.len());
-        w.shards[shard].row_f32(local, &mut row);
-        out[hi * w.row_dim..(hi + 1) * w.row_dim].copy_from_slice(&row);
+    ids
+}
+
+/// The n-gram rows of every PLE layer for every token of a frame, each
+/// against its own history: `[layer][token]` → heads × `row_dim`. The rows
+/// are scattered over a ~25 GB table, so on a host whose page cache does
+/// not hold the file every row is a disk read; read one after another they
+/// cost tens of milliseconds per token. They are independent, so the pool
+/// reads them all at once.
+fn ple_frame_rows(
+    layers: &[Layer],
+    cfg: &Cfg,
+    history: &[u32],
+    ids: &[u32],
+    pool: Option<&Pool>,
+) -> Vec<Vec<Vec<f32>>> {
+    let mut out: Vec<Vec<Vec<f32>>> = Vec::with_capacity(layers.len());
+    // (layer, token, head, row id), and the destination of each row
+    let mut jobs: Vec<(usize, usize, usize, i64)> = Vec::new();
+    let mut hist: Vec<u32> = history.to_vec();
+    for (li, l) in layers.iter().enumerate() {
+        let Some(pw) = l.ple.as_ref() else {
+            out.push(Vec::new());
+            continue;
+        };
+        hist.truncate(history.len());
+        let mut rows = Vec::with_capacity(ids.len());
+        for (t, &id) in ids.iter().enumerate() {
+            let rid = ple_row_ids(pw, cfg, &hist, id);
+            rows.push(vec![0.0f32; rid.len() * pw.row_dim]);
+            jobs.extend(rid.into_iter().enumerate().map(|(h, r)| (li, t, h, r)));
+            hist.push(id);
+        }
+        out.push(rows);
+    }
+    // the tables alone: a layer also holds host-side caches that are not Sync
+    let tables: Vec<Option<&PleWeights>> = layers.iter().map(|l| l.ple.as_ref()).collect();
+    let dst: Vec<crate::pool::SendMut> = jobs
+        .iter()
+        .map(|&(li, t, h, _)| {
+            let dim = tables[li].map_or(0, |w| w.row_dim);
+            crate::pool::SendMut::new(out[li][t][h * dim..].as_mut_ptr())
+        })
+        .collect();
+    let read = |s: usize, e: usize| {
+        for j in s..e {
+            let (li, _, _, id) = jobs[j];
+            let Some(w) = tables[li] else {
+                continue;
+            };
+            // SAFETY: every job owns a distinct `row_dim` slice of `out`,
+            // which outlives the dispatch.
+            let row = unsafe { std::slice::from_raw_parts_mut(dst[j].at(0), w.row_dim) };
+            ple_row(w, id, row);
+        }
+    };
+    match pool {
+        Some(p) if jobs.len() > 1 => p.run_rows(jobs.len(), &read),
+        _ => read(0, jobs.len()),
     }
     out
 }
@@ -2470,6 +2557,14 @@ struct DevProf {
     layers_with_cold: usize,
     chains: usize,
     aborted: usize,
+    /// finishing encoders into command buffers (encode-ahead included)
+    finish: std::time::Duration,
+    /// spin on the frame's fence only
+    spin: std::time::Duration,
+    /// from the fence to the next submit: cold parse, admissions, finalize
+    post: std::time::Duration,
+    /// gathering the frame's PLE n-gram rows from the mapped table
+    ple: std::time::Duration,
 }
 
 /// The whole token on the card. Returns `false` when the device path is
@@ -2698,9 +2793,25 @@ fn forward_tokens_device(
             // frame scratch and f32 K/V to ~16k context; raise it for longer
             // sequences (`CMF_QWEN_KV_RESERVE_MB`), lower it for more experts.
             .unwrap_or(768);
+        // The generic bank allocator would carve another (budget/10)
+        // clamped to 2-4 GiB below the request, a workspace for the DSV4/GLM
+        // paths that this path never uses: its KV and frames live in the
+        // reserve above. Below a 24 GiB budget the carve-out stays (slot
+        // counts as before); on a 32 GB card it would idle ~2.8 GiB, about
+        // 1,700 expert slots. `CMF_QWEN_WORKSPACE_MB` overrides.
+        let workspace = std::env::var("CMF_QWEN_WORKSPACE_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|m| m << 20)
+            .unwrap_or(if budget >= 24 << 30 {
+                0
+            } else {
+                (budget / 10).clamp(2 << 30, 4 << 30)
+            });
         let free = budget
             .saturating_sub(resident)
-            .saturating_sub(reserve_mb << 20);
+            .saturating_sub(reserve_mb << 20)
+            .saturating_sub(workspace);
         let slots = (free / per as u64) as usize;
         let n_layers = layers.len();
         // staging for the cold passes: one slot per token slot and rank
@@ -2719,9 +2830,11 @@ fn forward_tokens_device(
         };
         if prof {
             eprintln!(
-                "qwen4-device: budget {} MB, skeleton resident {} MB, arena request {} slots ({} MB), got {} slots",
+                "qwen4-device: budget {} MB, skeleton resident {} MB, reserve {} MB, workspace {} MB, arena request {} slots ({} MB), got {} slots",
                 budget >> 20,
                 resident >> 20,
+                reserve_mb,
+                workspace >> 20,
                 slots,
                 (slots as u64 * per as u64) >> 20,
                 arena.owner.len()
@@ -2822,22 +2935,9 @@ fn forward_tokens_device(
         dev.seed(t, &emb, cfg.hc);
     }
     // the PLE rows of every token of the chunk, against its own history
-    let mut hist: Vec<u32> = state.token_history.clone();
-    let ple_rows: Vec<Vec<Vec<f32>>> = layers
-        .iter()
-        .map(|l| match l.ple.as_ref() {
-            Some(pw) => {
-                let mut rows = Vec::with_capacity(ntok);
-                hist.truncate(state.token_history.len());
-                for &id in ids {
-                    rows.push(ple_embedding(pw, cfg, &hist, id));
-                    hist.push(id);
-                }
-                rows
-            }
-            None => Vec::new(),
-        })
-        .collect();
+    let tp = std::time::Instant::now();
+    let ple_rows = ple_frame_rows(layers, cfg, &state.token_history, ids, pool);
+    pf.ple += tp.elapsed();
     // Frames 0..n are the layers, frame n the head. A chain of frames goes
     // out in one submission; its layers are gated on the card so that a
     // cold expert in one of them leaves every later frame unexecuted, and
@@ -2849,7 +2949,12 @@ fn forward_tokens_device(
     // Single-frame chains are encoded one frame ahead, while the card runs
     // the current one: with one frame per chain the next chain always
     // starts at the next frame, miss or not.
-    let mut prepared: Option<(wgpu::CommandEncoder, u64, Option<usize>, usize)> = None;
+    // It is finished into a command buffer right there: wgpu records the
+    // real commands at finish, and doing it after the fence would put that
+    // replay between one frame's fence and the next frame's submit.
+    let mut prepared: Option<(wgpu::CommandBuffer, u64, Option<usize>, usize)> = None;
+    let dump_hyper = std::env::var("CMF_QWEN_DUMP_HYPER").ok();
+    let mut t_fence: Option<std::time::Instant> = None;
     // the row stride of the head's logits in the stage (bytes)
     let mut lstride_out = 0usize;
     while fi < frames_total && failed.is_none() {
@@ -2954,7 +3059,7 @@ fn forward_tokens_device(
             drop(merge);
             Ok((enc, stage_off, logits_off, lstride))
         };
-        let (enc, stage_off, logits_off, ls) = match prepared.take() {
+        let (cb, stage_off, logits_off, ls) = match prepared.take() {
             Some(p) => p,
             None => match encode_chain(
                 fi,
@@ -2965,7 +3070,12 @@ fn forward_tokens_device(
                 &mut pf,
                 &mut vocab_out,
             ) {
-                Ok(r) => r,
+                Ok((e, a, b, c)) => {
+                    let tf = std::time::Instant::now();
+                    let cb = q4::finish_frame(e);
+                    pf.finish += tf.elapsed();
+                    (cb, a, b, c)
+                }
                 Err(why) => {
                     failed = Some(why);
                     break;
@@ -2982,12 +3092,17 @@ fn forward_tokens_device(
             break;
         }
         let t0 = std::time::Instant::now();
-        // staged admissions land before the frame that reads their slots
-        arena.flush_uploads();
-        let Some(pend) = q4::submit_chain(dev, enc, stage_off) else {
+        // staged admissions land before the frame that reads their slots:
+        // their copies go first in the frame's own queue submission
+        let uploads = arena.take_uploads();
+        let Some(pend) = q4::submit_frame(dev, uploads, cb, stage_off) else {
             failed = Some("submit");
             break;
         };
+        arena.rearm_uploads();
+        if let Some(tf) = t_fence.take() {
+            pf.post += tf.elapsed();
+        }
         // one frame per chain: the next frame is encoded while this one runs
         arena.hold_layers = [None, None];
         if chain_len == 1 && hi < frames_total {
@@ -3001,7 +3116,11 @@ fn forward_tokens_device(
                 &mut pf,
                 &mut vocab_out,
             ) {
-                Ok(r) => prepared = Some(r),
+                Ok((e, a, b, c)) => {
+                    let tf = std::time::Instant::now();
+                    prepared = Some((q4::finish_frame(e), a, b, c));
+                    pf.finish += tf.elapsed();
+                }
                 Err(why) => {
                     failed = Some(why);
                     break;
@@ -3012,11 +3131,14 @@ fn forward_tokens_device(
             // that layer's experts, nor this layer's own winners of the frame
             arena.hold_layers = [(hi < n).then_some(hi), (fi < n).then_some(fi)];
         }
+        let ts = std::time::Instant::now();
         let Some(bytes) = pend.wait() else {
             failed = Some("readback");
             break;
         };
+        pf.spin += ts.elapsed();
         pf.wait += t0.elapsed();
+        t_fence = Some(std::time::Instant::now());
         pf.chains += 1;
         // the first frame of the chain that routed to a cold expert
         let mut miss_at: Option<usize> = None;
@@ -3027,12 +3149,12 @@ fn forward_tokens_device(
             }
             let layer = &layers[f];
             dev.commit(f);
-            if let Ok(dir) = std::env::var("CMF_QWEN_DUMP_HYPER")
+            if let Some(dir) = dump_hyper.as_deref()
                 && let Some(rows) = q4::read_hyper(dev, ntok, cfg.hc * cfg.hidden)
             {
                 let _ = std::fs::create_dir_all(&dir);
                 for (t, row) in rows.iter().enumerate() {
-                    let path = std::path::Path::new(&dir)
+                    let path = std::path::Path::new(dir)
                         .join(format!("pos{:05}_layer{f:02}.f32", pos0 + t));
                     let bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
                     let _ = std::fs::write(path, bytes);
@@ -3233,10 +3355,14 @@ fn forward_tokens_device(
         let fill_ns = FILL_NS.swap(0, std::sync::atomic::Ordering::Relaxed);
         let fill_n = FILL_N.swap(0, std::sync::atomic::Ordering::Relaxed);
         eprintln!(
-            "qwen4-device pos={position} ntok={ntok} total={:.1}ms encode={:.1}ms wait={:.1}ms cold_cpu={:.1}ms admit={:.1}ms chains={} aborted_frames={} cold={} experts ({} on device) in {} layers fills={fill_n} fill_sum={:.1}ms",
+            "qwen4-device pos={position} ntok={ntok} total={:.1}ms encode={:.1}ms finish={:.1}ms wait={:.1}ms spin={:.1}ms post={:.1}ms ple={:.1}ms cold_cpu={:.1}ms admit={:.1}ms chains={} aborted_frames={} cold={} experts ({} on device) in {} layers fills={fill_n} fill_sum={:.1}ms",
             t_token.elapsed().as_secs_f64() * 1e3,
             pf.encode.as_secs_f64() * 1e3,
+            pf.finish.as_secs_f64() * 1e3,
             pf.wait.as_secs_f64() * 1e3,
+            pf.spin.as_secs_f64() * 1e3,
+            pf.post.as_secs_f64() * 1e3,
+            pf.ple.as_secs_f64() * 1e3,
             pf.cold_cpu.as_secs_f64() * 1e3,
             pf.admit.as_secs_f64() * 1e3,
             pf.chains,

@@ -19182,6 +19182,29 @@ pub(crate) fn ranked_adapters(instance: &wgpu::Instance, backends: wgpu::Backend
     all
 }
 
+/// Instance flags for the compute context. wgpu's release default keeps
+/// `VALIDATION_INDIRECT_CALL`, which puts a validation dispatch, a
+/// pipeline switch and barriers in front of EVERY indirect dispatch;
+/// on the qwen4 device path (cold passes, layer chains) that is a few
+/// microseconds per call. Our indirect arguments are written by our own
+/// code and stay far below `max_compute_workgroups_per_dimension`, so the
+/// validation is dropped where the backend allows it.
+/// `WGPU_VALIDATION_INDIRECT_CALL=1` brings it back (only that variable is
+/// read: `with_env()` would also honour WGPU_VALIDATION and friends and
+/// switch on the slow validation layers). DX12 keeps it: without it
+/// `@builtin(num_workgroups)` reads 0 there and grid-stride loops never end.
+/// Dropping the flag also lifts wgpu's 4 GiB `max_buffer_size` cap; the
+/// device request in `init` re-applies it.
+fn instance_flags(backends: wgpu::Backends) -> wgpu::InstanceFlags {
+    let mut flags = wgpu::InstanceFlags::default();
+    let forced = std::env::var("WGPU_VALIDATION_INDIRECT_CALL")
+        .ok()
+        .map(|v| v != "0");
+    let keep = forced.unwrap_or(cfg!(windows) && backends.contains(wgpu::Backends::DX12));
+    flags.set(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL, keep);
+    flags
+}
+
 fn init(dev: usize) -> Result<Ctx, String> {
     // Backend selection is automatic (wgpu picks the platform's best:
     // DX12 on Windows, Vulkan on Linux, Metal on macOS), but the
@@ -19189,7 +19212,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let backends = backends_from_env();
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends,
-        flags: wgpu::InstanceFlags::default(),
+        flags: instance_flags(backends),
         memory_budget_thresholds: Default::default(),
         backend_options: Default::default(),
         display: None,
@@ -19265,7 +19288,11 @@ fn init(dev: usize) -> Result<Ctx, String> {
 
     // Take the card's maximum limits — large tensors (lm_head ≈ 254 MB
     // int8) require a raised storage buffer; a discrete card handles GB.
-    let limits = adapter.limits();
+    // `max_buffer_size` keeps the 4 GiB cap wgpu applies while indirect
+    // validation is on (`instance_flags` turns it off): the buffer-fit
+    // checks were written against that cap.
+    let mut limits = adapter.limits();
+    limits.max_buffer_size = limits.max_buffer_size.min(u32::MAX as u64);
     // 33 152 B = the stride-257 attend kernels' workgroup footprint.
     // Adreno/Mali/wgpu-Metal report 32 768 — there only the stride-129
     // (hd <= 128) kernels are created.
@@ -54165,6 +54192,28 @@ pub fn dsv4_global_moe_create_slots(
         segments = DSV4_GLOBAL_MOE_SEGMENTS_S16;
     }
     dsv4_global_moe_create_inner(model, slots, inter, hidden, gu_q2, segments, false)
+}
+
+/// The S8 bank with exactly `slots` slots and no workspace carve-out, for
+/// a caller that sized the request against its own reserve (the qwen4
+/// device path). Unlike `dsv4_global_moe_create_slots` it never moves to
+/// S16, so the four-row S8 expert kernels stay available.
+pub fn dsv4_global_moe_create_s8_exact(
+    model: &Arc<CmfModel>,
+    slots: usize,
+    inter: usize,
+    hidden: usize,
+    gu_q2: bool,
+) -> Option<(usize, usize)> {
+    dsv4_global_moe_create_inner(
+        model,
+        slots,
+        inter,
+        hidden,
+        gu_q2,
+        DSV4_GLOBAL_MOE_SEGMENTS,
+        false,
+    )
 }
 
 fn dsv4_global_moe_create_with_segments(
