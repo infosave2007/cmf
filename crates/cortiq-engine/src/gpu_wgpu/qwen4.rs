@@ -2386,6 +2386,50 @@ fn snap_stride(g: &Geom) -> usize {
     (g.gdn.kk - 1) * cdim + g.gdn.nv * g.gdn.dk * g.gdn.dv
 }
 
+/// The readback stages' size at creation; `Dev::ensure_stage` grows them
+/// when a forward needs more (a verify window's logits rows).
+const STAGE_MIN: u64 = 4 << 20;
+
+/// Bytes a readback stage is allocated with to hold `need`: whole MiB,
+/// never below `STAGE_MIN`.
+pub(crate) fn stage_size(need: u64) -> u64 {
+    (need.div_ceil(1 << 20) * (1 << 20)).max(STAGE_MIN)
+}
+
+/// What one submitted chain of a forward copies into its stage, at most:
+/// `layer_frames` layer frames of `frame_bytes` each (cold lists and MoE
+/// inputs, 16-byte aligned), then `logit_rows` rows of the head's logits at
+/// `logit_stride` bytes (one row for a plain token, every position in a
+/// verify window). The layout `forward_tokens_device` encodes.
+pub(crate) fn chain_stage_bytes(
+    layer_frames: usize,
+    frame_bytes: usize,
+    logit_rows: usize,
+    logit_stride: usize,
+) -> u64 {
+    (layer_frames * frame_bytes) as u64 + ((logit_rows * logit_stride) as u64).div_ceil(16) * 16
+}
+
+/// The row stride (bytes) of the logits `encode_head` leaves for the
+/// vocabulary projection `lm_head` of `model`.
+pub(crate) fn head_stride(model: &Arc<CmfModel>, lm_head: usize) -> Option<usize> {
+    let e = model.tensors.get(lm_head)?;
+    (e.shape.len() == 2).then(|| tstride(e.shape[0] * 4))
+}
+
+fn stage_buf(c: &Ctx, i: usize, bytes: u64) -> wgpu::Buffer {
+    c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(if i == 0 {
+            "qwen4-stage-0"
+        } else {
+            "qwen4-stage-1"
+        }),
+        size: bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
 fn storage_buf(c: &Ctx, label: &str, bytes: u64) -> wgpu::Buffer {
     c.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
@@ -2458,20 +2502,7 @@ impl Dev {
             pos: 0,
             pending_inject: false,
             binds: std::cell::RefCell::new(HashMap::new()),
-            stages: [
-                c.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("qwen4-stage-0"),
-                    size: 4 << 20,
-                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }),
-                c.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("qwen4-stage-1"),
-                    size: 4 << 20,
-                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }),
-            ],
+            stages: [stage_buf(c, 0, STAGE_MIN), stage_buf(c, 1, STAGE_MIN)],
             stage_ix: 0,
             cold_args: c.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("qwen4-cold-args"),
@@ -2671,6 +2702,46 @@ impl Dev {
         );
     }
 
+    /// Make both readback stages hold at least `bytes`. Every copy of a
+    /// frame names the stage it was encoded against, so a forward calls this
+    /// before it encodes its first frame; a stage a finished readback still
+    /// holds stays alive with it. The stages start at `STAGE_MIN` (4 MiB),
+    /// which holds four rows of a 248k vocabulary's logits and no more: a
+    /// verify window of five or more positions (MTP k >= 4) needs larger
+    /// ones. False when `bytes` exceeds the device's buffer limit.
+    pub(crate) fn ensure_stage(&mut self, bytes: u64) -> bool {
+        let Some(c) = ctx() else { return false };
+        let have = self.stages[0].size().min(self.stages[1].size());
+        if bytes <= have {
+            return true;
+        }
+        let size = stage_size(bytes);
+        if size > c.device.limits().max_buffer_size {
+            return false;
+        }
+        self.stages = [stage_buf(c, 0, size), stage_buf(c, 1, size)];
+        true
+    }
+
+    /// VRAM of `rows` verify-window snapshot rows over layers of `kinds`
+    /// (`(is_gdn, has_ple)`, as `Dev::new` takes them): what
+    /// `ensure_snaps(g, rows)` allocates.
+    pub(crate) fn snap_bytes(g: &Geom, kinds: &[(bool, bool)], rows: usize) -> u64 {
+        let ple_cap = ((g.ple_kernel.max(1) - 1) * g.ple_dilation).max(1);
+        kinds
+            .iter()
+            .map(|&(is_gdn, has_ple)| {
+                let gdn = if is_gdn { snap_stride(g) * 4 } else { 0 };
+                let ple = if has_ple {
+                    ple_cap * g.hc * g.hidden * 4
+                } else {
+                    0
+                };
+                (rows * (gdn + ple)) as u64
+            })
+            .sum()
+    }
+
     /// Make sure `nt` snapshot slots exist for every recurrent layer.
     pub(crate) fn ensure_snaps(&mut self, g: &Geom, nt: usize) {
         let Some(c) = ctx() else { return };
@@ -2681,6 +2752,10 @@ impl Dev {
                     storage_buf(c, "qwen4-snap-gdn", (nt * stride * 4) as u64),
                     nt,
                 ));
+                // the GDN kernels' cached groups of a smaller window name
+                // the replaced buffer: their snapshots would land there
+                // while `restore` reads this one
+                self.forget_layer(li);
             }
             if let Some(pd) = l.ple.as_ref() {
                 while self.ple_snaps[li].len() < nt {
@@ -5919,7 +5994,10 @@ pub(crate) fn encode_argmax(
 }
 
 /// Copy `bytes` of `src` from `src_off` into the current stage at `off`
-/// (ends any open pass).
+/// (ends any open pass). False, with nothing recorded, when either range
+/// is out of bounds: wgpu would only report that when the encoder is
+/// finished, as a validation error that takes the process down.
+#[must_use]
 pub(crate) fn copy_to_stage(
     enc: &mut wgpu::CommandEncoder,
     dev: &Dev,
@@ -5927,9 +6005,14 @@ pub(crate) fn copy_to_stage(
     src_off: u64,
     off: u64,
     bytes: u64,
-) {
+) -> bool {
+    let fits = |o: u64, size: u64| o.checked_add(bytes).is_some_and(|end| end <= size);
+    if !fits(off, dev.stage().size()) || !fits(src_off, src.size()) {
+        return false;
+    }
     flush_pass(&*enc);
     enc.copy_buffer_to_buffer(src, src_off, dev.stage(), off, bytes);
+    true
 }
 
 /// Debug: every token slot's hyper state (`hc·hidden` floats each).
@@ -6287,5 +6370,78 @@ mod shader_tests {
                 "entry point {ep} missing"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+
+    /// The Qwen3.5-family vocabulary the Flash-Next `lm_head` projects to.
+    const VOCAB: usize = 248_320;
+
+    #[test]
+    fn verify_window_logits_fit_the_stage() {
+        let ls = tstride(VOCAB * 4);
+        assert_eq!(ls, 993_280);
+        // the initial stage holds a window of four rows and not five: what
+        // made MTP k = 4 (a five-position verify window) crash
+        assert!(chain_stage_bytes(0, 0, 4, ls) <= STAGE_MIN);
+        assert!(chain_stage_bytes(0, 0, 5, ls) > STAGE_MIN);
+        for rows in 1..=TMAX {
+            let need = chain_stage_bytes(0, 0, rows, ls);
+            let size = stage_size(need);
+            assert!(size >= need, "window {rows}: stage {size} < {need}");
+            assert!(size >= STAGE_MIN && size % (1 << 20) == 0);
+        }
+        assert_eq!(stage_size(0), STAGE_MIN);
+        assert_eq!(stage_size(STAGE_MIN + 1), STAGE_MIN + (1 << 20));
+        // layer frames first, the logits rows 16-byte aligned after them
+        assert_eq!(chain_stage_bytes(3, 1024, 2, 10), 3 * 1024 + 32);
+        assert_eq!(chain_stage_bytes(2, 512, 0, ls), 1024);
+    }
+
+    #[test]
+    fn snapshot_bytes_follow_the_window() {
+        let g = Geom {
+            hidden: 2048,
+            hc: 4,
+            eps: 1e-6,
+            n_heads: 16,
+            n_kv_heads: 2,
+            head_dim: 256,
+            rotary_dim: 64,
+            index_heads: 4,
+            index_dim: 128,
+            index_budget: 2048,
+            compress_ratio: 4,
+            gdn: GdnGeom {
+                nv: 32,
+                nk: 16,
+                dk: 128,
+                dv: 128,
+                kk: 4,
+            },
+            ple_kernel: 4,
+            ple_dilation: 1,
+            top_k: 10,
+            n_experts: 512,
+            inter: 512,
+            gu_q2: true,
+        };
+        // conv ring (kk-1)·cdim then S = nv·dk·dv, f32
+        let gdn_row = ((4 - 1) * (2 * 16 * 128 + 32 * 128) + 32 * 128 * 128) * 4;
+        // the PLE history ring, (kernel-1)·dilation rows of hc·hidden
+        let ple_row = 3 * 4 * 2048 * 4;
+        let kinds = [(true, false), (false, true), (false, false), (true, true)];
+        assert_eq!(Dev::snap_bytes(&g, &kinds, 0), 0);
+        assert_eq!(
+            Dev::snap_bytes(&g, &kinds, 1),
+            (2 * gdn_row + 2 * ple_row) as u64
+        );
+        assert_eq!(
+            Dev::snap_bytes(&g, &kinds, 8),
+            2 * Dev::snap_bytes(&g, &kinds, 4)
+        );
     }
 }
