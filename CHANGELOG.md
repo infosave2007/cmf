@@ -94,6 +94,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reservation and `oracle.reasoning_deadline_s` (60) to its deadline; the
   reasoning tokens (billed in `usage.cost`) are shown in the ledger and in
   `cmf.usage.oracle.reasoning_tokens` (ORACLE.md "Reasoning").
+  A reasoning call cut by its token allowance or its deadline is asked
+  once more without reasoning, so the question is still answered.
 
 ### Changed
 - Oracle egress redaction (`oracle.redact_pii`, unless `cmf.allow_pii_egress`)

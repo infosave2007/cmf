@@ -369,6 +369,25 @@ impl OracleConfig {
         (self.reasoning != "off").then_some(self.reasoning.as_str())
     }
 
+    /// This configuration with the reasoning off (the oracle's direct
+    /// answer after a reasoning call that failed, DESIGN C5).
+    pub fn without_reasoning(&self) -> Self {
+        Self {
+            reasoning: "off".into(),
+            ..self.clone()
+        }
+    }
+
+    /// How long one escalation may hold the oracle: a call's deadline, and
+    /// with the reasoning on the direct call that may follow a failed one.
+    pub fn escalation_deadline_s(&self) -> f64 {
+        if self.reasoning_effort().is_some() {
+            self.call_deadline_s() + self.deadline_s
+        } else {
+            self.deadline_s
+        }
+    }
+
     /// The deadline of one call: `deadline_s`, plus `reasoning_deadline_s`
     /// when the reasoning is on.
     pub fn call_deadline_s(&self) -> f64 {

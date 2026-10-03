@@ -186,6 +186,11 @@ pub fn call_max_tokens(cfg: &OracleConfig, questions: usize) -> u32 {
     t
 }
 
+/// The failures of a reasoning call that [`OracleClient::call`] asks again
+/// without reasoning: the reasoning outgrew `reasoning_max_tokens`, or the
+/// call outlived its deadline.
+pub const REASONING_FALLBACK: &[&str] = &["finish_length", "read_timeout", "transport_timeout"];
+
 /// The body's `reasoning` object: disabled, or the configured effort with
 /// the reasoning text excluded from the response (DESIGN C4).
 fn reasoning_value(cfg: &OracleConfig) -> Value {
@@ -1554,10 +1559,26 @@ impl OracleClient {
         }
     }
 
-    /// One call for `questions` about `state` (see the module notes).
+    /// One call for `questions` about `state` (see the module notes). A
+    /// reasoning call that outgrew its token allowance or its deadline
+    /// ([`REASONING_FALLBACK`]) is asked once more without reasoning: a
+    /// direct answer beats none (DESIGN C5). Each call is its own ledger
+    /// entry; the stop rules see the second one's outcome last.
     pub fn call(&self, caller: &Caller<'_>, questions: &[&Question], state: &Value) -> CallOutcome {
         let body = request_body(&self.cfg, questions, state);
-        self.call_body(caller, questions, &body)
+        let outcome = self.call_body(caller, questions, &body);
+        match &outcome {
+            CallOutcome::Failed(f)
+                if self.cfg.reasoning_effort().is_some()
+                    && REASONING_FALLBACK.contains(&f.error.as_str()) =>
+            {
+                let direct = self.cfg.without_reasoning();
+                tracing::info!(error = %f.error, "reasoning oracle call failed; asking without reasoning");
+                let body = request_body(&direct, questions, state);
+                self.call_with(caller, questions, &body, call_max_tokens(&direct, questions.len()))
+            }
+            _ => outcome,
+        }
     }
 
     /// [`OracleClient::call`] with a body built by [`request_body`].
@@ -1567,6 +1588,17 @@ impl OracleClient {
         questions: &[&Question],
         body: &[u8],
     ) -> CallOutcome {
+        self.call_with(caller, questions, body, call_max_tokens(&self.cfg, questions.len()))
+    }
+
+    /// One call of `body`, whose `max_tokens` is `mt`.
+    fn call_with(
+        &self,
+        caller: &Caller<'_>,
+        questions: &[&Question],
+        body: &[u8],
+        mt: u32,
+    ) -> CallOutcome {
         // The key without surrounding whitespace; a malformed one is never
         // sent (nor put in a header whose error would echo it).
         let key = match read_key(&self.key, &self.cfg.api_key_env) {
@@ -1574,7 +1606,6 @@ impl OracleClient {
             (KeyState::Missing, None) => return CallOutcome::Refused(RefusalReason::NoKey),
             (_, None) => return CallOutcome::Refused(RefusalReason::BadKey),
         };
-        let mt = call_max_tokens(&self.cfg, questions.len());
         let res = reservation_usd(body.len(), mt, self.max_price);
         let call_id = new_call_id();
         let key_id = caller.key_id();

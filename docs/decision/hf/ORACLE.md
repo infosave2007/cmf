@@ -350,7 +350,16 @@ on top of `deadline_s`), and the reasoning tokens are billed: OpenRouter's
 `cmf.usage.oracle.reasoning_tokens` show how many there were. Measure it on
 your own traffic before turning it on; the provider must support reasoning
 (`provider.require_parameters: true` keeps OpenRouter from routing to one
-that does not).
+that does not, but not from one that accepts the parameter and ignores it:
+check that the ledger shows reasoning tokens, and list such a provider in
+`provider.ignore`).
+
+A reasoning call that outgrows its token allowance (`finish_length`) or its
+deadline (`read_timeout`, `transport_timeout`) is asked once more without
+reasoning, so the question still gets the oracle's direct answer. Both calls
+are in the ledger (the first one is billed when the provider bills it), the
+stop rules count the second one's outcome, and a follower waiting for the
+same question waits for both.
 
 ## Budget and stop rules
 
