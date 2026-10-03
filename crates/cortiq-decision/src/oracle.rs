@@ -28,10 +28,11 @@
 //! probabilities: [number per level]}`, noul `{noul: boolean, p_true:
 //! number}` — and `max_tokens` grows by `min(probability_tokens_per_question·q,
 //! 4096)` ([`call_max_tokens`]). A bare verdict (the 0.8.7 form) is still
-//! read, as one-hot; listed probabilities must be finite numbers in [0, 1],
-//! each of an option (a level, at most one per level) at most once, else the
-//! content is invalid (`invalid_probability`); the server normalizes them
-//! ([`crate::answer::Verdict::normalize`]).
+//! read, as one-hot; listed probabilities must be finite numbers in [0, 1]
+//! (the schema bounds them), each of an option (a level, at most one per
+//! level) at most once, else the distribution is dropped and the valid
+//! verdict kept as one-hot (the call is not failed); the server normalizes
+//! them ([`crate::answer::Verdict::normalize`]).
 //!
 //! **Reasoning** (0.8.8, DESIGN C4, `oracle.reasoning`: `off` by default):
 //! with an effort (`low`, `medium`, `high`) the body's `reasoning` is
@@ -205,6 +206,11 @@ fn verdict_property(q: &Question) -> Value {
     }
 }
 
+/// The schema of one listed probability, a number in [0, 1].
+fn p_schema() -> Value {
+    json!({"type": "number", "minimum": 0, "maximum": 1})
+}
+
 /// The structured-output schema of one question: the bare verdict, or with
 /// `probabilities` the verdict and its distribution (see the module notes).
 fn property(q: &Question, probabilities: bool) -> Value {
@@ -217,7 +223,7 @@ fn property(q: &Question, probabilities: bool) -> Value {
             "probabilities",
             json!({"type": "array", "items": {
                 "type": "object",
-                "properties": {"id": {"type": "string", "enum": q.options()}, "p": {"type": "number"}},
+                "properties": {"id": {"type": "string", "enum": q.options()}, "p": p_schema()},
                 "required": ["id", "p"],
                 "additionalProperties": false,
             }}),
@@ -225,9 +231,9 @@ fn property(q: &Question, probabilities: bool) -> Value {
         QuestionKind::Score => (
             "score",
             "probabilities",
-            json!({"type": "array", "items": {"type": "number"}}),
+            json!({"type": "array", "items": p_schema()}),
         ),
-        QuestionKind::Noul => ("noul", "p_true", json!({"type": "number"})),
+        QuestionKind::Noul => ("noul", "p_true", p_schema()),
     };
     let mut props = Map::new();
     props.insert(key.into(), verdict_property(q));
@@ -393,11 +399,8 @@ fn usage_of(body: &Map<String, Value>) -> Option<CallUsage> {
 }
 
 /// A listed probability: a finite number in [0, 1].
-fn probability(v: &Value) -> std::result::Result<f64, String> {
-    match v.as_f64() {
-        Some(p) if p.is_finite() && (0.0..=1.0).contains(&p) => Ok(p),
-        _ => Err("invalid_probability".into()),
-    }
+fn probability(v: &Value) -> Option<f64> {
+    v.as_f64().filter(|p| p.is_finite() && (0.0..=1.0).contains(p))
 }
 
 /// The bare verdict of one question (the 0.8.7 form, or the verdict field of
@@ -435,39 +438,57 @@ fn parse_verdict(q: &Question, v: &Value) -> std::result::Result<Verdict, String
         QuestionKind::Noul => ("noul", "p_true"),
     };
     let stated = bare_verdict(q, o.get(key).unwrap_or(&Value::Null))?;
+    match listed_probabilities(q, o.get(dist_key)) {
+        Ok(listed) => Ok(Verdict::normalize(q, stated, &listed)),
+        // A valid verdict is kept whatever its distribution: a malformed one
+        // (a percent, a null, an id twice, …) is dropped, never the paid
+        // call (DESIGN C3).
+        Err(code) => {
+            tracing::debug!(code, "oracle: a malformed distribution dropped, the verdict kept one-hot");
+            Ok(Verdict::one_hot(stated))
+        }
+    }
+}
+
+/// The probabilities a verdict object lists (see [`parse_verdict`]): each a
+/// finite number in [0, 1], of an option of the question (a level, at most
+/// one per level) at most once; `Err("invalid_probability")` otherwise.
+fn listed_probabilities(
+    q: &Question,
+    dist: Option<&Value>,
+) -> std::result::Result<Vec<(String, f64)>, &'static str> {
+    const INVALID: &str = "invalid_probability";
+    let p = |v: &Value| probability(v).ok_or(INVALID);
     let mut listed: Vec<(String, f64)> = Vec::new();
-    match (q.kind, o.get(dist_key)) {
+    match (q.kind, dist) {
         (_, None | Some(Value::Null)) => {}
         (QuestionKind::Choice, Some(Value::Array(items))) => {
             let options = q.options();
             for it in items {
                 let id = match it.get("id") {
                     Some(Value::String(id)) if options.contains(&id.as_str()) => id,
-                    _ => return Err("invalid_probability".into()),
+                    _ => return Err(INVALID),
                 };
                 if listed.iter().any(|(l, _)| l == id) {
-                    return Err("invalid_probability".into());
+                    return Err(INVALID);
                 }
-                listed.push((
-                    id.clone(),
-                    probability(it.get("p").unwrap_or(&Value::Null))?,
-                ));
+                listed.push((id.clone(), p(it.get("p").unwrap_or(&Value::Null))?));
             }
         }
         (QuestionKind::Score, Some(Value::Array(items))) => {
             if items.len() > q.levels().len() {
-                return Err("invalid_probability".into());
+                return Err(INVALID);
             }
-            for (i, p) in items.iter().enumerate() {
-                listed.push((i.to_string(), probability(p)?));
+            for (i, v) in items.iter().enumerate() {
+                listed.push((i.to_string(), p(v)?));
             }
         }
-        (QuestionKind::Noul, Some(p)) => {
-            listed.push((crate::answer::NOUL_TRUE.to_string(), probability(p)?));
+        (QuestionKind::Noul, Some(v)) => {
+            listed.push((crate::answer::NOUL_TRUE.to_string(), p(v)?));
         }
-        _ => return Err("invalid_probability".into()),
+        _ => return Err(INVALID),
     }
-    Ok(Verdict::normalize(q, stated, &listed))
+    Ok(listed)
 }
 
 /// Check the verdict object of the content against the questions.
@@ -2224,7 +2245,7 @@ mod tests {
             &json!({"type": "object", "properties": {
                 "choice": {"type": "string", "enum": ["b", "a"]},
                 "probabilities": {"type": "array", "items": {"type": "object",
-                    "properties": {"id": {"type": "string", "enum": ["b", "a"]}, "p": {"type": "number"}},
+                    "properties": {"id": {"type": "string", "enum": ["b", "a"]}, "p": {"type": "number", "minimum": 0, "maximum": 1}},
                     "required": ["id", "p"], "additionalProperties": false}}},
                 "required": ["choice", "probabilities"], "additionalProperties": false})
         );
@@ -2240,7 +2261,7 @@ mod tests {
         assert_eq!(props["n"]["required"], json!(["noul", "p_true"]));
         assert_eq!(
             props["n"]["properties"]["p_true"],
-            json!({"type": "number"})
+            json!({"type": "number", "minimum": 0, "maximum": 1})
         );
     }
 
@@ -2323,17 +2344,30 @@ mod tests {
         )
         .unwrap();
         assert!(v.iter().all(Verdict::is_one_hot));
+        // A malformed distribution beside a valid verdict is dropped: the
+        // verdict stays, one-hot, and the call is not failed.
         for bad in [
             r#"{"c":{"choice":"a","probabilities":[{"id":"a","p":1.5}]},"s":0,"n":true}"#,
+            r#"{"c":{"choice":"a","probabilities":[{"id":"a","p":70},{"id":"b","p":30}]},"s":0,"n":true}"#,
+            r#"{"c":{"choice":"a","probabilities":[{"id":"a","p":null}]},"s":0,"n":true}"#,
+            r#"{"c":{"choice":"a","probabilities":[{"id":"a","p":1.0000001}]},"s":0,"n":true}"#,
             r#"{"c":{"choice":"a","probabilities":[{"id":"q","p":0.5}]},"s":0,"n":true}"#,
             r#"{"c":{"choice":"a","probabilities":[{"id":"a","p":0.5},{"id":"a","p":0.1}]},"s":0,"n":true}"#,
             r#"{"c":{"choice":"a","probabilities":{"a":0.5}},"s":0,"n":true}"#,
             r#"{"c":"a","s":{"score":0,"probabilities":[0.1,0.2,0.7]},"n":true}"#,
+            r#"{"c":"a","s":{"score":0,"probabilities":[0.1,"x"]},"n":true}"#,
             r#"{"c":"a","s":0,"n":{"noul":true,"p_true":-0.1}}"#,
+            r#"{"c":"a","s":0,"n":{"noul":true,"p_true":"high"}}"#,
         ] {
+            let v = parse_verdicts(bad, &qs).unwrap_or_else(|e| panic!("{bad}: {e}"));
+            assert!(v.iter().all(Verdict::is_one_hot), "{bad}");
             assert_eq!(
-                parse_verdicts(bad, &qs),
-                Err("invalid_probability".into()),
+                v.iter().map(|v| v.answer.clone()).collect::<Vec<_>>(),
+                [
+                    OracleAnswer::Choice("a".into()),
+                    OracleAnswer::Score(0),
+                    OracleAnswer::Noul(true)
+                ],
                 "{bad}"
             );
         }

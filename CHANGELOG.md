@@ -83,7 +83,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cache and `learn.log` keep the distribution (`CachePutP`), and 0.8.7 cache
   records replay one-hot. `oracle.probability_tokens_per_question` (128,
   measured 57–87 for five ids) is added to `max_tokens` per question
-  (API.md §3.3, §6; ORACLE.md "Probabilities").
+  (API.md §3.3, §6; ORACLE.md "Probabilities"). The schema bounds each
+  probability to [0, 1]; a malformed distribution beside a valid verdict
+  (a percent, a null, an unknown or repeated id, too many levels) is dropped
+  and the verdict kept one-hot — the paid call is not failed and does not
+  count toward `max_errors`.
 - Oracle reasoning: `oracle.reasoning` (`off` | `low` | `medium` | `high`)
   sends OpenRouter `reasoning: {effort, exclude: true}`, adds
   `oracle.reasoning_max_tokens` (4096) to each call's `max_tokens` and
@@ -113,6 +117,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answer's (it counted 1). On `/v1/systemone` a noul answer is p(true).
   The oracle request body asks for the distribution (`oracle.probabilities:
   false` sends the 0.8.7 body, byte for byte the v4 driver's).
+  `cortiq decision learn --answers` finds a driver ledger line by the sha256
+  of the body it sends or of that 0.8.7 body, so the v4 ledgers are still
+  reused with the defaults.
 - `/v1/decisions` no longer refuses an empty `state` (`""`, `{}`, `[]`) or a
   `null` one with 400: it is a state-less request. Requests with a non-empty
   state are read exactly as in 0.8.6 and 0.8.7.

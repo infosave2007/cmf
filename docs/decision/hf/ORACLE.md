@@ -314,8 +314,10 @@ Since 0.8.8 (`oracle.probabilities`, on by default) the oracle answers each
 question with its verdict and a distribution: for a choice the at most 5 most
 likely option ids with their probabilities, for a score one probability per
 level, for a noul p(true). The server checks it (finite numbers in [0, 1],
-ids of the question, each once; else the content is invalid, a paid failure)
-and normalizes it: the listed options keep their mass (renormalized when it
+which the schema also states, ids of the question, each once, at most one
+per level; a malformed distribution is dropped and the valid verdict kept as
+one-hot, so the call neither fails nor counts toward `max_errors`) and
+normalizes it: the listed options keep their mass (renormalized when it
 is above 1), the rest is spread uniformly over the unlisted ones, and the
 verdict becomes the argmax (a tie goes to the stated verdict; a noul is true
 above 0.5). Every surface answers with it — `probabilities` and `confidence`
