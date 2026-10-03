@@ -1853,6 +1853,129 @@ fn q4_dn_q4tp4(@builtin(workgroup_id) wid: vec3<u32>,
         }
     }
 }
+
+// ── The q4tp twin of q4_gu_q2tp4: gate/up planes in q4tp (16 nibble bytes
+// a 32-column group). Same bindings, uniform, dispatch geometry and output
+// as q4_gu_q2tp4; each group decoded as `dsv4_global_gate_up_q4tp` decodes
+// it (nibble − 8, scale exp2(lo + code·step), no zero rung). The four rows
+// ride in the lanes of vec4s, so nothing private is indexed at run time.
+// Word reads need `mat16` even, which inter % 4 == 0 gives (every section
+// of a q4tp matrix is then a whole number of words). ──
+fn gq_gc5(seg: u32, o: u32, shf: u32) -> u32 {
+    var c = gq_g8(seg, o);
+    if (shf > 3u) { c = c | (gq_g8(seg, o + 1u) << 8u); }
+    return (c >> shf) & 31u;
+}
+fn gq_uc5(seg: u32, o: u32, shf: u32) -> u32 {
+    var c = gq_u8(seg, o);
+    if (shf > 3u) { c = c | (gq_u8(seg, o + 1u) << 8u); }
+    return (c >> shf) & 31u;
+}
+// one row's 32-column group: four nibble words from word `w`
+fn gq_gd32(seg: u32, w: u32, x0: vec4<f32>, x1: vec4<f32>, x2: vec4<f32>, x3: vec4<f32>,
+           x4: vec4<f32>, x5: vec4<f32>, x6: vec4<f32>, x7: vec4<f32>) -> f32 {
+    return gv_dot8(gq_g32(seg, w), x0, x1) + gv_dot8(gq_g32(seg, w + 1u), x2, x3)
+         + gv_dot8(gq_g32(seg, w + 2u), x4, x5) + gv_dot8(gq_g32(seg, w + 3u), x6, x7);
+}
+fn gq_ud32(seg: u32, w: u32, x0: vec4<f32>, x1: vec4<f32>, x2: vec4<f32>, x3: vec4<f32>,
+           x4: vec4<f32>, x5: vec4<f32>, x6: vec4<f32>, x7: vec4<f32>) -> f32 {
+    return gv_dot8(gq_u32(seg, w), x0, x1) + gv_dot8(gq_u32(seg, w + 1u), x2, x3)
+         + gv_dot8(gq_u32(seg, w + 2u), x4, x5) + gv_dot8(gq_u32(seg, w + 3u), x6, x7);
+}
+// a row's (lo, step) pair at u16 offset `par16` of the gate / up plane
+fn gq_gpl(seg: u32, par16: u32) -> vec2<f32> {
+    return unpack2x16float(gq_g16(seg, par16) | (gq_g16(seg, par16 + 1u) << 16u));
+}
+fn gq_upl(seg: u32, par16: u32) -> vec2<f32> {
+    return unpack2x16float(gq_u16(seg, par16) | (gq_u16(seg, par16 + 1u) << 16u));
+}
+@compute @workgroup_size(64)
+fn q4_gu_q4tp4(@builtin(workgroup_id) wid: vec3<u32>,
+               @builtin(local_invocation_index) lid: u32) {
+    let row0 = wid.x * 4u;
+    let slot = wid.y;
+    let batch = wid.z;
+    let bslot = batch * gq_p.slots + slot;
+    let flat = gq_sel[bslot];
+    let seg = flat / gq_p.segment_slots;
+    let local = flat - seg * gq_p.segment_slots;
+    let gpr = gq_p.gpr;
+    let rows = gq_p.inter;
+    let base16 = local * gq_p.mat16;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let par0 = base16 + rows * gpr * 8u + row0 * 2u;
+    let cod0 = (base16 + rows * gpr * 8u + rows * 2u) * 2u + row0 * cst;
+    let g0 = gq_gpl(seg, par0);
+    let g1 = gq_gpl(seg, par0 + 2u);
+    let g2 = gq_gpl(seg, par0 + 4u);
+    let g3 = gq_gpl(seg, par0 + 6u);
+    let u0 = gq_upl(seg, par0);
+    let u1 = gq_upl(seg, par0 + 2u);
+    let u2 = gq_upl(seg, par0 + 4u);
+    let u3 = gq_upl(seg, par0 + 6u);
+    let glo = vec4<f32>(g0.x, g1.x, g2.x, g3.x);
+    let gst = vec4<f32>(g0.y, g1.y, g2.y, g3.y);
+    let ulo = vec4<f32>(u0.x, u1.x, u2.x, u3.x);
+    let ust = vec4<f32>(u0.y, u1.y, u2.y, u3.y);
+    // nibble word of (row0, group 0); the next row is gpr·4 words on
+    let wr = gpr * 4u;
+    let w0 = (base16 >> 1u) + row0 * wr;
+    var ag = vec4<f32>(0.0);
+    var au = vec4<f32>(0.0);
+    let xb4 = batch * gpr * 8u;
+    for (var g = lid; g < gpr; g = g + 64u) {
+        let xo = xb4 + g * 8u;
+        let x0 = gq_x[xo];
+        let x1 = gq_x[xo + 1u];
+        let x2 = gq_x[xo + 2u];
+        let x3 = gq_x[xo + 3u];
+        let x4 = gq_x[xo + 4u];
+        let x5 = gq_x[xo + 5u];
+        let x6 = gq_x[xo + 6u];
+        let x7 = gq_x[xo + 7u];
+        let bit = g * 5u;
+        let cb = cod0 + (bit >> 3u);
+        let shf = bit & 7u;
+        let cg = vec4<u32>(gq_gc5(seg, cb, shf), gq_gc5(seg, cb + cst, shf),
+                           gq_gc5(seg, cb + 2u * cst, shf), gq_gc5(seg, cb + 3u * cst, shf));
+        let cu = vec4<u32>(gq_uc5(seg, cb, shf), gq_uc5(seg, cb + cst, shf),
+                           gq_uc5(seg, cb + 2u * cst, shf), gq_uc5(seg, cb + 3u * cst, shf));
+        let sg = exp2(glo + vec4<f32>(cg) * gst);
+        let su = exp2(ulo + vec4<f32>(cu) * ust);
+        let w = w0 + g * 4u;
+        let dg = vec4<f32>(gq_gd32(seg, w, x0, x1, x2, x3, x4, x5, x6, x7),
+                           gq_gd32(seg, w + wr, x0, x1, x2, x3, x4, x5, x6, x7),
+                           gq_gd32(seg, w + 2u * wr, x0, x1, x2, x3, x4, x5, x6, x7),
+                           gq_gd32(seg, w + 3u * wr, x0, x1, x2, x3, x4, x5, x6, x7));
+        let du = vec4<f32>(gq_ud32(seg, w, x0, x1, x2, x3, x4, x5, x6, x7),
+                           gq_ud32(seg, w + wr, x0, x1, x2, x3, x4, x5, x6, x7),
+                           gq_ud32(seg, w + 2u * wr, x0, x1, x2, x3, x4, x5, x6, x7),
+                           gq_ud32(seg, w + 3u * wr, x0, x1, x2, x3, x4, x5, x6, x7));
+        ag = ag + sg * dg;
+        au = au + su * du;
+    }
+    gq_pg[lid] = ag;
+    gq_pu[lid] = au;
+    workgroupBarrier();
+    var stride = 32u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lid < stride) {
+            gq_pg[lid] = gq_pg[lid] + gq_pg[lid + stride];
+            gq_pu[lid] = gq_pu[lid] + gq_pu[lid + stride];
+        }
+        workgroupBarrier();
+        stride = stride >> 1u;
+    }
+    if (lid < 4u) {
+        let row = row0 + lid;
+        if (row < rows) {
+            let gate = gq_pg[0][lid];
+            let up = gq_pu[0][lid];
+            gq_act[bslot * gq_p.inter + row] = (gate / (1.0 + exp(-gate))) * up;
+        }
+    }
+}
 "#;
 
 /// HC v3: one hyper-connection mix in two subgroup kernels (`hc3_down`:
@@ -2154,6 +2277,7 @@ pub(crate) struct Pipes {
     t_route: wgpu::ComputePipeline,
     embed_gather_q82: wgpu::ComputePipeline,
     gu_q2tp4: wgpu::ComputePipeline,
+    gu_q4tp4: wgpu::ComputePipeline,
     dn_q4tp4: wgpu::ComputePipeline,
     t_hc_down: wgpu::ComputePipeline,
     t_hc_upfold2: wgpu::ComputePipeline,
@@ -2167,6 +2291,18 @@ pub(crate) struct Pipes {
     /// HC v3 (`HC3_WGSL`), where the device takes it; None keeps every
     /// hyper-connection mix on the kernels above.
     hc3: Option<Hc3>,
+}
+
+impl Pipes {
+    /// The row-blocked gate/up kernel for the bank's gate/up dtype (q2tp or
+    /// q4tp). Both take the same layout, so a cached bind group fits either.
+    fn gu4(&self, gu_q2: bool) -> &wgpu::ComputePipeline {
+        if gu_q2 {
+            &self.gu_q2tp4
+        } else {
+            &self.gu_q4tp4
+        }
+    }
 }
 
 /// The HC v3 module and its pipelines, specialized on first use per loop
@@ -2457,6 +2593,7 @@ fn build_pipes(c: &Ctx) -> Option<Pipes> {
         t_route: pipe("q4t_route"),
         embed_gather_q82: pipe("q4_embed_gather_q82"),
         gu_q2tp4: pipe_l("q4_gu_q2tp4", &gu_layout),
+        gu_q4tp4: pipe_l("q4_gu_q4tp4", &gu_layout),
         dn_q4tp4: pipe_l("q4_dn_q4tp4", &dn_layout),
         t_hc_down: pipe("q4t_hc_down"),
         t_hc_upfold2: pipe("q4t_hc_upfold2"),
@@ -2822,11 +2959,10 @@ fn hc_fused() -> bool {
     *S.get_or_init(|| std::env::var("CMF_QWEN_HC_FUSE").as_deref() == Ok("1"))
 }
 
-/// Do the row-blocked expert kernels apply (q2tp gate/up over an
-/// eight-segment arena, rows in fours)?
+/// Do the row-blocked expert kernels apply (gate/up in q2tp or q4tp, down in
+/// q4tp, over an eight-segment arena, rows in fours)?
 fn blocked_experts(g: &Geom, segments: usize) -> bool {
-    g.gu_q2
-        && segments == 8
+    segments == 8
         && g.inter % 4 == 0
         && g.hidden % 4 == 0
         && std::env::var("CMF_QWEN_EXPERT4").as_deref() != Ok("0")
@@ -5975,6 +6111,7 @@ pub(crate) fn encode_layer(
         );
         if blocked_experts(g, global.segments) {
             // four rows a workgroup: x read once per group for four rows
+            let gu4 = p.gu4(g.gu_q2);
             let bg_gu = bc.get(710, || {
                 let gate_b: Vec<_> = global
                     .gate
@@ -5988,7 +6125,7 @@ pub(crate) fn encode_layer(
                     .collect();
                 c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("qwen4-gu4"),
-                    layout: &p.gu_q2tp4.get_bind_group_layout(0),
+                    layout: &gu4.get_bind_group_layout(0),
                     entries: &[
                         wgpu::BindGroupEntry {
                             binding: 0,
@@ -6007,11 +6144,11 @@ pub(crate) fn encode_layer(
             let bg_gu_p = bc.get(711, || {
                 c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("qwen4-gu4-p"),
-                    layout: &p.gu_q2tp4.get_bind_group_layout(1),
+                    layout: &gu4.get_bind_group_layout(1),
                     entries: &[bind_buf(0, &gu_u)],
                 })
             });
-            pass.set_pipeline(&p.gu_q2tp4);
+            pass.set_pipeline(gu4);
             pass.set_bind_group(0, &bg_gu, &[]);
             pass.set_bind_group(1, &bg_gu_p, &[]);
             bc.launch(
@@ -6314,7 +6451,7 @@ pub(crate) fn encode_pending(
     );
     let blocked = blocked_experts(g, global.segments);
     let (pipe_gu, pipe_dn): (&wgpu::ComputePipeline, &wgpu::ComputePipeline) = if blocked {
-        (&p.gu_q2tp4, &p.dn_q4tp4)
+        (p.gu4(g.gu_q2), &p.dn_q4tp4)
     } else {
         (p_gu, p_dn)
     };
@@ -7177,6 +7314,7 @@ mod shader_tests {
             "q4t_route",
             "q4_embed_gather_q82",
             "q4_gu_q2tp4",
+            "q4_gu_q4tp4",
             "q4_dn_q4tp4",
             "q4t_hc_down",
             "q4t_hc_upfold2",
@@ -7258,7 +7396,7 @@ mod shader_tests {
 mod hc3_device_tests {
     use super::*;
 
-    fn f2h(f: f32) -> u16 {
+    pub(super) fn f2h(f: f32) -> u16 {
         // round-to-nearest-even into f16 (the values here stay normal)
         let x = f.to_bits();
         let sign = ((x >> 16) & 0x8000) as u16;
@@ -7278,9 +7416,17 @@ mod hc3_device_tests {
         sign | h
     }
 
-    struct Rnd(u64);
+    pub(super) struct Rnd(pub(super) u64);
     impl Rnd {
-        fn n(&mut self) -> f32 {
+        /// 64 raw xorshift bits
+        pub(super) fn bits(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        pub(super) fn n(&mut self) -> f32 {
             // sum of four uniforms, centred: close enough to a normal
             let mut s = 0.0f32;
             for _ in 0..4 {
@@ -7293,7 +7439,7 @@ mod hc3_device_tests {
         }
     }
 
-    fn upload(c: &Ctx, label: &str, bytes: &[u8]) -> wgpu::Buffer {
+    pub(super) fn upload(c: &Ctx, label: &str, bytes: &[u8]) -> wgpu::Buffer {
         let b = storage_buf(c, label, bytes.len() as u64);
         c.queue.write_buffer(&b, 0, bytes);
         b
@@ -7311,12 +7457,12 @@ mod hc3_device_tests {
 
     /// Written over every output buffer before each run, so a value a
     /// kernel failed to write cannot pass for the other arm's.
-    const POISON: f32 = 7.7e30;
+    pub(super) const POISON: f32 = 7.7e30;
 
     /// max |a - b| over the first `n` floats of `nt` rows at `stride`,
     /// relative to max |b|; infinite where either side kept the poison
     /// the run wrote first (a value the kernel never produced) or is not finite
-    fn rel(a: &[f32], b: &[f32], nt: usize, stride: usize, n: usize) -> f32 {
+    pub(super) fn rel(a: &[f32], b: &[f32], nt: usize, stride: usize, n: usize) -> f32 {
         let (mut d, mut m) = (0.0f32, 0.0f32);
         for t in 0..nt {
             for i in 0..n {
@@ -7530,6 +7676,413 @@ mod hc3_device_tests {
             }
         }
         assert!(worst < 1e-4, "HC v3 departs from the pre-v3 mix: {worst:e}");
+    }
+}
+
+/// q4tp resident experts on the row-blocked kernels. The device test runs
+/// `q4_gu_q4tp4` (picked by `Pipes::gu4`) against the arena's one-row
+/// `dsv4_global_gate_up_q4tp`, then the blocked down kernel against the
+/// one-row down kernel on each arm's activations, over a synthetic
+/// eight-segment bank of Qwen3.8-Flash-Next's expert shape (inter 640,
+/// hidden 2560) for 1, 4 and 8 tokens of ten slots spread over every
+/// segment, with the host decode (`dequant_q4tp`) as a third witness for
+/// gate/up. Needs an adapter with binding arrays (Metal and Vulkan have them):
+/// `CMF_GPU=wgpu cargo test --release -p cortiq-engine --features gpu expert4_ -- --include-ignored --nocapture`
+#[cfg(test)]
+mod expert4_tests {
+    use super::hc3_device_tests::{POISON, Rnd, f2h, rel, upload};
+    use super::*;
+    use cortiq_core::quant::{dequant_q4tp, expected_nbytes, q4tp_put_code, q4tp_sections};
+
+    const INTER: usize = 640;
+    const HIDDEN: usize = 2560;
+    const SEGS: usize = 8;
+    const PER_SEG: usize = 3;
+    const SLOTS: usize = 10;
+
+    fn geom(inter: usize, gu_q2: bool) -> Geom {
+        Geom {
+            hidden: HIDDEN,
+            hc: 4,
+            eps: 1e-6,
+            n_heads: 16,
+            n_kv_heads: 2,
+            head_dim: 256,
+            rotary_dim: 64,
+            index_heads: 4,
+            index_dim: 128,
+            index_budget: 2048,
+            compress_ratio: 4,
+            gdn: GdnGeom {
+                nv: 32,
+                nk: 16,
+                dk: 128,
+                dv: 128,
+                kk: 4,
+            },
+            ple_kernel: 4,
+            ple_dilation: 1,
+            top_k: SLOTS,
+            n_experts: 512,
+            inter,
+            gu_q2,
+        }
+    }
+
+    /// q4tp banks take the blocked kernels on the same terms as q2tp ones.
+    #[test]
+    fn blocked_experts_take_q4tp_banks() {
+        if std::env::var("CMF_QWEN_EXPERT4").as_deref() == Ok("0") {
+            eprintln!("CMF_QWEN_EXPERT4=0 in the environment: skipped");
+            return;
+        }
+        for gu_q2 in [true, false] {
+            assert!(blocked_experts(&geom(INTER, gu_q2), 8));
+            assert!(!blocked_experts(&geom(INTER, gu_q2), 16));
+            assert!(!blocked_experts(&geom(INTER + 2, gu_q2), 8));
+        }
+        // the blocked gate/up kernel reads whole words: mat16 must be even
+        let n = expected_nbytes(TensorDtype::Q4TiledP, &[INTER, HIDDEN]).unwrap();
+        assert_eq!(n % 4, 0);
+        for rows in (4..256).step_by(4) {
+            for cols in [32, 64, 96, 160, 2560] {
+                let n = expected_nbytes(TensorDtype::Q4TiledP, &[rows, cols]).unwrap();
+                assert_eq!(n % 4, 0, "q4tp [{rows}, {cols}]");
+            }
+        }
+    }
+
+    /// A random q4tp matrix: uniform nibbles, rung codes over the whole
+    /// ladder, per-row (lo, step) so the scales span 2^-10 .. 2^-2.
+    fn q4tp_matrix(r: &mut Rnd, rows: usize, cols: usize) -> Vec<u8> {
+        let mut b = vec![0u8; expected_nbytes(TensorDtype::Q4TiledP, &[rows, cols]).unwrap()];
+        let gpr = cols / 32;
+        let (poff, coff, cst) = q4tp_sections(rows, cols);
+        for x in &mut b[..poff] {
+            *x = (r.bits() >> 32) as u8;
+        }
+        for row in 0..rows {
+            let lo = f2h(-10.0 + 0.3 * r.n());
+            let st = f2h(0.25 + 0.01 * r.n());
+            b[poff + row * 4..poff + row * 4 + 2].copy_from_slice(&lo.to_le_bytes());
+            b[poff + row * 4 + 2..poff + row * 4 + 4].copy_from_slice(&st.to_le_bytes());
+            let codes = &mut b[coff + row * cst..coff + (row + 1) * cst];
+            for g in 0..gpr {
+                q4tp_put_code(codes, g, (r.bits() >> 40) as usize & 31);
+            }
+        }
+        b
+    }
+
+    fn f32s(b: &[u8]) -> Vec<f32> {
+        bytemuck::cast_slice(b).to_vec()
+    }
+
+    fn arr(v: &[wgpu::Buffer]) -> Vec<wgpu::BufferBinding<'_>> {
+        v.iter()
+            .map(wgpu::Buffer::as_entire_buffer_binding)
+            .collect()
+    }
+
+    fn arr_entry<'a>(b: u32, a: &'a [wgpu::BufferBinding<'a>]) -> wgpu::BindGroupEntry<'a> {
+        wgpu::BindGroupEntry {
+            binding: b,
+            resource: wgpu::BindingResource::BufferArray(a),
+        }
+    }
+
+    #[test]
+    #[ignore = "needs a GPU with binding arrays"]
+    fn expert4_q4tp_matches_one_row_kernels() {
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu device (CMF_GPU=wgpu on macOS): skipped");
+            return;
+        };
+        let Some(p) = pipes(c) else {
+            eprintln!("qwen4 kernels unavailable on this adapter: skipped");
+            return;
+        };
+        let Some((p_gu, p_dn)) = dsv4_global_moe_pipelines(c, false, SEGS) else {
+            eprintln!(
+                "no global q4tp arena kernels on {}: skipped",
+                c.adapter_info.name
+            );
+            return;
+        };
+        let g = geom(INTER, false);
+        assert!(blocked_experts(&g, SEGS) || std::env::var_os("CMF_QWEN_EXPERT4").is_some());
+        eprintln!(
+            "adapter: {} ({:?})",
+            c.adapter_info.name, c.adapter_info.backend
+        );
+        let mut r = Rnd(0x51F1_5EED_0F4E_0E4D);
+        let n_exp = SEGS * PER_SEG;
+        let (gu_len, d_len) = (
+            expected_nbytes(TensorDtype::Q4TiledP, &[INTER, HIDDEN]).unwrap(),
+            expected_nbytes(TensorDtype::Q4TiledP, &[HIDDEN, INTER]).unwrap(),
+        );
+        // expert e lives in segment e / PER_SEG at local slot e % PER_SEG
+        let mut gate_m = Vec::new();
+        let mut up_m = Vec::new();
+        let mut down_m = Vec::new();
+        for _ in 0..n_exp {
+            gate_m.push(q4tp_matrix(&mut r, INTER, HIDDEN));
+            up_m.push(q4tp_matrix(&mut r, INTER, HIDDEN));
+            down_m.push(q4tp_matrix(&mut r, HIDDEN, INTER));
+        }
+        let bank = |mats: &[Vec<u8>], label: &str| -> Vec<wgpu::Buffer> {
+            (0..SEGS)
+                .map(|s| upload(c, label, &mats[s * PER_SEG..(s + 1) * PER_SEG].concat()))
+                .collect()
+        };
+        let (gate_b, up_b, down_b) = (
+            bank(&gate_m, "e4-gate"),
+            bank(&up_m, "e4-up"),
+            bank(&down_m, "e4-down"),
+        );
+        let (gate_a, up_a, down_a) = (arr(&gate_b), arr(&up_b), arr(&down_b));
+        let tmax = 8usize;
+        let x0: Vec<f32> = (0..tmax * HIDDEN).map(|_| r.n()).collect();
+        // every token's ten slots: distinct experts, all segments in use
+        let mut sel0 = vec![0u32; tmax * SLOTS];
+        for t in 0..tmax {
+            let off = (r.bits() >> 33) as usize % n_exp;
+            for s in 0..SLOTS {
+                sel0[t * SLOTS + s] = ((off + s * 7) % n_exp) as u32;
+            }
+        }
+        let wt0: Vec<f32> = (0..tmax * SLOTS)
+            .map(|_| 0.05 + r.n().abs() * 0.1)
+            .collect();
+        let x = upload(c, "e4-x", bytemuck::cast_slice(&x0));
+        let sel = upload(c, "e4-sel", bytemuck::cast_slice(&sel0));
+        let wt = upload(c, "e4-wt", bytemuck::cast_slice(&wt0));
+        let act_n = tmax * SLOTS * INTER;
+        let (act_old, act_new) = (
+            storage_buf(c, "e4-act-old", (act_n * 4) as u64),
+            storage_buf(c, "e4-act-new", (act_n * 4) as u64),
+        );
+        let (y_old, y_new) = (
+            storage_buf(c, "e4-y-old", (tmax * HIDDEN * 4) as u64),
+            storage_buf(c, "e4-y-new", (tmax * HIDDEN * 4) as u64),
+        );
+        let gu_u = uniform_u32x8(
+            c,
+            [
+                (HIDDEN / 32) as u32,
+                INTER as u32,
+                SLOTS as u32,
+                (gu_len / 2) as u32,
+                0.0f32.to_bits(),
+                PER_SEG as u32,
+                0,
+                0,
+            ],
+        );
+        let dn_u = uniform_u32x8(
+            c,
+            [
+                (INTER / 32) as u32,
+                HIDDEN as u32,
+                SLOTS as u32,
+                (d_len / 2) as u32,
+                PER_SEG as u32,
+                0,
+                0,
+                0,
+            ],
+        );
+        let gu4 = p.gu4(false);
+        let bg = |pipe: &wgpu::ComputePipeline, entries: &[wgpu::BindGroupEntry]| {
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("e4-test"),
+                layout: &pipe.get_bind_group_layout(0),
+                entries,
+            })
+        };
+        let bgp = |pipe: &wgpu::ComputePipeline, u: &wgpu::Buffer| {
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("e4-test-p"),
+                layout: &pipe.get_bind_group_layout(1),
+                entries: &[bind_buf(0, u)],
+            })
+        };
+        // (pipeline, group 0, group 1) for the one-row and the blocked arm
+        let gu_old = (
+            p_gu,
+            bg(
+                p_gu,
+                &[
+                    arr_entry(0, &gate_a),
+                    arr_entry(1, &up_a),
+                    bind_buf(2, &x),
+                    bind_buf(3, &sel),
+                    bind_buf(4, &act_old),
+                    bind_buf(5, &wt),
+                ],
+            ),
+            bgp(p_gu, &gu_u),
+        );
+        let gu_new = (
+            gu4,
+            bg(
+                gu4,
+                &[
+                    arr_entry(0, &gate_a),
+                    arr_entry(1, &up_a),
+                    bind_buf(2, &x),
+                    bind_buf(3, &sel),
+                    bind_buf(4, &act_new),
+                ],
+            ),
+            bgp(gu4, &gu_u),
+        );
+        let dn = |pipe: &'static wgpu::ComputePipeline, act: &wgpu::Buffer, y: &wgpu::Buffer| {
+            (
+                pipe,
+                bg(
+                    pipe,
+                    &[
+                        arr_entry(0, &down_a),
+                        bind_buf(1, act),
+                        bind_buf(2, &sel),
+                        bind_buf(3, &wt),
+                        bind_buf(4, y),
+                    ],
+                ),
+                bgp(pipe, &dn_u),
+            )
+        };
+        let dn_old = dn(p_dn, &act_old, &y_old);
+        let dn_new = dn(&p.dn_q4tp4, &act_new, &y_new);
+        type Arm<'a> = (&'a wgpu::ComputePipeline, wgpu::BindGroup, wgpu::BindGroup);
+        let launch = |pass: &mut PassHandle, a: &Arm, wg: (u32, u32, u32)| {
+            pass.set_pipeline(a.0);
+            pass.set_bind_group(0, &a.1, &[]);
+            pass.set_bind_group(1, &a.2, &[]);
+            pass.dispatch_workgroups(wg.0, wg.1, wg.2);
+        };
+        let poison = |b: &wgpu::Buffer, n: usize| {
+            c.queue
+                .write_buffer(b, 0, bytemuck::cast_slice(&vec![POISON; n]));
+        };
+        let mut worst = (0.0f32, 0.0f32, 0.0f32);
+        for nt in [1usize, 4, 8] {
+            for b in [&act_old, &act_new] {
+                poison(b, act_n);
+            }
+            for b in [&y_old, &y_new] {
+                poison(b, tmax * HIDDEN);
+            }
+            let mut enc = new_encoder("e4-test").expect("encoder");
+            {
+                let mut pass = begin_pass(&mut enc);
+                let n = nt as u32;
+                launch(&mut pass, &gu_old, (INTER as u32, SLOTS as u32, n));
+                launch(&mut pass, &dn_old, (HIDDEN as u32, n, 1));
+                launch(&mut pass, &gu_new, ((INTER / 4) as u32, SLOTS as u32, n));
+                launch(&mut pass, &dn_new, ((HIDDEN / 4) as u32, n, 1));
+            }
+            let (an, yn) = ((act_n * 4) as u64, (tmax * HIDDEN * 4) as u64);
+            let out = submit_readback(
+                enc,
+                &[(&act_old, an), (&act_new, an), (&y_old, yn), (&y_new, yn)],
+            )
+            .expect("readback");
+            let (an, yn) = (an as usize, yn as usize);
+            let a_old = f32s(&out[..an]);
+            let a_new = f32s(&out[an..2 * an]);
+            let y_o = f32s(&out[2 * an..2 * an + yn]);
+            let y_n = f32s(&out[2 * an + yn..2 * an + 2 * yn]);
+            // the host decode of every (token, slot)'s gate/up, f64 sums
+            let mut a_host = vec![0.0f32; nt * SLOTS * INTER];
+            let (mut wg, mut wu) = (vec![0.0f32; INTER * HIDDEN], vec![0.0f32; INTER * HIDDEN]);
+            for e in 0..n_exp {
+                let users: Vec<usize> = (0..nt * SLOTS)
+                    .filter(|&bs| sel0[bs] as usize == e)
+                    .collect();
+                if users.is_empty() {
+                    continue;
+                }
+                dequant_q4tp(&gate_m[e], INTER, HIDDEN, &mut wg);
+                dequant_q4tp(&up_m[e], INTER, HIDDEN, &mut wu);
+                for bs in users {
+                    let xt = &x0[(bs / SLOTS) * HIDDEN..(bs / SLOTS + 1) * HIDDEN];
+                    for row in 0..INTER {
+                        let (mut sg, mut su) = (0.0f64, 0.0f64);
+                        for (j, &xv) in xt.iter().enumerate() {
+                            sg += f64::from(wg[row * HIDDEN + j]) * f64::from(xv);
+                            su += f64::from(wu[row * HIDDEN + j]) * f64::from(xv);
+                        }
+                        a_host[bs * INTER + row] = ((sg / (1.0 + (-sg).exp())) * su) as f32;
+                    }
+                }
+            }
+            let rows = nt * SLOTS;
+            let e_blk = rel(&a_new, &a_old, rows, INTER, INTER);
+            let e_old_h = rel(&a_old, &a_host, rows, INTER, INTER);
+            let e_new_h = rel(&a_new, &a_host, rows, INTER, INTER);
+            let e_y = rel(&y_n, &y_o, nt, HIDDEN, HIDDEN);
+            eprintln!(
+                "nt {nt}: gate/up blocked vs one-row {e_blk:.2e} (one-row vs host {e_old_h:.2e}, \
+                 blocked vs host {e_new_h:.2e}); down output blocked vs one-row {e_y:.2e}"
+            );
+            // tokens past nt untouched by either arm
+            for bs in rows * INTER..act_n {
+                assert!(
+                    a_old[bs] == POISON && a_new[bs] == POISON,
+                    "act {bs} past nt = {nt}"
+                );
+            }
+            worst.0 = worst.0.max(e_blk);
+            worst.1 = worst.1.max(e_new_h).max(e_old_h);
+            worst.2 = worst.2.max(e_y);
+        }
+        assert!(
+            worst.0 < 1e-5,
+            "blocked q4tp gate/up departs: {:e}",
+            worst.0
+        );
+        assert!(
+            worst.1 < 1e-4,
+            "q4tp gate/up departs from the host: {:e}",
+            worst.1
+        );
+        assert!(
+            worst.2 < 1e-5,
+            "blocked q4tp down chain departs: {:e}",
+            worst.2
+        );
+        // wall time of the gate/up dispatch alone, many in one pass (the
+        // adapter here is not the target card: a ratio, not a number to quote)
+        const REPS: usize = 200;
+        for nt in [1usize, 8] {
+            let mut times = [0.0f64; 2];
+            for _round in 0..2 {
+                for (i, (arm, wg)) in [
+                    (&gu_old, (INTER as u32, SLOTS as u32, nt as u32)),
+                    (&gu_new, ((INTER / 4) as u32, SLOTS as u32, nt as u32)),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let mut enc = new_encoder("e4-time").expect("encoder");
+                    {
+                        let mut pass = begin_pass(&mut enc);
+                        for _ in 0..REPS {
+                            launch(&mut pass, arm, wg);
+                        }
+                    }
+                    let t0 = std::time::Instant::now();
+                    submit_readback(enc, &[(&sel, 16)]).expect("readback");
+                    times[i] = t0.elapsed().as_secs_f64() * 1e6 / REPS as f64;
+                }
+            }
+            eprintln!(
+                "nt {nt}: gate/up {:.1} µs one-row, {:.1} µs blocked a dispatch",
+                times[0], times[1]
+            );
+        }
     }
 }
 
