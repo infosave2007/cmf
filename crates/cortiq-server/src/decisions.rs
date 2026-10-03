@@ -268,7 +268,7 @@ use cortiq_decision::eval::{f32_json, jev_confidence};
 use cortiq_decision::generation;
 use cortiq_decision::keys::{AuthFailure, KeyStore, now_unix};
 use cortiq_decision::ledger::{Actions, FLUSH_EVERY, Flusher, UsageLedger, UsageRecord};
-use cortiq_decision::matching::{MatchKind, SkillMatch};
+use cortiq_decision::matching::SkillMatch;
 use cortiq_decision::metering::{Rates, Usd};
 use cortiq_decision::protocol::{
     ApiError, CmfOptions, DecisionRequest, ModelRef, Profile, Question, QuestionKind, Reason,
@@ -833,11 +833,14 @@ fn require_json(headers: &HeaderMap) -> Result<(), HttpError> {
     }
 }
 
+/// A capacity error (DESIGN A21): the marker in the message,
+/// `details.capacity`, 413 here and 422 on the System One surface.
 fn too_large(limit: usize) -> HttpError {
-    HttpError::reason(
+    HttpError::from(ApiError::capacity(
         Reason::PayloadTooLarge,
+        None,
         format!("request body is larger than {limit} bytes"),
-    )
+    ))
     .with_detail("limit", json!(limit))
 }
 
@@ -1657,7 +1660,14 @@ async fn decide_http(st: &Arc<DecisionState>, headers: &HeaderMap, body: Body) -
 }
 
 async fn systemone_http(st: &Arc<DecisionState>, headers: &HeaderMap, body: Body) -> Handled {
-    let (p, bytes) = keyed_body(st, headers, body).await?;
+    // A body over the limit is a capacity error: 422 + the marker here
+    // (DESIGN A21), as every other capacity error of this surface.
+    let (p, bytes) = keyed_body(st, headers, body).await.map_err(|mut e| {
+        if e.status == 413 {
+            e.status = 422;
+        }
+        e
+    })?;
     let account = p.account.clone();
     let guard = st
         .svc
@@ -2276,6 +2286,7 @@ impl DecisionState {
             accepted,
             // `/v1/route` never explores (DESIGN A16 is the decisions API's).
             explore: false,
+            none: None,
             certified: false,
             gate,
             profile: r.profile,
@@ -2397,14 +2408,7 @@ impl DecisionState {
         let outcome = QuestionOutcome {
             id: ROUTE_QUESTION_ID.to_string(),
             kind: QuestionKind::Choice,
-            matched: SkillMatch {
-                kind: MatchKind::Exact,
-                skill: Some(s.id().to_string()),
-                candidates: (0..local.labels.len()).collect(),
-                unknown: Vec::new(),
-                reason: None,
-                ambiguous: false,
-            },
+            matched: SkillMatch::exact(s.id(), local.labels.len()),
             action,
             local: Some(local.clone()),
             oracle: None,
@@ -2438,6 +2442,7 @@ impl DecisionState {
                 model,
                 request: &req,
                 features: &features,
+                question_features: &[&features],
                 questions: std::slice::from_ref(&outcome),
             });
             self.link(request_id, request_id);

@@ -11,12 +11,15 @@
 //!  "response":{"round":null},
 //!  "oracle":{"enabled":false,"default_per_request":true,"base_url":"https://openrouter.ai/api/v1","api_key_env":"OPENROUTER_API_KEY",
 //!   "model":"deepseek/deepseek-v4.1-flash","provider":{"sort":"price","require_parameters":true,"allow_fallbacks":true,"max_price":{"prompt":0.1,"completion":0.5}},
-//!   "max_tokens_per_question":64,"deadline_s":30,"budget_usd":1.0,"max_calls":10000,"max_errors":30,"redact_pii":true,"title":"cortiq-decision","data_collection":null},
+//!   "max_tokens_per_question":64,"deadline_s":30,"budget_usd":1.0,"max_calls":10000,"max_errors":30,"redact_pii":true,"title":"cortiq-decision","data_collection":null,
+//!   "probabilities":true,"probability_tokens_per_question":128,"reasoning":"off","reasoning_max_tokens":4096,
+//!   "reasoning_deadline_s":60},
 //!  "cache":{"enabled":true,"threshold":0.97,"cap":50000},
 //!  "learning":{"enabled":true,"refit_min_new":25,"dedup":0.995,"cold_start":true,"synchronous":false,
 //!   "auto_skills":true,"auto_min_rows":10,"auto_k":8,"auto_tau":0.9,"auto_min_agreement":0.8,
 //!   "auto_min_coverage":0.8,"auto_max_skills":256,"auto_max_labels":64,"auto_max_examples_per_label":1000,
-//!   "auto_temperature_min":0.02,"auto_explore_every":8},
+//!   "auto_temperature_min":0.02,"auto_explore_every":8,"auto_min_sightings":5,"auto_sightings_cap":100000,
+//!   "auto_max_stateless_skills":256,"auto_min_sightings_stateful":1},
 //!  "feedback":{"pending_cap":50000}}
 //! ```
 //!
@@ -56,8 +59,19 @@ pub const DEFAULT_ORACLE_BASE_URL: &str = "https://openrouter.ai/api/v1";
 pub const DEFAULT_ORACLE_KEY_ENV: &str = "OPENROUTER_API_KEY";
 /// Default oracle model.
 pub const DEFAULT_ORACLE_MODEL: &str = "deepseek/deepseek-v4.1-flash";
-/// The largest `max_tokens` of one oracle call (spec §5.3: `64·q (≤4096)`).
+/// The largest `max_tokens` of one oracle call (spec §5.3: `64·q (≤4096)`);
+/// the probabilities' allowance (DESIGN C3) is bounded alike, apart.
 pub const MAX_ORACLE_TOKENS: u32 = 4096;
+/// Default `oracle.probability_tokens_per_question` (DESIGN C3): measured
+/// with the o200k tokenizer, a choice verdict with 5 listed probabilities
+/// costs 57–87 tokens more than the bare verdict (letters, the kit's
+/// `option_N`, BANKING77 label ids of 25–48 bytes), a 10-level score 39, a
+/// noul 10 — 128 leaves room for a provider's wider tokenizer.
+pub const DEFAULT_PROBABILITY_TOKENS: u32 = 128;
+/// `oracle.reasoning` values (DESIGN C4): `off`, or an OpenRouter effort.
+pub const REASONING_EFFORTS: [&str; 4] = ["off", "low", "medium", "high"];
+/// The largest `oracle.reasoning_max_tokens`.
+pub const MAX_REASONING_TOKENS: u32 = 65_536;
 /// The only rounding `response.round` / `cmf.round` accept (hundredths, spec §4.7).
 pub const ROUND_HUNDREDTHS: u8 = 2;
 
@@ -271,6 +285,24 @@ pub struct OracleConfig {
     pub redact_pii: bool,
     pub title: String,
     pub data_collection: Option<String>,
+    /// Ask for a distribution with every verdict (0.8.8, DESIGN C3): choice
+    /// the ≤ 5 most likely option ids with their probabilities, score one
+    /// per level, noul p(true). `false` sends the 0.8.7 body (the v4
+    /// driver's) and answers one-hot.
+    pub probabilities: bool,
+    /// Tokens per question added to `max_tokens` for the distribution when
+    /// `probabilities` is on (`min(·q, 4096)`).
+    pub probability_tokens_per_question: u32,
+    /// The oracle's reasoning effort (0.8.8, DESIGN C4): `off` (the request
+    /// disables reasoning, as before), `low`, `medium` or `high` (OpenRouter
+    /// `reasoning: {effort, exclude: true}`; the verdicts stay the final
+    /// message). An accuracy / latency / cost trade.
+    pub reasoning: String,
+    /// Tokens added to a call's `max_tokens` for the reasoning when it is on
+    /// (one allowance per call; reserved, so the budget accounts for it).
+    pub reasoning_max_tokens: u32,
+    /// Seconds added to `deadline_s` when the reasoning is on.
+    pub reasoning_deadline_s: f64,
 }
 
 impl Default for OracleConfig {
@@ -299,6 +331,11 @@ impl Default for OracleConfig {
             redact_pii: true,
             title: "cortiq-decision".into(),
             data_collection: None,
+            probabilities: true,
+            probability_tokens_per_question: DEFAULT_PROBABILITY_TOKENS,
+            reasoning: "off".into(),
+            reasoning_max_tokens: 4096,
+            reasoning_deadline_s: 60.0,
         }
     }
 }
@@ -324,6 +361,41 @@ impl OracleConfig {
             Ok(v)
         };
         Ok((get("prompt")?, get("completion")?))
+    }
+
+    /// The reasoning effort of a call, `None` when `reasoning` is `off`
+    /// (DESIGN C4).
+    pub fn reasoning_effort(&self) -> Option<&str> {
+        (self.reasoning != "off").then_some(self.reasoning.as_str())
+    }
+
+    /// This configuration with the reasoning off (the oracle's direct
+    /// answer after a reasoning call that failed, DESIGN C5).
+    pub fn without_reasoning(&self) -> Self {
+        Self {
+            reasoning: "off".into(),
+            ..self.clone()
+        }
+    }
+
+    /// How long one escalation may hold the oracle: a call's deadline, and
+    /// with the reasoning on the direct call that may follow a failed one.
+    pub fn escalation_deadline_s(&self) -> f64 {
+        if self.reasoning_effort().is_some() {
+            self.call_deadline_s() + self.deadline_s
+        } else {
+            self.deadline_s
+        }
+    }
+
+    /// The deadline of one call: `deadline_s`, plus `reasoning_deadline_s`
+    /// when the reasoning is on.
+    pub fn call_deadline_s(&self) -> f64 {
+        if self.reasoning_effort().is_some() {
+            self.deadline_s + self.reasoning_deadline_s
+        } else {
+            self.deadline_s
+        }
     }
 
     /// The `provider` object of a request body: the preferences plus
@@ -390,7 +462,8 @@ pub struct LearningConfig {
     /// Share of a contract's examples the active labels must hold at the
     /// activation (so that the quarantined labels are genuinely rare).
     pub auto_min_coverage: f32,
-    /// Contracts learned at most.
+    /// Stateful contracts learned at most (state-less ones have their own
+    /// cap, `auto_max_stateless_skills`).
     pub auto_max_skills: usize,
     /// Option ids a learned contract may have at most.
     pub auto_max_labels: usize,
@@ -411,6 +484,35 @@ pub struct LearningConfig {
     /// four kept 36 % of the traffic at the oracle while a label the oracle
     /// itself names inconsistently never activated). 0 turns it off.
     pub auto_explore_every: u64,
+    /// The sighting of a state-less contract (a request with an empty
+    /// `state`, DESIGN A20) from which it is registered and learned. 5: a
+    /// contract cannot activate before `auto_min_rows` (10) examples of each
+    /// of its ≥ 2 labels, so the four answers not learned cost a learnable
+    /// contract little, while a contract seen a few times — a multiple-choice
+    /// item whose options change with every question, the twin sentences of
+    /// a WinoGrande pair — never reaches `learn.log` nor takes a slot of
+    /// `auto_max_stateless_skills`. On the Decision Index suite's state-less
+    /// rows 2 registered 756 contracts, 3 registered 168, 5 registered 20
+    /// (the intent sets, VAST, CLadder and a few repeated items). 1
+    /// registers at the first sighting, as stateful contracts do by default.
+    pub auto_min_sightings: u32,
+    /// Contracts whose sightings are counted (an in-memory LRU, lost on
+    /// restart; the state-less ones and, when `auto_min_sightings_stateful`
+    /// is above 1, the stateful ones).
+    pub auto_sightings_cap: usize,
+    /// State-less contracts learned at most, counted apart from the stateful
+    /// ones: stateful contracts register at their first sighting, and a run
+    /// of stateful one-offs (per-row instructions, a tool catalogue per
+    /// request) would otherwise fill `auto_max_skills` before a repeated
+    /// state-less contract is seen.
+    pub auto_max_stateless_skills: usize,
+    /// The sighting of a stateful contract (a request with a non-empty
+    /// `state`) from which it is registered and learned (DESIGN B2). 1, the
+    /// default, registers at the first sighting (0.8.6); a larger value keeps
+    /// one-off stateful contracts — benchmark items, a rubric per question —
+    /// out of `learn.log` and `auto_max_skills`, at the price of the answers
+    /// before that sighting, which are not learned.
+    pub auto_min_sightings_stateful: u32,
 }
 
 impl Default for LearningConfig {
@@ -432,6 +534,22 @@ impl Default for LearningConfig {
             auto_max_examples_per_label: 1000,
             auto_temperature_min: 0.02,
             auto_explore_every: 8,
+            auto_min_sightings: 5,
+            auto_sightings_cap: 100_000,
+            auto_max_stateless_skills: 256,
+            auto_min_sightings_stateful: 1,
+        }
+    }
+}
+
+impl LearningConfig {
+    /// The sighting from which a contract of this kind is registered
+    /// (DESIGN A20, B2).
+    pub fn min_sightings(&self, stateless: bool) -> u32 {
+        if stateless {
+            self.auto_min_sightings
+        } else {
+            self.auto_min_sightings_stateful
         }
     }
 }
@@ -827,8 +945,26 @@ impl Config {
             "oracle.max_tokens_per_question must be in 1..={MAX_ORACLE_TOKENS}"
         );
         ensure!(
+            (1..=MAX_ORACLE_TOKENS).contains(&o.probability_tokens_per_question),
+            "oracle.probability_tokens_per_question must be in 1..={MAX_ORACLE_TOKENS}"
+        );
+        ensure!(
             o.deadline_s.is_finite() && o.deadline_s > 0.0,
             "oracle.deadline_s must be positive"
+        );
+        ensure!(
+            REASONING_EFFORTS.contains(&o.reasoning.as_str()),
+            "oracle.reasoning must be one of {}, got '{}'",
+            REASONING_EFFORTS.join(", "),
+            o.reasoning
+        );
+        ensure!(
+            (1..=MAX_REASONING_TOKENS).contains(&o.reasoning_max_tokens),
+            "oracle.reasoning_max_tokens must be in 1..={MAX_REASONING_TOKENS}"
+        );
+        ensure!(
+            o.reasoning_deadline_s.is_finite() && o.reasoning_deadline_s >= 0.0,
+            "oracle.reasoning_deadline_s must be finite and non-negative"
         );
         ensure!(
             o.budget_usd.is_finite() && o.budget_usd >= 0.0,
@@ -877,6 +1013,22 @@ impl Config {
         ensure!(
             l.auto_max_examples_per_label >= 1,
             "learning.auto_max_examples_per_label must be positive"
+        );
+        ensure!(
+            l.auto_min_sightings >= 1,
+            "learning.auto_min_sightings must be positive"
+        );
+        ensure!(
+            l.auto_min_sightings_stateful >= 1,
+            "learning.auto_min_sightings_stateful must be positive"
+        );
+        ensure!(
+            l.auto_sightings_cap >= 1,
+            "learning.auto_sightings_cap must be positive"
+        );
+        ensure!(
+            l.auto_max_stateless_skills >= 1,
+            "learning.auto_max_stateless_skills must be positive"
         );
         // Any positive f32-exact `T` is a valid gate (`Gate::validate`); the
         // floor is bounded by 1 only so that a typo cannot flatten the softmax.
@@ -971,11 +1123,17 @@ mod tests {
         assert_eq!((l.auto_max_skills, l.auto_max_labels), (256, 64));
         assert_eq!(l.auto_max_examples_per_label, 1000);
         assert_eq!((l.auto_temperature_min, l.auto_explore_every), (0.02, 8));
+        assert_eq!((l.auto_min_sightings, l.auto_sightings_cap), (5, 100_000));
+        assert_eq!(l.auto_max_stateless_skills, 256);
+        assert_eq!(l.auto_min_sightings_stateful, 1);
         let ok = |j: &str| Config::from_json(format!(r#"{{"learning":{{{j}}}}}"#).as_bytes());
         assert!(ok(r#""auto_skills":false,"auto_min_rows":2,"auto_k":1,"auto_tau":0,"auto_max_labels":255"#).is_ok());
         // 0 = no floor / exploration off; the floor may reach 1.
         assert!(ok(r#""auto_temperature_min":0,"auto_explore_every":0"#).is_ok());
         assert!(ok(r#""auto_temperature_min":1"#).is_ok());
+        assert!(ok(r#""auto_min_sightings":1,"auto_sightings_cap":1"#).is_ok());
+        assert!(ok(r#""auto_max_stateless_skills":1"#).is_ok());
+        assert!(ok(r#""auto_min_sightings_stateful":3"#).is_ok());
         for (j, what) in [
             (r#""auto_min_rows":1"#, "auto_min_rows"),
             (r#""auto_k":0"#, "auto_k"),
@@ -991,6 +1149,16 @@ mod tests {
             ),
             (r#""auto_temperature_min":-0.01"#, "auto_temperature_min"),
             (r#""auto_temperature_min":1.5"#, "auto_temperature_min"),
+            (r#""auto_min_sightings":0"#, "auto_min_sightings"),
+            (r#""auto_sightings_cap":0"#, "auto_sightings_cap"),
+            (
+                r#""auto_min_sightings_stateful":0"#,
+                "auto_min_sightings_stateful",
+            ),
+            (
+                r#""auto_max_stateless_skills":0"#,
+                "auto_max_stateless_skills",
+            ),
             // A u64: serde names the value, not the key.
             (r#""auto_explore_every":-1"#, "invalid value"),
             (r#""auto_unknown":1"#, "unknown field"),
