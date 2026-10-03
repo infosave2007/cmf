@@ -460,7 +460,7 @@ fn physical_total_bytes() -> Option<u64> {
 
 /// AVAILABLE RAM in bytes, best effort — used only to refuse a bake
 /// whose f32 replica would swap instead of run.
-fn available_ram_bytes() -> Option<u64> {
+pub(crate) fn available_ram_bytes() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
         // free% × total from the same counters the memory-pressure
