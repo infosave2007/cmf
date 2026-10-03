@@ -179,7 +179,9 @@ goes to the oracle on every new text and, until 0.8.5, was never learned. Since
   sentences, a repeated MuSR question) are not worth a skill: on the
   Decision Index suite's state-less rows 2 registered 756 contracts, 5
   registered 20. Stateful contracts register at their first sighting, as in
-  0.8.6, against `auto_max_skills`; state-less ones have their own cap
+  0.8.6 (from 0.8.8 at their `learning.auto_min_sightings_stateful`-th, 1 by
+  default, counted in the same LRU), against `auto_max_skills`; state-less
+  ones have their own cap
   `auto_max_stateless_skills` (256), so stateful one-offs (per-row
   instructions, a tool catalogue per request) never take their slots. State-less
   answers are never `certified`. A state-less auto-skill answers state-less

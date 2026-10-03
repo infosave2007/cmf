@@ -93,9 +93,11 @@
 //! restart), so one-off contracts — a multiple-choice benchmark whose options
 //! change with every item — never reach `learn.log` nor use up
 //! `learning.auto_max_stateless_skills`; the answers before that are not
-//! learned. Stateful contracts register at the first sighting, as in 0.8.6,
-//! against their own cap `learning.auto_max_skills`, so stateful one-offs
-//! never crowd a repeated state-less contract out.
+//! learned. Stateful contracts register at their
+//! `learning.auto_min_sightings_stateful`-th sighting (1 by default: the
+//! first, as in 0.8.6; DESIGN B2; counted in the same LRU, the contract id
+//! tells the kinds apart), against their own cap `learning.auto_max_skills`,
+//! so stateful one-offs never crowd a repeated state-less contract out.
 //!
 //! **Admin** (spec §5b): oracle status and switches, learning status (buffer,
 //! cache, quarantine, attempts, task hashes), generations and rollback (the
@@ -277,8 +279,9 @@ struct Stats {
     recent: VecDeque<Value>,
 }
 
-/// How often each state-less contract was seen before it was registered
-/// (DESIGN A20): a bounded LRU of contract ids, oldest touched evicted first.
+/// How often each contract under a sightings gate was seen before it was
+/// registered (DESIGN A20, B2): a bounded LRU of contract ids, oldest touched
+/// evicted first. A state-less and a stateful contract never share an id.
 #[derive(Debug, Default)]
 pub struct Sightings {
     cap: usize,
@@ -354,7 +357,7 @@ struct Inner {
     books: Mutex<Books>,
     /// The contracts of the auto-skills (restored from `learn.log` first).
     contracts: Mutex<ContractRegistry>,
-    /// Sightings of state-less contracts not registered yet (DESIGN A20).
+    /// Sightings of gated contracts not registered yet (DESIGN A20, B2).
     sightings: Mutex<Sightings>,
     bases: Mutex<HashMap<String, Arc<Rows>>>,
     flights: Mutex<Vec<Flight>>,
@@ -738,9 +741,7 @@ impl Inner {
                 self.log.append(&LogRecord::Contract(c.clone()))?;
                 reg.insert(c.clone());
                 self.stats.lock().auto_registered += 1;
-                if c.stateless {
-                    self.sightings.lock().forget(&c.skill);
-                }
+                self.sightings.lock().forget(&c.skill);
             }
             // Closed label set: a label outside the contract (a superset
             // request, a router feedback) is refused (DESIGN A5). A served
@@ -1120,15 +1121,20 @@ impl Escalator for Cascade {
             .collect();
         let mut out: Vec<Option<Resolved>> = vec![None; n];
 
-        // Sightings of the state-less contracts not registered yet (DESIGN
-        // A20), one per contract and request, whatever answers them next.
+        // Sightings of the gated contracts not registered yet (DESIGN A20,
+        // B2: every state-less one, a stateful one when
+        // `auto_min_sightings_stateful` > 1), one per contract and request,
+        // whatever answers them next.
         let mut seen: HashMap<String, u32> = HashMap::new();
         if cfg.learning.enabled {
             for p in &e.pending {
                 let Some(c) = auto_contract(cfg, e, p) else {
                     continue;
                 };
-                if !c.stateless || seen.contains_key(&c.skill) {
+                // State-less contracts are always counted (the admin
+                // `auto_sightings` of 0.8.7), stateful ones only when gated.
+                let gated = c.stateless || cfg.learning.auto_min_sightings_stateful > 1;
+                if !gated || seen.contains_key(&c.skill) {
                     continue;
                 }
                 let registered = inner.contracts.lock().contains(&c.skill);
@@ -1252,15 +1258,14 @@ impl Escalator for Cascade {
                             Some(skill) if teaches(e, p, skill) => (skill.clone(), None),
                             Some(_) => continue,
                             None => match auto_contract(cfg, e, p) {
-                                // A state-less contract seen fewer than
-                                // `auto_min_sightings` times is not
+                                // A contract seen fewer than its kind's
+                                // `auto_min_sightings*` times is not
                                 // registered yet: its answer is not learned
-                                // (DESIGN A20).
+                                // (DESIGN A20, B2).
                                 Some(c)
-                                    if c.stateless
-                                        && seen.get(&c.skill).is_some_and(|&k| {
-                                            k < cfg.learning.auto_min_sightings
-                                        }) =>
+                                    if seen.get(&c.skill).is_some_and(|&k| {
+                                        k < cfg.learning.min_sightings(c.stateless)
+                                    }) =>
                                 {
                                     continue;
                                 }

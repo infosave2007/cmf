@@ -443,7 +443,11 @@ directory nor counted against the registry; the answers before that
 sighting are not learned. State-less contracts are capped by
 `learning.auto_max_stateless_skills`, apart from the stateful ones'
 `auto_max_skills`. Requests with a non-empty state behave exactly as in
-0.8.6 (their contracts register at the first sighting). The same rules
+0.8.6 (their contracts register at the first sighting) unless
+`learning.auto_min_sightings_stateful` is above 1: then a stateful contract
+too registers only at that sighting (0.8.8; counted in the same LRU), which
+keeps one-off stateful contracts — benchmark items, a rubric per question —
+out of the state directory and `auto_max_skills`. The same rules
 hold on `/v1/systemone` ([section 3a](#3a-system-one-request-adapter-jev-compatible)).
 `/v1/skills/{id}` of a state-less auto-skill shows `rubric.instructions:
 null` and `rubric.input: "instructions"`; `GET /v1/admin/learning` lists it
@@ -909,7 +913,7 @@ unknown key is an error. The defaults:
                "auto_max_labels": 64, "auto_max_examples_per_label": 1000,
                "auto_temperature_min": 0.02, "auto_explore_every": 8,
                "auto_min_sightings": 5, "auto_sightings_cap": 100000,
-               "auto_max_stateless_skills": 256},
+               "auto_max_stateless_skills": 256, "auto_min_sightings_stateful": 1},
   "feedback": {"pending_cap": 50000},
   "complexity_weights": {"base": 0.4, "ambiguity": 0.25, "novelty": 0.15, "margin": 0.1, "length": 0.1},
   "complexity_tiers": [{"tier": "low", "max": 0.33}, {"tier": "medium", "max": 0.66}, {"tier": "high", "max": 1.0}],
@@ -942,9 +946,11 @@ one text in that many while a label is quarantined — the one case in which a
 gate-accepted question reaches the oracle, auto-skills only;
 `auto_min_sightings` (≥ 1) is the sighting of a state-less contract from
 which it is registered and learned (1: at once, like a stateful one),
-`auto_sightings_cap` (≥ 1) how many unregistered state-less contracts the
-in-memory sightings LRU tracks and `auto_max_stateless_skills` (≥ 1) how
-many state-less contracts are learned at most. `cortiq serve --oracle MODEL` and its companions
+`auto_sightings_cap` (≥ 1) how many unregistered contracts the in-memory
+sightings LRU tracks, `auto_max_stateless_skills` (≥ 1) how many state-less
+contracts are learned at most and `auto_min_sightings_stateful` (≥ 1, 0.8.8)
+the sighting of a stateful contract from which it is registered (1: at once,
+as in 0.8.6). `cortiq serve --oracle MODEL` and its companions
 override the `oracle` section (and `--no-oracle-learning` sets
 `learning.enabled` false); a file that sets `oracle.provider` keeps its
 `max_price` unless `--oracle-max-price` is given.
