@@ -9359,6 +9359,10 @@ impl Pipeline {
                         pool: pool.as_deref(),
                         v_head_dim: self.layer_v_dim(li),
                     };
+                    #[cfg(feature = "gpu")]
+                    let _mirror = self
+                        .prefill_mirror_target(li)
+                        .map(crate::gpu::enter_prefill_mirror);
                     let mut attn = attention::qwen_attention_batch(
                         &normed,
                         b,
@@ -9602,10 +9606,19 @@ impl Pipeline {
         }
         crate::gpu::set_layer(-1); // lm_head/final ops outside layer-split
         if prefill_prof_on() {
+            let ms = |a: &std::sync::atomic::AtomicU64| {
+                a.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6
+            };
+            let sp = &attention::ATTN_SPLIT;
             eprintln!(
-                "prefill-split: attention {:.1} ms, ffn {:.1} ms (cumulative)",
-                PREFILL_SPLIT[0].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
-                PREFILL_SPLIT[1].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6
+                "prefill-split: attention {:.1} ms (proj {:.1}, host loop {:.1}, attend {:.1}, \
+                 o-proj {:.1}), ffn {:.1} ms (cumulative)",
+                ms(&PREFILL_SPLIT[0]),
+                ms(&sp[0]),
+                ms(&sp[1]),
+                ms(&sp[2]),
+                ms(&sp[3]),
+                ms(&PREFILL_SPLIT[1])
             );
         }
         // A batched span owns a complete set of positions. Publish any
@@ -10194,6 +10207,42 @@ impl Pipeline {
             invf,
             window: self.layer_window(li),
             sink: self.kv_cache.layers[li].sinks.as_deref(),
+        })
+    }
+
+    /// The decode graph's device K/V mirror that layer `li`'s batched
+    /// prefill appends its chunk to and attends against (wgpu), instead
+    /// of uploading the layer's whole K/V prefix every chunk and the whole
+    /// cache again at the first decode token. Only where the token graph
+    /// will read that very mirror: the decode graph on, not refused, and
+    /// this layer's geometry what it requests (`graph_attn_geom`: KV heads,
+    /// V as wide as K, the window as a ring, no sink).
+    ///
+    /// Spark-X2.5 only (`proj_gate_sigmoid`), the one architecture whose
+    /// output was measured identical on it. `CMF_PREFILL_MIRROR=0` keeps
+    /// the host upload (A/B).
+    #[cfg(feature = "gpu")]
+    fn prefill_mirror_target(&self, li: usize) -> Option<crate::gpu::PrefillMirror> {
+        if !self.proj_gate_sigmoid
+            || std::env::var("CMF_PREFILL_MIRROR").as_deref() == Ok("0")
+            || !crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Decode)
+            || self.graph_refused()
+            || self.o1_active()
+            || self.attn_softcap > 0.0
+            || self.wgpu_graph_attn_decline().is_some()
+        {
+            return None;
+        }
+        let g = self.graph_attn_geom(li)?;
+        let (nkv, hd, _) = self.layer_geom(li);
+        // The token graph passes the call-wide head width (layer 0's).
+        if g.nkv != nkv || g.dv != hd || g.sink.is_some() || hd != self.layer_geom(0).1 {
+            return None;
+        }
+        Some(crate::gpu::PrefillMirror {
+            kv_id: self.graph_kv_id,
+            layer: li,
+            limit: self.kv_cache.max_seq_len,
         })
     }
 

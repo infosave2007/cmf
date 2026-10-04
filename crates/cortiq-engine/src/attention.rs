@@ -1388,6 +1388,18 @@ pub fn qwen_attention(
     out
 }
 
+/// `CMF_PREFILL_PROF`: cumulative ns of `qwen_attention_batch`'s stages —
+/// projections (q|k|v and a projected gate), the per-position host loop
+/// (bias, norms, RoPE, host append), the attend (with its gate), the O
+/// projection. The pipeline prints them with its attention/FFN split.
+pub(crate) static ATTN_SPLIT: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+pub(crate) fn attn_split_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CMF_PREFILL_PROF").is_some())
+}
+
 /// Batched-chunk exact attention (roadmap §3 P0 «prefill»): Q/K/V and O
 /// projections run as chunk-GEMMs — each weight row streams from memory
 /// ONCE per chunk instead of once per position — while the attention
@@ -1439,6 +1451,7 @@ pub fn qwen_attention_batch(
     }
 
     // ── chunk-GEMM projections ──
+    let split_t0 = std::time::Instant::now();
     let mut q_all = take_buf(b * qrows);
     let mut k_all = take_buf(b * nkv * hd);
     let mut v_all = take_buf(b * vrow);
@@ -1612,6 +1625,7 @@ pub fn qwen_attention_batch(
         && cache.mode == crate::kv_cache::KvMode::F32
         && std::env::var("CMF_PAR_ATTEND").map_or(true, |v| v != "0");
     let stash_q = batched_attend || par_positions;
+    let split_t1 = std::time::Instant::now();
     let prof_attend = crate::cpuprof::time(crate::cpuprof::Slot::PrefillAttend);
     let s0 = cache.seq_len;
     let mut ao_all = take_buf(b * nh * hd);
@@ -1706,6 +1720,7 @@ pub fn qwen_attention_batch(
         recycle_buf(&mut q);
         recycle_buf(&mut gate);
     }
+    let split_t2 = std::time::Instant::now();
     if par_positions {
         let pool = cfg.pool.expect("par_positions requires a pool");
         let s_end = cache.seq_len;
@@ -1769,25 +1784,52 @@ pub fn qwen_attention_batch(
                     qhm[h * b * hd + bi * hd..h * b * hd + (bi + 1) * hd].copy_from_slice(src);
                 }
             }
-            // Under a masking window only the rows the first query can still
-            // see go up: `lo` is the oldest of them.
             let w = if device_window { cfg.window.unwrap_or(0) } else { 0 };
-            let lo = if w > 0 { (s0 + 1).saturating_sub(w) } else { 0 };
-            let ks: Vec<&[f32]> = (0..nkv).map(|g| &cache.head_keys(g)[lo * hd..]).collect();
-            let vs: Vec<&[f32]> = (0..nkv).map(|g| &cache.head_values(g)[lo * hd..]).collect();
-            done = crate::gpu::chunk_attend_win(
-                &qhm,
-                &ks,
-                &vs,
-                b,
-                s0 - lo,
-                nh,
-                nkv,
-                hd,
-                cfg.scale,
-                w,
-                &mut ao_all,
-            );
+            // The pipeline named the decode graph's device mirror of this
+            // layer: append the chunk's rows to it and attend in place
+            // (`chunk_attend_mirror`; the host rows above are the same
+            // bits). Rows are positions there, so the host cache must be
+            // unevicted (`position == seq_len`).
+            if let Some(t) = crate::gpu::prefill_mirror()
+                .filter(|_| cfg.gate_sigmoid && vd == hd && cfg.position == s0)
+            {
+                done = crate::gpu::chunk_attend_mirror(
+                    t,
+                    cache.k_heads(),
+                    cache.v_heads(),
+                    &qhm,
+                    b,
+                    s0,
+                    nh,
+                    nkv,
+                    hd,
+                    cfg.scale,
+                    cfg.window,
+                    w,
+                    &mut ao_all,
+                );
+            }
+            if !done {
+                // Under a masking window only the rows the first query can
+                // still see go up: `lo` is the oldest of them.
+                let lo = if w > 0 { (s0 + 1).saturating_sub(w) } else { 0 };
+                let ks: Vec<&[f32]> = (0..nkv).map(|g| &cache.head_keys(g)[lo * hd..]).collect();
+                let vs: Vec<&[f32]> =
+                    (0..nkv).map(|g| &cache.head_values(g)[lo * hd..]).collect();
+                done = crate::gpu::chunk_attend_win(
+                    &qhm,
+                    &ks,
+                    &vs,
+                    b,
+                    s0 - lo,
+                    nh,
+                    nkv,
+                    hd,
+                    cfg.scale,
+                    w,
+                    &mut ao_all,
+                );
+            }
             recycle_buf(&mut qhm);
         }
         #[cfg(target_arch = "aarch64")]
@@ -1886,6 +1928,7 @@ pub fn qwen_attention_batch(
     recycle_buf(&mut q_rope_all);
     recycle_buf(&mut gates_all);
     drop(prof_attend);
+    let split_t3 = std::time::Instant::now();
 
     // ── chunk-GEMM output projection ──
     // V narrower than the head width: drop every head's (zero) pad dims so
@@ -1893,6 +1936,18 @@ pub fn qwen_attention_batch(
     let mut ao_all = compact_heads(ao_all, nh, hd, vd);
     let mut out = vec![0.0f32; b * cfg.hidden_size];
     wo.matmat(&ao_all, b, &mut out, cfg.pool);
+    if attn_split_on() {
+        let t4 = std::time::Instant::now();
+        for (i, (a, z)) in [(split_t0, split_t1), (split_t1, split_t2), (split_t2, split_t3), (split_t3, t4)]
+            .into_iter()
+            .enumerate()
+        {
+            ATTN_SPLIT[i].fetch_add(
+                z.duration_since(a).as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
     recycle_buf(&mut q_all);
     recycle_buf(&mut k_all);
     recycle_buf(&mut v_all);
