@@ -17548,9 +17548,11 @@ mod attend_x_shader_tests {
 struct GraphX {
     kv_append: wgpu::ComputePipeline,
     attend: wgpu::ComputePipeline,
-    /// `gqa_attend_x4g`: head-gated layers' attend (gate folded in).
-    attend_g: wgpu::ComputePipeline,
-    attend_g_l: wgpu::BindGroupLayout,
+    /// `gqa_attend_x4g`: head-gated layers' attend (gate folded in). Built
+    /// under its own error scope: None on a device that rejects it, and
+    /// such layers then take `gqa_attend_x` + `gate_mul` — the rest of the
+    /// set (MiMo-V2's attend) never depends on it.
+    attend_g: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
     part: wgpu::ComputePipeline,
     merge: wgpu::ComputePipeline,
     q82_b: wgpu::ComputePipeline,
@@ -20284,7 +20286,24 @@ fn init(dev: usize) -> Result<Ctx, String> {
                 px("gqa_attend_merge_x"),
                 px("q8_2f_matvec_b"),
             );
-            let attend_g = px("gqa_attend_x4g");
+            // Its own scope: a rejection costs only the head-gated fold.
+            // CMF_ATTEND_X4G=0 forces that fallback (the A/B of the fold).
+            let attend_g = if std::env::var("CMF_ATTEND_X4G").as_deref() == Ok("0") {
+                None
+            } else {
+                let sg = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let p = px("gqa_attend_x4g");
+                if let Some(e) = pollster::block_on(sg.pop()) {
+                    tracing::warn!(
+                        "gqa_attend_x4g rejected ({e}): head-gated layers attend with \
+                         gqa_attend_x + gate_mul"
+                    );
+                    None
+                } else {
+                    let l = p.get_bind_group_layout(0);
+                    Some((p, l))
+                }
+            };
             let mut q82_short = Vec::new();
             for rows in 1..=4 {
                 let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -20303,7 +20322,6 @@ fn init(dev: usize) -> Result<Ctx, String> {
                 q82_short,
                 kv_l: kv_append.get_bind_group_layout(0),
                 attend_l: attend.get_bind_group_layout(0),
-                attend_g_l: attend_g.get_bind_group_layout(0),
                 attend_g,
                 part_l: part.get_bind_group_layout(0),
                 merge_l: merge.get_bind_group_layout(0),
@@ -26653,12 +26671,14 @@ pub fn forward_token_graph(
                             pass.set_pipeline(&gx.merge);
                             pass.set_bind_group(0, &bg_merge, &[]);
                             pass.dispatch_workgroups(nh as u32, 1, 1);
-                        } else if !skip_attn && hg.is_some() {
+                        } else if let Some((attend_g, attend_g_l)) =
+                            gx.attend_g.as_ref().filter(|_| !skip_attn && hg.is_some())
+                        {
                             // Head-gated layer: the split-value attend with
                             // the gate folded into its output write.
                             let bg_att = bind_pairs(
                                 c,
-                                &gx.attend_g_l,
+                                attend_g_l,
                                 &[
                                     (0, &qout),
                                     (1, kbuf),
@@ -26669,7 +26689,7 @@ pub fn forward_token_graph(
                                     (8, &gout),
                                 ],
                             );
-                            go(&mut enc, &gx.attend_g, &bg_att, nh as u32);
+                            go(&mut enc, attend_g, &bg_att, nh as u32);
                             gate_folded = true;
                         } else if !skip_attn {
                             let bg_att = bind_pairs(
