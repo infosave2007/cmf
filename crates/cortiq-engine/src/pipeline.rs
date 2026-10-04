@@ -9625,10 +9625,12 @@ impl Pipeline {
                 .map(|v| v == "0")
                 .unwrap_or(false)
             || b < 32
-            || self.swa.is_some()
+            // Sliding windows with per-layer RoPE ride the chunk graph
+            // (`metal_graph_swa`: causal_softmax_win, per-layer tables).
+            || (self.swa.is_some() && !self.metal_graph_swa())
             || self.global_attn.is_some()
             // per-layer KV heads, narrow V, learned sinks (MiMo-V2)
-            || self.graph_attn_decline_reason().is_some()
+            || (self.graph_attn_decline_reason().is_some() && !self.metal_graph_swa())
             // Collection owns the exact Q trace and boundary conversion;
             // this chunk graph appends dense KV without feeding that trace.
             || self.o1_active()
@@ -9640,7 +9642,6 @@ impl Pipeline {
         let Some(model) = self.model.clone() else {
             return li0;
         };
-        let inv_freq = self.inv_freq.clone();
         let (nh, nkv, hd, hs) = (
             self.num_heads,
             self.num_kv_heads,
@@ -9657,7 +9658,12 @@ impl Pipeline {
         };
         let mut layers: Vec<crate::gpu_metal::ChunkLayer> = Vec::new();
         let mut stored_at: Vec<usize> = Vec::new();
-        for li in li0..self.num_layers.min(loop_end).min(cap) {
+        let run_end = self.num_layers.min(loop_end).min(cap);
+        // Each layer's own RoPE table (Spark-X2.5: sliding and full layers
+        // differ); the global one for every model without sliding layers.
+        let tables: Vec<std::sync::Arc<Vec<f32>>> =
+            (li0..run_end).map(|li| self.layer_inv_freq(li)).collect();
+        for li in li0..run_end {
             let lw = &self.weights.layers[self.phys_layer(li)];
             if lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some() {
                 break;
@@ -9670,14 +9676,23 @@ impl Pipeline {
                 q_norm,
                 k_norm,
                 output_gate: false,
-                softplus_gate: None,
+                softplus_gate,
                 bias,
             } = &lw.attn
             else {
                 break;
             };
+            // Spark-X2.5's per-head sigmoid g_proj gate, from f32 rows.
+            let head_gate = match softplus_gate {
+                None => None,
+                Some((g, true)) if self.proj_gate_sigmoid => match g.f32_parts() {
+                    Some((d, r, c)) if r == nh && c == hs => Some(d),
+                    _ => break,
+                },
+                Some(_) => break,
+            };
             let FfnKind::Dense(d) = &lw.ffn else { break };
-            if d.act != Act::Silu || !d.segs.is_empty() {
+            if !matches!(d.act, Act::Silu | Act::Gelu) || !d.segs.is_empty() {
                 break;
             }
             // q8_row (row_scale populated), or q4_tiled / q4tp (row_scale
@@ -9725,8 +9740,8 @@ impl Pipeline {
                     .map(|(a, bb, cc)| (a.as_slice(), bb.as_slice(), cc.as_slice())),
                 q_norm: q_norm.as_deref(),
                 k_norm: k_norm.as_deref(),
-                inv_freq: &inv_freq,
-                rd: self.rotary_dim,
+                inv_freq: &tables[li - li0],
+                rd: self.layer_geom(li).2,
                 nh,
                 nkv,
                 hd,
@@ -9735,6 +9750,9 @@ impl Pipeline {
                 gemma: matches!(self.norm_style, cortiq_core::NormStyle::Gemma),
                 late_qk_norm: self.qk_norm_after_rope,
                 eps: self.rms_eps as f32,
+                window: self.layer_window(li),
+                head_gate,
+                gelu: d.act == Act::Gelu,
             });
         }
         if layers.is_empty() {
