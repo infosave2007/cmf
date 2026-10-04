@@ -29,6 +29,7 @@ mod support;
 #[path = "common/toy_dir.rs"]
 mod toy_dir;
 
+use cortiq_decision::cascade::CacheView;
 use cortiq_decision::config::{Config, OracleConfig};
 use cortiq_decision::learn;
 use cortiq_decision::manifest::Rubric;
@@ -37,7 +38,7 @@ use cortiq_decision::oracle::{self, process_env};
 use cortiq_decision::protocol::{
     ModelRule, Question, QuestionKind, parse_request, validate_decisions_response, wire_questions,
 };
-use cortiq_decision::service::{Action, AdminCommand, OracleStatus, Principal};
+use cortiq_decision::service::{Action, AdminCommand, Escalator, OracleStatus, Principal};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -337,17 +338,23 @@ fn cache_answers_repeats_and_paraphrases_without_calls() {
     assert!((0.97..1.0).contains(&c), "paraphrase cos {c}");
     let mock = MockOracle::answering("travel");
     let st = Stand::new(&stand_config(&mock.url()));
+    // An empty cache answers nothing without the oracle: a request without
+    // consent fails before any work, as before 0.8.10.
+    assert!(!st.cascade.answers_without_oracle());
     let d1 = st.decide(&topics_body(a)).unwrap();
     assert_eq!(d1.questions[0].action, Action::Oracle);
+    assert!(st.cascade.answers_without_oracle());
     let d2 = st.decide(&topics_body(a)).unwrap();
     assert_eq!(d2.questions[0].action, Action::Cache);
     assert_eq!(d2.questions[0].decision_path, "escalate→cache");
     assert_eq!(d2.response["answers"]["task"]["choice"], "travel");
     assert_eq!(d2.response["usage"]["cost"].as_f64(), Some(0.0));
     assert_eq!(d2.response["cmf"]["usage"]["oracle"]["calls"], 0);
+    // A paraphrase is another state: by default (0.8.10) only the same
+    // question hits, so it is a call.
     let d3 = st.decide(&topics_body(p)).unwrap();
-    assert_eq!(d3.questions[0].action, Action::Cache, "paraphrase");
-    assert_eq!(mock.hits(), 1);
+    assert_eq!(d3.questions[0].action, Action::Oracle, "paraphrase");
+    assert_eq!(mock.hits(), 2);
     // A far text is a call; another skill scope (the same text asked with
     // other options) is a miss too.
     let far = &rejected()[1];
@@ -356,7 +363,7 @@ fn cache_answers_repeats_and_paraphrases_without_calls() {
         st.decide(&topics_body(far)).unwrap().questions[0].action,
         Action::Oracle
     );
-    assert_eq!(mock.hits(), 2);
+    assert_eq!(mock.hits(), 3);
     let sub = body(
         json!(a),
         json!({"task": choice(&["billing", "travel"])}),
@@ -366,7 +373,37 @@ fn cache_answers_repeats_and_paraphrases_without_calls() {
     assert_ne!(d.questions[0].action, Action::Cache);
     assert_eq!(
         st.cascade.cache_len(),
-        2 + usize::from(d.questions[0].action == Action::Oracle)
+        3 + usize::from(d.questions[0].action == Action::Oracle)
+    );
+
+    // Near reuse opted in (`cache.threshold` 0.97, the default before
+    // 0.8.10): the paraphrase is a cache answer.
+    let mut near = stand_config(&mock.url());
+    near.cache.threshold = 0.97;
+    let st3 = Stand::new(&near);
+    let before = mock.hits();
+    assert_eq!(
+        st3.decide(&topics_body(a)).unwrap().questions[0].action,
+        Action::Oracle
+    );
+    let d3 = st3.decide(&topics_body(p)).unwrap();
+    assert_eq!(d3.questions[0].action, Action::Cache, "near paraphrase");
+    assert_eq!(mock.hits(), before + 1);
+
+    // The read-only view of a state directory's cache (`decide --oracle`
+    // without a key) replays the same entries; a missing log or a cache
+    // switched off holds none.
+    let cfg = stand_config(&mock.url());
+    let view = CacheView::load(&cfg.cache, &st.state.learn_log_path()).unwrap();
+    assert_eq!(view.len(), st.cascade.cache_len());
+    let none = st.dir.path().join("no-such.log");
+    assert!(CacheView::load(&cfg.cache, &none).unwrap().is_empty());
+    let mut off = cfg.cache;
+    off.enabled = false;
+    assert!(
+        CacheView::load(&off, &st.state.learn_log_path())
+            .unwrap()
+            .is_empty()
     );
 
     // Cache off: the repeat is a call.
@@ -381,6 +418,7 @@ fn cache_answers_repeats_and_paraphrases_without_calls() {
         );
     }
     assert_eq!(mock.hits(), before + 2);
+    assert!(!st2.cascade.answers_without_oracle());
 }
 
 #[test]

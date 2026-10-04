@@ -42,7 +42,8 @@
 //!   and no state, a rejected one is answered by one call (PII redacted, the
 //!   key only in its Authorization header, `RUST_LOG=debug` included), then
 //!   from the cache; labels no skill has go to the oracle; without the key
-//!   `no_key` and the command line's hint; a server holding the state
+//!   `no_key` and the command line's hint, but the state directory's cached
+//!   answers still served (read only, 0.8.10); a server holding the state
 //!   directory is named; batch rows keep their local columns, the per-run
 //!   `--oracle-budget` caps the calls; nothing is learned. The stop rules
 //!   hold across runs as on a server (another model, a cost above the
@@ -4017,6 +4018,42 @@ fn decide_oracle_asks_only_what_the_gate_rejects_and_hides_the_key() {
     assert!(!stderr_of(&o).contains("server"), "{}", show(&o));
     assert_eq!(mock.requests().len(), before);
     assert!(!state2.exists());
+    // ... on the state directory of the runs above (0.8.10): the text the
+    // oracle answered is a cache answer, read only (no request, no LOCK,
+    // learn.log unchanged); a text it never answered abstains with no_key.
+    let log_before = std::fs::read(state.join("learn.log")).unwrap();
+    let o = decide_oracle(&base, &["-p", &pii], &["--state", st, "--json"], &[]);
+    assert!(o.status.success(), "{}", show(&o));
+    let v = json_of(&stdout_of(&o));
+    let q = &v["cmf"]["questions"]["task"];
+    assert_eq!(
+        (q["action"].as_str(), q["source"].as_str()),
+        (Some("cache"), Some("cache")),
+        "{v}"
+    );
+    assert_eq!(q["flags"], json!([]), "{v}");
+    assert_eq!(v["answers"]["task"]["choice"], "travel");
+    assert!(v["cmf"].get("hint").is_none(), "{v}");
+    let o = decide_oracle(&base, &["-p", &pii], &["--state", st], &[]);
+    assert!(o.status.success(), "{}", show(&o));
+    assert!(
+        stdout_of(&o).contains(&format!(
+            "choice:     travel (from the cache of oracle {ORACLE_MODEL}: its answer to the same text, $0.00)"
+        )),
+        "{}",
+        show(&o)
+    );
+    let o = decide_oracle(&base, &["-p", &texts[2]], &["--state", st, "--json"], &[]);
+    assert!(o.status.success(), "{}", show(&o));
+    let v = json_of(&stdout_of(&o));
+    assert_eq!(
+        v["cmf"]["questions"]["task"]["flags"],
+        json!(["oracle_disabled", "no_key"]),
+        "{v}"
+    );
+    assert_eq!(mock.requests().len(), before);
+    assert_eq!(std::fs::read(state.join("learn.log")).unwrap(), log_before);
+    assert!(!state.join("LOCK").exists());
 
     // 7. A key typed where a name or the model belongs is refused before
     // anything, never shown; the companions need --oracle.

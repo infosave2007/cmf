@@ -825,7 +825,16 @@ fn rollback_and_restart_restore_the_served_state() {
         st.state.read_current().unwrap().unwrap().sha256,
         served(&st).model_sha()
     );
-    let d = st.decide(&topics_body(&fresh()[0])).unwrap();
+    // A local probe (no oracle): an untaught text is not an exact repeat, so
+    // since 0.8.10 the cache no longer answers it from a near lesson and an
+    // oracle answer would add an example to the buffer this test counts.
+    let d = st
+        .decide(&body(
+            json!(fresh()[0]),
+            json!({"task": choice(&TOPICS)}),
+            Some(json!({"oracle": false})),
+        ))
+        .unwrap();
     assert_ne!(
         d.questions[0].action,
         Action::Local,
