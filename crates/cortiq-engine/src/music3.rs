@@ -1166,6 +1166,7 @@ impl Music3Ar {
                         output_gate: false,
                         cpu_k: &cache[li][bi].k,
                         cpu_v: &cache[li][bi].v,
+                        cpu_base: 0,
                         geom: None,
                         head_gate: None,
                     },
