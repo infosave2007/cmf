@@ -37125,6 +37125,41 @@ pub fn chunk_attend_win(
         c.queue
             .write_buffer(&vb, off, bytemuck::cast_slice(&v[h][..n * hd]));
     }
+    drop(sc);
+    let offs: Vec<u64> = (0..nkv).map(|h| (h * n * hd * 4) as u64).collect();
+    let enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("chunk-attend"),
+    });
+    chunk_attend_run(
+        c, enc, &qb, (&kb, &offs), (&vb, &offs), b, s0, n, nh, nkv, hd, scale, window, out,
+    )
+}
+
+/// The device half of `chunk_attend_win`: `q` already in `qb`
+/// (head-major [nh][b][hd]); kv head `g`'s `n` K rows start at byte
+/// `k.1[g]` of `k.0` (V likewise), `[n][hd]` contiguous. Records into
+/// `enc` (anything already in it runs first) and reads the [b][nh·hd]
+/// result back into `out`.
+#[allow(clippy::too_many_arguments)]
+fn chunk_attend_run(
+    c: &Ctx,
+    mut enc: wgpu::CommandEncoder,
+    qb: &wgpu::Buffer,
+    k: (&wgpu::Buffer, &[u64]),
+    v: (&wgpu::Buffer, &[u64]),
+    b: usize,
+    s0: usize,
+    n: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    scale: f32,
+    window: usize,
+    out: &mut [f32],
+) -> bool {
+    let dev = &c.device;
+    let st = wgpu::BufferUsages::STORAGE;
+    let mut sc = c.scratch.lock().unwrap();
     let scb = Scratch::ensure(dev, &mut sc.dsc, (b * n * 4) as u64, st, "ca-scores");
     let pb = Scratch::ensure(dev, &mut sc.dpan, (nh * b * hd * 4) as u64, st, "ca-panel");
     let ab = Scratch::ensure(
@@ -37173,17 +37208,14 @@ pub fn chunk_attend_win(
     let khead = (n * hd * 4) as u64;
     let sc_len = (b * n * 4) as u64;
     let hpk = nh / nkv;
-    let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("chunk-attend"),
-    });
     for h in 0..nh {
-        let kv = (h / hpk) as u64;
+        let kv = h / hpk;
         let bg_qk = dev.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ca-qk"),
             layout: &c.dit_qk.get_bind_group_layout(0),
             entries: &[
-                slot(&qb, h as u64 * qhead, qhead, 0),
-                slot(&kb, kv * khead, khead, 1),
+                slot(qb, h as u64 * qhead, qhead, 0),
+                slot(k.0, k.1[kv], khead, 1),
                 slot(&scb, 0, sc_len, 2),
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -37207,7 +37239,7 @@ pub fn chunk_attend_win(
             layout: &c.dit_pv.get_bind_group_layout(0),
             entries: &[
                 slot(&scb, 0, sc_len, 0),
-                slot(&vb, kv * khead, khead, 1),
+                slot(v.0, v.1[kv], khead, 1),
                 slot(&pb, h as u64 * qhead, qhead, 2),
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -37269,6 +37301,142 @@ pub fn chunk_attend_win(
         (b * nh * hd * 4) as u64,
         &mut out[..b * nh * hd],
     )
+}
+
+/// `chunk_attend_win` against the token graph's device K/V mirror of
+/// `(kv_id, layer)` — the buffers the decode graph reads — instead of
+/// re-uploading the layer's whole prefix from the host every chunk.
+///
+/// Spark-X2.5 4B at a 16k prompt shipped about 22 GB of K/V over the bus
+/// that way (each of 32 chunks re-sent every full layer's prefix and
+/// every sliding layer's 1023-row window), and the first decode token
+/// then uploaded the whole cache once more (0.8 GB at 8k: 16 tokens
+/// right after an 8k prefill ran at 13 tok/s against a steady 29).
+///
+/// The host cache stays the source of truth: it already holds the
+/// chunk's rows (rows `[0, s0 + b)`), and `kv_mirror_seed_x` appends the
+/// ones the mirror lacks — the chunk's `b`, or a longer catch-up after a
+/// host-only chunk. Same geometry as the token graph's `ensure_x` (V as
+/// wide as K; a ring of `kv_ring_cap(w)` rows on a sliding layer), so the
+/// decode finds `synced == position` and uploads nothing. The kernels,
+/// their inputs and parameters are `chunk_attend_win`'s: the mirror rows
+/// are the host rows bit for bit, so is the result.
+///
+/// `ring` = the layer's window (the mirror geometry), `window` = what the
+/// softmax masks with (0 while the window still masks nothing). False =
+/// nothing attended; whatever reached the mirror is valid host data.
+#[allow(clippy::too_many_arguments)]
+pub fn chunk_attend_mirror(
+    kv_id: u64,
+    layer: usize,
+    limit: usize,
+    cpu_k: &[Vec<f32>],
+    cpu_v: &[Vec<f32>],
+    q: &[f32],
+    b: usize,
+    s0: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    scale: f32,
+    ring: Option<usize>,
+    window: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if nh == 0 || nkv == 0 || b == 0 || hd == 0 || nh % nkv != 0 || hd % 4 != 0 {
+        return false;
+    }
+    if q.len() < nh * b * hd || out.len() < b * nh * hd {
+        return false;
+    }
+    // Only the ring's own window can mask (the rows below it are gone).
+    if window > 0 && ring != Some(window) {
+        return false;
+    }
+    let limits = c.device.limits();
+    // Per-head row offsets bind the mirror in place: a row must be a
+    // multiple of the storage offset alignment (hd 256 = 1 KiB, 256 B).
+    if (hd * 4) as u64 % (limits.min_storage_buffer_offset_alignment.max(1) as u64) != 0 {
+        return false;
+    }
+    let n_abs = s0 + b;
+    let lo = if window > 0 { (s0 + 1).saturating_sub(window) } else { 0 };
+    let n = n_abs - lo;
+    let khead = (n * hd * 4) as u64;
+    if khead > limits.max_storage_buffer_binding_size as u64 {
+        return false;
+    }
+    // The ring must hold the chunk and the window of its first query at
+    // once: b + min(s0, w - 1) <= kv_ring_cap(w) — b <= 513 on Spark's
+    // 512-window, 1024-row ring.
+    if ring.is_some_and(|w| n > kv_ring_cap(w)) {
+        return false;
+    }
+    let (mk, mv, cap, ring_layout) = {
+        let mut kvm = c.attn_kv.lock().unwrap();
+        // One spare row: the first decode token lands at `n_abs` on a
+        // prompt that ends this chunk (no regrow copy before it).
+        let want = kv_capacity(limit, n_abs + 1);
+        let e = kv_mirror_ensure_x(c, &mut kvm, (kv_id, layer), nkv, hd, hd, want, ring);
+        if e.ring.is_none() && e.cap < n_abs {
+            return false; // the context limit: a full mirror never wraps
+        }
+        if e.synced > s0 {
+            // Rows past the host's: not ours to trust. Reseed from the
+            // host (a ring keeps only its newest `cap` rows of it).
+            e.synced = 0;
+            e.lo = 0;
+        }
+        if !kv_mirror_seed_x(c, e, cpu_k, cpu_v, n_abs) {
+            return false;
+        }
+        if lo < e.resident_from() {
+            return false;
+        }
+        (e.k.clone(), e.v.clone(), e.cap, e.ring.is_some())
+    };
+    let dev = &c.device;
+    let st = wgpu::BufferUsages::STORAGE;
+    let mut sc = c.scratch.lock().unwrap();
+    let qb = Scratch::ensure(
+        dev,
+        &mut sc.dq,
+        (nh * b * hd * 4) as u64,
+        st | wgpu::BufferUsages::COPY_DST,
+        "ca-q",
+    );
+    c.queue
+        .write_buffer(&qb, 0, bytemuck::cast_slice(&q[..nh * b * hd]));
+    let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("chunk-attend-mirror"),
+    });
+    let row = (hd * 4) as u64;
+    let slot0 = lo % cap;
+    if ring_layout && slot0 + n > cap {
+        // The window wraps the ring: gather its two runs per head into the
+        // packed scratch on the device (at most 1023 rows a head).
+        let kvsz = (nkv * n * hd * 4) as u64;
+        let kb = Scratch::ensure(dev, &mut sc.dk, kvsz, st | wgpu::BufferUsages::COPY_DST, "ca-k");
+        let vb = Scratch::ensure(dev, &mut sc.dv, kvsz, st | wgpu::BufferUsages::COPY_DST, "ca-v");
+        drop(sc);
+        let first = cap - slot0;
+        for g in 0..nkv {
+            let dst = g as u64 * khead;
+            let src = ((g * cap + slot0) * hd * 4) as u64;
+            let src2 = ((g * cap) * hd * 4) as u64;
+            for (m, d) in [(&mk, &kb), (&mv, &vb)] {
+                enc.copy_buffer_to_buffer(m, src, d, dst, first as u64 * row);
+                enc.copy_buffer_to_buffer(m, src2, d, dst + first as u64 * row, (n - first) as u64 * row);
+            }
+        }
+        let offs: Vec<u64> = (0..nkv).map(|g| g as u64 * khead).collect();
+        chunk_attend_run(c, enc, &qb, (&kb, &offs), (&vb, &offs), b, s0 - lo, n, nh, nkv, hd, scale, window, out)
+    } else {
+        drop(sc);
+        let offs: Vec<u64> = (0..nkv).map(|g| ((g * cap + slot0) * hd * 4) as u64).collect();
+        chunk_attend_run(c, enc, &qb, (&mk, &offs), (&mv, &offs), b, s0 - lo, n, nh, nkv, hd, scale, window, out)
+    }
 }
 
 /// Fused QKV on wgpu: one upload of the normed chunk, three GEMMs, one
@@ -42543,6 +42711,62 @@ mod tests {
         });
         drop(probe_after_drain);
         let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+    }
+
+    /// The prefill's mirror attend is the host upload's attend bit for bit
+    /// on the f32 kernels, chunk after chunk, on a full-context mirror and
+    /// on a sliding layer's ring (whose window wraps at s0 = 1024 and
+    /// 2048), and leaves the mirror holding exactly the host's rows — what
+    /// the decode graph then finds instead of re-uploading them.
+    #[test]
+    fn chunk_attend_mirror_matches_host_upload() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping mirror attend test");
+            return;
+        };
+        let _drain = TestGpuDrain::new(c);
+        let (nh, nkv, hd, w) = (4usize, 2usize, 256usize, 512usize);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let val = |salt: usize, i: usize| {
+            ((i.wrapping_mul(2654435761) ^ salt.wrapping_mul(40503)) % 1999) as f32 / 1999.0 - 0.5
+        };
+        for ring in [None, Some(w)] {
+            let kv_id = (1u64 << 50) | ((ring.is_some() as u64) << 1);
+            let mut hk: Vec<Vec<f32>> = vec![Vec::new(); nkv];
+            let mut hv: Vec<Vec<f32>> = vec![Vec::new(); nkv];
+            let mut s0 = 0usize;
+            for b in [512usize, 512, 512, 512, 512, 40] {
+                for g in 0..nkv {
+                    hk[g].extend((s0 * hd..(s0 + b) * hd).map(|i| val(2 * g + 1, i)));
+                    hv[g].extend((s0 * hd..(s0 + b) * hd).map(|i| val(2 * g + 2, i)));
+                }
+                let q: Vec<f32> = (0..nh * b * hd).map(|i| val(97 + s0, i)).collect();
+                let wmask = if ring.is_some() && s0 + b > w { w } else { 0 };
+                let lo = if wmask > 0 { (s0 + 1).saturating_sub(wmask) } else { 0 };
+                let ks: Vec<&[f32]> = hk.iter().map(|k| &k[lo * hd..]).collect();
+                let vs: Vec<&[f32]> = hv.iter().map(|v| &v[lo * hd..]).collect();
+                let mut want = vec![0f32; b * nh * hd];
+                assert!(chunk_attend_win(
+                    &q, &ks, &vs, b, s0 - lo, nh, nkv, hd, scale, wmask, &mut want
+                ));
+                let mut got = vec![0f32; b * nh * hd];
+                assert!(
+                    chunk_attend_mirror(
+                        kv_id, 0, 65536, &hk, &hv, &q, b, s0, nh, nkv, hd, scale, ring, wmask,
+                        &mut got
+                    ),
+                    "mirror attend refused at s0 {s0} (ring {ring:?})"
+                );
+                assert!(
+                    got.iter().zip(&want).all(|(x, y)| x.to_bits() == y.to_bits()),
+                    "mirror attend differs from the upload at s0 {s0}, ring {ring:?}"
+                );
+                assert_eq!(kv_mirror_stored(kv_id, 0), Some(s0 + b));
+                s0 += b;
+            }
+            kv_mirror_reset(kv_id);
+        }
     }
 
     #[test]

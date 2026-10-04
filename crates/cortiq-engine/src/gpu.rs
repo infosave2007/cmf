@@ -2353,6 +2353,92 @@ pub fn gemm_many_keep(
     }
 }
 
+/// The decode graph's device K/V mirror a prefill chunk of one layer also
+/// writes to (wgpu): `kv_id` is the pipeline's graph id, `layer` the
+/// virtual layer index, `limit` the cache's `max_seq_len` — the same key
+/// and capacity ceiling the token graph uses, so the mirror the prefill
+/// fills is the one the first decode token reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrefillMirror {
+    pub kv_id: u64,
+    pub layer: usize,
+    pub limit: usize,
+}
+
+thread_local! {
+    /// Set by the pipeline around one layer's batched attention (see
+    /// `enter_prefill_mirror`); every other caller of the batched
+    /// attention (MTP heads, tests) sees None and keeps the host upload.
+    static PREFILL_MIRROR: Cell<Option<PrefillMirror>> = const { Cell::new(None) };
+}
+
+/// Restores the previous target on drop.
+pub struct PrefillMirrorGuard(Option<PrefillMirror>);
+
+impl Drop for PrefillMirrorGuard {
+    fn drop(&mut self) {
+        PREFILL_MIRROR.with(|c| c.set(self.0));
+    }
+}
+
+/// Name the device mirror the current layer's prefill chunk appends to
+/// and attends against, for the guard's lifetime.
+pub fn enter_prefill_mirror(t: PrefillMirror) -> PrefillMirrorGuard {
+    PrefillMirrorGuard(PREFILL_MIRROR.with(|c| c.replace(Some(t))))
+}
+
+/// The mirror `enter_prefill_mirror` named on this thread, if any.
+pub fn prefill_mirror() -> Option<PrefillMirror> {
+    PREFILL_MIRROR.with(|c| c.get())
+}
+
+/// `chunk_attend_win` against the decode graph's device mirror instead of
+/// an upload of the whole prefix: the host rows the mirror lacks (the
+/// chunk's own `b`, or more after a host-only chunk) are appended first,
+/// then the attention binds the mirror rows in place. `ring` is the
+/// layer's window as the mirror geometry (Some on every sliding layer),
+/// `window` the window the softmax masks with (0 while it masks nothing).
+/// wgpu only; false = nothing attended (the caller uploads as before).
+#[allow(unused_variables, clippy::too_many_arguments)]
+pub fn chunk_attend_mirror(
+    t: PrefillMirror,
+    cpu_k: &[Vec<f32>],
+    cpu_v: &[Vec<f32>],
+    q: &[f32],
+    b: usize,
+    s0: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    scale: f32,
+    ring: Option<usize>,
+    window: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::chunk_attend_mirror(
+            t.kv_id,
+            t.layer,
+            t.limit,
+            cpu_k,
+            cpu_v,
+            q,
+            b,
+            s0,
+            nh,
+            nkv,
+            hd,
+            scale,
+            ring,
+            window,
+            out,
+        ),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 /// Whether the active backend's chunk attend can apply a sliding window.
 pub fn chunk_attend_windowed() -> bool {
     match backend() {
