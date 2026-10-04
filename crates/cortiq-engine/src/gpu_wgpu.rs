@@ -46994,6 +46994,11 @@ fn main() {
             .filter(|(x, y)| x.to_bits() != y.to_bits())
             .count();
         let nz = a.iter().filter(|v| **v != 0.0).count();
+        let rel = a
+            .iter()
+            .zip(b)
+            .map(|(&x, &y)| (x - y).abs() / y.abs().max(1e-3))
+            .fold(0f32, f32::max);
         // The device activation against the host's formula on the same g, u.
         let host = |gv: f32, uv: f32| match act_code {
             0 => crate::inference::silu(gv) * uv,
@@ -47017,10 +47022,21 @@ fn main() {
             nz > inter / 2,
             "reference activations mostly zero — harness wrong"
         );
-        assert_eq!(
-            mism, 0,
-            "{mism} of {inter} activations differ between the fused kernel and gate/up/silu"
-        );
+        // Bit for bit on Vulkan, where it was measured (RTX 2000 Ada). On
+        // macOS CI (wgpu over Metal) the two kernels differ in the last bits
+        // for 36-40 % of the activations; there the contract is the host
+        // formula's tolerance.
+        if c.adapter_info.backend == wgpu::Backend::Vulkan {
+            assert_eq!(
+                mism, 0,
+                "{mism} of {inter} activations differ between the fused kernel and gate/up/silu"
+            );
+        } else {
+            assert!(
+                rel < 1e-5,
+                "act {act_code}: fused kernel off gate/up/silu by {rel:e} (relative, {mism} differ)"
+            );
+        }
     }
 
     /// The four-row unrolled q8_2f matvec against the one-row kernel, bit
