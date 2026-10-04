@@ -5,6 +5,32 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.10] - 2026-10-04
+
+### Fixed
+- Decisions API: a data skill takes a `subset` question only with evidence
+  that the question is its task. Polar answers (yes, no, maybe, true,
+  false) count for nothing as labels of a subset; three other labels are
+  evidence by their ids, as before; fewer must each be specific — a
+  compound id such as `card_arrival`, or a one-word id described by its
+  own name or the skill's rubric criterion (not by a sentence that merely
+  contains the word, nor `null`). `cmf.skill`, the skill's rubric
+  instructions, its rubric criteria verbatim and its whole trained label
+  set (the question it was built for, also after it learns a new label)
+  take any subset; the route instructions only for a skill without a
+  rubric, and `cortiq decide --labels` now names the skill its labels
+  resolve to. Until now every binary question with `{yes, no}` options was
+  a subset of an intent skill that has "yes" and "no" intents (the user
+  affirms / denies): on a public decision benchmark suite 167,639 of its
+  282,368 questions — aspect presence, tool and document relevance,
+  sarcasm, answer selection, causal and forecast questions of nine tasks —
+  were claimed this way, and those the gate accepted were answered by the
+  intent classifier at 1–45 % accuracy instead of reaching the oracle. They
+  are now untrained (the oracle answers them, or 422 without it; the reason
+  names the refused subset) and learnable as auto-skills of their own
+  contract. Exact matches (by ids or by descriptions), the intent
+  benchmarks' rows and the documented banking examples are unchanged.
+
 ## [0.8.9] - 2026-10-03
 
 ### Changed
