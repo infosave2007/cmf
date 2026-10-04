@@ -997,6 +997,42 @@ kernel void causal_softmax(
     for (uint i = allowed + lane; i < n; i += 32u) r[i] = 0.0f;
 }
 
+// `causal_softmax` over a sliding window: row bi keeps the last `w`
+// allowed positions [allowed − w, allowed) — the host's `stored − w`
+// lower bound — and zeroes the rest of its row.
+kernel void causal_softmax_win(
+    device float*  p    [[buffer(0)]],
+    constant uint& n    [[buffer(1)]],  // row length (stride)
+    constant uint& s0   [[buffer(2)]],
+    constant uint& nb   [[buffer(3)]],
+    constant uint& m    [[buffer(4)]],  // rows
+    constant uint& w    [[buffer(5)]],  // window
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgp [[threadgroup_position_in_grid]],
+    uint sgs [[simdgroups_per_threadgroup]])
+{
+    uint row = tgp * sgs + sg;
+    if (row >= m) return;
+    uint allowed = s0 + (row % nb) + 1u;
+    uint lo = allowed > w ? allowed - w : 0u;
+    device float* r = p + (ulong)row * n;
+    float mx = -INFINITY;
+    for (uint i = lo + lane; i < allowed; i += 32u) mx = max(mx, r[i]);
+    mx = simd_max(mx);
+    float sum = 0.0f;
+    for (uint i = lo + lane; i < allowed; i += 32u) {
+        float e = exp(r[i] - mx);
+        r[i] = e;
+        sum += e;
+    }
+    sum = simd_sum(sum);
+    float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+    for (uint i = lo + lane; i < allowed; i += 32u) r[i] *= inv;
+    for (uint i = lane; i < lo; i += 32u) r[i] = 0.0f;
+    for (uint i = allowed + lane; i < n; i += 32u) r[i] = 0.0f;
+}
+
 // Attention importance: imp[pos] += Σ over rows of P[row, pos] (masked
 // column sums — the zeroed tail contributes nothing). One THREAD per
 // position, rows walked inside: adjacent threads read adjacent
@@ -2034,7 +2070,8 @@ kernel void gelu_mul_pre(
 // Per-head projected output gate (Spark-X2.5 `self_attn.g_proj`): head h
 // of the attention output scales by sigmoid(G[h]·x), x the layer's normed
 // input — the host's `apply_projected_gate` (per-head, sigmoid). One
-// simdgroup per head: the [n] dot, then the gain over the head's hd lanes.
+// simdgroup per (head, row): the [n] dot, then the gain over the head's hd
+// lanes. Rows (grid y) are the chunk's positions: ao [row][nh·hd], x [row][n].
 kernel void head_gate_sigmoid(
     device float*       ao  [[buffer(0)]],
     device const float* gw  [[buffer(1)]],
@@ -2044,17 +2081,18 @@ kernel void head_gate_sigmoid(
     constant uint&      n   [[buffer(5)]],
     uint sg   [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
-    uint tg   [[threadgroup_position_in_grid]],
+    uint2 tg  [[threadgroup_position_in_grid]],
     uint sgs  [[simdgroups_per_threadgroup]])
 {
-    uint h = tg * sgs + sg;
+    uint h = tg.x * sgs + sg;
     if (h >= nh) return;
     device const float* row = gw + (ulong)h * n;
+    device const float* xr = x + (ulong)tg.y * n;
     float acc = 0.0f;
-    for (uint i = lane; i < n; i += 32u) acc += row[i] * x[i];
+    for (uint i = lane; i < n; i += 32u) acc += row[i] * xr[i];
     float g = simd_sum(acc);
     float gain = 1.0f / (1.0f + exp(-g));
-    device float* a = ao + (ulong)h * hd;
+    device float* a = ao + ((ulong)tg.y * nh + h) * hd;
     for (uint d = lane; d < hd; d += 32u) a[d] *= gain;
 }
 
@@ -6713,6 +6751,8 @@ struct Ctx {
     gelu: ComputePipelineState,
     /// `head_gate_sigmoid`: per-head projected output gate (Spark-X2.5).
     hgate: ComputePipelineState,
+    /// `causal_softmax_win`: the chunk softmax over a sliding window.
+    csmaxw: ComputePipelineState,
     axpy: ComputePipelineState,
     zero: ComputePipelineState,
     rqkn: ComputePipelineState,
@@ -6951,6 +6991,7 @@ fn init() -> Result<Ctx, String> {
     let silu = pso("silu_mul_pre")?;
     let gelu = pso("gelu_mul_pre")?;
     let hgate = pso("head_gate_sigmoid")?;
+    let csmaxw = pso("causal_softmax_win")?;
     let axpy = pso("axpy")?;
     let zero = pso("fill_zero")?;
     let rqkn = pso("attn_rope_qkn")?;
@@ -7063,6 +7104,7 @@ fn init() -> Result<Ctx, String> {
         silu,
         gelu,
         hgate,
+        csmaxw,
         axpy,
         zero,
         rqkn,
@@ -9407,6 +9449,12 @@ pub struct ChunkLayer<'a> {
     pub inter: usize,
     pub gemma: bool,
     pub eps: f32,
+    /// Sliding window of this layer (None = full causal context).
+    pub window: Option<usize>,
+    /// Per-head sigmoid output gate `[nh × hs]` (Spark-X2.5 `g_proj`).
+    pub head_gate: Option<&'a [f32]>,
+    /// Exact GELU between gate and up instead of SiLU.
+    pub gelu: bool,
 }
 
 /// Run a RUN of consecutive prefill layers for the whole chunk in a
@@ -9566,6 +9614,16 @@ pub fn chunk_run_gpu(
     let mut preps: Vec<ChunkPrep> = Vec::with_capacity(layers.len());
     for (l, lio) in layers.iter().zip(io.iter()) {
         if l.nh != nh || l.nkv != nkv || l.hd != hd || l.hs != hs || l.inter != inter {
+            return false;
+        }
+        // Per-layer RoPE width (Spark-X2.5: 64 on full layers, 256 on
+        // sliding ones), window and gate shape.
+        if l.rd < 2
+            || l.rd > hd
+            || (l.rd / 2) % 32 != 0
+            || l.window == Some(0)
+            || l.head_gate.is_some_and(|g| g.len() != nh * hs)
+        {
             return false;
         }
         // An empty row_scale marks q4_tiled (scales inside the tiles);
@@ -10004,12 +10062,20 @@ pub fn chunk_run_gpu(
             cmd = prof.cut(c, cmd, "att_qk");
             {
                 let enc = cmd.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&c.csmax);
+                enc.set_compute_pipeline_state(if l.window.is_some() {
+                    &c.csmaxw
+                } else {
+                    &c.csmax
+                });
                 for g in 0..nkv {
                     enc.set_buffer(0, Some(&scores), g as u64 * g_stride);
                     let words = [ncur as u32, prep.st0 as u32, b as u32, m_rows as u32];
                     for (i, w) in words.iter().enumerate() {
                         enc.set_bytes(1 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
+                    }
+                    if let Some(w) = l.window {
+                        let w_u = w.min(u32::MAX as usize) as u32;
+                        enc.set_bytes(5, 4, &w_u as *const u32 as *const std::ffi::c_void);
                     }
                     let sgs = 8u64;
                     enc.dispatch_thread_groups(
@@ -10066,6 +10132,13 @@ pub fn chunk_run_gpu(
                 MTLSize::new(256, 1, 1),
             );
             enc.end_encoding();
+            // Per-head output gate off the input-normed rows (n_b holds
+            // them until the post-attention add+norm below).
+            if let Some(gw) = l.head_gate {
+                let enc = cmd.new_compute_command_encoder();
+                encode_head_gate(c, enc, &attn, &const_buf(c, gw), &n_b, nh, hd, hs, b);
+                enc.end_encoding();
+            }
         }
         cmd = prof.cut(c, cmd, "attend");
         encode_mul_mm(
@@ -10115,6 +10188,36 @@ pub fn chunk_run_gpu(
             enc.end_encoding();
         }
         cmd = prof.cut(c, cmd, "mm_gateup");
+        if l.gelu {
+            // GELU: gelu(g)·u in place over the gate rows, then the plain
+            // down GEMM (the fused-activation GEMMs compute SiLU only).
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&c.gelu);
+            enc.set_buffer(0, Some(&gb), 0);
+            enc.set_buffer(1, Some(&ub), 0);
+            enc.set_buffer(2, Some(&gb), 0); // dummy col (has_col = 0)
+            enc.set_buffer(3, Some(&gb), 0);
+            let (n_u, hc) = ((b * inter) as u32, 0u32);
+            enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(5, 4, &hc as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_threads(MTLSize::new((b * inter) as u64, 1, 1), MTLSize::new(256, 1, 1));
+            enc.end_encoding();
+            let enc = cmd.new_compute_command_encoder();
+            enc_mul_mm(
+                c,
+                enc,
+                &fbuf,
+                prep.abs[6],
+                &prep.rs[6],
+                prep.kind[6],
+                &gb,
+                &db,
+                b,
+                l.down.1,
+                l.down.2,
+            );
+            enc.end_encoding();
+        } else
         // down GEMM with silu(g)·u fused into the X-tile load — no
         // standalone activation stage, no act-buffer round trip.
         {
@@ -15173,14 +15276,16 @@ impl TokenGraph {
         // 6b. projected per-head gate off the normed input (n_b still
         //     holds it: nothing since step 1 wrote n_b).
         if let Some(gw) = p.head_gate {
-            let sgs = 4u64;
-            disp(
+            encode_head_gate(
+                self.c,
                 enc,
-                &self.c.hgate,
-                &[(&ao_b, 0), (&const_buf(self.c, gw), 0), (&self.n_b, 0)],
-                &[p.nh as u32, p.hd as u32, self.dims.hidden as u32],
-                &[],
-                ((p.nh as u64).div_ceil(sgs) * sgs * 32, sgs * 32),
+                &ao_b,
+                &const_buf(self.c, gw),
+                &self.n_b,
+                p.nh,
+                p.hd,
+                self.dims.hidden,
+                1,
             );
             self.bar(enc);
         }
@@ -17549,6 +17654,34 @@ fn encode_gqa_attend_blk(
         MTLSize::new(hd as u64, 1, 1),
     );
     true
+}
+
+/// `head_gate_sigmoid` over `rows` positions: ao `[rows][nh·hd]` scaled
+/// per (row, head) by sigmoid(G[h]·x[row]), x `[rows][hidden]`.
+#[allow(clippy::too_many_arguments)]
+fn encode_head_gate(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    ao: &Buffer,
+    gw: &Buffer,
+    x: &Buffer,
+    nh: usize,
+    hd: usize,
+    hidden: usize,
+    rows: usize,
+) {
+    enc.set_compute_pipeline_state(&c.hgate);
+    enc.set_buffer(0, Some(ao), 0);
+    enc.set_buffer(1, Some(gw), 0);
+    enc.set_buffer(2, Some(x), 0);
+    for (i, w) in [nh as u32, hd as u32, hidden as u32].iter().enumerate() {
+        enc.set_bytes(3 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
+    }
+    let sgs = 4u64;
+    enc.dispatch_thread_groups(
+        MTLSize::new((nh as u64).div_ceil(sgs), rows as u64, 1),
+        MTLSize::new(sgs * 32, 1, 1),
+    );
 }
 
 /// Positions past which the attend goes GQA-shared/split-K
