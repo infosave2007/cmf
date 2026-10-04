@@ -1475,7 +1475,8 @@ pub(crate) struct ReuseLayer {
     /// Exact-attention layer (rows in `LayerKvCache`); otherwise a
     /// recurrent / latent mixer whose state cannot be rewound.
     pub full: bool,
-    /// Rows the host owner cache holds.
+    /// Positions the host owner cache reaches (`pos_len`: a trimmed
+    /// sliding tail stores only the newest of them).
     pub host_rows: usize,
     /// Rows the wgpu token graph's device mirror holds (None: no mirror).
     pub device_rows: Option<usize>,
@@ -1577,7 +1578,9 @@ impl Pipeline {
                 );
                 ReuseLayer {
                     full,
-                    host_rows: self.kv_cache.layers[li].seq_len,
+                    // Absolute depth: a trimmed sliding tail stores fewer
+                    // rows than the positions it has seen.
+                    host_rows: self.kv_cache.layers[li].pos_len(),
                     device_rows: crate::gpu::graph_kv_stored(kv_id, li),
                     device_state: crate::gpu::graph_state_resident(kv_id, li),
                 }
@@ -1677,7 +1680,7 @@ impl Pipeline {
                     for p in 0..to - from {
                         cache.append(&k[p * row..(p + 1) * row], &v[p * row..(p + 1) * row], &[]);
                     }
-                    if cache.seq_len != to {
+                    if cache.pos_len() != to {
                         return false;
                     }
                 }
@@ -6251,6 +6254,7 @@ impl Pipeline {
                 output_gate: *output_gate,
                 cpu_k: m.kv.k_heads(),
                 cpu_v: m.kv.v_heads(),
+                cpu_base: m.kv.base(),
                 geom: None,
                 head_gate: None,
             },
@@ -6412,6 +6416,7 @@ impl Pipeline {
                 output_gate: *output_gate,
                 cpu_k: m.kv.k_heads(),
                 cpu_v: m.kv.v_heads(),
+                cpu_base: m.kv.base(),
                 geom: None,
                 head_gate: None,
             },
@@ -10230,7 +10235,8 @@ impl Pipeline {
             ) {
                 continue;
             }
-            let host = self.kv_cache.layers[li].seq_len;
+            // Absolute: a trimmed sliding tail holds positions base.. only.
+            let host = self.kv_cache.layers[li].pos_len();
             if host >= position {
                 continue;
             }
@@ -10469,6 +10475,7 @@ impl Pipeline {
                     output_gate: false,
                     cpu_k: self.kv_cache.layers[li].k_heads(),
                     cpu_v: self.kv_cache.layers[li].v_heads(),
+                    cpu_base: self.kv_cache.layers[li].base(),
                     geom: self.graph_attn_geom(li),
                     head_gate: None,
                 },
@@ -11233,6 +11240,7 @@ impl Pipeline {
                         output_gate: *output_gate,
                         cpu_k: self.kv_cache.layers[li].k_heads(),
                         cpu_v: self.kv_cache.layers[li].v_heads(),
+                        cpu_base: self.kv_cache.layers[li].base(),
                         geom: self.graph_attn_geom(li),
                         head_gate,
                     }
@@ -13122,6 +13130,7 @@ impl Pipeline {
                             output_gate: *output_gate,
                             cpu_k: self.kv_cache.layers[li].k_heads(),
                             cpu_v: self.kv_cache.layers[li].v_heads(),
+                            cpu_base: self.kv_cache.layers[li].base(),
                             geom: self.graph_attn_geom(li),
                             // The batched graph has no head-gate arm; a
                             // gated layer is refused above.
