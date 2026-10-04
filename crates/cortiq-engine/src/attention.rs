@@ -1501,7 +1501,14 @@ pub fn qwen_attention_batch(
     // plus the chunk) masks nothing: each query's window then starts at
     // row 0, which is exactly the full causal attend — so a short prompt
     // on a sliding layer (Spark-X2.5: 512) keeps the batched attend.
-    let window_masks = cfg.window.is_some_and(|w| cache.seq_len + b > w);
+    // Taken only on Spark-X2.5 (`gate_sigmoid`, the one architecture whose
+    // prefill parity was measured on it): every other windowed model
+    // (Gemma-3, Phi-3, Laguna, ...) keeps its historical per-position
+    // attend bit for bit. The identity holds for all of them — widen this
+    // after measuring one.
+    let window_masks = cfg
+        .window
+        .is_some_and(|w| !cfg.gate_sigmoid || cache.seq_len + b > w);
     let attend_ok = b >= 32
         && cache.mode == crate::kv_cache::KvMode::F32
         && cfg.softcap == 0.0 // capped scores: per-position attend (correctness first)
@@ -1516,12 +1523,15 @@ pub fn qwen_attention_batch(
     // machine with no CPU twin (x86) a refusal after this point would
     // leave the output zeroed, so refusal must be impossible short of a
     // lost device.
-    // A projected (softplus / head-wise sigmoid) gate is applied to
-    // `ao_all` after the batched attend, so it does not exclude the device.
+    // A projected gate is applied to `ao_all` after the batched attend, so
+    // it does not need the device to know it. Admitted for Spark-X2.5's
+    // head-wise sigmoid only: Laguna's softplus gate keeps the CPU attend
+    // it has always had (no Laguna parity was measured on this arm).
     let gpu_attend = attend_ok
         && crate::gpu::enabled_here()
         && !crate::gpu::mm_killed()
         && !cfg.output_gate
+        && (cfg.softplus_gate.is_none() || cfg.gate_sigmoid)
         && nh > 0
         && nkv > 0
         && hd > 0
