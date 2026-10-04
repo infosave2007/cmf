@@ -2626,6 +2626,11 @@ impl Pipeline {
                         let cpu_k: Vec<&[f32]> = (0..nkv).map(|g| cache.head_keys(g)).collect();
                         let cpu_v: Vec<&[f32]> = (0..nkv).map(|g| cache.head_values(g)).collect();
                         let cpu_stored = if o1_layer { 0 } else { cpu_k[0].len() / hd };
+                        // A trimmed tail always holds the window the
+                        // device attend reads (`first = rows + 1 − w`).
+                        debug_assert!(
+                            cache.base() == 0 || window_l.is_some_and(|w| cpu_stored + 1 >= w)
+                        );
                         let p = crate::gpu::AttnDeviceParams {
                             kv_id,
                             layer: *li,
@@ -2645,6 +2650,7 @@ impl Pipeline {
                             cpu_k,
                             cpu_v,
                             cpu_stored,
+                            cpu_gen: cache.generation(),
                             o1: o1p,
                             window: window_l,
                             head_gate: head_gate_w,
@@ -2807,6 +2813,7 @@ impl Pipeline {
                             cpu_k,
                             cpu_v,
                             cpu_stored: stored,
+                            cpu_gen: cache.generation(),
                             o1: None,
                             window: window_l,
                             head_gate: None,
@@ -9765,6 +9772,13 @@ impl Pipeline {
             if layer.mode != crate::kv_cache::KvMode::F32 || layer.o1.is_some() {
                 break;
             }
+            // A trimmed tail holds every row the chunk's first query reads.
+            debug_assert!(
+                layer.base() == 0
+                    || self
+                        .layer_window(li)
+                        .is_some_and(|w| layer.head_len(0) + 1 >= w)
+            );
             stored_at.push(layer.head_len(0));
             layers.push(crate::gpu_metal::ChunkLayer {
                 model: &model,
@@ -9813,6 +9827,7 @@ impl Pipeline {
             let layer = &self.kv_cache.layers[li];
             io.push(crate::gpu_metal::ChunkIo {
                 cpu_stored: stored_at[i],
+                cpu_gen: layer.generation(),
                 cpu_k: (0..nkv).map(|g| layer.head_keys(g)).collect(),
                 cpu_v: (0..nkv).map(|g| layer.head_values(g)).collect(),
                 out_k: ok,
@@ -11613,6 +11628,7 @@ impl Pipeline {
                 cpu_k,
                 cpu_v,
                 cpu_stored,
+                cpu_gen: cache.generation(),
                 o1: None,
                 window: None,
                 head_gate: None,
@@ -12242,6 +12258,7 @@ impl Pipeline {
                 cpu_k,
                 cpu_v,
                 cpu_stored,
+                cpu_gen: cache.generation(),
                 o1: None,
                 window: None,
                 head_gate: None,
@@ -12494,6 +12511,7 @@ impl Pipeline {
                 cpu_k,
                 cpu_v,
                 cpu_stored,
+                cpu_gen: cache.generation(),
                 o1: None,
                 window: None,
                 head_gate: None,
@@ -12760,6 +12778,7 @@ impl Pipeline {
                     cpu_k: cpu_k.clone(),
                     cpu_v: cpu_v.clone(),
                     cpu_stored: cpu_stored + j,
+                    cpu_gen: cache.generation(),
                     o1: None,
                     window: None,
                     head_gate: None,
