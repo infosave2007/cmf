@@ -48,6 +48,16 @@ const KV_COL_WARMUP: usize = 64;
 /// → target <1% with a per-group one). V — per-row scale (measured +0.56%).
 const KV_K_GROUP: usize = 32;
 
+/// Source of `LayerKvCache::generation`. Process-wide so two caches (or a
+/// cache and a restored clone of itself from another moment) never share a
+/// value by accident: a device mirror keyed by (generation, rows) can then tell
+/// "the rows I hold" from "the same number of different rows".
+static KV_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_gen() -> u64 {
+    KV_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Per-layer O(1) Nyström attention state (runtime `attn_type`
 /// override — spec §7 presence-driven pattern, no format change).
 ///
@@ -101,8 +111,28 @@ pub struct LayerKvCache {
     /// Accumulated attention mass per stored position: importance of a
     /// position is how much probability mass reads it.
     imp: Vec<f32>,
-    /// Positions appended so far (grows once per token, dead heads included).
+    /// Rows stored (grows once per token, dead heads included). Stored
+    /// row 0 is absolute position `base`, so this equals the context depth
+    /// only while `base == 0`; [`Self::pos_len`] is the depth. Every attend
+    /// indexes rows, never positions (eviction made this a row count long
+    /// before `trim_window` did).
     pub seq_len: usize,
+    /// Absolute position of stored row 0. Only `trim_window` advances it;
+    /// 0 on every layer that was never trimmed.
+    base: usize,
+    /// The attend window of a layer that keeps only its tail
+    /// (`trim_window`), set by the first call. A property of the layer,
+    /// not of the conversation: `clear()` keeps it. Such a layer bounds
+    /// itself, so the cache-wide eviction leaves it alone.
+    tail: Option<usize>,
+    /// Storage generation: a fresh value on every mutation other than
+    /// `append` and `truncate_last` (clear, trim, eviction, wire import,
+    /// resets). A device mirror that copies these rows keys its validity on
+    /// (generation, rows): a trimmed layer's row count is periodic (576..639 for a
+    /// 512 window), so the count alone can match a different set of rows.
+    /// Appends and rollbacks show up in the count, and the speculative
+    /// paths re-point their mirrors themselves, so they keep the value.
+    generation: u64,
     pub num_kv_heads: usize,
     pub head_dim: usize,
     /// Linear-core recurrent state S (vmf_phase), f64; empty on full layers.
@@ -152,6 +182,12 @@ pub enum WireKind {
     Linear = 1,
     /// Bounded anchor: insert counter + ring K/V.
     Bounded = 2,
+    /// A full layer that stores only its tail (`trim_window`): `base` as
+    /// u64, then the `Full` body of the stored rows. Sent only when
+    /// `base > 0`, so an untrimmed record is byte-identical to `Full`; a
+    /// peer that predates it refuses it as an unknown kind instead of
+    /// reading the tail as a whole history.
+    FullTail = 3,
 }
 
 impl WireKind {
@@ -160,6 +196,7 @@ impl WireKind {
             0 => Some(WireKind::Full),
             1 => Some(WireKind::Linear),
             2 => Some(WireKind::Bounded),
+            3 => Some(WireKind::FullTail),
             _ => None,
         }
     }
@@ -185,6 +222,9 @@ impl LayerKvCache {
             vcol: vec![Vec::new(); num_kv_heads],
             imp: Vec::new(),
             seq_len: 0,
+            base: 0,
+            tail: None,
+            generation: next_gen(),
             num_kv_heads,
             head_dim,
             linear_state: Vec::new(),
@@ -257,6 +297,7 @@ impl LayerKvCache {
         if let Some(b) = self.bounded.as_mut() {
             b.restore(s);
             self.seq_len = b.seen;
+            self.generation = next_gen();
         }
     }
 
@@ -273,13 +314,102 @@ impl LayerKvCache {
         self.linear_scratch.clear();
     }
 
-    /// Per-KV-head stored keys `[seq_len × head_dim]` (GPU token graph sync).
+    /// Per-KV-head stored keys `[seq_len × head_dim]` (GPU token graph
+    /// sync): the stored tail, row 0 = position `base()`.
     pub fn k_heads(&self) -> &[Vec<f32>] {
         &self.k
     }
-    /// Per-KV-head stored values `[seq_len × head_dim]`.
+    /// Per-KV-head stored values `[seq_len × head_dim]`, row 0 = `base()`.
     pub fn v_heads(&self) -> &[Vec<f32>] {
         &self.v
+    }
+
+    // ── Sliding-window tail (trim_window) ──
+
+    /// Absolute position of stored row 0 (0 unless `trim_window` dropped
+    /// a prefix).
+    pub fn base(&self) -> usize {
+        self.base
+    }
+
+    /// Absolute context depth: the position the next append will hold.
+    pub fn pos_len(&self) -> usize {
+        self.base + self.seq_len
+    }
+
+    /// Storage generation (see the field): with the row count, the key a
+    /// device copy of these rows is valid under.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The window this layer trims to, once `trim_window` ran on it.
+    pub fn tail_window(&self) -> Option<usize> {
+        self.tail
+    }
+
+    /// Drop the rows a sliding-window layer can never read again. A query
+    /// at position p reads p−w+1..=p only, so once more than `2w` rows are
+    /// stored the front is drained down to `w + slack` rows, the cut
+    /// rounded DOWN to an absolute position that is a multiple of `align`
+    /// (so `w + slack ..= w + slack + align − 1` rows stay). Returns the
+    /// rows dropped.
+    ///
+    /// The rows that stay keep their order and values (`Vec::drain` of the
+    /// front), and every attend indexes rows relative to the newest one
+    /// (`first = rows − w`), so each later query sees the very rows it saw
+    /// untrimmed — bit for bit. `slack` rows past the window are what a
+    /// rollback (`truncate_last`) may take back without losing a row the
+    /// window needs. `align` keeps device GEMMs that reduce over the rows
+    /// from row 0 in fixed tiles on the tile grid they had untrimmed (the
+    /// dropped rows were whole all-zero tiles there).
+    ///
+    /// Callers trim only at a safe point: never between a call's appends
+    /// and its attend or importance accumulation (a prefill chunk appends
+    /// all its rows first and indexes them from the count it started at).
+    ///
+    /// No-op on an O(1) or bounded layer (they own their bound), and on a
+    /// q8 layer whose per-channel field is not frozen yet: the freeze
+    /// reads every stored row, so dropping one before it would change it.
+    pub fn trim_window(&mut self, w: usize, slack: usize, align: usize) -> usize {
+        if self.o1.is_some() || self.bounded.is_some() || w == 0 {
+            return 0;
+        }
+        self.tail = Some(w);
+        if self.seq_len <= 2 * w {
+            return 0;
+        }
+        if matches!(self.mode, KvMode::Q8 { .. })
+            && self.kcol.iter().all(Vec::is_empty)
+            && self.vcol.iter().all(Vec::is_empty)
+        {
+            return 0;
+        }
+        let align = align.max(1);
+        let keep_from = self.pos_len().saturating_sub(w + slack);
+        let new_base = keep_from / align * align;
+        if new_base <= self.base {
+            return 0;
+        }
+        let d = new_base - self.base;
+        let hd = self.head_dim;
+        fn drop_front<T>(v: &mut Vec<T>, n: usize) {
+            let n = n.min(v.len());
+            v.drain(..n);
+        }
+        for h in 0..self.num_kv_heads {
+            drop_front(&mut self.k[h], d * hd);
+            drop_front(&mut self.v[h], d * hd);
+            drop_front(&mut self.kq[h], d * hd);
+            drop_front(&mut self.vq[h], d * hd);
+            drop_front(&mut self.ks[h], d * hd.div_ceil(KV_K_GROUP));
+            drop_front(&mut self.vs[h], d);
+        }
+        drop_front(&mut self.imp, d);
+        self.base = new_base;
+        self.seq_len -= d;
+        self.generation = next_gen();
+        d
     }
 
     // ── O(1) Nyström override ──
@@ -378,6 +508,8 @@ impl LayerKvCache {
         self.imp.clear();
         self.o1 = None;
         self.seq_len = 0;
+        self.base = 0;
+        self.generation = next_gen();
         self.o1_transitioned = false;
         self.o1_error = Some(err);
     }
@@ -701,6 +833,8 @@ impl LayerKvCache {
     /// computes score = s_k·⟨q⊙col_k, k_q⟩ and the weighted sum of V in i8
     /// with f32 accumulation. Returns (output [head_dim], probs [stored]).
     pub fn attend(&self, q: &[f32], kv_head: usize) -> (Vec<f32>, Vec<f32>) {
+        // Full-context layers only: a trimmed tail is not the whole row.
+        debug_assert!(self.tail.is_none(), "attend() on a sliding-window tail");
         let hd = self.head_dim;
         if self.mode == KvMode::F32 {
             let stored = self.k[kv_head].len() / hd;
@@ -1238,6 +1372,18 @@ impl LayerKvCache {
             self.seq_len = b.seen;
             return;
         }
+        // A trimmed tail keeps `slack` rows past its window for exactly
+        // this; a deeper rollback leaves the next query short of rows its
+        // window reads (no Spark path rolls back more than 2).
+        if let Some(w) = self.tail
+            && self.base > 0
+            && self.seq_len - d < w.saturating_sub(1)
+        {
+            tracing::warn!(
+                "sliding tail: rollback of {d} leaves {} rows under the {w}-row window",
+                self.seq_len - d
+            );
+        }
         for h in 0..self.num_kv_heads {
             let keep = self.k[h].len().saturating_sub(d * self.head_dim);
             self.k[h].truncate(keep);
@@ -1306,6 +1452,9 @@ impl LayerKvCache {
             b.clear();
         }
         self.seq_len = 0;
+        // `tail` stays: the window is the layer's, not the conversation's.
+        self.base = 0;
+        self.generation = next_gen();
     }
 
     /// Serialize this layer's state for the wire (versioned, v2): a
@@ -1349,10 +1498,16 @@ impl LayerKvCache {
         u(WIRE_VERSION, &mut out);
         out.extend_from_slice(&self.wire_identity.to_le_bytes());
         u(self.wire_layer, &mut out);
-        out.push(self.wire_kind as u8);
+        // A trimmed full layer travels as its tail and says where it starts.
+        let kind = match self.wire_kind {
+            WireKind::Full if self.base > 0 => WireKind::FullTail,
+            k => k,
+        };
+        out.push(kind as u8);
         out.push(u8::from(f16));
         out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&(self.seq_len as u64).to_le_bytes());
+        // The header carries the absolute depth (== seq_len untrimmed).
+        out.extend_from_slice(&(self.pos_len() as u64).to_le_bytes());
         let push = |xs: &[f32], o: &mut Vec<u8>| {
             if f16 {
                 for &x in xs {
@@ -1364,8 +1519,12 @@ impl LayerKvCache {
                 }
             }
         };
-        match self.wire_kind {
+        match kind {
             WireKind::Full => self.export_full_body(f16, &mut out),
+            WireKind::FullTail => {
+                out.extend_from_slice(&(self.base as u64).to_le_bytes());
+                self.export_full_body(f16, &mut out);
+            }
             WireKind::Linear => {
                 u(self.num_kv_heads as u32, &mut out);
                 u(self.head_dim as u32, &mut out);
@@ -1495,7 +1654,10 @@ impl LayerKvCache {
                 self.wire_layer
             ));
         }
-        if kind != self.wire_kind {
+        // A full layer takes its trimmed tail too.
+        let fits = kind == self.wire_kind
+            || (kind == WireKind::FullTail && self.wire_kind == WireKind::Full);
+        if !fits {
             return Err(format!(
                 "kv import: record kind {kind:?} does not match this layer's {:?}",
                 self.wire_kind
@@ -1527,6 +1689,22 @@ impl LayerKvCache {
                         self.seq_len
                     ));
                 }
+            }
+            WireKind::FullTail => {
+                need_payload(8, o)?;
+                let base = u64::from_le_bytes(buf[o..o + 8].try_into().unwrap()) as usize;
+                o += 8;
+                let n = self.import_full_body(&buf[o..])?;
+                o += n;
+                if base.checked_add(self.seq_len) != Some(position) {
+                    let rows = self.seq_len;
+                    self.reset_per_position_storage();
+                    self.seq_len = 0;
+                    return Err(format!(
+                        "kv import: tail base {base} + {rows} rows != header position {position}"
+                    ));
+                }
+                self.base = base;
             }
             WireKind::Linear => {
                 let heads = u32_at(&mut o)? as usize;
@@ -1624,6 +1802,8 @@ impl LayerKvCache {
         self.o1 = None;
         self.o1_error = None;
         self.o1_transitioned = false;
+        self.base = 0;
+        self.generation = next_gen();
     }
 
     /// Parse the per-position record (legacy wire body); returns the
@@ -1731,9 +1911,16 @@ impl LayerKvCache {
         // about the context depth.  Both states therefore bypass ordinary
         // eviction until the transition or explicit reset completes.  A
         // bounded anchor likewise: the ring evicts itself every token.
-        if self.o1.is_some() || self.bounded.is_some() || self.seq_len <= keep_last {
+        // A sliding-window tail (`trim_window`) bounds itself and must stay
+        // the exact contiguous window its attends index.
+        if self.o1.is_some()
+            || self.bounded.is_some()
+            || self.tail.is_some()
+            || self.seq_len <= keep_last
+        {
             return;
         }
+        self.generation = next_gen();
         let drop = self.seq_len - keep_last;
         for h in 0..self.num_kv_heads {
             // Dead heads store fewer positions; drop proportionally.
@@ -1761,16 +1948,18 @@ impl LayerKvCache {
     /// with the positions carrying the highest accumulated attention
     /// mass (vmfcore: PPL 8.342 vs 8.687 for recency-only, full 8.295).
     fn evict_born(&mut self, keep_last: usize, sink: usize, recent: usize) {
-        if self.o1.is_some() || self.bounded.is_some() {
+        if self.o1.is_some() || self.bounded.is_some() || self.tail.is_some() {
             // See evict(): collecting must retain the exact prefix as well as
             // sealed O(1) state must retain its own bounded representation;
-            // a bounded anchor's ring is its own eviction.
+            // a bounded anchor's ring is its own eviction, and a sliding
+            // tail its own (a gather would make its rows non-contiguous).
             return;
         }
         let stored = self.imp.len();
         if stored <= keep_last {
             return;
         }
+        self.generation = next_gen();
         // Budget discipline: sinks first, recents next, both clamped so
         // the total never exceeds keep_last.
         let sink_n = sink.min(keep_last);
@@ -1900,9 +2089,11 @@ impl KvCache {
             .saturating_sub(self.recurrent_state_bytes())
     }
 
-    /// Current sequence length (max across layers — dead layers may lag).
+    /// Current sequence length (max across layers — dead layers may lag):
+    /// the absolute depth, which a trimmed sliding layer keeps in
+    /// `pos_len()` while it stores only its tail.
     pub fn seq_len(&self) -> usize {
-        self.layers.iter().map(|l| l.seq_len).max().unwrap_or(0)
+        self.layers.iter().map(|l| l.pos_len()).max().unwrap_or(0)
     }
 
     /// Bytes owned by bounded-anchor rings (constant in context).
@@ -1912,11 +2103,12 @@ impl KvCache {
 
     /// True when some layer with PER-POSITION storage reached the cap.
     /// Bounded anchors hold nothing per position and never need it: a
-    /// model whose every layer is O(1) has no eviction cliff at all.
+    /// model whose every layer is O(1) has no eviction cliff at all. A
+    /// sliding tail (`trim_window`) bounds itself and is not counted.
     pub fn needs_eviction(&self) -> bool {
         self.layers
             .iter()
-            .filter(|l| l.bounded.is_none())
+            .filter(|l| l.bounded.is_none() && l.tail.is_none())
             .map(|l| l.seq_len)
             .max()
             .unwrap_or(0)
@@ -2557,5 +2749,300 @@ mod tests {
         );
         // imp stays aligned with the gathered positions.
         assert_eq!(layer.head_len(0), 4);
+    }
+
+    // ── Sliding-window tail (trim_window) ──
+
+    /// Deterministic row of `n` values in [-1, 1) for position `p`.
+    fn swa_row(p: usize, n: usize, salt: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| ((p * 7919 + i * 104_729 + salt * 1_299_709) % 2003) as f32 / 1001.5 - 1.0)
+            .collect()
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// The stored tail is the untrimmed cache's rows from `base` on, in
+    /// order, with the bounds the trigger promises — a dead head included.
+    #[test]
+    fn swa_trim_keeps_contiguous_tail() {
+        let (nkv, hd, w, slack, align) = (2usize, 8usize, 6usize, 2usize, 4usize);
+        let alive = [true, false];
+        let mut full = LayerKvCache::new(nkv, hd);
+        full.mode = KvMode::F32;
+        let mut t = full.clone();
+        let mut trims = 0;
+        for p in 0..100 {
+            let (k, v) = (swa_row(p, nkv * hd, 1), swa_row(p, nkv * hd, 2));
+            full.append(&k, &v, &alive);
+            t.append(&k, &v, &alive);
+            if t.trim_window(w, slack, align) > 0 {
+                trims += 1;
+                assert!(
+                    (w + slack..w + slack + align).contains(&t.seq_len),
+                    "rows after a trim: {}",
+                    t.seq_len
+                );
+            }
+            assert!(t.seq_len <= 2 * w, "rows {} past the trigger", t.seq_len);
+            assert_eq!(t.pos_len(), p + 1);
+            assert_eq!(t.base() % align, 0);
+            assert_eq!(t.base() + t.seq_len, full.seq_len);
+            let b = t.base();
+            assert_eq!(t.head_keys(0), &full.head_keys(0)[b * hd..]);
+            assert_eq!(t.head_values(0), &full.head_values(0)[b * hd..]);
+            assert!(t.head_keys(1).is_empty() && t.head_values(1).is_empty());
+            assert_eq!(t.imp.len(), t.seq_len);
+        }
+        assert!(trims > 5, "only {trims} trims in 100 positions");
+        assert_eq!(t.tail_window(), Some(w));
+        assert_eq!(full.tail_window(), None);
+    }
+
+    /// Two caches fed the same rows, one trimmed: every windowed attend
+    /// (`first = rows − w`) gives the same output and importance, bit for
+    /// bit, under F32 and the q8 cache — the q8 field freezes at 64 rows,
+    /// before the first trim.
+    #[test]
+    fn swa_trimmed_attend_equals_untrimmed() {
+        let (nkv, hd, hpk) = (2usize, 16usize, 2usize);
+        for mode in [KvMode::F32, KvMode::Q8 { k: true, v: true }] {
+            for (w, slack, align) in [(40usize, 2usize, 4usize), (37, 5, 16), (64, 64, 64)] {
+                let mut full = LayerKvCache::new(nkv, hd);
+                full.mode = mode;
+                let mut t = full.clone();
+                let scale = 0.3f32;
+                let mut trims = 0;
+                for p in 0..400 {
+                    let (k, v) = (swa_row(p, nkv * hd, 3), swa_row(p, nkv * hd, 4));
+                    full.append(&k, &v, &[]);
+                    t.append(&k, &v, &[]);
+                    let q = swa_row(p, nkv * hpk * hd, 5);
+                    for g in 0..nkv {
+                        let qg = &q[g * hpk * hd..(g + 1) * hpk * hd];
+                        let (nf, nt) = (full.head_len(g), t.head_len(g));
+                        let (mut of, mut ot) = (vec![0f32; hpk * hd], vec![0f32; hpk * hd]);
+                        let (mut imf, mut imt) = (vec![0f32; nf], vec![0f32; nt]);
+                        full.attend_group(
+                            qg,
+                            g,
+                            &mut of,
+                            &mut imf,
+                            scale,
+                            nf.saturating_sub(w),
+                            0.0,
+                            &[],
+                        );
+                        t.attend_group(
+                            qg,
+                            g,
+                            &mut ot,
+                            &mut imt,
+                            scale,
+                            nt.saturating_sub(w),
+                            0.0,
+                            &[],
+                        );
+                        assert_eq!(bits(&of), bits(&ot), "{mode:?} w {w} pos {p} group {g}");
+                        assert_eq!(bits(&imf[t.base()..]), bits(&imt), "{mode:?} w {w} pos {p}");
+                        full.accumulate_imp(&imf);
+                        t.accumulate_imp(&imt);
+                    }
+                    if t.trim_window(w, slack, align) > 0 {
+                        trims += 1;
+                    }
+                    assert_eq!(bits(&full.imp[t.base()..]), bits(&t.imp));
+                }
+                assert!(trims > 0, "{mode:?} w {w}: never trimmed");
+            }
+        }
+    }
+
+    /// A rollback no deeper than the slack, then new rows: still the
+    /// untrimmed answer.
+    #[test]
+    fn swa_truncate_after_trim() {
+        let (nkv, hd, w) = (1usize, 8usize, 10usize);
+        let mut full = LayerKvCache::new(nkv, hd);
+        full.mode = KvMode::F32;
+        let mut t = full.clone();
+        let mut p = 0usize;
+        for round in 0..60 {
+            for _ in 0..3 {
+                let (k, v) = (swa_row(p, hd, 6), swa_row(p, hd, 7));
+                full.append(&k, &v, &[]);
+                t.append(&k, &v, &[]);
+                p += 1;
+            }
+            t.trim_window(w, 2, 4);
+            // Speculative-style rollback of 2, then replacement rows.
+            full.truncate_last(2);
+            t.truncate_last(2);
+            p -= 2;
+            assert_eq!(t.pos_len(), full.seq_len);
+            for _ in 0..2 {
+                let (k, v) = (swa_row(p, hd, 8 + round), swa_row(p, hd, 9 + round));
+                full.append(&k, &v, &[]);
+                t.append(&k, &v, &[]);
+                p += 1;
+            }
+            let q = swa_row(p, hd, 10);
+            let (nf, nt) = (full.head_len(0), t.head_len(0));
+            let (mut of, mut ot) = (vec![0f32; hd], vec![0f32; hd]);
+            let (mut imf, mut imt) = (vec![0f32; nf], vec![0f32; nt]);
+            full.attend_group(&q, 0, &mut of, &mut imf, 0.5, nf - w.min(nf), 0.0, &[]);
+            t.attend_group(&q, 0, &mut ot, &mut imt, 0.5, nt - w.min(nt), 0.0, &[]);
+            assert_eq!(bits(&of), bits(&ot), "round {round}");
+        }
+        assert!(t.base() > 0);
+    }
+
+    /// The cache-wide eviction leaves a sliding tail alone, and a tail
+    /// does not count toward the eviction trigger.
+    #[test]
+    fn swa_evict_skips_tail() {
+        for policy in [EvictionPolicy::Recent, EvictionPolicy::Born { sink: 1 }] {
+            let mut c = KvCache::new(2, 1, 4, 30);
+            c.policy = policy;
+            for p in 0..25 {
+                for l in &mut c.layers {
+                    l.append(&swa_row(p, 4, 1), &swa_row(p, 4, 2), &[]);
+                }
+                c.layers[0].trim_window(8, 2, 4);
+            }
+            let t_rows = c.layers[0].seq_len;
+            let t_base = c.layers[0].base();
+            assert!(t_base > 0);
+            assert!(!c.needs_eviction(), "25 rows < cap 30");
+            for p in 25..30 {
+                for l in &mut c.layers {
+                    l.append(&swa_row(p, 4, 1), &swa_row(p, 4, 2), &[]);
+                }
+            }
+            // Layer 0 (tail, 5 rows past its last trim) is not what triggers.
+            assert!(c.needs_eviction());
+            let gen0 = c.layers[0].generation();
+            c.evict(10);
+            assert_eq!(c.layers[0].seq_len, t_rows + 5, "{policy:?}: tail evicted");
+            assert_eq!(c.layers[0].base(), t_base);
+            assert_eq!(c.layers[0].generation(), gen0);
+            assert_eq!(
+                c.layers[1].seq_len, 10,
+                "{policy:?}: full layer not evicted"
+            );
+            assert_eq!(c.seq_len(), 30, "absolute depth from the tail");
+        }
+    }
+
+    /// `generation` moves on every mutation a device copy cannot follow by its
+    /// row count, and stays on appends and rollbacks.
+    #[test]
+    fn swa_gen_bumps() {
+        let mut l = LayerKvCache::new(1, 4);
+        l.mode = KvMode::F32;
+        let g0 = l.generation();
+        assert_ne!(
+            LayerKvCache::new(1, 4).generation(),
+            g0,
+            "fresh caches differ"
+        );
+        for p in 0..20 {
+            l.append(&swa_row(p, 4, 1), &swa_row(p, 4, 2), &[]);
+        }
+        assert_eq!(l.generation(), g0, "append");
+        l.truncate_last(2);
+        assert_eq!(l.generation(), g0, "truncate_last");
+        assert_eq!(l.trim_window(10, 2, 4), 0, "18 rows ≤ 2w: no trim");
+        assert_eq!(l.generation(), g0, "a no-op trim");
+        for p in 18..21 {
+            l.append(&swa_row(p, 4, 1), &swa_row(p, 4, 2), &[]);
+        }
+        assert!(l.trim_window(10, 2, 4) > 0);
+        let g1 = l.generation();
+        assert_ne!(g1, g0, "trim");
+        let snap = l.clone();
+        l.clear();
+        let g2 = l.generation();
+        assert_ne!(g2, g1, "clear");
+        assert_eq!((l.base(), l.pos_len(), l.tail_window()), (0, 0, Some(10)));
+        let mut e = LayerKvCache::new(1, 4);
+        e.mode = KvMode::F32;
+        for p in 0..12 {
+            e.append(&swa_row(p, 4, 1), &swa_row(p, 4, 2), &[]);
+        }
+        let ge = e.generation();
+        e.evict(20);
+        assert_eq!(e.generation(), ge, "an eviction that does nothing");
+        e.evict(6);
+        assert_ne!(e.generation(), ge, "evict");
+        let ge = e.generation();
+        e.evict_born(3, 1, 1);
+        assert_ne!(e.generation(), ge, "evict_born");
+        let mut i = LayerKvCache::new(1, 4);
+        let gi = i.generation();
+        i.import_wire(&snap.export_wire(false).unwrap()).unwrap();
+        assert_ne!(i.generation(), gi, "import");
+        assert_ne!(
+            i.generation(),
+            snap.generation(),
+            "an import is new storage"
+        );
+    }
+
+    /// A trimmed layer travels as `FullTail` and answers the same on the
+    /// far side; an untrimmed one is still byte-for-byte `Full`; a layer
+    /// with another kind refuses the tail.
+    #[test]
+    fn wire_full_tail_roundtrip() {
+        let (nkv, hd, w) = (2usize, 4usize, 6usize);
+        let mut a = LayerKvCache::new(nkv, hd);
+        a.mode = KvMode::F32;
+        for p in 0..5 {
+            a.append(&swa_row(p, nkv * hd, 1), &swa_row(p, nkv * hd, 2), &[]);
+        }
+        let plain = a.export_wire(false).unwrap();
+        assert_eq!(plain[20], WireKind::Full as u8, "untrimmed stays Full");
+        assert_eq!(u64::from_le_bytes(plain[24..32].try_into().unwrap()), 5);
+        for p in 5..40 {
+            a.append(&swa_row(p, nkv * hd, 1), &swa_row(p, nkv * hd, 2), &[]);
+            a.trim_window(w, 2, 4);
+        }
+        assert!(a.base() > 0);
+        for f16 in [false, true] {
+            let bytes = a.export_wire(f16).unwrap();
+            assert_eq!(bytes[20], WireKind::FullTail as u8);
+            assert_eq!(u64::from_le_bytes(bytes[24..32].try_into().unwrap()), 40);
+            let mut b = LayerKvCache::new(nkv, hd);
+            b.import_wire(&bytes).expect("tail import");
+            assert_eq!(
+                (b.base(), b.seq_len, b.pos_len()),
+                (a.base(), a.seq_len, 40)
+            );
+            if !f16 {
+                let q = swa_row(99, 2 * hd, 3);
+                for g in 0..nkv {
+                    let n = a.head_len(g);
+                    let (mut oa, mut ob) = (vec![0f32; 2 * hd], vec![0f32; 2 * hd]);
+                    let (mut ia, mut ib) = (vec![0f32; n], vec![0f32; n]);
+                    a.attend_group(&q, g, &mut oa, &mut ia, 0.5, n - w, 0.0, &[]);
+                    b.attend_group(&q, g, &mut ob, &mut ib, 0.5, n - w, 0.0, &[]);
+                    assert_eq!(bits(&oa), bits(&ob));
+                }
+                // ... and a Full import over it puts row 0 back at 0.
+                b.import_wire(&plain).unwrap();
+                assert_eq!((b.base(), b.pos_len()), (0, 5));
+            }
+        }
+        // A position that disagrees with base + rows is refused.
+        let mut bad = a.export_wire(false).unwrap();
+        bad[24..32].copy_from_slice(&41u64.to_le_bytes());
+        assert!(LayerKvCache::new(nkv, hd).import_wire(&bad).is_err());
+        // A bounded layer does not take a tail.
+        let mut r = LayerKvCache::new(nkv, hd);
+        r.install_bounded(8);
+        let err = r.import_wire(&a.export_wire(false).unwrap()).unwrap_err();
+        assert!(err.contains("does not match"), "{err}");
     }
 }
