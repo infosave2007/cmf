@@ -31,7 +31,10 @@
 //! A record of a kind this binary does not know ends the replay the same way
 //! (a 0.8.5 binary on a 0.8.6 state directory truncates the log at its first
 //! contract record, a 0.8.7 binary on a 0.8.8 one at its first cache put
-//! with a distribution — never run an older binary on it).
+//! with a distribution — never run an older binary on it). 0.8.11 adds no
+//! kind: a cache put's input digest rides in the scope field of its record
+//! ([`crate::cache`]), which a 0.8.9 binary replays as an entry that never
+//! hits.
 
 use crate::cache::CacheEntry;
 use crate::canonical;
@@ -868,12 +871,14 @@ mod tests {
             LogRecord::Example(ex("a", [0.6, 0.8, 0.0])),
             LogRecord::CachePut(CacheEntry {
                 scope: "skill:s:x".into(),
+                input: None,
                 phi_p: vec![1.0, 0.0],
                 answer: OracleAnswer::Score(3).into(),
                 ts: 9,
             }),
             LogRecord::CachePut(CacheEntry {
                 scope: "contract:c".into(),
+                input: Some([7; 32]),
                 phi_p: vec![0.0, 1.0],
                 answer: Verdict {
                     answer: OracleAnswer::Choice("b".into()),
@@ -923,6 +928,7 @@ mod tests {
     fn cache_puts_with_and_without_a_distribution() {
         let entry = |answer: Verdict| CacheEntry {
             scope: "contract:c".into(),
+            input: None,
             phi_p: vec![0.6, 0.8],
             answer,
             ts: 7,
@@ -952,6 +958,28 @@ mod tests {
         let f = dist.frame();
         assert_eq!(f[8], KIND_CACHE_PUT_P);
         assert_eq!(read_records(&f).0, vec![dist]);
+        // 0.8.11: an entry with its input digest keeps both record kinds
+        // (the digest rides in the scope) and comes back whole.
+        for answer in [
+            OracleAnswer::Score(2).into(),
+            Verdict {
+                answer: OracleAnswer::Choice("y".into()),
+                probabilities: vec![("x".into(), 0.25), ("y".into(), 0.75)],
+            },
+        ] {
+            let kind = if answer.is_one_hot() {
+                KIND_CACHE_PUT
+            } else {
+                KIND_CACHE_PUT_P
+            };
+            let r = LogRecord::CachePut(CacheEntry {
+                input: Some([0x5a; 32]),
+                ..entry(answer)
+            });
+            let f = r.frame();
+            assert_eq!(f[8], kind);
+            assert_eq!(read_records(&f), (vec![r], f.len()));
+        }
     }
 
     fn object(v: Value) -> Map<String, Value> {

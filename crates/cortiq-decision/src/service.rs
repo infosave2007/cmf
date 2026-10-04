@@ -11,7 +11,12 @@
 //!    `cortiq/decision@<12 hex>` must name it (else 404);
 //! 2. every question is matched to a skill ([`crate::matching`]);
 //! 3. untrained questions (no match, superset, score, noul) need the oracle: when
-//!    the call is not allowed the request fails with 422 before any work;
+//!    the call is not allowed the request fails with 422 before any work —
+//!    unless the escalator answers without the oracle
+//!    ([`Escalator::answers_without_oracle`]: the cascade's cache is on and
+//!    holds something, 0.8.11), when a question its cache misses fails it
+//!    after step 5 with the same 422, which names every untrained question
+//!    (the cache's hits too: an error never tells what the cache holds);
 //! 4. the encoder and the hash run once on the state text; each exact or subset
 //!    question is decided by its skill (the errors of a skill are computed once
 //!    per request), and the gate of the profile decides `local` or not. A
@@ -25,7 +30,10 @@
 //!    one call when the oracle is allowed (spec §5.1: `oracle.enabled`, the
 //!    key's `oracle_allowed` and `cmf.oracle` / `default_per_request`; the
 //!    escalator adds the key, budget and stop checks): `oracle` or `cache`
-//!    answers replace them; otherwise a trained question stays `abstain` with a
+//!    answers replace them. Without that consent the escalator still answers
+//!    what it already holds ([`Escalator::resolve_without_oracle`], 0.8.11):
+//!    a cache hit is `cache` (no call, nothing sent, no cost), a miss is
+//!    refused. Otherwise a trained question stays `abstain` with a
 //!    flag and an untrained one fails the request (422, 502 or 503). A
 //!    trained question refused because the oracle is not ready (flags
 //!    `oracle_disabled`, `no_key`, `budget`, `stopped`) also gives the answer
@@ -120,6 +128,9 @@ pub const DEFAULT_ROUTE_INSTRUCTIONS: &str =
 pub struct SkillRuntime {
     scorer: SkillScorer,
     manifest: SkillManifest,
+    /// The active labels from the data (not a cold start), in task order:
+    /// the label set the skill was built for (DESIGN C2.1).
+    trained: Vec<String>,
 }
 
 impl SkillRuntime {
@@ -223,10 +234,17 @@ impl LoadedModel {
             // A skill with no active task (an auto-skill whose labels are all
             // quarantined) gets an empty scorer: listed by `/v1/skills`, no
             // active labels for the matcher (`relate` skips it).
+            let trained = s
+                .manifest
+                .active_tasks()
+                .filter(|t| t.origin == TaskOrigin::Data)
+                .map(|t| t.label.clone())
+                .collect();
             skills.push(SkillRuntime {
                 scorer: SkillScorer::from_model(&model, s.id())
                     .with_context(|| format!("skill '{}'", s.id()))?,
                 manifest: s.manifest.clone(),
+                trained,
             });
         }
         Ok(Self {
@@ -294,7 +312,9 @@ impl LoadedModel {
     /// The labels of every skill as the matcher sees them: the active ones
     /// (candidates) and, for an auto-skill, its whole contract as known and
     /// its contract sha (`data.train.sha256`, the hash of its rubric — the
-    /// loader checks it), the only thing it is matched by (DESIGN A18).
+    /// loader checks it), the only thing it is matched by (DESIGN A18); a
+    /// data skill with its rubric and its trained label set, the evidence of
+    /// a subset (DESIGN C2.1).
     pub fn skill_labels(&self) -> Vec<SkillLabels<'_>> {
         self.skills
             .iter()
@@ -309,6 +329,8 @@ impl LoadedModel {
                     )
                 } else {
                     SkillLabels::data(s.id(), active)
+                        .with_rubric(s.manifest.rubric.as_ref())
+                        .with_trained(&s.trained)
                 }
             })
             .collect()
@@ -928,6 +950,36 @@ pub trait Escalator: Send + Sync {
     /// cache, single flight, one oracle call. Called only after the service's
     /// consent checks passed; must return one [`Resolved`] per pending question.
     fn escalate(&self, escalation: &Escalation<'_>) -> EscalationResult;
+
+    /// Resolve the undetermined questions of a request the oracle may not be
+    /// called for — the service's consent checks refused it for `refused`
+    /// (`oracle_disabled`, `consent_off`) — from what the escalator already
+    /// holds, with no call and nothing sent (0.8.11): a cached answer, else
+    /// [`Resolution::Refused`] with `refused`. Called only when
+    /// [`Escalator::answers_without_oracle`] is true; one [`Resolved`] per
+    /// pending question. Default: every question refused.
+    fn resolve_without_oracle(
+        &self,
+        escalation: &Escalation<'_>,
+        refused: RefusalReason,
+    ) -> EscalationResult {
+        EscalationResult {
+            resolved: escalation
+                .pending
+                .iter()
+                .map(|_| Resolved::new(Resolution::Refused(refused)))
+                .collect(),
+            usage: OracleUsage::default(),
+        }
+    }
+
+    /// Whether [`Escalator::resolve_without_oracle`] may answer anything
+    /// (the cascade: its cache is on). Default: false — a request without
+    /// consent is then refused as before 0.8.11, its untrained questions
+    /// before the encoder runs.
+    fn answers_without_oracle(&self) -> bool {
+        false
+    }
 
     /// `POST /v1/feedback` (spec §5.11): only decisions of the caller's account.
     fn feedback(
@@ -1589,7 +1641,17 @@ impl DecisionService {
         // Matching.
         let matches = match_questions(&model, req)?;
         let consent = self.consent(req, p);
-        if let Err(reason) = consent {
+        // Without consent the escalator may still answer from what it holds
+        // (its cache: no call, nothing sent; 0.8.11). When it cannot, an
+        // untrained question fails here, before any work.
+        let without_oracle = consent.is_err()
+            && self
+                .escalator
+                .as_ref()
+                .is_some_and(|e| e.answers_without_oracle());
+        if let Err(reason) = consent
+            && !without_oracle
+        {
             let untrained: Vec<usize> = (0..matches.len())
                 .filter(|&i| !matches[i].kind.is_local())
                 .collect();
@@ -1639,8 +1701,17 @@ impl DecisionService {
         let mut oracle_usage = OracleUsage::default();
         let to = Instant::now();
         if !pending_idx.is_empty() {
-            match (consent, &self.escalator) {
-                (Ok(()), Some(esc)) => {
+            // The escalator, and why the oracle may not be called (`None`:
+            // it may): with consent the cascade; without it the escalator's
+            // answers without the oracle (its cache, 0.8.11) when it has any.
+            let route = match (consent, &self.escalator) {
+                (Ok(()), Some(esc)) => Ok((esc, None)),
+                (Err(reason), Some(esc)) if without_oracle => Ok((esc, Some(reason))),
+                (Err(reason), _) => Err(reason),
+                (Ok(()), None) => Err(RefusalReason::OracleDisabled),
+            };
+            match route {
+                Ok((esc, refused)) => {
                     let pending: Vec<Pending<'_>> = pending_idx
                         .iter()
                         .map(|&i| Pending {
@@ -1660,7 +1731,10 @@ impl DecisionService {
                         pending,
                         oracle_credit_usd: self.oracle_credit_left(p),
                     };
-                    let result = esc.escalate(&e);
+                    let result = match refused {
+                        None => esc.escalate(&e),
+                        Some(reason) => esc.resolve_without_oracle(&e, reason),
+                    };
                     oracle_usage = result.usage;
                     if result.resolved.len() == pending_idx.len() {
                         for (&i, r) in pending_idx.iter().zip(result.resolved) {
@@ -1679,16 +1753,9 @@ impl DecisionService {
                         }
                     }
                 }
-                (Err(reason), _) => {
+                Err(reason) => {
                     for &i in &pending_idx {
                         resolved[i] = Some(Resolved::new(Resolution::Refused(reason)));
-                    }
-                }
-                (Ok(()), None) => {
-                    for &i in &pending_idx {
-                        resolved[i] = Some(Resolved::new(Resolution::Refused(
-                            RefusalReason::OracleDisabled,
-                        )));
                     }
                 }
             }
@@ -1736,7 +1803,11 @@ impl DecisionService {
             })
             .collect();
         if !unresolved.is_empty() {
-            return Err(untrained_error(req, &matches, &unresolved));
+            return Err(untrained_error(
+                req,
+                &matches,
+                &masked_refusals(&unresolved, &resolved, &locals),
+            ));
         }
 
         // Answers.
@@ -2753,6 +2824,38 @@ fn top1_vs_top2(l: Option<&LocalDecision>) -> String {
         [a] => format!("{} only candidate", l.labels[a.index]),
         [] => "no candidates".into(),
     }
+}
+
+/// The untrained questions a failed request names (0.8.11): `unresolved`,
+/// unless one of them was refused the oracle — then every untrained one
+/// answered from the cache is named as well, refused for the same reason.
+/// A request refused the oracle (no consent, the oracle off, stopped or out
+/// of budget) is answered from the cache alone; naming only its misses would
+/// tell, in an error that is neither metered nor recorded, which questions
+/// the shared cache holds. So it names every untrained question, as the 422
+/// before any work did (0.8.9).
+fn masked_refusals(
+    unresolved: &[(usize, Resolution)],
+    resolved: &[Option<Resolved>],
+    locals: &[Option<LocalDecision>],
+) -> Vec<(usize, Resolution)> {
+    let Some(reason) = unresolved.iter().find_map(|(_, r)| match r {
+        Resolution::Refused(r) => Some(*r),
+        _ => None,
+    }) else {
+        return unresolved.to_vec();
+    };
+    (0..locals.len())
+        .filter(|&i| locals[i].is_none())
+        .filter_map(|i| match unresolved.iter().find(|(j, _)| *j == i) {
+            Some(u) => Some(u.clone()),
+            None => matches!(
+                resolved[i].as_ref().map(|r| &r.resolution),
+                Some(Resolution::Cache(_))
+            )
+            .then_some((i, Resolution::Refused(reason))),
+        })
+        .collect()
 }
 
 /// The 422/502/503 of untrained questions without a verdict.

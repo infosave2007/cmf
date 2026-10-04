@@ -5,6 +5,94 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.11] - 2026-10-04
+
+### Changed
+- Decision cache: exact first. An entry carries the sha256 of its
+  question's whole input (the state as asked, canonical JSON; a state-less
+  question's whole instructions, the lead-in line included) beside its scope
+  (the contract, and the skill and option set), and a lookup hits on the same
+  scope and input first. The text embedding no longer decides by default: it
+  reads only the first 512 tokens and barely moves when a deciding detail
+  changes (a note in a POP909 JSON score, a number in a CLadder question, an
+  address in a PhishNChips e-mail), and at the old cos ≥ 0.97 a Decision Index
+  run through the gateway answered ~60k of 282k questions with another row's
+  oracle answer (index 58 -> 51.9; 57.78 with 0.9999). Near reuse is now
+  opt-in: `cache.threshold` defaults to 1 (was 0.97), which turns it off;
+  a value below 1 brings it back at that cosine (the key and its range are
+  unchanged). Single flight follows the same rule: by default only a
+  question with the same input waits for a call in flight; a near
+  duplicate leads its own call and gets its own answer (ORACLE.md "How a
+  question flows", API.md §3.2, §6).
+- An entry logged before 0.8.11 has no digest: it answers at cos ≥
+  `cache.legacy_cos` (new key, default 0.9999; or at `cache.threshold` with
+  near reuse on). That is not exact — states that differ only past the
+  encoder's 512 tokens, or state-less questions that differ only in the
+  lead-in line, have cos 1 — so `cache.legacy_cos: 1` turns such entries
+  off: they are not loaded and answer nothing, and an oracle pass on the
+  same state directory then gives each question an entry with its digest
+  (the records stay in `learn.log`, with the examples and contracts).
+- `cortiq decide --oracle` uses the default cache: only the same text is a
+  cache answer (it reused paraphrases at cos ≥ 0.97 before; there is no flag
+  for near reuse), worded "its answer to the same text".
+
+### Fixed
+- Decisions API: a data skill takes a `subset` question only with evidence
+  that the question is its task. Polar answers (yes, no, maybe, true,
+  false) count for nothing as labels of a subset; three other labels are
+  evidence by their ids, as before; fewer must each be specific — a
+  compound id such as `card_arrival`, or a one-word id described by its
+  own name or the skill's rubric criterion (not by a sentence that merely
+  contains the word, nor `null`). `cmf.skill`, the skill's rubric
+  instructions, its rubric criteria verbatim and its whole trained label
+  set (the question it was built for, also after it learns a new label)
+  take any subset; the route instructions only for a skill without a
+  rubric, and `cortiq decide --labels` now names the skill its labels
+  resolve to. Until now every binary question with `{yes, no}` options was
+  a subset of an intent skill that has "yes" and "no" intents (the user
+  affirms / denies): on a public decision benchmark suite 167,639 of its
+  282,368 questions — aspect presence, tool and document relevance,
+  sarcasm, answer selection, causal and forecast questions of nine tasks —
+  were claimed this way, and those the gate accepted were answered by the
+  intent classifier at 1–45 % accuracy instead of reaching the oracle. They
+  are now untrained (the oracle answers them, or 422 without it; the reason
+  names the refused subset) and learnable as auto-skills of their own
+  contract. Exact matches (by ids or by descriptions), the intent
+  benchmarks' rows and the documented banking examples are unchanged.
+- The cache answers what it holds when the oracle may not be called: a key
+  with `oracle_allowed: false`, `cmf.oracle: false` (the router's
+  `allow_oracle: false`), `oracle.enabled: false`, the admin switch off, a
+  stop rule (`max_errors`, HTTP 401-403, ...) or an exhausted budget no
+  longer turn a cached answer into a refusal. A hit is `action: cache`,
+  `decision_path: escalate→cache`, with no call, no egress and no cost; a
+  miss is refused as before (the flag, 422 or 503), and a failed request
+  names every untrained question, as 0.8.9 did — never which of them the
+  shared cache held. The service asks the escalator through the new
+  `Escalator::resolve_without_oracle` (the default refuses every question,
+  as before) when `answers_without_oracle` says it can (the cascade: its
+  cache is on and holds something; an empty cache keeps the 422 before any
+  work). `cortiq decide --oracle` without a usable key answers from the
+  state directory's cache too (read only: no `LOCK`, nothing written).
+- A single-flight follower of the same question puts its answer in the
+  cache and `learn.log` as an oracle answer is (a dedup with its leader's
+  put). The ~242 questions a cache-only pass missed after an oracle pass
+  had followed a near duplicate at cos ≥ 0.97; with exact single flight
+  they lead their own calls and get entries of their own. A near
+  duplicate's follower (near reuse on) stores nothing: the oracle never read
+  its input.
+
+### Compatibility
+- `learn.log` gains no record kind: the input digest rides in the scope
+  field of the `CachePut` / `CachePutP` records (`exact:<64 hex>|<scope>`).
+  Records of 0.8.9 and older replay unchanged; a 0.8.9 binary on a 0.8.11
+  state directory keeps the whole log and reads the new entries as a scope
+  it never looks up (they never hit there).
+- The state directory now holds the sha256 of every cached question's input
+  as asked (before PII redaction): it confirms a known text exactly
+  (ORACLE.md "What leaves the machine").
+- `POST /v1/admin/oracle {"enabled": false}` and the stop rules stop calls,
+  not cached answers: only `cache.enabled: false` (a restart) stops those.
+
 ## [0.8.10] - 2026-10-04
 
 ### Added

@@ -227,7 +227,11 @@ API takes the same fields. A key created with the CLI may use the oracle
 with `--oracle-allowed=false`; the server's oracle switch, budget, the key's
 `--oracle-budget-usd` and the stop rules still apply. A key created through
 `POST /v1/admin/keys` has `oracle_allowed` only when the body sets it, as
-in the router.
+in the router. A key without `oracle_allowed` never calls the oracle, but
+since 0.8.11 its undetermined questions are answered from the shared cache
+when it holds the same question (`action: cache`, other accounts' oracle
+answers; only `cache.enabled: false` turns that off — ORACLE.md "How a
+question flows").
 
 ```bash
 cortiq decision keys list --state ./decision.state
@@ -354,14 +358,15 @@ curl -s "$CORTIQ/api/alpha/decisions" \
 
 ### 3.2 Skill matching and `certified`
 
-The local model looks at the option ids first (instructions matter to the
-oracle alone; descriptions only through the description match below). With
-L = the option ids of a choice question:
+The local model looks at the option ids first (instructions and
+descriptions matter to it only through the description match and as the
+evidence of a subset, both below). With L = the option ids of a choice
+question:
 
 | Match | When | Decided by |
 |---|---|---|
 | `exact` | L equals the active labels of exactly one skill | that skill's certified gate |
-| `subset` | L is a strict subset (at least 2) of one skill's labels | argmin, softmax, margin and novelty over L only; the same T, θ, τ; never certified |
+| `subset` | L is a strict subset (at least 2) of one skill's labels, with evidence that the question is that skill's task (below) | argmin, softmax, margin and novelty over L only; the same T, θ, τ; never certified |
 | `superset` | one skill's labels plus labels it does not know | the oracle only; its answer teaches that skill only for a key with `learning_allowed` |
 | `untrained` | anything else, and every `score` / `noul` question | the oracle only; without it the request is 422 |
 
@@ -391,6 +396,38 @@ way. On the published model, the kit's rows read this way (the lead-in
 line dropped, section 3.1): BANKING77 macro-F1 0.933 (0.854 with the
 lead-in), CLINC150+OOS 0.929 with the gate's rejections as out of scope
 (0.384 with the lead-in); no threshold tuned on those rows.
+
+**Subset evidence (0.8.11).** A subset names only part of a skill's
+labels, so it is taken as the skill's task only with evidence; by ids or
+by descriptions, one of:
+
+- *the skill's own question*: `cmf.skill` names the skill; the
+  instructions are the skill's rubric's (for a skill without a rubric, the
+  `Classify the input into exactly one of the task labels.` of its route
+  question); every listed option is described by the skill's rubric
+  criterion of its label, verbatim (`GET /v1/skills/{id}` shows them); or
+  the listed labels are the skill's whole trained label set — the exact
+  question it was built for stays its own after it learns a new label;
+- *specific labels*: **polar answers** (`yes`, `no`, `maybe`, `true`,
+  `false`, compared as descriptions are) count for nothing — they answer
+  every yes/no question, and an intent skill that has them as intents
+  (`clinc150`: the user affirms, denies) does not answer questions about a
+  state. Three other listed labels are evidence by their ids, whatever the
+  descriptions (the example of 3.1). Fewer must each be specific: a
+  compound id (two words or more, such as `card_arrival` — the examples of
+  3.1, `/v1/feedback` and the System One adapter), or a one-word id whose
+  description is its own name (`"alarm": "Alarm"`; a description match is
+  so by construction) or the skill's criterion. A description that merely
+  contains the word (`"alarm": "Set an alarm"`, `"date": "a value of type
+  date"`) or `null` is no evidence for a one-word id; one label alone next
+  to polar answers or a none option must be compound.
+
+A subset without evidence is `untrained` — the oracle answers it, it may be
+learned as an auto-skill of its own contract, and without an oracle the
+422 reason names the refused subset (name the skill with `cmf.skill` to use
+it anyway). `cortiq decide --labels` names the skill its labels resolve to.
+Before 0.8.11 every `{yes, no}` question was a `clinc150` subset, decided by
+the intent classifier.
 
 **Auto-skills (0.8.6).** A choice question no skill fits (`untrained` because
 of its options, not an ambiguous one and not one forced with `cmf.skill`) is
@@ -456,9 +493,11 @@ the instructions, which are the data: every item of a classification set
 under the same options is one contract, learned and then answered locally,
 and never the same contract as a request with a non-empty state over the
 same criteria (whose contract includes its instructions). Its cache scope is
-that contract too, with the φ of the instructions text, so a near-identical
-text under the same criteria is a cache hit. The instructions of a
-state-less question are its input: they leave for the oracle PII-redacted
+that contract too, with the digest and the φ of the instructions text, so
+the same text under the same criteria is a cache hit (a near-identical one
+only with near reuse opted in, `cache.threshold` below 1, since 0.8.11).
+The instructions of a state-less question are its input: they leave for
+the oracle PII-redacted
 like a state (unless `allow_pii_egress`; since 0.8.8 so do every question's
 instructions and criteria descriptions, never the option ids — ORACLE.md
 "What leaves the machine"), the oracle request otherwise unchanged (`state`
@@ -948,7 +987,7 @@ unknown key is an error. The defaults:
              "max_errors": 30, "redact_pii": true, "title": "cortiq-decision", "data_collection": null,
              "probabilities": true, "probability_tokens_per_question": 128,
              "reasoning": "off", "reasoning_max_tokens": 4096, "reasoning_deadline_s": 60},
-  "cache": {"enabled": true, "threshold": 0.97, "cap": 50000},
+  "cache": {"enabled": true, "threshold": 1.0, "legacy_cos": 0.9999, "cap": 50000},
   "learning": {"enabled": true, "refit_min_new": 25, "dedup": 0.995, "cold_start": true, "synchronous": false,
                "auto_skills": true, "auto_min_rows": 10, "auto_k": 8, "auto_tau": 0.9,
                "auto_min_agreement": 0.8, "auto_min_coverage": 0.8, "auto_max_skills": 256,
@@ -969,7 +1008,12 @@ part of the file: the admin token and the OpenRouter key are read from the
 environment variables it names. `auth.plans` may override the plan table.
 `oracle.base_url` must be https, or plain http to a loopback address only (a
 local proxy). The oracle, cache and learning sections are explained in
-[ORACLE.md](ORACLE.md). The `learning.auto_*` keys govern auto-skills
+[ORACLE.md](ORACLE.md); `cache.threshold` is 1 since 0.8.11 (only the same
+question — scope and input — is a hit; below 1 a cosine of the text
+embeddings at least that high is one too, 0.97 being the default before);
+`cache.legacy_cos` (0.8.11) is the cosine from which an entry logged before
+0.8.11, which has no input digest, is a hit (1 turns those entries off).
+The `learning.auto_*` keys govern auto-skills
 (section 3.2, [ORACLE.md](ORACLE.md#auto-skills)): `auto_skills` learns
 untrained choice contracts at all; `auto_min_rows` fit rows (≥ 2) a label
 needs to be active; `auto_k` the rank of its topologies; `auto_tau` the
