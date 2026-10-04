@@ -2512,14 +2512,14 @@ impl Pipeline {
             }
         };
 
-        let inv_freq = self.inv_freq.clone();
+        // RoPE table and rotary width are per layer (`layer_inv_freq`,
+        // `layer_geom`) inside the loop below.
         let pool = self.pool.clone();
-        let (nh, nkv, hd, hs, rd, eps) = (
+        let (nh, nkv, hd, hs, eps) = (
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
             self.hidden_size,
-            self.rotary_dim,
             self.rms_eps,
         );
         let norm_style = self.norm_style;
@@ -2780,7 +2780,10 @@ impl Pipeline {
                             nh,
                             nkv,
                             hd,
-                            rd,
+                            // The layer's own geometry, as the CPU attend
+                            // above used it (the projected gate is applied
+                            // after this probe on both sides).
+                            rd: rd_l,
                             position,
                             scale: self.attn_scale,
                             eps: eps as f32,
@@ -2789,12 +2792,12 @@ impl Pipeline {
                             output_gate: *output_gate,
                             q_norm: *q_norm,
                             k_norm: *k_norm,
-                            inv_freq: &inv_freq,
+                            inv_freq: &inv_freq_l,
                             cpu_k,
                             cpu_v,
                             cpu_stored: stored,
                             o1: None,
-                            window: None,
+                            window: window_l,
                             head_gate: None,
                         };
                         if let Some((dq, dk, dv, dao)) = graph.debug_attn_device(l, &p, &h_now) {
@@ -10054,9 +10057,17 @@ impl Pipeline {
     /// only attention-level decline (Spark-X2.5); per-layer KV heads,
     /// narrow V, sinks, Gemma-4 global geometry and scaled RoPE positions
     /// still decline.
+    ///
+    /// Per-layer Q heads (Laguna) and capped scores (Gemma-2) decline here
+    /// too, with V norm (Gemma-4): the chunk prefill's own gate checks
+    /// neither of the first two, and before this door opened its `swa`
+    /// refusal kept every sliding model with them off the chunk graph.
     #[cfg(target_os = "macos")]
     fn metal_graph_swa(&self) -> bool {
         (self.swa.is_some() || self.sliding_layers.is_some())
+            && self.attention_heads_per_layer.is_none()
+            && !self.attn_v_norm
+            && self.attn_softcap == 0.0
             && self.kv_heads_per_layer.is_none()
             && self.v_head_dim.map_or(true, |vd| vd == self.head_dim)
             && !self.kv_cache.layers.iter().any(|l| l.sinks.is_some())
