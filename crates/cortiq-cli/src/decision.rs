@@ -42,7 +42,10 @@
 //!   surrounding whitespace (a warning says so), `bad_key` when what is left
 //!   is not a key (never sent); a missing one is worded for the command line
 //!   (`OPENROUTER_API_KEY is not set (decide --oracle reads the key from the
-//!   environment)`), also when labels no skill has leave only the oracle;
+//!   environment)`), also when labels no skill has leave only the oracle.
+//!   Without a usable key `decide --oracle` still answers what the state
+//!   directory's cache holds (0.8.11: read only, no call, no `LOCK`, nothing
+//!   written); the rest is refused `no_key` / `bad_key`;
 //! * `cortiq decision init | train | add-skill | learn | info | verify |
 //!   materialize | rollback | keys | oracle check`;
 //! * `cortiq serve FILE` on a decision file: the decisions server on
@@ -54,7 +57,7 @@ use clap::{ArgGroup, Args, Subcommand};
 use cortiq_core::CmfModel;
 use cortiq_core::format::features;
 use cortiq_decision::build::{self, BuildReport, TrainOptions};
-use cortiq_decision::cascade::Cascade;
+use cortiq_decision::cascade::{CacheView, Cascade};
 use cortiq_decision::config::{
     Config, DEFAULT_ORACLE_BASE_URL, DEFAULT_ORACLE_KEY_ENV, DEFAULT_ORACLE_MODEL,
 };
@@ -1083,18 +1086,25 @@ impl BatchTally {
     }
 }
 
-/// The oracle of `decide --oracle` without a usable key: every undetermined
-/// question is refused with `no_key` (the variable is unset) or `bad_key`
+/// The oracle of `decide --oracle` without a usable key: an undetermined
+/// question the state directory's cache holds is answered from it (0.8.11,
+/// as a server answers it from its cache when its key is missing), every
+/// other one is refused with `no_key` (the variable is unset) or `bad_key`
 /// (it holds something that is not a key), as a server refuses it — no
-/// network, no state directory.
+/// network; the state directory is only read, never created or locked.
 struct KeylessOracle {
     /// `NoKey` or `BadKey`.
     reason: RefusalReason,
     status: OracleStatus,
+    /// The state directory's cache when it holds anything.
+    cache: Option<CacheView>,
 }
 
 impl Escalator for KeylessOracle {
     fn escalate(&self, e: &Escalation<'_>) -> EscalationResult {
+        if let Some(c) = &self.cache {
+            return c.resolve(e, self.reason);
+        }
         EscalationResult {
             resolved: e
                 .pending
@@ -1167,7 +1177,7 @@ struct RunTotals {
 /// on top of what its ledger already holds; learning is off. The stop rules
 /// hold as on a server: a stop is written to `oracle.state` and keeps the
 /// oracle off for later runs until `--oracle-resume`. Without a usable key,
-/// [`KeylessOracle`] (no network, no state).
+/// [`KeylessOracle`] (no network; the state directory's cache read only).
 struct OracleRun {
     svc: DecisionService,
     cascade: Option<Arc<Cascade>>,
@@ -1221,7 +1231,29 @@ impl OracleRun {
         };
         if let Some((reason, status)) = keyless {
             oracle_setup::prepare(&mut cfg, flags, false)?;
-            let esc: Arc<dyn Escalator> = Arc::new(KeylessOracle { reason, status });
+            // What the oracle answered earlier runs on this state directory
+            // is answered all the same (no call; read only, so no LOCK and
+            // nothing written; a directory that is not there stays so).
+            let learn_log = state
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| StateDir::default_for(model_path))
+                .join(cortiq_decision::statedir::LEARN_LOG_FILE);
+            let cache = if learn_log.is_file() {
+                match CacheView::load(&cfg.cache, &learn_log) {
+                    Ok(c) => (!c.is_empty()).then_some(c),
+                    Err(e) => {
+                        eprintln!("warning: the oracle's cached answers are not used: {e:#}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let esc: Arc<dyn Escalator> = Arc::new(KeylessOracle {
+                reason,
+                status,
+                cache,
+            });
             return Ok(Self {
                 svc: DecisionService::open(Arc::clone(handle), cfg.clone(), Some(esc))?
                     .without_hint_log(),
@@ -1878,9 +1910,18 @@ fn single_request(model: &LoadedModel, a: &DecideArgs, text: &str) -> Result<Val
             || Value::String(server::DEFAULT_ROUTE_INSTRUCTIONS.to_string()),
             |r| r.instructions,
         );
+        // `--labels` alone: the data skill they name (exact or subset, spec
+        // §4.5), named with `cmf.skill` — the labels are that skill's own
+        // question, which a subset must show (DESIGN C2.1). Labels no skill
+        // has, ambiguous or superset ones go as they are: the service says
+        // why, or the oracle answers.
+        let forced = a.skill.clone().or_else(|| {
+            let labels: Vec<&str> = a.labels.iter().map(String::as_str).collect();
+            cortiq_decision::matching::skill_for_labels(&model.skill_labels(), &labels).ok()
+        });
         (
             json!({"type": "choice", "instructions": instructions, "criteria": criteria}),
-            a.skill.clone(),
+            forced,
         )
     };
     let mut body = json!({
@@ -2029,7 +2070,7 @@ fn render_question(o: &QuestionOutcome, cost: f64, oracle: Option<&OracleView>) 
             Some(format!("{c} (from oracle {}, {})", v.model, usd(cost)))
         }
         (Action::Cache, Some(c), Some(v)) => Some(format!(
-            "{c} (from the cache of oracle {}: its answer to a similar text, $0.00)",
+            "{c} (from the cache of oracle {}: its answer to the same text, $0.00)",
             v.model
         )),
         _ => None,
@@ -2232,7 +2273,9 @@ pub enum KeysCmd {
         oracle_budget_usd: Option<String>,
         /// Whether this key's undetermined questions may reach the oracle
         /// (default: true, as imported router keys; --oracle-allowed=false
-        /// creates a key that never escalates). The server's oracle switch,
+        /// creates a key that never calls the oracle — its undetermined
+        /// questions are still answered from the server's shared cache when
+        /// it holds the same question, 0.8.11). The server's oracle switch,
         /// budgets and stop rules still apply
         #[arg(
             long,

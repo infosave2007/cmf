@@ -7,8 +7,9 @@
 //!   `/v1/route` (router fields `oracle`, `source`, promoted score), then the
 //!   cache; the escalation audit and the metrics;
 //! * gate-accepted questions never reach the oracle, even with `cmf.oracle`;
-//! * cache: a repeat and a paraphrase make no call; single flight: two parallel
-//!   identical HTTP requests make one call;
+//! * cache: a repeat makes no call, a paraphrase only with near reuse opted
+//!   in (0.8.11); single flight: two parallel identical HTTP requests make one
+//!   call;
 //! * learning: 25 oracle answers promote (generation 1, isolation of every other
 //!   task, the next similar request local); rollback and restart over HTTP
 //!   restore the served generation and the cache; a holdout regression (25
@@ -21,6 +22,14 @@
 //!   questions get 502;
 //! * consent: `oracle.enabled: false`, `cmf.oracle: false`, a key with
 //!   `oracle_allowed: false`, router `allow_oracle: false` — 0 calls;
+//! * the cache without the oracle (0.8.11): without consent, and with the
+//!   oracle switched off, stopped or out of budget, a cache hit is served
+//!   with no call and a miss keeps its refusal — an error names every
+//!   untrained question, as 0.8.9 did, never which ones the cache held;
+//!   single flight follows the cache's rule, and a near duplicate's
+//!   follower never caches the answer to another input under its own; a
+//!   0.8.9 `learn.log` replays and answers exact repeats, and
+//!   `cache.legacy_cos: 1` turns its entries off;
 //! * PII redaction on by default;
 //! * the request body for one choice question is byte for byte the v4 driver's
 //!   (9 ledger fixtures of `cortiq-decision`, sent over HTTP);
@@ -61,6 +70,7 @@ mod toy_dir;
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Request};
+use cortiq_decision::buffer::{LogRecord, read_records};
 use cortiq_decision::build::{self, TrainOptions};
 use cortiq_decision::cascade::CascadeOptions;
 use cortiq_decision::config::Config;
@@ -644,9 +654,16 @@ impl Srv {
     }
 
     /// Close and open again on the same state directory.
-    fn restart(mut self, cfg: &Config) -> Self {
+    fn restart(self, cfg: &Config) -> Self {
+        self.restart_with(cfg, |_| {})
+    }
+
+    /// [`Srv::restart`], running `between` on the state directory while the
+    /// server is closed.
+    fn restart_with(mut self, cfg: &Config, between: impl FnOnce(&Path)) -> Self {
         self.app.take();
         self.server.take().unwrap().close().unwrap();
+        between(&self.state_root());
         let base = self.base.clone();
         let dir = std::mem::replace(&mut self.dir, tempfile::tempdir().unwrap());
         Self::open_on(&base, dir, cfg, test_key())
@@ -981,9 +998,19 @@ async fn a_repeat_and_a_paraphrase_are_cache_answers_without_calls() {
     assert_eq!(r2.body["answers"]["task"]["choice"], "travel");
     assert_eq!(r2.body["usage"]["cost"].as_f64(), Some(0.0));
     assert_eq!(r2.body["cmf"]["usage"]["oracle"]["calls"], 0);
+    // A paraphrase is another state: by default (0.8.11) only the same
+    // question hits, so it is a call.
+    assert_eq!(srv.decide(&topics_body(p)).await.action(), "oracle");
+    assert_eq!(mock.hits(), 2);
+    // Near reuse opted in (`cache.threshold` 0.97, the default before
+    // 0.8.11): the paraphrase is a cache answer.
+    let mut near = stand_config(&mock.url());
+    near.cache.threshold = 0.97;
+    let srv = Srv::new(&near);
+    assert_eq!(srv.decide(&topics_body(a)).await.action(), "oracle");
     let r3 = srv.decide(&topics_body(p)).await;
     assert_eq!(r3.action(), "cache", "paraphrase");
-    assert_eq!(mock.hits(), 1);
+    assert_eq!(mock.hits(), 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1589,6 +1616,452 @@ async fn consent_switches_make_no_call() {
         )
         .await;
     assert_eq!(r.flags(), json!(["oracle_disabled"]));
+    assert_eq!(mock.hits(), 1);
+}
+
+// ------------------------------------------------------------------ cache without the oracle
+
+/// A key minted over the admin API without `oracle_allowed` (the default).
+async fn plain_key(srv: &Srv, account: &str) -> String {
+    let r = srv
+        .admin("POST", "/v1/admin/keys", Some(&json!({"account": account})))
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text);
+    r.body["key"].as_str().unwrap().to_string()
+}
+
+/// One `topics` question about `text`.
+fn trained_body(text: &str, cmf: Option<Value>) -> Value {
+    body(json!(text), json!({"task": choice(&TOPICS)}), cmf)
+}
+
+/// One untrained score question `u` about `text`.
+fn score_body(text: &str, cmf: Option<Value>) -> Value {
+    body(json!(text), json!({"u": score_question()}), cmf)
+}
+
+/// Question `q` of `r` came from the cache: no call, no cost, no refusal flag.
+fn assert_cached(r: &Resp, q: &str) {
+    assert_eq!(r.status, 200, "{}", r.text);
+    assert_eq!(r.q(q)["action"], "cache", "{}", r.text);
+    assert_eq!(r.q(q)["decision_path"], "escalate→cache");
+    assert_eq!(r.q(q)["flags"], json!([]));
+    assert_eq!(r.body["usage"]["cost"].as_f64(), Some(0.0));
+    assert_eq!(r.body["cmf"]["usage"]["oracle"]["calls"], 0);
+}
+
+/// `first`, then 250 ms later (its call in flight) `second`, as `topics`
+/// questions.
+async fn in_parallel(srv: &Srv, first: &str, second: &str) -> (Resp, Resp) {
+    let (b1, b2) = (topics_body(first), topics_body(second));
+    tokio::join!(srv.decide(&b1), async {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        srv.decide(&b2).await
+    })
+}
+
+/// The `CachePut` records of a state directory's `learn.log`.
+fn logged_cache_puts(state: &Path) -> usize {
+    let bytes = std::fs::read(state.join("learn.log")).unwrap();
+    let (records, valid) = read_records(&bytes);
+    assert_eq!(valid, bytes.len());
+    records
+        .iter()
+        .filter(|r| matches!(r, LogRecord::CachePut(_)))
+        .count()
+}
+
+/// 0.8.11: the answers the system already holds are served when the oracle
+/// may not be called for the request — a key without `oracle_allowed`,
+/// `cmf.oracle: false`, the router's `allow_oracle: false` — with no call;
+/// a miss keeps the refusal of 0.8.9 (`consent_off`, 422).
+#[tokio::test]
+async fn a_request_without_oracle_consent_gets_cache_hits_and_no_call() {
+    let mock = MockOracle::answering("travel");
+    let srv = Srv::new(&stand_config(&mock.url()));
+    let held = &rejected()[0];
+    // The oracle answers a trained and an untrained question once.
+    assert_eq!(
+        srv.decide(&trained_body(held, None)).await.action(),
+        "oracle"
+    );
+    let r = srv.decide(&score_body("x", None)).await;
+    assert_eq!(r.q("u")["action"], "oracle", "{}", r.text);
+    let rr = srv
+        .post(
+            "/v1/route",
+            None,
+            &json!({"taxonomy_id": "topics", "input": {"text": rejected()[2]}}),
+        )
+        .await;
+    assert_eq!(rr.body["decision"]["source"], "oracle", "{}", rr.text);
+    assert_eq!(mock.hits(), 3);
+    let ledger = srv.ledger().len();
+
+    // cmf.oracle: false (the open mode, where the oracle is otherwise
+    // allowed; it ends with the first key).
+    let off = Some(json!({"oracle": false}));
+    assert_cached(&srv.decide(&trained_body(held, off.clone())).await, "task");
+    assert_cached(&srv.decide(&score_body("x", off.clone())).await, "u");
+    assert_eq!(
+        srv.decide(&trained_body(&rejected()[1], off.clone()))
+            .await
+            .flags(),
+        json!(["consent_off"])
+    );
+    assert_eq!(
+        srv.decide(&score_body("y", off)).await.error(),
+        (422, "UNSUPPORTED_QUESTION".to_string())
+    );
+    // The router's allow_oracle: false.
+    let rr = srv
+        .post("/v1/route", None, &json!({"taxonomy_id": "topics", "input": {"text": rejected()[2]}, "options": {"allow_oracle": false}}))
+        .await;
+    assert_eq!(rr.body["decision"]["source"], "cache", "{}", rr.text);
+
+    // A key without oracle_allowed (from now on every request needs a key).
+    let plain = plain_key(&srv, "plain").await;
+    let r = srv
+        .post("/v1/decisions", Some(&plain), &trained_body(held, None))
+        .await;
+    assert_cached(&r, "task");
+    assert_eq!(r.body["answers"]["task"]["choice"], "travel");
+    assert!(r.body["cmf"].get("hint").is_none(), "{}", r.text);
+    let r = srv
+        .post("/v1/decisions", Some(&plain), &score_body("x", None))
+        .await;
+    assert_cached(&r, "u");
+    assert_eq!(r.body["answers"]["u"]["score"], 0, "{}", r.text);
+    let rr = srv
+        .post(
+            "/v1/route",
+            Some(&plain),
+            &json!({"taxonomy_id": "topics", "input": {"text": rejected()[2]}}),
+        )
+        .await;
+    assert_eq!(rr.body["decision"]["source"], "cache", "{}", rr.text);
+    assert_eq!(rr.body["decision"]["task_label"], "travel");
+    assert_eq!(rr.body["oracle"]["consulted"], false);
+    // Misses are refused exactly as before.
+    let r = srv
+        .post(
+            "/v1/decisions",
+            Some(&plain),
+            &trained_body(&rejected()[1], None),
+        )
+        .await;
+    assert_eq!(r.action(), "abstain");
+    assert_eq!(r.flags(), json!(["consent_off"]));
+    assert_eq!(r.q("task")["decision_path"], "escalate→disabled");
+    assert_eq!(
+        srv.post("/v1/decisions", Some(&plain), &score_body("y", None))
+            .await
+            .error(),
+        (422, "UNSUPPORTED_QUESTION".to_string())
+    );
+
+    // No call, no reservation; the hits are counted.
+    assert_eq!(mock.hits(), 3);
+    assert_eq!(srv.ledger().len(), ledger);
+    let l = srv.learning().await;
+    assert_eq!(l["cache"]["hits"], 6, "{}", l["cache"]);
+}
+
+/// 0.8.11: an oracle disabled (in the configuration or by the admin),
+/// stopped by a stop rule or out of budget still serves what the cache holds
+/// (also replayed after a restart); a miss keeps its flag, 422 or 503.
+#[tokio::test]
+async fn a_disabled_stopped_or_exhausted_oracle_still_serves_cache_hits() {
+    let r = rejected();
+    // A fail switch for the stop rule below.
+    let fail = Arc::new(AtomicBool::new(false));
+    let f2 = fail.clone();
+    let mock = MockOracle::start(move |req| {
+        if f2.load(Ordering::SeqCst) {
+            raw_reply(500, r#"{"error":{"message":"upstream"}}"#)
+        } else {
+            answer_reply(req, |_, o| pick(o, "travel"), 1e-5)
+        }
+    });
+    let mut cfg = stand_config(&mock.url());
+    cfg.oracle.max_errors = 1;
+    let srv = Srv::new(&cfg);
+    assert_eq!(
+        srv.decide(&trained_body(&r[0], None)).await.action(),
+        "oracle"
+    );
+    assert_eq!(
+        srv.decide(&score_body("x", None)).await.q("u")["action"],
+        "oracle"
+    );
+    assert_eq!(mock.hits(), 2);
+
+    // The admin switch.
+    let s = srv
+        .admin("POST", "/v1/admin/oracle", Some(&json!({"enabled": false})))
+        .await;
+    assert_eq!(s.status, 200, "{}", s.text);
+    assert_cached(&srv.decide(&trained_body(&r[0], None)).await, "task");
+    assert_cached(&srv.decide(&score_body("x", None)).await, "u");
+    assert_eq!(
+        srv.decide(&trained_body(&r[1], None)).await.flags(),
+        json!(["oracle_disabled"])
+    );
+    enable(&srv).await;
+
+    // Stopped by max_errors.
+    fail.store(true, Ordering::SeqCst);
+    assert_eq!(
+        srv.decide(&trained_body(&r[1], None)).await.flags(),
+        json!(["oracle_unavailable"])
+    );
+    assert_eq!(srv.oracle_state()["stop_reason"], "max_errors");
+    assert_eq!(mock.hits(), 3);
+    assert_cached(&srv.decide(&trained_body(&r[0], None)).await, "task");
+    assert_cached(&srv.decide(&score_body("x", None)).await, "u");
+    assert_eq!(
+        srv.decide(&trained_body(&r[2], None)).await.flags(),
+        json!(["stopped"])
+    );
+    assert_eq!(
+        srv.decide(&score_body("y", None)).await.error(),
+        (503, "ORACLE_DISABLED".to_string())
+    );
+    assert_eq!(mock.hits(), 3);
+
+    // Disabled in the configuration: the cache comes back from learn.log.
+    let mut off = cfg.clone();
+    off.oracle.enabled = false;
+    let srv = srv.restart(&off);
+    assert_cached(&srv.decide(&trained_body(&r[0], None)).await, "task");
+    assert_cached(&srv.decide(&score_body("x", None)).await, "u");
+    assert_eq!(
+        srv.decide(&trained_body(&r[1], None)).await.flags(),
+        json!(["oracle_disabled"])
+    );
+    assert_eq!(
+        srv.decide(&score_body("y", None)).await.error(),
+        (422, "UNSUPPORTED_QUESTION".to_string())
+    );
+    assert_eq!(mock.hits(), 3);
+
+    // Out of budget (max_calls).
+    fail.store(false, Ordering::SeqCst);
+    let mut capped = stand_config(&mock.url());
+    capped.oracle.max_calls = 2;
+    let srv = Srv::new(&capped);
+    assert_eq!(
+        srv.decide(&trained_body(&r[0], None)).await.action(),
+        "oracle"
+    );
+    assert_eq!(
+        srv.decide(&score_body("x", None)).await.q("u")["action"],
+        "oracle"
+    );
+    assert_eq!(mock.hits(), 5);
+    assert_cached(&srv.decide(&trained_body(&r[0], None)).await, "task");
+    assert_cached(&srv.decide(&score_body("x", None)).await, "u");
+    assert_eq!(
+        srv.decide(&trained_body(&r[1], None)).await.flags(),
+        json!(["budget"])
+    );
+    assert_eq!(
+        srv.decide(&score_body("y", None)).await.error(),
+        (503, "ORACLE_BUDGET_EXHAUSTED".to_string())
+    );
+    assert_eq!(mock.hits(), 5);
+}
+
+/// 0.8.11: single flight follows the cache's rule. By default only the same
+/// question waits for a call in flight (a near duplicate leads its own and
+/// gets its own answer). With near reuse opted in a paraphrase follows and
+/// gets the leader's answer, but nothing is cached under its own input — the
+/// oracle never read it: restarted with exact reuse only, the paraphrase is
+/// a call and gets its own answer, not the leader's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn single_flight_follows_the_cache_rule_and_never_caches_another_inputs_answer() {
+    let a = "cruise ship cabin deck please";
+    let p = "cruise ship cabin today";
+    let c = cos(&phi_p(a), &phi_p(p));
+    assert!((0.97..1.0).contains(&c), "paraphrase cos {c}");
+    // A slow oracle that answers the two texts differently.
+    let mock = MockOracle::start(|req| {
+        let deck = req.state().as_str().is_some_and(|s| s.contains("deck"));
+        let label = if deck { "travel" } else { "cards" };
+        let mut r = answer_reply(req, move |_, o| pick(o, label), 1.3e-5);
+        r.delay = Duration::from_millis(800);
+        r
+    });
+    // Exact only (the default): the same question follows, once logged.
+    let cfg = stand_config(&mock.url());
+    let srv = Srv::new(&cfg);
+    let (r1, r2) = in_parallel(&srv, a, a).await;
+    let mut actions = vec![r1.action().to_string(), r2.action().to_string()];
+    actions.sort();
+    assert_eq!(actions, ["cache", "oracle"]);
+    assert_eq!(mock.hits(), 1);
+    assert_eq!(srv.learning().await["cache"]["entries"], 1);
+    assert_eq!(logged_cache_puts(&srv.state_root()), 1);
+    // A near duplicate leads its own call and gets its own answer.
+    let srv = Srv::new(&cfg);
+    let (r1, r2) = in_parallel(&srv, a, p).await;
+    assert_eq!((r1.action(), r2.action()), ("oracle", "oracle"));
+    assert_eq!(r1.body["answers"]["task"]["choice"], "travel");
+    assert_eq!(r2.body["answers"]["task"]["choice"], "cards");
+    assert_eq!(mock.hits(), 3);
+
+    // Near reuse opted in: the paraphrase follows and gets the leader's
+    // answer; only the leader's input is cached.
+    let mut near = stand_config(&mock.url());
+    near.cache.threshold = 0.97;
+    let srv = Srv::new(&near);
+    let (r1, r2) = in_parallel(&srv, a, p).await;
+    assert_eq!((r1.action(), r2.action()), ("oracle", "cache"));
+    assert_eq!(r2.body["answers"]["task"]["choice"], "travel");
+    assert_eq!(mock.hits(), 4);
+    assert_eq!(srv.learning().await["cache"]["entries"], 1);
+    assert_eq!(logged_cache_puts(&srv.state_root()), 1);
+    // While near reuse is on, a repeat of the paraphrase hits the leader's
+    // entry (no call).
+    assert_eq!(srv.decide(&topics_body(p)).await.action(), "cache");
+    assert_eq!(mock.hits(), 4);
+    // Restarted with exact reuse only: the leader's text is a cache answer,
+    // the paraphrase a call with its own answer.
+    let srv = srv.restart(&cfg);
+    assert_eq!(srv.learning().await["cache"]["entries"], 1);
+    assert_eq!(srv.decide(&topics_body(a)).await.action(), "cache");
+    let r = srv.decide(&topics_body(p)).await;
+    assert_eq!(r.action(), "oracle", "{}", r.text);
+    assert_eq!(r.body["answers"]["task"]["choice"], "cards");
+    assert_eq!(mock.hits(), 5);
+    assert_eq!(srv.decide(&topics_body(p)).await.action(), "cache");
+    assert_eq!(mock.hits(), 5);
+}
+
+/// A `learn.log` written by 0.8.9 (cache puts without an input digest)
+/// replays unchanged: its entries answer an exact repeat (cos φ_P ≥ 0.9999)
+/// and nothing nearer; a 0.8.9 binary reads the 0.8.11 records (their digest
+/// rides in the scope). `cache.legacy_cos: 1` turns those entries off on the
+/// same state directory (they are not loaded), so the oracle pass gives each
+/// question an entry with its digest, which answers it from then on.
+#[tokio::test]
+async fn cache_records_of_0_8_9_replay_and_answer_exact_repeats() {
+    let a = "cruise ship cabin deck please";
+    let p = "cruise ship cabin today";
+    let c = cos(&phi_p(a), &phi_p(p));
+    assert!(c < cortiq_decision::cache::EXACT_COS, "paraphrase cos {c}");
+    let mock = MockOracle::answering("travel");
+    let cfg = stand_config(&mock.url());
+    let srv = Srv::new(&cfg);
+    assert_eq!(srv.decide(&topics_body(a)).await.action(), "oracle");
+    // The same log as 0.8.9 wrote it: every cache put without its digest.
+    let srv = srv.restart_with(&cfg, |state| {
+        let path = state.join("learn.log");
+        let bytes = std::fs::read(&path).unwrap();
+        let (records, valid) = read_records(&bytes);
+        assert_eq!(valid, bytes.len());
+        let mut old = Vec::new();
+        let mut puts = 0;
+        for r in records {
+            let r = match r {
+                LogRecord::CachePut(mut e) => {
+                    assert!(e.input.is_some());
+                    assert!(e.scope.starts_with("skill:topics:"), "{}", e.scope);
+                    e.input = None;
+                    puts += 1;
+                    LogRecord::CachePut(e)
+                }
+                other => other,
+            };
+            old.extend(r.frame());
+        }
+        assert_eq!(puts, 1);
+        std::fs::write(&path, old).unwrap();
+    });
+    assert_eq!(srv.learning().await["cache"]["entries"], 1);
+    let r = srv.decide(&topics_body(a)).await;
+    assert_eq!(r.action(), "cache", "{}", r.text);
+    assert_eq!(mock.hits(), 1);
+    assert_eq!(srv.decide(&topics_body(p)).await.action(), "oracle");
+    assert_eq!(mock.hits(), 2);
+
+    // Legacy reuse off: the digest-less entry is not loaded (only p's
+    // counts), so `a` is a call, cached with its digest.
+    let mut strict = cfg.clone();
+    strict.cache.legacy_cos = 1.0;
+    let srv = srv.restart(&strict);
+    let l = srv.learning().await;
+    assert_eq!(l["cache"]["entries"], 1, "{}", l["cache"]);
+    assert_eq!(l["cache"]["legacy_cos"], 1.0);
+    assert_eq!(srv.decide(&topics_body(a)).await.action(), "oracle");
+    assert_eq!(mock.hits(), 3);
+    assert_eq!(srv.decide(&topics_body(a)).await.action(), "cache");
+    assert_eq!(logged_cache_puts(&srv.state_root()), 3);
+    // Back to the default: the log kept every record; `a` hits.
+    let srv = srv.restart(&cfg);
+    assert_eq!(srv.learning().await["cache"]["entries"], 3);
+    assert_eq!(srv.decide(&topics_body(a)).await.action(), "cache");
+    assert_eq!(srv.decide(&topics_body(p)).await.action(), "cache");
+    assert_eq!(mock.hits(), 3);
+}
+
+/// Two untrained questions about one state: `u` (the oracle answered it
+/// once) and `v` (never asked).
+fn two_untrained(cmf: Option<Value>) -> Value {
+    let v = json!({"type": "score", "instructions": "How risky?", "criteria": ["low", "high"]});
+    body(json!("x"), json!({"u": score_question(), "v": v}), cmf)
+}
+
+/// 0.8.11: a request refused the oracle is answered from the cache alone,
+/// and when a question the cache misses fails it, the error names every
+/// untrained question — exactly the 0.8.9 error, whether the cache held
+/// some of them or nothing — never which ones the cache held (a failed
+/// request is neither metered nor recorded). An empty cache fails a request
+/// without consent before any work, as in 0.8.9.
+#[tokio::test]
+async fn a_refused_request_never_tells_which_questions_the_cache_holds() {
+    let mock = MockOracle::answering("travel");
+    let cfg = stand_config(&mock.url());
+    // The reference: a server whose cache is empty.
+    let empty = Srv::new(&cfg);
+    let srv = Srv::new(&cfg);
+    let r = srv.decide(&score_body("x", None)).await;
+    assert_eq!(r.q("u")["action"], "oracle", "{}", r.text);
+    assert_eq!(mock.hits(), 1);
+    let details = |r: &Resp| r.body["error"]["metadata"]["details"].clone();
+
+    // Without consent: 422, both questions named, as on the empty server.
+    let off = Some(json!({"oracle": false}));
+    let want = empty.decide(&two_untrained(off.clone())).await;
+    assert_eq!(want.error(), (422, "UNSUPPORTED_QUESTION".to_string()));
+    let got = srv.decide(&two_untrained(off.clone())).await;
+    assert_eq!(got.error(), (422, "UNSUPPORTED_QUESTION".to_string()));
+    assert_eq!(details(&got), details(&want), "{}", got.text);
+    assert_eq!(
+        details(&got)["questions"]["u"]["oracle"],
+        "the oracle is not allowed for this request or key"
+    );
+    assert!(details(&got)["questions"]["v"].is_object(), "{}", got.text);
+    assert_eq!(got.body["error"]["message"], want.body["error"]["message"]);
+    // Every question held: answered.
+    assert_cached(&srv.decide(&score_body("x", off)).await, "u");
+
+    // The oracle switched off by the admin (consent given): the same.
+    for s in [&empty, &srv] {
+        let r = s
+            .admin("POST", "/v1/admin/oracle", Some(&json!({"enabled": false})))
+            .await;
+        assert_eq!(r.status, 200, "{}", r.text);
+    }
+    let want = empty.decide(&two_untrained(None)).await;
+    assert_eq!(want.error(), (422, "UNSUPPORTED_QUESTION".to_string()));
+    let got = srv.decide(&two_untrained(None)).await;
+    assert_eq!(got.error(), (422, "UNSUPPORTED_QUESTION".to_string()));
+    assert_eq!(details(&got), details(&want), "{}", got.text);
+    assert_eq!(
+        details(&got)["questions"]["u"]["oracle"],
+        "the oracle is disabled"
+    );
     assert_eq!(mock.hits(), 1);
 }
 
@@ -2833,8 +3306,12 @@ async fn an_untrained_contract_becomes_an_auto_skill_and_answers_locally() {
     assert_eq!(r.q("task")["match"], "exact", "{}", r.text);
     assert_eq!(r.q("task")["skill"], id);
     assert_eq!(srv.learning().await["auto_contracts"], 5);
-    // An ambiguous contract (a subset of two data skills) is not learned.
-    let r = ask(&srv, &choice(&["billing", "cards"]), &lessons[0].1[1]).await;
+    // An ambiguous contract (a subset of two data skills, each with the
+    // evidence two one-word labels need: their names, DESIGN C2.1) is not
+    // learned.
+    let named = json!({"type": "choice", "instructions": "Which topic?",
+                       "criteria": {"billing": "billing", "cards": "cards"}});
+    let r = ask(&srv, &named, &lessons[0].1[1]).await;
     assert_eq!(r.q("task")["match"], "untrained");
     assert!(
         r.q("task")["reason"]

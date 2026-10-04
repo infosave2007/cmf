@@ -3,16 +3,30 @@
 //! The service calls [`Cascade`] only for undetermined questions (the gate
 //! rejected them, or they are untrained) and only after its own consent checks
 //! (`oracle.enabled`, the key's `oracle_allowed`, `cmf.oracle` /
-//! `default_per_request`). A question the gate accepted never reaches it (spec
+//! `default_per_request`); without that consent it asks the cache alone
+//! (0.8.11, step 1). A question the gate accepted never reaches it (spec
 //! §5.1). For one request (spec §5.2):
 //! 1. **permission**: the admin switch, a key in the environment, no stop
 //!    reason, a budget left (globally, calls, the key's `oracle_budget_usd`
-//!    and what its `credit_usd` has left); otherwise every question is
-//!    refused (`oracle_disabled`, `no_key`, `stopped`, `budget`);
-//! 2. **cache** ([`crate::cache`]): a hit answers the question at no cost;
-//! 3. **single flight**: a question whose scope is in flight in another request
-//!    with cos φ_P ≥ `cache.threshold` waits for that call and reuses its answer
-//!    (as a cache answer); the others lead;
+//!    and what its `credit_usd` has left); otherwise (0.8.11) every question
+//!    the cache answers is answered from it — no call, nothing sent — and
+//!    the others are refused (`oracle_disabled`, `no_key`, `stopped`,
+//!    `budget`). A request the service's own consent checks refused
+//!    (`oracle.enabled`, `oracle_allowed`, `cmf.oracle`) gets the same
+//!    cache-only answer ([`Escalator::resolve_without_oracle`]): a cache hit
+//!    has no cost and no egress;
+//! 2. **cache** ([`crate::cache`]): a hit answers the question at no cost —
+//!    by default only the same question (scope and input digest) hits;
+//!    near reuse at cos φ_P ≥ `cache.threshold` is opt-in (0.8.11);
+//! 3. **single flight**: a question of the same scope as one in flight in
+//!    another request, with the same input (or, near reuse on, cos φ_P ≥
+//!    `cache.threshold`: [`crate::cache::reuses`]), waits for that call and
+//!    reuses its answer (as a cache answer); the others lead. A follower of
+//!    the same input puts the answer in the cache and `learn.log` as an
+//!    oracle answer is (0.8.11; it dedups with its leader's put, whichever
+//!    comes first). A follower of another input (near reuse) stores nothing:
+//!    the oracle never read its input, and an entry under its digest would
+//!    answer it exactly — after near reuse is turned off as well;
 //! 4. **one call** for every leading question ([`crate::oracle`]); the state,
 //!    the questions' instructions and their criteria's descriptions (0.8.8,
 //!    DESIGN B4; never the option ids) are PII-redacted when
@@ -112,9 +126,11 @@
 
 use crate::answer::OracleAnswer;
 use crate::buffer::{
-    AddOutcome, Contract, ContractRegistry, Example, LearnLog, LearningBuffer, LogRecord, dot,
+    AddOutcome, Contract, ContractRegistry, Example, LearnLog, LearningBuffer, LogRecord,
 };
-use crate::cache::{CacheEntry, SemanticCache, scope_of_as};
+use crate::cache::{
+    CacheEntry, InputDigest, SemanticCache, input_digest, reuses, scope_of_as, state_digest,
+};
 use crate::config::Config;
 use crate::container::{DecisionModel, Verify};
 use crate::generation;
@@ -131,10 +147,11 @@ use crate::service::{
     OracleUsage, Pending, Principal, RefusalReason, Resolution, Resolved,
 };
 use crate::statedir::StateDir;
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use parking_lot::{Condvar, Mutex};
 use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -217,8 +234,123 @@ impl Slot {
 struct Flight {
     id: u64,
     scope: String,
+    input: InputDigest,
     phi_p: Vec<f32>,
     slot: Arc<Slot>,
+}
+
+/// What the cache knows a pending question by, in pending order: φ_P (the
+/// state's, or in a state-less request its instructions', DESIGN A19.4), the
+/// scope and the input digest ([`crate::cache`]).
+struct QuestionKeys<'a> {
+    phis: Vec<&'a [f32]>,
+    scopes: Vec<String>,
+    inputs: Vec<InputDigest>,
+}
+
+impl<'a> QuestionKeys<'a> {
+    fn of(e: &'a Escalation<'_>) -> Self {
+        let mut state: Option<InputDigest> = None;
+        let mut keys = Self {
+            phis: Vec::with_capacity(e.pending.len()),
+            scopes: Vec::with_capacity(e.pending.len()),
+            inputs: Vec::with_capacity(e.pending.len()),
+        };
+        for p in &e.pending {
+            let reads = e.request.reads_instructions(p.question);
+            keys.phis.push(&e.features_of(p.index).phi_p);
+            keys.scopes.push(scope_of_as(p.question, p.matched, reads));
+            keys.inputs.push(if reads {
+                input_digest(e.request, p.question)
+            } else {
+                *state.get_or_insert_with(|| state_digest(e.request))
+            });
+        }
+        keys
+    }
+}
+
+/// The questions answered from `cache` alone (`None`: the cache is off) —
+/// no call, nothing sent, no single flight, nothing learned — the others
+/// refused with `reason`; and the positions of those misses.
+fn answer_from(
+    cache: Option<&Mutex<SemanticCache>>,
+    keys: &QuestionKeys<'_>,
+    reason: RefusalReason,
+) -> (Vec<Resolved>, Vec<usize>) {
+    let mut cache = cache.map(|c| c.lock());
+    let mut misses = Vec::new();
+    let resolved = (0..keys.scopes.len())
+        .map(|i| {
+            let hit = cache
+                .as_mut()
+                .and_then(|c| c.get(&keys.scopes[i], &keys.inputs[i], keys.phis[i]));
+            match hit {
+                Some((a, _)) => Resolved::new(Resolution::Cache(a)),
+                None => {
+                    misses.push(i);
+                    Resolved::new(Resolution::Refused(reason))
+                }
+            }
+        })
+        .collect();
+    (resolved, misses)
+}
+
+/// A state directory's cache of oracle answers, read only (0.8.11): what
+/// `cortiq decide --oracle` without a usable key answers from — the oracle's
+/// answers to earlier runs (or a server) on that directory, by the rules of
+/// the cascade's cache — with no call, no lock taken and nothing written.
+pub struct CacheView {
+    /// `None`: `cache.enabled` is off.
+    cache: Option<Mutex<SemanticCache>>,
+}
+
+impl CacheView {
+    /// The cache puts of `learn_log` replayed under `cfg` (a missing file is
+    /// an empty cache; a cut or corrupt tail — a writer's last record — is
+    /// skipped, the file left as it is).
+    pub fn load(cfg: &crate::config::CacheConfig, learn_log: &Path) -> Result<Self> {
+        if !cfg.enabled {
+            return Ok(Self { cache: None });
+        }
+        let bytes = match std::fs::read(learn_log) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                return Err(e).with_context(|| format!("read {}", learn_log.display()));
+            }
+        };
+        let mut cache = SemanticCache::from_config(cfg);
+        for r in crate::buffer::read_records(&bytes).0 {
+            if let LogRecord::CachePut(e) = r {
+                cache.put(e);
+            }
+        }
+        Ok(Self {
+            cache: Some(Mutex::new(cache)),
+        })
+    }
+
+    /// Entries of the cache.
+    pub fn len(&self) -> usize {
+        self.cache.as_ref().map_or(0, |c| c.lock().len())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The escalation's questions the cache holds are answered from it
+    /// (`cache`), the others refused with `reason`
+    /// ([`Escalator::resolve_without_oracle`] of the cascade).
+    pub fn resolve(&self, e: &Escalation<'_>, reason: RefusalReason) -> EscalationResult {
+        let (resolved, _) = answer_from(self.cache.as_ref(), &QuestionKeys::of(e), reason);
+        EscalationResult {
+            resolved,
+            usage: OracleUsage::default(),
+        }
+    }
 }
 
 /// Removes a request's flights from the registry and resolves them (failed,
@@ -421,7 +553,7 @@ impl Cascade {
             opts.key,
         )?;
         let (log, replayed) = LearnLog::open(&state.learn_log_path())?;
-        let mut cache = SemanticCache::new(cfg.cache.threshold, cfg.cache.cap);
+        let mut cache = SemanticCache::from_config(&cfg.cache);
         let mut buffer = LearningBuffer::new(cfg.learning.dedup);
         let mut contracts = ContractRegistry::default();
         let mut orphans = 0u64;
@@ -669,6 +801,23 @@ fn seed_contracts(
 }
 
 impl Inner {
+    /// Store an answer in the cache and log it when the cache took it.
+    fn cache_put(&self, entry: CacheEntry) {
+        let stored = self.cache.lock().put(entry.clone());
+        if stored && let Err(err) = self.log.append(&LogRecord::CachePut(entry)) {
+            tracing::error!(error = %err, "learn.log: cache put not recorded");
+        }
+    }
+
+    /// The questions answered from the cache alone ([`answer_from`]).
+    fn answer_from_cache(
+        &self,
+        keys: &QuestionKeys<'_>,
+        reason: RefusalReason,
+    ) -> (Vec<Resolved>, Vec<usize>) {
+        answer_from(self.cfg.cache.enabled.then_some(&self.cache), keys, reason)
+    }
+
     fn base_rows(&self, model: &DecisionModel, skill: &str) -> Result<Arc<Rows>> {
         let mut b = self.bases.lock();
         if let Some(r) = b.get(skill) {
@@ -953,7 +1102,8 @@ impl Inner {
         drop(b);
         let c = self.cache.lock();
         let cache = json!({"entries": c.len(), "hits": c.hits(), "lookups": c.lookups(),
-                           "threshold": c.threshold(), "enabled": self.cfg.cache.enabled});
+                           "threshold": c.threshold(), "legacy_cos": c.legacy_cos(),
+                           "enabled": self.cfg.cache.enabled});
         drop(c);
         let mut tasks = serde_json::Map::new();
         for s in model.skills() {
@@ -1099,41 +1249,27 @@ impl Escalator for Cascade {
                 .collect();
             (state, qs, redacted)
         };
+        // φ_P, scope and input of each question: the state's and its
+        // contract, or in a state-less request its instructions' and the
+        // criteria's (DESIGN A19.4).
+        let keys = QuestionKeys::of(e);
+        let (phis, scopes, inputs) = (&keys.phis, &keys.scopes, &keys.inputs);
         if let Err(r) = inner.oracle.permission(&caller) {
-            if r == RefusalReason::Budget {
+            // What the cache holds is answered all the same (0.8.11): no
+            // call, nothing sent; only the misses are refused.
+            let (resolved, misses) = inner.answer_from_cache(&keys, r);
+            if r == RefusalReason::Budget && !misses.is_empty() {
                 // Refused before a body was built: the status and the hints
                 // name what this request's call would reserve.
-                let all: Vec<usize> = (0..n).collect();
-                let (state, qs, _) = egress(&all);
+                let (state, qs, _) = egress(&misses);
                 let qs: Vec<&Question> = qs.iter().collect();
                 inner.oracle.note_budget_refusal(&qs, &state);
             }
             return EscalationResult {
-                resolved: (0..n)
-                    .map(|_| Resolved::new(Resolution::Refused(r)))
-                    .collect(),
+                resolved,
                 usage: OracleUsage::default(),
             };
         }
-        // φ_P and scope of each question: the state's and its contract, or
-        // in a state-less request its instructions' and the criteria's
-        // (DESIGN A19.4).
-        let phis: Vec<&Vec<f32>> = e
-            .pending
-            .iter()
-            .map(|p| &e.features_of(p.index).phi_p)
-            .collect();
-        let scopes: Vec<String> = e
-            .pending
-            .iter()
-            .map(|p| {
-                scope_of_as(
-                    p.question,
-                    p.matched,
-                    e.request.reads_instructions(p.question),
-                )
-            })
-            .collect();
         let mut out: Vec<Option<Resolved>> = vec![None; n];
 
         // Sightings of the gated contracts not registered yet (DESIGN A20,
@@ -1164,7 +1300,7 @@ impl Escalator for Cascade {
         if cfg.cache.enabled {
             let mut c = inner.cache.lock();
             for i in 0..n {
-                if let Some((a, _)) = c.get(&scopes[i], phis[i]) {
+                if let Some((a, _)) = c.get(&scopes[i], &inputs[i], phis[i]) {
                     out[i] = Some(Resolved::new(Resolution::Cache(a)));
                 }
             }
@@ -1172,7 +1308,9 @@ impl Escalator for Cascade {
 
         // 3. Single flight.
         let mut leaders = Vec::new();
-        let mut followers: Vec<(usize, Arc<Slot>)> = Vec::new();
+        // A follower, its leader's slot, and whether it asks the leader's
+        // input (else a near duplicate, near reuse on).
+        let mut followers: Vec<(usize, Arc<Slot>, bool)> = Vec::new();
         let mut guard = FlightGuard {
             flights: &inner.flights,
             mine: Vec::new(),
@@ -1186,17 +1324,16 @@ impl Escalator for Cascade {
                 let phi = phis[i];
                 let found = fl.iter().find(|f| {
                     f.scope == scopes[i]
-                        && f.phi_p.len() == phi.len()
-                        && dot(&f.phi_p, phi) >= cfg.cache.threshold
+                        && reuses(cfg.cache.threshold, &f.input, &f.phi_p, &inputs[i], phi)
                 });
                 if let Some(f) = found {
-                    followers.push((i, Arc::clone(&f.slot)));
+                    followers.push((i, Arc::clone(&f.slot), f.input == inputs[i]));
                     continue;
                 }
                 // A leader that finished between the first cache lookup and
                 // this registration left its answer in the cache.
                 if cfg.cache.enabled
-                    && let Some((a, _)) = inner.cache.lock().recheck(&scopes[i], phi)
+                    && let Some((a, _)) = inner.cache.lock().recheck(&scopes[i], &inputs[i], phi)
                 {
                     out[i] = Some(Resolved::new(Resolution::Cache(a)));
                 } else {
@@ -1205,7 +1342,8 @@ impl Escalator for Cascade {
                     fl.push(Flight {
                         id,
                         scope: scopes[i].clone(),
-                        phi_p: phi.clone(),
+                        input: inputs[i],
+                        phi_p: phi.to_vec(),
                         slot: Arc::clone(&slot),
                     });
                     guard.mine.push((id, slot));
@@ -1247,18 +1385,13 @@ impl Escalator for Cascade {
                         });
                         guard.mine[k].1.set(Resolution::Oracle(v.clone()));
                         if cfg.cache.enabled {
-                            let entry = CacheEntry {
+                            inner.cache_put(CacheEntry {
                                 scope: scopes[i].clone(),
-                                phi_p: phis[i].clone(),
+                                input: Some(inputs[i]),
+                                phi_p: phis[i].to_vec(),
                                 answer: v.clone(),
                                 ts,
-                            };
-                            let stored = inner.cache.lock().put(entry.clone());
-                            if stored
-                                && let Err(err) = inner.log.append(&LogRecord::CachePut(entry))
-                            {
-                                tracing::error!(error = %err, "learn.log: cache put not recorded");
-                            }
+                            });
                         }
                         let p = &e.pending[i];
                         if !cfg.learning.enabled {
@@ -1349,9 +1482,28 @@ impl Escalator for Cascade {
 
         // Followers wait for their leader.
         let wait = Duration::from_secs_f64(cfg.oracle.escalation_deadline_s()) + FOLLOWER_GRACE;
-        for (i, slot) in followers {
+        for (i, slot, same_input) in followers {
             let r = match slot.wait(wait) {
-                Some(Resolution::Oracle(a)) => Resolution::Cache(a),
+                Some(Resolution::Oracle(a)) => {
+                    // The answer to this very question (the leader's input):
+                    // cached and logged as an oracle answer is (0.8.11; the
+                    // leader's put and this one dedup, whichever comes
+                    // first). A near duplicate's is not: the oracle never
+                    // read its input, and an entry under its digest would
+                    // answer it exactly, also once near reuse is off —
+                    // its repeat hits the leader's entry while near reuse
+                    // is on. Learned it is not: the leader's call taught.
+                    if cfg.cache.enabled && same_input {
+                        inner.cache_put(CacheEntry {
+                            scope: scopes[i].clone(),
+                            input: Some(inputs[i]),
+                            phi_p: phis[i].to_vec(),
+                            answer: a.clone(),
+                            ts: now_unix(),
+                        });
+                    }
+                    Resolution::Cache(a)
+                }
                 Some(other) => other,
                 None => Resolution::Failed("single-flight wait timed out".into()),
             };
@@ -1368,6 +1520,29 @@ impl Escalator for Cascade {
                 .collect(),
             usage,
         }
+    }
+
+    /// The cache alone (0.8.11): a request the service's consent checks
+    /// refused is answered with what the cache holds — no call, nothing
+    /// sent, no single flight, nothing learned, no sighting — and its misses
+    /// are refused with `refused`.
+    fn resolve_without_oracle(
+        &self,
+        e: &Escalation<'_>,
+        refused: RefusalReason,
+    ) -> EscalationResult {
+        let (resolved, _) = self.inner.answer_from_cache(&QuestionKeys::of(e), refused);
+        EscalationResult {
+            resolved,
+            usage: OracleUsage::default(),
+        }
+    }
+
+    /// The cache is on and holds something: an empty cache answers
+    /// nothing, so a request without consent then fails before any work
+    /// as before 0.8.11.
+    fn answers_without_oracle(&self) -> bool {
+        self.inner.cfg.cache.enabled && !self.inner.cache.lock().is_empty()
     }
 
     fn feedback(&self, fb: &FeedbackRequest, principal: &Principal) -> Result<Value, ApiError> {

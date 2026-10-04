@@ -34,24 +34,71 @@ says first whether it is ready — [Check your setup](#check-your-setup)).
    [Who may use it](#who-may-use-it-and-who-teaches)); the request consents
    (`cmf.oracle`, the router's `options.allow_oracle`, else
    `oracle.default_per_request`); budget is left; no stop rule fired.
-   Otherwise a trained question stays `abstain` with a flag (`oracle_disabled`,
+   Otherwise the question is still looked up in the cache (step 3; since
+   0.8.11): a hit is answered `action: cache`, `decision_path
+   escalate→cache`, with no call and nothing sent. Only a miss is refused:
+   a trained question stays `abstain` with a flag (`oracle_disabled`,
    `no_key` beside `oracle_disabled` when the key variable is not set,
    `bad_key` beside it when the variable holds something that is not a key,
    `consent_off`, `budget`, `stopped`) and, on the decisions API, a one-line
    `cmf.hint` that says what to do (the router API keeps its answer and its
    flags as they were — a missing key is `oracle_disabled` there — and the
-   server logs the hint); an untrained question fails with 422 or 503.
-3. **Semantic cache.** Within the same scope — the question's contract
+   server logs the hint); an untrained question fails with 422 or 503, and
+   the error names every untrained question of the request — also those
+   the cache answered — so it never tells which of them the cache holds.
+3. **Cache, exact first.** Within the same scope — the question's contract
    (type, instructions and criteria), and for a question matched to a skill
-   also the skill and the set of options — a stored oracle answer whose text
-   embedding has cosine ≥ 0.97 with the new one is reused: `action: cache`,
-   cost 0. Up to 50000 entries, ring buffer. The cache is shared by all
-   accounts: an answer given under one caller's instructions is never served
-   to a question with other instructions or criteria, and a `cache` answer
-   tells its caller that some account asked a near-identical text under the
-   same contract.
+   also the skill and the set of options — a stored oracle answer to the
+   *same input* is reused: `action: cache`, cost 0. The input is the sha256
+   of the whole state as asked (canonical JSON, before PII redaction; for a
+   state-less question its whole instructions, the lead-in line included),
+   not the text embedding, which reads only the first 512 tokens and barely
+   moves when one number of a JSON state changes. Up to 50000 entries, ring
+   buffer. The cache is shared by all accounts: an answer given under one
+   caller's instructions is never served to a question with other
+   instructions or criteria, and a `cache` answer tells its caller that some
+   account asked the same text under the same contract.
+   * **Near reuse is opt-in** (since 0.8.11): with `cache.threshold` below
+     1, an answer whose text embedding has cosine ≥ the threshold with the
+     new one is reused too (0.97 was the default before 0.8.11). The default
+     1 turns it off: decision states that look alike often differ in the
+     detail that decides (a note in a JSON score, a number in a causal
+     question, one address in an e-mail), and at 0.97 a Decision Index run
+     through the gateway answered ~60k of 282k questions with another row's
+     oracle answer (index 58 → 51.9). Turn it on only for traffic whose
+     paraphrases share their answer (intent routing of short texts).
+   * **Entries written before 0.8.11** carry no input digest: they are
+     reused for an embedding cosine ≥ `cache.legacy_cos` (default 0.9999,
+     the repeat of a text as far as the encoder reads it), or at the
+     threshold with near reuse on. That is not exact: two states that
+     differ only past the encoder's 512 tokens, or two state-less questions
+     that differ only in their lead-in line, have cosine 1. On such a state
+     directory set `cache.legacy_cos: 1`: the old entries are not loaded and
+     answer nothing (their records stay in `learn.log` beside the examples
+     and contracts), so the next oracle pass asks each question once and
+     stores its answer with its digest. Re-running the pass without it
+     changes nothing: an old entry still answers first.
+   * **Without the oracle.** The cache is consulted for every escalated
+     question, also when the oracle may not be called for it: a key with
+     `oracle_allowed: false`, `cmf.oracle: false` (the router's
+     `allow_oracle: false`), `oracle.enabled: false`, the admin switch off,
+     a stop rule or an exhausted budget (and `cortiq decide --oracle`
+     without a usable key, from its state directory's cache, read only). A
+     hit costs nothing and sends nothing, so after an oracle pass the same
+     questions are answered without it; a miss is refused as before (the
+     flag, 422 or 503; the error names every untrained question). Like any
+     hit, it tells such a caller that some account asked the same text
+     under the same contract. Neither the admin switch nor a stop rule
+     stops cached answers; only `cache.enabled: false` (a restart) does,
+     with the rest of the cache.
 4. **Single flight.** A question already in flight in another request (same
-   scope, cosine ≥ 0.97) waits for that call instead of making its own.
+   scope and the same input; with near reuse on, cosine ≥ `cache.threshold`)
+   waits for that call instead of making its own. A follower of the same
+   input is answered by the leader's entry, cached and kept in `learn.log`,
+   so its repeat is a hit after a restart as well. A near duplicate's
+   follower (near reuse on) gets the leader's answer but nothing is stored
+   under its own input — the oracle never read it; while near reuse is on
+   its repeat hits the leader's entry, and with it off it is asked.
 5. **One call** carries all remaining questions of the request: `POST
    {base_url}/chat/completions` with a strict JSON-schema answer (an enum of
    the option ids for choice, an integer level for score, a boolean for noul)
@@ -335,6 +382,11 @@ verdict, a 10-level score 39, a noul 10.
 record; an entry without one keeps the 0.8.7 `CachePut` record, and every
 0.8.7 `CachePut` replays as one-hot. A 0.8.7 binary stops replaying at the
 first `CachePutP`: never run an older binary on a newer state directory.
+Since 0.8.11 a cache entry's input digest rides in the scope field of the
+same two records (`exact:<sha256>|<scope>`): records of 0.8.9 and older
+replay unchanged (as entries without a digest), and a 0.8.9 binary reads
+the new records as entries of a scope it never looks up (they never hit)
+instead of stopping its replay.
 
 ## Reasoning
 
@@ -390,7 +442,10 @@ same question waits for both.
   working oracle — and its reservation counts as likely unbilled.
 * `GET /v1/admin/oracle` shows spent, reserved, remaining, calls, failures and
   the stop reason; `POST /v1/admin/oracle` can switch the oracle and lower
-  `budget_usd` / `max_calls` within the configured values.
+  `budget_usd` / `max_calls` within the configured values. Since 0.8.11 the
+  switch and the stop rules stop calls only: answers already in the cache
+  are still served (step 3); `cache.enabled: false` and a restart stop
+  those.
 
 ## What leaves the machine
 
@@ -419,10 +474,13 @@ same question waits for both.
 * **Never sent**: accepted questions, other questions of the request, client
   keys, accounts, vectors.
 * **Kept on disk** in the state directory: vectors and hashed features of
-  learned examples and cached answers, the oracle ledger (no texts), usage
+  learned examples and cached answers, since 0.8.11 the sha256 of each cached
+  question's input as asked (the whole state, or a state-less question's
+  instructions, before PII redaction), the oracle ledger (no texts), usage
   records (no texts). Hashed n-gram features can show whether a known text was
-  seen, so treat the state directory as sensitive (it is created with mode
-  0700).
+  seen, and an input's sha256 confirms a known text exactly (a short e-mail,
+  a phone number, a card number guessed and hashed), so treat the state
+  directory as sensitive (it is created with mode 0700).
 * The OpenRouter key is read from the environment variable named by
   `oracle.api_key_env`; it is never written to the configuration, the model,
   the state or the logs.
@@ -704,11 +762,15 @@ jq -c '{answer, action, source, oracle_cost_usd, flags}' results.jsonl
   summary on stderr. For one text, `--json` carries `action` and `source`
   in `cmf.questions.task`, the call's cost in `cmf.usage.oracle` and the
   run's status, spend and budget in `cmf.oracle`.
-* **Without a usable key** a rejected text abstains with `no_key` (or
-  `bad_key`) and the hint `OPENROUTER_API_KEY is not set (decide --oracle
-  reads the key from the environment): export …`; nothing is sent and no
-  state directory is made. Labels no skill has can only be answered by the
-  oracle, so there the same words end the run with an error.
+* **Without a usable key** a rejected text the state directory's cache
+  holds (the oracle answered the same text in an earlier run, or a server
+  on that directory did) is answered from it, `action: cache` (since
+  0.8.11; the directory is only read — no `LOCK`, nothing written); any
+  other rejected text abstains with `no_key` (or `bad_key`) and the hint
+  `OPENROUTER_API_KEY is not set (decide --oracle reads the key from the
+  environment): export …`. Nothing is sent and no state directory is made.
+  Labels no skill has can only be answered by the oracle or its cache, so
+  there the same words end the run with an error on a miss.
 * `--oracle-budget USD` (default $1.00) and `--oracle-max-calls N` cap each
   run; the rows past the cap abstain with the flag `budget`. A budget that
   cannot hold the run's first call — 0 included — is `budget_too_small`
@@ -777,7 +839,10 @@ warning: removed the LOCK of state directory cortiq-decision.cmf.state left by p
   means "required unless loopback").
 * **Keys**: `cortiq decision keys create` makes keys that may use the oracle
   (`oracle_allowed: true`, like imported router keys); `--oracle-allowed=false`
-  makes one that never escalates, and `--oracle-budget-usd` caps one key's
+  makes one that never calls the oracle — since 0.8.11 its undetermined
+  questions are still answered from the shared cache when it holds the same
+  question (other accounts' oracle answers; only `cache.enabled: false`
+  turns that off) — and `--oracle-budget-usd` caps one key's
   oracle spending. Teaching the shared skills is a separate permission,
   `--learning-allowed` (off by default); it alone lets a caller's untrained
   contracts become [auto-skills](#auto-skills). Keys made through `POST
@@ -818,7 +883,7 @@ cat > oracle-server.json <<'EOF'
     "max_errors": 30,
     "redact_pii": true
   },
-  "cache": {"enabled": true, "threshold": 0.97},
+  "cache": {"enabled": true, "threshold": 1.0, "legacy_cos": 0.9999},
   "learning": {"enabled": true, "refit_min_new": 25}
 }
 EOF

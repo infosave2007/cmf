@@ -230,6 +230,13 @@ fn choice(labels: &[&str]) -> Value {
     json!({"type": "choice", "instructions": "Which topic?", "criteria": c})
 }
 
+/// [`choice`] whose descriptions are the labels themselves: the evidence a
+/// subset of fewer than three one-word labels needs (DESIGN C2.1).
+fn named(labels: &[&str]) -> Value {
+    let c: Map<String, Value> = labels.iter().map(|l| (l.to_string(), json!(l))).collect();
+    json!({"type": "choice", "instructions": "Which topic?", "criteria": c})
+}
+
 fn body(state: Value, questions: Value, cmf: Option<Value>) -> Vec<u8> {
     let mut v = json!({"model": "cortiq/decision", "state": state, "questions": questions});
     if let Some(c) = cmf {
@@ -541,11 +548,7 @@ fn subset_is_decided_over_its_options_only() {
     let s = ev.scorer();
     let sub = ["travel", "Weather"];
     for (text, _) in toy().dev.iter().take(12) {
-        let d = run(
-            &svc,
-            &body(json!(text), json!({"task": choice(&sub)}), None),
-        )
-        .unwrap();
+        let d = run(&svc, &body(json!(text), json!({"task": named(&sub)}), None)).unwrap();
         let o = &d.questions[0];
         assert_eq!(o.matched.kind, MatchKind::Subset);
         assert_eq!(o.matched.skill.as_deref(), Some("topics"));
@@ -579,6 +582,80 @@ fn subset_is_decided_over_its_options_only() {
     }
 }
 
+/// A subset needs evidence that the question is the skill's task (DESIGN
+/// C2.1), here through the served model (the skill's rubric reaches the
+/// matcher). Two one-word option ids need their own names or the skill's
+/// rubric criteria as descriptions: `null` and descriptions that merely
+/// contain the word ("about travel") are no evidence (422, the reason names
+/// the refused subset), and the route instructions are no evidence for a
+/// skill with a rubric; `cmf.skill` and the rubric's instructions are. From
+/// three ids on, `null` descriptions keep the match by ids.
+#[test]
+fn a_two_option_subset_needs_evidence_of_the_task() {
+    let svc = service();
+    let text = json!(toy().dev[0].0);
+    let with = |ids: &[&str], instructions: &str, describe: &dyn Fn(&str) -> Value| {
+        let c: Map<String, Value> = ids.iter().map(|l| (l.to_string(), describe(l))).collect();
+        json!({"type": "choice", "instructions": instructions, "criteria": c})
+    };
+    let silent = |_: &str| Value::Null;
+    let pair = ["travel", "Weather"];
+    for (task, why) in [
+        (
+            with(&pair, "Which topic?", &silent),
+            "the single word 'travel'",
+        ),
+        (choice(&pair), "the single word 'travel'"),
+        (
+            with(
+                &pair,
+                cortiq_decision::service::DEFAULT_ROUTE_INSTRUCTIONS,
+                &silent,
+            ),
+            "the single word 'travel'",
+        ),
+    ] {
+        let e = run(&svc, &body(text.clone(), json!({ "task": task }), None)).unwrap_err();
+        assert_eq!((e.status, e.reason), (422, Reason::UnsupportedQuestion));
+        let q = &e.details.as_deref().unwrap()["questions"]["task"];
+        assert_eq!(q["match"], "untrained");
+        let r = q["reason"].as_str().unwrap();
+        assert!(
+            r.contains("subset of skill 'topics'") && r.contains(why),
+            "{r}"
+        );
+    }
+    let matched = |b: Vec<u8>| run(&svc, &b).unwrap().questions[0].matched.clone();
+    // The labels themselves, or the rubric's criteria verbatim.
+    let criterion = |l: &str| json!(format!("The message is about {l}."));
+    for task in [named(&pair), with(&pair, "Which topic?", &criterion)] {
+        let m = matched(body(text.clone(), json!({ "task": task }), None));
+        assert_eq!(
+            (m.kind, m.skill.as_deref()),
+            (MatchKind::Subset, Some("topics"))
+        );
+    }
+    // `cmf.skill`, the rubric's instructions.
+    for (instructions, cmf) in [
+        ("Which topic?", Some(json!({"skill": "topics"}))),
+        ("Which topic is the message about?", None),
+    ] {
+        let m = matched(body(
+            text.clone(),
+            json!({"task": with(&pair, instructions, &silent)}),
+            cmf,
+        ));
+        assert_eq!(m.kind, MatchKind::Subset, "{instructions}");
+    }
+    // Three ids: the ids are the evidence.
+    let m = matched(body(
+        text.clone(),
+        json!({"task": with(&["travel", "Weather", "cards"], "Which topic?", &silent)}),
+        None,
+    ));
+    assert_eq!(m.kind, MatchKind::Subset);
+}
+
 #[test]
 fn superset_untrained_forced_and_ambiguous() {
     let svc = service();
@@ -607,12 +684,13 @@ fn superset_untrained_forced_and_ambiguous() {
         e.details.as_deref().unwrap()["questions"]["task"]["match"],
         "untrained"
     );
-    // Ambiguous: {billing, cards} is a subset of both skills.
+    // Ambiguous: {billing, cards} is a subset of both skills (named, the
+    // evidence of each, DESIGN C2.1).
     let e = run(
         &svc,
         &body(
             text.clone(),
-            json!({"task": choice(&["billing", "cards"])}),
+            json!({"task": named(&["billing", "cards"])}),
             None,
         ),
     )
@@ -675,7 +753,7 @@ fn superset_untrained_forced_and_ambiguous() {
         &svc,
         &body(
             json!({"message": toy().dev[0].0}),
-            json!({"a": choice(&TOPICS), "b": choice(&["cards", "travel"])}),
+            json!({"a": choice(&TOPICS), "b": named(&["cards", "travel"])}),
             None,
         ),
     )
