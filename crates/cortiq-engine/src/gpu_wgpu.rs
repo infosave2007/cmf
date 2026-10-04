@@ -37493,6 +37493,78 @@ pub fn q8_ffn_packed(
     fused_gemm_from_device(model, w2, &act, b, hidden, inter, out)
 }
 
+/// The LLM prefill's dense FFN with separate gate, up and down weights in
+/// any codec that has a device GEMM (`q8_row`, `q8_2f`, `q4tp`, mixed): the
+/// gate and up panels stay on the card, the activation folds them there
+/// (`ffn_silu_mul`: 0 SiLU, 1 exact GELU), and down reads the folded panel
+/// from the card. One readback instead of three, and no host pass over the
+/// two b·inter panels — which on a q8_2f prefill cost more than the GEMMs.
+#[allow(clippy::too_many_arguments)]
+pub fn ffn_act_keep(
+    model: &Arc<CmfModel>,
+    w1: usize,
+    w3: usize,
+    w2: usize,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    inter: usize,
+    act: u32,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let panel = (b * inter * 4) as u64;
+    if b == 0
+        || act > 1
+        || xs.len() < b * hidden
+        || out.len() < b * hidden
+        || panel > PANEL_BUDGET_BYTES as u64
+    {
+        return false;
+    }
+    // `fused_panel_keep` hands back the shared result scratch, which the up
+    // projection reuses: the gate panel moves to a buffer of its own first.
+    let Some(g_scratch) = fused_panel_keep(model, w1, xs, b, inter, hidden) else {
+        return false;
+    };
+    let g = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("ffnact-g"),
+        size: panel,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("ffnact-g"),
+        });
+    enc.copy_buffer_to_buffer(&g_scratch, 0, &g, 0, panel);
+    c.queue.submit(Some(enc.finish()));
+    let Some(u) = fused_panel_keep(model, w3, xs, b, inter, hidden) else {
+        return false;
+    };
+    let p = uniform_u32x4(c, [(b * inter) as u32, 0, 0, act]);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("ffnact-act"),
+        layout: &c.ffn_silu.get_bind_group_layout(0),
+        entries: &[bind_buf(0, &g), bind_buf(1, &u), bind_buf(2, &p)],
+    });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("ffnact-act"),
+        });
+    {
+        let mut pass = begin_pass_with(&mut enc, Some("ffnact-act"), None);
+        pass.set_pipeline(&c.ffn_silu);
+        pass.set_bind_group(0, &bind, &[]);
+        let wgs = ((b * inter) as u32).div_ceil(256);
+        pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
+    }
+    c.queue.submit(Some(enc.finish()));
+    fused_gemm_from_device(model, w2, &g, b, hidden, inter, out)
+}
+
 /// The FFN pair for whichever codec the container is packed in.
 #[allow(clippy::too_many_arguments)]
 pub fn ffn_packed(
