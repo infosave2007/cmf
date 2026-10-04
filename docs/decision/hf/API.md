@@ -358,14 +358,15 @@ curl -s "$CORTIQ/api/alpha/decisions" \
 
 ### 3.2 Skill matching and `certified`
 
-The local model looks at the option ids first (instructions matter to the
-oracle alone; descriptions only through the description match below). With
-L = the option ids of a choice question:
+The local model looks at the option ids first (instructions and
+descriptions matter to it only through the description match and as the
+evidence of a subset, both below). With L = the option ids of a choice
+question:
 
 | Match | When | Decided by |
 |---|---|---|
 | `exact` | L equals the active labels of exactly one skill | that skill's certified gate |
-| `subset` | L is a strict subset (at least 2) of one skill's labels | argmin, softmax, margin and novelty over L only; the same T, θ, τ; never certified |
+| `subset` | L is a strict subset (at least 2) of one skill's labels, with evidence that the question is that skill's task (below) | argmin, softmax, margin and novelty over L only; the same T, θ, τ; never certified |
 | `superset` | one skill's labels plus labels it does not know | the oracle only; its answer teaches that skill only for a key with `learning_allowed` |
 | `untrained` | anything else, and every `score` / `noul` question | the oracle only; without it the request is 422 |
 
@@ -395,6 +396,38 @@ way. On the published model, the kit's rows read this way (the lead-in
 line dropped, section 3.1): BANKING77 macro-F1 0.933 (0.854 with the
 lead-in), CLINC150+OOS 0.929 with the gate's rejections as out of scope
 (0.384 with the lead-in); no threshold tuned on those rows.
+
+**Subset evidence (0.8.10).** A subset names only part of a skill's
+labels, so it is taken as the skill's task only with evidence; by ids or
+by descriptions, one of:
+
+- *the skill's own question*: `cmf.skill` names the skill; the
+  instructions are the skill's rubric's (for a skill without a rubric, the
+  `Classify the input into exactly one of the task labels.` of its route
+  question); every listed option is described by the skill's rubric
+  criterion of its label, verbatim (`GET /v1/skills/{id}` shows them); or
+  the listed labels are the skill's whole trained label set — the exact
+  question it was built for stays its own after it learns a new label;
+- *specific labels*: **polar answers** (`yes`, `no`, `maybe`, `true`,
+  `false`, compared as descriptions are) count for nothing — they answer
+  every yes/no question, and an intent skill that has them as intents
+  (`clinc150`: the user affirms, denies) does not answer questions about a
+  state. Three other listed labels are evidence by their ids, whatever the
+  descriptions (the example of 3.1). Fewer must each be specific: a
+  compound id (two words or more, such as `card_arrival` — the examples of
+  3.1, `/v1/feedback` and the System One adapter), or a one-word id whose
+  description is its own name (`"alarm": "Alarm"`; a description match is
+  so by construction) or the skill's criterion. A description that merely
+  contains the word (`"alarm": "Set an alarm"`, `"date": "a value of type
+  date"`) or `null` is no evidence for a one-word id; one label alone next
+  to polar answers or a none option must be compound.
+
+A subset without evidence is `untrained` — the oracle answers it, it may be
+learned as an auto-skill of its own contract, and without an oracle the
+422 reason names the refused subset (name the skill with `cmf.skill` to use
+it anyway). `cortiq decide --labels` names the skill its labels resolve to.
+Before 0.8.10 every `{yes, no}` question was a `clinc150` subset, decided by
+the intent classifier.
 
 **Auto-skills (0.8.6).** A choice question no skill fits (`untrained` because
 of its options, not an ambiguous one and not one forced with `cmf.skill`) is

@@ -1910,9 +1910,18 @@ fn single_request(model: &LoadedModel, a: &DecideArgs, text: &str) -> Result<Val
             || Value::String(server::DEFAULT_ROUTE_INSTRUCTIONS.to_string()),
             |r| r.instructions,
         );
+        // `--labels` alone: the data skill they name (exact or subset, spec
+        // §4.5), named with `cmf.skill` — the labels are that skill's own
+        // question, which a subset must show (DESIGN C2.1). Labels no skill
+        // has, ambiguous or superset ones go as they are: the service says
+        // why, or the oracle answers.
+        let forced = a.skill.clone().or_else(|| {
+            let labels: Vec<&str> = a.labels.iter().map(String::as_str).collect();
+            cortiq_decision::matching::skill_for_labels(&model.skill_labels(), &labels).ok()
+        });
         (
             json!({"type": "choice", "instructions": instructions, "criteria": criteria}),
-            a.skill.clone(),
+            forced,
         )
     };
     let mut body = json!({
