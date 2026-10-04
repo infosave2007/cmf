@@ -2417,6 +2417,9 @@ pub fn chunk_attend_mirror(
 ) -> bool {
     match backend() {
         #[cfg(feature = "gpu")]
+        // QKᵀ and P·V on the matrix units where the device has them (f16
+        // operands, f32 accumulators — not bit-identical to the f32
+        // kernels); `CMF_PREFILL_ATTN_COOP=0` keeps the f32 ones (A/B).
         Backend::Wgpu => crate::gpu_wgpu::chunk_attend_mirror(
             t.kv_id,
             t.layer,
@@ -2432,6 +2435,7 @@ pub fn chunk_attend_mirror(
             scale,
             ring,
             window,
+            std::env::var("CMF_PREFILL_ATTN_COOP").as_deref() != Ok("0"),
             out,
         ),
         #[allow(unreachable_patterns)]
