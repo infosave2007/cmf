@@ -1234,7 +1234,7 @@ fn softplus(x: f32) -> f32 {
     x.max(0.0) + (-x.abs()).exp().ln_1p()
 }
 
-fn apply_projected_gate(
+pub(crate) fn apply_projected_gate(
     ao: &mut [f32],
     raw: &[f32],
     per_head: bool,
