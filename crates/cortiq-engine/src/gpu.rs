@@ -1574,6 +1574,11 @@ pub enum GraphAttn<'a> {
         /// context and a plain softmax — the historical contract, whose
         /// kernels and dispatch are untouched.
         geom: Option<GraphAttnGeom<'a>>,
+        /// Spark-X2.5 head-wise output gate: `self_attn.g_proj`
+        /// `[num_heads, hidden]` against the attention's normed input; head
+        /// h's output is scaled by sigmoid(g[h]) before the O projection.
+        /// None = no such gate (every other model).
+        head_gate: Option<GraphW<'a>>,
     },
     Gdn {
         qkv: GraphW<'a>,
@@ -1640,6 +1645,26 @@ pub struct GraphAttnGeom<'a> {
     pub sink: Option<&'a [f32]>,
 }
 
+/// Activation of a graph layer's dense FFN, `act(gate)·up`. The code is
+/// the word the kernels read (`silu_mul_pre`'s `_c`, the fused gate+up
+/// kernels' `_p1`): 0 keeps the historical SiLU expression untouched.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphAct {
+    Silu,
+    /// Exact erf GELU (HF `gelu`), erf by Abramowitz–Stegun 7.1.26 — the
+    /// formula `inference::erf_f32` uses on the host.
+    GeluErf,
+}
+
+impl GraphAct {
+    pub fn code(self) -> u32 {
+        match self {
+            Self::Silu => 0,
+            Self::GeluErf => 1,
+        }
+    }
+}
+
 /// Per-layer weights for the whole-token wgpu graph.
 pub struct GraphLayer<'a> {
     pub input_norm: &'a [f32],
@@ -1660,6 +1685,9 @@ pub enum GraphFfn<'a> {
         gate: GraphW<'a>,
         up: GraphW<'a>,
         down: GraphW<'a>,
+        /// act(gate)·up. The builders refuse an activation with no arm here
+        /// (before this field the graph computed SiLU for any dense FFN).
+        act: GraphAct,
     },
     Moe {
         /// Router logits weight (f32, kind 4) `[n_exp, hidden]`.
@@ -2350,6 +2378,47 @@ pub fn q4tp_ffn(
         Backend::Wgpu => crate::gpu_wgpu::q4tp_ffn(model, w1, w3, w2, xs, b, hidden, inter, out),
         #[allow(unreachable_patterns)]
         _ => false,
+    }
+}
+
+/// `q4tp_ffn` (`q4tp` = true) / `q4t_ffn` with the activation named:
+/// SiLU takes the plain entry points (every backend), the exact GELU of
+/// Spark-X2.5 has a wgpu arm only — other backends decline it.
+#[allow(clippy::too_many_arguments, unused_variables)]
+pub fn q4_ffn_act(
+    model: &Arc<CmfModel>,
+    w1: usize,
+    w3: usize,
+    w2: usize,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    inter: usize,
+    q4tp: bool,
+    act: GraphAct,
+    out: &mut [f32],
+) -> bool {
+    match act {
+        GraphAct::Silu if q4tp => q4tp_ffn(model, w1, w3, w2, xs, b, hidden, inter, out),
+        GraphAct::Silu => q4t_ffn(model, w1, w3, w2, xs, b, hidden, inter, out),
+        GraphAct::GeluErf => match backend() {
+            #[cfg(feature = "gpu")]
+            Backend::Wgpu => crate::gpu_wgpu::q4_ffn_act(
+                model,
+                w1,
+                w3,
+                w2,
+                xs,
+                b,
+                hidden,
+                inter,
+                q4tp,
+                act.code(),
+                out,
+            ),
+            #[allow(unreachable_patterns)]
+            _ => false,
+        },
     }
 }
 

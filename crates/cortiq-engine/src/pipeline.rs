@@ -521,6 +521,17 @@ impl Act {
             _ => self.apply(g) * u,
         }
     }
+
+    /// The wgpu graphs' arm for this activation; None = no device kernel
+    /// computes it, and the graph builder must refuse the layer (the dense
+    /// graph FFN once computed SiLU for whatever the model asked for).
+    pub fn graph_act(self) -> Option<crate::gpu::GraphAct> {
+        match self {
+            Self::Silu => Some(crate::gpu::GraphAct::Silu),
+            Self::Gelu => Some(crate::gpu::GraphAct::GeluErf),
+            Self::GeluTanh | Self::Situ { .. } => None,
+        }
+    }
 }
 
 /// Dense gated triple — the FFN of a dense layer or of one expert.
@@ -6143,12 +6154,14 @@ impl Pipeline {
                 cpu_k: m.kv.k_heads(),
                 cpu_v: m.kv.v_heads(),
                 geom: None,
+                head_gate: None,
             },
             post_norm: &lw.post_norm,
             ffn: crate::gpu::GraphFfn::Dense {
                 gate: gw(&d.gate_proj)?,
                 up: gw(&d.up_proj)?,
                 down: gw(&d.down_proj)?,
+                act: d.act.graph_act()?,
             },
         };
         let nh = self.num_heads;
@@ -6252,6 +6265,13 @@ impl Pipeline {
         if !d.segs.is_empty() {
             return crate::gpu::BatchGraphOutcome::Declined; // tube layers run on the segmented path
         }
+        // The graph has no arm for a projected output gate, and only the
+        // activations `graph_act` names.
+        let (AttnKind::Full { softplus_gate: None, .. }, Some(gact)) =
+            (&lw.attn, d.act.graph_act())
+        else {
+            return crate::gpu::BatchGraphOutcome::Declined;
+        };
         fn gw(t: &QTensor) -> Option<crate::gpu::GraphW<'_>> {
             let (_, i, kind, rs) = t.graph_weight()?;
             Some(crate::gpu::GraphW {
@@ -6295,12 +6315,14 @@ impl Pipeline {
                 cpu_k: m.kv.k_heads(),
                 cpu_v: m.kv.v_heads(),
                 geom: None,
+                head_gate: None,
             },
             post_norm: &lw.post_norm,
             ffn: crate::gpu::GraphFfn::Dense {
                 gate: gg,
                 up: gu,
                 down: gd,
+                act: gact,
             },
         };
         let positions: Vec<usize> = (first_pos..first_pos + pairs.len()).collect();
@@ -8123,7 +8145,12 @@ impl Pipeline {
                     MetalBatchNllOutcome::Failed(err) => return Err(err),
                 }
             }
-            if self.can_prefill_batched() && !graph_quality {
+            // CMF_NLL_SERIAL=1 scores position by position through the
+            // decode path (the wgpu token graph where it admits the model)
+            // — the perplexity gate of a decode kernel, which the batched
+            // prefill arm below never runs.
+            let force_serial = std::env::var("CMF_NLL_SERIAL").as_deref() == Ok("1");
+            if self.can_prefill_batched() && !graph_quality && !force_serial {
                 // prefill-GEMM: layer-major position chunks, lm_head batched
                 // (254MB lm_head read once per chunk, not per position).
                 // The layer chunk is large (grouping positions by MoE experts
@@ -10273,6 +10300,7 @@ impl Pipeline {
                     cpu_k: self.kv_cache.layers[li].k_heads(),
                     cpu_v: self.kv_cache.layers[li].v_heads(),
                     geom: self.graph_attn_geom(li),
+                    head_gate: None,
                 },
             };
             let (nkv, hd, rd) = self.layer_geom(li);
@@ -10821,11 +10849,24 @@ impl Pipeline {
                 // A tube layer is several matrices, not one — the
                 // whole-layer graph has no shape for it yet.
                 FfnKind::Dense(d) if !d.segs.is_empty() => return None,
-                FfnKind::Dense(d) => crate::gpu::GraphFfn::Dense {
-                    gate: gw(&d.gate_proj)?,
-                    up: gw(&d.up_proj)?,
-                    down: gw(&d.down_proj)?,
-                },
+                FfnKind::Dense(d) => {
+                    // An activation the graph has no kernel arm for keeps
+                    // the CPU/per-op owner, by name — the dense graph FFN
+                    // used to compute SiLU for whatever the model asked.
+                    let Some(act) = d.act.graph_act() else {
+                        self.note_graph_decline(
+                            "wgpu token graph",
+                            "dense FFN activation without a graph kernel",
+                        );
+                        return None;
+                    };
+                    crate::gpu::GraphFfn::Dense {
+                        gate: gw(&d.gate_proj)?,
+                        up: gw(&d.up_proj)?,
+                        down: gw(&d.down_proj)?,
+                        act,
+                    }
+                }
                 FfnKind::Moe(m) => {
                     // Adaptive τ and expert masks keep the CPU path, where
                     // they are implemented. Sigmoid routing with a selection
@@ -10985,9 +11026,25 @@ impl Pipeline {
                     softplus_gate,
                     bias,
                 } => {
-                    if softplus_gate.is_some() || self.attention_heads_per_layer.is_some() {
+                    if self.attention_heads_per_layer.is_some() {
                         return None;
                     }
+                    // A projected output gate rides the graph in one form:
+                    // Spark-X2.5's head-wise sigmoid (one g_proj row per Q
+                    // head). Laguna's softplus gate keeps the CPU path.
+                    let head_gate = match softplus_gate {
+                        None => None,
+                        Some((g, true)) if self.proj_gate_sigmoid && !*output_gate => {
+                            Some(gw(g)?)
+                        }
+                        Some(_) => {
+                            self.note_graph_decline(
+                                "wgpu token graph",
+                                "projected softplus / per-element output gate",
+                            );
+                            return None;
+                        }
+                    };
                     let (m, _, _, _) = wq
                         .graph_weight()
                         .or_else(|| wq.graph_weight_descriptor())?;
@@ -11007,6 +11064,7 @@ impl Pipeline {
                         cpu_k: self.kv_cache.layers[li].k_heads(),
                         cpu_v: self.kv_cache.layers[li].v_heads(),
                         geom: self.graph_attn_geom(li),
+                        head_gate,
                     }
                 }
                 AttnKind::LinearGdn(w) => {
@@ -12703,11 +12761,23 @@ impl Pipeline {
                         }
                         return None;
                     }
-                    FfnKind::Dense(d) => crate::gpu::GraphFfn::Dense {
-                        gate: gw(&d.gate_proj)?,
-                        up: gw(&d.up_proj)?,
-                        down: gw(&d.down_proj)?,
-                    },
+                    FfnKind::Dense(d) => {
+                        let Some(act) = d.act.graph_act() else {
+                            if batch_debug {
+                                eprintln!(
+                                    "batch graph: dense FFN activation {:?} without a graph kernel at layer {li}",
+                                    d.act
+                                );
+                            }
+                            return None;
+                        };
+                        crate::gpu::GraphFfn::Dense {
+                            gate: gw(&d.gate_proj)?,
+                            up: gw(&d.up_proj)?,
+                            down: gw(&d.down_proj)?,
+                            act,
+                        }
+                    }
                     FfnKind::Moe(m) => {
                         // Adaptive τ and expert masks stay on the CPU path.
                         // Sigmoid scores, the selection bias, a routed scale
@@ -12867,6 +12937,9 @@ impl Pipeline {
                             cpu_k: self.kv_cache.layers[li].k_heads(),
                             cpu_v: self.kv_cache.layers[li].v_heads(),
                             geom: self.graph_attn_geom(li),
+                            // The batched graph has no head-gate arm; a
+                            // gated layer is refused above.
+                            head_gate: None,
                         }
                     }
                     AttnKind::LinearGdn(w) => {
@@ -15857,8 +15930,11 @@ fn dense_ffn_batch(
     // the LLM prefill was simply never wired to it. A task mask needs the
     // activations on the host between the halves, so it keeps the CPU
     // arm below.
+    // SiLU and the exact GELU (Spark-X2.5) have device arms; `q4_ffn_act`
+    // hands SiLU to the very entry points this used to call.
+    let fused_act = d.act.graph_act();
     if mask_row.is_none()
-        && d.act == Act::Silu
+        && fused_act.is_some()
         && b >= 32
         && crate::gpu::enabled_here()
         && !crate::gpu::mm_killed()
@@ -15879,7 +15955,9 @@ fn dense_ffn_batch(
             d.down_proj.mapped_q4t(),
         ) {
             let mut out = vec![0.0f32; b * hidden];
-            if crate::gpu::q4t_ffn(model, w1, w3, w2, xs, b, hidden, inter, &mut out) {
+            let act = fused_act.expect("checked above");
+            if crate::gpu::q4_ffn_act(model, w1, w3, w2, xs, b, hidden, inter, false, act, &mut out)
+            {
                 return out;
             }
         }
@@ -15893,7 +15971,9 @@ fn dense_ffn_batch(
             d.down_proj.mapped_q4tp(),
         ) {
             let mut out = vec![0.0f32; b * hidden];
-            if crate::gpu::q4tp_ffn(model, w1, w3, w2, xs, b, hidden, inter, &mut out) {
+            let act = fused_act.expect("checked above");
+            if crate::gpu::q4_ffn_act(model, w1, w3, w2, xs, b, hidden, inter, true, act, &mut out)
+            {
                 return out;
             }
         }
