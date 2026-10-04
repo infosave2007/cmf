@@ -17277,6 +17277,74 @@ fn gqa_attend_x(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// The decode attend of a head-gated layer (Spark-X2.5's g_proj gate):
+// `gqa_attend_x`'s scores and online softmax, its value pass split four
+// ways — lane = (position quarter lid >> 6, dim quad lid & 63), a quarter of
+// the chunk's positions per lane and four output dims per vec4 load
+// (dv % 4 == 0, dv <= 256) — and the head's sigmoid gate folded into the
+// output write: out = (Σ/l)·σ(g[h]), the host's order. Admitted only for
+// head-gated layers, so every other per-layer-geometry model keeps
+// `gqa_attend_x` to the bit. `ax_v4` is binding 2 seen as vec4 rows (only
+// this entry point reads it), `ax_hg` the per-head gate logits.
+@group(0) @binding(2) var<storage, read> ax_v4 : array<vec4<f32>>;
+@group(0) @binding(8) var<storage, read> ax_hg : array<f32>;
+var<workgroup> ax_acc4: array<vec4<f32>, 256>;
+
+@compute @workgroup_size(256)
+fn gqa_attend_x4g(@builtin(workgroup_id) wid: vec3<u32>,
+                  @builtin(local_invocation_index) lid: u32) {
+    let h = wid.x;
+    if (h >= ax_p.nh) { return; }
+    let n = ax_p.n;
+    let dv4 = ax_p.dv / 4u;
+    let qq = lid >> 6u;
+    let j = lid & 63u;
+    let vbase = (h / ax_p.hpk) * ax_p.cap * dv4;
+    var m = -1.0e30;
+    var l = 0.0;
+    if (ax_p.sink != 0u) {
+        m = ax_sink[h];
+        l = 1.0;
+    }
+    var acc = vec4<f32>(0.0);
+    var c0 = 0u;
+    loop {
+        if (c0 >= n) { break; }
+        let cn = min(256u, n - c0);
+        let cm = ax_scores(h, c0, cn, lid);
+        let mp = max(m, cm);
+        let f = exp(m - mp);
+        let w = select(0.0, exp(ax_sc[lid] - mp), lid < cn);
+        ax_sc[lid] = w;
+        l = l * f + ax_sum(w, lid);
+        acc = acc * f;
+        if (j < dv4) {
+            let s0 = (ax_p.first + c0) % ax_p.cap;
+            var p = qq;
+            loop {
+                if (p >= cn) { break; }
+                acc = acc + ax_sc[p] * ax_v4[vbase + ax_slot(s0, p) * dv4 + j];
+                p = p + 4u;
+            }
+        }
+        m = mp;
+        c0 = c0 + 256u;
+        workgroupBarrier();
+    }
+    ax_acc4[lid] = acc;
+    workgroupBarrier();
+    if (lid < dv4) {
+        let sv = (ax_acc4[lid] + ax_acc4[lid + 64u]) + (ax_acc4[lid + 128u] + ax_acc4[lid + 192u]);
+        let gain = 1.0 / (1.0 + exp(-ax_hg[h]));
+        let o = (sv / l) * gain;
+        let ob = h * ax_p.dv + lid * 4u;
+        ax_o[ob] = o.x;
+        ax_o[ob + 1u] = o.y;
+        ax_o[ob + 2u] = o.z;
+        ax_o[ob + 3u] = o.w;
+    }
+}
+
 // One chunk per workgroup (grid nh × chunks): the chunk's unnormalized
 // value sum and its (max, sum) frame, for gqa_attend_merge_x.
 @compute @workgroup_size(256)
@@ -17480,6 +17548,9 @@ mod attend_x_shader_tests {
 struct GraphX {
     kv_append: wgpu::ComputePipeline,
     attend: wgpu::ComputePipeline,
+    /// `gqa_attend_x4g`: head-gated layers' attend (gate folded in).
+    attend_g: wgpu::ComputePipeline,
+    attend_g_l: wgpu::BindGroupLayout,
     part: wgpu::ComputePipeline,
     merge: wgpu::ComputePipeline,
     q82_b: wgpu::ComputePipeline,
@@ -20213,6 +20284,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
                 px("gqa_attend_merge_x"),
                 px("q8_2f_matvec_b"),
             );
+            let attend_g = px("gqa_attend_x4g");
             let mut q82_short = Vec::new();
             for rows in 1..=4 {
                 let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -20231,6 +20303,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
                 q82_short,
                 kv_l: kv_append.get_bind_group_layout(0),
                 attend_l: attend.get_bind_group_layout(0),
+                attend_g_l: attend_g.get_bind_group_layout(0),
+                attend_g,
                 part_l: part.get_bind_group_layout(0),
                 merge_l: merge.get_bind_group_layout(0),
                 q82_l: q82_b.get_bind_group_layout(0),
@@ -26322,6 +26396,17 @@ pub fn forward_token_graph(
                             ((lnkv * ldv) as u32).div_ceil(256),
                         );
                     }
+                    // Spark-X2.5 head gate logits g = g_proj · n1, beside the
+                    // QKV projections (same input, no dependency on them, so
+                    // no extra barrier). `gout` is free scratch on a
+                    // head-gated layer: it has no Qwen3.5 output gate (the
+                    // builder refuses both), and the rope kernel writes
+                    // `gout` only under that gate's flag.
+                    if let Some(hgm) = hg {
+                        emat(&mut enc, hgm, &n1, &gout, nh, hidden);
+                    }
+                    // true = the attend already scaled each head by its gate.
+                    let mut gate_folded = false;
                     if let Some(views) = o1_here {
                         // O(1) attention: rope as usual, then the three o1
                         // kernels replace kv_append + attend. State mirrors on
@@ -26461,6 +26546,7 @@ pub fn forward_token_graph(
                         // passfuse shortcuts assume the uniform contract
                         // and are never taken here.
                         let gx = c.graph_x.as_ref().expect("checked at admission");
+                        ts_point!(enc, 20); // CMF_GRAPH_TS_ALL: qkv projections
                         let (kbuf, vbuf) = kvbufs[li].as_ref().unwrap();
                         let mcap = xcaps[&li];
                         let slot_u = stp * layers.len() + li;
@@ -26523,6 +26609,7 @@ pub fn forward_token_graph(
                             pass.set_bind_group(0, &bg_kv, &[]);
                             pass.dispatch_workgroups(((g.nkv * hd) as u32).div_ceil(256), 1, 1);
                         }
+                        ts_point!(enc, 22); // rope + kv append
                         if !skip_attn && g.window.is_none() && n > ATTEND_SPLIT_MIN {
                             // Long full-context layer: chunks across
                             // workgroups, then a per-head merge (same pass —
@@ -26566,6 +26653,24 @@ pub fn forward_token_graph(
                             pass.set_pipeline(&gx.merge);
                             pass.set_bind_group(0, &bg_merge, &[]);
                             pass.dispatch_workgroups(nh as u32, 1, 1);
+                        } else if !skip_attn && hg.is_some() {
+                            // Head-gated layer: the split-value attend with
+                            // the gate folded into its output write.
+                            let bg_att = bind_pairs(
+                                c,
+                                &gx.attend_g_l,
+                                &[
+                                    (0, &qout),
+                                    (1, kbuf),
+                                    (2, vbuf),
+                                    (3, &attn),
+                                    (4, atx_u),
+                                    (5, &sink_b),
+                                    (8, &gout),
+                                ],
+                            );
+                            go(&mut enc, &gx.attend_g, &bg_att, nh as u32);
+                            gate_folded = true;
                         } else if !skip_attn {
                             let bg_att = bind_pairs(
                                 c,
@@ -26581,6 +26686,7 @@ pub fn forward_token_graph(
                             );
                             go(&mut enc, &gx.attend, &bg_att, nh as u32);
                         }
+                        ts_point!(enc, 23); // attend
                     } else {
                         let (kbuf, vbuf) = kvbufs[li].as_ref().unwrap();
                         // rope + kv_append are independent (both read kb, neither
@@ -26832,17 +26938,14 @@ pub fn forward_token_graph(
                             ((nh * hd) as u32).div_ceil(256),
                         );
                     }
-                    // Spark-X2.5 head-wise gate: g = g_proj · n1 (the
-                    // attention's normed input, still intact here), then
-                    // head h of the attention output *= sigmoid(g[h]).
-                    // `gout` is free scratch: a head-gated layer has no
-                    // Qwen3.5 output gate (refused by the builder).
-                    if let Some(hgm) = hg {
-                        if attn_done || skip_attn {
-                            graph_decline("head gate on a fused / skipped attention arm");
+                    // Spark-X2.5 head-wise gate, where the attend did not
+                    // fold it in: head h of the attention output *=
+                    // sigmoid(g[h]), g computed beside the QKV projections.
+                    if hg.is_some() && !gate_folded {
+                        if attn_done {
+                            graph_decline("head gate on a fused attention arm");
                             return token_graph_outcome(o1_started || state_started, false);
                         }
-                        emat(&mut enc, hgm, &n1, &gout, nh, hidden);
                         let gm_u = uniform_u32x4(c, [(nh * ldv) as u32, ldv as u32, 0, 0]);
                         go(
                             &mut enc,
@@ -26850,6 +26953,7 @@ pub fn forward_token_graph(
                             &bgc(36, li, &c.layout_gate_mul, &[&gout, &attn, &gm_u]),
                             ((nh * ldv) as u32).div_ceil(256),
                         );
+                        ts_point!(enc, 24); // head gate
                     }
                     if !attn_done {
                         let Some(wo_in) = prism_input(&mut enc, &[wo], &attn, nh * ldv) else {
