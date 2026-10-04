@@ -686,6 +686,9 @@ pub struct QwenAttnCfg<'a> {
     /// HunYuan dense: the per-head q/k RMSNorm runs AFTER RoPE
     /// (`ModelArch::qk_norm_after_rope`). False = norm, then rotate.
     pub qk_norm_after_rope: bool,
+    /// `softplus_gate` applies sigmoid instead of softplus (Spark-X2.5's
+    /// head-wise output gate; Laguna's is softplus).
+    pub gate_sigmoid: bool,
     /// Norm-weight semantics for qk-norm (same as the layer norms).
     pub norm_style: cortiq_core::NormStyle,
     /// Qwen2-family q/k/v projection biases (added after the matvecs).
@@ -1231,17 +1234,30 @@ fn softplus(x: f32) -> f32 {
     x.max(0.0) + (-x.abs()).exp().ln_1p()
 }
 
-fn apply_projected_gate(ao: &mut [f32], raw: &[f32], per_head: bool, head_dim: usize) {
+fn apply_projected_gate(
+    ao: &mut [f32],
+    raw: &[f32],
+    per_head: bool,
+    head_dim: usize,
+    sigmoid: bool,
+) {
+    let act = |g: f32| {
+        if sigmoid {
+            1.0 / (1.0 + (-g).exp())
+        } else {
+            softplus(g)
+        }
+    };
     if per_head {
         for (h, &g) in raw.iter().enumerate() {
-            let gain = softplus(g);
+            let gain = act(g);
             for a in &mut ao[h * head_dim..(h + 1) * head_dim] {
                 *a *= gain;
             }
         }
     } else {
         for (a, &g) in ao.iter_mut().zip(raw) {
-            *a *= softplus(g);
+            *a *= act(g);
         }
     }
 }
@@ -1359,7 +1375,7 @@ pub fn qwen_attention(
     if let (Some(raw), Some((_, per_head))) = (projected.as_deref(), cfg.softplus_gate) {
         // A gate is refused at load when V is narrower than the head
         // (the core output is compacted), so ao is nh·head_dim here.
-        apply_projected_gate(&mut ao, raw, per_head, cfg.head_dim);
+        apply_projected_gate(&mut ao, raw, per_head, cfg.head_dim, cfg.gate_sigmoid);
     }
     let mut out = take_buf(cfg.hidden_size);
     let prof = crate::cpuprof::time(crate::cpuprof::Slot::AttnO);
@@ -1614,7 +1630,7 @@ pub fn qwen_attention_batch(
                 (projected_all.as_deref(), cfg.softplus_gate)
             {
                 let raw = &all[bi * proj.rows()..(bi + 1) * proj.rows()];
-                apply_projected_gate(&mut ao, raw, per_head, hd);
+                apply_projected_gate(&mut ao, raw, per_head, hd, cfg.gate_sigmoid);
             }
             ao_all[bi * nh * hd..(bi + 1) * nh * hd].copy_from_slice(&ao);
             recycle_buf(&mut ao);
@@ -1664,7 +1680,7 @@ pub fn qwen_attention_batch(
                 }
                 if let (Some(all), Some((pj, per_head))) = (proj, cfg.softplus_gate) {
                     let raw = &all[bi * pj.rows()..(bi + 1) * pj.rows()];
-                    apply_projected_gate(ao, raw, per_head, hd);
+                    apply_projected_gate(ao, raw, per_head, hd, cfg.gate_sigmoid);
                 }
             }
         };
@@ -1787,6 +1803,7 @@ pub fn qwen_attention_batch(
                     &all[bi * proj.rows()..(bi + 1) * proj.rows()],
                     per_head,
                     hd,
+                    cfg.gate_sigmoid,
                 );
             }
         }
@@ -1845,7 +1862,7 @@ pub fn qwen_attention_nystrom(
         apply_gate(&mut ao, &p.gate);
     }
     if let (Some(raw), Some((_, per_head))) = (projected.as_deref(), cfg.softplus_gate) {
-        apply_projected_gate(&mut ao, raw, per_head, cfg.head_dim);
+        apply_projected_gate(&mut ao, raw, per_head, cfg.head_dim, cfg.gate_sigmoid);
     }
     let mut out = vec![0.0f32; cfg.hidden_size];
     wo.matvec(&ao, &mut out, cfg.pool);
@@ -1992,8 +2009,8 @@ pub fn qwen_attention_pair(
         let mut g1 = take_buf(proj.rows());
         let mut g2 = take_buf(proj.rows());
         proj.matvec2(h1, h2, &mut g1, &mut g2, cfg.pool);
-        apply_projected_gate(&mut a1, &g1, per_head, hd);
-        apply_projected_gate(&mut a2, &g2, per_head, hd);
+        apply_projected_gate(&mut a1, &g1, per_head, hd, cfg.gate_sigmoid);
+        apply_projected_gate(&mut a2, &g2, per_head, hd, cfg.gate_sigmoid);
         recycle_buf(&mut g1);
         recycle_buf(&mut g2);
     }
@@ -2140,6 +2157,7 @@ mod tests {
             window,
             v_norm: false,
             qk_norm_after_rope: false,
+            gate_sigmoid: false,
             q_norm: None,
             k_norm: None,
             output_gate: false,
@@ -2445,6 +2463,7 @@ mod tests {
             window: None,
             v_norm: false,
             qk_norm_after_rope: false,
+            gate_sigmoid: false,
             q_norm: None,
             k_norm: None,
             output_gate: false,
@@ -2496,6 +2515,7 @@ mod tests {
             window: None,
             v_norm: true,
             qk_norm_after_rope: false,
+            gate_sigmoid: false,
             q_norm: None,
             k_norm: None,
             output_gate: false,
@@ -2559,6 +2579,7 @@ mod tests {
             window: None,
             v_norm: false,
             qk_norm_after_rope: false,
+            gate_sigmoid: false,
             norm_style: cortiq_core::NormStyle::Qwen,
             bias: None,
             pool: None,
@@ -2764,6 +2785,7 @@ mod qk_norm_order_tests {
             window: None,
             v_norm: false,
             qk_norm_after_rope: late,
+            gate_sigmoid: false,
             q_norm: Some(qw),
             k_norm: Some(kw),
             output_gate: false,

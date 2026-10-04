@@ -483,6 +483,7 @@ impl Pipeline {
             window: self.layer_window(li),
             v_norm: self.attn_v_norm,
             qk_norm_after_rope: self.qk_norm_after_rope,
+            gate_sigmoid: false,
             q_norm: None,
             k_norm: None,
             output_gate: false,
