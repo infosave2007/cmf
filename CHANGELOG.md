@@ -5,6 +5,46 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.10] - 2026-10-04
+
+### Added
+- Spark-X2.5 (`model_type: spark2_5`, XHToken/Spark-X2.5-1.7B and -4B):
+  `cortiq convert` maps the checkpoint (`model.embedding` as the tied
+  embedding, the fused `q_k_v_proj` split into q|k|v, `out_proj`, the
+  nested full/sliding RoPE profiles, the 512-token sliding window), and the
+  engine runs its three new parts: the exact erf GELU of the gated MLP
+  (`Act::Gelu`), the head-wise sigmoid output gate `g_proj`, and the
+  per-layer attention geometry (three sliding layers rotating all 256 dims
+  at θ 1e4, then one full layer rotating 64 at θ 5e6). f16 perplexity equals
+  transformers (10.500 at 1024 tokens), and the greedy text is identical.
+- Vulkan: Spark runs on the whole-token graph — GELU arms of the fused
+  gate|up and FFN kernels (the activation code rides in a free uniform word,
+  SiLU paths unchanged), the g_proj matvec beside q|k|v, and the gate folded
+  into the attend (`gqa_attend_x4g`). The builder now refuses an activation
+  with no kernel arm by name instead of computing SiLU for it. RTX 2000 Ada,
+  `bench --core`: 1.7B q8_2f 33 → 85.5 tok/s, 4B q8_2f 11.3 → 40.4, 4B q4tp
+  11.5 → 59. `CMF_NLL_SERIAL=1` scores `ppl` through the decode path.
+- Metal: Spark decodes on the block graph (per-layer RoPE tables and
+  windows in the device attend, `head_gate_sigmoid`, `gelu_mul_pre` and the
+  fused `q4tp_matvec_m_gu_gelu`) and prefills on the chunk graph
+  (`causal_softmax_win`). Only Spark's shape of sliding model is admitted.
+  M4: 1.7B q4tp 41 → 67 tok/s, 4B q4tp 15.9 → 29.6; text identical to the
+  CPU.
+- Server: Spark's tool calls (`<tool_call>NAME<arg_key>K</arg_key>
+  <arg_value>V</arg_value></tool_call>`) become `tool_calls`; a value is a
+  string where the tool's schema says string and parsed JSON otherwise, and
+  the name must be one of the declared tools.
+
+### Fixed
+- Server: a chat template that opens the reasoning block in the prompt
+  (Spark ends the generation prompt in `<think>`) used to return a reply
+  holding only `</think>`; the opener is put back, so the reply reads
+  `<think>…</think>answer` as for other thinking models.
+- Server: `enable_thinking: false` no longer injects its "output only the
+  final answer" system directive when the request offers tools — it talked
+  the model out of calling them (Spark-X2.5-1.7B: 2 of 6 calls with it, 4 of
+  6 without).
+
 ## [0.8.9] - 2026-10-03
 
 ### Changed
