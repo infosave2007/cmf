@@ -9194,6 +9194,7 @@ impl Pipeline {
             #[cfg(feature = "gpu")]
             self.pull_lagging_host_kv(li, li + 1, start_pos);
             let lw = &self.weights.layers[self.phys_layer(li)];
+            let t_attn = std::time::Instant::now();
             // ── attention ──
             match &lw.attn {
                 AttnKind::Kda(w) => {
@@ -9470,6 +9471,8 @@ impl Pipeline {
                 .filter(|m| m.ffn_active_count(li) < self.intermediate_size)
                 .and_then(|m| m.ffn_masks.get(li))
                 .map(|v| v.as_slice());
+            let attn_ns = t_attn.elapsed().as_nanos() as u64;
+            let t_ffn = std::time::Instant::now();
             let mut ffn = match &lw.ffn {
                 FfnKind::Dense(d) if !d.segs.is_empty() => {
                     tube_ffn(d, &post, b, pool.as_deref(), mask_row)
@@ -9510,6 +9513,10 @@ impl Pipeline {
                     out
                 }
             };
+            if prefill_prof_on() {
+                PREFILL_SPLIT[0].fetch_add(attn_ns, std::sync::atomic::Ordering::Relaxed);
+                PREFILL_SPLIT[1].fetch_add(t_ffn.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
             if let Some(w) = &lw.ffn_out_norm {
                 for bi in 0..b {
                     inference::rms_norm_into(
@@ -9594,6 +9601,13 @@ impl Pipeline {
             }
         }
         crate::gpu::set_layer(-1); // lm_head/final ops outside layer-split
+        if prefill_prof_on() {
+            eprintln!(
+                "prefill-split: attention {:.1} ms, ffn {:.1} ms (cumulative)",
+                PREFILL_SPLIT[0].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+                PREFILL_SPLIT[1].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6
+            );
+        }
         // A batched span owns a complete set of positions. Publish any
         // collecting→sealed transition only after every layer has finished;
         // callers that cross into serial/device work must see the new epoch
@@ -16067,6 +16081,16 @@ thread_local! {
         const { std::cell::RefCell::new([Vec::new(), Vec::new(), Vec::new()]) };
 }
 
+/// CMF_PREFILL_PROF: cumulative ns of the batched walk's attention and
+/// FFN halves (all layers, all chunks).
+static PREFILL_SPLIT: [std::sync::atomic::AtomicU64; 2] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+fn prefill_prof_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CMF_PREFILL_PROF").is_some())
+}
+
 fn dense_ffn_batch(
     d: &DenseFfn,
     xs: &[f32],
@@ -16127,6 +16151,23 @@ fn dense_ffn_batch(
             let act = fused_act.expect("checked above");
             if crate::gpu::q4_ffn_act(model, w1, w3, w2, xs, b, hidden, inter, true, act, &mut out)
             {
+                return out;
+            }
+        }
+        // Every other device codec — int8, or gate/up and down in different
+        // codecs: the three GEMMs with the panels kept on the card. Without
+        // it a q8_2f prefill read both b·inter panels home, folded them on
+        // one host thread, and sent the result back for down.
+        // CMF_FFN_KEEP=0 keeps the per-GEMM path (A/B).
+        if let (true, Some((model, w1)), Some((_, w3)), Some((_, w2))) = (
+            std::env::var("CMF_FFN_KEEP").as_deref() != Ok("0"),
+            d.gate_proj.mapped_device_gemm(),
+            d.up_proj.mapped_device_gemm(),
+            d.down_proj.mapped_device_gemm(),
+        ) {
+            let mut out = vec![0.0f32; b * hidden];
+            let act = fused_act.expect("checked above");
+            if crate::gpu::ffn_act_keep(model, w1, w3, w2, xs, b, hidden, inter, act, &mut out) {
                 return out;
             }
         }

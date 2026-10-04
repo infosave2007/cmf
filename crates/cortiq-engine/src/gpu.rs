@@ -2422,6 +2422,42 @@ pub fn q4_ffn_act(
     }
 }
 
+/// The LLM prefill's dense FFN for separate gate/up/down weights in any
+/// codec with a device GEMM (int8, q4tp, or a mix of them): the panels
+/// stay on the card between the projections. wgpu only; other backends
+/// decline and the caller keeps its per-GEMM path.
+#[allow(clippy::too_many_arguments, unused_variables)]
+pub fn ffn_act_keep(
+    model: &Arc<CmfModel>,
+    w1: usize,
+    w3: usize,
+    w2: usize,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    inter: usize,
+    act: GraphAct,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::ffn_act_keep(
+            model,
+            w1,
+            w3,
+            w2,
+            xs,
+            b,
+            hidden,
+            inter,
+            act.code(),
+            out,
+        ),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 /// Qwen Image's exact two-projection tanh-GELU FFN.  The WGPU arm keeps the
 /// intermediate on the device; other backends decline so the caller retains
 /// its bounded CPU path.  `bias_in` is applied before GELU and `bias_out`
