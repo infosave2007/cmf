@@ -384,6 +384,9 @@ pub struct Pipeline {
     pub attn_v_norm: bool,
     /// HunYuan dense: per-head q/k norm runs after RoPE (see the arch flag).
     pub qk_norm_after_rope: bool,
+    /// The per-head `self_attn.g_proj` output gate uses sigmoid
+    /// (Spark-X2.5) instead of softplus (Laguna).
+    pub proj_gate_sigmoid: bool,
     /// Final-logit soft-capping C: logits = C·tanh(logits/C) (Gemma-4).
     pub final_softcap: Option<f32>,
     /// Cortiq Embryo hierarchical head: cluster matrix [C, hidden]. The
@@ -465,6 +468,8 @@ pub enum Act {
     #[default]
     Silu,
     GeluTanh,
+    /// Exact erf GELU (HF `hidden_act = "gelu"`: Spark-X2.5).
+    Gelu,
     /// Kimi-K3 SituAndMul: BOTH halves transform —
     /// a = β·tanh(g/β)·σ(g), up' = linβ·tanh(u/linβ) (linβ>0), out = a·up'.
     Situ {
@@ -477,6 +482,8 @@ impl Act {
     pub fn from_arch(name: &str) -> Self {
         if name == "gelu_tanh" {
             Self::GeluTanh
+        } else if name == "gelu" {
+            Self::Gelu
         } else {
             Self::Silu
         }
@@ -498,6 +505,7 @@ impl Act {
         match self {
             Self::Silu => inference::silu(x),
             Self::GeluTanh => inference::gelu_tanh(x),
+            Self::Gelu => inference::gelu_erf(x),
             Self::Situ { beta, .. } => beta * (x / beta).tanh() * (1.0 / (1.0 + (-x).exp())),
         }
     }
@@ -2620,6 +2628,7 @@ impl Pipeline {
                         window: None,
                         v_norm: false,
                         qk_norm_after_rope: self.qk_norm_after_rope,
+                        gate_sigmoid: self.proj_gate_sigmoid,
                         q_norm: *q_norm,
                         k_norm: *k_norm,
                         output_gate: *output_gate,
@@ -2994,6 +3003,7 @@ impl Pipeline {
             inv_freq_global: None,
             attn_v_norm: false,
             qk_norm_after_rope: false,
+            proj_gate_sigmoid: false,
             final_softcap: None,
             head_clusters: None,
             attn_softcap: 0.0,
@@ -3577,6 +3587,7 @@ impl Pipeline {
             window: None,
             v_norm: false,
             qk_norm_after_rope: self.qk_norm_after_rope,
+            gate_sigmoid: self.proj_gate_sigmoid,
             q_norm: None,
             k_norm: None,
             output_gate: false,
@@ -7619,6 +7630,7 @@ impl Pipeline {
                         window: self.layer_window(li),
                         v_norm: self.attn_v_norm,
                         qk_norm_after_rope: self.qk_norm_after_rope,
+                        gate_sigmoid: self.proj_gate_sigmoid,
                         q_norm: q_norm.as_deref(),
                         k_norm: k_norm.as_deref(),
                         output_gate: *output_gate,
@@ -9212,6 +9224,7 @@ impl Pipeline {
                         window: self.layer_window(li),
                         v_norm: self.attn_v_norm,
                         qk_norm_after_rope: self.qk_norm_after_rope,
+                        gate_sigmoid: self.proj_gate_sigmoid,
                         q_norm: q_norm.as_deref(),
                         k_norm: k_norm.as_deref(),
                         output_gate: *output_gate,
@@ -14852,6 +14865,7 @@ impl Pipeline {
                         window: None,
                         v_norm: self.attn_v_norm,
                         qk_norm_after_rope: self.qk_norm_after_rope,
+                        gate_sigmoid: self.proj_gate_sigmoid,
                         q_norm: q_norm.as_deref(),
                         k_norm: k_norm.as_deref(),
                         output_gate: *output_gate,
@@ -14998,6 +15012,7 @@ impl Pipeline {
                                 window: self.layer_window(li),
                                 v_norm: self.attn_v_norm,
                                 qk_norm_after_rope: self.qk_norm_after_rope,
+                                gate_sigmoid: self.proj_gate_sigmoid,
                                 q_norm: q_norm.as_deref(),
                                 k_norm: k_norm.as_deref(),
                                 output_gate: *output_gate,
