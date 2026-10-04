@@ -14,7 +14,7 @@
 //!    the call is not allowed the request fails with 422 before any work —
 //!    unless the escalator answers without the oracle
 //!    ([`Escalator::answers_without_oracle`]: the cascade's cache is on and
-//!    holds something, 0.8.10), when a question its cache misses fails it
+//!    holds something, 0.8.11), when a question its cache misses fails it
 //!    after step 5 with the same 422, which names every untrained question
 //!    (the cache's hits too: an error never tells what the cache holds);
 //! 4. the encoder and the hash run once on the state text; each exact or subset
@@ -31,7 +31,7 @@
 //!    key's `oracle_allowed` and `cmf.oracle` / `default_per_request`; the
 //!    escalator adds the key, budget and stop checks): `oracle` or `cache`
 //!    answers replace them. Without that consent the escalator still answers
-//!    what it already holds ([`Escalator::resolve_without_oracle`], 0.8.10):
+//!    what it already holds ([`Escalator::resolve_without_oracle`], 0.8.11):
 //!    a cache hit is `cache` (no call, nothing sent, no cost), a miss is
 //!    refused. Otherwise a trained question stays `abstain` with a
 //!    flag and an untrained one fails the request (422, 502 or 503). A
@@ -954,7 +954,7 @@ pub trait Escalator: Send + Sync {
     /// Resolve the undetermined questions of a request the oracle may not be
     /// called for — the service's consent checks refused it for `refused`
     /// (`oracle_disabled`, `consent_off`) — from what the escalator already
-    /// holds, with no call and nothing sent (0.8.10): a cached answer, else
+    /// holds, with no call and nothing sent (0.8.11): a cached answer, else
     /// [`Resolution::Refused`] with `refused`. Called only when
     /// [`Escalator::answers_without_oracle`] is true; one [`Resolved`] per
     /// pending question. Default: every question refused.
@@ -975,7 +975,7 @@ pub trait Escalator: Send + Sync {
 
     /// Whether [`Escalator::resolve_without_oracle`] may answer anything
     /// (the cascade: its cache is on). Default: false — a request without
-    /// consent is then refused as before 0.8.10, its untrained questions
+    /// consent is then refused as before 0.8.11, its untrained questions
     /// before the encoder runs.
     fn answers_without_oracle(&self) -> bool {
         false
@@ -1642,7 +1642,7 @@ impl DecisionService {
         let matches = match_questions(&model, req)?;
         let consent = self.consent(req, p);
         // Without consent the escalator may still answer from what it holds
-        // (its cache: no call, nothing sent; 0.8.10). When it cannot, an
+        // (its cache: no call, nothing sent; 0.8.11). When it cannot, an
         // untrained question fails here, before any work.
         let without_oracle = consent.is_err()
             && self
@@ -1703,7 +1703,7 @@ impl DecisionService {
         if !pending_idx.is_empty() {
             // The escalator, and why the oracle may not be called (`None`:
             // it may): with consent the cascade; without it the escalator's
-            // answers without the oracle (its cache, 0.8.10) when it has any.
+            // answers without the oracle (its cache, 0.8.11) when it has any.
             let route = match (consent, &self.escalator) {
                 (Ok(()), Some(esc)) => Ok((esc, None)),
                 (Err(reason), Some(esc)) if without_oracle => Ok((esc, Some(reason))),
@@ -2826,7 +2826,7 @@ fn top1_vs_top2(l: Option<&LocalDecision>) -> String {
     }
 }
 
-/// The untrained questions a failed request names (0.8.10): `unresolved`,
+/// The untrained questions a failed request names (0.8.11): `unresolved`,
 /// unless one of them was refused the oracle — then every untrained one
 /// answered from the cache is named as well, refused for the same reason.
 /// A request refused the oracle (no consent, the oracle off, stopped or out

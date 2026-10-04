@@ -35,7 +35,7 @@ says first whether it is ready — [Check your setup](#check-your-setup)).
    (`cmf.oracle`, the router's `options.allow_oracle`, else
    `oracle.default_per_request`); budget is left; no stop rule fired.
    Otherwise the question is still looked up in the cache (step 3; since
-   0.8.10): a hit is answered `action: cache`, `decision_path
+   0.8.11): a hit is answered `action: cache`, `decision_path
    escalate→cache`, with no call and nothing sent. Only a miss is refused:
    a trained question stays `abstain` with a flag (`oracle_disabled`,
    `no_key` beside `oracle_disabled` when the key variable is not set,
@@ -58,16 +58,16 @@ says first whether it is ready — [Check your setup](#check-your-setup)).
    caller's instructions is never served to a question with other
    instructions or criteria, and a `cache` answer tells its caller that some
    account asked the same text under the same contract.
-   * **Near reuse is opt-in** (since 0.8.10): with `cache.threshold` below
+   * **Near reuse is opt-in** (since 0.8.11): with `cache.threshold` below
      1, an answer whose text embedding has cosine ≥ the threshold with the
-     new one is reused too (0.97 was the default before 0.8.10). The default
+     new one is reused too (0.97 was the default before 0.8.11). The default
      1 turns it off: decision states that look alike often differ in the
      detail that decides (a note in a JSON score, a number in a causal
      question, one address in an e-mail), and at 0.97 a Decision Index run
      through the gateway answered ~60k of 282k questions with another row's
      oracle answer (index 58 → 51.9). Turn it on only for traffic whose
      paraphrases share their answer (intent routing of short texts).
-   * **Entries written before 0.8.10** carry no input digest: they are
+   * **Entries written before 0.8.11** carry no input digest: they are
      reused for an embedding cosine ≥ `cache.legacy_cos` (default 0.9999,
      the repeat of a text as far as the encoder reads it), or at the
      threshold with near reuse on. That is not exact: two states that
@@ -382,7 +382,7 @@ verdict, a 10-level score 39, a noul 10.
 record; an entry without one keeps the 0.8.7 `CachePut` record, and every
 0.8.7 `CachePut` replays as one-hot. A 0.8.7 binary stops replaying at the
 first `CachePutP`: never run an older binary on a newer state directory.
-Since 0.8.10 a cache entry's input digest rides in the scope field of the
+Since 0.8.11 a cache entry's input digest rides in the scope field of the
 same two records (`exact:<sha256>|<scope>`): records of 0.8.9 and older
 replay unchanged (as entries without a digest), and a 0.8.9 binary reads
 the new records as entries of a scope it never looks up (they never hit)
@@ -442,7 +442,7 @@ same question waits for both.
   working oracle — and its reservation counts as likely unbilled.
 * `GET /v1/admin/oracle` shows spent, reserved, remaining, calls, failures and
   the stop reason; `POST /v1/admin/oracle` can switch the oracle and lower
-  `budget_usd` / `max_calls` within the configured values. Since 0.8.10 the
+  `budget_usd` / `max_calls` within the configured values. Since 0.8.11 the
   switch and the stop rules stop calls only: answers already in the cache
   are still served (step 3); `cache.enabled: false` and a restart stop
   those.
@@ -474,7 +474,7 @@ same question waits for both.
 * **Never sent**: accepted questions, other questions of the request, client
   keys, accounts, vectors.
 * **Kept on disk** in the state directory: vectors and hashed features of
-  learned examples and cached answers, since 0.8.10 the sha256 of each cached
+  learned examples and cached answers, since 0.8.11 the sha256 of each cached
   question's input as asked (the whole state, or a state-less question's
   instructions, before PII redaction), the oracle ledger (no texts), usage
   records (no texts). Hashed n-gram features can show whether a known text was
@@ -765,7 +765,7 @@ jq -c '{answer, action, source, oracle_cost_usd, flags}' results.jsonl
 * **Without a usable key** a rejected text the state directory's cache
   holds (the oracle answered the same text in an earlier run, or a server
   on that directory did) is answered from it, `action: cache` (since
-  0.8.10; the directory is only read — no `LOCK`, nothing written); any
+  0.8.11; the directory is only read — no `LOCK`, nothing written); any
   other rejected text abstains with `no_key` (or `bad_key`) and the hint
   `OPENROUTER_API_KEY is not set (decide --oracle reads the key from the
   environment): export …`. Nothing is sent and no state directory is made.
@@ -839,7 +839,7 @@ warning: removed the LOCK of state directory cortiq-decision.cmf.state left by p
   means "required unless loopback").
 * **Keys**: `cortiq decision keys create` makes keys that may use the oracle
   (`oracle_allowed: true`, like imported router keys); `--oracle-allowed=false`
-  makes one that never calls the oracle — since 0.8.10 its undetermined
+  makes one that never calls the oracle — since 0.8.11 its undetermined
   questions are still answered from the shared cache when it holds the same
   question (other accounts' oracle answers; only `cache.enabled: false`
   turns that off) — and `--oracle-budget-usd` caps one key's

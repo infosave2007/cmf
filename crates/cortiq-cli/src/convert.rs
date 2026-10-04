@@ -650,6 +650,9 @@ fn canon_name_for_arch(arch: &ModelArch, raw: &str, towers: MimoTowers) -> Optio
     if arch.arch_name == MIMO_V2 {
         return mimo_v2_canon(raw, towers);
     }
+    if arch.arch_name == "spark2_5" {
+        return spark25_canon(raw);
+    }
     if arch.arch_name.eq_ignore_ascii_case("whisper")
         && (raw.starts_with("model.encoder.") || raw.starts_with("model.decoder."))
     {
@@ -676,6 +679,20 @@ fn canon_name_for_arch(arch: &ModelArch, raw: &str, towers: MimoTowers) -> Optio
         return Some(format!("vis.{rest}"));
     }
     canon_name(raw)
+}
+
+/// Spark-X2.5 (`spark2_5`) onto the canonical layout: the embedding is
+/// spelled `model.embedding`, attention fuses Q/K/V as `q_k_v_proj` (split
+/// downstream by the `qkv_proj` path) and names its output `out_proj`. The
+/// head-wise gate `self_attn.g_proj` is already the canonical name.
+fn spark25_canon(raw: &str) -> Option<String> {
+    if raw == "model.embedding.weight" {
+        return Some("model.embed_tokens.weight".into());
+    }
+    Some(
+        raw.replace(".self_attn.q_k_v_proj.", ".self_attn.qkv_proj.")
+            .replace(".self_attn.out_proj.", ".self_attn.o_proj."),
+    )
 }
 
 /// Map LFM2 / LFM2-MoE vendor tensor names onto CMF's canonical (Qwen2)
@@ -4055,7 +4072,9 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     // Qwen3.5 nests rope params under `rope_parameters`. Laguna goes one
     // level deeper and carries independent full/sliding profiles.
     let rope_root = tc.get("rope_parameters");
-    let is_laguna_config = model_type.eq_ignore_ascii_case("laguna");
+    // Spark-X2.5 nests its two profiles the same way.
+    let is_laguna_config =
+        model_type.eq_ignore_ascii_case("laguna") || model_type.eq_ignore_ascii_case("spark2_5");
     let rope = if is_laguna_config {
         rope_root.and_then(|r| r.get("full_attention"))
     } else {
@@ -4377,6 +4396,8 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         .unwrap_or("silu")
     {
         "gelu_pytorch_tanh" | "gelu_tanh" | "gelu_new" => "gelu_tanh".to_string(),
+        // HF `gelu` is the exact erf form (Spark-X2.5).
+        "gelu" => "gelu".to_string(),
         "silu" | "swish" => "silu".to_string(),
         other => anyhow::bail!("unsupported hidden_act '{other}'"),
     };
@@ -4639,6 +4660,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             }),
         sliding_window: cfg_usize(tc, "sliding_window").filter(|_| {
             is_laguna
+                || mt == "spark2_5"
                 || is_gemma2
                 || is_gemma3n
                 || tc.get("sliding_window_pattern").is_some()

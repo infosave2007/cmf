@@ -4,8 +4,10 @@
 //! Two families:
 //!
 //! * **Hermes / Qwen**: `<tool_call>{"name": …, "arguments": {…}}</tool_call>`,
-//!   and Nanbeige's XML body inside the same wrapper
-//!   (`<tool_call><function=NAME><parameter=K>V</parameter></function></tool_call>`).
+//!   Nanbeige's XML body inside the same wrapper
+//!   (`<tool_call><function=NAME><parameter=K>V</parameter></function></tool_call>`),
+//!   and the key/value body of Spark-X2.5 (GLM lineage):
+//!   `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`.
 //! * **MiniCPM5**: `<function name="NAME"><param name="K">V</param>…</function>`,
 //!   several calls in a row, values optionally wrapped in `<![CDATA[…]]>`.
 //!   Parsed like SGLang's `minicpm5` tool-call parser
@@ -37,7 +39,7 @@ const THINK_CLOSE: &str = "</think>";
 /// validation; the Hermes grammar carries JSON and needs none).
 pub fn extract_tool_calls(text: &str, tools: Option<&[Value]>) -> (String, Vec<Value>) {
     let (start, end) = content_region(text);
-    let (plain_mid, mut calls) = extract_hermes(&text[start..end]);
+    let (plain_mid, mut calls) = extract_hermes(&text[start..end], tools.unwrap_or(&[]));
     let (plain_mid, minicpm) = extract_minicpm5(&plain_mid, tools.unwrap_or(&[]));
     calls.extend(minicpm);
     let mut plain = String::with_capacity(text.len());
@@ -76,7 +78,7 @@ fn openai_call(name: &str, args: &Value) -> Value {
 /// `<tool_call>{...}</tool_call>` blocks. A block whose body does not
 /// parse stays in the text verbatim — a client can read prose, but it
 /// cannot execute garbage; an unterminated block (truncated output) too.
-fn extract_hermes(text: &str) -> (String, Vec<Value>) {
+fn extract_hermes(text: &str, tools: &[Value]) -> (String, Vec<Value>) {
     const OPEN: &str = "<tool_call>";
     const CLOSE: &str = "</tool_call>";
     let mut rest = text;
@@ -92,7 +94,8 @@ fn extract_hermes(text: &str) -> (String, Vec<Value>) {
         // Nanbeige's XML `<function=name><parameter=k>v...`.
         let parsed = serde_json::from_str::<Value>(body)
             .ok()
-            .or_else(|| parse_nanbeige_function(body));
+            .or_else(|| parse_nanbeige_function(body))
+            .or_else(|| parse_arg_key_call(body, tools));
         match parsed {
             Some(v) if v.get("name").map(|n| n.is_string()) == Some(true) => {
                 plain.push_str(&rest[..i]);
@@ -105,6 +108,69 @@ fn extract_hermes(text: &str) -> (String, Vec<Value>) {
     }
     plain.push_str(rest);
     (plain, calls)
+}
+
+/// Spark-X2.5's key/value grammar, normalised to the JSON shape:
+/// `NAME<arg_key>K</arg_key><arg_value>V</arg_value>…`. The template renders
+/// a string value as is and anything else through `tojson`, so a value
+/// stays a string when the tool's schema declares the parameter a string
+/// (or when no schema is known and the text is not a JSON object, array,
+/// number, boolean or null); otherwise it is parsed back as JSON.
+fn parse_arg_key_call(body: &str, tools: &[Value]) -> Option<Value> {
+    let t = body.trim();
+    let first = t.find("<arg_key>").unwrap_or(t.len());
+    let name = t[..first].trim();
+    // a function name: an identifier, never prose that merely sits inside
+    // a <tool_call> wrapper
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+    {
+        return None;
+    }
+    let declared = tools
+        .iter()
+        .filter_map(|tool| tool.get("function").or(Some(tool)))
+        .find(|f| f.get("name").and_then(|n| n.as_str()) == Some(name));
+    if !tools.is_empty() && declared.is_none() {
+        return None;
+    }
+    let props = declared
+        .and_then(|f| f.get("parameters"))
+        .and_then(|p| p.get("properties"));
+    let mut args = Map::new();
+    let mut rest = &t[first..];
+    while let Some(ks) = rest.find("<arg_key>") {
+        let k0 = ks + "<arg_key>".len();
+        let k1 = rest[k0..].find("</arg_key>")? + k0;
+        let key = rest[k0..k1].trim().to_string();
+        let after = &rest[k1 + "</arg_key>".len()..];
+        let v0 = after.find("<arg_value>")? + "<arg_value>".len();
+        let v1 = after[v0..].find("</arg_value>")? + v0;
+        let raw = &after[v0..v1];
+        let declared_string = props
+            .and_then(|p| p.get(&key))
+            .and_then(|s| s.get("type"))
+            .map(|ty| match ty {
+                Value::String(s) => s == "string",
+                Value::Array(a) => a.iter().any(|x| x.as_str() == Some("string")),
+                _ => false,
+            });
+        let val = match declared_string {
+            Some(true) => Value::String(raw.to_string()),
+            _ => serde_json::from_str::<Value>(raw.trim())
+                .ok()
+                .filter(|v| !v.is_string() || declared_string == Some(false))
+                .unwrap_or_else(|| Value::String(raw.to_string())),
+        };
+        args.insert(key, val);
+        rest = &after[v1 + "</arg_value>".len()..];
+    }
+    if !rest.trim().is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({"name": name, "arguments": args}))
 }
 
 /// Nanbeige's XML tool grammar, normalised to the JSON shape:
@@ -597,6 +663,43 @@ impl ToolHoldback {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn spark_arg_key_calls_follow_the_schema() {
+        let tools = vec![serde_json::json!({"type": "function", "function": {
+            "name": "get_weather",
+            "parameters": {"type": "object", "properties": {
+                "city": {"type": "string"}, "zip": {"type": "string"},
+                "days": {"type": "integer"}, "units": {"type": "object"}}}}})];
+        let text = "<think>let me check</think>Sure.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>zip</arg_key><arg_value>75001</arg_value><arg_key>days</arg_key><arg_value>3</arg_value><arg_key>units</arg_key><arg_value>{\"t\": \"C\"}</arg_value></tool_call>";
+        let (plain, calls) = extract_tool_calls(text, Some(&tools));
+        assert_eq!(calls.len(), 1);
+        assert!(plain.ends_with("Sure."));
+        let f = &calls[0]["function"];
+        assert_eq!(f["name"], "get_weather");
+        let args: Value = serde_json::from_str(f["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["city"], "Paris");
+        assert_eq!(args["zip"], "75001");
+        assert_eq!(args["days"], 3);
+        assert_eq!(args["units"]["t"], "C");
+        // no schema: plain words stay strings, JSON values parse
+        let (_, calls) = extract_tool_calls(
+            "<tool_call>lookup<arg_key>q</arg_key><arg_value>rust</arg_value><arg_key>n</arg_key><arg_value>5</arg_value></tool_call>",
+            None,
+        );
+        let args: Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["q"], "rust");
+        assert_eq!(args["n"], 5);
+        // a broken block stays text
+        let (plain, calls) = extract_tool_calls(
+            "<tool_call>lookup<arg_key>q</arg_key>rust</tool_call>",
+            None,
+        );
+        assert!(calls.is_empty());
+        assert!(plain.contains("<tool_call>"));
+    }
+
     use super::*;
 
     fn args(call: &Value) -> Value {

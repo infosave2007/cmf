@@ -1201,8 +1201,12 @@ async fn chat_completions(
             // Hard thinking suppression: when enable_thinking=false, inject a
             // system-level directive so even models that ignore the empty
             //  block still produce direct answers.
+            // Not with tools: "output ONLY the final answer" talks a model
+            // out of calling them (Spark-X2.5 answered 4 of 6 tool requests
+            // with invented results under it, and called the tool in all
+            // 6 without it).
             eprintln!("[serve] thinking={:?}", req.thinking());
-            if req.thinking() == Some(false) {
+            if req.thinking() == Some(false) && req.effective_tools().is_none() {
                 let has_system = msgs.iter().any(|m| m["role"] == "system");
                 let directive = "Answer directly and concisely. Do NOT reason, think step-by-step, or explain your process. Output ONLY the final answer.";
                 if has_system {
@@ -1260,6 +1264,13 @@ async fn chat_completions(
     let dsv41_thinking = dsv41
         && req.thinking() != Some(false)
         && (req.thinking() == Some(true) || req.reasoning_effort.is_some());
+    // A template that opens the reasoning block itself (Spark-X2.5: the
+    // generation prompt ends in `<think>`) leaves the reply holding only
+    // the closing tag. The opener is put back, so the reply has the same
+    // `<think>…</think>answer` shape as the other thinking models.
+    let think_opened = !dsv41
+        && req.thinking() != Some(false)
+        && prompt_ends_in_think(&state.tokenizer, &prompt_ids);
 
     if let Some(class_tokens) = req
         .cortiq
@@ -1410,8 +1421,17 @@ async fn chat_completions(
             let tools_active = req.effective_tools().is_some();
             let holdback = std::sync::Arc::new(std::sync::Mutex::new(ToolHoldback::new()));
             let holdback_cb = holdback.clone();
+            let mut opener = think_opened.then(|| "<think>".to_string());
 
             let callback: cortiq_engine::TokenCallback = Box::new(move |token: &str| {
+                let opened;
+                let token = match opener.take() {
+                    Some(o) => {
+                        opened = o + token;
+                        opened.as_str()
+                    }
+                    None => token,
+                };
                 // Every piece of content goes out through here, so the
                 // think filter's flushes pass the tool holdback too.
                 let emit = |text: &str| -> bool {
@@ -1604,6 +1624,10 @@ async fn chat_completions(
             let content = strip_think_block(&result.text);
             let (plain, calls) = extract_tool_calls(&content, req.effective_tools());
             (plain, calls, None)
+        } else if think_opened {
+            let text = format!("<think>{}", result.text);
+            let (plain, calls) = extract_tool_calls(&text, req.effective_tools());
+            (plain, calls, None)
         } else {
             let (plain, calls) = extract_tool_calls(&result.text, req.effective_tools());
             (plain, calls, None)
@@ -1757,6 +1781,12 @@ fn extract_dsv41_result(
         return extract_dsv41_completion(&wire, thinking);
     }
     extract_dsv41_completion(&result.text, thinking)
+}
+
+/// Whether the rendered prompt ends in an opened `<think>` block.
+fn prompt_ends_in_think(tok: &cortiq_engine::tokenizer::Tokenizer, ids: &[u32]) -> bool {
+    let tail = &ids[ids.len().saturating_sub(4)..];
+    tok.decode_for_protocol(tail).trim_end().ends_with("<think>")
 }
 
 fn strip_think_block(s: &str) -> String {

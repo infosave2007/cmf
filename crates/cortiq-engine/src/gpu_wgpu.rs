@@ -3847,6 +3847,23 @@ fn q1_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
 // ── Element-wise kernels of the MoE block (silu·mul·col, axpy, zeroing) ──
 struct N1 { n: u32, f: u32, lim: f32, _c: u32 };
 
+// Exact (erf) GELU, 0.5·x·(1 + erf(x/√2)) — HF `hidden_act = "gelu"`.
+// erf by Abramowitz–Stegun 7.1.26, the formula `inference::erf_f32` runs
+// on the host (|error| <= 1.5e-7; WGSL has no erf).
+fn cmf_erf(x: f32) -> f32 {
+    let a = abs(x);
+    let t = 1.0 / (1.0 + 0.3275911 * a);
+    let y = 1.0
+        - (((((1.0614054 * t - 1.4531521) * t + 1.4214138) * t - 0.28449674) * t
+            + 0.2548296)
+            * t)
+            * exp(-a * a);
+    return select(y, -y, x < 0.0);
+}
+fn cmf_gelu_erf(x: f32) -> f32 {
+    return 0.5 * x * (1.0 + cmf_erf(x * 0.70710678));
+}
+
 @group(0) @binding(0) var<storage, read>       sg   : array<f32>;
 @group(0) @binding(1) var<storage, read>       su   : array<f32>;
 @group(0) @binding(2) var<storage, read>       scol : array<f32>;
@@ -3867,6 +3884,9 @@ fn silu_mul_pre(@builtin(global_invocation_id) gid: vec3<u32>,
         gv = min(gv, snp.lim);
     }
     var v = (gv / (1.0 + exp(-gv))) * uv;
+    // `_c` = the dense FFN's activation (`GraphAct::code`): 0 SiLU above,
+    // 1 exact GELU.
+    if (snp._c == 1u) { v = cmf_gelu_erf(gv) * uv; }
     if (snp.f == 1u) { v = v * scol[i]; }
     sact[i] = v;
 }
@@ -4050,6 +4070,8 @@ fn f32_matvec_merge(@builtin(workgroup_id) wid: vec3<u32>,
 }
 
 // Qwen3.5 output gate: attn_out *= sigmoid(gate), element-wise over nh·hd.
+// `f` > 0: one gate per head of width f (Spark-X2.5's head-wise g_proj
+// gate) — element i reads gate i / f. f = 0 is the element-wise form.
 @group(0) @binding(0) var<storage, read>       gm_g : array<f32>;
 @group(0) @binding(1) var<storage, read_write> gm_o : array<f32>;
 @group(0) @binding(2) var<uniform>             gm_p : N1;
@@ -4057,7 +4079,9 @@ fn f32_matvec_merge(@builtin(workgroup_id) wid: vec3<u32>,
 fn gate_mul(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     if (i >= gm_p.n) { return; }
-    gm_o[i] = gm_o[i] * (1.0 / (1.0 + exp(-gm_g[i])));
+    var gi = i;
+    if (gm_p.f != 0u) { gi = i / gm_p.f; }
+    gm_o[i] = gm_o[i] * (1.0 / (1.0 + exp(-gm_g[gi])));
 }
 
 @group(0) @binding(0) var<storage, read_write> zy  : array<f32>;
@@ -4078,7 +4102,12 @@ fn ffn_silu_mul(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.y * (65535u * 256u) + gid.x;
     if (i >= fsp.n) { return; }
     let g = fsg[i];
-    fsg[i] = (g / (1.0 + exp(-g))) * fsu[i];
+    // `_c` = `GraphAct::code`: 0 SiLU (the historical expression), 1 GELU.
+    if (fsp._c == 1u) {
+        fsg[i] = cmf_gelu_erf(g) * fsu[i];
+    } else {
+        fsg[i] = (g / (1.0 + exp(-g))) * fsu[i];
+    }
 }
 
 // Qwen Image's MLP middle is tanh-GELU, not the SwiGLU used by the
@@ -9520,8 +9549,14 @@ fn q4tp_matvec16w_gu(@builtin(workgroup_id) wid: vec3<u32>,
                 ua = clamp(ua, -lim, lim); ub = clamp(ub, -lim, lim);
                 ga = min(ga, lim); gb = min(gb, lim);
             }
-            if (r0 < rows) { q1y[r0] = (ga / (1.0 + exp(-ga))) * ua; }
-            if (r1 < rows) { q1y[r1] = (gb / (1.0 + exp(-gb))) * ub; }
+            // `_p1` = `GraphAct::code`: 0 SiLU, 1 exact GELU.
+            if (q1p._p1 == 1u) {
+                if (r0 < rows) { q1y[r0] = cmf_gelu_erf(ga) * ua; }
+                if (r1 < rows) { q1y[r1] = cmf_gelu_erf(gb) * ub; }
+            } else {
+                if (r0 < rows) { q1y[r0] = (ga / (1.0 + exp(-ga))) * ua; }
+                if (r1 < rows) { q1y[r1] = (gb / (1.0 + exp(-gb))) * ub; }
+            }
         }
         workgroupBarrier();
         wb = wb + nwg.x;
@@ -9820,8 +9855,14 @@ fn q4tp_matvec16nl_gu(@builtin(workgroup_id) wid: vec3<u32>,
                 ua = clamp(ua, -lim, lim); ub = clamp(ub, -lim, lim);
                 ga = min(ga, lim); gb = min(gb, lim);
             }
-            if (r0 < rows) { q1y[r0] = (ga / (1.0 + exp(-ga))) * ua; }
-            if (r1 < rows) { q1y[r1] = (gb / (1.0 + exp(-gb))) * ub; }
+            // `_p1` = `GraphAct::code`: 0 SiLU, 1 exact GELU.
+            if (q1p._p1 == 1u) {
+                if (r0 < rows) { q1y[r0] = cmf_gelu_erf(ga) * ua; }
+                if (r1 < rows) { q1y[r1] = cmf_gelu_erf(gb) * ub; }
+            } else {
+                if (r0 < rows) { q1y[r0] = (ga / (1.0 + exp(-ga))) * ua; }
+                if (r1 < rows) { q1y[r1] = (gb / (1.0 + exp(-gb))) * ub; }
+            }
         }
         workgroupBarrier();
         wb = wb + nwg.x;
@@ -13133,11 +13174,14 @@ fn dit_softmax(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
     let t = lid.x;
     // Causal bound: query `wid.x` may see keys 0..=s0+wid.x. Masked
     // entries are zeroed rather than set to -inf so the P·V GEMM that
-    // follows reads a clean matrix.
+    // follows reads a clean matrix. `causal` = 1 + w (w > 0) adds a
+    // sliding window: the query sees only its last w keys, itself included.
     var lim = dp.n;
+    var lo = 0u;
     if (dp.causal != 0u) { lim = min(dp.n, dp.s0 + wid.x + 1u); }
+    if (dp.causal > 1u && lim > dp.causal - 1u) { lo = lim - (dp.causal - 1u); }
     var mx = -3.4e38;
-    for (var j = t; j < lim; j = j + 256u) { mx = max(mx, dc[row + j]); }
+    for (var j = lo + t; j < lim; j = j + 256u) { mx = max(mx, dc[row + j]); }
     dit_red[t] = mx;
     workgroupBarrier();
     for (var s = 128u; s > 0u; s = s >> 1u) {
@@ -13147,11 +13191,12 @@ fn dit_softmax(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
     let m = dit_red[0];
     workgroupBarrier();
     var sum = 0.0;
-    for (var j = t; j < lim; j = j + 256u) {
+    for (var j = lo + t; j < lim; j = j + 256u) {
         let e = exp(dc[row + j] - m);
         dc[row + j] = e;
         sum = sum + e;
     }
+    for (var j = t; j < lo; j = j + 256u) { dc[row + j] = 0.0; }
     for (var j = lim + t; j < dp.n; j = j + 256u) { dc[row + j] = 0.0; }
     dit_red[t] = sum;
     workgroupBarrier();
@@ -13160,7 +13205,7 @@ fn dit_softmax(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
         workgroupBarrier();
     }
     let inv = 1.0 / dit_red[0];
-    for (var j = t; j < lim; j = j + 256u) { dc[row + j] = dc[row + j] * inv; }
+    for (var j = lo + t; j < lim; j = j + 256u) { dc[row + j] = dc[row + j] * inv; }
 }
 
 // [nh][n][hd] panel -> [n][nh*hd].
@@ -17236,6 +17281,74 @@ fn gqa_attend_x(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// The decode attend of a head-gated layer (Spark-X2.5's g_proj gate):
+// `gqa_attend_x`'s scores and online softmax, its value pass split four
+// ways — lane = (position quarter lid >> 6, dim quad lid & 63), a quarter of
+// the chunk's positions per lane and four output dims per vec4 load
+// (dv % 4 == 0, dv <= 256) — and the head's sigmoid gate folded into the
+// output write: out = (Σ/l)·σ(g[h]), the host's order. Admitted only for
+// head-gated layers, so every other per-layer-geometry model keeps
+// `gqa_attend_x` to the bit. `ax_v4` is binding 2 seen as vec4 rows (only
+// this entry point reads it), `ax_hg` the per-head gate logits.
+@group(0) @binding(2) var<storage, read> ax_v4 : array<vec4<f32>>;
+@group(0) @binding(8) var<storage, read> ax_hg : array<f32>;
+var<workgroup> ax_acc4: array<vec4<f32>, 256>;
+
+@compute @workgroup_size(256)
+fn gqa_attend_x4g(@builtin(workgroup_id) wid: vec3<u32>,
+                  @builtin(local_invocation_index) lid: u32) {
+    let h = wid.x;
+    if (h >= ax_p.nh) { return; }
+    let n = ax_p.n;
+    let dv4 = ax_p.dv / 4u;
+    let qq = lid >> 6u;
+    let j = lid & 63u;
+    let vbase = (h / ax_p.hpk) * ax_p.cap * dv4;
+    var m = -1.0e30;
+    var l = 0.0;
+    if (ax_p.sink != 0u) {
+        m = ax_sink[h];
+        l = 1.0;
+    }
+    var acc = vec4<f32>(0.0);
+    var c0 = 0u;
+    loop {
+        if (c0 >= n) { break; }
+        let cn = min(256u, n - c0);
+        let cm = ax_scores(h, c0, cn, lid);
+        let mp = max(m, cm);
+        let f = exp(m - mp);
+        let w = select(0.0, exp(ax_sc[lid] - mp), lid < cn);
+        ax_sc[lid] = w;
+        l = l * f + ax_sum(w, lid);
+        acc = acc * f;
+        if (j < dv4) {
+            let s0 = (ax_p.first + c0) % ax_p.cap;
+            var p = qq;
+            loop {
+                if (p >= cn) { break; }
+                acc = acc + ax_sc[p] * ax_v4[vbase + ax_slot(s0, p) * dv4 + j];
+                p = p + 4u;
+            }
+        }
+        m = mp;
+        c0 = c0 + 256u;
+        workgroupBarrier();
+    }
+    ax_acc4[lid] = acc;
+    workgroupBarrier();
+    if (lid < dv4) {
+        let sv = (ax_acc4[lid] + ax_acc4[lid + 64u]) + (ax_acc4[lid + 128u] + ax_acc4[lid + 192u]);
+        let gain = 1.0 / (1.0 + exp(-ax_hg[h]));
+        let o = (sv / l) * gain;
+        let ob = h * ax_p.dv + lid * 4u;
+        ax_o[ob] = o.x;
+        ax_o[ob + 1u] = o.y;
+        ax_o[ob + 2u] = o.z;
+        ax_o[ob + 3u] = o.w;
+    }
+}
+
 // One chunk per workgroup (grid nh × chunks): the chunk's unnormalized
 // value sum and its (max, sum) frame, for gqa_attend_merge_x.
 @compute @workgroup_size(256)
@@ -17439,6 +17552,11 @@ mod attend_x_shader_tests {
 struct GraphX {
     kv_append: wgpu::ComputePipeline,
     attend: wgpu::ComputePipeline,
+    /// `gqa_attend_x4g`: head-gated layers' attend (gate folded in). Built
+    /// under its own error scope: None on a device that rejects it, and
+    /// such layers then take `gqa_attend_x` + `gate_mul` — the rest of the
+    /// set (MiMo-V2's attend) never depends on it.
+    attend_g: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
     part: wgpu::ComputePipeline,
     merge: wgpu::ComputePipeline,
     q82_b: wgpu::ComputePipeline,
@@ -20172,6 +20290,24 @@ fn init(dev: usize) -> Result<Ctx, String> {
                 px("gqa_attend_merge_x"),
                 px("q8_2f_matvec_b"),
             );
+            // Its own scope: a rejection costs only the head-gated fold.
+            // CMF_ATTEND_X4G=0 forces that fallback (the A/B of the fold).
+            let attend_g = if std::env::var("CMF_ATTEND_X4G").as_deref() == Ok("0") {
+                None
+            } else {
+                let sg = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let p = px("gqa_attend_x4g");
+                if let Some(e) = pollster::block_on(sg.pop()) {
+                    tracing::warn!(
+                        "gqa_attend_x4g rejected ({e}): head-gated layers attend with \
+                         gqa_attend_x + gate_mul"
+                    );
+                    None
+                } else {
+                    let l = p.get_bind_group_layout(0);
+                    Some((p, l))
+                }
+            };
             let mut q82_short = Vec::new();
             for rows in 1..=4 {
                 let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -20190,6 +20326,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
                 q82_short,
                 kv_l: kv_append.get_bind_group_layout(0),
                 attend_l: attend.get_bind_group_layout(0),
+                attend_g,
                 part_l: part.get_bind_group_layout(0),
                 merge_l: merge.get_bind_group_layout(0),
                 q82_l: q82_b.get_bind_group_layout(0),
@@ -22247,11 +22384,13 @@ fn mv_gu_bind(
     act: &wgpu::Buffer,
     inter: usize,
     cols: usize,
+    act_code: u32,
 ) -> (wgpu::BindGroup, u32) {
     let gpr = cols / 32;
     // `_p0` carries the swiglu limit as f32 bits; the token graph's dense
     // FFN has none (0.0), which is what silu_mul_pre gets there too.
-    let p_buf = uniform_u32x4(c, [gpr as u32, inter as u32, 0, inter as u32]);
+    // `_p1` is the activation (`GraphAct::code`, 0 = SiLU).
+    let p_buf = uniform_u32x4(c, [gpr as u32, inter as u32, 0, act_code]);
     let layout = gu_pipe(c).get_bind_group_layout(0);
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("mv-gu"),
@@ -24018,11 +24157,21 @@ fn graph_layer_payload_bytes(
         Some(())
     };
     match &layer.attn {
-        crate::gpu::GraphAttn::Full { wq, wk, wv, wo, .. } => {
+        crate::gpu::GraphAttn::Full {
+            wq,
+            wk,
+            wv,
+            wo,
+            head_gate,
+            ..
+        } => {
             add(wq)?;
             add(wk)?;
             add(wv)?;
             add(wo)?;
+            if let Some(g) = head_gate {
+                add(g)?;
+            }
         }
         crate::gpu::GraphAttn::Gdn {
             qkv, z, a, b, out, ..
@@ -24040,7 +24189,7 @@ fn graph_layer_payload_bytes(
     }
     match &layer.ffn {
         crate::gpu::GraphFfn::AttentionOnly => {}
-        crate::gpu::GraphFfn::Dense { gate, up, down } => {
+        crate::gpu::GraphFfn::Dense { gate, up, down, .. } => {
             add(gate)?;
             add(up)?;
             add(down)?;
@@ -24201,6 +24350,8 @@ pub fn forward_token_graph(
             /// unless the layer carries its own geometry).
             nkv: usize,
             dv: usize,
+            /// Spark-X2.5 head-wise output gate `[nh, hidden]`.
+            hg: Option<GMat>,
         },
         Conv {
             inp: GMat,
@@ -24232,6 +24383,8 @@ pub fn forward_token_graph(
             /// here asked for weights that do not exist — the graph then
             /// refused for the whole model, on every token, silently.
             width: usize,
+            /// `GraphAct::code` of act(gate)·up.
+            act: u32,
         },
         Moe {
             router: GMat,
@@ -24452,6 +24605,7 @@ pub fn forward_token_graph(
                 wo,
                 output_gate,
                 geom,
+                head_gate,
                 ..
             } => {
                 let (lnkv, ldv) = geom.map_or((nkv, hd), |g| (g.nkv, g.dv));
@@ -24466,6 +24620,20 @@ pub fn forward_token_graph(
                     graph_decline("attn q/k/v/o resolve");
                     return token_graph_outcome(o1_started || state_started, false);
                 };
+                // The head gate reads the attention's normed input as is:
+                // a transformed (Prism) plane has no input FWHT here.
+                let hg = match head_gate {
+                    None => None,
+                    Some(g) => match resolve(g, nh, hidden) {
+                        Some(m) if m.prism == crate::gpu::GraphPrismOp::None && !m.affine => {
+                            Some(m)
+                        }
+                        _ => {
+                            graph_decline("head gate resolve");
+                            return token_graph_outcome(o1_started || state_started, false);
+                        }
+                    },
+                };
                 LAttn::Full {
                     wq,
                     wk,
@@ -24473,6 +24641,7 @@ pub fn forward_token_graph(
                     wo,
                     nkv: lnkv,
                     dv: ldv,
+                    hg,
                 }
             }
             crate::gpu::GraphAttn::Gdn {
@@ -24540,7 +24709,12 @@ pub fn forward_token_graph(
             crate::gpu::GraphFfn::AttentionOnly => {
                 return token_graph_outcome(o1_started || state_started, false);
             }
-            crate::gpu::GraphFfn::Dense { gate, up, down } => {
+            crate::gpu::GraphFfn::Dense {
+                gate,
+                up,
+                down,
+                act,
+            } => {
                 // The tensor knows its own width; the config only knows
                 // the widest. Ask the weight.
                 let ffn_w = model
@@ -24563,6 +24737,7 @@ pub fn forward_token_graph(
                     up,
                     down,
                     width: ffn_w,
+                    act: act.code(),
                 }
             }
             crate::gpu::GraphFfn::Moe {
@@ -25439,6 +25614,8 @@ pub fn forward_token_graph(
     let rms_u = uniform_u32x4(c, [hidden as u32, g, eps.to_bits(), 0]);
     let ax_u = uniform_u32x4(c, [1.0f32.to_bits(), hidden as u32, 0, 0]);
     let silu_u = uniform_u32x4(c, [inter as u32, 0, 0, 0]);
+    // The exact-GELU twin (`silu_mul_pre`'s `_c` = 1) for GELU layers.
+    let gelu_u = uniform_u32x4(c, [inter as u32, 0, 0, 1]);
     let steps = steps.max(1);
     // One uniform PER STEP, with stable identities: write_buffer lands at
     // submit, so a single shared buffer would collapse every step to the
@@ -26133,6 +26310,7 @@ pub fn forward_token_graph(
                         wo,
                         nkv: lnkv,
                         dv: ldv,
+                        hg,
                     },
                     crate::gpu::GraphAttn::Full {
                         q_norm,
@@ -26240,6 +26418,17 @@ pub fn forward_token_graph(
                             ((lnkv * ldv) as u32).div_ceil(256),
                         );
                     }
+                    // Spark-X2.5 head gate logits g = g_proj · n1, beside the
+                    // QKV projections (same input, no dependency on them, so
+                    // no extra barrier). `gout` is free scratch on a
+                    // head-gated layer: it has no Qwen3.5 output gate (the
+                    // builder refuses both), and the rope kernel writes
+                    // `gout` only under that gate's flag.
+                    if let Some(hgm) = hg {
+                        emat(&mut enc, hgm, &n1, &gout, nh, hidden);
+                    }
+                    // true = the attend already scaled each head by its gate.
+                    let mut gate_folded = false;
                     if let Some(views) = o1_here {
                         // O(1) attention: rope as usual, then the three o1
                         // kernels replace kv_append + attend. State mirrors on
@@ -26379,6 +26568,7 @@ pub fn forward_token_graph(
                         // passfuse shortcuts assume the uniform contract
                         // and are never taken here.
                         let gx = c.graph_x.as_ref().expect("checked at admission");
+                        ts_point!(enc, 20); // CMF_GRAPH_TS_ALL: qkv projections
                         let (kbuf, vbuf) = kvbufs[li].as_ref().unwrap();
                         let mcap = xcaps[&li];
                         let slot_u = stp * layers.len() + li;
@@ -26441,6 +26631,7 @@ pub fn forward_token_graph(
                             pass.set_bind_group(0, &bg_kv, &[]);
                             pass.dispatch_workgroups(((g.nkv * hd) as u32).div_ceil(256), 1, 1);
                         }
+                        ts_point!(enc, 22); // rope + kv append
                         if !skip_attn && g.window.is_none() && n > ATTEND_SPLIT_MIN {
                             // Long full-context layer: chunks across
                             // workgroups, then a per-head merge (same pass —
@@ -26484,6 +26675,26 @@ pub fn forward_token_graph(
                             pass.set_pipeline(&gx.merge);
                             pass.set_bind_group(0, &bg_merge, &[]);
                             pass.dispatch_workgroups(nh as u32, 1, 1);
+                        } else if let Some((attend_g, attend_g_l)) =
+                            gx.attend_g.as_ref().filter(|_| !skip_attn && hg.is_some())
+                        {
+                            // Head-gated layer: the split-value attend with
+                            // the gate folded into its output write.
+                            let bg_att = bind_pairs(
+                                c,
+                                attend_g_l,
+                                &[
+                                    (0, &qout),
+                                    (1, kbuf),
+                                    (2, vbuf),
+                                    (3, &attn),
+                                    (4, atx_u),
+                                    (5, &sink_b),
+                                    (8, &gout),
+                                ],
+                            );
+                            go(&mut enc, attend_g, &bg_att, nh as u32);
+                            gate_folded = true;
                         } else if !skip_attn {
                             let bg_att = bind_pairs(
                                 c,
@@ -26499,6 +26710,7 @@ pub fn forward_token_graph(
                             );
                             go(&mut enc, &gx.attend, &bg_att, nh as u32);
                         }
+                        ts_point!(enc, 23); // attend
                     } else {
                         let (kbuf, vbuf) = kvbufs[li].as_ref().unwrap();
                         // rope + kv_append are independent (both read kb, neither
@@ -26509,7 +26721,7 @@ pub fn forward_token_graph(
                         // O-projection ride the SAME pass as rope/kv when they prep —
                         // five passes become one, and dispatch order is unchanged.
                         let short_ctx = !(n_ctx > ATTEND_SPLIT_MIN && (hd <= 128 || c.big_attend));
-                        if passfuse && short_ctx && !skip_attn {
+                        if passfuse && short_ctx && !skip_attn && hg.is_none() {
                             attn_done = true;
                             let (mut ap, al) = attend_pipes(c, hd);
                             let dec_l;
@@ -26600,6 +26812,7 @@ pub fn forward_token_graph(
                             && k_norm.is_none()
                             && !*output_gate
                             && !*late_qk_norm
+                            && hg.is_none()
                         {
                             // Plain heads at short context: rope, the KV
                             // append and the attend in ONE dispatch
@@ -26748,6 +26961,23 @@ pub fn forward_token_graph(
                             &bgc(21, li, &c.layout_gate_mul, &[&gout, &attn, &gm_u]),
                             ((nh * hd) as u32).div_ceil(256),
                         );
+                    }
+                    // Spark-X2.5 head-wise gate, where the attend did not
+                    // fold it in: head h of the attention output *=
+                    // sigmoid(g[h]), g computed beside the QKV projections.
+                    if hg.is_some() && !gate_folded {
+                        if attn_done {
+                            graph_decline("head gate on a fused attention arm");
+                            return token_graph_outcome(o1_started || state_started, false);
+                        }
+                        let gm_u = uniform_u32x4(c, [(nh * ldv) as u32, ldv as u32, 0, 0]);
+                        go(
+                            &mut enc,
+                            &c.gate_mul,
+                            &bgc(36, li, &c.layout_gate_mul, &[&gout, &attn, &gm_u]),
+                            ((nh * ldv) as u32).div_ceil(256),
+                        );
+                        ts_point!(enc, 24); // head gate
                     }
                     if !attn_done {
                         let Some(wo_in) = prism_input(&mut enc, &[wo], &attn, nh * ldv) else {
@@ -27149,8 +27379,12 @@ pub fn forward_token_graph(
                     up,
                     down,
                     width,
+                    act,
                 } => {
                     let inter = *width; // this layer's, not the model's
+                    let act = *act;
+                    // act(gate)·up's uniform: SiLU's is the historical one.
+                    let act_u = if act == 0 { &silu_u } else { &gelu_u };
                     let mut continue_ffn = false;
                     // DUAL (CMF_MV_DUAL=1): gate and up in ONE dispatch —
                     // the elimination table's verdict was the wave drain
@@ -27158,6 +27392,7 @@ pub fn forward_token_graph(
                     // of the four per layer. Falls through to the split
                     // path whenever either side is not plain q4tp.
                     if c.use_mv_dual
+                        && act == 0 // the dsilu-down epilogue is SiLU-only
                         && gate.kind == 2
                         && up.kind == 2
                         && gate.prism == crate::gpu::GraphPrismOp::None
@@ -27189,7 +27424,7 @@ pub fn forward_token_graph(
                             25,
                             li,
                             &c.layout_silu,
-                            &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u],
+                            &[&gbuf, &ubuf, &dummy_hd, &abuf, act_u],
                         );
                         let mut pass = begin_pass(&mut enc);
                         if let Some((p, b, w)) = &ffn_pre {
@@ -27271,7 +27506,7 @@ pub fn forward_token_graph(
                             && c.q4tp_mv16w_probe.is_none();
                         let pgu_fused = if gu_ok {
                             let (b, w) =
-                                mv_gu_bind(c, &gate.buf, &up.buf, &n1, &abuf, inter, hidden);
+                                mv_gu_bind(c, &gate.buf, &up.buf, &n1, &abuf, inter, hidden, act);
                             Some((gu_pipe(c), b, w))
                         } else {
                             None
@@ -27327,7 +27562,7 @@ pub fn forward_token_graph(
                                 26,
                                 li,
                                 &c.layout_silu,
-                                &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u],
+                                &[&gbuf, &ubuf, &dummy_hd, &abuf, act_u],
                             );
                             let mut pass = begin_pass(&mut enc);
                             let fine = ts_full || li < 32;
@@ -27364,7 +27599,7 @@ pub fn forward_token_graph(
                                 26,
                                 li,
                                 &c.layout_silu,
-                                &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u],
+                                &[&gbuf, &ubuf, &dummy_hd, &abuf, act_u],
                             );
                             let mut pass = begin_pass(&mut enc);
                             let fine = ts_full || li < 32;
@@ -27421,7 +27656,7 @@ pub fn forward_token_graph(
                                     27,
                                     li,
                                     &c.layout_silu,
-                                    &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u],
+                                    &[&gbuf, &ubuf, &dummy_hd, &abuf, act_u],
                                 ),
                                 (inter as u32).div_ceil(256),
                             );
@@ -28313,6 +28548,25 @@ pub fn forward_batch_graph_at(
     // incorrect because the `GMat`s below retain evicted buffers until the
     // batch command finishes, producing a full-model transient allocation.
     for l in layers {
+        // No batched arm for the head-wise output gate or a non-SiLU dense
+        // FFN yet: refuse by name before any upload (the builders already
+        // do; this keeps a direct caller from running them as plain).
+        if matches!(
+            &l.attn,
+            crate::gpu::GraphAttn::Full {
+                head_gate: Some(_),
+                ..
+            }
+        ) {
+            bgraph_refused("head-wise output gate (no batched arm)");
+            return batch_outcome(o1_started || state_started, false);
+        }
+        if let crate::gpu::GraphFfn::Dense { act, .. } = &l.ffn {
+            if *act != crate::gpu::GraphAct::Silu {
+                bgraph_refused("non-SiLU dense FFN (no batched arm)");
+                return batch_outcome(o1_started || state_started, false);
+            }
+        }
         if let crate::gpu::GraphAttn::Full {
             geom: Some(g),
             output_gate,
@@ -28687,6 +28941,7 @@ pub fn forward_batch_graph_at(
                 gate: lg,
                 up: lu,
                 down: ld,
+                ..
             } => {
                 // Per-layer FFN width, from the weight rather than the
                 // header — a pruned model narrows it layer by layer.
@@ -33381,6 +33636,8 @@ pub fn q8_matmat_2f(
     cols: usize,
     out: &mut [f32],
 ) -> bool {
+    // MiMo's f32 GEMM contract holds on this entry too (see `q8_matmat`).
+    let _precision = MimoF32Gemm::enter(&model.arch().arch_name);
     let Some(c) = ctx() else { return false };
     if cols % 4 != 0 || rows == 0 || b == 0 || col_field.len() < cols {
         return false;
@@ -36797,6 +37054,25 @@ pub fn chunk_attend(
     scale: f32,
     out: &mut [f32],
 ) -> bool {
+    chunk_attend_win(q, k, v, b, s0, nh, nkv, hd, scale, 0, out)
+}
+
+/// `chunk_attend` with a sliding window (`window` > 0): query `s0 + i` sees
+/// only the keys `s0 + i + 1 - window ..= s0 + i`.
+#[allow(clippy::too_many_arguments)]
+pub fn chunk_attend_win(
+    q: &[f32],
+    k: &[&[f32]],
+    v: &[&[f32]],
+    b: usize,
+    s0: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    scale: f32,
+    window: usize,
+    out: &mut [f32],
+) -> bool {
     let Some(c) = ctx() else { return false };
     let n = s0 + b;
     if nh == 0 || nkv == 0 || b == 0 || hd == 0 || nh % nkv != 0 || n == 0 {
@@ -36879,7 +37155,7 @@ pub fn chunk_attend(
         bf
     };
     let p_qk = params(b as u32, hd as u32, n as u32, scale, s0 as u32, 0);
-    let p_sm = params(b as u32, hd as u32, n as u32, 1.0, s0 as u32, 1);
+    let p_sm = params(b as u32, hd as u32, n as u32, 1.0, s0 as u32, 1 + window as u32);
     let p_pv = params(b as u32, n as u32, hd as u32, 1.0, s0 as u32, 0);
     let p_un = params(nh as u32, b as u32, hd as u32, 1.0, 0, 0);
 
@@ -37140,7 +37416,7 @@ pub fn q4t_ffn(
     inter: usize,
     out: &mut [f32],
 ) -> bool {
-    ffn_q4(model, w1, w3, w2, xs, b, hidden, inter, false, out)
+    ffn_q4(model, w1, w3, w2, xs, b, hidden, inter, false, 0, out)
 }
 
 /// The q4tp twin. Same three GEMMs, same scratch, the ladder layout's
@@ -37240,6 +37516,138 @@ pub fn q8_ffn_packed(
         return false;
     };
     fused_gemm_from_device(model, w2, &act, b, hidden, inter, out)
+}
+
+/// Several projections of one host activation with their results read back
+/// in ONE trip: `out` = [P0 (b·rows0) | P1 (b·rows1) | …], each `idxs` entry
+/// (tensor, rows). Every GEMM is the codec's own `fused_panel_keep`, so the
+/// numbers are those of separate `matmat` calls — only the readback after
+/// each (a host round trip that cost more than a small GEMM) is merged.
+pub fn gemm_many_keep(
+    model: &Arc<CmfModel>,
+    idxs: &[(usize, usize)],
+    xs: &[f32],
+    b: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    let _precision = MimoF32Gemm::enter(&model.arch().arch_name);
+    let Some(c) = ctx() else { return false };
+    let total: usize = idxs.iter().map(|&(_, r)| b * r).sum();
+    if b == 0 || idxs.is_empty() || out.len() < total || xs.len() < b * cols {
+        return false;
+    }
+    let size = (total * 4) as u64;
+    let cat = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("many-cat"),
+        size,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let mut off = 0u64;
+    for &(idx, rows) in idxs {
+        // Each panel lands in the shared result scratch, which the next
+        // projection reuses: it moves into its slot of `cat` first.
+        let Some(panel) = fused_panel_keep(model, idx, xs, b, rows, cols) else {
+            return false;
+        };
+        let len = (b * rows * 4) as u64;
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("many-copy"),
+            });
+        enc.copy_buffer_to_buffer(&panel, 0, &cat, off, len);
+        c.queue.submit(Some(enc.finish()));
+        off += len;
+    }
+    let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("many-stage"),
+        size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("many-read"),
+        });
+    readback(c, enc, &cat, &stage, size, &mut out[..total])
+}
+
+/// The LLM prefill's dense FFN with separate gate, up and down weights in
+/// any codec that has a device GEMM (`q8_row`, `q8_2f`, `q4tp`, mixed): the
+/// gate and up panels stay on the card, the activation folds them there
+/// (`ffn_silu_mul`: 0 SiLU, 1 exact GELU), and down reads the folded panel
+/// from the card. One readback instead of three, and no host pass over the
+/// two b·inter panels — which on a q8_2f prefill cost more than the GEMMs.
+#[allow(clippy::too_many_arguments)]
+pub fn ffn_act_keep(
+    model: &Arc<CmfModel>,
+    w1: usize,
+    w3: usize,
+    w2: usize,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    inter: usize,
+    act: u32,
+    out: &mut [f32],
+) -> bool {
+    let _precision = MimoF32Gemm::enter(&model.arch().arch_name);
+    let Some(c) = ctx() else { return false };
+    let panel = (b * inter * 4) as u64;
+    if b == 0
+        || act > 1
+        || xs.len() < b * hidden
+        || out.len() < b * hidden
+        || panel > PANEL_BUDGET_BYTES as u64
+    {
+        return false;
+    }
+    // `fused_panel_keep` hands back the shared result scratch, which the up
+    // projection reuses: the gate panel moves to a buffer of its own first.
+    let Some(g_scratch) = fused_panel_keep(model, w1, xs, b, inter, hidden) else {
+        return false;
+    };
+    let g = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("ffnact-g"),
+        size: panel,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("ffnact-g"),
+        });
+    enc.copy_buffer_to_buffer(&g_scratch, 0, &g, 0, panel);
+    c.queue.submit(Some(enc.finish()));
+    let Some(u) = fused_panel_keep(model, w3, xs, b, inter, hidden) else {
+        return false;
+    };
+    let p = uniform_u32x4(c, [(b * inter) as u32, 0, 0, act]);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("ffnact-act"),
+        layout: &c.ffn_silu.get_bind_group_layout(0),
+        entries: &[bind_buf(0, &g), bind_buf(1, &u), bind_buf(2, &p)],
+    });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("ffnact-act"),
+        });
+    {
+        let mut pass = begin_pass_with(&mut enc, Some("ffnact-act"), None);
+        pass.set_pipeline(&c.ffn_silu);
+        pass.set_bind_group(0, &bind, &[]);
+        let wgs = ((b * inter) as u32).div_ceil(256);
+        pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
+    }
+    c.queue.submit(Some(enc.finish()));
+    fused_gemm_from_device(model, w2, &g, b, hidden, inter, out)
 }
 
 /// The FFN pair for whichever codec the container is packed in.
@@ -37776,7 +38184,26 @@ pub fn q4tp_ffn(
     inter: usize,
     out: &mut [f32],
 ) -> bool {
-    ffn_q4(model, w1, w3, w2, xs, b, hidden, inter, true, out)
+    ffn_q4(model, w1, w3, w2, xs, b, hidden, inter, true, 0, out)
+}
+
+/// `q4t_ffn` / `q4tp_ffn` with the activation of act(gate)·up named
+/// (`GraphAct::code`: 0 SiLU — the plain entry points — 1 exact GELU).
+#[allow(clippy::too_many_arguments)]
+pub fn q4_ffn_act(
+    model: &Arc<CmfModel>,
+    w1: usize,
+    w3: usize,
+    w2: usize,
+    xs: &[f32],
+    b: usize,
+    hidden: usize,
+    inter: usize,
+    q4tp: bool,
+    act: u32,
+    out: &mut [f32],
+) -> bool {
+    ffn_q4(model, w1, w3, w2, xs, b, hidden, inter, q4tp, act, out)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -37790,10 +38217,11 @@ fn ffn_q4(
     hidden: usize,
     inter: usize,
     q4tp: bool,
+    act: u32,
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
-    if hidden % 32 != 0 || inter % 32 != 0 || b == 0 {
+    if hidden % 32 != 0 || inter % 32 != 0 || b == 0 || act > 1 {
         return false;
     }
     let bytes = model.primary_bytes();
@@ -37871,7 +38299,8 @@ fn ffn_q4(
     // one rewritable buffer cannot serve them.
     let p13 = uniform_u32x4(c, [(hidden / 4) as u32, inter as u32, b as u32, 0]);
     let p2 = uniform_u32x4(c, [(inter / 4) as u32, hidden as u32, b as u32, 0]);
-    let psilu = uniform_u32x4(c, [(b * inter) as u32, 0, 0, 0]);
+    // `_c` = the activation (`ffn_silu_mul`: 0 SiLU, 1 exact GELU).
+    let psilu = uniform_u32x4(c, [(b * inter) as u32, 0, 0, act]);
     let mm = mm_pipeline(c, q4tp, false);
     let mm_layout = mm.get_bind_group_layout(0);
     let bind_mm = |q: &wgpu::Buffer, x: &wgpu::Buffer, y: &wgpu::Buffer, p: &wgpu::Buffer| {
@@ -46447,11 +46876,20 @@ fn main() {
     fn wgpu_q4tp_matvec16w_gu_matches_three_dispatches() {
         // 4096 wide (gpr 128) and 2048 wide (gpr 64, the MiniCPM5-2B
         // hidden), whose reference matvec is the narrow 16-row kernel.
-        gu_matches_three_dispatches(4096);
-        gu_matches_three_dispatches(2048);
+        gu_matches_three_dispatches(4096, 0);
+        gu_matches_three_dispatches(2048, 0);
     }
 
-    fn gu_matches_three_dispatches(cols: usize) {
+    /// The same contract for the exact-GELU arm (`GraphAct::GeluErf`, act
+    /// word 1: Spark-X2.5), plus the activations against the host's
+    /// `gelu_erf(g)·u` on the device's own g and u.
+    #[test]
+    fn wgpu_q4tp_matvec16w_gu_gelu_matches_three_dispatches() {
+        gu_matches_three_dispatches(4096, 1);
+        gu_matches_three_dispatches(2048, 1);
+    }
+
+    fn gu_matches_three_dispatches(cols: usize, act_code: u32) {
         unsafe { std::env::set_var("CMF_GPU", "wgpu") };
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
@@ -46505,7 +46943,7 @@ fn main() {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         encode_q4tp_mv4(c, &mut enc, &gb, &xb, &gy, inter, cols);
         encode_q4tp_mv4(c, &mut enc, &ub, &xb, &uy, inter, cols);
-        let silu_u = uniform_u32x4(c, [inter as u32, 0, 0, 0]);
+        let silu_u = uniform_u32x4(c, [inter as u32, 0, 0, act_code]);
         let bg_silu = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &c.layout_silu,
@@ -46523,7 +46961,7 @@ fn main() {
             pass.set_bind_group(0, &bg_silu, &[]);
             pass.dispatch_workgroups((inter as u32).div_ceil(256), 1, 1);
         }
-        let (bind, wgc) = mv_gu_bind(c, &gb, &ub, &xb, &act, inter, cols);
+        let (bind, wgc) = mv_gu_bind(c, &gb, &ub, &xb, &act, inter, cols, act_code);
         {
             let mut pass = begin_pass(&mut enc);
             pass.set_pipeline(gu_pipe(c));
@@ -46532,29 +46970,49 @@ fn main() {
         }
         let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: (2 * inter * 4) as u64,
+            size: (4 * inter * 4) as u64,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        flush_pass(&enc);
-        enc.copy_buffer_to_buffer(&act_ref, 0, &stage, 0, (inter * 4) as u64);
-        flush_pass(&enc);
-        enc.copy_buffer_to_buffer(&act, 0, &stage, (inter * 4) as u64, (inter * 4) as u64);
+        let row = (inter * 4) as u64;
+        for (k, src) in [&act_ref, &act, &gy, &uy].into_iter().enumerate() {
+            flush_pass(&enc);
+            enc.copy_buffer_to_buffer(src, 0, &stage, k as u64 * row, row);
+        }
         submit(c, finish_enc(enc));
         let slice = stage.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
         let data = slice.get_mapped_range().expect("map");
         let all: &[f32] = bytemuck::cast_slice(&data);
-        let (a, b) = all.split_at(inter);
+        let (a, rest) = all.split_at(inter);
+        let (b, rest) = rest.split_at(inter);
+        let (g, u) = rest.split_at(inter);
         let mism = a
             .iter()
             .zip(b)
             .filter(|(x, y)| x.to_bits() != y.to_bits())
             .count();
         let nz = a.iter().filter(|v| **v != 0.0).count();
+        // The device activation against the host's formula on the same g, u.
+        let host = |gv: f32, uv: f32| match act_code {
+            0 => crate::inference::silu(gv) * uv,
+            _ => crate::inference::gelu_erf(gv) * uv,
+        };
+        let worst = a
+            .iter()
+            .zip(g.iter().zip(u))
+            .map(|(&dv, (&gv, &uv))| {
+                let hv = host(gv, uv);
+                (dv - hv).abs() / hv.abs().max(1e-3)
+            })
+            .fold(0f32, f32::max);
         drop(data);
         stage.unmap();
+        assert!(
+            worst < 1e-5,
+            "act {act_code}: device activation off the host formula by {worst:e} (relative)"
+        );
         assert!(
             nz > inter / 2,
             "reference activations mostly zero — harness wrong"

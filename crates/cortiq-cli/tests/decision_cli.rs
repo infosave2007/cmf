@@ -43,7 +43,7 @@
 //!   key only in its Authorization header, `RUST_LOG=debug` included), then
 //!   from the cache; labels no skill has go to the oracle; without the key
 //!   `no_key` and the command line's hint, but the state directory's cached
-//!   answers still served (read only, 0.8.10); a server holding the state
+//!   answers still served (read only, 0.8.11); a server holding the state
 //!   directory is named; batch rows keep their local columns, the per-run
 //!   `--oracle-budget` caps the calls; nothing is learned. The stop rules
 //!   hold across runs as on a server (another model, a cost above the
@@ -4021,7 +4021,7 @@ fn decide_oracle_asks_only_what_the_gate_rejects_and_hides_the_key() {
     assert!(!stderr_of(&o).contains("server"), "{}", show(&o));
     assert_eq!(mock.requests().len(), before);
     assert!(!state2.exists());
-    // ... on the state directory of the runs above (0.8.10): the text the
+    // ... on the state directory of the runs above (0.8.11): the text the
     // oracle answered is a cache answer, read only (no request, no LOCK,
     // learn.log unchanged); a text it never answered abstains with no_key.
     let log_before = std::fs::read(state.join("learn.log")).unwrap();

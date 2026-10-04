@@ -6,6 +6,27 @@ use cortiq_core::types::NormStyle;
 /// SiLU activation function.
 #[inline(always)]
 /// tanh-approximated GELU (Gemma's GeGLU gate; HF `gelu_pytorch_tanh`).
+/// Exact (erf) GELU, `0.5·x·(1 + erf(x/√2))` — HF `hidden_act = "gelu"`.
+/// erf by Abramowitz–Stegun 7.1.26 (|error| ≤ 1.5e-7), the same formula the
+/// GPU kernels use (WGSL and MSL have no erf).
+#[inline]
+pub fn gelu_erf(x: f32) -> f32 {
+    0.5 * x * (1.0 + erf_f32(x * std::f32::consts::FRAC_1_SQRT_2))
+}
+
+/// erf(x) by Abramowitz–Stegun 7.1.26, |error| ≤ 1.5e-7.
+#[inline]
+pub fn erf_f32(x: f32) -> f32 {
+    let a = x.abs();
+    let t = 1.0 / (1.0 + 0.327_591_1 * a);
+    let y = 1.0
+        - (((((1.061_405_4 * t - 1.453_152_1) * t + 1.421_413_8) * t - 0.284_496_74) * t
+            + 0.254_829_6)
+            * t)
+            * (-a * a).exp();
+    if x < 0.0 { -y } else { y }
+}
+
 pub fn gelu_tanh(x: f32) -> f32 {
     const C: f32 = 0.797_884_6; // √(2/π)
     0.5 * x * (1.0 + (C * (x + 0.044_715 * x * x * x)).tanh())

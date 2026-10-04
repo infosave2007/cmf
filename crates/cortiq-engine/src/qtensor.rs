@@ -1790,20 +1790,47 @@ impl QTensor {
                     return;
                 }
                 let out_addr = SendMut(out.as_mut_ptr());
+                // Over the batch, four positions a row at a time: four
+                // independent chains, each still summing j = 0..cols in the
+                // scalar order (bit-identical to the one-at-a-time loop and
+                // to `matvec_rows`). The batch is the wide axis of a prefill;
+                // the rows may be few (Spark-X2.5's 16-row g_proj spent
+                // 17 ms a layer here split over its rows).
                 let run = |start: usize, end: usize| {
-                    for o in start..end {
-                        let row = &data[o * cols..(o + 1) * cols];
-                        for bi in 0..b {
-                            let x = &xs_all[bi * cols..(bi + 1) * cols];
-                            let mut acc = 0f32;
-                            for j in 0..cols {
-                                acc += row[j] * x[j];
+                    let mut bi = start;
+                    while bi < end {
+                        let n = (end - bi).min(4);
+                        for o in 0..rows {
+                            let row = &data[o * cols..(o + 1) * cols];
+                            if n == 4 {
+                                let x = |k: usize| &xs_all[(bi + k) * cols..(bi + k + 1) * cols];
+                                let (x0, x1, x2, x3) = (x(0), x(1), x(2), x(3));
+                                let (mut a0, mut a1, mut a2, mut a3) = (0f32, 0f32, 0f32, 0f32);
+                                for j in 0..cols {
+                                    let w = row[j];
+                                    a0 += w * x0[j];
+                                    a1 += w * x1[j];
+                                    a2 += w * x2[j];
+                                    a3 += w * x3[j];
+                                }
+                                for (k, acc) in [a0, a1, a2, a3].into_iter().enumerate() {
+                                    unsafe { *out_addr.at((bi + k) * rows + o) = acc };
+                                }
+                            } else {
+                                for k in 0..n {
+                                    let x = &xs_all[(bi + k) * cols..(bi + k + 1) * cols];
+                                    let mut acc = 0f32;
+                                    for j in 0..cols {
+                                        acc += row[j] * x[j];
+                                    }
+                                    unsafe { *out_addr.at((bi + k) * rows + o) = acc };
+                                }
                             }
-                            unsafe { *out_addr.at(bi * rows + o) = acc };
                         }
+                        bi += n;
                     }
                 };
-                dispatch_rows(pool, rows, &run);
+                dispatch_rows(pool, b, &run);
             }
             Self::Mapped {
                 model,
@@ -2318,6 +2345,27 @@ impl QTensor {
                                 return;
                             }
                             crate::gpu::ProbeArm::Gpu => {
+                                // The two-field codec's own entry first, as
+                                // `device_matmat` takes it: the column field
+                                // folds into the weight plane and the GEMM
+                                // runs on the matrix units. The plain int8
+                                // entry below is the scalar f32 GEMM — on a
+                                // Spark-X2.5 4B prefill it ran q|k|v|o at
+                                // host speed.
+                                if *dtype == TensorDtype::Q8_2f
+                                    && std::env::var("CMF_Q8_2F_DEV").as_deref() != Ok("0")
+                                    && crate::gpu::q8_matmat_2f(
+                                        model, *idx, row_scale, col_field, xs_all, b, rows,
+                                        cols, out,
+                                    )
+                                {
+                                    crate::gpu::probe_record(
+                                        crate::gpu::OpClass::Matmat,
+                                        true,
+                                        t0.elapsed(),
+                                    );
+                                    return;
+                                }
                                 let flat: Vec<f32> =
                                     pre.iter().flat_map(|v| v.iter().copied()).collect();
                                 if crate::gpu::q8_matmat(
@@ -11391,6 +11439,26 @@ mod tests {
     }
 
     use super::*;
+
+    /// The f32 `matmat` walks the batch four positions a row at a time; every
+    /// output must still be the scalar-order sum `matvec` gives, bit for bit
+    /// (a 7-row batch covers the four-wide block and the remainder).
+    #[test]
+    fn f32_matmat_equals_matvec_bitwise() {
+        let (rows, cols, b) = (5usize, 37usize, 7usize);
+        let w: Vec<f32> = (0..rows * cols).map(|i| ((i * 7919 % 113) as f32 - 56.0) / 37.0).collect();
+        let xs: Vec<f32> = (0..b * cols).map(|i| ((i * 104_729 % 97) as f32 - 48.0) / 29.0).collect();
+        let t = QTensor::from_f32(w, rows, cols);
+        let mut out = vec![0f32; b * rows];
+        t.matmat(&xs, b, &mut out, None);
+        for bi in 0..b {
+            let mut one = vec![0f32; rows];
+            t.matvec(&xs[bi * cols..(bi + 1) * cols], &mut one, None);
+            for o in 0..rows {
+                assert_eq!(out[bi * rows + o].to_bits(), one[o].to_bits(), "bi {bi} row {o}");
+            }
+        }
+    }
 
     #[test]
     fn q2tp_i8_dot_matches_exact_on_grid() {

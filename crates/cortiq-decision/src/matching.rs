@@ -7,7 +7,7 @@
 //!    then applied to that skill alone;
 //! 2. **exact**: L = A(s) for exactly one skill → decided by the skill's gate;
 //! 3. **subset**: L ⊊ A(s) for exactly one skill, |L| ≥ 2, with evidence
-//!    that the question is the skill's task (0.8.10, see "Subset evidence")
+//!    that the question is the skill's task (0.8.11, see "Subset evidence")
 //!    → decided over L only (argmin, softmax, margin and novelty over L; the
 //!    same T, θ, τ), never certified;
 //! 4. **superset**: A(s) ⊊ L for exactly one skill (the rest of L unknown) →
@@ -54,7 +54,7 @@
 //! match); auto-skills are never matched this way. The match reports `"by":
 //! "descriptions"` next to its kind.
 //!
-//! **Subset evidence** (0.8.10, DESIGN C2.1). A relation claims that the
+//! **Subset evidence** (0.8.11, DESIGN C2.1). A relation claims that the
 //! question *is* the skill's task. An exact relation shows it by itself: the
 //! whole label set of a trained skill is its own question. A subset names
 //! only a part of that set, and a part is evidence of the task only when it
@@ -80,7 +80,7 @@
 //!   something holds of the state — an answer form, not the skill's
 //!   classes, whatever its descriptions (`"yes": "Yes"` restates the word).
 //!   Of the other listed labels, three or more are evidence by their ids
-//!   (as before 0.8.10). Fewer must each be **specific**: a compound name
+//!   (as before 0.8.11). Fewer must each be **specific**: a compound name
 //!   (two words or more, normalized as in C2, such as `card_arrival`),
 //!   which an unrelated question does not use by accident, or a single word
 //!   that the option's description gives as the skill's own name for it —
@@ -91,7 +91,7 @@
 //!   options in the same words. One label alone, beside polar answers or a
 //!   none option, must be compound.
 //!
-//! Measured before 0.8.10 on a public decision benchmark: binary questions
+//! Measured before 0.8.11 on a public decision benchmark: binary questions
 //! of unrelated tasks (aspect presence, tool relevance, sarcasm, answer
 //! selection, causal queries, forecasts) were all taken as a subset of an
 //! intent skill with yes/no intents and answered locally at 1–45 %

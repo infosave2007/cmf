@@ -826,7 +826,7 @@ fn rollback_and_restart_restore_the_served_state() {
         served(&st).model_sha()
     );
     // A local probe (no oracle): an untaught text is not an exact repeat, so
-    // since 0.8.10 the cache no longer answers it from a near lesson and an
+    // since 0.8.11 the cache no longer answers it from a near lesson and an
     // oracle answer would add an example to the buffer this test counts.
     let d = st
         .decide(&body(
