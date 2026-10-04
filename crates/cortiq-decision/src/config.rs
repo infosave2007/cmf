@@ -14,7 +14,7 @@
 //!   "max_tokens_per_question":64,"deadline_s":30,"budget_usd":1.0,"max_calls":10000,"max_errors":30,"redact_pii":true,"title":"cortiq-decision","data_collection":null,
 //!   "probabilities":true,"probability_tokens_per_question":128,"reasoning":"off","reasoning_max_tokens":4096,
 //!   "reasoning_deadline_s":60},
-//!  "cache":{"enabled":true,"threshold":0.97,"cap":50000},
+//!  "cache":{"enabled":true,"threshold":1.0,"legacy_cos":0.9999,"cap":50000},
 //!  "learning":{"enabled":true,"refit_min_new":25,"dedup":0.995,"cold_start":true,"synchronous":false,
 //!   "auto_skills":true,"auto_min_rows":10,"auto_k":8,"auto_tau":0.9,"auto_min_agreement":0.8,
 //!   "auto_min_coverage":0.8,"auto_max_skills":256,"auto_max_labels":64,"auto_max_examples_per_label":1000,
@@ -415,13 +415,23 @@ impl OracleConfig {
     }
 }
 
-/// The semantic cache of oracle answers (spec §5.6).
+/// The cache of oracle answers (spec §5.6, [`crate::cache`]).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CacheConfig {
     pub enabled: bool,
-    /// cos φ_P of a hit.
+    /// Near reuse, opt-in (0.8.10): below 1, an entry of the question's
+    /// scope whose cos φ_P with it is at least this answers it too (and a
+    /// question waits for such a question in flight). 1, the default (0.97
+    /// before 0.8.10): only the same question — scope and input digest —
+    /// hits, or an entry logged before 0.8.10 (`legacy_cos`).
     pub threshold: f32,
+    /// cos φ_P from which an entry logged before 0.8.10 (no input digest)
+    /// answers a question of its scope (0.8.10): default
+    /// [`crate::cache::EXACT_COS`] (0.9999, the text as far as the encoder
+    /// reads it); 1 turns such entries off — they are not loaded and answer
+    /// nothing, near reuse on or not.
+    pub legacy_cos: f32,
     pub cap: usize,
 }
 
@@ -429,7 +439,8 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            threshold: 0.97,
+            threshold: crate::cache::NEAR_OFF,
+            legacy_cos: crate::cache::EXACT_COS,
             cap: 50_000,
         }
     }
@@ -983,6 +994,7 @@ impl Config {
         }
         // cache, learning, feedback
         check_unit("cache.threshold", self.cache.threshold, true)?;
+        check_unit("cache.legacy_cos", self.cache.legacy_cos, true)?;
         ensure!(self.cache.cap >= 1, "cache.cap must be positive");
         ensure!(
             self.learning.refit_min_new >= 1,
@@ -1098,7 +1110,15 @@ mod tests {
         assert_eq!(c.limits.max_inflight, 64);
         assert_eq!(c.oracle.max_price().unwrap(), (0.1, 0.5));
         assert!(!c.oracle.enabled);
-        assert_eq!(c.cache.threshold, 0.97);
+        // Near reuse is opt-in (0.8.10): only the same question hits.
+        assert_eq!(c.cache.threshold, 1.0);
+        let near = Config::from_json(br#"{"cache":{"threshold":0.97}}"#).unwrap();
+        assert_eq!(near.cache.threshold, 0.97);
+        // Entries logged before 0.8.10 answer at cos ≥ 0.9999; 1 turns them
+        // off.
+        assert_eq!(c.cache.legacy_cos, 0.9999);
+        let off = Config::from_json(br#"{"cache":{"legacy_cos":1}}"#).unwrap();
+        assert_eq!(off.cache.legacy_cos, 1.0);
         assert_eq!(c.learning.refit_min_new, 25);
         // The router's plans: every key expires after 30 days.
         for p in ["starter", "developer", "pro", "scale"] {
@@ -1178,6 +1198,8 @@ mod tests {
         assert!(Config::from_json(br#"{"pricing":{"input_usd_per_1m":0.1}}"#).is_err());
         assert!(Config::from_json(br#"{"pricing":{"input_usd_per_1m":"-1"}}"#).is_err());
         assert!(Config::from_json(br#"{"cache":{"threshold":1.5}}"#).is_err());
+        assert!(Config::from_json(br#"{"cache":{"legacy_cos":0}}"#).is_err());
+        assert!(Config::from_json(br#"{"cache":{"legacy_cos":1.01}}"#).is_err());
         assert!(Config::from_json(br#"{"oracle":{"provider":{}}}"#).is_err());
         assert!(Config::from_json(br#"{"auth":{"require":true,"key_prefix":"sk-"}}"#).is_ok());
         assert!(Config::from_json(br#"{"auth":{"admin_token_env":"A B"}}"#).is_err());
