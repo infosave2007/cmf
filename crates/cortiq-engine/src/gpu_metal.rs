@@ -9471,6 +9471,8 @@ pub struct ChunkLayer<'a> {
 /// decides run boundaries.
 pub struct ChunkIo<'a> {
     pub cpu_stored: usize,
+    /// `LayerKvCache::generation` of the rows in `cpu_k`/`cpu_v`.
+    pub cpu_gen: u64,
     pub cpu_k: Vec<&'a [f32]>,
     pub cpu_v: Vec<&'a [f32]>,
     pub out_k: &'a mut [f32],
@@ -9746,6 +9748,7 @@ pub fn chunk_run_gpu(
                     .new_buffer(0, MTLResourceOptions::StorageModeShared),
                 cap: 0,
                 stored: usize::MAX,
+                generation: 0,
             });
             if entry.cap < need {
                 let cap = need.next_power_of_two().max(1024);
@@ -9762,7 +9765,7 @@ pub fn chunk_run_gpu(
                 entry.cap = cap;
                 entry.stored = usize::MAX;
             }
-            if entry.stored != lio.cpu_stored {
+            if entry.stored != lio.cpu_stored || entry.generation != lio.cpu_gen {
                 if lio.cpu_k.len() != nkv || lio.cpu_v.len() != nkv {
                     return false;
                 }
@@ -9788,6 +9791,7 @@ pub fn chunk_run_gpu(
                     }
                 }
                 entry.stored = lio.cpu_stored;
+                entry.generation = lio.cpu_gen;
             }
             unsafe {
                 std::ptr::write_bytes(entry.imp.contents() as *mut u8, 0, need * 4);
@@ -13490,14 +13494,18 @@ fn disp_tg(
 /// Device mirror of one layer's K/V cache: `[nkv, cap, hd]` each, plus
 /// the per-position attention-importance accumulator for this token. The
 /// CPU cache stays the owner of record — `stored` tracks how many CPU
-/// rows the mirror reflects, and any mismatch (eviction, rollback, a
-/// non-graph path having appended) triggers a full re-upload.
+/// rows the mirror reflects and `generation` which storage they came
+/// from (`LayerKvCache::generation`); any mismatch (eviction, rollback, a
+/// non-graph path having appended, a sliding tail's front trim, a clear)
+/// triggers a full re-upload. The count alone is not enough: a trimmed
+/// tail's row count is periodic, so equal counts can hold other rows.
 pub struct KvMirror {
     k: Buffer,
     v: Buffer,
     imp: Buffer,
     cap: usize,
     stored: usize,
+    generation: u64,
 }
 
 // Buffers are retained ObjC pointers, guarded by the registry Mutex.
@@ -14505,6 +14513,7 @@ impl TokenGraph {
             cpu_k: p.cpu_k.clone(),
             cpu_v: p.cpu_v.clone(),
             cpu_stored: p.cpu_stored,
+            cpu_gen: p.cpu_gen,
             o1: None,
             window: p.window,
             head_gate: p.head_gate,
@@ -14881,6 +14890,7 @@ impl TokenGraph {
                         .new_buffer(0, MTLResourceOptions::StorageModeShared),
                     cap: 0,
                     stored: usize::MAX, // force first-touch upload
+                    generation: 0,
                 });
                 if entry.cap < need {
                     let cap = need.next_power_of_two().max(1024);
@@ -14903,9 +14913,9 @@ impl TokenGraph {
                     entry.cap = cap;
                     entry.stored = usize::MAX;
                 }
-                if entry.stored != p.cpu_stored {
+                if entry.stored != p.cpu_stored || entry.generation != p.cpu_gen {
                     // Resync from the owner of record (eviction, rollback,
-                    // a CPU-path append, or a fresh mirror).
+                    // a CPU-path append, a tail trim, or a fresh mirror).
                     if std::env::var("CMF_MIRROR_DBG").is_ok() {
                         eprintln!(
                             "kv-mirror resync L{} : mirror {} vs cpu {} rows",
@@ -14934,6 +14944,7 @@ impl TokenGraph {
                         }
                     }
                     entry.stored = p.cpu_stored;
+                    entry.generation = p.cpu_gen;
                 }
                 let out = (
                     entry.k.clone(),
@@ -16004,6 +16015,9 @@ pub struct AttnDeviceParams<'a> {
     pub cpu_k: Vec<&'a [f32]>,
     pub cpu_v: Vec<&'a [f32]>,
     pub cpu_stored: usize,
+    /// `LayerKvCache::generation` of those rows: with `cpu_stored`, the
+    /// key the mirror is valid under.
+    pub cpu_gen: u64,
     /// Some = this layer attends through the O(1) Nystrom state; the
     /// KV mirror is not touched at all.
     pub o1: Option<O1AttnParams<'a>>,
@@ -17059,6 +17073,7 @@ impl VerifyGraph {
                     .new_buffer(0, MTLResourceOptions::StorageModeShared),
                 cap: 0,
                 stored: usize::MAX,
+                generation: 0,
             });
             if entry.cap < need {
                 let cap = need.next_power_of_two().max(1024);
@@ -17078,7 +17093,7 @@ impl VerifyGraph {
                 entry.cap = cap;
                 entry.stored = usize::MAX;
             }
-            if entry.stored != p.cpu_stored {
+            if entry.stored != p.cpu_stored || entry.generation != p.cpu_gen {
                 for h in 0..p.nkv {
                     if p.cpu_k[h].len() != p.cpu_stored * p.hd
                         || p.cpu_v[h].len() != p.cpu_stored * p.hd
@@ -17093,6 +17108,7 @@ impl VerifyGraph {
                     }
                 }
                 entry.stored = p.cpu_stored;
+                entry.generation = p.cpu_gen;
             }
             let out = (entry.k.clone(), entry.v.clone(), entry.cap, entry.stored);
             entry.stored += b;
