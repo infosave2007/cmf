@@ -46699,11 +46699,20 @@ fn main() {
     fn wgpu_q4tp_matvec16w_gu_matches_three_dispatches() {
         // 4096 wide (gpr 128) and 2048 wide (gpr 64, the MiniCPM5-2B
         // hidden), whose reference matvec is the narrow 16-row kernel.
-        gu_matches_three_dispatches(4096);
-        gu_matches_three_dispatches(2048);
+        gu_matches_three_dispatches(4096, 0);
+        gu_matches_three_dispatches(2048, 0);
     }
 
-    fn gu_matches_three_dispatches(cols: usize) {
+    /// The same contract for the exact-GELU arm (`GraphAct::GeluErf`, act
+    /// word 1: Spark-X2.5), plus the activations against the host's
+    /// `gelu_erf(g)·u` on the device's own g and u.
+    #[test]
+    fn wgpu_q4tp_matvec16w_gu_gelu_matches_three_dispatches() {
+        gu_matches_three_dispatches(4096, 1);
+        gu_matches_three_dispatches(2048, 1);
+    }
+
+    fn gu_matches_three_dispatches(cols: usize, act_code: u32) {
         unsafe { std::env::set_var("CMF_GPU", "wgpu") };
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping");
@@ -46757,7 +46766,7 @@ fn main() {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         encode_q4tp_mv4(c, &mut enc, &gb, &xb, &gy, inter, cols);
         encode_q4tp_mv4(c, &mut enc, &ub, &xb, &uy, inter, cols);
-        let silu_u = uniform_u32x4(c, [inter as u32, 0, 0, 0]);
+        let silu_u = uniform_u32x4(c, [inter as u32, 0, 0, act_code]);
         let bg_silu = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &c.layout_silu,
@@ -46775,7 +46784,7 @@ fn main() {
             pass.set_bind_group(0, &bg_silu, &[]);
             pass.dispatch_workgroups((inter as u32).div_ceil(256), 1, 1);
         }
-        let (bind, wgc) = mv_gu_bind(c, &gb, &ub, &xb, &act, inter, cols, 0);
+        let (bind, wgc) = mv_gu_bind(c, &gb, &ub, &xb, &act, inter, cols, act_code);
         {
             let mut pass = begin_pass(&mut enc);
             pass.set_pipeline(gu_pipe(c));
@@ -46784,29 +46793,49 @@ fn main() {
         }
         let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: (2 * inter * 4) as u64,
+            size: (4 * inter * 4) as u64,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        flush_pass(&enc);
-        enc.copy_buffer_to_buffer(&act_ref, 0, &stage, 0, (inter * 4) as u64);
-        flush_pass(&enc);
-        enc.copy_buffer_to_buffer(&act, 0, &stage, (inter * 4) as u64, (inter * 4) as u64);
+        let row = (inter * 4) as u64;
+        for (k, src) in [&act_ref, &act, &gy, &uy].into_iter().enumerate() {
+            flush_pass(&enc);
+            enc.copy_buffer_to_buffer(src, 0, &stage, k as u64 * row, row);
+        }
         submit(c, finish_enc(enc));
         let slice = stage.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
         let data = slice.get_mapped_range().expect("map");
         let all: &[f32] = bytemuck::cast_slice(&data);
-        let (a, b) = all.split_at(inter);
+        let (a, rest) = all.split_at(inter);
+        let (b, rest) = rest.split_at(inter);
+        let (g, u) = rest.split_at(inter);
         let mism = a
             .iter()
             .zip(b)
             .filter(|(x, y)| x.to_bits() != y.to_bits())
             .count();
         let nz = a.iter().filter(|v| **v != 0.0).count();
+        // The device activation against the host's formula on the same g, u.
+        let host = |gv: f32, uv: f32| match act_code {
+            0 => crate::inference::silu(gv) * uv,
+            _ => crate::inference::gelu_erf(gv) * uv,
+        };
+        let worst = a
+            .iter()
+            .zip(g.iter().zip(u))
+            .map(|(&dv, (&gv, &uv))| {
+                let hv = host(gv, uv);
+                (dv - hv).abs() / hv.abs().max(1e-3)
+            })
+            .fold(0f32, f32::max);
         drop(data);
         stage.unmap();
+        assert!(
+            worst < 1e-5,
+            "act {act_code}: device activation off the host formula by {worst:e} (relative)"
+        );
         assert!(
             nz > inter / 2,
             "reference activations mostly zero — harness wrong"
