@@ -1,4 +1,4 @@
-//! Cache of oracle answers (spec §5.6; exact-first since 0.8.10).
+//! Cache of oracle answers (spec §5.6; exact-first since 0.8.11).
 //!
 //! An entry is `{scope, input, φ_P, answer, ts}`:
 //! * **scope** of a question matched to a skill (exact, subset, superset):
@@ -13,7 +13,7 @@
 //!   scopes. A `cache` answer does tell its caller that some account asked
 //!   the same text (a near-identical one with near reuse on) under the same
 //!   contract;
-//! * **input** (0.8.10, [`input_digest`]) is the sha256 of what the oracle
+//! * **input** (0.8.11, [`input_digest`]) is the sha256 of what the oracle
 //!   read besides the scope, as asked (before PII redaction): the canonical
 //!   JSON `{"state": <state>}`, or for a question that reads its
 //!   instructions (a state-less request, DESIGN A19) `{"instructions":
@@ -33,7 +33,7 @@
 //! 1. **exact** — the earliest entry with the question's input digest hits,
 //!    whatever its φ_P;
 //! 2. **legacy** — an entry replayed from a `learn.log` record written before
-//!    0.8.10 has no digest: the best of those by cos φ_P (the earliest on a
+//!    0.8.11 has no digest: the best of those by cos φ_P (the earliest on a
 //!    tie) hits when cos ≥ `cache.legacy_cos` (default [`EXACT_COS`], 0.9999:
 //!    a repeat of the text as far as the encoder reads it). That is not
 //!    exact — two states that differ past the encoder's 512 tokens, or two
@@ -45,7 +45,7 @@
 //!    entry by cos φ_P, digest or not (the earliest on a tie), hits when cos ≥
 //!    `cache.threshold`.
 //!
-//! The default `cache.threshold` is 1 (0.97 before 0.8.10): near reuse is
+//! The default `cache.threshold` is 1 (0.97 before 0.8.11): near reuse is
 //! off and only the same question hits. Decision states that look alike
 //! differ in the detail that decides — a note in a JSON score, a number in a
 //! causal question, one address in an e-mail — and at 0.97 a Decision Index
@@ -56,15 +56,15 @@
 //! **Put** ([`SemanticCache::put`]): an entry of the same scope, input digest
 //! and verdict makes the put a no-op (a digest-less entry — only a replayed
 //! one — is a no-op next to a digest-less entry of the same scope and verdict
-//! with cos ≥ [`PUT_DEDUP`], the rule before 0.8.10, and is not kept at all
+//! with cos ≥ [`PUT_DEDUP`], the rule before 0.8.11, and is not kept at all
 //! with legacy reuse off); at capacity (50,000) the oldest entry leaves (a
 //! ring). The cache is consulted only for a question
-//! that was escalated — also when the oracle may not be called for it (0.8.10:
+//! that was escalated — also when the oracle may not be called for it (0.8.11:
 //! consent off, the oracle disabled, stopped or out of budget; a hit costs
 //! nothing and sends nothing) — and its puts are kept in `learn.log` and
 //! replayed at start.
 //!
-//! **`learn.log`** (0.8.10): the digest travels in the scope field of the
+//! **`learn.log`** (0.8.11): the digest travels in the scope field of the
 //! unchanged `CachePut` / `CachePutP` record, as the prefix
 //! `exact:<64 hex>|` (`CacheEntry::encode`). A scope starts with `skill:`
 //! or `contract:`, so the prefix is unambiguous: a record without it (every
@@ -102,7 +102,7 @@ use std::collections::{HashMap, VecDeque};
 /// cos φ_P above which a put of a digest-less entry of the same scope and
 /// answer is skipped.
 pub const PUT_DEDUP: f32 = 0.999;
-/// cos φ_P from which a digest-less entry (logged before 0.8.10) answers a
+/// cos φ_P from which a digest-less entry (logged before 0.8.11) answers a
 /// question of its scope by default (`cache.legacy_cos`): the repeat of a
 /// text as far as the encoder reads it.
 pub const EXACT_COS: f32 = 0.9999;
@@ -194,7 +194,7 @@ pub fn reuses(
 pub struct CacheEntry {
     pub scope: String,
     /// The question's input digest ([`input_digest`]); `None` for an entry
-    /// replayed from a record written before 0.8.10.
+    /// replayed from a record written before 0.8.11.
     pub input: Option<InputDigest>,
     pub phi_p: Vec<f32>,
     pub answer: Verdict,
@@ -635,7 +635,7 @@ mod tests {
         );
     }
 
-    /// Entries logged before 0.8.10 carry no digest: by default they answer
+    /// Entries logged before 0.8.11 carry no digest: by default they answer
     /// at cos ≥ EXACT_COS, with near reuse on at the threshold, and their
     /// puts dedup as before.
     #[test]
@@ -833,7 +833,7 @@ mod tests {
     }
 
     /// The cache as one scan of the whole ring per lookup and put (the
-    /// pre-0.8.8 structure, with the 0.8.10 rules).
+    /// pre-0.8.8 structure, with the 0.8.11 rules).
     struct Linear {
         entries: VecDeque<CacheEntry>,
         threshold: f32,

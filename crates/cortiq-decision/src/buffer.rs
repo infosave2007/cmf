@@ -31,7 +31,7 @@
 //! A record of a kind this binary does not know ends the replay the same way
 //! (a 0.8.5 binary on a 0.8.6 state directory truncates the log at its first
 //! contract record, a 0.8.7 binary on a 0.8.8 one at its first cache put
-//! with a distribution — never run an older binary on it). 0.8.10 adds no
+//! with a distribution — never run an older binary on it). 0.8.11 adds no
 //! kind: a cache put's input digest rides in the scope field of its record
 //! ([`crate::cache`]), which a 0.8.9 binary replays as an entry that never
 //! hits.
@@ -958,7 +958,7 @@ mod tests {
         let f = dist.frame();
         assert_eq!(f[8], KIND_CACHE_PUT_P);
         assert_eq!(read_records(&f).0, vec![dist]);
-        // 0.8.10: an entry with its input digest keeps both record kinds
+        // 0.8.11: an entry with its input digest keeps both record kinds
         // (the digest rides in the scope) and comes back whole.
         for answer in [
             OracleAnswer::Score(2).into(),

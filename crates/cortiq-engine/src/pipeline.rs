@@ -384,6 +384,9 @@ pub struct Pipeline {
     pub attn_v_norm: bool,
     /// HunYuan dense: per-head q/k norm runs after RoPE (see the arch flag).
     pub qk_norm_after_rope: bool,
+    /// The per-head `self_attn.g_proj` output gate uses sigmoid
+    /// (Spark-X2.5) instead of softplus (Laguna).
+    pub proj_gate_sigmoid: bool,
     /// Final-logit soft-capping C: logits = C·tanh(logits/C) (Gemma-4).
     pub final_softcap: Option<f32>,
     /// Cortiq Embryo hierarchical head: cluster matrix [C, hidden]. The
@@ -465,6 +468,8 @@ pub enum Act {
     #[default]
     Silu,
     GeluTanh,
+    /// Exact erf GELU (HF `hidden_act = "gelu"`: Spark-X2.5).
+    Gelu,
     /// Kimi-K3 SituAndMul: BOTH halves transform —
     /// a = β·tanh(g/β)·σ(g), up' = linβ·tanh(u/linβ) (linβ>0), out = a·up'.
     Situ {
@@ -477,6 +482,8 @@ impl Act {
     pub fn from_arch(name: &str) -> Self {
         if name == "gelu_tanh" {
             Self::GeluTanh
+        } else if name == "gelu" {
+            Self::Gelu
         } else {
             Self::Silu
         }
@@ -498,6 +505,7 @@ impl Act {
         match self {
             Self::Silu => inference::silu(x),
             Self::GeluTanh => inference::gelu_tanh(x),
+            Self::Gelu => inference::gelu_erf(x),
             Self::Situ { beta, .. } => beta * (x / beta).tanh() * (1.0 / (1.0 + (-x).exp())),
         }
     }
@@ -511,6 +519,17 @@ impl Act {
                 self.apply(g) * (linear_beta * (u / linear_beta).tanh())
             }
             _ => self.apply(g) * u,
+        }
+    }
+
+    /// The wgpu graphs' arm for this activation; None = no device kernel
+    /// computes it, and the graph builder must refuse the layer (the dense
+    /// graph FFN once computed SiLU for whatever the model asked for).
+    pub fn graph_act(self) -> Option<crate::gpu::GraphAct> {
+        match self {
+            Self::Silu => Some(crate::gpu::GraphAct::Silu),
+            Self::Gelu => Some(crate::gpu::GraphAct::GeluErf),
+            Self::GeluTanh | Self::Situ { .. } => None,
         }
     }
 }
@@ -2014,25 +2033,29 @@ impl Pipeline {
             }
             return start;
         }
-        // The graph encodes SiLU FFN and full-context attention with an
-        // explicit model scale. Architectures with sliding windows,
-        // sandwich norms or non-SiLU FFNs still fall back to the CPU path.
-        if self.swa.is_some()
+        // The graph encodes SiLU or exact-GELU FFNs and attention with an
+        // explicit model scale. Sliding-window layers with their own RoPE
+        // table / rotary width ride it too (`metal_graph_swa`): both the
+        // device attend and the sandwich's CPU attend read each layer's
+        // window and table. Sandwich norms and other activations fall back
+        // to the CPU path.
+        let swa_graph = self.metal_graph_swa();
+        if (self.swa.is_some() && !swa_graph)
             || self.global_attn.is_some()
             || self.attention_heads_per_layer.is_some()
             || self.attn_v_norm
             // per-layer KV heads, narrow V, learned sinks (MiMo-V2)
-            || self.graph_attn_decline_reason().is_some()
+            || (self.graph_attn_decline_reason().is_some() && !swa_graph)
             || self.weights.layers.iter().any(|lw| {
                 lw.attn_out_norm.is_some()
                     || lw.ffn_out_norm.is_some()
                     || lw.layer_scale.is_some()
-                    || matches!(&lw.ffn, FfnKind::Dense(d) if d.act != Act::Silu)
+                    || matches!(&lw.ffn, FfnKind::Dense(d) if !matches!(d.act, Act::Silu | Act::Gelu))
             })
         {
-            // The Metal graphs have no per-layer attention geometry (the
-            // wgpu graphs do): say so once, by name.
-            if let Some(reason) = self.graph_attn_decline_reason() {
+            // The Metal graphs' device attend has no per-layer attention
+            // geometry (the wgpu graphs do): say so once, by name.
+            if let Some(reason) = self.graph_attn_decline_reason().filter(|_| !swa_graph) {
                 self.note_graph_decline("metal block graph", reason);
             }
             if std::env::var("CMF_GRAPH_DBG").is_ok() {
@@ -2068,6 +2091,13 @@ impl Pipeline {
                 q_norm: Option<&'a [f32]>,
                 k_norm: Option<&'a [f32]>,
                 output_gate: bool,
+                /// `self_attn.g_proj` output gate (per-head flag): the
+                /// sandwich projects the device-normed input on the host
+                /// and gates the attend's output before O.
+                proj_gate: Option<(&'a QTensor, bool)>,
+                /// The same gate's f32 rows `[nh × hidden]` when the device
+                /// attend can apply it (per-head sigmoid, f32 in RAM).
+                head_gate_w: Option<&'a [f32]>,
                 bias: Option<(&'a [f32], &'a [f32], &'a [f32])>,
                 /// Attend on the device too (no sync): F32 KV, no
                 /// o1/bias, dims inside the kernels' contract.
@@ -2117,6 +2147,8 @@ impl Pipeline {
                         gate: g,
                         up: u,
                         down: dn,
+                        // The front gate admitted SiLU or exact GELU only.
+                        gelu: d.act == Act::Gelu,
                     }
                 }
                 FfnKind::Moe(m) => {
@@ -2195,14 +2227,20 @@ impl Pipeline {
                     q_norm,
                     k_norm,
                     output_gate,
-                    softplus_gate: None,
+                    softplus_gate,
                     bias,
-                } if !self.kv_cache.layers[scan].o1_sealed()
+                } if (!self.kv_cache.layers[scan].o1_sealed()
                     // Sealed o1 stays plannable when the Metal o1 port
                     // is on: full_gpu attends through the device state,
                     // and any refusal falls to the sandwich, whose CPU
                     // core routes sealed layers through the nystrom step.
-                    || std::env::var("CMF_O1_METAL").as_deref() == Ok("1") =>
+                    || std::env::var("CMF_O1_METAL").as_deref() == Ok("1"))
+                    // A projected output gate: Spark-X2.5's per-head
+                    // sigmoid form only (Laguna's softplus gate is
+                    // unmeasured on these paths and keeps the CPU walk).
+                    && softplus_gate
+                        .as_ref()
+                        .is_none_or(|(_, per_head)| *per_head && self.proj_gate_sigmoid) =>
                 {
                     let parts = (
                         wq.metal_graph_parts(),
@@ -2223,7 +2261,16 @@ impl Pipeline {
                     let o1_metal = cache.o1.is_some()
                         && std::env::var("CMF_O1_METAL").as_deref() == Ok("1")
                         && cache.o1_views().is_some();
+                    // The device attend takes the layer's window and RoPE
+                    // table, and the per-head gate from f32 rows; a gate
+                    // held otherwise sandwiches.
+                    let head_gate_w = softplus_gate
+                        .as_ref()
+                        .and_then(|(g, _)| g.f32_parts())
+                        .filter(|&(_, r, c)| r == self.num_heads && c == self.hidden_size)
+                        .map(|(d, _, _)| d);
                     let full_gpu = attend_contract
+                        && softplus_gate.is_none() == head_gate_w.is_none()
                         && cache.mode == crate::kv_cache::KvMode::F32
                         && (cache.o1.is_none() || o1_metal)
                         && bias.is_none()
@@ -2245,6 +2292,8 @@ impl Pipeline {
                         q_norm: q_norm.as_deref(),
                         k_norm: k_norm.as_deref(),
                         output_gate: *output_gate,
+                        proj_gate: softplus_gate.as_ref().map(|(g, per_head)| (g, *per_head)),
+                        head_gate_w,
                         bias: bias
                             .as_ref()
                             .map(|(a, b, c)| (a.as_slice(), b.as_slice(), c.as_slice())),
@@ -2287,6 +2336,10 @@ impl Pipeline {
                 // GDN + 16 attn) the sandwich costs 2x the whole decode
                 // (1.2 vs 2.21 tok/s measured before the arena fix).
                 || (self.head_dim <= 256 && has_gdn)
+                // Sliding-window layers bound most attends by the window:
+                // Spark-X2.5-1.7B q4tp on the M4 decodes 67 tok/s
+                // device-attended against 23 sandwiched (28 syncs/token).
+                || (self.head_dim <= 256 && swa_graph)
                 || attend_mode == "force"
                 || attend_mode == "256");
         if !dev_attend {
@@ -2335,6 +2388,14 @@ impl Pipeline {
             }
             return start;
         };
+        if swa_graph && self.head_dim > 128 {
+            // Spark-X2.5 (hd 256, 4 Q heads per KV head): the GQA-shared
+            // split-K attend reads each K/V row once for the group instead
+            // of once per head plus the importance re-read — at depth 1000
+            // on the M4, 59.5 tok/s against 50.0 with the per-head kernel
+            // up to the default 512 (every sliding layer sits at <= 512).
+            graph.set_attend_blk_from(64);
+        }
         let gcfg = self.gdn_cfg.map(|cfg| GdnGpuCfg {
             nv: cfg.num_v_heads,
             nk: cfg.num_k_heads,
@@ -2431,7 +2492,7 @@ impl Pipeline {
                     && self.kv_cache.layers[*li].o1.is_none()
                     && [l.wq, l.wk, l.wv, l.wo].into_iter().all(one_pass)
                     && match l.ffn {
-                        MetalFfn::Dense { gate, up, down } => {
+                        MetalFfn::Dense { gate, up, down, .. } => {
                             one_pass(gate) && one_pass(up) && one_pass(down)
                         }
                         _ => false,
@@ -2447,22 +2508,29 @@ impl Pipeline {
             }
             None => {
                 graph.set_dense_concurrent(dense_fast);
+                // Spark-X2.5 q8_2f: the four-row q8_2f matvec decodes the
+                // 1.7B at 40.5 tok/s on the M4 against 27.7 one-row.
+                let q8r4 = if swa_graph {
+                    crate::gpu_metal::DENSE_Q8R4
+                } else {
+                    0
+                };
                 crate::gpu_metal::MvFastGuard::set_bits(if dense_fast {
-                    crate::gpu_metal::DENSE_MV | crate::gpu_metal::DENSE_FUSE
+                    crate::gpu_metal::DENSE_MV | crate::gpu_metal::DENSE_FUSE | q8r4
                 } else {
                     0
                 })
             }
         };
 
-        let inv_freq = self.inv_freq.clone();
+        // RoPE table and rotary width are per layer (`layer_inv_freq`,
+        // `layer_geom`) inside the loop below.
         let pool = self.pool.clone();
-        let (nh, nkv, hd, hs, rd, eps) = (
+        let (nh, nkv, hd, hs, eps) = (
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
             self.hidden_size,
-            self.rotary_dim,
             self.rms_eps,
         );
         let norm_style = self.norm_style;
@@ -2521,10 +2589,21 @@ impl Pipeline {
                     q_norm,
                     k_norm,
                     output_gate,
+                    proj_gate,
+                    head_gate_w,
                     bias,
                     full_gpu,
                 } => {
                     let _ia = std::time::Instant::now();
+                    // This layer's attention geometry: its window, RoPE
+                    // table and rotary width (Spark-X2.5 interleaves
+                    // 512-window layers rotating all dims at θ 1e4 with
+                    // full layers rotating a quarter at θ 5e6). Every model
+                    // without sliding layers reads the global ones here.
+                    let inv_freq_l = self.layer_inv_freq(*li);
+                    let rd_l = self.layer_geom(*li).2;
+                    let window_l = self.layer_window(*li);
+                    let head_gate_w = *head_gate_w;
                     // ── Fully device-resident attention: no sync at all.
                     if *full_gpu {
                         let cache = &self.kv_cache.layers[*li];
@@ -2553,7 +2632,7 @@ impl Pipeline {
                             nh,
                             nkv,
                             hd,
-                            rd,
+                            rd: rd_l,
                             position,
                             scale: self.attn_scale,
                             eps: eps as f32,
@@ -2562,11 +2641,13 @@ impl Pipeline {
                             output_gate: *output_gate,
                             q_norm: *q_norm,
                             k_norm: *k_norm,
-                            inv_freq: &inv_freq,
+                            inv_freq: &inv_freq_l,
                             cpu_k,
                             cpu_v,
                             cpu_stored,
                             o1: o1p,
+                            window: window_l,
+                            head_gate: head_gate_w,
                         };
                         let o1_bad = o1_layer && p.o1.is_none();
                         if !o1_bad && graph.attn_device_ok(l, &p) && graph.encode_attn_device(l, &p)
@@ -2607,19 +2688,30 @@ impl Pipeline {
                     let mut k = attention::take_buf(l.wk.1);
                     let mut v = attention::take_buf(l.wv.1);
                     graph.read_qkv(&mut q_raw, &mut k, &mut v);
+                    // Projected output gate: g = G·norm(h) on the host, off
+                    // the normed input the prefix left on the device.
+                    let mut gate_raw = proj_gate.map(|(gp, _)| {
+                        let mut normed = attention::take_buf(hs);
+                        graph.read_normed(&mut normed);
+                        let mut raw = attention::take_buf(gp.rows());
+                        gp.matvec(&normed, &mut raw, pool.as_deref());
+                        attention::recycle_buf(&mut normed);
+                        raw
+                    });
                     let cfg = QwenAttnCfg {
                         num_heads: nh,
                         num_kv_heads: nkv,
                         head_dim: hd,
                         hidden_size: hs,
                         position,
-                        inv_freq: &inv_freq,
-                        rotary_dim: rd,
+                        inv_freq: &inv_freq_l,
+                        rotary_dim: rd_l,
                         scale: self.attn_scale,
                         softcap: self.attn_softcap,
-                        window: None,
+                        window: window_l,
                         v_norm: false,
                         qk_norm_after_rope: self.qk_norm_after_rope,
+                        gate_sigmoid: self.proj_gate_sigmoid,
                         q_norm: *q_norm,
                         k_norm: *k_norm,
                         output_gate: *output_gate,
@@ -2699,7 +2791,10 @@ impl Pipeline {
                             nh,
                             nkv,
                             hd,
-                            rd,
+                            // The layer's own geometry, as the CPU attend
+                            // above used it (the projected gate is applied
+                            // after this probe on both sides).
+                            rd: rd_l,
                             position,
                             scale: self.attn_scale,
                             eps: eps as f32,
@@ -2708,11 +2803,13 @@ impl Pipeline {
                             output_gate: *output_gate,
                             q_norm: *q_norm,
                             k_norm: *k_norm,
-                            inv_freq: &inv_freq,
+                            inv_freq: &inv_freq_l,
                             cpu_k,
                             cpu_v,
                             cpu_stored: stored,
                             o1: None,
+                            window: window_l,
+                            head_gate: None,
                         };
                         if let Some((dq, dk, dv, dao)) = graph.debug_attn_device(l, &p, &h_now) {
                             let md = |a: &[f32], b: &[f32]| {
@@ -2733,6 +2830,20 @@ impl Pipeline {
                         } else {
                             eprintln!("attn-oracle L{li}: device probe declined");
                         }
+                    }
+                    if let (Some(raw), Some((_, per_head))) = (gate_raw.as_deref(), *proj_gate) {
+                        // V is as wide as the head (the front gate), so ao
+                        // is nh·hd here, as in `qwen_attention`.
+                        attention::apply_projected_gate(
+                            &mut ao,
+                            raw,
+                            per_head,
+                            hd,
+                            self.proj_gate_sigmoid,
+                        );
+                    }
+                    if let Some(mut raw) = gate_raw.take() {
+                        attention::recycle_buf(&mut raw);
                     }
                     graph.encode_attn_suffix(l, &ao);
                     // Early commit: the GPU starts O+FFN while the CPU
@@ -2994,6 +3105,7 @@ impl Pipeline {
             inv_freq_global: None,
             attn_v_norm: false,
             qk_norm_after_rope: false,
+            proj_gate_sigmoid: false,
             final_softcap: None,
             head_clusters: None,
             attn_softcap: 0.0,
@@ -3577,6 +3689,7 @@ impl Pipeline {
             window: None,
             v_norm: false,
             qk_norm_after_rope: self.qk_norm_after_rope,
+            gate_sigmoid: self.proj_gate_sigmoid,
             q_norm: None,
             k_norm: None,
             output_gate: false,
@@ -6132,12 +6245,14 @@ impl Pipeline {
                 cpu_k: m.kv.k_heads(),
                 cpu_v: m.kv.v_heads(),
                 geom: None,
+                head_gate: None,
             },
             post_norm: &lw.post_norm,
             ffn: crate::gpu::GraphFfn::Dense {
                 gate: gw(&d.gate_proj)?,
                 up: gw(&d.up_proj)?,
                 down: gw(&d.down_proj)?,
+                act: d.act.graph_act()?,
             },
         };
         let nh = self.num_heads;
@@ -6241,6 +6356,13 @@ impl Pipeline {
         if !d.segs.is_empty() {
             return crate::gpu::BatchGraphOutcome::Declined; // tube layers run on the segmented path
         }
+        // The graph has no arm for a projected output gate, and only the
+        // activations `graph_act` names.
+        let (AttnKind::Full { softplus_gate: None, .. }, Some(gact)) =
+            (&lw.attn, d.act.graph_act())
+        else {
+            return crate::gpu::BatchGraphOutcome::Declined;
+        };
         fn gw(t: &QTensor) -> Option<crate::gpu::GraphW<'_>> {
             let (_, i, kind, rs) = t.graph_weight()?;
             Some(crate::gpu::GraphW {
@@ -6284,12 +6406,14 @@ impl Pipeline {
                 cpu_k: m.kv.k_heads(),
                 cpu_v: m.kv.v_heads(),
                 geom: None,
+                head_gate: None,
             },
             post_norm: &lw.post_norm,
             ffn: crate::gpu::GraphFfn::Dense {
                 gate: gg,
                 up: gu,
                 down: gd,
+                act: gact,
             },
         };
         let positions: Vec<usize> = (first_pos..first_pos + pairs.len()).collect();
@@ -7619,6 +7743,7 @@ impl Pipeline {
                         window: self.layer_window(li),
                         v_norm: self.attn_v_norm,
                         qk_norm_after_rope: self.qk_norm_after_rope,
+                        gate_sigmoid: self.proj_gate_sigmoid,
                         q_norm: q_norm.as_deref(),
                         k_norm: k_norm.as_deref(),
                         output_gate: *output_gate,
@@ -8111,7 +8236,12 @@ impl Pipeline {
                     MetalBatchNllOutcome::Failed(err) => return Err(err),
                 }
             }
-            if self.can_prefill_batched() && !graph_quality {
+            // CMF_NLL_SERIAL=1 scores position by position through the
+            // decode path (the wgpu token graph where it admits the model)
+            // — the perplexity gate of a decode kernel, which the batched
+            // prefill arm below never runs.
+            let force_serial = std::env::var("CMF_NLL_SERIAL").as_deref() == Ok("1");
+            if self.can_prefill_batched() && !graph_quality && !force_serial {
                 // prefill-GEMM: layer-major position chunks, lm_head batched
                 // (254MB lm_head read once per chunk, not per position).
                 // The layer chunk is large (grouping positions by MoE experts
@@ -9064,6 +9194,7 @@ impl Pipeline {
             #[cfg(feature = "gpu")]
             self.pull_lagging_host_kv(li, li + 1, start_pos);
             let lw = &self.weights.layers[self.phys_layer(li)];
+            let t_attn = std::time::Instant::now();
             // ── attention ──
             match &lw.attn {
                 AttnKind::Kda(w) => {
@@ -9212,6 +9343,7 @@ impl Pipeline {
                         window: self.layer_window(li),
                         v_norm: self.attn_v_norm,
                         qk_norm_after_rope: self.qk_norm_after_rope,
+                        gate_sigmoid: self.proj_gate_sigmoid,
                         q_norm: q_norm.as_deref(),
                         k_norm: k_norm.as_deref(),
                         output_gate: *output_gate,
@@ -9339,6 +9471,8 @@ impl Pipeline {
                 .filter(|m| m.ffn_active_count(li) < self.intermediate_size)
                 .and_then(|m| m.ffn_masks.get(li))
                 .map(|v| v.as_slice());
+            let attn_ns = t_attn.elapsed().as_nanos() as u64;
+            let t_ffn = std::time::Instant::now();
             let mut ffn = match &lw.ffn {
                 FfnKind::Dense(d) if !d.segs.is_empty() => {
                     tube_ffn(d, &post, b, pool.as_deref(), mask_row)
@@ -9379,6 +9513,10 @@ impl Pipeline {
                     out
                 }
             };
+            if prefill_prof_on() {
+                PREFILL_SPLIT[0].fetch_add(attn_ns, std::sync::atomic::Ordering::Relaxed);
+                PREFILL_SPLIT[1].fetch_add(t_ffn.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
             if let Some(w) = &lw.ffn_out_norm {
                 for bi in 0..b {
                     inference::rms_norm_into(
@@ -9463,6 +9601,13 @@ impl Pipeline {
             }
         }
         crate::gpu::set_layer(-1); // lm_head/final ops outside layer-split
+        if prefill_prof_on() {
+            eprintln!(
+                "prefill-split: attention {:.1} ms, ffn {:.1} ms (cumulative)",
+                PREFILL_SPLIT[0].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
+                PREFILL_SPLIT[1].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6
+            );
+        }
         // A batched span owns a complete set of positions. Publish any
         // collecting→sealed transition only after every layer has finished;
         // callers that cross into serial/device work must see the new epoch
@@ -9524,10 +9669,12 @@ impl Pipeline {
                 .map(|v| v == "0")
                 .unwrap_or(false)
             || b < 32
-            || self.swa.is_some()
+            // Sliding windows with per-layer RoPE ride the chunk graph
+            // (`metal_graph_swa`: causal_softmax_win, per-layer tables).
+            || (self.swa.is_some() && !self.metal_graph_swa())
             || self.global_attn.is_some()
             // per-layer KV heads, narrow V, learned sinks (MiMo-V2)
-            || self.graph_attn_decline_reason().is_some()
+            || (self.graph_attn_decline_reason().is_some() && !self.metal_graph_swa())
             // Collection owns the exact Q trace and boundary conversion;
             // this chunk graph appends dense KV without feeding that trace.
             || self.o1_active()
@@ -9539,7 +9686,6 @@ impl Pipeline {
         let Some(model) = self.model.clone() else {
             return li0;
         };
-        let inv_freq = self.inv_freq.clone();
         let (nh, nkv, hd, hs) = (
             self.num_heads,
             self.num_kv_heads,
@@ -9556,7 +9702,12 @@ impl Pipeline {
         };
         let mut layers: Vec<crate::gpu_metal::ChunkLayer> = Vec::new();
         let mut stored_at: Vec<usize> = Vec::new();
-        for li in li0..self.num_layers.min(loop_end).min(cap) {
+        let run_end = self.num_layers.min(loop_end).min(cap);
+        // Each layer's own RoPE table (Spark-X2.5: sliding and full layers
+        // differ); the global one for every model without sliding layers.
+        let tables: Vec<std::sync::Arc<Vec<f32>>> =
+            (li0..run_end).map(|li| self.layer_inv_freq(li)).collect();
+        for li in li0..run_end {
             let lw = &self.weights.layers[self.phys_layer(li)];
             if lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some() {
                 break;
@@ -9569,14 +9720,23 @@ impl Pipeline {
                 q_norm,
                 k_norm,
                 output_gate: false,
-                softplus_gate: None,
+                softplus_gate,
                 bias,
             } = &lw.attn
             else {
                 break;
             };
+            // Spark-X2.5's per-head sigmoid g_proj gate, from f32 rows.
+            let head_gate = match softplus_gate {
+                None => None,
+                Some((g, true)) if self.proj_gate_sigmoid => match g.f32_parts() {
+                    Some((d, r, c)) if r == nh && c == hs => Some(d),
+                    _ => break,
+                },
+                Some(_) => break,
+            };
             let FfnKind::Dense(d) = &lw.ffn else { break };
-            if d.act != Act::Silu || !d.segs.is_empty() {
+            if !matches!(d.act, Act::Silu | Act::Gelu) || !d.segs.is_empty() {
                 break;
             }
             // q8_row (row_scale populated), or q4_tiled / q4tp (row_scale
@@ -9624,8 +9784,8 @@ impl Pipeline {
                     .map(|(a, bb, cc)| (a.as_slice(), bb.as_slice(), cc.as_slice())),
                 q_norm: q_norm.as_deref(),
                 k_norm: k_norm.as_deref(),
-                inv_freq: &inv_freq,
-                rd: self.rotary_dim,
+                inv_freq: &tables[li - li0],
+                rd: self.layer_geom(li).2,
                 nh,
                 nkv,
                 hd,
@@ -9634,6 +9794,9 @@ impl Pipeline {
                 gemma: matches!(self.norm_style, cortiq_core::NormStyle::Gemma),
                 late_qk_norm: self.qk_norm_after_rope,
                 eps: self.rms_eps as f32,
+                window: self.layer_window(li),
+                head_gate,
+                gelu: d.act == Act::Gelu,
             });
         }
         if layers.is_empty() {
@@ -9925,6 +10088,38 @@ impl Pipeline {
             return Some("sliding-window layers");
         }
         None
+    }
+
+    /// Can the Metal block graph carry this model's sliding-window layers?
+    /// Both of its attention forms take a layer's own window, RoPE table
+    /// and rotary width: the device attend (`AttnDeviceParams::window`, the
+    /// layer's `inv_freq`/`rd`) and the sandwich's host attend (exactly the
+    /// CPU path's attention). True when the sliding window is the model's
+    /// only attention-level decline (Spark-X2.5); per-layer KV heads,
+    /// narrow V, sinks, Gemma-4 global geometry and scaled RoPE positions
+    /// still decline.
+    ///
+    /// Per-layer Q heads (Laguna) and capped scores (Gemma-2) decline here
+    /// too, with V norm (Gemma-4): the chunk prefill's own gate checks
+    /// neither of the first two, and before this door opened its `swa`
+    /// refusal kept every sliding model with them off the chunk graph.
+    #[cfg(target_os = "macos")]
+    fn metal_graph_swa(&self) -> bool {
+        (self.swa.is_some() || self.sliding_layers.is_some())
+            && self.attention_heads_per_layer.is_none()
+            && !self.attn_v_norm
+            && self.attn_softcap == 0.0
+            && self.kv_heads_per_layer.is_none()
+            && self.v_head_dim.map_or(true, |vd| vd == self.head_dim)
+            && !self.kv_cache.layers.iter().any(|l| l.sinks.is_some())
+            && self.global_attn.is_none()
+            && self.inv_freq_global.is_none()
+            && (0..self.num_layers).all(|li| self.layer_rope_scale(li) == 1.0)
+            && !(0..self.num_layers).any(|li| {
+                self.layer_is_local(li)
+                    && self.inv_freq_local.is_none()
+                    && self.rotary_dim_local.is_some_and(|r| r != self.rotary_dim)
+            })
     }
 
     /// Why the WGPU graphs (whole-token, batched prefill, greedy burst)
@@ -10260,6 +10455,7 @@ impl Pipeline {
                     cpu_k: self.kv_cache.layers[li].k_heads(),
                     cpu_v: self.kv_cache.layers[li].v_heads(),
                     geom: self.graph_attn_geom(li),
+                    head_gate: None,
                 },
             };
             let (nkv, hd, rd) = self.layer_geom(li);
@@ -10808,11 +11004,24 @@ impl Pipeline {
                 // A tube layer is several matrices, not one — the
                 // whole-layer graph has no shape for it yet.
                 FfnKind::Dense(d) if !d.segs.is_empty() => return None,
-                FfnKind::Dense(d) => crate::gpu::GraphFfn::Dense {
-                    gate: gw(&d.gate_proj)?,
-                    up: gw(&d.up_proj)?,
-                    down: gw(&d.down_proj)?,
-                },
+                FfnKind::Dense(d) => {
+                    // An activation the graph has no kernel arm for keeps
+                    // the CPU/per-op owner, by name — the dense graph FFN
+                    // used to compute SiLU for whatever the model asked.
+                    let Some(act) = d.act.graph_act() else {
+                        self.note_graph_decline(
+                            "wgpu token graph",
+                            "dense FFN activation without a graph kernel",
+                        );
+                        return None;
+                    };
+                    crate::gpu::GraphFfn::Dense {
+                        gate: gw(&d.gate_proj)?,
+                        up: gw(&d.up_proj)?,
+                        down: gw(&d.down_proj)?,
+                        act,
+                    }
+                }
                 FfnKind::Moe(m) => {
                     // Adaptive τ and expert masks keep the CPU path, where
                     // they are implemented. Sigmoid routing with a selection
@@ -10972,9 +11181,25 @@ impl Pipeline {
                     softplus_gate,
                     bias,
                 } => {
-                    if softplus_gate.is_some() || self.attention_heads_per_layer.is_some() {
+                    if self.attention_heads_per_layer.is_some() {
                         return None;
                     }
+                    // A projected output gate rides the graph in one form:
+                    // Spark-X2.5's head-wise sigmoid (one g_proj row per Q
+                    // head). Laguna's softplus gate keeps the CPU path.
+                    let head_gate = match softplus_gate {
+                        None => None,
+                        Some((g, true)) if self.proj_gate_sigmoid && !*output_gate => {
+                            Some(gw(g)?)
+                        }
+                        Some(_) => {
+                            self.note_graph_decline(
+                                "wgpu token graph",
+                                "projected softplus / per-element output gate",
+                            );
+                            return None;
+                        }
+                    };
                     let (m, _, _, _) = wq
                         .graph_weight()
                         .or_else(|| wq.graph_weight_descriptor())?;
@@ -10994,6 +11219,7 @@ impl Pipeline {
                         cpu_k: self.kv_cache.layers[li].k_heads(),
                         cpu_v: self.kv_cache.layers[li].v_heads(),
                         geom: self.graph_attn_geom(li),
+                        head_gate,
                     }
                 }
                 AttnKind::LinearGdn(w) => {
@@ -11241,6 +11467,7 @@ impl Pipeline {
                         gate: g,
                         up: u,
                         down: dn,
+                        gelu: false, // SiLU only (the arm above)
                     }
                 }
                 _ => return None,
@@ -11387,6 +11614,8 @@ impl Pipeline {
                 cpu_v,
                 cpu_stored,
                 o1: None,
+                window: None,
+                head_gate: None,
             },
             cpu_stored,
         )
@@ -11970,6 +12199,7 @@ impl Pipeline {
                 gate: g,
                 up: u,
                 down: dn,
+                gelu: d.act == Act::Gelu,
             },
         };
         let (nh, nkv, hd, rd) = (
@@ -12013,6 +12243,8 @@ impl Pipeline {
                 cpu_v,
                 cpu_stored,
                 o1: None,
+                window: None,
+                head_gate: None,
             };
             if !graph.attn_ok(&l, &p) || !graph.encode_attn_b(&l, &p) {
                 return None;
@@ -12228,6 +12460,7 @@ impl Pipeline {
                 gate: g,
                 up: u,
                 down: dn,
+                gelu: d.act == Act::Gelu,
             },
         };
         let (nh, nkv, hd, rd) = (
@@ -12262,6 +12495,8 @@ impl Pipeline {
                 cpu_v,
                 cpu_stored,
                 o1: None,
+                window: None,
+                head_gate: None,
             };
             if !graph.attn_device_ok(&l, &p) || !graph.encode_attn_device(&l, &p) {
                 return None;
@@ -12462,6 +12697,7 @@ impl Pipeline {
                 gate: g,
                 up: u,
                 down: dn,
+                gelu: d.act == Act::Gelu,
             },
         };
         let (nh, nkv, hd, rd) = (
@@ -12525,6 +12761,8 @@ impl Pipeline {
                     cpu_v: cpu_v.clone(),
                     cpu_stored: cpu_stored + j,
                     o1: None,
+                    window: None,
+                    head_gate: None,
                 };
                 if !graph.attn_device_ok(&l, &p) || !graph.encode_attn_device(&l, &p) {
                     return Err(false);
@@ -12690,11 +12928,23 @@ impl Pipeline {
                         }
                         return None;
                     }
-                    FfnKind::Dense(d) => crate::gpu::GraphFfn::Dense {
-                        gate: gw(&d.gate_proj)?,
-                        up: gw(&d.up_proj)?,
-                        down: gw(&d.down_proj)?,
-                    },
+                    FfnKind::Dense(d) => {
+                        let Some(act) = d.act.graph_act() else {
+                            if batch_debug {
+                                eprintln!(
+                                    "batch graph: dense FFN activation {:?} without a graph kernel at layer {li}",
+                                    d.act
+                                );
+                            }
+                            return None;
+                        };
+                        crate::gpu::GraphFfn::Dense {
+                            gate: gw(&d.gate_proj)?,
+                            up: gw(&d.up_proj)?,
+                            down: gw(&d.down_proj)?,
+                            act,
+                        }
+                    }
                     FfnKind::Moe(m) => {
                         // Adaptive τ and expert masks stay on the CPU path.
                         // Sigmoid scores, the selection bias, a routed scale
@@ -12854,6 +13104,9 @@ impl Pipeline {
                             cpu_k: self.kv_cache.layers[li].k_heads(),
                             cpu_v: self.kv_cache.layers[li].v_heads(),
                             geom: self.graph_attn_geom(li),
+                            // The batched graph has no head-gate arm; a
+                            // gated layer is refused above.
+                            head_gate: None,
                         }
                     }
                     AttnKind::LinearGdn(w) => {
@@ -14852,6 +15105,7 @@ impl Pipeline {
                         window: None,
                         v_norm: self.attn_v_norm,
                         qk_norm_after_rope: self.qk_norm_after_rope,
+                        gate_sigmoid: self.proj_gate_sigmoid,
                         q_norm: q_norm.as_deref(),
                         k_norm: k_norm.as_deref(),
                         output_gate: *output_gate,
@@ -14998,6 +15252,7 @@ impl Pipeline {
                                 window: self.layer_window(li),
                                 v_norm: self.attn_v_norm,
                                 qk_norm_after_rope: self.qk_norm_after_rope,
+                                gate_sigmoid: self.proj_gate_sigmoid,
                                 q_norm: q_norm.as_deref(),
                                 k_norm: k_norm.as_deref(),
                                 output_gate: *output_gate,
@@ -15826,6 +16081,16 @@ thread_local! {
         const { std::cell::RefCell::new([Vec::new(), Vec::new(), Vec::new()]) };
 }
 
+/// CMF_PREFILL_PROF: cumulative ns of the batched walk's attention and
+/// FFN halves (all layers, all chunks).
+static PREFILL_SPLIT: [std::sync::atomic::AtomicU64; 2] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+fn prefill_prof_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CMF_PREFILL_PROF").is_some())
+}
+
 fn dense_ffn_batch(
     d: &DenseFfn,
     xs: &[f32],
@@ -15842,8 +16107,11 @@ fn dense_ffn_batch(
     // the LLM prefill was simply never wired to it. A task mask needs the
     // activations on the host between the halves, so it keeps the CPU
     // arm below.
+    // SiLU and the exact GELU (Spark-X2.5) have device arms; `q4_ffn_act`
+    // hands SiLU to the very entry points this used to call.
+    let fused_act = d.act.graph_act();
     if mask_row.is_none()
-        && d.act == Act::Silu
+        && fused_act.is_some()
         && b >= 32
         && crate::gpu::enabled_here()
         && !crate::gpu::mm_killed()
@@ -15864,7 +16132,9 @@ fn dense_ffn_batch(
             d.down_proj.mapped_q4t(),
         ) {
             let mut out = vec![0.0f32; b * hidden];
-            if crate::gpu::q4t_ffn(model, w1, w3, w2, xs, b, hidden, inter, &mut out) {
+            let act = fused_act.expect("checked above");
+            if crate::gpu::q4_ffn_act(model, w1, w3, w2, xs, b, hidden, inter, false, act, &mut out)
+            {
                 return out;
             }
         }
@@ -15878,7 +16148,26 @@ fn dense_ffn_batch(
             d.down_proj.mapped_q4tp(),
         ) {
             let mut out = vec![0.0f32; b * hidden];
-            if crate::gpu::q4tp_ffn(model, w1, w3, w2, xs, b, hidden, inter, &mut out) {
+            let act = fused_act.expect("checked above");
+            if crate::gpu::q4_ffn_act(model, w1, w3, w2, xs, b, hidden, inter, true, act, &mut out)
+            {
+                return out;
+            }
+        }
+        // Every other device codec — int8, or gate/up and down in different
+        // codecs: the three GEMMs with the panels kept on the card. Without
+        // it a q8_2f prefill read both b·inter panels home, folded them on
+        // one host thread, and sent the result back for down.
+        // CMF_FFN_KEEP=0 keeps the per-GEMM path (A/B).
+        if let (true, Some((model, w1)), Some((_, w3)), Some((_, w2))) = (
+            std::env::var("CMF_FFN_KEEP").as_deref() != Ok("0"),
+            d.gate_proj.mapped_device_gemm(),
+            d.up_proj.mapped_device_gemm(),
+            d.down_proj.mapped_device_gemm(),
+        ) {
+            let mut out = vec![0.0f32; b * hidden];
+            let act = fused_act.expect("checked above");
+            if crate::gpu::ffn_act_keep(model, w1, w3, w2, xs, b, hidden, inter, act, &mut out) {
                 return out;
             }
         }

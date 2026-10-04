@@ -4706,6 +4706,12 @@ fn cmd_ppl(
     if windowed.is_none() {
         ids.truncate(max_tokens);
     }
+    // CMF_PPL_IDS_OUT=path: the scored token ids, space-separated — for
+    // diffing the tokenizer against a reference on the same corpus.
+    if let Ok(p) = std::env::var("CMF_PPL_IDS_OUT") {
+        let s: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+        std::fs::write(&p, s.join(" "))?;
+    }
 
     if let Some(offsets) = windowed {
         return ppl_windows(

@@ -339,7 +339,7 @@ fn cache_answers_repeats_and_paraphrases_without_calls() {
     let mock = MockOracle::answering("travel");
     let st = Stand::new(&stand_config(&mock.url()));
     // An empty cache answers nothing without the oracle: a request without
-    // consent fails before any work, as before 0.8.10.
+    // consent fails before any work, as before 0.8.11.
     assert!(!st.cascade.answers_without_oracle());
     let d1 = st.decide(&topics_body(a)).unwrap();
     assert_eq!(d1.questions[0].action, Action::Oracle);
@@ -350,7 +350,7 @@ fn cache_answers_repeats_and_paraphrases_without_calls() {
     assert_eq!(d2.response["answers"]["task"]["choice"], "travel");
     assert_eq!(d2.response["usage"]["cost"].as_f64(), Some(0.0));
     assert_eq!(d2.response["cmf"]["usage"]["oracle"]["calls"], 0);
-    // A paraphrase is another state: by default (0.8.10) only the same
+    // A paraphrase is another state: by default (0.8.11) only the same
     // question hits, so it is a call.
     let d3 = st.decide(&topics_body(p)).unwrap();
     assert_eq!(d3.questions[0].action, Action::Oracle, "paraphrase");
@@ -377,7 +377,7 @@ fn cache_answers_repeats_and_paraphrases_without_calls() {
     );
 
     // Near reuse opted in (`cache.threshold` 0.97, the default before
-    // 0.8.10): the paraphrase is a cache answer.
+    // 0.8.11): the paraphrase is a cache answer.
     let mut near = stand_config(&mock.url());
     near.cache.threshold = 0.97;
     let st3 = Stand::new(&near);

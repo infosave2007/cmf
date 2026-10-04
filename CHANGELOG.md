@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.8.10] - 2026-10-04
+## [0.8.11] - 2026-10-04
 
 ### Changed
 - Decision cache: exact first. An entry carries the sha256 of its
@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   question with the same input waits for a call in flight; a near
   duplicate leads its own call and gets its own answer (ORACLE.md "How a
   question flows", API.md §3.2, §6).
-- An entry logged before 0.8.10 has no digest: it answers at cos ≥
+- An entry logged before 0.8.11 has no digest: it answers at cos ≥
   `cache.legacy_cos` (new key, default 0.9999; or at `cache.threshold` with
   near reuse on). That is not exact — states that differ only past the
   encoder's 512 tokens, or state-less questions that differ only in the
@@ -84,7 +84,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Compatibility
 - `learn.log` gains no record kind: the input digest rides in the scope
   field of the `CachePut` / `CachePutP` records (`exact:<64 hex>|<scope>`).
-  Records of 0.8.9 and older replay unchanged; a 0.8.9 binary on a 0.8.10
+  Records of 0.8.9 and older replay unchanged; a 0.8.9 binary on a 0.8.11
   state directory keeps the whole log and reads the new entries as a scope
   it never looks up (they never hit there).
 - The state directory now holds the sha256 of every cached question's input
@@ -92,6 +92,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (ORACLE.md "What leaves the machine").
 - `POST /v1/admin/oracle {"enabled": false}` and the stop rules stop calls,
   not cached answers: only `cache.enabled: false` (a restart) stops those.
+
+## [0.8.10] - 2026-10-04
+
+### Added
+- Spark-X2.5 (`model_type: spark2_5`, XHToken/Spark-X2.5-1.7B and -4B):
+  `cortiq convert` maps the checkpoint (`model.embedding` as the tied
+  embedding, the fused `q_k_v_proj` split into q|k|v, `out_proj`, the
+  nested full/sliding RoPE profiles, the 512-token sliding window), and the
+  engine runs its three new parts: the exact erf GELU of the gated MLP
+  (`Act::Gelu`), the head-wise sigmoid output gate `g_proj`, and the
+  per-layer attention geometry (three sliding layers rotating all 256 dims
+  at θ 1e4, then one full layer rotating 64 at θ 5e6). f16 perplexity equals
+  transformers (10.500 at 1024 tokens), and the greedy text is identical.
+- Vulkan: Spark runs on the whole-token graph — GELU arms of the fused
+  gate|up and FFN kernels (the activation code rides in a free uniform word,
+  SiLU paths unchanged), the g_proj matvec beside q|k|v, and the gate folded
+  into the attend (`gqa_attend_x4g`). The builder now refuses an activation
+  with no kernel arm by name instead of computing SiLU for it. RTX 2000 Ada,
+  `bench --core`: 1.7B q8_2f 33 → 85.5 tok/s, 4B q8_2f 11.3 → 40.4, 4B q4tp
+  11.5 → 59. `CMF_NLL_SERIAL=1` scores `ppl` through the decode path.
+- Metal: Spark decodes on the block graph (per-layer RoPE tables and
+  windows in the device attend, `head_gate_sigmoid`, `gelu_mul_pre` and the
+  fused `q4tp_matvec_m_gu_gelu`) and prefills on the chunk graph
+  (`causal_softmax_win`). Only Spark's shape of sliding model is admitted.
+  M4: 1.7B q4tp 41 → 67 tok/s, 4B q4tp 15.9 → 29.6; text identical to the
+  CPU.
+- Server: Spark's tool calls (`<tool_call>NAME<arg_key>K</arg_key>
+  <arg_value>V</arg_value></tool_call>`) become `tool_calls`; a value is a
+  string where the tool's schema says string and parsed JSON otherwise, and
+  the name must be one of the declared tools.
+- `CMF_PPL_IDS_OUT=path` writes the token ids `ppl` scores; `CMF_PREFILL_PROF`
+  also splits the batched prefill walk into attention and FFN time.
+
+### Changed
+- Vulkan prefill of dense models (every codec with a device GEMM, not only
+  Spark):
+  - the FFN keeps the gate and up panels on the card and folds the
+    activation there (`ffn_act_keep`; q4t/q4tp keep their fused kernel). It
+    used to read both b·inter panels home and fold them on one host thread;
+  - a q8_2f projection takes the matrix-unit GEMM (`q8_matmat_2f`), not the
+    scalar f32 one;
+  - q|k|v come back in one readback;
+  - the f32 GEMM walks the batch four positions per row. Every sum keeps
+    its scalar order, so the output is bit-identical (Spark's 16-row
+    `g_proj`: 17 → 2 ms a layer).
+
+  1000-token prompt on an RTX 2000 Ada: Spark-X2.5-4B q8_2f 59 → 220
+  tok/s, 1.7B q8_2f 127 → 548, Qwen3-0.6B q8_2f 360 → 755. Perplexity is
+  unchanged, and greedy text is identical. `CMF_FFN_KEEP=0` and
+  `CMF_QKV_KEEP=0` restore the old paths for A/B.
+- Spark's sliding layers attend on the card past their window as well. The
+  device softmax takes the window in its causal word, and the portable
+  fallback honours it.
+
+### Fixed
+- Server: a chat template that opens the reasoning block in the prompt
+  (Spark ends the generation prompt in `<think>`) used to return a reply
+  holding only `</think>`; the opener is put back, so the reply reads
+  `<think>…</think>answer` as for other thinking models.
+- Server: `enable_thinking: false` no longer injects its "output only the
+  final answer" system directive when the request offers tools — it talked
+  the model out of calling them (Spark-X2.5-1.7B: 2 of 6 calls with it, 4 of
+  6 without).
 
 ## [0.8.9] - 2026-10-03
 

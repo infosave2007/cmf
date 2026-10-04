@@ -420,14 +420,14 @@ impl OracleConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct CacheConfig {
     pub enabled: bool,
-    /// Near reuse, opt-in (0.8.10): below 1, an entry of the question's
+    /// Near reuse, opt-in (0.8.11): below 1, an entry of the question's
     /// scope whose cos φ_P with it is at least this answers it too (and a
     /// question waits for such a question in flight). 1, the default (0.97
-    /// before 0.8.10): only the same question — scope and input digest —
-    /// hits, or an entry logged before 0.8.10 (`legacy_cos`).
+    /// before 0.8.11): only the same question — scope and input digest —
+    /// hits, or an entry logged before 0.8.11 (`legacy_cos`).
     pub threshold: f32,
-    /// cos φ_P from which an entry logged before 0.8.10 (no input digest)
-    /// answers a question of its scope (0.8.10): default
+    /// cos φ_P from which an entry logged before 0.8.11 (no input digest)
+    /// answers a question of its scope (0.8.11): default
     /// [`crate::cache::EXACT_COS`] (0.9999, the text as far as the encoder
     /// reads it); 1 turns such entries off — they are not loaded and answer
     /// nothing, near reuse on or not.
@@ -1110,11 +1110,11 @@ mod tests {
         assert_eq!(c.limits.max_inflight, 64);
         assert_eq!(c.oracle.max_price().unwrap(), (0.1, 0.5));
         assert!(!c.oracle.enabled);
-        // Near reuse is opt-in (0.8.10): only the same question hits.
+        // Near reuse is opt-in (0.8.11): only the same question hits.
         assert_eq!(c.cache.threshold, 1.0);
         let near = Config::from_json(br#"{"cache":{"threshold":0.97}}"#).unwrap();
         assert_eq!(near.cache.threshold, 0.97);
-        // Entries logged before 0.8.10 answer at cos ≥ 0.9999; 1 turns them
+        // Entries logged before 0.8.11 answer at cos ≥ 0.9999; 1 turns them
         // off.
         assert_eq!(c.cache.legacy_cos, 0.9999);
         let off = Config::from_json(br#"{"cache":{"legacy_cos":1}}"#).unwrap();

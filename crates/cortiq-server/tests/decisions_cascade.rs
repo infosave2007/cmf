@@ -8,7 +8,7 @@
 //!   cache; the escalation audit and the metrics;
 //! * gate-accepted questions never reach the oracle, even with `cmf.oracle`;
 //! * cache: a repeat makes no call, a paraphrase only with near reuse opted
-//!   in (0.8.10); single flight: two parallel identical HTTP requests make one
+//!   in (0.8.11); single flight: two parallel identical HTTP requests make one
 //!   call;
 //! * learning: 25 oracle answers promote (generation 1, isolation of every other
 //!   task, the next similar request local); rollback and restart over HTTP
@@ -22,7 +22,7 @@
 //!   questions get 502;
 //! * consent: `oracle.enabled: false`, `cmf.oracle: false`, a key with
 //!   `oracle_allowed: false`, router `allow_oracle: false` — 0 calls;
-//! * the cache without the oracle (0.8.10): without consent, and with the
+//! * the cache without the oracle (0.8.11): without consent, and with the
 //!   oracle switched off, stopped or out of budget, a cache hit is served
 //!   with no call and a miss keeps its refusal — an error names every
 //!   untrained question, as 0.8.9 did, never which ones the cache held;
@@ -998,12 +998,12 @@ async fn a_repeat_and_a_paraphrase_are_cache_answers_without_calls() {
     assert_eq!(r2.body["answers"]["task"]["choice"], "travel");
     assert_eq!(r2.body["usage"]["cost"].as_f64(), Some(0.0));
     assert_eq!(r2.body["cmf"]["usage"]["oracle"]["calls"], 0);
-    // A paraphrase is another state: by default (0.8.10) only the same
+    // A paraphrase is another state: by default (0.8.11) only the same
     // question hits, so it is a call.
     assert_eq!(srv.decide(&topics_body(p)).await.action(), "oracle");
     assert_eq!(mock.hits(), 2);
     // Near reuse opted in (`cache.threshold` 0.97, the default before
-    // 0.8.10): the paraphrase is a cache answer.
+    // 0.8.11): the paraphrase is a cache answer.
     let mut near = stand_config(&mock.url());
     near.cache.threshold = 0.97;
     let srv = Srv::new(&near);
@@ -1671,7 +1671,7 @@ fn logged_cache_puts(state: &Path) -> usize {
         .count()
 }
 
-/// 0.8.10: the answers the system already holds are served when the oracle
+/// 0.8.11: the answers the system already holds are served when the oracle
 /// may not be called for the request — a key without `oracle_allowed`,
 /// `cmf.oracle: false`, the router's `allow_oracle: false` — with no call;
 /// a miss keeps the refusal of 0.8.9 (`consent_off`, 422).
@@ -1767,7 +1767,7 @@ async fn a_request_without_oracle_consent_gets_cache_hits_and_no_call() {
     assert_eq!(l["cache"]["hits"], 6, "{}", l["cache"]);
 }
 
-/// 0.8.10: an oracle disabled (in the configuration or by the admin),
+/// 0.8.11: an oracle disabled (in the configuration or by the admin),
 /// stopped by a stop rule or out of budget still serves what the cache holds
 /// (also replayed after a restart); a miss keeps its flag, 422 or 503.
 #[tokio::test]
@@ -1872,7 +1872,7 @@ async fn a_disabled_stopped_or_exhausted_oracle_still_serves_cache_hits() {
     assert_eq!(mock.hits(), 5);
 }
 
-/// 0.8.10: single flight follows the cache's rule. By default only the same
+/// 0.8.11: single flight follows the cache's rule. By default only the same
 /// question waits for a call in flight (a near duplicate leads its own and
 /// gets its own answer). With near reuse opted in a paraphrase follows and
 /// gets the leader's answer, but nothing is cached under its own input — the
@@ -1940,7 +1940,7 @@ async fn single_flight_follows_the_cache_rule_and_never_caches_another_inputs_an
 
 /// A `learn.log` written by 0.8.9 (cache puts without an input digest)
 /// replays unchanged: its entries answer an exact repeat (cos φ_P ≥ 0.9999)
-/// and nothing nearer; a 0.8.9 binary reads the 0.8.10 records (their digest
+/// and nothing nearer; a 0.8.9 binary reads the 0.8.11 records (their digest
 /// rides in the scope). `cache.legacy_cos: 1` turns those entries off on the
 /// same state directory (they are not loaded), so the oracle pass gives each
 /// question an entry with its digest, which answers it from then on.
@@ -2012,7 +2012,7 @@ fn two_untrained(cmf: Option<Value>) -> Value {
     body(json!("x"), json!({"u": score_question(), "v": v}), cmf)
 }
 
-/// 0.8.10: a request refused the oracle is answered from the cache alone,
+/// 0.8.11: a request refused the oracle is answered from the cache alone,
 /// and when a question the cache misses fails it, the error names every
 /// untrained question — exactly the 0.8.9 error, whether the cache held
 /// some of them or nothing — never which ones the cache held (a failed

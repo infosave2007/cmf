@@ -4,11 +4,11 @@
 //! rejected them, or they are untrained) and only after its own consent checks
 //! (`oracle.enabled`, the key's `oracle_allowed`, `cmf.oracle` /
 //! `default_per_request`); without that consent it asks the cache alone
-//! (0.8.10, step 1). A question the gate accepted never reaches it (spec
+//! (0.8.11, step 1). A question the gate accepted never reaches it (spec
 //! §5.1). For one request (spec §5.2):
 //! 1. **permission**: the admin switch, a key in the environment, no stop
 //!    reason, a budget left (globally, calls, the key's `oracle_budget_usd`
-//!    and what its `credit_usd` has left); otherwise (0.8.10) every question
+//!    and what its `credit_usd` has left); otherwise (0.8.11) every question
 //!    the cache answers is answered from it — no call, nothing sent — and
 //!    the others are refused (`oracle_disabled`, `no_key`, `stopped`,
 //!    `budget`). A request the service's own consent checks refused
@@ -17,13 +17,13 @@
 //!    has no cost and no egress;
 //! 2. **cache** ([`crate::cache`]): a hit answers the question at no cost —
 //!    by default only the same question (scope and input digest) hits;
-//!    near reuse at cos φ_P ≥ `cache.threshold` is opt-in (0.8.10);
+//!    near reuse at cos φ_P ≥ `cache.threshold` is opt-in (0.8.11);
 //! 3. **single flight**: a question of the same scope as one in flight in
 //!    another request, with the same input (or, near reuse on, cos φ_P ≥
 //!    `cache.threshold`: [`crate::cache::reuses`]), waits for that call and
 //!    reuses its answer (as a cache answer); the others lead. A follower of
 //!    the same input puts the answer in the cache and `learn.log` as an
-//!    oracle answer is (0.8.10; it dedups with its leader's put, whichever
+//!    oracle answer is (0.8.11; it dedups with its leader's put, whichever
 //!    comes first). A follower of another input (near reuse) stores nothing:
 //!    the oracle never read its input, and an entry under its digest would
 //!    answer it exactly — after near reuse is turned off as well;
@@ -297,7 +297,7 @@ fn answer_from(
     (resolved, misses)
 }
 
-/// A state directory's cache of oracle answers, read only (0.8.10): what
+/// A state directory's cache of oracle answers, read only (0.8.11): what
 /// `cortiq decide --oracle` without a usable key answers from — the oracle's
 /// answers to earlier runs (or a server) on that directory, by the rules of
 /// the cascade's cache — with no call, no lock taken and nothing written.
@@ -1255,7 +1255,7 @@ impl Escalator for Cascade {
         let keys = QuestionKeys::of(e);
         let (phis, scopes, inputs) = (&keys.phis, &keys.scopes, &keys.inputs);
         if let Err(r) = inner.oracle.permission(&caller) {
-            // What the cache holds is answered all the same (0.8.10): no
+            // What the cache holds is answered all the same (0.8.11): no
             // call, nothing sent; only the misses are refused.
             let (resolved, misses) = inner.answer_from_cache(&keys, r);
             if r == RefusalReason::Budget && !misses.is_empty() {
@@ -1486,7 +1486,7 @@ impl Escalator for Cascade {
             let r = match slot.wait(wait) {
                 Some(Resolution::Oracle(a)) => {
                     // The answer to this very question (the leader's input):
-                    // cached and logged as an oracle answer is (0.8.10; the
+                    // cached and logged as an oracle answer is (0.8.11; the
                     // leader's put and this one dedup, whichever comes
                     // first). A near duplicate's is not: the oracle never
                     // read its input, and an entry under its digest would
@@ -1522,7 +1522,7 @@ impl Escalator for Cascade {
         }
     }
 
-    /// The cache alone (0.8.10): a request the service's consent checks
+    /// The cache alone (0.8.11): a request the service's consent checks
     /// refused is answered with what the cache holds — no call, nothing
     /// sent, no single flight, nothing learned, no sighting — and its misses
     /// are refused with `refused`.
@@ -1540,7 +1540,7 @@ impl Escalator for Cascade {
 
     /// The cache is on and holds something: an empty cache answers
     /// nothing, so a request without consent then fails before any work
-    /// as before 0.8.10.
+    /// as before 0.8.11.
     fn answers_without_oracle(&self) -> bool {
         self.inner.cfg.cache.enabled && !self.inner.cache.lock().is_empty()
     }

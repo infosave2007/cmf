@@ -44,7 +44,7 @@
 //!   (`OPENROUTER_API_KEY is not set (decide --oracle reads the key from the
 //!   environment)`), also when labels no skill has leave only the oracle.
 //!   Without a usable key `decide --oracle` still answers what the state
-//!   directory's cache holds (0.8.10: read only, no call, no `LOCK`, nothing
+//!   directory's cache holds (0.8.11: read only, no call, no `LOCK`, nothing
 //!   written); the rest is refused `no_key` / `bad_key`;
 //! * `cortiq decision init | train | add-skill | learn | info | verify |
 //!   materialize | rollback | keys | oracle check`;
@@ -1087,7 +1087,7 @@ impl BatchTally {
 }
 
 /// The oracle of `decide --oracle` without a usable key: an undetermined
-/// question the state directory's cache holds is answered from it (0.8.10,
+/// question the state directory's cache holds is answered from it (0.8.11,
 /// as a server answers it from its cache when its key is missing), every
 /// other one is refused with `no_key` (the variable is unset) or `bad_key`
 /// (it holds something that is not a key), as a server refuses it — no
@@ -2275,7 +2275,7 @@ pub enum KeysCmd {
         /// (default: true, as imported router keys; --oracle-allowed=false
         /// creates a key that never calls the oracle — its undetermined
         /// questions are still answered from the server's shared cache when
-        /// it holds the same question, 0.8.10). The server's oracle switch,
+        /// it holds the same question, 0.8.11). The server's oracle switch,
         /// budgets and stop rules still apply
         #[arg(
             long,

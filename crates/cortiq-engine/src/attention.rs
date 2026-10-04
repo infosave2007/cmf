@@ -686,6 +686,9 @@ pub struct QwenAttnCfg<'a> {
     /// HunYuan dense: the per-head q/k RMSNorm runs AFTER RoPE
     /// (`ModelArch::qk_norm_after_rope`). False = norm, then rotate.
     pub qk_norm_after_rope: bool,
+    /// `softplus_gate` applies sigmoid instead of softplus (Spark-X2.5's
+    /// head-wise output gate; Laguna's is softplus).
+    pub gate_sigmoid: bool,
     /// Norm-weight semantics for qk-norm (same as the layer norms).
     pub norm_style: cortiq_core::NormStyle,
     /// Qwen2-family q/k/v projection biases (added after the matvecs).
@@ -1231,17 +1234,30 @@ fn softplus(x: f32) -> f32 {
     x.max(0.0) + (-x.abs()).exp().ln_1p()
 }
 
-fn apply_projected_gate(ao: &mut [f32], raw: &[f32], per_head: bool, head_dim: usize) {
+pub(crate) fn apply_projected_gate(
+    ao: &mut [f32],
+    raw: &[f32],
+    per_head: bool,
+    head_dim: usize,
+    sigmoid: bool,
+) {
+    let act = |g: f32| {
+        if sigmoid {
+            1.0 / (1.0 + (-g).exp())
+        } else {
+            softplus(g)
+        }
+    };
     if per_head {
         for (h, &g) in raw.iter().enumerate() {
-            let gain = softplus(g);
+            let gain = act(g);
             for a in &mut ao[h * head_dim..(h + 1) * head_dim] {
                 *a *= gain;
             }
         }
     } else {
         for (a, &g) in ao.iter_mut().zip(raw) {
-            *a *= softplus(g);
+            *a *= act(g);
         }
     }
 }
@@ -1359,7 +1375,7 @@ pub fn qwen_attention(
     if let (Some(raw), Some((_, per_head))) = (projected.as_deref(), cfg.softplus_gate) {
         // A gate is refused at load when V is narrower than the head
         // (the core output is compacted), so ao is nh·head_dim here.
-        apply_projected_gate(&mut ao, raw, per_head, cfg.head_dim);
+        apply_projected_gate(&mut ao, raw, per_head, cfg.head_dim, cfg.gate_sigmoid);
     }
     let mut out = take_buf(cfg.hidden_size);
     let prof = crate::cpuprof::time(crate::cpuprof::Slot::AttnO);
@@ -1460,16 +1476,63 @@ pub fn qwen_attention_batch(
             }
             _ => false,
         };
+    // Any other device codec: q|k|v (and the projected gate) as separate
+    // GEMMs on the card, read back in one trip instead of one each.
+    let mut projected_all: Option<Vec<f32>> = None;
+    let fused = fused
+        || (crate::gpu::enabled_here()
+            && !crate::gpu::mm_killed()
+            && b >= 32
+            && std::env::var("CMF_QKV_KEEP").as_deref() != Ok("0")
+            && match (
+                wq.mapped_device_gemm(),
+                wk.mapped_device_gemm(),
+                wv.mapped_device_gemm(),
+                cfg.softplus_gate.map(|(p, _)| p.mapped_device_gemm()),
+            ) {
+                // A projected gate in another codec (Spark keeps its 16-row
+                // g_proj in f32) stays a host GEMM below; q|k|v still go.
+                (Some((model, iq)), Some((mk, ik)), Some((mv, iv)), gate)
+                    if std::sync::Arc::ptr_eq(model, mk) && std::sync::Arc::ptr_eq(model, mv) =>
+                {
+                    let gate = gate.flatten().filter(|(mg, _)| std::sync::Arc::ptr_eq(model, mg));
+                    let (rk, rv) = (wk.rows(), wv.rows());
+                    let mut idxs = vec![(iq, qrows), (ik, rk), (iv, rv)];
+                    let rg = match (gate, cfg.softplus_gate) {
+                        (Some((_, ig)), Some((p, _))) => {
+                            idxs.push((ig, p.rows()));
+                            p.rows()
+                        }
+                        _ => 0,
+                    };
+                    let mut cat = take_buf(b * (qrows + rk + rv + rg));
+                    let ok = crate::gpu::gemm_many_keep(model, &idxs, normed_all, b, cfg.hidden_size, &mut cat);
+                    if ok {
+                        let (e1, e2, e3) = (b * qrows, b * (qrows + rk), b * (qrows + rk + rv));
+                        q_all.copy_from_slice(&cat[..e1]);
+                        k_all.copy_from_slice(&cat[e1..e2]);
+                        v_all.copy_from_slice(&cat[e2..e3]);
+                        if rg > 0 {
+                            projected_all = Some(cat[e3..e3 + b * rg].to_vec());
+                        }
+                    }
+                    recycle_buf(&mut cat);
+                    ok
+                }
+                _ => false,
+            });
     if !fused {
         wq.matmat(normed_all, b, &mut q_all, cfg.pool);
         wk.matmat(normed_all, b, &mut k_all, cfg.pool);
         wv.matmat(normed_all, b, &mut v_all, cfg.pool);
     }
-    let mut projected_all = cfg.softplus_gate.map(|(proj, _)| {
-        let mut values = take_buf(b * proj.rows());
-        proj.matmat(normed_all, b, &mut values, cfg.pool);
-        values
-    });
+    if projected_all.is_none() {
+        projected_all = cfg.softplus_gate.map(|(proj, _)| {
+            let mut values = take_buf(b * proj.rows());
+            proj.matmat(normed_all, b, &mut values, cfg.pool);
+            values
+        });
+    }
 
     // ── per-position: bias, gate split, qk-norm, partial RoPE, append;
     //    the attend either runs per position (exact historical order)
@@ -1481,10 +1544,26 @@ pub fn qwen_attention_batch(
     // attend_chunk, the portable fallback) know neither a window nor a
     // learned sink: such layers keep the per-position grouped attend,
     // which carries both.
+    // A window wider than every key this chunk can see (the cache's rows
+    // plus the chunk) masks nothing: each query's window then starts at
+    // row 0, which is exactly the full causal attend — so a short prompt
+    // on a sliding layer (Spark-X2.5: 512) keeps the batched attend.
+    // Taken only on Spark-X2.5 (`gate_sigmoid`, the one architecture whose
+    // prefill parity was measured on it): every other windowed model
+    // (Gemma-3, Phi-3, Laguna, ...) keeps its historical per-position
+    // attend bit for bit. The identity holds for all of them — widen this
+    // after measuring one.
+    let window_masks = cfg
+        .window
+        .is_some_and(|w| !cfg.gate_sigmoid || cache.seq_len + b > w);
+    // A window that does mask: the wgpu chunk softmax applies it itself
+    // (`chunk_attend_win`), and the portable fallback below honours it too.
+    // Spark-X2.5 only, as above.
+    let device_window = window_masks && cfg.gate_sigmoid && crate::gpu::chunk_attend_windowed();
     let attend_ok = b >= 32
         && cache.mode == crate::kv_cache::KvMode::F32
         && cfg.softcap == 0.0 // capped scores: per-position attend (correctness first)
-        && cfg.window.is_none()
+        && (!window_masks || device_window)
         && cache.sinks.is_none();
     // The device can batch it on any architecture. That matters because
     // the CPU twin needs Accelerate or the NEON micro-GEMM, so x86 had
@@ -1495,11 +1574,15 @@ pub fn qwen_attention_batch(
     // machine with no CPU twin (x86) a refusal after this point would
     // leave the output zeroed, so refusal must be impossible short of a
     // lost device.
+    // A projected gate is applied to `ao_all` after the batched attend, so
+    // it does not need the device to know it. Admitted for Spark-X2.5's
+    // head-wise sigmoid only: Laguna's softplus gate keeps the CPU attend
+    // it has always had (no Laguna parity was measured on this arm).
     let gpu_attend = attend_ok
         && crate::gpu::enabled_here()
         && !crate::gpu::mm_killed()
         && !cfg.output_gate
-        && cfg.softplus_gate.is_none()
+        && (cfg.softplus_gate.is_none() || cfg.gate_sigmoid)
         && nh > 0
         && nkv > 0
         && hd > 0
@@ -1614,7 +1697,7 @@ pub fn qwen_attention_batch(
                 (projected_all.as_deref(), cfg.softplus_gate)
             {
                 let raw = &all[bi * proj.rows()..(bi + 1) * proj.rows()];
-                apply_projected_gate(&mut ao, raw, per_head, hd);
+                apply_projected_gate(&mut ao, raw, per_head, hd, cfg.gate_sigmoid);
             }
             ao_all[bi * nh * hd..(bi + 1) * nh * hd].copy_from_slice(&ao);
             recycle_buf(&mut ao);
@@ -1664,7 +1747,7 @@ pub fn qwen_attention_batch(
                 }
                 if let (Some(all), Some((pj, per_head))) = (proj, cfg.softplus_gate) {
                     let raw = &all[bi * pj.rows()..(bi + 1) * pj.rows()];
-                    apply_projected_gate(ao, raw, per_head, hd);
+                    apply_projected_gate(ao, raw, per_head, hd, cfg.gate_sigmoid);
                 }
             }
         };
@@ -1686,18 +1769,23 @@ pub fn qwen_attention_batch(
                     qhm[h * b * hd + bi * hd..h * b * hd + (bi + 1) * hd].copy_from_slice(src);
                 }
             }
-            let ks: Vec<&[f32]> = (0..nkv).map(|g| cache.head_keys(g)).collect();
-            let vs: Vec<&[f32]> = (0..nkv).map(|g| cache.head_values(g)).collect();
-            done = crate::gpu::chunk_attend(
+            // Under a masking window only the rows the first query can still
+            // see go up: `lo` is the oldest of them.
+            let w = if device_window { cfg.window.unwrap_or(0) } else { 0 };
+            let lo = if w > 0 { (s0 + 1).saturating_sub(w) } else { 0 };
+            let ks: Vec<&[f32]> = (0..nkv).map(|g| &cache.head_keys(g)[lo * hd..]).collect();
+            let vs: Vec<&[f32]> = (0..nkv).map(|g| &cache.head_values(g)[lo * hd..]).collect();
+            done = crate::gpu::chunk_attend_win(
                 &qhm,
                 &ks,
                 &vs,
                 b,
-                s0,
+                s0 - lo,
                 nh,
                 nkv,
                 hd,
                 cfg.scale,
+                w,
                 &mut ao_all,
             );
             recycle_buf(&mut qhm);
@@ -1736,17 +1824,20 @@ pub fn qwen_attention_batch(
             }
             let out_ptr = OutPtr(ao_all.as_mut_ptr());
             let (qr, sc) = (&q_rope_all, cfg.scale);
+            let win = if device_window { cfg.window } else { None };
             let run = |start: usize, end: usize| {
                 for bi in start..end {
                     let lim = s0 + bi + 1;
+                    let lo = win.map_or(0, |w| lim.saturating_sub(w));
                     for h in 0..nh {
                         let kv = h / heads_per_kv;
                         let (ks, vs) = (cache.head_keys(kv), cache.head_values(kv));
                         if ks.len() < n * hd || vs.len() < n * hd {
                             continue;
                         }
+                        let (ks, vs) = (&ks[lo * hd..], &vs[lo * hd..]);
                         let q = &qr[bi * nh * hd + h * hd..bi * nh * hd + (h + 1) * hd];
-                        let mut probs = vec![0f32; lim];
+                        let mut probs = vec![0f32; lim - lo];
                         let mut mx = f32::NEG_INFINITY;
                         for (j, p) in probs.iter_mut().enumerate() {
                             let krow = &ks[j * hd..(j + 1) * hd];
@@ -1787,6 +1878,7 @@ pub fn qwen_attention_batch(
                     &all[bi * proj.rows()..(bi + 1) * proj.rows()],
                     per_head,
                     hd,
+                    cfg.gate_sigmoid,
                 );
             }
         }
@@ -1845,7 +1937,7 @@ pub fn qwen_attention_nystrom(
         apply_gate(&mut ao, &p.gate);
     }
     if let (Some(raw), Some((_, per_head))) = (projected.as_deref(), cfg.softplus_gate) {
-        apply_projected_gate(&mut ao, raw, per_head, cfg.head_dim);
+        apply_projected_gate(&mut ao, raw, per_head, cfg.head_dim, cfg.gate_sigmoid);
     }
     let mut out = vec![0.0f32; cfg.hidden_size];
     wo.matvec(&ao, &mut out, cfg.pool);
@@ -1992,8 +2084,8 @@ pub fn qwen_attention_pair(
         let mut g1 = take_buf(proj.rows());
         let mut g2 = take_buf(proj.rows());
         proj.matvec2(h1, h2, &mut g1, &mut g2, cfg.pool);
-        apply_projected_gate(&mut a1, &g1, per_head, hd);
-        apply_projected_gate(&mut a2, &g2, per_head, hd);
+        apply_projected_gate(&mut a1, &g1, per_head, hd, cfg.gate_sigmoid);
+        apply_projected_gate(&mut a2, &g2, per_head, hd, cfg.gate_sigmoid);
         recycle_buf(&mut g1);
         recycle_buf(&mut g2);
     }
@@ -2140,6 +2232,7 @@ mod tests {
             window,
             v_norm: false,
             qk_norm_after_rope: false,
+            gate_sigmoid: false,
             q_norm: None,
             k_norm: None,
             output_gate: false,
@@ -2445,6 +2538,7 @@ mod tests {
             window: None,
             v_norm: false,
             qk_norm_after_rope: false,
+            gate_sigmoid: false,
             q_norm: None,
             k_norm: None,
             output_gate: false,
@@ -2496,6 +2590,7 @@ mod tests {
             window: None,
             v_norm: true,
             qk_norm_after_rope: false,
+            gate_sigmoid: false,
             q_norm: None,
             k_norm: None,
             output_gate: false,
@@ -2559,6 +2654,7 @@ mod tests {
             window: None,
             v_norm: false,
             qk_norm_after_rope: false,
+            gate_sigmoid: false,
             norm_style: cortiq_core::NormStyle::Qwen,
             bias: None,
             pool: None,
@@ -2764,6 +2860,7 @@ mod qk_norm_order_tests {
             window: None,
             v_norm: false,
             qk_norm_after_rope: late,
+            gate_sigmoid: false,
             q_norm: Some(qw),
             k_norm: Some(kw),
             output_gate: false,
