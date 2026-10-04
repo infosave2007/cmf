@@ -2000,6 +2000,64 @@ kernel void silu_mul_pre(
     act[i] = (gv / (1.0f + exp(-gv))) * u[i] * cv;
 }
 
+// erf by Abramowitz–Stegun 7.1.26 (|error| <= 1.5e-7): the host's
+// `inference::erf_f32` term for term (MSL has no erf).
+inline float erf_as(float x) {
+    float a = fabs(x);
+    float t = 1.0f / (1.0f + 0.3275911f * a);
+    float y = 1.0f
+        - (((((1.0614054f * t - 1.4531521f) * t + 1.4214138f) * t - 0.28449674f) * t
+            + 0.2548296f) * t) * exp(-a * a);
+    return x < 0.0f ? -y : y;
+}
+
+// Exact (erf) GELU, `inference::gelu_erf` (HF hidden_act "gelu": Spark-X2.5).
+inline float gelu_erf(float x) {
+    return 0.5f * x * (1.0f + erf_as(x * 0.70710678f));
+}
+
+// `silu_mul_pre` with the exact GELU in place of SiLU (same bindings).
+kernel void gelu_mul_pre(
+    device const float* g   [[buffer(0)]],
+    device const float* u   [[buffer(1)]],
+    device const float* col [[buffer(2)]],
+    device float*       act [[buffer(3)]],
+    constant uint&      n   [[buffer(4)]],
+    constant uint&      has_col [[buffer(5)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= n) return;
+    float cv = has_col != 0 ? col[i] : 1.0f;
+    act[i] = gelu_erf(g[i]) * u[i] * cv;
+}
+
+// Per-head projected output gate (Spark-X2.5 `self_attn.g_proj`): head h
+// of the attention output scales by sigmoid(G[h]·x), x the layer's normed
+// input — the host's `apply_projected_gate` (per-head, sigmoid). One
+// simdgroup per head: the [n] dot, then the gain over the head's hd lanes.
+kernel void head_gate_sigmoid(
+    device float*       ao  [[buffer(0)]],
+    device const float* gw  [[buffer(1)]],
+    device const float* x   [[buffer(2)]],
+    constant uint&      nh  [[buffer(3)]],
+    constant uint&      hd  [[buffer(4)]],
+    constant uint&      n   [[buffer(5)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tg   [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    uint h = tg * sgs + sg;
+    if (h >= nh) return;
+    device const float* row = gw + (ulong)h * n;
+    float acc = 0.0f;
+    for (uint i = lane; i < n; i += 32u) acc += row[i] * x[i];
+    float g = simd_sum(acc);
+    float gain = 1.0f / (1.0f + exp(-g));
+    device float* a = ao + (ulong)h * hd;
+    for (uint d = lane; d < hd; d += 32u) a[d] *= gain;
+}
+
 // Full attention on the device — one simdgroup per head throughout.
 // Dims contract (checked host-side): hd % 4 == 0, hd <= 256, and for
 // RoPE lane-local pairing (rd/2) % 32 == 0 with rd <= hd.
@@ -4803,6 +4861,84 @@ kernel void q4tp_matvec_m_gu(
     }
 }
 
+// `q4tp_matvec_m_gu` with the exact GELU in its epilogue (Spark-X2.5):
+// the same two-matrix walk, `gelu_mul_pre`'s expression on the way out.
+kernel void q4tp_matvec_m_gu_gelu(
+    device const uchar* qg   [[buffer(0)]],
+    device const float* x    [[buffer(1)]],
+    device float*       act  [[buffer(2)]],
+    constant uint&      gpr  [[buffer(3)]],
+    constant uint&      rows [[buffer(4)]],
+    device const uchar* qu   [[buffer(5)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    threadgroup float lad[8u * 8u * 32u];
+    uint r0 = (tgpos * sgs + sg) * 4u;
+    bool active = r0 < rows;
+    uint nr = active ? min(rows - r0, 4u) : 0u;
+    ulong params_off = (ulong)rows * (ulong)gpr * 16ul;
+    ulong codes_off  = params_off + (ulong)rows * 4ul;
+    uint  stride     = (gpr * 5u + 7u) / 8u;
+    for (uint ri = 0u; ri < nr; ++ri) {
+        device const half* pg = (device const half*)(qg + params_off + (ulong)(r0 + ri) * 4ul);
+        device const half* pu = (device const half*)(qu + params_off + (ulong)(r0 + ri) * 4ul);
+        lad[(sg * 8u + ri) * 32u + lane] = exp2((float)pg[0] + (float)lane * (float)pg[1]);
+        lad[(sg * 8u + 4u + ri) * 32u + lane] = exp2((float)pu[0] + (float)lane * (float)pu[1]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!active) return;
+    const float4 sc = float4(1.0f, 1.0f / 16.0f, 1.0f / 256.0f, 1.0f / 4096.0f);
+    float ag0 = 0.0f, ag1 = 0.0f, ag2 = 0.0f, ag3 = 0.0f;
+    float au0 = 0.0f, au1 = 0.0f, au2 = 0.0f, au3 = 0.0f;
+    for (uint g = lane; g < gpr; g += 32u) {
+        device const float4* xv = (device const float4*)(x + g * 32u);
+        float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+        float4 x4 = xv[4], x5 = xv[5], x6 = xv[6], x7 = xv[7];
+        float4 s4 = x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+        float m8 = -8.0f * (s4.x + s4.y + s4.z + s4.w);
+        x0 *= sc; x1 *= sc; x2 *= sc; x3 *= sc; x4 *= sc; x5 *= sc; x6 *= sc; x7 *= sc;
+        uint bit = g * 5u;
+        uint cb  = bit >> 3u;
+        uint shf = bit & 7u;
+        for (uint j = 0u; j < 2u * nr; ++j) {
+            uint ri = j >> 1u;
+            bool up = (j & 1u) != 0u;
+            device const uchar* q = up ? qu : qg;
+            uint r = r0 + ri;
+            uint4 b = *(device const uint4*)(q + ((ulong)r * gpr + (ulong)g) * 16ul);
+            device const uchar* cp = q + codes_off + (ulong)r * (ulong)stride + cb;
+            uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
+            float scale = lad[(sg * 8u + (up ? 4u : 0u) + ri) * 32u + code];
+            float gsum = dot(q4_nib4_scaled(b.x), x0) + dot(q4_nib4_scaled(b.x >> 16), x1)
+                       + dot(q4_nib4_scaled(b.y), x2) + dot(q4_nib4_scaled(b.y >> 16), x3)
+                       + dot(q4_nib4_scaled(b.z), x4) + dot(q4_nib4_scaled(b.z >> 16), x5)
+                       + dot(q4_nib4_scaled(b.w), x6) + dot(q4_nib4_scaled(b.w >> 16), x7);
+            float contrib = scale * (gsum + m8);
+            if (j == 0u) ag0 += contrib;
+            else if (j == 1u) au0 += contrib;
+            else if (j == 2u) ag1 += contrib;
+            else if (j == 3u) au1 += contrib;
+            else if (j == 4u) ag2 += contrib;
+            else if (j == 5u) au2 += contrib;
+            else if (j == 6u) ag3 += contrib;
+            else au3 += contrib;
+        }
+    }
+    ag0 = simd_sum(ag0); ag1 = simd_sum(ag1); ag2 = simd_sum(ag2); ag3 = simd_sum(ag3);
+    au0 = simd_sum(au0); au1 = simd_sum(au1); au2 = simd_sum(au2); au3 = simd_sum(au3);
+    if (lane == 0u) {
+        float cv = 1.0f;
+        float gv = ag0;
+        act[r0] = gelu_erf(gv) * au0 * cv;
+        if (nr > 1u) { gv = ag1; act[r0 + 1u] = gelu_erf(gv) * au1 * cv; }
+        if (nr > 2u) { gv = ag2; act[r0 + 2u] = gelu_erf(gv) * au2 * cv; }
+        if (nr > 3u) { gv = ag3; act[r0 + 3u] = gelu_erf(gv) * au3 * cv; }
+    }
+}
+
 // `q4tp_matvec` over the FIRST `rows_do` rows of a `rows`-row tensor: the
 // planes are laid out by the full row count, the dispatch stops early —
 // the draft head's vocabulary shortlist (CMF_DRAFT_VOCAB).
@@ -6521,6 +6657,8 @@ struct Ctx {
     q4tp_m: ComputePipelineState,
     /// `q4tp_matvec_m_gu`: fused gate|up|SiLU of the dense decode.
     q4tp_mgu: ComputePipelineState,
+    /// `q4tp_matvec_m_gu_gelu`: the same with the exact GELU.
+    q4tp_mgu_gelu: ComputePipelineState,
     /// Standalone q2tp matvec with explicit ordinary/affine centre.
     q2tp: ComputePipelineState,
     /// Production affine Prism sign/zero-select matvec; legal tensors only.
@@ -6571,6 +6709,10 @@ struct Ctx {
     qkn: ComputePipelineState,
     stateup: ComputePipelineState,
     silu: ComputePipelineState,
+    /// `gelu_mul_pre`: the exact-GELU twin of `silu` (dense GELU FFNs).
+    gelu: ComputePipelineState,
+    /// `head_gate_sigmoid`: per-head projected output gate (Spark-X2.5).
+    hgate: ComputePipelineState,
     axpy: ComputePipelineState,
     zero: ComputePipelineState,
     rqkn: ComputePipelineState,
@@ -6768,6 +6910,7 @@ fn init() -> Result<Ctx, String> {
     let q4tp = pso("q4tp_matvec")?;
     let q4tp_m = pso("q4tp_matvec_m")?;
     let q4tp_mgu = pso("q4tp_matvec_m_gu")?;
+    let q4tp_mgu_gelu = pso("q4tp_matvec_m_gu_gelu")?;
     let q2tp = pso("q2tp_matvec")?;
     let q2tp_affine = pso("q2tp_affine_select_matvec")?;
     let q2tpmm = pso("q2tp_mul_mm")?;
@@ -6806,6 +6949,8 @@ fn init() -> Result<Ctx, String> {
     let qkn = pso("gdn_qk_norms")?;
     let stateup = pso("gdn_state_update")?;
     let silu = pso("silu_mul_pre")?;
+    let gelu = pso("gelu_mul_pre")?;
+    let hgate = pso("head_gate_sigmoid")?;
     let axpy = pso("axpy")?;
     let zero = pso("fill_zero")?;
     let rqkn = pso("attn_rope_qkn")?;
@@ -6877,6 +7022,7 @@ fn init() -> Result<Ctx, String> {
         q4tp,
         q4tp_m,
         q4tp_mgu,
+        q4tp_mgu_gelu,
         q2tp,
         q2tp_affine,
         q2tpmm,
@@ -6915,6 +7061,8 @@ fn init() -> Result<Ctx, String> {
         qkn,
         stateup,
         silu,
+        gelu,
+        hgate,
         axpy,
         zero,
         rqkn,
@@ -7783,6 +7931,16 @@ pub const DENSE_MV: u8 = 1;
 pub const DENSE_CONC: u8 = 2;
 /// Fused epilogues: h += O·ao, gate|up|SiLU in one pass, h += Down·act.
 pub const DENSE_FUSE: u8 = 4;
+/// q8_2f projections take the four-row `q8f_matvec_r4` (same per-row
+/// accumulation order as `q8f_matvec`, x·col read once per four rows).
+/// Opened per plan (Spark-X2.5); `CMF_Q8_R4=1` forces it everywhere,
+/// `=0` closes it.
+pub const DENSE_Q8R4: u8 = 8;
+
+/// Whether this thread's q8_2f projections take `q8f_matvec_r4`.
+fn q8r4_on() -> bool {
+    MV_FAST.with(|f| f.get() & DENSE_Q8R4 != 0)
+}
 
 /// Whether q4tp decode matvecs encoded on this thread take the
 /// masked-nibble kernel (`q4tp_matvec_m`).
@@ -7822,17 +7980,20 @@ impl MvFastGuard {
         MvFastGuard { prev }
     }
 
-    /// `DENSE_MV` / `DENSE_FUSE` bits (other bits ignored).
+    /// `DENSE_MV` / `DENSE_FUSE` / `DENSE_Q8R4` bits (others ignored).
     pub fn set_bits(bits: u8) -> MvFastGuard {
         static ENV: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
         let allowed = *ENV.get_or_init(|| {
             let off = |k: &str| std::env::var(k).as_deref() == Ok("0");
-            let mut a = DENSE_MV | DENSE_FUSE;
+            let mut a = DENSE_MV | DENSE_FUSE | DENSE_Q8R4;
             if off("CMF_METAL_MVFAST") {
                 a &= !DENSE_MV;
             }
             if off("CMF_METAL_FUSE") {
                 a &= !DENSE_FUSE;
+            }
+            if off("CMF_Q8_R4") {
+                a &= !DENSE_Q8R4;
             }
             a
         });
@@ -7871,6 +8032,7 @@ pub fn dense_ab_arm() -> Option<(u8, usize)> {
                     'm' => DENSE_MV,
                     'c' => DENSE_CONC,
                     'f' => DENSE_FUSE,
+                    'r' => DENSE_Q8R4,
                     _ => return None,
                 };
             }
@@ -8024,8 +8186,9 @@ fn encode_q4tp_matvec_m_add(
     );
 }
 
-/// act = silu(G·x) ⊙ (U·x) in one dispatch (`q4tp_matvec_m_gu`); both
-/// tensors are `rows × gpr·32` q4tp.
+/// act = silu(G·x) ⊙ (U·x) in one dispatch (`q4tp_matvec_m_gu`; `gelu`:
+/// the exact GELU instead, `q4tp_matvec_m_gu_gelu`); both tensors are
+/// `rows × gpr·32` q4tp.
 #[allow(clippy::too_many_arguments)]
 fn encode_q4tp_matvec_m_gu(
     c: &Ctx,
@@ -8037,9 +8200,10 @@ fn encode_q4tp_matvec_m_gu(
     act: &Buffer,
     rows: usize,
     gpr: usize,
+    gelu: bool,
 ) {
     note_weight_bytes(&ProjKind::Q4tp, 2 * rows, gpr);
-    enc.set_compute_pipeline_state(&c.q4tp_mgu);
+    enc.set_compute_pipeline_state(if gelu { &c.q4tp_mgu_gelu } else { &c.q4tp_mgu });
     fbuf.bind(enc, 0, abs_g);
     enc.set_buffer(1, Some(xs), 0);
     enc.set_buffer(2, Some(act), 0);
@@ -8588,9 +8752,10 @@ fn encode_q8_matvec(
     static R4: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // Four-row reuse is an opt-in probe: on the fanless M4 it reduced x/col
     // traffic but the register-pressure/occupancy trade was neutral to slower
-    // across alternating runs. Keep the one-row kernel as the measured default.
-    let r4 =
-        col_buf.is_some() && *R4.get_or_init(|| std::env::var("CMF_Q8_R4").as_deref() == Ok("1"));
+    // across alternating runs. Keep the one-row kernel as the measured default;
+    // a plan opens it per thread (`DENSE_Q8R4`) where it was measured faster.
+    let r4 = col_buf.is_some()
+        && (*R4.get_or_init(|| std::env::var("CMF_Q8_R4").as_deref() == Ok("1")) || q8r4_on());
     enc.set_compute_pipeline_state(if r4 {
         &c.q8f_r4
     } else if col_buf.is_some() {
@@ -8848,7 +9013,7 @@ pub fn q4tp_fused_for_test(
     let cmd = c.queue.new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
     match mode {
-        0 => encode_q4tp_matvec_m_gu(c, enc, &fbuf, abs, abs_u, &xs_buf, &y_buf, rows, gpr),
+        0 => encode_q4tp_matvec_m_gu(c, enc, &fbuf, abs, abs_u, &xs_buf, &y_buf, rows, gpr, false),
         1 => encode_q4tp_matvec_m_add(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, gpr),
         _ => {
             enc.end_encoding();
@@ -12920,6 +13085,10 @@ pub enum MetalFfn<'a> {
         gate: (usize, usize, usize),
         up: (usize, usize, usize),
         down: (usize, usize, usize),
+        /// Exact (erf) GELU instead of SiLU between gate and up
+        /// (Spark-X2.5). Only the token graph's `encode_post_ffn`
+        /// computes it; every other Dense consumer refuses it.
+        gelu: bool,
     },
     Moe(GpuMoe<'a>),
 }
@@ -13417,6 +13586,10 @@ pub struct TokenGraph {
     conc: bool,
     /// True while an open layer encoder is concurrent: `bar` emits.
     in_conc: std::cell::Cell<bool>,
+    /// The plan's own depth past which the single-token attend takes the
+    /// GQA-shared split-K kernel (`set_attend_blk_from`); None = the
+    /// process default `gqa_blk_threshold()`.
+    blk_from: Option<usize>,
 }
 
 impl TokenGraph {
@@ -13460,6 +13633,7 @@ impl TokenGraph {
             logits_b: None,
             ids_b: None,
             conc: false,
+            blk_from: None,
             in_conc: std::cell::Cell::new(false),
         })
     }
@@ -13472,6 +13646,13 @@ impl TokenGraph {
         let allowed =
             *ENV.get_or_init(|| std::env::var("CMF_METAL_CONC").as_deref() != Ok("0"));
         self.conc = on && allowed;
+    }
+
+    /// Depth past which this graph's single-token attends go GQA-shared
+    /// split-K (`gqa_attend_blk`: K/V read once per group, no importance
+    /// pass). An explicit `CMF_GQA_BLK` still wins.
+    pub fn set_attend_blk_from(&mut self, n: usize) {
+        self.blk_from = Some(n);
     }
 
     /// `set_dense_concurrent` without the env gate (the in-process A/B).
@@ -13755,7 +13936,7 @@ impl TokenGraph {
     /// Pre-flight of a layer's FFN half (shared by both layer kinds).
     fn ffn_ok(&self, f: &MetalFfn) -> bool {
         match f {
-            MetalFfn::Dense { gate, up, down } => {
+            MetalFfn::Dense { gate, up, down, .. } => {
                 down.1 == self.dims.hidden
                     && [gate, up, down]
                         .iter()
@@ -14222,6 +14403,8 @@ impl TokenGraph {
             cpu_v: p.cpu_v.clone(),
             cpu_stored: p.cpu_stored,
             o1: None,
+            window: p.window,
+            head_gate: p.head_gate,
         };
         // fresh mirror every time
         kv_mirror_drop(p2.kv_id);
@@ -14451,6 +14634,16 @@ impl TokenGraph {
         self.qkv_bufs = Some((q_b, k_b, v_b));
     }
 
+    /// Read the prefix's normed input (`n_b`: the layer's input RMSNorm)
+    /// after `sync` — the operand of a host-side projection that rides the
+    /// sandwich (Spark-X2.5's per-head `g_proj` gate). UMA memcpy.
+    pub fn read_normed(&self, out: &mut [f32]) {
+        let n = out.len().min(self.dims.hidden);
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.n_b.contents() as *const f32, out.as_mut_ptr(), n);
+        }
+    }
+
     /// Read the prefix's q/k/v after `sync` (UMA memcpy).
     pub fn read_qkv(&mut self, q: &mut [f32], k: &mut [f32], v: &mut [f32]) {
         let (q_b, k_b, v_b) = self.qkv_bufs.take().expect("read_qkv without prefix");
@@ -14513,8 +14706,13 @@ impl TokenGraph {
         // instead of separate enc_axpy + rmsnorm.
         let delta = (!o_fused).then_some(&self.d_b);
         match &l.ffn {
-            MetalFfn::Dense { gate, up, down } => {
-                self.encode_post_ffn(enc, l.post_norm, *gate, *up, *down, delta);
+            MetalFfn::Dense {
+                gate,
+                up,
+                down,
+                gelu,
+            } => {
+                self.encode_post_ffn(enc, l.post_norm, *gate, *up, *down, *gelu, delta);
             }
             MetalFfn::Moe(m) => {
                 self.encode_post_moe_ffn(enc, l.post_norm, m, delta);
@@ -14538,6 +14736,9 @@ impl TokenGraph {
             && p.cpu_k.len() == p.nkv
             && p.cpu_v.len() == p.nkv
             && p.inv_freq.len() >= p.rd / 2
+            && p.window.is_none_or(|w| w >= 1 && p.o1.is_none())
+            && p.head_gate
+                .is_none_or(|g| g.len() == p.nh * self.dims.hidden && !p.output_gate)
     }
 
     /// One attention layer entirely on the device: norm → QKV →
@@ -14898,8 +15099,17 @@ impl TokenGraph {
             //    is the point where the split stops paying for itself.
             //    Deep contexts take the GQA-shared split-K kernel (K/V read
             //    once for the group's heads; no importance pass).
-            let n_pos = stored + 1;
-            let thr = gqa_blk_threshold();
+            //    A sliding window starts the walk `first` rows in: K/V/imp
+            //    bind that many rows past their bases (every head's rows
+            //    sit at kh·cap + p, so one offset shifts all of them).
+            let n_all = stored + 1;
+            let first = p.window.map_or(0, |w| n_all.saturating_sub(w));
+            let n_pos = n_all - first;
+            let (kv_off, imp_off) = ((first * p.hd * 4) as u64, (first * 4) as u64);
+            let thr = match self.blk_from {
+                Some(n) if std::env::var("CMF_GQA_BLK").is_err() => n,
+                _ => gqa_blk_threshold(),
+            };
             let blk = thr > 0
                 && n_pos > thr
                 && encode_gqa_attend_blk(
@@ -14908,12 +15118,13 @@ impl TokenGraph {
                     &qr_b,
                     &k_mb,
                     &v_mb,
+                    kv_off,
                     &ao_b,
                     p.nh,
                     p.nkv,
                     p.hd,
                     cap,
-                    stored,
+                    stored - first,
                     1,
                     p.scale,
                     self.in_conc.get(),
@@ -14926,7 +15137,13 @@ impl TokenGraph {
                 disp_tg(
                     enc,
                     &self.c.gqat,
-                    &[(&qr_b, 0), (&k_mb, 0), (&v_mb, 0), (&ao_b, 0), (&imp_mb, 0)],
+                    &[
+                        (&qr_b, 0),
+                        (&k_mb, kv_off),
+                        (&v_mb, kv_off),
+                        (&ao_b, 0),
+                        (&imp_mb, imp_off),
+                    ],
                     &[
                         p.nh as u32,
                         (p.nh / p.nkv) as u32,
@@ -14953,6 +15170,20 @@ impl TokenGraph {
             );
             self.bar(enc);
         }
+        // 6b. projected per-head gate off the normed input (n_b still
+        //     holds it: nothing since step 1 wrote n_b).
+        if let Some(gw) = p.head_gate {
+            let sgs = 4u64;
+            disp(
+                enc,
+                &self.c.hgate,
+                &[(&ao_b, 0), (&const_buf(self.c, gw), 0), (&self.n_b, 0)],
+                &[p.nh as u32, p.hd as u32, self.dims.hidden as u32],
+                &[],
+                ((p.nh as u64).div_ceil(sgs) * sgs * 32, sgs * 32),
+            );
+            self.bar(enc);
+        }
         // 7. O + residual + FFN + residual
         self.encode_o_ffn(enc, l, &ao_b);
         enc.end_encoding();
@@ -14964,6 +15195,7 @@ impl TokenGraph {
     /// Some, fuses `h += delta` and `n = rmsnorm(h, post_norm)` into a
     /// single `add_rmsnorm_rows` dispatch instead of separate axpy +
     /// rmsnorm (saves one encoder round trip per call — 2/layer).
+    #[allow(clippy::too_many_arguments)]
     fn encode_post_ffn(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
@@ -14971,6 +15203,7 @@ impl TokenGraph {
         gate: (usize, usize, usize),
         up: (usize, usize, usize),
         down: (usize, usize, usize),
+        gelu: bool,
         delta: Option<&Buffer>,
     ) {
         if std::env::var("CMF_FFN_TRACE").is_ok() {
@@ -15016,6 +15249,7 @@ impl TokenGraph {
         self.bar(enc);
         let (ag, au) = (self.proj_abs(gate).unwrap(), self.proj_abs(up).unwrap());
         // Dense decode (`fuse_on`): gate|up|SiLU as one dispatch into fa_b.
+        // A GELU FFN takes the kernel's exact-GELU twin.
         let gu_fused = fuse_on()
             && matches!(ag.1, ProjKind::Q4tp)
             && matches!(au.1, ProjKind::Q4tp)
@@ -15032,6 +15266,7 @@ impl TokenGraph {
                 &fa_b,
                 gate.1,
                 gate.2 / GROUP_SIZE,
+                gelu,
             );
         } else {
             // Gate and up as ONE dispatch when both are q4t
@@ -15097,6 +15332,7 @@ impl TokenGraph {
         // down consumes gate and up directly with SiLU inline — the
         // silu dispatch and its dependent-stage drain disappear.
         let dsilu_ok = std::env::var("CMF_METAL_DUAL").as_deref() == Ok("1")
+            && !gelu
             && matches!(ad.1, ProjKind::Q4t)
             && inter % 4 == 0;
         if down_fused {
@@ -15145,7 +15381,7 @@ impl TokenGraph {
             );
         } else {
             {
-                enc.set_compute_pipeline_state(&self.c.silu);
+                enc.set_compute_pipeline_state(if gelu { &self.c.gelu } else { &self.c.silu });
                 enc.set_buffer(0, Some(&fg_b), 0);
                 enc.set_buffer(1, Some(&fu_b), 0);
                 enc.set_buffer(2, Some(&fg_b), 0); // dummy col (has_col = 0)
@@ -15602,8 +15838,21 @@ impl TokenGraph {
             // Fused: h += d, n = rmsnorm(h, post_norm) — one dispatch.
             {
                 match &l.ffn {
-                    MetalFfn::Dense { gate, up, down } => {
-                        self.encode_post_ffn(enc, l.post_norm, *gate, *up, *down, Some(&d_b));
+                    MetalFfn::Dense {
+                        gate,
+                        up,
+                        down,
+                        gelu,
+                    } => {
+                        self.encode_post_ffn(
+                            enc,
+                            l.post_norm,
+                            *gate,
+                            *up,
+                            *down,
+                            *gelu,
+                            Some(&d_b),
+                        );
                     }
                     MetalFfn::Moe(m) => {
                         self.encode_post_moe_ffn(enc, l.post_norm, m, Some(&d_b));
@@ -15653,6 +15902,13 @@ pub struct AttnDeviceParams<'a> {
     /// Some = this layer attends through the O(1) Nystrom state; the
     /// KV mirror is not touched at all.
     pub o1: Option<O1AttnParams<'a>>,
+    /// Sliding window: attend the last `w` positions (this one
+    /// included), the host's `stored - w` lower bound. None = full context.
+    pub window: Option<usize>,
+    /// Per-head projected output gate `[nh × hidden]` (f32 rows of
+    /// `self_attn.g_proj`): head h scales by sigmoid(G[h]·norm(h_in))
+    /// after the attend, before O (Spark-X2.5).
+    pub head_gate: Option<&'a [f32]>,
 }
 
 /// After the token's final sync: copy the row the graph appended for
@@ -16247,7 +16503,9 @@ impl VerifyGraph {
 
     fn ffn_n8_ok(&self, f: &MetalFfn) -> bool {
         match f {
-            MetalFfn::Dense { gate, up, down } => {
+            // The batched twins compute SiLU only.
+            MetalFfn::Dense { gelu: true, .. } => false,
+            MetalFfn::Dense { gate, up, down, .. } => {
                 down.1 == self.tg.dims.hidden
                     && [gate, up, down]
                         .iter()
@@ -16273,6 +16531,9 @@ impl VerifyGraph {
     pub fn attn_ok(&self, l: &AttnGpuLayer, p: &AttnDeviceParams) -> bool {
         self.tg.attn_device_ok(l, p)
             && p.o1.is_none()
+            // The batched twins attend full context, ungated.
+            && p.window.is_none()
+            && p.head_gate.is_none()
             && [l.wq, l.wk, l.wv, l.wo]
                 .iter()
                 .all(|t| self.batch_abs(*t).is_some())
@@ -16430,7 +16691,14 @@ impl VerifyGraph {
         ffn: &MetalFfn,
     ) {
         let c = self.tg.c;
-        let MetalFfn::Dense { gate, up, down } = ffn else {
+        let MetalFfn::Dense {
+            gate,
+            up,
+            down,
+            gelu: false,
+        } = ffn
+        else {
+            // GELU never reaches here: `ffn_n8_ok` refused it.
             return;
         };
         // h += d (the mixer's output); n = rmsnorm(h, post_norm)
@@ -16808,8 +17076,8 @@ impl VerifyGraph {
             && stored + b > thr
             && !verify_skip('a')
             && encode_gqa_attend_blk(
-                c, enc, &qr_b, &k_mb, &v_mb, &ao_b, p.nh, p.nkv, p.hd, cap, stored, b, p.scale,
-                false,
+                c, enc, &qr_b, &k_mb, &v_mb, 0, &ao_b, p.nh, p.nkv, p.hd, cap, stored, b,
+                p.scale, false,
             );
         if b >= 2 && !blk {
             // the chunk attend: one simdgroup per (row, head), row e over
@@ -17220,6 +17488,9 @@ fn encode_gqa_attend_blk(
     q: &Buffer,
     k_mb: &Buffer,
     v_mb: &Buffer,
+    // Byte offset of the first attended row into k_mb/v_mb (a sliding
+    // window's lower bound; 0 = full context).
+    kv_off: u64,
     ao: &Buffer,
     nh: usize,
     nkv: usize,
@@ -17243,8 +17514,8 @@ fn encode_gqa_attend_blk(
     );
     enc.set_compute_pipeline_state(&c.gqablk);
     enc.set_buffer(0, Some(q), 0);
-    enc.set_buffer(1, Some(k_mb), 0);
-    enc.set_buffer(2, Some(v_mb), 0);
+    enc.set_buffer(1, Some(k_mb), kv_off);
+    enc.set_buffer(2, Some(v_mb), kv_off);
     enc.set_buffer(3, Some(&part), 0);
     let w = [
         nh as u32,
