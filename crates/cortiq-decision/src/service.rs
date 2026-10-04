@@ -120,6 +120,9 @@ pub const DEFAULT_ROUTE_INSTRUCTIONS: &str =
 pub struct SkillRuntime {
     scorer: SkillScorer,
     manifest: SkillManifest,
+    /// The active labels from the data (not a cold start), in task order:
+    /// the label set the skill was built for (DESIGN C2.1).
+    trained: Vec<String>,
 }
 
 impl SkillRuntime {
@@ -223,10 +226,17 @@ impl LoadedModel {
             // A skill with no active task (an auto-skill whose labels are all
             // quarantined) gets an empty scorer: listed by `/v1/skills`, no
             // active labels for the matcher (`relate` skips it).
+            let trained = s
+                .manifest
+                .active_tasks()
+                .filter(|t| t.origin == TaskOrigin::Data)
+                .map(|t| t.label.clone())
+                .collect();
             skills.push(SkillRuntime {
                 scorer: SkillScorer::from_model(&model, s.id())
                     .with_context(|| format!("skill '{}'", s.id()))?,
                 manifest: s.manifest.clone(),
+                trained,
             });
         }
         Ok(Self {
@@ -294,7 +304,9 @@ impl LoadedModel {
     /// The labels of every skill as the matcher sees them: the active ones
     /// (candidates) and, for an auto-skill, its whole contract as known and
     /// its contract sha (`data.train.sha256`, the hash of its rubric — the
-    /// loader checks it), the only thing it is matched by (DESIGN A18).
+    /// loader checks it), the only thing it is matched by (DESIGN A18); a
+    /// data skill with its rubric and its trained label set, the evidence of
+    /// a subset (DESIGN C2.1).
     pub fn skill_labels(&self) -> Vec<SkillLabels<'_>> {
         self.skills
             .iter()
@@ -309,6 +321,8 @@ impl LoadedModel {
                     )
                 } else {
                     SkillLabels::data(s.id(), active)
+                        .with_rubric(s.manifest.rubric.as_ref())
+                        .with_trained(&s.trained)
                 }
             })
             .collect()

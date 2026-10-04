@@ -2833,8 +2833,12 @@ async fn an_untrained_contract_becomes_an_auto_skill_and_answers_locally() {
     assert_eq!(r.q("task")["match"], "exact", "{}", r.text);
     assert_eq!(r.q("task")["skill"], id);
     assert_eq!(srv.learning().await["auto_contracts"], 5);
-    // An ambiguous contract (a subset of two data skills) is not learned.
-    let r = ask(&srv, &choice(&["billing", "cards"]), &lessons[0].1[1]).await;
+    // An ambiguous contract (a subset of two data skills, each with the
+    // evidence two one-word labels need: their names, DESIGN C2.1) is not
+    // learned.
+    let named = json!({"type": "choice", "instructions": "Which topic?",
+                       "criteria": {"billing": "billing", "cards": "cards"}});
+    let r = ask(&srv, &named, &lessons[0].1[1]).await;
     assert_eq!(r.q("task")["match"], "untrained");
     assert!(
         r.q("task")["reason"]

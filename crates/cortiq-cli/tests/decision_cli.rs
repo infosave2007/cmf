@@ -967,6 +967,9 @@ fn decide_one_text_exact_subset_json_and_round() {
     assert_eq!(r["answers"]["task"]["choice"], ans["choice"]);
 
     // --labels: a strict subset of one skill's labels, or exactly a skill.
+    // Two one-word labels without descriptions are a subset only as the
+    // skill's own question: decide names the skill they resolve to with
+    // `cmf.skill` (DESIGN C2.1).
     let sub = decide_json(&t.path, text, &["--labels", "Weather,travel"]);
     let q = &sub["cmf"]["questions"]["task"];
     assert_eq!(
