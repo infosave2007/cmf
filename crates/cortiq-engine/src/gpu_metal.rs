@@ -10035,11 +10035,9 @@ pub fn chunk_run_gpu(
             let ncur = prep.st0 + b;
             let m_rows = hpk * b;
             let g_stride = (m_rows * ncur * 4) as u64;
-            let scores = io_buf(
-                c,
-                72_000_000_089 + nkv * m_rows * ncur,
-                nkv * m_rows * ncur * 4,
-            );
+            // Grow-only per (nkv, chunk rows): every score the reads below
+            // touch is written first, so a larger slot changes nothing.
+            let scores = io_buf_grow(c, 72_000_000_089 + nkv * m_rows, nkv * m_rows * ncur * 4);
             let scale = 1.0f32 / (hd as f32).sqrt();
             {
                 let enc = cmd.new_compute_command_encoder();
@@ -13285,6 +13283,31 @@ fn io_buf(c: &Ctx, key: usize, nbytes: usize) -> Buffer {
                 .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
         })
         .clone()
+}
+
+/// `io_buf` for a scratch whose size changes from call to call: one slot
+/// per key, replaced only by a larger one. `io_buf` never evicts and
+/// caches by exact key, so a size folded into the key leaves one buffer
+/// behind per distinct size — the chunk prefill's scores, keyed on the
+/// context length, kept one per chunk: Spark-X2.5 4B q4tp at 6000
+/// tokens held 1249 MB of scores in 12 buffers, 326 MB in 2 with this
+/// (device allocation 6010 → 5087 MB). A command buffer still holding a
+/// replaced slot retains it until it completes.
+fn io_buf_grow(c: &Ctx, key: usize, nbytes: usize) -> Buffer {
+    let mut cache = c.io_bufs.lock().unwrap();
+    let k = io_key(key);
+    if let Some(b) = cache.get(&k)
+        && b.length() as usize >= nbytes
+    {
+        return b.clone();
+    }
+    crate::gpu::probe_note_cold();
+    IO_BUF_ALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let b = c
+        ._device
+        .new_buffer(nbytes.max(4) as u64, MTLResourceOptions::StorageModeShared);
+    cache.insert(k, b.clone());
+    b
 }
 
 /// CMF_METAL_STATE4=0 keeps the one-thread-per-column GDN state kernel
