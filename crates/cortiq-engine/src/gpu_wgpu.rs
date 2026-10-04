@@ -17944,6 +17944,10 @@ struct Ctx {
     act_absmax: Option<wgpu::ComputePipeline>,
     /// The DiT's attention GEMMs on the matrix units.
     dit_gemm_coop: Option<wgpu::ComputePipeline>,
+    /// Causal chunk attention's QK^T and P·V on the matrix units, with the
+    /// causal/sliding band skipped (`PF_ATTN_COOP_SRC`). Both or neither.
+    pf_qk_coop: Option<wgpu::ComputePipeline>,
+    pf_pv_coop: Option<wgpu::ComputePipeline>,
     /// Interleaved qkv → head-major q/k/v, on the device.
     dit_qkv_split: Option<wgpu::ComputePipeline>,
     vae_im2col: Option<wgpu::ComputePipeline>,
@@ -19802,6 +19806,19 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let dit_gemm_coop = (q4tp_mm_coop.is_some())
         .then(|| mk_coop(DIT_COOP_SRC, "dit-coop", "dit_gemm_coop"))
         .flatten();
+    let (pf_qk_coop, pf_pv_coop) = match (
+        q4tp_mm_coop
+            .is_some()
+            .then(|| mk_coop(PF_ATTN_COOP_SRC, "pf-attn-coop", "pf_qk_coop"))
+            .flatten(),
+        q4tp_mm_coop
+            .is_some()
+            .then(|| mk_coop(PF_ATTN_COOP_SRC, "pf-attn-coop", "pf_pv_coop"))
+            .flatten(),
+    ) {
+        (Some(a), Some(b)) => (Some(a), Some(b)),
+        _ => (None, None),
+    };
     let act_amax_part = mk_coop(COOP_AMAX_SRC, "act-absmax-p", "act_absmax_part");
     let act_amax_fold = mk_coop(COOP_AMAX_SRC, "act-absmax-f", "act_absmax_fold");
     let q4tp_dq_f16 = (want_f16 && q4tp_mm_coop.is_some())
@@ -20512,6 +20529,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
         ffn_silu_packed,
         act_absmax,
         dit_gemm_coop,
+        pf_qk_coop,
+        pf_pv_coop,
         dit_qkv_split,
         vae_im2col,
         conv1d_im2col,
@@ -37131,7 +37150,7 @@ pub fn chunk_attend_win(
         label: Some("chunk-attend"),
     });
     chunk_attend_run(
-        c, enc, &qb, (&kb, &offs), (&vb, &offs), b, s0, n, nh, nkv, hd, scale, window, out,
+        c, enc, &qb, (&kb, &offs), (&vb, &offs), b, s0, n, nh, nkv, hd, scale, window, false, out,
     )
 }
 
@@ -37155,12 +37174,26 @@ fn chunk_attend_run(
     hd: usize,
     scale: f32,
     window: usize,
+    coop: bool,
     out: &mut [f32],
 ) -> bool {
     let dev = &c.device;
     let st = wgpu::BufferUsages::STORAGE;
+    let hpk = nh / nkv;
+    // The matrix-unit arm scores a whole KV group (its `hpk` query heads
+    // stacked) per pass: hpk·b·n floats must fit one binding.
+    let coop = match (coop, c.pf_qk_coop.as_ref(), c.pf_pv_coop.as_ref()) {
+        (true, Some(qk), Some(pv))
+            if hd % 4 == 0
+                && (hpk * b * n * 4) as u64 <= dev.limits().max_storage_buffer_binding_size as u64 =>
+        {
+            Some((qk, pv))
+        }
+        _ => None,
+    };
+    let score_rows = if coop.is_some() { hpk * b } else { b };
     let mut sc = c.scratch.lock().unwrap();
-    let scb = Scratch::ensure(dev, &mut sc.dsc, (b * n * 4) as u64, st, "ca-scores");
+    let scb = Scratch::ensure(dev, &mut sc.dsc, (score_rows * n * 4) as u64, st, "ca-scores");
     let pb = Scratch::ensure(dev, &mut sc.dpan, (nh * b * hd * 4) as u64, st, "ca-panel");
     let ab = Scratch::ensure(
         dev,
@@ -37206,9 +37239,101 @@ fn chunk_attend_run(
     }
     let qhead = (b * hd * 4) as u64;
     let khead = (n * hd * 4) as u64;
-    let sc_len = (b * n * 4) as u64;
-    let hpk = nh / nkv;
-    for h in 0..nh {
+    let sc_len = (score_rows * n * 4) as u64;
+    if let Some((qk_pipe, pv_pipe)) = coop {
+        // P·V's P goes to f16 multiplied by 2^14 (a probability as small
+        // as ~4e-9 stays a normal number); the store divides it back.
+        const PSCALE: f32 = 16384.0;
+        let pa = |cols: usize, rows: usize, sc_out: f32, pscale: f32| -> wgpu::Buffer {
+            let raw: [u32; 12] = [
+                cols as u32,
+                rows as u32,
+                (hpk * b) as u32,
+                sc_out.to_bits(),
+                hd as u32,
+                b as u32,
+                s0 as u32,
+                1 + window as u32,
+                pscale.to_bits(),
+                0,
+                0,
+                0,
+            ];
+            let bf = dev.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ca-coop-params"),
+                size: 48,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            c.queue.write_buffer(&bf, 0, bytemuck::cast_slice(&raw));
+            bf
+        };
+        let pq_qk = pa(hd, n, scale, 1.0);
+        let pq_pv = pa(n, hd, 1.0 / PSCALE, PSCALE);
+        let ghead = hpk as u64 * qhead;
+        let mt = ((hpk * b) as u32).div_ceil(64);
+        for g in 0..nkv {
+            let bg_qk = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ca-qk-coop"),
+                layout: &qk_pipe.get_bind_group_layout(0),
+                entries: &[
+                    slot(k.0, k.1[g], khead, 0),
+                    slot(qb, g as u64 * ghead, ghead, 1),
+                    slot(&scb, 0, sc_len, 2),
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: pq_qk.as_entire_binding(),
+                    },
+                ],
+            });
+            let bg_sm = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ca-sm"),
+                layout: &c.dit_softmax.get_bind_group_layout(0),
+                entries: &[
+                    slot(&scb, 0, sc_len, 2),
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: p_sm.as_entire_binding(),
+                    },
+                ],
+            });
+            let bg_pv = dev.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ca-pv-coop"),
+                layout: &pv_pipe.get_bind_group_layout(0),
+                entries: &[
+                    slot(v.0, v.1[g], khead, 0),
+                    slot(&scb, 0, sc_len, 1),
+                    slot(&pb, g as u64 * ghead, ghead, 2),
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: pq_pv.as_entire_binding(),
+                    },
+                ],
+            });
+            {
+                let mut pass = begin_pass_with(&mut enc, Some("ca-qk"), None);
+                pass.set_pipeline(qk_pipe);
+                pass.set_bind_group(0, &bg_qk, &[]);
+                pass.dispatch_workgroups((n as u32).div_ceil(64), mt, 1);
+            }
+            {
+                // One row per (query, head) of the group: wid.y picks the
+                // head's plane, wid.x the query (the causal bound's index).
+                let mut pass = begin_pass_with(&mut enc, Some("ca-sm"), None);
+                pass.set_pipeline(&c.dit_softmax);
+                pass.set_bind_group(0, &bg_sm, &[]);
+                pass.dispatch_workgroups(b as u32, hpk as u32, 1);
+            }
+            {
+                let mut pass = begin_pass_with(&mut enc, Some("ca-pv"), None);
+                pass.set_pipeline(pv_pipe);
+                pass.set_bind_group(0, &bg_pv, &[]);
+                pass.dispatch_workgroups((hd as u32).div_ceil(64), mt, 1);
+            }
+        }
+    }
+    let scalar_heads = if coop.is_some() { 0 } else { nh };
+    for h in 0..scalar_heads {
         let kv = h / hpk;
         let bg_qk = dev.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ca-qk"),
@@ -37341,6 +37466,7 @@ pub fn chunk_attend_mirror(
     scale: f32,
     ring: Option<usize>,
     window: usize,
+    coop: bool,
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
@@ -37431,11 +37557,11 @@ pub fn chunk_attend_mirror(
             }
         }
         let offs: Vec<u64> = (0..nkv).map(|g| g as u64 * khead).collect();
-        chunk_attend_run(c, enc, &qb, (&kb, &offs), (&vb, &offs), b, s0 - lo, n, nh, nkv, hd, scale, window, out)
+        chunk_attend_run(c, enc, &qb, (&kb, &offs), (&vb, &offs), b, s0 - lo, n, nh, nkv, hd, scale, window, coop, out)
     } else {
         drop(sc);
         let offs: Vec<u64> = (0..nkv).map(|g| ((g * cap + slot0) * hd * 4) as u64).collect();
-        chunk_attend_run(c, enc, &qb, (&mk, &offs), (&mv, &offs), b, s0 - lo, n, nh, nkv, hd, scale, window, out)
+        chunk_attend_run(c, enc, &qb, (&mk, &offs), (&mv, &offs), b, s0 - lo, n, nh, nkv, hd, scale, window, coop, out)
     }
 }
 
@@ -40003,6 +40129,216 @@ fn dit_gemm_coop(@builtin(workgroup_id) wid: vec3<u32>,
         let nn = t % 64u;
         if (m0 + m < dcp.nb && n0 + nn < dcp.rows) {
             dcy[dcp.c_off + (m0 + m) * dcp.rows + n0 + nn] = dm_c[m * 64u + nn] * dcp.scale;
+        }
+    }
+}
+"#;
+
+/// Causal chunk attention on the matrix units: one KV group's stacked
+/// query heads (`nb` = heads·`qb` rows, row r is query r % qb of its head)
+/// against `n` keys. `pf_qk_coop` writes S = scale·Q·Kᵀ, `pf_pv_coop`
+/// O = P·V from the softmaxed S (`dit_softmax`, unchanged, in between).
+/// Operands are staged to f16, accumulators are f32 — the layout and the
+/// loads of `dit_gemm_coop`; `pf_pv_coop` reads V as it is stored
+/// ([n][hd], no transpose) and multiplies P by `pscale` before the f16
+/// cast (2^14: a probability down to ~4e-9 stays a normal f16; the store
+/// divides it back out).
+///
+/// Band skipping, exact: a 64-row tile within one head sees only keys
+/// [lo(first row), lim(last row)) — causal bound `s0 + q + 1`, and with
+/// `causal` = 1 + w the window's floor. QK tiles outside it are not
+/// computed (the softmax zeroes every entry outside a row's own range
+/// and never reads them); PV reduces only over it (the P entries past
+/// it are those zeros). A sliding layer's 512-row band in a 512×1023
+/// chunk is 56% of the tiles.
+const PF_ATTN_COOP_SRC: &str = r#"
+enable wgpu_cooperative_matrix;
+enable f16;
+
+struct PaP {
+    cols: u32,    // reduction width (QK: hd; PV: n)
+    rows: u32,    // output columns (QK: n; PV: hd)
+    nb: u32,      // output rows (stacked query heads)
+    scale: f32,   // applied at the store
+    ldb: u32,     // B row stride in elements (K/V rows: hd)
+    qb: u32,      // queries per head
+    s0: u32,      // keys before the first query
+    causal: u32,  // 1 = causal, 1 + w = causal under a w-key window
+    pscale: f32,  // A multiplier before the f16 cast
+    _p0: u32, _p1: u32, _p2: u32,
+};
+@group(0) @binding(0) var<storage, read> pab: array<f32>;
+@group(0) @binding(1) var<storage, read> paa: array<f32>;
+@group(0) @binding(2) var<storage, read_write> pay: array<f32>;
+@group(0) @binding(3) var<uniform> pap: PaP;
+
+const KS: u32 = 32u;
+var<workgroup> pa_a: array<f16, 64 * 32>;
+var<workgroup> pa_b: array<f16, 64 * 32>;
+var<workgroup> pa_c: array<f32, 64 * 64>;
+
+// Keys [x, y) some row of the 64-row tile at m0 can see (nkeys keys).
+fn pa_band(m0: u32, nkeys: u32) -> vec2<u32> {
+    let r1 = min(m0 + 63u, pap.nb - 1u);
+    if (r1 / pap.qb != m0 / pap.qb) { return vec2<u32>(0u, nkeys); }
+    let q0 = m0 % pap.qb;
+    let q1 = r1 % pap.qb;
+    let hi = min(nkeys, pap.s0 + q1 + 1u);
+    let lim0 = min(nkeys, pap.s0 + q0 + 1u);
+    var lo = 0u;
+    if (pap.causal > 1u && lim0 > pap.causal - 1u) { lo = lim0 - (pap.causal - 1u); }
+    return vec2<u32>(lo, hi);
+}
+
+@compute @workgroup_size(128)
+fn pf_qk_coop(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_index) tid: u32,
+              @builtin(subgroup_id) sg: u32) {
+    let m0 = wid.y * 64u;
+    let n0 = wid.x * 64u;
+    let band = pa_band(m0, pap.rows);
+    // A tile wholly outside the band reduces over nothing and stores
+    // nothing (no early return: the coop ops need uniform control flow,
+    // and naga does not see a return as uniform).
+    let live = n0 < band.y && n0 + 64u > band.x;
+    let cols = select(0u, pap.cols, live);
+    var c0: coop_mat16x16<f32, C>;
+    var c1: coop_mat16x16<f32, C>;
+    var c2: coop_mat16x16<f32, C>;
+    var c3: coop_mat16x16<f32, C>;
+    var k0 = 0u;
+    loop {
+        if (k0 >= cols) { break; }
+        for (var t = tid; t < 64u * 8u; t = t + 128u) {
+            let m = t / 8u;
+            let k4 = (t % 8u) * 4u;
+            let col0 = k0 + k4;
+            let dst = m * KS + k4;
+            var v = vec4<f32>(0.0);
+            if (m0 + m < pap.nb && col0 + 3u < cols) {
+                let base = (m0 + m) * cols + col0;
+                v = vec4<f32>(paa[base], paa[base + 1u], paa[base + 2u], paa[base + 3u]);
+            }
+            pa_a[dst] = f16(v.x); pa_a[dst + 1u] = f16(v.y);
+            pa_a[dst + 2u] = f16(v.z); pa_a[dst + 3u] = f16(v.w);
+        }
+        for (var t = tid; t < 64u * 8u; t = t + 128u) {
+            let nn = t / 8u;
+            let k4 = (t % 8u) * 4u;
+            let col0 = k0 + k4;
+            let bd = nn * KS + k4;
+            var wv = vec4<f32>(0.0);
+            if (n0 + nn < pap.rows && col0 + 3u < cols) {
+                let base = (n0 + nn) * pap.ldb + col0;
+                wv = vec4<f32>(pab[base], pab[base + 1u], pab[base + 2u], pab[base + 3u]);
+            }
+            pa_b[bd] = f16(wv.x); pa_b[bd + 1u] = f16(wv.y);
+            pa_b[bd + 2u] = f16(wv.z); pa_b[bd + 3u] = f16(wv.w);
+        }
+        workgroupBarrier();
+        for (var kk = 0u; kk < KS; kk = kk + 16u) {
+            let a = coopLoadT<coop_mat16x16<f16, A>>(&pa_a[sg * 512u + kk], 32u);
+            let b0 = coopLoad<coop_mat16x16<f16, B>>(&pa_b[kk], 32u);
+            let b1 = coopLoad<coop_mat16x16<f16, B>>(&pa_b[512u + kk], 32u);
+            let b2 = coopLoad<coop_mat16x16<f16, B>>(&pa_b[1024u + kk], 32u);
+            let b3 = coopLoad<coop_mat16x16<f16, B>>(&pa_b[1536u + kk], 32u);
+            c0 = coopMultiplyAdd(a, b0, c0);
+            c1 = coopMultiplyAdd(a, b1, c1);
+            c2 = coopMultiplyAdd(a, b2, c2);
+            c3 = coopMultiplyAdd(a, b3, c3);
+        }
+        workgroupBarrier();
+        k0 = k0 + KS;
+    }
+    coopStoreT(c0, &pa_c[sg * 16u * 64u + 0u], 64u);
+    coopStoreT(c1, &pa_c[sg * 16u * 64u + 16u], 64u);
+    coopStoreT(c2, &pa_c[sg * 16u * 64u + 32u], 64u);
+    coopStoreT(c3, &pa_c[sg * 16u * 64u + 48u], 64u);
+    workgroupBarrier();
+    for (var t = tid; t < 64u * 64u; t = t + 128u) {
+        let m = t / 64u;
+        let nn = t % 64u;
+        if (live && m0 + m < pap.nb && n0 + nn < pap.rows) {
+            pay[(m0 + m) * pap.rows + n0 + nn] = pa_c[m * 64u + nn] * pap.scale;
+        }
+    }
+}
+
+@compute @workgroup_size(128)
+fn pf_pv_coop(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_index) tid: u32,
+              @builtin(subgroup_id) sg: u32) {
+    let m0 = wid.y * 64u;
+    let n0 = wid.x * 64u;
+    let cols = pap.cols;
+    let band = pa_band(m0, cols);
+    var c0: coop_mat16x16<f32, C>;
+    var c1: coop_mat16x16<f32, C>;
+    var c2: coop_mat16x16<f32, C>;
+    var c3: coop_mat16x16<f32, C>;
+    var k0 = (band.x / KS) * KS;
+    loop {
+        if (k0 >= band.y) { break; }
+        // P rows: 64 × KS, as in QK (scalar tail: n need not be a
+        // multiple of four).
+        for (var t = tid; t < 64u * 8u; t = t + 128u) {
+            let m = t / 8u;
+            let k4 = (t % 8u) * 4u;
+            let col0 = k0 + k4;
+            let dst = m * KS + k4;
+            var v = vec4<f32>(0.0);
+            if (m0 + m < pap.nb && col0 < cols) {
+                let base = (m0 + m) * cols + col0;
+                v.x = paa[base];
+                if (col0 + 1u < cols) { v.y = paa[base + 1u]; }
+                if (col0 + 2u < cols) { v.z = paa[base + 2u]; }
+                if (col0 + 3u < cols) { v.w = paa[base + 3u]; }
+            }
+            v = v * pap.pscale;
+            pa_a[dst] = f16(v.x); pa_a[dst + 1u] = f16(v.y);
+            pa_a[dst + 2u] = f16(v.z); pa_a[dst + 3u] = f16(v.w);
+        }
+        // V rows k0..k0+KS, output columns n0..n0+64: four consecutive
+        // columns of one key row per thread (coalesced), staged as
+        // pa_b[col][key] — the [n][k] layout the NT loads expect.
+        for (var t = tid; t < KS * 16u; t = t + 128u) {
+            let k = t / 16u;
+            let c4 = (t % 16u) * 4u;
+            var wv = vec4<f32>(0.0);
+            if (k0 + k < cols && n0 + c4 + 3u < pap.rows) {
+                let base = (k0 + k) * pap.ldb + n0 + c4;
+                wv = vec4<f32>(pab[base], pab[base + 1u], pab[base + 2u], pab[base + 3u]);
+            }
+            pa_b[c4 * KS + k] = f16(wv.x);
+            pa_b[(c4 + 1u) * KS + k] = f16(wv.y);
+            pa_b[(c4 + 2u) * KS + k] = f16(wv.z);
+            pa_b[(c4 + 3u) * KS + k] = f16(wv.w);
+        }
+        workgroupBarrier();
+        for (var kk = 0u; kk < KS; kk = kk + 16u) {
+            let a = coopLoadT<coop_mat16x16<f16, A>>(&pa_a[sg * 512u + kk], 32u);
+            let b0 = coopLoad<coop_mat16x16<f16, B>>(&pa_b[kk], 32u);
+            let b1 = coopLoad<coop_mat16x16<f16, B>>(&pa_b[512u + kk], 32u);
+            let b2 = coopLoad<coop_mat16x16<f16, B>>(&pa_b[1024u + kk], 32u);
+            let b3 = coopLoad<coop_mat16x16<f16, B>>(&pa_b[1536u + kk], 32u);
+            c0 = coopMultiplyAdd(a, b0, c0);
+            c1 = coopMultiplyAdd(a, b1, c1);
+            c2 = coopMultiplyAdd(a, b2, c2);
+            c3 = coopMultiplyAdd(a, b3, c3);
+        }
+        workgroupBarrier();
+        k0 = k0 + KS;
+    }
+    coopStoreT(c0, &pa_c[sg * 16u * 64u + 0u], 64u);
+    coopStoreT(c1, &pa_c[sg * 16u * 64u + 16u], 64u);
+    coopStoreT(c2, &pa_c[sg * 16u * 64u + 32u], 64u);
+    coopStoreT(c3, &pa_c[sg * 16u * 64u + 48u], 64u);
+    workgroupBarrier();
+    for (var t = tid; t < 64u * 64u; t = t + 128u) {
+        let m = t / 64u;
+        let nn = t % 64u;
+        if (m0 + m < pap.nb && n0 + nn < pap.rows) {
+            pay[(m0 + m) * pap.rows + n0 + nn] = pa_c[m * 64u + nn] * pap.scale;
         }
     }
 }
@@ -42717,7 +43053,8 @@ mod tests {
     /// on the f32 kernels, chunk after chunk, on a full-context mirror and
     /// on a sliding layer's ring (whose window wraps at s0 = 1024 and
     /// 2048), and leaves the mirror holding exactly the host's rows — what
-    /// the decode graph then finds instead of re-uploading them.
+    /// the decode graph then finds instead of re-uploading them. The
+    /// matrix-unit arm stays within f16-operand error of the same result.
     #[test]
     fn chunk_attend_mirror_matches_host_upload() {
         unsafe { std::env::set_var("CMF_GPU", "wgpu") };
@@ -42732,40 +43069,54 @@ mod tests {
             ((i.wrapping_mul(2654435761) ^ salt.wrapping_mul(40503)) % 1999) as f32 / 1999.0 - 0.5
         };
         for ring in [None, Some(w)] {
-            let kv_id = (1u64 << 50) | ((ring.is_some() as u64) << 1);
-            let mut hk: Vec<Vec<f32>> = vec![Vec::new(); nkv];
-            let mut hv: Vec<Vec<f32>> = vec![Vec::new(); nkv];
-            let mut s0 = 0usize;
-            for b in [512usize, 512, 512, 512, 512, 40] {
-                for g in 0..nkv {
-                    hk[g].extend((s0 * hd..(s0 + b) * hd).map(|i| val(2 * g + 1, i)));
-                    hv[g].extend((s0 * hd..(s0 + b) * hd).map(|i| val(2 * g + 2, i)));
+            for coop in [false, true] {
+                let kv_id = (1u64 << 50) | ((ring.is_some() as u64) << 1) | coop as u64;
+                let mut hk: Vec<Vec<f32>> = vec![Vec::new(); nkv];
+                let mut hv: Vec<Vec<f32>> = vec![Vec::new(); nkv];
+                let mut s0 = 0usize;
+                for b in [512usize, 512, 512, 512, 512, 40] {
+                    for g in 0..nkv {
+                        hk[g].extend((s0 * hd..(s0 + b) * hd).map(|i| val(2 * g + 1, i)));
+                        hv[g].extend((s0 * hd..(s0 + b) * hd).map(|i| val(2 * g + 2, i)));
+                    }
+                    let q: Vec<f32> = (0..nh * b * hd).map(|i| val(97 + s0, i)).collect();
+                    let wmask = if ring.is_some() && s0 + b > w { w } else { 0 };
+                    let lo = if wmask > 0 { (s0 + 1).saturating_sub(wmask) } else { 0 };
+                    let ks: Vec<&[f32]> = hk.iter().map(|k| &k[lo * hd..]).collect();
+                    let vs: Vec<&[f32]> = hv.iter().map(|v| &v[lo * hd..]).collect();
+                    let mut want = vec![0f32; b * nh * hd];
+                    assert!(chunk_attend_win(
+                        &q, &ks, &vs, b, s0 - lo, nh, nkv, hd, scale, wmask, &mut want
+                    ));
+                    let mut got = vec![0f32; b * nh * hd];
+                    assert!(
+                        chunk_attend_mirror(
+                            kv_id, 0, 65536, &hk, &hv, &q, b, s0, nh, nkv, hd, scale, ring, wmask,
+                            coop, &mut got
+                        ),
+                        "mirror attend refused at s0 {s0} (ring {ring:?})"
+                    );
+                    if coop {
+                        let peak = want.iter().fold(0f32, |a, &x| a.max(x.abs()));
+                        let err = got
+                            .iter()
+                            .zip(&want)
+                            .fold(0f32, |a, (&x, &y)| a.max((x - y).abs()));
+                        assert!(
+                            err <= 1e-2 * peak + 1e-5,
+                            "coop attend off by {err} (peak {peak}) at s0 {s0}, ring {ring:?}"
+                        );
+                    } else {
+                        assert!(
+                            got.iter().zip(&want).all(|(x, y)| x.to_bits() == y.to_bits()),
+                            "mirror attend differs from the upload at s0 {s0}, ring {ring:?}"
+                        );
+                    }
+                    assert_eq!(kv_mirror_stored(kv_id, 0), Some(s0 + b));
+                    s0 += b;
                 }
-                let q: Vec<f32> = (0..nh * b * hd).map(|i| val(97 + s0, i)).collect();
-                let wmask = if ring.is_some() && s0 + b > w { w } else { 0 };
-                let lo = if wmask > 0 { (s0 + 1).saturating_sub(wmask) } else { 0 };
-                let ks: Vec<&[f32]> = hk.iter().map(|k| &k[lo * hd..]).collect();
-                let vs: Vec<&[f32]> = hv.iter().map(|v| &v[lo * hd..]).collect();
-                let mut want = vec![0f32; b * nh * hd];
-                assert!(chunk_attend_win(
-                    &q, &ks, &vs, b, s0 - lo, nh, nkv, hd, scale, wmask, &mut want
-                ));
-                let mut got = vec![0f32; b * nh * hd];
-                assert!(
-                    chunk_attend_mirror(
-                        kv_id, 0, 65536, &hk, &hv, &q, b, s0, nh, nkv, hd, scale, ring, wmask,
-                        &mut got
-                    ),
-                    "mirror attend refused at s0 {s0} (ring {ring:?})"
-                );
-                assert!(
-                    got.iter().zip(&want).all(|(x, y)| x.to_bits() == y.to_bits()),
-                    "mirror attend differs from the upload at s0 {s0}, ring {ring:?}"
-                );
-                assert_eq!(kv_mirror_stored(kv_id, 0), Some(s0 + b));
-                s0 += b;
+                kv_mirror_reset(kv_id);
             }
-            kv_mirror_reset(kv_id);
         }
     }
 
