@@ -34,6 +34,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   <arg_value>V</arg_value></tool_call>`) become `tool_calls`; a value is a
   string where the tool's schema says string and parsed JSON otherwise, and
   the name must be one of the declared tools.
+- `CMF_PPL_IDS_OUT=path` writes the token ids `ppl` scores; `CMF_PREFILL_PROF`
+  also splits the batched prefill walk into attention and FFN time.
+
+### Changed
+- Vulkan prefill of dense models (every codec with a device GEMM, not only
+  Spark):
+  - the FFN keeps the gate and up panels on the card and folds the
+    activation there (`ffn_act_keep`; q4t/q4tp keep their fused kernel). It
+    used to read both b·inter panels home and fold them on one host thread;
+  - a q8_2f projection takes the matrix-unit GEMM (`q8_matmat_2f`), not the
+    scalar f32 one;
+  - q|k|v come back in one readback;
+  - the f32 GEMM walks the batch four positions per row. Every sum keeps
+    its scalar order, so the output is bit-identical (Spark's 16-row
+    `g_proj`: 17 → 2 ms a layer).
+
+  1000-token prompt on an RTX 2000 Ada: Spark-X2.5-4B q8_2f 59 → 220
+  tok/s, 1.7B q8_2f 127 → 548, Qwen3-0.6B q8_2f 360 → 755. Perplexity is
+  unchanged, and greedy text is identical. `CMF_FFN_KEEP=0` and
+  `CMF_QKV_KEEP=0` restore the old paths for A/B.
+- Spark's sliding layers attend on the card past their window as well. The
+  device softmax takes the window in its causal word, and the portable
+  fallback honours it.
 
 ### Fixed
 - Server: a chat template that opens the reasoning block in the prompt
