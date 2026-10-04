@@ -13174,11 +13174,14 @@ fn dit_softmax(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
     let t = lid.x;
     // Causal bound: query `wid.x` may see keys 0..=s0+wid.x. Masked
     // entries are zeroed rather than set to -inf so the P·V GEMM that
-    // follows reads a clean matrix.
+    // follows reads a clean matrix. `causal` = 1 + w (w > 0) adds a
+    // sliding window: the query sees only its last w keys, itself included.
     var lim = dp.n;
+    var lo = 0u;
     if (dp.causal != 0u) { lim = min(dp.n, dp.s0 + wid.x + 1u); }
+    if (dp.causal > 1u && lim > dp.causal - 1u) { lo = lim - (dp.causal - 1u); }
     var mx = -3.4e38;
-    for (var j = t; j < lim; j = j + 256u) { mx = max(mx, dc[row + j]); }
+    for (var j = lo + t; j < lim; j = j + 256u) { mx = max(mx, dc[row + j]); }
     dit_red[t] = mx;
     workgroupBarrier();
     for (var s = 128u; s > 0u; s = s >> 1u) {
@@ -13188,11 +13191,12 @@ fn dit_softmax(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
     let m = dit_red[0];
     workgroupBarrier();
     var sum = 0.0;
-    for (var j = t; j < lim; j = j + 256u) {
+    for (var j = lo + t; j < lim; j = j + 256u) {
         let e = exp(dc[row + j] - m);
         dc[row + j] = e;
         sum = sum + e;
     }
+    for (var j = t; j < lo; j = j + 256u) { dc[row + j] = 0.0; }
     for (var j = lim + t; j < dp.n; j = j + 256u) { dc[row + j] = 0.0; }
     dit_red[t] = sum;
     workgroupBarrier();
@@ -13201,7 +13205,7 @@ fn dit_softmax(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
         workgroupBarrier();
     }
     let inv = 1.0 / dit_red[0];
-    for (var j = t; j < lim; j = j + 256u) { dc[row + j] = dc[row + j] * inv; }
+    for (var j = lo + t; j < lim; j = j + 256u) { dc[row + j] = dc[row + j] * inv; }
 }
 
 // [nh][n][hd] panel -> [n][nh*hd].
@@ -33632,6 +33636,8 @@ pub fn q8_matmat_2f(
     cols: usize,
     out: &mut [f32],
 ) -> bool {
+    // MiMo's f32 GEMM contract holds on this entry too (see `q8_matmat`).
+    let _precision = MimoF32Gemm::enter(&model.arch().arch_name);
     let Some(c) = ctx() else { return false };
     if cols % 4 != 0 || rows == 0 || b == 0 || col_field.len() < cols {
         return false;
@@ -37048,6 +37054,25 @@ pub fn chunk_attend(
     scale: f32,
     out: &mut [f32],
 ) -> bool {
+    chunk_attend_win(q, k, v, b, s0, nh, nkv, hd, scale, 0, out)
+}
+
+/// `chunk_attend` with a sliding window (`window` > 0): query `s0 + i` sees
+/// only the keys `s0 + i + 1 - window ..= s0 + i`.
+#[allow(clippy::too_many_arguments)]
+pub fn chunk_attend_win(
+    q: &[f32],
+    k: &[&[f32]],
+    v: &[&[f32]],
+    b: usize,
+    s0: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    scale: f32,
+    window: usize,
+    out: &mut [f32],
+) -> bool {
     let Some(c) = ctx() else { return false };
     let n = s0 + b;
     if nh == 0 || nkv == 0 || b == 0 || hd == 0 || nh % nkv != 0 || n == 0 {
@@ -37130,7 +37155,7 @@ pub fn chunk_attend(
         bf
     };
     let p_qk = params(b as u32, hd as u32, n as u32, scale, s0 as u32, 0);
-    let p_sm = params(b as u32, hd as u32, n as u32, 1.0, s0 as u32, 1);
+    let p_sm = params(b as u32, hd as u32, n as u32, 1.0, s0 as u32, 1 + window as u32);
     let p_pv = params(b as u32, n as u32, hd as u32, 1.0, s0 as u32, 0);
     let p_un = params(nh as u32, b as u32, hd as u32, 1.0, 0, 0);
 
@@ -37493,6 +37518,65 @@ pub fn q8_ffn_packed(
     fused_gemm_from_device(model, w2, &act, b, hidden, inter, out)
 }
 
+/// Several projections of one host activation with their results read back
+/// in ONE trip: `out` = [P0 (b·rows0) | P1 (b·rows1) | …], each `idxs` entry
+/// (tensor, rows). Every GEMM is the codec's own `fused_panel_keep`, so the
+/// numbers are those of separate `matmat` calls — only the readback after
+/// each (a host round trip that cost more than a small GEMM) is merged.
+pub fn gemm_many_keep(
+    model: &Arc<CmfModel>,
+    idxs: &[(usize, usize)],
+    xs: &[f32],
+    b: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    let _precision = MimoF32Gemm::enter(&model.arch().arch_name);
+    let Some(c) = ctx() else { return false };
+    let total: usize = idxs.iter().map(|&(_, r)| b * r).sum();
+    if b == 0 || idxs.is_empty() || out.len() < total || xs.len() < b * cols {
+        return false;
+    }
+    let size = (total * 4) as u64;
+    let cat = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("many-cat"),
+        size,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let mut off = 0u64;
+    for &(idx, rows) in idxs {
+        // Each panel lands in the shared result scratch, which the next
+        // projection reuses: it moves into its slot of `cat` first.
+        let Some(panel) = fused_panel_keep(model, idx, xs, b, rows, cols) else {
+            return false;
+        };
+        let len = (b * rows * 4) as u64;
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("many-copy"),
+            });
+        enc.copy_buffer_to_buffer(&panel, 0, &cat, off, len);
+        c.queue.submit(Some(enc.finish()));
+        off += len;
+    }
+    let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("many-stage"),
+        size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("many-read"),
+        });
+    readback(c, enc, &cat, &stage, size, &mut out[..total])
+}
+
 /// The LLM prefill's dense FFN with separate gate, up and down weights in
 /// any codec that has a device GEMM (`q8_row`, `q8_2f`, `q4tp`, mixed): the
 /// gate and up panels stay on the card, the activation folds them there
@@ -37512,6 +37596,7 @@ pub fn ffn_act_keep(
     act: u32,
     out: &mut [f32],
 ) -> bool {
+    let _precision = MimoF32Gemm::enter(&model.arch().arch_name);
     let Some(c) = ctx() else { return false };
     let panel = (b * inter * 4) as u64;
     if b == 0

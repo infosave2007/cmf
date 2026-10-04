@@ -2308,6 +2308,61 @@ pub fn chunk_attend(
     }
 }
 
+/// `chunk_attend` under a sliding window (`window` keys, the query's own
+/// included). wgpu only; see `chunk_attend_windowed`.
+#[allow(unused_variables, clippy::too_many_arguments)]
+pub fn chunk_attend_win(
+    q: &[f32],
+    k: &[&[f32]],
+    v: &[&[f32]],
+    b: usize,
+    s0: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    scale: f32,
+    window: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => {
+            crate::gpu_wgpu::chunk_attend_win(q, k, v, b, s0, nh, nkv, hd, scale, window, out)
+        }
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// Several projections of one host activation, read back in one trip:
+/// `out` = [P0 | P1 | …], each `idxs` entry (tensor, rows). wgpu only.
+#[allow(unused_variables)]
+pub fn gemm_many_keep(
+    model: &Arc<CmfModel>,
+    idxs: &[(usize, usize)],
+    xs: &[f32],
+    b: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::gemm_many_keep(model, idxs, xs, b, cols, out),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// Whether the active backend's chunk attend can apply a sliding window.
+pub fn chunk_attend_windowed() -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => true,
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 /// Fused QKV projection: one upload of the normed chunk, three GEMMs,
 /// one readback of Q|K|V back to back. Metal has no twin yet — its
 /// chunk graph keeps the whole layer resident and never surfaces QKV.
