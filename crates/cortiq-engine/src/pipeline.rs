@@ -9636,6 +9636,13 @@ impl Pipeline {
                 ms(&sp[3]),
                 ms(&PREFILL_SPLIT[1]),
             );
+            let [calls, attended, wo, ring, reseed, f16] = wgpu_mirror_counters();
+            eprintln!(
+                "prefill-mirror: {calls} calls, {attended} attended ({wo} with O on the card), \
+                 {ring} ring refusals, {reseed} reseeds, {f16} f16 fallbacks, {} upload \
+                 fallbacks (cumulative)",
+                attention::MIRROR_UPLOADS.load(std::sync::atomic::Ordering::Relaxed),
+            );
         }
         // A batched span owns a complete set of positions. Publish any
         // collecting→sealed transition only after every layer has finished;
@@ -16168,6 +16175,19 @@ fn wgpu_prefill_counters() -> (f64, f64, f64, u64) {
     }
     #[cfg(not(feature = "gpu"))]
     (0.0, 0.0, 0.0, 0)
+}
+
+/// The wgpu prefill mirror attend's outcome counters
+/// (`gpu_wgpu::MIRROR_EVENTS`).
+fn wgpu_mirror_counters() -> [u64; 6] {
+    #[cfg(feature = "gpu")]
+    {
+        crate::gpu_wgpu::MIRROR_EVENTS
+            .each_ref()
+            .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+    }
+    #[cfg(not(feature = "gpu"))]
+    [0; 6]
 }
 
 fn prefill_prof_on() -> bool {

@@ -1401,6 +1401,11 @@ pub fn qwen_attention(
 pub(crate) static ATTN_SPLIT: [std::sync::atomic::AtomicU64; 7] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
+/// `CMF_PREFILL_PROF`: chunks whose layer named a device mirror but went up
+/// by the host upload instead (the mirror attend refused them).
+pub(crate) static MIRROR_UPLOADS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) fn attn_split_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CMF_PREFILL_PROF").is_some())
@@ -1983,6 +1988,9 @@ pub fn qwen_attention_batch(
                 );
             }
             if !done {
+                if mirror.is_some() {
+                    MIRROR_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 // Under a masking window only the rows the first query can
                 // still see go up: `lo` is the oldest of them.
                 let lo = if w > 0 { (s0 + 1).saturating_sub(w) } else { 0 };
