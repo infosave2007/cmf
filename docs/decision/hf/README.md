@@ -96,7 +96,8 @@ cortiq serve cortiq-decision.cmf --jev-compatible --port 8080
 Point a System One client at `http://127.0.0.1:8080/v1/systemone`. Its default
 `jev-latest` (and the historical `typesafe/jev-1.13`) is accepted **only as a
 request alias**; an omitted model works too. Every response identifies the
-local CMF model as `cmf-decision-0.8.5` — this adapter does not serve or claim
+local CMF model as `cmf-decision-<version>`, the server's Cortiq version
+(`cmf-decision-0.8.13` on this release) — this adapter does not serve or claim
 to be Jev. `GET /v1/models` supplies the matching System One discovery shape
 when the flag is enabled. [Request and response details →](API.md#3a-system-one-request-adapter-jev-compatible)
 
