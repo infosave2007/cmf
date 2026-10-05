@@ -4453,7 +4453,7 @@ fn decide_oracle_batch_respects_its_budget_cap_per_run() {
     assert_eq!(sum["oracle"]["refused_cost_usd"].as_f64(), Some(unknown));
     assert!(
         stderr_of(&o).contains(
-            "of it is the reservation of calls OpenRouter refused (HTTP 401, 402, 403 or 429) without a cost, likely not billed"
+            "of it is the reservation of calls OpenRouter refused (HTTP 401, 402, 403 or 429, or a prompt over the model's context) without a cost, likely not billed"
         ) && !stderr_of(&o).contains("may have billed"),
         "{}",
         show(&o)
@@ -4659,7 +4659,7 @@ fn decide_oracle_stop_rules_hold_across_runs_until_resumed() {
     assert!(
         out.contains("spent in this run (1 call; $")
             && out.contains(
-                "of it is the reservation of calls OpenRouter refused (HTTP 401, 402, 403 or 429) without a cost, likely not billed)"
+                "of it is the reservation of calls OpenRouter refused (HTTP 401, 402, 403 or 429, or a prompt over the model's context) without a cost, likely not billed)"
             ),
         "{out}"
     );
