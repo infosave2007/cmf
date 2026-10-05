@@ -127,8 +127,6 @@ impl Stream for SseStream {
     }
 }
 
-/// A content-delta chunk (built synchronously from the generation thread).
-
 /// One delta carrying the aggregated tool calls, indexed for clients
 /// that merge by `index`.
 pub fn tool_calls_chunk(
@@ -156,6 +154,7 @@ pub fn tool_calls_chunk(
     }
 }
 
+/// A content-delta chunk (built synchronously from the generation thread).
 pub fn token_chunk(id: &str, model: &str, token: &str, created: u64) -> StreamChunk {
     StreamChunk {
         id: id.to_string(),
