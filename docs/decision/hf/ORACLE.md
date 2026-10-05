@@ -761,7 +761,7 @@ jq -c '{answer, action, source, oracle_cost_usd, flags}' results.jsonl
   gate rejected, so read `action` before trusting `answer`) — `action`
   (`local`, `oracle`, `cache` or `abstain`), `source`, `oracle_cost_usd`
   (this row's call; 0 for a local or cached answer), `flags`
-  (`pii_redacted`, or why a row abstained: `budget`, `no_key`, `bad_key`,
+  (why a row abstained: `budget`, `no_key`, `bad_key`,
   `stopped`, `oracle_unavailable`, …) and, for a labelled row, `answer_correct`
   (`answer` equals the label). The oracle's totals and a `hint` are in the
   summary on stderr. For one text, `--json` carries `action` and `source`
