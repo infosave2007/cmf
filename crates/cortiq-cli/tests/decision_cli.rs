@@ -4443,17 +4443,15 @@ fn decide_oracle_batch_respects_its_budget_cap_per_run() {
         )),
         "{sum}"
     );
-    // The refused call reported no cost: its reservation is charged, and
-    // named as likely not billed (OpenRouter refused it: HTTP 401).
-    let unknown = sum["oracle"]["unknown_cost_usd"].as_f64().unwrap();
-    assert!(
-        unknown > 0.0 && unknown == sum["oracle"]["spent_usd"].as_f64().unwrap(),
-        "{sum}"
-    );
-    assert_eq!(sum["oracle"]["refused_cost_usd"].as_f64(), Some(unknown));
+    // The refused call reported no cost: OpenRouter refused it (HTTP 401)
+    // before any model ran, so its reservation is released, not charged.
+    let refused = sum["oracle"]["refused_cost_usd"].as_f64().unwrap();
+    assert!(refused > 0.0, "{sum}");
+    assert_eq!(sum["oracle"]["spent_usd"].as_f64(), Some(0.0), "{sum}");
+    assert_eq!(sum["oracle"]["unknown_cost_usd"].as_f64(), Some(0.0), "{sum}");
     assert!(
         stderr_of(&o).contains(
-            "of it is the reservation of calls OpenRouter refused (HTTP 401, 402, 403 or 429, or a prompt over the model's context) without a cost, likely not billed"
+            "of reservations released, not charged, for calls OpenRouter refused before any model ran (HTTP 400, 401, 402, 403, 404, 413, 422 or 429, or a prompt over the model's context)"
         ) && !stderr_of(&o).contains("may have billed"),
         "{}",
         show(&o)
@@ -4657,9 +4655,9 @@ fn decide_oracle_stop_rules_hold_across_runs_until_resumed() {
         "{out}"
     );
     assert!(
-        out.contains("spent in this run (1 call; $")
+        out.contains("$0.00 spent in this run (1 call; $")
             && out.contains(
-                "of it is the reservation of calls OpenRouter refused (HTTP 401, 402, 403 or 429, or a prompt over the model's context) without a cost, likely not billed)"
+                "of reservations released, not charged, for calls OpenRouter refused before any model ran (HTTP 400, 401, 402, 403, 404, 413, 422 or 429, or a prompt over the model's context))"
             ),
         "{out}"
     );

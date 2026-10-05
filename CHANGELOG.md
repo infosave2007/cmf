@@ -27,12 +27,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   follower got "single-flight wait timed out" while its leader still
   answered. It now waits for both calls
   (`2 · (deadline_s + reasoning_deadline_s)`).
-- Oracle ledger replay (a restarted server, `ledger_totals`): the
-  reservation of a call refused as over the model's context
-  (`context_length`) is counted as likely unbilled (`refused_cost`), as the
-  live totals already did; after a restart it was counted as possibly billed.
-  `cortiq decide --oracle` names such calls in its spend line. What is
-  charged is unchanged.
+- Oracle budget: a call OpenRouter refused before any model ran — HTTP
+  400, 401, 402, 403, 404, 413, 422 or 429 without a cost, or a prompt over
+  the model's context (`context_length`) — releases its reservation instead
+  of being charged it. Each refusal used to cost its full reservation, so a
+  burst of rate limits or over-long items could exhaust `budget_usd` with
+  nothing billed. A timeout, a lost connection or a 5xx without a cost is
+  still charged its reservation. `refused_cost` (oracle status, `cortiq
+  decide --oracle`) now counts the released reservations and is no longer
+  part of `spent`; a restarted server replays the ledger the same way (a
+  `context_length` refusal used to count as possibly billed after a
+  restart).
 - Decision docs: the System One adapter answers
   `cmf-decision-<version>`, its own version, and refuses another (README and
   API.md named `cmf-decision-0.8.5`); both calls of a reasoning fallback

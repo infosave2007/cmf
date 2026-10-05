@@ -550,6 +550,60 @@ fn the_callers_credit_limits_oracle_calls() {
     assert_eq!(mock.hits(), 2);
 }
 
+#[test]
+fn a_call_refused_before_any_model_ran_releases_its_reservation() {
+    // OpenRouter refuses a burst (HTTP 429) before any model ran: nothing is
+    // billed, so the reservations are released and the refusals do not use
+    // up the budget (they once stopped a working oracle on `budget`).
+    let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let n2 = n.clone();
+    let mock =
+        MockOracle::start(
+            move |req| match n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0..=2 => raw_reply(429, r#"{"error":{"message":"rate limited"}}"#),
+                _ => answer_reply(req, |_, o| pick(o, "travel"), 1e-5),
+            },
+        );
+    let mut cfg = stand_config(&mock.url());
+    cfg.oracle.max_errors = 100;
+    let st = Stand::new(&cfg);
+    let r = rejected();
+    assert!(
+        flags(&st.decide(&topics_body(&r[0])).unwrap(), 0)
+            .contains(&"oracle_unavailable".to_string())
+    );
+    let res = st.ledger()[0]["reserved_usd"].as_f64().unwrap();
+    // Room for one reservation and a half: charged refusals would leave none.
+    st.svc
+        .admin(&AdminCommand::OracleUpdate(
+            json!({"budget_usd": 1.5 * res}),
+        ))
+        .unwrap();
+    for q in &r[1..3] {
+        assert!(
+            flags(&st.decide(&topics_body(q)).unwrap(), 0)
+                .contains(&"oracle_unavailable".to_string())
+        );
+    }
+    let t = st.cascade.oracle().totals();
+    assert_eq!((t.spent, t.unknown_cost), (0.0, 0.0), "{t:?}");
+    assert!(t.refused_cost >= 3.0 * res * 0.99, "{t:?}");
+    assert_eq!(
+        st.decide(&topics_body(&r[3])).unwrap().questions[0].action,
+        Action::Oracle
+    );
+    assert_eq!(mock.hits(), 4);
+    let t = st.cascade.oracle().totals();
+    assert!(t.spent > 0.0 && t.spent < res, "{t:?}");
+    // The ledger replays to the same totals.
+    let st = st.restart(&cfg);
+    let t2 = st.cascade.oracle().totals();
+    assert_eq!(
+        (t2.spent, t2.refused_cost, t2.unknown_cost),
+        (t.spent, t.refused_cost, 0.0)
+    );
+}
+
 // ------------------------------------------------------------------ stop rules
 
 fn enable(st: &Stand) {
@@ -717,8 +771,8 @@ fn failures_in_a_row_count_across_restarts_and_a_resume_clears_them() {
     // after a restart).
     assert_eq!(st.oracle_state()["last_error"], "http_500");
     // A failed call with no reported cost is charged its reservation, and
-    // counted as such; an HTTP 500 is not a refusal OpenRouter likely did
-    // not bill (as 401, 402, 403 and 429 are).
+    // counted as such; an HTTP 500 may have been billed (a refusal before
+    // any model ran — 400, 401, 402, 403, 404, 413, 422, 429 — is not).
     let t = st.cascade.oracle().totals();
     assert!(
         t.unknown_cost > 0.0 && (t.unknown_cost - t.spent).abs() < 1e-15,
@@ -1250,8 +1304,11 @@ fn the_ledger_and_the_stop_survive_a_restart() {
     let spent = st.cascade.oracle().totals().spent;
     mock.set(|_| raw_reply(403, "{}"));
     st.decide(&topics_body(&rejected()[1])).unwrap();
-    let spent2 = st.cascade.oracle().totals().spent;
-    assert!(spent2 > spent);
+    // A refused key ran no model: its reservation is released, not charged.
+    let t = st.cascade.oracle().totals();
+    let spent2 = t.spent;
+    assert_eq!(spent2, spent);
+    assert!(t.refused_cost > 0.0, "{t:?}");
     // A reservation left open by a crash.
     let ledger = st.state.oracle_ledger_path();
     let st = {
