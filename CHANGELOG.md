@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- Oracle PII redaction is off by default: `oracle.redact_pii` defaults to
+  `false` (was `true`), so the state, instructions and criteria leave as
+  asked and no question gets `pii_redacted`. Its secret-like pattern also
+  rewrote tool names, slugs and chemical names: a Decision Index run sent
+  10,225 questions to the oracle with such words replaced by `[REDACTED]`.
+  `"oracle": {"redact_pii": true}` in `--decision-config` (or
+  `--oracle-config` of `decision learn`) turns it back on, unchanged, and
+  `cmf.allow_pii_egress` still skips it per request. `cortiq decide
+  --oracle` has no configuration, so it sends the text as written
+  (ORACLE.md "What leaves the machine").
 ## [0.8.12] - 2026-10-05
 
 ### Changed
