@@ -32,15 +32,17 @@
 //! * the oracle in two steps (`serve --oracle MODEL` with `OPENROUTER_API_KEY`)
 //!   against a loopback OpenRouter (endpoint and model listings, chat
 //!   completions): ready with twice the cheapest structured-output price,
-//!   only gate-rejected questions reach it, PII redacted, the key in no log
+//!   only gate-rejected questions reach it, sent as asked (PII redaction is
+//!   opt-in, off by default), the key in no log
 //!   (`RUST_LOG=debug`), output or state file; `no_key` with a startup line
 //!   and a hint; unknown and unstructured models refused with cheap
 //!   suggestions; an unreachable listing falls back; `--oracle-max-price`;
 //!   `budget_exhausted` by calls and by dollars; `keys create` allows the
 //!   oracle unless `--oracle-allowed=false`;
 //! * `decide --oracle MODEL` (U2): a gate-accepted text touches no network
-//!   and no state, a rejected one is answered by one call (PII redacted, the
-//!   key only in its Authorization header, `RUST_LOG=debug` included), then
+//!   and no state, a rejected one is answered by one call (its text sent as
+//!   written, no PII redaction; the key only in its Authorization header,
+//!   `RUST_LOG=debug` included), then
 //!   from the cache; labels no skill has go to the oracle; without the key
 //!   `no_key` and the command line's hint, but the state directory's cached
 //!   answers still served (read only, 0.8.11); a server holding the state
@@ -3134,7 +3136,8 @@ fn serve_oracle_in_two_steps_is_ready_asks_only_undetermined_questions_and_hides
     assert_eq!(st["key_present"], true);
     assert_eq!(st["budget_usd"], 5.0);
     assert_eq!(st["max_price"], json!({"prompt": 0.06, "completion": 0.58}));
-    assert_eq!(st["redact_pii"], true);
+    // PII redaction is opt-in (`oracle.redact_pii`), off by default.
+    assert_eq!(st["redact_pii"], false);
     assert!(!st.to_string().contains(FAKE_OPENROUTER_KEY));
     let (_, h, _) = http_h("GET", &srv.url("/healthz"), &[], None);
     assert_eq!(h["oracle_status"], "ready", "{h}");
@@ -3171,7 +3174,8 @@ fn serve_oracle_in_two_steps_is_ready_asks_only_undetermined_questions_and_hides
     }
     assert!(local > 0, "no dev text was accepted by the gate");
     let before = mock.chats();
-    // A gate-rejected question goes to the oracle, its state PII-redacted.
+    // A gate-rejected question goes to the oracle, its state as asked: no
+    // PII redaction by default (the e-mail address is sent, no flag).
     let texts = distinct_texts(2, 7, "u1", 0.97);
     let (code, v) = http(
         "POST",
@@ -3186,7 +3190,7 @@ fn serve_oracle_in_two_steps_is_ready_asks_only_undetermined_questions_and_hides
     let q = &v["cmf"]["questions"]["task"];
     assert_eq!(q["action"], "oracle", "{v}");
     assert!(
-        q["flags"]
+        !q["flags"]
             .as_array()
             .unwrap()
             .iter()
@@ -3200,7 +3204,7 @@ fn serve_oracle_in_two_steps_is_ready_asks_only_undetermined_questions_and_hides
     let sent = mock.states();
     let last = sent.last().unwrap().to_string();
     assert!(
-        !last.contains("jane.roe@example.com") && last.contains("[REDACTED]"),
+        last.contains("jane.roe@example.com") && !last.contains("[REDACTED]"),
         "{last}"
     );
     // The skill's own question (/v1/route) from the anonymous loopback caller
@@ -3831,8 +3835,9 @@ fn decide_oracle_asks_only_what_the_gate_rejects_and_hides_the_key() {
         "a gate-accepted text created the state directory"
     );
 
-    // 2. A text the gate rejects: one call, the state PII-redacted, the key
-    // only in the call's Authorization header.
+    // 2. A text the gate rejects: one call, the state sent as written (no
+    // PII redaction by default), the key only in the call's Authorization
+    // header.
     let texts = distinct_texts(3, 7, "u2", 0.97);
     let pii = format!("{} write to jane.roe@example.com", texts[0]);
     let o = decide_oracle(&base, &["-p", &pii], &["--state", st], &key_debug);
@@ -3848,7 +3853,7 @@ fn decide_oracle_asks_only_what_the_gate_rejects_and_hides_the_key() {
         out.contains("action:     oracle (the gate rejected the local choice"),
         "{out}"
     );
-    assert!(out.contains("[pii_redacted]"), "{out}");
+    assert!(!out.contains("pii_redacted"), "{out}");
     assert!(
         out.contains(&format!(
             "oracle:     {ORACLE_MODEL} via {}: $0.000013 spent in this run (1 call), budget $1.00; ledger {}: $0.000013 over 1 call in all",
@@ -3865,7 +3870,7 @@ fn decide_oracle_asks_only_what_the_gate_rejects_and_hides_the_key() {
     assert_eq!(mock.chats(), 1);
     let sent = mock.states().last().unwrap().to_string();
     assert!(
-        !sent.contains("jane.roe@example.com") && sent.contains("[REDACTED]"),
+        sent.contains("jane.roe@example.com") && !sent.contains("[REDACTED]"),
         "{sent}"
     );
     let reqs = mock.requests();

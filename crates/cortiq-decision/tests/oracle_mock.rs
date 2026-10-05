@@ -19,7 +19,8 @@
 //! * consent: `oracle.enabled: false`, `cmf.oracle: false`, `oracle_allowed:
 //!   false`, `default_per_request: false`, no key in the environment, the admin
 //!   switch — 0 calls;
-//! * PII redaction on by default (string leaves of a JSON state too);
+//! * PII redaction off by default (the state sent as asked) and on with
+//!   `oracle.redact_pii: true` (string leaves of a JSON state too);
 //! * the key: read from the environment only (a child process with the variable
 //!   set), its bytes never on disk or in the captured logs;
 //! * the ledger and the stop survive a restart; an open reservation is charged.
@@ -185,8 +186,8 @@ fn bodies_on_the_wire_equal_the_driver_and_replay_the_ledger() {
             delay: Duration::ZERO,
         }
     });
-    // Default configuration (redaction on: none of these texts has PII); the
-    // cache is off so that every row is a call.
+    // Default configuration (no PII redaction; none of these texts has PII
+    // anyway); the cache is off so that every row is a call.
     let mut cfg = stand_config(&mock.url());
     cfg.cache.enabled = false;
     cfg.oracle.probabilities = false;
@@ -976,22 +977,33 @@ fn consent_switches_make_no_call() {
 // ------------------------------------------------------------------ PII
 
 #[test]
-fn pii_is_redacted_by_default() {
+fn pii_is_sent_as_asked_by_default_and_redacted_on_opt_in() {
     let text = "cruise ship yacht harbor mail john.doe@example.com call +15551234567";
     let mock = MockOracle::answering("travel");
+    // The default (`oracle.redact_pii: false`): the e-mail address and the
+    // number leave as asked, no flag.
+    assert!(!Config::default().oracle.redact_pii);
     let st = Stand::new(&stand_config(&mock.url()));
     let d = st.decide(&topics_body(text)).unwrap();
     assert_eq!(d.questions[0].action, Action::Oracle, "the gate rejects it");
+    assert!(flags(&d, 0).is_empty());
+    assert_eq!(mock.requests()[0].state(), json!(text));
+    assert!(String::from_utf8_lossy(&mock.requests()[0].body).contains("john.doe@example.com"));
+
+    // Opt-in: redacted, flagged.
+    let mut on = stand_config(&mock.url());
+    on.oracle.redact_pii = true;
+    let st = Stand::new(&on);
+    let d = st.decide(&topics_body(text)).unwrap();
     assert_eq!(flags(&d, 0), vec!["pii_redacted"]);
-    let sent = mock.requests()[0].state();
     assert_eq!(
-        sent,
+        mock.requests()[1].state(),
         json!("cruise ship yacht harbor mail [REDACTED] call [REDACTED]")
     );
-    assert!(!String::from_utf8_lossy(&mock.requests()[0].body).contains("john.doe"));
+    assert!(!String::from_utf8_lossy(&mock.requests()[1].body).contains("john.doe"));
 
-    // Consent to egress, or redaction off: sent as is.
-    let mut cfg = stand_config(&mock.url());
+    // Opt-in, but the request consents to egress: sent as is.
+    let mut cfg = on.clone();
     cfg.cache.enabled = false;
     let st = Stand::new(&cfg);
     let d = st
@@ -1002,15 +1014,10 @@ fn pii_is_redacted_by_default() {
         ))
         .unwrap();
     assert!(flags(&d, 0).is_empty());
-    assert_eq!(mock.requests()[1].state(), json!(text));
-    let mut raw = stand_config(&mock.url());
-    raw.oracle.redact_pii = false;
-    let st = Stand::new(&raw);
-    st.decide(&topics_body(text)).unwrap();
     assert_eq!(mock.requests()[2].state(), json!(text));
 
-    // A JSON state: string leaves are redacted, keys kept.
-    let st = Stand::new(&stand_config(&mock.url()));
+    // Opt-in, a JSON state: string leaves are redacted, keys kept.
+    let st = Stand::new(&on);
     let state = json!({"from": "a.b@c.de", "body": "cruise ship yacht"});
     let d = st
         .decide(&body(state, json!({"u": score_question()}), None))

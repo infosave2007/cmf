@@ -5,8 +5,9 @@
 //! else has a default, and every safety property of [`crate::oracle`] stays:
 //! the oracle is asked only about undetermined questions, every call is
 //! reserved against the budget before it is sent, the stop rules hold, the
-//! state is PII-redacted by default and the key is read only from the
-//! environment at the moment of a call, never stored, logged or printed.
+//! state is sent as asked (PII redaction is an opt-in, `oracle.redact_pii`)
+//! and the key is read only from the environment at the moment of a call,
+//! never stored, logged or printed.
 //!
 //! [`apply`] turns [`OracleFlags`] into the `oracle` section of a
 //! [`Config`] (the flags override the `--decision-config` values; without

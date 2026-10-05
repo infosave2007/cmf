@@ -453,11 +453,15 @@ same question waits for both.
   `state` and the `instructions` and `criteria` of those questions. In a
   state-less request (empty `state`) the instructions are the input; since
   0.8.8 every question's instructions and its criteria's descriptions are
-  redacted like a state (below), the option ids never. Receivers:
+  redacted like a state when PII redaction is on (below), the option ids
+  never. Receivers:
   OpenRouter and the provider it routes to (`provider.sort: price`,
   fallbacks allowed; set `oracle.data_collection: "deny"` to exclude providers
   that store data).
-* **PII redaction** is on by default (`oracle.redact_pii`): e-mail addresses,
+* **PII redaction** is off by default: the text is sent as asked. It was on
+  through 0.8.11, and its secret-like pattern also rewrote tool names, slugs
+  and chemical names (10,225 questions of one Decision Index run). Turn it
+  on with `"oracle": {"redact_pii": true}`; then e-mail addresses,
   secret-like tokens (20 or more characters of `[A-Za-z0-9_-]` with a digit and
   a letter) and numbers of 9 or more digits — also when their digit groups
   are separated by spaces, dashes, dots, slashes or parentheses, as in
@@ -469,8 +473,8 @@ same question waits for both.
   the auto-skill contract are those of the question as asked, so caching and
   learning do not change. It is a heuristic: names, postal addresses, numbers
   written in words and identifiers with letters between short digit groups
-  are not detected. A request can opt out with `cmf.allow_pii_egress`
-  (router: `options.allow_pii_egress`).
+  are not detected. With it on, a request can opt out with
+  `cmf.allow_pii_egress` (router: `options.allow_pii_egress`).
 * **Never sent**: accepted questions, other questions of the request, client
   keys, accounts, vectors.
 * **Kept on disk** in the state directory: vectors and hashed features of
@@ -522,8 +526,9 @@ oracle: NOT ready — OPENROUTER_API_KEY is not set (set it to your OpenRouter k
 
 Everything else keeps its safe default: a budget of $1.00, provider
 routing `{sort: price, require_parameters: true, allow_fallbacks: true}`,
-PII redaction on, the stop rules, and the oracle only for questions the
-local model cannot decide. Optional companions of `--oracle` (each
+the stop rules, and the oracle only for questions the local model cannot
+decide. The text is sent as asked: PII redaction is an opt-in
+(`oracle.redact_pii` in `--decision-config`). Optional companions of `--oracle` (each
 overrides `--decision-config`):
 
 | Flag | Default | Meaning |
@@ -714,9 +719,9 @@ curl -s http://127.0.0.1:8080/healthz | jq -r .oracle_status     # the server of
 `cortiq decide` takes the same `--oracle MODEL` (and the `--oracle-*`
 flags of the table above) for one text or a batch. The text is decided
 locally first; only when the gate rejects it — or no skill has the asked
-labels — is one call made, with the same reservation, stop rules, PII
-redaction and key handling as a server. A text the gate accepts sends
-nothing.
+labels — is one call made, with the same reservation, stop rules and key
+handling as a server; the text is sent as written (no PII redaction). A text
+the gate accepts sends nothing.
 
 ```bash
 cortiq decide cortiq-decision.cmf --skill banking77 -p "the exchange rate you gave me looks wrong" \
@@ -881,7 +886,7 @@ cat > oracle-server.json <<'EOF'
     "max_calls": 10000,
     "deadline_s": 30,
     "max_errors": 30,
-    "redact_pii": true
+    "redact_pii": false
   },
   "cache": {"enabled": true, "threshold": 1.0, "legacy_cos": 0.9999},
   "learning": {"enabled": true, "refit_min_new": 25}

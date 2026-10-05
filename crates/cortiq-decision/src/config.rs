@@ -11,7 +11,7 @@
 //!  "response":{"round":null},
 //!  "oracle":{"enabled":false,"default_per_request":true,"base_url":"https://openrouter.ai/api/v1","api_key_env":"OPENROUTER_API_KEY",
 //!   "model":"deepseek/deepseek-v4.1-flash","provider":{"sort":"price","require_parameters":true,"allow_fallbacks":true,"max_price":{"prompt":0.1,"completion":0.5}},
-//!   "max_tokens_per_question":64,"deadline_s":30,"budget_usd":1.0,"max_calls":10000,"max_errors":30,"redact_pii":true,"title":"cortiq-decision","data_collection":null,
+//!   "max_tokens_per_question":64,"deadline_s":30,"budget_usd":1.0,"max_calls":10000,"max_errors":30,"redact_pii":false,"title":"cortiq-decision","data_collection":null,
 //!   "probabilities":true,"probability_tokens_per_question":128,"reasoning":"off","reasoning_max_tokens":4096,
 //!   "reasoning_deadline_s":60},
 //!  "cache":{"enabled":true,"threshold":1.0,"legacy_cos":0.9999,"cap":50000},
@@ -282,6 +282,10 @@ pub struct OracleConfig {
     pub budget_usd: f64,
     pub max_calls: u64,
     pub max_errors: u32,
+    /// Opt-in PII redaction of the text sent to the oracle ([`crate::pii`]).
+    /// Off by default (on through 0.8.11): its patterns also rewrote tool
+    /// names, slugs and chemical names that look like secrets. `true` turns
+    /// it on; a request's `cmf.allow_pii_egress` still skips it then.
     pub redact_pii: bool,
     pub title: String,
     pub data_collection: Option<String>,
@@ -328,7 +332,7 @@ impl Default for OracleConfig {
             budget_usd: 1.0,
             max_calls: 10_000,
             max_errors: 30,
-            redact_pii: true,
+            redact_pii: false,
             title: "cortiq-decision".into(),
             data_collection: None,
             probabilities: true,

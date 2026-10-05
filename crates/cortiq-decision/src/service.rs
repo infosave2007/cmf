@@ -24,7 +24,8 @@
 //!    per distinct instructions text instead: each question is read through
 //!    its own instructions ([`DecisionRequest::input_text`]), matched to an
 //!    auto-skill by its state-less contract, cached and escalated with the φ
-//!    of its text, its instructions redacted for the oracle like a state —
+//!    of its text, its instructions redacted for the oracle like a state
+//!    (when `oracle.redact_pii` is on) —
 //!    and never certified;
 //! 5. undetermined questions (gate rejected, untrained) go to the escalator in
 //!    one call when the oracle is allowed (spec §5.1: `oracle.enabled`, the
