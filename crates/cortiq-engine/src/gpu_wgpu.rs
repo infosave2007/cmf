@@ -37806,6 +37806,19 @@ fn chunk_attend_run(
 pub static CHUNK_ATTEND_WAIT_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// What the prefill's mirror attend did, cumulative (CMF_PREFILL_PROF
+/// prints it): [calls, chunks attended, of them with the gate and the O
+/// projection on the card, ring refusals (chunk + window past the ring),
+/// reseeds (the mirror was ahead of the host), f16-guard fallbacks to the
+/// f32 kernels]. A chunk the O-on-card call refuses is tried once more
+/// without it, so a refused chunk counts two calls and two refusals.
+pub static MIRROR_EVENTS: [std::sync::atomic::AtomicU64; 6] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+fn mirror_event(i: usize) {
+    MIRROR_EVENTS[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// `chunk_attend_win` against the token graph's device K/V mirror of
 /// `(kv_id, layer)` — the buffers the decode graph reads — instead of
 /// re-uploading the layer's whole prefix from the host every chunk.
@@ -37935,7 +37948,11 @@ pub fn chunk_attend_mirror_wo(
         }
         submit(c, finish_enc(enc));
     }
-    fused_gemm_from_device(wo.0, wo.1, &ab, b, hidden, nh * hd, &mut out[..b * hidden])
+    let ok = fused_gemm_from_device(wo.0, wo.1, &ab, b, hidden, nh * hd, &mut out[..b * hidden]);
+    if ok {
+        mirror_event(2);
+    }
+    ok
 }
 
 /// The head-wise output gate on a resident [b][nh·hd] attention panel:
@@ -37977,6 +37994,7 @@ fn chunk_attend_mirror_impl(
     keep: Option<&mut Option<wgpu::Buffer>>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    mirror_event(0);
     if nh == 0 || nkv == 0 || b == 0 || hd == 0 || nh % nkv != 0 || hd % 4 != 0 {
         return false;
     }
@@ -37986,6 +38004,7 @@ fn chunk_attend_mirror_impl(
     let coop = coop && {
         let fits = operand_max <= crate::gpu::F16_MAX;
         if !fits {
+            mirror_event(5);
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
                 tracing::warn!(
@@ -38020,6 +38039,7 @@ fn chunk_attend_mirror_impl(
     // once: b + min(s0, w - 1) <= kv_ring_cap(w) — b <= 513 on Spark's
     // 512-window, 1024-row ring.
     if ring.is_some_and(|w| n > kv_ring_cap(w)) {
+        mirror_event(3);
         return false;
     }
     let (mk, mv, cap, ring_layout) = {
@@ -38034,6 +38054,7 @@ fn chunk_attend_mirror_impl(
         if e.synced > s0 {
             // Rows past the host's: not ours to trust. Reseed from the
             // host (a ring keeps only its newest `cap` rows of it).
+            mirror_event(4);
             e.synced = 0;
             e.lo = 0;
         }
@@ -38062,7 +38083,7 @@ fn chunk_attend_mirror_impl(
     });
     let row = (hd * 4) as u64;
     let slot0 = lo % cap;
-    if ring_layout && slot0 + n > cap {
+    let ok = if ring_layout && slot0 + n > cap {
         // The window wraps the ring: gather its two runs per head into the
         // packed scratch on the device (at most 1023 rows a head).
         let kvsz = (nkv * n * hd * 4) as u64;
@@ -38085,7 +38106,11 @@ fn chunk_attend_mirror_impl(
         drop(sc);
         let offs: Vec<u64> = (0..nkv).map(|g| ((g * cap + slot0) * hd * 4) as u64).collect();
         chunk_attend_run(c, enc, &qb, (&mk, &offs), (&mv, &offs), b, s0 - lo, n, nh, nkv, hd, scale, window, coop, out, keep)
+    };
+    if ok {
+        mirror_event(1);
     }
+    ok
 }
 
 /// Fused QKV on wgpu: one upload of the normed chunk, three GEMMs, one
@@ -43806,6 +43831,81 @@ mod tests {
             );
         }
         kv_mirror_reset(kv_id);
+    }
+
+    /// A mirror AHEAD of the host (its rows past `s0` belong to a
+    /// continuation the host no longer holds) is reseeded from the host
+    /// before the chunk attends: the result is the host upload's bit for
+    /// bit on the f32 kernels, for a full-context mirror and for a sliding
+    /// layer's ring, and the next chunk continues from the reseeded rows.
+    #[test]
+    fn chunk_attend_mirror_reseeds_when_ahead_of_the_host() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping mirror reseed test");
+            return;
+        };
+        let _one = chunk_attend_test_lock();
+        let _drain = TestGpuDrain::new(c);
+        let (nh, nkv, hd, w) = (4usize, 2usize, 256usize, 512usize);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let val = |salt: usize, i: usize| {
+            ((i.wrapping_mul(2654435761) ^ salt.wrapping_mul(40503)) % 1999) as f32 / 1999.0 - 0.5
+        };
+        for ring in [None, Some(w)] {
+            let kv_id = (1u64 << 50) | 0x20 | ring.is_some() as u64;
+            let mut hk: Vec<Vec<f32>> = vec![Vec::new(); nkv];
+            let mut hv: Vec<Vec<f32>> = vec![Vec::new(); nkv];
+            // (s0, b, salt): three chunks to 1100 rows, then the host keeps
+            // 900 of them and continues with other rows (salt 1), then one
+            // more chunk past the reseed.
+            let steps = [
+                (0usize, 512usize, 0usize),
+                (512, 512, 0),
+                (1024, 76, 0),
+                (900, 300, 1),
+                (1200, 100, 1),
+            ];
+            for (s0, b, salt) in steps {
+                for g in 0..nkv {
+                    hk[g].truncate(s0 * hd);
+                    hv[g].truncate(s0 * hd);
+                    hk[g].extend((s0 * hd..(s0 + b) * hd).map(|i| val(2 * g + 1 + 10 * salt, i)));
+                    hv[g].extend((s0 * hd..(s0 + b) * hd).map(|i| val(2 * g + 2 + 10 * salt, i)));
+                }
+                let q: Vec<f32> = (0..nh * b * hd).map(|i| val(97 + s0 + salt, i)).collect();
+                let wmask = if ring.is_some() && s0 + b > w { w } else { 0 };
+                let lo = if wmask > 0 { (s0 + 1).saturating_sub(wmask) } else { 0 };
+                let ks: Vec<&[f32]> = hk.iter().map(|k| &k[lo * hd..]).collect();
+                let vs: Vec<&[f32]> = hv.iter().map(|v| &v[lo * hd..]).collect();
+                let mut want = vec![0f32; b * nh * hd];
+                assert!(chunk_attend_win(
+                    &q, &ks, &vs, b, s0 - lo, nh, nkv, hd, scale, wmask, &mut want
+                ));
+                let ahead = kv_mirror_stored(kv_id, 0).is_some_and(|m| m > s0);
+                let reseeds = MIRROR_EVENTS[4].load(std::sync::atomic::Ordering::Relaxed);
+                let mut got = vec![0f32; b * nh * hd];
+                assert!(
+                    chunk_attend_mirror(
+                        kv_id, 0, 65536, &hk, &hv, &q, b, s0, nh, nkv, hd, scale, ring, wmask,
+                        false, f32::INFINITY, &mut got
+                    ),
+                    "mirror attend refused at s0 {s0} (ring {ring:?})"
+                );
+                if ahead {
+                    assert!(
+                        MIRROR_EVENTS[4].load(std::sync::atomic::Ordering::Relaxed) > reseeds,
+                        "a mirror ahead of the host at s0 {s0} was not reseeded"
+                    );
+                }
+                assert!(
+                    got.iter().zip(&want).all(|(x, y)| x.to_bits() == y.to_bits()),
+                    "mirror attend differs from the upload at s0 {s0}, ring {ring:?}"
+                );
+                assert_eq!(kv_mirror_stored(kv_id, 0), Some(s0 + b));
+            }
+            kv_mirror_reset(kv_id);
+        }
     }
 
     #[test]
