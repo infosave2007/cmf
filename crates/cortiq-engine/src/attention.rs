@@ -2831,6 +2831,156 @@ mod tests {
             assert_eq!(a, b, "full mask must be bit-identical to dense");
         }
     }
+
+    /// Spark-X2.5's sliding layer (head-wise sigmoid g_proj gate, window
+    /// 6 here) with its tail trimmed after every call answers bit for bit
+    /// what the untrimmed cache does — per position, in batched chunks of
+    /// 5 and 13 (the per-position and pool-parallel `upto` attends), and in
+    /// fused pairs with a 2-row rollback in between.
+    #[test]
+    fn swa_trim_batch_pair_single_equal() {
+        let (nh, nkv, hd, hs) = (4usize, 2usize, 8usize, 16usize);
+        let w = 6usize;
+        let inv = rope_inv_freq(hd, 10_000.0);
+        let wq = synth(nh * hd, hs, 31);
+        let wk = synth(nkv * hd, hs, 32);
+        let wv = synth(nkv * hd, hs, 33);
+        let wo = synth(hs, nh * hd, 34);
+        let gp = synth(nh, hs, 35);
+        let n = 64usize;
+        let xs: Vec<Vec<f32>> = (0..n)
+            .map(|p| {
+                (0..hs)
+                    .map(|i| ((i * 5 + p * 3) as f32 * 0.17).sin())
+                    .collect()
+            })
+            .collect();
+        let cfg = |position: usize, pool: Option<&'static crate::pool::Pool>| QwenAttnCfg {
+            num_heads: nh,
+            num_kv_heads: nkv,
+            head_dim: hd,
+            hidden_size: hs,
+            position,
+            inv_freq: &inv,
+            rotary_dim: hd,
+            scale: 1.0 / (hd as f32).sqrt(),
+            softcap: 0.0,
+            window: Some(w),
+            v_norm: false,
+            qk_norm_after_rope: false,
+            gate_sigmoid: true,
+            q_norm: None,
+            k_norm: None,
+            output_gate: false,
+            softplus_gate: Some((&gp, true)),
+            rope_scale: 1.0,
+            bias: None,
+            rms_eps: 1e-6,
+            norm_style: cortiq_core::NormStyle::Qwen,
+            pool,
+            v_head_dim: hd,
+        };
+        let fresh = || {
+            let mut c = LayerKvCache::new(nkv, hd);
+            c.mode = crate::kv_cache::KvMode::F32;
+            c
+        };
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        static POOL: std::sync::OnceLock<crate::pool::Pool> = std::sync::OnceLock::new();
+        let pool: &'static crate::pool::Pool = POOL.get_or_init(|| crate::pool::Pool::new(2));
+        for pool in [None, Some(pool)] {
+            // Two arms, identical calls; `trim` trims after each one.
+            let run = |trim: bool| {
+                let (mut cs, mut cb, mut cp) = (fresh(), fresh(), fresh());
+                let mut out_s = Vec::new();
+                for (p, x) in xs.iter().enumerate() {
+                    out_s.push(qwen_attention(
+                        x,
+                        &wq,
+                        &wk,
+                        &wv,
+                        &wo,
+                        &mut cs,
+                        &cfg(p, pool),
+                    ));
+                    if trim {
+                        cs.trim_window(w, 2, 4);
+                    }
+                }
+                let mut out_b = Vec::new();
+                let mut p0 = 0usize;
+                for &b in [5usize, 13].iter().cycle() {
+                    if p0 >= n {
+                        break;
+                    }
+                    let b = b.min(n - p0);
+                    let flat: Vec<f32> = xs[p0..p0 + b].iter().flatten().copied().collect();
+                    let o =
+                        qwen_attention_batch(&flat, b, &wq, &wk, &wv, &wo, &mut cb, &cfg(p0, pool));
+                    out_b.extend(o.chunks(hs).map(|r| r.to_vec()));
+                    if trim {
+                        cb.trim_window(w, 2, 4);
+                    }
+                    p0 += b;
+                }
+                let mut out_p = Vec::new();
+                let mut p = 0usize;
+                while p + 1 < n {
+                    let (a, b) = qwen_attention_pair(
+                        &xs[p],
+                        &xs[p + 1],
+                        &wq,
+                        &wk,
+                        &wv,
+                        &wo,
+                        &mut cp,
+                        &cfg(p, pool),
+                    );
+                    if trim {
+                        cp.trim_window(w, 2, 4);
+                    }
+                    // Every third pair is a rejected draft: roll it back
+                    // and run the pair again on other inputs.
+                    if (p / 2) % 3 == 1 {
+                        cp.truncate_last(2);
+                        let (a2, b2) = qwen_attention_pair(
+                            &xs[p + 1],
+                            &xs[p],
+                            &wq,
+                            &wk,
+                            &wv,
+                            &wo,
+                            &mut cp,
+                            &cfg(p, pool),
+                        );
+                        out_p.push(a2);
+                        out_p.push(b2);
+                        if trim {
+                            cp.trim_window(w, 2, 4);
+                        }
+                    } else {
+                        out_p.push(a);
+                        out_p.push(b);
+                    }
+                    p += 2;
+                }
+                (out_s, out_b, out_p, cs.base(), cb.base(), cp.base())
+            };
+            let (s0, b0, p0, ..) = run(false);
+            let (s1, b1, p1, bs, bb, bp) = run(true);
+            assert!(bs > 0 && bb > 0 && bp > 0, "the trim fired: {bs} {bb} {bp}");
+            let pl = pool.is_some();
+            for p in 0..n {
+                assert_eq!(bits(&s0[p]), bits(&s1[p]), "single p{p} pool {pl}");
+                assert_eq!(bits(&b0[p]), bits(&b1[p]), "batch p{p} pool {pl}");
+                // The batched walk is the per-position one, bit for bit.
+                assert_eq!(bits(&s0[p]), bits(&b1[p]), "batch vs single p{p} pool {pl}");
+            }
+            for (p, (a, b)) in p0.iter().zip(&p1).enumerate() {
+                assert_eq!(bits(a), bits(b), "pair row {p} pool {pl}");
+            }
+        }
+    }
 }
 
 /// HunYuan dense applies the per-head q/k RMSNorm AFTER RoPE. A rotation
