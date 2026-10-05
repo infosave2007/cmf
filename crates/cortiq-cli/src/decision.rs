@@ -1163,8 +1163,8 @@ struct RunTotals {
     /// … of which the full reservations of failed calls that reported no
     /// cost (OpenRouter may not have billed them, as for a refused key) …
     unknown_cost: f64,
-    /// … of which those of calls OpenRouter refused (401, 402, 403, 429):
-    /// likely not billed.
+    /// … of which those of calls OpenRouter refused (401, 402, 403, 429, or
+    /// a prompt over the model's context): likely not billed.
     refused_cost: f64,
     calls: u64,
     /// Everything the ledger holds (earlier runs included).
@@ -1692,7 +1692,7 @@ impl OracleRun {
         let mut unknown = String::new();
         if t.refused_cost > 0.0 {
             unknown.push_str(&format!(
-                "; {} of it is the reservation of calls OpenRouter refused (HTTP 401, 402, 403 or 429) without a cost, likely not billed",
+                "; {} of it is the reservation of calls OpenRouter refused (HTTP 401, 402, 403 or 429, or a prompt over the model's context) without a cost, likely not billed",
                 usd(t.refused_cost)
             ));
         }

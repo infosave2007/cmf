@@ -1126,9 +1126,10 @@ pub struct LedgerTotals {
     /// less, or nothing, as for a refused key).
     pub unknown_cost: f64,
     /// Of `unknown_cost`: those of calls OpenRouter refused with HTTP 401,
-    /// 402, 403 or 429 ([`likely_unbilled`]), which it likely did not bill.
-    /// The rest (a timeout, a lost connection, a run interrupted with its
-    /// call in flight, another failure) may have been billed.
+    /// 402, 403 or 429 ([`likely_unbilled`]) or as over the model's context
+    /// ([`CONTEXT_LENGTH_CODE`]), which it likely did not bill. The rest (a
+    /// timeout, a lost connection, a run interrupted with its call in
+    /// flight, another failure) may have been billed.
     pub refused_cost: f64,
     /// Reservations of calls in flight.
     pub inflight: f64,
@@ -1211,7 +1212,9 @@ fn replay_ledger(path: &Path) -> Result<(LedgerTotals, Vec<OpenReservation>, u64
                         .get("http_status")
                         .and_then(Value::as_u64)
                         .and_then(|c| u16::try_from(c).ok());
-                    if likely_unbilled(http) {
+                    let overflow =
+                        v.get("error").and_then(Value::as_str) == Some(CONTEXT_LENGTH_CODE);
+                    if likely_unbilled(http) || overflow {
                         totals.refused_cost += charged;
                     }
                 }
@@ -3392,5 +3395,29 @@ mod tests {
             ledger_totals(&dir.path().join("none.jsonl")).unwrap(),
             LedgerTotals::default()
         );
+    }
+
+    /// A replayed ledger counts a prompt over the context as likely unbilled,
+    /// as the live settle does ([`CONTEXT_LENGTH_CODE`]); other failures stay
+    /// possibly billed.
+    #[test]
+    fn ledger_replay_counts_context_length_as_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("oracle.jsonl");
+        let lines = [
+            json!({"status":"reserved","call_id":"a","key_id":"k","reserved_usd":0.25}),
+            json!({"status":"failed_unknown_cost","call_id":"a","key_id":"k","reserved_usd":0.25,
+                   "http_status":400,"error":"context_length"}),
+            json!({"status":"reserved","call_id":"b","key_id":"k","reserved_usd":0.5}),
+            json!({"status":"failed_unknown_cost","call_id":"b","key_id":"k","reserved_usd":0.5,
+                   "http_status":500,"error":"http_500"}),
+        ];
+        let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(&p, text).unwrap();
+        let lt = ledger_totals(&p).unwrap();
+        assert_eq!(lt.unknown_cost, 0.75);
+        assert_eq!(lt.refused_cost, 0.25);
+        let c = OracleClient::open(&OracleConfig::default(), &p, None, Arc::new(|_| None)).unwrap();
+        assert_eq!(c.totals().refused_cost, 0.25);
     }
 }

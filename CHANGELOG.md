@@ -26,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (180 s). When the direct call came late, the follower got "single-flight
   wait timed out" while its leader still answered. It now waits for both
   calls (`2 · (deadline_s + reasoning_deadline_s)`).
+- Oracle ledger replay (a restarted server, `ledger_totals`): the
+  reservation of a call refused as over the model's context
+  (`context_length`) is counted as likely unbilled (`refused_cost`), as the
+  live totals already did; after a restart it was counted as possibly billed.
+  `cortiq decide --oracle` names such calls in its spend line. What is
+  charged is unchanged.
 
 ## [0.8.12] - 2026-10-05
 
