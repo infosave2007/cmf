@@ -405,7 +405,8 @@ fn usage_of(body: &Map<String, Value>) -> Option<CallUsage> {
 
 /// A listed probability: a finite number in [0, 1].
 fn probability(v: &Value) -> Option<f64> {
-    v.as_f64().filter(|p| p.is_finite() && (0.0..=1.0).contains(p))
+    v.as_f64()
+        .filter(|p| p.is_finite() && (0.0..=1.0).contains(p))
 }
 
 /// The bare verdict of one question (the 0.8.7 form, or the verdict field of
@@ -449,7 +450,10 @@ fn parse_verdict(q: &Question, v: &Value) -> std::result::Result<Verdict, String
         // (a percent, a null, an id twice, …) is dropped, never the paid
         // call (DESIGN C3).
         Err(code) => {
-            tracing::debug!(code, "oracle: a malformed distribution dropped, the verdict kept one-hot");
+            tracing::debug!(
+                code,
+                "oracle: a malformed distribution dropped, the verdict kept one-hot"
+            );
             Ok(Verdict::one_hot(stated))
         }
     }
@@ -1578,7 +1582,12 @@ impl OracleClient {
                 let direct = self.cfg.without_reasoning();
                 tracing::info!(error = %f.error, "reasoning oracle call failed; asking without reasoning");
                 let body = request_body(&direct, questions, state);
-                self.call_with(caller, questions, &body, call_max_tokens(&direct, questions.len()))
+                self.call_with(
+                    caller,
+                    questions,
+                    &body,
+                    call_max_tokens(&direct, questions.len()),
+                )
             }
             _ => outcome,
         }
@@ -1591,7 +1600,12 @@ impl OracleClient {
         questions: &[&Question],
         body: &[u8],
     ) -> CallOutcome {
-        self.call_with(caller, questions, body, call_max_tokens(&self.cfg, questions.len()))
+        self.call_with(
+            caller,
+            questions,
+            body,
+            call_max_tokens(&self.cfg, questions.len()),
+        )
     }
 
     /// One call of `body`, whose `max_tokens` is `mt`.
