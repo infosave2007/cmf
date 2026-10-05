@@ -1114,6 +1114,10 @@ mod tests {
         assert_eq!(c.limits.max_inflight, 64);
         assert_eq!(c.oracle.max_price().unwrap(), (0.1, 0.5));
         assert!(!c.oracle.enabled);
+        // PII redaction is opt-in: off without the key, on with it.
+        assert!(!c.oracle.redact_pii);
+        let pii = Config::from_json(br#"{"oracle":{"redact_pii":true}}"#).unwrap();
+        assert!(pii.oracle.redact_pii);
         // Near reuse is opt-in (0.8.11): only the same question hits.
         assert_eq!(c.cache.threshold, 1.0);
         let near = Config::from_json(br#"{"cache":{"threshold":0.97}}"#).unwrap();
