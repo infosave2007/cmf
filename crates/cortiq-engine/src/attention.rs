@@ -1890,10 +1890,12 @@ pub fn qwen_attention_batch(
             // The pipeline named the decode graph's device mirror of this
             // layer: append the chunk's rows to it and attend in place
             // (`chunk_attend_mirror`; the host rows above are the same
-            // bits). Rows are positions there, so the host cache must be
-            // unevicted (`position == seq_len`).
+            // bits). Rows are positions there, so the host rows must be
+            // contiguous positions: unevicted, from `base` on (a sliding
+            // tail, `trim_window`, starts past 0).
+            let host_base = cache.base();
             let mirror = crate::gpu::prefill_mirror()
-                .filter(|_| cfg.gate_sigmoid && vd == hd && cfg.position == s0);
+                .filter(|_| cfg.gate_sigmoid && vd == hd && cfg.position == host_base + s0);
             // The matrix-unit attend casts Q, K and V to f16: its guard
             // takes max |x| over the chunk's queries and over every K/V row
             // the cache holds (those the attend reads among them).
@@ -1950,9 +1952,10 @@ pub fn qwen_attention_batch(
                     t,
                     cache.k_heads(),
                     cache.v_heads(),
+                    host_base,
                     &qhm,
                     b,
-                    s0,
+                    cfg.position,
                     nh,
                     nkv,
                     hd,
@@ -1974,9 +1977,10 @@ pub fn qwen_attention_batch(
                     t,
                     cache.k_heads(),
                     cache.v_heads(),
+                    host_base,
                     &qhm,
                     b,
-                    s0,
+                    cfg.position,
                     nh,
                     nkv,
                     hd,
