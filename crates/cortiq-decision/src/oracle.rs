@@ -2307,6 +2307,7 @@ mod tests {
         let v = request_value(&off, &[&c], &json!("x"));
         assert_eq!(v["reasoning"], json!({"enabled": false}));
         assert_eq!(off.call_deadline_s(), 30.0);
+        assert_eq!(off.escalation_deadline_s(), 30.0);
         let on = OracleConfig {
             reasoning: "medium".into(),
             ..OracleConfig::default()
@@ -2316,6 +2317,10 @@ mod tests {
         assert_eq!(v["max_tokens"], json!(64 + 128 + 4096));
         assert_eq!(call_max_tokens(&on, 2), 128 + 256 + 4096);
         assert_eq!(on.call_deadline_s(), 90.0);
+        // A follower waits for both calls of an escalation, each bounded by
+        // the agent's timeout (the call's deadline).
+        assert_eq!(on.escalation_deadline_s(), 2.0 * on.call_deadline_s());
+        assert_eq!(on.escalation_deadline_s(), 180.0);
         let mut cfg = crate::config::Config::default();
         cfg.oracle.reasoning = "extreme".into();
         assert!(cfg.validate().is_err());

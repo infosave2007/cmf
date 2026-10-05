@@ -382,11 +382,13 @@ impl OracleConfig {
         }
     }
 
-    /// How long one escalation may hold the oracle: a call's deadline, and
-    /// with the reasoning on the direct call that may follow a failed one.
+    /// How long one escalation may hold the oracle: one call's deadline, and
+    /// with the reasoning on two of them, the reasoning call and the direct
+    /// call that may follow a failed one, each bounded by the HTTP agent's
+    /// timeout ([`Self::call_deadline_s`]).
     pub fn escalation_deadline_s(&self) -> f64 {
         if self.reasoning_effort().is_some() {
-            self.call_deadline_s() + self.deadline_s
+            2.0 * self.call_deadline_s()
         } else {
             self.deadline_s
         }
