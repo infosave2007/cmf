@@ -19718,6 +19718,48 @@ mod tests {
         assert!(b.kv_cache.total_memory_bytes() < a.kv_cache.total_memory_bytes());
     }
 
+    /// The network split's KvFetch hand-off on a trimmed stack: every
+    /// layer shipped over the wire mid-sequence (the sliding ones as
+    /// `FullTail`) into a fresh pipeline that never ran a position, which
+    /// then decodes on — bit for bit what the untrimmed pipeline decodes.
+    #[test]
+    fn swa_trim_wire_handoff_continues_bitwise() {
+        let mut a = spark_test_pipeline(None);
+        let mut b = spark_test_pipeline(Some((2, 4)));
+        let ids: Vec<u32> = (0..29u32).map(|i| (i * 13 + 7) % 64).collect();
+        let ha = a.prefill_batch_span(PrefillIn::Ids(&ids), 0, None, 0, 4);
+        let hb = b.prefill_batch_span(PrefillIn::Ids(&ids), 0, None, 0, 4);
+        assert_eq!(f32_bits(&ha), f32_bits(&hb));
+        let mut pos = ids.len();
+        for _ in 0..5 {
+            let e = a.embed_single(((pos * 5) % 64) as u32);
+            assert_eq!(
+                f32_bits(&a.forward_layers(&e, pos, None)),
+                f32_bits(&b.forward_layers(&e, pos, None))
+            );
+            pos += 1;
+        }
+        let mut c = spark_test_pipeline(Some((2, 4)));
+        for li in 0..4 {
+            let bytes = b.kv_cache.layers[li].export_wire(false).unwrap();
+            c.kv_cache.layers[li].import_wire(&bytes).unwrap();
+        }
+        assert!(c.kv_cache.layers[0].base() > 0, "a tail travelled");
+        assert_eq!(c.kv_cache.seq_len(), pos);
+        for step in 0..17 {
+            let e = a.embed_single(((pos * 3 + 1) % 64) as u32);
+            let ha = a.forward_layers(&e, pos, None);
+            let hc = c.forward_layers(&e, pos, None);
+            assert_eq!(
+                f32_bits(&ha),
+                f32_bits(&hc),
+                "after the hand-off, step {step}"
+            );
+            pos += 1;
+        }
+        assert!(c.kv_cache.layers[0].seq_len <= 12, "the receiver trims on");
+    }
+
     /// A synthetic MiMo draft stack of `n` layers for `mimo_test_pipeline`
     /// (the SWA geometry of its sliding layers: 2 KV heads, head 8 / V 4).
     fn mimo_test_mtp(n: usize, gain: f32) -> mimo_mtp::MimoMtp {
