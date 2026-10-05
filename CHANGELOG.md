@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cmf.allow_pii_egress` still skips it per request. `cortiq decide
   --oracle` has no configuration, so it sends the text as written
   (ORACLE.md "What leaves the machine").
+
 ## [0.8.12] - 2026-10-05
 
 ### Changed
