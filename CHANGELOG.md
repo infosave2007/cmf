@@ -5,9 +5,54 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.12] - 2026-10-05
 
 ### Changed
+- Vulkan prompt ingest for Spark-X2.5: 1.7-2x faster for q8_2f files and
+  1.4-1.75x for q4mix files, from 1k to 16k tokens. The steps:
+  - Each layer's chunk K/V goes into the decode graph's device KV mirror
+    (a 1024-row ring on sliding layers), and the chunk attends against it.
+    Before, every 512-token chunk re-uploaded each full layer's whole K/V
+    prefix and each sliding layer's 1023-row window: about 22 GB over a
+    16k-token 4B prompt.
+  - Decode starts on a mirror that is already in sync. Before, the first
+    decode token after a long prompt uploaded the host cache once more.
+  - QKᵀ and P·V run on the matrix units, and tiles outside the causal or
+    sliding band are skipped.
+  - The int8 GEMMs take the 128×128 matrix-unit tile.
+  - The head gate and the O projection stay on the card, and q|k|v share
+    one operand upload.
+  - RoPE runs across the pool.
+
+  RTX 2000 Ada, `bench --core --ignore-eos`, medians of three runs
+  interleaved with 0.8.10, prompt tok/s at 1000 / 16000 tokens (time to
+  first token at 16000):
+
+  | file | 0.8.10 | 0.8.12 |
+  |---|---|---|
+  | 4B q8_2f | 189 / 192 (84 s) | 377 / 361 (41 s) |
+  | 4B q4mix | 191 / 156 (98 s) | 282 / 254 (59 s) |
+  | 1.7B q8_2f | 535 / 415 (39 s) | 906 / 833 (18.5 s) |
+  | 1.7B q4mix | 538 / 411 (39 s) | 772 / 718 (22.5 s) |
+
+  Decode at depth 8000 is 5-11 % faster, probably because 0.8.10 paid the
+  mirror upload in its first steps. Plain decode is unchanged.
+
+  The matrix-unit attention computes in f16 (f32 accumulators). It moves
+  logits by up to 0.25, about as far as the 0.8.10 GPU path is from the
+  strict CPU. In 4 of about 60 compared generations a near-tie flips the
+  greedy text. Wiki perplexity moves by at most 0.05 % (4B q8_2f 10.677
+  → 10.672).
+
+  Escape hatches:
+  - `CMF_PREFILL_ATTN_COOP=0` keeps the f32 attention kernels and the
+    0.8.10 output, byte for byte;
+  - `CMF_PREFILL_MIRROR=0` keeps the upload path.
+
+  A guard falls back to the f32 kernels when any |q|, |k| or |v| exceeds
+  the f16 range. The new host-side shortcuts are taken on Spark-X2.5 only;
+  the faster max|x| scan also serves other models' int8 and q4tp GEMMs,
+  with the same result.
 - Spark-X2.5's sliding layers keep only the tail their 512-token window can
   still read. The host cache stored every position on every layer; a
   sliding layer now drops its front once it holds more than 1024 rows and
@@ -40,8 +85,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alternating pairs, not the trim's. Past `CMF_MAX_SEQ` the cache-wide
   eviction leaves the sliding tails alone (they bound themselves), so the
   output there is not the untrimmed one: 1.7B q8_2f, a 1088-token prompt
-  under `CMF_MAX_SEQ=1088`, keeps continuing the text where the untrimmed
-  run falls into one repeated line (Metal) or blank lines (wgpu).
+  under `CMF_MAX_SEQ=1088` (Metal; 1100 on wgpu), keeps continuing the text
+  where the untrimmed run falls into one repeated line (Metal) or blank
+  lines (wgpu).
 - The KV wire carries a trimmed layer as a new record kind (`FullTail`:
   the absolute position of its first row, then the usual body). An
   untrimmed layer still travels as before; a peer without the kind refuses
