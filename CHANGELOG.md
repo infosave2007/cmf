@@ -37,7 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   9.2 GB footprint (KV+state 2562 MB). Over 1500 generated tokens after 6000 (three trims,
   each followed by one mirror re-upload) decode is 16.7 → 16.8 tok/s.
   The CPU decode range is this shared machine's spread over three
-  alternating pairs, not the trim's.
+  alternating pairs, not the trim's. Past `CMF_MAX_SEQ` the cache-wide
+  eviction leaves the sliding tails alone (they bound themselves), so the
+  output there is not the untrimmed one: 1.7B q8_2f, a 1088-token prompt
+  under `CMF_MAX_SEQ=1088`, keeps continuing the text where the untrimmed
+  run falls into one repeated line (Metal) or blank lines (wgpu).
 - The KV wire carries a trimmed layer as a new record kind (`FullTail`:
   the absolute position of its first row, then the usual body). An
   untrimmed layer still travels as before; a peer without the kind refuses
