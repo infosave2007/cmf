@@ -283,7 +283,7 @@ pub struct OracleConfig {
     pub max_calls: u64,
     pub max_errors: u32,
     /// Opt-in PII redaction of the text sent to the oracle ([`crate::pii`]).
-    /// Off by default (on through 0.8.11): its patterns also rewrote tool
+    /// Off by default (on through 0.8.12): its patterns also rewrote tool
     /// names, slugs and chemical names that look like secrets. `true` turns
     /// it on; a request's `cmf.allow_pii_egress` still skips it then.
     pub redact_pii: bool,

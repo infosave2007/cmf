@@ -459,7 +459,7 @@ same question waits for both.
   fallbacks allowed; set `oracle.data_collection: "deny"` to exclude providers
   that store data).
 * **PII redaction** is off by default: the text is sent as asked. It was on
-  through 0.8.11, and its secret-like pattern also rewrote tool names, slugs
+  through 0.8.12, and its secret-like pattern also rewrote tool names, slugs
   and chemical names (10,225 questions of one Decision Index run). Turn it
   on with `"oracle": {"redact_pii": true}`; then e-mail addresses,
   secret-like tokens (20 or more characters of `[A-Za-z0-9_-]` with a digit and
