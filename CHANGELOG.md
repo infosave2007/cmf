@@ -19,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   --oracle` has no configuration, so it sends the text as written
   (ORACLE.md "What leaves the machine").
 
+### Fixed
+- Single flight with the reasoning on: a follower waited one call's deadline
+  plus `deadline_s` (120 s by default), but the leader's reasoning call and
+  the direct call after a failed one are each bounded by the call's deadline
+  (180 s). When the direct call came late, the follower got "single-flight
+  wait timed out" while its leader still answered. It now waits for both
+  calls (`2 · (deadline_s + reasoning_deadline_s)`).
+
 ## [0.8.12] - 2026-10-05
 
 ### Changed
