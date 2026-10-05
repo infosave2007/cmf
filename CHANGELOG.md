@@ -33,8 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   live totals already did; after a restart it was counted as possibly billed.
   `cortiq decide --oracle` names such calls in its spend line. What is
   charged is unchanged.
-- Decision docs: PII redaction was on by default through 0.8.12, not 0.8.11
-  (ORACLE.md and the crate docs); the System One adapter answers
+- Decision docs: the System One adapter answers
   `cmf-decision-<version>`, its own version, and refuses another (README and
   API.md named `cmf-decision-0.8.5`); both calls of a reasoning fallback
   count toward the stop rules, so a failed first call can reach
