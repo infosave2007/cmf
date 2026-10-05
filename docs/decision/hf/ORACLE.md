@@ -426,8 +426,12 @@ same question waits for both.
   × `oracle_markup` ≤ the credit left.
 * **Ledger.** `oracle.jsonl` gets a `reserved` line, fsynced, before the
   request leaves; after the answer a `settled`, `failed_billed` or
-  `failed_unknown_cost` line with the cost, tokens and latency. At start any
-  reservation without a closing line counts as spent.
+  `failed_unknown_cost` line with the cost, tokens and latency. A failed call
+  without a reported cost is charged its reservation (a timeout, a lost
+  connection, a 5xx may have been billed), unless OpenRouter refused the
+  request before any model ran — HTTP 400, 401, 402, 403, 404, 413, 422 or
+  429, or the `context_length` failure below — which releases it. At start
+  any reservation without a closing line counts as spent.
 * **Checks of every answer.** HTTP 200 within `deadline_s` (no retries), a
   finite `usage.cost` ≥ 0, `finish_reason: stop`, exactly the asked question
   ids with the schema's types. A 200 that carries only an `error` is a failure.
@@ -441,7 +445,7 @@ same question waits for both.
   context length) is the failure `context_length`: the question gets a 422
   whose message says `maximum context length` (a trained one abstains), it
   does not count toward `max_errors` — a run of long items must not stop a
-  working oracle — and its reservation counts as likely unbilled.
+  working oracle — and its reservation is released, not charged.
 * `GET /v1/admin/oracle` shows spent, reserved, remaining, calls, failures and
   the stop reason; `POST /v1/admin/oracle` can switch the oracle and lower
   `budget_usd` / `max_calls` within the configured values. Since 0.8.11 the
