@@ -2460,7 +2460,9 @@ pub fn prefill_mirror() -> Option<PrefillMirror> {
 /// `chunk_attend_win` against the decode graph's device mirror instead of
 /// an upload of the whole prefix: the host rows the mirror lacks (the
 /// chunk's own `b`, or more after a host-only chunk) are appended first,
-/// then the attention binds the mirror rows in place. `ring` is the
+/// then the attention binds the mirror rows in place. `s0` is the chunk's
+/// first position and `base` the position of host row 0
+/// (`LayerKvCache::base`: past 0 on a trimmed sliding tail). `ring` is the
 /// layer's window as the mirror geometry (Some on every sliding layer),
 /// `window` the window the softmax masks with (0 while it masks nothing).
 /// `operand_max` = max |x| over `q` and every K/V row the attend reads
@@ -2472,6 +2474,7 @@ pub fn chunk_attend_mirror(
     t: PrefillMirror,
     cpu_k: &[Vec<f32>],
     cpu_v: &[Vec<f32>],
+    base: usize,
     q: &[f32],
     b: usize,
     s0: usize,
@@ -2496,6 +2499,7 @@ pub fn chunk_attend_mirror(
             t.limit,
             cpu_k,
             cpu_v,
+            base,
             q,
             b,
             s0,
@@ -2526,6 +2530,7 @@ pub fn chunk_attend_mirror_wo(
     t: PrefillMirror,
     cpu_k: &[Vec<f32>],
     cpu_v: &[Vec<f32>],
+    base: usize,
     q: &[f32],
     b: usize,
     s0: usize,
@@ -2549,6 +2554,7 @@ pub fn chunk_attend_mirror_wo(
             t.limit,
             cpu_k,
             cpu_v,
+            base,
             q,
             b,
             s0,

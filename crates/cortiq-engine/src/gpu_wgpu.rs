@@ -37878,17 +37878,20 @@ fn mirror_event(i: usize) {
 /// right after an 8k prefill ran at 13 tok/s against a steady 29).
 ///
 /// The host cache stays the source of truth: it already holds the
-/// chunk's rows (rows `[0, s0 + b)`), and `kv_mirror_seed_x` appends the
-/// ones the mirror lacks — the chunk's `b`, or a longer catch-up after a
-/// host-only chunk. Same geometry as the token graph's `ensure_x` (V as
-/// wide as K; a ring of `kv_ring_cap(w)` rows on a sliding layer), so the
-/// decode finds `synced == position` and uploads nothing. With `coop`
-/// off the kernels, their inputs and parameters are `chunk_attend_win`'s:
-/// the mirror rows are the host rows bit for bit, so is the result. With
-/// it on (and the device able), QKᵀ and P·V run on the matrix units
-/// (`PF_ATTN_COOP_SRC`, f16 operands) — unless `operand_max` (max |x|
-/// over `q` and the K/V rows the attend reads, `gpu::abs_max_or_inf`) is
-/// past f16's range, where the cast would overflow: then the f32 kernels.
+/// chunk's rows (positions `[base, s0 + b)`; `s0` is the chunk's first
+/// position, `base` that of host row 0 — past 0 on a sliding layer that
+/// keeps only its tail, `LayerKvCache::trim_window`), and
+/// `kv_mirror_seed_x` appends the ones the mirror lacks — the chunk's `b`,
+/// or a longer catch-up after a host-only chunk. Same geometry as the
+/// token graph's `ensure_x` (V as wide as K; a ring of `kv_ring_cap(w)`
+/// rows on a sliding layer), so the decode finds `synced == position`
+/// and uploads nothing. With `coop` off the kernels, their inputs and
+/// parameters are `chunk_attend_win`'s: the mirror rows are the host rows
+/// bit for bit, so is the result. With it on (and the device able), QKᵀ
+/// and P·V run on the matrix units (`PF_ATTN_COOP_SRC`, f16 operands) —
+/// unless `operand_max` (max |x| over `q` and the K/V rows the attend
+/// reads, `gpu::abs_max_or_inf`) is past f16's range, where the cast
+/// would overflow: then the f32 kernels.
 ///
 /// `ring` = the layer's window (the mirror geometry), `window` = what the
 /// softmax masks with (0 while the window still masks nothing). False =
@@ -37900,6 +37903,7 @@ pub fn chunk_attend_mirror(
     limit: usize,
     cpu_k: &[Vec<f32>],
     cpu_v: &[Vec<f32>],
+    base: usize,
     q: &[f32],
     b: usize,
     s0: usize,
@@ -37914,8 +37918,8 @@ pub fn chunk_attend_mirror(
     out: &mut [f32],
 ) -> bool {
     chunk_attend_mirror_impl(
-        kv_id, layer, limit, cpu_k, cpu_v, q, b, s0, nh, nkv, hd, scale, ring, window, coop,
-        operand_max, out, None,
+        kv_id, layer, limit, cpu_k, cpu_v, base, q, b, s0, nh, nkv, hd, scale, ring, window,
+        coop, operand_max, out, None,
     )
 }
 
@@ -37943,6 +37947,7 @@ pub fn chunk_attend_mirror_wo(
     limit: usize,
     cpu_k: &[Vec<f32>],
     cpu_v: &[Vec<f32>],
+    base: usize,
     q: &[f32],
     b: usize,
     s0: usize,
@@ -37965,8 +37970,8 @@ pub fn chunk_attend_mirror_wo(
     }
     let mut kept = None;
     if !chunk_attend_mirror_impl(
-        kv_id, layer, limit, cpu_k, cpu_v, q, b, s0, nh, nkv, hd, scale, ring, window, coop,
-        operand_max, &mut [], Some(&mut kept),
+        kv_id, layer, limit, cpu_k, cpu_v, base, q, b, s0, nh, nkv, hd, scale, ring, window,
+        coop, operand_max, &mut [], Some(&mut kept),
     ) {
         return false;
     }
@@ -38027,6 +38032,7 @@ fn chunk_attend_mirror_impl(
     limit: usize,
     cpu_k: &[Vec<f32>],
     cpu_v: &[Vec<f32>],
+    base: usize,
     q: &[f32],
     b: usize,
     s0: usize,
@@ -38106,7 +38112,7 @@ fn chunk_attend_mirror_impl(
             e.synced = 0;
             e.lo = 0;
         }
-        if !kv_mirror_seed_x(c, e, cpu_k, cpu_v, n_abs) {
+        if !kv_mirror_seed_x(c, e, cpu_k, cpu_v, base, n_abs) {
             return false;
         }
         if lo < e.resident_from() {
@@ -43783,8 +43789,8 @@ mod tests {
                     });
                     assert!(
                         chunk_attend_mirror(
-                            kv_id, 0, 65536, &hk, &hv, &q, b, s0, nh, nkv, hd, scale, ring, wmask,
-                            coop, om, &mut got
+                            kv_id, 0, 65536, &hk, &hv, 0, &q, b, s0, nh, nkv, hd, scale, ring,
+                            wmask, coop, om, &mut got
                         ),
                         "mirror attend refused at s0 {s0} (ring {ring:?})"
                     );
@@ -43859,6 +43865,7 @@ mod tests {
                 65536,
                 cache.k_heads(),
                 cache.v_heads(),
+                0,
                 &q,
                 b,
                 s0,
@@ -43935,7 +43942,7 @@ mod tests {
                 let mut got = vec![0f32; b * nh * hd];
                 assert!(
                     chunk_attend_mirror(
-                        kv_id, 0, 65536, &hk, &hv, &q, b, s0, nh, nkv, hd, scale, ring, wmask,
+                        kv_id, 0, 65536, &hk, &hv, 0, &q, b, s0, nh, nkv, hd, scale, ring, wmask,
                         false, f32::INFINITY, &mut got
                     ),
                     "mirror attend refused at s0 {s0} (ring {ring:?})"
@@ -43954,6 +43961,124 @@ mod tests {
             }
             kv_mirror_reset(kv_id);
         }
+    }
+
+    /// A sliding layer whose host keeps only its tail
+    /// (`LayerKvCache::trim_window`, Spark's 512 window with 64 rows of
+    /// slack on a 64-row grid): host row 0 is position `base`, the mirror
+    /// is indexed by position. Chunk after chunk the mirror attend is the
+    /// UNTRIMMED host's upload attend bit for bit on the f32 kernels — for
+    /// a mirror that followed every chunk, for one first seeded after the
+    /// host had trimmed, and for one ahead of the host after a rollback
+    /// (reseeded from the tail).
+    #[test]
+    fn chunk_attend_mirror_reads_a_trimmed_host_tail() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping trimmed-tail mirror test");
+            return;
+        };
+        let _one = chunk_attend_test_lock();
+        let _drain = TestGpuDrain::new(c);
+        let (nh, nkv, hd, w) = (4usize, 2usize, 256usize, 512usize);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let val = |salt: usize, i: usize| {
+            ((i.wrapping_mul(2654435761) ^ salt.wrapping_mul(40503)) % 1999) as f32 / 1999.0 - 0.5
+        };
+        let mut full = crate::kv_cache::LayerKvCache::new(nkv, hd);
+        full.mode = crate::kv_cache::KvMode::F32;
+        let mut tail = full.clone();
+        // Followed every chunk / first used at position 2048 (step 4),
+        // then every chunk after it, the rollback included.
+        let (kv_a, kv_b) = ((1u64 << 50) | 0x30, (1u64 << 50) | 0x31);
+        // (s0, b, salt): the host trims from the 1536-row chunk on; at
+        // 2000 it takes back 100 rows (both mirrors hold 2100) and goes on
+        // with other rows.
+        let steps = [
+            (0usize, 512usize, 0usize),
+            (512, 512, 0),
+            (1024, 512, 0),
+            (1536, 512, 0),
+            (2048, 52, 0),
+            (2000, 300, 1),
+            (2300, 512, 1),
+            (2812, 40, 1),
+        ];
+        let mut trimmed = false;
+        for (step, (s0, b, salt)) in steps.into_iter().enumerate() {
+            let have = full.seq_len;
+            if s0 < have {
+                full.truncate_last(have - s0);
+                tail.truncate_last(have - s0);
+            }
+            assert_eq!(tail.pos_len(), s0);
+            for p in s0..s0 + b {
+                let row = |s: usize| -> Vec<f32> {
+                    (0..nkv * hd).map(|i| val(s + 10 * salt, p * nkv * hd + i)).collect()
+                };
+                let (k, v) = (row(1), row(2));
+                full.append(&k, &v, &[]);
+                tail.append(&k, &v, &[]);
+            }
+            let q: Vec<f32> = (0..nh * b * hd).map(|i| val(97 + s0 + salt, i)).collect();
+            let wmask = if s0 + b > w { w } else { 0 };
+            let lo = if wmask > 0 { (s0 + 1).saturating_sub(wmask) } else { 0 };
+            let ks: Vec<&[f32]> = (0..nkv).map(|g| &full.head_keys(g)[lo * hd..]).collect();
+            let vs: Vec<&[f32]> = (0..nkv).map(|g| &full.head_values(g)[lo * hd..]).collect();
+            let mut want = vec![0f32; b * nh * hd];
+            assert!(chunk_attend_win(
+                &q, &ks, &vs, b, s0 - lo, nh, nkv, hd, scale, wmask, &mut want
+            ));
+            trimmed |= tail.base() > 0;
+            let reseeds = MIRROR_EVENTS[4].load(std::sync::atomic::Ordering::Relaxed);
+            for kv_id in [kv_a, kv_b] {
+                if kv_id == kv_b && step < 4 {
+                    continue;
+                }
+                let mut got = vec![0f32; b * nh * hd];
+                assert!(
+                    chunk_attend_mirror(
+                        kv_id,
+                        0,
+                        65536,
+                        tail.k_heads(),
+                        tail.v_heads(),
+                        tail.base(),
+                        &q,
+                        b,
+                        s0,
+                        nh,
+                        nkv,
+                        hd,
+                        scale,
+                        Some(w),
+                        wmask,
+                        false,
+                        f32::INFINITY,
+                        &mut got
+                    ),
+                    "mirror attend refused at s0 {s0} (base {}, mirror {kv_id:#x})",
+                    tail.base()
+                );
+                assert!(
+                    got.iter().zip(&want).all(|(x, y)| x.to_bits() == y.to_bits()),
+                    "mirror attend over the tail (base {}) differs from the untrimmed upload \
+                     at s0 {s0}, mirror {kv_id:#x}",
+                    tail.base()
+                );
+                assert_eq!(kv_mirror_stored(kv_id, 0), Some(s0 + b));
+            }
+            if s0 == 2000 {
+                assert!(
+                    MIRROR_EVENTS[4].load(std::sync::atomic::Ordering::Relaxed) >= reseeds + 2,
+                    "the mirrors ahead of the rolled-back tail were not reseeded"
+                );
+            }
+            tail.trim_window(w, 64, 64);
+        }
+        assert!(trimmed, "the host never trimmed");
+        kv_mirror_reset(kv_a);
+        kv_mirror_reset(kv_b);
     }
 
     #[test]
