@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.13] - 2026-10-05
 
 ### Changed
 - Oracle PII redaction is off by default: `oracle.redact_pii` defaults to
@@ -21,17 +21,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Single flight with the reasoning on: a follower waited one call's deadline
-  plus `deadline_s` (120 s by default), but the leader's reasoning call and
-  the direct call after a failed one are each bounded by the call's deadline
-  (180 s). When the direct call came late, the follower got "single-flight
-  wait timed out" while its leader still answered. It now waits for both
-  calls (`2 · (deadline_s + reasoning_deadline_s)`).
+  plus `deadline_s` (120 s with the default deadlines), but the leader's
+  reasoning call and the direct call after a failed one are each bounded by
+  the call's deadline (180 s together). When the direct call came late, the
+  follower got "single-flight wait timed out" while its leader still
+  answered. It now waits for both calls
+  (`2 · (deadline_s + reasoning_deadline_s)`).
 - Oracle ledger replay (a restarted server, `ledger_totals`): the
   reservation of a call refused as over the model's context
   (`context_length`) is counted as likely unbilled (`refused_cost`), as the
   live totals already did; after a restart it was counted as possibly billed.
   `cortiq decide --oracle` names such calls in its spend line. What is
   charged is unchanged.
+- Decision docs: PII redaction was on by default through 0.8.12, not 0.8.11
+  (ORACLE.md and the crate docs); the System One adapter answers
+  `cmf-decision-<version>`, its own version, and refuses another (README and
+  API.md named `cmf-decision-0.8.5`); both calls of a reasoning fallback
+  count toward the stop rules, so a failed first call can reach
+  `max_errors` (ORACLE.md said only the second one counted). The
+  `token_chunk` doc line of the server's streaming module was attached to
+  `tool_calls_chunk`.
 
 ## [0.8.12] - 2026-10-05
 
