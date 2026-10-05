@@ -745,7 +745,7 @@ native server. It does **not** load Jev weights or present itself as Jev.
 
 | Field | Adapter rule |
 |---|---|
-| `model` | optional. Omitted, `jev-latest`, `jev-preview`, `jev-1.13.0`, the `typesafe/jev-1.13` selector series, `cmf-decision-<version>` and `default` (the Decision Index kit's placeholder; not listed by discovery) select the current local CMF decision model at this endpoint only. |
+| `model` | optional. Omitted, `jev-latest`, `jev-preview`, `jev-1.13.0`, the `typesafe/jev-1.13` selector series, `cmf-decision-<version>` of this server's own version (another version is refused as an unknown model) and `default` (the Decision Index kit's placeholder; not listed by discovery) select the current local CMF decision model at this endpoint only. |
 | `state` | a string, object, array or `null`; empty (`""`, `{}`, `[]`, `null`) makes the request state-less ([section 3.2](#32-skill-matching-and-certified)). |
 | `questions` | an object of `choice`, `score` or `noul` questions. `instructions` may be omitted or `null`, matching System One clients. |
 
@@ -772,7 +772,7 @@ A successful response is intentionally small and identifies the local model:
 
 ```json
 {
-  "model": "cmf-decision-0.8.5",
+  "model": "cmf-decision-0.8.13",
   "answers": {
     "intent": {
       "type": "choice",
@@ -788,7 +788,8 @@ A successful response is intentionally small and identifies the local model:
 The token figures use the same request metering as the native endpoint; their
 values vary with the request. `GET /v1/models` changes to System One discovery
 format in adapter mode. Its `models` array contains the canonical
-`cmf-decision-0.8.5` entry and transport aliases such as `jev-latest`; each
+`cmf-decision-<version>` entry (`cmf-decision-0.8.13` on this release) and
+transport aliases such as `jev-latest`; each
 alias describes itself as a route to the local CMF model. Requests use the same
 Cortiq key policy as the rest of the server. System One errors use
 `{"error":{"type", "message", "code", "request_id"}}`. Schema errors and
