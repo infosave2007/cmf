@@ -18285,6 +18285,13 @@ struct Ctx {
     /// [nkv, cap, hd] each, persists across decode tokens. `synced` counts
     /// the positions already resident (prefill sync + graph appends).
     attn_kv: Mutex<HashMap<(u64, usize), KvMirror>>,
+    /// Lazily built prefill kernels (the int8 GEMM's `zi_mm` route, the
+    /// head gate), owned here so `shutdown` drops them with the device: a
+    /// pipeline parked in a process-wide static keeps the Vulkan device
+    /// alive into process exit, where the NVIDIA driver's own teardown
+    /// races it (an intermittent segfault after the last token, seen with
+    /// the `zimage` cache).
+    prefill_pipes: Mutex<HashMap<String, Arc<wgpu::ComputePipeline>>>,
     /// GDN recurrent state per (kv_id, layer): (conv ring, S), persists across
     /// decode tokens (created zeroed on first touch).
     gdn_state: Mutex<HashMap<(u64, usize), (wgpu::Buffer, wgpu::Buffer)>>,
@@ -18810,6 +18817,8 @@ struct Scratch {
     dvt: Option<(wgpu::Buffer, u64)>,
     /// Partial maxima of the two-stage activation reduction.
     amaxp: Option<(wgpu::Buffer, u64)>,
+    /// The f16 activation panel of an int8 GEMM routed through `zi_mm`.
+    zact: Option<(wgpu::Buffer, u64)>,
     /// The folded activation scale (one f32) the batched-prefill coop
     /// GEMMs read; every GEMM in the chunk rewrites it in queue order.
     amax1: Option<(wgpu::Buffer, u64)>,
@@ -20731,6 +20740,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         dit_pool: Mutex::new(HashMap::new()),
         rs_bufs: Mutex::new(HashMap::new()),
         attn_kv: Mutex::new(HashMap::new()),
+        prefill_pipes: Mutex::new(HashMap::new()),
         gdn_state: Mutex::new(HashMap::new()),
         gdn_cursor: Mutex::new(HashMap::new()),
         gdn_snap: Mutex::new(HashMap::new()),
@@ -33696,6 +33706,7 @@ pub fn q8_matmat_2f(
         cols,
         Some(out),
         None,
+        None,
     )
     .is_some()
 }
@@ -33950,6 +33961,7 @@ pub(crate) fn fused_gemm_from_device(
                 cols,
                 Some(out),
                 Some(src),
+                None,
             )
             .is_some()
         }
@@ -34005,7 +34017,100 @@ pub fn q8_matmat_keep(
         cols,
         None,
         None,
+        None,
     )
+}
+
+/// `q8_matmat_keep` for an operand already on the card (`src`, b × cols)
+/// whose f16-arm scale the caller took on the host from the same values.
+#[allow(clippy::too_many_arguments)]
+fn q8_matmat_keep_src(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    src: &wgpu::Buffer,
+    src_scale: f32,
+    b: usize,
+    rows: usize,
+    cols: usize,
+) -> Option<wgpu::Buffer> {
+    use cortiq_core::TensorDtype as D;
+    let c = ctx()?;
+    let entry = &model.tensors[idx];
+    if !matches!(entry.dtype, D::Q8Row | D::Q8_2f) || cols % 4 != 0 || rows == 0 || b == 0 {
+        return None;
+    }
+    if entry.shape.first().copied().unwrap_or(0) < rows {
+        return None;
+    }
+    let (rs, cf) = q8_fields(model, idx, rows, cols)?;
+    let col = (entry.dtype == D::Q8_2f).then_some(&cf[..]);
+    let abs = model.entry_abs_offset(entry)?;
+    let bytes = model.primary_bytes();
+    let payload_len = if entry.dtype == D::Q8_2f {
+        entry.nbytes as usize
+    } else {
+        rows * cols
+    };
+    if abs + payload_len > bytes.len() {
+        return None;
+    }
+    dispatch_matmat_keep(
+        c,
+        {
+            note_layer((model.uid() as usize, idx), &model.tensors[idx].name);
+            Some((model.uid() as usize, idx))
+        },
+        &bytes[abs..abs + payload_len],
+        &rs,
+        col,
+        &[],
+        b,
+        rows,
+        cols,
+        None,
+        Some(src),
+        Some(src_scale),
+    )
+}
+
+/// A host activation that several int8 projections of one call read:
+/// uploaded once and scanned for its f16 scale once (the scan the
+/// per-projection upload ran on the same values), so each product is the
+/// per-projection one bit for bit. None unless every weight is int8 on the
+/// fused path, and outside Spark-X2.5's prefill (`gpu::prefill_fast_gemm`,
+/// the one architecture this was measured on). `CMF_SHARED_UPLOAD=0` keeps
+/// one upload per projection (A/B).
+fn shared_q8_operand(
+    c: &Ctx,
+    model: &Arc<CmfModel>,
+    idxs: &[usize],
+    xs: &[f32],
+    b: usize,
+    cols: usize,
+) -> Option<(wgpu::Buffer, f32)> {
+    use cortiq_core::TensorDtype as D;
+    if idxs.len() < 2
+        || !crate::gpu::prefill_fast_gemm()
+        || !fused_any()
+        || cols % 4 != 0
+        || xs.len() < b * cols
+        || !idxs
+            .iter()
+            .all(|&i| matches!(model.tensors[i].dtype, D::Q8Row | D::Q8_2f))
+        || std::env::var("CMF_SHARED_UPLOAD").as_deref() == Ok("0")
+    {
+        return None;
+    }
+    let xb = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("shared-xs"),
+        size: (b * cols * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    c.queue
+        .write_buffer(&xb, 0, bytemuck::cast_slice(&xs[..b * cols]));
+    let mx = host_absmax(&xs[..b * cols]);
+    Some((xb, if mx > 1000.0 { 1000.0 / mx } else { 1.0 }))
 }
 
 /// Batched q1 GEMM (prefill): resident 1-bit weight, batch of raw-f32 inputs,
@@ -34126,8 +34231,162 @@ fn dispatch_matmat(
         cols,
         Some(out),
         None,
+        None,
     )
     .is_some()
+}
+
+/// GEMMs `zi_gemm_route` has taken (CMF_PREFILL_PROF prints it).
+pub static ZI_GEMM_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The `zi_mm` route of the int8 matrix-unit GEMM (`dispatch_matmat_keep`):
+/// (the GEMM, the activation cast, the store-scale pass), where the caller
+/// asked for it (`gpu::prefill_fast_gemm`, Spark's prefill) and the shape
+/// fits the 128x128x32 tile without padding N or K. `CMF_PREFILL_ZI_MM=0`
+/// keeps the 64x64 kernel (A/B).
+fn zi_gemm_route(
+    c: &Ctx,
+    b: usize,
+    rows: usize,
+    cols: usize,
+) -> Option<(
+    Arc<wgpu::ComputePipeline>,
+    Arc<wgpu::ComputePipeline>,
+    Arc<wgpu::ComputePipeline>,
+)> {
+    if !crate::gpu::prefill_fast_gemm()
+        || rows % 128 != 0
+        || cols % 32 != 0
+        || b == 0
+        || zimage::pad_rows(b) * cols.max(rows) >= (1usize << 31) / 4
+        || std::env::var("CMF_PREFILL_ZI_MM").as_deref() == Ok("0")
+    {
+        return None;
+    }
+    zimage::zctx()?;
+    let cfg = zimage::MmCfg::new(128, 128, 32, 2, 2, zimage::Epi::F32);
+    if !cfg.valid() || cfg.shared_bytes() > c.device.limits().max_compute_workgroup_storage_size {
+        return None;
+    }
+    let mm = prefill_pipe(c, "zi_mm_128x128x32_2x2_f32", &zimage::mm_src(cfg), "zi_mm")?;
+    let cvt = prefill_pipe(c, "zi_act_f16", ZI_ACT_SRC, "zi_act_f16")?;
+    let post = prefill_pipe(c, "zi_post_scale", ZI_ACT_SRC, "zi_post_scale")?;
+    Some((mm, cvt, post))
+}
+
+/// Build (once per context) a prefill kernel into `Ctx::prefill_pipes`.
+/// Without naga's injected bounds checks, as `zimage::pipeline` builds
+/// `zi_mm`: the kernels index only inside buffers padded for them (rows to
+/// the 128-row tile), and the small ones check their own bounds.
+fn prefill_pipe(c: &Ctx, key: &str, src: &str, entry: &str) -> Option<Arc<wgpu::ComputePipeline>> {
+    if let Some(p) = c.prefill_pipes.lock().ok()?.get(key) {
+        return Some(p.clone());
+    }
+    let sc = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    // SAFETY: see above — every binding these kernels index is sized for
+    // the dispatch, and every loop has a uniform, finite trip count.
+    let m = unsafe {
+        c.device.create_shader_module_trusted(
+            wgpu::ShaderModuleDescriptor {
+                label: Some(key),
+                source: wgpu::ShaderSource::Wgsl(src.into()),
+            },
+            wgpu::ShaderRuntimeChecks::unchecked(),
+        )
+    };
+    if let Some(e) = pollster::block_on(sc.pop()) {
+        tracing::warn!("prefill kernel {key} rejected: {e}");
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        return None;
+    }
+    let sc = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let p = c.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(key),
+        layout: None,
+        module: &m,
+        entry_point: Some(entry),
+        compilation_options: Default::default(),
+        cache: c.pipeline_cache.as_ref(),
+    });
+    if let Some(e) = pollster::block_on(sc.pop()) {
+        tracing::warn!("prefill pipeline {key} rejected: {e}");
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        return None;
+    }
+    let p = Arc::new(p);
+    c.prefill_pipes.lock().ok()?.insert(key.to_string(), p.clone());
+    Some(p)
+}
+
+/// The two ends of the int8 GEMM's `zi_mm` route, written as the 64x64
+/// kernel (`COOP_MM_F16_SRC`) does them: the activation scale is the host
+/// one in the uniform or, under the sentinel, the device max|x| fold;
+/// `f16(x * ainv)` is the same cast of the same product, and the store
+/// multiplies by `aback` computed the same way. Rows past `n` (the tile
+/// padding) are zeros.
+const ZI_ACT_SRC: &str = r#"
+enable f16;
+
+struct CvP { n: u32, total: u32, pad: u32, _p: u32 };
+@group(0) @binding(0) var<storage, read> cvx: array<f32>;
+@group(0) @binding(1) var<storage, read_write> cvy: array<f16>;
+@group(0) @binding(2) var<uniform> cvp: CvP;
+@group(0) @binding(3) var<storage, read> cvs: array<f32>;
+
+@compute @workgroup_size(256)
+fn zi_act_f16(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.y * (65535u * 256u) + gid.x;
+    if (i >= cvp.total) { return; }
+    let asc_in = select(bitcast<f32>(cvp.pad), cvs[0], cvp.pad == 0xFFFFFFFFu);
+    let ainv = select(1.0, asc_in, asc_in > 0.0);
+    var v = 0.0;
+    if (i < cvp.n) { v = cvx[i]; }
+    cvy[i] = f16(v * ainv);
+}
+
+struct PsP { n: u32, pad: u32, _a: u32, _b: u32 };
+@group(0) @binding(0) var<storage, read_write> psy: array<f32>;
+@group(0) @binding(1) var<uniform> psp: PsP;
+@group(0) @binding(2) var<storage, read> pss: array<f32>;
+
+@compute @workgroup_size(256)
+fn zi_post_scale(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.y * (65535u * 256u) + gid.x;
+    if (i >= psp.n) { return; }
+    let asc_in = select(bitcast<f32>(psp.pad), pss[0], psp.pad == 0xFFFFFFFFu);
+    let aback = select(1.0, 1.0 / asc_in, asc_in > 0.0);
+    psy[i] = psy[i] * aback;
+}
+"#;
+
+/// max |x| over the finite entries of a host activation (0 when there are
+/// none) — the f16 GEMM arms' operand scale. Sixteen independent lanes,
+/// then one fold: the same maximum as the one-chain `fold(.., m.max(|v|))`
+/// it replaces (a maximum does not depend on the order it is taken in),
+/// which the compiler cannot vectorize — each step waits on the last.
+/// Measured on the pod's x86 (baseline target, 512 × 2560 floats):
+/// 1.05 -> 0.24 ms, and a Spark-4B q8_2f prefill takes it 7.3M floats a
+/// layer per 512-token chunk (q, k, v, gate, up, o).
+fn host_absmax(xs: &[f32]) -> f32 {
+    let mut acc = [0f32; 16];
+    let mut it = xs.chunks_exact(16);
+    for c in &mut it {
+        for (a, &v) in acc.iter_mut().zip(c) {
+            let v = v.abs();
+            // finite (NaN compares false) and larger
+            if v < f32::INFINITY && v > *a {
+                *a = v;
+            }
+        }
+    }
+    let mut m = it
+        .remainder()
+        .iter()
+        .fold(0f32, |m, v| if v.is_finite() { m.max(v.abs()) } else { m });
+    for a in acc {
+        m = m.max(a);
+    }
+    m
 }
 
 /// The same int8 GEMM, with the result LEFT on the card when `out` is None.
@@ -34154,6 +34413,11 @@ fn dispatch_matmat_keep(
     cols: usize,
     mut out: Option<&mut [f32]>,
     src: Option<&wgpu::Buffer>,
+    // The f16 arm's operand scale for a resident `src` the caller already
+    // scanned on the host (the same values): the scale `pre` would have
+    // produced, so the result is the host operand's bit for bit. None: a
+    // resident operand is scanned on the card.
+    src_scale: Option<f32>,
 ) -> Option<wgpu::Buffer> {
     if full_quant.len() < rows * cols
         || row_scale.len() < rows
@@ -34273,7 +34537,7 @@ fn dispatch_matmat_keep(
     // taken on the card; without that reduction the f16 operands overflow.
     let can_dev_scale =
         (c.act_amax_part.is_some() && c.act_amax_fold.is_some()) || c.act_absmax.is_some();
-    let coop = if src.is_some() && !can_dev_scale {
+    let coop = if src.is_some() && src_scale.is_none() && !can_dev_scale {
         None
     } else {
         coop
@@ -34283,14 +34547,13 @@ fn dispatch_matmat_keep(
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| eprintln!("int8 GEMM: matrix units (plane {rows}x{cols})"));
         }
-        let dev_scale = src.is_some();
+        let dev_scale = src.is_some() && src_scale.is_none();
         let ascale: f32 = if dev_scale {
             0.0
+        } else if let Some(s) = src_scale {
+            s
         } else {
-            let mx =
-                pre[..b * cols]
-                    .iter()
-                    .fold(0f32, |m, v| if v.is_finite() { m.max(v.abs()) } else { m });
+            let mx = host_absmax(&pre[..b * cols]);
             if mx > 1000.0 {
                 1000.0 / mx
             } else {
@@ -34358,7 +34621,105 @@ fn dispatch_matmat_keep(
         if dev_scale {
             encode_act_absmax_with(c, &mut enc, &xs_buf, b * cols, &asc_buf, Some(&amax_parts));
         }
-        {
+        // The same product through `zi_mm` (128x128 tiles, 2x2 subgroups,
+        // register prefetch; 13.5-21 TF against this kernel's 4.8-5.6 on the
+        // RTX 2000 Ada, zimage_gemmbench): the activation goes to f16 first
+        // with the same scale and the same cast, the plane is the same, and
+        // each 16x16 accumulator takes the same MMAs in the same K order —
+        // then the same `* aback` at the store. Bit for bit this kernel's
+        // result (unit-tested).
+        let zi = zi_gemm_route(c, b, rows, cols);
+        let y_buf = match &zi {
+            Some(_) => Scratch::ensure(
+                &c.device,
+                &mut sc.y,
+                (zimage::pad_rows(b) * rows * 4) as u64,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                "mm-y",
+            ),
+            None => y_buf,
+        };
+        if let Some((zpipe, cvt, post)) = &zi {
+            ZI_GEMM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mp = zimage::pad_rows(b);
+            let act16 = Scratch::ensure(
+                &c.device,
+                &mut sc.zact,
+                (mp * cols * 2) as u64,
+                wgpu::BufferUsages::STORAGE,
+                "zi-act",
+            );
+            let sent = cp[3];
+            let cv_u = uniform_u32x4(c, [(b * cols) as u32, (mp * cols) as u32, sent, 0]);
+            let bg_cv = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("zi-act"),
+                layout: &cvt.get_bind_group_layout(0),
+                entries: &[
+                    bind_buf(0, &xs_buf),
+                    bind_buf(1, &act16),
+                    bind_buf(2, &cv_u),
+                    bind_buf(3, &asc_buf),
+                ],
+            });
+            let mm_u = c
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("zi-mm-p"),
+                    contents: bytemuck::cast_slice(&[
+                        b as u32,
+                        rows as u32,
+                        cols as u32,
+                        rows as u32,
+                        0u32,
+                        0u32,
+                        1.0f32.to_bits(),
+                        0u32,
+                        0u32,
+                        0u32,
+                        0u32,
+                        0u32,
+                    ]),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            let bg_mm = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("zi-mm"),
+                layout: &zpipe.get_bind_group_layout(0),
+                entries: &[
+                    bind_buf(0, plane),
+                    bind_buf(1, &act16),
+                    bind_buf(2, &y_buf),
+                    bind_buf(3, &mm_u),
+                ],
+            });
+            {
+                let mut pass = begin_pass_with(&mut enc, Some("zi-act"), None);
+                pass.set_pipeline(cvt);
+                pass.set_bind_group(0, &bg_cv, &[]);
+                let wgs = ((mp * cols) as u32).div_ceil(256);
+                pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
+            }
+            {
+                let mut pass = begin_pass_with(&mut enc, Some("zi-mm"), None);
+                pass.set_pipeline(zpipe);
+                pass.set_bind_group(0, &bg_mm, &[]);
+                pass.dispatch_workgroups((rows / 128) as u32, (b as u32).div_ceil(128), 1);
+            }
+            // The store's `* aback`; a host scale of exactly 1 makes it the
+            // identity, so the pass is skipped.
+            if dev_scale || ascale != 1.0 {
+                let ps_u = uniform_u32x4(c, [(b * rows) as u32, sent, 0, 0]);
+                let bg_ps = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("zi-post"),
+                    layout: &post.get_bind_group_layout(0),
+                    entries: &[bind_buf(0, &y_buf), bind_buf(1, &ps_u), bind_buf(2, &asc_buf)],
+                });
+                let mut pass = begin_pass_with(&mut enc, Some("zi-post"), None);
+                pass.set_pipeline(post);
+                pass.set_bind_group(0, &bg_ps, &[]);
+                let wgs = ((b * rows) as u32).div_ceil(256);
+                pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
+            }
+        } else {
             let mut pass = begin_pass_with(&mut enc, Some("q8coop"), None);
             pass.set_pipeline(mm_pipe);
             pass.set_bind_group(0, &bind_mm, &[]);
@@ -35537,9 +35898,7 @@ fn tp_matmat_impl(
         || !can_reduce_here
         || std::env::var("CMF_PROJ_DEV_SCAN").as_deref() != Ok("1");
     let ascale: f32 = if coop_arm && src.is_none() && host_scan {
-        let mx = xs[..b * cols]
-            .iter()
-            .fold(0f32, |m, v| if v.is_finite() { m.max(v.abs()) } else { m });
+        let mx = host_absmax(&xs[..b * cols]);
         if mx > 1000.0 {
             1000.0 / mx
         } else {
@@ -37151,6 +37510,7 @@ pub fn chunk_attend_win(
     });
     chunk_attend_run(
         c, enc, &qb, (&kb, &offs), (&vb, &offs), b, s0, n, nh, nkv, hd, scale, window, false, out,
+        None,
     )
 }
 
@@ -37176,6 +37536,7 @@ fn chunk_attend_run(
     window: usize,
     coop: bool,
     out: &mut [f32],
+    keep: Option<&mut Option<wgpu::Buffer>>,
 ) -> bool {
     let dev = &c.device;
     let st = wgpu::BufferUsages::STORAGE;
@@ -37418,15 +37779,32 @@ fn chunk_attend_run(
         pass.set_bind_group(0, &bg_un, &[]);
         pass.dispatch_workgroups_flat(((nh * b * hd) as u32).div_ceil(256));
     }
-    readback(
+    if let Some(slot) = keep {
+        // The caller's next kernels read the [b][nh·hd] panel where it is.
+        submit(c, finish_enc(enc));
+        *slot = Some(ab);
+        return true;
+    }
+    let t_rb = std::time::Instant::now();
+    let ok = readback(
         c,
         enc,
         &ab,
         &stage,
         (b * nh * hd * 4) as u64,
         &mut out[..b * nh * hd],
-    )
+    );
+    CHUNK_ATTEND_WAIT_NS.fetch_add(
+        t_rb.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    ok
 }
+
+/// Wall time `chunk_attend_run` spends in its readback — the submit, the
+/// device's kernels and the copy home (CMF_PREFILL_PROF reads it).
+pub static CHUNK_ATTEND_WAIT_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// `chunk_attend_win` against the token graph's device K/V mirror of
 /// `(kv_id, layer)` — the buffers the decode graph reads — instead of
@@ -37443,9 +37821,13 @@ fn chunk_attend_run(
 /// ones the mirror lacks — the chunk's `b`, or a longer catch-up after a
 /// host-only chunk. Same geometry as the token graph's `ensure_x` (V as
 /// wide as K; a ring of `kv_ring_cap(w)` rows on a sliding layer), so the
-/// decode finds `synced == position` and uploads nothing. The kernels,
-/// their inputs and parameters are `chunk_attend_win`'s: the mirror rows
-/// are the host rows bit for bit, so is the result.
+/// decode finds `synced == position` and uploads nothing. With `coop`
+/// off the kernels, their inputs and parameters are `chunk_attend_win`'s:
+/// the mirror rows are the host rows bit for bit, so is the result. With
+/// it on (and the device able), QKᵀ and P·V run on the matrix units
+/// (`PF_ATTN_COOP_SRC`, f16 operands) — unless `operand_max` (max |x|
+/// over `q` and the K/V rows the attend reads, `gpu::abs_max_or_inf`) is
+/// past f16's range, where the cast would overflow: then the f32 kernels.
 ///
 /// `ring` = the layer's window (the mirror geometry), `window` = what the
 /// softmax masks with (0 while the window still masks nothing). False =
@@ -37467,13 +37849,154 @@ pub fn chunk_attend_mirror(
     ring: Option<usize>,
     window: usize,
     coop: bool,
+    operand_max: f32,
     out: &mut [f32],
+) -> bool {
+    chunk_attend_mirror_impl(
+        kv_id, layer, limit, cpu_k, cpu_v, q, b, s0, nh, nkv, hd, scale, ring, window, coop,
+        operand_max, out, None,
+    )
+}
+
+/// `chunk_attend_mirror` followed by the layer's head gate and its O
+/// projection, with the attention output never leaving the card: it used
+/// to come home (8 MB a Spark-4B chunk), take the gate on the host and go
+/// straight back up for the O GEMM. `gains` = the per-(position, head)
+/// gate the host computed exactly as `apply_projected_gate` does (b × nh;
+/// the device multiply is the same single f32 multiply); `wo` = the O
+/// weight, `out` = [b][hidden].
+///
+/// The O GEMM scans its resident operand on the card. That is the host
+/// path's product bit for bit only while max |gated attention output| <=
+/// 1000: both sides then find the same maximum and take the operand scale
+/// 1, and past it the card's `1000 / max` (a WGSL division, not correctly
+/// rounded on every backend) may differ from the host's in the last bit.
+/// The caller vouches for it (`attention::qwen_attention_batch` passes
+/// this path only when max |v| bounds the output below 1000), and only
+/// Spark-X2.5's prefill takes it. False = nothing written to `out`; the
+/// mirror rows the call appended are host-valid either way.
+#[allow(clippy::too_many_arguments)]
+pub fn chunk_attend_mirror_wo(
+    kv_id: u64,
+    layer: usize,
+    limit: usize,
+    cpu_k: &[Vec<f32>],
+    cpu_v: &[Vec<f32>],
+    q: &[f32],
+    b: usize,
+    s0: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    scale: f32,
+    ring: Option<usize>,
+    window: usize,
+    coop: bool,
+    operand_max: f32,
+    gains: Option<&[f32]>,
+    wo: (&Arc<CmfModel>, usize),
+    hidden: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if out.len() < b * hidden || gains.is_some_and(|g| g.len() < b * nh) {
+        return false;
+    }
+    let mut kept = None;
+    if !chunk_attend_mirror_impl(
+        kv_id, layer, limit, cpu_k, cpu_v, q, b, s0, nh, nkv, hd, scale, ring, window, coop,
+        operand_max, &mut [], Some(&mut kept),
+    ) {
+        return false;
+    }
+    let Some(ab) = kept else { return false };
+    if let Some(g) = gains {
+        let Some(pipe) = prefill_pipe(c, "pf_head_gate", PF_HEAD_GATE_SRC, "pf_head_gate") else {
+            return false;
+        };
+        let gb = storage_bytes(c, bytemuck::cast_slice(&g[..b * nh]));
+        let u = uniform_u32x4(c, [(b * nh * hd) as u32, hd as u32, nh as u32, 0]);
+        let bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pf-head-gate"),
+            layout: &pipe.get_bind_group_layout(0),
+            entries: &[bind_buf(0, &ab), bind_buf(1, &gb), bind_buf(2, &u)],
+        });
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("pf-head-gate"),
+            });
+        {
+            let mut pass = begin_pass_with(&mut enc, Some("pf-head-gate"), None);
+            pass.set_pipeline(&pipe);
+            pass.set_bind_group(0, &bg, &[]);
+            let wgs = ((b * nh * hd) as u32).div_ceil(256);
+            pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
+        }
+        submit(c, finish_enc(enc));
+    }
+    fused_gemm_from_device(wo.0, wo.1, &ab, b, hidden, nh * hd, &mut out[..b * hidden])
+}
+
+/// The head-wise output gate on a resident [b][nh·hd] attention panel:
+/// every element times its (position, head) gain, which the host computed.
+const PF_HEAD_GATE_SRC: &str = r#"
+struct GhP { n: u32, hd: u32, nh: u32, _p: u32 };
+@group(0) @binding(0) var<storage, read_write> ghy: array<f32>;
+@group(0) @binding(1) var<storage, read> ghg: array<f32>;
+@group(0) @binding(2) var<uniform> ghp: GhP;
+
+@compute @workgroup_size(256)
+fn pf_head_gate(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.y * (65535u * 256u) + gid.x;
+    if (i >= ghp.n) { return; }
+    let h = i / ghp.hd;
+    ghy[i] = ghy[i] * ghg[h];
+}
+"#;
+
+#[allow(clippy::too_many_arguments)]
+fn chunk_attend_mirror_impl(
+    kv_id: u64,
+    layer: usize,
+    limit: usize,
+    cpu_k: &[Vec<f32>],
+    cpu_v: &[Vec<f32>],
+    q: &[f32],
+    b: usize,
+    s0: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    scale: f32,
+    ring: Option<usize>,
+    window: usize,
+    coop: bool,
+    operand_max: f32,
+    out: &mut [f32],
+    keep: Option<&mut Option<wgpu::Buffer>>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
     if nh == 0 || nkv == 0 || b == 0 || hd == 0 || nh % nkv != 0 || hd % 4 != 0 {
         return false;
     }
-    if q.len() < nh * b * hd || out.len() < b * nh * hd {
+    // The matrix units read Q, K and V as f16 (no operand scale): past
+    // f16's range the cast overflows to inf, so such a chunk takes the
+    // f32 kernels (NaN and inf report +inf here).
+    let coop = coop && {
+        let fits = operand_max <= crate::gpu::F16_MAX;
+        if !fits {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    "prefill attention: an operand of max |x| {operand_max} exceeds f16; \
+                     f32 kernels for such chunks"
+                )
+            });
+        }
+        fits
+    };
+    if q.len() < nh * b * hd || (keep.is_none() && out.len() < b * nh * hd) {
         return false;
     }
     // Only the ring's own window can mask (the rows below it are gone).
@@ -37557,11 +38080,11 @@ pub fn chunk_attend_mirror(
             }
         }
         let offs: Vec<u64> = (0..nkv).map(|g| g as u64 * khead).collect();
-        chunk_attend_run(c, enc, &qb, (&kb, &offs), (&vb, &offs), b, s0 - lo, n, nh, nkv, hd, scale, window, coop, out)
+        chunk_attend_run(c, enc, &qb, (&kb, &offs), (&vb, &offs), b, s0 - lo, n, nh, nkv, hd, scale, window, coop, out, keep)
     } else {
         drop(sc);
         let offs: Vec<u64> = (0..nkv).map(|g| ((g * cap + slot0) * hd * 4) as u64).collect();
-        chunk_attend_run(c, enc, &qb, (&mk, &offs), (&mv, &offs), b, s0 - lo, n, nh, nkv, hd, scale, window, coop, out)
+        chunk_attend_run(c, enc, &qb, (&mk, &offs), (&mv, &offs), b, s0 - lo, n, nh, nkv, hd, scale, window, coop, out, keep)
     }
 }
 
@@ -37827,6 +38350,7 @@ pub fn gemm_many_keep(
 ) -> bool {
     let _precision = MimoF32Gemm::enter(&model.arch().arch_name);
     let Some(c) = ctx() else { return false };
+    let t_enq = std::time::Instant::now();
     let total: usize = idxs.iter().map(|&(_, r)| b * r).sum();
     if b == 0 || idxs.is_empty() || out.len() < total || xs.len() < b * cols {
         return false;
@@ -37840,11 +38364,17 @@ pub fn gemm_many_keep(
             | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
+    let ids: Vec<usize> = idxs.iter().map(|&(i, _)| i).collect();
+    let shared = shared_q8_operand(c, model, &ids, xs, b, cols);
     let mut off = 0u64;
     for &(idx, rows) in idxs {
         // Each panel lands in the shared result scratch, which the next
         // projection reuses: it moves into its slot of `cat` first.
-        let Some(panel) = fused_panel_keep(model, idx, xs, b, rows, cols) else {
+        let panel = match &shared {
+            Some((xb, sc)) => q8_matmat_keep_src(model, idx, xb, *sc, b, rows, cols),
+            None => fused_panel_keep(model, idx, xs, b, rows, cols),
+        };
+        let Some(panel) = panel else {
             return false;
         };
         let len = (b * rows * 4) as u64;
@@ -37868,8 +38398,20 @@ pub fn gemm_many_keep(
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("many-read"),
         });
-    readback(c, enc, &cat, &stage, size, &mut out[..total])
+    let t_rb = std::time::Instant::now();
+    let ok = readback(c, enc, &cat, &stage, size, &mut out[..total]);
+    GEMM_MANY_NS[0].fetch_add(
+        t_rb.duration_since(t_enq).as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    GEMM_MANY_NS[1].fetch_add(t_rb.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    ok
 }
+
+/// `gemm_many_keep`'s wall time: [encode + submit, readback wait + copy]
+/// (CMF_PREFILL_PROF prints it).
+pub static GEMM_MANY_NS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// The LLM prefill's dense FFN with separate gate, up and down weights in
 /// any codec that has a device GEMM (`q8_row`, `q8_2f`, `q4tp`, mixed): the
@@ -37903,7 +38445,12 @@ pub fn ffn_act_keep(
     }
     // `fused_panel_keep` hands back the shared result scratch, which the up
     // projection reuses: the gate panel moves to a buffer of its own first.
-    let Some(g_scratch) = fused_panel_keep(model, w1, xs, b, inter, hidden) else {
+    let shared = shared_q8_operand(c, model, &[w1, w3], xs, b, hidden);
+    let project = |w: usize| match &shared {
+        Some((xb, sc)) => q8_matmat_keep_src(model, w, xb, *sc, b, inter, hidden),
+        None => fused_panel_keep(model, w, xs, b, inter, hidden),
+    };
+    let Some(g_scratch) = project(w1) else {
         return false;
     };
     let g = c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -37919,7 +38466,7 @@ pub fn ffn_act_keep(
         });
     enc.copy_buffer_to_buffer(&g_scratch, 0, &g, 0, panel);
     c.queue.submit(Some(enc.finish()));
-    let Some(u) = fused_panel_keep(model, w3, xs, b, inter, hidden) else {
+    let Some(u) = project(w3) else {
         return false;
     };
     let p = uniform_u32x4(c, [(b * inter) as u32, 0, 0, act]);
@@ -38223,9 +38770,7 @@ pub fn q4tp_ffn_packed(
     let ascale = if dev_scan {
         0.0
     } else {
-        let mx = xs[..b * hidden]
-            .iter()
-            .fold(0f32, |m, v| if v.is_finite() { m.max(v.abs()) } else { m });
+        let mx = host_absmax(&xs[..b * hidden]);
         if mx > 1000.0 {
             1000.0 / mx
         } else {
@@ -43049,6 +43594,76 @@ mod tests {
         let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
     }
 
+    /// The int8 matrix-unit GEMM through `zi_mm` is the 64x64 kernel's
+    /// result bit for bit: a host-scanned operand at scale 1 and at a
+    /// max|x| past 1000 (scale 1000/max), and a resident operand scanned on
+    /// the card, with M not a multiple of the 128-row tile.
+    #[test]
+    fn zi_route_matches_int8_coop_gemm_bit_for_bit() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping zi route test");
+            return;
+        };
+        let _drain = TestGpuDrain::new(c);
+        let (rows, cols) = (256usize, 512usize);
+        let q: Vec<u8> = (0..rows * cols)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        let rs: Vec<f32> = (0..rows).map(|r| 0.01 + (r % 7) as f32 * 1e-3).collect();
+        let cf: Vec<f32> = (0..cols).map(|j| 0.5 + (j % 5) as f32 * 0.25).collect();
+        for (b, amp) in [(300usize, 3.0f32), (128, 2500.0)] {
+            let x: Vec<f32> = (0..b * cols)
+                .map(|i| ((i.wrapping_mul(40503) % 1999) as f32 / 1999.0 - 0.5) * amp)
+                .collect();
+            for dev in [false, true] {
+                let run = |fast: bool| -> Vec<f32> {
+                    let _g = fast.then(crate::gpu::enter_prefill_fast_gemm);
+                    let src = dev.then(|| storage_bytes(c, bytemuck::cast_slice(&x)));
+                    let mut out = vec![0f32; b * rows];
+                    let pre: &[f32] = if dev { &[] } else { &x };
+                    assert!(
+                        dispatch_matmat_keep(
+                            c,
+                            None,
+                            &q,
+                            &rs,
+                            Some(&cf),
+                            pre,
+                            b,
+                            rows,
+                            cols,
+                            Some(&mut out),
+                            src.as_ref(),
+                            None,
+                        )
+                        .is_some()
+                    );
+                    out
+                };
+                let want = run(false);
+                let taken = ZI_GEMM_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+                let got = run(true);
+                if zimage::zctx().is_some() && c.q4tp_mm_coop_f16.is_some() {
+                    assert!(ZI_GEMM_CALLS.load(std::sync::atomic::Ordering::Relaxed) > taken);
+                }
+                assert!(want.iter().any(|v| *v != 0.0));
+                assert!(
+                    want.iter().zip(&got).all(|(a, z)| a.to_bits() == z.to_bits()),
+                    "zi route differs (b {b}, amp {amp}, device operand {dev})"
+                );
+            }
+        }
+    }
+
+    /// One chunk-attend test at a time: the attends share the context's
+    /// scratch (the staging buffer among it), which the prefill only ever
+    /// drives from one thread — two tests at once map it under each other.
+    fn chunk_attend_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ONE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// The prefill's mirror attend is the host upload's attend bit for bit
     /// on the f32 kernels, chunk after chunk, on a full-context mirror and
     /// on a sliding layer's ring (whose window wraps at s0 = 1024 and
@@ -43062,6 +43677,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping mirror attend test");
             return;
         };
+        let _one = chunk_attend_test_lock();
         let _drain = TestGpuDrain::new(c);
         let (nh, nkv, hd, w) = (4usize, 2usize, 256usize, 512usize);
         let scale = 1.0 / (hd as f32).sqrt();
@@ -43089,10 +43705,13 @@ mod tests {
                         &q, &ks, &vs, b, s0 - lo, nh, nkv, hd, scale, wmask, &mut want
                     ));
                     let mut got = vec![0f32; b * nh * hd];
+                    let om = hk.iter().chain(&hv).fold(crate::gpu::abs_max_or_inf(&q), |m, x| {
+                        m.max(crate::gpu::abs_max_or_inf(x))
+                    });
                     assert!(
                         chunk_attend_mirror(
                             kv_id, 0, 65536, &hk, &hv, &q, b, s0, nh, nkv, hd, scale, ring, wmask,
-                            coop, &mut got
+                            coop, om, &mut got
                         ),
                         "mirror attend refused at s0 {s0} (ring {ring:?})"
                     );
@@ -43118,6 +43737,75 @@ mod tests {
                 kv_mirror_reset(kv_id);
             }
         }
+    }
+
+    /// A K entry past f16's range, appended by an earlier chunk, keeps the
+    /// later chunks' matrix-unit attend on the f32 kernels: the host
+    /// cache's running max (`LayerKvCache::kv_abs_max`) still reports it,
+    /// and the result is the host upload's bit for bit where an f16 cast
+    /// of that key would have overflowed to inf.
+    #[test]
+    fn chunk_attend_mirror_f16_guard_takes_f32_kernels() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping f16 guard test");
+            return;
+        };
+        let _one = chunk_attend_test_lock();
+        let _drain = TestGpuDrain::new(c);
+        let (nh, nkv, hd, b) = (4usize, 2usize, 256usize, 64usize);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let val = |salt: usize, i: usize| {
+            ((i.wrapping_mul(2654435761) ^ salt.wrapping_mul(40503)) % 1999) as f32 / 1999.0 - 0.5
+        };
+        let mut cache = crate::kv_cache::LayerKvCache::new(nkv, hd);
+        cache.mode = crate::kv_cache::KvMode::F32;
+        let kv_id = (1u64 << 50) | 0x16;
+        for chunk in 0..3usize {
+            let s0 = chunk * b;
+            for p in s0..s0 + b {
+                let mut k: Vec<f32> = (0..nkv * hd).map(|i| val(1, p * nkv * hd + i)).collect();
+                let v: Vec<f32> = (0..nkv * hd).map(|i| val(2, p * nkv * hd + i)).collect();
+                if p == 5 {
+                    k[hd + 3] = 7.0e4;
+                }
+                cache.append(&k, &v, &[]);
+            }
+            let q: Vec<f32> = (0..nh * b * hd).map(|i| val(97 + s0, i)).collect();
+            let (km, vm) = cache.kv_abs_max();
+            assert_eq!(km, 7.0e4, "the running max lost the key at chunk {chunk}");
+            let om = crate::gpu::abs_max_or_inf(&q).max(km).max(vm);
+            let ks: Vec<&[f32]> = cache.k_heads().iter().map(|k| &k[..]).collect();
+            let vs: Vec<&[f32]> = cache.v_heads().iter().map(|v| &v[..]).collect();
+            let mut want = vec![0f32; b * nh * hd];
+            assert!(chunk_attend_win(&q, &ks, &vs, b, s0, nh, nkv, hd, scale, 0, &mut want));
+            let mut got = vec![0f32; b * nh * hd];
+            assert!(chunk_attend_mirror(
+                kv_id,
+                0,
+                65536,
+                cache.k_heads(),
+                cache.v_heads(),
+                &q,
+                b,
+                s0,
+                nh,
+                nkv,
+                hd,
+                scale,
+                None,
+                0,
+                true,
+                om,
+                &mut got
+            ));
+            assert!(want.iter().all(|x| x.is_finite()));
+            assert!(
+                got.iter().zip(&want).all(|(x, y)| x.to_bits() == y.to_bits()),
+                "chunk {chunk}: the guarded attend is not the f32 kernels' result"
+            );
+        }
+        kv_mirror_reset(kv_id);
     }
 
     #[test]
@@ -57922,10 +58610,7 @@ pub fn q4tp_gelu_ffn(
             let wgs = pairs_u32.div_ceil(256);
             pass.dispatch_workgroups(wgs.min(MAX_WG), wgs.div_ceil(MAX_WG), 1);
         }
-        let mx = xs[..x_len].iter().fold(
-            0.0f32,
-            |m, &v| if v.is_finite() { m.max(v.abs()) } else { m },
-        );
+        let mx = host_absmax(&xs[..x_len]);
         let ascale = if mx > 1000.0 { 1000.0 / mx } else { 1.0 };
         encode_q4_tile_mm_full(
             c,

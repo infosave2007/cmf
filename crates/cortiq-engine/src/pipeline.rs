@@ -9136,6 +9136,13 @@ impl Pipeline {
                 })
                 .map(|_| crate::gpu::enter_cpu_scope());
             crate::gpu::set_layer(li as i64); // layer-split GPU/CPU
+            // Spark-X2.5: the layer's int8 matrix-unit GEMMs take the
+            // `zi_mm` tile, bit-identical to the 64x64 kernel and about
+            // three times its rate (`gpu_wgpu::zi_gemm_route`).
+            #[cfg(feature = "gpu")]
+            let _fast_gemm = self
+                .proj_gate_sigmoid
+                .then(crate::gpu::enter_prefill_fast_gemm);
             // GPU chunk graph (default-on under CMF_GPU=1): a run of
             // consecutive eligible layers for the whole chunk in ONE
             // Metal submission — norm, QKV, RoPE with fused mirror
@@ -9610,15 +9617,24 @@ impl Pipeline {
                 a.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6
             };
             let sp = &attention::ATTN_SPLIT;
+            let (qkv_enq, qkv_wait, ca_wait, zi) = wgpu_prefill_counters();
             eprintln!(
-                "prefill-split: attention {:.1} ms (proj {:.1}, host loop {:.1}, attend {:.1}, \
-                 o-proj {:.1}), ffn {:.1} ms (cumulative)",
+                "prefill-split: attention {:.1} ms (proj {:.1} [qkv enqueue {:.1} wait {:.1}, \
+                 host gate {:.1}], host loop {:.1}, attend {:.1} \
+                 [q pack {:.1}, device {:.1} of which readback {:.1}], o-proj {:.1}), \
+                 ffn {:.1} ms (cumulative; zi_mm GEMMs {zi})",
                 ms(&PREFILL_SPLIT[0]),
                 ms(&sp[0]),
+                qkv_enq,
+                qkv_wait,
+                ms(&sp[6]),
                 ms(&sp[1]),
                 ms(&sp[2]),
+                ms(&sp[4]),
+                ms(&sp[5]),
+                ca_wait,
                 ms(&sp[3]),
-                ms(&PREFILL_SPLIT[1])
+                ms(&PREFILL_SPLIT[1]),
             );
         }
         // A batched span owns a complete set of positions. Publish any
@@ -16134,6 +16150,25 @@ thread_local! {
 /// FFN halves (all layers, all chunks).
 static PREFILL_SPLIT: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+/// The wgpu side of `CMF_PREFILL_PROF`: q|k|v GEMMs' enqueue and readback
+/// wait, the chunk attend's readback wait (ms, cumulative) and the int8
+/// GEMMs the `zi_mm` route took.
+fn wgpu_prefill_counters() -> (f64, f64, f64, u64) {
+    #[cfg(feature = "gpu")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ms = |a: &std::sync::atomic::AtomicU64| a.load(Relaxed) as f64 / 1e6;
+        (
+            ms(&crate::gpu_wgpu::GEMM_MANY_NS[0]),
+            ms(&crate::gpu_wgpu::GEMM_MANY_NS[1]),
+            ms(&crate::gpu_wgpu::CHUNK_ATTEND_WAIT_NS),
+            crate::gpu_wgpu::ZI_GEMM_CALLS.load(Relaxed),
+        )
+    }
+    #[cfg(not(feature = "gpu"))]
+    (0.0, 0.0, 0.0, 0)
+}
 
 fn prefill_prof_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

@@ -1234,6 +1234,15 @@ fn softplus(x: f32) -> f32 {
     x.max(0.0) + (-x.abs()).exp().ln_1p()
 }
 
+/// The gain one projected-gate value gives (sigmoid, or softplus).
+pub(crate) fn projected_gate_gain(g: f32, sigmoid: bool) -> f32 {
+    if sigmoid {
+        1.0 / (1.0 + (-g).exp())
+    } else {
+        softplus(g)
+    }
+}
+
 pub(crate) fn apply_projected_gate(
     ao: &mut [f32],
     raw: &[f32],
@@ -1241,13 +1250,7 @@ pub(crate) fn apply_projected_gate(
     head_dim: usize,
     sigmoid: bool,
 ) {
-    let act = |g: f32| {
-        if sigmoid {
-            1.0 / (1.0 + (-g).exp())
-        } else {
-            softplus(g)
-        }
-    };
+    let act = |g: f32| projected_gate_gain(g, sigmoid);
     if per_head {
         for (h, &g) in raw.iter().enumerate() {
             let gain = act(g);
@@ -1391,9 +1394,12 @@ pub fn qwen_attention(
 /// `CMF_PREFILL_PROF`: cumulative ns of `qwen_attention_batch`'s stages —
 /// projections (q|k|v and a projected gate), the per-position host loop
 /// (bias, norms, RoPE, host append), the attend (with its gate), the O
-/// projection. The pipeline prints them with its attention/FFN split.
-pub(crate) static ATTN_SPLIT: [std::sync::atomic::AtomicU64; 4] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// projection — and inside the attend, the device call's two host parts:
+/// the head-major pack of Q and the call itself (upload, kernels, readback);
+/// last, the share of the projections a host-side projected gate takes.
+/// The pipeline prints them with its attention/FFN split.
+pub(crate) static ATTN_SPLIT: [std::sync::atomic::AtomicU64; 7] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
 pub(crate) fn attn_split_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1539,12 +1545,19 @@ pub fn qwen_attention_batch(
         wk.matmat(normed_all, b, &mut k_all, cfg.pool);
         wv.matmat(normed_all, b, &mut v_all, cfg.pool);
     }
+    let t_gate = std::time::Instant::now();
     if projected_all.is_none() {
         projected_all = cfg.softplus_gate.map(|(proj, _)| {
             let mut values = take_buf(b * proj.rows());
             proj.matmat(normed_all, b, &mut values, cfg.pool);
             values
         });
+    }
+    if attn_split_on() {
+        ATTN_SPLIT[6].fetch_add(
+            t_gate.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     // ── per-position: bias, gate split, qk-norm, partial RoPE, append;
@@ -1639,11 +1652,91 @@ pub fn qwen_attention_batch(
     } else {
         Vec::new()
     };
+    // Bias, V norm, qk-norm and RoPE are per position and touch nothing but
+    // that position's rows: on a pooled host they run across the pool
+    // first (in place in q_all / k_all / v_all), and the loop below keeps
+    // only the ordered part — the o1 trace, the host append, the stash.
+    // Same arithmetic per position, so bit-identical; the serial walk was
+    // ~2.3 s of a Spark-4B 8k prefill (36 layers × 8000 positions).
+    // Spark-X2.5 only (`gate_sigmoid`), the one architecture this was
+    // measured on: every other model keeps the serial walk.
+    // `CMF_PAR_ROPE=0` keeps it serial (A/B).
+    let pre_rotated = stash_q
+        && cfg.gate_sigmoid
+        && !cfg.output_gate
+        && cache.o1.is_none()
+        && b >= 32
+        && cfg.pool.is_some()
+        && std::env::var("CMF_PAR_ROPE").as_deref() != Ok("0");
+    // max |x| over the chunk's rotated queries, keys and values
+    // (`gpu::abs_max_or_inf`), for the device attend's f16 operand guard:
+    // taken in the pool pass below while the rows are hot, else scanned.
+    let qkv_amax = [const { std::sync::atomic::AtomicU32::new(0) }; 3];
+    if pre_rotated {
+        let pool = cfg.pool.expect("pre_rotated requires a pool");
+        let (qp, kp, vp) = (
+            crate::pool::SendMut::new(q_all.as_mut_ptr()),
+            crate::pool::SendMut::new(k_all.as_mut_ptr()),
+            crate::pool::SendMut::new(v_all.as_mut_ptr()),
+        );
+        let run = |b0: usize, b1: usize| {
+            for bi in b0..b1 {
+                // SAFETY: position bi owns row bi of each panel.
+                let (q, k, v) = unsafe {
+                    (
+                        std::slice::from_raw_parts_mut(qp.at(bi * qrows), nh * hd),
+                        std::slice::from_raw_parts_mut(kp.at(bi * nkv * hd), nkv * hd),
+                        std::slice::from_raw_parts_mut(vp.at(bi * vrow), vrow),
+                    )
+                };
+                if let Some((bq, bk, bv)) = cfg.bias {
+                    for (x, bb) in q.iter_mut().zip(bq) {
+                        *x += bb;
+                    }
+                    for (x, bb) in k.iter_mut().zip(bk) {
+                        *x += bb;
+                    }
+                    for (x, bb) in v.iter_mut().zip(bv) {
+                        *x += bb;
+                    }
+                }
+                if cfg.v_norm {
+                    for g in 0..nkv {
+                        vnorm_head(&mut v[g * vd..g * vd + vd], cfg.rms_eps);
+                    }
+                }
+                qk_norm_and_rope(cfg, q, k, nh, nkv, hd, cfg.position + bi);
+                if gpu_attend {
+                    // Non-negative (or +inf): the bit order is the order.
+                    for (a, x) in qkv_amax.iter().zip([&*q, &*k, &*v]) {
+                        a.fetch_max(
+                            crate::gpu::abs_max_or_inf(x).to_bits(),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                }
+            }
+        };
+        pool.run_rows(b, &run);
+    }
     for bi in 0..b {
         let pos = cfg.position + bi;
         let q_raw = &mut q_all[bi * qrows..(bi + 1) * qrows];
         let k = &mut k_all[bi * nkv * hd..(bi + 1) * nkv * hd];
         let v = &mut v_all[bi * vrow..(bi + 1) * vrow];
+        if pre_rotated {
+            // Already biased, normed and rotated above.
+            cache.o1_push_q(&q_raw[..nh * hd]);
+            if vd == hd {
+                cache.append(k, v, &[]);
+            } else {
+                let mut vp = pad_heads(v.to_vec(), nkv, vd, hd);
+                cache.append(k, &vp, &[]);
+                recycle_buf(&mut vp);
+            }
+            q_rope_all[bi * nh * hd..(bi + 1) * nh * hd].copy_from_slice(&q_raw[..nh * hd]);
+            continue;
+        }
         if let Some((bq, bk, bv)) = cfg.bias {
             for (x, bb) in q_raw.iter_mut().zip(bq) {
                 *x += bb;
@@ -1773,10 +1866,13 @@ pub fn qwen_attention_batch(
         }
         recycle_buf(&mut imp_all);
     }
+    // Set when the device ran the head gate and the O projection too.
+    let mut projected_out: Option<Vec<f32>> = None;
     if batched_attend {
         // Head-major pack for the device kernel: [b][nh·hd] -> [nh][b][hd].
         let mut done = false;
         if gpu_attend {
+            let t_pack = std::time::Instant::now();
             let mut qhm = take_buf(nh * b * hd);
             for bi in 0..b {
                 for h in 0..nh {
@@ -1784,15 +1880,91 @@ pub fn qwen_attention_batch(
                     qhm[h * b * hd + bi * hd..h * b * hd + (bi + 1) * hd].copy_from_slice(src);
                 }
             }
+            let t_dev = std::time::Instant::now();
             let w = if device_window { cfg.window.unwrap_or(0) } else { 0 };
             // The pipeline named the decode graph's device mirror of this
             // layer: append the chunk's rows to it and attend in place
             // (`chunk_attend_mirror`; the host rows above are the same
             // bits). Rows are positions there, so the host cache must be
             // unevicted (`position == seq_len`).
-            if let Some(t) = crate::gpu::prefill_mirror()
-                .filter(|_| cfg.gate_sigmoid && vd == hd && cfg.position == s0)
-            {
+            let mirror = crate::gpu::prefill_mirror()
+                .filter(|_| cfg.gate_sigmoid && vd == hd && cfg.position == s0);
+            // The matrix-unit attend casts Q, K and V to f16: its guard
+            // takes max |x| over the chunk's queries and over every K/V row
+            // the cache holds (those the attend reads among them).
+            let pass_max =
+                |i: usize| f32::from_bits(qkv_amax[i].load(std::sync::atomic::Ordering::Relaxed));
+            let (k_max, v_max) = match mirror {
+                // The chunk's rows were measured in the pool pass.
+                Some(_) if pre_rotated => {
+                    cache.kv_abs_max_after((s0, s0 + b, pass_max(1), pass_max(2)))
+                }
+                Some(_) => cache.kv_abs_max(),
+                None => (f32::INFINITY, f32::INFINITY),
+            };
+            let q_max = if pre_rotated {
+                pass_max(0)
+            } else if mirror.is_some() {
+                crate::gpu::abs_max_or_inf(&qhm)
+            } else {
+                f32::INFINITY
+            };
+            let operand_max = q_max.max(k_max).max(v_max);
+            // The whole tail on the card when the O weight has a device GEMM:
+            // the head gate (its gains taken here exactly as
+            // `apply_projected_gate` takes them) and the O projection read
+            // the attention output where it is. `CMF_PREFILL_WO_KEEP=0`
+            // brings it home as before (A/B).
+            // The card's scan of the O operand gives the host's product bit
+            // for bit only while max |gated output| <= 1000
+            // (`gpu_wgpu::chunk_attend_mirror_wo`). A softmax average of V
+            // rows times a sigmoid gain is at most max |v| (times 1 + ~2^-10
+            // for the f16 operands), so max |v| <= 990 vouches for it; past
+            // that the output comes home. Spark-X2.5 only, as the mirror.
+            let gains = match (projected_all.as_deref(), cfg.softplus_gate) {
+                (Some(all), Some((proj, true))) if proj.rows() == nh => Some(Some(
+                    all[..b * nh]
+                        .iter()
+                        .map(|&g| projected_gate_gain(g, cfg.gate_sigmoid))
+                        .collect::<Vec<f32>>(),
+                )),
+                (None, None) => Some(None),
+                _ => None,
+            };
+            if let (Some(t), Some(gains), Some(wo_dev)) = (
+                mirror,
+                gains.filter(|_| {
+                    !cfg.output_gate
+                        && v_max <= 990.0
+                        && std::env::var("CMF_PREFILL_WO_KEEP").as_deref() != Ok("0")
+                }),
+                wo.mapped_device_gemm(),
+            ) {
+                let mut o = vec![0.0f32; b * cfg.hidden_size];
+                if crate::gpu::chunk_attend_mirror_wo(
+                    t,
+                    cache.k_heads(),
+                    cache.v_heads(),
+                    &qhm,
+                    b,
+                    s0,
+                    nh,
+                    nkv,
+                    hd,
+                    cfg.scale,
+                    cfg.window,
+                    w,
+                    operand_max,
+                    gains.as_deref(),
+                    wo_dev,
+                    cfg.hidden_size,
+                    &mut o,
+                ) {
+                    projected_out = Some(o);
+                    done = true;
+                }
+            }
+            if let Some(t) = mirror.filter(|_| !done) {
                 done = crate::gpu::chunk_attend_mirror(
                     t,
                     cache.k_heads(),
@@ -1806,6 +1978,7 @@ pub fn qwen_attention_batch(
                     cfg.scale,
                     cfg.window,
                     w,
+                    operand_max,
                     &mut ao_all,
                 );
             }
@@ -1831,6 +2004,17 @@ pub fn qwen_attention_batch(
                 );
             }
             recycle_buf(&mut qhm);
+            if attn_split_on() {
+                let t_end = std::time::Instant::now();
+                ATTN_SPLIT[4].fetch_add(
+                    t_dev.duration_since(t_pack).as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                ATTN_SPLIT[5].fetch_add(
+                    t_end.duration_since(t_dev).as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
         }
         #[cfg(target_arch = "aarch64")]
         if !done {
@@ -1910,10 +2094,12 @@ pub fn qwen_attention_batch(
                 None => run(0, b),
             }
         }
-        if cfg.output_gate {
+        if cfg.output_gate && projected_out.is_none() {
             apply_gate(&mut ao_all, &gates_all);
         }
-        if let (Some(all), Some((proj, per_head))) = (projected_all.as_deref(), cfg.softplus_gate) {
+        if let (Some(all), Some((proj, per_head)), None) =
+            (projected_all.as_deref(), cfg.softplus_gate, projected_out.as_ref())
+        {
             for bi in 0..b {
                 apply_projected_gate(
                     &mut ao_all[bi * nh * hd..(bi + 1) * nh * hd],
@@ -1934,8 +2120,14 @@ pub fn qwen_attention_batch(
     // V narrower than the head width: drop every head's (zero) pad dims so
     // o_proj reads b × nh·v_head_dim.
     let mut ao_all = compact_heads(ao_all, nh, hd, vd);
-    let mut out = vec![0.0f32; b * cfg.hidden_size];
-    wo.matmat(&ao_all, b, &mut out, cfg.pool);
+    let out = match projected_out {
+        Some(o) => o,
+        None => {
+            let mut out = vec![0.0f32; b * cfg.hidden_size];
+            wo.matmat(&ao_all, b, &mut out, cfg.pool);
+            out
+        }
+    };
     if attn_split_on() {
         let t4 = std::time::Instant::now();
         for (i, (a, z)) in [(split_t0, split_t1), (split_t1, split_t2), (split_t2, split_t3), (split_t3, t4)]
