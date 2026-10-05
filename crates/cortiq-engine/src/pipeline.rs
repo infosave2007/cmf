@@ -349,6 +349,13 @@ pub struct Pipeline {
     /// Sliding-window attention: (window, every-Nth-layer-is-global
     /// pattern) — Gemma-3.
     pub swa: Option<(usize, usize)>,
+    /// Sliding-window tail trimming, `(slack, align)` for
+    /// `LayerKvCache::trim_window`: every layer with a window keeps only
+    /// the rows its window can still read (Spark-X2.5: 576..639 rows per
+    /// 512-window layer instead of the whole context — 27 of the 4B's 36
+    /// layers). Set at load for Spark-X2.5 only (`CMF_SWA_TRIM=0` turns
+    /// it off); None keeps every row, as every other model always has.
+    pub swa_trim: Option<(usize, usize)>,
     /// Explicit local/global schedule for architectures that cannot be
     /// represented by Gemma's every-Nth-global convention.
     pub sliding_layers: Option<Vec<bool>>,
@@ -1475,7 +1482,8 @@ pub(crate) struct ReuseLayer {
     /// Exact-attention layer (rows in `LayerKvCache`); otherwise a
     /// recurrent / latent mixer whose state cannot be rewound.
     pub full: bool,
-    /// Rows the host owner cache holds.
+    /// Positions the host owner cache reaches (`pos_len`: a trimmed
+    /// sliding tail stores only the newest of them).
     pub host_rows: usize,
     /// Rows the wgpu token graph's device mirror holds (None: no mirror).
     pub device_rows: Option<usize>,
@@ -1577,7 +1585,9 @@ impl Pipeline {
                 );
                 ReuseLayer {
                     full,
-                    host_rows: self.kv_cache.layers[li].seq_len,
+                    // Absolute depth: a trimmed sliding tail stores fewer
+                    // rows than the positions it has seen.
+                    host_rows: self.kv_cache.layers[li].pos_len(),
                     device_rows: crate::gpu::graph_kv_stored(kv_id, li),
                     device_state: crate::gpu::graph_state_resident(kv_id, li),
                 }
@@ -1677,7 +1687,7 @@ impl Pipeline {
                     for p in 0..to - from {
                         cache.append(&k[p * row..(p + 1) * row], &v[p * row..(p + 1) * row], &[]);
                     }
-                    if cache.seq_len != to {
+                    if cache.pos_len() != to {
                         return false;
                     }
                 }
@@ -2626,6 +2636,11 @@ impl Pipeline {
                         let cpu_k: Vec<&[f32]> = (0..nkv).map(|g| cache.head_keys(g)).collect();
                         let cpu_v: Vec<&[f32]> = (0..nkv).map(|g| cache.head_values(g)).collect();
                         let cpu_stored = if o1_layer { 0 } else { cpu_k[0].len() / hd };
+                        // A trimmed tail always holds the window the
+                        // device attend reads (`first = rows + 1 − w`).
+                        debug_assert!(
+                            cache.base() == 0 || window_l.is_some_and(|w| cpu_stored + 1 >= w)
+                        );
                         let p = crate::gpu::AttnDeviceParams {
                             kv_id,
                             layer: *li,
@@ -2645,6 +2660,7 @@ impl Pipeline {
                             cpu_k,
                             cpu_v,
                             cpu_stored,
+                            cpu_gen: cache.generation(),
                             o1: o1p,
                             window: window_l,
                             head_gate: head_gate_w,
@@ -2807,6 +2823,7 @@ impl Pipeline {
                             cpu_k,
                             cpu_v,
                             cpu_stored: stored,
+                            cpu_gen: cache.generation(),
                             o1: None,
                             window: window_l,
                             head_gate: None,
@@ -3092,6 +3109,7 @@ impl Pipeline {
             embed_multiplier: 1.0,
             attn_scale: 1.0 / (head_dim as f32).sqrt(),
             swa: None,
+            swa_trim: None,
             sliding_layers: None,
             anchor_core: None,
             bounded_rope: None,
@@ -5134,6 +5152,9 @@ impl Pipeline {
                 break 'decode;
             }
 
+            // Catch-all for decode paths that bypass the walks' own trim
+            // (a graph step, a speculative round).
+            self.swa_trim_tails();
             if self.dsv41.is_none() && self.kv_cache.needs_eviction() {
                 // Say it ONCE, loudly: past this point the model keeps
                 // talking but has lost half its context, and on a GDN
@@ -6244,6 +6265,7 @@ impl Pipeline {
                 output_gate: *output_gate,
                 cpu_k: m.kv.k_heads(),
                 cpu_v: m.kv.v_heads(),
+                cpu_base: m.kv.base(),
                 geom: None,
                 head_gate: None,
             },
@@ -6405,6 +6427,7 @@ impl Pipeline {
                 output_gate: *output_gate,
                 cpu_k: m.kv.k_heads(),
                 cpu_v: m.kv.v_heads(),
+                cpu_base: m.kv.base(),
                 geom: None,
                 head_gate: None,
             },
@@ -7879,6 +7902,7 @@ impl Pipeline {
             self.commit_linear_scratch();
         }
         self.o1_progress();
+        self.swa_trim_tails();
         (h1, h2)
     }
 
@@ -9613,6 +9637,8 @@ impl Pipeline {
         // callers that cross into serial/device work must see the new epoch
         // before this function returns.
         self.o1_progress();
+        // Every layer of the chunk has appended and attended its rows.
+        self.swa_trim_tails();
         h
     }
 
@@ -9765,6 +9791,13 @@ impl Pipeline {
             if layer.mode != crate::kv_cache::KvMode::F32 || layer.o1.is_some() {
                 break;
             }
+            // A trimmed tail holds every row the chunk's first query reads.
+            debug_assert!(
+                layer.base() == 0
+                    || self
+                        .layer_window(li)
+                        .is_some_and(|w| layer.head_len(0) + 1 >= w)
+            );
             stored_at.push(layer.head_len(0));
             layers.push(crate::gpu_metal::ChunkLayer {
                 model: &model,
@@ -9813,6 +9846,7 @@ impl Pipeline {
             let layer = &self.kv_cache.layers[li];
             io.push(crate::gpu_metal::ChunkIo {
                 cpu_stored: stored_at[i],
+                cpu_gen: layer.generation(),
                 cpu_k: (0..nkv).map(|g| layer.head_keys(g)).collect(),
                 cpu_v: (0..nkv).map(|g| layer.head_values(g)).collect(),
                 out_k: ok,
@@ -9890,6 +9924,28 @@ impl Pipeline {
     fn layer_window(&self, li: usize) -> Option<usize> {
         self.swa
             .and_then(|(w, _)| self.layer_is_local(li).then_some(w))
+    }
+
+    /// Drop every sliding layer's rows its window can no longer read
+    /// (`LayerKvCache::trim_window`). Call only at a safe point — after a
+    /// complete position / pair / chunk walk, never between a layer's
+    /// appends and its attend. One comparison per layer below the trigger.
+    ///
+    /// Off with an MTP head: its verify oracles and rollbacks snapshot and
+    /// compare per-layer row counts as positions (`CMF_METAL_VERIFY_CHECK`,
+    /// the MTP caches), which a trimmed tail would break.
+    fn swa_trim_tails(&mut self) {
+        let Some((slack, align)) = self.swa_trim else {
+            return;
+        };
+        if self.mtp.is_some() || self.mimo_mtp.is_some() || !self.dsv4_mtp.is_empty() {
+            return;
+        }
+        for li in 0..self.num_layers.min(self.kv_cache.layers.len()) {
+            if let Some(w) = self.layer_window(li) {
+                self.kv_cache.layers[li].trim_window(w, slack, align);
+            }
+        }
     }
 
     fn layer_num_heads(&self, li: usize) -> usize {
@@ -10215,7 +10271,8 @@ impl Pipeline {
             ) {
                 continue;
             }
-            let host = self.kv_cache.layers[li].seq_len;
+            // Absolute: a trimmed sliding tail holds positions base.. only.
+            let host = self.kv_cache.layers[li].pos_len();
             if host >= position {
                 continue;
             }
@@ -10454,6 +10511,7 @@ impl Pipeline {
                     output_gate: false,
                     cpu_k: self.kv_cache.layers[li].k_heads(),
                     cpu_v: self.kv_cache.layers[li].v_heads(),
+                    cpu_base: self.kv_cache.layers[li].base(),
                     geom: self.graph_attn_geom(li),
                     head_gate: None,
                 },
@@ -10546,6 +10604,7 @@ impl Pipeline {
     ) -> Vec<f32> {
         let out = self.forward_layers_upto(hidden, position, task_mask, None);
         self.o1_progress();
+        self.swa_trim_tails();
         out
     }
 
@@ -10616,6 +10675,7 @@ impl Pipeline {
         }
         let out = self.forward_layers_span(hidden, position, task_mask, from, Some(upto));
         self.o1_progress();
+        self.swa_trim_tails();
         if self
             .graph_failed
             .swap(false, std::sync::atomic::Ordering::Relaxed)
@@ -11218,6 +11278,7 @@ impl Pipeline {
                         output_gate: *output_gate,
                         cpu_k: self.kv_cache.layers[li].k_heads(),
                         cpu_v: self.kv_cache.layers[li].v_heads(),
+                        cpu_base: self.kv_cache.layers[li].base(),
                         geom: self.graph_attn_geom(li),
                         head_gate,
                     }
@@ -11613,6 +11674,7 @@ impl Pipeline {
                 cpu_k,
                 cpu_v,
                 cpu_stored,
+                cpu_gen: cache.generation(),
                 o1: None,
                 window: None,
                 head_gate: None,
@@ -12242,6 +12304,7 @@ impl Pipeline {
                 cpu_k,
                 cpu_v,
                 cpu_stored,
+                cpu_gen: cache.generation(),
                 o1: None,
                 window: None,
                 head_gate: None,
@@ -12494,6 +12557,7 @@ impl Pipeline {
                 cpu_k,
                 cpu_v,
                 cpu_stored,
+                cpu_gen: cache.generation(),
                 o1: None,
                 window: None,
                 head_gate: None,
@@ -12760,6 +12824,7 @@ impl Pipeline {
                     cpu_k: cpu_k.clone(),
                     cpu_v: cpu_v.clone(),
                     cpu_stored: cpu_stored + j,
+                    cpu_gen: cache.generation(),
                     o1: None,
                     window: None,
                     head_gate: None,
@@ -13103,6 +13168,7 @@ impl Pipeline {
                             output_gate: *output_gate,
                             cpu_k: self.kv_cache.layers[li].k_heads(),
                             cpu_v: self.kv_cache.layers[li].v_heads(),
+                            cpu_base: self.kv_cache.layers[li].base(),
                             geom: self.graph_attn_geom(li),
                             // The batched graph has no head-gate arm; a
                             // gated layer is refused above.
@@ -19555,6 +19621,143 @@ mod tests {
         p.ignore_eos = true;
         let r = p.generate_from_ids(&ids, 4, None, None).unwrap();
         assert_eq!(r.token_ids.len(), 4);
+    }
+
+    /// A Spark-X2.5-shaped stack: layers 0..3 slide (window 6), layer 3
+    /// is global, every attention carries the head-wise sigmoid g_proj gate.
+    fn spark_test_pipeline(trim: Option<(usize, usize)>) -> Pipeline {
+        let (hs, nh) = (16usize, 4usize);
+        let mut p = create_test_pipeline(hs, 24, nh, 2, 8, 4, 64);
+        p.layer_dump = None;
+        p.swa = Some((6, 4));
+        p.proj_gate_sigmoid = true;
+        for (li, lw) in p.weights.layers.iter_mut().enumerate() {
+            if let AttnKind::Full { softplus_gate, .. } = &mut lw.attn {
+                let g: Vec<f32> = (0..nh * hs)
+                    .map(|i| (((i * 29 + li * 7) % 83) as f32 / 83.0 - 0.5) * 0.8)
+                    .collect();
+                *softplus_gate = Some((QTensor::from_f32(g, nh, hs), true));
+            }
+        }
+        p.swa_trim = trim;
+        p
+    }
+
+    /// Trimming the sliding tails changes nothing but memory: the same
+    /// prompt in uneven chunks, a decode walk, and fused pairs with a
+    /// 2-row rollback give bit-identical hiddens with and without it,
+    /// while the trimmed sliding layers stay bounded and the global layer
+    /// keeps every row.
+    #[test]
+    fn swa_trim_pipeline_matches_untrimmed_bitwise() {
+        let mut a = spark_test_pipeline(None);
+        let mut b = spark_test_pipeline(Some((2, 4)));
+        assert_eq!(
+            (0..4).map(|li| b.layer_window(li)).collect::<Vec<_>>(),
+            vec![Some(6), Some(6), Some(6), None]
+        );
+        let ids: Vec<u32> = (0..41u32).map(|i| (i * 11 + 5) % 64).collect();
+        let mut pos = 0usize;
+        for &n in [5usize, 13, 7, 16].iter().cycle() {
+            if pos >= ids.len() {
+                break;
+            }
+            let end = (pos + n).min(ids.len());
+            let ha = a.prefill_batch_span(PrefillIn::Ids(&ids[pos..end]), pos, None, 0, 4);
+            let hb = b.prefill_batch_span(PrefillIn::Ids(&ids[pos..end]), pos, None, 0, 4);
+            assert_eq!(f32_bits(&ha), f32_bits(&hb), "prefill chunk at {pos}");
+            pos = end;
+        }
+        for _ in 0..23 {
+            let e = a.embed_single(((pos * 7) % 64) as u32);
+            let ha = a.forward_layers(&e, pos, None);
+            let hb = b.forward_layers(&e, pos, None);
+            assert_eq!(f32_bits(&ha), f32_bits(&hb), "decode at {pos}");
+            for li in 0..3 {
+                assert!(b.kv_cache.layers[li].seq_len <= 12, "layer {li} bounded");
+            }
+            pos += 1;
+        }
+        for round in 0..9 {
+            let (e1, e2) = (a.embed_single(round * 3 + 1), a.embed_single(round * 5 + 2));
+            let (a1, a2) = a.forward_pair(&e1, &e2, pos);
+            let (b1, b2) = b.forward_pair(&e1, &e2, pos);
+            assert_eq!(f32_bits(&a1), f32_bits(&b1), "pair lane 1 round {round}");
+            assert_eq!(f32_bits(&a2), f32_bits(&b2), "pair lane 2 round {round}");
+            if round % 2 == 1 {
+                // A rejected draft: both lanes roll back.
+                for p in [&mut a, &mut b] {
+                    for l in &mut p.kv_cache.layers {
+                        l.truncate_last(2);
+                    }
+                }
+            } else {
+                pos += 2;
+            }
+        }
+        let e = a.embed_single(9);
+        let (ha, hb) = (
+            a.forward_layers(&e, pos, None),
+            b.forward_layers(&e, pos, None),
+        );
+        assert_eq!(f32_bits(&ha), f32_bits(&hb), "after the pairs");
+        for li in 0..3 {
+            let (la, lb) = (&a.kv_cache.layers[li], &b.kv_cache.layers[li]);
+            assert!(lb.base() > 0, "layer {li} trimmed");
+            assert_eq!(la.base(), 0);
+            assert_eq!(lb.pos_len(), la.seq_len);
+            assert_eq!(lb.head_keys(0), &la.head_keys(0)[lb.base() * 8..]);
+        }
+        let (ga, gb) = (&a.kv_cache.layers[3], &b.kv_cache.layers[3]);
+        assert_eq!(
+            (gb.base(), gb.seq_len),
+            (0, ga.seq_len),
+            "the global layer keeps all"
+        );
+        assert_eq!(b.kv_cache.seq_len(), a.kv_cache.seq_len());
+        assert!(b.kv_cache.total_memory_bytes() < a.kv_cache.total_memory_bytes());
+    }
+
+    /// The network split's KvFetch hand-off on a trimmed stack: every
+    /// layer shipped over the wire mid-sequence (the sliding ones as
+    /// `FullTail`) into a fresh pipeline that never ran a position, which
+    /// then decodes on — bit for bit what the untrimmed pipeline decodes.
+    #[test]
+    fn swa_trim_wire_handoff_continues_bitwise() {
+        let mut a = spark_test_pipeline(None);
+        let mut b = spark_test_pipeline(Some((2, 4)));
+        let ids: Vec<u32> = (0..29u32).map(|i| (i * 13 + 7) % 64).collect();
+        let ha = a.prefill_batch_span(PrefillIn::Ids(&ids), 0, None, 0, 4);
+        let hb = b.prefill_batch_span(PrefillIn::Ids(&ids), 0, None, 0, 4);
+        assert_eq!(f32_bits(&ha), f32_bits(&hb));
+        let mut pos = ids.len();
+        for _ in 0..5 {
+            let e = a.embed_single(((pos * 5) % 64) as u32);
+            assert_eq!(
+                f32_bits(&a.forward_layers(&e, pos, None)),
+                f32_bits(&b.forward_layers(&e, pos, None))
+            );
+            pos += 1;
+        }
+        let mut c = spark_test_pipeline(Some((2, 4)));
+        for li in 0..4 {
+            let bytes = b.kv_cache.layers[li].export_wire(false).unwrap();
+            c.kv_cache.layers[li].import_wire(&bytes).unwrap();
+        }
+        assert!(c.kv_cache.layers[0].base() > 0, "a tail travelled");
+        assert_eq!(c.kv_cache.seq_len(), pos);
+        for step in 0..17 {
+            let e = a.embed_single(((pos * 3 + 1) % 64) as u32);
+            let ha = a.forward_layers(&e, pos, None);
+            let hc = c.forward_layers(&e, pos, None);
+            assert_eq!(
+                f32_bits(&ha),
+                f32_bits(&hc),
+                "after the hand-off, step {step}"
+            );
+            pos += 1;
+        }
+        assert!(c.kv_cache.layers[0].seq_len <= 12, "the receiver trims on");
     }
 
     /// A synthetic MiMo draft stack of `n` layers for `mimo_test_pipeline`

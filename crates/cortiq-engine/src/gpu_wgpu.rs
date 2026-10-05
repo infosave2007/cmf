@@ -18718,48 +18718,69 @@ fn kv_mirror_ensure_x<'a>(
 /// `[synced, to)` (a ring takes only the newest `cap` of them — anything
 /// older is a row its window can no longer see). Host K rows are `hd`
 /// wide; host V rows are `hd` wide too, zero-padded past `dv`, and are
-/// compacted to the mirror's `dv`. False (nothing written) when the host
-/// holds fewer than `to` rows for some head.
+/// compacted to the mirror's `dv`. Host row 0 is position `base` (a
+/// sliding layer that keeps only its tail, `LayerKvCache::base`; 0
+/// otherwise). False (nothing written) when the host does not reach `to`
+/// for some head, or no longer holds a row the mirror lacks and still
+/// needs: for a ring, one inside the window of the query at `to`; for a
+/// full-context mirror, any.
 fn kv_mirror_seed_x(
     c: &Ctx,
     m: &mut KvMirror,
     cpu_k: &[Vec<f32>],
     cpu_v: &[Vec<f32>],
+    base: usize,
     to: usize,
 ) -> bool {
     let (nkv, hd, dv, cap) = (m.nkv, m.hd, m.dv, m.cap);
     if m.synced >= to {
         return true;
     }
-    if cpu_k.len() < nkv
+    if base > to
+        || cpu_k.len() < nkv
         || cpu_v.len() < nkv
-        || (0..nkv).any(|h| cpu_k[h].len() < to * hd || cpu_v[h].len() < to * hd)
+        || (0..nkv)
+            .any(|h| cpu_k[h].len() < (to - base) * hd || cpu_v[h].len() < (to - base) * hd)
     {
         return false;
     }
     let from = match m.ring {
-        Some(_) => m.synced.max(to.saturating_sub(cap)),
-        None => m.synced,
+        Some(w) => {
+            // Rows before `base` are gone from the host; the ring may skip
+            // them only when the window of the query at `to` starts later.
+            if base > m.synced.max((to + 1).saturating_sub(w)) {
+                return false;
+            }
+            m.synced.max(to.saturating_sub(cap)).max(base)
+        }
+        None => {
+            if base > m.synced {
+                return false;
+            }
+            m.synced
+        }
     };
     for h in 0..nkv {
         let mut p = from;
         while p < to {
             let slot = p % cap;
             let run = (cap - slot).min(to - p);
+            // Host row of position p.
+            let hp = p - base;
             c.queue.write_buffer(
                 &m.k,
                 ((h * cap + slot) * hd * 4) as u64,
-                bytemuck::cast_slice(&cpu_k[h][p * hd..(p + run) * hd]),
+                bytemuck::cast_slice(&cpu_k[h][hp * hd..(hp + run) * hd]),
             );
             if dv == hd {
                 c.queue.write_buffer(
                     &m.v,
                     ((h * cap + slot) * dv * 4) as u64,
-                    bytemuck::cast_slice(&cpu_v[h][p * hd..(p + run) * hd]),
+                    bytemuck::cast_slice(&cpu_v[h][hp * hd..(hp + run) * hd]),
                 );
             } else {
                 let mut rows = Vec::with_capacity(run * dv);
-                for r in p..p + run {
+                for r in hp..hp + run {
                     rows.extend_from_slice(&cpu_v[h][r * hd..r * hd + dv]);
                 }
                 c.queue.write_buffer(
@@ -25156,6 +25177,7 @@ pub fn forward_token_graph(
                 crate::gpu::GraphAttn::Full {
                     cpu_k,
                     cpu_v,
+                    cpu_base,
                     geom: Some(g),
                     ..
                 } if o1.get(li).is_none_or(|v| v.is_none()) => {
@@ -25175,7 +25197,9 @@ pub fn forward_token_graph(
                         graph_refused("KV mirror is ahead of token-graph position");
                         return token_graph_outcome(true, false);
                     }
-                    if e.synced < position && !kv_mirror_seed_x(c, e, cpu_k, cpu_v, position) {
+                    if e.synced < position
+                        && !kv_mirror_seed_x(c, e, cpu_k, cpu_v, *cpu_base, position)
+                    {
                         graph_refused("host KV rows missing for the device mirror seed");
                         return token_graph_outcome(o1_started || state_started, false);
                     }
@@ -25183,7 +25207,12 @@ pub fn forward_token_graph(
                     kvbufs.push(Some((e.k.clone(), e.v.clone())));
                     gdnbufs.push(None);
                 }
-                crate::gpu::GraphAttn::Full { cpu_k, cpu_v, .. } => {
+                crate::gpu::GraphAttn::Full {
+                    cpu_k,
+                    cpu_v,
+                    cpu_base,
+                    ..
+                } => {
                     if o1.get(li).is_some_and(|v| v.is_some()) {
                         // o1 replaces this layer's KV attention outright —
                         // no mirror, and no prefill K/V upload (16K of it
@@ -25191,6 +25220,14 @@ pub fn forward_token_graph(
                         kvbufs.push(None);
                         gdnbufs.push(None);
                         continue;
+                    }
+                    // This arm indexes host rows by position and marks the
+                    // mirror synced whatever it copied: a trimmed tail
+                    // (only per-layer-geometry layers are trimmed) is not
+                    // its input.
+                    if *cpu_base > 0 {
+                        graph_refused("host KV tail starts past position 0");
+                        return token_graph_outcome(o1_started || state_started, false);
                     }
                     let e = kv_mirror_ensure(c, &mut kvm, (kv_id, layer_base + li), nkv, hd, cap);
                     if e.synced > position {
@@ -29441,6 +29478,7 @@ pub fn forward_batch_graph_at(
                 crate::gpu::GraphAttn::Full {
                     cpu_k,
                     cpu_v,
+                    cpu_base,
                     geom: Some(g),
                     ..
                 } if o1.get(li).is_none_or(|v| v.is_none()) => {
@@ -29458,7 +29496,7 @@ pub fn forward_batch_graph_at(
                         bgraph_refused("KV mirror is ahead of batch position");
                         return batch_outcome(true, false);
                     }
-                    if e.synced < pos0 && !kv_mirror_seed_x(c, e, cpu_k, cpu_v, pos0) {
+                    if e.synced < pos0 && !kv_mirror_seed_x(c, e, cpu_k, cpu_v, *cpu_base, pos0) {
                         bgraph_refused("CPU KV seed missing for nonzero batch position");
                         return batch_outcome(o1_started || state_started, false);
                     }
@@ -29466,7 +29504,12 @@ pub fn forward_batch_graph_at(
                     kvbufs.push(Some((e.k.clone(), e.v.clone())));
                     gdnbufs.push(None);
                 }
-                crate::gpu::GraphAttn::Full { cpu_k, cpu_v, .. } => {
+                crate::gpu::GraphAttn::Full {
+                    cpu_k,
+                    cpu_v,
+                    cpu_base,
+                    ..
+                } => {
                     if o1.get(li).is_some_and(|v| v.is_some()) {
                         // Sealed O(1) owns this layer's attention state. Do
                         // not allocate or advance an exact-KV mirror that a
@@ -29474,6 +29517,11 @@ pub fn forward_batch_graph_at(
                         kvbufs.push(None);
                         gdnbufs.push(None);
                         continue;
+                    }
+                    // Position-indexed seed below: never a trimmed tail.
+                    if *cpu_base > 0 {
+                        bgraph_refused("host KV tail starts past position 0");
+                        return batch_outcome(o1_started || state_started, false);
                     }
                     let e = kv_mirror_ensure(c, &mut kvm, (kv_id, layer_base + li), nkv, hd, cap);
                     if e.synced > pos0 {

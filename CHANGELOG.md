@@ -5,6 +5,60 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- Spark-X2.5's sliding layers keep only the tail their 512-token window can
+  still read. The host cache stored every position on every layer; a
+  sliding layer now drops its front once it holds more than 1024 rows and
+  keeps 576..639 (the window, 64 rows of rollback slack, the cut on a 64-row
+  grid). 27 of the 4B's 36 layers and 21 of the 1.7B's 28 are sliding, and
+  the Metal KV mirrors follow the host rows, so they shrink too. Attends
+  index rows relative to the newest one, so the output is unchanged:
+  perplexity, greedy text (prompts up to 3k tokens, up to 1500 generated)
+  and two-turn chats with KV reuse are identical with and without it on
+  the CPU (strict), Metal (block and chunk graphs, the sandwich) and wgpu.
+  `CMF_SWA_TRIM=0` keeps every row. Other windowed models (Gemma-3/4,
+  Phi-3, Laguna, MiMo) and models with a speculation head are unchanged.
+  M4, `bench --core --ignore-eos`, 64 tokens after the prompt, off → on:
+
+  | model, path, prompt | KV+state | peak footprint | decode tok/s |
+  |---|---|---|---|
+  | 4B q8_2f, Metal, 6000 | 1788 → 670 MB | 5.3-5.9 → 2.7-2.9 GB | 15.3-15.5 → 17.2 |
+  | 4B q4tp, Metal, 6000 | 1788 → 670 MB | 5.6-5.7 → 2.9 GB | 26.5-27.3 → 27.3-27.4 |
+  | 1.7B q8_2f, Metal, 6000 | 695 → 261 MB | 3.0 → 1.9 GB | 34.9-37.3 → 38.1-38.6 |
+  | 4B q8_2f, CPU, 6000 | 1788 → 670 MB | 2.2-2.3 → 1.5 GB | 9.4-12.0 → 8.6-11.7 |
+  | 1.7B q8_2f, CPU, 6000 | 695 → 261 MB | 1.07 → 0.71 GB | 23.9 → 23.8 |
+  | 4B q8_2f, Metal, 16384 | 4850 → 1354 MB | 15.7 → 5.4 GB | 0.6 → 13.7 |
+
+  At 16k the untrimmed 4B reaches a 15.7 GB footprint (every layer's Metal
+  mirror rounds up to 32768 rows) and decoded at 0.6 tok/s beside a desktop
+  session on this 24 GB Mac; with the trim, 32k runs at 10.2 tok/s in a
+  9.2 GB footprint (KV+state 2562 MB). Over 1500 generated tokens after 6000 (three trims,
+  each followed by one mirror re-upload) decode is 16.7 → 16.8 tok/s.
+  The CPU decode range is this shared machine's spread over three
+  alternating pairs, not the trim's. Past `CMF_MAX_SEQ` the cache-wide
+  eviction leaves the sliding tails alone (they bound themselves), so the
+  output there is not the untrimmed one: 1.7B q8_2f, a 1088-token prompt
+  under `CMF_MAX_SEQ=1088`, keeps continuing the text where the untrimmed
+  run falls into one repeated line (Metal) or blank lines (wgpu).
+- The KV wire carries a trimmed layer as a new record kind (`FullTail`:
+  the absolute position of its first row, then the usual body). An
+  untrimmed layer still travels as before; a peer without the kind refuses
+  it as unknown.
+- Metal KV mirrors are re-uploaded when the host cache's storage changed,
+  not only its row count (`LayerKvCache::generation`): a trimmed tail
+  returns to the same row counts. This also retires a mirror left over from
+  a cleared sequence.
+
+### Fixed
+- Metal chunk prefill (q8_row, q4t and q4tp weights; q8_2f prefills per
+  op and never reaches it): its scores scratch was cached once
+  per context length and never freed, so a long prompt kept one buffer per
+  chunk. It is now one grow-only buffer per shape. Spark-X2.5 4B q4tp,
+  6000-token prompt: 12 buffers / 1249 MB → 2 / 326 MB; Metal allocation
+  6010 → 5087 MB.
+
 ## [0.8.11] - 2026-10-04
 
 ### Changed

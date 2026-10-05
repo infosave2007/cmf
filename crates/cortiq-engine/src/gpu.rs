@@ -1567,6 +1567,10 @@ pub enum GraphAttn<'a> {
         output_gate: bool,
         cpu_k: &'a [Vec<f32>],
         cpu_v: &'a [Vec<f32>],
+        /// Absolute position of `cpu_k`/`cpu_v` row 0
+        /// (`LayerKvCache::base`): a sliding layer that keeps only its
+        /// tail stores rows from there on. 0 for every untrimmed layer.
+        cpu_base: usize,
         /// This layer's own attention geometry, when the model's layers do
         /// not share one (MiMo-V2: 4/8 KV heads, 128-wide V under 192-wide
         /// heads, sliding windows with learned sinks, two RoPE tables).
