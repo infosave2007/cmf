@@ -4448,7 +4448,11 @@ fn decide_oracle_batch_respects_its_budget_cap_per_run() {
     let refused = sum["oracle"]["refused_cost_usd"].as_f64().unwrap();
     assert!(refused > 0.0, "{sum}");
     assert_eq!(sum["oracle"]["spent_usd"].as_f64(), Some(0.0), "{sum}");
-    assert_eq!(sum["oracle"]["unknown_cost_usd"].as_f64(), Some(0.0), "{sum}");
+    assert_eq!(
+        sum["oracle"]["unknown_cost_usd"].as_f64(),
+        Some(0.0),
+        "{sum}"
+    );
     assert!(
         stderr_of(&o).contains(
             "of reservations released, not charged, for calls OpenRouter refused before any model ran (HTTP 400, 401, 402, 403, 404, 413, 422 or 429, or a prompt over the model's context)"
