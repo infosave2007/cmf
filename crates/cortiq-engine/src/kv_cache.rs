@@ -170,6 +170,11 @@ pub struct LayerKvCache {
     /// hash64 of the model's operator identity
     /// (`ModelArch::linear_core_identity` JSON); 0 = no operator record.
     pub wire_identity: u64,
+    /// `kv_abs_max`'s running answer: max |x| over the f32 K rows and over
+    /// the V rows `[0, kv_amax_rows)` of every head (+inf once one was inf
+    /// or NaN).
+    kv_amax: [f32; 2],
+    kv_amax_rows: usize,
 }
 
 /// State-record kind of the versioned cache wire (`export_wire` v2).
@@ -237,7 +242,69 @@ impl LayerKvCache {
             wire_kind: WireKind::Full,
             wire_layer: 0,
             wire_identity: 0,
+            kv_amax: [0.0; 2],
+            kv_amax_rows: 0,
         }
+    }
+
+    /// (max |k|, max |v|) over every K and over every V entry the cache
+    /// stores in f32, +inf when one is inf or NaN: what the wgpu prefill
+    /// compares with f16's range before its matrix-unit attention casts
+    /// these rows to f16. Lazy — it scans only the rows appended since the
+    /// last call; every other change to the rows (truncate, evict, clear,
+    /// import, an o1 seal) moves the scanned mark back
+    /// (`kv_rows_changed`), and a scan from the first row starts afresh.
+    pub(crate) fn kv_abs_max(&mut self) -> (f32, f32) {
+        let hd = self.head_dim.max(1);
+        let rows = self.kv_rows();
+        if rows < self.kv_amax_rows {
+            self.kv_amax_rows = 0;
+        }
+        if self.kv_amax_rows == 0 {
+            self.kv_amax = [0.0; 2];
+        }
+        let from = self.kv_amax_rows * hd;
+        for (m, heads) in self.kv_amax.iter_mut().zip([&self.k, &self.v]) {
+            for x in heads.iter().filter(|x| x.len() > from) {
+                *m = m.max(crate::gpu::abs_max_or_inf(&x[from..]));
+            }
+        }
+        self.kv_amax_rows = rows;
+        (self.kv_amax[0], self.kv_amax[1])
+    }
+
+    /// `kv_abs_max` for a caller that took the maxima of the rows it just
+    /// appended itself: `chunk` = (from, upto, max |k|, max |v|) over the
+    /// rows `[from, upto)`. Folded in without a scan when the cache holds
+    /// exactly `upto` rows and every row before `from` was scanned; else
+    /// the plain scan.
+    pub(crate) fn kv_abs_max_after(&mut self, chunk: (usize, usize, f32, f32)) -> (f32, f32) {
+        let (from, upto, km, vm) = chunk;
+        if self.kv_amax_rows != from || self.kv_rows() != upto || from > upto {
+            return self.kv_abs_max();
+        }
+        if from == 0 {
+            self.kv_amax = [0.0; 2];
+        }
+        self.kv_amax = [self.kv_amax[0].max(km), self.kv_amax[1].max(vm)];
+        self.kv_amax_rows = upto;
+        (self.kv_amax[0], self.kv_amax[1])
+    }
+
+    /// Rows any head stores.
+    fn kv_rows(&self) -> usize {
+        let hd = self.head_dim.max(1);
+        self.k
+            .iter()
+            .chain(&self.v)
+            .map(|x| x.len() / hd)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Rows from `first` on may no longer be the ones `kv_abs_max` scanned.
+    fn kv_rows_changed(&mut self, first: usize) {
+        self.kv_amax_rows = self.kv_amax_rows.min(first);
     }
 
     // ── Natively bounded anchor (swa_sink_v1) ──
@@ -409,6 +476,12 @@ impl LayerKvCache {
         self.base = new_base;
         self.seq_len -= d;
         self.generation = next_gen();
+        // `kv_abs_max` counts its scanned mark from the old row 0. Moved
+        // with the rows, the next scan still starts at the first row it has
+        // not seen; left in place, rows appended after the trim up to the
+        // old mark would never be scanned. The maxima may keep a dropped
+        // row's value, which only over-states.
+        self.kv_amax_rows = self.kv_amax_rows.saturating_sub(d);
         d
     }
 
@@ -499,6 +572,7 @@ impl LayerKvCache {
     pub(crate) fn o1_abort(&mut self, err: String) {
         self.k.iter_mut().for_each(Vec::clear);
         self.v.iter_mut().for_each(Vec::clear);
+        self.kv_rows_changed(0);
         self.kq.iter_mut().for_each(Vec::clear);
         self.ks.iter_mut().for_each(Vec::clear);
         self.vq.iter_mut().for_each(Vec::clear);
@@ -641,6 +715,7 @@ impl LayerKvCache {
             self.k[h] = Vec::new();
             self.v[h] = Vec::new();
         }
+        self.kv_rows_changed(0);
         self.imp = Vec::new();
         self.o1 = Some(O1State::Sealed { groups });
         self.o1_transitioned = true;
@@ -1384,8 +1459,12 @@ impl LayerKvCache {
                 self.seq_len - d
             );
         }
+        let mut first_changed = usize::MAX;
         for h in 0..self.num_kv_heads {
             let keep = self.k[h].len().saturating_sub(d * self.head_dim);
+            if !self.k[h].is_empty() || !self.v[h].is_empty() {
+                first_changed = first_changed.min(keep / self.head_dim.max(1));
+            }
             self.k[h].truncate(keep);
             self.v[h].truncate(keep);
             let ngk = self.head_dim.div_ceil(KV_K_GROUP);
@@ -1400,6 +1479,7 @@ impl LayerKvCache {
         }
         self.imp.truncate(self.imp.len().saturating_sub(d));
         self.seq_len -= d;
+        self.kv_rows_changed(first_changed);
     }
 
     /// Accumulate attention mass per stored position (summed over heads).
@@ -1428,6 +1508,7 @@ impl LayerKvCache {
 
     /// Clear cache (e.g. on new conversation or task switch).
     pub fn clear(&mut self) {
+        self.kv_rows_changed(0);
         for h in 0..self.num_kv_heads {
             self.k[h].clear();
             self.v[h].clear();
@@ -1791,6 +1872,7 @@ impl LayerKvCache {
         self.mode = KvMode::F32;
         self.k = vec![Vec::new(); heads];
         self.v = vec![Vec::new(); heads];
+        self.kv_rows_changed(0);
         self.kq = vec![Vec::new(); heads];
         self.ks = vec![Vec::new(); heads];
         self.vq = vec![Vec::new(); heads];
@@ -1933,6 +2015,7 @@ impl LayerKvCache {
             }
             drop_front(&mut self.k[h], d * hd);
             drop_front(&mut self.v[h], d * hd);
+            self.kv_rows_changed(0);
             drop_front(&mut self.kq[h], d * hd);
             drop_front(&mut self.vq[h], d * hd);
             drop_front(&mut self.ks[h], d * hd.div_ceil(KV_K_GROUP));
@@ -2003,9 +2086,11 @@ impl LayerKvCache {
         for h in 0..self.num_kv_heads {
             if !self.k[h].is_empty() {
                 self.k[h] = gather(&self.k[h], &kept, hd);
+                self.kv_rows_changed(0);
             }
             if !self.v[h].is_empty() {
                 self.v[h] = gather(&self.v[h], &kept, hd);
+                self.kv_rows_changed(0);
             }
             if !self.kq[h].is_empty() {
                 self.kq[h] = gather(&self.kq[h], &kept, hd);
@@ -2136,6 +2221,65 @@ impl KvCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lazy K/V maximum the wgpu prefill's f16 guard reads: rows a
+    /// truncation drops and later appends rewrite are scanned again, an
+    /// inf or NaN reports +inf, `clear` starts afresh, and a caller's own
+    /// maxima of the rows it just appended fold in only when they continue
+    /// the scanned prefix.
+    #[test]
+    fn kv_abs_max_follows_appends_truncation_and_clear() {
+        let (heads, hd) = (2usize, 4usize);
+        let mut c = LayerKvCache::new(heads, hd);
+        c.mode = KvMode::F32;
+        let row = |x: f32| vec![x; heads * hd];
+        for _ in 0..4 {
+            c.append(&row(0.5), &row(-0.25), &[]);
+        }
+        assert_eq!(c.kv_abs_max(), (0.5, 0.25));
+        c.truncate_last(2);
+        c.append(&row(-9.0), &row(3.0), &[]);
+        c.append(&row(0.5), &row(0.25), &[]);
+        assert_eq!(c.kv_abs_max(), (9.0, 3.0), "rewritten rows were not rescanned");
+        c.append(&row(f32::NAN), &row(0.0), &[]);
+        assert_eq!(c.kv_abs_max().0, f32::INFINITY);
+        c.clear();
+        c.append(&row(1.0), &row(2.0), &[]);
+        assert_eq!(c.kv_abs_max(), (1.0, 2.0));
+        c.append(&row(4.0), &row(1.0), &[]);
+        // Rows [1, 2) continue the scanned prefix: the caller's maxima.
+        assert_eq!(c.kv_abs_max_after((1, 2, 4.0, 1.0)), (4.0, 2.0));
+        c.append(&row(8.0), &row(1.0), &[]);
+        // A stale `from` falls back to the scan.
+        assert_eq!(c.kv_abs_max_after((0, 3, 0.0, 0.0)), (8.0, 2.0));
+    }
+
+    /// A trim drops rows from the front: `kv_abs_max` must still scan every
+    /// row appended after it, also when more are appended than were dropped
+    /// before the next call.
+    #[test]
+    fn kv_abs_max_scans_rows_appended_after_a_trim() {
+        let (heads, hd, w) = (1usize, 4usize, 8usize);
+        let mut c = LayerKvCache::new(heads, hd);
+        c.mode = KvMode::F32;
+        let row = |x: f32| vec![x; heads * hd];
+        for _ in 0..(2 * w + 4) {
+            c.append(&row(0.5), &row(0.5), &[]);
+        }
+        assert_eq!(c.kv_abs_max(), (0.5, 0.5));
+        let d = c.trim_window(w, 2, 2);
+        assert!(d > 0, "the trim must drop rows for this test");
+        // The first row after the trim is large, then more rows than were
+        // dropped: without moving the mark, rows [stored - d, old mark) —
+        // the large one among them — would go unscanned.
+        let first_new = c.kv_rows();
+        c.append(&row(-7.0), &row(6.0), &[]);
+        for _ in 0..(d + 3) {
+            c.append(&row(0.5), &row(0.5), &[]);
+        }
+        assert!(c.kv_rows() > 2 * w + 4 && first_new < 2 * w + 4);
+        assert_eq!(c.kv_abs_max(), (7.0, 6.0));
+    }
 
     #[test]
     fn memory_breakdown_separates_recurrent_and_attention_state() {

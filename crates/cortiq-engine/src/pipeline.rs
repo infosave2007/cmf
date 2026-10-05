@@ -9160,6 +9160,13 @@ impl Pipeline {
                 })
                 .map(|_| crate::gpu::enter_cpu_scope());
             crate::gpu::set_layer(li as i64); // layer-split GPU/CPU
+            // Spark-X2.5: the layer's int8 matrix-unit GEMMs take the
+            // `zi_mm` tile, bit-identical to the 64x64 kernel and about
+            // three times its rate (`gpu_wgpu::zi_gemm_route`).
+            #[cfg(feature = "gpu")]
+            let _fast_gemm = self
+                .proj_gate_sigmoid
+                .then(crate::gpu::enter_prefill_fast_gemm);
             // GPU chunk graph (default-on under CMF_GPU=1): a run of
             // consecutive eligible layers for the whole chunk in ONE
             // Metal submission — norm, QKV, RoPE with fused mirror
@@ -9383,6 +9390,10 @@ impl Pipeline {
                         pool: pool.as_deref(),
                         v_head_dim: self.layer_v_dim(li),
                     };
+                    #[cfg(feature = "gpu")]
+                    let _mirror = self
+                        .prefill_mirror_target(li)
+                        .map(crate::gpu::enter_prefill_mirror);
                     let mut attn = attention::qwen_attention_batch(
                         &normed,
                         b,
@@ -9626,10 +9637,35 @@ impl Pipeline {
         }
         crate::gpu::set_layer(-1); // lm_head/final ops outside layer-split
         if prefill_prof_on() {
+            let ms = |a: &std::sync::atomic::AtomicU64| {
+                a.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6
+            };
+            let sp = &attention::ATTN_SPLIT;
+            let (qkv_enq, qkv_wait, ca_wait, zi) = wgpu_prefill_counters();
             eprintln!(
-                "prefill-split: attention {:.1} ms, ffn {:.1} ms (cumulative)",
-                PREFILL_SPLIT[0].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6,
-                PREFILL_SPLIT[1].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6
+                "prefill-split: attention {:.1} ms (proj {:.1} [qkv enqueue {:.1} wait {:.1}, \
+                 host gate {:.1}], host loop {:.1}, attend {:.1} \
+                 [q pack {:.1}, device {:.1} of which readback {:.1}], o-proj {:.1}), \
+                 ffn {:.1} ms (cumulative; zi_mm GEMMs {zi})",
+                ms(&PREFILL_SPLIT[0]),
+                ms(&sp[0]),
+                qkv_enq,
+                qkv_wait,
+                ms(&sp[6]),
+                ms(&sp[1]),
+                ms(&sp[2]),
+                ms(&sp[4]),
+                ms(&sp[5]),
+                ca_wait,
+                ms(&sp[3]),
+                ms(&PREFILL_SPLIT[1]),
+            );
+            let [calls, attended, wo, ring, reseed, f16] = wgpu_mirror_counters();
+            eprintln!(
+                "prefill-mirror: {calls} calls, {attended} attended ({wo} with O on the card), \
+                 {ring} ring refusals, {reseed} reseeds, {f16} f16 fallbacks, {} upload \
+                 fallbacks (cumulative)",
+                attention::MIRROR_UPLOADS.load(std::sync::atomic::Ordering::Relaxed),
             );
         }
         // A batched span owns a complete set of positions. Publish any
@@ -10250,6 +10286,42 @@ impl Pipeline {
             invf,
             window: self.layer_window(li),
             sink: self.kv_cache.layers[li].sinks.as_deref(),
+        })
+    }
+
+    /// The decode graph's device K/V mirror that layer `li`'s batched
+    /// prefill appends its chunk to and attends against (wgpu), instead
+    /// of uploading the layer's whole K/V prefix every chunk and the whole
+    /// cache again at the first decode token. Only where the token graph
+    /// will read that very mirror: the decode graph on, not refused, and
+    /// this layer's geometry what it requests (`graph_attn_geom`: KV heads,
+    /// V as wide as K, the window as a ring, no sink).
+    ///
+    /// Spark-X2.5 only (`proj_gate_sigmoid`), the one architecture whose
+    /// output was measured identical on it. `CMF_PREFILL_MIRROR=0` keeps
+    /// the host upload (A/B).
+    #[cfg(feature = "gpu")]
+    fn prefill_mirror_target(&self, li: usize) -> Option<crate::gpu::PrefillMirror> {
+        if !self.proj_gate_sigmoid
+            || std::env::var("CMF_PREFILL_MIRROR").as_deref() == Ok("0")
+            || !crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Decode)
+            || self.graph_refused()
+            || self.o1_active()
+            || self.attn_softcap > 0.0
+            || self.wgpu_graph_attn_decline().is_some()
+        {
+            return None;
+        }
+        let g = self.graph_attn_geom(li)?;
+        let (nkv, hd, _) = self.layer_geom(li);
+        // The token graph passes the call-wide head width (layer 0's).
+        if g.nkv != nkv || g.dv != hd || g.sink.is_some() || hd != self.layer_geom(0).1 {
+            return None;
+        }
+        Some(crate::gpu::PrefillMirror {
+            kv_id: self.graph_kv_id,
+            layer: li,
+            limit: self.kv_cache.max_seq_len,
         })
     }
 
@@ -16151,6 +16223,38 @@ thread_local! {
 /// FFN halves (all layers, all chunks).
 static PREFILL_SPLIT: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+/// The wgpu side of `CMF_PREFILL_PROF`: q|k|v GEMMs' enqueue and readback
+/// wait, the chunk attend's readback wait (ms, cumulative) and the int8
+/// GEMMs the `zi_mm` route took.
+fn wgpu_prefill_counters() -> (f64, f64, f64, u64) {
+    #[cfg(feature = "gpu")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ms = |a: &std::sync::atomic::AtomicU64| a.load(Relaxed) as f64 / 1e6;
+        (
+            ms(&crate::gpu_wgpu::GEMM_MANY_NS[0]),
+            ms(&crate::gpu_wgpu::GEMM_MANY_NS[1]),
+            ms(&crate::gpu_wgpu::CHUNK_ATTEND_WAIT_NS),
+            crate::gpu_wgpu::ZI_GEMM_CALLS.load(Relaxed),
+        )
+    }
+    #[cfg(not(feature = "gpu"))]
+    (0.0, 0.0, 0.0, 0)
+}
+
+/// The wgpu prefill mirror attend's outcome counters
+/// (`gpu_wgpu::MIRROR_EVENTS`).
+fn wgpu_mirror_counters() -> [u64; 6] {
+    #[cfg(feature = "gpu")]
+    {
+        crate::gpu_wgpu::MIRROR_EVENTS
+            .each_ref()
+            .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+    }
+    #[cfg(not(feature = "gpu"))]
+    [0; 6]
+}
 
 fn prefill_prof_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

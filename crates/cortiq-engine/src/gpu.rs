@@ -2357,6 +2357,219 @@ pub fn gemm_many_keep(
     }
 }
 
+thread_local! {
+    /// Set by the pipeline around a layer of Spark-X2.5's batched prefill:
+    /// its int8 matrix-unit GEMMs may take the `zi_mm` tile, and the
+    /// projections that read one activation share its upload (wgpu).
+    static PREFILL_FAST_GEMM: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Restores the previous flag on drop.
+pub struct PrefillFastGemmGuard(bool);
+
+impl Drop for PrefillFastGemmGuard {
+    fn drop(&mut self) {
+        PREFILL_FAST_GEMM.with(|c| c.set(self.0));
+    }
+}
+
+/// Let this thread's int8 matrix-unit GEMMs take the `zi_mm` tile for the
+/// guard's lifetime (bit-identical to the 64x64 kernel; see
+/// `gpu_wgpu::zi_gemm_route`).
+pub fn enter_prefill_fast_gemm() -> PrefillFastGemmGuard {
+    PrefillFastGemmGuard(PREFILL_FAST_GEMM.with(|c| c.replace(true)))
+}
+
+/// Whether `enter_prefill_fast_gemm` is in force on this thread.
+pub fn prefill_fast_gemm() -> bool {
+    PREFILL_FAST_GEMM.with(|c| c.get())
+}
+
+/// The largest finite f16. An operand the matrix-unit attention casts to
+/// f16 must stay within it, or the cast overflows to inf.
+pub const F16_MAX: f32 = 65504.0;
+
+/// max |x| over `xs`, or +inf when an entry is inf or NaN: the value the
+/// f16 operand guards compare with `F16_MAX`. Sixteen independent lanes
+/// and a flag, so it vectorizes (a single `fold` chain does not).
+pub fn abs_max_or_inf(xs: &[f32]) -> f32 {
+    let mut acc = [0f32; 16];
+    let mut bad = [false; 16];
+    let mut it = xs.chunks_exact(16);
+    for c in &mut it {
+        for ((a, f), &v) in acc.iter_mut().zip(bad.iter_mut()).zip(c) {
+            let v = v.abs();
+            // NaN compares false both ways: flagged, never taken.
+            *f |= !(v < f32::INFINITY);
+            *a = if v > *a { v } else { *a };
+        }
+    }
+    let mut m = 0f32;
+    for &v in it.remainder() {
+        let v = v.abs();
+        if !(v < f32::INFINITY) {
+            return f32::INFINITY;
+        }
+        m = m.max(v);
+    }
+    if bad.iter().any(|&f| f) {
+        return f32::INFINITY;
+    }
+    acc.iter().fold(m, |m, &a| m.max(a))
+}
+
+/// The decode graph's device K/V mirror a prefill chunk of one layer also
+/// writes to (wgpu): `kv_id` is the pipeline's graph id, `layer` the
+/// virtual layer index, `limit` the cache's `max_seq_len` — the same key
+/// and capacity ceiling the token graph uses, so the mirror the prefill
+/// fills is the one the first decode token reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrefillMirror {
+    pub kv_id: u64,
+    pub layer: usize,
+    pub limit: usize,
+}
+
+thread_local! {
+    /// Set by the pipeline around one layer's batched attention (see
+    /// `enter_prefill_mirror`); every other caller of the batched
+    /// attention (MTP heads, tests) sees None and keeps the host upload.
+    static PREFILL_MIRROR: Cell<Option<PrefillMirror>> = const { Cell::new(None) };
+}
+
+/// Restores the previous target on drop.
+pub struct PrefillMirrorGuard(Option<PrefillMirror>);
+
+impl Drop for PrefillMirrorGuard {
+    fn drop(&mut self) {
+        PREFILL_MIRROR.with(|c| c.set(self.0));
+    }
+}
+
+/// Name the device mirror the current layer's prefill chunk appends to
+/// and attends against, for the guard's lifetime.
+pub fn enter_prefill_mirror(t: PrefillMirror) -> PrefillMirrorGuard {
+    PrefillMirrorGuard(PREFILL_MIRROR.with(|c| c.replace(Some(t))))
+}
+
+/// The mirror `enter_prefill_mirror` named on this thread, if any.
+pub fn prefill_mirror() -> Option<PrefillMirror> {
+    PREFILL_MIRROR.with(|c| c.get())
+}
+
+/// `chunk_attend_win` against the decode graph's device mirror instead of
+/// an upload of the whole prefix: the host rows the mirror lacks (the
+/// chunk's own `b`, or more after a host-only chunk) are appended first,
+/// then the attention binds the mirror rows in place. `ring` is the
+/// layer's window as the mirror geometry (Some on every sliding layer),
+/// `window` the window the softmax masks with (0 while it masks nothing).
+/// `operand_max` = max |x| over `q` and every K/V row the attend reads
+/// (`abs_max_or_inf`; +inf when unknown): past `F16_MAX` the f32 kernels
+/// run instead of the matrix units. wgpu only; false = nothing attended
+/// (the caller uploads as before).
+#[allow(unused_variables, clippy::too_many_arguments)]
+pub fn chunk_attend_mirror(
+    t: PrefillMirror,
+    cpu_k: &[Vec<f32>],
+    cpu_v: &[Vec<f32>],
+    q: &[f32],
+    b: usize,
+    s0: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    scale: f32,
+    ring: Option<usize>,
+    window: usize,
+    operand_max: f32,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        // QKᵀ and P·V on the matrix units where the device has them (f16
+        // operands, f32 accumulators — not bit-identical to the f32
+        // kernels: Spark-X2.5 4B q8_2f wiki ppl 10.677 -> 10.672);
+        // `CMF_PREFILL_ATTN_COOP=0` keeps the f32 ones (A/B).
+        Backend::Wgpu => crate::gpu_wgpu::chunk_attend_mirror(
+            t.kv_id,
+            t.layer,
+            t.limit,
+            cpu_k,
+            cpu_v,
+            q,
+            b,
+            s0,
+            nh,
+            nkv,
+            hd,
+            scale,
+            ring,
+            window,
+            std::env::var("CMF_PREFILL_ATTN_COOP").as_deref() != Ok("0"),
+            operand_max,
+            out,
+        ),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// `chunk_attend_mirror`, then the head gate (`gains`, b × nh, computed on
+/// the host) and the O projection `wo` on the card: the attention output
+/// never comes home. `out` = [b][hidden]. The card scans the O operand
+/// itself, which is the host path's product bit for bit only while max
+/// |gated output| <= 1000: the caller vouches for that (Spark-X2.5's
+/// prefill, max |v| <= 990). wgpu only; false = nothing written to `out`
+/// (the caller attends and projects as before).
+#[allow(unused_variables, clippy::too_many_arguments)]
+pub fn chunk_attend_mirror_wo(
+    t: PrefillMirror,
+    cpu_k: &[Vec<f32>],
+    cpu_v: &[Vec<f32>],
+    q: &[f32],
+    b: usize,
+    s0: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    scale: f32,
+    ring: Option<usize>,
+    window: usize,
+    operand_max: f32,
+    gains: Option<&[f32]>,
+    wo: (&Arc<CmfModel>, usize),
+    hidden: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::chunk_attend_mirror_wo(
+            t.kv_id,
+            t.layer,
+            t.limit,
+            cpu_k,
+            cpu_v,
+            q,
+            b,
+            s0,
+            nh,
+            nkv,
+            hd,
+            scale,
+            ring,
+            window,
+            std::env::var("CMF_PREFILL_ATTN_COOP").as_deref() != Ok("0"),
+            operand_max,
+            gains,
+            wo,
+            hidden,
+            out,
+        ),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
 /// Whether the active backend's chunk attend can apply a sliding window.
 pub fn chunk_attend_windowed() -> bool {
     match backend() {
@@ -3897,6 +4110,28 @@ pub fn weight_bytes_by() -> [u64; 6] {
     }
     #[allow(unreachable_code)]
     [0; 6]
+}
+
+#[cfg(test)]
+mod f16_guard_tests {
+    use super::*;
+
+    /// The f16 guard's maximum: the largest magnitude through the lanes and
+    /// the remainder, +inf for an inf or a NaN anywhere.
+    #[test]
+    fn abs_max_or_inf_is_the_magnitude_maximum() {
+        let mut xs: Vec<f32> = (0..37).map(|i| (i as f32 - 18.0) * 0.5).collect();
+        assert_eq!(abs_max_or_inf(&xs), 9.0);
+        xs[36] = -70000.0; // the remainder
+        assert_eq!(abs_max_or_inf(&xs), 70000.0);
+        xs[3] = f32::NAN; // a lane
+        assert_eq!(abs_max_or_inf(&xs), f32::INFINITY);
+        xs[3] = 0.0;
+        xs[35] = f32::NEG_INFINITY;
+        assert_eq!(abs_max_or_inf(&xs), f32::INFINITY);
+        assert_eq!(abs_max_or_inf(&[]), 0.0);
+        assert_eq!(abs_max_or_inf(&[-0.0, -1e-30]), 1e-30);
+    }
 }
 
 #[cfg(test)]
