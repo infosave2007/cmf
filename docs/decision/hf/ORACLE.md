@@ -409,8 +409,10 @@ check that the ledger shows reasoning tokens, and list such a provider in
 A reasoning call that outgrows its token allowance (`finish_length`) or its
 deadline (`read_timeout`, `transport_timeout`) is asked once more without
 reasoning, so the question still gets the oracle's direct answer. Both calls
-are in the ledger (the first one is billed when the provider bills it), the
-stop rules count the second one's outcome, and a follower waiting for the
+are in the ledger (the first one is billed when the provider bills it) and
+each counts toward the stop rules: a failed first call adds one to the
+failures in a row (and can reach `max_errors` before the second call is
+made), an answered second call clears the count. A follower waiting for the
 same question waits for both.
 
 ## Budget and stop rules
