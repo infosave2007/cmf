@@ -25,7 +25,7 @@
 //!
 //! [`redact_value`] applies [`redact`] to every string leaf of a JSON state
 //! (object keys are kept). Redaction is an opt-in, off by default: it was on
-//! through 0.8.11, and the secret pattern also matched tool names, slugs and
+//! through 0.8.12, and the secret pattern also matched tool names, slugs and
 //! chemical names. The cascade redacts only when `oracle.redact_pii` is on and
 //! the request did not set `cmf.allow_pii_egress` — the state and, since 0.8.8
 //! (DESIGN B4), each question's instructions and criteria (the option ids are
