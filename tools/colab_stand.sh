@@ -23,7 +23,7 @@ printf '{"file_format_version":"1.0.0","ICD":{"library_path":"libEGL_nvidia.so.0
 cat > /root/setup_build.sh <<'SB'
 #!/bin/bash
 set -e
-curl --proto '=https' -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.85.0 --profile minimal
+curl --proto '=https' -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.88.0 --profile minimal
 source $HOME/.cargo/env
 mkdir -p /root/cmf
 if [ -f /root/cmf-src.tgz ]; then
