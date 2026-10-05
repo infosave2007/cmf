@@ -39,7 +39,7 @@ hf download infosave/Spark-X2.5-cmf Spark-X2.5-4B-q8_2f.cmf --local-dir .
 cortiq run Spark-X2.5-4B-q8_2f.cmf --prompt "Explain quicksort in three sentences." --no-think
 ```
 
-Use cortiq 0.8.10 or later; prebuilt binaries for Linux, macOS and Windows are
+Use cortiq 0.8.12 or later; prebuilt binaries for Linux, macOS and Windows are
 on the [releases page](https://github.com/infosave2007/cmf/releases). The
 engine picks the GPU and its settings itself. `--no-think` asks for a direct
 answer; without it the model reasons in a `<think>` block first, so raise
@@ -66,18 +66,22 @@ are 4-bit in the compact files.
 
 | hardware | backend | 4B q8_2f | 4B q4mix | 1.7B q8_2f | 1.7B q4mix |
 |---|---|---:|---:|---:|---:|
-| RTX 2000 Ada (16 GB) | Vulkan | 39.9 | 47.8 | 85.0 | 98.8 |
+| RTX 2000 Ada (16 GB) | Vulkan | 40.3 | 48.2 | 85.6 | 101.1 |
 | Mac mini M4 (24 GB) | Metal | 20.5 | 25.3 | 41.0 | 52.7 |
 | Mac mini M4 (24 GB) | CPU, 10 cores | 21.2 | 23.2 | 47.8 | 51.7 |
 | EPYC 9354, 7 cores | CPU | 14.0 | 13.7 | 30.8 | 30.0 |
 
-Prompt processing, 1000-token prompt, tok/s:
+Prompt processing, tok/s:
 
-| hardware | backend | 4B q8_2f | 4B q4mix | 1.7B q8_2f | 1.7B q4mix |
-|---|---|---:|---:|---:|---:|
-| RTX 2000 Ada (16 GB) | Vulkan | 228 | 224 | 553 | 523 |
-| Mac mini M4 (24 GB) | Metal | 155 | 157 | 350 | 353 |
-| EPYC 9354, 7 cores | CPU | 39 | 40 | 90 | 84 |
+| hardware | backend | prompt | 4B q8_2f | 4B q4mix | 1.7B q8_2f | 1.7B q4mix |
+|---|---|---:|---:|---:|---:|---:|
+| RTX 2000 Ada (16 GB) | Vulkan | 1000 | 377 | 282 | 906 | 772 |
+| RTX 2000 Ada (16 GB) | Vulkan | 16000 | 361 | 254 | 833 | 718 |
+| Mac mini M4 (24 GB) | Metal | 1000 | 155 | 157 | 350 | 353 |
+| EPYC 9354, 7 cores | CPU | 1000 | 39 | 40 | 90 | 84 |
+
+A 16000-token prompt takes 41 s on the 4B q8_2f and 18.5 s on the 1.7B q8_2f
+(RTX 2000 Ada).
 
 On the RTX 2000 Ada the 4B q8_2f file takes 4.5 GB of VRAM at a 3k-token
 context.
@@ -159,8 +163,11 @@ Raise it with `CMF_MAX_SEQ`:
 CMF_MAX_SEQ=131072 cortiq run Spark-X2.5-4B-q8_2f.cmf --prompt "..." --max-tokens 4096
 ```
 
-The cache grows with the conversation and takes 288 KB of RAM per token for
-the 4B (9 GB at 32k tokens) and 112 KB for the 1.7B (3.5 GB at 32k).
+Only the full-attention layers keep every token (74 KB per token for the 4B,
+29 KB for the 1.7B); the sliding layers keep only the rows their
+512-token window reads (at most 1024). The
+4B's cache takes 1.3 GB at 16k tokens and 2.6 GB at 32k, the 1.7B's 0.5 GB at
+16k.
 
 ## Verify the download
 
@@ -192,7 +199,7 @@ hf download infosave/Spark-X2.5-cmf Spark-X2.5-4B-q8_2f.cmf --local-dir .
 cortiq run Spark-X2.5-4B-q8_2f.cmf --prompt "Объясни квиксорт в трёх предложениях." --no-think
 ```
 
-Используйте cortiq 0.8.10 или новее; готовые сборки для Linux, macOS и Windows —
+Используйте cortiq 0.8.12 или новее; готовые сборки для Linux, macOS и Windows —
 на [странице релизов](https://github.com/infosave2007/cmf/releases). Движок сам
 выбирает GPU и настройки. `--no-think` даёт прямой ответ; без него модель
 сначала рассуждает в блоке `<think>`, поэтому увеличьте `--max-tokens` (по
@@ -219,18 +226,22 @@ wikitext-2 test с BOS-токеном в начале; неквантованн�
 
 | железо | бэкенд | 4B q8_2f | 4B q4mix | 1.7B q8_2f | 1.7B q4mix |
 |---|---|---:|---:|---:|---:|
-| RTX 2000 Ada (16 ГБ) | Vulkan | 39.9 | 47.8 | 85.0 | 98.8 |
+| RTX 2000 Ada (16 ГБ) | Vulkan | 40.3 | 48.2 | 85.6 | 101.1 |
 | Mac mini M4 (24 ГБ) | Metal | 20.5 | 25.3 | 41.0 | 52.7 |
 | Mac mini M4 (24 ГБ) | CPU, 10 ядер | 21.2 | 23.2 | 47.8 | 51.7 |
 | EPYC 9354, 7 ядер | CPU | 14.0 | 13.7 | 30.8 | 30.0 |
 
-Обработка промпта из 1000 токенов, ток/с:
+Обработка промпта, ток/с:
 
-| железо | бэкенд | 4B q8_2f | 4B q4mix | 1.7B q8_2f | 1.7B q4mix |
-|---|---|---:|---:|---:|---:|
-| RTX 2000 Ada (16 ГБ) | Vulkan | 228 | 224 | 553 | 523 |
-| Mac mini M4 (24 ГБ) | Metal | 155 | 157 | 350 | 353 |
-| EPYC 9354, 7 ядер | CPU | 39 | 40 | 90 | 84 |
+| железо | бэкенд | промпт | 4B q8_2f | 4B q4mix | 1.7B q8_2f | 1.7B q4mix |
+|---|---|---:|---:|---:|---:|---:|
+| RTX 2000 Ada (16 ГБ) | Vulkan | 1000 | 377 | 282 | 906 | 772 |
+| RTX 2000 Ada (16 ГБ) | Vulkan | 16000 | 361 | 254 | 833 | 718 |
+| Mac mini M4 (24 ГБ) | Metal | 1000 | 155 | 157 | 350 | 353 |
+| EPYC 9354, 7 ядер | CPU | 1000 | 39 | 40 | 90 | 84 |
+
+Промпт из 16000 токенов обрабатывается за 41 с на 4B q8_2f и за 18.5 с на
+1.7B q8_2f (RTX 2000 Ada).
 
 На RTX 2000 Ada файл 4B q8_2f занимает 4.5 ГБ видеопамяти при контексте 3k токенов.
 
@@ -304,8 +315,10 @@ curl http://localhost:8080/v1/chat/completions \
 Увеличьте его через `CMF_MAX_SEQ`:
 `CMF_MAX_SEQ=131072 cortiq run Spark-X2.5-4B-q8_2f.cmf --prompt "..." --max-tokens 4096`.
 
-Кэш растёт вместе с диалогом и занимает 288 КБ RAM на токен у 4B (9 ГБ на 32k
-токенов) и 112 КБ у 1.7B (3.5 ГБ на 32k).
+Каждый токен хранят только слои с полным вниманием (74 КБ на токен у 4B,
+29 КБ у 1.7B); скользящие слои держат только строки,
+которые читает их окно в 512 токенов (не больше 1024). Кэш 4B
+занимает 1.3 ГБ на 16k токенов и 2.6 ГБ на 32k, кэш 1.7B — 0.5 ГБ на 16k.
 
 ### Проверка загрузки
 
@@ -336,7 +349,7 @@ hf download infosave/Spark-X2.5-cmf Spark-X2.5-4B-q8_2f.cmf --local-dir .
 cortiq run Spark-X2.5-4B-q8_2f.cmf --prompt "用三句话解释快速排序。" --no-think
 ```
 
-建议使用 cortiq 0.8.10 或更新版本；Linux、macOS、Windows 预编译二进制见
+建议使用 cortiq 0.8.12 或更新版本；Linux、macOS、Windows 预编译二进制见
 [发布页面](https://github.com/infosave2007/cmf/releases)。引擎会自动选择 GPU 和设置。
 `--no-think` 直接给出回答；不加该参数时模型会先在 `<think>` 块中思考，请调高
 `--max-tokens`（默认 256）。
@@ -360,18 +373,21 @@ BOS token；未量化模型分别为 10.61（4B）和 14.49（1.7B；transformer
 
 | 硬件 | 后端 | 4B q8_2f | 4B q4mix | 1.7B q8_2f | 1.7B q4mix |
 |---|---|---:|---:|---:|---:|
-| RTX 2000 Ada（16 GB） | Vulkan | 39.9 | 47.8 | 85.0 | 98.8 |
+| RTX 2000 Ada（16 GB） | Vulkan | 40.3 | 48.2 | 85.6 | 101.1 |
 | Mac mini M4（24 GB） | Metal | 20.5 | 25.3 | 41.0 | 52.7 |
 | Mac mini M4（24 GB） | CPU，10 核 | 21.2 | 23.2 | 47.8 | 51.7 |
 | EPYC 9354，7 核 | CPU | 14.0 | 13.7 | 30.8 | 30.0 |
 
-1000 token 提示词的处理速度，tok/s：
+提示词处理速度，tok/s：
 
-| 硬件 | 后端 | 4B q8_2f | 4B q4mix | 1.7B q8_2f | 1.7B q4mix |
-|---|---|---:|---:|---:|---:|
-| RTX 2000 Ada（16 GB） | Vulkan | 228 | 224 | 553 | 523 |
-| Mac mini M4（24 GB） | Metal | 155 | 157 | 350 | 353 |
-| EPYC 9354，7 核 | CPU | 39 | 40 | 90 | 84 |
+| 硬件 | 后端 | 提示词 | 4B q8_2f | 4B q4mix | 1.7B q8_2f | 1.7B q4mix |
+|---|---|---:|---:|---:|---:|---:|
+| RTX 2000 Ada（16 GB） | Vulkan | 1000 | 377 | 282 | 906 | 772 |
+| RTX 2000 Ada（16 GB） | Vulkan | 16000 | 361 | 254 | 833 | 718 |
+| Mac mini M4（24 GB） | Metal | 1000 | 155 | 157 | 350 | 353 |
+| EPYC 9354，7 核 | CPU | 1000 | 39 | 40 | 90 | 84 |
+
+在 RTX 2000 Ada 上，16000 token 的提示词在 4B q8_2f 上需要 41 秒，在 1.7B q8_2f 上需要 18.5 秒。
 
 在 RTX 2000 Ada 上，4B q8_2f 文件在 3k token 上下文时占用 4.5 GB 显存。
 
@@ -438,8 +454,9 @@ libglx0`；无显示器的机器需设置 `XDG_RUNTIME_DIR=/tmp`。
 模型支持 1 048 576 个 token；KV 缓存默认容纳 32 768 个，可用 `CMF_MAX_SEQ` 调高：
 `CMF_MAX_SEQ=131072 cortiq run Spark-X2.5-4B-q8_2f.cmf --prompt "..." --max-tokens 4096`。
 
-缓存随对话增长，4B 每个 token 占 288 KB 内存（32k token 为 9 GB），1.7B 为 112 KB
-（32k 为 3.5 GB）。
+只有全注意力层保存每个 token（4B 每个 token 74 KB，1.7B 为 29 KB），滑动窗口层只保留
+其 512 token 窗口读取的行（最多 1024 行）。4B 的缓存在 16k token 时占 1.3 GB，32k 时占 2.6 GB；1.7B 在 16k
+时占 0.5 GB。
 
 ### 校验下载
 
