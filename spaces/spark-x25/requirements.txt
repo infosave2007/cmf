@@ -1,0 +1,7 @@
+# Pin the UI stack: Gradio 4.44 needs these compatible schema versions.
+gradio==4.44.1
+fastapi==0.115.6
+pydantic==2.9.2
+starlette==0.41.3
+huggingface_hub>=0.26,<1
+requests>=2.31,<3
