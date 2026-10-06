@@ -72,8 +72,11 @@
 //! line of `oracle.jsonl` is written and fsynced before the network is
 //! touched; after the answer one line `settled`
 //! (the cost), `failed_billed` (a failure with a cost) or `failed_unknown_cost`
-//! (charged at the reservation). A reservation found open at start is charged in
-//! full and closed with `failed_unknown_cost` (`unsettled_at_start`).
+//! (charged at the reservation, unless OpenRouter refused the request before
+//! any model ran — HTTP 400, 401, 402, 403, 404, 413, 422 or 429, or a prompt
+//! over the model's context — which releases it). A reservation found open at
+//! start is charged in full and closed with `failed_unknown_cost`
+//! (`unsettled_at_start`).
 //!
 //! **Stop rules** (the oracle stays off until `POST /v1/admin/oracle
 //! {"enabled":true}`, or `cortiq decide --oracle-resume`; the reason is kept in
@@ -405,7 +408,8 @@ fn usage_of(body: &Map<String, Value>) -> Option<CallUsage> {
 
 /// A listed probability: a finite number in [0, 1].
 fn probability(v: &Value) -> Option<f64> {
-    v.as_f64().filter(|p| p.is_finite() && (0.0..=1.0).contains(p))
+    v.as_f64()
+        .filter(|p| p.is_finite() && (0.0..=1.0).contains(p))
 }
 
 /// The bare verdict of one question (the 0.8.7 form, or the verdict field of
@@ -449,7 +453,10 @@ fn parse_verdict(q: &Question, v: &Value) -> std::result::Result<Verdict, String
         // (a percent, a null, an id twice, …) is dropped, never the paid
         // call (DESIGN C3).
         Err(code) => {
-            tracing::debug!(code, "oracle: a malformed distribution dropped, the verdict kept one-hot");
+            tracing::debug!(
+                code,
+                "oracle: a malformed distribution dropped, the verdict kept one-hot"
+            );
             Ok(Verdict::one_hot(stated))
         }
     }
@@ -1104,10 +1111,21 @@ pub fn resume_state_file(path: &Path) -> Result<Option<OracleState>> {
 
 // ------------------------------------------------------------------ ledger
 
-/// Whether OpenRouter likely did not bill a failed call that reported no
-/// cost: it refused it (HTTP 401, 402, 403 or 429) before any model ran.
+/// Whether OpenRouter did not bill a failed call that reported no cost: it
+/// refused the request (HTTP 400, 401, 402, 403, 404, 413, 422 or 429)
+/// before any model ran.
 pub fn likely_unbilled(http_status: Option<u16>) -> bool {
-    matches!(http_status, Some(401 | 402 | 403 | 429))
+    matches!(
+        http_status,
+        Some(400 | 401 | 402 | 403 | 404 | 413 | 422 | 429)
+    )
+}
+
+/// Whether a `failed_unknown_cost` call was refused before any model ran
+/// ([`likely_unbilled`], or a prompt over the model's context): its
+/// reservation is released, not charged.
+fn refused_unbilled(http_status: Option<u16>, error: Option<&str>) -> bool {
+    likely_unbilled(http_status) || error == Some(CONTEXT_LENGTH_CODE)
 }
 
 /// Status of a line of `oracle.jsonl`.
@@ -1119,16 +1137,18 @@ pub const LEDGER_FAILED_UNKNOWN: &str = "failed_unknown_cost";
 /// Money and calls of the ledger.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LedgerTotals {
-    /// Charged: costs of settled and billed calls, reservations of the others.
+    /// Charged: costs of settled and billed calls, reservations of the other
+    /// failed calls (a refused one charges nothing).
     pub spent: f64,
     /// Of `spent`: the reservations charged in full for failed calls that
-    /// reported no cost (`failed_unknown_cost`; OpenRouter may have billed
-    /// less, or nothing, as for a refused key).
+    /// reported no cost and were not refused (`failed_unknown_cost`: a
+    /// timeout, a lost connection, a 5xx, a run interrupted with its call in
+    /// flight, a bad answer; OpenRouter may have billed less, or nothing).
     pub unknown_cost: f64,
-    /// Of `unknown_cost`: those of calls OpenRouter refused with HTTP 401,
-    /// 402, 403 or 429 ([`likely_unbilled`]), which it likely did not bill.
-    /// The rest (a timeout, a lost connection, a run interrupted with its
-    /// call in flight, another failure) may have been billed.
+    /// Not in `spent`: the reservations released for calls OpenRouter refused
+    /// before any model ran (HTTP 400, 401, 402, 403, 404, 413, 422 or 429,
+    /// [`likely_unbilled`], or a prompt over the model's context,
+    /// [`CONTEXT_LENGTH_CODE`]).
     pub refused_cost: f64,
     /// Reservations of calls in flight.
     pub inflight: f64,
@@ -1195,7 +1215,7 @@ fn replay_ledger(path: &Path) -> Result<(LedgerTotals, Vec<OpenReservation>, u64
                 open.insert(id, (r, key));
             }
             st @ (LEDGER_SETTLED | LEDGER_FAILED_BILLED | LEDGER_FAILED_UNKNOWN) => {
-                let charged = if st == LEDGER_FAILED_UNKNOWN {
+                let amount = if st == LEDGER_FAILED_UNKNOWN {
                     f("reserved_usd")
                 } else {
                     f("cost_usd")
@@ -1204,16 +1224,18 @@ fn replay_ledger(path: &Path) -> Result<(LedgerTotals, Vec<OpenReservation>, u64
                     anyhow::anyhow!("{} line {}: amount missing", path.display(), n + 1)
                 })?;
                 open.remove(&id);
+                let http = v
+                    .get("http_status")
+                    .and_then(Value::as_u64)
+                    .and_then(|c| u16::try_from(c).ok());
+                let refused = st == LEDGER_FAILED_UNKNOWN
+                    && refused_unbilled(http, v.get("error").and_then(Value::as_str));
+                let charged = if refused { 0.0 } else { amount };
                 totals.spent += charged;
-                if st == LEDGER_FAILED_UNKNOWN {
+                if refused {
+                    totals.refused_cost += amount;
+                } else if st == LEDGER_FAILED_UNKNOWN {
                     totals.unknown_cost += charged;
-                    let http = v
-                        .get("http_status")
-                        .and_then(Value::as_u64)
-                        .and_then(|c| u16::try_from(c).ok());
-                    if likely_unbilled(http) {
-                        totals.refused_cost += charged;
-                    }
                 }
                 *totals.per_key.entry(key).or_insert(0.0) += charged;
                 if st == LEDGER_SETTLED {
@@ -1575,7 +1597,12 @@ impl OracleClient {
                 let direct = self.cfg.without_reasoning();
                 tracing::info!(error = %f.error, "reasoning oracle call failed; asking without reasoning");
                 let body = request_body(&direct, questions, state);
-                self.call_with(caller, questions, &body, call_max_tokens(&direct, questions.len()))
+                self.call_with(
+                    caller,
+                    questions,
+                    &body,
+                    call_max_tokens(&direct, questions.len()),
+                )
             }
             _ => outcome,
         }
@@ -1588,7 +1615,12 @@ impl OracleClient {
         questions: &[&Question],
         body: &[u8],
     ) -> CallOutcome {
-        self.call_with(caller, questions, body, call_max_tokens(&self.cfg, questions.len()))
+        self.call_with(
+            caller,
+            questions,
+            body,
+            call_max_tokens(&self.cfg, questions.len()),
+        )
     }
 
     /// One call of `body`, whose `max_tokens` is `mt`.
@@ -1779,18 +1811,22 @@ impl OracleClient {
             ),
             CallOutcome::Refused(_) => return,
         };
-        let charged = usage.map_or(res, |u| u.cost);
+        let refused =
+            status == LEDGER_FAILED_UNKNOWN && refused_unbilled(http_status, error.as_deref());
+        let charged = if refused {
+            0.0
+        } else {
+            usage.map_or(res, |u| u.cost)
+        };
         let mut inner = self.inner.lock();
         {
             let t = &mut inner.totals;
             t.inflight = (t.inflight - res).max(0.0);
             t.spent += charged;
-            let overflow = error.as_deref() == Some(CONTEXT_LENGTH_CODE);
-            if status == LEDGER_FAILED_UNKNOWN {
+            if refused {
+                t.refused_cost += res;
+            } else if status == LEDGER_FAILED_UNKNOWN {
                 t.unknown_cost += charged;
-                if likely_unbilled(http_status) || overflow {
-                    t.refused_cost += charged;
-                }
             }
             let k = t.per_key.entry(key_id.to_string()).or_insert(0.0);
             *k = (*k - res).max(0.0) + charged;
@@ -2307,6 +2343,7 @@ mod tests {
         let v = request_value(&off, &[&c], &json!("x"));
         assert_eq!(v["reasoning"], json!({"enabled": false}));
         assert_eq!(off.call_deadline_s(), 30.0);
+        assert_eq!(off.escalation_deadline_s(), 30.0);
         let on = OracleConfig {
             reasoning: "medium".into(),
             ..OracleConfig::default()
@@ -2316,6 +2353,10 @@ mod tests {
         assert_eq!(v["max_tokens"], json!(64 + 128 + 4096));
         assert_eq!(call_max_tokens(&on, 2), 128 + 256 + 4096);
         assert_eq!(on.call_deadline_s(), 90.0);
+        // A follower waits for both calls of an escalation, each bounded by
+        // the agent's timeout (the call's deadline).
+        assert_eq!(on.escalation_deadline_s(), 2.0 * on.call_deadline_s());
+        assert_eq!(on.escalation_deadline_s(), 180.0);
         let mut cfg = crate::config::Config::default();
         cfg.oracle.reasoning = "extreme".into();
         assert!(cfg.validate().is_err());
@@ -3387,5 +3428,35 @@ mod tests {
             ledger_totals(&dir.path().join("none.jsonl")).unwrap(),
             LedgerTotals::default()
         );
+    }
+
+    /// A replayed ledger releases the reservation of a call refused before any
+    /// model ran (a prompt over the context, [`CONTEXT_LENGTH_CODE`]; an HTTP
+    /// 429), as the live settle does; other failures stay charged.
+    #[test]
+    fn ledger_replay_counts_context_length_as_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("oracle.jsonl");
+        let lines = [
+            json!({"status":"reserved","call_id":"a","key_id":"k","reserved_usd":0.25}),
+            json!({"status":"failed_unknown_cost","call_id":"a","key_id":"k","reserved_usd":0.25,
+                   "http_status":400,"error":"context_length"}),
+            json!({"status":"reserved","call_id":"b","key_id":"k","reserved_usd":0.5}),
+            json!({"status":"failed_unknown_cost","call_id":"b","key_id":"k","reserved_usd":0.5,
+                   "http_status":500,"error":"http_500"}),
+            json!({"status":"reserved","call_id":"c","key_id":"k","reserved_usd":0.125}),
+            json!({"status":"failed_unknown_cost","call_id":"c","key_id":"k","reserved_usd":0.125,
+                   "http_status":429,"error":"http_429"}),
+        ];
+        let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(&p, text).unwrap();
+        let lt = ledger_totals(&p).unwrap();
+        assert_eq!(lt.spent, 0.5);
+        assert_eq!(lt.unknown_cost, 0.5);
+        assert_eq!(lt.refused_cost, 0.375);
+        assert_eq!(lt.per_key.get("k"), Some(&0.5));
+        let c = OracleClient::open(&OracleConfig::default(), &p, None, Arc::new(|_| None)).unwrap();
+        assert_eq!(c.totals().spent, 0.5);
+        assert_eq!(c.totals().refused_cost, 0.375);
     }
 }

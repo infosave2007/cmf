@@ -19,7 +19,8 @@
 //! * consent: `oracle.enabled: false`, `cmf.oracle: false`, `oracle_allowed:
 //!   false`, `default_per_request: false`, no key in the environment, the admin
 //!   switch — 0 calls;
-//! * PII redaction on by default (string leaves of a JSON state too);
+//! * PII redaction off by default (the state sent as asked) and on with
+//!   `oracle.redact_pii: true` (string leaves of a JSON state too);
 //! * the key: read from the environment only (a child process with the variable
 //!   set), its bytes never on disk or in the captured logs;
 //! * the ledger and the stop survive a restart; an open reservation is charged.
@@ -185,8 +186,8 @@ fn bodies_on_the_wire_equal_the_driver_and_replay_the_ledger() {
             delay: Duration::ZERO,
         }
     });
-    // Default configuration (redaction on: none of these texts has PII); the
-    // cache is off so that every row is a call.
+    // Default configuration (no PII redaction; none of these texts has PII
+    // anyway); the cache is off so that every row is a call.
     let mut cfg = stand_config(&mock.url());
     cfg.cache.enabled = false;
     cfg.oracle.probabilities = false;
@@ -549,6 +550,60 @@ fn the_callers_credit_limits_oracle_calls() {
     assert_eq!(mock.hits(), 2);
 }
 
+#[test]
+fn a_call_refused_before_any_model_ran_releases_its_reservation() {
+    // OpenRouter refuses a burst (HTTP 429) before any model ran: nothing is
+    // billed, so the reservations are released and the refusals do not use
+    // up the budget (they once stopped a working oracle on `budget`).
+    let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let n2 = n.clone();
+    let mock =
+        MockOracle::start(
+            move |req| match n2.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0..=2 => raw_reply(429, r#"{"error":{"message":"rate limited"}}"#),
+                _ => answer_reply(req, |_, o| pick(o, "travel"), 1e-5),
+            },
+        );
+    let mut cfg = stand_config(&mock.url());
+    cfg.oracle.max_errors = 100;
+    let st = Stand::new(&cfg);
+    let r = rejected();
+    assert!(
+        flags(&st.decide(&topics_body(&r[0])).unwrap(), 0)
+            .contains(&"oracle_unavailable".to_string())
+    );
+    let res = st.ledger()[0]["reserved_usd"].as_f64().unwrap();
+    // Room for one reservation and a half: charged refusals would leave none.
+    st.svc
+        .admin(&AdminCommand::OracleUpdate(
+            json!({"budget_usd": 1.5 * res}),
+        ))
+        .unwrap();
+    for q in &r[1..3] {
+        assert!(
+            flags(&st.decide(&topics_body(q)).unwrap(), 0)
+                .contains(&"oracle_unavailable".to_string())
+        );
+    }
+    let t = st.cascade.oracle().totals();
+    assert_eq!((t.spent, t.unknown_cost), (0.0, 0.0), "{t:?}");
+    assert!(t.refused_cost >= 3.0 * res * 0.99, "{t:?}");
+    assert_eq!(
+        st.decide(&topics_body(&r[3])).unwrap().questions[0].action,
+        Action::Oracle
+    );
+    assert_eq!(mock.hits(), 4);
+    let t = st.cascade.oracle().totals();
+    assert!(t.spent > 0.0 && t.spent < res, "{t:?}");
+    // The ledger replays to the same totals.
+    let st = st.restart(&cfg);
+    let t2 = st.cascade.oracle().totals();
+    assert_eq!(
+        (t2.spent, t2.refused_cost, t2.unknown_cost),
+        (t.spent, t.refused_cost, 0.0)
+    );
+}
+
 // ------------------------------------------------------------------ stop rules
 
 fn enable(st: &Stand) {
@@ -716,8 +771,8 @@ fn failures_in_a_row_count_across_restarts_and_a_resume_clears_them() {
     // after a restart).
     assert_eq!(st.oracle_state()["last_error"], "http_500");
     // A failed call with no reported cost is charged its reservation, and
-    // counted as such; an HTTP 500 is not a refusal OpenRouter likely did
-    // not bill (as 401, 402, 403 and 429 are).
+    // counted as such; an HTTP 500 may have been billed (a refusal before
+    // any model ran — 400, 401, 402, 403, 404, 413, 422, 429 — is not).
     let t = st.cascade.oracle().totals();
     assert!(
         t.unknown_cost > 0.0 && (t.unknown_cost - t.spent).abs() < 1e-15,
@@ -976,22 +1031,33 @@ fn consent_switches_make_no_call() {
 // ------------------------------------------------------------------ PII
 
 #[test]
-fn pii_is_redacted_by_default() {
+fn pii_is_sent_as_asked_by_default_and_redacted_on_opt_in() {
     let text = "cruise ship yacht harbor mail john.doe@example.com call +15551234567";
     let mock = MockOracle::answering("travel");
+    // The default (`oracle.redact_pii: false`): the e-mail address and the
+    // number leave as asked, no flag.
+    assert!(!Config::default().oracle.redact_pii);
     let st = Stand::new(&stand_config(&mock.url()));
     let d = st.decide(&topics_body(text)).unwrap();
     assert_eq!(d.questions[0].action, Action::Oracle, "the gate rejects it");
+    assert!(flags(&d, 0).is_empty());
+    assert_eq!(mock.requests()[0].state(), json!(text));
+    assert!(String::from_utf8_lossy(&mock.requests()[0].body).contains("john.doe@example.com"));
+
+    // Opt-in: redacted, flagged.
+    let mut on = stand_config(&mock.url());
+    on.oracle.redact_pii = true;
+    let st = Stand::new(&on);
+    let d = st.decide(&topics_body(text)).unwrap();
     assert_eq!(flags(&d, 0), vec!["pii_redacted"]);
-    let sent = mock.requests()[0].state();
     assert_eq!(
-        sent,
+        mock.requests()[1].state(),
         json!("cruise ship yacht harbor mail [REDACTED] call [REDACTED]")
     );
-    assert!(!String::from_utf8_lossy(&mock.requests()[0].body).contains("john.doe"));
+    assert!(!String::from_utf8_lossy(&mock.requests()[1].body).contains("john.doe"));
 
-    // Consent to egress, or redaction off: sent as is.
-    let mut cfg = stand_config(&mock.url());
+    // Opt-in, but the request consents to egress: sent as is.
+    let mut cfg = on.clone();
     cfg.cache.enabled = false;
     let st = Stand::new(&cfg);
     let d = st
@@ -1002,15 +1068,10 @@ fn pii_is_redacted_by_default() {
         ))
         .unwrap();
     assert!(flags(&d, 0).is_empty());
-    assert_eq!(mock.requests()[1].state(), json!(text));
-    let mut raw = stand_config(&mock.url());
-    raw.oracle.redact_pii = false;
-    let st = Stand::new(&raw);
-    st.decide(&topics_body(text)).unwrap();
     assert_eq!(mock.requests()[2].state(), json!(text));
 
-    // A JSON state: string leaves are redacted, keys kept.
-    let st = Stand::new(&stand_config(&mock.url()));
+    // Opt-in, a JSON state: string leaves are redacted, keys kept.
+    let st = Stand::new(&on);
     let state = json!({"from": "a.b@c.de", "body": "cruise ship yacht"});
     let d = st
         .decide(&body(state, json!({"u": score_question()}), None))
@@ -1243,8 +1304,11 @@ fn the_ledger_and_the_stop_survive_a_restart() {
     let spent = st.cascade.oracle().totals().spent;
     mock.set(|_| raw_reply(403, "{}"));
     st.decide(&topics_body(&rejected()[1])).unwrap();
-    let spent2 = st.cascade.oracle().totals().spent;
-    assert!(spent2 > spent);
+    // A refused key ran no model: its reservation is released, not charged.
+    let t = st.cascade.oracle().totals();
+    let spent2 = t.spent;
+    assert_eq!(spent2, spent);
+    assert!(t.refused_cost > 0.0, "{t:?}");
     // A reservation left open by a crash.
     let ledger = st.state.oracle_ledger_path();
     let st = {

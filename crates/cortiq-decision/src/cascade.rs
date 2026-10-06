@@ -30,8 +30,8 @@
 //! 4. **one call** for every leading question ([`crate::oracle`]); the state,
 //!    the questions' instructions and their criteria's descriptions (0.8.8,
 //!    DESIGN B4; never the option ids) are PII-redacted when
-//!    `oracle.redact_pii` is on and the request did not set
-//!    `cmf.allow_pii_egress` (flag `pii_redacted`); the cache scope, the
+//!    `oracle.redact_pii` is on (opt-in, off by default) and the request did
+//!    not set `cmf.allow_pii_egress` (flag `pii_redacted`); the cache scope, the
 //!    contract key and the learned example keep the question as asked;
 //! 5. **success**: the answers are cached (and logged; the scope holds the
 //!    question's contract, so an answer is reused only for the same
@@ -103,11 +103,12 @@
 //! instructions' (the cache, single flight and its example use it), its cache
 //! scope and its auto-skill hash the criteria alone
 //! ([`crate::cache::scope_of_as`], [`Contract::stateless`]), and its
-//! instructions leave for the oracle PII-redacted like a state. Such a
-//! contract is registered only from its `learning.auto_min_sightings`-th
-//! sighting (an escalation of a learnable question of it; counted in a
-//! bounded in-memory LRU of `learning.auto_sightings_cap` contracts, lost on
-//! restart), so one-off contracts — a multiple-choice benchmark whose options
+//! instructions leave for the oracle like a state (PII-redacted when
+//! `oracle.redact_pii` is on). Such a contract is registered only from its
+//! `learning.auto_min_sightings`-th sighting (an escalation of a learnable
+//! question of it; counted in a bounded in-memory LRU of
+//! `learning.auto_sightings_cap` contracts, lost on restart), so one-off
+//! contracts — a multiple-choice benchmark whose options
 //! change with every item — never reach `learn.log` nor use up
 //! `learning.auto_max_stateless_skills`; the answers before that are not
 //! learned. Stateful contracts register at their
@@ -1210,7 +1211,8 @@ impl Escalator for Cascade {
             credit_left_usd: e.oracle_credit_usd,
         };
         // The state and the questions as they would leave for the oracle (PII
-        // redacted unless the request allows its egress), and whether
+        // redacted when `oracle.redact_pii` is on — off by default — and the
+        // request does not allow its egress), and whether
         // anything was redacted. Every question's instructions (a state-less
         // question's input, DESIGN A19.3) and its criteria's descriptions are
         // redacted like a state (DESIGN B4) — the option ids, `true`/`false`

@@ -30,7 +30,8 @@
 //!   follower never caches the answer to another input under its own; a
 //!   0.8.9 `learn.log` replays and answers exact repeats, and
 //!   `cache.legacy_cos: 1` turns its entries off;
-//! * PII redaction on by default;
+//! * PII redaction off by default (the state sent as asked), on with
+//!   `oracle.redact_pii: true` unless the request allows its egress;
 //! * the request body for one choice question is byte for byte the v4 driver's
 //!   (9 ledger fixtures of `cortiq-decision`, sent over HTTP);
 //! * the key comes only from the environment and its bytes are in no response,
@@ -57,7 +58,7 @@
 //!   take the state-less contracts' slots; capacity errors carry the Decision
 //!   Index marker (422 on System One, the oracle's context overflow 422
 //!   everywhere, not a stop); PII in state-less instructions is redacted for
-//!   the oracle; System One oracle and cache choice answers carry the one-hot
+//!   the oracle when redaction is on; System One oracle and cache choice answers carry the one-hot
 //!   distribution the kit's validator requires, and its `default` model name
 //!   is accepted.
 //!
@@ -2068,18 +2069,28 @@ async fn a_refused_request_never_tells_which_questions_the_cache_holds() {
 // ------------------------------------------------------------------ PII
 
 #[tokio::test]
-async fn pii_is_redacted_by_default() {
+async fn pii_is_sent_as_asked_by_default_and_redacted_on_opt_in() {
     let text = "cruise ship yacht harbor mail john.doe@example.com call +15551234567";
     let mock = MockOracle::answering("travel");
+    // The default (`oracle.redact_pii: false`): sent as asked, no flag.
     let srv = Srv::new(&stand_config(&mock.url()));
+    let r = srv.decide(&topics_body(text)).await;
+    assert_eq!(r.action(), "oracle");
+    assert_eq!(r.flags(), json!([]));
+    assert_eq!(mock.requests()[0].state(), json!(text));
+    // Opt-in: redacted, flagged...
+    let mut on = stand_config(&mock.url());
+    on.oracle.redact_pii = true;
+    let srv = Srv::new(&on);
     let r = srv.decide(&topics_body(text)).await;
     assert_eq!(r.action(), "oracle");
     assert_eq!(r.flags(), json!(["pii_redacted"]));
     assert_eq!(
-        mock.requests()[0].state(),
+        mock.requests()[1].state(),
         json!("cruise ship yacht harbor mail [REDACTED] call [REDACTED]")
     );
-    let mut cfg = stand_config(&mock.url());
+    // ... unless the request allows its egress.
+    let mut cfg = on.clone();
     cfg.cache.enabled = false;
     let srv = Srv::new(&cfg);
     let r = srv
@@ -2090,7 +2101,7 @@ async fn pii_is_redacted_by_default() {
         ))
         .await;
     assert_eq!(r.flags(), json!([]));
-    assert_eq!(mock.requests()[1].state(), json!(text));
+    assert_eq!(mock.requests()[2].state(), json!(text));
     // The router API's allow_pii_egress (default false).
     let rr = srv
         .post(
@@ -2100,7 +2111,7 @@ async fn pii_is_redacted_by_default() {
         )
         .await;
     assert_eq!(rr.body["decision"]["flags"], json!(["pii_redacted"]));
-    assert!(!String::from_utf8_lossy(&mock.requests()[2].body).contains("john.doe"));
+    assert!(!String::from_utf8_lossy(&mock.requests()[3].body).contains("john.doe"));
 }
 
 // ------------------------------------------------------------------ driver bodies
@@ -5091,8 +5102,9 @@ fn asked_question(req: &MockRequest) -> Value {
     qs["questions"]["task"].clone()
 }
 
-/// PII in a question's instructions and in its criteria's descriptions is
-/// redacted in the oracle request (DESIGN B4) — the option ids are intact —
+/// With `oracle.redact_pii` on (an opt-in), PII in a question's instructions
+/// and in its criteria's descriptions is redacted in the oracle request
+/// (DESIGN B4) — the option ids are intact —
 /// while the cache scope and the auto-skill key are those of the question as
 /// asked: the same question with `allow_pii_egress` (nothing redacted) hits
 /// the cache entry of the redacted call, and the registered auto-skill is the
@@ -5105,7 +5117,9 @@ async fn pii_in_instructions_and_descriptions_is_redacted_on_egress_only() {
                    "criteria": {"food": "about food (chef@example.com)",
                                 "cruise": "about cruise, call +1 (555) 123-4567"}});
     let mock = MockOracle::answering("cruise");
-    let srv = Srv::new(&stand_config(&mock.url()));
+    let mut on = stand_config(&mock.url());
+    on.oracle.redact_pii = true;
+    let srv = Srv::new(&on);
     let r = srv
         .decide(&body(json!(text), json!({"task": q.clone()}), None))
         .await;
@@ -5146,7 +5160,7 @@ async fn pii_in_instructions_and_descriptions_is_redacted_on_egress_only() {
     assert_eq!(r.flags(), json!([]));
     assert_eq!(mock.hits(), 1);
     // With `allow_pii_egress` nothing is redacted.
-    let mut cfg = stand_config(&mock.url());
+    let mut cfg = on.clone();
     cfg.cache.enabled = false;
     let srv = Srv::new(&cfg);
     let r = srv
@@ -5165,7 +5179,7 @@ async fn pii_in_instructions_and_descriptions_is_redacted_on_egress_only() {
 
     // State-less: the descriptions are redacted as well, the key is the
     // original criteria's.
-    let mut once = stand_config(&mock.url());
+    let mut once = on.clone();
     once.learning.auto_min_sightings = 1;
     let srv = Srv::new(&once);
     let mut sl = q.clone();
@@ -5191,14 +5205,16 @@ async fn pii_in_instructions_and_descriptions_is_redacted_on_egress_only() {
     );
 }
 
-/// A state-less request's instructions are its input: PII in them is
-/// redacted in the oracle request like a state (DESIGN A19.3), unless the
-/// request allows its egress; the state `{}` is sent as is.
+/// A state-less request's instructions are its input: with
+/// `oracle.redact_pii` on (an opt-in), PII in them is redacted in the oracle
+/// request like a state (DESIGN A19.3), unless the request allows its
+/// egress; the state `{}` is sent as is.
 #[tokio::test]
 async fn pii_in_stateless_instructions_is_redacted() {
     let text = "cruise ship yacht harbor mail john.doe@example.com call +15551234567";
     let mock = MockOracle::answering("travel");
     let mut cfg = stand_config(&mock.url());
+    cfg.oracle.redact_pii = true;
     cfg.cache.enabled = false;
     let srv = Srv::new(&cfg);
     let q = sl_question(&["food", "travel"], text);
@@ -5621,7 +5637,8 @@ async fn a_reasoning_call_cut_by_length_is_answered_without_reasoning() {
                 "usage": {"prompt_tokens": 900, "completion_tokens": 2048, "cost": 3.0e-4,
                           "completion_tokens_details": {"reasoning_tokens": 2048}},
             })
-        } else if v["reasoning"] == json!({"enabled": false}) && v["max_tokens"] == json!(64 + 128) {
+        } else if v["reasoning"] == json!({"enabled": false}) && v["max_tokens"] == json!(64 + 128)
+        {
             let content = verdicts(req, |_, o| pick(o, "travel")).to_string();
             json!({
                 "id": "gen-mock", "model": ORACLE_MODEL, "provider": "Mock",
@@ -5645,10 +5662,21 @@ async fn a_reasoning_call_cut_by_length_is_answered_without_reasoning() {
     assert_eq!(r.status, 200, "{}", r.text);
     assert_eq!(r.action(), "oracle", "{}", r.text);
     assert_eq!(r.body["answers"]["task"]["choice"], "travel");
-    assert_eq!(mock.requests().len(), 2, "one reasoning call, one direct call");
+    assert_eq!(
+        mock.requests().len(),
+        2,
+        "one reasoning call, one direct call"
+    );
     let ledger = srv.ledger();
-    let statuses: Vec<&str> = ledger.iter().map(|l| l["status"].as_str().unwrap()).collect();
-    assert_eq!(statuses, ["reserved", "failed_billed", "reserved", "settled"], "{ledger:?}");
+    let statuses: Vec<&str> = ledger
+        .iter()
+        .map(|l| l["status"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        statuses,
+        ["reserved", "failed_billed", "reserved", "settled"],
+        "{ledger:?}"
+    );
     assert_eq!(ledger[1]["error"], "finish_length");
     assert_eq!(ledger[2]["max_tokens"], 64 + 128);
     let st = srv.admin("GET", "/v1/admin/oracle", None).await;

@@ -72,7 +72,7 @@ for i in $(seq 0 14); do
 done
 dd if=/content/dsv4-q2tp.cmf of=/dev/null bs=64M   # warm the page cache; mmap faults read at ~50 MB/s cold
 
-curl --proto '=https' -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.85.0 --profile minimal
+curl --proto '=https' -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.88.0 --profile minimal
 git clone https://github.com/infosave2007/cmf.git /root/cmf
 cd /root/cmf && cargo build --release --features gpu
 ```
