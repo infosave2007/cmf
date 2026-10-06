@@ -497,12 +497,12 @@ that contract too, with the digest and the φ of the instructions text, so
 the same text under the same criteria is a cache hit (a near-identical one
 only with near reuse opted in, `cache.threshold` below 1, since 0.8.11).
 The instructions of a state-less question are its input: they leave for
-the oracle PII-redacted
-like a state (unless `allow_pii_egress`; since 0.8.8 so do every question's
-instructions and criteria descriptions, never the option ids — ORACLE.md
-"What leaves the machine"), the oracle request otherwise unchanged (`state`
-sent as `{}`). Each one is limited to `limits.state_bytes`
-(a capacity error past it); state-less answers are never `certified`. A
+the oracle like a state — as asked by default, PII-redacted only with
+`oracle.redact_pii` on and without `allow_pii_egress` (then, since 0.8.8, so
+are every question's instructions and criteria descriptions, never the
+option ids — ORACLE.md "What leaves the machine") — the oracle request
+otherwise unchanged (`state` sent as `{}`). Each one is limited to
+`limits.state_bytes` (a capacity error past it); state-less answers are never `certified`. A
 state-less contract is registered and learned only from its fifth sighting
 (`learning.auto_min_sightings`; sightings counted in memory, at most
 `learning.auto_sightings_cap` contracts, lost on restart): a one-off contract
@@ -583,7 +583,7 @@ curl -s "$CORTIQ/v1/skills/banking77" -H "Authorization: Bearer $KEY" \
 | `source`, `skill`, `match`, `certified` | where the answer came from; section 3.2 (`by: "descriptions"` next to `match` for a description match) |
 | `gate` | `accepted`, `p_top` and `tau`, `novelty` and `theta`, `is_novel`, `margin`, `profile` |
 | `errors` | reconstruction errors of the 5 best labels (all of them with `cmf.explain`) |
-| `flags` | e.g. `oracle_disabled`, `no_key` (with `oracle_disabled`: the key variable is not set), `bad_key` (with `oracle_disabled`: it holds something that is not a key), `consent_off`, `budget`, `stopped`, `oracle_unavailable`, `pii_redacted`, `explore` (a gate-accepted question of an auto-skill answered by the oracle for exploration, section 3.2) |
+| `flags` | e.g. `oracle_disabled`, `no_key` (with `oracle_disabled`: the key variable is not set), `bad_key` (with `oracle_disabled`: it holds something that is not a key), `consent_off`, `budget`, `stopped`, `oracle_unavailable`, `pii_redacted` (only with the opt-in `oracle.redact_pii`), `explore` (a gate-accepted question of an auto-skill answered by the oracle for exploration, section 3.2) |
 | `confident` | the answer can be used as is (gate accepted and not novel, or a valid oracle answer) |
 | `complexity` | `{score, tier, factors: {base, ambiguity, novelty, margin, length}}`, the cortiq-router formula |
 | `routing` | `{target, reason}` when `routing_tiers` maps the tier |
@@ -745,7 +745,7 @@ native server. It does **not** load Jev weights or present itself as Jev.
 
 | Field | Adapter rule |
 |---|---|
-| `model` | optional. Omitted, `jev-latest`, `jev-preview`, `jev-1.13.0`, the `typesafe/jev-1.13` selector series, `cmf-decision-<version>` and `default` (the Decision Index kit's placeholder; not listed by discovery) select the current local CMF decision model at this endpoint only. |
+| `model` | optional. Omitted, `jev-latest`, `jev-preview`, `jev-1.13.0`, the `typesafe/jev-1.13` selector series, `cmf-decision-<version>` of this server's own version (another version is refused as an unknown model) and `default` (the Decision Index kit's placeholder; not listed by discovery) select the current local CMF decision model at this endpoint only. |
 | `state` | a string, object, array or `null`; empty (`""`, `{}`, `[]`, `null`) makes the request state-less ([section 3.2](#32-skill-matching-and-certified)). |
 | `questions` | an object of `choice`, `score` or `noul` questions. `instructions` may be omitted or `null`, matching System One clients. |
 
@@ -772,7 +772,7 @@ A successful response is intentionally small and identifies the local model:
 
 ```json
 {
-  "model": "cmf-decision-0.8.5",
+  "model": "cmf-decision-0.8.13",
   "answers": {
     "intent": {
       "type": "choice",
@@ -788,7 +788,8 @@ A successful response is intentionally small and identifies the local model:
 The token figures use the same request metering as the native endpoint; their
 values vary with the request. `GET /v1/models` changes to System One discovery
 format in adapter mode. Its `models` array contains the canonical
-`cmf-decision-0.8.5` entry and transport aliases such as `jev-latest`; each
+`cmf-decision-<version>` entry (`cmf-decision-0.8.13` on this release) and
+transport aliases such as `jev-latest`; each
 alias describes itself as a route to the local CMF model. Requests use the same
 Cortiq key policy as the rest of the server. System One errors use
 `{"error":{"type", "message", "code", "request_id"}}`. Schema errors and
@@ -984,7 +985,7 @@ unknown key is an error. The defaults:
              "provider": {"sort": "price", "require_parameters": true, "allow_fallbacks": true,
                           "max_price": {"prompt": 0.1, "completion": 0.5}},
              "max_tokens_per_question": 64, "deadline_s": 30, "budget_usd": 1.0, "max_calls": 10000,
-             "max_errors": 30, "redact_pii": true, "title": "cortiq-decision", "data_collection": null,
+             "max_errors": 30, "redact_pii": false, "title": "cortiq-decision", "data_collection": null,
              "probabilities": true, "probability_tokens_per_question": 128,
              "reasoning": "off", "reasoning_max_tokens": 4096, "reasoning_deadline_s": 60},
   "cache": {"enabled": true, "threshold": 1.0, "legacy_cos": 0.9999, "cap": 50000},

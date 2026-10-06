@@ -20,9 +20,10 @@
 //!   and only a question it cannot decide (the gate rejects it, or no skill
 //!   has the labels) goes to the OpenRouter model, through the server's own
 //!   cascade and client — the reservation before every call, the stop rules,
-//!   PII redaction by default, the key read from the environment at the call
-//!   and printed nowhere. A text the gate accepts touches no network and no
-//!   state. The reservation ledger and the answer cache are the state
+//!   the text sent as written (no PII redaction: `oracle.redact_pii` is an
+//!   opt-in of a server's `--decision-config`), the key read from the
+//!   environment at the call and printed nowhere. A text the gate accepts
+//!   touches no network and no state. The reservation ledger and the answer cache are the state
 //!   directory's (`--state DIR`, else `<FILE>.state`, under its `LOCK`);
 //!   `--oracle-budget` caps what the run spends (default $1.00). The stop
 //!   rules hold as on a server: a stop (a refused key, no credit, another
@@ -504,7 +505,7 @@ pub struct DecideOracleArgs {
     /// rejects it, or no skill has the labels), e.g.
     /// deepseek/deepseek-v4.1-flash. A text the gate accepts never reaches it.
     /// The key is read from OPENROUTER_API_KEY (--oracle-key-env), never
-    /// printed; the text sent is PII-redacted. The oracle's ledger and answer
+    /// printed; the text is sent as written. The oracle's ledger and answer
     /// cache are kept in the state directory (--state DIR, else <FILE>.state)
     #[arg(long, value_name = "MODEL")]
     pub oracle: Option<String>,
@@ -1160,10 +1161,11 @@ struct RunTotals {
     /// Charged in this run (USD) …
     spent: f64,
     /// … of which the full reservations of failed calls that reported no
-    /// cost (OpenRouter may not have billed them, as for a refused key) …
+    /// cost and were not refused (OpenRouter may have billed them) …
     unknown_cost: f64,
-    /// … of which those of calls OpenRouter refused (401, 402, 403, 429):
-    /// likely not billed.
+    /// … and, not charged, the reservations released for calls OpenRouter
+    /// refused before any model ran (HTTP 4xx, or a prompt over the model's
+    /// context).
     refused_cost: f64,
     calls: u64,
     /// Everything the ledger holds (earlier runs included).
@@ -1689,17 +1691,17 @@ impl OracleRun {
     fn spend_text(&self) -> String {
         let t = self.totals();
         let mut unknown = String::new();
-        if t.refused_cost > 0.0 {
-            unknown.push_str(&format!(
-                "; {} of it is the reservation of calls OpenRouter refused (HTTP 401, 402, 403 or 429) without a cost, likely not billed",
-                usd(t.refused_cost)
-            ));
-        }
-        let other = t.unknown_cost - t.refused_cost;
+        let other = t.unknown_cost;
         if other > 1e-12 {
             unknown.push_str(&format!(
                 "; {} of it is the reservation of failed calls that reported no cost (a timeout, a lost connection, an interrupted run, a bad answer), which OpenRouter may have billed",
                 usd(other)
+            ));
+        }
+        if t.refused_cost > 0.0 {
+            unknown.push_str(&format!(
+                "; {} of reservations released, not charged, for calls OpenRouter refused before any model ran (HTTP 400, 401, 402, 403, 404, 413, 422 or 429, or a prompt over the model's context)",
+                usd(t.refused_cost)
             ));
         }
         let mut s = format!(

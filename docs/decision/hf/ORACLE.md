@@ -409,8 +409,10 @@ check that the ledger shows reasoning tokens, and list such a provider in
 A reasoning call that outgrows its token allowance (`finish_length`) or its
 deadline (`read_timeout`, `transport_timeout`) is asked once more without
 reasoning, so the question still gets the oracle's direct answer. Both calls
-are in the ledger (the first one is billed when the provider bills it), the
-stop rules count the second one's outcome, and a follower waiting for the
+are in the ledger (the first one is billed when the provider bills it) and
+each counts toward the stop rules: a failed first call adds one to the
+failures in a row (and can reach `max_errors` before the second call is
+made), an answered second call clears the count. A follower waiting for the
 same question waits for both.
 
 ## Budget and stop rules
@@ -424,8 +426,12 @@ same question waits for both.
   × `oracle_markup` ≤ the credit left.
 * **Ledger.** `oracle.jsonl` gets a `reserved` line, fsynced, before the
   request leaves; after the answer a `settled`, `failed_billed` or
-  `failed_unknown_cost` line with the cost, tokens and latency. At start any
-  reservation without a closing line counts as spent.
+  `failed_unknown_cost` line with the cost, tokens and latency. A failed call
+  without a reported cost is charged its reservation (a timeout, a lost
+  connection, a 5xx may have been billed), unless OpenRouter refused the
+  request before any model ran — HTTP 400, 401, 402, 403, 404, 413, 422 or
+  429, or the `context_length` failure below — which releases it. At start
+  any reservation without a closing line counts as spent.
 * **Checks of every answer.** HTTP 200 within `deadline_s` (no retries), a
   finite `usage.cost` ≥ 0, `finish_reason: stop`, exactly the asked question
   ids with the schema's types. A 200 that carries only an `error` is a failure.
@@ -439,7 +445,7 @@ same question waits for both.
   context length) is the failure `context_length`: the question gets a 422
   whose message says `maximum context length` (a trained one abstains), it
   does not count toward `max_errors` — a run of long items must not stop a
-  working oracle — and its reservation counts as likely unbilled.
+  working oracle — and its reservation is released, not charged.
 * `GET /v1/admin/oracle` shows spent, reserved, remaining, calls, failures and
   the stop reason; `POST /v1/admin/oracle` can switch the oracle and lower
   `budget_usd` / `max_calls` within the configured values. Since 0.8.11 the
@@ -453,11 +459,15 @@ same question waits for both.
   `state` and the `instructions` and `criteria` of those questions. In a
   state-less request (empty `state`) the instructions are the input; since
   0.8.8 every question's instructions and its criteria's descriptions are
-  redacted like a state (below), the option ids never. Receivers:
+  redacted like a state when PII redaction is on (below), the option ids
+  never. Receivers:
   OpenRouter and the provider it routes to (`provider.sort: price`,
   fallbacks allowed; set `oracle.data_collection: "deny"` to exclude providers
   that store data).
-* **PII redaction** is on by default (`oracle.redact_pii`): e-mail addresses,
+* **PII redaction** is off by default: the text is sent as asked. It was on
+  through 0.8.12, and its secret-like pattern also rewrote tool names, slugs
+  and chemical names (10,225 questions of one Decision Index run). Turn it
+  on with `"oracle": {"redact_pii": true}`; then e-mail addresses,
   secret-like tokens (20 or more characters of `[A-Za-z0-9_-]` with a digit and
   a letter) and numbers of 9 or more digits — also when their digit groups
   are separated by spaces, dashes, dots, slashes or parentheses, as in
@@ -469,8 +479,8 @@ same question waits for both.
   the auto-skill contract are those of the question as asked, so caching and
   learning do not change. It is a heuristic: names, postal addresses, numbers
   written in words and identifiers with letters between short digit groups
-  are not detected. A request can opt out with `cmf.allow_pii_egress`
-  (router: `options.allow_pii_egress`).
+  are not detected. With it on, a request can opt out with
+  `cmf.allow_pii_egress` (router: `options.allow_pii_egress`).
 * **Never sent**: accepted questions, other questions of the request, client
   keys, accounts, vectors.
 * **Kept on disk** in the state directory: vectors and hashed features of
@@ -522,8 +532,9 @@ oracle: NOT ready — OPENROUTER_API_KEY is not set (set it to your OpenRouter k
 
 Everything else keeps its safe default: a budget of $1.00, provider
 routing `{sort: price, require_parameters: true, allow_fallbacks: true}`,
-PII redaction on, the stop rules, and the oracle only for questions the
-local model cannot decide. Optional companions of `--oracle` (each
+the stop rules, and the oracle only for questions the local model cannot
+decide. The text is sent as asked: PII redaction is an opt-in
+(`oracle.redact_pii` in `--decision-config`). Optional companions of `--oracle` (each
 overrides `--decision-config`):
 
 | Flag | Default | Meaning |
@@ -714,9 +725,9 @@ curl -s http://127.0.0.1:8080/healthz | jq -r .oracle_status     # the server of
 `cortiq decide` takes the same `--oracle MODEL` (and the `--oracle-*`
 flags of the table above) for one text or a batch. The text is decided
 locally first; only when the gate rejects it — or no skill has the asked
-labels — is one call made, with the same reservation, stop rules, PII
-redaction and key handling as a server. A text the gate accepts sends
-nothing.
+labels — is one call made, with the same reservation, stop rules and key
+handling as a server; the text is sent as written (no PII redaction). A text
+the gate accepts sends nothing.
 
 ```bash
 cortiq decide cortiq-decision.cmf --skill banking77 -p "the exchange rate you gave me looks wrong" \
@@ -756,7 +767,7 @@ jq -c '{answer, action, source, oracle_cost_usd, flags}' results.jsonl
   gate rejected, so read `action` before trusting `answer`) — `action`
   (`local`, `oracle`, `cache` or `abstain`), `source`, `oracle_cost_usd`
   (this row's call; 0 for a local or cached answer), `flags`
-  (`pii_redacted`, or why a row abstained: `budget`, `no_key`, `bad_key`,
+  (why a row abstained: `budget`, `no_key`, `bad_key`,
   `stopped`, `oracle_unavailable`, …) and, for a labelled row, `answer_correct`
   (`answer` equals the label). The oracle's totals and a `hint` are in the
   summary on stderr. For one text, `--json` carries `action` and `source`
@@ -881,7 +892,7 @@ cat > oracle-server.json <<'EOF'
     "max_calls": 10000,
     "deadline_s": 30,
     "max_errors": 30,
-    "redact_pii": true
+    "redact_pii": false
   },
   "cache": {"enabled": true, "threshold": 1.0, "legacy_cos": 0.9999},
   "learning": {"enabled": true, "refit_min_new": 25}
