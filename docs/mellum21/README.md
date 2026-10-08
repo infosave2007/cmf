@@ -35,7 +35,7 @@ model.
 | Attention | 21 sliding-window layers (1,024 tokens) + 7 full-attention YaRN layers; declared 131,072-token context |
 | CMF profile | Expert matrices: Q4TP · always-active attention, embedding and output: Q8_2f · router and norms: F16 |
 | Artifact | `mellum2.1-12b-a2.5b-thinking-q4tp.cmf` · 6,884,556,163 bytes (6.41 GiB) |
-| Verified with | Cortiq CLI 0.8.9 |
+| Verified with | Cortiq CLI 0.8.14 |
 | Artifact SHA-256 | `1734d8c585134547efa6eb60f092fd741135fe0f398fe9dc77ab4b97df6a7175` |
 
 The mixed profile spends precision where every token passes and compresses the
@@ -99,18 +99,20 @@ reverse proxy protects it.
 
 ## Measured CPU performance
 
-Five independent CPU runs of the same artifact on a shared RunPod host
-(AMD EPYC 7663, 112 logical CPUs, approximately 251 GiB RAM), using
+Five independent CPU runs of the same 0.8.14 artifact on a shared RunPod host
+(AMD EPYC 7663, 112 logical CPUs, approximately 251 GiB RAM; container CPU
+quota 23.8 cores), using
 `CMF_GPU=0 cortiq bench ... --ctx 512 --tokens 256 --core --ignore-eos --json`:
 
 | Context / generation | Prefill, median | Steady decode, median (range) | TTFT, median (range) |
 |---:|---:|---:|---:|
-| 512 / 256 tokens | 30.81 tok/s | 40.75 tok/s (40.60–41.27) | 16.53 s (15.84–16.65) |
+| 512 / 256 tokens | 38.41 tok/s | 40.73 tok/s (40.62–41.23) | 13.53 s (13.43–13.77) |
 
 These are CPU-core measurements, not an end-to-end service SLA. The observed
 KV state at sequence 767 was 87,965,696 bytes; it is not process RSS.
 On this pod the automatic worker policy selected 22 threads; a bounded sweep
-of 12, 16, 20, 22, 24, and 28 workers found 22 fastest for steady decode.
+of 8, 12, 16, 20, 22, 24, and 28 workers found 22 fastest for steady decode
+(41.75 tok/s in one 128-token calibration run).
 The CMF file can also use eligible Metal and Vulkan runtime paths, but this
 release intentionally publishes no end-to-end GPU throughput number until it
 has a complete, reproducible hardware record. Check the selected adapter with
@@ -128,7 +130,7 @@ scope.
 | `config.json` SHA-256 | `f43d018246094dee6dca455b3072766b6acbefd1ac8e7fe664df34710606a541` |
 | `tokenizer.json` SHA-256 | `58548a346eb073e5132bf7d8ad17dc6971bca36ade378ca4d2bfbc49bf60da2a` |
 | `chat_template.jinja` SHA-256 | `4593a34d52f3364ac13ce57f4bea5688924e8942da6df8201e411db17e729f48` |
-| Conversion | `CMF_ENCODE_THREADS=112 cortiq convert --model /workspace/mellum-cmf/upstream --quant q4tp --output /workspace/mellum-cmf/out/mellum2.1-12b-a2.5b-thinking-q4tp.cmf` |
+| Conversion | `CMF_ENCODE_THREADS=112 cortiq convert --model ./mellum-upstream --quant q4tp --output mellum2.1-12b-a2.5b-thinking-q4tp.cmf` |
 
 `cortiq verify` passed after conversion: it validates the CMF envelope,
 sections, directory, and all 5,631 tensor hashes. A successful integrity check

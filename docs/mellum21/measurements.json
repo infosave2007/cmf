@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "record_status": "measured_cpu_release_candidate",
+  "record_status": "measured_release_candidate",
   "artifact": {
     "repository": "infosave/Mellum2.1-12B-A2.5B-Thinking-CMF",
     "file": "mellum2.1-12b-a2.5b-thinking-q4tp.cmf",
@@ -15,7 +15,7 @@
       "f16": 141,
       "policy": "Q4TP expert matrices; Q8_2f always-active attention, embedding, and output matrices; F16 router and norms"
     },
-    "cortiq_version": "0.8.9"
+    "cortiq_version": "0.8.14"
   },
   "source": {
     "repository": "JetBrains/Mellum2.1-12B-A2.5B-Thinking",
@@ -25,7 +25,7 @@
     "chat_template_sha256": "4593a34d52f3364ac13ce57f4bea5688924e8942da6df8201e411db17e729f48"
   },
   "conversion": {
-    "command": "CMF_ENCODE_THREADS=112 cortiq convert --model /workspace/mellum-cmf/upstream --quant q4tp --output /workspace/mellum-cmf/out/mellum2.1-12b-a2.5b-thinking-q4tp.cmf",
+    "command": "CMF_ENCODE_THREADS=112 cortiq convert --model ./mellum-upstream --quant q4tp --output mellum2.1-12b-a2.5b-thinking-q4tp.cmf",
     "verification_after_conversion": "passed",
     "verification_scope": "CMF envelope, sections, tensor directory, and per-tensor hashes"
   },
@@ -34,6 +34,7 @@
       "id": "runpod-epyc-7663-cpu",
       "cpu": "AMD EPYC 7663",
       "logical_cpus": 112,
+      "container_cpu_quota_cores": 23.8,
       "ram_gib_approx": 251,
       "os": "Ubuntu 24.04 container",
       "accelerator_present_but_not_used": "NVIDIA RTX PRO 4500 Blackwell (32623 MiB)",
@@ -50,73 +51,75 @@
         "samples": [
           {
             "sample": 1,
-            "prefill_tokens_per_second": 30.5451,
-            "steady_decode_tokens_per_second": 41.258,
-            "ttft_seconds": 16.5323
+          "prefill_tokens_per_second": 36.68733191893246,
+          "steady_decode_tokens_per_second": 40.83872215900373,
+          "ttft_seconds": 13.770330692
           },
           {
             "sample": 2,
-            "prefill_tokens_per_second": 30.8812,
-            "steady_decode_tokens_per_second": 40.7382,
-            "ttft_seconds": 16.6234
+          "prefill_tokens_per_second": 38.47311195509964,
+          "steady_decode_tokens_per_second": 40.61548172203934,
+          "ttft_seconds": 13.486690498
           },
           {
             "sample": 3,
-            "prefill_tokens_per_second": 30.6842,
-            "steady_decode_tokens_per_second": 41.2662,
-            "ttft_seconds": 16.6462
+          "prefill_tokens_per_second": 38.40545158376237,
+          "steady_decode_tokens_per_second": 40.61762477215301,
+          "ttft_seconds": 13.531308871
           },
           {
             "sample": 4,
-            "prefill_tokens_per_second": 30.807,
-            "steady_decode_tokens_per_second": 40.5975,
-            "ttft_seconds": 15.8445
+          "prefill_tokens_per_second": 37.27846543637383,
+          "steady_decode_tokens_per_second": 40.73391360488646,
+          "ttft_seconds": 13.431651348
           },
           {
             "sample": 5,
-            "prefill_tokens_per_second": 31.4649,
-            "steady_decode_tokens_per_second": 40.7521,
-            "ttft_seconds": 16.3741
+          "prefill_tokens_per_second": 38.518351467459745,
+          "steady_decode_tokens_per_second": 41.23110817908527,
+          "ttft_seconds": 13.570826922
           }
         ],
         "median": {
-          "prefill_tokens_per_second": 30.807,
-          "steady_decode_tokens_per_second": 40.7521,
-          "ttft_seconds": 16.5323
+          "prefill_tokens_per_second": 38.40545158376237,
+          "steady_decode_tokens_per_second": 40.73391360488646,
+          "ttft_seconds": 13.531308871
         },
         "range": {
-          "prefill_tokens_per_second": [30.5451, 31.4649],
-          "steady_decode_tokens_per_second": [40.5975, 41.2662],
-          "ttft_seconds": [15.8445, 16.6462]
+          "prefill_tokens_per_second": [36.68733191893246, 38.518351467459745],
+          "steady_decode_tokens_per_second": [40.61548172203934, 41.23110817908527],
+          "ttft_seconds": [13.431651348, 13.770330692]
         },
         "kv_state_bytes_at_sequence_767": 87965696,
         "raw_file_names": [
-          "raw/bench/cpu-1.json",
-          "raw/bench/cpu-2.json",
-          "raw/bench/cpu-3.json",
-          "raw/bench/cpu-4.json",
-          "raw/bench/cpu-5.json"
+          "benchmarks/cpu/cpu-1.json",
+          "benchmarks/cpu/cpu-2.json",
+          "benchmarks/cpu/cpu-3.json",
+          "benchmarks/cpu/cpu-4.json",
+          "benchmarks/cpu/cpu-5.json"
         ]
       },
       "thread_calibration": {
         "command": "CMF_GPU=0 CMF_THREADS=N cortiq bench MODEL --ctx 512 --tokens 128 --core --ignore-eos --json",
         "scope": "one bounded run per value; host-specific tuning only",
         "steady_decode_tokens_per_second": {
-          "12": 30.5542,
-          "16": 34.986,
-          "20": 39.29,
-          "22": 40.23,
-          "24": 39.145,
-          "28": 36.203
+          "8": 26.36149488165558,
+          "12": 31.390149509878206,
+          "16": 36.857279912410014,
+          "20": 40.40911660928907,
+          "22": 41.749798350117665,
+          "24": 36.583243157871394,
+          "28": 37.39878687534889
         },
         "selected_workers": 22,
         "raw_file_names": [
-          "raw/tuning/threads-12.json",
-          "raw/tuning/threads-16.json",
-          "raw/tuning/threads-20.json",
-          "raw/tuning/threads-22.json",
-          "raw/tuning/threads-24.json",
-          "raw/tuning/threads-28.json"
+          "benchmarks/tuning/threads-8.json",
+          "benchmarks/tuning/threads-12.json",
+          "benchmarks/tuning/threads-16.json",
+          "benchmarks/tuning/threads-20.json",
+          "benchmarks/tuning/threads-22.json",
+          "benchmarks/tuning/threads-24.json",
+          "benchmarks/tuning/threads-28.json"
         ]
       }
     }
@@ -137,7 +140,18 @@
     "source_vs_cmf_fixed_greedy_smoke": {
       "prompts": 5,
       "exact_completion_matches_after_source_end_marker_normalization": 4,
-      "backend_pair": "source BF16 CUDA vs CMF Q4TP CPU"
+      "backend_pair": "source BF16 CUDA vs Cortiq 0.8.14 CMF Q4TP CPU",
+      "raw_paths": [
+        "benchmarks/source-suite.json",
+        "benchmarks/cmf-suite.json"
+      ]
+    },
+    "sliding_window_boundary_probe": {
+      "prompt_tokens": 1152,
+      "generated_tokens": 4,
+      "sequence_length_after_generation": 1155,
+      "sliding_window_tokens": 1024,
+      "raw_path": "benchmarks/cpu-swa-boundary-1152.json"
     },
     "quality_note": "The 5-prompt smoke is not a general task-quality score or a byte-identical upstream-parity claim."
   }
