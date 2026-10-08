@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "status": "FILL_ME_AFTER_EXECUTING_BENCHMARKS_MD",
+  "artifact": {
+    "repository": "infosave/Mellum2.1-12B-A2.5B-Thinking-CMF",
+    "file": "mellum2.1-12b-a2.5b-thinking-q4tp.cmf",
+    "sha256": "FILL_ME",
+    "bytes": null,
+    "cmf_directory_hash": "FILL_ME",
+    "quantization_policy": "FILL_ME",
+    "cortiq_version": "FILL_ME"
+  },
+  "source": {
+    "repository": "JetBrains/Mellum2.1-12B-A2.5B-Thinking",
+    "revision": "92ddae9fc7665e9f801d141d2e5a6b2caf2460c4",
+    "config_sha256": "FILL_ME",
+    "tokenizer_sha256": "FILL_ME",
+    "chat_template_sha256": "FILL_ME"
+  },
+  "integrity": {
+    "verified_after_conversion": null,
+    "verified_after_hf_download": null,
+    "raw_logs": []
+  },
+  "correctness": {
+    "fixed_prompt_suite": "FILL_ME",
+    "cpu_gpu_identical_outputs": null,
+    "source_vs_cmf_metric": "FILL_ME_OR_REMOVE",
+    "source_vs_cmf_value": null,
+    "raw_paths": []
+  },
+  "machines": [
+    {
+      "id": "FILL_ME",
+      "os": "FILL_ME",
+      "cpu": "FILL_ME",
+      "ram_bytes": null,
+      "adapter": "FILL_ME",
+      "driver": "FILL_ME",
+      "backend": "cpu|vulkan|metal",
+      "environment": {
+        "CMF_GPU": "FILL_ME",
+        "CMF_GPU_VRAM_MB": "unset_or_exact_value"
+      },
+      "benchmark": {
+        "command": "FILL_ME",
+        "context_tokens": 512,
+        "generated_tokens": 256,
+        "mode": "core|production",
+        "samples": [],
+        "raw_paths": []
+      }
+    }
+  ]
+}
