@@ -39,7 +39,8 @@
       "accelerator_present_but_not_used": "NVIDIA RTX PRO 4500 Blackwell (32623 MiB)",
       "backend": "cpu",
       "environment": {
-        "CMF_GPU": "0"
+        "CMF_GPU": "0",
+        "CMF_THREADS": "automatic (22 workers selected under a 23.8-core cgroup quota)"
       },
       "benchmark": {
         "command": "cortiq bench MODEL --ctx 512 --tokens 256 --core --ignore-eos --json",
@@ -95,6 +96,27 @@
           "raw/bench/cpu-3.json",
           "raw/bench/cpu-4.json",
           "raw/bench/cpu-5.json"
+        ]
+      },
+      "thread_calibration": {
+        "command": "CMF_GPU=0 CMF_THREADS=N cortiq bench MODEL --ctx 512 --tokens 128 --core --ignore-eos --json",
+        "scope": "one bounded run per value; host-specific tuning only",
+        "steady_decode_tokens_per_second": {
+          "12": 30.5542,
+          "16": 34.986,
+          "20": 39.29,
+          "22": 40.23,
+          "24": 39.145,
+          "28": 36.203
+        },
+        "selected_workers": 22,
+        "raw_file_names": [
+          "raw/tuning/threads-12.json",
+          "raw/tuning/threads-16.json",
+          "raw/tuning/threads-20.json",
+          "raw/tuning/threads-22.json",
+          "raw/tuning/threads-24.json",
+          "raw/tuning/threads-28.json"
         ]
       }
     }
