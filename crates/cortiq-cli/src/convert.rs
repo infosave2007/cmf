@@ -855,12 +855,13 @@ fn quant_for_tensor(arch: &ModelArch, name: &str, base: Quant) -> Quant {
     if arch.arch_name.eq_ignore_ascii_case("granite") && vocabulary_edges {
         return Quant::Q8_2f;
     }
-    // MiMo-V2: the routed experts (256 per layer, 8 active) are the whole
-    // memory wall and take the requested 4-/2-bit plane. Everything a token
-    // always traverses — q/k/v/o, the dense layer-0 MLP, the embedding and
-    // lm_head — stays q8_2f. (The router is f16 and the bias/sinks f32 by
-    // the force rules, before this policy is consulted.)
-    if arch.arch_name == MIMO_V2 {
+    // MiMo-V2 and Mellum are routed-MoE models whose expert banks dominate
+    // the file, while every token always traverses the attention stack and
+    // vocabulary edges.  Their q4tp profile therefore keeps the experts on
+    // the requested 4-/2-bit plane and the always-active skeleton at q8_2f.
+    // The router is f16 and norms are f16 by the emitter's force/shape rules
+    // before this policy is consulted.
+    if arch.arch_name == MIMO_V2 || arch.arch_name.eq_ignore_ascii_case("mellum") {
         return if name.contains(".mlp.experts.") {
             base
         } else {
@@ -3863,11 +3864,11 @@ fn layer_index_of(name: &str) -> Option<usize> {
 }
 
 /// The profile `cortiq convert` uses when `--quant` is not given (or is
-/// `auto`): q8 for every family, except MiMo-V2, whose 256 routed experts
-/// per layer make 8 bits pointless — it converts to q4tp, and its profile
-/// rule (`quant_for_tensor`) keeps the always-active skeleton at q8_2f.
+/// `auto`): q8 for every family, except the large routed-expert MiMo-V2 and
+/// Mellum profiles.  Those default to q4tp for the expert bank, while
+/// `quant_for_tensor` keeps the always-active skeleton at q8_2f.
 fn default_quant_for_arch(arch: &ModelArch) -> Quant {
-    if arch.arch_name == MIMO_V2 {
+    if arch.arch_name == MIMO_V2 || arch.arch_name.eq_ignore_ascii_case("mellum") {
         Quant::Q4TiledP
     } else {
         Quant::Q8Row
@@ -4069,18 +4070,23 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     } else {
         None
     };
-    // Qwen3.5 nests rope params under `rope_parameters`. Laguna goes one
-    // level deeper and carries independent full/sliding profiles.
+    // Qwen3.5 nests rope params under `rope_parameters`.  Laguna, Spark
+    // and Mellum go one level deeper and carry independent full/sliding
+    // profiles.  Mellum's full layers use YaRN while its sliding layers use
+    // ordinary RoPE, so flattening this distinction would make a file load
+    // but rotate one of the two layer classes with the wrong frequencies.
     let rope_root = tc.get("rope_parameters");
     // Spark-X2.5 nests its two profiles the same way.
     let is_laguna_config =
         model_type.eq_ignore_ascii_case("laguna") || model_type.eq_ignore_ascii_case("spark2_5");
-    let rope = if is_laguna_config {
+    let is_mellum_config = model_type.eq_ignore_ascii_case("mellum");
+    let is_dual_rope_config = is_laguna_config || is_mellum_config;
+    let rope = if is_dual_rope_config {
         rope_root.and_then(|r| r.get("full_attention"))
     } else {
         rope_root
     };
-    let local_rope = if is_laguna_config {
+    let local_rope = if is_dual_rope_config {
         rope_root.and_then(|r| r.get("sliding_attention"))
     } else {
         None
@@ -4353,6 +4359,10 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
                     .get("mscale_all_dim")
                     .and_then(|v| v.as_f64())
                     .map(|v| v as f32),
+                // Mellum gives the *full-attention* YaRN profile an explicit
+                // 1.277258... cos/sin scale.  Preserve that source value;
+                // the independent sliding profile is default RoPE and keeps
+                // the pipeline's local scale at its 1.0 default.
                 attention_factor: r
                     .get("attention_factor")
                     .and_then(|v| v.as_f64())
@@ -4661,6 +4671,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         sliding_window: cfg_usize(tc, "sliding_window").filter(|_| {
             is_laguna
                 || mt == "spark2_5"
+                || is_mellum_config
                 || is_gemma2
                 || is_gemma3n
                 || tc.get("sliding_window_pattern").is_some()
@@ -8401,6 +8412,128 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn mellum_config_keeps_dual_rope_swa_and_softmax_moe_contract() {
+        // JetBrains/Mellum2.1-12B-A2.5B-Thinking has three local layers
+        // followed by one full-context layer.  Its full layers use YaRN,
+        // while local layers deliberately stay on ordinary 500k-base RoPE.
+        // Keep the fixture small, but retain every architecture switch from
+        // the release config that affects a CMF forward pass.
+        let config = serde_json::json!({
+            "model_type": "mellum",
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "vocab_size": 100,
+            "max_position_embeddings": 131072,
+            "rms_norm_eps": 0.000001,
+            "hidden_act": "silu",
+            "tie_word_embeddings": false,
+            "sliding_window": 1024,
+            "layer_types": [
+                "sliding_attention", "sliding_attention",
+                "sliding_attention", "full_attention"
+            ],
+            "num_experts": 64,
+            "num_experts_per_tok": 8,
+            "moe_intermediate_size": 16,
+            "norm_topk_prob": true,
+            "rope_parameters": {
+                "full_attention": {
+                    "rope_type": "yarn",
+                    "rope_theta": 500000.0,
+                    "factor": 16.0,
+                    "original_max_position_embeddings": 8192,
+                    "beta_fast": 32.0,
+                    "beta_slow": 1.0,
+                    // This is applied by the full-attention YaRN profile;
+                    // the independent sliding default-RoPE profile stays 1.
+                    "attention_factor": 1.2772588722239782
+                },
+                "sliding_attention": {
+                    "rope_type": "default",
+                    "rope_theta": 500000.0
+                }
+            }
+        });
+
+        let arch = build_arch(&config).unwrap();
+        assert_eq!(arch.arch_name, "mellum");
+        assert_eq!(arch.max_position_embeddings, 131072);
+        assert_eq!(arch.norm_style, NormStyle::Qwen);
+        assert_eq!(
+            arch.layer_types,
+            vec![
+                LayerType::SlidingAttention,
+                LayerType::SlidingAttention,
+                LayerType::SlidingAttention,
+                LayerType::FullAttention,
+            ]
+        );
+        assert_eq!(arch.sliding_window, Some(1024));
+        assert_eq!(arch.sliding_window_pattern, None);
+        assert_eq!(arch.rope_theta, 500000.0);
+        assert_eq!(arch.rope_local_base_freq, Some(500000.0));
+        assert_eq!(arch.partial_rotary_factor, 1.0);
+        assert_eq!(arch.local_partial_rotary_factor, None);
+        let yarn = arch.yarn.as_ref().unwrap();
+        assert_eq!(yarn.factor, 16.0);
+        assert_eq!(yarn.original_max_position_embeddings, 8192);
+        assert_eq!(yarn.beta_fast, 32.0);
+        assert_eq!(yarn.beta_slow, 1.0);
+        assert_eq!(yarn.attention_factor, 1.2772588722239782);
+        let moe = arch.moe.as_ref().unwrap();
+        assert_eq!(moe.num_experts, 64);
+        assert_eq!(moe.top_k, 8);
+        assert_eq!(moe.moe_intermediate_size, 16);
+        assert!(moe.norm_topk_prob);
+        assert!(!moe.router_sigmoid);
+        assert_eq!(moe.shared_expert_intermediate_size, None);
+
+        // Mellum's 64-expert bank is the memory wall: both `auto` and an
+        // explicit q4tp request use q4tp for it, but retain every token's
+        // attention/vocabulary skeleton at q8_2f.  The router is protected
+        // independently by the f16 force rule; vector norms take the f16
+        // emitter path.
+        assert_eq!(default_quant_for_arch(&arch), Quant::Q4TiledP);
+        for requested in [default_quant_for_arch(&arch), Quant::Q4TiledP] {
+            assert_eq!(
+                profile_quant(&arch, requested, "model.layers.0.mlp.experts.3.gate_proj.weight"),
+                Quant::Q4TiledP
+            );
+            assert_eq!(
+                profile_quant(&arch, requested, "model.layers.0.mlp.experts.3.up_proj.weight"),
+                Quant::Q4TiledP
+            );
+            assert_eq!(
+                profile_quant(&arch, requested, "model.layers.0.mlp.experts.3.down_proj.weight"),
+                Quant::Q4TiledP
+            );
+            assert_eq!(
+                profile_quant(&arch, requested, "model.layers.0.self_attn.q_proj.weight"),
+                Quant::Q8_2f
+            );
+            assert_eq!(
+                profile_quant(&arch, requested, "model.embed_tokens.weight"),
+                Quant::Q8_2f
+            );
+            assert_eq!(profile_quant(&arch, requested, "lm_head.weight"), Quant::Q8_2f);
+        }
+        assert!(force_f16("model.layers.0.mlp.gate.weight"));
+        assert_eq!(
+            profile_quant(
+                &arch,
+                Quant::F16,
+                "model.layers.0.mlp.experts.3.gate_proj.weight"
+            ),
+            Quant::F16,
+            "an explicit f16 conversion remains an exact-parity path"
+        );
+    }
+
+    #[test]
     fn exec_order_lays_out_by_layer_then_block() {
         // Alphabetical order (the safetensors default) would put layer 10 before
         // layer 2 and the router after the experts — the exec-order key fixes both.
@@ -9815,6 +9948,233 @@ pub(crate) mod tests {
         let model = CmfModel::open(&out).unwrap();
         assert_eq!(model.arch().vocab_size, 32);
         assert_eq!(model.arch().num_layers, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tiny_mellum_auto_converts_loads_and_executes_its_dual_rope_schedule() {
+        // A generated, fully-shaped Mellum fixture is intentionally used
+        // instead of upstream weights.  It crosses the converter, CMF
+        // directory, generic MoE loader and one real forward pass, including
+        // all three local-attention layers and the YaRN full-attention layer.
+        let dir = std::env::temp_dir().join(format!(
+            "cortiq-mellum-convtest-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let config = serde_json::json!({
+            "model_type": "mellum",
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "vocab_size": 32,
+            "max_position_embeddings": 131072,
+            "rms_norm_eps": 0.000001,
+            "hidden_act": "silu",
+            "tie_word_embeddings": false,
+            "sliding_window": 1024,
+            "layer_types": [
+                "sliding_attention", "sliding_attention",
+                "sliding_attention", "full_attention"
+            ],
+            "num_experts": 2,
+            "num_experts_per_tok": 1,
+            "moe_intermediate_size": 32,
+            "norm_topk_prob": true,
+            "rope_parameters": {
+                "full_attention": {
+                    "rope_type": "yarn",
+                    "rope_theta": 500000.0,
+                    "factor": 16.0,
+                    "original_max_position_embeddings": 8192,
+                    "beta_fast": 32.0,
+                    "beta_slow": 1.0,
+                    "attention_factor": 1.2772588722239782
+                },
+                "sliding_attention": {
+                    "rope_type": "default",
+                    "rope_theta": 500000.0
+                }
+            }
+        });
+        fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        // Valid minimal HF tokenizer JSON.  The test drives `forward_ids`,
+        // but embedding this makes the runnable CMF's tokenizer path real.
+        fs::write(
+            dir.join("tokenizer.json"),
+            r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1},"merges":[]}}"#,
+        )
+        .unwrap();
+
+        let values = |n: usize, salt: usize| {
+            (0..n)
+                .map(|i| ((i + salt) as f32 * 0.017).sin() * 0.05)
+                .collect::<Vec<_>>()
+        };
+        let mut tensors: Vec<(String, Vec<usize>, Vec<f32>)> = vec![
+            (
+                "model.embed_tokens.weight".into(),
+                vec![32, 32],
+                values(32 * 32, 1),
+            ),
+            ("lm_head.weight".into(), vec![32, 32], values(32 * 32, 2)),
+            ("model.norm.weight".into(), vec![32], vec![1.0; 32]),
+        ];
+        for li in 0..4 {
+            let p = format!("model.layers.{li}.");
+            tensors.extend([
+                (
+                    format!("{p}input_layernorm.weight"),
+                    vec![32],
+                    vec![1.0; 32],
+                ),
+                (
+                    format!("{p}post_attention_layernorm.weight"),
+                    vec![32],
+                    vec![1.0; 32],
+                ),
+                (
+                    format!("{p}self_attn.q_proj.weight"),
+                    vec![32, 32],
+                    values(32 * 32, 10 + li),
+                ),
+                (
+                    format!("{p}self_attn.k_proj.weight"),
+                    vec![8, 32],
+                    values(8 * 32, 20 + li),
+                ),
+                (
+                    format!("{p}self_attn.v_proj.weight"),
+                    vec![8, 32],
+                    values(8 * 32, 30 + li),
+                ),
+                (
+                    format!("{p}self_attn.o_proj.weight"),
+                    vec![32, 32],
+                    values(32 * 32, 40 + li),
+                ),
+                (
+                    format!("{p}self_attn.q_norm.weight"),
+                    vec![8],
+                    vec![1.0; 8],
+                ),
+                (
+                    format!("{p}self_attn.k_norm.weight"),
+                    vec![8],
+                    vec![1.0; 8],
+                ),
+                (
+                    format!("{p}mlp.gate.weight"),
+                    vec![2, 32],
+                    values(2 * 32, 50 + li),
+                ),
+            ]);
+            for expert in 0..2 {
+                let ep = format!("{p}mlp.experts.{expert}.");
+                tensors.extend([
+                    (
+                        format!("{ep}gate_proj.weight"),
+                        vec![32, 32],
+                        values(32 * 32, 60 + li * 2 + expert),
+                    ),
+                    (
+                        format!("{ep}up_proj.weight"),
+                        vec![32, 32],
+                        values(32 * 32, 70 + li * 2 + expert),
+                    ),
+                    (
+                        format!("{ep}down_proj.weight"),
+                        vec![32, 32],
+                        values(32 * 32, 80 + li * 2 + expert),
+                    ),
+                ]);
+            }
+        }
+        let refs: Vec<(&str, Vec<usize>, Vec<f32>)> = tensors
+            .iter()
+            .map(|(name, shape, vals)| (name.as_str(), shape.clone(), vals.clone()))
+            .collect();
+        fs::write(dir.join("model.safetensors"), tiny_safetensors(&refs)).unwrap();
+        let out = dir.join("tiny-mellum.cmf");
+        run_convert(
+            dir.to_str().unwrap(),
+            AUTO_QUANT,
+            out.to_str().unwrap(),
+            None,
+            None,
+            None,
+            false,
+            |_| {},
+        )
+        .unwrap();
+
+        let model = std::sync::Arc::new(CmfModel::open(&out).unwrap());
+        assert!(model.verify().is_empty(), "CMF verify: {:?}", model.verify());
+        assert_eq!(model.arch().sliding_window, Some(1024));
+        assert_eq!(
+            model.arch().yarn.as_ref().unwrap().attention_factor,
+            1.2772588722239782
+        );
+        // The Mellum `auto` profile is intentionally mixed: its sparse
+        // expert bank is q4tp, the always-active attention/vocabulary
+        // skeleton is q8_2f, and the router/norms remain f16.
+        let dtype = |name: &str| model.tensor(name).unwrap().dtype;
+        assert_eq!(dtype("model.embed_tokens.weight"), TensorDtype::Q8_2f);
+        assert_eq!(dtype("lm_head.weight"), TensorDtype::Q8_2f);
+        assert_eq!(
+            dtype("model.layers.0.self_attn.q_proj.weight"),
+            TensorDtype::Q8_2f
+        );
+        assert_eq!(
+            dtype("model.layers.0.mlp.experts.0.gate_proj.weight"),
+            TensorDtype::Q4TiledP
+        );
+        assert_eq!(
+            dtype("model.layers.0.mlp.experts.0.up_proj.weight"),
+            TensorDtype::Q4TiledP
+        );
+        assert_eq!(
+            dtype("model.layers.0.mlp.experts.0.down_proj.weight"),
+            TensorDtype::Q4TiledP
+        );
+        assert_eq!(dtype("model.layers.0.mlp.gate.weight"), TensorDtype::F16);
+        assert_eq!(
+            dtype("model.layers.0.input_layernorm.weight"),
+            TensorDtype::F16
+        );
+        let mut pipeline = cortiq_engine::Pipeline::from_model(
+            &model,
+            cortiq_engine::sampler::SamplerConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(pipeline.swa, Some((1024, usize::MAX)));
+        assert_eq!(
+            pipeline.sliding_layers,
+            Some(vec![true, true, true, false])
+        );
+        assert_eq!(pipeline.rope_base, 500000.0);
+        assert_eq!(pipeline.rope_scale, 1.2772588722239782);
+        assert_eq!(pipeline.rope_scale_local, 1.0);
+        let full_yarn = cortiq_engine::attention::yarn_inv_freq(8, 500000.0, 16.0, 8192, 32.0, 1.0);
+        let local_rope = cortiq_engine::attention::rope_inv_freq(8, 500000.0);
+        assert_eq!(pipeline.inv_freq.as_slice(), full_yarn.as_slice());
+        assert_eq!(pipeline.inv_freq_local.as_ref().unwrap().as_slice(), local_rope.as_slice());
+        assert_ne!(full_yarn, local_rope, "full YaRN must not use the local profile");
+        assert_eq!(pipeline.rotary_dim_local, Some(8));
+        let logits = pipeline.forward_ids(&[0, 1], None).unwrap();
+        assert_eq!(logits.len(), 32);
+        assert!(logits.iter().all(|v| v.is_finite()));
+
+        drop(pipeline);
+        drop(model);
         let _ = fs::remove_dir_all(&dir);
     }
 
