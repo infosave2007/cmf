@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.14] - 2026-10-08
+
+### Added
+- Mellum2.1 12B-A2.5B Thinking CMF conversion support, preserving the
+  upstream dual RoPE profiles (full-attention YaRN and local sliding RoPE),
+  the three-sliding/one-full attention schedule, top-8 routing, and tokenizer
+  and chat-template metadata. The release model card includes artifact
+  provenance and measured CPU results; it does not claim unverified full-model
+  GPU throughput or broad quality parity.
+- A focused top-8 Q4TP MoE kernel correctness test for the Vulkan/wgpu and
+  native Metal paths.
+
 ## [0.8.13] - 2026-10-05
 
 ### Changed
