@@ -19,7 +19,8 @@ they were the same experiment.
 
 **Host:** shared RunPod machine with AMD EPYC 7663, 112 logical CPUs, and
 approximately 251 GiB RAM. The attached RTX PRO 4500 Blackwell GPU (32,623 MiB) was not used
-for these CPU measurements.
+for these CPU measurements. The container had a 23.8-core CPU quota; the
+runtime's automatic policy selected a 22-worker pool.
 
 **Command:**
 
@@ -46,6 +47,14 @@ not a request latency or service-throughput SLA.
 
 The model's observed KV state at sequence 767 was 87,965,696 bytes. That is a
 KV-state observation, not total process memory or a 131K-context measurement.
+
+### Worker-pool calibration
+
+Before the five-sample record above, one bounded 512-context / 128-generation
+core run was made for each worker count. The automatic 22-worker setting gave
+the highest steady decode of the tested values (40.23 tok/s); forcing more
+workers did not help on this quota (24: 39.15; 28: 36.20 tok/s). This is a
+host-specific tuning check, not a cross-machine performance claim.
 
 ## Scope and validation
 
