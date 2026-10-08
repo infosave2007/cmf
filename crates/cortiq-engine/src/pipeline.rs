@@ -3682,6 +3682,13 @@ impl Pipeline {
         self.calib_temp
     }
 
+    /// The primary (full-attention) RoPE inverse-frequency table selected
+    /// from the CMF architecture.  This is read-only diagnostic state for
+    /// parity checks; local sliding layers may use `inv_freq_local` instead.
+    pub fn rope_inv_freq(&self) -> &[f32] {
+        self.inv_freq.as_slice()
+    }
+
     /// Partial rotary (Qwen3.5): rotate only the first `rotary_dim` dims;
     /// the frequency table is rebuilt over the rotary dims.
     pub fn set_rotary(&mut self, rotary_dim: usize, base: f32) {
@@ -19025,6 +19032,30 @@ mod tests {
         assert_ne!(r2.finish_reason, "cancelled");
     }
     use super::*;
+
+    #[test]
+    fn explicit_sliding_schedule_selects_local_rope_profile() {
+        // Mellum alternates three local 1,024-token layers with one global
+        // YaRN layer.  An explicit schedule deliberately overrides the
+        // cadence sentinel in `swa`, so test both RoPE table and scale
+        // dispatch rather than merely checking that the metadata loaded.
+        let mut p = create_test_pipeline(32, 64, 4, 1, 8, 4, 32);
+        p.swa = Some((1024, usize::MAX));
+        p.sliding_layers = Some(vec![true, true, true, false]);
+        p.inv_freq = std::sync::Arc::new(vec![0.125; 4]);
+        p.inv_freq_local = Some(std::sync::Arc::new(vec![0.25; 4]));
+        p.rope_scale = 1.277_258_9;
+        p.rope_scale_local = 1.0;
+
+        for li in 0..3 {
+            assert_eq!(p.layer_window(li), Some(1024), "local layer {li}");
+            assert_eq!(p.layer_inv_freq(li).as_slice(), &[0.25; 4]);
+            assert_eq!(p.layer_rope_scale(li), 1.0, "local layer {li}");
+        }
+        assert_eq!(p.layer_window(3), None);
+        assert_eq!(p.layer_inv_freq(3).as_slice(), &[0.125; 4]);
+        assert_eq!(p.layer_rope_scale(3), 1.277_258_9);
+    }
 
     /// sparse_ffn_quant must equal a dense FFN where inactive neurons are
     /// zeroed (mask × mmap correctness). On F32 tensors this is EXACT —
