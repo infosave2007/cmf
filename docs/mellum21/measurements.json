@@ -43,7 +43,7 @@
         "CMF_GPU": "0",
         "CMF_THREADS": "automatic (22 workers selected under a 23.8-core cgroup quota)"
       },
-      "benchmark": {
+    "benchmark": {
         "command": "cortiq bench MODEL --ctx 512 --tokens 256 --core --ignore-eos --json",
         "context_tokens": 512,
         "generated_tokens": 256,
@@ -120,6 +120,16 @@
           "benchmarks/tuning/threads-22.json",
           "benchmarks/tuning/threads-24.json",
           "benchmarks/tuning/threads-28.json"
+        ]
+      },
+      "resource_observation": {
+        "command": "CMF_GPU=0 cortiq run MODEL --prompt 'Return exactly: 2 + 2 = 4' --greedy --max-tokens 16",
+        "scope": "one short-prompt CPU smoke run, not a max-context result",
+        "max_rss_mib": 4749.60546875,
+        "elapsed_wall_seconds": 1.2375612705945969,
+        "raw_paths": [
+          "benchmarks/cpu-memory-smoke.json",
+          "benchmarks/cpu-memory-smoke.txt"
         ]
       }
     }
