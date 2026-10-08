@@ -1,152 +1,71 @@
-# Mellum2.1 CMF: release benchmark protocol
+# Mellum2.1 CMF — measurement record
 
-This is a release gate, not a marketing template. A number belongs on the model
-card only when its raw command output, artifact hash and hardware record are
-kept with the release. Do not compare a cold run with a warm run, CPU with GPU,
-or different context lengths in one column.
+This document records only measured results for the release artifact. It does
+not compare CPU and GPU figures, or CMF and the upstream checkpoint, as though
+they were the same experiment.
 
-## 1. Freeze inputs before measuring
+## Artifact under test
 
-Record these once for each candidate artifact:
+| Field | Value |
+|---|---|
+| File | `mellum2.1-12b-a2.5b-thinking-q4tp.cmf` |
+| Size | 6,884,556,163 bytes (6.41 GiB) |
+| SHA-256 | `1734d8c585134547efa6eb60f092fd741135fe0f398fe9dc77ab4b97df6a7175` |
+| Cortiq | 0.8.9 |
+| Integrity | `cortiq verify` passed after conversion: envelope, sections, 5,631 directory entries, and per-tensor hashes |
+| Quantization | 5,376 Q4TP tensors; 114 Q8_2f tensors; 141 F16 tensors |
 
-```bash
-MODEL='mellum2.1-12b-a2.5b-thinking-q4tp.cmf'
-sha256sum "$MODEL"
-cortiq --version
-cortiq info "$MODEL"
-cortiq verify "$MODEL"
-```
+## CPU core benchmark
 
-Record the upstream revision and hashes used by conversion:
+**Host:** shared RunPod machine with AMD EPYC 7663, 112 logical CPUs, and
+approximately 251 GiB RAM. The attached RTX PRO 4500 Blackwell GPU (32,623 MiB) was not used
+for these CPU measurements.
 
-```bash
-sha256sum mellum-upstream/config.json \
-          mellum-upstream/tokenizer.json \
-          mellum-upstream/chat_template.jinja
-```
-
-The upstream revision for this release candidate is
-`92ddae9fc7665e9f801d141d2e5a6b2caf2460c4`. If the conversion used another
-revision, publish that fact rather than relabeling the artifact.
-
-## 2. Correctness gate
-
-1. `cortiq verify "$MODEL"` must pass after conversion **and again after the
-   artifact is downloaded from Hugging Face**.
-2. Save deterministic CPU greedy outputs for a fixed prompt set. Re-run the
-   same commands with the GPU selection being tested. Report whether each
-   output is identical; if not, retain both outputs and explain the observed
-   difference rather than calling it parity.
-3. Record the converter's architecture/template/tokenizer test result and the
-   exact test command. Do not claim upstream-model parity unless a published
-   harness and its raw results measure it.
-4. For a quantization-quality comparison, score the same held-out text and
-   token budget for every profile. `cortiq ppl` provides a reproducible
-   CMF-side gate; it is not a substitute for an upstream task benchmark.
-
-Example fixed CPU/GPU smoke contract:
+**Command:**
 
 ```bash
-mkdir -p raw/outputs
-PROMPT='Implement a Python function that returns the first non-repeating character.'
-
-CMF_GPU=0 cortiq run "$MODEL" --prompt "$PROMPT" --greedy --max-tokens 256 \
-  > raw/outputs/cpu.txt
-CMF_GPU=wgpu XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}" \
-  cortiq run "$MODEL" --prompt "$PROMPT" --greedy --max-tokens 256 \
-  > raw/outputs/vulkan.txt
-
-diff -u raw/outputs/cpu.txt raw/outputs/vulkan.txt \
-  | tee raw/outputs/cpu-vulkan.diff
-```
-
-For a Metal run, replace `CMF_GPU=wgpu` with `CMF_GPU=1`. A non-empty diff is
-evidence to investigate, not a reason to hide the output. On a quantized file,
-upstream BF16 and CMF need not produce byte-identical completions; label any
-source-vs-CMF comparison with its actual metric and prompt suite.
-
-Example CMF-side perplexity record (supply a redistributable held-out text
-file and its SHA-256):
-
-```bash
-sha256sum evaluation/heldout.txt
-CMF_GPU=0 cortiq ppl "$MODEL" --file evaluation/heldout.txt --tokens 4096 \
-  | tee raw/ppl-cpu.txt
-```
-
-## 3. Throughput protocol
-
-Use the same artifact, context length, generated-token count and benchmark mode
-for every backend. The command below uses Cortiq's synthetic 512-token context,
-256 generated tokens, greedy core timing, and EOS suppression. It reports
-machine-readable JSON. Run five independent processes so that run-to-run
-variation is visible; `cortiq bench` itself performs an untimed warm-up.
-
-```bash
-mkdir -p raw/bench
-
-# CPU reference
 for i in 1 2 3 4 5; do
-  CMF_GPU=0 cortiq bench "$MODEL" --ctx 512 --tokens 256 --core --ignore-eos --json \
-    | tee "raw/bench/cpu-${i}.json"
-done
-
-# Linux Vulkan / wgpu candidate
-for i in 1 2 3 4 5; do
-  CMF_GPU=wgpu XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}" \
-    cortiq bench "$MODEL" --ctx 512 --tokens 256 --core --ignore-eos --json \
-    | tee "raw/bench/vulkan-${i}.json"
-done
-
-# macOS Metal candidate
-for i in 1 2 3 4 5; do
-  CMF_GPU=1 cortiq bench "$MODEL" --ctx 512 --tokens 256 --core --ignore-eos --json \
-    | tee "raw/bench/metal-${i}.json"
+  CMF_GPU=0 cortiq bench "$MODEL" \
+    --ctx 512 --tokens 256 --core --ignore-eos --json \
+    > "raw/bench/cpu-${i}.json"
 done
 ```
 
-Do not publish a GPU value when the JSON or stderr says the graph fell back,
-weights were repeatedly uploaded, or the selected adapter is unknown. Keep
-`CMF_GPU_VRAM_MB` unset for an automatic-budget result; if it is set, record
-the exact value and label the result as a constrained-budget run.
+Each sample was a separate process. `--core` reports model-core timing; it is
+not a request latency or service-throughput SLA.
 
-For production-loop measurements, repeat the same protocol **without**
-`--core`, place it in a separate table, and do not present it as the same
-metric as core decode.
+| Sample | Prefill tok/s | Steady decode tok/s | TTFT (s) |
+|---:|---:|---:|---:|
+| 1 | 30.5451 | 41.2580 | 16.5323 |
+| 2 | 30.8812 | 40.7382 | 16.6234 |
+| 3 | 30.6842 | 41.2662 | 16.6462 |
+| 4 | 30.8070 | 40.5975 | 15.8445 |
+| 5 | 31.4649 | 40.7521 | 16.3741 |
+| **median** | **30.8070** | **40.7521** | **16.5323** |
+| **range** | **30.5451–31.4649** | **40.5975–41.2662** | **15.8445–16.6462** |
 
-## 4. Hardware and software record
+The model's observed KV state at sequence 767 was 87,965,696 bytes. That is a
+KV-state observation, not total process memory or a 131K-context measurement.
 
-Save the output that applies to the test machine; unavailable commands are
-allowed to fail, but should be noted rather than silently omitted:
+## Scope and validation
 
-```bash
-{
-  date -u +'%Y-%m-%dT%H:%M:%SZ'
-  uname -a
-  cortiq --version
-  cortiq gpu
-  command -v lscpu >/dev/null && lscpu
-  command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
-  command -v vulkaninfo >/dev/null && vulkaninfo --summary
-  command -v system_profiler >/dev/null && system_profiler SPDisplaysDataType
-} | tee raw/hardware.txt
-```
+- The release artifact passed `cortiq verify` on the conversion host.
+- The converter/runtime regression tests cover Mellum's full-vs-sliding RoPE
+  schedule, top-8 MoE, mixed tensor profile, and a tiny forward pass.
+- A local OpenAI-compatible API smoke request completed against the converted
+  artifact.
+- A fixed five-prompt greedy smoke suite paired the source BF16 CUDA model and
+  this CMF CPU artifact. Four of five completions matched exactly after
+  normalizing the source end marker. This is a functional smoke check, **not**
+  a task-quality score or a claim of byte-identical upstream parity.
 
-Also record the OS image/container, driver, adapter name, RAM, declared VRAM,
-Cortiq version, artifact SHA-256, environment variables and whether the model
-was reloaded between samples.
+No end-to-end Metal or Vulkan model throughput number is published in this
+release. On the benchmark pod, Vulkan exposed llvmpipe rather than the NVIDIA
+adapter because the NVIDIA ICD was unavailable in the container. The runtime's
+generic selected-top-8 Q4TP MoE kernel has component coverage on Metal and
+wgpu; that is deliberately not presented as a full-model benchmark.
 
-## 5. Card table to fill from raw results
-
-Publish medians over the five JSON files, plus the range. Values below are
-intentionally blank until measured.
-
-| Artifact SHA-256 | Backend | Adapter / CPU | Context | Mode | Prefill tok/s | Steady decode tok/s (median; range) | TTFT | VRAM / RAM observation | Raw files |
-|---|---|---|---:|---|---:|---:|---:|---|---|
-| **FILL** | CPU | **FILL** | 512 | core | **FILL** | **FILL** | **FILL** | **FILL** | `raw/bench/cpu-*.json` |
-| **FILL** | Vulkan | **FILL** | 512 | core | **FILL** | **FILL** | **FILL** | **FILL** | `raw/bench/vulkan-*.json` |
-| **FILL** | Metal | **FILL** | 512 | core | **FILL** | **FILL** | **FILL** | **FILL** | `raw/bench/metal-*.json` |
-
-Attach `measurements.template.json` as `measurements.json` only after replacing
-all `FILL_ME` values and adding the raw-file paths. Never convert an empty
-field into a performance claim.
+The structured copy of this record is [measurements.json](measurements.json).
+For a new benchmark, retain the emitted JSON, exact environment, selected
+adapter, artifact SHA-256, context, generation budget, and whether a model was
+reloaded between samples.

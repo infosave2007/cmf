@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "record_status": "measured_cpu_release_candidate",
+  "artifact": {
+    "repository": "infosave/Mellum2.1-12B-A2.5B-Thinking-CMF",
+    "file": "mellum2.1-12b-a2.5b-thinking-q4tp.cmf",
+    "sha256": "1734d8c585134547efa6eb60f092fd741135fe0f398fe9dc77ab4b97df6a7175",
+    "bytes": 6884556163,
+    "reported_size_gib": 6.41,
+    "reported_size_gb": 6.885,
+    "cmf_directory_entries": 5631,
+    "tensor_profile": {
+      "q4tp": 5376,
+      "q8_2f": 114,
+      "f16": 141,
+      "policy": "Q4TP expert matrices; Q8_2f always-active attention, embedding, and output matrices; F16 router and norms"
+    },
+    "cortiq_version": "0.8.9"
+  },
+  "source": {
+    "repository": "JetBrains/Mellum2.1-12B-A2.5B-Thinking",
+    "revision": "92ddae9fc7665e9f801d141d2e5a6b2caf2460c4",
+    "config_sha256": "f43d018246094dee6dca455b3072766b6acbefd1ac8e7fe664df34710606a541",
+    "tokenizer_sha256": "58548a346eb073e5132bf7d8ad17dc6971bca36ade378ca4d2bfbc49bf60da2a",
+    "chat_template_sha256": "4593a34d52f3364ac13ce57f4bea5688924e8942da6df8201e411db17e729f48"
+  },
+  "conversion": {
+    "command": "CMF_ENCODE_THREADS=112 cortiq convert --model /workspace/mellum-cmf/upstream --quant q4tp --output /workspace/mellum-cmf/out/mellum2.1-12b-a2.5b-thinking-q4tp.cmf",
+    "verification_after_conversion": "passed",
+    "verification_scope": "CMF envelope, sections, tensor directory, and per-tensor hashes"
+  },
+  "machines": [
+    {
+      "id": "runpod-epyc-7663-cpu",
+      "cpu": "AMD EPYC 7663",
+      "logical_cpus": 112,
+      "ram_gib_approx": 251,
+      "os": "Ubuntu 24.04 container",
+      "accelerator_present_but_not_used": "NVIDIA RTX PRO 4500 Blackwell (32623 MiB)",
+      "backend": "cpu",
+      "environment": {
+        "CMF_GPU": "0"
+      },
+      "benchmark": {
+        "command": "cortiq bench MODEL --ctx 512 --tokens 256 --core --ignore-eos --json",
+        "context_tokens": 512,
+        "generated_tokens": 256,
+        "mode": "core",
+        "samples": [
+          {
+            "sample": 1,
+            "prefill_tokens_per_second": 30.5451,
+            "steady_decode_tokens_per_second": 41.258,
+            "ttft_seconds": 16.5323
+          },
+          {
+            "sample": 2,
+            "prefill_tokens_per_second": 30.8812,
+            "steady_decode_tokens_per_second": 40.7382,
+            "ttft_seconds": 16.6234
+          },
+          {
+            "sample": 3,
+            "prefill_tokens_per_second": 30.6842,
+            "steady_decode_tokens_per_second": 41.2662,
+            "ttft_seconds": 16.6462
+          },
+          {
+            "sample": 4,
+            "prefill_tokens_per_second": 30.807,
+            "steady_decode_tokens_per_second": 40.5975,
+            "ttft_seconds": 15.8445
+          },
+          {
+            "sample": 5,
+            "prefill_tokens_per_second": 31.4649,
+            "steady_decode_tokens_per_second": 40.7521,
+            "ttft_seconds": 16.3741
+          }
+        ],
+        "median": {
+          "prefill_tokens_per_second": 30.807,
+          "steady_decode_tokens_per_second": 40.7521,
+          "ttft_seconds": 16.5323
+        },
+        "range": {
+          "prefill_tokens_per_second": [30.5451, 31.4649],
+          "steady_decode_tokens_per_second": [40.5975, 41.2662],
+          "ttft_seconds": [15.8445, 16.6462]
+        },
+        "kv_state_bytes_at_sequence_767": 87965696,
+        "raw_file_names": [
+          "raw/bench/cpu-1.json",
+          "raw/bench/cpu-2.json",
+          "raw/bench/cpu-3.json",
+          "raw/bench/cpu-4.json",
+          "raw/bench/cpu-5.json"
+        ]
+      }
+    }
+  ],
+  "gpu_results": {
+    "end_to_end_model_benchmark_published": false,
+    "reason": "The RunPod container exposed only llvmpipe to Vulkan because the NVIDIA ICD was unavailable. No complete, reproducible end-to-end GPU hardware record is included in this release; do not infer GPU throughput from the CPU table or component tests."
+  },
+  "functional_validation": {
+    "converter_regression_scope": [
+      "dual RoPE schedule",
+      "sliding-attention metadata",
+      "top-8 MoE contract",
+      "mixed tensor profile",
+      "tiny real forward pass"
+    ],
+    "local_openai_compatible_api_smoke": "passed",
+    "source_vs_cmf_fixed_greedy_smoke": {
+      "prompts": 5,
+      "exact_completion_matches_after_source_end_marker_normalization": 4,
+      "backend_pair": "source BF16 CUDA vs CMF Q4TP CPU"
+    },
+    "quality_note": "The 5-prompt smoke is not a general task-quality score or a byte-identical upstream-parity claim."
+  }
+}

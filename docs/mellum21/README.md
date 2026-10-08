@@ -1,68 +1,50 @@
 ---
 license: apache-2.0
-library_name: cortiq
 base_model: JetBrains/Mellum2.1-12B-A2.5B-Thinking
 base_model_relation: quantized
+library_name: cortiq
 pipeline_tag: text-generation
 tags:
   - cmf
   - cortiq
-  - quantized
+  - local-inference
+  - code-generation
   - moe
-  - mellum
-  - code
+  - quantized
   - reasoning
   - thinking
   - vulkan
   - metal
-language:
-  - en
 ---
 
-<!--
-RELEASE GATE — complete the artifact table and provenance fields from the
-actual build before publishing. Do not replace them with estimates, and do not
-add a throughput or quality claim without the raw command output described in
-BENCHMARKS.md.
--->
+# Mellum2.1 12B-A2.5B Thinking · CMF
 
-# Mellum2.1 Thinking · CMF
-
-A single-file CMF release of
+A ready-to-run CMF conversion of
 [JetBrains/Mellum2.1-12B-A2.5B-Thinking](https://huggingface.co/JetBrains/Mellum2.1-12B-A2.5B-Thinking)
-for the Cortiq runtime. It is a conversion and quantization of the upstream
-checkpoint, **not** a new fine-tune or a claim that quantization preserves every
-output exactly.
+for local inference with [Cortiq](https://github.com/infosave2007/cmf).
+It keeps the upstream tokenizer and chat template in one memory-mapped `.cmf`
+file. This is a quantized conversion, not a fine-tune or a new foundation
+model.
 
-CMF stores the model payload, tokenizer and chat metadata in one memory-mapped
-file and records structural and per-tensor integrity metadata. Use
-`cortiq verify` after every download; verification establishes file integrity,
-not model quality or safety.
+## At a glance
 
-## Release manifest
-
-| Field | Release value |
+| | |
 |---|---|
-| CMF artifact | `mellum2.1-12b-a2.5b-thinking-q4tp.cmf` <!-- FILL: change only if the final artifact name differs. --> |
-| Cortiq CLI minimum | **FILL FROM THE RELEASE BUILD** |
-| Quantization policy | **FILL FROM THE CONVERSION MANIFEST** |
-| File size | **FILL FROM THE UPLOADED FILE** |
-| SHA-256 | **FILL FROM THE UPLOADED FILE** |
-| CMF directory hash | **FILL FROM `cortiq info` / release record** |
-| Source revision | [`92ddae9fc7665e9f801d141d2e5a6b2caf2460c4`](https://huggingface.co/JetBrains/Mellum2.1-12B-A2.5B-Thinking/tree/92ddae9fc7665e9f801d141d2e5a6b2caf2460c4) |
-| Conversion command | **FILL WITH THE EXACT RELEASE COMMAND** |
+| Base checkpoint | Mellum2.1 12B-A2.5B Thinking (Apache-2.0) |
+| Architecture | 28-layer MoE; 64 experts, top-8 routing; 12.15B total / 2.5B active parameters |
+| Attention | 21 sliding-window layers (1,024 tokens) + 7 full-attention YaRN layers; declared 131,072-token context |
+| CMF profile | Expert matrices: Q4TP · always-active attention, embedding and output: Q8_2f · router and norms: F16 |
+| Artifact | `mellum2.1-12b-a2.5b-thinking-q4tp.cmf` · 6,884,556,163 bytes (6.41 GiB) |
+| Verified with | Cortiq CLI 0.8.9 |
+| Artifact SHA-256 | `1734d8c585134547efa6eb60f092fd741135fe0f398fe9dc77ab4b97df6a7175` |
 
-The pinned upstream configuration identifies Mellum as a 28-layer MoE language
-model with 64 experts and top-8 routing (12B total / 2.5B active parameters),
-with a mixture of sliding-window and full-attention layers. The conversion must
-preserve that declared architecture, the tokenizer and the upstream chat
-template; the release provenance record is the authority for what was actually
-included.
+The mixed profile spends precision where every token passes and compresses the
+sparse expert bank. It is intentionally not described as lossless: quantization
+can change logits and completions.
 
-## Quick start
+## Run locally
 
-Install the current Cortiq CLI, download the published artifact, then verify it
-before running it:
+Install Cortiq, fetch the single file, and verify it before execution:
 
 ```bash
 cargo install cortiq-cli --locked
@@ -72,25 +54,28 @@ MODEL='mellum2.1-12b-a2.5b-thinking-q4tp.cmf'
 curl --fail --location --output "$MODEL" \
   "https://huggingface.co/${REPO}/resolve/main/${MODEL}"
 
+printf '%s  %s\n' \
+  '1734d8c585134547efa6eb60f092fd741135fe0f398fe9dc77ab4b97df6a7175' \
+  "$MODEL" | sha256sum --check
 cortiq verify "$MODEL"
-cortiq run "$MODEL" \
-  --prompt 'Write a small, well-tested Python function that parses an ISO-8601 date.' \
-  --greedy --max-tokens 512
 ```
 
-`cortiq run` applies the chat template embedded in the CMF file. Mellum is a
-thinking model: keep enough generation budget for a reasoning block plus the
-visible answer. For a direct-answer template mode, use `--no-think` after the
-release's template-parity check has passed:
+Generate code or an answer with the embedded chat template:
 
 ```bash
-cortiq run "$MODEL" --prompt 'Explain binary search in three sentences.' \
-  --no-think --greedy --max-tokens 160
+cortiq run "$MODEL" --greedy --max-tokens 512 \
+  --prompt 'Write a small, well-tested Python function that parses an ISO-8601 date.'
 ```
 
-## Local API server
+Mellum is a thinking model. Leave enough output budget for its reasoning and
+answer. To request the template's direct-answer mode:
 
-The same file can stay loaded behind Cortiq's local OpenAI-compatible server:
+```bash
+cortiq run "$MODEL" --no-think --greedy --max-tokens 160 \
+  --prompt 'Explain binary search in three sentences.'
+```
+
+## Local API
 
 ```bash
 cortiq serve "$MODEL" --host 127.0.0.1 --port 8080
@@ -98,76 +83,77 @@ cortiq serve "$MODEL" --host 127.0.0.1 --port 8080
 
 ```bash
 curl --fail http://127.0.0.1:8080/healthz
-curl --fail http://127.0.0.1:8080/v1/models
 curl --fail http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "mellum2.1-thinking-cmf",
+    "model": "mellum-cortiq",
     "temperature": 0,
-    "messages": [{"role": "user", "content": "Implement a stable merge sort in Python."}]
+    "max_tokens": 256,
+    "messages": [{"role": "user", "content": "Implement stable merge sort in Python."}]
   }'
 ```
 
-The server exposes `/v1/chat/completions`, `/v1/completions`, `/v1/models`,
-`/healthz` and `/v1/cortiq/status`. Bind to loopback unless you intentionally
-place authentication and transport security in front of it.
+The server provides `/v1/chat/completions`, `/v1/completions`, `/v1/models`,
+`/healthz`, and `/v1/cortiq/status`. Keep it on loopback unless an authenticated
+reverse proxy protects it.
 
-## CPU, Vulkan and Metal
+## Measured CPU performance
 
-One CMF artifact is used on all backends. Select the path explicitly when
-checking a deployment:
+Five independent CPU runs of the same artifact on a shared RunPod host
+(AMD EPYC 7663, 112 logical CPUs, approximately 251 GiB RAM), using
+`CMF_GPU=0 cortiq bench ... --ctx 512 --tokens 256 --core --ignore-eos --json`:
 
-```bash
-# Portable CPU reference
-CMF_GPU=0 cortiq run "$MODEL" --prompt 'Return the sum of 21 and 21.' --greedy
+| Context / generation | Prefill, median | Steady decode, median (range) | TTFT, median (range) |
+|---:|---:|---:|---:|
+| 512 / 256 tokens | 30.81 tok/s | 40.75 tok/s (40.60–41.27) | 16.53 s (15.84–16.65) |
 
-# Linux with a working Vulkan/wgpu adapter
-CMF_GPU=wgpu XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}" \
-  cortiq run "$MODEL" --prompt 'Return the sum of 21 and 21.' --greedy
+These are CPU-core measurements, not an end-to-end service SLA. The observed
+KV state at sequence 767 was 87,965,696 bytes; it is not process RSS.
+The CMF file can also use eligible Metal and Vulkan runtime paths, but this
+release intentionally publishes no end-to-end GPU throughput number until it
+has a complete, reproducible hardware record. Check the selected adapter with
+`cortiq gpu` before treating a run as GPU-backed.
 
-# macOS: native Metal when the installed Cortiq build and device support it
-CMF_GPU=1 cortiq run "$MODEL" --prompt 'Return the sum of 21 and 21.' --greedy
-```
+See [BENCHMARKS.md](BENCHMARKS.md) and
+[measurements.json](measurements.json) for the command, all five samples, and
+scope.
 
-Use `cortiq gpu` to inspect adapters before treating a run as GPU-backed. GPU
-speed, memory use and even the selected execution path depend on the artifact,
-Cortiq build, driver and available memory; the published benchmark table must
-name all of them. If no compatible GPU path is available, use `CMF_GPU=0` for
-the CPU reference path.
+## Provenance and reproducibility
 
-## Reproduce the conversion
+| Input | Pinned value |
+|---|---|
+| Upstream revision | [`92ddae9fc7665e9f801d141d2e5a6b2caf2460c4`](https://huggingface.co/JetBrains/Mellum2.1-12B-A2.5B-Thinking/tree/92ddae9fc7665e9f801d141d2e5a6b2caf2460c4) |
+| `config.json` SHA-256 | `f43d018246094dee6dca455b3072766b6acbefd1ac8e7fe664df34710606a541` |
+| `tokenizer.json` SHA-256 | `58548a346eb073e5132bf7d8ad17dc6971bca36ade378ca4d2bfbc49bf60da2a` |
+| `chat_template.jinja` SHA-256 | `4593a34d52f3364ac13ce57f4bea5688924e8942da6df8201e411db17e729f48` |
+| Conversion | `CMF_ENCODE_THREADS=112 cortiq convert --model /workspace/mellum-cmf/upstream --quant q4tp --output /workspace/mellum-cmf/out/mellum2.1-12b-a2.5b-thinking-q4tp.cmf` |
 
-The release must retain a pinned source snapshot and an exact conversion
-command. The following is the expected shape for the Q4TP artifact above;
-replace it only with the command recorded in the release manifest:
+`cortiq verify` passed after conversion: it validates the CMF envelope,
+sections, directory, and all 5,631 tensor hashes. A successful integrity check
+does not establish task quality, safety, or byte-for-byte equivalence with the
+BF16 checkpoint.
 
-```bash
-# Download the pinned upstream snapshot to ./mellum-upstream with a tool that
-# honors revision 92ddae9fc7665e9f801d141d2e5a6b2caf2460c4, then:
-cortiq convert --model ./mellum-upstream --quant q4tp \
-  --output mellum2.1-12b-a2.5b-thinking-q4tp.cmf
-cortiq verify mellum2.1-12b-a2.5b-thinking-q4tp.cmf
-```
+The conversion path has regression coverage for Mellum's dual RoPE schedule,
+sliding-attention metadata, top-8 MoE contract, mixed quantization profile, and
+a tiny real forward pass. `/healthz`, `/v1/models`, and a local chat completion
+also passed. In a fixed five-prompt greedy smoke suite, CMF CPU matched four of
+five source BF16 CUDA completions after the upstream end marker was normalized.
+That small fixed set is an implementation check—not a general code benchmark or
+a substitute for reviewing generated code.
 
-A proper release records the source revision; hashes of `config.json`,
-`tokenizer.json` and `chat_template.jinja`; the resulting CMF SHA-256; and the
-conversion/runtime version. `BENCHMARKS.md` defines the quality and speed gate.
+## Limits
 
-## What is and is not measured
+- The upstream architecture declares 131,072 tokens; no full-context quality or
+  throughput claim is made here.
+- This file is intended for local code-oriented generation. Review output before
+  running it, especially when it can alter code, infrastructure, or data.
+- `cortiq verify` proves file integrity, not capability, harmlessness, or
+  suitability for a particular project.
 
-This card intentionally contains no invented tokens-per-second, VRAM or quality
-numbers. Add only measurements produced by the documented commands in
-[`BENCHMARKS.md`](BENCHMARKS.md), with the raw JSON retained in the repository.
-A quantized model can change logits and generated text. A passing `cortiq
-verify` result detects malformed or changed file payloads; it does not prove
-benchmark parity, suitability for a particular codebase, or safe use.
+## License and attribution
 
-## Attribution and license
-
-- Original model: [JetBrains/Mellum2.1-12B-A2.5B-Thinking](https://huggingface.co/JetBrains/Mellum2.1-12B-A2.5B-Thinking),
-  Apache-2.0. The upstream source and its model card define the original
-  capabilities, intended use and limitations.
-- CMF container and Cortiq runtime: [infosave2007/cmf](https://github.com/infosave2007/cmf),
-  Apache-2.0.
-- This repository distributes a derived, quantized representation. Preserve
-  the upstream license and attribution with every redistribution.
+The original Mellum checkpoint is released by JetBrains under Apache-2.0. This
+repository distributes a derived, quantized representation and retains that
+attribution. Cortiq and the CMF container implementation are Apache-2.0.
+Refer to the [upstream model card](https://huggingface.co/JetBrains/Mellum2.1-12B-A2.5B-Thinking)
+for the original model's intended use and limitations.
