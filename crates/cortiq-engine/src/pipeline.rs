@@ -3573,6 +3573,13 @@ impl Pipeline {
         self.calib_temp
     }
 
+    /// The primary (full-attention) RoPE inverse-frequency table selected
+    /// from the CMF architecture.  This is read-only diagnostic state for
+    /// parity checks; local sliding layers may use `inv_freq_local` instead.
+    pub fn rope_inv_freq(&self) -> &[f32] {
+        self.inv_freq.as_slice()
+    }
+
     /// Partial rotary (Qwen3.5): rotate only the first `rotary_dim` dims;
     /// the frequency table is rebuilt over the rotary dims.
     pub fn set_rotary(&mut self, rotary_dim: usize, base: f32) {
