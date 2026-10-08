@@ -110,6 +110,8 @@ quota 23.8 cores), using
 
 These are CPU-core measurements, not an end-to-end service SLA. The observed
 KV state at sequence 767 was 87,965,696 bytes; it is not process RSS.
+A separate 16-token CPU smoke run peaked at 4,750 MiB process RSS on that
+host; this is a short-prompt observation, not a 131K-context memory figure.
 On this pod the automatic worker policy selected 22 threads; a bounded sweep
 of 8, 12, 16, 20, 22, 24, and 28 workers found 22 fastest for steady decode
 (41.75 tok/s in one 128-token calibration run).

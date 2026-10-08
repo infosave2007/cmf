@@ -47,6 +47,9 @@ not a request latency or service-throughput SLA.
 
 The model's observed KV state at sequence 767 was 87,965,696 bytes. That is a
 KV-state observation, not total process memory or a 131K-context measurement.
+A separate 16-token `cortiq run` smoke peaked at 4,749.6 MiB process RSS
+(Python child-process `ru_maxrss`); the raw measurement is included under
+`benchmarks/cpu-memory-smoke.json`. It is not a maximum-context memory claim.
 
 ### Worker-pool calibration
 
