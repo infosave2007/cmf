@@ -109,6 +109,8 @@ Five independent CPU runs of the same artifact on a shared RunPod host
 
 These are CPU-core measurements, not an end-to-end service SLA. The observed
 KV state at sequence 767 was 87,965,696 bytes; it is not process RSS.
+On this pod the automatic worker policy selected 22 threads; a bounded sweep
+of 12, 16, 20, 22, 24, and 28 workers found 22 fastest for steady decode.
 The CMF file can also use eligible Metal and Vulkan runtime paths, but this
 release intentionally publishes no end-to-end GPU throughput number until it
 has a complete, reproducible hardware record. Check the selected adapter with
