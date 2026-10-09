@@ -511,6 +511,9 @@ enum Commands {
         /// List the task prompts the file carries and exit
         #[arg(long)]
         list_prompts: bool,
+        /// Benchmark: run the forward N times, print each time (in-process)
+        #[arg(long, default_value = "1", hide = true)]
+        repeat: usize,
     },
     /// Transcribe audio with a Whisper CMF checkpoint (WAV, PCM or float).
     Transcribe {
@@ -2877,6 +2880,7 @@ async fn main() -> anyhow::Result<()> {
             npy,
             show_tokens,
             list_prompts,
+            repeat,
         } => embed::run(embed::EmbedArgs {
             model,
             texts: texts.into_iter().chain(text).collect(),
@@ -2890,6 +2894,7 @@ async fn main() -> anyhow::Result<()> {
             npy,
             show_tokens,
             list_prompts,
+            repeat,
         }),
         Commands::Transcribe {
             model,
