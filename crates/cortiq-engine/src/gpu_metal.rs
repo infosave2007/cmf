@@ -13663,7 +13663,7 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
         }
     };
 
-    for (j, trio) in jobs.iter().zip(&abs3) {
+    for (ji, (j, trio)) in jobs.iter().zip(&abs3).enumerate() {
         let (gi, grows, gcols, grs) = &j.gate;
         let (ui, urows, ucols, urs) = &j.up;
         let (di, drows, dcols, drs) = &j.down;
@@ -13683,9 +13683,14 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
         } else {
             g_buf.clone() // never read: silu has_col = 0
         };
-        // gate/up xs — per call (small, via the size-keyed io cache).
-        let xsg = get_io(6_000_000_087 + j.xs_gate.len(), j.xs_gate.len() * 4);
-        let xsu = get_io(7_000_000_103 + j.xs_up.len(), j.xs_up.len() * 4);
+        // gate/up xs — one staging pair PER JOB (size-keyed io cache plus
+        // the job index). The command buffer runs after this loop, so a
+        // pair shared by size handed every expert the LAST job's inputs:
+        // harmless while xs is the bare x, wrong for q8_2f experts, whose
+        // xs is x·col with each expert's own column field (Mellum2.1 q8_2f
+        // experts decoded on the per-op path: wiki ppl 7.39 against 7.21).
+        let xsg = get_io(6_000_000_087 + ji * 1_000_003 + j.xs_gate.len(), j.xs_gate.len() * 4);
+        let xsu = get_io(7_000_000_103 + ji * 1_000_003 + j.xs_up.len(), j.xs_up.len() * 4);
         unsafe {
             std::ptr::copy_nonoverlapping(
                 j.xs_gate.as_ptr(),
