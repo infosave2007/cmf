@@ -24,6 +24,18 @@
 //! Texts are tokenized as `[BOS] + prompt + text + [EOS]` and capped at 8192
 //! tokens; token-id inputs get BOS/EOS added when missing and are not
 //! prompted.
+//!
+//! **Audio.** An input object with `audio` embeds sound into the same space:
+//! `{"audio": "data:audio/wav;base64,…"}`, a local path, an `http(s)://`
+//! URL, `{"data": <base64>, "format": "wav"}`, or a list of those; the
+//! OpenAI chat part `{"type": "input_audio", "input_audio": {"data",
+//! "format"}}` is accepted too. WAV is decoded natively (any rate and
+//! channel count: mixed to mono, resampled to 16 kHz); other formats need
+//! `ffmpeg` on the server. Clips are cut at 30 s (750 tokens). Audio alone
+//! takes no task prompt; with `text`, the text carries one `<|audio|>` per
+//! clip (`{"text": "Narration: <|audio|>", "audio": […]}`) and the prompt
+//! options apply to it as to any text. The audio tower loads on the first
+//! audio request.
 
 use axum::{
     Router,
@@ -36,8 +48,9 @@ use axum::{
 use base64::Engine as _;
 use cortiq_core::CmfModel;
 use cortiq_engine::egemma2::{EmbeddingGemma2, MATRYOSHKA_DIMS, Prompts, TextInput, matryoshka};
+use cortiq_engine::egemma2_audio::{self as ea, AudioInput, AudioTower};
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::Semaphore;
 use tower_http::cors::CorsLayer;
 
@@ -48,6 +61,9 @@ pub struct EmbedState {
     pub enc: Arc<EmbeddingGemma2>,
     pub model_id: String,
     sem: Arc<Semaphore>,
+    /// the file, for the towers that load on first use
+    model: Option<Arc<CmfModel>>,
+    audio: OnceLock<Result<AudioTower, String>>,
 }
 
 impl EmbedState {
@@ -57,7 +73,38 @@ impl EmbedState {
             model_id,
             // one forward at a time: it already uses every core
             sem: Arc::new(Semaphore::new(1)),
+            model: None,
+            audio: OnceLock::new(),
         }
+    }
+
+    /// Keep the file so the audio tower can load on the first audio input.
+    pub fn with_model(mut self, model: Arc<CmfModel>) -> Self {
+        self.model = Some(model);
+        self
+    }
+
+    fn has_audio(&self) -> bool {
+        self.model.as_deref().is_some_and(ea::has_audio)
+    }
+
+    /// The audio tower, loaded once.
+    fn audio_tower(&self) -> Result<&AudioTower, String> {
+        let model = self
+            .model
+            .as_ref()
+            .ok_or("this server was started without audio support")?;
+        self.audio
+            .get_or_init(|| {
+                let t0 = std::time::Instant::now();
+                let r = AudioTower::load(model, cortiq_engine::pool::Pool::from_env());
+                if r.is_ok() {
+                    eprintln!("  audio tower loaded in {:.2}s", t0.elapsed().as_secs_f64());
+                }
+                r
+            })
+            .as_ref()
+            .map_err(|e| e.clone())
     }
 }
 
@@ -66,6 +113,52 @@ impl EmbedState {
 pub enum Item {
     Text(TextInputSpec),
     Ids(Vec<u32>),
+    /// audio sources (decoded in the job) with optional `<|audio|>` text
+    Audio(AudioSpec),
+}
+
+/// An audio input: the sources of its clips, in order, and the text that
+/// places them (`None`: the clips alone, unprompted).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioSpec {
+    pub text: Option<TextInputSpec>,
+    pub sources: Vec<Value>,
+}
+
+/// The audio sources of an input object, if it has any.
+fn audio_sources(x: &Value) -> Result<Option<Vec<Value>>, ApiError> {
+    if x.get("type").and_then(Value::as_str) == Some("input_audio")
+        || x.get("input_audio").is_some()
+    {
+        let inner = x
+            .get("input_audio")
+            .ok_or_else(|| bad("an input_audio part needs 'input_audio'", Some("input")))?;
+        return Ok(Some(vec![json!({ "input_audio": inner })]));
+    }
+    let a = match x.get("audio") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(a) => a,
+    };
+    let list = match a {
+        Value::Array(v) => v.clone(),
+        v @ (Value::String(_) | Value::Object(_)) => vec![v.clone()],
+        _ => {
+            return Err(bad(
+                "'audio' must be a source (data URL, path, URL or {\"data\"}) or a list of them",
+                Some("input"),
+            ));
+        }
+    };
+    if list.is_empty() {
+        return Err(bad("'audio' is empty", Some("input")));
+    }
+    if !list.iter().all(|v| v.is_string() || v.is_object()) {
+        return Err(bad(
+            "each audio source must be a string or an object",
+            Some("input"),
+        ));
+    }
+    Ok(Some(list))
 }
 
 /// A text input with its prompt options (owned, comparable).
@@ -225,8 +318,44 @@ pub fn parse_request(body: &Value, prompts: &Prompts) -> Result<Parsed, ApiError
     let input = body
         .get("input")
         .ok_or_else(|| bad("'input' is required", Some("input")))?;
+    let object_item = |x: &Value| -> Result<Item, ApiError> {
+        if let Some(sources) = audio_sources(x)? {
+            let text = match x.get("text") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(t)) => {
+                    let n = t.matches(ea::PLACEHOLDER).count();
+                    if n != sources.len() {
+                        return Err(bad(
+                            format!(
+                                "the text holds {n} {} placeholder(s) for {} audio clip(s)",
+                                ea::PLACEHOLDER,
+                                sources.len()
+                            ),
+                            Some("input"),
+                        ));
+                    }
+                    let o = overlay(&defaults, &options(x)?);
+                    let Item::Text(spec) = text_item(t, &o)? else {
+                        unreachable!("text_item returns text")
+                    };
+                    Some(spec)
+                }
+                Some(_) => return Err(bad("'text' must be a string", Some("input"))),
+            };
+            return Ok(Item::Audio(AudioSpec { text, sources }));
+        }
+        let text = x.get("text").and_then(|t| t.as_str()).ok_or_else(|| {
+            bad(
+                "an input object needs a 'text' string (or 'audio')",
+                Some("input"),
+            )
+        })?;
+        let o = overlay(&defaults, &options(x)?);
+        text_item(text, &o)
+    };
     let items: Vec<Item> = match input {
         Value::String(s) => vec![text_item(s, &defaults)?],
+        Value::Object(_) => vec![object_item(input)?],
         Value::Array(a) if a.is_empty() => return Err(bad("'input' is empty", Some("input"))),
         Value::Array(a) if a.iter().all(|x| x.is_number()) => {
             vec![Item::Ids(token_ids(a).ok_or_else(|| {
@@ -246,13 +375,7 @@ pub fn parse_request(body: &Value, prompts: &Prompts) -> Result<Parsed, ApiError
                             Some("input"),
                         )
                     }),
-                Value::Object(_) => {
-                    let text = x.get("text").and_then(|t| t.as_str()).ok_or_else(|| {
-                        bad("an input object needs a 'text' string", Some("input"))
-                    })?;
-                    let o = overlay(&defaults, &options(x)?);
-                    text_item(text, &o)
-                }
+                Value::Object(_) => object_item(x),
                 _ => Err(bad(
                     "each input must be a string, a token-id array or an object",
                     Some("input"),
@@ -260,7 +383,10 @@ pub fn parse_request(body: &Value, prompts: &Prompts) -> Result<Parsed, ApiError
             })
             .collect::<Result<_, _>>()?,
         _ => {
-            return Err(bad("'input' must be a string or an array", Some("input")));
+            return Err(bad(
+                "'input' must be a string, an array or an object",
+                Some("input"),
+            ));
         }
     };
     if items.len() > MAX_INPUTS {
@@ -306,8 +432,13 @@ async fn embeddings(State(st): State<Arc<EmbedState>>, body: Bytes) -> Response 
         );
     };
     let enc = st.enc.clone();
+    let state = st.clone();
     let job = tokio::task::spawn_blocking(move || -> Result<(Vec<Vec<f32>>, usize), ApiError> {
-        let mut seqs = Vec::with_capacity(parsed.items.len());
+        let n_items = parsed.items.len();
+        let mut text_idx = Vec::new();
+        let mut seqs = Vec::new();
+        let mut audio_idx = Vec::new();
+        let mut audio_in: Vec<AudioInput> = Vec::new();
         for (i, it) in parsed.items.iter().enumerate() {
             let ids = match it {
                 Item::Text(spec) => enc
@@ -333,11 +464,51 @@ async fn embeddings(State(st): State<Arc<EmbedState>>, body: Bytes) -> Response 
                     }
                     ids
                 }
+                Item::Audio(spec) => {
+                    let clips = spec
+                        .sources
+                        .iter()
+                        .map(ea::load_audio_source)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| bad(format!("input {i}: {e}"), Some("input")))?;
+                    audio_in.push(AudioInput {
+                        text: spec.text.as_ref().map(TextInputSpec::to_input),
+                        clips,
+                    });
+                    audio_idx.push(i);
+                    continue;
+                }
             };
             seqs.push(ids);
+            text_idx.push(i);
         }
-        let tokens = seqs.iter().map(|s| s.len()).sum();
-        let full = enc.embed_ids(&seqs).map_err(|e| bad(e, Some("input")))?;
+        let mut tokens: usize = seqs.iter().map(|s| s.len()).sum();
+        let mut full: Vec<Vec<f32>> = vec![Vec::new(); n_items];
+        if !seqs.is_empty() {
+            let v = enc.embed_ids(&seqs).map_err(|e| bad(e, Some("input")))?;
+            for (v, &i) in v.into_iter().zip(&text_idx) {
+                full[i] = v;
+            }
+        }
+        if !audio_in.is_empty() {
+            let tower = state.audio_tower().map_err(|e| bad(e, Some("input")))?;
+            for (k, a) in audio_in.iter().enumerate() {
+                let n: Vec<usize> = a.clips.iter().map(|c| ea::num_tokens(c.len())).collect();
+                tokens += ea::input_ids(
+                    &enc,
+                    (tower.audio_token, tower.boa_token, tower.eoa_token),
+                    a,
+                    &n,
+                )
+                .map_err(|e| bad(format!("input {}: {e}", audio_idx[k]), Some("input")))?
+                .len();
+            }
+            let v = ea::embed_audio_inputs(&enc, tower, &audio_in)
+                .map_err(|e| bad(e, Some("input")))?;
+            for (v, &i) in v.into_iter().zip(&audio_idx) {
+                full[i] = v;
+            }
+        }
         let out = full
             .iter()
             .map(|v| matryoshka(v, parsed.dim))
@@ -404,7 +575,11 @@ async fn healthz(State(st): State<Arc<EmbedState>>) -> Json<Value> {
     Json(json!({
         "status": "ok",
         "model": st.model_id,
-        "capabilities": {"embeddings": true, "dimensions": MATRYOSHKA_DIMS},
+        "capabilities": {
+            "embeddings": true,
+            "dimensions": MATRYOSHKA_DIMS,
+            "audio": st.has_audio(),
+        },
     }))
 }
 
@@ -427,9 +602,11 @@ pub async fn serve(
     addr: std::net::SocketAddr,
 ) -> anyhow::Result<()> {
     let pool = cortiq_engine::pool::Pool::from_env();
-    let enc = tokio::task::spawn_blocking(move || EmbeddingGemma2::load(&model, pool))
+    let m2 = model.clone();
+    let enc = tokio::task::spawn_blocking(move || EmbeddingGemma2::load(&m2, pool))
         .await?
         .map_err(anyhow::Error::msg)?;
+    let audio = ea::has_audio(&model);
     let model_id = std::path::Path::new(model_path)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -444,8 +621,11 @@ pub async fn serve(
         enc.dim,
         enc.prompts().names().len()
     );
+    if audio {
+        println!("    audio input: on (the tower loads on the first audio request)");
+    }
     println!("  Embeddings API: POST http://{addr}/v1/embeddings (model \"{model_id}\")");
-    let app = router(Arc::new(EmbedState::new(enc, model_id)));
+    let app = router(Arc::new(EmbedState::new(enc, model_id).with_model(model)));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
@@ -526,6 +706,58 @@ mod tests {
             json!({"input": 5}),
             json!({"input": "x", "prompt_name": "A", "task": "B"}),
             json!("text"),
+        ] {
+            assert!(parse_request(&body, &p()).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn parses_audio_inputs() {
+        let r = parse_request(
+            &json!({"input": [{"audio": "data:audio/wav;base64,AA=="}, "a text"], "prompt_name": "SearchQuery"}),
+            &p(),
+        )
+        .unwrap();
+        // audio alone takes no prompt; the text keeps the request's
+        assert_eq!(
+            r.items[0],
+            Item::Audio(AudioSpec {
+                text: None,
+                sources: vec![json!("data:audio/wav;base64,AA==")],
+            })
+        );
+        let Item::Text(t) = &r.items[1] else { panic!() };
+        assert_eq!(t.prompt_name.as_deref(), Some("SearchQuery"));
+        // interleaved: one placeholder per clip, prompt options apply to the text
+        let r = parse_request(
+            &json!({"input": {"text": "A <|audio|> B <|audio|>", "audio": ["/a.wav", {"data": "AA==", "format": "wav"}], "task": "Clustering"}}),
+            &p(),
+        )
+        .unwrap();
+        let Item::Audio(a) = &r.items[0] else {
+            panic!()
+        };
+        assert_eq!(a.sources.len(), 2);
+        assert_eq!(
+            a.text.as_ref().unwrap().prompt_name.as_deref(),
+            Some("Clustering")
+        );
+        // the OpenAI chat part
+        let r = parse_request(
+            &json!({"input": [{"type": "input_audio", "input_audio": {"data": "AA==", "format": "wav"}}]}),
+            &p(),
+        )
+        .unwrap();
+        assert!(
+            matches!(&r.items[0], Item::Audio(AudioSpec { text: None, sources }) if sources.len() == 1)
+        );
+        for body in [
+            json!({"input": [{"audio": []}]}),
+            json!({"input": [{"audio": 5}]}),
+            json!({"input": [{"audio": "x.wav", "text": "no placeholder"}]}),
+            json!({"input": [{"audio": ["a.wav", "b.wav"], "text": "one <|audio|>"}]}),
+            json!({"input": [{"audio": "x.wav", "text": 3}]}),
+            json!({"input": [{"type": "input_audio"}]}),
         ] {
             assert!(parse_request(&body, &p()).is_err(), "{body}");
         }
