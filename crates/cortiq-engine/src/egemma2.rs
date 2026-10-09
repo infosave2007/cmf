@@ -53,10 +53,33 @@ pub const MAX_TOKENS: usize = 8192;
 pub const MATRYOSHKA_DIMS: [usize; 4] = [768, 512, 256, 128];
 /// Sequences are packed into one forward up to this many tokens.
 const PACK_TOKENS: usize = 8192;
-/// Query rows per attention block.
+/// Query rows per attention block: sliding layers (a block's key span is
+/// its rows plus the window, so smaller blocks waste less) and full ones.
 const QBLOCK: usize = 128;
+const QBLOCK_FULL: usize = 512;
+/// Sequences up to this long attend on the pool, one (sequence, head) per
+/// work item; longer ones go through blocked GEMMs.
+const SHORT_SEQ: usize = 96;
 
 const EPS: f64 = 1e-6;
+
+/// `CMF_EGEMMA2_PROF=1`: per-forward time split (projections / attention
+/// core / the rest) on stderr.
+mod prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static LIN: AtomicU64 = AtomicU64::new(0);
+    pub static ATTN: AtomicU64 = AtomicU64::new(0);
+    pub fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("CMF_EGEMMA2_PROF").is_ok_and(|v| v == "1"))
+    }
+    pub fn add(c: &AtomicU64, t: std::time::Instant) {
+        c.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+    pub fn take(c: &AtomicU64) -> f64 {
+        c.swap(0, Ordering::Relaxed) as f64 / 1e3
+    }
+}
 
 /// The sentence-transformers prompt table of the release
 /// (`config_sentence_transformers.json`), used when a file carries none.
@@ -274,7 +297,20 @@ enum Mat {
 }
 
 impl Mat {
-    fn load(model: &Arc<CmfModel>, name: &str) -> Result<Mat, String> {
+    /// `dequant`: widen a quantized matrix to f32 once (Accelerate GEMM,
+    /// 4 bytes a weight) instead of running the quantized kernels on it.
+    fn load(model: &Arc<CmfModel>, name: &str, dequant: bool) -> Result<Mat, String> {
+        let e = model
+            .tensor(name)
+            .ok_or_else(|| format!("missing tensor {name}"))?;
+        if dequant && e.shape.len() == 2 {
+            let (rows, cols) = (e.shape[0], e.shape[1]);
+            return Ok(Mat::F32 {
+                w: vecf(model, name)?,
+                rows,
+                cols,
+            });
+        }
         Ok(match QTensor::from_model(model, name)? {
             QTensor::F32 { data, rows, cols } => Mat::F32 {
                 w: data,
@@ -293,6 +329,7 @@ impl Mat {
     }
 
     fn apply(&self, x: &[f32], n: usize, pool: Option<&Pool>) -> Vec<f32> {
+        let t0 = std::time::Instant::now();
         let mut out = vec![0f32; n * self.rows()];
         match self {
             Mat::F32 { w, rows, cols } => {
@@ -300,6 +337,7 @@ impl Mat {
             }
             Mat::Q(q) => q.matmat(x, n, &mut out, pool),
         }
+        prof::add(&prof::LIN, t0);
         out
     }
 }
@@ -480,22 +518,120 @@ fn add_normed(h: &mut [f32], y: &[f32], w: &[f32], d: usize, pool: Option<&Pool>
     });
 }
 
+/// `x[i] = gelu_tanh(x[i]) * y[i]`.
+///
+/// `0.5·x·(1 + tanh z)` is `x·σ(2z)`, so one exponential (NEON, |rel err| <
+/// 2e-7) and one division replace libm's `tanh` — which, at 2560 values a
+/// token a layer, was most of the forward outside the GEMMs.
+#[inline]
+fn gelu_mul_slice(x: &mut [f32], y: &[f32]) {
+    let mut i = 0usize;
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: every lane read/written is below `x.len()`, `y` is as long.
+    unsafe {
+        use core::arch::aarch64::*;
+        debug_assert!(y.len() >= x.len());
+        let k = vdupq_n_f32(-2.0 * 0.797_884_56);
+        let c = vdupq_n_f32(0.044715);
+        let one = vdupq_n_f32(1.0);
+        while i + 4 <= x.len() {
+            let v = vld1q_f32(x.as_ptr().add(i));
+            let v3 = vmulq_f32(vmulq_f32(v, v), v);
+            let e = crate::attention::vexpq_f32(vmulq_f32(k, vfmaq_f32(v, c, v3)));
+            let g = vdivq_f32(v, vaddq_f32(one, e));
+            vst1q_f32(
+                x.as_mut_ptr().add(i),
+                vmulq_f32(g, vld1q_f32(y.as_ptr().add(i))),
+            );
+            i += 4;
+        }
+    }
+    for (a, &b) in x[i..].iter_mut().zip(&y[i..]) {
+        *a = gelu_tanh(*a) * b;
+    }
+}
+
 /// `a = gelu_tanh(a) * b`, elementwise, across the pool.
 fn gelu_mul(a: &mut [f32], b: &[f32], pool: Option<&Pool>) {
     let n = a.len();
-    let grain = 4096usize;
+    let grain = 16384usize;
     let dst = Shared(a.as_mut_ptr());
     rows(pool, n.div_ceil(grain), &|s, e| {
         let (lo, hi) = (s * grain, (e * grain).min(n));
         let r = unsafe { dst.at(lo, hi - lo) };
-        for (x, &y) in r.iter_mut().zip(&b[lo..hi]) {
-            *x = gelu_tanh(*x) * y;
-        }
+        gelu_mul_slice(r, &b[lo..hi]);
     });
 }
 
-/// Softmax of `row` in place (finite inputs).
+/// `y[n,m] = x[n,k] · w[m,k]ᵀ` where row `r` of `w` starts at `w[r·ldw]`.
+fn gemm_nt_strided(x: &[f32], w: &[f32], ldw: usize, y: &mut [f32], n: usize, k: usize, m: usize) {
+    assert!(m == 0 || w.len() >= (m - 1) * ldw + k);
+    if ldw == k {
+        return crate::fcd_ops::gemm_nt_host(x, &w[..m * k], y, n, k, m, None);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        #[link(name = "Accelerate", kind = "framework")]
+        unsafe extern "C" {
+            fn cblas_sgemm(
+                order: i32,
+                ta: i32,
+                tb: i32,
+                m: i32,
+                n: i32,
+                k: i32,
+                alpha: f32,
+                a: *const f32,
+                lda: i32,
+                b: *const f32,
+                ldb: i32,
+                beta: f32,
+                c: *mut f32,
+                ldc: i32,
+            );
+        }
+        // SAFETY: the bounds were checked above; row-major (101), x·wᵀ.
+        unsafe {
+            cblas_sgemm(
+                101,
+                111,
+                112,
+                n as i32,
+                m as i32,
+                k as i32,
+                1.0,
+                x.as_ptr(),
+                k as i32,
+                w.as_ptr(),
+                ldw as i32,
+                0.0,
+                y.as_mut_ptr(),
+                m as i32,
+            );
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut wc = vec![0f32; m * k];
+        for r in 0..m {
+            wc[r * k..(r + 1) * k].copy_from_slice(&w[r * ldw..r * ldw + k]);
+        }
+        crate::fcd_ops::gemm_nt_host(x, &wc, y, n, k, m, None);
+    }
+}
+
+/// Softmax of `row` in place (finite inputs) — NEON on aarch64.
 fn softmax(row: &mut [f32]) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::attention::softmax_row(row);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    softmax_scalar(row);
+}
+
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+fn softmax_scalar(row: &mut [f32]) {
     let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mut den = 0f64;
     for r in row.iter_mut() {
@@ -595,6 +731,11 @@ impl EmbeddingGemma2 {
         );
         let per_layer = &tc["per_layer_config"];
         let ple_dim = g("hidden_size_per_layer_input", 512);
+        // A quantized text stack is widened to f32 at load: 130 M weights are
+        // ~0.5 GB of RAM, and the f32 GEMM runs ~2.5x faster than the q8
+        // kernels on these shapes (the token table stays mapped either way).
+        // `CMF_EGEMMA2_LOWMEM=1` keeps the quantized kernels.
+        let dequant = !std::env::var("CMF_EGEMMA2_LOWMEM").is_ok_and(|v| v == "1");
 
         // The per-layer-input projection, split into one [ple_dim, hidden]
         // matrix per layer (each layer reads only its own slice).
@@ -624,7 +765,7 @@ impl EmbeddingGemma2 {
                 .as_u64()
                 .map(|v| v as usize)
                 .unwrap_or(if full { 1 } else { kv_heads });
-            let ld = |s: &str| Mat::load(model, &format!("{p}.{s}"));
+            let ld = |s: &str| Mat::load(model, &format!("{p}.{s}"), dequant);
             let q = ld("self_attn.q_proj.weight")?;
             let k = ld("self_attn.k_proj.weight")?;
             if q.rows() != n_heads * hd || k.rows() != nkv * hd {
@@ -684,7 +825,7 @@ impl EmbeddingGemma2 {
             .or_else(|| cfg["eos_token_id"].as_u64())
             .unwrap_or(1) as u32;
         let prompts = Prompts::from_st_config(&eg["sentence_transformers"]).unwrap_or_default();
-        let head = Mat::load(model, "language_model.embedding_projection.weight")?;
+        let head = Mat::load(model, "language_model.embedding_projection.weight", true)?;
         let embed = Table::load(model, "language_model.embed_tokens.weight")?;
         let dim = head.rows();
         Ok(EmbeddingGemma2 {
@@ -824,6 +965,7 @@ impl EmbeddingGemma2 {
     }
 
     fn forward_pooled_locked(&self, x: Vec<f32>, lens: &[usize]) -> Vec<Vec<f32>> {
+        let t_fwd = std::time::Instant::now();
         let pool = self.pool.as_deref();
         let d = self.hidden;
         let n: usize = lens.iter().sum();
@@ -880,14 +1022,25 @@ impl EmbeddingGemma2 {
             }
         }
         let hn = rms_rows(&h, Some(&self.norm), d, pool);
-        segs.iter()
+        let out = segs
+            .iter()
             .map(|&(s, l)| {
                 let mean = mean_pool(&hn[s * d..(s + l) * d], l, d);
                 let mut v = self.head.apply(&mean, 1, pool);
                 l2_normalize(&mut v);
                 v
             })
-            .collect()
+            .collect();
+        let (lin, attn) = (prof::take(&prof::LIN), prof::take(&prof::ATTN));
+        if prof::on() {
+            let total = t_fwd.elapsed().as_secs_f64() * 1e3;
+            eprintln!(
+                "egemma2 forward: {n} tokens / {} seqs in {total:.1} ms — projections {lin:.1}, attention core {attn:.1}, rest {:.1}",
+                lens.len(),
+                total - lin - attn
+            );
+        }
+        out
     }
 
     /// Self-attention of one layer over packed sequences; `a` is the
@@ -939,9 +1092,50 @@ impl EmbeddingGemma2 {
                 }
             });
         }
+        let t_core = std::time::Instant::now();
         let mut out = vec![0f32; n * qw];
         let group = nq / nkv;
-        for &(s0, len) in segs {
+        // Short sequences: one (sequence, head) pair per work item, all of
+        // them across the pool, each computed serially — a batch of queries
+        // is thousands of tiny attentions, and a GEMM call (plus a pool
+        // dispatch) per pair cost more than the arithmetic.
+        let items: Vec<(usize, usize)> = segs
+            .iter()
+            .filter(|&&(_, len)| len <= SHORT_SEQ)
+            .flat_map(|&(s0, len)| (0..nq).map(move |h| (s0 * nq + h, len)))
+            .collect();
+        if !items.is_empty() {
+            let op = Shared(out.as_mut_ptr());
+            let window = l.window;
+            let (q, k, v) = (&q, &k, &v);
+            rows(pool, items.len(), &|s, e| {
+                let mut p = vec![0f32; SHORT_SEQ];
+                for &(code, len) in &items[s..e] {
+                    let (s0, qh) = (code / nq, code % nq);
+                    let kvh = qh / group;
+                    for i in 0..len {
+                        let (lo, hi) = match window {
+                            Some(w) => (i.saturating_sub(w), (i + w + 1).min(len)),
+                            None => (0, len),
+                        };
+                        let qi = &q[(s0 + i) * qw + qh * hd..][..hd];
+                        let row = &mut p[..hi - lo];
+                        for (j, r) in (lo..hi).zip(row.iter_mut()) {
+                            *r =
+                                crate::attention::dot_f32(qi, &k[(s0 + j) * kw + kvh * hd..][..hd]);
+                        }
+                        softmax(row);
+                        // SAFETY: (row, head) slices are disjoint across items
+                        let o = unsafe { op.at((s0 + i) * qw + qh * hd, hd) };
+                        o.iter_mut().for_each(|x| *x = 0.0);
+                        for (j, &w) in (lo..hi).zip(row.iter()) {
+                            crate::attention::axpy_f32(o, &v[(s0 + j) * kw + kvh * hd..][..hd], w);
+                        }
+                    }
+                }
+            });
+        }
+        for &(s0, len) in segs.iter().filter(|&&(_, len)| len > SHORT_SEQ) {
             for kvh in 0..nkv {
                 // this key head's keys [len, hd] and values transposed [hd, len]
                 let mut kh = vec![0f32; len * hd];
@@ -954,10 +1148,15 @@ impl EmbeddingGemma2 {
                     }
                 }
                 for qh in kvh * group..(kvh + 1) * group {
-                    let mut qb = vec![0f32; QBLOCK.min(len) * hd];
+                    let qblock = if l.window.is_some() {
+                        QBLOCK
+                    } else {
+                        QBLOCK_FULL
+                    };
+                    let mut qb = vec![0f32; qblock.min(len) * hd];
                     let mut i0 = 0usize;
                     while i0 < len {
-                        let i1 = (i0 + QBLOCK).min(len);
+                        let i1 = (i0 + qblock).min(len);
                         let nb = i1 - i0;
                         let (k0, k1) = match l.window {
                             Some(w) => (i0.saturating_sub(w), (i1 - 1 + w + 1).min(len)),
@@ -995,14 +1194,9 @@ impl EmbeddingGemma2 {
                                 row[hi..].iter_mut().for_each(|x| *x = 0.0);
                             }
                         });
-                        // P · V: V's columns k0..k1 as a contiguous [hd, kr]
-                        let mut vb = vec![0f32; hd * kr];
-                        for c in 0..hd {
-                            vb[c * kr..(c + 1) * kr]
-                                .copy_from_slice(&vt[c * len + k0..c * len + k1]);
-                        }
+                        // P · V over V's columns k0..k1 (rows of `vt`, stride len)
                         let mut ob = vec![0f32; nb * hd];
-                        crate::fcd_ops::gemm_nt_host(&sc, &vb, &mut ob, nb, kr, hd, None);
+                        gemm_nt_strided(&sc, &vt[k0..], len, &mut ob, nb, kr, hd);
                         for i in 0..nb {
                             out[(s0 + i0 + i) * qw + qh * hd..][..hd]
                                 .copy_from_slice(&ob[i * hd..(i + 1) * hd]);
@@ -1012,6 +1206,7 @@ impl EmbeddingGemma2 {
                 }
             }
         }
+        prof::add(&prof::ATTN, t_core);
         l.o.apply(&out, n, pool)
     }
 }

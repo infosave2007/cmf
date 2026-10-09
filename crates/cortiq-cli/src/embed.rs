@@ -25,6 +25,8 @@ pub struct EmbedArgs {
     pub npy: Option<String>,
     pub show_tokens: bool,
     pub list_prompts: bool,
+    /// run the forward this many times and report each (in-process timing)
+    pub repeat: usize,
 }
 
 /// One JSON Lines input: a bare string, or an object.
@@ -148,9 +150,26 @@ pub fn run(args: EmbedArgs) -> Result<()> {
             eprintln!("[{i}] {} tokens: {s:?}", s.len());
         }
     }
-    let t0 = std::time::Instant::now();
-    let full = enc.embed_ids(&ids).map_err(anyhow::Error::msg)?;
-    let secs = t0.elapsed().as_secs_f64();
+    let mut times = Vec::new();
+    let mut full = Vec::new();
+    for _ in 0..args.repeat.max(1) {
+        let t0 = std::time::Instant::now();
+        full = enc.embed_ids(&ids).map_err(anyhow::Error::msg)?;
+        times.push(t0.elapsed().as_secs_f64());
+    }
+    if times.len() > 1 {
+        let ms: Vec<String> = times.iter().map(|t| format!("{:.1}", t * 1e3)).collect();
+        let mut sorted = times.clone();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        eprintln!(
+            "repeat {}: [{}] ms; median {:.1} ms = {:.0} tok/s",
+            times.len(),
+            ms.join(", "),
+            sorted[sorted.len() / 2] * 1e3,
+            tokens as f64 / sorted[sorted.len() / 2]
+        );
+    }
+    let secs = times[0];
     let vecs: Vec<Vec<f32>> = full
         .iter()
         .map(|v| matryoshka(v, args.dim))
