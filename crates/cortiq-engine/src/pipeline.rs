@@ -3469,11 +3469,17 @@ impl Pipeline {
     /// from the production route.
     /// Positions per batched-graph submit for the prompt: `CMF_BATCH_K`
     /// when set (0 = one position at a time through the token graph),
-    /// otherwise 32 on a discrete card whose prompt takes the graph route.
+    /// otherwise 128 (32 for a MoE stack) on a discrete card whose prompt
+    /// takes the graph route.
     /// The batched graph read a 2048-token prompt at 53 tok/s against 28.5
     /// one position at a time on an RTX PRO 4000 (Qwen3.8-27B q4tp: TTFT
     /// 39 s against 72), and its states are the speculative verify's,
     /// measured identical to the plain path. macOS keeps its own arm.
+    /// 128, not 32: the q4tp prefill GEMM tiles 64 batch rows, so a
+    /// 32-row chunk left half of every tile idle. Qwen3.8-27B q4tp on an
+    /// RTX 3090, 1000-token prompt: 51 tok/s at 32, 82 at 64, 95 at 128,
+    /// 97 at 256; greedy output byte-identical to the 32-row chunks
+    /// (every GEMM row and the k-looped recurrences are per position).
     pub fn generation_batch_k(&self) -> usize {
         if let Some(k) = std::env::var("CMF_BATCH_K")
             .ok()
@@ -3483,7 +3489,14 @@ impl Pipeline {
         }
         #[cfg(not(target_os = "macos"))]
         if self.graph_prefill_preferred() && !self.o1_active() {
-            return 32;
+            // MoE stacks keep the 32 their expert-grouped prefill was
+            // measured at; 128 is measured on the dense hybrids only.
+            let moe = self
+                .weights
+                .layers
+                .iter()
+                .any(|lw| matches!(&lw.ffn, FfnKind::Moe(_)));
+            return if moe { 32 } else { 128 };
         }
         0
     }
