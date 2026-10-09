@@ -31450,13 +31450,25 @@ pub fn forward_batch_graph_at(
                     } else {
                         k
                     };
+                    // Short-context positions batch too, through the dec
+                    // twin, when the loop would take `gqa_attend_dec`
+                    // (`CMF_ATTN_BT_DEC=0`: those keep the loop).
+                    let t_from = if bt.is_some()
+                        && c.attend_dec
+                        && hd <= 256
+                        && std::env::var("CMF_ATTN_BT_DEC").as_deref() != Ok("0")
+                    {
+                        0
+                    } else {
+                        t_split
+                    };
                     // ONE compute pass for every position: the loop's four
                     // dispatches per token each carried their own pass, and
                     // pass boundaries — not the math — were 4.3 of this
                     // stage's 5.4 ms. In-pass dispatch ordering already
                     // guarantees each sees the previous one's writes.
                     let mut pass = begin_pass(&mut enc);
-                    for i in 0..t_split {
+                    for i in 0..t_from {
                         let p = positions[i];
                         let gate_flag = if *output_gate { 1u32 } else { 0 };
                         let rope_u = uniform_rope(
@@ -31602,7 +31614,7 @@ pub fn forward_batch_graph_at(
                         );
                     }
                     drop(pass);
-                    if let Some(p) = bt.filter(|_| t_split < k) {
+                    if let Some(p) = bt.filter(|_| t_from < k) {
                         let gate_flag = if *output_gate { 1u32 } else { 0 };
                         let rope_words = rope_uniform_words(
                             nh,
@@ -31631,13 +31643,13 @@ pub fn forward_batch_graph_at(
                         dense_batch::encode_attn_bt(
                             c, &mut enc, p, rope_words, &qraw_b, &kb_b, &vb_b, qall, gall, &qnw,
                             &knw, &invf_b, kbuf, vbuf, pacc, pml, &attn_bb, nh, nkv, hd, cap,
-                            positions[0], t_split, k, *sub, *nc, attn_scale,
+                            positions[0], t_from, t_split, k, *sub, *nc, attn_scale,
                         );
                         if *output_gate {
-                            // The loop's gate_mul, over rows t_split..k at once
+                            // The loop's gate_mul, over rows t_from..k at once
                             // (the same element-wise product).
-                            let rows = k - t_split;
-                            let off = (t_split * nh * hd * 4) as u64;
+                            let rows = k - t_from;
+                            let off = (t_from * nh * hd * 4) as u64;
                             let len = (rows * nh * hd * 4) as u64;
                             let gm_u = unif(&[(rows * nh * hd) as u32, 0, 0, 0]);
                             let bgm = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
