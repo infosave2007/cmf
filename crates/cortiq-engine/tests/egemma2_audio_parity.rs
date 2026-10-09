@@ -210,7 +210,14 @@ fn egemma2_audio_parity() {
     // a clip embeds alone as it does in a batch
     let alone = ea::embed_audio_inputs(&enc, &tower, &all[..1]).unwrap();
     let cs = cosine(&alone[0], &got[0]);
-    assert!(cs > 0.999_999, "batch vs single: {cs}");
+    // CMF_EGEMMA2_LOWMEM keeps the quantized kernels, whose CPU/GPU
+    // arbitration may take a different arm from one call to the next
+    let same = if std::env::var("CMF_EGEMMA2_LOWMEM").is_ok_and(|v| v == "1") {
+        0.999_99
+    } else {
+        0.999_999
+    };
+    assert!(cs > same, "batch vs single: {cs}");
     // the same clip through a text placeholder (no prompt) is the same input
     let via_text = ea::embed_audio_inputs(
         &enc,
@@ -222,7 +229,7 @@ fn egemma2_audio_parity() {
     )
     .unwrap();
     let cs = cosine(&via_text[0], &got[0]);
-    assert!(cs > 0.999_999, "placeholder text vs audio-only: {cs}");
+    assert!(cs > same, "placeholder text vs audio-only: {cs}");
 
     // ── the extra cases
     let xdir = refdir.join("audio_extra");
