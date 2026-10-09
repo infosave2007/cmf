@@ -29,6 +29,8 @@ pub(crate) mod qi21_vae;
 pub mod mimo_bank;
 /// Qwen3.8-Flash-Next device-resident token path.
 pub(crate) mod qwen4;
+/// Row-blocked decode kernels for the generic q4tp MoE graph block.
+pub(crate) mod moe_r4;
 
 /// Workgroup limit per dimension (WebGPU minimum; lm_head has more
 /// rows — we use grid-stride in the shader).
@@ -17387,7 +17389,10 @@ fn gqa_attend_merge_x(@builtin(workgroup_id) wid: vec3<u32>,
                       @builtin(local_invocation_index) lid: u32) {
     let h = wid.x;
     if (h >= ax_p.nh) { return; }
-    let used = (ax_p.n + 255u) / 256u;
+    // `_a` carries the chunk length of `gqa_attend_part_xg` (64); zero is
+    // the 256-position chunk of `gqa_attend_part_x`, as before.
+    let ck = select(256u, ax_p._a, ax_p._a != 0u);
+    let used = (ax_p.n + ck - 1u) / ck;
     let base = h * ax_p.nc;
     var mg = -1.0e30;
     if (ax_p.sink != 0u) { mg = ax_sink[h]; }
@@ -17405,6 +17410,320 @@ fn gqa_attend_merge_x(@builtin(workgroup_id) wid: vec3<u32>,
             a = a + ax_acc[idx * ax_p.dv + d] * exp(ax_ml[idx].x - mg);
         }
         ax_o[h * ax_p.dv + d] = a / lg;
+    }
+}
+
+// GQA-SHARED split decode attend for the per-layer geometry: ONE workgroup
+// per (kv head, 64-position chunk) serves every query head of the group,
+// so a K/V row is read once for all of them, and short chunks keep the
+// card busy where `gqa_attend_x` ran one workgroup per head through every
+// position (Mellum2.1, 32 query heads on 4 kv heads: 94 µs a layer at 240
+// positions, 330 µs at a full 1,024-position window on an RTX 3090).
+// Ring-aware like the rest of this module (row (first + p) % cap); the
+// partials land in the [h*nc + ch] layout `gqa_attend_merge_x` reads,
+// with `_a` = 64 telling it the chunk length. hpk <= 8, hd <= 256,
+// dv <= 128. Lanes are (position, head) items for the scores, 16 lanes a
+// head for the chunk max/sum, and output dims for the value pass.
+var<workgroup> xg_q: array<vec4<f32>, 520>;   // [hq*(hd4+1) + d4] (padded: no bank conflicts)
+var<workgroup> xg_w: array<f32, 512>;         // [hq*64 + p]
+var<workgroup> xg_m: array<f32, 128>;
+var<workgroup> xg_l: array<f32, 128>;
+// One (kv group g, chunk ch) frame: queries from ax_q at vec4 offset q4,
+// positions first + ch*64 .. of n, K/V rows (first + p) % cap, partials
+// to [(pb + hq) * nc + ch]. Called in uniform control flow only.
+fn xg_core(lid: u32, g: u32, ch: u32, n: u32, first: u32, q4: u32, pb: u32,
+           hpk: u32, hd: u32, dv: u32, cap: u32, nc: u32, scale: f32) {
+    let c0 = ch * 64u;
+    let cn = min(64u, n - c0);
+    let hd4 = hd / 4u;
+    let kbase = g * cap * hd4;
+    let vbase = g * cap * dv;
+    let s0 = (first + c0) % cap;
+    let nq = hpk * hd4;
+    let qs = hd4 + 1u;
+    for (var i = lid; i < nq; i = i + 128u) {
+        let qh = i / hd4;
+        xg_q[qh * qs + (i - qh * hd4)] = ax_q[q4 + i];
+    }
+    for (var i = lid; i < 512u; i = i + 128u) { xg_w[i] = -1.0e30; }
+    workgroupBarrier();
+    let items = cn * hpk;
+    for (var it = lid; it < items; it = it + 128u) {
+        let p = it / hpk;
+        let hq = it - p * hpk;
+        let sp = s0 + p;
+        let krow = kbase + select(sp, sp - cap, sp >= cap) * hd4;
+        let qb = hq * qs;
+        var d4 = vec4<f32>(0.0);
+        for (var d = 0u; d < hd4; d = d + 1u) { d4 = d4 + xg_q[qb + d] * ax_k[krow + d]; }
+        xg_w[hq * 64u + p] = (d4.x + d4.y + d4.z + d4.w) * scale;
+    }
+    workgroupBarrier();
+    let hq = lid >> 4u;
+    let sl = lid & 15u;
+    let rb = hq * 64u + sl * 4u;
+    xg_m[lid] = max(max(xg_w[rb], xg_w[rb + 1u]), max(xg_w[rb + 2u], xg_w[rb + 3u]));
+    workgroupBarrier();
+    var st = 8u;
+    loop {
+        if (st == 0u) { break; }
+        if (sl < st) { xg_m[lid] = max(xg_m[lid], xg_m[lid + st]); }
+        workgroupBarrier();
+        st = st >> 1u;
+    }
+    let hm = xg_m[hq * 16u];
+    var sm = 0.0;
+    for (var j = 0u; j < 4u; j = j + 1u) {
+        let w = select(0.0, exp(xg_w[rb + j] - hm), sl * 4u + j < cn);
+        xg_w[rb + j] = w;
+        sm = sm + w;
+    }
+    xg_l[lid] = sm;
+    workgroupBarrier();
+    st = 8u;
+    loop {
+        if (st == 0u) { break; }
+        if (sl < st) { xg_l[lid] = xg_l[lid] + xg_l[lid + st]; }
+        workgroupBarrier();
+        st = st >> 1u;
+    }
+    if (lid < dv) {
+        var a0 = 0.0; var a1 = 0.0; var a2 = 0.0; var a3 = 0.0;
+        var a4 = 0.0; var a5 = 0.0; var a6 = 0.0; var a7 = 0.0;
+        for (var p = 0u; p < cn; p = p + 1u) {
+            let sp = s0 + p;
+            let v = ax_v[vbase + select(sp, sp - cap, sp >= cap) * dv + lid];
+            a0 = a0 + xg_w[p] * v;
+            a1 = a1 + xg_w[64u + p] * v;
+            a2 = a2 + xg_w[128u + p] * v;
+            a3 = a3 + xg_w[192u + p] * v;
+            a4 = a4 + xg_w[256u + p] * v;
+            a5 = a5 + xg_w[320u + p] * v;
+            a6 = a6 + xg_w[384u + p] * v;
+            a7 = a7 + xg_w[448u + p] * v;
+        }
+        let ib = pb * nc + ch;
+        ax_acc[ib * dv + lid] = a0;
+        if (hpk > 1u) { ax_acc[(ib + nc) * dv + lid] = a1; }
+        if (hpk > 2u) { ax_acc[(ib + 2u * nc) * dv + lid] = a2; }
+        if (hpk > 3u) { ax_acc[(ib + 3u * nc) * dv + lid] = a3; }
+        if (hpk > 4u) { ax_acc[(ib + 4u * nc) * dv + lid] = a4; }
+        if (hpk > 5u) { ax_acc[(ib + 5u * nc) * dv + lid] = a5; }
+        if (hpk > 6u) { ax_acc[(ib + 6u * nc) * dv + lid] = a6; }
+        if (hpk > 7u) { ax_acc[(ib + 7u * nc) * dv + lid] = a7; }
+    }
+    if (lid < hpk) {
+        ax_ml[(pb + lid) * nc + ch] = vec2<f32>(xg_m[lid * 16u], xg_l[lid * 16u]);
+    }
+}
+
+@compute @workgroup_size(128)
+fn gqa_attend_part_xg(@builtin(workgroup_id) wid: vec3<u32>,
+                      @builtin(local_invocation_index) lid: u32) {
+    let g = wid.x;
+    let hpk = ax_p.hpk;
+    if (g * hpk >= ax_p.nh) { return; }
+    if (wid.y * 64u >= ax_p.n) { return; }
+    xg_core(lid, g, wid.y, ax_p.n, ax_p.first, g * hpk * (ax_p.hd / 4u), g * hpk,
+            hpk, ax_p.hd, ax_p.dv, ax_p.cap, ax_p.nc, ax_p.scale);
+}
+
+// The batch graph's twin: token t = t0 + wid.z of a contiguous run whose
+// first position is pos0 (a window, if any, ends at the token's own
+// position). K/V rows of the whole run are already in the mirror (a ring
+// holds 2·window rows, so a run of <= window positions never overwrites a
+// row a member still sees). Queries are rows of the batched [k][nh][hd]
+// buffer; a sub-run of `k` tokens keeps its partials at
+// [((tl·nh + h)·nc + ch)] (tl = wid.z), merged by `gqa_attend_merge_xb`
+// into output row t.
+struct AbP {
+    nh: u32, hpk: u32, hd: u32, dv: u32,
+    cap: u32, pos0: u32, win: u32, scale: f32,
+    sink: u32, nc: u32, k: u32, t0: u32,
+};
+@group(0) @binding(9) var<uniform> ab_p: AbP;
+fn ab_n(t: u32) -> u32 {
+    let na = ab_p.pos0 + t + 1u;
+    return select(na, min(na, ab_p.win), ab_p.win != 0u);
+}
+@compute @workgroup_size(128)
+fn gqa_attend_part_xgb(@builtin(workgroup_id) wid: vec3<u32>,
+                       @builtin(local_invocation_index) lid: u32) {
+    let g = wid.x;
+    let tl = wid.z;
+    let t = ab_p.t0 + tl;
+    let hpk = ab_p.hpk;
+    if (g * hpk >= ab_p.nh || tl >= ab_p.k) { return; }
+    let n = ab_n(t);
+    if (wid.y * 64u >= n) { return; }
+    let first = ab_p.pos0 + t + 1u - n;
+    let hd4 = ab_p.hd / 4u;
+    xg_core(lid, g, wid.y, n, first, (t * ab_p.nh + g * hpk) * hd4, tl * ab_p.nh + g * hpk,
+            hpk, ab_p.hd, ab_p.dv, ab_p.cap, ab_p.nc, ab_p.scale);
+}
+
+@compute @workgroup_size(128)
+fn gqa_attend_merge_xb(@builtin(workgroup_id) wid: vec3<u32>,
+                       @builtin(local_invocation_index) lid: u32) {
+    let h = wid.x;
+    let tl = wid.y;
+    let t = ab_p.t0 + tl;
+    if (h >= ab_p.nh || tl >= ab_p.k) { return; }
+    let used = (ab_n(t) + 63u) / 64u;
+    let base = (tl * ab_p.nh + h) * ab_p.nc;
+    var mg = -1.0e30;
+    if (ab_p.sink != 0u) { mg = ax_sink[h]; }
+    for (var ci = 0u; ci < used; ci = ci + 1u) { mg = max(mg, ax_ml[base + ci].x); }
+    var lg = 0.0;
+    if (ab_p.sink != 0u) { lg = exp(ax_sink[h] - mg); }
+    for (var ci = 0u; ci < used; ci = ci + 1u) {
+        let ml = ax_ml[base + ci];
+        lg = lg + ml.y * exp(ml.x - mg);
+    }
+    for (var d = lid; d < ab_p.dv; d = d + 128u) {
+        var a = 0.0;
+        for (var ci = 0u; ci < used; ci = ci + 1u) {
+            let idx = base + ci;
+            a = a + ax_acc[idx * ab_p.dv + d] * exp(ax_ml[idx].x - mg);
+        }
+        ax_o[(t * ab_p.nh + h) * ab_p.dv + d] = a / lg;
+    }
+}
+
+// The batch run's K/V rows into the mirror in ONE dispatch (token = gid.y).
+@compute @workgroup_size(256)
+fn kv_append_xb(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let t = gid.y;
+    let slot = (kx_p.pos + t) % kx_p.cap;
+    let kw = kx_p.nkv * kx_p.hd;
+    if (i < kw) {
+        let h = i / kx_p.hd;
+        kx_kc[(h * kx_p.cap + slot) * kx_p.hd + (i % kx_p.hd)] = kx_k[t * kw + i];
+    }
+    let vw = kx_p.nkv * kx_p.dv;
+    if (i < vw) {
+        let h = i / kx_p.dv;
+        kx_vc[(h * kx_p.cap + slot) * kx_p.dv + (i % kx_p.dv)] = kx_v[t * vw + i];
+    }
+}
+
+// `attn_rope_qkn` with a token axis (wid.y = token t of a run starting at
+// rb_p.pos): Q/K norm + RoPE (+ YaRN amplitude) of every row of the batched
+// projections in ONE dispatch. Q rows land at t·nh·hd of `rb_qout`, K is
+// rotated in place. Same per-head arithmetic as the token kernel; no output
+// gate (the batch graph keeps per-token rope for gated layers).
+struct RbP {
+    nh: u32, nkv: u32, hd: u32, rd: u32,
+    pos: u32, flags: u32, eps: f32, tok: u32,
+    rope_scale: f32, _p0: u32, _p1: u32, _p2: u32,
+};
+@group(0) @binding(10) var<storage, read>       rb_qraw : array<f32>;
+@group(0) @binding(11) var<storage, read_write> rb_k    : array<f32>;
+@group(0) @binding(12) var<storage, read_write> rb_qout : array<f32>;
+@group(0) @binding(13) var<storage, read>       rb_qnw  : array<f32>;
+@group(0) @binding(14) var<storage, read>       rb_knw  : array<f32>;
+@group(0) @binding(15) var<storage, read>       rb_invf : array<f32>;
+@group(0) @binding(16) var<uniform>             rb_p    : RbP;
+var<workgroup> rb_red: array<f32, 32>;
+var<workgroup> rb_head: array<f32, 256>;
+@compute @workgroup_size(32)
+fn rope_xb(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let head = wid.x;
+    let t = wid.y;
+    let lane = lid.x;
+    let nh = rb_p.nh;
+    let hd = rb_p.hd;
+    if (head >= nh + rb_p.nkv) { return; }
+    let isq = head < nh;
+    let pos = rb_p.pos + t;
+    let src_base = select((head - nh) * hd, head * hd, isq);
+    let qoff = t * nh * hd;
+    let koff = t * rb_p.nkv * hd;
+    let nt = (hd + 31u) / 32u;
+    var xv: array<f32, 8>;
+    var ss = 0.0;
+    for (var i = 0u; i < nt; i = i + 1u) {
+        let d = i * 32u + lane;
+        var val = 0.0;
+        if (d < hd) { val = select(rb_k[koff + src_base + d], rb_qraw[qoff + src_base + d], isq); }
+        xv[i] = val;
+        ss = ss + val * val;
+    }
+    rb_red[lane] = ss;
+    workgroupBarrier();
+    var stride = 16u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lane < stride) { rb_red[lane] = rb_red[lane] + rb_red[lane + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let normed = select((rb_p.flags & 4u) != 0u, (rb_p.flags & 2u) != 0u, isq);
+    let late = (rb_p.flags & 32u) != 0u;
+    let hlf = rb_p.rd / 2u;
+    for (var i = 0u; i < nt; i = i + 1u) {
+        let d = i * 32u + lane;
+        if (d < hd) { rb_head[d] = xv[i]; }
+    }
+    workgroupBarrier();
+    if (late) {
+        var ri0 = lane;
+        loop {
+            if (ri0 >= hlf) { break; }
+            let angle0 = f32(pos) * rb_invf[ri0];
+            let cc0 = cos(angle0);
+            let sf0 = sin(angle0);
+            let y0 = rb_head[ri0];
+            let y1 = rb_head[ri0 + hlf];
+            rb_head[ri0] = (y0 * cc0 - y1 * sf0) * rb_p.rope_scale;
+            rb_head[ri0 + hlf] = (y0 * sf0 + y1 * cc0) * rb_p.rope_scale;
+            ri0 = ri0 + 32u;
+        }
+    }
+    workgroupBarrier();
+    for (var i = 0u; i < nt; i = i + 1u) {
+        let d = i * 32u + lane;
+        if (d < hd) { xv[i] = rb_head[d]; }
+    }
+    workgroupBarrier();
+    if (normed) {
+        let inv = 1.0 / sqrt(rb_red[0] / f32(hd) + rb_p.eps);
+        let gemma = (rb_p.flags & 8u) != 0u;
+        for (var i = 0u; i < nt; i = i + 1u) {
+            let d = i * 32u + lane;
+            if (d < hd) {
+                var wd = select(rb_knw[d], rb_qnw[d], isq);
+                if (gemma) { wd = 1.0 + wd; }
+                xv[i] = xv[i] * inv * wd;
+            }
+        }
+    }
+    for (var i = 0u; i < nt; i = i + 1u) {
+        let d = i * 32u + lane;
+        if (d < hd) { rb_head[d] = xv[i]; }
+    }
+    workgroupBarrier();
+    if (!late) {
+        var ri = lane;
+        loop {
+            if (ri >= hlf) { break; }
+            let angle = f32(pos) * rb_invf[ri];
+            let cc = cos(angle);
+            let sfac = sin(angle);
+            let x0 = rb_head[ri];
+            let x1 = rb_head[ri + hlf];
+            rb_head[ri] = (x0 * cc - x1 * sfac) * rb_p.rope_scale;
+            rb_head[ri + hlf] = (x0 * sfac + x1 * cc) * rb_p.rope_scale;
+            ri = ri + 32u;
+        }
+    }
+    workgroupBarrier();
+    for (var i = 0u; i < nt; i = i + 1u) {
+        let d = i * 32u + lane;
+        if (d < hd) {
+            if (isq) { rb_qout[qoff + src_base + d] = rb_head[d]; } else { rb_k[koff + src_base + d] = rb_head[d]; }
+        }
     }
 }
 
@@ -17566,6 +17885,16 @@ struct GraphX {
     /// such layers then take `gqa_attend_x` + `gate_mul` — the rest of the
     /// set (MiMo-V2's attend) never depends on it.
     attend_g: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    /// `gqa_attend_part_xg`: the GQA-shared 64-position split decode
+    /// attend (+ `gqa_attend_merge_x`). None on a device that rejects it
+    /// or under `CMF_ATTEND_XG=0`; the token graph then keeps
+    /// `gqa_attend_x` / `gqa_attend_part_x`.
+    part_g: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    /// The batch graph's one-dispatch-per-stage attention for a contiguous
+    /// run (`rope_xb`, `kv_append_xb`, `gqa_attend_part_xgb`,
+    /// `gqa_attend_merge_xb`). None on rejection or `CMF_ATTEND_XB=0`: the
+    /// batch keeps its per-token loop.
+    xb: Option<XBatch>,
     part: wgpu::ComputePipeline,
     merge: wgpu::ComputePipeline,
     q82_b: wgpu::ComputePipeline,
@@ -17577,6 +17906,17 @@ struct GraphX {
     part_l: wgpu::BindGroupLayout,
     merge_l: wgpu::BindGroupLayout,
     q82_l: wgpu::BindGroupLayout,
+}
+
+struct XBatch {
+    rope: wgpu::ComputePipeline,
+    rope_l: wgpu::BindGroupLayout,
+    kv: wgpu::ComputePipeline,
+    kv_l: wgpu::BindGroupLayout,
+    part: wgpu::ComputePipeline,
+    part_l: wgpu::BindGroupLayout,
+    merge: wgpu::ComputePipeline,
+    merge_l: wgpu::BindGroupLayout,
 }
 
 /// Bind group from explicit (binding, buffer) pairs — the ATTEND_X entry
@@ -18156,6 +18496,8 @@ struct Ctx {
     )>,
     /// The Qwen3.8-Flash-Next frame kernels, compiled on first use.
     qwen4_pipes: std::sync::OnceLock<Option<qwen4::Pipes>>,
+    /// The generic MoE block's row-blocked decode pair, compiled on first use.
+    moe_r4_pipes: std::sync::OnceLock<Option<moe_r4::Pipes>>,
     moe_down_q4tp_b2: wgpu::ComputePipeline,
     moe_down_q4tp_part: wgpu::ComputePipeline,
     moe_down_q4tp_b4: wgpu::ComputePipeline,
@@ -20365,6 +20707,51 @@ fn init(dev: usize) -> Result<Ctx, String> {
                     Some((p, l))
                 }
             };
+            let part_g = if std::env::var("CMF_ATTEND_XG").as_deref() == Ok("0") {
+                None
+            } else {
+                let sg = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let p = px("gqa_attend_part_xg");
+                if let Some(e) = pollster::block_on(sg.pop()) {
+                    tracing::warn!(
+                        "gqa_attend_part_xg rejected ({e}): geometry layers attend with \
+                         gqa_attend_x / gqa_attend_part_x"
+                    );
+                    None
+                } else {
+                    let l = p.get_bind_group_layout(0);
+                    Some((p, l))
+                }
+            };
+            let xb = if std::env::var("CMF_ATTEND_XB").as_deref() == Ok("0") || part_g.is_none() {
+                None
+            } else {
+                let sg = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let (rope, kv, part, merge) = (
+                    px("rope_xb"),
+                    px("kv_append_xb"),
+                    px("gqa_attend_part_xgb"),
+                    px("gqa_attend_merge_xb"),
+                );
+                if let Some(e) = pollster::block_on(sg.pop()) {
+                    tracing::warn!(
+                        "batched attend-x kernels rejected ({e}): the batch graph attends \
+                         per token"
+                    );
+                    None
+                } else {
+                    Some(XBatch {
+                        rope_l: rope.get_bind_group_layout(0),
+                        kv_l: kv.get_bind_group_layout(0),
+                        part_l: part.get_bind_group_layout(0),
+                        merge_l: merge.get_bind_group_layout(0),
+                        rope,
+                        kv,
+                        part,
+                        merge,
+                    })
+                }
+            };
             let mut q82_short = Vec::new();
             for rows in 1..=4 {
                 let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -20384,6 +20771,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
                 kv_l: kv_append.get_bind_group_layout(0),
                 attend_l: attend.get_bind_group_layout(0),
                 attend_g,
+                part_g,
+                xb,
                 part_l: part.get_bind_group_layout(0),
                 merge_l: merge.get_bind_group_layout(0),
                 q82_l: q82_b.get_bind_group_layout(0),
@@ -20697,6 +21086,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         dsv4_global_s16_capable: s16_capable,
         dsv4_global_s16_lazy: std::sync::OnceLock::new(),
         qwen4_pipes: std::sync::OnceLock::new(),
+        moe_r4_pipes: std::sync::OnceLock::new(),
         moe_down_q4tp_b2,
         moe_down_q4tp_part,
         moe_down_q4tp_b4,
@@ -26663,7 +27053,22 @@ pub fn forward_token_graph(
                         let n_all = position + 1;
                         let n = g.window.map_or(n_all, |w| n_all.min(w));
                         let first = n_all - n;
-                        let nc = mcap.div_ceil(ATTEND_X_CK);
+                        // GQA-shared 64-position split (`gqa_attend_part_xg`)
+                        // for every ungated layer it can serve; its chunk
+                        // length rides to the merge in word 10.
+                        let xg = gx
+                            .part_g
+                            .as_ref()
+                            .filter(|_| {
+                                hg.is_none()
+                                    && nh % g.nkv == 0
+                                    && nh / g.nkv <= 8
+                                    && hd % 4 == 0
+                                    && hd <= 256
+                                    && g.dv <= 128
+                            });
+                        let xg_ck = if xg.is_some() { 64 } else { 0 };
+                        let nc = mcap.div_ceil(if xg.is_some() { 64 } else { ATTEND_X_CK });
                         c.queue.write_buffer(
                             kvx_u,
                             0,
@@ -26692,7 +27097,7 @@ pub fn forward_token_graph(
                                 attn_scale.to_bits(),
                                 u32::from(g.sink.is_some()),
                                 nc as u32,
-                                0,
+                                xg_ck,
                                 0,
                             ]),
                         );
@@ -26719,7 +27124,46 @@ pub fn forward_token_graph(
                             pass.dispatch_workgroups(((g.nkv * hd) as u32).div_ceil(256), 1, 1);
                         }
                         ts_point!(enc, 22); // rope + kv append
-                        if !skip_attn && g.window.is_none() && n > ATTEND_SPLIT_MIN {
+                        if let (Some((pg, pg_l)), false) = (xg, skip_attn) {
+                            let xacc = GraphScratch::ensure(
+                                &c.device,
+                                &mut gs.xacc,
+                                (nh * nc * g.dv * 4) as u64,
+                                st,
+                                "g-xacc",
+                            );
+                            let xml = GraphScratch::ensure(
+                                &c.device,
+                                &mut gs.xml,
+                                (nh * nc * 8) as u64,
+                                st,
+                                "g-xml",
+                            );
+                            let bg_part = bind_pairs(
+                                c,
+                                pg_l,
+                                &[
+                                    (0, &qout),
+                                    (1, kbuf),
+                                    (2, vbuf),
+                                    (4, atx_u),
+                                    (6, &xacc),
+                                    (7, &xml),
+                                ],
+                            );
+                            let bg_merge = bind_pairs(
+                                c,
+                                &gx.merge_l,
+                                &[(3, &attn), (4, atx_u), (5, &sink_b), (6, &xacc), (7, &xml)],
+                            );
+                            let mut pass = begin_pass(&mut enc);
+                            pass.set_pipeline(pg);
+                            pass.set_bind_group(0, &bg_part, &[]);
+                            pass.dispatch_workgroups(g.nkv as u32, n.div_ceil(64) as u32, 1);
+                            pass.set_pipeline(&gx.merge);
+                            pass.set_bind_group(0, &bg_merge, &[]);
+                            pass.dispatch_workgroups(nh as u32, 1, 1);
+                        } else if !skip_attn && g.window.is_none() && n > ATTEND_SPLIT_MIN {
                             // Long full-context layer: chunks across
                             // workgroups, then a per-head merge (same pass —
                             // dispatch order makes the partials visible).
@@ -27908,8 +28352,61 @@ pub fn forward_token_graph(
                             &[mlogit, mslog, msel, mwt, &sel_u, &sgate.buf, &n1],
                         )
                     });
-                    let bg_gu = bg(l_gu, &[gate_all, up_all, &n1, msel, mact, &gu_u]);
-                    let bg_dn = bg(l_dn, &[down_all, mact, msel, mwt, &ob, &dn_u]);
+                    // q4tp experts: the row-blocked pair (four rows a
+                    // workgroup, vec4 activations, 16-byte weight words) when
+                    // the geometry admits it; `CMF_MOE_R4=0` keeps the
+                    // one-row kernels.
+                    let r4 = if *q4tp && !*gu_q2 {
+                        moe_r4::decode(c).filter(|_| {
+                            moe_r4::fits(hidden, *mi, gu_mat16, mat16(hidden, *mi))
+                        })
+                    } else {
+                        None
+                    };
+                    let (p_gu, p_dn, bg_gu, bg_dn, gu_wg, dn_wg) = if let Some(r4) = r4 {
+                        (
+                            &r4.gu,
+                            &r4.dn,
+                            bind_pairs(
+                                c,
+                                &r4.gu_l,
+                                &[
+                                    (0, gate_all),
+                                    (1, up_all),
+                                    (2, &n1),
+                                    (3, msel),
+                                    (4, mact),
+                                    (5, &gu_u),
+                                    (6, gate_all),
+                                    (7, up_all),
+                                ],
+                            ),
+                            bind_pairs(
+                                c,
+                                &r4.dn_l,
+                                &[
+                                    (8, down_all),
+                                    (9, down_all),
+                                    (10, mact),
+                                    (11, msel),
+                                    (12, mwt),
+                                    (13, &ob),
+                                    (14, &dn_u),
+                                ],
+                            ),
+                            (*mi / 4) as u32,
+                            (hidden / 4) as u32,
+                        )
+                    } else {
+                        (
+                            p_gu,
+                            p_dn,
+                            bg(l_gu, &[gate_all, up_all, &n1, msel, mact, &gu_u]),
+                            bg(l_dn, &[down_all, mact, msel, mwt, &ob, &dn_u]),
+                            *mi as u32,
+                            hidden as u32,
+                        )
+                    };
                     let pr = prep(router, &n1, mlogit, *n_exp, hidden);
                     let ps = prep(sgate, &n1, mslog, 1, hidden);
                     let mut continue_moe_std = true;
@@ -28030,11 +28527,11 @@ pub fn forward_token_graph(
                             if !skip_moe {
                                 pass.set_pipeline(p_gu);
                                 pass.set_bind_group(0, &bg_gu, &[]);
-                                pass.dispatch_workgroups(*mi as u32, slots as u32, 1);
+                                pass.dispatch_workgroups(gu_wg, slots as u32, 1);
                                 tsp!(pass, fine, 33); // gate/up experts
                                 pass.set_pipeline(p_dn);
                                 pass.set_bind_group(0, &bg_dn, &[]);
-                                pass.dispatch_workgroups(hidden as u32, 1, 1);
+                                pass.dispatch_workgroups(dn_wg, 1, 1);
                                 tsp!(pass, fine, 34); // down experts
                                 if let Some((p, b, w)) = &ffn_post {
                                     pass.set_pipeline(p);
@@ -28057,9 +28554,9 @@ pub fn forward_token_graph(
                                 let mut pass = begin_pass(&mut enc);
                                 pass.set_pipeline(p_gu);
                                 pass.set_bind_group(0, &bg_gu, &[]);
-                                pass.dispatch_workgroups(*mi as u32, slots as u32, 1);
+                                pass.dispatch_workgroups(gu_wg, slots as u32, 1);
                             }
-                            go(&mut enc, p_dn, &bg_dn, hidden as u32);
+                            go(&mut enc, p_dn, &bg_dn, dn_wg);
                         }
                     } // continue_moe_std
                 }
@@ -30300,6 +30797,145 @@ pub fn forward_batch_graph_at(
                             None,
                         );
                     }
+                } else if let Some((g, xb)) = geom.and_then(|g| {
+                    let hpk = nh / g.nkv.max(1);
+                    c.graph_x
+                        .as_ref()
+                        .and_then(|gx| gx.xb.as_ref())
+                        .filter(|_| {
+                            !*output_gate
+                                && nh % g.nkv == 0
+                                && hpk <= 8
+                                && hd % 4 == 0
+                                && hd <= 256
+                                && g.dv <= 128
+                                && g.window.is_none_or(|w| k <= w)
+                                && positions.windows(2).all(|w| w[1] == w[0] + 1)
+                        })
+                        .map(|xb| (g, xb))
+                }) {
+                    // Per-layer geometry, the whole contiguous run at once:
+                    // RoPE of every row, every row's K/V into the mirror,
+                    // then each token's causal (windowed) attend through
+                    // the GQA-shared 64-position split — four dispatches a
+                    // layer where the per-token loop below issues 4·k.
+                    let (kbuf, vbuf) = kvbufs[li].as_ref().unwrap();
+                    let mcap = xcaps[&li];
+                    let invf_l = stor(bytemuck::cast_slice(g.invf));
+                    let sink_b = match g.sink {
+                        Some(sk) => stor(bytemuck::cast_slice(sk)),
+                        None => rwc(nh),
+                    };
+                    let p0 = positions[0];
+                    let hpk = nh / g.nkv;
+                    let n_of = |t: usize| {
+                        let na = p0 + t + 1;
+                        g.window.map_or(na, |w| na.min(w))
+                    };
+                    let nc = n_of(k - 1).div_ceil(64);
+                    // Partials of a sub-run of tokens stay under ~64 MB.
+                    let per_tok = nh * nc * g.dv * 4;
+                    let sub = ((64usize << 20) / per_tok.max(1)).clamp(1, k);
+                    let qall = rwc(k * nh * hd);
+                    let xacc = rwc(sub * nh * nc * g.dv);
+                    let xml = rwc(sub * nh * nc * 2);
+                    let rope_u = unif(&rope_uniform_words(
+                        nh,
+                        g.nkv,
+                        hd,
+                        g.rd,
+                        p0,
+                        flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm),
+                        eps,
+                        0,
+                        g.rope_scale,
+                    ));
+                    let kvx_u = unif(&[
+                        g.nkv as u32,
+                        hd as u32,
+                        g.dv as u32,
+                        mcap as u32,
+                        p0 as u32,
+                        0,
+                        0,
+                        0,
+                    ]);
+                    let bg_rope = bind_pairs(
+                        c,
+                        &xb.rope_l,
+                        &[
+                            (10, &qraw_b),
+                            (11, &kb_b),
+                            (12, &qall),
+                            (13, &qnw),
+                            (14, &knw),
+                            (15, &invf_l),
+                            (16, &rope_u),
+                        ],
+                    );
+                    let bg_kv = bind_pairs(
+                        c,
+                        &xb.kv_l,
+                        &[(0, &kb_b), (1, &vb_b), (2, kbuf), (3, vbuf), (4, &kvx_u)],
+                    );
+                    let mut pass = begin_pass(&mut enc);
+                    pass.set_pipeline(&xb.rope);
+                    pass.set_bind_group(0, &bg_rope, &[]);
+                    pass.dispatch_workgroups((nh + g.nkv) as u32, k as u32, 1);
+                    state_started = true;
+                    pass.set_pipeline(&xb.kv);
+                    pass.set_bind_group(0, &bg_kv, &[]);
+                    pass.dispatch_workgroups(
+                        ((g.nkv * hd.max(g.dv)) as u32).div_ceil(256),
+                        k as u32,
+                        1,
+                    );
+                    let mut t0 = 0;
+                    while t0 < k {
+                        let kk = sub.min(k - t0);
+                        let ab_u = unif(&[
+                            nh as u32,
+                            hpk as u32,
+                            hd as u32,
+                            g.dv as u32,
+                            mcap as u32,
+                            p0 as u32,
+                            g.window.unwrap_or(0) as u32,
+                            attn_scale.to_bits(),
+                            u32::from(g.sink.is_some()),
+                            nc as u32,
+                            kk as u32,
+                            t0 as u32,
+                        ]);
+                        let bg_part = bind_pairs(
+                            c,
+                            &xb.part_l,
+                            &[
+                                (0, &qall),
+                                (1, kbuf),
+                                (2, vbuf),
+                                (6, &xacc),
+                                (7, &xml),
+                                (9, &ab_u),
+                            ],
+                        );
+                        let bg_merge = bind_pairs(
+                            c,
+                            &xb.merge_l,
+                            &[(3, &attn_bb), (5, &sink_b), (6, &xacc), (7, &xml), (9, &ab_u)],
+                        );
+                        pass.set_pipeline(&xb.part);
+                        pass.set_bind_group(0, &bg_part, &[]);
+                        pass.dispatch_workgroups(
+                            g.nkv as u32,
+                            n_of(t0 + kk - 1).div_ceil(64) as u32,
+                            kk as u32,
+                        );
+                        pass.set_pipeline(&xb.merge);
+                        pass.set_bind_group(0, &bg_merge, &[]);
+                        pass.dispatch_workgroups(nh as u32, kk as u32, 1);
+                        t0 += kk;
+                    }
                 } else if let Some(g) = geom {
                     // Per-layer geometry (MiMo-V2): per token, this layer's
                     // RoPE, the dv-wide append (a ring row for a sliding
@@ -31150,16 +31786,91 @@ pub fn forward_batch_graph_at(
                         &[gate_all, up_all, &n1, msel, mact, &gu_u],
                     );
                     let bg_dn = bg(&c.layout_moe_dn_b, &[down_all, mact, msel, mwt, &ob, &dn_u]);
+                    // Expert-grouped arm (no shared expert, q4tp geometry the
+                    // 16-byte word reads admit): bucket the selections by
+                    // expert, stream each expert once for its tokens, then
+                    // mix the slot outputs per token.
+                    let moeg = moe_r4::prefill(c).filter(|_| {
+                        !*has_shared && moe_r4::fits(hidden, *mi, gu_stride, mat16(hidden, *mi))
+                    });
                     let mut pass = begin_pass(&mut enc);
                     pass.set_pipeline(&c.moe_select_b);
                     pass.set_bind_group(0, &bg_sel, &[]);
                     pass.dispatch_workgroups(k as u32, 1, 1);
-                    pass.set_pipeline(&c.moe_gate_up_q4tp_b);
-                    pass.set_bind_group(0, &bg_gu, &[]);
-                    pass.dispatch_workgroups(*mi as u32, slots as u32, k as u32);
-                    pass.set_pipeline(&c.moe_down_q4tp_b);
-                    pass.set_bind_group(0, &bg_dn, &[]);
-                    pass.dispatch_workgroups(hidden as u32, k as u32, 1);
+                    if let Some(pg) = moeg {
+                        let n_ent = k * slots;
+                        let mkb = |n: usize, label: &str| {
+                            c.device.create_buffer(&wgpu::BufferDescriptor {
+                                label: Some(label),
+                                size: (n * 4).max(16) as u64,
+                                usage: wgpu::BufferUsages::STORAGE,
+                                mapped_at_creation: false,
+                            })
+                        };
+                        let goff = mkb(*n_exp + 1, "moeg-off");
+                        let gent = mkb(n_ent, "moeg-ent");
+                        let ypart = mkb(n_ent * hidden, "moeg-y");
+                        let gr_u = uniform_u32x4(c, [*n_exp as u32, n_ent as u32, 0, 0]);
+                        let gs_u = uniform_u32x4(
+                            c,
+                            [hidden as u32, slots as u32, (k * hidden) as u32, 0],
+                        );
+                        let bg_gr = bind_pairs(
+                            c,
+                            &pg.group_l,
+                            &[(0, msel), (1, &goff), (2, &gent), (3, &gr_u)],
+                        );
+                        let bg_ggu = bind_pairs(
+                            c,
+                            &pg.gu_l,
+                            &[
+                                (0, gate_all),
+                                (1, up_all),
+                                (2, gate_all),
+                                (3, up_all),
+                                (4, &n1),
+                                (5, &goff),
+                                (6, &gent),
+                                (7, mact),
+                                (8, &gu_u),
+                            ],
+                        );
+                        let bg_gdn = bind_pairs(
+                            c,
+                            &pg.dn_l,
+                            &[
+                                (0, down_all),
+                                (1, down_all),
+                                (2, mact),
+                                (3, &goff),
+                                (4, &gent),
+                                (5, &ypart),
+                                (6, &dn_u),
+                            ],
+                        );
+                        let bg_gs =
+                            bind_pairs(c, &pg.sum_l, &[(0, &ypart), (1, mwt), (2, &ob), (3, &gs_u)]);
+                        let tz = k.div_ceil(moe_r4::MOEG_TOKENS) as u32;
+                        pass.set_pipeline(&pg.group);
+                        pass.set_bind_group(0, &bg_gr, &[]);
+                        pass.dispatch_workgroups(1, 1, 1);
+                        pass.set_pipeline(&pg.gu);
+                        pass.set_bind_group(0, &bg_ggu, &[]);
+                        pass.dispatch_workgroups((*mi as u32).div_ceil(64), *n_exp as u32, tz);
+                        pass.set_pipeline(&pg.dn);
+                        pass.set_bind_group(0, &bg_gdn, &[]);
+                        pass.dispatch_workgroups((hidden as u32).div_ceil(64), *n_exp as u32, tz);
+                        pass.set_pipeline(&pg.sum);
+                        pass.set_bind_group(0, &bg_gs, &[]);
+                        pass.dispatch_workgroups(((k * hidden) as u32).div_ceil(256), 1, 1);
+                    } else {
+                        pass.set_pipeline(&c.moe_gate_up_q4tp_b);
+                        pass.set_bind_group(0, &bg_gu, &[]);
+                        pass.dispatch_workgroups(*mi as u32, slots as u32, k as u32);
+                        pass.set_pipeline(&c.moe_down_q4tp_b);
+                        pass.set_bind_group(0, &bg_dn, &[]);
+                        pass.dispatch_workgroups(hidden as u32, k as u32, 1);
+                    }
                     drop(pass);
                     continue_ffn = false;
                 }
@@ -66037,6 +66748,189 @@ pub fn attend_x_for_test(
     let ok = readback(c, enc, &ob, &stage, (nh * dv * 4) as u64, out);
     drop(keep);
     ok
+}
+
+/// The GQA-shared 64-position split attend (`gqa_attend_part_xg` +
+/// `gqa_attend_merge_x`), or — with `run > 0` — the batch graph's run
+/// kernels (`kv_append_xb`, `gqa_attend_part_xgb`, `gqa_attend_merge_xb`)
+/// for the LAST `run` positions, each attending its own causal (windowed)
+/// prefix. `q` is `[max(run,1)][nh][hd]`, `out` `[max(run,1)][nh][dv]`.
+/// False when the device or the kernels are missing.
+#[allow(clippy::too_many_arguments)]
+pub fn attend_xg_for_test(
+    q: &[f32],
+    k_rows: &[f32],
+    v_rows: &[f32],
+    sink: Option<&[f32]>,
+    window: Option<usize>,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    dv: usize,
+    scale: f32,
+    run: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let Some(gx) = c.graph_x.as_ref() else {
+        return false;
+    };
+    let Some((pg, pg_l)) = gx.part_g.as_ref() else {
+        return false;
+    };
+    let npos = k_rows.len() / (nkv * hd).max(1);
+    let rows = run.max(1);
+    if npos == 0
+        || run > npos
+        || q.len() != rows * nh * hd
+        || v_rows.len() != npos * nkv * dv
+        || out.len() != rows * nh * dv
+        || sink.is_some_and(|s| s.len() != nh)
+    {
+        return false;
+    }
+    let cap = match window {
+        Some(w) => kv_ring_cap(w),
+        None => npos.next_power_of_two(),
+    };
+    let pre = npos - run;
+    let kb = storage_bytes(c, bytemuck::cast_slice(k_rows));
+    let vb = storage_bytes(c, bytemuck::cast_slice(v_rows));
+    let kr = storage_bytes(c, bytemuck::cast_slice(&k_rows[pre * nkv * hd..]));
+    let vr = storage_bytes(c, bytemuck::cast_slice(&v_rows[pre * nkv * dv..]));
+    let qb = storage_bytes(c, bytemuck::cast_slice(q));
+    let zeros = vec![0f32; nh];
+    let sb = storage_bytes(c, bytemuck::cast_slice(sink.unwrap_or(&zeros)));
+    let kc = rw_f32(c, nkv * cap * hd, true);
+    let vc = rw_f32(c, nkv * cap * dv, true);
+    let ob = rw_f32(c, rows * nh * dv, true);
+    let n_of = |p: usize| window.map_or(p + 1, |w| (p + 1).min(w));
+    let nc = if run == 0 { cap.div_ceil(64) } else { n_of(npos - 1).div_ceil(64) };
+    let xacc = rw_f32(c, rows * nh * nc * dv, false);
+    let xml = rw_f32(c, rows * nh * nc * 2, false);
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("axg-test"),
+        });
+    let mut keep = Vec::new();
+    {
+        let mut pass = begin_pass(&mut enc);
+        let appended = if run == 0 { npos } else { pre };
+        for p in 0..appended {
+            let u = uniform_u32x8(
+                c,
+                [nkv as u32, hd as u32, dv as u32, cap as u32, p as u32, p as u32, 0, 0],
+            );
+            let bgk = bind_pairs(c, &gx.kv_l, &[(0, &kb), (1, &vb), (2, &kc), (3, &vc), (4, &u)]);
+            pass.set_pipeline(&gx.kv_append);
+            pass.set_bind_group(0, &bgk, &[]);
+            pass.dispatch_workgroups(((nkv * hd.max(dv)) as u32).div_ceil(256), 1, 1);
+            keep.push(u);
+        }
+        if run == 0 {
+            let n = n_of(npos - 1);
+            let au = storage_uniform(
+                c,
+                &[
+                    nh as u32,
+                    (nh / nkv) as u32,
+                    hd as u32,
+                    dv as u32,
+                    cap as u32,
+                    n as u32,
+                    (npos - n) as u32,
+                    scale.to_bits(),
+                    u32::from(sink.is_some()),
+                    nc as u32,
+                    64,
+                    0,
+                ],
+            );
+            let bgp = bind_pairs(
+                c,
+                pg_l,
+                &[(0, &qb), (1, &kc), (2, &vc), (4, &au), (6, &xacc), (7, &xml)],
+            );
+            let bgm = bind_pairs(
+                c,
+                &gx.merge_l,
+                &[(3, &ob), (4, &au), (5, &sb), (6, &xacc), (7, &xml)],
+            );
+            pass.set_pipeline(pg);
+            pass.set_bind_group(0, &bgp, &[]);
+            pass.dispatch_workgroups(nkv as u32, n.div_ceil(64) as u32, 1);
+            pass.set_pipeline(&gx.merge);
+            pass.set_bind_group(0, &bgm, &[]);
+            pass.dispatch_workgroups(nh as u32, 1, 1);
+            keep.push(au);
+        } else {
+            let Some(xb) = gx.xb.as_ref() else {
+                return false;
+            };
+            let ku = uniform_u32x8(
+                c,
+                [nkv as u32, hd as u32, dv as u32, cap as u32, pre as u32, 0, 0, 0],
+            );
+            let bgk = bind_pairs(c, &xb.kv_l, &[(0, &kr), (1, &vr), (2, &kc), (3, &vc), (4, &ku)]);
+            pass.set_pipeline(&xb.kv);
+            pass.set_bind_group(0, &bgk, &[]);
+            pass.dispatch_workgroups(((nkv * hd.max(dv)) as u32).div_ceil(256), run as u32, 1);
+            let au = storage_uniform(
+                c,
+                &[
+                    nh as u32,
+                    (nh / nkv) as u32,
+                    hd as u32,
+                    dv as u32,
+                    cap as u32,
+                    pre as u32,
+                    window.unwrap_or(0) as u32,
+                    scale.to_bits(),
+                    u32::from(sink.is_some()),
+                    nc as u32,
+                    run as u32,
+                    0,
+                ],
+            );
+            let bgp = bind_pairs(
+                c,
+                &xb.part_l,
+                &[(0, &qb), (1, &kc), (2, &vc), (6, &xacc), (7, &xml), (9, &au)],
+            );
+            let bgm = bind_pairs(
+                c,
+                &xb.merge_l,
+                &[(3, &ob), (5, &sb), (6, &xacc), (7, &xml), (9, &au)],
+            );
+            pass.set_pipeline(&xb.part);
+            pass.set_bind_group(0, &bgp, &[]);
+            pass.dispatch_workgroups(nkv as u32, nc as u32, run as u32);
+            pass.set_pipeline(&xb.merge);
+            pass.set_bind_group(0, &bgm, &[]);
+            pass.dispatch_workgroups(nh as u32, run as u32, 1);
+            keep.push(ku);
+            keep.push(au);
+        }
+    }
+    let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("axg-test-stage"),
+        size: (rows * nh * dv * 4) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let ok = readback(c, enc, &ob, &stage, (rows * nh * dv * 4) as u64, out);
+    drop(keep);
+    ok
+}
+
+fn storage_uniform(c: &Ctx, words: &[u32]) -> wgpu::Buffer {
+    c.device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("axg-test-u"),
+            contents: bytemuck::cast_slice(words),
+            usage: wgpu::BufferUsages::UNIFORM,
+        })
 }
 
 /// One hyper-connection join on the device: fold the copies (with the
