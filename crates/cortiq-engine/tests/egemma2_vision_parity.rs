@@ -103,7 +103,11 @@ impl Ctx {
             if cs < w.0 {
                 *w = (cs, format!("{id} @{dim}"));
             }
-            assert!(cs >= self.floor, "{id} dim {dim}: cosine {cs:.7} < {}", self.floor);
+            assert!(
+                cs >= self.floor,
+                "{id} dim {dim}: cosine {cs:.7} < {}",
+                self.floor
+            );
         }
         eprintln!("{line}");
     }
@@ -159,8 +163,16 @@ fn egemma2_vision_parity() {
     // ── images: resize bytes, soft tokens, embeddings
     let images = [
         ("image_fox_512_280", "image_fox_512.png", 280),
-        ("image_chart_rgba_1980x756_280", "image_chart_rgba_1980x756.png", 280),
-        ("image_portrait_530x941_280", "image_portrait_530x941.png", 280),
+        (
+            "image_chart_rgba_1980x756_280",
+            "image_chart_rgba_1980x756.png",
+            280,
+        ),
+        (
+            "image_portrait_530x941_280",
+            "image_portrait_530x941.png",
+            280,
+        ),
         ("image_tiny_64x48_280", "image_tiny_64x48.png", 280),
         ("image_fox_512_70", "image_fox_512.png", 70),
         ("image_fox_512_140", "image_fox_512.png", 140),
@@ -180,12 +192,7 @@ fn egemma2_vision_parity() {
         assert_eq!((th, tw), (hw[0], hw[1]), "{id}: resized size");
         let want = std::fs::read(vdir.join(format!("{id}.resized.u8"))).unwrap();
         let got = resize_bicubic_aa(&img, th, tw);
-        let diff = got
-            .data
-            .iter()
-            .zip(&want)
-            .filter(|(a, b)| a != b)
-            .count();
+        let diff = got.data.iter().zip(&want).filter(|(a, b)| a != b).count();
         let maxd = got
             .data
             .iter()
@@ -193,7 +200,10 @@ fn egemma2_vision_parity() {
             .map(|(&a, &b)| (a as i32 - b as i32).abs())
             .max()
             .unwrap_or(0);
-        eprintln!("{id:34} resize {tw}x{th}: {diff} of {} bytes differ (max {maxd})", want.len());
+        eprintln!(
+            "{id:34} resize {tw}x{th}: {diff} of {} bytes differ (max {maxd})",
+            want.len()
+        );
         assert_eq!(diff, 0, "{id}: resize is not byte-exact");
         let m = cx.enc.prepare_image(&img, Some(budget)).unwrap();
         let x = MixedInput {
@@ -257,7 +267,11 @@ fn egemma2_vision_parity() {
         media: vec![vin],
         ..Default::default()
     };
-    assert_eq!(cx.enc.input_ids(&x).unwrap(), cx.ids("video_fox_pan"), "video token ids");
+    assert_eq!(
+        cx.enc.input_ids(&x).unwrap(),
+        cx.ids("video_fox_pan"),
+        "video token ids"
+    );
     {
         let (tw, th) = proc.resized_size(fh[2], fh[1], 140).unwrap();
         let mut diff = 0usize;
@@ -274,7 +288,10 @@ fn egemma2_vision_parity() {
     }
     let t0 = std::time::Instant::now();
     let gv = cx.enc.embed(std::slice::from_ref(&x)).unwrap();
-    eprintln!("video (4 frames) embedded in {:.2}s", t0.elapsed().as_secs_f64());
+    eprintln!(
+        "video (4 frames) embedded in {:.2}s",
+        t0.elapsed().as_secs_f64()
+    );
     cx.check("video_fox_pan", &gv[0]);
     let mp4 = cx.refdir.join("inputs/video_fox_pan.mp4");
     match decode_video(&mp4, None, &proc) {
@@ -326,7 +343,9 @@ fn egemma2_vision_parity() {
 
     // text and media in one batch embed as they do apart
     let mixed = vec![
-        MixedInput::text(cortiq_engine::egemma2::TextInput::plain("a red fox in the snow")),
+        MixedInput::text(cortiq_engine::egemma2::TextInput::plain(
+            "a red fox in the snow",
+        )),
         x.clone(),
     ];
     let gm = cx.enc.embed(&mixed).unwrap();

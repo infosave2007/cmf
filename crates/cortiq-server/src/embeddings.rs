@@ -551,7 +551,8 @@ fn build_mixed(enc: &MediaEncoder, m: &MixedSpec, local: bool) -> Result<MixedIn
     let mut media = Vec::with_capacity(m.images.len() + m.videos.len());
     for (j, s) in m.images.iter().enumerate() {
         let bytes = fetch(s, local).map_err(|e| format!("image {j}: {e}"))?;
-        let img = cortiq_engine::media::decode_rgb(&bytes).map_err(|e| format!("image {j}: {e}"))?;
+        let img =
+            cortiq_engine::media::decode_rgb(&bytes).map_err(|e| format!("image {j}: {e}"))?;
         media.push(enc.prepare_image(&img, m.image_tokens)?);
     }
     for (j, s) in m.videos.iter().enumerate() {
@@ -567,7 +568,10 @@ fn build_mixed(enc: &MediaEncoder, m: &MixedSpec, local: bool) -> Result<MixedIn
             std::fs::write(&p, &bytes).map_err(|e| format!("video {j}: {e}"))?;
             (p.clone(), Some(TempFile(p)))
         } else if local {
-            (std::path::PathBuf::from(s.strip_prefix("file://").unwrap_or(s)), None)
+            (
+                std::path::PathBuf::from(s.strip_prefix("file://").unwrap_or(s)),
+                None,
+            )
         } else {
             return Err(fetch(s, local).err().unwrap_or_default());
         };
@@ -657,7 +661,9 @@ async fn embeddings(State(st): State<Arc<EmbedState>>, body: Bytes) -> Response 
         let mut b = if ids.is_empty() {
             Vec::new()
         } else {
-            enc.text.embed_ids(&ids).map_err(|e| bad(e, Some("input")))?
+            enc.text
+                .embed_ids(&ids)
+                .map_err(|e| bad(e, Some("input")))?
         }
         .into_iter();
         let mut out = Vec::with_capacity(inputs.len());
@@ -889,17 +895,25 @@ mod tests {
         assert_eq!(r.items.len(), 5);
         let Item::Text(t) = &r.items[0] else { panic!() };
         assert_eq!(t.prompt_name.as_deref(), Some("SearchQuery"));
-        let Item::Mixed(m) = &r.items[1] else { panic!() };
+        let Item::Mixed(m) = &r.items[1] else {
+            panic!()
+        };
         // media inputs do not inherit the request's prompt
         assert_eq!(m.prompt_name, None);
         assert_eq!(m.images.len(), 1);
-        let Item::Mixed(m) = &r.items[2] else { panic!() };
+        let Item::Mixed(m) = &r.items[2] else {
+            panic!()
+        };
         assert_eq!(m.text, "A fox: <|image|> in snow");
         assert_eq!(m.image_tokens, Some(560));
-        let Item::Mixed(m) = &r.items[3] else { panic!() };
+        let Item::Mixed(m) = &r.items[3] else {
+            panic!()
+        };
         assert_eq!(m.videos, vec!["https://x/v.mp4".to_string()]);
         assert_eq!(m.video_tokens, Some(70));
-        let Item::Mixed(m) = &r.items[4] else { panic!() };
+        let Item::Mixed(m) = &r.items[4] else {
+            panic!()
+        };
         assert_eq!(m.text, "Photo: <|image|>");
         assert_eq!(m.images, vec!["https://x/a.png".to_string()]);
         // a single content-part array is one input
@@ -908,7 +922,9 @@ mod tests {
             &p(),
         )
         .unwrap();
-        let Item::Mixed(m) = &r.items[0] else { panic!() };
+        let Item::Mixed(m) = &r.items[0] else {
+            panic!()
+        };
         assert_eq!(m.text, "<|image|> caption");
         // a media item may carry its own prompt
         let r = parse_request(
@@ -916,7 +932,9 @@ mod tests {
             &p(),
         )
         .unwrap();
-        let Item::Mixed(m) = &r.items[0] else { panic!() };
+        let Item::Mixed(m) = &r.items[0] else {
+            panic!()
+        };
         assert_eq!(m.title.as_deref(), Some("T"));
     }
 
