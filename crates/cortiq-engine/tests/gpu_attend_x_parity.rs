@@ -93,6 +93,11 @@ fn attend_x_matches_the_cpu_softmax_needs_cmf_gpu() {
         // workgroup walking three chunks, on the same rows
         (64, 4, 192, 128, 600, None, false, true),
         (64, 4, 192, 128, 600, None, false, false),
+        // Four chunks is the first 1,024-token global-attention boundary
+        // exercised by Mellum's periodic full-attention layers.  Keep the
+        // learned sink on here: it validates that the split merge retains
+        // both the value-less sink column and every chunk's denominator.
+        (64, 4, 192, 128, 1024, None, true, true),
         // sinks through the merge (not a MiMo shape: coverage)
         (8, 2, 64, 64, 520, None, true, true),
     ];

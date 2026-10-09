@@ -5418,7 +5418,16 @@ fn add_rmsnorm_b(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocatio
 // workgroup memory — no subgroup ops, portable). Heads [0,nh)=Q (2·hd each
 // when gated: q||gate), [nh,nh+nkv)=K. flags: 1=gate 2=qnorm 4=knorm 8=gemma
 // 32=norm-after-rope (HunYuan dense).
-struct RqP { nh: u32, nkv: u32, hd: u32, rd: u32, pos: u32, flags: u32, eps: f32, tok: u32 };
+// `rope_scale` is YaRN's post-rotation attention-amplitude factor. It
+// must stay separate from `rq_invf`: scaling the inverse frequencies would
+// change rotation angles, whereas YaRN scales the rotated Q/K values.
+// Kept at 48 bytes (three padding words) so every backend sees a stable
+// uniform stride.
+struct RqP {
+    nh: u32, nkv: u32, hd: u32, rd: u32,
+    pos: u32, flags: u32, eps: f32, tok: u32,
+    rope_scale: f32, _p0: u32, _p1: u32, _p2: u32,
+};
 @group(0) @binding(0) var<storage, read>       rq_qraw : array<f32>;
 @group(0) @binding(1) var<storage, read_write> rq_k    : array<f32>;
 @group(0) @binding(2) var<storage, read_write> rq_qout : array<f32>;
@@ -5488,8 +5497,8 @@ fn attn_rope_qkn(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocatio
             let sf0 = sin(angle0);
             let y0 = rq_head[ri0];
             let y1 = rq_head[ri0 + hlf];
-            rq_head[ri0] = y0 * cc0 - y1 * sf0;
-            rq_head[ri0 + hlf] = y0 * sf0 + y1 * cc0;
+            rq_head[ri0] = (y0 * cc0 - y1 * sf0) * rq_p.rope_scale;
+            rq_head[ri0 + hlf] = (y0 * sf0 + y1 * cc0) * rq_p.rope_scale;
             ri0 = ri0 + 32u;
         }
     }
@@ -5525,8 +5534,8 @@ fn attn_rope_qkn(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocatio
             let sfac = sin(angle);
             let x0 = rq_head[ri];
             let x1 = rq_head[ri + hlf];
-            rq_head[ri] = x0 * cc - x1 * sfac;
-            rq_head[ri + hlf] = x0 * sfac + x1 * cc;
+            rq_head[ri] = (x0 * cc - x1 * sfac) * rq_p.rope_scale;
+            rq_head[ri + hlf] = (x0 * sfac + x1 * cc) * rq_p.rope_scale;
             ri = ri + 32u;
         }
     }
@@ -18318,6 +18327,7 @@ struct Ctx {
     /// keeps them off the per-token encode critical path.
     uniforms: Mutex<HashMap<[u32; 4], wgpu::Buffer>>,
     uniforms8: Mutex<HashMap<[u32; 8], wgpu::Buffer>>,
+    uniforms12: Mutex<HashMap<[u32; 12], wgpu::Buffer>>,
     qwen4_uni16: Mutex<HashMap<[u32; 16], wgpu::Buffer>>,
     /// Immutable norm/small weight buffers cached by (data ptr, len), each
     /// carrying a content fingerprint — the ~200 per-layer norm uploads per
@@ -18957,7 +18967,7 @@ struct GraphScratch {
     // Position-dependent uniforms (fixed size, write_buffer each token)
     kv_u: Option<wgpu::Buffer>,   // 16 bytes: [nkv, hd, cap, position]
     at_u: Option<wgpu::Buffer>,   // 32 bytes: [nh, nh/nkv, hd, cap, pos+1, 0, 0, 0]
-    rope_u: Option<wgpu::Buffer>, // 32 bytes: [nh, nkv, hd, rd, pos, flags, eps, 0]
+    rope_u: Option<wgpu::Buffer>, // 48 bytes: [nh, nkv, hd, rd, pos, flags, eps, tok, rope_scale, 0, 0, 0]
     // Multi-step slots: one uniform PER STEP with a stable identity, so the
     // attention bind groups survive across chunks (write_buffer runs at
     // submit — a single shared uniform would collapse every step to the
@@ -20755,6 +20765,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         res_clock: std::sync::atomic::AtomicU64::new(0),
         uniforms: Mutex::new(HashMap::new()),
         uniforms8: Mutex::new(HashMap::new()),
+        uniforms12: Mutex::new(HashMap::new()),
         qwen4_uni16: Mutex::new(HashMap::new()),
         const_bufs: Mutex::new(HashMap::new()),
         gemm_w_bufs: Mutex::new(HashMap::new()),
@@ -23584,6 +23595,32 @@ pub fn attn_rope_qkn_gpu(
     k_out: &mut [f32],
     gout: &mut [f32],
 ) -> bool {
+    attn_rope_qkn_gpu_scaled(
+        qraw, k_in, qnw, knw, invf, nh, nkv, hd, rd, pos, flags, eps, 1.0, qout, k_out,
+        gout,
+    )
+}
+
+/// Internal parity entry point for YaRN's post-rotation amplitude factor.
+#[allow(clippy::too_many_arguments)]
+fn attn_rope_qkn_gpu_scaled(
+    qraw: &[f32],
+    k_in: &[f32],
+    qnw: &[f32],
+    knw: &[f32],
+    invf: &[f32],
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    rd: usize,
+    pos: usize,
+    flags: u32,
+    eps: f32,
+    rope_scale: f32,
+    qout: &mut [f32],
+    k_out: &mut [f32],
+    gout: &mut [f32],
+) -> bool {
     let Some(c) = ctx() else { return false };
     let qraw_b = storage_bytes(c, bytemuck::cast_slice(qraw));
     let k_b = c
@@ -23598,16 +23635,7 @@ pub fn attn_rope_qkn_gpu(
     let qnw_b = storage_bytes(c, bytemuck::cast_slice(qnw));
     let knw_b = storage_bytes(c, bytemuck::cast_slice(knw));
     let invf_b = storage_bytes(c, bytemuck::cast_slice(invf));
-    let p_data = [
-        nh as u32,
-        nkv as u32,
-        hd as u32,
-        rd as u32,
-        pos as u32,
-        flags,
-        eps.to_bits(),
-        0u32,
-    ];
+    let p_data = rope_uniform_words(nh, nkv, hd, rd, pos, flags, eps, 0, rope_scale);
     let p_buf = c
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -24097,16 +24125,8 @@ pub fn attn_dropin_gpu(
     encode_matvec_q1(c, &mut enc, &wq, &normed_b, &qraw_b, nh * hd, hidden);
     encode_matvec_q1(c, &mut enc, &wk, &normed_b, &k_b, nkv * hd, hidden);
     encode_matvec_q1(c, &mut enc, &wv, &normed_b, &v_b, nkv * hd, hidden);
-    let rq_p = unif(&[
-        nh as u32,
-        nkv as u32,
-        hd as u32,
-        rd as u32,
-        pos as u32,
-        flags,
-        eps.to_bits(),
-        0,
-    ]);
+    let rq_words = rope_uniform_words(nh, nkv, hd, rd, pos, flags, eps, 0, 1.0);
+    let rq_p = unif(&rq_words);
     go(
         &mut enc,
         &c.attn_rope,
@@ -25698,7 +25718,7 @@ pub fn forward_token_graph(
     };
     mku(&mut gs.kv_us, 16, steps);
     mku(&mut gs.at_us, 32, steps);
-    mku(&mut gs.rope_us, 32, steps * layers.len());
+    mku(&mut gs.rope_us, 48, steps * layers.len());
     if !xcaps.is_empty() {
         mku(&mut gs.kvx_us, 32, steps * layers.len());
         mku(&mut gs.atx_us, 48, steps * layers.len());
@@ -26404,16 +26424,17 @@ pub fn forward_token_graph(
                     c.queue.write_buffer(
                         &rope_u,
                         0,
-                        bytemuck::cast_slice(&[
-                            nh as u32,
-                            lnkv as u32,
-                            hd as u32,
-                            lrd as u32,
-                            position as u32,
+                        bytemuck::cast_slice(&rope_uniform_words(
+                            nh,
+                            lnkv,
+                            hd,
+                            lrd,
+                            position,
                             flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm) | gate_flag,
-                            eps.to_bits(),
+                            eps,
                             0,
-                        ]),
+                            geom.map_or(1.0, |g| g.rope_scale),
+                        )),
                     );
                     let qkv_in = match prism_input(
                         &mut enc,
@@ -30197,19 +30218,20 @@ pub fn forward_batch_graph_at(
                     let mut pass = begin_pass(&mut enc);
                     for i in 0..k {
                         let p = positions[i];
-                        let rope_u = uniform_u32x8(
+                        let rope_u = uniform_rope(
                             c,
-                            [
-                                nh as u32,
-                                nkv as u32,
-                                hd as u32,
-                                rd as u32,
-                                p as u32,
+                            rope_uniform_words(
+                                nh,
+                                nkv,
+                                hd,
+                                rd,
+                                p,
                                 flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm)
                                     | if *output_gate { 1 } else { 0 },
-                                eps.to_bits(),
-                                i as u32,
-                            ],
+                                eps,
+                                i,
+                                1.0,
+                            ),
                         );
                         let o1_u = uniform_u32x8(
                             c,
@@ -30304,16 +30326,18 @@ pub fn forward_batch_graph_at(
                         let p = positions[i];
                         // Fresh, not the content-keyed cache: a long prompt
                         // would park one cached uniform per position there.
-                        let rope_u = unif(&[
-                            nh as u32,
-                            g.nkv as u32,
-                            hd as u32,
-                            g.rd as u32,
-                            p as u32,
+                        let rope_words = rope_uniform_words(
+                            nh,
+                            g.nkv,
+                            hd,
+                            g.rd,
+                            p,
                             flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm),
-                            eps.to_bits(),
-                            i as u32,
-                        ]);
+                            eps,
+                            i,
+                            g.rope_scale,
+                        );
+                        let rope_u = unif(&rope_words);
                         let kvx_u = unif(&[
                             g.nkv as u32,
                             hd as u32,
@@ -30438,18 +30462,19 @@ pub fn forward_batch_graph_at(
                     for i in 0..k {
                         let p = positions[i];
                         let gate_flag = if *output_gate { 1u32 } else { 0 };
-                        let rope_u = uniform_u32x8(
+                        let rope_u = uniform_rope(
                             c,
-                            [
-                                nh as u32,
-                                nkv as u32,
-                                hd as u32,
-                                rd as u32,
-                                p as u32,
+                            rope_uniform_words(
+                                nh,
+                                nkv,
+                                hd,
+                                rd,
+                                p,
                                 flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm) | gate_flag,
-                                eps.to_bits(),
-                                i as u32,
-                            ],
+                                eps,
+                                i,
+                                1.0,
+                            ),
                         );
                         let kv_u = uniform_u32x4(
                             c,
@@ -33440,16 +33465,8 @@ pub fn attn_block_gpu(
     encode_matvec_q1(c, &mut enc, &wk_b, &normed_b, &k_b, nkv * hd, hidden);
     encode_matvec_q1(c, &mut enc, &wv_b, &normed_b, &v_b, nkv * hd, hidden);
     // 3. rope + qk-norm
-    let rq_p = unif(&[
-        nh as u32,
-        nkv as u32,
-        hd as u32,
-        rd as u32,
-        stored as u32,
-        flags,
-        eps.to_bits(),
-        0,
-    ]);
+    let rq_words = rope_uniform_words(nh, nkv, hd, rd, stored, flags, eps, 0, 1.0);
+    let rq_p = unif(&rq_words);
     dispatch(
         &mut enc,
         &c.attn_rope,
@@ -42630,6 +42647,52 @@ fn uniform_u32x8(c: &Ctx, v: [u32; 8]) -> wgpu::Buffer {
     b
 }
 
+/// Parameters for `attn_rope_qkn`. The final four words make the uniform
+/// 48 bytes and carry YaRN's *amplitude* factor without changing angles.
+#[inline]
+fn rope_uniform_words(
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    rd: usize,
+    pos: usize,
+    flags: u32,
+    eps: f32,
+    tok: usize,
+    rope_scale: f32,
+) -> [u32; 12] {
+    [
+        nh as u32,
+        nkv as u32,
+        hd as u32,
+        rd as u32,
+        pos as u32,
+        flags,
+        eps.to_bits(),
+        tok as u32,
+        rope_scale.to_bits(),
+        0,
+        0,
+        0,
+    ]
+}
+
+fn uniform_rope(c: &Ctx, v: [u32; 12]) -> wgpu::Buffer {
+    let mut u = c.uniforms12.lock().unwrap();
+    if let Some(b) = u.get(&v) {
+        return b.clone();
+    }
+    let b = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("rope-u"),
+            contents: bytemuck::cast_slice(&v),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    u.insert(v, b.clone());
+    b
+}
+
 fn encode_f32matvec_off(
     c: &Ctx,
     enc: &mut wgpu::CommandEncoder,
@@ -44962,6 +45025,8 @@ mod tests {
         // (>4-slot xv) and hlf=32 exercise the paths that broke the graph.
         let (nh, nkv, hd, rd, pos) = (4usize, 2usize, 256usize, 64usize, 5usize);
         let eps = 1e-6f32;
+        // Mellum's global YaRN layers use this exact post-rotation factor.
+        let rope_scale = 1.2772588722239782f32;
         let flags = 1u32 | 2u32 | 4u32; // gate + qnorm + knorm, non-gemma
         let jitter = |a: usize, b: usize| ((a * 31 + b * 17 + 7) % 97) as f32 / 97.0 - 0.5;
         // qraw: nh heads × 2·hd (q part || gate part); k: nkv × hd
@@ -44984,8 +45049,8 @@ mod tests {
                 let ang = pos as f32 * invf[i];
                 let (c, s) = (ang.cos(), ang.sin());
                 let (x0, x1) = (v[i], v[i + hlf]);
-                v[i] = x0 * c - x1 * s;
-                v[i + hlf] = x0 * s + x1 * c;
+                v[i] = (x0 * c - x1 * s) * rope_scale;
+                v[i + hlf] = (x0 * s + x1 * c) * rope_scale;
             }
         };
         let mut want_q = vec![0f32; nh * hd];
@@ -45006,9 +45071,9 @@ mod tests {
         let mut got_q = vec![0f32; nh * hd];
         let mut got_k = vec![0f32; nkv * hd];
         let mut got_g = vec![0f32; nh * hd];
-        assert!(attn_rope_qkn_gpu(
-            &qraw, &k_in, &qnw, &knw, &invf, nh, nkv, hd, rd, pos, flags, eps, &mut got_q,
-            &mut got_k, &mut got_g,
+        assert!(attn_rope_qkn_gpu_scaled(
+            &qraw, &k_in, &qnw, &knw, &invf, nh, nkv, hd, rd, pos, flags, eps, rope_scale,
+            &mut got_q, &mut got_k, &mut got_g,
         ));
         let md = |a: &[f32], b: &[f32]| {
             a.iter()
@@ -48860,9 +48925,9 @@ fn main() {
             let qout = mkb(&vec![0f32; nh * hd]);
             let gout = mkb(&vec![0f32; nh * hd]);
             let out_r = mkb(&vec![0f32; nh * hd]);
-            let rope_u = uniform_u32x8(
+            let rope_u = uniform_rope(
                 c,
-                [nh as u32, nkv as u32, hd as u32, rd as u32, pos as u32, 0, 1e-6f32.to_bits(), 0],
+                rope_uniform_words(nh, nkv, hd, rd, pos, 0, 1e-6, 0, 1.0),
             );
             let kv_u = uniform_u32x4(c, [nkv as u32, hd as u32, cap as u32, pos as u32]);
             let bgm = |l: &wgpu::BindGroupLayout, bufs: &[&wgpu::Buffer]| {
@@ -64256,6 +64321,29 @@ fn uni_slot8(c: &Ctx, tag: u8, kv: u64, li: usize, vals: [u32; 8]) -> wgpu::Buff
             .clone()
     };
     note_slot_write(c, "uni8", (tag, kv, li));
+    c.queue.write_buffer(&b, 0, bytemuck::cast_slice(&vals));
+    b
+}
+
+/// `uni_slot8`'s 48-byte twin. Kept separate because `attn_rope_qkn`'s
+/// YaRN factor enlarged its uniform from eight to twelve words; tags using
+/// this helper must never share a slot with an 8-word user.
+fn uni_slot12(c: &Ctx, tag: u8, kv: u64, li: usize, vals: [u32; 12]) -> wgpu::Buffer {
+    let li = dsv4_salted_li(li);
+    let b = {
+        let mut m = c.dsv4_uni.lock().unwrap();
+        m.entry((tag, kv, li))
+            .or_insert_with(|| {
+                c.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("dsv4-uni-slot12"),
+                    size: 48,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            })
+            .clone()
+    };
+    note_slot_write(c, "uni12", (tag, kv, li));
     c.queue.write_buffer(&b, 0, bytemuck::cast_slice(&vals));
     b
 }

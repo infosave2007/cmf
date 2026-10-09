@@ -10228,7 +10228,22 @@ impl Pipeline {
     /// what that geometry does not express keeps the decline, by name.
     /// None for every model with one attention geometry.
     pub fn wgpu_graph_attn_decline(&self) -> Option<&'static str> {
-        self.graph_attn_decline_reason()?;
+        // Keep the ordinary (uniform) fast arms off YaRN until they carry a
+        // scale field too. A non-uniform geometry gets a `GraphAttnGeom` and
+        // is handled below by the generic graph kernels.
+        let geometry_reason = self.graph_attn_decline_reason();
+        let has_scaled_rope = (0..self.num_layers).any(|li| self.layer_rope_scale(li) != 1.0);
+        if has_scaled_rope && geometry_reason.is_none() {
+            return Some("scaled RoPE without per-layer geometry");
+        }
+        // For Q/K norm after partial RoPE, the scale changes only the rotary
+        // slice's RMS denominator. The generic graph deliberately declines
+        // that uncommon combination until it carries a separate rotary sum;
+        // Mellum has q/k norm before RoPE, so it remains on this path.
+        if has_scaled_rope && self.qk_norm_after_rope {
+            return Some("scaled RoPE with post-RoPE Q/K norm");
+        }
+        geometry_reason?;
         if self.global_attn.is_some() {
             return Some("per-layer head width (Gemma-4 global layers) with per-layer geometry");
         }
@@ -10238,9 +10253,9 @@ impl Pipeline {
         if self.attn_v_norm {
             return Some("V norm with per-layer geometry");
         }
-        if (0..self.num_layers).any(|li| self.layer_rope_scale(li) != 1.0) {
-            return Some("scaled RoPE positions with per-layer geometry");
-        }
+        // `GraphAttnGeom::rope_scale` carries YaRN's post-rotation
+        // attention-amplitude factor to the WGPU RoPE kernel. It is not an
+        // angular position scale, so it must not be folded into `invf`.
         if self.weights.layers.iter().any(|lw| {
             lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some()
         }) {
@@ -10291,6 +10306,7 @@ impl Pipeline {
             dv: self.layer_v_dim(li),
             rd,
             invf,
+            rope_scale: self.layer_rope_scale(li),
             window: self.layer_window(li),
             sink: self.kv_cache.layers[li].sinks.as_deref(),
         })
@@ -20183,28 +20199,23 @@ mod tests {
         assert_eq!(q.graph_attn_geom(0).unwrap().window, Some(4));
         assert_eq!(q.graph_attn_geom(1).unwrap().window, None);
 
-        // Outside the per-layer geometry: a named wgpu decline, logged
-        // once per site.
+        // YaRN's post-rotation amplitude factor rides the per-layer graph
+        // geometry. It is intentionally not an angular scale folded into
+        // `invf`: the WGPU RoPE kernel receives it separately.
         let mut q = mimo_test_pipeline();
+        q.rope_scale = 2.0;
+        q.rope_scale_local = 1.25;
+        assert_eq!(q.wgpu_graph_attn_decline(), None);
+        assert_eq!(q.graph_attn_geom(0).unwrap().rope_scale, 2.0);
+        assert_eq!(q.graph_attn_geom(1).unwrap().rope_scale, 1.25);
+
+        // A uniform YaRN model cannot yet pass the factor through the fused
+        // RKV arm; decline safely instead of producing scale-1 output.
+        let mut q = plain();
         q.rope_scale = 2.0;
         assert_eq!(
             q.wgpu_graph_attn_decline(),
-            Some("scaled RoPE positions with per-layer geometry")
-        );
-        let emb = q.embed_single(3);
-        assert!(
-            q.try_token_graph_wgpu_steps(&emb, 0, &mut lg, 1, None, None, 0, q.num_layers)
-                .is_none()
-        );
-        let _ = q.try_token_graph_wgpu_steps(&emb, 1, &mut lg, 1, None, None, 0, q.num_layers);
-        let lines = q.graph_declines();
-        assert_eq!(
-            lines
-                .iter()
-                .filter(|l| l.starts_with("wgpu token graph") && l.contains("scaled RoPE"))
-                .count(),
-            1,
-            "{lines:?}"
+            Some("scaled RoPE without per-layer geometry")
         );
     }
 

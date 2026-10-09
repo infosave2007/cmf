@@ -1641,6 +1641,11 @@ pub struct GraphAttnGeom<'a> {
     pub rd: usize,
     /// This layer's RoPE inverse frequencies (`rd / 2` of them).
     pub invf: &'a [f32],
+    /// YaRN attention-amplitude factor applied after the rotary pair
+    /// transform. `1.0` is ordinary RoPE; Mellum's global layers use
+    /// `1.277258872…`. This is deliberately per-layer: local and global
+    /// layers may have different RoPE tables and factors.
+    pub rope_scale: f32,
     /// Positions a query sees, its own included (MiMo-V2 SWA: 128);
     /// None = the whole context.
     pub window: Option<usize>,
