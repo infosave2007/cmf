@@ -78,6 +78,26 @@ const EPS: f64 = 1e-6;
 /// Soft tokens per packed tower forward.
 const PACK_SOFT: usize = 4096;
 
+/// `CMF_EGEMMA2_PROF=1`: the time split of every audio embedding call on
+/// stderr (front end, subsampling, projections, attention core, text).
+mod prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static MEL: AtomicU64 = AtomicU64::new(0);
+    pub static SUB: AtomicU64 = AtomicU64::new(0);
+    pub static LIN: AtomicU64 = AtomicU64::new(0);
+    pub static ATT: AtomicU64 = AtomicU64::new(0);
+    pub fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("CMF_EGEMMA2_PROF").is_ok_and(|v| v == "1"))
+    }
+    pub fn add(c: &AtomicU64, t: std::time::Instant) {
+        c.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+    pub fn take(c: &AtomicU64) -> f64 {
+        c.swap(0, Ordering::Relaxed) as f64 / 1e3
+    }
+}
+
 // ───────────────────────────── sizes ─────────────────────────────
 
 /// Mel frames of a clip of `n` samples (after the 30 s cut).
@@ -450,18 +470,29 @@ impl ClipLin {
     }
 
     fn apply(&self, x: &[f32], n: usize, pool: Option<&Pool>) -> Vec<f32> {
-        let xc: Vec<f32>;
+        let mut xc: Vec<f32>;
         let x = if self.lo_in.is_finite() || self.hi_in.is_finite() {
-            xc = x.iter().map(|v| v.clamp(self.lo_in, self.hi_in)).collect();
+            xc = x.to_vec();
+            let (lo, hi) = (self.lo_in, self.hi_in);
+            par_chunks(&mut xc, pool, &|_, c| {
+                for v in c {
+                    *v = v.clamp(lo, hi);
+                }
+            });
             &xc[..]
         } else {
             x
         };
+        let t0 = std::time::Instant::now();
         let mut y = self.w.apply(x, n, pool);
+        prof::add(&prof::LIN, t0);
         if self.lo_out.is_finite() || self.hi_out.is_finite() {
-            for v in y.iter_mut() {
-                *v = v.clamp(self.lo_out, self.hi_out);
-            }
+            let (lo, hi) = (self.lo_out, self.hi_out);
+            par_chunks(&mut y, pool, &|_, c| {
+                for v in c {
+                    *v = v.clamp(lo, hi);
+                }
+            });
         }
         y
     }
@@ -720,7 +751,9 @@ impl AudioTower {
     /// each, in order. Clips are packed through the tower together.
     pub fn soft_tokens(&self, clips: &[&[f32]]) -> Vec<Vec<f32>> {
         let _g = self.busy.lock().unwrap_or_else(|e| e.into_inner());
+        let t0 = std::time::Instant::now();
         let mels: Vec<(Vec<f32>, usize)> = clips.iter().map(|c| self.log_mel(c)).collect();
+        prof::add(&prof::MEL, t0);
         let mut out = Vec::with_capacity(clips.len());
         let mut start = 0usize;
         while start < mels.len() {
@@ -765,7 +798,9 @@ impl AudioTower {
         let mut x = Vec::new();
         let mut lens = Vec::with_capacity(mels.len());
         for &(m, frames) in mels {
+            let t0 = std::time::Instant::now();
             let (sub, t) = self.subsample(m, frames, pool);
+            prof::add(&prof::SUB, t0);
             x.extend_from_slice(&sub);
             lens.push(t);
         }
@@ -779,7 +814,9 @@ impl AudioTower {
         for &l in &lens {
             pos.extend(0..l);
         }
+        let t0 = std::time::Instant::now();
         let mut h = self.in_proj.apply(&x, n, pool);
+        prof::add(&prof::LIN, t0);
         drop(x);
         if let Some(t) = trace.as_deref_mut() {
             t.push(h.clone());
@@ -799,27 +836,34 @@ impl AudioTower {
             drop(gl);
             norm_silu(&mut c, &l.lc_norm, d, pool);
             let e = l.lc_end.apply(&c, n, pool);
-            for (hv, ev) in h.iter_mut().zip(&e) {
-                *hv = ev + *hv;
-            }
+            par_chunks(&mut h, pool, &|off, c| {
+                for (hv, ev) in c.iter_mut().zip(&e[off..]) {
+                    *hv = ev + *hv;
+                }
+            });
             self.ffn(&l.ff2, &mut h, n, pool);
             h = rms_rows(&h, Some(&l.norm_out), d, pool);
             if let Some(t) = trace.as_deref_mut() {
                 t.push(h.clone());
             }
         }
+        let t0 = std::time::Instant::now();
         let mut o = self.out_proj.apply(&h, n, pool);
+        prof::add(&prof::LIN, t0);
         let od = self.out_bias.len();
-        for row in o.chunks_exact_mut(od) {
-            for (v, b) in row.iter_mut().zip(&self.out_bias) {
-                *v += b;
+        let bias = &self.out_bias;
+        par_chunks(&mut o, pool, &|off, c| {
+            for (i, v) in c.iter_mut().enumerate() {
+                *v += bias[(off + i) % od];
             }
-        }
+        });
         if let Some(t) = trace.as_deref_mut() {
             t.push(o.clone());
         }
         let on = rms_rows(&o, None, od, pool);
+        let t0 = std::time::Instant::now();
         let e = self.embed.apply(&on, n, pool);
+        prof::add(&prof::LIN, t0);
         let mut res = Vec::with_capacity(lens.len());
         let mut off = 0usize;
         for &l in &lens {
@@ -947,14 +991,18 @@ impl AudioTower {
         let mut k = l.k.apply(a, n, pool);
         let v = l.v.apply(a, n, pool);
         let (qs, ks) = (self.q_scale, self.k_scale);
-        for row in q.chunks_exact_mut(hd) {
-            for (x, &s) in row.iter_mut().zip(&l.q_dim) {
-                *x = (*x * qs) * s;
+        let qd = &l.q_dim;
+        par_chunks(&mut q, pool, &|off, c| {
+            for (i, x) in c.iter_mut().enumerate() {
+                *x = (*x * qs) * qd[(off + i) % hd];
             }
-        }
-        for x in k.iter_mut() {
-            *x *= ks;
-        }
+        });
+        par_chunks(&mut k, pool, &|_, c| {
+            for x in c {
+                *x *= ks;
+            }
+        });
+        let t_core = std::time::Instant::now();
         let mut out = vec![0f32; n * d];
         let dst = Shared(out.as_mut_ptr());
         let (left, cap) = (self.left, self.softcap);
@@ -995,6 +1043,7 @@ impl AudioTower {
                 }
             }
         });
+        prof::add(&prof::ATT, t_core);
         l.post.apply(&out, n, pool)
     }
 
@@ -1061,6 +1110,17 @@ fn check_frontend(pp: &serde_json::Value) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// `f(offset, slice)` over `x` in parallel slices.
+fn par_chunks(x: &mut [f32], pool: Option<&Pool>, f: &(dyn Fn(usize, &mut [f32]) + Sync)) {
+    let n = x.len();
+    let grain = 16384usize;
+    let dst = Shared(x.as_mut_ptr());
+    rows(pool, n.div_ceil(grain), &|s, e| {
+        let (lo, hi) = (s * grain, (e * grain).min(n));
+        f(lo, unsafe { dst.at(lo, hi - lo) });
+    });
 }
 
 /// LayerNorm over one channel row (no bias), then ReLU.
@@ -1249,7 +1309,13 @@ pub fn embed_audio_inputs(
         .iter()
         .flat_map(|i| i.clips.iter().map(|c| &c[..]))
         .collect();
+    let t_tower = std::time::Instant::now();
     let soft = tower.soft_tokens(&clips);
+    let tower_ms = t_tower.elapsed().as_secs_f64() * 1e3;
+    // the tower's projections go through the text encoder's `Mat`, whose
+    // profile counter the text forward reports: leave it the text's own
+    crate::egemma2::prof::take(&crate::egemma2::prof::LIN);
+    let t_text = std::time::Instant::now();
     let od = tower.out_dim;
     let d = enc.hidden();
     if od != d {
@@ -1299,6 +1365,24 @@ pub fn embed_audio_inputs(
         let lens: Vec<usize> = seqs[start..end].iter().map(|s| s.len()).collect();
         out.extend(enc.embed_merged(x, &lens));
         start = end;
+    }
+    if prof::on() {
+        let (mel, sub, lin, att) = (
+            prof::take(&prof::MEL),
+            prof::take(&prof::SUB),
+            prof::take(&prof::LIN),
+            prof::take(&prof::ATT),
+        );
+        let secs: f64 = clips.iter().map(|c| c.len() as f64).sum::<f64>() / SAMPLE_RATE as f64;
+        let toks: usize = soft.iter().map(|s| s.len() / od).sum();
+        eprintln!(
+            "egemma2 audio: {} clip(s), {secs:.2} s, {toks} soft tokens — tower {tower_ms:.1} ms \
+             (log-mel {mel:.1}, subsampling {sub:.1}, projections {lin:.1}, attention core {att:.1}, \
+             rest {:.1}); text {:.1} ms",
+            clips.len(),
+            tower_ms - mel - sub - lin - att,
+            t_text.elapsed().as_secs_f64() * 1e3
+        );
     }
     Ok(out)
 }
