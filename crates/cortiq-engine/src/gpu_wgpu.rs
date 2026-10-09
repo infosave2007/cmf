@@ -31,6 +31,8 @@ pub mod mimo_bank;
 pub(crate) mod qwen4;
 /// Row-blocked decode kernels for the generic q4tp MoE graph block.
 pub(crate) mod moe_r4;
+/// Token-axis batch kernels of the dense GDN hybrids (gated attention).
+pub(crate) mod dense_batch;
 
 /// Workgroup limit per dimension (WebGPU minimum; lm_head has more
 /// rows — we use grid-stride in the shader).
@@ -18564,6 +18566,8 @@ struct Ctx {
     qwen4_pipes: std::sync::OnceLock<Option<qwen4::Pipes>>,
     /// The generic MoE block's row-blocked decode pair, compiled on first use.
     moe_r4_pipes: std::sync::OnceLock<Option<moe_r4::Pipes>>,
+    /// Token-axis batch kernels of the dense hybrids (`dense_batch`).
+    dense_batch_pipes: std::sync::OnceLock<Option<dense_batch::Pipes>>,
     moe_down_q4tp_b2: wgpu::ComputePipeline,
     moe_down_q4tp_part: wgpu::ComputePipeline,
     moe_down_q4tp_b4: wgpu::ComputePipeline,
@@ -21167,6 +21171,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         dsv4_global_s16_lazy: std::sync::OnceLock::new(),
         qwen4_pipes: std::sync::OnceLock::new(),
         moe_r4_pipes: std::sync::OnceLock::new(),
+        dense_batch_pipes: std::sync::OnceLock::new(),
         moe_down_q4tp_b2,
         moe_down_q4tp_part,
         moe_down_q4tp_b4,
@@ -30285,6 +30290,11 @@ pub fn forward_batch_graph_at(
     let _kb_s = rwc(nkv * hd);
     let _vb_s = rwc(nkv * hd);
     let qout_s = rwc(nh * hd);
+    // Token-axis attention scratch (`dense_batch`), made at the first layer
+    // that runs it: batched Q and gate rows, split partials of a sub-run.
+    #[allow(clippy::type_complexity)]
+    let mut bt_bufs: Option<(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, usize, usize)> =
+        None;
     let gout_s = rwc(nh * hd);
     let attn_s = rwc(nh * hd);
     // Split-K attend partials for the per-row attention above 256 positions.
@@ -31381,13 +31391,31 @@ pub fn forward_batch_graph_at(
                     }
                 } else {
                     let (kbuf, vbuf) = kvbufs[li].as_ref().unwrap();
+                    // Past ATTEND_SPLIT_MIN every position takes the split
+                    // attend; those run as ONE token-axis dispatch per kernel
+                    // (`dense_batch`, bit-identical per token), the first
+                    // positions keep the loop below. `CMF_ATTN_BT=0`: all
+                    // positions through the loop.
+                    let bt = dense_batch::attn(c).filter(|_| {
+                        c.attend_gpart.is_some()
+                            && nh % nkv == 0
+                            && nh / nkv <= 8
+                            && hd <= 256
+                            && hd % 4 == 0
+                            && pos_end <= cap
+                    });
+                    let t_split = if bt.is_some() {
+                        ATTEND_SPLIT_MIN.saturating_sub(positions[0]).min(k)
+                    } else {
+                        k
+                    };
                     // ONE compute pass for every position: the loop's four
                     // dispatches per token each carried their own pass, and
                     // pass boundaries — not the math — were 4.3 of this
                     // stage's 5.4 ms. In-pass dispatch ordering already
                     // guarantees each sees the previous one's writes.
                     let mut pass = begin_pass(&mut enc);
-                    for i in 0..k {
+                    for i in 0..t_split {
                         let p = positions[i];
                         let gate_flag = if *output_gate { 1u32 } else { 0 };
                         let rope_u = uniform_rope(
@@ -31531,6 +31559,60 @@ pub fn forward_batch_graph_at(
                             i * nh * hd,
                             None,
                         );
+                    }
+                    drop(pass);
+                    if let Some(p) = bt.filter(|_| t_split < k) {
+                        let gate_flag = if *output_gate { 1u32 } else { 0 };
+                        let rope_words = rope_uniform_words(
+                            nh,
+                            nkv,
+                            hd,
+                            rd,
+                            positions[0],
+                            flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm) | gate_flag,
+                            eps,
+                            0,
+                            1.0,
+                        );
+                        let (qall, gall, pacc, pml, sub, nc) = bt_bufs.get_or_insert_with(|| {
+                            let nc = pos_end.div_ceil(dense_batch::BT_CK);
+                            let per_tok = nh * nc * hd * 4;
+                            let sub = ((64usize << 20) / per_tok.max(1)).clamp(1, k);
+                            (
+                                rwc(k * nh * hd),
+                                rwc(k * nh * hd),
+                                rwc(sub * nh * nc * hd),
+                                rwc(sub * nh * nc * 2),
+                                sub,
+                                nc,
+                            )
+                        });
+                        dense_batch::encode_attn_bt(
+                            c, &mut enc, p, rope_words, &qraw_b, &kb_b, &vb_b, qall, gall, &qnw,
+                            &knw, &invf_b, kbuf, vbuf, pacc, pml, &attn_bb, nh, nkv, hd, cap,
+                            positions[0], t_split, k, *sub, *nc, attn_scale,
+                        );
+                        if *output_gate {
+                            // The loop's gate_mul, over rows t_split..k at once
+                            // (the same element-wise product).
+                            let rows = k - t_split;
+                            let off = (t_split * nh * hd * 4) as u64;
+                            let len = (rows * nh * hd * 4) as u64;
+                            let gm_u = unif(&[(rows * nh * hd) as u32, 0, 0, 0]);
+                            let bgm = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: None,
+                                layout: &c.layout_gate_mul,
+                                entries: &[
+                                    bind_buf_off(0, gall, off, len),
+                                    bind_buf_off(1, &attn_bb, off, len),
+                                    bind_buf(2, &gm_u),
+                                ],
+                            });
+                            let mut pass = begin_pass(&mut enc);
+                            pass.set_pipeline(&c.gate_mul);
+                            pass.set_bind_group(0, &bgm, &[]);
+                            pass.dispatch_workgroups(((rows * nh * hd) as u32).div_ceil(256), 1, 1);
+                        }
                     }
                 }
                 let Some(attn_p) = prism_input_b(&mut enc, &[wo], &attn_bb, nh * ldv) else {
