@@ -10,6 +10,7 @@ pub mod dsv4;
 pub mod dsv41;
 pub mod dsv41_encoding;
 pub mod dsv41_vision;
+pub mod egemma2;
 pub(crate) mod expert_store;
 pub mod fcd;
 pub mod fcd_ops;
