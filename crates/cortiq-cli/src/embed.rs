@@ -189,7 +189,9 @@ fn build(enc: &MediaEncoder, s: &Spec, fps: Option<f64>) -> Result<(MixedInput, 
             notes.push(format!(
                 "video {} frames{} via {} → {} sampled {:?}, {} tokens each",
                 dv.total_frames,
-                dv.src_fps.map(|f| format!(" @ {f:.3} fps")).unwrap_or_default(),
+                dv.src_fps
+                    .map(|f| format!(" @ {f:.3} fps"))
+                    .unwrap_or_default(),
                 dv.decoder,
                 f.len(),
                 dv.indices,

@@ -565,7 +565,7 @@ pub(crate) fn gelu_mul(a: &mut [f32], b: &[f32], pool: Option<&Pool>) {
 }
 
 /// `y[n,m] = x[n,k] · w[m,k]ᵀ` where row `r` of `w` starts at `w[r·ldw]`.
-pub(crate) fn gemm_nt_strided(x: &[f32], w: &[f32], ldw: usize, y: &mut [f32], n: usize, k: usize, m: usize) {
+fn gemm_nt_strided(x: &[f32], w: &[f32], ldw: usize, y: &mut [f32], n: usize, k: usize, m: usize) {
     assert!(m == 0 || w.len() >= (m - 1) * ldw + k);
     if ldw == k {
         return crate::fcd_ops::gemm_nt_host(x, &w[..m * k], y, n, k, m, None);

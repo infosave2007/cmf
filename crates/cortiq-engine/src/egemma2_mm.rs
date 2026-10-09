@@ -130,7 +130,10 @@ impl MixedInput {
 pub fn layout_text(text: &str, media: &[Media]) -> Result<String, String> {
     let n_img = text.matches(IMAGE_PLACEHOLDER).count();
     let n_vid = text.matches(VIDEO_PLACEHOLDER).count();
-    let want_img = media.iter().filter(|m| matches!(m, Media::Image(_))).count();
+    let want_img = media
+        .iter()
+        .filter(|m| matches!(m, Media::Image(_)))
+        .count();
     let want_vid = media.len() - want_img;
     if n_img == 0 && n_vid == 0 {
         let mut parts: Vec<&str> = media.iter().map(|m| m.placeholder()).collect();
@@ -215,14 +218,18 @@ impl MediaEncoder {
 
     /// An image at `budget` soft tokens (`None`: the processor's default).
     pub fn prepare_image(&self, img: &RgbFrame, budget: Option<usize>) -> Result<Media, String> {
-        Ok(Media::Image(
-            self.proc
-                .prepare_image(img, budget.unwrap_or(self.proc.image_budget))?,
-        ))
+        Ok(Media::Image(self.proc.prepare_image(
+            img,
+            budget.unwrap_or(self.proc.image_budget),
+        )?))
     }
 
     /// Sampled video frames at `budget` soft tokens a frame.
-    pub fn prepare_frames(&self, frames: &[RgbFrame], budget: Option<usize>) -> Result<Media, String> {
+    pub fn prepare_frames(
+        &self,
+        frames: &[RgbFrame],
+        budget: Option<usize>,
+    ) -> Result<Media, String> {
         Ok(Media::Video(self.proc.prepare_frames(
             frames,
             budget.unwrap_or(self.proc.video_budget),
@@ -272,8 +279,10 @@ impl MediaEncoder {
         }
         // media of each kind, in the order their placeholders occur
         let order = placeholder_order(&full);
-        let mut imgs = (0..input.media.len()).filter(|&i| matches!(input.media[i], Media::Image(_)));
-        let mut vids = (0..input.media.len()).filter(|&i| matches!(input.media[i], Media::Video(_)));
+        let mut imgs =
+            (0..input.media.len()).filter(|&i| matches!(input.media[i], Media::Image(_)));
+        let mut vids =
+            (0..input.media.len()).filter(|&i| matches!(input.media[i], Media::Video(_)));
         let mut seq_media: Vec<usize> = Vec::with_capacity(order.len());
         for is_img in order {
             let m = if is_img { imgs.next() } else { vids.next() };

@@ -81,7 +81,15 @@ mod vprof {
     pub const MLP: usize = 4;
     pub const GELU: usize = 5;
     pub const NORMS: usize = 6;
-    const NAMES: [&str; 7] = ["q/k/v", "norm+rope", "attention core", "o", "mlp", "gelu", "norms"];
+    const NAMES: [&str; 7] = [
+        "q/k/v",
+        "norm+rope",
+        "attention core",
+        "o",
+        "mlp",
+        "gelu",
+        "norms",
+    ];
     static T: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
     pub fn on() -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -160,7 +168,8 @@ impl VisionProcessor {
         if let Some(x) = u(vp, "max_frames") {
             p.max_frames = x;
         }
-        p.overflow_truncate = vp.get("overflow_strategy").and_then(|x| x.as_str()) == Some("truncate");
+        p.overflow_truncate =
+            vp.get("overflow_strategy").and_then(|x| x.as_str()) == Some("truncate");
         p
     }
 
@@ -284,7 +293,11 @@ fn axis_taps(in_size: usize, out_size: usize) -> AxisTaps {
         .iter()
         .map(|&v| {
             let v = v * mul;
-            (if v < 0.0 { (-0.5 + v) as i32 } else { (0.5 + v) as i32 }) as i16
+            (if v < 0.0 {
+                (-0.5 + v) as i32
+            } else {
+                (0.5 + v) as i32
+            }) as i16
         })
         .collect();
     AxisTaps {
@@ -372,7 +385,8 @@ impl VisionInput {
 pub fn patchify(img: &RgbFrame, patch: usize) -> VisionInput {
     let (pw, ph) = (img.width / patch, img.height / patch);
     let dim = 3 * patch * patch;
-    let scale = 0.003_921_568_627_450_98_f32;
+    // the processor's rescale_factor (1/255 as Python's float), as f32
+    let scale = (1.0f64 / 255.0) as f32;
     let mut pixels = vec![0f32; pw * ph * dim];
     for py in 0..ph {
         for px in 0..pw {
@@ -380,7 +394,10 @@ pub fn patchify(img: &RgbFrame, patch: usize) -> VisionInput {
             for yy in 0..patch {
                 let row = (py * patch + yy) * img.width + px * patch;
                 let src = &img.data[row * 3..(row + patch) * 3];
-                for (d, &v) in dst[yy * patch * 3..(yy + 1) * patch * 3].iter_mut().zip(src) {
+                for (d, &v) in dst[yy * patch * 3..(yy + 1) * patch * 3]
+                    .iter_mut()
+                    .zip(src)
+                {
                     *d = 2.0 * (v as f32 * scale - 0.5);
                 }
             }
@@ -391,8 +408,19 @@ pub fn patchify(img: &RgbFrame, patch: usize) -> VisionInput {
 
 impl VisionProcessor {
     /// The size an image of `w × h` is resized to at `budget` soft tokens.
-    pub fn resized_size(&self, w: usize, h: usize, budget: usize) -> Result<(usize, usize), String> {
-        let (th, tw) = target_size(h, w, self.patch, budget * self.pool_k * self.pool_k, self.pool_k)?;
+    pub fn resized_size(
+        &self,
+        w: usize,
+        h: usize,
+        budget: usize,
+    ) -> Result<(usize, usize), String> {
+        let (th, tw) = target_size(
+            h,
+            w,
+            self.patch,
+            budget * self.pool_k * self.pool_k,
+            self.pool_k,
+        )?;
         Ok((tw, th))
     }
 
@@ -466,7 +494,11 @@ impl VisionProcessor {
                 // np.linspace(0, len-1, m, dtype=int): i·step, the last
                 // exactly the end, floored
                 let last = idx.len() - 1;
-                let step = if m > 1 { last as f64 / (m - 1) as f64 } else { 0.0 };
+                let step = if m > 1 {
+                    last as f64 / (m - 1) as f64
+                } else {
+                    0.0
+                };
                 idx = (0..m)
                     .map(|i| {
                         let t = if i + 1 == m && m > 1 {
@@ -558,7 +590,17 @@ pub fn decode_video(
     decode_with_ffmpeg(path, fps, proc)
 }
 
-fn ffprobe_stream(path: &Path) -> Result<(usize, usize, f64, Option<usize>, Option<f64>), String> {
+/// What ffprobe says about a video's first stream.
+struct Probe {
+    width: usize,
+    height: usize,
+    fps: f64,
+    /// the container's frame count, when it keeps one
+    frames: Option<usize>,
+    duration: Option<f64>,
+}
+
+fn ffprobe_stream(path: &Path) -> Result<Probe, String> {
     let out = std::process::Command::new("ffprobe")
         .args([
             "-v",
@@ -607,7 +649,13 @@ fn ffprobe_stream(path: &Path) -> Result<(usize, usize, f64, Option<usize>, Opti
         .as_str()
         .or_else(|| v["format"]["duration"].as_str())
         .and_then(|x| x.parse::<f64>().ok());
-    Ok((w, h, fps, nb, dur))
+    Ok(Probe {
+        width: w,
+        height: h,
+        fps,
+        frames: nb,
+        duration: dur,
+    })
 }
 
 fn decode_with_ffmpeg(
@@ -616,7 +664,13 @@ fn decode_with_ffmpeg(
     proc: &VisionProcessor,
 ) -> Result<DecodedVideo, String> {
     use std::io::Read;
-    let (w, h, probed_fps, nb, dur) = ffprobe_stream(path)?;
+    let Probe {
+        width: w,
+        height: h,
+        fps: probed_fps,
+        frames: nb,
+        duration: dur,
+    } = ffprobe_stream(path)?;
     let fps = fps_override.unwrap_or(probed_fps);
     // PyAV: total = stream.frames, duration = total / average_rate; a
     // container that does not count its frames falls back to its duration.
@@ -750,11 +804,7 @@ impl VisionTower {
                     .into(),
             );
         }
-        let prov = model
-            .header
-            .provenance
-            .clone()
-            .unwrap_or(Value::Null);
+        let prov = model.header.provenance.clone().unwrap_or(Value::Null);
         let vc = &prov["embedding_gemma2"]["config"]["vision_config"];
         let g = |k: &str, d: u64| vc.get(k).and_then(|v| v.as_u64()).unwrap_or(d) as usize;
         let hidden = g("hidden_size", 768);
@@ -762,7 +812,9 @@ impl VisionTower {
         let head_dim = g("head_dim", 64);
         let n_layers = g("num_hidden_layers", 16);
         let pool_k = g("pooling_kernel_size", 3);
-        let theta = vc["rope_parameters"]["rope_theta"].as_f64().unwrap_or(100.0) as f32;
+        let theta = vc["rope_parameters"]["rope_theta"]
+            .as_f64()
+            .unwrap_or(100.0) as f32;
         if vc.get("use_clipped_linears").and_then(|v| v.as_bool()) == Some(true) {
             return Err("vision tower with clipped linears is not supported".into());
         }
@@ -821,7 +873,11 @@ impl VisionTower {
             _ => GPU_MIN_PATCHES,
         };
         Ok(VisionTower {
-            input_proj: Mat::load(model, "vision_tower.patch_embedder.input_proj.weight", dequant)?,
+            input_proj: Mat::load(
+                model,
+                "vision_tower.patch_embedder.input_proj.weight",
+                dequant,
+            )?,
             pos,
             pos_rows: pos_shape[1],
             layers,
@@ -890,7 +946,10 @@ impl VisionTower {
         }
         let n = off;
         // patch embedding + the two position tables
-        let pix: Vec<f32> = inputs.iter().flat_map(|x| x.pixels.iter().copied()).collect();
+        let pix: Vec<f32> = inputs
+            .iter()
+            .flat_map(|x| x.pixels.iter().copied())
+            .collect();
         let mut h = self.input_proj.apply(&pix, n, pool);
         drop(pix);
         let (tx, ty) = self.pos.split_at(self.pos_rows * d);
@@ -1055,7 +1114,13 @@ impl VisionTower {
             let len = s.pw * s.ph;
             let rng = s.off * w..(s.off + len) * w;
             if len >= self.gpu_min_patches
-                && self.attend_gpu(&q[rng.clone()], &k[rng.clone()], &v[rng.clone()], len, &mut out[rng.clone()])
+                && self.attend_gpu(
+                    &q[rng.clone()],
+                    &k[rng.clone()],
+                    &v[rng.clone()],
+                    len,
+                    &mut out[rng.clone()],
+                )
             {
                 continue;
             }
@@ -1137,7 +1202,11 @@ fn sgemm_view(
             );
         }
         assert!(a.len() >= (m - 1) * lda + k);
-        assert!(if bt { b.len() >= (n - 1) * ldb + k } else { b.len() >= (k - 1) * ldb + n });
+        assert!(if bt {
+            b.len() >= (n - 1) * ldb + k
+        } else {
+            b.len() >= (k - 1) * ldb + n
+        });
         assert!(c.len() >= (m - 1) * ldc + n);
         // SAFETY: the views were bounds-checked above; row-major (101).
         unsafe {
@@ -1231,7 +1300,18 @@ fn attend_host(
     let mut bufs: [Vec<f32>; 3] = std::array::from_fn(|_| vec![0f32; qblock * len]);
     let scores = |t: usize, sc: &mut [f32]| {
         let (h, i0, nb) = step(t);
-        sgemm_view(&q[i0 * w + h * hd..], w, &k[h * hd..], w, true, &mut sc[..nb * len], len, nb, len, hd);
+        sgemm_view(
+            &q[i0 * w + h * hd..],
+            w,
+            &k[h * hd..],
+            w,
+            true,
+            &mut sc[..nb * len],
+            len,
+            nb,
+            len,
+            hd,
+        );
     };
     let outp = Shared(out.as_mut_ptr());
     let out_len = out.len();
@@ -1239,7 +1319,18 @@ fn attend_host(
         let (h, i0, nb) = step(t);
         // SAFETY: steps write disjoint (rows, head) blocks of `out`
         let o = unsafe { outp.at(0, out_len) };
-        sgemm_view(&sc[..nb * len], len, &v[h * hd..], w, false, &mut o[i0 * w + h * hd..], w, nb, hd, len);
+        sgemm_view(
+            &sc[..nb * len],
+            len,
+            &v[h * hd..],
+            w,
+            false,
+            &mut o[i0 * w + h * hd..],
+            w,
+            nb,
+            hd,
+            len,
+        );
     };
     let soft = |t: usize, sc: &mut [f32]| {
         let (_, _, nb) = step(t);
@@ -1303,7 +1394,11 @@ mod tests {
             ((360, 640, 140), (384, 720)),
         ];
         for ((h, w, b), want) in cases {
-            assert_eq!(target_size(h, w, 16, b * 9, 3).unwrap(), want, "{w}x{h} @ {b}");
+            assert_eq!(
+                target_size(h, w, 16, b * 9, 3).unwrap(),
+                want,
+                "{w}x{h} @ {b}"
+            );
         }
         // extreme aspect ratios clamp to one 48-px strip
         let (h, w) = target_size(10, 10_000, 16, 280 * 9, 3).unwrap();
@@ -1366,10 +1461,14 @@ mod tests {
         // C = A·Bᵀ and C = A·B on strided views, Accelerate vs the portable
         // gather path vs a scalar reference
         let (m, n, k, lda, ldb, ldc) = (5usize, 7usize, 9usize, 13usize, 11usize, 10usize);
-        let a: Vec<f32> = (0..m * lda).map(|i| ((i * 7 % 17) as f32 - 8.0) / 8.0).collect();
+        let a: Vec<f32> = (0..m * lda)
+            .map(|i| ((i * 7 % 17) as f32 - 8.0) / 8.0)
+            .collect();
         for bt in [true, false] {
             let blen = if bt { n * ldb } else { k * ldb };
-            let b: Vec<f32> = (0..blen).map(|i| ((i * 5 % 13) as f32 - 6.0) / 6.0).collect();
+            let b: Vec<f32> = (0..blen)
+                .map(|i| ((i * 5 % 13) as f32 - 6.0) / 6.0)
+                .collect();
             let mut want = vec![0f32; m * ldc];
             for r in 0..m {
                 for c in 0..n {
@@ -1406,14 +1505,19 @@ mod tests {
         for h in 0..nh {
             for i in 0..len {
                 let sc: Vec<f64> = (0..len)
-                    .map(|j| (0..hd).map(|c| (q[i * w + h * hd + c] * k[j * w + h * hd + c]) as f64).sum())
+                    .map(|j| {
+                        (0..hd)
+                            .map(|c| (q[i * w + h * hd + c] * k[j * w + h * hd + c]) as f64)
+                            .sum()
+                    })
                     .collect();
                 let mx = sc.iter().cloned().fold(f64::MIN, f64::max);
                 let e: Vec<f64> = sc.iter().map(|x| (x - mx).exp()).collect();
                 let z: f64 = e.iter().sum();
                 for c in 0..hd {
-                    want[i * w + h * hd + c] =
-                        (0..len).map(|j| e[j] / z * v[j * w + h * hd + c] as f64).sum::<f64>() as f32;
+                    want[i * w + h * hd + c] = (0..len)
+                        .map(|j| e[j] / z * v[j * w + h * hd + c] as f64)
+                        .sum::<f64>() as f32;
                 }
             }
         }
@@ -1421,7 +1525,11 @@ mod tests {
         for p in [None, Some(&pool)] {
             let mut out = vec![0f32; len * w];
             attend_host(&q, &k, &v, len, nh, hd, &mut out, p);
-            let err = out.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let err = out
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
             assert!(err < 1e-5, "max err {err}");
         }
     }
