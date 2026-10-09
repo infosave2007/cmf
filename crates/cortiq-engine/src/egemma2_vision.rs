@@ -45,7 +45,8 @@
 //! per weight over every patch of a batch); attention runs per image on the
 //! host in f32 (scores, softmax and value mix pipelined so the matrix unit
 //! and the vector units overlap), and on Metal's flash kernel for the
-//! largest images (budget 1120), where the n² term dominates
+//! largest images (4096+ patches: budgets 560, 1120), where the n² term
+//! dominates
 //! (`CMF_EGEMMA2_VISION_GPU=0` keeps everything on the host, `=1` sends
 //! every image to the device).
 
@@ -66,8 +67,9 @@ const PACK_PATCHES: usize = 10_080;
 /// rows a block takes.
 const SCORE_BLOCK: usize = 8 << 20;
 const QBLOCK_MIN: usize = 256;
-/// Images with at least this many patches attend on Metal when it is up.
-const GPU_MIN_PATCHES: usize = 8192;
+/// Images with at least this many patches attend on Metal when it is up
+/// (budgets 560 and 1120 of a square-ish image).
+const GPU_MIN_PATCHES: usize = 4096;
 
 /// `CMF_EGEMMA2_PROF=1`: per-forward time split of the tower on stderr.
 mod vprof {
@@ -808,9 +810,10 @@ impl VisionTower {
             .map(|i| 1.0f32 / theta.powf((2 * i) as f32 / (head_dim / 2) as f32))
             .collect();
         // Metal's flash attention (f16 operands, f32 sums) wins only where the
-        // n² scores dominate: measured on an M4, 4.7 s against 10.4 s at
-        // 9801 patches (budget 1120), a wash at 4761 (560), slower at 2304
-        // (280) than the pipelined host path, which is also exact f32.
+        // n² scores dominate. Attention core on an M4, device vs the
+        // pipelined host path: 4.3 s vs 8.2 s at 9801 patches (budget 1120),
+        // 1.05 s vs 1.68 s at 4761 (560), 0.43 s vs 0.35 s at 2304 (280) —
+        // where the host path, exact f32, stays.
         // CMF_EGEMMA2_VISION_GPU=0 never, =1 from 256 patches.
         let gpu_min_patches = match std::env::var("CMF_EGEMMA2_VISION_GPU").as_deref() {
             Ok("0") => usize::MAX,
