@@ -1,6 +1,6 @@
 //! `POST /v1/embeddings` for EmbeddingGemma 2 files — the OpenAI embeddings
-//! API over `cortiq_engine::egemma2`: texts, images, videos and interleaved
-//! text + media, one 768-d space.
+//! API over `cortiq_engine::egemma2`: texts, images, videos, audio and
+//! interleaved text + media, one 768-d space.
 //!
 //! An embedding file is an encoder: no pipeline, no KV cache, no chat. `cortiq
 //! serve` detects the architecture and runs this router instead of the LLM
@@ -23,21 +23,25 @@
 //!   per video frame (70 | 140 | 280 | 560 | 1120; defaults 280 / 140).
 //!
 //! An `input` array may also hold:
-//! * objects `{"text", "image", "video", "prompt_name"|"task", "title",
-//!   "prompt", "image_tokens", "video_tokens"}` — `image` / `video` a source
-//!   or a list of sources; a text with `<|image|>` / `<|video|>`
-//!   placeholders interleaves them in order (without placeholders the media
-//!   come first);
+//! * objects `{"text", "image", "video", "audio", "prompt_name"|"task",
+//!   "title", "prompt", "image_tokens", "video_tokens"}` — `image` /
+//!   `video` / `audio` a source or a list of sources; a text with
+//!   `<|image|>` / `<|video|>` / `<|audio|>` placeholders interleaves them in
+//!   order (without placeholders the media come first);
 //! * content-part arrays, interleaved in the order given:
 //!   `[{"type": "text", "text": …}, {"type": "image_url", "image_url":
-//!   {"url": …}}, {"type": "video_url", "video_url": {"url": …}}]`
-//!   (`input_image` / `image` / `video` with a `url` or `image_url` string
-//!   are accepted too).
+//!   {"url": …}}, {"type": "video_url", "video_url": {"url": …}},
+//!   {"type": "input_audio", "input_audio": {"data": <base64>, "format":
+//!   "wav"}}]` (`input_image` / `image` / `video` with a `url` or
+//!   `image_url` string, and `audio_url` / `audio` parts, are accepted too).
 //!
 //! A source is a `data:` URL (base64), an `http(s)://` URL, or — when the
-//! server listens on loopback, or `CMF_EMBED_LOCAL_MEDIA=1` — a local path.
-//! Videos are decoded with the `ffmpeg` executable (or a `.y4m` / frame
-//! directory path), sampled at 1 fps, at most 32 frames.
+//! server listens on loopback, or `CMF_EMBED_LOCAL_MEDIA=1` — a local path;
+//! an audio source may also be `{"data": <base64>, "format"?}`. Videos are
+//! decoded with the `ffmpeg` executable (or a `.y4m` / frame directory
+//! path), sampled at 1 fps, at most 32 frames. Audio is WAV (any rate and
+//! channel count: mixed to mono, resampled to 16 kHz) or, through
+//! `ffmpeg`, any other format; clips are cut at 30 s (750 tokens).
 //!
 //! Task prompts follow sentence-transformers: a request-level prompt
 //! applies to text-only inputs; an input with media takes a prompt only
@@ -56,7 +60,10 @@ use axum::{
 use base64::Engine as _;
 use cortiq_core::CmfModel;
 use cortiq_engine::egemma2::{MATRYOSHKA_DIMS, Prompts, TextInput, matryoshka};
-use cortiq_engine::egemma2_mm::{IMAGE_PLACEHOLDER, MediaEncoder, MixedInput, VIDEO_PLACEHOLDER};
+use cortiq_engine::egemma2_audio as ea;
+use cortiq_engine::egemma2_mm::{
+    AUDIO_PLACEHOLDER, IMAGE_PLACEHOLDER, Media, MediaEncoder, MixedInput, VIDEO_PLACEHOLDER,
+};
 use cortiq_engine::egemma2_vision::{BUDGETS, decode_video};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -65,7 +72,8 @@ use tower_http::cors::CorsLayer;
 
 /// OpenAI's own cap on inputs per request.
 const MAX_INPUTS: usize = 2048;
-/// Media items per request (each image is a ViT forward).
+/// Media items per request (each image is a ViT forward, each clip up to
+/// 30 s through the audio tower).
 const MAX_MEDIA: usize = 64;
 
 pub struct EmbedState {
@@ -122,6 +130,8 @@ pub struct MixedSpec {
     pub text: String,
     pub images: Vec<String>,
     pub videos: Vec<String>,
+    /// audio sources: a string, or `{"data", "format"}` / `{"url"}` …
+    pub audio: Vec<Value>,
     pub prompt_name: Option<String>,
     pub title: Option<String>,
     pub prompt: Option<String>,
@@ -267,6 +277,43 @@ fn sources(v: Option<&Value>, key: &'static str) -> Result<Vec<String>, ApiError
     }
 }
 
+/// The audio sources of an input object: its `audio` (a source or a list),
+/// or the object itself when it is an `input_audio` part.
+fn audio_sources(x: &Value) -> Result<Vec<Value>, ApiError> {
+    if x.get("type").and_then(Value::as_str) == Some("input_audio")
+        || x.get("input_audio").is_some()
+    {
+        let inner = x
+            .get("input_audio")
+            .ok_or_else(|| bad("an input_audio part needs 'input_audio'", Some("input")))?;
+        return Ok(vec![json!({ "input_audio": inner })]);
+    }
+    let a = match x.get("audio").or_else(|| x.get("audio_url")) {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(a) => a,
+    };
+    let list = match a {
+        Value::Array(v) => v.clone(),
+        v @ (Value::String(_) | Value::Object(_)) => vec![v.clone()],
+        _ => {
+            return Err(bad(
+                "'audio' must be a source (data URL, URL, path or {\"data\"}) or a list of them",
+                Some("input"),
+            ));
+        }
+    };
+    if list.is_empty() {
+        return Err(bad("'audio' is empty", Some("input")));
+    }
+    if !list.iter().all(|v| v.is_string() || v.is_object()) {
+        return Err(bad(
+            "each audio source must be a string or an object",
+            Some("input"),
+        ));
+    }
+    Ok(list)
+}
+
 /// OpenAI-style content parts, interleaved in order into one input.
 fn content_parts(parts: &[Value]) -> Result<MixedSpec, ApiError> {
     let mut texts: Vec<String> = Vec::new();
@@ -304,9 +351,19 @@ fn content_parts(parts: &[Value]) -> Result<MixedSpec, ApiError> {
                 spec.videos.push(s);
                 texts.push(VIDEO_PLACEHOLDER.to_string());
             }
+            "input_audio" | "audio_url" | "audio" => {
+                let mut a = audio_sources(p)?;
+                if a.len() != 1 {
+                    return Err(bad("an audio part holds one clip", Some("input")));
+                }
+                spec.audio.push(a.remove(0));
+                texts.push(AUDIO_PLACEHOLDER.to_string());
+            }
             other => {
                 return Err(bad(
-                    format!("content part type '{other}': use text, image_url or video_url"),
+                    format!(
+                        "content part type '{other}': use text, image_url, video_url or input_audio"
+                    ),
                     Some("input"),
                 ));
             }
@@ -378,7 +435,7 @@ pub fn parse_request(body: &Value, prompts: &Prompts) -> Result<Parsed, ApiError
     };
     // media inputs: budgets inherit, prompts only from the item itself
     let mixed_item = |mut spec: MixedSpec, own: &Opts| -> Result<Item, ApiError> {
-        if spec.images.is_empty() && spec.videos.is_empty() {
+        if spec.images.is_empty() && spec.videos.is_empty() && spec.audio.is_empty() {
             let o = overlay(&defaults, own);
             return text_item(&spec.text, &o);
         }
@@ -407,14 +464,20 @@ pub fn parse_request(body: &Value, prompts: &Prompts) -> Result<Parsed, ApiError
         } else {
             videos
         };
+        let audio = audio_sources(x)?;
         let text = match x.get("text") {
             None | Some(Value::Null) => String::new(),
             Some(Value::String(t)) => t.clone(),
             Some(_) => return Err(bad("'text' must be a string", Some("input"))),
         };
-        if text.is_empty() && images.is_empty() && videos.is_empty() && x.get("text").is_none() {
+        if text.is_empty()
+            && images.is_empty()
+            && videos.is_empty()
+            && audio.is_empty()
+            && x.get("text").is_none()
+        {
             return Err(bad(
-                "an input object needs 'text', 'image' or 'video'",
+                "an input object needs 'text', 'image', 'video' or 'audio'",
                 Some("input"),
             ));
         }
@@ -423,6 +486,7 @@ pub fn parse_request(body: &Value, prompts: &Prompts) -> Result<Parsed, ApiError
                 text,
                 images,
                 videos,
+                audio,
                 ..Default::default()
             },
             &own,
@@ -486,13 +550,13 @@ pub fn parse_request(body: &Value, prompts: &Prompts) -> Result<Parsed, ApiError
     let media: usize = items
         .iter()
         .map(|i| match i {
-            Item::Mixed(m) => m.images.len() + m.videos.len(),
+            Item::Mixed(m) => m.images.len() + m.videos.len() + m.audio.len(),
             _ => 0,
         })
         .sum();
     if media > MAX_MEDIA {
         return Err(bad(
-            format!("{media} images/videos > the {MAX_MEDIA} allowed per request"),
+            format!("{media} images/videos/audio clips > the {MAX_MEDIA} allowed per request"),
             Some("input"),
         ));
     }
@@ -522,6 +586,35 @@ fn fetch(src: &str, local: bool) -> Result<Vec<u8>, String> {
     cortiq_engine::media::load_image_bytes(&json!({ "url": src }))
 }
 
+/// A clip (mono 16 kHz) from an audio source: a string (as [`fetch`]), or
+/// `{"data": <base64>, "format"?}`, `{"url"}`, `{"path"}`, or the OpenAI
+/// `{"input_audio": {"data", "format"}}`.
+fn audio_clip(src: &Value, local: bool) -> Result<Vec<f32>, String> {
+    let bytes = match src {
+        Value::String(s) => fetch(s, local)?,
+        Value::Object(m) => {
+            if let Some(inner) = m.get("input_audio") {
+                return audio_clip(inner, local);
+            }
+            if let Some(u) = m
+                .get("url")
+                .or_else(|| m.get("path"))
+                .and_then(Value::as_str)
+            {
+                fetch(u, local)?
+            } else if let Some(d) = m.get("data").and_then(Value::as_str) {
+                base64::engine::general_purpose::STANDARD
+                    .decode(d.trim())
+                    .map_err(|e| format!("invalid base64 audio data: {e}"))?
+            } else {
+                return Err("an audio object needs 'data', 'url' or 'path'".into());
+            }
+        }
+        _ => return Err("an audio source must be a string or an object".into()),
+    };
+    ea::decode_audio(&bytes)
+}
+
 /// A temporary file removed on drop (a fetched video for ffmpeg).
 struct TempFile(std::path::PathBuf);
 
@@ -548,7 +641,7 @@ fn video_ext(src: &str) -> &'static str {
 
 /// Decode a mixed input's media and build it.
 fn build_mixed(enc: &MediaEncoder, m: &MixedSpec, local: bool) -> Result<MixedInput, String> {
-    let mut media = Vec::with_capacity(m.images.len() + m.videos.len());
+    let mut media = Vec::with_capacity(m.images.len() + m.videos.len() + m.audio.len());
     for (j, s) in m.images.iter().enumerate() {
         let bytes = fetch(s, local).map_err(|e| format!("image {j}: {e}"))?;
         let img =
@@ -577,6 +670,11 @@ fn build_mixed(enc: &MediaEncoder, m: &MixedSpec, local: bool) -> Result<MixedIn
         };
         let dv = decode_video(&path, None, &enc.proc).map_err(|e| format!("video {j}: {e}"))?;
         media.push(enc.prepare_frames(&dv.frames, m.video_tokens)?);
+    }
+    for (j, s) in m.audio.iter().enumerate() {
+        media.push(Media::Audio(
+            audio_clip(s, local).map_err(|e| format!("audio {j}: {e}"))?,
+        ));
     }
     Ok(MixedInput {
         text: m.text.clone(),
@@ -719,12 +817,15 @@ async fn models(State(st): State<Arc<EmbedState>>) -> Json<Value> {
     }))
 }
 
-fn modalities(st: &EmbedState) -> Vec<&'static str> {
-    if st.enc.has_vision() {
-        vec!["text", "image", "video"]
-    } else {
-        vec!["text"]
+fn modalities(enc: &MediaEncoder) -> Vec<&'static str> {
+    let mut m = vec!["text"];
+    if enc.has_vision() {
+        m.extend(["image", "video"]);
     }
+    if enc.has_audio() {
+        m.push("audio");
+    }
+    m
 }
 
 async fn prompts(State(st): State<Arc<EmbedState>>) -> Json<Value> {
@@ -738,10 +839,15 @@ async fn prompts(State(st): State<Arc<EmbedState>>) -> Json<Value> {
         "prompts": map,
         "dimensions": MATRYOSHKA_DIMS,
         "max_tokens": st.enc.text.max_tokens,
-        "modalities": modalities(&st),
+        "modalities": modalities(&st.enc),
         "image_tokens": {"default": st.enc.proc.image_budget, "allowed": BUDGETS},
         "video_tokens": {"default": st.enc.proc.video_budget, "allowed": BUDGETS},
         "video": {"fps": st.enc.proc.video_fps, "max_frames": st.enc.proc.max_frames},
+        "audio": {
+            "sample_rate": ea::SAMPLE_RATE,
+            "tokens_per_second": 25,
+            "max_seconds": ea::MAX_SAMPLES / ea::SAMPLE_RATE as usize,
+        },
     }))
 }
 
@@ -752,7 +858,7 @@ async fn healthz(State(st): State<Arc<EmbedState>>) -> Json<Value> {
         "capabilities": {
             "embeddings": true,
             "dimensions": MATRYOSHKA_DIMS,
-            "modalities": modalities(&st),
+            "modalities": modalities(&st.enc),
         },
     }))
 }
@@ -783,6 +889,9 @@ pub async fn serve(
             // the tower's ~0.7 GB of f32 weights, once, before the first request
             enc.warm_vision()?;
         }
+        if enc.has_audio() {
+            enc.warm_audio()?;
+        }
         Ok(enc)
     })
     .await?
@@ -802,11 +911,7 @@ pub async fn serve(
         },
         enc.text.dim,
         enc.text.prompts().names().len(),
-        if enc.has_vision() {
-            "text, image, video"
-        } else {
-            "text"
-        }
+        modalities(&enc).join(", ")
     );
     println!(
         "  Embeddings API: POST http://{addr}/v1/embeddings (model \"{model_id}\"; local media paths {})",
@@ -959,6 +1064,63 @@ mod tests {
         ] {
             assert!(parse_request(&body, &p()).is_err(), "{body}");
         }
+    }
+
+    #[test]
+    fn parses_audio_inputs() {
+        let r = parse_request(
+            &json!({"input": [{"audio": "data:audio/wav;base64,AA=="}, "a text"], "prompt_name": "SearchQuery"}),
+            &p(),
+        )
+        .unwrap();
+        // audio alone takes no request-level prompt; the text keeps it
+        let Item::Mixed(m) = &r.items[0] else {
+            panic!()
+        };
+        assert_eq!(m.audio, vec![json!("data:audio/wav;base64,AA==")]);
+        assert_eq!(m.prompt_name, None);
+        let Item::Text(t) = &r.items[1] else { panic!() };
+        assert_eq!(t.prompt_name.as_deref(), Some("SearchQuery"));
+        // interleaved with an image; the item's own prompt applies
+        let r = parse_request(
+            &json!({"input": {"text": "A <|audio|> B <|image|> <|audio|>", "image": "data:,", "audio": ["/a.wav", {"data": "AA==", "format": "wav"}], "task": "Clustering"}}),
+            &p(),
+        )
+        .unwrap();
+        let Item::Mixed(m) = &r.items[0] else {
+            panic!()
+        };
+        assert_eq!((m.audio.len(), m.images.len()), (2, 1));
+        assert_eq!(m.prompt_name.as_deref(), Some("Clustering"));
+        // OpenAI parts: a bare input_audio object, and content parts
+        let r = parse_request(
+            &json!({"input": ["x", {"type": "input_audio", "input_audio": {"data": "AA==", "format": "wav"}}]}),
+            &p(),
+        )
+        .unwrap();
+        assert!(matches!(&r.items[1], Item::Mixed(m) if m.audio.len() == 1 && m.text.is_empty()));
+        let r = parse_request(
+            &json!({"input": [[{"type": "text", "text": "said:"}, {"type": "input_audio", "input_audio": {"data": "AA==", "format": "wav"}}]]}),
+            &p(),
+        )
+        .unwrap();
+        let Item::Mixed(m) = &r.items[0] else {
+            panic!()
+        };
+        assert_eq!(m.text, "said: <|audio|>");
+        for body in [
+            json!({"input": [{"audio": []}]}),
+            json!({"input": [{"audio": 5}]}),
+            json!({"input": [{"audio": [1]}]}),
+            json!({"input": [{"type": "input_audio"}]}),
+            json!({"input": [{"audio": "x.wav", "text": 3}]}),
+        ] {
+            assert!(parse_request(&body, &p()).is_err(), "{body}");
+        }
+        // a local path is refused off loopback
+        assert!(audio_clip(&json!("/etc/hosts"), false).is_err());
+        assert!(audio_clip(&json!({"path": "/etc/hosts"}), false).is_err());
+        assert!(audio_clip(&json!({"data": "!!"}), false).is_err());
     }
 
     #[test]

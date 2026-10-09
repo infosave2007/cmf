@@ -469,8 +469,9 @@ enum Commands {
     },
     /// Embeddings from an EmbeddingGemma 2 .cmf (`cortiq convert --model
     /// <google/embeddinggemma-2 dir>`): texts, images (--image), videos
-    /// (--video) and interleaved text + media (--interleave) in one space —
-    /// unit-length 768-d vectors, or a Matryoshka prefix with --dim 512|256|128.
+    /// (--video), audio (--audio) and interleaved text + media (--interleave)
+    /// in one space — unit-length 768-d vectors, or a Matryoshka prefix with
+    /// --dim 512|256|128.
     Embed {
         /// Path to the EmbeddingGemma 2 .cmf
         #[arg(long)]
@@ -480,10 +481,17 @@ enum Commands {
         /// More texts (repeatable)
         #[arg(long = "text")]
         text: Vec<String>,
+        /// An audio file to embed on its own (repeatable; WAV, or any format
+        /// ffmpeg reads; mixed to mono, resampled to 16 kHz, cut at 30 s)
+        #[arg(long)]
+        audio: Vec<String>,
         /// A file with one text per line
         #[arg(long)]
         file: Option<String>,
-        /// JSON Lines: each line a string or {"text", "prompt_name"|"task", "title", "prompt"}
+        /// JSON Lines: each line a string or {"text", "prompt_name"|"task", "title",
+        /// "prompt", "image", "video", "audio": path | [paths], "image_tokens",
+        /// "video_tokens"} (the text's <|image|> / <|video|> / <|audio|>
+        /// placeholders take the media in order)
         #[arg(long)]
         jsonl: Option<String>,
         /// Task prompt: SearchQuery, Document, QuestionAnswering, FactChecking,
@@ -532,9 +540,9 @@ enum Commands {
         /// Soft tokens per video frame: 70 | 140 (default) | 280 | 560 | 1120
         #[arg(long = "video-tokens")]
         video_tokens: Option<usize>,
-        /// One interleaved input: the text (its <|image|> / <|video|>
-        /// placeholders take the --image / --video media in order) instead of
-        /// one embedding per item
+        /// One interleaved input: the text (its <|image|> / <|video|> /
+        /// <|audio|> placeholders take the --image / --video / --audio media
+        /// in order) instead of one embedding per item
         #[arg(long)]
         interleave: bool,
     },
@@ -2893,6 +2901,7 @@ async fn main() -> anyhow::Result<()> {
             model,
             texts,
             text,
+            audio,
             file,
             jsonl,
             prompt_name,
@@ -2913,6 +2922,7 @@ async fn main() -> anyhow::Result<()> {
         } => embed::run(embed::EmbedArgs {
             model,
             texts: texts.into_iter().chain(text).collect(),
+            audio,
             file,
             jsonl,
             prompt_name,

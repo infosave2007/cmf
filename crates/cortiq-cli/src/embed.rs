@@ -1,5 +1,6 @@
 //! `cortiq embed` — embeddings from an EmbeddingGemma 2 `.cmf`: texts,
-//! images, videos, and interleaved text + media, all in one 768-d space.
+//! images, videos, audio, and interleaved text + media, all in one 768-d
+//! space.
 //!
 //! Every input is one embedding: unit length, 768-d, or a Matryoshka prefix
 //! (`--dim 512|256|128`, re-normalized). `--prompt-name` applies one of the
@@ -7,19 +8,23 @@
 //! `--list-prompts` prints them) to the text inputs; `--title` fills the
 //! Document prompt. `--jsonl` gives each line its own prompt/title/media.
 //!
-//! Media: `--image PATH|URL` and `--video PATH` (repeatable) are inputs of
-//! their own. A video is an mp4/webm/mov/… (decoded with the `ffmpeg`
-//! executable), a `.y4m`, or a directory of frames (`--video-fps` gives
-//! their rate; without it they are taken as already sampled at 1 fps).
+//! Media: `--image PATH|URL`, `--video PATH` and `--audio PATH`
+//! (repeatable) are inputs of their own. A video is an mp4/webm/mov/…
+//! (decoded with the `ffmpeg` executable), a `.y4m`, or a directory of
+//! frames (`--video-fps` gives their rate; without it they are taken as
+//! already sampled at 1 fps). Audio is WAV (decoded natively) or anything
+//! `ffmpeg` reads; any rate or channel count is mixed down to mono and
+//! resampled to 16 kHz; clips are cut at 30 s (25 tokens a second).
 //! `--interleave` makes ONE input of the text and the media instead: the
-//! text's `<|image|>` / `<|video|>` placeholders take them in order (or,
-//! with no placeholders, the media come first). `--image-tokens` /
-//! `--video-tokens` set the soft-token budget (70 | 140 | 280 | 560 | 1120;
-//! defaults 280 per image, 140 per frame).
+//! text's `<|image|>` / `<|video|>` / `<|audio|>` placeholders take them in
+//! order (or, with no placeholders, the media come first). `--image-tokens`
+//! / `--video-tokens` set the soft-token budget (70 | 140 | 280 | 560 |
+//! 1120; defaults 280 per image, 140 per frame).
 
 use anyhow::{Context, Result, anyhow};
 use cortiq_core::CmfModel;
 use cortiq_engine::egemma2::{cosine, matryoshka};
+use cortiq_engine::egemma2_audio as ea;
 use cortiq_engine::egemma2_mm::{Media, MediaEncoder, MixedInput};
 use cortiq_engine::egemma2_vision::decode_video;
 use std::io::Write;
@@ -42,6 +47,8 @@ pub struct EmbedArgs {
     pub repeat: usize,
     pub images: Vec<String>,
     pub videos: Vec<String>,
+    /// audio files (WAV, or anything ffmpeg reads)
+    pub audio: Vec<String>,
     pub video_fps: Option<f64>,
     pub image_tokens: Option<usize>,
     pub video_tokens: Option<usize>,
@@ -54,6 +61,7 @@ struct Spec {
     text: String,
     images: Vec<String>,
     videos: Vec<String>,
+    audio: Vec<String>,
     prompt_name: Option<String>,
     title: Option<String>,
     prompt: Option<String>,
@@ -78,8 +86,8 @@ fn str_or_list(v: Option<&serde_json::Value>) -> Result<Vec<String>> {
 }
 
 /// One JSON Lines input: a bare string, or an object
-/// `{"text", "image", "video", "prompt_name"|"task", "title", "prompt",
-/// "image_tokens", "video_tokens"}`.
+/// `{"text", "image", "video", "audio", "prompt_name"|"task", "title",
+/// "prompt", "image_tokens", "video_tokens"}`.
 fn parse_jsonl_line(line: &str, defaults: &Spec) -> Result<Spec> {
     let v: serde_json::Value = serde_json::from_str(line)?;
     if let Some(s) = v.as_str() {
@@ -90,13 +98,14 @@ fn parse_jsonl_line(line: &str, defaults: &Spec) -> Result<Spec> {
     }
     let images = str_or_list(v.get("image").or_else(|| v.get("images")))?;
     let videos = str_or_list(v.get("video").or_else(|| v.get("videos")))?;
+    let audio = str_or_list(v.get("audio"))?;
     let text = v
         .get("text")
         .or_else(|| v.get("input"))
         .and_then(|t| t.as_str());
-    if text.is_none() && images.is_empty() && videos.is_empty() {
+    if text.is_none() && images.is_empty() && videos.is_empty() && audio.is_empty() {
         return Err(anyhow!(
-            "expected a string or an object with \"text\", \"image\" or \"video\""
+            "expected a string or an object with \"text\", \"image\", \"video\" or \"audio\""
         ));
     }
     let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
@@ -104,7 +113,7 @@ fn parse_jsonl_line(line: &str, defaults: &Spec) -> Result<Spec> {
     let has = |k: &str| v.get(k).is_some();
     // sentence-transformers prompts text-only inputs: a line with media
     // takes a prompt only from itself
-    let media = !images.is_empty() || !videos.is_empty();
+    let media = !images.is_empty() || !videos.is_empty() || !audio.is_empty();
     let inherit = |own: Option<String>, k: bool, d: &Option<String>| {
         if k {
             own
@@ -125,6 +134,7 @@ fn parse_jsonl_line(line: &str, defaults: &Spec) -> Result<Spec> {
         prompt: inherit(s("prompt"), has("prompt"), &defaults.prompt),
         images,
         videos,
+        audio,
         image_tokens: u("image_tokens").or(defaults.image_tokens),
         video_tokens: u("video_tokens").or(defaults.video_tokens),
     })
@@ -159,9 +169,9 @@ fn load_image(src: &str) -> Result<cortiq_engine::media::RgbFrame> {
 
 /// Decode a spec's media and build the input.
 fn build(enc: &MediaEncoder, s: &Spec, fps: Option<f64>) -> Result<(MixedInput, String)> {
-    let mut media = Vec::with_capacity(s.images.len() + s.videos.len());
+    let mut media = Vec::with_capacity(s.images.len() + s.videos.len() + s.audio.len());
     let mut notes = Vec::new();
-    // images first, then videos: each kind fills its own placeholders in order
+    // each kind fills its own placeholders in order
     for p in &s.images {
         let img = load_image(p)?;
         let m = enc
@@ -199,6 +209,20 @@ fn build(enc: &MediaEncoder, s: &Spec, fps: Option<f64>) -> Result<(MixedInput, 
             ));
         }
         media.push(m);
+    }
+    for p in &s.audio {
+        let clip = ea::read_audio(std::path::Path::new(p)).map_err(anyhow::Error::msg)?;
+        notes.push(format!(
+            "audio {:.2} s → {} tokens{}",
+            clip.len() as f64 / ea::SAMPLE_RATE as f64,
+            ea::num_tokens(clip.len()),
+            if clip.len() > ea::MAX_SAMPLES {
+                " (cut at 30 s)"
+            } else {
+                ""
+            }
+        ));
+        media.push(Media::Audio(clip));
     }
     Ok((
         MixedInput {
@@ -243,7 +267,7 @@ pub fn run(args: EmbedArgs) -> Result<()> {
     if args.interleave {
         if args.texts.len() > 1 || args.file.is_some() || args.jsonl.is_some() {
             return Err(anyhow!(
-                "--interleave makes one input of ONE text and the --image/--video media \
+                "--interleave makes one input of ONE text and the --image/--video/--audio media \
                  (use --jsonl for several interleaved inputs)"
             ));
         }
@@ -251,6 +275,7 @@ pub fn run(args: EmbedArgs) -> Result<()> {
             text: args.texts.first().cloned().unwrap_or_default(),
             images: args.images.clone(),
             videos: args.videos.clone(),
+            audio: args.audio.clone(),
             ..defaults.clone()
         });
     } else {
@@ -290,10 +315,16 @@ pub fn run(args: EmbedArgs) -> Result<()> {
                 ..bare.clone()
             });
         }
+        for p in &args.audio {
+            specs.push(Spec {
+                audio: vec![p.clone()],
+                ..bare.clone()
+            });
+        }
     }
     if specs.is_empty() {
         return Err(anyhow!(
-            "nothing to embed: give texts (positional or --text), --file, --jsonl, --image or --video"
+            "nothing to embed: give texts (positional or --text), --file, --jsonl, --image, --video or --audio"
         ));
     }
     let t_prep = std::time::Instant::now();
@@ -318,10 +349,10 @@ pub fn run(args: EmbedArgs) -> Result<()> {
     }
     let has_media = inputs.iter().any(|x| !x.media.is_empty());
     if has_media {
-        // the tower's one-time load is not part of the timed forward
+        // the towers' one-time load is not part of the timed forward
         let t = std::time::Instant::now();
-        enc.warm_vision().map_err(anyhow::Error::msg)?;
-        eprintln!("vision tower loaded in {:.2}s", t.elapsed().as_secs_f64());
+        enc.warm_for(&inputs).map_err(anyhow::Error::msg)?;
+        eprintln!("media tower(s) loaded in {:.2}s", t.elapsed().as_secs_f64());
     }
     let mut times = Vec::new();
     let mut full = Vec::new();
@@ -460,6 +491,28 @@ mod tests {
         let c = parse_jsonl_line(r#"{"image":"a.png","task":"Document"}"#, &d).unwrap();
         assert_eq!(c.prompt_name.as_deref(), Some("Document"));
         assert!(parse_jsonl_line(r#"{"image":5}"#, &d).is_err());
+    }
+
+    #[test]
+    fn jsonl_audio_lines() {
+        let d = Spec {
+            prompt_name: Some("SearchQuery".into()),
+            ..Default::default()
+        };
+        let a = parse_jsonl_line(r#"{"audio":"a.wav"}"#, &d).unwrap();
+        assert_eq!(a.audio, vec!["a.wav".to_string()]);
+        // audio alone takes no default prompt
+        assert_eq!(a.prompt_name, None);
+        let b = parse_jsonl_line(
+            r#"{"text":"Said: <|audio|> then <|image|>","audio":["a.wav"],"image":"f.png","task":"Clustering"}"#,
+            &d,
+        )
+        .unwrap();
+        assert_eq!(b.audio.len(), 1);
+        assert_eq!(b.images.len(), 1);
+        assert_eq!(b.prompt_name.as_deref(), Some("Clustering"));
+        assert!(parse_jsonl_line(r#"{"audio":[1]}"#, &d).is_err());
+        assert!(parse_jsonl_line(r#"{"audio":3}"#, &d).is_err());
     }
 
     #[test]

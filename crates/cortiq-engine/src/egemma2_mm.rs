@@ -1,8 +1,8 @@
-//! EmbeddingGemma 2 multimodal inputs: text, images and video — alone or
-//! interleaved in one sequence — embedded into the one 768-d space.
+//! EmbeddingGemma 2 multimodal inputs: text, images, video and audio —
+//! alone or interleaved in one sequence — embedded into the one 768-d space.
 //!
-//! An input is a text that may hold placeholders (`<|image|>`, `<|video|>`)
-//! and the media that fill them, in order. Exactly as
+//! An input is a text that may hold placeholders (`<|image|>`, `<|video|>`,
+//! `<|audio|>`) and the media that fill them, in order. Exactly as
 //! `EmbeddingGemma2Processor` lays it out:
 //!
 //! * each `<|image|>` becomes `<|image>` + N × `<|image|>` + `<image|>`,
@@ -10,23 +10,28 @@
 //!   budget of 280);
 //! * each `<|video|>` becomes, per sampled frame, `<|image>` + M ×
 //!   `<|video|>` + `<image|>` (M = 120 for a 16:9 frame at 140);
+//! * each `<|audio|>` becomes `<|audio>` + K × `<|audio|>` + `<audio|>`,
+//!   K = 25 per second of the clip (mono 16 kHz, cut at 30 s);
 //! * the whole is `[BOS] … [EOS]`, at most 8192 tokens (media are never
 //!   cut: an input that does not fit is an error);
-//! * media given without placeholders in the text come first, separated by
-//!   spaces, then the text (the processor's own layout for a text-less
-//!   input is `"<|image|> <|image|>"`).
+//! * media given without placeholders in the text come first — images, then
+//!   videos, then audio clips, separated by spaces — then the text (the
+//!   processor's own layout for a text-less input is `"<|image|> <|image|>"`).
 //!
 //! The text is tokenized with the placeholders in it (they are added
 //! tokens, so they split it exactly where the processor's expansion
 //! would), then each placeholder id is expanded. The token rows are
-//! `E[id]·sqrt(512)`; the placeholder rows are replaced by the tower's
-//! soft tokens; the text model runs over the merged rows.
+//! `E[id]·sqrt(512)`; the placeholder rows are replaced by the towers' soft
+//! tokens (vision for images and frames, audio for clips); the text model
+//! runs over the merged rows. Every input of a call goes through each tower
+//! together, then through the text model packed up to the context.
 //!
 //! Task prompts follow sentence-transformers: they prefix text-only
 //! inputs. An input with media gets a prompt only when one is set on that
 //! input itself (then it prefixes its text, placeholders included).
 
 use crate::egemma2::{EmbeddingGemma2, TextInput};
+use crate::egemma2_audio::{self as ea, AudioTower};
 use crate::egemma2_vision::{VisionInput, VisionProcessor, VisionTower};
 use crate::media::RgbFrame;
 use crate::pool::Pool;
@@ -36,6 +41,7 @@ use std::sync::{Arc, OnceLock};
 
 pub const IMAGE_PLACEHOLDER: &str = "<|image|>";
 pub const VIDEO_PLACEHOLDER: &str = "<|video|>";
+pub const AUDIO_PLACEHOLDER: &str = ea::PLACEHOLDER;
 
 /// The special token ids of the layout (`config.json`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -44,6 +50,9 @@ pub struct SpecialIds {
     pub video: u32,
     pub boi: u32,
     pub eoi: u32,
+    pub audio: u32,
+    pub boa: u32,
+    pub eoa: u32,
 }
 
 impl Default for SpecialIds {
@@ -53,6 +62,9 @@ impl Default for SpecialIds {
             video: 258_884,
             boi: 255_999,
             eoi: 258_882,
+            audio: ea::AUDIO_TOKEN,
+            boa: ea::BOA_TOKEN,
+            eoa: ea::EOA_TOKEN,
         }
     }
 }
@@ -66,6 +78,10 @@ impl SpecialIds {
             video: g("video_token_id", d.video),
             boi: g("boi_token_id", d.boi),
             eoi: g("eoi_token_id", d.eoi),
+            audio: g("audio_token_id", d.audio),
+            boa: g("boa_token_id", d.boa),
+            // config.json spells this one `eoa_token_index`
+            eoa: g("eoa_token_id", g("eoa_token_index", d.eoa)),
         }
     }
 }
@@ -76,13 +92,45 @@ pub enum Media {
     Image(VisionInput),
     /// the sampled frames, each at the video budget
     Video(Vec<VisionInput>),
+    /// a clip, mono 16 kHz (cut at 30 s by the tower)
+    Audio(Vec<f32>),
+}
+
+/// The three kinds of placeholder, in the processor's text-less order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Kind {
+    Image,
+    Video,
+    Audio,
+}
+
+impl Kind {
+    const ALL: [Kind; 3] = [Kind::Image, Kind::Video, Kind::Audio];
+
+    fn placeholder(self) -> &'static str {
+        match self {
+            Kind::Image => IMAGE_PLACEHOLDER,
+            Kind::Video => VIDEO_PLACEHOLDER,
+            Kind::Audio => AUDIO_PLACEHOLDER,
+        }
+    }
 }
 
 impl Media {
-    fn placeholder(&self) -> &'static str {
+    fn kind(&self) -> Kind {
         match self {
-            Media::Image(_) => IMAGE_PLACEHOLDER,
-            Media::Video(_) => VIDEO_PLACEHOLDER,
+            Media::Image(_) => Kind::Image,
+            Media::Video(_) => Kind::Video,
+            Media::Audio(_) => Kind::Audio,
+        }
+    }
+
+    /// images / frames this medium sends through the vision tower
+    fn vision_rows(&self) -> usize {
+        match self {
+            Media::Image(_) => 1,
+            Media::Video(f) => f.len(),
+            Media::Audio(_) => 0,
         }
     }
 }
@@ -121,59 +169,76 @@ impl MixedInput {
             ..Default::default()
         }
     }
+
+    /// A clip (mono 16 kHz) on its own.
+    pub fn audio(wave: Vec<f32>) -> Self {
+        MixedInput {
+            media: vec![Media::Audio(wave)],
+            ..Default::default()
+        }
+    }
 }
 
 /// The text with every medium's placeholder in place: the text as given
 /// when its placeholders match the media (per kind, in order); otherwise —
-/// no placeholders at all — the media's placeholders first, space
+/// no placeholders at all — the media's placeholders first (images, videos,
+/// then audio, as the processor lays out a text-less input), space
 /// separated, then the text.
 pub fn layout_text(text: &str, media: &[Media]) -> Result<String, String> {
-    let n_img = text.matches(IMAGE_PLACEHOLDER).count();
-    let n_vid = text.matches(VIDEO_PLACEHOLDER).count();
-    let want_img = media
+    let found: Vec<usize> = Kind::ALL
         .iter()
-        .filter(|m| matches!(m, Media::Image(_)))
-        .count();
-    let want_vid = media.len() - want_img;
-    if n_img == 0 && n_vid == 0 {
-        let mut parts: Vec<&str> = media.iter().map(|m| m.placeholder()).collect();
+        .map(|k| text.matches(k.placeholder()).count())
+        .collect();
+    let want: Vec<usize> = Kind::ALL
+        .iter()
+        .map(|&k| media.iter().filter(|m| m.kind() == k).count())
+        .collect();
+    if found.iter().all(|&n| n == 0) {
+        let mut kinds: Vec<Kind> = media.iter().map(Media::kind).collect();
+        kinds.sort();
+        let mut parts: Vec<&str> = kinds.iter().map(|k| k.placeholder()).collect();
         if !text.is_empty() {
             parts.push(text);
         }
         return Ok(parts.join(" "));
     }
-    if n_img != want_img || n_vid != want_vid {
+    if found != want {
         return Err(format!(
-            "the text holds {n_img} {IMAGE_PLACEHOLDER} and {n_vid} {VIDEO_PLACEHOLDER} \
-             but {want_img} image(s) and {want_vid} video(s) were given"
+            "the text holds {} {IMAGE_PLACEHOLDER}, {} {VIDEO_PLACEHOLDER} and {} \
+             {AUDIO_PLACEHOLDER} but {} image(s), {} video(s) and {} audio clip(s) were given",
+            found[0], found[1], found[2], want[0], want[1], want[2]
         ));
     }
     Ok(text.to_string())
 }
 
-/// The order the placeholders occur in `text`: `true` for an image.
-fn placeholder_order(text: &str) -> Vec<bool> {
+/// The kinds of the placeholders in `text`, in the order they occur.
+fn placeholder_order(text: &str) -> Vec<Kind> {
     let mut out = Vec::new();
     let mut rest = text;
     loop {
-        let (i, v) = (rest.find(IMAGE_PLACEHOLDER), rest.find(VIDEO_PLACEHOLDER));
-        match (i, v) {
-            (None, None) => break,
-            (Some(a), b) if b.is_none_or(|b| a < b) => {
-                out.push(true);
-                rest = &rest[a + IMAGE_PLACEHOLDER.len()..];
-            }
-            (_, Some(b)) => {
-                out.push(false);
-                rest = &rest[b + VIDEO_PLACEHOLDER.len()..];
-            }
-            _ => unreachable!(),
-        }
+        let next = Kind::ALL
+            .iter()
+            .filter_map(|&k| rest.find(k.placeholder()).map(|at| (at, k)))
+            .min();
+        let Some((at, k)) = next else { break };
+        out.push(k);
+        rest = &rest[at + k.placeholder().len()..];
     }
     out
 }
 
-/// The text encoder with the vision tower beside it (loaded on first use).
+/// Where an input's soft tokens come from, in sequence order: the vision
+/// rows (its images and frames, numbered in `media` order, a video's
+/// frames consecutively) and the audio clips (numbered in `media` order).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Placement {
+    pub vision: Vec<usize>,
+    pub audio: Vec<usize>,
+}
+
+/// The text encoder with the vision and audio towers beside it (each
+/// loaded on first use).
 pub struct MediaEncoder {
     pub text: EmbeddingGemma2,
     pub proc: VisionProcessor,
@@ -181,6 +246,7 @@ pub struct MediaEncoder {
     model: Arc<CmfModel>,
     pool: Option<Arc<Pool>>,
     vision: OnceLock<Result<VisionTower, String>>,
+    audio: OnceLock<Result<AudioTower, String>>,
 }
 
 impl MediaEncoder {
@@ -195,6 +261,7 @@ impl MediaEncoder {
             model: model.clone(),
             pool,
             vision: OnceLock::new(),
+            audio: OnceLock::new(),
         })
     }
 
@@ -214,6 +281,42 @@ impl MediaEncoder {
     /// Load the tower now (a server does it at startup).
     pub fn warm_vision(&self) -> Result<(), String> {
         self.vision().map(|_| ())
+    }
+
+    /// Does the file carry the audio tower?
+    pub fn has_audio(&self) -> bool {
+        ea::has_audio(&self.model)
+    }
+
+    /// The audio tower, loaded on first use (~1.2 GB of f32 weights).
+    pub fn audio(&self) -> Result<&AudioTower, String> {
+        self.audio
+            .get_or_init(|| {
+                if !self.has_audio() {
+                    return Err("this file carries no audio tower (a text-only pack?)".into());
+                }
+                AudioTower::load(&self.model, self.pool.clone())
+            })
+            .as_ref()
+            .map_err(|e| e.clone())
+    }
+
+    /// Load the audio tower now.
+    pub fn warm_audio(&self) -> Result<(), String> {
+        self.audio().map(|_| ())
+    }
+
+    /// Load the towers the inputs need (their one-time load stays out of
+    /// a timed forward).
+    pub fn warm_for(&self, inputs: &[MixedInput]) -> Result<(), String> {
+        let media = || inputs.iter().flat_map(|x| x.media.iter());
+        if media().any(|m| m.vision_rows() > 0) {
+            self.warm_vision()?;
+        }
+        if media().any(|m| matches!(m, Media::Audio(_))) {
+            self.warm_audio()?;
+        }
+        Ok(())
     }
 
     /// An image at `budget` soft tokens (`None`: the processor's default).
@@ -241,10 +344,9 @@ impl MediaEncoder {
         Ok(self.layout(input)?.0)
     }
 
-    /// Token ids of one input with every placeholder expanded, and the
-    /// order its encoded images / frames (numbered in `media` order, a
-    /// video's frames consecutively) occupy the placeholder rows.
-    pub fn layout(&self, input: &MixedInput) -> Result<(Vec<u32>, Vec<usize>), String> {
+    /// Token ids of one input with every placeholder expanded, and where
+    /// its soft tokens come from, in sequence order.
+    pub fn layout(&self, input: &MixedInput) -> Result<(Vec<u32>, Placement), String> {
         if input.media.is_empty() {
             let ids = self.text.input_ids(&TextInput {
                 text: input.text.clone(),
@@ -252,7 +354,7 @@ impl MediaEncoder {
                 title: input.title.clone(),
                 prompt: input.prompt.clone(),
             })?;
-            return Ok((ids, Vec::new()));
+            return Ok((ids, Placement::default()));
         }
         let k = self.proc.pool_k;
         let laid = layout_text(&input.text, &input.media)?;
@@ -267,52 +369,75 @@ impl MediaEncoder {
         } else {
             laid
         };
-        // first encoded row of each medium
+        // first vision row / audio clip of each medium
         let mut first = Vec::with_capacity(input.media.len());
-        let mut r = 0usize;
+        let (mut r, mut a) = (0usize, 0usize);
         for m in &input.media {
-            first.push(r);
-            r += match m {
-                Media::Image(_) => 1,
-                Media::Video(f) => f.len(),
-            };
+            match m {
+                Media::Audio(_) => {
+                    first.push(a);
+                    a += 1;
+                }
+                _ => {
+                    first.push(r);
+                    r += m.vision_rows();
+                }
+            }
         }
         // media of each kind, in the order their placeholders occur
-        let order = placeholder_order(&full);
-        let mut imgs =
-            (0..input.media.len()).filter(|&i| matches!(input.media[i], Media::Image(_)));
-        let mut vids =
-            (0..input.media.len()).filter(|&i| matches!(input.media[i], Media::Video(_)));
-        let mut seq_media: Vec<usize> = Vec::with_capacity(order.len());
-        for is_img in order {
-            let m = if is_img { imgs.next() } else { vids.next() };
+        let mut of_kind: Vec<_> = Kind::ALL
+            .iter()
+            .map(|&kd| {
+                (0..input.media.len())
+                    .filter(move |&i| input.media[i].kind() == kd)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+            })
+            .collect();
+        let mut seq_media: Vec<usize> = Vec::new();
+        for kd in placeholder_order(&full) {
+            let m = of_kind[kd as usize].next();
             seq_media.push(m.ok_or("a placeholder without a medium")?);
         }
-        if imgs.next().is_some() || vids.next().is_some() {
+        if of_kind.iter_mut().any(|it| it.next().is_some()) {
             return Err("a medium without a placeholder".into());
         }
         let raw = self.text.tokenizer().encode(&full);
         let mut ids = Vec::with_capacity(raw.len() + 512);
-        let mut rows_order = Vec::with_capacity(r);
+        let mut place = Placement::default();
         ids.push(self.text.bos);
         let mut next = seq_media.iter();
         for &t in &raw {
-            if t == self.ids.image || t == self.ids.video {
+            if t == self.ids.image || t == self.ids.video || t == self.ids.audio {
                 let m = *next.next().ok_or("more placeholder tokens than media")?;
+                let want = match input.media[m].kind() {
+                    Kind::Image => self.ids.image,
+                    Kind::Video => self.ids.video,
+                    Kind::Audio => self.ids.audio,
+                };
+                if t != want {
+                    return Err("a placeholder did not tokenize to its token".into());
+                }
                 match &input.media[m] {
                     Media::Image(x) => {
                         ids.push(self.ids.boi);
                         ids.extend(std::iter::repeat_n(self.ids.image, x.n_soft(k)));
                         ids.push(self.ids.eoi);
-                        rows_order.push(first[m]);
+                        place.vision.push(first[m]);
                     }
                     Media::Video(frames) => {
                         for (j, f) in frames.iter().enumerate() {
                             ids.push(self.ids.boi);
                             ids.extend(std::iter::repeat_n(self.ids.video, f.n_soft(k)));
                             ids.push(self.ids.eoi);
-                            rows_order.push(first[m] + j);
+                            place.vision.push(first[m] + j);
                         }
+                    }
+                    Media::Audio(w) => {
+                        ids.push(self.ids.boa);
+                        ids.extend(std::iter::repeat_n(self.ids.audio, ea::num_tokens(w.len())));
+                        ids.push(self.ids.eoa);
+                        place.audio.push(first[m]);
                     }
                 }
             } else {
@@ -326,17 +451,17 @@ impl MediaEncoder {
         if ids.len() > self.text.max_tokens {
             return Err(format!(
                 "{} tokens > the model's {} token context (media are not truncated: \
-                 lower the image budget or the number of frames)",
+                 lower the image budget, the number of frames or the audio length)",
                 ids.len(),
                 self.text.max_tokens
             ));
         }
-        Ok((ids, rows_order))
+        Ok((ids, place))
     }
 
     /// Embed inputs: unit-length vectors of the model's width, in order.
     pub fn embed(&self, inputs: &[MixedInput]) -> Result<Vec<Vec<f32>>, String> {
-        let laid: Vec<(Vec<u32>, Vec<usize>)> = inputs
+        let laid: Vec<(Vec<u32>, Placement)> = inputs
             .iter()
             .enumerate()
             .map(|(i, x)| self.layout(x).map_err(|e| format!("input {i}: {e}")))
@@ -345,22 +470,41 @@ impl MediaEncoder {
         if inputs.iter().all(|x| x.media.is_empty()) {
             return self.text.embed_ids(&seqs);
         }
-        // every image / frame of every input through the tower, packed
+        // every image / frame of every input through the vision tower, and
+        // every clip through the audio tower, each packed
         let mut flat: Vec<VisionInput> = Vec::new();
+        let mut clips: Vec<&[f32]> = Vec::new();
         let mut base = Vec::with_capacity(inputs.len());
         for x in inputs {
-            base.push(flat.len());
+            base.push((flat.len(), clips.len()));
             for m in &x.media {
                 match m {
                     Media::Image(v) => flat.push(v.clone()),
                     Media::Video(f) => flat.extend(f.iter().cloned()),
+                    Media::Audio(w) => clips.push(w),
                 }
             }
         }
-        let soft = self.vision()?.encode(&flat)?;
-        drop(flat);
         let d = self.text.hidden();
-        let (image, video) = (self.ids.image, self.ids.video);
+        let soft = if flat.is_empty() {
+            Vec::new()
+        } else {
+            self.vision()?.encode(&flat)?
+        };
+        drop(flat);
+        let asoft = if clips.is_empty() {
+            Vec::new()
+        } else {
+            let tower = self.audio()?;
+            if tower.out_dim != d {
+                return Err(format!(
+                    "audio soft tokens are {}-d, the text encoder is {d}-d",
+                    tower.out_dim
+                ));
+            }
+            tower.soft_tokens(&clips)
+        };
+        let (image, video, audio) = (self.ids.image, self.ids.video, self.ids.audio);
         let mut out: Vec<Option<Vec<f32>>> = vec![None; inputs.len()];
         // pack sequences up to the context into one forward
         let mut start = 0usize;
@@ -376,18 +520,30 @@ impl MediaEncoder {
             let mut x = self.text.embed_rows(&seqs[start..end]);
             let mut row = 0usize;
             for i in start..end {
-                let (ids, order) = &laid[i];
-                let mut src = order
+                let (ids, place) = &laid[i];
+                let (vb, ab) = base[i];
+                let mut vsrc = place
+                    .vision
                     .iter()
-                    .flat_map(|&j| soft[base[i] + j].chunks_exact(d));
+                    .flat_map(|&j| soft[vb + j].chunks_exact(d));
+                let mut asrc = place
+                    .audio
+                    .iter()
+                    .flat_map(|&j| asoft[ab + j].chunks_exact(d));
                 for &t in ids {
-                    if t == image || t == video {
-                        let s = src.next().ok_or("fewer soft tokens than placeholders")?;
+                    let src = if t == image || t == video {
+                        Some(vsrc.next().ok_or("fewer soft tokens than placeholders")?)
+                    } else if t == audio {
+                        Some(asrc.next().ok_or("fewer audio tokens than placeholders")?)
+                    } else {
+                        None
+                    };
+                    if let Some(s) = src {
                         x[row * d..(row + 1) * d].copy_from_slice(s);
                     }
                     row += 1;
                 }
-                if src.next().is_some() {
+                if vsrc.next().is_some() || asrc.next().is_some() {
                     return Err("more soft tokens than placeholders".into());
                 }
             }
@@ -442,13 +598,30 @@ mod tests {
         );
         assert!(layout_text("A <|image|> <|image|>", &[img(3, 3)]).is_err());
         assert!(layout_text("A <|video|>", &[img(3, 3)]).is_err());
+        // the processor's text-less order: images, videos, audio
+        let clip = Media::Audio(vec![0.0; 1600]);
+        assert_eq!(
+            layout_text("", &[clip.clone(), vid(1), img(3, 3)]).unwrap(),
+            "<|image|> <|video|> <|audio|>"
+        );
+        assert_eq!(
+            layout_text("said: <|audio|>", std::slice::from_ref(&clip)).unwrap(),
+            "said: <|audio|>"
+        );
+        assert!(layout_text("said: <|audio|> <|audio|>", &[clip]).is_err());
     }
 
     #[test]
     fn placeholder_order_interleaves_kinds() {
         assert_eq!(
-            placeholder_order("x <|video|> y <|image|><|image|> <|video|>"),
-            vec![false, true, true, false]
+            placeholder_order("x <|video|> y <|image|><|audio|><|image|> <|video|>"),
+            vec![
+                Kind::Video,
+                Kind::Image,
+                Kind::Audio,
+                Kind::Image,
+                Kind::Video
+            ]
         );
         assert!(placeholder_order("plain").is_empty());
     }
