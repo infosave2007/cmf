@@ -1153,23 +1153,40 @@ fn sgemm_view(
         }
     }
     #[cfg(not(target_os = "macos"))]
-    {
-        let mut ac = vec![0f32; m * k];
-        for r in 0..m {
-            ac[r * k..(r + 1) * k].copy_from_slice(&a[r * lda..r * lda + k]);
+    sgemm_view_portable(a, lda, b, ldb, bt, c, ldc, m, n, k);
+}
+
+/// [`sgemm_view`] without Accelerate: the views gathered for the portable
+/// GEMM (compiled everywhere, so the macOS tests cover it).
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn sgemm_view_portable(
+    a: &[f32],
+    lda: usize,
+    b: &[f32],
+    ldb: usize,
+    bt: bool,
+    c: &mut [f32],
+    ldc: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+) {
+    let mut ac = vec![0f32; m * k];
+    for r in 0..m {
+        ac[r * k..(r + 1) * k].copy_from_slice(&a[r * lda..r * lda + k]);
+    }
+    // the portable GEMM takes B as [n×k]
+    let mut bc = vec![0f32; n * k];
+    for r in 0..n {
+        for j in 0..k {
+            bc[r * k + j] = if bt { b[r * ldb + j] } else { b[j * ldb + r] };
         }
-        // the portable GEMM takes B as [n×k]
-        let mut bc = vec![0f32; n * k];
-        for r in 0..n {
-            for j in 0..k {
-                bc[r * k + j] = if bt { b[r * ldb + j] } else { b[j * ldb + r] };
-            }
-        }
-        let mut cc = vec![0f32; m * n];
-        crate::fcd_ops::gemm_nt_host(&ac, &bc, &mut cc, m, k, n, None);
-        for r in 0..m {
-            c[r * ldc..r * ldc + n].copy_from_slice(&cc[r * n..(r + 1) * n]);
-        }
+    }
+    let mut cc = vec![0f32; m * n];
+    crate::fcd_ops::gemm_nt_host(&ac, &bc, &mut cc, m, k, n, None);
+    for r in 0..m {
+        c[r * ldc..r * ldc + n].copy_from_slice(&cc[r * n..(r + 1) * n]);
     }
 }
 
@@ -1335,6 +1352,71 @@ mod tests {
         assert_eq!(long.len(), 32);
         assert_eq!(long[0], 0);
         assert_eq!(*long.last().unwrap(), 99 * 30);
+    }
+
+    #[test]
+    fn strided_gemm_views_agree() {
+        // C = A·Bᵀ and C = A·B on strided views, Accelerate vs the portable
+        // gather path vs a scalar reference
+        let (m, n, k, lda, ldb, ldc) = (5usize, 7usize, 9usize, 13usize, 11usize, 10usize);
+        let a: Vec<f32> = (0..m * lda).map(|i| ((i * 7 % 17) as f32 - 8.0) / 8.0).collect();
+        for bt in [true, false] {
+            let blen = if bt { n * ldb } else { k * ldb };
+            let b: Vec<f32> = (0..blen).map(|i| ((i * 5 % 13) as f32 - 6.0) / 6.0).collect();
+            let mut want = vec![0f32; m * ldc];
+            for r in 0..m {
+                for c in 0..n {
+                    want[r * ldc + c] = (0..k)
+                        .map(|j| a[r * lda + j] * if bt { b[c * ldb + j] } else { b[j * ldb + c] })
+                        .sum();
+                }
+            }
+            let mut c1 = vec![0f32; m * ldc];
+            sgemm_view(&a, lda, &b, ldb, bt, &mut c1, ldc, m, n, k);
+            let mut c2 = vec![0f32; m * ldc];
+            sgemm_view_portable(&a, lda, &b, ldb, bt, &mut c2, ldc, m, n, k);
+            for r in 0..m {
+                for c in 0..n {
+                    let w = want[r * ldc + c];
+                    assert!((c1[r * ldc + c] - w).abs() < 1e-4, "bt={bt} accel");
+                    assert!((c2[r * ldc + c] - w).abs() < 1e-4, "bt={bt} portable");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn host_attention_matches_naive() {
+        // two heads of 8 over 300 rows: the pipelined block path (with and
+        // without a pool) against a direct softmax(q·kᵀ)·v
+        let (len, nh, hd) = (300usize, 2usize, 8usize);
+        let w = nh * hd;
+        let f = |i: usize, s: usize| (((i * s) % 29) as f32 - 14.0) / 20.0;
+        let q: Vec<f32> = (0..len * w).map(|i| f(i, 7)).collect();
+        let k: Vec<f32> = (0..len * w).map(|i| f(i, 11)).collect();
+        let v: Vec<f32> = (0..len * w).map(|i| f(i, 13)).collect();
+        let mut want = vec![0f32; len * w];
+        for h in 0..nh {
+            for i in 0..len {
+                let sc: Vec<f64> = (0..len)
+                    .map(|j| (0..hd).map(|c| (q[i * w + h * hd + c] * k[j * w + h * hd + c]) as f64).sum())
+                    .collect();
+                let mx = sc.iter().cloned().fold(f64::MIN, f64::max);
+                let e: Vec<f64> = sc.iter().map(|x| (x - mx).exp()).collect();
+                let z: f64 = e.iter().sum();
+                for c in 0..hd {
+                    want[i * w + h * hd + c] =
+                        (0..len).map(|j| e[j] / z * v[j * w + h * hd + c] as f64).sum::<f64>() as f32;
+                }
+            }
+        }
+        let pool = crate::pool::Pool::new(3);
+        for p in [None, Some(&pool)] {
+            let mut out = vec![0f32; len * w];
+            attend_host(&q, &k, &v, len, nh, hd, &mut out, p);
+            let err = out.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            assert!(err < 1e-5, "max err {err}");
+        }
     }
 
     #[test]
