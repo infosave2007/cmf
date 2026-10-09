@@ -42,10 +42,14 @@
 //! Padding patches of the reference processor are masked out of attention
 //! and pooling there, so the tower here simply runs each image on its real
 //! patches. Images are packed back to back for the projections (one GEMM
-//! per weight over every patch of a batch); attention runs per image, on
-//! Metal when it is up (`CMF_EGEMMA2_VISION_GPU=0` keeps it on the host).
+//! per weight over every patch of a batch); attention runs per image on the
+//! host in f32 (scores, softmax and value mix pipelined so the matrix unit
+//! and the vector units overlap), and on Metal's flash kernel for the
+//! largest images (budget 1120), where the n² term dominates
+//! (`CMF_EGEMMA2_VISION_GPU=0` keeps everything on the host, `=1` sends
+//! every image to the device).
 
-use crate::egemma2::{Mat, add_normed, gelu_mul, gemm_nt_strided, rms_into, rms_rows, softmax, vecf};
+use crate::egemma2::{Mat, add_normed, gelu_mul, rms_into, rms_rows, softmax, vecf};
 use crate::ltxdit::{Shared, rows};
 use crate::media::RgbFrame;
 use crate::pool::Pool;
@@ -58,8 +62,43 @@ use std::sync::{Arc, Mutex};
 pub const BUDGETS: [usize; 5] = [70, 140, 280, 560, 1120];
 /// Patches are packed into one tower forward up to this many rows.
 const PACK_PATCHES: usize = 10_080;
-/// Query rows per host attention block.
-const QBLOCK: usize = 512;
+/// Scores per host attention block (32 MB of f32), and the fewest query
+/// rows a block takes.
+const SCORE_BLOCK: usize = 8 << 20;
+const QBLOCK_MIN: usize = 256;
+/// Images with at least this many patches attend on Metal when it is up.
+const GPU_MIN_PATCHES: usize = 8192;
+
+/// `CMF_EGEMMA2_PROF=1`: per-forward time split of the tower on stderr.
+mod vprof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub const QKV: usize = 0;
+    pub const NORM_ROPE: usize = 1;
+    pub const CORE: usize = 2;
+    pub const O: usize = 3;
+    pub const MLP: usize = 4;
+    pub const GELU: usize = 5;
+    pub const NORMS: usize = 6;
+    const NAMES: [&str; 7] = ["q/k/v", "norm+rope", "attention core", "o", "mlp", "gelu", "norms"];
+    static T: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+    pub fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("CMF_EGEMMA2_PROF").is_ok_and(|v| v == "1"))
+    }
+    pub fn add(i: usize, t: std::time::Instant) {
+        if on() {
+            T[i].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+    }
+    pub fn take() -> String {
+        NAMES
+            .iter()
+            .enumerate()
+            .map(|(i, n)| format!("{n} {:.1}", T[i].swap(0, Ordering::Relaxed) as f64 / 1e3))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
 
 // ------------------------------------------------------------ processor
 
@@ -678,7 +717,8 @@ pub struct VisionTower {
     pub out_dim: usize,
     pool: Option<Arc<Pool>>,
     busy: Mutex<()>,
-    gpu_attention: bool,
+    /// images of at least this many patches attend on the device
+    gpu_min_patches: usize,
 }
 
 /// Per-image segment of a packed batch.
@@ -763,7 +803,16 @@ impl VisionTower {
         let inv_freq = (0..quarter)
             .map(|i| 1.0f32 / theta.powf((2 * i) as f32 / (head_dim / 2) as f32))
             .collect();
-        let gpu_attention = !std::env::var("CMF_EGEMMA2_VISION_GPU").is_ok_and(|v| v == "0");
+        // Metal's flash attention (f16 operands, f32 sums) wins only where the
+        // n² scores dominate: measured on an M4, 4.7 s against 10.4 s at
+        // 9801 patches (budget 1120), a wash at 4761 (560), slower at 2304
+        // (280) than the pipelined host path, which is also exact f32.
+        // CMF_EGEMMA2_VISION_GPU=0 never, =1 from 256 patches.
+        let gpu_min_patches = match std::env::var("CMF_EGEMMA2_VISION_GPU").as_deref() {
+            Ok("0") => usize::MAX,
+            Ok("1") => 256,
+            _ => GPU_MIN_PATCHES,
+        };
         Ok(VisionTower {
             input_proj: Mat::load(model, "vision_tower.patch_embedder.input_proj.weight", dequant)?,
             pos,
@@ -778,7 +827,7 @@ impl VisionTower {
             pool_k,
             pool,
             busy: Mutex::new(()),
-            gpu_attention,
+            gpu_min_patches,
         })
     }
 
@@ -867,31 +916,40 @@ impl VisionTower {
                 }
             }
         }
-        let mut t_attn = 0f64;
         for l in &self.layers {
+            let t0 = std::time::Instant::now();
             let a = rms_rows(&h, Some(&l.in_norm), d, pool);
-            let ta = std::time::Instant::now();
+            vprof::add(vprof::NORMS, t0);
             let attn = self.attention(l, &a, n, &segs, &cos, &sin, pool);
-            t_attn += ta.elapsed().as_secs_f64();
+            let t0 = std::time::Instant::now();
             add_normed(&mut h, &attn, &l.post_attn_norm, d, pool);
             let m = rms_rows(&h, Some(&l.pre_ff_norm), d, pool);
+            vprof::add(vprof::NORMS, t0);
+            let t0 = std::time::Instant::now();
             let mut g = l.gate.apply(&m, n, pool);
             let u = l.up.apply(&m, n, pool);
+            vprof::add(vprof::MLP, t0);
+            let t0 = std::time::Instant::now();
             gelu_mul(&mut g, &u, pool);
             drop(u);
+            vprof::add(vprof::GELU, t0);
+            let t0 = std::time::Instant::now();
             let f = l.down.apply(&g, n, pool);
+            vprof::add(vprof::MLP, t0);
+            let t0 = std::time::Instant::now();
             add_normed(&mut h, &f, &l.post_ff_norm, d, pool);
+            vprof::add(vprof::NORMS, t0);
         }
         // 3x3 average pooling, sqrt(hidden), then embed_vision
         let k = self.pool_k;
         let root = (d as f32).sqrt();
         let inv_k2 = 1.0f32 / (k * k) as f32;
-        if std::env::var("CMF_EGEMMA2_PROF").is_ok_and(|v| v == "1") {
+        if vprof::on() {
             eprintln!(
-                "egemma2 vision: {n} patches / {} images in {:.1} ms — attention (incl. q/k/v/o) {:.1} ms",
+                "egemma2 vision: {n} patches / {} images in {:.1} ms — {}",
                 segs.len(),
                 t_fwd.elapsed().as_secs_f64() * 1e3,
-                t_attn * 1e3
+                vprof::take()
             );
         }
         segs.iter()
@@ -930,9 +988,12 @@ impl VisionTower {
     ) -> Vec<f32> {
         let (hd, nh) = (self.head_dim, self.heads);
         let w = nh * hd;
+        let t0 = std::time::Instant::now();
         let mut q = l.q.apply(a, n, pool);
         let mut k = l.k.apply(a, n, pool);
         let mut v = l.v.apply(a, n, pool);
+        vprof::add(vprof::QKV, t0);
+        let t0 = std::time::Instant::now();
         let quarter = hd / 4;
         {
             let (qp, kp, vp) = (
@@ -980,12 +1041,13 @@ impl VisionTower {
                 }
             });
         }
+        vprof::add(vprof::NORM_ROPE, t0);
+        let t0 = std::time::Instant::now();
         let mut out = vec![0f32; n * w];
         for s in segs {
             let len = s.pw * s.ph;
             let rng = s.off * w..(s.off + len) * w;
-            if self.gpu_attention
-                && len >= 256
+            if len >= self.gpu_min_patches
                 && self.attend_gpu(&q[rng.clone()], &k[rng.clone()], &v[rng.clone()], len, &mut out[rng.clone()])
             {
                 continue;
@@ -1001,7 +1063,11 @@ impl VisionTower {
                 pool,
             );
         }
-        l.o.apply(&out, n, pool)
+        vprof::add(vprof::CORE, t0);
+        let t0 = std::time::Instant::now();
+        let r = l.o.apply(&out, n, pool);
+        vprof::add(vprof::O, t0);
+        r
     }
 
     /// All heads of one image on the device (`gpu::dit_attention`, flash
@@ -1026,8 +1092,97 @@ impl VisionTower {
     }
 }
 
+/// `C[m×n] = A[m×k] · op(B)` on strided row-major views: `bt` = B is
+/// `[n×k]` (used transposed), else `[k×n]`. Accelerate reads the views in
+/// place; elsewhere they are gathered for the portable GEMM.
+#[allow(clippy::too_many_arguments)]
+fn sgemm_view(
+    a: &[f32],
+    lda: usize,
+    b: &[f32],
+    ldb: usize,
+    bt: bool,
+    c: &mut [f32],
+    ldc: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+) {
+    #[cfg(target_os = "macos")]
+    {
+        #[link(name = "Accelerate", kind = "framework")]
+        unsafe extern "C" {
+            fn cblas_sgemm(
+                order: i32,
+                ta: i32,
+                tb: i32,
+                m: i32,
+                n: i32,
+                k: i32,
+                alpha: f32,
+                a: *const f32,
+                lda: i32,
+                b: *const f32,
+                ldb: i32,
+                beta: f32,
+                c: *mut f32,
+                ldc: i32,
+            );
+        }
+        assert!(a.len() >= (m - 1) * lda + k);
+        assert!(if bt { b.len() >= (n - 1) * ldb + k } else { b.len() >= (k - 1) * ldb + n });
+        assert!(c.len() >= (m - 1) * ldc + n);
+        // SAFETY: the views were bounds-checked above; row-major (101).
+        unsafe {
+            cblas_sgemm(
+                101,
+                111,
+                if bt { 112 } else { 111 },
+                m as i32,
+                n as i32,
+                k as i32,
+                1.0,
+                a.as_ptr(),
+                lda as i32,
+                b.as_ptr(),
+                ldb as i32,
+                0.0,
+                c.as_mut_ptr(),
+                ldc as i32,
+            );
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut ac = vec![0f32; m * k];
+        for r in 0..m {
+            ac[r * k..(r + 1) * k].copy_from_slice(&a[r * lda..r * lda + k]);
+        }
+        // the portable GEMM takes B as [n×k]
+        let mut bc = vec![0f32; n * k];
+        for r in 0..n {
+            for j in 0..k {
+                bc[r * k + j] = if bt { b[r * ldb + j] } else { b[j * ldb + r] };
+            }
+        }
+        let mut cc = vec![0f32; m * n];
+        crate::fcd_ops::gemm_nt_host(&ac, &bc, &mut cc, m, k, n, None);
+        for r in 0..m {
+            c[r * ldc..r * ldc + n].copy_from_slice(&cc[r * n..(r + 1) * n]);
+        }
+    }
+}
+
 /// Host attention of one image: per head, blocks of queries against every
-/// key (Accelerate GEMMs for the scores and the value mix).
+/// key — one GEMM for the scores, the softmax rows across the pool, one
+/// GEMM for the value mix, on the heads' strided views of q/k/v (no
+/// gathers). A block holds up to ~8 M scores (32 MB), so a 280-token
+/// image's 2304 patches go in one block a head.
+///
+/// The steps are pipelined: while the pool runs the softmax of block `t`,
+/// a second thread computes the scores of block `t + 1` and the value mix
+/// of block `t - 1` — the GEMMs (the matrix unit) and the exponentials
+/// (the vector units) overlap instead of taking turns.
 #[allow(clippy::too_many_arguments)]
 fn attend_host(
     q: &[f32],
@@ -1040,39 +1195,69 @@ fn attend_host(
     pool: Option<&Pool>,
 ) {
     let w = nh * hd;
-    let mut kh = vec![0f32; len * hd];
-    let mut vt = vec![0f32; hd * len];
-    let mut qb = vec![0f32; QBLOCK.min(len) * hd];
-    let mut sc = vec![0f32; QBLOCK.min(len) * len];
-    let mut ob = vec![0f32; QBLOCK.min(len) * hd];
-    for h in 0..nh {
-        for t in 0..len {
-            kh[t * hd..(t + 1) * hd].copy_from_slice(&k[t * w + h * hd..][..hd]);
-            for (c, &x) in v[t * w + h * hd..][..hd].iter().enumerate() {
-                vt[c * len + t] = x;
+    let qblock = (SCORE_BLOCK / len).clamp(QBLOCK_MIN, len.max(1));
+    let nblk = len.div_ceil(qblock);
+    let steps = nh * nblk;
+    // step -> (head, first row, rows)
+    let step = |t: usize| {
+        let (h, b) = (t / nblk, t % nblk);
+        let i0 = b * qblock;
+        (h, i0, (i0 + qblock).min(len) - i0)
+    };
+    let mut bufs: [Vec<f32>; 3] = std::array::from_fn(|_| vec![0f32; qblock * len]);
+    let scores = |t: usize, sc: &mut [f32]| {
+        let (h, i0, nb) = step(t);
+        sgemm_view(&q[i0 * w + h * hd..], w, &k[h * hd..], w, true, &mut sc[..nb * len], len, nb, len, hd);
+    };
+    let outp = Shared(out.as_mut_ptr());
+    let out_len = out.len();
+    let mix = |t: usize, sc: &[f32]| {
+        let (h, i0, nb) = step(t);
+        // SAFETY: steps write disjoint (rows, head) blocks of `out`
+        let o = unsafe { outp.at(0, out_len) };
+        sgemm_view(&sc[..nb * len], len, &v[h * hd..], w, false, &mut o[i0 * w + h * hd..], w, nb, hd, len);
+    };
+    let soft = |t: usize, sc: &mut [f32]| {
+        let (_, _, nb) = step(t);
+        let sp = Shared(sc.as_mut_ptr());
+        rows(pool, nb, &|s, e| {
+            for i in s..e {
+                softmax(unsafe { sp.at(i * len, len) });
             }
+        });
+    };
+    if pool.is_none() || steps < 2 {
+        let sc = &mut bufs[0];
+        for t in 0..steps {
+            scores(t, sc);
+            soft(t, sc);
+            mix(t, sc);
         }
-        let mut i0 = 0usize;
-        while i0 < len {
-            let i1 = (i0 + QBLOCK).min(len);
-            let nb = i1 - i0;
-            for i in 0..nb {
-                qb[i * hd..(i + 1) * hd].copy_from_slice(&q[(i0 + i) * w + h * hd..][..hd]);
-            }
-            crate::fcd_ops::gemm_nt_host(&qb[..nb * hd], &kh, &mut sc[..nb * len], nb, hd, len, None);
-            let sp = Shared(sc.as_mut_ptr());
-            rows(pool, nb, &|s, e| {
-                for i in s..e {
-                    softmax(unsafe { sp.at(i * len, len) });
+        return;
+    }
+    scores(0, &mut bufs[0]);
+    for t in 0..steps {
+        // bufs[t % 3] holds the scores of t; t + 1 goes to the next, t - 1
+        // is in the previous
+        let [b0, b1, b2] = &mut bufs;
+        let (cur, next, prev) = match t % 3 {
+            0 => (b0, b1, b2),
+            1 => (b1, b2, b0),
+            _ => (b2, b0, b1),
+        };
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                if t + 1 < steps {
+                    scores(t + 1, next);
+                }
+                if t >= 1 {
+                    mix(t - 1, prev);
                 }
             });
-            gemm_nt_strided(&sc[..nb * len], &vt, len, &mut ob[..nb * hd], nb, len, hd);
-            for i in 0..nb {
-                out[(i0 + i) * w + h * hd..][..hd].copy_from_slice(&ob[i * hd..(i + 1) * hd]);
-            }
-            i0 = i1;
-        }
+            soft(t, cur);
+        });
     }
+    mix(steps - 1, &bufs[(steps - 1) % 3]);
 }
 
 #[cfg(test)]
