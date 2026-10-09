@@ -2024,6 +2024,7 @@ impl Pipeline {
         use crate::gpu::{AttnGpuLayer, GdnGpuCfg, GdnGpuLayer, GraphDims, MetalFfn, TokenGraph};
         let graph_force = crate::gpu::q1_force() || crate::gpu::q2tp_gpu_opt_in();
         if self.attn_softcap > 0.0 // capped scores: no graph kernel — CPU path
+            || !self.metal_rope_scale_ok()
             || !crate::gpu::enabled_here()
             || !graph_force
             || std::env::var("CMF_GPU_BLOCK")
@@ -2510,11 +2511,36 @@ impl Pipeline {
             }
             Item::Gdn { .. } => false,
         });
-        let ab = crate::gpu_metal::dense_ab_arm().filter(|_| dense_fast);
+        // MoE decode with every layer device-attended (Mellum2.1): the
+        // routed experts' jobs ladder and the q8_2f attention projections
+        // take their measured levers (`MOE_*`, `DENSE_Q8R4`).
+        let moe_plan = !dense_fast
+            && plan.iter().all(|it| match it {
+                Item::Attn {
+                    l, li, full_gpu, ..
+                } => {
+                    *full_gpu
+                        && self.kv_cache.layers[*li].o1.is_none()
+                        && matches!(l.ffn, MetalFfn::Moe(_))
+                }
+                Item::Gdn { .. } => false,
+            });
+        let ab = crate::gpu_metal::dense_ab_arm().filter(|_| dense_fast || moe_plan);
+        if block_diag {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static SAID_AB: AtomicBool = AtomicBool::new(false);
+            if !SAID_AB.swap(true, Ordering::Relaxed) {
+                eprintln!("q1-graph: dense_fast={dense_fast} moe_plan={moe_plan} ab={ab:?}");
+            }
+        }
         let _mv_fast = match ab {
             Some((bits, _)) => {
                 graph.set_dense_concurrent_raw(bits & crate::gpu_metal::DENSE_CONC != 0);
                 crate::gpu_metal::MvFastGuard::set_raw(bits)
+            }
+            None if moe_plan => {
+                graph.set_dense_concurrent(crate::gpu_metal::MOE_PLAN_BITS & crate::gpu_metal::DENSE_CONC != 0);
+                crate::gpu_metal::MvFastGuard::set_bits(crate::gpu_metal::MOE_PLAN_BITS)
             }
             None => {
                 graph.set_dense_concurrent(dense_fast);
@@ -2657,6 +2683,7 @@ impl Pipeline {
                             q_norm: *q_norm,
                             k_norm: *k_norm,
                             inv_freq: &inv_freq_l,
+                            rope_scale: self.layer_rope_scale(*li),
                             cpu_k,
                             cpu_v,
                             cpu_stored,
@@ -2732,7 +2759,7 @@ impl Pipeline {
                         k_norm: *k_norm,
                         output_gate: *output_gate,
                         softplus_gate: None,
-                        rope_scale: 1.0,
+                        rope_scale: self.layer_rope_scale(*li),
                         bias: *bias,
                         rms_eps: eps,
                         norm_style,
@@ -2820,6 +2847,7 @@ impl Pipeline {
                             q_norm: *q_norm,
                             k_norm: *k_norm,
                             inv_freq: &inv_freq_l,
+                            rope_scale: self.layer_rope_scale(*li),
                             cpu_k,
                             cpu_v,
                             cpu_stored: stored,
@@ -9748,6 +9776,7 @@ impl Pipeline {
             // this chunk graph appends dense KV without feeding that trace.
             || self.o1_active()
             || self.attn_v_norm
+            || !self.metal_rope_scale_ok()
             || (self.attn_scale - 1.0 / (self.head_dim as f32).sqrt()).abs() > 1e-9
         {
             return li0;
@@ -9769,13 +9798,15 @@ impl Pipeline {
         } else {
             self.num_layers
         };
-        let mut layers: Vec<crate::gpu_metal::ChunkLayer> = Vec::new();
-        let mut stored_at: Vec<usize> = Vec::new();
         let run_end = self.num_layers.min(loop_end).min(cap);
         // Each layer's own RoPE table (Spark-X2.5: sliding and full layers
         // differ); the global one for every model without sliding layers.
+        // Declared before `layers`, which borrows it (and drops a routing
+        // closure on MoE layers).
         let tables: Vec<std::sync::Arc<Vec<f32>>> =
             (li0..run_end).map(|li| self.layer_inv_freq(li)).collect();
+        let mut layers: Vec<crate::gpu_metal::ChunkLayer> = Vec::new();
+        let mut stored_at: Vec<usize> = Vec::new();
         for li in li0..run_end {
             let lw = &self.weights.layers[self.phys_layer(li)];
             if lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some() {
@@ -9804,27 +9835,76 @@ impl Pipeline {
                 },
                 Some(_) => break,
             };
-            let FfnKind::Dense(d) = &lw.ffn else { break };
-            if !matches!(d.act, Act::Silu | Act::Gelu) || !d.segs.is_empty() {
-                break;
-            }
-            // q8_row (row_scale populated), or q4_tiled / q4tp (row_scale
-            // empty — their scales are in the payload). Mixing across the
-            // seven projections of one layer is fine; the encoder branches
-            // per weight on the tensor's dtype. Anything else refuses.
+            // The FFN: a dense SiLU/GELU trio, or routed q4tp experts
+            // (Mellum2.1: softmax router, no shared expert) whose first
+            // trio stands in for the shape checks.
+            let (gate_t, up_t, down_t, ffn_act, moe) = match &lw.ffn {
+                FfnKind::Dense(d)
+                    if matches!(d.act, Act::Silu | Act::Gelu) && d.segs.is_empty() =>
+                {
+                    (&d.gate_proj, &d.up_proj, &d.down_proj, d.act, None)
+                }
+                FfnKind::Moe(m) => match chunk_moe_parts(m, hs) {
+                    Some((router, experts)) => {
+                        let e0 = &m.experts[0];
+                        let route = Box::new(move |lg: &[f32]| {
+                            // `moe_ffn_batch`'s routing and weights, row by row.
+                            let (idx, p, wsum) = moe_route(lg, m, None);
+                            let mut st = m.stats.borrow_mut();
+                            if st.len() < m.experts.len() {
+                                st.resize(m.experts.len(), 0);
+                            }
+                            for &e in &idx {
+                                st[e] += 1;
+                            }
+                            let w = idx.iter().map(|&e| p[e] / wsum).collect();
+                            (idx, w)
+                        });
+                        (
+                            &e0.gate_proj,
+                            &e0.up_proj,
+                            &e0.down_proj,
+                            Act::Silu,
+                            Some(crate::gpu_metal::ChunkMoe {
+                                router,
+                                experts,
+                                route,
+                            }),
+                        )
+                    }
+                    None => break,
+                },
+                _ => break,
+            };
+            // q8_row (row_scale populated), q8_2f (plus its input field),
+            // or q4_tiled / q4tp (row_scale empty — their scales are in the
+            // payload). Mixing across the seven projections of one layer is
+            // fine; the encoder branches per weight on the tensor's dtype.
+            // Anything else refuses.
             fn cw(t: &QTensor) -> Option<(usize, usize, usize, &[f32])> {
                 t.q8_row_parts()
+                    .or_else(|| t.q8_2f_parts().map(|(i, r, c, rs, _)| (i, r, c, rs)))
                     .or_else(|| t.q4t_parts().map(|(i, r, c)| (i, r, c, &[][..])))
                     .or_else(|| t.q4tp_parts().map(|(i, r, c)| (i, r, c, &[][..])))
+            }
+            fn cf(t: &QTensor) -> &[f32] {
+                t.q8_2f_parts().map_or(&[][..], |(_, _, _, _, cf)| cf)
+            }
+            let col = [cf(wq), cf(wk), cf(wv), cf(wo)];
+            // q8_2f projections ride the chunk graph on the MoE layers it
+            // was measured on (Mellum2.1); dense q8_2f stacks keep the host
+            // walk until they are measured too.
+            if moe.is_none() && col.iter().any(|c| !c.is_empty()) {
+                break;
             }
             let parts = (
                 cw(wq),
                 cw(wk),
                 cw(wv),
                 cw(wo),
-                cw(&d.gate_proj),
-                cw(&d.up_proj),
-                cw(&d.down_proj),
+                cw(gate_t),
+                cw(up_t),
+                cw(down_t),
             );
             let (Some(pq), Some(pk), Some(pv), Some(po), Some(pg), Some(pu), Some(pd)) = parts
             else {
@@ -9861,18 +9941,21 @@ impl Pipeline {
                 q_norm: q_norm.as_deref(),
                 k_norm: k_norm.as_deref(),
                 inv_freq: &tables[li - li0],
+                rope_scale: self.layer_rope_scale(li),
                 rd: self.layer_geom(li).2,
                 nh,
                 nkv,
                 hd,
                 hs,
-                inter: d.gate_proj.rows(),
+                inter: gate_t.rows(),
                 gemma: matches!(self.norm_style, cortiq_core::NormStyle::Gemma),
                 late_qk_norm: self.qk_norm_after_rope,
                 eps: self.rms_eps as f32,
                 window: self.layer_window(li),
                 head_gate,
-                gelu: d.act == Act::Gelu,
+                gelu: ffn_act == Act::Gelu,
+                col,
+                moe,
             });
         }
         if layers.is_empty() {
@@ -10189,14 +10272,26 @@ impl Pipeline {
         None
     }
 
+    /// Can the Metal kernels apply this model's RoPE amplitude? Every
+    /// rotation kernel (`attn_rope_qkn[_b]`, `chunk_rope_kv`) multiplies the
+    /// rotated pair by the layer's `rope_scale` (YaRN `attention_factor`,
+    /// Mellum2.1's global layers) exactly where the CPU's
+    /// `rope_rotate_scaled` does. With the Q/K norm AFTER RoPE the kernels'
+    /// shared sum of squares would be the unscaled one, so that pairing
+    /// (no known model) declines.
+    #[cfg(target_os = "macos")]
+    fn metal_rope_scale_ok(&self) -> bool {
+        !(self.qk_norm_after_rope && (0..self.num_layers).any(|li| self.layer_rope_scale(li) != 1.0))
+    }
+
     /// Can the Metal block graph carry this model's sliding-window layers?
     /// Both of its attention forms take a layer's own window, RoPE table
     /// and rotary width: the device attend (`AttnDeviceParams::window`, the
     /// layer's `inv_freq`/`rd`) and the sandwich's host attend (exactly the
     /// CPU path's attention). True when the sliding window is the model's
     /// only attention-level decline (Spark-X2.5); per-layer KV heads,
-    /// narrow V, sinks, Gemma-4 global geometry and scaled RoPE positions
-    /// still decline.
+    /// narrow V, sinks and Gemma-4 global geometry still decline; a YaRN
+    /// amplitude per layer rides along (`metal_rope_scale_ok`).
     ///
     /// Per-layer Q heads (Laguna) and capped scores (Gemma-2) decline here
     /// too, with V norm (Gemma-4): the chunk prefill's own gate checks
@@ -10213,7 +10308,7 @@ impl Pipeline {
             && !self.kv_cache.layers.iter().any(|l| l.sinks.is_some())
             && self.global_attn.is_none()
             && self.inv_freq_global.is_none()
-            && (0..self.num_layers).all(|li| self.layer_rope_scale(li) == 1.0)
+            && self.metal_rope_scale_ok()
             && !(0..self.num_layers).any(|li| {
                 self.layer_is_local(li)
                     && self.inv_freq_local.is_none()
@@ -11590,6 +11685,7 @@ impl Pipeline {
             || self.graph_attn_decline_reason().is_some()
             || self.attn_v_norm
             || self.loop_final_norm
+            || !self.metal_rope_scale_ok()
         {
             return None;
         }
@@ -11737,6 +11833,7 @@ impl Pipeline {
         k_norm: Option<&'a [f32]>,
         output_gate: bool,
         inv_freq: &'a [f32],
+        rope_scale: f32,
         geom: (usize, usize, usize, usize),
         pos0: usize,
         kv_id: u64,
@@ -11766,6 +11863,7 @@ impl Pipeline {
                 q_norm,
                 k_norm,
                 inv_freq,
+                rope_scale,
                 cpu_k,
                 cpu_v,
                 cpu_stored,
@@ -11872,6 +11970,7 @@ impl Pipeline {
                         *k_norm,
                         *output_gate,
                         &inv_freq,
+                        self.layer_rope_scale(*li),
                         geom,
                         pos0,
                         kv_id,
@@ -11929,6 +12028,7 @@ impl Pipeline {
                         *k_norm,
                         *output_gate,
                         &inv_freq,
+                        self.layer_rope_scale(*li),
                         geom,
                         pos0,
                         kv_id,
@@ -12396,6 +12496,7 @@ impl Pipeline {
                 q_norm: q_norm.as_deref(),
                 k_norm: k_norm.as_deref(),
                 inv_freq: &inv_freq,
+                rope_scale: self.rope_scale,
                 cpu_k,
                 cpu_v,
                 cpu_stored,
@@ -12649,6 +12750,7 @@ impl Pipeline {
                 q_norm: q_norm.as_deref(),
                 k_norm: k_norm.as_deref(),
                 inv_freq: &inv_freq,
+                rope_scale: self.rope_scale,
                 cpu_k,
                 cpu_v,
                 cpu_stored,
@@ -12916,6 +13018,7 @@ impl Pipeline {
                     q_norm: q_norm.as_deref(),
                     k_norm: k_norm.as_deref(),
                     inv_freq: &inv_freq,
+                    rope_scale: self.rope_scale,
                     cpu_k: cpu_k.clone(),
                     cpu_v: cpu_v.clone(),
                     cpu_stored: cpu_stored + j,
@@ -16554,6 +16657,15 @@ fn moe_ffn_batch(
             let inherit_cpu = crate::gpu::inherit_cpu_scope();
             let run = |start: usize, end: usize| {
                 let _cpu_scope = inherit_cpu();
+                // Native Metal: the per-op device helpers (`q4tp_ffn`,
+                // `q8_matmat`, …) stage through size-keyed shared io
+                // buffers and are not re-entrant — two workers whose experts
+                // drew the same row count wrote one buffer at once, so a
+                // Mellum2.1 prompt came out different on every run. The
+                // workers keep whole experts on the CPU there; the device
+                // prefill is the MoE chunk graph.
+                #[cfg(target_os = "macos")]
+                let _metal_cpu = crate::gpu::enter_cpu_scope();
                 for ai in start..end {
                     let e = active_r[ai];
                     let list = &assign_r[e];
@@ -17768,6 +17880,57 @@ pub(crate) fn moe_parts(
 /// and Gemma's router-input norm refuse here — those semantics stay on
 /// the CPU path.
 #[cfg(target_os = "macos")]
+/// The routed experts of a MoE layer as the Metal chunk prefill takes
+/// them: f32 router rows and every expert's q4tp (gate, up, down) tensor
+/// indices, uniform SiLU shapes. Only the plain routed form — no shared
+/// expert, no per-expert scale, no resonance or τ router, no router input
+/// norm; the batched host walk keeps the rest. The routing itself stays the
+/// host's (`moe_route`), so mask and selection bias need nothing here.
+#[cfg(target_os = "macos")]
+#[allow(clippy::type_complexity)]
+fn chunk_moe_parts(m: &MoeFfn, hidden: usize) -> Option<(&[f32], Vec<(usize, usize, usize)>)> {
+    if m.shared.is_some()
+        || m.per_expert_scale.is_some()
+        || m.resonance.is_some()
+        || m.route_tau.is_some()
+        || m.router_input_norm
+        || m.experts.is_empty()
+        || m.top_k == 0
+        || std::env::var("CMF_RMS_TRACE").is_ok()
+        || std::env::var("CMF_ACT_DUMP").is_ok()
+        || std::env::var("CMF_METAL_MOE_PREFILL").as_deref() == Ok("0")
+    {
+        return None;
+    }
+    let (rf, rr, rc) = m.router.f32_parts()?;
+    if rr != m.experts.len() || rc != hidden {
+        return None;
+    }
+    let inter = m.experts[0].gate_proj.rows();
+    let experts = m
+        .experts
+        .iter()
+        .map(|e| {
+            if e.act != Act::Silu
+                || !e.segs.is_empty()
+                || e.gate_proj.rows() != inter
+                || e.up_proj.rows() != inter
+                || e.down_proj.cols() != inter
+                || e.gate_proj.cols() != hidden
+                || e.down_proj.rows() != hidden
+            {
+                return None;
+            }
+            Some((
+                e.gate_proj.mapped_q4tp()?.1,
+                e.up_proj.mapped_q4tp()?.1,
+                e.down_proj.mapped_q4tp()?.1,
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some((rf, experts))
+}
+
 fn metal_moe_graph_parts(m: &MoeFfn, hidden: usize) -> Option<crate::gpu::GpuMoe<'_>> {
     if m.router_input_norm
         || m.route_tau.is_some()
@@ -17779,10 +17942,13 @@ fn metal_moe_graph_parts(m: &MoeFfn, hidden: usize) -> Option<crate::gpu::GpuMoe
     {
         return None;
     }
-    // The select kernel always fills the shared slot: a model without a
-    // shared expert (LFM2-MoE) stays on the CPU path here.
+    // Without a shared expert the select kernel fills the k routed jobs
+    // only (flag 32). Measured on Mellum2.1's softmax router; the sigmoid /
+    // biased routers without one (LFM2-MoE) keep the CPU path until they
+    // are measured too.
     let (sh, sg) = match &m.shared {
-        Some((sh, sg)) => (sh, sg.as_ref()),
+        Some((sh, sg)) => (Some(sh), sg.as_ref()),
+        None if !m.router_sigmoid && m.expert_bias.is_none() => (None, None),
         None => return None,
     };
     let (rf, rr, rc) = m.router.f32_parts()?;
@@ -17836,7 +18002,10 @@ fn metal_moe_graph_parts(m: &MoeFfn, hidden: usize) -> Option<crate::gpu::GpuMoe
         ))
     };
     let experts = m.experts.iter().map(trio).collect::<Option<Vec<_>>>()?;
-    let shared = trio(sh)?;
+    let shared = match sh {
+        Some(sh) => Some(trio(sh)?),
+        None => None,
+    };
     Some(crate::gpu::GpuMoe {
         router: rf,
         sgate: sf,
