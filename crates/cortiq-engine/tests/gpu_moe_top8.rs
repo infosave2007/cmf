@@ -248,3 +248,167 @@ fn generic_q4tp_moe_top8_of_64_matches_scalar_reference() {
     drop(model);
     std::fs::remove_dir_all(dir).ok();
 }
+
+fn q8_row_payload(rows: usize, cols: usize, seed: usize) -> (Vec<u8>, Vec<f32>) {
+    let mut out = Vec::with_capacity(rows * cols + rows * 2);
+    for r in 0..rows {
+        for c in 0..cols {
+            out.push((((seed * 31 + r * 13 + c * 7) % 255) as i32 - 127) as i8 as u8);
+        }
+    }
+    let mut scales = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let h = f32_to_f16(0.002 + ((seed + r) % 7) as f32 * 0.0005);
+        out.extend_from_slice(&h.to_le_bytes());
+        scales.push(cortiq_core::quant::f16_to_f32(h));
+    }
+    (out, scales)
+}
+
+/// q8 jobs whose gate/up inputs differ per job — what a q8_2f expert
+/// sends (x times that expert's own column field) — plus a per-job down
+/// column field. The whole block is one command buffer, so a staging
+/// buffer shared between jobs hands every expert the last job's input
+/// (native Metal before the per-job key: Mellum2.1 q8_2f experts decoded
+/// at wiki ppl 7.39 instead of 7.21).
+#[test]
+fn q8_moe_jobs_keep_their_own_inputs() {
+    let test_backend = std::env::var("CMF_MOE_TEST_BACKEND").unwrap_or_else(|_| "wgpu".into());
+    let run: for<'a> fn(&Arc<CmfModel>, &[MoeJob<'a>], &mut [f32]) -> bool =
+        match test_backend.as_str() {
+            "wgpu" => {
+                unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+                if !cortiq_engine::gpu_wgpu::enabled() {
+                    eprintln!("skipped: no WGPU adapter");
+                    return;
+                }
+                cortiq_engine::gpu_wgpu::moe_block
+            }
+            "metal" => {
+                #[cfg(target_os = "macos")]
+                {
+                    unsafe { std::env::set_var("CMF_GPU", "1") };
+                    if !cortiq_engine::gpu_metal::enabled() {
+                        eprintln!("skipped: no native Metal adapter");
+                        return;
+                    }
+                    cortiq_engine::gpu_metal::moe_block
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    panic!("CMF_MOE_TEST_BACKEND=metal requires macOS")
+                }
+            }
+            other => panic!("unknown CMF_MOE_TEST_BACKEND={other:?}; use wgpu or metal"),
+        };
+
+    let (hidden, inter, n_jobs) = (96usize, 128usize, 4usize);
+    let mut specs = Vec::new();
+    let mut scales: Vec<[Vec<f32>; 3]> = Vec::new();
+    for e in 0..n_jobs {
+        let mut s3: [Vec<f32>; 3] = Default::default();
+        for (k, (part, rows, cols)) in [("gate", inter, hidden), ("up", inter, hidden), ("down", hidden, inter)]
+            .into_iter()
+            .enumerate()
+        {
+            let (data, rs) = q8_row_payload(rows, cols, e * 5 + k);
+            specs.push(TensorSpec {
+                name: format!("experts.{e}.{part}"),
+                dtype: TensorDtype::Q8Row,
+                shape: vec![rows, cols],
+                data,
+            });
+            s3[k] = rs;
+        }
+        scales.push(s3);
+    }
+    specs.push(TensorSpec {
+        name: "pad".into(),
+        dtype: TensorDtype::F32,
+        shape: vec![8192, 2],
+        data: vec![0; 8192 * 8],
+    });
+    let dir = std::env::temp_dir().join(format!(
+        "cmf-moe-q8-inputs-{}-{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("q8jobs.cmf");
+    CmfModel::write(&path, &header(hidden, inter), &specs, None, None).unwrap();
+    let model = Arc::new(CmfModel::open(&path).unwrap());
+
+    let x: Vec<f32> = (0..hidden)
+        .map(|i| ((i * 19 + 3) % 97) as f32 / 97.0 - 0.5)
+        .collect();
+    // Per-job column fields, as q8_2f experts carry them.
+    let col = |e: usize, n: usize, salt: usize| -> Vec<f32> {
+        (0..n)
+            .map(|i| 0.5 + ((e * 11 + i * 3 + salt) % 17) as f32 / 16.0)
+            .collect()
+    };
+    let xs_g: Vec<Vec<f32>> = (0..n_jobs)
+        .map(|e| x.iter().zip(col(e, hidden, 1)).map(|(a, b)| a * b).collect())
+        .collect();
+    let xs_u: Vec<Vec<f32>> = (0..n_jobs)
+        .map(|e| x.iter().zip(col(e, hidden, 2)).map(|(a, b)| a * b).collect())
+        .collect();
+    let dcols: Vec<Vec<f32>> = (0..n_jobs).map(|e| col(e, inter, 3)).collect();
+    let mix = [0.4f32, 0.3, 0.2, 0.1];
+    let mut jobs = Vec::with_capacity(n_jobs);
+    for e in 0..n_jobs {
+        let gi = model.tensor_index(&format!("experts.{e}.gate")).unwrap();
+        let ui = model.tensor_index(&format!("experts.{e}.up")).unwrap();
+        let di = model.tensor_index(&format!("experts.{e}.down")).unwrap();
+        jobs.push(MoeJob {
+            gate: (gi, inter, hidden, &scales[e][0]),
+            up: (ui, inter, hidden, &scales[e][1]),
+            down: (di, hidden, inter, &scales[e][2]),
+            xs_gate: xs_g[e].clone(),
+            xs_up: xs_u[e].clone(),
+            down_col: &dcols[e],
+            w: mix[e],
+            q1: false,
+            q4t: false,
+            q4tp: false,
+            gu_q2: false,
+            swiglu_limit: 0.0,
+        });
+    }
+    let mut got = vec![0.0; hidden];
+    assert!(
+        run(&model, &jobs, &mut got),
+        "{test_backend} refused a well-formed q8 MoE block"
+    );
+
+    let mut want = vec![0.0f32; hidden];
+    for e in 0..n_jobs {
+        let gi = model.tensor_index(&format!("experts.{e}.gate")).unwrap();
+        let ui = model.tensor_index(&format!("experts.{e}.up")).unwrap();
+        let di = model.tensor_index(&format!("experts.{e}.down")).unwrap();
+        let g = mv(&dequant(&model, gi, inter, hidden), inter, hidden, &xs_g[e]);
+        let u = mv(&dequant(&model, ui, inter, hidden), inter, hidden, &xs_u[e]);
+        let a: Vec<f32> = g
+            .iter()
+            .zip(&u)
+            .zip(&dcols[e])
+            .map(|((&gv, &uv), &c)| gv / (1.0 + (-gv).exp()) * uv * c)
+            .collect();
+        let d = mv(&dequant(&model, di, hidden, inter), hidden, inter, &a);
+        for (dst, v) in want.iter_mut().zip(d) {
+            *dst += mix[e] * v;
+        }
+    }
+    let (mut num, mut den) = (0.0f64, 0.0f64);
+    for (&a, &b) in got.iter().zip(&want) {
+        assert!(a.is_finite(), "GPU produced a non-finite MoE output");
+        num += (a as f64 - b as f64).powi(2);
+        den += (b as f64).powi(2);
+    }
+    let rel = (num / den.max(1e-30)).sqrt();
+    eprintln!("{test_backend} q8 per-job-input MoE relative RMS error: {rel:.3e}");
+    assert!(rel < 3e-4, "q8 MoE jobs mixed up their inputs: {rel:.3e}");
+
+    drop(model);
+    std::fs::remove_dir_all(dir).ok();
+}
