@@ -33,6 +33,8 @@ pub(crate) mod qwen4;
 pub(crate) mod moe_r4;
 /// Token-axis batch kernels of the dense GDN hybrids (gated attention).
 pub(crate) mod dense_batch;
+/// Warp-per-row q4tp decode matvecs (bit-identical to the 16nl rows).
+pub(crate) mod dense_mv;
 
 /// Workgroup limit per dimension (WebGPU minimum; lm_head has more
 /// rows — we use grid-stride in the shader).
@@ -18568,6 +18570,8 @@ struct Ctx {
     moe_r4_pipes: std::sync::OnceLock<Option<moe_r4::Pipes>>,
     /// Token-axis batch kernels of the dense hybrids (`dense_batch`).
     dense_batch_pipes: std::sync::OnceLock<Option<dense_batch::Pipes>>,
+    /// Warp-per-row q4tp decode matvecs (`dense_mv`).
+    dense_mv_pipes: std::sync::OnceLock<Option<dense_mv::MvSg>>,
     moe_down_q4tp_b2: wgpu::ComputePipeline,
     moe_down_q4tp_part: wgpu::ComputePipeline,
     moe_down_q4tp_b4: wgpu::ComputePipeline,
@@ -21172,6 +21176,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         qwen4_pipes: std::sync::OnceLock::new(),
         moe_r4_pipes: std::sync::OnceLock::new(),
         dense_batch_pipes: std::sync::OnceLock::new(),
+        dense_mv_pipes: std::sync::OnceLock::new(),
         moe_down_q4tp_b2,
         moe_down_q4tp_part,
         moe_down_q4tp_b4,
@@ -26507,6 +26512,13 @@ pub fn forward_token_graph(
                     // runs, for a like-for-like A/B: on the RTX 5090 pod
                     // q4t (8-row pairs) decoded 7% FASTER than q4tp (quad
                     // 16-row) on Qwen3.8-27B despite 7.5% fewer bytes.
+                    // Warp-per-row twin of 16nl (same rows to the bit).
+                    if c.use_mv_nl
+                        && c.q4tp_mv16w_probe.is_none()
+                        && let Some(t) = dense_mv::sg_prep(c, xs, cols, &[(&m.buf, y, rows)])
+                    {
+                        return Some(t);
+                    }
                     let (pipe6, per_wg) = if c.use_mv_nl && c.q4tp_mv16w_probe.is_none() {
                         (&c.q4tp_mv16nl, 16u32)
                     } else if gpr <= 64 {
@@ -26623,6 +26635,12 @@ pub fn forward_token_graph(
         let gpr = cols / 32;
         if !mv_fuse_gpr_ok(gpr) || c.q4tp_mv16w_probe.is_some() {
             return None;
+        }
+        if c.use_mv_nl
+            && let Some(t) =
+                dense_mv::sg_prep(c, xs, cols, &[(&a.buf, ya, rows_a), (&b.buf, yb, rows_b)])
+        {
+            return Some(t);
         }
         let (bind, wg) = mv_x2_bind(c, &a.buf, &b.buf, xs, ya, yb, rows_a, rows_b, cols);
         Some((x2_pipe(c), bind, wg))
@@ -28218,9 +28236,23 @@ pub fn forward_token_graph(
                             && mv_fuse_gpr_ok(hidden / 32)
                             && c.q4tp_mv16w_probe.is_none();
                         let pgu_fused = if gu_ok {
-                            let (b, w) =
-                                mv_gu_bind(c, &gate.buf, &up.buf, &n1, &abuf, inter, hidden, act);
-                            Some((gu_pipe(c), b, w))
+                            match c
+                                .use_mv_nl
+                                .then(|| {
+                                    dense_mv::sg_gu_prep(
+                                        c, &gate.buf, &up.buf, &n1, &abuf, inter, hidden, act,
+                                    )
+                                })
+                                .flatten()
+                            {
+                                Some(t) => Some(t),
+                                None => {
+                                    let (b, w) = mv_gu_bind(
+                                        c, &gate.buf, &up.buf, &n1, &abuf, inter, hidden, act,
+                                    );
+                                    Some((gu_pipe(c), b, w))
+                                }
+                            }
                         } else {
                             None
                         };
