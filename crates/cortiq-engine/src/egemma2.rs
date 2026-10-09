@@ -287,7 +287,7 @@ pub fn wrap_ids(ids: &[u32], bos: u32, eos: u32, max_tokens: usize) -> Vec<u32> 
 
 /// A projection `y = x·Wᵀ`: owned f32 (the exact profiles dequantize once)
 /// or a mapped quantized tensor on the engine's kernels.
-enum Mat {
+pub(crate) enum Mat {
     F32 {
         w: Vec<f32>,
         rows: usize,
@@ -299,7 +299,7 @@ enum Mat {
 impl Mat {
     /// `dequant`: widen a quantized matrix to f32 once (Accelerate GEMM,
     /// 4 bytes a weight) instead of running the quantized kernels on it.
-    fn load(model: &Arc<CmfModel>, name: &str, dequant: bool) -> Result<Mat, String> {
+    pub(crate) fn load(model: &Arc<CmfModel>, name: &str, dequant: bool) -> Result<Mat, String> {
         let e = model
             .tensor(name)
             .ok_or_else(|| format!("missing tensor {name}"))?;
@@ -321,14 +321,14 @@ impl Mat {
         })
     }
 
-    fn rows(&self) -> usize {
+    pub(crate) fn rows(&self) -> usize {
         match self {
             Mat::F32 { rows, .. } => *rows,
             Mat::Q(q) => q.rows(),
         }
     }
 
-    fn apply(&self, x: &[f32], n: usize, pool: Option<&Pool>) -> Vec<f32> {
+    pub(crate) fn apply(&self, x: &[f32], n: usize, pool: Option<&Pool>) -> Vec<f32> {
         let t0 = std::time::Instant::now();
         let mut out = vec![0f32; n * self.rows()];
         match self {
@@ -397,7 +397,7 @@ impl Table {
     }
 }
 
-fn vecf(model: &CmfModel, name: &str) -> Result<Vec<f32>, String> {
+pub(crate) fn vecf(model: &CmfModel, name: &str) -> Result<Vec<f32>, String> {
     crate::dit::cmf_f32(model, name)
 }
 
@@ -471,7 +471,7 @@ impl Rot {
 }
 
 /// RMS-normalize `x` (`[n, d]`) row by row, times `w` when given.
-fn rms_rows(x: &[f32], w: Option<&[f32]>, d: usize, pool: Option<&Pool>) -> Vec<f32> {
+pub(crate) fn rms_rows(x: &[f32], w: Option<&[f32]>, d: usize, pool: Option<&Pool>) -> Vec<f32> {
     let n = x.len() / d;
     let mut out = vec![0f32; x.len()];
     let dst = Shared(out.as_mut_ptr());
@@ -485,7 +485,7 @@ fn rms_rows(x: &[f32], w: Option<&[f32]>, d: usize, pool: Option<&Pool>) -> Vec<
 }
 
 #[inline]
-fn rms_into(x: &[f32], w: Option<&[f32]>, out: &mut [f32]) {
+pub(crate) fn rms_into(x: &[f32], w: Option<&[f32]>, out: &mut [f32]) {
     let ss = x.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / x.len() as f64;
     let inv = 1.0 / (ss + EPS).sqrt();
     match w {
@@ -503,7 +503,7 @@ fn rms_into(x: &[f32], w: Option<&[f32]>, out: &mut [f32]) {
 }
 
 /// `h += rms_w(y)` row by row.
-fn add_normed(h: &mut [f32], y: &[f32], w: &[f32], d: usize, pool: Option<&Pool>) {
+pub(crate) fn add_normed(h: &mut [f32], y: &[f32], w: &[f32], d: usize, pool: Option<&Pool>) {
     let n = h.len() / d;
     let dst = Shared(h.as_mut_ptr());
     rows(pool, n, &|s, e| {
@@ -553,7 +553,7 @@ fn gelu_mul_slice(x: &mut [f32], y: &[f32]) {
 }
 
 /// `a = gelu_tanh(a) * b`, elementwise, across the pool.
-fn gelu_mul(a: &mut [f32], b: &[f32], pool: Option<&Pool>) {
+pub(crate) fn gelu_mul(a: &mut [f32], b: &[f32], pool: Option<&Pool>) {
     let n = a.len();
     let grain = 16384usize;
     let dst = Shared(a.as_mut_ptr());
@@ -565,7 +565,7 @@ fn gelu_mul(a: &mut [f32], b: &[f32], pool: Option<&Pool>) {
 }
 
 /// `y[n,m] = x[n,k] · w[m,k]ᵀ` where row `r` of `w` starts at `w[r·ldw]`.
-fn gemm_nt_strided(x: &[f32], w: &[f32], ldw: usize, y: &mut [f32], n: usize, k: usize, m: usize) {
+pub(crate) fn gemm_nt_strided(x: &[f32], w: &[f32], ldw: usize, y: &mut [f32], n: usize, k: usize, m: usize) {
     assert!(m == 0 || w.len() >= (m - 1) * ldw + k);
     if ldw == k {
         return crate::fcd_ops::gemm_nt_host(x, &w[..m * k], y, n, k, m, None);
@@ -622,7 +622,7 @@ fn gemm_nt_strided(x: &[f32], w: &[f32], ldw: usize, y: &mut [f32], n: usize, k:
 }
 
 /// Softmax of `row` in place (finite inputs) — NEON on aarch64.
-fn softmax(row: &mut [f32]) {
+pub(crate) fn softmax(row: &mut [f32]) {
     #[cfg(target_arch = "aarch64")]
     {
         crate::attention::softmax_row(row);

@@ -1,14 +1,27 @@
-//! `cortiq embed` — text embeddings from an EmbeddingGemma 2 `.cmf`.
+//! `cortiq embed` — embeddings from an EmbeddingGemma 2 `.cmf`: texts,
+//! images, videos, and interleaved text + media, all in one 768-d space.
 //!
 //! Every input is one embedding: unit length, 768-d, or a Matryoshka prefix
 //! (`--dim 512|256|128`, re-normalized). `--prompt-name` applies one of the
 //! model's task prompts (`SearchQuery`, `Document`, `QuestionAnswering`, …;
-//! `--list-prompts` prints them); `--title` fills the Document prompt.
-//! `--jsonl` gives each line its own prompt/title.
+//! `--list-prompts` prints them) to the text inputs; `--title` fills the
+//! Document prompt. `--jsonl` gives each line its own prompt/title/media.
+//!
+//! Media: `--image PATH|URL` and `--video PATH` (repeatable) are inputs of
+//! their own. A video is an mp4/webm/mov/… (decoded with the `ffmpeg`
+//! executable), a `.y4m`, or a directory of frames (`--video-fps` gives
+//! their rate; without it they are taken as already sampled at 1 fps).
+//! `--interleave` makes ONE input of the text and the media instead: the
+//! text's `<|image|>` / `<|video|>` placeholders take them in order (or,
+//! with no placeholders, the media come first). `--image-tokens` /
+//! `--video-tokens` set the soft-token budget (70 | 140 | 280 | 560 | 1120;
+//! defaults 280 per image, 140 per frame).
 
 use anyhow::{Context, Result, anyhow};
 use cortiq_core::CmfModel;
-use cortiq_engine::egemma2::{EmbeddingGemma2, TextInput, cosine, matryoshka};
+use cortiq_engine::egemma2::{cosine, matryoshka};
+use cortiq_engine::egemma2_mm::{Media, MediaEncoder, MixedInput};
+use cortiq_engine::egemma2_vision::decode_video;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -27,42 +40,93 @@ pub struct EmbedArgs {
     pub list_prompts: bool,
     /// run the forward this many times and report each (in-process timing)
     pub repeat: usize,
+    pub images: Vec<String>,
+    pub videos: Vec<String>,
+    pub video_fps: Option<f64>,
+    pub image_tokens: Option<usize>,
+    pub video_tokens: Option<usize>,
+    pub interleave: bool,
 }
 
-/// One JSON Lines input: a bare string, or an object.
-fn parse_jsonl_line(line: &str, defaults: &TextInput) -> Result<TextInput> {
+/// One input as given, before its media are decoded.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Spec {
+    text: String,
+    images: Vec<String>,
+    videos: Vec<String>,
+    prompt_name: Option<String>,
+    title: Option<String>,
+    prompt: Option<String>,
+    image_tokens: Option<usize>,
+    video_tokens: Option<usize>,
+}
+
+fn str_or_list(v: Option<&serde_json::Value>) -> Result<Vec<String>> {
+    match v {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::String(s)) => Ok(vec![s.clone()]),
+        Some(serde_json::Value::Array(a)) => a
+            .iter()
+            .map(|x| {
+                x.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow!("media lists hold strings (paths or URLs)"))
+            })
+            .collect(),
+        Some(_) => Err(anyhow!("media must be a string or a list of strings")),
+    }
+}
+
+/// One JSON Lines input: a bare string, or an object
+/// `{"text", "image", "video", "prompt_name"|"task", "title", "prompt",
+/// "image_tokens", "video_tokens"}`.
+fn parse_jsonl_line(line: &str, defaults: &Spec) -> Result<Spec> {
     let v: serde_json::Value = serde_json::from_str(line)?;
     if let Some(s) = v.as_str() {
-        return Ok(TextInput {
+        return Ok(Spec {
             text: s.to_string(),
             ..defaults.clone()
         });
     }
+    let images = str_or_list(v.get("image").or_else(|| v.get("images")))?;
+    let videos = str_or_list(v.get("video").or_else(|| v.get("videos")))?;
     let text = v
         .get("text")
         .or_else(|| v.get("input"))
-        .and_then(|t| t.as_str())
-        .ok_or_else(|| anyhow!("expected a string or an object with \"text\""))?;
+        .and_then(|t| t.as_str());
+    if text.is_none() && images.is_empty() && videos.is_empty() {
+        return Err(anyhow!(
+            "expected a string or an object with \"text\", \"image\" or \"video\""
+        ));
+    }
     let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+    let u = |k: &str| v.get(k).and_then(|x| x.as_u64()).map(|x| x as usize);
     let has = |k: &str| v.get(k).is_some();
-    Ok(TextInput {
-        text: text.to_string(),
-        // a line that names its own prompt (even `null`) overrides the flag
-        prompt_name: if has("prompt_name") || has("task") {
-            s("prompt_name").or_else(|| s("task"))
+    // sentence-transformers prompts text-only inputs: a line with media
+    // takes a prompt only from itself
+    let media = !images.is_empty() || !videos.is_empty();
+    let inherit = |own: Option<String>, k: bool, d: &Option<String>| {
+        if k {
+            own
+        } else if media {
+            None
         } else {
-            defaults.prompt_name.clone()
-        },
-        title: if has("title") {
-            s("title")
-        } else {
-            defaults.title.clone()
-        },
-        prompt: if has("prompt") {
-            s("prompt")
-        } else {
-            defaults.prompt.clone()
-        },
+            d.clone()
+        }
+    };
+    Ok(Spec {
+        text: text.unwrap_or("").to_string(),
+        prompt_name: inherit(
+            s("prompt_name").or_else(|| s("task")),
+            has("prompt_name") || has("task"),
+            &defaults.prompt_name,
+        ),
+        title: inherit(s("title"), has("title"), &defaults.title),
+        prompt: inherit(s("prompt"), has("prompt"), &defaults.prompt),
+        images,
+        videos,
+        image_tokens: u("image_tokens").or(defaults.image_tokens),
+        video_tokens: u("video_tokens").or(defaults.video_tokens),
     })
 }
 
@@ -86,59 +150,159 @@ fn write_npy(path: &str, rows: &[Vec<f32>]) -> Result<()> {
     std::fs::write(path, out).with_context(|| format!("write {path}"))
 }
 
+/// Read an image from a path, a `file://`, `http(s)://` or `data:` URL.
+fn load_image(src: &str) -> Result<cortiq_engine::media::RgbFrame> {
+    let bytes = cortiq_engine::media::load_image_bytes(&serde_json::json!({ "url": src }))
+        .map_err(|e| anyhow!("{src}: {e}"))?;
+    cortiq_engine::media::decode_rgb(&bytes).map_err(|e| anyhow!("{src}: {e}"))
+}
+
+/// Decode a spec's media and build the input.
+fn build(enc: &MediaEncoder, s: &Spec, fps: Option<f64>) -> Result<(MixedInput, String)> {
+    let mut media = Vec::with_capacity(s.images.len() + s.videos.len());
+    let mut notes = Vec::new();
+    // images first, then videos: each kind fills its own placeholders in order
+    for p in &s.images {
+        let img = load_image(p)?;
+        let m = enc
+            .prepare_image(&img, s.image_tokens)
+            .map_err(|e| anyhow!("{p}: {e}"))?;
+        if let Media::Image(v) = &m {
+            notes.push(format!(
+                "image {}x{} → {}x{} px, {} tokens",
+                img.width,
+                img.height,
+                v.pw * enc.proc.patch,
+                v.ph * enc.proc.patch,
+                v.n_soft(enc.proc.pool_k)
+            ));
+        }
+        media.push(m);
+    }
+    for p in &s.videos {
+        let dv = decode_video(std::path::Path::new(p), fps, &enc.proc)
+            .map_err(|e| anyhow!("{p}: {e}"))?;
+        let m = enc
+            .prepare_frames(&dv.frames, s.video_tokens)
+            .map_err(|e| anyhow!("{p}: {e}"))?;
+        if let Media::Video(f) = &m {
+            notes.push(format!(
+                "video {} frames{} via {} → {} sampled {:?}, {} tokens each",
+                dv.total_frames,
+                dv.src_fps.map(|f| format!(" @ {f:.3} fps")).unwrap_or_default(),
+                dv.decoder,
+                f.len(),
+                dv.indices,
+                f.first().map(|x| x.n_soft(enc.proc.pool_k)).unwrap_or(0)
+            ));
+        }
+        media.push(m);
+    }
+    Ok((
+        MixedInput {
+            text: s.text.clone(),
+            media,
+            prompt_name: s.prompt_name.clone(),
+            title: s.title.clone(),
+            prompt: s.prompt.clone(),
+        },
+        notes.join("; "),
+    ))
+}
+
 pub fn run(args: EmbedArgs) -> Result<()> {
     let t_load = std::time::Instant::now();
     let model = Arc::new(CmfModel::open(&args.model).with_context(|| args.model.clone())?);
     let pool = cortiq_engine::pool::Pool::from_env();
-    let enc = EmbeddingGemma2::load(&model, pool).map_err(anyhow::Error::msg)?;
+    let enc = MediaEncoder::load(&model, pool).map_err(anyhow::Error::msg)?;
     let load_s = t_load.elapsed().as_secs_f64();
     if args.list_prompts {
-        for name in enc.prompts().names() {
-            println!("{name}\t{:?}", enc.prompts().get(name).unwrap_or(""));
+        for name in enc.text.prompts().names() {
+            println!("{name}\t{:?}", enc.text.prompts().get(name).unwrap_or(""));
         }
         return Ok(());
     }
     if !cortiq_engine::egemma2::MATRYOSHKA_DIMS.contains(&args.dim) {
         return Err(anyhow!("--dim {}: use 768, 512, 256 or 128", args.dim));
     }
-    let defaults = TextInput {
-        text: String::new(),
+    let defaults = Spec {
         prompt_name: args.prompt_name.clone(),
         title: args.title.clone(),
         prompt: args.prompt.clone(),
+        image_tokens: args.image_tokens,
+        video_tokens: args.video_tokens,
+        ..Default::default()
     };
-    let mut inputs: Vec<TextInput> = args
-        .texts
-        .iter()
-        .map(|t| TextInput {
-            text: t.clone(),
+    let mut specs: Vec<Spec> = Vec::new();
+    let text_spec = |t: &str| Spec {
+        text: t.to_string(),
+        ..defaults.clone()
+    };
+    if args.interleave {
+        if args.texts.len() > 1 || args.file.is_some() || args.jsonl.is_some() {
+            return Err(anyhow!(
+                "--interleave makes one input of ONE text and the --image/--video media \
+                 (use --jsonl for several interleaved inputs)"
+            ));
+        }
+        specs.push(Spec {
+            text: args.texts.first().cloned().unwrap_or_default(),
+            images: args.images.clone(),
+            videos: args.videos.clone(),
             ..defaults.clone()
-        })
-        .collect();
-    if let Some(f) = &args.file {
-        let body = std::fs::read_to_string(f).with_context(|| f.clone())?;
-        for line in body.lines().filter(|l| !l.trim().is_empty()) {
-            inputs.push(TextInput {
-                text: line.to_string(),
-                ..defaults.clone()
+        });
+    } else {
+        specs.extend(args.texts.iter().map(|t| text_spec(t)));
+        if let Some(f) = &args.file {
+            let body = std::fs::read_to_string(f).with_context(|| f.clone())?;
+            for line in body.lines().filter(|l| !l.trim().is_empty()) {
+                specs.push(text_spec(line));
+            }
+        }
+        if let Some(f) = &args.jsonl {
+            let body = std::fs::read_to_string(f).with_context(|| f.clone())?;
+            for (i, line) in body.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                specs.push(
+                    parse_jsonl_line(line, &defaults).with_context(|| format!("{f}:{}", i + 1))?,
+                );
+            }
+        }
+        // media alone take no prompt (sentence-transformers)
+        let bare = Spec {
+            image_tokens: args.image_tokens,
+            video_tokens: args.video_tokens,
+            ..Default::default()
+        };
+        for p in &args.images {
+            specs.push(Spec {
+                images: vec![p.clone()],
+                ..bare.clone()
+            });
+        }
+        for p in &args.videos {
+            specs.push(Spec {
+                videos: vec![p.clone()],
+                ..bare.clone()
             });
         }
     }
-    if let Some(f) = &args.jsonl {
-        let body = std::fs::read_to_string(f).with_context(|| f.clone())?;
-        for (i, line) in body.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            inputs
-                .push(parse_jsonl_line(line, &defaults).with_context(|| format!("{f}:{}", i + 1))?);
-        }
-    }
-    if inputs.is_empty() {
+    if specs.is_empty() {
         return Err(anyhow!(
-            "nothing to embed: give texts (positional or --text), --file or --jsonl"
+            "nothing to embed: give texts (positional or --text), --file, --jsonl, --image or --video"
         ));
     }
+    let t_prep = std::time::Instant::now();
+    let mut inputs = Vec::with_capacity(specs.len());
+    let mut notes = Vec::with_capacity(specs.len());
+    for (i, s) in specs.iter().enumerate() {
+        let (x, note) = build(&enc, s, args.video_fps).with_context(|| format!("input {i}"))?;
+        inputs.push(x);
+        notes.push(note);
+    }
+    let prep_s = t_prep.elapsed().as_secs_f64();
     let ids: Vec<Vec<u32>> = inputs
         .iter()
         .enumerate()
@@ -150,11 +314,18 @@ pub fn run(args: EmbedArgs) -> Result<()> {
             eprintln!("[{i}] {} tokens: {s:?}", s.len());
         }
     }
+    let has_media = inputs.iter().any(|x| !x.media.is_empty());
+    if has_media {
+        // the tower's one-time load is not part of the timed forward
+        let t = std::time::Instant::now();
+        enc.warm_vision().map_err(anyhow::Error::msg)?;
+        eprintln!("vision tower loaded in {:.2}s", t.elapsed().as_secs_f64());
+    }
     let mut times = Vec::new();
     let mut full = Vec::new();
     for _ in 0..args.repeat.max(1) {
         let t0 = std::time::Instant::now();
-        full = enc.embed_ids(&ids).map_err(anyhow::Error::msg)?;
+        full = enc.embed(&inputs).map_err(anyhow::Error::msg)?;
         times.push(t0.elapsed().as_secs_f64());
     }
     if times.len() > 1 {
@@ -176,15 +347,20 @@ pub fn run(args: EmbedArgs) -> Result<()> {
         .collect::<std::result::Result<_, _>>()
         .map_err(anyhow::Error::msg)?;
     eprintln!(
-        "embedded {} input(s), {tokens} tokens in {:.3}s ({:.0} tok/s; load {:.2}s, {})",
+        "embedded {} input(s), {tokens} tokens in {:.3}s ({:.0} tok/s; load {:.2}s{}, {})",
         vecs.len(),
         secs,
         tokens as f64 / secs.max(1e-9),
         load_s,
-        if enc.quant.is_empty() {
+        if has_media {
+            format!(", media decode+resize {prep_s:.2}s")
+        } else {
+            String::new()
+        },
+        if enc.text.quant.is_empty() {
             "?"
         } else {
-            &enc.quant
+            &enc.text.quant
         }
     );
     if let Some(p) = &args.npy {
@@ -209,9 +385,14 @@ pub fn run(args: EmbedArgs) -> Result<()> {
     } else if args.npy.is_none() {
         for (i, v) in vecs.iter().enumerate() {
             let head: Vec<String> = v.iter().take(6).map(|x| format!("{x:+.5}")).collect();
+            let what = if notes[i].is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", notes[i])
+            };
             writeln!(
                 out,
-                "[{i}] {} tokens, dim {}: {} …",
+                "[{i}] {} tokens, dim {}{what}: {} …",
                 ids[i].len(),
                 v.len(),
                 head.join(" ")
@@ -237,11 +418,9 @@ mod tests {
 
     #[test]
     fn jsonl_lines_override_defaults() {
-        let d = TextInput {
-            text: String::new(),
+        let d = Spec {
             prompt_name: Some("SearchQuery".into()),
-            title: None,
-            prompt: None,
+            ..Default::default()
         };
         let a = parse_jsonl_line("\"hello\"", &d).unwrap();
         assert_eq!(a.text, "hello");
@@ -255,6 +434,30 @@ mod tests {
         let t = parse_jsonl_line(r#"{"input":"x","task":"Clustering"}"#, &d).unwrap();
         assert_eq!(t.prompt_name.as_deref(), Some("Clustering"));
         assert!(parse_jsonl_line("{\"nope\":1}", &d).is_err());
+    }
+
+    #[test]
+    fn jsonl_media_lines() {
+        let d = Spec {
+            prompt_name: Some("SearchQuery".into()),
+            image_tokens: Some(560),
+            ..Default::default()
+        };
+        let a = parse_jsonl_line(r#"{"image":"a.png"}"#, &d).unwrap();
+        assert_eq!(a.images, vec!["a.png".to_string()]);
+        // media inputs do not inherit the default prompt
+        assert_eq!(a.prompt_name, None);
+        assert_eq!(a.image_tokens, Some(560));
+        let b = parse_jsonl_line(
+            r#"{"text":"A fox: <|image|> and <|video|>","image":["f.png"],"video":"v.mp4","video_tokens":70}"#,
+            &d,
+        )
+        .unwrap();
+        assert_eq!(b.videos, vec!["v.mp4".to_string()]);
+        assert_eq!(b.video_tokens, Some(70));
+        let c = parse_jsonl_line(r#"{"image":"a.png","task":"Document"}"#, &d).unwrap();
+        assert_eq!(c.prompt_name.as_deref(), Some("Document"));
+        assert!(parse_jsonl_line(r#"{"image":5}"#, &d).is_err());
     }
 
     #[test]

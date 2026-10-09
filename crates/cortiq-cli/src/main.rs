@@ -467,9 +467,10 @@ enum Commands {
         )]
         mimo_towers: String,
     },
-    /// Text embeddings from an EmbeddingGemma 2 .cmf (`cortiq convert --model
-    /// <google/embeddinggemma-2 dir>`): unit-length 768-d vectors, or a
-    /// Matryoshka prefix with --dim 512|256|128.
+    /// Embeddings from an EmbeddingGemma 2 .cmf (`cortiq convert --model
+    /// <google/embeddinggemma-2 dir>`): texts, images (--image), videos
+    /// (--video) and interleaved text + media (--interleave) in one space —
+    /// unit-length 768-d vectors, or a Matryoshka prefix with --dim 512|256|128.
     Embed {
         /// Path to the EmbeddingGemma 2 .cmf
         #[arg(long)]
@@ -514,6 +515,28 @@ enum Commands {
         /// Benchmark: run the forward N times, print each time (in-process)
         #[arg(long, default_value = "1", hide = true)]
         repeat: usize,
+        /// An image to embed: a path or an http(s)/data URL (repeatable)
+        #[arg(long = "image")]
+        image: Vec<String>,
+        /// A video to embed: mp4/webm/mov/… (needs ffmpeg on PATH), .y4m, or a
+        /// directory of frames (repeatable). Sampled at 1 fps, at most 32 frames.
+        #[arg(long = "video")]
+        video: Vec<String>,
+        /// Frame rate of a --video frame directory (without it the frames are
+        /// taken as already sampled)
+        #[arg(long = "video-fps")]
+        video_fps: Option<f64>,
+        /// Soft tokens per image: 70 | 140 | 280 (default) | 560 | 1120
+        #[arg(long = "image-tokens")]
+        image_tokens: Option<usize>,
+        /// Soft tokens per video frame: 70 | 140 (default) | 280 | 560 | 1120
+        #[arg(long = "video-tokens")]
+        video_tokens: Option<usize>,
+        /// One interleaved input: the text (its <|image|> / <|video|>
+        /// placeholders take the --image / --video media in order) instead of
+        /// one embedding per item
+        #[arg(long)]
+        interleave: bool,
     },
     /// Transcribe audio with a Whisper CMF checkpoint (WAV, PCM or float).
     Transcribe {
@@ -2881,6 +2904,12 @@ async fn main() -> anyhow::Result<()> {
             show_tokens,
             list_prompts,
             repeat,
+            image,
+            video,
+            video_fps,
+            image_tokens,
+            video_tokens,
+            interleave,
         } => embed::run(embed::EmbedArgs {
             model,
             texts: texts.into_iter().chain(text).collect(),
@@ -2895,6 +2924,12 @@ async fn main() -> anyhow::Result<()> {
             show_tokens,
             list_prompts,
             repeat,
+            images: image,
+            videos: video,
+            video_fps,
+            image_tokens,
+            video_tokens,
+            interleave,
         }),
         Commands::Transcribe {
             model,
