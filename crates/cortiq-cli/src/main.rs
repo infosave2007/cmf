@@ -467,9 +467,9 @@ enum Commands {
         )]
         mimo_towers: String,
     },
-    /// Text embeddings from an EmbeddingGemma 2 .cmf (`cortiq convert --model
-    /// <google/embeddinggemma-2 dir>`): unit-length 768-d vectors, or a
-    /// Matryoshka prefix with --dim 512|256|128.
+    /// Text and audio embeddings from an EmbeddingGemma 2 .cmf (`cortiq
+    /// convert --model <google/embeddinggemma-2 dir>`): unit-length 768-d
+    /// vectors, or a Matryoshka prefix with --dim 512|256|128.
     Embed {
         /// Path to the EmbeddingGemma 2 .cmf
         #[arg(long)]
@@ -479,10 +479,15 @@ enum Commands {
         /// More texts (repeatable)
         #[arg(long = "text")]
         text: Vec<String>,
+        /// An audio file to embed on its own (repeatable; WAV, or any format
+        /// ffmpeg reads; mixed to mono, resampled to 16 kHz, cut at 30 s)
+        #[arg(long)]
+        audio: Vec<String>,
         /// A file with one text per line
         #[arg(long)]
         file: Option<String>,
-        /// JSON Lines: each line a string or {"text", "prompt_name"|"task", "title", "prompt"}
+        /// JSON Lines: each line a string or {"text", "prompt_name"|"task", "title",
+        /// "prompt", "audio": path | [paths]} (text with one <|audio|> per clip)
         #[arg(long)]
         jsonl: Option<String>,
         /// Task prompt: SearchQuery, Document, QuestionAnswering, FactChecking,
@@ -2870,6 +2875,7 @@ async fn main() -> anyhow::Result<()> {
             model,
             texts,
             text,
+            audio,
             file,
             jsonl,
             prompt_name,
@@ -2884,6 +2890,7 @@ async fn main() -> anyhow::Result<()> {
         } => embed::run(embed::EmbedArgs {
             model,
             texts: texts.into_iter().chain(text).collect(),
+            audio,
             file,
             jsonl,
             prompt_name,

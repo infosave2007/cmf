@@ -11,6 +11,7 @@ pub mod dsv41;
 pub mod dsv41_encoding;
 pub mod dsv41_vision;
 pub mod egemma2;
+pub mod egemma2_audio;
 pub(crate) mod expert_store;
 pub mod fcd;
 pub mod fcd_ops;

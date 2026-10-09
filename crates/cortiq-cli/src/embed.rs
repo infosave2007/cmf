@@ -1,20 +1,31 @@
-//! `cortiq embed` — text embeddings from an EmbeddingGemma 2 `.cmf`.
+//! `cortiq embed` — text and audio embeddings from an EmbeddingGemma 2
+//! `.cmf`.
 //!
 //! Every input is one embedding: unit length, 768-d, or a Matryoshka prefix
 //! (`--dim 512|256|128`, re-normalized). `--prompt-name` applies one of the
 //! model's task prompts (`SearchQuery`, `Document`, `QuestionAnswering`, …;
 //! `--list-prompts` prints them); `--title` fills the Document prompt.
 //! `--jsonl` gives each line its own prompt/title.
+//!
+//! `--audio PATH` (repeatable) embeds a clip on its own, unprompted: WAV
+//! natively, other formats through `ffmpeg`; any rate or channel count is
+//! mixed down to mono and resampled to 16 kHz; clips are cut at 30 s. A
+//! `--jsonl` line `{"text": "… <|audio|> …", "audio": ["a.wav"]}` interleaves
+//! text and audio in one input (one `<|audio|>` per clip, in order);
+//! `{"audio": "a.wav"}` is an audio-only line.
 
 use anyhow::{Context, Result, anyhow};
 use cortiq_core::CmfModel;
 use cortiq_engine::egemma2::{EmbeddingGemma2, TextInput, cosine, matryoshka};
+use cortiq_engine::egemma2_audio::{self as ea, AudioInput, AudioTower};
 use std::io::Write;
 use std::sync::Arc;
 
 pub struct EmbedArgs {
     pub model: String,
     pub texts: Vec<String>,
+    /// audio files, one audio-only input each
+    pub audio: Vec<String>,
     pub file: Option<String>,
     pub jsonl: Option<String>,
     pub prompt_name: Option<String>,
@@ -66,6 +77,57 @@ fn parse_jsonl_line(line: &str, defaults: &TextInput) -> Result<TextInput> {
     })
 }
 
+/// One input of the run, in output order.
+enum Job {
+    Text(TextInput),
+    /// audio clips (paths, for the listing) with optional placeholder text
+    Audio(Vec<String>, AudioInput),
+}
+
+/// The `audio` field of a JSON Lines object: a path or a list of paths.
+fn audio_paths(v: &serde_json::Value) -> Result<Option<Vec<String>>> {
+    match v.get("audio") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(p)) => Ok(Some(vec![p.clone()])),
+        Some(serde_json::Value::Array(a)) => a
+            .iter()
+            .map(|x| {
+                x.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow!("\"audio\" must hold file paths"))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Some),
+        Some(_) => Err(anyhow!("\"audio\" must be a path or a list of paths")),
+    }
+}
+
+/// A JSON Lines input: text (as [`parse_jsonl_line`]) or, with an `audio`
+/// field, audio clips with optional `<|audio|>` text.
+fn parse_jsonl_job(line: &str, defaults: &TextInput) -> Result<Job> {
+    let v: serde_json::Value = serde_json::from_str(line)?;
+    let Some(paths) = audio_paths(&v)? else {
+        return Ok(Job::Text(parse_jsonl_line(line, defaults)?));
+    };
+    if paths.is_empty() {
+        return Err(anyhow!("\"audio\" is empty"));
+    }
+    let has_text = v
+        .get("text")
+        .or_else(|| v.get("input"))
+        .is_some_and(|t| t.is_string());
+    let text = if has_text {
+        Some(parse_jsonl_line(line, defaults)?)
+    } else {
+        None
+    };
+    let clips = paths
+        .iter()
+        .map(|p| ea::read_audio(std::path::Path::new(p)).map_err(anyhow::Error::msg))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Job::Audio(paths, AudioInput { text, clips }))
+}
+
 fn write_npy(path: &str, rows: &[Vec<f32>]) -> Result<()> {
     let n = rows.len();
     let d = rows.first().map(|r| r.len()).unwrap_or(0);
@@ -107,21 +169,23 @@ pub fn run(args: EmbedArgs) -> Result<()> {
         title: args.title.clone(),
         prompt: args.prompt.clone(),
     };
-    let mut inputs: Vec<TextInput> = args
+    let mut jobs: Vec<Job> = args
         .texts
         .iter()
-        .map(|t| TextInput {
-            text: t.clone(),
-            ..defaults.clone()
+        .map(|t| {
+            Job::Text(TextInput {
+                text: t.clone(),
+                ..defaults.clone()
+            })
         })
         .collect();
     if let Some(f) = &args.file {
         let body = std::fs::read_to_string(f).with_context(|| f.clone())?;
         for line in body.lines().filter(|l| !l.trim().is_empty()) {
-            inputs.push(TextInput {
+            jobs.push(Job::Text(TextInput {
                 text: line.to_string(),
                 ..defaults.clone()
-            });
+            }));
         }
     }
     if let Some(f) = &args.jsonl {
@@ -130,20 +194,75 @@ pub fn run(args: EmbedArgs) -> Result<()> {
             if line.trim().is_empty() {
                 continue;
             }
-            inputs
-                .push(parse_jsonl_line(line, &defaults).with_context(|| format!("{f}:{}", i + 1))?);
+            jobs.push(parse_jsonl_job(line, &defaults).with_context(|| format!("{f}:{}", i + 1))?);
         }
     }
-    if inputs.is_empty() {
-        return Err(anyhow!(
-            "nothing to embed: give texts (positional or --text), --file or --jsonl"
+    for p in &args.audio {
+        let clip = ea::read_audio(std::path::Path::new(p)).map_err(anyhow::Error::msg)?;
+        jobs.push(Job::Audio(
+            vec![p.clone()],
+            AudioInput {
+                text: None,
+                clips: vec![clip],
+            },
         ));
     }
-    let ids: Vec<Vec<u32>> = inputs
-        .iter()
-        .enumerate()
-        .map(|(i, x)| enc.input_ids(x).map_err(|e| anyhow!("input {i}: {e}")))
-        .collect::<Result<_>>()?;
+    if jobs.is_empty() {
+        return Err(anyhow!(
+            "nothing to embed: give texts (positional or --text), --file, --jsonl or --audio"
+        ));
+    }
+    let mut text_idx = Vec::new();
+    let mut text_ids: Vec<Vec<u32>> = Vec::new();
+    let mut audio_idx = Vec::new();
+    let mut audio_in: Vec<AudioInput> = Vec::new();
+    for (i, j) in jobs.into_iter().enumerate() {
+        match j {
+            Job::Text(x) => {
+                text_ids.push(enc.input_ids(&x).map_err(|e| anyhow!("input {i}: {e}"))?);
+                text_idx.push(i);
+            }
+            Job::Audio(paths, a) => {
+                for (p, c) in paths.iter().zip(&a.clips) {
+                    eprintln!(
+                        "[{i}] audio {p}: {:.2} s → {} tokens{}",
+                        c.len() as f64 / ea::SAMPLE_RATE as f64,
+                        ea::num_tokens(c.len()),
+                        if c.len() > ea::MAX_SAMPLES {
+                            " (cut at 30 s)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                audio_in.push(a);
+                audio_idx.push(i);
+            }
+        }
+    }
+    let n_inputs = text_idx.len() + audio_idx.len();
+    let tower = if audio_in.is_empty() {
+        None
+    } else {
+        let t0 = std::time::Instant::now();
+        let t = AudioTower::load(&model, cortiq_engine::pool::Pool::from_env())
+            .map_err(anyhow::Error::msg)?;
+        eprintln!("audio tower loaded in {:.2}s", t0.elapsed().as_secs_f64());
+        Some(t)
+    };
+    // token ids of every input, in output order
+    let mut ids: Vec<Vec<u32>> = vec![Vec::new(); n_inputs];
+    for (k, &i) in text_idx.iter().enumerate() {
+        ids[i] = text_ids[k].clone();
+    }
+    if let Some(t) = &tower {
+        for (k, &i) in audio_idx.iter().enumerate() {
+            let a = &audio_in[k];
+            let n: Vec<usize> = a.clips.iter().map(|c| ea::num_tokens(c.len())).collect();
+            ids[i] = ea::input_ids(&enc, (t.audio_token, t.boa_token, t.eoa_token), a, &n)
+                .map_err(|e| anyhow!("input {i}: {e}"))?;
+        }
+    }
     let tokens: usize = ids.iter().map(|s| s.len()).sum();
     if args.show_tokens {
         for (i, s) in ids.iter().enumerate() {
@@ -151,10 +270,30 @@ pub fn run(args: EmbedArgs) -> Result<()> {
         }
     }
     let mut times = Vec::new();
-    let mut full = Vec::new();
+    let mut full: Vec<Vec<f32>> = Vec::new();
     for _ in 0..args.repeat.max(1) {
         let t0 = std::time::Instant::now();
-        full = enc.embed_ids(&ids).map_err(anyhow::Error::msg)?;
+        let mut out: Vec<Vec<f32>> = vec![Vec::new(); n_inputs];
+        if !text_ids.is_empty() {
+            for (v, &i) in enc
+                .embed_ids(&text_ids)
+                .map_err(anyhow::Error::msg)?
+                .into_iter()
+                .zip(&text_idx)
+            {
+                out[i] = v;
+            }
+        }
+        if let Some(t) = &tower {
+            for (v, &i) in ea::embed_audio_inputs(&enc, t, &audio_in)
+                .map_err(anyhow::Error::msg)?
+                .into_iter()
+                .zip(&audio_idx)
+            {
+                out[i] = v;
+            }
+        }
+        full = out;
         times.push(t0.elapsed().as_secs_f64());
     }
     if times.len() > 1 {
@@ -255,6 +394,69 @@ mod tests {
         let t = parse_jsonl_line(r#"{"input":"x","task":"Clustering"}"#, &d).unwrap();
         assert_eq!(t.prompt_name.as_deref(), Some("Clustering"));
         assert!(parse_jsonl_line("{\"nope\":1}", &d).is_err());
+    }
+
+    #[test]
+    fn jsonl_audio_lines() {
+        let v = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        assert_eq!(audio_paths(&v(r#"{"text":"x"}"#)).unwrap(), None);
+        assert_eq!(
+            audio_paths(&v(r#"{"audio":"a.wav"}"#)).unwrap(),
+            Some(vec!["a.wav".to_string()])
+        );
+        assert_eq!(
+            audio_paths(&v(r#"{"audio":["a.wav","b.flac"]}"#))
+                .unwrap()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(audio_paths(&v(r#"{"audio":[1]}"#)).is_err());
+        assert!(audio_paths(&v(r#"{"audio":3}"#)).is_err());
+        let d = TextInput::default();
+        assert!(parse_jsonl_job(r#"{"audio":[]}"#, &d).is_err());
+        assert!(parse_jsonl_job(r#"{"audio":"/nonexistent/x.wav"}"#, &d).is_err());
+        assert!(matches!(
+            parse_jsonl_job(r#"{"text":"plain"}"#, &d).unwrap(),
+            Job::Text(_)
+        ));
+        // a real clip: an audio-only line and one with placeholder text
+        let wav = std::env::temp_dir().join(format!("egemma2-jsonl-{}.wav", std::process::id()));
+        let mut b = Vec::new();
+        let data: Vec<u8> = (0..1600i16).flat_map(|i| (i * 7).to_le_bytes()).collect();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        b.extend_from_slice(b"WAVEfmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&16000u32.to_le_bytes());
+        b.extend_from_slice(&32000u32.to_le_bytes());
+        b.extend_from_slice(&2u16.to_le_bytes());
+        b.extend_from_slice(&16u16.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        b.extend_from_slice(&data);
+        std::fs::write(&wav, &b).unwrap();
+        let p = wav.to_str().unwrap();
+        let Job::Audio(paths, a) = parse_jsonl_job(&format!(r#"{{"audio":"{p}"}}"#), &d).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(paths, vec![p.to_string()]);
+        assert!(a.text.is_none());
+        assert_eq!(a.clips[0].len(), 1600);
+        let Job::Audio(_, a) = parse_jsonl_job(
+            &format!(r#"{{"text":"Said: <|audio|>","audio":["{p}"],"task":"Clustering"}}"#),
+            &d,
+        )
+        .unwrap() else {
+            panic!()
+        };
+        let t = a.text.unwrap();
+        assert_eq!(t.text, "Said: <|audio|>");
+        assert_eq!(t.prompt_name.as_deref(), Some("Clustering"));
+        let _ = std::fs::remove_file(&wav);
     }
 
     #[test]
