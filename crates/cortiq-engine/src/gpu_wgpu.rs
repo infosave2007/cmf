@@ -17428,6 +17428,9 @@ var<workgroup> xg_q: array<vec4<f32>, 520>;   // [hq*(hd4+1) + d4] (padded: no b
 var<workgroup> xg_w: array<f32, 512>;         // [hq*64 + p]
 var<workgroup> xg_m: array<f32, 128>;
 var<workgroup> xg_l: array<f32, 128>;
+// The chunk's V rows, staged while the scores run: every lane issues its
+// loads at once instead of the value pass waiting on one load per position.
+var<workgroup> xg_vs: array<vec4<f32>, 2048>; // [p*dv4 + d4]
 // One (kv group g, chunk ch) frame: queries from ax_q at vec4 offset q4,
 // positions first + ch*64 .. of n, K/V rows (first + p) % cap, partials
 // to [(pb + hq) * nc + ch]. Called in uniform control flow only.
@@ -17437,7 +17440,6 @@ fn xg_core(lid: u32, g: u32, ch: u32, n: u32, first: u32, q4: u32, pb: u32,
     let cn = min(64u, n - c0);
     let hd4 = hd / 4u;
     let kbase = g * cap * hd4;
-    let vbase = g * cap * dv;
     let s0 = (first + c0) % cap;
     let nq = hpk * hd4;
     let qs = hd4 + 1u;
@@ -17447,6 +17449,13 @@ fn xg_core(lid: u32, g: u32, ch: u32, n: u32, first: u32, q4: u32, pb: u32,
     }
     for (var i = lid; i < 512u; i = i + 128u) { xg_w[i] = -1.0e30; }
     workgroupBarrier();
+    let dv4 = dv / 4u;
+    let vbase4 = g * cap * dv4;
+    for (var i = lid; i < cn * dv4; i = i + 128u) {
+        let p = i / dv4;
+        let sp = s0 + p;
+        xg_vs[i] = ax_v4[vbase4 + select(sp, sp - cap, sp >= cap) * dv4 + (i - p * dv4)];
+    }
     let items = cn * hpk;
     for (var it = lid; it < items; it = it + 128u) {
         let p = it / hpk;
@@ -17490,9 +17499,10 @@ fn xg_core(lid: u32, g: u32, ch: u32, n: u32, first: u32, q4: u32, pb: u32,
     if (lid < dv) {
         var a0 = 0.0; var a1 = 0.0; var a2 = 0.0; var a3 = 0.0;
         var a4 = 0.0; var a5 = 0.0; var a6 = 0.0; var a7 = 0.0;
+        let lq = lid >> 2u;
+        let lc = lid & 3u;
         for (var p = 0u; p < cn; p = p + 1u) {
-            let sp = s0 + p;
-            let v = ax_v[vbase + select(sp, sp - cap, sp >= cap) * dv + lid];
+            let v = xg_vs[p * dv4 + lq][lc];
             a0 = a0 + xg_w[p] * v;
             a1 = a1 + xg_w[64u + p] * v;
             a2 = a2 + xg_w[128u + p] * v;
@@ -17627,14 +17637,11 @@ struct RbP {
 @group(0) @binding(16) var<uniform>             rb_p    : RbP;
 var<workgroup> rb_red: array<f32, 32>;
 var<workgroup> rb_head: array<f32, 256>;
-@compute @workgroup_size(32)
-fn rope_xb(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let head = wid.x;
-    let t = wid.y;
-    let lane = lid.x;
+// Normalize + rotate head `head` of token row t into rb_head (Q rows from
+// rb_qraw, K rows from rb_k). Uniform control flow only (barriers).
+fn rb_rope(head: u32, t: u32, lane: u32) {
     let nh = rb_p.nh;
     let hd = rb_p.hd;
-    if (head >= nh + rb_p.nkv) { return; }
     let isq = head < nh;
     let pos = rb_p.pos + t;
     let src_base = select((head - nh) * hd, head * hd, isq);
@@ -17719,10 +17726,66 @@ fn rope_xb(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) 
         }
     }
     workgroupBarrier();
+}
+
+@compute @workgroup_size(32)
+fn rope_xb(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let head = wid.x;
+    let t = wid.y;
+    let lane = lid.x;
+    let nh = rb_p.nh;
+    let hd = rb_p.hd;
+    if (head >= nh + rb_p.nkv) { return; }
+    rb_rope(head, t, lane);
+    let isq = head < nh;
+    let src_base = select((head - nh) * hd, head * hd, isq);
+    let qoff = t * nh * hd;
+    let koff = t * rb_p.nkv * hd;
+    let nt = (hd + 31u) / 32u;
     for (var i = 0u; i < nt; i = i + 1u) {
         let d = i * 32u + lane;
         if (d < hd) {
             if (isq) { rb_qout[qoff + src_base + d] = rb_head[d]; } else { rb_k[koff + src_base + d] = rb_head[d]; }
+        }
+    }
+}
+
+// The token graph's rope + mirror append in ONE dispatch: Q heads to
+// rb_qout, rotated K heads straight into mirror row pos % cap, and nkv more
+// workgroups copying the V rows (rb_p._p0 = cap, rb_p._p1 = dv). The K
+// written is the value `attn_rope_qkn` + `kv_append_x` store.
+@group(0) @binding(17) var<storage, read_write> rk_kc : array<f32>;
+@group(0) @binding(18) var<storage, read_write> rk_vc : array<f32>;
+@group(0) @binding(19) var<storage, read>       rk_v  : array<f32>;
+@compute @workgroup_size(32)
+fn rope_kv_x(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let head = wid.x;
+    let lane = lid.x;
+    let nh = rb_p.nh;
+    let nkv = rb_p.nkv;
+    let hd = rb_p.hd;
+    let cap = rb_p._p0;
+    let slot = rb_p.pos % cap;
+    if (head >= nh + 2u * nkv) { return; }
+    if (head >= nh + nkv) {
+        let h = head - nh - nkv;
+        let dv = rb_p._p1;
+        for (var d = lane; d < dv; d = d + 32u) {
+            rk_vc[(h * cap + slot) * dv + d] = rk_v[h * dv + d];
+        }
+        return;
+    }
+    rb_rope(head, 0u, lane);
+    let isq = head < nh;
+    let nt = (hd + 31u) / 32u;
+    for (var i = 0u; i < nt; i = i + 1u) {
+        let d = i * 32u + lane;
+        if (d < hd) {
+            if (isq) {
+                rb_qout[head * hd + d] = rb_head[d];
+            } else {
+                rk_kc[((head - nh) * cap + slot) * hd + d] = rb_head[d];
+            }
         }
     }
 }
@@ -17895,6 +17958,9 @@ struct GraphX {
     /// `gqa_attend_merge_xb`). None on rejection or `CMF_ATTEND_XB=0`: the
     /// batch keeps its per-token loop.
     xb: Option<XBatch>,
+    /// `rope_kv_x`: the token graph's RoPE + mirror append in one dispatch
+    /// (None on rejection or `CMF_ROPE_KV=0`).
+    rope_kv: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
     part: wgpu::ComputePipeline,
     merge: wgpu::ComputePipeline,
     q82_b: wgpu::ComputePipeline,
@@ -20752,6 +20818,19 @@ fn init(dev: usize) -> Result<Ctx, String> {
                     })
                 }
             };
+            let rope_kv = if std::env::var("CMF_ROPE_KV").as_deref() == Ok("0") {
+                None
+            } else {
+                let sg = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let p = px("rope_kv_x");
+                if let Some(e) = pollster::block_on(sg.pop()) {
+                    tracing::warn!("rope_kv_x rejected ({e}): rope and append stay two dispatches");
+                    None
+                } else {
+                    let l = p.get_bind_group_layout(0);
+                    Some((p, l))
+                }
+            };
             let mut q82_short = Vec::new();
             for rows in 1..=4 {
                 let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -20773,6 +20852,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
                 attend_g,
                 part_g,
                 xb,
+                rope_kv,
                 part_l: part.get_bind_group_layout(0),
                 merge_l: merge.get_bind_group_layout(0),
                 q82_l: q82_b.get_bind_group_layout(0),
@@ -26811,21 +26891,24 @@ pub fn forward_token_graph(
                         .map(|k| stor(bytemuck::cast_slice(k)))
                         .unwrap_or_else(|| zeros(hd));
                     let gate_flag = if *output_gate { 1u32 } else { 0 };
-                    c.queue.write_buffer(
-                        &rope_u,
+                    let mut rope_words = rope_uniform_words(
+                        nh,
+                        lnkv,
+                        hd,
+                        lrd,
+                        position,
+                        flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm) | gate_flag,
+                        eps,
                         0,
-                        bytemuck::cast_slice(&rope_uniform_words(
-                            nh,
-                            lnkv,
-                            hd,
-                            lrd,
-                            position,
-                            flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm) | gate_flag,
-                            eps,
-                            0,
-                            geom.map_or(1.0, |g| g.rope_scale),
-                        )),
+                        geom.map_or(1.0, |g| g.rope_scale),
                     );
+                    // Padding words 9/10: the mirror rows and V width the
+                    // fused `rope_kv_x` appends with (ignored elsewhere).
+                    if let (Some(g), Some(mc)) = (geom, xcaps.get(&li)) {
+                        rope_words[9] = *mc as u32;
+                        rope_words[10] = g.dv as u32;
+                    }
+                    c.queue.write_buffer(&rope_u, 0, bytemuck::cast_slice(&rope_words));
                     let qkv_in = match prism_input(
                         &mut enc,
                         &[wq, wk, wv],
@@ -26848,6 +26931,60 @@ pub fn forward_token_graph(
                     } else {
                         None
                     };
+                    // Three q8_2f projections in one dispatch (bit-identical
+                    // to the three `q8_2f_matvec4` dispatches it replaces).
+                    let mv3 = if group
+                        && pkv.is_none()
+                        && wq.kind == 7
+                        && wk.kind == 7
+                        && wv.kind == 7
+                        && c.use_q82_mv4
+                        && hidden % 16 == 0
+                    {
+                        moe_r4::mv3(c)
+                    } else {
+                        None
+                    };
+                    let sg3 = mv3.is_some()
+                        && moe_r4::q82sg_encode(
+                            c,
+                            &mut enc,
+                            &qkv_in,
+                            hidden,
+                            &[
+                                (&wq.buf, &qraw, qrows),
+                                (&wk.buf, &kb, lnkv * hd),
+                                (&wv.buf, &vb, lnkv * ldv),
+                            ],
+                        );
+                    if sg3 {
+                        // encoded by the warp-per-row kernel
+                    } else if let Some((p3, l3)) = mv3 {
+                        let (rk, rv) = (lnkv * hd, lnkv * ldv);
+                        let u3 = uniform_u32x4(
+                            c,
+                            [qrows as u32, rk as u32, rv as u32, hidden as u32],
+                        );
+                        let bg3 = bind_pairs(
+                            c,
+                            l3,
+                            &[
+                                (0, &wq.buf),
+                                (1, &wk.buf),
+                                (2, &wv.buf),
+                                (3, &qkv_in),
+                                (4, &qraw),
+                                (5, &kb),
+                                (6, &vb),
+                                (7, &u3),
+                            ],
+                        );
+                        let blocks = qrows.div_ceil(4) + rk.div_ceil(4) + rv.div_ceil(4);
+                        let mut pass = begin_pass(&mut enc);
+                        pass.set_pipeline(p3);
+                        pass.set_bind_group(0, &bg3, &[]);
+                        pass.dispatch_workgroups((blocks as u32).min(MAX_WG), 1, 1);
+                    } else {
                     match (pkv, prep(wq, &qkv_in, &qraw, qrows, hidden)) {
                         (Some((p2, b2, w2)), Some((pq, bq, wgq))) => {
                             let mut pass = begin_pass(&mut enc);
@@ -26866,6 +27003,7 @@ pub fn forward_token_graph(
                                 (wv, &qkv_in, &vb, lnkv * ldv, hidden),
                             ],
                         ),
+                    }
                     }
                     if let Some((bq, bk, bv)) = bias {
                         let (bqb, bkb, bvb) = (
@@ -27066,6 +27204,8 @@ pub fn forward_token_graph(
                                     && hd % 4 == 0
                                     && hd <= 256
                                     && g.dv <= 128
+                                && g.dv % 4 == 0
+                                    && g.dv % 4 == 0
                             });
                         let xg_ck = if xg.is_some() { 64 } else { 0 };
                         let nc = mcap.div_ceil(if xg.is_some() { 64 } else { ATTEND_X_CK });
@@ -27106,12 +27246,38 @@ pub fn forward_token_graph(
                             .sink
                             .map(|sk| stor(bytemuck::cast_slice(sk)))
                             .unwrap_or_else(|| zeros(nh));
+                        // RoPE + append fused, for a layer without an output
+                        // gate (the fused kernel does not split q||gate).
+                        let rkv = gx.rope_kv.as_ref().filter(|_| !*output_gate && hd <= 256);
+                        if let (Some((rp, rl)), false) = (rkv, skip_attn) {
+                            let bg_rk = bind_pairs(
+                                c,
+                                rl,
+                                &[
+                                    (10, &qraw),
+                                    (11, &kb),
+                                    (12, &qout),
+                                    (13, &qnw),
+                                    (14, &knw),
+                                    (15, &invf_l),
+                                    (16, &rope_u),
+                                    (17, kbuf),
+                                    (18, vbuf),
+                                    (19, &vb),
+                                ],
+                            );
+                            let mut pass = begin_pass(&mut enc);
+                            pass.set_pipeline(rp);
+                            pass.set_bind_group(0, &bg_rk, &[]);
+                            pass.dispatch_workgroups((nh + 2 * g.nkv) as u32, 1, 1);
+                            state_started = true;
+                        }
                         let bg_rope = bg(
                             &c.layout_attn_rope,
                             &[&qraw, &kb, &qout, &gout, &qnw, &knw, &invf_l, &rope_u],
                         );
                         let bg_kv = bg(&gx.kv_l, &[&kb, &vb, kbuf, vbuf, kvx_u]);
-                        if !skip_attn {
+                        if !skip_attn && rkv.is_none() {
                             let mut pass = begin_pass(&mut enc);
                             pass.set_pipeline(&c.attn_rope);
                             pass.set_bind_group(0, &bg_rope, &[]);
@@ -27515,7 +27681,18 @@ pub fn forward_token_graph(
                             graph_decline("Prism O transform unavailable");
                             return token_graph_outcome(o1_started || state_started, false);
                         };
-                        emat(&mut enc, wo, &wo_in, &ob, hidden, nh * ldv);
+                        if !(wo.kind == 7
+                            && c.use_q82_mv4
+                            && moe_r4::q82sg_encode(
+                                c,
+                                &mut enc,
+                                &wo_in,
+                                nh * ldv,
+                                &[(&wo.buf, &ob, hidden)],
+                            ))
+                        {
+                            emat(&mut enc, wo, &wo_in, &ob, hidden, nh * ldv);
+                        }
                     }
                 }
                 (
@@ -28363,7 +28540,114 @@ pub fn forward_token_graph(
                     } else {
                         None
                     };
-                    let (p_gu, p_dn, bg_gu, bg_dn, gu_wg, dn_wg) = if let Some(r4) = r4 {
+                    // Softmax top-k with no bias and no shared expert: the
+                    // select rides inside both expert kernels (bit-identical
+                    // to `moe_select`), one dependent dispatch fewer a layer.
+                    // `CMF_MOE_FOLD=0` keeps the separate select.
+                    let sel_fold = r4.is_some()
+                        && !*sigmoid
+                        && bias.is_none()
+                        && !*has_shared
+                        && *n_exp <= 64
+                        && slots <= 32
+                        && std::env::var("CMF_MOE_FOLD").as_deref() != Ok("0");
+                    let (p_gu, p_dn, bg_gu, bg_dn, gu_wg, dn_wg) = if let (Some(r4), true) =
+                        (r4, sel_fold)
+                    {
+                        let guf_u = uniform_u32x8(
+                            c,
+                            [
+                                (hidden / 32) as u32,
+                                *mi as u32,
+                                slots as u32,
+                                gu_mat16,
+                                0,
+                                *n_exp as u32,
+                                0,
+                                0,
+                            ],
+                        );
+                        let fd_u = uniform_u32x4(
+                            c,
+                            [
+                                *n_exp as u32,
+                                *top_k as u32,
+                                u32::from(*norm_topk),
+                                route_scale.to_bits(),
+                            ],
+                        );
+                        // Gate/up through the subgroup kernel where it exists
+                        // (RTX 3090: 1.53 -> 1.22 ms a token); the down stays
+                        // on the four-row kernel, which beat its subgroup twin
+                        // (0.98 vs 1.07 ms).
+                        if let Some(sg) = r4.sg.as_ref() {
+                            (
+                                &sg.gu,
+                                &r4.dn_f,
+                                bind_pairs(
+                                    c,
+                                    &sg.gu_l,
+                                    &[
+                                        (0, gate_all),
+                                        (1, up_all),
+                                        (2, &n1),
+                                        (4, mact),
+                                        (5, &guf_u),
+                                        (15, mlogit),
+                                    ],
+                                ),
+                                bind_pairs(
+                                    c,
+                                    &r4.dn_f_l,
+                                    &[
+                                        (8, down_all),
+                                        (9, down_all),
+                                        (10, mact),
+                                        (13, &ob),
+                                        (14, &dn_u),
+                                        (15, mlogit),
+                                        (16, &fd_u),
+                                    ],
+                                ),
+                                (*mi / 4) as u32,
+                                (hidden / 4) as u32,
+                            )
+                        } else {
+                        (
+                            &r4.gu_f,
+                            &r4.dn_f,
+                            bind_pairs(
+                                c,
+                                &r4.gu_f_l,
+                                &[
+                                    (0, gate_all),
+                                    (1, up_all),
+                                    (2, &n1),
+                                    (4, mact),
+                                    (5, &guf_u),
+                                    (6, gate_all),
+                                    (7, up_all),
+                                    (15, mlogit),
+                                ],
+                            ),
+                            bind_pairs(
+                                c,
+                                &r4.dn_f_l,
+                                &[
+                                    (8, down_all),
+                                    (9, down_all),
+                                    (10, mact),
+                                    (13, &ob),
+                                    (14, &dn_u),
+                                    (15, mlogit),
+                                    (16, &fd_u),
+                                ],
+                            ),
+                            (*mi / 4) as u32,
+                            (hidden / 4) as u32,
+                        )
+                        }
+                    } else if let Some(r4) = r4.filter(|_| slots <= 32) {
                         (
                             &r4.gu,
                             &r4.dn,
@@ -28512,7 +28796,9 @@ pub fn forward_token_graph(
                             // the tree kernel.
                             let plain =
                                 !*sigmoid && bias.is_none() && *has_shared && *shared_gated;
-                            if let (Some(sgp), true) = (&c.moe_select_sg, plain) {
+                            if sel_fold {
+                                // folded into the expert kernels below
+                            } else if let (Some(sgp), true) = (&c.moe_select_sg, plain) {
                                 // Same binding ORDER as the tree kernel's bg_sel —
                                 // but its OWN layout (auto layouts are exclusive).
                                 pass.set_pipeline(sgp);
@@ -28827,6 +29113,12 @@ pub fn forward_token_graph(
         };
         if lrows < ltotal && lm.kind == 6 && hidden % 32 == 0 && hidden / 32 > 64 {
             encode_q4tp_mv16w_shortlist(c, &mut enc, &lm.buf, &lm_in, &lbuf, lrows, hidden, ltotal);
+        } else if lm.kind == 7
+            && lrows == ltotal
+            && c.use_q82_mv4
+            && moe_r4::q82sg_encode(c, &mut enc, &lm_in, hidden, &[(&lm.buf, &lbuf, lrows)])
+        {
+            // warp-per-row head
         } else {
             emat(&mut enc, &lm, &lm_in, &lbuf, lrows, hidden);
         }
