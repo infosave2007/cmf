@@ -7,6 +7,8 @@ mod choice;
 mod convert;
 mod decision;
 mod dialog;
+mod egemma2pack;
+mod embed;
 mod gguf;
 mod gptq;
 mod growth;
@@ -464,6 +466,51 @@ enum Commands {
             value_name = "text|mm-only|multimodal"
         )]
         mimo_towers: String,
+    },
+    /// Text embeddings from an EmbeddingGemma 2 .cmf (`cortiq convert --model
+    /// <google/embeddinggemma-2 dir>`): unit-length 768-d vectors, or a
+    /// Matryoshka prefix with --dim 512|256|128.
+    Embed {
+        /// Path to the EmbeddingGemma 2 .cmf
+        #[arg(long)]
+        model: String,
+        /// Texts to embed (one embedding each)
+        texts: Vec<String>,
+        /// More texts (repeatable)
+        #[arg(long = "text")]
+        text: Vec<String>,
+        /// A file with one text per line
+        #[arg(long)]
+        file: Option<String>,
+        /// JSON Lines: each line a string or {"text", "prompt_name"|"task", "title", "prompt"}
+        #[arg(long)]
+        jsonl: Option<String>,
+        /// Task prompt: SearchQuery, Document, QuestionAnswering, FactChecking,
+        /// CodeRetrieval, Classification, Clustering, SentenceSimilarity, …
+        /// (--list-prompts). Default: none (the text as given).
+        #[arg(long = "prompt-name", visible_alias = "task")]
+        prompt_name: Option<String>,
+        /// Title for the Document prompt (`title: {title} | text: …`)
+        #[arg(long)]
+        title: Option<String>,
+        /// A raw prompt prefix instead of a named one
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Output dimension: 768, or a Matryoshka prefix 512 | 256 | 128 (re-normalized)
+        #[arg(long, default_value = "768")]
+        dim: usize,
+        /// Print OpenAI-style JSON ({"data":[{"embedding":[…]}], "usage":…})
+        #[arg(long)]
+        json: bool,
+        /// Write the embeddings as a float32 .npy [n, dim]
+        #[arg(long)]
+        npy: Option<String>,
+        /// Print each input's token ids to stderr
+        #[arg(long)]
+        show_tokens: bool,
+        /// List the task prompts the file carries and exit
+        #[arg(long)]
+        list_prompts: bool,
     },
     /// Transcribe audio with a Whisper CMF checkpoint (WAV, PCM or float).
     Transcribe {
@@ -2816,6 +2863,34 @@ async fn main() -> anyhow::Result<()> {
             println!("✓ wrote {output}");
             Ok(())
         }
+        Commands::Embed {
+            model,
+            texts,
+            text,
+            file,
+            jsonl,
+            prompt_name,
+            title,
+            prompt,
+            dim,
+            json,
+            npy,
+            show_tokens,
+            list_prompts,
+        } => embed::run(embed::EmbedArgs {
+            model,
+            texts: texts.into_iter().chain(text).collect(),
+            file,
+            jsonl,
+            prompt_name,
+            title,
+            prompt,
+            dim,
+            json,
+            npy,
+            show_tokens,
+            list_prompts,
+        }),
         Commands::Transcribe {
             model,
             audio,
@@ -4150,6 +4225,15 @@ async fn cmd_serve(
     if is_decision {
         drop(model);
         return decision::serve(model_path, host, port, decision_flags).await;
+    }
+    // An EmbeddingGemma 2 file is an encoder: no Pipeline, no KV cache —
+    // the embeddings server (POST /v1/embeddings) takes it.
+    if cortiq_engine::egemma2::is_embedding_gemma2(&model) {
+        let addr = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+            .map_err(|e| anyhow::anyhow!("bind address {host}:{port}: {e}"))?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("bind address {host}:{port}: no address"))?;
+        return cortiq_server::embeddings::serve(model, model_path, addr).await;
     }
     let lookup_mode =
         cortiq_engine::lookup::LookupMode::resolve(lookup_mode).map_err(anyhow::Error::msg)?;

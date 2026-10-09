@@ -670,6 +670,7 @@ dependencies = [
  "anyhow",
  "axum",
  "axum-extra",
+ "base64",
  "chrono",
  "cortiq-core",
  "cortiq-decision",

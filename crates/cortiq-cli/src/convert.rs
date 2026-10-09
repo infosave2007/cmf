@@ -5637,6 +5637,24 @@ pub fn run_convert_multi_towers(
         );
         return crate::mimo_towers::run_convert_mimo_mm(model, outputs, progress);
     }
+    // EmbeddingGemma 2 is an encoder with its own packer (text + towers)
+    // and its own profiles (bf16 | f32 | q8_2f | q4tp).
+    if let Some(dir) = Some(Path::new(model)).filter(|d| {
+        fs::read(d.join("config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .is_some_and(|c| c.get("model_type").and_then(|v| v.as_str()) == Some("embedding_gemma2"))
+    }) {
+        anyhow::ensure!(
+            defrag.is_none() && o1_hint.is_none() && !resume && towers == MimoTowers::TextOnly,
+            "embedding_gemma2: --defrag, --o1, --resume and --mimo-towers do not apply"
+        );
+        for (q, path) in outputs {
+            crate::egemma2pack::convert(dir, q, path)?;
+        }
+        progress(1.0);
+        return Ok(());
+    }
     for (i, (_, path)) in outputs.iter().enumerate() {
         anyhow::ensure!(!path.trim().is_empty(), "output path {} is empty", i + 1);
         anyhow::ensure!(
@@ -5686,6 +5704,12 @@ pub fn run_convert_multi_towers(
     let config: serde_json::Value = serde_json::from_slice(
         &fs::read(dir.join("config.json")).map_err(|e| anyhow::anyhow!("read config.json: {e}"))?,
     )?;
+    // EmbeddingGemma 2 converts from a local dir (dispatched above).
+    anyhow::ensure!(
+        config.get("model_type").and_then(|v| v.as_str()) != Some("embedding_gemma2"),
+        "embedding_gemma2 converts from a local checkpoint dir: \
+         `hf download {model} --local-dir DIR`, then `cortiq convert --model DIR`"
+    );
     let mut arch = build_arch(&config)?;
     // The multimodal towers (checked before any shard is touched: a missing
     // audio tokenizer must not surface after a multi-hour text pass).
