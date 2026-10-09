@@ -967,6 +967,9 @@ impl EmbeddingGemma2 {
 
     fn forward_pooled_locked(&self, x: Vec<f32>, lens: &[usize]) -> Vec<Vec<f32>> {
         let t_fwd = std::time::Instant::now();
+        // the media towers run their projections through `Mat` too: start
+        // this forward's split from zero
+        let _ = (prof::take(&prof::LIN), prof::take(&prof::ATTN));
         let pool = self.pool.as_deref();
         let d = self.hidden;
         let n: usize = lens.iter().sum();
