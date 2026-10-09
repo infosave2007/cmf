@@ -184,9 +184,13 @@ var<workgroup> ag_sc: array<f32, 2048>;
 var<workgroup> ag_red: array<f32, 2048>;
 @compute @workgroup_size(256)
 fn gqa_attend_gpart_bt(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
-    let g = wid.x;
+    // Token is the FAST axis (`_a` = 1): the workgroups in flight together
+    // are the run's tokens over one (kv head, chunk), so that chunk's K/V
+    // rows are read from DRAM about once and served from L2 to the rest.
+    let tfast = ap_p._a == 1u;
+    let tl = select(wid.z, wid.x, tfast);
     let ch = wid.y;
-    let tl = wid.z;
+    let g = select(wid.x, wid.z, tfast);
     let hpk = ap_p.hpk;
     let nkv = ap_p.nh / hpk;
     if (g >= nkv || tl >= ap_p.k) { return; }
@@ -696,6 +700,8 @@ pub(crate) fn encode_attn_bt(
         pass.set_bind_group(0, &bg_dec, &[]);
         pass.dispatch_workgroups(nh as u32, kk as u32, 1);
     }
+    // `CMF_ATTN_BT_TFAST=0`: kv head fastest (the first order).
+    let tfast = std::env::var("CMF_ATTN_BT_TFAST").as_deref() != Ok("0");
     let mut t0 = t_dec.max(t_from);
     while t0 < k {
         let kk = sub.min(k - t0);
@@ -715,7 +721,7 @@ pub(crate) fn encode_attn_bt(
                     scale.to_bits(),
                     kk as u32,
                     t0 as u32,
-                    0,
+                    u32::from(tfast),
                     0,
                 ]),
                 usage: wgpu::BufferUsages::UNIFORM,
@@ -734,7 +740,11 @@ pub(crate) fn encode_attn_bt(
         let bg_merge = bind(&p.merge_l, &[(16, pacc), (17, pml), (18, &at_u), (19, attn_bb)]);
         pass.set_pipeline(&p.part);
         pass.set_bind_group(0, &bg_part, &[]);
-        pass.dispatch_workgroups(nkv as u32, n_last.div_ceil(BT_CK) as u32, kk as u32);
+        if tfast {
+            pass.dispatch_workgroups(kk as u32, n_last.div_ceil(BT_CK) as u32, nkv as u32);
+        } else {
+            pass.dispatch_workgroups(nkv as u32, n_last.div_ceil(BT_CK) as u32, kk as u32);
+        }
         pass.set_pipeline(&p.merge);
         pass.set_bind_group(0, &bg_merge, &[]);
         pass.dispatch_workgroups(nh as u32, kk as u32, 1);
