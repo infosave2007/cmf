@@ -28,9 +28,14 @@
 //!   kept at q8_2f: a token row *is* the residual stream at layer 0, and the
 //!   per-layer projection feeds all 24 layers at once — neither error is
 //!   averaged away downstream. The towers' matrices take q8_2f under both
-//!   quantized profiles: the vision tower at q8_2f keeps every image /
-//!   video / interleaved embedding at cosine >= 0.9997 against the float32
-//!   reference (`tests/egemma2_vision_parity.rs`).
+//!   quantized profiles. Measured against the float32 reference: the vision
+//!   tower at q8_2f keeps every image / video / interleaved embedding at
+//!   cosine >= 0.9997 (`tests/egemma2_vision_parity.rs`); a q8_2f audio
+//!   tower under the exact text encoder costs 2e-6…1.4e-5 of `1 − cos`
+//!   (10 clips and interleaved inputs), the q8_2f text encoder ~1e-4 — the
+//!   towers are not where a q8_2f file loses accuracy. The audio
+//!   convolutions (4-D subsampling, 3-D depthwise), `per_dim_scale`, the
+//!   clip bounds and the output bias stay exact as non-matrices.
 //!   `--tensor-quant PATTERN=QUANT` overrides any 2-D matrix (`f16`/`bf16`
 //!   there means the exact copy).
 //!
@@ -419,6 +424,50 @@ mod tests {
             ),
             Codec::Exact
         );
+    }
+
+    #[test]
+    fn audio_tower_codecs() {
+        let q8 = Profile::Quant(Quant::Q8_2f);
+        let q4 = Profile::Quant(Quant::Q4TiledP);
+        for p in [q8, q4] {
+            for (name, shape) in [
+                (
+                    "audio_tower.layers.3.feed_forward2.ffw_layer_1.linear.weight",
+                    &[4096usize, 1024][..],
+                ),
+                (
+                    "audio_tower.layers.3.self_attn.relative_k_proj.weight",
+                    &[1024, 1024],
+                ),
+                (
+                    "audio_tower.subsample_conv_projection.input_proj_linear.weight",
+                    &[1024, 1024],
+                ),
+                ("audio_tower.output_proj.weight", &[1536, 1024]),
+            ] {
+                assert_eq!(
+                    codec_for(name, shape, p),
+                    Codec::Matrix(Quant::Q8_2f),
+                    "{name}"
+                );
+            }
+            for (name, shape) in [
+                (
+                    "audio_tower.subsample_conv_projection.layer1.conv.weight",
+                    &[32usize, 128, 3, 3][..],
+                ),
+                (
+                    "audio_tower.layers.3.lconv1d.depthwise_conv1d.weight",
+                    &[1024, 1, 5],
+                ),
+                ("audio_tower.layers.3.self_attn.per_dim_scale", &[128]),
+                ("audio_tower.output_proj.bias", &[1536]),
+                ("embed_audio.embedding_projection.weight", &[512, 1536]),
+            ] {
+                assert_eq!(codec_for(name, shape, p), Codec::Exact, "{name}");
+            }
+        }
     }
 
     #[test]

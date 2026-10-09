@@ -65,7 +65,7 @@ const EPS: f64 = 1e-6;
 
 /// `CMF_EGEMMA2_PROF=1`: per-forward time split (projections / attention
 /// core / the rest) on stderr.
-mod prof {
+pub(crate) mod prof {
     use std::sync::atomic::{AtomicU64, Ordering};
     pub static LIN: AtomicU64 = AtomicU64::new(0);
     pub static ATTN: AtomicU64 = AtomicU64::new(0);
