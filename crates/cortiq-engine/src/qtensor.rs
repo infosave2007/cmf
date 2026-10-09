@@ -494,6 +494,26 @@ impl QTensor {
         }
     }
 
+    /// (directory idx, rows, cols, row_scale, col_field) of a q8_2f mapped
+    /// tensor — the chunk-prefill graph stages x·col on the device first.
+    pub(crate) fn q8_2f_parts(&self) -> Option<(usize, usize, usize, &[f32], &[f32])> {
+        if self.has_prism_contract() {
+            return None;
+        }
+        match self {
+            Self::Mapped {
+                idx,
+                dtype: TensorDtype::Q8_2f,
+                rows,
+                cols,
+                row_scale,
+                col_field,
+                ..
+            } if col_field.len() == *cols => Some((*idx, *rows, *cols, row_scale, col_field)),
+            _ => None,
+        }
+    }
+
     /// The layout this tensor is stored in, when it is mapped from a model.
     /// The frames branch on it — a q2tp gate against a q4tp down is a real
     /// combination in the 2-bit profile and needs a different kernel.
