@@ -9893,8 +9893,14 @@ impl Pipeline {
             let col = [cf(wq), cf(wk), cf(wv), cf(wo)];
             // q8_2f projections ride the chunk graph on the MoE layers it
             // was measured on (Mellum2.1); dense q8_2f stacks keep the host
-            // walk until they are measured too.
-            if moe.is_none() && col.iter().any(|c| !c.is_empty()) {
+            // walk until they are measured too. That includes a q8_2f
+            // gate/up/down behind q4/q8_row attention: the chunk FFN has no
+            // x·col staging, so it would run those weights without their
+            // input field (0.8.14 refused every q8_2f weight here).
+            if moe.is_none()
+                && (col.iter().any(|c| !c.is_empty())
+                    || [gate_t, up_t, down_t].iter().any(|t| !cf(t).is_empty()))
+            {
                 break;
             }
             let parts = (
