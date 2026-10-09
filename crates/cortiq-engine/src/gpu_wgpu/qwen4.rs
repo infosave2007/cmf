@@ -5699,7 +5699,7 @@ pub(crate) fn encode_layer(
                         };
                         let lk = bt.key();
                         // indexer query: per-head norm (1+w) + partial rope, no gate, no K
-                        let pb = uni_slot8(
+                        let pb = uni_slot12(
                             c,
                             U_ROPE_IQ,
                             uid,
@@ -5712,6 +5712,10 @@ pub(crate) fn encode_layer(
                                 pos as u32,
                                 2 | 8,
                                 g.eps.to_bits(),
+                                0,
+                                1.0f32.to_bits(),
+                                0,
+                                0,
                                 0,
                             ],
                         );
@@ -5737,7 +5741,7 @@ pub(crate) fn encode_layer(
                             (ih as u32, 1, 1),
                         );
                         // attention q/gate split, q/k norm (1+w), partial rope, K in place
-                        let pb = uni_slot8(
+                        let pb = uni_slot12(
                             c,
                             U_ROPE_QK,
                             uid,
@@ -5750,6 +5754,10 @@ pub(crate) fn encode_layer(
                                 pos as u32,
                                 1 | 2 | 4 | 8,
                                 g.eps.to_bits(),
+                                0,
+                                1.0f32.to_bits(),
+                                0,
+                                0,
                                 0,
                             ],
                         );
