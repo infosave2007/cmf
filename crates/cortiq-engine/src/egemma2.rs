@@ -525,6 +525,7 @@ fn add_normed(h: &mut [f32], y: &[f32], w: &[f32], d: usize, pool: Option<&Pool>
 /// token a layer, was most of the forward outside the GEMMs.
 #[inline]
 fn gelu_mul_slice(x: &mut [f32], y: &[f32]) {
+    #[allow(unused_mut)] // only the NEON body advances it
     let mut i = 0usize;
     #[cfg(target_arch = "aarch64")]
     // SAFETY: every lane read/written is below `x.len()`, `y` is as long.
