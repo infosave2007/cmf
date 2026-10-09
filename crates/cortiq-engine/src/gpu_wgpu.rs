@@ -18572,6 +18572,8 @@ struct Ctx {
     dense_batch_pipes: std::sync::OnceLock<Option<dense_batch::Pipes>>,
     /// Warp-per-row q4tp decode matvecs (`dense_mv`).
     dense_mv_pipes: std::sync::OnceLock<Option<dense_mv::MvSg>>,
+    /// Subgroup-tree GDN step twins (`dense_mv::gdn`).
+    gdn_sg_pipes: std::sync::OnceLock<Option<dense_mv::GdnSg>>,
     moe_down_q4tp_b2: wgpu::ComputePipeline,
     moe_down_q4tp_part: wgpu::ComputePipeline,
     moe_down_q4tp_b4: wgpu::ComputePipeline,
@@ -21177,6 +21179,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         moe_r4_pipes: std::sync::OnceLock::new(),
         dense_batch_pipes: std::sync::OnceLock::new(),
         dense_mv_pipes: std::sync::OnceLock::new(),
+        gdn_sg_pipes: std::sync::OnceLock::new(),
         moe_down_q4tp_b2,
         moe_down_q4tp_part,
         moe_down_q4tp_b4,
@@ -27772,9 +27775,11 @@ pub fn forward_token_graph(
                     // The parallel step/norm entries use SUBSETS of the gdn
                     // binding set, and an auto layout lists only what its entry
                     // reads — each gets its own bind group (lesson of the day).
+                    // The subgroup-tree twin when it came up (same sums).
+                    let par_pipe = dense_mv::gdn(c).map_or(&c.gdn_step_par, |g| &g.par);
                     let bg_par = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: None,
-                        layout: &c.gdn_step_par.get_bind_group_layout(0),
+                        layout: &par_pipe.get_bind_group_layout(0),
                         entries: &[
                             bind_buf(0, &cq_b),
                             bind_buf(2, &a_b),
@@ -27956,7 +27961,7 @@ pub fn forward_token_graph(
                                 pass.dispatch_workgroups((*cdim as u32).div_ceil(256), 1, 1);
                                 tsp!(pass, fine, 11); // conv
                                 if c.gdn_par {
-                                    pass.set_pipeline(&c.gdn_step_par);
+                                    pass.set_pipeline(par_pipe);
                                     pass.set_bind_group(0, &bg_par, &[]);
                                     pass.dispatch_workgroups(
                                         *nv as u32,
@@ -28002,7 +28007,7 @@ pub fn forward_token_graph(
                         if c.gdn_par {
                             {
                                 let mut pass = begin_pass(&mut enc);
-                                pass.set_pipeline(&c.gdn_step_par);
+                                pass.set_pipeline(par_pipe);
                                 pass.set_bind_group(0, &bg_par, &[]);
                                 pass.dispatch_workgroups(*nv as u32, (*dv as u32).div_ceil(4), 1);
                                 pass.set_pipeline(&c.gdn_step_norm);
@@ -31935,11 +31940,13 @@ pub fn forward_batch_graph_at(
                         // gdn_step_k includes the gated RMS normalization.
                         needs_norm_k = false;
                     } else {
-                        pass.set_pipeline(&c.gdn_step_par_k);
+                        let park_pipe =
+                            dense_mv::gdn(c).map_or(&c.gdn_step_par_k, |g| &g.park);
+                        pass.set_pipeline(park_pipe);
                         pass.set_bind_group(
                             0,
                             &{
-                                let l = c.gdn_step_par_k.get_bind_group_layout(0);
+                                let l = park_pipe.get_bind_group_layout(0);
                                 // The auto layout keeps only what the entry
                                 // point touches: no z, no norm weight here.
                                 c.device.create_bind_group(&wgpu::BindGroupDescriptor {
