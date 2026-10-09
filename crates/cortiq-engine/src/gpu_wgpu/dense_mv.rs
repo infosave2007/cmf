@@ -4252,3 +4252,248 @@ fn q4tp_gu_sg(@builtin(workgroup_id) wid: vec3<u32>,
     run_gu(wid.x, lid >> 5u, lane);
 }
 "#;
+
+/// `gdn_step_par` (decode) and `gdn_step_par_k` (batch) with their tree
+/// reductions finished by subgroup shuffles: the stride-64 step through
+/// workgroup memory, the stride-32 step and the 16..1 strides inside the
+/// first subgroup, in the tree's own pair order — the same sums to the
+/// bit with four barriers a reduction where the loop takes nine.
+pub(crate) const GDN_SG_WGSL: &str = r#"
+struct GdnP { nv: u32, dk: u32, dv: u32, kd: u32, rep: u32, cdim: u32, eps: f32, tok: u32 };
+@group(0) @binding(0) var<storage, read>       gd_cq   : array<f32>;
+@group(0) @binding(2) var<storage, read>       gd_a    : array<f32>;
+@group(0) @binding(3) var<storage, read>       gd_b    : array<f32>;
+@group(0) @binding(4) var<storage, read>       gd_alog : array<f32>;
+@group(0) @binding(5) var<storage, read>       gd_dtb  : array<f32>;
+@group(0) @binding(7) var<storage, read_write> gd_S4   : array<vec4<f32>>;
+@group(0) @binding(8) var<storage, read_write> gd_o4   : array<vec4<f32>>;
+@group(0) @binding(9) var<uniform>             gd_p    : GdnP;
+var<workgroup> sr1: array<f32, 128>;
+var<workgroup> sr4: array<vec4<f32>, 128>;
+var<workgroup> sbc: vec4<f32>;
+fn gd_softplus(x: f32) -> f32 {
+    if (x > 20.0) { return x; }
+    return log(1.0 + exp(x));
+}
+// The 128-lane tree `for stride 64..1: r[t] += r[t + stride]` and its
+// trailing barrier, value of r[0] to every lane.
+fn sgr1(t: u32, v: f32) -> f32 {
+    sr1[t] = v;
+    workgroupBarrier();
+    if (t < 64u) { sr1[t] = sr1[t] + sr1[t + 64u]; }
+    workgroupBarrier();
+    if (t < 32u) {
+        var s = sr1[t] + sr1[t + 32u];
+        s = s + subgroupShuffleDown(s, 16u);
+        s = s + subgroupShuffleDown(s, 8u);
+        s = s + subgroupShuffleDown(s, 4u);
+        s = s + subgroupShuffleDown(s, 2u);
+        s = s + subgroupShuffleDown(s, 1u);
+        if (t == 0u) { sbc.x = s; }
+    }
+    workgroupBarrier();
+    let r = sbc.x;
+    workgroupBarrier();
+    return r;
+}
+fn sgr4(t: u32, v: vec4<f32>) -> vec4<f32> {
+    sr4[t] = v;
+    workgroupBarrier();
+    if (t < 64u) { sr4[t] = sr4[t] + sr4[t + 64u]; }
+    workgroupBarrier();
+    if (t < 32u) {
+        var s = sr4[t] + sr4[t + 32u];
+        s = s + subgroupShuffleDown(s, 16u);
+        s = s + subgroupShuffleDown(s, 8u);
+        s = s + subgroupShuffleDown(s, 4u);
+        s = s + subgroupShuffleDown(s, 2u);
+        s = s + subgroupShuffleDown(s, 1u);
+        if (t == 0u) { sbc = s; }
+    }
+    workgroupBarrier();
+    let r = sbc;
+    workgroupBarrier();
+    return r;
+}
+@compute @workgroup_size(128)
+fn gdn_step_par_sg(@builtin(workgroup_id) wid: vec3<u32>,
+                   @builtin(local_invocation_id) lid: vec3<u32>) {
+    let h = wid.x;
+    let dj4 = wid.y;
+    let t = lid.x;
+    let dk = gd_p.dk;
+    let dv = gd_p.dv;
+    if (h >= gd_p.nv || dj4 * 4u >= dv) { return; }
+    let ko = h / gd_p.rep;
+    let qs = ko * dk;
+    let ks = gd_p.kd + ko * dk;
+    let nq = sgr1(t, select(0.0, gd_cq[qs + t] * gd_cq[qs + t], t < dk));
+    let nkn = sgr1(t, select(0.0, gd_cq[ks + t] * gd_cq[ks + t], t < dk));
+    let invq = 1.0 / (sqrt(nq + 1e-6) * sqrt(f32(dk)));
+    let invk = 1.0 / sqrt(nkn + 1e-6);
+    let abo = gd_p.tok * gd_p.nv;
+    let g = exp(-exp(gd_alog[h]) * gd_softplus(gd_a[abo + h] + gd_dtb[h]));
+    let beta = 1.0 / (1.0 + exp(-gd_b[abo + h]));
+    let s4base = (h * dk * dv) >> 2u;
+    let dv4 = dv >> 2u;
+    let vto = 2u * gd_p.kd + h * dv + dj4 * 4u;
+    let vt = vec4<f32>(gd_cq[vto], gd_cq[vto + 1u], gd_cq[vto + 2u], gd_cq[vto + 3u]);
+    let kf_t = select(0.0, gd_cq[ks + t] * invk, t < dk);
+    let qf_t = select(0.0, gd_cq[qs + t] * invq, t < dk);
+    var kv4 = vec4<f32>(0.0);
+    if (t < dk) {
+        kv4 = gd_S4[s4base + t * dv4 + dj4] * kf_t;
+    }
+    let kv = sgr4(t, kv4);
+    let delta = (vt - g * kv) * beta;
+    var contrib = vec4<f32>(0.0);
+    if (t < dk) {
+        let idx = s4base + t * dv4 + dj4;
+        let cell = g * gd_S4[idx] + kf_t * delta;
+        gd_S4[idx] = cell;
+        contrib = qf_t * cell;
+    }
+    let o = sgr4(t, contrib);
+    if (t == 0u) {
+        let zo4 = (gd_p.tok * gd_p.nv * dv) >> 2u;
+        gd_o4[zo4 + h * dv4 + dj4] = o;
+    }
+}
+"#;
+
+pub(crate) const GDNK_SG_WGSL: &str = r#"
+struct GdKP {
+    nv: u32, dk: u32, dv: u32, kd: u32,
+    rep: u32, cdim: u32, eps: f32, kb: u32,
+    stride: u32, ring_els: u32, p0: u32, p1: u32,
+};
+@group(0) @binding(0) var<storage, read>       gdk_cq   : array<f32>;
+@group(0) @binding(2) var<storage, read>       gdk_a    : array<f32>;
+@group(0) @binding(3) var<storage, read>       gdk_b    : array<f32>;
+@group(0) @binding(4) var<storage, read>       gdk_alog : array<f32>;
+@group(0) @binding(5) var<storage, read>       gdk_dtb  : array<f32>;
+@group(0) @binding(7) var<storage, read_write> gdk_S4   : array<vec4<f32>>;
+@group(0) @binding(8) var<storage, read_write> gdk_o4   : array<vec4<f32>>;
+@group(0) @binding(9) var<uniform>             gdk_p    : GdKP;
+@group(0) @binding(10) var<storage, read_write> gdk_snap4 : array<vec4<f32>>;
+var<workgroup> sr1: array<f32, 128>;
+var<workgroup> sr4: array<vec4<f32>, 128>;
+var<workgroup> sbc: vec4<f32>;
+fn gd_softplus(x: f32) -> f32 {
+    if (x > 20.0) { return x; }
+    return log(1.0 + exp(x));
+}
+fn sgr1(t: u32, v: f32) -> f32 {
+    sr1[t] = v;
+    workgroupBarrier();
+    if (t < 64u) { sr1[t] = sr1[t] + sr1[t + 64u]; }
+    workgroupBarrier();
+    if (t < 32u) {
+        var s = sr1[t] + sr1[t + 32u];
+        s = s + subgroupShuffleDown(s, 16u);
+        s = s + subgroupShuffleDown(s, 8u);
+        s = s + subgroupShuffleDown(s, 4u);
+        s = s + subgroupShuffleDown(s, 2u);
+        s = s + subgroupShuffleDown(s, 1u);
+        if (t == 0u) { sbc.x = s; }
+    }
+    workgroupBarrier();
+    let r = sbc.x;
+    workgroupBarrier();
+    return r;
+}
+fn sgr4(t: u32, v: vec4<f32>) -> vec4<f32> {
+    sr4[t] = v;
+    workgroupBarrier();
+    if (t < 64u) { sr4[t] = sr4[t] + sr4[t + 64u]; }
+    workgroupBarrier();
+    if (t < 32u) {
+        var s = sr4[t] + sr4[t + 32u];
+        s = s + subgroupShuffleDown(s, 16u);
+        s = s + subgroupShuffleDown(s, 8u);
+        s = s + subgroupShuffleDown(s, 4u);
+        s = s + subgroupShuffleDown(s, 2u);
+        s = s + subgroupShuffleDown(s, 1u);
+        if (t == 0u) { sbc = s; }
+    }
+    workgroupBarrier();
+    let r = sbc;
+    workgroupBarrier();
+    return r;
+}
+@compute @workgroup_size(128)
+fn gdn_step_par_k_sg(@builtin(workgroup_id) wid: vec3<u32>,
+                     @builtin(local_invocation_id) lid: vec3<u32>) {
+    let h = wid.x;
+    let dj4 = wid.y;
+    let t = lid.x;
+    let dk = gdk_p.dk;
+    let dv = gdk_p.dv;
+    if (h >= gdk_p.nv || dj4 * 4u >= dv) { return; }
+    let ko = h / gdk_p.rep;
+    let dv4 = dv >> 2u;
+    let s4base = (h * dk * dv) >> 2u;
+    for (var i = 0u; i < gdk_p.kb; i = i + 1u) {
+        let cq0 = i * gdk_p.cdim;
+        let qs = cq0 + ko * dk;
+        let ks = cq0 + gdk_p.kd + ko * dk;
+        let nq = sgr1(t, select(0.0, gdk_cq[qs + t] * gdk_cq[qs + t], t < dk));
+        let nkn = sgr1(t, select(0.0, gdk_cq[ks + t] * gdk_cq[ks + t], t < dk));
+        let invq = 1.0 / (sqrt(nq + 1e-6) * sqrt(f32(dk)));
+        let invk = 1.0 / sqrt(nkn + 1e-6);
+        let abo = i * gdk_p.nv;
+        let g = exp(-exp(gdk_alog[h]) * gd_softplus(gdk_a[abo + h] + gdk_dtb[h]));
+        let beta = 1.0 / (1.0 + exp(-gdk_b[abo + h]));
+        let vto = cq0 + 2u * gdk_p.kd + h * dv + dj4 * 4u;
+        let vt = vec4<f32>(gdk_cq[vto], gdk_cq[vto + 1u], gdk_cq[vto + 2u], gdk_cq[vto + 3u]);
+        let kf_t = select(0.0, gdk_cq[ks + t] * invk, t < dk);
+        let qf_t = select(0.0, gdk_cq[qs + t] * invq, t < dk);
+        var kv4 = vec4<f32>(0.0);
+        if (t < dk) {
+            kv4 = gdk_S4[s4base + t * dv4 + dj4] * kf_t;
+        }
+        let kv = sgr4(t, kv4);
+        let delta = (vt - g * kv) * beta;
+        var contrib = vec4<f32>(0.0);
+        if (t < dk) {
+            let idx = s4base + t * dv4 + dj4;
+            let cell = g * gdk_S4[idx] + kf_t * delta;
+            gdk_S4[idx] = cell;
+            if (gdk_p.stride != 0u) {
+                gdk_snap4[(i * gdk_p.stride + gdk_p.ring_els) / 4u + idx] = cell;
+            }
+            contrib = qf_t * cell;
+        }
+        let o = sgr4(t, contrib);
+        if (t == 0u) {
+            gdk_o4[(i * gdk_p.nv * dv) / 4u + h * dv4 + dj4] = o;
+        }
+    }
+}
+"#;
+
+/// The subgroup-tree GDN step twins (`CMF_GDN_SG=0` keeps the loops).
+pub(crate) struct GdnSg {
+    pub(crate) par: wgpu::ComputePipeline,
+    pub(crate) par_l: wgpu::BindGroupLayout,
+    pub(crate) park: wgpu::ComputePipeline,
+    pub(crate) park_l: wgpu::BindGroupLayout,
+}
+
+fn build_gdn(c: &Ctx) -> Option<GdnSg> {
+    if std::env::var("CMF_GDN_SG").as_deref() == Ok("0") || !sg32(c) {
+        return None;
+    }
+    let par = compile(c, "cmf-gdn-sg", GDN_SG_WGSL, "gdn_step_par_sg")?;
+    let park = compile(c, "cmf-gdnk-sg", GDNK_SG_WGSL, "gdn_step_par_k_sg")?;
+    Some(GdnSg {
+        par_l: par.get_bind_group_layout(0),
+        par,
+        park_l: park.get_bind_group_layout(0),
+        park,
+    })
+}
+
+pub(crate) fn gdn(c: &Ctx) -> Option<&GdnSg> {
+    c.gdn_sg_pipes.get_or_init(|| build_gdn(c)).as_ref()
+}
