@@ -5814,9 +5814,10 @@ kernel void gather_rows(
     xg[(ulong)gid.y * n + gid.x] = x[(ulong)idx[gid.y] * n + gid.x];
 }
 
-// The chunk's MoE output: out[bi] = Σ_j w[bi][j]·eo[slot[bi][j]], the
-// row's experts in ascending expert index from 0.0 — the accumulation
-// order of the host's batched `moe_ffn_batch` scatter.
+// The chunk's MoE output: out[bi] = Σ_j w[bi][j]·eo[slot[bi][j]]·up[slot],
+// the row's experts in ascending expert index from 0.0 — the accumulation
+// order of the host's batched `moe_ffn_batch` scatter. `up` undoes the
+// power-of-two pre-scale of `moe_act_rows` (1.0 on almost every row).
 kernel void moe_combine_rows(
     device const float* eo   [[buffer(0)]],
     device float*       out  [[buffer(1)]],
@@ -5824,6 +5825,7 @@ kernel void moe_combine_rows(
     device const float* w    [[buffer(3)]],
     constant uint&      n    [[buffer(4)]],
     constant uint&      k    [[buffer(5)]],
+    device const float* up   [[buffer(6)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= n) return;
@@ -5831,9 +5833,53 @@ kernel void moe_combine_rows(
     float acc = 0.0f;
     for (uint j = 0u; j < k; ++j) {
         uint s = slot[bi * k + j];
-        acc += w[bi * k + j] * eo[(ulong)s * n + gid.x];
+        acc += w[bi * k + j] * (eo[(ulong)s * n + gid.x] * up[s]);
     }
     out[(ulong)bi * n + gid.x] = acc;
+}
+
+// The experts' SiLU·up rows for the down GEMM, which stages X as half:
+// Mellum2.1's activations reach 2.8e5 on ordinary text, past half's
+// 65504, and the fused SiLU GEMM turned those rows into inf. One
+// threadgroup per packed row: act = silu(g)·u in f32, the row's |max|,
+// and when it passes 16384 the row is scaled by an exact power of two
+// whose inverse goes to `up` for the combine (`row_pow2_scale`'s rule).
+kernel void moe_act_rows(
+    device const float* g   [[buffer(0)]],
+    device const float* u   [[buffer(1)]],
+    device float*       a   [[buffer(2)]],
+    device float*       up  [[buffer(3)]],
+    constant uint&      n   [[buffer(4)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint row  [[threadgroup_position_in_grid]])
+{
+    threadgroup float part[8];
+    threadgroup float sc;
+    ulong base = (ulong)row * n;
+    float m = 0.0f;
+    for (uint i = tid; i < n; i += 256u) {
+        float gv = g[base + i];
+        float v = (gv / (1.0f + exp(-gv))) * u[base + i];
+        a[base + i] = v;
+        m = max(m, fabs(v));
+    }
+    m = simd_max(m);
+    if (lane == 0u) part[sg] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        float tot = 0.0f;
+        for (uint q = 0u; q < 8u; ++q) tot = max(tot, part[q]);
+        float e = tot > 16384.0f ? ceil(log2(tot / 16384.0f)) : 0.0f;
+        sc = exp2(-e);
+        up[row] = exp2(e);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    float s = sc;
+    if (s != 1.0f) {
+        for (uint i = tid; i < n; i += 256u) a[base + i] = a[base + i] * s;
+    }
 }
 
 // A jobs kernel's weight pointer: the windowed arena's `locate`
@@ -7114,6 +7160,7 @@ struct Ctx {
     f32mvr8: ComputePipelineState,
     colscale: ComputePipelineState,
     gatherr: ComputePipelineState,
+    moeact: ComputePipelineState,
     moecomb: ComputePipelineState,
     /// `moe_topk_select` over one simdgroup (bit-identical outputs).
     moesel_sg: ComputePipelineState,
@@ -7367,6 +7414,7 @@ fn init() -> Result<Ctx, String> {
     let f32mvr8 = pso("f32_mv_rows8")?;
     let colscale = pso("col_scale_rows")?;
     let gatherr = pso("gather_rows")?;
+    let moeact = pso("moe_act_rows")?;
     let moecomb = pso("moe_combine_rows")?;
     let moesel_sg = pso("moe_topk_select_sg")?;
     let moe_gu_m = pso("q4tp_moe_gu_m")?;
@@ -7487,6 +7535,7 @@ fn init() -> Result<Ctx, String> {
         f32mvr8,
         colscale,
         gatherr,
+        moeact,
         moecomb,
         moesel_sg,
         moe_gu_m,
@@ -9962,8 +10011,9 @@ fn enc_q4tp_mm_rows(
 /// The MoE FFN of one chunk-graph layer (`ChunkMoe`): router logits on the
 /// device, ONE sync, the host's routing on those logits, then the routed
 /// rows gathered into per-expert panels, the experts' gate/up GEMMs
-/// (independent — one concurrent encoder), the down GEMMs with SiLU·up
-/// fused into their X load, and the per-row mix into `db` in ascending
+/// (independent — one concurrent encoder), SiLU·up per row with a
+/// power-of-two guard against the GEMMs' half staging, the down GEMMs,
+/// and the per-row mix into `db` in ascending
 /// expert order (`moe_ffn_batch`'s scatter). `cmd` is committed and
 /// replaced at the sync. False = the routing came back malformed; the
 /// caller abandons the run (the host walk redoes it).
@@ -10068,8 +10118,8 @@ fn chunk_moe_ffn(
         enc.end_encoding();
     }
     {
-        // The experts' panels are independent: one concurrent encoder,
-        // a buffer barrier between the gate|up and the down stages.
+        // The experts' panels are independent: one concurrent encoder
+        // per stage (gate|up here, down below).
         let enc =
             cmd.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent);
         for e in 0..ne {
@@ -10081,27 +10131,33 @@ fn chunk_moe_ffn(
             enc_q4tp_mm_rows(c, enc, fbuf, ga, &xg_b, off[e], &g_b, off[e], n_e, inter, hs);
             enc_q4tp_mm_rows(c, enc, fbuf, ua, &xg_b, off[e], &u_b, off[e], n_e, inter, hs);
         }
-        enc_barrier(enc);
-        enc.set_compute_pipeline_state(&c.q4tpmmsilu);
-        let (cols_u, rows_u) = (inter as u32, hs as u32);
+        enc.end_encoding();
+    }
+    // SiLU·up per packed row, power-of-two guarded for the half staging.
+    let act_b = io_buf_grow(c, 84_000_000_043, n_as * inter * 4);
+    let up_b = io_buf_grow(c, 85_000_000_047, n_as.max(1) * 4);
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.moeact);
+        enc.set_buffer(0, Some(&g_b), 0);
+        enc.set_buffer(1, Some(&u_b), 0);
+        enc.set_buffer(2, Some(&act_b), 0);
+        enc.set_buffer(3, Some(&up_b), 0);
+        let n_u = inter as u32;
+        enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
+        enc.dispatch_thread_groups(MTLSize::new(n_as as u64, 1, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+    }
+    {
+        let enc =
+            cmd.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent);
         for e in 0..ne {
             let n_e = off[e + 1] - off[e];
             if n_e == 0 {
                 continue;
             }
             let (_, _, da) = mabs[e];
-            fbuf.bind(enc, 0, da);
-            enc.set_buffer(1, Some(&g_b), (off[e] * inter * 4) as u64);
-            enc.set_buffer(2, Some(&u_b), (off[e] * inter * 4) as u64);
-            enc.set_buffer(3, Some(&eo_b), (off[e] * hs * 4) as u64);
-            let b_u = n_e as u32;
-            enc.set_bytes(4, 4, &cols_u as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(5, 4, &rows_u as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(6, 4, &b_u as *const u32 as *const std::ffi::c_void);
-            enc.dispatch_thread_groups(
-                MTLSize::new((n_e as u64).div_ceil(32), (hs as u64).div_ceil(64), 1),
-                MTLSize::new(128, 1, 1),
-            );
+            enc_q4tp_mm_rows(c, enc, fbuf, da, &act_b, off[e], &eo_b, off[e], n_e, hs, inter);
         }
         enc.end_encoding();
     }
@@ -10115,6 +10171,7 @@ fn chunk_moe_ffn(
         let (n_u, k_u) = (hs as u32, topk as u32);
         enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
         enc.set_bytes(5, 4, &k_u as *const u32 as *const std::ffi::c_void);
+        enc.set_buffer(6, Some(&up_b), 0);
         enc.dispatch_threads(MTLSize::new(hs as u64, b as u64, 1), MTLSize::new(256, 1, 1));
         enc.end_encoding();
     }
