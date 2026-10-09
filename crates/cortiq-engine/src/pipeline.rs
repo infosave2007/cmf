@@ -17872,14 +17872,6 @@ pub(crate) fn moe_parts(
     }
 }
 
-/// Map a MoE onto the Metal token graph's contract: f32 router, a
-/// shared expert (gated — Qwen — or ungated at weight 1 — DeepSeek-V3 /
-/// HunYuan hy_v3), softmax or sigmoid scores with an optional selection
-/// bias and routed scale, experts uniformly q4tp (or the mixed profile:
-/// q2tp gate/up over a q4tp down). τ routers, masks, per-expert scales
-/// and Gemma's router-input norm refuse here — those semantics stay on
-/// the CPU path.
-#[cfg(target_os = "macos")]
 /// The routed experts of a MoE layer as the Metal chunk prefill takes
 /// them: f32 router rows and every expert's q4tp (gate, up, down) tensor
 /// indices, uniform SiLU shapes. Only the plain routed form — no shared
@@ -17931,6 +17923,14 @@ fn chunk_moe_parts(m: &MoeFfn, hidden: usize) -> Option<(&[f32], Vec<(usize, usi
     Some((rf, experts))
 }
 
+/// Map a MoE onto the Metal token graph's contract: f32 router, a
+/// shared expert (gated — Qwen — or ungated at weight 1 — DeepSeek-V3 /
+/// HunYuan hy_v3), softmax or sigmoid scores with an optional selection
+/// bias and routed scale, experts uniformly q4tp (or the mixed profile:
+/// q2tp gate/up over a q4tp down). τ routers, masks, per-expert scales
+/// and Gemma's router-input norm refuse here — those semantics stay on
+/// the CPU path.
+#[cfg(target_os = "macos")]
 fn metal_moe_graph_parts(m: &MoeFfn, hidden: usize) -> Option<crate::gpu::GpuMoe<'_>> {
     if m.router_input_norm
         || m.route_tau.is_some()
