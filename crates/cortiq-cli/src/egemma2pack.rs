@@ -28,7 +28,9 @@
 //!   kept at q8_2f: a token row *is* the residual stream at layer 0, and the
 //!   per-layer projection feeds all 24 layers at once — neither error is
 //!   averaged away downstream. The towers' matrices take q8_2f under both
-//!   quantized profiles (their parity gates land with the modality work).
+//!   quantized profiles: the vision tower at q8_2f keeps every image /
+//!   video / interleaved embedding at cosine >= 0.9997 against the float32
+//!   reference (`tests/egemma2_vision_parity.rs`).
 //!   `--tensor-quant PATTERN=QUANT` overrides any 2-D matrix (`f16`/`bf16`
 //!   there means the exact copy).
 //!
