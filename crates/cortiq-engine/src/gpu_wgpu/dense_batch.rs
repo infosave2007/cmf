@@ -352,6 +352,9 @@ pub(crate) struct AttnBt {
 
 pub(crate) struct Pipes {
     pub(crate) attn: Option<AttnBt>,
+    /// `q4tp_mm_r`; None on rejection, a small workgroup-storage limit or
+    /// `CMF_Q4MM_R=0`.
+    pub(crate) mm_r: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
 }
 
 fn build_attn(c: &Ctx) -> Option<AttnBt> {
@@ -397,10 +400,74 @@ fn build_attn(c: &Ctx) -> Option<AttnBt> {
     })
 }
 
+fn build_mm_r(c: &Ctx) -> Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)> {
+    if std::env::var("CMF_Q4MM_R").as_deref() == Ok("0") {
+        return None;
+    }
+    if c.device.limits().max_compute_workgroup_storage_size < 2 * 1024 * 16 {
+        return None;
+    }
+    let scope = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let module = c.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("cmf-q4mm-r"),
+        source: wgpu::ShaderSource::Wgsl(MM_R_WGSL.into()),
+    });
+    let p = c
+        .device
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("q4tp_mm_r"),
+            layout: None,
+            module: &module,
+            entry_point: Some("q4tp_mm_r"),
+            compilation_options: Default::default(),
+            cache: c.pipeline_cache.as_ref(),
+        });
+    if let Some(e) = pollster::block_on(scope.pop()) {
+        tracing::warn!("cmf-q4mm-r module rejected ({e}): the prompt GEMM keeps q4tp_mul_mm");
+        return None;
+    }
+    let l = p.get_bind_group_layout(0);
+    Some((p, l))
+}
+
 fn build(c: &Ctx) -> Option<Pipes> {
     Some(Pipes {
         attn: build_attn(c),
+        mm_r: build_mm_r(c),
     })
+}
+
+/// Encode `y[nb][rows] = x[nb][cols] · Wᵀ` for a q4tp weight through
+/// `q4tp_mm_r`. False (nothing encoded) when the kernel is missing or the
+/// width is not a multiple of its 64-column step.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_q4tp_mm_r(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+    nb: usize,
+) -> bool {
+    let Some((p, l)) = pipes(c).and_then(|p| p.mm_r.as_ref()) else {
+        return false;
+    };
+    if cols % 64 != 0 || rows == 0 || nb == 0 || rows.div_ceil(64) > MAX_WG as usize {
+        return false;
+    }
+    let u = uniform_u32x4(c, [(cols / 4) as u32, rows as u32, nb as u32, 0]);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("q4mm-r"),
+        layout: l,
+        entries: &[bind_buf(0, weight), bind_buf(1, xs), bind_buf(2, y), bind_buf(3, &u)],
+    });
+    let mut pass = begin_pass(enc);
+    pass.set_pipeline(p);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups(rows.div_ceil(64) as u32, nb.div_ceil(64) as u32, 1);
+    true
 }
 
 pub(crate) fn pipes(c: &Ctx) -> Option<&Pipes> {
@@ -551,3 +618,265 @@ pub(crate) fn encode_attn_bt(
     }
 }
 
+pub(crate) const MM_R_WGSL: &str = r#"
+struct MmP { cols4: u32, rows: u32, nb: u32, pad: u32 };
+@group(0) @binding(0) var<storage, read>       qmm  : array<u32>;
+@group(0) @binding(1) var<storage, read>       xmm4 : array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> ymm  : array<f32>;
+@group(0) @binding(3) var<uniform>             pmm  : MmP;
+// 64 k x 16 four-row groups each, XOR-swizzled by the k block so both the
+// staging stores and the compute loads stay conflict-free.
+var<workgroup> rx: array<vec4<f32>, 1024>;
+var<workgroup> rw: array<vec4<f32>, 1024>;
+fn rb(off: u32) -> u32 {
+    return (qmm[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+// Register-blocked q4tp GEMM for the batched prompt: a 64 (batch rows) x 64
+// (output rows) tile per 128-lane workgroup, 64 columns (two q4tp groups) a
+// step, four batch rows x eight output rows per lane. Every output is the
+// sequential k-order sum `a = a + x*w` of `q4tp_mul_mm`, with the same
+// weight values, so the two kernels agree to the bit; this one stages each
+// weight word once per tile, takes one scale per row and group instead of
+// one per four weights, and feeds 32 FMAs from three shared loads.
+@compute @workgroup_size(128)
+fn q4tp_mm_r(@builtin(workgroup_id) wid: vec3<u32>,
+             @builtin(local_invocation_index) t: u32) {
+    let cols4 = pmm.cols4;
+    let cols = cols4 * 4u;
+    let gpr = cols >> 5u;
+    let rows = pmm.rows;
+    let nb = pmm.nb;
+    let m0 = wid.y * 64u;
+    let n0 = wid.x * 64u;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    // Weight staging role: word kw of the step (group kw/4, word kw%4) of
+    // rows 4ng..4ng+3. Lanes of a warp share rows, so a row's 32 bytes of a
+    // step come in one sector.
+    let kw = t & 7u;
+    let ng = t >> 3u;
+    let wr = n0 + ng * 4u;
+    // Compute role: batch rows 4tm..4tm+3, output rows 8tn..8tn+7.
+    let tm = t & 15u;
+    let tn = t >> 4u;
+    var a00 = 0.0;
+    var a01 = 0.0;
+    var a02 = 0.0;
+    var a03 = 0.0;
+    var a04 = 0.0;
+    var a05 = 0.0;
+    var a06 = 0.0;
+    var a07 = 0.0;
+    var a10 = 0.0;
+    var a11 = 0.0;
+    var a12 = 0.0;
+    var a13 = 0.0;
+    var a14 = 0.0;
+    var a15 = 0.0;
+    var a16 = 0.0;
+    var a17 = 0.0;
+    var a20 = 0.0;
+    var a21 = 0.0;
+    var a22 = 0.0;
+    var a23 = 0.0;
+    var a24 = 0.0;
+    var a25 = 0.0;
+    var a26 = 0.0;
+    var a27 = 0.0;
+    var a30 = 0.0;
+    var a31 = 0.0;
+    var a32 = 0.0;
+    var a33 = 0.0;
+    var a34 = 0.0;
+    var a35 = 0.0;
+    var a36 = 0.0;
+    var a37 = 0.0;
+    var k0 = 0u;
+    loop {
+        if (k0 >= cols) { break; }
+        for (var u = t; u < 256u; u = u + 128u) {
+            let kq = u & 15u;
+            let mg = u >> 4u;
+            let m = m0 + mg * 4u;
+            let ci = (k0 >> 2u) + kq;
+            var v0 = vec4<f32>(0.0);
+            var v1 = vec4<f32>(0.0);
+            var v2 = vec4<f32>(0.0);
+            var v3 = vec4<f32>(0.0);
+            if (m < nb) { v0 = xmm4[m * cols4 + ci]; }
+            if (m + 1u < nb) { v1 = xmm4[(m + 1u) * cols4 + ci]; }
+            if (m + 2u < nb) { v2 = xmm4[(m + 2u) * cols4 + ci]; }
+            if (m + 3u < nb) { v3 = xmm4[(m + 3u) * cols4 + ci]; }
+            let kb = kq * 64u;
+            let sx = mg ^ kq;
+            rx[kb + sx] = vec4<f32>(v0.x, v1.x, v2.x, v3.x);
+            rx[kb + 16u + sx] = vec4<f32>(v0.y, v1.y, v2.y, v3.y);
+            rx[kb + 32u + sx] = vec4<f32>(v0.z, v1.z, v2.z, v3.z);
+            rx[kb + 48u + sx] = vec4<f32>(v0.w, v1.w, v2.w, v3.w);
+        }
+        {
+            let g = (k0 >> 5u) + (kw >> 2u);
+            let word = kw & 3u;
+            let bit = g * 5u;
+            let sh = bit & 7u;
+            let r0 = min(wr + 0u, rows - 1u);
+            let cb0 = codes_b + r0 * cstride + (bit >> 3u);
+            var cv0 = rb(cb0);
+            if (sh > 3u) { cv0 = cv0 | (rb(cb0 + 1u) << 8u); }
+            let pr0 = unpack2x16float(qmm[params_w + r0]);
+            let s0 = exp2(pr0.x + f32((cv0 >> sh) & 31u) * pr0.y);
+            let q0 = qmm[(r0 * gpr + g) * 4u + word];
+            let r1 = min(wr + 1u, rows - 1u);
+            let cb1 = codes_b + r1 * cstride + (bit >> 3u);
+            var cv1 = rb(cb1);
+            if (sh > 3u) { cv1 = cv1 | (rb(cb1 + 1u) << 8u); }
+            let pr1 = unpack2x16float(qmm[params_w + r1]);
+            let s1 = exp2(pr1.x + f32((cv1 >> sh) & 31u) * pr1.y);
+            let q1 = qmm[(r1 * gpr + g) * 4u + word];
+            let r2 = min(wr + 2u, rows - 1u);
+            let cb2 = codes_b + r2 * cstride + (bit >> 3u);
+            var cv2 = rb(cb2);
+            if (sh > 3u) { cv2 = cv2 | (rb(cb2 + 1u) << 8u); }
+            let pr2 = unpack2x16float(qmm[params_w + r2]);
+            let s2 = exp2(pr2.x + f32((cv2 >> sh) & 31u) * pr2.y);
+            let q2 = qmm[(r2 * gpr + g) * 4u + word];
+            let r3 = min(wr + 3u, rows - 1u);
+            let cb3 = codes_b + r3 * cstride + (bit >> 3u);
+            var cv3 = rb(cb3);
+            if (sh > 3u) { cv3 = cv3 | (rb(cb3 + 1u) << 8u); }
+            let pr3 = unpack2x16float(qmm[params_w + r3]);
+            let s3 = exp2(pr3.x + f32((cv3 >> sh) & 31u) * pr3.y);
+            let q3 = qmm[(r3 * gpr + g) * 4u + word];
+            let sw = ng ^ kw;
+            let kb = kw * 128u;
+            rw[kb + 0u + sw] = vec4<f32>((f32((q0 >> 0u) & 0xFu) - 8.0) * s0, (f32((q1 >> 0u) & 0xFu) - 8.0) * s1, (f32((q2 >> 0u) & 0xFu) - 8.0) * s2, (f32((q3 >> 0u) & 0xFu) - 8.0) * s3);
+            rw[kb + 16u + sw] = vec4<f32>((f32((q0 >> 4u) & 0xFu) - 8.0) * s0, (f32((q1 >> 4u) & 0xFu) - 8.0) * s1, (f32((q2 >> 4u) & 0xFu) - 8.0) * s2, (f32((q3 >> 4u) & 0xFu) - 8.0) * s3);
+            rw[kb + 32u + sw] = vec4<f32>((f32((q0 >> 8u) & 0xFu) - 8.0) * s0, (f32((q1 >> 8u) & 0xFu) - 8.0) * s1, (f32((q2 >> 8u) & 0xFu) - 8.0) * s2, (f32((q3 >> 8u) & 0xFu) - 8.0) * s3);
+            rw[kb + 48u + sw] = vec4<f32>((f32((q0 >> 12u) & 0xFu) - 8.0) * s0, (f32((q1 >> 12u) & 0xFu) - 8.0) * s1, (f32((q2 >> 12u) & 0xFu) - 8.0) * s2, (f32((q3 >> 12u) & 0xFu) - 8.0) * s3);
+            rw[kb + 64u + sw] = vec4<f32>((f32((q0 >> 16u) & 0xFu) - 8.0) * s0, (f32((q1 >> 16u) & 0xFu) - 8.0) * s1, (f32((q2 >> 16u) & 0xFu) - 8.0) * s2, (f32((q3 >> 16u) & 0xFu) - 8.0) * s3);
+            rw[kb + 80u + sw] = vec4<f32>((f32((q0 >> 20u) & 0xFu) - 8.0) * s0, (f32((q1 >> 20u) & 0xFu) - 8.0) * s1, (f32((q2 >> 20u) & 0xFu) - 8.0) * s2, (f32((q3 >> 20u) & 0xFu) - 8.0) * s3);
+            rw[kb + 96u + sw] = vec4<f32>((f32((q0 >> 24u) & 0xFu) - 8.0) * s0, (f32((q1 >> 24u) & 0xFu) - 8.0) * s1, (f32((q2 >> 24u) & 0xFu) - 8.0) * s2, (f32((q3 >> 24u) & 0xFu) - 8.0) * s3);
+            rw[kb + 112u + sw] = vec4<f32>((f32((q0 >> 28u) & 0xFu) - 8.0) * s0, (f32((q1 >> 28u) & 0xFu) - 8.0) * s1, (f32((q2 >> 28u) & 0xFu) - 8.0) * s2, (f32((q3 >> 28u) & 0xFu) - 8.0) * s3);
+        }
+        workgroupBarrier();
+        for (var kq = 0u; kq < 16u; kq = kq + 1u) {
+            let sx = tm ^ kq;
+            let sw = kq >> 1u;
+            let na = (tn * 2u) ^ sw;
+            let nbb = (tn * 2u + 1u) ^ sw;
+            {
+                let kk = kq * 4u + 0u;
+                let xv = rx[kk * 16u + sx];
+                let wa = rw[kk * 16u + na];
+                let wb = rw[kk * 16u + nbb];
+                let x0 = xv.x; let x1 = xv.y; let x2 = xv.z; let x3 = xv.w;
+                let y0 = wa.x; let y1 = wa.y; let y2 = wa.z; let y3 = wa.w;
+                let y4 = wb.x; let y5 = wb.y; let y6 = wb.z; let y7 = wb.w;
+                a00 = a00 + x0 * y0; a01 = a01 + x0 * y1; a02 = a02 + x0 * y2; a03 = a03 + x0 * y3; a04 = a04 + x0 * y4; a05 = a05 + x0 * y5; a06 = a06 + x0 * y6; a07 = a07 + x0 * y7;
+                a10 = a10 + x1 * y0; a11 = a11 + x1 * y1; a12 = a12 + x1 * y2; a13 = a13 + x1 * y3; a14 = a14 + x1 * y4; a15 = a15 + x1 * y5; a16 = a16 + x1 * y6; a17 = a17 + x1 * y7;
+                a20 = a20 + x2 * y0; a21 = a21 + x2 * y1; a22 = a22 + x2 * y2; a23 = a23 + x2 * y3; a24 = a24 + x2 * y4; a25 = a25 + x2 * y5; a26 = a26 + x2 * y6; a27 = a27 + x2 * y7;
+                a30 = a30 + x3 * y0; a31 = a31 + x3 * y1; a32 = a32 + x3 * y2; a33 = a33 + x3 * y3; a34 = a34 + x3 * y4; a35 = a35 + x3 * y5; a36 = a36 + x3 * y6; a37 = a37 + x3 * y7;
+            }
+            {
+                let kk = kq * 4u + 1u;
+                let xv = rx[kk * 16u + sx];
+                let wa = rw[kk * 16u + na];
+                let wb = rw[kk * 16u + nbb];
+                let x0 = xv.x; let x1 = xv.y; let x2 = xv.z; let x3 = xv.w;
+                let y0 = wa.x; let y1 = wa.y; let y2 = wa.z; let y3 = wa.w;
+                let y4 = wb.x; let y5 = wb.y; let y6 = wb.z; let y7 = wb.w;
+                a00 = a00 + x0 * y0; a01 = a01 + x0 * y1; a02 = a02 + x0 * y2; a03 = a03 + x0 * y3; a04 = a04 + x0 * y4; a05 = a05 + x0 * y5; a06 = a06 + x0 * y6; a07 = a07 + x0 * y7;
+                a10 = a10 + x1 * y0; a11 = a11 + x1 * y1; a12 = a12 + x1 * y2; a13 = a13 + x1 * y3; a14 = a14 + x1 * y4; a15 = a15 + x1 * y5; a16 = a16 + x1 * y6; a17 = a17 + x1 * y7;
+                a20 = a20 + x2 * y0; a21 = a21 + x2 * y1; a22 = a22 + x2 * y2; a23 = a23 + x2 * y3; a24 = a24 + x2 * y4; a25 = a25 + x2 * y5; a26 = a26 + x2 * y6; a27 = a27 + x2 * y7;
+                a30 = a30 + x3 * y0; a31 = a31 + x3 * y1; a32 = a32 + x3 * y2; a33 = a33 + x3 * y3; a34 = a34 + x3 * y4; a35 = a35 + x3 * y5; a36 = a36 + x3 * y6; a37 = a37 + x3 * y7;
+            }
+            {
+                let kk = kq * 4u + 2u;
+                let xv = rx[kk * 16u + sx];
+                let wa = rw[kk * 16u + na];
+                let wb = rw[kk * 16u + nbb];
+                let x0 = xv.x; let x1 = xv.y; let x2 = xv.z; let x3 = xv.w;
+                let y0 = wa.x; let y1 = wa.y; let y2 = wa.z; let y3 = wa.w;
+                let y4 = wb.x; let y5 = wb.y; let y6 = wb.z; let y7 = wb.w;
+                a00 = a00 + x0 * y0; a01 = a01 + x0 * y1; a02 = a02 + x0 * y2; a03 = a03 + x0 * y3; a04 = a04 + x0 * y4; a05 = a05 + x0 * y5; a06 = a06 + x0 * y6; a07 = a07 + x0 * y7;
+                a10 = a10 + x1 * y0; a11 = a11 + x1 * y1; a12 = a12 + x1 * y2; a13 = a13 + x1 * y3; a14 = a14 + x1 * y4; a15 = a15 + x1 * y5; a16 = a16 + x1 * y6; a17 = a17 + x1 * y7;
+                a20 = a20 + x2 * y0; a21 = a21 + x2 * y1; a22 = a22 + x2 * y2; a23 = a23 + x2 * y3; a24 = a24 + x2 * y4; a25 = a25 + x2 * y5; a26 = a26 + x2 * y6; a27 = a27 + x2 * y7;
+                a30 = a30 + x3 * y0; a31 = a31 + x3 * y1; a32 = a32 + x3 * y2; a33 = a33 + x3 * y3; a34 = a34 + x3 * y4; a35 = a35 + x3 * y5; a36 = a36 + x3 * y6; a37 = a37 + x3 * y7;
+            }
+            {
+                let kk = kq * 4u + 3u;
+                let xv = rx[kk * 16u + sx];
+                let wa = rw[kk * 16u + na];
+                let wb = rw[kk * 16u + nbb];
+                let x0 = xv.x; let x1 = xv.y; let x2 = xv.z; let x3 = xv.w;
+                let y0 = wa.x; let y1 = wa.y; let y2 = wa.z; let y3 = wa.w;
+                let y4 = wb.x; let y5 = wb.y; let y6 = wb.z; let y7 = wb.w;
+                a00 = a00 + x0 * y0; a01 = a01 + x0 * y1; a02 = a02 + x0 * y2; a03 = a03 + x0 * y3; a04 = a04 + x0 * y4; a05 = a05 + x0 * y5; a06 = a06 + x0 * y6; a07 = a07 + x0 * y7;
+                a10 = a10 + x1 * y0; a11 = a11 + x1 * y1; a12 = a12 + x1 * y2; a13 = a13 + x1 * y3; a14 = a14 + x1 * y4; a15 = a15 + x1 * y5; a16 = a16 + x1 * y6; a17 = a17 + x1 * y7;
+                a20 = a20 + x2 * y0; a21 = a21 + x2 * y1; a22 = a22 + x2 * y2; a23 = a23 + x2 * y3; a24 = a24 + x2 * y4; a25 = a25 + x2 * y5; a26 = a26 + x2 * y6; a27 = a27 + x2 * y7;
+                a30 = a30 + x3 * y0; a31 = a31 + x3 * y1; a32 = a32 + x3 * y2; a33 = a33 + x3 * y3; a34 = a34 + x3 * y4; a35 = a35 + x3 * y5; a36 = a36 + x3 * y6; a37 = a37 + x3 * y7;
+            }
+        }
+        workgroupBarrier();
+        k0 = k0 + 64u;
+    }
+    let nq = n0 + tn * 8u;
+    {
+        let m = m0 + tm * 4u + 0u;
+        if (m < nb) {
+            let o = m * rows + nq;
+            if (nq + 0u < rows) { ymm[o + 0u] = a00; }
+            if (nq + 1u < rows) { ymm[o + 1u] = a01; }
+            if (nq + 2u < rows) { ymm[o + 2u] = a02; }
+            if (nq + 3u < rows) { ymm[o + 3u] = a03; }
+            if (nq + 4u < rows) { ymm[o + 4u] = a04; }
+            if (nq + 5u < rows) { ymm[o + 5u] = a05; }
+            if (nq + 6u < rows) { ymm[o + 6u] = a06; }
+            if (nq + 7u < rows) { ymm[o + 7u] = a07; }
+        }
+    }
+    {
+        let m = m0 + tm * 4u + 1u;
+        if (m < nb) {
+            let o = m * rows + nq;
+            if (nq + 0u < rows) { ymm[o + 0u] = a10; }
+            if (nq + 1u < rows) { ymm[o + 1u] = a11; }
+            if (nq + 2u < rows) { ymm[o + 2u] = a12; }
+            if (nq + 3u < rows) { ymm[o + 3u] = a13; }
+            if (nq + 4u < rows) { ymm[o + 4u] = a14; }
+            if (nq + 5u < rows) { ymm[o + 5u] = a15; }
+            if (nq + 6u < rows) { ymm[o + 6u] = a16; }
+            if (nq + 7u < rows) { ymm[o + 7u] = a17; }
+        }
+    }
+    {
+        let m = m0 + tm * 4u + 2u;
+        if (m < nb) {
+            let o = m * rows + nq;
+            if (nq + 0u < rows) { ymm[o + 0u] = a20; }
+            if (nq + 1u < rows) { ymm[o + 1u] = a21; }
+            if (nq + 2u < rows) { ymm[o + 2u] = a22; }
+            if (nq + 3u < rows) { ymm[o + 3u] = a23; }
+            if (nq + 4u < rows) { ymm[o + 4u] = a24; }
+            if (nq + 5u < rows) { ymm[o + 5u] = a25; }
+            if (nq + 6u < rows) { ymm[o + 6u] = a26; }
+            if (nq + 7u < rows) { ymm[o + 7u] = a27; }
+        }
+    }
+    {
+        let m = m0 + tm * 4u + 3u;
+        if (m < nb) {
+            let o = m * rows + nq;
+            if (nq + 0u < rows) { ymm[o + 0u] = a30; }
+            if (nq + 1u < rows) { ymm[o + 1u] = a31; }
+            if (nq + 2u < rows) { ymm[o + 2u] = a32; }
+            if (nq + 3u < rows) { ymm[o + 3u] = a33; }
+            if (nq + 4u < rows) { ymm[o + 4u] = a34; }
+            if (nq + 5u < rows) { ymm[o + 5u] = a35; }
+            if (nq + 6u < rows) { ymm[o + 6u] = a36; }
+            if (nq + 7u < rows) { ymm[o + 7u] = a37; }
+        }
+    }
+}
+"#;

@@ -30655,7 +30655,11 @@ pub fn forward_batch_graph_at(
                     } else {
                         encode_q4_tile_mm(c, enc, &c.q4tp_mm, &m.buf, xs, y, rows, cols, k)
                     }
-                } else {
+                } else if !(k > 16
+                    && dense_batch::encode_q4tp_mm_r(c, enc, &m.buf, xs, y, rows, cols, k))
+                {
+                    // `q4tp_mm_r` (same sums to the bit, 64x64 tiles a
+                    // 128-lane group); `CMF_Q4MM_R=0` keeps this one.
                     encode_q4_tile_mm(c, enc, &c.q4tp_mm, &m.buf, xs, y, rows, cols, k)
                 }
             }
