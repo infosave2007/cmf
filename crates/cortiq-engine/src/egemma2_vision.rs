@@ -504,9 +504,11 @@ pub struct DecodedVideo {
 /// * a **`.y4m`** stream is read natively (its own rate, BT.601 YUV → RGB);
 /// * anything else (**mp4, webm, mov, mkv, …**) goes through the `ffmpeg`
 ///   and `ffprobe` executables — decoded to rgb24 and sampled exactly as the
-///   reference's PyAV path (`frames / average_rate` is the duration). There
-///   is no in-process codec: without ffmpeg on `PATH`, pass a frame
-///   directory or a y4m.
+///   reference's PyAV path (`frames / average_rate` is the duration; frames
+///   as stored, no rotation applied). ffmpeg's YUV → RGB rounding differs
+///   from PyAV's by up to 2 levels (cosine 0.9993 against the reference
+///   computed from PyAV's frames). There is no in-process codec: without
+///   ffmpeg on `PATH`, pass a frame directory or a y4m.
 pub fn decode_video(
     path: &Path,
     fps: Option<f64>,
@@ -622,7 +624,9 @@ fn decode_with_ffmpeg(
     let indices = proc.sample_indices(total, Some(fps));
     let last = *indices.last().ok_or("video has no frames")?;
     let mut child = std::process::Command::new("ffmpeg")
-        .args(["-v", "error", "-nostdin", "-i"])
+        // -noautorotate: frames as stored, as PyAV (the reference decoder)
+        // hands them over — a rotation tag is not applied
+        .args(["-v", "error", "-nostdin", "-noautorotate", "-i"])
         .arg(path)
         .args([
             "-map",
