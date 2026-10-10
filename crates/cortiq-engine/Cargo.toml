@@ -26,6 +26,9 @@ minijinja = { workspace = true }
 minijinja-contrib = { workspace = true }
 base64 = { workspace = true }
 rustfft = { workspace = true }
+# EmbeddingGemma 2's f32 GEMMs where Accelerate is not (Linux, Windows):
+# packed AVX/FMA/AVX-512 and NEON kernels, pure Rust.
+matrixmultiply = "0.3.9"
 # DeepSeek-V4.1 image decode/resize and remote image ingress.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 ureq = { version = "2", features = ["tls"] }

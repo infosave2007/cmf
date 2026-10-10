@@ -362,13 +362,111 @@ impl Mat {
         let t0 = std::time::Instant::now();
         let mut out = vec![0f32; n * self.rows()];
         match self {
-            Mat::F32 { w, rows, cols } => {
-                crate::fcd_ops::gemm_nt_host(x, w, &mut out, n, *cols, *rows, pool)
-            }
+            Mat::F32 { w, rows, cols } => gemm_nt(x, w, &mut out, n, *cols, *rows, pool),
             Mat::Q(q) => q.matmat(x, n, &mut out, pool),
         }
         prof::add(&prof::LIN, t0);
         out
+    }
+}
+
+/// Is Apple's Accelerate the f32 GEMM (macOS, unless `CMF_ACCEL=0`)?
+fn accelerate() -> bool {
+    cfg!(target_os = "macos") && std::env::var("CMF_ACCEL").as_deref() != Ok("0")
+}
+
+/// `y[n,m] = x[n,k] · w[m,k]ᵀ`, row-major, f32. Accelerate on macOS;
+/// elsewhere `matrixmultiply`'s packed kernels (AVX/FMA/AVX-512, NEON) on
+/// blocks of the output across the pool — the engine's portable fallback
+/// is a dot product per output (8.6x slower measured on the M4 with
+/// `CMF_ACCEL=0`).
+pub(crate) fn gemm_nt(
+    x: &[f32],
+    w: &[f32],
+    y: &mut [f32],
+    n: usize,
+    k: usize,
+    m: usize,
+    pool: Option<&Pool>,
+) {
+    assert!(x.len() >= n * k && w.len() >= m * k && y.len() >= n * m);
+    if accelerate() {
+        return crate::fcd_ops::gemm_nt_host(x, w, y, n, k, m, pool);
+    }
+    gemm_nt_portable(x, w, y, n, k, m, pool)
+}
+
+/// [`gemm_nt`] without Accelerate (compiled everywhere, so the macOS tests
+/// cover it).
+fn gemm_nt_portable(
+    x: &[f32],
+    w: &[f32],
+    y: &mut [f32],
+    n: usize,
+    k: usize,
+    m: usize,
+    pool: Option<&Pool>,
+) {
+    assert!(x.len() >= n * k && w.len() >= m * k && y.len() >= n * m);
+    if n == 0 || m == 0 {
+        return;
+    }
+    // Row blocks when there are enough rows to share; otherwise blocks of
+    // output columns (a single query's projections).
+    let threads = pool.map(|p| p.n_workers()).unwrap_or(1).max(1);
+    let by_rows = n >= 32 * threads || n >= m;
+    let (len, unit) = if by_rows { (n, 32) } else { (m, 64) };
+    let chunk = len.div_ceil(threads).div_ceil(unit) * unit;
+    let blocks = len.div_ceil(chunk);
+    // the output's address, shared with the workers as an integer
+    let ybase = y.as_mut_ptr() as usize;
+    let run = |b: usize| {
+        let yp = ybase as *mut f32;
+        let (lo, hi) = (b * chunk, ((b + 1) * chunk).min(len));
+        // SAFETY: blocks write disjoint rows (or columns) of y; the strides
+        // describe x[n,k] row-major, wᵀ[k,m] (w row-major) and y[n,m].
+        unsafe {
+            if by_rows {
+                matrixmultiply::sgemm(
+                    hi - lo,
+                    k,
+                    m,
+                    1.0,
+                    x.as_ptr().add(lo * k),
+                    k as isize,
+                    1,
+                    w.as_ptr(),
+                    1,
+                    k as isize,
+                    0.0,
+                    yp.add(lo * m),
+                    m as isize,
+                    1,
+                );
+            } else {
+                matrixmultiply::sgemm(
+                    n,
+                    k,
+                    hi - lo,
+                    1.0,
+                    x.as_ptr(),
+                    k as isize,
+                    1,
+                    w.as_ptr().add(lo * k),
+                    1,
+                    k as isize,
+                    0.0,
+                    yp.add(lo),
+                    m as isize,
+                    1,
+                );
+            }
+        }
+    };
+    if blocks <= 1 {
+        run(0);
+    } else {
+        rows(pool, blocks, &|s, e| (s..e).for_each(run));
     }
 }
 
@@ -597,6 +695,32 @@ pub(crate) fn gelu_mul(a: &mut [f32], b: &[f32], pool: Option<&Pool>) {
 /// `y[n,m] = x[n,k] · w[m,k]ᵀ` where row `r` of `w` starts at `w[r·ldw]`.
 fn gemm_nt_strided(x: &[f32], w: &[f32], ldw: usize, y: &mut [f32], n: usize, k: usize, m: usize) {
     assert!(m == 0 || w.len() >= (m - 1) * ldw + k);
+    assert!(x.len() >= n * k && y.len() >= n * m);
+    if !accelerate() {
+        if n > 0 && m > 0 {
+            // SAFETY: bounds checked above; wᵀ[k,m] has row stride 1 and
+            // column stride ldw
+            unsafe {
+                matrixmultiply::sgemm(
+                    n,
+                    k,
+                    m,
+                    1.0,
+                    x.as_ptr(),
+                    k as isize,
+                    1,
+                    w.as_ptr(),
+                    1,
+                    ldw as isize,
+                    0.0,
+                    y.as_mut_ptr(),
+                    m as isize,
+                    1,
+                );
+            }
+        }
+        return;
+    }
     if ldw == k {
         return crate::fcd_ops::gemm_nt_host(x, &w[..m * k], y, n, k, m, None);
     }
@@ -640,14 +764,6 @@ fn gemm_nt_strided(x: &[f32], w: &[f32], ldw: usize, y: &mut [f32], n: usize, k:
                 m as i32,
             );
         }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let mut wc = vec![0f32; m * k];
-        for r in 0..m {
-            wc[r * k..(r + 1) * k].copy_from_slice(&w[r * ldw..r * ldw + k]);
-        }
-        crate::fcd_ops::gemm_nt_host(x, &wc, y, n, k, m, None);
     }
 }
 
@@ -1332,76 +1448,97 @@ impl EmbeddingGemma2 {
                 }
             });
         }
-        for &(s0, len) in segs.iter().filter(|&&(_, len)| len > SHORT_SEQ) {
-            for kvh in 0..nkv {
-                // this key head's keys [len, hd] and values transposed [hd, len]
-                let mut kh = vec![0f32; len * hd];
-                let mut vt = vec![0f32; hd * len];
-                for t in 0..len {
-                    kh[t * hd..(t + 1) * hd].copy_from_slice(&k[(s0 + t) * kw + kvh * hd..][..hd]);
-                    let vr = &v[(s0 + t) * kw + kvh * hd..][..hd];
-                    for (c, &val) in vr.iter().enumerate() {
-                        vt[c * len + t] = val;
-                    }
-                }
-                for qh in kvh * group..(kvh + 1) * group {
-                    let qblock = if l.window.is_some() {
-                        QBLOCK
-                    } else {
-                        QBLOCK_FULL
-                    };
-                    let mut qb = vec![0f32; qblock.min(len) * hd];
-                    let mut i0 = 0usize;
-                    while i0 < len {
-                        let i1 = (i0 + qblock).min(len);
-                        let nb = i1 - i0;
-                        let (k0, k1) = match l.window {
-                            Some(w) => (i0.saturating_sub(w), (i1 - 1 + w + 1).min(len)),
-                            None => (0, len),
-                        };
-                        let kr = k1 - k0;
-                        for i in 0..nb {
-                            qb[i * hd..(i + 1) * hd]
-                                .copy_from_slice(&q[(s0 + i0 + i) * qw + qh * hd..][..hd]);
-                        }
-                        let mut sc = vec![0f32; nb * kr];
-                        crate::fcd_ops::gemm_nt_host(
-                            &qb[..nb * hd],
-                            &kh[k0 * hd..k1 * hd],
-                            &mut sc,
-                            nb,
-                            hd,
-                            kr,
-                            None,
-                        );
-                        // softmax over each row's allowed span; zero outside
-                        let sp = Shared(sc.as_mut_ptr());
-                        let window = l.window;
-                        rows(pool, nb, &|s, e| {
-                            for i in s..e {
-                                let row = unsafe { sp.at(i * kr, kr) };
-                                let qi = i0 + i;
-                                let (lo, hi) = match window {
-                                    Some(w) => (qi.saturating_sub(w), (qi + w + 1).min(len)),
-                                    None => (0, len),
-                                };
-                                let (lo, hi) = (lo - k0, hi - k0);
-                                softmax(&mut row[lo..hi]);
-                                row[..lo].iter_mut().for_each(|x| *x = 0.0);
-                                row[hi..].iter_mut().for_each(|x| *x = 0.0);
-                            }
-                        });
-                        // P · V over V's columns k0..k1 (rows of `vt`, stride len)
-                        let mut ob = vec![0f32; nb * hd];
-                        gemm_nt_strided(&sc, &vt[k0..], len, &mut ob, nb, kr, hd);
-                        for i in 0..nb {
-                            out[(s0 + i0 + i) * qw + qh * hd..][..hd]
-                                .copy_from_slice(&ob[i * hd..(i + 1) * hd]);
-                        }
-                        i0 = i1;
-                    }
+        // Long sequences: per (sequence, key head), blocked GEMMs. With
+        // Accelerate one item at a time, its GEMMs and the softmax rows on
+        // the pool; with the portable GEMM (single-threaded per call) the
+        // items themselves go across the pool.
+        let long: Vec<(usize, usize, usize)> = segs
+            .iter()
+            .filter(|&&(_, len)| len > SHORT_SEQ)
+            .flat_map(|&(s0, len)| (0..nkv).map(move |kvh| (s0, len, kvh)))
+            .collect();
+        let op = Shared(out.as_mut_ptr());
+        let (q, k, v) = (&q, &k, &v);
+        let window = l.window;
+        let attend = |s0: usize, len: usize, kvh: usize, inner: Option<&Pool>| {
+            // this key head's keys [len, hd] and values transposed [hd, len]
+            let mut kh = vec![0f32; len * hd];
+            let mut vt = vec![0f32; hd * len];
+            for t in 0..len {
+                kh[t * hd..(t + 1) * hd].copy_from_slice(&k[(s0 + t) * kw + kvh * hd..][..hd]);
+                let vr = &v[(s0 + t) * kw + kvh * hd..][..hd];
+                for (c, &val) in vr.iter().enumerate() {
+                    vt[c * len + t] = val;
                 }
             }
+            let qblock = if window.is_some() {
+                QBLOCK
+            } else {
+                QBLOCK_FULL
+            };
+            let mut qb = vec![0f32; qblock.min(len) * hd];
+            for qh in kvh * group..(kvh + 1) * group {
+                let mut i0 = 0usize;
+                while i0 < len {
+                    let i1 = (i0 + qblock).min(len);
+                    let nb = i1 - i0;
+                    let (k0, k1) = match window {
+                        Some(w) => (i0.saturating_sub(w), (i1 - 1 + w + 1).min(len)),
+                        None => (0, len),
+                    };
+                    let kr = k1 - k0;
+                    for i in 0..nb {
+                        qb[i * hd..(i + 1) * hd]
+                            .copy_from_slice(&q[(s0 + i0 + i) * qw + qh * hd..][..hd]);
+                    }
+                    let mut sc = vec![0f32; nb * kr];
+                    gemm_nt(
+                        &qb[..nb * hd],
+                        &kh[k0 * hd..k1 * hd],
+                        &mut sc,
+                        nb,
+                        hd,
+                        kr,
+                        None,
+                    );
+                    // softmax over each row's allowed span; zero outside
+                    let sp = Shared(sc.as_mut_ptr());
+                    rows(inner, nb, &|s, e| {
+                        for i in s..e {
+                            let row = unsafe { sp.at(i * kr, kr) };
+                            let qi = i0 + i;
+                            let (lo, hi) = match window {
+                                Some(w) => (qi.saturating_sub(w), (qi + w + 1).min(len)),
+                                None => (0, len),
+                            };
+                            let (lo, hi) = (lo - k0, hi - k0);
+                            softmax(&mut row[lo..hi]);
+                            row[..lo].iter_mut().for_each(|x| *x = 0.0);
+                            row[hi..].iter_mut().for_each(|x| *x = 0.0);
+                        }
+                    });
+                    // P · V over V's columns k0..k1 (rows of `vt`, stride len)
+                    let mut ob = vec![0f32; nb * hd];
+                    gemm_nt_strided(&sc, &vt[k0..], len, &mut ob, nb, kr, hd);
+                    for i in 0..nb {
+                        // SAFETY: (row, q head) slices are disjoint across items
+                        let o = unsafe { op.at((s0 + i0 + i) * qw + qh * hd, hd) };
+                        o.copy_from_slice(&ob[i * hd..(i + 1) * hd]);
+                    }
+                    i0 = i1;
+                }
+            }
+        };
+        if accelerate() || long.len() < 2 {
+            for &(s0, len, kvh) in &long {
+                attend(s0, len, kvh, pool);
+            }
+        } else {
+            rows(pool, long.len(), &|s, e| {
+                for &(s0, len, kvh) in &long[s..e] {
+                    attend(s0, len, kvh, None);
+                }
+            });
         }
         prof::add(&prof::ATTN, t_core);
         l.o.apply(&out, n, pool)
@@ -1429,6 +1566,59 @@ mod tests {
         assert_eq!(matryoshka(&v, 768).unwrap(), v);
         assert!(matryoshka(&v, 300).is_err());
         assert!(matryoshka(&v[..256], 512).is_err());
+    }
+
+    /// The portable GEMM (row blocks, column blocks, one block, strided)
+    /// against a plain triple loop.
+    #[test]
+    fn portable_gemm_matches_naive() {
+        let pool = crate::pool::Pool::new(4);
+        let mut st = 7u64;
+        let mut rnd = || {
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((st >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+        };
+        for (n, k, m) in [
+            (1, 512, 1024),
+            (3, 64, 200),
+            (300, 96, 70),
+            (517, 33, 129),
+            (64, 512, 512),
+        ] {
+            let x: Vec<f32> = (0..n * k).map(|_| rnd()).collect();
+            let w: Vec<f32> = (0..m * k).map(|_| rnd()).collect();
+            let mut want = vec![0f32; n * m];
+            for i in 0..n {
+                for j in 0..m {
+                    want[i * m + j] = (0..k)
+                        .map(|t| x[i * k + t] as f64 * w[j * k + t] as f64)
+                        .sum::<f64>() as f32;
+                }
+            }
+            for p in [None, Some(&pool)] {
+                let mut y = vec![f32::NAN; n * m];
+                gemm_nt_portable(&x, &w, &mut y, n, k, m, p);
+                let err = y
+                    .iter()
+                    .zip(&want)
+                    .fold(0f32, |a, (g, w)| a.max((g - w).abs()));
+                assert!(err < 1e-4, "{n}x{k}x{m}: {err}");
+            }
+        }
+        // strided rows of w (an attention head inside a wider row)
+        let (n, k, m, ldw) = (5usize, 16usize, 7usize, 40usize);
+        let x: Vec<f32> = (0..n * k).map(|_| rnd()).collect();
+        let w: Vec<f32> = (0..m * ldw).map(|_| rnd()).collect();
+        let mut y = vec![0f32; n * m];
+        gemm_nt_strided(&x, &w, ldw, &mut y, n, k, m);
+        for i in 0..n {
+            for j in 0..m {
+                let r: f32 = (0..k).map(|t| x[i * k + t] * w[j * ldw + t]).sum();
+                assert!((y[i * m + j] - r).abs() < 1e-5);
+            }
+        }
     }
 
     #[test]

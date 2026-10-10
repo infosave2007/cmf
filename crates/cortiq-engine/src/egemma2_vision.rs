@@ -1341,21 +1341,36 @@ fn sgemm_view_portable(
     n: usize,
     k: usize,
 ) {
-    let mut ac = vec![0f32; m * k];
-    for r in 0..m {
-        ac[r * k..(r + 1) * k].copy_from_slice(&a[r * lda..r * lda + k]);
+    if m == 0 || n == 0 {
+        return;
     }
-    // the portable GEMM takes B as [n×k]
-    let mut bc = vec![0f32; n * k];
-    for r in 0..n {
-        for j in 0..k {
-            bc[r * k + j] = if bt { b[r * ldb + j] } else { b[j * ldb + r] };
-        }
-    }
-    let mut cc = vec![0f32; m * n];
-    crate::fcd_ops::gemm_nt_host(&ac, &bc, &mut cc, m, k, n, None);
-    for r in 0..m {
-        c[r * ldc..r * ldc + n].copy_from_slice(&cc[r * n..(r + 1) * n]);
+    assert!(a.len() >= (m - 1) * lda + k && c.len() >= (m - 1) * ldc + n);
+    // B as the [k×n] operand: Bᵀ's (j, r) is b[r·ldb + j], B's is b[j·ldb + r]
+    let (rsb, csb) = if bt {
+        assert!(b.len() >= (n - 1) * ldb + k);
+        (1isize, ldb as isize)
+    } else {
+        assert!(k == 0 || b.len() >= (k - 1) * ldb + n);
+        (ldb as isize, 1isize)
+    };
+    // SAFETY: every view was bounds-checked above
+    unsafe {
+        matrixmultiply::sgemm(
+            m,
+            k,
+            n,
+            1.0,
+            a.as_ptr(),
+            lda as isize,
+            1,
+            b.as_ptr(),
+            rsb,
+            csb,
+            0.0,
+            c.as_mut_ptr(),
+            ldc as isize,
+            1,
+        );
     }
 }
 
