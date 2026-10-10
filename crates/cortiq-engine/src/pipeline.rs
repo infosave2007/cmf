@@ -3496,7 +3496,23 @@ impl Pipeline {
                 .layers
                 .iter()
                 .any(|lw| matches!(&lw.ffn, FfnKind::Moe(_)));
-            return if moe { 32 } else { 128 };
+            // q8_2f experts (moe_q82's grouped prefill) read each expert
+            // once per group of up to 16 of its entries, so the chunk that
+            // fills those groups is the faster ingest: Mellum2.1 q8_2f on an
+            // RTX 3090, 4000-token prompt, 503 tok/s at 64 rows, 542 at 128
+            // (and 542 at 256).
+            let q82 = crate::gpu::moe_q82_graph_on()
+                && self.weights.layers.iter().any(|lw| {
+                    matches!(&lw.ffn, FfnKind::Moe(m)
+                        if m.experts.first().is_some_and(|e| e.gate_proj.mapped_q8_2f().is_some()))
+                });
+            return if q82 {
+                128
+            } else if moe {
+                32
+            } else {
+                128
+            };
         }
         0
     }
@@ -11337,6 +11353,8 @@ impl Pipeline {
                     // The mixed 2-bit profile: q2tp gate/up over a q4tp
                     // down. Uniform across the layer, like `q4tp` itself.
                     let mut gu_q2: Option<bool> = None;
+                    // q8_2f experts (gate, up and down): their own kernels.
+                    let mut q82: Option<bool> = None;
                     for e in m.experts.iter().chain(shared.map(|(se, _)| se)) {
                         if !matches!(e.act, Act::Silu)
                             || e.gate_proj.rows() != inter
@@ -11366,12 +11384,13 @@ impl Pipeline {
                                 return None;
                             }
                         }
-                        let (mm, gi, ui, di, is_p, is_q2) = match e.gate_proj.mapped_q4t() {
+                        let (mm, gi, ui, di, is_p, is_q2, is_8) = match e.gate_proj.mapped_q4t() {
                             Some((mm, gi)) => (
                                 mm,
                                 gi,
                                 e.up_proj.mapped_q4t()?.1,
                                 e.down_proj.mapped_q4t()?.1,
+                                false,
                                 false,
                                 false,
                             ),
@@ -11383,21 +11402,41 @@ impl Pipeline {
                                     e.down_proj.mapped_q4tp()?.1,
                                     true,
                                     true,
+                                    false,
                                 ),
-                                None => {
-                                    let (mm, gi) = e.gate_proj.mapped_q4tp()?;
-                                    (
+                                None => match e.gate_proj.mapped_q4tp() {
+                                    Some((mm, gi)) => (
                                         mm,
                                         gi,
                                         e.up_proj.mapped_q4tp()?.1,
                                         e.down_proj.mapped_q4tp()?.1,
                                         true,
                                         false,
-                                    )
-                                }
+                                        false,
+                                    ),
+                                    // q8_2f experts: all three projections,
+                                    // each with its own column field.
+                                    None => {
+                                        if !crate::gpu::moe_q82_graph_on() {
+                                            return None;
+                                        }
+                                        let (mm, gi) = e.gate_proj.mapped_q8_2f()?;
+                                        (
+                                            mm,
+                                            gi,
+                                            e.up_proj.mapped_q8_2f()?.1,
+                                            e.down_proj.mapped_q8_2f()?.1,
+                                            false,
+                                            false,
+                                            true,
+                                        )
+                                    }
+                                },
                             },
                         };
-                        if *q4tp.get_or_insert(is_p) != is_p || *gu_q2.get_or_insert(is_q2) != is_q2
+                        if *q4tp.get_or_insert(is_p) != is_p
+                            || *gu_q2.get_or_insert(is_q2) != is_q2
+                            || *q82.get_or_insert(is_8) != is_8
                         {
                             // The shared expert rides in the same packed
                             // buffer as the routed ones, so a layer that
@@ -11405,7 +11444,7 @@ impl Pipeline {
                             // Say so: the symptom is a whole model quietly
                             // running its MoE on the CPU.
                             tracing::warn!(
-                                "MoE layer mixes expert layouts (q4tp={is_p}, q2tp gate/up={is_q2})                                  — every expert of a layer, INCLUDING the shared one, must share                                  a layout. The whole-token graph declines this layer."
+                                "MoE layer mixes expert layouts (q4tp={is_p}, q2tp gate/up={is_q2}, q8_2f={is_8})                                  — every expert of a layer, INCLUDING the shared one, must share                                  a layout. The whole-token graph declines this layer."
                             );
                             return None;
                         }
@@ -11431,6 +11470,7 @@ impl Pipeline {
                         norm_topk: m.norm_topk_prob,
                         q4tp: q4tp?,
                         gu_q2: gu_q2.unwrap_or(false),
+                        q82: q82.unwrap_or(false),
                         sigmoid: m.router_sigmoid,
                         bias: m.expert_bias.as_deref(),
                         has_shared,
@@ -13268,6 +13308,7 @@ impl Pipeline {
                         let mut experts = Vec::with_capacity(m.experts.len() + 1);
                         let mut q4tp: Option<bool> = None;
                         let mut gu_q2: Option<bool> = None;
+                        let mut q82: Option<bool> = None;
                         for e in m.experts.iter().chain(shared.map(|(se, _)| se)) {
                             if !matches!(e.act, Act::Silu)
                                 || e.gate_proj.rows() != inter
@@ -13277,13 +13318,15 @@ impl Pipeline {
                             }
                             // Same ladder as the token graph: q4t → q2tp
                             // (mixed profile: 2-bit gate/up over a q4tp
-                            // down) → q4tp. Uniform across the layer.
-                            let (mm, gi, ui, di, is_p, is_q2) = match e.gate_proj.mapped_q4t() {
+                            // down) → q4tp → q8_2f. Uniform across the layer.
+                            let (mm, gi, ui, di, is_p, is_q2, is_8) = match e.gate_proj.mapped_q4t()
+                            {
                                 Some((mm, gi)) => (
                                     mm,
                                     gi,
                                     e.up_proj.mapped_q4t()?.1,
                                     e.down_proj.mapped_q4t()?.1,
+                                    false,
                                     false,
                                     false,
                                 ),
@@ -13295,22 +13338,39 @@ impl Pipeline {
                                         e.down_proj.mapped_q4tp()?.1,
                                         true,
                                         true,
+                                        false,
                                     ),
-                                    None => {
-                                        let (mm, gi) = e.gate_proj.mapped_q4tp()?;
-                                        (
+                                    None => match e.gate_proj.mapped_q4tp() {
+                                        Some((mm, gi)) => (
                                             mm,
                                             gi,
                                             e.up_proj.mapped_q4tp()?.1,
                                             e.down_proj.mapped_q4tp()?.1,
                                             true,
                                             false,
-                                        )
-                                    }
+                                            false,
+                                        ),
+                                        None => {
+                                            if !crate::gpu::moe_q82_graph_on() {
+                                                return None;
+                                            }
+                                            let (mm, gi) = e.gate_proj.mapped_q8_2f()?;
+                                            (
+                                                mm,
+                                                gi,
+                                                e.up_proj.mapped_q8_2f()?.1,
+                                                e.down_proj.mapped_q8_2f()?.1,
+                                                false,
+                                                false,
+                                                true,
+                                            )
+                                        }
+                                    },
                                 },
                             };
                             if *q4tp.get_or_insert(is_p) != is_p
                                 || *gu_q2.get_or_insert(is_q2) != is_q2
+                                || *q82.get_or_insert(is_8) != is_8
                             {
                                 return None;
                             }
@@ -13337,6 +13397,7 @@ impl Pipeline {
                             norm_topk: m.norm_topk_prob,
                             q4tp: q4tp?,
                             gu_q2: gu_q2.unwrap_or(false),
+                            q82: q82.unwrap_or(false),
                             sigmoid: m.router_sigmoid,
                             bias: m.expert_bias.as_deref(),
                             has_shared,
