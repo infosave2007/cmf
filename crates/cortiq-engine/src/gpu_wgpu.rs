@@ -28552,7 +28552,17 @@ pub fn forward_token_graph(
                     // The select reads a separately computed shared gate only
                     // for a gated shared expert whose gate is not f32.
                     let need_sg = !fold && *has_shared && *shared_gated && sgate.kind != 4;
-                    let pr = prep(router, &n1, mlogit, *n_exp, hidden);
+                    // f32 router: the warp-a-row kernel of the same module.
+                    let rt = if router.kind == 4 {
+                        moe_q82::router_job(c, &d8, &router.buf, &n1, mlogit, *n_exp, hidden)
+                    } else {
+                        None
+                    };
+                    let pr = if rt.is_some() {
+                        None
+                    } else {
+                        prep(router, &n1, mlogit, *n_exp, hidden)
+                    };
                     let ps = if need_sg {
                         prep(sgate, &n1, mslog, 1, hidden)
                     } else {
@@ -28589,7 +28599,8 @@ pub fn forward_token_graph(
                             &[mlogit, mslog, msel, mwt, &sel_u, &sgate.buf, &n1, &bias_buf],
                         )
                     });
-                    if pr.is_none() || (need_sg && ps.is_none()) {
+                    let router_own = rt.is_none() && pr.is_none();
+                    if router_own || (need_sg && ps.is_none()) {
                         // An un-preppable router or gate dtype: own passes,
                         // after the FFN norm they read.
                         if let Some((p, b, w)) = ffn_pre.take() {
@@ -28598,7 +28609,7 @@ pub fn forward_token_graph(
                             pass.set_bind_group(0, &b, &[]);
                             pass.dispatch_workgroups(w, 1, 1);
                         }
-                        if pr.is_none() {
+                        if router_own {
                             emat(&mut enc, router, &n1, mlogit, *n_exp, hidden);
                         }
                         if need_sg && ps.is_none() {
@@ -28613,8 +28624,12 @@ pub fn forward_token_graph(
                     }
                     let fine = ts_full || li == 0;
                     tsp!(pass, fine, 30);
-                    if let Some((p, b, w)) = &pr {
-                        if !skip_router {
+                    if !skip_router {
+                        if let Some((b, n)) = &rt {
+                            pass.set_pipeline(&d8.rt);
+                            pass.set_bind_group(0, b, &[]);
+                            pass.dispatch_workgroups(*n, 1, 1);
+                        } else if let Some((p, b, w)) = &pr {
                             pass.set_pipeline(p);
                             pass.set_bind_group(0, b, &[]);
                             pass.dispatch_workgroups(*w, 1, 1);
