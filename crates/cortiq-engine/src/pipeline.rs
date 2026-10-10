@@ -3496,7 +3496,22 @@ impl Pipeline {
                 .layers
                 .iter()
                 .any(|lw| matches!(&lw.ffn, FfnKind::Moe(_)));
-            return if moe { 32 } else { 128 };
+            // q8_2f experts (moe_q82's grouped prefill) read each expert
+            // once per group of up to 16 of its entries, so the chunk that
+            // fills those groups is the faster ingest: Mellum2.1 q8_2f on an
+            // RTX 3090, 4000-token prompt, 359 tok/s at 32 rows.
+            let q82 = crate::gpu::moe_q82_graph_on()
+                && self.weights.layers.iter().any(|lw| {
+                    matches!(&lw.ffn, FfnKind::Moe(m)
+                        if m.experts.first().is_some_and(|e| e.gate_proj.mapped_q8_2f().is_some()))
+                });
+            return if q82 {
+                128
+            } else if moe {
+                32
+            } else {
+                128
+            };
         }
         0
     }

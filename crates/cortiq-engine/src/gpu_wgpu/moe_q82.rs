@@ -26,8 +26,19 @@
 
 use super::*;
 
-/// Prefill entries per workgroup.
-pub(crate) const NT: usize = 8;
+/// Prefill entries per workgroup (`CMF_M8_NT`: 4, 8, 16 or 32). Every
+/// workgroup streams its expert's rows once, so the expert's bytes are read
+/// once per group of entries.
+fn nt() -> usize {
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("CMF_M8_NT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| matches!(v, 4 | 8 | 16 | 32))
+            .unwrap_or(16)
+    })
+}
 /// Prefill column tile, in 32-bit words (four columns each).
 const TW: usize = 32;
 
@@ -148,26 +159,11 @@ fn m8_gu(@builtin(workgroup_id) wid: vec3<u32>,
         let w0 = gb + r * hv4;
         var ag = 0.0;
         var au = 0.0;
-        var k = lane;
-        loop {
-            if (k + 2u * ssz >= hv4) { break; }
-            let a0 = g8_gw[w0 + k];
-            let a1 = g8_gw[w0 + k + ssz];
-            let a2 = g8_gw[w0 + k + 2u * ssz];
-            let b0 = g8_uw[w0 + k];
-            let b1 = g8_uw[w0 + k + ssz];
-            let b2 = g8_uw[w0 + k + 2u * ssz];
-            ag = ag + dot(q8x4(a0), g8_xg[k]) + dot(q8x4(a1), g8_xg[k + ssz])
-                    + dot(q8x4(a2), g8_xg[k + 2u * ssz]);
-            au = au + dot(q8x4(b0), g8_xu[k]) + dot(q8x4(b1), g8_xu[k + ssz])
-                    + dot(q8x4(b2), g8_xu[k + 2u * ssz]);
-            k = k + 3u * ssz;
-        }
-        loop {
-            if (k >= hv4) { break; }
-            ag = ag + dot(q8x4(g8_gw[w0 + k]), g8_xg[k]);
-            au = au + dot(q8x4(g8_uw[w0 + k]), g8_xu[k]);
-            k = k + ssz;
+        // {UG} words of gate and of up a lane per pass, all loads issued
+        // before the first dot; each lane still sums its words in order.
+        for (var kb = 0u; kb < hv4; kb = kb + {UG}u * ssz) {
+{GU_LOAD}
+{GU_DOT}
         }
         let tg = subgroupAdd(ag);
         let tu = subgroupAdd(au);
@@ -269,33 +265,57 @@ fn m8_dn(@builtin(workgroup_id) wid: vec3<u32>,
         let r = select(rows - 1u, row, live);
         let odd = (r & 1u) == 1u;
         var acc = 0.0;
-        for (var s = 0u; s < d8_p.slots; s = s + 1u) {
-            let base = d8_ss[s] * d8_p.dsw;
-            let w0 = base + r * iv4;
-            let a0 = s * iv4;
-            var part = 0.0;
-            var k = lane;
-            loop {
-                if (k + 3u * ssz >= iv4) { break; }
-                let p0 = d8_w[w0 + k];
-                let p1 = d8_w[w0 + k + ssz];
-                let p2 = d8_w[w0 + k + 2u * ssz];
-                let p3 = d8_w[w0 + k + 3u * ssz];
-                part = part + dot(q8x4(p0), d8_act[a0 + k]) + dot(q8x4(p1), d8_act[a0 + k + ssz])
-                            + dot(q8x4(p2), d8_act[a0 + k + 2u * ssz])
-                            + dot(q8x4(p3), d8_act[a0 + k + 3u * ssz]);
-                k = k + 4u * ssz;
+        // Two slots at a time, {UD} words of each a lane per pass, all
+        // loads issued before the first dot; per lane the words of a slot
+        // still sum in order and the slots fold into `acc` in slot order.
+        for (var s = 0u; s < d8_p.slots; s = s + 2u) {
+            let s1 = min(s + 1u, d8_p.slots - 1u);
+            let b0 = d8_ss[s] * d8_p.dsw;
+            let b1 = d8_ss[s1] * d8_p.dsw;
+            let w0 = b0 + r * iv4;
+            let w1 = b1 + r * iv4;
+            let x0 = s * iv4;
+            let x1 = s1 * iv4;
+            var p0 = 0.0;
+            var p1 = 0.0;
+            for (var kb = 0u; kb < iv4; kb = kb + {UD}u * ssz) {
+{DN_LOAD}
+{DN_DOT}
             }
-            loop {
-                if (k >= iv4) { break; }
-                part = part + dot(q8x4(d8_w[w0 + k]), d8_act[a0 + k]);
-                k = k + ssz;
+            acc = acc + (d8_sw[s] * h2(d8_w[b0 + qw + (r >> 1u)], odd)) * p0;
+            if (s + 1u < d8_p.slots) {
+                acc = acc + (d8_sw[s1] * h2(d8_w[b1 + qw + (r >> 1u)], odd)) * p1;
             }
-            acc = acc + (d8_sw[s] * h2(d8_w[base + qw + (r >> 1u)], odd)) * part;
         }
         let t = subgroupAdd(acc);
         if (lane == 0u && live) { d8_y[row] = t; }
     }
+}
+
+// ── f32 router logits, one 32-lane workgroup a row ──
+// `f32_matvec` walks a row with one dependent load a step (~18 us a layer
+// for 64 x 2304 on an RTX 3090); here every lane issues its vec4 loads
+// before the first dot.
+struct RtP { rows: u32, cols: u32, _a: u32, _b: u32 };
+@group(0) @binding(16) var<storage, read>       r8_w : array<vec4<f32>>;
+@group(0) @binding(17) var<storage, read>       r8_x : array<vec4<f32>>;
+@group(0) @binding(18) var<storage, read_write> r8_y : array<f32>;
+@group(0) @binding(19) var<uniform>             r8_p : RtP;
+
+@compute @workgroup_size(32)
+fn m8_rt(@builtin(workgroup_id) wid: vec3<u32>,
+         @builtin(subgroup_invocation_id) lane: u32,
+         @builtin(subgroup_size) ssz: u32) {
+    let row = wid.x;
+    let c4 = r8_p.cols >> 2u;
+    let b = row * c4;
+    var acc = 0.0;
+    for (var kb = 0u; kb < c4; kb = kb + {UR}u * ssz) {
+{RT_LOAD}
+{RT_DOT}
+    }
+    let t = subgroupAdd(acc);
+    if (lane == 0u) { r8_y[row] = t; }
 }
 "#;
 
@@ -448,14 +468,17 @@ fn prefill_wgsl() -> String {
         String::new(),
         String::new(),
     );
-    for j in 0..NT {
+    let nt = nt();
+    // The entry count is workgroup-uniform: an entry past it costs nothing
+    // (at a 32-token chunk an expert holds about four of the eight).
+    for j in 0..nt {
         gi.push_str(&format!(
             "    let e{j} = pg_ent[beg + min({j}u, nt - 1u)];\n    var ag{j} = 0.0; var au{j} = 0.0;\n"
         ));
         let sg = j * 2 * TW;
         let su = sg + TW;
         gb.push_str(&format!(
-            "            ag{j} = ag{j} + dot(g0, pg_s[{sg}u + so]) + dot(g1, pg_s[{sg}u + so + 1u])\n                  + dot(g2, pg_s[{sg}u + so + 2u]) + dot(g3, pg_s[{sg}u + so + 3u]);\n            au{j} = au{j} + dot(u0, pg_s[{su}u + so]) + dot(u1, pg_s[{su}u + so + 1u])\n                  + dot(u2, pg_s[{su}u + so + 2u]) + dot(u3, pg_s[{su}u + so + 3u]);\n"
+            "            if ({j}u < nt) {{\n            ag{j} = ag{j} + dot(g0, pg_s[{sg}u + so]) + dot(g1, pg_s[{sg}u + so + 1u])\n                  + dot(g2, pg_s[{sg}u + so + 2u]) + dot(g3, pg_s[{sg}u + so + 3u]);\n            au{j} = au{j} + dot(u0, pg_s[{su}u + so]) + dot(u1, pg_s[{su}u + so + 1u])\n                  + dot(u2, pg_s[{su}u + so + 2u]) + dot(u3, pg_s[{su}u + so + 3u]);\n            }}\n"
         ));
         go.push_str(&format!(
             "        if ({j}u < nt) {{ let gg = ag{j} * gs; let uu = au{j} * us; pg_act[e{j} * rows + row] = ((gg / (1.0 + exp(-gg))) * uu) * dc; }}\n"
@@ -465,7 +488,7 @@ fn prefill_wgsl() -> String {
         ));
         let sd = j * TW;
         dbody.push_str(&format!(
-            "            ac{j} = ac{j} + dot(a0, pd_s[{sd}u + so]) + dot(a1, pd_s[{sd}u + so + 1u])\n                  + dot(a2, pd_s[{sd}u + so + 2u]) + dot(a3, pd_s[{sd}u + so + 3u]);\n"
+            "            if ({j}u < nt) {{ ac{j} = ac{j} + dot(a0, pd_s[{sd}u + so]) + dot(a1, pd_s[{sd}u + so + 1u])\n                  + dot(a2, pd_s[{sd}u + so + 2u]) + dot(a3, pd_s[{sd}u + so + 3u]); }}\n"
         ));
         dout.push_str(&format!(
             "        if ({j}u < nt) {{ pd_y[e{j} * rows + row] = ac{j} * sc; }}\n"
@@ -478,20 +501,75 @@ fn prefill_wgsl() -> String {
         .replace("{DN_INIT}", &di)
         .replace("{DN_BODY}", &dbody)
         .replace("{DN_OUT}", &dout)
-        .replace("{NT2TW}", &(NT * 2 * TW).to_string())
-        .replace("{NTTW}", &(NT * TW).to_string())
+        .replace("{NT2TW}", &(nt * 2 * TW).to_string())
+        .replace("{NTTW}", &(nt * TW).to_string())
         .replace("{TW2}", &(2 * TW).to_string())
         .replace("{TW4}", &(TW / 4).to_string())
         .replace("{TW}", &TW.to_string())
-        .replace("{NT}", &NT.to_string());
+        .replace("{NT}", &nt.to_string());
     format!("{COMMON_WGSL}{body}")
 }
 
+/// Words a lane issues per pass: gate/up (`CMF_M8_UGU`), down
+/// (`CMF_M8_UDN`, per slot of a pair) and router vec4s (`CMF_M8_URT`).
+fn unroll(key: &str, def: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| (1..=32).contains(v))
+        .unwrap_or(def)
+}
+fn unrolls() -> (usize, usize, usize) {
+    static V: OnceLock<(usize, usize, usize)> = OnceLock::new();
+    *V.get_or_init(|| (unroll("CMF_M8_UGU", 6), unroll("CMF_M8_UDN", 8), unroll("CMF_M8_URT", 6)))
+}
+
 fn decode_wgsl(hidden: usize) -> String {
-    format!(
-        "{COMMON_WGSL}{}",
-        DECODE_WGSL.replace("{HV4}", &(hidden / 4).to_string())
-    )
+    let (ug, ud, ur) = unrolls();
+    let (mut gl, mut gd, mut dl, mut dd, mut rl, mut rd) = (
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+    );
+    for j in 0..ug {
+        gl.push_str(&format!(
+            "            let k{j} = kb + lane + {j}u * ssz;\n            let a{j} = g8_gw[w0 + k{j}];\n            let b{j} = g8_uw[w0 + k{j}];\n"
+        ));
+        gd.push_str(&format!(
+            "            if (k{j} < hv4) {{ ag = ag + dot(q8x4(a{j}), g8_xg[k{j}]); au = au + dot(q8x4(b{j}), g8_xu[k{j}]); }}\n"
+        ));
+    }
+    for j in 0..ud {
+        dl.push_str(&format!(
+            "                let k{j} = kb + lane + {j}u * ssz;\n                let c{j} = d8_w[w0 + k{j}];\n                let e{j} = d8_w[w1 + k{j}];\n"
+        ));
+        dd.push_str(&format!(
+            "                if (k{j} < iv4) {{ p0 = p0 + dot(q8x4(c{j}), d8_act[x0 + k{j}]); p1 = p1 + dot(q8x4(e{j}), d8_act[x1 + k{j}]); }}\n"
+        ));
+    }
+    for j in 0..ur {
+        rl.push_str(&format!(
+            "        let k{j} = kb + lane + {j}u * ssz;\n        let w{j} = r8_w[b + k{j}];\n        let x{j} = r8_x[k{j}];\n"
+        ));
+        rd.push_str(&format!(
+            "        if (k{j} < c4) {{ acc = acc + dot(w{j}, x{j}); }}\n"
+        ));
+    }
+    let body = DECODE_WGSL
+        .replace("{HV4}", &(hidden / 4).to_string())
+        .replace("{GU_LOAD}", &gl)
+        .replace("{GU_DOT}", &gd)
+        .replace("{DN_LOAD}", &dl)
+        .replace("{DN_DOT}", &dd)
+        .replace("{RT_LOAD}", &rl)
+        .replace("{RT_DOT}", &rd)
+        .replace("{UG}", &ug.to_string())
+        .replace("{UD}", &ud.to_string())
+        .replace("{UR}", &ur.to_string());
+    format!("{COMMON_WGSL}{body}")
 }
 
 type Pl = (wgpu::ComputePipeline, wgpu::BindGroupLayout);
@@ -535,6 +613,8 @@ pub(crate) struct Dec {
     gu_l: wgpu::BindGroupLayout,
     pub(crate) dn: wgpu::ComputePipeline,
     dn_l: wgpu::BindGroupLayout,
+    pub(crate) rt: wgpu::ComputePipeline,
+    rt_l: wgpu::BindGroupLayout,
 }
 
 pub(crate) struct Pre {
@@ -561,12 +641,13 @@ pub(crate) fn decode(c: &Ctx, hidden: usize) -> Option<Arc<Dec>> {
     let v = (sg32(c)
         && hidden % 16 == 0
         && smem as u32 <= c.device.limits().max_compute_workgroup_storage_size)
-        .then(|| build(c, "cmf-moe-q82", &decode_wgsl(hidden), &["m8_gu", "m8_dn"]))
+        .then(|| build(c, "cmf-moe-q82", &decode_wgsl(hidden), &["m8_gu", "m8_dn", "m8_rt"]))
         .flatten()
         .map(|mut v| {
+            let (rt, rt_l) = v.pop().unwrap();
             let (dn, dn_l) = v.pop().unwrap();
             let (gu, gu_l) = v.pop().unwrap();
-            Arc::new(Dec { gu, gu_l, dn, dn_l })
+            Arc::new(Dec { gu, gu_l, dn, dn_l, rt, rt_l })
         });
     m.insert(key, v.clone());
     v
@@ -686,6 +767,30 @@ pub(crate) fn decode_job(
     }
 }
 
+/// The warp-a-row f32 router (`CMF_M8_ROUTER=0` keeps `f32_matvec`):
+/// bind group and grid, or None when the router is outside it (cols % 4).
+pub(crate) fn router_job(
+    c: &Ctx,
+    d: &Dec,
+    w: &wgpu::Buffer,
+    x: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+) -> Option<(wgpu::BindGroup, u32)> {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("CMF_M8_ROUTER").as_deref() != Ok("0"))
+        || cols % 4 != 0
+        || rows == 0
+        || rows as u32 > MAX_WG
+    {
+        return None;
+    }
+    let u = uniform_u32x4(c, [rows as u32, cols as u32, 0, 0]);
+    let bg = bind_pairs(c, &d.rt_l, &[(16, w), (17, x), (18, y), (19, &u)]);
+    Some((bg, rows as u32))
+}
+
 /// One prefill layer's grouped bindings and grids (z = entry groups).
 pub(crate) struct PrefillJob {
     pub(crate) gu_bg: wgpu::BindGroup,
@@ -742,7 +847,7 @@ pub(crate) fn prefill_job(
             (16, &u),
         ],
     );
-    let z = k.div_ceil(NT) as u32;
+    let z = k.div_ceil(nt()) as u32;
     PrefillJob {
         gu_bg,
         dn_bg,
