@@ -371,7 +371,7 @@ impl Mat {
 }
 
 /// Is Apple's Accelerate the f32 GEMM (macOS, unless `CMF_ACCEL=0`)?
-fn accelerate() -> bool {
+pub(crate) fn accelerate() -> bool {
     cfg!(target_os = "macos") && std::env::var("CMF_ACCEL").as_deref() != Ok("0")
 }
 

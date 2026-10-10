@@ -67,6 +67,8 @@ const PACK_PATCHES: usize = 10_080;
 /// rows a block takes.
 const SCORE_BLOCK: usize = 8 << 20;
 const QBLOCK_MIN: usize = 256;
+/// Query rows per step when the steps run across the pool (no Accelerate).
+const ITEM_QBLOCK: usize = 128;
 /// Images with at least this many patches attend on Metal when it is up
 /// (budgets 560 and 1120 of a square-ish image).
 const GPU_MIN_PATCHES: usize = 4096;
@@ -1273,7 +1275,7 @@ fn sgemm_view(
     k: usize,
 ) {
     #[cfg(target_os = "macos")]
-    {
+    if crate::egemma2::accelerate() {
         #[link(name = "Accelerate", kind = "framework")]
         unsafe extern "C" {
             fn cblas_sgemm(
@@ -1319,15 +1321,14 @@ fn sgemm_view(
                 ldc as i32,
             );
         }
+        return;
     }
-    #[cfg(not(target_os = "macos"))]
     sgemm_view_portable(a, lda, b, ldb, bt, c, ldc, m, n, k);
 }
 
-/// [`sgemm_view`] without Accelerate: the views gathered for the portable
-/// GEMM (compiled everywhere, so the macOS tests cover it).
+/// [`sgemm_view`] without Accelerate (`matrixmultiply`, one thread a call;
+/// macOS takes it under `CMF_ACCEL=0`).
 #[allow(clippy::too_many_arguments)]
-#[cfg_attr(target_os = "macos", allow(dead_code))]
 fn sgemm_view_portable(
     a: &[f32],
     lda: usize,
@@ -1394,6 +1395,9 @@ fn attend_host(
     out: &mut [f32],
     pool: Option<&Pool>,
 ) {
+    if pool.is_some() && !crate::egemma2::accelerate() {
+        return attend_host_items(q, k, v, len, nh, hd, out, pool);
+    }
     let w = nh * hd;
     let qblock = (SCORE_BLOCK / len).clamp(QBLOCK_MIN, len.max(1));
     let nblk = len.div_ceil(qblock);
@@ -1480,6 +1484,61 @@ fn attend_host(
         });
     }
     mix(steps - 1, &bufs[(steps - 1) % 3]);
+}
+
+/// [`attend_host`] with the portable GEMM, which runs on one thread a
+/// call: the pipelined form would leave the GEMMs (nearly all the work) on
+/// one core, so here the (head, block of [`ITEM_QBLOCK`] queries) steps
+/// themselves go across the pool, each with its own score rows. A 280-token
+/// image on a 30-worker EPYC 7H12 (Linux): 10.3 -> 3.2 s, its 16 layers'
+/// attention core ~8 -> 0.65 s; a 4-frame video 10.9 -> 5.1 s.
+#[allow(clippy::too_many_arguments)]
+fn attend_host_items(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    len: usize,
+    nh: usize,
+    hd: usize,
+    out: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    if len == 0 {
+        return;
+    }
+    let w = nh * hd;
+    let qblock = ITEM_QBLOCK.min(len);
+    let nblk = len.div_ceil(qblock);
+    let outp = Shared(out.as_mut_ptr());
+    rows(pool, nh * nblk, &|s, e| {
+        let mut sc = vec![0f32; qblock * len];
+        let mut ob = vec![0f32; qblock * hd];
+        for t in s..e {
+            let (h, i0) = (t / nblk, (t % nblk) * qblock);
+            let nb = (i0 + qblock).min(len) - i0;
+            let sc = &mut sc[..nb * len];
+            sgemm_view(
+                &q[i0 * w + h * hd..],
+                w,
+                &k[h * hd..],
+                w,
+                true,
+                sc,
+                len,
+                nb,
+                len,
+                hd,
+            );
+            for row in sc.chunks_exact_mut(len) {
+                softmax(row);
+            }
+            sgemm_view(sc, len, &v[h * hd..], w, false, &mut ob, hd, nb, hd, len);
+            for (i, src) in ob[..nb * hd].chunks_exact(hd).enumerate() {
+                // SAFETY: steps write disjoint (row, head) slices of `out`
+                unsafe { outp.at((i0 + i) * w + h * hd, hd) }.copy_from_slice(src);
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1601,7 +1660,9 @@ mod tests {
     #[test]
     fn host_attention_matches_naive() {
         // two heads of 8 over 300 rows: the pipelined block path (with and
-        // without a pool) against a direct softmax(q·kᵀ)·v
+        // without a pool) and the per-step path of the portable GEMM (300
+        // rows = two full query blocks and a partial one) against a direct
+        // softmax(q·kᵀ)·v
         let (len, nh, hd) = (300usize, 2usize, 8usize);
         let w = nh * hd;
         let f = |i: usize, s: usize| (((i * s) % 29) as f32 - 14.0) / 20.0;
@@ -1629,9 +1690,13 @@ mod tests {
             }
         }
         let pool = crate::pool::Pool::new(3);
-        for p in [None, Some(&pool)] {
+        for (p, items) in [(None, false), (Some(&pool), false), (Some(&pool), true)] {
             let mut out = vec![0f32; len * w];
-            attend_host(&q, &k, &v, len, nh, hd, &mut out, p);
+            if items {
+                attend_host_items(&q, &k, &v, len, nh, hd, &mut out, p);
+            } else {
+                attend_host(&q, &k, &v, len, nh, hd, &mut out, p);
+            }
             let err = out
                 .iter()
                 .zip(&want)
