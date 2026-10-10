@@ -534,6 +534,154 @@ kernel void eg_flash64(
                       ssm + sg * 256u, sdm + sg * 64u, smm + sg * 8u, slm + sg * 8u);
 }
 
+// The same attention with K/V blocks staged in threadgroup memory and
+// shared by NSG simdgroups (8·NSG queries a group): each key block is read
+// from memory once per group instead of once per simdgroup — the direct
+// form above falls to ~0.8 TF/s at 9801 patches, where every 32-query tile
+// streams the whole key/value set through the cache.
+template <uint HD, uint NSG>
+static inline void eg_flash_staged(
+    device const float* QKV, device float* out, device const uint* segs,
+    constant EgFlash& p, uint3 tg, uint tid, ushort sg, ushort lane,
+    threadgroup float* ks, threadgroup float* vs,
+    threadgroup float* ss, threadgroup float* sd, threadgroup float* sm, threadgroup float* sl)
+{
+    const uint s0 = segs[2u * tg.z], len = segs[2u * tg.z + 1u];
+    const uint qbase = tg.x * (8u * NSG);
+    if (qbase >= len) return;
+    const uint h = tg.y, kvh = h / p.group;
+    device const float* qrow = QKV + (ulong)(s0 + qbase + 8u * sg) * p.ld + p.q_off + h * HD;
+    device const float* kbase = QKV + (ulong)s0 * p.ld + p.k_off + kvh * HD;
+    device const float* vbase = QKV + (ulong)s0 * p.ld + p.v_off + kvh * HD;
+    const uint srow = lane / 4u, schunk = lane % 4u;
+    if (lane < 8u) {
+        sm[lane] = -INFINITY;
+        sl[lane] = 0.0f;
+    }
+    constexpr uint NOB = HD / 8u;
+    simdgroup_float8x8 qf[NOB];
+    for (uint kb = 0; kb < NOB; ++kb)
+        simdgroup_load(qf[kb], qrow + kb * 8u, p.ld, ulong2(0, 0), false);
+    simdgroup_float8x8 o8[NOB];
+    for (uint i = 0; i < NOB; ++i) o8[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    constexpr uint C4 = HD / 4u;                  // float4 per key row
+    for (uint kb0 = 0; kb0 < len; kb0 += 32u) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < 32u * C4; i += 32u * NSG) {
+            const uint r = i / C4, c = (i % C4) * 4u;
+            const ulong off = (ulong)(kb0 + r) * p.ld + c;
+            *(threadgroup float4*)(ks + r * HD + c) = *(device const float4*)(kbase + off);
+            *(threadgroup float4*)(vs + r * HD + c) = *(device const float4*)(vbase + off);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // S[8×32] = Q·Kᵀ
+        for (uint cb = 0; cb < 4u; ++cb) {
+            simdgroup_float8x8 s8 = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (uint kb = 0; kb < NOB; ++kb) {
+                simdgroup_float8x8 b8;
+                simdgroup_load(b8, ks + cb * 8u * HD + kb * 8u, HD, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(s8, qf[kb], b8, s8);
+            }
+            simdgroup_store(s8, ss + cb * 8u, 32u, ulong2(0, 0), false);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        const float mprev = sm[srow], lprev = sl[srow];
+        float lmax = -INFINITY;
+        for (uint j = 0; j < 8u; ++j) {
+            const uint col = schunk * 8u + j;
+            if (kb0 + col < len) lmax = max(lmax, ss[srow * 32u + col] * p.scale);
+        }
+        lmax = max(lmax, simd_shuffle_xor(lmax, 1u));
+        lmax = max(lmax, simd_shuffle_xor(lmax, 2u));
+        const float mnew = max(mprev, lmax);
+        const float alpha = precise::exp(mprev - mnew);
+        float psum = 0.0f;
+        for (uint j = 0; j < 8u; ++j) {
+            const uint col = schunk * 8u + j;
+            const float e = (kb0 + col < len) ? precise::exp(ss[srow * 32u + col] * p.scale - mnew) : 0.0f;
+            ss[srow * 32u + col] = e;
+            psum += e;
+        }
+        psum += simd_shuffle_xor(psum, 1u);
+        psum += simd_shuffle_xor(psum, 2u);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (schunk == 0u) {
+            sm[srow] = mnew;
+            sl[srow] = alpha * lprev + psum;
+        }
+        if (simd_any(alpha != 1.0f)) {
+            for (uint i = lane; i < 64u; i += 32u) sd[i] = 0.0f;
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            if (schunk == 0u) sd[srow * 8u + srow] = alpha;
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_float8x8 d8;
+            simdgroup_load(d8, sd, 8u, ulong2(0, 0), false);
+            for (uint i = 0; i < NOB; ++i) {
+                simdgroup_float8x8 t8;
+                simdgroup_multiply(t8, d8, o8[i]);
+                o8[i] = t8;
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        // O += P·V
+        for (uint kb = 0; kb < 4u; ++kb) {
+            simdgroup_float8x8 a8;
+            simdgroup_load(a8, ss + kb * 8u, 32u, ulong2(0, 0), false);
+            for (uint i = 0; i < NOB; ++i) {
+                simdgroup_float8x8 b8;
+                simdgroup_load(b8, vs + kb * 8u * HD + i * 8u, HD, ulong2(0, 0), false);
+                simdgroup_multiply_accumulate(o8[i], a8, b8, o8[i]);
+            }
+        }
+    }
+    // O /= l, store the rows inside the sequence (no group barriers below)
+    for (uint i = lane; i < 64u; i += 32u) sd[i] = 0.0f;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (schunk == 0u) sd[srow * 8u + srow] = 1.0f / sl[srow];
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 d8;
+    simdgroup_load(d8, sd, 8u, ulong2(0, 0), false);
+    const uint row0 = qbase + 8u * sg;
+    if (row0 >= len) return;
+    device float* obase = out + (ulong)(s0 + row0) * p.ldo + h * HD;
+    for (uint i = 0; i < NOB; ++i) {
+        simdgroup_float8x8 t8;
+        simdgroup_multiply(t8, d8, o8[i]);
+        if (row0 + 8u <= len) {
+            simdgroup_store(t8, obase + i * 8u, p.ldo, ulong2(0, 0), false);
+        } else {
+            simdgroup_store(t8, ss, 8u, ulong2(0, 0), false);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint e = lane; e < 64u; e += 32u) {
+                const uint r = e / 8u;
+                if (row0 + r < len) obase[(ulong)r * p.ldo + i * 8u + e % 8u] = ss[e];
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+// 8 simdgroups: 64 queries a group; K/V blocks 2 × 8 KB
+kernel void eg_flash64s(
+    device const float* QKV [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    device const uint* segs [[buffer(2)]],
+    constant EgFlash& p [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]],
+    uint3 tg [[threadgroup_position_in_grid]])
+{
+    threadgroup float ks[32 * 64];
+    threadgroup float vs[32 * 64];
+    threadgroup float ssm[8 * 8 * 32];
+    threadgroup float sdm[8 * 64];
+    threadgroup float smm[8 * 8];
+    threadgroup float slm[8 * 8];
+    eg_flash_staged<64, 8>(QKV, out, segs, p, tg, tid, sg, lane, ks, vs,
+                           ssm + sg * 256u, sdm + sg * 64u, smm + sg * 8u, slm + sg * 8u);
+}
+
 // Softmax of each attention row over its allowed keys, in place; zeros
 // elsewhere up to the padded row width. One simdgroup per row.
 struct EgAtt {
