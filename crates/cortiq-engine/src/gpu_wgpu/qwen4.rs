@@ -8062,15 +8062,23 @@ pub(crate) fn stage_expert(
 ///
 /// Segments (1 GiB) are allocated by a background thread — the driver pins
 /// and clears ~0.3 s per GiB — so the tier comes online in steps; an
-/// admission it cannot place yet takes the `write_buffer` path.
+/// admission it cannot place yet takes the `write_buffer` path. The thread
+/// starts after the first completed submission (`done`), so the first
+/// encode creates its resources unhindered; the pinning still holds up the
+/// frames that run alongside it (~7 s in all for 28 GiB on the 3090), which
+/// is why the tier is not on by default with the whole card (§8).
 pub(crate) struct HostTier {
     bank: Arc<Dsv4GlobalMoeBufs>,
     segs: Arc<Vec<std::sync::OnceLock<super::host_mem::SysBuf>>>,
+    grow_started: std::sync::atomic::AtomicBool,
     seg_slots: usize,
     stride: u64,
     off: [u64; 3],
     cap: usize,
     online: Arc<std::sync::atomic::AtomicUsize>,
+    /// no more segments are coming (all allocated, or the driver refused
+    /// one: the tier then stays at `online` slots)
+    grown: Arc<std::sync::atomic::AtomicBool>,
     meta: std::sync::Mutex<TierMeta>,
     copies: std::sync::Mutex<Vec<(u32, u32)>>,
     /// copy batches handed to the queue (`take`) / known complete (`done`)
@@ -8095,12 +8103,18 @@ struct TierMeta {
     hand: usize,
 }
 
+/// The card of the device path takes `write_buffer` bytes through the legacy
+/// BAR window (`host_mem::small_bar`): where the host tier pays off.
+pub(crate) fn small_bar() -> bool {
+    ctx().is_some_and(|c| super::host_mem::small_bar(&c.device))
+}
+
 impl HostTier {
     /// A tier of at most `cap_bytes` over `n_keys` experts of `model`'s
     /// global bank. None off Vulkan, without host-visible system memory, or
     /// when the first segment cannot be allocated.
     pub(crate) fn new(model: &CmfModel, n_keys: usize, cap_bytes: u64) -> Option<Arc<Self>> {
-        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicU64, AtomicUsize};
         let c = ctx()?;
         let bank = c.dsv4_global_moe.lock().unwrap().get(&model.uid()).cloned()?;
         let al = |n: usize| (n as u64).div_ceil(256) * 256;
@@ -8123,29 +8137,16 @@ impl HostTier {
             Arc::new((0..nseg).map(|_| std::sync::OnceLock::new()).collect());
         let _ = segs[0].set(first);
         let online = Arc::new(AtomicUsize::new(seg_slots.min(cap)));
-        if nseg > 1 {
-            let (segs2, online2) = (segs.clone(), online.clone());
-            let _ = std::thread::Builder::new()
-                .name("qwen4-host-tier".into())
-                .spawn(move || {
-                    for i in 1..segs2.len() {
-                        let Some(b) = super::host_mem::sysmem_buffer(&c.device, seg_len, true)
-                        else {
-                            break;
-                        };
-                        let _ = segs2[i].set(b);
-                        online2.store(((i + 1) * seg_slots).min(cap), Ordering::Release);
-                    }
-                });
-        }
         Some(Arc::new(Self {
             bank,
             segs,
+            grow_started: std::sync::atomic::AtomicBool::new(nseg <= 1),
             seg_slots,
             stride,
             off,
             cap,
             online,
+            grown: Arc::new(std::sync::atomic::AtomicBool::new(nseg <= 1)),
             meta: std::sync::Mutex::new(TierMeta {
                 slot_of: vec![u32::MAX; n_keys],
                 key_of: vec![u32::MAX; cap],
@@ -8182,7 +8183,12 @@ impl HostTier {
 
     /// Every slot is taken (further fills evict).
     pub(crate) fn full(&self) -> bool {
-        self.meta.lock().unwrap().bump >= self.cap
+        let limit = if self.grown.load(std::sync::atomic::Ordering::Acquire) {
+            self.online()
+        } else {
+            self.cap
+        };
+        self.meta.lock().unwrap().bump >= limit
     }
 
     /// The tier has (or is writing) expert `key`.
@@ -8254,12 +8260,6 @@ impl HostTier {
         }
     }
 
-    /// Experts the tier holds.
-    pub(crate) fn held(&self) -> usize {
-        let m = self.meta.lock().unwrap();
-        m.ready.iter().filter(|&&r| r).count()
-    }
-
     fn queue_copy(&self, m: &mut TierMeta, s: usize, arena_slot: usize) {
         m.refbit[s] = true;
         m.epoch[s] = self.taken.load(std::sync::atomic::Ordering::Acquire) + 1;
@@ -8311,7 +8311,7 @@ impl HostTier {
             let s = if m.bump < online {
                 m.bump += 1;
                 m.bump - 1
-            } else if online < self.cap {
+            } else if online < self.cap && !self.grown.load(Ordering::Acquire) {
                 // more segments are coming: do not evict yet
                 self.misses.fetch_add(1, Ordering::Relaxed);
                 return false;
@@ -8424,6 +8424,36 @@ impl HostTier {
         use std::sync::atomic::Ordering;
         self.completed
             .store(self.taken.load(Ordering::Acquire), Ordering::Release);
+        if !self.grow_started.swap(true, Ordering::AcqRel) {
+            self.grow();
+        }
+    }
+
+    /// Allocate the segments after the first in the background.
+    fn grow(&self) {
+        use std::sync::atomic::Ordering;
+        let Some(c) = ctx() else {
+            self.grown.store(true, Ordering::Release);
+            return;
+        };
+        let (segs, online, grown) = (self.segs.clone(), self.online.clone(), self.grown.clone());
+        let (seg_slots, cap) = (self.seg_slots, self.cap);
+        let seg_len = seg_slots as u64 * self.stride;
+        let spawned = std::thread::Builder::new()
+            .name("qwen4-host-tier".into())
+            .spawn(move || {
+                for i in 1..segs.len() {
+                    let Some(b) = super::host_mem::sysmem_buffer(&c.device, seg_len, true) else {
+                        break;
+                    };
+                    let _ = segs[i].set(b);
+                    online.store(((i + 1) * seg_slots).min(cap), Ordering::Release);
+                }
+                grown.store(true, Ordering::Release);
+            });
+        if spawned.is_err() {
+            self.grown.store(true, Ordering::Release);
+        }
     }
 }
 

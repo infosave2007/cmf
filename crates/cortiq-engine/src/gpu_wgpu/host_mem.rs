@@ -54,8 +54,9 @@ impl SysBuf {
 
 /// Allocate `size` bytes of host-heap memory as a `COPY_SRC | COPY_DST`
 /// buffer: HOST_VISIBLE | HOST_COHERENT, with HOST_CACHED when `cached`,
-/// never DEVICE_LOCAL. None off Vulkan or when the driver refuses.
-#[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
+/// never DEVICE_LOCAL. None off Vulkan (and off Linux) or when the driver
+/// refuses.
+#[cfg(target_os = "linux")]
 pub fn sysmem_buffer(device: &wgpu::Device, size: u64, cached: bool) -> Option<SysBuf> {
     use ash::vk;
     if size == 0 || size > device.limits().max_buffer_size {
@@ -131,7 +132,36 @@ pub fn sysmem_buffer(device: &wgpu::Device, size: u64, cached: bool) -> Option<S
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "android")))]
+#[cfg(not(target_os = "linux"))]
 pub fn sysmem_buffer(_device: &wgpu::Device, _size: u64, _cached: bool) -> Option<SysBuf> {
     None
+}
+
+/// The card's CPU-writable VRAM window is the legacy BAR (at most 512 MiB:
+/// no resizable BAR), so every `write_buffer` byte crosses PCIe as a CPU
+/// store into that window. False off Vulkan or when there is no such type.
+#[cfg(target_os = "linux")]
+pub fn small_bar(device: &wgpu::Device) -> bool {
+    use ash::vk;
+    // SAFETY: a read-only query on the physical device wgpu owns.
+    unsafe {
+        let Some(hal) = device.as_hal::<wgpu::hal::api::Vulkan>() else {
+            return false;
+        };
+        let props = hal
+            .shared_instance()
+            .raw_instance()
+            .get_physical_device_memory_properties(hal.raw_physical_device());
+        let both = vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE;
+        let window = (0..props.memory_type_count as usize)
+            .filter(|&i| props.memory_types[i].property_flags.contains(both))
+            .map(|i| props.memory_heaps[props.memory_types[i].heap_index as usize].size)
+            .max();
+        window.is_some_and(|w| w <= 512 << 20)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn small_bar(_device: &wgpu::Device) -> bool {
+    false
 }

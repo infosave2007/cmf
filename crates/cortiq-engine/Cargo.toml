@@ -71,8 +71,12 @@ libc = "0.2"
 # Vulkan exists: Apple has none (the Metal backend uses its own matrix
 # units) and the wgpu path remains the universal one everywhere.
 [target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))'.dependencies]
+
 # The same `ash` wgpu-hal is built on: host-heap buffers for DMA uploads
 # (`gpu_wgpu::host_mem`) need a memory type wgpu does not let one choose.
+# Linux only: measured there (RTX 3090); Windows and Android builds keep
+# the `write_buffer` admissions and do not compile it.
+[target.'cfg(target_os = "linux")'.dependencies]
 ash = { version = "0.38", optional = true }
 
 [dev-dependencies]
