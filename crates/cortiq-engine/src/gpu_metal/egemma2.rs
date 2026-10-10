@@ -62,6 +62,7 @@ struct Pipes {
     row_inv: ComputePipelineState,
     pool: ComputePipelineState,
     flash64: ComputePipelineState,
+    flash64s: ComputePipelineState,
 }
 
 static PIPES: OnceLock<Result<Pipes, String>> = OnceLock::new();
@@ -126,6 +127,7 @@ fn pipes(c: &Ctx) -> Result<&'static Pipes, String> {
                 row_inv: pso("eg_row_inv")?,
                 pool: pso("eg_pool")?,
                 flash64: pso("eg_flash64")?,
+                flash64s: pso("eg_flash64s")?,
             })
         })
         .as_ref()
@@ -1313,6 +1315,7 @@ impl VisionGpu {
         // writes and reads n² floats a head); `CMF_EGEMMA2_VISION_FLASH=0`
         // keeps the GEMM form
         let flash = hd == 64 && std::env::var("CMF_EGEMMA2_VISION_FLASH").as_deref() != Ok("0");
+        let direct_flash = std::env::var("CMF_EGEMMA2_FLASH").as_deref() == Ok("direct");
         let (rounds, s_need) = if flash {
             (Vec::new(), 0)
         } else {
@@ -1396,8 +1399,15 @@ impl VisionGpu {
                 n,
             );
             if flash {
+                // staged K/V shared by 8 simdgroups (64 queries a group);
+                // `CMF_EGEMMA2_FLASH=direct`: 4 simdgroups reading K/V each
+                let (pso, q_tile, threads) = if direct_flash {
+                    (&p.flash64, 32u64, 128u64)
+                } else {
+                    (&p.flash64s, 64, 256)
+                };
                 let enc = g.rec.enc("attn");
-                enc.set_compute_pipeline_state(&p.flash64);
+                enc.set_compute_pipeline_state(pso);
                 enc.set_buffer(0, Some(&bqkv), 0);
                 enc.set_buffer(1, Some(&batt), 0);
                 enc.set_buffer(2, Some(&bseg), 0);
@@ -1416,8 +1426,12 @@ impl VisionGpu {
                     },
                 );
                 enc.dispatch_thread_groups(
-                    MTLSize::new((max_len as u64).div_ceil(32), nh as u64, segs.len() as u64),
-                    MTLSize::new(128, 1, 1),
+                    MTLSize::new(
+                        (max_len as u64).div_ceil(q_tile),
+                        nh as u64,
+                        segs.len() as u64,
+                    ),
+                    MTLSize::new(threads, 1, 1),
                 );
             } else {
                 g.attention(&rounds, &bqkv, &bs, &batt, (ld, w, w, hd, w))?;
