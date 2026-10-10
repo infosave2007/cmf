@@ -182,6 +182,21 @@ pub struct State {
 /// the uploads overlap.
 pub(crate) static FILL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static FILL_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Wall time of the parallel fill sections (against FILL_NS: their overlap).
+pub(crate) static FILLS_WALL_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// An expert's (gate, up, down) bytes straight from the model's mapping.
+#[cfg(feature = "gpu")]
+fn expert_slices(model: &CmfModel, t: (usize, usize, usize)) -> Option<[&[u8]; 3]> {
+    let bytes = model.primary_bytes();
+    let part = |i: usize| -> Option<&[u8]> {
+        let e = model.tensors.get(i)?;
+        let abs = model.entry_abs_offset(e)?;
+        bytes.get(abs..abs + e.nbytes as usize)
+    };
+    Some([part(t.0)?, part(t.1)?, part(t.2)?])
+}
 
 /// `CMF_QWEN_FILL_TRACE=1`: one line per admission (caller, layer, expert, slot).
 fn fill_trace() -> bool {
@@ -202,6 +217,13 @@ pub(crate) struct QwenGpuPool {
     /// frame submit); None uploads directly.
     #[cfg(feature = "gpu")]
     stager: Option<crate::gpu_wgpu::qwen4::Stager>,
+    /// The host-heap tier admissions copy from by DMA (`HostTier`); None
+    /// uploads through `write_buffer` (or the staging ring).
+    #[cfg(feature = "gpu")]
+    pub(crate) tier: Option<Arc<crate::gpu_wgpu::qwen4::HostTier>>,
+    /// Persistent workers for the admission copies (`CMF_QWEN_ADMIT_THREADS`,
+    /// default 16; 0 spawns scoped threads per batch as before).
+    admit_pool: Option<Arc<Pool>>,
     /// The host tiers behind this arena (RAM tier, then the file), set by
     /// the device path; None reads experts straight from the memory map.
     pub(crate) store: Option<Arc<crate::expert_store::ExpertStore>>,
@@ -354,6 +376,14 @@ impl QwenGpuPool {
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(0);
             pool.stager = crate::gpu_wgpu::qwen4::Stager::new(stage_mb);
+            // Spawning a thread per expert and batch (mmap + munmap of its
+            // stack) contends with the copies' own page faults on the
+            // address-space lock: a pool of parked workers instead.
+            let admit_threads = std::env::var("CMF_QWEN_ADMIT_THREADS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(16);
+            pool.admit_pool = (admit_threads > 0).then(|| Arc::new(Pool::new(admit_threads)));
             // A cold expert costs the host hundreds of microseconds; the
             // device path admits on the first miss and fetches at least a
             // handful per layer and token. Both stay operator-tunable.
@@ -514,20 +544,37 @@ impl QwenGpuPool {
         triple: (usize, usize, usize),
     ) -> bool {
         let t0 = std::time::Instant::now();
-        let stored = self.store.as_ref().and_then(|store| {
-            store.with_expert(layer, expert, true, |parts| {
-                crate::gpu_wgpu::qwen4::upload_expert_parts(
-                    self.stager.as_ref(),
-                    model,
-                    slot,
-                    parts,
-                )
-            })
-        });
+        let key = layer * self.n_experts + expert;
+        // the host-heap tier: a DMA copy when it holds the expert; else the
+        // expert goes into the tier first (one memcpy into host RAM) when it
+        // has a slot, and through the queue otherwise
+        let tier = self.tier.as_ref();
+        if tier.is_some_and(|t| t.hit(key, slot)) {
+            if slot < self.staging_base
+                && let Some(store) = self.store.as_ref()
+            {
+                store.note_vram(layer, expert, true);
+            }
+            return true;
+        }
+        let up = |parts: [&[u8]; 3]| -> bool {
+            if tier.is_some_and(|t| t.fill(key, Some(slot), parts)) {
+                return true;
+            }
+            crate::gpu_wgpu::qwen4::upload_expert_parts(self.stager.as_ref(), model, slot, parts)
+        };
+        let stored = self
+            .store
+            .as_ref()
+            .and_then(|store| store.with_expert(layer, expert, true, up));
         let ok = match stored {
             Some(ok) => ok,
             None => {
-                if let Some(st) = self.stager.as_ref()
+                if tier.is_some()
+                    && let Some(parts) = expert_slices(model, triple)
+                {
+                    up(parts)
+                } else if let Some(st) = self.stager.as_ref()
                     && crate::gpu_wgpu::qwen4::stage_expert(st, model, slot, triple)
                 {
                     true
@@ -551,6 +598,85 @@ impl QwenGpuPool {
         ok
     }
 
+    /// `fill_slot` for every `(slot, expert)` job of `layer`, in parallel:
+    /// on the admission pool when there is one, else one scoped thread per
+    /// job (`chunked`: at most 32 threads). One result per job.
+    #[cfg(feature = "gpu")]
+    fn run_fills(
+        &self,
+        model: &Arc<CmfModel>,
+        layer: usize,
+        jobs: &[(usize, usize)],
+        triples: &[(usize, usize, usize)],
+        chunked: bool,
+    ) -> Vec<bool> {
+        let t0 = std::time::Instant::now();
+        let me = &*self;
+        let out: Vec<bool> = if jobs.len() <= 1 {
+            jobs.iter()
+                .map(|&(slot, e)| me.fill_slot(model, slot, layer, e, triples[e]))
+                .collect()
+        } else if let Some(pool) = self.admit_pool.as_ref() {
+            let done: Vec<std::sync::atomic::AtomicBool> = jobs
+                .iter()
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect();
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            pool.run(&|_, _| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(&(slot, e)) = jobs.get(i) else { break };
+                    let ok = me.fill_slot(model, slot, layer, e, triples[e]);
+                    done[i].store(ok, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+            done.iter()
+                .map(|d| d.load(std::sync::atomic::Ordering::Relaxed))
+                .collect()
+        } else if chunked {
+            const ADMIT_THREADS: usize = 32;
+            let nth = jobs.len().min(ADMIT_THREADS);
+            let per = jobs.len().div_ceil(nth);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = jobs
+                    .chunks(per)
+                    .map(|part| {
+                        let model = model.clone();
+                        let h = scope.spawn(move || {
+                            part.iter()
+                                .map(|&(slot, e)| me.fill_slot(&model, slot, layer, e, triples[e]))
+                                .collect::<Vec<bool>>()
+                        });
+                        (part.len(), h)
+                    })
+                    .collect();
+                // a panicked thread fails its whole part, keeping the
+                // results aligned with `jobs`
+                handles
+                    .into_iter()
+                    .flat_map(|(n, h)| h.join().unwrap_or_else(|_| vec![false; n]))
+                    .collect()
+            })
+        } else {
+            std::thread::scope(|scope| {
+                let hs: Vec<_> = jobs
+                    .iter()
+                    .map(|&(slot, e)| {
+                        let model = model.clone();
+                        let triple = triples[e];
+                        scope.spawn(move || me.fill_slot(&model, slot, layer, e, triple))
+                    })
+                    .collect();
+                hs.into_iter().map(|h| h.join().unwrap_or(false)).collect()
+            })
+        };
+        FILLS_WALL_NS.fetch_add(
+            t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        out
+    }
+
     /// An arena slot gave up `old`: the RAM tier wants it back.
     fn dropped(&self, old: (usize, usize)) {
         if old.1 != usize::MAX
@@ -560,18 +686,40 @@ impl QwenGpuPool {
         }
     }
 
-    /// Submit what the staging ring holds ahead of the next frame.
+    /// Submit what the staging ring and the host tier hold ahead of the
+    /// next frame.
     #[cfg(feature = "gpu")]
     pub(crate) fn flush_uploads(&mut self) {
         if let Some(st) = self.stager.as_mut() {
             st.flush();
         }
+        if let Some(cb) = self.tier.as_ref().and_then(|t| t.take()) {
+            crate::gpu_wgpu::qwen4::submit_cb(cb);
+        }
     }
 
     /// The staged uploads as a command buffer to submit ahead of a frame
     /// in the same queue submission; `rearm_uploads` follows the submit.
+    /// (With both a staging ring and a host tier, the ring's copies go out
+    /// on their own submission first: they target other slots.)
     pub(crate) fn take_uploads(&mut self) -> Option<wgpu::CommandBuffer> {
-        self.stager.as_mut().and_then(|st| st.take())
+        let staged = self.stager.as_mut().and_then(|st| st.take());
+        let tiered = self.tier.as_ref().and_then(|t| t.take());
+        match (staged, tiered) {
+            (Some(a), Some(b)) => {
+                crate::gpu_wgpu::qwen4::submit_cb(a);
+                Some(b)
+            }
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// A submission that followed every copy `take_uploads` handed out has
+    /// completed: the host tier may reuse the slots they read.
+    pub(crate) fn uploads_done(&self) {
+        if let Some(t) = self.tier.as_ref() {
+            t.done();
+        }
     }
 
     pub(crate) fn rearm_uploads(&mut self) {
@@ -606,24 +754,7 @@ impl QwenGpuPool {
             .filter(|&(_, &e)| e < self.n_experts)
             .map(|(j, &e)| (base + j, e))
             .collect();
-        let me = &*self;
-        let ok: Vec<bool> = if jobs.len() <= 1 {
-            jobs.iter()
-                .map(|&(slot, e)| me.fill_slot(model, slot, layer, e, triples[e]))
-                .collect()
-        } else {
-            std::thread::scope(|scope| {
-                let hs: Vec<_> = jobs
-                    .iter()
-                    .map(|&(slot, e)| {
-                        let model = model.clone();
-                        let triple = triples[e];
-                        scope.spawn(move || me.fill_slot(&model, slot, layer, e, triple))
-                    })
-                    .collect();
-                hs.into_iter().map(|h| h.join().unwrap_or(false)).collect()
-            })
-        };
+        let ok = self.run_fills(model, layer, &jobs, triples, false);
         let mut out = vec![None; experts.len()];
         let mut ji = 0;
         for (j, &e) in experts.iter().enumerate() {
@@ -727,52 +858,34 @@ impl QwenGpuPool {
             let es: Vec<usize> = uploads.iter().map(|&(_, e)| e).collect();
             store.prefetch(layer, &es);
         }
-        let me = &*self;
-        let results: Vec<bool> = if uploads.len() <= 1 {
-            uploads
-                .iter()
-                .map(|&(slot, e)| me.fill_slot(model, slot, layer, e, triples[e]))
-                .collect()
-        } else if pooled {
-            const ADMIT_THREADS: usize = 32;
-            let nth = uploads.len().min(ADMIT_THREADS);
-            let per = uploads.len().div_ceil(nth);
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = uploads
-                    .chunks(per)
-                    .map(|part| {
-                        let model = model.clone();
-                        let h = scope.spawn(move || {
-                            part.iter()
-                                .map(|&(slot, e)| me.fill_slot(&model, slot, layer, e, triples[e]))
-                                .collect::<Vec<bool>>()
-                        });
-                        (part.len(), h)
-                    })
-                    .collect();
-                // a panicked thread fails its whole part, keeping the
-                // results aligned with `uploads`
-                handles
-                    .into_iter()
-                    .flat_map(|(n, h)| h.join().unwrap_or_else(|_| vec![false; n]))
-                    .collect()
-            })
-        } else {
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = uploads
-                    .iter()
-                    .map(|&(slot, e)| {
-                        let model = model.clone();
-                        let triple = triples[e];
-                        scope.spawn(move || me.fill_slot(&model, slot, layer, e, triple))
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| h.join().unwrap_or(false))
-                    .collect()
-            })
-        };
+        // host-tier hits are a queued copy each: no thread for those
+        let mut hit = vec![false; uploads.len()];
+        if let Some(t) = self.tier.as_ref() {
+            for (i, &(slot, e)) in uploads.iter().enumerate() {
+                if t.hit(layer * self.n_experts + e, slot) {
+                    hit[i] = true;
+                    if slot < self.staging_base
+                        && let Some(store) = self.store.as_ref()
+                    {
+                        store.note_vram(layer, e, true);
+                    }
+                }
+            }
+        }
+        let all = uploads;
+        let rest: Vec<(usize, usize)> = all
+            .iter()
+            .zip(&hit)
+            .filter(|(_, h)| !**h)
+            .map(|(&u, _)| u)
+            .collect();
+        let results = self.run_fills(model, layer, &rest, triples, pooled);
+        let mut rest_ok = results.into_iter();
+        let results: Vec<bool> = hit
+            .iter()
+            .map(|&h| h || rest_ok.next().unwrap_or(false))
+            .collect();
+        let uploads = all;
         let mut failed: Vec<usize> = Vec::new();
         for (i, &(slot, e)) in uploads.iter().enumerate() {
             if !results.get(i).copied().unwrap_or(false) {
@@ -1164,6 +1277,9 @@ impl QwenGpuPool {
             staging,
             #[cfg(feature = "gpu")]
             stager: None,
+            #[cfg(feature = "gpu")]
+            tier: None,
+            admit_pool: None,
             store: None,
             segment_slots,
             floor: (staging_base / n_layers.max(1)).max(2),
@@ -1299,24 +1415,7 @@ impl QwenGpuPool {
         }
         // phase 2: the uploads, in parallel (they were one after another:
         // at a 12 GB budget that was the larger half of every token)
-        let me = &*self;
-        let ok: Vec<bool> = if plan.len() <= 1 {
-            plan.iter()
-                .map(|&(slot, e)| me.fill_slot(model, slot, layer, e, triples[e]))
-                .collect()
-        } else {
-            std::thread::scope(|scope| {
-                let hs: Vec<_> = plan
-                    .iter()
-                    .map(|&(slot, e)| {
-                        let model = model.clone();
-                        let triple = triples[e];
-                        scope.spawn(move || me.fill_slot(&model, slot, layer, e, triple))
-                    })
-                    .collect();
-                hs.into_iter().map(|h| h.join().unwrap_or(false)).collect()
-            })
-        };
+        let ok = self.run_fills(model, layer, &plan, triples, false);
         let mut failed = false;
         for (&(slot, e), ok) in plan.iter().zip(&ok) {
             if !ok {
@@ -3232,6 +3331,76 @@ fn forward_tokens_device(
                 );
             }
         }
+        // The host-heap tier behind the arena: admissions become DMA copies
+        // (`HostTier`). CMF_QWEN_HTIER_MB=0 turns it off, =<MiB> sizes it;
+        // by default it is sized for every expert the arena cannot hold,
+        // within half of the memory this process can still take.
+        {
+            let n_keys = layers.len() * n_experts;
+            let want_slots = n_keys.saturating_sub(cap_slots) + cap_slots / 8;
+            let stride = (per as u64).div_ceil(256) * 256 + 1024;
+            let want = want_slots as u64 * stride;
+            let cap_bytes = match std::env::var("CMF_QWEN_HTIER_MB").ok().as_deref() {
+                None | Some("auto") | Some("") => crate::expert_store::host_available_bytes()
+                    .map_or(0, |avail| want.min(avail / 2)),
+                Some(v) => v.parse::<u64>().map_or(0, |mb| mb << 20),
+            };
+            if cap_bytes > 0 {
+                let t0 = std::time::Instant::now();
+                let tier = q4::HostTier::new(&model, n_keys, cap_bytes);
+                if prof {
+                    match tier.as_ref() {
+                        Some(t) => eprintln!(
+                            "qwen4-device: host tier {} slots ({} MiB, first GiB in {:.0} ms, the rest in the background)",
+                            t.capacity(),
+                            (t.capacity() as u64 * t.stride()) >> 20,
+                            t0.elapsed().as_secs_f64() * 1e3
+                        ),
+                        None => eprintln!("qwen4-device: host tier unavailable"),
+                    }
+                }
+                // CMF_QWEN_HTIER_FILL=<threads> (default 8, 0 = lazy only):
+                // copy every expert the arena does not hold into the tier
+                // in the background, the profiled ones first, so prompt
+                // ingest admits by DMA alone.
+                let fill_threads = std::env::var("CMF_QWEN_HTIER_FILL")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(8);
+                if let Some(t) = tier.as_ref()
+                    && fill_threads > 0
+                {
+                    let arena = state.gpu_pool.as_ref().unwrap();
+                    let mut order: Vec<usize> = Vec::with_capacity(n_keys);
+                    let mut seen = vec![false; n_keys];
+                    let ranked = profile.as_ref().map(|p| p.ranked()).unwrap_or_default();
+                    for &(l, e) in &ranked {
+                        if l < layers.len() && e < n_experts {
+                            let k = l * n_experts + e;
+                            if !seen[k] && arena.slot_for[k] == u32::MAX {
+                                seen[k] = true;
+                                order.push(k);
+                            }
+                        }
+                    }
+                    for e in 0..n_experts {
+                        for l in 0..layers.len() {
+                            let k = l * n_experts + e;
+                            if !seen[k] && arena.slot_for[k] == u32::MAX {
+                                seen[k] = true;
+                                order.push(k);
+                            }
+                        }
+                    }
+                    let flat: Vec<(usize, usize, usize)> =
+                        triples.iter().flat_map(|r| r.iter().copied()).collect();
+                    if flat.len() == n_keys {
+                        t.start_fill(model.clone(), Arc::new(flat), order, fill_threads);
+                    }
+                }
+                state.gpu_pool.as_mut().unwrap().tier = tier;
+            }
+        }
         if std::env::var_os("CMF_QWEN_PROFILE_SAVE").is_some() && profile.is_none() {
             profile = Some(ExpertProfile::new(layers.len(), n_experts));
         }
@@ -3536,6 +3705,7 @@ fn forward_tokens_device(
             failed = Some("readback");
             break;
         };
+        arena.uploads_done();
         pf.spin += ts.elapsed();
         pf.wait += t0.elapsed();
         if let Some(m) = q4::ts_read() {
@@ -3803,8 +3973,24 @@ fn forward_tokens_device(
             .unwrap_or_default();
         let fill_ns = FILL_NS.swap(0, std::sync::atomic::Ordering::Relaxed);
         let fill_n = FILL_N.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let fills_wall = FILLS_WALL_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6;
+        let store_line = match arena.tier.as_ref() {
+            Some(t) => {
+                use std::sync::atomic::Ordering::Relaxed;
+                format!(
+                    "{store_line} htier hits={} fills={} fill_sum={:.1}ms nofit={} online={} bg_fills={}",
+                    t.hits.swap(0, Relaxed),
+                    t.fills.swap(0, Relaxed),
+                    t.fill_ns.swap(0, Relaxed) as f64 / 1e6,
+                    t.misses.swap(0, Relaxed),
+                    t.online(),
+                    t.bg_fills.load(Relaxed)
+                )
+            }
+            None => store_line,
+        };
         eprintln!(
-            "qwen4-device pos={position} ntok={ntok} total={:.1}ms encode={:.1}ms finish={:.1}ms wait={:.1}ms spin={:.1}ms post={:.1}ms ple={:.1}ms cold_cpu={:.1}ms admit={:.1}ms chains={} aborted_frames={} cold={} experts ({} on device) in {} layers fills={fill_n} fill_sum={:.1}ms {store_line}",
+            "qwen4-device pos={position} ntok={ntok} total={:.1}ms encode={:.1}ms finish={:.1}ms wait={:.1}ms spin={:.1}ms post={:.1}ms ple={:.1}ms cold_cpu={:.1}ms admit={:.1}ms chains={} aborted_frames={} cold={} experts ({} on device) in {} layers fills={fill_n} fill_sum={:.1}ms fill_wall={fills_wall:.1}ms {store_line}",
             t_token.elapsed().as_secs_f64() * 1e3,
             pf.encode.as_secs_f64() * 1e3,
             pf.finish.as_secs_f64() * 1e3,

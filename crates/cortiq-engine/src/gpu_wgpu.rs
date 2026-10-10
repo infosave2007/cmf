@@ -29,6 +29,8 @@ pub(crate) mod qi21_vae;
 pub mod mimo_bank;
 /// Qwen3.8-Flash-Next device-resident token path.
 pub(crate) mod qwen4;
+/// System-memory buffers the card copies from (Vulkan).
+pub mod host_mem;
 /// Row-blocked decode kernels for the generic q4tp MoE graph block.
 pub(crate) mod moe_r4;
 /// Token-axis batch kernels of the dense GDN hybrids (gated attention).
