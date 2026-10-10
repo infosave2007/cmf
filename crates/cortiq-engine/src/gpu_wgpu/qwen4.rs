@@ -2986,6 +2986,8 @@ fn build_pipes(c: &Ctx) -> Option<Pipes> {
                 cache: c.pipeline_cache.as_ref(),
             })
     };
+    // the subgroup module of this context's device, built on first use
+    let sgm: SgModule = std::cell::OnceCell::new();
     Some(Pipes {
         group_rmsnorm: pipe("q4_group_rmsnorm"),
         f16_matvec: pipe("q4_f16_matvec"),
@@ -3018,19 +3020,23 @@ fn build_pipes(c: &Ctx) -> Option<Pipes> {
         t_idx_build: pipe("q4t_idx_build"),
         t_attend: pipe("q4t_attend"),
         hc3: build_hc3(c),
-        gu4w: build_sg_l(c, "q4_gu_q2tp4w", "CMF_QWEN_GU4W", true, &gu_layout, opts()),
-        dn4s: build_sg_l(c, "q4_dn_q4tp4s", "CMF_QWEN_DN4S", true, &dn_layout, opts()),
-        route2: build_sg_auto(c, "q4t_route2", "CMF_QWEN_ROUTE2", opts()),
+        gu4w: build_sg_l(c, &sgm, "q4_gu_q2tp4w", "CMF_QWEN_GU4W", true, &gu_layout, opts()),
+        dn4s: build_sg_l(c, &sgm, "q4_dn_q4tp4s", "CMF_QWEN_DN4S", true, &dn_layout, opts()),
+        route2: build_sg_auto(c, &sgm, "q4t_route2", "CMF_QWEN_ROUTE2", opts()),
         f16_matvec2: pipe("q4_f16_matvec2"),
-        q82sg: build_sg_auto(c, "q4_q82_sg", "CMF_QWEN_Q82SG", opts()),
+        q82sg: build_sg_auto(c, &sgm, "q4_q82_sg", "CMF_QWEN_Q82SG", opts()),
     })
 }
 
-/// The subgroup module (`QWEN4_SG_WGSL` on top of the qwen4 sources),
-/// built once on 32-lane-subgroup devices; None elsewhere or on rejection.
-fn sg_module(c: &Ctx) -> Option<&'static wgpu::ShaderModule> {
-    static M: OnceLock<Option<wgpu::ShaderModule>> = OnceLock::new();
-    M.get_or_init(|| {
+/// The subgroup module (`QWEN4_SG_WGSL` on top of the qwen4 sources) of
+/// one context, built on first use: once per device, since a module (and
+/// the subgroup-size check) belongs to the device its context drives.
+type SgModule = std::cell::OnceCell<Option<wgpu::ShaderModule>>;
+
+/// The subgroup module on 32-lane-subgroup devices; None elsewhere or on
+/// rejection.
+fn sg_module<'a>(c: &Ctx, m: &'a SgModule) -> Option<&'a wgpu::ShaderModule> {
+    m.get_or_init(|| {
         if !c.device.features().contains(wgpu::Features::SUBGROUP)
             || c.adapter_info.subgroup_min_size != 32
             || c.adapter_info.subgroup_max_size != 32
@@ -3060,6 +3066,7 @@ fn sg_module(c: &Ctx) -> Option<&'static wgpu::ShaderModule> {
 /// `env` is "0", without the module, or on rejection.
 fn build_sg_auto(
     c: &Ctx,
+    sgm: &SgModule,
     ep: &str,
     env: &str,
     opts: wgpu::PipelineCompilationOptions<'_>,
@@ -3067,7 +3074,7 @@ fn build_sg_auto(
     if std::env::var(env).as_deref() == Ok("0") {
         return None;
     }
-    let module = sg_module(c)?;
+    let module = sg_module(c, sgm)?;
     let si = c.device.push_error_scope(wgpu::ErrorFilter::Internal);
     let sv = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
     let p = c
@@ -3092,6 +3099,7 @@ fn build_sg_auto(
 /// The eight-row expert pair, in its own module (subgroup builtins).
 fn build_sg_l(
     c: &Ctx,
+    sgm: &SgModule,
     ep: &str,
     env: &str,
     default_on: bool,
@@ -3106,7 +3114,7 @@ fn build_sg_l(
     if !on {
         return None;
     }
-    let module = sg_module(c)?;
+    let module = sg_module(c, sgm)?;
     let si = c.device.push_error_scope(wgpu::ErrorFilter::Internal);
     let sv = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
     let p = c

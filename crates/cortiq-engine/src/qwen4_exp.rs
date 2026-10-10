@@ -742,16 +742,19 @@ impl QwenGpuPool {
                     .chunks(per)
                     .map(|part| {
                         let model = model.clone();
-                        scope.spawn(move || {
+                        let h = scope.spawn(move || {
                             part.iter()
                                 .map(|&(slot, e)| me.fill_slot(&model, slot, layer, e, triples[e]))
                                 .collect::<Vec<bool>>()
-                        })
+                        });
+                        (part.len(), h)
                     })
                     .collect();
+                // a panicked thread fails its whole part, keeping the
+                // results aligned with `uploads`
                 handles
                     .into_iter()
-                    .flat_map(|h| h.join().unwrap_or_default())
+                    .flat_map(|(n, h)| h.join().unwrap_or_else(|_| vec![false; n]))
                     .collect()
             })
         } else {
