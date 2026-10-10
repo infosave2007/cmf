@@ -31167,6 +31167,36 @@ pub fn forward_batch_graph_at(
             mk(k * ms * mi, "bg-mact"),
         )
     });
+    // q8_2f grouped-prefill scratch (moe_q82): one set serves every layer,
+    // as the routing scratch above does — the layers run in order inside
+    // the one command buffer (at 128 rows the per-slot outputs alone are
+    // 9.4 MB a layer on Mellum2.1).
+    let moeg8_bufs = lws
+        .iter()
+        .find_map(|w| match &w.ffn {
+            BFfn::Moe {
+                n_exp,
+                top_k,
+                q82: true,
+                ..
+            } => Some((*n_exp, *top_k + 1)),
+            _ => None,
+        })
+        .map(|(mn, ms)| {
+            let mkb = |n: usize, label: &str| {
+                c.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(label),
+                    size: (n * 4).max(16) as u64,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                })
+            };
+            (
+                mkb(mn + 1, "moeg8-off"),
+                mkb(k * ms, "moeg8-ent"),
+                mkb(k * ms * hidden, "moeg8-y"),
+            )
+        });
     let cpo =
         |enc: &mut wgpu::CommandEncoder,
          src: &wgpu::Buffer,
@@ -32389,29 +32419,19 @@ pub fn forward_batch_graph_at(
                     &[mlogit, &n1, msel, mwt, &sel_u, &sgate.buf, &bias_buf],
                 );
                 let n_ent = k * slots;
-                let mkb = |n: usize, label: &str| {
-                    c.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some(label),
-                        size: (n * 4).max(16) as u64,
-                        usage: wgpu::BufferUsages::STORAGE,
-                        mapped_at_creation: false,
-                    })
-                };
-                let goff = mkb(*n_exp + 1, "moeg8-off");
-                let gent = mkb(n_ent, "moeg8-ent");
-                let ypart = mkb(n_ent * hidden, "moeg8-y");
+                let (goff, gent, ypart) = moeg8_bufs.as_ref().unwrap();
                 let gr_u = uniform_u32x4(c, [*n_exp as u32, n_ent as u32, 0, 0]);
                 let gs_u =
                     uniform_u32x4(c, [hidden as u32, slots as u32, (k * hidden) as u32, 0]);
                 let bg_gr = bind_pairs(
                     c,
                     &pg.group_l,
-                    &[(0, msel), (1, &goff), (2, &gent), (3, &gr_u)],
+                    &[(0, msel), (1, goff), (2, gent), (3, &gr_u)],
                 );
                 let bg_gs =
-                    bind_pairs(c, &pg.sum_l, &[(0, &ypart), (1, mwt), (2, &ob), (3, &gs_u)]);
+                    bind_pairs(c, &pg.sum_l, &[(0, ypart), (1, mwt), (2, &ob), (3, &gs_u)]);
                 let job = moe_q82::prefill_job(
-                    c, &p8, gate_all, up_all, down_all, &n1, &goff, &gent, mact, &ypart, hidden,
+                    c, &p8, gate_all, up_all, down_all, &n1, goff, gent, mact, ypart, hidden,
                     *mi, slots, *n_exp, k,
                 );
                 let mut pass = begin_pass(&mut enc);

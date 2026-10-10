@@ -3499,7 +3499,8 @@ impl Pipeline {
             // q8_2f experts (moe_q82's grouped prefill) read each expert
             // once per group of up to 16 of its entries, so the chunk that
             // fills those groups is the faster ingest: Mellum2.1 q8_2f on an
-            // RTX 3090, 4000-token prompt, 359 tok/s at 32 rows.
+            // RTX 3090, 4000-token prompt, 503 tok/s at 64 rows, 542 at 128
+            // (and 542 at 256).
             let q82 = crate::gpu::moe_q82_graph_on()
                 && self.weights.layers.iter().any(|lw| {
                     matches!(&lw.ffn, FfnKind::Moe(m)

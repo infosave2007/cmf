@@ -17,12 +17,13 @@
 //! `silu(g)·u` already multiplied by the down's column field, so the down
 //! kernel reads its input straight from the act buffer. The softmax top-k
 //! select can ride inside both (bit-identical to `moe_select`, as in
-//! `moe_r4`'s folded pair).
+//! `moe_r4`'s folded pair). The f32 router has its own warp-a-row kernel
+//! (`m8_rt`).
 //!
 //! Prefill (`m8g_gu`, `m8g_dn`): the expert-grouped batch shape of
 //! `moe_r4`'s moeg kernels (bucketed by `moeg_group`, mixed by `moeg_sum`):
-//! one thread per output row, up to eight entries of one expert per
-//! workgroup, the entries' `x·col` staged per 128-column tile.
+//! one thread per output row, up to sixteen entries of one expert per
+//! workgroup (`CMF_M8_NT`), the entries' `x·col` staged per 128-column tile.
 
 use super::*;
 
@@ -470,7 +471,7 @@ fn prefill_wgsl() -> String {
     );
     let nt = nt();
     // The entry count is workgroup-uniform: an entry past it costs nothing
-    // (at a 32-token chunk an expert holds about four of the eight).
+    // (the last group of an expert is usually part-full).
     for j in 0..nt {
         gi.push_str(&format!(
             "    let e{j} = pg_ent[beg + min({j}u, nt - 1u)];\n    var ag{j} = 0.0; var au{j} = 0.0;\n"
