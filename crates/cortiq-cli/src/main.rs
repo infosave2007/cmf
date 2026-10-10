@@ -7,6 +7,8 @@ mod choice;
 mod convert;
 mod decision;
 mod dialog;
+mod egemma2pack;
+mod embed;
 mod gguf;
 mod gptq;
 mod growth;
@@ -464,6 +466,85 @@ enum Commands {
             value_name = "text|mm-only|multimodal"
         )]
         mimo_towers: String,
+    },
+    /// Embeddings from an EmbeddingGemma 2 .cmf (`cortiq convert --model
+    /// <google/embeddinggemma-2 dir>`): texts, images (--image), videos
+    /// (--video), audio (--audio) and interleaved text + media (--interleave)
+    /// in one space — unit-length 768-d vectors, or a Matryoshka prefix with
+    /// --dim 512|256|128.
+    Embed {
+        /// Path to the EmbeddingGemma 2 .cmf
+        #[arg(long)]
+        model: String,
+        /// Texts to embed (one embedding each)
+        texts: Vec<String>,
+        /// More texts (repeatable)
+        #[arg(long = "text")]
+        text: Vec<String>,
+        /// An audio file to embed on its own (repeatable; WAV, or any format
+        /// ffmpeg reads; mixed to mono, resampled to 16 kHz, cut at 30 s)
+        #[arg(long)]
+        audio: Vec<String>,
+        /// A file with one text per line
+        #[arg(long)]
+        file: Option<String>,
+        /// JSON Lines: each line a string or {"text", "prompt_name"|"task", "title",
+        /// "prompt", "image", "video", "audio": path | [paths], "image_tokens",
+        /// "video_tokens"} (the text's <|image|> / <|video|> / <|audio|>
+        /// placeholders take the media in order)
+        #[arg(long)]
+        jsonl: Option<String>,
+        /// Task prompt: SearchQuery, Document, QuestionAnswering, FactChecking,
+        /// CodeRetrieval, Classification, Clustering, SentenceSimilarity, …
+        /// (--list-prompts). Default: none (the text as given).
+        #[arg(long = "prompt-name", visible_alias = "task")]
+        prompt_name: Option<String>,
+        /// Title for the Document prompt (`title: {title} | text: …`)
+        #[arg(long)]
+        title: Option<String>,
+        /// A raw prompt prefix instead of a named one
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Output dimension: 768, or a Matryoshka prefix 512 | 256 | 128 (re-normalized)
+        #[arg(long, default_value = "768")]
+        dim: usize,
+        /// Print OpenAI-style JSON ({"data":[{"embedding":[…]}], "usage":…})
+        #[arg(long)]
+        json: bool,
+        /// Write the embeddings as a float32 .npy [n, dim]
+        #[arg(long)]
+        npy: Option<String>,
+        /// Print each input's token ids to stderr
+        #[arg(long)]
+        show_tokens: bool,
+        /// List the task prompts the file carries and exit
+        #[arg(long)]
+        list_prompts: bool,
+        /// Benchmark: run the forward N times, print each time (in-process)
+        #[arg(long, default_value = "1", hide = true)]
+        repeat: usize,
+        /// An image to embed: a path or an http(s)/data URL (repeatable)
+        #[arg(long = "image")]
+        image: Vec<String>,
+        /// A video to embed: mp4/webm/mov/… (needs ffmpeg on PATH), .y4m, or a
+        /// directory of frames (repeatable). Sampled at 1 fps, at most 32 frames.
+        #[arg(long = "video")]
+        video: Vec<String>,
+        /// Frame rate of a --video frame directory (without it the frames are
+        /// taken as already sampled)
+        #[arg(long = "video-fps")]
+        video_fps: Option<f64>,
+        /// Soft tokens per image: 70 | 140 | 280 (default) | 560 | 1120
+        #[arg(long = "image-tokens")]
+        image_tokens: Option<usize>,
+        /// Soft tokens per video frame: 70 | 140 (default) | 280 | 560 | 1120
+        #[arg(long = "video-tokens")]
+        video_tokens: Option<usize>,
+        /// One interleaved input: the text (its <|image|> / <|video|> /
+        /// <|audio|> placeholders take the --image / --video / --audio media
+        /// in order) instead of one embedding per item
+        #[arg(long)]
+        interleave: bool,
     },
     /// Transcribe audio with a Whisper CMF checkpoint (WAV, PCM or float).
     Transcribe {
@@ -2816,6 +2897,50 @@ async fn main() -> anyhow::Result<()> {
             println!("✓ wrote {output}");
             Ok(())
         }
+        Commands::Embed {
+            model,
+            texts,
+            text,
+            audio,
+            file,
+            jsonl,
+            prompt_name,
+            title,
+            prompt,
+            dim,
+            json,
+            npy,
+            show_tokens,
+            list_prompts,
+            repeat,
+            image,
+            video,
+            video_fps,
+            image_tokens,
+            video_tokens,
+            interleave,
+        } => embed::run(embed::EmbedArgs {
+            model,
+            texts: texts.into_iter().chain(text).collect(),
+            audio,
+            file,
+            jsonl,
+            prompt_name,
+            title,
+            prompt,
+            dim,
+            json,
+            npy,
+            show_tokens,
+            list_prompts,
+            repeat,
+            images: image,
+            videos: video,
+            video_fps,
+            image_tokens,
+            video_tokens,
+            interleave,
+        }),
         Commands::Transcribe {
             model,
             audio,
@@ -4150,6 +4275,15 @@ async fn cmd_serve(
     if is_decision {
         drop(model);
         return decision::serve(model_path, host, port, decision_flags).await;
+    }
+    // An EmbeddingGemma 2 file is an encoder: no Pipeline, no KV cache —
+    // the embeddings server (POST /v1/embeddings) takes it.
+    if cortiq_engine::egemma2::is_embedding_gemma2(&model) {
+        let addr = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+            .map_err(|e| anyhow::anyhow!("bind address {host}:{port}: {e}"))?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("bind address {host}:{port}: no address"))?;
+        return cortiq_server::embeddings::serve(model, model_path, addr).await;
     }
     let lookup_mode =
         cortiq_engine::lookup::LookupMode::resolve(lookup_mode).map_err(anyhow::Error::msg)?;
