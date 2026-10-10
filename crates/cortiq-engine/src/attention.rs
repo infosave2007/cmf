@@ -241,7 +241,7 @@ unsafe fn dot_f32_neon(a: &[f32], b: &[f32]) -> f32 {
 /// scalar expf there would eat the whole GEMM win.
 #[cfg(target_arch = "aarch64")]
 #[inline]
-unsafe fn vexpq_f32(x: core::arch::aarch64::float32x4_t) -> core::arch::aarch64::float32x4_t {
+pub(crate) unsafe fn vexpq_f32(x: core::arch::aarch64::float32x4_t) -> core::arch::aarch64::float32x4_t {
     // SAFETY: pure register math.
     unsafe {
         use core::arch::aarch64::*;
