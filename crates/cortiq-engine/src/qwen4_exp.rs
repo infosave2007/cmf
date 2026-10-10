@@ -3331,27 +3331,23 @@ fn forward_tokens_device(
                 );
             }
         }
-        // The host-heap tier behind the arena: admissions become DMA copies
-        // (`HostTier`). CMF_QWEN_HTIER_MB=0 turns it off, =<MiB> or =auto
-        // sizes it (auto: every expert the arena cannot hold). Unset, it is
-        // on (auto) only where it wins (RTX 3090, §8 of the device doc):
-        // `write_buffer` goes through the legacy BAR window (Linux, no
-        // resizable BAR) and the arena holds under 90 % of the profile's hot
-        // set (a VRAM budget: decode at 12 GB 16.6 -> 27.1 tok/s). With the whole
-        // card the arena holds the hot set, and pinning ~28 GiB stalls the
-        // first prompt frame by ~7 s for a +5 % steady ingest: off there.
-        // Whatever is asked, it never pins more than half of the memory
-        // this process can still take (cgroup and MemAvailable) nor comes
-        // within 16 GiB of it.
+        // The host-heap tier behind the arena (Linux): admissions become DMA
+        // copies (`HostTier`). Off unless asked: CMF_QWEN_HTIER_MB=auto sizes
+        // it for every expert the arena cannot hold, =<MiB> to that size.
+        // Measured on the RTX 3090 (no resizable BAR, §8.7 of the device
+        // doc) against the admission pool alone it adds 2-5 % of steady
+        // decode and ingest, while pinning 28-37 GiB holds up the frames
+        // beside it (first token of a one-shot run +7-11 s) and squeezes
+        // the page cache: worth it only for a long-lived process. Whatever
+        // is asked, it never pins more than half of the memory this process
+        // can still take (cgroup and MemAvailable) nor comes within 16 GiB
+        // of it.
         {
             let n_keys = layers.len() * n_experts;
             let want_slots = n_keys.saturating_sub(cap_slots) + cap_slots / 8;
             let stride = (per as u64).div_ceil(256) * 256 + 1024;
             let want = want_slots as u64 * stride;
-            // the arena holds less than 90 % of the profiled hot set
-            let hot_spills = cap_slots * 10 < warm_order.len() * 9;
             let asked = match std::env::var("CMF_QWEN_HTIER_MB").ok().as_deref() {
-                None | Some("") if hot_spills && q4::small_bar() => want,
                 None | Some("") => 0,
                 Some("auto") => want,
                 Some(v) => v.parse::<u64>().map_or(0, |mb| mb << 20),

@@ -8066,7 +8066,7 @@ pub(crate) fn stage_expert(
 /// starts after the first completed submission (`done`), so the first
 /// encode creates its resources unhindered; the pinning still holds up the
 /// frames that run alongside it (~7 s in all for 28 GiB on the 3090), which
-/// is why the tier is not on by default with the whole card (§8).
+/// is why the tier is not on by default (§8.7 of the device doc).
 pub(crate) struct HostTier {
     bank: Arc<Dsv4GlobalMoeBufs>,
     segs: Arc<Vec<std::sync::OnceLock<super::host_mem::SysBuf>>>,
@@ -8101,12 +8101,6 @@ struct TierMeta {
     epoch: Vec<u64>,
     bump: usize,
     hand: usize,
-}
-
-/// The card of the device path takes `write_buffer` bytes through the legacy
-/// BAR window (`host_mem::small_bar`): where the host tier pays off.
-pub(crate) fn small_bar() -> bool {
-    ctx().is_some_and(|c| super::host_mem::small_bar(&c.device))
 }
 
 impl HostTier {
