@@ -618,6 +618,7 @@ name = "cortiq-engine"
 version = "0.8.14"
 dependencies = [
  "anyhow",
+ "ash",
  "base64",
  "bytemuck",
  "cortiq-core",

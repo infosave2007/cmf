@@ -38,12 +38,18 @@ bytemuck = { version = "1", optional = true, features = ["derive"] }
 
 [features]
 # `--features gpu` enables the wgpu path; test on a discrete card.
-gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "dep:ash"]
 
 # Imports `cortiq_engine::gpu_wgpu`, which exists only with `gpu`: without
 # this, `cargo test -p cortiq-engine` (no features) failed to build it.
 [[example]]
 name = "dsv41_expert_gpu_proof"
+required-features = ["gpu"]
+
+# Host-to-card transfer ceilings (memcpy, write_buffer, DMA) for the
+# Qwen3.8-Flash-Next expert admissions.
+[[example]]
+name = "qwen4_xfer_bench"
 required-features = ["gpu"]
 
 # GPU path (D5): Metal on Apple Silicon; unified memory + no-copy buffers.
@@ -62,6 +68,9 @@ libc = "0.2"
 # Vulkan exists: Apple has none (the Metal backend uses its own matrix
 # units) and the wgpu path remains the universal one everywhere.
 [target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))'.dependencies]
+# The same `ash` wgpu-hal is built on: host-heap buffers for DMA uploads
+# (`gpu_wgpu::host_mem`) need a memory type wgpu does not let one choose.
+ash = { version = "0.38", optional = true }
 
 [dev-dependencies]
 # Tests opt into `RUST_LOG` to see the resident-graph refusals (warn!).
