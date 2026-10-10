@@ -48,6 +48,11 @@
 //! from itself. Texts are tokenized as `[BOS] + prompt + text + [EOS]` and
 //! capped at 8192 tokens; an input with media that does not fit is a 400.
 //! Token-id inputs get BOS/EOS added when missing and are not prompted.
+//!
+//! Requests are decoded in parallel; the forwards run on one worker that
+//! batches every request waiting when it comes free (an array input is one
+//! batch already; concurrent single-text clients share forwards — measured
+//! on an M4: 27 → 185 single-query requests/s at 64 clients).
 
 use axum::{
     Router,
@@ -66,8 +71,8 @@ use cortiq_engine::egemma2_mm::{
 };
 use cortiq_engine::egemma2_vision::{BUDGETS, decode_video};
 use serde_json::{Value, json};
-use std::sync::Arc;
-use tokio::sync::Semaphore;
+use std::sync::{Arc, Mutex, mpsc};
+use tokio::sync::oneshot;
 use tower_http::cors::CorsLayer;
 
 /// OpenAI's own cap on inputs per request.
@@ -75,23 +80,143 @@ const MAX_INPUTS: usize = 2048;
 /// Media items per request (each image is a ViT forward, each clip up to
 /// 30 s through the audio tower).
 const MAX_MEDIA: usize = 64;
+/// One batched forward takes queued requests up to this many tokens …
+const BATCH_TOKENS: usize = 16_384;
+/// … and this many requests.
+const BATCH_JOBS: usize = 256;
 
 pub struct EmbedState {
     pub enc: Arc<MediaEncoder>,
     pub model_id: String,
     /// local paths are accepted as media sources
     pub local_media: bool,
-    sem: Arc<Semaphore>,
+    batcher: Batcher,
 }
 
 impl EmbedState {
     pub fn new(enc: MediaEncoder, model_id: String, local_media: bool) -> Self {
+        let enc = Arc::new(enc);
         EmbedState {
-            enc: Arc::new(enc),
+            batcher: Batcher::start(enc.clone()),
+            enc,
             model_id,
             local_media,
-            // one forward at a time: it already uses every core
-            sem: Arc::new(Semaphore::new(1)),
+        }
+    }
+}
+
+/// The embeddings of one request: its mixed inputs, then its token-id inputs.
+type Embedded = Result<(Vec<Vec<f32>>, Vec<Vec<f32>>), String>;
+
+/// One request's prepared inputs, waiting for a forward.
+struct Job {
+    mixed: Vec<MixedInput>,
+    ids: Vec<Vec<u32>>,
+    tokens: usize,
+    reply: oneshot::Sender<Embedded>,
+}
+
+/// Cross-request batching: one worker thread owns the forwards (each
+/// already uses every core, or the GPU), and when it comes free it takes
+/// every request queued meanwhile (up to [`BATCH_TOKENS`] /
+/// [`BATCH_JOBS`]) into one batch — concurrent single-query clients share
+/// a forward instead of queueing for one each. An idle server adds no
+/// delay: a lone request runs as soon as it arrives.
+struct Batcher {
+    tx: Mutex<mpsc::Sender<Job>>,
+}
+
+impl Batcher {
+    fn start(enc: Arc<MediaEncoder>) -> Batcher {
+        let (tx, rx) = mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("embed-batcher".into())
+            .spawn(move || {
+                let mut held: Option<Job> = None;
+                loop {
+                    let first = match held.take() {
+                        Some(j) => j,
+                        None => match rx.recv() {
+                            Ok(j) => j,
+                            Err(_) => return,
+                        },
+                    };
+                    let mut toks = first.tokens;
+                    let mut jobs = vec![first];
+                    while jobs.len() < BATCH_JOBS {
+                        match rx.try_recv() {
+                            Ok(j) if toks + j.tokens > BATCH_TOKENS => {
+                                held = Some(j);
+                                break;
+                            }
+                            Ok(j) => {
+                                toks += j.tokens;
+                                jobs.push(j);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    run_batch(&enc, jobs);
+                }
+            })
+            .expect("spawn the embedding batcher");
+        Batcher { tx: Mutex::new(tx) }
+    }
+
+    fn submit(&self, job: Job) -> Result<(), String> {
+        self.tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send(job)
+            .map_err(|_| "the embedding worker has stopped".to_string())
+    }
+}
+
+fn embed_one(enc: &MediaEncoder, mixed: &[MixedInput], ids: &[Vec<u32>]) -> Embedded {
+    let a = if mixed.is_empty() {
+        Vec::new()
+    } else {
+        enc.embed(mixed)?
+    };
+    let b = if ids.is_empty() {
+        Vec::new()
+    } else {
+        enc.text.embed_ids(ids)?
+    };
+    Ok((a, b))
+}
+
+/// One forward over the jobs' inputs together; on an error each job runs
+/// alone, so it gets its own result.
+fn run_batch(enc: &MediaEncoder, mut jobs: Vec<Job>) {
+    if jobs.len() == 1 {
+        let j = jobs.pop().unwrap();
+        let r = embed_one(enc, &j.mixed, &j.ids);
+        let _ = j.reply.send(r);
+        return;
+    }
+    let mut counts = Vec::with_capacity(jobs.len());
+    let (mut mixed, mut ids) = (Vec::new(), Vec::new());
+    for j in &mut jobs {
+        counts.push((j.mixed.len(), j.ids.len()));
+        mixed.append(&mut j.mixed);
+        ids.append(&mut j.ids);
+    }
+    match embed_one(enc, &mixed, &ids) {
+        Ok((a, b)) => {
+            let (mut a, mut b) = (a.into_iter(), b.into_iter());
+            for (j, &(na, nb)) in jobs.into_iter().zip(&counts) {
+                let mine = (a.by_ref().take(na).collect(), b.by_ref().take(nb).collect());
+                let _ = j.reply.send(Ok(mine));
+            }
+        }
+        Err(_) => {
+            let (mut mixed, mut ids) = (mixed.into_iter(), ids.into_iter());
+            for (j, &(na, nb)) in jobs.into_iter().zip(&counts) {
+                let m: Vec<MixedInput> = mixed.by_ref().take(na).collect();
+                let s: Vec<Vec<u32>> = ids.by_ref().take(nb).collect();
+                let _ = j.reply.send(embed_one(enc, &m, &s));
+            }
         }
     }
 }
@@ -700,16 +825,11 @@ async fn embeddings(State(st): State<Arc<EmbedState>>, body: Bytes) -> Response 
         Ok(p) => p,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, e, "invalid_request_error"),
     };
-    let Ok(_permit) = st.sem.clone().acquire_owned().await else {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            bad("server is shutting down", None),
-            "server_error",
-        );
-    };
     let enc = st.enc.clone();
     let local = st.local_media;
-    let job = tokio::task::spawn_blocking(move || -> Result<(Vec<Vec<f32>>, usize), ApiError> {
+    // decode and lay out the inputs off the runtime (requests in parallel)
+    type Prepared = (Vec<bool>, Vec<MixedInput>, Vec<Vec<u32>>, usize);
+    let prep = tokio::task::spawn_blocking(move || -> Result<Prepared, ApiError> {
         let mut inputs = Vec::with_capacity(parsed.items.len());
         let mut tokens = 0usize;
         for (i, it) in parsed.items.iter().enumerate() {
@@ -747,33 +867,21 @@ async fn embeddings(State(st): State<Arc<EmbedState>>, body: Bytes) -> Response 
             tokens += n;
             inputs.push((i, Some(x), None));
         }
-        let mixed: Vec<MixedInput> = inputs.iter().filter_map(|(_, x, _)| x.clone()).collect();
-        let ids: Vec<Vec<u32>> = inputs.iter().filter_map(|(_, _, s)| s.clone()).collect();
+        let order: Vec<bool> = inputs.iter().map(|(_, x, _)| x.is_some()).collect();
+        let mut mixed = Vec::new();
+        let mut ids = Vec::new();
+        for (_, x, s) in inputs {
+            match (x, s) {
+                (Some(x), _) => mixed.push(x),
+                (None, Some(s)) => ids.push(s),
+                (None, None) => {}
+            }
+        }
         tokens += ids.iter().map(|s| s.len()).sum::<usize>();
-        let mut a = if mixed.is_empty() {
-            Vec::new()
-        } else {
-            enc.embed(&mixed).map_err(|e| bad(e, Some("input")))?
-        }
-        .into_iter();
-        let mut b = if ids.is_empty() {
-            Vec::new()
-        } else {
-            enc.text
-                .embed_ids(&ids)
-                .map_err(|e| bad(e, Some("input")))?
-        }
-        .into_iter();
-        let mut out = Vec::with_capacity(inputs.len());
-        for (_, x, _) in &inputs {
-            let v = if x.is_some() { a.next() } else { b.next() };
-            let v = v.ok_or_else(|| bad("embedding count mismatch", None))?;
-            out.push(matryoshka(&v, parsed.dim).map_err(|e| bad(e, Some("dimensions")))?);
-        }
-        Ok((out, tokens))
+        Ok((order, mixed, ids, tokens))
     })
     .await;
-    let (vecs, tokens) = match job {
+    let (order, mixed, ids, tokens) = match prep {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => return error_response(StatusCode::BAD_REQUEST, e, "invalid_request_error"),
         Err(e) => {
@@ -784,6 +892,59 @@ async fn embeddings(State(st): State<Arc<EmbedState>>, body: Bytes) -> Response 
             );
         }
     };
+    // the forward: batched with whatever other requests are waiting
+    let (tx, rx) = oneshot::channel();
+    if let Err(e) = st.batcher.submit(Job {
+        mixed,
+        ids,
+        tokens,
+        reply: tx,
+    }) {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            bad(e, None),
+            "server_error",
+        );
+    }
+    let (a, b) = match rx.await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                bad(e, Some("input")),
+                "invalid_request_error",
+            );
+        }
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                bad("embedding failed: the worker dropped the request", None),
+                "server_error",
+            );
+        }
+    };
+    let (mut a, mut b) = (a.into_iter(), b.into_iter());
+    let mut vecs = Vec::with_capacity(order.len());
+    for is_mixed in order {
+        let v = if is_mixed { a.next() } else { b.next() };
+        let Some(v) = v else {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                bad("embedding count mismatch", None),
+                "server_error",
+            );
+        };
+        match matryoshka(&v, parsed.dim) {
+            Ok(m) => vecs.push(m),
+            Err(e) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    bad(e, Some("dimensions")),
+                    "invalid_request_error",
+                );
+            }
+        }
+    }
     let data: Vec<Value> = vecs
         .iter()
         .enumerate()

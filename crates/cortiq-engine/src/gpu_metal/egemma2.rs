@@ -232,7 +232,7 @@ fn wrap(c: &Ctx, v: &[f32]) -> Buffer {
     let page = super::page_size();
     let addr = v.as_ptr() as usize;
     let bytes = v.len() * 4;
-    if bytes >= page && addr % page == 0 {
+    if bytes >= page && addr.is_multiple_of(page) {
         return c._device.new_buffer_with_bytes_no_copy(
             v.as_ptr() as *const c_void,
             (bytes.div_ceil(page) * page) as u64,
@@ -404,7 +404,6 @@ impl Arena {
 #[derive(Clone, Copy)]
 struct AttItem {
     s0: usize,
-    len: usize,
     h: usize,
     kvh: usize,
     q0: usize,
@@ -459,7 +458,6 @@ fn att_plan(
                     },
                     AttItem {
                         s0,
-                        len,
                         h,
                         kvh: h / group,
                         q0,
@@ -829,7 +827,10 @@ impl TextGpu {
         let c = super::ctx().ok_or("no Metal device")?;
         pipes(c)?;
         let d = spec.hidden;
-        if d % 64 != 0 || spec.inter % 64 != 0 || spec.n_ple % 64 != 0 {
+        if ![d, spec.inter, spec.n_ple]
+            .iter()
+            .all(|x| x.is_multiple_of(64))
+        {
             return Err(format!(
                 "widths {d}/{}/{} are not multiples of 64",
                 spec.inter, spec.n_ple
@@ -838,7 +839,7 @@ impl TextGpu {
         let mut layers = Vec::with_capacity(spec.layers.len());
         for (i, l) in spec.layers.iter().enumerate() {
             let hd = l.head_dim;
-            if hd % 64 != 0 || l.kv_heads == 0 || l.q_heads % l.kv_heads != 0 {
+            if !hd.is_multiple_of(64) || l.kv_heads == 0 || !l.q_heads.is_multiple_of(l.kv_heads) {
                 return Err(format!("layer {i}: head layout {}x{hd}", l.q_heads));
             }
             if l.rope >= spec.ropes.len() || spec.ropes[l.rope].0 != hd {

@@ -951,7 +951,7 @@ impl AudioTower {
                     }
                 }
             });
-            crate::fcd_ops::gemm_nt_host(
+            crate::egemma2::gemm_nt(
                 &col[..nr * kk],
                 &self.conv1,
                 &mut y1[tb * f2 * c1..te * f2 * c1],
