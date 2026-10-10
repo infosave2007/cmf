@@ -674,10 +674,21 @@ pub(crate) fn host_available_bytes() -> Option<u64> {
                     .unwrap_or(0);
                 Some(max.saturating_sub(cur.saturating_sub(file)))
             }
+            // cgroup v1: the page cache counts as available here too
             _ => read("/sys/fs/cgroup/memory/memory.limit_in_bytes")
                 .filter(|&v| v < u64::MAX / 2)
                 .zip(read("/sys/fs/cgroup/memory/memory.usage_in_bytes"))
-                .map(|(l, u)| l.saturating_sub(u)),
+                .map(|(l, u)| {
+                    let cache = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.stat")
+                        .ok()
+                        .and_then(|s| {
+                            s.lines()
+                                .find(|l| l.starts_with("total_cache "))
+                                .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+                        })
+                        .unwrap_or(0);
+                    l.saturating_sub(u.saturating_sub(cache))
+                }),
         };
         Some(cg.map_or(avail, |c| c.min(avail)))
     }
