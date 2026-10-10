@@ -9938,6 +9938,10 @@ pub(crate) mod tests {
 
     #[test]
     fn convert_tiny_model_end_to_end() {
+        // run_convert reads CMF_CONVERT_ONLY and the resume knobs, which
+        // other tests set under ENV_LOCK: without it this conversion could
+        // come out a partial probe file.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("cortiq-convtest-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -9981,6 +9985,9 @@ pub(crate) mod tests {
         // instead of upstream weights.  It crosses the converter, CMF
         // directory, generic MoE loader and one real forward pass, including
         // all three local-attention layers and the YaRN full-attention layer.
+        // ENV_LOCK: run_convert reads CMF_CONVERT_ONLY, which the probe test
+        // sets for its own conversion.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "cortiq-mellum-convtest-{}",
             std::process::id()
