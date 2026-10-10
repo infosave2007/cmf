@@ -31,6 +31,8 @@ pub mod mimo_bank;
 pub(crate) mod qwen4;
 /// Row-blocked decode kernels for the generic q4tp MoE graph block.
 pub(crate) mod moe_r4;
+/// q8_2f MoE experts on the token graph (decode) and batch graph (prefill).
+pub(crate) mod moe_q82;
 /// Token-axis batch kernels of the dense GDN hybrids (gated attention).
 pub(crate) mod dense_batch;
 /// Warp-per-row q4tp decode matvecs (bit-identical to the 16nl rows).
@@ -23316,12 +23318,10 @@ fn moe_expert_bufs(
     gu_q2: bool,
     dn_q2: bool,
 ) -> Option<(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer)> {
-    use std::sync::atomic::Ordering;
     if hidden % 32 != 0 || inter % 32 != 0 {
         graph_refused("moe_expert_bufs: hidden/inter not 32-aligned");
         return None;
     }
-    let bytes = model.primary_bytes();
     let key = (model.uid() as usize, experts.first()?.0);
     if let Some(t) = c.moe_expw.lock().unwrap().get(&key) {
         return Some(t.clone());
@@ -23345,6 +23345,61 @@ fn moe_expert_bufs(
     } else {
         plen(hidden, inter)?
     };
+    moe_expert_upload(c, model, experts, inter, hidden, gu_len, d_len)
+}
+
+/// q8_2f experts (gate, up, down): one blob each — int8 body, f16 row
+/// scales, f16 column field — packed expert after expert like the 4-bit
+/// stacks. Same budget rule, cache key and upload as `moe_expert_bufs`.
+fn moe_expert_bufs_q82(
+    c: &Ctx,
+    model: &Arc<CmfModel>,
+    experts: &[(usize, usize, usize)],
+    inter: usize,
+    hidden: usize,
+) -> Option<(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer)> {
+    if !moe_q82::fits(hidden, inter) {
+        graph_refused("moe_expert_bufs_q82: geometry outside the q8_2f expert kernels");
+        return None;
+    }
+    let key = (model.uid() as usize, experts.first()?.0);
+    if let Some(t) = c.moe_expw.lock().unwrap().get(&key) {
+        return Some(t.clone());
+    }
+    if experts.iter().flat_map(|&(g, u, d)| [g, u, d]).any(|i| {
+        model
+            .tensors
+            .get(i)
+            .is_none_or(|e| e.dtype != cortiq_core::TensorDtype::Q8_2f)
+    }) {
+        graph_refused("moe_expert_bufs_q82: an expert tensor is not q8_2f");
+        return None;
+    }
+    moe_expert_upload(
+        c,
+        model,
+        experts,
+        inter,
+        hidden,
+        moe_q82::blob_bytes(inter, hidden),
+        moe_q82::blob_bytes(hidden, inter),
+    )
+}
+
+/// The upload half of `moe_expert_bufs`: gate/up blobs of `gu_len` bytes,
+/// down blobs of `d_len`, every expert checked before anything is allocated.
+fn moe_expert_upload(
+    c: &Ctx,
+    model: &Arc<CmfModel>,
+    experts: &[(usize, usize, usize)],
+    inter: usize,
+    hidden: usize,
+    gu_len: usize,
+    d_len: usize,
+) -> Option<(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer)> {
+    use std::sync::atomic::Ordering;
+    let bytes = model.primary_bytes();
+    let key = (model.uid() as usize, experts.first()?.0);
     let total = (experts.len() * (2 * gu_len + d_len)) as u64;
     if c.resident.load(Ordering::Relaxed) + total > c.vram_budget {
         // Over budget — the whole graph falls to CPU. Say so ONCE with the
@@ -24951,6 +25006,8 @@ pub fn forward_token_graph(
             norm_topk: bool,
             q4tp: bool,
             gu_q2: bool,
+            /// q8_2f experts: `moe_q82`'s decode pair.
+            q82: bool,
             sigmoid: bool,
             bias: Option<wgpu::Buffer>,
             has_shared: bool,
@@ -25303,6 +25360,7 @@ pub fn forward_token_graph(
                 norm_topk,
                 q4tp,
                 gu_q2,
+                q82,
                 sigmoid,
                 bias,
                 has_shared,
@@ -25317,6 +25375,14 @@ pub fn forward_token_graph(
                         "moe shape: top_k {top_k} n_exp {n_exp} experts {} (want {want})",
                         experts.len()
                     ));
+                    return token_graph_outcome(o1_started || state_started, false);
+                }
+                // q8_2f experts run only on `moe_q82`'s decode pair: refuse
+                // before any upload when it cannot serve this geometry.
+                if *q82
+                    && (!moe_q82::fits(hidden, *mi) || moe_q82::decode(c, hidden).is_none())
+                {
+                    graph_decline("q8_2f MoE experts: no decode kernels for this device/geometry");
                     return token_graph_outcome(o1_started || state_started, false);
                 }
                 let Some(router) = resolve(router, *n_exp, hidden) else {
@@ -25344,8 +25410,14 @@ pub fn forward_token_graph(
                         .unwrap()
                         .contains_key(&(model.uid() as usize, e.0))
                 });
-                let need = moe_pack_bytes(experts.len(), *mi, hidden, *q4tp, *gu_q2, false)
-                    .unwrap_or(u64::MAX);
+                let need = if *q82 {
+                    (experts.len()
+                        * (2 * moe_q82::blob_bytes(*mi, hidden) + moe_q82::blob_bytes(hidden, *mi)))
+                        as u64
+                } else {
+                    moe_pack_bytes(experts.len(), *mi, hidden, *q4tp, *gu_q2, false)
+                        .unwrap_or(u64::MAX)
+                };
                 if !cached
                     && !lws.is_empty()
                     && c.resident.load(std::sync::atomic::Ordering::Relaxed) + need > c.vram_budget
@@ -25362,9 +25434,12 @@ pub fn forward_token_graph(
                     graph_decline("Prism MoE experts require an unimplemented resident transform");
                     return token_graph_outcome(o1_started || state_started, false);
                 }
-                let Some((gate_all, up_all, down_all)) =
+                let packed = if *q82 {
+                    moe_expert_bufs_q82(c, model, experts, *mi, hidden)
+                } else {
                     moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp, *gu_q2, false)
-                else {
+                };
+                let Some((gate_all, up_all, down_all)) = packed else {
                     graph_decline("moe_expert_bufs (pack/budget/dtype)");
                     return token_graph_outcome(o1_started || state_started, false);
                 };
@@ -25380,6 +25455,7 @@ pub fn forward_token_graph(
                     norm_topk: *norm_topk,
                     q4tp: *q4tp,
                     gu_q2: *gu_q2,
+                    q82: *q82,
                     sigmoid: *sigmoid,
                     bias: bias.map(|b| {
                         c.device
@@ -28422,6 +28498,157 @@ pub fn forward_token_graph(
                         }
                     } // !continue_ffn
                 }
+                // q8_2f experts (`moe_q82`): router matvec, the select (folded
+                // into both expert kernels for a plain softmax top-k), gate/up
+                // + SiLU written pre-multiplied by each slot's down column
+                // field, the weighted down — one compute pass, as the q4tp
+                // block below.
+                LFfn::Moe {
+                    router,
+                    sgate,
+                    gate_all,
+                    up_all,
+                    down_all,
+                    n_exp,
+                    top_k,
+                    inter: mi,
+                    norm_topk,
+                    q82: true,
+                    sigmoid,
+                    bias,
+                    has_shared,
+                    shared_gated,
+                    route_scale,
+                    ..
+                } => {
+                    let (mlogit, mslog, msel, mwt, mact) = moe_bufs.as_ref().unwrap();
+                    let slots = *top_k + usize::from(*has_shared);
+                    let Some(d8) = moe_q82::decode(c, hidden).filter(|_| slots <= 32) else {
+                        graph_decline("q8_2f MoE decode kernels unavailable");
+                        return token_graph_outcome(o1_started || state_started, false);
+                    };
+                    let fold = !*sigmoid
+                        && bias.is_none()
+                        && !*has_shared
+                        && *n_exp <= 64
+                        && std::env::var("CMF_MOE_FOLD").as_deref() != Ok("0");
+                    let job = moe_q82::decode_job(
+                        c,
+                        &d8,
+                        gate_all,
+                        up_all,
+                        down_all,
+                        &n1,
+                        msel,
+                        mwt,
+                        mact,
+                        &ob,
+                        mlogit,
+                        hidden,
+                        *mi,
+                        slots,
+                        fold.then_some((*n_exp, *top_k, *norm_topk, *route_scale)),
+                    );
+                    // The select reads a separately computed shared gate only
+                    // for a gated shared expert whose gate is not f32.
+                    let need_sg = !fold && *has_shared && *shared_gated && sgate.kind != 4;
+                    let pr = prep(router, &n1, mlogit, *n_exp, hidden);
+                    let ps = if need_sg {
+                        prep(sgate, &n1, mslog, 1, hidden)
+                    } else {
+                        None
+                    };
+                    let bg_sel = (!fold).then(|| {
+                        let sel_u = uniform_u32x8(
+                            c,
+                            [
+                                *n_exp as u32,
+                                *top_k as u32,
+                                u32::from(*norm_topk)
+                                    | (u32::from(*sigmoid) << 1)
+                                    | (u32::from(bias.is_some()) << 2)
+                                    | (u32::from(*has_shared) << 3)
+                                    | (u32::from(*has_shared && !*shared_gated) << 4),
+                                ((hidden as u32) << 8) | (u32::from(sgate.kind == 4) * 4),
+                                route_scale.to_bits(),
+                                0,
+                                0,
+                                0,
+                            ],
+                        );
+                        let bias_buf = bias.clone().unwrap_or_else(|| {
+                            c.device
+                                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                    label: Some("moe8-sel-bias0"),
+                                    contents: &[0u8; 4],
+                                    usage: wgpu::BufferUsages::STORAGE,
+                                })
+                        });
+                        bg(
+                            &c.layout_moe_sel,
+                            &[mlogit, mslog, msel, mwt, &sel_u, &sgate.buf, &n1, &bias_buf],
+                        )
+                    });
+                    if pr.is_none() || (need_sg && ps.is_none()) {
+                        // An un-preppable router or gate dtype: own passes,
+                        // after the FFN norm they read.
+                        if let Some((p, b, w)) = ffn_pre.take() {
+                            let mut pass = begin_pass(&mut enc);
+                            pass.set_pipeline(p);
+                            pass.set_bind_group(0, &b, &[]);
+                            pass.dispatch_workgroups(w, 1, 1);
+                        }
+                        if pr.is_none() {
+                            emat(&mut enc, router, &n1, mlogit, *n_exp, hidden);
+                        }
+                        if need_sg && ps.is_none() {
+                            emat(&mut enc, sgate, &n1, mslog, 1, hidden);
+                        }
+                    }
+                    let mut pass = begin_pass(&mut enc);
+                    if let Some((p, b, w)) = &ffn_pre {
+                        pass.set_pipeline(p);
+                        pass.set_bind_group(0, b, &[]);
+                        pass.dispatch_workgroups(*w, 1, 1);
+                    }
+                    let fine = ts_full || li == 0;
+                    tsp!(pass, fine, 30);
+                    if let Some((p, b, w)) = &pr {
+                        if !skip_router {
+                            pass.set_pipeline(p);
+                            pass.set_bind_group(0, b, &[]);
+                            pass.dispatch_workgroups(*w, 1, 1);
+                        }
+                    }
+                    tsp!(pass, fine, 31);
+                    if let Some((p, b, w)) = &ps {
+                        pass.set_pipeline(p);
+                        pass.set_bind_group(0, b, &[]);
+                        pass.dispatch_workgroups(*w, 1, 1);
+                    }
+                    if let Some(b) = &bg_sel {
+                        pass.set_pipeline(&c.moe_select);
+                        pass.set_bind_group(0, b, &[]);
+                        pass.dispatch_workgroups(1, 1, 1);
+                    }
+                    tsp!(pass, fine, 32);
+                    if !skip_moe {
+                        pass.set_pipeline(&d8.gu);
+                        pass.set_bind_group(0, &job.gu_bg, &[]);
+                        pass.dispatch_workgroups(job.gu_x, slots as u32, 1);
+                        tsp!(pass, fine, 33);
+                        pass.set_pipeline(&d8.dn);
+                        pass.set_bind_group(0, &job.dn_bg, &[]);
+                        pass.dispatch_workgroups(job.dn_x, 1, 1);
+                        tsp!(pass, fine, 34);
+                        if let Some((p, b, w)) = &ffn_post {
+                            pass.set_pipeline(p);
+                            pass.set_bind_group(0, b, &[]);
+                            pass.dispatch_workgroups(*w, 1, 1);
+                            tail_done = true;
+                        }
+                    }
+                }
                 LFfn::Moe {
                     router,
                     sgate,
@@ -28434,6 +28661,7 @@ pub fn forward_token_graph(
                     norm_topk,
                     q4tp,
                     gu_q2,
+                    q82: false,
                     sigmoid,
                     bias,
                     has_shared,
@@ -29627,6 +29855,8 @@ pub fn forward_batch_graph_at(
             /// Mixed 2-bit profile: q2tp gate/up over a q4tp down. The
             /// whole-chunk q4tp fast lane must NOT take these bytes.
             gu_q2: bool,
+            /// q8_2f experts: `moe_q82`'s grouped prefill pair.
+            q82: bool,
             sigmoid: bool,
             bias: Option<wgpu::Buffer>,
             /// A shared expert rides as the last pack entry (and slot
@@ -29899,6 +30129,7 @@ pub fn forward_batch_graph_at(
                 norm_topk,
                 q4tp,
                 gu_q2,
+                q82,
                 sigmoid,
                 bias,
                 has_shared,
@@ -29908,6 +30139,17 @@ pub fn forward_batch_graph_at(
                 if *top_k >= 16 || *n_exp > 256 || experts.len() != n_exp + usize::from(*has_shared)
                 {
                     bgraph_refused("site:5979");
+                    return batch_outcome(o1_started || state_started, false);
+                }
+                // q8_2f experts ride only the expert-grouped pair, which
+                // buckets routed experts (no shared slot).
+                if *q82
+                    && (*has_shared
+                        || !moe_q82::fits(hidden, *mi)
+                        || moe_q82::prefill(c).is_none()
+                        || moe_r4::prefill(c).is_none())
+                {
+                    bgraph_refused("q8_2f MoE experts: no grouped prefill kernels for this layer");
                     return batch_outcome(o1_started || state_started, false);
                 }
                 // Without a shared expert the router stands in for the gate
@@ -29923,9 +30165,16 @@ pub fn forward_batch_graph_at(
                     bgraph_refused("site:5985");
                     return batch_outcome(o1_started || state_started, false);
                 };
-                let Some((gate_all, up_all, down_all)) =
+                if *q82 && router.kind != 4 && !gemmable(&router) {
+                    bgraph_refused("q8_2f MoE: router weight neither f32 nor gemmable");
+                    return batch_outcome(o1_started || state_started, false);
+                }
+                let packed = if *q82 {
+                    moe_expert_bufs_q82(c, model, experts, *mi, hidden)
+                } else {
                     moe_expert_bufs(c, model, experts, *mi, hidden, *q4tp, *gu_q2, false)
-                else {
+                };
+                let Some((gate_all, up_all, down_all)) = packed else {
                     bgraph_refused("site:5990");
                     return batch_outcome(o1_started || state_started, false);
                 };
@@ -29941,6 +30190,7 @@ pub fn forward_batch_graph_at(
                     norm_topk: *norm_topk,
                     q4tp: *q4tp,
                     gu_q2: *gu_q2,
+                    q82: *q82,
                     sigmoid: *sigmoid,
                     bias: bias.map(|b| {
                         c.device
@@ -32050,6 +32300,122 @@ pub fn forward_batch_graph_at(
                 };
                 ematb(&mut enc, down, &abuf_p, &ob, hidden, inter);
             }
+            // q8_2f experts (`moe_q82`): every token's router row, the
+            // batched select, then the expert-grouped pair — the selections
+            // bucketed by expert (`moeg_group`), each expert's weights
+            // streamed once for up to eight of its entries, the slot outputs
+            // mixed per token in slot order (`moeg_sum`).
+            BFfn::Moe {
+                router,
+                sgate,
+                gate_all,
+                up_all,
+                down_all,
+                n_exp,
+                top_k,
+                inter: mi,
+                norm_topk,
+                q82: true,
+                sigmoid,
+                bias,
+                has_shared,
+                shared_gated,
+                route_scale,
+                ..
+            } => {
+                let (mlogit, _mslog, msel, mwt, mact) = moe_bufs.as_ref().unwrap();
+                let slots = *top_k + usize::from(*has_shared);
+                let (Some(p8), Some(pg)) = (moe_q82::prefill(c), moe_r4::prefill(c)) else {
+                    bgraph_refused("q8_2f MoE prefill kernels unavailable");
+                    return batch_outcome(o1_started || state_started, false);
+                };
+                let sel_u = uniform_u32x8(
+                    c,
+                    [
+                        *n_exp as u32,
+                        *top_k as u32,
+                        u32::from(*norm_topk)
+                            | (u32::from(*sigmoid) << 1)
+                            | (u32::from(bias.is_some()) << 2)
+                            | (u32::from(*has_shared) << 3)
+                            | (u32::from(*has_shared && !*shared_gated) << 4),
+                        ((hidden as u32) << 8) | (u32::from(sgate.kind == 4) * 4),
+                        route_scale.to_bits(),
+                        0,
+                        0,
+                        0,
+                    ],
+                );
+                let bias_buf = bias.clone().unwrap_or_else(|| {
+                    c.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("bmoe8-sel-bias0"),
+                            contents: &[0u8; 4],
+                            usage: wgpu::BufferUsages::STORAGE,
+                        })
+                });
+                if router.kind == 4 {
+                    // Router for every token in ONE dispatch (f32_matvec's
+                    // per-row math, as the q4tp lane).
+                    let fr_u = uniform_u32x4(c, [hidden as u32, *n_exp as u32, 0, 0]);
+                    let mut pass = begin_pass(&mut enc);
+                    pass.set_pipeline(&c.f32_matvec_b);
+                    pass.set_bind_group(
+                        0,
+                        &bg(&c.layout_f32b, &[&router.buf, &n1, mlogit, &fr_u]),
+                        &[],
+                    );
+                    pass.dispatch_workgroups((*n_exp as u32).min(MAX_WG), k as u32, 1);
+                } else {
+                    ematb(&mut enc, router, &n1, mlogit, *n_exp, hidden);
+                }
+                let bg_sel = bg(
+                    &c.layout_moe_sel_b,
+                    &[mlogit, &n1, msel, mwt, &sel_u, &sgate.buf, &bias_buf],
+                );
+                let n_ent = k * slots;
+                let mkb = |n: usize, label: &str| {
+                    c.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(label),
+                        size: (n * 4).max(16) as u64,
+                        usage: wgpu::BufferUsages::STORAGE,
+                        mapped_at_creation: false,
+                    })
+                };
+                let goff = mkb(*n_exp + 1, "moeg8-off");
+                let gent = mkb(n_ent, "moeg8-ent");
+                let ypart = mkb(n_ent * hidden, "moeg8-y");
+                let gr_u = uniform_u32x4(c, [*n_exp as u32, n_ent as u32, 0, 0]);
+                let gs_u =
+                    uniform_u32x4(c, [hidden as u32, slots as u32, (k * hidden) as u32, 0]);
+                let bg_gr = bind_pairs(
+                    c,
+                    &pg.group_l,
+                    &[(0, msel), (1, &goff), (2, &gent), (3, &gr_u)],
+                );
+                let bg_gs =
+                    bind_pairs(c, &pg.sum_l, &[(0, &ypart), (1, mwt), (2, &ob), (3, &gs_u)]);
+                let job = moe_q82::prefill_job(
+                    c, &p8, gate_all, up_all, down_all, &n1, &goff, &gent, mact, &ypart, hidden,
+                    *mi, slots, *n_exp, k,
+                );
+                let mut pass = begin_pass(&mut enc);
+                pass.set_pipeline(&c.moe_select_b);
+                pass.set_bind_group(0, &bg_sel, &[]);
+                pass.dispatch_workgroups(k as u32, 1, 1);
+                pass.set_pipeline(&pg.group);
+                pass.set_bind_group(0, &bg_gr, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+                pass.set_pipeline(&p8.gu);
+                pass.set_bind_group(0, &job.gu_bg, &[]);
+                pass.dispatch_workgroups(job.gu_grid.0, job.gu_grid.1, job.gu_grid.2);
+                pass.set_pipeline(&p8.dn);
+                pass.set_bind_group(0, &job.dn_bg, &[]);
+                pass.dispatch_workgroups(job.dn_grid.0, job.dn_grid.1, job.dn_grid.2);
+                pass.set_pipeline(&pg.sum);
+                pass.set_bind_group(0, &bg_gs, &[]);
+                pass.dispatch_workgroups(((k * hidden) as u32).div_ceil(256), 1, 1);
+            }
             // Routing is per token, so the experts run token by token —
             // but inside THIS submit, next to the batched attention and
             // projections. Same four kernels the token graph uses, fed a
@@ -32066,6 +32432,7 @@ pub fn forward_batch_graph_at(
                 norm_topk,
                 q4tp,
                 gu_q2,
+                q82: false,
                 sigmoid,
                 bias,
                 has_shared,
