@@ -5149,7 +5149,7 @@ impl Pipeline {
                     }
                 }
             }
-            let t_next = match forced {
+            let t_next = match forced.or_else(|| forced_ids_at(generated)) {
                 Some(c) => c,
                 None => {
                     let _prof = crate::cpuprof::time(crate::cpuprof::Slot::Sampler);
@@ -9858,7 +9858,7 @@ impl Pipeline {
                     (&d.gate_proj, &d.up_proj, &d.down_proj, d.act, None)
                 }
                 FfnKind::Moe(m) => match chunk_moe_parts(m, hs) {
-                    Some((router, experts)) => {
+                    Some((router, experts, q8)) => {
                         let e0 = &m.experts[0];
                         let route = Box::new(move |lg: &[f32]| {
                             // `moe_ffn_batch`'s routing and weights, row by row.
@@ -9881,6 +9881,7 @@ impl Pipeline {
                             Some(crate::gpu_metal::ChunkMoe {
                                 router,
                                 experts,
+                                q8,
                                 route,
                             }),
                         )
@@ -17899,7 +17900,7 @@ pub(crate) fn moe_parts(
 /// host's (`moe_route`), so mask and selection bias need nothing here.
 #[cfg(target_os = "macos")]
 #[allow(clippy::type_complexity)]
-fn chunk_moe_parts(m: &MoeFfn, hidden: usize) -> Option<(&[f32], Vec<(usize, usize, usize)>)> {
+fn chunk_moe_parts(m: &MoeFfn, hidden: usize) -> Option<(&[f32], Vec<(usize, usize, usize)>, bool)> {
     if m.shared.is_some()
         || m.per_expert_scale.is_some()
         || m.resonance.is_some()
@@ -17918,6 +17919,10 @@ fn chunk_moe_parts(m: &MoeFfn, hidden: usize) -> Option<(&[f32], Vec<(usize, usi
         return None;
     }
     let inter = m.experts[0].gate_proj.rows();
+    // All-q8_2f experts (Mellum2.1 q8_2f) ride the `moe_q8` GEMMs;
+    // `CMF_METAL_MOE_Q8=0` keeps them on the host walk.
+    let q8 = crate::gpu_metal::moe_q8::enabled()
+        && m.experts[0].gate_proj.q8_2f_parts().is_some();
     let experts = m
         .experts
         .iter()
@@ -17932,6 +17937,10 @@ fn chunk_moe_parts(m: &MoeFfn, hidden: usize) -> Option<(&[f32], Vec<(usize, usi
             {
                 return None;
             }
+            if q8 {
+                let q8i = |t: &QTensor| t.q8_2f_parts().map(|p| p.0);
+                return Some((q8i(&e.gate_proj)?, q8i(&e.up_proj)?, q8i(&e.down_proj)?));
+            }
             Some((
                 e.gate_proj.mapped_q4tp()?.1,
                 e.up_proj.mapped_q4tp()?.1,
@@ -17939,7 +17948,7 @@ fn chunk_moe_parts(m: &MoeFfn, hidden: usize) -> Option<(&[f32], Vec<(usize, usi
             ))
         })
         .collect::<Option<Vec<_>>>()?;
-    Some((rf, experts))
+    Some((rf, experts, q8))
 }
 
 /// Map a MoE onto the Metal token graph's contract: f32 router, a
@@ -17996,6 +18005,12 @@ fn metal_moe_graph_parts(m: &MoeFfn, hidden: usize) -> Option<crate::gpu::GpuMoe
     // The first expert's gate decides the profile; every trio (shared
     // included) must agree — the jobs ladder flips ONE kernel for all.
     let gu_q2 = m.experts[0].gate_proj.mapped_q2tp().is_some();
+    // All-q8_2f routed experts (Mellum2.1 q8_2f: no shared expert, the
+    // contract they were measured on) take the `moe_q8` kernels;
+    // `CMF_METAL_MOE_Q8=0` keeps them off the graph (per-op path).
+    let q8 = crate::gpu_metal::moe_q8::enabled()
+        && m.shared.is_none()
+        && m.experts[0].gate_proj.q8_2f_parts().is_some();
     let trio = |e: &DenseFfn| -> Option<(usize, usize, usize)> {
         if e.act != Act::Silu
             || e.gate_proj.rows() != inter
@@ -18006,6 +18021,10 @@ fn metal_moe_graph_parts(m: &MoeFfn, hidden: usize) -> Option<crate::gpu::GpuMoe
             || e.down_proj.cols() != inter
         {
             return None;
+        }
+        if q8 {
+            let q8i = |t: &QTensor| t.q8_2f_parts().map(|p| p.0);
+            return Some((q8i(&e.gate_proj)?, q8i(&e.up_proj)?, q8i(&e.down_proj)?));
         }
         let pick = |t: &QTensor| -> Option<usize> {
             if gu_q2 {
@@ -18036,10 +18055,29 @@ fn metal_moe_graph_parts(m: &MoeFfn, hidden: usize) -> Option<crate::gpu::GpuMoe
         norm_topk: m.norm_topk_prob,
         route_scale: m.routed_scaling,
         gu_q2,
+        q8,
         sigmoid: m.router_sigmoid,
         bias: m.expert_bias.as_deref(),
         shared_gated,
     })
+}
+
+/// `CMF_FORCE_IDS=<file>` (diagnostics): decode step n commits the n-th
+/// whitespace-separated token id of the file instead of sampling, while the
+/// logits are still computed (and dumped by `CMF_LOGIT_DUMP_ALL`) — one
+/// backend teacher-forced along another's greedy sequence, so top-1
+/// agreement can be counted past a near-tie divergence.
+fn forced_ids_at(step: usize) -> Option<u32> {
+    static IDS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    IDS.get_or_init(|| {
+        std::env::var("CMF_FORCE_IDS")
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|s| s.split_whitespace().filter_map(|t| t.parse().ok()).collect())
+            .unwrap_or_default()
+    })
+    .get(step)
+    .copied()
 }
 
 /// Build one gate/up/down GPU job from three tensors. `moe_push_job` is the
