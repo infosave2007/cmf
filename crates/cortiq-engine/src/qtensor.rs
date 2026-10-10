@@ -616,6 +616,23 @@ impl QTensor {
         }
     }
 
+    /// (model, tensor idx) for a q8_2f mapped weight — the eight-bit slot of
+    /// the MoE graph ladder (int8 body, f16 row scales, f16 column field).
+    pub fn mapped_q8_2f(&self) -> Option<(&Arc<CmfModel>, usize)> {
+        if self.has_prism_contract() {
+            return None;
+        }
+        match self {
+            Self::Mapped {
+                model,
+                idx,
+                dtype: TensorDtype::Q8_2f,
+                ..
+            } => Some((model, *idx)),
+            _ => None,
+        }
+    }
+
     /// (model, tensor idx) for a q2tp mapped weight — the 2-bit twin of
     /// `mapped_q4tp`, used by the mixed MoE profile.
     pub fn mapped_q2tp(&self) -> Option<(&Arc<CmfModel>, usize)> {

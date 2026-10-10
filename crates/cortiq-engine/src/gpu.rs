@@ -1722,6 +1722,11 @@ pub enum GraphFfn<'a> {
         /// `down` stays q4tp — the mixed profile a 2-bit-class checkpoint
         /// converts into. Only meaningful with `q4tp: true`.
         gu_q2: bool,
+        /// `true` = every expert's gate, up AND down is q8_2f (int8 body,
+        /// f16 row scales, f16 column field; Mellum2.1's quality file).
+        /// `q4tp` and `gu_q2` are false then. Its own kernels: each
+        /// expert's input is multiplied by THAT expert's column field.
+        q82: bool,
         /// LFM2-MoE / DeepSeek-V3 `noaux_tc` routing: per-expert sigmoid
         /// scores instead of a softmax, and `norm_topk` renormalises with
         /// the 1e-6 floor. The softmax arm is bit-identical to before.
@@ -1947,6 +1952,13 @@ pub fn mimo_attention_scratch_scope<R>(enabled: bool, f: impl FnOnce() -> R) -> 
     }
     let _restore = Restore(MIMO_ATTN_SCRATCH.with(|v| v.replace(enabled)));
     f()
+}
+
+/// q8_2f MoE experts on the wgpu token and batch graphs (`CMF_MOE_Q82=0`
+/// keeps them off the graphs: every op on its own, the 0.8.15 route).
+pub(crate) fn moe_q82_graph_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_MOE_Q82").as_deref() != Ok("0"))
 }
 
 thread_local! {
