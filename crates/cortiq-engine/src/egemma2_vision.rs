@@ -878,6 +878,8 @@ impl VisionTower {
             Ok("1") => 256,
             _ => GPU_MIN_PATCHES,
         };
+        // mutated only where the device path exists
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut tower = VisionTower {
             #[cfg(target_os = "macos")]
             gpu: None,
@@ -960,13 +962,10 @@ impl VisionTower {
     /// Do the encoder layers run on the device (Metal)?
     pub fn on_device(&self) -> bool {
         #[cfg(target_os = "macos")]
-        {
-            self.gpu.is_some() && !self.host_only.load(std::sync::atomic::Ordering::Relaxed)
-        }
+        let up = self.gpu.is_some();
         #[cfg(not(target_os = "macos"))]
-        {
-            false
-        }
+        let up = false;
+        up && !self.host_only.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Soft tokens of each input, `[n_soft, out_dim]` row-major: the rows
