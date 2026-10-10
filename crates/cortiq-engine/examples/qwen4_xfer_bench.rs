@@ -14,7 +14,7 @@
 //! - DMA: `copy_buffer_to_buffer` from host-heap / `MAP_WRITE` buffers into
 //!   a device-local buffer, as one large copy and as expert-sized parts.
 //!
-//! Usage: cargo build --release -p cortiq-engine --features gpu \
+//! Usage (Linux): cargo build --release -p cortiq-engine --features gpu \
 //!          --example qwen4_xfer_bench && qwen4_xfer_bench <model.cmf>
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -30,6 +30,14 @@ struct Map {
 unsafe impl Send for Map {}
 unsafe impl Sync for Map {}
 
+// Linux only, like the host-heap buffers it measures: `libc` is not a
+// dependency on Windows, where `--features gpu --all-targets` builds this too.
+#[cfg(not(target_os = "linux"))]
+fn map_file(_path: &str) -> Map {
+    panic!("qwen4_xfer_bench runs on Linux only (mmap of the model, Vulkan host-heap buffers)");
+}
+
+#[cfg(target_os = "linux")]
 fn map_file(path: &str) -> Map {
     use std::os::unix::io::AsRawFd;
     let f = std::fs::File::open(path).expect("open");
