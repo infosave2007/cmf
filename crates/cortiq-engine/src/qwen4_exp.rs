@@ -611,7 +611,7 @@ impl QwenGpuPool {
         chunked: bool,
     ) -> Vec<bool> {
         let t0 = std::time::Instant::now();
-        let me = &*self;
+        let me = self;
         let out: Vec<bool> = if jobs.len() <= 1 {
             jobs.iter()
                 .map(|&(slot, e)| me.fill_slot(model, slot, layer, e, triples[e]))
@@ -3332,18 +3332,38 @@ fn forward_tokens_device(
             }
         }
         // The host-heap tier behind the arena: admissions become DMA copies
-        // (`HostTier`). CMF_QWEN_HTIER_MB=0 turns it off, =<MiB> sizes it;
-        // by default it is sized for every expert the arena cannot hold,
-        // within half of the memory this process can still take.
+        // (`HostTier`). CMF_QWEN_HTIER_MB=0 turns it off, =<MiB> or =auto
+        // sizes it (auto: every expert the arena cannot hold). Unset, it is
+        // on (auto) only where it wins (RTX 3090, §8 of the device doc):
+        // `write_buffer` goes through the legacy BAR window (Linux, no
+        // resizable BAR) and the arena holds under 90 % of the profile's hot
+        // set (a VRAM budget: decode at 12 GB 16.6 -> 27.1 tok/s). With the whole
+        // card the arena holds the hot set, and pinning ~28 GiB stalls the
+        // first prompt frame by ~7 s for a +5 % steady ingest: off there.
+        // Whatever is asked, it never pins more than half of the memory
+        // this process can still take (cgroup and MemAvailable) nor comes
+        // within 16 GiB of it.
         {
             let n_keys = layers.len() * n_experts;
             let want_slots = n_keys.saturating_sub(cap_slots) + cap_slots / 8;
             let stride = (per as u64).div_ceil(256) * 256 + 1024;
             let want = want_slots as u64 * stride;
-            let cap_bytes = match std::env::var("CMF_QWEN_HTIER_MB").ok().as_deref() {
-                None | Some("auto") | Some("") => crate::expert_store::host_available_bytes()
-                    .map_or(0, |avail| want.min(avail / 2)),
+            // the arena holds less than 90 % of the profiled hot set
+            let hot_spills = cap_slots * 10 < warm_order.len() * 9;
+            let asked = match std::env::var("CMF_QWEN_HTIER_MB").ok().as_deref() {
+                None | Some("") if hot_spills && q4::small_bar() => want,
+                None | Some("") => 0,
+                Some("auto") => want,
                 Some(v) => v.parse::<u64>().map_or(0, |mb| mb << 20),
+            };
+            let cap_bytes = if asked == 0 {
+                0
+            } else {
+                crate::expert_store::host_available_bytes().map_or(0, |avail| {
+                    asked
+                        .min(avail / 2)
+                        .min(avail.saturating_sub(16 << 30))
+                })
             };
             if cap_bytes > 0 {
                 let t0 = std::time::Instant::now();
@@ -3351,7 +3371,7 @@ fn forward_tokens_device(
                 if prof {
                     match tier.as_ref() {
                         Some(t) => eprintln!(
-                            "qwen4-device: host tier {} slots ({} MiB, first GiB in {:.0} ms, the rest in the background)",
+                            "qwen4-device: host tier {} slots ({} MiB, first GiB in {:.0} ms, the rest in the background after the first frame)",
                             t.capacity(),
                             (t.capacity() as u64 * t.stride()) >> 20,
                             t0.elapsed().as_secs_f64() * 1e3
