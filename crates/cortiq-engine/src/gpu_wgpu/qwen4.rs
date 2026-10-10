@@ -7788,6 +7788,13 @@ pub(crate) fn whole(b: &wgpu::Buffer) -> Rng {
     Rng::all(b)
 }
 
+/// Submit one finished command buffer on its own.
+pub(crate) fn submit_cb(cb: wgpu::CommandBuffer) {
+    if let Some(c) = ctx() {
+        submit(c, cb);
+    }
+}
+
 /// Submit without a readback (a token whose logits nobody wants).
 pub(crate) fn submit_only(enc: wgpu::CommandEncoder) {
     if let Some(c) = ctx() {
@@ -8033,6 +8040,415 @@ pub(crate) fn stage_expert(
     put(&b.gate[seg], t.0, b.gu_len)
         && put(&b.up[seg], t.1, b.gu_len)
         && put(&b.down[seg], t.2, b.d_len)
+}
+
+// ── host-heap expert tier: admissions as DMA copies ──
+
+/// Routed experts in GPU-visible host memory (`host_mem::sysmem_buffer`,
+/// the cached type), one slot per expert: gate, up and down at 256-byte
+/// aligned offsets. An admission whose expert sits here is three
+/// `copy_buffer_to_buffer` commands, recorded now and submitted ahead of the
+/// frame that reads the arena slot — the card's copy engine pulls the bytes
+/// over PCIe and the CPU copies nothing. A miss copies the expert once from
+/// the mapping into a free slot (CLOCK eviction once the tier is full)
+/// first: parallel writes into system RAM, not into the PCIe window.
+///
+/// Why (RTX 3090, PCIe 4.0 x16, no resizable BAR, measured with the
+/// `qwen4_xfer_bench` example): `write_buffer` stages every expert in the
+/// 256 MB BAR window and serializes across threads (an 8-token prompt frame
+/// spent ~80 ms admitting ~410 experts, ~9 GB/s, the card idle meanwhile);
+/// a DMA copy from host memory runs at 24.5 GB/s and a parallel memcpy from
+/// the page-cached mapping into host memory at 45-60 GB/s.
+///
+/// Segments (1 GiB) are allocated by a background thread — the driver pins
+/// and clears ~0.3 s per GiB — so the tier comes online in steps; an
+/// admission it cannot place yet takes the `write_buffer` path. The thread
+/// starts after the first completed submission (`done`), so the first
+/// encode creates its resources unhindered; the pinning still holds up the
+/// frames that run alongside it (~7 s in all for 28 GiB on the 3090), which
+/// is why the tier is not on by default (§8.7 of the device doc).
+pub(crate) struct HostTier {
+    bank: Arc<Dsv4GlobalMoeBufs>,
+    segs: Arc<Vec<std::sync::OnceLock<super::host_mem::SysBuf>>>,
+    grow_started: std::sync::atomic::AtomicBool,
+    seg_slots: usize,
+    stride: u64,
+    off: [u64; 3],
+    cap: usize,
+    online: Arc<std::sync::atomic::AtomicUsize>,
+    /// no more segments are coming (all allocated, or the driver refused
+    /// one: the tier then stays at `online` slots)
+    grown: Arc<std::sync::atomic::AtomicBool>,
+    meta: std::sync::Mutex<TierMeta>,
+    copies: std::sync::Mutex<Vec<(u32, u32)>>,
+    /// copy batches handed to the queue (`take`) / known complete (`done`)
+    taken: std::sync::atomic::AtomicU64,
+    completed: std::sync::atomic::AtomicU64,
+    pub(crate) hits: std::sync::atomic::AtomicU64,
+    pub(crate) fills: std::sync::atomic::AtomicU64,
+    pub(crate) fill_ns: std::sync::atomic::AtomicU64,
+    pub(crate) misses: std::sync::atomic::AtomicU64,
+    pub(crate) bg_fills: std::sync::atomic::AtomicU64,
+}
+
+struct TierMeta {
+    slot_of: Vec<u32>,
+    key_of: Vec<u32>,
+    ready: Vec<bool>,
+    refbit: Vec<bool>,
+    /// the copy batch that last read the slot: it may be evicted only once
+    /// that batch is complete
+    epoch: Vec<u64>,
+    bump: usize,
+    hand: usize,
+}
+
+impl HostTier {
+    /// A tier of at most `cap_bytes` over `n_keys` experts of `model`'s
+    /// global bank. None off Vulkan, without host-visible system memory, or
+    /// when the first segment cannot be allocated.
+    pub(crate) fn new(model: &CmfModel, n_keys: usize, cap_bytes: u64) -> Option<Arc<Self>> {
+        use std::sync::atomic::{AtomicU64, AtomicUsize};
+        let c = ctx()?;
+        let bank = c.dsv4_global_moe.lock().unwrap().get(&model.uid()).cloned()?;
+        let al = |n: usize| (n as u64).div_ceil(256) * 256;
+        let off = [0, al(bank.gu_len), 2 * al(bank.gu_len)];
+        let stride = off[2] + al(bank.d_len);
+        let seg_bytes = std::env::var("CMF_QWEN_HTIER_SEG_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(1 << 30, |mb| mb << 20)
+            .min(c.device.limits().max_buffer_size);
+        let seg_slots = (seg_bytes / stride) as usize;
+        let cap = ((cap_bytes / stride) as usize).min(n_keys).min(u32::MAX as usize - 1);
+        if seg_slots == 0 || cap < 64 || n_keys >= u32::MAX as usize {
+            return None;
+        }
+        let nseg = cap.div_ceil(seg_slots);
+        let seg_len = seg_slots as u64 * stride;
+        let first = super::host_mem::sysmem_buffer(&c.device, seg_len, true)?;
+        let segs: Arc<Vec<std::sync::OnceLock<super::host_mem::SysBuf>>> =
+            Arc::new((0..nseg).map(|_| std::sync::OnceLock::new()).collect());
+        let _ = segs[0].set(first);
+        let online = Arc::new(AtomicUsize::new(seg_slots.min(cap)));
+        Some(Arc::new(Self {
+            bank,
+            segs,
+            grow_started: std::sync::atomic::AtomicBool::new(nseg <= 1),
+            seg_slots,
+            stride,
+            off,
+            cap,
+            online,
+            grown: Arc::new(std::sync::atomic::AtomicBool::new(nseg <= 1)),
+            meta: std::sync::Mutex::new(TierMeta {
+                slot_of: vec![u32::MAX; n_keys],
+                key_of: vec![u32::MAX; cap],
+                ready: vec![false; cap],
+                refbit: vec![false; cap],
+                epoch: vec![0; cap],
+                bump: 0,
+                hand: 0,
+            }),
+            copies: std::sync::Mutex::new(Vec::new()),
+            taken: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            fills: AtomicU64::new(0),
+            fill_ns: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            bg_fills: AtomicU64::new(0),
+        }))
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    /// Slots whose segment is allocated.
+    pub(crate) fn online(&self) -> usize {
+        self.online.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Bytes per slot.
+    pub(crate) fn stride(&self) -> u64 {
+        self.stride
+    }
+
+    /// Every slot is taken (further fills evict).
+    pub(crate) fn full(&self) -> bool {
+        let limit = if self.grown.load(std::sync::atomic::Ordering::Acquire) {
+            self.online()
+        } else {
+            self.cap
+        };
+        self.meta.lock().unwrap().bump >= limit
+    }
+
+    /// The tier has (or is writing) expert `key`.
+    pub(crate) fn has(&self, key: usize) -> bool {
+        self.meta
+            .lock()
+            .unwrap()
+            .slot_of
+            .get(key)
+            .is_some_and(|&s| s != u32::MAX)
+    }
+
+    /// Fill the tier in the background with `order` (keys, most wanted
+    /// first; `triples[key]` its tensors in `model`) on `threads` threads,
+    /// while it has free slots. Admissions that miss before the loader
+    /// reaches their expert still fill it themselves.
+    pub(crate) fn start_fill(
+        self: &Arc<Self>,
+        model: Arc<CmfModel>,
+        triples: Arc<Vec<(usize, usize, usize)>>,
+        order: Vec<usize>,
+        threads: usize,
+    ) {
+        let order = Arc::new(order);
+        let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..threads.max(1) {
+            let (me, order, next, model, triples) = (
+                Arc::downgrade(self),
+                order.clone(),
+                next.clone(),
+                model.clone(),
+                triples.clone(),
+            );
+            let _ = std::thread::Builder::new()
+                .name("qwen4-tier-fill".into())
+                .spawn(move || {
+                    let bytes = model.primary_bytes();
+                    let part = |i: usize| -> Option<&[u8]> {
+                        let e = model.tensors.get(i)?;
+                        let abs = model.entry_abs_offset(e)?;
+                        bytes.get(abs..abs + e.nbytes as usize)
+                    };
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&key) = order.get(i) else { return };
+                        let Some(t) = me.upgrade() else { return };
+                        if t.has(key) {
+                            continue;
+                        }
+                        let Some(&(g, u, d)) = triples.get(key) else {
+                            continue;
+                        };
+                        let (Some(g), Some(u), Some(d)) = (part(g), part(u), part(d)) else {
+                            continue;
+                        };
+                        loop {
+                            // never evict for a guess: stop once full
+                            if t.full() {
+                                return;
+                            }
+                            if t.fill(key, None, [g, u, d]) || t.has(key) {
+                                break;
+                            }
+                            // the next segment is still being allocated
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                    }
+                });
+        }
+    }
+
+    fn queue_copy(&self, m: &mut TierMeta, s: usize, arena_slot: usize) {
+        m.refbit[s] = true;
+        m.epoch[s] = self.taken.load(std::sync::atomic::Ordering::Acquire) + 1;
+        self.copies
+            .lock()
+            .unwrap()
+            .push((s as u32, arena_slot as u32));
+    }
+
+    /// Queue the copy of expert `key` into `arena_slot` when the tier holds
+    /// it. False when it does not (or it is still being written).
+    pub(crate) fn hit(&self, key: usize, arena_slot: usize) -> bool {
+        if arena_slot >= self.bank.capacity {
+            return false;
+        }
+        let mut m = self.meta.lock().unwrap();
+        let Some(&s) = m.slot_of.get(key) else {
+            return false;
+        };
+        if s == u32::MAX || !m.ready[s as usize] {
+            return false;
+        }
+        self.queue_copy(&mut m, s as usize, arena_slot);
+        drop(m);
+        self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+
+    /// Copy expert `key` (`parts`: gate, up, down) into a tier slot, then,
+    /// with `arena_slot`, queue its copy into the arena. False when the
+    /// tier has no slot for it now (the caller uploads it another way).
+    pub(crate) fn fill(&self, key: usize, arena_slot: Option<usize>, parts: [&[u8]; 3]) -> bool {
+        use std::sync::atomic::Ordering;
+        let b = &self.bank;
+        if parts[0].len() != b.gu_len
+            || parts[1].len() != b.gu_len
+            || parts[2].len() != b.d_len
+            || arena_slot.is_some_and(|a| a >= b.capacity)
+        {
+            return false;
+        }
+        let t0 = std::time::Instant::now();
+        let s = {
+            let mut m = self.meta.lock().unwrap();
+            if m.slot_of.get(key).is_none_or(|&s| s != u32::MAX) {
+                return false;
+            }
+            let online = self.online();
+            let s = if m.bump < online {
+                m.bump += 1;
+                m.bump - 1
+            } else if online < self.cap && !self.grown.load(Ordering::Acquire) {
+                // more segments are coming: do not evict yet
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                return false;
+            } else {
+                // CLOCK over the whole tier: skip slots being written, slots
+                // a pending copy reads, and (once) recently used ones
+                let done = self.completed.load(Ordering::Acquire);
+                let mut pick = None;
+                for _ in 0..2 * self.cap {
+                    let s = m.hand;
+                    m.hand = (m.hand + 1) % self.cap;
+                    if !m.ready[s] || m.epoch[s] > done {
+                        continue;
+                    }
+                    if m.refbit[s] {
+                        m.refbit[s] = false;
+                        continue;
+                    }
+                    pick = Some(s);
+                    break;
+                }
+                let Some(s) = pick else {
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                };
+                let old = m.key_of[s] as usize;
+                if let Some(o) = m.slot_of.get_mut(old) {
+                    *o = u32::MAX;
+                }
+                s
+            };
+            m.key_of[s] = key as u32;
+            m.slot_of[key] = s as u32;
+            m.ready[s] = false;
+            s
+        };
+        let Some(seg) = self.segs[s / self.seg_slots].get() else {
+            // cannot happen (online covers it); undo
+            let mut m = self.meta.lock().unwrap();
+            m.slot_of[key] = u32::MAX;
+            m.key_of[s] = u32::MAX;
+            return false;
+        };
+        let base = (s % self.seg_slots) as u64 * self.stride;
+        let ok = (0..3).all(|i| seg.write(base + self.off[i], parts[i]));
+        let mut m = self.meta.lock().unwrap();
+        if !ok {
+            m.slot_of[key] = u32::MAX;
+            m.key_of[s] = u32::MAX;
+            return false;
+        }
+        m.ready[s] = true;
+        if let Some(a) = arena_slot {
+            self.queue_copy(&mut m, s, a);
+        } else {
+            m.refbit[s] = true;
+        }
+        drop(m);
+        if arena_slot.is_some() {
+            self.fills.fetch_add(1, Ordering::Relaxed);
+            self.fill_ns
+                .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        } else {
+            self.bg_fills.fetch_add(1, Ordering::Relaxed);
+        }
+        true
+    }
+
+    /// The queued copies as one command buffer, to go ahead of the frame
+    /// that reads their arena slots (same queue submission). None when
+    /// nothing is queued.
+    pub(crate) fn take(&self) -> Option<wgpu::CommandBuffer> {
+        let c = ctx()?;
+        let m = self.meta.lock().unwrap();
+        let copies = std::mem::take(&mut *self.copies.lock().unwrap());
+        if copies.is_empty() {
+            return None;
+        }
+        let b = &self.bank;
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("qwen4-host-tier-copies"),
+            });
+        for (s, a) in copies {
+            let (s, a) = (s as usize, a as usize);
+            let Some(seg) = self.segs[s / self.seg_slots].get() else {
+                continue;
+            };
+            let base = (s % self.seg_slots) as u64 * self.stride;
+            let (aseg, local) = (a / b.segment_slots, a % b.segment_slots);
+            let dst = [
+                (&b.gate[aseg], (local * b.gu_len) as u64, b.gu_len as u64),
+                (&b.up[aseg], (local * b.gu_len) as u64, b.gu_len as u64),
+                (&b.down[aseg], (local * b.d_len) as u64, b.d_len as u64),
+            ];
+            for (i, (buf, doff, len)) in dst.into_iter().enumerate() {
+                enc.copy_buffer_to_buffer(&seg.buffer, base + self.off[i], buf, doff, len);
+            }
+        }
+        self.taken
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        drop(m);
+        Some(enc.finish())
+    }
+
+    /// Every batch `take` handed out so far has executed (the caller waited
+    /// on a submission that followed them).
+    pub(crate) fn done(&self) {
+        use std::sync::atomic::Ordering;
+        self.completed
+            .store(self.taken.load(Ordering::Acquire), Ordering::Release);
+        if !self.grow_started.swap(true, Ordering::AcqRel) {
+            self.grow();
+        }
+    }
+
+    /// Allocate the segments after the first in the background.
+    fn grow(&self) {
+        use std::sync::atomic::Ordering;
+        let Some(c) = ctx() else {
+            self.grown.store(true, Ordering::Release);
+            return;
+        };
+        let (segs, online, grown) = (self.segs.clone(), self.online.clone(), self.grown.clone());
+        let (seg_slots, cap) = (self.seg_slots, self.cap);
+        let seg_len = seg_slots as u64 * self.stride;
+        let spawned = std::thread::Builder::new()
+            .name("qwen4-host-tier".into())
+            .spawn(move || {
+                for i in 1..segs.len() {
+                    let Some(b) = super::host_mem::sysmem_buffer(&c.device, seg_len, true) else {
+                        break;
+                    };
+                    let _ = segs[i].set(b);
+                    online.store(((i + 1) * seg_slots).min(cap), Ordering::Release);
+                }
+                grown.store(true, Ordering::Release);
+            });
+        if spawned.is_err() {
+            self.grown.store(true, Ordering::Release);
+        }
+    }
 }
 
 /// A frame salt for cell `j` of a chain that records several positions
