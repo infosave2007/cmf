@@ -30,8 +30,8 @@ hf download infosave/Qwen3.8-27B-cmf qwen38-27b-q4tp.cmf --local-dir .
 cortiq run qwen38-27b-q4tp.cmf --prompt "Explain quicksort in three sentences." --no-think
 ```
 
-Use cortiq 0.7.3 or later; prebuilt binaries for Linux, macOS and Windows
-are on the [releases page](https://github.com/infosave2007/cmf/releases).
+Use cortiq 0.8.15 or later for fast prompt processing; prebuilt binaries for
+Linux, macOS and Windows are on the [releases page](https://github.com/infosave2007/cmf/releases).
 The engine picks the GPU and its settings itself. `--no-think` asks for a
 direct answer; without it the model reasons first, so raise `--max-tokens`
 (default 256).
@@ -54,12 +54,25 @@ Decode speed of `qwen38-27b-q4tp.cmf`, one stream, tok/s:
 | hardware | backend | plain decode | code prompt | `cortiq bench --core` |
 |---|---|---:|---:|---:|
 | RTX 5090 (32 GB) | Vulkan | 48.7 | 56.5 | 76 |
+| RTX 3090 (24 GB) | Vulkan | 37.1 | 43.6 | 62.4 |
 | RTX PRO 4000 Blackwell (24 GB) | Vulkan | 27.9 | 43.9 | 54.8 |
 | Mac mini M4 (24 GB) | Metal | 6.8 | 17.3 | 20.0 |
 
 The code prompt and bench columns use speculative decoding with `--greedy`;
 on the RTX 5090 the code prompt carries a 2.3k-token context. RTX 5090
-figures were measured on an earlier release.
+figures were measured on an earlier release. RTX 3090 figures were measured
+with cortiq 0.8.15 on Ubuntu 24.04: plain decode with `CMF_GRAPH_SPEC=0`, a
+400-token code answer, 91% of drafted tokens accepted in the bench.
+
+Prompt processing on the RTX 3090 (`cortiq bench --ctx N`):
+
+| prompt | prompt processing, tok/s | time to first token | decode at this depth, tok/s |
+|---|---:|---:|---:|
+| 1000 tokens | 199 | 5.0 s | 57.8 |
+| 4000 tokens | 199 | 20.1 s | 33.9 |
+
+Decode in this table is speculative: 87% of drafted tokens are accepted after
+a 1000-token prompt, 50% after a 4000-token prompt.
 
 **Speculative decoding** is on by default for `qwen38-27b-q4tp.cmf`: the
 model's own MTP head drafts several tokens and the GPU verifies them in one
@@ -210,8 +223,8 @@ hf download infosave/Qwen3.8-27B-cmf qwen38-27b-q4tp.cmf --local-dir .
 cortiq run qwen38-27b-q4tp.cmf --prompt "Объясни квиксорт в трёх предложениях." --no-think
 ```
 
-Используйте cortiq 0.7.3 или новее; готовые сборки для Linux, macOS и
-Windows — на [странице релизов](https://github.com/infosave2007/cmf/releases).
+Для быстрой обработки промпта используйте cortiq 0.8.15 или новее; готовые
+сборки для Linux, macOS и Windows — на [странице релизов](https://github.com/infosave2007/cmf/releases).
 Движок сам выбирает GPU и настройки. `--no-think` даёт прямой ответ; без него
 модель сначала рассуждает, поэтому увеличьте `--max-tokens` (по умолчанию 256).
 
@@ -233,12 +246,25 @@ Windows — на [странице релизов](https://github.com/infosave20
 | железо | бэкенд | обычное декодирование | промпт с кодом | `cortiq bench --core` |
 |---|---|---:|---:|---:|
 | RTX 5090 (32 ГБ) | Vulkan | 48.7 | 56.5 | 76 |
+| RTX 3090 (24 ГБ) | Vulkan | 37.1 | 43.6 | 62.4 |
 | RTX PRO 4000 Blackwell (24 ГБ) | Vulkan | 27.9 | 43.9 | 54.8 |
 | Mac mini M4 (24 ГБ) | Metal | 6.8 | 17.3 | 20.0 |
 
 Столбцы «промпт с кодом» и bench измерены со спекулятивным декодированием и
 `--greedy`; на RTX 5090 промпт с кодом идёт с контекстом 2.3k токенов. Данные
-для RTX 5090 получены на одном из прошлых релизов.
+для RTX 5090 получены на одном из прошлых релизов. Данные для RTX 3090 измерены
+на cortiq 0.8.15 под Ubuntu 24.04: обычное декодирование — с `CMF_GRAPH_SPEC=0`,
+ответ на промпт с кодом — 400 токенов, в bench принимается 91 % черновых токенов.
+
+Обработка промпта на RTX 3090 (`cortiq bench --ctx N`):
+
+| промпт | обработка промпта, токенов/с | время до первого токена | декодирование на этой глубине, токенов/с |
+|---|---:|---:|---:|
+| 1000 токенов | 199 | 5.0 с | 57.8 |
+| 4000 токенов | 199 | 20.1 с | 33.9 |
+
+Декодирование в этой таблице спекулятивное: после промпта в 1000 токенов
+принимается 87 % черновых токенов, после промпта в 4000 токенов — 50 %.
 
 **Спекулятивное декодирование** включено по умолчанию для
 `qwen38-27b-q4tp.cmf`: собственная MTP-голова модели предлагает несколько
@@ -368,8 +394,8 @@ hf download infosave/Qwen3.8-27B-cmf qwen38-27b-q4tp.cmf --local-dir .
 cortiq run qwen38-27b-q4tp.cmf --prompt "用三句话解释快速排序。" --no-think
 ```
 
-建议使用 cortiq 0.7.3 或更新版本；Linux、macOS、Windows 预编译二进制见
-[发布页面](https://github.com/infosave2007/cmf/releases)。引擎会自动选择 GPU 和
+建议使用 cortiq 0.8.15 或更新版本，以获得快速的提示词处理；Linux、macOS、Windows
+预编译二进制见[发布页面](https://github.com/infosave2007/cmf/releases)。引擎会自动选择 GPU 和
 设置。`--no-think` 直接给出回答；不加该参数时模型会先思考，请调高 `--max-tokens`
 （默认 256）。
 
@@ -390,11 +416,24 @@ cortiq run qwen38-27b-q4tp.cmf --prompt "用三句话解释快速排序。" --no
 | 硬件 | 后端 | 普通解码 | 代码类提示词 | `cortiq bench --core` |
 |---|---|---:|---:|---:|
 | RTX 5090（32 GB） | Vulkan | 48.7 | 56.5 | 76 |
+| RTX 3090（24 GB） | Vulkan | 37.1 | 43.6 | 62.4 |
 | RTX PRO 4000 Blackwell（24 GB） | Vulkan | 27.9 | 43.9 | 54.8 |
 | Mac mini M4（24 GB） | Metal | 6.8 | 17.3 | 20.0 |
 
 「代码类提示词」和 bench 两列使用推测解码和 `--greedy`；RTX 5090 的代码类提示词
-带 2.3k token 上下文。RTX 5090 数据测于较早的版本。
+带 2.3k token 上下文。RTX 5090 数据测于较早的版本。RTX 3090 数据使用 cortiq 0.8.15
+在 Ubuntu 24.04 上测得：普通解码设置 `CMF_GRAPH_SPEC=0`，代码类提示词生成 400 个
+token，bench 中 91% 的草稿 token 被接受。
+
+RTX 3090 上的提示词处理（`cortiq bench --ctx N`）：
+
+| 提示词 | 提示词处理，tok/s | 首 token 延迟 | 该深度下的解码，tok/s |
+|---|---:|---:|---:|
+| 1000 token | 199 | 5.0 秒 | 57.8 |
+| 4000 token | 199 | 20.1 秒 | 33.9 |
+
+该表中的解码为推测解码：1000 token 提示词之后草稿 token 接受率为 87%，4000 token
+提示词之后为 50%。
 
 `qwen38-27b-q4tp.cmf` **默认开启推测解码**：模型自带的 MTP 头一次起草多个
 token，由 GPU 批量验证。它在代码和结构化输出上收益最大；自由文本接近普通速度，

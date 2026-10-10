@@ -93,6 +93,11 @@ fn attend_x_matches_the_cpu_softmax_needs_cmf_gpu() {
         // workgroup walking three chunks, on the same rows
         (64, 4, 192, 128, 600, None, false, true),
         (64, 4, 192, 128, 600, None, false, false),
+        // Four chunks is the first 1,024-token global-attention boundary
+        // exercised by Mellum's periodic full-attention layers.  Keep the
+        // learned sink on here: it validates that the split merge retains
+        // both the value-less sink column and every chunk's denominator.
+        (64, 4, 192, 128, 1024, None, true, true),
         // sinks through the merge (not a MiMo shape: coverage)
         (8, 2, 64, 64, 520, None, true, true),
     ];
@@ -129,5 +134,83 @@ fn attend_x_matches_the_cpu_softmax_needs_cmf_gpu() {
             rel < 1e-5,
             "device attend-x diverged from the CPU: {rel:.3e}"
         );
+    }
+}
+
+/// The GQA-shared 64-position split (`gqa_attend_part_xg`, the token
+/// graph's per-layer-geometry attend) and the batch graph's run kernels
+/// (`run > 0`: the last `run` positions appended in one dispatch, each
+/// attending its own causal, windowed prefix) against the same CPU softmax.
+#[cfg(feature = "gpu")]
+#[test]
+fn attend_xg_matches_the_cpu_softmax_needs_cmf_gpu() {
+    match cortiq_engine::gpu_wgpu::selected_and_up() {
+        None => {
+            cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());
+            return;
+        }
+        Some(false) => panic!("wgpu selected but the context did not come up"),
+        Some(true) => {}
+    }
+    // (nh, nkv, hd, dv, npos, window, sink, run)
+    let cases: &[(usize, usize, usize, usize, usize, Option<usize>, bool, usize)] = &[
+        // Mellum2.1: 32 query heads on 4 kv heads, 1,024-position window
+        // over a wrapped ring, and a full layer.
+        (32, 4, 128, 128, 1500, Some(1024), false, 0),
+        (32, 4, 128, 128, 1500, None, false, 0),
+        (32, 4, 128, 128, 40, None, false, 0),
+        // MiMo-V2-like sliding layer with sinks, the toy shapes.
+        (16, 8, 192, 128, 700, Some(128), true, 0),
+        (8, 4, 48, 32, 37, Some(8), true, 0),
+        (8, 4, 48, 32, 5, Some(8), true, 0),
+        (8, 2, 64, 64, 520, None, true, 0),
+        // Batch runs: across the window edge, full context, sinks, a run
+        // that starts at position 0.
+        (32, 4, 128, 128, 1100, Some(1024), false, 32),
+        (32, 4, 128, 128, 300, None, false, 32),
+        (16, 8, 192, 128, 700, Some(128), true, 32),
+        (8, 4, 48, 32, 37, Some(8), true, 5),
+        (8, 2, 64, 64, 40, None, true, 40),
+    ];
+    for &(nh, nkv, hd, dv, npos, window, with_sink, run) in cases {
+        let rows = run.max(1);
+        let q: Vec<f32> = (0..rows * nh * hd).map(|i| val(i, 1) * 0.5).collect();
+        let k: Vec<f32> = (0..npos * nkv * hd).map(|i| val(i, 2)).collect();
+        let v: Vec<f32> = (0..npos * nkv * dv).map(|i| val(i, 3)).collect();
+        let sink: Vec<f32> = (0..nh).map(|h| val(h, 4) * 4.0).collect();
+        let sink = with_sink.then_some(sink.as_slice());
+        let scale = (hd as f32).powf(-0.5);
+        let mut got = vec![0f32; rows * nh * dv];
+        assert!(
+            cortiq_engine::gpu_wgpu::attend_xg_for_test(
+                &q, &k, &v, sink, window, nh, nkv, hd, dv, scale, run, &mut got
+            ),
+            "device or attend-xg kernels missing"
+        );
+        let mut worst = 0f64;
+        for r in 0..rows {
+            // Row r is position npos - rows + r, seeing its own prefix.
+            let pos = npos - rows + r;
+            let want = cpu_attend(
+                &q[r * nh * hd..(r + 1) * nh * hd],
+                &k[..(pos + 1) * nkv * hd],
+                &v[..(pos + 1) * nkv * dv],
+                sink,
+                window,
+                nh,
+                nkv,
+                hd,
+                dv,
+                scale,
+            );
+            let g = &got[r * nh * dv..(r + 1) * nh * dv];
+            let num: f64 = g.iter().zip(&want).map(|(a, b)| ((a - b) as f64).powi(2)).sum();
+            let den: f64 = want.iter().map(|a| (*a as f64).powi(2)).sum::<f64>().max(1e-30);
+            worst = worst.max((num / den).sqrt());
+        }
+        println!(
+            "xg nh {nh} nkv {nkv} hd {hd} dv {dv} npos {npos} window {window:?} sink {with_sink} run {run}: worst rel {worst:.3e}"
+        );
+        assert!(worst < 1e-5, "device attend-xg diverged from the CPU: {worst:.3e}");
     }
 }

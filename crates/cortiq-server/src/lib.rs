@@ -7,6 +7,7 @@
 pub mod api;
 pub mod dashboard;
 pub mod decisions;
+pub mod embeddings;
 pub mod ood;
 pub mod openai;
 pub mod route;

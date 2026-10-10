@@ -13,7 +13,7 @@ categories.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-cortiq-core = { path = "../cortiq-core", version = "0.8.14" }
+cortiq-core = { path = "../cortiq-core", version = "0.8.15" }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
 tokio = { workspace = true }
@@ -26,6 +26,9 @@ minijinja = { workspace = true }
 minijinja-contrib = { workspace = true }
 base64 = { workspace = true }
 rustfft = { workspace = true }
+# EmbeddingGemma 2's f32 GEMMs where Accelerate is not (Linux, Windows):
+# packed AVX/FMA/AVX-512 and NEON kernels, pure Rust.
+matrixmultiply = "0.3.9"
 # DeepSeek-V4.1 image decode/resize and remote image ingress.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 ureq = { version = "2", features = ["tls"] }
@@ -38,12 +41,18 @@ bytemuck = { version = "1", optional = true, features = ["derive"] }
 
 [features]
 # `--features gpu` enables the wgpu path; test on a discrete card.
-gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "dep:ash"]
 
 # Imports `cortiq_engine::gpu_wgpu`, which exists only with `gpu`: without
 # this, `cargo test -p cortiq-engine` (no features) failed to build it.
 [[example]]
 name = "dsv41_expert_gpu_proof"
+required-features = ["gpu"]
+
+# Host-to-card transfer ceilings (memcpy, write_buffer, DMA) for the
+# Qwen3.8-Flash-Next expert admissions.
+[[example]]
+name = "qwen4_xfer_bench"
 required-features = ["gpu"]
 
 # GPU path (D5): Metal on Apple Silicon; unified memory + no-copy buffers.
@@ -62,6 +71,13 @@ libc = "0.2"
 # Vulkan exists: Apple has none (the Metal backend uses its own matrix
 # units) and the wgpu path remains the universal one everywhere.
 [target.'cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))'.dependencies]
+
+# The same `ash` wgpu-hal is built on: host-heap buffers for DMA uploads
+# (`gpu_wgpu::host_mem`) need a memory type wgpu does not let one choose.
+# Linux only: measured there (RTX 3090); Windows and Android builds keep
+# the `write_buffer` admissions and do not compile it.
+[target.'cfg(target_os = "linux")'.dependencies]
+ash = { version = "0.38", optional = true }
 
 [dev-dependencies]
 # Tests opt into `RUST_LOG` to see the resident-graph refusals (warn!).

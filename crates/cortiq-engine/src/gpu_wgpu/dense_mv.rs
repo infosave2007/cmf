@@ -1,0 +1,1709 @@
+//! Warp-per-row q4tp decode matvecs for the whole-token graph.
+//!
+//! `q4tp_matvec16nl` gives a 64-lane sub-block four rows, walks the row's
+//! 16-byte groups two and a half at a time (5120 columns) and then pays a
+//! six-barrier workgroup tree for every sixteen rows. On an RTX 3090 that
+//! held Qwen3.8-27B's narrow projections at 37-52 % of the bus (GDN qkv+z
+//! 349 GB/s, out_proj 357, FFN down 488). These kernels give a 32-lane
+//! subgroup R rows (`CMF_MV_SG_R`, 4 or 2; gate+up `CMF_GU_SG_R`, 2 or 4),
+//! two groups a lane a step with every load of the step issued before the
+//! first FMA (clamped, unconditional), no barrier at all, and finish with
+//! subgroup shuffles.
+//!
+//! Each row is the 16nl row to the bit: lane l holds the partials of the
+//! 16nl lanes l (groups l, l+64, …) and l+32 (groups l+32, l+96, …) in two
+//! accumulators, adds them (the tree's stride-32 step), and the shuffle
+//! steps 16, 8, 4, 2, 1 take the partner's partial in the tree's own
+//! order. Up to three matrices of one input per dispatch, and the fused
+//! gate+up+SiLU of `q4tp_matvec16nl_gu`.
+//!
+//! `CMF_MV_SG=0` keeps the 16nl kernels.
+
+use super::*;
+
+pub(crate) struct MvSg {
+    pub(crate) mv: wgpu::ComputePipeline,
+    pub(crate) mv_l: wgpu::BindGroupLayout,
+    pub(crate) gu: wgpu::ComputePipeline,
+    pub(crate) gu_l: wgpu::BindGroupLayout,
+    /// Rows a subgroup owns.
+    pub(crate) rpw: usize,
+    /// Rows a subgroup owns in the fused gate+up.
+    pub(crate) grpw: usize,
+    /// Never-written output for the unused matrix slots.
+    dummy_y: wgpu::Buffer,
+}
+
+fn sg32(c: &Ctx) -> bool {
+    c.device.features().contains(wgpu::Features::SUBGROUP)
+        && c.adapter_info.subgroup_min_size == 32
+        && c.adapter_info.subgroup_max_size == 32
+}
+
+fn shape(var_r: &str, r_default: usize) -> usize {
+    match std::env::var(var_r).as_deref() {
+        Ok("2") => 2,
+        Ok("4") => 4,
+        _ => r_default,
+    }
+}
+
+fn compile(c: &Ctx, label: &str, src: &str, entry: &str) -> Option<wgpu::ComputePipeline> {
+    let scope = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let module = c.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(src.into()),
+    });
+    let p = c
+        .device
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry),
+            layout: None,
+            module: &module,
+            entry_point: Some(entry),
+            compilation_options: Default::default(),
+            cache: c.pipeline_cache.as_ref(),
+        });
+    if let Some(e) = pollster::block_on(scope.pop()) {
+        tracing::warn!("{label} module rejected ({e}): q4tp decode keeps the 16nl kernels");
+        return None;
+    }
+    Some(p)
+}
+
+fn build(c: &Ctx) -> Option<MvSg> {
+    if std::env::var("CMF_MV_SG").as_deref() == Ok("0") || !sg32(c) {
+        return None;
+    }
+    // Rows a subgroup owns (R); a lane loads two 16-byte groups a step,
+    // every load of the step issued before its first FMA. The fused
+    // gate+up carries two weight rows per output row, so it has its own.
+    let rpw = shape("CMF_MV_SG_R", 4);
+    let grpw = shape("CMF_GU_SG_R", 2);
+    // Measured on Qwen3.8-27B / RTX 3090 plain decode (tok/s): R4U2 36.3,
+    // R2U2 33.0, R8U2 31.3, R2U4 32.2, R4U4 32.5, R1 24.0; only R4U2 and
+    // R2U2 are kept. Gate+up: R2U2 36.4, R4U2 36.1, R2U4 35.5, R1 33.1.
+    let (src, rpw) = match rpw {
+        2 => (MV_SG_R2U2, 2),
+        _ => (MV_SG_R4U2, 4),
+    };
+    let (gsrc, grpw) = match grpw {
+        4 => (GU_SG_R4U2, 4),
+        _ => (GU_SG_R2U2, 2),
+    };
+    let mv = compile(c, "cmf-mv-sg", src, "q4tp_mv_sg")?;
+    let gu = compile(c, "cmf-gu-sg", gsrc, "q4tp_gu_sg")?;
+    let dummy_y = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("mv-sg-dummy"),
+        size: 16,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    Some(MvSg {
+        mv_l: mv.get_bind_group_layout(0),
+        mv,
+        gu_l: gu.get_bind_group_layout(0),
+        gu,
+        rpw,
+        grpw,
+        dummy_y,
+    })
+}
+
+pub(crate) fn pipes(c: &Ctx) -> Option<&MvSg> {
+    c.dense_mv_pipes.get_or_init(|| build(c)).as_ref()
+}
+
+/// Up to three q4tp matvecs of one input `xs` (`mats`: weight, output,
+/// rows) as ONE dispatch: (pipeline, bind group, workgroups). None when the
+/// kernel is missing or the width is not whole groups.
+pub(crate) fn sg_prep<'a>(
+    c: &'a Ctx,
+    xs: &wgpu::Buffer,
+    cols: usize,
+    mats: &[(&wgpu::Buffer, &wgpu::Buffer, usize)],
+) -> Option<(&'a wgpu::ComputePipeline, wgpu::BindGroup, u32)> {
+    let p = pipes(c)?;
+    if cols % 32 != 0 || mats.is_empty() || mats.len() > 3 {
+        return None;
+    }
+    let per = 8 * p.rpw;
+    let r = |i: usize| mats.get(i).map_or(0, |m| m.2);
+    let groups: usize = (0..3).map(|i| r(i).div_ceil(per)).sum();
+    if groups == 0 || groups as u32 > MAX_WG {
+        return None;
+    }
+    let u = uniform_u32x8(
+        c,
+        [r(0) as u32, r(1) as u32, r(2) as u32, (cols / 32) as u32, 0, 0, 0, 0],
+    );
+    let w = |i: usize| mats.get(i).map_or(mats[0].0, |m| m.0);
+    let y = |i: usize| mats.get(i).map_or(&p.dummy_y, |m| m.1);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("mv-sg"),
+        layout: &p.mv_l,
+        entries: &[
+            bind_buf(0, w(0)),
+            bind_buf(1, w(1)),
+            bind_buf(2, w(2)),
+            bind_buf(3, w(0)),
+            bind_buf(4, w(1)),
+            bind_buf(5, w(2)),
+            bind_buf(6, xs),
+            bind_buf(7, y(0)),
+            bind_buf(8, y(1)),
+            bind_buf(9, y(2)),
+            bind_buf(10, &u),
+        ],
+    });
+    Some((&p.mv, bind, groups as u32))
+}
+
+/// gate+up+activation of `q4tp_matvec16nl_gu` (act code 0 SiLU, 1 exact
+/// GELU; `lim` the swiglu limit, 0 for none) as ONE dispatch.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sg_gu_prep<'a>(
+    c: &'a Ctx,
+    gate: &wgpu::Buffer,
+    up: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    act: &wgpu::Buffer,
+    inter: usize,
+    cols: usize,
+    act_code: u32,
+) -> Option<(&'a wgpu::ComputePipeline, wgpu::BindGroup, u32)> {
+    let p = pipes(c)?;
+    if cols % 32 != 0 || inter == 0 {
+        return None;
+    }
+    let groups = inter.div_ceil(8 * p.grpw);
+    if groups as u32 > MAX_WG {
+        return None;
+    }
+    let u = uniform_u32x8(
+        c,
+        [inter as u32, inter as u32, 0, (cols / 32) as u32, 0, act_code, 0, 0],
+    );
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("gu-sg"),
+        layout: &p.gu_l,
+        entries: &[
+            bind_buf(0, gate),
+            bind_buf(1, up),
+            bind_buf(3, gate),
+            bind_buf(4, up),
+            bind_buf(6, xs),
+            bind_buf(7, act),
+            bind_buf(10, &u),
+        ],
+    });
+    Some((&p.gu, bind, groups as u32))
+}
+
+
+pub(crate) const MV_SG_R2U2: &str = r#"
+struct SgP { rows_a: u32, rows_b: u32, rows_c: u32, gpr: u32, lim: u32, act: u32, _p0: u32, _p1: u32 };
+@group(0) @binding(0)  var<storage, read>       sg_wa  : array<u32>;
+@group(0) @binding(1)  var<storage, read>       sg_wb  : array<u32>;
+@group(0) @binding(2)  var<storage, read>       sg_wc  : array<u32>;
+@group(0) @binding(3)  var<storage, read>       sg_w4a : array<vec4<u32>>;
+@group(0) @binding(4)  var<storage, read>       sg_w4b : array<vec4<u32>>;
+@group(0) @binding(5)  var<storage, read>       sg_w4c : array<vec4<u32>>;
+@group(0) @binding(6)  var<storage, read>       sg_x   : array<vec4<f32>>;
+@group(0) @binding(7)  var<storage, read_write> sg_ya  : array<f32>;
+@group(0) @binding(8)  var<storage, read_write> sg_yb  : array<f32>;
+@group(0) @binding(9)  var<storage, read_write> sg_yc  : array<f32>;
+@group(0) @binding(10) var<uniform>             sg_p   : SgP;
+fn sg_byte_a(off: u32) -> u32 { return (sg_wa[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu; }
+fn sg_byte_b(off: u32) -> u32 { return (sg_wb[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu; }
+fn sg_byte_c(off: u32) -> u32 { return (sg_wc[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu; }
+fn sg_nib(w: u32, sh: u32) -> f32 {
+    return bitcast<f32>(((w >> sh) & 0xFu) | 0x4B000000u) - 8388616.0;
+}
+fn sg_dot8(w: u32, a: vec4<f32>, b: vec4<f32>) -> f32 {
+    return sg_nib(w, 0u) * a.x
+         + sg_nib(w, 4u) * a.y
+         + sg_nib(w, 8u) * a.z
+         + sg_nib(w, 12u) * a.w
+         + sg_nib(w, 16u) * b.x
+         + sg_nib(w, 20u) * b.y
+         + sg_nib(w, 24u) * b.z
+         + sg_nib(w, 28u) * b.w;
+}
+// The 64-lane tree of `q4tp_matvec16nl` from stride 16 down: lane l takes
+// lane l+s's partial, in the same order (own + partner).
+fn sg_tree(v0: f32) -> f32 {
+    var v = v0;
+    v = v + subgroupShuffleDown(v, 16u);
+    v = v + subgroupShuffleDown(v, 8u);
+    v = v + subgroupShuffleDown(v, 4u);
+    v = v + subgroupShuffleDown(v, 2u);
+    v = v + subgroupShuffleDown(v, 1u);
+    return v;
+}
+fn sg_erf(x: f32) -> f32 {
+    let a = abs(x);
+    let t = 1.0 / (1.0 + 0.3275911 * a);
+    let y = 1.0
+        - (((((1.0614054 * t - 1.4531521) * t + 1.4214138) * t - 0.28449674) * t
+            + 0.2548296)
+            * t)
+            * exp(-a * a);
+    return select(y, -y, x < 0.0);
+}
+fn sg_gelu_erf(x: f32) -> f32 {
+    return 0.5 * x * (1.0 + sg_erf(x * 0.70710678));
+}
+fn run_a(blk: u32, warp: u32, lane: u32) {
+    let rows = sg_p.rows_a;
+    let gpr = sg_p.gpr;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let base = (blk * 8u + warp) * 2u;
+    let r0 = base + 0u;
+    let l0 = r0 < rows;
+    let q0 = select(base, r0, l0);
+    let cm0 = codes_b + q0 * cstride;
+    let pm0 = unpack2x16float(sg_wa[params_w + q0]);
+    var ma0 = 0.0;
+    var mb0 = 0.0;
+    let r1 = base + 1u;
+    let l1 = r1 < rows;
+    let q1 = select(base, r1, l1);
+    let cm1 = codes_b + q1 * cstride;
+    let pm1 = unpack2x16float(sg_wa[params_w + q1]);
+    var ma1 = 0.0;
+    var mb1 = 0.0;
+    if (!l0) { return; }
+    var g = lane;
+    loop {
+        if (g >= gpr) { break; }
+        let g0 = min(g + 0u, gpr - 1u);
+        let bit0 = g0 * 5u;
+        let cbo0 = bit0 >> 3u;
+        let sh0 = bit0 & 7u;
+        let xo0 = g0 * 8u;
+        let xa0 = sg_x[xo0 + 0u];
+        let xb0 = sg_x[xo0 + 1u];
+        let xc0 = sg_x[xo0 + 2u];
+        let xd0 = sg_x[xo0 + 3u];
+        let xe0 = sg_x[xo0 + 4u];
+        let xf0 = sg_x[xo0 + 5u];
+        let xg0 = sg_x[xo0 + 6u];
+        let xh0 = sg_x[xo0 + 7u];
+        let g1 = min(g + 32u, gpr - 1u);
+        let bit1 = g1 * 5u;
+        let cbo1 = bit1 >> 3u;
+        let sh1 = bit1 & 7u;
+        let xo1 = g1 * 8u;
+        let xa1 = sg_x[xo1 + 0u];
+        let xb1 = sg_x[xo1 + 1u];
+        let xc1 = sg_x[xo1 + 2u];
+        let xd1 = sg_x[xo1 + 3u];
+        let xe1 = sg_x[xo1 + 4u];
+        let xf1 = sg_x[xo1 + 5u];
+        let xg1 = sg_x[xo1 + 6u];
+        let xh1 = sg_x[xo1 + 7u];
+        var cvm00 = sg_byte_a(cm0 + cbo0);
+        if (sh0 > 3u) { cvm00 = cvm00 | (sg_byte_a(cm0 + cbo0 + 1u) << 8u); }
+        let vm00 = sg_w4a[q0 * gpr + g0];
+        var cvm01 = sg_byte_a(cm0 + cbo1);
+        if (sh1 > 3u) { cvm01 = cvm01 | (sg_byte_a(cm0 + cbo1 + 1u) << 8u); }
+        let vm01 = sg_w4a[q0 * gpr + g1];
+        var cvm10 = sg_byte_a(cm1 + cbo0);
+        if (sh0 > 3u) { cvm10 = cvm10 | (sg_byte_a(cm1 + cbo0 + 1u) << 8u); }
+        let vm10 = sg_w4a[q1 * gpr + g0];
+        var cvm11 = sg_byte_a(cm1 + cbo1);
+        if (sh1 > 3u) { cvm11 = cvm11 | (sg_byte_a(cm1 + cbo1 + 1u) << 8u); }
+        let vm11 = sg_w4a[q1 * gpr + g1];
+        ma0 = ma0 + exp2(pm0.x + f32((cvm00 >> sh0) & 31u) * pm0.y)
+            * (sg_dot8(vm00.x, xa0, xb0) + sg_dot8(vm00.y, xc0, xd0)
+             + sg_dot8(vm00.z, xe0, xf0) + sg_dot8(vm00.w, xg0, xh0));
+        ma1 = ma1 + exp2(pm1.x + f32((cvm10 >> sh0) & 31u) * pm1.y)
+            * (sg_dot8(vm10.x, xa0, xb0) + sg_dot8(vm10.y, xc0, xd0)
+             + sg_dot8(vm10.z, xe0, xf0) + sg_dot8(vm10.w, xg0, xh0));
+        if (g + 32u < gpr) {
+            mb0 = mb0 + exp2(pm0.x + f32((cvm01 >> sh1) & 31u) * pm0.y)
+                * (sg_dot8(vm01.x, xa1, xb1) + sg_dot8(vm01.y, xc1, xd1)
+                 + sg_dot8(vm01.z, xe1, xf1) + sg_dot8(vm01.w, xg1, xh1));
+            mb1 = mb1 + exp2(pm1.x + f32((cvm11 >> sh1) & 31u) * pm1.y)
+                * (sg_dot8(vm11.x, xa1, xb1) + sg_dot8(vm11.y, xc1, xd1)
+                 + sg_dot8(vm11.z, xe1, xf1) + sg_dot8(vm11.w, xg1, xh1));
+        }
+        g = g + 64u;
+    }
+    let t0 = sg_tree(ma0 + mb0);
+    let t1 = sg_tree(ma1 + mb1);
+    if (lane == 0u) {
+        if (l0) { sg_ya[r0] = t0; }
+        if (l1) { sg_ya[r1] = t1; }
+    }
+}
+fn run_b(blk: u32, warp: u32, lane: u32) {
+    let rows = sg_p.rows_b;
+    let gpr = sg_p.gpr;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let base = (blk * 8u + warp) * 2u;
+    let r0 = base + 0u;
+    let l0 = r0 < rows;
+    let q0 = select(base, r0, l0);
+    let cm0 = codes_b + q0 * cstride;
+    let pm0 = unpack2x16float(sg_wb[params_w + q0]);
+    var ma0 = 0.0;
+    var mb0 = 0.0;
+    let r1 = base + 1u;
+    let l1 = r1 < rows;
+    let q1 = select(base, r1, l1);
+    let cm1 = codes_b + q1 * cstride;
+    let pm1 = unpack2x16float(sg_wb[params_w + q1]);
+    var ma1 = 0.0;
+    var mb1 = 0.0;
+    if (!l0) { return; }
+    var g = lane;
+    loop {
+        if (g >= gpr) { break; }
+        let g0 = min(g + 0u, gpr - 1u);
+        let bit0 = g0 * 5u;
+        let cbo0 = bit0 >> 3u;
+        let sh0 = bit0 & 7u;
+        let xo0 = g0 * 8u;
+        let xa0 = sg_x[xo0 + 0u];
+        let xb0 = sg_x[xo0 + 1u];
+        let xc0 = sg_x[xo0 + 2u];
+        let xd0 = sg_x[xo0 + 3u];
+        let xe0 = sg_x[xo0 + 4u];
+        let xf0 = sg_x[xo0 + 5u];
+        let xg0 = sg_x[xo0 + 6u];
+        let xh0 = sg_x[xo0 + 7u];
+        let g1 = min(g + 32u, gpr - 1u);
+        let bit1 = g1 * 5u;
+        let cbo1 = bit1 >> 3u;
+        let sh1 = bit1 & 7u;
+        let xo1 = g1 * 8u;
+        let xa1 = sg_x[xo1 + 0u];
+        let xb1 = sg_x[xo1 + 1u];
+        let xc1 = sg_x[xo1 + 2u];
+        let xd1 = sg_x[xo1 + 3u];
+        let xe1 = sg_x[xo1 + 4u];
+        let xf1 = sg_x[xo1 + 5u];
+        let xg1 = sg_x[xo1 + 6u];
+        let xh1 = sg_x[xo1 + 7u];
+        var cvm00 = sg_byte_b(cm0 + cbo0);
+        if (sh0 > 3u) { cvm00 = cvm00 | (sg_byte_b(cm0 + cbo0 + 1u) << 8u); }
+        let vm00 = sg_w4b[q0 * gpr + g0];
+        var cvm01 = sg_byte_b(cm0 + cbo1);
+        if (sh1 > 3u) { cvm01 = cvm01 | (sg_byte_b(cm0 + cbo1 + 1u) << 8u); }
+        let vm01 = sg_w4b[q0 * gpr + g1];
+        var cvm10 = sg_byte_b(cm1 + cbo0);
+        if (sh0 > 3u) { cvm10 = cvm10 | (sg_byte_b(cm1 + cbo0 + 1u) << 8u); }
+        let vm10 = sg_w4b[q1 * gpr + g0];
+        var cvm11 = sg_byte_b(cm1 + cbo1);
+        if (sh1 > 3u) { cvm11 = cvm11 | (sg_byte_b(cm1 + cbo1 + 1u) << 8u); }
+        let vm11 = sg_w4b[q1 * gpr + g1];
+        ma0 = ma0 + exp2(pm0.x + f32((cvm00 >> sh0) & 31u) * pm0.y)
+            * (sg_dot8(vm00.x, xa0, xb0) + sg_dot8(vm00.y, xc0, xd0)
+             + sg_dot8(vm00.z, xe0, xf0) + sg_dot8(vm00.w, xg0, xh0));
+        ma1 = ma1 + exp2(pm1.x + f32((cvm10 >> sh0) & 31u) * pm1.y)
+            * (sg_dot8(vm10.x, xa0, xb0) + sg_dot8(vm10.y, xc0, xd0)
+             + sg_dot8(vm10.z, xe0, xf0) + sg_dot8(vm10.w, xg0, xh0));
+        if (g + 32u < gpr) {
+            mb0 = mb0 + exp2(pm0.x + f32((cvm01 >> sh1) & 31u) * pm0.y)
+                * (sg_dot8(vm01.x, xa1, xb1) + sg_dot8(vm01.y, xc1, xd1)
+                 + sg_dot8(vm01.z, xe1, xf1) + sg_dot8(vm01.w, xg1, xh1));
+            mb1 = mb1 + exp2(pm1.x + f32((cvm11 >> sh1) & 31u) * pm1.y)
+                * (sg_dot8(vm11.x, xa1, xb1) + sg_dot8(vm11.y, xc1, xd1)
+                 + sg_dot8(vm11.z, xe1, xf1) + sg_dot8(vm11.w, xg1, xh1));
+        }
+        g = g + 64u;
+    }
+    let t0 = sg_tree(ma0 + mb0);
+    let t1 = sg_tree(ma1 + mb1);
+    if (lane == 0u) {
+        if (l0) { sg_yb[r0] = t0; }
+        if (l1) { sg_yb[r1] = t1; }
+    }
+}
+fn run_c(blk: u32, warp: u32, lane: u32) {
+    let rows = sg_p.rows_c;
+    let gpr = sg_p.gpr;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let base = (blk * 8u + warp) * 2u;
+    let r0 = base + 0u;
+    let l0 = r0 < rows;
+    let q0 = select(base, r0, l0);
+    let cm0 = codes_b + q0 * cstride;
+    let pm0 = unpack2x16float(sg_wc[params_w + q0]);
+    var ma0 = 0.0;
+    var mb0 = 0.0;
+    let r1 = base + 1u;
+    let l1 = r1 < rows;
+    let q1 = select(base, r1, l1);
+    let cm1 = codes_b + q1 * cstride;
+    let pm1 = unpack2x16float(sg_wc[params_w + q1]);
+    var ma1 = 0.0;
+    var mb1 = 0.0;
+    if (!l0) { return; }
+    var g = lane;
+    loop {
+        if (g >= gpr) { break; }
+        let g0 = min(g + 0u, gpr - 1u);
+        let bit0 = g0 * 5u;
+        let cbo0 = bit0 >> 3u;
+        let sh0 = bit0 & 7u;
+        let xo0 = g0 * 8u;
+        let xa0 = sg_x[xo0 + 0u];
+        let xb0 = sg_x[xo0 + 1u];
+        let xc0 = sg_x[xo0 + 2u];
+        let xd0 = sg_x[xo0 + 3u];
+        let xe0 = sg_x[xo0 + 4u];
+        let xf0 = sg_x[xo0 + 5u];
+        let xg0 = sg_x[xo0 + 6u];
+        let xh0 = sg_x[xo0 + 7u];
+        let g1 = min(g + 32u, gpr - 1u);
+        let bit1 = g1 * 5u;
+        let cbo1 = bit1 >> 3u;
+        let sh1 = bit1 & 7u;
+        let xo1 = g1 * 8u;
+        let xa1 = sg_x[xo1 + 0u];
+        let xb1 = sg_x[xo1 + 1u];
+        let xc1 = sg_x[xo1 + 2u];
+        let xd1 = sg_x[xo1 + 3u];
+        let xe1 = sg_x[xo1 + 4u];
+        let xf1 = sg_x[xo1 + 5u];
+        let xg1 = sg_x[xo1 + 6u];
+        let xh1 = sg_x[xo1 + 7u];
+        var cvm00 = sg_byte_c(cm0 + cbo0);
+        if (sh0 > 3u) { cvm00 = cvm00 | (sg_byte_c(cm0 + cbo0 + 1u) << 8u); }
+        let vm00 = sg_w4c[q0 * gpr + g0];
+        var cvm01 = sg_byte_c(cm0 + cbo1);
+        if (sh1 > 3u) { cvm01 = cvm01 | (sg_byte_c(cm0 + cbo1 + 1u) << 8u); }
+        let vm01 = sg_w4c[q0 * gpr + g1];
+        var cvm10 = sg_byte_c(cm1 + cbo0);
+        if (sh0 > 3u) { cvm10 = cvm10 | (sg_byte_c(cm1 + cbo0 + 1u) << 8u); }
+        let vm10 = sg_w4c[q1 * gpr + g0];
+        var cvm11 = sg_byte_c(cm1 + cbo1);
+        if (sh1 > 3u) { cvm11 = cvm11 | (sg_byte_c(cm1 + cbo1 + 1u) << 8u); }
+        let vm11 = sg_w4c[q1 * gpr + g1];
+        ma0 = ma0 + exp2(pm0.x + f32((cvm00 >> sh0) & 31u) * pm0.y)
+            * (sg_dot8(vm00.x, xa0, xb0) + sg_dot8(vm00.y, xc0, xd0)
+             + sg_dot8(vm00.z, xe0, xf0) + sg_dot8(vm00.w, xg0, xh0));
+        ma1 = ma1 + exp2(pm1.x + f32((cvm10 >> sh0) & 31u) * pm1.y)
+            * (sg_dot8(vm10.x, xa0, xb0) + sg_dot8(vm10.y, xc0, xd0)
+             + sg_dot8(vm10.z, xe0, xf0) + sg_dot8(vm10.w, xg0, xh0));
+        if (g + 32u < gpr) {
+            mb0 = mb0 + exp2(pm0.x + f32((cvm01 >> sh1) & 31u) * pm0.y)
+                * (sg_dot8(vm01.x, xa1, xb1) + sg_dot8(vm01.y, xc1, xd1)
+                 + sg_dot8(vm01.z, xe1, xf1) + sg_dot8(vm01.w, xg1, xh1));
+            mb1 = mb1 + exp2(pm1.x + f32((cvm11 >> sh1) & 31u) * pm1.y)
+                * (sg_dot8(vm11.x, xa1, xb1) + sg_dot8(vm11.y, xc1, xd1)
+                 + sg_dot8(vm11.z, xe1, xf1) + sg_dot8(vm11.w, xg1, xh1));
+        }
+        g = g + 64u;
+    }
+    let t0 = sg_tree(ma0 + mb0);
+    let t1 = sg_tree(ma1 + mb1);
+    if (lane == 0u) {
+        if (l0) { sg_yc[r0] = t0; }
+        if (l1) { sg_yc[r1] = t1; }
+    }
+}
+
+@compute @workgroup_size(256)
+fn q4tp_mv_sg(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_index) lid: u32,
+              @builtin(subgroup_invocation_id) lane: u32) {
+    let per = 8u * 2u;
+    let warp = lid >> 5u;
+    let ba = (sg_p.rows_a + per - 1u) / per;
+    let bb = (sg_p.rows_b + per - 1u) / per;
+    let wb = wid.x;
+    if (wb < ba) {
+        run_a(wb, warp, lane);
+    } else if (wb < ba + bb) {
+        run_b(wb - ba, warp, lane);
+    } else {
+        run_c(wb - ba - bb, warp, lane);
+    }
+}
+
+"#;
+
+pub(crate) const MV_SG_R4U2: &str = r#"
+struct SgP { rows_a: u32, rows_b: u32, rows_c: u32, gpr: u32, lim: u32, act: u32, _p0: u32, _p1: u32 };
+@group(0) @binding(0)  var<storage, read>       sg_wa  : array<u32>;
+@group(0) @binding(1)  var<storage, read>       sg_wb  : array<u32>;
+@group(0) @binding(2)  var<storage, read>       sg_wc  : array<u32>;
+@group(0) @binding(3)  var<storage, read>       sg_w4a : array<vec4<u32>>;
+@group(0) @binding(4)  var<storage, read>       sg_w4b : array<vec4<u32>>;
+@group(0) @binding(5)  var<storage, read>       sg_w4c : array<vec4<u32>>;
+@group(0) @binding(6)  var<storage, read>       sg_x   : array<vec4<f32>>;
+@group(0) @binding(7)  var<storage, read_write> sg_ya  : array<f32>;
+@group(0) @binding(8)  var<storage, read_write> sg_yb  : array<f32>;
+@group(0) @binding(9)  var<storage, read_write> sg_yc  : array<f32>;
+@group(0) @binding(10) var<uniform>             sg_p   : SgP;
+fn sg_byte_a(off: u32) -> u32 { return (sg_wa[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu; }
+fn sg_byte_b(off: u32) -> u32 { return (sg_wb[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu; }
+fn sg_byte_c(off: u32) -> u32 { return (sg_wc[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu; }
+fn sg_nib(w: u32, sh: u32) -> f32 {
+    return bitcast<f32>(((w >> sh) & 0xFu) | 0x4B000000u) - 8388616.0;
+}
+fn sg_dot8(w: u32, a: vec4<f32>, b: vec4<f32>) -> f32 {
+    return sg_nib(w, 0u) * a.x
+         + sg_nib(w, 4u) * a.y
+         + sg_nib(w, 8u) * a.z
+         + sg_nib(w, 12u) * a.w
+         + sg_nib(w, 16u) * b.x
+         + sg_nib(w, 20u) * b.y
+         + sg_nib(w, 24u) * b.z
+         + sg_nib(w, 28u) * b.w;
+}
+// The 64-lane tree of `q4tp_matvec16nl` from stride 16 down: lane l takes
+// lane l+s's partial, in the same order (own + partner).
+fn sg_tree(v0: f32) -> f32 {
+    var v = v0;
+    v = v + subgroupShuffleDown(v, 16u);
+    v = v + subgroupShuffleDown(v, 8u);
+    v = v + subgroupShuffleDown(v, 4u);
+    v = v + subgroupShuffleDown(v, 2u);
+    v = v + subgroupShuffleDown(v, 1u);
+    return v;
+}
+fn sg_erf(x: f32) -> f32 {
+    let a = abs(x);
+    let t = 1.0 / (1.0 + 0.3275911 * a);
+    let y = 1.0
+        - (((((1.0614054 * t - 1.4531521) * t + 1.4214138) * t - 0.28449674) * t
+            + 0.2548296)
+            * t)
+            * exp(-a * a);
+    return select(y, -y, x < 0.0);
+}
+fn sg_gelu_erf(x: f32) -> f32 {
+    return 0.5 * x * (1.0 + sg_erf(x * 0.70710678));
+}
+fn run_a(blk: u32, warp: u32, lane: u32) {
+    let rows = sg_p.rows_a;
+    let gpr = sg_p.gpr;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let base = (blk * 8u + warp) * 4u;
+    let r0 = base + 0u;
+    let l0 = r0 < rows;
+    let q0 = select(base, r0, l0);
+    let cm0 = codes_b + q0 * cstride;
+    let pm0 = unpack2x16float(sg_wa[params_w + q0]);
+    var ma0 = 0.0;
+    var mb0 = 0.0;
+    let r1 = base + 1u;
+    let l1 = r1 < rows;
+    let q1 = select(base, r1, l1);
+    let cm1 = codes_b + q1 * cstride;
+    let pm1 = unpack2x16float(sg_wa[params_w + q1]);
+    var ma1 = 0.0;
+    var mb1 = 0.0;
+    let r2 = base + 2u;
+    let l2 = r2 < rows;
+    let q2 = select(base, r2, l2);
+    let cm2 = codes_b + q2 * cstride;
+    let pm2 = unpack2x16float(sg_wa[params_w + q2]);
+    var ma2 = 0.0;
+    var mb2 = 0.0;
+    let r3 = base + 3u;
+    let l3 = r3 < rows;
+    let q3 = select(base, r3, l3);
+    let cm3 = codes_b + q3 * cstride;
+    let pm3 = unpack2x16float(sg_wa[params_w + q3]);
+    var ma3 = 0.0;
+    var mb3 = 0.0;
+    if (!l0) { return; }
+    var g = lane;
+    loop {
+        if (g >= gpr) { break; }
+        let g0 = min(g + 0u, gpr - 1u);
+        let bit0 = g0 * 5u;
+        let cbo0 = bit0 >> 3u;
+        let sh0 = bit0 & 7u;
+        let xo0 = g0 * 8u;
+        let xa0 = sg_x[xo0 + 0u];
+        let xb0 = sg_x[xo0 + 1u];
+        let xc0 = sg_x[xo0 + 2u];
+        let xd0 = sg_x[xo0 + 3u];
+        let xe0 = sg_x[xo0 + 4u];
+        let xf0 = sg_x[xo0 + 5u];
+        let xg0 = sg_x[xo0 + 6u];
+        let xh0 = sg_x[xo0 + 7u];
+        let g1 = min(g + 32u, gpr - 1u);
+        let bit1 = g1 * 5u;
+        let cbo1 = bit1 >> 3u;
+        let sh1 = bit1 & 7u;
+        let xo1 = g1 * 8u;
+        let xa1 = sg_x[xo1 + 0u];
+        let xb1 = sg_x[xo1 + 1u];
+        let xc1 = sg_x[xo1 + 2u];
+        let xd1 = sg_x[xo1 + 3u];
+        let xe1 = sg_x[xo1 + 4u];
+        let xf1 = sg_x[xo1 + 5u];
+        let xg1 = sg_x[xo1 + 6u];
+        let xh1 = sg_x[xo1 + 7u];
+        var cvm00 = sg_byte_a(cm0 + cbo0);
+        if (sh0 > 3u) { cvm00 = cvm00 | (sg_byte_a(cm0 + cbo0 + 1u) << 8u); }
+        let vm00 = sg_w4a[q0 * gpr + g0];
+        var cvm01 = sg_byte_a(cm0 + cbo1);
+        if (sh1 > 3u) { cvm01 = cvm01 | (sg_byte_a(cm0 + cbo1 + 1u) << 8u); }
+        let vm01 = sg_w4a[q0 * gpr + g1];
+        var cvm10 = sg_byte_a(cm1 + cbo0);
+        if (sh0 > 3u) { cvm10 = cvm10 | (sg_byte_a(cm1 + cbo0 + 1u) << 8u); }
+        let vm10 = sg_w4a[q1 * gpr + g0];
+        var cvm11 = sg_byte_a(cm1 + cbo1);
+        if (sh1 > 3u) { cvm11 = cvm11 | (sg_byte_a(cm1 + cbo1 + 1u) << 8u); }
+        let vm11 = sg_w4a[q1 * gpr + g1];
+        var cvm20 = sg_byte_a(cm2 + cbo0);
+        if (sh0 > 3u) { cvm20 = cvm20 | (sg_byte_a(cm2 + cbo0 + 1u) << 8u); }
+        let vm20 = sg_w4a[q2 * gpr + g0];
+        var cvm21 = sg_byte_a(cm2 + cbo1);
+        if (sh1 > 3u) { cvm21 = cvm21 | (sg_byte_a(cm2 + cbo1 + 1u) << 8u); }
+        let vm21 = sg_w4a[q2 * gpr + g1];
+        var cvm30 = sg_byte_a(cm3 + cbo0);
+        if (sh0 > 3u) { cvm30 = cvm30 | (sg_byte_a(cm3 + cbo0 + 1u) << 8u); }
+        let vm30 = sg_w4a[q3 * gpr + g0];
+        var cvm31 = sg_byte_a(cm3 + cbo1);
+        if (sh1 > 3u) { cvm31 = cvm31 | (sg_byte_a(cm3 + cbo1 + 1u) << 8u); }
+        let vm31 = sg_w4a[q3 * gpr + g1];
+        ma0 = ma0 + exp2(pm0.x + f32((cvm00 >> sh0) & 31u) * pm0.y)
+            * (sg_dot8(vm00.x, xa0, xb0) + sg_dot8(vm00.y, xc0, xd0)
+             + sg_dot8(vm00.z, xe0, xf0) + sg_dot8(vm00.w, xg0, xh0));
+        ma1 = ma1 + exp2(pm1.x + f32((cvm10 >> sh0) & 31u) * pm1.y)
+            * (sg_dot8(vm10.x, xa0, xb0) + sg_dot8(vm10.y, xc0, xd0)
+             + sg_dot8(vm10.z, xe0, xf0) + sg_dot8(vm10.w, xg0, xh0));
+        ma2 = ma2 + exp2(pm2.x + f32((cvm20 >> sh0) & 31u) * pm2.y)
+            * (sg_dot8(vm20.x, xa0, xb0) + sg_dot8(vm20.y, xc0, xd0)
+             + sg_dot8(vm20.z, xe0, xf0) + sg_dot8(vm20.w, xg0, xh0));
+        ma3 = ma3 + exp2(pm3.x + f32((cvm30 >> sh0) & 31u) * pm3.y)
+            * (sg_dot8(vm30.x, xa0, xb0) + sg_dot8(vm30.y, xc0, xd0)
+             + sg_dot8(vm30.z, xe0, xf0) + sg_dot8(vm30.w, xg0, xh0));
+        if (g + 32u < gpr) {
+            mb0 = mb0 + exp2(pm0.x + f32((cvm01 >> sh1) & 31u) * pm0.y)
+                * (sg_dot8(vm01.x, xa1, xb1) + sg_dot8(vm01.y, xc1, xd1)
+                 + sg_dot8(vm01.z, xe1, xf1) + sg_dot8(vm01.w, xg1, xh1));
+            mb1 = mb1 + exp2(pm1.x + f32((cvm11 >> sh1) & 31u) * pm1.y)
+                * (sg_dot8(vm11.x, xa1, xb1) + sg_dot8(vm11.y, xc1, xd1)
+                 + sg_dot8(vm11.z, xe1, xf1) + sg_dot8(vm11.w, xg1, xh1));
+            mb2 = mb2 + exp2(pm2.x + f32((cvm21 >> sh1) & 31u) * pm2.y)
+                * (sg_dot8(vm21.x, xa1, xb1) + sg_dot8(vm21.y, xc1, xd1)
+                 + sg_dot8(vm21.z, xe1, xf1) + sg_dot8(vm21.w, xg1, xh1));
+            mb3 = mb3 + exp2(pm3.x + f32((cvm31 >> sh1) & 31u) * pm3.y)
+                * (sg_dot8(vm31.x, xa1, xb1) + sg_dot8(vm31.y, xc1, xd1)
+                 + sg_dot8(vm31.z, xe1, xf1) + sg_dot8(vm31.w, xg1, xh1));
+        }
+        g = g + 64u;
+    }
+    let t0 = sg_tree(ma0 + mb0);
+    let t1 = sg_tree(ma1 + mb1);
+    let t2 = sg_tree(ma2 + mb2);
+    let t3 = sg_tree(ma3 + mb3);
+    if (lane == 0u) {
+        if (l0) { sg_ya[r0] = t0; }
+        if (l1) { sg_ya[r1] = t1; }
+        if (l2) { sg_ya[r2] = t2; }
+        if (l3) { sg_ya[r3] = t3; }
+    }
+}
+fn run_b(blk: u32, warp: u32, lane: u32) {
+    let rows = sg_p.rows_b;
+    let gpr = sg_p.gpr;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let base = (blk * 8u + warp) * 4u;
+    let r0 = base + 0u;
+    let l0 = r0 < rows;
+    let q0 = select(base, r0, l0);
+    let cm0 = codes_b + q0 * cstride;
+    let pm0 = unpack2x16float(sg_wb[params_w + q0]);
+    var ma0 = 0.0;
+    var mb0 = 0.0;
+    let r1 = base + 1u;
+    let l1 = r1 < rows;
+    let q1 = select(base, r1, l1);
+    let cm1 = codes_b + q1 * cstride;
+    let pm1 = unpack2x16float(sg_wb[params_w + q1]);
+    var ma1 = 0.0;
+    var mb1 = 0.0;
+    let r2 = base + 2u;
+    let l2 = r2 < rows;
+    let q2 = select(base, r2, l2);
+    let cm2 = codes_b + q2 * cstride;
+    let pm2 = unpack2x16float(sg_wb[params_w + q2]);
+    var ma2 = 0.0;
+    var mb2 = 0.0;
+    let r3 = base + 3u;
+    let l3 = r3 < rows;
+    let q3 = select(base, r3, l3);
+    let cm3 = codes_b + q3 * cstride;
+    let pm3 = unpack2x16float(sg_wb[params_w + q3]);
+    var ma3 = 0.0;
+    var mb3 = 0.0;
+    if (!l0) { return; }
+    var g = lane;
+    loop {
+        if (g >= gpr) { break; }
+        let g0 = min(g + 0u, gpr - 1u);
+        let bit0 = g0 * 5u;
+        let cbo0 = bit0 >> 3u;
+        let sh0 = bit0 & 7u;
+        let xo0 = g0 * 8u;
+        let xa0 = sg_x[xo0 + 0u];
+        let xb0 = sg_x[xo0 + 1u];
+        let xc0 = sg_x[xo0 + 2u];
+        let xd0 = sg_x[xo0 + 3u];
+        let xe0 = sg_x[xo0 + 4u];
+        let xf0 = sg_x[xo0 + 5u];
+        let xg0 = sg_x[xo0 + 6u];
+        let xh0 = sg_x[xo0 + 7u];
+        let g1 = min(g + 32u, gpr - 1u);
+        let bit1 = g1 * 5u;
+        let cbo1 = bit1 >> 3u;
+        let sh1 = bit1 & 7u;
+        let xo1 = g1 * 8u;
+        let xa1 = sg_x[xo1 + 0u];
+        let xb1 = sg_x[xo1 + 1u];
+        let xc1 = sg_x[xo1 + 2u];
+        let xd1 = sg_x[xo1 + 3u];
+        let xe1 = sg_x[xo1 + 4u];
+        let xf1 = sg_x[xo1 + 5u];
+        let xg1 = sg_x[xo1 + 6u];
+        let xh1 = sg_x[xo1 + 7u];
+        var cvm00 = sg_byte_b(cm0 + cbo0);
+        if (sh0 > 3u) { cvm00 = cvm00 | (sg_byte_b(cm0 + cbo0 + 1u) << 8u); }
+        let vm00 = sg_w4b[q0 * gpr + g0];
+        var cvm01 = sg_byte_b(cm0 + cbo1);
+        if (sh1 > 3u) { cvm01 = cvm01 | (sg_byte_b(cm0 + cbo1 + 1u) << 8u); }
+        let vm01 = sg_w4b[q0 * gpr + g1];
+        var cvm10 = sg_byte_b(cm1 + cbo0);
+        if (sh0 > 3u) { cvm10 = cvm10 | (sg_byte_b(cm1 + cbo0 + 1u) << 8u); }
+        let vm10 = sg_w4b[q1 * gpr + g0];
+        var cvm11 = sg_byte_b(cm1 + cbo1);
+        if (sh1 > 3u) { cvm11 = cvm11 | (sg_byte_b(cm1 + cbo1 + 1u) << 8u); }
+        let vm11 = sg_w4b[q1 * gpr + g1];
+        var cvm20 = sg_byte_b(cm2 + cbo0);
+        if (sh0 > 3u) { cvm20 = cvm20 | (sg_byte_b(cm2 + cbo0 + 1u) << 8u); }
+        let vm20 = sg_w4b[q2 * gpr + g0];
+        var cvm21 = sg_byte_b(cm2 + cbo1);
+        if (sh1 > 3u) { cvm21 = cvm21 | (sg_byte_b(cm2 + cbo1 + 1u) << 8u); }
+        let vm21 = sg_w4b[q2 * gpr + g1];
+        var cvm30 = sg_byte_b(cm3 + cbo0);
+        if (sh0 > 3u) { cvm30 = cvm30 | (sg_byte_b(cm3 + cbo0 + 1u) << 8u); }
+        let vm30 = sg_w4b[q3 * gpr + g0];
+        var cvm31 = sg_byte_b(cm3 + cbo1);
+        if (sh1 > 3u) { cvm31 = cvm31 | (sg_byte_b(cm3 + cbo1 + 1u) << 8u); }
+        let vm31 = sg_w4b[q3 * gpr + g1];
+        ma0 = ma0 + exp2(pm0.x + f32((cvm00 >> sh0) & 31u) * pm0.y)
+            * (sg_dot8(vm00.x, xa0, xb0) + sg_dot8(vm00.y, xc0, xd0)
+             + sg_dot8(vm00.z, xe0, xf0) + sg_dot8(vm00.w, xg0, xh0));
+        ma1 = ma1 + exp2(pm1.x + f32((cvm10 >> sh0) & 31u) * pm1.y)
+            * (sg_dot8(vm10.x, xa0, xb0) + sg_dot8(vm10.y, xc0, xd0)
+             + sg_dot8(vm10.z, xe0, xf0) + sg_dot8(vm10.w, xg0, xh0));
+        ma2 = ma2 + exp2(pm2.x + f32((cvm20 >> sh0) & 31u) * pm2.y)
+            * (sg_dot8(vm20.x, xa0, xb0) + sg_dot8(vm20.y, xc0, xd0)
+             + sg_dot8(vm20.z, xe0, xf0) + sg_dot8(vm20.w, xg0, xh0));
+        ma3 = ma3 + exp2(pm3.x + f32((cvm30 >> sh0) & 31u) * pm3.y)
+            * (sg_dot8(vm30.x, xa0, xb0) + sg_dot8(vm30.y, xc0, xd0)
+             + sg_dot8(vm30.z, xe0, xf0) + sg_dot8(vm30.w, xg0, xh0));
+        if (g + 32u < gpr) {
+            mb0 = mb0 + exp2(pm0.x + f32((cvm01 >> sh1) & 31u) * pm0.y)
+                * (sg_dot8(vm01.x, xa1, xb1) + sg_dot8(vm01.y, xc1, xd1)
+                 + sg_dot8(vm01.z, xe1, xf1) + sg_dot8(vm01.w, xg1, xh1));
+            mb1 = mb1 + exp2(pm1.x + f32((cvm11 >> sh1) & 31u) * pm1.y)
+                * (sg_dot8(vm11.x, xa1, xb1) + sg_dot8(vm11.y, xc1, xd1)
+                 + sg_dot8(vm11.z, xe1, xf1) + sg_dot8(vm11.w, xg1, xh1));
+            mb2 = mb2 + exp2(pm2.x + f32((cvm21 >> sh1) & 31u) * pm2.y)
+                * (sg_dot8(vm21.x, xa1, xb1) + sg_dot8(vm21.y, xc1, xd1)
+                 + sg_dot8(vm21.z, xe1, xf1) + sg_dot8(vm21.w, xg1, xh1));
+            mb3 = mb3 + exp2(pm3.x + f32((cvm31 >> sh1) & 31u) * pm3.y)
+                * (sg_dot8(vm31.x, xa1, xb1) + sg_dot8(vm31.y, xc1, xd1)
+                 + sg_dot8(vm31.z, xe1, xf1) + sg_dot8(vm31.w, xg1, xh1));
+        }
+        g = g + 64u;
+    }
+    let t0 = sg_tree(ma0 + mb0);
+    let t1 = sg_tree(ma1 + mb1);
+    let t2 = sg_tree(ma2 + mb2);
+    let t3 = sg_tree(ma3 + mb3);
+    if (lane == 0u) {
+        if (l0) { sg_yb[r0] = t0; }
+        if (l1) { sg_yb[r1] = t1; }
+        if (l2) { sg_yb[r2] = t2; }
+        if (l3) { sg_yb[r3] = t3; }
+    }
+}
+fn run_c(blk: u32, warp: u32, lane: u32) {
+    let rows = sg_p.rows_c;
+    let gpr = sg_p.gpr;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let base = (blk * 8u + warp) * 4u;
+    let r0 = base + 0u;
+    let l0 = r0 < rows;
+    let q0 = select(base, r0, l0);
+    let cm0 = codes_b + q0 * cstride;
+    let pm0 = unpack2x16float(sg_wc[params_w + q0]);
+    var ma0 = 0.0;
+    var mb0 = 0.0;
+    let r1 = base + 1u;
+    let l1 = r1 < rows;
+    let q1 = select(base, r1, l1);
+    let cm1 = codes_b + q1 * cstride;
+    let pm1 = unpack2x16float(sg_wc[params_w + q1]);
+    var ma1 = 0.0;
+    var mb1 = 0.0;
+    let r2 = base + 2u;
+    let l2 = r2 < rows;
+    let q2 = select(base, r2, l2);
+    let cm2 = codes_b + q2 * cstride;
+    let pm2 = unpack2x16float(sg_wc[params_w + q2]);
+    var ma2 = 0.0;
+    var mb2 = 0.0;
+    let r3 = base + 3u;
+    let l3 = r3 < rows;
+    let q3 = select(base, r3, l3);
+    let cm3 = codes_b + q3 * cstride;
+    let pm3 = unpack2x16float(sg_wc[params_w + q3]);
+    var ma3 = 0.0;
+    var mb3 = 0.0;
+    if (!l0) { return; }
+    var g = lane;
+    loop {
+        if (g >= gpr) { break; }
+        let g0 = min(g + 0u, gpr - 1u);
+        let bit0 = g0 * 5u;
+        let cbo0 = bit0 >> 3u;
+        let sh0 = bit0 & 7u;
+        let xo0 = g0 * 8u;
+        let xa0 = sg_x[xo0 + 0u];
+        let xb0 = sg_x[xo0 + 1u];
+        let xc0 = sg_x[xo0 + 2u];
+        let xd0 = sg_x[xo0 + 3u];
+        let xe0 = sg_x[xo0 + 4u];
+        let xf0 = sg_x[xo0 + 5u];
+        let xg0 = sg_x[xo0 + 6u];
+        let xh0 = sg_x[xo0 + 7u];
+        let g1 = min(g + 32u, gpr - 1u);
+        let bit1 = g1 * 5u;
+        let cbo1 = bit1 >> 3u;
+        let sh1 = bit1 & 7u;
+        let xo1 = g1 * 8u;
+        let xa1 = sg_x[xo1 + 0u];
+        let xb1 = sg_x[xo1 + 1u];
+        let xc1 = sg_x[xo1 + 2u];
+        let xd1 = sg_x[xo1 + 3u];
+        let xe1 = sg_x[xo1 + 4u];
+        let xf1 = sg_x[xo1 + 5u];
+        let xg1 = sg_x[xo1 + 6u];
+        let xh1 = sg_x[xo1 + 7u];
+        var cvm00 = sg_byte_c(cm0 + cbo0);
+        if (sh0 > 3u) { cvm00 = cvm00 | (sg_byte_c(cm0 + cbo0 + 1u) << 8u); }
+        let vm00 = sg_w4c[q0 * gpr + g0];
+        var cvm01 = sg_byte_c(cm0 + cbo1);
+        if (sh1 > 3u) { cvm01 = cvm01 | (sg_byte_c(cm0 + cbo1 + 1u) << 8u); }
+        let vm01 = sg_w4c[q0 * gpr + g1];
+        var cvm10 = sg_byte_c(cm1 + cbo0);
+        if (sh0 > 3u) { cvm10 = cvm10 | (sg_byte_c(cm1 + cbo0 + 1u) << 8u); }
+        let vm10 = sg_w4c[q1 * gpr + g0];
+        var cvm11 = sg_byte_c(cm1 + cbo1);
+        if (sh1 > 3u) { cvm11 = cvm11 | (sg_byte_c(cm1 + cbo1 + 1u) << 8u); }
+        let vm11 = sg_w4c[q1 * gpr + g1];
+        var cvm20 = sg_byte_c(cm2 + cbo0);
+        if (sh0 > 3u) { cvm20 = cvm20 | (sg_byte_c(cm2 + cbo0 + 1u) << 8u); }
+        let vm20 = sg_w4c[q2 * gpr + g0];
+        var cvm21 = sg_byte_c(cm2 + cbo1);
+        if (sh1 > 3u) { cvm21 = cvm21 | (sg_byte_c(cm2 + cbo1 + 1u) << 8u); }
+        let vm21 = sg_w4c[q2 * gpr + g1];
+        var cvm30 = sg_byte_c(cm3 + cbo0);
+        if (sh0 > 3u) { cvm30 = cvm30 | (sg_byte_c(cm3 + cbo0 + 1u) << 8u); }
+        let vm30 = sg_w4c[q3 * gpr + g0];
+        var cvm31 = sg_byte_c(cm3 + cbo1);
+        if (sh1 > 3u) { cvm31 = cvm31 | (sg_byte_c(cm3 + cbo1 + 1u) << 8u); }
+        let vm31 = sg_w4c[q3 * gpr + g1];
+        ma0 = ma0 + exp2(pm0.x + f32((cvm00 >> sh0) & 31u) * pm0.y)
+            * (sg_dot8(vm00.x, xa0, xb0) + sg_dot8(vm00.y, xc0, xd0)
+             + sg_dot8(vm00.z, xe0, xf0) + sg_dot8(vm00.w, xg0, xh0));
+        ma1 = ma1 + exp2(pm1.x + f32((cvm10 >> sh0) & 31u) * pm1.y)
+            * (sg_dot8(vm10.x, xa0, xb0) + sg_dot8(vm10.y, xc0, xd0)
+             + sg_dot8(vm10.z, xe0, xf0) + sg_dot8(vm10.w, xg0, xh0));
+        ma2 = ma2 + exp2(pm2.x + f32((cvm20 >> sh0) & 31u) * pm2.y)
+            * (sg_dot8(vm20.x, xa0, xb0) + sg_dot8(vm20.y, xc0, xd0)
+             + sg_dot8(vm20.z, xe0, xf0) + sg_dot8(vm20.w, xg0, xh0));
+        ma3 = ma3 + exp2(pm3.x + f32((cvm30 >> sh0) & 31u) * pm3.y)
+            * (sg_dot8(vm30.x, xa0, xb0) + sg_dot8(vm30.y, xc0, xd0)
+             + sg_dot8(vm30.z, xe0, xf0) + sg_dot8(vm30.w, xg0, xh0));
+        if (g + 32u < gpr) {
+            mb0 = mb0 + exp2(pm0.x + f32((cvm01 >> sh1) & 31u) * pm0.y)
+                * (sg_dot8(vm01.x, xa1, xb1) + sg_dot8(vm01.y, xc1, xd1)
+                 + sg_dot8(vm01.z, xe1, xf1) + sg_dot8(vm01.w, xg1, xh1));
+            mb1 = mb1 + exp2(pm1.x + f32((cvm11 >> sh1) & 31u) * pm1.y)
+                * (sg_dot8(vm11.x, xa1, xb1) + sg_dot8(vm11.y, xc1, xd1)
+                 + sg_dot8(vm11.z, xe1, xf1) + sg_dot8(vm11.w, xg1, xh1));
+            mb2 = mb2 + exp2(pm2.x + f32((cvm21 >> sh1) & 31u) * pm2.y)
+                * (sg_dot8(vm21.x, xa1, xb1) + sg_dot8(vm21.y, xc1, xd1)
+                 + sg_dot8(vm21.z, xe1, xf1) + sg_dot8(vm21.w, xg1, xh1));
+            mb3 = mb3 + exp2(pm3.x + f32((cvm31 >> sh1) & 31u) * pm3.y)
+                * (sg_dot8(vm31.x, xa1, xb1) + sg_dot8(vm31.y, xc1, xd1)
+                 + sg_dot8(vm31.z, xe1, xf1) + sg_dot8(vm31.w, xg1, xh1));
+        }
+        g = g + 64u;
+    }
+    let t0 = sg_tree(ma0 + mb0);
+    let t1 = sg_tree(ma1 + mb1);
+    let t2 = sg_tree(ma2 + mb2);
+    let t3 = sg_tree(ma3 + mb3);
+    if (lane == 0u) {
+        if (l0) { sg_yc[r0] = t0; }
+        if (l1) { sg_yc[r1] = t1; }
+        if (l2) { sg_yc[r2] = t2; }
+        if (l3) { sg_yc[r3] = t3; }
+    }
+}
+
+@compute @workgroup_size(256)
+fn q4tp_mv_sg(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_index) lid: u32,
+              @builtin(subgroup_invocation_id) lane: u32) {
+    let per = 8u * 4u;
+    let warp = lid >> 5u;
+    let ba = (sg_p.rows_a + per - 1u) / per;
+    let bb = (sg_p.rows_b + per - 1u) / per;
+    let wb = wid.x;
+    if (wb < ba) {
+        run_a(wb, warp, lane);
+    } else if (wb < ba + bb) {
+        run_b(wb - ba, warp, lane);
+    } else {
+        run_c(wb - ba - bb, warp, lane);
+    }
+}
+
+"#;
+
+
+
+
+
+pub(crate) const GU_SG_R2U2: &str = r#"
+struct SgP { rows_a: u32, rows_b: u32, rows_c: u32, gpr: u32, lim: u32, act: u32, _p0: u32, _p1: u32 };
+@group(0) @binding(0)  var<storage, read>       sg_wa  : array<u32>;
+@group(0) @binding(1)  var<storage, read>       sg_wb  : array<u32>;
+@group(0) @binding(2)  var<storage, read>       sg_wc  : array<u32>;
+@group(0) @binding(3)  var<storage, read>       sg_w4a : array<vec4<u32>>;
+@group(0) @binding(4)  var<storage, read>       sg_w4b : array<vec4<u32>>;
+@group(0) @binding(5)  var<storage, read>       sg_w4c : array<vec4<u32>>;
+@group(0) @binding(6)  var<storage, read>       sg_x   : array<vec4<f32>>;
+@group(0) @binding(7)  var<storage, read_write> sg_ya  : array<f32>;
+@group(0) @binding(8)  var<storage, read_write> sg_yb  : array<f32>;
+@group(0) @binding(9)  var<storage, read_write> sg_yc  : array<f32>;
+@group(0) @binding(10) var<uniform>             sg_p   : SgP;
+fn sg_byte_a(off: u32) -> u32 { return (sg_wa[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu; }
+fn sg_byte_b(off: u32) -> u32 { return (sg_wb[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu; }
+fn sg_byte_c(off: u32) -> u32 { return (sg_wc[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu; }
+fn sg_nib(w: u32, sh: u32) -> f32 {
+    return bitcast<f32>(((w >> sh) & 0xFu) | 0x4B000000u) - 8388616.0;
+}
+fn sg_dot8(w: u32, a: vec4<f32>, b: vec4<f32>) -> f32 {
+    return sg_nib(w, 0u) * a.x
+         + sg_nib(w, 4u) * a.y
+         + sg_nib(w, 8u) * a.z
+         + sg_nib(w, 12u) * a.w
+         + sg_nib(w, 16u) * b.x
+         + sg_nib(w, 20u) * b.y
+         + sg_nib(w, 24u) * b.z
+         + sg_nib(w, 28u) * b.w;
+}
+// The 64-lane tree of `q4tp_matvec16nl` from stride 16 down: lane l takes
+// lane l+s's partial, in the same order (own + partner).
+fn sg_tree(v0: f32) -> f32 {
+    var v = v0;
+    v = v + subgroupShuffleDown(v, 16u);
+    v = v + subgroupShuffleDown(v, 8u);
+    v = v + subgroupShuffleDown(v, 4u);
+    v = v + subgroupShuffleDown(v, 2u);
+    v = v + subgroupShuffleDown(v, 1u);
+    return v;
+}
+fn sg_erf(x: f32) -> f32 {
+    let a = abs(x);
+    let t = 1.0 / (1.0 + 0.3275911 * a);
+    let y = 1.0
+        - (((((1.0614054 * t - 1.4531521) * t + 1.4214138) * t - 0.28449674) * t
+            + 0.2548296)
+            * t)
+            * exp(-a * a);
+    return select(y, -y, x < 0.0);
+}
+fn sg_gelu_erf(x: f32) -> f32 {
+    return 0.5 * x * (1.0 + sg_erf(x * 0.70710678));
+}
+fn run_gu(blk: u32, warp: u32, lane: u32) {
+    let rows = sg_p.rows_a;
+    let gpr = sg_p.gpr;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let base = (blk * 8u + warp) * 2u;
+    let r0 = base + 0u;
+    let l0 = r0 < rows;
+    let q0 = select(base, r0, l0);
+    let cg0 = codes_b + q0 * cstride;
+    let pg0 = unpack2x16float(sg_wa[params_w + q0]);
+    var ga0 = 0.0;
+    var gb0 = 0.0;
+    let cu0 = codes_b + q0 * cstride;
+    let pu0 = unpack2x16float(sg_wb[params_w + q0]);
+    var ua0 = 0.0;
+    var ub0 = 0.0;
+    let r1 = base + 1u;
+    let l1 = r1 < rows;
+    let q1 = select(base, r1, l1);
+    let cg1 = codes_b + q1 * cstride;
+    let pg1 = unpack2x16float(sg_wa[params_w + q1]);
+    var ga1 = 0.0;
+    var gb1 = 0.0;
+    let cu1 = codes_b + q1 * cstride;
+    let pu1 = unpack2x16float(sg_wb[params_w + q1]);
+    var ua1 = 0.0;
+    var ub1 = 0.0;
+    if (!l0) { return; }
+    var g = lane;
+    loop {
+        if (g >= gpr) { break; }
+        let g0 = min(g + 0u, gpr - 1u);
+        let bit0 = g0 * 5u;
+        let cbo0 = bit0 >> 3u;
+        let sh0 = bit0 & 7u;
+        let xo0 = g0 * 8u;
+        let xa0 = sg_x[xo0 + 0u];
+        let xb0 = sg_x[xo0 + 1u];
+        let xc0 = sg_x[xo0 + 2u];
+        let xd0 = sg_x[xo0 + 3u];
+        let xe0 = sg_x[xo0 + 4u];
+        let xf0 = sg_x[xo0 + 5u];
+        let xg0 = sg_x[xo0 + 6u];
+        let xh0 = sg_x[xo0 + 7u];
+        let g1 = min(g + 32u, gpr - 1u);
+        let bit1 = g1 * 5u;
+        let cbo1 = bit1 >> 3u;
+        let sh1 = bit1 & 7u;
+        let xo1 = g1 * 8u;
+        let xa1 = sg_x[xo1 + 0u];
+        let xb1 = sg_x[xo1 + 1u];
+        let xc1 = sg_x[xo1 + 2u];
+        let xd1 = sg_x[xo1 + 3u];
+        let xe1 = sg_x[xo1 + 4u];
+        let xf1 = sg_x[xo1 + 5u];
+        let xg1 = sg_x[xo1 + 6u];
+        let xh1 = sg_x[xo1 + 7u];
+        var cvg00 = sg_byte_a(cg0 + cbo0);
+        if (sh0 > 3u) { cvg00 = cvg00 | (sg_byte_a(cg0 + cbo0 + 1u) << 8u); }
+        let vg00 = sg_w4a[q0 * gpr + g0];
+        var cvg01 = sg_byte_a(cg0 + cbo1);
+        if (sh1 > 3u) { cvg01 = cvg01 | (sg_byte_a(cg0 + cbo1 + 1u) << 8u); }
+        let vg01 = sg_w4a[q0 * gpr + g1];
+        var cvg10 = sg_byte_a(cg1 + cbo0);
+        if (sh0 > 3u) { cvg10 = cvg10 | (sg_byte_a(cg1 + cbo0 + 1u) << 8u); }
+        let vg10 = sg_w4a[q1 * gpr + g0];
+        var cvg11 = sg_byte_a(cg1 + cbo1);
+        if (sh1 > 3u) { cvg11 = cvg11 | (sg_byte_a(cg1 + cbo1 + 1u) << 8u); }
+        let vg11 = sg_w4a[q1 * gpr + g1];
+        var cvu00 = sg_byte_b(cu0 + cbo0);
+        if (sh0 > 3u) { cvu00 = cvu00 | (sg_byte_b(cu0 + cbo0 + 1u) << 8u); }
+        let vu00 = sg_w4b[q0 * gpr + g0];
+        var cvu01 = sg_byte_b(cu0 + cbo1);
+        if (sh1 > 3u) { cvu01 = cvu01 | (sg_byte_b(cu0 + cbo1 + 1u) << 8u); }
+        let vu01 = sg_w4b[q0 * gpr + g1];
+        var cvu10 = sg_byte_b(cu1 + cbo0);
+        if (sh0 > 3u) { cvu10 = cvu10 | (sg_byte_b(cu1 + cbo0 + 1u) << 8u); }
+        let vu10 = sg_w4b[q1 * gpr + g0];
+        var cvu11 = sg_byte_b(cu1 + cbo1);
+        if (sh1 > 3u) { cvu11 = cvu11 | (sg_byte_b(cu1 + cbo1 + 1u) << 8u); }
+        let vu11 = sg_w4b[q1 * gpr + g1];
+        ga0 = ga0 + exp2(pg0.x + f32((cvg00 >> sh0) & 31u) * pg0.y)
+            * (sg_dot8(vg00.x, xa0, xb0) + sg_dot8(vg00.y, xc0, xd0)
+             + sg_dot8(vg00.z, xe0, xf0) + sg_dot8(vg00.w, xg0, xh0));
+        ga1 = ga1 + exp2(pg1.x + f32((cvg10 >> sh0) & 31u) * pg1.y)
+            * (sg_dot8(vg10.x, xa0, xb0) + sg_dot8(vg10.y, xc0, xd0)
+             + sg_dot8(vg10.z, xe0, xf0) + sg_dot8(vg10.w, xg0, xh0));
+        ua0 = ua0 + exp2(pu0.x + f32((cvu00 >> sh0) & 31u) * pu0.y)
+            * (sg_dot8(vu00.x, xa0, xb0) + sg_dot8(vu00.y, xc0, xd0)
+             + sg_dot8(vu00.z, xe0, xf0) + sg_dot8(vu00.w, xg0, xh0));
+        ua1 = ua1 + exp2(pu1.x + f32((cvu10 >> sh0) & 31u) * pu1.y)
+            * (sg_dot8(vu10.x, xa0, xb0) + sg_dot8(vu10.y, xc0, xd0)
+             + sg_dot8(vu10.z, xe0, xf0) + sg_dot8(vu10.w, xg0, xh0));
+        if (g + 32u < gpr) {
+            gb0 = gb0 + exp2(pg0.x + f32((cvg01 >> sh1) & 31u) * pg0.y)
+                * (sg_dot8(vg01.x, xa1, xb1) + sg_dot8(vg01.y, xc1, xd1)
+                 + sg_dot8(vg01.z, xe1, xf1) + sg_dot8(vg01.w, xg1, xh1));
+            gb1 = gb1 + exp2(pg1.x + f32((cvg11 >> sh1) & 31u) * pg1.y)
+                * (sg_dot8(vg11.x, xa1, xb1) + sg_dot8(vg11.y, xc1, xd1)
+                 + sg_dot8(vg11.z, xe1, xf1) + sg_dot8(vg11.w, xg1, xh1));
+            ub0 = ub0 + exp2(pu0.x + f32((cvu01 >> sh1) & 31u) * pu0.y)
+                * (sg_dot8(vu01.x, xa1, xb1) + sg_dot8(vu01.y, xc1, xd1)
+                 + sg_dot8(vu01.z, xe1, xf1) + sg_dot8(vu01.w, xg1, xh1));
+            ub1 = ub1 + exp2(pu1.x + f32((cvu11 >> sh1) & 31u) * pu1.y)
+                * (sg_dot8(vu11.x, xa1, xb1) + sg_dot8(vu11.y, xc1, xd1)
+                 + sg_dot8(vu11.z, xe1, xf1) + sg_dot8(vu11.w, xg1, xh1));
+        }
+        g = g + 64u;
+    }
+    var gg0 = sg_tree(ga0 + gb0);
+    var uu0 = sg_tree(ua0 + ub0);
+    var gg1 = sg_tree(ga1 + gb1);
+    var uu1 = sg_tree(ua1 + ub1);
+    if (lane == 0u) {
+        let lim = bitcast<f32>(sg_p.lim);
+        if (l0) {
+            if (lim > 0.0) { uu0 = clamp(uu0, -lim, lim); gg0 = min(gg0, lim); }
+            if (sg_p.act == 1u) { sg_ya[r0] = sg_gelu_erf(gg0) * uu0; }
+            else { sg_ya[r0] = (gg0 / (1.0 + exp(-gg0))) * uu0; }
+        }
+        if (l1) {
+            if (lim > 0.0) { uu1 = clamp(uu1, -lim, lim); gg1 = min(gg1, lim); }
+            if (sg_p.act == 1u) { sg_ya[r1] = sg_gelu_erf(gg1) * uu1; }
+            else { sg_ya[r1] = (gg1 / (1.0 + exp(-gg1))) * uu1; }
+        }
+    }
+}
+
+@compute @workgroup_size(256)
+fn q4tp_gu_sg(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_index) lid: u32,
+              @builtin(subgroup_invocation_id) lane: u32) {
+    run_gu(wid.x, lid >> 5u, lane);
+}
+"#;
+
+pub(crate) const GU_SG_R4U2: &str = r#"
+struct SgP { rows_a: u32, rows_b: u32, rows_c: u32, gpr: u32, lim: u32, act: u32, _p0: u32, _p1: u32 };
+@group(0) @binding(0)  var<storage, read>       sg_wa  : array<u32>;
+@group(0) @binding(1)  var<storage, read>       sg_wb  : array<u32>;
+@group(0) @binding(2)  var<storage, read>       sg_wc  : array<u32>;
+@group(0) @binding(3)  var<storage, read>       sg_w4a : array<vec4<u32>>;
+@group(0) @binding(4)  var<storage, read>       sg_w4b : array<vec4<u32>>;
+@group(0) @binding(5)  var<storage, read>       sg_w4c : array<vec4<u32>>;
+@group(0) @binding(6)  var<storage, read>       sg_x   : array<vec4<f32>>;
+@group(0) @binding(7)  var<storage, read_write> sg_ya  : array<f32>;
+@group(0) @binding(8)  var<storage, read_write> sg_yb  : array<f32>;
+@group(0) @binding(9)  var<storage, read_write> sg_yc  : array<f32>;
+@group(0) @binding(10) var<uniform>             sg_p   : SgP;
+fn sg_byte_a(off: u32) -> u32 { return (sg_wa[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu; }
+fn sg_byte_b(off: u32) -> u32 { return (sg_wb[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu; }
+fn sg_byte_c(off: u32) -> u32 { return (sg_wc[off >> 2u] >> ((off & 3u) * 8u)) & 0xFFu; }
+fn sg_nib(w: u32, sh: u32) -> f32 {
+    return bitcast<f32>(((w >> sh) & 0xFu) | 0x4B000000u) - 8388616.0;
+}
+fn sg_dot8(w: u32, a: vec4<f32>, b: vec4<f32>) -> f32 {
+    return sg_nib(w, 0u) * a.x
+         + sg_nib(w, 4u) * a.y
+         + sg_nib(w, 8u) * a.z
+         + sg_nib(w, 12u) * a.w
+         + sg_nib(w, 16u) * b.x
+         + sg_nib(w, 20u) * b.y
+         + sg_nib(w, 24u) * b.z
+         + sg_nib(w, 28u) * b.w;
+}
+// The 64-lane tree of `q4tp_matvec16nl` from stride 16 down: lane l takes
+// lane l+s's partial, in the same order (own + partner).
+fn sg_tree(v0: f32) -> f32 {
+    var v = v0;
+    v = v + subgroupShuffleDown(v, 16u);
+    v = v + subgroupShuffleDown(v, 8u);
+    v = v + subgroupShuffleDown(v, 4u);
+    v = v + subgroupShuffleDown(v, 2u);
+    v = v + subgroupShuffleDown(v, 1u);
+    return v;
+}
+fn sg_erf(x: f32) -> f32 {
+    let a = abs(x);
+    let t = 1.0 / (1.0 + 0.3275911 * a);
+    let y = 1.0
+        - (((((1.0614054 * t - 1.4531521) * t + 1.4214138) * t - 0.28449674) * t
+            + 0.2548296)
+            * t)
+            * exp(-a * a);
+    return select(y, -y, x < 0.0);
+}
+fn sg_gelu_erf(x: f32) -> f32 {
+    return 0.5 * x * (1.0 + sg_erf(x * 0.70710678));
+}
+fn run_gu(blk: u32, warp: u32, lane: u32) {
+    let rows = sg_p.rows_a;
+    let gpr = sg_p.gpr;
+    let params_w = rows * gpr * 4u;
+    let codes_b = rows * gpr * 16u + rows * 4u;
+    let cstride = (gpr * 5u + 7u) / 8u;
+    let base = (blk * 8u + warp) * 4u;
+    let r0 = base + 0u;
+    let l0 = r0 < rows;
+    let q0 = select(base, r0, l0);
+    let cg0 = codes_b + q0 * cstride;
+    let pg0 = unpack2x16float(sg_wa[params_w + q0]);
+    var ga0 = 0.0;
+    var gb0 = 0.0;
+    let cu0 = codes_b + q0 * cstride;
+    let pu0 = unpack2x16float(sg_wb[params_w + q0]);
+    var ua0 = 0.0;
+    var ub0 = 0.0;
+    let r1 = base + 1u;
+    let l1 = r1 < rows;
+    let q1 = select(base, r1, l1);
+    let cg1 = codes_b + q1 * cstride;
+    let pg1 = unpack2x16float(sg_wa[params_w + q1]);
+    var ga1 = 0.0;
+    var gb1 = 0.0;
+    let cu1 = codes_b + q1 * cstride;
+    let pu1 = unpack2x16float(sg_wb[params_w + q1]);
+    var ua1 = 0.0;
+    var ub1 = 0.0;
+    let r2 = base + 2u;
+    let l2 = r2 < rows;
+    let q2 = select(base, r2, l2);
+    let cg2 = codes_b + q2 * cstride;
+    let pg2 = unpack2x16float(sg_wa[params_w + q2]);
+    var ga2 = 0.0;
+    var gb2 = 0.0;
+    let cu2 = codes_b + q2 * cstride;
+    let pu2 = unpack2x16float(sg_wb[params_w + q2]);
+    var ua2 = 0.0;
+    var ub2 = 0.0;
+    let r3 = base + 3u;
+    let l3 = r3 < rows;
+    let q3 = select(base, r3, l3);
+    let cg3 = codes_b + q3 * cstride;
+    let pg3 = unpack2x16float(sg_wa[params_w + q3]);
+    var ga3 = 0.0;
+    var gb3 = 0.0;
+    let cu3 = codes_b + q3 * cstride;
+    let pu3 = unpack2x16float(sg_wb[params_w + q3]);
+    var ua3 = 0.0;
+    var ub3 = 0.0;
+    if (!l0) { return; }
+    var g = lane;
+    loop {
+        if (g >= gpr) { break; }
+        let g0 = min(g + 0u, gpr - 1u);
+        let bit0 = g0 * 5u;
+        let cbo0 = bit0 >> 3u;
+        let sh0 = bit0 & 7u;
+        let xo0 = g0 * 8u;
+        let xa0 = sg_x[xo0 + 0u];
+        let xb0 = sg_x[xo0 + 1u];
+        let xc0 = sg_x[xo0 + 2u];
+        let xd0 = sg_x[xo0 + 3u];
+        let xe0 = sg_x[xo0 + 4u];
+        let xf0 = sg_x[xo0 + 5u];
+        let xg0 = sg_x[xo0 + 6u];
+        let xh0 = sg_x[xo0 + 7u];
+        let g1 = min(g + 32u, gpr - 1u);
+        let bit1 = g1 * 5u;
+        let cbo1 = bit1 >> 3u;
+        let sh1 = bit1 & 7u;
+        let xo1 = g1 * 8u;
+        let xa1 = sg_x[xo1 + 0u];
+        let xb1 = sg_x[xo1 + 1u];
+        let xc1 = sg_x[xo1 + 2u];
+        let xd1 = sg_x[xo1 + 3u];
+        let xe1 = sg_x[xo1 + 4u];
+        let xf1 = sg_x[xo1 + 5u];
+        let xg1 = sg_x[xo1 + 6u];
+        let xh1 = sg_x[xo1 + 7u];
+        var cvg00 = sg_byte_a(cg0 + cbo0);
+        if (sh0 > 3u) { cvg00 = cvg00 | (sg_byte_a(cg0 + cbo0 + 1u) << 8u); }
+        let vg00 = sg_w4a[q0 * gpr + g0];
+        var cvg01 = sg_byte_a(cg0 + cbo1);
+        if (sh1 > 3u) { cvg01 = cvg01 | (sg_byte_a(cg0 + cbo1 + 1u) << 8u); }
+        let vg01 = sg_w4a[q0 * gpr + g1];
+        var cvg10 = sg_byte_a(cg1 + cbo0);
+        if (sh0 > 3u) { cvg10 = cvg10 | (sg_byte_a(cg1 + cbo0 + 1u) << 8u); }
+        let vg10 = sg_w4a[q1 * gpr + g0];
+        var cvg11 = sg_byte_a(cg1 + cbo1);
+        if (sh1 > 3u) { cvg11 = cvg11 | (sg_byte_a(cg1 + cbo1 + 1u) << 8u); }
+        let vg11 = sg_w4a[q1 * gpr + g1];
+        var cvg20 = sg_byte_a(cg2 + cbo0);
+        if (sh0 > 3u) { cvg20 = cvg20 | (sg_byte_a(cg2 + cbo0 + 1u) << 8u); }
+        let vg20 = sg_w4a[q2 * gpr + g0];
+        var cvg21 = sg_byte_a(cg2 + cbo1);
+        if (sh1 > 3u) { cvg21 = cvg21 | (sg_byte_a(cg2 + cbo1 + 1u) << 8u); }
+        let vg21 = sg_w4a[q2 * gpr + g1];
+        var cvg30 = sg_byte_a(cg3 + cbo0);
+        if (sh0 > 3u) { cvg30 = cvg30 | (sg_byte_a(cg3 + cbo0 + 1u) << 8u); }
+        let vg30 = sg_w4a[q3 * gpr + g0];
+        var cvg31 = sg_byte_a(cg3 + cbo1);
+        if (sh1 > 3u) { cvg31 = cvg31 | (sg_byte_a(cg3 + cbo1 + 1u) << 8u); }
+        let vg31 = sg_w4a[q3 * gpr + g1];
+        var cvu00 = sg_byte_b(cu0 + cbo0);
+        if (sh0 > 3u) { cvu00 = cvu00 | (sg_byte_b(cu0 + cbo0 + 1u) << 8u); }
+        let vu00 = sg_w4b[q0 * gpr + g0];
+        var cvu01 = sg_byte_b(cu0 + cbo1);
+        if (sh1 > 3u) { cvu01 = cvu01 | (sg_byte_b(cu0 + cbo1 + 1u) << 8u); }
+        let vu01 = sg_w4b[q0 * gpr + g1];
+        var cvu10 = sg_byte_b(cu1 + cbo0);
+        if (sh0 > 3u) { cvu10 = cvu10 | (sg_byte_b(cu1 + cbo0 + 1u) << 8u); }
+        let vu10 = sg_w4b[q1 * gpr + g0];
+        var cvu11 = sg_byte_b(cu1 + cbo1);
+        if (sh1 > 3u) { cvu11 = cvu11 | (sg_byte_b(cu1 + cbo1 + 1u) << 8u); }
+        let vu11 = sg_w4b[q1 * gpr + g1];
+        var cvu20 = sg_byte_b(cu2 + cbo0);
+        if (sh0 > 3u) { cvu20 = cvu20 | (sg_byte_b(cu2 + cbo0 + 1u) << 8u); }
+        let vu20 = sg_w4b[q2 * gpr + g0];
+        var cvu21 = sg_byte_b(cu2 + cbo1);
+        if (sh1 > 3u) { cvu21 = cvu21 | (sg_byte_b(cu2 + cbo1 + 1u) << 8u); }
+        let vu21 = sg_w4b[q2 * gpr + g1];
+        var cvu30 = sg_byte_b(cu3 + cbo0);
+        if (sh0 > 3u) { cvu30 = cvu30 | (sg_byte_b(cu3 + cbo0 + 1u) << 8u); }
+        let vu30 = sg_w4b[q3 * gpr + g0];
+        var cvu31 = sg_byte_b(cu3 + cbo1);
+        if (sh1 > 3u) { cvu31 = cvu31 | (sg_byte_b(cu3 + cbo1 + 1u) << 8u); }
+        let vu31 = sg_w4b[q3 * gpr + g1];
+        ga0 = ga0 + exp2(pg0.x + f32((cvg00 >> sh0) & 31u) * pg0.y)
+            * (sg_dot8(vg00.x, xa0, xb0) + sg_dot8(vg00.y, xc0, xd0)
+             + sg_dot8(vg00.z, xe0, xf0) + sg_dot8(vg00.w, xg0, xh0));
+        ga1 = ga1 + exp2(pg1.x + f32((cvg10 >> sh0) & 31u) * pg1.y)
+            * (sg_dot8(vg10.x, xa0, xb0) + sg_dot8(vg10.y, xc0, xd0)
+             + sg_dot8(vg10.z, xe0, xf0) + sg_dot8(vg10.w, xg0, xh0));
+        ga2 = ga2 + exp2(pg2.x + f32((cvg20 >> sh0) & 31u) * pg2.y)
+            * (sg_dot8(vg20.x, xa0, xb0) + sg_dot8(vg20.y, xc0, xd0)
+             + sg_dot8(vg20.z, xe0, xf0) + sg_dot8(vg20.w, xg0, xh0));
+        ga3 = ga3 + exp2(pg3.x + f32((cvg30 >> sh0) & 31u) * pg3.y)
+            * (sg_dot8(vg30.x, xa0, xb0) + sg_dot8(vg30.y, xc0, xd0)
+             + sg_dot8(vg30.z, xe0, xf0) + sg_dot8(vg30.w, xg0, xh0));
+        ua0 = ua0 + exp2(pu0.x + f32((cvu00 >> sh0) & 31u) * pu0.y)
+            * (sg_dot8(vu00.x, xa0, xb0) + sg_dot8(vu00.y, xc0, xd0)
+             + sg_dot8(vu00.z, xe0, xf0) + sg_dot8(vu00.w, xg0, xh0));
+        ua1 = ua1 + exp2(pu1.x + f32((cvu10 >> sh0) & 31u) * pu1.y)
+            * (sg_dot8(vu10.x, xa0, xb0) + sg_dot8(vu10.y, xc0, xd0)
+             + sg_dot8(vu10.z, xe0, xf0) + sg_dot8(vu10.w, xg0, xh0));
+        ua2 = ua2 + exp2(pu2.x + f32((cvu20 >> sh0) & 31u) * pu2.y)
+            * (sg_dot8(vu20.x, xa0, xb0) + sg_dot8(vu20.y, xc0, xd0)
+             + sg_dot8(vu20.z, xe0, xf0) + sg_dot8(vu20.w, xg0, xh0));
+        ua3 = ua3 + exp2(pu3.x + f32((cvu30 >> sh0) & 31u) * pu3.y)
+            * (sg_dot8(vu30.x, xa0, xb0) + sg_dot8(vu30.y, xc0, xd0)
+             + sg_dot8(vu30.z, xe0, xf0) + sg_dot8(vu30.w, xg0, xh0));
+        if (g + 32u < gpr) {
+            gb0 = gb0 + exp2(pg0.x + f32((cvg01 >> sh1) & 31u) * pg0.y)
+                * (sg_dot8(vg01.x, xa1, xb1) + sg_dot8(vg01.y, xc1, xd1)
+                 + sg_dot8(vg01.z, xe1, xf1) + sg_dot8(vg01.w, xg1, xh1));
+            gb1 = gb1 + exp2(pg1.x + f32((cvg11 >> sh1) & 31u) * pg1.y)
+                * (sg_dot8(vg11.x, xa1, xb1) + sg_dot8(vg11.y, xc1, xd1)
+                 + sg_dot8(vg11.z, xe1, xf1) + sg_dot8(vg11.w, xg1, xh1));
+            gb2 = gb2 + exp2(pg2.x + f32((cvg21 >> sh1) & 31u) * pg2.y)
+                * (sg_dot8(vg21.x, xa1, xb1) + sg_dot8(vg21.y, xc1, xd1)
+                 + sg_dot8(vg21.z, xe1, xf1) + sg_dot8(vg21.w, xg1, xh1));
+            gb3 = gb3 + exp2(pg3.x + f32((cvg31 >> sh1) & 31u) * pg3.y)
+                * (sg_dot8(vg31.x, xa1, xb1) + sg_dot8(vg31.y, xc1, xd1)
+                 + sg_dot8(vg31.z, xe1, xf1) + sg_dot8(vg31.w, xg1, xh1));
+            ub0 = ub0 + exp2(pu0.x + f32((cvu01 >> sh1) & 31u) * pu0.y)
+                * (sg_dot8(vu01.x, xa1, xb1) + sg_dot8(vu01.y, xc1, xd1)
+                 + sg_dot8(vu01.z, xe1, xf1) + sg_dot8(vu01.w, xg1, xh1));
+            ub1 = ub1 + exp2(pu1.x + f32((cvu11 >> sh1) & 31u) * pu1.y)
+                * (sg_dot8(vu11.x, xa1, xb1) + sg_dot8(vu11.y, xc1, xd1)
+                 + sg_dot8(vu11.z, xe1, xf1) + sg_dot8(vu11.w, xg1, xh1));
+            ub2 = ub2 + exp2(pu2.x + f32((cvu21 >> sh1) & 31u) * pu2.y)
+                * (sg_dot8(vu21.x, xa1, xb1) + sg_dot8(vu21.y, xc1, xd1)
+                 + sg_dot8(vu21.z, xe1, xf1) + sg_dot8(vu21.w, xg1, xh1));
+            ub3 = ub3 + exp2(pu3.x + f32((cvu31 >> sh1) & 31u) * pu3.y)
+                * (sg_dot8(vu31.x, xa1, xb1) + sg_dot8(vu31.y, xc1, xd1)
+                 + sg_dot8(vu31.z, xe1, xf1) + sg_dot8(vu31.w, xg1, xh1));
+        }
+        g = g + 64u;
+    }
+    var gg0 = sg_tree(ga0 + gb0);
+    var uu0 = sg_tree(ua0 + ub0);
+    var gg1 = sg_tree(ga1 + gb1);
+    var uu1 = sg_tree(ua1 + ub1);
+    var gg2 = sg_tree(ga2 + gb2);
+    var uu2 = sg_tree(ua2 + ub2);
+    var gg3 = sg_tree(ga3 + gb3);
+    var uu3 = sg_tree(ua3 + ub3);
+    if (lane == 0u) {
+        let lim = bitcast<f32>(sg_p.lim);
+        if (l0) {
+            if (lim > 0.0) { uu0 = clamp(uu0, -lim, lim); gg0 = min(gg0, lim); }
+            if (sg_p.act == 1u) { sg_ya[r0] = sg_gelu_erf(gg0) * uu0; }
+            else { sg_ya[r0] = (gg0 / (1.0 + exp(-gg0))) * uu0; }
+        }
+        if (l1) {
+            if (lim > 0.0) { uu1 = clamp(uu1, -lim, lim); gg1 = min(gg1, lim); }
+            if (sg_p.act == 1u) { sg_ya[r1] = sg_gelu_erf(gg1) * uu1; }
+            else { sg_ya[r1] = (gg1 / (1.0 + exp(-gg1))) * uu1; }
+        }
+        if (l2) {
+            if (lim > 0.0) { uu2 = clamp(uu2, -lim, lim); gg2 = min(gg2, lim); }
+            if (sg_p.act == 1u) { sg_ya[r2] = sg_gelu_erf(gg2) * uu2; }
+            else { sg_ya[r2] = (gg2 / (1.0 + exp(-gg2))) * uu2; }
+        }
+        if (l3) {
+            if (lim > 0.0) { uu3 = clamp(uu3, -lim, lim); gg3 = min(gg3, lim); }
+            if (sg_p.act == 1u) { sg_ya[r3] = sg_gelu_erf(gg3) * uu3; }
+            else { sg_ya[r3] = (gg3 / (1.0 + exp(-gg3))) * uu3; }
+        }
+    }
+}
+
+@compute @workgroup_size(256)
+fn q4tp_gu_sg(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_index) lid: u32,
+              @builtin(subgroup_invocation_id) lane: u32) {
+    run_gu(wid.x, lid >> 5u, lane);
+}
+"#;
+
+
+
+/// `gdn_step_par` (decode) and `gdn_step_par_k` (batch) with their tree
+/// reductions finished by subgroup shuffles: the stride-64 step through
+/// workgroup memory, the stride-32 step and the 16..1 strides inside the
+/// first subgroup, in the tree's own pair order — the same sums to the
+/// bit with four barriers a reduction where the loop takes nine.
+pub(crate) const GDN_SG_WGSL: &str = r#"
+struct GdnP { nv: u32, dk: u32, dv: u32, kd: u32, rep: u32, cdim: u32, eps: f32, tok: u32 };
+@group(0) @binding(0) var<storage, read>       gd_cq   : array<f32>;
+@group(0) @binding(2) var<storage, read>       gd_a    : array<f32>;
+@group(0) @binding(3) var<storage, read>       gd_b    : array<f32>;
+@group(0) @binding(4) var<storage, read>       gd_alog : array<f32>;
+@group(0) @binding(5) var<storage, read>       gd_dtb  : array<f32>;
+@group(0) @binding(7) var<storage, read_write> gd_S4   : array<vec4<f32>>;
+@group(0) @binding(8) var<storage, read_write> gd_o4   : array<vec4<f32>>;
+@group(0) @binding(9) var<uniform>             gd_p    : GdnP;
+var<workgroup> sr1: array<f32, 128>;
+var<workgroup> sr4: array<vec4<f32>, 128>;
+var<workgroup> sbc: vec4<f32>;
+fn gd_softplus(x: f32) -> f32 {
+    if (x > 20.0) { return x; }
+    return log(1.0 + exp(x));
+}
+// The 128-lane tree `for stride 64..1: r[t] += r[t + stride]` and its
+// trailing barrier, value of r[0] to every lane.
+fn sgr1(t: u32, v: f32) -> f32 {
+    sr1[t] = v;
+    workgroupBarrier();
+    if (t < 64u) { sr1[t] = sr1[t] + sr1[t + 64u]; }
+    workgroupBarrier();
+    if (t < 32u) {
+        var s = sr1[t] + sr1[t + 32u];
+        s = s + subgroupShuffleDown(s, 16u);
+        s = s + subgroupShuffleDown(s, 8u);
+        s = s + subgroupShuffleDown(s, 4u);
+        s = s + subgroupShuffleDown(s, 2u);
+        s = s + subgroupShuffleDown(s, 1u);
+        if (t == 0u) { sbc.x = s; }
+    }
+    workgroupBarrier();
+    let r = sbc.x;
+    workgroupBarrier();
+    return r;
+}
+fn sgr4(t: u32, v: vec4<f32>) -> vec4<f32> {
+    sr4[t] = v;
+    workgroupBarrier();
+    if (t < 64u) { sr4[t] = sr4[t] + sr4[t + 64u]; }
+    workgroupBarrier();
+    if (t < 32u) {
+        var s = sr4[t] + sr4[t + 32u];
+        s = s + subgroupShuffleDown(s, 16u);
+        s = s + subgroupShuffleDown(s, 8u);
+        s = s + subgroupShuffleDown(s, 4u);
+        s = s + subgroupShuffleDown(s, 2u);
+        s = s + subgroupShuffleDown(s, 1u);
+        if (t == 0u) { sbc = s; }
+    }
+    workgroupBarrier();
+    let r = sbc;
+    workgroupBarrier();
+    return r;
+}
+@compute @workgroup_size(128)
+fn gdn_step_par_sg(@builtin(workgroup_id) wid: vec3<u32>,
+                   @builtin(local_invocation_id) lid: vec3<u32>) {
+    let h = wid.x;
+    let dj4 = wid.y;
+    let t = lid.x;
+    let dk = gd_p.dk;
+    let dv = gd_p.dv;
+    if (h >= gd_p.nv || dj4 * 4u >= dv) { return; }
+    let ko = h / gd_p.rep;
+    let qs = ko * dk;
+    let ks = gd_p.kd + ko * dk;
+    let nq = sgr1(t, select(0.0, gd_cq[qs + t] * gd_cq[qs + t], t < dk));
+    let nkn = sgr1(t, select(0.0, gd_cq[ks + t] * gd_cq[ks + t], t < dk));
+    let invq = 1.0 / (sqrt(nq + 1e-6) * sqrt(f32(dk)));
+    let invk = 1.0 / sqrt(nkn + 1e-6);
+    let abo = gd_p.tok * gd_p.nv;
+    let g = exp(-exp(gd_alog[h]) * gd_softplus(gd_a[abo + h] + gd_dtb[h]));
+    let beta = 1.0 / (1.0 + exp(-gd_b[abo + h]));
+    let s4base = (h * dk * dv) >> 2u;
+    let dv4 = dv >> 2u;
+    let vto = 2u * gd_p.kd + h * dv + dj4 * 4u;
+    let vt = vec4<f32>(gd_cq[vto], gd_cq[vto + 1u], gd_cq[vto + 2u], gd_cq[vto + 3u]);
+    let kf_t = select(0.0, gd_cq[ks + t] * invk, t < dk);
+    let qf_t = select(0.0, gd_cq[qs + t] * invq, t < dk);
+    var kv4 = vec4<f32>(0.0);
+    if (t < dk) {
+        kv4 = gd_S4[s4base + t * dv4 + dj4] * kf_t;
+    }
+    let kv = sgr4(t, kv4);
+    let delta = (vt - g * kv) * beta;
+    var contrib = vec4<f32>(0.0);
+    if (t < dk) {
+        let idx = s4base + t * dv4 + dj4;
+        let cell = g * gd_S4[idx] + kf_t * delta;
+        gd_S4[idx] = cell;
+        contrib = qf_t * cell;
+    }
+    let o = sgr4(t, contrib);
+    if (t == 0u) {
+        let zo4 = (gd_p.tok * gd_p.nv * dv) >> 2u;
+        gd_o4[zo4 + h * dv4 + dj4] = o;
+    }
+}
+"#;
+
+pub(crate) const GDNK_SG_WGSL: &str = r#"
+struct GdKP {
+    nv: u32, dk: u32, dv: u32, kd: u32,
+    rep: u32, cdim: u32, eps: f32, kb: u32,
+    stride: u32, ring_els: u32, p0: u32, p1: u32,
+};
+@group(0) @binding(0) var<storage, read>       gdk_cq   : array<f32>;
+@group(0) @binding(2) var<storage, read>       gdk_a    : array<f32>;
+@group(0) @binding(3) var<storage, read>       gdk_b    : array<f32>;
+@group(0) @binding(4) var<storage, read>       gdk_alog : array<f32>;
+@group(0) @binding(5) var<storage, read>       gdk_dtb  : array<f32>;
+@group(0) @binding(7) var<storage, read_write> gdk_S4   : array<vec4<f32>>;
+@group(0) @binding(8) var<storage, read_write> gdk_o4   : array<vec4<f32>>;
+@group(0) @binding(9) var<uniform>             gdk_p    : GdKP;
+@group(0) @binding(10) var<storage, read_write> gdk_snap4 : array<vec4<f32>>;
+var<workgroup> sr1: array<f32, 128>;
+var<workgroup> sr4: array<vec4<f32>, 128>;
+var<workgroup> sbc: vec4<f32>;
+fn gd_softplus(x: f32) -> f32 {
+    if (x > 20.0) { return x; }
+    return log(1.0 + exp(x));
+}
+fn sgr1(t: u32, v: f32) -> f32 {
+    sr1[t] = v;
+    workgroupBarrier();
+    if (t < 64u) { sr1[t] = sr1[t] + sr1[t + 64u]; }
+    workgroupBarrier();
+    if (t < 32u) {
+        var s = sr1[t] + sr1[t + 32u];
+        s = s + subgroupShuffleDown(s, 16u);
+        s = s + subgroupShuffleDown(s, 8u);
+        s = s + subgroupShuffleDown(s, 4u);
+        s = s + subgroupShuffleDown(s, 2u);
+        s = s + subgroupShuffleDown(s, 1u);
+        if (t == 0u) { sbc.x = s; }
+    }
+    workgroupBarrier();
+    let r = sbc.x;
+    workgroupBarrier();
+    return r;
+}
+fn sgr4(t: u32, v: vec4<f32>) -> vec4<f32> {
+    sr4[t] = v;
+    workgroupBarrier();
+    if (t < 64u) { sr4[t] = sr4[t] + sr4[t + 64u]; }
+    workgroupBarrier();
+    if (t < 32u) {
+        var s = sr4[t] + sr4[t + 32u];
+        s = s + subgroupShuffleDown(s, 16u);
+        s = s + subgroupShuffleDown(s, 8u);
+        s = s + subgroupShuffleDown(s, 4u);
+        s = s + subgroupShuffleDown(s, 2u);
+        s = s + subgroupShuffleDown(s, 1u);
+        if (t == 0u) { sbc = s; }
+    }
+    workgroupBarrier();
+    let r = sbc;
+    workgroupBarrier();
+    return r;
+}
+@compute @workgroup_size(128)
+fn gdn_step_par_k_sg(@builtin(workgroup_id) wid: vec3<u32>,
+                     @builtin(local_invocation_id) lid: vec3<u32>) {
+    let h = wid.x;
+    let dj4 = wid.y;
+    let t = lid.x;
+    let dk = gdk_p.dk;
+    let dv = gdk_p.dv;
+    if (h >= gdk_p.nv || dj4 * 4u >= dv) { return; }
+    let ko = h / gdk_p.rep;
+    let dv4 = dv >> 2u;
+    let s4base = (h * dk * dv) >> 2u;
+    for (var i = 0u; i < gdk_p.kb; i = i + 1u) {
+        let cq0 = i * gdk_p.cdim;
+        let qs = cq0 + ko * dk;
+        let ks = cq0 + gdk_p.kd + ko * dk;
+        let nq = sgr1(t, select(0.0, gdk_cq[qs + t] * gdk_cq[qs + t], t < dk));
+        let nkn = sgr1(t, select(0.0, gdk_cq[ks + t] * gdk_cq[ks + t], t < dk));
+        let invq = 1.0 / (sqrt(nq + 1e-6) * sqrt(f32(dk)));
+        let invk = 1.0 / sqrt(nkn + 1e-6);
+        let abo = i * gdk_p.nv;
+        let g = exp(-exp(gdk_alog[h]) * gd_softplus(gdk_a[abo + h] + gdk_dtb[h]));
+        let beta = 1.0 / (1.0 + exp(-gdk_b[abo + h]));
+        let vto = cq0 + 2u * gdk_p.kd + h * dv + dj4 * 4u;
+        let vt = vec4<f32>(gdk_cq[vto], gdk_cq[vto + 1u], gdk_cq[vto + 2u], gdk_cq[vto + 3u]);
+        let kf_t = select(0.0, gdk_cq[ks + t] * invk, t < dk);
+        let qf_t = select(0.0, gdk_cq[qs + t] * invq, t < dk);
+        var kv4 = vec4<f32>(0.0);
+        if (t < dk) {
+            kv4 = gdk_S4[s4base + t * dv4 + dj4] * kf_t;
+        }
+        let kv = sgr4(t, kv4);
+        let delta = (vt - g * kv) * beta;
+        var contrib = vec4<f32>(0.0);
+        if (t < dk) {
+            let idx = s4base + t * dv4 + dj4;
+            let cell = g * gdk_S4[idx] + kf_t * delta;
+            gdk_S4[idx] = cell;
+            if (gdk_p.stride != 0u) {
+                gdk_snap4[(i * gdk_p.stride + gdk_p.ring_els) / 4u + idx] = cell;
+            }
+            contrib = qf_t * cell;
+        }
+        let o = sgr4(t, contrib);
+        if (t == 0u) {
+            gdk_o4[(i * gdk_p.nv * dv) / 4u + h * dv4 + dj4] = o;
+        }
+    }
+}
+"#;
+
+/// The subgroup-tree GDN step twins (`CMF_GDN_SG=0` keeps the loops).
+pub(crate) struct GdnSg {
+    pub(crate) par: wgpu::ComputePipeline,
+    pub(crate) par_l: wgpu::BindGroupLayout,
+    pub(crate) park: wgpu::ComputePipeline,
+    pub(crate) park_l: wgpu::BindGroupLayout,
+}
+
+fn build_gdn(c: &Ctx) -> Option<GdnSg> {
+    if std::env::var("CMF_GDN_SG").as_deref() == Ok("0") || !sg32(c) {
+        return None;
+    }
+    let par = compile(c, "cmf-gdn-sg", GDN_SG_WGSL, "gdn_step_par_sg")?;
+    let park = compile(c, "cmf-gdnk-sg", GDNK_SG_WGSL, "gdn_step_par_k_sg")?;
+    Some(GdnSg {
+        par_l: par.get_bind_group_layout(0),
+        par,
+        park_l: park.get_bind_group_layout(0),
+        park,
+    })
+}
+
+pub(crate) fn gdn(c: &Ctx) -> Option<&GdnSg> {
+    c.gdn_sg_pipes.get_or_init(|| build_gdn(c)).as_ref()
+}
