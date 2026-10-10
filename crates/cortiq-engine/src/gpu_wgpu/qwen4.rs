@@ -3018,7 +3018,7 @@ fn build_pipes(c: &Ctx) -> Option<Pipes> {
         t_idx_build: pipe("q4t_idx_build"),
         t_attend: pipe("q4t_attend"),
         hc3: build_hc3(c),
-        gu4w: build_sg_l(c, "q4_gu_q2tp4w", "CMF_QWEN_GU4W", false, &gu_layout, opts()),
+        gu4w: build_sg_l(c, "q4_gu_q2tp4w", "CMF_QWEN_GU4W", true, &gu_layout, opts()),
         dn4s: build_sg_l(c, "q4_dn_q4tp4s", "CMF_QWEN_DN4S", true, &dn_layout, opts()),
         route2: build_sg_auto(c, "q4t_route2", "CMF_QWEN_ROUTE2", opts()),
         f16_matvec2: pipe("q4_f16_matvec2"),
@@ -7971,27 +7971,10 @@ pub(crate) fn upload_expert_parts(
     ];
     for (part, (buf, off)) in parts.iter().zip(dst) {
         if !st.is_some_and(|s| s.put(buf, off, part)) {
-            queue_write(c, buf, off, part);
+            c.queue.write_buffer(buf, off, part);
         }
     }
     true
-}
-
-/// `queue.write_buffer`, or with `CMF_QWEN_WBW=1` the copy straight into
-/// the queue's own staging view (`write_buffer_with`), outside the queue's
-/// lock, so parallel admissions copy in parallel.
-fn queue_write(c: &Ctx, buf: &wgpu::Buffer, off: u64, part: &[u8]) {
-    static WBW: OnceLock<bool> = OnceLock::new();
-    let wbw = *WBW.get_or_init(|| std::env::var("CMF_QWEN_WBW").as_deref() == Ok("1"));
-    if wbw
-        && let Some(size) = wgpu::BufferSize::new(part.len() as u64)
-        && part.len() % 4 == 0
-        && let Some(mut view) = c.queue.write_buffer_with(buf, off, size)
-    {
-        view.copy_from_slice(part);
-        return;
-    }
-    c.queue.write_buffer(buf, off, part);
 }
 
 /// Hand the queue's pending `write_buffer` data to the GPU and wait, so
