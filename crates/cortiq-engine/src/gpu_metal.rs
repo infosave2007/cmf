@@ -33,6 +33,11 @@ pub mod qi21;
 #[doc(hidden)]
 pub mod egemma2;
 
+// q8_2f routed experts on the token graph and the MoE chunk prefill —
+// child module, `gpu_metal/moe_q8.rs`.
+#[doc(hidden)]
+pub mod moe_q8;
+
 // Native Metal scratch buffers are process-wide (the command queue and
 // `Ctx::io_bufs` are shared by all pipelines).  A buffer is safe to reuse
 // only after the owning pipeline's command buffer has completed; two server
@@ -9975,6 +9980,9 @@ pub struct ChunkLayer<'a> {
 pub struct ChunkMoe<'a> {
     pub router: &'a [f32],
     pub experts: Vec<(usize, usize, usize)>,
+    /// The trios are q8_2f (`moe_q8`: blob-addressed GEMMs with each
+    /// weight's own row scales and input field), not q4tp.
+    pub q8: bool,
     #[allow(clippy::type_complexity)]
     pub route: Box<dyn Fn(&[f32]) -> (Vec<usize>, Vec<f32>) + 'a>,
 }
@@ -10110,6 +10118,13 @@ fn chunk_moe_ffn(
     let g_b = io_buf_grow(c, 81_000_000_031, n_as * inter * 4);
     let u_b = io_buf_grow(c, 82_000_000_037, n_as * inter * 4);
     let eo_b = io_buf_grow(c, 83_000_000_041, n_as * hs * 4);
+    // q8_2f experts: the same panels through the blob-addressed q8 GEMM
+    // (each weight's own row scales; gate/up multiply their own input field
+    // into X while staging it, down's field is folded into the act rows).
+    let q8p = if m.q8 { moe_q8::pipes(c) } else { None };
+    if m.q8 && q8p.is_none() {
+        return false;
+    }
     {
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&c.gatherr);
@@ -10132,6 +10147,11 @@ fn chunk_moe_ffn(
                 continue;
             }
             let (ga, ua, _) = mabs[e];
+            if let Some(p) = q8p {
+                moe_q8::enc_mm_rows(p, enc, fbuf, ga, &xg_b, off[e], &g_b, off[e], n_e, inter, hs, true);
+                moe_q8::enc_mm_rows(p, enc, fbuf, ua, &xg_b, off[e], &u_b, off[e], n_e, inter, hs, true);
+                continue;
+            }
             enc_q4tp_mm_rows(c, enc, fbuf, ga, &xg_b, off[e], &g_b, off[e], n_e, inter, hs);
             enc_q4tp_mm_rows(c, enc, fbuf, ua, &xg_b, off[e], &u_b, off[e], n_e, inter, hs);
         }
@@ -10140,7 +10160,19 @@ fn chunk_moe_ffn(
     // SiLU·up per packed row, power-of-two guarded for the half staging.
     let act_b = io_buf_grow(c, 84_000_000_043, n_as * inter * 4);
     let up_b = io_buf_grow(c, 85_000_000_047, n_as.max(1) * 4);
-    {
+    if let Some(p) = q8p {
+        // q8_2f: (silu(g)·u)·col_down per expert panel, guarded on that.
+        let enc =
+            cmd.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent);
+        for e in 0..ne {
+            let n_e = off[e + 1] - off[e];
+            if n_e == 0 {
+                continue;
+            }
+            moe_q8::enc_act_rows(p, enc, fbuf, mabs[e].2, &g_b, &u_b, &act_b, &up_b, off[e], n_e, inter, hs);
+        }
+        enc.end_encoding();
+    } else {
         let enc = cmd.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&c.moeact);
         enc.set_buffer(0, Some(&g_b), 0);
@@ -10161,6 +10193,10 @@ fn chunk_moe_ffn(
                 continue;
             }
             let (_, _, da) = mabs[e];
+            if let Some(p) = q8p {
+                moe_q8::enc_mm_rows(p, enc, fbuf, da, &act_b, off[e], &eo_b, off[e], n_e, hs, inter, false);
+                continue;
+            }
             enc_q4tp_mm_rows(c, enc, fbuf, da, &act_b, off[e], &eo_b, off[e], n_e, hs, inter);
         }
         enc.end_encoding();
@@ -10400,9 +10436,22 @@ pub fn chunk_run_gpu(
             if n_exp == 0 || n_exp > 256 || m.router.len() != n_exp * hs {
                 return false;
             }
+            // q8_2f trios: the blob-addressed GEMM tiles K by 32.
+            if m.q8 && (moe_q8::pipes(c).is_none() || hs % 32 != 0 || inter % 32 != 0) {
+                return false;
+            }
             for &(g, u, d) in &m.experts {
                 let q4 = |i: usize, r: usize, cc: usize| -> Option<usize> {
                     let e = l.model.tensors.get(i)?;
+                    if m.q8 {
+                        if e.dtype != cortiq_core::TensorDtype::Q8_2f || e.shape.as_slice() != [r, cc] {
+                            return None;
+                        }
+                        let a = l.model.entry_abs_offset(e)?;
+                        let n = moe_q8::tensor_bytes(r, cc)?;
+                        return (a % 4 == 0 && a + n <= safe_len && e.nbytes as usize >= n)
+                            .then_some(a);
+                    }
                     if e.dtype != cortiq_core::TensorDtype::Q4TiledP || e.shape.as_slice() != [r, cc] {
                         return None;
                     }
@@ -10708,12 +10757,25 @@ pub fn chunk_run_gpu(
         add_norm(&cmd, pending_delta.then_some(&db), &inorm, &n_b);
         pending_delta = true;
         cmd = prof.cut(c, cmd, "norm");
+        // A q8_2f MoE layer (Mellum2.1 q8_2f) may run its q8_2f projections
+        // through the blob-addressed f32-tile GEMM and its attention GEMMs
+        // with f32 tiles (`moe_q8`); every other layer keeps its kernels.
+        let q8l = l.moe.as_ref().is_some_and(|m| m.q8);
+        let q8proj = if q8l && moe_q8::proj_on() { moe_q8::pipes(c) } else { None };
+        let q8att = if q8l && moe_q8::att_on() { moe_q8::pipes(c) } else { None };
         {
             // Independent outputs — one encoder, three dispatches (a q8_2f
             // projection stages its x·col first; the serial encoder orders
             // the shared staging buffer).
             let enc = cmd.new_compute_command_encoder();
             for (i, (t, y)) in [(&l.wq, &qraw), (&l.wk, &kraw), (&l.wv, &vraw)].into_iter().enumerate() {
+                let fits = |n: Option<usize>| n.is_some_and(|n| prep.abs[i] + n <= safe_len);
+                if let Some(p) = q8proj
+                    .filter(|_| !l.col[i].is_empty() && t.2 % 32 == 0 && fits(moe_q8::tensor_bytes(t.1, t.2)))
+                {
+                    moe_q8::enc_mm_rows(p, enc, &fbuf, prep.abs[i], &n_b, 0, y, 0, b, t.1, t.2, true);
+                    continue;
+                }
                 let x = if l.col[i].is_empty() {
                     &n_b
                 } else {
@@ -10784,8 +10846,10 @@ pub fn chunk_run_gpu(
             let scale = 1.0f32 / (hd as f32).sqrt();
             {
                 let enc = cmd.new_compute_command_encoder();
-                let pso = mm_pipeline(c, 0, hd, 2);
-                enc.set_compute_pipeline_state(&pso);
+                match q8att {
+                    Some(p) => moe_q8::set_att_nt(p, enc),
+                    None => enc.set_compute_pipeline_state(&mm_pipeline(c, 0, hd, 2)),
+                }
                 for g in 0..nkv {
                     let koff = (g * prep.cap * hd * 4) as u64;
                     let qoff = (g * hpk * b * hd * 4) as u64;
@@ -10844,8 +10908,10 @@ pub fn chunk_run_gpu(
                         enc.set_bytes(2 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
                     }
                     enc.dispatch_threads(MTLSize::new(ncur as u64, 32, 1), MTLSize::new(64, 4, 1));
-                    let pso = mm_pipeline(c, hd, 0, 3);
-                    enc.set_compute_pipeline_state(&pso);
+                    match q8att {
+                        Some(p) => moe_q8::set_att_nn(p, enc),
+                        None => enc.set_compute_pipeline_state(&mm_pipeline(c, hd, 0, 3)),
+                    }
                     let koff = (g * prep.cap * hd * 4) as u64;
                     let qoff = (g * hpk * b * hd * 4) as u64;
                     enc.set_buffer(0, Some(&prep.v_mb), koff);
@@ -10888,13 +10954,18 @@ pub fn chunk_run_gpu(
         cmd = prof.cut(c, cmd, "attend");
         {
             let enc = cmd.new_compute_command_encoder();
-            let x = if l.col[3].is_empty() {
-                &attn
+            let o_fits = moe_q8::tensor_bytes(l.wo.1, l.wo.2).is_some_and(|n| prep.abs[3] + n <= safe_len);
+            if let Some(p) = q8proj.filter(|_| !l.col[3].is_empty() && l.wo.2 % 32 == 0 && o_fits) {
+                moe_q8::enc_mm_rows(p, enc, &fbuf, prep.abs[3], &attn, 0, &ob, 0, b, l.wo.1, l.wo.2, true);
             } else {
-                col_scale(enc, &attn, l.col[3], nh * hd);
-                &xpre
-            };
-            enc_mul_mm(c, enc, &fbuf, prep.abs[3], &prep.rs[3], prep.kind[3], x, &ob, b, l.wo.1, l.wo.2);
+                let x = if l.col[3].is_empty() {
+                    &attn
+                } else {
+                    col_scale(enc, &attn, l.col[3], nh * hd);
+                    &xpre
+                };
+                enc_mul_mm(c, enc, &fbuf, prep.abs[3], &prep.rs[3], prep.kind[3], x, &ob, b, l.wo.1, l.wo.2);
+            }
             enc.end_encoding();
         }
         cmd = prof.cut(c, cmd, "mm_o");
@@ -13972,6 +14043,9 @@ pub struct GpuMoe<'a> {
     pub route_scale: f32,
     /// Mixed 2-bit profile: q2tp gate/up over a q4tp down.
     pub gu_q2: bool,
+    /// Every trio q8_2f (Mellum2.1 q8_2f): the `moe_q8` jobs kernels, each
+    /// job applying its own weight's input field.
+    pub q8: bool,
     /// Sigmoid scores instead of a softmax (LFM2-MoE / DeepSeek-V3 /
     /// HunYuan hy_v3); the top-k renorm then floors the sum at 1e-6.
     pub sigmoid: bool,
@@ -14848,6 +14922,9 @@ impl TokenGraph {
                 {
                     return false;
                 }
+                if m.q8 && (m.gu_q2 || moe_q8::pipes(self.c).is_none()) {
+                    return false;
+                }
                 // Every expert trio bounds-checked against the mmap: the
                 // jobs kernels read raw offsets with no further checks.
                 let ok_at = |idx: usize, rows: usize, cols: usize, q2: bool| -> bool {
@@ -14857,6 +14934,15 @@ impl TokenGraph {
                     let Some(abs) = self.model.entry_abs_offset(entry) else {
                         return false;
                     };
+                    if m.q8 {
+                        // q8_2f: payload, row scales and input field all
+                        // inside the mapping; char4 rows need 4-byte bases.
+                        return entry.dtype == cortiq_core::TensorDtype::Q8_2f
+                            && entry.shape.as_slice() == [rows, cols]
+                            && abs % 4 == 0
+                            && moe_q8::tensor_bytes(rows, cols)
+                                .is_some_and(|n| abs + n <= self.safe_len && entry.nbytes as usize >= n);
+                    }
                     let dt = if q2 {
                         cortiq_core::TensorDtype::Q2TiledP
                     } else {
@@ -16488,6 +16574,56 @@ impl TokenGraph {
                 MTLSize::new(sgs * 32, 1, 1),
             );
         };
+        // q8_2f experts (`moe_q8`): the same ladder over the q8 kernels, each
+        // job multiplying its own weight's input field into its input. The
+        // preflight (`ffn_ok`) already compiled them. The fused passes are
+        // opt-in here: on Mellum2.1 q8_2f (M4, in-process pairs) the fused
+        // gate|up|SiLU measured 1.021 and the fused down+mix 1.044 of the
+        // jobs ladder's wall per token — q4tp's levers do not carry over.
+        let q8p = if m.q8 { moe_q8::pipes(c) } else { None };
+        if let Some(p) = q8p {
+            if !decode_skip('g') {
+                if moe_bit(MOE_GU) && moe_q8::gu_fused() {
+                    moe_q8::enc_gu(p, enc, &self.fbuf, &bgu_b, &self.n_b, &a_b, inter, hidden, ne);
+                } else {
+                    moe_q8::enc_jobs(p, enc, &self.fbuf, &bgu_b, &self.n_b, &gu_b, inter, hidden, ne * 2, 0);
+                    self.bar(enc);
+                    enc.set_compute_pipeline_state(&c.moesilu);
+                    enc.set_buffer(0, Some(&gu_b), 0);
+                    enc.set_buffer(1, Some(&a_b), 0);
+                    let n_u = inter as u32;
+                    let ne_u = ne as u32;
+                    enc.set_bytes(2, 4, &n_u as *const u32 as *const std::ffi::c_void);
+                    enc.set_bytes(3, 4, &ne_u as *const u32 as *const std::ffi::c_void);
+                    enc.dispatch_threads(
+                        MTLSize::new((ne * inter) as u64, 1, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
+                }
+            }
+            self.bar(enc);
+            if decode_skip('d') {
+                return;
+            }
+            if moe_q8::down_fused() {
+                moe_q8::enc_down_mix(p, enc, &self.fbuf, &bdn_b, &a_b, &self.h_b, &w_b, hidden, inter, ne);
+                return;
+            }
+            moe_q8::enc_jobs(p, enc, &self.fbuf, &bdn_b, &a_b, &eo_b, hidden, inter, ne, inter);
+            self.bar(enc);
+            enc.set_compute_pipeline_state(&c.moered);
+            enc.set_buffer(0, Some(&eo_b), 0);
+            enc.set_buffer(1, Some(&w_b), 0);
+            enc.set_buffer(2, Some(&self.d_b), 0);
+            let n_u = hidden as u32;
+            let ne_u = ne as u32;
+            enc.set_bytes(3, 4, &n_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(4, 4, &ne_u as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_threads(MTLSize::new(hidden as u64, 1, 1), MTLSize::new(256, 1, 1));
+            self.bar(enc);
+            disp_axpy(c, enc, &self.d_b, &self.h_b, 1.0, hidden);
+            return;
+        }
         if decode_skip('g') {
         } else if moe_bit(MOE_GU) && !m.gu_q2 {
             // gate|up|SiLU for every job in one masked-nibble pass.
