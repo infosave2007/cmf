@@ -114,15 +114,16 @@ Decode, tok/s:
 |---|---:|---:|
 | `cortiq bench --tokens 120 --core` | **49.1** | 44.3 (74 % of drafts accepted) |
 | 200-token story, `cortiq run --greedy --no-think` | 31.4 | 23.4 |
-| the same bench at a 16 GB budget (`CMF_GPU_VRAM_MB=16000`), one run | 33.5 | — |
+| the same bench at a 16 GB budget (`CMF_GPU_VRAM_MB=16000`) | 34.6 | — |
+| the same bench at a 12 GB budget (`CMF_GPU_VRAM_MB=12000`) | 22.1 | — |
 
 Long prompts, plain decoding (`CMF_QWEN_MTP=0`):
 
 | prompt | prompt processing, tok/s | time to first token | decode at that depth, tok/s |
 |---|---:|---:|---:|
-| ~1,000-token text, steady rate after the first chunk | 57.8 | — | — |
-| `cortiq bench --ctx 1000` | 43.8 | 10.3 s | 38.2 |
-| `cortiq bench --ctx 2000` | 40.7 | 22.3 s | 33.5 |
+| ~1,000-token text, steady rate after the first chunk | 67.5 | — | — |
+| `cortiq bench --ctx 1000` | 42.8 | 9.9 s | 40.2 |
+| `cortiq bench --ctx 2000` | 40.4 | 20.7 s | 38.7 |
 
 On this card speculative decoding is slower than plain decoding, so set `CMF_QWEN_MTP=0` there; that also frees about 0.9 GB of VRAM for experts.
 
@@ -324,6 +325,8 @@ Upstream context is 262,144 tokens. The GPU path serves positions up to about 16
 | `CMF_QWEN_CHECKED` | unset | GPU | `1` = shader runtime checks and workgroup zero-init back on (slower; for debugging) |
 | `CMF_QWEN_IO` | `mmap` | GPU | how a missing expert is read: copied from the memory map; `pread` = one buffered read; `direct` = page cache if resident, else O_DIRECT (Linux) |
 | `CMF_QWEN_RAM_TIER_MB` | unset (off) | GPU | explicit RAM tier: `auto` = free RAM minus a reserve, or a size in MiB; drops copies of arena experts first, reloads evicted ones in the background |
+| `CMF_QWEN_HTIER_MB` | unset (off) | GPU | host-memory expert tier (Linux): `auto` or a size in MiB; the card pulls missing experts by DMA from pinned system memory instead of CPU writes; pins at most half of the memory the process can take. Pays in a long-lived server at small VRAM budgets; a one-shot run starts later |
+| `CMF_QWEN_ADMIT_THREADS` | 16 | GPU | threads of the expert admission pool; `0` = the previous per-frame threads |
 | `CMF_QWEN_CACHE_HINTS` | unset | GPU | `1` = release an expert's file pages once it is in VRAM, read it back ahead when evicted (Linux) |
 | `CMF_QWEN_WILLNEED` | unset | GPU | `1` = read-ahead advice before each copy (helps a cold disk, costs on cached pages) |
 | `CMF_QWEN_STORE` | on | GPU | `0` = the 0.8.7 read path |
@@ -381,7 +384,7 @@ hf download infosave/Qwen3.8-Flash-Next-cmf flashnext.profile --local-dir .
 CMF_QWEN_PROFILE=flashnext.profile cortiq run qwen38-flash-next-q2tp.cmf --prompt "Объясни квиксорт в трёх предложениях." --no-think --greedy
 ```
 
-Скорость (один поток, `cortiq bench --tokens 120 --core`, файл q2tp, профиль маршрутизации): RTX 3090 24 ГБ, cortiq 0.8.15 — 49,1 ток/с без спекулятивного декодирования (`CMF_QWEN_MTP=0`), 44,3 с ним (принято 74 % черновиков), 33,5 при `CMF_GPU_VRAM_MB=16000` (один прогон); RTX 5090 32 ГБ, cortiq 0.8.8 — 81,7 ток/с на всей карте, 108,6 со спекулятивным декодированием, обработка промпта 88–95 ток/с, 50,5 при `CMF_GPU_VRAM_MB=16000`, 31,4 при 12 ГБ; RTX 4090 24 ГБ, cortiq 0.8.7 — 41,9 / 27,2 / 16,3. Условия на RTX 3090: драйвер 580, Vulkan, Ubuntu 24.04, хост AMD EPYC 7H12, медианы трёх прогонов; автоматический бюджет (около 21,5 ГБ) вмещает все 8163 эксперта из профиля, весь файл 77 ГБ лежит в кэше страниц ОС. Там же рассказ на 200 токенов (`cortiq run --greedy --no-think`) — 31,4 ток/с без спекуляции и 23,4 с ней; текст ~1000 токенов обрабатывается со скоростью 57,8 ток/с (установившаяся, после первого фрагмента); `cortiq bench --ctx 1000` — промпт 43,8 ток/с, первый токен через 10,3 с, декодирование на этой глубине 38,2 ток/с; `--ctx 2000` — 40,7 ток/с, 22,3 с, 33,5 ток/с (декодирование без спекуляции). На этой карте спекулятивное декодирование медленнее обычного, поэтому ставьте там `CMF_QWEN_MTP=0`; это также освобождает около 0,9 ГБ видеопамяти под эксперты. На реальных запросах через `cortiq serve` (рассказ, код, объяснение, текст на русском, SQL) RTX 5090 даёт 47–63 ток/с и 54–65 со спекулятивным декодированием. Пример длинного кода — [3D-аквариум](examples/3d-aquarium/README.md): ответ на 10 930 токенов, рабочая HTML-страница на Three.js, 67,8 ток/с.
+Скорость (один поток, `cortiq bench --tokens 120 --core`, файл q2tp, профиль маршрутизации): RTX 3090 24 ГБ, cortiq 0.8.15 — 49,1 ток/с без спекулятивного декодирования (`CMF_QWEN_MTP=0`), 44,3 с ним (принято 74 % черновиков), 34,6 при `CMF_GPU_VRAM_MB=16000`, 22,1 при 12 ГБ; RTX 5090 32 ГБ, cortiq 0.8.8 — 81,7 ток/с на всей карте, 108,6 со спекулятивным декодированием, обработка промпта 88–95 ток/с, 50,5 при `CMF_GPU_VRAM_MB=16000`, 31,4 при 12 ГБ; RTX 4090 24 ГБ, cortiq 0.8.7 — 41,9 / 27,2 / 16,3. Условия на RTX 3090: драйвер 580, Vulkan, Ubuntu 24.04, хост AMD EPYC 7H12, медианы трёх прогонов; автоматический бюджет (около 21,5 ГБ) вмещает все 8163 эксперта из профиля, весь файл 77 ГБ лежит в кэше страниц ОС. Там же рассказ на 200 токенов (`cortiq run --greedy --no-think`) — 31,4 ток/с без спекуляции и 23,4 с ней; текст ~1000 токенов обрабатывается со скоростью 57,8 ток/с (установившаяся, после первого фрагмента); `cortiq bench --ctx 1000` — промпт 43,8 ток/с, первый токен через 10,3 с, декодирование на этой глубине 38,2 ток/с; `--ctx 2000` — 40,7 ток/с, 22,3 с, 33,5 ток/с (декодирование без спекуляции). На этой карте спекулятивное декодирование медленнее обычного, поэтому ставьте там `CMF_QWEN_MTP=0`; это также освобождает около 0,9 ГБ видеопамяти под эксперты. На реальных запросах через `cortiq serve` (рассказ, код, объяснение, текст на русском, SQL) RTX 5090 даёт 47–63 ток/с и 54–65 со спекулятивным декодированием. Пример длинного кода — [3D-аквариум](examples/3d-aquarium/README.md): ответ на 10 930 токенов, рабочая HTML-страница на Three.js, 67,8 ток/с.
 
 Файл q4tp (эксперты 4 бита, 97 ГБ) качественнее: перплексия на коде 4,11 против 4,76 у q2tp, совпадение с эталоном на CPU 0,994–0,996 против 0,986–0,989. Для него есть свой MTP-файл `qwen38-flash-next-q4tp.mtp.cmf` (1,50 ГБ) и профиль `flashnext-q4tp.profile`. На RTX 5090 с cortiq 0.8.9 — 40,3 ток/с, 44,4 со спекулятивным декодированием; эксперт весит 2,6 МБ вместо 1,75, в видеопамять их помещается примерно на треть меньше, и без оперативной памяти под весь файл (97 ГБ) он заметно медленнее: 11–20 ток/с на реальных запросах при 62 ГБ.
 
