@@ -61,7 +61,28 @@ const QBLOCK_FULL: usize = 512;
 /// work item; longer ones go through blocked GEMMs.
 const SHORT_SEQ: usize = 96;
 
-const EPS: f64 = 1e-6;
+pub(crate) const EPS: f64 = 1e-6;
+
+/// Below this many tokens a batch runs on the device alone.
+#[cfg(target_os = "macos")]
+const CO_MIN_TOKENS: usize = 2048;
+
+/// The share of a device batch's tokens the host computes beside it
+/// (`CMF_EGEMMA2_CPU_SHARE`, default 0 = device only). Measured on the M4
+/// (in-process, three interleaved rounds): 0.2 cost 3-4% on both 256 × 32
+/// and 64 × 512 tokens — the busy CPU slows the GPU part by more than it
+/// adds — so the co-run stays an opt-in.
+#[cfg(target_os = "macos")]
+fn cpu_share() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("CMF_EGEMMA2_CPU_SHARE")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|v| v.clamp(0.0, 0.9))
+            .unwrap_or(0.0)
+    })
+}
 
 /// `CMF_EGEMMA2_PROF=1`: per-forward time split (projections / attention
 /// core / the rest) on stderr.
@@ -325,6 +346,15 @@ impl Mat {
         match self {
             Mat::F32 { rows, .. } => *rows,
             Mat::Q(q) => q.rows(),
+        }
+    }
+
+    /// The f32 weights, when the matrix holds them.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn f32_weights(&self) -> Option<&[f32]> {
+        match self {
+            Mat::F32 { w, .. } => Some(w),
+            Mat::Q(_) => None,
         }
     }
 
@@ -650,6 +680,12 @@ fn softmax_scalar(row: &mut [f32]) {
 /// The EmbeddingGemma 2 text encoder (and the shared pieces every modality
 /// path goes through: the tokenizer, the prompt table, the head).
 pub struct EmbeddingGemma2 {
+    /// the device forward (macOS / Metal); first, so it drops before the
+    /// host weights it wraps
+    #[cfg(target_os = "macos")]
+    gpu: Option<crate::gpu_metal::egemma2::TextGpu>,
+    /// run the host forward even when the device one is up (A/B, tests)
+    host_only: std::sync::atomic::AtomicBool,
     tok: Tokenizer,
     prompts: Prompts,
     embed: Table,
@@ -829,7 +865,10 @@ impl EmbeddingGemma2 {
         let head = Mat::load(model, "language_model.embedding_projection.weight", true)?;
         let embed = Table::load(model, "language_model.embed_tokens.weight")?;
         let dim = head.rows();
-        Ok(EmbeddingGemma2 {
+        let mut enc = EmbeddingGemma2 {
+            #[cfg(target_os = "macos")]
+            gpu: None,
+            host_only: std::sync::atomic::AtomicBool::new(false),
             tok,
             prompts,
             embed,
@@ -850,7 +889,95 @@ impl EmbeddingGemma2 {
             pool,
             busy: Mutex::new(()),
             quant: prov["quant"].as_str().unwrap_or("").to_string(),
+        };
+        #[cfg(target_os = "macos")]
+        if dequant && crate::gpu_metal::egemma2::enabled() {
+            match enc.device_encoder() {
+                Ok(g) => enc.gpu = Some(g),
+                Err(e) => tracing::info!("egemma2: Metal text path off ({e}); the CPU runs it"),
+            }
+        }
+        Ok(enc)
+    }
+
+    /// The device forward over this encoder's own f32 weights.
+    #[cfg(target_os = "macos")]
+    fn device_encoder(&self) -> Result<crate::gpu_metal::egemma2::TextGpu, String> {
+        use crate::gpu_metal::egemma2::{LayerSpec, TextGpu, TextSpec};
+        fn f(m: &Mat) -> Result<&[f32], String> {
+            m.f32_weights()
+                .ok_or_else(|| "a quantized matrix (low-memory mode)".to_string())
+        }
+        let mut ropes: Vec<(usize, u32, Vec<f32>, Vec<f32>)> = Vec::new();
+        let mut layers = Vec::with_capacity(self.layers.len());
+        let mut inter = 0usize;
+        for l in &self.layers {
+            let key = (l.head_dim, l.theta.to_bits());
+            let rope = match ropes.iter().position(|r| (r.0, r.1) == key) {
+                Some(i) => i,
+                None => {
+                    let r = Rot::build(self.max_tokens, l.head_dim, l.theta);
+                    ropes.push((key.0, key.1, r.cos, r.sin));
+                    ropes.len() - 1
+                }
+            };
+            inter = l.gate.rows();
+            layers.push(LayerSpec {
+                q: f(&l.q)?,
+                k: f(&l.k)?,
+                v: f(&l.v)?,
+                o: f(&l.o)?,
+                gate: f(&l.gate)?,
+                up: f(&l.up)?,
+                down: f(&l.down)?,
+                ple_in: f(&l.ple_in)?,
+                ple_gate: f(&l.ple_gate)?,
+                ple_proj: f(&l.ple_proj)?,
+                q_norm: &l.q_norm,
+                k_norm: &l.k_norm,
+                in_norm: &l.in_norm,
+                post_attn_norm: &l.post_attn_norm,
+                pre_ff_norm: &l.pre_ff_norm,
+                post_ff_norm: &l.post_ff_norm,
+                ple_norm: &l.ple_norm,
+                head_dim: l.head_dim,
+                q_heads: l.q_heads,
+                kv_heads: l.kv_heads,
+                window: l.window,
+                scalar: l.scalar,
+                rope,
+            });
+        }
+        TextGpu::new(&TextSpec {
+            hidden: self.hidden,
+            inter,
+            n_ple: self.n_ple,
+            eps: EPS as f32,
+            ple_scale: (self.hidden as f32).powf(-0.5),
+            ple_norm: &self.ple_norm,
+            norm: &self.norm,
+            layers,
+            ropes: ropes.into_iter().map(|(hd, _, c, s)| (hd, c, s)).collect(),
+            max_tokens: self.max_tokens,
         })
+    }
+
+    /// Run the host forward (`true`) even when the device one is up.
+    pub fn force_host(&self, on: bool) {
+        self.host_only
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Does the forward run on the device (Metal)?
+    pub fn on_device(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.gpu.is_some() && !self.host_only.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
     }
 
     pub fn prompts(&self) -> &Prompts {
@@ -966,6 +1093,72 @@ impl EmbeddingGemma2 {
     }
 
     fn forward_pooled_locked(&self, x: Vec<f32>, lens: &[usize]) -> Vec<Vec<f32>> {
+        #[cfg(target_os = "macos")]
+        if let Some(g) = self.gpu.as_ref().filter(|_| self.on_device()) {
+            let d = self.hidden;
+            let head = |pooled: Vec<f32>| -> Vec<Vec<f32>> {
+                let nseq = pooled.len() / d;
+                let y = self.head.apply(&pooled, nseq, self.pool.as_deref());
+                y.chunks_exact(self.dim)
+                    .map(|r| {
+                        let mut v = r.to_vec();
+                        l2_normalize(&mut v);
+                        v
+                    })
+                    .collect()
+            };
+            // With `CMF_EGEMMA2_CPU_SHARE` the CPU takes the last sequences
+            // of a big batch while the device runs the rest (off by
+            // default: see `cpu_share`).
+            let n: usize = lens.iter().sum();
+            let share = cpu_share();
+            let mut split = lens.len();
+            if share > 0.0 && lens.len() >= 2 && n >= CO_MIN_TOKENS {
+                let want = (n as f64 * share) as usize;
+                let mut tail = 0usize;
+                while split > 1 && tail + lens[split - 1] <= want {
+                    split -= 1;
+                    tail += lens[split];
+                }
+            }
+            let gpu_rows: usize = lens[..split].iter().sum();
+            let (xg, xc) = x.split_at(gpu_rows * d);
+            let (gpu, host) = std::thread::scope(|sc| {
+                let job = sc.spawn(|| g.forward(xg, &lens[..split]));
+                let host = (split < lens.len()).then(|| {
+                    let t = std::time::Instant::now();
+                    let v = self.forward_host(xc.to_vec(), &lens[split..]);
+                    (v, t.elapsed().as_secs_f64())
+                });
+                (job.join(), host)
+            });
+            match gpu {
+                Ok(Ok(pooled)) => {
+                    let mut out = head(pooled);
+                    if let Some((v, secs)) = host {
+                        if prof::on() {
+                            eprintln!(
+                                "egemma2 co-run: host {} seqs / {} tokens in {:.1} ms beside the device",
+                                lens.len() - split,
+                                n - gpu_rows,
+                                secs * 1e3
+                            );
+                        }
+                        out.extend(v);
+                    }
+                    return out;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("egemma2: Metal forward failed ({e}); the CPU runs it")
+                }
+                Err(_) => tracing::warn!("egemma2: Metal forward panicked; the CPU runs it"),
+            }
+        }
+        self.forward_host(x, lens)
+    }
+
+    /// The host forward (Accelerate / the engine's GEMM, the pool).
+    fn forward_host(&self, x: Vec<f32>, lens: &[usize]) -> Vec<Vec<f32>> {
         let t_fwd = std::time::Instant::now();
         // the media towers run their projections through `Mat` too: start
         // this forward's split from zero

@@ -217,6 +217,19 @@ fn egemma2_audio_parity() {
         let cs = cosine(a, b);
         assert!(cs > same, "shortcut vs MediaEncoder: {cs}");
     }
+    // the device text forward (when up) agrees with the host one
+    if enc.on_device() {
+        enc.force_host(true);
+        let host = mm.embed(&mixed).expect("embed (host)");
+        enc.force_host(false);
+        let worst = got
+            .iter()
+            .zip(&host)
+            .map(|(a, b)| cosine(a, b))
+            .fold(1.0f64, f64::min);
+        eprintln!("device vs host text forward: worst cosine {worst:.9}");
+        assert!(worst > 0.999_999, "device vs host: {worst}");
+    }
     let mut worst = (1.0f64, String::new());
     for ((c, _), g) in inputs.iter().zip(&got) {
         let row = c["row"].as_u64().unwrap() as usize;

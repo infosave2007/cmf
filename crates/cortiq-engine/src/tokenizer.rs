@@ -12,6 +12,7 @@
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::OnceLock;
 use unicode_normalization::UnicodeNormalization;
 
 /// GPT-2 pre-tokenizer pattern — used when tokenizer.json carries no
@@ -46,6 +47,10 @@ pub struct Tokenizer {
     id_to_token: Vec<String>,
     /// BPE merge ranks: (left, right) → rank (lower merges first)
     ranks: HashMap<(String, String), u32>,
+    /// The SentencePiece merges over token ids (built on first use; `None`
+    /// when a merge names a string outside the vocabulary — the string
+    /// path then runs)
+    sp_ids: OnceLock<Option<SpMerges>>,
     /// All added tokens (split during encode; emitted raw at decode)
     added: Vec<(String, u32)>,
     /// IDs of added tokens (decode: emit content raw, no byte-map)
@@ -516,6 +521,7 @@ impl Tokenizer {
             vocab,
             id_to_token,
             ranks,
+            sp_ids: OnceLock::new(),
             added,
             added_ids,
             special_ids,
@@ -551,6 +557,7 @@ impl Tokenizer {
             vocab,
             id_to_token,
             ranks: HashMap::new(),
+            sp_ids: OnceLock::new(),
             added: Vec::new(),
             added_ids: HashSet::new(),
             special_ids: HashSet::new(),
@@ -706,12 +713,45 @@ impl Tokenizer {
         }
     }
 
+    /// The id-level merge table of a SentencePiece vocabulary.
+    fn sp_merges(&self) -> Option<&SpMerges> {
+        self.sp_ids
+            .get_or_init(|| SpMerges::build(&self.vocab, &self.ranks))
+            .as_ref()
+    }
+
     /// SentencePiece BPE: symbols are chars (no byte-level alphabet);
     /// unknown symbols fall back to <0xNN> tokens per UTF-8 byte.
+    ///
+    /// The rule is "merge every occurrence of the lowest-ranked adjacent
+    /// pair, left to right, until none is left". [`SpMerges::encode`] runs
+    /// it over ids with a heap (O(n log n)); this string form (O(n²) with a
+    /// clone per pair) remains for vocabularies whose merges leave the
+    /// vocabulary and as the reference the fast form is tested against.
     fn bpe_piece_sp(&self, piece: &str, out: &mut Vec<u32>) {
         if piece.is_empty() {
             return;
         }
+        if !SP_STRINGS.with(|f| f.get()) {
+            if let Some(m) = self.sp_merges() {
+                m.encode(&self.vocab, piece, out);
+                return;
+            }
+        }
+        self.bpe_piece_sp_strings(piece, out);
+    }
+
+    /// [`encode`](Self::encode) with the SentencePiece string form forced:
+    /// the reference the id-level BPE is checked against.
+    #[doc(hidden)]
+    pub fn encode_reference(&self, text: &str) -> Vec<u32> {
+        SP_STRINGS.with(|f| f.set(true));
+        let ids = self.encode(text);
+        SP_STRINGS.with(|f| f.set(false));
+        ids
+    }
+
+    fn bpe_piece_sp_strings(&self, piece: &str, out: &mut Vec<u32>) {
         let mut sym: Vec<String> = piece.chars().map(|c| c.to_string()).collect();
         loop {
             let mut best: Option<(u32, usize)> = None;
@@ -1264,6 +1304,154 @@ pub enum TokenizerError {
     Parse(String),
 }
 
+/// SentencePiece merges over token ids: `(left, right)` → `(rank, merged)`.
+struct SpMerges {
+    pairs: HashMap<u64, (u32, u32)>,
+    /// `<0xNN>` ids for the byte fallback (`u32::MAX` = absent)
+    bytes: [u32; 256],
+}
+
+const SP_NONE: u32 = u32::MAX;
+
+thread_local! {
+    /// [`Tokenizer::encode_reference`] in progress on this thread.
+    static SP_STRINGS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+impl SpMerges {
+    fn build(vocab: &HashMap<String, u32>, ranks: &HashMap<(String, String), u32>) -> Option<Self> {
+        if ranks.is_empty() {
+            return None;
+        }
+        let mut pairs = HashMap::with_capacity(ranks.len());
+        let mut cat = String::new();
+        for ((a, b), &r) in ranks {
+            let (&ia, &ib) = (vocab.get(a)?, vocab.get(b)?);
+            cat.clear();
+            cat.push_str(a);
+            cat.push_str(b);
+            let &m = vocab.get(&cat)?;
+            pairs.insert(((ia as u64) << 32) | ib as u64, (r, m));
+        }
+        let mut bytes = [SP_NONE; 256];
+        for (b, slot) in bytes.iter_mut().enumerate() {
+            if let Some(&id) = vocab.get(&format!("<0x{b:02X}>")) {
+                *slot = id;
+            }
+        }
+        Some(SpMerges { pairs, bytes })
+    }
+
+    #[inline]
+    fn rank(&self, a: u32, b: u32) -> Option<(u32, u32)> {
+        if a == SP_NONE || b == SP_NONE {
+            return None;
+        }
+        self.pairs.get(&(((a as u64) << 32) | b as u64)).copied()
+    }
+
+    /// The string form's rule over ids: take the lowest rank among the
+    /// adjacent pairs, merge every live occurrence of that pair left to
+    /// right (non-overlapping), and only then admit the pairs the merges
+    /// formed — exactly the order of `bpe_piece_sp_strings`.
+    fn encode(&self, vocab: &HashMap<String, u32>, piece: &str, out: &mut Vec<u32>) {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let spans: Vec<(usize, usize)> = piece
+            .char_indices()
+            .map(|(i, c)| (i, i + c.len_utf8()))
+            .collect();
+        let n = spans.len();
+        let mut buf = [0u8; 4];
+        let mut id: Vec<u32> = piece
+            .chars()
+            .map(|c| *vocab.get(c.encode_utf8(&mut buf) as &str).unwrap_or(&SP_NONE))
+            .collect();
+        let mut next: Vec<usize> = (1..=n).collect();
+        let mut prev: Vec<usize> = (0..n).map(|i| i.wrapping_sub(1)).collect();
+        let mut alive = vec![true; n];
+        let mut heap: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::with_capacity(n);
+        for i in 0..n.saturating_sub(1) {
+            if let Some((r, _)) = self.rank(id[i], id[i + 1]) {
+                heap.push(Reverse((r, i)));
+            }
+        }
+        let mut batch: Vec<usize> = Vec::new();
+        let mut merged: Vec<usize> = Vec::new();
+        while let Some(&Reverse((r, _))) = heap.peek() {
+            batch.clear();
+            while let Some(&Reverse((r2, pos))) = heap.peek() {
+                if r2 != r {
+                    break;
+                }
+                heap.pop();
+                batch.push(pos);
+            }
+            batch.sort_unstable();
+            batch.dedup();
+            merged.clear();
+            for &pos in &batch {
+                if !alive[pos] || next[pos] >= n {
+                    continue;
+                }
+                let j = next[pos];
+                match self.rank(id[pos], id[j]) {
+                    Some((rr, m)) if rr == r => {
+                        id[pos] = m;
+                        alive[j] = false;
+                        next[pos] = next[j];
+                        if next[j] < n {
+                            prev[next[j]] = pos;
+                        }
+                        merged.push(pos);
+                    }
+                    _ => {}
+                }
+            }
+            for &pos in &merged {
+                if !alive[pos] {
+                    continue;
+                }
+                let pv = prev[pos];
+                if pv < n && alive[pv] {
+                    if let Some((r2, _)) = self.rank(id[pv], id[pos]) {
+                        heap.push(Reverse((r2, pv)));
+                    }
+                }
+                let nx = next[pos];
+                if nx < n {
+                    if let Some((r2, _)) = self.rank(id[pos], id[nx]) {
+                        heap.push(Reverse((r2, pos)));
+                    }
+                }
+            }
+        }
+        let mut i = 0usize;
+        while i < n {
+            if id[i] != SP_NONE {
+                out.push(id[i]);
+            } else {
+                // a character outside the vocabulary: its UTF-8 bytes
+                let (a, b) = spans[i];
+                let mut ok = true;
+                for &byte in piece[a..b].as_bytes() {
+                    match self.bytes[byte as usize] {
+                        SP_NONE => {
+                            ok = false;
+                            break;
+                        }
+                        t => out.push(t),
+                    }
+                }
+                if !ok {
+                    tracing::error!("tokenizer: no id for SP symbol {:?} — dropped", &piece[a..b]);
+                }
+            }
+            i = next[i];
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1321,6 +1509,69 @@ mod tests {
               ]
             }}"#
         )
+    }
+
+    /// The id-level SentencePiece BPE gives the string form's ids on every
+    /// input, including merges whose products rank below the merge that
+    /// made them, overlapping runs ("aaa"), two merges producing one
+    /// string, and characters outside the vocabulary (byte fallback, with
+    /// one byte missing).
+    #[test]
+    fn sp_heap_bpe_matches_the_string_form() {
+        let toks = [
+            "a", "b", "c", "▁", "bc", "abc", "ab", "aa", "aab", "ca", "▁a", "aabc",
+            "aaa", "<0x64>", "<0xC3>", "▁▁",
+        ];
+        let vocab: Vec<String> = toks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| format!("\"{t}\": {i}"))
+            .collect();
+        let merges = [
+            ("aab", "c"),
+            ("b", "c"),
+            ("a", "bc"),
+            ("a", "b"),
+            ("ab", "c"),
+            ("a", "a"),
+            ("aa", "b"),
+            ("c", "a"),
+            ("▁", "a"),
+            ("aa", "a"),
+            ("▁", "▁"),
+        ];
+        let merges: Vec<String> = merges
+            .iter()
+            .map(|(a, b)| format!("[\"{a}\", \"{b}\"]"))
+            .collect();
+        let json = format!(
+            r#"{{"model": {{"type": "BPE", "byte_fallback": true, "vocab": {{ {} }}, "merges": [{}]}},
+               "normalizer": {{"type": "Replace", "pattern": {{"String": " "}}, "content": "\u2581"}},
+               "added_tokens": []}}"#,
+            vocab.join(", "),
+            merges.join(", ")
+        );
+        let t = Tokenizer::from_json(&json).unwrap();
+        assert!(t.metaspace, "a byte_fallback vocabulary takes the SentencePiece path");
+        assert!(t.sp_merges().is_some());
+        let alphabet = ['a', 'b', 'c', '\u{2581}', 'd', 'é', 'a', 'a', 'b'];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for len in 0..40 {
+            for _ in 0..60 {
+                let piece: String = (0..len)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        alphabet[(state % alphabet.len() as u64) as usize]
+                    })
+                    .collect();
+                let (mut fast, mut slow) = (Vec::new(), Vec::new());
+                t.sp_merges().unwrap().encode(&t.vocab, &piece, &mut fast);
+                t.bpe_piece_sp_strings(&piece, &mut slow);
+                assert_eq!(fast, slow, "{piece:?}");
+            }
+        }
     }
 
     /// MiniCPM5 marks its tool grammar special. Decoding must keep the

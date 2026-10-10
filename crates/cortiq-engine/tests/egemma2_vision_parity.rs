@@ -247,6 +247,22 @@ fn egemma2_vision_parity() {
     let alone = cx.enc.embed(&batch[1..2]).unwrap();
     let cs = cosine(&alone[0], &got[1]);
     assert!(cs > 0.999_999, "batch vs single: {cs}");
+    // the device forwards (when up) agree with the host ones
+    let tower = cx.enc.vision().unwrap();
+    if tower.on_device() || cx.enc.text.on_device() {
+        tower.force_host(true);
+        cx.enc.text.force_host(true);
+        let host = cx.enc.embed(&batch).unwrap();
+        tower.force_host(false);
+        cx.enc.text.force_host(false);
+        let worst = got
+            .iter()
+            .zip(&host)
+            .map(|(a, b)| cosine(a, b))
+            .fold(1.0f64, f64::min);
+        eprintln!("device vs host forward: worst cosine {worst:.9}");
+        assert!(worst > 0.999_999, "device vs host: {worst}");
+    }
 
     // ── video: the reference's decoded frames, then the mp4 itself
     let fh: Vec<usize> = index["video_fox_pan"]["frames_fhw"]
