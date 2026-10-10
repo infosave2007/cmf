@@ -339,12 +339,20 @@ impl QwenGpuPool {
             staging,
         )
         .map(|mut pool| {
-            // admissions go through a pinned staging ring (CMF_QWEN_STAGE_MB
-            // per buffer, 0 = straight through the queue)
+            // Admissions go straight through the queue (`write_buffer`) by
+            // default; CMF_QWEN_STAGE_MB=<n> puts them through a pinned
+            // staging ring of n MB per buffer. Measured on an RTX 3090 with
+            // the file in the page cache, the ring lost at every budget: the
+            // card waited ~25 ms longer per 8-token prompt frame (prompt
+            // ingest 48-49 -> 56-60 tok/s without it), and decode of a
+            // 200-token story went 32.0/32.3 -> 33.6/34.0 tok/s at the full
+            // card and 17.1/17.7 -> 19.5/19.4 at 12 GB (131 cold experts a
+            // token). The ring was introduced on hosts whose page cache could
+            // not hold the file; there it may still win.
             let stage_mb = std::env::var("CMF_QWEN_STAGE_MB")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(256);
+                .unwrap_or(0);
             pool.stager = crate::gpu_wgpu::qwen4::Stager::new(stage_mb);
             // A cold expert costs the host hundreds of microseconds; the
             // device path admits on the first miss and fetches at least a
