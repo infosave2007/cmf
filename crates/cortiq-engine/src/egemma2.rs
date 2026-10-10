@@ -981,6 +981,8 @@ impl EmbeddingGemma2 {
         let head = Mat::load(model, "language_model.embedding_projection.weight", true)?;
         let embed = Table::load(model, "language_model.embed_tokens.weight")?;
         let dim = head.rows();
+        // mutated only where the device path exists
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut enc = EmbeddingGemma2 {
             #[cfg(target_os = "macos")]
             gpu: None,
@@ -1087,13 +1089,10 @@ impl EmbeddingGemma2 {
     /// Does the forward run on the device (Metal)?
     pub fn on_device(&self) -> bool {
         #[cfg(target_os = "macos")]
-        {
-            self.gpu.is_some() && !self.host_only.load(std::sync::atomic::Ordering::Relaxed)
-        }
+        let up = self.gpu.is_some();
         #[cfg(not(target_os = "macos"))]
-        {
-            false
-        }
+        let up = false;
+        up && !self.host_only.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn prompts(&self) -> &Prompts {
