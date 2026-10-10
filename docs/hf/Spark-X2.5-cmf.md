@@ -66,6 +66,7 @@ are 4-bit in the compact files.
 
 | hardware | backend | 4B q8_2f | 4B q4mix | 1.7B q8_2f | 1.7B q4mix |
 |---|---|---:|---:|---:|---:|
+| RTX 3090 (24 GB) | Vulkan | 94.4 | 108.5 | 164.7 | 180.0 |
 | RTX 2000 Ada (16 GB) | Vulkan | 40.3 | 48.2 | 85.6 | 101.1 |
 | Mac mini M4 (24 GB) | Metal | 20.5 | 25.3 | 41.0 | 52.7 |
 | Mac mini M4 (24 GB) | CPU, 10 cores | 21.2 | 23.2 | 47.8 | 51.7 |
@@ -75,13 +76,16 @@ Prompt processing, tok/s:
 
 | hardware | backend | prompt | 4B q8_2f | 4B q4mix | 1.7B q8_2f | 1.7B q4mix |
 |---|---|---:|---:|---:|---:|---:|
+| RTX 3090 (24 GB) | Vulkan | 1000 | 209 | 194 | 453 | 445 |
+| RTX 3090 (24 GB) | Vulkan | 16000 | 195 | 187 | 419 | 411 |
 | RTX 2000 Ada (16 GB) | Vulkan | 1000 | 377 | 282 | 906 | 772 |
 | RTX 2000 Ada (16 GB) | Vulkan | 16000 | 361 | 254 | 833 | 718 |
 | Mac mini M4 (24 GB) | Metal | 1000 | 155 | 157 | 350 | 353 |
 | EPYC 9354, 7 cores | CPU | 1000 | 39 | 40 | 90 | 84 |
 
 A 16000-token prompt takes 41 s on the 4B q8_2f and 18.5 s on the 1.7B q8_2f
-(RTX 2000 Ada).
+on the RTX 2000 Ada, 77.9 s and 38.8 s on the RTX 3090. RTX 3090 rows: cortiq
+0.8.15, Ubuntu 24.04, driver 580.
 
 On the RTX 2000 Ada the 4B q8_2f file takes 4.5 GB of VRAM at a 3k-token
 context.
@@ -226,6 +230,7 @@ wikitext-2 test с BOS-токеном в начале; неквантованн�
 
 | железо | бэкенд | 4B q8_2f | 4B q4mix | 1.7B q8_2f | 1.7B q4mix |
 |---|---|---:|---:|---:|---:|
+| RTX 3090 (24 ГБ) | Vulkan | 94.4 | 108.5 | 164.7 | 180.0 |
 | RTX 2000 Ada (16 ГБ) | Vulkan | 40.3 | 48.2 | 85.6 | 101.1 |
 | Mac mini M4 (24 ГБ) | Metal | 20.5 | 25.3 | 41.0 | 52.7 |
 | Mac mini M4 (24 ГБ) | CPU, 10 ядер | 21.2 | 23.2 | 47.8 | 51.7 |
@@ -235,13 +240,16 @@ wikitext-2 test с BOS-токеном в начале; неквантованн�
 
 | железо | бэкенд | промпт | 4B q8_2f | 4B q4mix | 1.7B q8_2f | 1.7B q4mix |
 |---|---|---:|---:|---:|---:|---:|
+| RTX 3090 (24 ГБ) | Vulkan | 1000 | 209 | 194 | 453 | 445 |
+| RTX 3090 (24 ГБ) | Vulkan | 16000 | 195 | 187 | 419 | 411 |
 | RTX 2000 Ada (16 ГБ) | Vulkan | 1000 | 377 | 282 | 906 | 772 |
 | RTX 2000 Ada (16 ГБ) | Vulkan | 16000 | 361 | 254 | 833 | 718 |
 | Mac mini M4 (24 ГБ) | Metal | 1000 | 155 | 157 | 350 | 353 |
 | EPYC 9354, 7 ядер | CPU | 1000 | 39 | 40 | 90 | 84 |
 
 Промпт из 16000 токенов обрабатывается за 41 с на 4B q8_2f и за 18.5 с на
-1.7B q8_2f (RTX 2000 Ada).
+1.7B q8_2f на RTX 2000 Ada, за 77.9 с и 38.8 с на RTX 3090. Строки RTX 3090:
+cortiq 0.8.15, Ubuntu 24.04, драйвер 580.
 
 На RTX 2000 Ada файл 4B q8_2f занимает 4.5 ГБ видеопамяти при контексте 3k токенов.
 
@@ -373,6 +381,7 @@ BOS token；未量化模型分别为 10.61（4B）和 14.49（1.7B；transformer
 
 | 硬件 | 后端 | 4B q8_2f | 4B q4mix | 1.7B q8_2f | 1.7B q4mix |
 |---|---|---:|---:|---:|---:|
+| RTX 3090（24 GB） | Vulkan | 94.4 | 108.5 | 164.7 | 180.0 |
 | RTX 2000 Ada（16 GB） | Vulkan | 40.3 | 48.2 | 85.6 | 101.1 |
 | Mac mini M4（24 GB） | Metal | 20.5 | 25.3 | 41.0 | 52.7 |
 | Mac mini M4（24 GB） | CPU，10 核 | 21.2 | 23.2 | 47.8 | 51.7 |
@@ -382,12 +391,14 @@ BOS token；未量化模型分别为 10.61（4B）和 14.49（1.7B；transformer
 
 | 硬件 | 后端 | 提示词 | 4B q8_2f | 4B q4mix | 1.7B q8_2f | 1.7B q4mix |
 |---|---|---:|---:|---:|---:|---:|
+| RTX 3090（24 GB） | Vulkan | 1000 | 209 | 194 | 453 | 445 |
+| RTX 3090（24 GB） | Vulkan | 16000 | 195 | 187 | 419 | 411 |
 | RTX 2000 Ada（16 GB） | Vulkan | 1000 | 377 | 282 | 906 | 772 |
 | RTX 2000 Ada（16 GB） | Vulkan | 16000 | 361 | 254 | 833 | 718 |
 | Mac mini M4（24 GB） | Metal | 1000 | 155 | 157 | 350 | 353 |
 | EPYC 9354，7 核 | CPU | 1000 | 39 | 40 | 90 | 84 |
 
-在 RTX 2000 Ada 上，16000 token 的提示词在 4B q8_2f 上需要 41 秒，在 1.7B q8_2f 上需要 18.5 秒。
+在 RTX 2000 Ada 上，16000 token 的提示词在 4B q8_2f 上需要 41 秒，在 1.7B q8_2f 上需要 18.5 秒；在 RTX 3090 上分别需要 77.9 秒和 38.8 秒。RTX 3090 的数据：cortiq 0.8.15，Ubuntu 24.04，驱动 580。
 
 在 RTX 2000 Ada 上，4B q8_2f 文件在 3k token 上下文时占用 4.5 GB 显存。
 
