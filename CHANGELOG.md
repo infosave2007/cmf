@@ -5,6 +5,181 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.15] - 2026-10-10
+
+### Added
+- EmbeddingGemma 2 (`google/embeddinggemma-2`, Apache-2.0) in CMF. Text,
+  images, video, audio and inputs that mix them share one 768-d space.
+  - `cortiq convert` packs the text, vision and audio towers into one file:
+    - `q8_2f`, 798 MB, the default;
+    - `q4tp`, 647 MB: the text tower stays q8_2f, and the vision MLPs and
+      audio feed-forward layers are 4-bit (`--tensor-quant` recipe on the
+      model card);
+    - `bf16`, 1.52 GB.
+  - Matryoshka truncation to 768/512/256/128 with re-normalization.
+  - The model's task prompts by name (search query, document with title,
+    question answering, fact checking, code retrieval, classification,
+    clustering, sentence similarity).
+  - Images use the processor's resize and its 70–1120 soft-token budget.
+    Video is sampled at 1 frame/s through ffmpeg. Audio is mono 16 kHz,
+    resampled when needed, at 25 tokens/s.
+  - `cortiq embed` for text, `--image`, `--video` and `--audio`.
+  - `POST /v1/embeddings` in `cortiq serve`: OpenAI-compatible (`input`
+    as a string or an array, `dimensions`, `encoding_format`), plus prompt
+    names and media inputs. Concurrent requests are batched into one
+    forward pass.
+  - Cosine against the float32 reference:
+    - `bf16`: 1.0000000 for every modality;
+    - `q8_2f`: worst 0.99975 for text, images and audio, 0.99914 for video
+      decoded by ffmpeg.
+  - On Metal the text encoder and the vision layers run on the GPU. Mac
+    mini M4, `q8_2f`:
+    - 232 short texts/s;
+    - 15 ms for one query;
+    - 0.84 s for one image at 280 tokens;
+    - a 30 s clip at 55× real time.
+  - Elsewhere the GEMMs use the `matrixmultiply` crate (new dependency).
+- The SentencePiece BPE tokenizer works on token ids: 66× faster, with
+  identical ids.
+
+### Changed
+- Dense models on Vulkan: prompt ingest and decode kernels.
+  - Changes:
+    - 128-row prefill chunks (`CMF_BATCH_K`);
+    - token-axis gated attention (`CMF_ATTN_BT`);
+    - a register-blocked, pipelined q4tp GEMM (`CMF_Q4MM_R`);
+    - warp-per-row q4tp decode matvecs (`CMF_MV_SG`);
+    - a subgroup GDN step (`CMF_GDN_SG`).
+  - Qwen3.8-27B on an RTX 3090, compared with 0.8.14:
+    - prompt ingest 51 → 196 tok/s;
+    - time to first token 19.6 → 5.1 s at 1000 tokens and 81 → 20.5 s at
+      4000;
+    - plain decode 31.4 → 36.9 tok/s;
+    - speculative decode 55.9 → 60.3 tok/s.
+  - Greedy text and perplexity are unchanged.
+- Qwen3.8-Flash-Next device path on Vulkan:
+  - Changes:
+    - the cold experts of a prompt frame are admitted in one parallel batch
+      (`CMF_QWEN_ADMIT_BATCH`), and the cold pass is sized to the frame
+      (`CMF_QWEN_COLD_K`);
+    - expert uploads go through the queue. `CMF_QWEN_STAGE_MB` now
+      defaults to 0; `256` restores the pinned ring;
+    - workgroup-argmax routing (`CMF_QWEN_ROUTE2`);
+    - single-token f16 pairs (`CMF_QWEN_PAIR1`);
+    - subgroup twins of the q8_2f matvec, the GDN step and the expert
+      kernels (`CMF_QWEN_Q82SG`, `CMF_GDN_SG`, `CMF_QWEN_GU4W`,
+      `CMF_QWEN_DN4S`). They keep the summation order.
+  - RTX 3090, full card, compared with 0.8.14:
+    - plain decode 46.9 → 49.4 tok/s;
+    - speculative decode 33.9 → 40.3 tok/s;
+    - prompt ingest at ~1000 tokens 40.7 → 56.3 tok/s;
+    - time to first token 13.1 → 10.2 s at 1000 tokens and 28.4 → 22.5 s
+      at 2000.
+  - Greedy text is byte-identical, with and without speculation.
+- Qwen3.8-Flash-Next expert admission on Vulkan, second pass:
+  - a persistent pool of 16 admission threads reserves and fills a
+    frame's cold experts in one pass;
+  - an optional host-memory expert tier on Linux: system-memory buffers
+    the card pulls by DMA, instead of CPU writes through the 256 MB BAR
+    window. It is off by default. `CMF_QWEN_HTIER_MB=auto` or a size in
+    MiB turns it on; it pins at most half of the memory the process can
+    take.
+  - RTX 3090, compared with the first pass:
+    - plain decode at a 16 GB budget 30.0 → 34.6 tok/s, at 12 GB
+      17.5 → 22.1 tok/s;
+    - prompt ingest at ~1000 tokens on the full card 57.7 → 67.5 tok/s;
+    - time to first token at 2000 tokens 25.3 → 20.8 s.
+  - `CMF_QWEN_ADMIT_THREADS=0` restores the per-frame threads.
+  - Greedy text is byte-identical, with the tier on and off.
+- Mellum2.1 `q8_2f` file (8-bit experts) on the Vulkan token and batch
+  graphs. Both took only 4-bit experts, so this file ran every op on its
+  own, with attention on the host.
+  - New `gpu_wgpu/moe_q82.rs`. Each expert's input is multiplied by that
+    expert's own column field, as on the host.
+    - Decode: warp-per-row gate/up with SiLU and a weighted down. The
+      top-k selection is folded in, and an f32 router runs one warp a row.
+    - Prefill: expert-grouped GEMMs of up to 16 entries a group, with
+      128-row chunks for q8_2f MoE.
+  - `CMF_MOE_Q82=0` restores the previous path.
+  - RTX 3090:
+    - decode 4.1 → 139.9 tok/s;
+    - 4000-token prompt 547 tok/s, TTFT 7.3 s, decode at that depth
+      132.5 tok/s.
+  - Greedy text is byte-identical to the strict CPU. Perplexity at 2048
+    tokens: wiki 7.183 (CPU 7.180), code 3.153 (3.146). The code gap
+    starts at a routing near-tie. The q4tp graph route diverges at the
+    same place.
+  - Decode needs 32-lane subgroups (NVIDIA). Other GPUs keep the per-op
+    decode with the grouped prefill.
+- Mellum2.1 `q8_2f` file (8-bit experts) on the Metal graphs. The decode
+  graph and the MoE chunk prefill took only 4-bit experts, so this file ran
+  every op on its own, slower than the CPU.
+  - New q8_2f expert kernels (`gpu_metal/moe_q8.rs`). Each job reads its
+    own row scales and column field from the file.
+  - The chunk attention of q8_2f MoE layers uses f32 tiles. With half
+    tiles, perplexity drifted 0.36 %.
+  - `CMF_METAL_MOE_Q8=0` restores the previous path.
+  - Mac mini M4:
+    - decode 10.7 → 35.6 tok/s;
+    - 3000-token prompt 110 → 318 tok/s, TTFT 27.7 → 9.8 s.
+  - Greedy text matches the strict CPU (one routing near-tie on a short
+    chat prompt). Perplexity equals the CPU: wiki 7.180, code 3.146.
+- Mellum2.1 12B-A2.5B Thinking runs on the GPU graphs.
+  - 0.8.14 refused it on both graphs (scaled RoPE; a MoE without a shared
+    expert), so every op ran on its own and attention ran on the CPU.
+  - Vulkan, RTX 3090, `q4tp` file:
+    - decode 150 tok/s, 4.0 in 0.8.14;
+    - 4000-token prompt: 382 tok/s, TTFT 10.5 s (164 s).
+  - Metal, M4:
+    - decode 46.8 tok/s, 30.5 in 0.8.14;
+    - 3000-token prompt: 413 tok/s, TTFT 7.3 s. 0.8.14 crashed at that
+      length.
+  - Greedy text matches the strict CPU, byte for byte on Vulkan and up to
+    near-ties on Metal. Perplexity matches the CPU on both: 7.407.
+- Vulkan, for the per-layer YaRN amplitude of the global layers:
+  - row-blocked q4tp MoE kernels (`CMF_MOE_R4`);
+  - the top-k selection folded into the expert pass (`CMF_MOE_FOLD`);
+  - a subgroup gate/up kernel (`CMF_MOE_SG`), from a CUDA Rust experiment
+    ported to WGSL;
+  - expert-grouped prefill MoE (`CMF_MOEG`);
+  - per-layer-geometry attention:
+    - GQA-shared and staged-V (`CMF_ATTEND_XG`);
+    - batched prefill (`CMF_ATTEND_XB`);
+  - fused RoPE+append (`CMF_ROPE_KV`);
+  - Q/K/V in one dispatch (`CMF_MV3`);
+  - a warp-per-row q8_2f matvec (`CMF_Q82_SG`).
+
+  Each switch set to `0` restores the previous path.
+- Metal:
+  - the YaRN amplitude in every rotation kernel (1.0 runs the original
+    ops);
+  - routed-only MoE on the decode graph;
+  - MoE chunk prefill;
+  - four-row q8_2f matvec, simdgroup top-k and a fused gate|up|SiLU expert
+    pass for MoE plans (`CMF_METAL_MOEFAST`, `CMF_Q8_R4`).
+- Release check against 0.8.14 (greedy text, byte for byte):
+  - Vulkan, RTX 3090: Spark-X2.5 4B/1.7B q8_2f/q4mix, Qwen3.8-27B,
+    Qwen3.8-Flash-Next (plain and MTP) and MiniCPM5 q8_2f/q4tp are
+    identical. Mellum q4tp equals the strict CPU.
+  - Metal, M4: Spark-X2.5, MiniCPM5, Granite-4.2-3B, Qwen3.5-4B and
+    Nanbeige4.2 are identical.
+  - The id-level tokenizer gives the same ids on every model's tokenizer.
+
+### Fixed
+- Metal per-op MoE block: every expert job read the last job's staged
+  gate/up input. This was harmless for q4 experts and wrong for q8_2f ones,
+  whose input carries the expert's column field. It was present in 0.8.14.
+  - Mellum with 8-bit experts, wikitext ppl: 7.390 → 7.211, which equals
+    the CPU.
+- Metal MoE chunk prefill: the half-precision staging of the down GEMM
+  overflowed on Mellum's activations (up to 2.8e5) and gave NaN
+  perplexity. Large rows are now pre-scaled.
+- macOS host prefill: parallel expert workers shared device buffers and
+  raced, so the same prompt gave different logits run to run. They now run
+  on the CPU.
+- Metal chunk prefill: dense layers with a q8_2f FFN keep the host walk, as
+  in 0.8.14.
+
 ## [0.8.14] - 2026-10-08
 
 ### Added

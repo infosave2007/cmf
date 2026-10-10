@@ -1978,6 +1978,388 @@ fn q4_gu_q4tp4(@builtin(workgroup_id) wid: vec3<u32>,
 }
 "#;
 
+/// Subgroup twins of qwen4 kernels (32-lane subgroups laid out over the
+/// local index). Every twin keeps its original's arithmetic exactly: the
+/// same lane walk and add order, and the same pairing in a 64-lane tree
+/// (level 32 through workgroup memory, levels 16..1 as xor shuffles, which
+/// pair lane i with lane i + s for every lane i < s, as the tree does). Its
+/// own module (built on top of `QWEN4_WGSL` + `QWEN4T_WGSL` for the
+/// bindings and helpers): the subgroup builtins need the device feature.
+pub(crate) const QWEN4_SG_WGSL: &str = r#"
+var<workgroup> g8_t: array<vec4<f32>, 64>;
+fn g8_tail(v: vec4<f32>) -> vec4<f32> {
+    var r = v;
+    r = r + subgroupShuffleXor(r, 16u);
+    r = r + subgroupShuffleXor(r, 8u);
+    r = r + subgroupShuffleXor(r, 4u);
+    r = r + subgroupShuffleXor(r, 2u);
+    r = r + subgroupShuffleXor(r, 1u);
+    return r;
+}
+// q4_gu_q2tp4 on 128-lane groups: two independent 64-lane halves, each
+// four rows of the same (slot, token) with q4_gu_q2tp4's lane walk, add
+// order and tree (finished in registers), so a group carries eight rows
+// and the dispatch half the groups — one resident wave on cards where the
+// 64-lane groups needed one and a third. Grid (inter / 8, slots, tokens).
+var<workgroup> g8_h: array<vec4<f32>, 128>;
+@compute @workgroup_size(128)
+fn q4_gu_q2tp4w(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(local_invocation_index) lidw: u32) {
+    let half = lidw >> 6u;
+    let lid = lidw & 63u;
+    let row0 = (wid.x * 2u + half) * 4u;
+    let slot = wid.y;
+    let batch = wid.z;
+    let bslot = batch * gq_p.slots + slot;
+    let flat = gq_sel[bslot];
+    let seg = flat / gq_p.segment_slots;
+    let local = flat - seg * gq_p.segment_slots;
+    let gpr = gq_p.gpr;
+    let rows = gq_p.inter;
+    let base16 = local * gq_p.mat16;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let par0 = base16 + rows * gpr * 4u;
+    let cod0 = (par0 + rows * 2u) * 2u;
+    var gl: array<vec2<f32>, 4>;
+    var ul: array<vec2<f32>, 4>;
+    for (var k = 0u; k < 4u; k = k + 1u) {
+        let par16 = par0 + (row0 + k) * 2u;
+        gl[k] = unpack2x16float(gq_g16(seg, par16) | (gq_g16(seg, par16 + 1u) << 16u));
+        ul[k] = unpack2x16float(gq_u16(seg, par16) | (gq_u16(seg, par16 + 1u) << 16u));
+    }
+    var ag = vec4<f32>(0.0);
+    var au = vec4<f32>(0.0);
+    let xb4 = batch * gpr * 8u;
+    for (var g = lid; g < gpr; g = g + 64u) {
+        let xo = xb4 + g * 8u;
+        let x0 = gq_x[xo];
+        let x1 = gq_x[xo + 1u];
+        let x2 = gq_x[xo + 2u];
+        let x3 = gq_x[xo + 3u];
+        let x4 = gq_x[xo + 4u];
+        let x5 = gq_x[xo + 5u];
+        let x6 = gq_x[xo + 6u];
+        let x7 = gq_x[xo + 7u];
+        let bit = g * 5u;
+        let cb = bit >> 3u;
+        let shf = bit & 7u;
+        for (var k = 0u; k < 4u; k = k + 1u) {
+            let row = row0 + k;
+            let cod8 = cod0 + row * cst;
+            var cg = gq_g8(seg, cod8 + cb);
+            var cu = gq_u8(seg, cod8 + cb);
+            if (shf > 3u) {
+                cg = cg | (gq_g8(seg, cod8 + cb + 1u) << 8u);
+                cu = cu | (gq_u8(seg, cod8 + cb + 1u) << 8u);
+            }
+            let sg = gq_scale((cg >> shf) & 31u, gl[k]);
+            let su = gq_scale((cu >> shf) & 31u, ul[k]);
+            let w32 = (base16 + row * gpr * 4u + g * 4u) >> 1u;
+            let dg = gq_dot16(gq_g32(seg, w32), x0, x1, x2, x3) + gq_dot16(gq_g32(seg, w32 + 1u), x4, x5, x6, x7);
+            let du = gq_dot16(gq_u32(seg, w32), x0, x1, x2, x3) + gq_dot16(gq_u32(seg, w32 + 1u), x4, x5, x6, x7);
+            ag[k] = ag[k] + sg * dg;
+            au[k] = au[k] + su * du;
+        }
+    }
+    let hb = half * 64u;
+    if (lid >= 32u) {
+        g8_h[hb + lid - 32u] = ag;
+        g8_h[hb + lid] = au;
+    }
+    workgroupBarrier();
+    if (lid < 32u) {
+        let ta = g8_tail(ag + g8_h[hb + lid]);
+        let tu = g8_tail(au + g8_h[hb + 32u + lid]);
+        if (lid == 0u) {
+            for (var k = 0u; k < 4u; k = k + 1u) {
+                let row = row0 + k;
+                if (row < rows) {
+                    let gate = ta[k];
+                    let up = tu[k];
+                    gq_act[bslot * gq_p.inter + row] = (gate / (1.0 + exp(-gate))) * up;
+                }
+            }
+        }
+    }
+}
+
+// q4_dn_q4tp4 with the tree finished in registers.
+@compute @workgroup_size(64)
+fn q4_dn_q4tp4s(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(local_invocation_index) lid: u32) {
+    let row0 = wid.x * 4u;
+    let batch = wid.y;
+    let gpr = gv_p.gpr;
+    let rows = gv_p.hidden;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let total = gv_p.slots * gpr;
+    var acc = vec4<f32>(0.0);
+    for (var i = lid; i < total; i = i + 64u) {
+        let slot = i / gpr;
+        let g = i - slot * gpr;
+        let bslot = batch * gv_p.slots + slot;
+        let flat = gv_sel[bslot];
+        let seg = flat / gv_p.segment_slots;
+        let local = flat - seg * gv_p.segment_slots;
+        let base16 = local * gv_p.mat16;
+        let par0 = base16 + rows * gpr * 8u;
+        let cod0 = (par0 + rows * 2u) * 2u;
+        let xo = (bslot * gpr + g) * 8u;
+        let a0 = gv_act[xo];
+        let a1 = gv_act[xo + 1u];
+        let a2 = gv_act[xo + 2u];
+        let a3 = gv_act[xo + 3u];
+        let a4 = gv_act[xo + 4u];
+        let a5 = gv_act[xo + 5u];
+        let a6 = gv_act[xo + 6u];
+        let a7 = gv_act[xo + 7u];
+        let wt = gv_wt[bslot];
+        let bit = g * 5u;
+        let cb = bit >> 3u;
+        let shf = bit & 7u;
+        for (var k = 0u; k < 4u; k = k + 1u) {
+            let row = row0 + k;
+            let par16 = par0 + row * 2u;
+            let pl = unpack2x16float(gv_16(seg, par16) | (gv_16(seg, par16 + 1u) << 16u));
+            let cod8 = cod0 + row * cst;
+            var cv = gv_8(seg, cod8 + cb);
+            if (shf > 3u) { cv = cv | (gv_8(seg, cod8 + cb + 1u) << 8u); }
+            let scale = exp2(pl.x + f32((cv >> shf) & 31u) * pl.y);
+            let t16 = base16 + (row * gpr + g) * 8u;
+            var d = 0.0;
+            d = d + gv_dot8(gv_16(seg, t16) | (gv_16(seg, t16 + 1u) << 16u), a0, a1);
+            d = d + gv_dot8(gv_16(seg, t16 + 2u) | (gv_16(seg, t16 + 3u) << 16u), a2, a3);
+            d = d + gv_dot8(gv_16(seg, t16 + 4u) | (gv_16(seg, t16 + 5u) << 16u), a4, a5);
+            d = d + gv_dot8(gv_16(seg, t16 + 6u) | (gv_16(seg, t16 + 7u) << 16u), a6, a7);
+            acc[k] = acc[k] + wt * scale * d;
+        }
+    }
+    if (lid >= 32u) {
+        g8_t[lid - 32u] = acc;
+    }
+    workgroupBarrier();
+    if (lid < 32u) {
+        let ta = g8_tail(acc + g8_t[lid]);
+        if (lid == 0u) {
+            for (var k = 0u; k < 4u; k = k + 1u) {
+                let row = row0 + k;
+                if (row < rows) {
+                    gv_y[batch * gv_p.hidden + row] = ta[k];
+                }
+            }
+        }
+    }
+}
+
+// ── q4t_route with the ranking as k rounds of a workgroup argmax instead of
+// every expert counting its rank against all n (one SM walking n² compares),
+// and the softmax tail on workgroup memory instead of a single lane's chain
+// of dependent global loads and stores. A round picks the largest live
+// score, ties to the lowest index: exactly the expert whose rank in
+// q4t_route is the round number. The tail repeats q4t_route's arithmetic
+// in its order (max, exp(s − max), the sum in rank order, s·(scale/sum));
+// a cold winner's resident weight stays 0, as there. n <= 512, one expert a
+// lane; 32-lane subgroups laid out over the local index. ──
+var<workgroup> r2_v: array<f32, 16>;
+var<workgroup> r2_i: array<u32, 16>;
+var<workgroup> r2_m: array<u32, 64>;
+var<workgroup> r2_s: array<f32, 64>;
+var<workgroup> r2_e: array<f32, 64>;
+var<workgroup> r2_inv: f32;
+fn r2_better(v2: f32, i2: u32, v: f32, i: u32) -> bool {
+    return v2 > v || (v2 == v && i2 < i);
+}
+@compute @workgroup_size(512)
+fn q4t_route2(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_index) lid: u32) {
+    let t = wid.x;
+    let n = tr_p.n;
+    let k = tr_p.top_k;
+    let s0 = t * tr_p.ss;
+    let f0 = t * tr_p.fs;
+    let i0 = t * tr_p.is;
+    let c0 = t * tr_p.cs;
+    let pin_shared = (tr_p.flags & 8u) != 0u;
+    let subset = (tr_p.flags & 16u) != 0u;
+    let qwen = (tr_p.flags & 32u) != 0u;
+    let shared_gated = (tr_p.flags & 64u) != 0u;
+    let shared_slot = tr_p.flags >> 8u;
+    if (pin_shared && lid == 0u) {
+        tr_idx[i0 + k] = shared_slot;
+        if (shared_gated) {
+            tr_w[i0 + k] = bitcast<f32>(tr_forced[f0 + k]);
+        } else {
+            tr_w[i0 + k] = 1.0;
+        }
+    }
+    let neg_inf = bitcast<f32>(0xFF800000u);
+    var alive = lid < n;
+    var si = neg_inf;
+    if (alive) {
+        let v = tr_s[s0 + lid];
+        si = v;
+        if (!qwen) {
+            var sp = v;
+            if (v <= 20.0) { sp = log(1.0 + exp(v)); }
+            si = sqrt(sp);
+        }
+    }
+    let m = lid;
+    for (var rank = 0u; rank < k; rank = rank + 1u) {
+        var bv = select(neg_inf, si, alive);
+        var bi = select(0xFFFFFFFFu, m, alive);
+        for (var sft = 16u; sft > 0u; sft = sft >> 1u) {
+            let ov = subgroupShuffleXor(bv, sft);
+            let oi = subgroupShuffleXor(bi, sft);
+            if (r2_better(ov, oi, bv, bi)) {
+                bv = ov;
+                bi = oi;
+            }
+        }
+        if ((lid & 31u) == 0u) {
+            r2_v[lid >> 5u] = bv;
+            r2_i[lid >> 5u] = bi;
+        }
+        workgroupBarrier();
+        var wv = r2_v[0];
+        var wi = r2_i[0];
+        for (var j = 1u; j < 16u; j = j + 1u) {
+            if (r2_better(r2_v[j], r2_i[j], wv, wi)) {
+                wv = r2_v[j];
+                wi = r2_i[j];
+            }
+        }
+        workgroupBarrier();
+        if (alive && wi == m) {
+            alive = false;
+            r2_m[rank] = m;
+            r2_s[rank] = si;
+        }
+    }
+    workgroupBarrier();
+    // q4t_route's tail, over the k winners in rank order (n >= k: all used)
+    if (lid == 0u) {
+        tr_cnt[t * 4u] = k;
+        var qmx = -3.0e38;
+        if (qwen) {
+            for (var j = 0u; j < k; j = j + 1u) { qmx = max(qmx, r2_s[j]); }
+        }
+        var sum = 0.0;
+        for (var j = 0u; j < k; j = j + 1u) {
+            var e = r2_s[j];
+            if (qwen) { e = exp(r2_s[j] - qmx); }
+            r2_e[j] = e;
+            sum = sum + e;
+        }
+        var inv = 1.0;
+        if (sum > 0.0) { inv = tr_p.scale / sum; }
+        r2_inv = inv;
+    }
+    workgroupBarrier();
+    if (lid < k) {
+        let j = lid;
+        let mj = r2_m[j];
+        // q4t_route scales only when the sum was positive; inv is then 1
+        // and e·1 is e
+        let scaled = r2_e[j] * r2_inv;
+        tr_cold[c0 + 2u * k + 2u * j] = mj;
+        tr_cold[c0 + 2u * k + 2u * j + 1u] = bitcast<u32>(scaled);
+        tr_cold[c0 + 2u * j] = 0xFFFFFFFFu;
+        tr_cold[c0 + 2u * j + 1u] = 0u;
+        if (subset) {
+            let slot = tr_map[mj];
+            if (slot == 0xFFFFFFFFu) {
+                tr_idx[i0 + j] = 0u;
+                tr_w[i0 + j] = 0.0;
+                tr_cold[c0 + 2u * j] = mj;
+                tr_cold[c0 + 2u * j + 1u] = bitcast<u32>(scaled);
+            } else {
+                tr_idx[i0 + j] = slot;
+                tr_w[i0 + j] = scaled;
+            }
+        } else {
+            tr_idx[i0 + j] = mj;
+            tr_w[i0 + j] = scaled;
+        }
+    }
+}
+
+// ── q8_2f matvec, one token: `q8_2f_matvec4` (four rows a 256-lane group, a
+// row on 64 lanes, the column walk unrolled four deep) with its tree's
+// levels 16..1 as xor shuffles inside the row's lower subgroup, so a row
+// block pays two barriers instead of seven. Lane walk, add order and the
+// pairing of the tree are q8_2f_matvec4's: the same bits. ──
+var<workgroup> q8s_t: array<f32, 128>;
+@compute @workgroup_size(256)
+fn q4_q82_sg(@builtin(workgroup_id) wid: vec3<u32>,
+             @builtin(num_workgroups) nwg: vec3<u32>,
+             @builtin(local_invocation_index) lid: u32) {
+    let rows = tq_p.rows;
+    let ngrp = tq_p.ngrp;
+    let qbytes = rows * tq_p.cols;
+    let rs0 = qbytes >> 2u;
+    let cs0h = (qbytes >> 1u) + rows;
+    let sub = lid >> 6u;
+    let l = lid & 63u;
+    let blocks = (rows + 3u) / 4u;
+    var wb = wid.x;
+    loop {
+        if (wb >= blocks) { break; }
+        let row = wb * 4u + sub;
+        var acc = 0.0;
+        if (row < rows) {
+            let roww = row * ngrp;
+            var i = l;
+            loop {
+                if (i + 192u >= ngrp) { break; }
+                let w0 = tq_w[roww + i];
+                let w1 = tq_w[roww + i + 64u];
+                let w2 = tq_w[roww + i + 128u];
+                let w3 = tq_w[roww + i + 192u];
+                let x0 = tq_x[i];
+                let x1 = tq_x[i + 64u];
+                let x2 = tq_x[i + 128u];
+                let x3 = tq_x[i + 192u];
+                let s0 = tq_f16x4(cs0h + i * 4u);
+                let s1 = tq_f16x4(cs0h + (i + 64u) * 4u);
+                let s2 = tq_f16x4(cs0h + (i + 128u) * 4u);
+                let s3 = tq_f16x4(cs0h + (i + 192u) * 4u);
+                acc = acc + dot(tq_i8x4(w0), x0 * s0);
+                acc = acc + dot(tq_i8x4(w1), x1 * s1);
+                acc = acc + dot(tq_i8x4(w2), x2 * s2);
+                acc = acc + dot(tq_i8x4(w3), x3 * s3);
+                i = i + 256u;
+            }
+            loop {
+                if (i >= ngrp) { break; }
+                acc = acc + dot(tq_i8x4(tq_w[roww + i]), tq_x[i] * tq_f16x4(cs0h + i * 4u));
+                i = i + 64u;
+            }
+        }
+        if (l >= 32u) {
+            q8s_t[sub * 32u + l - 32u] = acc;
+        }
+        workgroupBarrier();
+        if (l < 32u) {
+            var r = acc + q8s_t[sub * 32u + l];
+            r = r + subgroupShuffleXor(r, 16u);
+            r = r + subgroupShuffleXor(r, 8u);
+            r = r + subgroupShuffleXor(r, 4u);
+            r = r + subgroupShuffleXor(r, 2u);
+            r = r + subgroupShuffleXor(r, 1u);
+            if (l == 0u && row < rows) {
+                let rw = unpack2x16float(tq_w[rs0 + (row >> 1u)]);
+                var sc = rw.x;
+                if ((row & 1u) == 1u) { sc = rw.y; }
+                tq_y[row] = r * sc;
+            }
+        }
+        workgroupBarrier();
+        wb = wb + nwg.x;
+    }
+}
+"#;
+
 /// HC v3: one hyper-connection mix in two subgroup kernels (`hc3_down`:
 /// group RMS norm folded into the down projection and the injection gate,
 /// `hc3_upfold`: up-projection and sigmoid fold). Every 16-byte weight word
@@ -2291,9 +2673,40 @@ pub(crate) struct Pipes {
     /// HC v3 (`HC3_WGSL`), where the device takes it; None keeps every
     /// hyper-connection mix on the kernels above.
     hc3: Option<Hc3>,
+    /// `q4_gu_q2tp4w` (`CMF_QWEN_GU4W`: two four-row halves a 128-lane
+    /// group) and `q4_dn_q4tp4s` (`CMF_QWEN_DN4S`: the tree finished in
+    /// registers), subgroup twins of the four-row expert pair; None without
+    /// 32-lane subgroups, on rejection, or with the switch at 0.
+    gu4w: Option<wgpu::ComputePipeline>,
+    dn4s: Option<wgpu::ComputePipeline>,
+    /// `q4t_route2` (`QWEN4_SG_WGSL`): the ranking as k argmax rounds;
+    /// None without 32-lane subgroups or with `CMF_QWEN_ROUTE2=0`.
+    route2: Option<wgpu::ComputePipeline>,
+    /// `q4_f16_matvec2`: the single-token pair (`q4t_f16_pair` reads four
+    /// token rows per column even for one token); `CMF_QWEN_PAIR1=0` off.
+    f16_matvec2: wgpu::ComputePipeline,
+    /// `q4_q82_sg` (`QWEN4_SG_WGSL`): one-token q8_2f matvecs with the
+    /// shuffle tail; None without the module or with `CMF_QWEN_Q82SG=0`.
+    q82sg: Option<wgpu::ComputePipeline>,
 }
 
 impl Pipes {
+    /// Gate/up rows per workgroup of the resident-expert pair: 8 on the
+    /// two-half twin (q2tp gate/up, inter % 8 == 0), else 4.
+    fn gu_rows(&self, g: &Geom) -> usize {
+        if self.gu4w.is_some() && g.gu_q2 && g.inter % 8 == 0 { 8 } else { 4 }
+    }
+
+    /// The row-blocked (gate/up, down) pair: the subgroup twins where they
+    /// came up.
+    fn experts_blocked(&self, g: &Geom) -> (&wgpu::ComputePipeline, &wgpu::ComputePipeline) {
+        let gu = match &self.gu4w {
+            Some(p) if self.gu_rows(g) == 8 => p,
+            _ => self.gu4(g.gu_q2),
+        };
+        (gu, self.dn4s.as_ref().unwrap_or(&self.dn_q4tp4))
+    }
+
     /// The row-blocked gate/up kernel for the bank's gate/up dtype (q2tp or
     /// q4tp). Both take the same layout, so a cached bind group fits either.
     fn gu4(&self, gu_q2: bool) -> &wgpu::ComputePipeline {
@@ -2573,6 +2986,8 @@ fn build_pipes(c: &Ctx) -> Option<Pipes> {
                 cache: c.pipeline_cache.as_ref(),
             })
     };
+    // the subgroup module of this context's device, built on first use
+    let sgm: SgModule = std::cell::OnceCell::new();
     Some(Pipes {
         group_rmsnorm: pipe("q4_group_rmsnorm"),
         f16_matvec: pipe("q4_f16_matvec"),
@@ -2605,7 +3020,121 @@ fn build_pipes(c: &Ctx) -> Option<Pipes> {
         t_idx_build: pipe("q4t_idx_build"),
         t_attend: pipe("q4t_attend"),
         hc3: build_hc3(c),
+        gu4w: build_sg_l(c, &sgm, "q4_gu_q2tp4w", "CMF_QWEN_GU4W", true, &gu_layout, opts()),
+        dn4s: build_sg_l(c, &sgm, "q4_dn_q4tp4s", "CMF_QWEN_DN4S", true, &dn_layout, opts()),
+        route2: build_sg_auto(c, &sgm, "q4t_route2", "CMF_QWEN_ROUTE2", opts()),
+        f16_matvec2: pipe("q4_f16_matvec2"),
+        q82sg: build_sg_auto(c, &sgm, "q4_q82_sg", "CMF_QWEN_Q82SG", opts()),
     })
+}
+
+/// The subgroup module (`QWEN4_SG_WGSL` on top of the qwen4 sources) of
+/// one context, built on first use: once per device, since a module (and
+/// the subgroup-size check) belongs to the device its context drives.
+type SgModule = std::cell::OnceCell<Option<wgpu::ShaderModule>>;
+
+/// The subgroup module on 32-lane-subgroup devices; None elsewhere or on
+/// rejection.
+fn sg_module<'a>(c: &Ctx, m: &'a SgModule) -> Option<&'a wgpu::ShaderModule> {
+    m.get_or_init(|| {
+        if !c.device.features().contains(wgpu::Features::SUBGROUP)
+            || c.adapter_info.subgroup_min_size != 32
+            || c.adapter_info.subgroup_max_size != 32
+        {
+            return None;
+        }
+        let si = c.device.push_error_scope(wgpu::ErrorFilter::Internal);
+        let sv = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let module = qwen_module(
+            c,
+            "qwen4-sg",
+            &format!("{QWEN4_WGSL}{QWEN4T_WGSL}{QWEN4_SG_WGSL}"),
+        );
+        let ev = pollster::block_on(sv.pop());
+        let ei = pollster::block_on(si.pop());
+        if let Some(e) = ev.or(ei) {
+            tracing::warn!("qwen4 subgroup module rejected: {e}");
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+            return None;
+        }
+        Some(module)
+    })
+    .as_ref()
+}
+
+/// One entry point of the subgroup module on an automatic layout; None when
+/// `env` is "0", without the module, or on rejection.
+fn build_sg_auto(
+    c: &Ctx,
+    sgm: &SgModule,
+    ep: &str,
+    env: &str,
+    opts: wgpu::PipelineCompilationOptions<'_>,
+) -> Option<wgpu::ComputePipeline> {
+    if std::env::var(env).as_deref() == Ok("0") {
+        return None;
+    }
+    let module = sg_module(c, sgm)?;
+    let si = c.device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let sv = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let p = c
+        .device
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(ep),
+            layout: None,
+            module,
+            entry_point: Some(ep),
+            compilation_options: opts,
+            cache: c.pipeline_cache.as_ref(),
+        });
+    let ev = pollster::block_on(sv.pop());
+    let ei = pollster::block_on(si.pop());
+    if let Some(e) = ev.or(ei) {
+        tracing::warn!("qwen4 {ep} rejected: {e}");
+        return None;
+    }
+    Some(p)
+}
+
+/// The eight-row expert pair, in its own module (subgroup builtins).
+fn build_sg_l(
+    c: &Ctx,
+    sgm: &SgModule,
+    ep: &str,
+    env: &str,
+    default_on: bool,
+    layout: &wgpu::PipelineLayout,
+    opts: wgpu::PipelineCompilationOptions<'_>,
+) -> Option<wgpu::ComputePipeline> {
+    let on = match std::env::var(env).as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => default_on,
+    };
+    if !on {
+        return None;
+    }
+    let module = sg_module(c, sgm)?;
+    let si = c.device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let sv = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let p = c
+        .device
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(ep),
+            layout: Some(layout),
+            module,
+            entry_point: Some(ep),
+            compilation_options: opts,
+            cache: c.pipeline_cache.as_ref(),
+        });
+    let ev = pollster::block_on(sv.pop());
+    let ei = pollster::block_on(si.pop());
+    if let Some(e) = ev.or(ei) {
+        tracing::warn!("qwen4 {ep} rejected: {e}");
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        return None;
+    }
+    Some(p)
 }
 
 fn pipes(c: &Ctx) -> Option<&Pipes> {
@@ -2772,6 +3301,13 @@ pub(crate) struct Dev {
     /// most frames repeat it (no cold winner), and two queue writes per
     /// layer sit on the path between one frame's fence and the next submit.
     fin_last: std::cell::Cell<Option<([u32; 8], u32)>>,
+    /// The cold pass's gate/up and down uniforms (`CMF_QWEN_COLD_K`): the
+    /// slot count per token is the frame's largest cold list, written at
+    /// finalize with the indirect sizes; `cold_tpl` holds the other words,
+    /// `cold_k` the count last written (0: none yet).
+    cold_u: [wgpu::Buffer; 2],
+    cold_tpl: std::cell::Cell<Option<([u32; 8], [u32; 8])>>,
+    cold_k: std::cell::Cell<usize>,
     /// Every dispatch of a layer reads its workgroup count from `args_live`,
     /// which the layer's gate kernel fills from `args_tpl` — or with zeros
     /// once an earlier layer of the chain routed to a cold expert. The host
@@ -2819,6 +3355,7 @@ fn step_slot(step: u16) -> usize {
         500..=513 => 40 + (step as usize - 500), // QSA (never with GDN in one row)
         600 => 54,                               // attention inject
         700..=713 => 55 + (step as usize - 700), // MoE route / experts / miss
+        714 => 58,                               // the route's other kernel
         800 => 69,                               // lm_head (head row)
         _ => 79,
     };
@@ -3126,6 +3663,16 @@ impl Dev {
                 mapped_at_creation: false,
             }),
             fin_last: std::cell::Cell::new(None),
+            cold_u: [0, 1].map(|_| {
+                c.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("qwen4-cold-u"),
+                    size: 32,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            }),
+            cold_tpl: std::cell::Cell::new(None),
+            cold_k: std::cell::Cell::new(0),
             args_tpl: c.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("qwen4-args-tpl"),
                 size: (rows * SLOTS * 16) as u64,
@@ -3890,6 +4437,43 @@ fn pair_w(
         return None;
     }
     let bbuf = b.map_or_else(|| a.buf.clone(), |b| b.buf.clone());
+    if nt == 1 && pair1_env() {
+        // one token: the single-row pair kernel (row t = 0 of q4t_f16_pair
+        // is its arithmetic bit for bit); the bind group is cached apart
+        // from the frame's (its key carries nt)
+        dispatch(
+            c,
+            pass,
+            &p.f16_matvec2,
+            bc,
+            step,
+            "qwen4-pair1",
+            || {
+                vec![
+                    a.buf.clone(),
+                    bbuf,
+                    x.clone(),
+                    ya.clone(),
+                    yb.clone(),
+                    uniform_u32x8(
+                        c,
+                        [
+                            a.cols as u32,
+                            a.rows as u32,
+                            rows_b as u32,
+                            act,
+                            inv.to_bits(),
+                            yb_off as u32,
+                            0,
+                            0,
+                        ],
+                    ),
+                ]
+            },
+            (total as u32, 1, 1),
+        );
+        return Some(());
+    }
     dispatch(
         c,
         pass,
@@ -3949,6 +4533,44 @@ fn q82_t(
     step: u16,
 ) -> bool {
     if nt == 1 {
+        if let Some(sg) = p.q82sg.as_ref()
+            && w.dtype == TensorDtype::Q8_2f
+            && w.cols % 16 == 0
+            && c.use_q82_mv4
+        {
+            // the bits of `q8_2f_matvec4`, which `encode_mv` picks for
+            // these shapes, with the subgroup tail
+            dispatch(
+                c,
+                pass,
+                sg,
+                bc,
+                step,
+                "qwen4-q82sg",
+                || {
+                    vec![
+                        w.buf.clone(),
+                        x.clone(),
+                        y.clone(),
+                        uniform_u32x8(
+                            c,
+                            [
+                                (w.cols / 4) as u32,
+                                w.rows as u32,
+                                w.cols as u32,
+                                1,
+                                0,
+                                0,
+                                0,
+                                0,
+                            ],
+                        ),
+                    ]
+                },
+                ((w.rows as u32).div_ceil(4).min(MAX_WG), 1, 1),
+            );
+            return true;
+        }
         return encode_mv(c, p, pass, w, x, y, bc, step);
     }
     if w.dtype != TensorDtype::Q8_2f || w.cols % 16 != 0 || xs % 4 != 0 {
@@ -4129,6 +4751,20 @@ fn inject_pre(
 /// Do the mixes of this device take the pending inject into their kernels
 /// (HC v3 built, `CMF_QWEN_HC_V3_INJECT` not 0)? A mix whose shape v3 does
 /// not take still injects first, through `inject_pre`.
+/// `CMF_QWEN_PAIR1=0`: one-token f16 pairs on `q4t_f16_pair` as before.
+fn pair1_env() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_QWEN_PAIR1").as_deref() != Ok("0"))
+}
+
+/// `CMF_QWEN_COLD_K=0`: the cold pass runs top_k slots for every token of
+/// the frame (padded with weight-zero copies) instead of the frame's
+/// longest cold list.
+fn cold_k_env() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_QWEN_COLD_K").as_deref() != Ok("0"))
+}
+
 fn hc_v3_fuses(p: &Pipes) -> bool {
     p.hc3.is_some() && hc_v3_inject_env()
 }
@@ -5048,6 +5684,7 @@ pub(crate) fn encode_layer(
 
     // ── attention half ──
     let mut pass = begin_pass(enc);
+    ts_pass(&mut pass, 2);
     let pre_attn = defer_inject.then_some(PreInject {
         blk: &mo,
         bs: hs,
@@ -5074,6 +5711,7 @@ pub(crate) fn encode_layer(
     } else if let Some(q) = &pre_attn {
         inject_pre(c, p, &mut pass, g, hyper, q, nt, bc);
     }
+    ts_pass(&mut pass, 3);
     match &w.mixer {
         MixerW::Gdn {
             qkv,
@@ -5133,6 +5771,7 @@ pub(crate) fn encode_layer(
                     mv_t(c, p, &mut pass, model, *a, &x, hs, &ab, abs_, nt, bc, 402)?;
                     mv_t(c, p, &mut pass, model, *b, &x, hs, &bb, abs_, nt, bc, 403)?;
                 }
+                ts_pass(&mut pass, 9);
                 let taps = const_buf(c, bytemuck::cast_slice(&conv1d[..cdim * gd.kk]));
                 let alog = const_buf(c, bytemuck::cast_slice(&a_log[..gd.nv]));
                 let dtb = const_buf(c, bytemuck::cast_slice(&dt_bias[..gd.nv]));
@@ -5214,11 +5853,14 @@ pub(crate) fn encode_layer(
                 pass.set_pipeline(&c.gdn_conv_k);
                 pass.set_bind_group(0, &bg_conv, &[]);
                 bs.launch(&mut pass, 404, ((cdim as u32).div_ceil(256), 1, 1));
+                // the subgroup-tree twin where it came up (the same sums,
+                // `CMF_GDN_SG=0` keeps the loops)
+                let park = super::dense_mv::gdn(c).map_or(&c.gdn_step_par_k, |s| &s.park);
                 let bg_step = bs.get(405, || {
                     // the auto layout keeps only what the entry point touches
                     c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("qwen4-gdn-step-k"),
-                        layout: &c.gdn_step_par_k.get_bind_group_layout(0),
+                        layout: &park.get_bind_group_layout(0),
                         entries: &[
                             bind_buf(0, &cq),
                             bind_buf(2, &ab),
@@ -5232,7 +5874,7 @@ pub(crate) fn encode_layer(
                         ],
                     })
                 });
-                pass.set_pipeline(&c.gdn_step_par_k);
+                pass.set_pipeline(park);
                 pass.set_bind_group(0, &bg_step, &[]);
                 bs.launch(
                     &mut pass,
@@ -5259,6 +5901,7 @@ pub(crate) fn encode_layer(
                     },
                     (gd.nv as u32, nt as u32, 1),
                 );
+                ts_pass(&mut pass, 10);
                 mv_t(
                     c, p, &mut pass, model, *out, &gdo, gs, &blk, hs, nt, bc, 407,
                 )?;
@@ -5354,6 +5997,7 @@ pub(crate) fn encode_layer(
                     bc,
                     503,
                 )?;
+                ts_pass(&mut pass, 9);
                 if qsa_tw() {
                     let freq = const_buf(c, bytemuck::cast_slice(&inv_freq[..rd / 2]));
                     let qnw = const_buf(c, bytemuck::cast_slice(&q_norm[..hd]));
@@ -5674,6 +6318,7 @@ pub(crate) fn encode_layer(
                         },
                         (nh as u32, nt as u32, 1),
                     );
+                    ts_pass(&mut pass, 10);
                 } else {
                     let freq = const_buf(c, bytemuck::cast_slice(&inv_freq[..rd / 2]));
                     let qnw = const_buf(c, bytemuck::cast_slice(&q_norm[..hd]));
@@ -5699,7 +6344,7 @@ pub(crate) fn encode_layer(
                         };
                         let lk = bt.key();
                         // indexer query: per-head norm (1+w) + partial rope, no gate, no K
-                        let pb = uni_slot8(
+                        let pb = uni_slot12(
                             c,
                             U_ROPE_IQ,
                             uid,
@@ -5712,6 +6357,10 @@ pub(crate) fn encode_layer(
                                 pos as u32,
                                 2 | 8,
                                 g.eps.to_bits(),
+                                0,
+                                1.0f32.to_bits(),
+                                0,
+                                0,
                                 0,
                             ],
                         );
@@ -5737,7 +6386,7 @@ pub(crate) fn encode_layer(
                             (ih as u32, 1, 1),
                         );
                         // attention q/gate split, q/k norm (1+w), partial rope, K in place
-                        let pb = uni_slot8(
+                        let pb = uni_slot12(
                             c,
                             U_ROPE_QK,
                             uid,
@@ -5750,6 +6399,10 @@ pub(crate) fn encode_layer(
                                 pos as u32,
                                 1 | 2 | 4 | 8,
                                 g.eps.to_bits(),
+                                0,
+                                1.0f32.to_bits(),
+                                0,
+                                0,
                                 0,
                             ],
                         );
@@ -5972,6 +6625,7 @@ pub(crate) fn encode_layer(
             }
         }
     }
+    ts_pass(&mut pass, 4);
     // the attention block enters the state: inside the MoE mix's kernels
     // (HC v3), or by its own dispatch in front of it
     let attn_blk = PreInject {
@@ -6004,6 +6658,7 @@ pub(crate) fn encode_layer(
             200,
         )?;
     }
+    ts_pass(&mut pass, 5);
     let slots = g.top_k + 1;
     let logits = tbuf(c, T_LOGITS, g.n_experts * 4, false);
     let forced = tbuf_exact(c, T_FORCED, slots * 4, false);
@@ -6034,16 +6689,21 @@ pub(crate) fn encode_layer(
             bc,
             708,
         )?;
+        ts_pass(&mut pass, 11);
         // route on the card: Qwen ranking + softmax over the chosen ten, the
         // arena's remap turns winners into slots or hands them back cold
         let rflags: u32 =
             8 | 16 | 32 | (u32::from(w.shared_gate.is_some()) << 6) | (shared_slot << 8);
+        let (route_pipe, route_step) = match &p.route2 {
+            Some(r2) if g.n_experts <= 512 && g.top_k <= 64 => (r2, 714),
+            _ => (&p.t_route, 703),
+        };
         dispatch(
             c,
             &mut pass,
-            &p.t_route,
+            route_pipe,
             bc,
-            703,
+            route_step,
             "qwen4t-route",
             || {
                 vec![
@@ -6072,6 +6732,7 @@ pub(crate) fn encode_layer(
             (nt as u32, 1, 1),
         );
     }
+    ts_pass(&mut pass, 6);
     if !skip("experts") {
         // resident experts straight from the global arena, every token in
         // one dispatch (the kernels take the token as their batch index)
@@ -6110,8 +6771,9 @@ pub(crate) fn encode_layer(
             ],
         );
         if blocked_experts(g, global.segments) {
-            // four rows a workgroup: x read once per group for four rows
-            let gu4 = p.gu4(g.gu_q2);
+            // four (eight) rows a workgroup: x read once per group for all
+            let (gu4, dn4) = p.experts_blocked(g);
+            let gr = p.gu_rows(g);
             let bg_gu = bc.get(710, || {
                 let gate_b: Vec<_> = global
                     .gate
@@ -6154,8 +6816,9 @@ pub(crate) fn encode_layer(
             bc.launch(
                 &mut pass,
                 704,
-                ((g.inter / 4) as u32, slots as u32, nt as u32),
+                ((g.inter / gr) as u32, slots as u32, nt as u32),
             );
+            ts_pass(&mut pass, 12);
             let bg_dn = bc.get(712, || {
                 let down_b: Vec<_> = global
                     .down
@@ -6164,7 +6827,7 @@ pub(crate) fn encode_layer(
                     .collect();
                 c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("qwen4-dn4"),
-                    layout: &p.dn_q4tp4.get_bind_group_layout(0),
+                    layout: &dn4.get_bind_group_layout(0),
                     entries: &[
                         wgpu::BindGroupEntry {
                             binding: 0,
@@ -6180,11 +6843,11 @@ pub(crate) fn encode_layer(
             let bg_dn_p = bc.get(713, || {
                 c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("qwen4-dn4-p"),
-                    layout: &p.dn_q4tp4.get_bind_group_layout(1),
+                    layout: &dn4.get_bind_group_layout(1),
                     entries: &[bind_buf(0, &dn_u)],
                 })
             });
-            pass.set_pipeline(&p.dn_q4tp4);
+            pass.set_pipeline(dn4);
             pass.set_bind_group(0, &bg_dn, &[]);
             pass.set_bind_group(1, &bg_dn_p, &[]);
             bc.launch(&mut pass, 706, ((hidden / 4) as u32, nt as u32, 1));
@@ -6281,6 +6944,7 @@ pub(crate) fn encode_layer(
         pass.set_bind_group(0, &bind, &[]);
         bc.launch(&mut pass, 709, (1, 1, 1));
     }
+    ts_pass(&mut pass, 7);
     drop(pass);
     for (t, h, r) in ple_snapped {
         if let Some(e) = dev.ple_snaps[li].get_mut(t) {
@@ -6423,35 +7087,36 @@ pub(crate) fn encode_pending(
         };
         (cortiq_core::quant::expected_nbytes(dt, &[rows, cols]).unwrap_or(0) / 2) as u32
     };
-    let gu_u = uniform_u32x8(
-        c,
-        [
-            (hidden / 32) as u32,
-            g.inter as u32,
-            k as u32,
-            stride16(g.inter, hidden, g.gu_q2),
-            0.0f32.to_bits(),
-            global.segment_slots as u32,
-            0,
-            0,
-        ],
-    );
-    let dn_u = uniform_u32x8(
-        c,
-        [
-            (g.inter / 32) as u32,
-            hidden as u32,
-            k as u32,
-            stride16(hidden, g.inter, false),
-            global.segment_slots as u32,
-            0,
-            0,
-            0,
-        ],
-    );
+    let gu_w = [
+        (hidden / 32) as u32,
+        g.inter as u32,
+        k as u32,
+        stride16(g.inter, hidden, g.gu_q2),
+        0.0f32.to_bits(),
+        global.segment_slots as u32,
+        0,
+        0,
+    ];
+    let dn_w = [
+        (g.inter / 32) as u32,
+        hidden as u32,
+        k as u32,
+        stride16(hidden, g.inter, false),
+        global.segment_slots as u32,
+        0,
+        0,
+        0,
+    ];
+    let (gu_u, dn_u) = if cold_k_env() {
+        // the slot word is rewritten per frame at finalize
+        dev.cold_tpl.set(Some((gu_w, dn_w)));
+        (dev.cold_u[0].clone(), dev.cold_u[1].clone())
+    } else {
+        (uniform_u32x8(c, gu_w), uniform_u32x8(c, dn_w))
+    };
     let blocked = blocked_experts(g, global.segments);
     let (pipe_gu, pipe_dn): (&wgpu::ComputePipeline, &wgpu::ComputePipeline) = if blocked {
-        (p.gu4(g.gu_q2), &p.dn_q4tp4)
+        p.experts_blocked(g)
     } else {
         (p_gu, p_dn)
     };
@@ -6578,8 +7243,34 @@ pub(crate) fn finalize_pending(
 ) -> bool {
     let Some(c) = ctx() else { return false };
     let k = g.top_k;
+    let k_full = k;
     let any_dev = cold_slots.iter().take(nt).any(|s| !s.is_empty());
     let any_host = cold_host.iter().take(nt).any(Option::is_some);
+    // Slots per token in the cold pass: the frame's longest cold list
+    // (`CMF_QWEN_COLD_K`, default) or always top_k. The padding slots carry
+    // weight zero, so the down kernel's sums only lose trailing zero terms.
+    let tpl = dev.cold_tpl.get().filter(|_| cold_k_env());
+    let k = match tpl {
+        Some(_) if any_dev => cold_slots
+            .iter()
+            .take(nt)
+            .map(|s| s.len().min(k))
+            .max()
+            .unwrap_or(k)
+            .max(1),
+        _ => k,
+    };
+    if let Some((gu_w, dn_w)) = tpl
+        && any_dev
+        && dev.cold_k.get() != k
+    {
+        let (mut a, mut b) = (gu_w, dn_w);
+        a[2] = k as u32;
+        b[2] = k as u32;
+        c.queue.write_buffer(&dev.cold_u[0], 0, bytemuck::cast_slice(&a));
+        c.queue.write_buffer(&dev.cold_u[1], 0, bytemuck::cast_slice(&b));
+        dev.cold_k.set(k);
+    }
     if any_dev {
         let mut sel = vec![0u32; nt * k];
         let mut wt = vec![0.0f32; nt * k];
@@ -6596,12 +7287,12 @@ pub(crate) fn finalize_pending(
             }
         }
         c.queue.write_buffer(
-            &tbuf_exact(c, T_CSEL, k * 4, true),
+            &tbuf_exact(c, T_CSEL, k_full * 4, true),
             0,
             bytemuck::cast_slice(&sel),
         );
         c.queue.write_buffer(
-            &tbuf_exact(c, T_CWT, k * 4, true),
+            &tbuf_exact(c, T_CWT, k_full * 4, true),
             0,
             bytemuck::cast_slice(&wt),
         );
@@ -6612,10 +7303,14 @@ pub(crate) fn finalize_pending(
             .unwrap()
             .get(&dev.uid)
             .is_some_and(|b| blocked_experts(g, b.segments));
-    let div = if blocked { 4 } else { 1 };
+    let (div_gu, div) = match (blocked, pipes(c)) {
+        (true, Some(p)) => (p.gu_rows(g), 4),
+        (true, None) => (4, 4),
+        (false, _) => (1, 1),
+    };
     let args: [u32; 8] = if any_dev {
         [
-            (g.inter / div) as u32,
+            (g.inter / div_gu) as u32,
             k as u32,
             nt as u32,
             0,
@@ -6975,6 +7670,88 @@ pub(crate) fn copy_to_stage(
     true
 }
 
+// ── GPU stage timestamps (`CMF_QWEN_TS=1` with `CMF_GPU_TS=2`): a probe,
+// not a release path. Every frame writes the same fixed marks (`TS_*`), so
+// slot i always means the same frame point; the frame resolves them into
+// the context's timestamp stage, which the host reads after the fence. ──
+
+/// Mark slots of a frame: chain head, after the pending cold pass, after
+/// PLE, after the attention mix, after the mixer, after the MoE mix, after
+/// routing, after the experts, after the stage copies.
+pub(crate) const TS_MARKS: u32 = 13;
+
+pub(crate) fn ts_probe() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("CMF_QWEN_TS").as_deref() == Ok("1")
+            && ctx().is_some_and(|c| {
+                c.ts_query.is_some()
+                    && c.device
+                        .features()
+                        .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES)
+            })
+    })
+}
+
+/// Write mark `i` inside the frame's open pass.
+fn ts_pass(pass: &mut wgpu::ComputePass<'_>, i: u32) {
+    if !ts_probe() {
+        return;
+    }
+    if let Some((qs, _, _)) = ctx().and_then(|c| c.ts_query.as_ref()) {
+        pass.write_timestamp(qs, i);
+    }
+}
+
+/// Write mark `i` on the encoder (through the merged pass).
+pub(crate) fn ts_mark(enc: &mut wgpu::CommandEncoder, i: u32) {
+    if !ts_probe() {
+        return;
+    }
+    let mut pass = begin_pass(enc);
+    ts_pass(&mut pass, i);
+}
+
+/// Resolve the frame's marks into the timestamp stage (end of the frame).
+pub(crate) fn ts_resolve(enc: &mut wgpu::CommandEncoder) {
+    if !ts_probe() {
+        return;
+    }
+    if let Some((qs, resolve, tstage)) = ctx().and_then(|c| c.ts_query.as_ref()) {
+        flush_pass(&*enc);
+        enc.resolve_query_set(qs, 0..TS_MARKS, resolve, 0);
+        enc.copy_buffer_to_buffer(resolve, 0, tstage, 0, TS_MARKS as u64 * 8);
+    }
+}
+
+/// The marks of the frame whose fence just passed, in nanoseconds.
+pub(crate) fn ts_read() -> Option<Vec<f64>> {
+    if !ts_probe() {
+        return None;
+    }
+    let c = ctx()?;
+    let (_, _, tstage) = c.ts_query.as_ref()?;
+    let slice = tstage.slice(..TS_MARKS as u64 * 8);
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let d2 = done.clone();
+    slice.map_async(wgpu::MapMode::Read, move |_| {
+        d2.store(true, std::sync::atomic::Ordering::Release)
+    });
+    let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+    if !done.load(std::sync::atomic::Ordering::Acquire) {
+        tstage.unmap();
+        return None;
+    }
+    let v: Vec<f64> = {
+        let data = slice.get_mapped_range().ok()?;
+        data.chunks_exact(8)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()) as f64 * c.ts_period as f64)
+            .collect()
+    };
+    tstage.unmap();
+    Some(v)
+}
+
 /// Debug: every token slot's hyper state (`hc·hidden` floats each).
 pub(crate) fn read_hyper(dev: &Dev, ntok: usize, hh: usize) -> Option<Vec<Vec<f32>>> {
     let enc = new_encoder("qwen4-dump")?;
@@ -7009,6 +7786,13 @@ pub(crate) fn tap_bufs(dev: &Dev, g: &Geom) -> [wgpu::Buffer; 5] {
 /// A whole buffer as a bind group entry.
 pub(crate) fn whole(b: &wgpu::Buffer) -> Rng {
     Rng::all(b)
+}
+
+/// Submit one finished command buffer on its own.
+pub(crate) fn submit_cb(cb: wgpu::CommandBuffer) {
+    if let Some(c) = ctx() {
+        submit(c, cb);
+    }
 }
 
 /// Submit without a readback (a token whose logits nobody wants).
@@ -7256,6 +8040,415 @@ pub(crate) fn stage_expert(
     put(&b.gate[seg], t.0, b.gu_len)
         && put(&b.up[seg], t.1, b.gu_len)
         && put(&b.down[seg], t.2, b.d_len)
+}
+
+// ── host-heap expert tier: admissions as DMA copies ──
+
+/// Routed experts in GPU-visible host memory (`host_mem::sysmem_buffer`,
+/// the cached type), one slot per expert: gate, up and down at 256-byte
+/// aligned offsets. An admission whose expert sits here is three
+/// `copy_buffer_to_buffer` commands, recorded now and submitted ahead of the
+/// frame that reads the arena slot — the card's copy engine pulls the bytes
+/// over PCIe and the CPU copies nothing. A miss copies the expert once from
+/// the mapping into a free slot (CLOCK eviction once the tier is full)
+/// first: parallel writes into system RAM, not into the PCIe window.
+///
+/// Why (RTX 3090, PCIe 4.0 x16, no resizable BAR, measured with the
+/// `qwen4_xfer_bench` example): `write_buffer` stages every expert in the
+/// 256 MB BAR window and serializes across threads (an 8-token prompt frame
+/// spent ~80 ms admitting ~410 experts, ~9 GB/s, the card idle meanwhile);
+/// a DMA copy from host memory runs at 24.5 GB/s and a parallel memcpy from
+/// the page-cached mapping into host memory at 45-60 GB/s.
+///
+/// Segments (1 GiB) are allocated by a background thread — the driver pins
+/// and clears ~0.3 s per GiB — so the tier comes online in steps; an
+/// admission it cannot place yet takes the `write_buffer` path. The thread
+/// starts after the first completed submission (`done`), so the first
+/// encode creates its resources unhindered; the pinning still holds up the
+/// frames that run alongside it (~7 s in all for 28 GiB on the 3090), which
+/// is why the tier is not on by default (§8.7 of the device doc).
+pub(crate) struct HostTier {
+    bank: Arc<Dsv4GlobalMoeBufs>,
+    segs: Arc<Vec<std::sync::OnceLock<super::host_mem::SysBuf>>>,
+    grow_started: std::sync::atomic::AtomicBool,
+    seg_slots: usize,
+    stride: u64,
+    off: [u64; 3],
+    cap: usize,
+    online: Arc<std::sync::atomic::AtomicUsize>,
+    /// no more segments are coming (all allocated, or the driver refused
+    /// one: the tier then stays at `online` slots)
+    grown: Arc<std::sync::atomic::AtomicBool>,
+    meta: std::sync::Mutex<TierMeta>,
+    copies: std::sync::Mutex<Vec<(u32, u32)>>,
+    /// copy batches handed to the queue (`take`) / known complete (`done`)
+    taken: std::sync::atomic::AtomicU64,
+    completed: std::sync::atomic::AtomicU64,
+    pub(crate) hits: std::sync::atomic::AtomicU64,
+    pub(crate) fills: std::sync::atomic::AtomicU64,
+    pub(crate) fill_ns: std::sync::atomic::AtomicU64,
+    pub(crate) misses: std::sync::atomic::AtomicU64,
+    pub(crate) bg_fills: std::sync::atomic::AtomicU64,
+}
+
+struct TierMeta {
+    slot_of: Vec<u32>,
+    key_of: Vec<u32>,
+    ready: Vec<bool>,
+    refbit: Vec<bool>,
+    /// the copy batch that last read the slot: it may be evicted only once
+    /// that batch is complete
+    epoch: Vec<u64>,
+    bump: usize,
+    hand: usize,
+}
+
+impl HostTier {
+    /// A tier of at most `cap_bytes` over `n_keys` experts of `model`'s
+    /// global bank. None off Vulkan, without host-visible system memory, or
+    /// when the first segment cannot be allocated.
+    pub(crate) fn new(model: &CmfModel, n_keys: usize, cap_bytes: u64) -> Option<Arc<Self>> {
+        use std::sync::atomic::{AtomicU64, AtomicUsize};
+        let c = ctx()?;
+        let bank = c.dsv4_global_moe.lock().unwrap().get(&model.uid()).cloned()?;
+        let al = |n: usize| (n as u64).div_ceil(256) * 256;
+        let off = [0, al(bank.gu_len), 2 * al(bank.gu_len)];
+        let stride = off[2] + al(bank.d_len);
+        let seg_bytes = std::env::var("CMF_QWEN_HTIER_SEG_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(1 << 30, |mb| mb << 20)
+            .min(c.device.limits().max_buffer_size);
+        let seg_slots = (seg_bytes / stride) as usize;
+        let cap = ((cap_bytes / stride) as usize).min(n_keys).min(u32::MAX as usize - 1);
+        if seg_slots == 0 || cap < 64 || n_keys >= u32::MAX as usize {
+            return None;
+        }
+        let nseg = cap.div_ceil(seg_slots);
+        let seg_len = seg_slots as u64 * stride;
+        let first = super::host_mem::sysmem_buffer(&c.device, seg_len, true)?;
+        let segs: Arc<Vec<std::sync::OnceLock<super::host_mem::SysBuf>>> =
+            Arc::new((0..nseg).map(|_| std::sync::OnceLock::new()).collect());
+        let _ = segs[0].set(first);
+        let online = Arc::new(AtomicUsize::new(seg_slots.min(cap)));
+        Some(Arc::new(Self {
+            bank,
+            segs,
+            grow_started: std::sync::atomic::AtomicBool::new(nseg <= 1),
+            seg_slots,
+            stride,
+            off,
+            cap,
+            online,
+            grown: Arc::new(std::sync::atomic::AtomicBool::new(nseg <= 1)),
+            meta: std::sync::Mutex::new(TierMeta {
+                slot_of: vec![u32::MAX; n_keys],
+                key_of: vec![u32::MAX; cap],
+                ready: vec![false; cap],
+                refbit: vec![false; cap],
+                epoch: vec![0; cap],
+                bump: 0,
+                hand: 0,
+            }),
+            copies: std::sync::Mutex::new(Vec::new()),
+            taken: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            hits: AtomicU64::new(0),
+            fills: AtomicU64::new(0),
+            fill_ns: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            bg_fills: AtomicU64::new(0),
+        }))
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    /// Slots whose segment is allocated.
+    pub(crate) fn online(&self) -> usize {
+        self.online.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Bytes per slot.
+    pub(crate) fn stride(&self) -> u64 {
+        self.stride
+    }
+
+    /// Every slot is taken (further fills evict).
+    pub(crate) fn full(&self) -> bool {
+        let limit = if self.grown.load(std::sync::atomic::Ordering::Acquire) {
+            self.online()
+        } else {
+            self.cap
+        };
+        self.meta.lock().unwrap().bump >= limit
+    }
+
+    /// The tier has (or is writing) expert `key`.
+    pub(crate) fn has(&self, key: usize) -> bool {
+        self.meta
+            .lock()
+            .unwrap()
+            .slot_of
+            .get(key)
+            .is_some_and(|&s| s != u32::MAX)
+    }
+
+    /// Fill the tier in the background with `order` (keys, most wanted
+    /// first; `triples[key]` its tensors in `model`) on `threads` threads,
+    /// while it has free slots. Admissions that miss before the loader
+    /// reaches their expert still fill it themselves.
+    pub(crate) fn start_fill(
+        self: &Arc<Self>,
+        model: Arc<CmfModel>,
+        triples: Arc<Vec<(usize, usize, usize)>>,
+        order: Vec<usize>,
+        threads: usize,
+    ) {
+        let order = Arc::new(order);
+        let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..threads.max(1) {
+            let (me, order, next, model, triples) = (
+                Arc::downgrade(self),
+                order.clone(),
+                next.clone(),
+                model.clone(),
+                triples.clone(),
+            );
+            let _ = std::thread::Builder::new()
+                .name("qwen4-tier-fill".into())
+                .spawn(move || {
+                    let bytes = model.primary_bytes();
+                    let part = |i: usize| -> Option<&[u8]> {
+                        let e = model.tensors.get(i)?;
+                        let abs = model.entry_abs_offset(e)?;
+                        bytes.get(abs..abs + e.nbytes as usize)
+                    };
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&key) = order.get(i) else { return };
+                        let Some(t) = me.upgrade() else { return };
+                        if t.has(key) {
+                            continue;
+                        }
+                        let Some(&(g, u, d)) = triples.get(key) else {
+                            continue;
+                        };
+                        let (Some(g), Some(u), Some(d)) = (part(g), part(u), part(d)) else {
+                            continue;
+                        };
+                        loop {
+                            // never evict for a guess: stop once full
+                            if t.full() {
+                                return;
+                            }
+                            if t.fill(key, None, [g, u, d]) || t.has(key) {
+                                break;
+                            }
+                            // the next segment is still being allocated
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                    }
+                });
+        }
+    }
+
+    fn queue_copy(&self, m: &mut TierMeta, s: usize, arena_slot: usize) {
+        m.refbit[s] = true;
+        m.epoch[s] = self.taken.load(std::sync::atomic::Ordering::Acquire) + 1;
+        self.copies
+            .lock()
+            .unwrap()
+            .push((s as u32, arena_slot as u32));
+    }
+
+    /// Queue the copy of expert `key` into `arena_slot` when the tier holds
+    /// it. False when it does not (or it is still being written).
+    pub(crate) fn hit(&self, key: usize, arena_slot: usize) -> bool {
+        if arena_slot >= self.bank.capacity {
+            return false;
+        }
+        let mut m = self.meta.lock().unwrap();
+        let Some(&s) = m.slot_of.get(key) else {
+            return false;
+        };
+        if s == u32::MAX || !m.ready[s as usize] {
+            return false;
+        }
+        self.queue_copy(&mut m, s as usize, arena_slot);
+        drop(m);
+        self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+
+    /// Copy expert `key` (`parts`: gate, up, down) into a tier slot, then,
+    /// with `arena_slot`, queue its copy into the arena. False when the
+    /// tier has no slot for it now (the caller uploads it another way).
+    pub(crate) fn fill(&self, key: usize, arena_slot: Option<usize>, parts: [&[u8]; 3]) -> bool {
+        use std::sync::atomic::Ordering;
+        let b = &self.bank;
+        if parts[0].len() != b.gu_len
+            || parts[1].len() != b.gu_len
+            || parts[2].len() != b.d_len
+            || arena_slot.is_some_and(|a| a >= b.capacity)
+        {
+            return false;
+        }
+        let t0 = std::time::Instant::now();
+        let s = {
+            let mut m = self.meta.lock().unwrap();
+            if m.slot_of.get(key).is_none_or(|&s| s != u32::MAX) {
+                return false;
+            }
+            let online = self.online();
+            let s = if m.bump < online {
+                m.bump += 1;
+                m.bump - 1
+            } else if online < self.cap && !self.grown.load(Ordering::Acquire) {
+                // more segments are coming: do not evict yet
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                return false;
+            } else {
+                // CLOCK over the whole tier: skip slots being written, slots
+                // a pending copy reads, and (once) recently used ones
+                let done = self.completed.load(Ordering::Acquire);
+                let mut pick = None;
+                for _ in 0..2 * self.cap {
+                    let s = m.hand;
+                    m.hand = (m.hand + 1) % self.cap;
+                    if !m.ready[s] || m.epoch[s] > done {
+                        continue;
+                    }
+                    if m.refbit[s] {
+                        m.refbit[s] = false;
+                        continue;
+                    }
+                    pick = Some(s);
+                    break;
+                }
+                let Some(s) = pick else {
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                };
+                let old = m.key_of[s] as usize;
+                if let Some(o) = m.slot_of.get_mut(old) {
+                    *o = u32::MAX;
+                }
+                s
+            };
+            m.key_of[s] = key as u32;
+            m.slot_of[key] = s as u32;
+            m.ready[s] = false;
+            s
+        };
+        let Some(seg) = self.segs[s / self.seg_slots].get() else {
+            // cannot happen (online covers it); undo
+            let mut m = self.meta.lock().unwrap();
+            m.slot_of[key] = u32::MAX;
+            m.key_of[s] = u32::MAX;
+            return false;
+        };
+        let base = (s % self.seg_slots) as u64 * self.stride;
+        let ok = (0..3).all(|i| seg.write(base + self.off[i], parts[i]));
+        let mut m = self.meta.lock().unwrap();
+        if !ok {
+            m.slot_of[key] = u32::MAX;
+            m.key_of[s] = u32::MAX;
+            return false;
+        }
+        m.ready[s] = true;
+        if let Some(a) = arena_slot {
+            self.queue_copy(&mut m, s, a);
+        } else {
+            m.refbit[s] = true;
+        }
+        drop(m);
+        if arena_slot.is_some() {
+            self.fills.fetch_add(1, Ordering::Relaxed);
+            self.fill_ns
+                .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        } else {
+            self.bg_fills.fetch_add(1, Ordering::Relaxed);
+        }
+        true
+    }
+
+    /// The queued copies as one command buffer, to go ahead of the frame
+    /// that reads their arena slots (same queue submission). None when
+    /// nothing is queued.
+    pub(crate) fn take(&self) -> Option<wgpu::CommandBuffer> {
+        let c = ctx()?;
+        let m = self.meta.lock().unwrap();
+        let copies = std::mem::take(&mut *self.copies.lock().unwrap());
+        if copies.is_empty() {
+            return None;
+        }
+        let b = &self.bank;
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("qwen4-host-tier-copies"),
+            });
+        for (s, a) in copies {
+            let (s, a) = (s as usize, a as usize);
+            let Some(seg) = self.segs[s / self.seg_slots].get() else {
+                continue;
+            };
+            let base = (s % self.seg_slots) as u64 * self.stride;
+            let (aseg, local) = (a / b.segment_slots, a % b.segment_slots);
+            let dst = [
+                (&b.gate[aseg], (local * b.gu_len) as u64, b.gu_len as u64),
+                (&b.up[aseg], (local * b.gu_len) as u64, b.gu_len as u64),
+                (&b.down[aseg], (local * b.d_len) as u64, b.d_len as u64),
+            ];
+            for (i, (buf, doff, len)) in dst.into_iter().enumerate() {
+                enc.copy_buffer_to_buffer(&seg.buffer, base + self.off[i], buf, doff, len);
+            }
+        }
+        self.taken
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        drop(m);
+        Some(enc.finish())
+    }
+
+    /// Every batch `take` handed out so far has executed (the caller waited
+    /// on a submission that followed them).
+    pub(crate) fn done(&self) {
+        use std::sync::atomic::Ordering;
+        self.completed
+            .store(self.taken.load(Ordering::Acquire), Ordering::Release);
+        if !self.grow_started.swap(true, Ordering::AcqRel) {
+            self.grow();
+        }
+    }
+
+    /// Allocate the segments after the first in the background.
+    fn grow(&self) {
+        use std::sync::atomic::Ordering;
+        let Some(c) = ctx() else {
+            self.grown.store(true, Ordering::Release);
+            return;
+        };
+        let (segs, online, grown) = (self.segs.clone(), self.online.clone(), self.grown.clone());
+        let (seg_slots, cap) = (self.seg_slots, self.cap);
+        let seg_len = seg_slots as u64 * self.stride;
+        let spawned = std::thread::Builder::new()
+            .name("qwen4-host-tier".into())
+            .spawn(move || {
+                for i in 1..segs.len() {
+                    let Some(b) = super::host_mem::sysmem_buffer(&c.device, seg_len, true) else {
+                        break;
+                    };
+                    let _ = segs[i].set(b);
+                    online.store(((i + 1) * seg_slots).min(cap), Ordering::Release);
+                }
+                grown.store(true, Ordering::Release);
+            });
+        if spawned.is_err() {
+            self.grown.store(true, Ordering::Release);
+        }
+    }
 }
 
 /// A frame salt for cell `j` of a chain that records several positions
