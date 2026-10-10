@@ -761,6 +761,12 @@ struct VLayer {
 
 /// The `gemma4_vision` tower and `embed_vision` of an EmbeddingGemma 2 pack.
 pub struct VisionTower {
+    /// the encoder layers on the device (macOS / Metal); first, so it drops
+    /// before the host weights it wraps
+    #[cfg(target_os = "macos")]
+    gpu: Option<crate::gpu_metal::egemma2::VisionGpu>,
+    /// run the host layers even when the device ones are up (A/B, tests)
+    host_only: std::sync::atomic::AtomicBool,
     input_proj: Mat,
     /// `[2, rows, hidden]`: column table, then row table
     pos: Vec<f32>,
@@ -872,7 +878,10 @@ impl VisionTower {
             Ok("1") => 256,
             _ => GPU_MIN_PATCHES,
         };
-        Ok(VisionTower {
+        let mut tower = VisionTower {
+            #[cfg(target_os = "macos")]
+            gpu: None,
+            host_only: std::sync::atomic::AtomicBool::new(false),
             input_proj: Mat::load(
                 model,
                 "vision_tower.patch_embedder.input_proj.weight",
@@ -891,7 +900,73 @@ impl VisionTower {
             pool,
             busy: Mutex::new(()),
             gpu_min_patches,
-        })
+        };
+        #[cfg(target_os = "macos")]
+        if dequant && crate::gpu_metal::egemma2::enabled() {
+            match tower.device_layers() {
+                Ok(g) => tower.gpu = Some(g),
+                Err(e) => {
+                    tracing::info!("egemma2 vision: Metal layers off ({e}); the CPU runs them")
+                }
+            }
+        }
+        Ok(tower)
+    }
+
+    /// The encoder layers on the device, over this tower's f32 weights.
+    #[cfg(target_os = "macos")]
+    fn device_layers(&self) -> Result<crate::gpu_metal::egemma2::VisionGpu, String> {
+        use crate::gpu_metal::egemma2::{VLayerSpec, VisionGpu};
+        fn f(m: &Mat) -> Result<&[f32], String> {
+            m.f32_weights()
+                .ok_or_else(|| "a quantized matrix (low-memory mode)".to_string())
+        }
+        let specs = self
+            .layers
+            .iter()
+            .map(|l| {
+                Ok(VLayerSpec {
+                    q: f(&l.q)?,
+                    k: f(&l.k)?,
+                    v: f(&l.v)?,
+                    o: f(&l.o)?,
+                    gate: f(&l.gate)?,
+                    up: f(&l.up)?,
+                    down: f(&l.down)?,
+                    q_norm: &l.q_norm,
+                    k_norm: &l.k_norm,
+                    in_norm: &l.in_norm,
+                    post_attn_norm: &l.post_attn_norm,
+                    pre_ff_norm: &l.pre_ff_norm,
+                    post_ff_norm: &l.post_ff_norm,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        VisionGpu::new(
+            &specs,
+            self.hidden,
+            self.heads,
+            self.head_dim,
+            crate::egemma2::EPS as f32,
+        )
+    }
+
+    /// Run the host layers (`true`) even when the device ones are up.
+    pub fn force_host(&self, on: bool) {
+        self.host_only
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Do the encoder layers run on the device (Metal)?
+    pub fn on_device(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.gpu.is_some() && !self.host_only.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
     }
 
     /// Soft tokens of each input, `[n_soft, out_dim]` row-major: the rows
@@ -982,7 +1057,25 @@ impl VisionTower {
                 }
             }
         }
-        for l in &self.layers {
+        #[cfg(target_os = "macos")]
+        let on_device = match self.gpu.as_ref().filter(|_| self.on_device()) {
+            Some(g) => {
+                let lens: Vec<usize> = segs.iter().map(|s| s.pw * s.ph).collect();
+                match g.forward(&mut h, &lens, &cos, &sin) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!(
+                            "egemma2 vision: Metal layers failed ({e}); the CPU runs them"
+                        );
+                        false
+                    }
+                }
+            }
+            None => false,
+        };
+        #[cfg(not(target_os = "macos"))]
+        let on_device = false;
+        for l in self.layers.iter().filter(|_| !on_device) {
             let t0 = std::time::Instant::now();
             let a = rms_rows(&h, Some(&l.in_norm), d, pool);
             vprof::add(vprof::NORMS, t0);

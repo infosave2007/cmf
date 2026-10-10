@@ -29,6 +29,10 @@ pub mod zimage;
 #[doc(hidden)]
 pub mod qi21;
 
+// EmbeddingGemma 2 text encoder — child module, `gpu_metal/egemma2.rs`.
+#[doc(hidden)]
+pub mod egemma2;
+
 // Native Metal scratch buffers are process-wide (the command queue and
 // `Ctx::io_bufs` are shared by all pipelines).  A buffer is safe to reuse
 // only after the owning pipeline's command buffer has completed; two server

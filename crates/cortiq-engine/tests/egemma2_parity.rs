@@ -102,8 +102,61 @@ fn egemma2_text_parity() {
             c["id"]
         );
     }
+    // the id-level SentencePiece BPE equals the string form, on the cases
+    // and on spliced mixes of them
+    {
+        let tok = enc.tokenizer();
+        let mut texts: Vec<String> = inputs.iter().map(|i| i.text.clone()).collect();
+        let n = texts.len();
+        for i in 0..n {
+            let (a, b) = (&texts[i], &texts[(i * 7 + 3) % n]);
+            let cut = |s: &str, f: usize| {
+                let mut k = s.len() * f / 8;
+                while !s.is_char_boundary(k) {
+                    k -= 1;
+                }
+                k
+            };
+            let mix = format!("{}{}", &a[..cut(a, 5)], &b[cut(b, 2)..]);
+            texts.push(mix);
+        }
+        let t0 = std::time::Instant::now();
+        let fast: Vec<Vec<u32>> = texts.iter().map(|t| tok.encode(t)).collect();
+        let tf = t0.elapsed().as_secs_f64();
+        let t0 = std::time::Instant::now();
+        let slow: Vec<Vec<u32>> = texts.iter().map(|t| tok.encode_reference(t)).collect();
+        let ts = t0.elapsed().as_secs_f64();
+        for (t, (f, s)) in texts.iter().zip(fast.iter().zip(&slow)) {
+            assert_eq!(
+                f,
+                s,
+                "id-level vs string BPE on {:?}",
+                &t[..t.len().min(60)]
+            );
+        }
+        eprintln!(
+            "tokenizer: {} texts, {} tokens — id-level {:.1} ms, string form {:.1} ms",
+            texts.len(),
+            fast.iter().map(|f| f.len()).sum::<usize>(),
+            tf * 1e3,
+            ts * 1e3
+        );
+    }
     // all cases in one packed batch
     let got = enc.embed_texts(&inputs).unwrap();
+    // the device forward (when up) agrees with the host one
+    if enc.on_device() {
+        enc.force_host(true);
+        let host = enc.embed_texts(&inputs).unwrap();
+        enc.force_host(false);
+        let worst = got
+            .iter()
+            .zip(&host)
+            .map(|(a, b)| cosine(a, b))
+            .fold(1.0f64, f64::min);
+        eprintln!("device vs host forward: worst cosine {worst:.9}");
+        assert!(worst > 0.999_999, "device vs host: {worst}");
+    }
     let mut worst = (1.0f64, String::new());
     for (c, g) in cases.iter().zip(&got) {
         let row = c["row"].as_u64().unwrap() as usize;
