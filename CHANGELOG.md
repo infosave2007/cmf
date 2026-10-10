@@ -77,19 +77,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       at 2000.
   - Greedy text is byte-identical, with and without speculation.
 - Qwen3.8-Flash-Next expert admission on Vulkan, second pass:
-  - the admission pool reserves and fills a frame's cold experts in one
-    pass;
+  - a persistent pool of 16 admission threads reserves and fills a
+    frame's cold experts in one pass;
   - an optional host-memory expert tier on Linux: system-memory buffers
     the card pulls by DMA, instead of CPU writes through the 256 MB BAR
     window. It is off by default. `CMF_QWEN_HTIER_MB=auto` or a size in
     MiB turns it on; it pins at most half of the memory the process can
     take.
-  - RTX 3090, plain decode:
-    - 12 GB budget: 10.6 → 25.6 tok/s;
-    - 16 GB budget: 30.6 → 33.8 tok/s.
-  - RTX 3090, prompt ingest at ~1000 tokens on the full card: ~57 → 67.5
-    tok/s.
-  - Greedy text is byte-identical.
+  - RTX 3090, compared with the first pass:
+    - plain decode at a 16 GB budget 30.0 → 34.6 tok/s, at 12 GB
+      17.5 → 22.1 tok/s;
+    - prompt ingest at ~1000 tokens on the full card 57.7 → 67.5 tok/s;
+    - time to first token at 2000 tokens 25.3 → 20.8 s.
+  - `CMF_QWEN_ADMIT_THREADS=0` restores the per-frame threads.
+  - Greedy text is byte-identical, with the tier on and off.
 - Mellum2.1 `q8_2f` file (8-bit experts) on the Vulkan token and batch
   graphs. Both took only 4-bit experts, so this file ran every op on its
   own, with attention on the host.
