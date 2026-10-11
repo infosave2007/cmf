@@ -16586,11 +16586,12 @@ fn bake_silu_mul(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// dact into the concatenated dgu — silu·mul backward, exactly
 /// `ops::silu_bwd`'s σ(x)·(1 + x·(1−σ(x))).
 const BAKE_SILU_BWD_SRC: &str = r#"
-struct BwP { inter: u32, total: u32, _a: u32, stride: u32 };
+struct BwP { inter: u32, total: u32, scaled: u32, stride: u32 };
 @group(0) @binding(0) var<storage, read> bw_plane : array<f32>;
 @group(0) @binding(1) var<storage, read> bw_dact : array<f32>;
 @group(0) @binding(2) var<storage, read_write> bw_dgu : array<f32>;
 @group(0) @binding(3) var<uniform> bw_p : BwP;
+@group(0) @binding(4) var<storage, read> bw_s : array<f32>;
 @compute @workgroup_size(256)
 fn bake_silu_bwd(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.y * bw_p.stride + gid.x;
@@ -16599,7 +16600,8 @@ fn bake_silu_bwd(@builtin(global_invocation_id) gid: vec3<u32>) {
     let j = i % bw_p.inter;
     let g = bw_plane[r * 2u * bw_p.inter + j];
     let u = bw_plane[r * 2u * bw_p.inter + bw_p.inter + j];
-    let da = bw_dact[i];
+    var da = bw_dact[i];
+    if (bw_p.scaled != 0u) { da = da * bw_s[j]; }
     let s = 1.0 / (1.0 + exp(-g));
     bw_dgu[r * 2u * bw_p.inter + j] = da * u * (s * (1.0 + g * (1.0 - s)));
     bw_dgu[r * 2u * bw_p.inter + bw_p.inter + j] = da * (g * s);
@@ -16643,11 +16645,12 @@ fn bake_gelu_mul(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// GELU backward link: dg = da·u·(Φ(g) + g·φ(g)), du = da·gelu(g) —
 /// exactly `ops::gelu_erf_bwd`.
 const BAKE_GELU_BWD_SRC: &str = r#"
-struct BgwP { inter: u32, total: u32, _a: u32, stride: u32 };
+struct BgwP { inter: u32, total: u32, scaled: u32, stride: u32 };
 @group(0) @binding(0) var<storage, read> bgw_plane : array<f32>;
 @group(0) @binding(1) var<storage, read> bgw_dact : array<f32>;
 @group(0) @binding(2) var<storage, read_write> bgw_dgu : array<f32>;
 @group(0) @binding(3) var<uniform> bgw_p : BgwP;
+@group(0) @binding(4) var<storage, read> bgw_s : array<f32>;
 fn bkw_erf(x: f32) -> f32 {
     let a = abs(x);
     let t = 1.0 / (1.0 + 0.3275911 * a);
@@ -16666,12 +16669,242 @@ fn bake_gelu_bwd(@builtin(global_invocation_id) gid: vec3<u32>) {
     let j = i % bgw_p.inter;
     let g = bgw_plane[r * 2u * bgw_p.inter + j];
     let u = bgw_plane[r * 2u * bgw_p.inter + bgw_p.inter + j];
-    let da = bgw_dact[i];
+    var da = bgw_dact[i];
+    if (bgw_p.scaled != 0u) { da = da * bgw_s[j]; }
     let cdf = 0.5 * (1.0 + bkw_erf(g * 0.70710678));
     let pdf = exp(-0.5 * g * g) * 0.3989422804014327;
     bgw_dgu[r * 2u * bgw_p.inter + j] = da * u * (cdf + g * pdf);
     bgw_dgu[r * 2u * bgw_p.inter + bgw_p.inter + j] = da * (g * cdf);
 }
+"#;
+
+/// DTG-MA mask gradient on the card: dm[j] = Σ_r dact[r,j]·act(g[r,j])·u[r,j]
+/// from the resident gate+up plane and the dh·down product — one thread per
+/// neuron walking the rows (coalesced across neurons). What the host
+/// summed in f64 over a 335 MB plane it no longer needs to see.
+const BAKE_MASKGRAD_SRC: &str = r#"
+struct MgP { inter: u32, n: u32, act: u32, _c: u32 };
+@group(0) @binding(0) var<storage, read> mg_plane : array<f32>;
+@group(0) @binding(1) var<storage, read> mg_dact : array<f32>;
+@group(0) @binding(2) var<storage, read_write> mg_dm : array<f32>;
+@group(0) @binding(3) var<uniform> mg_p : MgP;
+fn mg_erf(x: f32) -> f32 {
+    let a = abs(x);
+    let t = 1.0 / (1.0 + 0.3275911 * a);
+    let y = 1.0
+        - (((((1.0614054 * t - 1.4531521) * t + 1.4214138) * t - 0.28449674) * t
+            + 0.2548296)
+            * t)
+            * exp(-a * a);
+    return select(y, -y, x < 0.0);
+}
+fn mg_act(g: f32) -> f32 {
+    if (mg_p.act == 1u) { return 0.5 * g * (1.0 + mg_erf(g * 0.70710678)); }
+    return g / (1.0 + exp(-g));
+}
+@compute @workgroup_size(256)
+fn bake_mask_grad(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let j = gid.x;
+    if (j >= mg_p.inter) { return; }
+    var acc = 0.0;
+    for (var r = 0u; r < mg_p.n; r = r + 1u) {
+        let g = mg_plane[r * 2u * mg_p.inter + j];
+        let u = mg_plane[r * 2u * mg_p.inter + mg_p.inter + j];
+        acc = acc + mg_dact[r * mg_p.inter + j] * mg_act(g) * u;
+    }
+    mg_dm[j] = acc;
+}
+"#;
+
+
+/// Bake attention backward, kernel 1 — one workgroup per (query row,
+/// sequence·head): the row's softmax recomputed (scores, max, sum), the
+/// dot `dp_j = dao·v_j`, `D = Σ p·dp`, then `ds_j = p_j(dp_j − D)·scale`
+/// and `dq = Σ_j ds_j·k_j` with lanes over components. Writes the row's
+/// (max, den, D) for kernel 2. Same window rule as the forward.
+const BAKE_ATTN_BWD_Q_SRC: &str = r#"
+struct AbP { t: u32, nh: u32, nkv: u32, hd: u32, b: u32, window: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<storage, read> ab_q : array<f32>;
+@group(0) @binding(1) var<storage, read> ab_k : array<f32>;
+@group(0) @binding(2) var<storage, read> ab_v : array<f32>;
+@group(0) @binding(3) var<storage, read> ab_do : array<f32>;
+@group(0) @binding(4) var<storage, read_write> ab_dq : array<f32>;
+@group(0) @binding(5) var<storage, read_write> ab_stat : array<f32>;
+@group(0) @binding(6) var<uniform> ab_p : AbP;
+
+var<workgroup> abq_sc: array<f32, 2048>;
+var<workgroup> abq_red: array<f32, 128>;
+
+fn abq_reduce_max(lid: u32, v: f32) -> f32 {
+    abq_red[lid] = v;
+    workgroupBarrier();
+    for (var s = 64u; s > 0u; s = s >> 1u) {
+        if (lid < s) { abq_red[lid] = max(abq_red[lid], abq_red[lid + s]); }
+        workgroupBarrier();
+    }
+    let r = abq_red[0];
+    workgroupBarrier();
+    return r;
+}
+fn abq_reduce_sum(lid: u32, v: f32) -> f32 {
+    abq_red[lid] = v;
+    workgroupBarrier();
+    for (var s = 64u; s > 0u; s = s >> 1u) {
+        if (lid < s) { abq_red[lid] = abq_red[lid] + abq_red[lid + s]; }
+        workgroupBarrier();
+    }
+    let r = abq_red[0];
+    workgroupBarrier();
+    return r;
+}
+
+@compute @workgroup_size(128)
+fn bake_attn_bwd_q(@builtin(workgroup_id) wid: vec3<u32>,
+                   @builtin(local_invocation_index) lid: u32) {
+    let ti = wid.x;
+    let unit = wid.y;
+    let bi = unit / ab_p.nh;
+    let h = unit % ab_p.nh;
+    let rep = ab_p.nh / ab_p.nkv;
+    let g = h / rep;
+    let hd = ab_p.hd;
+    let qdim = ab_p.nh * hd;
+    let kvdim = ab_p.nkv * hd;
+    let scale = 1.0 / sqrt(f32(hd));
+    let row = bi * ab_p.t + ti;
+    let qbase = row * qdim + h * hd;
+    var first = 0u;
+    if (ab_p.window != 0u && ti + 1u > ab_p.window) { first = ti + 1u - ab_p.window; }
+    // 1. scores
+    for (var j = first + lid; j <= ti; j = j + 128u) {
+        let kbase = (bi * ab_p.t + j) * kvdim + g * hd;
+        var s = 0.0;
+        for (var c = 0u; c < hd; c = c + 1u) { s = s + ab_q[qbase + c] * ab_k[kbase + c]; }
+        abq_sc[j] = s * scale;
+    }
+    workgroupBarrier();
+    var lmx = -3.0e38;
+    for (var j = first + lid; j <= ti; j = j + 128u) { lmx = max(lmx, abq_sc[j]); }
+    let mx = abq_reduce_max(lid, lmx);
+    var lsum = 0.0;
+    for (var j = first + lid; j <= ti; j = j + 128u) { lsum = lsum + exp(abq_sc[j] - mx); }
+    let den = abq_reduce_sum(lid, lsum);
+    // 2. D = Σ_j p_j · (dao·v_j)
+    var ld = 0.0;
+    for (var j = first + lid; j <= ti; j = j + 128u) {
+        let vbase = (bi * ab_p.t + j) * kvdim + g * hd;
+        var dp = 0.0;
+        for (var c = 0u; c < hd; c = c + 1u) { dp = dp + ab_do[qbase + c] * ab_v[vbase + c]; }
+        ld = ld + (exp(abq_sc[j] - mx) / den) * dp;
+    }
+    let dsum = abq_reduce_sum(lid, ld);
+    // 3. ds_j·scale in place
+    for (var j = first + lid; j <= ti; j = j + 128u) {
+        let vbase = (bi * ab_p.t + j) * kvdim + g * hd;
+        var dp = 0.0;
+        for (var c = 0u; c < hd; c = c + 1u) { dp = dp + ab_do[qbase + c] * ab_v[vbase + c]; }
+        let p = exp(abq_sc[j] - mx) / den;
+        abq_sc[j] = p * (dp - dsum) * scale;
+    }
+    workgroupBarrier();
+    // 4. dq[c] = Σ_j ds_j·k_j[c]
+    for (var c = lid; c < hd; c = c + 128u) {
+        var acc = 0.0;
+        for (var j = first; j <= ti; j = j + 1u) {
+            acc = acc + abq_sc[j] * ab_k[(bi * ab_p.t + j) * kvdim + g * hd + c];
+        }
+        ab_dq[qbase + c] = acc;
+    }
+    if (lid == 0u) {
+        let sbase = (row * ab_p.nh + h) * 4u;
+        ab_stat[sbase] = mx;
+        ab_stat[sbase + 1u] = den;
+        ab_stat[sbase + 2u] = dsum;
+    }
+}
+"#;
+
+/// Bake attention backward, kernel 2 — one workgroup per (key row j,
+/// sequence·kv-group): for every query head of the group and every query
+/// t that sees j (t ∈ [j, j+w−1] under a window), lanes own a block of
+/// 128 queries each: `p = exp(s − m_t)/den_t`, `ds = p(dp − D_t)·scale`
+/// into shared memory, then lanes flip to components and accumulate
+/// `dk_j += Σ_t ds·q_t`, `dv_j += Σ_t p·dao_t`.
+const BAKE_ATTN_BWD_KV_SRC: &str = r#"
+struct AkP { t: u32, nh: u32, nkv: u32, hd: u32, b: u32, window: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<storage, read> ak_q : array<f32>;
+@group(0) @binding(1) var<storage, read> ak_k : array<f32>;
+@group(0) @binding(2) var<storage, read> ak_v : array<f32>;
+@group(0) @binding(3) var<storage, read> ak_do : array<f32>;
+@group(0) @binding(4) var<storage, read> ak_stat : array<f32>;
+@group(0) @binding(5) var<storage, read_write> ak_dk : array<f32>;
+@group(0) @binding(6) var<storage, read_write> ak_dv : array<f32>;
+@group(0) @binding(7) var<uniform> ak_p : AkP;
+
+var<workgroup> akp: array<f32, 128>;
+var<workgroup> akd: array<f32, 128>;
+
+@compute @workgroup_size(128)
+fn bake_attn_bwd_kv(@builtin(workgroup_id) wid: vec3<u32>,
+                    @builtin(local_invocation_index) lid: u32) {
+    let j = wid.x;
+    let unit = wid.y;
+    let bi = unit / ab_p_nkv();
+    let g = unit % ab_p_nkv();
+    let rep = ak_p.nh / ak_p.nkv;
+    let hd = ak_p.hd;
+    let qdim = ak_p.nh * hd;
+    let kvdim = ak_p.nkv * hd;
+    let scale = 1.0 / sqrt(f32(hd));
+    let kbase = (bi * ak_p.t + j) * kvdim + g * hd;
+    var t_last = ak_p.t - 1u;
+    if (ak_p.window != 0u && j + ak_p.window - 1u < t_last) { t_last = j + ak_p.window - 1u; }
+    // accumulators for this lane's components (hd ≤ 256 → ≤ 2 per lane)
+    var dk0 = 0.0; var dk1 = 0.0; var dv0 = 0.0; var dv1 = 0.0;
+    for (var h = g * rep; h < (g + 1u) * rep; h = h + 1u) {
+        for (var tb = j; tb <= t_last; tb = tb + 128u) {
+            let t = tb + lid;
+            var p = 0.0;
+            var ds = 0.0;
+            if (t <= t_last) {
+                let row = bi * ak_p.t + t;
+                let qbase = row * qdim + h * hd;
+                var s = 0.0;
+                var dp = 0.0;
+                for (var c = 0u; c < hd; c = c + 1u) {
+                    s = s + ak_q[qbase + c] * ak_k[kbase + c];
+                    dp = dp + ak_do[qbase + c] * ak_v[kbase + c];
+                }
+                let sbase = (row * ak_p.nh + h) * 4u;
+                p = exp(s * scale - ak_stat[sbase]) / ak_stat[sbase + 1u];
+                ds = p * (dp - ak_stat[sbase + 2u]) * scale;
+            }
+            akp[lid] = p;
+            akd[lid] = ds;
+            workgroupBarrier();
+            let nblk = min(128u, t_last + 1u - tb);
+            for (var tt = 0u; tt < nblk; tt = tt + 1u) {
+                let qb = (bi * ak_p.t + tb + tt) * qdim + h * hd;
+                dk0 = dk0 + akd[tt] * ak_q[qb + lid];
+                dv0 = dv0 + akp[tt] * ak_do[qb + lid];
+                if (lid + 128u < hd) {
+                    dk1 = dk1 + akd[tt] * ak_q[qb + lid + 128u];
+                    dv1 = dv1 + akp[tt] * ak_do[qb + lid + 128u];
+                }
+            }
+            workgroupBarrier();
+        }
+    }
+    if (lid < hd) {
+        ak_dk[kbase + lid] = dk0;
+        ak_dv[kbase + lid] = dv0;
+    }
+    if (lid + 128u < hd) {
+        ak_dk[kbase + lid + 128u] = dk1;
+        ak_dv[kbase + lid + 128u] = dv1;
+    }
+}
+fn ab_p_nkv() -> u32 { return ak_p.nkv; }
 "#;
 
 /// The bake attention chain, stage 1: from the fused qkv plane the coop
@@ -18540,11 +18773,16 @@ struct Ctx {
     /// The exact-GELU pair of the same two links (Spark-X2.5).
     bake_gelu: wgpu::ComputePipeline,
     bake_gelu_bwd: wgpu::ComputePipeline,
+    /// DTG-MA mask gradient from the resident plane (Phase A on the card).
+    bake_mask_grad: wgpu::ComputePipeline,
     /// The bake attention chain's middle: split+norm+rope, causal
     /// softmax·V per head, output gate (plain f32 modules).
     bake_qkr: wgpu::ComputePipeline,
     bake_attn_head: wgpu::ComputePipeline,
     bake_attn_gate: wgpu::ComputePipeline,
+    /// The bake attention backward (dq; dk+dv) for full-layer FCD.
+    bake_attn_bwd_q: wgpu::ComputePipeline,
+    bake_attn_bwd_kv: wgpu::ComputePipeline,
     /// Per-layer gate+up planes the forward chain parks for the backward
     /// one — the resident graph's memory. Grow-only per layer; ~84 MB a
     /// layer at chunk size, discrete cards only.
@@ -19444,6 +19682,17 @@ struct Scratch {
     /// changes every call has no business in the resident weight ledger
     /// (and its fingerprint is a full pass over 178 MB per call).
     bwt: Option<(wgpu::Buffer, u64)>,
+    // The bake attention backward chain (dedicated: usages differ from
+    // the forward slots).
+    abq: Option<(wgpu::Buffer, u64)>,
+    abk: Option<(wgpu::Buffer, u64)>,
+    abv: Option<(wgpu::Buffer, u64)>,
+    abdo: Option<(wgpu::Buffer, u64)>,
+    abdq: Option<(wgpu::Buffer, u64)>,
+    abdk: Option<(wgpu::Buffer, u64)>,
+    abdv: Option<(wgpu::Buffer, u64)>,
+    abstat: Option<(wgpu::Buffer, u64)>,
+    abst: Option<(wgpu::Buffer, u64)>,
     by: Option<(wgpu::Buffer, u64)>,
     vcx: Option<(wgpu::Buffer, u64)>,
     vcc: Option<(wgpu::Buffer, u64)>,
@@ -20503,9 +20752,12 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let bake_silu_bwd = plain(BAKE_SILU_BWD_SRC, "bake-silu-bwd", "bake_silu_bwd");
     let bake_gelu = plain(BAKE_GELU_SRC, "bake-gelu", "bake_gelu_mul");
     let bake_gelu_bwd = plain(BAKE_GELU_BWD_SRC, "bake-gelu-bwd", "bake_gelu_bwd");
+    let bake_mask_grad = plain(BAKE_MASKGRAD_SRC, "bake-mask-grad", "bake_mask_grad");
     let bake_qkr = plain(BAKE_QKR_SRC, "bake-qkr", "bake_qkr");
     let bake_attn_head = plain(BAKE_ATTN_SRC, "bake-attn", "bake_attn_head");
     let bake_attn_gate = plain(BAKE_AGATE_SRC, "bake-agate", "bake_attn_gate");
+    let bake_attn_bwd_q = plain(BAKE_ATTN_BWD_Q_SRC, "bake-attn-bwd-q", "bake_attn_bwd_q");
+    let bake_attn_bwd_kv = plain(BAKE_ATTN_BWD_KV_SRC, "bake-attn-bwd-kv", "bake_attn_bwd_kv");
     let argmax_part = pipe("argmax_part");
     let gdn_step_par = pipe("gdn_step_par");
     let gdn_step_par2 = pipe("gdn_step_par2");
@@ -21225,9 +21477,12 @@ fn init(dev: usize) -> Result<Ctx, String> {
         bake_silu_bwd,
         bake_gelu,
         bake_gelu_bwd,
+        bake_mask_grad,
         bake_qkr,
         bake_attn_head,
         bake_attn_gate,
+        bake_attn_bwd_q,
+        bake_attn_bwd_kv,
         bake_planes: Mutex::new(HashMap::new()),
         argmax_part,
         gdn_step_par,
@@ -60265,6 +60520,168 @@ pub fn attn_chain_f32(
     acts
 }
 
+
+/// The bake attention CORE backward on the card: from the rotated q/k,
+/// v, and the gradient at the head outputs (`dao`, per head, AFTER the
+/// gate's backward), the gradients at q/k (rotated space) and v, under
+/// the forward's window. Declines on shapes the kernels do not take.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_bwd_chain_f32(
+    qrot: &[f32],
+    krot: &[f32],
+    vproj: &[f32],
+    dao: &[f32],
+    b: usize,
+    t: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    window: Option<usize>,
+    dq: &mut [f32],
+    dk: &mut [f32],
+    dv: &mut [f32],
+) -> bool {
+    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") || f32_strict() {
+        return false;
+    }
+    let Some(c) = ctx() else { return false };
+    let n = b * t;
+    let qdim = nh * hd;
+    let kvdim = nkv * hd;
+    if hd > 256
+        || t > 2048
+        || nh % nkv != 0
+        || qrot.len() < n * qdim
+        || krot.len() < n * kvdim
+        || vproj.len() < n * kvdim
+        || dao.len() < n * qdim
+        || dq.len() < n * qdim
+        || dk.len() < n * kvdim
+        || dv.len() < n * kvdim
+    {
+        return false;
+    }
+    let f4 = |x: usize| (x * 4) as u64;
+    let _bake = BAKE_LOCK.lock().unwrap();
+    let mut sc = c.scratch.lock().unwrap();
+    let inb = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+    let outb = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
+    let qb = Scratch::ensure(&c.device, &mut sc.abq, f4(n * qdim), inb, "bake-ab-q");
+    let kb = Scratch::ensure(&c.device, &mut sc.abk, f4(n * kvdim), inb, "bake-ab-k");
+    let vb = Scratch::ensure(&c.device, &mut sc.abv, f4(n * kvdim), inb, "bake-ab-v");
+    let dob = Scratch::ensure(&c.device, &mut sc.abdo, f4(n * qdim), inb, "bake-ab-do");
+    let dqb = Scratch::ensure(&c.device, &mut sc.abdq, f4(n * qdim), outb, "bake-ab-dq");
+    let dkb = Scratch::ensure(&c.device, &mut sc.abdk, f4(n * kvdim), outb, "bake-ab-dk");
+    let dvb = Scratch::ensure(&c.device, &mut sc.abdv, f4(n * kvdim), outb, "bake-ab-dv");
+    let stb = Scratch::ensure(
+        &c.device,
+        &mut sc.abstat,
+        f4(n * nh * 4),
+        wgpu::BufferUsages::STORAGE,
+        "bake-ab-stat",
+    );
+    let o_dq = 0u64;
+    let o_dk = f4(n * qdim).div_ceil(16) * 16;
+    let o_dv = (o_dk + f4(n * kvdim)).div_ceil(16) * 16;
+    let need = o_dv + f4(n * kvdim);
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.abst,
+        need,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "bake-ab-stage",
+    );
+    drop(sc);
+    c.queue.write_buffer(&qb, 0, bytemuck::cast_slice(&qrot[..n * qdim]));
+    c.queue.write_buffer(&kb, 0, bytemuck::cast_slice(&krot[..n * kvdim]));
+    c.queue.write_buffer(&vb, 0, bytemuck::cast_slice(&vproj[..n * kvdim]));
+    c.queue.write_buffer(&dob, 0, bytemuck::cast_slice(&dao[..n * qdim]));
+    let params: [u32; 8] = [
+        t as u32,
+        nh as u32,
+        nkv as u32,
+        hd as u32,
+        b as u32,
+        window.unwrap_or(0) as u32,
+        0,
+        0,
+    ];
+    let u = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("bake-attn-bwd"),
+        });
+    {
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.bake_attn_bwd_q.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &qb),
+                bind_buf(1, &kb),
+                bind_buf(2, &vb),
+                bind_buf(3, &dob),
+                bind_buf(4, &dqb),
+                bind_buf(5, &stb),
+                bind_buf(6, &u),
+            ],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(&c.bake_attn_bwd_q);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(t as u32, (b * nh) as u32, 1);
+    }
+    {
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.bake_attn_bwd_kv.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &qb),
+                bind_buf(1, &kb),
+                bind_buf(2, &vb),
+                bind_buf(3, &dob),
+                bind_buf(4, &stb),
+                bind_buf(5, &dkb),
+                bind_buf(6, &dvb),
+                bind_buf(7, &u),
+            ],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(&c.bake_attn_bwd_kv);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(t as u32, (b * nkv) as u32, 1);
+    }
+    flush_pass(&enc);
+    enc.copy_buffer_to_buffer(&dqb, 0, &stage, o_dq, f4(n * qdim));
+    flush_pass(&enc);
+    enc.copy_buffer_to_buffer(&dkb, 0, &stage, o_dk, f4(n * kvdim));
+    flush_pass(&enc);
+    enc.copy_buffer_to_buffer(&dvb, 0, &stage, o_dv, f4(n * kvdim));
+    submit(c, finish_enc(enc));
+    let slice = stage.slice(..need);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+        return false;
+    }
+    {
+        let Ok(data) = slice.get_mapped_range() else {
+            stage.unmap();
+            return false;
+        };
+        par_copy(&mut dq[..n * qdim], bytemuck::cast_slice(&data[o_dq as usize..(o_dq + f4(n * qdim)) as usize]));
+        par_copy(&mut dk[..n * kvdim], bytemuck::cast_slice(&data[o_dk as usize..(o_dk + f4(n * kvdim)) as usize]));
+        par_copy(&mut dv[..n * kvdim], bytemuck::cast_slice(&data[o_dv as usize..(o_dv + f4(n * kvdim)) as usize]));
+    }
+    stage.unmap();
+    true
+}
+
 /// The frozen FFN's backward as one device chain, fed by the plane the
 /// forward parked: dact = dh2·down, dgu = silu·mul-backward(plane, dact),
 /// dn2 = dgu·gu — one submit, and the only PCIe traffic is dh2 down
@@ -60282,11 +60699,16 @@ pub fn ffn_bwd_chain_f32(
     hsz: usize,
     inter: usize,
     act: crate::fcd_ops::FfnAct,
+    scale: Option<&[f32]>,
+    dmask: Option<&mut [f32]>,
 ) -> bool {
     if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") {
         return false;
     }
     let Some(c) = ctx() else { return false };
+    if scale.is_some_and(|s| s.len() < inter) || dmask.as_ref().is_some_and(|d| d.len() < inter) {
+        return false;
+    }
     let act_bwd_link = match act {
         crate::fcd_ops::FfnAct::Silu => &c.bake_silu_bwd,
         crate::fcd_ops::FfnAct::GeluErf => &c.bake_gelu_bwd,
@@ -60353,16 +60775,33 @@ pub fn ffn_bwd_chain_f32(
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         "bake-y",
     );
+    // Readback plan: dn2, then (Phase A) the mask gradient, 16-aligned.
+    let dm_bytes = (inter * 4) as u64;
+    let dm_off = dn2_bytes.div_ceil(16) * 16;
+    let need = if dmask.is_some() { dm_off + dm_bytes } else { dn2_bytes };
     let stage = Scratch::ensure(
         &c.device,
         &mut sc.bst,
-        dn2_bytes,
+        need,
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         "bake-stage",
+    );
+    // The attention chain's qinv slot is idle here: it holds dm.
+    let dmb = Scratch::ensure(
+        &c.device,
+        &mut sc.biq,
+        dm_bytes.max(16),
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        "bake-qinv",
     );
     drop(sc);
     c.queue
         .write_buffer(&dhb, 0, bytemuck::cast_slice(&dh2[..n * hsz]));
+    static NO_SCALE_B: [u8; 4] = [0; 4];
+    let sbuf = match scale {
+        Some(sv) => const_buf(c, bytemuck::cast_slice(&sv[..inter])),
+        None => const_buf(c, &NO_SCALE_B),
+    };
     let uni = |v: [u32; 4]| {
         c.device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -60399,7 +60838,7 @@ pub fn ffn_bwd_chain_f32(
         let wgs = total.div_ceil(256);
         let gx = wgs.min(32_768);
         let gy = wgs.div_ceil(32_768);
-        let u = uni([inter as u32, total, 0, gx * 256]);
+        let u = uni([inter as u32, total, scale.is_some() as u32, gx * 256]);
         let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &act_bwd_link.get_bind_group_layout(0),
@@ -60408,12 +60847,37 @@ pub fn ffn_bwd_chain_f32(
                 bind_buf(1, &dact),
                 bind_buf(2, &dgu),
                 bind_buf(3, &u),
+                bind_buf(4, &sbuf),
             ],
         });
         let mut pass = begin_pass(&mut enc);
         pass.set_pipeline(act_bwd_link);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(gx, gy, 1);
+    }
+    if dmask.is_some() {
+        // dm[j] = Σ_r dact·act·u from the resident plane (pre-scale, as the
+        // host accumulated it).
+        let u = uni([
+            inter as u32,
+            n as u32,
+            matches!(act, crate::fcd_ops::FfnAct::GeluErf) as u32,
+            0,
+        ]);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.bake_mask_grad.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &plane),
+                bind_buf(1, &dact),
+                bind_buf(2, &dmb),
+                bind_buf(3, &u),
+            ],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(&c.bake_mask_grad);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((inter as u32).div_ceil(256), 1, 1);
     }
     {
         // dn2[n, hsz] = dgu[n, 2·inter] · gu[2·inter, hsz]
@@ -60433,7 +60897,35 @@ pub fn ffn_bwd_chain_f32(
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups((hsz as u32).div_ceil(64), (n as u32).div_ceil(64), 1);
     }
-    readback(c, enc, &ybuf, &stage, dn2_bytes, &mut dn2[..n * hsz])
+    flush_pass(&enc);
+    enc.copy_buffer_to_buffer(&ybuf, 0, &stage, 0, dn2_bytes);
+    if dmask.is_some() {
+        flush_pass(&enc);
+        enc.copy_buffer_to_buffer(&dmb, 0, &stage, dm_off, dm_bytes);
+    }
+    submit(c, finish_enc(enc));
+    let slice = stage.slice(..need);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+        return false;
+    }
+    {
+        let Ok(data) = slice.get_mapped_range() else {
+            stage.unmap();
+            return false;
+        };
+        par_copy(
+            &mut dn2[..n * hsz],
+            bytemuck::cast_slice(&data[..dn2_bytes as usize]),
+        );
+        if let Some(dm) = dmask {
+            dm[..inter].copy_from_slice(bytemuck::cast_slice(
+                &data[dm_off as usize..(dm_off + dm_bytes) as usize],
+            ));
+        }
+    }
+    stage.unmap();
+    true
 }
 
 /// VAE conv2d on the card: same padding, stride 1, direct (no im2col).

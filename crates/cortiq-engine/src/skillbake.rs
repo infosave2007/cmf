@@ -18,7 +18,7 @@
 //! attention branch): the backward walks the residual stream through
 //! the FFN chain only, which is what makes a pure-Rust backward small.
 
-use crate::fcd::{FcdModel, LnFfn, act_bwd_rows, add_into_pooled, pooled_rows, rmsnorm_bwd_pooled, rmsnorm_fwd_pooled};
+use crate::fcd::{AttnW, FcdModel, LnFfn, act_bwd_rows, add_into_pooled, pooled_rows, rmsnorm_bwd_pooled, rmsnorm_fwd_pooled};
 use crate::fcd_ops as ops;
 use crate::sampler::SplitMix64;
 use cortiq_core::CmfModel;
@@ -131,6 +131,20 @@ pub struct BakeHyper {
     /// Score the assistant's answer span of each chat record instead of
     /// every token (or one-token labels). Exclusive with `focus_tokens`.
     pub answer_span: Option<AnswerSpan>,
+    /// Start Phase A from these mask logits (one row per virtual layer,
+    /// e.g. a previous run's archaeology `selected_logits`) instead of
+    /// the uniform init — so a mask trained once can be FCD-polished
+    /// again, or Phase A resumed, in a separate run (`--steps-a 0` keeps it).
+    pub mask_logits: Option<Vec<Vec<f32>>>,
+    /// Patent 2 Soft-Fold compilation: the neurons that survive τ keep
+    /// their LEARNED gain σ(m) (folded into down_proj by the writer) instead
+    /// of being snapped to 1. Evaluation and Phase B then run that exact
+    /// function (σ(m) above τ, 0 below), so what is scored is what ships.
+    pub soft_fold: bool,
+    /// Full-layer FCD: Phase B also trains the attention projections
+    /// (q/k/v/o, the projected head gate) and both norm gains of the FCD
+    /// layers — the notebook's "unfreeze the last N layers entirely".
+    pub fcd_attn: bool,
 }
 
 impl Default for BakeHyper {
@@ -161,6 +175,9 @@ impl Default for BakeHyper {
             focus_tokens: Vec::new(),
             focus_follow_tokens: Vec::new(),
             answer_span: None,
+            mask_logits: None,
+            soft_fold: false,
+            fcd_attn: false,
         }
     }
 }
@@ -195,6 +212,43 @@ pub struct BakeCheckpoint {
     pub sparsity: f64,
     pub accuracy: Option<f64>,
     pub balanced_accuracy: Option<f64>,
+    /// The mask logits at this evaluation — so any iteration's mask can
+    /// be picked after the run (`--mask-from` with a chosen checkpoint).
+    pub logits: Vec<Vec<f32>>,
+}
+
+/// Trained attention + norm masters of a full-layer FCD layer (f32).
+#[derive(Clone)]
+pub struct AttnMasters {
+    /// Fused `[qrows + 2·kvdim, hidden]` (q rows first, then k, then v).
+    pub wqkv: Vec<f32>,
+    /// `[hidden, nh·hd]`.
+    pub wo: Vec<f32>,
+    /// Per-head gate projection `[nh, hidden]` (Spark-X2.5), if the layer has one.
+    pub gproj: Option<Vec<f32>>,
+    pub iln: Vec<f32>,
+    pub pln: Vec<f32>,
+}
+
+/// Their gradients (f64 accumulators), same shapes.
+pub struct AttnGrads {
+    pub wqkv: Vec<f64>,
+    pub wo: Vec<f64>,
+    pub gproj: Option<Vec<f64>>,
+    pub iln: Vec<f64>,
+    pub pln: Vec<f64>,
+}
+
+impl AttnGrads {
+    fn zeros_like(m: &AttnMasters) -> Self {
+        Self {
+            wqkv: vec![0.0; m.wqkv.len()],
+            wo: vec![0.0; m.wo.len()],
+            gproj: m.gproj.as_ref().map(|g| vec![0.0; g.len()]),
+            iln: vec![0.0; m.iln.len()],
+            pln: vec![0.0; m.pln.len()],
+        }
+    }
 }
 
 /// The trained artifacts: everything the defrag writer needs, f32.
@@ -212,6 +266,8 @@ pub struct BakeArtifacts {
     pub gate_up: Vec<Option<(Vec<f32>, Vec<f32>)>>,
     /// Which layers went through Phase B.
     pub fcd_layers: Vec<usize>,
+    /// Trained attention/norm masters (full-layer FCD), per layer.
+    pub attn: Vec<Option<AttnMasters>>,
     /// The trained mask logits, per virtual layer — a CONTINUOUS
     /// per-neuron importance the hard keep flags throw away. The tube
     /// planner ranks and orders neurons by these, not by raw
@@ -369,6 +425,10 @@ struct Pass<'a> {
     focus_follow_tokens: &'a [u32],
     /// Answer-span scoring (see `AnswerSpan`); None = focus/all-token.
     span: Option<&'a AnswerSpan>,
+    /// `hard` gates keep σ(m) above τ instead of snapping to 1 (Soft-Fold).
+    soft_fold: bool,
+    /// Full-layer FCD masters per layer (attention + norms); None = frozen.
+    attn_tr: &'a [Option<AttnMasters>],
 }
 
 /// Raw-pointer carriers for pooled row writes (disjoint ranges per worker).
@@ -482,7 +542,11 @@ impl Pass<'_> {
             .map(|&l| {
                 let s = sigmoid(l);
                 if self.hard {
-                    if s > self.tau { 1.0 } else { 0.0 }
+                    if s > self.tau {
+                        if self.soft_fold { s } else { 1.0 }
+                    } else {
+                        0.0
+                    }
                 } else {
                     s
                 }
@@ -492,10 +556,14 @@ impl Pass<'_> {
 
     fn wts<'b>(&'b self, li: usize, mats: &'b crate::fcd::LayerMats) -> LnFfn<'b> {
         let l = &self.fm.layers[li];
+        let (iln, pln): (&[f32], &[f32]) = match &self.attn_tr[li] {
+            Some(m) => (&m.iln, &m.pln),
+            None => (&l.iln, &l.pln),
+        };
         match &self.ffn[li] {
             Some((g, u, d)) => LnFfn {
-                iln: &l.iln,
-                pln: &l.pln,
+                iln,
+                pln,
                 gate: g,
                 up: u,
                 down: d,
@@ -503,8 +571,8 @@ impl Pass<'_> {
                 gu: None,
             },
             None => LnFfn {
-                iln: &l.iln,
-                pln: &l.pln,
+                iln,
+                pln,
                 gate: &[],
                 up: &[],
                 down: &mats.down,
@@ -573,6 +641,7 @@ impl Pass<'_> {
                 false,
                 layer == last,
                 Some(&gate),
+                true,
             );
             if layer == last {
                 let acts = acts.expect("last FFN boundary requested");
@@ -616,6 +685,7 @@ impl Pass<'_> {
         grad: Option<(
             &mut [Vec<f64>],
             &mut [Option<(Vec<f64>, Vec<f64>, Vec<f64>)>],
+            &mut [Option<AttnGrads>],
         )>,
     ) -> (f64, usize) {
         self.chunk_batch_scored(ids, b, grad, None)
@@ -628,6 +698,7 @@ impl Pass<'_> {
         grad: Option<(
             &mut [Vec<f64>],
             &mut [Option<(Vec<f64>, Vec<f64>, Vec<f64>)>],
+            &mut [Option<AttnGrads>],
         )>,
         mut focus_stats: Option<&mut FocusStats>,
     ) -> (f64, usize) {
@@ -668,7 +739,28 @@ impl Pass<'_> {
             let mats_hold = fm.mats(li).expect("layer mats");
             let wts = self.wts(li, &mats_hold);
             let want = grad.is_some();
-            let (h2, a) = fm.layer_forward_scaled(li, &h, b, t, &wts, false, want, Some(&g));
+            // A frozen layer's backward runs on the card from the plane the
+            // forward parks there; only a trained (Phase-B) layer needs its
+            // gate/up/act planes on the host.
+            let planes_host = !(want && self.ffn[li].is_none());
+            let attn_w = self.attn_tr[li].as_ref().map(|m| AttnW {
+                wqkv: &m.wqkv,
+                wo: &m.wo,
+                head_gate: m.gproj.as_deref(),
+            });
+            let (h2, a) = fm.layer_forward_scaled(
+                li,
+                &h,
+                b,
+                t,
+                &wts,
+                false,
+                want,
+                Some(&g),
+                planes_host,
+                attn_w,
+                want && attn_w.is_some(),
+            );
             h_ins.push(if want { h } else { Vec::new() });
             acts.push(a);
             masks.push(g);
@@ -849,7 +941,7 @@ impl Pass<'_> {
                 }
             }
         }
-        let Some((dmask, dffn)) = grad else {
+        let Some((dmask, dffn, dattn)) = grad else {
             return (nll, scored);
         };
         // Backward: final norm, then the FFN chain layer by layer.
@@ -869,135 +961,348 @@ impl Pass<'_> {
             let inter = fm.layers[li].inter;
             let mats_hold = fm.mats(li).expect("layer mats");
             let wts = self.wts(li, &mats_hold);
-            // h2 = h1 + act2 @ downᵀ  →  dact2 = dh @ down.
-            let mut dact2 = vec![0f32; n * inter];
-            ops::gemm_dx(&dh, wts.down, &mut dact2, n, inter, hsz, fm.pool.as_deref());
-            if let Some((_, _, dd)) = dffn[li].as_mut() {
-                // dW_down += dhᵀ · act2 (act2 = act·g).
-                let mut act2 = a.act.clone();
+            let mut dn2 = vec![0f32; n * hsz];
+            let mut device_done = false;
+            #[cfg(feature = "gpu")]
+            if a.act.is_empty() && dffn[li].is_none() {
+                if let Some(gu) = wts.gu {
+                    // Phase A on the card: dact = dh·down, the mask gradient
+                    // from the resident plane, dgu through the act link
+                    // with the gate folded in, dn2 = dgu·gu. Only dn2 and
+                    // dm[inter] come back.
+                    let mut dm_dev = vec![0f32; inter];
+                    if crate::gpu_wgpu::ffn_bwd_chain_f32(
+                        &dh, wts.down, gu, li, &mut dn2, n, hsz, inter, fm.act, Some(g), Some(&mut dm_dev),
+                    ) {
+                        for (d, &x) in dmask[vl].iter_mut().zip(&dm_dev) {
+                            *d += x as f64;
+                        }
+                        device_done = true;
+                    }
+                }
+            }
+            if !device_done {
+                assert!(
+                    !a.act.is_empty(),
+                    "layer {li}: the forward left its FFN plane on the device but the device backward declined"
+                );
+                // h2 = h1 + act2 @ downᵀ  →  dact2 = dh @ down.
+                let mut dact2 = vec![0f32; n * inter];
+                ops::gemm_dx(&dh, wts.down, &mut dact2, n, inter, hsz, fm.pool.as_deref());
+                if let Some((_, _, dd)) = dffn[li].as_mut() {
+                    // dW_down += dhᵀ · act2 (act2 = act·g).
+                    let mut act2 = a.act.clone();
+                    {
+                        let ap = SendMutF(act2.as_mut_ptr());
+                        pooled_rows(n, pool, &|lo, hi| {
+                            // SAFETY: disjoint row ranges per worker.
+                            let rows = unsafe { std::slice::from_raw_parts_mut(ap.at(lo * inter), (hi - lo) * inter) };
+                            for row in rows.chunks_exact_mut(inter) {
+                                for (x, &gv) in row.iter_mut().zip(g) {
+                                    *x *= gv;
+                                }
+                            }
+                        });
+                    }
+                    let mut dw = vec![0f32; hsz * inter];
+                    ops::gemm_dw(&dh, &act2, &mut dw, n, inter, hsz, fm.pool.as_deref());
+                    for (o, &x) in dd.iter_mut().zip(&dw) {
+                        *o += x as f64;
+                    }
+                }
+                // Mask grad: dm = Σ_t dact2·act · σ'(m)  (soft; STE-equal).
+                // Indexed by the VIRTUAL layer: each visit's mask row gets
+                // exactly its own visit's gradient, no cross-visit sum.
                 {
-                    let ap = SendMutF(act2.as_mut_ptr());
-                    pooled_rows(n, pool, &|lo, hi| {
-                        // SAFETY: disjoint row ranges per worker.
-                        let rows = unsafe { std::slice::from_raw_parts_mut(ap.at(lo * inter), (hi - lo) * inter) };
-                        for row in rows.chunks_exact_mut(inter) {
-                            for (x, &gv) in row.iter_mut().zip(g) {
-                                *x *= gv;
+                    let dm = &mut dmask[vl];
+                    // Parallel over neuron ranges: each worker owns a column
+                    // span of dm and walks every row for it.
+                    let dmp = SendMutF64(dm.as_mut_ptr());
+                    let (dact2_r, act_r) = (&dact2, &a.act);
+                    pooled_rows(inter.div_ceil(256), pool, &|lo, hi| {
+                        let (js, je) = (lo * 256, (hi * 256).min(inter));
+                        // SAFETY: disjoint column ranges per worker.
+                        let dmj = unsafe { std::slice::from_raw_parts_mut(dmp.at(js), je - js) };
+                        for r in 0..n {
+                            let da = &dact2_r[r * inter + js..r * inter + je];
+                            let aa = &act_r[r * inter + js..r * inter + je];
+                            for ((d, &x), &y) in dmj.iter_mut().zip(da).zip(aa) {
+                                *d += x as f64 * y as f64;
                             }
                         }
                     });
-                }
-                let mut dw = vec![0f32; hsz * inter];
-                ops::gemm_dw(&dh, &act2, &mut dw, n, inter, hsz, fm.pool.as_deref());
-                for (o, &x) in dd.iter_mut().zip(&dw) {
-                    *o += x as f64;
-                }
-            }
-            // Mask grad: dm = Σ_t dact2·act · σ'(m)  (soft; STE-equal).
-            // Indexed by the VIRTUAL layer: each visit's mask row gets
-            // exactly its own visit's gradient, no cross-visit sum.
-            {
-                let dm = &mut dmask[vl];
-                // Parallel over neuron ranges: each worker owns a column
-                // span of dm and walks every row for it.
-                let dmp = SendMutF64(dm.as_mut_ptr());
-                let (dact2_r, act_r) = (&dact2, &a.act);
-                pooled_rows(inter.div_ceil(256), pool, &|lo, hi| {
-                    let (js, je) = (lo * 256, (hi * 256).min(inter));
-                    // SAFETY: disjoint column ranges per worker.
-                    let dmj = unsafe { std::slice::from_raw_parts_mut(dmp.at(js), je - js) };
-                    for r in 0..n {
-                        let da = &dact2_r[r * inter + js..r * inter + je];
-                        let aa = &act_r[r * inter + js..r * inter + je];
-                        for ((d, &x), &y) in dmj.iter_mut().zip(da).zip(aa) {
-                            *d += x as f64 * y as f64;
-                        }
+                    // σ'(m) folded in once per chunk (constant per neuron).
+                    for (j, d) in dm.iter_mut().enumerate() {
+                        let _ = j;
+                        let _ = d;
                     }
-                });
-                // σ'(m) folded in once per chunk (constant per neuron).
-                for (j, d) in dm.iter_mut().enumerate() {
-                    let _ = j;
-                    let _ = d;
                 }
-            }
-            // dact = dact2 · g;  act·mul backward (pooled).
-            let mut dg_pre = vec![0f32; n * inter];
-            let mut du_pre = vec![0f32; n * inter];
-            act_bwd_rows(
-                fm.act,
-                &a.gpre,
-                &a.upre,
-                &dact2,
-                Some(g),
-                &mut dg_pre,
-                &mut du_pre,
-                n,
-                inter,
-                fm.pool.as_deref(),
-            );
-            // dn2 = dg_pre @ gate + du_pre @ up — one fused submit when
-            // the frozen concat exists; the trained-copy path keeps two.
-            let mut dn2 = vec![0f32; n * hsz];
-            if let Some(gu) = wts.gu {
-                let mut dgu = vec![0f32; n * 2 * inter];
-                {
-                    let gp = SendMutF(dgu.as_mut_ptr());
-                    let (dgr, dur) = (&dg_pre, &du_pre);
-                    pooled_rows(n, pool, &|lo, hi| {
-                        for r in lo..hi {
-                            // SAFETY: disjoint rows per worker.
-                            let row = unsafe { std::slice::from_raw_parts_mut(gp.at(r * 2 * inter), 2 * inter) };
-                            row[..inter].copy_from_slice(&dgr[r * inter..(r + 1) * inter]);
-                            row[inter..].copy_from_slice(&dur[r * inter..(r + 1) * inter]);
-                        }
-                    });
-                }
-                ops::gemm_dx(&dgu, gu, &mut dn2, n, hsz, 2 * inter, fm.pool.as_deref());
-            } else {
-                ops::gemm_dx(
-                    &dg_pre,
-                    wts.gate,
-                    &mut dn2,
+                // dact = dact2 · g;  act·mul backward (pooled).
+                let mut dg_pre = vec![0f32; n * inter];
+                let mut du_pre = vec![0f32; n * inter];
+                act_bwd_rows(
+                    fm.act,
+                    &a.gpre,
+                    &a.upre,
+                    &dact2,
+                    Some(g),
+                    &mut dg_pre,
+                    &mut du_pre,
                     n,
-                    hsz,
                     inter,
                     fm.pool.as_deref(),
                 );
-                let mut dn2b = vec![0f32; n * hsz];
-                ops::gemm_dx(
-                    &du_pre,
-                    wts.up,
-                    &mut dn2b,
-                    n,
-                    hsz,
-                    inter,
-                    fm.pool.as_deref(),
-                );
-                for (x, &y) in dn2.iter_mut().zip(&dn2b) {
-                    *x += y;
+                // dn2 = dg_pre @ gate + du_pre @ up — one fused submit when
+                // the frozen concat exists; the trained-copy path keeps two.
+                if let Some(gu) = wts.gu {
+                    let mut dgu = vec![0f32; n * 2 * inter];
+                    {
+                        let gp = SendMutF(dgu.as_mut_ptr());
+                        let (dgr, dur) = (&dg_pre, &du_pre);
+                        pooled_rows(n, pool, &|lo, hi| {
+                            for r in lo..hi {
+                                // SAFETY: disjoint rows per worker.
+                                let row = unsafe { std::slice::from_raw_parts_mut(gp.at(r * 2 * inter), 2 * inter) };
+                                row[..inter].copy_from_slice(&dgr[r * inter..(r + 1) * inter]);
+                                row[inter..].copy_from_slice(&dur[r * inter..(r + 1) * inter]);
+                            }
+                        });
+                    }
+                    ops::gemm_dx(&dgu, gu, &mut dn2, n, hsz, 2 * inter, fm.pool.as_deref());
+                } else {
+                    ops::gemm_dx(
+                        &dg_pre,
+                        wts.gate,
+                        &mut dn2,
+                        n,
+                        hsz,
+                        inter,
+                        fm.pool.as_deref(),
+                    );
+                    let mut dn2b = vec![0f32; n * hsz];
+                    ops::gemm_dx(
+                        &du_pre,
+                        wts.up,
+                        &mut dn2b,
+                        n,
+                        hsz,
+                        inter,
+                        fm.pool.as_deref(),
+                    );
+                    for (x, &y) in dn2.iter_mut().zip(&dn2b) {
+                        *x += y;
+                    }
+                }
+                if let Some((dgw, duw, _)) = dffn[li].as_mut() {
+                    let mut dw = vec![0f32; inter * hsz];
+                    ops::gemm_dw(&dg_pre, &a.n2, &mut dw, n, hsz, inter, fm.pool.as_deref());
+                    for (o, &x) in dgw.iter_mut().zip(&dw) {
+                        *o += x as f64;
+                    }
+                    dw.fill(0.0);
+                    ops::gemm_dw(&du_pre, &a.n2, &mut dw, n, hsz, inter, fm.pool.as_deref());
+                    for (o, &x) in duw.iter_mut().zip(&dw) {
+                        *o += x as f64;
+                    }
                 }
             }
-            if let Some((dgw, duw, _)) = dffn[li].as_mut() {
-                let mut dw = vec![0f32; inter * hsz];
-                ops::gemm_dw(&dg_pre, &a.n2, &mut dw, n, hsz, inter, fm.pool.as_deref());
-                for (o, &x) in dgw.iter_mut().zip(&dw) {
-                    *o += x as f64;
-                }
-                dw.fill(0.0);
-                ops::gemm_dw(&du_pre, &a.n2, &mut dw, n, hsz, inter, fm.pool.as_deref());
-                for (o, &x) in duw.iter_mut().zip(&dw) {
-                    *o += x as f64;
-                }
-            }
-            // Post-norm backward into h1; the attention branch carries
-            // no gradient (frozen), so dh1 flows straight to dh_in.
+            // Post-norm backward into h1; a frozen attention branch carries
+            // no gradient, so dh1 flows straight to dh_in.
             let mut dh1 = dh.clone(); // residual h2 = h1 + ffn
             rmsnorm_bwd_pooled(&a.h1, wts.pln, &a.inv2, &dn2, fm.gemma, &mut dh1, pool);
+            if let (Some(m), Some(dg)) = (&self.attn_tr[li], dattn[li].as_mut()) {
+                // Full-layer FCD: through the trained attention — post-norm
+                // gain, o_proj, the head gate, the attention core (device),
+                // RoPE, q/k/v projections, the input norm — into dh_in.
+                norm_gain_grad(&a.h1, &a.inv2, &dn2, &mut dg.pln, pool);
+                let dh_attn = self.attn_backward(li, vl, &h_ins[vl], a, &dh1, m, dg, b, t);
+                add_into_pooled(&mut dh1, &dh_attn, pool);
+            }
             dh = dh1;
-            let _ = &h_ins[vl];
         }
         crate::fcd::prof::add(&crate::fcd::prof::BWD, t_bwd);
         (nll, scored)
+    }
+}
+
+
+/// dw[j] = Σ_r dy[r,j]·x[r,j]·inv[r] — the RMSNorm gain gradient (Qwen
+/// style), pooled over column spans.
+fn norm_gain_grad(x: &[f32], inv: &[f32], dy: &[f32], dw: &mut [f64], pool: Option<&crate::pool::Pool>) {
+    let d = dw.len();
+    let n = x.len() / d;
+    let dp = SendMutF64(dw.as_mut_ptr());
+    pooled_rows(d.div_ceil(64), pool, &|lo, hi| {
+        let (js, je) = (lo * 64, (hi * 64).min(d));
+        // SAFETY: disjoint column spans per worker.
+        let out = unsafe { std::slice::from_raw_parts_mut(dp.at(js), je - js) };
+        for r in 0..n {
+            let inv_r = inv[r] as f64;
+            for (o, j) in out.iter_mut().zip(js..je) {
+                *o += dy[r * d + j] as f64 * x[r * d + j] as f64 * inv_r;
+            }
+        }
+    });
+}
+
+impl Pass<'_> {
+    /// The attention branch's backward for a full-layer FCD layer: from
+    /// `dattn` (the gradient at attn_out) to the gradient at h_in through
+    /// the attention path, accumulating the trained weights' gradients.
+    #[allow(clippy::too_many_arguments)]
+    fn attn_backward(
+        &self,
+        li: usize,
+        _vl: usize,
+        h_in: &[f32],
+        a: &crate::fcd::LayerActs,
+        dattn: &[f32],
+        m: &AttnMasters,
+        dg: &mut AttnGrads,
+        b: usize,
+        t: usize,
+    ) -> Vec<f32> {
+        let fm = self.fm;
+        let pool = fm.pool.as_deref();
+        let (hsz, nh, nkv, hd) = (fm.hidden, fm.nh, fm.nkv, fm.hd);
+        let n = b * t;
+        let (qdim, kvdim) = (nh * hd, nkv * hd);
+        let (window, local) = fm.attn_geometry(li).expect("full-layer FCD on a non-attention layer");
+        let (qrot, krot, vproj, ao, head_gain) = a
+            .attn_full()
+            .expect("full-layer FCD needs the attention activations");
+        // n1: the normed input the projections read (recomputed from h_in).
+        let mut n1 = vec![0f32; n * hsz];
+        let mut inv1 = vec![0f32; n];
+        rmsnorm_fwd_pooled(h_in, &m.iln, fm.eps, fm.gemma, &mut n1, &mut inv1, pool);
+        // ao_eff = ao ⊙ gain; dWo += dattnᵀ·ao_eff; dao_eff = dattn·Wo.
+        let mut ao_eff = ao.to_vec();
+        if !head_gain.is_empty() {
+            for r in 0..n {
+                for h in 0..nh {
+                    let gain = head_gain[r * nh + h];
+                    for x in &mut ao_eff[r * qdim + h * hd..r * qdim + (h + 1) * hd] {
+                        *x *= gain;
+                    }
+                }
+            }
+        }
+        {
+            let mut dw = vec![0f32; hsz * qdim];
+            ops::gemm_dw(dattn, &ao_eff, &mut dw, n, qdim, hsz, pool);
+            for (o, &x) in dg.wo.iter_mut().zip(&dw) {
+                *o += x as f64;
+            }
+        }
+        let mut dao_eff = vec![0f32; n * qdim];
+        ops::gemm_dx(dattn, &m.wo, &mut dao_eff, n, qdim, hsz, pool);
+        // Head gate: dao = dao_eff·gain; dgain = Σ_c dao_eff·ao; dgraw = dgain·σ′.
+        let mut dn1 = vec![0f32; n * hsz];
+        let mut dao = dao_eff;
+        if let (Some(gw), Some(dgw)) = (&m.gproj, dg.gproj.as_mut()) {
+            let mut dgraw = vec![0f32; n * nh];
+            for r in 0..n {
+                for h in 0..nh {
+                    let gain = head_gain[r * nh + h];
+                    let s = r * qdim + h * hd;
+                    let mut dgain = 0f32;
+                    for c in 0..hd {
+                        dgain += dao[s + c] * ao[s + c];
+                        dao[s + c] *= gain;
+                    }
+                    dgraw[r * nh + h] = dgain * gain * (1.0 - gain);
+                }
+            }
+            let mut dw = vec![0f32; nh * hsz];
+            ops::gemm_dw(&dgraw, &n1, &mut dw, n, hsz, nh, pool);
+            for (o, &x) in dgw.iter_mut().zip(&dw) {
+                *o += x as f64;
+            }
+            ops::gemm_dx(&dgraw, gw, &mut dn1, n, hsz, nh, pool);
+        }
+        // Attention core: dq/dk (rotated space), dv — device chain, host fallback.
+        let mut dqrot = vec![0f32; n * qdim];
+        let mut dkrot = vec![0f32; n * kvdim];
+        let mut dvproj = vec![0f32; n * kvdim];
+        let mut done = false;
+        #[cfg(feature = "gpu")]
+        {
+            done = crate::gpu_wgpu::attn_bwd_chain_f32(
+                qrot, krot, vproj, &dao, b, t, nh, nkv, hd, window, &mut dqrot, &mut dkrot, &mut dvproj,
+            );
+        }
+        if !done {
+            let rep = nh / nkv;
+            for bi in 0..b {
+                for h in 0..nh {
+                    let g = h / rep;
+                    let mut q64 = vec![0f64; t * hd];
+                    let mut k64 = vec![0f64; t * hd];
+                    let mut v64 = vec![0f64; t * hd];
+                    let mut do64 = vec![0f64; t * hd];
+                    for p in 0..t {
+                        let r = bi * t + p;
+                        for c in 0..hd {
+                            q64[p * hd + c] = qrot[r * qdim + h * hd + c] as f64;
+                            k64[p * hd + c] = krot[r * kvdim + g * hd + c] as f64;
+                            v64[p * hd + c] = vproj[r * kvdim + g * hd + c] as f64;
+                            do64[p * hd + c] = dao[r * qdim + h * hd + c] as f64;
+                        }
+                    }
+                    let mut dq = vec![0f64; t * hd];
+                    let mut dk = vec![0f64; t * hd];
+                    let mut dv = vec![0f64; t * hd];
+                    ops::attn_head_bwd_window(&q64, &k64, &v64, &do64, t, hd, hd, window, &mut dq, &mut dk, &mut dv);
+                    for p in 0..t {
+                        let r = bi * t + p;
+                        for c in 0..hd {
+                            dqrot[r * qdim + h * hd + c] += dq[p * hd + c] as f32;
+                            dkrot[r * kvdim + g * hd + c] += dk[p * hd + c] as f32;
+                            dvproj[r * kvdim + g * hd + c] += dv[p * hd + c] as f32;
+                        }
+                    }
+                }
+            }
+        }
+        // RoPE backward (no qk-norm on these layers), per head.
+        let (rotary_dim, inv_freq) = fm.layer_rope(local);
+        for r in 0..n {
+            let pos = r % t;
+            for h in 0..nh {
+                let s = r * qdim + h * hd;
+                ops::rope_bwd(&mut dqrot[s..s + rotary_dim], pos, inv_freq);
+            }
+            for g in 0..nkv {
+                let s = r * kvdim + g * hd;
+                ops::rope_bwd(&mut dkrot[s..s + rotary_dim], pos, inv_freq);
+            }
+        }
+        // dqkv = [dq | dk | dv]; dWqkv += dqkvᵀ·n1; dn1 += dqkv·Wqkv.
+        let fused = qdim + 2 * kvdim;
+        let mut dqkv = vec![0f32; n * fused];
+        for r in 0..n {
+            let row = &mut dqkv[r * fused..(r + 1) * fused];
+            row[..qdim].copy_from_slice(&dqrot[r * qdim..(r + 1) * qdim]);
+            row[qdim..qdim + kvdim].copy_from_slice(&dkrot[r * kvdim..(r + 1) * kvdim]);
+            row[qdim + kvdim..].copy_from_slice(&dvproj[r * kvdim..(r + 1) * kvdim]);
+        }
+        {
+            let mut dw = vec![0f32; fused * hsz];
+            ops::gemm_dw(&dqkv, &n1, &mut dw, n, hsz, fused, pool);
+            for (o, &x) in dg.wqkv.iter_mut().zip(&dw) {
+                *o += x as f64;
+            }
+        }
+        {
+            let mut dx = vec![0f32; n * hsz];
+            ops::gemm_dx(&dqkv, &m.wqkv, &mut dx, n, hsz, fused, pool);
+            add_into_pooled(&mut dn1, &dx, pool);
+        }
+        // Input norm: gain gradient + through-grad into h_in.
+        norm_gain_grad(h_in, &inv1, &dn1, &mut dg.iln, pool);
+        let mut dh_in = vec![0f32; n * hsz];
+        rmsnorm_bwd_pooled(h_in, &m.iln, &inv1, &dn1, fm.gemma, &mut dh_in, pool);
+        dh_in
     }
 }
 
@@ -1335,6 +1640,7 @@ pub fn replica_score_file_mask(
     let vn = nl * loops;
     let inter = fm.layers[0].inter;
     let ffn: Vec<Option<(Vec<f32>, Vec<f32>, Vec<f32>)>> = vec![None; nl];
+    let no_attn: Vec<Option<AttnMasters>> = vec![None; ffn.len()];
     // Binary mask → logits at ±50: σ crosses any τ exactly as the bit says.
     let task = &model.masks.default_task;
     let mask = model
@@ -1371,6 +1677,8 @@ pub fn replica_score_file_mask(
             focus_tokens: &[],
             focus_follow_tokens: &[],
             span: None,
+            soft_fold: false,
+            attn_tr: &no_attn,
         };
         held_ppl(&pass, chunks)
     };
@@ -1429,6 +1737,8 @@ pub fn skill_bake(
             focus_tokens: &hy.focus_tokens,
             focus_follow_tokens: &hy.focus_follow_tokens,
             span: hy.answer_span.as_ref(),
+            soft_fold: hy.soft_fold,
+            attn_tr: &attn_tr,
         };
         let score = held_score(&pass, &held);
         let keep: Vec<Vec<bool>> = fm
@@ -1459,6 +1769,7 @@ pub fn skill_bake(
             down: vec![Vec::new(); nl],
             gate_up: vec![None; nl],
             fcd_layers: Vec::new(),
+            attn: (0..nl).map(|_| None).collect(),
             logits: logits.clone(),
             final_logits: logits,
             checkpoints: Vec::new(),
@@ -1505,8 +1816,23 @@ pub fn skill_bake(
     let m0 = mask_init_logit_for(loops, hy.mask_init);
     // One mask row per VIRTUAL layer: nl × loops. Unlooped: vn == nl.
     let vn = nl * loops;
-    let mut logits: Vec<Vec<f32>> = vec![vec![m0; inter]; vn];
+    let mut logits: Vec<Vec<f32>> = match &hy.mask_logits {
+        Some(m) => {
+            if m.len() != vn || m.iter().any(|row| row.len() != inter) {
+                return Err(format!(
+                    "skill bake: --mask-from has {} rows of {} logits; this model needs {vn} × {inter}",
+                    m.len(),
+                    m.first().map(Vec::len).unwrap_or(0)
+                ));
+            }
+            log(&format!("mask: resuming from {} supplied logit rows", m.len()));
+            m.clone()
+        }
+        None => vec![vec![m0; inter]; vn],
+    };
     let mut ffn: Vec<Option<(Vec<f32>, Vec<f32>, Vec<f32>)>> = vec![None; nl];
+    // Full-layer FCD masters (attention + norms), filled before Phase B.
+    let mut attn_tr: Vec<Option<AttnMasters>> = vec![None; nl];
 
     // Baseline (no mask): even σ(m0) is not exactly 1, so measure with
     // gates forced open via hard mask over +∞… simplest: logits +50.
@@ -1520,6 +1846,8 @@ pub fn skill_bake(
         focus_tokens: &hy.focus_tokens,
         focus_follow_tokens: &hy.focus_follow_tokens,
         span: hy.answer_span.as_ref(),
+            soft_fold: hy.soft_fold,
+            attn_tr: &attn_tr,
     };
     let backbone_score = held_score(&base_pass, &held);
     let backbone = backbone_score.ppl;
@@ -1567,6 +1895,7 @@ pub fn skill_bake(
         let (batch_ids, batch) = calibration_batch(&calib, step, hy.batch)?;
         let mut dmask: Vec<Vec<f64>> = vec![vec![0.0; inter]; vn];
         let mut dffn: Vec<Option<(Vec<f64>, Vec<f64>, Vec<f64>)>> = vec![None; nl];
+        let mut dattn: Vec<Option<AttnGrads>> = (0..nl).map(|_| None).collect();
         let pass = Pass {
             fm: &fm,
             tau: hy.tau,
@@ -1576,8 +1905,10 @@ pub fn skill_bake(
             focus_tokens: &hy.focus_tokens,
             focus_follow_tokens: &hy.focus_follow_tokens,
             span: hy.answer_span.as_ref(),
+            soft_fold: hy.soft_fold,
+            attn_tr: &attn_tr,
         };
-        let _ = pass.chunk_batch(&batch_ids, batch, Some((&mut dmask, &mut dffn)));
+        let _ = pass.chunk_batch(&batch_ids, batch, Some((&mut dmask, &mut dffn, &mut dattn)));
         // Fold σ'(m) into the mask grads + add the L1 term.
         let l1_per = l1 / (inter as f64 * nl as f64);
         for li in 0..vn {
@@ -1615,6 +1946,8 @@ pub fn skill_bake(
                 focus_tokens: &hy.focus_tokens,
                 focus_follow_tokens: &hy.focus_follow_tokens,
                 span: hy.answer_span.as_ref(),
+            soft_fold: hy.soft_fold,
+            attn_tr: &attn_tr,
             };
             crate::gpu::bake_precision_strict(false);
             let hs = held_score(&pass, &held);
@@ -1666,6 +1999,7 @@ pub fn skill_bake(
                 sparsity: sp,
                 accuracy: hs.accuracy,
                 balanced_accuracy: hs.balanced_accuracy,
+                logits: logits.clone(),
             });
             // Best checkpoint selection: respect target_sparsity and any
             // caller-declared natural-distribution quality guards. The
@@ -1703,6 +2037,16 @@ pub fn skill_bake(
                     best = (hp, Some(logits.clone()), sp);
                     best_step = step + 1;
                 }
+            } else if eligible && hy.checkpoint_accuracy && hy.answer_span.is_some() {
+                // Answer-span mode: the held-out token accuracy of the hard
+                // mask decides (the experiments' soft/hard accuracy gate),
+                // PPL breaks ties.
+                let acc = hs.accuracy.unwrap_or(f64::NEG_INFINITY);
+                if acc > best_accuracy || (acc == best_accuracy && hp < best.0) {
+                    best_accuracy = acc;
+                    best = (hp, Some(logits.clone()), sp);
+                    best_step = step + 1;
+                }
             } else if eligible && hp < best.0 {
                 best = (hp, Some(logits.clone()), sp);
                 best_step = step + 1;
@@ -1711,10 +2055,7 @@ pub fn skill_bake(
                 "  [A] step {}: L1={l1:.3} pruned={:.2}% hard-PPL={hp:.3}{} (bottom {}@{:.2}%) [fwd+bwd {:.1}s, adam {:.2}s per step]",
                 step + 1,
                 sp * 100.0,
-                hs.accuracy
-                    .zip(hs.balanced_accuracy)
-                    .map(|(a, b)| format!(" acc={:.2}% bal={:.2}%", a * 100.0, b * 100.0))
-                    .unwrap_or_default(),
+                score_suffix(&hs),
                 if best.0 == f64::MAX {
                     "—".to_string()
                 } else {
@@ -1789,13 +2130,15 @@ pub fn skill_bake(
         focus_tokens: &hy.focus_tokens,
         focus_follow_tokens: &hy.focus_follow_tokens,
         span: hy.answer_span.as_ref(),
+            soft_fold: hy.soft_fold,
+            attn_tr: &attn_tr,
     };
     // With no mask-training steps the hard mask is still exactly all-open,
     // so rescoring the same validation batch is pure duplicate work.  This
     // matters for focused 512-token records where one gate can take minutes
     // on a laptop, and keeps short FCD sweeps practical without changing a
     // single number.
-    let masked_score = if hy.steps_a == 0 {
+    let masked_score = if hy.steps_a == 0 && hy.mask_logits.is_none() {
         backbone_score.clone()
     } else {
         held_score(&pass, &held)
@@ -1819,12 +2162,33 @@ pub fn skill_bake(
                 .map_err(|e| format!("phase-B down: {e}"))?,
         ));
     }
+    if hy.fcd_attn {
+        for &li in &fcd {
+            if fm.attn_geometry(li).is_none() {
+                return Err(format!("--fcd-attn: layer {li} is not a softmax-attention layer"));
+            }
+            let mats = fm.mats(li)?;
+            attn_tr[li] = Some(AttnMasters {
+                wqkv: mats.wqkv.clone(),
+                wo: mats.wo.clone(),
+                gproj: fm.head_gate_weights(li).map(<[f32]>::to_vec),
+                iln: fm.layers[li].iln.clone(),
+                pln: fm.layers[li].pln.clone(),
+            });
+        }
+        log(&format!("[B] full-layer FCD: attention + norms of {} layer(s) train too", fcd.len()));
+    }
     let sizes: Vec<usize> = fcd
         .iter()
         .flat_map(|&li| {
             let (g, u, d) = ffn[li].as_ref().expect("phase-B masters");
-            [g.len(), u.len(), d.len()]
+            let mut v = vec![g.len(), u.len(), d.len()];
+            if let Some(m) = &attn_tr[li] {
+                v.extend([m.wqkv.len(), m.wo.len(), m.gproj.as_ref().map_or(0, Vec::len), m.iln.len(), m.pln.len()]);
+            }
+            v
         })
+        .filter(|&n| n > 0)
         .collect();
     let mut adam_b = Adam::new(&sizes, hy.lr_b);
     // The mask-only model is a real checkpoint too. If every FCD eval is
@@ -1834,6 +2198,7 @@ pub fn skill_bake(
         HeldScore,
         Option<Vec<Option<(Vec<f32>, Vec<f32>, Vec<f32>)>>>,
     ) = (masked_score.clone(), Some(vec![None; nl]));
+    let mut best_attn: Vec<Option<AttnMasters>> = attn_tr.clone();
     let cached_phase_b =
         hy.steps_b > 0 && fcd.len() == 1 && loops == 1 && !hy.focus_tokens.is_empty();
     if cached_phase_b {
@@ -1847,6 +2212,8 @@ pub fn skill_bake(
             focus_tokens: &hy.focus_tokens,
             focus_follow_tokens: &hy.focus_follow_tokens,
             span: hy.answer_span.as_ref(),
+            soft_fold: hy.soft_fold,
+            attn_tr: &attn_tr,
         };
         log(&format!(
             "[B-cache] extracting native CMF boundaries: {} train + {} held records",
@@ -1949,6 +2316,7 @@ pub fn skill_bake(
                 };
                 if better {
                     best_b = (cur.clone(), Some(ffn.clone()));
+                    best_attn = attn_tr.clone();
                 }
                 log(&format!(
                     "  [B-cache] step {}: held-PPL {:.3} acc={:.2}% bal={:.2}% (best {:.3})",
@@ -1971,6 +2339,8 @@ pub fn skill_bake(
                     })
                 })
                 .collect();
+            let mut dattn: Vec<Option<AttnGrads>> =
+                attn_tr.iter().map(|m| m.as_ref().map(AttnGrads::zeros_like)).collect();
             let pass = Pass {
                 fm: &fm,
                 tau: hy.tau,
@@ -1980,14 +2350,17 @@ pub fn skill_bake(
                 focus_tokens: &hy.focus_tokens,
                 focus_follow_tokens: &hy.focus_follow_tokens,
                 span: hy.answer_span.as_ref(),
+            soft_fold: hy.soft_fold,
+            attn_tr: &attn_tr,
             };
-            let _ = pass.chunk_batch(&batch_ids, batch, Some((&mut dmask, &mut dffn)));
+            let _ = pass.chunk_batch(&batch_ids, batch, Some((&mut dmask, &mut dffn, &mut dattn)));
             // Cosine LR.
             let lr_scale =
                 0.5 * (1.0 + (std::f64::consts::PI * step as f64 / hy.steps_b as f64).cos());
             let first_fcd = fcd[0];
             let mut params: Vec<&mut [f32]> = Vec::new();
             let mut grads: Vec<Vec<f64>> = Vec::new();
+            let attn_tr_slots = &mut attn_tr[first_fcd..];
             for (off, slot) in ffn[first_fcd..].iter_mut().enumerate() {
                 let li = first_fcd + off;
                 let Some((g, u, d)) = slot.as_mut() else {
@@ -2000,6 +2373,20 @@ pub fn skill_bake(
                 grads.push(du);
                 params.push(d.as_mut_slice());
                 grads.push(dd);
+                if let (Some(m), Some(ag)) = (attn_tr_slots[off].as_mut(), dattn[li].take()) {
+                    params.push(m.wqkv.as_mut_slice());
+                    grads.push(ag.wqkv);
+                    params.push(m.wo.as_mut_slice());
+                    grads.push(ag.wo);
+                    if let (Some(gp), Some(dgp)) = (m.gproj.as_mut(), ag.gproj) {
+                        params.push(gp.as_mut_slice());
+                        grads.push(dgp);
+                    }
+                    params.push(m.iln.as_mut_slice());
+                    grads.push(ag.iln);
+                    params.push(m.pln.as_mut_slice());
+                    grads.push(ag.pln);
+                }
             }
             // Same visit normalisation as Phase A: dffn accumulates every
             // visit of a physical layer, and an FFN update perturbs BOTH
@@ -2016,9 +2403,15 @@ pub fn skill_bake(
                     focus_tokens: &hy.focus_tokens,
                     focus_follow_tokens: &hy.focus_follow_tokens,
                     span: hy.answer_span.as_ref(),
+            soft_fold: hy.soft_fold,
+            attn_tr: &attn_tr,
                 };
                 let cur = held_score(&pass, &held);
-                let better = if hy.checkpoint_accuracy && !hy.focus_tokens.is_empty() {
+                let better = if hy.checkpoint_accuracy && hy.answer_span.is_some() {
+                    let cur_acc = cur.accuracy.unwrap_or(f64::NEG_INFINITY);
+                    let best_acc = best_b.0.accuracy.unwrap_or(f64::NEG_INFINITY);
+                    cur_acc > best_acc || (cur_acc == best_acc && cur.ppl < best_b.0.ppl)
+                } else if hy.checkpoint_accuracy && !hy.focus_tokens.is_empty() {
                     let cur_bal = cur.balanced_accuracy.unwrap_or(f64::NEG_INFINITY);
                     let best_bal = best_b.0.balanced_accuracy.unwrap_or(f64::NEG_INFINITY);
                     let cur_acc = cur.accuracy.unwrap_or(f64::NEG_INFINITY);
@@ -2031,6 +2424,7 @@ pub fn skill_bake(
                 };
                 if better {
                     best_b = (cur.clone(), Some(ffn.clone()));
+                    best_attn = attn_tr.clone();
                 }
                 log(&format!(
                     "  [B] step {}: held-PPL {:.3}{} (best {:.3})",
@@ -2043,6 +2437,7 @@ pub fn skill_bake(
         }
     }
     ffn = best_b.1.take().expect("phase-B always has a checkpoint");
+    attn_tr = best_attn;
     let overlaid_score = best_b.0;
     let overlaid = overlaid_score.ppl;
 
@@ -2121,6 +2516,7 @@ pub fn skill_bake(
         keep_visits,
         down: down_out,
         gate_up,
+        attn: attn_tr,
         fcd_layers: fcd,
         logits: logits.clone(),
         final_logits,

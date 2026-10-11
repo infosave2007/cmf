@@ -2637,6 +2637,28 @@ enum SkillCmd {
         /// of refusing the corpus; records are never cut.
         #[arg(long)]
         drop_oversize: bool,
+        /// Start from the mask of a previous run's --archaeology-report
+        /// (its `selected_logits`); with --steps-a 0 the mask is kept and
+        /// only Phase B runs.
+        #[arg(long)]
+        mask_from: Option<String>,
+        /// Patent 2 Soft-Fold compilation: surviving neurons keep their
+        /// learned gain σ(m), folded into down_proj (evaluated and
+        /// FCD-polished as such); default snaps them to 1.
+        #[arg(long)]
+        soft_fold: bool,
+        /// Keep the full FFN shape and ship the mask as a CMF task mask
+        /// (`--task <name>` at run/serve time) instead of cutting dead
+        /// neurons out of the tensors.
+        #[arg(long)]
+        no_defrag: bool,
+        /// Name of the task mask written with --no-defrag (or a looped model)
+        #[arg(long, default_value = "specialist")]
+        mask_name: String,
+        /// Full-layer FCD: Phase B also trains the attention projections,
+        /// the projected head gate and both norm gains of the FCD layers
+        #[arg(long)]
+        fcd_attn: bool,
         /// Target sparsity (0.0–1.0): force at least this fraction of
         /// FFN neurons to be pruned. 0 = auto (denoising bottom)
         #[arg(long, default_value = "0.0")]
@@ -4133,6 +4155,11 @@ async fn main() -> anyhow::Result<()> {
                 answer_after,
                 answer_end,
                 drop_oversize,
+                mask_from,
+                soft_fold,
+                no_defrag,
+                mask_name,
+                fcd_attn,
                 target_sparsity,
                 l1_aggression,
                 l1_init,
@@ -4170,6 +4197,11 @@ async fn main() -> anyhow::Result<()> {
                 answer_after.as_deref(),
                 answer_end.as_deref(),
                 drop_oversize,
+                mask_from.as_deref(),
+                soft_fold,
+                no_defrag,
+                &mask_name,
+                fcd_attn,
                 target_sparsity,
                 l1_aggression,
                 l1_init,

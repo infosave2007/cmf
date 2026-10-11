@@ -1345,6 +1345,11 @@ pub fn run_skill_bake(
     answer_after: Option<&str>,
     answer_end: Option<&str>,
     drop_oversize: bool,
+    mask_from: Option<&str>,
+    soft_fold: bool,
+    no_defrag: bool,
+    mask_name: &str,
+    fcd_attn: bool,
     target_sparsity: f64,
     l1_aggression: f64,
     l1_init: f64,
@@ -1453,8 +1458,8 @@ pub fn run_skill_bake(
         focus_tokens.unwrap_or("")
     };
     anyhow::ensure!(
-        !checkpoint_accuracy || !focus_ids.is_empty(),
-        "--checkpoint-accuracy needs --focus-tokens"
+        !checkpoint_accuracy || !focus_ids.is_empty() || answer_span.is_some(),
+        "--checkpoint-accuracy needs --focus-tokens or --answer-after/--answer-end"
     );
     anyhow::ensure!(
         !checkpoint_raw_priority || !focus_ids.is_empty(),
@@ -1561,11 +1566,39 @@ pub fn run_skill_bake(
         checkpoint_min_accuracy,
         checkpoint_min_balanced_accuracy,
         checkpoint_raw_priority,
-        align: ffn_align,
-        uniform_inter,
+        // The in-file task mask is exact bits: no alignment padding, no
+        // forced uniform width — those exist for physically cut tensors.
+        align: if no_defrag { 1 } else { ffn_align },
+        uniform_inter: uniform_inter && !no_defrag,
         focus_tokens: focus_ids,
         focus_follow_tokens: focus_follow_ids,
         answer_span: answer_span.clone(),
+        soft_fold,
+        fcd_attn,
+        mask_logits: match mask_from {
+            Some(path) => {
+                let doc: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(path).with_context(|| format!("reading --mask-from {path}"))?,
+                )
+                .with_context(|| format!("parsing --mask-from {path}"))?;
+                let rows = doc
+                    .get("selected_logits")
+                    .and_then(|v| v.as_array())
+                    .context("--mask-from: no `selected_logits` array (an archaeology report)")?;
+                Some(
+                    rows.iter()
+                        .map(|row| {
+                            row.as_array()
+                                .context("--mask-from: a logit row is not an array")?
+                                .iter()
+                                .map(|x| x.as_f64().map(|v| v as f32).context("--mask-from: non-numeric logit"))
+                                .collect::<anyhow::Result<Vec<f32>>>()
+                        })
+                        .collect::<anyhow::Result<Vec<Vec<f32>>>>()?,
+                )
+            }
+            None => None,
+        },
         ..Default::default()
     };
     let (report, arts) =
@@ -1707,6 +1740,7 @@ pub fn run_skill_bake(
                 "sparsity": checkpoint.sparsity,
                 "accuracy": checkpoint.accuracy,
                 "balanced_accuracy": checkpoint.balanced_accuracy,
+                "logits": &checkpoint.logits,
             })).collect::<Vec<_>>(),
             "kept_per_layer": &report.kept_per_layer,
             "keep_indices": keep_indices,
@@ -1747,6 +1781,23 @@ pub fn run_skill_bake(
         {
             continue;
         }
+        // Full-layer FCD: the trained attention projections, head gate and
+        // norm gains of those layers are written below from the masters.
+        if let Some(rest) = t.name.strip_prefix("model.layers.") {
+            let li: Option<usize> = rest.split('.').next().and_then(|s| s.parse().ok());
+            if let Some(li) = li
+                && arts.attn.get(li).is_some_and(|m| m.is_some())
+                && (rest.contains(".self_attn.q_proj.")
+                    || rest.contains(".self_attn.k_proj.")
+                    || rest.contains(".self_attn.v_proj.")
+                    || rest.contains(".self_attn.o_proj.")
+                    || rest.contains(".self_attn.g_proj.")
+                    || rest.contains(".input_layernorm.")
+                    || rest.contains(".post_attention_layernorm."))
+            {
+                continue;
+            }
+        }
         if t.name.starts_with("skill.") {
             continue; // a defragged specialist is a standalone file
         }
@@ -1775,11 +1826,17 @@ pub fn run_skill_bake(
     // second index space. So for looped models the file keeps its full
     // FFN shape and the sparsity ships as a per-visit task mask the
     // runtime applies each pass (format feature LOOP_MASKS).
+    // `--no-defrag` keeps the full FFN shape for every model and ships the
+    // mask as a CMF task mask (the format's own DTG-MA record): the file
+    // stays the whole model, the runtime zeroes the dead neurons per
+    // layer, and the specialist is a mask catalog entry plus the tensors
+    // Phase B / soft-fold touched — no physical cut.
     let loops = model.arch().num_loops.max(1);
+    let full_shape = loops > 1 || no_defrag;
     let mut max_kept = 0usize;
     for li in 0..nl {
         let alive = &arts.keep[li];
-        let kept: Vec<usize> = if loops > 1 {
+        let kept: Vec<usize> = if full_shape {
             (0..orig_inter).collect()
         } else {
             alive
@@ -1793,12 +1850,17 @@ pub fn run_skill_bake(
         max_kept = max_kept.max(kept.len());
         let trained = arts.gate_up[li].is_some();
         let shape_unchanged = is_identity_keep(&kept, orig_inter);
+        // Soft-fold changes a layer's down_proj whenever any kept neuron's
+        // gain is not exactly 1 — i.e. always; dead neurons keep their
+        // column (the mask zeroes them) so the delta against the backbone
+        // is the fold alone.
+        let folded = soft_fold && loops == 1;
         // Do not turn a frozen layer into a false skill delta.  Even a
         // nominally idempotent q8_2f -> f32 -> q8_2f round-trip can choose
         // slightly different row/column fields, changing all three hashes.
         // When no neuron was physically removed, the exact source payload is
         // already the correct frozen tensor and must be copied byte-for-byte.
-        if !trained && shape_unchanged {
+        if !trained && shape_unchanged && !folded {
             for suffix in ["gate_proj", "up_proj", "down_proj"] {
                 let name = format!("model.layers.{li}.mlp.{suffix}.weight");
                 let entry = model
@@ -1830,10 +1892,27 @@ pub fn run_skill_bake(
             up_k.extend_from_slice(&up_f[r * hidden..(r + 1) * hidden]);
         }
         let down_f = &arts.down[li];
+        // Soft-Fold (Patent 2, mode 26): a surviving neuron's learned gain
+        // σ(m) rides into its down_proj column — exactly the gate the bake
+        // evaluated and Phase B trained against. One mask row per layer on
+        // an unlooped stack (looped models keep the runtime task mask).
+        let fold: Vec<f32> = if soft_fold && loops == 1 {
+            kept.iter()
+                .map(|&c| {
+                    if alive[c] {
+                        1.0 / (1.0 + (-arts.logits[li][c]).exp())
+                    } else {
+                        1.0
+                    }
+                })
+                .collect()
+        } else {
+            vec![1.0; kept.len()]
+        };
         let mut down_k = Vec::with_capacity(hidden * kept.len());
         for r in 0..hidden {
-            for &c in &kept {
-                down_k.push(down_f[r * orig_inter + c]);
+            for (&c, &f) in kept.iter().zip(&fold) {
+                down_k.push(down_f[r * orig_inter + c] * f);
             }
         }
         let base_dtype = model
@@ -1862,6 +1941,22 @@ pub fn run_skill_bake(
             ("up_proj", &up_k, kept.len(), hidden, q_rowsafe),
             ("down_proj", &down_k, hidden, kept.len(), q_down),
         ] {
+            if !trained && shape_unchanged && suffix != "down_proj" {
+                // Untouched at full shape: the source bytes are the tensor.
+                let name = format!("model.layers.{li}.mlp.{suffix}.weight");
+                let entry = model
+                    .tensors
+                    .iter()
+                    .find(|tensor| tensor.name == name)
+                    .with_context(|| format!("missing tensor {name}"))?;
+                tensors.push(TensorSpec {
+                    name,
+                    dtype: entry.dtype,
+                    shape: entry.shape.clone(),
+                    data: model.tensor_bytes(&entry.name)?.to_vec(),
+                });
+                continue;
+            }
             let (dtype, data) = if trained {
                 encode_trained_fcd(vals, rows, cols)
             } else {
@@ -1875,6 +1970,70 @@ pub fn run_skill_bake(
             });
         }
     }
+    // Full-layer FCD layers: q/k/v split back out of the fused master,
+    // o_proj, the head gate and both norm gains (gains and gate stay f32;
+    // the projections take the trained-master codec).
+    let f32_bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    for (li, m) in arts.attn.iter().enumerate() {
+        let Some(m) = m else { continue };
+        let p = format!("model.layers.{li}.");
+        let shape_of = |name: &str| -> anyhow::Result<Vec<usize>> {
+            Ok(model
+                .tensors
+                .iter()
+                .find(|t| t.name == name)
+                .with_context(|| format!("missing tensor {name}"))?
+                .shape
+                .clone())
+        };
+        let qs = shape_of(&format!("{p}self_attn.q_proj.weight"))?;
+        let ks = shape_of(&format!("{p}self_attn.k_proj.weight"))?;
+        let vs = shape_of(&format!("{p}self_attn.v_proj.weight"))?;
+        let (qrows, krows, vrows) = (qs[0], ks[0], vs[0]);
+        anyhow::ensure!(
+            m.wqkv.len() == (qrows + krows + vrows) * hidden,
+            "layer {li}: fused qkv master has {} values, expected {}",
+            m.wqkv.len(),
+            (qrows + krows + vrows) * hidden
+        );
+        let mut off = 0usize;
+        for (suffix, rows) in [("q_proj", qrows), ("k_proj", krows), ("v_proj", vrows)] {
+            let vals = &m.wqkv[off * hidden..(off + rows) * hidden];
+            let (dtype, data) = encode_trained_fcd(vals, rows, hidden);
+            tensors.push(TensorSpec {
+                name: format!("{p}self_attn.{suffix}.weight"),
+                dtype,
+                shape: vec![rows, hidden],
+                data,
+            });
+            off += rows;
+        }
+        let os = shape_of(&format!("{p}self_attn.o_proj.weight"))?;
+        let (dtype, data) = encode_trained_fcd(&m.wo, os[0], os[1]);
+        tensors.push(TensorSpec {
+            name: format!("{p}self_attn.o_proj.weight"),
+            dtype,
+            shape: os.clone(),
+            data,
+        });
+        if let Some(g) = &m.gproj {
+            let gs = shape_of(&format!("{p}self_attn.g_proj.weight"))?;
+            tensors.push(TensorSpec {
+                name: format!("{p}self_attn.g_proj.weight"),
+                dtype: TensorDtype::F32,
+                shape: gs,
+                data: f32_bytes(g),
+            });
+        }
+        for (suffix, vals) in [("input_layernorm", &m.iln), ("post_attention_layernorm", &m.pln)] {
+            tensors.push(TensorSpec {
+                name: format!("{p}{suffix}.weight"),
+                dtype: TensorDtype::F32,
+                shape: vec![vals.len()],
+                data: f32_bytes(vals),
+            });
+        }
+    }
     let mut header = model.header.clone();
     header.skills.clear();
     header.arch.intermediate_size = max_kept;
@@ -1883,7 +2042,9 @@ pub fn run_skill_bake(
         .take()
         .unwrap_or_else(|| serde_json::json!({}));
     prov["defrag"] = serde_json::json!({
-        "recipe": "skill-bake L1+FCD (native)",
+        "recipe": if soft_fold { "skill-bake L1+FCD soft-fold (native)" } else { "skill-bake L1+FCD (native)" },
+        "shipped_as": if full_shape { "task-mask" } else { "defrag" },
+        "mask_name": mask_name,
         "pre_intermediate": orig_inter,
         "post_intermediate_max": max_kept,
         "kept_per_layer": report.kept_per_layer,
@@ -1899,7 +2060,7 @@ pub fn run_skill_bake(
     header.provenance = Some(prov);
     // The per-visit mask, when there is one to ship.
     let ffn_b = orig_inter.div_ceil(8);
-    let visit_mask: Option<TaskMask> = (loops > 1).then(|| {
+    let visit_mask: Option<TaskMask> = full_shape.then(|| {
         let ffn_masks: Vec<Vec<u8>> = arts
             .keep_visits
             .iter()
@@ -1915,8 +2076,15 @@ pub fn run_skill_bake(
             .collect();
         TaskMask {
             task_id: 1,
-            name: "specialist".into(),
-            description: Some("DTG-MA per-visit mask (loop-aware bake)".into()),
+            name: mask_name.to_string(),
+            description: Some(if loops > 1 {
+                "DTG-MA per-visit mask (loop-aware bake)".to_string()
+            } else {
+                format!(
+                    "DTG-MA task mask (skill bake, {}; serve/run with --task {mask_name})",
+                    if soft_fold { "soft-fold gains in down_proj" } else { "hard" }
+                )
+            }),
             sparsity: report.pruned_ratio as f32,
             quality: None,
             ffn_masks,
@@ -1946,7 +2114,7 @@ pub fn run_skill_bake(
     });
     let catalog = visit_mask.as_ref().map(|m| MaskCatalog {
         masks: vec![m.clone()],
-        default_task: "specialist".into(),
+        default_task: mask_name.to_string(),
     });
     let tmp = format!("{output}.tmp");
     CmfModel::write(
