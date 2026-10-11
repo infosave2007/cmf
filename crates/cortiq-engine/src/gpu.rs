@@ -1976,6 +1976,13 @@ pub fn mimo_attention_scratch_scope<R>(enabled: bool, f: impl FnOnce() -> R) -> 
     f()
 }
 
+/// Gemma-4's prompt on the batched wgpu graph (`CMF_G4_BATCH=0` keeps the
+/// chunked host prefill it used before).
+pub fn g4_batch_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_G4_BATCH").as_deref() != Ok("0"))
+}
+
 /// q8_2f MoE experts on the wgpu token and batch graphs (`CMF_MOE_Q82=0`
 /// keeps them off the graphs: every op on its own, the 0.8.15 route).
 pub(crate) fn moe_q82_graph_on() -> bool {
