@@ -38,6 +38,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `CMF_NUCLEUS_SPARSE=0` keeps the dense chain). Gemma's final-logit
   soft-capping runs on the worker pool.
 
+- Metal runs Gemma-4 (the humanizer 12B) on the token graph and in the
+  chunk prefill: 512-wide global layers, scale-less V norm, sandwich norms,
+  the layer scalar and tanh-GELU (`gpu_metal/gemma4.rs`; `CMF_METAL_GEMMA4=0`
+  and `CMF_METAL_GEMMA4_CHUNK=0` turn them off). Mac mini M4: q8_2f decode
+  4.3 → 6.6 tok/s, q4tp-ffn 4.4 → 8.5; a 1000-token prompt 25–28 → 14–15 s
+  to the first token. Perplexity equals the CPU (q8_2f 5.665, q4tp-ffn
+  5.869); greedy text is identical to the strict CPU.
+
 ### Fixed
 - `cortiq serve` `/v1/completions` prepends the tokenizer's BOS to a raw
   prompt, as `run --raw` and the chat template do. A Gemma prompt reached
