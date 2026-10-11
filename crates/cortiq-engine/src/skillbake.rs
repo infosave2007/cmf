@@ -145,6 +145,10 @@ pub struct BakeHyper {
     /// (q/k/v/o, the projected head gate) and both norm gains of the FCD
     /// layers — the notebook's "unfreeze the last N layers entirely".
     pub fcd_attn: bool,
+    /// Write every Phase-A evaluation's mask logits to
+    /// `<dir>/phase-a-step-<n>.json` as it happens (a `--mask-from` input),
+    /// so a long run survives being stopped.
+    pub checkpoint_dir: Option<String>,
 }
 
 impl Default for BakeHyper {
@@ -178,6 +182,7 @@ impl Default for BakeHyper {
             mask_logits: None,
             soft_fold: false,
             fcd_attn: false,
+            checkpoint_dir: None,
         }
     }
 }
@@ -642,6 +647,8 @@ impl Pass<'_> {
                 layer == last,
                 Some(&gate),
                 true,
+                None,
+                false,
             );
             if layer == last {
                 let acts = acts.expect("last FFN boundary requested");
@@ -666,6 +673,7 @@ impl Pass<'_> {
         grad: Option<(
             &mut [Vec<f64>],
             &mut [Option<(Vec<f64>, Vec<f64>, Vec<f64>)>],
+            &mut [Option<AttnGrads>],
         )>,
     ) -> (f64, usize) {
         self.chunk_batch(ids, 1, grad)
@@ -1361,8 +1369,22 @@ fn held_score(pass: &Pass, held: &[Vec<u32>]) -> HeldScore {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8_192);
-    let group_n = (group_tokens / held[0].len().max(1)).clamp(1, GROUP_MAX);
-    for group in held.chunks(group_n) {
+    let groups: Vec<&[Vec<u32>]> = {
+        let mut v = Vec::new();
+        let mut i = 0;
+        while i < held.len() {
+            let len = held[i].len();
+            let cap = (group_tokens / len.max(1)).clamp(1, GROUP_MAX);
+            let mut j = i;
+            while j < held.len() && held[j].len() == len && j - i < cap {
+                j += 1;
+            }
+            v.push(&held[i..j]);
+            i = j;
+        }
+        v
+    };
+    for group in groups {
         let t = group[0].len();
         if group.iter().all(|c| c.len() == t) {
             let flat: Vec<u32> = group.iter().flatten().copied().collect();
@@ -1388,16 +1410,39 @@ fn held_score(pass: &Pass, held: &[Vec<u32>]) -> HeldScore {
     }
 }
 
+/// The calibration records as runs of equal length, each cut into blocks
+/// of at most `batch` records: `(start, count)`. Records are expected
+/// sorted by length (stable, so the shuffle within a length survives);
+/// the batch at `step` is `blocks[step % blocks.len()]`.
+fn length_blocks(calib: &[Vec<u32>], batch: usize) -> Vec<(usize, usize)> {
+    let batch = batch.max(1);
+    let mut blocks = Vec::new();
+    let mut i = 0;
+    while i < calib.len() {
+        let len = calib[i].len();
+        let mut j = i;
+        while j < calib.len() && calib[j].len() == len && j - i < batch {
+            j += 1;
+        }
+        blocks.push((i, j - i));
+        i = j;
+    }
+    blocks
+}
+
 fn calibration_batch(
     calib: &[Vec<u32>],
     step: usize,
     requested: usize,
 ) -> Result<(Vec<u32>, usize), String> {
     let batch = requested.max(1).min(calib.len());
-    let width = calib[0].len();
-    let mut flat = Vec::with_capacity(batch * width);
-    for offset in 0..batch {
-        let record = &calib[(step * batch + offset) % calib.len()];
+    // Equal-length records only: with length buckets the records are
+    // sorted by length and the blocks never mix widths.
+    let blocks = length_blocks(calib, batch);
+    let (start, count) = blocks[step % blocks.len()];
+    let width = calib[start].len();
+    let mut flat = Vec::with_capacity(count * width);
+    for record in &calib[start..start + count] {
         if record.len() != width {
             return Err(format!(
                 "skill bake: --batch needs equal-length records ({} != {width})",
@@ -1406,7 +1451,7 @@ fn calibration_batch(
         }
         flat.extend_from_slice(record);
     }
-    Ok((flat, batch))
+    Ok((flat, count))
 }
 
 fn build_focused_fcd_cache(
@@ -1707,9 +1752,18 @@ pub fn skill_bake(
     // on the device chain they were ~700 MB of PCIe readback per layer.
     fm.attn_acts = false;
     let nl = fm.layers.len();
+    // Full-layer FCD masters (attention + norms), filled before Phase B;
+    // every Pass carries the slice so a trained layer's forward reads them.
+    let mut attn_tr: Vec<Option<AttnMasters>> = vec![None; nl];
     let inter = fm.layers.iter().map(|l| l.inter).max().unwrap_or(0);
-    let held: Vec<Vec<u32>> = chunks[..held_n.min(chunks.len())].to_vec();
-    let calib: Vec<Vec<u32>> = chunks[held_n.min(chunks.len())..].to_vec();
+    // Stable sorts by length: with --length-buckets the batches and the
+    // held-out groups stay homogeneous while the shuffle within a length
+    // survives; without buckets every record has the chunk width and
+    // nothing moves.
+    let mut held: Vec<Vec<u32>> = chunks[..held_n.min(chunks.len())].to_vec();
+    held.sort_by_key(Vec::len);
+    let mut calib: Vec<Vec<u32>> = chunks[held_n.min(chunks.len())..].to_vec();
+    calib.sort_by_key(Vec::len);
     if calib.len() < 12 {
         return Err(format!(
             "skill bake: corpus too small ({} calib chunks)",
@@ -1721,7 +1775,9 @@ pub fn skill_bake(
     // scoring path already handles per-layer FFN widths; the optimizer and
     // defragment writer below still require one common width, so return the
     // identity checkpoint before that training-only constraint is applied.
-    if hy.steps_a == 0 && hy.steps_b == 0 && hy.fcd_layers == 0 {
+    // (A supplied mask is not an identity run: it goes through the scored
+    // path below so the mask is evaluated and written.)
+    if hy.steps_a == 0 && hy.steps_b == 0 && hy.fcd_layers == 0 && hy.mask_logits.is_none() {
         let logits: Vec<Vec<f32>> = fm
             .layers
             .iter()
@@ -1831,8 +1887,6 @@ pub fn skill_bake(
         None => vec![vec![m0; inter]; vn],
     };
     let mut ffn: Vec<Option<(Vec<f32>, Vec<f32>, Vec<f32>)>> = vec![None; nl];
-    // Full-layer FCD masters (attention + norms), filled before Phase B.
-    let mut attn_tr: Vec<Option<AttnMasters>> = vec![None; nl];
 
     // Baseline (no mask): even σ(m0) is not exactly 1, so measure with
     // gates forced open via hard mask over +∞… simplest: logits +50.
@@ -2001,6 +2055,25 @@ pub fn skill_bake(
                 balanced_accuracy: hs.balanced_accuracy,
                 logits: logits.clone(),
             });
+            if let Some(dir) = &hy.checkpoint_dir {
+                let doc = serde_json::json!({
+                    "schema": "cmf-bake-checkpoint-v1",
+                    "step": step + 1,
+                    "l1": l1,
+                    "ppl": hp,
+                    "sparsity": sp,
+                    "accuracy": hs.accuracy,
+                    "selected_logits": &logits,
+                });
+                let path = format!("{dir}/phase-a-step-{}.json", step + 1);
+                match serde_json::to_vec(&doc) {
+                    Ok(bytes) => match std::fs::write(&path, bytes) {
+                        Ok(()) => log(&format!("  [A] checkpoint written: {path}")),
+                        Err(e) => log(&format!("  [A] checkpoint NOT written ({path}): {e}")),
+                    },
+                    Err(e) => log(&format!("  [A] checkpoint NOT serialised: {e}")),
+                }
+            }
             // Best checkpoint selection: respect target_sparsity and any
             // caller-declared natural-distribution quality guards. The
             // guards are strict (`>`, not `>=`) so a majority baseline cannot
@@ -2361,7 +2434,11 @@ pub fn skill_bake(
             let mut params: Vec<&mut [f32]> = Vec::new();
             let mut grads: Vec<Vec<f64>> = Vec::new();
             let attn_tr_slots = &mut attn_tr[first_fcd..];
-            for (off, slot) in ffn[first_fcd..].iter_mut().enumerate() {
+            for (off, (slot, aslot)) in ffn[first_fcd..]
+                .iter_mut()
+                .zip(attn_tr_slots.iter_mut())
+                .enumerate()
+            {
                 let li = first_fcd + off;
                 let Some((g, u, d)) = slot.as_mut() else {
                     continue;
@@ -2373,7 +2450,7 @@ pub fn skill_bake(
                 grads.push(du);
                 params.push(d.as_mut_slice());
                 grads.push(dd);
-                if let (Some(m), Some(ag)) = (attn_tr_slots[off].as_mut(), dattn[li].take()) {
+                if let (Some(m), Some(ag)) = (aslot.as_mut(), dattn[li].take()) {
                     params.push(m.wqkv.as_mut_slice());
                     grads.push(ag.wqkv);
                     params.push(m.wo.as_mut_slice());
@@ -2652,11 +2729,16 @@ mod tests {
             calibration_batch(&records, 0, 2).unwrap(),
             (vec![1, 2, 3, 4], 2)
         );
+        // A run of equal lengths is cut into blocks of at most `batch`;
+        // the tail block is smaller, and the schedule wraps.
+        assert_eq!(calibration_batch(&records, 1, 2).unwrap(), (vec![5, 6], 1));
         assert_eq!(
-            calibration_batch(&records, 1, 2).unwrap(),
-            (vec![5, 6, 1, 2], 2)
+            calibration_batch(&records, 2, 2).unwrap(),
+            (vec![1, 2, 3, 4], 2)
         );
-        assert!(calibration_batch(&[vec![1, 2], vec![3]], 0, 2).is_err());
+        // Mixed lengths never share a block (length buckets).
+        assert_eq!(calibration_batch(&[vec![1, 2], vec![3]], 0, 2).unwrap(), (vec![1, 2], 1));
+        assert_eq!(calibration_batch(&[vec![1, 2], vec![3]], 1, 2).unwrap(), (vec![3], 1));
     }
 
     /// align=32 rounds each layer UP by resurrecting the largest

@@ -2637,6 +2637,11 @@ enum SkillCmd {
         /// of refusing the corpus; records are never cut.
         #[arg(long)]
         drop_oversize: bool,
+        /// Pad chat records to the smallest of chunk/4, chunk/2, 3·chunk/4,
+        /// chunk they fit instead of the full chunk; batches are drawn
+        /// from equal-length records
+        #[arg(long)]
+        length_buckets: bool,
         /// Start from the mask of a previous run's --archaeology-report
         /// (its `selected_logits`); with --steps-a 0 the mask is kept and
         /// only Phase B runs.
@@ -2659,6 +2664,10 @@ enum SkillCmd {
         /// the projected head gate and both norm gains of the FCD layers
         #[arg(long)]
         fcd_attn: bool,
+        /// Write each Phase-A evaluation's mask logits into this directory
+        /// (phase-a-step-N.json, usable with --mask-from) as the run goes
+        #[arg(long)]
+        checkpoint_dir: Option<String>,
         /// Target sparsity (0.0–1.0): force at least this fraction of
         /// FFN neurons to be pruned. 0 = auto (denoising bottom)
         #[arg(long, default_value = "0.0")]
@@ -4155,11 +4164,13 @@ async fn main() -> anyhow::Result<()> {
                 answer_after,
                 answer_end,
                 drop_oversize,
+                length_buckets,
                 mask_from,
                 soft_fold,
                 no_defrag,
                 mask_name,
                 fcd_attn,
+                checkpoint_dir,
                 target_sparsity,
                 l1_aggression,
                 l1_init,
@@ -4197,11 +4208,13 @@ async fn main() -> anyhow::Result<()> {
                 answer_after.as_deref(),
                 answer_end.as_deref(),
                 drop_oversize,
+                length_buckets,
                 mask_from.as_deref(),
                 soft_fold,
                 no_defrag,
                 &mask_name,
                 fcd_attn,
+                checkpoint_dir.as_deref(),
                 target_sparsity,
                 l1_aggression,
                 l1_init,

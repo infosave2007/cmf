@@ -1184,6 +1184,7 @@ fn focused_chat_record_chunks(
     span: Option<&AnswerSpan>,
     record_start: &str,
     drop_oversize: bool,
+    length_buckets: bool,
 ) -> anyhow::Result<Option<(Vec<Vec<u32>>, FocusedCorpusStats)>> {
     let mut out = Vec::new();
     let mut saw_chat_records = false;
@@ -1239,7 +1240,19 @@ fn focused_chat_record_chunks(
             );
             if ids.len() < chunk {
                 stats.padded_records += 1;
-                ids.resize(chunk, pad);
+                // Length buckets: pad to the smallest of chunk/4 … chunk
+                // (64-aligned) the record fits — the trainer batches equal
+                // lengths, so a short record no longer costs a full chunk.
+                let width = if length_buckets {
+                    (1..=4)
+                        .map(|k| (chunk * k / 4).div_ceil(64) * 64)
+                        .find(|&w| w >= ids.len())
+                        .unwrap_or(chunk)
+                        .min(chunk)
+                } else {
+                    chunk
+                };
+                ids.resize(width, pad);
             }
             out.push(ids);
             if out.len() == need {
@@ -1265,6 +1278,7 @@ fn scored_corpus_chunks(
     span: Option<&AnswerSpan>,
     record_start: &str,
     drop_oversize: bool,
+    length_buckets: bool,
 ) -> anyhow::Result<(Vec<Vec<u32>>, Option<FocusedCorpusStats>)> {
     if (!focus_ids.is_empty() || span.is_some())
         && let Some((chunks, stats)) = focused_chat_record_chunks(
@@ -1277,6 +1291,7 @@ fn scored_corpus_chunks(
             span,
             record_start,
             drop_oversize,
+            length_buckets,
         )?
     {
         anyhow::ensure!(
@@ -1345,11 +1360,13 @@ pub fn run_skill_bake(
     answer_after: Option<&str>,
     answer_end: Option<&str>,
     drop_oversize: bool,
+    length_buckets: bool,
     mask_from: Option<&str>,
     soft_fold: bool,
     no_defrag: bool,
     mask_name: &str,
     fcd_attn: bool,
+    checkpoint_dir: Option<&str>,
     target_sparsity: f64,
     l1_aggression: f64,
     l1_init: f64,
@@ -1478,6 +1495,7 @@ pub fn run_skill_bake(
             answer_span.as_ref(),
             record_start,
             drop_oversize,
+            length_buckets,
         )?;
         (chunks, held, stats)
     } else {
@@ -1492,6 +1510,7 @@ pub fn run_skill_bake(
             answer_span.as_ref(),
             record_start,
             drop_oversize,
+            length_buckets,
         )?;
         let (calib, calib_stats) = scored_corpus_chunks(
             &tok,
@@ -1504,6 +1523,7 @@ pub fn run_skill_bake(
             answer_span.as_ref(),
             record_start,
             drop_oversize,
+            length_buckets,
         )?;
         let mut joined = held_chunks;
         joined.extend(calib);
@@ -1575,6 +1595,13 @@ pub fn run_skill_bake(
         answer_span: answer_span.clone(),
         soft_fold,
         fcd_attn,
+        checkpoint_dir: match checkpoint_dir {
+            Some(d) => {
+                std::fs::create_dir_all(d).with_context(|| format!("creating --checkpoint-dir {d}"))?;
+                Some(d.to_string())
+            }
+            None => None,
+        },
         mask_logits: match mask_from {
             Some(path) => {
                 let doc: serde_json::Value = serde_json::from_slice(
@@ -1896,13 +1923,16 @@ pub fn run_skill_bake(
         // σ(m) rides into its down_proj column — exactly the gate the bake
         // evaluated and Phase B trained against. One mask row per layer on
         // an unlooped stack (looped models keep the runtime task mask).
+        // Soft-fold at full shape: a dead neuron's down column is ZEROED, so
+        // the file is the exact specialist even when served without its
+        // task mask (the mask then only lets the sparse arm skip rows).
         let fold: Vec<f32> = if soft_fold && loops == 1 {
             kept.iter()
                 .map(|&c| {
                     if alive[c] {
                         1.0 / (1.0 + (-arts.logits[li][c]).exp())
                     } else {
-                        1.0
+                        0.0
                     }
                 })
                 .collect()
@@ -2086,7 +2116,25 @@ pub fn run_skill_bake(
                 )
             }),
             sparsity: report.pruned_ratio as f32,
-            quality: None,
+            // The bake's own held-out verdict rides with the mask: the
+            // answer-span token accuracy when one was measured, else the
+            // held-out PPL ratio specialist/backbone.
+            quality: Some(match report.overlaid_accuracy {
+                Some(acc) => cortiq_core::mask::Quality {
+                    metric: "heldout_answer_token_acc".into(),
+                    value: acc as f32,
+                    baseline_dense: report.backbone_accuracy.map(|a| a as f32),
+                    n_samples: Some(held_n as u32),
+                    dataset_sha256: None,
+                },
+                None => cortiq_core::mask::Quality {
+                    metric: "heldout_ppl_ratio".into(),
+                    value: (report.overlaid / report.backbone.max(1e-9)) as f32,
+                    baseline_dense: Some(1.0),
+                    n_samples: Some(held_n as u32),
+                    dataset_sha256: None,
+                },
+            }),
             ffn_masks,
             // ALL-ONES, not empty: the codec writes a zero row for a
             // missing entry, and a zero head row means "no active
