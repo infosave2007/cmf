@@ -4399,6 +4399,12 @@ async fn cmd_serve(
             cortiq_engine::gpu::set_current_device(*d);
         }
         let mut pipeline = Pipeline::from_model(&model, SamplerConfig::default())?;
+        // No endpoint reports per-token confidence, and it is a full-vocab
+        // softmax every token (~1 ms at Gemma's 262k vocab).
+        // `CMF_SERVE_CONFIDENCE=1` keeps it.
+        if std::env::var("CMF_SERVE_CONFIDENCE").as_deref() != Ok("1") {
+            pipeline.set_confidence(false);
+        }
         o1.apply(&mut pipeline)?;
         if let Some(devs) = &split_devices {
             pipeline
