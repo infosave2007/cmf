@@ -2668,6 +2668,11 @@ enum SkillCmd {
         /// (phase-a-step-N.json, usable with --mask-from) as the run goes
         #[arg(long)]
         checkpoint_dir: Option<String>,
+        /// JSONL with one object per record of --held-files, in record
+        /// order, whose "family" names the record's group: held scores
+        /// report per-family verdict accuracy and gate on its macro mean
+        #[arg(long)]
+        held_tags: Option<String>,
         /// Target sparsity (0.0–1.0): force at least this fraction of
         /// FFN neurons to be pruned. 0 = auto (denoising bottom)
         #[arg(long, default_value = "0.0")]
@@ -4171,6 +4176,7 @@ async fn main() -> anyhow::Result<()> {
                 mask_name,
                 fcd_attn,
                 checkpoint_dir,
+                held_tags,
                 target_sparsity,
                 l1_aggression,
                 l1_init,
@@ -4215,6 +4221,7 @@ async fn main() -> anyhow::Result<()> {
                 &mask_name,
                 fcd_attn,
                 checkpoint_dir.as_deref(),
+                held_tags.as_deref(),
                 target_sparsity,
                 l1_aggression,
                 l1_init,

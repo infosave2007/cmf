@@ -1185,6 +1185,7 @@ fn focused_chat_record_chunks(
     record_start: &str,
     drop_oversize: bool,
     length_buckets: bool,
+    mut kept: Option<&mut Vec<usize>>,
 ) -> anyhow::Result<Option<(Vec<Vec<u32>>, FocusedCorpusStats)>> {
     let mut out = Vec::new();
     let mut saw_chat_records = false;
@@ -1255,6 +1256,11 @@ fn focused_chat_record_chunks(
                 ids.resize(width, pad);
             }
             out.push(ids);
+            if let Some(k) = kept.as_deref_mut() {
+                // Ordinal of the record across the files, as a renderer's
+                // index lists them.
+                k.push(stats.records_seen - 1);
+            }
             if out.len() == need {
                 return Ok(Some((out, stats)));
             }
@@ -1279,6 +1285,7 @@ fn scored_corpus_chunks(
     record_start: &str,
     drop_oversize: bool,
     length_buckets: bool,
+    kept: Option<&mut Vec<usize>>,
 ) -> anyhow::Result<(Vec<Vec<u32>>, Option<FocusedCorpusStats>)> {
     if (!focus_ids.is_empty() || span.is_some())
         && let Some((chunks, stats)) = focused_chat_record_chunks(
@@ -1292,6 +1299,7 @@ fn scored_corpus_chunks(
             record_start,
             drop_oversize,
             length_buckets,
+            kept,
         )?
     {
         anyhow::ensure!(
@@ -1367,6 +1375,7 @@ pub fn run_skill_bake(
     mask_name: &str,
     fcd_attn: bool,
     checkpoint_dir: Option<&str>,
+    held_tags: Option<&str>,
     target_sparsity: f64,
     l1_aggression: f64,
     l1_init: f64,
@@ -1461,9 +1470,15 @@ pub fn run_skill_bake(
                 "--answer-end {end:?} encodes to {} tokens; it must be exactly one",
                 end_ids.len()
             );
+            // Every id's text, so the held score can grade whole verdicts
+            // (the JSON values) instead of the span's scaffolding tokens.
+            let values = cortiq_engine::skillbake::TokenText(std::sync::Arc::new(
+                (0..tok.vocab_size() as u32).map(|id| tok.decode_token(id)).collect(),
+            ));
             Some(AnswerSpan {
                 start,
                 end: end_ids[0],
+                values: Some(values),
             })
         }
         (None, None) => None,
@@ -1482,6 +1497,7 @@ pub fn run_skill_bake(
         !checkpoint_raw_priority || !focus_ids.is_empty(),
         "--checkpoint-raw-priority needs --focus-tokens"
     );
+    let mut held_kept: Vec<usize> = Vec::new();
     let (chunks, held_n, focused_stats) = if held_files.is_empty() {
         let need = calib_chunks + held;
         let (chunks, stats) = scored_corpus_chunks(
@@ -1496,6 +1512,7 @@ pub fn run_skill_bake(
             record_start,
             drop_oversize,
             length_buckets,
+            None,
         )?;
         (chunks, held, stats)
     } else {
@@ -1511,6 +1528,7 @@ pub fn run_skill_bake(
             record_start,
             drop_oversize,
             length_buckets,
+            Some(&mut held_kept),
         )?;
         let (calib, calib_stats) = scored_corpus_chunks(
             &tok,
@@ -1524,6 +1542,7 @@ pub fn run_skill_bake(
             record_start,
             drop_oversize,
             length_buckets,
+            None,
         )?;
         let mut joined = held_chunks;
         joined.extend(calib);
@@ -1595,6 +1614,34 @@ pub fn run_skill_bake(
         answer_span: answer_span.clone(),
         soft_fold,
         fcd_attn,
+        held_tags: match held_tags {
+            Some(path) => {
+                anyhow::ensure!(!held_files.is_empty(), "--held-tags names records of --held-files");
+                let text = std::fs::read_to_string(path).with_context(|| format!("reading --held-tags {path}"))?;
+                let mut names: Vec<String> = Vec::new();
+                let mut by_record: Vec<usize> = Vec::new();
+                for (i, line) in text.lines().filter(|l| !l.trim().is_empty()).enumerate() {
+                    let v: serde_json::Value = serde_json::from_str(line)
+                        .with_context(|| format!("--held-tags {path}: line {}", i + 1))?;
+                    let name = v.get("family").and_then(|f| f.as_str()).unwrap_or("?").to_string();
+                    let at = names.iter().position(|n| *n == name).unwrap_or_else(|| {
+                        names.push(name);
+                        names.len() - 1
+                    });
+                    by_record.push(at);
+                }
+                anyhow::ensure!(
+                    held_kept.iter().all(|&r| r < by_record.len()),
+                    "--held-tags {path} lists {} records; the held files have more",
+                    by_record.len()
+                );
+                Some(cortiq_engine::skillbake::HeldTags {
+                    names,
+                    of: held_kept.iter().map(|&r| by_record[r]).collect(),
+                })
+            }
+            None => None,
+        },
         checkpoint_dir: match checkpoint_dir {
             Some(d) => {
                 std::fs::create_dir_all(d).with_context(|| format!("creating --checkpoint-dir {d}"))?;
@@ -2160,9 +2207,15 @@ pub fn run_skill_bake(
             priority: MaskPriority::Primary,
         }
     });
+    // A soft-folded file is the exact specialist with no mask applied (dead
+    // columns are zeroed), so it ships with the mask recorded but NOT the
+    // default task: the runtime's masked FFN arm is a host path, and the
+    // unmasked file serves on the device at full speed. `--task <name>`
+    // still selects the mask (the sparse arm) when wanted.
+    let soft_exact = soft_fold && loops == 1;
     let catalog = visit_mask.as_ref().map(|m| MaskCatalog {
         masks: vec![m.clone()],
-        default_task: mask_name.to_string(),
+        default_task: if soft_exact { "general".to_string() } else { mask_name.to_string() },
     });
     let tmp = format!("{output}.tmp");
     CmfModel::write(
@@ -2206,7 +2259,7 @@ pub fn run_skill_bake(
     // fast path (activation zeroing inside the fused arms) — the
     // specialist is scored the way it is meant to be served: mask active,
     // quantized storage untouched, batched speed.
-    let rt_spec = runtime_ppl(&tmp, visit_mask.as_ref())?;
+    let rt_spec = runtime_ppl(&tmp, if soft_exact { None } else { visit_mask.as_ref() })?;
     println!(
         "runtime gate (held-out, real engine): backbone {rt_base:.3} → specialist {rt_spec:.3} ({:+.1}%)",
         (rt_spec / rt_base - 1.0) * 100.0
