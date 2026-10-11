@@ -5352,7 +5352,9 @@ fn gdn_step_norm(@builtin(workgroup_id) wid: vec3<u32>,
 
 // Fused residual-add + RMSNorm (WGSL twin of Metal add_rmsnorm_rows): h += d
 // in place, then o = rms(h)·w. Collapses an axpy + an rmsnorm dispatch into
-// one — cuts two launches per layer off the token graph.
+// one — cuts two launches per layer off the token graph. `_p` != 0 is a
+// layer scale's f32 bits (Gemma-4 `layer_scalar`): h = (h + d)·scale — the
+// token graph's add_rmsnorm only; 0 leaves the historical expression.
 struct ArP { n: u32, gemma: u32, eps: f32, _p: u32 };
 @group(0) @binding(0) var<storage, read_write> ar_h : array<f32>;
 @group(0) @binding(1) var<storage, read>       ar_d : array<f32>;
@@ -5368,7 +5370,8 @@ fn add_rmsnorm(@builtin(local_invocation_id) lid: vec3<u32>) {
     var i = tid;
     loop {
         if (i >= n) { break; }
-        let v = ar_h[i] + ar_d[i];
+        var v = ar_h[i] + ar_d[i];
+        if (ar_p._p != 0u) { v = v * bitcast<f32>(ar_p._p); }
         ar_h[i] = v;
         acc = acc + v * v;
         i = i + 256u;
@@ -5456,7 +5459,9 @@ struct RqP {
 @group(0) @binding(6) var<storage, read>       rq_invf : array<f32>;
 @group(0) @binding(7) var<uniform>             rq_p    : RqP;
 var<workgroup> rq_red: array<f32, 32>;
-var<workgroup> rq_head: array<f32, 256>;
+// 512: Gemma-4's global heads. Every model up to 256 runs the same loops
+// over the same `nt` (<= 8) slots as before.
+var<workgroup> rq_head: array<f32, 512>;
 @compute @workgroup_size(32)
 fn attn_rope_qkn(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let head = wid.x;
@@ -5471,8 +5476,8 @@ fn attn_rope_qkn(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocatio
     // batched projection output, K is rotated IN PLACE in its batch slice.
     let qoff = rq_p.tok * nh * select(1u, 2u, gate) * hd;
     let koff = rq_p.tok * rq_p.nkv * hd;
-    let nt = (hd + 31u) / 32u;  // ≤ 8 for head_dim ≤ 256 (Qwen3.5 uses 256)
-    var xv: array<f32, 8>;
+    let nt = (hd + 31u) / 32u;  // ≤ 16 for head_dim ≤ 512 (Gemma-4 global layers)
+    var xv: array<f32, 16>;
     var ss = 0.0;
     for (var t = 0u; t < nt; t = t + 1u) {
         let d = t * 32u + lane;
@@ -17293,6 +17298,9 @@ fn gqa_attend_x(@builtin(workgroup_id) wid: vec3<u32>,
         l = 1.0;
     }
     var acc = 0.0;
+    // V wider than the workgroup (Gemma-4's 512-wide global heads): lane
+    // lid also owns dim lid + 256. Never taken at dv <= 256.
+    var acc2 = 0.0;
     var c0 = 0u;
     loop {
         if (c0 >= n) { break; }
@@ -17306,12 +17314,18 @@ fn gqa_attend_x(@builtin(workgroup_id) wid: vec3<u32>,
         if (lid < ax_p.dv) {
             acc = acc * f + ax_values(h, c0, cn, lid);
         }
+        if (lid + 256u < ax_p.dv) {
+            acc2 = acc2 * f + ax_values(h, c0, cn, lid + 256u);
+        }
         m = mp;
         c0 = c0 + 256u;
         workgroupBarrier();
     }
     if (lid < ax_p.dv) {
         ax_o[h * ax_p.dv + lid] = acc / l;
+    }
+    if (lid + 256u < ax_p.dv) {
+        ax_o[h * ax_p.dv + lid + 256u] = acc2 / l;
     }
 }
 
@@ -17401,6 +17415,9 @@ fn gqa_attend_part_x(@builtin(workgroup_id) wid: vec3<u32>,
     let idx = h * ax_p.nc + ch;
     if (lid < ax_p.dv) {
         ax_acc[idx * ax_p.dv + lid] = ax_values(h, c0, cn, lid);
+    }
+    if (lid + 256u < ax_p.dv) {
+        ax_acc[idx * ax_p.dv + lid + 256u] = ax_values(h, c0, cn, lid + 256u);
     }
     if (lid == 0u) {
         ax_ml[idx] = vec2<f32>(cm, s);
@@ -18024,6 +18041,11 @@ fn bind_pairs(
 }
 
 /// Why the ATTEND_X kernels cannot serve a layer geometry, if they cannot.
+/// Unit weights for the scale-less norms the graphs run through weighted
+/// kernels (Gemma-4's V norm): a static, so the content-keyed buffer cache
+/// sees one stable address.
+static GRAPH_ONES: [f32; 512] = [1.0; 512];
+
 fn graph_geom_problem(
     c: &Ctx,
     g: &crate::gpu::GraphAttnGeom<'_>,
@@ -18038,12 +18060,19 @@ fn graph_geom_problem(
     if g.nkv == 0 || nh % g.nkv != 0 {
         return Some("per-layer attention geometry: KV heads must divide the Q heads");
     }
-    if g.dv == 0 || g.dv % 4 != 0 || g.dv > hd || g.dv > 256 {
+    // A layer's own head width (Gemma-4's 512-wide global layers): the
+    // rope/qk-norm kernel stages up to 512 dims, the attend's value pass
+    // takes two dims a lane past 256. Wider than the call's `hd` only on a
+    // desktop-class device (the uniform arms' limit, `hd_cap`, is 256).
+    if g.hd == 0 || g.hd % 4 != 0 || g.hd > 512 || (g.hd > hd && c.hd_cap < 256) {
+        return Some("per-layer attention geometry: head width must be a multiple of 4 <= 512");
+    }
+    if g.dv == 0 || g.dv % 4 != 0 || g.dv > g.hd || g.dv > 512 {
         return Some(
             "per-layer attention geometry: V width must be a multiple of 4 in 4..=head_dim",
         );
     }
-    if g.rd > hd || g.rd % 2 != 0 || g.invf.len() < g.rd / 2 {
+    if g.rd > g.hd || g.rd % 2 != 0 || g.invf.len() < g.rd / 2 {
         return Some("per-layer attention geometry: rotary width / RoPE table out of range");
     }
     if g.window == Some(0) {
@@ -19372,6 +19401,8 @@ struct GraphScratch {
     gout: Option<(wgpu::Buffer, u64)>,
     attn: Option<(wgpu::Buffer, u64)>,
     ob: Option<(wgpu::Buffer, u64)>,
+    /// The sandwich-normed token-mixer / FFN output (Gemma), before its add.
+    ob2: Option<(wgpu::Buffer, u64)>,
     gbuf: Option<(wgpu::Buffer, u64)>,
     ubuf: Option<(wgpu::Buffer, u64)>,
     abuf: Option<(wgpu::Buffer, u64)>,
@@ -24971,9 +25002,10 @@ pub fn forward_token_graph(
             wk: GMat,
             wv: GMat,
             wo: GMat,
-            /// This layer's KV heads and V width (the call-wide nkv / hd
-            /// unless the layer carries its own geometry).
+            /// This layer's KV heads, Q/K head width and V width (the
+            /// call-wide nkv / hd unless the layer carries its own geometry).
             nkv: usize,
+            hd: usize,
             dv: usize,
             /// Spark-X2.5 head-wise output gate `[nh, hidden]`.
             hg: Option<GMat>,
@@ -25236,11 +25268,13 @@ pub fn forward_token_graph(
                 ..
             } => {
                 let (lnkv, ldv) = geom.map_or((nkv, hd), |g| (g.nkv, g.dv));
+                // Gemma-4 global layers: 512-wide heads over the call's 256.
+                let lhd = geom.map_or(hd, |g| g.hd);
                 // Gated attention: wq packs q||gate per head → 2·nh·hd rows.
-                let qrows = nh * hd * (1 + *output_gate as usize);
+                let qrows = nh * lhd * (1 + *output_gate as usize);
                 let (Some(wq), Some(wk), Some(wv), Some(wo)) = (
                     resolve(wq, qrows, hidden),
-                    resolve(wk, lnkv * hd, hidden),
+                    resolve(wk, lnkv * lhd, hidden),
                     resolve(wv, lnkv * ldv, hidden),
                     resolve(wo, hidden, nh * ldv),
                 ) else {
@@ -25267,6 +25301,7 @@ pub fn forward_token_graph(
                     wv,
                     wo,
                     nkv: lnkv,
+                    hd: lhd,
                     dv: ldv,
                     hg,
                 }
@@ -25677,10 +25712,19 @@ pub fn forward_token_graph(
             }
         )
     });
+    // Q-side scratch: the widest layer's head (Gemma-4 global layers are
+    // 512 wide over the call's 256).
+    let max_hd = lws
+        .iter()
+        .filter_map(|lw| match &lw.attn {
+            LAttn::Full { hd: lhd, .. } => Some(*lhd),
+            _ => None,
+        })
+        .fold(hd, usize::max);
     let qraw = GraphScratch::ensure(
         &c.device,
         &mut gs.qraw,
-        (nh * hd * (1 + any_gate as usize) * 4) as u64,
+        (nh * max_hd * (1 + any_gate as usize) * 4) as u64,
         st,
         "g-qraw",
     );
@@ -25688,16 +25732,33 @@ pub fn forward_token_graph(
     let kv_rows = lws
         .iter()
         .filter_map(|lw| match &lw.attn {
-            LAttn::Full { nkv, .. } => Some(*nkv * hd),
+            LAttn::Full { nkv, hd: lhd, .. } => Some(*nkv * *lhd),
             _ => None,
         })
         .fold(nkv * hd, usize::max);
     let kb = GraphScratch::ensure(&c.device, &mut gs.kb, (kv_rows * 4) as u64, st, "g-kb");
     let vb = GraphScratch::ensure(&c.device, &mut gs.vb, (kv_rows * 4) as u64, st, "g-vb");
-    let qout = GraphScratch::ensure(&c.device, &mut gs.qout, (nh * hd * 4) as u64, st, "g-qout");
-    let gout = GraphScratch::ensure(&c.device, &mut gs.gout, (nh * hd * 4) as u64, st, "g-gout");
-    let attn = GraphScratch::ensure(&c.device, &mut gs.attn, (nh * hd * 4) as u64, st, "g-attn");
+    let qout =
+        GraphScratch::ensure(&c.device, &mut gs.qout, (nh * max_hd * 4) as u64, st, "g-qout");
+    let gout =
+        GraphScratch::ensure(&c.device, &mut gs.gout, (nh * max_hd * 4) as u64, st, "g-gout");
+    let attn =
+        GraphScratch::ensure(&c.device, &mut gs.attn, (nh * max_hd * 4) as u64, st, "g-attn");
     let ob = GraphScratch::ensure(&c.device, &mut gs.ob, (hidden * 4) as u64, st, "g-ob");
+    // Gemma sandwich norms write the normed mixer/FFN output here before
+    // its residual add (allocated only when a layer has them).
+    let sandwich = layers
+        .iter()
+        .any(|l| l.attn_out_norm.is_some() || l.ffn_out_norm.is_some() || l.layer_scale.is_some());
+    if sandwich && !loop_norm_at.is_empty() {
+        graph_decline("sandwich norms with a looped stack");
+        return token_graph_outcome(o1_started || state_started, false);
+    }
+    let ob2 = if sandwich {
+        Some(GraphScratch::ensure(&c.device, &mut gs.ob2, (hidden * 4) as u64, st, "g-ob2"))
+    } else {
+        None
+    };
     let gbuf = GraphScratch::ensure(&c.device, &mut gs.gbuf, (inter * 4) as u64, st, "g-gbuf");
     let ubuf = GraphScratch::ensure(&c.device, &mut gs.ubuf, (inter * 4) as u64, st, "g-ubuf");
     let abuf = GraphScratch::ensure(&c.device, &mut gs.abuf, (inter * 4) as u64, st, "g-abuf");
@@ -25813,7 +25874,7 @@ pub fn forward_token_graph(
                         &mut kvm,
                         (kv_id, layer_base + li),
                         g.nkv,
-                        hd,
+                        g.hd,
                         g.dv,
                         cap,
                         g.window,
@@ -26985,6 +27046,7 @@ pub fn forward_token_graph(
                         wv,
                         wo,
                         nkv: lnkv,
+                        hd: lhd,
                         dv: ldv,
                         hg,
                     },
@@ -26999,6 +27061,10 @@ pub fn forward_token_graph(
                     },
                 ) => {
                     let (lnkv, ldv) = (*lnkv, *ldv);
+                    // This layer's head width: every size below (projection
+                    // rows, rope/qk-norm, mirror rows, attend) is the layer's.
+                    // Equal to the call's `hd` except on Gemma-4 global layers.
+                    let hd = *lhd;
                     let lrd = geom.map_or(rd, |g| g.rd);
                     let o1_here = o1.get(li).and_then(|v| v.as_ref());
                     // true = the fused short-context arm already ran the output
@@ -27366,6 +27432,26 @@ pub fn forward_token_graph(
                             .sink
                             .map(|sk| stor(bytemuck::cast_slice(sk)))
                             .unwrap_or_else(|| zeros(nh));
+                        // Gemma-4's scale-less V norm, in place on the raw V
+                        // rows before they are appended: the rope/qk-norm
+                        // kernel over the KV heads alone (nh = 0), K-norm bit
+                        // only, unit weights, no rotation (rd = 0) — exactly
+                        // `attention::vnorm_head`.
+                        if g.v_norm && !skip_attn {
+                            let vn_u = uniform_rope(
+                                c,
+                                rope_uniform_words(0, g.nkv, g.dv, 0, 0, 4, eps, 0, 1.0),
+                            );
+                            let ones = stor(bytemuck::cast_slice(&GRAPH_ONES[..g.dv]));
+                            let bg_vn = bg(
+                                &c.layout_attn_rope,
+                                &[&qraw, &vb, &qout, &gout, &qnw, &ones, &invf_l, &vn_u],
+                            );
+                            let mut pass = begin_pass(&mut enc);
+                            pass.set_pipeline(&c.attn_rope);
+                            pass.set_bind_group(0, &bg_vn, &[]);
+                            pass.dispatch_workgroups(g.nkv as u32, 1, 1);
+                        }
                         // RoPE + append fused, for a layer without an output
                         // gate (the fused kernel does not split q||gate).
                         let rkv = gx.rope_kv.as_ref().filter(|_| !*output_gate && hd <= 256);
@@ -28161,12 +28247,27 @@ pub fn forward_token_graph(
             // and let within-pass serialization do the same job for free.
             // CMF_PASSFUSE=0 puts it back in its own pass.
             let mut ffn_pre: Option<(&wgpu::ComputePipeline, wgpu::BindGroup, u32)> = None;
+            // Gemma sandwich: the mixer output is RMS-normed (its own
+            // weights) into ob2 before the residual add reads it.
+            let mix_out = match (l.attn_out_norm, ob2.as_ref()) {
+                (Some(w), Some(o2)) => {
+                    let won = stor(bytemuck::cast_slice(w));
+                    go(
+                        &mut enc,
+                        &c.rmsnorm,
+                        &bgc(60, li, &c.layout_rmsnorm, &[&ob, &won, o2, &rms_u]),
+                        1,
+                    );
+                    o2
+                }
+                _ => &ob,
+            };
             if !skip_norm {
                 let nbg = bgc(
                     23,
                     li,
                     &c.layout_add_rmsnorm,
-                    &[&h_buf, &ob, &pnw, &n1, &rms_u],
+                    &[&h_buf, mix_out, &pnw, &n1, &rms_u],
                 );
                 if fuse_pre {
                     ffn_pre = Some((&c.add_rmsnorm, nbg, 1));
@@ -28179,7 +28280,10 @@ pub fn forward_token_graph(
             // dispatch writes — the same within-pass ordering the block above
             // relies on. With both ends folded in, a layer is TWO passes
             // (token-mix, then FFN) instead of four.
-            let simple_tail = fuse_tail && !loop_norm_at.contains(&li);
+            // A sandwich-normed or layer-scaled FFN output takes the unfused
+            // tail below (its norm and scale sit between the FFN and the add).
+            let sandwich_tail = l.ffn_out_norm.is_some() || l.layer_scale.is_some();
+            let simple_tail = fuse_tail && !loop_norm_at.contains(&li) && !sandwich_tail;
             let mut ffn_post: Option<(&wgpu::ComputePipeline, wgpu::BindGroup, u32)> = None;
             let mut tail_done = false;
             if simple_tail {
@@ -29160,6 +29264,50 @@ pub fn forward_token_graph(
             ts!(enc, 2, lkind);
             if tail_done {
                 // already emitted at the end of the FFN pass
+            } else if sandwich_tail {
+                // Gemma: ob2 = rms(ob)·ffn_out_norm, then h = (h + ob2)·scale
+                // and n1 = rms(h)·next input norm in one add_rmsnorm (the
+                // scale rides its `_p` word). The last layer reuses the same
+                // dispatch for the add and scale; its norm output is unused
+                // (the head normalizes h itself).
+                let tail_src = match (l.ffn_out_norm, ob2.as_ref()) {
+                    (Some(w), Some(o2)) => {
+                        let wfn = stor(bytemuck::cast_slice(w));
+                        go(
+                            &mut enc,
+                            &c.rmsnorm,
+                            &bgc(61, li, &c.layout_rmsnorm, &[&ob, &wfn, o2, &rms_u]),
+                            1,
+                        );
+                        o2
+                    }
+                    _ => &ob,
+                };
+                let tail_u = uniform_u32x4(
+                    c,
+                    [
+                        hidden as u32,
+                        if gemma { 1u32 } else { 0 },
+                        eps.to_bits(),
+                        l.layer_scale.map_or(0, |sc| sc.to_bits()),
+                    ],
+                );
+                let next_w = if li + 1 < layers.len() {
+                    stor(bytemuck::cast_slice(layers[li + 1].input_norm))
+                } else {
+                    pnw.clone()
+                };
+                go(
+                    &mut enc,
+                    &c.add_rmsnorm,
+                    &bgc(
+                        62,
+                        li,
+                        &c.layout_add_rmsnorm,
+                        &[&h_buf, tail_src, &next_w, &n1, &tail_u],
+                    ),
+                    1,
+                );
             } else if li + 1 < layers.len() {
                 if loop_norm_at.contains(&li) {
                     // h += ob; n1 = rms(h, final_norm); copy n1→h; n1 = rms(h, next_input_norm)
