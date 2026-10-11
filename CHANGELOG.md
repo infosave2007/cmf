@@ -5,6 +5,36 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- humanizer (`jialinyyzz/humanizer`, a Gemma-4 12B rewriting fine-tune,
+  Apache-2.0) in CMF: text model only, the authors' completion prompt as the
+  file's chat template (`run --prompt` and `/v1/chat/completions` build
+  exactly `BOS + instruction + draft.strip() + "\n\n### Rewritten:\n\n"`,
+  system and earlier turns ignored), and their sampling as file defaults.
+- `cortiq convert --sampling temperature=…,top_p=…,top_k=…,min_p=…,repetition_penalty=…`
+  records a model's recommended sampling in the header
+  (`provenance.sampling`, shown by `cortiq info`); `run` and `serve` start
+  from it, flags and request fields still override it.
+- `cortiq serve`: `top_k` (0 or negative = off) and `min_p` request fields on
+  `/v1/chat/completions` and `/v1/completions`, llama.cpp's
+  `repeat_penalty` as an alias of `repetition_penalty`, `top_p`/`seed` on
+  `/v1/completions`.
+
+### Performance
+- Gemma-4 dense models run on the wgpu whole-token graph: per-layer head
+  width (512-wide global layers over 256-wide sliding ones), the scale-less
+  V norm, sandwich norms and the layer scalar. humanizer q8_2f on an RTX PRO
+  4000: decode 7.2 → 32.9 tok/s (`bench --core`), logits against HF
+  transformers (bf16) on 5,320 prompt positions: top-1 97.7 %, KL 2.1e-3.
+  Gemma-2/3 keep the per-op path until measured the same way.
+- tanh-GELU (`gelu_pytorch_tanh`) in the device FFN kernels: Gemma dense
+  FFNs run on the card in decode and prefill instead of the host.
+- Top-p without top-k samples from the head of the distribution instead of
+  sorting the vocabulary every token (exact; ~40 ms a token at a 262k
+  vocab). Gemma's final-logit soft-capping runs on the worker pool.
+
 ## [0.8.15] - 2026-10-10
 
 ### Added
