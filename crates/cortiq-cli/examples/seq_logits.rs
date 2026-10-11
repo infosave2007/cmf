@@ -8,7 +8,9 @@
 //! (`greedy` optional: after the sequence, decode N greedy tokens and
 //! record them with their logits rows too; `score_from` optional: write
 //! rows from this index on only; `text` / `chat` optional: tokenizer and
-//! chat-template parity against `ids`, `parity_only` skips the forward).
+//! chat-template parity against `ids`, `parity_only` skips the forward;
+//! `prefill: true` runs the prompt through the batched prefill and keeps
+//! only its last row before the greedy rows).
 //! Output, per sequence, in <out_dir>:
 //!   <name>.f32  — rows × vocab little-endian f32, row p = logits after
 //!                 position p (row 0 predicts ids[1]); greedy rows follow
@@ -89,11 +91,22 @@ fn main() {
         }
         let t0 = std::time::Instant::now();
         let mut rows: Vec<Vec<f32>> = Vec::with_capacity(ids.len() + greedy);
-        let first = p.forward_ids(&ids[..1], None).expect("forward_ids");
-        let vocab = first.len();
-        rows.push(first);
-        for (pos, &id) in ids.iter().enumerate().skip(1) {
-            rows.push(p.decode_step_logits(id, pos));
+        // `"prefill": true`: the whole prompt through the batched prefill
+        // (what run/serve take), ONE row = the logits after its last
+        // position; greedy rows follow through the decode path.
+        let batched = v.get("prefill").and_then(|b| b.as_bool()).unwrap_or(false);
+        let vocab;
+        if batched {
+            let last = p.forward_ids(&ids, None).expect("forward_ids");
+            vocab = last.len();
+            rows.push(last);
+        } else {
+            let first = p.forward_ids(&ids[..1], None).expect("forward_ids");
+            vocab = first.len();
+            rows.push(first);
+            for (pos, &id) in ids.iter().enumerate().skip(1) {
+                rows.push(p.decode_step_logits(id, pos));
+            }
         }
         let mut greedy_ids = Vec::new();
         let mut pos = ids.len();
@@ -132,6 +145,7 @@ fn main() {
             "score_from": score_from,
             "vocab": vocab,
             "n_prompt": ids.len(),
+            "batched_prefill": batched,
             "greedy_ids": greedy_ids,
             "greedy_text": p.tokenizer.decode(&greedy_ids),
             "top1": top1,

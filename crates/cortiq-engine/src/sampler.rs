@@ -1172,6 +1172,81 @@ fn apply_top_k(probs: &mut [f32], k: usize, sel: &mut Vec<f32>) {
 /// sorted — after top-k that is ≤ k elements, not the whole vocab; the
 /// kept set is marked in-place instead of a per-token HashSet.
 fn apply_top_p(probs: &mut [f32], top_p: f32) {
+    if apply_top_p_head(probs, top_p) {
+        return;
+    }
+    apply_top_p_full(probs, top_p);
+}
+
+/// Top-p from the head of the distribution, without sorting the vocab:
+/// partition out the `TOP_P_HEAD` largest probabilities, sort only those,
+/// and find the cutoff there. Keeps exactly what `apply_top_p_full` keeps
+/// — every probability above the cutoff value, and of those EQUAL to it
+/// the lowest indices first (the stable sort's order) — and declines
+/// (false, `probs` untouched) when the nucleus does not close inside the
+/// head or a tie at the cutoff reaches past it. A 262k vocab with no top-k
+/// (Gemma-4 humanizer: top-p 0.95, top-k off) paid a full 262k sort per
+/// token on the host: ~40 ms of a ~70 ms token.
+const TOP_P_HEAD: usize = 1024;
+
+fn apply_top_p_head(probs: &mut [f32], top_p: f32) -> bool {
+    let n = probs.len();
+    if n <= TOP_P_HEAD * 4 {
+        return false;
+    }
+    let mut head: Vec<(usize, f32)> = probs
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|&(_, p)| p > 0.0)
+        .collect();
+    if head.len() <= TOP_P_HEAD {
+        return false;
+    }
+    let by_desc = |a: &(usize, f32), b: &(usize, f32)| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    };
+    head.select_nth_unstable_by(TOP_P_HEAD - 1, by_desc);
+    head.truncate(TOP_P_HEAD);
+    head.sort_by(by_desc);
+    let mut cumsum = 0.0f32;
+    let mut cut = None;
+    for (i, &(_, prob)) in head.iter().enumerate() {
+        cumsum += prob;
+        if cumsum >= top_p {
+            cut = Some(i);
+            break;
+        }
+    }
+    let Some(cut) = cut else {
+        return false;
+    };
+    let v = head[cut].1;
+    // How many of the kept entries carry the cutoff value; the full sort
+    // keeps exactly that many of the value's lowest indices.
+    let keep_eq = head[..=cut].iter().filter(|&&(_, p)| p == v).count();
+    // A tie group that spills past the head could hide lower indices the
+    // partition left out: the full sort decides then.
+    if head[TOP_P_HEAD - 1].1 == v {
+        return false;
+    }
+    let mut eq_seen = 0usize;
+    for p in probs.iter_mut() {
+        if *p > v {
+            continue;
+        }
+        if *p == v && eq_seen < keep_eq {
+            eq_seen += 1;
+            continue;
+        }
+        *p = 0.0;
+    }
+    true
+}
+
+fn apply_top_p_full(probs: &mut [f32], top_p: f32) {
     let mut indexed: Vec<(usize, f32)> = probs
         .iter()
         .copied()
@@ -1702,6 +1777,38 @@ mod tests {
         let mut scratch = SamplerScratch::default();
         apply_repetition_penalty(&mut logits, &[1, 1, 2, 1, 2], 2.0, &mut scratch);
         assert_eq!(logits, vec![1.0, 2.0, -12.0]);
+    }
+
+    /// The head-only top-p keeps exactly what the full sort keeps, ties at
+    /// the cutoff included (few distinct values on purpose).
+    #[test]
+    fn top_p_head_matches_the_full_sort() {
+        for seed in 0..40u64 {
+            let mut r = SplitMix64::new(seed);
+            let n = 20_000usize;
+            let flat = seed % 3 == 0;
+            let raw: Vec<f32> = (0..n)
+                .map(|i| {
+                    let u = r.next_f32();
+                    if flat {
+                        ((r.next_u64() % 7) as f32) * 0.5
+                    } else if i % 97 == 0 {
+                        8.0 + 4.0 * u
+                    } else {
+                        u * 3.0
+                    }
+                })
+                .collect();
+            let mut probs = raw.clone();
+            softmax_inplace_pool(None, &mut probs);
+            for &tp in &[0.5f32, 0.9, 0.95, 0.999] {
+                let mut a = probs.clone();
+                let mut b = probs.clone();
+                apply_top_p(&mut a, tp);
+                apply_top_p_full(&mut b, tp);
+                assert_eq!(a, b, "seed {seed} top_p {tp}");
+            }
+        }
     }
 
     #[test]
