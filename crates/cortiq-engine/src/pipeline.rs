@@ -2966,9 +2966,7 @@ impl Pipeline {
             crate::gpu::hostprof_total(_mt0);
             lg.resize(self.vocab_size, 0.0);
             if let Some(c) = self.final_softcap {
-                for l in lg.iter_mut() {
-                    *l = c * (*l / c).tanh();
-                }
+                softcap_in_place(&mut lg, c, self.pool.as_deref());
             }
             self.graph_logits = Some(lg);
         }
@@ -8396,9 +8394,7 @@ impl Pipeline {
                             // decode paths apply it; scoring must too, or
                             // the uncapped softmax misprices every token.
                             if let Some(c) = self.final_softcap {
-                                for v in lg.iter_mut() {
-                                    *v = c * (*v / c).tanh();
-                                }
+                                softcap_in_place(lg, c, self.pool.as_deref());
                             }
                             // Cortiq Embryo hierarchical head: same correction
                             // the decode path applies (lm_head_forward).
@@ -12382,9 +12378,7 @@ impl Pipeline {
                     }
                 }
                 if let Some(c) = self.final_softcap {
-                    for v in lg.iter_mut() {
-                        *v = c * (*v / c).tanh();
-                    }
+                    softcap_in_place(lg, c, self.pool.as_deref());
                 }
                 let target = ids[absolute + 1] as usize;
                 if target >= vocab {
@@ -15187,9 +15181,7 @@ impl Pipeline {
                         // pad/cap to vocab and hand them to the sampler directly.
                         lg.resize(self.vocab_size, 0.0);
                         if let Some(c) = self.final_softcap {
-                            for l in lg.iter_mut() {
-                                *l = c * (*l / c).tanh();
-                            }
+                            softcap_in_place(&mut lg, c, self.pool.as_deref());
                         }
                         self.graph_logits = Some(lg);
                     }
@@ -15266,9 +15258,7 @@ impl Pipeline {
                     if !lg.is_empty() {
                         lg.resize(self.vocab_size, 0.0);
                         if let Some(c) = self.final_softcap {
-                            for l in lg.iter_mut() {
-                                *l = c * (*l / c).tanh();
-                            }
+                            softcap_in_place(&mut lg, c, self.pool.as_deref());
                         }
                         self.graph_logits = Some(lg);
                     }
@@ -16015,9 +16005,7 @@ impl Pipeline {
             }
         }
         if let Some(c) = self.final_softcap {
-            for l in logits.iter_mut() {
-                *l = c * (*l / c).tanh();
-            }
+            softcap_in_place(&mut logits, c, self.pool.as_deref());
         }
         if let Some(cm) = self.head_clusters.as_ref() {
             self.hierarchical_head_logprobs(hidden, cm, &mut logits);
@@ -16960,6 +16948,30 @@ fn moe_ffn_rows_exact(
         }
     }
     out
+}
+
+/// Gemma's final-logit soft-capping, `c·tanh(x/c)`, over a whole vocab row —
+/// element for element the serial expression, split across the pool: at a
+/// 262k vocab the serial `tanh` pass was ~5 ms of a 36 ms decode token.
+pub(crate) fn softcap_in_place(v: &mut [f32], c: f32, pool: Option<&Pool>) {
+    match pool {
+        Some(p) if v.len() >= 1 << 15 => {
+            let base = v.as_mut_ptr() as usize;
+            p.run_rows(v.len(), &|s, e| {
+                // SAFETY: run_rows hands out disjoint [s, e) ranges of `v`,
+                // which outlives the (blocking) dispatch.
+                let sl = unsafe { std::slice::from_raw_parts_mut((base as *mut f32).add(s), e - s) };
+                for x in sl {
+                    *x = c * (*x / c).tanh();
+                }
+            });
+        }
+        _ => {
+            for x in v.iter_mut() {
+                *x = c * (*x / c).tanh();
+            }
+        }
+    }
 }
 
 thread_local! {
