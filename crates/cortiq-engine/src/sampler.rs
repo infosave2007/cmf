@@ -35,6 +35,9 @@ pub struct SamplerScratch {
     cand_parts: Vec<Vec<(u32, f32)>>,
     sum_parts: Vec<f32>,
     sparse: Sparse,
+    /// Set by `sparse_distribution_into`: the top-p nucleus closed inside
+    /// the candidates (false = the candidate cap cut it short).
+    sparse_cut: bool,
 }
 
 impl SamplerScratch {
@@ -280,6 +283,26 @@ pub fn sample_with_scratch_pool(
         scratch.sparse = sp;
         return t;
     }
+    // Top-p with top-k OFF (the humanizer's 0.95 over Gemma's 262k vocab):
+    // the nucleus nearly always closes inside the SPARSE_TOPK_MAX largest
+    // logits, and then top-k at that cap keeps exactly what top-k off keeps
+    // — so the sparse chain serves it. A nucleus that does not close there
+    // (a flat row) falls through to the dense chain. The dense pass over
+    // the whole vocab was ~9 ms of a ~44 ms decode token.
+    if nucleus_sparse_ok(config, logits.len()) {
+        let capped = SamplerConfig {
+            top_k: SPARSE_TOPK_MAX as u32,
+            ..config.clone()
+        };
+        let mut sp = std::mem::take(&mut scratch.sparse);
+        let ok = sparse_distribution_into(logits, &capped, past_tokens, scratch, pool, &mut sp);
+        if ok && scratch.sparse_cut {
+            let t = draw_sparse(&sp, rng);
+            scratch.sparse = sp;
+            return t;
+        }
+        scratch.sparse = sp;
+    }
     let mut probs = std::mem::take(&mut scratch.probs);
     let normalized = chain(logits, config, past_tokens, scratch, pool, &mut probs);
 
@@ -490,6 +513,20 @@ pub const SPARSE_TOPK_MAX: usize = 256;
 /// Whether `config` can go through the sparse chain: a real temperature
 /// and a top-k in 1..=256. Qwen's recommended instruct settings
 /// (0.7 / top-p 0.8 / top-k 20 / presence 1.5) do.
+/// Top-p without top-k over a vocabulary much larger than the sparse cap.
+fn nucleus_sparse_ok(config: &SamplerConfig, vocab: usize) -> bool {
+    config.top_k == 0
+        && config.temperature >= 1e-6
+        && config.top_p > 0.0
+        && config.top_p < 1.0
+        && vocab > SPARSE_TOPK_MAX * 4
+        && {
+            // `CMF_NUCLEUS_SPARSE=0` keeps the dense chain (A/B).
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| std::env::var("CMF_NUCLEUS_SPARSE").as_deref() != Ok("0"))
+        }
+}
+
 pub fn sparse_ok(config: &SamplerConfig) -> bool {
     config.temperature >= 1e-6 && config.top_k > 0 && (config.top_k as usize) <= SPARSE_TOPK_MAX
 }
@@ -561,6 +598,7 @@ pub fn sparse_distribution_into(
         let min_p = config.min_p;
         let mut cum = 0.0f32;
         let mut cut = false;
+        scratch.sparse_cut = false;
         for &(id, l) in cand.iter() {
             if cut {
                 break;
@@ -579,6 +617,7 @@ pub fn sparse_distribution_into(
                 cut = true;
             }
         }
+        scratch.sparse_cut = cut;
         // renormalise over the survivors and order by id
         let sum: f32 = out.iter().map(|c| c.1).sum();
         if sum > 0.0 {
@@ -1777,6 +1816,56 @@ mod tests {
         let mut scratch = SamplerScratch::default();
         apply_repetition_penalty(&mut logits, &[1, 1, 2, 1, 2], 2.0, &mut scratch);
         assert_eq!(logits, vec![1.0, 2.0, -12.0]);
+    }
+
+    /// Top-p with top-k off through the capped sparse chain: when the
+    /// nucleus closes inside the cap, the support and probabilities are the
+    /// dense chain's (top-k 0), as for the sparse chain proper.
+    #[test]
+    fn nucleus_sparse_matches_the_dense_top_p() {
+        let n = 50_000usize;
+        let mut closed = 0;
+        for seed in 0..8u64 {
+            let mut r = SplitMix64::new(500 + seed);
+            let logits: Vec<f32> = (0..n)
+                .map(|i| {
+                    let base = ((r.next_u64() % 3000) as f32 - 1500.0) / 300.0;
+                    if i % 997 == 0 { base + 14.0 } else { base }
+                })
+                .collect();
+            let cfg = SamplerConfig {
+                temperature: 1.0,
+                top_p: 0.95,
+                top_k: 0,
+                min_p: 0.0,
+                repetition_penalty: 1.0,
+                ..Default::default()
+            };
+            assert!(nucleus_sparse_ok(&cfg, n));
+            let mut sd = SamplerScratch::default();
+            let mut dense = Vec::new();
+            distribution_into(&logits, &cfg, &[], &mut sd, None, &mut dense);
+            let capped = SamplerConfig { top_k: SPARSE_TOPK_MAX as u32, ..cfg.clone() };
+            let mut ss = SamplerScratch::default();
+            let mut sp = Vec::new();
+            let ok = sparse_distribution_into(&logits, &capped, &[], &mut ss, None, &mut sp);
+            if !(ok && ss.sparse_cut) {
+                continue;
+            }
+            closed += 1;
+            let dense_nz: Vec<(u32, f32)> = dense
+                .iter()
+                .enumerate()
+                .filter(|&(_, &v)| v > 0.0)
+                .map(|(i, &v)| (i as u32, v))
+                .collect();
+            assert_eq!(dense_nz.len(), sp.len(), "seed {seed}");
+            for (a, b) in dense_nz.iter().zip(sp.iter()) {
+                assert_eq!(a.0, b.0, "seed {seed}: ids differ");
+                assert!((a.1 - b.1).abs() <= 2e-5 * a.1.max(1e-3), "seed {seed}: {} vs {}", a.1, b.1);
+            }
+        }
+        assert!(closed >= 4, "the nucleus closed inside the cap only {closed} times");
     }
 
     /// The head-only top-p keeps exactly what the full sort keeps, ties at
