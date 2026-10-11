@@ -9967,14 +9967,33 @@ pub struct ChunkLayer<'a> {
     pub window: Option<usize>,
     /// Per-head sigmoid output gate `[nh × hs]` (Spark-X2.5 `g_proj`).
     pub head_gate: Option<&'a [f32]>,
-    /// Exact GELU between gate and up instead of SiLU.
-    pub gelu: bool,
+    /// The activation between gate and up, `GraphAct::code`: 0 SiLU,
+    /// 1 exact GELU, 2 tanh-GELU (Gemma-4, `gemma4`).
+    pub act: u8,
+    /// Gemma-4's extras (`gemma4`): per-layer geometry, V norm, attention
+    /// scale, sandwich norms, layer scalar, q8_2f FFN.
+    pub g4: Option<ChunkGemma4<'a>>,
     /// q8_2f input fields of q, k, v, o (empty = plain q8_row / q4):
     /// the GEMM reads x·col (`col_scale_rows`), as the CPU's `prescale`.
     pub col: [&'a [f32]; 4],
     /// A routed-experts FFN instead of gate/up/down (Mellum2.1): `gate`,
     /// `up`, `down` then carry the FIRST expert's trio for the shape checks.
     pub moe: Option<ChunkMoe<'a>>,
+}
+
+/// What a Gemma-4 chunk layer adds (`gpu_metal::gemma4`). Its layers may
+/// differ in KV heads and head width (512-wide global layers over one KV
+/// head: the 16-slot `chunk_rope_kv_w16`); the attention GEMMs run with f32
+/// operand tiles and every q8_2f projection — the FFN's too — through the
+/// blob-addressed f32-tile GEMM that reads the weight's own input field
+/// (`moe_q8`), the pair that held Mellum2.1's q8_2f perplexity on the CPU's.
+pub struct ChunkGemma4<'a> {
+    pub v_norm: bool,
+    /// Attention score scale (the model's; Gemma-4 sets 1.0).
+    pub scale: f32,
+    pub attn_out_norm: Option<&'a [f32]>,
+    pub ffn_out_norm: Option<&'a [f32]>,
+    pub layer_scale: Option<f32>,
 }
 
 /// The MoE FFN of a chunk-graph layer: f32 router rows, the q4tp expert
@@ -10258,6 +10277,9 @@ struct ChunkPrep {
     st0: usize,
     /// Routed experts' absolute (gate, up, down) offsets (MoE layers).
     moe_abs: Vec<(usize, usize, usize)>,
+    /// Gemma-4: which of the seven weights are q8_2f blobs (the blob GEMM
+    /// reads their row scales and input field in place; bounds checked).
+    q8f: [bool; 7],
 }
 
 /// GPU time of a completed command buffer (GPUEndTime − GPUStartTime),
@@ -10361,9 +10383,23 @@ pub fn chunk_run_gpu(
         return false;
     }
     let (nh, nkv, hd, hs, inter) = (first.nh, first.nkv, first.hd, first.hs, first.inter);
+    // Gemma-4 runs carry their own kernels and may vary KV heads / head
+    // width per layer (the buffers below are sized for the widest).
+    let g4p = if layers.iter().any(|l| l.g4.is_some() || l.act == 2) {
+        match gemma4::pipes(c) {
+            Some(p) if layers.iter().all(|l| l.g4.is_some()) => Some(p),
+            _ => return false,
+        }
+    } else {
+        None
+    };
+    if g4p.is_some() && moe_q8::pipes(c).is_none() {
+        return false;
+    }
+    let wide_ok = |hd: usize| hd <= 256 || (g4p.is_some() && gemma4::w16_on() && hd <= 512);
     if b < 32
         || hd % 4 != 0
-        || hd > 256
+        || !wide_ok(hd)
         || first.rd < 2
         || first.rd > hd
         || (first.rd / 2) % 32 != 0
@@ -10383,7 +10419,15 @@ pub fn chunk_run_gpu(
     // resident, shapes uniform, mirror ready).
     let mut preps: Vec<ChunkPrep> = Vec::with_capacity(layers.len());
     for (l, lio) in layers.iter().zip(io.iter()) {
-        if l.nh != nh || l.nkv != nkv || l.hd != hd || l.hs != hs || l.inter != inter {
+        if l.nh != nh || l.hs != hs || l.inter != inter {
+            return false;
+        }
+        if g4p.is_none() && (l.nkv != nkv || l.hd != hd) {
+            return false;
+        }
+        // This layer's own KV heads and head width (uniform but for Gemma-4).
+        let (nkv, hd) = (l.nkv, l.hd);
+        if hd % 4 != 0 || !wide_ok(hd) || l.nkv == 0 || nh % l.nkv != 0 {
             return false;
         }
         // Per-layer RoPE width (Spark-X2.5: 64 on full layers, 256 on
@@ -10432,6 +10476,25 @@ pub fn chunk_run_gpu(
             match abs_of(t) {
                 Some(a) => *slot = a,
                 None => return false,
+            }
+        }
+        // Gemma-4: q8_2f weights take the blob GEMM — its payload, row
+        // scales and input field inside the mapping, K a multiple of 32.
+        let mut q8f = [false; 7];
+        if l.g4.is_some() {
+            for (i, t) in tens.iter().enumerate() {
+                let Some(e) = l.model.tensors.get(t.0) else {
+                    return false;
+                };
+                if e.dtype == cortiq_core::TensorDtype::Q8_2f {
+                    let fits = moe_q8::tensor_bytes(t.1, t.2).is_some_and(|n| {
+                        abs[i] % 4 == 0 && abs[i] + n <= safe_len && e.nbytes as usize >= n
+                    });
+                    if !fits || t.2 % 32 != 0 || (i < 4 && l.col[i].is_empty()) {
+                        return false;
+                    }
+                    q8f[i] = true;
+                }
             }
         }
         // Routed experts: every trio q4tp, the first one's shape, in the file.
@@ -10627,26 +10690,30 @@ pub fn chunk_run_gpu(
             cap,
             st0,
             moe_abs,
+            q8f,
         });
     }
 
     // ── Shared per-run buffers (pooled by size, reused across layers —
     // encoder ordering within one command buffer serializes access).
+    // The widest layer's Q and KV rows (every layer's for all but Gemma-4).
+    let qw = layers.iter().map(|l| l.nh * l.hd).max().unwrap_or(nh * hd);
+    let kvw = layers.iter().map(|l| l.nkv * l.hd).max().unwrap_or(nkv * hd);
     let h_b = io_buf(c, 60_000_000_071 + b * hs, b * hs * 4);
     let n_b = io_buf(c, 61_000_000_091 + b * hs, b * hs * 4);
-    let qraw = io_buf(c, 62_000_000_017 + b * nh * hd, b * nh * hd * 4);
-    let kraw = io_buf(c, 63_000_000_029 + b * nkv * hd, b * nkv * hd * 4);
-    let vraw = io_buf(c, 64_000_000_063 + b * nkv * hd, b * nkv * hd * 4);
-    let qrope = io_buf(c, 65_000_000_087 + b * nh * hd, b * nh * hd * 4);
-    let attn = io_buf(c, 66_000_000_103 + b * nh * hd, b * nh * hd * 4);
-    let apanel = io_buf(c, 73_000_000_117 + b * nh * hd, b * nh * hd * 4);
+    let qraw = io_buf(c, 62_000_000_017 + b * qw, b * qw * 4);
+    let kraw = io_buf(c, 63_000_000_029 + b * kvw, b * kvw * 4);
+    let vraw = io_buf(c, 64_000_000_063 + b * kvw, b * kvw * 4);
+    let qrope = io_buf(c, 65_000_000_087 + b * qw, b * qw * 4);
+    let attn = io_buf(c, 66_000_000_103 + b * qw, b * qw * 4);
+    let apanel = io_buf(c, 73_000_000_117 + b * qw, b * qw * 4);
     let ob = io_buf(c, 67_000_000_141 + b * hs, b * hs * 4);
     let gb = io_buf(c, 68_000_000_169 + b * inter, b * inter * 4);
     let ub = io_buf(c, 69_000_000_213 + b * inter, b * inter * 4);
     let db = io_buf(c, 71_000_000_073 + b * hs, b * hs * 4);
     // q8_2f: x·col staged for the projection that reads it (serial
     // encoders order the reuse).
-    let xpre = io_buf(c, 75_000_000_019 + b * hs.max(nh * hd), b * hs.max(nh * hd) * 4);
+    let xpre = io_buf(c, 75_000_000_019 + b * hs.max(qw), b * hs.max(qw) * 4);
     let col_scale = |enc: &metal::ComputeCommandEncoderRef, x: &Buffer, col: &[f32], n: usize| {
         enc.set_compute_pipeline_state(&c.colscale);
         enc.set_buffer(0, Some(x), 0);
@@ -10722,6 +10789,8 @@ pub fn chunk_run_gpu(
         cmd = prof.cut(c, cmd, "embed");
     }
     for (l, prep) in layers.iter().zip(&preps) {
+        // This layer's geometry (Gemma-4's global layers: 512 wide, 1 KV head).
+        let (nkv, hd) = (l.nkv, l.hd);
         let inorm = const_buf(c, l.input_norm);
         let pnorm = const_buf(c, l.post_norm);
         let invf = const_buf(c, &l.inv_freq[..l.rd / 2]);
@@ -10768,6 +10837,13 @@ pub fn chunk_run_gpu(
         let q8l = l.moe.as_ref().is_some_and(|m| m.q8);
         let q8proj = if q8l && moe_q8::proj_on() { moe_q8::pipes(c) } else { None };
         let q8att = if q8l && moe_q8::att_on() { moe_q8::pipes(c) } else { None };
+        // Gemma-4: q8_2f projections through the blob GEMM (their input
+        // fields read in place) and f32 attention tiles, always.
+        let (q8proj, q8att) = if l.g4.is_some() {
+            (moe_q8::pipes(c), moe_q8::pipes(c))
+        } else {
+            (q8proj, q8att)
+        };
         {
             // Independent outputs — one encoder, three dispatches (a q8_2f
             // projection stages its x·col first; the serial encoder orders
@@ -10792,9 +10868,18 @@ pub fn chunk_run_gpu(
             enc.end_encoding();
         }
         cmd = prof.cut(c, cmd, "mm_qkv");
+        if l.g4.as_ref().is_some_and(|g| g.v_norm) {
+            let enc = cmd.new_compute_command_encoder();
+            gemma4::enc_vnorm(g4p.unwrap(), enc, &vraw, nkv, hd, b, l.eps);
+            enc.end_encoding();
+        }
         {
             let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&c.cropekv);
+            enc.set_compute_pipeline_state(if hd > 256 {
+                &g4p.unwrap().cropekv16
+            } else {
+                &c.cropekv
+            });
             for (i, buf) in [
                 &qraw, &kraw, &vraw, &qrope, &prep.k_mb, &prep.v_mb, &bqb, &bkb, &bvb, &qn_b,
                 &kn_b, &invf,
@@ -10848,7 +10933,7 @@ pub fn chunk_run_gpu(
             // Grow-only per (nkv, chunk rows): every score the reads below
             // touch is written first, so a larger slot changes nothing.
             let scores = io_buf_grow(c, 72_000_000_089 + nkv * m_rows, nkv * m_rows * ncur * 4);
-            let scale = 1.0f32 / (hd as f32).sqrt();
+            let scale = l.g4.as_ref().map_or(1.0f32 / (hd as f32).sqrt(), |g| g.scale);
             {
                 let enc = cmd.new_compute_command_encoder();
                 match q8att {
@@ -10974,6 +11059,19 @@ pub fn chunk_run_gpu(
             enc.end_encoding();
         }
         cmd = prof.cut(c, cmd, "mm_o");
+        // Gemma-4 sandwich: O·attn is RMS-normed in place before its add.
+        if let Some(w) = l.g4.as_ref().and_then(|g| g.attn_out_norm) {
+            let enc = cmd.new_compute_command_encoder();
+            disp(
+                enc,
+                &c.rmsrows,
+                &[(&ob, 0), (&const_buf(c, w), 0), (&ob, 0)],
+                &[hs as u32, l.gemma as u32],
+                &[l.eps],
+                ((b * 256) as u64, 256),
+            );
+            enc.end_encoding();
+        }
         add_norm(&cmd, Some(&ob), &pnorm, &n_b);
         cmd = prof.cut(c, cmd, "axpy+norm");
         if let Some(m) = &l.moe {
@@ -10982,6 +11080,65 @@ pub fn chunk_run_gpu(
                 return false;
             }
             cmd = prof.cut(c, cmd, "moe");
+        } else if let Some(g4) = l.g4.as_ref() {
+            // Gemma-4: gate/up (a q8_2f weight through the blob GEMM with its
+            // own input field, any other through the tiled GEMM), the
+            // activation in place over the gate rows, down, then the layer
+            // tail h = (h + norm(down))·scalar — no delta left pending.
+            let p8 = moe_q8::pipes(c).expect("checked with g4p");
+            let mm = |enc: &metal::ComputeCommandEncoderRef,
+                      i: usize,
+                      t: &(usize, usize, usize, &[f32]),
+                      x: &Buffer,
+                      y: &Buffer| {
+                if prep.q8f[i] {
+                    moe_q8::enc_mm_rows(p8, enc, &fbuf, prep.abs[i], x, 0, y, 0, b, t.1, t.2, true);
+                } else {
+                    enc_mul_mm(c, enc, &fbuf, prep.abs[i], &prep.rs[i], prep.kind[i], x, y, b, t.1, t.2);
+                }
+            };
+            let enc = cmd.new_compute_command_encoder();
+            mm(enc, 4, &l.gate, &n_b, &gb);
+            mm(enc, 5, &l.up, &n_b, &ub);
+            enc.end_encoding();
+            cmd = prof.cut(c, cmd, "mm_gateup");
+            let enc = cmd.new_compute_command_encoder();
+            if l.act == 2 {
+                gemma4::enc_gelut(g4p.unwrap(), enc, &gb, &ub, &gb, b * inter);
+            } else {
+                enc.set_compute_pipeline_state(if l.act == 1 { &c.gelu } else { &c.silu });
+                enc.set_buffer(0, Some(&gb), 0);
+                enc.set_buffer(1, Some(&ub), 0);
+                enc.set_buffer(2, Some(&gb), 0); // dummy col (has_col = 0)
+                enc.set_buffer(3, Some(&gb), 0);
+                let (n_u, hc) = ((b * inter) as u32, 0u32);
+                enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(5, 4, &hc as *const u32 as *const std::ffi::c_void);
+                enc.dispatch_threads(MTLSize::new((b * inter) as u64, 1, 1), MTLSize::new(256, 1, 1));
+            }
+            enc.end_encoding();
+            let enc = cmd.new_compute_command_encoder();
+            mm(enc, 6, &l.down, &gb, &db);
+            enc.end_encoding();
+            if g4.ffn_out_norm.is_some() || g4.layer_scale.is_some() {
+                let enc = cmd.new_compute_command_encoder();
+                let wb = g4.ffn_out_norm.map(|w| const_buf(c, w));
+                gemma4::enc_norm_add_scale(
+                    g4p.unwrap(),
+                    enc,
+                    &h_b,
+                    &db,
+                    wb.as_ref(),
+                    hs,
+                    l.gemma,
+                    l.eps,
+                    g4.layer_scale.unwrap_or(1.0),
+                    b,
+                );
+                enc.end_encoding();
+                pending_delta = false;
+            }
+            cmd = prof.cut(c, cmd, "mm_down");
         } else {
         {
             let enc = cmd.new_compute_command_encoder();
@@ -11014,7 +11171,7 @@ pub fn chunk_run_gpu(
             enc.end_encoding();
         }
         cmd = prof.cut(c, cmd, "mm_gateup");
-        if l.gelu {
+        if l.act == 1 {
             // GELU: gelu(g)·u in place over the gate rows, then the plain
             // down GEMM (the fused-activation GEMMs compute SiLU only).
             let enc = cmd.new_compute_command_encoder();
@@ -11126,7 +11283,8 @@ pub fn chunk_run_gpu(
     unsafe {
         std::ptr::copy_nonoverlapping(h_b.contents() as *const f32, h.as_mut_ptr(), b * hs);
     }
-    for (prep, lio) in preps.iter().zip(io.iter_mut()) {
+    for ((prep, lio), l) in preps.iter().zip(io.iter_mut()).zip(layers) {
+        let (nkv, hd) = (l.nkv, l.hd);
         unsafe {
             let kc = prep.k_mb.contents() as *const f32;
             let vc = prep.v_mb.contents() as *const f32;

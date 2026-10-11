@@ -9825,6 +9825,11 @@ impl Pipeline {
         // (The old streaming attend needed a depth bound at ~1k; the
         // GEMM attention scales like the CPU path and lifted it.)
         // CMF_GPU_CHUNK=0 disables the graph.
+        // Gemma-4 (`metal_gemma4`) brings its own kernels for the global
+        // layers, V norm, attention scale and sandwich (`ChunkGemma4`).
+        // `CMF_METAL_GEMMA4_CHUNK=0` keeps its prompt on the host walk.
+        let gemma4 = self.metal_gemma4()
+            && std::env::var("CMF_METAL_GEMMA4_CHUNK").as_deref() != Ok("0");
         if !crate::gpu::enabled_here()
             || std::env::var("CMF_GPU_CHUNK")
                 .map(|v| v == "0")
@@ -9832,16 +9837,16 @@ impl Pipeline {
             || b < 32
             // Sliding windows with per-layer RoPE ride the chunk graph
             // (`metal_graph_swa`: causal_softmax_win, per-layer tables).
-            || (self.swa.is_some() && !self.metal_graph_swa())
-            || self.global_attn.is_some()
+            || (self.swa.is_some() && !self.metal_graph_swa() && !gemma4)
+            || (self.global_attn.is_some() && !gemma4)
             // per-layer KV heads, narrow V, learned sinks (MiMo-V2)
-            || (self.graph_attn_decline_reason().is_some() && !self.metal_graph_swa())
+            || (self.graph_attn_decline_reason().is_some() && !self.metal_graph_swa() && !gemma4)
             // Collection owns the exact Q trace and boundary conversion;
             // this chunk graph appends dense KV without feeding that trace.
             || self.o1_active()
-            || self.attn_v_norm
+            || (self.attn_v_norm && !gemma4)
             || !self.metal_rope_scale_ok()
-            || (self.attn_scale - 1.0 / (self.head_dim as f32).sqrt()).abs() > 1e-9
+            || ((self.attn_scale - 1.0 / (self.head_dim as f32).sqrt()).abs() > 1e-9 && !gemma4)
         {
             return li0;
         }
@@ -9873,7 +9878,9 @@ impl Pipeline {
         let mut stored_at: Vec<usize> = Vec::new();
         for li in li0..run_end {
             let lw = &self.weights.layers[self.phys_layer(li)];
-            if lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some() {
+            if (lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some())
+                && !gemma4
+            {
                 break;
             }
             let AttnKind::Full {
@@ -9904,7 +9911,9 @@ impl Pipeline {
             // trio stands in for the shape checks.
             let (gate_t, up_t, down_t, ffn_act, moe) = match &lw.ffn {
                 FfnKind::Dense(d)
-                    if matches!(d.act, Act::Silu | Act::Gelu) && d.segs.is_empty() =>
+                    if (matches!(d.act, Act::Silu | Act::Gelu)
+                        || (gemma4 && d.act == Act::GeluTanh))
+                        && d.segs.is_empty() =>
                 {
                     (&d.gate_proj, &d.up_proj, &d.down_proj, d.act, None)
                 }
@@ -9962,7 +9971,10 @@ impl Pipeline {
             // gate/up/down behind q4/q8_row attention: the chunk FFN has no
             // x·col staging, so it would run those weights without their
             // input field (0.8.14 refused every q8_2f weight here).
+            // Gemma-4 reads every q8_2f weight through the blob GEMM with its
+            // own field (`ChunkGemma4`), so its dense q8_2f stack rides.
             if moe.is_none()
+                && !gemma4
                 && (col.iter().any(|c| !c.is_empty())
                     || [gate_t, up_t, down_t].iter().any(|t| !cf(t).is_empty()))
             {
@@ -9993,6 +10005,14 @@ impl Pipeline {
                         .is_some_and(|w| layer.head_len(0) + 1 >= w)
             );
             stored_at.push(layer.head_len(0));
+            // Per-layer geometry for Gemma-4 (512-wide global layers over
+            // one KV head); every other model keeps the pipeline-wide one.
+            let (nkv, hd) = if gemma4 {
+                let (a, bb, _) = self.layer_geom(li);
+                (a, bb)
+            } else {
+                (nkv, hd)
+            };
             layers.push(crate::gpu_metal::ChunkLayer {
                 model: &model,
                 kv_id: self.graph_kv_id,
@@ -10024,7 +10044,14 @@ impl Pipeline {
                 eps: self.rms_eps as f32,
                 window: self.layer_window(li),
                 head_gate,
-                gelu: ffn_act == Act::Gelu,
+                act: ffn_act.graph_act().map_or(0, |a| a.code() as u8),
+                g4: gemma4.then(|| crate::gpu_metal::ChunkGemma4 {
+                    v_norm: self.attn_v_norm,
+                    scale: self.attn_scale,
+                    attn_out_norm: lw.attn_out_norm.as_deref(),
+                    ffn_out_norm: lw.ffn_out_norm.as_deref(),
+                    layer_scale: lw.layer_scale,
+                }),
                 col,
                 moe,
             });
@@ -10032,15 +10059,18 @@ impl Pipeline {
         if layers.is_empty() {
             return li0;
         }
-        let row = nkv * hd;
+        // KV row width per layer (uniform but for Gemma-4).
+        let rows_kv: Vec<(usize, usize)> = layers.iter().map(|l| (l.nkv, l.nkv * l.hd)).collect();
         let mut store: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> = stored_at
             .iter()
-            .map(|&st| (vec![0f32; b * row], vec![0f32; b * row], vec![0f32; st + b]))
+            .zip(&rows_kv)
+            .map(|(&st, &(_, row))| (vec![0f32; b * row], vec![0f32; b * row], vec![0f32; st + b]))
             .collect();
         let mut io: Vec<crate::gpu_metal::ChunkIo> = Vec::with_capacity(layers.len());
         for (i, (ok, ov, oi)) in store.iter_mut().enumerate() {
             let li = layers[i].layer;
             let layer = &self.kv_cache.layers[li];
+            let nkv = rows_kv[i].0;
             io.push(crate::gpu_metal::ChunkIo {
                 cpu_stored: stored_at[i],
                 cpu_gen: layer.generation(),
@@ -10079,6 +10109,7 @@ impl Pipeline {
         // and bank the importance masses per layer.
         for (i, (ok, ov, oi)) in store.iter().enumerate().take(n_run) {
             let li = li0 + i;
+            let row = rows_kv[i].1;
             let layer = &mut self.kv_cache.layers[li];
             for bi in 0..b {
                 layer.append(
