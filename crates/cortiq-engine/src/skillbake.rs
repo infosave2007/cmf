@@ -37,6 +37,99 @@ pub struct AnswerSpan {
     pub start: Vec<u32>,
     /// The turn terminator (one token); the last scored target.
     pub end: u32,
+    /// Decoded text of every vocabulary id. When present, the answer's
+    /// top-level JSON values are located in it and the held score grades
+    /// whole verdicts (`answer_values`): a question counts as correct only
+    /// when every token of its value is the argmax. Token accuracy over
+    /// the span alone is dominated by the braces, quotes and question ids
+    /// the model copies from the prompt.
+    pub values: Option<TokenText>,
+}
+
+/// Decoded text per token id (see `AnswerSpan::values`).
+#[derive(Clone, PartialEq, Eq)]
+pub struct TokenText(pub Arc<Vec<String>>);
+
+impl std::fmt::Debug for TokenText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TokenText({} ids)", self.0.len())
+    }
+}
+
+/// The target positions of each top-level value of the JSON object an
+/// answer span holds (`{"q1": "option_24", "q2": 3}` → two groups), in
+/// order. A token overlapping a value's characters belongs to it, so a
+/// token that merges a quote with the label's first letters is graded with
+/// the label. Positions are indices into `ids`, within `first..=last`.
+pub fn answer_values(ids: &[u32], first: usize, last: usize, text: &TokenText) -> Vec<Vec<usize>> {
+    let mut groups = Vec::new();
+    let mut cur: Option<Vec<usize>> = None;
+    let (mut depth, mut in_str, mut esc, mut expect_value) = (0i32, false, false, false);
+    let mark = |cur: &mut Option<Vec<usize>>, p: usize| {
+        if let Some(g) = cur.as_mut() {
+            if g.last() != Some(&p) {
+                g.push(p);
+            }
+        }
+    };
+    for p in first..=last.min(ids.len().saturating_sub(1)) {
+        let piece = text.0.get(ids[p] as usize).map(String::as_str).unwrap_or("");
+        for ch in piece.chars() {
+            if in_str {
+                if esc {
+                    esc = false;
+                } else if ch == '\\' {
+                    esc = true;
+                } else if ch == '"' {
+                    in_str = false;
+                }
+                mark(&mut cur, p);
+                continue;
+            }
+            if expect_value && !ch.is_whitespace() {
+                expect_value = false;
+                cur = Some(Vec::new());
+            }
+            match ch {
+                '"' => {
+                    in_str = true;
+                    mark(&mut cur, p);
+                }
+                '{' | '[' => {
+                    depth += 1;
+                    mark(&mut cur, p);
+                }
+                '}' | ']' => {
+                    if depth == 1 {
+                        if let Some(g) = cur.take() {
+                            if !g.is_empty() {
+                                groups.push(g);
+                            }
+                        }
+                    } else {
+                        mark(&mut cur, p);
+                    }
+                    depth -= 1;
+                }
+                ',' if depth == 1 => {
+                    if let Some(g) = cur.take() {
+                        if !g.is_empty() {
+                            groups.push(g);
+                        }
+                    }
+                }
+                ':' if depth == 1 && cur.is_none() => expect_value = true,
+                c if c.is_whitespace() && depth == 1 => {}
+                _ => mark(&mut cur, p),
+            }
+        }
+    }
+    if let Some(g) = cur {
+        if !g.is_empty() {
+            groups.push(g);
+        }
+    }
+    groups
 }
 
 /// The scored target range `(first, last)` (inclusive, indices into
@@ -149,6 +242,10 @@ pub struct BakeHyper {
     /// `<dir>/phase-a-step-<n>.json` as it happens (a `--mask-from` input),
     /// so a long run survives being stopped.
     pub checkpoint_dir: Option<String>,
+    /// Tags of the held records (in held order before the length sort):
+    /// held scores then report per-tag verdict accuracy and gate on its
+    /// macro average.
+    pub held_tags: Option<HeldTags>,
 }
 
 impl Default for BakeHyper {
@@ -183,6 +280,7 @@ impl Default for BakeHyper {
             soft_fold: false,
             fcd_attn: false,
             checkpoint_dir: None,
+            held_tags: None,
         }
     }
 }
@@ -462,6 +560,12 @@ struct FocusStats {
     correct: usize,
     class_total: Vec<usize>,
     class_correct: Vec<usize>,
+    /// Answer-span verdicts (`answer_values`) and those predicted whole.
+    questions: usize,
+    questions_correct: usize,
+    /// (verdicts, right) per sequence of the LAST scored call — the held
+    /// scorer attributes them to the records' tags; never merged.
+    seq: Vec<(usize, usize)>,
 }
 
 impl FocusStats {
@@ -477,6 +581,20 @@ impl FocusStats {
         (self.total > 0).then(|| self.correct as f64 / self.total as f64)
     }
 
+    fn question_accuracy(&self) -> Option<f64> {
+        (self.questions > 0).then(|| self.questions_correct as f64 / self.questions as f64)
+    }
+
+    /// The held score's accuracy pair: whole-verdict accuracy when the span
+    /// located values (then the token accuracy rides along for the log),
+    /// otherwise the token/class accuracy alone.
+    fn accuracies(&self) -> (Option<f64>, Option<f64>) {
+        match self.question_accuracy() {
+            Some(q) => (Some(q), self.accuracy()),
+            None => (self.accuracy(), None),
+        }
+    }
+
     fn balanced_accuracy(&self) -> Option<f64> {
         let recalls: Vec<f64> = self
             .class_total
@@ -490,6 +608,8 @@ impl FocusStats {
     fn merge(&mut self, other: &Self) {
         self.total += other.total;
         self.correct += other.correct;
+        self.questions += other.questions;
+        self.questions_correct += other.questions_correct;
         if self.class_total.len() < other.class_total.len() {
             self.class_total.resize(other.class_total.len(), 0);
             self.class_correct.resize(other.class_correct.len(), 0);
@@ -506,8 +626,42 @@ impl FocusStats {
 #[derive(Clone, Debug)]
 struct HeldScore {
     ppl: f64,
+    /// Whole-verdict accuracy in answer-span mode with located values,
+    /// else token (span) or class (focus) accuracy.
     accuracy: Option<f64>,
     balanced_accuracy: Option<f64>,
+    /// The span's token accuracy when `accuracy` is the verdict accuracy.
+    token_accuracy: Option<f64>,
+    /// Verdict accuracy over all questions when `accuracy` is the macro
+    /// over held tags (families); None otherwise.
+    micro_accuracy: Option<f64>,
+    /// (tag, verdicts, right) per held tag, in tag order.
+    per_tag: Vec<(String, usize, usize)>,
+}
+
+/// Held records' tags (e.g. the benchmark family of each validation
+/// record): the names, and one name index per held record.
+#[derive(Clone, Debug, Default)]
+pub struct HeldTags {
+    pub names: Vec<String>,
+    pub of: Vec<usize>,
+}
+
+/// " | <tag> 61.0 (41)" per tag — the macro gate's ingredients.
+fn tag_line(score: &HeldScore) -> Option<String> {
+    (!score.per_tag.is_empty()).then(|| {
+        score
+            .per_tag
+            .iter()
+            .map(|(name, n, ok)| {
+                format!(
+                    "{name} {:.1} ({n})",
+                    if *n > 0 { *ok as f64 * 100.0 / *n as f64 } else { f64::NAN }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    })
 }
 
 /// Frozen boundary immediately before one trainable final FFN.  This is not
@@ -819,6 +973,14 @@ impl Pass<'_> {
             // the answer span of each record. The scored rows are gathered
             // so a span pays for its own positions only, not the prompt's.
             let inv_n = 1.0 / scored as f64;
+            // Argmax hit per scored target, for the whole-verdict count.
+            let mut hits: Option<Vec<bool>> = (focus_stats.is_some()
+                && self.span.is_some_and(|sp| sp.values.is_some()))
+            .then(|| vec![false; scored]);
+            // CMF_BAKE_QDEBUG=N prints gold vs argmax of the first N verdicts
+            // of every held call (diagnosing the verdict locator).
+            let qdebug: usize = std::env::var("CMF_BAKE_QDEBUG").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let mut preds: Vec<u32> = if qdebug > 0 && hits.is_some() { vec![0; scored] } else { Vec::new() };
             let mut p0 = 0usize;
             while p0 < scored {
                 let pc = POS_CHUNK.min(scored - p0);
@@ -851,6 +1013,12 @@ impl Pass<'_> {
                             stats.correct += 1;
                         }
                     }
+                    if let Some(h) = hits.as_mut() {
+                        h[p0 + r] = arg == target;
+                    }
+                    if !preds.is_empty() {
+                        preds[p0 + r] = arg as u32;
+                    }
                     if grad.is_some() {
                         // dCE/dlogit = softmax − onehot, scaled by 1/scored.
                         for v in row.iter_mut() {
@@ -872,6 +1040,40 @@ impl Pass<'_> {
                     }
                 }
                 p0 += pc;
+            }
+            // Whole verdicts: a question is right when every token of its
+            // value is the argmax (what greedy decoding emits after the
+            // same prefix).
+            if let (Some(h), Some(stats), Some(sp)) = (&hits, focus_stats.as_deref_mut(), self.span) {
+                if let Some(text) = &sp.values {
+                    let at: std::collections::HashMap<usize, bool> =
+                        targets.iter().copied().zip(h.iter().copied()).collect();
+                    let pred_at: std::collections::HashMap<usize, u32> =
+                        targets.iter().copied().zip(preds.iter().copied()).collect();
+                    let mut shown = 0usize;
+                    stats.seq = vec![(0, 0); b];
+                    for bi in 0..b {
+                        let seq = &ids[bi * t..(bi + 1) * t];
+                        let Some((first, last)) = answer_targets(seq, sp) else {
+                            continue;
+                        };
+                        if shown < qdebug {
+                            let gold: Vec<String> = (first.max(1)..=last).map(|q| format!("{:?}", text.0.get(seq[q] as usize).map(String::as_str).unwrap_or("?"))).collect();
+                            let got: Vec<String> = (first.max(1)..=last).map(|q| format!("{:?}", pred_at.get(&(bi * t + q)).and_then(|&id| text.0.get(id as usize)).map(String::as_str).unwrap_or("?"))).collect();
+                            let groups = answer_values(seq, first.max(1), last, text);
+                            eprintln!("[qdebug] gold {} | argmax {} | value groups {:?} (span starts at {})", gold.join(" "), got.join(" "), groups, first.max(1));
+                            shown += 1;
+                        }
+                        for group in answer_values(seq, first.max(1), last, text) {
+                            stats.questions += 1;
+                            stats.seq[bi].0 += 1;
+                            if group.iter().all(|&q| at.get(&(bi * t + q)).copied().unwrap_or(false)) {
+                                stats.questions_correct += 1;
+                                stats.seq[bi].1 += 1;
+                            }
+                        }
+                    }
+                }
             }
         } else {
             // Exact classifier mode. Only the declared label rows can enter
@@ -1334,7 +1536,16 @@ fn chain_prof(i: usize) -> f64 {
 fn score_suffix(score: &HeldScore) -> String {
     match (score.accuracy, score.balanced_accuracy) {
         (Some(a), Some(b)) => format!(" | acc {:.2}% bal {:.2}%", a * 100.0, b * 100.0),
-        (Some(a), None) => format!(" | tok-acc {:.2}%", a * 100.0),
+        (Some(a), None) => match (score.micro_accuracy, score.token_accuracy) {
+            (Some(m), Some(t)) => format!(
+                " | q-acc macro {:.2}% micro {:.2}% tok {:.2}%",
+                a * 100.0,
+                m * 100.0,
+                t * 100.0
+            ),
+            (None, Some(t)) => format!(" | q-acc {:.2}% tok-acc {:.2}%", a * 100.0, t * 100.0),
+            _ => format!(" | tok-acc {:.2}%", a * 100.0),
+        },
         _ => String::new(),
     }
 }
@@ -1344,6 +1555,14 @@ fn held_ppl(pass: &Pass, held: &[Vec<u32>]) -> f64 {
 }
 
 fn held_score(pass: &Pass, held: &[Vec<u32>]) -> HeldScore {
+    held_score_tagged(pass, held, None)
+}
+
+/// `held_score` with per-tag verdict counts: when the records carry tags
+/// and the span locates values, the score's accuracy is the MACRO verdict
+/// accuracy over tags (each family weighs the same, as in a benchmark
+/// index), the micro one rides along.
+fn held_score_tagged(pass: &Pass, held: &[Vec<u32>], tags: Option<&HeldTags>) -> HeldScore {
     // Bounded batched passes over the held set: equal-length records share
     // one GEMM per weight, while the cap keeps activation/GPU scratch memory
     // predictable for a full validation sweep. Aggregation is exact because
@@ -1353,6 +1572,9 @@ fn held_score(pass: &Pass, held: &[Vec<u32>]) -> HeldScore {
             ppl: f64::NAN,
             accuracy: None,
             balanced_accuracy: None,
+            token_accuracy: None,
+            micro_accuracy: None,
+            per_tag: Vec::new(),
         };
     }
     let mut nll = 0f64;
@@ -1384,6 +1606,18 @@ fn held_score(pass: &Pass, held: &[Vec<u32>]) -> HeldScore {
         }
         v
     };
+    let mut per_tag: Vec<(usize, usize)> = vec![(0, 0); tags.map_or(0, |t| t.names.len())];
+    let mut credit = |at: usize, part: &FocusStats| {
+        if let Some(tg) = tags {
+            for (j, &(q, ok)) in part.seq.iter().enumerate() {
+                if let Some(&ti) = tg.of.get(at + j) {
+                    per_tag[ti].0 += q;
+                    per_tag[ti].1 += ok;
+                }
+            }
+        }
+    };
+    let mut at = 0usize;
     for group in groups {
         let t = group[0].len();
         if group.iter().all(|c| c.len() == t) {
@@ -1392,21 +1626,41 @@ fn held_score(pass: &Pass, held: &[Vec<u32>]) -> HeldScore {
             let (l, k) = pass.chunk_batch_scored(&flat, group.len(), None, Some(&mut part));
             nll += l;
             n += k;
+            credit(at, &part);
             stats.merge(&part);
         } else {
-            for c in group {
+            for (j, c) in group.iter().enumerate() {
                 let mut part = FocusStats::new(pass.focus_tokens.len());
                 let (l, k) = pass.chunk_batch_scored(c, 1, None, Some(&mut part));
                 nll += l;
                 n += k;
+                credit(at + j, &part);
                 stats.merge(&part);
             }
+        }
+        at += group.len();
+    }
+    let (mut accuracy, token_accuracy) = stats.accuracies();
+    let mut micro_accuracy = None;
+    let mut tagged = Vec::new();
+    if let Some(tg) = tags
+        && token_accuracy.is_some()
+    {
+        let rates: Vec<f64> =
+            per_tag.iter().filter(|(q, _)| *q > 0).map(|&(q, ok)| ok as f64 / q as f64).collect();
+        if !rates.is_empty() {
+            micro_accuracy = accuracy;
+            accuracy = Some(rates.iter().sum::<f64>() / rates.len() as f64);
+            tagged = tg.names.iter().cloned().zip(per_tag).map(|(name, (q, ok))| (name, q, ok)).collect();
         }
     }
     HeldScore {
         ppl: (nll / n.max(1) as f64).exp(),
-        accuracy: stats.accuracy(),
+        accuracy,
         balanced_accuracy: stats.balanced_accuracy(),
+        token_accuracy,
+        micro_accuracy,
+        per_tag: tagged,
     }
 }
 
@@ -1493,6 +1747,9 @@ fn cached_fcd_run(
                 ppl: f64::NAN,
                 accuracy: None,
                 balanced_accuracy: None,
+                token_accuracy: None,
+                micro_accuracy: None,
+                per_tag: Vec::new(),
             },
             None,
         );
@@ -1596,6 +1853,9 @@ fn cached_fcd_run(
         ppl: (nll / rows as f64).exp(),
         accuracy: stats.accuracy(),
         balanced_accuracy: stats.balanced_accuracy(),
+        token_accuracy: None,
+        micro_accuracy: None,
+        per_tag: Vec::new(),
     };
     let Some(dh_normed) = dh_normed else {
         return (score, None);
@@ -1761,7 +2021,14 @@ pub fn skill_bake(
     // survives; without buckets every record has the chunk width and
     // nothing moves.
     let mut held: Vec<Vec<u32>> = chunks[..held_n.min(chunks.len())].to_vec();
-    held.sort_by_key(Vec::len);
+    // The tags follow their records through the stable length sort.
+    let mut order: Vec<usize> = (0..held.len()).collect();
+    order.sort_by_key(|&i| held[i].len());
+    let held_tags: Option<HeldTags> = hy.held_tags.as_ref().map(|t| HeldTags {
+        names: t.names.clone(),
+        of: order.iter().map(|&i| t.of.get(i).copied().unwrap_or(0)).collect(),
+    });
+    held = order.iter().map(|&i| std::mem::take(&mut held[i])).collect();
     let mut calib: Vec<Vec<u32>> = chunks[held_n.min(chunks.len())..].to_vec();
     calib.sort_by_key(Vec::len);
     if calib.len() < 12 {
@@ -1903,12 +2170,51 @@ pub fn skill_bake(
             soft_fold: hy.soft_fold,
             attn_tr: &attn_tr,
     };
-    let backbone_score = held_score(&base_pass, &held);
+    // CMF_BAKE_SKIP_BASELINE=1 with a supplied mask: a checkpoint
+    // measurement that already knows the backbone's score skips its pass.
+    let skip_baseline = hy.mask_logits.is_some()
+        && std::env::var("CMF_BAKE_SKIP_BASELINE").is_ok_and(|v| v == "1");
+    let backbone_score = if skip_baseline {
+        HeldScore {
+            ppl: f64::NAN,
+            accuracy: None,
+            balanced_accuracy: None,
+            token_accuracy: None,
+            micro_accuracy: None,
+            per_tag: Vec::new(),
+        }
+    } else {
+        held_score_tagged(&base_pass, &held, held_tags.as_ref())
+    };
     let backbone = backbone_score.ppl;
     log(&format!(
         "baseline (full): {backbone:.3}{}",
         score_suffix(&backbone_score)
     ));
+    if let Some(line) = tag_line(&backbone_score) {
+        log(&format!("    per tag: {line}"));
+    }
+    // A resumed mask is scored before it trains on: the run's own start,
+    // and with --steps-a 0 a held-out measurement of any checkpoint.
+    if hy.mask_logits.is_some() {
+        let start_pass = Pass {
+            fm: &fm,
+            tau: hy.tau,
+            logits: &logits,
+            hard: true,
+            ffn: &ffn,
+            focus_tokens: &hy.focus_tokens,
+            focus_follow_tokens: &hy.focus_follow_tokens,
+            span: hy.answer_span.as_ref(),
+            soft_fold: hy.soft_fold,
+            attn_tr: &attn_tr,
+        };
+        let s0 = held_score_tagged(&start_pass, &held, held_tags.as_ref());
+        log(&format!("supplied mask: {:.3}{}", s0.ppl, score_suffix(&s0)));
+        if let Some(line) = tag_line(&s0) {
+            log(&format!("    per tag: {line}"));
+        }
+    }
 
     // ── Phase A: mask training ──
     let mut adam_a = Adam::new(&vec![inter; vn], hy.lr_a);
@@ -2004,7 +2310,7 @@ pub fn skill_bake(
             attn_tr: &attn_tr,
             };
             crate::gpu::bake_precision_strict(false);
-            let hs = held_score(&pass, &held);
+            let hs = held_score_tagged(&pass, &held, held_tags.as_ref());
             let hp = hs.ppl;
             crate::gpu::bake_precision_strict(strict_a);
             // Name the neurons that crossed τ since the last eval. At
@@ -2063,6 +2369,9 @@ pub fn skill_bake(
                     "ppl": hp,
                     "sparsity": sp,
                     "accuracy": hs.accuracy,
+                    "micro_accuracy": hs.micro_accuracy,
+                    "token_accuracy": hs.token_accuracy,
+                    "per_tag": hs.per_tag,
                     "selected_logits": &logits,
                 });
                 let path = format!("{dir}/phase-a-step-{}.json", step + 1);
@@ -2111,9 +2420,10 @@ pub fn skill_bake(
                     best_step = step + 1;
                 }
             } else if eligible && hy.checkpoint_accuracy && hy.answer_span.is_some() {
-                // Answer-span mode: the held-out token accuracy of the hard
-                // mask decides (the experiments' soft/hard accuracy gate),
-                // PPL breaks ties.
+                // Answer-span mode: the held-out accuracy of the hard mask
+                // decides — whole verdicts when the span locates values,
+                // else span tokens (the experiments' accuracy gate); PPL
+                // breaks ties.
                 let acc = hs.accuracy.unwrap_or(f64::NEG_INFINITY);
                 if acc > best_accuracy || (acc == best_accuracy && hp < best.0) {
                     best_accuracy = acc;
@@ -2138,6 +2448,9 @@ pub fn skill_bake(
                 acc_chunk / (step + 1) as f64,
                 acc_adam / (step + 1) as f64
             ));
+            if let Some(line) = tag_line(&hs) {
+                log(&format!("    per tag: {line}"));
+            }
         }
     }
     // If target_sparsity was set but no checkpoint qualified, fall back
@@ -2214,7 +2527,7 @@ pub fn skill_bake(
     let masked_score = if hy.steps_a == 0 && hy.mask_logits.is_none() {
         backbone_score.clone()
     } else {
-        held_score(&pass, &held)
+        held_score_tagged(&pass, &held, held_tags.as_ref())
     };
     let masked = masked_score.ppl;
     log(&format!(
@@ -2483,7 +2796,7 @@ pub fn skill_bake(
             soft_fold: hy.soft_fold,
             attn_tr: &attn_tr,
                 };
-                let cur = held_score(&pass, &held);
+                let cur = held_score_tagged(&pass, &held, held_tags.as_ref());
                 let better = if hy.checkpoint_accuracy && hy.answer_span.is_some() {
                     let cur_acc = cur.accuracy.unwrap_or(f64::NEG_INFINITY);
                     let best_acc = best_b.0.accuracy.unwrap_or(f64::NEG_INFINITY);
@@ -2688,12 +3001,35 @@ mod tests {
     }
 
     #[test]
+    fn answer_values_group_each_top_level_value() {
+        // {"q1": "option_24", "q2": [ "a" ], "q3": 3}<end>, split the way a
+        // byte-level BPE might: quotes merged with keys and labels.
+        let pieces = [
+            "{\"", "q1", "\":", " \"", "option", "_", "24", "\",", " \"q2", "\":", " [", " \"a\"", " ]", ",", " \"q3\":",
+            " 3", "}", "<end>",
+        ];
+        let text = TokenText(Arc::new(pieces.iter().map(|p| p.to_string()).collect()));
+        let ids: Vec<u32> = (0..pieces.len() as u32).collect();
+        let groups = answer_values(&ids, 0, ids.len() - 1, &text);
+        assert_eq!(groups, vec![vec![3, 4, 5, 6, 7], vec![10, 11, 12], vec![15]]);
+    }
+
+    #[test]
+    fn answer_values_keep_escaped_quotes_inside_the_value() {
+        let pieces = ["{\"q\": \"a", "\\\"", "b\"}", "<end>"];
+        let text = TokenText(Arc::new(pieces.iter().map(|p| p.to_string()).collect()));
+        let ids: Vec<u32> = (0..pieces.len() as u32).collect();
+        assert_eq!(answer_values(&ids, 0, 3, &text), vec![vec![0, 1, 2]]);
+    }
+
+    #[test]
     fn balanced_accuracy_exposes_majority_class_collapse() {
         let stats = FocusStats {
             total: 100,
             correct: 90,
             class_total: vec![90, 10],
             class_correct: vec![90, 0],
+            ..FocusStats::default()
         };
         assert_eq!(stats.accuracy(), Some(0.9));
         assert_eq!(stats.balanced_accuracy(), Some(0.5));
@@ -2706,14 +3042,22 @@ mod tests {
             correct: 2,
             class_total: vec![2, 1],
             class_correct: vec![1, 1],
+            questions: 2,
+            questions_correct: 1,
+            seq: Vec::new(),
         };
         let second = FocusStats {
             total: 4,
             correct: 3,
             class_total: vec![1, 3],
             class_correct: vec![1, 2],
+            questions: 3,
+            questions_correct: 3,
+            seq: Vec::new(),
         };
         all.merge(&second);
+        assert_eq!(all.question_accuracy(), Some(4.0 / 5.0));
+        assert_eq!(all.accuracies(), (Some(4.0 / 5.0), Some(5.0 / 7.0)));
         assert_eq!(all.total, 7);
         assert_eq!(all.correct, 5);
         assert_eq!(all.class_total, vec![3, 4]);
@@ -2808,6 +3152,7 @@ mod answer_span_tests {
         let sp = AnswerSpan {
             start: vec![7, 8],
             end: 1,
+            values: None,
         };
         // prompt … [7 8] answer 20 21 [1] pad 1 1
         let ids = [5, 7, 8, 9, 7, 8, 20, 21, 1, 1, 1];
@@ -2828,6 +3173,7 @@ mod answer_span_tests {
         let sp = AnswerSpan {
             start: vec![2],
             end: 6,
+            values: None,
         };
         assert_eq!(scored_targets(&ids, 0, 6, &[], &[], Some(&sp)), vec![2, 3, 4, 5]);
     }
