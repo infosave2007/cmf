@@ -50344,8 +50344,17 @@ fn main() {
             .fold(0f32, f32::max);
         drop(data);
         stage.unmap();
+        // WGSL's tanh is implementation-defined: NVIDIA's Vulkan driver
+        // matches the host to 1e-6, while wgpu over Metal (macOS CI; the
+        // engine itself runs native Metal there) lowers it to Metal's fast
+        // tanh, 3.6e-4 off for act 2.
+        let tol = if act_code == 2 && c.adapter_info.backend != wgpu::Backend::Vulkan {
+            1e-3
+        } else {
+            1e-5
+        };
         assert!(
-            worst < 1e-5,
+            worst < tol,
             "act {act_code}: device activation off the host formula by {worst:e} (relative)"
         );
         assert!(
