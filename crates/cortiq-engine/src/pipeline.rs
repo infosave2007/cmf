@@ -1943,6 +1943,119 @@ impl Pipeline {
             && self.automatic_gpu_prefix().is_some()
     }
 
+    /// Gemma-4's prompt through the batched wgpu graph (`gemma_batch`): a
+    /// dense stack wholly on a discrete card, whose token graph already
+    /// decodes it. Not `graph_prefill_preferred` — the host stays the KV
+    /// owner for reuse and scoring; only generation's ingest changes.
+    /// `CMF_G4_BATCH=0` keeps the chunked host prefill.
+    fn g4_batch_prefill(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            false
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            (self.global_attn.is_some() || self.attn_v_norm)
+                && crate::gpu::g4_batch_on()
+                && crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Prefill)
+                && crate::gpu::enabled_here()
+                && crate::gpu::discrete()
+                && !self.graph_refused()
+                && !self.o1_active()
+                && self.attn_softcap == 0.0
+                && self.wgpu_graph_attn_decline().is_none()
+                && self.weights.layers.iter().all(|lw| {
+                    matches!(lw.attn, AttnKind::Full { .. }) && matches!(lw.ffn, FfnKind::Dense(_))
+                })
+                && self.automatic_gpu_prefix().is_none()
+        }
+    }
+
+    /// Gemma-4's batched prefill of `ids` at positions `pos0..`
+    /// (`g4_batch_prefill`): chunks of `generation_batch_k` rows through the
+    /// batch graph. Ok((n, rows)): `n` positions ingested; `rows` = the last
+    /// one's hidden, or every row's (`keep_all`). A refusal stops early
+    /// (n < ids.len()) after pulling the device rows the host walk needs.
+    /// Err: a failure after admission — the device state is undefined.
+    #[cfg(not(target_os = "macos"))]
+    fn g4_batch_ingest(
+        &mut self,
+        ids: &[u32],
+        pos0: usize,
+        keep_all: bool,
+    ) -> Result<(usize, Vec<f32>), String> {
+        let hs = self.hidden_size;
+        let chunk = self.generation_batch_k().max(1);
+        let end_all = pos0 + ids.len();
+        let mut pos = pos0;
+        let mut out = Vec::new();
+        while pos < end_all && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            let end = (pos + chunk).min(end_all);
+            let bk = end - pos;
+            let mut hiddens = vec![0f32; bk * hs];
+            for (j, &id) in ids[pos - pos0..end - pos0].iter().enumerate() {
+                hiddens[j * hs..(j + 1) * hs].copy_from_slice(&self.embed_single(id));
+            }
+            let positions: Vec<usize> = (pos..end).collect();
+            let t_chunk = std::time::Instant::now();
+            let outcome = self.try_batch_graph_wgpu(&mut hiddens, &positions, bk, None);
+            if std::env::var("CMF_GRAPH_PROF").is_ok() {
+                let ms = t_chunk.elapsed().as_secs_f64() * 1000.0;
+                eprintln!(
+                    "batch-chunk: phase=prompt mode=gemma4 k={bk} outcome={outcome:?} {ms:.1} ms ({:.1} tok/s)",
+                    bk as f64 / (ms / 1000.0)
+                );
+            }
+            match outcome {
+                crate::gpu::BatchGraphOutcome::Completed => {
+                    if keep_all {
+                        out.extend_from_slice(&hiddens);
+                    } else {
+                        out = hiddens[(bk - 1) * hs..].to_vec();
+                    }
+                    pos = end;
+                }
+                crate::gpu::BatchGraphOutcome::Failed => {
+                    return Err("Gemma-4 batched prefill failed after admission".into());
+                }
+                crate::gpu::BatchGraphOutcome::Declined => {
+                    #[cfg(feature = "gpu")]
+                    if pos > pos0 {
+                        self.pull_lagging_host_kv(0, self.num_layers, pos);
+                    }
+                    break;
+                }
+            }
+        }
+        Ok((pos - pos0, out))
+    }
+
+    /// Hidden rows of every position of `ids` through Gemma-4's batched
+    /// prefill from a fresh sequence (the prefill's teacher-forced logits
+    /// for parity gates: `logits_from_hidden` per row). None when the model
+    /// or the card does not take that route, or it refused part way.
+    pub fn g4_prefill_hidden_rows(&mut self, ids: &[u32]) -> Option<Vec<f32>> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            if ids.is_empty() || !self.g4_batch_prefill() {
+                return None;
+            }
+            self.clear_sequence_state();
+            match self.g4_batch_ingest(ids, 0, true) {
+                Ok((n, rows)) if n == ids.len() => Some(rows),
+                _ => {
+                    self.clear_sequence_state();
+                    None
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = ids;
+            None
+        }
+    }
+
     #[cfg(not(target_os = "macos"))]
     fn graph_prefill_preferred(&self) -> bool {
         // Discrete-GPU wgpu whole-token graph: GDN layers carry recurrent state
@@ -3486,6 +3599,11 @@ impl Pipeline {
         {
             return k;
         }
+        // Gemma-4 (`g4_batch_prefill`): 128-row chunks, the GEMM tile's
+        // two 64-row halves full.
+        if self.g4_batch_prefill() {
+            return 128;
+        }
         #[cfg(not(target_os = "macos"))]
         if self.graph_prefill_preferred() && !self.o1_active() {
             // MoE stacks keep the 32 their expert-grouped prefill was
@@ -4555,6 +4673,40 @@ impl Pipeline {
                     input_ids.len(),
                     _tp.elapsed().as_secs_f64() * 1e3
                 );
+            }
+        }
+        // Gemma-4 on a discrete card: the prompt through the batched wgpu
+        // graph (`g4_batch_ingest`); its K/V land in the device mirrors
+        // decode reads. A refusal leaves the rest of the prompt to the
+        // chunked host prefill below.
+        #[cfg(not(target_os = "macos"))]
+        if task_mask.is_none()
+            && !dyn_prefill
+            && mtp.is_none()
+            && o1_prefill.is_none()
+            && batch_k > 0
+            && pos + 1 < input_ids.len()
+            && self.g4_batch_prefill()
+        {
+            let t_g4 = std::time::Instant::now();
+            match self.g4_batch_ingest(&input_ids[pos..], pos, false) {
+                Ok((n, last)) => {
+                    if n > 0 {
+                        hidden.copy_from_slice(&last);
+                    }
+                    if std::env::var("CMF_PREFILL_PROF").is_ok() {
+                        eprintln!(
+                            "gemma4 batch prefill: {n} of {} tokens in {:.1} ms",
+                            input_ids.len() - pos,
+                            t_g4.elapsed().as_secs_f64() * 1e3
+                        );
+                    }
+                    pos += n;
+                }
+                Err(e) => {
+                    self.finish_generation(&mut mtp, &mut router, true);
+                    return Err(e);
+                }
             }
         }
         self.mimo_moe_prepare();
@@ -8030,6 +8182,23 @@ impl Pipeline {
         // (2) bench times THIS function and calls the result "prefill",
         // so a different path here reports a number production never
         // sees (W2 on 2×5090: 8.7 tok/s reported against 125 real).
+        // Gemma-4: generation's batched-graph ingest (`g4_batch_ingest`),
+        // so bench and the parity tools time and score the route run/serve
+        // take; a refusal leaves the rest to the chunked host prefill.
+        #[cfg(not(target_os = "macos"))]
+        if task_mask.is_none() && ids.len() > 2 && self.g4_batch_prefill() {
+            let (n, last) = match self.g4_batch_ingest(ids, 0, false) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.clear_sequence_state();
+                    return Err(e);
+                }
+            };
+            if n > 0 {
+                hidden.copy_from_slice(&last);
+                pos = n;
+            }
+        }
         if self.can_prefill_batched() && !self.graph_prefill_preferred() && ids.len() > 2 {
             // prefill-GEMM in chunks; only the last position's hidden is
             // needed. (o1-compatible: the batch path attends per position
@@ -10426,6 +10595,11 @@ impl Pipeline {
     /// cannot run of Gemma-4, which the token graph does run: per-layer
     /// head widths, the V norm, sandwich norms and the layer scalar.
     fn batch_graph_gemma_decline(&self) -> Option<&'static str> {
+        // Gemma-4 rides `gemma_batch` (per-layer head width, V norm,
+        // sandwich norms, layer scalar) unless CMF_G4_BATCH=0.
+        if (self.global_attn.is_some() || self.attn_v_norm) && crate::gpu::g4_batch_on() {
+            return None;
+        }
         if self.global_attn.is_some() {
             return Some("per-layer head width (Gemma-4 global layers)");
         }
@@ -13521,13 +13695,16 @@ impl Pipeline {
                     }
                     _ => return None,
                 };
+                // Gemma-4's sandwich norms and layer scalar (`gemma_batch`);
+                // every other model hands the graph none, as before.
+                let g4 = self.global_attn.is_some() || self.attn_v_norm;
                 layers.push(crate::gpu::GraphLayer {
                     input_norm: &lw.input_norm,
                     attn,
                     post_norm: &lw.post_norm,
-                    attn_out_norm: None,
-                    ffn_out_norm: None,
-                    layer_scale: None,
+                    attn_out_norm: if g4 { lw.attn_out_norm.as_deref() } else { None },
+                    ffn_out_norm: if g4 { lw.ffn_out_norm.as_deref() } else { None },
+                    layer_scale: if g4 { lw.layer_scale } else { None },
                     ffn: gffn,
                 });
             }

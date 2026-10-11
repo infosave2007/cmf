@@ -37,6 +37,8 @@ pub(crate) mod moe_r4;
 pub(crate) mod moe_q82;
 /// Token-axis batch kernels of the dense GDN hybrids (gated attention).
 pub(crate) mod dense_batch;
+/// Gemma-4 on the batch graph (prompt ingest) and its q8_2f prompt GEMM.
+pub(crate) mod gemma_batch;
 /// Warp-per-row q4tp decode matvecs (bit-identical to the 16nl rows).
 pub(crate) mod dense_mv;
 
@@ -18618,6 +18620,8 @@ struct Ctx {
     moe_r4_pipes: std::sync::OnceLock<Option<moe_r4::Pipes>>,
     /// Token-axis batch kernels of the dense hybrids (`dense_batch`).
     dense_batch_pipes: std::sync::OnceLock<Option<dense_batch::Pipes>>,
+    /// Gemma-4 batch kernels (`gemma_batch`).
+    g4_batch_pipes: std::sync::OnceLock<Option<gemma_batch::Pipes>>,
     /// Warp-per-row q4tp decode matvecs (`dense_mv`).
     dense_mv_pipes: std::sync::OnceLock<Option<dense_mv::MvSg>>,
     /// Subgroup-tree GDN step twins (`dense_mv::gdn`).
@@ -21228,6 +21232,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         qwen4_pipes: std::sync::OnceLock::new(),
         moe_r4_pipes: std::sync::OnceLock::new(),
         dense_batch_pipes: std::sync::OnceLock::new(),
+        g4_batch_pipes: std::sync::OnceLock::new(),
         dense_mv_pipes: std::sync::OnceLock::new(),
         gdn_sg_pipes: std::sync::OnceLock::new(),
         moe_down_q4tp_b2,
@@ -29882,6 +29887,17 @@ pub fn forward_batch_graph_at(
         bgraph_refused("pos+k past cap, or head_dim not %4 / over hd_cap");
         return batch_outcome(o1_started || state_started, false); // vec4 K/V reads; hd_cap = workgroup-storage limit
     }
+    // Gemma-4 (its scale-less V norm marks it): own attention kernels,
+    // sandwich tails, tanh-GELU and the q8_2f prompt GEMM (`gemma_batch`).
+    // Every other model never takes a line of it.
+    let g4_model = layers.iter().any(|l| {
+        matches!(&l.attn, crate::gpu::GraphAttn::Full { geom: Some(g), .. } if g.v_norm)
+    });
+    let g4p = if g4_model { gemma_batch::pipes(c) } else { None };
+    if g4_model && g4p.is_none() {
+        bgraph_refused("Gemma-4 batch kernels unavailable (CMF_G4_BATCH=0 or rejected)");
+        return batch_outcome(o1_started || state_started, false);
+    }
     // Unlike the decode graph this function has no host-tail handoff: every
     // layer must coexist in one command buffer. Refuse before the first
     // upload when that live set cannot fit. Relying on the LRU here is
@@ -29902,8 +29918,24 @@ pub fn forward_batch_graph_at(
             return batch_outcome(o1_started || state_started, false);
         }
         if let crate::gpu::GraphFfn::Dense { act, .. } = &l.ffn {
-            if *act != crate::gpu::GraphAct::Silu {
+            // Gemma-4's tanh-GELU (and exact GELU) ride the act word of
+            // the batched act(gate)·up kernel; other models keep SiLU only.
+            if *act != crate::gpu::GraphAct::Silu && !(g4_model && act.code() <= 2) {
                 bgraph_refused("non-SiLU dense FFN (no batched arm)");
+                return batch_outcome(o1_started || state_started, false);
+            }
+        }
+        if !g4_model
+            && (l.attn_out_norm.is_some() || l.ffn_out_norm.is_some() || l.layer_scale.is_some())
+        {
+            bgraph_refused("sandwich norms / layer scale outside Gemma-4");
+            return batch_outcome(o1_started || state_started, false);
+        }
+        if let crate::gpu::GraphAttn::Full { geom: Some(g), .. } = &l.attn {
+            if g4_model
+                && !(g.v_norm && gemma_batch::attn_fits(nh, g.nkv, g.hd, g.dv, g.rd) && g.sink.is_none())
+            {
+                bgraph_refused("Gemma-4 layer geometry outside the batch kernels");
                 return batch_outcome(o1_started || state_started, false);
             }
         }
@@ -30000,6 +30032,9 @@ pub fn forward_batch_graph_at(
             wv: GMat,
             wo: GMat,
             nkv: usize,
+            /// This layer's Q/K head width: the call's `hd` except on
+            /// Gemma-4 global layers (512 over 256).
+            hd: usize,
             dv: usize,
         },
         Gdn {
@@ -30034,6 +30069,8 @@ pub fn forward_batch_graph_at(
             /// here asked for weights that do not exist — the graph then
             /// refused for the whole model, on every token, silently.
             width: usize,
+            /// `GraphAct::code` of act(gate)·up (0 SiLU; Gemma-4: 2).
+            act: u32,
         },
         Moe {
             router: GMat,
@@ -30199,10 +30236,12 @@ pub fn forward_batch_graph_at(
                     return batch_outcome(o1_started || state_started, false);
                 } // batched bias axpy not wired
                 let (lnkv, ldv) = geom.map_or((nkv, hd), |g| (g.nkv, g.dv));
-                let qrows = nh * hd * (1 + *output_gate as usize);
+                // Gemma-4 global layers: 512-wide heads over the call's 256.
+                let lhd = geom.map_or(hd, |g| g.hd);
+                let qrows = nh * lhd * (1 + *output_gate as usize);
                 let (Some(wq), Some(wk), Some(wv), Some(wo)) = (
                     resolve(wq, qrows, hidden),
-                    resolve(wk, lnkv * hd, hidden),
+                    resolve(wk, lnkv * lhd, hidden),
                     resolve(wv, lnkv * ldv, hidden),
                     resolve(wo, hidden, nh * ldv),
                 ) else {
@@ -30219,6 +30258,7 @@ pub fn forward_batch_graph_at(
                     wv,
                     wo,
                     nkv: lnkv,
+                    hd: lhd,
                     dv: ldv,
                 }
             }
@@ -30283,7 +30323,7 @@ pub fn forward_batch_graph_at(
                 gate: lg,
                 up: lu,
                 down: ld,
-                ..
+                act: lact,
             } => {
                 // Per-layer FFN width, from the weight rather than the
                 // header — a pruned model narrows it layer by layer.
@@ -30311,6 +30351,7 @@ pub fn forward_batch_graph_at(
                     up,
                     down,
                     width: ffn_w,
+                    act: lact.code(),
                 }
             }
             crate::gpu::GraphFfn::Moe {
@@ -30743,21 +30784,33 @@ pub fn forward_batch_graph_at(
             }
         )
     });
-    let qdim = nh * hd * (1 + any_gate as usize);
+    // The widest layer's head (Gemma-4 global layers: 512 over the call's
+    // 256); every other model has one width and these sizes are its own.
+    let max_hd = lws
+        .iter()
+        .filter_map(|lw| match &lw.attn {
+            LAttn::Full { hd: lhd, .. } => Some(*lhd),
+            _ => None,
+        })
+        .fold(hd, usize::max);
+    let qdim = nh * max_hd * (1 + any_gate as usize);
     let (gnv, _gnk, gdk, gdv, _gkk, gcdim) = gdn_dims.unwrap_or((1, 1, 1, 1, 1, 1));
     // batched GEMM outputs
     let qraw_b = rwc(k * qdim);
-    // Widest layer's K/V projection (per-layer KV heads).
+    // Widest layer's K/V projection (per-layer KV heads and head width).
     let kv_rows = lws
         .iter()
         .filter_map(|lw| match &lw.attn {
-            LAttn::Full { nkv, .. } => Some(*nkv * hd),
+            LAttn::Full { nkv, hd: lhd, .. } => Some(*nkv * *lhd),
             _ => None,
         })
         .fold(nkv * hd, usize::max);
     let kb_b = rwc(k * kv_rows);
     let vb_b = rwc(k * kv_rows);
-    let attn_bb = rwc(k * nh * hd);
+    let attn_bb = rwc(k * nh * max_hd);
+    // Gemma-4: normed + rotated Q rows of the run, and the sandwich-normed
+    // mixer / FFN output before its residual add.
+    let g4_bufs = g4p.map(|_| (rwc(k * nh * max_hd), rwc(k * hidden)));
     let qkv_b = rwc(k * gcdim);
     let z_b = rwc(k * gnv * gdv);
     let gdo_b = rwc(k * gnv * gdv);
@@ -30812,12 +30865,14 @@ pub fn forward_batch_graph_at(
                     geom: Some(g),
                     ..
                 } if o1.get(li).is_none_or(|v| v.is_none()) => {
+                    // The layer's own head width (Gemma-4 global layers),
+                    // as the token graph keys the same mirror.
                     let e = kv_mirror_ensure_x(
                         c,
                         &mut kvm,
                         (kv_id, layer_base + li),
                         g.nkv,
-                        hd,
+                        g.hd,
                         g.dv,
                         cap,
                         g.window,
@@ -30990,6 +31045,13 @@ pub fn forward_batch_graph_at(
         match m.kind {
             0 => encode_q8_mm(c, enc, &m.buf, m.rs.as_ref().unwrap(), xs, y, rows, cols, k),
             5 => encode_q4_tile_mm(c, enc, &c.q4t_mm, &m.buf, xs, y, rows, cols, k),
+            // Gemma-4's prompt chunks: the register-blocked int8 GEMM (each
+            // weight word read once per 64 batch rows, exact f32 sums in
+            // tile order). Every other model keeps the eight-row arm below.
+            7 if k > 16
+                && g4p.is_some_and(|gp| {
+                    gemma_batch::encode_q82_mm(c, enc, gp, &m.buf, xs, y, rows, cols, k)
+                }) => {}
             // q8_2f: eight batch rows per weight read, each output the
             // decode kernel's bit for bit (`q8_2f_matvec_b`).
             7 => {
@@ -31400,7 +31462,9 @@ pub fn forward_batch_graph_at(
             if bts_on {
                 if let Some((qs, _, _)) = c.ts_query.as_ref() {
                     let n = bts_lbl.len() as u32;
-                    let cap = if std::env::var("CMF_BATCH_KERNEL_TS").as_deref() == Ok("1") {
+                    let cap = if std::env::var("CMF_BATCH_KERNEL_TS").as_deref() == Ok("1")
+                        || std::env::var("CMF_GRAPH_TS_ALL").as_deref() == Ok("1")
+                    {
                         1024
                     } else {
                         250
@@ -31446,6 +31510,7 @@ pub fn forward_batch_graph_at(
                     wv,
                     wo,
                     nkv: lnkv,
+                    hd: lhd,
                     dv: ldv,
                 },
                 crate::gpu::GraphAttn::Full {
@@ -31458,6 +31523,9 @@ pub fn forward_batch_graph_at(
                 },
             ) => {
                 let (lnkv, ldv) = (*lnkv, *ldv);
+                // This layer's head width: every size below is the layer's.
+                // Equal to the call's `hd` except on Gemma-4 global layers.
+                let hd = *lhd;
                 let o1_here = o1.get(li).and_then(|v| v.as_ref());
                 let qnw = stor(bytemuck::cast_slice(q_norm.unwrap_or(&vec![0f32; hd])));
                 let knw = stor(bytemuck::cast_slice(k_norm.unwrap_or(&vec![0f32; hd])));
@@ -31478,7 +31546,52 @@ pub fn forward_batch_graph_at(
                     lnkv * ldv,
                     hidden,
                 );
-                if let Some(views) = o1_here {
+                if let (Some(gp), Some((qall, _)), Some(g), None) =
+                    (g4p, g4_bufs.as_ref(), geom.filter(|g| g.v_norm), o1_here)
+                {
+                    // Gemma-4: Q/K norm + RoPE and the V norm of every row,
+                    // every row into the (ring) mirror, then the blocked
+                    // causal attend — three dispatches a layer.
+                    let (kbuf, vbuf) = kvbufs[li].as_ref().unwrap();
+                    let invf_l = stor(bytemuck::cast_slice(g.invf));
+                    state_started = true;
+                    // Stage stamps (CMF_BATCH_TS=1): "gdn-in" = norm + Q/K/V
+                    // GEMMs, "recur" = rope + append + attend, then "attn" =
+                    // the output GEMM.
+                    bts!(enc, 6);
+                    gemma_batch::encode_attn(
+                        c,
+                        &mut enc,
+                        gp,
+                        &gemma_batch::G4Attn {
+                            nh,
+                            nkv: g.nkv,
+                            hd,
+                            rd: g.rd,
+                            dv: g.dv,
+                            flags: flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm),
+                            eps,
+                            rope_scale: g.rope_scale,
+                            v_norm: g.v_norm,
+                            cap: xcaps[&li],
+                            pos0: positions[0],
+                            window: g.window,
+                            scale: attn_scale,
+                            k,
+                        },
+                        &qraw_b,
+                        &kb_b,
+                        &vb_b,
+                        qall,
+                        &qnw,
+                        &knw,
+                        &invf_l,
+                        kbuf,
+                        vbuf,
+                        &attn_bb,
+                    );
+                    bts!(enc, 5);
+                } else if let Some(views) = o1_here {
                     // Sealed O(1) attention uses the same rotated Q/K/V
                     // projections as the exact path, then runs the existing
                     // far/push/attend kernels for each batch row in causal
@@ -32490,10 +32603,25 @@ pub fn forward_batch_graph_at(
             }
             _ => return batch_outcome(o1_started || state_started, false),
         }
+        // Gemma sandwich: the mixer output is RMS-normed with its own
+        // weights before the residual add reads it.
+        let mix_out = match (l.attn_out_norm, g4_bufs.as_ref()) {
+            (Some(w), Some((_, ob2))) => {
+                let won = stor(bytemuck::cast_slice(w));
+                go(
+                    &mut enc,
+                    &c.rmsnorm_b,
+                    &bg(&c.layout_rmsnorm_b, &[&ob, &won, ob2, &rms_u]),
+                    k as u32,
+                );
+                ob2
+            }
+            _ => &ob,
+        };
         go(
             &mut enc,
             &c.add_rmsnorm_b,
-            &bg(&c.layout_add_rmsnorm_b, &[&h_buf, &ob, &pnw, &n1, &rms_u]),
+            &bg(&c.layout_add_rmsnorm_b, &[&h_buf, mix_out, &pnw, &n1, &rms_u]),
             k as u32,
         );
         match &lw.ffn {
@@ -32505,6 +32633,7 @@ pub fn forward_batch_graph_at(
                 up,
                 down,
                 width,
+                act,
             } => {
                 let inter = *width; // this layer's, not the model's
                 let Some(n1_p) = prism_input_b(&mut enc, &[gate, up], &n1, hidden) else {
@@ -32512,12 +32641,24 @@ pub fn forward_batch_graph_at(
                     return batch_outcome(o1_started || state_started, false);
                 };
                 ematb2(&mut enc, gate, up, &n1_p, &gbuf, &ubuf, inter, inter, hidden);
+                // act(gate)·up: SiLU keeps the historical uniform; Gemma-4's
+                // tanh-GELU rides its `_c` word (admitted above only there).
+                let act_u = if *act == 0 {
+                    silu_u.clone()
+                } else {
+                    unif(&[(k * inter) as u32, 0, 0, *act])
+                };
                 go(
                     &mut enc,
                     &c.silu,
-                    &bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &silu_u]),
+                    &bg(&c.layout_silu, &[&gbuf, &ubuf, &dummy_hd, &abuf, &act_u]),
                     ((k * inter) as u32).div_ceil(256),
                 );
+                if g4p.is_some() {
+                    // "gdn-proj" = post-attention norms + gate/up GEMM + act;
+                    // "ffn" then = the down GEMM.
+                    bts!(enc, 7);
+                }
                 let Some(abuf_p) = prism_input_b(&mut enc, &[down], &abuf, inter) else {
                     bgraph_refused("Prism transform unavailable for batched FFN output");
                     return batch_outcome(o1_started || state_started, false);
@@ -32914,7 +33055,44 @@ pub fn forward_batch_graph_at(
             }
         }
         bts!(enc, 3);
-        if li + 1 < layers.len() {
+        let sandwich_tail = l.ffn_out_norm.is_some() || l.layer_scale.is_some();
+        if let (true, Some(gp), Some((_, ob2))) = (sandwich_tail, g4p, g4_bufs.as_ref()) {
+            // Gemma: ob2 = rms(ob)·ffn_out_norm, then h = (h + ob2)·scale
+            // and n1 = rms(h)·next input norm in one per-row pass. The last
+            // layer's norm output is unused (the head normalizes h itself).
+            let src = match l.ffn_out_norm {
+                Some(w) => {
+                    let wfn = stor(bytemuck::cast_slice(w));
+                    go(
+                        &mut enc,
+                        &c.rmsnorm_b,
+                        &bg(&c.layout_rmsnorm_b, &[&ob, &wfn, ob2, &rms_u]),
+                        k as u32,
+                    );
+                    ob2
+                }
+                None => &ob,
+            };
+            let next_w = if li + 1 < layers.len() {
+                stor(bytemuck::cast_slice(layers[li + 1].input_norm))
+            } else {
+                pnw.clone()
+            };
+            gemma_batch::encode_add_norm(
+                c,
+                &mut enc,
+                gp,
+                &h_buf,
+                src,
+                &next_w,
+                &n1,
+                hidden,
+                gemma,
+                eps,
+                l.layer_scale,
+                k,
+            );
+        } else if li + 1 < layers.len() {
             let inw_next = stor(bytemuck::cast_slice(layers[li + 1].input_norm));
             go(
                 &mut enc,
