@@ -38,6 +38,11 @@ pub mod egemma2;
 #[doc(hidden)]
 pub mod moe_q8;
 
+// Gemma-4 (humanizer 12B) on the token graph and the chunk prefill —
+// child module, `gpu_metal/gemma4.rs`.
+#[doc(hidden)]
+pub mod gemma4;
+
 // Native Metal scratch buffers are process-wide (the command queue and
 // `Ctx::io_bufs` are shared by all pipelines).  A buffer is safe to reuse
 // only after the owning pipeline's command buffer has completed; two server
@@ -9962,14 +9967,33 @@ pub struct ChunkLayer<'a> {
     pub window: Option<usize>,
     /// Per-head sigmoid output gate `[nh × hs]` (Spark-X2.5 `g_proj`).
     pub head_gate: Option<&'a [f32]>,
-    /// Exact GELU between gate and up instead of SiLU.
-    pub gelu: bool,
+    /// The activation between gate and up, `GraphAct::code`: 0 SiLU,
+    /// 1 exact GELU, 2 tanh-GELU (Gemma-4, `gemma4`).
+    pub act: u8,
+    /// Gemma-4's extras (`gemma4`): per-layer geometry, V norm, attention
+    /// scale, sandwich norms, layer scalar, q8_2f FFN.
+    pub g4: Option<ChunkGemma4<'a>>,
     /// q8_2f input fields of q, k, v, o (empty = plain q8_row / q4):
     /// the GEMM reads x·col (`col_scale_rows`), as the CPU's `prescale`.
     pub col: [&'a [f32]; 4],
     /// A routed-experts FFN instead of gate/up/down (Mellum2.1): `gate`,
     /// `up`, `down` then carry the FIRST expert's trio for the shape checks.
     pub moe: Option<ChunkMoe<'a>>,
+}
+
+/// What a Gemma-4 chunk layer adds (`gpu_metal::gemma4`). Its layers may
+/// differ in KV heads and head width (512-wide global layers over one KV
+/// head: the 16-slot `chunk_rope_kv_w16`); the attention GEMMs run with f32
+/// operand tiles and every q8_2f projection — the FFN's too — through the
+/// blob-addressed f32-tile GEMM that reads the weight's own input field
+/// (`moe_q8`), the pair that held Mellum2.1's q8_2f perplexity on the CPU's.
+pub struct ChunkGemma4<'a> {
+    pub v_norm: bool,
+    /// Attention score scale (the model's; Gemma-4 sets 1.0).
+    pub scale: f32,
+    pub attn_out_norm: Option<&'a [f32]>,
+    pub ffn_out_norm: Option<&'a [f32]>,
+    pub layer_scale: Option<f32>,
 }
 
 /// The MoE FFN of a chunk-graph layer: f32 router rows, the q4tp expert
@@ -10253,6 +10277,9 @@ struct ChunkPrep {
     st0: usize,
     /// Routed experts' absolute (gate, up, down) offsets (MoE layers).
     moe_abs: Vec<(usize, usize, usize)>,
+    /// Gemma-4: which of the seven weights are q8_2f blobs (the blob GEMM
+    /// reads their row scales and input field in place; bounds checked).
+    q8f: [bool; 7],
 }
 
 /// GPU time of a completed command buffer (GPUEndTime − GPUStartTime),
@@ -10356,9 +10383,23 @@ pub fn chunk_run_gpu(
         return false;
     }
     let (nh, nkv, hd, hs, inter) = (first.nh, first.nkv, first.hd, first.hs, first.inter);
+    // Gemma-4 runs carry their own kernels and may vary KV heads / head
+    // width per layer (the buffers below are sized for the widest).
+    let g4p = if layers.iter().any(|l| l.g4.is_some() || l.act == 2) {
+        match gemma4::pipes(c) {
+            Some(p) if layers.iter().all(|l| l.g4.is_some()) => Some(p),
+            _ => return false,
+        }
+    } else {
+        None
+    };
+    if g4p.is_some() && moe_q8::pipes(c).is_none() {
+        return false;
+    }
+    let wide_ok = |hd: usize| hd <= 256 || (g4p.is_some() && gemma4::w16_on() && hd <= 512);
     if b < 32
         || hd % 4 != 0
-        || hd > 256
+        || !wide_ok(hd)
         || first.rd < 2
         || first.rd > hd
         || (first.rd / 2) % 32 != 0
@@ -10378,7 +10419,15 @@ pub fn chunk_run_gpu(
     // resident, shapes uniform, mirror ready).
     let mut preps: Vec<ChunkPrep> = Vec::with_capacity(layers.len());
     for (l, lio) in layers.iter().zip(io.iter()) {
-        if l.nh != nh || l.nkv != nkv || l.hd != hd || l.hs != hs || l.inter != inter {
+        if l.nh != nh || l.hs != hs || l.inter != inter {
+            return false;
+        }
+        if g4p.is_none() && (l.nkv != nkv || l.hd != hd) {
+            return false;
+        }
+        // This layer's own KV heads and head width (uniform but for Gemma-4).
+        let (nkv, hd) = (l.nkv, l.hd);
+        if hd % 4 != 0 || !wide_ok(hd) || l.nkv == 0 || nh % l.nkv != 0 {
             return false;
         }
         // Per-layer RoPE width (Spark-X2.5: 64 on full layers, 256 on
@@ -10427,6 +10476,25 @@ pub fn chunk_run_gpu(
             match abs_of(t) {
                 Some(a) => *slot = a,
                 None => return false,
+            }
+        }
+        // Gemma-4: q8_2f weights take the blob GEMM — its payload, row
+        // scales and input field inside the mapping, K a multiple of 32.
+        let mut q8f = [false; 7];
+        if l.g4.is_some() {
+            for (i, t) in tens.iter().enumerate() {
+                let Some(e) = l.model.tensors.get(t.0) else {
+                    return false;
+                };
+                if e.dtype == cortiq_core::TensorDtype::Q8_2f {
+                    let fits = moe_q8::tensor_bytes(t.1, t.2).is_some_and(|n| {
+                        abs[i] % 4 == 0 && abs[i] + n <= safe_len && e.nbytes as usize >= n
+                    });
+                    if !fits || t.2 % 32 != 0 || (i < 4 && l.col[i].is_empty()) {
+                        return false;
+                    }
+                    q8f[i] = true;
+                }
             }
         }
         // Routed experts: every trio q4tp, the first one's shape, in the file.
@@ -10622,26 +10690,30 @@ pub fn chunk_run_gpu(
             cap,
             st0,
             moe_abs,
+            q8f,
         });
     }
 
     // ── Shared per-run buffers (pooled by size, reused across layers —
     // encoder ordering within one command buffer serializes access).
+    // The widest layer's Q and KV rows (every layer's for all but Gemma-4).
+    let qw = layers.iter().map(|l| l.nh * l.hd).max().unwrap_or(nh * hd);
+    let kvw = layers.iter().map(|l| l.nkv * l.hd).max().unwrap_or(nkv * hd);
     let h_b = io_buf(c, 60_000_000_071 + b * hs, b * hs * 4);
     let n_b = io_buf(c, 61_000_000_091 + b * hs, b * hs * 4);
-    let qraw = io_buf(c, 62_000_000_017 + b * nh * hd, b * nh * hd * 4);
-    let kraw = io_buf(c, 63_000_000_029 + b * nkv * hd, b * nkv * hd * 4);
-    let vraw = io_buf(c, 64_000_000_063 + b * nkv * hd, b * nkv * hd * 4);
-    let qrope = io_buf(c, 65_000_000_087 + b * nh * hd, b * nh * hd * 4);
-    let attn = io_buf(c, 66_000_000_103 + b * nh * hd, b * nh * hd * 4);
-    let apanel = io_buf(c, 73_000_000_117 + b * nh * hd, b * nh * hd * 4);
+    let qraw = io_buf(c, 62_000_000_017 + b * qw, b * qw * 4);
+    let kraw = io_buf(c, 63_000_000_029 + b * kvw, b * kvw * 4);
+    let vraw = io_buf(c, 64_000_000_063 + b * kvw, b * kvw * 4);
+    let qrope = io_buf(c, 65_000_000_087 + b * qw, b * qw * 4);
+    let attn = io_buf(c, 66_000_000_103 + b * qw, b * qw * 4);
+    let apanel = io_buf(c, 73_000_000_117 + b * qw, b * qw * 4);
     let ob = io_buf(c, 67_000_000_141 + b * hs, b * hs * 4);
     let gb = io_buf(c, 68_000_000_169 + b * inter, b * inter * 4);
     let ub = io_buf(c, 69_000_000_213 + b * inter, b * inter * 4);
     let db = io_buf(c, 71_000_000_073 + b * hs, b * hs * 4);
     // q8_2f: x·col staged for the projection that reads it (serial
     // encoders order the reuse).
-    let xpre = io_buf(c, 75_000_000_019 + b * hs.max(nh * hd), b * hs.max(nh * hd) * 4);
+    let xpre = io_buf(c, 75_000_000_019 + b * hs.max(qw), b * hs.max(qw) * 4);
     let col_scale = |enc: &metal::ComputeCommandEncoderRef, x: &Buffer, col: &[f32], n: usize| {
         enc.set_compute_pipeline_state(&c.colscale);
         enc.set_buffer(0, Some(x), 0);
@@ -10717,6 +10789,8 @@ pub fn chunk_run_gpu(
         cmd = prof.cut(c, cmd, "embed");
     }
     for (l, prep) in layers.iter().zip(&preps) {
+        // This layer's geometry (Gemma-4's global layers: 512 wide, 1 KV head).
+        let (nkv, hd) = (l.nkv, l.hd);
         let inorm = const_buf(c, l.input_norm);
         let pnorm = const_buf(c, l.post_norm);
         let invf = const_buf(c, &l.inv_freq[..l.rd / 2]);
@@ -10763,6 +10837,13 @@ pub fn chunk_run_gpu(
         let q8l = l.moe.as_ref().is_some_and(|m| m.q8);
         let q8proj = if q8l && moe_q8::proj_on() { moe_q8::pipes(c) } else { None };
         let q8att = if q8l && moe_q8::att_on() { moe_q8::pipes(c) } else { None };
+        // Gemma-4: q8_2f projections through the blob GEMM (their input
+        // fields read in place) and f32 attention tiles, always.
+        let (q8proj, q8att) = if l.g4.is_some() {
+            (moe_q8::pipes(c), moe_q8::pipes(c))
+        } else {
+            (q8proj, q8att)
+        };
         {
             // Independent outputs — one encoder, three dispatches (a q8_2f
             // projection stages its x·col first; the serial encoder orders
@@ -10787,9 +10868,18 @@ pub fn chunk_run_gpu(
             enc.end_encoding();
         }
         cmd = prof.cut(c, cmd, "mm_qkv");
+        if l.g4.as_ref().is_some_and(|g| g.v_norm) {
+            let enc = cmd.new_compute_command_encoder();
+            gemma4::enc_vnorm(g4p.unwrap(), enc, &vraw, nkv, hd, b, l.eps);
+            enc.end_encoding();
+        }
         {
             let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&c.cropekv);
+            enc.set_compute_pipeline_state(if hd > 256 {
+                &g4p.unwrap().cropekv16
+            } else {
+                &c.cropekv
+            });
             for (i, buf) in [
                 &qraw, &kraw, &vraw, &qrope, &prep.k_mb, &prep.v_mb, &bqb, &bkb, &bvb, &qn_b,
                 &kn_b, &invf,
@@ -10843,7 +10933,7 @@ pub fn chunk_run_gpu(
             // Grow-only per (nkv, chunk rows): every score the reads below
             // touch is written first, so a larger slot changes nothing.
             let scores = io_buf_grow(c, 72_000_000_089 + nkv * m_rows, nkv * m_rows * ncur * 4);
-            let scale = 1.0f32 / (hd as f32).sqrt();
+            let scale = l.g4.as_ref().map_or(1.0f32 / (hd as f32).sqrt(), |g| g.scale);
             {
                 let enc = cmd.new_compute_command_encoder();
                 match q8att {
@@ -10969,6 +11059,19 @@ pub fn chunk_run_gpu(
             enc.end_encoding();
         }
         cmd = prof.cut(c, cmd, "mm_o");
+        // Gemma-4 sandwich: O·attn is RMS-normed in place before its add.
+        if let Some(w) = l.g4.as_ref().and_then(|g| g.attn_out_norm) {
+            let enc = cmd.new_compute_command_encoder();
+            disp(
+                enc,
+                &c.rmsrows,
+                &[(&ob, 0), (&const_buf(c, w), 0), (&ob, 0)],
+                &[hs as u32, l.gemma as u32],
+                &[l.eps],
+                ((b * 256) as u64, 256),
+            );
+            enc.end_encoding();
+        }
         add_norm(&cmd, Some(&ob), &pnorm, &n_b);
         cmd = prof.cut(c, cmd, "axpy+norm");
         if let Some(m) = &l.moe {
@@ -10977,6 +11080,65 @@ pub fn chunk_run_gpu(
                 return false;
             }
             cmd = prof.cut(c, cmd, "moe");
+        } else if let Some(g4) = l.g4.as_ref() {
+            // Gemma-4: gate/up (a q8_2f weight through the blob GEMM with its
+            // own input field, any other through the tiled GEMM), the
+            // activation in place over the gate rows, down, then the layer
+            // tail h = (h + norm(down))·scalar — no delta left pending.
+            let p8 = moe_q8::pipes(c).expect("checked with g4p");
+            let mm = |enc: &metal::ComputeCommandEncoderRef,
+                      i: usize,
+                      t: &(usize, usize, usize, &[f32]),
+                      x: &Buffer,
+                      y: &Buffer| {
+                if prep.q8f[i] {
+                    moe_q8::enc_mm_rows(p8, enc, &fbuf, prep.abs[i], x, 0, y, 0, b, t.1, t.2, true);
+                } else {
+                    enc_mul_mm(c, enc, &fbuf, prep.abs[i], &prep.rs[i], prep.kind[i], x, y, b, t.1, t.2);
+                }
+            };
+            let enc = cmd.new_compute_command_encoder();
+            mm(enc, 4, &l.gate, &n_b, &gb);
+            mm(enc, 5, &l.up, &n_b, &ub);
+            enc.end_encoding();
+            cmd = prof.cut(c, cmd, "mm_gateup");
+            let enc = cmd.new_compute_command_encoder();
+            if l.act == 2 {
+                gemma4::enc_gelut(g4p.unwrap(), enc, &gb, &ub, &gb, b * inter);
+            } else {
+                enc.set_compute_pipeline_state(if l.act == 1 { &c.gelu } else { &c.silu });
+                enc.set_buffer(0, Some(&gb), 0);
+                enc.set_buffer(1, Some(&ub), 0);
+                enc.set_buffer(2, Some(&gb), 0); // dummy col (has_col = 0)
+                enc.set_buffer(3, Some(&gb), 0);
+                let (n_u, hc) = ((b * inter) as u32, 0u32);
+                enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(5, 4, &hc as *const u32 as *const std::ffi::c_void);
+                enc.dispatch_threads(MTLSize::new((b * inter) as u64, 1, 1), MTLSize::new(256, 1, 1));
+            }
+            enc.end_encoding();
+            let enc = cmd.new_compute_command_encoder();
+            mm(enc, 6, &l.down, &gb, &db);
+            enc.end_encoding();
+            if g4.ffn_out_norm.is_some() || g4.layer_scale.is_some() {
+                let enc = cmd.new_compute_command_encoder();
+                let wb = g4.ffn_out_norm.map(|w| const_buf(c, w));
+                gemma4::enc_norm_add_scale(
+                    g4p.unwrap(),
+                    enc,
+                    &h_b,
+                    &db,
+                    wb.as_ref(),
+                    hs,
+                    l.gemma,
+                    l.eps,
+                    g4.layer_scale.unwrap_or(1.0),
+                    b,
+                );
+                enc.end_encoding();
+                pending_delta = false;
+            }
+            cmd = prof.cut(c, cmd, "mm_down");
         } else {
         {
             let enc = cmd.new_compute_command_encoder();
@@ -11009,7 +11171,7 @@ pub fn chunk_run_gpu(
             enc.end_encoding();
         }
         cmd = prof.cut(c, cmd, "mm_gateup");
-        if l.gelu {
+        if l.act == 1 {
             // GELU: gelu(g)·u in place over the gate rows, then the plain
             // down GEMM (the fused-activation GEMMs compute SiLU only).
             let enc = cmd.new_compute_command_encoder();
@@ -11121,7 +11283,8 @@ pub fn chunk_run_gpu(
     unsafe {
         std::ptr::copy_nonoverlapping(h_b.contents() as *const f32, h.as_mut_ptr(), b * hs);
     }
-    for (prep, lio) in preps.iter().zip(io.iter_mut()) {
+    for ((prep, lio), l) in preps.iter().zip(io.iter_mut()).zip(layers) {
+        let (nkv, hd) = (l.nkv, l.hd);
         unsafe {
             let kc = prep.k_mb.contents() as *const f32;
             let vc = prep.v_mb.contents() as *const f32;
@@ -14015,10 +14178,11 @@ pub enum MetalFfn<'a> {
         gate: (usize, usize, usize),
         up: (usize, usize, usize),
         down: (usize, usize, usize),
-        /// Exact (erf) GELU instead of SiLU between gate and up
-        /// (Spark-X2.5). Only the token graph's `encode_post_ffn`
-        /// computes it; every other Dense consumer refuses it.
-        gelu: bool,
+        /// The activation between gate and up, `GraphAct::code`: 0 SiLU,
+        /// 1 exact (erf) GELU (Spark-X2.5), 2 tanh-GELU (Gemma-4, the
+        /// `gemma4` kernels). Only the token graph's `encode_post_ffn`
+        /// computes 1 and 2; every other Dense consumer refuses them.
+        act: u8,
     },
     Moe(GpuMoe<'a>),
 }
@@ -14093,6 +14257,12 @@ pub struct AttnGpuLayer<'a> {
     pub wv: (usize, usize, usize),
     pub wo: (usize, usize, usize),
     pub ffn: MetalFfn<'a>,
+    /// Gemma-4 sandwich norms (`gemma4` kernels): O·ao and the FFN output
+    /// are RMS-normed with these before their residual adds.
+    pub attn_out_norm: Option<&'a [f32]>,
+    pub ffn_out_norm: Option<&'a [f32]>,
+    /// Gemma-4 `layer_scalar`: the stream is scaled by it at layer end.
+    pub layer_scale: Option<f32>,
 }
 
 /// Buffers `io_buf` had to allocate (cache misses). A first-touch Shared
@@ -14986,6 +15156,15 @@ impl TokenGraph {
         if l.wo.1 != self.dims.hidden {
             return false;
         }
+        // Gemma-4's sandwich norms, layer scalar and tanh-GELU come from
+        // its own library; the MoE tail has no sandwich step.
+        let tail = l.attn_out_norm.is_some() || l.ffn_out_norm.is_some() || l.layer_scale.is_some();
+        let tanh = matches!(l.ffn, MetalFfn::Dense { act: 2, .. });
+        if (tail || tanh)
+            && (matches!(l.ffn, MetalFfn::Moe(_)) || gemma4::pipes(self.c).is_none())
+        {
+            return false;
+        }
         [l.wq, l.wk, l.wv, l.wo]
             .iter()
             .all(|t| self.proj_abs(*t).is_some())
@@ -15382,6 +15561,7 @@ impl TokenGraph {
             o1: None,
             window: p.window,
             head_gate: p.head_gate,
+            v_norm: p.v_norm,
         };
         // fresh mirror every time
         kv_mirror_drop(p2.kv_id);
@@ -15655,7 +15835,8 @@ impl TokenGraph {
         let (abs, q1t) = self.proj_abs(l.wo).unwrap();
         // Dense decode (`fuse_on`): h += O·ao in the projection's epilogue,
         // so the norm below runs without a delta — bit-exact, one pass less.
-        let o_fused = fuse_on() && matches!(q1t, ProjKind::Q4tp);
+        // Not under a Gemma-4 sandwich norm: O·ao is normed before its add.
+        let o_fused = fuse_on() && matches!(q1t, ProjKind::Q4tp) && l.attn_out_norm.is_none();
         if decode_skip('o') {
         } else if o_fused {
             encode_q4tp_matvec_m_add(
@@ -15682,6 +15863,19 @@ impl TokenGraph {
             );
         }
         self.bar(enc);
+        // Gemma-4 sandwich: O·ao is RMS-normed in place before its add
+        // (`rmsnorm_k` reads each element before it writes it).
+        if let Some(w) = l.attn_out_norm {
+            disp(
+                enc,
+                &self.c.rmsn,
+                &[(&self.d_b, 0), (&const_buf(self.c, w), 0), (&self.d_b, 0)],
+                &[self.dims.hidden as u32, self.dims.gemma as u32],
+                &[self.dims.eps],
+                (256, 256),
+            );
+            self.bar(enc);
+        }
         // Fused: h += d_b, n = rmsnorm(h, post_norm) — one dispatch
         // instead of separate enc_axpy + rmsnorm.
         let delta = (!o_fused).then_some(&self.d_b);
@@ -15690,9 +15884,11 @@ impl TokenGraph {
                 gate,
                 up,
                 down,
-                gelu,
+                act,
             } => {
-                self.encode_post_ffn(enc, l.post_norm, *gate, *up, *down, *gelu, delta);
+                let tail = (l.ffn_out_norm.is_some() || l.layer_scale.is_some())
+                    .then_some((l.ffn_out_norm, l.layer_scale.unwrap_or(1.0)));
+                self.encode_post_ffn(enc, l.post_norm, *gate, *up, *down, *act, delta, tail);
             }
             MetalFfn::Moe(m) => {
                 self.encode_post_moe_ffn(enc, l.post_norm, m, delta);
@@ -15702,9 +15898,19 @@ impl TokenGraph {
 
     /// Dims contract of the device-attend kernels (host-side check).
     pub fn attn_device_ok(&self, l: &AttnGpuLayer, p: &AttnDeviceParams) -> bool {
+        // Heads wider than 256 (Gemma-4's 512-wide global layers) take the
+        // `gemma4` 16-slot kernels: plain heads only (no gate, no O(1)).
+        let wide_ok = p.hd <= 256
+            || (p.hd <= 512
+                && gemma4::w16_on()
+                && !p.output_gate
+                && p.head_gate.is_none()
+                && p.o1.is_none()
+                && gemma4::pipes(self.c).is_some());
         self.attn_ok(l)
             && p.hd % 4 == 0
-            && p.hd <= 256
+            && wide_ok
+            && (!p.v_norm || gemma4::pipes(self.c).is_some())
             && p.rd <= p.hd
             && p.rd >= 2
             && (p.rd / 2) % 32 == 0
@@ -15904,6 +16110,19 @@ impl TokenGraph {
             );
         }
         self.bar(enc);
+        // Gemma-4: the scale-less V norm before V is cached, and the 16-slot
+        // kernels for its 512-wide global heads (`attn_device_ok` checked
+        // the library compiled).
+        let g4 = if p.v_norm || p.hd > 256 {
+            gemma4::pipes(self.c)
+        } else {
+            None
+        };
+        let wide = p.hd > 256;
+        if p.v_norm {
+            gemma4::enc_vnorm(g4.unwrap(), enc, &v_b, p.nkv, p.hd, 1, p.eps);
+            self.bar(enc);
+        }
         // 3. per-head qk-norm + RoPE (gate split into g_b)
         let nhd = p.nh * p.hd;
         let qr_b = io_buf(self.c, 44_000_000_007 + nhd, nhd * 4);
@@ -15935,7 +16154,11 @@ impl TokenGraph {
                 | ((p.gemma as u32) << 3)
                 | ((p.late_qk_norm as u32) << 5);
             let invf = const_buf(self.c, p.inv_freq);
-            enc.set_compute_pipeline_state(&self.c.cropekv);
+            enc.set_compute_pipeline_state(if wide {
+                &g4.unwrap().cropekv16
+            } else {
+                &self.c.cropekv
+            });
             // No bias (flag 16 clear): slots 6..8 are never read.
             for (i, buf) in [
                 &q_b, &k_b, &v_b, &qr_b, k_mb, v_mb, &qr_b, &qr_b, &qr_b, &qn_b, &kn_b, &invf,
@@ -15970,7 +16193,7 @@ impl TokenGraph {
         } else {
             disp(
                 enc,
-                &self.c.rqkn,
+                if wide { &g4.unwrap().rqkn16 } else { &self.c.rqkn },
                 &[
                     (&q_b, 0),
                     (&k_b, 0),
@@ -16098,12 +16321,16 @@ impl TokenGraph {
                 _ if moe_bit(ATT_BLK) && std::env::var("CMF_GQA_BLK").is_err() => 64,
                 _ => gqa_blk_threshold(),
             };
+            // (`encode_gqa_attend_blk`'s hpk <= 8 for the main kernel; the
+            // wide twin runs Gemma-4's 16 heads per KV head.)
             let blk = skip_a
                 || thr > 0
                 && n_pos > thr
-                && encode_gqa_attend_blk(
+                && (wide || p.nh / p.nkv <= 8)
+                && encode_gqa_attend_blk_with(
                     self.c,
                     enc,
+                    if wide { &g4.unwrap().gqablk16 } else { &self.c.gqablk },
                     &qr_b,
                     &k_mb,
                     &v_mb,
@@ -16118,14 +16345,15 @@ impl TokenGraph {
                     p.scale,
                     self.in_conc.get(),
                 );
-            let cap_sgs = (self.c.gqat.max_total_threads_per_threadgroup() as usize / 32)
+            let att_pso = if wide { &g4.unwrap().gqat16 } else { &self.c.gqat };
+            let cap_sgs = (att_pso.max_total_threads_per_threadgroup() as usize / 32)
                 .clamp(1, gqa_split_max());
             let sgs = n_pos.div_ceil(32).clamp(1, cap_sgs);
             let tg_threads = 32 * sgs;
             if !blk {
                 disp_tg(
                     enc,
-                    &self.c.gqat,
+                    att_pso,
                     &[
                         (&qr_b, 0),
                         (&k_mb, kv_off),
@@ -16194,9 +16422,20 @@ impl TokenGraph {
         gate: (usize, usize, usize),
         up: (usize, usize, usize),
         down: (usize, usize, usize),
-        gelu: bool,
+        act: u8,
         delta: Option<&Buffer>,
+        // Gemma-4 layer tail: (ffn_out_norm, layer_scale) — h = (h +
+        // norm(d))·sc in one `gemma4` pass instead of the plain h += d.
+        tail: Option<(Option<&[f32]>, f32)>,
     ) {
+        let gelu = act == 1;
+        // tanh-GELU (and the layer tail) come from the Gemma-4 library;
+        // `attn_ok` refused the layer when it did not compile.
+        let g4 = if act == 2 || tail.is_some() {
+            gemma4::pipes(self.c)
+        } else {
+            None
+        };
         if std::env::var("CMF_FFN_TRACE").is_ok() {
             static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -16246,7 +16485,20 @@ impl TokenGraph {
             && matches!(au.1, ProjKind::Q4tp)
             && gate.1 == up.1
             && gate.2 == up.2;
-        if gu_fused {
+        if gu_fused && act == 2 {
+            note_weight_bytes(&ProjKind::Q4tp, 2 * gate.1, gate.2 / GROUP_SIZE);
+            gemma4::enc_mgu_gelut(
+                g4.expect("gemma4 kernels (attn_ok)"),
+                enc,
+                &self.fbuf,
+                ag.0,
+                au.0,
+                &self.n_b,
+                &fa_b,
+                gate.1,
+                gate.2 / GROUP_SIZE,
+            );
+        } else if gu_fused {
             encode_q4tp_matvec_m_gu(
                 self.c,
                 enc,
@@ -16318,12 +16570,12 @@ impl TokenGraph {
         }
         self.bar(enc);
         let ad = self.proj_abs(down).unwrap();
-        let down_fused = gu_fused && matches!(ad.1, ProjKind::Q4tp);
+        let down_fused = gu_fused && matches!(ad.1, ProjKind::Q4tp) && tail.is_none();
         // Part two of the fusion stack (same CMF_METAL_DUAL=1 gate):
         // down consumes gate and up directly with SiLU inline — the
         // silu dispatch and its dependent-stage drain disappear.
         let dsilu_ok = std::env::var("CMF_METAL_DUAL").as_deref() == Ok("1")
-            && !gelu
+            && act == 0
             && matches!(ad.1, ProjKind::Q4t)
             && inter % 4 == 0;
         if down_fused {
@@ -16371,7 +16623,9 @@ impl TokenGraph {
                 MTLSize::new(sgs * 32, 1, 1),
             );
         } else {
-            {
+            if act == 2 {
+                gemma4::enc_gelut(g4.expect("gemma4 kernels (attn_ok)"), enc, &fg_b, &fu_b, &fa_b, inter);
+            } else {
                 enc.set_compute_pipeline_state(if gelu { &self.c.gelu } else { &self.c.silu });
                 enc.set_buffer(0, Some(&fg_b), 0);
                 enc.set_buffer(1, Some(&fu_b), 0);
@@ -16398,6 +16652,22 @@ impl TokenGraph {
             }
         }
         self.bar(enc);
+        if let Some((w, sc)) = tail {
+            let wb = w.map(|w| const_buf(self.c, w));
+            gemma4::enc_norm_add_scale(
+                g4.expect("gemma4 kernels (attn_ok)"),
+                enc,
+                &self.h_b,
+                &self.d_b,
+                wb.as_ref(),
+                self.dims.hidden,
+                self.dims.gemma,
+                self.dims.eps,
+                sc,
+                1,
+            );
+            return;
+        }
         disp_axpy(self.c, enc, &self.d_b, &self.h_b, 1.0, self.dims.hidden);
     }
 
@@ -16947,7 +17217,7 @@ impl TokenGraph {
                         gate,
                         up,
                         down,
-                        gelu,
+                        act,
                     } => {
                         self.encode_post_ffn(
                             enc,
@@ -16955,8 +17225,9 @@ impl TokenGraph {
                             *gate,
                             *up,
                             *down,
-                            *gelu,
+                            *act,
                             Some(&d_b),
+                            None,
                         );
                     }
                     MetalFfn::Moe(m) => {
@@ -17020,6 +17291,9 @@ pub struct AttnDeviceParams<'a> {
     /// `self_attn.g_proj`): head h scales by sigmoid(G[h]·norm(h_in))
     /// after the attend, before O (Spark-X2.5).
     pub head_gate: Option<&'a [f32]>,
+    /// Gemma-4: every V head is RMS-normalized (no weight) before it is
+    /// cached (`gemma4::enc_vnorm`, the host's `vnorm_head`).
+    pub v_norm: bool,
 }
 
 /// After the token's final sync: copy the row the graph appended for
@@ -17626,7 +17900,7 @@ impl VerifyGraph {
     fn ffn_n8_ok(&self, f: &MetalFfn) -> bool {
         match f {
             // The batched twins compute SiLU only.
-            MetalFfn::Dense { gelu: true, .. } => false,
+            MetalFfn::Dense { act, .. } if *act != 0 => false,
             MetalFfn::Dense { gate, up, down, .. } => {
                 down.1 == self.tg.dims.hidden
                     && [gate, up, down]
@@ -17656,6 +17930,11 @@ impl VerifyGraph {
             // The batched twins attend full context, ungated.
             && p.window.is_none()
             && p.head_gate.is_none()
+            // ...and know nothing of Gemma-4.
+            && !p.v_norm
+            && l.attn_out_norm.is_none()
+            && l.ffn_out_norm.is_none()
+            && l.layer_scale.is_none()
             && [l.wq, l.wk, l.wv, l.wo]
                 .iter()
                 .all(|t| self.batch_abs(*t).is_some())
@@ -17817,7 +18096,7 @@ impl VerifyGraph {
             gate,
             up,
             down,
-            gelu: false,
+            act: 0,
         } = ffn
         else {
             // GELU never reaches here: `ffn_n8_ok` refused it.
@@ -18627,7 +18906,38 @@ fn encode_gqa_attend_blk(
     conc: bool,
 ) -> bool {
     let hpk = nh / nkv;
-    if hpk == 0 || hpk > 8 || hd > 1024 || nb == 0 {
+    if hpk > 8 {
+        return false;
+    }
+    encode_gqa_attend_blk_with(
+        c, enc, &c.gqablk, q, k_mb, v_mb, kv_off, ao, nh, nkv, hd, cap, stored, nb, scale, conc,
+    )
+}
+
+/// `encode_gqa_attend_blk` through a given blk kernel: the main one, or
+/// Gemma-4's 16-slot twin (head width 512, one KV head for 16 Q heads —
+/// a threadgroup of 16 simdgroups).
+#[allow(clippy::too_many_arguments)]
+fn encode_gqa_attend_blk_with(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    pso: &ComputePipelineState,
+    q: &Buffer,
+    k_mb: &Buffer,
+    v_mb: &Buffer,
+    kv_off: u64,
+    ao: &Buffer,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    cap: usize,
+    stored: usize,
+    nb: usize,
+    scale: f32,
+    conc: bool,
+) -> bool {
+    let hpk = nh / nkv;
+    if hpk == 0 || hpk > 32 || hd > 1024 || nb == 0 {
         return false;
     }
     let n_max = stored + nb;
@@ -18637,7 +18947,7 @@ fn encode_gqa_attend_blk(
         48_000_000_131 + nb * nh * nblk * (hd + 2),
         nb * nh * nblk * (hd + 2) * 4,
     );
-    enc.set_compute_pipeline_state(&c.gqablk);
+    enc.set_compute_pipeline_state(pso);
     enc.set_buffer(0, Some(q), 0);
     enc.set_buffer(1, Some(k_mb), kv_off);
     enc.set_buffer(2, Some(v_mb), kv_off);
