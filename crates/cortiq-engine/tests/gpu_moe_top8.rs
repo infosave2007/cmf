@@ -203,6 +203,7 @@ fn generic_q4tp_moe_top8_of_64_matches_scalar_reference() {
             q4tp: true,
             gu_q2: false,
             swiglu_limit: 0.0,
+            act: 0,
         });
     }
 
@@ -373,6 +374,7 @@ fn q8_moe_jobs_keep_their_own_inputs() {
             q4tp: false,
             gu_q2: false,
             swiglu_limit: 0.0,
+            act: 0,
         });
     }
     let mut got = vec![0.0; hidden];

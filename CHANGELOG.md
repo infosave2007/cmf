@@ -5,6 +5,84 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.16] - 2026-10-11
+
+### Added
+- humanizer (`jialinyyzz/humanizer`, a Gemma-4 12B rewriting fine-tune,
+  Apache-2.0) in CMF: text model only, the authors' completion prompt as the
+  file's chat template (`run --prompt` and `/v1/chat/completions` build
+  exactly `BOS + instruction + draft.strip() + "\n\n### Rewritten:\n\n"`,
+  system and earlier turns ignored), and their sampling as file defaults.
+- `cortiq convert --sampling temperature=…,top_p=…,top_k=…,min_p=…,repetition_penalty=…`
+  records a model's recommended sampling in the header
+  (`provenance.sampling`, shown by `cortiq info`); `run` and `serve` start
+  from it, flags and request fields still override it.
+- `cortiq serve`: `top_k` (0 or negative = off) and `min_p` request fields on
+  `/v1/chat/completions` and `/v1/completions`, llama.cpp's
+  `repeat_penalty` as an alias of `repetition_penalty`, `top_p`/`seed` on
+  `/v1/completions`.
+- `convert --sampling … ,max_tokens=N`: a file's default completion budget.
+  `cortiq serve` takes the request's `max_completion_tokens`, else its
+  `max_tokens`, else the file's, else 256 (a rewrite of a 950-token draft
+  runs ~930 tokens; the humanizer files carry 2048).
+
+### Performance
+- Gemma-4 dense models run on the wgpu whole-token graph: per-layer head
+  width (512-wide global layers over 256-wide sliding ones), the scale-less
+  V norm, sandwich norms and the layer scalar. humanizer q8_2f on an RTX PRO
+  4000: decode 7.2 → 31.7 tok/s (`bench --core`), logits against HF
+  transformers (bf16) on 5,320 prompt positions: top-1 97.7 %, KL 2.1e-3.
+  Gemma-2/3 keep the per-op path until measured the same way.
+- tanh-GELU (`gelu_pytorch_tanh`) in the device FFN kernels: Gemma dense
+  FFNs run on the card in decode and prefill instead of the host.
+- Top-p without top-k samples from the head of the distribution instead of
+  sorting the vocabulary every token (exact; ~40 ms a token at a 262k
+  vocab), and from the 256 largest logits when the nucleus closes inside
+  them (humanizer q8_2f sampled decode in `serve`: 21.8 → 24.7 tok/s;
+  `CMF_NUCLEUS_SPARSE=0` keeps the dense chain). Gemma's final-logit
+  soft-capping runs on the worker pool.
+- Gemma-4 prompts ride the batched wgpu graph (128-row chunks): token-axis
+  Q/K norm + RoPE with the V norm, ring KV append, a blocked causal attend
+  (eight tokens a workgroup, sliding and 512-wide global layers), the
+  sandwich norms and layer scalar, tanh-GELU, and a register-blocked q8_2f
+  prompt GEMM (exact f32). humanizer on an RTX PRO 4000, 1000-token prompt,
+  medians of three interleaved with the previous build: q8_2f 90.1 → 392.5
+  tok/s (TTFT 10.8 → 2.55 s), q4tp-ffn 138.2 → 429.9 tok/s (TTFT 6.9 →
+  2.3 s). Teacher-forced top-1 along the HF reference unchanged (EN 99.70 %,
+  ZH 99.34 % on the rewrites); greedy rewrites identical. `CMF_G4_BATCH=0`
+  keeps the chunked host prefill, `CMF_G4_MM=0` the eight-row q8_2f arm.
+- Gemma-4 decode past 256 positions: a GQA-shared split attend (eight query
+  heads a workgroup over 64-position chunks, 512-wide heads) instead of one
+  workgroup per head re-reading the window; the sandwich residual is one
+  dispatch (bit-identical). Decode at a 1000-token context: q8_2f 28.3 →
+  32.0 tok/s, q4tp-ffn 36.4 → 42.8. `serve`, a 957-token draft rewritten end
+  to end with the authors' sampling: q8_2f 48.7 → 36.4 s (TTFT 11.2 →
+  2.4 s), q4tp-ffn 36.9 → 28.9 s (TTFT 7.5 → 2.2 s). `CMF_G4_DEC=0`,
+  `CMF_G4_FUSE=0` roll back.
+- First use of a model on wgpu no longer copies every uploaded tensor into
+  a RAM tier that is off (`CMF_RAM_TIER_MB` unset): the copies were dropped
+  unread and cost ~9 s on a 12 GB file. Staged uploads copy on up to eight
+  threads with two chunks in flight (`CMF_GPU_UPLOAD_THREADS`). humanizer
+  q8_2f one-shot `run`: first token 17.9 → 4.1 s.
+- `cortiq serve` skips the per-token confidence softmax no endpoint reports
+  (`CMF_SERVE_CONFIDENCE=1` keeps it).
+
+- Metal runs Gemma-4 (the humanizer 12B) on the token graph and in the
+  chunk prefill: 512-wide global layers, scale-less V norm, sandwich norms,
+  the layer scalar and tanh-GELU (`gpu_metal/gemma4.rs`; `CMF_METAL_GEMMA4=0`
+  and `CMF_METAL_GEMMA4_CHUNK=0` turn them off). Mac mini M4: q8_2f decode
+  4.3 → 6.6 tok/s, q4tp-ffn 4.4 → 8.5; a 1000-token prompt 25–28 → 14–15 s
+  to the first token. Perplexity equals the CPU (q8_2f 5.665, q4tp-ffn
+  5.869); greedy text is identical to the strict CPU.
+
+### Fixed
+- `cortiq serve` no longer prints the first chat message (the user's text)
+  to stderr on every request.
+- `cortiq serve` `/v1/completions` prepends the tokenizer's BOS to a raw
+  prompt, as `run --raw` and the chat template do. A Gemma prompt reached
+  the model without `<bos>` (the humanizer's raw prompt: 437 ids instead of
+  438, and a rewrite that differed from the chat endpoint's).
+
 ## [0.8.15] - 2026-10-10
 
 ### Added

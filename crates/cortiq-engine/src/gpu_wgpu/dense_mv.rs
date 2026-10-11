@@ -254,6 +254,9 @@ fn sg_erf(x: f32) -> f32 {
 fn sg_gelu_erf(x: f32) -> f32 {
     return 0.5 * x * (1.0 + sg_erf(x * 0.70710678));
 }
+fn sg_gelu_tanh(x: f32) -> f32 {
+    return 0.5 * x * (1.0 + tanh(0.7978846 * (x + 0.044715 * x * x * x)));
+}
 fn run_a(blk: u32, warp: u32, lane: u32) {
     let rows = sg_p.rows_a;
     let gpr = sg_p.gpr;
@@ -585,6 +588,9 @@ fn sg_erf(x: f32) -> f32 {
 }
 fn sg_gelu_erf(x: f32) -> f32 {
     return 0.5 * x * (1.0 + sg_erf(x * 0.70710678));
+}
+fn sg_gelu_tanh(x: f32) -> f32 {
+    return 0.5 * x * (1.0 + tanh(0.7978846 * (x + 0.044715 * x * x * x)));
 }
 fn run_a(blk: u32, warp: u32, lane: u32) {
     let rows = sg_p.rows_a;
@@ -1048,6 +1054,9 @@ fn sg_erf(x: f32) -> f32 {
 fn sg_gelu_erf(x: f32) -> f32 {
     return 0.5 * x * (1.0 + sg_erf(x * 0.70710678));
 }
+fn sg_gelu_tanh(x: f32) -> f32 {
+    return 0.5 * x * (1.0 + tanh(0.7978846 * (x + 0.044715 * x * x * x)));
+}
 fn run_gu(blk: u32, warp: u32, lane: u32) {
     let rows = sg_p.rows_a;
     let gpr = sg_p.gpr;
@@ -1168,11 +1177,13 @@ fn run_gu(blk: u32, warp: u32, lane: u32) {
         if (l0) {
             if (lim > 0.0) { uu0 = clamp(uu0, -lim, lim); gg0 = min(gg0, lim); }
             if (sg_p.act == 1u) { sg_ya[r0] = sg_gelu_erf(gg0) * uu0; }
+            else if (sg_p.act == 2u) { sg_ya[r0] = sg_gelu_tanh(gg0) * uu0; }
             else { sg_ya[r0] = (gg0 / (1.0 + exp(-gg0))) * uu0; }
         }
         if (l1) {
             if (lim > 0.0) { uu1 = clamp(uu1, -lim, lim); gg1 = min(gg1, lim); }
             if (sg_p.act == 1u) { sg_ya[r1] = sg_gelu_erf(gg1) * uu1; }
+            else if (sg_p.act == 2u) { sg_ya[r1] = sg_gelu_tanh(gg1) * uu1; }
             else { sg_ya[r1] = (gg1 / (1.0 + exp(-gg1))) * uu1; }
         }
     }
@@ -1238,6 +1249,9 @@ fn sg_erf(x: f32) -> f32 {
 }
 fn sg_gelu_erf(x: f32) -> f32 {
     return 0.5 * x * (1.0 + sg_erf(x * 0.70710678));
+}
+fn sg_gelu_tanh(x: f32) -> f32 {
+    return 0.5 * x * (1.0 + tanh(0.7978846 * (x + 0.044715 * x * x * x)));
 }
 fn run_gu(blk: u32, warp: u32, lane: u32) {
     let rows = sg_p.rows_a;
@@ -1433,21 +1447,25 @@ fn run_gu(blk: u32, warp: u32, lane: u32) {
         if (l0) {
             if (lim > 0.0) { uu0 = clamp(uu0, -lim, lim); gg0 = min(gg0, lim); }
             if (sg_p.act == 1u) { sg_ya[r0] = sg_gelu_erf(gg0) * uu0; }
+            else if (sg_p.act == 2u) { sg_ya[r0] = sg_gelu_tanh(gg0) * uu0; }
             else { sg_ya[r0] = (gg0 / (1.0 + exp(-gg0))) * uu0; }
         }
         if (l1) {
             if (lim > 0.0) { uu1 = clamp(uu1, -lim, lim); gg1 = min(gg1, lim); }
             if (sg_p.act == 1u) { sg_ya[r1] = sg_gelu_erf(gg1) * uu1; }
+            else if (sg_p.act == 2u) { sg_ya[r1] = sg_gelu_tanh(gg1) * uu1; }
             else { sg_ya[r1] = (gg1 / (1.0 + exp(-gg1))) * uu1; }
         }
         if (l2) {
             if (lim > 0.0) { uu2 = clamp(uu2, -lim, lim); gg2 = min(gg2, lim); }
             if (sg_p.act == 1u) { sg_ya[r2] = sg_gelu_erf(gg2) * uu2; }
+            else if (sg_p.act == 2u) { sg_ya[r2] = sg_gelu_tanh(gg2) * uu2; }
             else { sg_ya[r2] = (gg2 / (1.0 + exp(-gg2))) * uu2; }
         }
         if (l3) {
             if (lim > 0.0) { uu3 = clamp(uu3, -lim, lim); gg3 = min(gg3, lim); }
             if (sg_p.act == 1u) { sg_ya[r3] = sg_gelu_erf(gg3) * uu3; }
+            else if (sg_p.act == 2u) { sg_ya[r3] = sg_gelu_tanh(gg3) * uu3; }
             else { sg_ya[r3] = (gg3 / (1.0 + exp(-gg3))) * uu3; }
         }
     }

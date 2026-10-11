@@ -1171,6 +1171,9 @@ impl Music3Ar {
                         head_gate: None,
                     },
                     post_norm: &blk.n2.w,
+                    attn_out_norm: None,
+                    ffn_out_norm: None,
+                    layer_scale: None,
                     ffn: crate::gpu::GraphFfn::Dense {
                         gate: g,
                         up: u,

@@ -681,15 +681,36 @@ async fn run_classification(
 struct SamplerOptions {
     temperature: Option<f32>,
     top_p: Option<f32>,
+    /// vLLM / llama.cpp extras: top-k (0 or negative = off) and the
+    /// min-p floor (0 = off).
+    top_k: Option<i64>,
+    min_p: Option<f32>,
     seed: Option<u64>,
     repetition_penalty: Option<f32>,
     presence_penalty: Option<f32>,
 }
 
+/// The sampler a request starts from: the engine defaults, overlaid with
+/// the file's own recommendation (`header.provenance.sampling`, written by
+/// `cortiq convert --sampling`).
+fn file_sampler(state: &AppState) -> SamplerConfig {
+    SamplerConfig::from_provenance(state.runtime.model().header.provenance.as_ref())
+}
+
+#[cfg(test)]
 fn request_sampler(opts: SamplerOptions) -> Result<SamplerConfig, Response> {
+    request_sampler_from(SamplerConfig::default(), opts)
+}
+
+fn request_sampler_from(
+    base: SamplerConfig,
+    opts: SamplerOptions,
+) -> Result<SamplerConfig, Response> {
     let SamplerOptions {
         temperature,
         top_p,
+        top_k,
+        min_p,
         seed,
         repetition_penalty,
         presence_penalty,
@@ -718,7 +739,19 @@ fn request_sampler(opts: SamplerOptions) -> Result<SamplerConfig, Response> {
             "presence_penalty must be finite",
         ));
     }
-    let mut config = SamplerConfig::default();
+    if min_p.is_some_and(|v| !v.is_finite() || !(0.0..=1.0).contains(&v)) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "min_p must be finite and between 0 and 1",
+        ));
+    }
+    let mut config = base;
+    if let Some(k) = top_k {
+        config.top_k = k.clamp(0, u32::MAX as i64) as u32;
+    }
+    if let Some(v) = min_p {
+        config.min_p = v;
+    }
     if let Some(v) = temperature {
         config.temperature = v;
         if v < 1e-6 {
@@ -747,15 +780,28 @@ struct ChatCompletionsRequest {
     temperature: Option<f32>,
     top_p: Option<f32>,
     seed: Option<u64>,
+    /// vLLM / llama.cpp extras: top-k (0 or negative = off) and the min-p
+    /// floor (0 = off). Absent = the file's sampling defaults, else the
+    /// engine's (top-k 40, min-p 0.05).
+    #[serde(default)]
+    top_k: Option<i64>,
+    #[serde(default)]
+    min_p: Option<f32>,
     /// vLLM-style extras: multiplicative repetition penalty (the engine
     /// default is 1.1; `temperature: 0` alone makes it 1.0) and a flat
-    /// presence penalty on every seen token.
-    #[serde(default)]
+    /// presence penalty on every seen token. llama.cpp's spelling
+    /// `repeat_penalty` is accepted too.
+    #[serde(default, alias = "repeat_penalty")]
     repetition_penalty: Option<f32>,
     #[serde(default)]
     presence_penalty: Option<f32>,
-    #[serde(default = "default_max_tokens")]
-    max_tokens: u32,
+    /// Absent (and no `max_completion_tokens`): the file's own default
+    /// (`convert --sampling max_tokens=N`), else [`default_max_tokens`].
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    /// OpenAI's newer spelling; wins over `max_tokens` when both are sent.
+    #[serde(default)]
+    max_completion_tokens: Option<u32>,
     #[serde(default)]
     stream: bool,
     /// Reasoning-model switch: `false` renders the chat template with
@@ -1019,13 +1065,18 @@ async fn chat_completions(
         } else {
             state.runtime.active_selection().await
         };
-    let mut sampler_config = match request_sampler(SamplerOptions {
-        temperature: req.temperature,
-        top_p: req.top_p,
-        seed: req.seed,
-        repetition_penalty: req.repetition_penalty,
-        presence_penalty: req.presence_penalty,
-    }) {
+    let mut sampler_config = match request_sampler_from(
+        file_sampler(&state),
+        SamplerOptions {
+            temperature: req.temperature,
+            top_p: req.top_p,
+            top_k: req.top_k,
+            min_p: req.min_p,
+            seed: req.seed,
+            repetition_penalty: req.repetition_penalty,
+            presence_penalty: req.presence_penalty,
+        },
+    ) {
         Ok(config) => config,
         Err(response) => return response,
     };
@@ -1222,7 +1273,6 @@ async fn chat_completions(
                     );
                 }
             }
-            eprintln!("[serve] msgs[0]={:?}", msgs.first());
             match req.effective_tools() {
                 // With tools a failed render is an ERROR: the ChatML
                 // fallback has no place for them, and the model would
@@ -1260,7 +1310,8 @@ async fn chat_completions(
     });
     let dsv41 = vl_inputs.is_some();
 
-    let max_tokens = req.max_tokens as usize;
+    let max_tokens =
+        effective_max_tokens(&state, req.max_completion_tokens.or(req.max_tokens)) as usize;
     let dsv41_thinking = dsv41
         && req.thinking() != Some(false)
         && (req.thinking() == Some(true) || req.reasoning_effort.is_some());
@@ -1807,11 +1858,22 @@ struct CompletionsRequest {
     prompt: String,
     temperature: Option<f32>,
     #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    top_k: Option<i64>,
+    #[serde(default)]
+    min_p: Option<f32>,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default, alias = "repeat_penalty")]
     repetition_penalty: Option<f32>,
     #[serde(default)]
     presence_penalty: Option<f32>,
-    #[serde(default = "default_max_tokens")]
-    max_tokens: u32,
+    /// Absent: the file's own default, else [`default_max_tokens`].
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    max_completion_tokens: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -1837,12 +1899,18 @@ async fn completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CompletionsRequest>,
 ) -> Response {
-    let sampler_config = match request_sampler(SamplerOptions {
-        temperature: req.temperature,
-        repetition_penalty: req.repetition_penalty,
-        presence_penalty: req.presence_penalty,
-        ..Default::default()
-    }) {
+    let sampler_config = match request_sampler_from(
+        file_sampler(&state),
+        SamplerOptions {
+            temperature: req.temperature,
+            top_p: req.top_p,
+            top_k: req.top_k,
+            min_p: req.min_p,
+            seed: req.seed,
+            repetition_penalty: req.repetition_penalty,
+            presence_penalty: req.presence_penalty,
+        },
+    ) {
         Ok(config) => config,
         Err(response) => return response,
     };
@@ -1874,7 +1942,10 @@ async fn completions(
         Ok(Some((d, outcome))) => {
             match &outcome {
                 LookupOutcome::Answer(a) => {
-                    let prompt_tokens = state.tokenizer.encode(&req.prompt).len() as u32;
+                    let prompt_tokens = state
+                        .tokenizer
+                        .with_bos(state.tokenizer.encode(&req.prompt))
+                        .len() as u32;
                     return Json(CompletionsResponse {
                         id: format!("cmf-{}", uuid::Uuid::new_v4()),
                         object: "text_completion".to_string(),
@@ -1907,14 +1978,18 @@ async fn completions(
             lookup_outcome = Some(outcome);
         }
     }
-    let prompt_ids = state.tokenizer.encode(&prompt);
+    // A raw completion starts a fresh context: the tokenizer's BOS contract
+    // holds here as in `run --raw` and the chat template. Without it a
+    // Gemma prompt is one token short of what the model was trained on
+    // (the humanizer's raw-prompt rewrite drifted from the chat one).
+    let prompt_ids = state.tokenizer.with_bos(state.tokenizer.encode(&prompt));
 
     let (result, elapsed_ms, decision) = match run_generation(
         state.clone(),
         prompt_ids,
         None,
         None,
-        req.max_tokens as usize,
+        effective_max_tokens(&state, req.max_completion_tokens.or(req.max_tokens)) as usize,
         request_mask,
         sampler_config,
         None,
@@ -1958,6 +2033,18 @@ async fn completions(
 
 fn default_max_tokens() -> u32 {
     256
+}
+
+/// The completion budget of a request: the client's own number when it
+/// sent one, else the file's recommendation (`header.provenance.sampling.
+/// max_tokens`, written by `convert --sampling max_tokens=N` — a rewriter
+/// whose answers run past 256 tokens carries 2048), else 256.
+fn effective_max_tokens(state: &AppState, requested: Option<u32>) -> u32 {
+    requested
+        .or_else(|| {
+            cortiq_engine::sampler::file_max_tokens(state.runtime.model().header.provenance.as_ref())
+        })
+        .unwrap_or_else(default_max_tokens)
 }
 
 #[cfg(test)]
@@ -2006,6 +2093,41 @@ mod tests {
             ..Default::default()
         })
         .is_err());
+        assert!(request_sampler(SamplerOptions {
+            min_p: Some(1.5),
+            ..Default::default()
+        })
+        .is_err());
+    }
+
+    /// A file's sampling recommendation is the base; request fields win,
+    /// and `top_k: -1` (vLLM's "off") means off.
+    #[test]
+    fn file_sampling_is_the_base_and_requests_override_it() {
+        let base = SamplerConfig::from_provenance(Some(&serde_json::json!({"sampling": {
+            "temperature": 1.0, "top_p": 0.95, "top_k": 0, "min_p": 0.0, "repetition_penalty": 1.0
+        }})));
+        let plain = request_sampler_from(base.clone(), SamplerOptions::default()).unwrap();
+        assert_eq!(
+            (plain.temperature, plain.top_p, plain.top_k, plain.min_p, plain.repetition_penalty),
+            (1.0, 0.95, 0, 0.0, 1.0)
+        );
+        let req: ChatCompletionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "x"}],
+            "top_k": -1, "min_p": 0.1, "repeat_penalty": 1.05
+        }))
+        .unwrap();
+        let over = request_sampler_from(
+            base,
+            SamplerOptions {
+                top_k: req.top_k,
+                min_p: req.min_p,
+                repetition_penalty: req.repetition_penalty,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((over.top_k, over.min_p, over.repetition_penalty), (0, 0.1, 1.05));
     }
 
     /// `temperature: 0` is greedy in the CLI's `--greedy` sense: no
