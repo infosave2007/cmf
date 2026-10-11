@@ -937,10 +937,10 @@ pub(crate) fn parse_sampling(spec: &str) -> anyhow::Result<serde_json::Value> {
             cortiq_engine::sampler::FILE_SAMPLING_KEYS.join(", ")
         );
         let v = v.trim();
-        let val = if k == "top_k" {
+        let val = if k == "top_k" || k == "max_tokens" {
             serde_json::json!(v
                 .parse::<u32>()
-                .map_err(|e| anyhow::anyhow!("--sampling top_k '{v}': {e}"))?)
+                .map_err(|e| anyhow::anyhow!("--sampling {k} '{v}': {e}"))?)
         } else {
             let x = v
                 .parse::<f64>()
@@ -7602,6 +7602,13 @@ pub(crate) mod tests {
         );
         let c = cortiq_engine::SamplerConfig::from_provenance(Some(&serde_json::json!({"sampling": v})));
         assert_eq!((c.top_k, c.min_p, c.repetition_penalty), (0, 0.0, 1.0));
+        let mt = parse_sampling("temperature=1.0,max_tokens=2048").unwrap();
+        assert_eq!(mt["max_tokens"], serde_json::json!(2048));
+        assert_eq!(
+            cortiq_engine::sampler::file_max_tokens(Some(&serde_json::json!({"sampling": mt}))),
+            Some(2048)
+        );
+        assert!(parse_sampling("max_tokens=-5").is_err());
         assert!(parse_sampling("top_k=-1").is_err());
         assert!(parse_sampling("temp=1").is_err());
         assert!(parse_sampling("").is_err());

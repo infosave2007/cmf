@@ -95,8 +95,21 @@ fn main() {
         // (what run/serve take), ONE row = the logits after its last
         // position; greedy rows follow through the decode path.
         let batched = v.get("prefill").and_then(|b| b.as_bool()).unwrap_or(false);
+        // `"prefill_rows": true`: every prompt row's logits out of Gemma-4's
+        // batched prefill (the batch graph's hidden rows, final norm + head
+        // per row) — the prefill path's own teacher-forced comparison.
+        let prefill_rows = v.get("prefill_rows").and_then(|b| b.as_bool()).unwrap_or(false);
         let vocab;
-        if batched {
+        if prefill_rows {
+            let hs = p.hidden_size;
+            let hrows = p
+                .g4_prefill_hidden_rows(&ids)
+                .expect("prefill_rows: this model/card does not take the Gemma-4 batched prefill");
+            for r in 0..ids.len() {
+                rows.push(p.logits_from_hidden(&hrows[r * hs..(r + 1) * hs]));
+            }
+            vocab = rows[0].len();
+        } else if batched {
             let last = p.forward_ids(&ids, None).expect("forward_ids");
             vocab = last.len();
             rows.push(last);
@@ -146,6 +159,7 @@ fn main() {
             "vocab": vocab,
             "n_prompt": ids.len(),
             "batched_prefill": batched,
+            "prefill_rows": prefill_rows,
             "greedy_ids": greedy_ids,
             "greedy_text": p.tokenizer.decode(&greedy_ids),
             "top1": top1,

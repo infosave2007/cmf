@@ -795,8 +795,13 @@ struct ChatCompletionsRequest {
     repetition_penalty: Option<f32>,
     #[serde(default)]
     presence_penalty: Option<f32>,
-    #[serde(default = "default_max_tokens")]
-    max_tokens: u32,
+    /// Absent (and no `max_completion_tokens`): the file's own default
+    /// (`convert --sampling max_tokens=N`), else [`default_max_tokens`].
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    /// OpenAI's newer spelling; wins over `max_tokens` when both are sent.
+    #[serde(default)]
+    max_completion_tokens: Option<u32>,
     #[serde(default)]
     stream: bool,
     /// Reasoning-model switch: `false` renders the chat template with
@@ -1268,7 +1273,6 @@ async fn chat_completions(
                     );
                 }
             }
-            eprintln!("[serve] msgs[0]={:?}", msgs.first());
             match req.effective_tools() {
                 // With tools a failed render is an ERROR: the ChatML
                 // fallback has no place for them, and the model would
@@ -1306,7 +1310,8 @@ async fn chat_completions(
     });
     let dsv41 = vl_inputs.is_some();
 
-    let max_tokens = req.max_tokens as usize;
+    let max_tokens =
+        effective_max_tokens(&state, req.max_completion_tokens.or(req.max_tokens)) as usize;
     let dsv41_thinking = dsv41
         && req.thinking() != Some(false)
         && (req.thinking() == Some(true) || req.reasoning_effort.is_some());
@@ -1864,8 +1869,11 @@ struct CompletionsRequest {
     repetition_penalty: Option<f32>,
     #[serde(default)]
     presence_penalty: Option<f32>,
-    #[serde(default = "default_max_tokens")]
-    max_tokens: u32,
+    /// Absent: the file's own default, else [`default_max_tokens`].
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    #[serde(default)]
+    max_completion_tokens: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -1981,7 +1989,7 @@ async fn completions(
         prompt_ids,
         None,
         None,
-        req.max_tokens as usize,
+        effective_max_tokens(&state, req.max_completion_tokens.or(req.max_tokens)) as usize,
         request_mask,
         sampler_config,
         None,
@@ -2025,6 +2033,18 @@ async fn completions(
 
 fn default_max_tokens() -> u32 {
     256
+}
+
+/// The completion budget of a request: the client's own number when it
+/// sent one, else the file's recommendation (`header.provenance.sampling.
+/// max_tokens`, written by `convert --sampling max_tokens=N` — a rewriter
+/// whose answers run past 256 tokens carries 2048), else 256.
+fn effective_max_tokens(state: &AppState, requested: Option<u32>) -> u32 {
+    requested
+        .or_else(|| {
+            cortiq_engine::sampler::file_max_tokens(state.runtime.model().header.provenance.as_ref())
+        })
+        .unwrap_or_else(default_max_tokens)
 }
 
 #[cfg(test)]
