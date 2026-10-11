@@ -1639,7 +1639,11 @@ pub enum GraphAttn<'a> {
 pub struct GraphAttnGeom<'a> {
     /// KV heads of this layer (divides the Q heads).
     pub nkv: usize,
-    /// V head width, `4 <= dv <= head_dim`, a multiple of 4.
+    /// Q/K head width of this layer. The call-wide `hd` for every model
+    /// but Gemma-4, whose global layers are 512 wide over 256-wide sliding
+    /// ones (`<= 512`, a multiple of 4).
+    pub hd: usize,
+    /// V head width, `4 <= dv <= hd`, a multiple of 4.
     pub dv: usize,
     /// Rotary width of this layer (NeoX half-split over `[0, rd)`).
     pub rd: usize,
@@ -1656,6 +1660,9 @@ pub struct GraphAttnGeom<'a> {
     /// Learned per-Q-head sink logits (gpt-oss / MiMo-V2): they join the
     /// softmax max and denominator and carry no value row.
     pub sink: Option<&'a [f32]>,
+    /// Gemma-4's scale-less V norm: every V head is RMS-normalized (no
+    /// weight) before it is cached, as `attention::vnorm_head` does.
+    pub v_norm: bool,
 }
 
 /// Activation of a graph layer's dense FFN, `act(gate)·up`. The code is
@@ -1688,6 +1695,13 @@ pub struct GraphLayer<'a> {
     pub attn: GraphAttn<'a>,
     pub post_norm: &'a [f32],
     pub ffn: GraphFfn<'a>,
+    /// Gemma sandwich norms: the token mixer's output and the FFN's output
+    /// are RMS-normed with these weights before their residual adds.
+    pub attn_out_norm: Option<&'a [f32]>,
+    pub ffn_out_norm: Option<&'a [f32]>,
+    /// Gemma-4 `layer_scalar`: the residual stream is multiplied by it at
+    /// the end of the layer.
+    pub layer_scale: Option<f32>,
 }
 
 /// The FFN of one graph layer: a dense SwiGLU trio, or a routed MoE —

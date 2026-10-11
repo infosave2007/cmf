@@ -6335,6 +6335,9 @@ impl Pipeline {
                 head_gate: None,
             },
             post_norm: &lw.post_norm,
+            attn_out_norm: None,
+            ffn_out_norm: None,
+            layer_scale: None,
             ffn: crate::gpu::GraphFfn::Dense {
                 gate: gw(&d.gate_proj)?,
                 up: gw(&d.up_proj)?,
@@ -6497,6 +6500,9 @@ impl Pipeline {
                 head_gate: None,
             },
             post_norm: &lw.post_norm,
+            attn_out_norm: None,
+            ffn_out_norm: None,
+            layer_scale: None,
             ffn: crate::gpu::GraphFfn::Dense {
                 gate: gg,
                 up: gu,
@@ -10376,23 +10382,28 @@ impl Pipeline {
             return Some("scaled RoPE with post-RoPE Q/K norm");
         }
         geometry_reason?;
-        if self.global_attn.is_some() {
-            return Some("per-layer head width (Gemma-4 global layers) with per-layer geometry");
-        }
+        // Gemma-4: global layers 512 wide over 256-wide sliding ones
+        // (`GraphAttnGeom::hd`), the scale-less V norm (`v_norm`), and the
+        // sandwich norms + layer scalar (`GraphLayer`) ride the TOKEN graph.
+        // The batch graph has none of the three and refuses them itself
+        // (`batch_graph_gemma_decline`).
         if self.attention_heads_per_layer.is_some() {
             return Some("per-layer Q head counts with per-layer geometry");
         }
-        if self.attn_v_norm {
-            return Some("V norm with per-layer geometry");
+        // Sandwich norms are measured on Gemma-4 only (the humanizer port,
+        // against HF transformers); Gemma-2/3 keep the per-op path until
+        // they are measured the same way.
+        let gemma4 = self.global_attn.is_some() || self.attn_v_norm;
+        if !gemma4
+            && self.weights.layers.iter().any(|lw| {
+                lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some()
+            })
+        {
+            return Some("sandwich norms / layer scale with per-layer geometry");
         }
         // `GraphAttnGeom::rope_scale` carries YaRN's post-rotation
         // attention-amplitude factor to the WGPU RoPE kernel. It is not an
         // angular position scale, so it must not be folded into `invf`.
-        if self.weights.layers.iter().any(|lw| {
-            lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some()
-        }) {
-            return Some("sandwich norms / layer scale with per-layer geometry");
-        }
         if self.weights.layers.iter().any(|lw| {
             matches!(
                 &lw.attn,
@@ -10415,13 +10426,31 @@ impl Pipeline {
         None
     }
 
+    /// What the wgpu BATCH graph (and the attention-only singleton graphs)
+    /// cannot run of Gemma-4, which the token graph does run: per-layer
+    /// head widths, the V norm, sandwich norms and the layer scalar.
+    fn batch_graph_gemma_decline(&self) -> Option<&'static str> {
+        if self.global_attn.is_some() {
+            return Some("per-layer head width (Gemma-4 global layers)");
+        }
+        if self.attn_v_norm {
+            return Some("V norm");
+        }
+        if self.weights.layers.iter().any(|lw| {
+            lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some()
+        }) {
+            return Some("sandwich norms / layer scale");
+        }
+        None
+    }
+
     /// The wgpu graphs' attention geometry for layer `li` (virtual index):
     /// Some only for a model whose layers do not share one (MiMo-V2) — KV
     /// heads, V width, rotary width and RoPE table, window and sinks of
     /// THIS layer, exactly what the CPU attention reads for it.
     fn graph_attn_geom(&self, li: usize) -> Option<crate::gpu::GraphAttnGeom<'_>> {
         self.graph_attn_decline_reason()?;
-        let (nkv, _hd, rd) = self.layer_geom(li);
+        let (nkv, hd, rd) = self.layer_geom(li);
         let invf: &[f32] = if self.layer_is_local(li) {
             match &self.inv_freq_local {
                 Some(f) => f.as_slice(),
@@ -10435,12 +10464,14 @@ impl Pipeline {
         };
         Some(crate::gpu::GraphAttnGeom {
             nkv,
+            hd,
             dv: self.layer_v_dim(li),
             rd,
             invf,
             rope_scale: self.layer_rope_scale(li),
             window: self.layer_window(li),
             sink: self.kv_cache.layers[li].sinks.as_deref(),
+            v_norm: self.attn_v_norm,
         })
     }
 
@@ -10723,6 +10754,9 @@ impl Pipeline {
             let layer = crate::gpu::GraphLayer {
                 input_norm: &lw.input_norm,
                 post_norm: &lw.post_norm,
+                attn_out_norm: None,
+                ffn_out_norm: None,
+                layer_scale: None,
                 ffn: crate::gpu::GraphFfn::AttentionOnly,
                 attn: crate::gpu::GraphAttn::Full {
                     wq: q,
@@ -11580,6 +11614,9 @@ impl Pipeline {
                 input_norm: &lw.input_norm,
                 attn,
                 post_norm: &lw.post_norm,
+                attn_out_norm: lw.attn_out_norm.as_deref(),
+                ffn_out_norm: lw.ffn_out_norm.as_deref(),
+                layer_scale: lw.layer_scale,
                 ffn: gffn,
             });
         }
@@ -13186,7 +13223,10 @@ impl Pipeline {
         }
         // Same attention contract as the token graph: per-layer geometry
         // rides `geom`, anything it cannot express declines by name.
-        if let Some(reason) = self.wgpu_graph_attn_decline() {
+        if let Some(reason) = self
+            .wgpu_graph_attn_decline()
+            .or_else(|| self.batch_graph_gemma_decline())
+        {
             self.note_graph_decline("wgpu batch graph", reason);
             return crate::gpu::BatchGraphOutcome::Declined;
         }
@@ -13491,6 +13531,9 @@ impl Pipeline {
                     input_norm: &lw.input_norm,
                     attn,
                     post_norm: &lw.post_norm,
+                    attn_out_norm: None,
+                    ffn_out_norm: None,
+                    layer_scale: None,
                     ffn: gffn,
                 });
             }
