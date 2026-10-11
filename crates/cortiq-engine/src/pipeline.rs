@@ -2051,18 +2051,25 @@ impl Pipeline {
         // device attend and the sandwich's CPU attend read each layer's
         // window and table. Sandwich norms and other activations fall back
         // to the CPU path.
-        let swa_graph = self.metal_graph_swa();
+        // Gemma-4 (`metal_gemma4`): its sliding layers ride the same door,
+        // its global layers, V norm, sandwich norms, layer scalar and
+        // tanh-GELU the `gpu_metal::gemma4` kernels.
+        let gemma4 = self.metal_gemma4();
+        let swa_graph = self.metal_graph_swa() || gemma4;
         if (self.swa.is_some() && !swa_graph)
-            || self.global_attn.is_some()
+            || (self.global_attn.is_some() && !gemma4)
             || self.attention_heads_per_layer.is_some()
-            || self.attn_v_norm
+            || (self.attn_v_norm && !gemma4)
             // per-layer KV heads, narrow V, learned sinks (MiMo-V2)
             || (self.graph_attn_decline_reason().is_some() && !swa_graph)
             || self.weights.layers.iter().any(|lw| {
-                lw.attn_out_norm.is_some()
+                ((lw.attn_out_norm.is_some()
                     || lw.ffn_out_norm.is_some()
-                    || lw.layer_scale.is_some()
-                    || matches!(&lw.ffn, FfnKind::Dense(d) if !matches!(d.act, Act::Silu | Act::Gelu))
+                    || lw.layer_scale.is_some())
+                    && !gemma4)
+                    || matches!(&lw.ffn, FfnKind::Dense(d)
+                        if !(matches!(d.act, Act::Silu | Act::Gelu)
+                            || (gemma4 && d.act == Act::GeluTanh)))
             })
         {
             // The Metal graphs' device attend has no per-layer attention
@@ -2159,8 +2166,9 @@ impl Pipeline {
                         gate: g,
                         up: u,
                         down: dn,
-                        // The front gate admitted SiLU or exact GELU only.
-                        gelu: d.act == Act::Gelu,
+                        // The front gate admitted SiLU, exact GELU and
+                        // (Gemma-4) tanh-GELU only.
+                        act: d.act.graph_act().map_or(0, |a| a.code() as u8),
                     }
                 }
                 FfnKind::Moe(m) => {
@@ -2281,15 +2289,24 @@ impl Pipeline {
                         .and_then(|(g, _)| g.f32_parts())
                         .filter(|&(_, r, c)| r == self.num_heads && c == self.hidden_size)
                         .map(|(d, _, _)| d);
+                    // Gemma-4's global layers are 512 wide over one KV head
+                    // (the `gemma4` 16-slot kernels, `CMF_METAL_GEMMA4_W16`).
+                    let (nkv_g, hd_g) = if gemma4 {
+                        let (a, b, _) = self.layer_geom(scan);
+                        (a, b)
+                    } else {
+                        (self.num_kv_heads, self.head_dim)
+                    };
                     let full_gpu = attend_contract
                         && softplus_gate.is_none() == head_gate_w.is_none()
                         && cache.mode == crate::kv_cache::KvMode::F32
                         && (cache.o1.is_none() || o1_metal)
                         && bias.is_none()
-                        && pq.1 == self.num_heads * self.head_dim * (1 + *output_gate as usize)
-                        && pk.1 == self.num_kv_heads * self.head_dim
-                        && pv.1 == self.num_kv_heads * self.head_dim
-                        && po.2 == self.num_heads * self.head_dim;
+                        && (hd_g <= 256 || crate::gpu_metal::gemma4::w16_on())
+                        && pq.1 == self.num_heads * hd_g * (1 + *output_gate as usize)
+                        && pk.1 == nkv_g * hd_g
+                        && pv.1 == nkv_g * hd_g
+                        && po.2 == self.num_heads * hd_g;
                     plan.push(Item::Attn {
                         l: AttnGpuLayer {
                             attn_norm: &lw.input_norm,
@@ -2299,6 +2316,9 @@ impl Pipeline {
                             wv: pv,
                             wo: po,
                             ffn,
+                            attn_out_norm: lw.attn_out_norm.as_deref(),
+                            ffn_out_norm: lw.ffn_out_norm.as_deref(),
+                            layer_scale: lw.layer_scale,
                         },
                         li: scan,
                         q_norm: q_norm.as_deref(),
@@ -2579,7 +2599,7 @@ impl Pipeline {
         let mut pending: Vec<(usize, usize)> = Vec::new();
         // Device-attended layers: their K/V/imp are pulled from the
         // mirror after the final sync.
-        let mut dev_attn: Vec<usize> = Vec::new();
+        let mut dev_attn: Vec<(usize, usize, usize)> = Vec::new();
         for item in &plan {
             let _xt0 = std::time::Instant::now();
             let _xkind: u32 = match item {
@@ -2641,6 +2661,14 @@ impl Pipeline {
                     let rd_l = self.layer_geom(*li).2;
                     let window_l = self.layer_window(*li);
                     let head_gate_w = *head_gate_w;
+                    // This layer's KV heads and head width: Gemma-4's global
+                    // layers (one 512-wide KV head) differ from the base.
+                    let (nkv, hd) = if gemma4 {
+                        let (a, b, _) = self.layer_geom(*li);
+                        (a, b)
+                    } else {
+                        (nkv, hd)
+                    };
                     // ── Fully device-resident attention: no sync at all.
                     if *full_gpu {
                         let cache = &self.kv_cache.layers[*li];
@@ -2692,13 +2720,14 @@ impl Pipeline {
                             o1: o1p,
                             window: window_l,
                             head_gate: head_gate_w,
+                            v_norm: self.attn_v_norm,
                         };
                         let o1_bad = o1_layer && p.o1.is_none();
                         if !o1_bad && graph.attn_device_ok(l, &p) && graph.encode_attn_device(l, &p)
                         {
                             // o1 layers leave no mirror row to pull.
                             if p.o1.is_none() {
-                                dev_attn.push(*li);
+                                dev_attn.push((*li, nkv, hd));
                             }
                             graph.commit_kind = 3;
                             graph.commit();
@@ -2753,7 +2782,9 @@ impl Pipeline {
                         scale: self.attn_scale,
                         softcap: self.attn_softcap,
                         window: window_l,
-                        v_norm: false,
+                        // Gemma-4 only (the front gate refuses V norm
+                        // otherwise).
+                        v_norm: self.attn_v_norm,
                         qk_norm_after_rope: self.qk_norm_after_rope,
                         gate_sigmoid: self.proj_gate_sigmoid,
                         q_norm: *q_norm,
@@ -2856,6 +2887,7 @@ impl Pipeline {
                             o1: None,
                             window: window_l,
                             head_gate: None,
+                            v_norm: self.attn_v_norm,
                         };
                         if let Some((dq, dk, dv, dao)) = graph.debug_attn_device(l, &p, &h_now) {
                             let md = |a: &[f32], b: &[f32]| {
@@ -2987,7 +3019,7 @@ impl Pipeline {
         // Device-attended layers: replay the CPU bookkeeping — append
         // the mirror's new K/V row (rope'd on the GPU) into the owner
         // cache, then bank this token's attention-importance mass.
-        for li in dev_attn {
+        for (li, nkv, hd) in dev_attn {
             let mut krow = attention::take_buf(nkv * hd);
             let mut vrow = attention::take_buf(nkv * hd);
             if crate::gpu::kv_mirror_read_last(kv_id, li, nkv, hd, &mut krow, &mut vrow) {
@@ -9793,6 +9825,11 @@ impl Pipeline {
         // (The old streaming attend needed a depth bound at ~1k; the
         // GEMM attention scales like the CPU path and lifted it.)
         // CMF_GPU_CHUNK=0 disables the graph.
+        // Gemma-4 (`metal_gemma4`) brings its own kernels for the global
+        // layers, V norm, attention scale and sandwich (`ChunkGemma4`).
+        // `CMF_METAL_GEMMA4_CHUNK=0` keeps its prompt on the host walk.
+        let gemma4 = self.metal_gemma4()
+            && std::env::var("CMF_METAL_GEMMA4_CHUNK").as_deref() != Ok("0");
         if !crate::gpu::enabled_here()
             || std::env::var("CMF_GPU_CHUNK")
                 .map(|v| v == "0")
@@ -9800,16 +9837,16 @@ impl Pipeline {
             || b < 32
             // Sliding windows with per-layer RoPE ride the chunk graph
             // (`metal_graph_swa`: causal_softmax_win, per-layer tables).
-            || (self.swa.is_some() && !self.metal_graph_swa())
-            || self.global_attn.is_some()
+            || (self.swa.is_some() && !self.metal_graph_swa() && !gemma4)
+            || (self.global_attn.is_some() && !gemma4)
             // per-layer KV heads, narrow V, learned sinks (MiMo-V2)
-            || (self.graph_attn_decline_reason().is_some() && !self.metal_graph_swa())
+            || (self.graph_attn_decline_reason().is_some() && !self.metal_graph_swa() && !gemma4)
             // Collection owns the exact Q trace and boundary conversion;
             // this chunk graph appends dense KV without feeding that trace.
             || self.o1_active()
-            || self.attn_v_norm
+            || (self.attn_v_norm && !gemma4)
             || !self.metal_rope_scale_ok()
-            || (self.attn_scale - 1.0 / (self.head_dim as f32).sqrt()).abs() > 1e-9
+            || ((self.attn_scale - 1.0 / (self.head_dim as f32).sqrt()).abs() > 1e-9 && !gemma4)
         {
             return li0;
         }
@@ -9841,7 +9878,9 @@ impl Pipeline {
         let mut stored_at: Vec<usize> = Vec::new();
         for li in li0..run_end {
             let lw = &self.weights.layers[self.phys_layer(li)];
-            if lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some() {
+            if (lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some())
+                && !gemma4
+            {
                 break;
             }
             let AttnKind::Full {
@@ -9872,7 +9911,9 @@ impl Pipeline {
             // trio stands in for the shape checks.
             let (gate_t, up_t, down_t, ffn_act, moe) = match &lw.ffn {
                 FfnKind::Dense(d)
-                    if matches!(d.act, Act::Silu | Act::Gelu) && d.segs.is_empty() =>
+                    if (matches!(d.act, Act::Silu | Act::Gelu)
+                        || (gemma4 && d.act == Act::GeluTanh))
+                        && d.segs.is_empty() =>
                 {
                     (&d.gate_proj, &d.up_proj, &d.down_proj, d.act, None)
                 }
@@ -9930,7 +9971,10 @@ impl Pipeline {
             // gate/up/down behind q4/q8_row attention: the chunk FFN has no
             // x·col staging, so it would run those weights without their
             // input field (0.8.14 refused every q8_2f weight here).
+            // Gemma-4 reads every q8_2f weight through the blob GEMM with its
+            // own field (`ChunkGemma4`), so its dense q8_2f stack rides.
             if moe.is_none()
+                && !gemma4
                 && (col.iter().any(|c| !c.is_empty())
                     || [gate_t, up_t, down_t].iter().any(|t| !cf(t).is_empty()))
             {
@@ -9961,6 +10005,14 @@ impl Pipeline {
                         .is_some_and(|w| layer.head_len(0) + 1 >= w)
             );
             stored_at.push(layer.head_len(0));
+            // Per-layer geometry for Gemma-4 (512-wide global layers over
+            // one KV head); every other model keeps the pipeline-wide one.
+            let (nkv, hd) = if gemma4 {
+                let (a, bb, _) = self.layer_geom(li);
+                (a, bb)
+            } else {
+                (nkv, hd)
+            };
             layers.push(crate::gpu_metal::ChunkLayer {
                 model: &model,
                 kv_id: self.graph_kv_id,
@@ -9992,7 +10044,14 @@ impl Pipeline {
                 eps: self.rms_eps as f32,
                 window: self.layer_window(li),
                 head_gate,
-                gelu: ffn_act == Act::Gelu,
+                act: ffn_act.graph_act().map_or(0, |a| a.code() as u8),
+                g4: gemma4.then(|| crate::gpu_metal::ChunkGemma4 {
+                    v_norm: self.attn_v_norm,
+                    scale: self.attn_scale,
+                    attn_out_norm: lw.attn_out_norm.as_deref(),
+                    ffn_out_norm: lw.ffn_out_norm.as_deref(),
+                    layer_scale: lw.layer_scale,
+                }),
                 col,
                 moe,
             });
@@ -10000,15 +10059,18 @@ impl Pipeline {
         if layers.is_empty() {
             return li0;
         }
-        let row = nkv * hd;
+        // KV row width per layer (uniform but for Gemma-4).
+        let rows_kv: Vec<(usize, usize)> = layers.iter().map(|l| (l.nkv, l.nkv * l.hd)).collect();
         let mut store: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> = stored_at
             .iter()
-            .map(|&st| (vec![0f32; b * row], vec![0f32; b * row], vec![0f32; st + b]))
+            .zip(&rows_kv)
+            .map(|(&st, &(_, row))| (vec![0f32; b * row], vec![0f32; b * row], vec![0f32; st + b]))
             .collect();
         let mut io: Vec<crate::gpu_metal::ChunkIo> = Vec::with_capacity(layers.len());
         for (i, (ok, ov, oi)) in store.iter_mut().enumerate() {
             let li = layers[i].layer;
             let layer = &self.kv_cache.layers[li];
+            let nkv = rows_kv[i].0;
             io.push(crate::gpu_metal::ChunkIo {
                 cpu_stored: stored_at[i],
                 cpu_gen: layer.generation(),
@@ -10047,6 +10109,7 @@ impl Pipeline {
         // and bank the importance masses per layer.
         for (i, (ok, ov, oi)) in store.iter().enumerate().take(n_run) {
             let li = li0 + i;
+            let row = rows_kv[i].1;
             let layer = &mut self.kv_cache.layers[li];
             for bi in 0..b {
                 layer.append(
@@ -10348,6 +10411,36 @@ impl Pipeline {
             && self.global_attn.is_none()
             && self.inv_freq_global.is_none()
             && self.metal_rope_scale_ok()
+            && !(0..self.num_layers).any(|li| {
+                self.layer_is_local(li)
+                    && self.inv_freq_local.is_none()
+                    && self.rotary_dim_local.is_some_and(|r| r != self.rotary_dim)
+            })
+    }
+
+    /// Can the Metal graphs carry this Gemma-4 model (`gpu_metal::gemma4`)?
+    /// Its sliding layers (window, local RoPE table, 256-wide heads)
+    /// device-attend like Spark-X2.5's; the 512-wide global layers (one KV
+    /// head, proportional RoPE in the zero-padded table) take the 16-slot
+    /// kernels; the V norm, sandwich norms, layer scalar and tanh-GELU come
+    /// from the Gemma-4 library. Dense FFNs only (no Gemma-4 MoE measured).
+    /// `CMF_METAL_GEMMA4=0` declines it as before (CPU attention).
+    #[cfg(target_os = "macos")]
+    fn metal_gemma4(&self) -> bool {
+        crate::gpu_metal::gemma4::enabled()
+            && (self.global_attn.is_some() || self.attn_v_norm)
+            && self.attention_heads_per_layer.is_none()
+            && self.kv_heads_per_layer.is_none()
+            && self.v_head_dim.is_none()
+            && !self.kv_cache.layers.iter().any(|l| l.sinks.is_some())
+            && self.attn_softcap == 0.0
+            && !self.qk_norm_after_rope
+            && self.metal_rope_scale_ok()
+            && self
+                .weights
+                .layers
+                .iter()
+                .all(|lw| matches!(&lw.ffn, FfnKind::Dense(d) if d.segs.is_empty()))
             && !(0..self.num_layers).any(|li| {
                 self.layer_is_local(li)
                     && self.inv_freq_local.is_none()
@@ -11813,7 +11906,7 @@ impl Pipeline {
                         gate: g,
                         up: u,
                         down: dn,
-                        gelu: false, // SiLU only (the arm above)
+                        act: 0, // SiLU only (the arm above)
                     }
                 }
                 _ => return None,
@@ -11891,6 +11984,9 @@ impl Pipeline {
                             wv: pv,
                             wo: po,
                             ffn,
+                            attn_out_norm: None,
+                            ffn_out_norm: None,
+                            layer_scale: None,
                         },
                         li,
                         q_norm: q_norm.as_deref(),
@@ -11965,6 +12061,7 @@ impl Pipeline {
                 o1: None,
                 window: None,
                 head_gate: None,
+                v_norm: false,
             },
             cpu_stored,
         )
@@ -12548,8 +12645,11 @@ impl Pipeline {
                 gate: g,
                 up: u,
                 down: dn,
-                gelu: d.act == Act::Gelu,
+                act: (d.act == Act::Gelu) as u8,
             },
+            attn_out_norm: None,
+            ffn_out_norm: None,
+            layer_scale: None,
         };
         let (nh, nkv, hd, rd) = (
             self.num_heads,
@@ -12596,6 +12696,7 @@ impl Pipeline {
                 o1: None,
                 window: None,
                 head_gate: None,
+                v_norm: false,
             };
             if !graph.attn_ok(&l, &p) || !graph.encode_attn_b(&l, &p) {
                 return None;
@@ -12811,8 +12912,11 @@ impl Pipeline {
                 gate: g,
                 up: u,
                 down: dn,
-                gelu: d.act == Act::Gelu,
+                act: (d.act == Act::Gelu) as u8,
             },
+            attn_out_norm: None,
+            ffn_out_norm: None,
+            layer_scale: None,
         };
         let (nh, nkv, hd, rd) = (
             self.num_heads,
@@ -12850,6 +12954,7 @@ impl Pipeline {
                 o1: None,
                 window: None,
                 head_gate: None,
+                v_norm: false,
             };
             if !graph.attn_device_ok(&l, &p) || !graph.encode_attn_device(&l, &p) {
                 return None;
@@ -13050,8 +13155,11 @@ impl Pipeline {
                 gate: g,
                 up: u,
                 down: dn,
-                gelu: d.act == Act::Gelu,
+                act: (d.act == Act::Gelu) as u8,
             },
+            attn_out_norm: None,
+            ffn_out_norm: None,
+            layer_scale: None,
         };
         let (nh, nkv, hd, rd) = (
             self.num_heads,
@@ -13118,6 +13226,7 @@ impl Pipeline {
                     o1: None,
                     window: None,
                     head_gate: None,
+                    v_norm: false,
                 };
                 if !graph.attn_device_ok(&l, &p) || !graph.encode_attn_device(&l, &p) {
                     return Err(false);
