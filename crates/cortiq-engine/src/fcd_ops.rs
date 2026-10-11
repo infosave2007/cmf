@@ -98,12 +98,25 @@ impl Fp for f64 {
 }
 
 #[inline]
+/// Eight independent accumulators: a single-chain float sum cannot be
+/// reassociated by the compiler, so the one-accumulator form ran scalar
+/// and made the host attention of a bake (t² dots per head) its slowest
+/// link. The lanes vectorize; the summation order is fixed and
+/// deterministic.
 fn dot<F: Fp>(a: &[F], b: &[F]) -> F {
+    let mut acc = [F::ZERO; 8];
+    let mut ca = a.chunks_exact(8);
+    let mut cb = b.chunks_exact(8);
+    for (x, y) in (&mut ca).zip(&mut cb) {
+        for l in 0..8 {
+            acc[l] += x[l] * y[l];
+        }
+    }
     let mut s = F::ZERO;
-    for (x, y) in a.iter().zip(b) {
+    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
         s += *x * *y;
     }
-    s
+    ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7])) + s
 }
 
 // ─────────────────────── generic matmul (nt) ───────────────────────
@@ -311,8 +324,10 @@ pub fn gemm_nt(
     let _t_gemm = std::time::Instant::now();
     crate::fcd::prof::GEMM_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _guard = scopeguard_gemm(_t_gemm, n, k, m);
+    // A thin output (m < 64: a per-head gate projection) never fills a
+    // tensor-core tile and only costs the round trip — host.
     #[cfg(feature = "gpu")]
-    if n * k * m >= (1 << 22) && crate::gpu::enabled_here() {
+    if n * k * m >= (1 << 22) && m >= 64 && crate::gpu::enabled_here() {
         let t0 = std::time::Instant::now();
         match crate::gpu::probe_arm(crate::gpu::OpClass::GemmNt) {
             crate::gpu::ProbeArm::Gpu => {
@@ -643,6 +658,76 @@ pub fn silu_bwd<F: Fp>(x: F) -> F {
     s * (F::ONE + x * (F::ONE - s))
 }
 
+/// erf by Abramowitz–Stegun 7.1.26 (|error| ≤ 1.5e-7) — the formula the
+/// runtime (`inference::erf_f32`) and the GPU kernels evaluate, so the
+/// bake differentiates the activation the model will actually run.
+#[inline]
+pub fn erf_as<F: Fp>(x: F) -> F {
+    let a = x.maxf(-x);
+    let t = F::ONE / (F::ONE + F::fromf(0.327_591_1) * a);
+    let poly = ((((F::fromf(1.061_405_4) * t - F::fromf(1.453_152_1)) * t
+        + F::fromf(1.421_413_8))
+        * t
+        - F::fromf(0.284_496_74))
+        * t
+        + F::fromf(0.254_829_6))
+        * t;
+    let y = F::ONE - poly * (-(a * a)).exp();
+    if x < F::ZERO { -y } else { y }
+}
+
+/// Exact (erf) GELU, `0.5·x·(1 + erf(x/√2))` — HF `hidden_act = "gelu"`
+/// (Spark-X2.5).
+#[inline]
+pub fn gelu_erf<F: Fp>(x: F) -> F {
+    F::fromf(0.5) * x * (F::ONE + erf_as(x * F::fromf(std::f64::consts::FRAC_1_SQRT_2)))
+}
+
+/// d gelu / dx = Φ(x) + x·φ(x): Φ = ½(1 + erf(x/√2)), φ = exp(−x²/2)/√(2π).
+#[inline]
+pub fn gelu_erf_bwd<F: Fp>(x: F) -> F {
+    let cdf = F::fromf(0.5) * (F::ONE + erf_as(x * F::fromf(std::f64::consts::FRAC_1_SQRT_2)));
+    let pdf = (-(x * x) * F::fromf(0.5)).exp() * F::fromf(0.398_942_280_401_432_7);
+    cdf + x * pdf
+}
+
+/// The gated FFN's gate-branch activation: `act(g)·u` feeds down_proj.
+/// One enum, so every forward and every hand-rolled backward in the
+/// trainer names the same function instead of spelling SiLU inline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FfnAct {
+    Silu,
+    /// Exact erf GELU (Spark-X2.5).
+    GeluErf,
+}
+
+impl FfnAct {
+    /// `None` for an activation the backward does not differentiate yet.
+    pub fn from_arch(name: &str) -> Option<Self> {
+        match name {
+            "silu" => Some(Self::Silu),
+            "gelu" => Some(Self::GeluErf),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn fwd<F: Fp>(self, x: F) -> F {
+        match self {
+            Self::Silu => silu(x),
+            Self::GeluErf => gelu_erf(x),
+        }
+    }
+
+    #[inline]
+    pub fn bwd<F: Fp>(self, x: F) -> F {
+        match self {
+            Self::Silu => silu_bwd(x),
+            Self::GeluErf => gelu_erf_bwd(x),
+        }
+    }
+}
+
 // ──────────────────────────── RMSNorm ────────────────────────────
 
 /// RMSNorm over `n` rows of width `d = w.len()`:
@@ -779,7 +864,6 @@ pub fn seg_means_bwd<F: Fp>(dl: &[F], t: usize, d: usize, m: usize, dx: &mut [F]
 
 /// Exact per-head causal attention: out[t] = softmax(q_t·Kᵀ/√d)·V over
 /// j ≤ t. `q`,`k` are `[t,d]`, `v` is `[t,dv]`, `out` is `[t,dv]`.
-#[allow(clippy::needless_range_loop)] // row[j] pairs with k-row j — indices are the clearer form
 pub fn attn_head_fwd<F: Fp>(
     q: &[F],
     k: &[F],
@@ -789,18 +873,38 @@ pub fn attn_head_fwd<F: Fp>(
     dv: usize,
     out: &mut [F],
 ) {
+    attn_head_fwd_window(q, k, v, t, d, dv, None, out)
+}
+
+/// `attn_head_fwd` with a sliding window: query t sees the keys
+/// `j ∈ [t+1−w, t]` (w keys, itself included) — the runtime's
+/// `first = stored − w` rule (`attention::attend_all_heads`), so a
+/// bake's forward on a Gemma-3 / Spark-X2.5 local layer matches what
+/// the engine serves. `None` is full causal.
+#[allow(clippy::needless_range_loop, clippy::too_many_arguments)] // row[j] pairs with k-row j — indices are the clearer form
+pub fn attn_head_fwd_window<F: Fp>(
+    q: &[F],
+    k: &[F],
+    v: &[F],
+    t: usize,
+    d: usize,
+    dv: usize,
+    window: Option<usize>,
+    out: &mut [F],
+) {
     let scale = F::fromf(1.0 / (d as f64).sqrt());
     let mut row = vec![F::ZERO; t];
     for ti in 0..t {
+        let first = window.map(|w| (ti + 1).saturating_sub(w)).unwrap_or(0);
         let qr = &q[ti * d..(ti + 1) * d];
         let mut mx = F::fromf(f64::NEG_INFINITY);
-        for j in 0..=ti {
+        for j in first..=ti {
             let s = dot(qr, &k[j * d..(j + 1) * d]) * scale;
             row[j] = s;
             mx = mx.maxf(s);
         }
         let mut den = F::ZERO;
-        for j in 0..=ti {
+        for j in first..=ti {
             row[j] = (row[j] - mx).exp();
             den += row[j];
         }
@@ -808,7 +912,7 @@ pub fn attn_head_fwd<F: Fp>(
         for o in or.iter_mut() {
             *o = F::ZERO;
         }
-        for j in 0..=ti {
+        for j in first..=ti {
             let p = row[j] / den;
             for (o, vv) in or.iter_mut().zip(&v[j * dv..(j + 1) * dv]) {
                 *o += p * *vv;
@@ -820,7 +924,7 @@ pub fn attn_head_fwd<F: Fp>(
 /// Exact-attention backward (probs recomputed row by row — the trainer
 /// is layer-checkpointed, nothing is stored). Standard softmax chain:
 /// ds_j = p_j·(dp_j − Σ p·dp), dp_j = dout·v_j.
-#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+#[allow(clippy::too_many_arguments)]
 pub fn attn_head_bwd<F: Fp>(
     q: &[F],
     k: &[F],
@@ -833,18 +937,37 @@ pub fn attn_head_bwd<F: Fp>(
     dk: &mut [F],
     dvv: &mut [F],
 ) {
+    attn_head_bwd_window(q, k, v, dout, t, d, dv, None, dq, dk, dvv)
+}
+
+/// `attn_head_bwd` under the sliding window of `attn_head_fwd_window`.
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub fn attn_head_bwd_window<F: Fp>(
+    q: &[F],
+    k: &[F],
+    v: &[F],
+    dout: &[F],
+    t: usize,
+    d: usize,
+    dv: usize,
+    window: Option<usize>,
+    dq: &mut [F],
+    dk: &mut [F],
+    dvv: &mut [F],
+) {
     let scale = F::fromf(1.0 / (d as f64).sqrt());
     let mut row = vec![F::ZERO; t];
     for ti in 0..t {
+        let first = window.map(|w| (ti + 1).saturating_sub(w)).unwrap_or(0);
         let qr = &q[ti * d..(ti + 1) * d];
         let mut mx = F::fromf(f64::NEG_INFINITY);
-        for j in 0..=ti {
+        for j in first..=ti {
             let s = dot(qr, &k[j * d..(j + 1) * d]) * scale;
             row[j] = s;
             mx = mx.maxf(s);
         }
         let mut den = F::ZERO;
-        for j in 0..=ti {
+        for j in first..=ti {
             row[j] = (row[j] - mx).exp();
             den += row[j];
         }
@@ -852,14 +975,14 @@ pub fn attn_head_bwd<F: Fp>(
         // dp_j and the softmax dot Σ p·dp in one pass.
         let mut pdp = F::ZERO;
         let mut dp = vec![F::ZERO; ti + 1];
-        for j in 0..=ti {
+        for j in first..=ti {
             let p = row[j] / den;
             row[j] = p; // row now holds probabilities
             dp[j] = dot(dor, &v[j * dv..(j + 1) * dv]);
             pdp += p * dp[j];
         }
         let dqr = &mut dq[ti * d..(ti + 1) * d];
-        for j in 0..=ti {
+        for j in first..=ti {
             let p = row[j];
             // dV
             for (dvo, o) in dvv[j * dv..(j + 1) * dv].iter_mut().zip(dor) {
