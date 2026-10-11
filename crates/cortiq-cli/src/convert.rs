@@ -919,6 +919,50 @@ pub(crate) fn parse_tensor_quant(spec: &str) -> anyhow::Result<(String, Quant)> 
 }
 
 /// Install the converter's per-tensor overrides (replaces any earlier set).
+/// `--sampling`: the model's recommended sampling, recorded in
+/// `header.provenance.sampling`; `run` and `serve` start from it.
+static SAMPLING_DEFAULTS: Mutex<Option<serde_json::Value>> = Mutex::new(None);
+
+/// Parse `key=value,key=value` over [`cortiq_engine::sampler::FILE_SAMPLING_KEYS`].
+pub(crate) fn parse_sampling(spec: &str) -> anyhow::Result<serde_json::Value> {
+    let mut m = serde_json::Map::new();
+    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (k, v) = part
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--sampling '{part}': expected KEY=VALUE"))?;
+        let k = k.trim();
+        anyhow::ensure!(
+            cortiq_engine::sampler::FILE_SAMPLING_KEYS.contains(&k),
+            "--sampling: unknown key '{k}' (known: {})",
+            cortiq_engine::sampler::FILE_SAMPLING_KEYS.join(", ")
+        );
+        let v = v.trim();
+        let val = if k == "top_k" {
+            serde_json::json!(v
+                .parse::<u32>()
+                .map_err(|e| anyhow::anyhow!("--sampling top_k '{v}': {e}"))?)
+        } else {
+            let x = v
+                .parse::<f64>()
+                .map_err(|e| anyhow::anyhow!("--sampling {k} '{v}': {e}"))?;
+            anyhow::ensure!(x.is_finite() && x >= 0.0, "--sampling {k}: {x} must be finite and >= 0");
+            serde_json::json!(x)
+        };
+        m.insert(k.to_string(), val);
+    }
+    anyhow::ensure!(!m.is_empty(), "--sampling: nothing to record");
+    Ok(serde_json::Value::Object(m))
+}
+
+pub fn set_sampling_defaults(spec: Option<&str>) -> anyhow::Result<()> {
+    *SAMPLING_DEFAULTS.lock().unwrap() = spec.map(parse_sampling).transpose()?;
+    Ok(())
+}
+
+fn sampling_defaults() -> Option<serde_json::Value> {
+    SAMPLING_DEFAULTS.lock().unwrap().clone()
+}
+
 pub fn set_tensor_quant_overrides(specs: &[String]) -> anyhow::Result<()> {
     let parsed = specs
         .iter()
@@ -7369,6 +7413,14 @@ pub fn run_convert_multi_towers(
         }
         None => provenance,
     };
+    let provenance = match sampling_defaults() {
+        Some(s) => {
+            let mut p = provenance;
+            p["sampling"] = s;
+            p
+        }
+        None => provenance,
+    };
     // A CMF_CONVERT_ONLY probe must never pass for a model.
     let provenance = match &convert_only {
         Some(pats) => {
@@ -7538,6 +7590,22 @@ pub(crate) fn q2tp_expert_gate_or_up(name: &str) -> bool {
 pub(crate) mod tests {
     use super::*;
     use cortiq_core::format::CmfModel;
+
+    #[test]
+    fn sampling_spec_parses_into_the_header_shape() {
+        let v = parse_sampling("temperature=1.0, top_p=0.95,top_k=0,min_p=0,repetition_penalty=1.0")
+            .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"temperature": 1.0, "top_p": 0.95, "top_k": 0, "min_p": 0.0,
+                               "repetition_penalty": 1.0})
+        );
+        let c = cortiq_engine::SamplerConfig::from_provenance(Some(&serde_json::json!({"sampling": v})));
+        assert_eq!((c.top_k, c.min_p, c.repetition_penalty), (0, 0.0, 1.0));
+        assert!(parse_sampling("top_k=-1").is_err());
+        assert!(parse_sampling("temp=1").is_err());
+        assert!(parse_sampling("").is_err());
+    }
 
     #[test]
     fn whisper_config_and_native_tensor_names_are_supported() {

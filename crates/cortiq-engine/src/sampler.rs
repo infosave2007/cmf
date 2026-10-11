@@ -153,6 +153,59 @@ impl Default for SamplerConfig {
     }
 }
 
+/// Keys a file may carry in `header.provenance.sampling`
+/// (`cortiq convert --sampling`).
+pub const FILE_SAMPLING_KEYS: [&str; 6] = [
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "repetition_penalty",
+    "presence_penalty",
+];
+
+impl SamplerConfig {
+    /// The engine defaults with the file's own sampling recommendation on
+    /// top: `header.provenance.sampling` (written by `cortiq convert
+    /// --sampling`, e.g. a rewriting model trained and evaluated at
+    /// temperature 1.0 / top-p 0.95 / no top-k / no min-p / no repetition
+    /// penalty). Keys the file does not set keep the engine default;
+    /// explicit flags and request fields still override both.
+    pub fn from_provenance(provenance: Option<&serde_json::Value>) -> Self {
+        let mut c = Self::default();
+        let Some(s) = provenance.and_then(|p| p.get("sampling")) else {
+            return c;
+        };
+        let f = |k: &str| s.get(k).and_then(|v| v.as_f64()).filter(|v| v.is_finite());
+        if let Some(v) = f("temperature") {
+            c.temperature = v as f32;
+        }
+        if let Some(v) = f("top_p") {
+            c.top_p = v as f32;
+        }
+        if let Some(v) = s.get("top_k").and_then(|v| v.as_u64()) {
+            c.top_k = v.min(u32::MAX as u64) as u32;
+        }
+        if let Some(v) = f("min_p") {
+            c.min_p = v as f32;
+        }
+        if let Some(v) = f("repetition_penalty") {
+            c.repetition_penalty = v as f32;
+        }
+        if let Some(v) = f("presence_penalty") {
+            c.presence_penalty = v as f32;
+        }
+        c
+    }
+
+    /// True when the file carries a sampling recommendation.
+    pub fn file_has_defaults(provenance: Option<&serde_json::Value>) -> bool {
+        provenance
+            .and_then(|p| p.get("sampling"))
+            .is_some_and(|s| s.as_object().is_some_and(|o| !o.is_empty()))
+    }
+}
+
 /// Sample next token from logits. Chain order is fixed:
 /// rep-penalty → temperature → softmax → min-p → top-k → top-p → sample.
 pub fn sample(
@@ -1649,6 +1702,24 @@ mod tests {
         let mut scratch = SamplerScratch::default();
         apply_repetition_penalty(&mut logits, &[1, 1, 2, 1, 2], 2.0, &mut scratch);
         assert_eq!(logits, vec![1.0, 2.0, -12.0]);
+    }
+
+    #[test]
+    fn file_sampling_defaults_override_only_what_they_set() {
+        let none = SamplerConfig::from_provenance(None);
+        assert_eq!(none.top_k, SamplerConfig::default().top_k);
+        let p = serde_json::json!({"sampling": {
+            "temperature": 1.0, "top_p": 0.95, "top_k": 0, "min_p": 0.0,
+            "repetition_penalty": 1.0
+        }});
+        let c = SamplerConfig::from_provenance(Some(&p));
+        assert_eq!(
+            (c.temperature, c.top_p, c.top_k, c.min_p, c.repetition_penalty),
+            (1.0, 0.95, 0, 0.0, 1.0)
+        );
+        assert_eq!(c.presence_penalty, SamplerConfig::default().presence_penalty);
+        assert!(SamplerConfig::file_has_defaults(Some(&p)));
+        assert!(!SamplerConfig::file_has_defaults(Some(&serde_json::json!({}))));
     }
 
     #[test]
