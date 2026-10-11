@@ -1032,6 +1032,287 @@ fn q8_2f_mm_r2(@builtin(workgroup_id) wid: vec3<u32>,
 }
 "#;
 
+/// Gemma-4's DECODE attend (the token graph) past ATTEND_SPLIT_MIN
+/// positions: a GQA-shared split over 64-position chunks, eight query heads
+/// a workgroup (shorter contexts keep the one-workgroup-a-head attend). The per-head split
+/// (`gqa_attend_part_x`) read a 1024-position sliding window once per Q
+/// head (twice the KV bytes at two heads a group, sixteen times on the
+/// 512-wide global layers) and was 6.9 of a 1k-context token's 32.6 ms.
+/// Partials land in `gqa_attend_merge_x`'s layout ([h·nc + ch], chunk
+/// length 64 in uniform word 10); that kernel merges them. Uniform = the
+/// ATTEND_X `AxP` words. Requires an even heads-per-group count (a head
+/// pair shares its K/V rows) and nh % 8 == 0.
+pub(crate) const G4_DEC_WGSL: &str = r#"
+struct AxP {
+    nh: u32, hpk: u32, hd: u32, dv: u32,
+    cap: u32, n: u32, first: u32, scale: f32,
+    sink: u32, nc: u32, ck: u32, _b: u32,
+};
+@group(0) @binding(0) var<storage, read>       dq   : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read>       dk   : array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read>       dvv  : array<vec4<f32>>;
+@group(0) @binding(4) var<uniform>             dp   : AxP;
+@group(0) @binding(6) var<storage, read_write> dacc : array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read_write> dml  : array<vec2<f32>>;
+var<workgroup> dsq: array<vec4<f32>, 1024>;  // [head·hd4 + d4]
+var<workgroup> dsw: array<f32, 512>;         // [head·64 + p]: scores, then weights
+var<workgroup> dred: array<f32, 256>;        // [head·32 + r]
+@compute @workgroup_size(256)
+fn g4_attend_dec(@builtin(workgroup_id) wid: vec3<u32>,
+                 @builtin(local_invocation_index) lid: u32) {
+    let hb0 = wid.x * 8u;
+    let ch = wid.y;
+    let nh = dp.nh;
+    let hpk = dp.hpk;
+    if (hb0 >= nh || ch * 64u >= dp.n) { return; }
+    let c0 = ch * 64u;
+    let cn = min(64u, dp.n - c0);
+    let nhb = min(8u, nh - hb0);
+    let hd4 = dp.hd / 4u;
+    let dv4 = dp.dv / 4u;
+    let cap = dp.cap;
+    let nc = dp.nc;
+    for (var i = lid; i < 8u * hd4; i = i + 256u) {
+        let j = i / hd4;
+        var qv = vec4<f32>(0.0);
+        if (j < nhb) { qv = dq[(hb0 + j) * hd4 + (i - j * hd4)]; }
+        dsq[i] = qv;
+    }
+    workgroupBarrier();
+    let s0 = (dp.first + c0) % cap;
+    // Scores: lane = (position p, head pair hp) — heads 2hp, 2hp+1 share a
+    // K row (an even heads-per-group count).
+    let p = lid & 63u;
+    let hp = lid >> 6u;
+    let ha = 2u * hp;
+    let hbb = ha + 1u;
+    var sa = -1.0e30;
+    var sb = -1.0e30;
+    if (p < cn && ha < nhb) {
+        var sl = s0 + p;
+        if (sl >= cap) { sl = sl - cap; }
+        let krow = ((hb0 + ha) / hpk * cap + sl) * hd4;
+        var da = vec4<f32>(0.0);
+        var db = vec4<f32>(0.0);
+        for (var d = 0u; d < hd4; d = d + 1u) {
+            let kv = dk[krow + d];
+            da = da + dsq[ha * hd4 + d] * kv;
+            db = db + dsq[hbb * hd4 + d] * kv;
+        }
+        sa = (da.x + da.y + da.z + da.w) * dp.scale;
+        if (hbb < nhb) { sb = (db.x + db.y + db.z + db.w) * dp.scale; }
+    }
+    dsw[ha * 64u + p] = sa;
+    dsw[hbb * 64u + p] = sb;
+    workgroupBarrier();
+    // Per head: max and sum over the chunk, 32 lanes a head.
+    let hl = lid >> 5u;
+    let r = lid & 31u;
+    dred[lid] = max(dsw[hl * 64u + r], dsw[hl * 64u + r + 32u]);
+    workgroupBarrier();
+    var st = 16u;
+    loop {
+        if (st == 0u) { break; }
+        if (r < st) { dred[lid] = max(dred[lid], dred[lid + st]); }
+        workgroupBarrier();
+        st = st >> 1u;
+    }
+    let cm = dred[hl * 32u];
+    workgroupBarrier();
+    let live = hl < nhb;
+    let w0 = select(0.0, exp(dsw[hl * 64u + r] - cm), live && r < cn);
+    let w1 = select(0.0, exp(dsw[hl * 64u + r + 32u] - cm), live && r + 32u < cn);
+    dsw[hl * 64u + r] = w0;
+    dsw[hl * 64u + r + 32u] = w1;
+    dred[lid] = w0 + w1;
+    workgroupBarrier();
+    st = 16u;
+    loop {
+        if (st == 0u) { break; }
+        if (r < st) { dred[lid] = dred[lid] + dred[lid + st]; }
+        workgroupBarrier();
+        st = st >> 1u;
+    }
+    if (r == 0u && live) {
+        dml[(hb0 + hl) * nc + ch] = vec2<f32>(cm, dred[lid]);
+    }
+    // Values: lane = (dim quad q, head pair hq), quads q and q + 64.
+    let q = lid & 63u;
+    let hq = lid >> 6u;
+    let h0 = 2u * hq;
+    let h1 = h0 + 1u;
+    if (h0 < nhb) {
+        let vb4 = (hb0 + h0) / hpk * cap * dv4;
+        var a0 = vec4<f32>(0.0);
+        var a1 = vec4<f32>(0.0);
+        var a2 = vec4<f32>(0.0);
+        var a3 = vec4<f32>(0.0);
+        let lo = q < dv4;
+        let hi = q + 64u < dv4;
+        for (var pp = 0u; pp < cn; pp = pp + 1u) {
+            var sl = s0 + pp;
+            if (sl >= cap) { sl = sl - cap; }
+            let row = vb4 + sl * dv4;
+            let wa = dsw[h0 * 64u + pp];
+            let wb = dsw[h1 * 64u + pp];
+            if (lo) {
+                let v = dvv[row + q];
+                a0 = a0 + wa * v;
+                a1 = a1 + wb * v;
+            }
+            if (hi) {
+                let v2 = dvv[row + q + 64u];
+                a2 = a2 + wa * v2;
+                a3 = a3 + wb * v2;
+            }
+        }
+        let o0 = ((hb0 + h0) * nc + ch) * dv4;
+        let o1 = ((hb0 + h1) * nc + ch) * dv4;
+        if (lo) {
+            dacc[o0 + q] = a0;
+            if (h1 < nhb) { dacc[o1 + q] = a1; }
+        }
+        if (hi) {
+            dacc[o0 + q + 64u] = a2;
+            if (h1 < nhb) { dacc[o1 + q + 64u] = a3; }
+        }
+    }
+}
+"#;
+
+/// The decode attend pipeline (`G4_DEC_WGSL`), compiled on first use;
+/// None under `CMF_G4_DEC=0` or when rejected.
+pub(crate) fn dec_pipe(c: &Ctx) -> Option<&Pipe> {
+    c.g4_dec_pipe
+        .get_or_init(|| {
+            if std::env::var("CMF_G4_DEC").as_deref() == Ok("0")
+                || c.device.limits().max_compute_workgroup_storage_size < 32 * 1024
+            {
+                return None;
+            }
+            module_pipes(c, "cmf-g4-dec", G4_DEC_WGSL, &["g4_attend_dec"])
+                .and_then(|v| v.into_iter().next())
+        })
+        .as_ref()
+}
+
+/// Can `g4_attend_dec` serve this decode geometry?
+pub(crate) fn dec_fits(nh: usize, nkv: usize, hd: usize, dv: usize) -> bool {
+    nkv > 0
+        && nh % nkv == 0
+        && (nh / nkv) % 2 == 0
+        && nh % 8 == 0
+        && hd % 4 == 0
+        && (4..=512).contains(&hd)
+        && dv % 4 == 0
+        && (4..=512).contains(&dv)
+}
+
+/// Gemma's sandwich residual in ONE token-graph dispatch: o = rms(x)·w1
+/// (the mixer / FFN output norm), h = (h + o)·scale, n1 = rms(h)·w2. The
+/// two kernels it replaces, `rmsnorm` (1024 lanes) then `add_rmsnorm` (256
+/// lanes), run here in that order with their own lane counts, trees and
+/// expressions — `o` round-trips through workgroup memory as it did through
+/// a buffer — so every output is theirs to the bit. Two single-workgroup
+/// dispatches a site were ~1 ms of a 48-layer token.
+pub(crate) const G4_SANDWICH_WGSL: &str = r#"
+struct SwP { n: u32, gemma: u32, eps: f32, scale: u32 };
+@group(0) @binding(0) var<storage, read>       sw_x  : array<f32>;
+@group(0) @binding(1) var<storage, read>       sw_w1 : array<f32>;
+@group(0) @binding(2) var<storage, read_write> sw_h  : array<f32>;
+@group(0) @binding(3) var<storage, read>       sw_w2 : array<f32>;
+@group(0) @binding(4) var<storage, read_write> sw_o  : array<f32>;
+@group(0) @binding(5) var<uniform>             sw_p  : SwP;
+var<workgroup> sw_part: array<f32, 1024>;
+var<workgroup> sw_mid: array<f32, 8192>;
+@compute @workgroup_size(1024)
+fn g4_sandwich(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let tid = lid.x;
+    let n = sw_p.n;
+    // rmsnorm: x → mid
+    var acc = 0.0;
+    var i = tid;
+    loop {
+        if (i >= n) { break; }
+        let v = sw_x[i];
+        acc = acc + v * v;
+        i = i + 1024u;
+    }
+    sw_part[tid] = acc;
+    workgroupBarrier();
+    var stride = 512u;
+    loop {
+        if (stride == 0u) { break; }
+        if (tid < stride) { sw_part[tid] = sw_part[tid] + sw_part[tid + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let inv = inverseSqrt(sw_part[0] / f32(n) + sw_p.eps);
+    i = tid;
+    loop {
+        if (i >= n) { break; }
+        var wv = sw_w1[i];
+        if (sw_p.gemma == 1u) { wv = 1.0 + wv; }
+        sw_mid[i] = sw_x[i] * inv * wv;
+        i = i + 1024u;
+    }
+    workgroupBarrier();
+    // add_rmsnorm: h = (h + mid)·scale, o = rms(h)·w2 — its 256 lanes.
+    var acc2 = 0.0;
+    if (tid < 256u) {
+        i = tid;
+        loop {
+            if (i >= n) { break; }
+            var v = sw_h[i] + sw_mid[i];
+            if (sw_p.scale != 0u) { v = v * bitcast<f32>(sw_p.scale); }
+            sw_h[i] = v;
+            acc2 = acc2 + v * v;
+            i = i + 256u;
+        }
+        sw_part[tid] = acc2;
+    }
+    workgroupBarrier();
+    stride = 128u;
+    loop {
+        if (stride == 0u) { break; }
+        if (tid < stride) { sw_part[tid] = sw_part[tid] + sw_part[tid + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let inv2 = inverseSqrt(sw_part[0] / f32(n) + sw_p.eps);
+    if (tid < 256u) {
+        i = tid;
+        loop {
+            if (i >= n) { break; }
+            var wv = sw_w2[i];
+            if (sw_p.gemma == 1u) { wv = 1.0 + wv; }
+            sw_o[i] = sw_h[i] * inv2 * wv;
+            i = i + 256u;
+        }
+    }
+}
+"#;
+
+/// The fused sandwich pipeline, compiled on first use; None under
+/// `CMF_G4_FUSE=0`, when rejected, or for a hidden size past 8192.
+pub(crate) fn sandwich_pipe(c: &Ctx, hidden: usize) -> Option<&Pipe> {
+    if hidden > 8192 {
+        return None;
+    }
+    c.g4_sandwich_pipe
+        .get_or_init(|| {
+            if std::env::var("CMF_G4_FUSE").as_deref() == Ok("0")
+                || c.device.limits().max_compute_workgroup_storage_size < 36 * 1024
+                || c.device.limits().max_compute_invocations_per_workgroup < 1024
+            {
+                return None;
+            }
+            module_pipes(c, "cmf-g4-sandwich", G4_SANDWICH_WGSL, &["g4_sandwich"])
+                .and_then(|v| v.into_iter().next())
+        })
+        .as_ref()
+}
+
 type Pipe = (wgpu::ComputePipeline, wgpu::BindGroupLayout);
 
 pub(crate) struct Pipes {
@@ -1319,7 +1600,12 @@ mod shader_tests {
     /// Both modules parse and validate (naga) without a device.
     #[test]
     fn g4_batch_shaders_validate() {
-        for (name, src) in [("g4", G4_WGSL), ("q82mm", Q82_MM_WGSL)] {
+        for (name, src) in [
+            ("g4", G4_WGSL),
+            ("q82mm", Q82_MM_WGSL),
+            ("g4dec", G4_DEC_WGSL),
+            ("g4sw", G4_SANDWICH_WGSL),
+        ] {
             let module = wgpu::naga::front::wgsl::parse_str(src)
                 .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(src)));
             wgpu::naga::valid::Validator::new(

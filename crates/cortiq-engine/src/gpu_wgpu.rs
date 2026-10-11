@@ -18622,6 +18622,10 @@ struct Ctx {
     dense_batch_pipes: std::sync::OnceLock<Option<dense_batch::Pipes>>,
     /// Gemma-4 batch kernels (`gemma_batch`).
     g4_batch_pipes: std::sync::OnceLock<Option<gemma_batch::Pipes>>,
+    /// Gemma-4's GQA-shared decode attend (`gemma_batch::dec_pipe`).
+    g4_dec_pipe: std::sync::OnceLock<Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>>,
+    /// Gemma's fused sandwich residual (`gemma_batch::sandwich_pipe`).
+    g4_sandwich_pipe: std::sync::OnceLock<Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>>,
     /// Warp-per-row q4tp decode matvecs (`dense_mv`).
     dense_mv_pipes: std::sync::OnceLock<Option<dense_mv::MvSg>>,
     /// Subgroup-tree GDN step twins (`dense_mv::gdn`).
@@ -21233,6 +21237,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
         moe_r4_pipes: std::sync::OnceLock::new(),
         dense_batch_pipes: std::sync::OnceLock::new(),
         g4_batch_pipes: std::sync::OnceLock::new(),
+        g4_dec_pipe: std::sync::OnceLock::new(),
+        g4_sandwich_pipe: std::sync::OnceLock::new(),
         dense_mv_pipes: std::sync::OnceLock::new(),
         gdn_sg_pipes: std::sync::OnceLock::new(),
         moe_down_q4tp_b2,
@@ -22289,7 +22295,9 @@ fn weight_buffer_l(
         }
         if c.resident.load(Ordering::Relaxed) + len > c.vram_budget {
             RES_REFUSED.fetch_add(1, Ordering::Relaxed);
-            if tier_bytes.is_none() {
+            // Only with a tier: the copy below is the whole tensor, and with
+            // the tier off `host_tier_put` drops it unread.
+            if tier_bytes.is_none() && host_tier_cache_admissible(full_quant.len()) {
                 host_tier_put(key, std::sync::Arc::new(full_quant.to_vec()));
             }
             return None; // still no room — honest CPU
@@ -22319,6 +22327,11 @@ fn weight_buffer_l(
         // second model in the Vulkan allocator. A fixed chunk class keeps the
         // speed and bounds the transient peak.
         let chunk = upload_chunk_bytes().next_multiple_of(4);
+        // Staging copies of the previous chunks still in flight: the card
+        // copies chunk i while the host fills chunk i + 1 (at most two
+        // outstanding, so the transient stays two chunk classes).
+        let mut in_flight: Vec<wgpu::Buffer> = Vec::with_capacity(2);
+        let threads = upload_threads();
         for (ci, src) in full_quant.chunks(chunk).enumerate() {
             let n = src.len().next_multiple_of(4) as u64;
             let stg = c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -22340,7 +22353,43 @@ fn weight_buffer_l(
                 };
                 // Write-only by construction: mapped upload memory may be
                 // uncached, so wgpu hands out a slice you may write but not read.
-                view.slice(..src.len()).copy_from_slice(src);
+                // The copy out of the mapped file is the upload's wall (one
+                // thread faulting the mmap in at ~1 GB/s): split it across
+                // `upload_threads()` (CMF_GPU_UPLOAD_THREADS=1: one thread).
+                {
+                    let mut dst = view.slice(..src.len());
+                    if threads > 1 && src.len() >= 4 << 20 {
+                        let part = src.len().div_ceil(threads).next_multiple_of(4096);
+                        // Disjoint ranges of the mapped staging memory, one a
+                        // thread, written (never read) before the scope ends
+                        // — `WriteOnly`'s own contract for raw access from
+                        // several threads.
+                        let base = dst.as_raw_element_ptr().as_ptr() as usize;
+                        std::thread::scope(|s| {
+                            let mut off = 0usize;
+                            while off < src.len() {
+                                let take = part.min(src.len() - off);
+                                let piece = &src[off..off + take];
+                                let at = base + off;
+                                s.spawn(move || {
+                                    // SAFETY: [at, at + take) lies inside the
+                                    // mapped write range and no other thread
+                                    // touches it; `piece` is a disjoint source.
+                                    unsafe {
+                                        std::ptr::copy_nonoverlapping(
+                                            piece.as_ptr(),
+                                            at as *mut u8,
+                                            take,
+                                        )
+                                    }
+                                });
+                                off += take;
+                            }
+                        });
+                    } else {
+                        dst.copy_from_slice(src);
+                    }
+                }
                 if src.len() < n as usize {
                     view.slice(src.len()..).fill(0);
                 }
@@ -22354,8 +22403,15 @@ fn weight_buffer_l(
             submit(c, finish_enc(enc));
             // The staging buffer must outlive the copy; polling before it is
             // dropped also lets the allocator reuse this same chunk class.
+            in_flight.push(stg);
+            if in_flight.len() >= 2 {
+                let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+                in_flight.clear();
+            }
+        }
+        if !in_flight.is_empty() {
             let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
-            drop(stg);
+            in_flight.clear();
         }
     } else if full_quant.len() % 4 == 0 {
         c.queue.write_buffer(&buf, 0, full_quant);
@@ -22379,7 +22435,14 @@ fn weight_buffer_l(
             layer: incoming_layer,
         },
     );
-    if tier_bytes.is_none() {
+    // Only with a RAM tier (`CMF_RAM_TIER_MB`): `to_vec` is the whole
+    // tensor, and with the tier off `host_tier_put` dropped it unread — a
+    // 12 GB Gemma-4 file paid ~9 s of first-use copies for nothing.
+    // `CMF_TIER_COPY_ALWAYS=1`: the historical unconditional copy.
+    if tier_bytes.is_none()
+        && (host_tier_cache_admissible(full_quant.len())
+            || std::env::var("CMF_TIER_COPY_ALWAYS").as_deref() == Ok("1"))
+    {
         host_tier_put(key, std::sync::Arc::new(full_quant.to_vec()));
     }
     Some(buf)
@@ -27398,8 +27461,22 @@ pub fn forward_token_graph(
                                 && g.dv % 4 == 0
                                     && g.dv % 4 == 0
                             });
-                        let xg_ck = if xg.is_some() { 64 } else { 0 };
-                        let nc = mcap.div_ceil(if xg.is_some() { 64 } else { ATTEND_X_CK });
+                        // Gemma-4: the GQA-shared 64-position split with
+                        // eight query heads a workgroup and 512-wide heads
+                        // (`gemma_batch::dec_pipe`); same partial layout and
+                        // merge. `CMF_G4_DEC=0`: the per-head split below.
+                        // Past ATTEND_SPLIT_MIN only: at a short context its
+                        // two workgroups a layer lose to one a head.
+                        let g4dec = gemma_batch::dec_pipe(c).filter(|_| {
+                            g.v_norm
+                                && hg.is_none()
+                                && xg.is_none()
+                                && n > ATTEND_SPLIT_MIN
+                                && gemma_batch::dec_fits(nh, g.nkv, hd, g.dv)
+                        });
+                        let ck64 = xg.is_some() || g4dec.is_some();
+                        let xg_ck = if ck64 { 64 } else { 0 };
+                        let nc = mcap.div_ceil(if ck64 { 64 } else { ATTEND_X_CK });
                         c.queue.write_buffer(
                             kvx_u,
                             0,
@@ -27503,7 +27580,46 @@ pub fn forward_token_graph(
                             pass.dispatch_workgroups(((g.nkv * hd) as u32).div_ceil(256), 1, 1);
                         }
                         ts_point!(enc, 22); // rope + kv append
-                        if let (Some((pg, pg_l)), false) = (xg, skip_attn) {
+                        if let (Some((dpp, dpl)), false) = (g4dec, skip_attn) {
+                            let xacc = GraphScratch::ensure(
+                                &c.device,
+                                &mut gs.xacc,
+                                (nh * nc * g.dv * 4) as u64,
+                                st,
+                                "g-xacc",
+                            );
+                            let xml = GraphScratch::ensure(
+                                &c.device,
+                                &mut gs.xml,
+                                (nh * nc * 8) as u64,
+                                st,
+                                "g-xml",
+                            );
+                            let bg_part = bind_pairs(
+                                c,
+                                dpl,
+                                &[
+                                    (0, &qout),
+                                    (1, kbuf),
+                                    (2, vbuf),
+                                    (4, atx_u),
+                                    (6, &xacc),
+                                    (7, &xml),
+                                ],
+                            );
+                            let bg_merge = bind_pairs(
+                                c,
+                                &gx.merge_l,
+                                &[(3, &attn), (4, atx_u), (5, &sink_b), (6, &xacc), (7, &xml)],
+                            );
+                            let mut pass = begin_pass(&mut enc);
+                            pass.set_pipeline(dpp);
+                            pass.set_bind_group(0, &bg_part, &[]);
+                            pass.dispatch_workgroups(nh.div_ceil(8) as u32, n.div_ceil(64) as u32, 1);
+                            pass.set_pipeline(&gx.merge);
+                            pass.set_bind_group(0, &bg_merge, &[]);
+                            pass.dispatch_workgroups(nh as u32, 1, 1);
+                        } else if let (Some((pg, pg_l)), false) = (xg, skip_attn) {
                             let xacc = GraphScratch::ensure(
                                 &c.device,
                                 &mut gs.xacc,
@@ -28261,10 +28377,26 @@ pub fn forward_token_graph(
             // and let within-pass serialization do the same job for free.
             // CMF_PASSFUSE=0 puts it back in its own pass.
             let mut ffn_pre: Option<(&wgpu::ComputePipeline, wgpu::BindGroup, u32)> = None;
+            // Gemma sandwich, fused: rms(ob)·attn_out_norm, the residual add
+            // and the FFN norm in one dispatch (`gemma_batch::sandwich_pipe`,
+            // bit-identical to the two below). `CMF_G4_FUSE=0`: two.
+            let mut sw_mix_done = false;
+            if let (Some(w), Some(_), false) = (l.attn_out_norm, ob2.as_ref(), skip_norm) {
+                if let Some((sp, sl)) = gemma_batch::sandwich_pipe(c, hidden) {
+                    let won = stor(bytemuck::cast_slice(w));
+                    let sbg = bgc(64, li, sl, &[&ob, &won, &h_buf, &pnw, &n1, &rms_u]);
+                    if fuse_pre {
+                        ffn_pre = Some((sp, sbg, 1));
+                    } else {
+                        go(&mut enc, sp, &sbg, 1);
+                    }
+                    sw_mix_done = true;
+                }
+            }
             // Gemma sandwich: the mixer output is RMS-normed (its own
             // weights) into ob2 before the residual add reads it.
             let mix_out = match (l.attn_out_norm, ob2.as_ref()) {
-                (Some(w), Some(o2)) => {
+                (Some(w), Some(o2)) if !sw_mix_done => {
                     let won = stor(bytemuck::cast_slice(w));
                     go(
                         &mut enc,
@@ -28276,7 +28408,7 @@ pub fn forward_token_graph(
                 }
                 _ => &ob,
             };
-            if !skip_norm {
+            if !skip_norm && !sw_mix_done {
                 let nbg = bgc(
                     23,
                     li,
@@ -29284,19 +29416,6 @@ pub fn forward_token_graph(
                 // scale rides its `_p` word). The last layer reuses the same
                 // dispatch for the add and scale; its norm output is unused
                 // (the head normalizes h itself).
-                let tail_src = match (l.ffn_out_norm, ob2.as_ref()) {
-                    (Some(w), Some(o2)) => {
-                        let wfn = stor(bytemuck::cast_slice(w));
-                        go(
-                            &mut enc,
-                            &c.rmsnorm,
-                            &bgc(61, li, &c.layout_rmsnorm, &[&ob, &wfn, o2, &rms_u]),
-                            1,
-                        );
-                        o2
-                    }
-                    _ => &ob,
-                };
                 let tail_u = uniform_u32x4(
                     c,
                     [
@@ -29311,17 +29430,44 @@ pub fn forward_token_graph(
                 } else {
                     pnw.clone()
                 };
-                go(
-                    &mut enc,
-                    &c.add_rmsnorm,
-                    &bgc(
-                        62,
-                        li,
-                        &c.layout_add_rmsnorm,
-                        &[&h_buf, tail_src, &next_w, &n1, &tail_u],
-                    ),
-                    1,
-                );
+                // Fused (`gemma_batch::sandwich_pipe`): the FFN output norm,
+                // the scaled residual add and the next input norm in one
+                // dispatch, bit-identical to the pair below.
+                let sw_tail = match (l.ffn_out_norm, ob2.as_ref()) {
+                    (Some(w), Some(_)) => gemma_batch::sandwich_pipe(c, hidden).map(|(sp, sl)| {
+                        let wfn = stor(bytemuck::cast_slice(w));
+                        (sp, bgc(65, li, sl, &[&ob, &wfn, &h_buf, &next_w, &n1, &tail_u]))
+                    }),
+                    _ => None,
+                };
+                if let Some((sp, sbg)) = sw_tail {
+                    go(&mut enc, sp, &sbg, 1);
+                } else {
+                    let tail_src = match (l.ffn_out_norm, ob2.as_ref()) {
+                        (Some(w), Some(o2)) => {
+                            let wfn = stor(bytemuck::cast_slice(w));
+                            go(
+                                &mut enc,
+                                &c.rmsnorm,
+                                &bgc(61, li, &c.layout_rmsnorm, &[&ob, &wfn, o2, &rms_u]),
+                                1,
+                            );
+                            o2
+                        }
+                        _ => &ob,
+                    };
+                    go(
+                        &mut enc,
+                        &c.add_rmsnorm,
+                        &bgc(
+                            62,
+                            li,
+                            &c.layout_add_rmsnorm,
+                            &[&h_buf, tail_src, &next_w, &n1, &tail_u],
+                        ),
+                        1,
+                    );
+                }
             } else if li + 1 < layers.len() {
                 if loop_norm_at.contains(&li) {
                     // h += ob; n1 = rms(h, final_norm); copy n1→h; n1 = rms(h, next_input_norm)
@@ -29893,7 +30039,9 @@ pub fn forward_batch_graph_at(
     let g4_model = layers.iter().any(|l| {
         matches!(&l.attn, crate::gpu::GraphAttn::Full { geom: Some(g), .. } if g.v_norm)
     });
+    let t_g4p = std::time::Instant::now();
     let g4p = if g4_model { gemma_batch::pipes(c) } else { None };
+    let g4p_ms = t_g4p.elapsed().as_secs_f64() * 1e3;
     if g4_model && g4p.is_none() {
         bgraph_refused("Gemma-4 batch kernels unavailable (CMF_G4_BATCH=0 or rejected)");
         return batch_outcome(o1_started || state_started, false);
@@ -30217,6 +30365,7 @@ pub fn forward_batch_graph_at(
     // file's speculative verify declined every round and spun.
     let gemmable =
         |m: &GMat| matches!(m.kind, 0 | 1 | 5 | 6 | 9) || (m.kind == 7 && c.graph_x.is_some());
+    let t_resolve = std::time::Instant::now();
     let mut lws = Vec::with_capacity(layers.len());
     let mut gdn_dims: Option<(usize, usize, usize, usize, usize, usize)> = None;
     for l in layers {
@@ -30443,6 +30592,7 @@ pub fn forward_batch_graph_at(
         };
         lws.push(LW { attn, ffn: bffn });
     }
+    let resolve_ms = t_resolve.elapsed().as_secs_f64() * 1e3;
     // Recurrent state and exact-KV mirrors must enter this batch at the same
     // absolute position. Validate all cursors before allocating the batch
     // scratch or uploading a sealed O(1) mirror; otherwise a later refusal
@@ -33190,8 +33340,10 @@ pub fn forward_batch_graph_at(
     if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
         let post = t_enc_done.elapsed().as_secs_f64() * 1e3;
         eprintln!(
-            "batch-graph: encode {:.1} ms | gpu+readback {:.1} ms",
+            "batch-graph: encode {:.1} ms (weights resolve {:.1}, Gemma-4 kernels {:.1}) | gpu+readback {:.1} ms",
             t_bfn.elapsed().as_secs_f64() * 1e3 - post,
+            resolve_ms,
+            g4p_ms,
             post,
         );
     }
@@ -41506,6 +41658,23 @@ fn upload_staged() -> bool {
 /// occupied 33.5 GB, and its 29.3 GB Q8_2F twin OOMed a 46 GB A40 before the
 /// fallback could run. Fixed-size chunks let the allocator reuse one small
 /// class while the final device-local buffers remain budget-accounted.
+/// Host threads copying a staged weight chunk out of the mapped file
+/// (`CMF_GPU_UPLOAD_THREADS`, default min(8, cores)). One thread faulted a
+/// 12 GB Gemma-4 file in at ~1 GB/s: a one-shot run's first token waited
+/// ~11 s on it.
+fn upload_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CMF_GPU_UPLOAD_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism().map_or(1, |n| n.get()).min(8)
+            })
+            .max(1)
+    })
+}
+
 fn upload_chunk_bytes() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
