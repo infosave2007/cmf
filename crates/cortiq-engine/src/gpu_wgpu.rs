@@ -27537,10 +27537,17 @@ pub fn forward_token_graph(
                             pass.set_pipeline(&gx.merge);
                             pass.set_bind_group(0, &bg_merge, &[]);
                             pass.dispatch_workgroups(nh as u32, 1, 1);
-                        } else if !skip_attn && g.window.is_none() && n > ATTEND_SPLIT_MIN {
+                        } else if !skip_attn
+                            && (g.window.is_none() || (g.v_norm && hg.is_none()))
+                            && n > ATTEND_SPLIT_MIN
+                        {
                             // Long full-context layer: chunks across
                             // workgroups, then a per-head merge (same pass —
                             // dispatch order makes the partials visible).
+                            // Gemma-4's 1024-position sliding layers too: one
+                            // workgroup per head walking four chunks in turn
+                            // was ~10 ms of a 1k-context token (16 workgroups
+                            // on a 70-SM card); the part kernels are ring-aware.
                             let used = n.div_ceil(ATTEND_X_CK);
                             let xacc = GraphScratch::ensure(
                                 &c.device,
