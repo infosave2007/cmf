@@ -35,6 +35,9 @@ pub struct SamplerScratch {
     cand_parts: Vec<Vec<(u32, f32)>>,
     sum_parts: Vec<f32>,
     sparse: Sparse,
+    /// Set by `sparse_distribution_into`: the top-p nucleus closed inside
+    /// the candidates (false = the candidate cap cut it short).
+    sparse_cut: bool,
 }
 
 impl SamplerScratch {
@@ -153,6 +156,72 @@ impl Default for SamplerConfig {
     }
 }
 
+/// Keys a file may carry in `header.provenance.sampling`
+/// (`cortiq convert --sampling`). `max_tokens` is the completion budget a
+/// request gets when it names none (`run -n`, the server's `max_tokens`).
+pub const FILE_SAMPLING_KEYS: [&str; 7] = [
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "repetition_penalty",
+    "presence_penalty",
+    "max_tokens",
+];
+
+/// The file's default completion budget (`header.provenance.sampling.
+/// max_tokens`), when it carries one.
+pub fn file_max_tokens(provenance: Option<&serde_json::Value>) -> Option<u32> {
+    provenance
+        .and_then(|p| p.get("sampling"))
+        .and_then(|s| s.get("max_tokens"))
+        .and_then(|v| v.as_u64())
+        .filter(|&n| n > 0)
+        .map(|n| n.min(u32::MAX as u64) as u32)
+}
+
+impl SamplerConfig {
+    /// The engine defaults with the file's own sampling recommendation on
+    /// top: `header.provenance.sampling` (written by `cortiq convert
+    /// --sampling`, e.g. a rewriting model trained and evaluated at
+    /// temperature 1.0 / top-p 0.95 / no top-k / no min-p / no repetition
+    /// penalty). Keys the file does not set keep the engine default;
+    /// explicit flags and request fields still override both.
+    pub fn from_provenance(provenance: Option<&serde_json::Value>) -> Self {
+        let mut c = Self::default();
+        let Some(s) = provenance.and_then(|p| p.get("sampling")) else {
+            return c;
+        };
+        let f = |k: &str| s.get(k).and_then(|v| v.as_f64()).filter(|v| v.is_finite());
+        if let Some(v) = f("temperature") {
+            c.temperature = v as f32;
+        }
+        if let Some(v) = f("top_p") {
+            c.top_p = v as f32;
+        }
+        if let Some(v) = s.get("top_k").and_then(|v| v.as_u64()) {
+            c.top_k = v.min(u32::MAX as u64) as u32;
+        }
+        if let Some(v) = f("min_p") {
+            c.min_p = v as f32;
+        }
+        if let Some(v) = f("repetition_penalty") {
+            c.repetition_penalty = v as f32;
+        }
+        if let Some(v) = f("presence_penalty") {
+            c.presence_penalty = v as f32;
+        }
+        c
+    }
+
+    /// True when the file carries a sampling recommendation.
+    pub fn file_has_defaults(provenance: Option<&serde_json::Value>) -> bool {
+        provenance
+            .and_then(|p| p.get("sampling"))
+            .is_some_and(|s| s.as_object().is_some_and(|o| !o.is_empty()))
+    }
+}
+
 /// Sample next token from logits. Chain order is fixed:
 /// rep-penalty → temperature → softmax → min-p → top-k → top-p → sample.
 pub fn sample(
@@ -226,6 +295,26 @@ pub fn sample_with_scratch_pool(
         };
         scratch.sparse = sp;
         return t;
+    }
+    // Top-p with top-k OFF (the humanizer's 0.95 over Gemma's 262k vocab):
+    // the nucleus nearly always closes inside the SPARSE_TOPK_MAX largest
+    // logits, and then top-k at that cap keeps exactly what top-k off keeps
+    // — so the sparse chain serves it. A nucleus that does not close there
+    // (a flat row) falls through to the dense chain. The dense pass over
+    // the whole vocab was ~9 ms of a ~44 ms decode token.
+    if nucleus_sparse_ok(config, logits.len()) {
+        let capped = SamplerConfig {
+            top_k: SPARSE_TOPK_MAX as u32,
+            ..config.clone()
+        };
+        let mut sp = std::mem::take(&mut scratch.sparse);
+        let ok = sparse_distribution_into(logits, &capped, past_tokens, scratch, pool, &mut sp);
+        if ok && scratch.sparse_cut {
+            let t = draw_sparse(&sp, rng);
+            scratch.sparse = sp;
+            return t;
+        }
+        scratch.sparse = sp;
     }
     let mut probs = std::mem::take(&mut scratch.probs);
     let normalized = chain(logits, config, past_tokens, scratch, pool, &mut probs);
@@ -437,6 +526,20 @@ pub const SPARSE_TOPK_MAX: usize = 256;
 /// Whether `config` can go through the sparse chain: a real temperature
 /// and a top-k in 1..=256. Qwen's recommended instruct settings
 /// (0.7 / top-p 0.8 / top-k 20 / presence 1.5) do.
+/// Top-p without top-k over a vocabulary much larger than the sparse cap.
+fn nucleus_sparse_ok(config: &SamplerConfig, vocab: usize) -> bool {
+    config.top_k == 0
+        && config.temperature >= 1e-6
+        && config.top_p > 0.0
+        && config.top_p < 1.0
+        && vocab > SPARSE_TOPK_MAX * 4
+        && {
+            // `CMF_NUCLEUS_SPARSE=0` keeps the dense chain (A/B).
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| std::env::var("CMF_NUCLEUS_SPARSE").as_deref() != Ok("0"))
+        }
+}
+
 pub fn sparse_ok(config: &SamplerConfig) -> bool {
     config.temperature >= 1e-6 && config.top_k > 0 && (config.top_k as usize) <= SPARSE_TOPK_MAX
 }
@@ -508,6 +611,7 @@ pub fn sparse_distribution_into(
         let min_p = config.min_p;
         let mut cum = 0.0f32;
         let mut cut = false;
+        scratch.sparse_cut = false;
         for &(id, l) in cand.iter() {
             if cut {
                 break;
@@ -526,6 +630,7 @@ pub fn sparse_distribution_into(
                 cut = true;
             }
         }
+        scratch.sparse_cut = cut;
         // renormalise over the survivors and order by id
         let sum: f32 = out.iter().map(|c| c.1).sum();
         if sum > 0.0 {
@@ -1119,6 +1224,81 @@ fn apply_top_k(probs: &mut [f32], k: usize, sel: &mut Vec<f32>) {
 /// sorted — after top-k that is ≤ k elements, not the whole vocab; the
 /// kept set is marked in-place instead of a per-token HashSet.
 fn apply_top_p(probs: &mut [f32], top_p: f32) {
+    if apply_top_p_head(probs, top_p) {
+        return;
+    }
+    apply_top_p_full(probs, top_p);
+}
+
+/// Top-p from the head of the distribution, without sorting the vocab:
+/// partition out the `TOP_P_HEAD` largest probabilities, sort only those,
+/// and find the cutoff there. Keeps exactly what `apply_top_p_full` keeps
+/// — every probability above the cutoff value, and of those EQUAL to it
+/// the lowest indices first (the stable sort's order) — and declines
+/// (false, `probs` untouched) when the nucleus does not close inside the
+/// head or a tie at the cutoff reaches past it. A 262k vocab with no top-k
+/// (Gemma-4 humanizer: top-p 0.95, top-k off) paid a full 262k sort per
+/// token on the host: ~40 ms of a ~70 ms token.
+const TOP_P_HEAD: usize = 1024;
+
+fn apply_top_p_head(probs: &mut [f32], top_p: f32) -> bool {
+    let n = probs.len();
+    if n <= TOP_P_HEAD * 4 {
+        return false;
+    }
+    let mut head: Vec<(usize, f32)> = probs
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|&(_, p)| p > 0.0)
+        .collect();
+    if head.len() <= TOP_P_HEAD {
+        return false;
+    }
+    let by_desc = |a: &(usize, f32), b: &(usize, f32)| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    };
+    head.select_nth_unstable_by(TOP_P_HEAD - 1, by_desc);
+    head.truncate(TOP_P_HEAD);
+    head.sort_by(by_desc);
+    let mut cumsum = 0.0f32;
+    let mut cut = None;
+    for (i, &(_, prob)) in head.iter().enumerate() {
+        cumsum += prob;
+        if cumsum >= top_p {
+            cut = Some(i);
+            break;
+        }
+    }
+    let Some(cut) = cut else {
+        return false;
+    };
+    let v = head[cut].1;
+    // How many of the kept entries carry the cutoff value; the full sort
+    // keeps exactly that many of the value's lowest indices.
+    let keep_eq = head[..=cut].iter().filter(|&&(_, p)| p == v).count();
+    // A tie group that spills past the head could hide lower indices the
+    // partition left out: the full sort decides then.
+    if head[TOP_P_HEAD - 1].1 == v {
+        return false;
+    }
+    let mut eq_seen = 0usize;
+    for p in probs.iter_mut() {
+        if *p > v {
+            continue;
+        }
+        if *p == v && eq_seen < keep_eq {
+            eq_seen += 1;
+            continue;
+        }
+        *p = 0.0;
+    }
+    true
+}
+
+fn apply_top_p_full(probs: &mut [f32], top_p: f32) {
     let mut indexed: Vec<(usize, f32)> = probs
         .iter()
         .copied()
@@ -1649,6 +1829,106 @@ mod tests {
         let mut scratch = SamplerScratch::default();
         apply_repetition_penalty(&mut logits, &[1, 1, 2, 1, 2], 2.0, &mut scratch);
         assert_eq!(logits, vec![1.0, 2.0, -12.0]);
+    }
+
+    /// Top-p with top-k off through the capped sparse chain: when the
+    /// nucleus closes inside the cap, the support and probabilities are the
+    /// dense chain's (top-k 0), as for the sparse chain proper.
+    #[test]
+    fn nucleus_sparse_matches_the_dense_top_p() {
+        let n = 50_000usize;
+        let mut closed = 0;
+        for seed in 0..8u64 {
+            let mut r = SplitMix64::new(500 + seed);
+            let logits: Vec<f32> = (0..n)
+                .map(|i| {
+                    let base = ((r.next_u64() % 3000) as f32 - 1500.0) / 300.0;
+                    if i % 997 == 0 { base + 14.0 } else { base }
+                })
+                .collect();
+            let cfg = SamplerConfig {
+                temperature: 1.0,
+                top_p: 0.95,
+                top_k: 0,
+                min_p: 0.0,
+                repetition_penalty: 1.0,
+                ..Default::default()
+            };
+            assert!(nucleus_sparse_ok(&cfg, n));
+            let mut sd = SamplerScratch::default();
+            let mut dense = Vec::new();
+            distribution_into(&logits, &cfg, &[], &mut sd, None, &mut dense);
+            let capped = SamplerConfig { top_k: SPARSE_TOPK_MAX as u32, ..cfg.clone() };
+            let mut ss = SamplerScratch::default();
+            let mut sp = Vec::new();
+            let ok = sparse_distribution_into(&logits, &capped, &[], &mut ss, None, &mut sp);
+            if !(ok && ss.sparse_cut) {
+                continue;
+            }
+            closed += 1;
+            let dense_nz: Vec<(u32, f32)> = dense
+                .iter()
+                .enumerate()
+                .filter(|&(_, &v)| v > 0.0)
+                .map(|(i, &v)| (i as u32, v))
+                .collect();
+            assert_eq!(dense_nz.len(), sp.len(), "seed {seed}");
+            for (a, b) in dense_nz.iter().zip(sp.iter()) {
+                assert_eq!(a.0, b.0, "seed {seed}: ids differ");
+                assert!((a.1 - b.1).abs() <= 2e-5 * a.1.max(1e-3), "seed {seed}: {} vs {}", a.1, b.1);
+            }
+        }
+        assert!(closed >= 4, "the nucleus closed inside the cap only {closed} times");
+    }
+
+    /// The head-only top-p keeps exactly what the full sort keeps, ties at
+    /// the cutoff included (few distinct values on purpose).
+    #[test]
+    fn top_p_head_matches_the_full_sort() {
+        for seed in 0..40u64 {
+            let mut r = SplitMix64::new(seed);
+            let n = 20_000usize;
+            let flat = seed % 3 == 0;
+            let raw: Vec<f32> = (0..n)
+                .map(|i| {
+                    let u = r.next_f32();
+                    if flat {
+                        ((r.next_u64() % 7) as f32) * 0.5
+                    } else if i % 97 == 0 {
+                        8.0 + 4.0 * u
+                    } else {
+                        u * 3.0
+                    }
+                })
+                .collect();
+            let mut probs = raw.clone();
+            softmax_inplace_pool(None, &mut probs);
+            for &tp in &[0.5f32, 0.9, 0.95, 0.999] {
+                let mut a = probs.clone();
+                let mut b = probs.clone();
+                apply_top_p(&mut a, tp);
+                apply_top_p_full(&mut b, tp);
+                assert_eq!(a, b, "seed {seed} top_p {tp}");
+            }
+        }
+    }
+
+    #[test]
+    fn file_sampling_defaults_override_only_what_they_set() {
+        let none = SamplerConfig::from_provenance(None);
+        assert_eq!(none.top_k, SamplerConfig::default().top_k);
+        let p = serde_json::json!({"sampling": {
+            "temperature": 1.0, "top_p": 0.95, "top_k": 0, "min_p": 0.0,
+            "repetition_penalty": 1.0
+        }});
+        let c = SamplerConfig::from_provenance(Some(&p));
+        assert_eq!(
+            (c.temperature, c.top_p, c.top_k, c.min_p, c.repetition_penalty),
+            (1.0, 0.95, 0, 0.0, 1.0)
+        );
+        assert_eq!(c.presence_penalty, SamplerConfig::default().presence_penalty);
+        assert!(SamplerConfig::file_has_defaults(Some(&p)));
+        assert!(!SamplerConfig::file_has_defaults(Some(&serde_json::json!({}))));
     }
 
     #[test]

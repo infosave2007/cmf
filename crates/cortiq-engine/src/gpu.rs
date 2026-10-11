@@ -1073,6 +1073,10 @@ pub struct MoeJob<'a> {
     /// the difference only shows on saturating activations, which is the
     /// hardest kind of divergence to notice.
     pub swiglu_limit: f32,
+    /// `GraphAct::code` of act(gate)·up: 0 SiLU (every MoE expert), 1 exact
+    /// GELU, 2 tanh-GELU (a Gemma dense FFN riding the single-job block).
+    /// A backend without the activation must refuse the job.
+    pub act: u32,
 }
 
 /// A single independent batch matvec (GDN projections of one input).
@@ -1635,7 +1639,11 @@ pub enum GraphAttn<'a> {
 pub struct GraphAttnGeom<'a> {
     /// KV heads of this layer (divides the Q heads).
     pub nkv: usize,
-    /// V head width, `4 <= dv <= head_dim`, a multiple of 4.
+    /// Q/K head width of this layer. The call-wide `hd` for every model
+    /// but Gemma-4, whose global layers are 512 wide over 256-wide sliding
+    /// ones (`<= 512`, a multiple of 4).
+    pub hd: usize,
+    /// V head width, `4 <= dv <= hd`, a multiple of 4.
     pub dv: usize,
     /// Rotary width of this layer (NeoX half-split over `[0, rd)`).
     pub rd: usize,
@@ -1652,6 +1660,9 @@ pub struct GraphAttnGeom<'a> {
     /// Learned per-Q-head sink logits (gpt-oss / MiMo-V2): they join the
     /// softmax max and denominator and carry no value row.
     pub sink: Option<&'a [f32]>,
+    /// Gemma-4's scale-less V norm: every V head is RMS-normalized (no
+    /// weight) before it is cached, as `attention::vnorm_head` does.
+    pub v_norm: bool,
 }
 
 /// Activation of a graph layer's dense FFN, `act(gate)·up`. The code is
@@ -1663,6 +1674,9 @@ pub enum GraphAct {
     /// Exact erf GELU (HF `gelu`), erf by Abramowitz–Stegun 7.1.26 — the
     /// formula `inference::erf_f32` uses on the host.
     GeluErf,
+    /// tanh-approximated GELU (HF `gelu_pytorch_tanh`, the Gemma family):
+    /// `inference::gelu_tanh` term for term.
+    GeluTanh,
 }
 
 impl GraphAct {
@@ -1670,6 +1684,7 @@ impl GraphAct {
         match self {
             Self::Silu => 0,
             Self::GeluErf => 1,
+            Self::GeluTanh => 2,
         }
     }
 }
@@ -1680,6 +1695,13 @@ pub struct GraphLayer<'a> {
     pub attn: GraphAttn<'a>,
     pub post_norm: &'a [f32],
     pub ffn: GraphFfn<'a>,
+    /// Gemma sandwich norms: the token mixer's output and the FFN's output
+    /// are RMS-normed with these weights before their residual adds.
+    pub attn_out_norm: Option<&'a [f32]>,
+    pub ffn_out_norm: Option<&'a [f32]>,
+    /// Gemma-4 `layer_scalar`: the residual stream is multiplied by it at
+    /// the end of the layer.
+    pub layer_scale: Option<f32>,
 }
 
 /// The FFN of one graph layer: a dense SwiGLU trio, or a routed MoE —
@@ -1952,6 +1974,13 @@ pub fn mimo_attention_scratch_scope<R>(enabled: bool, f: impl FnOnce() -> R) -> 
     }
     let _restore = Restore(MIMO_ATTN_SCRATCH.with(|v| v.replace(enabled)));
     f()
+}
+
+/// Gemma-4's prompt on the batched wgpu graph (`CMF_G4_BATCH=0` keeps the
+/// chunked host prefill it used before).
+pub fn g4_batch_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_G4_BATCH").as_deref() != Ok("0"))
 }
 
 /// q8_2f MoE experts on the wgpu token and batch graphs (`CMF_MOE_Q82=0`
@@ -2696,7 +2725,7 @@ pub fn q4_ffn_act(
     match act {
         GraphAct::Silu if q4tp => q4tp_ffn(model, w1, w3, w2, xs, b, hidden, inter, out),
         GraphAct::Silu => q4t_ffn(model, w1, w3, w2, xs, b, hidden, inter, out),
-        GraphAct::GeluErf => match backend() {
+        GraphAct::GeluErf | GraphAct::GeluTanh => match backend() {
             #[cfg(feature = "gpu")]
             Backend::Wgpu => crate::gpu_wgpu::q4_ffn_act(
                 model,
@@ -3766,6 +3795,10 @@ pub fn gdn_block(
 #[allow(unused_variables)]
 pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> bool {
     match backend() {
+        // The Metal block applies SiLU only: any other activation is an
+        // honest refusal (the caller keeps its host path).
+        #[cfg(target_os = "macos")]
+        Backend::Metal if jobs.iter().any(|j| j.act != 0) => false,
         #[cfg(target_os = "macos")]
         Backend::Metal => crate::gpu_metal::moe_block(model, jobs, out),
         #[cfg(feature = "gpu")]
