@@ -27443,7 +27443,9 @@ pub fn forward_token_graph(
                                 rope_uniform_words(0, g.nkv, g.dv, 0, 0, 4, eps, 0, 1.0),
                             );
                             let ones = stor(bytemuck::cast_slice(&GRAPH_ONES[..g.dv]));
-                            let bg_vn = bg(
+                            let bg_vn = bgc(
+                                63,
+                                li,
                                 &c.layout_attn_rope,
                                 &[&qraw, &vb, &qout, &gout, &qnw, &ones, &invf_l, &vn_u],
                             );
