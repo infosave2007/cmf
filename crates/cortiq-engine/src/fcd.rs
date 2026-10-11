@@ -1089,8 +1089,17 @@ enum AttnActs {
     },
 }
 
+/// Trained attention weights of a full-layer FCD layer, in place of the
+/// frozen `LayerMats`/head gate for one forward.
+#[derive(Clone, Copy)]
+pub(crate) struct AttnW<'a> {
+    pub(crate) wqkv: &'a [f32],
+    pub(crate) wo: &'a [f32],
+    pub(crate) head_gate: Option<&'a [f32]>,
+}
+
 pub(crate) struct LayerActs {
-    inv1: Vec<f32>,
+    pub(crate) inv1: Vec<f32>,
     attn: AttnActs,
     pub(crate) h1: Vec<f32>,
     pub(crate) n2: Vec<f32>,
@@ -1098,6 +1107,25 @@ pub(crate) struct LayerActs {
     pub(crate) gpre: Vec<f32>,
     pub(crate) upre: Vec<f32>,
     pub(crate) act: Vec<f32>,
+}
+
+impl LayerActs {
+    /// The full-attention activations a full-layer FCD backward needs:
+    /// (qrot, krot, vproj, ao, head_gain) — None for GDN layers or when
+    /// the forward did not keep them.
+    pub(crate) fn attn_full(&self) -> Option<(&[f32], &[f32], &[f32], &[f32], &[f32])> {
+        match &self.attn {
+            AttnActs::Full {
+                qrot,
+                krot,
+                vproj,
+                ao,
+                head_gain,
+                ..
+            } if !qrot.is_empty() => Some((qrot, krot, vproj, ao, head_gain)),
+            _ => None,
+        }
+    }
 }
 
 /// Disjoint-write pointer for pooled per-head scatter (pipeline pattern).
@@ -1283,8 +1311,26 @@ impl FcdModel {
     /// Per-head RMS-norm (qk-norm) + partial RoPE for all rows of a
     /// projection buffer. `heads` per row, `x` is `[n, heads·hd]`.
     /// Saves the per-(row, head) rms inv when a norm gain is present.
+    /// (window, local-RoPE) of a full-attention layer — None for GDN.
+    pub(crate) fn attn_geometry(&self, li: usize) -> Option<(Option<usize>, bool)> {
+        match &self.layers[li].attn {
+            FcdAttn::Full {
+                window, local_rope, ..
+            } => Some((*window, *local_rope)),
+            _ => None,
+        }
+    }
+
+    /// The frozen per-head gate projection of a layer (Spark-X2.5), if any.
+    pub(crate) fn head_gate_weights(&self, li: usize) -> Option<&[f32]> {
+        match &self.layers[li].attn {
+            FcdAttn::Full { head_gate, .. } => head_gate.as_deref(),
+            _ => None,
+        }
+    }
+
     /// The RoPE geometry of a layer: local layers may own a table.
-    fn layer_rope(&self, local: bool) -> (usize, &[f64]) {
+    pub(crate) fn layer_rope(&self, local: bool) -> (usize, &[f64]) {
         if local {
             (
                 self.rotary_dim_local.unwrap_or(self.rotary_dim),
@@ -1341,7 +1387,7 @@ impl FcdModel {
         nystrom: bool,
         want_acts: bool,
     ) -> (Vec<f32>, Option<LayerActs>) {
-        self.layer_forward_scaled(li, h_in, b, t, wts, nystrom, want_acts, None)
+        self.layer_forward_scaled(li, h_in, b, t, wts, nystrom, want_acts, None, true, None, false)
     }
 
     /// `layer_forward` with an optional per-neuron FFN activation scale
@@ -1358,6 +1404,9 @@ impl FcdModel {
         nystrom: bool,
         want_acts: bool,
         ffn_scale: Option<&[f32]>,
+        ffn_planes_to_host: bool,
+        attn_w: Option<AttnW<'_>>,
+        want_attn_acts: bool,
     ) -> (Vec<f32>, Option<LayerActs>) {
         // Polish-only: the flags select what to TRAIN, not what to convert.
         let nystrom = nystrom && !self.polish_only;
@@ -1373,7 +1422,9 @@ impl FcdModel {
         let mats = self.mats(li).expect("layer mats");
         let t_attn = std::time::Instant::now();
         let (attn_out, attn_acts) = match &l.attn {
-            FcdAttn::Full { .. } => self.full_attn_fwd(&l.attn, &mats, &n1, b, t, nystrom),
+            FcdAttn::Full { .. } => {
+                self.full_attn_fwd(&l.attn, &mats, &n1, b, t, nystrom, attn_w, want_attn_acts)
+            }
             FcdAttn::Gdn { .. } => self.gdn_attn_fwd(&l.attn, &n1, b, t),
         };
         prof::add(&prof::ATTN_FWD, t_attn);
@@ -1404,7 +1455,9 @@ impl FcdModel {
         #[cfg(feature = "gpu")]
         if let Some(gu) = wts.gu {
             if crate::gpu::enabled_here() {
-                let mut both = want_acts.then(|| vec![0f32; n * 2 * inter]);
+                // A training call whose backward runs on the card leaves the
+                // plane there: nothing of n×2·inter crosses PCIe.
+                let mut both = (want_acts && ffn_planes_to_host).then(|| vec![0f32; n * 2 * inter]);
                 let t_chain = std::time::Instant::now();
                 let chained = crate::gpu_wgpu::ffn_chain_f32(
                     &n2,
@@ -1497,6 +1550,7 @@ impl FcdModel {
     /// Full-attention forward: projections (+optional biases), optional
     /// per-head [q; gate] split (Qwen3.5 output gate), qk-norm + RoPE,
     /// per-head exact-or-Nyström attention, σ(gate) multiply, o_proj.
+    #[allow(clippy::too_many_arguments)]
     fn full_attn_fwd(
         &self,
         attn: &FcdAttn,
@@ -1505,8 +1559,14 @@ impl FcdModel {
         b: usize,
         t: usize,
         nystrom: bool,
+        attn_w: Option<AttnW<'_>>,
+        want_attn_acts: bool,
     ) -> (Vec<f32>, AttnActs) {
-        let (wqkv, wo) = (&mats.wqkv[..], &mats.wo[..]);
+        // Trained copies (full-layer FCD) stand in for the frozen mats.
+        let (wqkv, wo) = match attn_w {
+            Some(w) => (w.wqkv, w.wo),
+            None => (&mats.wqkv[..], &mats.wo[..]),
+        };
         let FcdAttn::Full {
             qrows: _,
             q_norm,
@@ -1535,7 +1595,8 @@ impl FcdModel {
         // row, applied to the whole head — the runtime's
         // `apply_projected_gate(per_head = true, sigmoid = true)`. Computed
         // once here; both the device chain and the host path consume it.
-        let head_gain: Vec<f32> = match head_gate {
+        let head_gate_w: Option<&[f32]> = attn_w.and_then(|w| w.head_gate).or(head_gate.as_deref());
+        let head_gain: Vec<f32> = match head_gate_w {
             Some(gw) => {
                 let mut graw = vec![0f32; n * nh];
                 ops::gemm_nt(n1, gw, &mut graw, n, hsz, nh, pool);
@@ -1554,7 +1615,7 @@ impl FcdModel {
         // the reference.
         #[cfg(feature = "gpu")]
         if !nystrom && crate::gpu::enabled_here() {
-            let want_acts = self.attn_acts;
+            let want_acts = self.attn_acts || want_attn_acts;
             let rope = {
                 let mut rt = self.rope_tab.lock().unwrap();
                 match rt.as_ref() {
@@ -1989,7 +2050,7 @@ impl FcdModel {
             if let Some(gu) = wts.gu {
                 if crate::gpu::enabled_here()
                     && crate::gpu_wgpu::ffn_bwd_chain_f32(
-                        dh2, wts.down, gu, li, &mut dn2, n, hsz, inter, self.act,
+                        dh2, wts.down, gu, li, &mut dn2, n, hsz, inter, self.act, None, None,
                     )
                 {
                     bwd_fused = true;
