@@ -157,15 +157,28 @@ impl Default for SamplerConfig {
 }
 
 /// Keys a file may carry in `header.provenance.sampling`
-/// (`cortiq convert --sampling`).
-pub const FILE_SAMPLING_KEYS: [&str; 6] = [
+/// (`cortiq convert --sampling`). `max_tokens` is the completion budget a
+/// request gets when it names none (`run -n`, the server's `max_tokens`).
+pub const FILE_SAMPLING_KEYS: [&str; 7] = [
     "temperature",
     "top_p",
     "top_k",
     "min_p",
     "repetition_penalty",
     "presence_penalty",
+    "max_tokens",
 ];
+
+/// The file's default completion budget (`header.provenance.sampling.
+/// max_tokens`), when it carries one.
+pub fn file_max_tokens(provenance: Option<&serde_json::Value>) -> Option<u32> {
+    provenance
+        .and_then(|p| p.get("sampling"))
+        .and_then(|s| s.get("max_tokens"))
+        .and_then(|v| v.as_u64())
+        .filter(|&n| n > 0)
+        .map(|n| n.min(u32::MAX as u64) as u32)
+}
 
 impl SamplerConfig {
     /// The engine defaults with the file's own sampling recommendation on
