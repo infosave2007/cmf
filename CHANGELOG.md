@@ -26,14 +26,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Gemma-4 dense models run on the wgpu whole-token graph: per-layer head
   width (512-wide global layers over 256-wide sliding ones), the scale-less
   V norm, sandwich norms and the layer scalar. humanizer q8_2f on an RTX PRO
-  4000: decode 7.2 → 32.9 tok/s (`bench --core`), logits against HF
+  4000: decode 7.2 → 31.7 tok/s (`bench --core`), logits against HF
   transformers (bf16) on 5,320 prompt positions: top-1 97.7 %, KL 2.1e-3.
   Gemma-2/3 keep the per-op path until measured the same way.
 - tanh-GELU (`gelu_pytorch_tanh`) in the device FFN kernels: Gemma dense
   FFNs run on the card in decode and prefill instead of the host.
 - Top-p without top-k samples from the head of the distribution instead of
   sorting the vocabulary every token (exact; ~40 ms a token at a 262k
-  vocab). Gemma's final-logit soft-capping runs on the worker pool.
+  vocab), and from the 256 largest logits when the nucleus closes inside
+  them (humanizer q8_2f sampled decode in `serve`: 21.8 → 24.7 tok/s;
+  `CMF_NUCLEUS_SPARSE=0` keeps the dense chain). Gemma's final-logit
+  soft-capping runs on the worker pool.
+
+### Fixed
+- `cortiq serve` `/v1/completions` prepends the tokenizer's BOS to a raw
+  prompt, as `run --raw` and the chat template do. A Gemma prompt reached
+  the model without `<bos>` (the humanizer's raw prompt: 437 ids instead of
+  438, and a rewrite that differed from the chat endpoint's).
 
 ## [0.8.15] - 2026-10-10
 
