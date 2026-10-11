@@ -1934,7 +1934,10 @@ async fn completions(
         Ok(Some((d, outcome))) => {
             match &outcome {
                 LookupOutcome::Answer(a) => {
-                    let prompt_tokens = state.tokenizer.encode(&req.prompt).len() as u32;
+                    let prompt_tokens = state
+                        .tokenizer
+                        .with_bos(state.tokenizer.encode(&req.prompt))
+                        .len() as u32;
                     return Json(CompletionsResponse {
                         id: format!("cmf-{}", uuid::Uuid::new_v4()),
                         object: "text_completion".to_string(),
@@ -1967,7 +1970,11 @@ async fn completions(
             lookup_outcome = Some(outcome);
         }
     }
-    let prompt_ids = state.tokenizer.encode(&prompt);
+    // A raw completion starts a fresh context: the tokenizer's BOS contract
+    // holds here as in `run --raw` and the chat template. Without it a
+    // Gemma prompt is one token short of what the model was trained on
+    // (the humanizer's raw-prompt rewrite drifted from the chat one).
+    let prompt_ids = state.tokenizer.with_bos(state.tokenizer.encode(&prompt));
 
     let (result, elapsed_ms, decision) = match run_generation(
         state.clone(),
