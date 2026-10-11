@@ -1073,6 +1073,10 @@ pub struct MoeJob<'a> {
     /// the difference only shows on saturating activations, which is the
     /// hardest kind of divergence to notice.
     pub swiglu_limit: f32,
+    /// `GraphAct::code` of act(gate)·up: 0 SiLU (every MoE expert), 1 exact
+    /// GELU, 2 tanh-GELU (a Gemma dense FFN riding the single-job block).
+    /// A backend without the activation must refuse the job.
+    pub act: u32,
 }
 
 /// A single independent batch matvec (GDN projections of one input).
@@ -1663,6 +1667,9 @@ pub enum GraphAct {
     /// Exact erf GELU (HF `gelu`), erf by Abramowitz–Stegun 7.1.26 — the
     /// formula `inference::erf_f32` uses on the host.
     GeluErf,
+    /// tanh-approximated GELU (HF `gelu_pytorch_tanh`, the Gemma family):
+    /// `inference::gelu_tanh` term for term.
+    GeluTanh,
 }
 
 impl GraphAct {
@@ -1670,6 +1677,7 @@ impl GraphAct {
         match self {
             Self::Silu => 0,
             Self::GeluErf => 1,
+            Self::GeluTanh => 2,
         }
     }
 }
@@ -2696,7 +2704,7 @@ pub fn q4_ffn_act(
     match act {
         GraphAct::Silu if q4tp => q4tp_ffn(model, w1, w3, w2, xs, b, hidden, inter, out),
         GraphAct::Silu => q4t_ffn(model, w1, w3, w2, xs, b, hidden, inter, out),
-        GraphAct::GeluErf => match backend() {
+        GraphAct::GeluErf | GraphAct::GeluTanh => match backend() {
             #[cfg(feature = "gpu")]
             Backend::Wgpu => crate::gpu_wgpu::q4_ffn_act(
                 model,
@@ -3766,6 +3774,10 @@ pub fn gdn_block(
 #[allow(unused_variables)]
 pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> bool {
     match backend() {
+        // The Metal block applies SiLU only: any other activation is an
+        // honest refusal (the caller keeps its host path).
+        #[cfg(target_os = "macos")]
+        Backend::Metal if jobs.iter().any(|j| j.act != 0) => false,
         #[cfg(target_os = "macos")]
         Backend::Metal => crate::gpu_metal::moe_block(model, jobs, out),
         #[cfg(feature = "gpu")]

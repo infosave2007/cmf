@@ -3873,6 +3873,11 @@ fn cmf_erf(x: f32) -> f32 {
 fn cmf_gelu_erf(x: f32) -> f32 {
     return 0.5 * x * (1.0 + cmf_erf(x * 0.70710678));
 }
+// tanh GELU (HF `gelu_pytorch_tanh`, the Gemma family) — `inference::gelu_tanh`
+// term for term: 0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³))).
+fn cmf_gelu_tanh(x: f32) -> f32 {
+    return 0.5 * x * (1.0 + tanh(0.7978846 * (x + 0.044715 * x * x * x)));
+}
 
 @group(0) @binding(0) var<storage, read>       sg   : array<f32>;
 @group(0) @binding(1) var<storage, read>       su   : array<f32>;
@@ -3895,8 +3900,9 @@ fn silu_mul_pre(@builtin(global_invocation_id) gid: vec3<u32>,
     }
     var v = (gv / (1.0 + exp(-gv))) * uv;
     // `_c` = the dense FFN's activation (`GraphAct::code`): 0 SiLU above,
-    // 1 exact GELU.
+    // 1 exact GELU, 2 tanh-GELU.
     if (snp._c == 1u) { v = cmf_gelu_erf(gv) * uv; }
+    if (snp._c == 2u) { v = cmf_gelu_tanh(gv) * uv; }
     if (snp.f == 1u) { v = v * scol[i]; }
     sact[i] = v;
 }
@@ -4112,9 +4118,12 @@ fn ffn_silu_mul(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.y * (65535u * 256u) + gid.x;
     if (i >= fsp.n) { return; }
     let g = fsg[i];
-    // `_c` = `GraphAct::code`: 0 SiLU (the historical expression), 1 GELU.
+    // `_c` = `GraphAct::code`: 0 SiLU (the historical expression), 1 GELU,
+    // 2 tanh-GELU.
     if (fsp._c == 1u) {
         fsg[i] = cmf_gelu_erf(g) * fsu[i];
+    } else if (fsp._c == 2u) {
+        fsg[i] = cmf_gelu_tanh(g) * fsu[i];
     } else {
         fsg[i] = (g / (1.0 + exp(-g))) * fsu[i];
     }
@@ -9568,10 +9577,13 @@ fn q4tp_matvec16w_gu(@builtin(workgroup_id) wid: vec3<u32>,
                 ua = clamp(ua, -lim, lim); ub = clamp(ub, -lim, lim);
                 ga = min(ga, lim); gb = min(gb, lim);
             }
-            // `_p1` = `GraphAct::code`: 0 SiLU, 1 exact GELU.
+            // `_p1` = `GraphAct::code`: 0 SiLU, 1 exact GELU, 2 tanh-GELU.
             if (q1p._p1 == 1u) {
                 if (r0 < rows) { q1y[r0] = cmf_gelu_erf(ga) * ua; }
                 if (r1 < rows) { q1y[r1] = cmf_gelu_erf(gb) * ub; }
+            } else if (q1p._p1 == 2u) {
+                if (r0 < rows) { q1y[r0] = cmf_gelu_tanh(ga) * ua; }
+                if (r1 < rows) { q1y[r1] = cmf_gelu_tanh(gb) * ub; }
             } else {
                 if (r0 < rows) { q1y[r0] = (ga / (1.0 + exp(-ga))) * ua; }
                 if (r1 < rows) { q1y[r1] = (gb / (1.0 + exp(-gb))) * ub; }
@@ -9874,10 +9886,13 @@ fn q4tp_matvec16nl_gu(@builtin(workgroup_id) wid: vec3<u32>,
                 ua = clamp(ua, -lim, lim); ub = clamp(ub, -lim, lim);
                 ga = min(ga, lim); gb = min(gb, lim);
             }
-            // `_p1` = `GraphAct::code`: 0 SiLU, 1 exact GELU.
+            // `_p1` = `GraphAct::code`: 0 SiLU, 1 exact GELU, 2 tanh-GELU.
             if (q1p._p1 == 1u) {
                 if (r0 < rows) { q1y[r0] = cmf_gelu_erf(ga) * ua; }
                 if (r1 < rows) { q1y[r1] = cmf_gelu_erf(gb) * ub; }
+            } else if (q1p._p1 == 2u) {
+                if (r0 < rows) { q1y[r0] = cmf_gelu_tanh(ga) * ua; }
+                if (r1 < rows) { q1y[r1] = cmf_gelu_tanh(gb) * ub; }
             } else {
                 if (r0 < rows) { q1y[r0] = (ga / (1.0 + exp(-ga))) * ua; }
                 if (r1 < rows) { q1y[r1] = (gb / (1.0 + exp(-gb))) * ub; }
@@ -26263,6 +26278,7 @@ pub fn forward_token_graph(
     let silu_u = uniform_u32x4(c, [inter as u32, 0, 0, 0]);
     // The exact-GELU twin (`silu_mul_pre`'s `_c` = 1) for GELU layers.
     let gelu_u = uniform_u32x4(c, [inter as u32, 0, 0, 1]);
+    let gelu_tanh_u = uniform_u32x4(c, [inter as u32, 0, 0, 2]);
     let steps = steps.max(1);
     // One uniform PER STEP, with stable identities: write_buffer lands at
     // submit, so a single shared buffer would collapse every step to the
@@ -28198,7 +28214,11 @@ pub fn forward_token_graph(
                     let inter = *width; // this layer's, not the model's
                     let act = *act;
                     // act(gate)·up's uniform: SiLU's is the historical one.
-                    let act_u = if act == 0 { &silu_u } else { &gelu_u };
+                    let act_u = match act {
+                        0 => &silu_u,
+                        2 => &gelu_tanh_u,
+                        _ => &gelu_u,
+                    };
                     let mut continue_ffn = false;
                     // DUAL (CMF_MV_DUAL=1): gate and up in ONE dispatch —
                     // the elimination table's verdict was the wave drain
@@ -40076,7 +40096,7 @@ pub fn ffn_act_keep(
     let Some(c) = ctx() else { return false };
     let panel = (b * inter * 4) as u64;
     if b == 0
-        || act > 1
+        || act > 2
         || xs.len() < b * hidden
         || out.len() < b * hidden
         || panel > PANEL_BUDGET_BYTES as u64
@@ -40700,7 +40720,7 @@ fn ffn_q4(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
-    if hidden % 32 != 0 || inter % 32 != 0 || b == 0 || act > 1 {
+    if hidden % 32 != 0 || inter % 32 != 0 || b == 0 || act > 2 {
         return false;
     }
     let bytes = model.primary_bytes();
@@ -45070,11 +45090,11 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
             encode_matvec(c, &mut enc, gw, &xsg, &grs_b, &g_buf, *gr, *gc);
             encode_matvec(c, &mut enc, uw, &xsu, &urs_b, &u_buf, *ur, *uc);
         }
-        // act = silu(g)·u·col_down
+        // act = act(g)·u·col_down (`_c` = the job's `GraphAct::code`)
         {
             let np = uniform_u32x4(
                 c,
-                [inter as u32, has_col as u32, j.swiglu_limit.to_bits(), 0],
+                [inter as u32, has_col as u32, j.swiglu_limit.to_bits(), j.act],
             );
             let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
@@ -50034,6 +50054,13 @@ fn main() {
         gu_matches_three_dispatches(2048, 1);
     }
 
+    /// The tanh-GELU arm (act word 2: the Gemma family, Gemma-4 humanizer).
+    #[test]
+    fn wgpu_q4tp_matvec16w_gu_gelu_tanh_matches_three_dispatches() {
+        gu_matches_three_dispatches(4096, 2);
+        gu_matches_three_dispatches(2048, 2);
+    }
+
     fn gu_matches_three_dispatches(cols: usize, act_code: u32) {
         unsafe { std::env::set_var("CMF_GPU", "wgpu") };
         let Some(c) = ctx() else {
@@ -50147,6 +50174,7 @@ fn main() {
         // The device activation against the host's formula on the same g, u.
         let host = |gv: f32, uv: f32| match act_code {
             0 => crate::inference::silu(gv) * uv,
+            2 => crate::inference::gelu_tanh(gv) * uv,
             _ => crate::inference::gelu_erf(gv) * uv,
         };
         let worst = a

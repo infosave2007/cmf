@@ -536,7 +536,8 @@ impl Act {
         match self {
             Self::Silu => Some(crate::gpu::GraphAct::Silu),
             Self::Gelu => Some(crate::gpu::GraphAct::GeluErf),
-            Self::GeluTanh | Self::Situ { .. } => None,
+            Self::GeluTanh => Some(crate::gpu::GraphAct::GeluTanh),
+            Self::Situ { .. } => None,
         }
     }
 }
@@ -17815,10 +17816,9 @@ fn dense_ffn_gpu(d: &DenseFfn, x: &[f32], _pool: Option<&Pool>) -> Option<Vec<f3
     {
         return None;
     }
-    // The GPU block hardcodes SiLU; GeLU FFNs (Gemma) stay on CPU.
-    if d.act != Act::Silu {
-        return None;
-    }
+    // The GPU block applies SiLU, exact GELU and tanh-GELU (Gemma); other
+    // activations stay on the CPU.
+    d.act.graph_act()?;
     // Threshold: tiny FFNs are not worth a submission (q1 excepted —
     // see the caller's gate).
     if d.gate_proj.rows() < crate::gpu::min_rows() && !d.gate_proj.is_q1() {
@@ -18190,6 +18190,7 @@ pub(crate) fn moe_push_job_parts<'a>(
         q4tp: gq4 && (gq2 || gate.mapped_q4tp().is_some()),
         gu_q2: gq2,
         swiglu_limit,
+        act: 0,
     });
     Some(())
 }
@@ -18203,9 +18204,9 @@ fn moe_push_job<'a>(
     model_ref: &mut Option<std::sync::Arc<cortiq_core::CmfModel>>,
 ) -> Option<()> {
     use crate::qtensor::prescale;
-    if d.act != Act::Silu {
-        return None; // GPU block hardcodes SiLU
-    }
+    // The block's act(gate)·up pass takes the activation's code (SiLU,
+    // exact GELU, tanh-GELU); anything without a device form stays home.
+    let act = d.act.graph_act()?.code();
     let (gm, gi, gr, gc, grs, gcf, gq1, gq4, gq2) = moe_parts(&d.gate_proj)?;
     let (_, ui, ur, uc, urs, ucf, uq1, uq4, uq2) = moe_parts(&d.up_proj)?;
     let (_, di, dr, dc, drs, dcf, dq1, dq4, dq2) = moe_parts(&d.down_proj)?;
@@ -18242,6 +18243,7 @@ fn moe_push_job<'a>(
         q4tp: gq4 && (gq2 || d.gate_proj.mapped_q4tp().is_some()),
         gu_q2: gq2,
         swiglu_limit: 0.0,
+        act,
     });
     Some(())
 }
