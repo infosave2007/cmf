@@ -26,6 +26,11 @@
 //!
 //! `CMF_G4_BATCH=0` keeps Gemma-4 on the chunked host prefill;
 //! `CMF_G4_MM=0` keeps the batch graph's eight-row q8_2f arm.
+//!
+//! Two token-graph (decode) kernels live here too: `g4_attend_dec`, the
+//! GQA-shared split attend past 256 positions (`CMF_G4_DEC=0`: the
+//! per-head split), and `g4_sandwich`, the sandwich residual in one
+//! dispatch (bit-identical; `CMF_G4_FUSE=0`: two dispatches).
 
 use super::*;
 
