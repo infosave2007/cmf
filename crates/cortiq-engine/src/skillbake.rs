@@ -2812,7 +2812,12 @@ pub fn skill_bake(
                 } else {
                     cur.ppl < best_b.0.ppl
                 };
-                if better {
+                // CMF_BAKE_B_TAKE_LAST=1: the correction the recipe prescribes
+                // (Patent 2 §4.5: one light FCD step) ships as trained — a
+                // held set of a few verdicts per family cannot veto it on noise;
+                // its score is still logged.
+                let take_last = std::env::var("CMF_BAKE_B_TAKE_LAST").is_ok_and(|v| v == "1");
+                if better || (take_last && step + 1 == hy.steps_b) {
                     best_b = (cur.clone(), Some(ffn.clone()));
                     best_attn = attn_tr.clone();
                 }
@@ -2823,6 +2828,9 @@ pub fn skill_bake(
                     score_suffix(&cur),
                     best_b.0.ppl
                 ));
+                if let Some(line) = tag_line(&cur) {
+                    log(&format!("    per tag: {line}"));
+                }
             }
         }
     }
