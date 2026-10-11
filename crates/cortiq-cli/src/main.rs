@@ -466,6 +466,13 @@ enum Commands {
             value_name = "text|mm-only|multimodal"
         )]
         mimo_towers: String,
+        /// Record the model's recommended sampling in the file, e.g.
+        /// `temperature=1.0,top_p=0.95,top_k=0,min_p=0,repetition_penalty=1.0`
+        /// (keys: temperature, top_p, top_k, min_p, repetition_penalty,
+        /// presence_penalty). `run` and `serve` start from it; flags and
+        /// request fields still override it.
+        #[arg(long, value_name = "KEY=VALUE,...")]
+        sampling: Option<String>,
     },
     /// Embeddings from an EmbeddingGemma 2 .cmf (`cortiq convert --model
     /// <google/embeddinggemma-2 dir>`): texts, images (--image), videos
@@ -800,20 +807,23 @@ enum Commands {
         /// Greedy decoding (temperature 0) — gates and base models
         #[arg(long)]
         greedy: bool,
-        /// Sampling temperature (default 0.7; ignored with --greedy)
+        /// Sampling temperature (default: the file's sampling defaults when
+        /// it carries them, else 0.7; ignored with --greedy)
         #[arg(long, conflicts_with = "greedy")]
         temperature: Option<f32>,
-        /// Repetition penalty (default 1.1; 1.0 disables — better for code,
-        /// where repeated identifiers are the point, not a defect)
+        /// Repetition penalty (default: the file's, else 1.1; 1.0 disables —
+        /// better for code, where repeated identifiers are the point, not a
+        /// defect)
         #[arg(long, conflicts_with = "greedy")]
         rep_penalty: Option<f32>,
-        /// Nucleus cutoff (Qwen3.8: 0.95 thinking, 0.80 instruct)
+        /// Nucleus cutoff (default: the file's, else 0.9; Qwen3.8: 0.95
+        /// thinking, 0.80 instruct)
         #[arg(long)]
         top_p: Option<f32>,
-        /// Top-k cutoff (Qwen3.8: 20)
+        /// Top-k cutoff, 0 = off (default: the file's, else 40; Qwen3.8: 20)
         #[arg(long)]
         top_k: Option<u32>,
-        /// Min-p floor (Qwen3.8: 0.0)
+        /// Min-p floor, 0 = off (default: the file's, else 0.05; Qwen3.8: 0.0)
         #[arg(long)]
         min_p: Option<f32>,
         /// Flat penalty on every already-seen token (Qwen3.8 instruct: 1.5)
@@ -2826,8 +2836,10 @@ async fn main() -> anyhow::Result<()> {
             o1_sink,
             mtp_sidecar,
             mimo_towers,
+            sampling,
         } => {
             let towers = convert::parse_mimo_towers(&mimo_towers)?;
+            convert::set_sampling_defaults(sampling.as_deref())?;
             // Qwen3.8-Flash-Next: the MTP head is a hyper-connected hybrid
             // layer with its own 512 experts; it converts through the normal
             // walk (expert split, skeleton policy) from the 31-tensor source
@@ -5952,7 +5964,21 @@ async fn cmd_run(
             }
         }
     }
-    let mut sampler = SamplerConfig::default();
+    // The file's own sampling recommendation (`convert --sampling`) is the
+    // starting point; every flag below still overrides it.
+    let prov = model.header.provenance.as_ref();
+    let mut sampler = SamplerConfig::from_provenance(prov);
+    if SamplerConfig::file_has_defaults(prov) && !greedy {
+        eprintln!(
+            "sampling: the file's defaults (temperature {}, top-p {}, top-k {}, min-p {}, \
+             repetition penalty {}); flags override",
+            sampler.temperature,
+            sampler.top_p,
+            sampler.top_k,
+            sampler.min_p,
+            sampler.repetition_penalty
+        );
+    }
     if greedy {
         sampler.temperature = 0.0;
         sampler.repetition_penalty = 1.0;
@@ -6970,6 +6996,14 @@ async fn cmd_info(model_path: &str, tensors: Option<&str>) -> anyhow::Result<()>
             "sidecar required"
         }
     );
+    if let Some(s) = model
+        .header
+        .provenance
+        .as_ref()
+        .and_then(|p| p.get("sampling"))
+    {
+        println!("  Sampling:    {s} (file defaults for run / serve)");
+    }
     println!(
         "  MTP:         {}",
         match &arch.mtp {

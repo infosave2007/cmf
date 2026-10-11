@@ -681,15 +681,36 @@ async fn run_classification(
 struct SamplerOptions {
     temperature: Option<f32>,
     top_p: Option<f32>,
+    /// vLLM / llama.cpp extras: top-k (0 or negative = off) and the
+    /// min-p floor (0 = off).
+    top_k: Option<i64>,
+    min_p: Option<f32>,
     seed: Option<u64>,
     repetition_penalty: Option<f32>,
     presence_penalty: Option<f32>,
 }
 
+/// The sampler a request starts from: the engine defaults, overlaid with
+/// the file's own recommendation (`header.provenance.sampling`, written by
+/// `cortiq convert --sampling`).
+fn file_sampler(state: &AppState) -> SamplerConfig {
+    SamplerConfig::from_provenance(state.runtime.model().header.provenance.as_ref())
+}
+
+#[cfg(test)]
 fn request_sampler(opts: SamplerOptions) -> Result<SamplerConfig, Response> {
+    request_sampler_from(SamplerConfig::default(), opts)
+}
+
+fn request_sampler_from(
+    base: SamplerConfig,
+    opts: SamplerOptions,
+) -> Result<SamplerConfig, Response> {
     let SamplerOptions {
         temperature,
         top_p,
+        top_k,
+        min_p,
         seed,
         repetition_penalty,
         presence_penalty,
@@ -718,7 +739,19 @@ fn request_sampler(opts: SamplerOptions) -> Result<SamplerConfig, Response> {
             "presence_penalty must be finite",
         ));
     }
-    let mut config = SamplerConfig::default();
+    if min_p.is_some_and(|v| !v.is_finite() || !(0.0..=1.0).contains(&v)) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "min_p must be finite and between 0 and 1",
+        ));
+    }
+    let mut config = base;
+    if let Some(k) = top_k {
+        config.top_k = k.clamp(0, u32::MAX as i64) as u32;
+    }
+    if let Some(v) = min_p {
+        config.min_p = v;
+    }
     if let Some(v) = temperature {
         config.temperature = v;
         if v < 1e-6 {
@@ -747,10 +780,18 @@ struct ChatCompletionsRequest {
     temperature: Option<f32>,
     top_p: Option<f32>,
     seed: Option<u64>,
+    /// vLLM / llama.cpp extras: top-k (0 or negative = off) and the min-p
+    /// floor (0 = off). Absent = the file's sampling defaults, else the
+    /// engine's (top-k 40, min-p 0.05).
+    #[serde(default)]
+    top_k: Option<i64>,
+    #[serde(default)]
+    min_p: Option<f32>,
     /// vLLM-style extras: multiplicative repetition penalty (the engine
     /// default is 1.1; `temperature: 0` alone makes it 1.0) and a flat
-    /// presence penalty on every seen token.
-    #[serde(default)]
+    /// presence penalty on every seen token. llama.cpp's spelling
+    /// `repeat_penalty` is accepted too.
+    #[serde(default, alias = "repeat_penalty")]
     repetition_penalty: Option<f32>,
     #[serde(default)]
     presence_penalty: Option<f32>,
@@ -1019,13 +1060,18 @@ async fn chat_completions(
         } else {
             state.runtime.active_selection().await
         };
-    let mut sampler_config = match request_sampler(SamplerOptions {
-        temperature: req.temperature,
-        top_p: req.top_p,
-        seed: req.seed,
-        repetition_penalty: req.repetition_penalty,
-        presence_penalty: req.presence_penalty,
-    }) {
+    let mut sampler_config = match request_sampler_from(
+        file_sampler(&state),
+        SamplerOptions {
+            temperature: req.temperature,
+            top_p: req.top_p,
+            top_k: req.top_k,
+            min_p: req.min_p,
+            seed: req.seed,
+            repetition_penalty: req.repetition_penalty,
+            presence_penalty: req.presence_penalty,
+        },
+    ) {
         Ok(config) => config,
         Err(response) => return response,
     };
@@ -1807,6 +1853,14 @@ struct CompletionsRequest {
     prompt: String,
     temperature: Option<f32>,
     #[serde(default)]
+    top_p: Option<f32>,
+    #[serde(default)]
+    top_k: Option<i64>,
+    #[serde(default)]
+    min_p: Option<f32>,
+    #[serde(default)]
+    seed: Option<u64>,
+    #[serde(default, alias = "repeat_penalty")]
     repetition_penalty: Option<f32>,
     #[serde(default)]
     presence_penalty: Option<f32>,
@@ -1837,12 +1891,18 @@ async fn completions(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CompletionsRequest>,
 ) -> Response {
-    let sampler_config = match request_sampler(SamplerOptions {
-        temperature: req.temperature,
-        repetition_penalty: req.repetition_penalty,
-        presence_penalty: req.presence_penalty,
-        ..Default::default()
-    }) {
+    let sampler_config = match request_sampler_from(
+        file_sampler(&state),
+        SamplerOptions {
+            temperature: req.temperature,
+            top_p: req.top_p,
+            top_k: req.top_k,
+            min_p: req.min_p,
+            seed: req.seed,
+            repetition_penalty: req.repetition_penalty,
+            presence_penalty: req.presence_penalty,
+        },
+    ) {
         Ok(config) => config,
         Err(response) => return response,
     };
@@ -2006,6 +2066,41 @@ mod tests {
             ..Default::default()
         })
         .is_err());
+        assert!(request_sampler(SamplerOptions {
+            min_p: Some(1.5),
+            ..Default::default()
+        })
+        .is_err());
+    }
+
+    /// A file's sampling recommendation is the base; request fields win,
+    /// and `top_k: -1` (vLLM's "off") means off.
+    #[test]
+    fn file_sampling_is_the_base_and_requests_override_it() {
+        let base = SamplerConfig::from_provenance(Some(&serde_json::json!({"sampling": {
+            "temperature": 1.0, "top_p": 0.95, "top_k": 0, "min_p": 0.0, "repetition_penalty": 1.0
+        }})));
+        let plain = request_sampler_from(base.clone(), SamplerOptions::default()).unwrap();
+        assert_eq!(
+            (plain.temperature, plain.top_p, plain.top_k, plain.min_p, plain.repetition_penalty),
+            (1.0, 0.95, 0, 0.0, 1.0)
+        );
+        let req: ChatCompletionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "x"}],
+            "top_k": -1, "min_p": 0.1, "repeat_penalty": 1.05
+        }))
+        .unwrap();
+        let over = request_sampler_from(
+            base,
+            SamplerOptions {
+                top_k: req.top_k,
+                min_p: req.min_p,
+                repetition_penalty: req.repetition_penalty,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((over.top_k, over.min_p, over.repetition_penalty), (0, 0.1, 1.05));
     }
 
     /// `temperature: 0` is greedy in the CLI's `--greedy` sense: no
