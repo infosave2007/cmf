@@ -18,11 +18,44 @@
 //! attention branch): the backward walks the residual stream through
 //! the FFN chain only, which is what makes a pure-Rust backward small.
 
-use crate::fcd::{FcdModel, LnFfn};
+use crate::fcd::{FcdModel, LnFfn, act_bwd_rows, add_into_pooled, pooled_rows, rmsnorm_bwd_pooled, rmsnorm_fwd_pooled};
 use crate::fcd_ops as ops;
 use crate::sampler::SplitMix64;
 use cortiq_core::CmfModel;
 use std::sync::Arc;
+
+/// Supervised chat records scored on the assistant's answer only: every
+/// target from the first token after `start` (the rendered generation
+/// prompt, e.g. `<|Bot|></think>`) through the first `end` token (the
+/// turn terminator) carries the LM loss; the prompt is context. This is
+/// the multi-token sibling of `focus_tokens` — a JSON verdict, a number,
+/// a sentence — where a one-token label does not fit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AnswerSpan {
+    /// Token ids of the generation prompt; the answer starts right after
+    /// its LAST occurrence in the record.
+    pub start: Vec<u32>,
+    /// The turn terminator (one token); the last scored target.
+    pub end: u32,
+}
+
+/// The scored target range `(first, last)` (inclusive, indices into
+/// `ids`) of one record, or `None` when the record carries no answer.
+pub fn answer_targets(ids: &[u32], span: &AnswerSpan) -> Option<(usize, usize)> {
+    let m = span.start.len();
+    if m == 0 || ids.len() <= m {
+        return None;
+    }
+    let at = (0..=ids.len() - m).rev().find(|&i| ids[i..i + m] == span.start[..])?;
+    let first = at + m;
+    if first >= ids.len() {
+        return None;
+    }
+    let last = (first..ids.len())
+        .find(|&i| ids[i] == span.end)
+        .unwrap_or(ids.len() - 1);
+    Some((first, last))
+}
 
 /// Hyper-parameters — defaults are the certified recipe.
 #[derive(Clone, Debug)]
@@ -95,6 +128,9 @@ pub struct BakeHyper {
     /// this prevents label names mentioned inside the user instruction from
     /// being mistaken for answer positions.
     pub focus_follow_tokens: Vec<u32>,
+    /// Score the assistant's answer span of each chat record instead of
+    /// every token (or one-token labels). Exclusive with `focus_tokens`.
+    pub answer_span: Option<AnswerSpan>,
 }
 
 impl Default for BakeHyper {
@@ -124,6 +160,7 @@ impl Default for BakeHyper {
             uniform_inter: false,
             focus_tokens: Vec::new(),
             focus_follow_tokens: Vec::new(),
+            answer_span: None,
         }
     }
 }
@@ -294,6 +331,28 @@ fn is_scored_target(
             || (target_index + 1 < sequence_end && follow.contains(&ids[target_index + 1])))
 }
 
+/// The scored target indices (into the flat batch) of the sequence at
+/// `base..base + t`: its answer span, its focused labels, or every
+/// position.
+fn scored_targets(
+    ids: &[u32],
+    base: usize,
+    t: usize,
+    focus: &[u32],
+    follow: &[u32],
+    span: Option<&AnswerSpan>,
+) -> Vec<usize> {
+    match span {
+        Some(sp) => match answer_targets(&ids[base..base + t], sp) {
+            Some((first, last)) => (base + first.max(1)..=base + last).collect(),
+            None => Vec::new(),
+        },
+        None => (base + 1..base + t)
+            .filter(|&target_index| is_scored_target(ids, target_index, base + t, focus, follow))
+            .collect(),
+    }
+}
+
 /// One forward + CE(+optionally backward through the FFN chain).
 /// Returns (nll_sum, tokens). `dmask`/`dffn` accumulate when given.
 struct Pass<'a> {
@@ -308,6 +367,28 @@ struct Pass<'a> {
     focus_tokens: &'a [u32],
     /// Empty means no right-context constraint on focused targets.
     focus_follow_tokens: &'a [u32],
+    /// Answer-span scoring (see `AnswerSpan`); None = focus/all-token.
+    span: Option<&'a AnswerSpan>,
+}
+
+/// Raw-pointer carriers for pooled row writes (disjoint ranges per worker).
+struct SendMutF(*mut f32);
+unsafe impl Send for SendMutF {}
+unsafe impl Sync for SendMutF {}
+impl SendMutF {
+    #[inline]
+    unsafe fn at(&self, i: usize) -> *mut f32 {
+        unsafe { self.0.add(i) }
+    }
+}
+struct SendMutF64(*mut f64);
+unsafe impl Send for SendMutF64 {}
+unsafe impl Sync for SendMutF64 {}
+impl SendMutF64 {
+    #[inline]
+    unsafe fn at(&self, i: usize) -> *mut f64 {
+        unsafe { self.0.add(i) }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -552,6 +633,7 @@ impl Pass<'_> {
     ) -> (f64, usize) {
         let fm = self.fm;
         let hsz = fm.hidden;
+        let pool = fm.pool.as_deref();
         debug_assert!(ids.len() % b.max(1) == 0, "ragged batch");
         let t = ids.len() / b.max(1);
         let n = b * t;
@@ -596,7 +678,7 @@ impl Pass<'_> {
             if fm.loop_norm && li + 1 == nl && vl + 1 < vn {
                 let mut hn = vec![0f32; n * hsz];
                 let mut inv = vec![0f32; n];
-                ops::rmsnorm_fwd(&h, &fm.final_norm, fm.eps, fm.gemma, &mut hn, &mut inv);
+                rmsnorm_fwd_pooled(&h, &fm.final_norm, fm.eps, fm.gemma, &mut hn, &mut inv, pool);
                 if want {
                     lnorms[vl] = Some((h, inv));
                 }
@@ -606,85 +688,90 @@ impl Pass<'_> {
         // Final norm + tied LM head, CE summed over positions 1..t.
         let mut hn = vec![0f32; n * hsz];
         let mut inv = vec![0f32; n];
-        ops::rmsnorm_fwd(&h, &fm.final_norm, fm.eps, fm.gemma, &mut hn, &mut inv);
+        rmsnorm_fwd_pooled(&h, &fm.final_norm, fm.eps, fm.gemma, &mut hn, &mut inv, pool);
         let lm: &[f32] = fm.lm_head.as_deref().unwrap_or(&fm.embed);
         let vocab = lm.len() / hsz;
-        let pool = fm.pool.as_deref();
         let mut nll = 0f64;
         let mut dh_n = vec![0f32; n * hsz]; // dL/d hn
         // Chunk the vocab matmul over positions to bound the logits buf.
         // Positions are walked PER SEQUENCE: the last position of chunk
         // i must not be scored against the first token of chunk i+1.
         const POS_CHUNK: usize = 64;
-        let scored = (0..b)
-            .map(|bi| {
-                let base = bi * t;
-                (base + 1..base + t)
-                    .filter(|&target_index| {
-                        is_scored_target(
-                            ids,
-                            target_index,
-                            base + t,
-                            self.focus_tokens,
-                            self.focus_follow_tokens,
-                        )
-                    })
-                    .count()
+        let targets: Vec<usize> = (0..b)
+            .flat_map(|bi| {
+                scored_targets(
+                    ids,
+                    bi * t,
+                    t,
+                    self.focus_tokens,
+                    self.focus_follow_tokens,
+                    self.span,
+                )
             })
-            .sum::<usize>();
+            .collect();
+        let scored = targets.len();
         if scored == 0 {
             return (0.0, 0);
         }
         if self.focus_tokens.is_empty() {
-            // Ordinary language-model mode still needs the complete
-            // vocabulary distribution at every target position.
-            for bi in 0..b {
-                let base = bi * t;
-                let mut p0 = 0usize;
-                while p0 < t - 1 {
-                    let pc = POS_CHUNK.min(t - 1 - p0);
-                    let mut logits = vec![0f32; pc * vocab];
-                    ops::gemm_nt(
-                        &hn[(base + p0) * hsz..(base + p0 + pc) * hsz],
-                        lm,
-                        &mut logits,
-                        pc,
-                        hsz,
-                        vocab,
-                        pool,
-                    );
-                    for r in 0..pc {
-                        let target_index = base + p0 + r + 1;
-                        let target = ids[target_index] as usize;
-                        let row = &mut logits[r * vocab..(r + 1) * vocab];
-                        let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
-                        let mut sum = 0f64;
-                        for v in row.iter() {
-                            sum += ((*v as f64) - mx).exp();
+            // Ordinary language-model mode: the complete vocabulary
+            // distribution at every scored target — every position, or
+            // the answer span of each record. The scored rows are gathered
+            // so a span pays for its own positions only, not the prompt's.
+            let inv_n = 1.0 / scored as f64;
+            let mut p0 = 0usize;
+            while p0 < scored {
+                let pc = POS_CHUNK.min(scored - p0);
+                let rows = &targets[p0..p0 + pc];
+                let src: Vec<usize> = rows.iter().map(|&target_index| target_index - 1).collect();
+                let hsrc = gather_rows(&hn, &src, hsz);
+                let mut logits = vec![0f32; pc * vocab];
+                ops::gemm_nt(&hsrc, lm, &mut logits, pc, hsz, vocab, pool);
+                for (r, &target_index) in rows.iter().enumerate() {
+                    let target = ids[target_index] as usize;
+                    let row = &mut logits[r * vocab..(r + 1) * vocab];
+                    let (mut mx, mut arg) = (f32::NEG_INFINITY, 0usize);
+                    for (j, &v) in row.iter().enumerate() {
+                        if v > mx {
+                            mx = v;
+                            arg = j;
                         }
-                        nll += mx + sum.ln() - row[target] as f64;
-                        if grad.is_some() {
-                            // dCE/dlogit = softmax − onehot, scaled by 1/scored.
-                            let inv_n = 1.0 / scored as f64;
-                            for v in row.iter_mut() {
-                                *v = ((((*v as f64) - mx).exp() / sum) * inv_n) as f32;
-                            }
-                            row[target] -= inv_n as f32;
+                    }
+                    let mx = mx as f64;
+                    let mut sum = 0f64;
+                    for v in row.iter() {
+                        sum += ((*v as f64) - mx).exp();
+                    }
+                    nll += mx + sum.ln() - row[target] as f64;
+                    // Teacher-forced token accuracy of the answer span — the
+                    // one number a verdict corpus is really graded on.
+                    if let (Some(stats), Some(_)) = (focus_stats.as_deref_mut(), self.span) {
+                        stats.total += 1;
+                        if arg == target {
+                            stats.correct += 1;
                         }
                     }
                     if grad.is_some() {
-                        ops::gemm_dx(
-                            &logits,
-                            lm,
-                            &mut dh_n[(base + p0) * hsz..(base + p0 + pc) * hsz],
-                            pc,
-                            hsz,
-                            vocab,
-                            pool,
-                        );
+                        // dCE/dlogit = softmax − onehot, scaled by 1/scored.
+                        for v in row.iter_mut() {
+                            *v = ((((*v as f64) - mx).exp() / sum) * inv_n) as f32;
+                        }
+                        row[target] -= inv_n as f32;
                     }
-                    p0 += pc;
                 }
+                if grad.is_some() {
+                    let mut dsrc = vec![0f32; pc * hsz];
+                    ops::gemm_dx(&logits, lm, &mut dsrc, pc, hsz, vocab, pool);
+                    for (r, &s) in src.iter().enumerate() {
+                        for (d, &x) in dh_n[s * hsz..(s + 1) * hsz]
+                            .iter_mut()
+                            .zip(&dsrc[r * hsz..(r + 1) * hsz])
+                        {
+                            *d += x;
+                        }
+                    }
+                }
+                p0 += pc;
             }
         } else {
             // Exact classifier mode. Only the declared label rows can enter
@@ -768,13 +855,13 @@ impl Pass<'_> {
         // Backward: final norm, then the FFN chain layer by layer.
         let t_bwd = std::time::Instant::now();
         let mut dh = vec![0f32; n * hsz];
-        ops::rmsnorm_bwd(&h, &fm.final_norm, &inv, &dh_n, fm.gemma, &mut dh, None);
+        rmsnorm_bwd_pooled(&h, &fm.final_norm, &inv, &dh_n, fm.gemma, &mut dh, pool);
         for vl in (0..vn).rev() {
             let li = vl % nl;
             // Undo the loop-boundary norm this step fed into.
             if let Some((hb, inv)) = lnorms[vl].as_ref() {
                 let mut dprev = vec![0f32; n * hsz];
-                ops::rmsnorm_bwd(hb, &fm.final_norm, inv, &dh, fm.gemma, &mut dprev, None);
+                rmsnorm_bwd_pooled(hb, &fm.final_norm, inv, &dh, fm.gemma, &mut dprev, pool);
                 dh = dprev;
             }
             let a = acts[vl].as_ref().expect("acts saved in grad mode");
@@ -788,10 +875,17 @@ impl Pass<'_> {
             if let Some((_, _, dd)) = dffn[li].as_mut() {
                 // dW_down += dhᵀ · act2 (act2 = act·g).
                 let mut act2 = a.act.clone();
-                for r in 0..n {
-                    for (x, &gv) in act2[r * inter..(r + 1) * inter].iter_mut().zip(g) {
-                        *x *= gv;
-                    }
+                {
+                    let ap = SendMutF(act2.as_mut_ptr());
+                    pooled_rows(n, pool, &|lo, hi| {
+                        // SAFETY: disjoint row ranges per worker.
+                        let rows = unsafe { std::slice::from_raw_parts_mut(ap.at(lo * inter), (hi - lo) * inter) };
+                        for row in rows.chunks_exact_mut(inter) {
+                            for (x, &gv) in row.iter_mut().zip(g) {
+                                *x *= gv;
+                            }
+                        }
+                    });
                 }
                 let mut dw = vec![0f32; hsz * inter];
                 ops::gemm_dw(&dh, &act2, &mut dw, n, inter, hsz, fm.pool.as_deref());
@@ -804,40 +898,59 @@ impl Pass<'_> {
             // exactly its own visit's gradient, no cross-visit sum.
             {
                 let dm = &mut dmask[vl];
-                for r in 0..n {
-                    let da = &dact2[r * inter..(r + 1) * inter];
-                    let aa = &a.act[r * inter..(r + 1) * inter];
-                    for j in 0..inter {
-                        dm[j] += da[j] as f64 * aa[j] as f64;
+                // Parallel over neuron ranges: each worker owns a column
+                // span of dm and walks every row for it.
+                let dmp = SendMutF64(dm.as_mut_ptr());
+                let (dact2_r, act_r) = (&dact2, &a.act);
+                pooled_rows(inter.div_ceil(256), pool, &|lo, hi| {
+                    let (js, je) = (lo * 256, (hi * 256).min(inter));
+                    // SAFETY: disjoint column ranges per worker.
+                    let dmj = unsafe { std::slice::from_raw_parts_mut(dmp.at(js), je - js) };
+                    for r in 0..n {
+                        let da = &dact2_r[r * inter + js..r * inter + je];
+                        let aa = &act_r[r * inter + js..r * inter + je];
+                        for ((d, &x), &y) in dmj.iter_mut().zip(da).zip(aa) {
+                            *d += x as f64 * y as f64;
+                        }
                     }
-                }
+                });
                 // σ'(m) folded in once per chunk (constant per neuron).
                 for (j, d) in dm.iter_mut().enumerate() {
                     let _ = j;
                     let _ = d;
                 }
             }
-            // dact = dact2 · g;  silu·mul backward.
+            // dact = dact2 · g;  act·mul backward (pooled).
             let mut dg_pre = vec![0f32; n * inter];
             let mut du_pre = vec![0f32; n * inter];
-            for r in 0..n {
-                for j in 0..inter {
-                    let i = r * inter + j;
-                    let da = dact2[i] * g[j];
-                    let sg = ops::silu(a.gpre[i]);
-                    dg_pre[i] = da * a.upre[i] * ops::silu_bwd(a.gpre[i]);
-                    du_pre[i] = da * sg;
-                }
-            }
+            act_bwd_rows(
+                fm.act,
+                &a.gpre,
+                &a.upre,
+                &dact2,
+                Some(g),
+                &mut dg_pre,
+                &mut du_pre,
+                n,
+                inter,
+                fm.pool.as_deref(),
+            );
             // dn2 = dg_pre @ gate + du_pre @ up — one fused submit when
             // the frozen concat exists; the trained-copy path keeps two.
             let mut dn2 = vec![0f32; n * hsz];
             if let Some(gu) = wts.gu {
                 let mut dgu = vec![0f32; n * 2 * inter];
-                for r in 0..n {
-                    let row = &mut dgu[r * 2 * inter..(r + 1) * 2 * inter];
-                    row[..inter].copy_from_slice(&dg_pre[r * inter..(r + 1) * inter]);
-                    row[inter..].copy_from_slice(&du_pre[r * inter..(r + 1) * inter]);
+                {
+                    let gp = SendMutF(dgu.as_mut_ptr());
+                    let (dgr, dur) = (&dg_pre, &du_pre);
+                    pooled_rows(n, pool, &|lo, hi| {
+                        for r in lo..hi {
+                            // SAFETY: disjoint rows per worker.
+                            let row = unsafe { std::slice::from_raw_parts_mut(gp.at(r * 2 * inter), 2 * inter) };
+                            row[..inter].copy_from_slice(&dgr[r * inter..(r + 1) * inter]);
+                            row[inter..].copy_from_slice(&dur[r * inter..(r + 1) * inter]);
+                        }
+                    });
                 }
                 ops::gemm_dx(&dgu, gu, &mut dn2, n, hsz, 2 * inter, fm.pool.as_deref());
             } else {
@@ -879,7 +992,7 @@ impl Pass<'_> {
             // Post-norm backward into h1; the attention branch carries
             // no gradient (frozen), so dh1 flows straight to dh_in.
             let mut dh1 = dh.clone(); // residual h2 = h1 + ffn
-            ops::rmsnorm_bwd(&a.h1, wts.pln, &a.inv2, &dn2, fm.gemma, &mut dh1, None);
+            rmsnorm_bwd_pooled(&a.h1, wts.pln, &a.inv2, &dn2, fm.gemma, &mut dh1, pool);
             dh = dh1;
             let _ = &h_ins[vl];
         }
@@ -889,6 +1002,30 @@ impl Pass<'_> {
 }
 
 /// Held-out PPL with the hard mask (and Phase-B weights when present).
+/// The device chains' phase timers (0 weights, 1 submit→poll, 2 copies);
+/// zero without the gpu feature.
+fn chain_prof(i: usize) -> f64 {
+    #[cfg(feature = "gpu")]
+    {
+        crate::gpu_wgpu::chain_prof_take(i)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = i;
+        0.0
+    }
+}
+
+/// " | acc X% bal Y%" (focused classes), " | tok-acc X%" (answer span),
+/// or nothing (all-token LM).
+fn score_suffix(score: &HeldScore) -> String {
+    match (score.accuracy, score.balanced_accuracy) {
+        (Some(a), Some(b)) => format!(" | acc {:.2}% bal {:.2}%", a * 100.0, b * 100.0),
+        (Some(a), None) => format!(" | tok-acc {:.2}%", a * 100.0),
+        _ => String::new(),
+    }
+}
+
 fn held_ppl(pass: &Pass, held: &[Vec<u32>]) -> f64 {
     held_score(pass, held).ppl
 }
@@ -908,8 +1045,19 @@ fn held_score(pass: &Pass, held: &[Vec<u32>]) -> HeldScore {
     let mut nll = 0f64;
     let mut n = 0usize;
     let mut stats = FocusStats::new(pass.focus_tokens.len());
-    const GROUP: usize = 32;
-    for group in held.chunks(GROUP) {
+    // Up to 32 records per pass, bounded by tokens: 32 x 3072-token chat
+    // records made a 98k-row pass whose gate+up plane (n x 2*inter f32)
+    // crossed the 2 GiB device binding limit and panicked wgpu.
+    // 8k tokens keeps a 4 B model's gate+up plane (n × 20480 f32) under
+    // the 2 GiB binding ceiling once the scratch rounds up; CMF_BAKE_EVAL_TOKENS
+    // overrides.
+    const GROUP_MAX: usize = 32;
+    let group_tokens: usize = std::env::var("CMF_BAKE_EVAL_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8_192);
+    let group_n = (group_tokens / held[0].len().max(1)).clamp(1, GROUP_MAX);
+    for group in held.chunks(group_n) {
         let t = group[0].len();
         if group.iter().all(|c| c.len() == t) {
             let flat: Vec<u32> = group.iter().flatten().copied().collect();
@@ -1025,7 +1173,7 @@ fn cached_fcd_run(
     for row in 0..rows {
         for column in 0..inter {
             let at = row * inter + column;
-            act[at] = ops::silu(gate_pre[at]) * up_pre[at] * gate[column];
+            act[at] = fm.act.fwd(gate_pre[at]) * up_pre[at] * gate[column];
         }
     }
     let mut ffn = vec![0f32; rows * hidden];
@@ -1129,8 +1277,8 @@ fn cached_fcd_run(
         for column in 0..inter {
             let at = row * inter + column;
             let da = dact[at] * gate[column];
-            dg_pre[at] = da * up_pre[at] * ops::silu_bwd(gate_pre[at]);
-            du_pre[at] = da * ops::silu(gate_pre[at]);
+            dg_pre[at] = da * up_pre[at] * fm.act.bwd(gate_pre[at]);
+            du_pre[at] = da * fm.act.fwd(gate_pre[at]);
         }
     }
     let mut dg = vec![0f32; inter * hidden];
@@ -1222,6 +1370,7 @@ pub fn replica_score_file_mask(
             ffn: &ffn,
             focus_tokens: &[],
             focus_follow_tokens: &[],
+            span: None,
         };
         held_ppl(&pass, chunks)
     };
@@ -1244,7 +1393,11 @@ pub fn skill_bake(
         sink: 1,
         rect: crate::nystrom::O1_DEFAULT_RECT,
     };
-    let fm = FcdModel::from_cmf(model, &o1_off, false)?;
+    let mut fm = FcdModel::from_cmf(model, &o1_off, false)?;
+    // The bake's backward never enters attention (frozen, residual
+    // through-path only), so the attention activations are dead weight:
+    // on the device chain they were ~700 MB of PCIe readback per layer.
+    fm.attn_acts = false;
     let nl = fm.layers.len();
     let inter = fm.layers.iter().map(|l| l.inter).max().unwrap_or(0);
     let held: Vec<Vec<u32>> = chunks[..held_n.min(chunks.len())].to_vec();
@@ -1275,6 +1428,7 @@ pub fn skill_bake(
             ffn: &ffn,
             focus_tokens: &hy.focus_tokens,
             focus_follow_tokens: &hy.focus_follow_tokens,
+            span: hy.answer_span.as_ref(),
         };
         let score = held_score(&pass, &held);
         let keep: Vec<Vec<bool>> = fm
@@ -1365,16 +1519,13 @@ pub fn skill_bake(
         ffn: &ffn,
         focus_tokens: &hy.focus_tokens,
         focus_follow_tokens: &hy.focus_follow_tokens,
+        span: hy.answer_span.as_ref(),
     };
     let backbone_score = held_score(&base_pass, &held);
     let backbone = backbone_score.ppl;
     log(&format!(
         "baseline (full): {backbone:.3}{}",
-        backbone_score
-            .accuracy
-            .zip(backbone_score.balanced_accuracy)
-            .map(|(a, b)| format!(" | acc {:.2}% bal {:.2}%", a * 100.0, b * 100.0))
-            .unwrap_or_default()
+        score_suffix(&backbone_score)
     ));
 
     // ── Phase A: mask training ──
@@ -1403,7 +1554,14 @@ pub fn skill_bake(
     // same 2.56% sparsity; the f32 run retraces the reference trajectory
     // to the third decimal). Evals inside the loop lift the restriction —
     // their tensor-core numbers match f32 at print precision.
-    crate::gpu::bake_precision_strict(true);
+    // CMF_BAKE_A_STRICT=0 lifts it: Phase A then rides the tensor-core
+    // chains like Phase B (tf32-class operands) — the choice of a bake
+    // that measures its mask on the held-out set anyway and cannot
+    // afford a CPU-only phase on a 4 B model.
+    let strict_a = std::env::var("CMF_BAKE_A_STRICT")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    crate::gpu::bake_precision_strict(strict_a);
     for step in 0..hy.steps_a {
         let t_step = std::time::Instant::now();
         let (batch_ids, batch) = calibration_batch(&calib, step, hy.batch)?;
@@ -1417,6 +1575,7 @@ pub fn skill_bake(
             ffn: &ffn,
             focus_tokens: &hy.focus_tokens,
             focus_follow_tokens: &hy.focus_follow_tokens,
+            span: hy.answer_span.as_ref(),
         };
         let _ = pass.chunk_batch(&batch_ids, batch, Some((&mut dmask, &mut dffn)));
         // Fold σ'(m) into the mask grads + add the L1 term.
@@ -1455,11 +1614,12 @@ pub fn skill_bake(
                 ffn: &ffn,
                 focus_tokens: &hy.focus_tokens,
                 focus_follow_tokens: &hy.focus_follow_tokens,
+                span: hy.answer_span.as_ref(),
             };
             crate::gpu::bake_precision_strict(false);
             let hs = held_score(&pass, &held);
             let hp = hs.ppl;
-            crate::gpu::bake_precision_strict(true);
+            crate::gpu::bake_precision_strict(strict_a);
             // Name the neurons that crossed τ since the last eval. At
             // 0.01% pruned = ~24 neurons for a 135 held-PPL, WHICH 24 is
             // the whole diagnosis: it decides between "this model has no
@@ -1602,6 +1762,18 @@ pub fn skill_bake(
             hy.steps_a,
             if gc > 0 { g * 1000.0 / gc as f64 } else { 0.0 }
         ));
+        log(&format!(
+            "[prof] inside: attn-chain {:.1}s | ffn-pre {:.1}s | ffn-chain {:.1}s | ffn-act(split+act) {:.1}s | ffn-host {:.1}s | ffn-post {:.1}s | chain-w {:.1}s gpu {:.1}s copy {:.1}s",
+            prof::take(&prof::ATTN_CHAIN),
+            prof::take(&prof::FFN_PRE),
+            prof::take(&prof::FFN_CHAIN),
+            prof::take(&prof::FFN_ACT),
+            prof::take(&prof::FFN_HOST),
+            prof::take(&prof::FFN_POST),
+            chain_prof(0),
+            chain_prof(1),
+            chain_prof(2),
+        ));
         log(&format!("[prof] gemm shapes:\n{}", prof::shape_report(6)));
     }
     let final_logits = logits.clone();
@@ -1616,6 +1788,7 @@ pub fn skill_bake(
         ffn: &ffn,
         focus_tokens: &hy.focus_tokens,
         focus_follow_tokens: &hy.focus_follow_tokens,
+        span: hy.answer_span.as_ref(),
     };
     // With no mask-training steps the hard mask is still exactly all-open,
     // so rescoring the same validation batch is pure duplicate work.  This
@@ -1629,8 +1802,9 @@ pub fn skill_bake(
     };
     let masked = masked_score.ppl;
     log(&format!(
-        "[A] {:.0}s: masked-PPL {masked:.3}",
-        t0.elapsed().as_secs_f64()
+        "[A] {:.0}s: masked-PPL {masked:.3}{}",
+        t0.elapsed().as_secs_f64(),
+        score_suffix(&masked_score)
     ));
 
     // ── Phase B: FCD of the last N layers' FFN (hard mask active) ──
@@ -1672,6 +1846,7 @@ pub fn skill_bake(
             ffn: &ffn,
             focus_tokens: &hy.focus_tokens,
             focus_follow_tokens: &hy.focus_follow_tokens,
+            span: hy.answer_span.as_ref(),
         };
         log(&format!(
             "[B-cache] extracting native CMF boundaries: {} train + {} held records",
@@ -1804,6 +1979,7 @@ pub fn skill_bake(
                 ffn: &ffn,
                 focus_tokens: &hy.focus_tokens,
                 focus_follow_tokens: &hy.focus_follow_tokens,
+                span: hy.answer_span.as_ref(),
             };
             let _ = pass.chunk_batch(&batch_ids, batch, Some((&mut dmask, &mut dffn)));
             // Cosine LR.
@@ -1839,6 +2015,7 @@ pub fn skill_bake(
                     ffn: &ffn,
                     focus_tokens: &hy.focus_tokens,
                     focus_follow_tokens: &hy.focus_follow_tokens,
+                    span: hy.answer_span.as_ref(),
                 };
                 let cur = held_score(&pass, &held);
                 let better = if hy.checkpoint_accuracy && !hy.focus_tokens.is_empty() {
@@ -1859,10 +2036,7 @@ pub fn skill_bake(
                     "  [B] step {}: held-PPL {:.3}{} (best {:.3})",
                     step + 1,
                     cur.ppl,
-                    cur.accuracy
-                        .zip(cur.balanced_accuracy)
-                        .map(|(a, b)| format!(" acc={:.2}% bal={:.2}%", a * 100.0, b * 100.0))
-                        .unwrap_or_default(),
+                    score_suffix(&cur),
                     best_b.0.ppl
                 ));
             }
@@ -2144,5 +2318,39 @@ mod tests {
         let dead: Vec<f32> = vec![-5.0; inter];
         let masks = keep_masks(&[dead], 0.5, 32, false);
         assert_eq!(kept(&masks), vec![32]); // max(1) → rounded to 32
+    }
+}
+
+#[cfg(test)]
+mod answer_span_tests {
+    use super::*;
+
+    #[test]
+    fn answer_targets_follow_the_last_prompt_to_the_terminator() {
+        let sp = AnswerSpan {
+            start: vec![7, 8],
+            end: 1,
+        };
+        // prompt … [7 8] answer 20 21 [1] pad 1 1
+        let ids = [5, 7, 8, 9, 7, 8, 20, 21, 1, 1, 1];
+        assert_eq!(answer_targets(&ids, &sp), Some((6, 8)));
+        // No terminator: the span runs to the end of the record.
+        let ids = [5, 7, 8, 20, 21];
+        assert_eq!(answer_targets(&ids, &sp), Some((3, 4)));
+        // No prompt, or a prompt with nothing after it: unscored.
+        assert_eq!(answer_targets(&[5, 6, 1], &sp), None);
+        assert_eq!(answer_targets(&[5, 7, 8], &sp), None);
+    }
+
+    #[test]
+    fn scored_targets_cover_every_position_without_focus_or_span() {
+        let ids = [1u32, 2, 3, 4, 5, 6];
+        assert_eq!(scored_targets(&ids, 0, 3, &[], &[], None), vec![1, 2]);
+        assert_eq!(scored_targets(&ids, 3, 3, &[], &[], None), vec![4, 5]);
+        let sp = AnswerSpan {
+            start: vec![2],
+            end: 6,
+        };
+        assert_eq!(scored_targets(&ids, 0, 6, &[], &[], Some(&sp)), vec![2, 3, 4, 5]);
     }
 }

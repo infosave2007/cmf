@@ -81,6 +81,48 @@ fn gradcheck_matmul_nt_dx_dw() {
 }
 
 #[test]
+fn gradcheck_gelu_erf() {
+    let mut x = synth(64, 4);
+    for v in x.iter_mut() {
+        *v *= 6.0; // cover both tails
+    }
+    let r = synth(64, 5);
+    let loss = |x: &[f64]| -> f64 { x.iter().zip(&r).map(|(&v, b)| ops::gelu_erf(v) * b).sum() };
+    let dx: Vec<f64> = x
+        .iter()
+        .zip(&r)
+        .map(|(&v, b)| ops::gelu_erf_bwd(v) * b)
+        .collect();
+    let fx = fd_grad(&mut x, loss);
+    let e = rel_err(&dx, &fx);
+    println!("gradcheck gelu_erf: rel err {e:.2e}");
+    assert!(e < TOL);
+    // The runtime's f32 erf GELU and the trainer's generic one agree.
+    for &v in &[-4.0f32, -1.0, -0.1, 0.0, 0.3, 1.7, 5.0] {
+        let a = cortiq_engine::inference::gelu_erf(v);
+        let b = ops::gelu_erf(v);
+        assert!((a - b).abs() <= 1e-6 * (1.0 + a.abs()), "gelu {v}: runtime {a} vs trainer {b}");
+    }
+}
+
+#[test]
+fn attention_window_matches_full_when_wide_and_masks_when_narrow() {
+    let (t, d) = (6usize, 4usize);
+    let q = synth(t * d, 11);
+    let k = synth(t * d, 12);
+    let v = synth(t * d, 13);
+    let mut full = vec![0f64; t * d];
+    let mut wide = vec![0f64; t * d];
+    let mut narrow = vec![0f64; t * d];
+    ops::attn_head_fwd(&q, &k, &v, t, d, d, &mut full);
+    ops::attn_head_fwd_window(&q, &k, &v, t, d, d, Some(t), &mut wide);
+    ops::attn_head_fwd_window(&q, &k, &v, t, d, d, Some(1), &mut narrow);
+    assert!(full.iter().zip(&wide).all(|(a, b)| (a - b).abs() < 1e-12));
+    // Window 1: every query sees only its own value row.
+    assert!(narrow.iter().zip(&v).all(|(a, b)| (a - b).abs() < 1e-12));
+}
+
+#[test]
 fn gradcheck_silu() {
     let mut x = synth(64, 4);
     for v in x.iter_mut() {

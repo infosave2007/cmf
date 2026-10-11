@@ -19,6 +19,7 @@ use cortiq_core::quant::f32_to_f16;
 use cortiq_core::{
     CmfModel, SelectionDescriptor, SkillRecord, TensorDtype, TensorEntry, TensorSpec,
 };
+use cortiq_engine::skillbake::{AnswerSpan, answer_targets};
 use cortiq_engine::{Pipeline, SamplerConfig};
 use std::path::Path;
 use std::sync::Arc;
@@ -1123,9 +1124,8 @@ fn corpus_chunks(
 /// reaches its label without the beginning of its own prompt.  Keep this
 /// helper deliberately task-agnostic — a record can teach market direction,
 /// sentiment, intent, moderation, or any other one-token label.
-fn chat_record_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
-    const START: &str = "<|im_start|>system";
-    let starts: Vec<usize> = text.match_indices(START).map(|(at, _)| at).collect();
+fn chat_record_ranges(text: &str, start: &str) -> Vec<std::ops::Range<usize>> {
+    let starts: Vec<usize> = text.match_indices(start).map(|(at, _)| at).collect();
     starts
         .iter()
         .enumerate()
@@ -1173,6 +1173,7 @@ impl FocusedCorpusStats {
 /// Load focused ChatML records one by one, preserve their causal prefix, and
 /// right-pad them to a common batchable length.  Returns `None` for ordinary
 /// text so the established streaming LM chunker remains the fallback.
+#[allow(clippy::too_many_arguments)]
 fn focused_chat_record_chunks(
     tok: &cortiq_engine::tokenizer::Tokenizer,
     files: &[String],
@@ -1180,6 +1181,9 @@ fn focused_chat_record_chunks(
     need: usize,
     focus_ids: &[u32],
     focus_follow_ids: &[u32],
+    span: Option<&AnswerSpan>,
+    record_start: &str,
+    drop_oversize: bool,
 ) -> anyhow::Result<Option<(Vec<Vec<u32>>, FocusedCorpusStats)>> {
     let mut out = Vec::new();
     let mut saw_chat_records = false;
@@ -1190,7 +1194,7 @@ fn focused_chat_record_chunks(
         .unwrap_or(0);
     for file in files {
         let text = std::fs::read_to_string(file)?;
-        let ranges = chat_record_ranges(&text);
+        let ranges = chat_record_ranges(&text, record_start);
         if ranges.is_empty() {
             continue;
         }
@@ -1199,11 +1203,15 @@ fn focused_chat_record_chunks(
         for range in ranges {
             stats.records_seen += 1;
             let mut ids = tok.encode(&text[range]);
-            let scored = (1..ids.len()).any(|index| {
-                focus_ids.contains(&ids[index])
-                    && (focus_follow_ids.is_empty()
-                        || (index + 1 < ids.len() && focus_follow_ids.contains(&ids[index + 1])))
-            });
+            let scored = match span {
+                Some(sp) => answer_targets(&ids, sp).is_some(),
+                None => (1..ids.len()).any(|index| {
+                    focus_ids.contains(&ids[index])
+                        && (focus_follow_ids.is_empty()
+                            || (index + 1 < ids.len()
+                                && focus_follow_ids.contains(&ids[index + 1])))
+                }),
+            };
             if !scored {
                 continue;
             }
@@ -1215,9 +1223,15 @@ fn focused_chat_record_chunks(
             };
             stats.tokens_max = stats.tokens_max.max(ids.len());
             stats.tokens_total += ids.len();
+            if ids.len() > chunk && drop_oversize {
+                // Counted, never cut: a record that does not fit is left
+                // out whole rather than trained on an arbitrary tail.
+                stats.truncated_records += 1;
+                continue;
+            }
             anyhow::ensure!(
                 ids.len() <= chunk,
-                "focused ChatML record {}/{} has {} tokens, exceeding --chunk {}. Increase --chunk; truncation is disabled to preserve the complete record",
+                "focused ChatML record {}/{} has {} tokens, exceeding --chunk {}. Increase --chunk or pass --drop-oversize; truncation is disabled to preserve the complete record",
                 stats.records_seen,
                 file,
                 ids.len(),
@@ -1239,6 +1253,7 @@ fn focused_chat_record_chunks(
     Ok(None)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scored_corpus_chunks(
     tok: &cortiq_engine::tokenizer::Tokenizer,
     files: &[String],
@@ -1247,18 +1262,34 @@ fn scored_corpus_chunks(
     focus_ids: &[u32],
     focus_follow_ids: &[u32],
     focus_desc: &str,
+    span: Option<&AnswerSpan>,
+    record_start: &str,
+    drop_oversize: bool,
 ) -> anyhow::Result<(Vec<Vec<u32>>, Option<FocusedCorpusStats>)> {
-    if !focus_ids.is_empty()
-        && let Some((chunks, stats)) =
-            focused_chat_record_chunks(tok, files, chunk, need, focus_ids, focus_follow_ids)?
+    if (!focus_ids.is_empty() || span.is_some())
+        && let Some((chunks, stats)) = focused_chat_record_chunks(
+            tok,
+            files,
+            chunk,
+            need,
+            focus_ids,
+            focus_follow_ids,
+            span,
+            record_start,
+            drop_oversize,
+        )?
     {
         anyhow::ensure!(
             chunks.len() >= need,
-            "corpus has only {} complete scored ChatML records containing [{focus_desc}]; need {need}",
+            "corpus has only {} complete scored chat records containing [{focus_desc}]; need {need}",
             chunks.len()
         );
         return Ok((chunks, Some(stats)));
     }
+    anyhow::ensure!(
+        span.is_none(),
+        "answer-span scoring needs chat records starting with {record_start:?}; none found in the corpus files"
+    );
     let raw_need = if focus_ids.is_empty() {
         need
     } else {
@@ -1310,6 +1341,10 @@ pub fn run_skill_bake(
     batch: usize,
     fcd_batch: usize,
     focus_tokens: Option<&str>,
+    record_start: &str,
+    answer_after: Option<&str>,
+    answer_end: Option<&str>,
+    drop_oversize: bool,
     target_sparsity: f64,
     l1_aggression: f64,
     l1_init: f64,
@@ -1388,7 +1423,35 @@ pub fn run_skill_bake(
         );
         ids
     };
-    let focus_desc = focus_tokens.unwrap_or("");
+    // Answer-span scoring: the rendered generation prompt and the turn
+    // terminator, as the model's own tokenizer sees them.
+    let answer_span = match (answer_after, answer_end) {
+        (Some(after), Some(end)) => {
+            anyhow::ensure!(
+                focus_ids.is_empty(),
+                "--answer-after and --focus-tokens are mutually exclusive"
+            );
+            let start = tok.encode(after);
+            anyhow::ensure!(!start.is_empty(), "--answer-after {after:?} encodes to no tokens");
+            let end_ids = tok.encode(end);
+            anyhow::ensure!(
+                end_ids.len() == 1,
+                "--answer-end {end:?} encodes to {} tokens; it must be exactly one",
+                end_ids.len()
+            );
+            Some(AnswerSpan {
+                start,
+                end: end_ids[0],
+            })
+        }
+        (None, None) => None,
+        _ => anyhow::bail!("--answer-after and --answer-end go together"),
+    };
+    let focus_desc = if answer_span.is_some() {
+        "answer span"
+    } else {
+        focus_tokens.unwrap_or("")
+    };
     anyhow::ensure!(
         !checkpoint_accuracy || !focus_ids.is_empty(),
         "--checkpoint-accuracy needs --focus-tokens"
@@ -1407,6 +1470,9 @@ pub fn run_skill_bake(
             &focus_ids,
             &focus_follow_ids,
             focus_desc,
+            answer_span.as_ref(),
+            record_start,
+            drop_oversize,
         )?;
         (chunks, held, stats)
     } else {
@@ -1418,6 +1484,9 @@ pub fn run_skill_bake(
             &focus_ids,
             &focus_follow_ids,
             focus_desc,
+            answer_span.as_ref(),
+            record_start,
+            drop_oversize,
         )?;
         let (calib, calib_stats) = scored_corpus_chunks(
             &tok,
@@ -1427,6 +1496,9 @@ pub fn run_skill_bake(
             &focus_ids,
             &focus_follow_ids,
             focus_desc,
+            answer_span.as_ref(),
+            record_start,
+            drop_oversize,
         )?;
         let mut joined = held_chunks;
         joined.extend(calib);
@@ -1448,14 +1520,16 @@ pub fn run_skill_bake(
         } else {
             " (dedicated validation files)"
         },
-        focus_tokens
-            .map(|v| format!(" | focused targets [{v}]"))
-            .unwrap_or_default()
+        match (focus_tokens, answer_after) {
+            (Some(v), _) => format!(" | focused targets [{v}]"),
+            (None, Some(a)) => format!(" | answer-span loss after {a:?}"),
+            (None, None) => String::new(),
+        }
     );
     if let Some(stats) = &focused_stats {
         let mean = stats.tokens_total as f64 / stats.records_scored.max(1) as f64;
         println!(
-            "focused-record audit: files={} seen={} scored={} tokens min/mean/max={}/{:.1}/{} padded={} truncated={} policy=reject-oversize",
+            "focused-record audit: files={} seen={} scored={} tokens min/mean/max={}/{:.1}/{} padded={} oversize={} policy={}",
             stats.files,
             stats.records_seen,
             stats.records_scored,
@@ -1464,6 +1538,7 @@ pub fn run_skill_bake(
             stats.tokens_max,
             stats.padded_records,
             stats.truncated_records,
+            if drop_oversize { "drop-oversize" } else { "reject-oversize" },
         );
     }
     let hyper = cortiq_engine::skillbake::BakeHyper {
@@ -1490,6 +1565,7 @@ pub fn run_skill_bake(
         uniform_inter,
         focus_tokens: focus_ids,
         focus_follow_tokens: focus_follow_ids,
+        answer_span: answer_span.clone(),
         ..Default::default()
     };
     let (report, arts) =
@@ -1538,6 +1614,21 @@ pub fn run_skill_bake(
         );
     }
 
+    if answer_span.is_some()
+        && let Some(((base_acc, mask_acc), fcd_acc)) = report
+            .backbone_accuracy
+            .zip(report.masked_accuracy)
+            .zip(report.overlaid_accuracy)
+    {
+        println!(
+            "=== answer-span token accuracy (held-out, teacher-forced): {:.2}% → mask {:.2}% → FCD {:.2}% ({:+.2} pp)",
+            base_acc * 100.0,
+            mask_acc * 100.0,
+            fcd_acc * 100.0,
+            (fcd_acc - base_acc) * 100.0,
+        );
+    }
+
     if let Some(path) = archaeology_report {
         let keep_indices: Vec<Vec<usize>> = arts
             .keep
@@ -1566,6 +1657,9 @@ pub fn run_skill_bake(
             "model": model_path,
             "focus_tokens": focus_tokens,
             "hyper": {
+                "record_start": record_start,
+                "answer_after": answer_after,
+                "answer_end": answer_end,
                 "steps_a": steps_a,
                 "lr_a": lr_a,
                 "eval_every": eval_every,
@@ -1955,7 +2049,7 @@ mod tests {
             "<|im_start|>system\na<|im_end|>\n<|im_start|>assistant\nUP<|im_end|>\n",
             "<|im_start|>system\nb<|im_end|>\n<|im_start|>assistant\nDOWN<|im_end|>\n",
         );
-        let ranges = chat_record_ranges(text);
+        let ranges = chat_record_ranges(text, "<|im_start|>system");
         assert_eq!(ranges.len(), 2);
         assert!(text[ranges[0].clone()].starts_with("<|im_start|>system\na"));
         assert!(text[ranges[0].clone()].contains("assistant\nUP"));

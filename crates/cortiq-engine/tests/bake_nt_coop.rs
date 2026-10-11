@@ -161,6 +161,7 @@ fn bake_ffn_chain_matches_host_composition() {
             n,
             hsz,
             inter,
+            cortiq_engine::fcd_ops::FfnAct::Silu,
         );
         if !got {
             eprintln!("chain declined (no cooperative arm here) — skipped");
@@ -260,6 +261,8 @@ fn bake_attn_chain_matches_host_reference() {
         k_norm: Some(&kn),
         bias: Some(&bias),
         output_gate: true,
+        head_gain: None,
+        window: None,
         gemma: false,
         eps,
         rotary_half: half,
@@ -420,12 +423,23 @@ fn bake_ffn_bwd_chain_matches_host_composition() {
         n,
         hsz,
         inter,
+        cortiq_engine::fcd_ops::FfnAct::Silu,
     ) {
         eprintln!("forward chain declined (no cooperative arm) — skipped");
         return;
     }
     let mut dn2 = vec![0f32; n * hsz];
-    if !cortiq_engine::gpu_wgpu::ffn_bwd_chain_f32(&dh2, &down, &gu, li, &mut dn2, n, hsz, inter) {
+    if !cortiq_engine::gpu_wgpu::ffn_bwd_chain_f32(
+        &dh2,
+        &down,
+        &gu,
+        li,
+        &mut dn2,
+        n,
+        hsz,
+        inter,
+        cortiq_engine::fcd_ops::FfnAct::Silu,
+    ) {
         // The forward parked a plane; on a cooperative device the
         // backward must take it (a non-discrete adapter may not).
         eprintln!("bwd chain declined (uma adapter?) — skipped");

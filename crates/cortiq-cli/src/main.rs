@@ -2617,6 +2617,26 @@ enum SkillCmd {
         /// DOWN,UP). Empty means ordinary all-token LM loss.
         #[arg(long)]
         focus_tokens: Option<String>,
+        /// Start marker of one chat record in the corpus files (the
+        /// rendered first turn): records split on it, never on token
+        /// windows. ChatML by default; Spark-X2.5 renders
+        /// "<｜start▁of▁sentence｜><|System|>".
+        #[arg(long, default_value = "<|im_start|>system")]
+        record_start: String,
+        /// Score only the assistant's answer of each record: the tokens
+        /// after the LAST occurrence of this rendered generation prompt
+        /// ("<|im_start|>assistant\n", "<|Bot|></think>", …) through
+        /// --answer-end. Multi-token answers; exclusive with --focus-tokens.
+        #[arg(long, requires = "answer_end")]
+        answer_after: Option<String>,
+        /// The one-token turn terminator that closes an answer
+        /// ("<|im_end|>", "<｜end▁of▁sentence｜>", …)
+        #[arg(long, requires = "answer_after")]
+        answer_end: Option<String>,
+        /// Leave out (and count) chat records longer than --chunk instead
+        /// of refusing the corpus; records are never cut.
+        #[arg(long)]
+        drop_oversize: bool,
         /// Target sparsity (0.0–1.0): force at least this fraction of
         /// FFN neurons to be pruned. 0 = auto (denoising bottom)
         #[arg(long, default_value = "0.0")]
@@ -4109,6 +4129,10 @@ async fn main() -> anyhow::Result<()> {
                 batch,
                 fcd_batch,
                 focus_tokens,
+                record_start,
+                answer_after,
+                answer_end,
+                drop_oversize,
                 target_sparsity,
                 l1_aggression,
                 l1_init,
@@ -4142,6 +4166,10 @@ async fn main() -> anyhow::Result<()> {
                 batch,
                 fcd_batch,
                 focus_tokens.as_deref(),
+                &record_start,
+                answer_after.as_deref(),
+                answer_end.as_deref(),
+                drop_oversize,
                 target_sparsity,
                 l1_aggression,
                 l1_init,
