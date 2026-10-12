@@ -19047,6 +19047,17 @@ struct Ctx {
     /// the other's operand. The scratch lock cannot cover it: `readback`
     /// takes that lock itself, and std mutexes do not re-enter.
     mm_gate: Mutex<()>,
+    /// One device op at a time across threads, re-entrant within one.
+    /// Every op takes it right after `ctx()` and holds it to its end: the
+    /// scratch slots are shared by every pipeline on the device and most
+    /// ops release the scratch lock before they encode, submit and read
+    /// back — or hand a pooled slot (`sc.y`, `sc.dout`) to the next step
+    /// of a keep chain. Two serve slots decoding at once therefore
+    /// computed on each other's operands (59 of 75 concurrent Spark
+    /// completions garbage, measured) or submitted while the other had
+    /// `ca-stage` mapped (a validation panic). Lock order: op_gate →
+    /// mm_gate → scratch.
+    op_gate: OpGate,
     /// One run-owned sidecar (the component gate exercises one real matrix).
     /// A mismatched model/tensor rebuilds it rather than reusing stale row ids.
     q2_ladder: Mutex<Option<Q2LadderCache>>,
@@ -19632,6 +19643,49 @@ fn kv_mirror_seed_x(
     true
 }
 
+/// A re-entrant gate (see `Ctx::op_gate`): the owning thread may enter
+/// again — ops call ops — while every other thread waits for the
+/// outermost exit.
+#[derive(Default)]
+struct OpGate {
+    state: Mutex<(Option<std::thread::ThreadId>, usize)>,
+    free: std::sync::Condvar,
+}
+
+struct OpGuard<'a>(&'a OpGate);
+
+impl OpGate {
+    fn enter(&self) -> OpGuard<'_> {
+        let me = std::thread::current().id();
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            match st.0 {
+                None => {
+                    *st = (Some(me), 1);
+                    break;
+                }
+                Some(owner) if owner == me => {
+                    st.1 += 1;
+                    break;
+                }
+                Some(_) => st = self.free.wait(st).unwrap_or_else(|e| e.into_inner()),
+            }
+        }
+        OpGuard(self)
+    }
+}
+
+impl Drop for OpGuard<'_> {
+    fn drop(&mut self) {
+        let mut st = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.1 -= 1;
+        if st.1 == 0 {
+            st.0 = None;
+            self.0.free.notify_one();
+        }
+    }
+}
+
 #[derive(Default)]
 struct Scratch {
     xs: Option<(wgpu::Buffer, u64)>,
@@ -20031,6 +20085,7 @@ pub fn automatic_layer_prefix(
         return None; // an explicit split always wins
     }
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     if c.vram_budget == u64::MAX || num_layers == 0 || physical_layers == 0 {
         return None;
     }
@@ -21652,6 +21707,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         resident: std::sync::atomic::AtomicU64::new(0),
         scratch: Mutex::new(Scratch::default()),
         mm_gate: Mutex::new(()),
+        op_gate: OpGate::default(),
         q2_ladder: Mutex::new(None),
         planes: Mutex::new(std::collections::HashMap::new()),
         weight_bufs: Mutex::new(HashMap::new()),
@@ -21743,6 +21799,7 @@ fn res_score(e: &Resident, now: u64) -> f32 {
 /// 125 times in a 48-token run on an emulated 24 GB card.
 pub fn pin_weights(model: &Arc<CmfModel>, idxs: &[usize]) -> usize {
     let Some(c) = ctx() else { return 0 };
+    let _op = c.op_gate.enter();
     let uid = model.uid() as usize;
     let mut map = c.weight_bufs.lock().unwrap();
     let mut n = 0;
@@ -21765,6 +21822,7 @@ pub fn pin_weights(model: &Arc<CmfModel>, idxs: &[usize]) -> usize {
 /// is empty. The engine calls this once, after a generation has run.
 pub fn pipeline_cache_flush() {
     let Some(c) = ctx() else { return };
+    let _op = c.op_gate.enter();
     pipeline_cache_store(c.pipeline_cache.as_ref(), &c.adapter_info);
 }
 
@@ -22959,6 +23017,7 @@ pub fn q2tp_selection_report(label: &str) {
 /// `None` means the optional experiment was not requested or failed closed.
 pub fn q2tp_ladder_cache_snapshot() -> Option<(usize, u64, u64)> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let cache = c.q2_ladder.lock().unwrap();
     cache
         .as_ref()
@@ -24012,6 +24071,7 @@ pub fn moe_expert_bufs_requant_gu(
 ) -> Option<(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer)> {
     use std::sync::atomic::Ordering;
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let enc2 = *crate::dsv4::DSPARK_Q2TP_ENCODE.get()?;
     if hidden % 32 != 0 || inter % 32 != 0 {
         return None;
@@ -24112,6 +24172,7 @@ pub fn enabled() -> bool {
 /// can't be resolved.
 pub fn q8_resident_or_upload(model: &Arc<CmfModel>, idx: usize, may_upload: bool) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let entry = &model.tensors[idx];
     let rows_total = entry.shape.first().copied().unwrap_or(0);
     let cols = entry.shape.get(1).copied().unwrap_or(0);
@@ -24171,6 +24232,7 @@ pub fn q8_matvec_range(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if cols % 4 != 0 || rows == 0 {
         return false;
     }
@@ -24371,6 +24433,7 @@ fn q1t_like(
     q4: bool,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let gpr = cols / 32;
     if rows == 0 || cols % 32 != 0 || xs.len() < cols || out.len() < rows {
         return false;
@@ -24509,6 +24572,7 @@ pub fn q1_matvec(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let gpr = cols / 32;
     if rows == 0 || cols % 32 != 0 || gpr % 2 != 0 || xs.len() < cols || out.len() < rows {
         return false;
@@ -24544,6 +24608,7 @@ pub fn q1_matvec(
 /// direct buffers (no residency cache). Returns false without a GPU context.
 pub fn rmsnorm_row(x: &[f32], w: &[f32], out: &mut [f32], gemma: bool, eps: f32) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let n = x.len();
     if n == 0 || w.len() < n || out.len() < n {
         return false;
@@ -24633,6 +24698,7 @@ fn attn_rope_qkn_gpu_scaled(
     gout: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let qraw_b = storage_bytes(c, bytemuck::cast_slice(qraw));
     let k_b = c
         .device
@@ -24729,6 +24795,7 @@ pub fn gqa_attend_gpu(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if hd % 4 != 0 || hd > c.hd_cap {
         return false; // vec4 K/V reads; hd_cap = workgroup-storage limit
     }
@@ -24802,6 +24869,7 @@ pub fn gqa_attend_split_gpu(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if hd % 4 != 0 || hd > c.hd_cap || nh % hpk != 0 {
         return false;
     }
@@ -25018,6 +25086,7 @@ pub fn attn_dropin_gpu(
     attn_out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if pos >= cap || hd % 4 != 0 || hd > c.hd_cap {
         return false; // vec4 K/V reads; hd_cap = workgroup-storage limit
     }
@@ -25372,6 +25441,7 @@ pub fn forward_token_graph(
         graph_refused("no ctx");
         return token_graph_outcome(o1_started || state_started, false);
     };
+    let _op = c.op_gate.enter();
     let graph_live_budget = graph_live_weight_budget(c, model);
     if position >= cap || hd % 4 != 0 || hd > c.hd_cap {
         {
@@ -30357,6 +30427,7 @@ pub fn forward_batch_graph_at(
         bgraph_refused("no ctx");
         return batch_outcome(o1_started || state_started, false);
     };
+    let _op = c.op_gate.enter();
     // This is the true entry for the resident batch graph.  The token graph
     // has its own reset, but a batch call normally follows a completed
     // readback without passing through that path.  Reset before resolving
@@ -33804,6 +33875,7 @@ pub fn forward_batch_graph_at(
 /// recurrent layers and letting the next graph consume mixed state.
 pub fn gdn_spec_restore(kv_id: u64, slot: usize, base_pos: usize, expected_layers: usize) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let snaps = c.gdn_snap.lock().unwrap();
     let entries: Vec<(usize, &(wgpu::Buffer, u64, u64, usize, usize))> = snaps
         .iter()
@@ -34371,6 +34443,7 @@ fn forward_embryo_graph_rows(
         }
         return false;
     };
+    let _op = c.op_gate.enter();
     // The resident graph has a single readback, so a short opt-in profiler
     // can separate the device timestamped dispatch from host encode and the
     // submit/map/copy wait.  Keep this off the normal path: resolving a query
@@ -35270,6 +35343,7 @@ fn forward_embryo_graph_rows(
 /// Drop the device K/V mirror for a pipeline (called on cache clear).
 pub fn kv_mirror_reset(kv_id: u64) {
     if let Some(c) = ctx() {
+        let _op = c.op_gate.enter();
         c.attn_kv.lock().unwrap().retain(|(id, _), _| *id != kv_id);
         c.gdn_state
             .lock()
@@ -35295,6 +35369,7 @@ pub fn kv_mirror_reset(kv_id: u64) {
 /// The storage itself is retained for the next append.
 pub fn kv_mirror_set_stored(kv_id: u64, layer: usize, stored: usize) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let mut mirrors = c.attn_kv.lock().unwrap();
     let Some(m) = mirrors.get_mut(&(kv_id, layer)) else {
         return false;
@@ -35330,6 +35405,7 @@ pub fn kv_mirror_set_stored(kv_id: u64, layer: usize, stored: usize) -> bool {
 /// this pipeline has no mirror for the layer.
 pub fn kv_mirror_stored(kv_id: u64, layer: usize) -> Option<usize> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     c.attn_kv.lock().unwrap().get(&(kv_id, layer)).map(|m| m.synced)
 }
 
@@ -35352,6 +35428,7 @@ pub fn kv_mirror_read_rows(
     hd: usize,
 ) -> Option<Vec<(Vec<f32>, Vec<f32>)>> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let row_bytes = (hd * 4) as u64;
     let mut srcs = Vec::with_capacity(reqs.len());
     {
@@ -35452,6 +35529,7 @@ pub fn kv_mirror_pull_host(
     hd: usize,
 ) -> Option<(Vec<f32>, Vec<f32>, usize)> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let (kb, vb, cap, dv, first_valid) = {
         let mirrors = c.attn_kv.lock().unwrap();
         let m = mirrors.get(&(kv_id, layer))?;
@@ -35587,6 +35665,7 @@ pub fn gdn_conv_gpu(
     cq: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let qb = storage_bytes(c, bytemuck::cast_slice(qkv));
     let tb = storage_bytes(c, bytemuck::cast_slice(taps));
     let rb = c
@@ -35675,6 +35754,7 @@ pub fn gdn_step_gpu(
     o: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let sb = c
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -35794,6 +35874,7 @@ pub fn attn_block_gpu(
     h_out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let unif = |data: &[u32]| {
         c.device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -36044,6 +36125,7 @@ pub fn q82_short_rows(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let Some(gx) = c.graph_x.as_ref() else {
         return false;
     };
@@ -36141,6 +36223,7 @@ pub fn q8_matmat_2f(
     // MiMo's f32 GEMM contract holds on this entry too (see `q8_matmat`).
     let _precision = MimoF32Gemm::enter(&model.arch().arch_name);
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if cols % 4 != 0 || rows == 0 || b == 0 || col_field.len() < cols {
         return false;
     }
@@ -36219,6 +36302,7 @@ pub fn q8_matmat(
 ) -> bool {
     let _precision = MimoF32Gemm::enter(&model.arch().arch_name);
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if cols % 4 != 0 || rows == 0 || b == 0 {
         return false;
     }
@@ -36402,6 +36486,7 @@ pub(crate) fn fused_gemm_from_device(
         }
         dt @ (D::Q8Row | D::Q8_2f) if fused_any() => {
             let Some(c) = ctx() else { return false };
+            let _op = c.op_gate.enter();
             let Some((rs, cf)) = q8_fields(model, idx, rows, cols) else {
                 return false;
             };
@@ -36457,6 +36542,7 @@ pub fn q8_matmat_keep(
     cols: usize,
 ) -> Option<wgpu::Buffer> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     if cols % 4 != 0 || rows == 0 || b == 0 {
         return None;
     }
@@ -36508,6 +36594,7 @@ fn q8_matmat_keep_src(
 ) -> Option<wgpu::Buffer> {
     use cortiq_core::TensorDtype as D;
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let entry = &model.tensors[idx];
     if !matches!(entry.dtype, D::Q8Row | D::Q8_2f) || cols % 4 != 0 || rows == 0 || b == 0 {
         return None;
@@ -36600,6 +36687,7 @@ pub fn q1_matmat(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if cols % 64 != 0 || rows == 0 || b == 0 || pre.len() < b * cols || out.len() < b * rows {
         return false;
     }
@@ -37323,6 +37411,7 @@ pub fn dit_phase_report() -> Option<String> {
 /// before it decides which arm a still-cold call should take.
 pub fn weight_is_resident(model: &Arc<CmfModel>, idx: usize) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     c.weight_bufs
         .lock()
         .unwrap()
@@ -37348,6 +37437,7 @@ pub(crate) fn q4tp_matmat_dev(
     cols: usize,
 ) -> Option<wgpu::Buffer> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let mut out = Vec::new();
     // Reuse the whole validated path; `keep` swaps the readback for a
     // handle to the same buffer.
@@ -37611,6 +37701,7 @@ pub fn music3_ffn(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let Some(glu) = c.music3_glu.as_ref() else {
         return false;
     };
@@ -37762,6 +37853,7 @@ fn q2tp_matvec_impl(
     affine: bool,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if cols % 32 != 0 || rows == 0 || xs.len() < cols || out.len() < rows {
         return false;
     }
@@ -38244,6 +38336,7 @@ fn tp_matmat_impl(
     dst: Option<&wgpu::Buffer>,
 ) -> Option<wgpu::Buffer> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let _gate = c.mm_gate.lock().unwrap();
     let _gpr = cols / 32;
     if cols % 32 != 0 || rows == 0 || b == 0 {
@@ -38580,6 +38673,7 @@ pub fn q4t_matmat(
 ) -> bool {
     let _precision = MimoF32Gemm::enter(&model.arch().arch_name);
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let _gate = c.mm_gate.lock().unwrap();
     let gpr = cols / 32;
     if cols % 32 != 0 || rows == 0 || b == 0 {
@@ -38726,6 +38820,7 @@ pub fn q4tp_matvec_batch_for_test(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if cols % 32 != 0
         || rows == 0
         || batch == 0
@@ -38878,6 +38973,7 @@ pub fn dit_qkv_attn_out(
     proj: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let inner = nh * hd;
     let can_dev_scale =
         (c.act_amax_part.is_some() && c.act_amax_fold.is_some()) || c.act_absmax.is_some();
@@ -38967,6 +39063,7 @@ pub fn vae_qkv_attn_out(
     proj: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let inner = nh * hd;
     let can_dev_scale =
         (c.act_amax_part.is_some() && c.act_amax_fold.is_some()) || c.act_absmax.is_some();
@@ -39074,6 +39171,7 @@ pub fn dit_split_only(
     out_q: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let Some(split) = c.dit_qkv_split.as_ref() else {
         return false;
     };
@@ -39247,6 +39345,7 @@ pub fn dit_attention_packed_src(
     qkv_bias: Option<&[f32]>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let Some(split) = c.dit_qkv_split.as_ref() else {
         return false;
     };
@@ -39464,6 +39563,7 @@ fn dit_attention_inner(
     keep: Option<&mut Option<wgpu::Buffer>>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if nh == 0 || nkv == 0 || n == 0 || hd == 0 || nh % nkv != 0 {
         return false;
     }
@@ -39925,6 +40025,7 @@ pub fn chunk_attend_win(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let n = s0 + b;
     if nh == 0 || nkv == 0 || b == 0 || hd == 0 || nh % nkv != 0 || n == 0 {
         return false;
@@ -40390,6 +40491,7 @@ pub fn chunk_attend_mirror_wo(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if out.len() < b * hidden || gains.is_some_and(|g| g.len() < b * nh) {
         return false;
     }
@@ -40473,6 +40575,7 @@ fn chunk_attend_mirror_impl(
     keep: Option<&mut Option<wgpu::Buffer>>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     mirror_event(0);
     if nh == 0 || nkv == 0 || b == 0 || hd == 0 || nh % nkv != 0 || hd % 4 != 0 {
         return false;
@@ -40613,6 +40716,7 @@ pub fn q4t_qkv(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if cols % 32 != 0 || b == 0 {
         return false;
     }
@@ -40827,6 +40931,7 @@ pub fn q8_ffn_packed(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if b == 0 || xs.len() < b * hidden || out.len() < b * hidden {
         return false;
     }
@@ -40854,6 +40959,7 @@ pub fn gemm_many_keep(
 ) -> bool {
     let _precision = MimoF32Gemm::enter(&model.arch().arch_name);
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let t_enq = std::time::Instant::now();
     let total: usize = idxs.iter().map(|&(_, r)| b * r).sum();
     if b == 0 || idxs.is_empty() || out.len() < total || xs.len() < b * cols {
@@ -40938,6 +41044,7 @@ pub fn ffn_act_keep(
 ) -> bool {
     let _precision = MimoF32Gemm::enter(&model.arch().arch_name);
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let panel = (b * inter * 4) as u64;
     if b == 0
         || act > 2
@@ -41112,6 +41219,7 @@ pub fn q4tp_ffn_packed(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let _gate = c.mm_gate.lock().unwrap();
     let t_stage = std::time::Instant::now();
     if hidden % 32 != 0 || inter % 32 != 0 || b == 0 {
@@ -41564,6 +41672,7 @@ fn ffn_q4(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if hidden % 32 != 0 || inter % 32 != 0 || b == 0 || act > 2 {
         return false;
     }
@@ -41712,6 +41821,7 @@ pub fn q1t_matmat(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let gpr = cols / 32;
     if cols % 32 != 0 || rows == 0 || b == 0 {
         return false;
@@ -41935,6 +42045,7 @@ pub fn perf_report() {
 /// in milliseconds per iteration.
 pub fn roundtrip_bench(n: usize) -> Option<(f64, f64)> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let n = n.max(1);
     // 1. Submit an empty encoder and wait for the queue to drain.
     let t0 = std::time::Instant::now();
@@ -44445,6 +44556,7 @@ struct O1Dev {
 /// request's sealed state.
 pub fn o1_device_stats(kv_id: u64) -> (usize, u64) {
     let Some(c) = ctx() else { return (0, 0) };
+    let _op = c.op_gate.enter();
     let map = c.o1m.lock().unwrap();
     map.iter()
         .filter(|((id, _), _)| *id == kv_id)
@@ -45751,6 +45863,7 @@ fn encode_silu_down(
 /// the caller's fallback stays intact.
 fn matvec_batch_q1(model: &Arc<CmfModel>, jobs: &[BatchJob], out: &mut [&mut [f32]]) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let bytes = model.primary_bytes();
     // Resident weight per job (VRAM cache; over-budget/oob → honest CPU).
     let mut weights = Vec::with_capacity(jobs.len());
@@ -45838,6 +45951,7 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
         return false;
     }
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if jobs.is_empty() {
         return false;
     }
@@ -46012,6 +46126,7 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
 /// N independent q8-matvec (GDN projections of one input) in a single submission.
 pub fn matvec_batch(model: &Arc<CmfModel>, jobs: &[BatchJob], out: &mut [&mut [f32]]) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if jobs.is_empty() || jobs.len() != out.len() {
         return false;
     }
@@ -46140,6 +46255,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping shared-context teardown test");
             return;
         };
+        let _op = c.op_gate.enter();
         {
             let drain = TestGpuDrain::new(c);
             let probe = c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -46172,6 +46288,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping zi route test");
             return;
         };
+        let _op = c.op_gate.enter();
         let _drain = TestGpuDrain::new(c);
         let (rows, cols) = (256usize, 512usize);
         let q: Vec<u8> = (0..rows * cols)
@@ -46244,6 +46361,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping mirror attend test");
             return;
         };
+        let _op = c.op_gate.enter();
         let _one = chunk_attend_test_lock();
         let _drain = TestGpuDrain::new(c);
         let (nh, nkv, hd, w) = (4usize, 2usize, 256usize, 512usize);
@@ -46318,6 +46436,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping f16 guard test");
             return;
         };
+        let _op = c.op_gate.enter();
         let _one = chunk_attend_test_lock();
         let _drain = TestGpuDrain::new(c);
         let (nh, nkv, hd, b) = (4usize, 2usize, 256usize, 64usize);
@@ -46388,6 +46507,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping mirror reseed test");
             return;
         };
+        let _op = c.op_gate.enter();
         let _one = chunk_attend_test_lock();
         let _drain = TestGpuDrain::new(c);
         let (nh, nkv, hd, w) = (4usize, 2usize, 256usize, 512usize);
@@ -46466,6 +46586,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping trimmed-tail mirror test");
             return;
         };
+        let _op = c.op_gate.enter();
         let _one = chunk_attend_test_lock();
         let _drain = TestGpuDrain::new(c);
         let (nh, nkv, hd, w) = (4usize, 2usize, 256usize, 512usize);
@@ -46613,6 +46734,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping qwen constant lifetime test");
             return;
         };
+        let _op = c.op_gate.enter();
         let _gate = c.mm_gate.lock().unwrap();
         let mut bias = vec![1.0f32, 2.0, 3.0, 4.0];
         let zeros = [0.0f32; 4];
@@ -46664,6 +46786,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping qwen layernorm parity test");
             return;
         };
+        let _op = c.op_gate.enter();
         let _gate = c.mm_gate.lock().unwrap();
         let eps = 1.0e-6f32;
         let batch = 4usize;
@@ -46759,6 +46882,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping DiT cooperative odd-tail test");
             return;
         };
+        let _op = c.op_gate.enter();
         let _gate = c.mm_gate.lock().unwrap();
         let Some(pipe) = c.dit_gemm_coop.as_ref() else {
             eprintln!("cooperative matrix pipeline unavailable — skipping odd-tail test");
@@ -46867,6 +46991,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping parity test");
             return;
         };
+        let _op = c.op_gate.enter();
         let (rows, cols) = (256usize, 64usize); // cols % 4 == 0
                                                 // Synthetic int8 weights + row scales + pre-scaled activations.
         let mut q = vec![0i8; rows * cols];
@@ -46931,6 +47056,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping q8_2f parity test");
             return;
         };
+        let _op = c.op_gate.enter();
         // Three rows put the column-scale plane in the high half of the
         // final row-scale word. This is the packed layout that the old
         // word-aligned address calculation decoded one half-word late.
@@ -47056,6 +47182,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping q8_2f model parity test");
             return;
         };
+        let _op = c.op_gate.enter();
         let model = Arc::new(CmfModel::open(path).expect("open CMF_Q8_2F_MODEL"));
         let (idx, entry) = model
             .tensors
@@ -47167,6 +47294,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let n: usize = std::env::var("CMF_CHAIN_N")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -47296,6 +47424,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping q1 parity test");
             return;
         };
+        let _op = c.op_gate.enter();
         let (rows, cols) = (33usize, 256usize); // gpr = 8 (even), odd rows
         let gpr = cols / 32;
         let mut payload = Vec::new();
@@ -47371,6 +47500,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let n = 896usize;
         let eps = 1e-6f32;
         let h: Vec<f32> = (0..n)
@@ -47530,6 +47660,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping gqa_attend parity test");
             return;
         };
+        let _op = c.op_gate.enter();
         // hd=128 exercises the stride-129 kernel (exists everywhere);
         // hd=256 exercises stride-257 where the device's workgroup
         // storage allows it (32 KB devices — Adreno/Mali/wgpu-Metal —
@@ -47605,6 +47736,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         if c.attend_gpart.is_none() {
             eprintln!("no gqa gpart kernel on this device (small workgroup storage) — skipping");
             return;
@@ -47708,6 +47840,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping o1 test");
             return;
         };
+        let _op = c.op_gate.enter();
         // Production geometry (Qwen3.6): the small-dim version passed while
         // the real model garbled, so the test runs BOTH.
         for (d, dv, m, w, sink, hpg, t) in [
@@ -48194,6 +48327,7 @@ mod tests {
         }
 
         let c = ctx().expect("actual Vulkan adapter required for corrected replay");
+        let _op = c.op_gate.enter();
         let uid = u64::MAX - 17;
         let views: Vec<_> = groups.iter().map(|st| st.device_view()).collect();
         o1_ensure(c, uid, layer, &views, 1).expect("upload corrected replay state");
@@ -48665,6 +48799,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping attn_block test");
             return;
         };
+        let _op = c.op_gate.enter();
         let (nh, nkv, hd, rd, hidden, cap, stored) =
             (4usize, 2usize, 64usize, 64usize, 128usize, 8usize, 2usize);
         let hpk = nh / nkv;
@@ -48883,6 +49018,7 @@ mod tests {
             eprintln!("no wgpu device — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let Some(pipe) = c.q4tp_mm_coop.as_ref() else {
             eprintln!("no cooperative pipeline — skipping");
             return;
@@ -48996,6 +49132,7 @@ mod tests {
             eprintln!("no wgpu device — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         // a[i][k] = i + k/16, b[k][j] = (k == j) ? 1 : 0  → c == a.
         // With b the identity, any mix-up in B's layout still returns a,
         // so b is made asymmetric: b[k][j] = k*16 + j, and the expected
@@ -49241,6 +49378,7 @@ fn main(@builtin(local_invocation_index) tid: u32,
             eprintln!("no wgpu device — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         for (label, src) in [
             (
                 "16x16 f16 in, f32 out",
@@ -49347,6 +49485,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let rows: usize = env_usize("CMF_MM_ROWS", 9216);
         let cols: usize = env_usize("CMF_MM_COLS", 2304);
         let n: usize = env_usize("CMF_MM_N", 2085);
@@ -49436,6 +49575,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let mk_w = |rows: usize, seed: usize| -> Vec<u8> {
             let total = cortiq_core::quant::expected_nbytes(
                 cortiq_core::TensorDtype::Q4TiledP,
@@ -49546,6 +49686,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let sg_requested = q2tp_sg_env_admitted();
         eprintln!(
             "q2tp matvec pipeline: subgroup_requested={sg_requested} admitted={} diagnostics={}",
@@ -49705,6 +49846,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let _drain = TestGpuDrain::new(c);
         let (rows, cols) = (129usize, 4096usize);
         let gpr = cols / cortiq_core::quant::GROUP_SIZE;
@@ -49847,6 +49989,7 @@ fn main() {
         let Some(c) = ctx() else {
             panic!("Q2 cooperative component requires a wgpu adapter");
         };
+        let _op = c.op_gate.enter();
         let _drain = TestGpuDrain::new(c);
         assert!(
             c.q2tp_mm_coop.is_some(),
@@ -50021,6 +50164,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let _drain = TestGpuDrain::new(c);
         let Some(pipe) = c.fwht.as_ref() else {
             eprintln!("shader-f16 unavailable — skipping Prism FWHT test");
@@ -50119,6 +50263,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let _drain = TestGpuDrain::new(c);
         let Some(pipe) = c.fwht.as_ref() else {
             eprintln!("shader-f16 unavailable — skipping Prism FWHT width test");
@@ -50280,6 +50425,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let _drain = TestGpuDrain::new(c);
         let (rows, cols, batch) = (64usize, 512usize, 3usize);
         let gpr = cols / 32;
@@ -50416,6 +50562,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let (rows, cols, batch) = (1000usize, 4096usize, 5usize);
         let total =
             cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])
@@ -50520,6 +50667,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let (Some(p4), Some(l4)) = (&c.matvec_pair_v4, &c.layout_mv2_v4) else {
             eprintln!("pair_v4 off — skipping");
             return;
@@ -50600,6 +50748,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let staged = c.q4tp_mv4_bk8s.is_some();
         for &(rows, cols, batch) in &[(1000usize, 4096usize, 5usize), (272usize, 17408usize, 6usize), (512usize, 5120usize, 8usize), (64usize, 2048usize, 2usize)] {
             let total = cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols]).unwrap();
@@ -50680,6 +50829,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         if c.use_mv_bk < 2 {
             eprintln!("bku arm off — skipping");
             return;
@@ -50799,6 +50949,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         if c.use_mv_bk < 2 || !c.use_mv_x2 {
             eprintln!("bku arm or x2 off in this environment — skipping");
             return;
@@ -50928,6 +51079,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let inter = 1000usize;
         let mk_w = |seed: usize| -> Vec<u8> {
             let total = cortiq_core::quant::expected_nbytes(
@@ -51093,6 +51245,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         for (si, (rows, cols)) in [(2048usize, 2048usize), (1001, 6144), (37, 1040), (6, 16)]
             .into_iter()
             .enumerate()
@@ -51187,6 +51340,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         for (si, (rows, cols)) in [(2048usize, 2048usize), (1000, 6144), (37, 4096), (333, 1024)]
             .into_iter()
             .enumerate()
@@ -51293,6 +51447,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let (nh, nkv, hd, cap) = (16usize, 2usize, 128usize, 640usize);
         let hpk = nh / nkv;
         let scale = 1.0 / (hd as f32).sqrt();
@@ -51445,6 +51600,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let reps = env_usize("CMF_MM_REPS", 40);
         // Per-dispatch floor: a tiny matvec (16 rows) issued 700 times in
         // ONE submit — the launch + drain cost a serial chain pays per
@@ -51707,6 +51863,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let (Some(pipe), Some(_)) = (c.q4tp_mm_coop_f16.as_ref(), c.q4tp_dq_f16.as_ref()) else {
             eprintln!("no f16 plane GEMM here — skipping");
             return;
@@ -51848,6 +52005,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         if c.q4tp_mm_coop_f16.is_none() {
             // A device WITH cooperative matrices that has no f16 pipeline
             // means the shader was rejected — which is how a wrong
@@ -51952,6 +52110,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         // 1.7B-ish attention geometry.
         let (nh, nkv, hd, rd, hidden, cap, stored) = (
             16usize, 8usize, 128usize, 128usize, 2048usize, 256usize, 128usize,
@@ -52070,6 +52229,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping q1t parity test");
             return;
         };
+        let _op = c.op_gate.enter();
         use cortiq_core::quant::{f32_to_f16, q1t_pack, GROUP_SIZE};
         let (rows, cols) = (33usize, 256usize);
         let gpr = cols / GROUP_SIZE;
@@ -52134,6 +52294,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping q4b parity test");
             return;
         };
+        let _op = c.op_gate.enter();
         use cortiq_core::quant::{f32_to_f16, GROUP_SIZE};
         let (rows, cols) = (33usize, 256usize);
         let n_groups = rows * (cols / GROUP_SIZE);
@@ -52177,6 +52338,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping q1t GEMM parity test");
             return;
         };
+        let _op = c.op_gate.enter();
         use cortiq_core::quant::{f32_to_f16, q1t_pack, GROUP_SIZE};
         let (b, rows, cols) = (40usize, 64usize, 256usize);
         let gpr = cols / GROUP_SIZE;
@@ -52243,6 +52405,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping matmat test");
             return;
         };
+        let _op = c.op_gate.enter();
         let (rows, cols, b) = (128usize, 64usize, 5usize);
         let mut q = vec![0i8; rows * cols];
         for (i, v) in q.iter_mut().enumerate() {
@@ -52286,6 +52449,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping mul_mm test");
             return;
         };
+        let _op = c.op_gate.enter();
         let (rows, cols, b) = (100usize, 52usize, 70usize);
         let mut q = vec![0i8; rows * cols];
         for (i, v) in q.iter_mut().enumerate() {
@@ -52328,6 +52492,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping q1_mul_mm test");
             return;
         };
+        let _op = c.op_gate.enter();
         let (rows, cols, b) = (100usize, 128usize, 70usize); // cols % 64 == 0
         let np = cols / 64;
         let jit = |a: usize| ((a * 2654435761usize) >> 13) as u32; // cheap hash → bits
@@ -52480,6 +52645,7 @@ pub fn rope_heads_for_test(
     inverse: bool,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if x.len() != nh * hd || rd > hd || rd % 2 != 0 || inv_freq.len() * 2 < rd {
         return false;
     }
@@ -52546,6 +52712,7 @@ pub fn o_lora_a_for_test(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if rows == 0 || lora == 0 || rows % lora != 0 || out.len() < rows {
         return false;
     }
@@ -52627,6 +52794,7 @@ pub fn kv_pool_for_test(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if width == 0 || ratio == 0 || out.len() < width {
         return false;
     }
@@ -52711,6 +52879,7 @@ pub fn index_scores_for_test(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if q.len() < nh * hd || kv.len() < n_pos * hd || hw.len() < nh || out.len() < n_pos {
         return false;
     }
@@ -52764,6 +52933,7 @@ pub fn index_scores_for_test(
 /// different field order than the shader reads — so it silently did nothing.
 pub fn axpy_for_test(x: &[f32], y: &mut [f32], w: f32, set: bool, soff: usize) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let n = y.len();
     if n == 0 || x.len() < soff + n {
         return false;
@@ -52800,6 +52970,7 @@ pub fn axpy_for_test(x: &[f32], y: &mut [f32], w: f32, set: bool, soff: usize) -
 
 pub fn top_k_for_test(scores: &[f32], k: usize, out: &mut Vec<u32>) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let n = scores.len();
     if n == 0 || n > 4096 || k == 0 {
         out.clear();
@@ -53720,6 +53891,7 @@ pub fn dsv4_encode_prep(
     enc: &mut wgpu::CommandEncoder,
 ) -> Option<usize> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     // The compressors first: both read this token's hidden state, and the
     // attention one appends into the same cache buffer the window lives in,
     // past the window's capacity.
@@ -53831,6 +54003,7 @@ pub fn dsv4_encode_prep(
 /// have different widths.
 fn dsv4_index_cache(kv_id: u64, li: usize, floats: usize) -> Option<wgpu::Buffer> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let cap = floats.next_power_of_two().max(1024);
     let mut m = c.dsv4_ixkv.lock().unwrap();
     // Growing CARRIES the contents. This cache accumulates one compressed
@@ -54034,6 +54207,7 @@ fn dsv4_layer_frame_enc(
     let Some(c) = ctx() else {
         no!("нет контекста wgpu")
     };
+    let _op = c.op_gate.enter();
     // Keys are per (layer, token); the cache lookup below stays per layer.
     let lk = li * FRAME_TOK_STRIDE + tok;
     let a = g.attn;
@@ -54492,6 +54666,7 @@ fn dsv4_layer_frame_enc(
 /// region walks off the end as the sequence lengthens.
 pub fn dsv4_cache_ensure(kv_id: u64, li: usize, cap: usize) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if (cap * 4) as u64 > c.device.limits().max_storage_buffer_binding_size {
         return false;
     }
@@ -54550,6 +54725,7 @@ pub fn dsv4_cache_ensure(kv_id: u64, li: usize, cap: usize) -> bool {
 /// Seed only the fold: the device's qn is already this layer's.
 pub fn dsv4_chain_seed_fold(x: &[f32]) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let b = frame_buf(c, 45, x.len() * 4, true);
     c.queue.write_buffer(&b, 0, bytemuck::cast_slice(x));
     true
@@ -54558,6 +54734,7 @@ pub fn dsv4_chain_seed_fold(x: &[f32]) -> bool {
 /// Seed one token of a batch: its opening fold and its LoRA vector.
 pub fn dsv4_chain_seed_t(x: &[f32], qn: &[f32], tok: usize) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let b = frame_buf_t(c, 45, tok, x.len() * 4, true);
     c.queue.write_buffer(&b, 0, bytemuck::cast_slice(x));
     let q = frame_buf_t(c, 4, tok, qn.len() * 4, true);
@@ -54567,6 +54744,7 @@ pub fn dsv4_chain_seed_t(x: &[f32], qn: &[f32], tok: usize) -> bool {
 
 pub fn dsv4_chain_seed(x: &[f32], qn: &[f32]) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let b = frame_buf(c, 45, x.len() * 4, true);
     c.queue.write_buffer(&b, 0, bytemuck::cast_slice(x));
     // The LoRA vector too: every frame leaves the NEXT layer's there, and
@@ -54623,6 +54801,7 @@ pub fn dsv4_chain_batch(
     state_out: Option<&mut [f32]>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let Some((_, g0, _)) = layers.first() else {
         return false;
     };
@@ -54924,6 +55103,7 @@ fn dsv4_chain_batch_bt(
     state_out: Option<&mut [f32]>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let Some((_, g0, _)) = layers.first() else {
         return false;
     };
@@ -55303,6 +55483,7 @@ pub fn dsv4_chain_seed_bt(
     qn: &[f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let up = |tag: u8, len: usize, off: usize, data: &[f32]| {
         let b = frame_buf_t(c, tag, 0, batch * len * 4, true);
         c.queue
@@ -55403,6 +55584,7 @@ pub fn dspark_graph(
     states_out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let (hc, dim) = (g.hc, g.dim);
     let mix_hc = (2 + hc) * hc;
     if states0.len() < block * hc * dim || states_out.len() < block * hc * dim {
@@ -56194,6 +56376,7 @@ thread_local! {
 /// just landed and compares it against the per-token path's.
 pub fn dsv4_dbg_read_ix(kv_id: u64, li: usize, off: usize, n: usize) -> Option<Vec<f32>> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let b = {
         let m = c.dsv4_ixkv.lock().unwrap();
         m.get(&(kv_id, li)).map(|(b, _)| b.clone())?
@@ -56221,6 +56404,7 @@ pub fn dsv4_dbg_read_ix(kv_id: u64, li: usize, off: usize, n: usize) -> Option<V
 
 pub fn dsv4_dbg_read_tag(tag: u8, tok: usize, n: usize) -> Option<Vec<f32>> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let b = {
         let m = c.dsv4_scratch.lock().unwrap();
         // The pool keys on (tag, tok, len); a debug reader doesn't know the
@@ -56265,6 +56449,7 @@ pub fn dsv4_spec_cap_read_all(batch: usize, n_caps: usize, hc_dim: usize, out: &
         return true;
     }
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let cap = frame_buf_t(c, BT_CAP, 0, n_caps * batch * hc_dim * 4, true);
     let bytes = (n_caps * batch * hc_dim * 4) as u64;
     let mut sc = c.scratch.lock().unwrap();
@@ -56303,6 +56488,7 @@ pub fn dsv4_spec_cap_read(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let cap = frame_buf_t(c, BT_CAP, 0, n_caps * batch * hc_dim * 4, true);
     let bytes = (hc_dim * 4) as u64;
     let mut sc = c.scratch.lock().unwrap();
@@ -56379,6 +56565,7 @@ pub fn dsv4_spec_shadow(
     batch: usize,
 ) -> Option<Dsv4SpecShadow> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let mut enc = c
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -56451,6 +56638,7 @@ pub fn dsv4_spec_shadow(
 /// rows, copy the compressor streams back. Counts are the host's business.
 pub fn dsv4_spec_restore(sh: &Dsv4SpecShadow) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let mut enc = c
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -56512,6 +56700,7 @@ pub fn dsv4_spec_commit_windows(
     k: usize,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if k == 0 {
         return true;
     }
@@ -56571,6 +56760,7 @@ pub fn dsv4_spec_replay(
     let Some(c) = ctx() else {
         rfail!("нет контекста")
     };
+    let _op = c.op_gate.enter();
     let retain = frame_buf_t(c, BT_RETAIN, 0, layers.len() * batch * dim * 4, false);
     let mut enc = c
         .device
@@ -56783,6 +56973,7 @@ fn dsv4_layer_frame_bt_enc(
     let Some(c) = ctx() else {
         no!("нет контекста wgpu")
     };
+    let _op = c.op_gate.enter();
     let a = g.attn;
     let m = g.moe;
     let (hc, dim) = (g.hc, a.dim);
@@ -58117,6 +58308,7 @@ pub fn dsv4_layer_chain(
     state_out: Option<&mut [f32]>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let Some((_, g0, _)) = layers.first() else {
         return false;
     };
@@ -58251,6 +58443,7 @@ pub fn dsv4_layer_batch_partial(
     pos0: usize,
 ) -> Option<Dsv4PartialBatchOut> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     if batch == 0 || batch > FRAME_TOK_STRIDE || w.moe.remap.is_none() || w.hc_next_fn.is_some() {
         return None;
     }
@@ -58379,6 +58572,7 @@ pub fn dsv4_layer_batch_partial(
 /// before the eventual capture read, so no extra submission is needed.
 pub fn dsv4_spec_cap_write_host(li: usize, batch: usize, hc_dim: usize, states: &[f32]) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let (_, caps) = SPEC_RETAIN.with(|v| v.borrow().clone());
     let Some(slot) = caps.iter().position(|&x| x == li) else {
         return true;
@@ -58424,6 +58618,7 @@ pub fn dsv4_layer_frame(
     cold_x_out: &mut Vec<f32>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let dim = g.attn.dim;
     if folded_next.len() < dim {
         return false;
@@ -58527,6 +58722,7 @@ pub fn dsv4_layer_frame(
 /// Is this tensor resident, or can it be made so? Uploads it if it can.
 pub fn dsv4_weight_ready(model: &Arc<CmfModel>, idx: usize) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let Some(e) = model.tensors.get(idx) else {
         return false;
     };
@@ -58654,6 +58850,7 @@ pub fn dsv4_global_moe_create_for_dsv41(
     gu_q2: bool,
 ) -> Option<(usize, usize)> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let segments = dsv4_global_moe_segments_for_dsv41(&c);
     dsv4_global_moe_create_with_segments(model, requested, inter, hidden, gu_q2, segments)
 }
@@ -58670,6 +58867,7 @@ pub fn dsv4_global_moe_create_slots(
     gu_q2: bool,
 ) -> Option<(usize, usize)> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     // One segment buffer is bounded by the binding range; past S8's
     // capacity the S16 family (built here on first need) doubles it.
     let gu_len = cortiq_core::quant::expected_nbytes(
@@ -58755,6 +58953,7 @@ fn dsv4_global_moe_create_inner(
 ) -> Option<(usize, usize)> {
     use std::sync::atomic::Ordering;
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     if dsv4_global_moe_pipelines(&c, gu_q2, segments).is_none() {
         return None;
     }
@@ -58899,6 +59098,7 @@ pub fn dsv4_global_slot_fill(model: &Arc<CmfModel>, slot: usize, t: (usize, usiz
         ok
     };
     let Some(c) = ctx() else { return finish(false) };
+    let _op = c.op_gate.enter();
     let Some(b) = c.dsv4_global_moe.lock().unwrap().get(&model.uid()).cloned() else {
         return finish(false);
     };
@@ -58978,6 +59178,7 @@ pub fn dsv4_global_slot_fill(model: &Arc<CmfModel>, slot: usize, t: (usize, usiz
 pub fn dsv4_experts_fit(inter: usize, hidden: usize, gu_q2: bool, dn_q2: bool) -> usize {
     use std::sync::atomic::Ordering;
     let Some(c) = ctx() else { return 0 };
+    let _op = c.op_gate.enter();
     let gu = if gu_q2 {
         cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q2TiledP, &[inter, hidden])
     } else {
@@ -59159,6 +59360,7 @@ pub fn vae_conv2d_coop(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let (Some(im2col), Some(gemm)) = (c.vae_im2col.as_ref(), c.gemm_nt_coop.as_ref()) else {
         return false;
     };
@@ -59362,6 +59564,7 @@ pub fn conv1d_gemm(
         return false;
     }
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let (Some(ic_pipe), Some(gemm)) = (c.conv1d_im2col.as_ref(), c.gemm_nt_coop.as_ref()) else {
         return false;
     };
@@ -59522,6 +59725,7 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
         return false;
     }
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     // Small jobs lose to the round trip.
     if n * k * m < (1 << 22) {
         return false;
@@ -59663,6 +59867,7 @@ pub fn gemm_dx_f32(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m:
         return false;
     }
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if n * k * m < (1 << 22) || k > 65_000 || n > 65_000 {
         return false;
     }
@@ -59832,6 +60037,7 @@ pub fn ffn_chain_f32(
         return false;
     }
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let act_link = match act {
         crate::fcd_ops::FfnAct::Silu => &c.bake_silu,
         crate::fcd_ops::FfnAct::GeluErf => &c.bake_gelu,
@@ -60058,6 +60264,7 @@ pub fn ffn_chain_f32(
 /// gate OOM-panicked the moment the planes joined the weights).
 pub fn bake_release() {
     let Some(c) = ctx() else { return };
+    let _op = c.op_gate.enter();
     let _bake = BAKE_LOCK.lock().unwrap();
     c.bake_planes.lock().unwrap().clear();
     c.gemm_w_bufs.lock().unwrap().clear();
@@ -60126,6 +60333,7 @@ pub fn attn_chain_f32(
         return None;
     }
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let nt = c.gemm_nt_coop.as_ref()?;
     let (b, t, nh, nkv, hd, hsz) = (cfg.b, cfg.t, cfg.nh, cfg.nkv, cfg.hd, cfg.hsz);
     let n = b * t;
@@ -60545,6 +60753,7 @@ pub fn attn_bwd_chain_f32(
         return false;
     }
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let n = b * t;
     let qdim = nh * hd;
     let kvdim = nkv * hd;
@@ -60706,6 +60915,7 @@ pub fn ffn_bwd_chain_f32(
         return false;
     }
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if scale.is_some_and(|s| s.len() < inter) || dmask.as_ref().is_some_and(|d| d.len() < inter) {
         return false;
     }
@@ -60977,6 +61187,7 @@ fn vae_conv_impl(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     // `h`/`w_img` are the SOURCE dims; an upsampling conv writes 2x.
     let (oh, ow) = if up2 { (h * 2, w_img * 2) } else { (h, w_img) };
     let ick2 = ic * k * k;
@@ -61100,6 +61311,7 @@ pub fn q4tp_qkv(
     v_out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if hidden % 32 != 0 || b == 0 || xs.len() < b * hidden {
         return false;
     }
@@ -61422,6 +61634,7 @@ pub fn qwen_image_mlp_inplace(
     gate: &[f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if batch < 32
         || hidden == 0
         || inter == 0
@@ -61555,6 +61768,7 @@ pub fn q4tp_gelu_ffn(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let _gate = c.mm_gate.lock().unwrap();
     if b < 32
         || hidden == 0
@@ -61993,6 +62207,7 @@ pub fn qwen_image_block(
     a: &mut crate::gpu::QwenImageBlockArgs<'_>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let hidden = a.heads.checked_mul(a.head_dim).unwrap_or(0);
     let total = a.image_tokens.checked_add(a.text_tokens).unwrap_or(0);
     let pairs = a.head_dim / 2;
@@ -63122,6 +63337,7 @@ pub fn qwen_image_chain(
     a: &mut crate::gpu::QwenImageChainArgs<'_>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let hidden = a.heads.checked_mul(a.head_dim).unwrap_or(0);
     let total = a.image_tokens.checked_add(a.text_tokens).unwrap_or(0);
     let pairs = a.head_dim / 2;
@@ -63336,6 +63552,7 @@ pub fn qwen_image_attention(
     a: &mut crate::gpu::QwenImageAttentionArgs<'_>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let hidden = a.heads.checked_mul(a.head_dim).unwrap_or(0);
     let total = a.image_tokens.checked_add(a.text_tokens).unwrap_or(0);
     let pairs = a.head_dim / 2;
@@ -63698,6 +63915,7 @@ pub fn dit_block_seg(
         bail("no ctx");
         return false;
     };
+    let _op = c.op_gate.enter();
     let (n, hs, inter) = (a.n, a.hidden, a.inter);
     let (nh, nkv, hd) = (a.nh, a.nkv, a.hd);
     if hs % 32 != 0 || inter % 32 != 0 || hd % 2 != 0 || nkv == 0 {
@@ -64285,6 +64503,7 @@ pub fn dit_block_seg(
 /// is interrupted — the state lives only on the device at that point.
 pub fn dit_state_fetch(x: &mut [f32]) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let pool = c.dit_pool.lock().unwrap();
     let Some((xb, have)) = pool.get("dit-x").cloned() else {
         return false;
@@ -64549,6 +64768,7 @@ pub fn dsv4_slot_fill(
                     return false;
                 };
                 let c = ctx().unwrap();
+                let _op = c.op_gate.enter();
                 if (slot + 1) * gl as usize > g.size() as usize / 1 {}
                 c.queue
                     .write_buffer(&g, (slot * gl) as u64, &bk.g[gi * gl..(gi + 1) * gl]);
@@ -64565,6 +64785,7 @@ pub fn dsv4_slot_fill(
     }
     use std::sync::atomic::Ordering;
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let key = (model.uid() as usize, pack_first);
     let Some((g, u, d)) = c.moe_expw.lock().unwrap().get(&key).cloned() else {
         return false;
@@ -64633,6 +64854,7 @@ pub fn dsv4_slot_fill(
 /// hybrid split (`cortiq bench --bw`). None when no device came up.
 pub fn upload_bandwidth_probe(block: usize, rounds: usize) -> Option<f64> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let src = vec![5u8; block];
     let buf = c.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("bw-probe"),
@@ -64681,6 +64903,7 @@ pub fn dsv4_experts_ready(
     dn_q2: bool,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     moe_expert_bufs(c, model, experts, inter, hidden, true, gu_q2, dn_q2).is_some()
 }
 
@@ -64695,6 +64918,7 @@ pub fn dsv4_experts_ready(
 /// written last — so this, like the state, is per token.
 pub fn dsv4_hc_write_t(post: &[f32], comb: &[f32], tok: usize) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let pb = frame_buf_t(c, 43, tok, post.len() * 4, true);
     let cb = frame_buf_t(c, 44, tok, comb.len() * 4, true);
     c.queue.write_buffer(&pb, 0, bytemuck::cast_slice(post));
@@ -64704,6 +64928,7 @@ pub fn dsv4_hc_write_t(post: &[f32], comb: &[f32], tok: usize) -> bool {
 
 pub fn dsv4_hc_write(post: &[f32], comb: &[f32]) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let pb = frame_buf(c, 43, post.len() * 4, true);
     let cb = frame_buf(c, 44, comb.len() * 4, true);
     c.queue.write_buffer(&pb, 0, bytemuck::cast_slice(post));
@@ -64719,6 +64944,7 @@ pub fn dsv4_hc_write(post: &[f32], comb: &[f32]) -> bool {
 /// the single-slot writer can only reach token zero.
 pub fn dsv4_state_write_t(state: &[f32], tok: usize) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let b = frame_buf_t(c, 40, tok, state.len() * 4, true);
     c.queue.write_buffer(&b, 0, bytemuck::cast_slice(state));
     true
@@ -64726,6 +64952,7 @@ pub fn dsv4_state_write_t(state: &[f32], tok: usize) -> bool {
 
 pub fn dsv4_state_write(state: &[f32]) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let b = frame_buf(c, 40, state.len() * 4, true);
     c.queue.write_buffer(&b, 0, bytemuck::cast_slice(state));
     true
@@ -64734,6 +64961,7 @@ pub fn dsv4_state_write(state: &[f32]) -> bool {
 /// Read the hyper-connection state back (end of token, for the head).
 pub fn dsv4_state_read(state: &mut [f32]) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let b = frame_buf(c, 40, state.len() * 4, true);
     let bytes = (state.len() * 4) as u64;
     let mut sc = c.scratch.lock().unwrap();
@@ -64783,6 +65011,7 @@ fn dsv4_state_add_cold_inner(
     preserved: Option<(u64, usize)>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if hc == 0 || cold.is_empty() || state_out.len() != hc * cold.len() {
         return false;
     }
@@ -64844,6 +65073,7 @@ pub fn bt_moe_route_for_test(
     w_out: &mut Vec<f32>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let n = scores.len() / b.max(1);
     if n == 0 || n > 1024 || top_k == 0 || top_k > 64 || b == 0 {
         return false;
@@ -64994,6 +65224,7 @@ fn moe_route_for_test_impl(
     w_out: &mut Vec<f32>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let n = scores.len();
     if n == 0 || n > 1024 || top_k == 0 || top_k > 64 {
         return false;
@@ -65396,6 +65627,7 @@ pub fn dispatch_bench() -> Vec<String> {
         out.push("нет устройства".into());
         return out;
     };
+    let _op = c.op_gate.enter();
     const N: usize = 2000;
     let bufs: Vec<wgpu::Buffer> = (0..8)
         .map(|_| {
@@ -65981,6 +66213,7 @@ pub fn dsv4_compressor_frame(
     enc: &mut wgpu::CommandEncoder,
 ) -> Option<usize> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let _ew = if g.overlap { g.width / 2 } else { g.width };
     if g.width == 0 || g.ratio == 0 || g.hidden % 32 != 0 {
         return None;
@@ -66250,6 +66483,7 @@ pub fn dsv4_window_append(
     enc: &mut wgpu::CommandEncoder,
 ) -> Option<usize> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let bytes = model.primary_bytes();
     let e = model.tensors.get(wkv)?;
     if e.dtype != cortiq_core::TensorDtype::Q4TiledP {
@@ -66372,6 +66606,7 @@ pub fn dsv4_window_place_for_test(
     out: &mut Vec<f32>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     // A POOLED buffer, not a fresh one: `encode_rmsnorm` caches its bind
     // group by key, so a new buffer every call would leave the cache
     // pointing at the first one. Production hands it `frame_buf` for the
@@ -66459,6 +66694,7 @@ pub fn dsv4_indexer_frame(
     enc: &mut wgpu::CommandEncoder,
 ) -> Option<usize> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let limit = n_ix.min(n_comp);
     if g.ih == 0 || g.idim == 0 || limit == 0 || limit > 4096 {
         return None;
@@ -66809,6 +67045,7 @@ pub fn dsv4_comp_state_for_test(
     out: &mut Vec<f32>,
 ) -> Option<bool> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let g = Dsv4CompGeom {
         width,
         hidden: 0,
@@ -66871,6 +67108,7 @@ pub fn dsv4_idx_build_for_test(
     out: &mut Vec<u32>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let n = win_len + pick.len();
     // A zero-length binding is a validation error, and "the indexer picked
     // nothing" is a real state — pad rather than refuse.
@@ -66921,6 +67159,7 @@ pub fn dsv4_idx_build_for_test(
 /// Drop a sequence's compressor streams (called with the rest of its state).
 pub fn dsv4_compressor_forget(kv_id: u64) {
     if let Some(c) = ctx() {
+        let _op = c.op_gate.enter();
         c.dsv4_comp.lock().unwrap().retain(|k, _| k.1 != kv_id);
     }
 }
@@ -66935,6 +67174,7 @@ pub fn dsv4_cache_write(kv_id: u64, li: usize, off: usize, data: &[f32], cap: us
         }
         return false;
     };
+    let _op = c.op_gate.enter();
     if off + data.len() > cap {
         if dbg {
             eprintln!("кеш dsv4: {off}+{} не влезает в {cap}", data.len());
@@ -67158,6 +67398,7 @@ pub static GREW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// Drop a conversation's caches (a new sequence, or the pipeline resetting).
 pub fn dsv4_cache_clear(kv_id: u64) {
     if let Some(c) = ctx() {
+        let _op = c.op_gate.enter();
         c.dsv4_kv.lock().unwrap().retain(|k, _| k.0 != kv_id);
     }
 }
@@ -67268,6 +67509,7 @@ pub fn dsv4_attn_frame(
     let Some(c) = ctx() else {
         no!("нет контекста wgpu")
     };
+    let _op = c.op_gate.enter();
     // `hidden` is only read when the frame has to build the LoRA vector
     // itself; demanding it regardless refused every caller that had one.
     if (qn_in.is_none() && q_in.is_none() && hidden.len() < g.dim)
@@ -67751,6 +67993,7 @@ pub fn dsv4_moe_frame(
     let Some(c) = ctx() else {
         no!("нет контекста wgpu")
     };
+    let _op = c.op_gate.enter();
     let global_bufs = w
         .global
         .and_then(|gl| c.dsv4_global_moe.lock().unwrap().get(&gl.pool_uid).cloned());
@@ -68585,6 +68828,7 @@ pub fn sparse_attend_for_test(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if q.len() != nh * hd || out.len() != nh * hd || sink.len() != nh || idxs.len() > 1024 {
         return false;
     }
@@ -68653,6 +68897,7 @@ pub fn attend_x_for_test(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let Some(gx) = c.graph_x.as_ref() else {
         return false;
     };
@@ -68794,6 +69039,7 @@ pub fn attend_xg_for_test(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let Some(gx) = c.graph_x.as_ref() else {
         return false;
     };
@@ -68978,6 +69224,7 @@ pub fn hc_join_for_test(
     expanded: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if state.len() != hc * dim || folded.len() != dim || expanded.len() != hc * dim {
         return false;
     }
@@ -69186,5 +69433,45 @@ mod mimo_precision_scope_tests {
         assert!(!MIMO_F32_GEMM.get());
         let _ = std::panic::catch_unwind(|| { let _mimo = MimoF32Gemm::enter("mimo_v2"); panic!("scope test"); });
         assert!(!MIMO_F32_GEMM.get());
+    }
+}
+
+#[cfg(test)]
+mod op_gate_tests {
+    use super::OpGate;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn op_gate_reenters_on_one_thread_and_excludes_the_others() {
+        let gate = Arc::new(OpGate::default());
+        // Re-entry on the owning thread must not block (ops call ops).
+        {
+            let _a = gate.enter();
+            let _b = gate.enter();
+        }
+        // Across threads: never two inside at once, every entry completes.
+        let inside = Arc::new(AtomicUsize::new(0));
+        let worst = Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let (gate, inside, worst) = (gate.clone(), inside.clone(), worst.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        let _g = gate.enter();
+                        let _nested = gate.enter();
+                        let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                        worst.fetch_max(now, Ordering::SeqCst);
+                        std::thread::yield_now();
+                        inside.fetch_sub(1, Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(worst.load(Ordering::SeqCst), 1);
+        assert_eq!(inside.load(Ordering::SeqCst), 0);
     }
 }
