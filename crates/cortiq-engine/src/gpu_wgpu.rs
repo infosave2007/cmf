@@ -16586,11 +16586,12 @@ fn bake_silu_mul(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// dact into the concatenated dgu — silu·mul backward, exactly
 /// `ops::silu_bwd`'s σ(x)·(1 + x·(1−σ(x))).
 const BAKE_SILU_BWD_SRC: &str = r#"
-struct BwP { inter: u32, total: u32, _a: u32, stride: u32 };
+struct BwP { inter: u32, total: u32, scaled: u32, stride: u32 };
 @group(0) @binding(0) var<storage, read> bw_plane : array<f32>;
 @group(0) @binding(1) var<storage, read> bw_dact : array<f32>;
 @group(0) @binding(2) var<storage, read_write> bw_dgu : array<f32>;
 @group(0) @binding(3) var<uniform> bw_p : BwP;
+@group(0) @binding(4) var<storage, read> bw_s : array<f32>;
 @compute @workgroup_size(256)
 fn bake_silu_bwd(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.y * bw_p.stride + gid.x;
@@ -16599,11 +16600,311 @@ fn bake_silu_bwd(@builtin(global_invocation_id) gid: vec3<u32>) {
     let j = i % bw_p.inter;
     let g = bw_plane[r * 2u * bw_p.inter + j];
     let u = bw_plane[r * 2u * bw_p.inter + bw_p.inter + j];
-    let da = bw_dact[i];
+    var da = bw_dact[i];
+    if (bw_p.scaled != 0u) { da = da * bw_s[j]; }
     let s = 1.0 / (1.0 + exp(-g));
     bw_dgu[r * 2u * bw_p.inter + j] = da * u * (s * (1.0 + g * (1.0 - s)));
     bw_dgu[r * 2u * bw_p.inter + bw_p.inter + j] = da * (g * s);
 }
+"#;
+
+
+/// The exact-GELU twin of the silu link (Spark-X2.5, `hidden_act = "gelu"`):
+/// erf by Abramowitz–Stegun 7.1.26 — the formula the host trainer
+/// (`fcd_ops::gelu_erf`) and the runtime kernels evaluate.
+const BAKE_GELU_SRC: &str = r#"
+struct BgP { inter: u32, total: u32, scaled: u32, stride: u32 };
+@group(0) @binding(0) var<storage, read> bg_b : array<f32>;
+@group(0) @binding(1) var<storage, read> bg_s : array<f32>;
+@group(0) @binding(2) var<storage, read_write> bg_a : array<f32>;
+@group(0) @binding(3) var<uniform> bg_p : BgP;
+fn bk_erf(x: f32) -> f32 {
+    let a = abs(x);
+    let t = 1.0 / (1.0 + 0.3275911 * a);
+    let y = 1.0
+        - (((((1.0614054 * t - 1.4531521) * t + 1.4214138) * t - 0.28449674) * t
+            + 0.2548296)
+            * t)
+            * exp(-a * a);
+    return select(y, -y, x < 0.0);
+}
+@compute @workgroup_size(256)
+fn bake_gelu_mul(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.y * bg_p.stride + gid.x;
+    if (i >= bg_p.total) { return; }
+    let r = i / bg_p.inter;
+    let j = i % bg_p.inter;
+    let g = bg_b[r * 2u * bg_p.inter + j];
+    let u = bg_b[r * 2u * bg_p.inter + bg_p.inter + j];
+    var a = (0.5 * g * (1.0 + bk_erf(g * 0.70710678))) * u;
+    if (bg_p.scaled != 0u) { a = a * bg_s[j]; }
+    bg_a[i] = a;
+}
+"#;
+
+/// GELU backward link: dg = da·u·(Φ(g) + g·φ(g)), du = da·gelu(g) —
+/// exactly `ops::gelu_erf_bwd`.
+const BAKE_GELU_BWD_SRC: &str = r#"
+struct BgwP { inter: u32, total: u32, scaled: u32, stride: u32 };
+@group(0) @binding(0) var<storage, read> bgw_plane : array<f32>;
+@group(0) @binding(1) var<storage, read> bgw_dact : array<f32>;
+@group(0) @binding(2) var<storage, read_write> bgw_dgu : array<f32>;
+@group(0) @binding(3) var<uniform> bgw_p : BgwP;
+@group(0) @binding(4) var<storage, read> bgw_s : array<f32>;
+fn bkw_erf(x: f32) -> f32 {
+    let a = abs(x);
+    let t = 1.0 / (1.0 + 0.3275911 * a);
+    let y = 1.0
+        - (((((1.0614054 * t - 1.4531521) * t + 1.4214138) * t - 0.28449674) * t
+            + 0.2548296)
+            * t)
+            * exp(-a * a);
+    return select(y, -y, x < 0.0);
+}
+@compute @workgroup_size(256)
+fn bake_gelu_bwd(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.y * bgw_p.stride + gid.x;
+    if (i >= bgw_p.total) { return; }
+    let r = i / bgw_p.inter;
+    let j = i % bgw_p.inter;
+    let g = bgw_plane[r * 2u * bgw_p.inter + j];
+    let u = bgw_plane[r * 2u * bgw_p.inter + bgw_p.inter + j];
+    var da = bgw_dact[i];
+    if (bgw_p.scaled != 0u) { da = da * bgw_s[j]; }
+    let cdf = 0.5 * (1.0 + bkw_erf(g * 0.70710678));
+    let pdf = exp(-0.5 * g * g) * 0.3989422804014327;
+    bgw_dgu[r * 2u * bgw_p.inter + j] = da * u * (cdf + g * pdf);
+    bgw_dgu[r * 2u * bgw_p.inter + bgw_p.inter + j] = da * (g * cdf);
+}
+"#;
+
+/// DTG-MA mask gradient on the card: dm[j] = Σ_r dact[r,j]·act(g[r,j])·u[r,j]
+/// from the resident gate+up plane and the dh·down product — one thread per
+/// neuron walking the rows (coalesced across neurons). What the host
+/// summed in f64 over a 335 MB plane it no longer needs to see.
+const BAKE_MASKGRAD_SRC: &str = r#"
+struct MgP { inter: u32, n: u32, act: u32, _c: u32 };
+@group(0) @binding(0) var<storage, read> mg_plane : array<f32>;
+@group(0) @binding(1) var<storage, read> mg_dact : array<f32>;
+@group(0) @binding(2) var<storage, read_write> mg_dm : array<f32>;
+@group(0) @binding(3) var<uniform> mg_p : MgP;
+fn mg_erf(x: f32) -> f32 {
+    let a = abs(x);
+    let t = 1.0 / (1.0 + 0.3275911 * a);
+    let y = 1.0
+        - (((((1.0614054 * t - 1.4531521) * t + 1.4214138) * t - 0.28449674) * t
+            + 0.2548296)
+            * t)
+            * exp(-a * a);
+    return select(y, -y, x < 0.0);
+}
+fn mg_act(g: f32) -> f32 {
+    if (mg_p.act == 1u) { return 0.5 * g * (1.0 + mg_erf(g * 0.70710678)); }
+    return g / (1.0 + exp(-g));
+}
+@compute @workgroup_size(256)
+fn bake_mask_grad(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let j = gid.x;
+    if (j >= mg_p.inter) { return; }
+    var acc = 0.0;
+    for (var r = 0u; r < mg_p.n; r = r + 1u) {
+        let g = mg_plane[r * 2u * mg_p.inter + j];
+        let u = mg_plane[r * 2u * mg_p.inter + mg_p.inter + j];
+        acc = acc + mg_dact[r * mg_p.inter + j] * mg_act(g) * u;
+    }
+    mg_dm[j] = acc;
+}
+"#;
+
+
+/// Bake attention backward, kernel 1 — one workgroup per (query row,
+/// sequence·head): the row's softmax recomputed (scores, max, sum), the
+/// dot `dp_j = dao·v_j`, `D = Σ p·dp`, then `ds_j = p_j(dp_j − D)·scale`
+/// and `dq = Σ_j ds_j·k_j` with lanes over components. Writes the row's
+/// (max, den, D) for kernel 2. Same window rule as the forward.
+const BAKE_ATTN_BWD_Q_SRC: &str = r#"
+struct AbP { t: u32, nh: u32, nkv: u32, hd: u32, b: u32, window: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<storage, read> ab_q : array<f32>;
+@group(0) @binding(1) var<storage, read> ab_k : array<f32>;
+@group(0) @binding(2) var<storage, read> ab_v : array<f32>;
+@group(0) @binding(3) var<storage, read> ab_do : array<f32>;
+@group(0) @binding(4) var<storage, read_write> ab_dq : array<f32>;
+@group(0) @binding(5) var<storage, read_write> ab_stat : array<f32>;
+@group(0) @binding(6) var<uniform> ab_p : AbP;
+
+var<workgroup> abq_sc: array<f32, 2048>;
+var<workgroup> abq_red: array<f32, 128>;
+
+fn abq_reduce_max(lid: u32, v: f32) -> f32 {
+    abq_red[lid] = v;
+    workgroupBarrier();
+    for (var s = 64u; s > 0u; s = s >> 1u) {
+        if (lid < s) { abq_red[lid] = max(abq_red[lid], abq_red[lid + s]); }
+        workgroupBarrier();
+    }
+    let r = abq_red[0];
+    workgroupBarrier();
+    return r;
+}
+fn abq_reduce_sum(lid: u32, v: f32) -> f32 {
+    abq_red[lid] = v;
+    workgroupBarrier();
+    for (var s = 64u; s > 0u; s = s >> 1u) {
+        if (lid < s) { abq_red[lid] = abq_red[lid] + abq_red[lid + s]; }
+        workgroupBarrier();
+    }
+    let r = abq_red[0];
+    workgroupBarrier();
+    return r;
+}
+
+@compute @workgroup_size(128)
+fn bake_attn_bwd_q(@builtin(workgroup_id) wid: vec3<u32>,
+                   @builtin(local_invocation_index) lid: u32) {
+    let ti = wid.x;
+    let unit = wid.y;
+    let bi = unit / ab_p.nh;
+    let h = unit % ab_p.nh;
+    let rep = ab_p.nh / ab_p.nkv;
+    let g = h / rep;
+    let hd = ab_p.hd;
+    let qdim = ab_p.nh * hd;
+    let kvdim = ab_p.nkv * hd;
+    let scale = 1.0 / sqrt(f32(hd));
+    let row = bi * ab_p.t + ti;
+    let qbase = row * qdim + h * hd;
+    var first = 0u;
+    if (ab_p.window != 0u && ti + 1u > ab_p.window) { first = ti + 1u - ab_p.window; }
+    // 1. scores
+    for (var j = first + lid; j <= ti; j = j + 128u) {
+        let kbase = (bi * ab_p.t + j) * kvdim + g * hd;
+        var s = 0.0;
+        for (var c = 0u; c < hd; c = c + 1u) { s = s + ab_q[qbase + c] * ab_k[kbase + c]; }
+        abq_sc[j] = s * scale;
+    }
+    workgroupBarrier();
+    var lmx = -3.0e38;
+    for (var j = first + lid; j <= ti; j = j + 128u) { lmx = max(lmx, abq_sc[j]); }
+    let mx = abq_reduce_max(lid, lmx);
+    var lsum = 0.0;
+    for (var j = first + lid; j <= ti; j = j + 128u) { lsum = lsum + exp(abq_sc[j] - mx); }
+    let den = abq_reduce_sum(lid, lsum);
+    // 2. D = Σ_j p_j · (dao·v_j)
+    var ld = 0.0;
+    for (var j = first + lid; j <= ti; j = j + 128u) {
+        let vbase = (bi * ab_p.t + j) * kvdim + g * hd;
+        var dp = 0.0;
+        for (var c = 0u; c < hd; c = c + 1u) { dp = dp + ab_do[qbase + c] * ab_v[vbase + c]; }
+        ld = ld + (exp(abq_sc[j] - mx) / den) * dp;
+    }
+    let dsum = abq_reduce_sum(lid, ld);
+    // 3. ds_j·scale in place
+    for (var j = first + lid; j <= ti; j = j + 128u) {
+        let vbase = (bi * ab_p.t + j) * kvdim + g * hd;
+        var dp = 0.0;
+        for (var c = 0u; c < hd; c = c + 1u) { dp = dp + ab_do[qbase + c] * ab_v[vbase + c]; }
+        let p = exp(abq_sc[j] - mx) / den;
+        abq_sc[j] = p * (dp - dsum) * scale;
+    }
+    workgroupBarrier();
+    // 4. dq[c] = Σ_j ds_j·k_j[c]
+    for (var c = lid; c < hd; c = c + 128u) {
+        var acc = 0.0;
+        for (var j = first; j <= ti; j = j + 1u) {
+            acc = acc + abq_sc[j] * ab_k[(bi * ab_p.t + j) * kvdim + g * hd + c];
+        }
+        ab_dq[qbase + c] = acc;
+    }
+    if (lid == 0u) {
+        let sbase = (row * ab_p.nh + h) * 4u;
+        ab_stat[sbase] = mx;
+        ab_stat[sbase + 1u] = den;
+        ab_stat[sbase + 2u] = dsum;
+    }
+}
+"#;
+
+/// Bake attention backward, kernel 2 — one workgroup per (key row j,
+/// sequence·kv-group): for every query head of the group and every query
+/// t that sees j (t ∈ [j, j+w−1] under a window), lanes own a block of
+/// 128 queries each: `p = exp(s − m_t)/den_t`, `ds = p(dp − D_t)·scale`
+/// into shared memory, then lanes flip to components and accumulate
+/// `dk_j += Σ_t ds·q_t`, `dv_j += Σ_t p·dao_t`.
+const BAKE_ATTN_BWD_KV_SRC: &str = r#"
+struct AkP { t: u32, nh: u32, nkv: u32, hd: u32, b: u32, window: u32, _b: u32, _c: u32 };
+@group(0) @binding(0) var<storage, read> ak_q : array<f32>;
+@group(0) @binding(1) var<storage, read> ak_k : array<f32>;
+@group(0) @binding(2) var<storage, read> ak_v : array<f32>;
+@group(0) @binding(3) var<storage, read> ak_do : array<f32>;
+@group(0) @binding(4) var<storage, read> ak_stat : array<f32>;
+@group(0) @binding(5) var<storage, read_write> ak_dk : array<f32>;
+@group(0) @binding(6) var<storage, read_write> ak_dv : array<f32>;
+@group(0) @binding(7) var<uniform> ak_p : AkP;
+
+var<workgroup> akp: array<f32, 128>;
+var<workgroup> akd: array<f32, 128>;
+
+@compute @workgroup_size(128)
+fn bake_attn_bwd_kv(@builtin(workgroup_id) wid: vec3<u32>,
+                    @builtin(local_invocation_index) lid: u32) {
+    let j = wid.x;
+    let unit = wid.y;
+    let bi = unit / ab_p_nkv();
+    let g = unit % ab_p_nkv();
+    let rep = ak_p.nh / ak_p.nkv;
+    let hd = ak_p.hd;
+    let qdim = ak_p.nh * hd;
+    let kvdim = ak_p.nkv * hd;
+    let scale = 1.0 / sqrt(f32(hd));
+    let kbase = (bi * ak_p.t + j) * kvdim + g * hd;
+    var t_last = ak_p.t - 1u;
+    if (ak_p.window != 0u && j + ak_p.window - 1u < t_last) { t_last = j + ak_p.window - 1u; }
+    // accumulators for this lane's components (hd ≤ 256 → ≤ 2 per lane)
+    var dk0 = 0.0; var dk1 = 0.0; var dv0 = 0.0; var dv1 = 0.0;
+    for (var h = g * rep; h < (g + 1u) * rep; h = h + 1u) {
+        for (var tb = j; tb <= t_last; tb = tb + 128u) {
+            let t = tb + lid;
+            var p = 0.0;
+            var ds = 0.0;
+            if (t <= t_last) {
+                let row = bi * ak_p.t + t;
+                let qbase = row * qdim + h * hd;
+                var s = 0.0;
+                var dp = 0.0;
+                for (var c = 0u; c < hd; c = c + 1u) {
+                    s = s + ak_q[qbase + c] * ak_k[kbase + c];
+                    dp = dp + ak_do[qbase + c] * ak_v[kbase + c];
+                }
+                let sbase = (row * ak_p.nh + h) * 4u;
+                p = exp(s * scale - ak_stat[sbase]) / ak_stat[sbase + 1u];
+                ds = p * (dp - ak_stat[sbase + 2u]) * scale;
+            }
+            akp[lid] = p;
+            akd[lid] = ds;
+            workgroupBarrier();
+            let nblk = min(128u, t_last + 1u - tb);
+            for (var tt = 0u; tt < nblk; tt = tt + 1u) {
+                let qb = (bi * ak_p.t + tb + tt) * qdim + h * hd;
+                dk0 = dk0 + akd[tt] * ak_q[qb + lid];
+                dv0 = dv0 + akp[tt] * ak_do[qb + lid];
+                if (lid + 128u < hd) {
+                    dk1 = dk1 + akd[tt] * ak_q[qb + lid + 128u];
+                    dv1 = dv1 + akp[tt] * ak_do[qb + lid + 128u];
+                }
+            }
+            workgroupBarrier();
+        }
+    }
+    if (lid < hd) {
+        ak_dk[kbase + lid] = dk0;
+        ak_dv[kbase + lid] = dv0;
+    }
+    if (lid + 128u < hd) {
+        ak_dk[kbase + lid + 128u] = dk1;
+        ak_dv[kbase + lid + 128u] = dv1;
+    }
+}
+fn ab_p_nkv() -> u32 { return ak_p.nkv; }
 "#;
 
 /// The bake attention chain, stage 1: from the fused qkv plane the coop
@@ -16734,15 +17035,15 @@ fn bake_qkr(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// axis: each lane owns one output component and walks j SEQUENTIALLY,
 /// which is the host loop's accumulation order per component.
 const BAKE_ATTN_SRC: &str = r#"
-struct AtP { t: u32, nh: u32, nkv: u32, hd: u32, b: u32, _a: u32, _b: u32, _c: u32 };
+struct AtP { t: u32, nh: u32, nkv: u32, hd: u32, b: u32, window: u32, _b: u32, _c: u32 };
 @group(0) @binding(0) var<storage, read> at_q : array<f32>;
 @group(0) @binding(1) var<storage, read> at_k : array<f32>;
 @group(0) @binding(2) var<storage, read> at_v : array<f32>;
 @group(0) @binding(3) var<storage, read_write> at_o : array<f32>;
 @group(0) @binding(4) var<uniform> at_p : AtP;
 
-var<workgroup> at_scores: array<f32, 1024>;
-var<workgroup> at_stat: array<f32, 2>;
+var<workgroup> at_scores: array<f32, 2048>;
+var<workgroup> at_red: array<f32, 128>;
 
 @compute @workgroup_size(128)
 fn bake_attn_head(@builtin(workgroup_id) wid: vec3<u32>,
@@ -16758,8 +17059,12 @@ fn bake_attn_head(@builtin(workgroup_id) wid: vec3<u32>,
     let kvdim = at_p.nkv * hd;
     let scale = 1.0 / sqrt(f32(hd));
     let qbase = (bi * at_p.t + ti) * qdim + h * hd;
-    // Phase 1: scores for j ≤ ti.
-    for (var j = lid; j <= ti; j = j + 128u) {
+    // Sliding window (0 = none): query ti sees keys [ti+1-w, ti] — the
+    // runtime's `first = stored - w` rule, the host kernel's `first`.
+    var first = 0u;
+    if (at_p.window != 0u && ti + 1u > at_p.window) { first = ti + 1u - at_p.window; }
+    // Phase 1: scores for first ≤ j ≤ ti.
+    for (var j = first + lid; j <= ti; j = j + 128u) {
         let kbase = (bi * at_p.t + j) * kvdim + g * hd;
         var s = 0.0;
         for (var c = 0u; c < hd; c = c + 1u) {
@@ -16768,36 +17073,52 @@ fn bake_attn_head(@builtin(workgroup_id) wid: vec3<u32>,
         at_scores[j] = s * scale;
     }
     workgroupBarrier();
-    if (lid == 0u) {
-        var mx = at_scores[0];
-        for (var j = 1u; j <= ti; j = j + 1u) {
-            mx = max(mx, at_scores[j]);
-        }
-        var den = 0.0;
-        for (var j = 0u; j <= ti; j = j + 1u) {
-            let e = exp(at_scores[j] - mx);
-            at_scores[j] = e;
-            den = den + e;
-        }
-        at_stat[0] = den;
+    // Row max and exp-sum as 128-lane tree reductions (a serial lane-0
+    // walk over 2048 scores was the kernel's slowest link).
+    var lmx = -3.0e38;
+    for (var j = first + lid; j <= ti; j = j + 128u) {
+        lmx = max(lmx, at_scores[j]);
     }
+    at_red[lid] = lmx;
     workgroupBarrier();
-    // Phase 2: lane c owns output component c, walks j in order.
-    let den = at_stat[0];
-    if (lid < hd) {
+    for (var s = 64u; s > 0u; s = s >> 1u) {
+        if (lid < s) { at_red[lid] = max(at_red[lid], at_red[lid + s]); }
+        workgroupBarrier();
+    }
+    let mx = at_red[0];
+    workgroupBarrier();
+    var lsum = 0.0;
+    for (var j = first + lid; j <= ti; j = j + 128u) {
+        let e = exp(at_scores[j] - mx);
+        at_scores[j] = e;
+        lsum = lsum + e;
+    }
+    at_red[lid] = lsum;
+    workgroupBarrier();
+    for (var s = 64u; s > 0u; s = s >> 1u) {
+        if (lid < s) { at_red[lid] = at_red[lid] + at_red[lid + s]; }
+        workgroupBarrier();
+    }
+    let den = at_red[0];
+    workgroupBarrier();
+    // Phase 2: lane c owns output component c (and c+128 for a 256-wide
+    // head), walks j in order.
+    for (var c = lid; c < hd; c = c + 128u) {
         var acc = 0.0;
-        for (var j = 0u; j <= ti; j = j + 1u) {
+        for (var j = first; j <= ti; j = j + 1u) {
             let p = at_scores[j] / den;
-            acc = acc + p * at_v[(bi * at_p.t + j) * kvdim + g * hd + lid];
+            acc = acc + p * at_v[(bi * at_p.t + j) * kvdim + g * hd + c];
         }
-        at_o[(bi * at_p.t + ti) * qdim + h * hd + lid] = acc;
+        at_o[(bi * at_p.t + ti) * qdim + h * hd + c] = acc;
     }
 }
 "#;
 
-/// Stage 3: the output gate — ao·σ(gate), elementwise, 2-D dispatch.
+/// Stage 3: the output gate — ao·σ(gate) elementwise (hd = 0), or
+/// ao·gain[row, head] from a per-head gain plane the host already
+/// squashed (Spark-X2.5's g_proj; hd/nh name the head geometry).
 const BAKE_AGATE_SRC: &str = r#"
-struct AgP { total: u32, stride: u32, _a: u32, _b: u32 };
+struct AgP { total: u32, stride: u32, hd: u32, nh: u32 };
 @group(0) @binding(0) var<storage, read> ag_a : array<f32>;
 @group(0) @binding(1) var<storage, read> ag_g : array<f32>;
 @group(0) @binding(2) var<storage, read_write> ag_o : array<f32>;
@@ -16806,8 +17127,15 @@ struct AgP { total: u32, stride: u32, _a: u32, _b: u32 };
 fn bake_attn_gate(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.y * ag_p.stride + gid.x;
     if (i >= ag_p.total) { return; }
-    let g = ag_g[i];
-    ag_o[i] = ag_a[i] * (1.0 / (1.0 + exp(-g)));
+    if (ag_p.hd == 0u) {
+        let g = ag_g[i];
+        ag_o[i] = ag_a[i] * (1.0 / (1.0 + exp(-g)));
+    } else {
+        let qdim = ag_p.nh * ag_p.hd;
+        let r = i / qdim;
+        let h = (i % qdim) / ag_p.hd;
+        ag_o[i] = ag_a[i] * ag_g[r * ag_p.nh + h];
+    }
 }
 "#;
 
@@ -18442,11 +18770,19 @@ struct Ctx {
     bake_silu: wgpu::ComputePipeline,
     /// Its backward: dact + the resident plane → concatenated dgu.
     bake_silu_bwd: wgpu::ComputePipeline,
+    /// The exact-GELU pair of the same two links (Spark-X2.5).
+    bake_gelu: wgpu::ComputePipeline,
+    bake_gelu_bwd: wgpu::ComputePipeline,
+    /// DTG-MA mask gradient from the resident plane (Phase A on the card).
+    bake_mask_grad: wgpu::ComputePipeline,
     /// The bake attention chain's middle: split+norm+rope, causal
     /// softmax·V per head, output gate (plain f32 modules).
     bake_qkr: wgpu::ComputePipeline,
     bake_attn_head: wgpu::ComputePipeline,
     bake_attn_gate: wgpu::ComputePipeline,
+    /// The bake attention backward (dq; dk+dv) for full-layer FCD.
+    bake_attn_bwd_q: wgpu::ComputePipeline,
+    bake_attn_bwd_kv: wgpu::ComputePipeline,
     /// Per-layer gate+up planes the forward chain parks for the backward
     /// one — the resident graph's memory. Grow-only per layer; ~84 MB a
     /// layer at chunk size, discrete cards only.
@@ -18711,6 +19047,17 @@ struct Ctx {
     /// the other's operand. The scratch lock cannot cover it: `readback`
     /// takes that lock itself, and std mutexes do not re-enter.
     mm_gate: Mutex<()>,
+    /// One device op at a time across threads, re-entrant within one.
+    /// Every op takes it right after `ctx()` and holds it to its end: the
+    /// scratch slots are shared by every pipeline on the device and most
+    /// ops release the scratch lock before they encode, submit and read
+    /// back — or hand a pooled slot (`sc.y`, `sc.dout`) to the next step
+    /// of a keep chain. Two serve slots decoding at once therefore
+    /// computed on each other's operands (59 of 75 concurrent Spark
+    /// completions garbage, measured) or submitted while the other had
+    /// `ca-stage` mapped (a validation panic). Lock order: op_gate →
+    /// mm_gate → scratch.
+    op_gate: OpGate,
     /// One run-owned sidecar (the component gate exercises one real matrix).
     /// A mismatched model/tensor rebuilds it rather than reusing stale row ids.
     q2_ladder: Mutex<Option<Q2LadderCache>>,
@@ -19296,6 +19643,49 @@ fn kv_mirror_seed_x(
     true
 }
 
+/// A re-entrant gate (see `Ctx::op_gate`): the owning thread may enter
+/// again — ops call ops — while every other thread waits for the
+/// outermost exit.
+#[derive(Default)]
+struct OpGate {
+    state: Mutex<(Option<std::thread::ThreadId>, usize)>,
+    free: std::sync::Condvar,
+}
+
+struct OpGuard<'a>(&'a OpGate);
+
+impl OpGate {
+    fn enter(&self) -> OpGuard<'_> {
+        let me = std::thread::current().id();
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            match st.0 {
+                None => {
+                    *st = (Some(me), 1);
+                    break;
+                }
+                Some(owner) if owner == me => {
+                    st.1 += 1;
+                    break;
+                }
+                Some(_) => st = self.free.wait(st).unwrap_or_else(|e| e.into_inner()),
+            }
+        }
+        OpGuard(self)
+    }
+}
+
+impl Drop for OpGuard<'_> {
+    fn drop(&mut self) {
+        let mut st = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.1 -= 1;
+        if st.1 == 0 {
+            st.0 = None;
+            self.0.free.notify_one();
+        }
+    }
+}
+
 #[derive(Default)]
 struct Scratch {
     xs: Option<(wgpu::Buffer, u64)>,
@@ -19346,6 +19736,17 @@ struct Scratch {
     /// changes every call has no business in the resident weight ledger
     /// (and its fingerprint is a full pass over 178 MB per call).
     bwt: Option<(wgpu::Buffer, u64)>,
+    // The bake attention backward chain (dedicated: usages differ from
+    // the forward slots).
+    abq: Option<(wgpu::Buffer, u64)>,
+    abk: Option<(wgpu::Buffer, u64)>,
+    abv: Option<(wgpu::Buffer, u64)>,
+    abdo: Option<(wgpu::Buffer, u64)>,
+    abdq: Option<(wgpu::Buffer, u64)>,
+    abdk: Option<(wgpu::Buffer, u64)>,
+    abdv: Option<(wgpu::Buffer, u64)>,
+    abstat: Option<(wgpu::Buffer, u64)>,
+    abst: Option<(wgpu::Buffer, u64)>,
     by: Option<(wgpu::Buffer, u64)>,
     vcx: Option<(wgpu::Buffer, u64)>,
     vcc: Option<(wgpu::Buffer, u64)>,
@@ -19684,6 +20085,7 @@ pub fn automatic_layer_prefix(
         return None; // an explicit split always wins
     }
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     if c.vram_budget == u64::MAX || num_layers == 0 || physical_layers == 0 {
         return None;
     }
@@ -20403,9 +20805,14 @@ fn init(dev: usize) -> Result<Ctx, String> {
     };
     let bake_silu = plain(BAKE_SILU_SRC, "bake-silu", "bake_silu_mul");
     let bake_silu_bwd = plain(BAKE_SILU_BWD_SRC, "bake-silu-bwd", "bake_silu_bwd");
+    let bake_gelu = plain(BAKE_GELU_SRC, "bake-gelu", "bake_gelu_mul");
+    let bake_gelu_bwd = plain(BAKE_GELU_BWD_SRC, "bake-gelu-bwd", "bake_gelu_bwd");
+    let bake_mask_grad = plain(BAKE_MASKGRAD_SRC, "bake-mask-grad", "bake_mask_grad");
     let bake_qkr = plain(BAKE_QKR_SRC, "bake-qkr", "bake_qkr");
     let bake_attn_head = plain(BAKE_ATTN_SRC, "bake-attn", "bake_attn_head");
     let bake_attn_gate = plain(BAKE_AGATE_SRC, "bake-agate", "bake_attn_gate");
+    let bake_attn_bwd_q = plain(BAKE_ATTN_BWD_Q_SRC, "bake-attn-bwd-q", "bake_attn_bwd_q");
+    let bake_attn_bwd_kv = plain(BAKE_ATTN_BWD_KV_SRC, "bake-attn-bwd-kv", "bake_attn_bwd_kv");
     let argmax_part = pipe("argmax_part");
     let gdn_step_par = pipe("gdn_step_par");
     let gdn_step_par2 = pipe("gdn_step_par2");
@@ -21123,9 +21530,14 @@ fn init(dev: usize) -> Result<Ctx, String> {
         gemm_nn_coop,
         bake_silu,
         bake_silu_bwd,
+        bake_gelu,
+        bake_gelu_bwd,
+        bake_mask_grad,
         bake_qkr,
         bake_attn_head,
         bake_attn_gate,
+        bake_attn_bwd_q,
+        bake_attn_bwd_kv,
         bake_planes: Mutex::new(HashMap::new()),
         argmax_part,
         gdn_step_par,
@@ -21295,6 +21707,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         resident: std::sync::atomic::AtomicU64::new(0),
         scratch: Mutex::new(Scratch::default()),
         mm_gate: Mutex::new(()),
+        op_gate: OpGate::default(),
         q2_ladder: Mutex::new(None),
         planes: Mutex::new(std::collections::HashMap::new()),
         weight_bufs: Mutex::new(HashMap::new()),
@@ -21386,6 +21799,7 @@ fn res_score(e: &Resident, now: u64) -> f32 {
 /// 125 times in a 48-token run on an emulated 24 GB card.
 pub fn pin_weights(model: &Arc<CmfModel>, idxs: &[usize]) -> usize {
     let Some(c) = ctx() else { return 0 };
+    let _op = c.op_gate.enter();
     let uid = model.uid() as usize;
     let mut map = c.weight_bufs.lock().unwrap();
     let mut n = 0;
@@ -21408,6 +21822,7 @@ pub fn pin_weights(model: &Arc<CmfModel>, idxs: &[usize]) -> usize {
 /// is empty. The engine calls this once, after a generation has run.
 pub fn pipeline_cache_flush() {
     let Some(c) = ctx() else { return };
+    let _op = c.op_gate.enter();
     pipeline_cache_store(c.pipeline_cache.as_ref(), &c.adapter_info);
 }
 
@@ -22602,6 +23017,7 @@ pub fn q2tp_selection_report(label: &str) {
 /// `None` means the optional experiment was not requested or failed closed.
 pub fn q2tp_ladder_cache_snapshot() -> Option<(usize, u64, u64)> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let cache = c.q2_ladder.lock().unwrap();
     cache
         .as_ref()
@@ -23655,6 +24071,7 @@ pub fn moe_expert_bufs_requant_gu(
 ) -> Option<(wgpu::Buffer, wgpu::Buffer, wgpu::Buffer)> {
     use std::sync::atomic::Ordering;
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let enc2 = *crate::dsv4::DSPARK_Q2TP_ENCODE.get()?;
     if hidden % 32 != 0 || inter % 32 != 0 {
         return None;
@@ -23755,6 +24172,7 @@ pub fn enabled() -> bool {
 /// can't be resolved.
 pub fn q8_resident_or_upload(model: &Arc<CmfModel>, idx: usize, may_upload: bool) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let entry = &model.tensors[idx];
     let rows_total = entry.shape.first().copied().unwrap_or(0);
     let cols = entry.shape.get(1).copied().unwrap_or(0);
@@ -23814,6 +24232,7 @@ pub fn q8_matvec_range(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if cols % 4 != 0 || rows == 0 {
         return false;
     }
@@ -24014,6 +24433,7 @@ fn q1t_like(
     q4: bool,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let gpr = cols / 32;
     if rows == 0 || cols % 32 != 0 || xs.len() < cols || out.len() < rows {
         return false;
@@ -24152,6 +24572,7 @@ pub fn q1_matvec(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let gpr = cols / 32;
     if rows == 0 || cols % 32 != 0 || gpr % 2 != 0 || xs.len() < cols || out.len() < rows {
         return false;
@@ -24187,6 +24608,7 @@ pub fn q1_matvec(
 /// direct buffers (no residency cache). Returns false without a GPU context.
 pub fn rmsnorm_row(x: &[f32], w: &[f32], out: &mut [f32], gemma: bool, eps: f32) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let n = x.len();
     if n == 0 || w.len() < n || out.len() < n {
         return false;
@@ -24276,6 +24698,7 @@ fn attn_rope_qkn_gpu_scaled(
     gout: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let qraw_b = storage_bytes(c, bytemuck::cast_slice(qraw));
     let k_b = c
         .device
@@ -24372,6 +24795,7 @@ pub fn gqa_attend_gpu(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if hd % 4 != 0 || hd > c.hd_cap {
         return false; // vec4 K/V reads; hd_cap = workgroup-storage limit
     }
@@ -24445,6 +24869,7 @@ pub fn gqa_attend_split_gpu(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if hd % 4 != 0 || hd > c.hd_cap || nh % hpk != 0 {
         return false;
     }
@@ -24661,6 +25086,7 @@ pub fn attn_dropin_gpu(
     attn_out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if pos >= cap || hd % 4 != 0 || hd > c.hd_cap {
         return false; // vec4 K/V reads; hd_cap = workgroup-storage limit
     }
@@ -25015,6 +25441,7 @@ pub fn forward_token_graph(
         graph_refused("no ctx");
         return token_graph_outcome(o1_started || state_started, false);
     };
+    let _op = c.op_gate.enter();
     let graph_live_budget = graph_live_weight_budget(c, model);
     if position >= cap || hd % 4 != 0 || hd > c.hd_cap {
         {
@@ -30000,6 +30427,7 @@ pub fn forward_batch_graph_at(
         bgraph_refused("no ctx");
         return batch_outcome(o1_started || state_started, false);
     };
+    let _op = c.op_gate.enter();
     // This is the true entry for the resident batch graph.  The token graph
     // has its own reset, but a batch call normally follows a completed
     // readback without passing through that path.  Reset before resolving
@@ -33447,6 +33875,7 @@ pub fn forward_batch_graph_at(
 /// recurrent layers and letting the next graph consume mixed state.
 pub fn gdn_spec_restore(kv_id: u64, slot: usize, base_pos: usize, expected_layers: usize) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let snaps = c.gdn_snap.lock().unwrap();
     let entries: Vec<(usize, &(wgpu::Buffer, u64, u64, usize, usize))> = snaps
         .iter()
@@ -34014,6 +34443,7 @@ fn forward_embryo_graph_rows(
         }
         return false;
     };
+    let _op = c.op_gate.enter();
     // The resident graph has a single readback, so a short opt-in profiler
     // can separate the device timestamped dispatch from host encode and the
     // submit/map/copy wait.  Keep this off the normal path: resolving a query
@@ -34913,6 +35343,7 @@ fn forward_embryo_graph_rows(
 /// Drop the device K/V mirror for a pipeline (called on cache clear).
 pub fn kv_mirror_reset(kv_id: u64) {
     if let Some(c) = ctx() {
+        let _op = c.op_gate.enter();
         c.attn_kv.lock().unwrap().retain(|(id, _), _| *id != kv_id);
         c.gdn_state
             .lock()
@@ -34938,6 +35369,7 @@ pub fn kv_mirror_reset(kv_id: u64) {
 /// The storage itself is retained for the next append.
 pub fn kv_mirror_set_stored(kv_id: u64, layer: usize, stored: usize) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let mut mirrors = c.attn_kv.lock().unwrap();
     let Some(m) = mirrors.get_mut(&(kv_id, layer)) else {
         return false;
@@ -34973,6 +35405,7 @@ pub fn kv_mirror_set_stored(kv_id: u64, layer: usize, stored: usize) -> bool {
 /// this pipeline has no mirror for the layer.
 pub fn kv_mirror_stored(kv_id: u64, layer: usize) -> Option<usize> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     c.attn_kv.lock().unwrap().get(&(kv_id, layer)).map(|m| m.synced)
 }
 
@@ -34995,6 +35428,7 @@ pub fn kv_mirror_read_rows(
     hd: usize,
 ) -> Option<Vec<(Vec<f32>, Vec<f32>)>> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let row_bytes = (hd * 4) as u64;
     let mut srcs = Vec::with_capacity(reqs.len());
     {
@@ -35095,6 +35529,7 @@ pub fn kv_mirror_pull_host(
     hd: usize,
 ) -> Option<(Vec<f32>, Vec<f32>, usize)> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let (kb, vb, cap, dv, first_valid) = {
         let mirrors = c.attn_kv.lock().unwrap();
         let m = mirrors.get(&(kv_id, layer))?;
@@ -35230,6 +35665,7 @@ pub fn gdn_conv_gpu(
     cq: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let qb = storage_bytes(c, bytemuck::cast_slice(qkv));
     let tb = storage_bytes(c, bytemuck::cast_slice(taps));
     let rb = c
@@ -35318,6 +35754,7 @@ pub fn gdn_step_gpu(
     o: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let sb = c
         .device
         .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -35437,6 +35874,7 @@ pub fn attn_block_gpu(
     h_out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let unif = |data: &[u32]| {
         c.device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -35687,6 +36125,7 @@ pub fn q82_short_rows(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let Some(gx) = c.graph_x.as_ref() else {
         return false;
     };
@@ -35784,6 +36223,7 @@ pub fn q8_matmat_2f(
     // MiMo's f32 GEMM contract holds on this entry too (see `q8_matmat`).
     let _precision = MimoF32Gemm::enter(&model.arch().arch_name);
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if cols % 4 != 0 || rows == 0 || b == 0 || col_field.len() < cols {
         return false;
     }
@@ -35862,6 +36302,7 @@ pub fn q8_matmat(
 ) -> bool {
     let _precision = MimoF32Gemm::enter(&model.arch().arch_name);
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if cols % 4 != 0 || rows == 0 || b == 0 {
         return false;
     }
@@ -36045,6 +36486,7 @@ pub(crate) fn fused_gemm_from_device(
         }
         dt @ (D::Q8Row | D::Q8_2f) if fused_any() => {
             let Some(c) = ctx() else { return false };
+            let _op = c.op_gate.enter();
             let Some((rs, cf)) = q8_fields(model, idx, rows, cols) else {
                 return false;
             };
@@ -36100,6 +36542,7 @@ pub fn q8_matmat_keep(
     cols: usize,
 ) -> Option<wgpu::Buffer> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     if cols % 4 != 0 || rows == 0 || b == 0 {
         return None;
     }
@@ -36151,6 +36594,7 @@ fn q8_matmat_keep_src(
 ) -> Option<wgpu::Buffer> {
     use cortiq_core::TensorDtype as D;
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let entry = &model.tensors[idx];
     if !matches!(entry.dtype, D::Q8Row | D::Q8_2f) || cols % 4 != 0 || rows == 0 || b == 0 {
         return None;
@@ -36243,6 +36687,7 @@ pub fn q1_matmat(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if cols % 64 != 0 || rows == 0 || b == 0 || pre.len() < b * cols || out.len() < b * rows {
         return false;
     }
@@ -36966,6 +37411,7 @@ pub fn dit_phase_report() -> Option<String> {
 /// before it decides which arm a still-cold call should take.
 pub fn weight_is_resident(model: &Arc<CmfModel>, idx: usize) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     c.weight_bufs
         .lock()
         .unwrap()
@@ -36991,6 +37437,7 @@ pub(crate) fn q4tp_matmat_dev(
     cols: usize,
 ) -> Option<wgpu::Buffer> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let mut out = Vec::new();
     // Reuse the whole validated path; `keep` swaps the readback for a
     // handle to the same buffer.
@@ -37254,6 +37701,7 @@ pub fn music3_ffn(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let Some(glu) = c.music3_glu.as_ref() else {
         return false;
     };
@@ -37405,6 +37853,7 @@ fn q2tp_matvec_impl(
     affine: bool,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if cols % 32 != 0 || rows == 0 || xs.len() < cols || out.len() < rows {
         return false;
     }
@@ -37887,6 +38336,7 @@ fn tp_matmat_impl(
     dst: Option<&wgpu::Buffer>,
 ) -> Option<wgpu::Buffer> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let _gate = c.mm_gate.lock().unwrap();
     let _gpr = cols / 32;
     if cols % 32 != 0 || rows == 0 || b == 0 {
@@ -38223,6 +38673,7 @@ pub fn q4t_matmat(
 ) -> bool {
     let _precision = MimoF32Gemm::enter(&model.arch().arch_name);
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let _gate = c.mm_gate.lock().unwrap();
     let gpr = cols / 32;
     if cols % 32 != 0 || rows == 0 || b == 0 {
@@ -38369,6 +38820,7 @@ pub fn q4tp_matvec_batch_for_test(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if cols % 32 != 0
         || rows == 0
         || batch == 0
@@ -38521,6 +38973,7 @@ pub fn dit_qkv_attn_out(
     proj: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let inner = nh * hd;
     let can_dev_scale =
         (c.act_amax_part.is_some() && c.act_amax_fold.is_some()) || c.act_absmax.is_some();
@@ -38610,6 +39063,7 @@ pub fn vae_qkv_attn_out(
     proj: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let inner = nh * hd;
     let can_dev_scale =
         (c.act_amax_part.is_some() && c.act_amax_fold.is_some()) || c.act_absmax.is_some();
@@ -38717,6 +39171,7 @@ pub fn dit_split_only(
     out_q: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let Some(split) = c.dit_qkv_split.as_ref() else {
         return false;
     };
@@ -38890,6 +39345,7 @@ pub fn dit_attention_packed_src(
     qkv_bias: Option<&[f32]>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let Some(split) = c.dit_qkv_split.as_ref() else {
         return false;
     };
@@ -39107,6 +39563,7 @@ fn dit_attention_inner(
     keep: Option<&mut Option<wgpu::Buffer>>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if nh == 0 || nkv == 0 || n == 0 || hd == 0 || nh % nkv != 0 {
         return false;
     }
@@ -39568,6 +40025,7 @@ pub fn chunk_attend_win(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let n = s0 + b;
     if nh == 0 || nkv == 0 || b == 0 || hd == 0 || nh % nkv != 0 || n == 0 {
         return false;
@@ -40033,6 +40491,7 @@ pub fn chunk_attend_mirror_wo(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if out.len() < b * hidden || gains.is_some_and(|g| g.len() < b * nh) {
         return false;
     }
@@ -40116,6 +40575,7 @@ fn chunk_attend_mirror_impl(
     keep: Option<&mut Option<wgpu::Buffer>>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     mirror_event(0);
     if nh == 0 || nkv == 0 || b == 0 || hd == 0 || nh % nkv != 0 || hd % 4 != 0 {
         return false;
@@ -40256,6 +40716,7 @@ pub fn q4t_qkv(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if cols % 32 != 0 || b == 0 {
         return false;
     }
@@ -40470,6 +40931,7 @@ pub fn q8_ffn_packed(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if b == 0 || xs.len() < b * hidden || out.len() < b * hidden {
         return false;
     }
@@ -40497,6 +40959,7 @@ pub fn gemm_many_keep(
 ) -> bool {
     let _precision = MimoF32Gemm::enter(&model.arch().arch_name);
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let t_enq = std::time::Instant::now();
     let total: usize = idxs.iter().map(|&(_, r)| b * r).sum();
     if b == 0 || idxs.is_empty() || out.len() < total || xs.len() < b * cols {
@@ -40581,6 +41044,7 @@ pub fn ffn_act_keep(
 ) -> bool {
     let _precision = MimoF32Gemm::enter(&model.arch().arch_name);
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let panel = (b * inter * 4) as u64;
     if b == 0
         || act > 2
@@ -40755,6 +41219,7 @@ pub fn q4tp_ffn_packed(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let _gate = c.mm_gate.lock().unwrap();
     let t_stage = std::time::Instant::now();
     if hidden % 32 != 0 || inter % 32 != 0 || b == 0 {
@@ -41207,6 +41672,7 @@ fn ffn_q4(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if hidden % 32 != 0 || inter % 32 != 0 || b == 0 || act > 2 {
         return false;
     }
@@ -41355,6 +41821,7 @@ pub fn q1t_matmat(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let gpr = cols / 32;
     if cols % 32 != 0 || rows == 0 || b == 0 {
         return false;
@@ -41578,6 +42045,7 @@ pub fn perf_report() {
 /// in milliseconds per iteration.
 pub fn roundtrip_bench(n: usize) -> Option<(f64, f64)> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let n = n.max(1);
     // 1. Submit an empty encoder and wait for the queue to drain.
     let t0 = std::time::Instant::now();
@@ -44088,6 +44556,7 @@ struct O1Dev {
 /// request's sealed state.
 pub fn o1_device_stats(kv_id: u64) -> (usize, u64) {
     let Some(c) = ctx() else { return (0, 0) };
+    let _op = c.op_gate.enter();
     let map = c.o1m.lock().unwrap();
     map.iter()
         .filter(|((id, _), _)| *id == kv_id)
@@ -45394,6 +45863,7 @@ fn encode_silu_down(
 /// the caller's fallback stays intact.
 fn matvec_batch_q1(model: &Arc<CmfModel>, jobs: &[BatchJob], out: &mut [&mut [f32]]) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let bytes = model.primary_bytes();
     // Resident weight per job (VRAM cache; over-budget/oob → honest CPU).
     let mut weights = Vec::with_capacity(jobs.len());
@@ -45481,6 +45951,7 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
         return false;
     }
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if jobs.is_empty() {
         return false;
     }
@@ -45655,6 +46126,7 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
 /// N independent q8-matvec (GDN projections of one input) in a single submission.
 pub fn matvec_batch(model: &Arc<CmfModel>, jobs: &[BatchJob], out: &mut [&mut [f32]]) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if jobs.is_empty() || jobs.len() != out.len() {
         return false;
     }
@@ -45783,6 +46255,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping shared-context teardown test");
             return;
         };
+        let _op = c.op_gate.enter();
         {
             let drain = TestGpuDrain::new(c);
             let probe = c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -45815,6 +46288,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping zi route test");
             return;
         };
+        let _op = c.op_gate.enter();
         let _drain = TestGpuDrain::new(c);
         let (rows, cols) = (256usize, 512usize);
         let q: Vec<u8> = (0..rows * cols)
@@ -45887,6 +46361,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping mirror attend test");
             return;
         };
+        let _op = c.op_gate.enter();
         let _one = chunk_attend_test_lock();
         let _drain = TestGpuDrain::new(c);
         let (nh, nkv, hd, w) = (4usize, 2usize, 256usize, 512usize);
@@ -45961,6 +46436,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping f16 guard test");
             return;
         };
+        let _op = c.op_gate.enter();
         let _one = chunk_attend_test_lock();
         let _drain = TestGpuDrain::new(c);
         let (nh, nkv, hd, b) = (4usize, 2usize, 256usize, 64usize);
@@ -46031,6 +46507,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping mirror reseed test");
             return;
         };
+        let _op = c.op_gate.enter();
         let _one = chunk_attend_test_lock();
         let _drain = TestGpuDrain::new(c);
         let (nh, nkv, hd, w) = (4usize, 2usize, 256usize, 512usize);
@@ -46109,6 +46586,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping trimmed-tail mirror test");
             return;
         };
+        let _op = c.op_gate.enter();
         let _one = chunk_attend_test_lock();
         let _drain = TestGpuDrain::new(c);
         let (nh, nkv, hd, w) = (4usize, 2usize, 256usize, 512usize);
@@ -46256,6 +46734,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping qwen constant lifetime test");
             return;
         };
+        let _op = c.op_gate.enter();
         let _gate = c.mm_gate.lock().unwrap();
         let mut bias = vec![1.0f32, 2.0, 3.0, 4.0];
         let zeros = [0.0f32; 4];
@@ -46307,6 +46786,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping qwen layernorm parity test");
             return;
         };
+        let _op = c.op_gate.enter();
         let _gate = c.mm_gate.lock().unwrap();
         let eps = 1.0e-6f32;
         let batch = 4usize;
@@ -46402,6 +46882,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping DiT cooperative odd-tail test");
             return;
         };
+        let _op = c.op_gate.enter();
         let _gate = c.mm_gate.lock().unwrap();
         let Some(pipe) = c.dit_gemm_coop.as_ref() else {
             eprintln!("cooperative matrix pipeline unavailable — skipping odd-tail test");
@@ -46510,6 +46991,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping parity test");
             return;
         };
+        let _op = c.op_gate.enter();
         let (rows, cols) = (256usize, 64usize); // cols % 4 == 0
                                                 // Synthetic int8 weights + row scales + pre-scaled activations.
         let mut q = vec![0i8; rows * cols];
@@ -46574,6 +47056,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping q8_2f parity test");
             return;
         };
+        let _op = c.op_gate.enter();
         // Three rows put the column-scale plane in the high half of the
         // final row-scale word. This is the packed layout that the old
         // word-aligned address calculation decoded one half-word late.
@@ -46699,6 +47182,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping q8_2f model parity test");
             return;
         };
+        let _op = c.op_gate.enter();
         let model = Arc::new(CmfModel::open(path).expect("open CMF_Q8_2F_MODEL"));
         let (idx, entry) = model
             .tensors
@@ -46810,6 +47294,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let n: usize = std::env::var("CMF_CHAIN_N")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -46939,6 +47424,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping q1 parity test");
             return;
         };
+        let _op = c.op_gate.enter();
         let (rows, cols) = (33usize, 256usize); // gpr = 8 (even), odd rows
         let gpr = cols / 32;
         let mut payload = Vec::new();
@@ -47014,6 +47500,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let n = 896usize;
         let eps = 1e-6f32;
         let h: Vec<f32> = (0..n)
@@ -47173,6 +47660,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping gqa_attend parity test");
             return;
         };
+        let _op = c.op_gate.enter();
         // hd=128 exercises the stride-129 kernel (exists everywhere);
         // hd=256 exercises stride-257 where the device's workgroup
         // storage allows it (32 KB devices — Adreno/Mali/wgpu-Metal —
@@ -47248,6 +47736,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         if c.attend_gpart.is_none() {
             eprintln!("no gqa gpart kernel on this device (small workgroup storage) — skipping");
             return;
@@ -47351,6 +47840,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping o1 test");
             return;
         };
+        let _op = c.op_gate.enter();
         // Production geometry (Qwen3.6): the small-dim version passed while
         // the real model garbled, so the test runs BOTH.
         for (d, dv, m, w, sink, hpg, t) in [
@@ -47837,6 +48327,7 @@ mod tests {
         }
 
         let c = ctx().expect("actual Vulkan adapter required for corrected replay");
+        let _op = c.op_gate.enter();
         let uid = u64::MAX - 17;
         let views: Vec<_> = groups.iter().map(|st| st.device_view()).collect();
         o1_ensure(c, uid, layer, &views, 1).expect("upload corrected replay state");
@@ -48308,6 +48799,7 @@ mod tests {
             eprintln!("no wgpu adapter — skipping attn_block test");
             return;
         };
+        let _op = c.op_gate.enter();
         let (nh, nkv, hd, rd, hidden, cap, stored) =
             (4usize, 2usize, 64usize, 64usize, 128usize, 8usize, 2usize);
         let hpk = nh / nkv;
@@ -48526,6 +49018,7 @@ mod tests {
             eprintln!("no wgpu device — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let Some(pipe) = c.q4tp_mm_coop.as_ref() else {
             eprintln!("no cooperative pipeline — skipping");
             return;
@@ -48639,6 +49132,7 @@ mod tests {
             eprintln!("no wgpu device — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         // a[i][k] = i + k/16, b[k][j] = (k == j) ? 1 : 0  → c == a.
         // With b the identity, any mix-up in B's layout still returns a,
         // so b is made asymmetric: b[k][j] = k*16 + j, and the expected
@@ -48884,6 +49378,7 @@ fn main(@builtin(local_invocation_index) tid: u32,
             eprintln!("no wgpu device — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         for (label, src) in [
             (
                 "16x16 f16 in, f32 out",
@@ -48990,6 +49485,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let rows: usize = env_usize("CMF_MM_ROWS", 9216);
         let cols: usize = env_usize("CMF_MM_COLS", 2304);
         let n: usize = env_usize("CMF_MM_N", 2085);
@@ -49079,6 +49575,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let mk_w = |rows: usize, seed: usize| -> Vec<u8> {
             let total = cortiq_core::quant::expected_nbytes(
                 cortiq_core::TensorDtype::Q4TiledP,
@@ -49189,6 +49686,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let sg_requested = q2tp_sg_env_admitted();
         eprintln!(
             "q2tp matvec pipeline: subgroup_requested={sg_requested} admitted={} diagnostics={}",
@@ -49348,6 +49846,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let _drain = TestGpuDrain::new(c);
         let (rows, cols) = (129usize, 4096usize);
         let gpr = cols / cortiq_core::quant::GROUP_SIZE;
@@ -49490,6 +49989,7 @@ fn main() {
         let Some(c) = ctx() else {
             panic!("Q2 cooperative component requires a wgpu adapter");
         };
+        let _op = c.op_gate.enter();
         let _drain = TestGpuDrain::new(c);
         assert!(
             c.q2tp_mm_coop.is_some(),
@@ -49664,6 +50164,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let _drain = TestGpuDrain::new(c);
         let Some(pipe) = c.fwht.as_ref() else {
             eprintln!("shader-f16 unavailable — skipping Prism FWHT test");
@@ -49762,6 +50263,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let _drain = TestGpuDrain::new(c);
         let Some(pipe) = c.fwht.as_ref() else {
             eprintln!("shader-f16 unavailable — skipping Prism FWHT width test");
@@ -49923,6 +50425,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let _drain = TestGpuDrain::new(c);
         let (rows, cols, batch) = (64usize, 512usize, 3usize);
         let gpr = cols / 32;
@@ -50059,6 +50562,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let (rows, cols, batch) = (1000usize, 4096usize, 5usize);
         let total =
             cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])
@@ -50163,6 +50667,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let (Some(p4), Some(l4)) = (&c.matvec_pair_v4, &c.layout_mv2_v4) else {
             eprintln!("pair_v4 off — skipping");
             return;
@@ -50243,6 +50748,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let staged = c.q4tp_mv4_bk8s.is_some();
         for &(rows, cols, batch) in &[(1000usize, 4096usize, 5usize), (272usize, 17408usize, 6usize), (512usize, 5120usize, 8usize), (64usize, 2048usize, 2usize)] {
             let total = cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols]).unwrap();
@@ -50323,6 +50829,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         if c.use_mv_bk < 2 {
             eprintln!("bku arm off — skipping");
             return;
@@ -50442,6 +50949,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         if c.use_mv_bk < 2 || !c.use_mv_x2 {
             eprintln!("bku arm or x2 off in this environment — skipping");
             return;
@@ -50571,6 +51079,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let inter = 1000usize;
         let mk_w = |seed: usize| -> Vec<u8> {
             let total = cortiq_core::quant::expected_nbytes(
@@ -50736,6 +51245,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         for (si, (rows, cols)) in [(2048usize, 2048usize), (1001, 6144), (37, 1040), (6, 16)]
             .into_iter()
             .enumerate()
@@ -50830,6 +51340,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         for (si, (rows, cols)) in [(2048usize, 2048usize), (1000, 6144), (37, 4096), (333, 1024)]
             .into_iter()
             .enumerate()
@@ -50936,6 +51447,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let (nh, nkv, hd, cap) = (16usize, 2usize, 128usize, 640usize);
         let hpk = nh / nkv;
         let scale = 1.0 / (hd as f32).sqrt();
@@ -51088,6 +51600,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let reps = env_usize("CMF_MM_REPS", 40);
         // Per-dispatch floor: a tiny matvec (16 rows) issued 700 times in
         // ONE submit — the launch + drain cost a serial chain pays per
@@ -51350,6 +51863,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         let (Some(pipe), Some(_)) = (c.q4tp_mm_coop_f16.as_ref(), c.q4tp_dq_f16.as_ref()) else {
             eprintln!("no f16 plane GEMM here — skipping");
             return;
@@ -51491,6 +52005,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         if c.q4tp_mm_coop_f16.is_none() {
             // A device WITH cooperative matrices that has no f16 pipeline
             // means the shader was rejected — which is how a wrong
@@ -51595,6 +52110,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping");
             return;
         };
+        let _op = c.op_gate.enter();
         // 1.7B-ish attention geometry.
         let (nh, nkv, hd, rd, hidden, cap, stored) = (
             16usize, 8usize, 128usize, 128usize, 2048usize, 256usize, 128usize,
@@ -51713,6 +52229,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping q1t parity test");
             return;
         };
+        let _op = c.op_gate.enter();
         use cortiq_core::quant::{f32_to_f16, q1t_pack, GROUP_SIZE};
         let (rows, cols) = (33usize, 256usize);
         let gpr = cols / GROUP_SIZE;
@@ -51777,6 +52294,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping q4b parity test");
             return;
         };
+        let _op = c.op_gate.enter();
         use cortiq_core::quant::{f32_to_f16, GROUP_SIZE};
         let (rows, cols) = (33usize, 256usize);
         let n_groups = rows * (cols / GROUP_SIZE);
@@ -51820,6 +52338,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping q1t GEMM parity test");
             return;
         };
+        let _op = c.op_gate.enter();
         use cortiq_core::quant::{f32_to_f16, q1t_pack, GROUP_SIZE};
         let (b, rows, cols) = (40usize, 64usize, 256usize);
         let gpr = cols / GROUP_SIZE;
@@ -51886,6 +52405,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping matmat test");
             return;
         };
+        let _op = c.op_gate.enter();
         let (rows, cols, b) = (128usize, 64usize, 5usize);
         let mut q = vec![0i8; rows * cols];
         for (i, v) in q.iter_mut().enumerate() {
@@ -51929,6 +52449,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping mul_mm test");
             return;
         };
+        let _op = c.op_gate.enter();
         let (rows, cols, b) = (100usize, 52usize, 70usize);
         let mut q = vec![0i8; rows * cols];
         for (i, v) in q.iter_mut().enumerate() {
@@ -51971,6 +52492,7 @@ fn main() {
             eprintln!("no wgpu adapter — skipping q1_mul_mm test");
             return;
         };
+        let _op = c.op_gate.enter();
         let (rows, cols, b) = (100usize, 128usize, 70usize); // cols % 64 == 0
         let np = cols / 64;
         let jit = |a: usize| ((a * 2654435761usize) >> 13) as u32; // cheap hash → bits
@@ -52123,6 +52645,7 @@ pub fn rope_heads_for_test(
     inverse: bool,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if x.len() != nh * hd || rd > hd || rd % 2 != 0 || inv_freq.len() * 2 < rd {
         return false;
     }
@@ -52189,6 +52712,7 @@ pub fn o_lora_a_for_test(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if rows == 0 || lora == 0 || rows % lora != 0 || out.len() < rows {
         return false;
     }
@@ -52270,6 +52794,7 @@ pub fn kv_pool_for_test(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if width == 0 || ratio == 0 || out.len() < width {
         return false;
     }
@@ -52354,6 +52879,7 @@ pub fn index_scores_for_test(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if q.len() < nh * hd || kv.len() < n_pos * hd || hw.len() < nh || out.len() < n_pos {
         return false;
     }
@@ -52407,6 +52933,7 @@ pub fn index_scores_for_test(
 /// different field order than the shader reads — so it silently did nothing.
 pub fn axpy_for_test(x: &[f32], y: &mut [f32], w: f32, set: bool, soff: usize) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let n = y.len();
     if n == 0 || x.len() < soff + n {
         return false;
@@ -52443,6 +52970,7 @@ pub fn axpy_for_test(x: &[f32], y: &mut [f32], w: f32, set: bool, soff: usize) -
 
 pub fn top_k_for_test(scores: &[f32], k: usize, out: &mut Vec<u32>) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let n = scores.len();
     if n == 0 || n > 4096 || k == 0 {
         out.clear();
@@ -53363,6 +53891,7 @@ pub fn dsv4_encode_prep(
     enc: &mut wgpu::CommandEncoder,
 ) -> Option<usize> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     // The compressors first: both read this token's hidden state, and the
     // attention one appends into the same cache buffer the window lives in,
     // past the window's capacity.
@@ -53474,6 +54003,7 @@ pub fn dsv4_encode_prep(
 /// have different widths.
 fn dsv4_index_cache(kv_id: u64, li: usize, floats: usize) -> Option<wgpu::Buffer> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let cap = floats.next_power_of_two().max(1024);
     let mut m = c.dsv4_ixkv.lock().unwrap();
     // Growing CARRIES the contents. This cache accumulates one compressed
@@ -53677,6 +54207,7 @@ fn dsv4_layer_frame_enc(
     let Some(c) = ctx() else {
         no!("нет контекста wgpu")
     };
+    let _op = c.op_gate.enter();
     // Keys are per (layer, token); the cache lookup below stays per layer.
     let lk = li * FRAME_TOK_STRIDE + tok;
     let a = g.attn;
@@ -54135,6 +54666,7 @@ fn dsv4_layer_frame_enc(
 /// region walks off the end as the sequence lengthens.
 pub fn dsv4_cache_ensure(kv_id: u64, li: usize, cap: usize) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if (cap * 4) as u64 > c.device.limits().max_storage_buffer_binding_size {
         return false;
     }
@@ -54193,6 +54725,7 @@ pub fn dsv4_cache_ensure(kv_id: u64, li: usize, cap: usize) -> bool {
 /// Seed only the fold: the device's qn is already this layer's.
 pub fn dsv4_chain_seed_fold(x: &[f32]) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let b = frame_buf(c, 45, x.len() * 4, true);
     c.queue.write_buffer(&b, 0, bytemuck::cast_slice(x));
     true
@@ -54201,6 +54734,7 @@ pub fn dsv4_chain_seed_fold(x: &[f32]) -> bool {
 /// Seed one token of a batch: its opening fold and its LoRA vector.
 pub fn dsv4_chain_seed_t(x: &[f32], qn: &[f32], tok: usize) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let b = frame_buf_t(c, 45, tok, x.len() * 4, true);
     c.queue.write_buffer(&b, 0, bytemuck::cast_slice(x));
     let q = frame_buf_t(c, 4, tok, qn.len() * 4, true);
@@ -54210,6 +54744,7 @@ pub fn dsv4_chain_seed_t(x: &[f32], qn: &[f32], tok: usize) -> bool {
 
 pub fn dsv4_chain_seed(x: &[f32], qn: &[f32]) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let b = frame_buf(c, 45, x.len() * 4, true);
     c.queue.write_buffer(&b, 0, bytemuck::cast_slice(x));
     // The LoRA vector too: every frame leaves the NEXT layer's there, and
@@ -54266,6 +54801,7 @@ pub fn dsv4_chain_batch(
     state_out: Option<&mut [f32]>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let Some((_, g0, _)) = layers.first() else {
         return false;
     };
@@ -54567,6 +55103,7 @@ fn dsv4_chain_batch_bt(
     state_out: Option<&mut [f32]>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let Some((_, g0, _)) = layers.first() else {
         return false;
     };
@@ -54946,6 +55483,7 @@ pub fn dsv4_chain_seed_bt(
     qn: &[f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let up = |tag: u8, len: usize, off: usize, data: &[f32]| {
         let b = frame_buf_t(c, tag, 0, batch * len * 4, true);
         c.queue
@@ -55046,6 +55584,7 @@ pub fn dspark_graph(
     states_out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let (hc, dim) = (g.hc, g.dim);
     let mix_hc = (2 + hc) * hc;
     if states0.len() < block * hc * dim || states_out.len() < block * hc * dim {
@@ -55837,6 +56376,7 @@ thread_local! {
 /// just landed and compares it against the per-token path's.
 pub fn dsv4_dbg_read_ix(kv_id: u64, li: usize, off: usize, n: usize) -> Option<Vec<f32>> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let b = {
         let m = c.dsv4_ixkv.lock().unwrap();
         m.get(&(kv_id, li)).map(|(b, _)| b.clone())?
@@ -55864,6 +56404,7 @@ pub fn dsv4_dbg_read_ix(kv_id: u64, li: usize, off: usize, n: usize) -> Option<V
 
 pub fn dsv4_dbg_read_tag(tag: u8, tok: usize, n: usize) -> Option<Vec<f32>> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let b = {
         let m = c.dsv4_scratch.lock().unwrap();
         // The pool keys on (tag, tok, len); a debug reader doesn't know the
@@ -55908,6 +56449,7 @@ pub fn dsv4_spec_cap_read_all(batch: usize, n_caps: usize, hc_dim: usize, out: &
         return true;
     }
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let cap = frame_buf_t(c, BT_CAP, 0, n_caps * batch * hc_dim * 4, true);
     let bytes = (n_caps * batch * hc_dim * 4) as u64;
     let mut sc = c.scratch.lock().unwrap();
@@ -55946,6 +56488,7 @@ pub fn dsv4_spec_cap_read(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let cap = frame_buf_t(c, BT_CAP, 0, n_caps * batch * hc_dim * 4, true);
     let bytes = (hc_dim * 4) as u64;
     let mut sc = c.scratch.lock().unwrap();
@@ -56022,6 +56565,7 @@ pub fn dsv4_spec_shadow(
     batch: usize,
 ) -> Option<Dsv4SpecShadow> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let mut enc = c
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -56094,6 +56638,7 @@ pub fn dsv4_spec_shadow(
 /// rows, copy the compressor streams back. Counts are the host's business.
 pub fn dsv4_spec_restore(sh: &Dsv4SpecShadow) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let mut enc = c
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -56155,6 +56700,7 @@ pub fn dsv4_spec_commit_windows(
     k: usize,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if k == 0 {
         return true;
     }
@@ -56214,6 +56760,7 @@ pub fn dsv4_spec_replay(
     let Some(c) = ctx() else {
         rfail!("нет контекста")
     };
+    let _op = c.op_gate.enter();
     let retain = frame_buf_t(c, BT_RETAIN, 0, layers.len() * batch * dim * 4, false);
     let mut enc = c
         .device
@@ -56426,6 +56973,7 @@ fn dsv4_layer_frame_bt_enc(
     let Some(c) = ctx() else {
         no!("нет контекста wgpu")
     };
+    let _op = c.op_gate.enter();
     let a = g.attn;
     let m = g.moe;
     let (hc, dim) = (g.hc, a.dim);
@@ -57760,6 +58308,7 @@ pub fn dsv4_layer_chain(
     state_out: Option<&mut [f32]>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let Some((_, g0, _)) = layers.first() else {
         return false;
     };
@@ -57894,6 +58443,7 @@ pub fn dsv4_layer_batch_partial(
     pos0: usize,
 ) -> Option<Dsv4PartialBatchOut> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     if batch == 0 || batch > FRAME_TOK_STRIDE || w.moe.remap.is_none() || w.hc_next_fn.is_some() {
         return None;
     }
@@ -58022,6 +58572,7 @@ pub fn dsv4_layer_batch_partial(
 /// before the eventual capture read, so no extra submission is needed.
 pub fn dsv4_spec_cap_write_host(li: usize, batch: usize, hc_dim: usize, states: &[f32]) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let (_, caps) = SPEC_RETAIN.with(|v| v.borrow().clone());
     let Some(slot) = caps.iter().position(|&x| x == li) else {
         return true;
@@ -58067,6 +58618,7 @@ pub fn dsv4_layer_frame(
     cold_x_out: &mut Vec<f32>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let dim = g.attn.dim;
     if folded_next.len() < dim {
         return false;
@@ -58170,6 +58722,7 @@ pub fn dsv4_layer_frame(
 /// Is this tensor resident, or can it be made so? Uploads it if it can.
 pub fn dsv4_weight_ready(model: &Arc<CmfModel>, idx: usize) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let Some(e) = model.tensors.get(idx) else {
         return false;
     };
@@ -58297,6 +58850,7 @@ pub fn dsv4_global_moe_create_for_dsv41(
     gu_q2: bool,
 ) -> Option<(usize, usize)> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let segments = dsv4_global_moe_segments_for_dsv41(&c);
     dsv4_global_moe_create_with_segments(model, requested, inter, hidden, gu_q2, segments)
 }
@@ -58313,6 +58867,7 @@ pub fn dsv4_global_moe_create_slots(
     gu_q2: bool,
 ) -> Option<(usize, usize)> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     // One segment buffer is bounded by the binding range; past S8's
     // capacity the S16 family (built here on first need) doubles it.
     let gu_len = cortiq_core::quant::expected_nbytes(
@@ -58398,6 +58953,7 @@ fn dsv4_global_moe_create_inner(
 ) -> Option<(usize, usize)> {
     use std::sync::atomic::Ordering;
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     if dsv4_global_moe_pipelines(&c, gu_q2, segments).is_none() {
         return None;
     }
@@ -58542,6 +59098,7 @@ pub fn dsv4_global_slot_fill(model: &Arc<CmfModel>, slot: usize, t: (usize, usiz
         ok
     };
     let Some(c) = ctx() else { return finish(false) };
+    let _op = c.op_gate.enter();
     let Some(b) = c.dsv4_global_moe.lock().unwrap().get(&model.uid()).cloned() else {
         return finish(false);
     };
@@ -58621,6 +59178,7 @@ pub fn dsv4_global_slot_fill(model: &Arc<CmfModel>, slot: usize, t: (usize, usiz
 pub fn dsv4_experts_fit(inter: usize, hidden: usize, gu_q2: bool, dn_q2: bool) -> usize {
     use std::sync::atomic::Ordering;
     let Some(c) = ctx() else { return 0 };
+    let _op = c.op_gate.enter();
     let gu = if gu_q2 {
         cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q2TiledP, &[inter, hidden])
     } else {
@@ -58802,6 +59360,7 @@ pub fn vae_conv2d_coop(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let (Some(im2col), Some(gemm)) = (c.vae_im2col.as_ref(), c.gemm_nt_coop.as_ref()) else {
         return false;
     };
@@ -59005,6 +59564,7 @@ pub fn conv1d_gemm(
         return false;
     }
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let (Some(ic_pipe), Some(gemm)) = (c.conv1d_im2col.as_ref(), c.gemm_nt_coop.as_ref()) else {
         return false;
     };
@@ -59165,6 +59725,7 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
         return false;
     }
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     // Small jobs lose to the round trip.
     if n * k * m < (1 << 22) {
         return false;
@@ -59306,6 +59867,7 @@ pub fn gemm_dx_f32(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m:
         return false;
     }
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if n * k * m < (1 << 22) || k > 65_000 || n > 65_000 {
         return false;
     }
@@ -59444,6 +60006,20 @@ pub fn gemm_dx_f32(dy: &[f32], w: &[f32], dx: &mut [f32], n: usize, k: usize, m:
 /// Returns false untouched wherever the cooperative pipeline is absent or
 /// a shape steps outside the tiles — the caller keeps its scalar path.
 #[allow(clippy::too_many_arguments)]
+/// Bake-chain phase timers (ns): 0 = weight residency, 1 = submit→poll,
+/// 2 = host copies. Read-and-reset by the bake's profile line.
+pub static CHAIN_PROF: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+pub fn chain_prof_take(i: usize) -> f64 {
+    CHAIN_PROF[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9
+}
+fn chain_prof_add(i: usize, t: std::time::Instant) {
+    CHAIN_PROF[i].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn ffn_chain_f32(
     n2: &[f32],
     gu: &[f32],
@@ -59455,11 +60031,17 @@ pub fn ffn_chain_f32(
     n: usize,
     hsz: usize,
     inter: usize,
+    act: crate::fcd_ops::FfnAct,
 ) -> bool {
     if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") {
         return false;
     }
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
+    let act_link = match act {
+        crate::fcd_ops::FfnAct::Silu => &c.bake_silu,
+        crate::fcd_ops::FfnAct::GeluErf => &c.bake_gelu,
+    };
     let Some(nt) = c.gemm_nt_coop.as_ref() else {
         return false;
     };
@@ -59479,8 +60061,10 @@ pub fn ffn_chain_f32(
         return false;
     }
     let _bake = BAKE_LOCK.lock().unwrap();
+    let t_w = std::time::Instant::now();
     let wgu = bake_weight(c, gu, "bake-gu");
     let wdn = bake_weight(c, down, "bake-dn");
+    chain_prof_add(0, t_w);
     let ffn_bytes = (n * hsz * 4) as u64;
     let both_bytes = (n * 2 * inter * 4) as u64;
     // ffn first, both after — the second slice starts 16-aligned.
@@ -59602,7 +60186,7 @@ pub fn ffn_chain_f32(
         let u2 = uni([inter as u32, total, scale.is_some() as u32, gx * 256]);
         let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
-            layout: &c.bake_silu.get_bind_group_layout(0),
+            layout: &act_link.get_bind_group_layout(0),
             entries: &[
                 bind_buf(0, &both),
                 bind_buf(1, &sbuf),
@@ -59611,7 +60195,7 @@ pub fn ffn_chain_f32(
             ],
         });
         let mut pass = begin_pass(&mut enc);
-        pass.set_pipeline(&c.bake_silu);
+        pass.set_pipeline(act_link);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(gx, gy, 1);
     }
@@ -59638,6 +60222,7 @@ pub fn ffn_chain_f32(
         flush_pass(&enc);
         enc.copy_buffer_to_buffer(&both, 0, &stage, off, both_bytes);
     }
+    let t_gpu = std::time::Instant::now();
     submit(c, finish_enc(enc));
     let slice = stage.slice(..stage_need);
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -59645,6 +60230,7 @@ pub fn ffn_chain_f32(
     slice.map_async(wgpu::MapMode::Read, move |_| {
         d2.store(true, std::sync::atomic::Ordering::Release);
     });
+    chain_prof_add(1, t_gpu);
     if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
         return false;
     }
@@ -59678,6 +60264,7 @@ pub fn ffn_chain_f32(
 /// gate OOM-panicked the moment the planes joined the weights).
 pub fn bake_release() {
     let Some(c) = ctx() else { return };
+    let _op = c.op_gate.enter();
     let _bake = BAKE_LOCK.lock().unwrap();
     c.bake_planes.lock().unwrap().clear();
     c.gemm_w_bufs.lock().unwrap().clear();
@@ -59712,6 +60299,11 @@ pub struct AttnChainCfg<'a> {
     /// Concatenated (bq | bk | bv) or None.
     pub bias: Option<&'a [f32]>,
     pub output_gate: bool,
+    /// Per-(row, head) sigmoid gains [n × nh] of a projected head gate
+    /// (Spark-X2.5 g_proj), multiplied into the head outputs before wo.
+    pub head_gain: Option<&'a [f32]>,
+    /// Sliding window of a local layer (None = full causal).
+    pub window: Option<usize>,
     pub gemma: bool,
     pub eps: f32,
     pub rotary_half: usize,
@@ -59741,6 +60333,7 @@ pub fn attn_chain_f32(
         return None;
     }
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let nt = c.gemm_nt_coop.as_ref()?;
     let (b, t, nh, nkv, hd, hsz) = (cfg.b, cfg.t, cfg.nh, cfg.nkv, cfg.hd, cfg.hsz);
     let n = b * t;
@@ -59748,8 +60341,8 @@ pub fn attn_chain_f32(
     let kvdim = nkv * hd;
     let qrows = if cfg.output_gate { 2 * qdim } else { qdim };
     let fused = qrows + 2 * kvdim;
-    if hd > 128
-        || t > 1024
+    if hd > 256
+        || t > 2048
         || hsz % 4 != 0
         || nh % nkv != 0
         || n * hsz * fused < (1 << 22)
@@ -59759,6 +60352,8 @@ pub fn attn_chain_f32(
         || cfg.wqkv.len() < fused * hsz
         || cfg.wo.len() < hsz * qdim
         || attn_out.len() < n * hsz
+        || cfg.head_gain.is_some_and(|g| g.len() < n * nh)
+        || (cfg.output_gate && cfg.head_gain.is_some())
     {
         return None;
     }
@@ -59809,11 +60404,12 @@ pub fn attn_chain_f32(
         wgpu::BufferUsages::STORAGE,
         "bake-vproj",
     );
+    // COPY_DST too: a projected head gate's gains are written into it.
     let gate = Scratch::ensure(
         &c.device,
         &mut sc.bgp,
         f4((n * qdim).max(1)),
-        wgpu::BufferUsages::STORAGE,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         "bake-gate",
     );
     let ao = Scratch::ensure(
@@ -59871,6 +60467,11 @@ pub fn attn_chain_f32(
     drop(sc);
     c.queue
         .write_buffer(&xbuf, 0, bytemuck::cast_slice(&n1[..n * hsz]));
+    // A projected head gate's gains ride the (otherwise idle) gate plane.
+    if let Some(g) = cfg.head_gain {
+        c.queue
+            .write_buffer(&gate, 0, bytemuck::cast_slice(&g[..n * nh]));
+    }
     // Small constants ride the fingerprinted cache; absent ones bind a
     // zero plane so the kernel adds nothing.
     static ONE_F32: [u8; 4] = [0, 0, 0, 0];
@@ -59996,7 +60597,14 @@ pub fn attn_chain_f32(
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
                 contents: bytemuck::cast_slice(&[
-                    t as u32, nh as u32, nkv as u32, hd as u32, b as u32, 0, 0, 0,
+                    t as u32,
+                    nh as u32,
+                    nkv as u32,
+                    hd as u32,
+                    b as u32,
+                    cfg.window.unwrap_or(0) as u32,
+                    0,
+                    0,
                 ]),
                 usage: wgpu::BufferUsages::UNIFORM,
             });
@@ -60016,12 +60624,18 @@ pub fn attn_chain_f32(
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(t as u32, (b * nh) as u32, 1);
     }
-    let wo_input = if cfg.output_gate {
+    let wo_input = if cfg.output_gate || cfg.head_gain.is_some() {
         let total = (n * qdim) as u32;
         let wgs = total.div_ceil(256);
         let gx = wgs.min(32_768);
         let gy = wgs.div_ceil(32_768);
-        let u = uni([total, gx * 256, 0, 0]);
+        // hd = 0 selects the elementwise σ(gate) form; a head gain names
+        // its geometry.
+        let u = if cfg.output_gate {
+            uni([total, gx * 256, 0, 0])
+        } else {
+            uni([total, gx * 256, hd as u32, nh as u32])
+        };
         let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &c.bake_attn_gate.get_bind_group_layout(0),
@@ -60114,6 +60728,169 @@ pub fn attn_chain_f32(
     acts
 }
 
+
+/// The bake attention CORE backward on the card: from the rotated q/k,
+/// v, and the gradient at the head outputs (`dao`, per head, AFTER the
+/// gate's backward), the gradients at q/k (rotated space) and v, under
+/// the forward's window. Declines on shapes the kernels do not take.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_bwd_chain_f32(
+    qrot: &[f32],
+    krot: &[f32],
+    vproj: &[f32],
+    dao: &[f32],
+    b: usize,
+    t: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    window: Option<usize>,
+    dq: &mut [f32],
+    dk: &mut [f32],
+    dv: &mut [f32],
+) -> bool {
+    if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") || f32_strict() {
+        return false;
+    }
+    let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
+    let n = b * t;
+    let qdim = nh * hd;
+    let kvdim = nkv * hd;
+    if hd > 256
+        || t > 2048
+        || nh % nkv != 0
+        || qrot.len() < n * qdim
+        || krot.len() < n * kvdim
+        || vproj.len() < n * kvdim
+        || dao.len() < n * qdim
+        || dq.len() < n * qdim
+        || dk.len() < n * kvdim
+        || dv.len() < n * kvdim
+    {
+        return false;
+    }
+    let f4 = |x: usize| (x * 4) as u64;
+    let _bake = BAKE_LOCK.lock().unwrap();
+    let mut sc = c.scratch.lock().unwrap();
+    let inb = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+    let outb = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC;
+    let qb = Scratch::ensure(&c.device, &mut sc.abq, f4(n * qdim), inb, "bake-ab-q");
+    let kb = Scratch::ensure(&c.device, &mut sc.abk, f4(n * kvdim), inb, "bake-ab-k");
+    let vb = Scratch::ensure(&c.device, &mut sc.abv, f4(n * kvdim), inb, "bake-ab-v");
+    let dob = Scratch::ensure(&c.device, &mut sc.abdo, f4(n * qdim), inb, "bake-ab-do");
+    let dqb = Scratch::ensure(&c.device, &mut sc.abdq, f4(n * qdim), outb, "bake-ab-dq");
+    let dkb = Scratch::ensure(&c.device, &mut sc.abdk, f4(n * kvdim), outb, "bake-ab-dk");
+    let dvb = Scratch::ensure(&c.device, &mut sc.abdv, f4(n * kvdim), outb, "bake-ab-dv");
+    let stb = Scratch::ensure(
+        &c.device,
+        &mut sc.abstat,
+        f4(n * nh * 4),
+        wgpu::BufferUsages::STORAGE,
+        "bake-ab-stat",
+    );
+    let o_dq = 0u64;
+    let o_dk = f4(n * qdim).div_ceil(16) * 16;
+    let o_dv = (o_dk + f4(n * kvdim)).div_ceil(16) * 16;
+    let need = o_dv + f4(n * kvdim);
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.abst,
+        need,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "bake-ab-stage",
+    );
+    drop(sc);
+    c.queue.write_buffer(&qb, 0, bytemuck::cast_slice(&qrot[..n * qdim]));
+    c.queue.write_buffer(&kb, 0, bytemuck::cast_slice(&krot[..n * kvdim]));
+    c.queue.write_buffer(&vb, 0, bytemuck::cast_slice(&vproj[..n * kvdim]));
+    c.queue.write_buffer(&dob, 0, bytemuck::cast_slice(&dao[..n * qdim]));
+    let params: [u32; 8] = [
+        t as u32,
+        nh as u32,
+        nkv as u32,
+        hd as u32,
+        b as u32,
+        window.unwrap_or(0) as u32,
+        0,
+        0,
+    ];
+    let u = c
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("bake-attn-bwd"),
+        });
+    {
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.bake_attn_bwd_q.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &qb),
+                bind_buf(1, &kb),
+                bind_buf(2, &vb),
+                bind_buf(3, &dob),
+                bind_buf(4, &dqb),
+                bind_buf(5, &stb),
+                bind_buf(6, &u),
+            ],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(&c.bake_attn_bwd_q);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(t as u32, (b * nh) as u32, 1);
+    }
+    {
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.bake_attn_bwd_kv.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &qb),
+                bind_buf(1, &kb),
+                bind_buf(2, &vb),
+                bind_buf(3, &dob),
+                bind_buf(4, &stb),
+                bind_buf(5, &dkb),
+                bind_buf(6, &dvb),
+                bind_buf(7, &u),
+            ],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(&c.bake_attn_bwd_kv);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(t as u32, (b * nkv) as u32, 1);
+    }
+    flush_pass(&enc);
+    enc.copy_buffer_to_buffer(&dqb, 0, &stage, o_dq, f4(n * qdim));
+    flush_pass(&enc);
+    enc.copy_buffer_to_buffer(&dkb, 0, &stage, o_dk, f4(n * kvdim));
+    flush_pass(&enc);
+    enc.copy_buffer_to_buffer(&dvb, 0, &stage, o_dv, f4(n * kvdim));
+    submit(c, finish_enc(enc));
+    let slice = stage.slice(..need);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+        return false;
+    }
+    {
+        let Ok(data) = slice.get_mapped_range() else {
+            stage.unmap();
+            return false;
+        };
+        par_copy(&mut dq[..n * qdim], bytemuck::cast_slice(&data[o_dq as usize..(o_dq + f4(n * qdim)) as usize]));
+        par_copy(&mut dk[..n * kvdim], bytemuck::cast_slice(&data[o_dk as usize..(o_dk + f4(n * kvdim)) as usize]));
+        par_copy(&mut dv[..n * kvdim], bytemuck::cast_slice(&data[o_dv as usize..(o_dv + f4(n * kvdim)) as usize]));
+    }
+    stage.unmap();
+    true
+}
+
 /// The frozen FFN's backward as one device chain, fed by the plane the
 /// forward parked: dact = dh2·down, dgu = silu·mul-backward(plane, dact),
 /// dn2 = dgu·gu — one submit, and the only PCIe traffic is dh2 down
@@ -60130,11 +60907,22 @@ pub fn ffn_bwd_chain_f32(
     n: usize,
     hsz: usize,
     inter: usize,
+    act: crate::fcd_ops::FfnAct,
+    scale: Option<&[f32]>,
+    dmask: Option<&mut [f32]>,
 ) -> bool {
     if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") {
         return false;
     }
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
+    if scale.is_some_and(|s| s.len() < inter) || dmask.as_ref().is_some_and(|d| d.len() < inter) {
+        return false;
+    }
+    let act_bwd_link = match act {
+        crate::fcd_ops::FfnAct::Silu => &c.bake_silu_bwd,
+        crate::fcd_ops::FfnAct::GeluErf => &c.bake_gelu_bwd,
+    };
     let Some(nn) = c.gemm_nn_coop.as_ref() else {
         return false;
     };
@@ -60197,16 +60985,33 @@ pub fn ffn_bwd_chain_f32(
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         "bake-y",
     );
+    // Readback plan: dn2, then (Phase A) the mask gradient, 16-aligned.
+    let dm_bytes = (inter * 4) as u64;
+    let dm_off = dn2_bytes.div_ceil(16) * 16;
+    let need = if dmask.is_some() { dm_off + dm_bytes } else { dn2_bytes };
     let stage = Scratch::ensure(
         &c.device,
         &mut sc.bst,
-        dn2_bytes,
+        need,
         wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         "bake-stage",
+    );
+    // The attention chain's qinv slot is idle here: it holds dm.
+    let dmb = Scratch::ensure(
+        &c.device,
+        &mut sc.biq,
+        dm_bytes.max(16),
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        "bake-qinv",
     );
     drop(sc);
     c.queue
         .write_buffer(&dhb, 0, bytemuck::cast_slice(&dh2[..n * hsz]));
+    static NO_SCALE_B: [u8; 4] = [0; 4];
+    let sbuf = match scale {
+        Some(sv) => const_buf(c, bytemuck::cast_slice(&sv[..inter])),
+        None => const_buf(c, &NO_SCALE_B),
+    };
     let uni = |v: [u32; 4]| {
         c.device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -60243,21 +61048,46 @@ pub fn ffn_bwd_chain_f32(
         let wgs = total.div_ceil(256);
         let gx = wgs.min(32_768);
         let gy = wgs.div_ceil(32_768);
-        let u = uni([inter as u32, total, 0, gx * 256]);
+        let u = uni([inter as u32, total, scale.is_some() as u32, gx * 256]);
         let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
-            layout: &c.bake_silu_bwd.get_bind_group_layout(0),
+            layout: &act_bwd_link.get_bind_group_layout(0),
             entries: &[
                 bind_buf(0, &plane),
                 bind_buf(1, &dact),
                 bind_buf(2, &dgu),
                 bind_buf(3, &u),
+                bind_buf(4, &sbuf),
             ],
         });
         let mut pass = begin_pass(&mut enc);
-        pass.set_pipeline(&c.bake_silu_bwd);
+        pass.set_pipeline(act_bwd_link);
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups(gx, gy, 1);
+    }
+    if dmask.is_some() {
+        // dm[j] = Σ_r dact·act·u from the resident plane (pre-scale, as the
+        // host accumulated it).
+        let u = uni([
+            inter as u32,
+            n as u32,
+            matches!(act, crate::fcd_ops::FfnAct::GeluErf) as u32,
+            0,
+        ]);
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.bake_mask_grad.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &plane),
+                bind_buf(1, &dact),
+                bind_buf(2, &dmb),
+                bind_buf(3, &u),
+            ],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(&c.bake_mask_grad);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups((inter as u32).div_ceil(256), 1, 1);
     }
     {
         // dn2[n, hsz] = dgu[n, 2·inter] · gu[2·inter, hsz]
@@ -60277,7 +61107,35 @@ pub fn ffn_bwd_chain_f32(
         pass.set_bind_group(0, &bind, &[]);
         pass.dispatch_workgroups((hsz as u32).div_ceil(64), (n as u32).div_ceil(64), 1);
     }
-    readback(c, enc, &ybuf, &stage, dn2_bytes, &mut dn2[..n * hsz])
+    flush_pass(&enc);
+    enc.copy_buffer_to_buffer(&ybuf, 0, &stage, 0, dn2_bytes);
+    if dmask.is_some() {
+        flush_pass(&enc);
+        enc.copy_buffer_to_buffer(&dmb, 0, &stage, dm_off, dm_bytes);
+    }
+    submit(c, finish_enc(enc));
+    let slice = stage.slice(..need);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    if c.device.poll(wgpu::PollType::wait_indefinitely()).is_err() {
+        return false;
+    }
+    {
+        let Ok(data) = slice.get_mapped_range() else {
+            stage.unmap();
+            return false;
+        };
+        par_copy(
+            &mut dn2[..n * hsz],
+            bytemuck::cast_slice(&data[..dn2_bytes as usize]),
+        );
+        if let Some(dm) = dmask {
+            dm[..inter].copy_from_slice(bytemuck::cast_slice(
+                &data[dm_off as usize..(dm_off + dm_bytes) as usize],
+            ));
+        }
+    }
+    stage.unmap();
+    true
 }
 
 /// VAE conv2d on the card: same padding, stride 1, direct (no im2col).
@@ -60329,6 +61187,7 @@ fn vae_conv_impl(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     // `h`/`w_img` are the SOURCE dims; an upsampling conv writes 2x.
     let (oh, ow) = if up2 { (h * 2, w_img * 2) } else { (h, w_img) };
     let ick2 = ic * k * k;
@@ -60452,6 +61311,7 @@ pub fn q4tp_qkv(
     v_out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if hidden % 32 != 0 || b == 0 || xs.len() < b * hidden {
         return false;
     }
@@ -60774,6 +61634,7 @@ pub fn qwen_image_mlp_inplace(
     gate: &[f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if batch < 32
         || hidden == 0
         || inter == 0
@@ -60907,6 +61768,7 @@ pub fn q4tp_gelu_ffn(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let _gate = c.mm_gate.lock().unwrap();
     if b < 32
         || hidden == 0
@@ -61345,6 +62207,7 @@ pub fn qwen_image_block(
     a: &mut crate::gpu::QwenImageBlockArgs<'_>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let hidden = a.heads.checked_mul(a.head_dim).unwrap_or(0);
     let total = a.image_tokens.checked_add(a.text_tokens).unwrap_or(0);
     let pairs = a.head_dim / 2;
@@ -62474,6 +63337,7 @@ pub fn qwen_image_chain(
     a: &mut crate::gpu::QwenImageChainArgs<'_>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let hidden = a.heads.checked_mul(a.head_dim).unwrap_or(0);
     let total = a.image_tokens.checked_add(a.text_tokens).unwrap_or(0);
     let pairs = a.head_dim / 2;
@@ -62688,6 +63552,7 @@ pub fn qwen_image_attention(
     a: &mut crate::gpu::QwenImageAttentionArgs<'_>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let hidden = a.heads.checked_mul(a.head_dim).unwrap_or(0);
     let total = a.image_tokens.checked_add(a.text_tokens).unwrap_or(0);
     let pairs = a.head_dim / 2;
@@ -63050,6 +63915,7 @@ pub fn dit_block_seg(
         bail("no ctx");
         return false;
     };
+    let _op = c.op_gate.enter();
     let (n, hs, inter) = (a.n, a.hidden, a.inter);
     let (nh, nkv, hd) = (a.nh, a.nkv, a.hd);
     if hs % 32 != 0 || inter % 32 != 0 || hd % 2 != 0 || nkv == 0 {
@@ -63637,6 +64503,7 @@ pub fn dit_block_seg(
 /// is interrupted — the state lives only on the device at that point.
 pub fn dit_state_fetch(x: &mut [f32]) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let pool = c.dit_pool.lock().unwrap();
     let Some((xb, have)) = pool.get("dit-x").cloned() else {
         return false;
@@ -63901,6 +64768,7 @@ pub fn dsv4_slot_fill(
                     return false;
                 };
                 let c = ctx().unwrap();
+                let _op = c.op_gate.enter();
                 if (slot + 1) * gl as usize > g.size() as usize / 1 {}
                 c.queue
                     .write_buffer(&g, (slot * gl) as u64, &bk.g[gi * gl..(gi + 1) * gl]);
@@ -63917,6 +64785,7 @@ pub fn dsv4_slot_fill(
     }
     use std::sync::atomic::Ordering;
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let key = (model.uid() as usize, pack_first);
     let Some((g, u, d)) = c.moe_expw.lock().unwrap().get(&key).cloned() else {
         return false;
@@ -63985,6 +64854,7 @@ pub fn dsv4_slot_fill(
 /// hybrid split (`cortiq bench --bw`). None when no device came up.
 pub fn upload_bandwidth_probe(block: usize, rounds: usize) -> Option<f64> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let src = vec![5u8; block];
     let buf = c.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("bw-probe"),
@@ -64033,6 +64903,7 @@ pub fn dsv4_experts_ready(
     dn_q2: bool,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     moe_expert_bufs(c, model, experts, inter, hidden, true, gu_q2, dn_q2).is_some()
 }
 
@@ -64047,6 +64918,7 @@ pub fn dsv4_experts_ready(
 /// written last — so this, like the state, is per token.
 pub fn dsv4_hc_write_t(post: &[f32], comb: &[f32], tok: usize) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let pb = frame_buf_t(c, 43, tok, post.len() * 4, true);
     let cb = frame_buf_t(c, 44, tok, comb.len() * 4, true);
     c.queue.write_buffer(&pb, 0, bytemuck::cast_slice(post));
@@ -64056,6 +64928,7 @@ pub fn dsv4_hc_write_t(post: &[f32], comb: &[f32], tok: usize) -> bool {
 
 pub fn dsv4_hc_write(post: &[f32], comb: &[f32]) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let pb = frame_buf(c, 43, post.len() * 4, true);
     let cb = frame_buf(c, 44, comb.len() * 4, true);
     c.queue.write_buffer(&pb, 0, bytemuck::cast_slice(post));
@@ -64071,6 +64944,7 @@ pub fn dsv4_hc_write(post: &[f32], comb: &[f32]) -> bool {
 /// the single-slot writer can only reach token zero.
 pub fn dsv4_state_write_t(state: &[f32], tok: usize) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let b = frame_buf_t(c, 40, tok, state.len() * 4, true);
     c.queue.write_buffer(&b, 0, bytemuck::cast_slice(state));
     true
@@ -64078,6 +64952,7 @@ pub fn dsv4_state_write_t(state: &[f32], tok: usize) -> bool {
 
 pub fn dsv4_state_write(state: &[f32]) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let b = frame_buf(c, 40, state.len() * 4, true);
     c.queue.write_buffer(&b, 0, bytemuck::cast_slice(state));
     true
@@ -64086,6 +64961,7 @@ pub fn dsv4_state_write(state: &[f32]) -> bool {
 /// Read the hyper-connection state back (end of token, for the head).
 pub fn dsv4_state_read(state: &mut [f32]) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let b = frame_buf(c, 40, state.len() * 4, true);
     let bytes = (state.len() * 4) as u64;
     let mut sc = c.scratch.lock().unwrap();
@@ -64135,6 +65011,7 @@ fn dsv4_state_add_cold_inner(
     preserved: Option<(u64, usize)>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if hc == 0 || cold.is_empty() || state_out.len() != hc * cold.len() {
         return false;
     }
@@ -64196,6 +65073,7 @@ pub fn bt_moe_route_for_test(
     w_out: &mut Vec<f32>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let n = scores.len() / b.max(1);
     if n == 0 || n > 1024 || top_k == 0 || top_k > 64 || b == 0 {
         return false;
@@ -64346,6 +65224,7 @@ fn moe_route_for_test_impl(
     w_out: &mut Vec<f32>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let n = scores.len();
     if n == 0 || n > 1024 || top_k == 0 || top_k > 64 {
         return false;
@@ -64748,6 +65627,7 @@ pub fn dispatch_bench() -> Vec<String> {
         out.push("нет устройства".into());
         return out;
     };
+    let _op = c.op_gate.enter();
     const N: usize = 2000;
     let bufs: Vec<wgpu::Buffer> = (0..8)
         .map(|_| {
@@ -65333,6 +66213,7 @@ pub fn dsv4_compressor_frame(
     enc: &mut wgpu::CommandEncoder,
 ) -> Option<usize> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let _ew = if g.overlap { g.width / 2 } else { g.width };
     if g.width == 0 || g.ratio == 0 || g.hidden % 32 != 0 {
         return None;
@@ -65602,6 +66483,7 @@ pub fn dsv4_window_append(
     enc: &mut wgpu::CommandEncoder,
 ) -> Option<usize> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let bytes = model.primary_bytes();
     let e = model.tensors.get(wkv)?;
     if e.dtype != cortiq_core::TensorDtype::Q4TiledP {
@@ -65724,6 +66606,7 @@ pub fn dsv4_window_place_for_test(
     out: &mut Vec<f32>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     // A POOLED buffer, not a fresh one: `encode_rmsnorm` caches its bind
     // group by key, so a new buffer every call would leave the cache
     // pointing at the first one. Production hands it `frame_buf` for the
@@ -65811,6 +66694,7 @@ pub fn dsv4_indexer_frame(
     enc: &mut wgpu::CommandEncoder,
 ) -> Option<usize> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let limit = n_ix.min(n_comp);
     if g.ih == 0 || g.idim == 0 || limit == 0 || limit > 4096 {
         return None;
@@ -66161,6 +67045,7 @@ pub fn dsv4_comp_state_for_test(
     out: &mut Vec<f32>,
 ) -> Option<bool> {
     let c = ctx()?;
+    let _op = c.op_gate.enter();
     let g = Dsv4CompGeom {
         width,
         hidden: 0,
@@ -66223,6 +67108,7 @@ pub fn dsv4_idx_build_for_test(
     out: &mut Vec<u32>,
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let n = win_len + pick.len();
     // A zero-length binding is a validation error, and "the indexer picked
     // nothing" is a real state — pad rather than refuse.
@@ -66273,6 +67159,7 @@ pub fn dsv4_idx_build_for_test(
 /// Drop a sequence's compressor streams (called with the rest of its state).
 pub fn dsv4_compressor_forget(kv_id: u64) {
     if let Some(c) = ctx() {
+        let _op = c.op_gate.enter();
         c.dsv4_comp.lock().unwrap().retain(|k, _| k.1 != kv_id);
     }
 }
@@ -66287,6 +67174,7 @@ pub fn dsv4_cache_write(kv_id: u64, li: usize, off: usize, data: &[f32], cap: us
         }
         return false;
     };
+    let _op = c.op_gate.enter();
     if off + data.len() > cap {
         if dbg {
             eprintln!("кеш dsv4: {off}+{} не влезает в {cap}", data.len());
@@ -66510,6 +67398,7 @@ pub static GREW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// Drop a conversation's caches (a new sequence, or the pipeline resetting).
 pub fn dsv4_cache_clear(kv_id: u64) {
     if let Some(c) = ctx() {
+        let _op = c.op_gate.enter();
         c.dsv4_kv.lock().unwrap().retain(|k, _| k.0 != kv_id);
     }
 }
@@ -66620,6 +67509,7 @@ pub fn dsv4_attn_frame(
     let Some(c) = ctx() else {
         no!("нет контекста wgpu")
     };
+    let _op = c.op_gate.enter();
     // `hidden` is only read when the frame has to build the LoRA vector
     // itself; demanding it regardless refused every caller that had one.
     if (qn_in.is_none() && q_in.is_none() && hidden.len() < g.dim)
@@ -67103,6 +67993,7 @@ pub fn dsv4_moe_frame(
     let Some(c) = ctx() else {
         no!("нет контекста wgpu")
     };
+    let _op = c.op_gate.enter();
     let global_bufs = w
         .global
         .and_then(|gl| c.dsv4_global_moe.lock().unwrap().get(&gl.pool_uid).cloned());
@@ -67937,6 +68828,7 @@ pub fn sparse_attend_for_test(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if q.len() != nh * hd || out.len() != nh * hd || sink.len() != nh || idxs.len() > 1024 {
         return false;
     }
@@ -68005,6 +68897,7 @@ pub fn attend_x_for_test(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let Some(gx) = c.graph_x.as_ref() else {
         return false;
     };
@@ -68146,6 +69039,7 @@ pub fn attend_xg_for_test(
     out: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     let Some(gx) = c.graph_x.as_ref() else {
         return false;
     };
@@ -68330,6 +69224,7 @@ pub fn hc_join_for_test(
     expanded: &mut [f32],
 ) -> bool {
     let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
     if state.len() != hc * dim || folded.len() != dim || expanded.len() != hc * dim {
         return false;
     }
@@ -68538,5 +69433,45 @@ mod mimo_precision_scope_tests {
         assert!(!MIMO_F32_GEMM.get());
         let _ = std::panic::catch_unwind(|| { let _mimo = MimoF32Gemm::enter("mimo_v2"); panic!("scope test"); });
         assert!(!MIMO_F32_GEMM.get());
+    }
+}
+
+#[cfg(test)]
+mod op_gate_tests {
+    use super::OpGate;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn op_gate_reenters_on_one_thread_and_excludes_the_others() {
+        let gate = Arc::new(OpGate::default());
+        // Re-entry on the owning thread must not block (ops call ops).
+        {
+            let _a = gate.enter();
+            let _b = gate.enter();
+        }
+        // Across threads: never two inside at once, every entry completes.
+        let inside = Arc::new(AtomicUsize::new(0));
+        let worst = Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let (gate, inside, worst) = (gate.clone(), inside.clone(), worst.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        let _g = gate.enter();
+                        let _nested = gate.enter();
+                        let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                        worst.fetch_max(now, Ordering::SeqCst);
+                        std::thread::yield_now();
+                        inside.fetch_sub(1, Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(worst.load(Ordering::SeqCst), 1);
+        assert_eq!(inside.load(Ordering::SeqCst), 0);
     }
 }

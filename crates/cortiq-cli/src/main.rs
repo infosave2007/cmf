@@ -2617,6 +2617,62 @@ enum SkillCmd {
         /// DOWN,UP). Empty means ordinary all-token LM loss.
         #[arg(long)]
         focus_tokens: Option<String>,
+        /// Start marker of one chat record in the corpus files (the
+        /// rendered first turn): records split on it, never on token
+        /// windows. ChatML by default; Spark-X2.5 renders
+        /// "<｜start▁of▁sentence｜><|System|>".
+        #[arg(long, default_value = "<|im_start|>system")]
+        record_start: String,
+        /// Score only the assistant's answer of each record: the tokens
+        /// after the LAST occurrence of this rendered generation prompt
+        /// ("<|im_start|>assistant\n", "<|Bot|></think>", …) through
+        /// --answer-end. Multi-token answers; exclusive with --focus-tokens.
+        #[arg(long, requires = "answer_end")]
+        answer_after: Option<String>,
+        /// The one-token turn terminator that closes an answer
+        /// ("<|im_end|>", "<｜end▁of▁sentence｜>", …)
+        #[arg(long, requires = "answer_after")]
+        answer_end: Option<String>,
+        /// Leave out (and count) chat records longer than --chunk instead
+        /// of refusing the corpus; records are never cut.
+        #[arg(long)]
+        drop_oversize: bool,
+        /// Pad chat records to the smallest of chunk/4, chunk/2, 3·chunk/4,
+        /// chunk they fit instead of the full chunk; batches are drawn
+        /// from equal-length records
+        #[arg(long)]
+        length_buckets: bool,
+        /// Start from the mask of a previous run's --archaeology-report
+        /// (its `selected_logits`); with --steps-a 0 the mask is kept and
+        /// only Phase B runs.
+        #[arg(long)]
+        mask_from: Option<String>,
+        /// Patent 2 Soft-Fold compilation: surviving neurons keep their
+        /// learned gain σ(m), folded into down_proj (evaluated and
+        /// FCD-polished as such); default snaps them to 1.
+        #[arg(long)]
+        soft_fold: bool,
+        /// Keep the full FFN shape and ship the mask as a CMF task mask
+        /// (`--task <name>` at run/serve time) instead of cutting dead
+        /// neurons out of the tensors.
+        #[arg(long)]
+        no_defrag: bool,
+        /// Name of the task mask written with --no-defrag (or a looped model)
+        #[arg(long, default_value = "specialist")]
+        mask_name: String,
+        /// Full-layer FCD: Phase B also trains the attention projections,
+        /// the projected head gate and both norm gains of the FCD layers
+        #[arg(long)]
+        fcd_attn: bool,
+        /// Write each Phase-A evaluation's mask logits into this directory
+        /// (phase-a-step-N.json, usable with --mask-from) as the run goes
+        #[arg(long)]
+        checkpoint_dir: Option<String>,
+        /// JSONL with one object per record of --held-files, in record
+        /// order, whose "family" names the record's group: held scores
+        /// report per-family verdict accuracy and gate on its macro mean
+        #[arg(long)]
+        held_tags: Option<String>,
         /// Target sparsity (0.0–1.0): force at least this fraction of
         /// FFN neurons to be pruned. 0 = auto (denoising bottom)
         #[arg(long, default_value = "0.0")]
@@ -4109,6 +4165,18 @@ async fn main() -> anyhow::Result<()> {
                 batch,
                 fcd_batch,
                 focus_tokens,
+                record_start,
+                answer_after,
+                answer_end,
+                drop_oversize,
+                length_buckets,
+                mask_from,
+                soft_fold,
+                no_defrag,
+                mask_name,
+                fcd_attn,
+                checkpoint_dir,
+                held_tags,
                 target_sparsity,
                 l1_aggression,
                 l1_init,
@@ -4142,6 +4210,18 @@ async fn main() -> anyhow::Result<()> {
                 batch,
                 fcd_batch,
                 focus_tokens.as_deref(),
+                &record_start,
+                answer_after.as_deref(),
+                answer_end.as_deref(),
+                drop_oversize,
+                length_buckets,
+                mask_from.as_deref(),
+                soft_fold,
+                no_defrag,
+                &mask_name,
+                fcd_attn,
+                checkpoint_dir.as_deref(),
+                held_tags.as_deref(),
                 target_sparsity,
                 l1_aggression,
                 l1_init,

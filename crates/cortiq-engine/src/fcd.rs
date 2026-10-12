@@ -21,7 +21,7 @@
 //!   (fcd_ops::gdn_*) so trainable layers BELOW them still learn;
 //!   vmf_phase linear layers are refused (no backward yet).
 
-use crate::fcd_ops::{self as ops, NysCfg};
+use crate::fcd_ops::{self as ops, FfnAct, NysCfg};
 use crate::nystrom::{O1Cfg, O1Layers};
 use crate::pipeline::{DenseFfn, FfnKind, Pipeline};
 use crate::pool::Pool;
@@ -197,6 +197,17 @@ pub mod prof {
     use std::sync::atomic::{AtomicU64, Ordering};
     pub static ATTN_FWD: AtomicU64 = AtomicU64::new(0);
     pub static FFN_FWD: AtomicU64 = AtomicU64::new(0);
+    /// Inside FFN_FWD: the device chain call, the plane split + host
+    /// activation, and the host (unfused) GEMM path.
+    pub static FFN_CHAIN: AtomicU64 = AtomicU64::new(0);
+    pub static FFN_ACT: AtomicU64 = AtomicU64::new(0);
+    pub static FFN_HOST: AtomicU64 = AtomicU64::new(0);
+    /// Before the chain (residual add, post-norm, buffers) and after it
+    /// (residual add, acts struct).
+    pub static FFN_PRE: AtomicU64 = AtomicU64::new(0);
+    pub static FFN_POST: AtomicU64 = AtomicU64::new(0);
+    /// Inside ATTN_FWD: the device chain call.
+    pub static ATTN_CHAIN: AtomicU64 = AtomicU64::new(0);
     pub static BWD: AtomicU64 = AtomicU64::new(0);
     pub static GEMM: AtomicU64 = AtomicU64::new(0);
     pub static GEMM_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -263,6 +274,15 @@ enum FcdAttn {
         /// Qwen3.5: wq rows = 2·nh·hd, per-head [q; gate]; the head
         /// outputs are multiplied by σ(gate) before o_proj.
         output_gate: bool,
+        /// Spark-X2.5: `self_attn.g_proj` [nh, hidden] — one sigmoid gain
+        /// per Q head from the layer's normed input, multiplied into that
+        /// head's output before o_proj (`attention::apply_projected_gate`).
+        head_gate: Option<Vec<f32>>,
+        /// Sliding-window layer: a query sees its last `w` keys only.
+        window: Option<usize>,
+        /// Local layers rotate with their own table (`inv_freq_local`,
+        /// `rotary_dim_local`) — Gemma-3 / Spark-X2.5 geometry.
+        local_rope: bool,
     },
     /// GatedDeltaNet (Qwen3.5 hybrids): never converted, never trained;
     /// through-backward = BPTT over the window (fcd_ops::gdn_*).
@@ -319,6 +339,17 @@ pub struct FcdModel {
     pub(crate) gemma: bool,
     rotary_dim: usize,
     inv_freq: Vec<f64>,
+    /// Sliding (local) layers' own RoPE geometry when the arch declares
+    /// one (`rope_local_base_freq` / `local_partial_rotary_factor`).
+    rotary_dim_local: Option<usize>,
+    inv_freq_local: Option<Vec<f64>>,
+    /// The FFN gate activation every forward and backward in this file
+    /// and in `skillbake` differentiate.
+    pub(crate) act: FfnAct,
+    /// Keep the per-layer attention activations (needed only by the
+    /// through-attention backward of `cortiq fcd`); the skill bake turns
+    /// this off and the device chain then reads back attn_out alone.
+    pub(crate) attn_acts: bool,
     /// [vocab, hidden]; also the tied head when `lm_head` is None.
     pub(crate) embed: Vec<f32>,
     pub(crate) lm_head: Option<Vec<f32>>,
@@ -335,7 +366,7 @@ pub struct FcdModel {
     /// cos/sin table for the device attention chain, keyed by t. Arc so
     /// the underlying address stays STABLE across calls — the GPU const
     /// cache dedups uploads by (pointer, fingerprint).
-    rope_tab: std::sync::Mutex<Option<(usize, std::sync::Arc<Vec<f32>>)>>,
+    rope_tab: std::sync::Mutex<Option<((usize, bool), std::sync::Arc<Vec<f32>>)>>,
     /// How many layers stay resident (0 = all, big machines).
     mats_window: usize,
     /// Which layers run the Nyström kernel in the student forward.
@@ -602,12 +633,12 @@ impl FcdModel {
         polish_only: bool,
     ) -> Result<Self, String> {
         let arch = model.arch().clone();
-        if arch.hidden_act != "silu" {
-            return Err(format!(
-                "fcd/skill-bake: hidden_act '{}' not supported yet (SiLU only)",
+        let act = FfnAct::from_arch(&arch.hidden_act).ok_or_else(|| {
+            format!(
+                "fcd/skill-bake: hidden_act '{}' not supported yet (silu | gelu)",
                 arch.hidden_act
-            ));
-        }
+            )
+        })?;
         let has_linear = arch
             .layer_types
             .iter()
@@ -699,6 +730,28 @@ impl FcdModel {
                         v.extend_from_slice(bv);
                         v
                     });
+                    // A projected output gate rides in one form: one row
+                    // per Q head with a sigmoid (Spark-X2.5). A per-element
+                    // or softplus gate has no trainer path yet — loud.
+                    let head_gate = match opt("g_proj.weight") {
+                        None => None,
+                        Some(g) if g.len() == nh * h => Some(g),
+                        Some(g) => {
+                            return Err(format!(
+                                "layer {li}: self_attn.g_proj has {} values; only a per-head gate (nh·hidden = {}) is supported",
+                                g.len(),
+                                nh * h
+                            ));
+                        }
+                    };
+                    let sliding = matches!(arch.layer_types.get(li), Some(LayerType::SlidingAttention));
+                    let window = if sliding {
+                        Some(arch.sliding_window.ok_or_else(|| {
+                            format!("layer {li} is SlidingAttention but arch.sliding_window is unset")
+                        })?)
+                    } else {
+                        None
+                    };
                     FcdAttn::Full {
                         qrows,
                         q_norm: opt("q_norm.weight"),
@@ -706,6 +759,9 @@ impl FcdModel {
                         bias,
                         bias_cat,
                         output_gate,
+                        head_gate,
+                        window,
+                        local_rope: sliding,
                     }
                 }
             };
@@ -727,6 +783,27 @@ impl FcdModel {
         let inv_freq: Vec<f64> = (0..rotary_dim / 2)
             .map(|i| 1.0 / base.powf(2.0 * i as f64 / rotary_dim as f64))
             .collect();
+        // Local (sliding) layers: the runtime's rule (`loader.rs`) — their
+        // rotary width follows `local_partial_rotary_factor` (else the
+        // global factor) and their table `rope_local_base_freq` when set.
+        let any_sliding = arch
+            .layer_types
+            .iter()
+            .any(|t| matches!(t, LayerType::SlidingAttention));
+        let rotary_dim_local = any_sliding.then(|| {
+            ((hd as f32 * arch.local_partial_rotary_factor.unwrap_or(arch.partial_rotary_factor))
+                as usize)
+                .max(2)
+                .min(hd)
+        });
+        let inv_freq_local = match (rotary_dim_local, arch.rope_local_base_freq) {
+            (Some(rd), Some(lb)) => Some(
+                (0..rd / 2)
+                    .map(|i| 1.0 / lb.powf(2.0 * i as f64 / rd as f64))
+                    .collect::<Vec<f64>>(),
+            ),
+            _ => None,
+        };
         let loops = arch.num_loops.max(1);
         let loop_norm = arch.loop_final_norm;
         let mut flags = o1.layer_flags(arch.num_layers);
@@ -803,6 +880,10 @@ impl FcdModel {
             gemma: matches!(arch.norm_style, NormStyle::Gemma),
             rotary_dim,
             inv_freq,
+            rotary_dim_local,
+            inv_freq_local,
+            act,
+            attn_acts: true,
             embed,
             lm_head,
             final_norm,
@@ -993,6 +1074,10 @@ enum AttnActs {
         ao: Vec<f32>,
         /// Raw gate half of q_proj (empty without an output gate).
         gate_pre: Vec<f32>,
+        /// Per-(row, head) sigmoid gains of a projected head gate (empty
+        /// without one). Frozen weights: the backward scales by the gain
+        /// and does not chase the gate's own input.
+        head_gain: Vec<f32>,
     },
     /// Raw projection streams — the GDN backward replays conv + the
     /// recurrence from these.
@@ -1004,8 +1089,17 @@ enum AttnActs {
     },
 }
 
+/// Trained attention weights of a full-layer FCD layer, in place of the
+/// frozen `LayerMats`/head gate for one forward.
+#[derive(Clone, Copy)]
+pub(crate) struct AttnW<'a> {
+    pub(crate) wqkv: &'a [f32],
+    pub(crate) wo: &'a [f32],
+    pub(crate) head_gate: Option<&'a [f32]>,
+}
+
 pub(crate) struct LayerActs {
-    inv1: Vec<f32>,
+    pub(crate) inv1: Vec<f32>,
     attn: AttnActs,
     pub(crate) h1: Vec<f32>,
     pub(crate) n2: Vec<f32>,
@@ -1013,6 +1107,25 @@ pub(crate) struct LayerActs {
     pub(crate) gpre: Vec<f32>,
     pub(crate) upre: Vec<f32>,
     pub(crate) act: Vec<f32>,
+}
+
+impl LayerActs {
+    /// The full-attention activations a full-layer FCD backward needs:
+    /// (qrot, krot, vproj, ao, head_gain) — None for GDN layers or when
+    /// the forward did not keep them.
+    pub(crate) fn attn_full(&self) -> Option<(&[f32], &[f32], &[f32], &[f32], &[f32])> {
+        match &self.attn {
+            AttnActs::Full {
+                qrot,
+                krot,
+                vproj,
+                ao,
+                head_gain,
+                ..
+            } if !qrot.is_empty() => Some((qrot, krot, vproj, ao, head_gain)),
+            _ => None,
+        }
+    }
 }
 
 /// Disjoint-write pointer for pooled per-head scatter (pipeline pattern).
@@ -1026,19 +1139,219 @@ impl<T> SendMut<T> {
     }
 }
 
+
+/// Split `[0, n)` into one contiguous range per pool worker and run `f(lo, hi)`
+/// on each — the shape of every row-wise host op below (norms, residual adds,
+/// plane copies), which were single-threaded memory walks over hundreds of MB.
+pub(crate) fn pooled_rows(n: usize, pool: Option<&Pool>, f: &(dyn Fn(usize, usize) + Sync)) {
+    match pool {
+        Some(p) if n >= 64 => p.run(&|w, nw| {
+            let lo = n * w / nw;
+            let hi = n * (w + 1) / nw;
+            if hi > lo {
+                f(lo, hi);
+            }
+        }),
+        _ => f(0, n),
+    }
+}
+
+/// `ops::rmsnorm_fwd` over row ranges in parallel.
+pub(crate) fn rmsnorm_fwd_pooled(
+    x: &[f32],
+    w: &[f32],
+    eps: f64,
+    gemma: bool,
+    y: &mut [f32],
+    inv: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    let d = w.len();
+    let n = x.len() / d;
+    let yp = SendMut(y.as_mut_ptr());
+    let ip = SendMut(inv.as_mut_ptr());
+    pooled_rows(n, pool, &|lo, hi| {
+        // SAFETY: disjoint row ranges per worker.
+        let (yr, ir) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(yp.at(lo * d), (hi - lo) * d),
+                std::slice::from_raw_parts_mut(ip.at(lo), hi - lo),
+            )
+        };
+        ops::rmsnorm_fwd(&x[lo * d..hi * d], w, eps, gemma, yr, ir);
+    });
+}
+
+/// `ops::rmsnorm_bwd` (through-grad only, frozen gain) over row ranges in parallel.
+pub(crate) fn rmsnorm_bwd_pooled(
+    x: &[f32],
+    w: &[f32],
+    inv: &[f32],
+    dy: &[f32],
+    gemma: bool,
+    dx: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    let d = w.len();
+    let n = x.len() / d;
+    let dp = SendMut(dx.as_mut_ptr());
+    pooled_rows(n, pool, &|lo, hi| {
+        // SAFETY: disjoint row ranges per worker.
+        let dxr = unsafe { std::slice::from_raw_parts_mut(dp.at(lo * d), (hi - lo) * d) };
+        ops::rmsnorm_bwd(&x[lo * d..hi * d], w, &inv[lo..hi], &dy[lo * d..hi * d], gemma, dxr, None);
+    });
+}
+
+/// `a += b`, elementwise, in parallel.
+pub(crate) fn add_into_pooled(a: &mut [f32], b: &[f32], pool: Option<&Pool>) {
+    let n = a.len().min(b.len());
+    let ap = SendMut(a.as_mut_ptr());
+    const CHUNK: usize = 4096;
+    let chunks = n.div_ceil(CHUNK);
+    pooled_rows(chunks, pool, &|lo, hi| {
+        let (s, e) = (lo * CHUNK, (hi * CHUNK).min(n));
+        // SAFETY: disjoint element ranges per worker.
+        let ar = unsafe { std::slice::from_raw_parts_mut(ap.at(s), e - s) };
+        for (x, &y) in ar.iter_mut().zip(&b[s..e]) {
+            *x += y;
+        }
+    });
+}
+
+/// `act[r] = f(gpre[r]) ⊙ upre[r]` over `n` rows of `inter`, pooled: the
+/// erf GELU is not free (63 M elements per 4 B training step), and one
+/// thread walking it was the slowest link of a Spark bake.
+pub(crate) fn act_mul_rows(
+    f: FfnAct,
+    gpre: &[f32],
+    upre: &[f32],
+    act: &mut [f32],
+    n: usize,
+    inter: usize,
+    pool: Option<&Pool>,
+) {
+    let row = |r: usize, out: &mut [f32]| {
+        let g = &gpre[r * inter..(r + 1) * inter];
+        let u = &upre[r * inter..(r + 1) * inter];
+        for ((o, &gv), &uv) in out.iter_mut().zip(g).zip(u) {
+            *o = f.fwd(gv) * uv;
+        }
+    };
+    match pool {
+        Some(p) if n > 1 => {
+            let ap = SendMut(act.as_mut_ptr());
+            p.run(&|w, nw| {
+                for r in (w..n).step_by(nw) {
+                    // SAFETY: disjoint row slices per worker.
+                    let out = unsafe { std::slice::from_raw_parts_mut(ap.at(r * inter), inter) };
+                    row(r, out);
+                }
+            });
+        }
+        _ => {
+            for r in 0..n {
+                row(r, &mut act[r * inter..(r + 1) * inter]);
+            }
+        }
+    }
+}
+
+/// The backward of `act_mul_rows` with an optional per-neuron scale `s`
+/// (the DTG-MA gate the forward multiplied in after the activation):
+/// `dg = dact·s·u·f′(g)`, `du = dact·s·f(g)`. Pooled like the forward.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn act_bwd_rows(
+    f: FfnAct,
+    gpre: &[f32],
+    upre: &[f32],
+    dact: &[f32],
+    scale: Option<&[f32]>,
+    dg: &mut [f32],
+    du: &mut [f32],
+    n: usize,
+    inter: usize,
+    pool: Option<&Pool>,
+) {
+    let row = |r: usize, dg: &mut [f32], du: &mut [f32]| {
+        let base = r * inter;
+        for j in 0..inter {
+            let i = base + j;
+            let da = dact[i] * scale.map(|s| s[j]).unwrap_or(1.0);
+            dg[j] = da * upre[i] * f.bwd(gpre[i]);
+            du[j] = da * f.fwd(gpre[i]);
+        }
+    };
+    match pool {
+        Some(p) if n > 1 => {
+            let gp = SendMut(dg.as_mut_ptr());
+            let up = SendMut(du.as_mut_ptr());
+            p.run(&|w, nw| {
+                for r in (w..n).step_by(nw) {
+                    // SAFETY: disjoint row slices per worker.
+                    let (dgr, dur) = unsafe {
+                        (
+                            std::slice::from_raw_parts_mut(gp.at(r * inter), inter),
+                            std::slice::from_raw_parts_mut(up.at(r * inter), inter),
+                        )
+                    };
+                    row(r, dgr, dur);
+                }
+            });
+        }
+        _ => {
+            for r in 0..n {
+                let (dgr, dur) = (&mut dg[r * inter..(r + 1) * inter], &mut du[r * inter..(r + 1) * inter]);
+                row(r, dgr, dur);
+            }
+        }
+    }
+}
+
 impl FcdModel {
     /// Per-head RMS-norm (qk-norm) + partial RoPE for all rows of a
     /// projection buffer. `heads` per row, `x` is `[n, heads·hd]`.
     /// Saves the per-(row, head) rms inv when a norm gain is present.
+    /// (window, local-RoPE) of a full-attention layer — None for GDN.
+    pub(crate) fn attn_geometry(&self, li: usize) -> Option<(Option<usize>, bool)> {
+        match &self.layers[li].attn {
+            FcdAttn::Full {
+                window, local_rope, ..
+            } => Some((*window, *local_rope)),
+            _ => None,
+        }
+    }
+
+    /// The frozen per-head gate projection of a layer (Spark-X2.5), if any.
+    pub(crate) fn head_gate_weights(&self, li: usize) -> Option<&[f32]> {
+        match &self.layers[li].attn {
+            FcdAttn::Full { head_gate, .. } => head_gate.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The RoPE geometry of a layer: local layers may own a table.
+    pub(crate) fn layer_rope(&self, local: bool) -> (usize, &[f64]) {
+        if local {
+            (
+                self.rotary_dim_local.unwrap_or(self.rotary_dim),
+                self.inv_freq_local.as_deref().unwrap_or(&self.inv_freq),
+            )
+        } else {
+            (self.rotary_dim, &self.inv_freq)
+        }
+    }
+
     fn qk_norm_rope(
         &self,
         x: &mut [f32],
         norm: Option<&[f32]>,
         heads: usize,
         t: usize,
+        local: bool,
         inv_out: &mut [f32],
     ) {
         let hd = self.hd;
+        let (rotary_dim, inv_freq) = self.layer_rope(local);
         let n = x.len() / (heads * hd);
         for r in 0..n {
             let pos = r % t;
@@ -1053,7 +1366,7 @@ impl FcdModel {
                     head.copy_from_slice(&y[..hd]);
                     inv_out[r * heads + hh] = inv[0];
                 }
-                ops::rope_fwd(&mut head[..self.rotary_dim], pos, &self.inv_freq);
+                ops::rope_fwd(&mut head[..rotary_dim], pos, inv_freq);
             }
         }
     }
@@ -1074,7 +1387,7 @@ impl FcdModel {
         nystrom: bool,
         want_acts: bool,
     ) -> (Vec<f32>, Option<LayerActs>) {
-        self.layer_forward_scaled(li, h_in, b, t, wts, nystrom, want_acts, None)
+        self.layer_forward_scaled(li, h_in, b, t, wts, nystrom, want_acts, None, true, None, false)
     }
 
     /// `layer_forward` with an optional per-neuron FFN activation scale
@@ -1091,6 +1404,9 @@ impl FcdModel {
         nystrom: bool,
         want_acts: bool,
         ffn_scale: Option<&[f32]>,
+        ffn_planes_to_host: bool,
+        attn_w: Option<AttnW<'_>>,
+        want_attn_acts: bool,
     ) -> (Vec<f32>, Option<LayerActs>) {
         // Polish-only: the flags select what to TRAIN, not what to convert.
         let nystrom = nystrom && !self.polish_only;
@@ -1101,31 +1417,36 @@ impl FcdModel {
 
         let mut n1 = vec![0f32; n * hsz];
         let mut inv1 = vec![0f32; n];
-        ops::rmsnorm_fwd(h_in, wts.iln, self.eps, self.gemma, &mut n1, &mut inv1);
+        rmsnorm_fwd_pooled(h_in, wts.iln, self.eps, self.gemma, &mut n1, &mut inv1, pool);
 
         let mats = self.mats(li).expect("layer mats");
         let t_attn = std::time::Instant::now();
         let (attn_out, attn_acts) = match &l.attn {
-            FcdAttn::Full { .. } => self.full_attn_fwd(&l.attn, &mats, &n1, b, t, nystrom),
+            FcdAttn::Full { .. } => {
+                self.full_attn_fwd(&l.attn, &mats, &n1, b, t, nystrom, attn_w, want_attn_acts)
+            }
             FcdAttn::Gdn { .. } => self.gdn_attn_fwd(&l.attn, &n1, b, t),
         };
         prof::add(&prof::ATTN_FWD, t_attn);
         let t_ffn = std::time::Instant::now();
 
         let mut h1 = h_in.to_vec();
-        for (a, &x) in h1.iter_mut().zip(&attn_out) {
-            *a += x;
-        }
+        add_into_pooled(&mut h1, &attn_out, pool);
 
         let mut n2 = vec![0f32; n * hsz];
         let mut inv2 = vec![0f32; n];
-        ops::rmsnorm_fwd(&h1, wts.pln, self.eps, self.gemma, &mut n2, &mut inv2);
+        rmsnorm_fwd_pooled(&h1, wts.pln, self.eps, self.gemma, &mut n2, &mut inv2, pool);
 
         let inter = l.inter;
-        let mut gpre = vec![0f32; n * inter];
-        let mut upre = vec![0f32; n * inter];
-        let mut act = vec![0f32; n * inter];
+        // The gate/up/act planes are allocated only by the path that fills
+        // them: zero-filling three n×inter buffers per layer that the device
+        // chain never touches cost more than the chain itself (48 s of a
+        // 73 s FFN forward on a 1.7 B smoke bake).
+        let mut gpre: Vec<f32> = Vec::new();
+        let mut upre: Vec<f32> = Vec::new();
+        let mut act: Vec<f32> = Vec::new();
         let mut ffn = vec![0f32; n * hsz];
+        prof::add(&prof::FFN_PRE, t_ffn);
         // The frozen fused-gu FFN rides the whole chain on the device when
         // the tensor-core arm is up: one submit, and the gate+up plane
         // only crosses PCIe when the backward pass will need it. An eval
@@ -1134,8 +1455,11 @@ impl FcdModel {
         #[cfg(feature = "gpu")]
         if let Some(gu) = wts.gu {
             if crate::gpu::enabled_here() {
-                let mut both = want_acts.then(|| vec![0f32; n * 2 * inter]);
-                if crate::gpu_wgpu::ffn_chain_f32(
+                // A training call whose backward runs on the card leaves the
+                // plane there: nothing of n×2·inter crosses PCIe.
+                let mut both = (want_acts && ffn_planes_to_host).then(|| vec![0f32; n * 2 * inter]);
+                let t_chain = std::time::Instant::now();
+                let chained = crate::gpu_wgpu::ffn_chain_f32(
                     &n2,
                     gu,
                     wts.down,
@@ -1146,23 +1470,33 @@ impl FcdModel {
                     n,
                     hsz,
                     inter,
-                ) {
+                    self.act,
+                );
+                prof::add(&prof::FFN_CHAIN, t_chain);
+                if chained {
                     fused = true;
                     if let Some(b) = &both {
+                        let t_act = std::time::Instant::now();
+                        gpre.reserve_exact(n * inter);
+                        upre.reserve_exact(n * inter);
                         for r in 0..n {
                             let row = &b[r * 2 * inter..(r + 1) * 2 * inter];
-                            gpre[r * inter..(r + 1) * inter].copy_from_slice(&row[..inter]);
-                            upre[r * inter..(r + 1) * inter].copy_from_slice(&row[inter..]);
+                            gpre.extend_from_slice(&row[..inter]);
+                            upre.extend_from_slice(&row[inter..]);
                         }
+                        act = vec![0f32; n * inter];
                         // PRE-scale, as the mask backward expects.
-                        for i in 0..n * inter {
-                            act[i] = ops::silu(gpre[i]) * upre[i];
-                        }
+                        act_mul_rows(self.act, &gpre, &upre, &mut act, n, inter, pool);
+                        prof::add(&prof::FFN_ACT, t_act);
                     }
                 }
             }
         }
+        let t_host = std::time::Instant::now();
         if !fused {
+            gpre = vec![0f32; n * inter];
+            upre = vec![0f32; n * inter];
+            act = vec![0f32; n * inter];
             if let Some(gu) = wts.gu {
                 // One submit; split back so everything downstream is
                 // byte-identical to the two-call path.
@@ -1177,9 +1511,7 @@ impl FcdModel {
                 ops::gemm_nt(&n2, wts.gate, &mut gpre, n, hsz, inter, pool);
                 ops::gemm_nt(&n2, wts.up, &mut upre, n, hsz, inter, pool);
             }
-            for i in 0..n * inter {
-                act[i] = ops::silu(gpre[i]) * upre[i];
-            }
+            act_mul_rows(self.act, &gpre, &upre, &mut act, n, inter, pool);
             match ffn_scale {
                 Some(g) => {
                     debug_assert_eq!(g.len(), inter);
@@ -1194,10 +1526,12 @@ impl FcdModel {
                 None => ops::gemm_nt(&act, wts.down, &mut ffn, n, inter, hsz, pool),
             }
         }
-        let mut h2 = h1.clone();
-        for (a, &x) in h2.iter_mut().zip(&ffn) {
-            *a += x;
-        }
+        prof::add(&prof::FFN_HOST, t_host);
+        let t_post = std::time::Instant::now();
+        // The acts keep h1; without them the residual add runs in place.
+        let mut h2 = if want_acts { h1.clone() } else { std::mem::take(&mut h1) };
+        add_into_pooled(&mut h2, &ffn, pool);
+        prof::add(&prof::FFN_POST, t_post);
 
         let acts = want_acts.then_some(LayerActs {
             inv1,
@@ -1216,6 +1550,7 @@ impl FcdModel {
     /// Full-attention forward: projections (+optional biases), optional
     /// per-head [q; gate] split (Qwen3.5 output gate), qk-norm + RoPE,
     /// per-head exact-or-Nyström attention, σ(gate) multiply, o_proj.
+    #[allow(clippy::too_many_arguments)]
     fn full_attn_fwd(
         &self,
         attn: &FcdAttn,
@@ -1224,8 +1559,14 @@ impl FcdModel {
         b: usize,
         t: usize,
         nystrom: bool,
+        attn_w: Option<AttnW<'_>>,
+        want_attn_acts: bool,
     ) -> (Vec<f32>, AttnActs) {
-        let (wqkv, wo) = (&mats.wqkv[..], &mats.wo[..]);
+        // Trained copies (full-layer FCD) stand in for the frozen mats.
+        let (wqkv, wo) = match attn_w {
+            Some(w) => (w.wqkv, w.wo),
+            None => (&mats.wqkv[..], &mats.wo[..]),
+        };
         let FcdAttn::Full {
             qrows: _,
             q_norm,
@@ -1233,10 +1574,14 @@ impl FcdModel {
             bias,
             bias_cat,
             output_gate,
+            head_gate,
+            window,
+            local_rope,
         } = attn
         else {
             unreachable!("full_attn_fwd on a non-Full layer");
         };
+
         let (hsz, nh, nkv, hd) = (self.hidden, self.nh, self.nkv, self.hd);
         let n = b * t;
         let pool = self.pool.as_deref();
@@ -1246,6 +1591,23 @@ impl FcdModel {
         let qrows = if *output_gate { 2 * qdim } else { qdim };
 
         let fused = qrows + 2 * kvdim;
+        // Projected head gate (Spark-X2.5): gain_h = σ(g_proj_h · n1) per
+        // row, applied to the whole head — the runtime's
+        // `apply_projected_gate(per_head = true, sigmoid = true)`. Computed
+        // once here; both the device chain and the host path consume it.
+        let head_gate_w: Option<&[f32]> = attn_w.and_then(|w| w.head_gate).or(head_gate.as_deref());
+        let head_gain: Vec<f32> = match head_gate_w {
+            Some(gw) => {
+                let mut graw = vec![0f32; n * nh];
+                ops::gemm_nt(n1, gw, &mut graw, n, hsz, nh, pool);
+                for v in graw.iter_mut() {
+                    *v = 1.0 / (1.0 + (-*v).exp());
+                }
+                graw
+            }
+            None => Vec::new(),
+        };
+        let (rotary_dim, inv_freq) = self.layer_rope(*local_rope);
         // ── device chain: the whole attention forward in one submit ──
         // Declines in strict-f32 mode, on Nyström layers (their kernel is
         // certified f64 and stays host), and wherever a shape steps
@@ -1253,23 +1615,23 @@ impl FcdModel {
         // the reference.
         #[cfg(feature = "gpu")]
         if !nystrom && crate::gpu::enabled_here() {
-            let want_acts = true; // the caller always builds acts today
+            let want_acts = self.attn_acts || want_attn_acts;
             let rope = {
                 let mut rt = self.rope_tab.lock().unwrap();
                 match rt.as_ref() {
-                    Some((tt, arc)) if *tt == t => arc.clone(),
+                    Some((key, arc)) if *key == (t, *local_rope) => arc.clone(),
                     _ => {
-                        let half = self.rotary_dim / 2;
+                        let half = rotary_dim / 2;
                         let mut tab = Vec::with_capacity(t * half * 2);
                         for pos in 0..t {
-                            for &freq in self.inv_freq.iter() {
+                            for &freq in inv_freq.iter() {
                                 let a = pos as f64 * freq;
                                 tab.push(a.cos() as f32);
                                 tab.push(a.sin() as f32);
                             }
                         }
                         let arc = std::sync::Arc::new(tab);
-                        *rt = Some((t, arc.clone()));
+                        *rt = Some(((t, *local_rope), arc.clone()));
                         arc
                     }
                 }
@@ -1281,9 +1643,11 @@ impl FcdModel {
                 k_norm: k_norm.as_deref(),
                 bias: bias_cat.as_deref(),
                 output_gate: *output_gate,
+                head_gain: (!head_gain.is_empty()).then_some(&head_gain[..]),
+                window: *window,
                 gemma: self.gemma,
                 eps: self.eps as f32,
-                rotary_half: self.rotary_dim / 2,
+                rotary_half: rotary_dim / 2,
                 rope: &rope,
                 b,
                 t,
@@ -1293,7 +1657,27 @@ impl FcdModel {
                 hsz: self.hidden,
             };
             let mut attn_out = vec![0f32; n * self.hidden];
-            if let Some(ch) = crate::gpu_wgpu::attn_chain_f32(n1, &cfg, &mut attn_out, want_acts) {
+            let t_chain = std::time::Instant::now();
+            let chained = crate::gpu_wgpu::attn_chain_f32(n1, &cfg, &mut attn_out, want_acts);
+            prof::add(&prof::ATTN_CHAIN, t_chain);
+            if let Some(ch) = chained {
+                if !want_acts {
+                    return (
+                        attn_out,
+                        AttnActs::Full {
+                            qpre: Vec::new(),
+                            kpre: Vec::new(),
+                            vproj: Vec::new(),
+                            qrot: Vec::new(),
+                            krot: Vec::new(),
+                            qinv: Vec::new(),
+                            kinv: Vec::new(),
+                            ao: Vec::new(),
+                            gate_pre: Vec::new(),
+                            head_gain,
+                        },
+                    );
+                }
                 // Rebuild the host-visible acts from the raw plane, with
                 // exactly the host split's bias/gate arithmetic.
                 let mut qraw = vec![0f32; n * qrows];
@@ -1345,6 +1729,7 @@ impl FcdModel {
                         kinv: ch.kinv,
                         ao: ch.ao,
                         gate_pre,
+                        head_gain,
                     },
                 );
             }
@@ -1398,8 +1783,8 @@ impl FcdModel {
         let mut krot = kpre.clone();
         let mut qinv = vec![0f32; n * nh];
         let mut kinv = vec![0f32; n * nkv];
-        self.qk_norm_rope(&mut qrot, q_norm.as_deref(), nh, t, &mut qinv);
-        self.qk_norm_rope(&mut krot, k_norm.as_deref(), nkv, t, &mut kinv);
+        self.qk_norm_rope(&mut qrot, q_norm.as_deref(), nh, t, *local_rope, &mut qinv);
+        self.qk_norm_rope(&mut krot, k_norm.as_deref(), nkv, t, *local_rope, &mut kinv);
 
         // ── attention heads: parallel over (sequence, head) ──
         let mut ao = vec![0f32; n * qdim];
@@ -1451,7 +1836,7 @@ impl FcdModel {
                             .copy_from_slice(&vr[r * kvdim + g * hd..r * kvdim + (g + 1) * hd]);
                     }
                     let mut o32 = vec![0f32; t * hd];
-                    ops::attn_head_fwd(&q32, &k32, &v32, t, hd, hd, &mut o32);
+                    ops::attn_head_fwd_window(&q32, &k32, &v32, t, hd, hd, *window, &mut o32);
                     for p in 0..t {
                         let r = bi * t + p;
                         for c in 0..hd {
@@ -1478,7 +1863,7 @@ impl FcdModel {
         }
 
         // Output gate: multiply the head outputs by σ(gate) before o_proj.
-        let ao_eff: Vec<f32> = if *output_gate {
+        let mut ao_eff: Vec<f32> = if *output_gate {
             ao.iter()
                 .zip(&gate_pre)
                 .map(|(&a, &g)| a * (1.0 / (1.0 + (-g).exp())))
@@ -1486,6 +1871,17 @@ impl FcdModel {
         } else {
             ao.clone()
         };
+        // The projected head gate's gains (computed above) scale each head.
+        if !head_gain.is_empty() {
+            for r in 0..n {
+                for h in 0..nh {
+                    let gain = head_gain[r * nh + h];
+                    for a in &mut ao_eff[r * qdim + h * hd..r * qdim + (h + 1) * hd] {
+                        *a *= gain;
+                    }
+                }
+            }
+        }
         let mut attn_out = vec![0f32; n * hsz];
         ops::gemm_nt(&ao_eff, wo, &mut attn_out, n, qdim, hsz, pool);
         (
@@ -1500,6 +1896,7 @@ impl FcdModel {
                 kinv,
                 ao,
                 gate_pre,
+                head_gain,
             },
         )
     }
@@ -1653,7 +2050,7 @@ impl FcdModel {
             if let Some(gu) = wts.gu {
                 if crate::gpu::enabled_here()
                     && crate::gpu_wgpu::ffn_bwd_chain_f32(
-                        dh2, wts.down, gu, li, &mut dn2, n, hsz, inter,
+                        dh2, wts.down, gu, li, &mut dn2, n, hsz, inter, self.act, None, None,
                     )
                 {
                     bwd_fused = true;
@@ -1668,10 +2065,7 @@ impl FcdModel {
             }
             let mut dg = vec![0f32; n * inter];
             let mut du = vec![0f32; n * inter];
-            for i in 0..n * inter {
-                dg[i] = dact[i] * acts.upre[i] * ops::silu_bwd(acts.gpre[i]);
-                du[i] = dact[i] * ops::silu(acts.gpre[i]);
-            }
+            act_bwd_rows(self.act, &acts.gpre, &acts.upre, &dact, None, &mut dg, &mut du, n, inter, pool);
             // Fused when the frozen concat exists (its gate/up slots are
             // empty by design); trained masters keep the two-call path.
             if let Some(gu) = wts.gu {
@@ -1744,6 +2138,8 @@ impl FcdModel {
             q_norm,
             k_norm,
             output_gate,
+            local_rope,
+            window,
             ..
         } = attn
         else {
@@ -1759,10 +2155,12 @@ impl FcdModel {
             kinv,
             ao,
             gate_pre,
+            head_gain,
         } = acts
         else {
             unreachable!("acts mismatch");
         };
+        let (rotary_dim, inv_freq) = self.layer_rope(*local_rope);
         let (hsz, nh, nkv, hd) = (self.hidden, self.nh, self.nkv, self.hd);
         let n = b * t;
         let pool = self.pool.as_deref();
@@ -1773,6 +2171,19 @@ impl FcdModel {
 
         let mut dao_eff = vec![0f32; n * qdim];
         ops::gemm_dx(dattn, wo, &mut dao_eff, n, qdim, hsz, pool);
+        // Projected head gate: the gain multiplies the whole head, so the
+        // gradient scales by it; the gate's weights are frozen and its
+        // input path is not chased (FCD policy: attention is closed-form).
+        if !head_gain.is_empty() {
+            for r in 0..n {
+                for h in 0..nh {
+                    let gain = head_gain[r * nh + h];
+                    for d in &mut dao_eff[r * qdim + h * hd..r * qdim + (h + 1) * hd] {
+                        *d *= gain;
+                    }
+                }
+            }
+        }
         // Output gate: ao_eff = ao·σ(g) → dao = d·σ(g), dg = d·ao·σ′(g).
         let (dao, dgate) = if *output_gate {
             let mut dao = vec![0f32; n * qdim];
@@ -1834,8 +2245,9 @@ impl FcdModel {
                             &mut dv64,
                         );
                     } else {
-                        ops::attn_head_bwd(
-                            &q64, &k64, &v64, &do64, t, hd, hd, &mut dq64, &mut dk64, &mut dv64,
+                        ops::attn_head_bwd_window(
+                            &q64, &k64, &v64, &do64, t, hd, hd, *window, &mut dq64, &mut dk64,
+                            &mut dv64,
                         );
                     }
                     for p in 0..t {
@@ -1880,7 +2292,7 @@ impl FcdModel {
             let pos = r % t;
             for h in 0..nh {
                 let s = r * qdim + h * hd;
-                ops::rope_bwd(&mut dqrot[s..s + self.rotary_dim], pos, &self.inv_freq);
+                ops::rope_bwd(&mut dqrot[s..s + rotary_dim], pos, inv_freq);
                 match q_norm {
                     Some(w) => ops::rmsnorm_bwd(
                         &qpre[s..s + hd],
@@ -1896,7 +2308,7 @@ impl FcdModel {
             }
             for g in 0..nkv {
                 let s = r * kvdim + g * hd;
-                ops::rope_bwd(&mut dkrot[s..s + self.rotary_dim], pos, &self.inv_freq);
+                ops::rope_bwd(&mut dkrot[s..s + rotary_dim], pos, inv_freq);
                 match k_norm {
                     Some(w) => ops::rmsnorm_bwd(
                         &kpre[s..s + hd],
