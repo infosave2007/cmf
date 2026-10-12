@@ -161,6 +161,7 @@ fn bake_ffn_chain_matches_host_composition() {
             n,
             hsz,
             inter,
+            cortiq_engine::fcd_ops::FfnAct::Silu,
         );
         if !got {
             eprintln!("chain declined (no cooperative arm here) — skipped");
@@ -260,6 +261,8 @@ fn bake_attn_chain_matches_host_reference() {
         k_norm: Some(&kn),
         bias: Some(&bias),
         output_gate: true,
+        head_gain: None,
+        window: None,
         gemma: false,
         eps,
         rotary_half: half,
@@ -420,12 +423,25 @@ fn bake_ffn_bwd_chain_matches_host_composition() {
         n,
         hsz,
         inter,
+        cortiq_engine::fcd_ops::FfnAct::Silu,
     ) {
         eprintln!("forward chain declined (no cooperative arm) — skipped");
         return;
     }
     let mut dn2 = vec![0f32; n * hsz];
-    if !cortiq_engine::gpu_wgpu::ffn_bwd_chain_f32(&dh2, &down, &gu, li, &mut dn2, n, hsz, inter) {
+    if !cortiq_engine::gpu_wgpu::ffn_bwd_chain_f32(
+        &dh2,
+        &down,
+        &gu,
+        li,
+        &mut dn2,
+        n,
+        hsz,
+        inter,
+        cortiq_engine::fcd_ops::FfnAct::Silu,
+        None,
+        None,
+    ) {
         // The forward parked a plane; on a cooperative device the
         // backward must take it (a non-discrete adapter may not).
         eprintln!("bwd chain declined (uma adapter?) — skipped");
@@ -473,4 +489,75 @@ fn bake_ffn_bwd_chain_matches_host_composition() {
         "bwd chain: worst |Δ| {worst} (scale {scale})"
     );
     println!("bwd chain: dn2 worst |Δ| {worst:.2e} against scale {scale:.2}");
+}
+
+/// The attention-core backward chain (dq; dk+dv under GQA, windowed or
+/// not) against the host f64 kernel the trainer differentiates with.
+#[test]
+fn bake_attn_bwd_chain_matches_host_kernel() {
+    unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+    let (b, t, nh, nkv, hd) = (2usize, 45usize, 4usize, 2usize, 32usize);
+    let (n, rep) = (b * t, nh / nkv);
+    let (qdim, kvdim) = (nh * hd, nkv * hd);
+    let g = |i: usize, m: usize, s: f32| ((i * 31 + m) % 101) as f32 / 101.0 * s - s / 2.0;
+    let q: Vec<f32> = (0..n * qdim).map(|i| g(i, 3, 2.0)).collect();
+    let k: Vec<f32> = (0..n * kvdim).map(|i| g(i, 5, 2.0)).collect();
+    let v: Vec<f32> = (0..n * kvdim).map(|i| g(i, 7, 1.0)).collect();
+    let dao: Vec<f32> = (0..n * qdim).map(|i| g(i, 11, 1.0)).collect();
+    let max_rel = |a: &[f32], r: &[f64]| -> f64 {
+        let scale = r.iter().map(|x| x.abs()).fold(0f64, f64::max).max(1e-9);
+        a.iter()
+            .zip(r)
+            .map(|(&x, &y)| (x as f64 - y).abs() / scale)
+            .fold(0f64, f64::max)
+    };
+    for window in [None, Some(16usize)] {
+        let mut dq64 = vec![0f64; n * qdim];
+        let mut dk64 = vec![0f64; n * kvdim];
+        let mut dv64 = vec![0f64; n * kvdim];
+        for bi in 0..b {
+            for h in 0..nh {
+                let gi = h / rep;
+                let mut qh = vec![0f64; t * hd];
+                let mut kh = vec![0f64; t * hd];
+                let mut vh = vec![0f64; t * hd];
+                let mut dh = vec![0f64; t * hd];
+                for p in 0..t {
+                    let r = bi * t + p;
+                    for c in 0..hd {
+                        qh[p * hd + c] = q[r * qdim + h * hd + c] as f64;
+                        kh[p * hd + c] = k[r * kvdim + gi * hd + c] as f64;
+                        vh[p * hd + c] = v[r * kvdim + gi * hd + c] as f64;
+                        dh[p * hd + c] = dao[r * qdim + h * hd + c] as f64;
+                    }
+                }
+                let mut dqh = vec![0f64; t * hd];
+                let mut dkh = vec![0f64; t * hd];
+                let mut dvh = vec![0f64; t * hd];
+                cortiq_engine::fcd_ops::attn_head_bwd_window(
+                    &qh, &kh, &vh, &dh, t, hd, hd, window, &mut dqh, &mut dkh, &mut dvh,
+                );
+                for p in 0..t {
+                    let r = bi * t + p;
+                    for c in 0..hd {
+                        dq64[r * qdim + h * hd + c] += dqh[p * hd + c];
+                        dk64[r * kvdim + gi * hd + c] += dkh[p * hd + c];
+                        dv64[r * kvdim + gi * hd + c] += dvh[p * hd + c];
+                    }
+                }
+            }
+        }
+        let mut dq = vec![0f32; n * qdim];
+        let mut dk = vec![0f32; n * kvdim];
+        let mut dv = vec![0f32; n * kvdim];
+        if !cortiq_engine::gpu_wgpu::attn_bwd_chain_f32(
+            &q, &k, &v, &dao, b, t, nh, nkv, hd, window, &mut dq, &mut dk, &mut dv,
+        ) {
+            eprintln!("attention backward chain declined — skipped");
+            return;
+        }
+        let (eq, ek, ev) = (max_rel(&dq, &dq64), max_rel(&dk, &dk64), max_rel(&dv, &dv64));
+        eprintln!("attn bwd chain window={window:?}: dq {eq:.2e} dk {ek:.2e} dv {ev:.2e}");
+        assert!(eq < 2e-3 && ek < 2e-3 && ev < 2e-3, "window {window:?}: dq {eq} dk {ek} dv {ev}");
+    }
 }

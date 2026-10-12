@@ -19,6 +19,7 @@ use cortiq_core::quant::f32_to_f16;
 use cortiq_core::{
     CmfModel, SelectionDescriptor, SkillRecord, TensorDtype, TensorEntry, TensorSpec,
 };
+use cortiq_engine::skillbake::{AnswerSpan, answer_targets};
 use cortiq_engine::{Pipeline, SamplerConfig};
 use std::path::Path;
 use std::sync::Arc;
@@ -1123,9 +1124,8 @@ fn corpus_chunks(
 /// reaches its label without the beginning of its own prompt.  Keep this
 /// helper deliberately task-agnostic — a record can teach market direction,
 /// sentiment, intent, moderation, or any other one-token label.
-fn chat_record_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
-    const START: &str = "<|im_start|>system";
-    let starts: Vec<usize> = text.match_indices(START).map(|(at, _)| at).collect();
+fn chat_record_ranges(text: &str, start: &str) -> Vec<std::ops::Range<usize>> {
+    let starts: Vec<usize> = text.match_indices(start).map(|(at, _)| at).collect();
     starts
         .iter()
         .enumerate()
@@ -1173,6 +1173,7 @@ impl FocusedCorpusStats {
 /// Load focused ChatML records one by one, preserve their causal prefix, and
 /// right-pad them to a common batchable length.  Returns `None` for ordinary
 /// text so the established streaming LM chunker remains the fallback.
+#[allow(clippy::too_many_arguments)]
 fn focused_chat_record_chunks(
     tok: &cortiq_engine::tokenizer::Tokenizer,
     files: &[String],
@@ -1180,6 +1181,11 @@ fn focused_chat_record_chunks(
     need: usize,
     focus_ids: &[u32],
     focus_follow_ids: &[u32],
+    span: Option<&AnswerSpan>,
+    record_start: &str,
+    drop_oversize: bool,
+    length_buckets: bool,
+    mut kept: Option<&mut Vec<usize>>,
 ) -> anyhow::Result<Option<(Vec<Vec<u32>>, FocusedCorpusStats)>> {
     let mut out = Vec::new();
     let mut saw_chat_records = false;
@@ -1190,7 +1196,7 @@ fn focused_chat_record_chunks(
         .unwrap_or(0);
     for file in files {
         let text = std::fs::read_to_string(file)?;
-        let ranges = chat_record_ranges(&text);
+        let ranges = chat_record_ranges(&text, record_start);
         if ranges.is_empty() {
             continue;
         }
@@ -1199,11 +1205,15 @@ fn focused_chat_record_chunks(
         for range in ranges {
             stats.records_seen += 1;
             let mut ids = tok.encode(&text[range]);
-            let scored = (1..ids.len()).any(|index| {
-                focus_ids.contains(&ids[index])
-                    && (focus_follow_ids.is_empty()
-                        || (index + 1 < ids.len() && focus_follow_ids.contains(&ids[index + 1])))
-            });
+            let scored = match span {
+                Some(sp) => answer_targets(&ids, sp).is_some(),
+                None => (1..ids.len()).any(|index| {
+                    focus_ids.contains(&ids[index])
+                        && (focus_follow_ids.is_empty()
+                            || (index + 1 < ids.len()
+                                && focus_follow_ids.contains(&ids[index + 1])))
+                }),
+            };
             if !scored {
                 continue;
             }
@@ -1215,9 +1225,15 @@ fn focused_chat_record_chunks(
             };
             stats.tokens_max = stats.tokens_max.max(ids.len());
             stats.tokens_total += ids.len();
+            if ids.len() > chunk && drop_oversize {
+                // Counted, never cut: a record that does not fit is left
+                // out whole rather than trained on an arbitrary tail.
+                stats.truncated_records += 1;
+                continue;
+            }
             anyhow::ensure!(
                 ids.len() <= chunk,
-                "focused ChatML record {}/{} has {} tokens, exceeding --chunk {}. Increase --chunk; truncation is disabled to preserve the complete record",
+                "focused ChatML record {}/{} has {} tokens, exceeding --chunk {}. Increase --chunk or pass --drop-oversize; truncation is disabled to preserve the complete record",
                 stats.records_seen,
                 file,
                 ids.len(),
@@ -1225,9 +1241,26 @@ fn focused_chat_record_chunks(
             );
             if ids.len() < chunk {
                 stats.padded_records += 1;
-                ids.resize(chunk, pad);
+                // Length buckets: pad to the smallest of chunk/4 … chunk
+                // (64-aligned) the record fits — the trainer batches equal
+                // lengths, so a short record no longer costs a full chunk.
+                let width = if length_buckets {
+                    (1..=4)
+                        .map(|k| (chunk * k / 4).div_ceil(64) * 64)
+                        .find(|&w| w >= ids.len())
+                        .unwrap_or(chunk)
+                        .min(chunk)
+                } else {
+                    chunk
+                };
+                ids.resize(width, pad);
             }
             out.push(ids);
+            if let Some(k) = kept.as_deref_mut() {
+                // Ordinal of the record across the files, as a renderer's
+                // index lists them.
+                k.push(stats.records_seen - 1);
+            }
             if out.len() == need {
                 return Ok(Some((out, stats)));
             }
@@ -1239,6 +1272,7 @@ fn focused_chat_record_chunks(
     Ok(None)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scored_corpus_chunks(
     tok: &cortiq_engine::tokenizer::Tokenizer,
     files: &[String],
@@ -1247,18 +1281,38 @@ fn scored_corpus_chunks(
     focus_ids: &[u32],
     focus_follow_ids: &[u32],
     focus_desc: &str,
+    span: Option<&AnswerSpan>,
+    record_start: &str,
+    drop_oversize: bool,
+    length_buckets: bool,
+    kept: Option<&mut Vec<usize>>,
 ) -> anyhow::Result<(Vec<Vec<u32>>, Option<FocusedCorpusStats>)> {
-    if !focus_ids.is_empty()
-        && let Some((chunks, stats)) =
-            focused_chat_record_chunks(tok, files, chunk, need, focus_ids, focus_follow_ids)?
+    if (!focus_ids.is_empty() || span.is_some())
+        && let Some((chunks, stats)) = focused_chat_record_chunks(
+            tok,
+            files,
+            chunk,
+            need,
+            focus_ids,
+            focus_follow_ids,
+            span,
+            record_start,
+            drop_oversize,
+            length_buckets,
+            kept,
+        )?
     {
         anyhow::ensure!(
             chunks.len() >= need,
-            "corpus has only {} complete scored ChatML records containing [{focus_desc}]; need {need}",
+            "corpus has only {} complete scored chat records containing [{focus_desc}]; need {need}",
             chunks.len()
         );
         return Ok((chunks, Some(stats)));
     }
+    anyhow::ensure!(
+        span.is_none(),
+        "answer-span scoring needs chat records starting with {record_start:?}; none found in the corpus files"
+    );
     let raw_need = if focus_ids.is_empty() {
         need
     } else {
@@ -1310,6 +1364,18 @@ pub fn run_skill_bake(
     batch: usize,
     fcd_batch: usize,
     focus_tokens: Option<&str>,
+    record_start: &str,
+    answer_after: Option<&str>,
+    answer_end: Option<&str>,
+    drop_oversize: bool,
+    length_buckets: bool,
+    mask_from: Option<&str>,
+    soft_fold: bool,
+    no_defrag: bool,
+    mask_name: &str,
+    fcd_attn: bool,
+    checkpoint_dir: Option<&str>,
+    held_tags: Option<&str>,
     target_sparsity: f64,
     l1_aggression: f64,
     l1_init: f64,
@@ -1388,15 +1454,50 @@ pub fn run_skill_bake(
         );
         ids
     };
-    let focus_desc = focus_tokens.unwrap_or("");
+    // Answer-span scoring: the rendered generation prompt and the turn
+    // terminator, as the model's own tokenizer sees them.
+    let answer_span = match (answer_after, answer_end) {
+        (Some(after), Some(end)) => {
+            anyhow::ensure!(
+                focus_ids.is_empty(),
+                "--answer-after and --focus-tokens are mutually exclusive"
+            );
+            let start = tok.encode(after);
+            anyhow::ensure!(!start.is_empty(), "--answer-after {after:?} encodes to no tokens");
+            let end_ids = tok.encode(end);
+            anyhow::ensure!(
+                end_ids.len() == 1,
+                "--answer-end {end:?} encodes to {} tokens; it must be exactly one",
+                end_ids.len()
+            );
+            // Every id's text, so the held score can grade whole verdicts
+            // (the JSON values) instead of the span's scaffolding tokens.
+            let values = cortiq_engine::skillbake::TokenText(std::sync::Arc::new(
+                (0..tok.vocab_size() as u32).map(|id| tok.decode_token(id)).collect(),
+            ));
+            Some(AnswerSpan {
+                start,
+                end: end_ids[0],
+                values: Some(values),
+            })
+        }
+        (None, None) => None,
+        _ => anyhow::bail!("--answer-after and --answer-end go together"),
+    };
+    let focus_desc = if answer_span.is_some() {
+        "answer span"
+    } else {
+        focus_tokens.unwrap_or("")
+    };
     anyhow::ensure!(
-        !checkpoint_accuracy || !focus_ids.is_empty(),
-        "--checkpoint-accuracy needs --focus-tokens"
+        !checkpoint_accuracy || !focus_ids.is_empty() || answer_span.is_some(),
+        "--checkpoint-accuracy needs --focus-tokens or --answer-after/--answer-end"
     );
     anyhow::ensure!(
         !checkpoint_raw_priority || !focus_ids.is_empty(),
         "--checkpoint-raw-priority needs --focus-tokens"
     );
+    let mut held_kept: Vec<usize> = Vec::new();
     let (chunks, held_n, focused_stats) = if held_files.is_empty() {
         let need = calib_chunks + held;
         let (chunks, stats) = scored_corpus_chunks(
@@ -1407,6 +1508,11 @@ pub fn run_skill_bake(
             &focus_ids,
             &focus_follow_ids,
             focus_desc,
+            answer_span.as_ref(),
+            record_start,
+            drop_oversize,
+            length_buckets,
+            None,
         )?;
         (chunks, held, stats)
     } else {
@@ -1418,6 +1524,11 @@ pub fn run_skill_bake(
             &focus_ids,
             &focus_follow_ids,
             focus_desc,
+            answer_span.as_ref(),
+            record_start,
+            drop_oversize,
+            length_buckets,
+            Some(&mut held_kept),
         )?;
         let (calib, calib_stats) = scored_corpus_chunks(
             &tok,
@@ -1427,6 +1538,11 @@ pub fn run_skill_bake(
             &focus_ids,
             &focus_follow_ids,
             focus_desc,
+            answer_span.as_ref(),
+            record_start,
+            drop_oversize,
+            length_buckets,
+            None,
         )?;
         let mut joined = held_chunks;
         joined.extend(calib);
@@ -1448,14 +1564,16 @@ pub fn run_skill_bake(
         } else {
             " (dedicated validation files)"
         },
-        focus_tokens
-            .map(|v| format!(" | focused targets [{v}]"))
-            .unwrap_or_default()
+        match (focus_tokens, answer_after) {
+            (Some(v), _) => format!(" | focused targets [{v}]"),
+            (None, Some(a)) => format!(" | answer-span loss after {a:?}"),
+            (None, None) => String::new(),
+        }
     );
     if let Some(stats) = &focused_stats {
         let mean = stats.tokens_total as f64 / stats.records_scored.max(1) as f64;
         println!(
-            "focused-record audit: files={} seen={} scored={} tokens min/mean/max={}/{:.1}/{} padded={} truncated={} policy=reject-oversize",
+            "focused-record audit: files={} seen={} scored={} tokens min/mean/max={}/{:.1}/{} padded={} oversize={} policy={}",
             stats.files,
             stats.records_seen,
             stats.records_scored,
@@ -1464,6 +1582,7 @@ pub fn run_skill_bake(
             stats.tokens_max,
             stats.padded_records,
             stats.truncated_records,
+            if drop_oversize { "drop-oversize" } else { "reject-oversize" },
         );
     }
     let hyper = cortiq_engine::skillbake::BakeHyper {
@@ -1486,10 +1605,74 @@ pub fn run_skill_bake(
         checkpoint_min_accuracy,
         checkpoint_min_balanced_accuracy,
         checkpoint_raw_priority,
-        align: ffn_align,
-        uniform_inter,
+        // The in-file task mask is exact bits: no alignment padding, no
+        // forced uniform width — those exist for physically cut tensors.
+        align: if no_defrag { 1 } else { ffn_align },
+        uniform_inter: uniform_inter && !no_defrag,
         focus_tokens: focus_ids,
         focus_follow_tokens: focus_follow_ids,
+        answer_span: answer_span.clone(),
+        soft_fold,
+        fcd_attn,
+        held_tags: match held_tags {
+            Some(path) => {
+                anyhow::ensure!(!held_files.is_empty(), "--held-tags names records of --held-files");
+                let text = std::fs::read_to_string(path).with_context(|| format!("reading --held-tags {path}"))?;
+                let mut names: Vec<String> = Vec::new();
+                let mut by_record: Vec<usize> = Vec::new();
+                for (i, line) in text.lines().filter(|l| !l.trim().is_empty()).enumerate() {
+                    let v: serde_json::Value = serde_json::from_str(line)
+                        .with_context(|| format!("--held-tags {path}: line {}", i + 1))?;
+                    let name = v.get("family").and_then(|f| f.as_str()).unwrap_or("?").to_string();
+                    let at = names.iter().position(|n| *n == name).unwrap_or_else(|| {
+                        names.push(name);
+                        names.len() - 1
+                    });
+                    by_record.push(at);
+                }
+                anyhow::ensure!(
+                    held_kept.iter().all(|&r| r < by_record.len()),
+                    "--held-tags {path} lists {} records; the held files have more",
+                    by_record.len()
+                );
+                Some(cortiq_engine::skillbake::HeldTags {
+                    names,
+                    of: held_kept.iter().map(|&r| by_record[r]).collect(),
+                })
+            }
+            None => None,
+        },
+        checkpoint_dir: match checkpoint_dir {
+            Some(d) => {
+                std::fs::create_dir_all(d).with_context(|| format!("creating --checkpoint-dir {d}"))?;
+                Some(d.to_string())
+            }
+            None => None,
+        },
+        mask_logits: match mask_from {
+            Some(path) => {
+                let doc: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(path).with_context(|| format!("reading --mask-from {path}"))?,
+                )
+                .with_context(|| format!("parsing --mask-from {path}"))?;
+                let rows = doc
+                    .get("selected_logits")
+                    .and_then(|v| v.as_array())
+                    .context("--mask-from: no `selected_logits` array (an archaeology report)")?;
+                Some(
+                    rows.iter()
+                        .map(|row| {
+                            row.as_array()
+                                .context("--mask-from: a logit row is not an array")?
+                                .iter()
+                                .map(|x| x.as_f64().map(|v| v as f32).context("--mask-from: non-numeric logit"))
+                                .collect::<anyhow::Result<Vec<f32>>>()
+                        })
+                        .collect::<anyhow::Result<Vec<Vec<f32>>>>()?,
+                )
+            }
+            None => None,
+        },
         ..Default::default()
     };
     let (report, arts) =
@@ -1538,6 +1721,21 @@ pub fn run_skill_bake(
         );
     }
 
+    if answer_span.is_some()
+        && let Some(((base_acc, mask_acc), fcd_acc)) = report
+            .backbone_accuracy
+            .zip(report.masked_accuracy)
+            .zip(report.overlaid_accuracy)
+    {
+        println!(
+            "=== answer-span token accuracy (held-out, teacher-forced): {:.2}% → mask {:.2}% → FCD {:.2}% ({:+.2} pp)",
+            base_acc * 100.0,
+            mask_acc * 100.0,
+            fcd_acc * 100.0,
+            (fcd_acc - base_acc) * 100.0,
+        );
+    }
+
     if let Some(path) = archaeology_report {
         let keep_indices: Vec<Vec<usize>> = arts
             .keep
@@ -1566,6 +1764,9 @@ pub fn run_skill_bake(
             "model": model_path,
             "focus_tokens": focus_tokens,
             "hyper": {
+                "record_start": record_start,
+                "answer_after": answer_after,
+                "answer_end": answer_end,
                 "steps_a": steps_a,
                 "lr_a": lr_a,
                 "eval_every": eval_every,
@@ -1613,6 +1814,7 @@ pub fn run_skill_bake(
                 "sparsity": checkpoint.sparsity,
                 "accuracy": checkpoint.accuracy,
                 "balanced_accuracy": checkpoint.balanced_accuracy,
+                "logits": &checkpoint.logits,
             })).collect::<Vec<_>>(),
             "kept_per_layer": &report.kept_per_layer,
             "keep_indices": keep_indices,
@@ -1653,6 +1855,23 @@ pub fn run_skill_bake(
         {
             continue;
         }
+        // Full-layer FCD: the trained attention projections, head gate and
+        // norm gains of those layers are written below from the masters.
+        if let Some(rest) = t.name.strip_prefix("model.layers.") {
+            let li: Option<usize> = rest.split('.').next().and_then(|s| s.parse().ok());
+            if let Some(li) = li
+                && arts.attn.get(li).is_some_and(|m| m.is_some())
+                && (rest.contains(".self_attn.q_proj.")
+                    || rest.contains(".self_attn.k_proj.")
+                    || rest.contains(".self_attn.v_proj.")
+                    || rest.contains(".self_attn.o_proj.")
+                    || rest.contains(".self_attn.g_proj.")
+                    || rest.contains(".input_layernorm.")
+                    || rest.contains(".post_attention_layernorm."))
+            {
+                continue;
+            }
+        }
         if t.name.starts_with("skill.") {
             continue; // a defragged specialist is a standalone file
         }
@@ -1681,11 +1900,17 @@ pub fn run_skill_bake(
     // second index space. So for looped models the file keeps its full
     // FFN shape and the sparsity ships as a per-visit task mask the
     // runtime applies each pass (format feature LOOP_MASKS).
+    // `--no-defrag` keeps the full FFN shape for every model and ships the
+    // mask as a CMF task mask (the format's own DTG-MA record): the file
+    // stays the whole model, the runtime zeroes the dead neurons per
+    // layer, and the specialist is a mask catalog entry plus the tensors
+    // Phase B / soft-fold touched — no physical cut.
     let loops = model.arch().num_loops.max(1);
+    let full_shape = loops > 1 || no_defrag;
     let mut max_kept = 0usize;
     for li in 0..nl {
         let alive = &arts.keep[li];
-        let kept: Vec<usize> = if loops > 1 {
+        let kept: Vec<usize> = if full_shape {
             (0..orig_inter).collect()
         } else {
             alive
@@ -1699,12 +1924,17 @@ pub fn run_skill_bake(
         max_kept = max_kept.max(kept.len());
         let trained = arts.gate_up[li].is_some();
         let shape_unchanged = is_identity_keep(&kept, orig_inter);
+        // Soft-fold changes a layer's down_proj whenever any kept neuron's
+        // gain is not exactly 1 — i.e. always; dead neurons keep their
+        // column (the mask zeroes them) so the delta against the backbone
+        // is the fold alone.
+        let folded = soft_fold && loops == 1;
         // Do not turn a frozen layer into a false skill delta.  Even a
         // nominally idempotent q8_2f -> f32 -> q8_2f round-trip can choose
         // slightly different row/column fields, changing all three hashes.
         // When no neuron was physically removed, the exact source payload is
         // already the correct frozen tensor and must be copied byte-for-byte.
-        if !trained && shape_unchanged {
+        if !trained && shape_unchanged && !folded {
             for suffix in ["gate_proj", "up_proj", "down_proj"] {
                 let name = format!("model.layers.{li}.mlp.{suffix}.weight");
                 let entry = model
@@ -1736,10 +1966,30 @@ pub fn run_skill_bake(
             up_k.extend_from_slice(&up_f[r * hidden..(r + 1) * hidden]);
         }
         let down_f = &arts.down[li];
+        // Soft-Fold (Patent 2, mode 26): a surviving neuron's learned gain
+        // σ(m) rides into its down_proj column — exactly the gate the bake
+        // evaluated and Phase B trained against. One mask row per layer on
+        // an unlooped stack (looped models keep the runtime task mask).
+        // Soft-fold at full shape: a dead neuron's down column is ZEROED, so
+        // the file is the exact specialist even when served without its
+        // task mask (the mask then only lets the sparse arm skip rows).
+        let fold: Vec<f32> = if soft_fold && loops == 1 {
+            kept.iter()
+                .map(|&c| {
+                    if alive[c] {
+                        1.0 / (1.0 + (-arts.logits[li][c]).exp())
+                    } else {
+                        0.0
+                    }
+                })
+                .collect()
+        } else {
+            vec![1.0; kept.len()]
+        };
         let mut down_k = Vec::with_capacity(hidden * kept.len());
         for r in 0..hidden {
-            for &c in &kept {
-                down_k.push(down_f[r * orig_inter + c]);
+            for (&c, &f) in kept.iter().zip(&fold) {
+                down_k.push(down_f[r * orig_inter + c] * f);
             }
         }
         let base_dtype = model
@@ -1768,6 +2018,22 @@ pub fn run_skill_bake(
             ("up_proj", &up_k, kept.len(), hidden, q_rowsafe),
             ("down_proj", &down_k, hidden, kept.len(), q_down),
         ] {
+            if !trained && shape_unchanged && suffix != "down_proj" {
+                // Untouched at full shape: the source bytes are the tensor.
+                let name = format!("model.layers.{li}.mlp.{suffix}.weight");
+                let entry = model
+                    .tensors
+                    .iter()
+                    .find(|tensor| tensor.name == name)
+                    .with_context(|| format!("missing tensor {name}"))?;
+                tensors.push(TensorSpec {
+                    name,
+                    dtype: entry.dtype,
+                    shape: entry.shape.clone(),
+                    data: model.tensor_bytes(&entry.name)?.to_vec(),
+                });
+                continue;
+            }
             let (dtype, data) = if trained {
                 encode_trained_fcd(vals, rows, cols)
             } else {
@@ -1781,6 +2047,70 @@ pub fn run_skill_bake(
             });
         }
     }
+    // Full-layer FCD layers: q/k/v split back out of the fused master,
+    // o_proj, the head gate and both norm gains (gains and gate stay f32;
+    // the projections take the trained-master codec).
+    let f32_bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    for (li, m) in arts.attn.iter().enumerate() {
+        let Some(m) = m else { continue };
+        let p = format!("model.layers.{li}.");
+        let shape_of = |name: &str| -> anyhow::Result<Vec<usize>> {
+            Ok(model
+                .tensors
+                .iter()
+                .find(|t| t.name == name)
+                .with_context(|| format!("missing tensor {name}"))?
+                .shape
+                .clone())
+        };
+        let qs = shape_of(&format!("{p}self_attn.q_proj.weight"))?;
+        let ks = shape_of(&format!("{p}self_attn.k_proj.weight"))?;
+        let vs = shape_of(&format!("{p}self_attn.v_proj.weight"))?;
+        let (qrows, krows, vrows) = (qs[0], ks[0], vs[0]);
+        anyhow::ensure!(
+            m.wqkv.len() == (qrows + krows + vrows) * hidden,
+            "layer {li}: fused qkv master has {} values, expected {}",
+            m.wqkv.len(),
+            (qrows + krows + vrows) * hidden
+        );
+        let mut off = 0usize;
+        for (suffix, rows) in [("q_proj", qrows), ("k_proj", krows), ("v_proj", vrows)] {
+            let vals = &m.wqkv[off * hidden..(off + rows) * hidden];
+            let (dtype, data) = encode_trained_fcd(vals, rows, hidden);
+            tensors.push(TensorSpec {
+                name: format!("{p}self_attn.{suffix}.weight"),
+                dtype,
+                shape: vec![rows, hidden],
+                data,
+            });
+            off += rows;
+        }
+        let os = shape_of(&format!("{p}self_attn.o_proj.weight"))?;
+        let (dtype, data) = encode_trained_fcd(&m.wo, os[0], os[1]);
+        tensors.push(TensorSpec {
+            name: format!("{p}self_attn.o_proj.weight"),
+            dtype,
+            shape: os.clone(),
+            data,
+        });
+        if let Some(g) = &m.gproj {
+            let gs = shape_of(&format!("{p}self_attn.g_proj.weight"))?;
+            tensors.push(TensorSpec {
+                name: format!("{p}self_attn.g_proj.weight"),
+                dtype: TensorDtype::F32,
+                shape: gs,
+                data: f32_bytes(g),
+            });
+        }
+        for (suffix, vals) in [("input_layernorm", &m.iln), ("post_attention_layernorm", &m.pln)] {
+            tensors.push(TensorSpec {
+                name: format!("{p}{suffix}.weight"),
+                dtype: TensorDtype::F32,
+                shape: vec![vals.len()],
+                data: f32_bytes(vals),
+            });
+        }
+    }
     let mut header = model.header.clone();
     header.skills.clear();
     header.arch.intermediate_size = max_kept;
@@ -1789,7 +2119,9 @@ pub fn run_skill_bake(
         .take()
         .unwrap_or_else(|| serde_json::json!({}));
     prov["defrag"] = serde_json::json!({
-        "recipe": "skill-bake L1+FCD (native)",
+        "recipe": if soft_fold { "skill-bake L1+FCD soft-fold (native)" } else { "skill-bake L1+FCD (native)" },
+        "shipped_as": if full_shape { "task-mask" } else { "defrag" },
+        "mask_name": mask_name,
         "pre_intermediate": orig_inter,
         "post_intermediate_max": max_kept,
         "kept_per_layer": report.kept_per_layer,
@@ -1805,7 +2137,7 @@ pub fn run_skill_bake(
     header.provenance = Some(prov);
     // The per-visit mask, when there is one to ship.
     let ffn_b = orig_inter.div_ceil(8);
-    let visit_mask: Option<TaskMask> = (loops > 1).then(|| {
+    let visit_mask: Option<TaskMask> = full_shape.then(|| {
         let ffn_masks: Vec<Vec<u8>> = arts
             .keep_visits
             .iter()
@@ -1821,10 +2153,35 @@ pub fn run_skill_bake(
             .collect();
         TaskMask {
             task_id: 1,
-            name: "specialist".into(),
-            description: Some("DTG-MA per-visit mask (loop-aware bake)".into()),
+            name: mask_name.to_string(),
+            description: Some(if loops > 1 {
+                "DTG-MA per-visit mask (loop-aware bake)".to_string()
+            } else {
+                format!(
+                    "DTG-MA task mask (skill bake, {}; serve/run with --task {mask_name})",
+                    if soft_fold { "soft-fold gains in down_proj" } else { "hard" }
+                )
+            }),
             sparsity: report.pruned_ratio as f32,
-            quality: None,
+            // The bake's own held-out verdict rides with the mask: the
+            // answer-span token accuracy when one was measured, else the
+            // held-out PPL ratio specialist/backbone.
+            quality: Some(match report.overlaid_accuracy {
+                Some(acc) => cortiq_core::mask::Quality {
+                    metric: "heldout_answer_token_acc".into(),
+                    value: acc as f32,
+                    baseline_dense: report.backbone_accuracy.map(|a| a as f32),
+                    n_samples: Some(held_n as u32),
+                    dataset_sha256: None,
+                },
+                None => cortiq_core::mask::Quality {
+                    metric: "heldout_ppl_ratio".into(),
+                    value: (report.overlaid / report.backbone.max(1e-9)) as f32,
+                    baseline_dense: Some(1.0),
+                    n_samples: Some(held_n as u32),
+                    dataset_sha256: None,
+                },
+            }),
             ffn_masks,
             // ALL-ONES, not empty: the codec writes a zero row for a
             // missing entry, and a zero head row means "no active
@@ -1850,9 +2207,15 @@ pub fn run_skill_bake(
             priority: MaskPriority::Primary,
         }
     });
+    // A soft-folded file is the exact specialist with no mask applied (dead
+    // columns are zeroed), so it ships with the mask recorded but NOT the
+    // default task: the runtime's masked FFN arm is a host path, and the
+    // unmasked file serves on the device at full speed. `--task <name>`
+    // still selects the mask (the sparse arm) when wanted.
+    let soft_exact = soft_fold && loops == 1;
     let catalog = visit_mask.as_ref().map(|m| MaskCatalog {
         masks: vec![m.clone()],
-        default_task: "specialist".into(),
+        default_task: if soft_exact { "general".to_string() } else { mask_name.to_string() },
     });
     let tmp = format!("{output}.tmp");
     CmfModel::write(
@@ -1896,7 +2259,7 @@ pub fn run_skill_bake(
     // fast path (activation zeroing inside the fused arms) — the
     // specialist is scored the way it is meant to be served: mask active,
     // quantized storage untouched, batched speed.
-    let rt_spec = runtime_ppl(&tmp, visit_mask.as_ref())?;
+    let rt_spec = runtime_ppl(&tmp, if soft_exact { None } else { visit_mask.as_ref() })?;
     println!(
         "runtime gate (held-out, real engine): backbone {rt_base:.3} → specialist {rt_spec:.3} ({:+.1}%)",
         (rt_spec / rt_base - 1.0) * 100.0
@@ -1955,7 +2318,7 @@ mod tests {
             "<|im_start|>system\na<|im_end|>\n<|im_start|>assistant\nUP<|im_end|>\n",
             "<|im_start|>system\nb<|im_end|>\n<|im_start|>assistant\nDOWN<|im_end|>\n",
         );
-        let ranges = chat_record_ranges(text);
+        let ranges = chat_record_ranges(text, "<|im_start|>system");
         assert_eq!(ranges.len(), 2);
         assert!(text[ranges[0].clone()].starts_with("<|im_start|>system\na"));
         assert!(text[ranges[0].clone()].contains("assistant\nUP"));
