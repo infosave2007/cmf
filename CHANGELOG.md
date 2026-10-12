@@ -5,6 +5,60 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.17] - 2026-10-12
+
+### Fixed
+- `cortiq serve` with more than one slot (the default is a quarter of the
+  cores, 1–4) corrupted concurrent requests on the GPU. Every op on a device
+  shares the context's scratch buffers, and most ops released the scratch
+  lock before they encoded, submitted and read back, or handed a pooled
+  buffer to the next step of a keep chain. Two slots decoding at once
+  computed on each other's operands. Spark-X2.5-4B on an RTX PRO 6000, 75 real prompts, 4 slots,
+  4 concurrent clients: 59 of 75 completions were garbage, or the server
+  panicked with `Buffer 'ca-stage' is still mapped` when the keep chains were
+  off. Device ops now take a per-device, re-entrant op gate: 0 of 75 bad, every
+  answer identical to the 1-slot run, and the 4 concurrent clients finish in
+  54 s against 75 s sequential.
+  On an RTX 2000 Ada (Vulkan), 8 overlapping Spark requests on 4 slots: 8/8
+  corrupted in 0.8.16, 0/8 in 0.8.17. Greedy text is byte-identical and
+  perplexity unchanged on Spark-X2.5-4B, MiniCPM5-2B, humanizer 12B and
+  Qwen3.8-Flash-Next; decode speed within ±0.5 % (interleaved A/B on
+  MiniCPM5-2B: 64.7 → 64.6 tok/s).
+
+### Added
+- `cortiq skill bake` bakes Spark-X2.5 (exact-erf GELU, sliding-window
+  attention with local RoPE, the per-head output gate) and answer-span skills.
+  The loss covers the assistant's answer only (`--record-start`,
+  `--answer-after`, `--answer-end`; `--drop-oversize` leaves out records
+  longer than the chunk).
+- New `skill bake` flags:
+  - `--soft-fold` folds σ(m) into `down_proj` (Patent 2, Soft-Fold);
+  - `--no-defrag --mask-name` ships the mask as a task-mask catalog entry
+    instead of cutting the FFN;
+  - `--mask-from` starts from, or measures, a saved mask;
+  - `--checkpoint-dir` writes the mask logits at every evaluation;
+  - `--length-buckets` pads records to the smallest of four widths and
+    batches equal lengths;
+  - `--fcd-attn` makes Phase B also train the attention projections, the
+    head gate and both norm gains.
+- Held scores of answer-span bakes grade whole verdicts: a question counts
+  only when every token of its JSON value is the argmax. `--held-tags <jsonl>`
+  reports per-family verdict accuracy and gates checkpoints on its macro
+  mean.
+- New `skill bake` environment variables:
+  - `CMF_BAKE_B_TAKE_LAST=1` ships the prescribed FCD steps as trained;
+  - `CMF_BAKE_SKIP_BASELINE=1` skips the backbone pass when only a supplied
+    mask is measured;
+  - `CMF_BAKE_A_STRICT=0` runs Phase A on the tensor-core chains;
+  - `CMF_BAKE_EVAL_TOKENS` bounds a held-out pass;
+  - `CMF_BAKE_QDEBUG=N` prints gold against argmax tokens.
+
+### Performance
+- `skill bake` runs on the GPU: the Phase-A mask gradient and the attention
+  backward run on the device, host norms and adds are pooled, and records
+  are length-bucketed. A Spark-X2.5-4B answer-span step (batch 4, records of
+  at most 2048 tokens) went from 27 s to 2.4 s on an RTX PRO 6000.
+
 ## [0.8.16] - 2026-10-11
 
 ### Added
