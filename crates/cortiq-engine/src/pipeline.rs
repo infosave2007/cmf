@@ -2136,6 +2136,19 @@ impl Pipeline {
     ) -> usize {
         let _mt0 = std::time::Instant::now(); // CMF_METAL_HOSTPROF
         use crate::gpu::{AttnGpuLayer, GdnGpuCfg, GdnGpuLayer, GraphDims, MetalFfn, TokenGraph};
+        const MOE_WORKING_SET_REASON: &str =
+            "model weights exceed Metal working set for native MoE graph";
+        // A prior admission check rejected this pipeline. Avoid rebuilding the
+        // entire 40-layer graph plan at every individual host layer after the
+        // fallback begins; the per-operation path below stays eligible.
+        if self
+            .graph_declines
+            .borrow()
+            .iter()
+            .any(|&(site, reason)| site == "metal block graph" && reason == MOE_WORKING_SET_REASON)
+        {
+            return start;
+        }
         let graph_force = crate::gpu::q1_force() || crate::gpu::q2tp_gpu_opt_in();
         if self.attn_softcap > 0.0 // capped scores: no graph kernel — CPU path
             || !self.metal_rope_scale_ok()
@@ -2471,6 +2484,28 @@ impl Pipeline {
             Item::Gdn { run, .. } => run.iter().any(|l| matches!(l.ffn, MetalFfn::Moe(_))),
             Item::Attn { l, .. } => matches!(l.ffn, MetalFfn::Moe(_)),
         });
+        // A native MoE graph binds every WeightArena window to its jobs
+        // kernels. On UMA, an mmap that already exceeds the driver's
+        // recommended working set will therefore fail after admission, when
+        // some recurrent/KV scratch has already been touched. Decline before
+        // allocating/encoding the graph instead; the ordinary per-operation
+        // route remains available and only materializes the needed window.
+        // Do not apply this to dense graphs: they bind one projection at a
+        // time and do not have the MoE jobs' all-window lifetime.
+        let metal_working_set = crate::gpu_metal::working_set_bytes();
+        let model_bytes = model.primary_bytes().len() as u64;
+        if has_moe && metal_working_set != 0 && model_bytes > metal_working_set {
+            tracing::info!(
+                model_bytes,
+                metal_working_set,
+                "native Metal MoE graph declined before allocation"
+            );
+            self.note_graph_decline("metal block graph", MOE_WORKING_SET_REASON);
+            if self.graph_head_required {
+                self.fail_metal_graph(MOE_WORKING_SET_REASON);
+            }
+            return start;
+        }
         let has_gdn = plan.iter().any(|it| matches!(it, Item::Gdn { .. }));
         let dev_attend = attend_contract
             && (self.head_dim <= 128

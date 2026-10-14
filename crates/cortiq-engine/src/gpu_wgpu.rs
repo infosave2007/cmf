@@ -20042,11 +20042,25 @@ pub fn resident_bytes() -> u64 {
 /// Physical live-set ceiling used while an over-size graph is assembled.
 /// On the measured Vulkan path Q8_2F needs about 1.6× its packed payload in
 /// driver allocations (19 Granite-30B layers: 15,384 MiB; 30 layers:
-/// 23,832 MiB). The adjusted ceiling still keeps a full graph whenever its
-/// packed payload fits below it (3B/8B on the A40, for example); only a Q8_2F
-/// stack whose physical expansion would cross the card becomes a prefix.
+/// 23,832 MiB). A q4tp-majority MoE stack has the same lifetime hazard: its
+/// three packed expert planes coexist with upload staging during graph setup.
+/// MiniCPM-V-4.7-35B-A3B q4tp is the reproducer: its 17.5 GiB logical stack
+/// OOMed on a 24 GiB Vulkan card, while the 9/16 ceiling admitted a stable
+/// 27-layer device prefix. Dense q4tp models keep the full budget.
+fn graph_live_budget_from_totals(vram_budget: u64, total: u64, q8: u64, q4tp_moe: u64) -> u64 {
+    if q8 > total / 2 || q4tp_moe > total / 2 {
+        // 5/8 matched the packed-to-physical slope but left less than one
+        // GiB for the fixed context/pipeline allocations on an A40. 9/16
+        // keeps ~3 GiB of measured headroom while retaining the largest safe
+        // prefix (and is still substantially better than a blanket 50%).
+        vram_budget.saturating_mul(9) / 16
+    } else {
+        vram_budget
+    }
+}
+
 fn graph_live_weight_budget(c: &Ctx, model: &Arc<CmfModel>) -> u64 {
-    let (mut total, mut q8) = (0u64, 0u64);
+    let (mut total, mut q8, mut q4tp_moe) = (0u64, 0u64, 0u64);
     for e in &model.tensors {
         if !crate::gpu::counts_as_placement_weight(model, &e.name) {
             continue; // a skill lane holds its tensors INSTEAD of the trunk ones
@@ -20055,16 +20069,13 @@ fn graph_live_weight_budget(c: &Ctx, model: &Arc<CmfModel>) -> u64 {
         if e.dtype == cortiq_core::TensorDtype::Q8_2f {
             q8 = q8.saturating_add(e.nbytes);
         }
+        if e.dtype == cortiq_core::TensorDtype::Q4TiledP
+            && (e.name.contains(".mlp.experts.") || e.name.contains(".mlp.shared_expert."))
+        {
+            q4tp_moe = q4tp_moe.saturating_add(e.nbytes);
+        }
     }
-    if q8 > total / 2 {
-        // 5/8 matched the packed-to-physical slope but left less than one
-        // GiB for the fixed context/pipeline allocations on an A40. 9/16
-        // keeps ~3 GiB of measured headroom while retaining the largest safe
-        // prefix (and is still substantially better than a blanket 50%).
-        c.vram_budget.saturating_mul(9) / 16
-    } else {
-        c.vram_budget
-    }
+    graph_live_budget_from_totals(c.vram_budget, total, q8, q4tp_moe)
 }
 
 /// Automatic prefix for ordinary per-op layer walks (most importantly the
@@ -46244,6 +46255,31 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         }
+    }
+
+    #[test]
+    fn q4tp_moe_majority_reserves_graph_headroom() {
+        let budget = 24u64 << 30;
+        let guarded = budget * 9 / 16;
+        // Q8_2F keeps its existing safety margin.
+        assert_eq!(
+            graph_live_budget_from_totals(budget, 18 << 30, 10 << 30, 0),
+            guarded
+        );
+        // A q4tp MoE-dominated stack gets the same physical-allocation
+        // safety margin; an ordinary dense q4tp stack does not.
+        assert_eq!(
+            graph_live_budget_from_totals(budget, 18 << 30, 1 << 30, 16 << 30),
+            guarded
+        );
+        assert_eq!(
+            graph_live_budget_from_totals(budget, 18 << 30, 1 << 30, 0),
+            budget
+        );
+        assert_eq!(
+            graph_live_budget_from_totals(budget, 18 << 30, 1 << 30, 8 << 30),
+            budget
+        );
     }
 
     /// Test teardown may poll a shared device, but it must not invalidate a

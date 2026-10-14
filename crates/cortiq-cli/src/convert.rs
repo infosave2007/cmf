@@ -496,6 +496,10 @@ pub(crate) fn canon_name(raw: &str) -> Option<String> {
         // Gemma-3n multimodal towers.
         "model.audio_tower.",
         "model.vision_tower.",
+        // MiniCPM-V projector/merger.  This generic text-only path has no
+        // image placeholder or canvas-MRoPE runtime, so keeping it would
+        // create unreadable dead payloads beside the text tower.
+        "model.merger.",
         // Qwen3.5-VL vision tower (Ornith-1.5 among them): 333 tensors
         // that would ride into the file as dead weight under their raw
         // names — the text tower converts alone.
@@ -867,6 +871,43 @@ fn quant_for_tensor(arch: &ModelArch, name: &str, base: Quant) -> Quant {
         } else {
             Quant::Q8_2f
         };
+    }
+    // MiniCPM-V 4.7 is a Qwen3.5 hybrid-MoE decoder behind a multimodal
+    // wrapper.  Its expert bank dominates the footprint; the recurrent GDN,
+    // full-attention layers and vocabulary boundaries run for every token.
+    // Keep that skeleton at q8_2f, but keep the shared expert on the same
+    // q4tp/q2tp plane as routed experts: the Metal/Vulkan MoE graph requires
+    // a uniform expert codec and would otherwise decline the whole block.
+    let qwen35_hybrid_moe = arch.moe.is_some()
+        && arch
+            .linear_core
+            .as_ref()
+            .is_some_and(|core| core.kind == "gated_delta_net")
+        && (arch.arch_name.to_ascii_lowercase().starts_with("qwen3_5")
+            || arch.arch_name.eq_ignore_ascii_case("minicpmv4_7"));
+    if qwen35_hybrid_moe {
+        return if name.contains(".mlp.experts.") || name.contains(".mlp.shared_expert.") {
+            base
+        } else {
+            Quant::Q8_2f
+        };
+    }
+    // The dense MiniCPM-V 4.7 1B sibling has the same recurrent Qwen3.5
+    // decoder but no MoE bank to amortize a uniformly low-bit boundary. Its
+    // 248k-token embedding and classifier are particularly quality-sensitive,
+    // so retain the two vocabulary edges in q8_2f just as the established
+    // MiniCPM5 mixed profile does.  This still permits the normal one-token
+    // Metal/WGPU graph; only a multi-step on-device re-embed burst needs a
+    // q4tp embedding and is deliberately not claimed by this fidelity-first
+    // compact profile.
+    let qwen35_dense_minicpmv47 = arch.arch_name.eq_ignore_ascii_case("minicpmv4_7")
+        && arch.moe.is_none()
+        && arch
+            .linear_core
+            .as_ref()
+            .is_some_and(|core| core.kind == "gated_delta_net");
+    if qwen35_dense_minicpmv47 && vocabulary_edges {
+        return Quant::Q8_2f;
     }
     if arch.qwen4_exp.is_none() {
         return base;
@@ -4009,6 +4050,10 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     let is_dsv4 = model_type == "deepseek_v4";
     let is_dsv41 = model_type == "deepseek_v41";
     let tc_model_type = tc.get("model_type").and_then(|v| v.as_str()).unwrap_or("");
+    // MiniCPM-V 4.7 wraps its Qwen3.5 text decoder in a vision model.  The
+    // numerical contracts belong to the nested decoder, not its wrapper.
+    let is_qwen35_text = model_type.to_ascii_lowercase().starts_with("qwen3_5")
+        || tc_model_type.to_ascii_lowercase().starts_with("qwen3_5");
     // DeepSeek-V4: the name mapping and both source quantizations (FP8
     // E4M3 with 128x128 block scales, MXFP4 experts) are in place, but
     // five of its blocks have no runtime yet — and without them the file
@@ -4205,7 +4250,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         .filter(|&n| n > 0)
         .map(|ne| {
             let mt = model_type.to_lowercase();
-            let ntp_default = mt.starts_with("qwen3_5")
+            let ntp_default = is_qwen35_text
                 || is_prism
                 || mt.contains("qwen3_next")
                 || mt.contains("qwen4_exp")
@@ -4313,7 +4358,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         );
     }
     let norm_style = if (mt.contains("gemma") && !mt.contains("gemma4") && !mt.contains("gemma3n"))
-        || mt.starts_with("qwen3_5")
+        || is_qwen35_text
         || mt.contains("qwen3_next")
         || mt.contains("qwen4_exp")
     {
@@ -4633,6 +4678,13 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             // qwen4_exp ships a second hyper-connected hybrid stack.  It is
             // not wire-compatible with the legacy DeepSeek/Qwen MTP block;
             // leave it out until that speculative-only head has an exact op.
+            None
+        } else if model_type == "minicpmv4_7" {
+            // The public MiniCPM-V 4.7 checkpoints advertise one MTP layer
+            // in config but ship no physical `mtp.*` tensors.  This converter
+            // packages their language backbone only; carrying that orphaned
+            // count into the CMF header would make the runtime advertise a
+            // speculative head it cannot load.
             None
         } else {
             ["mtp_num_hidden_layers", "num_nextn_predict_layers"]
@@ -9150,6 +9202,7 @@ pub(crate) mod tests {
             "model.visual.patch_embed.proj.weight",
             "model.visual.blocks.0.attn.qkv.weight",
             "model.visual.merger.mlp.0.weight",
+            "model.merger.mlp.0.linear_1.weight",
         ] {
             assert!(canon_name(n).is_none(), "{n} must be skipped");
         }
@@ -9158,6 +9211,178 @@ pub(crate) mod tests {
             canon_name("model.language_model.layers.0.mlp.gate_proj.weight").as_deref(),
             Some("model.layers.0.mlp.gate_proj.weight")
         );
+    }
+
+    #[test]
+    fn minicpmv47_wrapper_uses_qwen35_text_semantics() {
+        // The public MiniCPM-V 4.7 config exposes the decoder only through
+        // text_config.  Its wrapper must not lose Qwen3.5's zero-centered
+        // RMSNorm or its renormalized top-k router contract.
+        let cfg = serde_json::json!({
+            "model_type": "minicpmv4_7",
+            "tie_word_embeddings": false,
+            "text_config": {
+                "model_type": "qwen3_5_moe_text",
+                "hidden_size": 64,
+                "moe_intermediate_size": 16,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 1,
+                "head_dim": 16,
+                "vocab_size": 128,
+                "max_position_embeddings": 262144,
+                "mtp_num_hidden_layers": 1,
+                "partial_rotary_factor": 0.25,
+                "rope_parameters": {
+                    "rope_type": "default",
+                    "rope_theta": 10000000,
+                    "partial_rotary_factor": 0.25
+                },
+                "num_experts": 8,
+                "num_experts_per_tok": 2,
+                "shared_expert_intermediate_size": 16,
+                "linear_conv_kernel_dim": 4,
+                "linear_num_key_heads": 4,
+                "linear_num_value_heads": 4,
+                "linear_key_head_dim": 16,
+                "linear_value_head_dim": 16,
+                "layer_types": [
+                    "linear_attention", "linear_attention",
+                    "linear_attention", "full_attention"
+                ],
+                "rms_norm_eps": 0.000001
+            }
+        });
+        let arch = build_arch(&cfg).unwrap();
+        assert_eq!(arch.arch_name, "minicpmv4_7");
+        assert_eq!(arch.norm_style, NormStyle::Gemma);
+        assert!(
+            arch.mtp.is_none(),
+            "the public wrapper ships no MTP tensors"
+        );
+        assert!(arch.moe.as_ref().unwrap().norm_topk_prob);
+        assert_eq!(arch.rope_theta, 10_000_000.0);
+        assert_eq!(
+            arch.layer_types,
+            [
+                LayerType::LinearAttention,
+                LayerType::LinearAttention,
+                LayerType::LinearAttention,
+                LayerType::FullAttention,
+            ]
+        );
+        assert_eq!(
+            profile_quant(
+                &arch,
+                Quant::Q4TiledP,
+                "model.layers.0.mlp.experts.0.gate_proj.weight"
+            ),
+            Quant::Q4TiledP
+        );
+        for name in [
+            "model.embed_tokens.weight",
+            "lm_head.weight",
+            "model.layers.0.linear_attn.in_proj_qkv.weight",
+            "model.layers.3.self_attn.q_proj.weight",
+        ] {
+            assert_eq!(
+                profile_quant(&arch, Quant::Q4TiledP, name),
+                Quant::Q8_2f,
+                "{name}"
+            );
+        }
+        for name in [
+            "model.layers.0.mlp.shared_expert.gate_proj.weight",
+            "model.layers.0.mlp.shared_expert.up_proj.weight",
+            "model.layers.0.mlp.shared_expert.down_proj.weight",
+        ] {
+            assert_eq!(
+                profile_quant(&arch, Quant::Q4TiledP, name),
+                Quant::Q4TiledP,
+                "{name} must match the routed-expert codec for GPU MoE graphs"
+            );
+        }
+        assert_eq!(
+            profile_quant(
+                &arch,
+                Quant::Q8_2f,
+                "model.layers.0.mlp.experts.0.gate_proj.weight"
+            ),
+            Quant::Q8_2f
+        );
+    }
+
+    #[test]
+    fn minicpmv47_1b_dense_wrapper_uses_qwen35_text_semantics() {
+        // The 1B sibling uses the dense `qwen3_5_text` decoder.  It shares
+        // the wrapper and zero-centered norm contract. Its q4tp profile
+        // keeps only the quality-sensitive vocabulary boundaries in q8_2f;
+        // the ordinary dense decoder body remains q4tp.
+        let cfg = serde_json::json!({
+            "model_type": "minicpmv4_7",
+            "tie_word_embeddings": false,
+            "text_config": {
+                "model_type": "qwen3_5_text",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 1,
+                "head_dim": 16,
+                "vocab_size": 128,
+                "max_position_embeddings": 262144,
+                "mtp_num_hidden_layers": 1,
+                "partial_rotary_factor": 0.25,
+                "rope_parameters": {
+                    "rope_type": "default",
+                    "rope_theta": 10000000,
+                    "partial_rotary_factor": 0.25
+                },
+                "linear_conv_kernel_dim": 4,
+                "linear_num_key_heads": 4,
+                "linear_num_value_heads": 4,
+                "linear_key_head_dim": 16,
+                "linear_value_head_dim": 16,
+                "layer_types": [
+                    "linear_attention", "linear_attention",
+                    "linear_attention", "full_attention"
+                ],
+                "rms_norm_eps": 0.000001
+            }
+        });
+        let arch = build_arch(&cfg).unwrap();
+        assert_eq!(arch.arch_name, "minicpmv4_7");
+        assert_eq!(arch.norm_style, NormStyle::Gemma);
+        assert!(
+            arch.mtp.is_none(),
+            "the public wrapper ships no MTP tensors"
+        );
+        assert!(arch.moe.is_none());
+        assert_eq!(
+            profile_quant(
+                &arch,
+                Quant::Q4TiledP,
+                "model.layers.0.linear_attn.in_proj_qkv.weight"
+            ),
+            Quant::Q4TiledP
+        );
+        assert_eq!(
+            profile_quant(
+                &arch,
+                Quant::Q4TiledP,
+                "model.layers.3.self_attn.q_proj.weight"
+            ),
+            Quant::Q4TiledP
+        );
+        for name in ["model.embed_tokens.weight", "lm_head.weight"] {
+            assert_eq!(
+                profile_quant(&arch, Quant::Q4TiledP, name),
+                Quant::Q8_2f,
+                "{name} is a quality-sensitive vocabulary boundary"
+            );
+        }
+        assert!(force_f16("model.layers.0.linear_attn.in_proj_a.weight"));
+        assert!(force_f16("model.layers.0.mlp.gate.weight"));
     }
 
     #[test]

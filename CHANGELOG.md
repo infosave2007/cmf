@@ -5,6 +5,31 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.18] - 2026-10-14
+
+### Added
+- `cortiq convert --also-output QUANT=PATH` writes multiple independently
+  quantized CMF files from one streamed checkpoint pass, avoiding a second
+  source download and decode.
+
+### Fixed
+- MiniCPM-V 4.7 text-backbone conversion now reads the nested Qwen3.5
+  decoder contract: zero-centered RMSNorm and renormalized top-k routing.
+  It omits the unsupported vision merger with the vision tower instead of
+  storing unread payloads, excludes the advertised-but-absent MTP head from
+  the CMF header, and uses GPU-compatible mixed q4tp/q8_2f policies for the
+  35B-A3B MoE and the 1B dense sibling.
+- Wgpu now reserves graph headroom for q4tp-majority routed-MoE stacks, as
+  it already does for q8_2f-majority files. Oversize models use a safe GPU
+  layer prefix instead of exhausting 24 GB Vulkan/Metal devices during
+  graph setup; dense q4tp models retain the full-budget path.
+- Native Metal graph failures now include the underlying `MTLCommandBuffer`
+  `NSError` code and description, so memory pressure and resource failures
+  can be diagnosed without treating them as a silent fallback.
+- Native Metal declines a whole-token MoE graph before it binds an mmap that
+  already exceeds the device's recommended working set; generation takes the
+  safe per-operation route instead of failing after partial graph admission.
+
 ## [0.8.17] - 2026-10-12
 
 ### Fixed

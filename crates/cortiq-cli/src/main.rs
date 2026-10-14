@@ -400,6 +400,10 @@ enum Commands {
         /// Output .cmf path
         #[arg(long)]
         output: String,
+        /// Additional profile and output, QUANT=PATH (repeatable). Every
+        /// output shares one streamed source pass, avoiding a second download.
+        #[arg(long = "also-output", value_name = "QUANT=PATH")]
+        also_output: Vec<String>,
         /// Hugging Face token (for gated/private repos)
         #[arg(long)]
         hf_token: Option<String>,
@@ -2881,6 +2885,7 @@ async fn main() -> anyhow::Result<()> {
             model,
             quant,
             output,
+            also_output,
             hf_token,
             mean_bits,
             tensor_quant,
@@ -2894,6 +2899,10 @@ async fn main() -> anyhow::Result<()> {
             mimo_towers,
             sampling,
         } => {
+            anyhow::ensure!(
+                !mtp_sidecar || also_output.is_empty(),
+                "--also-output cannot be combined with --mtp-sidecar"
+            );
             let towers = convert::parse_mimo_towers(&mimo_towers)?;
             convert::set_sampling_defaults(sampling.as_deref())?;
             // Qwen3.8-Flash-Next: the MTP head is a hyper-connected hybrid
@@ -2951,10 +2960,26 @@ async fn main() -> anyhow::Result<()> {
                     }))
                 }
             };
-            convert::run_convert_towers(
+            let mut outputs = vec![(
+                quant.as_deref().unwrap_or(convert::AUTO_QUANT).to_string(),
+                output.clone(),
+            )];
+            for spec in also_output {
+                let (additional_quant, additional_output) = spec
+                    .split_once('=')
+                    .ok_or_else(|| anyhow::anyhow!("--also-output '{spec}': expected QUANT=PATH"))?;
+                anyhow::ensure!(
+                    !additional_quant.trim().is_empty() && !additional_output.trim().is_empty(),
+                    "--also-output '{spec}': expected non-empty QUANT=PATH"
+                );
+                outputs.push((
+                    additional_quant.trim().to_string(),
+                    additional_output.to_string(),
+                ));
+            }
+            convert::run_convert_multi_towers(
                 &model,
-                quant.as_deref().unwrap_or(convert::AUTO_QUANT),
-                &output,
+                &outputs,
                 hf_token.as_deref(),
                 defrag.as_deref(),
                 o1_hint,
@@ -2962,7 +2987,9 @@ async fn main() -> anyhow::Result<()> {
                 towers,
                 progress_reporter("converting"),
             )?;
-            println!("✓ wrote {output}");
+            for (_, output) in &outputs {
+                println!("✓ wrote {output}");
+            }
             Ok(())
         }
         Commands::Embed {
@@ -8909,6 +8936,48 @@ mod tests {
                 assert_eq!(video_fps, Some(2.0));
                 assert_eq!(mm.unwrap(), std::path::PathBuf::from("full.mm.cmf"));
                 assert_eq!(image_max_pixels, Some(200704));
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn convert_also_output_profiles_parse() {
+        let cli = std::thread::Builder::new()
+            .name("convert-also-output-parser".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                Cli::try_parse_from([
+                    "cortiq",
+                    "convert",
+                    "--model",
+                    "openbmb/MiniCPM-V-4.7-35B-A3B",
+                    "--quant",
+                    "q4tp",
+                    "--output",
+                    "q4.cmf",
+                    "--also-output",
+                    "q8_2f=q8.cmf",
+                    "--also-output",
+                    "f16=reference.cmf",
+                ])
+                .unwrap()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        match cli.command {
+            Commands::Convert {
+                model,
+                quant,
+                output,
+                also_output,
+                ..
+            } => {
+                assert_eq!(model, "openbmb/MiniCPM-V-4.7-35B-A3B");
+                assert_eq!(quant.as_deref(), Some("q4tp"));
+                assert_eq!(output, "q4.cmf");
+                assert_eq!(also_output, ["q8_2f=q8.cmf", "f16=reference.cmf"]);
             }
             _ => panic!("wrong subcommand"),
         }
