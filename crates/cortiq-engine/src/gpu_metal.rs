@@ -7756,6 +7756,35 @@ fn submit_and_wait(c: &Ctx, cmd: &metal::CommandBufferRef, outs: &[&Buffer]) {
 /// the next one spins or sleeps.
 static WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Return Metal's NSError payload for a failed command buffer. `metal` 0.29
+/// exposes the completion status but not `MTLCommandBuffer.error`, so query
+/// the latter through its Objective-C binding only on this terminal path.
+/// This keeps an allocation and Foundation round trip out of successful graph
+/// submissions while preserving the device's useful distinction (for example,
+/// out-of-memory vs. an invalid resource) when one fails.
+fn command_buffer_error_detail(cmd: &metal::CommandBufferRef) -> Option<String> {
+    use metal::foreign_types::ForeignTypeRef;
+    use metal::objc::{msg_send, sel, sel_impl};
+    use std::ffi::CStr;
+
+    let error: *mut metal::objc::runtime::Object = unsafe { msg_send![cmd.as_ptr(), error] };
+    if error.is_null() {
+        return None;
+    }
+    let code: isize = unsafe { msg_send![error, code] };
+    let description: *mut metal::objc::runtime::Object =
+        unsafe { msg_send![error, localizedDescription] };
+    if description.is_null() {
+        return Some(format!("NSError code {code}"));
+    }
+    let utf8: *const std::os::raw::c_char = unsafe { msg_send![description, UTF8String] };
+    if utf8.is_null() {
+        return Some(format!("NSError code {code}"));
+    }
+    let description = unsafe { CStr::from_ptr(utf8) }.to_string_lossy();
+    Some(format!("NSError code {code}: {description}"))
+}
+
 /// Wait for a command buffer, spinning only when spinning is cheaper.
 ///
 /// Sleeping and waking the thread costs ~1–3 ms, which across 40 MoE
@@ -7767,11 +7796,10 @@ static WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// making the render slower as well as hotter.
 ///
 /// So the budget follows the work: an average wait past a few milliseconds
-/// means the wake-up cost is noise and the thread should sleep.
-/// Wait for a command buffer and surface a terminal Metal error.  The old
+/// means the wake-up cost is noise and the thread should sleep. The old
 /// helper treated `MTLCommandBufferStatus::Error` exactly like Completed;
 /// graph callers then copied stale hidden/state buffers and silently fell
-/// back to CPU execution.  Keep the legacy fire-and-forget wrapper for the
+/// back to CPU execution. Keep the legacy fire-and-forget wrapper for the
 /// older per-op APIs, while checked graph completion uses this result.
 fn wait_fast_checked(cmd: &metal::CommandBufferRef) -> Result<(), String> {
     use metal::MTLCommandBufferStatus as S;
@@ -7797,10 +7825,15 @@ fn wait_fast_checked(cmd: &metal::CommandBufferRef) -> Result<(), String> {
     WAIT_US.store((ewma * 7 + took) / 8, std::sync::atomic::Ordering::Relaxed);
     match cmd.status() {
         S::Completed => Ok(()),
-        S::Error => Err(format!(
-            "Metal command buffer failed: status={:?}",
-            cmd.status()
-        )),
+        S::Error => {
+            let detail = command_buffer_error_detail(cmd)
+                .map(|detail| format!(" ({detail})"))
+                .unwrap_or_default();
+            Err(format!(
+                "Metal command buffer failed: status={:?}{detail}",
+                cmd.status()
+            ))
+        }
         status => Err(format!(
             "Metal command buffer did not complete: status={status:?}"
         )),
