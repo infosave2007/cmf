@@ -5,6 +5,37 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.19] - 2026-10-15
+
+### Added
+- `cortiq compact --execution-order` writes a verified CMF with tensor payloads
+  grouped in execution order (layer → expert → gate/up/down), so a bounded
+  selected-view MoE pager has a compact physical layout to target. The normal
+  compactor keeps its existing layout contract.
+- `cortiq convert --dspark-sidecar` validates and writes the published
+  MiniCPM-V 4.7 35B-A3B DSpark checkpoint as a separately hash-bound sidecar
+  (`q4tp`, `q8_2f`, or f16). This release does not run that sidecar and makes
+  no speculative-decoding speed claim.
+- MiniCPM-V 4.7 35B-A3B `q4tp` has an opt-in exact Vulkan dynamic MoE-tail
+  (`CMF_MINICPM_DYNAMIC_TAIL=1`, with `CMF_SDOT=0`): a bounded resident expert
+  bank serves warm routed experts while cold routed experts complete on CPU.
+  Router decisions, top-8 weights, and the shared expert are unchanged; an
+  admission, slot-map, or GPU-frame failure falls back to the ordinary exact
+  CPU MoE path.
+
+### Changed
+- The experimental native Metal selected-MoE path (`CMF_METAL_SPARSE_MOE=1`)
+  now binds bounded page-rounded no-copy views for the selected q4tp expert
+  matrices instead of a full-model mmap view. It remains opt-in and declines
+  safely to the CPU path on an admission or completion failure.
+
+### Performance
+- On one RTX 4090/Vulkan host, the opt-in MiniCPM q4tp profile generated 512
+  greedy tokens at 23.8, 24.3, and 23.8 tok/s (first token 18.1, 17.9, and
+  17.9 s). A 16-token greedy gate matched text and all 16/16 argmaxes against
+  the ordinary path; max |Δlogit| was 4.00543212890625e-05. These are scoped
+  hardware measurements, not a general performance guarantee.
+
 ## [0.8.18] - 2026-10-14
 
 ### Added

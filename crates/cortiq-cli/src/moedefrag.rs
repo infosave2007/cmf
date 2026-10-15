@@ -50,6 +50,10 @@ pub fn cmd_compact(
 ) -> anyhow::Result<()> {
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
     crate::knowledge::refuse_genome_rewrite(&model, "compact")?;
+    // Capture source metadata before writing: `output` may name this same
+    // file (or an alias of it), and a successful atomic install replaces that
+    // directory entry only after all mmap-backed payloads have been copied.
+    let in_sz = std::fs::metadata(model_path)?.len() as f64 / 1e9;
     let mut specs: Vec<TensorSpecRef> = model
         .tensors
         .iter()
@@ -63,6 +67,7 @@ pub fn cmd_compact(
     if execution_order {
         sort_specs_for_execution_order(&mut specs);
     }
+    let tensor_count = specs.len();
 
     // `open_sharded` merges all source shards into one logical model, while
     // `write_ref` emits exactly one standalone file. Retaining the first
@@ -70,23 +75,55 @@ pub fn cmd_compact(
     // files that do not exist.
     let mut header = model.header.clone();
     header.shard = None;
-    CmfModel::write_ref(
-        output,
-        &header,
-        &specs,
-        Some(&model.masks),
-        model.vocab.as_deref(),
-    )?;
-    let in_sz = std::fs::metadata(model_path)?.len() as f64 / 1e9;
-    let out_sz = std::fs::metadata(output)?.len() as f64 / 1e9;
+
+    // Never hand `write_ref` the final path: it truncates its destination
+    // before streaming its borrowed mmap payloads. Staging beside the final
+    // output makes the replacement atomic and also keeps it on the same
+    // filesystem. This protects same-path, symlink, and hard-link aliases of
+    // the source as well as pre-existing outputs on failure.
+    let output_path = std::path::Path::new(output);
+    let temp_path = crate::gguf::qwen_image_temp_path(output_path)?;
+    let write_result: anyhow::Result<()> = (|| {
+        CmfModel::write_ref(
+            &temp_path,
+            &header,
+            &specs,
+            Some(&model.masks),
+            model.vocab.as_deref(),
+        )?;
+        std::fs::File::open(&temp_path)
+            .with_context(|| format!("open staged compact output {}", temp_path.display()))?
+            .sync_all()
+            .with_context(|| format!("sync staged compact output {}", temp_path.display()))?;
+        Ok(())
+    })();
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err);
+    }
+
+    // Close every source mmap before replacing the output. This is required
+    // for same-path compaction on platforms that do not permit renaming over
+    // an open mapped file (and is harmless on Unix).
+    drop(specs);
+    drop(model);
+    if let Err(err) = std::fs::rename(&temp_path, output_path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(anyhow::Error::from(err).context(format!(
+            "atomically install compact output {}",
+            output_path.display()
+        )));
+    }
+    crate::gguf::qwen_image_sync_parent(output_path)?;
+
+    let out_sz = std::fs::metadata(output_path)?.len() as f64 / 1e9;
     let layout = if execution_order {
         " (execution order)"
     } else {
         ""
     };
     println!(
-        "compact{layout}: {} tensors\n{model_path} {in_sz:.2} GB -> {output} {out_sz:.2} GB ({:+.1}%)",
-        specs.len(),
+        "compact{layout}: {tensor_count} tensors\n{model_path} {in_sz:.2} GB -> {output} {out_sz:.2} GB ({:+.1}%)",
         (out_sz / in_sz - 1.0) * 100.0
     );
     Ok(())

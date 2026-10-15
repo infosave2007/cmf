@@ -32,6 +32,7 @@ pub mod linear_core;
 pub mod loader;
 pub mod lookup;
 pub mod mimo_moe;
+pub(crate) mod minicpm_tail;
 pub mod ltxaudio;
 pub mod ltxdit;
 pub mod ltxdur;

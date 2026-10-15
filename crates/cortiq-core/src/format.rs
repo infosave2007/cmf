@@ -2444,6 +2444,29 @@ pub fn mtp_sidecar_path(main: &Path) -> std::path::PathBuf {
     main.with_file_name(format!("{stem}.mtp.cmf"))
 }
 
+/// The Qwen3 DFlash/DSpark draft sidecar that belongs to a main CMF file:
+/// `<stem>.dspark.cmf` beside it (`minicpm-v47-q4tp.cmf` →
+/// `minicpm-v47-q4tp.dspark.cmf`).  DSpark is a separate draft architecture,
+/// not an MTP head, so this deliberately never returns an `.mtp.cmf` path.
+/// In particular, passing an MTP path produces a distinct
+/// `…mtp.dspark.cmf` name rather than overwriting the MTP payload.
+///
+/// A path that already names a DSpark sidecar is returned unchanged.  The
+/// runtime does not auto-load this file until it has a dedicated DFlash
+/// executor; keeping the naming rule here makes converter output and that
+/// future loader share one collision-free identity.
+pub fn dspark_sidecar_path(main: &Path) -> std::path::PathBuf {
+    let name = main
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if name.ends_with(".dspark.cmf") {
+        return main.to_path_buf();
+    }
+    let stem = name.strip_suffix(".cmf").unwrap_or(&name);
+    main.with_file_name(format!("{stem}.dspark.cmf"))
+}
+
 // ───────────────────── sparse index (§7 of the spec) ─────────────────────
 
 /// Build the sparse index from mask bitfields: a 32-neuron FFN group is

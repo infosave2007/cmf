@@ -3939,6 +3939,680 @@ pub fn write_mimo_mtp_sidecar(
     Ok(out)
 }
 
+// ── MiniCPM-V 4.7 DSpark sidecar (`<stem>.dspark.cmf`) ──────────────────
+//
+// DSpark is Qwen3 DFlash, not the MTP architecture carried by some CMF
+// backbones.  In particular it has five dense Qwen3 blocks, receives a
+// concatenation of five target hidden states, owns a separate KV cache, and
+// applies a Markov correction over a 15-position masked draft block.  The
+// generic `model.mtp.*` reader cannot safely interpret any of that.  P0
+// therefore only packages the official checkpoint under an explicit
+// `dspark.` namespace and binds it to one already-converted MiniCPM trunk.
+// It deliberately does not activate speculative decoding.
+
+const MINICPM_DSPARK_ARCH: &str = "minicpmv4_7_dspark_sidecar";
+const MINICPM_DSPARK_SOURCE_ARCH: &str = "Qwen3DSparkModel";
+const MINICPM_DSPARK_BASE_ARCH: &str = "minicpmv4_7";
+const MINICPM_DSPARK_TARGET_IDS: [usize; 5] = [3, 11, 19, 27, 35];
+
+/// Geometry of the one published MiniCPM-V 4.7 35B-A3B DSpark checkpoint.
+/// Keeping this local to the converter is intentional: until a dedicated
+/// executor exists, accepting a merely Qwen-shaped draft as this sidecar
+/// would create a file that looks compatible but is not.
+#[derive(Clone, Debug)]
+struct DsparkLayout {
+    hidden: usize,
+    intermediate: usize,
+    layers: usize,
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    vocab: usize,
+    markov_rank: usize,
+    block_size: usize,
+    mask_token_id: usize,
+    target_layers: [usize; 5],
+    num_target_layers: usize,
+    rope_theta: f64,
+    rms_norm_eps: f64,
+}
+
+/// One tensor in the fixed DSpark payload schema.  `source` is deliberately
+/// not a CMF backbone name: the writer prefixes every entry with `dspark.` so
+/// it cannot accidentally be read as part of the target model.
+#[derive(Clone, Debug)]
+struct DsparkTensorSpec {
+    source: String,
+    shape: Vec<usize>,
+    matrix: bool,
+}
+
+fn dspark_cfg_usize(config: &serde_json::Value, key: &str) -> anyhow::Result<usize> {
+    config
+        .get(key)
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: config has no integer {key}"))
+}
+
+fn dspark_cfg_bool(config: &serde_json::Value, key: &str) -> anyhow::Result<bool> {
+    config
+        .get(key)
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: config has no boolean {key}"))
+}
+
+fn dspark_cfg_str<'a>(config: &'a serde_json::Value, key: &str) -> anyhow::Result<&'a str> {
+    config
+        .get(key)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: config has no string {key}"))
+}
+
+impl DsparkLayout {
+    /// Parse and fail closed on the public 35B-A3B DSpark contract.  The
+    /// target-layer numbers stay in the source config's zero-based convention;
+    /// a future runtime must make its capture convention explicit rather than
+    /// silently treating the GGUF one-based presentation as equivalent.
+    fn official(config: &serde_json::Value) -> anyhow::Result<Self> {
+        let architectures = config
+            .get("architectures")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: config has no architectures array"))?;
+        anyhow::ensure!(
+            architectures.iter().any(|v| v.as_str() == Some(MINICPM_DSPARK_SOURCE_ARCH)),
+            "DSpark sidecar: expected architectures to include {MINICPM_DSPARK_SOURCE_ARCH}"
+        );
+        anyhow::ensure!(
+            dspark_cfg_str(config, "model_type")? == "qwen3",
+            "DSpark sidecar: expected model_type qwen3"
+        );
+        let dflash = config
+            .get("dflash_config")
+            .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: config has no dflash_config"))?;
+        anyhow::ensure!(
+            dspark_cfg_str(dflash, "projector_type")? == "dspark",
+            "DSpark sidecar: dflash_config.projector_type must be dspark"
+        );
+        anyhow::ensure!(
+            dspark_cfg_str(dflash, "attention_mode")? == "gqa",
+            "DSpark sidecar: dflash_config.attention_mode must be gqa"
+        );
+        anyhow::ensure!(
+            dspark_cfg_str(dflash, "markov_head_type")? == "vanilla",
+            "DSpark sidecar: dflash_config.markov_head_type must be vanilla"
+        );
+        anyhow::ensure!(
+            dspark_cfg_bool(dflash, "enable_confidence_head")?
+                && dspark_cfg_bool(dflash, "confidence_head_with_markov")?,
+            "DSpark sidecar: the published confidence head contract is required"
+        );
+        let target_layers: Vec<usize> = dflash
+            .get("target_layer_ids")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: dflash_config has no target_layer_ids"))?
+            .iter()
+            .map(|v| {
+                v.as_u64()
+                    .map(|v| v as usize)
+                    .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: target_layer_ids must be integers"))
+            })
+            .collect::<anyhow::Result<_>>()?;
+        anyhow::ensure!(
+            target_layers == MINICPM_DSPARK_TARGET_IDS,
+            "DSpark sidecar: target_layer_ids {target_layers:?} are not the published MiniCPM-V 4.7 contract {:?}",
+            MINICPM_DSPARK_TARGET_IDS
+        );
+        let target_layers: [usize; 5] = target_layers
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("DSpark sidecar: expected exactly five target layers"))?;
+
+        let layout = Self {
+            hidden: dspark_cfg_usize(config, "hidden_size")?,
+            intermediate: dspark_cfg_usize(config, "intermediate_size")?,
+            layers: dspark_cfg_usize(config, "num_hidden_layers")?,
+            heads: dspark_cfg_usize(config, "num_attention_heads")?,
+            kv_heads: dspark_cfg_usize(config, "num_key_value_heads")?,
+            head_dim: dspark_cfg_usize(config, "head_dim")?,
+            vocab: dspark_cfg_usize(config, "vocab_size")?,
+            markov_rank: dspark_cfg_usize(dflash, "markov_rank")?,
+            block_size: dspark_cfg_usize(config, "block_size")?,
+            mask_token_id: dspark_cfg_usize(dflash, "mask_token_id")?,
+            target_layers,
+            num_target_layers: dspark_cfg_usize(config, "num_target_layers")?,
+            rope_theta: config
+                .get("rope_parameters")
+                .and_then(|v| v.get("rope_theta"))
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: rope_parameters.rope_theta missing"))?,
+            rms_norm_eps: config
+                .get("rms_norm_eps")
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: rms_norm_eps missing"))?,
+        };
+        anyhow::ensure!(
+            layout.hidden == 2048
+                && layout.intermediate == 6144
+                && layout.layers == 5
+                && layout.heads == 8
+                && layout.kv_heads == 2
+                && layout.head_dim == 256
+                && layout.vocab == 248_144
+                && layout.markov_rank == 256
+                && layout.block_size == 15
+                && layout.mask_token_id == 248_076
+                && layout.num_target_layers == 40
+                && (layout.rope_theta - 10_000_000.0).abs() < f64::EPSILON
+                && (layout.rms_norm_eps - 1e-6).abs() < f64::EPSILON,
+            "DSpark sidecar: unsupported MiniCPM DFlash geometry {layout:?}"
+        );
+        anyhow::ensure!(
+            dspark_cfg_usize(config, "draft_vocab_size")? == layout.vocab,
+            "DSpark sidecar: draft_vocab_size must equal vocab_size"
+        );
+        anyhow::ensure!(
+            dspark_cfg_usize(config, "markov_rank")? == layout.markov_rank,
+            "DSpark sidecar: root markov_rank disagrees with dflash_config"
+        );
+        anyhow::ensure!(
+            dspark_cfg_bool(config, "enable_confidence_head")?
+                && dspark_cfg_bool(config, "confidence_head_with_markov")?,
+            "DSpark sidecar: root confidence-head flags disagree with dflash_config"
+        );
+        Ok(layout)
+    }
+}
+
+fn dspark_tensor_specs(layout: &DsparkLayout) -> Vec<DsparkTensorSpec> {
+    let mut specs = Vec::with_capacity(62);
+    let mut add = |source: String, shape: Vec<usize>, matrix: bool| {
+        specs.push(DsparkTensorSpec {
+            source,
+            shape,
+            matrix,
+        });
+    };
+    add(
+        "fc.weight".into(),
+        vec![layout.hidden, layout.hidden * layout.target_layers.len()],
+        true,
+    );
+    add("hidden_norm.weight".into(), vec![layout.hidden], false);
+    for li in 0..layout.layers {
+        let p = format!("layers.{li}.");
+        add(format!("{p}input_layernorm.weight"), vec![layout.hidden], false);
+        add(
+            format!("{p}self_attn.q_proj.weight"),
+            vec![layout.heads * layout.head_dim, layout.hidden],
+            true,
+        );
+        add(
+            format!("{p}self_attn.k_proj.weight"),
+            vec![layout.kv_heads * layout.head_dim, layout.hidden],
+            true,
+        );
+        add(
+            format!("{p}self_attn.v_proj.weight"),
+            vec![layout.kv_heads * layout.head_dim, layout.hidden],
+            true,
+        );
+        add(
+            format!("{p}self_attn.o_proj.weight"),
+            vec![layout.hidden, layout.heads * layout.head_dim],
+            true,
+        );
+        add(format!("{p}self_attn.q_norm.weight"), vec![layout.head_dim], false);
+        add(format!("{p}self_attn.k_norm.weight"), vec![layout.head_dim], false);
+        add(
+            format!("{p}post_attention_layernorm.weight"),
+            vec![layout.hidden],
+            false,
+        );
+        add(
+            format!("{p}mlp.gate_proj.weight"),
+            vec![layout.intermediate, layout.hidden],
+            true,
+        );
+        add(
+            format!("{p}mlp.up_proj.weight"),
+            vec![layout.intermediate, layout.hidden],
+            true,
+        );
+        add(
+            format!("{p}mlp.down_proj.weight"),
+            vec![layout.hidden, layout.intermediate],
+            true,
+        );
+    }
+    add("norm.weight".into(), vec![layout.hidden], false);
+    add(
+        "markov_head.markov_w1.weight".into(),
+        vec![layout.vocab, layout.markov_rank],
+        true,
+    );
+    add(
+        "markov_head.markov_w2.weight".into(),
+        vec![layout.vocab, layout.markov_rank],
+        true,
+    );
+    add(
+        "confidence_head.proj.weight".into(),
+        vec![1, layout.hidden + layout.markov_rank],
+        true,
+    );
+    add("confidence_head.proj.bias".into(), vec![1], false);
+    debug_assert_eq!(specs.len(), 62);
+    specs
+}
+
+fn dspark_canonical_name(source: &str) -> String {
+    format!("dspark.{source}")
+}
+
+fn dspark_quant_type(quant: Quant) -> QuantType {
+    match quant {
+        Quant::F16 => QuantType::F16,
+        Quant::Q8_2f => QuantType::Q8_2f,
+        // QuantType predates q4tp; the directory carries the authoritative
+        // Q4TiledP dtype and provenance names the exact codec.
+        Quant::Q4TiledP => QuantType::Q4Block,
+        _ => unreachable!("DSpark quant is validated before header construction"),
+    }
+}
+
+fn dspark_matrix_dtype(quant: Quant) -> TensorDtype {
+    match quant {
+        Quant::F16 => TensorDtype::F16,
+        Quant::Q8_2f => TensorDtype::Q8_2f,
+        Quant::Q4TiledP => TensorDtype::Q4TiledP,
+        _ => unreachable!("DSpark quant is validated before payload construction"),
+    }
+}
+
+fn validate_dspark_source(
+    source: &SafeTensors,
+    specs: &[DsparkTensorSpec],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        source.tensors.len() == specs.len(),
+        "DSpark sidecar: source has {} tensors, expected {} — refusing to drop unknown tensors",
+        source.tensors.len(),
+        specs.len()
+    );
+    let known: HashSet<&str> = specs.iter().map(|s| s.source.as_str()).collect();
+    for tensor in &source.tensors {
+        anyhow::ensure!(
+            known.contains(tensor.name.as_str()),
+            "DSpark sidecar: unexpected source tensor {} — refusing to drop it",
+            tensor.name
+        );
+    }
+    for spec in specs {
+        let tensor = source
+            .tensors
+            .iter()
+            .find(|t| t.name == spec.source)
+            .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: missing source tensor {}", spec.source))?;
+        anyhow::ensure!(
+            tensor.dtype == "BF16",
+            "DSpark sidecar: {} is {}, expected BF16",
+            spec.source,
+            tensor.dtype
+        );
+        anyhow::ensure!(
+            tensor.shape == spec.shape,
+            "DSpark sidecar: {} has shape {:?}, expected {:?}",
+            spec.source,
+            tensor.shape,
+            spec.shape
+        );
+        let elems = spec.shape.iter().product::<usize>();
+        anyhow::ensure!(
+            tensor.end >= tensor.start && tensor.end - tensor.start == elems * 2,
+            "DSpark sidecar: {} has invalid BF16 byte span [{}, {}) for {:?}",
+            spec.source,
+            tensor.start,
+            tensor.end,
+            spec.shape
+        );
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct DsparkBaseBinding {
+    filename: String,
+    arch_name: String,
+    trunk_hash: String,
+    dir_hash: String,
+}
+
+fn validate_dspark_base(base_path: &Path, layout: &DsparkLayout) -> anyhow::Result<DsparkBaseBinding> {
+    let filename = base_path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: --output must be a UTF-8 base .cmf filename"))?;
+    anyhow::ensure!(
+        filename.ends_with(".cmf")
+            && !filename.ends_with(".mtp.cmf")
+            && !filename.ends_with(".dspark.cmf"),
+        "DSpark sidecar: --output must name the existing base .cmf, never an .mtp.cmf or .dspark.cmf"
+    );
+    let base = cortiq_core::CmfModel::open(base_path)
+        .map_err(|e| anyhow::anyhow!("DSpark sidecar: open base {}: {e}", base_path.display()))?;
+    let arch = base.arch();
+    anyhow::ensure!(
+        arch.arch_name == MINICPM_DSPARK_BASE_ARCH,
+        "DSpark sidecar: base arch {} is not {}",
+        arch.arch_name,
+        MINICPM_DSPARK_BASE_ARCH
+    );
+    anyhow::ensure!(
+        arch.num_layers == layout.num_target_layers
+            && arch.hidden_size == layout.hidden
+            && arch.vocab_size == layout.vocab
+            && arch.head_dim == layout.head_dim,
+        "DSpark sidecar: base geometry (layers {}, hidden {}, vocab {}, head {}) does not match draft target ({}, {}, {}, {})",
+        arch.num_layers,
+        arch.hidden_size,
+        arch.vocab_size,
+        arch.head_dim,
+        layout.num_target_layers,
+        layout.hidden,
+        layout.vocab,
+        layout.head_dim
+    );
+    for (name, shape) in [
+        ("model.embed_tokens.weight", vec![layout.vocab, layout.hidden]),
+        ("lm_head.weight", vec![layout.vocab, layout.hidden]),
+    ] {
+        let tensor = base.tensor(name).ok_or_else(|| {
+            anyhow::anyhow!("DSpark sidecar: base is missing shared target tensor {name}")
+        })?;
+        anyhow::ensure!(
+            tensor.shape == shape,
+            "DSpark sidecar: base {name} shape {:?}, expected {:?}",
+            tensor.shape,
+            shape
+        );
+    }
+    Ok(DsparkBaseBinding {
+        filename: filename.to_string(),
+        arch_name: arch.arch_name.clone(),
+        trunk_hash: format!("{:016x}", base.trunk_hash()),
+        dir_hash: format!("{:016x}", base.dir_hash()),
+    })
+}
+
+fn dspark_sidecar_arch(layout: &DsparkLayout) -> anyhow::Result<ModelArch> {
+    let config = serde_json::json!({
+        "model_type": "qwen3",
+        "hidden_size": layout.hidden,
+        "intermediate_size": layout.intermediate,
+        "num_hidden_layers": layout.layers,
+        "num_attention_heads": layout.heads,
+        "num_key_value_heads": layout.kv_heads,
+        "head_dim": layout.head_dim,
+        "vocab_size": layout.vocab,
+        "max_position_embeddings": 262144,
+        "rms_norm_eps": layout.rms_norm_eps,
+        "rope_theta": layout.rope_theta,
+        "hidden_act": "silu",
+        "tie_word_embeddings": false,
+    });
+    let mut arch = build_arch(&config)?;
+    arch.arch_name = MINICPM_DSPARK_ARCH.into();
+    // The draft has no MTP, MoE, recurrent core, embedding, or lm_head of
+    // its own.  Those last two are *bound* in provenance to the target file.
+    arch.mtp = None;
+    arch.moe = None;
+    arch.linear_core = None;
+    Ok(arch)
+}
+
+fn dspark_header(
+    layout: &DsparkLayout,
+    binding: &DsparkBaseBinding,
+    model_dir: &Path,
+    quant: Quant,
+) -> anyhow::Result<CmfHeader> {
+    Ok(CmfHeader {
+        format: "cmf".into(),
+        version: CMF_VERSION,
+        arch: dspark_sidecar_arch(layout)?,
+        quant_type: dspark_quant_type(quant),
+        provenance: Some(serde_json::json!({
+            "kind": "minicpm_v47_dspark_sidecar",
+            "sidecar_format": "cmf-dspark-v1",
+            "source": {
+                "directory": model_dir.display().to_string(),
+                "file": "model.safetensors",
+                "architectures": [MINICPM_DSPARK_SOURCE_ARCH],
+                "dtype": "BF16",
+                "tensor_count": 62,
+            },
+            "base_binding": {
+                "filename": binding.filename,
+                "arch_name": binding.arch_name,
+                "trunk_hash64": binding.trunk_hash,
+                "dir_hash64": binding.dir_hash,
+                "shared_target_tensors": {
+                    "embedding": "model.embed_tokens.weight",
+                    "lm_head": "lm_head.weight",
+                },
+            },
+            "dflash": {
+                "block_size": layout.block_size,
+                "target_layer_ids_zero_based": layout.target_layers,
+                "num_target_layers": layout.num_target_layers,
+                "mask_token_id": layout.mask_token_id,
+                "markov_rank": layout.markov_rank,
+                "confidence_head": true,
+                "confidence_head_with_markov": true,
+                "capture_index_basis": "source config zero-based; executor must state its post-layer capture convention",
+            },
+            "tensor_namespace": "dspark.",
+            "weight_quant": quant_name(quant),
+            "matrix_policy": "every 2-D DSpark weight uses weight_quant; all norms and confidence bias are F32",
+            "runtime": {
+                "status": "conversion_only",
+                "automatic_loading": false,
+                "normal_target_behavior": "unchanged; a dedicated DFlash executor with exact target verification is required before use",
+            },
+            "converter": format!("cortiq {}", env!("CARGO_PKG_VERSION")),
+        })),
+        tokenizer_config: None,
+        section_hashes: None,
+        skills: Vec::new(),
+        shard: None,
+        calibration: None,
+        routing: None,
+        genome: None,
+        lineage: Vec::new(),
+        router: None,
+        segments: Vec::new(),
+    })
+}
+
+fn validate_written_dspark_sidecar(
+    model: &cortiq_core::CmfModel,
+    layout: &DsparkLayout,
+    binding: &DsparkBaseBinding,
+    quant: Quant,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        model.arch().arch_name == MINICPM_DSPARK_ARCH,
+        "DSpark sidecar: output arch identity was not preserved"
+    );
+    let provenance = model
+        .header
+        .provenance
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: output has no provenance"))?;
+    anyhow::ensure!(
+        provenance["kind"] == "minicpm_v47_dspark_sidecar"
+            && provenance["sidecar_format"] == "cmf-dspark-v1"
+            && provenance["tensor_namespace"] == "dspark.",
+        "DSpark sidecar: output identity metadata is malformed"
+    );
+    anyhow::ensure!(
+        provenance["base_binding"]["trunk_hash64"] == binding.trunk_hash
+            && provenance["base_binding"]["dir_hash64"] == binding.dir_hash,
+        "DSpark sidecar: output base binding changed while writing"
+    );
+    let specs = dspark_tensor_specs(layout);
+    anyhow::ensure!(
+        model.tensors.len() == specs.len(),
+        "DSpark sidecar: output has {} tensors, expected {}",
+        model.tensors.len(),
+        specs.len()
+    );
+    for spec in specs {
+        let name = dspark_canonical_name(&spec.source);
+        let tensor = model
+            .tensor(&name)
+            .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: output is missing {name}"))?;
+        anyhow::ensure!(
+            tensor.shape == spec.shape,
+            "DSpark sidecar: output {name} has shape {:?}, expected {:?}",
+            tensor.shape,
+            spec.shape
+        );
+        let expected_dtype = if spec.matrix {
+            dspark_matrix_dtype(quant)
+        } else {
+            TensorDtype::F32
+        };
+        anyhow::ensure!(
+            tensor.dtype == expected_dtype,
+            "DSpark sidecar: output {name} is {:?}, expected {:?}",
+            tensor.dtype,
+            expected_dtype
+        );
+    }
+    let problems = model.verify();
+    anyhow::ensure!(
+        problems.is_empty(),
+        "DSpark sidecar: output hash verification failed: {}",
+        problems.join("; ")
+    );
+    Ok(())
+}
+
+/// Encode a schema-validated DSpark source in one pass.  Kept separate from
+/// publication so tests can exercise the exact tensor namespace/codec path on
+/// a compact synthetic DFlash layout without relaxing the public checkpoint
+/// validator.
+fn write_dspark_payload(
+    source: &SafeTensors,
+    specs: &[DsparkTensorSpec],
+    header: &CmfHeader,
+    quant: Quant,
+    output: &Path,
+) -> anyhow::Result<()> {
+    let mut writer = cortiq_core::format::CmfStreamWriter::new(
+        output,
+        cortiq_core::format::CmfStreamWriter::head_reserve_for(specs.len(), 64),
+    )
+    .map_err(|e| anyhow::anyhow!("DSpark sidecar: create {}: {e}", output.display()))?;
+    for spec in specs {
+        let tensor = source
+            .tensors
+            .iter()
+            .find(|t| t.name == spec.source)
+            .expect("source schema was validated");
+        let vals = to_f32(&tensor.dtype, source.bytes(tensor))?;
+        anyhow::ensure!(
+            vals.len() == spec.shape.iter().product::<usize>() && vals.iter().all(|v| v.is_finite()),
+            "DSpark sidecar: {} contains an invalid numeric payload",
+            spec.source
+        );
+        let name = dspark_canonical_name(&spec.source);
+        if spec.matrix {
+            let (dtype, data) = quantize_2d(quant, &vals, spec.shape[0], spec.shape[1]);
+            writer
+                .push(&name, dtype, &spec.shape, &data)
+                .map_err(|e| anyhow::anyhow!("DSpark sidecar: write {name}: {e}"))?;
+        } else {
+            let data: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+            writer
+                .push(&name, TensorDtype::F32, &spec.shape, &data)
+                .map_err(|e| anyhow::anyhow!("DSpark sidecar: write {name}: {e}"))?;
+        }
+    }
+    writer
+        .finish(header, None, None)
+        .map_err(|e| anyhow::anyhow!("DSpark sidecar: finalize {}: {e}", output.display()))
+}
+
+/// Convert the official MiniCPM-V-4.7-35B-A3B DSpark checkpoint to a
+/// collision-free sidecar beside an existing CMF target.  This writes every
+/// official draft tensor, validates the result, and binds it to the exact
+/// base directory/trunk hashes.  It intentionally has no runtime effect.
+pub fn write_minicpm_dspark_sidecar(
+    model_dir: &Path,
+    base_output: &Path,
+    quant: &str,
+) -> anyhow::Result<PathBuf> {
+    let quant = parse_quant(quant)?;
+    anyhow::ensure!(
+        matches!(quant, Quant::Q8_2f | Quant::Q4TiledP | Quant::F16),
+        "DSpark sidecar: --quant must be q8_2f, q4tp, or f16"
+    );
+    let config_path = model_dir.join("config.json");
+    let config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&config_path)
+            .map_err(|e| anyhow::anyhow!("DSpark sidecar: {}: {e}", config_path.display()))?,
+    )?;
+    let layout = DsparkLayout::official(&config)?;
+    let binding = validate_dspark_base(base_output, &layout)?;
+    let out = cortiq_core::dspark_sidecar_path(base_output);
+    anyhow::ensure!(
+        out != base_output,
+        "DSpark sidecar: refusing to reuse the base output path"
+    );
+    anyhow::ensure!(
+        !out.exists(),
+        "DSpark sidecar: {} already exists; refusing to overwrite it",
+        out.display()
+    );
+    let source_path = model_dir.join("model.safetensors");
+    let source = open_safetensors(&source_path)?;
+    let specs = dspark_tensor_specs(&layout);
+    validate_dspark_source(&source, &specs)?;
+    let header = dspark_header(&layout, &binding, model_dir, quant)?;
+    if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    let filename = out
+        .file_name()
+        .and_then(|v| v.to_str())
+        .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: output filename must be UTF-8"))?;
+    let partial = out.with_file_name(format!(".{filename}.part-{}", std::process::id()));
+    let write_and_validate = (|| -> anyhow::Result<()> {
+        write_dspark_payload(&source, &specs, &header, quant, &partial)?;
+        let written = cortiq_core::CmfModel::open(&partial).map_err(|e| {
+            anyhow::anyhow!("DSpark sidecar: reopen {} after write: {e}", partial.display())
+        })?;
+        validate_written_dspark_sidecar(&written, &layout, &binding, quant)
+    })();
+    if let Err(err) = write_and_validate {
+        // This name belongs to this conversion only; cleaning it prevents a
+        // failed 389M draft conversion from stranding a misleading payload or
+        // consuming the disk budget for the next attempt.
+        let _ = fs::remove_file(&partial);
+        return Err(err);
+    }
+    fs::rename(&partial, &out).map_err(|e| {
+        anyhow::anyhow!(
+            "DSpark sidecar: publish {} -> {}: {e}",
+            partial.display(),
+            out.display()
+        )
+    })?;
+    Ok(out)
+}
+
 /// Layer index of a `model.layers.N.*` name.
 fn layer_index_of(name: &str) -> Option<usize> {
     name.strip_prefix("model.layers.")?
@@ -12362,6 +13036,189 @@ mod mimo_v2_tests {
         fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
         let err = write_mimo_mtp_sidecar(&dir, &dir.join("m.cmf"), "q8_2f").unwrap_err();
         assert!(err.to_string().contains("not found"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod dspark_sidecar_tests {
+    use super::*;
+    use cortiq_core::format::CmfModel;
+
+    type RawTensor = (String, &'static str, Vec<usize>, Vec<u8>);
+
+    fn raw_safetensors(tensors: &[RawTensor]) -> Vec<u8> {
+        let mut header = serde_json::Map::new();
+        let mut data = Vec::new();
+        for (name, dtype, shape, bytes) in tensors {
+            let start = data.len();
+            data.extend_from_slice(bytes);
+            header.insert(
+                name.clone(),
+                serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [start, data.len()]}),
+            );
+        }
+        let json = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut out = (json.len() as u64).to_le_bytes().to_vec();
+        out.extend_from_slice(&json);
+        out.extend_from_slice(&data);
+        out
+    }
+
+    fn bf16(vals: &[f32]) -> Vec<u8> {
+        vals.iter()
+            .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+            .collect()
+    }
+
+    fn tiny_layout() -> DsparkLayout {
+        DsparkLayout {
+            hidden: 32,
+            intermediate: 64,
+            layers: 5,
+            heads: 2,
+            kv_heads: 1,
+            head_dim: 16,
+            vocab: 64,
+            markov_rank: 32,
+            block_size: 15,
+            mask_token_id: 17,
+            target_layers: MINICPM_DSPARK_TARGET_IDS,
+            num_target_layers: 40,
+            rope_theta: 10_000_000.0,
+            rms_norm_eps: 1e-6,
+        }
+    }
+
+    fn official_config() -> serde_json::Value {
+        serde_json::json!({
+            "architectures": [MINICPM_DSPARK_SOURCE_ARCH],
+            "model_type": "qwen3",
+            "hidden_size": 2048,
+            "intermediate_size": 6144,
+            "num_hidden_layers": 5,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "vocab_size": 248144,
+            "draft_vocab_size": 248144,
+            "markov_rank": 256,
+            "block_size": 15,
+            "num_target_layers": 40,
+            "rms_norm_eps": 1e-6,
+            "rope_parameters": {"rope_theta": 10000000.0},
+            "enable_confidence_head": true,
+            "confidence_head_with_markov": true,
+            "dflash_config": {
+                "projector_type": "dspark",
+                "attention_mode": "gqa",
+                "markov_head_type": "vanilla",
+                "markov_rank": 256,
+                "mask_token_id": 248076,
+                "target_layer_ids": MINICPM_DSPARK_TARGET_IDS,
+                "enable_confidence_head": true,
+                "confidence_head_with_markov": true,
+            }
+        })
+    }
+
+    fn write_tiny_source(dir: &Path, layout: &DsparkLayout, extra: bool) -> SafeTensors {
+        let mut raw = Vec::new();
+        for (si, spec) in dspark_tensor_specs(layout).iter().enumerate() {
+            let n = spec.shape.iter().product::<usize>();
+            let values: Vec<f32> = (0..n)
+                .map(|i| {
+                    let x = ((i * 31 + si * 17) % 67) as f32 / 128.0 - 0.25;
+                    f32::from_bits(x.to_bits() & 0xffff_0000)
+                })
+                .collect();
+            raw.push((spec.source.clone(), "BF16", spec.shape.clone(), bf16(&values)));
+        }
+        if extra {
+            raw.push(("unexpected.weight".into(), "BF16", vec![1], bf16(&[0.0])));
+        }
+        let source = dir.join("model.safetensors");
+        fs::write(&source, raw_safetensors(&raw)).unwrap();
+        open_safetensors(&source).unwrap()
+    }
+
+    #[test]
+    fn dspark_contract_is_explicit_and_sidecar_name_never_aliases_mtp() {
+        let layout = DsparkLayout::official(&official_config()).unwrap();
+        assert_eq!(layout.target_layers, MINICPM_DSPARK_TARGET_IDS);
+        assert_eq!(layout.block_size, 15);
+        let mut bad = official_config();
+        bad["dflash_config"]["target_layer_ids"] = serde_json::json!([4, 12, 20, 28, 36]);
+        assert!(DsparkLayout::official(&bad).is_err());
+
+        let base = Path::new("/tmp/minicpm-q4tp.cmf");
+        assert_eq!(
+            cortiq_core::dspark_sidecar_path(base),
+            PathBuf::from("/tmp/minicpm-q4tp.dspark.cmf")
+        );
+        assert_eq!(
+            cortiq_core::dspark_sidecar_path(Path::new("/tmp/minicpm-q4tp.mtp.cmf")),
+            PathBuf::from("/tmp/minicpm-q4tp.mtp.dspark.cmf")
+        );
+        assert_eq!(
+            cortiq_core::dspark_sidecar_path(Path::new("/tmp/minicpm-q4tp.dspark.cmf")),
+            PathBuf::from("/tmp/minicpm-q4tp.dspark.cmf")
+        );
+    }
+
+    #[test]
+    fn dspark_schema_refuses_unknown_source_tensor() {
+        let dir = std::env::temp_dir().join(format!("cortiq-dspark-extra-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let layout = tiny_layout();
+        let source = write_tiny_source(&dir, &layout, true);
+        let err = validate_dspark_source(&source, &dspark_tensor_specs(&layout)).unwrap_err();
+        assert!(err.to_string().contains("expected 62") || err.to_string().contains("unexpected"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dspark_payload_writer_preserves_namespace_metadata_and_codecs() {
+        let dir = std::env::temp_dir().join(format!("cortiq-dspark-write-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let layout = tiny_layout();
+        let source = write_tiny_source(&dir, &layout, false);
+        let specs = dspark_tensor_specs(&layout);
+        validate_dspark_source(&source, &specs).unwrap();
+        let binding = DsparkBaseBinding {
+            filename: "minicpm-q4tp.cmf".into(),
+            arch_name: MINICPM_DSPARK_BASE_ARCH.into(),
+            trunk_hash: "0123456789abcdef".into(),
+            dir_hash: "fedcba9876543210".into(),
+        };
+        for (label, quant) in [
+            ("f16", Quant::F16),
+            ("q8", Quant::Q8_2f),
+            ("q4tp", Quant::Q4TiledP),
+        ] {
+            let header = dspark_header(&layout, &binding, &dir, quant).unwrap();
+            let output = dir.join(format!("{label}.dspark.cmf"));
+            write_dspark_payload(&source, &specs, &header, quant, &output).unwrap();
+            let model = CmfModel::open(&output).unwrap();
+            validate_written_dspark_sidecar(&model, &layout, &binding, quant).unwrap();
+            assert!(model.tensor("dspark.fc.weight").is_some());
+            assert!(model.tensor("fc.weight").is_none());
+            assert!(model.tensor("model.mtp.layers.0.fc.weight").is_none());
+            assert_eq!(
+                model.tensor("dspark.hidden_norm.weight").unwrap().dtype,
+                TensorDtype::F32
+            );
+            assert_eq!(
+                model.tensor("dspark.fc.weight").unwrap().dtype,
+                dspark_matrix_dtype(quant)
+            );
+            assert_eq!(
+                model.header.provenance.as_ref().unwrap()["runtime"]["automatic_loading"],
+                serde_json::json!(false)
+            );
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }

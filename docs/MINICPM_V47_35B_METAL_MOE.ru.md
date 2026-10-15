@@ -143,8 +143,24 @@ budget, pin до completion и exact CPU correction для cold expert.
 ~389M BF16 sidecar, 5 dense Qwen3 layers, до 15 draft tokens за проход,
 с target captures после `[3, 11, 19, 27, 35]`.
 
-Нужен отдельный `<base>.dspark.cmf` converter/runtime, а не reuse текущего
-DeepSeek-V4-specific MTP кода. Важно:
+P0-конвертер уже пишет отдельный `<base>.dspark.cmf`, а не reuse текущего
+DeepSeek-V4-specific MTP кода:
+
+```bash
+cortiq convert --model /path/to/MiniCPM-V-4.7-35B-A3B-DSpark \
+  --output /path/to/MiniCPM-V-4.7-35B-A3B-q4tp.cmf \
+  --quant q4tp --dspark-sidecar
+```
+
+Он принимает только опубликованную DSpark-геометрию и все 62 BF16 tensor,
+кладёт их под namespace `dspark.`, проверяет готовый CMF и привязывает
+sidecar к `trunk_hash`/`dir_hash` уже существующего base CMF. Поэтому
+`*.mtp.cmf` никогда не перезаписывается. Поддержаны `q8_2f`, `q4tp` и `f16`;
+`q4tp` может влиять только на acceptance будущего draft, но не на ответ
+верифицирующей target-модели.
+
+Это **только конвертация и идентичность**: sidecar пока не загружается
+автоматически и не даёт speed claim. Для runtime остаются обязательными:
 
 - draft делит target embedding/lm_head, но имеет собственные 5 KV-cache;
 - verify обязан подтверждать target-модель и транзакционно откатывать **и KV,
