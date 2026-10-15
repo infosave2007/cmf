@@ -2836,6 +2836,12 @@ struct GGuP {
 @group(1) @binding(0) var<uniform>             gg_p   : GGuP;
 var<workgroup> gg_pg: array<f32, 64>;
 var<workgroup> gg_pu: array<f32, 64>;
+// q4tp's scale ladder is a format-level recurrence, not a mathematically
+// interchangeable direct exp2: CPU readers build rung zero then multiply the
+// row ratio for each following rung.  One gate/up workgroup owns one row, so
+// retain both row-local tables here before its tile dots begin.
+var<workgroup> gg_gladder: array<f32, 32>;
+var<workgroup> gg_uladder: array<f32, 32>;
 
 // WGSL has no portable BF16 storage scalar.  This is the same round-to-nearest
 // even conversion used by the CPU V4.1 path, represented as an f32 value so
@@ -2908,8 +2914,19 @@ fn dsv4_global_gate_up_q4tp(@builtin(workgroup_id) wid: vec3<u32>,
     let par16 = base16 + rows * gpr * 8u + row * 2u;
     let cst = (gpr * 5u + 7u) / 8u;
     let cod8 = (base16 + rows * gpr * 8u + rows * 2u) * 2u + row * cst;
-    let gl = unpack2x16float(gg_g16(seg, par16) | (gg_g16(seg, par16 + 1u) << 16u));
-    let ul = unpack2x16float(gg_u16(seg, par16) | (gg_u16(seg, par16 + 1u) << 16u));
+    if (lid == 0u) {
+        let gl = unpack2x16float(gg_g16(seg, par16) | (gg_g16(seg, par16 + 1u) << 16u));
+        let ul = unpack2x16float(gg_u16(seg, par16) | (gg_u16(seg, par16 + 1u) << 16u));
+        let gr = exp2(gl.y);
+        let ur = exp2(ul.y);
+        gg_gladder[0] = exp2(gl.x);
+        gg_uladder[0] = exp2(ul.x);
+        for (var rung = 1u; rung < 32u; rung = rung + 1u) {
+            gg_gladder[rung] = gg_gladder[rung - 1u] * gr;
+            gg_uladder[rung] = gg_uladder[rung - 1u] * ur;
+        }
+    }
+    workgroupBarrier();
     var ag = 0.0;
     var au = 0.0;
     for (var g = lid; g < gpr; g = g + 64u) {
@@ -2922,8 +2939,8 @@ fn dsv4_global_gate_up_q4tp(@builtin(workgroup_id) wid: vec3<u32>,
             cg = cg | (gg_g8(seg, cod8 + cb + 1u) << 8u);
             cu = cu | (gg_u8(seg, cod8 + cb + 1u) << 8u);
         }
-        let sg = exp2(gl.x + f32((cg >> shf) & 31u) * gl.y);
-        let su = exp2(ul.x + f32((cu >> shf) & 31u) * ul.y);
+        let sg = gg_gladder[(cg >> shf) & 31u];
+        let su = gg_uladder[(cu >> shf) & 31u];
         let t16 = nib16 + g * 8u;
         let xb = batch * gpr * 32u + g * 32u;
         var dg = 0.0;
@@ -3065,6 +3082,11 @@ struct GDnP {
 @group(0) @binding(4) var<storage, read_write> gd_y   : array<f32>;
 @group(1) @binding(0) var<uniform>             gd_p   : GDnP;
 var<workgroup> gd_pt: array<f32, 64>;
+// One down-projection workgroup reduces every selected expert for one output
+// row.  `top_k <= 63` and the optional shared expert make at most 64 rows of
+// q4tp ladder state: 64 × 32 f32 = 8 KiB, below the portable 16 KiB workgroup
+// storage floor and independent of model/expert count.
+var<workgroup> gd_ladder: array<f32, 2048>;
 
 fn gd_bf16(v: f32) -> f32 {
     let bits = bitcast<u32>(v);
@@ -3100,6 +3122,22 @@ fn dsv4_global_down_q4tp(@builtin(workgroup_id) wid: vec3<u32>,
     let rows = gd_p.hidden;
     let cst = (gpr * 5u + 7u) / 8u;
     let total = gd_p.slots * gpr;
+    if (lid < gd_p.slots) {
+        let bslot = batch * gd_p.slots + lid;
+        let flat = gd_sel[bslot];
+        let seg = flat / gd_p.segment_slots;
+        let local = flat - seg * gd_p.segment_slots;
+        let base16 = local * gd_p.mat16;
+        let par16 = base16 + rows * gpr * 8u + row * 2u;
+        let pl = unpack2x16float(gd_16(seg, par16) | (gd_16(seg, par16 + 1u) << 16u));
+        let base = lid * 32u;
+        let ratio = exp2(pl.y);
+        gd_ladder[base] = exp2(pl.x);
+        for (var rung = 1u; rung < 32u; rung = rung + 1u) {
+            gd_ladder[base + rung] = gd_ladder[base + rung - 1u] * ratio;
+        }
+    }
+    workgroupBarrier();
     var acc = 0.0;
     for (var i = lid; i < total; i = i + 64u) {
         let slot = i / gpr;
@@ -3109,15 +3147,13 @@ fn dsv4_global_down_q4tp(@builtin(workgroup_id) wid: vec3<u32>,
         let seg = flat / gd_p.segment_slots;
         let local = flat - seg * gd_p.segment_slots;
         let base16 = local * gd_p.mat16;
-        let par16 = base16 + rows * gpr * 8u + row * 2u;
         let cod8 = (base16 + rows * gpr * 8u + rows * 2u) * 2u + row * cst;
-        let pl = unpack2x16float(gd_16(seg, par16) | (gd_16(seg, par16 + 1u) << 16u));
         let bit = g * 5u;
         let cb = bit >> 3u;
         let shf = bit & 7u;
         var cv = gd_8(seg, cod8 + cb);
         if (shf > 3u) { cv = cv | (gd_8(seg, cod8 + cb + 1u) << 8u); }
-        let scale = exp2(pl.x + f32((cv >> shf) & 31u) * pl.y);
+        let scale = gd_ladder[slot * 32u + ((cv >> shf) & 31u)];
         let t16 = base16 + (row * gpr + g) * 8u;
         let xb = (bslot * gpr + g) * 32u;
         var d = 0.0;
@@ -19983,6 +20019,7 @@ fn ctx_for(dev: usize) -> Option<&'static Ctx> {
 /// The caller must invoke this only after all model work has stopped.
 pub fn shutdown() {
     crate::mimo_moe::shutdown_banks();
+    crate::minicpm_tail::shutdown_banks();
     let Some(map) = CTXS.get() else { return };
     let mut owned = Vec::new();
     {
@@ -22460,6 +22497,17 @@ pub(crate) fn release_idle_model_buffers(uid: u64) {
         resident_sub(c, bytes);
         bytes
     };
+    // The MiniCPM CPU-tail controller owns a host-side logical slot map for
+    // this same model-wide pool.  A model-scoped image-cache release can
+    // remove the physical buffers without a full WGPU shutdown, so retire
+    // that map too; otherwise a later recreated pool could be addressed with
+    // stale slot contents.  Bump the bind epoch whenever the backing pool
+    // actually changed so cached prepared-tail groups cannot retain released
+    // buffer handles.
+    crate::minicpm_tail::release_model_bank(uid);
+    if global_moe_bytes != 0 {
+        GREW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let plane_count = {
         let mut map = c.planes.lock().unwrap();
         let before = map.len();
@@ -23929,6 +23977,432 @@ fn moe_expert_bufs_q82(
     )
 }
 
+/// One physical segment in a packed MoE projection upload.  The model stores
+/// every expert separately, while the device kernel reads one packed projection
+/// plane.  Keeping the gather plan explicit makes the device destination
+/// offsets auditable: each source byte is copied once to `expert * plen + off`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MoeStagedCopy {
+    source: usize,
+    source_offset: usize,
+    stage_offset: usize,
+    destination_offset: usize,
+    len: usize,
+}
+
+/// Split `source_count` equally-sized expert tensors into fixed-size staging
+/// chunks without changing their packed destination layout.  WebGPU copies
+/// require four-byte alignment; returning `None` lets the established
+/// `queue.write_buffer` path handle an exotic layout instead of admitting an
+/// invalid command buffer.
+fn moe_staged_copy_plan(
+    source_count: usize,
+    plen: usize,
+    chunk: usize,
+) -> Option<Vec<Vec<MoeStagedCopy>>> {
+    if source_count == 0 || plen == 0 || chunk == 0 || plen % 4 != 0 || chunk % 4 != 0 {
+        return None;
+    }
+    source_count.checked_mul(plen)?;
+    let mut source = 0usize;
+    let mut source_offset = 0usize;
+    let mut batches = Vec::new();
+    while source < source_count {
+        let mut stage_offset = 0usize;
+        let mut batch = Vec::new();
+        while source < source_count && stage_offset < chunk {
+            let remain_source = plen.checked_sub(source_offset)?;
+            let remain_stage = chunk.checked_sub(stage_offset)?;
+            let take = remain_source.min(remain_stage);
+            if take == 0 || take % 4 != 0 {
+                return None;
+            }
+            let destination_offset = source
+                .checked_mul(plen)?
+                .checked_add(source_offset)?;
+            batch.push(MoeStagedCopy {
+                source,
+                source_offset,
+                stage_offset,
+                destination_offset,
+                len: take,
+            });
+            stage_offset = stage_offset.checked_add(take)?;
+            source_offset = source_offset.checked_add(take)?;
+            if source_offset == plen {
+                source = source.checked_add(1)?;
+                source_offset = 0;
+            }
+        }
+        if batch.is_empty() {
+            return None;
+        }
+        batches.push(batch);
+    }
+    Some(batches)
+}
+
+/// A staged batch is deliberately filled in the same order as the packed
+/// destination plane.  Verify that invariant before submitting anything, then
+/// one DMA copy can replace one copy command per small expert tensor.
+fn moe_staged_batch_span(batch: &[MoeStagedCopy]) -> Option<(usize, usize)> {
+    let first = batch.first()?;
+    if first.stage_offset != 0 || first.len == 0 {
+        return None;
+    }
+    let destination_offset = first.destination_offset;
+    let mut len = 0usize;
+    for copy in batch {
+        if copy.len == 0
+            || copy.stage_offset != len
+            || copy.destination_offset != destination_offset.checked_add(len)?
+        {
+            return None;
+        }
+        len = len.checked_add(copy.len)?;
+    }
+    Some((destination_offset, len))
+}
+
+/// The regular per-tensor staging uploader cannot combine the hundreds of
+/// small expert tensors in one MoE projection.  A `queue.write_buffer` for
+/// every expert makes wgpu's internal staging belt allocate/flush hundreds of
+/// times, even though a model kernel wants one packed plane.  On discrete
+/// Vulkan, use fixed-size system-RAM staging chunks so the copy engine pulls
+/// the bytes; retain direct mapped chunks as the driver fallback.
+///
+/// `CMF_MOE_UPLOAD=queue` restores the historical one-write-per-expert route;
+/// `=staged` enables this route on UMA for diagnosis.  The default never keeps
+/// more than 192 MiB of host-visible staging alive, independently of expert
+/// count or model size.  It deliberately does *not* inherit
+/// `CMF_GPU_UPLOAD_CHUNK_MB`: a large generic-tensor chunk must not turn an
+/// MoE projection into an unbounded transient allocation.
+fn moe_upload_staged(c: &Ctx) -> bool {
+    match std::env::var("CMF_MOE_UPLOAD").as_deref() {
+        Ok("queue") => false,
+        Ok("staged") => true,
+        _ => c.discrete,
+    }
+}
+
+const MOE_UPLOAD_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+const MOE_UPLOAD_STAGING_LIMIT_BYTES: usize = 192 * 1024 * 1024;
+const MOE_UPLOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn moe_upload_staging_slots(chunk: usize) -> usize {
+    MOE_UPLOAD_STAGING_LIMIT_BYTES
+        .checked_div(chunk.max(1))
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// A submitted MoE upload must never own an unbounded first-use wait.  The
+/// staged and queue-belt paths share this deadline; a timeout cannot safely
+/// proceed to a later plane, so its caller declines this graph.
+fn moe_staged_wait(c: &Ctx) -> bool {
+    c.device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(MOE_UPLOAD_WAIT),
+        })
+        .is_ok()
+}
+
+/// Outcome of a staged MoE projection upload.  A mapping/plan refusal can be
+/// rewritten through the historical queue path after its submitted work drains;
+/// a failed or timed-out device poll is different — the command may still be
+/// touching the plane, so the graph must decline rather than expose it.
+enum MoeStagedUpload {
+    Complete,
+    RetryQueue,
+    AbandonGraph,
+}
+
+/// A fixed MoE staging chunk.  On Linux/Vulkan the `Sysmem` form is a
+/// persistently mapped non-DEVICE_LOCAL allocation: the CPU fills normal
+/// system RAM and the copy engine pulls it over PCIe.  `Mapped` preserves the
+/// established wgpu mapped-at-creation fallback for a driver without that
+/// memory type.
+enum MoeStage<'a> {
+    Sysmem(&'a host_mem::SysBuf),
+    Mapped(wgpu::Buffer),
+}
+
+impl MoeStage<'_> {
+    fn buffer(&self) -> &wgpu::Buffer {
+        match self {
+            Self::Sysmem(stage) => &stage.buffer,
+            Self::Mapped(stage) => stage,
+        }
+    }
+
+    fn fill(
+        &mut self,
+        batch: &[MoeStagedCopy],
+        bytes: &[u8],
+        offsets: &[usize],
+        chunk: usize,
+    ) -> bool {
+        match self {
+            Self::Sysmem(stage) => {
+                let Ok(capacity) = usize::try_from(stage.size()) else {
+                    return false;
+                };
+                moe_copy_batch_to_raw(stage.as_ptr(), capacity, batch, bytes, offsets)
+            }
+            Self::Mapped(stage) => {
+                let copied = match stage.slice(..).get_mapped_range_mut() {
+                    Ok(mut view) => {
+                        // Keep the write mapping live while the scoped workers
+                        // finish; `WriteOnly` permits disjoint raw writes.
+                        let mut write = view.slice(..);
+                        moe_copy_batch_to_raw(
+                            write.as_raw_element_ptr().as_ptr(),
+                            chunk,
+                            batch,
+                            bytes,
+                            offsets,
+                        )
+                    }
+                    Err(_) => false,
+                };
+                // `view`/`write` are already dropped.  Always unmap the
+                // fallback before it can be dropped or queue copies begin.
+                stage.unmap();
+                copied
+            }
+        }
+    }
+}
+
+/// Build the small, all-or-nothing host-RAM staging ring for one MoE layer.
+/// `host_mem` returns `None` on non-Linux/non-Vulkan or if the driver has no
+/// coherent non-device-local type; callers then use `MoeStage::Mapped` exactly
+/// as before.  Keeping just `slots` chunks bounds the host-visible live set.
+fn moe_sys_staging(c: &Ctx, slots: usize, chunk: usize) -> Option<Vec<host_mem::SysBuf>> {
+    if !c.discrete || slots == 0 {
+        return None;
+    }
+    let stages = (0..slots)
+        .map(|_| host_mem::sysmem_buffer(&c.device, chunk as u64, true))
+        .collect::<Option<Vec<_>>>();
+    if stages.is_some() {
+        static SYSBUF_NOTICE: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !SYSBUF_NOTICE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!(
+                "MoE upload: using Vulkan system-RAM DMA staging ring ({} x {} MiB)",
+                slots,
+                chunk / (1024 * 1024),
+            );
+        }
+    } else {
+        static MAPPED_NOTICE: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if !MAPPED_NOTICE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::debug!(
+                "MoE upload: Vulkan system-RAM staging unavailable; using mapped staging fallback"
+            );
+        }
+    }
+    stages
+}
+
+/// Fill disjoint staging ranges, splitting only for host-side parallelism.
+/// `batch` has already passed `moe_staged_batch_span`, and `capacity` is the
+/// fixed staging chunk size, so no two workers can touch the same byte.
+fn moe_copy_batch_to_raw(
+    destination: *mut u8,
+    capacity: usize,
+    batch: &[MoeStagedCopy],
+    bytes: &[u8],
+    offsets: &[usize],
+) -> bool {
+    const PARALLEL_MIN_BYTES: usize = 4 << 20;
+    const PIECE_BYTES: usize = 8 << 20;
+
+    // This helper is deliberately safe to call on its own: do not make the
+    // threaded branch depend on a caller remembering the planner proof.  In
+    // addition to proving the output span, this rejects overlapping or
+    // gapped `stage_offset`s before any raw write can run concurrently.
+    let Some((_, span_len)) = moe_staged_batch_span(batch) else {
+        return false;
+    };
+    if destination.is_null() || span_len > capacity {
+        return false;
+    }
+    let base = destination as usize;
+    let mut pieces = Vec::<(usize, &[u8])>::new();
+    let mut total = 0usize;
+    for copy in batch {
+        let Some(src_start) = offsets
+            .get(copy.source)
+            .and_then(|offset| offset.checked_add(copy.source_offset))
+        else {
+            return false;
+        };
+        let Some(src_end) = src_start.checked_add(copy.len) else {
+            return false;
+        };
+        let Some(src) = bytes.get(src_start..src_end) else {
+            return false;
+        };
+        let Some(dst_end) = copy.stage_offset.checked_add(copy.len) else {
+            return false;
+        };
+        if dst_end > capacity {
+            return false;
+        }
+        let Some(dst) = base.checked_add(copy.stage_offset) else {
+            return false;
+        };
+        let Some(next_total) = total.checked_add(src.len()) else {
+            return false;
+        };
+        total = next_total;
+        for (off, piece) in src.chunks(PIECE_BYTES).enumerate() {
+            let Some(at) = dst.checked_add(off * PIECE_BYTES) else {
+                return false;
+            };
+            pieces.push((at, piece));
+        }
+    }
+    if pieces.is_empty() {
+        return false;
+    }
+    let threads = upload_threads().min(pieces.len()).max(1);
+    if threads > 1 && total >= PARALLEL_MIN_BYTES {
+        let work = Mutex::new(pieces);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| loop {
+                    let job = work.lock().unwrap().pop();
+                    let Some((dst, src)) = job else { break };
+                    // SAFETY: every destination range was bounds-checked
+                    // above and planner validation makes them disjoint; the
+                    // scoped workers complete before the mapping is unmapped
+                    // or the sysmem chunk is submitted to the device.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(src.as_ptr(), dst as *mut u8, src.len());
+                    }
+                });
+            }
+        });
+    } else {
+        for (dst, src) in pieces {
+            // SAFETY: same checked, disjoint ranges as the parallel path.
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr(), dst as *mut u8, src.len());
+            }
+        }
+    }
+    true
+}
+
+/// Copy separately mapped expert tensors into the packed device plane through
+/// bounded staging chunks.  A mapping/plan refusal is recoverable: callers
+/// drain any submitted copy before overwriting the complete plane via the
+/// historical queue path.  A failed or timed-out poll fails closed because a
+/// fallback cannot make prior command buffers trustworthy.
+fn staged_moe_projection_upload(
+    c: &Ctx,
+    destination: &wgpu::Buffer,
+    bytes: &[u8],
+    offsets: &[usize],
+    plen: usize,
+    sys_staging: Option<&[host_mem::SysBuf]>,
+) -> MoeStagedUpload {
+    let chunk = MOE_UPLOAD_CHUNK_BYTES;
+    let Some(plan) = moe_staged_copy_plan(offsets.len(), plen, chunk) else {
+        return MoeStagedUpload::RetryQueue;
+    };
+    // Validate the coalesced copy ranges before any command is submitted. The
+    // planner normally guarantees this, but a future layout change must take
+    // the safe queue fallback rather than make a sparse packed plane.
+    let mut spans = Vec::with_capacity(plan.len());
+    for batch in &plan {
+        let Some(span) = moe_staged_batch_span(batch) else {
+            return MoeStagedUpload::RetryQueue;
+        };
+        spans.push(span);
+    }
+    // Validate every source range before any command is submitted.  That makes
+    // malformed CMF input a clean fallback rather than a half-filled plane.
+    if offsets.iter().any(|&offset| {
+        offset
+            .checked_add(plen)
+            .and_then(|end| bytes.get(offset..end))
+            .is_none()
+    }) {
+        return MoeStagedUpload::RetryQueue;
+    }
+    let slots = moe_upload_staging_slots(chunk);
+    // All-or-nothing: if the raw Vulkan host heap is unavailable, preserve
+    // the existing mapped-at-creation route rather than mixing resource
+    // classes inside one projection.
+    let sys_staging = sys_staging.filter(|stages| stages.len() >= slots);
+    let mut mapped_in_flight = Vec::with_capacity(slots);
+    let mut submitted = 0usize;
+    for (batch_index, (batch, (destination_offset, copy_len))) in
+        plan.into_iter().zip(spans).enumerate()
+    {
+        let mut stage = if let Some(stages) = sys_staging {
+            MoeStage::Sysmem(&stages[batch_index % slots])
+        } else {
+            MoeStage::Mapped(c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("moe-expert-staging"),
+                // Always the same class, including the final short chunk: this
+                // avoids a retained tail allocation for every projection.
+                size: chunk as u64,
+                usage: wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: true,
+            }))
+        };
+        if !stage.fill(&batch, bytes, offsets, chunk) {
+            // Earlier chunks, if any, must complete before the caller's
+            // queue-path rewrite starts.  This is a lifetime/order barrier,
+            // not an attempt to keep a failed device alive.
+            return if !moe_staged_wait(c) {
+                MoeStagedUpload::AbandonGraph
+            } else {
+                MoeStagedUpload::RetryQueue
+            };
+        }
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("moe-upload"),
+            });
+        flush_pass(&enc);
+        // The span was checked above: staging byte 0 is the first packed
+        // destination byte and there are no gaps. One copy avoids recording
+        // hundreds of tiny Vulkan copy commands per projection.
+        enc.copy_buffer_to_buffer(
+            stage.buffer(),
+            0,
+            destination,
+            destination_offset as u64,
+            copy_len as u64,
+        );
+        submit(c, finish_enc(enc));
+        if let MoeStage::Mapped(stage) = stage {
+            mapped_in_flight.push(stage);
+        }
+        submitted += 1;
+        if submitted >= slots {
+            if !moe_staged_wait(c) {
+                return MoeStagedUpload::AbandonGraph;
+            }
+            mapped_in_flight.clear();
+            submitted = 0;
+        }
+    }
+    if submitted != 0 && !moe_staged_wait(c) {
+        return MoeStagedUpload::AbandonGraph;
+    }
+    MoeStagedUpload::Complete
+}
+
 /// The upload half of `moe_expert_bufs`: gate/up blobs of `gu_len` bytes,
 /// down blobs of `d_len`, every expert checked before anything is allocated.
 fn moe_expert_upload(
@@ -23969,6 +24443,19 @@ fn moe_expert_upload(
     // Every byte range this layer ships to the card, for the post-upload
     // evict below.
     let uploaded = std::cell::RefCell::new(Vec::<(usize, usize)>::new());
+    let staged_upload = moe_upload_staged(c);
+    // A successful host-heap allocation is shared by gate/up/down and reused
+    // only after each bounded completion poll. Any allocation refusal leaves
+    // `None`, retaining the established mapped-at-creation path per chunk.
+    let sys_staging = if staged_upload {
+        moe_sys_staging(
+            c,
+            moe_upload_staging_slots(MOE_UPLOAD_CHUNK_BYTES),
+            MOE_UPLOAD_CHUNK_BYTES,
+        )
+    } else {
+        None
+    };
     let mk = |role: &dyn Fn(&(usize, usize, usize)) -> usize,
               rows: usize,
               cols: usize,
@@ -23992,24 +24479,43 @@ fn moe_expert_upload(
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        // Straight from the mapping to the queue, expert by expert. Gathering
-        // them into one Vec first meant a 2.2 GB allocation and a full extra
-        // memcpy PER LAYER — 94 GB of pointless copying across the release,
-        // on top of the 94 GB that has to move anyway.
-        // Counted, like every other upload. The rate the profile printed —
-        // 7850 MB/s — was measured over the SKELETON only, because the
-        // expert stack is ninety per cent of the bytes and goes through
-        // this loop rather than through `weight_buffer`.
+        // The device expects one packed projection, but the CMF keeps one
+        // tensor per expert.  On a discrete card, gather those separately
+        // mapped ranges through bounded direct staging chunks; this avoids
+        // hundreds of `queue.write_buffer` belt allocations per projection.
+        // If a driver declines the staged route, wait for any partial copies
+        // and overwrite the full plane through the historical queue path.
         let t_up = std::time::Instant::now();
-        for (i, &abs) in offs.iter().enumerate() {
-            c.queue
-                .write_buffer(&b, (i * plen) as u64, &bytes[abs..abs + plen]);
+        let staged = if staged_upload {
+            staged_moe_projection_upload(c, &b, bytes, &offs, plen, sys_staging.as_deref())
+        } else {
+            MoeStagedUpload::RetryQueue
+        };
+        match staged {
+            MoeStagedUpload::Complete => {}
+            MoeStagedUpload::RetryQueue => {
+                for (i, &abs) in offs.iter().enumerate() {
+                    c.queue
+                        .write_buffer(&b, (i * plen) as u64, &bytes[abs..abs + plen]);
+                }
+                // Bound transient memory by ONE projection, not a whole expert
+                // pack. Near the VRAM limit, keeping gate + up + down staging
+                // alive together can OOM even though their final device buffers
+                // fit.
+                submit_empty(c);
+                if !moe_staged_wait(c) {
+                    tracing::warn!(
+                        "MoE queue upload did not complete within {} seconds; declining the token graph",
+                        MOE_UPLOAD_WAIT.as_secs(),
+                    );
+                    return None;
+                }
+            }
+            MoeStagedUpload::AbandonGraph => {
+                tracing::warn!("MoE staged upload did not complete; declining the token graph");
+                return None;
+            }
         }
-        // Bound transient memory by ONE projection, not a whole expert
-        // pack. Near the VRAM limit, keeping gate + up + down staging alive
-        // together can OOM even though their final device buffers fit.
-        submit_empty(c);
-        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
         UPLOAD_NS.fetch_add(t_up.elapsed().as_nanos() as u64, Ordering::Relaxed);
         UPLOAD_BYTES.fetch_add((offs.len() * plen) as u64, Ordering::Relaxed);
         uploaded
@@ -24017,24 +24523,26 @@ fn moe_expert_upload(
             .extend(offs.iter().map(|&a| (a, plen)));
         Some(b)
     };
-    let (g, u, d) = match (
-        mk(&|t| t.0, inter, hidden, gu_len),
-        mk(&|t| t.1, inter, hidden, gu_len),
-        mk(&|t| t.2, hidden, inter, d_len),
-    ) {
-        (Some(g), Some(u), Some(d)) => (g, u, d),
-        _ => {
-            graph_refused("moe_expert_bufs: expert tensor shape/nbytes mismatch");
-            return None;
-        }
+    // Keep these calls sequential. In particular, a failed staged poll means
+    // the device may be lost; do not construct command buffers for the later
+    // planes after `mk` has declined the graph.
+    let Some(g) = mk(&|t| t.0, inter, hidden, gu_len) else {
+        graph_refused("moe_expert_bufs: expert tensor shape/nbytes mismatch");
+        return None;
     };
-    // Flush the write_buffer staging belt NOW: with 40 MoE layers the
-    // pending uploads (~17 GB) would otherwise coexist with their device
-    // copies until the graph's first submit — twice the expert weights in
-    // memory = device OOM on discrete cards. One submit+wait per layer
-    // bounds transient staging to this layer's three buffers.
-    submit_empty(c);
-    let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+    let Some(u) = mk(&|t| t.1, inter, hidden, gu_len) else {
+        graph_refused("moe_expert_bufs: expert tensor shape/nbytes mismatch");
+        return None;
+    };
+    let Some(d) = mk(&|t| t.2, hidden, inter, d_len) else {
+        graph_refused("moe_expert_bufs: expert tensor shape/nbytes mismatch");
+        return None;
+    };
+    // Every projection has already completed its own bounded upload: the
+    // staged ring waits before slot reuse, and the queue fallback flushes its
+    // write belt then waits above. Do not add an empty submit plus an
+    // unbounded final fence here: it is redundant in the normal staged path
+    // and can turn a recoverable driver stall into a process hang.
     // The card holds these bytes now, so the host copy is dead weight: the
     // page cache otherwise keeps every resident expert a second time, and on
     // a 112 GB model that second copy IS the machine's RAM (measured: 172 of
@@ -26294,6 +26802,27 @@ pub fn forward_token_graph(
     let dummy_hd = zeros(hd);
     // GDN intermediates (sized to the model's GDN geometry; 1 if no GDN layer).
     let (gnv, _gnk, gdk, gdv, _gkk, gcdim) = gdn_dims.unwrap_or((1, 1, 1, 1, 1, 1));
+    // MiniCPM's GDN geometry is homogeneous (admission above rejects a
+    // mixed stack), so these immutable params are one device object for the
+    // whole graph call rather than 30 fresh uniform buffers, one per layer.
+    let gdn_params = gdn_dims.map(|(nv, nk, dk, dv, kk, cdim)| {
+        (
+            uniform_u32x4(c, [cdim as u32, kk as u32, 0, 0]),
+            uniform_u32x8(
+                c,
+                [
+                    nv as u32,
+                    dk as u32,
+                    dv as u32,
+                    (nk * dk) as u32,
+                    (nv / nk) as u32,
+                    cdim as u32,
+                    eps.to_bits(),
+                    0,
+                ],
+            ),
+        )
+    });
     let qkv_b = GraphScratch::ensure(&c.device, &mut gs.qkv_b, (gcdim * 4) as u64, st, "g-qkv");
     let cq_b = GraphScratch::ensure(&c.device, &mut gs.cq_b, (gcdim * 4) as u64, st, "g-cq");
     let z_b = GraphScratch::ensure(&c.device, &mut gs.z_b, (gnv * gdv * 4) as u64, st, "g-z");
@@ -28477,8 +29006,8 @@ pub fn forward_token_graph(
                         b,
                         out,
                         nv,
-                        nk,
-                        dk,
+                        nk: _,
+                        dk: _,
                         dv,
                         kk,
                         cdim,
@@ -28497,29 +29026,26 @@ pub fn forward_token_graph(
                     let alog = stor(bytemuck::cast_slice(a_log));
                     let dtb = stor(bytemuck::cast_slice(dt_bias));
                     let gnorm = stor(bytemuck::cast_slice(norm));
-                    let gc_p = uniform_u32x4(c, [*cdim as u32, *kk as u32, 0, 0]);
-                    let gd_p = unif(&[
-                        *nv as u32,
-                        *dk as u32,
-                        *dv as u32,
-                        (nk * dk) as u32,
-                        (nv / nk) as u32,
-                        *cdim as u32,
-                        eps.to_bits(),
-                        0,
-                    ]);
+                    let (gc_p, gd_p) = gdn_params
+                        .as_ref()
+                        .expect("a GDN layer must have graph-wide GDN params");
                     let bg_conv = bgc(
                         22,
                         li,
                         &c.layout_gdn_conv,
-                        &[&qkv_b, &taps, ring, &cq_b, &gc_p],
+                        &[&qkv_b, &taps, ring, &cq_b, gc_p],
                     );
-                    let bg_step = bg(
-                        &c.layout_gdn,
-                        &[
-                            &cq_b, &z_b, &a_b, &b_b, &alog, &dtb, &gnorm, s, &gdo_b, &gd_p,
-                        ],
-                    );
+                    // The default parallel GDN path never dispatches the
+                    // serial step. Avoid constructing its ten-entry bind
+                    // group for every one of MiniCPM's 30 GDN layers.
+                    let bg_step = (!c.gdn_par).then(|| {
+                        bg(
+                            &c.layout_gdn,
+                            &[
+                                &cq_b, &z_b, &a_b, &b_b, &alog, &dtb, &gnorm, s, &gdo_b, gd_p,
+                            ],
+                        )
+                    });
                     // The parallel step/norm entries use SUBSETS of the gdn
                     // binding set, and an auto layout lists only what its entry
                     // reads — each gets its own bind group (lesson of the day).
@@ -28536,7 +29062,7 @@ pub fn forward_token_graph(
                             bind_buf(5, &dtb),
                             bind_buf(7, s),
                             bind_buf(8, &gdo_b),
-                            bind_buf(9, &gd_p),
+                            bind_buf(9, gd_p),
                         ],
                     });
                     let bg_snorm = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -28546,7 +29072,7 @@ pub fn forward_token_graph(
                             bind_buf(1, &z_b),
                             bind_buf(6, &gnorm),
                             bind_buf(8, &gdo_b),
-                            bind_buf(9, &gd_p),
+                            bind_buf(9, gd_p),
                         ],
                     });
                     let gi_u = uniform_u32x4(c, [*kk as u32, 0, 0, 0]);
@@ -28562,7 +29088,7 @@ pub fn forward_token_graph(
                                     bind_buf(5, &dtb),
                                     bind_buf(7, s),
                                     bind_buf(8, &gdo_b),
-                                    bind_buf(9, &gd_p),
+                                    bind_buf(9, gd_p),
                                     bind_buf(10, &qkv_b),
                                     bind_buf(11, ring),
                                     bind_buf(12, &taps),
@@ -28576,7 +29102,7 @@ pub fn forward_token_graph(
                                     bind_buf(1, &z_b),
                                     bind_buf(6, &gnorm),
                                     bind_buf(8, &gdo_b),
-                                    bind_buf(9, &gd_p),
+                                    bind_buf(9, gd_p),
                                     bind_buf(10, &qkv_b),
                                     bind_buf(11, ring),
                                     bind_buf(13, &gi_u),
@@ -28723,7 +29249,13 @@ pub fn forward_token_graph(
                                     tsp!(pass, fine, 13); // step_norm
                                 } else {
                                     pass.set_pipeline(&c.gdn_step);
-                                    pass.set_bind_group(0, &bg_step, &[]);
+                                    pass.set_bind_group(
+                                        0,
+                                        bg_step
+                                            .as_ref()
+                                            .expect("serial GDN step bind must exist"),
+                                        &[],
+                                    );
                                     pass.dispatch_workgroups(*nv as u32, 1, 1);
                                     tsp!(pass, fine, 12);
                                 }
@@ -28763,7 +29295,14 @@ pub fn forward_token_graph(
                                 pass.dispatch_workgroups(*nv as u32, 1, 1);
                             }
                         } else {
-                            go(&mut enc, &c.gdn_step, &bg_step, *nv as u32);
+                            go(
+                                &mut enc,
+                                &c.gdn_step,
+                                bg_step
+                                    .as_ref()
+                                    .expect("serial GDN step bind must exist"),
+                                *nv as u32,
+                            );
                         }
                         let Some(out_in) = prism_input(&mut enc, &[out], &gdo_b, nv * dv) else {
                             graph_decline("Prism GDN output transform unavailable");
@@ -29643,12 +30182,21 @@ pub fn forward_token_graph(
                         )
                         }
                     } else if let Some(r4) = r4.filter(|_| slots <= 32) {
+                        // The exact subgroup tails keep the ordinary pair's
+                        // lane walks and binary add tree.  Their auto layouts
+                        // are pipeline-local, so select matching layouts too.
+                        let (r4_gu, r4_dn, r4_gu_l, r4_dn_l) =
+                            if let Some(sg) = r4.exact_sg.as_ref() {
+                                (&sg.gu, &sg.dn, &sg.gu_l, &sg.dn_l)
+                            } else {
+                                (&r4.gu, &r4.dn, &r4.gu_l, &r4.dn_l)
+                            };
                         (
-                            &r4.gu,
-                            &r4.dn,
+                            r4_gu,
+                            r4_dn,
                             bind_pairs(
                                 c,
-                                &r4.gu_l,
+                                r4_gu_l,
                                 &[
                                     (0, gate_all),
                                     (1, up_all),
@@ -29662,7 +30210,7 @@ pub fn forward_token_graph(
                             ),
                             bind_pairs(
                                 c,
-                                &r4.dn_l,
+                                r4_dn_l,
                                 &[
                                     (8, down_all),
                                     (9, down_all),
@@ -33526,18 +34074,24 @@ pub fn forward_batch_graph_at(
                         &[gate_all, up_all, &n1, msel, mact, &gu_u],
                     );
                     let bg_dn = bg(&c.layout_moe_dn_b, &[down_all, mact, msel, mwt, &ob, &dn_u]);
-                    // Expert-grouped arm (no shared expert, q4tp geometry the
-                    // 16-byte word reads admit): bucket the selections by
-                    // expert, stream each expert once for its tokens, then
-                    // mix the slot outputs per token.
-                    let moeg = moe_r4::prefill(c).filter(|_| {
-                        !*has_shared && moe_r4::fits(hidden, *mi, gu_stride, mat16(hidden, *mi))
+                    // Expert-grouped arm: bucket the selections by expert,
+                    // stream each expert once for its tokens, then mix the
+                    // slot outputs per token. A gated shared expert is the
+                    // trailing packed block (id n_exp, slot top_k), so it
+                    // rides a distinct final bucket rather than being mixed
+                    // with routed id 255. `bucket_count` hard-limits the
+                    // WGSL's 257 counters (256 routed + one shared); any
+                    // other layout retains the established batched fallback.
+                    let moeg = moe_r4::prefill(c).and_then(|pg| {
+                        moe_r4::bucket_count(*n_exp, *has_shared).filter(|_| {
+                            moe_r4::fits(hidden, *mi, gu_stride, mat16(hidden, *mi))
+                        }).map(|buckets| (pg, buckets))
                     });
                     let mut pass = begin_pass(&mut enc);
                     pass.set_pipeline(&c.moe_select_b);
                     pass.set_bind_group(0, &bg_sel, &[]);
                     pass.dispatch_workgroups(k as u32, 1, 1);
-                    if let Some(pg) = moeg {
+                    if let Some((pg, buckets)) = moeg {
                         let n_ent = k * slots;
                         let mkb = |n: usize, label: &str| {
                             c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -33547,10 +34101,12 @@ pub fn forward_batch_graph_at(
                                 mapped_at_creation: false,
                             })
                         };
-                        let goff = mkb(*n_exp + 1, "moeg-off");
+                        // `goff` needs the terminal offset too: [0..buckets]
+                        // includes MiniCPM's trailing shared bucket 256.
+                        let goff = mkb(buckets + 1, "moeg-off");
                         let gent = mkb(n_ent, "moeg-ent");
                         let ypart = mkb(n_ent * hidden, "moeg-y");
-                        let gr_u = uniform_u32x4(c, [*n_exp as u32, n_ent as u32, 0, 0]);
+                        let gr_u = uniform_u32x4(c, [buckets as u32, n_ent as u32, 0, 0]);
                         let gs_u = uniform_u32x4(
                             c,
                             [hidden as u32, slots as u32, (k * hidden) as u32, 0],
@@ -33596,10 +34152,10 @@ pub fn forward_batch_graph_at(
                         pass.dispatch_workgroups(1, 1, 1);
                         pass.set_pipeline(&pg.gu);
                         pass.set_bind_group(0, &bg_ggu, &[]);
-                        pass.dispatch_workgroups((*mi as u32).div_ceil(64), *n_exp as u32, tz);
+                        pass.dispatch_workgroups((*mi as u32).div_ceil(64), buckets as u32, tz);
                         pass.set_pipeline(&pg.dn);
                         pass.set_bind_group(0, &bg_gdn, &[]);
-                        pass.dispatch_workgroups((hidden as u32).div_ceil(64), *n_exp as u32, tz);
+                        pass.dispatch_workgroups((hidden as u32).div_ceil(64), buckets as u32, tz);
                         pass.set_pipeline(&pg.sum);
                         pass.set_bind_group(0, &bg_gs, &[]);
                         pass.dispatch_workgroups(((k * hidden) as u32).div_ceil(256), 1, 1);
@@ -46280,6 +46836,88 @@ mod tests {
             graph_live_budget_from_totals(budget, 18 << 30, 1 << 30, 8 << 30),
             budget
         );
+    }
+
+    #[test]
+    fn moe_staged_plan_preserves_every_expert_byte_and_destination_offset() {
+        // 3 source experts × 12 B, staged into 16 B chunks: the first and
+        // last chunk split an expert, which is the important offset case.
+        let plen = 12usize;
+        let chunk = 16usize;
+        let sources: Vec<Vec<u8>> = (0..3)
+            .map(|expert| {
+                (0..plen)
+                    .map(|byte| (expert * 32 + byte) as u8)
+                    .collect()
+            })
+            .collect();
+        // Deliberately keep physical source tensors apart: the raw staging
+        // fill must respect `offsets`, not accidentally rely on contiguity in
+        // the model mapping.
+        let mut bytes = vec![0xa5u8; sources.len() * (plen + 5)];
+        let offsets: Vec<usize> = sources
+            .iter()
+            .enumerate()
+            .map(|(expert, source)| {
+                let offset = expert * (plen + 5) + 2;
+                bytes[offset..offset + source.len()].copy_from_slice(source);
+                offset
+            })
+            .collect();
+        let plan = moe_staged_copy_plan(sources.len(), plen, chunk).expect("aligned plan");
+        assert_eq!(plan.len(), 3);
+        let mut packed = vec![0u8; sources.len() * plen];
+        for batch in &plan {
+            let mut staged = vec![0u8; chunk];
+            assert!(moe_copy_batch_to_raw(
+                staged.as_mut_ptr(),
+                staged.len(),
+                batch,
+                &bytes,
+                &offsets,
+            ));
+            let (destination_offset, copy_len) =
+                moe_staged_batch_span(batch).expect("contiguous packed span");
+            packed[destination_offset..destination_offset + copy_len]
+                .copy_from_slice(&staged[..copy_len]);
+        }
+        assert_eq!(packed, sources.into_iter().flatten().collect::<Vec<_>>());
+        let malformed = [
+            MoeStagedCopy {
+                source: 0,
+                source_offset: 0,
+                stage_offset: 0,
+                destination_offset: 0,
+                len: 4,
+            },
+            MoeStagedCopy {
+                source: 1,
+                source_offset: 0,
+                stage_offset: 4,
+                destination_offset: 8,
+                len: 4,
+            },
+        ];
+        assert!(moe_staged_batch_span(&malformed).is_none());
+        // The parallel raw helper repeats the proof itself: a future caller
+        // cannot accidentally create an overlapping write race by skipping
+        // the planner validation above.
+        let mut reject = [0u8; 8];
+        assert!(!moe_copy_batch_to_raw(
+            reject.as_mut_ptr(),
+            reject.len(),
+            &malformed,
+            &bytes,
+            &offsets,
+        ));
+        assert_eq!(
+            moe_upload_staging_slots(MOE_UPLOAD_CHUNK_BYTES) * MOE_UPLOAD_CHUNK_BYTES,
+            MOE_UPLOAD_STAGING_LIMIT_BYTES
+        );
+        // The queue fallback shares this fence; neither upload route may
+        // silently reintroduce an indefinite first-use wait.
+        assert_eq!(MOE_UPLOAD_WAIT, std::time::Duration::from_secs(30));
+        assert!(moe_staged_copy_plan(1, 10, 16).is_none());
     }
 
     /// Test teardown may poll a shared device, but it must not invalidate a
@@ -67270,12 +67908,15 @@ pub fn dsv4_cache_write(kv_id: u64, li: usize, off: usize, data: &[f32], cap: us
 /// the file:
 ///
 /// * `frame_buf` (tag, len)   — 1, 2, 9, 17, 26, 27, 40, 43, 44, 70–79,
-///                              90–95, 104, 105, 108, 110, 111
+///                              90–95, 104, 105, 108, 110, 111, 180–209
+///                              (batch/DSpark), 210–212, 215–216
 /// * `frame_up_pos` (tag)     — 1, 79–80, 97, 108
 /// * `uni_slot` (tag, kv, li) — 84–85, 101, 130–131, 134, 136, 138, 140,
 ///                              142–164 (blit, even), 166, 168, 170
 /// * `cached_bind` (tag,kv,li)— 30–33, 36–42, 50–64, 80–101, 120–129,
-///                              132–141, 143–165 (blit, odd), 167, 169, 171
+///                              132–141, 143–165 (blit, odd), 167, 169–171,
+///                              180–199, 213–254 (batch/DSpark), 210–212,
+///                              215 (MiniCPM prepared tail)
 ///
 /// `CMF_DSV4_SLOT_CHECK=1` turns a collision between two `uni_slot` or
 /// `store_slot` sites into a panic instead of a silent wrong answer: a slot
@@ -67989,6 +68630,282 @@ pub struct Dsv4MoeGeom {
     /// generic MoE kernels intentionally stay f32 between quantized matvecs;
     /// V4.1 sets this only for its source-equivalent path.
     pub bf16: bool,
+}
+
+/// MiniCPM's dynamic CPU-tail route is already decided on the host.  Submit
+/// only the resident part of that exact route through the segmented q4tp
+/// bank: `selected_slots` are physical flat slots in route order and
+/// `selected_weights` are their final host-normalized weights.  The caller
+/// appends the pinned shared expert as the last pair and completes omitted
+/// (cold) routed experts on the CPU.
+///
+/// This is deliberately a separate, narrow frame instead of another mode of
+/// [`dsv4_moe_frame`].  The generic DSV4 caller owns device-side routing and
+/// cold-route telemetry.  MiniCPM owns both on the host already, so replaying
+/// its 1024-lane router, reading the same cold ids back, and executing
+/// zero-weight placeholder experts are pure tail overhead.  Any mismatch in
+/// this compact contract declines to the existing exact CPU fallback.
+pub fn minicpm_tail_prepared_frame(
+    model: &Arc<CmfModel>,
+    global: Dsv4GlobalMoe,
+    g: Dsv4MoeGeom,
+    x: &[f32],
+    selected_slots: &[u32],
+    selected_weights: &[f32],
+    out: &mut [f32],
+) -> bool {
+    macro_rules! no {
+        ($($t:tt)*) => {{
+            tracing::debug!("MiniCPM подготовленный MoE-кадр отклонён: {}", format_args!($($t)*));
+            if std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok() {
+                eprintln!("MiniCPM подготовленный MoE-кадр отклонён: {}", format_args!($($t)*));
+            }
+            return false;
+        }};
+    }
+
+    let t_all = std::time::Instant::now();
+    let Some(c) = ctx() else {
+        no!("нет контекста wgpu")
+    };
+    let _op = c.op_gate.enter();
+    let slots = selected_slots.len();
+    if global.pool_uid != model.uid()
+        || slots == 0
+        || slots != selected_weights.len()
+        || slots > g.top_k.saturating_add(1)
+        || slots > 64
+        || g.top_k != 8
+        || g.gu_q2
+        || g.bf16
+        || g.hidden == 0
+        || g.inter == 0
+        || g.hidden % 32 != 0
+        || g.inter % 32 != 0
+        || x.len() < g.hidden
+        || out.len() < g.hidden
+        || selected_weights
+            .iter()
+            .any(|weight| !weight.is_finite() || *weight < 0.0)
+        || selected_slots.last().copied() != Some(global.shared_slot)
+        || selected_slots
+            .iter()
+            .enumerate()
+            .any(|(i, slot)| selected_slots[..i].contains(slot))
+    {
+        no!(
+            "несовместимые prepared shapes: slots={slots} weights={} top_k={} hidden={} inter={}",
+            selected_weights.len(),
+            g.top_k,
+            g.hidden,
+            g.inter
+        );
+    }
+
+    let Some(global_bufs) = c
+        .dsv4_global_moe
+        .lock()
+        .unwrap()
+        .get(&global.pool_uid)
+        .cloned()
+    else {
+        no!("глобальный пул модели не найден")
+    };
+    if global_bufs.gu_q2
+        || global.segment_slots != global_bufs.segment_slots as u32
+        || selected_slots
+            .iter()
+            .any(|&slot| slot as usize >= global_bufs.capacity)
+    {
+        no!("глобальный пул не соответствует prepared q4tp кадру")
+    }
+
+    let Some(mact_bytes) = slots
+        .checked_mul(g.inter)
+        .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
+    else {
+        no!("переполнение prepared activation buffer")
+    };
+    let Some((p_gu, p_dn)) = dsv4_global_moe_pipelines(c, false, global_bufs.segments) else {
+        no!("глобальный q4tp pipeline недоступен")
+    };
+    let stride16 = |rows: usize, cols: usize| {
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])
+            .and_then(|bytes| u32::try_from(bytes / 2).ok())
+    };
+    let (Some(gu_stride), Some(dn_stride)) = (stride16(g.inter, g.hidden), stride16(g.hidden, g.inter))
+    else {
+        no!("prepared q4tp stride не вычислен")
+    };
+
+    // These tags are dedicated to the synchronous MiniCPM tail.  Frame
+    // buffers are grow-only and their identities are stable, which lets the
+    // matching global bind groups be cached by (model, compact slot count).
+    // 200–209 are already owned by the batched-token scratch roles.  These
+    // sparse tags are intentionally reserved in the registry above; sharing
+    // a tag would alias a live batch buffer or cached bind group.
+    const PREP_SEL: u8 = 210;
+    const PREP_WEIGHT: u8 = 211;
+    const PREP_ACT: u8 = 212;
+    const PREP_X: u8 = 215;
+    const PREP_OUT: u8 = 216;
+    let t_up = std::time::Instant::now();
+    let msel = frame_up(c, PREP_SEL, bytemuck::cast_slice(selected_slots));
+    let mwt = frame_up(c, PREP_WEIGHT, bytemuck::cast_slice(selected_weights));
+    let mact = frame_buf(c, PREP_ACT, mact_bytes, false);
+    let xb = frame_up(c, PREP_X, bytemuck::cast_slice(&x[..g.hidden]));
+    let ob = frame_buf(c, PREP_OUT, g.hidden * std::mem::size_of::<f32>(), false);
+    let gu_u = uniform_u32x8(
+        c,
+        [
+            (g.hidden / 32) as u32,
+            g.inter as u32,
+            slots as u32,
+            gu_stride,
+            g.swiglu_limit.to_bits(),
+            global.segment_slots,
+            0,
+            0,
+        ],
+    );
+    let dn_u = uniform_u32x8(
+        c,
+        [
+            (g.inter / 32) as u32,
+            g.hidden as u32,
+            slots as u32,
+            dn_stride,
+            global.segment_slots,
+            0,
+            0,
+            0,
+        ],
+    );
+    MOE_UP_NS.fetch_add(
+        t_up.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
+    let l_gu = p_gu.get_bind_group_layout(0);
+    let l_dn = p_dn.get_bind_group_layout(0);
+    let bg_gu = cached_bind(c, (PREP_SEL, global.pool_uid, slots), || {
+        let gate_bindings: Vec<_> = global_bufs
+            .gate
+            .iter()
+            .map(wgpu::Buffer::as_entire_buffer_binding)
+            .collect();
+        let up_bindings: Vec<_> = global_bufs
+            .up
+            .iter()
+            .map(wgpu::Buffer::as_entire_buffer_binding)
+            .collect();
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("minicpm-prepared-gu"),
+            layout: &l_gu,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::BufferArray(&gate_bindings),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::BufferArray(&up_bindings),
+                },
+                bind_buf(2, &xb),
+                bind_buf(3, &msel),
+                bind_buf(4, &mact),
+                bind_buf(5, &mwt),
+            ],
+        })
+    });
+    let bg_gu_p = cached_bind(c, (PREP_WEIGHT, global.pool_uid, slots), || {
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("minicpm-prepared-gu-p"),
+            layout: &p_gu.get_bind_group_layout(1),
+            entries: &[bind_buf(0, &gu_u)],
+        })
+    });
+    let bg_dn = cached_bind(c, (PREP_ACT, global.pool_uid, slots), || {
+        let down_bindings: Vec<_> = global_bufs
+            .down
+            .iter()
+            .map(wgpu::Buffer::as_entire_buffer_binding)
+            .collect();
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("minicpm-prepared-dn"),
+            layout: &l_dn,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::BufferArray(&down_bindings),
+                },
+                bind_buf(1, &mact),
+                bind_buf(2, &msel),
+                bind_buf(3, &mwt),
+                bind_buf(4, &ob),
+            ],
+        })
+    });
+    let bg_dn_p = cached_bind(c, (PREP_X, global.pool_uid, slots), || {
+        c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("minicpm-prepared-dn-p"),
+            layout: &p_dn.get_bind_group_layout(1),
+            entries: &[bind_buf(0, &dn_u)],
+        })
+    });
+
+    let t_pass = std::time::Instant::now();
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("minicpm-prepared-moe"),
+        });
+    {
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(p_gu);
+        pass.set_bind_group(0, &bg_gu, &[]);
+        pass.set_bind_group(1, &bg_gu_p, &[]);
+        pass.dispatch_workgroups(g.inter as u32, slots as u32, 1);
+        pass.set_pipeline(p_dn);
+        pass.set_bind_group(0, &bg_dn, &[]);
+        pass.set_bind_group(1, &bg_dn_p, &[]);
+        pass.dispatch_workgroups(g.hidden as u32, 1, 1);
+    }
+    MOE_PASS_NS.fetch_add(
+        t_pass.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
+    // The host already owns both `x` and the cold route, so this fence maps
+    // only the resident/shared partial result.  That is one 8 KiB readback
+    // for MiniCPM-35B rather than output + cold telemetry + duplicated x.
+    let t_enc = std::time::Instant::now();
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        (g.hidden * std::mem::size_of::<f32>()) as u64,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "minicpm-prepared-moe-stage",
+    );
+    let ok = readback(
+        c,
+        enc,
+        &ob,
+        &stage,
+        (g.hidden * std::mem::size_of::<f32>()) as u64,
+        &mut out[..g.hidden],
+    );
+    drop(sc);
+    MOE_ENC_NS.fetch_add(
+        t_enc.duration_since(t_all).as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    MOE_WAIT_NS.fetch_add(
+        t_enc.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    ok
 }
 
 pub fn dsv4_moe_frame(

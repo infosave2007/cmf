@@ -458,6 +458,12 @@ enum Commands {
         /// skeleton policy), norms and sinks f32.
         #[arg(long, conflicts_with = "mimo_towers")]
         mtp_sidecar: bool,
+        /// MiniCPM-V-4.7-35B-A3B only: convert the official Qwen3 DFlash/
+        /// DSpark checkpoint into the separate `<stem>.dspark.cmf` draft
+        /// sidecar beside an existing base --output CMF.  This is deliberately
+        /// not an MTP sidecar and does not enable a draft runtime by itself.
+        #[arg(long, conflicts_with = "mtp_sidecar")]
+        dspark_sidecar: bool,
         /// MiMo-V2 towers: `text` (default) drops them; `mm-only` writes the
         /// companion `<stem>.mm.cmf` (vision, audio encoder, speech
         /// embeddings, audio tokenizer encoder — no text tensors; `auto`
@@ -581,6 +587,11 @@ enum Commands {
         /// Output .cmf path
         #[arg(long)]
         output: String,
+        /// Lay out payloads in decode traversal order (including contiguous
+        /// gate/up/down weights per MoE expert). The default preserves the
+        /// source directory order.
+        #[arg(long)]
+        execution_order: bool,
     },
     /// Recode an existing .cmf into a denser layout without the original
     /// checkpoint. `--quant q4tp` re-expresses q4_tiled/q4_block per-tile
@@ -2896,6 +2907,7 @@ async fn main() -> anyhow::Result<()> {
             o1_window,
             o1_sink,
             mtp_sidecar,
+            dspark_sidecar,
             mimo_towers,
             sampling,
         } => {
@@ -2903,6 +2915,28 @@ async fn main() -> anyhow::Result<()> {
                 !mtp_sidecar || also_output.is_empty(),
                 "--also-output cannot be combined with --mtp-sidecar"
             );
+            anyhow::ensure!(
+                !dspark_sidecar || also_output.is_empty(),
+                "--also-output cannot be combined with --dspark-sidecar"
+            );
+            anyhow::ensure!(
+                !dspark_sidecar || mimo_towers == "text",
+                "--mimo-towers cannot be combined with --dspark-sidecar"
+            );
+            if dspark_sidecar {
+                let q = match quant.as_deref() {
+                    None => "q8_2f",
+                    Some(q) if q.eq_ignore_ascii_case(convert::AUTO_QUANT) => "q8_2f",
+                    Some(q) => q,
+                };
+                let path = convert::write_minicpm_dspark_sidecar(
+                    std::path::Path::new(&model),
+                    std::path::Path::new(&output),
+                    q,
+                )?;
+                println!("✓ wrote DSpark sidecar {}", path.display());
+                return Ok(());
+            }
             let towers = convert::parse_mimo_towers(&mimo_towers)?;
             convert::set_sampling_defaults(sampling.as_deref())?;
             // Qwen3.8-Flash-Next: the MTP head is a hyper-connected hybrid
@@ -3048,7 +3082,11 @@ async fn main() -> anyhow::Result<()> {
             println!("{text}");
             Ok(())
         }
-        Commands::Compact { model, output } => moedefrag::cmd_compact(&model, &output),
+        Commands::Compact {
+            model,
+            output,
+            execution_order,
+        } => moedefrag::cmd_compact(&model, &output, execution_order),
         Commands::Awnp {
             model,
             acts,
@@ -6799,6 +6837,52 @@ struct GpuCounterSnapshot {
     weight_bytes: u64,
 }
 
+/// Native-Metal execution receipts sampled around one `bench` generation.
+///
+/// The generic `GRAPH_TOK_*` counters describe the wgpu graph route.  Metal's
+/// TokenGraph and the oversized-MoE selected-view fallback have separate,
+/// completion-only counters; exposing their per-run deltas prevents a JSON
+/// benchmark from claiming a pager result after a silent CPU fallback.
+#[derive(Clone, Copy, Default)]
+struct NativeMetalBenchCounters {
+    graph_tokens: u64,
+    graph_layers: u64,
+    graph_errors: u64,
+    sparse_moe_blocks: u64,
+    sparse_moe_span_bytes: u64,
+}
+
+impl NativeMetalBenchCounters {
+    fn since(self, before: Self) -> Self {
+        Self {
+            graph_tokens: self.graph_tokens.saturating_sub(before.graph_tokens),
+            graph_layers: self.graph_layers.saturating_sub(before.graph_layers),
+            graph_errors: self.graph_errors.saturating_sub(before.graph_errors),
+            sparse_moe_blocks: self.sparse_moe_blocks.saturating_sub(before.sparse_moe_blocks),
+            sparse_moe_span_bytes: self
+                .sparse_moe_span_bytes
+                .saturating_sub(before.sparse_moe_span_bytes),
+        }
+    }
+}
+
+/// Native Metal is target-specific, but retain zero-valued fields in portable
+/// benchmark JSON so result-processing scripts do not need a platform branch.
+fn native_metal_bench_counters() -> NativeMetalBenchCounters {
+    let mut s = NativeMetalBenchCounters::default();
+    #[cfg(target_os = "macos")]
+    {
+        use std::sync::atomic::Ordering;
+        s.graph_tokens = cortiq_engine::pipeline::METAL_GRAPH_TOK_OK.load(Ordering::Relaxed);
+        s.graph_layers = cortiq_engine::pipeline::METAL_GRAPH_LAYERS.load(Ordering::Relaxed);
+        s.graph_errors = cortiq_engine::pipeline::METAL_GRAPH_ERRORS.load(Ordering::Relaxed);
+        s.sparse_moe_blocks = cortiq_engine::gpu_metal::SPARSE_MOE_BLOCKS.load(Ordering::Relaxed);
+        s.sparse_moe_span_bytes =
+            cortiq_engine::gpu_metal::SPARSE_MOE_SPAN_BYTES.load(Ordering::Relaxed);
+    }
+    s
+}
+
 /// One coherent counter sample. Bench rates are computed from two samples in
 /// the same inter-token window as steady tok/s; process-global totals include
 /// warmup, prefill and the pair-fusion microbenchmark and are not per-token.
@@ -8602,6 +8686,7 @@ async fn cmd_bench(
     let graph_prefix0 = cortiq_engine::pipeline::GRAPH_TOK_PREFIX.load(AtomicOrdering::Relaxed);
     let graph_full0 = cortiq_engine::pipeline::GRAPH_TOK_FULL.load(AtomicOrdering::Relaxed);
     let graph_miss0 = cortiq_engine::pipeline::GRAPH_TOK_MISS.load(AtomicOrdering::Relaxed);
+    let native_metal0 = native_metal_bench_counters();
     let stamps: Arc<std::sync::Mutex<Vec<Stamp>>> = Arc::default();
     let st = stamps.clone();
     let cb: cortiq_engine::TokenCallback = Box::new(move |_tok| {
@@ -8632,6 +8717,7 @@ async fn cmd_bench(
     let graph_miss = cortiq_engine::pipeline::GRAPH_TOK_MISS
         .load(AtomicOrdering::Relaxed)
         .saturating_sub(graph_miss0);
+    let native_metal = native_metal_bench_counters().since(native_metal0);
     let gpu_vram_budget = cortiq_engine::gpu::vram_budget();
     let gpu_resident_weight = cortiq_engine::gpu::resident_bytes();
     let (o1_device_layers, o1_device_state_bytes) = pipeline.o1_device_stats();
@@ -8784,6 +8870,11 @@ async fn cmd_bench(
             "graph_full_tokens": graph_full,
             "graph_prefix_tokens": graph_prefix,
             "graph_miss_tokens": graph_miss,
+            "native_metal_graph_tokens": native_metal.graph_tokens,
+            "native_metal_graph_layers": native_metal.graph_layers,
+            "native_metal_graph_errors": native_metal.graph_errors,
+            "native_metal_sparse_moe_blocks": native_metal.sparse_moe_blocks,
+            "native_metal_sparse_moe_span_bytes": native_metal.sparse_moe_span_bytes,
             "gpu_vram_budget_bytes": gpu_vram_budget,
             "gpu_resident_weight_bytes": gpu_resident_weight,
             "o1_device_layers": o1_device_layers,
