@@ -581,6 +581,11 @@ enum Commands {
         /// Output .cmf path
         #[arg(long)]
         output: String,
+        /// Lay out payloads in decode traversal order (including contiguous
+        /// gate/up/down weights per MoE expert). The default preserves the
+        /// source directory order.
+        #[arg(long)]
+        execution_order: bool,
     },
     /// Recode an existing .cmf into a denser layout without the original
     /// checkpoint. `--quant q4tp` re-expresses q4_tiled/q4_block per-tile
@@ -3048,7 +3053,11 @@ async fn main() -> anyhow::Result<()> {
             println!("{text}");
             Ok(())
         }
-        Commands::Compact { model, output } => moedefrag::cmd_compact(&model, &output),
+        Commands::Compact {
+            model,
+            output,
+            execution_order,
+        } => moedefrag::cmd_compact(&model, &output, execution_order),
         Commands::Awnp {
             model,
             acts,
