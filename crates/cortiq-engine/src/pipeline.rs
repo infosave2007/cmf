@@ -18966,21 +18966,22 @@ pub(crate) fn moe_ffn_experts(
     let (idx, p, wsum) = (&r.idx, &r.p, r.wsum);
     // D5: the whole layer MoE block in one GPU command buffer (experts — the
     // same mmap via a no-copy buffer; intermediate activations on the GPU).
-    // Same Ffn probe class as the dense chain: one submit per layer
-    // either wins on this driver stack or it doesn't.
+    // MoE owns a separate probe class from dense FFN: its selected-span pager
+    // has materially different residency and latency costs.
     if crate::gpu::enabled_here() {
-        match crate::gpu::probe_arm(crate::gpu::OpClass::Ffn) {
+        match crate::gpu::probe_arm(crate::gpu::OpClass::Moe) {
             crate::gpu::ProbeArm::Gpu => {
                 let t0 = std::time::Instant::now();
                 if let Some(out) = moe_ffn_gpu(m, x, &idx, &p, wsum, pool) {
-                    crate::gpu::probe_record(crate::gpu::OpClass::Ffn, true, t0.elapsed());
+                    crate::gpu::probe_record(crate::gpu::OpClass::Moe, true, t0.elapsed());
                     return out;
                 }
+                crate::gpu::probe_note_decline(crate::gpu::OpClass::Moe);
             }
             crate::gpu::ProbeArm::CpuTimed => {
                 let t0 = std::time::Instant::now();
                 let out = crate::gpu::cpu_scope(|| moe_ffn_cpu(m, x, &idx, &p, wsum, pool));
-                crate::gpu::probe_record(crate::gpu::OpClass::Ffn, false, t0.elapsed());
+                crate::gpu::probe_record(crate::gpu::OpClass::Moe, false, t0.elapsed());
                 return out;
             }
             crate::gpu::ProbeArm::Cpu => {

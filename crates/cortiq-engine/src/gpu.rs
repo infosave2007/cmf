@@ -279,7 +279,7 @@ fn probe_cache_key_named(class: &str) -> String {
     )
 }
 
-const CLASS_NAMES: [&str; 7] = [
+const CLASS_NAMES: [&str; 8] = [
     "ffn",
     "matvec",
     "matmat",
@@ -287,6 +287,11 @@ const CLASS_NAMES: [&str; 7] = [
     "matmat-wide",
     "lm-head",
     "gemm-nt",
+    // MoE has a different residency policy from a dense FFN. In
+    // particular, an out-of-core Metal MoE block can become viable after a
+    // dense `ffn` probe has (correctly) decided that ordinary per-op FFNs
+    // lose. Never let that remembered verdict suppress the separate path.
+    "moe",
 ];
 
 /// Adopt every verdict this device already reached in an earlier run.
@@ -501,6 +506,9 @@ pub enum OpClass {
     /// host it displaced. Its population is per-head slices, nothing
     /// like the weight GEMMs above, so it probes on its own.
     GemmNt = 6,
+    /// A host-routed MoE block. Kept separate from [`Self::Ffn`] because
+    /// its selected-weight pager has different memory and latency costs.
+    Moe = 7,
 }
 
 /// Which probe a large matvec belongs to. The head is an order of
@@ -593,7 +601,8 @@ impl Probe {
     }
 }
 
-static PROBES: [Probe; 7] = [
+static PROBES: [Probe; 8] = [
+    Probe::new(),
     Probe::new(),
     Probe::new(),
     Probe::new(),
