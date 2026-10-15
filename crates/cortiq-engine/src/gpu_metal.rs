@@ -8136,6 +8136,12 @@ pub(crate) struct WeightArena {
     bufs: Vec<OnceLock<Buffer>>,
     make: Box<dyn Fn(usize) -> Buffer + Send + Sync>,
     stride: usize,
+    /// Absolute byte range of the model mapping represented by this arena.
+    /// Ordinary arenas cover the complete primary section.  A paged token
+    /// graph instead owns one transient, page-rounded window and translates
+    /// every tensor binding / MoE jobs-table base into this range.
+    base: usize,
+    limit: usize,
 }
 
 impl WeightArena {
@@ -8143,11 +8149,27 @@ impl WeightArena {
         self.bufs[i].get_or_init(|| (self.make)(i))
     }
     fn locate(&self, abs: usize) -> (&Buffer, usize) {
+        debug_assert!(self.contains(abs, 1));
         if self.bufs.len() == 1 {
-            return (self.window(0), abs);
+            return (self.window(0), abs - self.base);
         }
         let i = (abs / self.stride).min(self.bufs.len() - 1);
         (self.window(i), abs - i * self.stride)
+    }
+    #[inline]
+    fn contains(&self, abs: usize, bytes: usize) -> bool {
+        abs >= self.base
+            && abs
+                .checked_add(bytes)
+                .is_some_and(|end| end <= self.limit)
+    }
+    /// Offset for the jobs kernels' raw base tables.  Full arenas retain
+    /// their historical absolute bases; a one-window transient page uses
+    /// page-relative bases and passes a zero window stride to the shader.
+    #[inline]
+    fn jobs_base(&self, abs: usize) -> usize {
+        debug_assert!(self.contains(abs, 1));
+        abs - self.base
     }
     /// The MoE jobs kernels index the arena from the GPU by absolute
     /// bases and resolve the window themselves (`bind_jobs_windows`), up
@@ -8200,7 +8222,353 @@ pub fn working_set_bytes() -> u64 {
         .unwrap_or(0)
 }
 
+/// `CMF_METAL_MOE_PAGER=1` admits an oversized MoE model as short-lived,
+/// sequential no-copy pages rather than binding its complete mmap.  The cap
+/// is deliberately conservative: it is never allowed above either one Metal
+/// buffer or the recommended working set minus 2 GiB for KV/state/scratch.
+/// An invalid setting is a refusal, not an unbounded allocation attempt.
+pub(crate) fn moe_pager_cap_bytes() -> Option<usize> {
+    static CAP: OnceLock<Option<usize>> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        if !metal_moe_pager_requested() {
+            return None;
+        }
+        const MIB: usize = 1024 * 1024;
+        const GIB: usize = 1024 * MIB;
+        let requested = std::env::var("CMF_METAL_MOE_PAGER_MAX_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(8 * 1024)
+            .checked_mul(MIB)?;
+        let max = max_buffer_bytes() as usize;
+        let working = working_set_bytes() as usize;
+        let allowed = max.min(working.saturating_sub(2 * GIB));
+        // A smaller page would turn each token into dozens of submissions;
+        // reject it rather than silently trading a residency stall for a
+        // synchronization stall.
+        (allowed >= 64 * MIB && requested >= 64 * MIB).then_some(requested.min(allowed))
+    })
+}
+
+/// Per-page host-side accounting for the bounded MoE pager.  These are
+/// deliberately host timings: Metal GPU timestamps are reported separately by
+/// `CMF_METAL_GPUPROF`, while the pager investigation needs to distinguish
+/// no-copy page construction from command-buffer submission/waits.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct MoePagerPageStats {
+    buffer_create: std::time::Duration,
+    commits: u32,
+    commit_host: std::time::Duration,
+    waits: u32,
+    wait_host: std::time::Duration,
+}
+
+fn moe_pager_prof_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_METAL_PAGER_PROF").as_deref() == Ok("1"))
+}
+
+#[derive(Default)]
+struct MoePagerTokenStats {
+    position: usize,
+    from: usize,
+    until: usize,
+    started: Option<std::time::Instant>,
+    pages: u32,
+    page_wall: std::time::Duration,
+    buffer_create: std::time::Duration,
+    commits: u32,
+    commit_host: std::time::Duration,
+    waits: u32,
+    wait_host: std::time::Duration,
+}
+
+thread_local! {
+    /// `forward_layers_span` owns the exact token boundary.  A single token
+    /// may call `q1_graph_gpu` five or more times as it walks transient
+    /// pages, so page metrics must not be mislabeled as token metrics.
+    static MOE_PAGER_PROF_TOKEN: std::cell::RefCell<Option<(u64, MoePagerTokenStats)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn pager_ms(d: std::time::Duration) -> f64 {
+    d.as_secs_f64() * 1_000.0
+}
+
+fn emit_moe_pager_token(reason: &str, stats: &MoePagerTokenStats) {
+    if stats.pages == 0 {
+        return;
+    }
+    let wall = stats.started.map(|t| t.elapsed()).unwrap_or_default();
+    let target = stats.until;
+    eprintln!(
+        "metal-pager-prof: token pos={} layers=[{}..{}) pages={} wall={:.2} ms \\
+         page-wall={:.2} ms buffer-create={:.2} ms commits={} commit-host={:.2} ms \\
+         waits={} wait-host={:.2} ms status={reason}",
+        stats.position,
+        stats.from,
+        target,
+        stats.pages,
+        pager_ms(wall),
+        pager_ms(stats.page_wall),
+        pager_ms(stats.buffer_create),
+        stats.commits,
+        pager_ms(stats.commit_host),
+        stats.waits,
+        pager_ms(stats.wait_host),
+    );
+}
+
+/// Exact outer-forward boundary for pager diagnostics.  It is intentionally
+/// created for every host forward only when profiling is requested, but emits
+/// nothing unless that forward actually admitted at least one bounded page.
+pub(crate) struct MoePagerTokenScope {
+    id: u64,
+    enabled: bool,
+}
+
+impl MoePagerTokenScope {
+    pub(crate) fn new(position: usize, from: usize, until: usize) -> Self {
+        if !moe_pager_prof_on() {
+            return Self {
+                id: 0,
+                enabled: false,
+            };
+        }
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        MOE_PAGER_PROF_TOKEN.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if let Some((_, old)) = slot.take() {
+                // A nested/re-entered forward must never silently merge two
+                // tokens into one timing line.  It is diagnostic-only, so
+                // report the interrupted scope and start a fresh boundary.
+                emit_moe_pager_token("replaced", &old);
+            }
+            *slot = Some((
+                id,
+                MoePagerTokenStats {
+                    position,
+                    from,
+                    until,
+                    started: Some(std::time::Instant::now()),
+                    ..Default::default()
+                },
+            ));
+        });
+        Self { id, enabled: true }
+    }
+}
+
+impl Drop for MoePagerTokenScope {
+    fn drop(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        MOE_PAGER_PROF_TOKEN.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.as_ref().is_some_and(|(id, _)| *id == self.id) {
+                if let Some((_, stats)) = slot.take() {
+                    emit_moe_pager_token("forward-return", &stats);
+                }
+            }
+        });
+    }
+}
+
+/// One actual transient page inside an outer token scope.  `Drop` reports an
+/// interrupted page too, so a graph refusal/error cannot make a partial page
+/// masquerade as a completed token in the profile.
+pub(crate) struct MoePagerPageScope {
+    enabled: bool,
+    position: usize,
+    layer_start: usize,
+    page_start: usize,
+    page_end: usize,
+    cap: usize,
+    ordinal: u32,
+    started: std::time::Instant,
+    finished: bool,
+}
+
+impl MoePagerPageScope {
+    pub(crate) fn new(
+        call_started: std::time::Instant,
+        position: usize,
+        layer_start: usize,
+        page_start: usize,
+        page_end: usize,
+        cap: usize,
+    ) -> Self {
+        if !moe_pager_prof_on() {
+            return Self {
+                enabled: false,
+                position,
+                layer_start,
+                page_start,
+                page_end,
+                cap,
+                ordinal: 0,
+                started: call_started,
+                finished: false,
+            };
+        }
+        let ordinal = MOE_PAGER_PROF_TOKEN.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let Some((_, token)) = slot.as_mut() else {
+                return 0;
+            };
+            // q1_graph_gpu is only called from the owning forward today; do
+            // not fuse a stale/re-entrant scope with this page if that ever
+            // changes.
+            if token.position != position {
+                return 0;
+            }
+            token.pages = token.pages.saturating_add(1);
+            token.pages
+        });
+        Self {
+            enabled: ordinal != 0,
+            position,
+            layer_start,
+            page_start,
+            page_end,
+            cap,
+            ordinal,
+            started: call_started,
+            finished: false,
+        }
+    }
+
+    pub(crate) fn finish(&mut self, layer_end: usize, stats: Option<MoePagerPageStats>, status: &str) {
+        if !self.enabled || self.finished {
+            return;
+        }
+        self.finished = true;
+        let wall = self.started.elapsed();
+        let stats = stats.unwrap_or_default();
+        MOE_PAGER_PROF_TOKEN.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if let Some((_, token)) = slot.as_mut() {
+                if token.position == self.position {
+                    token.page_wall += wall;
+                    token.buffer_create += stats.buffer_create;
+                    token.commits = token.commits.saturating_add(stats.commits);
+                    token.commit_host += stats.commit_host;
+                    token.waits = token.waits.saturating_add(stats.waits);
+                    token.wait_host += stats.wait_host;
+                }
+            }
+        });
+        eprintln!(
+            "metal-pager-prof: page={} pos={} layers=[{}..{}) weights=[{}..{}) {} MiB / cap {} MiB \\
+             wall={:.2} ms buffer-create={:.2} ms commits={} commit-host={:.2} ms waits={} \\
+             wait-host={:.2} ms status={status}",
+            self.ordinal,
+            self.position,
+            self.layer_start,
+            layer_end,
+            self.page_start,
+            self.page_end,
+            (self.page_end - self.page_start) / (1024 * 1024),
+            self.cap / (1024 * 1024),
+            pager_ms(wall),
+            pager_ms(stats.buffer_create),
+            stats.commits,
+            pager_ms(stats.commit_host),
+            stats.waits,
+            pager_ms(stats.wait_host),
+        );
+    }
+}
+
+impl Drop for MoePagerPageScope {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finish(self.layer_start, None, "interrupted");
+        }
+    }
+}
+
+/// Page-round a raw primary-section span.  `file_page_buffer` additionally
+/// verifies it against the actual mapped length before constructing Metal.
+pub(crate) fn page_round_span(start: usize, end: usize) -> Option<(usize, usize)> {
+    if start >= end {
+        return None;
+    }
+    let page = page_size();
+    let base = start / page * page;
+    let limit = end.checked_add(page - 1)? / page * page;
+    (base < limit).then_some((base, limit))
+}
+
+fn model_layer_index(name: &str) -> Option<usize> {
+    let suffix = name.strip_prefix("model.layers.")?;
+    suffix.split_once('.')?.0.parse().ok()
+}
+
+/// Physical payload span for one canonical `model.layers.N.*` namespace.
+/// This is cached by model uid because the paged graph plans this every decode
+/// token; scanning ~31k directory records per page would erase much of the
+/// latency win.  Unknown naming simply declines the experimental pager.
+pub(crate) fn model_layer_span(model: &Arc<CmfModel>, layer: usize) -> Option<(usize, usize)> {
+    type LayerSpans = Vec<Option<(usize, usize)>>;
+    static SPANS: OnceLock<Mutex<HashMap<usize, LayerSpans>>> = OnceLock::new();
+    let key = model_key(model);
+    let cache = SPANS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().unwrap();
+    let spans = cache.entry(key).or_insert_with(|| {
+        let mut out: Vec<Option<(usize, usize)>> = Vec::new();
+        for entry in &model.tensors {
+            let Some(li) = model_layer_index(&entry.name) else {
+                continue;
+            };
+            let Some(start) = model.entry_abs_offset(entry) else {
+                continue;
+            };
+            let Some(end) = start.checked_add(entry.nbytes as usize) else {
+                continue;
+            };
+            if li >= out.len() {
+                out.resize(li + 1, None);
+            }
+            out[li] = Some(match out[li] {
+                Some((lo, hi)) => (lo.min(start), hi.max(end)),
+                None => (start, end),
+            });
+        }
+        out
+    });
+    spans.get(layer).copied().flatten()
+}
+
+/// Exact physical span of a mapped tensor, for the paged final lm-head tail.
+pub(crate) fn model_tensor_span(model: &Arc<CmfModel>, idx: usize) -> Option<(usize, usize)> {
+    let entry = model.tensors.get(idx)?;
+    let start = model.entry_abs_offset(entry)?;
+    Some((start, start.checked_add(entry.nbytes as usize)?))
+}
+
 fn file_buffer(c: &Ctx, model: &Arc<CmfModel>) -> Option<(Arc<WeightArena>, usize)> {
+    // The paged graph deliberately uses `file_page_buffer`, never this
+    // retained full-mmap arena.  Once that opt-in is active for a model over
+    // the device's working-set recommendation, *every* legacy per-op Metal
+    // arm must decline to its established CPU fallback.  Protecting only the
+    // MoE jobs path is insufficient: a later q8/q4 attention or GDN
+    // projection would otherwise recreate the broad arena after a page
+    // boundary refusal and can wedge the driver under memory pressure.
+    if oversized_moe_arena_forbidden(model) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                model_bytes = model.primary_bytes().len(),
+                working_set = working_set_bytes(),
+                "Metal full model arena disabled by bounded MoE pager; legacy operations use CPU fallback"
+            );
+        }
+        return None;
+    }
     let bytes = model.primary_bytes();
     let base = bytes.as_ptr() as usize;
     let key = model_key(model);
@@ -8232,6 +8600,8 @@ fn file_buffer(c: &Ctx, model: &Arc<CmfModel>) -> Option<(Arc<WeightArena>, usiz
                 )
             }),
             stride: len.max(1),
+            base: 0,
+            limit: len,
         }
     } else {
         // The driver accounts the working set by BUFFER LENGTHS, not
@@ -8277,11 +8647,68 @@ fn file_buffer(c: &Ctx, model: &Arc<CmfModel>) -> Option<(Arc<WeightArena>, usiz
                 }
             }),
             stride,
+            base: 0,
+            limit: len,
         }
     };
     let arena = Arc::new(arena);
     cache.insert(key, (arena.clone(), Arc::clone(model)));
     Some((arena, len))
+}
+
+/// Make one transient no-copy Metal view of a page-rounded slice of the
+/// primary CMF mapping.  This is intentionally separate from `file_buffer`:
+/// the latter is an LRU-like process cache for fully resident graphs, while
+/// retaining page views across layer segments would put the entire oversized
+/// model back on Metal's working-set accounting and can stall the driver.
+fn file_page_buffer(
+    c: &Ctx,
+    model: &Arc<CmfModel>,
+    start: usize,
+    end: usize,
+) -> Option<(Arc<WeightArena>, usize)> {
+    let bytes = model.primary_bytes();
+    let page = page_size();
+    let file_len = bytes.len() / page * page;
+    if file_len == 0 || start >= end || end > file_len || bytes.as_ptr() as usize % page != 0 {
+        return None;
+    }
+    let (base, limit) = page_round_span(start, end)?;
+    if base >= limit || limit > file_len {
+        return None;
+    }
+    let len = limit - base;
+    // A page must be a single buffer: the MoE jobs shader gets one relative
+    // address space.  Refuse before the Metal call rather than asking the
+    // driver to create an oversize resource and possibly wedge residency.
+    let max = c._device.max_buffer_length() as usize / page * page;
+    if len > max {
+        return None;
+    }
+    let ptr = unsafe { bytes.as_ptr().add(base) };
+    let buf = unsafe {
+        c._device.new_buffer_with_bytes_no_copy(
+            ptr as *const std::ffi::c_void,
+            len as u64,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        )
+    };
+    let cell = OnceLock::new();
+    // A freshly-created cell cannot already be initialized.  If that ever
+    // changes, fail closed instead of allowing a lazy constructor to retain
+    // an unrelated mapping.
+    if cell.set(buf).is_err() {
+        return None;
+    }
+    let arena = WeightArena {
+        bufs: vec![cell],
+        make: Box::new(|_| unreachable!("transient page buffer is initialized eagerly")),
+        stride: len,
+        base,
+        limit,
+    };
+    Some((Arc::new(arena), file_len))
 }
 
 /// q8_row/q8_2f matvec on the GPU. `xs` — already prescaled activations (the same
@@ -13845,20 +14272,139 @@ impl SparseMoeRange {
     fn span_bytes(self) -> usize {
         self.end - self.start
     }
+
+    /// A single view is safe only when it covers no gap between the three
+    /// selected projections.  New execution-order CMFs put a given expert's
+    /// gate/up/down payloads beside each other, so this turns three
+    /// short-lived no-copy MTLBuffers into one without broadening the mapped
+    /// residency.  Older / streaming layouts commonly leave large holes;
+    /// those deliberately retain the three-view route.
+    fn contiguous_triple(
+        gate: Self,
+        up: Self,
+        down: Self,
+        max_buffer_bytes: usize,
+    ) -> Option<Self> {
+        let mut ranges = [gate, up, down];
+        ranges.sort_unstable_by_key(|range| range.start);
+        let start = ranges[0].start;
+        let mut end = ranges[0].end;
+        for range in &ranges[1..] {
+            // Strictly greater means a real unselected gap.  Equality is
+            // adjacent page ranges and is safe to coalesce.
+            if range.start > end {
+                return None;
+            }
+            end = end.max(range.end);
+        }
+        let merged = Self {
+            start,
+            end,
+            offset: 0,
+        };
+        (merged.span_bytes() <= max_buffer_bytes).then_some(merged)
+    }
 }
 
-/// `CMF_METAL_SPARSE_MOE=1` opts into the selected q4tp view pager. It is
-/// deliberately diagnostic until cold/warm parity and throughput gates show
-/// that 40 host-routed waits beat the CPU on a given UMA machine; ordinary
-/// models keep the proven resident WeightArena route.
+/// Rebase a tensor's payload offset into a coalesced no-copy expert view.
+/// `cover` is admitted only by [`SparseMoeRange::contiguous_triple`], but
+/// retain the bounds checks here so a future caller cannot accidentally bind
+/// a projection outside a transient selected range.
+fn sparse_moe_rebased_view(
+    buffer: &Buffer,
+    cover: SparseMoeRange,
+    tensor: SparseMoeRange,
+) -> Option<SparseMoeView> {
+    if tensor.start < cover.start || tensor.end > cover.end {
+        return None;
+    }
+    let offset = u64::try_from(tensor.start.checked_sub(cover.start)?)
+        .ok()?
+        .checked_add(tensor.offset)?;
+    if offset >= u64::try_from(cover.span_bytes()).ok()? {
+        return None;
+    }
+    Some(SparseMoeView {
+        buffer: buffer.clone(),
+        offset,
+    })
+}
+
+#[cfg(test)]
+mod sparse_moe_range_tests {
+    use super::*;
+
+    fn range(start: usize, end: usize) -> SparseMoeRange {
+        SparseMoeRange {
+            start,
+            end,
+            offset: 0,
+        }
+    }
+
+    #[test]
+    fn contiguous_triple_coalesces_adjacent_pages() {
+        let merged = SparseMoeRange::contiguous_triple(
+            range(4096, 8192),
+            range(8192, 12_288),
+            range(12_288, 16_384),
+            16_384,
+        )
+        .expect("adjacent page ranges must be coalescible");
+        assert_eq!((merged.start, merged.end), (4096, 16_384));
+    }
+
+    #[test]
+    fn contiguous_triple_rejects_a_gap_even_when_ranges_overlap_elsewhere() {
+        // A span-sum-only check would accept this: the first two ranges
+        // overlap enough to hide the later 4 KiB gap.  Mapping the cover
+        // would then bind an unrelated tensor, so only true continuity is
+        // allowed.
+        assert!(SparseMoeRange::contiguous_triple(
+            range(0, 8192),
+            range(0, 8192),
+            range(12_288, 16_384),
+            16_384,
+        )
+        .is_none());
+    }
+}
+
+/// Truthy parsing shared by the two explicitly experimental oversized-MoE
+/// paths.  Keeping the decision process-wide matches the other Metal feature
+/// switches and makes an invocation's safety policy immutable after startup.
+fn metal_env_truthy(name: &str) -> bool {
+    matches!(
+        std::env::var(name).as_deref(),
+        Ok("1") | Ok("on") | Ok("true")
+    )
+}
+
+/// `CMF_METAL_MOE_PAGER=1` is the bounded graph pager.  It also enables the
+/// already-parity-tested selected q4tp views as its *safe* fallback whenever
+/// a later graph segment cannot fit a page.  `CMF_METAL_SPARSE_MOE=1` keeps
+/// its direct diagnostic meaning.  Neither opt-in may fall through to a
+/// whole-model arena on an oversized UMA model: that turns a page refusal
+/// into the driver OOM/stall this policy exists to avoid.
+fn metal_moe_pager_requested() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| metal_env_truthy("CMF_METAL_MOE_PAGER"))
+}
+
 fn sparse_moe_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        matches!(
-            std::env::var("CMF_METAL_SPARSE_MOE").as_deref(),
-            Ok("1") | Ok("on") | Ok("true")
-        )
-    })
+    *ON.get_or_init(|| metal_env_truthy("CMF_METAL_SPARSE_MOE") || metal_moe_pager_requested())
+}
+
+/// Explicit selected-view / graph-pager users asked for bounded residency.
+/// If their model is bigger than Metal's working-set recommendation, never
+/// resurrect `file_buffer()` after the specialised path says it cannot serve
+/// this particular block.  Returning false from `moe_block` is the existing
+/// exact CPU fallback and, unlike a full no-copy arena, has no way to wedge
+/// the driver's eviction path mid-token.
+fn oversized_moe_arena_forbidden(model: &Arc<CmfModel>) -> bool {
+    let working_set = working_set_bytes();
+    sparse_moe_enabled() && working_set != 0 && model.primary_bytes().len() as u64 > working_set
 }
 
 /// Conservative cap for the page-rounded no-copy *views*, not q4tp payload
@@ -14006,6 +14552,12 @@ fn try_moe_block_jobs_q4tp_sparse(
         return SparseMoeResult::Declined;
     }
 
+    // Keep the exact old three-range admission as the fallback.  A compact
+    // execution-order file has contiguous gate/up/down pages for one expert,
+    // however, and can bind that triple through a single MTLBuffer.  This
+    // reduces per-layer no-copy buffer creation/binding from 27 to 9 for the
+    // normal top-8+shared route without retaining any view across tokens.
+    let max_buffer_bytes = c._device.max_buffer_length() as usize;
     let mut ranges = Vec::with_capacity(jobs.len());
     let mut bound_bytes = 0usize;
     for job in jobs {
@@ -14016,20 +14568,27 @@ fn try_moe_block_jobs_q4tp_sparse(
         ) else {
             return SparseMoeResult::Declined;
         };
-        let Some(next) = bound_bytes
-            .checked_add(gate.span_bytes())
-            .and_then(|n| n.checked_add(up.span_bytes()))
-            .and_then(|n| n.checked_add(down.span_bytes()))
+        let packed = SparseMoeRange::contiguous_triple(gate, up, down, max_buffer_bytes);
+        let triple_bytes = match packed {
+            Some(range) => range.span_bytes(),
+            None => gate
+                .span_bytes()
+                .checked_add(up.span_bytes())
+                .and_then(|n| n.checked_add(down.span_bytes()))
+                .unwrap_or(usize::MAX),
+        };
+        let Some(next) = bound_bytes.checked_add(triple_bytes)
         else {
             return SparseMoeResult::Declined;
         };
         bound_bytes = next;
-        ranges.push((gate, up, down));
+        ranges.push((gate, up, down, packed));
     }
     if bound_bytes > sparse_moe_span_cap_bytes()
-        || ranges.iter().flat_map(|(g, u, d)| [g, u, d]).any(|range| {
-            range.span_bytes() > c._device.max_buffer_length() as usize
-        })
+        || ranges
+            .iter()
+            .flat_map(|(g, u, d, _)| [g, u, d])
+            .any(|range| range.span_bytes() > max_buffer_bytes)
     {
         tracing::debug!(
             bound_bytes,
@@ -14039,17 +14598,39 @@ fn try_moe_block_jobs_q4tp_sparse(
         return SparseMoeResult::Declined;
     }
 
+    let view_buffers = ranges
+        .iter()
+        .map(|(_, _, _, packed)| if packed.is_some() { 1usize } else { 3usize })
+        .sum::<usize>();
     let base_ptr = bytes.as_ptr() as usize;
     let mut views = Vec::with_capacity(ranges.len());
-    for (gate, up, down) in ranges {
-        let (Some(gate), Some(up), Some(down)) = (
-            sparse_moe_view(c, base_ptr, gate),
-            sparse_moe_view(c, base_ptr, up),
-            sparse_moe_view(c, base_ptr, down),
-        ) else {
-            return SparseMoeResult::Declined;
+    for (gate, up, down, packed) in ranges {
+        let view_set = match packed {
+            Some(cover) => {
+                let Some(cover_view) = sparse_moe_view(c, base_ptr, cover) else {
+                    return SparseMoeResult::Declined;
+                };
+                let (Some(gate), Some(up), Some(down)) = (
+                    sparse_moe_rebased_view(&cover_view.buffer, cover, gate),
+                    sparse_moe_rebased_view(&cover_view.buffer, cover, up),
+                    sparse_moe_rebased_view(&cover_view.buffer, cover, down),
+                ) else {
+                    return SparseMoeResult::Declined;
+                };
+                SparseMoeViews { gate, up, down }
+            }
+            None => {
+                let (Some(gate), Some(up), Some(down)) = (
+                    sparse_moe_view(c, base_ptr, gate),
+                    sparse_moe_view(c, base_ptr, up),
+                    sparse_moe_view(c, base_ptr, down),
+                ) else {
+                    return SparseMoeResult::Declined;
+                };
+                SparseMoeViews { gate, up, down }
+            }
         };
-        views.push(SparseMoeViews { gate, up, down });
+        views.push(view_set);
     }
 
     let ne = views.len();
@@ -14224,6 +14805,7 @@ fn try_moe_block_jobs_q4tp_sparse(
             model_bytes,
             working_set,
             view_bytes = bound_bytes,
+            view_buffers,
             jobs = jobs.len(),
             fused_views9 = views9,
             "native Metal selected MoE views active"
@@ -14419,6 +15001,10 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
         SparseMoeResult::Ran => return true,
         SparseMoeResult::Declined => {
             moe_block_refused("selected q4tp views");
+            return false;
+        }
+        SparseMoeResult::NotApplicable if oversized_moe_arena_forbidden(model) => {
+            moe_block_refused("selected q4tp views unavailable");
             return false;
         }
         SparseMoeResult::NotApplicable => {}
@@ -15392,6 +15978,12 @@ pub struct TokenGraph {
     /// (with the item kind that committed it), so `sync` can sum GPU
     /// busy time per category and expose the gap to the wall.
     gpuprof: Vec<(metal::CommandBuffer, u32)>,
+    /// Present only for `new_paged` while `CMF_METAL_PAGER_PROF=1`; this
+    /// keeps page construction/submission accounting out of normal graphs.
+    pager_page: Option<MoePagerPageStats>,
+    /// True for a bounded `new_paged` graph regardless of whether optional
+    /// pager profiling is enabled.  Scheduling must not depend on telemetry.
+    paged: bool,
     /// Item kind for the NEXT commit (2=gdn-run, 3=attn, 0=other).
     pub commit_kind: u32,
     h_b: Buffer,
@@ -15426,12 +16018,64 @@ pub struct TokenGraph {
 }
 
 impl TokenGraph {
+    fn note_pager_commit(&mut self, elapsed: std::time::Duration) {
+        if let Some(stats) = self.pager_page.as_mut() {
+            stats.commits = stats.commits.saturating_add(1);
+            stats.commit_host += elapsed;
+        }
+    }
+
+    /// Host-side bounded-page metrics collected without changing graph
+    /// scheduling.  Only `new_paged` graphs can return a value here.
+    pub(crate) fn pager_page_stats(&self) -> Option<MoePagerPageStats> {
+        self.pager_page
+    }
+
     pub fn new(model: &Arc<CmfModel>, dims: GraphDims, h: &[f32]) -> Option<TokenGraph> {
         let c = ctx()?;
+        let (fbuf, safe_len) = file_buffer(c, model)?;
+        Self::with_arena(c, model, dims, h, fbuf, safe_len)
+    }
+
+    /// Construct a graph over a transient, single-window page of the model
+    /// mapping.  This is the admission path for an MoE model whose complete
+    /// mmap exceeds Metal's recommended working set.  Callers must put every
+    /// tensor a graph segment can touch inside `[start, end)` and must finish
+    /// the graph before constructing the next page; this routine never
+    /// inserts the page in the process-wide full-model arena cache.
+    pub fn new_paged(
+        model: &Arc<CmfModel>,
+        dims: GraphDims,
+        h: &[f32],
+        start: usize,
+        end: usize,
+    ) -> Option<TokenGraph> {
+        let c = ctx()?;
+        let prof_start = moe_pager_prof_on().then(std::time::Instant::now);
+        let (fbuf, safe_len) = file_page_buffer(c, model, start, end)?;
+        let buffer_create = prof_start.map(|t| t.elapsed());
+        let mut graph = Self::with_arena(c, model, dims, h, fbuf, safe_len)?;
+        graph.paged = true;
+        if let Some(buffer_create) = buffer_create {
+            graph.pager_page = Some(MoePagerPageStats {
+                buffer_create,
+                ..Default::default()
+            });
+        }
+        Some(graph)
+    }
+
+    fn with_arena(
+        c: &'static Ctx,
+        model: &Arc<CmfModel>,
+        dims: GraphDims,
+        h: &[f32],
+        fbuf: Arc<WeightArena>,
+        safe_len: usize,
+    ) -> Option<TokenGraph> {
         if h.len() != dims.hidden {
             return None;
         }
-        let (fbuf, safe_len) = file_buffer(c, model)?;
         let h_b = io_buf(c, 20_000_000_003 + dims.hidden, dims.hidden * 4);
         let n_b = io_buf(c, 21_000_000_011 + dims.hidden, dims.hidden * 4);
         let d_b = io_buf(c, 32_000_000_207 + dims.hidden, dims.hidden * 4);
@@ -15455,6 +16099,8 @@ impl TokenGraph {
             in_flight: Vec::new(),
             failed: false,
             gpuprof: Vec::new(),
+            pager_page: None,
+            paged: false,
             commit_kind: 0,
             h_b,
             n_b,
@@ -15502,6 +16148,18 @@ impl TokenGraph {
         }
     }
 
+    /// A graph page is a strict address-space boundary, not merely a hint for
+    /// the allocator.  Every raw projection and jobs-table base must pass it
+    /// before any command buffer is encoded; otherwise a stale absolute
+    /// offset could bind past a no-copy page and make the driver wait/fault
+    /// instead of returning an ordinary graph refusal.
+    #[inline]
+    fn arena_contains(&self, abs: usize, bytes: usize) -> bool {
+        abs.checked_add(bytes)
+            .is_some_and(|end| end <= self.safe_len)
+            && self.fbuf.contains(abs, bytes)
+    }
+
     /// Validate one q1 tensor and resolve its absolute payload offset.
     fn q1_abs(&self, t: (usize, usize, usize)) -> Option<usize> {
         let (idx, rows, cols) = t;
@@ -15510,7 +16168,8 @@ impl TokenGraph {
         }
         let entry = &self.model.tensors[idx];
         let abs = self.model.entry_abs_offset(entry)?;
-        if abs + rows * (cols / GROUP_SIZE) * Q1_TILE > self.safe_len {
+        let need = rows.checked_mul(cols / GROUP_SIZE)?.checked_mul(Q1_TILE)?;
+        if !self.arena_contains(abs, need) {
             return None;
         }
         Some(abs)
@@ -15527,7 +16186,7 @@ impl TokenGraph {
         let entry = &self.model.tensors[idx];
         let abs = self.model.entry_abs_offset(entry)?;
         // Whole variable-length payload (base + overlay) sits within nbytes.
-        if abs + entry.nbytes as usize > self.safe_len {
+        if !self.arena_contains(abs, entry.nbytes as usize) {
             return None;
         }
         Some(abs)
@@ -15542,8 +16201,9 @@ impl TokenGraph {
         }
         let entry = &self.model.tensors[idx];
         let abs = self.model.entry_abs_offset(entry)?;
-        let n_groups = rows * (cols / GROUP_SIZE);
-        if abs + n_groups * 16 + n_groups * 2 > self.safe_len {
+        let n_groups = rows.checked_mul(cols / GROUP_SIZE)?;
+        let need = n_groups.checked_mul(18)?;
+        if !self.arena_contains(abs, need) {
             return None;
         }
         Some(abs)
@@ -15562,7 +16222,7 @@ impl TokenGraph {
         let abs = self.model.entry_abs_offset(entry)?;
         let need =
             cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])?;
-        if abs + need > self.safe_len {
+        if !self.arena_contains(abs, need) {
             return None;
         }
         Some(abs)
@@ -15581,7 +16241,7 @@ impl TokenGraph {
             cortiq_core::TensorDtype::Q2TiledP,
             &[rows, cols],
         )?;
-        if abs + need > self.safe_len || (entry.nbytes as usize) < need {
+        if !self.arena_contains(abs, need) || (entry.nbytes as usize) < need {
             return None;
         }
         Some(abs)
@@ -15632,8 +16292,9 @@ impl TokenGraph {
         }
         let entry = &self.model.tensors[idx];
         let abs = self.model.entry_abs_offset(entry)?;
-        let n_groups = rows * (cols / GROUP_SIZE);
-        if abs + n_groups * (2 + GROUP_SIZE / 2) > self.safe_len {
+        let n_groups = rows.checked_mul(cols / GROUP_SIZE)?;
+        let need = n_groups.checked_mul(2 + GROUP_SIZE / 2)?;
+        if !self.arena_contains(abs, need) {
             return None;
         }
         Some(abs)
@@ -15712,9 +16373,11 @@ impl TokenGraph {
         let entry = &self.model.tensors[idx];
         let has_col = entry.dtype == cortiq_core::TensorDtype::Q8_2f;
         let abs = self.model.entry_abs_offset(entry)?;
-        let qlen = rows * cols;
-        let need = qlen + rows * 2 + if has_col { cols * 2 } else { 0 };
-        if abs + need > self.safe_len || (entry.nbytes as usize) < need {
+        let qlen = rows.checked_mul(cols)?;
+        let need = qlen
+            .checked_add(rows.checked_mul(2)?)?
+            .checked_add(if has_col { cols.checked_mul(2)? } else { 0 })?;
+        if !self.arena_contains(abs, need) || (entry.nbytes as usize) < need {
             return None;
         }
 
@@ -15811,7 +16474,7 @@ impl TokenGraph {
                             && entry.shape.as_slice() == [rows, cols]
                             && abs % 4 == 0
                             && moe_q8::tensor_bytes(rows, cols)
-                                .is_some_and(|n| abs + n <= self.safe_len && entry.nbytes as usize >= n);
+                                .is_some_and(|n| self.arena_contains(abs, n) && entry.nbytes as usize >= n);
                     }
                     let dt = if q2 {
                         cortiq_core::TensorDtype::Q2TiledP
@@ -15819,7 +16482,7 @@ impl TokenGraph {
                         cortiq_core::TensorDtype::Q4TiledP
                     };
                     match cortiq_core::quant::expected_nbytes(dt, &[rows, cols]) {
-                        Some(n) => abs + n <= self.safe_len && entry.dtype == dt,
+                        Some(n) => self.arena_contains(abs, n) && entry.dtype == dt,
                         None => false,
                     }
                 };
@@ -15883,16 +16546,35 @@ impl TokenGraph {
     /// makes the eventual checked sync wait all buffers without reading any
     /// output until every status has been validated.
     pub fn commit(&mut self) {
-        // CMF_METAL_ONEBUF=1: keep encoding into one command buffer and
-        // let `sync` commit it — probe for the per-buffer scheduling
-        // cost (residency walk over the arena windows at every commit).
-        static ONEBUF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *ONEBUF.get_or_init(|| std::env::var("CMF_METAL_ONEBUF").as_deref() == Ok("1")) {
+        // A bounded MoE page must use one command buffer by default.  On the
+        // target M4, committing each internal phase caused 21 residency waits
+        // per five-page token (~7.5 s); one page-local buffer needs five
+        // waits (~1.1 s) and has identical readback.  Keep the historical
+        // multi-buffer policy for ordinary graphs, and retain an explicit
+        // `CMF_METAL_ONEBUF=0` diagnostic override for the pager too.
+        static ONEBUF_OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+        let onebuf = match *ONEBUF_OVERRIDE.get_or_init(|| {
+            std::env::var("CMF_METAL_ONEBUF")
+                .ok()
+                .and_then(|v| match v.as_str() {
+                    "0" => Some(false),
+                    "1" => Some(true),
+                    _ => None,
+                })
+        }) {
+            Some(forced) => forced,
+            None => self.paged,
+        };
+        if onebuf {
             return;
         }
         if let Some(cmd) = self.cmd.take() {
+            let t_commit = self.pager_page.as_ref().map(|_| std::time::Instant::now());
             METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             cmd.commit();
+            if let Some(t_commit) = t_commit {
+                self.note_pager_commit(t_commit.elapsed());
+            }
             if gpuprof_on() {
                 self.gpuprof.push((cmd.clone(), self.commit_kind));
             }
@@ -15919,18 +16601,30 @@ impl TokenGraph {
             return Err("Metal TokenGraph is already failed".to_string());
         }
         if let Some(cmd) = self.cmd.take() {
+            let t_commit = self.pager_page.as_ref().map(|_| std::time::Instant::now());
             METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             cmd.commit();
+            if let Some(t_commit) = t_commit {
+                self.note_pager_commit(t_commit.elapsed());
+            }
             if gpuprof_on() {
                 self.gpuprof.push((cmd.clone(), self.commit_kind));
             }
             self.in_flight.push(cmd);
         }
         let flights = std::mem::take(&mut self.in_flight);
+        let wait_count = flights.len() as u32;
+        let t_wait = self.pager_page.as_ref().map(|_| std::time::Instant::now());
         let mut wait_error = None;
         for cmd in flights {
             if let Err(err) = wait_fast_checked(&cmd) {
                 wait_error.get_or_insert(err);
+            }
+        }
+        if let Some(t_wait) = t_wait {
+            if let Some(stats) = self.pager_page.as_mut() {
+                stats.waits = stats.waits.saturating_add(wait_count);
+                stats.wait_host += t_wait.elapsed();
             }
         }
         if let Some(err) = wait_error {
@@ -17397,10 +18091,12 @@ impl TokenGraph {
         let st_b = io_buf(c, 43_000_000_241 + salt, 3 * 8);
         // Rewritten every encode with identical bytes: cheap, and benign
         // even if a prior committed buffer is still reading them.
-        let abs_of = |idx: usize| -> u64 {
-            self.model
+        let base_of = |idx: usize| -> u64 {
+            let abs = self
+                .model
                 .entry_abs_offset(&self.model.tensors[idx])
-                .unwrap() as u64
+                .unwrap();
+            self.fbuf.jobs_base(abs) as u64
         };
         unsafe {
             let (pg, pu, pd) = (
@@ -17409,15 +18105,15 @@ impl TokenGraph {
                 dt_b.contents() as *mut u64,
             );
             for (i, &(g, u, d)) in m.experts.iter().enumerate() {
-                *pg.add(i) = abs_of(g);
-                *pu.add(i) = abs_of(u);
-                *pd.add(i) = abs_of(d);
+                *pg.add(i) = base_of(g);
+                *pu.add(i) = base_of(u);
+                *pd.add(i) = base_of(d);
             }
             if let Some((sg, su, sd)) = m.shared {
                 let ps = st_b.contents() as *mut u64;
-                *ps = abs_of(sg);
-                *ps.add(1) = abs_of(su);
-                *ps.add(2) = abs_of(sd);
+                *ps = base_of(sg);
+                *ps.add(1) = base_of(su);
+                *ps.add(2) = base_of(sd);
             }
         }
         // GPU-written scratch, size-keyed like the dense FFN's buffers:

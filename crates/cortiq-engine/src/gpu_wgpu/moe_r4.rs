@@ -327,8 +327,26 @@ fn moe4_dn_f(@builtin(workgroup_id) wid: vec3<u32>,
 /// that expert's tokens (`moeg_gu`, `moeg_dn`); the per-slot down outputs
 /// are then mixed per token (`moeg_sum`) in slot order. Every (row, token)
 /// sum is computed by one thread in group order, so the result does not
-/// depend on where in its bucket an entry landed.
+/// depend on where in its bucket an entry landed. The final bucket is also
+/// available for a trailing shared expert: MiniCPM's 256 routed experts plus
+/// that shared block are exactly the largest admitted layout.
 pub(crate) const MOEG_TOKENS: usize = 8;
+
+/// `moeg_group` has one 256-lane workgroup. It can count all 256 routed
+/// experts plus one shared expert, but no more. Keep this host-side contract
+/// next to the WGSL array bound so an oversized directory cannot turn a
+/// selection id into a storage-buffer or workgroup-array OOB access.
+pub(crate) const MOEG_MAX_BUCKETS: usize = 257;
+
+/// Number of packed expert blocks addressed by the grouped-prefill route.
+/// A shared expert is packed after the routed range and selected as id
+/// `n_exp`, so it must receive its own final bucket rather than aliasing the
+/// last routed one. `None` deliberately sends the caller to the established
+/// per-slot batched kernel.
+pub(crate) fn bucket_count(n_exp: usize, has_shared: bool) -> Option<usize> {
+    let buckets = n_exp.checked_add(usize::from(has_shared))?;
+    (n_exp > 0 && buckets <= MOEG_MAX_BUCKETS).then_some(buckets)
+}
 
 fn moeg_wgsl() -> String {
     let mut gu_init = String::new();
@@ -387,29 +405,51 @@ struct GrP { n_exp: u32, n: u32, _a: u32, _b: u32 };
 @group(0) @binding(1) var<storage, read_write> gr_off : array<u32>;
 @group(0) @binding(2) var<storage, read_write> gr_ent : array<u32>;
 @group(0) @binding(3) var<uniform>             gr_p   : GrP;
-var<workgroup> gr_cnt: array<atomic<u32>, 256>;
-var<workgroup> gr_base: array<u32, 256>;
+// MiniCPM has 256 routed experts and a gated shared expert addressed as
+// `n_exp` (=256). Keep a separate trailing bucket instead of folding that
+// entry into a routed one: its gate/up/down block is physically the final
+// pack entry and `moeg_sum` must still read it in slot order.
+var<workgroup> gr_cnt: array<atomic<u32>, 257>;
+var<workgroup> gr_base: array<u32, 257>;
 @compute @workgroup_size(256)
 fn moeg_group(@builtin(local_invocation_index) lid: u32) {
     atomicStore(&gr_cnt[lid], 0u);
+    // The 257th counter has no owning lane. It is only used when the host
+    // explicitly passes the shared-expert bucket; initialize it before any
+    // lane can increment it.
+    if (lid == 0u) { atomicStore(&gr_cnt[256u], 0u); }
     workgroupBarrier();
-    for (var i = lid; i < gr_p.n; i = i + 256u) { atomicAdd(&gr_cnt[gr_sel[i]], 1u); }
+    // Clamp the uniform as a second line of defense. The host only admits
+    // <=257 buckets, but malformed direct callers must not index a workgroup
+    // array or the offsets buffer out of range.
+    let nb = min(gr_p.n_exp, 257u);
+    for (var i = lid; i < gr_p.n; i = i + 256u) {
+        let e = gr_sel[i];
+        if (e < nb) { atomicAdd(&gr_cnt[e], 1u); }
+    }
     workgroupBarrier();
     if (lid == 0u) {
         var s = 0u;
-        for (var e = 0u; e < gr_p.n_exp; e = e + 1u) {
+        for (var e = 0u; e < nb; e = e + 1u) {
             gr_base[e] = s;
             gr_off[e] = s;
             s = s + atomicLoad(&gr_cnt[e]);
         }
-        gr_off[gr_p.n_exp] = s;
+        gr_off[nb] = s;
     }
     workgroupBarrier();
     atomicStore(&gr_cnt[lid], 0u);
+    if (lid == 0u) { atomicStore(&gr_cnt[256u], 0u); }
     workgroupBarrier();
     for (var i = lid; i < gr_p.n; i = i + 256u) {
         let e = gr_sel[i];
-        gr_ent[gr_base[e] + atomicAdd(&gr_cnt[e], 1u)] = i;
+        if (e < nb) {
+            let dst = gr_base[e] + atomicAdd(&gr_cnt[e], 1u);
+            // The count pass above is exact for valid select entries. This
+            // guard keeps a malformed selection/uniform from writing past
+            // the host-sized `gr_ent` buffer even if that invariant breaks.
+            if (dst < gr_p.n) { gr_ent[dst] = i; }
+        }
     }
 }
 
@@ -761,6 +801,216 @@ fn moesg_gu_f(@builtin(workgroup_id) wid: vec3<u32>,
 
 "#;
 
+/// Exact subgroup-tail twins of the ordinary four-row q4tp pair.  The
+/// first level of the original 64-lane reduction remains in workgroup
+/// memory (lane i + lane i+32); only its 32-lane tail moves to xor shuffles.
+/// On a device with fixed 32-lane subgroups, lane 0 therefore receives the
+/// same pairwise add tree and the same per-lane accumulation order as the
+/// original kernels.  This source is compiled as a separate module on top
+/// of `MOE4_WGSL`, so its automatic bind-group layouts remain pipeline-local.
+const MOE4_EXACT_SG_WGSL: &str = r#"
+fn r4_tail(v: vec4<f32>) -> vec4<f32> {
+    var r = v;
+    r = r + subgroupShuffleXor(r, 16u);
+    r = r + subgroupShuffleXor(r, 8u);
+    r = r + subgroupShuffleXor(r, 4u);
+    r = r + subgroupShuffleXor(r, 2u);
+    r = r + subgroupShuffleXor(r, 1u);
+    return r;
+}
+
+fn gu_body_sg(wid: vec3<u32>, lid: u32, expert: u32) {
+    let row0 = wid.x * 4u;
+    let slot = wid.y;
+    let gpr = gu_p.gpr;
+    let rows = gu_p.inter;
+    let base16 = expert * gu_p.mat16;
+    let cst = (gpr * 5u + 7u) / 8u;
+    // Row params: one word (f16 lo, f16 step) per row after the nibbles.
+    let parw = (base16 >> 1u) + rows * gpr * 4u + row0;
+    let g0 = unpack2x16float(gu_gw[parw]);
+    let g1 = unpack2x16float(gu_gw[parw + 1u]);
+    let g2 = unpack2x16float(gu_gw[parw + 2u]);
+    let g3 = unpack2x16float(gu_gw[parw + 3u]);
+    let u0 = unpack2x16float(gu_uw[parw]);
+    let u1 = unpack2x16float(gu_uw[parw + 1u]);
+    let u2 = unpack2x16float(gu_uw[parw + 2u]);
+    let u3 = unpack2x16float(gu_uw[parw + 3u]);
+    let glo = vec4<f32>(g0.x, g1.x, g2.x, g3.x);
+    let gst = vec4<f32>(g0.y, g1.y, g2.y, g3.y);
+    let ulo = vec4<f32>(u0.x, u1.x, u2.x, u3.x);
+    let ust = vec4<f32>(u0.y, u1.y, u2.y, u3.y);
+    let cod0 = (base16 + rows * gpr * 8u + rows * 2u) * 2u + row0 * cst;
+    // 16-byte word of (row0, group 0); the next row is gpr words on.
+    let nb = (base16 >> 3u) + row0 * gpr;
+    var ag = vec4<f32>(0.0);
+    var au = vec4<f32>(0.0);
+    for (var g = lid; g < gpr; g = g + 64u) {
+        let xo = g * 8u;
+        let x0 = gu_x[xo];      let x1 = gu_x[xo + 1u];
+        let x2 = gu_x[xo + 2u]; let x3 = gu_x[xo + 3u];
+        let x4 = gu_x[xo + 4u]; let x5 = gu_x[xo + 5u];
+        let x6 = gu_x[xo + 6u]; let x7 = gu_x[xo + 7u];
+        let bit = g * 5u;
+        let cb = cod0 + (bit >> 3u);
+        let shf = bit & 7u;
+        let cg = vec4<u32>(gu_gc(cb, shf), gu_gc(cb + cst, shf),
+                           gu_gc(cb + 2u * cst, shf), gu_gc(cb + 3u * cst, shf));
+        let cu = vec4<u32>(gu_uc(cb, shf), gu_uc(cb + cst, shf),
+                           gu_uc(cb + 2u * cst, shf), gu_uc(cb + 3u * cst, shf));
+        let sg = exp2(glo + vec4<f32>(cg) * gst);
+        let su = exp2(ulo + vec4<f32>(cu) * ust);
+        let w = nb + g;
+        let dg = vec4<f32>(m4_d32(gu_gw4[w], x0, x1, x2, x3, x4, x5, x6, x7),
+                           m4_d32(gu_gw4[w + gpr], x0, x1, x2, x3, x4, x5, x6, x7),
+                           m4_d32(gu_gw4[w + 2u * gpr], x0, x1, x2, x3, x4, x5, x6, x7),
+                           m4_d32(gu_gw4[w + 3u * gpr], x0, x1, x2, x3, x4, x5, x6, x7));
+        let du = vec4<f32>(m4_d32(gu_uw4[w], x0, x1, x2, x3, x4, x5, x6, x7),
+                           m4_d32(gu_uw4[w + gpr], x0, x1, x2, x3, x4, x5, x6, x7),
+                           m4_d32(gu_uw4[w + 2u * gpr], x0, x1, x2, x3, x4, x5, x6, x7),
+                           m4_d32(gu_uw4[w + 3u * gpr], x0, x1, x2, x3, x4, x5, x6, x7));
+        ag = ag + sg * dg;
+        au = au + su * du;
+    }
+    // This is the old tree's stride-32 level.  The fixed 32-lane gate
+    // ensures r4_tail below is exactly levels 16, 8, 4, 2, 1 for lane 0.
+    if (lid >= 32u) {
+        gu_pg[lid - 32u] = ag;
+        gu_pu[lid - 32u] = au;
+    }
+    workgroupBarrier();
+    if (lid < 32u) {
+        let tg = r4_tail(ag + gu_pg[lid]);
+        let tu = r4_tail(au + gu_pu[lid]);
+        if (lid == 0u) {
+            for (var k = 0u; k < 4u; k = k + 1u) {
+                var gg = tg[k];
+                var uu = tu[k];
+                if (gu_p.lim > 0.0) {
+                    uu = clamp(uu, -gu_p.lim, gu_p.lim);
+                    gg = min(gg, gu_p.lim);
+                }
+                gu_act[slot * rows + row0 + k] = (gg / (1.0 + exp(-gg))) * uu;
+            }
+        }
+    }
+}
+
+@compute @workgroup_size(64)
+fn moe4_gu_sg(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_index) lid: u32) {
+    gu_body_sg(wid, lid, gu_sel[wid.y]);
+}
+
+fn dn_body_sg(wid: vec3<u32>, lid: u32) {
+    let row0 = wid.x * 4u;
+    let gpr = dn_p.gpr;
+    let rows = dn_p.hidden;
+    let cst = (gpr * 5u + 7u) / 8u;
+    let total = dn_p.slots * gpr;
+    var acc = vec4<f32>(0.0);
+    for (var i = lid; i < total; i = i + 64u) {
+        let slot = i / gpr;
+        let g = i - slot * gpr;
+        let base16 = dn_ss[slot] * dn_p.mat16;
+        let parw = (base16 >> 1u) + rows * gpr * 4u + row0;
+        let p0 = unpack2x16float(dn_w[parw]);
+        let p1 = unpack2x16float(dn_w[parw + 1u]);
+        let p2 = unpack2x16float(dn_w[parw + 2u]);
+        let p3 = unpack2x16float(dn_w[parw + 3u]);
+        let cod0 = (base16 + rows * gpr * 8u + rows * 2u) * 2u + row0 * cst;
+        let bit = g * 5u;
+        let cb = cod0 + (bit >> 3u);
+        let shf = bit & 7u;
+        let cv = vec4<u32>(dn_c(cb, shf), dn_c(cb + cst, shf),
+                           dn_c(cb + 2u * cst, shf), dn_c(cb + 3u * cst, shf));
+        let scale = exp2(vec4<f32>(p0.x, p1.x, p2.x, p3.x)
+                         + vec4<f32>(cv) * vec4<f32>(p0.y, p1.y, p2.y, p3.y));
+        let xo = (slot * gpr + g) * 8u;
+        let a0 = dn_act[xo];      let a1 = dn_act[xo + 1u];
+        let a2 = dn_act[xo + 2u]; let a3 = dn_act[xo + 3u];
+        let a4 = dn_act[xo + 4u]; let a5 = dn_act[xo + 5u];
+        let a6 = dn_act[xo + 6u]; let a7 = dn_act[xo + 7u];
+        let w = (base16 >> 3u) + row0 * gpr + g;
+        let d = vec4<f32>(m4_d32(dn_w4[w], a0, a1, a2, a3, a4, a5, a6, a7),
+                          m4_d32(dn_w4[w + gpr], a0, a1, a2, a3, a4, a5, a6, a7),
+                          m4_d32(dn_w4[w + 2u * gpr], a0, a1, a2, a3, a4, a5, a6, a7),
+                          m4_d32(dn_w4[w + 3u * gpr], a0, a1, a2, a3, a4, a5, a6, a7));
+        acc = acc + dn_sw[slot] * (scale * d);
+    }
+    if (lid >= 32u) {
+        dn_pt[lid - 32u] = acc;
+    }
+    workgroupBarrier();
+    if (lid < 32u) {
+        let y = r4_tail(acc + dn_pt[lid]);
+        if (lid == 0u) {
+            for (var k = 0u; k < 4u; k = k + 1u) {
+                dn_y[row0 + k] = y[k];
+            }
+        }
+    }
+}
+
+@compute @workgroup_size(64)
+fn moe4_dn_sg(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_index) lid: u32) {
+    if (lid < dn_p.slots) {
+        dn_ss[lid] = dn_sel[lid];
+        dn_sw[lid] = dn_wt[lid];
+    }
+    workgroupBarrier();
+    dn_body_sg(wid, lid);
+}
+"#;
+
+/// The exact tree twins use their own automatic layouts: WGPU layouts are
+/// pipeline-exclusive even when the binding sets match the ordinary pair.
+pub(crate) struct ExactSg {
+    pub(crate) gu: wgpu::ComputePipeline,
+    pub(crate) gu_l: wgpu::BindGroupLayout,
+    pub(crate) dn: wgpu::ComputePipeline,
+    pub(crate) dn_l: wgpu::BindGroupLayout,
+}
+
+fn build_exact_sg(c: &Ctx) -> Option<ExactSg> {
+    if std::env::var("CMF_MOE_R4_SG").as_deref() == Ok("0") || !sg32(c) {
+        return None;
+    }
+    let internal = c.device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let validation = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let source = format!("{MOE4_WGSL}{MOE4_EXACT_SG_WGSL}");
+    let module = c.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("cmf-moe-r4-exact-sg"),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    let pipe = |ep: &str| {
+        c.device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(ep),
+                layout: None,
+                module: &module,
+                entry_point: Some(ep),
+                compilation_options: Default::default(),
+                cache: c.pipeline_cache.as_ref(),
+            })
+    };
+    let gu = pipe("moe4_gu_sg");
+    let dn = pipe("moe4_dn_sg");
+    let validation_error = pollster::block_on(validation.pop());
+    let internal_error = pollster::block_on(internal.pop());
+    if let Some(e) = validation_error.or(internal_error) {
+        tracing::warn!("cmf-moe-r4 exact subgroup tails rejected ({e}): keeping the ordinary four-row pair");
+        return None;
+    }
+    Some(ExactSg {
+        gu_l: gu.get_bind_group_layout(0),
+        dn_l: dn.get_bind_group_layout(0),
+        gu,
+        dn,
+    })
+}
+
 pub(crate) struct Sg {
     pub(crate) gu: wgpu::ComputePipeline,
     pub(crate) gu_l: wgpu::BindGroupLayout,
@@ -1051,6 +1301,9 @@ pub(crate) struct Pipes {
     pub(crate) mv3: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
     /// Subgroup folded-select pair (four rows a 128-lane workgroup).
     pub(crate) sg: Option<Sg>,
+    /// Exact 32-lane subgroup tails for the ordinary four-row pair; None
+    /// without fixed sg32, on device rejection, or `CMF_MOE_R4_SG=0`.
+    pub(crate) exact_sg: Option<ExactSg>,
     /// `q82_sg`: warp-per-row q8_2f projections (Q/K/V together, O, head).
     pub(crate) q82sg: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
     /// Never-written output slot for the unused matrices of a `q82_sg` call.
@@ -1161,6 +1414,7 @@ fn build(c: &Ctx) -> Option<Pipes> {
     let prefill = build_prefill(c);
     let mv3 = build_mv3(c);
     let sg = build_sg(c);
+    let exact_sg = build_exact_sg(c);
     let q82sg = build_q82sg(c);
     let dummy_y = c.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("q82-sg-dummy"),
@@ -1169,7 +1423,7 @@ fn build(c: &Ctx) -> Option<Pipes> {
         mapped_at_creation: false,
     });
     Some(Pipes {
-        gu, gu_l, dn, dn_l, gu_f, gu_f_l, dn_f, dn_f_l, mv3, sg, q82sg, dummy_y, prefill,
+        gu, gu_l, dn, dn_l, gu_f, gu_f_l, dn_f, dn_f_l, mv3, sg, exact_sg, q82sg, dummy_y, prefill,
     })
 }
 
@@ -1202,4 +1456,47 @@ pub(crate) fn fits(hidden: usize, inter: usize, gu_mat16: u32, dn_mat16: u32) ->
         && inter % 4 == 0
         && gu_mat16 % 8 == 0
         && dn_mat16 % 8 == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grouped_prefill_keeps_a_trailing_shared_bucket_distinct() {
+        assert_eq!(bucket_count(256, false), Some(256));
+        assert_eq!(bucket_count(256, true), Some(257));
+        assert_eq!(bucket_count(257, false), Some(257));
+        assert_eq!(bucket_count(257, true), None);
+        assert_eq!(bucket_count(0, false), None);
+    }
+
+    #[test]
+    fn grouped_prefill_wgsl_validates_with_shared_bucket_guards() {
+        let src = moeg_wgsl();
+        assert!(src.contains("array<atomic<u32>, 257>"));
+        assert!(src.contains("let nb = min(gr_p.n_exp, 257u)"));
+        assert!(src.contains("if (e < nb)"));
+        let module = wgpu::naga::front::wgsl::parse_str(&src)
+            .expect("expert-grouped prefill WGSL must parse");
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("expert-grouped prefill WGSL must validate");
+    }
+
+    #[test]
+    fn exact_subgroup_tail_wgsl_validates() {
+        let src = format!("{MOE4_WGSL}{MOE4_EXACT_SG_WGSL}");
+        let module = wgpu::naga::front::wgsl::parse_str(&src)
+            .expect("exact subgroup-tail WGSL must parse");
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("exact subgroup-tail WGSL must validate");
+    }
 }

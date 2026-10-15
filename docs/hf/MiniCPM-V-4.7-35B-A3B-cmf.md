@@ -62,11 +62,36 @@ part of the profile, not an accidental fallback. The q4tp file therefore has
 mixed per-tensor dtypes; inspect them with, for example,
 `cortiq info "$MODEL" --tensors model.layers.`.
 
-The release manifest records exact sizes and hashes, but no perplexity, quality,
-or tokens-per-second figure is claimed here. In particular, the source name
-“35B-A3B” does not make the full stored expert bank fit in 3 GB: plan for the
-complete CMF file, runtime buffers, context/KV state, and macOS unified-memory
-headroom.
+The release manifest records exact sizes and hashes. The scoped Vulkan
+measurement below is neither a perplexity/quality result nor a general
+throughput guarantee. In particular, the source name “35B-A3B” does not make
+the full stored expert bank fit in 3 GB: plan for the complete CMF file,
+runtime buffers, context/KV state, and macOS unified-memory headroom.
+
+## Measured Vulkan profile (RTX 4090; opt-in)
+
+Starting with `cortiq` **0.8.19**, the q4tp file has an opt-in Vulkan dynamic
+MoE-tail path. It preserves the source router, top-8 routing weights, and
+shared expert. A bounded GPU expert bank serves resident winners; cold routed
+experts complete on CPU. An admission, slot-map, or GPU-completion failure
+uses the ordinary CPU MoE path rather than returning a partial result.
+
+```bash
+CMF_GPU=1 WGPU_BACKEND=vulkan CMF_SDOT=0 \
+CMF_MINICPM_DYNAMIC_TAIL=1 \
+  cortiq run MiniCPM-V-4.7-35B-A3B-q4tp.cmf \
+  --raw --prompt "The capital of France is" --greedy -n 512
+```
+
+On one RTX 4090 under Vulkan, that profile measured **23.8, 24.3, and 23.8
+ tok/s** for 512 greedy generated tokens; first-token latency was **18.1,
+17.9, and 17.9 s**, respectively. A separate 16-token greedy regression gate
+matched the response text and all **16/16 argmaxes** against the ordinary
+path; max `|Δlogit|` was `4.00543212890625e-05`.
+
+These are one-machine measurements, not a promise for other GPUs, drivers,
+prompts, context lengths, or Macs. They are not directly comparable with a
+short CPU-only control run, so no universal percentage speedup is claimed.
 
 ## Release manifest
 
@@ -94,8 +119,11 @@ CMF_GPU=1 RUST_LOG=info \
 
 Use the log to confirm the active backend, then measure the exact release on
 the target machine. A CPU smoke test or a successful file conversion is not a
-Metal performance result. For long prompts, account for the full-attention
-layers' KV cache in addition to model weights.
+Metal performance result. `CMF_METAL_SPARSE_MOE=1` is an experimental,
+explicit q4tp selected-view path; it preserves CPU routing and declines to the
+ordinary path on admission/completion failure. It is not a whole-model Metal
+throughput claim. For long prompts, account for the full-attention layers' KV
+cache in addition to model weights.
 
 ## Scope and known limitations
 
@@ -176,10 +204,36 @@ Gated DeltaNet, свёртка, скалярные тензоры и нормы.
 точность, а не случайный fallback: тип каждого тензора можно посмотреть
 командой `cortiq info "$MODEL" --tensors model.layers.`.
 
-В release manifest указаны точные размеры и хеши, но не приводятся
-perplexity, оценка качества или tok/s без отдельных измерений. Метка исходника
-«35B-A3B» не означает, что весь банк экспертов поместится в 3 ГБ: учитывайте
-полный CMF, буферы runtime, контекст/KV и запас памяти macOS.
+В release manifest указаны точные размеры и хеши. Приведённый ниже
+Vulkan-замер не является результатом perplexity/качества и не даёт общего
+обещания tok/s. Метка исходника «35B-A3B» не означает, что весь банк экспертов
+поместится в 3 ГБ: учитывайте полный CMF, буферы runtime, контекст/KV и запас
+памяти macOS.
+
+### Измеренный Vulkan-профиль (RTX 4090; opt-in)
+
+Начиная с `cortiq` **0.8.19**, для q4tp доступен opt-in динамический
+Vulkan MoE-tail. Он сохраняет исходные router, веса top-8 route и shared
+expert. Ограниченный GPU-bank обслуживает resident winners, а cold routed
+experts досчитываются на CPU. При ошибке admission, карты slot или completion
+GPU выполняется обычный CPU MoE-путь, а не возвращается частичный результат.
+
+```bash
+CMF_GPU=1 WGPU_BACKEND=vulkan CMF_SDOT=0 \
+CMF_MINICPM_DYNAMIC_TAIL=1 \
+  cortiq run MiniCPM-V-4.7-35B-A3B-q4tp.cmf \
+  --raw --prompt "The capital of France is" --greedy -n 512
+```
+
+На одной RTX 4090/Vulkan этот профиль показал **23.8, 24.3 и 23.8 tok/s**
+на 512 greedy generated tokens; first-token был **18.1, 17.9 и 17.9 с**.
+Отдельный strict regression gate на 16 токенах дал одинаковое тело ответа и
+все **16/16 argmax** против обычного пути; max `|Δlogit|` —
+`4.00543212890625e-05`.
+
+Это замеры одной машины, а не обещание результата на других GPU, драйверах,
+prompt, длинах контекста или Mac. Они не сопоставимы напрямую с коротким
+CPU-only control run, поэтому универсальный процент ускорения не заявляется.
 
 ### Apple silicon / Metal
 
@@ -195,8 +249,11 @@ CMF_GPU=1 RUST_LOG=info \
 
 По логу убедитесь, какой backend включился, затем измерьте именно
 опубликованный файл на целевой машине. Успешная CPU-проверка или конвертация
-не является бенчмарком Metal. Для длинных промптов дополнительно учитывайте
-KV-cache full-attention слоёв.
+не является бенчмарком Metal. `CMF_METAL_SPARSE_MOE=1` — экспериментальный
+явный q4tp selected-view путь: router остаётся на CPU, а при admission/completion
+ошибке выполняется обычный путь. Это не заявление о whole-model скорости
+Metal. Для длинных промптов дополнительно учитывайте KV-cache full-attention
+слоёв.
 
 ### Границы поддержки
 
