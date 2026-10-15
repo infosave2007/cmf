@@ -6077,6 +6077,212 @@ kernel void q4tp_moe_down_m(
     }
 }
 
+// Exact-nine direct no-copy views for MiniCPM-V-4.7's top-8 plus shared
+// expert block.  The ordinary jobs kernels address a contiguous WeightArena;
+// these twins keep the same q4tp arithmetic but bind each routed tensor
+// directly, so fragmented CMF order never turns a 2 MiB expert into a GiB
+// Metal view.
+inline device const uchar* moe_view9(uint i,
+                                     device const uchar* q0,
+                                     device const uchar* q1,
+                                     device const uchar* q2,
+                                     device const uchar* q3,
+                                     device const uchar* q4,
+                                     device const uchar* q5,
+                                     device const uchar* q6,
+                                     device const uchar* q7,
+                                     device const uchar* q8) {
+    switch (i) {
+        case 0u: return q0;
+        case 1u: return q1;
+        case 2u: return q2;
+        case 3u: return q3;
+        case 4u: return q4;
+        case 5u: return q5;
+        case 6u: return q6;
+        case 7u: return q7;
+        default: return q8;
+    }
+}
+
+// Fused gate/up/SiLU for nine direct q4tp views.  It is the exact-nine
+// addressing twin of q4tp_moe_gu_m; one dispatch replaces nine GU dispatches.
+kernel void q4tp_moe_gu_views9(
+    device const uchar*  g0      [[buffer(0)]],
+    device const uchar*  g1      [[buffer(1)]],
+    device const uchar*  g2      [[buffer(2)]],
+    device const uchar*  g3      [[buffer(3)]],
+    device const uchar*  g4      [[buffer(4)]],
+    device const uchar*  g5      [[buffer(5)]],
+    device const uchar*  g6      [[buffer(6)]],
+    device const uchar*  g7      [[buffer(7)]],
+    device const uchar*  g8      [[buffer(8)]],
+    device const uchar*  u0      [[buffer(9)]],
+    device const uchar*  u1      [[buffer(10)]],
+    device const uchar*  u2      [[buffer(11)]],
+    device const uchar*  u3      [[buffer(12)]],
+    device const uchar*  u4      [[buffer(13)]],
+    device const uchar*  u5      [[buffer(14)]],
+    device const uchar*  u6      [[buffer(15)]],
+    device const uchar*  u7      [[buffer(16)]],
+    device const uchar*  u8      [[buffer(17)]],
+    device const float*  x       [[buffer(18)]],
+    device float*        act     [[buffer(19)]],
+    constant uint&       gpr     [[buffer(20)]],
+    constant uint&       rows    [[buffer(21)]],
+    constant uint&       tg_per  [[buffer(22)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    threadgroup float lad[8u * 8u * 32u];
+    uint j   = tgpos / tg_per;
+    uint tgl = tgpos - j * tg_per;
+    // The host submits exactly 9*tg_per threadgroups.  Preserve a hard
+    // guard nevertheless, so a malformed dispatch never aliases q8.
+    if (j >= 9u) return;
+    device const uchar* qg = moe_view9(j, g0, g1, g2, g3, g4, g5, g6, g7, g8);
+    device const uchar* qu = moe_view9(j, u0, u1, u2, u3, u4, u5, u6, u7, u8);
+    device float* aj = act + (ulong)j * (ulong)rows;
+    uint r0 = (tgl * sgs + sg) * 4u;
+    bool active = r0 < rows;
+    uint nr = active ? min(rows - r0, 4u) : 0u;
+    ulong params_off = (ulong)rows * (ulong)gpr * 16ul;
+    ulong codes_off  = params_off + (ulong)rows * 4ul;
+    uint  stride     = (gpr * 5u + 7u) / 8u;
+    for (uint ri = 0u; ri < nr; ++ri) {
+        device const half* pg = (device const half*)(qg + params_off + (ulong)(r0 + ri) * 4ul);
+        device const half* pu = (device const half*)(qu + params_off + (ulong)(r0 + ri) * 4ul);
+        lad[(sg * 8u + ri) * 32u + lane] = exp2((float)pg[0] + (float)lane * (float)pg[1]);
+        lad[(sg * 8u + 4u + ri) * 32u + lane] = exp2((float)pu[0] + (float)lane * (float)pu[1]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!active) return;
+    const float4 sc = float4(1.0f, 1.0f / 16.0f, 1.0f / 256.0f, 1.0f / 4096.0f);
+    float ag0 = 0.0f, ag1 = 0.0f, ag2 = 0.0f, ag3 = 0.0f;
+    float au0 = 0.0f, au1 = 0.0f, au2 = 0.0f, au3 = 0.0f;
+    for (uint g = lane; g < gpr; g += 32u) {
+        device const float4* xv = (device const float4*)(x + g * 32u);
+        float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+        float4 x4 = xv[4], x5 = xv[5], x6 = xv[6], x7 = xv[7];
+        float4 s4 = x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+        float m8 = -8.0f * (s4.x + s4.y + s4.z + s4.w);
+        x0 *= sc; x1 *= sc; x2 *= sc; x3 *= sc; x4 *= sc; x5 *= sc; x6 *= sc; x7 *= sc;
+        uint bit = g * 5u;
+        uint cb  = bit >> 3u;
+        uint shf = bit & 7u;
+        for (uint jj = 0u; jj < 2u * nr; ++jj) {
+            uint ri = jj >> 1u;
+            bool up = (jj & 1u) != 0u;
+            device const uchar* qq = up ? qu : qg;
+            uint r = r0 + ri;
+            uint4 b = *(device const uint4*)(qq + ((ulong)r * gpr + (ulong)g) * 16ul);
+            device const uchar* cp = qq + codes_off + (ulong)r * (ulong)stride + cb;
+            uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
+            float scale = lad[(sg * 8u + (up ? 4u : 0u) + ri) * 32u + code];
+            float gsum = dot(q4_nib4_scaled(b.x), x0) + dot(q4_nib4_scaled(b.x >> 16), x1)
+                       + dot(q4_nib4_scaled(b.y), x2) + dot(q4_nib4_scaled(b.y >> 16), x3)
+                       + dot(q4_nib4_scaled(b.z), x4) + dot(q4_nib4_scaled(b.z >> 16), x5)
+                       + dot(q4_nib4_scaled(b.w), x6) + dot(q4_nib4_scaled(b.w >> 16), x7);
+            float contrib = scale * (gsum + m8);
+            if (jj == 0u) ag0 += contrib;
+            else if (jj == 1u) au0 += contrib;
+            else if (jj == 2u) ag1 += contrib;
+            else if (jj == 3u) au1 += contrib;
+            else if (jj == 4u) ag2 += contrib;
+            else if (jj == 5u) au2 += contrib;
+            else if (jj == 6u) ag3 += contrib;
+            else au3 += contrib;
+        }
+    }
+    ag0 = simd_sum(ag0); ag1 = simd_sum(ag1); ag2 = simd_sum(ag2); ag3 = simd_sum(ag3);
+    au0 = simd_sum(au0); au1 = simd_sum(au1); au2 = simd_sum(au2); au3 = simd_sum(au3);
+    if (lane == 0u) {
+        float gv = ag0;
+        aj[r0] = (gv / (1.0f + exp(-gv))) * au0;
+        if (nr > 1u) { gv = ag1; aj[r0 + 1u] = (gv / (1.0f + exp(-gv))) * au1; }
+        if (nr > 2u) { gv = ag2; aj[r0 + 2u] = (gv / (1.0f + exp(-gv))) * au2; }
+        if (nr > 3u) { gv = ag3; aj[r0 + 3u] = (gv / (1.0f + exp(-gv))) * au3; }
+    }
+}
+
+// Nine direct down views plus the ordered weighted reduction.  This is the
+// no-residual twin of q4tp_moe_down_m: `out` is the MoE result, not h += out.
+kernel void q4tp_moe_down_views9(
+    device const uchar*  d0      [[buffer(0)]],
+    device const uchar*  d1      [[buffer(1)]],
+    device const uchar*  d2      [[buffer(2)]],
+    device const uchar*  d3      [[buffer(3)]],
+    device const uchar*  d4      [[buffer(4)]],
+    device const uchar*  d5      [[buffer(5)]],
+    device const uchar*  d6      [[buffer(6)]],
+    device const uchar*  d7      [[buffer(7)]],
+    device const uchar*  d8      [[buffer(8)]],
+    device const float*  a       [[buffer(9)]],
+    device float*        out     [[buffer(10)]],
+    device const float*  wmix    [[buffer(11)]],
+    constant uint&       gpr     [[buffer(12)]],
+    constant uint&       rows    [[buffer(13)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    uint r0 = (tgpos * sgs + sg) * 4u;
+    if (r0 >= rows) return;
+    uint nr = min(rows - r0, 4u);
+    ulong params_off = (ulong)rows * (ulong)gpr * 16ul;
+    ulong codes_off  = params_off + (ulong)rows * 4ul;
+    uint  stride     = (gpr * 5u + 7u) / 8u;
+    const float4 sc = float4(1.0f, 1.0f / 16.0f, 1.0f / 256.0f, 1.0f / 4096.0f);
+    float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+    for (uint e = 0u; e < 9u; ++e) {
+        device const uchar* qe = moe_view9(e, d0, d1, d2, d3, d4, d5, d6, d7, d8);
+        device const float* xe = a + (ulong)e * (ulong)gpr * 32ul;
+        float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+        for (uint g = lane; g < gpr; g += 32u) {
+            device const float4* xv = (device const float4*)(xe + g * 32u);
+            float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+            float4 x4 = xv[4], x5 = xv[5], x6 = xv[6], x7 = xv[7];
+            float4 s4 = x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+            float m8 = -8.0f * (s4.x + s4.y + s4.z + s4.w);
+            x0 *= sc; x1 *= sc; x2 *= sc; x3 *= sc; x4 *= sc; x5 *= sc; x6 *= sc; x7 *= sc;
+            uint bit = g * 5u;
+            uint cb  = bit >> 3u;
+            uint shf = bit & 7u;
+            for (uint ri = 0u; ri < nr; ++ri) {
+                uint r = r0 + ri;
+                uint4 b = *(device const uint4*)(qe + ((ulong)r * gpr + (ulong)g) * 16ul);
+                device const uchar* cp = qe + codes_off + (ulong)r * (ulong)stride + cb;
+                uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
+                device const half* ph = (device const half*)(qe + params_off + (ulong)r * 4ul);
+                float scale = exp2((float)ph[0] + (float)code * (float)ph[1]);
+                float gsum = dot(q4_nib4_scaled(b.x), x0) + dot(q4_nib4_scaled(b.x >> 16), x1)
+                           + dot(q4_nib4_scaled(b.y), x2) + dot(q4_nib4_scaled(b.y >> 16), x3)
+                           + dot(q4_nib4_scaled(b.z), x4) + dot(q4_nib4_scaled(b.z >> 16), x5)
+                           + dot(q4_nib4_scaled(b.w), x6) + dot(q4_nib4_scaled(b.w >> 16), x7);
+                float contrib = scale * (gsum + m8);
+                if (ri == 0u) acc0 += contrib;
+                else if (ri == 1u) acc1 += contrib;
+                else if (ri == 2u) acc2 += contrib;
+                else acc3 += contrib;
+            }
+        }
+        acc0 = simd_sum(acc0); acc1 = simd_sum(acc1);
+        acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+        float we = wmix[e];
+        o0 += we * acc0; o1 += we * acc1; o2 += we * acc2; o3 += we * acc3;
+    }
+    if (lane == 0u) {
+        out[r0] = o0;
+        if (nr > 1u) out[r0 + 1u] = o1;
+        if (nr > 2u) out[r0 + 2u] = o2;
+        if (nr > 3u) out[r0 + 3u] = o3;
+    }
+}
+
+
 // MEASURED NEUTRAL (M4, Lumina DiT 512² and the Nanbeige chunk prefill):
 // giving these two kernels q8_mul_mm's cols/rows function-constant
 // specialization changed nothing — paired runs at matched thermal state
@@ -7182,6 +7388,10 @@ struct Ctx {
     moe_gu_m: ComputePipelineState,
     /// Routed experts' down + weighted mix + residual in one pass.
     moe_dn_m: ComputePipelineState,
+    /// Exact-nine direct q4tp views: fused gate/up/SiLU.
+    moe_gu_views9: ComputePipelineState,
+    /// Exact-nine direct q4tp views: fused down plus ordered mix.
+    moe_dn_views9: ComputePipelineState,
     moesilu: ComputePipelineState,
     moered: ComputePipelineState,
     q4tmm: ComputePipelineState,
@@ -7433,6 +7643,8 @@ fn init() -> Result<Ctx, String> {
     let moesel_sg = pso("moe_topk_select_sg")?;
     let moe_gu_m = pso("q4tp_moe_gu_m")?;
     let moe_dn_m = pso("q4tp_moe_down_m")?;
+    let moe_gu_views9 = pso("q4tp_moe_gu_views9")?;
+    let moe_dn_views9 = pso("q4tp_moe_down_views9")?;
     let moesilu = pso("moe_silu_jobs")?;
     let moered = pso("moe_reduce_jobs")?;
     let q4tmm = pso("q4t_mul_mm")?;
@@ -7554,6 +7766,8 @@ fn init() -> Result<Ctx, String> {
         moesel_sg,
         moe_gu_m,
         moe_dn_m,
+        moe_gu_views9,
+        moe_dn_views9,
         moesilu,
         moered,
         q4tmm,
@@ -13584,6 +13798,440 @@ fn moe_jobs_batchable(jobs: &[MoeJob]) -> bool {
     })
 }
 
+/// Result of trying the no-copy selected-view path for a MoE block.
+///
+/// `Declined` deliberately differs from `NotApplicable`: on a model whose
+/// complete mmap is already bigger than Metal's recommended working set, the
+/// legacy arena would recreate the very whole-file binding the selected-view
+/// path is meant to avoid. Such a block must take the exact CPU fallback, not
+/// retry the unsafe broad binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SparseMoeResult {
+    NotApplicable,
+    Ran,
+    Declined,
+}
+
+/// Completed selected-view MoE blocks and the page-rounded Metal ranges they
+/// bound. These counters make a benchmark prove that it exercised the pager
+/// rather than silently taking the CPU fallback.
+pub static SPARSE_MOE_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPARSE_MOE_SPAN_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// A page-rounded no-copy view over exactly one routed q4tp tensor. `offset`
+/// advances from the page boundary to the tensor payload, so q4tp's required
+/// 16-byte payload alignment is preserved without making a buffer over the
+/// gap to any neighbouring tensor.
+struct SparseMoeView {
+    buffer: Buffer,
+    offset: u64,
+}
+
+struct SparseMoeViews {
+    gate: SparseMoeView,
+    up: SparseMoeView,
+    down: SparseMoeView,
+}
+
+#[derive(Clone, Copy)]
+struct SparseMoeRange {
+    start: usize,
+    end: usize,
+    offset: u64,
+}
+
+impl SparseMoeRange {
+    fn span_bytes(self) -> usize {
+        self.end - self.start
+    }
+}
+
+/// `CMF_METAL_SPARSE_MOE=1` opts into the selected q4tp view pager. It is
+/// deliberately diagnostic until cold/warm parity and throughput gates show
+/// that 40 host-routed waits beat the CPU on a given UMA machine; ordinary
+/// models keep the proven resident WeightArena route.
+fn sparse_moe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("CMF_METAL_SPARSE_MOE").as_deref(),
+            Ok("1") | Ok("on") | Ok("true")
+        )
+    })
+}
+
+/// Conservative cap for the page-rounded no-copy *views*, not q4tp payload
+/// bytes. A top-8 plus shared MiniCPM block normally binds about 18 MiB: the
+/// cap leaves room for page rounding and unusual expert shapes but prevents a
+/// malformed directory from turning the selected-view path into a broad mmap
+/// binding. An experiment may set `CMF_METAL_SPARSE_MOE_MAX_MB`; an invalid
+/// value never widens the default.
+fn sparse_moe_span_cap_bytes() -> usize {
+    const DEFAULT: usize = 128 << 20;
+    std::env::var("CMF_METAL_SPARSE_MOE_MAX_MB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .and_then(|mb| mb.checked_mul(1 << 20))
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT)
+}
+
+/// Validate the primary-shard q4tp tensor and form the smallest page-aligned
+/// range `new_buffer_with_bytes_no_copy` accepts for it.
+fn sparse_moe_range(
+    model: &CmfModel,
+    idx: usize,
+    rows: usize,
+    cols: usize,
+    page: usize,
+    safe_len: usize,
+) -> Option<SparseMoeRange> {
+    if cols % GROUP_SIZE != 0 {
+        return None;
+    }
+    let entry = model.tensors.get(idx)?;
+    if entry.shard != 0
+        || entry.dtype != cortiq_core::TensorDtype::Q4TiledP
+        || entry.shape.as_slice() != [rows, cols]
+    {
+        return None;
+    }
+    let qlen = cortiq_core::quant::expected_nbytes(
+        cortiq_core::TensorDtype::Q4TiledP,
+        &[rows, cols],
+    )?;
+    let abs = model.entry_abs_offset(entry)?;
+    let payload_end = abs.checked_add(qlen)?;
+    if entry.nbytes as usize != qlen || abs % 16 != 0 || payload_end > safe_len {
+        return None;
+    }
+    let start = abs / page * page;
+    let end = payload_end.checked_add(page - 1)? / page * page;
+    if end <= start || end > safe_len {
+        return None;
+    }
+    let offset = abs.checked_sub(start)?;
+    // The q4tp kernels read 16-byte tiles.  `abs % 16` above and an Apple
+    // page normally imply this already, but retain the property explicitly:
+    // a future non-standard page size must decline rather than misaligning a
+    // direct buffer binding.
+    if offset % 16 != 0 || offset >= end - start {
+        return None;
+    }
+    Some(SparseMoeRange {
+        start,
+        end,
+        offset: offset as u64,
+    })
+}
+
+/// Build a no-copy MTLBuffer from a previously validated page range. The
+/// caller owns the model Arc and all returned views until checked command
+/// buffer completion, so the mmap cannot be unmapped while Metal reads it.
+fn sparse_moe_view(
+    c: &Ctx,
+    base_ptr: usize,
+    range: SparseMoeRange,
+) -> Option<SparseMoeView> {
+    let span_bytes = range.span_bytes();
+    let ptr = base_ptr.checked_add(range.start)?;
+    let buffer = unsafe {
+        c._device.new_buffer_with_bytes_no_copy(
+            ptr as *const std::ffi::c_void,
+            span_bytes as u64,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        )
+    };
+    Some(SparseMoeView {
+        buffer,
+        offset: range.offset,
+    })
+}
+
+/// Run a uniform q4tp host-routed MoE block through 27 small, page-aligned
+/// no-copy tensor views instead of `file_buffer()`'s whole-model arena. The
+/// router has already chosen the exact experts on the host; no route is
+/// approximated and the normal CPU block remains the fallback.
+///
+/// Views are deliberately short-lived. Keeping every view seen by a 40-layer
+/// cyclic decode would gradually recreate the entire 18 GiB CMF in Metal's
+/// accounting; copying them into an UMA "expert cache" would merely consume
+/// the same memory a second time. MiniCPM's exact top-8 plus shared route
+/// uses two fused v9 dispatches (gate/up, then down+ordered mix); unusual
+/// routed counts retain the generic per-view ladder. Both choices trade a
+/// bounded ~18 MiB binding for host routing and one completion wait per MoE
+/// layer.
+fn try_moe_block_jobs_q4tp_sparse(
+    c: &Ctx,
+    model: &Arc<CmfModel>,
+    jobs: &[MoeJob],
+    out: &mut [f32],
+) -> SparseMoeResult {
+    if !sparse_moe_enabled() {
+        return SparseMoeResult::NotApplicable;
+    }
+    let working_set = working_set_bytes();
+    let model_bytes = model.primary_bytes().len() as u64;
+    if working_set == 0 || model_bytes <= working_set {
+        return SparseMoeResult::NotApplicable;
+    }
+
+    // This path is specialised for MiniCPM's q4tp SiLU top-8+shared block.
+    // Other dtypes retain their established implementation rather than being
+    // turned into an unexpected CPU-only path merely because their full model
+    // happens to exceed the recommended working set.
+    if jobs.iter().any(|j| j.gu_q2 || !j.q4tp || j.act != 0) {
+        return SparseMoeResult::NotApplicable;
+    }
+    if !moe_jobs_batchable(jobs)
+        || jobs.len() > 9
+        || jobs[0].down.2 != jobs[0].gate.1
+        || out.len() != jobs[0].down.1
+        || jobs[0].gate.1 == 0
+        || jobs[0].gate.2 == 0
+        || jobs[0].down.1 == 0
+        || jobs[0].gate.1 > u32::MAX as usize
+        || jobs[0].gate.2 > u32::MAX as usize
+        || jobs[0].down.1 > u32::MAX as usize
+    {
+        return SparseMoeResult::Declined;
+    }
+
+    let page = page_size();
+    let bytes = model.primary_bytes();
+    let safe_len = bytes.len() / page * page;
+    if safe_len == 0 || bytes.as_ptr() as usize % page != 0 {
+        return SparseMoeResult::Declined;
+    }
+
+    let mut ranges = Vec::with_capacity(jobs.len());
+    let mut bound_bytes = 0usize;
+    for job in jobs {
+        let (Some(gate), Some(up), Some(down)) = (
+            sparse_moe_range(model, job.gate.0, job.gate.1, job.gate.2, page, safe_len),
+            sparse_moe_range(model, job.up.0, job.up.1, job.up.2, page, safe_len),
+            sparse_moe_range(model, job.down.0, job.down.1, job.down.2, page, safe_len),
+        ) else {
+            return SparseMoeResult::Declined;
+        };
+        let Some(next) = bound_bytes
+            .checked_add(gate.span_bytes())
+            .and_then(|n| n.checked_add(up.span_bytes()))
+            .and_then(|n| n.checked_add(down.span_bytes()))
+        else {
+            return SparseMoeResult::Declined;
+        };
+        bound_bytes = next;
+        ranges.push((gate, up, down));
+    }
+    if bound_bytes > sparse_moe_span_cap_bytes()
+        || ranges.iter().flat_map(|(g, u, d)| [g, u, d]).any(|range| {
+            range.span_bytes() > c._device.max_buffer_length() as usize
+        })
+    {
+        tracing::debug!(
+            bound_bytes,
+            cap = sparse_moe_span_cap_bytes(),
+            "Metal selected MoE views declined by admission cap"
+        );
+        return SparseMoeResult::Declined;
+    }
+
+    let base_ptr = bytes.as_ptr() as usize;
+    let mut views = Vec::with_capacity(ranges.len());
+    for (gate, up, down) in ranges {
+        let (Some(gate), Some(up), Some(down)) = (
+            sparse_moe_view(c, base_ptr, gate),
+            sparse_moe_view(c, base_ptr, up),
+            sparse_moe_view(c, base_ptr, down),
+        ) else {
+            return SparseMoeResult::Declined;
+        };
+        views.push(SparseMoeViews { gate, up, down });
+    }
+
+    let ne = views.len();
+    let inter = jobs[0].gate.1;
+    let gcols = jobs[0].gate.2;
+    let hidden = jobs[0].down.1;
+    let get_io = |key: usize, nbytes: usize| -> Buffer {
+        let mut cache = c.io_bufs.lock().unwrap();
+        cache
+            .entry(io_key(key))
+            .or_insert_with(|| {
+                // Scratch is reusable; first allocation is a genuine probe
+                // warm-up. The short-lived no-copy views themselves are part
+                // of the steady out-of-core cost and do not call
+                // `probe_note_cold`.
+                crate::gpu::probe_note_cold();
+                c._device
+                    .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
+            })
+            .clone()
+    };
+    let wbuf = get_io(13_000_000_051 + ne, ne * 4);
+    let xbuf = get_io(14_000_000_059 + gcols, gcols * 4);
+    let abuf = get_io(16_000_000_069 + ne * inter, ne * inter * 4);
+    // MiniCPM-V-4.7 is exactly top-8 plus one shared expert.  Its v9
+    // kernels keep the selected views separate yet fuse each MoE stage, so
+    // skip the materialised per-expert down buffer altogether.  Retain the
+    // generic ladder for a diagnostic model with any other routed count.
+    let views9 = ne == 9;
+    let dbuf = if views9 {
+        None
+    } else {
+        Some(get_io(17_000_000_081 + ne * hidden, ne * hidden * 4))
+    };
+    let ybuf = get_io(18_000_000_099 + hidden, hidden * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            jobs[0].xs_gate.as_ptr(),
+            xbuf.contents() as *mut f32,
+            gcols,
+        );
+        let pw = wbuf.contents() as *mut f32;
+        for (i, job) in jobs.iter().enumerate() {
+            *pw.add(i) = job.w;
+        }
+    }
+
+    let cmd = c.queue.new_command_buffer();
+    if views9 {
+        // 1. All nine selected gate/up pairs in one dispatch.  The 18
+        // page-rounded bindings avoid the 0.1–2.6 GiB holes in this
+        // streaming-produced CMF's physical order without restoring nine
+        // command-encoder dispatches.
+        {
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&c.moe_gu_views9);
+            for (i, view) in views.iter().enumerate() {
+                let i = i as u64;
+                enc.set_buffer(i, Some(&view.gate.buffer), view.gate.offset);
+                enc.set_buffer(9 + i, Some(&view.up.buffer), view.up.offset);
+            }
+            enc.set_buffer(18, Some(&xbuf), 0);
+            enc.set_buffer(19, Some(&abuf), 0);
+            let (gpr_u, rows_u) = ((gcols / GROUP_SIZE) as u32, inter as u32);
+            let sgs = 4u64;
+            let tg_per = (inter as u64).div_ceil(sgs * 4);
+            let tg_per_u = tg_per as u32;
+            enc.set_bytes(20, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(21, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(22, 4, &tg_per_u as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(
+                MTLSize::new(tg_per * 9, 1, 1),
+                MTLSize::new(sgs * 32, 1, 1),
+            );
+            enc.end_encoding();
+        }
+        // 2. All nine down projections and the serial host-route order
+        // weighted mix in one dispatch.  `ybuf` is fully overwritten.
+        {
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&c.moe_dn_views9);
+            for (i, view) in views.iter().enumerate() {
+                enc.set_buffer(i as u64, Some(&view.down.buffer), view.down.offset);
+            }
+            enc.set_buffer(9, Some(&abuf), 0);
+            enc.set_buffer(10, Some(&ybuf), 0);
+            enc.set_buffer(11, Some(&wbuf), 0);
+            let (gpr_u, rows_u) = ((inter / GROUP_SIZE) as u32, hidden as u32);
+            let sgs = 4u64;
+            enc.set_bytes(12, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(13, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(
+                MTLSize::new((hidden as u64).div_ceil(sgs * 4), 1, 1),
+                MTLSize::new(sgs * 32, 1, 1),
+            );
+            enc.end_encoding();
+        }
+    } else {
+        let dbuf = dbuf.as_ref().expect("non-v9 selected MoE owns dbuf");
+        // Generic selected-view fallback: one gate/up and one down dispatch
+        // per expert, then the established ordered reduction.
+        {
+            let enc = cmd.new_compute_command_encoder();
+            let (gpr_u, rows_u) = ((gcols / GROUP_SIZE) as u32, inter as u32);
+            let sgs = 4u64;
+            let groups = (inter as u64).div_ceil(sgs * 4);
+            for (i, view) in views.iter().enumerate() {
+                enc.set_compute_pipeline_state(&c.q4tp_mgu);
+                enc.set_buffer(0, Some(&view.gate.buffer), view.gate.offset);
+                enc.set_buffer(1, Some(&xbuf), 0);
+                enc.set_buffer(2, Some(&abuf), (i * inter * 4) as u64);
+                enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+                enc.set_buffer(5, Some(&view.up.buffer), view.up.offset);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(groups, 1, 1),
+                    MTLSize::new(sgs * 32, 1, 1),
+                );
+            }
+            enc.end_encoding();
+        }
+        {
+            let enc = cmd.new_compute_command_encoder();
+            let (gpr_u, rows_u, addy) = ((inter / GROUP_SIZE) as u32, hidden as u32, 0u32);
+            let sgs = 4u64;
+            let groups = (hidden as u64).div_ceil(sgs * 4);
+            for (i, view) in views.iter().enumerate() {
+                enc.set_compute_pipeline_state(&c.q4tp_m);
+                enc.set_buffer(0, Some(&view.down.buffer), view.down.offset);
+                enc.set_buffer(1, Some(&abuf), (i * inter * 4) as u64);
+                enc.set_buffer(2, Some(dbuf), (i * hidden * 4) as u64);
+                enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(5, 4, &addy as *const u32 as *const std::ffi::c_void);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(groups, 1, 1),
+                    MTLSize::new(sgs * 32, 1, 1),
+                );
+            }
+            enc.end_encoding();
+        }
+        {
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&c.moered);
+            enc.set_buffer(0, Some(dbuf), 0);
+            enc.set_buffer(1, Some(&wbuf), 0);
+            enc.set_buffer(2, Some(&ybuf), 0);
+            let n_u = hidden as u32;
+            let ne_u = ne as u32;
+            enc.set_bytes(3, 4, &n_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(4, 4, &ne_u as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_threads(MTLSize::new(hidden as u64, 1, 1), MTLSize::new(256, 1, 1));
+            enc.end_encoding();
+        }
+    }
+    METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    cmd.commit();
+    if let Err(err) = wait_fast_checked(&cmd) {
+        tracing::warn!("metal q4tp selected-view MoE block failed: {err}");
+        return SparseMoeResult::Declined;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(ybuf.contents() as *const f32, out.as_mut_ptr(), hidden);
+    }
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SAID: AtomicBool = AtomicBool::new(false);
+    SPARSE_MOE_BLOCKS.fetch_add(1, Ordering::Relaxed);
+    SPARSE_MOE_SPAN_BYTES.fetch_add(bound_bytes as u64, Ordering::Relaxed);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            model_bytes,
+            working_set,
+            view_bytes = bound_bytes,
+            jobs = jobs.len(),
+            fused_views9 = views9,
+            "native Metal selected MoE views active"
+        );
+    }
+    SparseMoeResult::Ran
+}
+
 /// The whole expert block in four dispatches: gate+up for every expert,
 /// one fused SiLU, every down, one weighted reduce. `None` = a guard
 /// refused and the caller should walk the per-expert chain.
@@ -13726,7 +14374,13 @@ fn moe_block_jobs_q4tp(
     }
     METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     cmd.commit();
-    cmd.wait_until_completed();
+    if let Err(err) = wait_fast_checked(&cmd) {
+        // A caller may only read the shared y buffer after a successful
+        // completion. Returning `None` preserves the exact CPU fallback
+        // rather than exposing stale bytes after a memory-pressure error.
+        tracing::warn!("metal q4tp MoE block failed: {err}");
+        return None;
+    }
     unsafe {
         std::ptr::copy_nonoverlapping(ybuf.contents() as *const f32, out.as_mut_ptr(), hidden);
     }
@@ -13755,6 +14409,19 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
     if jobs.is_empty() {
         moe_block_refused("empty jobs");
         return false;
+    }
+    // On an oversized UMA model, never let the host-routed q4tp MoE path
+    // instantiate the legacy full-file arena before trying its selected
+    // short-lived views. `Declined` is an exact CPU fallback: retrying the
+    // legacy arena would bind the whole mapping and can turn a refusal into
+    // an OOM after some GPU work has already been enqueued.
+    match try_moe_block_jobs_q4tp_sparse(c, model, jobs, out) {
+        SparseMoeResult::Ran => return true,
+        SparseMoeResult::Declined => {
+            moe_block_refused("selected q4tp views");
+            return false;
+        }
+        SparseMoeResult::NotApplicable => {}
     }
     let _bytes = model.primary_bytes();
     let Some((fbuf, safe_len)) = file_buffer(c, model) else {
