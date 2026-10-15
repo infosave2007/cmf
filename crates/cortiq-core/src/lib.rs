@@ -13,7 +13,7 @@ pub mod types;
 pub use format::{
     AppendReport, CMF_MAGIC, CMF_VERSION, CmfError, CmfHeader, CmfModel, PendingAppend,
     RoutingCalibration, SelectionDescriptor, SkillRecord, SparseIndexEntry, TensorEntry,
-    TensorSpec, TensorSpecRef, build_sparse_index, mtp_sidecar_path,
+    TensorSpec, TensorSpecRef, build_sparse_index, dspark_sidecar_path, mtp_sidecar_path,
 };
 pub use hash::hash64;
 pub use knowledge::{

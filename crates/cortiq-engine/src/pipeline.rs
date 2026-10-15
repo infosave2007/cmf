@@ -111,6 +111,11 @@ pub struct Pipeline {
     /// MiMo-V2 expert placement (prefix / dynamic bank / hybrid), decided
     /// on the first forward — see `crate::mimo_moe`.
     pub(crate) mimo_moe: crate::mimo_moe::Slot,
+    /// Opt-in MiniCPM q4tp expert cache for a graph-produced CPU tail.
+    /// It is deliberately separate from MiMo's placement policy because it
+    /// serves only the stock MiniCPM top-8 geometry and otherwise falls back
+    /// to the ordinary exact host MoE path.
+    pub(crate) minicpm_tail: crate::minicpm_tail::MiniCpmTail,
     /// Linear-core geometry (present when the model has linear layers).
     pub vmf_cfg: Option<VmfPhaseCfg>,
     /// GatedDeltaNet geometry (faithful vendor operator).
@@ -2484,6 +2489,179 @@ impl Pipeline {
             Item::Gdn { run, .. } => run.iter().any(|l| matches!(l.ffn, MetalFfn::Moe(_))),
             Item::Attn { l, .. } => matches!(l.ffn, MetalFfn::Moe(_)),
         });
+        let metal_working_set = crate::gpu_metal::working_set_bytes();
+        let model_bytes = model.primary_bytes().len() as u64;
+        // An oversized MoE mmap normally has to decline: the jobs kernels
+        // bind all WeightArena windows.  The opt-in pager takes a different,
+        // bounded route: a *complete sequence of logical layers* is put in
+        // one transient no-copy page, graph-finished, dropped, then the outer
+        // layer loop calls us again for the next page.  That preserves exact
+        // hidden/GDN/KV handoff while replacing ~40 host-routed expert waits
+        // with a few page-boundary syncs.  Never use it for a fused-head NLL
+        // request: that contract explicitly requires a single whole graph.
+        let pager_cap = has_moe
+            .then(crate::gpu_metal::moe_pager_cap_bytes)
+            .flatten();
+        let pager_eligible = pager_cap.is_some()
+            && !self.graph_head_required
+            && metal_working_set != 0
+            && model_bytes > metal_working_set;
+        let mut pager_span: Option<(usize, usize)> = None;
+        if pager_eligible {
+            let cap = pager_cap.expect("checked above");
+            // When this page reaches the true model end, include the fused
+            // lm_head too.  Otherwise `lm_head_ok` would correctly refuse a
+            // binding outside the page after the layers had already run.
+            let tail_span = (self.graph_want_logits
+                && upto.is_none()
+                && scan == self.num_layers
+                && std::env::var("CMF_GPU_LMHEAD")
+                    .map(|v| v != "0")
+                    .unwrap_or(true))
+            .then(|| self.weights.lm_head.metal_graph_parts())
+            .flatten()
+            .and_then(|lm| crate::gpu_metal::model_tensor_span(&model, lm.0));
+            let add_layer_span = |span: Option<(usize, usize)>, li: usize| {
+                let (lo, hi) = crate::gpu_metal::model_layer_span(&model, self.phys_layer(li))?;
+                Some(match span {
+                    Some((cur_lo, cur_hi)) => (cur_lo.min(lo), cur_hi.max(hi)),
+                    None => (lo, hi),
+                })
+            };
+            let page_span = |span: (usize, usize), include_tail: bool| {
+                let (mut lo, mut hi) = span;
+                if include_tail {
+                    if let Some((tail_lo, tail_hi)) = tail_span {
+                        lo = lo.min(tail_lo);
+                        hi = hi.max(tail_hi);
+                    }
+                }
+                crate::gpu_metal::page_round_span(lo, hi)
+            };
+            let mut selected = 0usize;
+            let mut selected_span: Option<(usize, usize)> = None;
+            // `Item::Gdn` is built as a maximal run so the normal resident
+            // graph can batch its recurrent state work.  A physical CMF can
+            // nevertheless place that whole run across a page cap while each
+            // logical layer fits.  Split *only the final admitted run* at a
+            // layer boundary: the next outer-loop call rebuilds the remaining
+            // suffix, preserving hidden/state handoff and keeping the normal
+            // long-run batching within every page.
+            let mut gdn_prefix: Option<(usize, usize)> = None;
+            'items: for (i, item) in plan.iter().enumerate() {
+                match item {
+                    Item::Attn { li, .. } => {
+                        let Some(span) = add_layer_span(selected_span, *li) else {
+                            break;
+                        };
+                        let Some((page_lo, page_hi)) =
+                            page_span(span, i + 1 == plan.len())
+                        else {
+                            break;
+                        };
+                        if page_hi - page_lo > cap {
+                            break;
+                        }
+                        selected = i + 1;
+                        selected_span = Some((page_lo, page_hi));
+                    }
+                    Item::Gdn { first, run } => {
+                        // Preserve a complete recurrent run whenever it can
+                        // occupy a page on its own.  If the preceding items
+                        // merely used the remaining cap, close that page and
+                        // let the next q1 invocation retain the full run.
+                        // Prefix-splitting is only for a run that genuinely
+                        // cannot fit an empty page.
+                        let mut whole = None;
+                        for take in 1..=run.len() {
+                            whole = add_layer_span(whole, *first + take - 1);
+                            if whole.is_none() {
+                                break;
+                            }
+                        }
+                        let whole_fits_empty_page = whole
+                            .and_then(|span| page_span(span, false))
+                            .is_some_and(|(lo, hi)| hi - lo <= cap);
+                        if whole_fits_empty_page {
+                            let mut span = selected_span;
+                            for take in 1..=run.len() {
+                                let Some(next) = add_layer_span(span, *first + take - 1) else {
+                                    break 'items;
+                                };
+                                span = Some(next);
+                            }
+                            let Some(span) = span else {
+                                break;
+                            };
+                            let Some((page_lo, page_hi)) =
+                                page_span(span, i + 1 == plan.len())
+                            else {
+                                break;
+                            };
+                            if page_hi - page_lo > cap {
+                                break;
+                            }
+                            selected = i + 1;
+                            selected_span = Some((page_lo, page_hi));
+                            continue;
+                        }
+                        if selected != 0 {
+                            break;
+                        }
+                        let mut span = None;
+                        let mut best: Option<(usize, (usize, usize))> = None;
+                        for take in 1..=run.len() {
+                            let Some(next) = add_layer_span(span, *first + take - 1) else {
+                                break;
+                            };
+                            // A partial final run cannot encode the lm_head;
+                            // only its complete form above may include it.
+                            let Some((page_lo, page_hi)) = page_span(next, false) else {
+                                break;
+                            };
+                            if page_hi - page_lo > cap {
+                                break;
+                            }
+                            span = Some((page_lo, page_hi));
+                            best = Some((take, (page_lo, page_hi)));
+                        }
+                        let Some((take, page)) = best else {
+                            break;
+                        };
+                        selected = i + 1;
+                        selected_span = Some(page);
+                        if take != run.len() {
+                            gdn_prefix = Some((i, take));
+                            break 'items;
+                        }
+                    }
+                }
+            }
+            if selected != 0 {
+                if let Some((item, take)) = gdn_prefix {
+                    match &mut plan[item] {
+                        Item::Gdn { run, .. } => run.truncate(take),
+                        Item::Attn { .. } => unreachable!("only a GDN run is splittable"),
+                    }
+                }
+                let (page_lo, page_hi) = selected_span.expect("selected page span");
+                tracing::info!(
+                    page_start = page_lo,
+                    page_end = page_hi,
+                    page_mb = (page_hi - page_lo) / (1024 * 1024),
+                    cap_mb = cap / (1024 * 1024),
+                    graph_items = selected,
+                    "native Metal MoE graph uses transient bounded weight page"
+                );
+                plan.truncate(selected);
+                pager_span = Some((page_lo, page_hi));
+            } else {
+                tracing::warn!(
+                    cap_mb = cap / (1024 * 1024),
+                    "native Metal MoE pager declined: one graph item does not fit its safe page cap"
+                );
+            }
+        }
         // A native MoE graph binds every WeightArena window to its jobs
         // kernels. On UMA, an mmap that already exceeds the driver's
         // recommended working set will therefore fail after admission, when
@@ -2492,9 +2670,11 @@ impl Pipeline {
         // route remains available and only materializes the needed window.
         // Do not apply this to dense graphs: they bind one projection at a
         // time and do not have the MoE jobs' all-window lifetime.
-        let metal_working_set = crate::gpu_metal::working_set_bytes();
-        let model_bytes = model.primary_bytes().len() as u64;
-        if has_moe && metal_working_set != 0 && model_bytes > metal_working_set {
+        if has_moe
+            && metal_working_set != 0
+            && model_bytes > metal_working_set
+            && pager_span.is_none()
+        {
             tracing::info!(
                 model_bytes,
                 metal_working_set,
@@ -2562,7 +2742,27 @@ impl Pipeline {
             eps: self.rms_eps as f32,
             gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
         };
-        let Some(mut graph) = TokenGraph::new(&model, dims, h) else {
+        // The outer `forward_layers_span` scope is one logical token.  This
+        // guard starts at q1_graph_gpu entry and ends after all page readback,
+        // so a multi-page token cannot be reported as several whole tokens.
+        let mut pager_profile_page = pager_span.map(|(page_lo, page_hi)| {
+            crate::gpu_metal::MoePagerPageScope::new(
+                _mt0,
+                position,
+                start,
+                page_lo,
+                page_hi,
+                // `pager_span` is selected only after a cap was admitted;
+                // keep the profiler observational if that invariant is ever
+                // loosened rather than introducing a new inference panic.
+                pager_cap.unwrap_or(0),
+            )
+        });
+        let graph_new = match pager_span {
+            Some((page_lo, page_hi)) => TokenGraph::new_paged(&model, dims, h, page_lo, page_hi),
+            None => TokenGraph::new(&model, dims, h),
+        };
+        let Some(mut graph) = graph_new else {
             if self.graph_head_required {
                 self.fail_metal_graph("native TokenGraph allocation refused");
             }
@@ -3107,6 +3307,9 @@ impl Pipeline {
         }
         let _sy0 = std::time::Instant::now();
         if let Err(err) = graph.sync_checked() {
+            if let Some(profile) = pager_profile_page.as_mut() {
+                profile.finish(start, graph.pager_page_stats(), "sync-error");
+            }
             self.fail_metal_graph(&err);
             return start;
         }
@@ -3182,6 +3385,9 @@ impl Pipeline {
             attention::recycle_buf(&mut krow);
             attention::recycle_buf(&mut vrow);
         }
+        if let Some(profile) = pager_profile_page.as_mut() {
+            profile.finish(end, graph.pager_page_stats(), "page-complete");
+        }
         if let Some((_, arm)) = ab {
             crate::gpu_metal::dense_ab_record(arm, _mt0.elapsed());
         }
@@ -3252,6 +3458,7 @@ impl Pipeline {
                 .map(std::path::PathBuf::from),
             graph_declines: std::cell::RefCell::new(Vec::new()),
             mimo_moe: Default::default(),
+            minicpm_tail: Default::default(),
             vmf_cfg: None,
             gdn_cfg: None,
             kda_cfg: None,
@@ -7852,6 +8059,22 @@ impl Pipeline {
         if !self.pair_supported() {
             return (0.0, 0.0);
         }
+        // A GDN model that needs an automatic device prefix never uses this
+        // fused-pair path in normal generation: its recurrence is serial and
+        // the speculative pair is disabled by default.  More importantly,
+        // this diagnostic suppresses the token graph, so measuring it would
+        // stream the non-resident tail through per-op Vulkan just to print a
+        // non-production number.  Leave inference untouched and report the
+        // established unavailable sentinel instead.
+        if self.gdn_cfg.is_some()
+            && self.graph_prefill_preferred()
+            && self.automatic_gpu_prefix().is_some()
+        {
+            tracing::info!(
+                "pair micro-benchmark skipped: GDN device-prefix path has no production pair route"
+            );
+            return (0.0, 0.0);
+        }
         // This is a host-side pair micro-benchmark. It truncates the host KV
         // after every probe, so letting the whole-token graph participate
         // would leave its device GDN/KV mirror ahead of the next probe and
@@ -7931,8 +8154,21 @@ impl Pipeline {
             self.rms_eps,
         );
         let pool = self.pool.clone();
+        // `forward_pair` bypasses `forward_layers_span`, but its per-op
+        // body must still obey the ordinary layer placement. In particular,
+        // an over-capacity Vulkan model has a device prefix and a CPU tail;
+        // letting the pair walk submit the tail's selected MoE experts would
+        // stream the whole tail through the residency arena and defeat the
+        // measured VRAM bound.
+        let automatic_gpu_prefix = self.automatic_gpu_prefix();
 
         for li in 0..self.num_layers {
+            let _capacity_tail = automatic_gpu_prefix
+                .filter(|&prefix| li >= prefix && !self.mimo_moe.is_dynamic(li, false))
+                .map(|_| crate::gpu::enter_cpu_scope());
+            // Also makes an explicit CMF_GPU_LAYERS split apply to fused
+            // pairs, just as it does to the ordinary layer walk.
+            crate::gpu::set_layer(li as i64);
             let lw = &self.weights.layers[self.phys_layer(li)];
             // Norms into pipeline scratch (4 allocs/layer on the MTP
             // decode hot path before this).
@@ -8181,6 +8417,7 @@ impl Pipeline {
                 );
             }
         }
+        crate::gpu::set_layer(-1); // final/O(1) work is outside layer placement
         // Real O(1) prefill pairs may also carry tentative lane-2 recurrent
         // state. Commit it before publishing the transition epoch so the
         // next serial/device row cannot observe a new attention epoch with an
@@ -15226,6 +15463,12 @@ impl Pipeline {
         from: usize,
         upto: Option<usize>,
     ) -> Vec<f32> {
+        #[cfg(target_os = "macos")]
+        let _metal_pager_token_prof = crate::gpu_metal::MoePagerTokenScope::new(
+            position,
+            from,
+            upto.map_or(self.num_layers, |u| u.saturating_add(1)),
+        );
         debug_assert!(
             from == 0
                 || (self.dsv4.is_none()
@@ -16091,6 +16334,21 @@ impl Pipeline {
                         self.norm_style,
                         self.pool.as_deref(),
                     ),
+                    FfnKind::Moe(m)
+                        if task_mask.is_none()
+                            && host_tail
+                            && li >= tail_start
+                            && crate::minicpm_tail::MiniCpmTail::is_requested_target(m) =>
+                    {
+                        moe_ffn_minicpm_tail(
+                            &mut self.minicpm_tail,
+                            li,
+                            self.num_layers,
+                            m,
+                            post_normed,
+                            self.pool.as_deref(),
+                        )
+                    }
                     FfnKind::Moe(m)
                         if task_mask.is_none() && self.mimo_moe.is_dynamic(li, host_tail) =>
                     {
@@ -18966,21 +19224,22 @@ pub(crate) fn moe_ffn_experts(
     let (idx, p, wsum) = (&r.idx, &r.p, r.wsum);
     // D5: the whole layer MoE block in one GPU command buffer (experts — the
     // same mmap via a no-copy buffer; intermediate activations on the GPU).
-    // Same Ffn probe class as the dense chain: one submit per layer
-    // either wins on this driver stack or it doesn't.
+    // MoE owns a separate probe class from dense FFN: its selected-span pager
+    // has materially different residency and latency costs.
     if crate::gpu::enabled_here() {
-        match crate::gpu::probe_arm(crate::gpu::OpClass::Ffn) {
+        match crate::gpu::probe_arm(crate::gpu::OpClass::Moe) {
             crate::gpu::ProbeArm::Gpu => {
                 let t0 = std::time::Instant::now();
                 if let Some(out) = moe_ffn_gpu(m, x, &idx, &p, wsum, pool) {
-                    crate::gpu::probe_record(crate::gpu::OpClass::Ffn, true, t0.elapsed());
+                    crate::gpu::probe_record(crate::gpu::OpClass::Moe, true, t0.elapsed());
                     return out;
                 }
+                crate::gpu::probe_note_decline(crate::gpu::OpClass::Moe);
             }
             crate::gpu::ProbeArm::CpuTimed => {
                 let t0 = std::time::Instant::now();
                 let out = crate::gpu::cpu_scope(|| moe_ffn_cpu(m, x, &idx, &p, wsum, pool));
-                crate::gpu::probe_record(crate::gpu::OpClass::Ffn, false, t0.elapsed());
+                crate::gpu::probe_record(crate::gpu::OpClass::Moe, false, t0.elapsed());
                 return out;
             }
             crate::gpu::ProbeArm::Cpu => {
@@ -18989,6 +19248,28 @@ pub(crate) fn moe_ffn_experts(
         }
     }
     moe_ffn_cpu(m, x, &idx, &p, wsum, pool)
+}
+
+/// One MiniCPM CPU-tail MoE through its opt-in dynamic bank, or through the
+/// same-route host fallback.  The route is formed exactly once so statistics,
+/// tracing, and model semantics remain owned by `moe_ffn_route`.
+fn moe_ffn_minicpm_tail(
+    slot: &mut crate::minicpm_tail::MiniCpmTail,
+    li: usize,
+    total_layers: usize,
+    m: &MoeFfn,
+    x: &[f32],
+    pool: Option<&Pool>,
+) -> Vec<f32> {
+    let route = moe_ffn_route(m, x, pool, None);
+    match slot.forward(li, m, x, &route, pool, total_layers) {
+        Some(out) => out,
+        // A cache refusal must be observationally identical to the generic
+        // CPU-tail path. The surrounding host-tail scope already disables the
+        // per-op arena, so do not introduce a float-activation policy change
+        // merely because this explicit opt-in cache declined a model/layout.
+        None => moe_ffn_experts(m, x, &route, pool),
+    }
 }
 
 /// One MoE token through the MiMo expert bank (`crate::mimo_moe`), or —

@@ -250,6 +250,143 @@ pub(crate) struct QwenGpuPool {
     clock: u64,
 }
 
+/// An admission whose serial bookkeeping is complete but whose reserved
+/// expert fills have not run yet.
+///
+/// This is deliberately a narrow, consuming lease over [`QwenGpuPool`].  A
+/// caller may use [`Self::cold_ids`] only to overlap discardable host work
+/// with the fills.  It must call [`Self::finish`] before using any slot: a
+/// failed upload invalidates the whole admission and returns `None`.  Dropping
+/// an unfinished lease removes its unfilled reservations, so no stale logical
+/// slot can escape an abandoned overlap attempt.
+#[cfg(feature = "gpu")]
+#[must_use = "a pending admission must be finished or deliberately dropped"]
+pub(crate) struct QwenGpuPendingEnsure<'pool, 'input> {
+    pool: Option<&'pool mut QwenGpuPool>,
+    model: &'input Arc<CmfModel>,
+    picks: &'input [usize],
+    triples: &'input [(usize, usize, usize)],
+    layer: usize,
+    base: usize,
+    shared_slot: u32,
+    plan: Vec<(usize, usize)>,
+}
+
+#[cfg(feature = "gpu")]
+impl QwenGpuPendingEnsure<'_, '_> {
+    /// Routed picks which are definitely absent after reservation.  The
+    /// order is the caller's route order, including any duplicate input, so
+    /// it can be compared directly to the completed remap.
+    pub(crate) fn cold_ids(&self) -> Option<Vec<usize>> {
+        let pool = self.pool.as_deref()?;
+        cold_picks_from_slots(&pool.slot_for, self.base, pool.n_experts, self.picks)
+    }
+
+    /// Complete the reserved fills and return the same remap contract as
+    /// [`QwenGpuPool::ensure`].  This consumes the lease, ending its mutable
+    /// borrow of the pool before the caller submits uploads or encodes a
+    /// frame.
+    pub(crate) fn finish(self) -> Option<(Vec<u32>, u32)> {
+        self.finish_inner(false)
+            .map(|(remap, shared_slot, _)| (remap, shared_slot))
+    }
+
+    /// Complete the fills and submit any staged uploads before returning the
+    /// remap. This is for a caller whose next operation is a separate DSV4
+    /// frame rather than the generic Qwen frame that normally flushes itself.
+    /// The upload queue is flushed even when an admitted fill failed, matching
+    /// MiniCPM tail's existing failed-admission cleanup contract.
+    pub(crate) fn finish_and_flush(self) -> Option<(Vec<u32>, u32, usize)> {
+        self.finish_inner(true)
+    }
+
+    fn finish_inner(mut self, flush_uploads: bool) -> Option<(Vec<u32>, u32, usize)> {
+        // Taking the pool makes `Drop` a no-op. From this point this method
+        // owns the same cleanup responsibility as the old monolithic
+        // `ensure` implementation.
+        let pool = self.pool.take()?;
+        let model = self.model;
+        let triples = self.triples;
+        let layer = self.layer;
+        let base = self.base;
+        let shared_slot = self.shared_slot;
+        let plan = std::mem::take(&mut self.plan);
+        // phase 2: the uploads, in parallel (they were one after another:
+        // at a 12 GB budget that was the larger half of every token)
+        let ok = pool.run_fills(model, layer, &plan, triples, false);
+        let mut failed = false;
+        for (&(slot, e), ok) in plan.iter().zip(&ok) {
+            if !ok {
+                pool.owner[slot] = None;
+                pool.slot_for[base + e] = u32::MAX;
+                pool.occupancy[layer] = pool.occupancy[layer].saturating_sub(1);
+                pool.free.push(slot);
+                failed = true;
+            }
+        }
+        let result = if failed || triples.len() != pool.n_experts {
+            None
+        } else {
+            let remap = pool.slot_for[base..base + pool.n_experts].to_vec();
+            Some((remap, shared_slot, pool.segment_slots))
+        };
+        if flush_uploads {
+            pool.flush_uploads();
+        }
+        result
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl Drop for QwenGpuPendingEnsure<'_, '_> {
+    fn drop(&mut self) {
+        let Some(pool) = self.pool.as_deref_mut() else {
+            return;
+        };
+        // A lease can be discarded after its caller has started speculative
+        // CPU work but before any GPU bytes were written. Clear only the
+        // reservations still owned by this exact plan; an old evicted expert
+        // remains absent rather than being incorrectly remapped to bytes it
+        // no longer owns.
+        for &(slot, expert) in &self.plan {
+            let Some(key) = self.base.checked_add(expert) else {
+                continue;
+            };
+            if pool.owner.get(slot).copied().flatten() == Some((self.layer, expert))
+                && pool.slot_for.get(key) == Some(&(slot as u32))
+            {
+                pool.owner[slot] = None;
+                pool.slot_for[key] = u32::MAX;
+                if let Some(occupancy) = pool.occupancy.get_mut(self.layer) {
+                    *occupancy = occupancy.saturating_sub(1);
+                }
+                pool.free.push(slot);
+            }
+        }
+    }
+}
+
+/// Select misses from a post-reservation logical slot map in the exact route
+/// order.  Kept pure so an overlap caller can validate its optimistic host
+/// work without opening a GPU device.
+#[cfg(feature = "gpu")]
+fn cold_picks_from_slots(
+    slot_for: &[u32],
+    base: usize,
+    n_experts: usize,
+    picks: &[usize],
+) -> Option<Vec<usize>> {
+    let slots = slot_for.get(base..base.checked_add(n_experts)?)?;
+    let mut cold = Vec::with_capacity(picks.len());
+    for &expert in picks {
+        let slot = *slots.get(expert)?;
+        if slot == u32::MAX {
+            cold.push(expert);
+        }
+    }
+    Some(cold)
+}
+
 /// Parse a bounded pool percentage without allowing a malformed operator
 /// knob to turn into an unbounded allocation.  Kept pure so the Qwen and GLM
 /// policies can be regression-tested without initializing a GPU adapter.
@@ -265,6 +402,17 @@ fn bounded_pool_slots(raw: Option<&str>, safe: usize, cap_override: bool) -> usi
         .map(|v| if cap_override { v.min(safe) } else { v })
         .unwrap_or(safe)
         .max(floor)
+}
+
+/// Divide a resident arena only over layers that can actually reach it.
+///
+/// `floor` counts every owner, including a layer's pinned shared expert.  Do
+/// not round this up: when a deliberately small operator-provided arena has
+/// fewer slots than active layers, a larger floor would promise more protected
+/// slots than exist and turn the fallback into an accidental global policy.
+/// The caller's normal own-layer/global fallbacks still make progress at zero.
+fn active_layer_floor(capacity: usize, active_layers: usize) -> usize {
+    capacity / active_layers.max(1)
 }
 
 impl State {
@@ -397,6 +545,28 @@ impl QwenGpuPool {
                 .unwrap_or(pool.fetch_quota.max(16));
             pool
         })
+    }
+
+    /// Apply MiniCPM's narrow CPU-tail policy after generic construction.
+    /// Generic Qwen/device callers deliberately retain the constructor's
+    /// all-layer policy; MiniCPM knows that only its graph-produced tail can
+    /// touch this bank.
+    ///
+    /// The floor is policy-only: it never changes an admitted slot, router
+    /// score, route, or remap.  It merely changes which already-resident
+    /// routed expert is considered first for a future replacement.  The
+    /// two-worker admission default is likewise placement-only.  An explicit
+    /// `CMF_QWEN_ADMIT_THREADS` always wins, including an explicit `0`.
+    pub(crate) fn configure_minicpm_tail(&mut self, active_layers: usize) {
+        let layers = active_layers.clamp(1, self.occupancy.len().max(1));
+        self.floor = active_layer_floor(self.staging_base, layers);
+        if std::env::var_os("CMF_QWEN_ADMIT_THREADS").is_none() {
+            // MiniCPM's top-8 tail has only a handful of 1.7-MB admissions
+            // per layer.  The generic 16-worker Qwen default causes page
+            // fault/copy contention here; two parked workers leave the CPU
+            // cold-expert correction and the graph driver room to run.
+            self.admit_pool = Some(Arc::new(Pool::new(2)));
+        }
     }
 
     /// The MTP head's own bank: exactly `slots` slots (whole segments), no
@@ -612,6 +782,13 @@ impl QwenGpuPool {
     ) -> Vec<bool> {
         let t0 = std::time::Instant::now();
         let me = self;
+        // `current_device` is thread-local.  Unlike the persistent `Pool`
+        // path below (which propagates its descriptor's device), the scoped
+        // admission fallback creates fresh threads.  Preserve the caller's
+        // adapter there too: a fill on adapter 0 followed by a frame on
+        // adapter N would otherwise make a valid logical slot name stale
+        // physical bytes.
+        let device = crate::gpu::current_device();
         let out: Vec<bool> = if jobs.len() <= 1 {
             jobs.iter()
                 .map(|&(slot, e)| me.fill_slot(model, slot, layer, e, triples[e]))
@@ -643,9 +820,13 @@ impl QwenGpuPool {
                     .map(|part| {
                         let model = model.clone();
                         let h = scope.spawn(move || {
-                            part.iter()
-                                .map(|&(slot, e)| me.fill_slot(&model, slot, layer, e, triples[e]))
-                                .collect::<Vec<bool>>()
+                            crate::gpu::with_device(device, || {
+                                part.iter()
+                                    .map(|&(slot, e)| {
+                                        me.fill_slot(&model, slot, layer, e, triples[e])
+                                    })
+                                    .collect::<Vec<bool>>()
+                            })
                         });
                         (part.len(), h)
                     })
@@ -664,7 +845,11 @@ impl QwenGpuPool {
                     .map(|&(slot, e)| {
                         let model = model.clone();
                         let triple = triples[e];
-                        scope.spawn(move || me.fill_slot(&model, slot, layer, e, triple))
+                        scope.spawn(move || {
+                            crate::gpu::with_device(device, || {
+                                me.fill_slot(&model, slot, layer, e, triple)
+                            })
+                        })
                     })
                     .collect();
                 hs.into_iter().map(|h| h.join().unwrap_or(false)).collect()
@@ -1300,14 +1485,18 @@ impl QwenGpuPool {
         })
     }
 
-    pub(crate) fn ensure(
-        &mut self,
-        model: &Arc<CmfModel>,
+    /// Reserve slots for an admission without starting its potentially slow
+    /// fills.  Normal callers should use [`Self::ensure`]; this split form is
+    /// only for an exact caller that can overlap independent, discardable CPU
+    /// work with the fills and validates the completed remap before use.
+    pub(crate) fn begin_ensure<'pool, 'input>(
+        &'pool mut self,
+        model: &'input Arc<CmfModel>,
         layer: usize,
-        picks: &[usize],
-        triples: &[(usize, usize, usize)],
+        picks: &'input [usize],
+        triples: &'input [(usize, usize, usize)],
         shared: Option<(usize, usize, usize)>,
-    ) -> Option<(Vec<u32>, u32)> {
+    ) -> Option<QwenGpuPendingEnsure<'pool, 'input>> {
         self.clock = self.clock.saturating_add(1);
         let now = self.clock;
         let shared_slot = if let Some(triple) = shared {
@@ -1413,24 +1602,27 @@ impl QwenGpuPool {
             }
             plan.push((victim, expert));
         }
-        // phase 2: the uploads, in parallel (they were one after another:
-        // at a 12 GB budget that was the larger half of every token)
-        let ok = self.run_fills(model, layer, &plan, triples, false);
-        let mut failed = false;
-        for (&(slot, e), ok) in plan.iter().zip(&ok) {
-            if !ok {
-                self.owner[slot] = None;
-                self.slot_for[base + e] = u32::MAX;
-                self.occupancy[layer] = self.occupancy[layer].saturating_sub(1);
-                self.free.push(slot);
-                failed = true;
-            }
-        }
-        if failed || triples.len() != self.n_experts {
-            return None;
-        }
-        let remap = self.slot_for[base..base + self.n_experts].to_vec();
-        Some((remap, shared_slot))
+        Some(QwenGpuPendingEnsure {
+            pool: Some(self),
+            model,
+            picks,
+            triples,
+            layer,
+            base,
+            shared_slot,
+            plan,
+        })
+    }
+
+    pub(crate) fn ensure(
+        &mut self,
+        model: &Arc<CmfModel>,
+        layer: usize,
+        picks: &[usize],
+        triples: &[(usize, usize, usize)],
+        shared: Option<(usize, usize, usize)>,
+    ) -> Option<(Vec<u32>, u32)> {
+        self.begin_ensure(model, layer, picks, triples, shared)?.finish()
     }
 }
 
@@ -4666,6 +4858,18 @@ mod tests {
 
     #[cfg(feature = "gpu")]
     #[test]
+    fn pending_admission_cold_picks_keep_route_order() {
+        let slots = [3, u32::MAX, 7, u32::MAX, 11, u32::MAX, 13, u32::MAX];
+        assert_eq!(
+            cold_picks_from_slots(&slots, 4, 4, &[3, 1, 0, 1]),
+            Some(vec![3, 1, 1])
+        );
+        assert_eq!(cold_picks_from_slots(&slots, 4, 4, &[4]), None);
+        assert_eq!(cold_picks_from_slots(&slots, 5, 4, &[0]), None);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
     fn mtp_k_parses_and_clamps_to_the_frame() {
         assert_eq!(mtp_k(None), (3, false));
         for k in 1..=7 {
@@ -4692,6 +4896,20 @@ mod tests {
         assert_eq!(bounded_pool_pct(Some("90"), 75, 25, 85), 85);
         assert_eq!(bounded_pool_slots(Some("9999"), 752, true), 752);
         assert_eq!(bounded_pool_slots(Some("9999"), 752, false), 9999);
+    }
+
+    #[test]
+    fn active_tail_floor_uses_only_reachable_layers() {
+        // The MiniCPM 35B graph leaves 13 of 40 MoE layers in its CPU tail.
+        // A 512-slot arena therefore protects 39 owners per active layer,
+        // not the generic 12-owner all-layer floor.
+        assert_eq!(active_layer_floor(512, 40), 12);
+        assert_eq!(active_layer_floor(512, 13), 39);
+        assert!(active_layer_floor(512, 13) * 13 <= 512);
+        // Never over-promise protected residency on an intentionally tiny
+        // operator override.
+        assert_eq!(active_layer_floor(16, 13), 1);
+        assert_eq!(active_layer_floor(12, 13), 0);
     }
 
     #[test]
