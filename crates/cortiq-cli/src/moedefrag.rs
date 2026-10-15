@@ -39,12 +39,18 @@ fn router_layer(name: &str) -> Option<usize> {
 
 /// Plain container rewrite: reclaims the dead directory/header tails
 /// left by append-only skill growth (spec §9) and re-packs tensors
-/// tightly in directory order. Payloads stream from the source mmap
-/// (write_ref), so a 19 GB file compacts without RAM spikes.
-pub fn cmd_compact(model_path: &str, output: &str) -> anyhow::Result<()> {
+/// tightly in directory order by default. `execution_order` instead puts
+/// weights in decode traversal order, with every MoE expert's gate/up/down
+/// projections together. Payloads stream from the source mmap (`write_ref`),
+/// so a 19 GB file compacts without RAM spikes.
+pub fn cmd_compact(
+    model_path: &str,
+    output: &str,
+    execution_order: bool,
+) -> anyhow::Result<()> {
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
     crate::knowledge::refuse_genome_rewrite(&model, "compact")?;
-    let specs: Vec<TensorSpecRef> = model
+    let mut specs: Vec<TensorSpecRef> = model
         .tensors
         .iter()
         .map(|entry| TensorSpecRef {
@@ -54,21 +60,47 @@ pub fn cmd_compact(model_path: &str, output: &str) -> anyhow::Result<()> {
             data: model.entry_bytes(entry),
         })
         .collect();
+    if execution_order {
+        sort_specs_for_execution_order(&mut specs);
+    }
+
+    // `open_sharded` merges all source shards into one logical model, while
+    // `write_ref` emits exactly one standalone file. Retaining the first
+    // source shard's coordinates here would make the output look for sibling
+    // files that do not exist.
+    let mut header = model.header.clone();
+    header.shard = None;
     CmfModel::write_ref(
         output,
-        &model.header,
+        &header,
         &specs,
         Some(&model.masks),
         model.vocab.as_deref(),
     )?;
     let in_sz = std::fs::metadata(model_path)?.len() as f64 / 1e9;
     let out_sz = std::fs::metadata(output)?.len() as f64 / 1e9;
+    let layout = if execution_order {
+        " (execution order)"
+    } else {
+        ""
+    };
     println!(
-        "compact: {} tensors\n{model_path} {in_sz:.2} GB -> {output} {out_sz:.2} GB ({:+.1}%)",
+        "compact{layout}: {} tensors\n{model_path} {in_sz:.2} GB -> {output} {out_sz:.2} GB ({:+.1}%)",
         specs.len(),
         (out_sz / in_sz - 1.0) * 100.0
     );
     Ok(())
+}
+
+/// Order a compacted payload stream in the same deterministic traversal order
+/// used by conversion. Keep this separate from collection so the ordinary
+/// `compact` path preserves the source directory order byte-for-byte.
+fn sort_specs_for_execution_order(specs: &mut [TensorSpecRef<'_>]) {
+    specs.sort_by(|a, b| {
+        crate::convert::exec_order_key(&a.name)
+            .cmp(&crate::convert::exec_order_key(&b.name))
+            .then_with(|| a.name.cmp(&b.name))
+    });
 }
 
 /// Bake a task's expert restriction as a FIRST-CLASS task mask (spec
@@ -399,4 +431,53 @@ pub fn cmd_moe_defrag(
         (out_sz / in_sz - 1.0) * 100.0
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(name: &str) -> TensorSpecRef<'static> {
+        TensorSpecRef {
+            name: name.to_string(),
+            dtype: TensorDtype::F32,
+            shape: Vec::new(),
+            data: &[],
+        }
+    }
+
+    #[test]
+    fn compact_execution_order_groups_moe_expert_projections() {
+        let mut specs = vec![
+            spec("lm_head.weight"),
+            spec("model.layers.10.mlp.experts.1.up_proj.weight"),
+            spec("model.layers.2.mlp.experts.1.down_proj.weight"),
+            spec("model.layers.2.mlp.experts.0.up_proj.weight"),
+            spec("model.layers.2.mlp.experts.1.gate_proj.weight"),
+            spec("model.layers.2.mlp.experts.0.down_proj.weight"),
+            spec("model.layers.2.mlp.experts.0.gate_proj.weight"),
+            spec("model.layers.2.mlp.gate.weight"),
+            spec("model.embed_tokens.weight"),
+            spec("model.norm.weight"),
+        ];
+
+        sort_specs_for_execution_order(&mut specs);
+
+        let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "model.embed_tokens.weight",
+                "model.layers.2.mlp.gate.weight",
+                "model.layers.2.mlp.experts.0.gate_proj.weight",
+                "model.layers.2.mlp.experts.0.up_proj.weight",
+                "model.layers.2.mlp.experts.0.down_proj.weight",
+                "model.layers.2.mlp.experts.1.gate_proj.weight",
+                "model.layers.2.mlp.experts.1.down_proj.weight",
+                "model.layers.10.mlp.experts.1.up_proj.weight",
+                "model.norm.weight",
+                "lm_head.weight",
+            ]
+        );
+    }
 }
