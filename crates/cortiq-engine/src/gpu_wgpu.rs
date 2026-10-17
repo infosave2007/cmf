@@ -56,6 +56,9 @@ pub mod train_ops;
 pub mod train_mm;
 /// Trainer loss: frozen vocabulary head + KL against the teacher top-k.
 pub mod train_head;
+/// Device linear algebra of the NVG `blr` encoder (f32 GEMM, SPD solves,
+/// discrete-knot kernels).
+pub mod nvg_dev;
 
 /// Workgroup limit per dimension (WebGPU minimum; lm_head has more
 /// rows — we use grid-stride in the shader).
