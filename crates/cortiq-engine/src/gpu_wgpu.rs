@@ -47,6 +47,8 @@ pub(crate) mod gram;
 pub(crate) mod gptq_dev;
 /// GatedDeltaNet forward and BPTT backward on the device (training).
 pub mod gdn_train;
+/// Trainer kernels: RMSNorm, SwiGLU, gate, q/k norm + RoPE, attention.
+pub mod train_ops;
 
 /// Workgroup limit per dimension (WebGPU minimum; lm_head has more
 /// rows — we use grid-stride in the shader).
