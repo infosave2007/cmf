@@ -659,6 +659,190 @@ fn gdn_step(
     }
 }
 
+/// `CMF_GDN_SCAN=0`: the batched prefill walks `gdn_step` position by
+/// position (one pool barrier each) instead of [`gdn_scan_batch`].
+fn gdn_scan_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_GDN_SCAN").as_deref() != Ok("0"))
+}
+
+/// The recurrence of `b` consecutive positions in one pool dispatch per
+/// phase instead of one per position: the depthwise conv runs over the
+/// whole chunk first (channels split over the workers, each channel walking
+/// its positions in order through the same ring), then every worker takes
+/// whole heads and walks the positions in order. Per (position, head) the
+/// arithmetic is `gdn_step`'s, in the same order, so the outputs and the
+/// final state are bit-identical to `b` calls of it.
+///
+/// A 27B calibration chunk (512 positions × 48 GDN layers) paid ~25 k pool
+/// barriers per window for ~3 Mflop of work each; this pays two per layer.
+#[allow(clippy::too_many_arguments)]
+fn gdn_scan_batch(
+    qkv: &[f32],
+    z: &[f32],
+    a: &[f32],
+    bb: &[f32],
+    b: usize,
+    w: &GdnWeights,
+    cfg: &GdnCfg,
+    state: &mut [f32],
+    of: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    let (nv, nk, dk, dv, kk) = (
+        cfg.num_v_heads,
+        cfg.num_k_heads,
+        cfg.key_head_dim,
+        cfg.value_head_dim,
+        cfg.conv_kernel,
+    );
+    let c_dim = cfg.conv_dim();
+    let vd = nv * dv;
+    let (kd, rep) = (nk * dk, nv / nk);
+    let hist = kk.saturating_sub(1);
+    let (ring, s_all) = state.split_at_mut(hist * c_dim);
+
+    // Depthwise causal conv + SiLU for every position. The raw input of
+    // position t−hist+j is the chunk's own row when that index is ≥ 0 and
+    // ring row t+j otherwise (the ring holds the last `hist` raw rows,
+    // oldest first) — exactly what `gdn_step` reads from its ring.
+    let mut cq = vec![0f32; b * c_dim];
+    {
+        let ring_ro: &[f32] = ring;
+        let cq_ptr = SendMutF32(cq.as_mut_ptr());
+        let conv_range = |c0: usize, c1: usize| {
+            let cq_ptr = cq_ptr;
+            for c in c0..c1 {
+                let taps = &w.conv1d[c * kk..(c + 1) * kk];
+                for t in 0..b {
+                    let mut acc = qkv[t * c_dim + c] as f64 * taps[kk - 1] as f64;
+                    for j in 0..hist {
+                        let raw = if t + j >= hist {
+                            qkv[(t + j - hist) * c_dim + c]
+                        } else {
+                            ring_ro[(t + j) * c_dim + c]
+                        };
+                        acc += raw as f64 * taps[j] as f64;
+                    }
+                    // SAFETY: each worker owns a disjoint channel range.
+                    unsafe { *cq_ptr.0.add(t * c_dim + c) = silu(acc) as f32 };
+                }
+            }
+        };
+        match pool {
+            Some(pool) if c_dim >= 256 => pool.run(&|widx, n| {
+                let chunk = c_dim.div_ceil(n);
+                let c0 = (widx * chunk).min(c_dim);
+                let c1 = (c0 + chunk).min(c_dim);
+                if c0 < c1 {
+                    conv_range(c0, c1);
+                }
+            }),
+            _ => conv_range(0, c_dim),
+        }
+    }
+    // The ring after the chunk: its last `hist` raw rows (old ring rows
+    // when the chunk is shorter than the ring).
+    if hist > 0 {
+        let mut next = vec![0f32; hist * c_dim];
+        for j in 0..hist {
+            let src = if b + j >= hist {
+                &qkv[(b + j - hist) * c_dim..(b + j - hist + 1) * c_dim]
+            } else {
+                &ring[(b + j) * c_dim..(b + j + 1) * c_dim]
+            };
+            next[j * c_dim..(j + 1) * c_dim].copy_from_slice(src);
+        }
+        ring.copy_from_slice(&next);
+    }
+
+    let cq = &cq;
+    let s_ptr = SendMutF32(s_all.as_mut_ptr());
+    let of_ptr = SendMutF32(of.as_mut_ptr());
+    let head_range = |h0: usize, h1: usize| {
+        let (s_ptr, of_ptr) = (s_ptr, of_ptr);
+        let mut kv = crate::attention::take_buf(dv);
+        let mut delta = crate::attention::take_buf(dv);
+        let mut o = crate::attention::take_buf(dv);
+        let mut kf = crate::attention::take_buf(dk);
+        let mut qf = crate::attention::take_buf(dk);
+        for h in h0..h1 {
+            let ko = h / rep;
+            let (qs, ks) = (ko * dk, kd + ko * dk);
+            let g_base = -(w.a_log[h] as f64).exp();
+            // SAFETY: disjoint per-head S and output slices per worker.
+            let s = unsafe { std::slice::from_raw_parts_mut(s_ptr.0.add(h * dk * dv), dk * dv) };
+            for t in 0..b {
+                let cqt = &cq[t * c_dim..(t + 1) * c_dim];
+                let (mut nq, mut nkn) = (0f64, 0f64);
+                for d in 0..dk {
+                    nq += (cqt[qs + d] as f64) * (cqt[qs + d] as f64);
+                    nkn += (cqt[ks + d] as f64) * (cqt[ks + d] as f64);
+                }
+                let invq = (1.0 / ((nq + 1e-6).sqrt() * (dk as f64).sqrt())) as f32;
+                let invk = (1.0 / (nkn + 1e-6).sqrt()) as f32;
+                for d in 0..dk {
+                    qf[d] = cqt[qs + d] * invq;
+                    kf[d] = cqt[ks + d] * invk;
+                }
+                let g = (g_base * softplus(a[t * nv + h] as f64 + w.dt_bias[h] as f64)).exp() as f32;
+                let beta = sigmoid(bb[t * nv + h] as f64) as f32;
+                let oh = unsafe { std::slice::from_raw_parts_mut(of_ptr.0.add(t * vd + h * dv), dv) };
+                let vt = &cqt[2 * kd + h * dv..2 * kd + (h + 1) * dv];
+                kv[..dv].fill(0.0);
+                for di in 0..dk {
+                    let kfd = kf[di];
+                    let row = &s[di * dv..(di + 1) * dv];
+                    for dj in 0..dv {
+                        kv[dj] += row[dj] * kfd;
+                    }
+                }
+                for dj in 0..dv {
+                    delta[dj] = (vt[dj] - g * kv[dj]) * beta;
+                }
+                o[..dv].fill(0.0);
+                for di in 0..dk {
+                    let kfd = kf[di];
+                    let qfd = qf[di];
+                    let row = &mut s[di * dv..(di + 1) * dv];
+                    for dj in 0..dv {
+                        let cell = g * row[dj] + kfd * delta[dj];
+                        row[dj] = cell;
+                        o[dj] += qfd * cell;
+                    }
+                }
+                let ss: f64 = o[..dv].iter().map(|&v| (v as f64) * (v as f64)).sum();
+                let inv = 1.0 / (ss / dv as f64 + cfg.rms_eps).sqrt();
+                let zt = &z[t * vd..(t + 1) * vd];
+                for dj in 0..dv {
+                    let gate = if cfg.output_gate_sigmoid {
+                        sigmoid(zt[h * dv + dj] as f64)
+                    } else {
+                        silu(zt[h * dv + dj] as f64)
+                    };
+                    oh[dj] = ((o[dj] as f64 * inv) * w.norm[dj] as f64 * gate) as f32;
+                }
+            }
+        }
+        crate::attention::recycle_buf(&mut kv);
+        crate::attention::recycle_buf(&mut delta);
+        crate::attention::recycle_buf(&mut o);
+        crate::attention::recycle_buf(&mut kf);
+        crate::attention::recycle_buf(&mut qf);
+    };
+    match pool {
+        Some(pool) if nv >= 4 => pool.run(&|widx, n| {
+            let chunk = nv.div_ceil(n);
+            let h0 = (widx * chunk).min(nv);
+            let h1 = (h0 + chunk).min(nv);
+            if h0 < h1 {
+                head_range(h0, h1);
+            }
+        }),
+        _ => head_range(0, nv),
+    }
+}
+
 /// Forward one position through a GatedDeltaNet layer, advancing `state`.
 pub fn gdn_forward(
     x: &[f32],
@@ -764,18 +948,22 @@ pub fn gdn_forward_batch(
     w.in_proj_b.matmat(xs, b, &mut bb, pool);
 
     let mut of = vec![0.0f32; b * vd];
-    for bi in 0..b {
-        gdn_step(
-            &qkv[bi * c_dim..(bi + 1) * c_dim],
-            &z[bi * vd..(bi + 1) * vd],
-            &a[bi * nv..(bi + 1) * nv],
-            &bb[bi * nv..(bi + 1) * nv],
-            w,
-            cfg,
-            state,
-            &mut of[bi * vd..(bi + 1) * vd],
-            pool,
-        );
+    if b > 1 && gdn_scan_on() {
+        gdn_scan_batch(&qkv, &z, &a, &bb, b, w, cfg, state, &mut of, pool);
+    } else {
+        for bi in 0..b {
+            gdn_step(
+                &qkv[bi * c_dim..(bi + 1) * c_dim],
+                &z[bi * vd..(bi + 1) * vd],
+                &a[bi * nv..(bi + 1) * nv],
+                &bb[bi * nv..(bi + 1) * nv],
+                w,
+                cfg,
+                state,
+                &mut of[bi * vd..(bi + 1) * vd],
+                pool,
+            );
+        }
     }
     let mut out = vec![0.0f32; b * cfg.hidden_size];
     w.out_proj.matmat(&of, b, &mut out, pool);
@@ -2166,6 +2354,47 @@ mod tests {
             out_proj: synth(cfg.hidden_size, vd, 7),
         };
         (w, cfg)
+    }
+
+    /// The chunked scan equals `gdn_step` position by position, outputs and
+    /// state bit for bit — with a warm ring, a chunk shorter than the ring,
+    /// and both gate forms.
+    #[test]
+    fn gdn_scan_matches_steps_bitexact() {
+        for sigmoid_gate in [false, true] {
+            let (w, mut cfg) = tiny_gdn();
+            cfg.output_gate_sigmoid = sigmoid_gate;
+            let (c_dim, vd, nv) = (cfg.conv_dim(), cfg.num_v_heads * cfg.value_head_dim, cfg.num_v_heads);
+            let row = |n: usize, t: usize, salt: usize| -> Vec<f32> {
+                (0..n).map(|i| (((i * 7 + t * 31 + salt * 3) % 83) as f32 / 83.0 - 0.5) * 1.3).collect()
+            };
+            let mut s_ref = vec![0f32; cfg.state_len()];
+            let mut s_scan = s_ref.clone();
+            for (chunk, b) in [(0usize, 2usize), (1, 7), (2, 1), (3, 5)] {
+                let qkv: Vec<f32> = (0..b).flat_map(|t| row(c_dim, t + 10 * chunk, 1)).collect();
+                let z: Vec<f32> = (0..b).flat_map(|t| row(vd, t + 10 * chunk, 2)).collect();
+                let a: Vec<f32> = (0..b).flat_map(|t| row(nv, t + 10 * chunk, 3)).collect();
+                let bb: Vec<f32> = (0..b).flat_map(|t| row(nv, t + 10 * chunk, 4)).collect();
+                let mut of_ref = vec![0f32; b * vd];
+                for t in 0..b {
+                    gdn_step(
+                        &qkv[t * c_dim..(t + 1) * c_dim],
+                        &z[t * vd..(t + 1) * vd],
+                        &a[t * nv..(t + 1) * nv],
+                        &bb[t * nv..(t + 1) * nv],
+                        &w,
+                        &cfg,
+                        &mut s_ref,
+                        &mut of_ref[t * vd..(t + 1) * vd],
+                        None,
+                    );
+                }
+                let mut of_scan = vec![0f32; b * vd];
+                gdn_scan_batch(&qkv, &z, &a, &bb, b, &w, &cfg, &mut s_scan, &mut of_scan, None);
+                assert_eq!(of_scan, of_ref, "outputs, chunk {chunk} (b = {b})");
+                assert_eq!(s_scan, s_ref, "state, chunk {chunk} (b = {b})");
+            }
+        }
     }
 
     #[test]

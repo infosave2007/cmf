@@ -3651,6 +3651,45 @@ pub fn dit_attention(
     }
 }
 
+/// GPTQ calibration: a zeroed `cols × cols` Hessian accumulator on the
+/// device (wgpu only), or None — the caller keeps the host fold then.
+pub fn gram_alloc(cols: usize) -> Option<u64> {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::gram::alloc(cols);
+    }
+    let _ = cols;
+    None
+}
+
+/// `H[id] += XᵀX` over `b` rows of `xs` (`[b·cols]`).
+pub fn gram_add(id: u64, xs: &[f32], b: usize) -> bool {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::gram::add(id, xs, b);
+    }
+    let _ = (id, xs, b);
+    false
+}
+
+/// The accumulated Hessian as a full symmetric f64 matrix (frees it).
+pub fn gram_take(id: u64) -> Option<Vec<f64>> {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::gram::take(id);
+    }
+    let _ = id;
+    None
+}
+
+/// Free every device Hessian (an aborted calibration pass).
+pub fn gram_clear() {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        crate::gpu_wgpu::gram::clear();
+    }
+}
+
 /// Batched q4t GEMM on the device (imagegen DiT prefill shapes).
 /// Metal: q4t_mul_mm decodes the mmap-resident tiles inside the
 /// GEMM's K loop. wgpu (Vulkan/DX12 → NVIDIA/AMD/Intel/Adreno/Mali):

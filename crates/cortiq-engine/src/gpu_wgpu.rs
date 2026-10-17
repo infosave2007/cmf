@@ -41,6 +41,8 @@ pub(crate) mod dense_batch;
 pub(crate) mod gemma_batch;
 /// Warp-per-row q4tp decode matvecs (bit-identical to the 16nl rows).
 pub(crate) mod dense_mv;
+/// GPTQ calibration Hessians accumulated on the device (`H += XᵀX`).
+pub(crate) mod gram;
 
 /// Workgroup limit per dimension (WebGPU minimum; lm_head has more
 /// rows — we use grid-stride in the shader).
