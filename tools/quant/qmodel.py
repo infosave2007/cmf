@@ -257,32 +257,43 @@ class QLinear:
         return None
 
     def levels(self, r0=0, r1=None):
-        """code multipliers [rows, cols] (q8_2f: the int8 codes as f32)"""
+        """code multipliers [rows, cols] (q8_2f: the int8 codes as f32), unpacked straight into
+        one f32 buffer (no per-field temporaries)"""
         d = self.dev
         r1 = self.rows if r1 is None else r1
-        if self.dtype == "Q4TiledP":
+        n = r1 - r0
+        if self.dtype in TILED:
             c = d["codes"][r0:r1]
-            lo = (c & 15).float() - 8.0
-            hi = (c >> 4).float() - 8.0
-            return torch.stack([lo, hi], -1).reshape(r1 - r0, self.cols)
-        if self.dtype == "Q2TiledP":
-            c = d["codes"][r0:r1]
-            parts = [((c >> (2 * k)) & 3).float() - 1.5 for k in range(4)]
-            return torch.stack(parts, -1).reshape(r1 - r0, self.cols)
+            out = torch.empty(n, self.cols, device=c.device)
+            if self.dtype == "Q4TiledP":
+                o = out.view(n, self.cols // 2, 2)
+                o[..., 0].copy_(c & 15)
+                o[..., 1].copy_(c >> 4)
+                return out.sub_(8.0)
+            o = out.view(n, self.cols // 4, 4)
+            for k in range(4):
+                o[..., k].copy_((c >> (2 * k)) & 3)
+            return out.sub_(1.5)
         if self.dtype == "Q8_2f":
             return d["q"][r0:r1].float()
         raise AssertionError(self.dtype)
 
     def weight(self, S=None, r0=0, r1=None):
-        """f32 weight rows [r0, r1) on the device, the decoder's arithmetic"""
+        """f32 weight rows [r0, r1) on the device, the decoder's arithmetic (in place on the
+        unpacked levels unless an autograd graph through S is being recorded)"""
         d = self.dev
         r1 = self.rows if r1 is None else r1
+        n = r1 - r0
+        graph = S is not None and S.requires_grad and torch.is_grad_enabled()
         if self.dtype in TILED:
             s = (d["s0"] if S is None else S)[r0:r1]
-            return (self.levels(r0, r1).view(r1 - r0, -1, cc.G) * s[:, :, None]).view(r1 - r0, self.cols)
+            lv = self.levels(r0, r1).view(n, -1, cc.G)
+            return (lv * s[:, :, None] if graph else lv.mul_(s[:, :, None])).view(n, self.cols)
         if self.dtype == "Q8_2f":
             s = (d["rs"] if S is None else S)[r0:r1]
-            return (d["q"][r0:r1].float() * s[:, None]) * d["cs"][None, :]
+            if graph:
+                return (d["q"][r0:r1].float() * s[:, None]) * d["cs"][None, :]
+            return d["q"][r0:r1].float().mul_(s[:, None]).mul_(d["cs"][None, :])
         w = d["w"][r0:r1]
         if self.dtype == "F16":
             return w.view(torch.float16).float()
@@ -290,11 +301,19 @@ class QLinear:
             return (w.to(torch.int32) << 16).view(torch.float32)
         return w
 
-    def scale_grad(self, dW):
-        """d loss / d scale from d loss / d W (codes frozen)"""
+    def scale_grad(self, dW, r0=0, r1=None):
+        """d loss / d scale of rows [r0, r1) from d loss / d W of those rows (codes frozen)"""
+        r1 = self.rows if r1 is None else r1
+        n = r1 - r0
         if self.dtype in TILED:
-            return (dW.view(self.rows, -1, cc.G) * self.levels().view(self.rows, -1, cc.G)).sum(-1)
-        return (dW * (self.dev["q"].float() * self.dev["cs"][None, :])).sum(1)
+            return dW.view(n, -1, cc.G).mul_(self.levels(r0, r1).view(n, -1, cc.G)).sum(-1)
+        return dW.mul_(self.dev["q"][r0:r1].float().mul_(self.dev["cs"][None, :])).sum(1)
+
+    def row_blocks(self):
+        """row ranges decoded at a time: at most ~ROW_BLOCK_ELEMS f32 weights per block, so
+        the transient decode of a 17408 x 5120 projection never exceeds ~128 MB"""
+        step = max(64, ROW_BLOCK_ELEMS // max(1, self.cols))
+        return [(r0, min(r0 + step, self.rows)) for r0 in range(0, self.rows, step)]
 
     def __call__(self, x2):
         S = self.scale()
@@ -323,28 +342,50 @@ class QLinear:
         return q.with_row_scales(rs2), a_eff, None
 
 
+# f32 weights decoded at a time by the linear (rows are split into blocks above this)
+ROW_BLOCK_ELEMS = 1 << 25
+
+
 class _QMatmul(torch.autograd.Function):
     """y = x @ W(S)^T with W re-decoded in backward instead of saved: only x and the small
-    scale tensor are kept, so a layer's backward never holds more than one f32 weight."""
+    scale tensor are kept, and W is decoded in row blocks (`QLinear.row_blocks`), so a
+    layer's forward or backward never holds more than one block of f32 weight."""
 
     @staticmethod
     def forward(ctx, x, S, lin):
         ctx.lin = lin
         ctx.save_for_backward(x, S if S is not None else torch.empty(0))
         ctx.has_s = S is not None
-        return x @ lin.weight(S).t()
+        blocks = lin.row_blocks()
+        if len(blocks) == 1:
+            return x @ lin.weight(S).t()
+        y = x.new_empty(x.shape[0], lin.rows)
+        for r0, r1 in blocks:
+            y[:, r0:r1] = x @ lin.weight(S, r0, r1).t()
+        return y
 
     @staticmethod
     def backward(ctx, gy):
         x, S = ctx.saved_tensors
         lin = ctx.lin
         S = S if ctx.has_s else None
-        W = lin.weight(S)
-        gx = gy @ W if ctx.needs_input_grad[0] else None
-        del W
-        gS = None
-        if ctx.has_s and ctx.needs_input_grad[1]:
-            gS = lin.scale_grad(gy.t() @ x)
+        want_x = ctx.needs_input_grad[0]
+        want_s = ctx.has_s and ctx.needs_input_grad[1]
+        blocks = lin.row_blocks()
+        if len(blocks) == 1:
+            W = lin.weight(S)
+            gx = gy @ W if want_x else None
+            del W
+            gS = lin.scale_grad(gy.t() @ x) if want_s else None
+            return gx, gS, None
+        gx = torch.zeros_like(x) if want_x else None
+        gS = torch.empty_like(S) if want_s else None
+        for r0, r1 in blocks:
+            g = gy[:, r0:r1]
+            if want_x:
+                gx += g @ lin.weight(S, r0, r1)
+            if want_s:
+                gS[r0:r1] = lin.scale_grad(g.t() @ x, r0, r1)
         return gx, gS, None
 
 

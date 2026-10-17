@@ -219,6 +219,55 @@ class GradTest(unittest.TestCase):
             for a, b in zip(g_custom, g_ref):
                 torch.testing.assert_close(a, b, rtol=1e-4, atol=1e-5)
 
+    def test_device_decode_is_the_decoder_bit_for_bit(self):
+        rng = np.random.default_rng(8)
+        for dt in ("Q4TiledP", "Q2TiledP", "Q8_2f"):
+            raw = rand_tiled(rng, dt, 40, 96) if dt in qmodel.TILED else rand_q8(rng, 40, 96)
+            t = cmfio.Tensor("w", dt, (40, 96), 0, len(raw), 0, 0)
+            lin = qmodel.QLinear("w", t, np.frombuffer(raw, np.uint8), pin=False)
+            lin.load("cpu")
+            ref = cc.dequant(dt, np.frombuffer(raw, np.uint8), (40, 96))
+            np.testing.assert_array_equal(lin.weight().numpy(), ref)
+            np.testing.assert_array_equal(lin.weight(None, 7, 23).numpy(), ref[7:23])
+
+    def test_row_blocked_matmul_equals_one_block(self):
+        rng = np.random.default_rng(6)
+        rows, cols = 200, 64
+        for dt in ("Q4TiledP", "Q2TiledP", "Q8_2f", "F16"):
+            if dt in qmodel.TILED:
+                raw = rand_tiled(rng, dt, rows, cols)
+            elif dt == "Q8_2f":
+                raw = rand_q8(rng, rows, cols)
+            else:
+                raw = cc.encode_float("F16", rng.normal(0, 0.05, (rows, cols)))
+            t = cmfio.Tensor("w", dt, (rows, cols), 0, len(raw), 0, 0)
+            lin = qmodel.QLinear("w", t, np.frombuffer(raw, np.uint8), train=dt != "F16", step=True, pin=False)
+            lin.init_params("cpu")
+            lin.load("cpu")
+            if lin.a is not None:
+                with torch.no_grad():
+                    lin.a.copy_(torch.randn(rows) * 0.05)
+            x0 = torch.randn(9, cols)
+            gy = torch.randn(9, rows)
+            outs = []
+            for elems in (1 << 25, 64 * 70):           # one block / blocks of 70 rows (last one 60)
+                old, qmodel.ROW_BLOCK_ELEMS = qmodel.ROW_BLOCK_ELEMS, elems
+                try:
+                    self.assertEqual(len(lin.row_blocks()), 1 if elems == 1 << 25 else 3)
+                    x = x0.clone().requires_grad_(True)
+                    y = lin(x)
+                    y.backward(gy)
+                    outs.append((y.detach(), x.grad, None if lin.a is None else lin.a.grad.clone()))
+                    if lin.a is not None:
+                        lin.a.grad = None
+                        if lin.b is not None:
+                            lin.b.grad = None
+                finally:
+                    qmodel.ROW_BLOCK_ELEMS = old
+            for a, b in zip(outs[0], outs[1]):
+                if a is not None:
+                    torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-6)
+
     def test_head_kl_matches_dense_reference(self):
         torch.manual_seed(0)
         m = tiny_cmf("llama", seed=4, head_dtype="Q4TiledP")
