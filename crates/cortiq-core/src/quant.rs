@@ -369,6 +369,25 @@ pub fn repack_q1_to_q1g(bytes: &[u8], rows: usize, cols: usize, tol: f64) -> Q1g
     }
 }
 
+/// The inverse of [`repack_q1_to_q1g`]: a `q1g` payload back to `q1` tiles
+/// (each group's scale written into its four tiles). Exact — the result
+/// decodes to the same weights bit for bit — so a runtime that predates
+/// dtype 20 can still read the model, and a q1/q1g pair built this way
+/// isolates the kernels from the repack's tolerance groups.
+pub fn unpack_q1g_to_q1(bytes: &[u8], rows: usize, cols: usize) -> Vec<u8> {
+    assert_eq!(cols % Q1G_GROUP, 0, "q1g needs cols % 128 == 0");
+    let sc_off = q1g_scale_offset(rows, cols);
+    let tiles = rows * (cols / GROUP_SIZE);
+    assert_eq!(bytes.len(), sc_off + tiles / 4 * 2, "q1g payload length");
+    let mut q = vec![0u8; tiles * Q1_TILE];
+    for t in 0..tiles {
+        let o = t * Q1_TILE;
+        q[o..o + 2].copy_from_slice(&bytes[sc_off + (t / 4) * 2..sc_off + (t / 4) * 2 + 2]);
+        q[o + 2..o + 6].copy_from_slice(&bytes[t * 4..t * 4 + 4]);
+    }
+    q
+}
+
 /// Ternary tile: 2 (f16 scale) + 7 (32 base-3 codes, 5 ternary values per
 /// byte, `3^5 = 243 ≤ 256`) = 9 bytes ⇒ ~2.25 bpw base (vs the old 2-bit
 /// 10-byte tile). The packed codes carry the same `{0,+s,−s}` values, so
@@ -1216,6 +1235,8 @@ mod q1g_tests {
             let mut c = vec![0f32; rows * cols];
             dequant_tensor(&entry, &rp.data, &mut c).unwrap();
             assert_eq!(b, c);
+            // …and back: the q1 bytes themselves, exactly.
+            assert_eq!(unpack_q1g_to_q1(&rp.data, rows, cols), q1);
         }
     }
 
@@ -1253,6 +1274,10 @@ mod q1g_tests {
         let (mut a, mut b) = (vec![0f32; rows * cols], vec![0f32; rows * cols]);
         dequant_q1(&q1, &mut a);
         dequant_q1g(&loose.data, rows, cols, &mut b);
+        // q1g → q1 decodes to the q1g weights (not the source's) bit for bit.
+        let mut back = vec![0f32; rows * cols];
+        dequant_q1(&unpack_q1g_to_q1(&loose.data, rows, cols), &mut back);
+        assert!(back.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()));
         for g in 0..rows * cols / Q1G_GROUP {
             let (wa, wb) = (&a[g * 128..(g + 1) * 128], &b[g * 128..(g + 1) * 128]);
             if bumped.contains(&g) {
