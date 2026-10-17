@@ -43,6 +43,8 @@ pub(crate) mod gemma_batch;
 pub(crate) mod dense_mv;
 /// GPTQ calibration Hessians accumulated on the device (`H += XᵀX`).
 pub(crate) mod gram;
+/// GPTQ fold operator and q4tp row sweep on the device.
+pub(crate) mod gptq_dev;
 
 /// Workgroup limit per dimension (WebGPU minimum; lm_head has more
 /// rows — we use grid-stride in the shader).
