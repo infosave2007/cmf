@@ -50,6 +50,12 @@ pub enum QTensor {
         /// an anonymous copy of the quants for mmap pages that go cold.
         repack: Vec<u8>,
     },
+    /// Binary low-rank (`blr`): ±1 paths, signs from the mmap, scales as
+    /// f32 (docs/BLR_NVG.md §3). Every device-graph accessor answers `None`
+    /// for it (whole-token graphs decline to per-op/host paths); the CPU
+    /// kernels live in `crate::blr`, the per-op wgpu kernels in
+    /// `gpu_wgpu::blr`.
+    Blr(Box<crate::blr::BlrTensor>),
 }
 
 /// Load-time q8 repack gate (see `Mapped::repack`). OPT-IN
@@ -357,6 +363,13 @@ impl QTensor {
                 vbit_offsets: Vec::new(),
                 repack: Vec::new(),
             }),
+            // blr: factored kernels over the packed signs. CMF_BLR_DENSE=1
+            // dequantizes to f32 instead (A/B parity runs).
+            TensorDtype::BinaryLowRank if std::env::var("CMF_BLR_DENSE").as_deref() != Ok("1") => {
+                Ok(Self::Blr(Box::new(crate::blr::BlrTensor::from_model(
+                    model, idx,
+                )?)))
+            }
             // No fused kernel yet → dequantize once (correct, more RAM).
             _ => {
                 let mut data = vec![0.0f32; rows * cols];
@@ -364,6 +377,12 @@ impl QTensor {
                 Ok(Self::from_f32(data, rows, cols))
             }
         }
+    }
+
+    /// Binary low-rank tensor? Fused multi-tensor kernels refuse it and fall
+    /// back to per-tensor calls.
+    pub fn is_blr(&self) -> bool {
+        matches!(self, Self::Blr(_))
     }
 
     /// Binary-weight-mapped tensor, q1 or q1g? (GPU gates: the binary CPU
@@ -589,6 +608,7 @@ impl QTensor {
     pub fn rows(&self) -> usize {
         match self {
             Self::F32 { rows, .. } | Self::Mapped { rows, .. } => *rows,
+            Self::Blr(t) => t.rows,
         }
     }
 
@@ -685,6 +705,7 @@ impl QTensor {
     pub fn cols(&self) -> usize {
         match self {
             Self::F32 { cols, .. } | Self::Mapped { cols, .. } => *cols,
+            Self::Blr(t) => t.cols,
         }
     }
 
@@ -810,13 +831,14 @@ impl QTensor {
     pub fn as_f32(&self) -> Option<&[f32]> {
         match self {
             Self::F32 { data, .. } => Some(data),
-            Self::Mapped { .. } => None,
+            Self::Mapped { .. } | Self::Blr(_) => None,
         }
     }
 
     fn quant_bytes(&self) -> &[u8] {
         match self {
             Self::Mapped { model, idx, .. } => model.entry_bytes(&model.tensors[*idx]),
+            Self::Blr(t) => t.bytes(),
             Self::F32 { .. } => unreachable!("quant_bytes on F32"),
         }
     }
@@ -827,6 +849,7 @@ impl QTensor {
         debug_assert_eq!(dst.len(), cols);
         match self {
             Self::F32 { data, .. } => dst.copy_from_slice(&data[r * cols..(r + 1) * cols]),
+            Self::Blr(t) => t.row_f32(r, dst),
             Self::Mapped {
                 model,
                 idx,
@@ -1072,6 +1095,7 @@ impl QTensor {
     pub fn sparse_col_ok(&self) -> bool {
         match self {
             Self::F32 { .. } => true,
+            Self::Blr(_) => false,
             Self::Mapped { dtype, .. } => {
                 matches!(dtype, TensorDtype::Q8Row | TensorDtype::Q8_2f)
             }
@@ -1091,6 +1115,7 @@ impl QTensor {
                     *o += w * data[k * inter + c];
                 }
             }
+            Self::Blr(t) => t.add_col_scaled(c, w, out),
             Self::Mapped {
                 dtype,
                 row_scale,
@@ -1159,6 +1184,13 @@ impl QTensor {
                     *o += w * v;
                 }
             }
+            Self::Blr(t) => {
+                let tmp = &mut scratch[..cols];
+                t.row_f32(r, tmp);
+                for (o, v) in out.iter_mut().zip(tmp.iter()) {
+                    *o += w * v;
+                }
+            }
             Self::Mapped {
                 dtype,
                 row_scale,
@@ -1198,6 +1230,11 @@ impl QTensor {
             Self::F32 { data, .. } => {
                 let row = &data[r * cols..(r + 1) * cols];
                 row.iter().zip(x).map(|(w, v)| w * v).sum()
+            }
+            Self::Blr(t) => {
+                let tmp = &mut scratch[..cols];
+                t.row_f32(r, tmp);
+                tmp.iter().zip(x).map(|(w, v)| w * v).sum()
             }
             Self::Mapped {
                 model,
@@ -1257,6 +1294,15 @@ impl QTensor {
                 if !crate::f32_backend::matvec(data, x, out) {
                     matvec_rows(pool, data, x, out);
                 }
+            }
+            Self::Blr(t) => {
+                if crate::gpu::enabled_here()
+                    && crate::blr::gpu_wanted()
+                    && crate::gpu::blr_matmat(t, &x[..t.cols], 1, &mut out[..t.rows])
+                {
+                    return;
+                }
+                t.matvec(x, out, pool)
             }
             Self::Mapped {
                 model,
@@ -1716,6 +1762,10 @@ impl QTensor {
     ) {
         match self {
             Self::F32 { data, .. } => matvec_rows2(pool, data, x1, x2, o1, o2),
+            Self::Blr(_) => {
+                self.matvec(x1, o1, pool);
+                self.matvec(x2, o2, pool);
+            }
             Self::Mapped {
                 model,
                 idx,
@@ -1900,8 +1950,20 @@ impl QTensor {
             if let Self::Mapped { model, idx, .. } = self {
                 crate::gptq_capture::accumulate(&model.tensors[*idx].name, xs_all, b, cols);
             }
+            if let Self::Blr(t) = self {
+                crate::gptq_capture::accumulate(t.name(), xs_all, b, cols);
+            }
         }
         match self {
+            Self::Blr(t) => {
+                if crate::gpu::enabled_here()
+                    && crate::blr::gpu_wanted()
+                    && crate::gpu::blr_matmat(t, &xs_all[..b * cols], b, &mut out[..b * rows])
+                {
+                    return;
+                }
+                t.matmat(xs_all, b, out, pool)
+            }
             Self::F32 { data, .. } => {
                 if crate::f32_backend::matmat(data, xs_all, b, rows, cols, out) {
                     return;
@@ -2598,10 +2660,11 @@ impl QTensor {
         pool: Option<&Pool>,
     ) {
         let total_rows: usize = ts.iter().map(|t| t.rows()).sum();
-        if ts.iter().any(|t| t.has_prism_contract()) {
+        if ts.iter().any(|t| t.has_prism_contract() || t.is_blr()) {
             // The fused range kernels have no transform descriptor.  Let
             // each tensor's ordinary matvec dispatch perform the explicit
             // signed FWHT (and retain CPU fallback for mixed q2tp/q4tp).
+            // blr has no row-range kernel either: per-tensor calls.
             for (t, o) in ts.iter().zip(outs.iter_mut()) {
                 t.matvec(x, o, pool);
             }
@@ -3011,7 +3074,7 @@ impl QTensor {
         pool: Option<&Pool>,
     ) {
         let total_rows: usize = ts.iter().map(|t| t.rows()).sum();
-        if ts.iter().any(|t| t.has_prism_contract()) {
+        if ts.iter().any(|t| t.has_prism_contract() || t.is_blr()) {
             for i in 0..N {
                 ts[i].matvec2(x1, x2, o1s[i], o2s[i], pool);
             }
@@ -3283,7 +3346,7 @@ impl QTensor {
         limit: f32,
         pool: Option<&Pool>,
     ) -> bool {
-        if gate.has_prism_contract() || up.has_prism_contract() {
+        if gate.has_prism_contract() || up.has_prism_contract() || gate.is_blr() || up.is_blr() {
             // The fused gate/up kernels consume x directly.  Prism requires
             // a per-matrix signed FWHT, so the caller must use two ordinary
             // descriptor-aware matvecs instead of an unrotated fast path.
@@ -3601,6 +3664,9 @@ impl QTensor {
         if pairs.is_empty() || pairs.len() != outs.len() {
             return false;
         }
+        if pairs.iter().any(|(g, u)| g.is_blr() || u.is_blr()) {
+            return false;
+        }
         if !a8w8_enabled() {
             if limit > 0.0 {
                 // The exact-row fallback applies no SwiGLU clamp; the
@@ -3717,6 +3783,9 @@ impl QTensor {
         if downs.is_empty() || downs.len() != gs.len() || downs.len() != weights.len() {
             return false;
         }
+        if downs.iter().any(|d| d.is_blr()) {
+            return false;
+        }
         if !a8w8_enabled() {
             let mut terms = vec![vec![0.0; out.len()]; downs.len()];
             if !Self::moe_down_rows(downs, &vec![1; downs.len()], gs, &mut terms, pool) {
@@ -3805,6 +3874,9 @@ impl QTensor {
         pool: Option<&Pool>,
     ) -> bool {
         if pairs.is_empty() || pairs.len() != groups.len() {
+            return false;
+        }
+        if pairs.iter().any(|(g, u)| g.is_blr() || u.is_blr()) {
             return false;
         }
         let inter = pairs[0].0.rows();
@@ -3908,6 +3980,9 @@ impl QTensor {
         pool: Option<&Pool>,
     ) -> bool {
         if downs.is_empty() || downs.len() != group_lens.len() {
+            return false;
+        }
+        if downs.iter().any(|d| d.is_blr()) {
             return false;
         }
         let rows = downs[0].rows();
@@ -12893,6 +12968,135 @@ mod tests {
             assert_eq!(ra, rb, "embedding row {r}");
         }
         drop((g1, u1, gg, ug, model));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `blr` tensor read from a real CMF file: it maps to the factored
+    /// arm (not a dense copy), declines every device-graph accessor, and
+    /// every QTensor entry point a layer may take — matvec, matvec2,
+    /// matmat (table loop and GEMM sizes), the multi-tensor job mixed with
+    /// a q8_row sibling, the fused gate/up refusal, rows and columns — equals
+    /// the dense reference built by the core dequant.
+    #[test]
+    fn blr_mapped_tensor_paths_equal_dense() {
+        use crate::pool::Pool;
+        use cortiq_core::{CmfHeader, CmfModel, TensorSpec};
+        let (rows, cols, r) = (96usize, 128usize, 16usize);
+        let mut rng = crate::blr::tests::Rng(41);
+        let gate = crate::blr::tests::make(&mut rng, rows, cols, r, 2);
+        let up = crate::blr::tests::make(&mut rng, rows, cols, r, 1);
+        // q8_row sibling: [int8 rows·cols][f16 row scale · rows].
+        let mut q8: Vec<u8> = (0..rows * cols)
+            .map(|i| (((i * 89) % 253) as i32 - 126) as i8 as u8)
+            .collect();
+        for o in 0..rows {
+            q8.extend_from_slice(&cortiq_core::quant::f32_to_f16(0.002 + o as f32 * 1e-4).to_le_bytes());
+        }
+        let header: CmfHeader = serde_json::from_value(serde_json::json!({
+            "format": "cmf", "version": cortiq_core::CMF_VERSION,
+            "arch": {"arch_name": "tiny-blr", "hidden_size": cols,
+                "intermediate_size": rows, "num_layers": 1, "num_attention_heads": 2,
+                "num_kv_heads": 1, "head_dim": 64, "vocab_size": rows,
+                "layer_types": ["FullAttention"], "rms_norm_eps": 1e-6,
+                "max_position_embeddings": 8},
+            "quant_type": "Q8_2F"
+        }))
+        .unwrap();
+        let specs = [
+            TensorSpec {
+                name: "g".into(),
+                dtype: TensorDtype::BinaryLowRank,
+                shape: vec![rows, cols],
+                data: gate.clone(),
+            },
+            TensorSpec {
+                name: "u".into(),
+                dtype: TensorDtype::BinaryLowRank,
+                shape: vec![rows, cols],
+                data: up.clone(),
+            },
+            TensorSpec {
+                name: "q".into(),
+                dtype: TensorDtype::Q8Row,
+                shape: vec![rows, cols],
+                data: q8,
+            },
+        ];
+        let dir = std::env::temp_dir().join(format!("cmf-blr-mapped-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.cmf");
+        CmfModel::write(&path, &header, &specs, None, None).unwrap();
+        let model = Arc::new(CmfModel::open(&path).unwrap());
+        assert!(model.verify().is_empty(), "{:?}", model.verify());
+        let t = |n: &str| QTensor::from_model(&model, n).unwrap();
+        let (g, u, q) = (t("g"), t("u"), t("q"));
+        assert!(g.is_blr() && u.is_blr() && !q.is_blr());
+        assert!(g.graph_weight().is_none() && g.graph_weight_descriptor().is_none());
+        assert!(g.as_f32().is_none() && g.model_idx().is_none());
+        assert!(g.mapped_device_gemm().is_none() && g.q1_parts().is_none());
+        assert!(!g.sparse_col_ok());
+        assert_eq!((g.rows(), g.cols()), (rows, cols));
+        let deq = |bytes: &[u8]| {
+            let mut w = vec![0f32; rows * cols];
+            cortiq_core::blr::dequant_blr(bytes, rows, cols, &mut w).unwrap();
+            w
+        };
+        let (wg, wu) = (deq(&gate), deq(&up));
+        let mv = |w: &[f32], x: &[f32]| -> Vec<f32> {
+            (0..rows)
+                .map(|i| (0..cols).map(|j| w[i * cols + j] * x[j]).sum())
+                .collect()
+        };
+        let close = |a: &[f32], b: &[f32], what: &str| {
+            let s = b.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-30);
+            let e = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>().sqrt();
+            assert!(e / s < 1e-5, "{what}: rel {}", e / s);
+        };
+        let pool = Pool::new(3);
+        let x: Vec<f32> = (0..cols).map(|_| rng.f()).collect();
+        let x2: Vec<f32> = (0..cols).map(|_| rng.f()).collect();
+        let mut o = vec![0f32; rows];
+        g.matvec(&x, &mut o, Some(&pool));
+        close(&o, &mv(&wg, &x), "matvec");
+        let (mut o1, mut o2) = (vec![0f32; rows], vec![0f32; rows]);
+        g.matvec2(&x, &x2, &mut o1, &mut o2, Some(&pool));
+        close(&o1, &mv(&wg, &x), "matvec2 a");
+        close(&o2, &mv(&wg, &x2), "matvec2 b");
+        for b in [2usize, 5] {
+            let xs: Vec<f32> = (0..b * cols).map(|_| rng.f()).collect();
+            let mut om = vec![0f32; b * rows];
+            g.matmat(&xs, b, &mut om, Some(&pool));
+            for t in 0..b {
+                close(
+                    &om[t * rows..(t + 1) * rows],
+                    &mv(&wg, &xs[t * cols..(t + 1) * cols]),
+                    "matmat",
+                );
+            }
+        }
+        // Multi-tensor job mixed with a q8_row sibling: per-tensor fallback,
+        // the q8_row output identical to its own matvec.
+        let (mut a, mut bq, mut c) = (vec![0f32; rows], vec![0f32; rows], vec![0f32; rows]);
+        QTensor::matvec_many([&g, &q, &u], &x, [&mut a, &mut bq, &mut c], Some(&pool));
+        close(&a, &mv(&wg, &x), "matvec_many blr gate");
+        close(&c, &mv(&wu, &x), "matvec_many blr up");
+        let mut qo = vec![0f32; rows];
+        q.matvec(&x, &mut qo, Some(&pool));
+        assert_eq!(bq, qo, "matvec_many q8_row sibling");
+        let mut f = vec![0f32; rows];
+        assert!(!QTensor::matvec_silu_mul(&g, &u, &x, &mut f, Some(&pool)));
+        let mut row = vec![0f32; cols];
+        g.row_f32(rows / 3, &mut row);
+        close(&row, &wg[(rows / 3) * cols..(rows / 3 + 1) * cols], "row_f32");
+        let mut scratch = vec![0f32; cols];
+        let d = g.row_dot(7, &x, &mut scratch);
+        let want: f32 = (0..cols).map(|j| wg[7 * cols + j] * x[j]).sum();
+        assert!((d - want).abs() < 1e-4 * (1.0 + want.abs()), "row_dot");
+        let mut col = vec![0f32; rows];
+        g.add_col_scaled(cols / 2, 1.5, &mut col);
+        let want: Vec<f32> = (0..rows).map(|i| 1.5 * wg[i * cols + cols / 2]).collect();
+        close(&col, &want, "add_col_scaled");
+        drop((g, u, q, model));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -26,6 +26,11 @@ mod mimo_towers;
 mod moedefrag;
 mod music;
 mod npy;
+mod nvg;
+mod nvg_linalg;
+mod nvgbench;
+#[cfg(feature = "gpu")]
+mod nvg_gpu;
 mod qwen_imagepack;
 mod recall;
 mod requant;
@@ -396,9 +401,10 @@ enum Commands {
         /// or a hub repo id like `Qwen/Qwen2.5-0.5B-Instruct` (downloaded)
         #[arg(long)]
         model: String,
-        /// Quantization for 2-D weights: q8 | q8_2f | q4 | q4t | q4tp | q2tp | q1 | q1p | q1s | q1t | f16 | vbit | auto.
+        /// Quantization for 2-D weights: q8 | q8_2f | q4 | q4t | q4tp | q2tp | q1 | q1p | q1s | q1t | f16 | vbit | blr | auto.
         /// Default (or `auto`): q8, except MiMo-V2 (`mimo_v2`), which converts to
-        /// q4tp experts with a q8_2f skeleton.
+        /// q4tp experts with a q8_2f skeleton. `blr` = binary low-rank layer
+        /// projections at `--bpw` (encoder `--blr-method`, docs/BLR_NVG.md).
         #[arg(long)]
         quant: Option<String>,
         /// Output .cmf path
@@ -487,6 +493,48 @@ enum Commands {
         /// request fields still override it.
         #[arg(long, value_name = "KEY=VALUE,...")]
         sampling: Option<String>,
+        /// `--quant blr`: target bits per weight of the layer projections
+        /// (strict container count; embeddings/lm_head stay q8_2f, norms float).
+        #[arg(long = "bpw", visible_alias = "blr-bpw", default_value = "0.55")]
+        blr_bpw: f64,
+        /// `--quant blr` encoder: `nvg` (data-aware, needs --calib; sequential
+        /// per-layer calibration) or `dual-svid` (the data-free LittleBit
+        /// initialiser, kept as the comparison baseline).
+        #[arg(long = "blr-method", default_value = "nvg", value_name = "nvg|dual-svid")]
+        blr_method: String,
+        /// Calibration text for `--quant blr --blr-method nvg` (plain text;
+        /// never the evaluation split).
+        #[arg(long)]
+        calib: Option<String>,
+        /// K/V rank multiplier for GQA models (1 keeps the body at the named
+        /// budget; LittleBit used 4).
+        #[arg(long = "blr-kv-factor", default_value = "1.0")]
+        blr_kv_factor: f64,
+        /// Paths per tensor: auto (nvg: P=2 vs P=1 at the same bits, chosen on
+        /// the held-out calibration slice; dual-svid: 2) | 1 | 2.
+        #[arg(long = "blr-paths", default_value = "auto", value_name = "auto|1|2")]
+        blr_paths: String,
+        /// NVG calibration tokens used for fitting (512-token windows).
+        #[arg(long = "blr-fit-tokens", default_value = "14848")]
+        blr_fit_tokens: usize,
+        /// NVG held-out calibration tokens for the P=1/P=2 selection.
+        #[arg(long = "blr-sel-tokens", default_value = "3072")]
+        blr_sel_tokens: usize,
+        /// NVG relative Gram damping ρ.
+        #[arg(long = "blr-rho", default_value = "0.03")]
+        blr_rho: f64,
+        /// Encoder threads (default: all cores).
+        #[arg(long = "blr-threads")]
+        blr_threads: Option<usize>,
+        /// Keep the intermediate f16 source file (`<output>.src-f16.cmf`);
+        /// an existing one is reused instead of reconverting.
+        #[arg(long = "blr-keep-src")]
+        blr_keep_src: bool,
+        /// NVG encoder device: `gpu` (f32 on the wgpu device, calibration on
+        /// per-op device GEMMs), `cpu` (the f64 reference), `auto` = gpu when
+        /// a wgpu adapter is up (not on macOS).
+        #[arg(long = "blr-device", default_value = "auto", value_name = "auto|cpu|gpu")]
+        blr_device: String,
     },
     /// Embeddings from an EmbeddingGemma 2 .cmf (`cortiq convert --model
     /// <google/embeddinggemma-2 dir>`): texts, images (--image), videos
@@ -918,6 +966,47 @@ enum Commands {
         /// Output .cmf (the student with the trained metric)
         #[arg(long)]
         output: String,
+    },
+    /// One tensor through the NVG `blr` encoder with a per-stage profile, on
+    /// the CPU reference path and/or the device path, from Grams captured
+    /// once (layers 0..=l of the model's own forward) and cached. Without
+    /// --tensor: list the encoder's body linears with their shapes.
+    NvgBench {
+        /// Model .cmf (the calibration forward runs on it)
+        #[arg(long)]
+        model: String,
+        /// Tensor name (e.g. model.layers.0.mlp.down_proj.weight)
+        #[arg(long)]
+        tensor: Option<String>,
+        /// Calibration text (needed until the --gram-cache files exist)
+        #[arg(long)]
+        calib: Option<String>,
+        #[arg(long = "fit-tokens", default_value = "14848")]
+        fit_tokens: usize,
+        #[arg(long = "sel-tokens", default_value = "3072")]
+        sel_tokens: usize,
+        #[arg(long, default_value = "0.55")]
+        bpw: f64,
+        #[arg(long = "kv-factor", default_value = "1.0")]
+        kv_factor: f64,
+        #[arg(long, default_value = "auto", value_name = "auto|1|2")]
+        paths: String,
+        /// cpu | gpu | both
+        #[arg(long, default_value = "cpu")]
+        device: String,
+        #[arg(long, default_value = "16")]
+        threads: usize,
+        #[arg(long, default_value = "0.03")]
+        rho: f64,
+        /// Path prefix of the cached Grams (`<prefix>.fit.gram`, `.sel.gram`)
+        #[arg(long = "gram-cache")]
+        gram_cache: Option<String>,
+        /// Encode every body linear of this layer instead of one tensor
+        #[arg(long)]
+        layer: Option<usize>,
+        /// Tensors in flight on the device (--layer)
+        #[arg(long, default_value = "3")]
+        jobs: usize,
     },
     /// Chat with a model (applies the file's chat template), or one-shot
     /// with --prompt
@@ -3062,7 +3151,83 @@ async fn main() -> anyhow::Result<()> {
             dspark_sidecar,
             mimo_towers,
             sampling,
+            blr_bpw,
+            blr_method,
+            calib,
+            blr_kv_factor,
+            blr_paths,
+            blr_fit_tokens,
+            blr_sel_tokens,
+            blr_rho,
+            blr_threads,
+            blr_keep_src,
+            blr_device,
         } => {
+            if quant
+                .as_deref()
+                .is_some_and(|q| q.eq_ignore_ascii_case("blr"))
+            {
+                anyhow::ensure!(
+                    also_output.is_empty()
+                        && !mtp_sidecar
+                        && !dspark_sidecar
+                        && tensor_quant.is_empty()
+                        && !resume
+                        && defrag.is_none()
+                        && o1.is_none(),
+                    "--quant blr runs its own encoder: --also-output, --mtp-sidecar, \
+                     --dspark-sidecar, --tensor-quant, --resume, --defrag and --o1 do not apply"
+                );
+                let method = match blr_method.to_ascii_lowercase().as_str() {
+                    "nvg" => nvg::Method::Nvg,
+                    "dual-svid" | "dualsvid" => nvg::Method::DualSvid,
+                    other => anyhow::bail!("--blr-method {other}: expected nvg or dual-svid"),
+                };
+                let paths = match blr_paths.as_str() {
+                    "auto" => nvg::PathsChoice::Auto,
+                    "1" => nvg::PathsChoice::One,
+                    "2" => nvg::PathsChoice::Two,
+                    other => anyhow::bail!("--blr-paths {other}: expected auto, 1 or 2"),
+                };
+                anyhow::ensure!(
+                    blr_bpw > 0.0 && blr_bpw < 16.0,
+                    "--bpw {blr_bpw} out of range"
+                );
+                anyhow::ensure!(
+                    blr_kv_factor.is_finite() && blr_kv_factor > 0.0,
+                    "--blr-kv-factor {blr_kv_factor} must be finite and positive"
+                );
+                anyhow::ensure!(
+                    blr_fit_tokens >= 2 && blr_sel_tokens >= 2,
+                    "--blr-fit-tokens and --blr-sel-tokens must be at least 2"
+                );
+                let threads = blr_threads.unwrap_or_else(|| {
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(4)
+                });
+                let opts = nvg::BlrOpts {
+                    bpw: blr_bpw,
+                    method,
+                    calib,
+                    kv_factor: blr_kv_factor,
+                    paths,
+                    fit_tokens: blr_fit_tokens,
+                    sel_tokens: blr_sel_tokens,
+                    window: 512,
+                    rho: blr_rho,
+                    threads,
+                    keep_src: blr_keep_src,
+                    device: nvg::BlrDevice::resolve(&blr_device)?,
+                };
+                nvg::run_convert_blr(&model, &output, hf_token.as_deref(), &opts)?;
+                println!("✓ wrote {output}");
+                return Ok(());
+            }
+            anyhow::ensure!(
+                calib.is_none(),
+                "--calib is the NVG calibration text of --quant blr"
+            );
             anyhow::ensure!(
                 !mtp_sidecar || also_output.is_empty(),
                 "--also-output cannot be combined with --mtp-sidecar"
@@ -3357,6 +3522,45 @@ async fn main() -> anyhow::Result<()> {
         }
         #[cfg(not(feature = "gpu"))]
         Commands::NvgTrain { .. } => Err(anyhow::anyhow!("nvg-train needs a build with the gpu feature")),
+        Commands::NvgBench {
+            model,
+            tensor,
+            calib,
+            fit_tokens,
+            sel_tokens,
+            bpw,
+            kv_factor,
+            paths,
+            device,
+            threads,
+            rho,
+            gram_cache,
+            layer,
+            jobs,
+        } => {
+            let paths = match paths.as_str() {
+                "auto" => nvg::PathsChoice::Auto,
+                "1" => nvg::PathsChoice::One,
+                "2" => nvg::PathsChoice::Two,
+                other => anyhow::bail!("--paths {other}: expected auto, 1 or 2"),
+            };
+            nvgbench::run(&nvgbench::BenchOpts {
+                model: &model,
+                tensor: tensor.as_deref(),
+                calib: calib.as_deref(),
+                fit_tokens,
+                sel_tokens,
+                bpw,
+                kv_factor,
+                paths,
+                device: &device,
+                threads,
+                rho,
+                gram_cache: gram_cache.as_deref(),
+                layer,
+                jobs,
+            })
+        }
         Commands::QuantizeGptq {
             input,
             calib,
@@ -9394,6 +9598,72 @@ mod tests {
                 assert_eq!(quant.as_deref(), Some("q4tp"));
                 assert_eq!(output, "q4.cmf");
                 assert_eq!(also_output, ["q8_2f=q8.cmf", "f16=reference.cmf"]);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn convert_blr_options_parse() {
+        let cli = std::thread::Builder::new()
+            .name("convert-blr-parser".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                Cli::try_parse_from([
+                    "cortiq",
+                    "convert",
+                    "--model",
+                    "hf08",
+                    "--quant",
+                    "blr",
+                    "--output",
+                    "m.cmf",
+                    "--bpw",
+                    "1.0",
+                    "--blr-method",
+                    "dual-svid",
+                    "--calib",
+                    "calib.txt",
+                    "--blr-paths",
+                    "2",
+                    "--blr-rho",
+                    "0.125",
+                    "--blr-fit-tokens",
+                    "1024",
+                    "--blr-device",
+                    "cpu",
+                ])
+                .unwrap()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        match cli.command {
+            Commands::Convert {
+                quant,
+                blr_bpw,
+                blr_method,
+                calib,
+                blr_paths,
+                blr_rho,
+                blr_fit_tokens,
+                blr_sel_tokens,
+                blr_kv_factor,
+                blr_device,
+                ..
+            } => {
+                assert_eq!(blr_device, "cpu");
+                assert_eq!(nvg::BlrDevice::resolve(&blr_device).unwrap(), nvg::BlrDevice::Cpu);
+                assert!(nvg::BlrDevice::resolve("tpu").is_err());
+                assert_eq!(quant.as_deref(), Some("blr"));
+                assert_eq!(blr_bpw, 1.0);
+                assert_eq!(blr_method, "dual-svid");
+                assert_eq!(calib.as_deref(), Some("calib.txt"));
+                assert_eq!(blr_paths, "2");
+                assert_eq!(blr_rho, 0.125);
+                assert_eq!(blr_fit_tokens, 1024);
+                assert_eq!(blr_sel_tokens, 3072);
+                assert_eq!(blr_kv_factor, 1.0);
             }
             _ => panic!("wrong subcommand"),
         }

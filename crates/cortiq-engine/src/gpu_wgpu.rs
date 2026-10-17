@@ -45,6 +45,9 @@ pub(crate) mod dense_mv;
 pub(crate) mod gram;
 /// GPTQ fold operator and q4tp row sweep on the device.
 pub(crate) mod gptq_dev;
+/// Binary low-rank (`blr`) per-op kernels: two ±1 stages, decode and batched.
+pub(crate) mod blr;
+pub use blr::blr_matmat;
 /// GatedDeltaNet forward and BPTT backward on the device (training).
 pub mod gdn_train;
 /// Trainer kernels: RMSNorm, SwiGLU, gate, q/k norm + RoPE, attention.
@@ -55,6 +58,9 @@ pub mod train_mm;
 pub mod train_head;
 /// Subgroup q1g decode matvec (bit-identical to `q1g_matvec`, no barriers).
 pub(crate) mod q1g_mv;
+/// Device linear algebra of the NVG `blr` encoder (f32 GEMM, SPD solves,
+/// discrete-knot kernels).
+pub mod nvg_dev;
 
 /// Workgroup limit per dimension (WebGPU minimum; lm_head has more
 /// rows — we use grid-stride in the shader).

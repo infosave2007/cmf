@@ -4,6 +4,7 @@ pub mod attention;
 pub mod chat_template;
 pub mod cpuprof;
 pub mod audiovae;
+pub mod blr;
 pub mod bounded;
 pub mod dit;
 pub mod dsv4;
@@ -192,3 +193,5 @@ pub fn gpu_q1_matvec_for_test(
     gpu_metal::q1_matvec(model, idx, xs, rows, cols, out)
 }
 pub use sampler::SamplerConfig;
+/// Re-exported for offline tools (the NVG encoder's f64 GEMMs in the CLI).
+pub use matrixmultiply;
