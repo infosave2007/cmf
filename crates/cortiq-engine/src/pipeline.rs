@@ -2861,7 +2861,7 @@ impl Pipeline {
             use cortiq_core::TensorDtype as D;
             matches!(
                 model.tensors[t.0].dtype,
-                D::Q4TiledP | D::Q4Tiled | D::Q4Block | D::Q8Row | D::Q8_2f | D::Q1
+                D::Q4TiledP | D::Q4Tiled | D::Q4Block | D::Q8Row | D::Q8_2f | D::Q1 | D::Q1G
             )
         };
         let dense_fast = plan.iter().all(|it| match it {

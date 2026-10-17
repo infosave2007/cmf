@@ -29,7 +29,7 @@ DIR_RECORD_LEN = 56
 DTYPE_NAMES = {
     0: "F32", 1: "F16", 2: "Bf16", 3: "Q8Row", 4: "Q4Block", 5: "Mix84", 6: "U8",
     7: "Q4Col", 8: "Vbit", 9: "Q8_2f", 10: "VbitRo", 11: "Q4Tiled", 12: "Q1", 13: "Q1S",
-    14: "Q1T", 15: "Q4TiledP", 16: "Q2TiledP", 17: "U32", 18: "U64",
+    14: "Q1T", 15: "Q4TiledP", 16: "Q2TiledP", 17: "U32", 18: "U64", 20: "Q1G",
 }
 # the `--dtype` / `--tensor-quant` spelling of the dtypes the tools emit
 QUANT_NAME = {"F16": "f16", "Q8_2f": "q8_2f", "Q4TiledP": "q4tp", "Q2TiledP": "q2tp",

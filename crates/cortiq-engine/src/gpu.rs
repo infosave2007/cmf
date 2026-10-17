@@ -1107,6 +1107,8 @@ pub struct BatchJob<'a> {
 pub enum BatchLayout {
     Q8,
     Q1,
+    /// q1g: sign + scale planes, one scale per 128 (q1's raw-xs contract).
+    Q1g,
     Q4t,
     Q4tp,
 }
@@ -1494,6 +1496,27 @@ pub fn q1_matvec(
         Backend::Metal => crate::gpu_metal::q1_matvec(model, idx, xs, rows, cols, out),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::q1_matvec(model, idx, xs, rows, cols, out),
+        Backend::None => false,
+    }
+}
+
+/// q1g matvec (sign + scale planes, raw f32 activations); the q1 kernel's
+/// walk and sums, so a uniform-scale repack matches `q1_matvec` bit for
+/// bit. false = CPU fallback.
+#[allow(unused_variables)]
+pub fn q1g_matvec(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::q1g_matvec(model, idx, xs, rows, cols, out),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::q1g_matvec(model, idx, xs, rows, cols, out),
         Backend::None => false,
     }
 }
@@ -2259,6 +2282,24 @@ pub fn q1_matmat(
     match backend() {
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::q1_matmat(model, idx, xs, b, rows, cols, out),
+        #[allow(unused_variables)]
+        _ => false,
+    }
+}
+
+/// Batched q1g GEMM (prefill). wgpu only, like `q1_matmat`.
+pub fn q1g_matmat(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::q1g_matmat(model, idx, xs, b, rows, cols, out),
         #[allow(unused_variables)]
         _ => false,
     }

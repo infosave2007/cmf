@@ -247,6 +247,154 @@ pub fn dequant_q1s(bytes: &[u8], dst: &mut [f32]) {
     }
 }
 
+/// q1g group: ONE f16 scale per 128 weights — the native group of
+/// 1-bit-trained checkpoints, which `q1` stores four times (once per
+/// 32-tile).
+pub const Q1G_GROUP: usize = 128;
+/// Sign-bit bytes per q1g group (128 bits).
+pub const Q1G_BITS: usize = Q1G_GROUP / 8;
+
+/// Byte offset of the q1g scale plane inside the payload: the sign plane
+/// comes first, `rows · cols/8` bytes (a multiple of 16, so the scale
+/// plane is as aligned as the tensor itself).
+#[inline]
+pub fn q1g_scale_offset(rows: usize, cols: usize) -> usize {
+    rows * (cols / 8)
+}
+
+/// Scale of q1g group `g` (flat index `row · cols/128 + group`).
+#[inline]
+pub fn q1g_scale(bytes: &[u8], scale_off: usize, g: usize) -> f32 {
+    let o = scale_off + g * 2;
+    f16_to_f32(u16::from_le_bytes([bytes[o], bytes[o + 1]]))
+}
+
+/// Dequantize a full `q1g` tensor: `[sign bits: rows·cols/8][f16 scales:
+/// rows·cols/128]`; bit k of byte j (LSB-first) is weight j·8+k of the
+/// row, value = scale · (2·bit − 1). `cols % 128 == 0`.
+pub fn dequant_q1g(bytes: &[u8], rows: usize, cols: usize, dst: &mut [f32]) {
+    debug_assert_eq!(cols % Q1G_GROUP, 0);
+    let sc_off = q1g_scale_offset(rows, cols);
+    let n_groups = rows * (cols / Q1G_GROUP);
+    for g in 0..n_groups {
+        let s = q1g_scale(bytes, sc_off, g);
+        let base = g * Q1G_GROUP;
+        for (j, &byte) in bytes[g * Q1G_BITS..(g + 1) * Q1G_BITS].iter().enumerate() {
+            for k in 0..8 {
+                dst[base + j * 8 + k] = if (byte >> k) & 1 == 1 { s } else { -s };
+            }
+        }
+    }
+}
+
+/// Outcome of a `q1 → q1g` repack ([`repack_q1_to_q1g`]).
+#[derive(Debug, Clone)]
+pub struct Q1gRepack {
+    /// The q1g payload. Always built: a group whose four tile scales
+    /// differ carries its representative (see `repack_q1_to_q1g`), so the
+    /// caller decides from the counts whether to keep it.
+    pub data: Vec<u8>,
+    /// 128-groups in the tensor.
+    pub groups: usize,
+    /// Groups whose four 32-tile scales are NOT byte-identical — the only
+    /// groups whose decoded weights differ from the source.
+    pub differing: usize,
+    /// Largest `|s_tile − s_group| / s_group` over the differing groups
+    /// (0 when none differ; infinite when the representative is zero or
+    /// a scale is non-finite).
+    pub max_rel: f64,
+    /// Differing groups beyond the caller's relative tolerance.
+    pub over_tol: usize,
+}
+
+/// Repack a `q1` payload into `q1g` (2-D, `cols % 128 == 0`).
+///
+/// The sign plane is the tiles' bit fields concatenated, so it is always
+/// exact. Each 128-group keeps one scale: the tiles' common value when all
+/// four f16 scales are byte-identical (then the group decodes bit for bit
+/// as before), otherwise the f16 nearest the mean of the four — the
+/// L2-optimal single level for those 128 weights, since each tile
+/// contributes 32 weights of magnitude `s_tile`. Groups like that are
+/// counted in `differing`, and `over_tol` counts the ones whose relative
+/// spread exceeds `tol`.
+pub fn repack_q1_to_q1g(bytes: &[u8], rows: usize, cols: usize, tol: f64) -> Q1gRepack {
+    assert_eq!(cols % Q1G_GROUP, 0, "q1g needs cols % 128 == 0");
+    assert_eq!(
+        bytes.len(),
+        rows * (cols / GROUP_SIZE) * Q1_TILE,
+        "q1 payload length"
+    );
+    let groups = rows * (cols / Q1G_GROUP);
+    let sc_off = q1g_scale_offset(rows, cols);
+    let mut data = vec![0u8; sc_off + groups * 2];
+    let (mut differing, mut over_tol, mut max_rel) = (0usize, 0usize, 0f64);
+    for g in 0..groups {
+        let mut sc = [0u16; 4];
+        for (t, s) in sc.iter_mut().enumerate() {
+            let tile = &bytes[(g * 4 + t) * Q1_TILE..(g * 4 + t + 1) * Q1_TILE];
+            *s = u16::from_le_bytes([tile[0], tile[1]]);
+            data[g * Q1G_BITS + t * 4..g * Q1G_BITS + t * 4 + 4].copy_from_slice(&tile[2..6]);
+        }
+        let rep = if sc.iter().all(|&s| s == sc[0]) {
+            sc[0]
+        } else {
+            differing += 1;
+            let vals = sc.map(f16_to_f32);
+            let mean = vals.iter().map(|&v| v as f64).sum::<f64>() / 4.0;
+            let rep = f32_to_f16(mean as f32);
+            let r = f16_to_f32(rep) as f64;
+            let rel = vals
+                .iter()
+                .map(|&v| {
+                    let d = (v as f64 - r).abs();
+                    if d == 0.0 {
+                        0.0
+                    } else if r != 0.0 && r.is_finite() {
+                        d / r.abs()
+                    } else {
+                        f64::INFINITY
+                    }
+                })
+                .fold(
+                    0f64,
+                    |a, b| if b.is_nan() { f64::INFINITY } else { a.max(b) },
+                );
+            max_rel = max_rel.max(rel);
+            if rel.is_nan() || rel > tol {
+                over_tol += 1;
+            }
+            rep
+        };
+        data[sc_off + g * 2..sc_off + g * 2 + 2].copy_from_slice(&rep.to_le_bytes());
+    }
+    Q1gRepack {
+        data,
+        groups,
+        differing,
+        max_rel,
+        over_tol,
+    }
+}
+
+/// The inverse of [`repack_q1_to_q1g`]: a `q1g` payload back to `q1` tiles
+/// (each group's scale written into its four tiles). Exact — the result
+/// decodes to the same weights bit for bit — so a runtime that predates
+/// dtype 20 can still read the model, and a q1/q1g pair built this way
+/// isolates the kernels from the repack's tolerance groups.
+pub fn unpack_q1g_to_q1(bytes: &[u8], rows: usize, cols: usize) -> Vec<u8> {
+    assert_eq!(cols % Q1G_GROUP, 0, "q1g needs cols % 128 == 0");
+    let sc_off = q1g_scale_offset(rows, cols);
+    let tiles = rows * (cols / GROUP_SIZE);
+    assert_eq!(bytes.len(), sc_off + tiles / 4 * 2, "q1g payload length");
+    let mut q = vec![0u8; tiles * Q1_TILE];
+    for t in 0..tiles {
+        let o = t * Q1_TILE;
+        q[o..o + 2].copy_from_slice(&bytes[sc_off + (t / 4) * 2..sc_off + (t / 4) * 2 + 2]);
+        q[o + 2..o + 6].copy_from_slice(&bytes[t * 4..t * 4 + 4]);
+    }
+    q
+}
+
 /// Ternary tile: 2 (f16 scale) + 7 (32 base-3 codes, 5 ternary values per
 /// byte, `3^5 = 243 ≤ 256`) = 9 bytes ⇒ ~2.25 bpw base (vs the old 2-bit
 /// 10-byte tile). The packed codes carry the same `{0,+s,−s}` values, so
@@ -576,6 +724,14 @@ pub fn expected_nbytes(dtype: TensorDtype, shape: &[usize]) -> Option<usize> {
             // Interleaved tiles: [f16 scale][4B bits] per 32-group.
             n.div_ceil(GROUP_SIZE).checked_mul(Q1_TILE)
         }
+        TensorDtype::Q1G => {
+            // [sign plane n/8][f16 scale plane n/128 · 2] — 2-D only, whole
+            // 128-groups per row (the encoder emits nothing else).
+            if shape.len() != 2 || shape[1] % Q1G_GROUP != 0 {
+                return None;
+            }
+            (n / 8).checked_add((n / Q1G_GROUP).checked_mul(2)?)
+        }
         TensorDtype::Q4TiledP => {
             // [nibbles][row params][row-aligned 5-bit codes] — needs the
             // row count, so 2-D only (the encoder emits nothing else).
@@ -628,6 +784,7 @@ fn has_fixed_payload_size(dtype: TensorDtype) -> bool {
             | TensorDtype::Q4TiledP
             | TensorDtype::Q2TiledP
             | TensorDtype::Q1
+            | TensorDtype::Q1G
             | TensorDtype::Q8_2f
             | TensorDtype::U8
             | TensorDtype::U32
@@ -652,6 +809,17 @@ pub fn validate_payload(dtype: TensorDtype, shape: &[usize], bytes: &[u8]) -> Re
         if shape[1] == 0 || shape[1] % GROUP_SIZE != 0 {
             return Err(format!(
                 "q4tp cols {} not a positive multiple of {GROUP_SIZE}",
+                shape[1]
+            ));
+        }
+    }
+    if dtype == TensorDtype::Q1G {
+        if shape.len() != 2 {
+            return Err(format!("q1g tensor must be 2-D, got {shape:?}"));
+        }
+        if shape[1] == 0 || shape[1] % Q1G_GROUP != 0 {
+            return Err(format!(
+                "q1g cols {} not a positive multiple of {Q1G_GROUP}",
                 shape[1]
             ));
         }
@@ -811,6 +979,23 @@ pub fn dequant_tensor(entry: &TensorEntry, bytes: &[u8], dst: &mut [f32]) -> Res
             dequant_q2tp(bytes, entry.shape[0], entry.shape[1], dst);
         }
         TensorDtype::Q1 => dequant_q1(bytes, dst),
+        TensorDtype::Q1G => {
+            if entry.shape.len() != 2 || entry.shape[1] % Q1G_GROUP != 0 {
+                return Err(format!(
+                    "q1g tensor '{}' must be 2-D with cols % {Q1G_GROUP} == 0",
+                    entry.name
+                ));
+            }
+            let need = expected_nbytes(TensorDtype::Q1G, &entry.shape).unwrap_or(usize::MAX);
+            if bytes.len() < need {
+                return Err(format!(
+                    "q1g tensor '{}': payload {} < {need} bytes",
+                    entry.name,
+                    bytes.len()
+                ));
+            }
+            dequant_q1g(bytes, entry.shape[0], entry.shape[1], dst);
+        }
         TensorDtype::Q1S => dequant_q1s(bytes, dst),
         TensorDtype::Q1T => {
             if entry.shape.len() != 2 {
@@ -863,6 +1048,7 @@ pub fn bytes_per_weight(dtype: TensorDtype) -> f32 {
         TensorDtype::Q2TiledP => 0.269_531_25,
         TensorDtype::Vbit | TensorDtype::VbitRo => 0.5,
         TensorDtype::Q1 => 0.1875, // 6 bytes per 32 weights
+        TensorDtype::Q1G => 0.140_625, // 18 bytes per 128 weights
         // q1 base + a small sparse f16 overlay (informational; the true
         // size is the stored span, which grows with the outlier budget).
         TensorDtype::Q1S => 0.3125,
@@ -939,5 +1125,200 @@ mod f16_tests {
     #[test]
     fn vbit_is_supported() {
         assert!(crate::types::TensorDtype::Vbit.is_supported());
+    }
+}
+
+#[cfg(test)]
+mod q1g_tests {
+    use super::*;
+
+    /// Deterministic xorshift — the tests need reproducible "real-like"
+    /// payloads, not a crate dependency.
+    fn rng(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// A Bonsai-like q1 payload: one bf16-representable magnitude per
+    /// 128-group (log-spread over ~3 octaves like the published model's
+    /// scales), written into all four 32-tiles as f16, random sign bits.
+    fn bonsai_like_q1(rows: usize, cols: usize, seed: u64) -> Vec<u8> {
+        let mut st = seed | 1;
+        let gpr = cols / GROUP_SIZE;
+        let mut q = vec![0u8; rows * gpr * Q1_TILE];
+        for g in 0..rows * cols / Q1G_GROUP {
+            let e = (rng(&mut st) % 3000) as f32 / 1000.0;
+            let s = 0.004 * 2f32.powf(e);
+            // bf16 → f16: a bf16 value in this range is exact in f16.
+            let s = f32::from_bits(s.to_bits() & 0xFFFF_0000);
+            let h = f32_to_f16(s);
+            assert_eq!(f16_to_f32(h), s, "bf16 scale must be f16-exact");
+            for t in 0..4 {
+                let o = (g * 4 + t) * Q1_TILE;
+                q[o..o + 2].copy_from_slice(&h.to_le_bytes());
+                let bits = rng(&mut st) as u32;
+                q[o + 2..o + 6].copy_from_slice(&bits.to_le_bytes());
+            }
+        }
+        q
+    }
+
+    #[test]
+    fn q1g_dtype_identity() {
+        let d = TensorDtype::Q1G;
+        assert_eq!(d.id(), 20);
+        assert_eq!(TensorDtype::from_id(20), Some(d));
+        assert_eq!(d.name(), "q1g");
+        assert!(d.is_supported());
+        assert!(!d.is_raw());
+        assert_eq!(serde_json::to_string(&d).unwrap(), "\"q1g\"");
+    }
+
+    #[test]
+    fn q1g_size_and_validation() {
+        let (rows, cols) = (6usize, 384usize);
+        let n = rows * cols;
+        // 1.125 bits/weight exactly: n/8 sign bytes + n/128 f16 scales.
+        assert_eq!(
+            expected_nbytes(TensorDtype::Q1G, &[rows, cols]),
+            Some(n * 9 / 64)
+        );
+        assert_eq!(
+            expected_nbytes(TensorDtype::Q1G, &[rows, cols]).unwrap() * 4,
+            expected_nbytes(TensorDtype::Q1, &[rows, cols]).unwrap() * 3,
+            "q1g is exactly 3/4 of q1"
+        );
+        assert_eq!(expected_nbytes(TensorDtype::Q1G, &[rows, 96]), None);
+        assert_eq!(expected_nbytes(TensorDtype::Q1G, &[n]), None);
+        let good = vec![0u8; n * 9 / 64];
+        assert!(validate_payload(TensorDtype::Q1G, &[rows, cols], &good).is_ok());
+        assert!(validate_payload(TensorDtype::Q1G, &[rows, cols], &good[1..]).is_err());
+        let e = validate_payload(TensorDtype::Q1G, &[rows * 3, 128], &good[..1]).unwrap_err();
+        assert!(e.contains("payload length"), "{e}");
+        let e = validate_payload(TensorDtype::Q1G, &[rows, 96], &good).unwrap_err();
+        assert!(e.contains("multiple of 128"), "{e}");
+        let e = validate_payload(TensorDtype::Q1G, &[n], &good).unwrap_err();
+        assert!(e.contains("2-D"), "{e}");
+    }
+
+    /// The point of the dtype: a q1 tensor whose four tile scales agree in
+    /// every 128-group repacks to q1g with NO change at all — same sign
+    /// bits byte for byte, same decoded f32 bit for bit.
+    #[test]
+    fn uniform_q1_repacks_bit_exactly() {
+        for &(rows, cols) in &[(1usize, 128usize), (7, 256), (33, 2048), (4, 6144)] {
+            let q1 = bonsai_like_q1(rows, cols, (rows * 131 + cols) as u64);
+            let rp = repack_q1_to_q1g(&q1, rows, cols, 0.0);
+            assert_eq!(rp.groups, rows * cols / Q1G_GROUP);
+            assert_eq!((rp.differing, rp.over_tol, rp.max_rel), (0, 0, 0.0));
+            assert_eq!(
+                rp.data.len(),
+                expected_nbytes(TensorDtype::Q1G, &[rows, cols]).unwrap()
+            );
+            assert!(validate_payload(TensorDtype::Q1G, &[rows, cols], &rp.data).is_ok());
+            // The sign plane IS the tiles' bit fields, concatenated.
+            for t in 0..rows * cols / GROUP_SIZE {
+                assert_eq!(
+                    &rp.data[t * 4..t * 4 + 4],
+                    &q1[t * Q1_TILE + 2..t * Q1_TILE + 6]
+                );
+            }
+            let (mut a, mut b) = (vec![0f32; rows * cols], vec![0f32; rows * cols]);
+            dequant_q1(&q1, &mut a);
+            dequant_q1g(&rp.data, rows, cols, &mut b);
+            assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()));
+            // …and through the generic entry point.
+            let entry = TensorEntry {
+                name: "w".into(),
+                dtype: TensorDtype::Q1G,
+                shape: vec![rows, cols],
+                off: 0,
+                nbytes: rp.data.len() as u64,
+                hash: 0,
+                shard: 0,
+            };
+            let mut c = vec![0f32; rows * cols];
+            dequant_tensor(&entry, &rp.data, &mut c).unwrap();
+            assert_eq!(b, c);
+            // …and back: the q1 bytes themselves, exactly.
+            assert_eq!(unpack_q1g_to_q1(&rp.data, rows, cols), q1);
+        }
+    }
+
+    /// A group whose tiles disagree by f16 rounding (the 393 of 13.4 M on
+    /// Bonsai-1.7B) is counted, gets the f16 nearest the tiles' mean, and is
+    /// the ONLY place the decoded weights move.
+    #[test]
+    fn differing_groups_are_counted_and_confined() {
+        let (rows, cols) = (8usize, 512usize);
+        let mut q1 = bonsai_like_q1(rows, cols, 99);
+        let bumped = [3usize, 17, 30];
+        for &g in &bumped {
+            let o = (g * 4 + 2) * Q1_TILE; // third tile of the group
+            let h = u16::from_le_bytes([q1[o], q1[o + 1]]) + 1; // one f16 ulp
+            q1[o..o + 2].copy_from_slice(&h.to_le_bytes());
+        }
+        let strict = repack_q1_to_q1g(&q1, rows, cols, 0.0);
+        assert_eq!(strict.differing, bumped.len());
+        assert_eq!(
+            strict.over_tol,
+            bumped.len(),
+            "tol 0 refuses every differing group"
+        );
+        assert!(
+            strict.max_rel > 0.0 && strict.max_rel < 2f64.powi(-9),
+            "{}",
+            strict.max_rel
+        );
+        let loose = repack_q1_to_q1g(&q1, rows, cols, 2f64.powi(-8));
+        assert_eq!((loose.differing, loose.over_tol), (bumped.len(), 0));
+        assert_eq!(
+            loose.data, strict.data,
+            "the tolerance only decides, never encodes"
+        );
+        let (mut a, mut b) = (vec![0f32; rows * cols], vec![0f32; rows * cols]);
+        dequant_q1(&q1, &mut a);
+        dequant_q1g(&loose.data, rows, cols, &mut b);
+        // q1g → q1 decodes to the q1g weights (not the source's) bit for bit.
+        let mut back = vec![0f32; rows * cols];
+        dequant_q1(&unpack_q1g_to_q1(&loose.data, rows, cols), &mut back);
+        assert!(back.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()));
+        for g in 0..rows * cols / Q1G_GROUP {
+            let (wa, wb) = (&a[g * 128..(g + 1) * 128], &b[g * 128..(g + 1) * 128]);
+            if bumped.contains(&g) {
+                // Same signs; one magnitude for the whole group, within the
+                // spread of the four tile scales.
+                let s = wb[0].abs();
+                assert!(wb.iter().all(|v| v.abs() == s));
+                assert!(wa.iter().zip(wb).all(|(x, y)| x.signum() == y.signum()));
+                let (lo, hi) = wa.iter().fold((f32::MAX, 0f32), |(l, h), v| {
+                    (l.min(v.abs()), h.max(v.abs()))
+                });
+                assert!(s >= lo && s <= hi, "{s} outside [{lo}, {hi}]");
+            } else {
+                assert!(wa.iter().zip(wb).all(|(x, y)| x.to_bits() == y.to_bits()));
+            }
+        }
+    }
+
+    /// A scale that is zero in one tile and not in the others is not one
+    /// group: the zero tile sits a whole representative away (rel ≥ 1),
+    /// far outside any f16-rounding tolerance.
+    #[test]
+    fn zero_vs_nonzero_tile_is_never_within_tolerance() {
+        let (rows, cols) = (1usize, 128usize);
+        let mut q1 = bonsai_like_q1(rows, cols, 5);
+        q1[0..2].copy_from_slice(&0u16.to_le_bytes());
+        let rp = repack_q1_to_q1g(&q1, rows, cols, 0.5);
+        assert_eq!((rp.differing, rp.over_tol), (1, 1));
+        assert!(rp.max_rel >= 1.0, "{}", rp.max_rel);
+        // All four zero is a uniform group like any other.
+        for t in 0..4 {
+            q1[t * Q1_TILE..t * Q1_TILE + 2].copy_from_slice(&0u16.to_le_bytes());
+        }
+        let rp = repack_q1_to_q1g(&q1, rows, cols, 0.0);
+        assert_eq!((rp.differing, rp.over_tol), (0, 0));
     }
 }
