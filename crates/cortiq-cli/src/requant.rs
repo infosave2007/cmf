@@ -303,6 +303,175 @@ pub fn cmd_requant(
     Ok(())
 }
 
+/// `q1 → q1g`: repack the 1-bit tensors of a model whose native scale group
+/// is 128 (Bonsai class). Such a `q1` file stores every group scale four
+/// times, once per 32-tile; `q1g` keeps the sign bits byte for byte and
+/// one scale per group — 1.5 → 1.125 bits/weight with nothing re-quantized.
+///
+/// Lossless by default: a 128-group whose four tile scales are not
+/// byte-identical refuses the whole run (nothing is written) and the
+/// counts say where. `--allow-tol` accepts groups that agree within `tol`
+/// (relative; they take the f16 nearest the mean of their four scales, the
+/// L2-optimal level). Tensors with a group beyond `tol`, or with
+/// `cols % 128 != 0`, stay `q1` byte for byte. Everything else in the file
+/// is copied verbatim.
+pub fn cmd_requant_q1g(
+    model_path: &str,
+    output: Option<&str>,
+    in_place: bool,
+    allow_tol: bool,
+    tol: f64,
+) -> anyhow::Result<()> {
+    use cortiq_core::quant::{Q1G_GROUP, repack_q1_to_q1g};
+    if !in_place && output.is_none() {
+        bail!("either --output or --in-place is required");
+    }
+    anyhow::ensure!(
+        tol.is_finite() && tol >= 0.0,
+        "--tol must be a finite, non-negative ratio (got {tol})"
+    );
+    let model = Arc::new(CmfModel::open_sharded(model_path)?);
+    crate::knowledge::refuse_genome_rewrite(&model, "requant")?;
+
+    // Plan every tensor before writing anything: the run is all or nothing.
+    let mut plans: Vec<(usize, Vec<u8>)> = Vec::new();
+    let (mut groups, mut differing, mut accepted_tol) = (0usize, 0usize, 0usize);
+    let mut max_rel = 0f64;
+    let mut kept_shape: Vec<&str> = Vec::new();
+    let mut kept_tol: Vec<&str> = Vec::new();
+    for (i, e) in model.tensors.iter().enumerate() {
+        if e.dtype != TensorDtype::Q1 {
+            continue;
+        }
+        if e.shape.len() != 2 || e.shape[1] % Q1G_GROUP != 0 {
+            kept_shape.push(&e.name);
+            continue;
+        }
+        let (rows, cols) = (e.shape[0], e.shape[1]);
+        let rp = repack_q1_to_q1g(model.entry_bytes(e), rows, cols, tol);
+        groups += rp.groups;
+        differing += rp.differing;
+        if rp.differing > 0 {
+            max_rel = max_rel.max(rp.max_rel);
+            println!(
+                "  {}: {} of {} groups differ (max rel {:.3e}){}",
+                e.name,
+                rp.differing,
+                rp.groups,
+                rp.max_rel,
+                if rp.over_tol > 0 {
+                    format!(" — {} beyond tol {tol}, stays q1", rp.over_tol)
+                } else {
+                    String::new()
+                }
+            );
+        }
+        if rp.over_tol > 0 {
+            kept_tol.push(&e.name);
+            continue;
+        }
+        accepted_tol += rp.differing;
+        plans.push((i, rp.data));
+    }
+    if accepted_tol > 0 && !allow_tol {
+        bail!(
+            "{accepted_tol} of {groups} q1 128-groups have four tile scales that are not \
+             byte-identical (all within --tol {tol}, max rel {max_rel:.3e}: f16 rounding of the \
+             native scale). Repacking would move those groups' weights by up to that much; \
+             re-run with --allow-tol to accept. Nothing was written."
+        );
+    }
+    if plans.is_empty() {
+        bail!(
+            "no q1 tensor qualifies for q1g ({} with cols % 128 != 0, {} with a group beyond \
+             --tol {tol}); nothing was written",
+            kept_shape.len(),
+            kept_tol.len()
+        );
+    }
+    let exact = groups - differing;
+    let summary = format!(
+        "{} q1 tensors → q1g; 128-groups: {groups} total, {exact} exact, {accepted_tol} within \
+         tol (max rel {max_rel:.3e}); kept q1: {} (cols % 128), {} (beyond tol)",
+        plans.len(),
+        kept_shape.len(),
+        kept_tol.len()
+    );
+
+    if in_place {
+        let mut patches: Vec<(usize, TensorDtype, Vec<u8>)> = Vec::with_capacity(plans.len());
+        let (mut before, mut after) = (0u64, 0u64);
+        for (i, data) in plans {
+            let entry = &model.tensors[i];
+            if entry.shard != 0 {
+                bail!(
+                    "'{}' lives in a sibling shard; in-place needs shard 0",
+                    entry.name
+                );
+            }
+            before += entry.nbytes;
+            after += data.len() as u64;
+            patches.push((i, TensorDtype::Q1G, data));
+        }
+        drop(model); // release the mmap before rewriting under it
+        CmfModel::recode_entries_in_place(model_path, &patches)?;
+        println!(
+            "requant → q1g (in place): {summary}\n\
+             q1 payload {:.1} MB → {:.1} MB (file length unchanged; slack goes dark)",
+            before as f64 / 1e6,
+            after as f64 / 1e6,
+        );
+        return Ok(());
+    }
+
+    let output = output.unwrap();
+    anyhow::ensure!(
+        std::path::Path::new(output) != std::path::Path::new(model_path),
+        "--output must differ from the source (use --in-place to rewrite it)"
+    );
+    let mut by_idx: std::collections::HashMap<usize, Vec<u8>> = plans.into_iter().collect();
+    let (mut before, mut after) = (0u64, 0u64);
+    let mut specs: Vec<TensorSpec> = Vec::with_capacity(model.tensors.len());
+    for (i, entry) in model.tensors.iter().enumerate() {
+        let (dtype, data) = match by_idx.remove(&i) {
+            Some(d) => {
+                before += entry.nbytes;
+                after += d.len() as u64;
+                (TensorDtype::Q1G, d)
+            }
+            None => (entry.dtype, model.entry_bytes(entry).to_vec()),
+        };
+        specs.push(TensorSpec {
+            name: entry.name.clone(),
+            dtype,
+            shape: entry.shape.clone(),
+            data,
+        });
+    }
+    CmfModel::write(
+        output,
+        &model.header,
+        &specs,
+        Some(&model.masks),
+        model.vocab.as_deref(),
+    )?;
+    let (in_sz, out_sz) = (
+        std::fs::metadata(model_path)?.len() as f64,
+        std::fs::metadata(output)?.len() as f64,
+    );
+    println!(
+        "requant → q1g: {summary}\n\
+         q1 payload {:.1} MB → {:.1} MB ({:+.1}%), file {:.1} MB → {:.1} MB ({:+.1}%)",
+        before as f64 / 1e6,
+        after as f64 / 1e6,
+        (after as f64 / before as f64 - 1.0) * 100.0,
+        in_sz / 1e6,
+        out_sz / 1e6,
+        (out_sz / in_sz - 1.0) * 100.0
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,6 +730,157 @@ mod tests {
             assert!((got2[r] - got[r]).abs() <= got[r].abs().max(1.0) * 1e-5);
             assert!((got2[rows + r] - got[r]).abs() <= got[r].abs().max(1.0) * 1e-5);
         }
+    }
+
+    /// A q1 payload with ONE scale per 128-group written into all four of
+    /// its tiles (the Bonsai shape), deterministic signs.
+    fn uniform_q1(rows: usize, cols: usize, seed: u32) -> Vec<u8> {
+        use cortiq_core::quant::{Q1_TILE, f32_to_f16};
+        let tiles = rows * cols / GROUP_SIZE;
+        let mut q = vec![0u8; tiles * Q1_TILE];
+        for t in 0..tiles {
+            let s = 0.01 + 0.0005 * ((t / 4) as u32 ^ seed) as f32 % 0.02;
+            let h = f32_to_f16(s).to_le_bytes();
+            q[t * Q1_TILE..t * Q1_TILE + 2].copy_from_slice(&h);
+            let bits = (t as u32 ^ seed).wrapping_mul(2_654_435_761);
+            q[t * Q1_TILE + 2..t * Q1_TILE + 6].copy_from_slice(&bits.to_le_bytes());
+        }
+        q
+    }
+
+    fn dequant_of(m: &CmfModel, name: &str) -> Vec<f32> {
+        let e = m.tensor(name).unwrap();
+        let mut out = vec![0f32; e.shape.iter().product()];
+        dequant_tensor(e, m.entry_bytes(e), &mut out).unwrap();
+        out
+    }
+
+    /// End to end through the real command: uniform q1 tensors become q1g
+    /// with identical decoded weights; a group whose tiles disagree by an
+    /// f16 ulp refuses the run unless `--allow-tol`; a group far outside
+    /// the tolerance and a `cols % 128 != 0` tensor stay q1 byte for byte;
+    /// the in-place path writes the same thing.
+    #[test]
+    fn q1g_repack_is_lossless_and_refuses_what_it_cannot_keep() {
+        use cortiq_core::quant::Q1_TILE;
+        let dir = std::env::temp_dir().join(format!("cmf-q1g-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.cmf");
+        let out = dir.join("out.cmf");
+        let refused = dir.join("refused.cmf");
+        for p in [&out, &refused] {
+            if p.exists() {
+                std::fs::remove_file(p).unwrap();
+            }
+        }
+        let (rows, cols) = (8usize, 256usize);
+        let exact = uniform_q1(rows, cols, 7);
+        let mut ulp = uniform_q1(rows, cols, 9);
+        // group 5, tile 1: one f16 ulp up
+        let o = (5 * 4 + 1) * Q1_TILE;
+        let h = u16::from_le_bytes([ulp[o], ulp[o + 1]]) + 1;
+        ulp[o..o + 2].copy_from_slice(&h.to_le_bytes());
+        let mut wild = uniform_q1(rows, cols, 11);
+        // group 2, tile 3: twice the scale — not one group at all
+        let o = (2 * 4 + 3) * Q1_TILE;
+        let s = cortiq_core::quant::f16_to_f32(u16::from_le_bytes([wild[o], wild[o + 1]]));
+        wild[o..o + 2].copy_from_slice(&cortiq_core::quant::f32_to_f16(2.0 * s).to_le_bytes());
+        let narrow = uniform_q1(rows, 96, 13);
+        let norm: Vec<u8> = (0..cols)
+            .flat_map(|i| cortiq_core::quant::f32_to_f16(1.0 + i as f32 * 1e-3).to_le_bytes())
+            .collect();
+        let q1 = |name: &str, c: usize, data: &Vec<u8>| TensorSpec {
+            name: name.into(),
+            dtype: TensorDtype::Q1,
+            shape: vec![rows, c],
+            data: data.clone(),
+        };
+        let tensors = vec![
+            q1("model.layers.0.mlp.gate_proj.weight", cols, &exact),
+            q1("model.layers.0.mlp.up_proj.weight", cols, &ulp),
+            q1("model.layers.0.mlp.down_proj.weight", cols, &wild),
+            q1("model.layers.0.self_attn.o_proj.weight", 96, &narrow),
+            TensorSpec {
+                name: "model.norm.weight".into(),
+                dtype: TensorDtype::F16,
+                shape: vec![cols],
+                data: norm.clone(),
+            },
+        ];
+        let header: cortiq_core::CmfHeader = serde_json::from_value(serde_json::json!({
+            "format": "cmf",
+            "version": cortiq_core::CMF_VERSION,
+            "arch": {
+                "arch_name": "tiny-test", "hidden_size": cols, "intermediate_size": rows,
+                "num_layers": 1, "num_attention_heads": 1, "num_kv_heads": 1, "head_dim": 4,
+                "vocab_size": 16, "layer_types": ["FullAttention"], "rms_norm_eps": 1e-6,
+                "norm_style": "qwen", "hidden_act": "silu", "max_position_embeddings": 64
+            },
+            "quant_type": "VBIT"
+        }))
+        .expect("header json");
+        let (src_s, out_s) = (src.to_str().unwrap(), out.to_str().unwrap());
+        CmfModel::write(src_s, &header, &tensors, None, None).unwrap();
+        let src_bytes = std::fs::read(&src).unwrap();
+
+        // Strict: the ulp group refuses everything, nothing written.
+        let err = cmd_requant_q1g(src_s, Some(refused.to_str().unwrap()), false, false, 2f64.powi(-8))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--allow-tol") && err.contains("1 of"), "{err}");
+        assert!(!refused.exists());
+        // --allow-tol only works with q1g … and an output equal to the source is refused.
+        assert!(cmd_requant_q1g(src_s, Some(src_s), false, true, 2f64.powi(-8)).is_err());
+        assert_eq!(std::fs::read(&src).unwrap(), src_bytes);
+
+        cmd_requant_q1g(src_s, Some(out_s), false, true, 2f64.powi(-8)).unwrap();
+        let (s, m) = (CmfModel::open(src_s).unwrap(), CmfModel::open(out_s).unwrap());
+        assert!(m.verify().is_empty(), "verify(): {:?}", m.verify());
+        let dt = |n: &str| m.tensor(n).unwrap().dtype;
+        assert_eq!(dt("model.layers.0.mlp.gate_proj.weight"), TensorDtype::Q1G);
+        assert_eq!(dt("model.layers.0.mlp.up_proj.weight"), TensorDtype::Q1G);
+        assert_eq!(dt("model.layers.0.mlp.down_proj.weight"), TensorDtype::Q1);
+        assert_eq!(dt("model.layers.0.self_attn.o_proj.weight"), TensorDtype::Q1);
+        // exact: bit for bit; kept tensors: byte for byte.
+        let g = "model.layers.0.mlp.gate_proj.weight";
+        assert!(
+            dequant_of(&s, g)
+                .iter()
+                .zip(dequant_of(&m, g))
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+        assert_eq!(
+            m.entry_bytes(m.tensor(g).unwrap()).len() * 4,
+            s.entry_bytes(s.tensor(g).unwrap()).len() * 3
+        );
+        for n in [
+            "model.layers.0.mlp.down_proj.weight",
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.norm.weight",
+        ] {
+            assert_eq!(m.entry_bytes(m.tensor(n).unwrap()), s.entry_bytes(s.tensor(n).unwrap()));
+        }
+        // the ulp group moved, nothing else in that tensor did.
+        let (a, b) = (
+            dequant_of(&s, "model.layers.0.mlp.up_proj.weight"),
+            dequant_of(&m, "model.layers.0.mlp.up_proj.weight"),
+        );
+        let moved: Vec<usize> = (0..a.len()).filter(|&i| a[i] != b[i]).collect();
+        assert!(!moved.is_empty() && moved.iter().all(|&i| i / 128 == 5), "{moved:?}");
+
+        // In place: same tensors, same bytes as the --output file.
+        let ip = dir.join("inplace.cmf");
+        std::fs::write(&ip, &src_bytes).unwrap();
+        cmd_requant_q1g(ip.to_str().unwrap(), None, true, true, 2f64.powi(-8)).unwrap();
+        let mi = CmfModel::open(ip.to_str().unwrap()).unwrap();
+        assert!(mi.verify().is_empty(), "verify(): {:?}", mi.verify());
+        for e in &m.tensors {
+            let ei = mi.tensor(&e.name).unwrap();
+            assert_eq!(ei.dtype, e.dtype, "{}", e.name);
+            assert_eq!(mi.entry_bytes(ei), m.entry_bytes(e), "{}", e.name);
+        }
+        drop((s, m, mi));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn vals_dequant(q4: &[u8], rows: usize, cols: usize) -> Vec<f32> {
