@@ -7319,11 +7319,12 @@ kernel void prism_fwht_rows(
 
     "#;
 
-/// q1g kernels, compiled as their OWN library: a compile failure there
-/// (they have only ever been checked by mirroring q1_matvec, never run on a
-/// Mac by their author) must cost q1g its Metal path, not every model its
-/// whole backend. `Ctx::q1g`/`q1gh` are None in that case and q1g weights
-/// stay on the CPU, loudly.
+/// q1g kernels, compiled as their OWN library: a compile failure there must
+/// cost q1g its Metal path, not every model its whole backend.
+/// `Ctx::q1g`/`q1gh` are None in that case and q1g weights stay on the CPU,
+/// loudly. Checked on an Apple M4 outside cargo by
+/// `tools/metal_q1g_parity.swift`, which compiles this source and `MSL`
+/// straight from this file and compares the kernels bit for bit.
 const MSL_Q1G: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -7337,6 +7338,14 @@ using namespace metal;
 // (aligned u32, no straddling shift) and both tiles take the group's ONE
 // scale. A uniform-scale repack therefore decodes to q1_matvec's output bit
 // for bit, streaming 4.5 bytes per 32 weights instead of 6.
+//
+// The per-tile scale step is an EXPLICIT fma. Written as `acc += s * sum`
+// (q1_matvec's spelling), the default fast-math compile sees one scale
+// serving both tiles of the pair and folds `acc + s·A + s·B` into
+// `acc + s·(A + B)`; q1's two tiles load two scales it cannot prove equal,
+// so each step there compiles to its own fused multiply-add. Measured on an
+// M4: the folded form differed from q1 in most rows of most shapes, the
+// explicit fma matches q1 bit for bit in both kernels.
 kernel void q1g_matvec(
     device const uchar*  q    [[buffer(0)]],
     device const float4* xs   [[buffer(1)]],
@@ -7387,10 +7396,10 @@ kernel void q1g_matvec(
                 sC += select(-x, x, bool4(nc & 1u, nc & 2u, nc & 4u, nc & 8u));
                 sD += select(-x, x, bool4(nd & 1u, nd & 2u, nd & 4u, nd & 8u));
             }
-            acc0 += sa * (sA.x + sA.y + sA.z + sA.w);
-            acc1 += sb * (sB.x + sB.y + sB.z + sB.w);
-            acc2 += scc * (sC.x + sC.y + sC.z + sC.w);
-            acc3 += sd * (sD.x + sD.y + sD.z + sD.w);
+            acc0 = fma(sa, (sA.x + sA.y + sA.z + sA.w), acc0);
+            acc1 = fma(sb, (sB.x + sB.y + sB.z + sB.w), acc1);
+            acc2 = fma(scc, (sC.x + sC.y + sC.z + sC.w), acc2);
+            acc3 = fma(sd, (sD.x + sD.y + sD.z + sD.w), acc3);
         }
         {
             float4 sA = float4(0.0f), sB = float4(0.0f);
@@ -7404,10 +7413,10 @@ kernel void q1g_matvec(
                 sC += select(-x, x, bool4(nc & 1u, nc & 2u, nc & 4u, nc & 8u));
                 sD += select(-x, x, bool4(nd & 1u, nd & 2u, nd & 4u, nd & 8u));
             }
-            acc0 += sa * (sA.x + sA.y + sA.z + sA.w);
-            acc1 += sb * (sB.x + sB.y + sB.z + sB.w);
-            acc2 += scc * (sC.x + sC.y + sC.z + sC.w);
-            acc3 += sd * (sD.x + sD.y + sD.z + sD.w);
+            acc0 = fma(sa, (sA.x + sA.y + sA.z + sA.w), acc0);
+            acc1 = fma(sb, (sB.x + sB.y + sB.z + sB.w), acc1);
+            acc2 = fma(scc, (sC.x + sC.y + sC.z + sC.w), acc2);
+            acc3 = fma(sd, (sD.x + sD.y + sD.z + sD.w), acc3);
         }
     }
     acc0 = simd_sum(acc0);
@@ -7474,10 +7483,10 @@ kernel void q1g_matvec_h(
                 sC += select(-x, x, bool4(nc & 1u, nc & 2u, nc & 4u, nc & 8u));
                 sD += select(-x, x, bool4(nd & 1u, nd & 2u, nd & 4u, nd & 8u));
             }
-            acc0 += sa * (float)(sA.x + sA.y + sA.z + sA.w);
-            acc1 += sb * (float)(sB.x + sB.y + sB.z + sB.w);
-            acc2 += scc * (float)(sC.x + sC.y + sC.z + sC.w);
-            acc3 += sd * (float)(sD.x + sD.y + sD.z + sD.w);
+            acc0 = fma(sa, (float)(sA.x + sA.y + sA.z + sA.w), acc0);
+            acc1 = fma(sb, (float)(sB.x + sB.y + sB.z + sB.w), acc1);
+            acc2 = fma(scc, (float)(sC.x + sC.y + sC.z + sC.w), acc2);
+            acc3 = fma(sd, (float)(sD.x + sD.y + sD.z + sD.w), acc3);
         }
         {
             half4 sA = half4(0.0h), sB = half4(0.0h);
@@ -7491,10 +7500,10 @@ kernel void q1g_matvec_h(
                 sC += select(-x, x, bool4(nc & 1u, nc & 2u, nc & 4u, nc & 8u));
                 sD += select(-x, x, bool4(nd & 1u, nd & 2u, nd & 4u, nd & 8u));
             }
-            acc0 += sa * (float)(sA.x + sA.y + sA.z + sA.w);
-            acc1 += sb * (float)(sB.x + sB.y + sB.z + sB.w);
-            acc2 += scc * (float)(sC.x + sC.y + sC.z + sC.w);
-            acc3 += sd * (float)(sD.x + sD.y + sD.z + sD.w);
+            acc0 = fma(sa, (float)(sA.x + sA.y + sA.z + sA.w), acc0);
+            acc1 = fma(sb, (float)(sB.x + sB.y + sB.z + sB.w), acc1);
+            acc2 = fma(scc, (float)(sC.x + sC.y + sC.z + sC.w), acc2);
+            acc3 = fma(sd, (float)(sD.x + sD.y + sD.z + sD.w), acc3);
         }
     }
     acc0 = simd_sum(acc0);
@@ -21626,6 +21635,112 @@ mod tests {
         }
         Q1_KERNEL_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// q1g on the device returns q1's f32 BIT FOR BIT on a uniform-scale
+    /// repack — f32 and half kernels, per-op entry and the batch path (q1
+    /// and q1g jobs mixed) — over a real mmap. The kernels alone are also
+    /// covered without cargo by `tools/metal_q1g_parity.swift`.
+    #[test]
+    fn gpu_q1g_matvec_equals_q1() {
+        unsafe { std::env::set_var("CMF_GPU", "1") };
+        if !enabled() {
+            eprintln!("gpu test skipped: no Metal device");
+            return;
+        }
+        let Some(c) = ctx() else { return };
+        assert!(q1g_ready(c), "MSL_Q1G did not compile on this device");
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for &(rows, cols) in &[(130usize, 128usize), (33, 2048), (64, 6144)] {
+            let tiles = rows * cols / GROUP_SIZE;
+            let mut q1 = Vec::with_capacity(tiles * Q1_TILE);
+            for t in 0..tiles {
+                let s = 0.004 + ((t / 4 * 37 + rows) % 29) as f32 * 0.0011;
+                q1.extend_from_slice(&cortiq_core::quant::f32_to_f16(s).to_le_bytes());
+                let b = (t as u32)
+                    .wrapping_mul(2_654_435_761)
+                    .rotate_left((t % 31) as u32);
+                q1.extend_from_slice(&b.to_le_bytes());
+            }
+            let rp = cortiq_core::quant::repack_q1_to_q1g(&q1, rows, cols, 0.0);
+            assert_eq!(rp.differing, 0, "uniform scales repack exactly");
+            let header: CmfHeader = serde_json::from_value(serde_json::json!({
+                "format": "cmf", "version": CMF_VERSION,
+                "arch": {"arch_name": "tiny-q1g", "hidden_size": cols,
+                    "intermediate_size": rows, "num_layers": 1, "num_attention_heads": 2,
+                    "num_kv_heads": 1, "head_dim": 4, "vocab_size": rows,
+                    "layer_types": ["FullAttention"], "rms_norm_eps": 1e-6,
+                    "max_position_embeddings": 8},
+                "quant_type": "VBIT"
+            }))
+            .unwrap();
+            let spec = |name: &str, dtype, data: Vec<u8>, shape: Vec<usize>| TensorSpec {
+                name: name.into(),
+                dtype,
+                shape,
+                data,
+            };
+            // The q1g scale plane ends the tensor, so (as in `gpu_q1_case`)
+            // a pad tensor keeps it clear of the no-copy buffer's last page.
+            let specs = [
+                spec("a.weight", TensorDtype::Q1, q1, vec![rows, cols]),
+                spec("b.weight", TensorDtype::Q1G, rp.data, vec![rows, cols]),
+                spec(
+                    "pad.weight",
+                    TensorDtype::F32,
+                    vec![0u8; 4096 * 2 * 4],
+                    vec![4096, 2],
+                ),
+            ];
+            let dir = std::env::temp_dir()
+                .join(format!("cmf-gpu-q1g-{}-{rows}x{cols}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("gpu.cmf");
+            CmfModel::write(&path, &header, &specs, None, None).unwrap();
+            let model = std::sync::Arc::new(CmfModel::open(&path).unwrap());
+            let (ia, ib) = (
+                model.tensor_index("a.weight").unwrap(),
+                model.tensor_index("b.weight").unwrap(),
+            );
+            let x: Vec<f32> = (0..cols)
+                .map(|i| {
+                    let v = ((i * 7 + 3) % 29) as f32 / 29.0 - 0.5;
+                    if i % 97 == 0 { v * 40.0 } else { v }
+                })
+                .collect();
+            for mode in [1u8, 2u8] {
+                Q1_KERNEL_OVERRIDE.store(mode, std::sync::atomic::Ordering::Relaxed);
+                let (mut ya, mut yb) = (vec![0f32; rows], vec![0f32; rows]);
+                assert!(q1_matvec(&model, ia, &x, rows, cols, &mut ya), "q1 refused");
+                assert!(
+                    q1g_matvec(&model, ib, &x, rows, cols, &mut yb),
+                    "q1g refused"
+                );
+                assert_eq!(bits(&ya), bits(&yb), "{rows}x{cols} mode {mode}: per-op");
+                let job = |idx, layout| crate::gpu::BatchJob {
+                    idx,
+                    rows,
+                    cols,
+                    row_scale: &[],
+                    xs: x.clone(),
+                    layout,
+                };
+                let jobs = [
+                    job(ia, crate::gpu::BatchLayout::Q1),
+                    job(ib, crate::gpu::BatchLayout::Q1g),
+                ];
+                let (mut ba, mut bb) = (vec![0f32; rows], vec![0f32; rows]);
+                assert!(
+                    matvec_batch(&model, &jobs, &mut [&mut ba, &mut bb]),
+                    "batch refused"
+                );
+                assert_eq!(bits(&ba), bits(&ya), "{rows}x{cols} mode {mode}: batch q1");
+                assert_eq!(bits(&bb), bits(&ya), "{rows}x{cols} mode {mode}: batch q1g");
+            }
+            Q1_KERNEL_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+            drop(model);
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     /// Device `moe_topk_select` == the CPU routing semantics: softmax

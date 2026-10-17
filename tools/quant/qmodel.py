@@ -881,6 +881,10 @@ class Model:
         return t.to(self.act_device)
 
     def to_dev(self, t):
+        """host -> device; a page-locked boundary must arrive whole (contiguous): the CPU never
+        reads it, so the copy stays ordered after the asynchronous device -> host copy"""
+        if t.device.type == "cpu" and t.is_pinned() and not t.is_contiguous():
+            raise AssertionError("strided slice of an in-flight page-locked activation; slice on the device")
         return t.to(self.dev, non_blocking=True)
 
     # -- inputs
@@ -891,21 +895,26 @@ class Model:
         return x.to(self.act_device)
 
     # -- forward schedules
-    def forward_layers(self, xs, l0=0, l1=None, keep=False):
+    def forward_layers(self, xs, l0=0, l1=None, keep=False, own=False):
         """layer-major forward of micro-batches xs (list of [b, T, H] on act_device) through
-        layers [l0, l1); returns the outputs (and with keep=True every boundary)"""
+        layers [l0, l1); returns the outputs (and with keep=True every boundary). Without keep
+        each boundary is replaced in place as soon as its successor exists, so a pass holds one
+        set of boundaries plus one micro-batch, not two; own=True also hands over the list xs
+        itself (its inputs are dropped as they are consumed; xs ends up holding the outputs)."""
         l1 = len(self.layers) if l1 is None else l1
         bounds = [list(xs)] if keep else None
-        cur = list(xs)
+        cur = xs if (own and not keep) else list(xs)
         with torch.no_grad():
             for l in range(l0, l1):
                 self._enter(l, l + 1 if l + 1 < l1 else -1)
                 layer = self.layers[l]
-                nxt = [self.to_act(layer.forward(self.to_dev(x))) for x in cur]
-                self._leave(l)
-                cur = nxt
                 if keep:
+                    cur = [self.to_act(layer.forward(self.to_dev(x))) for x in cur]
                     bounds.append(cur)
+                else:
+                    for j in range(len(cur)):
+                        cur[j] = self.to_act(layer.forward(self.to_dev(cur[j])))
+                self._leave(l)
         return bounds if keep else cur
 
     def head_eval(self, x, tgt, lp_t=None, ix_t=None, topk=0):
@@ -932,7 +941,10 @@ class Model:
             for i0 in range(0, b, hw):
                 i1 = min(b, i0 + hw)
                 n = i1 - i0
-                xn = rms(self.to_dev(x[i0:i1, :T - 1]).reshape(n * (T - 1), H), self.final.eff(), self.arch.eps)
+                # move the contiguous block first and slice on the device: a strided slice of a
+                # page-locked boundary would be gathered by the CPU while its async copy is in flight
+                xd = self.to_dev(x[i0:i1])
+                xn = rms(xd[:, :T - 1].reshape(n * (T - 1), H), self.final.eff(), self.arch.eps)
                 t = torch.from_numpy(np.asarray(tgt[i0:i1, 1:], dtype=np.int64).reshape(-1)).to(self.dev)
                 ix = None if ix_t is None else ix_t[i0:i1].reshape(n * (T - 1), -1).to(self.dev).long()
                 lse, z_ix, z_t, tv, ti = self.head.scan(xn, self.vchunk, ix=ix, tgt=t, topk=topk)
@@ -953,8 +965,7 @@ class Model:
         nll, kl, lps, ixs = [], [], [], []
         for b0 in range(0, N, block):
             wb = windows[b0:b0 + block]
-            xs = [self.embed_ids(wb[i:i + mb]) for i in range(0, len(wb), mb)]
-            outs = self.forward_layers(xs)
+            outs = self.forward_layers([self.embed_ids(wb[i:i + mb]) for i in range(0, len(wb), mb)], own=True)
             for j, x in enumerate(outs):
                 s0 = b0 + j * mb
                 tg = wb[j * mb:j * mb + x.shape[0]]
@@ -969,7 +980,7 @@ class Model:
                 for lp, ix in tops:
                     lps.append(lp.numpy())
                     ixs.append(ix.numpy())
-            del xs, outs
+            del outs
         res = {"nll": np.array(nll), "kl": np.array(kl) if teacher is not None else None}
         if topk:
             res["lp"], res["ix"] = np.stack(lps), np.stack(ixs)

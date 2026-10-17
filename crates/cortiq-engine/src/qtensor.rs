@@ -2643,8 +2643,8 @@ impl QTensor {
         });
         // q1 and q1g may mix freely: the shared activation split and group
         // sums are layout-independent, only the row kernel differs.
-        let uniform_q1 = ts.iter().all(|t| t.bin_w().is_some())
-            && ts.iter().all(|t| t.cols() == ts[0].cols());
+        let uniform_q1 =
+            ts.iter().all(|t| t.bin_w().is_some()) && ts.iter().all(|t| t.cols() == ts[0].cols());
         let uniform_q1t = ts.iter().all(|t| {
             matches!(
                 t,
@@ -7796,7 +7796,13 @@ impl<'a> BinW<'a> {
     /// The SDOT/dotprod target feature must be present (`sdot_enabled`).
     #[cfg(target_arch = "aarch64")]
     #[inline]
-    unsafe fn dot_1x4_sdot(self, r: usize, gpr: usize, xs: [&[i8]; 4], gs: [&[i32]; 4]) -> [f32; 4] {
+    unsafe fn dot_1x4_sdot(
+        self,
+        r: usize,
+        gpr: usize,
+        xs: [&[i8]; 4],
+        gs: [&[i32]; 4],
+    ) -> [f32; 4] {
         // SAFETY: forwarded caller contract.
         unsafe {
             match self {
@@ -7900,8 +7906,58 @@ fn dot_q1g_row_i8(
     acc
 }
 
-/// AVX2 q1g row: `dot_q1_row_avx2` with the bits read from the plane and
-/// the scale converted once per 128-group instead of once per tile.
+/// Four tiles' unreduced `i32×8` partial sums → `[Σ0, Σ1, Σ2, Σ3]` in one
+/// hadd tree: 3 hadds + 1 add for four tiles where the per-tile reduce of
+/// the q1 kernels costs 7 ops each. Integer math, so any order gives the
+/// q1 kernel's per-tile sums exactly.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn q1g_hsum4(
+    d0: core::arch::x86_64::__m256i,
+    d1: core::arch::x86_64::__m256i,
+    d2: core::arch::x86_64::__m256i,
+    d3: core::arch::x86_64::__m256i,
+) -> core::arch::x86_64::__m128i {
+    // SAFETY: pure register math.
+    unsafe {
+        use core::arch::x86_64::*;
+        let h = _mm256_hadd_epi32(_mm256_hadd_epi32(d0, d1), _mm256_hadd_epi32(d2, d3));
+        _mm_add_epi32(_mm256_castsi256_si128(h), _mm256_extracti128_si256::<1>(h))
+    }
+}
+
+/// One 128-group's epilogue, in q1's float order: `d = 2·Σset − Σx` per
+/// tile (exact i32 → exact f32), then `acc += d·s` tile by tile — four
+/// separately rounded multiply/add pairs, the q1 kernels' sequence.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn q1g_group_acc(
+    acc: f32,
+    msum4: core::arch::x86_64::__m128i,
+    gsum4: &[i32],
+    s: f32,
+) -> f32 {
+    // SAFETY: gsum4 holds the group's four tile sums (callers slice it).
+    unsafe {
+        use core::arch::x86_64::*;
+        let g = _mm_loadu_si128(gsum4.as_ptr() as *const __m128i);
+        let d = _mm_cvtepi32_ps(_mm_sub_epi32(_mm_slli_epi32::<1>(msum4), g));
+        let mut f = [0f32; 4];
+        _mm_storeu_ps(f.as_mut_ptr(), d);
+        let mut acc = acc;
+        for v in f {
+            acc += v * s;
+        }
+        acc
+    }
+}
+
+/// AVX2 q1g row: `dot_q1_row_avx2`'s mask/select/maddubs per tile, but the
+/// four tiles of a 128-group reduce together (`q1g_hsum4`) and the scale
+/// converts once per group — bit-identical results (integer sums, then
+/// q1's per-tile float sequence), fewer horizontal ops and f16 decodes.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn dot_q1g_row_avx2(
@@ -7931,29 +7987,26 @@ unsafe fn dot_q1g_row_avx2(
         let mut gi = 0;
         while gi < gpr {
             let s = f16_to_f32(q1g_scale_bits(bytes, sc_off, r * gpr + gi));
-            for k in gi..gi + 4 {
-                let bits = (bp.add(k * 4) as *const u32).read_unaligned();
+            let mut d = [_mm256_setzero_si256(); 4];
+            for (k, dk) in d.iter_mut().enumerate() {
+                let t = gi + k;
+                let bits = (bp.add(t * 4) as *const u32).read_unaligned();
                 let bc = _mm256_shuffle_epi8(_mm256_set1_epi32(bits as i32), expand);
                 let mask = _mm256_cmpeq_epi8(_mm256_and_si256(bc, bitsel), bitsel);
-                let x = _mm256_loadu_si256(xq.as_ptr().add(k * GROUP_SIZE) as *const __m256i);
+                let x = _mm256_loadu_si256(xq.as_ptr().add(t * GROUP_SIZE) as *const __m256i);
                 let sel = _mm256_and_si256(x, mask);
-                let p16 = _mm256_maddubs_epi16(ones8, sel);
-                let d32 = _mm256_madd_epi16(p16, ones16);
-                let hi128 = _mm256_extracti128_si256::<1>(d32);
-                let s128 = _mm_add_epi32(_mm256_castsi256_si128(d32), hi128);
-                let s64 = _mm_add_epi32(s128, _mm_srli_si128::<8>(s128));
-                let s32 = _mm_add_epi32(s64, _mm_srli_si128::<4>(s64));
-                let msum = _mm_cvtsi128_si32(s32);
-                let d = 2 * msum - gsum[k];
-                acc += d as f32 * s;
+                *dk = _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, sel), ones16);
             }
+            let m4 = q1g_hsum4(d[0], d[1], d[2], d[3]);
+            acc = q1g_group_acc(acc, m4, &gsum[gi..gi + 4], s);
             gi += 4;
         }
         acc
     }
 }
 
-/// VNNI twin of `dot_q1g_row_avx2` (see `dpbusd_hsum` — bit-identical).
+/// VNNI twin of `dot_q1g_row_avx2`: `vpdpbusd(1u8, sel)` per tile (the
+/// same i32 lanes as maddubs+madd — bounded products), same group reduce.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vnni")]
 unsafe fn dot_q1g_row_vnni(
@@ -7981,22 +8034,26 @@ unsafe fn dot_q1g_row_vnni(
         let mut gi = 0;
         while gi < gpr {
             let s = f16_to_f32(q1g_scale_bits(bytes, sc_off, r * gpr + gi));
-            for k in gi..gi + 4 {
-                let bits = (bp.add(k * 4) as *const u32).read_unaligned();
+            let mut d = [_mm256_setzero_si256(); 4];
+            for (k, dk) in d.iter_mut().enumerate() {
+                let t = gi + k;
+                let bits = (bp.add(t * 4) as *const u32).read_unaligned();
                 let bc = _mm256_shuffle_epi8(_mm256_set1_epi32(bits as i32), expand);
                 let mask = _mm256_cmpeq_epi8(_mm256_and_si256(bc, bitsel), bitsel);
-                let x = _mm256_loadu_si256(xq.as_ptr().add(k * GROUP_SIZE) as *const __m256i);
-                let msum = dpbusd_hsum(ones8, _mm256_and_si256(x, mask));
-                let d = 2 * msum - gsum[k];
-                acc += d as f32 * s;
+                let x = _mm256_loadu_si256(xq.as_ptr().add(t * GROUP_SIZE) as *const __m256i);
+                *dk = _mm256_dpbusd_epi32(_mm256_setzero_si256(), ones8, _mm256_and_si256(x, mask));
             }
+            let m4 = q1g_hsum4(d[0], d[1], d[2], d[3]);
+            acc = q1g_group_acc(acc, m4, &gsum[gi..gi + 4], s);
             gi += 4;
         }
         acc
     }
 }
 
-/// Blocked 1×4 AVX2 q1g row (mask built once per tile, four streams).
+/// Blocked 1×4 AVX2 q1g row: each tile's mask is built once and serves
+/// four activation streams; per stream, the group reduce and float order
+/// of `dot_q1g_row_avx2` (so batch == matvec bit for bit).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn dot_q1g_row_1x4_avx2(
@@ -8025,23 +8082,23 @@ unsafe fn dot_q1g_row_1x4_avx2(
         let mut gi = 0;
         while gi < gpr {
             let s = f16_to_f32(q1g_scale_bits(bytes, sc_off, r * gpr + gi));
-            for t in gi..gi + 4 {
-                let bits = (bp.add(t * 4) as *const u32).read_unaligned();
+            // d[stream][tile]
+            let mut d = [[_mm256_setzero_si256(); 4]; 4];
+            for t in 0..4 {
+                let bits = (bp.add((gi + t) * 4) as *const u32).read_unaligned();
                 let bc = _mm256_shuffle_epi8(_mm256_set1_epi32(bits as i32), expand);
                 let mask = _mm256_cmpeq_epi8(_mm256_and_si256(bc, bitsel), bitsel);
                 for (k, xq) in xs.iter().enumerate() {
-                    let x = _mm256_loadu_si256(xq.as_ptr().add(t * GROUP_SIZE) as *const __m256i);
+                    let x = _mm256_loadu_si256(
+                        xq.as_ptr().add((gi + t) * GROUP_SIZE) as *const __m256i
+                    );
                     let sel = _mm256_and_si256(x, mask);
-                    let p16 = _mm256_maddubs_epi16(ones8, sel);
-                    let d32 = _mm256_madd_epi16(p16, ones16);
-                    let hi128 = _mm256_extracti128_si256::<1>(d32);
-                    let s128 = _mm_add_epi32(_mm256_castsi256_si128(d32), hi128);
-                    let s64 = _mm_add_epi32(s128, _mm_srli_si128::<8>(s128));
-                    let s32 = _mm_add_epi32(s64, _mm_srli_si128::<4>(s64));
-                    let msum = _mm_cvtsi128_si32(s32);
-                    let d = 2 * msum - gsums[k][t];
-                    acc[k] += d as f32 * s;
+                    d[k][t] = _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, sel), ones16);
                 }
+            }
+            for k in 0..4 {
+                let m4 = q1g_hsum4(d[k][0], d[k][1], d[k][2], d[k][3]);
+                acc[k] = q1g_group_acc(acc[k], m4, &gsums[k][gi..gi + 4], s);
             }
             gi += 4;
         }
@@ -8077,16 +8134,25 @@ unsafe fn dot_q1g_row_1x4_vnni(
         let mut gi = 0;
         while gi < gpr {
             let s = f16_to_f32(q1g_scale_bits(bytes, sc_off, r * gpr + gi));
-            for t in gi..gi + 4 {
-                let bits = (bp.add(t * 4) as *const u32).read_unaligned();
+            let mut d = [[_mm256_setzero_si256(); 4]; 4];
+            for t in 0..4 {
+                let bits = (bp.add((gi + t) * 4) as *const u32).read_unaligned();
                 let bc = _mm256_shuffle_epi8(_mm256_set1_epi32(bits as i32), expand);
                 let mask = _mm256_cmpeq_epi8(_mm256_and_si256(bc, bitsel), bitsel);
                 for (k, xq) in xs.iter().enumerate() {
-                    let x = _mm256_loadu_si256(xq.as_ptr().add(t * GROUP_SIZE) as *const __m256i);
-                    let msum = dpbusd_hsum(ones8, _mm256_and_si256(x, mask));
-                    let d = 2 * msum - gsums[k][t];
-                    acc[k] += d as f32 * s;
+                    let x = _mm256_loadu_si256(
+                        xq.as_ptr().add((gi + t) * GROUP_SIZE) as *const __m256i
+                    );
+                    d[k][t] = _mm256_dpbusd_epi32(
+                        _mm256_setzero_si256(),
+                        ones8,
+                        _mm256_and_si256(x, mask),
+                    );
                 }
+            }
+            for k in 0..4 {
+                let m4 = q1g_hsum4(d[k][0], d[k][1], d[k][2], d[k][3]);
+                acc[k] = q1g_group_acc(acc[k], m4, &gsums[k][gi..gi + 4], s);
             }
             gi += 4;
         }
@@ -8129,9 +8195,15 @@ unsafe fn dot_q1g_row_sdot(
             [4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5],
             [6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7],
             [8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9],
-            [10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11],
-            [12, 12, 12, 12, 12, 12, 12, 12, 13, 13, 13, 13, 13, 13, 13, 13],
-            [14, 14, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15],
+            [
+                10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11,
+            ],
+            [
+                12, 12, 12, 12, 12, 12, 12, 12, 13, 13, 13, 13, 13, 13, 13, 13,
+            ],
+            [
+                14, 14, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15,
+            ],
         ];
         let m = vld1q_u8(MASKS.as_ptr());
         let iw: [uint8x16_t; 8] = core::array::from_fn(|i| vld1q_u8(IW[i].as_ptr()));
@@ -8164,9 +8236,21 @@ unsafe fn dot_q1g_row_sdot(
         while gi + 4 <= vec_end {
             let ld = vld1q_u8(bp.add(gi * 4));
             let d0 = tile_dot!(tbl_mask!(ld, 0), tbl_mask!(ld, 1), xp.add(gi * GROUP_SIZE));
-            let d1 = tile_dot!(tbl_mask!(ld, 2), tbl_mask!(ld, 3), xp.add((gi + 1) * GROUP_SIZE));
-            let d2 = tile_dot!(tbl_mask!(ld, 4), tbl_mask!(ld, 5), xp.add((gi + 2) * GROUP_SIZE));
-            let d3 = tile_dot!(tbl_mask!(ld, 6), tbl_mask!(ld, 7), xp.add((gi + 3) * GROUP_SIZE));
+            let d1 = tile_dot!(
+                tbl_mask!(ld, 2),
+                tbl_mask!(ld, 3),
+                xp.add((gi + 1) * GROUP_SIZE)
+            );
+            let d2 = tile_dot!(
+                tbl_mask!(ld, 4),
+                tbl_mask!(ld, 5),
+                xp.add((gi + 2) * GROUP_SIZE)
+            );
+            let d3 = tile_dot!(
+                tbl_mask!(ld, 6),
+                tbl_mask!(ld, 7),
+                xp.add((gi + 3) * GROUP_SIZE)
+            );
             let neg = vpaddq_s32(vpaddq_s32(d0, d1), vpaddq_s32(d2, d3));
             let g = vld1q_s32(gp.add(gi));
             let dots = vnegq_s32(vaddq_s32(vshlq_n_s32::<1>(neg), g));
@@ -8222,9 +8306,15 @@ unsafe fn dot_q1g_row_1x4_sdot(
             [4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5],
             [6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7],
             [8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9],
-            [10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11],
-            [12, 12, 12, 12, 12, 12, 12, 12, 13, 13, 13, 13, 13, 13, 13, 13],
-            [14, 14, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15],
+            [
+                10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11,
+            ],
+            [
+                12, 12, 12, 12, 12, 12, 12, 12, 13, 13, 13, 13, 13, 13, 13, 13,
+            ],
+            [
+                14, 14, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15,
+            ],
         ];
         let m = vld1q_u8(MASKS.as_ptr());
         let iw: [uint8x16_t; 8] = core::array::from_fn(|i| vld1q_u8(IW[i].as_ptr()));
@@ -9253,14 +9343,7 @@ fn q1_matvec(
 
 /// Binary-weight matvec (q1 or q1g): A8W8 rows with the shared group
 /// sums, or the exact scalar walk under CMF_SDOT=0.
-fn bin_matvec(
-    w: BinW,
-    x: &[f32],
-    rows: usize,
-    cols: usize,
-    out: &mut [f32],
-    pool: Option<&Pool>,
-) {
+fn bin_matvec(w: BinW, x: &[f32], rows: usize, cols: usize, out: &mut [f32], pool: Option<&Pool>) {
     debug_assert_eq!(out.len(), rows);
     let gpr = cols / GROUP_SIZE;
     let out_addr = SendMut(out.as_mut_ptr());
@@ -9268,9 +9351,8 @@ fn bin_matvec(
         let act = split_act(x);
         let gsum = q1_group_sums(&act.xq, gpr);
         let (act, gsum) = (&act, &gsum);
-        let run = move |start: usize, end: usize| {
-            bin_range_a8w8(w, gpr, act, gsum, out_addr, start, end)
-        };
+        let run =
+            move |start: usize, end: usize| bin_range_a8w8(w, gpr, act, gsum, out_addr, start, end);
         dispatch_rows(pool, rows, &run);
         return;
     }
@@ -12581,7 +12663,10 @@ mod tests {
                 assert_eq!(a.to_bits(), b.to_bits(), "{rows}x{cols} i8 row {r}");
                 for j in [0, 31, 32, 127, cols - 1] {
                     let (a, b) = (wa.outlier(r, gpr, j), wb.outlier(r, gpr, j));
-                    assert_eq!((a.0.to_bits(), a.1.to_bits()), (b.0.to_bits(), b.1.to_bits()));
+                    assert_eq!(
+                        (a.0.to_bits(), a.1.to_bits()),
+                        (b.0.to_bits(), b.1.to_bits())
+                    );
                 }
                 #[cfg(target_arch = "x86_64")]
                 if avx2_enabled() {
@@ -12611,8 +12696,12 @@ mod tests {
             bin_matvec(wb, &x, rows, cols, &mut gb, None);
             assert_eq!(ga, gb, "{rows}x{cols} matvec");
             let x2 = q1g_test_x(cols, rows + 1);
-            let (mut a1, mut a2, mut b1, mut b2) =
-                (vec![0f32; rows], vec![0f32; rows], vec![0f32; rows], vec![0f32; rows]);
+            let (mut a1, mut a2, mut b1, mut b2) = (
+                vec![0f32; rows],
+                vec![0f32; rows],
+                vec![0f32; rows],
+                vec![0f32; rows],
+            );
             bin_matvec2(wa, &x, &x2, rows, cols, &mut a1, &mut a2, None);
             bin_matvec2(wb, &x, &x2, rows, cols, &mut b1, &mut b2, None);
             assert_eq!((&a1, &a2), (&b1, &b2), "{rows}x{cols} matvec2");
@@ -12637,15 +12726,22 @@ mod tests {
                 #[cfg(target_arch = "x86_64")]
                 if avx2_enabled() {
                     // SAFETY: AVX2 checked; payloads sized for (rows, cols).
-                    let (a, b) =
-                        unsafe { (wa.dot_1x4_x86(r, gpr, xq4, gs4), wb.dot_1x4_x86(r, gpr, xq4, gs4)) };
+                    let (a, b) = unsafe {
+                        (
+                            wa.dot_1x4_x86(r, gpr, xq4, gs4),
+                            wb.dot_1x4_x86(r, gpr, xq4, gs4),
+                        )
+                    };
                     assert_eq!(a.map(f32::to_bits), b.map(f32::to_bits), "1x4 row {r}");
                 }
                 #[cfg(target_arch = "aarch64")]
                 if sdot_enabled() {
                     // SAFETY: SDOT checked; payloads sized for (rows, cols).
                     let (a, b) = unsafe {
-                        (wa.dot_1x4_sdot(r, gpr, xq4, gs4), wb.dot_1x4_sdot(r, gpr, xq4, gs4))
+                        (
+                            wa.dot_1x4_sdot(r, gpr, xq4, gs4),
+                            wb.dot_1x4_sdot(r, gpr, xq4, gs4),
+                        )
                     };
                     assert_eq!(a.map(f32::to_bits), b.map(f32::to_bits), "1x4 row {r}");
                 }

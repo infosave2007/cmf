@@ -168,6 +168,7 @@ precision while large matrix blocks use a compact codec.
 | `q2tp_affine` | dtype-16 Prism profile with explicit `(c - 1) * s` affine operator; requires signed-Hadamard and affine metadata |
 | `vbit`, `vbit_ro` | size-constrained or mixed-bit profiles |
 | `q1`, `q1t`, `q1s` | trained binary or experimental ternary/PTQ paths |
+| `q1g` | trained binary with the native 128-weight scale group (1.125 bpw); a lossless `requant --quant q1g` of such a `q1` file |
 
 See [Q1T/PTQ](docs/Q1T_PTQ.md) for the experimental low-bit path and the
 [quantization coverage matrix](docs/QUANT_COVERAGE.ru.md) for codec support by

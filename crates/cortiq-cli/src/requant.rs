@@ -476,7 +476,11 @@ pub fn cmd_requant_q1g(
 /// each of its four tiles) — exact, so a runtime that predates dtype 20
 /// reads the same weights. The file grows back to 1.5 bits/weight, so
 /// there is no in-place form.
-pub fn cmd_requant_q1(model_path: &str, output: Option<&str>, in_place: bool) -> anyhow::Result<()> {
+pub fn cmd_requant_q1(
+    model_path: &str,
+    output: Option<&str>,
+    in_place: bool,
+) -> anyhow::Result<()> {
     use cortiq_core::quant::unpack_q1g_to_q1;
     anyhow::ensure!(
         !in_place,
@@ -495,7 +499,10 @@ pub fn cmd_requant_q1(model_path: &str, output: Option<&str>, in_place: bool) ->
         let src = model.entry_bytes(entry);
         let (dtype, data) = if entry.dtype == TensorDtype::Q1G {
             n += 1;
-            (TensorDtype::Q1, unpack_q1g_to_q1(src, entry.shape[0], entry.shape[1]))
+            (
+                TensorDtype::Q1,
+                unpack_q1g_to_q1(src, entry.shape[0], entry.shape[1]),
+            )
         } else {
             (entry.dtype, src.to_vec())
         };
@@ -870,9 +877,15 @@ mod tests {
         let src_bytes = std::fs::read(&src).unwrap();
 
         // Strict: the ulp group refuses everything, nothing written.
-        let err = cmd_requant_q1g(src_s, Some(refused.to_str().unwrap()), false, false, 2f64.powi(-8))
-            .unwrap_err()
-            .to_string();
+        let err = cmd_requant_q1g(
+            src_s,
+            Some(refused.to_str().unwrap()),
+            false,
+            false,
+            2f64.powi(-8),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("--allow-tol") && err.contains("1 of"), "{err}");
         assert!(!refused.exists());
         // --allow-tol only works with q1g … and an output equal to the source is refused.
@@ -880,13 +893,19 @@ mod tests {
         assert_eq!(std::fs::read(&src).unwrap(), src_bytes);
 
         cmd_requant_q1g(src_s, Some(out_s), false, true, 2f64.powi(-8)).unwrap();
-        let (s, m) = (CmfModel::open(src_s).unwrap(), CmfModel::open(out_s).unwrap());
+        let (s, m) = (
+            CmfModel::open(src_s).unwrap(),
+            CmfModel::open(out_s).unwrap(),
+        );
         assert!(m.verify().is_empty(), "verify(): {:?}", m.verify());
         let dt = |n: &str| m.tensor(n).unwrap().dtype;
         assert_eq!(dt("model.layers.0.mlp.gate_proj.weight"), TensorDtype::Q1G);
         assert_eq!(dt("model.layers.0.mlp.up_proj.weight"), TensorDtype::Q1G);
         assert_eq!(dt("model.layers.0.mlp.down_proj.weight"), TensorDtype::Q1);
-        assert_eq!(dt("model.layers.0.self_attn.o_proj.weight"), TensorDtype::Q1);
+        assert_eq!(
+            dt("model.layers.0.self_attn.o_proj.weight"),
+            TensorDtype::Q1
+        );
         // exact: bit for bit; kept tensors: byte for byte.
         let g = "model.layers.0.mlp.gate_proj.weight";
         assert!(
@@ -904,7 +923,10 @@ mod tests {
             "model.layers.0.self_attn.o_proj.weight",
             "model.norm.weight",
         ] {
-            assert_eq!(m.entry_bytes(m.tensor(n).unwrap()), s.entry_bytes(s.tensor(n).unwrap()));
+            assert_eq!(
+                m.entry_bytes(m.tensor(n).unwrap()),
+                s.entry_bytes(s.tensor(n).unwrap())
+            );
         }
         // the ulp group moved, nothing else in that tensor did.
         let (a, b) = (
@@ -912,7 +934,10 @@ mod tests {
             dequant_of(&m, "model.layers.0.mlp.up_proj.weight"),
         );
         let moved: Vec<usize> = (0..a.len()).filter(|&i| a[i] != b[i]).collect();
-        assert!(!moved.is_empty() && moved.iter().all(|&i| i / 128 == 5), "{moved:?}");
+        assert!(
+            !moved.is_empty() && moved.iter().all(|&i| i / 128 == 5),
+            "{moved:?}"
+        );
 
         // In place: same tensors, same bytes as the --output file.
         let ip = dir.join("inplace.cmf");
