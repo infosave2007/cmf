@@ -779,7 +779,8 @@ enum Commands {
         #[arg(long)]
         threads: Option<usize>,
         /// q4tp/q2tp: act-order GPTQ (channels by descending input energy,
-        /// group rungs fixed up front from the original weights)
+        /// group rungs fixed up front from the original weights — at 2 bits
+        /// that costs more than the order gains: not for q2tp)
         #[arg(long)]
         act_order: bool,
         /// q4tp/q2tp: Hessian cache file — loaded when it exists (calibration
