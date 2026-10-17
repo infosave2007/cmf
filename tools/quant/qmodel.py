@@ -865,6 +865,18 @@ class Model:
         layer.lin[role] = qlin
         return old
 
+    # -- activation transfers: page-locked host buffers + asynchronous copies, so parking a
+    # boundary in host RAM never stalls the device queue (values are plain copies)
+    def to_act(self, t):
+        if self.act_device.type == "cpu" and t.device.type == "cuda":
+            out = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+            out.copy_(t, non_blocking=True)
+            return out
+        return t.to(self.act_device)
+
+    def to_dev(self, t):
+        return t.to(self.dev, non_blocking=True)
+
     # -- inputs
     def embed_ids(self, ids):
         """ids [B, T] numpy -> [B, T, H] f32 on act_device"""
@@ -883,7 +895,7 @@ class Model:
             for l in range(l0, l1):
                 self._enter(l, l + 1 if l + 1 < l1 else -1)
                 layer = self.layers[l]
-                nxt = [layer.forward(x.to(self.dev)).to(self.act_device) for x in cur]
+                nxt = [self.to_act(layer.forward(self.to_dev(x))) for x in cur]
                 self._leave(l)
                 cur = nxt
                 if keep:
@@ -897,7 +909,7 @@ class Model:
         out_ce, out_kl, tops = [], [], []
         with torch.no_grad():
             for i in range(b):
-                xn = rms(x[i, :T - 1].to(self.dev), self.final.eff(), self.arch.eps)
+                xn = rms(self.to_dev(x[i, :T - 1]), self.final.eff(), self.arch.eps)
                 t = torch.from_numpy(np.asarray(tgt[i, 1:], dtype=np.int64)).to(self.dev)
                 ix = None if ix_t is None else ix_t[i].to(self.dev).long()
                 lse, z_ix, z_t, tv, ti = self.head.scan(xn, self.vchunk, ix=ix, tgt=t, topk=topk)
@@ -949,7 +961,7 @@ class Model:
         fin_params = self.final.params()
         for j, x in enumerate(bounds[-1]):
             s0 = j * mb
-            xl = x.to(self.dev).requires_grad_(True)
+            xl = self.to_dev(x).requires_grad_(True)
             b = xl.shape[0]
             kl = 0.0
             for i in range(b):
@@ -959,16 +971,16 @@ class Model:
             loss = kl / count
             loss.backward()
             kl_tot += float(kl.detach())
-            grads.append(xl.grad.to(self.act_device))
+            grads.append(self.to_act(xl.grad))
             del xl
         for l in range(len(self.layers) - 1, -1, -1):
             self._enter(l, l - 1)
             layer = self.layers[l]
             for j in range(len(xs)):
-                x = bounds[l][j].to(self.dev).requires_grad_(l > 0)
+                x = self.to_dev(bounds[l][j]).requires_grad_(l > 0)
                 y = layer.forward(x)
-                y.backward(grads[j].to(self.dev))
-                grads[j] = x.grad.to(self.act_device) if l > 0 else None
+                y.backward(self.to_dev(grads[j]))
+                grads[j] = self.to_act(x.grad) if l > 0 else None
                 del x, y
             self._leave(l)
             bounds[l + 1] = None
