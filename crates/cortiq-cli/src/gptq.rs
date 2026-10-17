@@ -1312,6 +1312,11 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
             .map_or(usize::MAX, |gb| ((gb * 1e9 / peak) as usize).max(1));
         let outer = o.threads.clamp(1, 16).min(groups.len().max(1)).min(mem_cap);
         let inner = (o.threads / outer).max(1);
+        // Widest Hessians first (longest-processing-time order): a 6144-wide
+        // fold costs ~27× a 2048-wide one, and one started last is the tail.
+        // The order cannot change any byte — results are keyed by slot.
+        let mut order: Vec<usize> = (0..groups.len()).collect();
+        order.sort_by_key(|&g| std::cmp::Reverse(groups[g].cols));
         let next = std::sync::atomic::AtomicUsize::new(0);
         let n_chunk: usize = groups.iter().map(|g| g.slots.len()).sum();
         let done = std::sync::atomic::AtomicUsize::new(0);
@@ -1319,8 +1324,9 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
             for _ in 0..outer {
                 s.spawn(|| {
                     loop {
-                        let gi = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(grp) = groups.get(gi) else { break };
+                        let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&gi) = order.get(k) else { break };
+                        let grp = &groups[gi];
                         let h = match grp.take_h() {
                             Ok(h) => h,
                             Err(e) => {
