@@ -238,8 +238,15 @@ pub fn add(id: u64, xs: &[f32], b: usize) -> bool {
 
 /// Read `H[id]` back as a full symmetric f64 matrix and free the buffer.
 pub fn take(id: u64) -> Option<Vec<f64>> {
+    let out = read(id)?;
+    free(id);
+    Some(out)
+}
+
+/// Read `H[id]` back as a full symmetric f64 matrix; the buffer stays.
+pub fn read(id: u64) -> Option<Vec<f64>> {
     let c = ctx()?;
-    let (h, cols) = REG.lock().unwrap().as_mut()?.slots.remove(&id)?;
+    let (h, cols) = buffer(id)?;
     let n = cols;
     let total = packed_len(n) * 4;
     const CHUNK: u64 = 256 << 20;
