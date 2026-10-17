@@ -7319,6 +7319,197 @@ kernel void prism_fwht_rows(
 
     "#;
 
+/// q1g kernels, compiled as their OWN library: a compile failure there
+/// (they have only ever been checked by mirroring q1_matvec, never run on a
+/// Mac by their author) must cost q1g its Metal path, not every model its
+/// whole backend. `Ctx::q1g`/`q1gh` are None in that case and q1g weights
+/// stay on the CPU, loudly.
+const MSL_Q1G: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// q1g: the same signs as PLANES — u32 words [rows·gpr] (word r·gpr+t holds
+// 32-tile t's bits) then f16 scales [rows·gpr/4], one per 128-group; gpr
+// counts 32-tiles and is a multiple of 4. q1_matvec line for line: a lane
+// still owns a 64-col tile pair (half a 128-group), FOUR rows share each
+// activation float4, and the select/add chains, the per-tile scale fma and
+// the simd_sum are unchanged — only the two sign words come from the plane
+// (aligned u32, no straddling shift) and both tiles take the group's ONE
+// scale. A uniform-scale repack therefore decodes to q1_matvec's output bit
+// for bit, streaming 4.5 bytes per 32 weights instead of 6.
+kernel void q1g_matvec(
+    device const uchar*  q    [[buffer(0)]],
+    device const float4* xs   [[buffer(1)]],
+    device float*        y    [[buffer(2)]],
+    constant uint&       gpr  [[buffer(3)]],
+    constant uint&       rows [[buffer(4)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    uint r0 = (tgpos * sgs + sg) * 4u;
+    if (r0 >= rows) return;
+    uint nr = min(rows - r0, 4u);
+    uint np = gpr >> 1;
+    uint gpg = gpr >> 2;
+    ulong r1 = r0 + (nr > 1u ? 1u : 0u);
+    ulong r2 = r0 + (nr > 2u ? 2u : 0u);
+    ulong r3 = r0 + (nr > 3u ? 3u : 0u);
+    device const uint* w = (device const uint*)q;
+    device const half* sc = (device const half*)(q + (ulong)rows * gpr * 4u);
+    device const uint* q0 = w + (ulong)r0 * gpr;
+    device const uint* q1p = w + r1 * gpr;
+    device const uint* q2p = w + r2 * gpr;
+    device const uint* q3p = w + r3 * gpr;
+    device const half* s0p = sc + (ulong)r0 * gpg;
+    device const half* s1p = sc + r1 * gpg;
+    device const half* s2p = sc + r2 * gpg;
+    device const half* s3p = sc + r3 * gpg;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint pidx = lane; pidx < np; pidx += 32u) {
+        uint a0 = q0[pidx * 2u], a2 = q0[pidx * 2u + 1u];
+        uint b0 = q1p[pidx * 2u], b2 = q1p[pidx * 2u + 1u];
+        uint c0 = q2p[pidx * 2u], c2 = q2p[pidx * 2u + 1u];
+        uint d0 = q3p[pidx * 2u], d2 = q3p[pidx * 2u + 1u];
+        float sa = (float)s0p[pidx >> 1], sb = (float)s1p[pidx >> 1];
+        float scc = (float)s2p[pidx >> 1], sd = (float)s3p[pidx >> 1];
+        ulong g = (ulong)pidx * 2u;
+        {
+            float4 sA = float4(0.0f), sB = float4(0.0f);
+            float4 sC = float4(0.0f), sD = float4(0.0f);
+            for (uint j = 0; j < 8; ++j) {
+                float4 x = xs[g * 8u + j];
+                uint na = a0 >> (j * 4u), nb = b0 >> (j * 4u);
+                uint nc = c0 >> (j * 4u), nd = d0 >> (j * 4u);
+                sA += select(-x, x, bool4(na & 1u, na & 2u, na & 4u, na & 8u));
+                sB += select(-x, x, bool4(nb & 1u, nb & 2u, nb & 4u, nb & 8u));
+                sC += select(-x, x, bool4(nc & 1u, nc & 2u, nc & 4u, nc & 8u));
+                sD += select(-x, x, bool4(nd & 1u, nd & 2u, nd & 4u, nd & 8u));
+            }
+            acc0 += sa * (sA.x + sA.y + sA.z + sA.w);
+            acc1 += sb * (sB.x + sB.y + sB.z + sB.w);
+            acc2 += scc * (sC.x + sC.y + sC.z + sC.w);
+            acc3 += sd * (sD.x + sD.y + sD.z + sD.w);
+        }
+        {
+            float4 sA = float4(0.0f), sB = float4(0.0f);
+            float4 sC = float4(0.0f), sD = float4(0.0f);
+            for (uint j = 0; j < 8; ++j) {
+                float4 x = xs[(g + 1u) * 8u + j];
+                uint na = a2 >> (j * 4u), nb = b2 >> (j * 4u);
+                uint nc = c2 >> (j * 4u), nd = d2 >> (j * 4u);
+                sA += select(-x, x, bool4(na & 1u, na & 2u, na & 4u, na & 8u));
+                sB += select(-x, x, bool4(nb & 1u, nb & 2u, nb & 4u, nb & 8u));
+                sC += select(-x, x, bool4(nc & 1u, nc & 2u, nc & 4u, nc & 8u));
+                sD += select(-x, x, bool4(nd & 1u, nd & 2u, nd & 4u, nd & 8u));
+            }
+            acc0 += sa * (sA.x + sA.y + sA.z + sA.w);
+            acc1 += sb * (sB.x + sB.y + sB.z + sB.w);
+            acc2 += scc * (sC.x + sC.y + sC.z + sC.w);
+            acc3 += sd * (sD.x + sD.y + sD.z + sD.w);
+        }
+    }
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
+    acc2 = simd_sum(acc2);
+    acc3 = simd_sum(acc3);
+    if (lane == 0) {
+        y[r0] = acc0;
+        if (nr > 1u) y[r0 + 1u] = acc1;
+        if (nr > 2u) y[r0 + 2u] = acc2;
+        if (nr > 3u) y[r0 + 3u] = acc3;
+    }
+}
+
+// Half-accumulation twin of q1g_matvec — q1_matvec_h's arithmetic on the
+// plane layout (default with CMF_Q1_HALF, like the q1 pair).
+kernel void q1g_matvec_h(
+    device const uchar*  q    [[buffer(0)]],
+    device const float4* xs   [[buffer(1)]],
+    device float*        y    [[buffer(2)]],
+    constant uint&       gpr  [[buffer(3)]],
+    constant uint&       rows [[buffer(4)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    uint r0 = (tgpos * sgs + sg) * 4u;
+    if (r0 >= rows) return;
+    uint nr = min(rows - r0, 4u);
+    uint np = gpr >> 1;
+    uint gpg = gpr >> 2;
+    ulong r1 = r0 + (nr > 1u ? 1u : 0u);
+    ulong r2 = r0 + (nr > 2u ? 2u : 0u);
+    ulong r3 = r0 + (nr > 3u ? 3u : 0u);
+    device const uint* w = (device const uint*)q;
+    device const half* sc = (device const half*)(q + (ulong)rows * gpr * 4u);
+    device const uint* q0 = w + (ulong)r0 * gpr;
+    device const uint* q1p = w + r1 * gpr;
+    device const uint* q2p = w + r2 * gpr;
+    device const uint* q3p = w + r3 * gpr;
+    device const half* s0p = sc + (ulong)r0 * gpg;
+    device const half* s1p = sc + r1 * gpg;
+    device const half* s2p = sc + r2 * gpg;
+    device const half* s3p = sc + r3 * gpg;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint pidx = lane; pidx < np; pidx += 32u) {
+        uint a0 = q0[pidx * 2u], a2 = q0[pidx * 2u + 1u];
+        uint b0 = q1p[pidx * 2u], b2 = q1p[pidx * 2u + 1u];
+        uint c0 = q2p[pidx * 2u], c2 = q2p[pidx * 2u + 1u];
+        uint d0 = q3p[pidx * 2u], d2 = q3p[pidx * 2u + 1u];
+        float sa = (float)s0p[pidx >> 1], sb = (float)s1p[pidx >> 1];
+        float scc = (float)s2p[pidx >> 1], sd = (float)s3p[pidx >> 1];
+        ulong g = (ulong)pidx * 2u;
+        {
+            half4 sA = half4(0.0h), sB = half4(0.0h);
+            half4 sC = half4(0.0h), sD = half4(0.0h);
+            for (uint j = 0; j < 8; ++j) {
+                half4 x = half4(xs[g * 8u + j]);
+                uint na = a0 >> (j * 4u), nb = b0 >> (j * 4u);
+                uint nc = c0 >> (j * 4u), nd = d0 >> (j * 4u);
+                sA += select(-x, x, bool4(na & 1u, na & 2u, na & 4u, na & 8u));
+                sB += select(-x, x, bool4(nb & 1u, nb & 2u, nb & 4u, nb & 8u));
+                sC += select(-x, x, bool4(nc & 1u, nc & 2u, nc & 4u, nc & 8u));
+                sD += select(-x, x, bool4(nd & 1u, nd & 2u, nd & 4u, nd & 8u));
+            }
+            acc0 += sa * (float)(sA.x + sA.y + sA.z + sA.w);
+            acc1 += sb * (float)(sB.x + sB.y + sB.z + sB.w);
+            acc2 += scc * (float)(sC.x + sC.y + sC.z + sC.w);
+            acc3 += sd * (float)(sD.x + sD.y + sD.z + sD.w);
+        }
+        {
+            half4 sA = half4(0.0h), sB = half4(0.0h);
+            half4 sC = half4(0.0h), sD = half4(0.0h);
+            for (uint j = 0; j < 8; ++j) {
+                half4 x = half4(xs[(g + 1u) * 8u + j]);
+                uint na = a2 >> (j * 4u), nb = b2 >> (j * 4u);
+                uint nc = c2 >> (j * 4u), nd = d2 >> (j * 4u);
+                sA += select(-x, x, bool4(na & 1u, na & 2u, na & 4u, na & 8u));
+                sB += select(-x, x, bool4(nb & 1u, nb & 2u, nb & 4u, nb & 8u));
+                sC += select(-x, x, bool4(nc & 1u, nc & 2u, nc & 4u, nc & 8u));
+                sD += select(-x, x, bool4(nd & 1u, nd & 2u, nd & 4u, nd & 8u));
+            }
+            acc0 += sa * (float)(sA.x + sA.y + sA.z + sA.w);
+            acc1 += sb * (float)(sB.x + sB.y + sB.z + sB.w);
+            acc2 += scc * (float)(sC.x + sC.y + sC.z + sC.w);
+            acc3 += sd * (float)(sD.x + sD.y + sD.z + sD.w);
+        }
+    }
+    acc0 = simd_sum(acc0);
+    acc1 = simd_sum(acc1);
+    acc2 = simd_sum(acc2);
+    acc3 = simd_sum(acc3);
+    if (lane == 0) {
+        y[r0] = acc0;
+        if (nr > 1u) y[r0 + 1u] = acc1;
+        if (nr > 2u) y[r0 + 2u] = acc2;
+        if (nr > 3u) y[r0 + 3u] = acc3;
+    }
+}
+"#;
+
 struct Ctx {
     _device: Device,
     queue: CommandQueue,
@@ -7339,6 +7530,10 @@ struct Ctx {
     q8mmm: ComputePipelineState,
     q1: ComputePipelineState,
     q1h: ComputePipelineState,
+    /// q1g twins (sign + scale planes) of `q1` / `q1h`, from their own
+    /// library (`MSL_Q1G`); None if that library failed to compile.
+    q1g: Option<ComputePipelineState>,
+    q1gh: Option<ComputePipelineState>,
     q1t: ComputePipelineState,
     q1t_ov: ComputePipelineState,
     q1t_mm: ComputePipelineState,
@@ -7612,6 +7807,28 @@ fn init() -> Result<Ctx, String> {
     let q8mmm = pso_fc("q8_mul_mm")?;
     let q1 = pso("q1_matvec")?;
     let q1h = pso("q1_matvec_h")?;
+    // Separate library: see `MSL_Q1G`. A failure is reported once and only
+    // q1g loses the device.
+    let (q1g, q1gh) = match device
+        .new_library_with_source(MSL_Q1G, &opts)
+        .map_err(|e| format!("MSL_Q1G compile: {e}"))
+        .and_then(|lib_g| {
+            let pso_g = |name: &str| -> Result<ComputePipelineState, String> {
+                let f = lib_g
+                    .get_function(name, None)
+                    .map_err(|e| format!("kernel {name}: {e}"))?;
+                device
+                    .new_compute_pipeline_state_with_function(&f)
+                    .map_err(|e| format!("pipeline {name}: {e}"))
+            };
+            Ok((pso_g("q1g_matvec")?, pso_g("q1g_matvec_h")?))
+        }) {
+        Ok((a, b)) => (Some(a), Some(b)),
+        Err(e) => {
+            eprintln!("metal: q1g kernels unavailable ({e}); q1g weights stay on the CPU");
+            (None, None)
+        }
+    };
     let q1t = pso("q1t_matvec")?;
     let q1t_ov = pso("q1t_overlay")?;
     let q1t_mm = pso("q1t_mul_mm")?;
@@ -7735,6 +7952,8 @@ fn init() -> Result<Ctx, String> {
         q8mmm,
         q1,
         q1h,
+        q1g,
+        q1gh,
         q1t,
         q1t_ov,
         q1t_mm,
@@ -8977,6 +9196,102 @@ fn encode_q1_matvec(
     );
 }
 
+/// Encode one q1g matvec (sign + scale planes; `gpr` = 32-tiles per row,
+/// `rows` = the tensor's own rows — the scale plane follows all of them).
+/// Same dispatch shape and f32/half kernel choice as `encode_q1_matvec`.
+/// Callers check `q1g_ready` first.
+#[allow(clippy::too_many_arguments)]
+fn encode_q1g_matvec(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    fbuf: &WeightArena,
+    abs: usize,
+    xs: &Buffer,
+    y: &Buffer,
+    rows: usize,
+    gpr: usize,
+) {
+    let pipe = if q1_half() { &c.q1gh } else { &c.q1g };
+    enc.set_compute_pipeline_state(pipe.as_ref().expect("q1g pipelines checked by the caller"));
+    fbuf.bind(enc, 0, abs);
+    enc.set_buffer(1, Some(xs), 0);
+    enc.set_buffer(2, Some(y), 0);
+    let gpr_u = gpr as u32;
+    let rows_u = rows as u32;
+    enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+    let sgs = 8u64; // × 4 rows per simdgroup
+    enc.dispatch_thread_groups(
+        MTLSize::new((rows as u64).div_ceil(sgs * 4), 1, 1),
+        MTLSize::new(sgs * 32, 1, 1),
+    );
+}
+
+/// Both q1g pipelines compiled (`MSL_Q1G`)?
+fn q1g_ready(c: &Ctx) -> bool {
+    c.q1g.is_some() && c.q1gh.is_some()
+}
+
+/// q1g matvec on the GPU (sign + scale planes, raw f32 activation) — the
+/// q1_matvec twin. `rows` must be the tensor's own. false = CPU fallback.
+pub fn q1g_matvec(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if !q1g_ready(c) || cols % cortiq_core::quant::Q1G_GROUP != 0 {
+        return false;
+    }
+    let entry = &model.tensors[idx];
+    if entry.shape.first().copied() != Some(rows) || entry.shape.get(1).copied() != Some(cols) {
+        return false;
+    }
+    let Some(abs) = model.entry_abs_offset(entry) else {
+        return false;
+    };
+    let _bytes = model.primary_bytes();
+    let Some((fbuf, safe_len)) = file_buffer(c, model) else {
+        return false;
+    };
+    let Some(need) =
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q1G, &[rows, cols])
+    else {
+        return false;
+    };
+    if abs + need > safe_len {
+        return false;
+    }
+    let get_io = |key: usize, nbytes: usize| -> Buffer {
+        let mut cache = c.io_bufs.lock().unwrap();
+        cache
+            .entry(io_key(key))
+            .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
+                c._device
+                    .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
+            })
+            .clone()
+    };
+    let xs_buf = get_io(13_000_000_559 + xs.len(), xs.len() * 4);
+    unsafe {
+        std::ptr::copy_nonoverlapping(xs.as_ptr(), xs_buf.contents() as *mut f32, xs.len());
+    }
+    let y_buf = get_io(14_000_000_573 + rows, rows * 4);
+    let cmd = c.queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    encode_q1g_matvec(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, cols / GROUP_SIZE);
+    enc.end_encoding();
+    submit_and_wait(c, cmd, &[&y_buf]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), rows);
+    }
+    true
+}
+
 /// Encode a q1t BASE matvec (ternary, raw-f32 x). `abs` points at the tile
 /// base; the overlay follows and is applied by `encode_q1t_overlay`.
 fn encode_q1t_matvec(
@@ -9035,6 +9350,8 @@ struct PrismSpec {
 #[derive(Clone)]
 enum ProjKind {
     Q1,
+    /// q1g sign + scale planes (`encode_q1g_matvec`).
+    Q1g,
     Q1t,
     Q4b,
     Q4t,
@@ -9825,9 +10142,15 @@ fn note_weight_bytes(kind: &ProjKind, rows: usize, gpr: usize) {
         ProjKind::Q2tp { .. } => 9, // 8 B two-bit plane + 5-bit ladder code
         ProjKind::Q4b => 18,
         ProjKind::Q1 | ProjKind::Q1t => 5,
+        // 4.5 B per 32-tile: counted below in exact eighths.
+        ProjKind::Q1g => 0,
         _ => 16,
     };
-    let add = rows as u64 * gpr as u64 * tile;
+    let add = if matches!(kind, ProjKind::Q1g) {
+        rows as u64 * gpr as u64 * 9 / 2
+    } else {
+        rows as u64 * gpr as u64 * tile
+    };
     WEIGHT_BYTES.fetch_add(add, std::sync::atomic::Ordering::Relaxed);
     let cat = WCAT.load(std::sync::atomic::Ordering::Relaxed) as usize % 6;
     WEIGHT_BYTES_BY[cat].fetch_add(add, std::sync::atomic::Ordering::Relaxed);
@@ -9884,6 +10207,9 @@ fn encode_proj(
         }
         ProjKind::Q1 => {
             encode_q1_matvec(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
+        }
+        ProjKind::Q1g => {
+            encode_q1g_matvec(c, enc, fbuf, abs, in_buf, out_buf, rows, gpr);
         }
         ProjKind::Q8 {
             row_scale,
@@ -15329,6 +15655,20 @@ pub fn matvec_batch(model: &Arc<CmfModel>, jobs: &[BatchJob], outs: &mut [&mut [
                 }
                 j.rows * (j.cols / GROUP_SIZE) * Q1_TILE
             }
+            // q1g: both planes, and only the whole tensor (its scale plane
+            // follows every row).
+            BL::Q1g => {
+                if !q1g_ready(c) || entry.shape.first().copied() != Some(j.rows) {
+                    return false;
+                }
+                match cortiq_core::quant::expected_nbytes(
+                    cortiq_core::TensorDtype::Q1G,
+                    &[j.rows, j.cols],
+                ) {
+                    Some(n) => n,
+                    None => return false,
+                }
+            }
             BL::Q4t => {
                 if j.cols % GROUP_SIZE != 0 {
                     return false;
@@ -15397,6 +15737,7 @@ pub fn matvec_batch(model: &Arc<CmfModel>, jobs: &[BatchJob], outs: &mut [&mut [
             let gpr = j.cols / GROUP_SIZE;
             match j.layout {
                 BL2::Q1 => encode_q1_matvec(c, enc, &fbuf, *abs, &xs_b, &y_b, j.rows, gpr),
+                BL2::Q1g => encode_q1g_matvec(c, enc, &fbuf, *abs, &xs_b, &y_b, j.rows, gpr),
                 BL2::Q4t => encode_q4t_matvec(c, enc, &fbuf, *abs, &xs_b, &y_b, j.rows, gpr),
                 BL2::Q4tp => encode_q4tp_matvec(c, enc, &fbuf, *abs, &xs_b, &y_b, j.rows, gpr),
                 BL2::Q8 => unreachable!(),
@@ -16175,6 +16516,27 @@ impl TokenGraph {
         Some(abs)
     }
 
+    /// Validate one q1g tensor: both planes must fit the safe mmap window,
+    /// `rows` must be the tensor's own (the scale plane follows every row),
+    /// and the q1g library must have compiled.
+    fn q1g_abs(&self, t: (usize, usize, usize)) -> Option<usize> {
+        let (idx, rows, cols) = t;
+        if !q1g_ready(self.c) {
+            return None;
+        }
+        let entry = &self.model.tensors[idx];
+        if entry.shape.first().copied() != Some(rows) {
+            return None;
+        }
+        let abs = self.model.entry_abs_offset(entry)?;
+        let need =
+            cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q1G, &[rows, cols])?;
+        if !self.arena_contains(abs, need) {
+            return None;
+        }
+        Some(abs)
+    }
+
     /// Validate one q1t tensor: base (9-byte tiles) then the per-row overlay
     /// must fit the safe mmap window. No gpr-parity constraint (the q1t kernel
     /// doesn't pair tiles).
@@ -16304,6 +16666,7 @@ impl TokenGraph {
     fn proj_abs(&self, t: (usize, usize, usize)) -> Option<(usize, ProjKind)> {
         match self.model.tensors[t.0].dtype {
             cortiq_core::TensorDtype::Q1 => self.q1_abs(t).map(|a| (a, ProjKind::Q1)),
+            cortiq_core::TensorDtype::Q1G => self.q1g_abs(t).map(|a| (a, ProjKind::Q1g)),
             cortiq_core::TensorDtype::Q1T => self.q1t_abs(t).map(|a| (a, ProjKind::Q1t)),
             cortiq_core::TensorDtype::Q4Block => self.q4b_abs(t).map(|a| (a, ProjKind::Q4b)),
             cortiq_core::TensorDtype::Q4Tiled => self.q4t_abs(t).map(|a| (a, ProjKind::Q4t)),
