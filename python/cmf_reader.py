@@ -33,7 +33,7 @@ KNOWN_FEATURES = (1 << 9) - 1
 DTYPE_NAME = {0: "f32", 1: "f16", 2: "bf16", 3: "q8_row", 4: "q4_block",
               5: "mix8_4", 6: "u8", 7: "q4_col", 8: "vbit", 9: "q8_2f",
               10: "vbit_ro", 11: "q4_tiled", 12: "q1", 13: "q1s",
-              14: "q1t", 15: "q4tp", 16: "q2tp"}
+              14: "q1t", 15: "q4tp", 16: "q2tp", 20: "q1g"}
 
 _SHARD_RE = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.cmf$")
 
@@ -169,6 +169,19 @@ def _dq_q1(raw: bytes, shape) -> np.ndarray:
     return vals.reshape(shape).copy()
 
 
+def _dq_q1g(raw: bytes, shape) -> np.ndarray:
+    """q1g (dtype 20): [sign bits: rows*cols/8][f16 scales: rows*cols/128]
+    — one scale per 128-group; bit k of byte j (LSB-first) is weight j*8+k
+    of the row, value = scale * (2*bit - 1). Lossless repack of a q1 tensor
+    whose four tile scales agree in every 128-group."""
+    rows, cols = shape
+    n = rows * cols
+    bits = np.unpackbits(np.frombuffer(raw, np.uint8, n // 8), bitorder="little")
+    sc = np.frombuffer(raw, np.float16, n // 128, n // 8).astype(np.float32)
+    vals = (bits.astype(np.float32) * 2.0 - 1.0).reshape(n // 128, 128) * sc[:, None]
+    return vals.reshape(shape).copy()
+
+
 def dequant(raw: bytes, dtype: str, shape) -> np.ndarray:
     if dtype == "f32":
         return np.frombuffer(raw, np.float32, int(np.prod(shape))).reshape(shape).copy()
@@ -193,6 +206,8 @@ def dequant(raw: bytes, dtype: str, shape) -> np.ndarray:
         return _dq_q4_tiled(raw, shape)
     if dtype == "q1":
         return _dq_q1(raw, shape)
+    if dtype == "q1g":
+        return _dq_q1g(raw, shape)
     raise ValueError(f"dtype {dtype}: dequant not implemented in the reader")
 
 

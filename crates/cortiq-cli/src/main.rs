@@ -624,13 +624,23 @@ enum Commands {
         /// Output .cmf path (omit with --in-place)
         #[arg(long)]
         output: Option<String>,
-        /// Target layout: q4tp (re-express scales), q4tp-quantize (float weights → q4tp), q2tp-draft (MTP inputs), or embryo-q8-head (experimental tied Embryo vocabulary only; new output required)
+        /// Target layout: q4tp (re-express scales), q4tp-quantize (float weights → q4tp), q2tp-draft (MTP inputs), q1g (lossless q1 repack: one scale per 128-group, 1.5 → 1.125 bpw), q1 (q1g back to q1 tiles, exact, for older readers), or embryo-q8-head (experimental tied Embryo vocabulary only; new output required)
         #[arg(long, default_value = "q4tp")]
         quant: String,
         /// Rewrite tensors inside the source file itself — for disks that
         /// cannot hold the model twice. New payloads must fit their slots.
         #[arg(long, default_value_t = false)]
         in_place: bool,
+        /// q1g only: accept 128-groups whose four q1 tile scales are not
+        /// byte-identical but agree within `--tol` (f16 rounding of the
+        /// native scale). Without it any such group refuses the whole run.
+        #[arg(long, default_value_t = false)]
+        allow_tol: bool,
+        /// q1g only: relative tolerance `|s_tile − s_group| / s_group` for
+        /// `--allow-tol` (default 2^-8 = 0.39 %: a few f16 ulps). Tensors
+        /// with a group beyond it stay q1, byte for byte.
+        #[arg(long, default_value_t = 0.00390625)]
+        tol: f64,
     },
     /// Bake a task's expert restriction as a switchable task mask
     /// (spec §5 expert fields): the full expert set stays, `run --task`
@@ -3143,7 +3153,19 @@ async fn main() -> anyhow::Result<()> {
             output,
             quant,
             in_place,
-        } => requant::cmd_requant(&model, output.as_deref(), &quant, in_place),
+            allow_tol,
+            tol,
+        } => {
+            if quant == "q1g" {
+                requant::cmd_requant_q1g(&model, output.as_deref(), in_place, allow_tol, tol)
+            } else if quant == "q1" && !allow_tol {
+                requant::cmd_requant_q1(&model, output.as_deref(), in_place)
+            } else if allow_tol {
+                Err(anyhow::anyhow!("--allow-tol only applies to --quant q1g"))
+            } else {
+                requant::cmd_requant(&model, output.as_deref(), &quant, in_place)
+            }
+        }
         Commands::TubeBake {
             model,
             plan,
