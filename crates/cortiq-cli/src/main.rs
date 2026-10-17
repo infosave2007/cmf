@@ -811,6 +811,10 @@ enum Commands {
         /// (the plain GPTQ arms of the q2tp study)
         #[arg(long, value_name = "on|off")]
         q2tp_debias: Option<String>,
+        /// q4tp/q2tp: the same output debias for the q4tp tensors (opt-in:
+        /// at 4 bits the shrinkage is ~16× smaller than at 2)
+        #[arg(long)]
+        q4tp_debias: bool,
     },
     /// Chat with a model (applies the file's chat template), or one-shot
     /// with --prompt
@@ -3191,6 +3195,7 @@ async fn main() -> anyhow::Result<()> {
             q2tp_rule,
             q2tp_rule_tensor,
             q2tp_debias,
+            q4tp_debias,
         } => {
             let codec = codec.to_ascii_lowercase();
             let q2tp_flags =
@@ -3234,6 +3239,7 @@ async fn main() -> anyhow::Result<()> {
                             .map(|s| gptq::parse_q2tp_rule_override(s))
                             .collect::<anyhow::Result<Vec<_>>>()?,
                         q2tp_debias,
+                        q4tp_debias,
                         chunk_layers: calib_chunk_layers,
                     };
                     gptq::run_quantize_gptq_tiled(&opts)?;
@@ -3243,8 +3249,9 @@ async fn main() -> anyhow::Result<()> {
                         calib_model.is_none()
                             && tensor_quant.is_empty()
                             && !q2tp_flags
+                            && !q4tp_debias
                             && calib_chunk_layers == 0,
-                        "--calib-model / --tensor-quant / --calib-chunk-layers / --q2tp-* apply to --codec q4tp|q2tp"
+                        "--calib-model / --tensor-quant / --calib-chunk-layers / --q2tp-* / --q4tp-debias apply to --codec q4tp|q2tp"
                     );
                     anyhow::ensure!(
                         calib.len() == 1,
