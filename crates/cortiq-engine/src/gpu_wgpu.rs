@@ -51,6 +51,8 @@ pub mod gdn_train;
 pub mod train_ops;
 /// Trainer GEMMs (zi_mm) and the binary low-rank layer forward/backward.
 pub mod train_mm;
+/// Trainer loss: frozen vocabulary head + KL against the teacher top-k.
+pub mod train_head;
 
 /// Workgroup limit per dimension (WebGPU minimum; lm_head has more
 /// rows — we use grid-stride in the shader).
