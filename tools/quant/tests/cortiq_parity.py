@@ -133,6 +133,7 @@ def main():
     ap.add_argument("--wl", type=int, default=160)
     ap.add_argument("--kinds", nargs="+", default=["llama", "qwen3_5"])
     ap.add_argument("--quants", nargs="+", default=["f16", "q4tp", "q2tp"])
+    ap.add_argument("--refit", action="store_true", help="also run metric_refit.py end to end on the tiny files")
     args = ap.parse_args()
     text = args.text or os.path.join(HERE, "..", "..", "..", "README.md")
     qmodel.setup_torch(0, tf32=False)
@@ -158,7 +159,54 @@ def main():
                   f"{np.round(mine, 4).tolist()}\n   max rel diff {rel.max():.2e} "
                   f"(per-token NLL {np.mean(ref) / (args.wl - 1):.3f})", flush=True)
     print(f"worst relative NLL difference {worst:.2e}")
-    return 0 if worst < 1e-4 else 1
+    ok = worst < 1e-4
+    if args.refit:
+        ok &= refit_chain(args, text)
+    return 0 if ok else 1
+
+
+def refit_chain(args, text):
+    """metric_refit.py end to end on the real tiny files: q4tp / q2tp student, f16 teacher, write-back through
+    cortiq patch-tensor --raw + verify; then the written file must (a) differ from its source only in the f16
+    fields, (b) score better than the source on the training windows, (c) score identically in torch and cortiq."""
+    import metric_refit
+    good = True
+    for kind in args.kinds:
+        d = os.path.join(args.work, kind)
+        ids_p = os.path.join(d, "ids.txt")
+        for q in [x for x in args.quants if x != "f16"]:
+            out = os.path.join(d, f"refit_{q}")
+            dst = os.path.join(d, f"{q}-genesis.cmf")
+            man = metric_refit.main(["--model", os.path.join(d, f"{q}.cmf"), "--teacher", os.path.join(d, "f16.cmf"),
+                                     "--corpus", f"{ids_p},train=12,held=0:3", "--out", out, "--wl", "64",
+                                     "--bs", "4", "--mb", "2", "--eval-mb", "4", "--epochs", "4", "--eval-every", "3",
+                                     "--step", "--lr", "3e-3", "--device", "cpu", "--write", dst, "--cortiq", args.cortiq,
+                                     "--topk", "16"])
+            src, new = cmfio.CmfFile(os.path.join(d, f"{q}.cmf")), cmfio.CmfFile(dst)
+            stray = 0
+            for n, t in src.tensors.items():
+                a, b = src.payload(n), new.payload(n)
+                if np.array_equal(a, b):
+                    continue
+                if t.dtype in qmodel.TILED:
+                    import cmfcodec as cc
+                    nb = cc.Tiled(t.dtype, a, *t.shape).nb
+                    diff = np.nonzero(a != b)[0]
+                    stray += int(((diff < nb) | (diff >= nb + 4 * t.shape[0])).sum())
+                elif not (len(t.shape) == 1 and t.dtype in qmodel.FLOATS):
+                    stray += 1
+            ids = cmfio.load_ids(ids_p)
+            w = calib.gather(ids, calib.even_starts(len(ids), 2, 64), 64)
+            ref = cortiq_window_nll(args.cortiq, dst, text, 2, 64, os.path.join(d, "ids2.txt"))
+            mine = qmodel.Model(new, "cpu").evaluate(w, mb=1)["nll"]
+            rel = float(np.max(np.abs(np.array(mine) - np.array(ref)) / np.array(ref)))
+            gain = man["hist"][0]["held_ce"] - man["best_held_ce"]
+            this = stray == 0 and gain > 0 and rel < 1e-4
+            good &= this
+            print(f"{kind:8s} {q:5s} genesis: held-out CE {man['hist'][0]['held_ce']:.4f} -> {man['best_held_ce']:.4f} "
+                  f"(snapped {man['held_ce_snapped']:.4f}), {man['n_payloads']} payloads, bytes outside f16 fields "
+                  f"{stray}, written file torch vs cortiq max rel {rel:.1e} -> {'ok' if this else 'FAIL'}", flush=True)
+    return good
 
 
 if __name__ == "__main__":
