@@ -2,6 +2,7 @@
 //!
 //! Format specification: `docs/CMF_V2_SPEC.md`.
 
+pub mod blr;
 pub mod format;
 pub mod hadamard;
 pub mod hash;
