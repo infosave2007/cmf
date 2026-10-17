@@ -907,7 +907,8 @@ pub(crate) struct GptqTiledOpts<'a> {
     pub q2tp_rule: Q2tpRule,
     /// `--q2tp-rule-tensor PATTERN=RULE`: first match wins.
     pub q2tp_rule_overrides: Vec<(String, Q2tpRule)>,
-    /// Remove each q2tp row's output shrinkage in the calibration metric.
+    /// Remove each q2tp row's output shrinkage in the calibration metric
+    /// (the CLI default: −11.5 % ppl on MiniCPM5's placed arm, zero bits).
     pub q2tp_debias: bool,
     /// Capture this many layers per calibration pass (0 = all at once):
     /// bounds the Hessian RAM at the price of one forward per pass.
