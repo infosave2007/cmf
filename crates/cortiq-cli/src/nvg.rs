@@ -1471,9 +1471,11 @@ pub fn run_convert_blr(
                 let mut fit_ppl = 0f64;
                 let keep = names.clone();
                 cortiq_engine::gptq_capture::begin_filtered(true, move |n| keep.contains(n));
+                // The device pass feeds the positions the host's scored
+                // forward feeds (a window's last token has no target there).
                 for wv in &fit_w {
                     if gpu {
-                        pipe.calib_forward(wv, l + 1, window).map_err(|e| anyhow::anyhow!(e))?;
+                        pipe.calib_forward(&wv[..wv.len() - 1], l + 1, window).map_err(|e| anyhow::anyhow!(e))?;
                     } else {
                         fit_ppl += pipe.ppl_ids(wv).map_err(|e| anyhow::anyhow!(e))?.ln();
                     }
@@ -1483,7 +1485,7 @@ pub fn run_convert_blr(
                 cortiq_engine::gptq_capture::begin_filtered(true, move |n| keep.contains(n));
                 for wv in &sel_w {
                     if gpu {
-                        pipe.calib_forward(wv, l + 1, window).map_err(|e| anyhow::anyhow!(e))?;
+                        pipe.calib_forward(&wv[..wv.len() - 1], l + 1, window).map_err(|e| anyhow::anyhow!(e))?;
                     } else {
                         pipe.ppl_ids(wv).map_err(|e| anyhow::anyhow!(e))?;
                     }
