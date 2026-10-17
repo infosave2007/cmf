@@ -8633,6 +8633,32 @@ impl Pipeline {
         Ok((nll / cnt.max(1) as f64).exp())
     }
 
+    /// GPTQ calibration forward: `ids` through layers `0..upto` only, in
+    /// layer-major chunks of `chunk` positions, with no vocabulary head and
+    /// no scoring. The Hessian hook (`gptq_capture`) folds every
+    /// projection's input on the way; the layers above the captured span
+    /// and the head would only cost time. Falls back to a scored forward
+    /// where the batched prefill does not apply.
+    pub fn calib_forward(&mut self, ids: &[u32], upto: usize, chunk: usize) -> Result<(), String> {
+        if !self.can_prefill_batched() {
+            return self.nll_ids_from(ids, 0).map(|_| ());
+        }
+        self.nll_begin()?;
+        let result: Result<(), String> = (|| {
+            let chunk = chunk.max(1);
+            let mut pos = 0usize;
+            while pos < ids.len() {
+                let end = (pos + chunk).min(ids.len());
+                let _ = self.prefill_batch_span(PrefillIn::Ids(&ids[pos..end]), pos, None, 0, upto);
+                self.nll_check_graph("calibration prefill", pos)?;
+                pos = end;
+            }
+            Ok(())
+        })();
+        self.nll_end();
+        result
+    }
+
     /// DTG-MA calibration pass (Patent 2): run `ids` through the model
     /// (CPU path, per position) and return each layer's per-neuron
     /// activation mass Σ|silu(gate)·up| — the statistic the task-guided
@@ -17113,6 +17139,10 @@ fn dense_ffn_batch(
         // a fused batch would leave it summing nothing — a probe that
         // reports zeros rather than failing, which is worse.
         && !ffn_probe_active()
+        // GPTQ calibration folds every projection's input on the host
+        // (`QTensor::matmat`); the fused chain would hand gate/up/down
+        // their inputs on the card and leave the FFN uncalibrated.
+        && !crate::gptq_capture::capturing()
     {
         if let (Some((model, w1)), Some((_, w3)), Some((_, w2))) = (
             d.gate_proj.mapped_q4t(),

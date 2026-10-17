@@ -971,32 +971,44 @@ impl CalibRun {
         Ok(Self { pipe, windows, used })
     }
 
-    /// One forward over every window with only `names` captured.
+    /// One forward over every window, layers `0..upto` only, with only
+    /// `names` captured.
     fn capture(
         &mut self,
         names: std::collections::HashSet<String>,
+        upto: usize,
+        lazy: bool,
         t0: std::time::Instant,
-    ) -> anyhow::Result<std::collections::HashMap<String, cortiq_engine::gptq_capture::HessianAcc>> {
+    ) -> anyhow::Result<cortiq_engine::gptq_capture::Captured> {
         cortiq_engine::gptq_capture::begin_filtered(true, move |n| names.contains(n));
+        // Positions per batched prefill step: the per-op device GEMMs of a
+        // GPU calibration pay one round trip per projection per step.
+        let chunk: usize = std::env::var("CMF_GPTQ_PREFILL_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(512);
         let n_win = self.windows.len();
-        let mut nll_sum = 0f64;
+        let t_pass = std::time::Instant::now();
         for (k, win) in self.windows.iter().enumerate() {
-            match self.pipe.ppl_ids(win) {
-                Ok(p) => nll_sum += p.ln(),
-                Err(e) => {
-                    let _ = cortiq_engine::gptq_capture::end();
-                    anyhow::bail!("calibration window {k}: {e}");
-                }
+            if let Err(e) = self.pipe.calib_forward(win, upto, chunk) {
+                let _ = cortiq_engine::gptq_capture::end_shared();
+                anyhow::bail!("calibration window {k}: {e}");
             }
             eprint!(
-                "\r  window {}/{n_win}  mean ppl {:.3}  {:.0}s   ",
+                "\r  window {}/{n_win}  {:.1}s/window  {:.0}s   ",
                 k + 1,
-                (nll_sum / (k + 1) as f64).exp(),
+                t_pass.elapsed().as_secs_f64() / (k + 1) as f64,
                 t0.elapsed().as_secs_f64()
             );
         }
         eprintln!();
-        Ok(cortiq_engine::gptq_capture::end())
+        let n_tok: usize = self.windows.iter().map(Vec::len).sum();
+        cortiq_engine::cpuprof::report("calibration pass", n_tok);
+        Ok(if lazy {
+            cortiq_engine::gptq_capture::end_shared_lazy()
+        } else {
+            cortiq_engine::gptq_capture::end_shared()
+        })
     }
 }
 
@@ -1004,6 +1016,8 @@ impl CalibRun {
 enum HSrc {
     Mem(std::sync::Mutex<Option<Vec<f64>>>),
     Cache { path: String, entry: HessCacheEntry },
+    /// Still on the device (`gptq_capture::end_shared_lazy`).
+    Device(std::sync::Mutex<Option<u64>>),
 }
 
 /// One distinct calibration Hessian and the linears that read it (q/k/v and
@@ -1025,6 +1039,10 @@ impl HGroup {
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("Hessian taken twice")),
             HSrc::Cache { path, entry } => Ok(read_hessian_entry(path, entry)?.h),
+            HSrc::Device(m) => {
+                let id = m.lock().unwrap().take().ok_or_else(|| anyhow::anyhow!("Hessian taken twice"))?;
+                cortiq_engine::gpu::gram_take(id).ok_or_else(|| anyhow::anyhow!("device Hessian readback failed"))
+            }
         }
     }
 }
@@ -1034,18 +1052,42 @@ impl HGroup {
 /// a group's lead is what it always was.
 fn groups_from_capture(
     model: &cortiq_core::format::CmfModel,
-    mut hess: std::collections::HashMap<String, cortiq_engine::gptq_capture::HessianAcc>,
+    cap: cortiq_engine::gptq_capture::Captured,
     slots: &[usize],
     no_hessian: &mut Vec<usize>,
 ) -> Vec<HGroup> {
+    let mut hess = cap.hess;
+    let mut device = cap.device;
+    let alias: std::collections::HashMap<String, String> = cap.alias.into_iter().collect();
     let mut groups: Vec<HGroup> = Vec::new();
+    let mut group_of_owner: std::collections::HashMap<String, usize> = Default::default();
+    let mut aliased: Vec<(usize, String)> = Vec::new();
     for &slot in slots {
         let entry = &model.tensors[slot];
         let cols = entry.shape[1];
+        if let Some(owner) = alias.get(&entry.name) {
+            aliased.push((slot, owner.clone()));
+            continue;
+        }
         let Some(acc) = hess.remove(&entry.name) else {
             no_hessian.push(slot);
             continue;
         };
+        if let Some(id) = device.remove(&entry.name) {
+            if acc.count == 0 || acc.cols != cols {
+                no_hessian.push(slot);
+                continue;
+            }
+            groups.push(HGroup {
+                slots: vec![slot],
+                cols,
+                count: acc.count,
+                sumsq: acc.sumsq,
+                src: HSrc::Device(std::sync::Mutex::new(Some(id))),
+            });
+            group_of_owner.insert(entry.name.clone(), groups.len() - 1);
+            continue;
+        }
         if acc.count == 0 || acc.cols != cols || acc.h.len() != cols * cols {
             no_hessian.push(slot);
             continue;
@@ -1058,13 +1100,26 @@ fn groups_from_capture(
         });
         match same {
             Some(g) => g.slots.push(slot),
-            None => groups.push(HGroup {
-                slots: vec![slot],
-                cols,
-                count: acc.count,
-                sumsq: acc.sumsq,
-                src: HSrc::Mem(std::sync::Mutex::new(Some(acc.h))),
-            }),
+            None => {
+                groups.push(HGroup {
+                    slots: vec![slot],
+                    cols,
+                    count: acc.count,
+                    sumsq: acc.sumsq,
+                    src: HSrc::Mem(std::sync::Mutex::new(Some(acc.h))),
+                });
+            }
+        }
+        if let Some(gi) = groups.iter().position(|g| g.slots.contains(&slot)) {
+            group_of_owner.insert(entry.name.clone(), gi);
+        }
+    }
+    // A projection that read its owner's very input shares the owner's
+    // group (and fold operator).
+    for (slot, owner) in aliased {
+        match group_of_owner.get(&owner) {
+            Some(&gi) if groups[gi].cols == model.tensors[slot].shape[1] => groups[gi].slots.push(slot),
+            _ => no_hessian.push(slot),
         }
     }
     groups
@@ -1124,7 +1179,9 @@ fn save_hessian_groups(
         .iter()
         .map(|g| match &g.src {
             HSrc::Mem(m) => Some(m.lock().unwrap()),
-            HSrc::Cache { .. } => None,
+            // Never with a cache file: the capture reads device Hessians
+            // back eagerly then.
+            HSrc::Cache { .. } | HSrc::Device(_) => None,
         })
         .collect();
     let items: Vec<HessCacheItem> = groups
@@ -1201,8 +1258,24 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
         matches!(o.profile, Quant::Q4TiledP | Quant::Q2TiledP),
         "quantize-gptq tiled path: the profile must be q4tp or q2tp"
     );
+    // CMF_GPTQ_GPU=1 keeps the device for the calibration forward (a 27B
+    // calibrates at ~9 tok/s on 27 host cores). The resident token graph
+    // would hide every projection's input from the Hessian hook, so it is
+    // switched off: the batched host prefill then sends each projection to
+    // a per-op device GEMM with host-side input, and the hook folds that
+    // input before the dispatch exactly as it does on the CPU.
+    let gpu_calib = std::env::var("CMF_GPTQ_GPU").as_deref() == Ok("1");
+    // …and the Hessians themselves accumulate on the card (CMF_GPTQ_GPU_HESS=0
+    // keeps the host fold).
+    cortiq_engine::gptq_capture::set_device(
+        gpu_calib && std::env::var("CMF_GPTQ_GPU_HESS").as_deref() != Ok("0"),
+    );
     unsafe {
-        std::env::set_var("CMF_GPU", "0");
+        if !gpu_calib {
+            std::env::set_var("CMF_GPU", "0");
+        } else if std::env::var("CMF_GPU_WGPU_GRAPH").is_err() {
+            std::env::set_var("CMF_GPU_WGPU_GRAPH", "0");
+        }
     }
     let t0 = Instant::now();
     let codec = crate::convert::quant_name(o.profile);
@@ -1250,6 +1323,7 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
     let n_gptq = std::sync::atomic::AtomicUsize::new(0);
     let failed = std::sync::Mutex::new(Vec::<String>::new());
     for (lo, hi, slots) in &chunks {
+        let missed_before = no_hessian.len();
         let cache = o.hessians.map(|p| {
             if o.chunk_layers == 0 {
                 p.to_string()
@@ -1283,8 +1357,16 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
                 } else {
                     eprintln!("capturing {} linears (≤{gb:.1} GB of Hessians) …", slots.len());
                 }
-                let hess = calib.as_mut().unwrap().capture(names, t0)?;
-                let groups = groups_from_capture(&model, hess, slots, &mut no_hessian);
+                // Device Hessians stay on the card until their fold reads
+                // them, unless a cache file wants them all on the host.
+                let lazy = cache.is_none();
+                let cap = calib.as_mut().unwrap().capture(names, hi.saturating_add(1), lazy, t0)?;
+                anyhow::ensure!(
+                    cap.broken.is_empty() || std::env::var("CMF_GPTQ_ALLOW_RTN").as_deref() == Ok("1"),
+                    "calibration capture invalid for {:?} (CMF_GPTQ_ALLOW_RTN=1 encodes them by the converter)",
+                    cap.broken
+                );
+                let groups = groups_from_capture(&model, cap, slots, &mut no_hessian);
                 if let Some(p) = cache.as_deref() {
                     save_hessian_groups(p, &model, &groups)?;
                     eprintln!("Hessians cached to {p}");
@@ -1298,6 +1380,21 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
             groups.len(),
             t0.elapsed().as_secs_f64()
         );
+        // A candidate the calibration forward never reached falls back to
+        // the converter's RTN; name them, so a forward path that bypasses
+        // the hook cannot pass for GPTQ.
+        let missed: Vec<&str> = no_hessian[missed_before..]
+            .iter()
+            .map(|&s| model.tensors[s].name.as_str())
+            .collect();
+        if !missed.is_empty() {
+            eprintln!(
+                "  WARNING: {} candidates got no Hessian (RTN): {}{}",
+                missed.len(),
+                missed.iter().take(40).copied().collect::<Vec<_>>().join(", "),
+                if missed.len() > 40 { ", …" } else { "" }
+            );
+        }
 
         // Workers take whole groups: the O(n³) fold operator dominates, so
         // many groups run at once and each fold and row sweep gets the
