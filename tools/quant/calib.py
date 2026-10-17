@@ -8,7 +8,8 @@ Corpus spec (repeatable `--corpus`):  PATH[,train=N][,held=OFF:CNT[+OFF:CNT...]]
          (default: 24 / #corpora windows over the last 10 % of the file)
 Placement (the q2tp/q4tp studies' rule, kept exactly so their runs reproduce): the held-out
 windows are placed first; train window j starts at j * ((n - WL - 1 - 4096) // N) and moves
-forward in steps of 128 tokens while it overlaps a held-out window. Held-out windows choose
+forward in steps of 128 tokens while it overlaps a held-out window (the 4096 margin shrinks to
+n/16 on corpora under ~64 k tokens). Held-out windows choose
 the checkpoint; the evaluation sets of a study must not be among the corpora.
 """
 import gc
@@ -76,7 +77,8 @@ def place(corpora, wl, nwin):
         busy = [(s, s + wl) for s in c.held_starts]
         c.train_starts = []
         if c.train:
-            stp = (n - wl - 1 - 4096) // c.train
+            # the studies' 4096-token tail margin, scaled down for small corpora
+            stp = (n - wl - 1 - min(4096, (n - wl - 1) // 16)) // c.train
             if stp <= 0:
                 raise SystemExit(f"{c.path}: {c.train} train windows of {wl} do not fit {n} tokens")
             for j in range(c.train):

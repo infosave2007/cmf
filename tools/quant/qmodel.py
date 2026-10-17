@@ -704,12 +704,13 @@ class Head:
             c1 = min(c0 + vchunk, self.vocab)
             z = self.logits(xn, c0, c1)
             lse_parts.append(torch.logsumexp(z, 1))
+            # masked gathers instead of nonzero(): no host synchronisation per chunk
             if ix is not None:
-                pr, kk = ((ix >= c0) & (ix < c1)).nonzero(as_tuple=True)
-                z_ix[pr, kk] = z[pr, ix[pr, kk] - c0]
+                inside = (ix >= c0) & (ix < c1)
+                z_ix = torch.where(inside, z.gather(1, (ix - c0).clamp(0, c1 - c0 - 1)), z_ix)
             if tgt is not None:
-                (pr,) = ((tgt >= c0) & (tgt < c1)).nonzero(as_tuple=True)
-                z_t[pr] = z[pr, tgt[pr] - c0]
+                inside = (tgt >= c0) & (tgt < c1)
+                z_t = torch.where(inside, z.gather(1, (tgt - c0).clamp(0, c1 - c0 - 1)[:, None])[:, 0], z_t)
             if topk:
                 v, i = z.topk(min(topk, c1 - c0), 1)
                 i = i + c0
@@ -731,8 +732,10 @@ class Head:
             if self.mult != 1.0:
                 z = z * self.mult
             G = torch.exp(z - lse[:, None]) * alpha[:, None]
-            pr, kk = ((ix >= c0) & (ix < c1)).nonzero(as_tuple=True)
-            G[pr, ix[pr, kk] - c0] += sparse[pr, kk]
+            # the top-K indices of a row are distinct: scatter-add touches each in-chunk entry once,
+            # the out-of-chunk ones (clamped) receive +0
+            inside = (ix >= c0) & (ix < c1)
+            G.scatter_add_(1, (ix - c0).clamp(0, c1 - c0 - 1), torch.where(inside, sparse, torch.zeros_like(sparse)))
             gx += G @ W
         return gx * self.mult if self.mult != 1.0 else gx
 
