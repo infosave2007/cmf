@@ -1175,6 +1175,51 @@ fn gptq_layer_chunks(
         .collect()
 }
 
+/// Refuse a calibration pass whose dense Hessians cannot fit: `need` bytes
+/// (q/k/v and gate/up are captured separately and deduplicated only after
+/// the pass) against 90 % of `total`, the machine's RAM (`None` = unknown,
+/// no check). The capture allocates on the first forward, so without this a
+/// Qwen3.8-27B run at the default `--calib-chunk-layers 0` (~3.6 GB a layer,
+/// ~230 GB) dies an OOM kill into its first CPU window. The error names a
+/// chunk size whose pass takes ≤ 60 % of RAM, leaving the folds room.
+fn check_capture_fits(need: f64, total: Option<f64>, layers: usize, chunk_layers: usize) -> anyhow::Result<()> {
+    let Some(total) = total.filter(|&t| t > 0.0) else {
+        return Ok(());
+    };
+    if need <= 0.9 * total {
+        return Ok(());
+    }
+    let per_layer = need / layers.max(1) as f64;
+    let fit = ((0.6 * total / per_layer) as usize).max(1);
+    let now = if chunk_layers == 0 { "all layers in one pass".to_string() } else { format!("{chunk_layers} layers a pass") };
+    anyhow::bail!(
+        "calibration would capture ~{:.0} GB of dense Hessians ({now}, ~{:.1} GB a layer) but this machine has {:.0} GB: \
+         pass --calib-chunk-layers {fit} or fewer",
+        need / 1e9,
+        per_layer / 1e9,
+        total / 1e9
+    )
+}
+
+/// How many Hessian groups to fold at once, given one group's in-flight
+/// `peak` bytes. `CMF_GPTQ_MEM_GB` (`env_gb`) is the budget for the folds
+/// alone, as it always was; otherwise 85 % of the machine's RAM (`total`)
+/// less what the run already `held` (the chunk's Hessians, the tensors
+/// written so far). Without that default the widest-first order starts the
+/// widest folds together — sixteen 17408-wide `down_proj` folds of a 27B are
+/// ~140 GB by this estimate on top of the chunk. `usize::MAX` = no cap.
+fn fold_concurrency(peak: f64, held: f64, env_gb: Option<f64>, total: Option<f64>) -> usize {
+    if !(peak > 0.0) {
+        return usize::MAX;
+    }
+    let budget = match (env_gb, total) {
+        (Some(gb), _) => gb * 1e9,
+        (None, Some(t)) if t > 0.0 => 0.85 * t - held,
+        _ => return usize::MAX,
+    };
+    ((budget / peak).max(0.0) as usize).max(1)
+}
+
 /// `cortiq quantize-gptq --codec q4tp|q2tp`: a q4tp or q2tp-profile file
 /// whose linears are GPTQ-rounded against calibration Hessians instead of
 /// round-to-nearest — the same layout, readers and kernels as `convert
@@ -1255,6 +1300,7 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
 
     let mut calib: Option<CalibRun> = None;
     let mut no_hessian: Vec<usize> = Vec::new();
+    let ram_total = cortiq_engine::fcd::physical_total_bytes().map(|b| b as f64);
     let results = std::sync::Mutex::new(Vec::<(usize, TensorDtype, Vec<u8>)>::new());
     let n_gptq = std::sync::atomic::AtomicUsize::new(0);
     let failed = std::sync::Mutex::new(Vec::<String>::new());
@@ -1277,16 +1323,19 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
                 groups_from_cache(&model, p, slots, &mut no_hessian)?
             }
             _ => {
+                let names: std::collections::HashSet<String> =
+                    slots.iter().map(|&s| model.tensors[s].name.clone()).collect();
+                let need: f64 = slots
+                    .iter()
+                    .map(|&s| (model.tensors[s].shape[1] as f64).powi(2) * 8.0)
+                    .sum();
+                let layers: std::collections::HashSet<Option<usize>> =
+                    slots.iter().map(|&s| layer_index(&model.tensors[s].name)).collect();
+                check_capture_fits(need, ram_total, layers.len(), o.chunk_layers)?;
+                let gb = need / 1e9;
                 if calib.is_none() {
                     calib = Some(CalibRun::new(o)?);
                 }
-                let names: std::collections::HashSet<String> =
-                    slots.iter().map(|&s| model.tensors[s].name.clone()).collect();
-                let gb: f64 = slots
-                    .iter()
-                    .map(|&s| (model.tensors[s].shape[1] as f64).powi(2) * 8.0)
-                    .sum::<f64>()
-                    / 1e9;
                 if o.chunk_layers > 0 {
                     eprintln!("layers {lo}..={hi}: capturing {} linears (≤{gb:.1} GB of Hessians) …", slots.len());
                 } else {
@@ -1311,14 +1360,23 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
         // Workers take whole groups: the O(n³) fold operator dominates, so
         // many groups run at once and each fold and row sweep gets the
         // threads left over. A group holds ~3·n² f64 + n² f32 at its peak
-        // (1 GB at n = 6144, 8 GB at 17408): `CMF_GPTQ_MEM_GB` caps how many
-        // run together, trading parallel groups for parallel folds.
+        // (1 GB at n = 6144, 8 GB at 17408), so [`fold_concurrency`] caps how
+        // many run together by the RAM left (`CMF_GPTQ_MEM_GB` overrides),
+        // trading parallel groups for parallel folds — the bytes are the same.
         let peak = groups.iter().map(|g| 28.0 * (g.cols as f64).powi(2)).fold(0.0, f64::max);
-        let mem_cap = std::env::var("CMF_GPTQ_MEM_GB")
+        let env_gb = std::env::var("CMF_GPTQ_MEM_GB")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
-            .filter(|&gb| gb > 0.0 && peak > 0.0)
-            .map_or(usize::MAX, |gb| ((gb * 1e9 / peak) as usize).max(1));
+            .filter(|&gb| gb > 0.0);
+        // Already resident: the chunk's captured Hessians and every tensor
+        // written so far (the output is assembled in RAM).
+        let held = groups
+            .iter()
+            .filter(|g| matches!(g.src, HSrc::Mem(_)))
+            .map(|g| 8.0 * (g.cols as f64).powi(2))
+            .sum::<f64>()
+            + results.lock().unwrap().iter().map(|r| r.2.len() as f64).sum::<f64>();
+        let mem_cap = fold_concurrency(peak, held, env_gb, ram_total);
         let outer = o.threads.clamp(1, 16).min(groups.len().max(1)).min(mem_cap);
         let inner = (o.threads / outer).max(1);
         // Widest Hessians first (longest-processing-time order): a 6144-wide
@@ -3524,6 +3582,26 @@ mod tests {
             ("model.layers.7.mlp.*".to_string(), Q2tpRule::Cortiq)
         );
         assert!(parse_q2tp_rule_override("x=bogus").is_err());
+    }
+
+    /// The RAM guards: a capture that cannot fit is refused with a chunk
+    /// size that does, and the number of folds in flight follows the RAM
+    /// left after what the run holds.
+    #[test]
+    fn ram_guards_refuse_impossible_captures_and_cap_folds() {
+        let gb = 1e9;
+        // Qwen3.8-27B-like: 64 layers × ~3.6 GB of Hessians on a 128 GB box.
+        let err = check_capture_fits(64.0 * 3.6 * gb, Some(128.0 * gb), 64, 0).unwrap_err().to_string();
+        assert!(err.contains("--calib-chunk-layers 21 "), "{err}");
+        assert!(check_capture_fits(16.0 * 3.6 * gb, Some(128.0 * gb), 16, 16).is_ok());
+        assert!(check_capture_fits(1e15, None, 64, 0).is_ok(), "unknown RAM: no check");
+        let peak = 28.0 * 17408f64.powi(2); // one 27B down_proj fold, ~8.5 GB
+        assert_eq!(fold_concurrency(peak, 0.0, None, None), usize::MAX, "unknown RAM: no cap");
+        assert_eq!(fold_concurrency(peak, 0.0, Some(20.0), Some(128.0 * gb)), 2, "CMF_GPTQ_MEM_GB wins");
+        // 0.85 · 128 − 50 GB held = 58.8 GB → 6 folds.
+        assert_eq!(fold_concurrency(peak, 50.0 * gb, None, Some(128.0 * gb)), 6);
+        assert_eq!(fold_concurrency(peak, 200.0 * gb, None, Some(128.0 * gb)), 1, "never below one");
+        assert_eq!(fold_concurrency(0.0, 0.0, None, Some(128.0 * gb)), usize::MAX);
     }
 
     /// With an identity Hessian GPTQ has nothing to fold: it must reproduce
