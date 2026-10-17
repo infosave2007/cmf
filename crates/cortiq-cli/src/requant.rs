@@ -472,6 +472,52 @@ pub fn cmd_requant_q1g(
     Ok(())
 }
 
+/// `q1g → q1`: write every q1g tensor back as q1 tiles (the group scale in
+/// each of its four tiles) — exact, so a runtime that predates dtype 20
+/// reads the same weights. The file grows back to 1.5 bits/weight, so
+/// there is no in-place form.
+pub fn cmd_requant_q1(model_path: &str, output: Option<&str>, in_place: bool) -> anyhow::Result<()> {
+    use cortiq_core::quant::unpack_q1g_to_q1;
+    anyhow::ensure!(
+        !in_place,
+        "q1g → q1 grows every tensor by a third; it needs --output, not --in-place"
+    );
+    let output = output.context("--output is required")?;
+    anyhow::ensure!(
+        std::path::Path::new(output) != std::path::Path::new(model_path),
+        "--output must differ from the source"
+    );
+    let model = Arc::new(CmfModel::open_sharded(model_path)?);
+    crate::knowledge::refuse_genome_rewrite(&model, "requant")?;
+    let mut n = 0usize;
+    let mut specs: Vec<TensorSpec> = Vec::with_capacity(model.tensors.len());
+    for entry in &model.tensors {
+        let src = model.entry_bytes(entry);
+        let (dtype, data) = if entry.dtype == TensorDtype::Q1G {
+            n += 1;
+            (TensorDtype::Q1, unpack_q1g_to_q1(src, entry.shape[0], entry.shape[1]))
+        } else {
+            (entry.dtype, src.to_vec())
+        };
+        specs.push(TensorSpec {
+            name: entry.name.clone(),
+            dtype,
+            shape: entry.shape.clone(),
+            data,
+        });
+    }
+    anyhow::ensure!(n > 0, "no q1g tensor in {model_path}; nothing was written");
+    CmfModel::write(
+        output,
+        &model.header,
+        &specs,
+        Some(&model.masks),
+        model.vocab.as_deref(),
+    )?;
+    println!("requant → q1: {n} q1g tensors written back as q1 tiles (exact)");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -879,7 +925,25 @@ mod tests {
             assert_eq!(ei.dtype, e.dtype, "{}", e.name);
             assert_eq!(mi.entry_bytes(ei), m.entry_bytes(e), "{}", e.name);
         }
-        drop((s, m, mi));
+        // And back to q1: the exact source bytes wherever the repack was
+        // exact; the q1g weights (not the source's) in the ulp tensor.
+        let back = dir.join("back.cmf");
+        if back.exists() {
+            std::fs::remove_file(&back).unwrap();
+        }
+        assert!(cmd_requant_q1(out_s, None, true).is_err());
+        cmd_requant_q1(out_s, Some(back.to_str().unwrap()), false).unwrap();
+        let mb = CmfModel::open(back.to_str().unwrap()).unwrap();
+        assert!(mb.verify().is_empty(), "verify(): {:?}", mb.verify());
+        for e in &s.tensors {
+            let eb = mb.tensor(&e.name).unwrap();
+            assert_eq!(eb.dtype, e.dtype, "{}", e.name);
+            if e.name != "model.layers.0.mlp.up_proj.weight" {
+                assert_eq!(mb.entry_bytes(eb), s.entry_bytes(e), "{}", e.name);
+            }
+        }
+        assert_eq!(dequant_of(&mb, "model.layers.0.mlp.up_proj.weight"), b);
+        drop((s, m, mi, mb));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

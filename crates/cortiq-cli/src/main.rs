@@ -624,7 +624,7 @@ enum Commands {
         /// Output .cmf path (omit with --in-place)
         #[arg(long)]
         output: Option<String>,
-        /// Target layout: q4tp (re-express scales), q4tp-quantize (float weights → q4tp), q2tp-draft (MTP inputs), q1g (lossless q1 repack: one scale per 128-group, 1.5 → 1.125 bpw), or embryo-q8-head (experimental tied Embryo vocabulary only; new output required)
+        /// Target layout: q4tp (re-express scales), q4tp-quantize (float weights → q4tp), q2tp-draft (MTP inputs), q1g (lossless q1 repack: one scale per 128-group, 1.5 → 1.125 bpw), q1 (q1g back to q1 tiles, exact, for older readers), or embryo-q8-head (experimental tied Embryo vocabulary only; new output required)
         #[arg(long, default_value = "q4tp")]
         quant: String,
         /// Rewrite tensors inside the source file itself — for disks that
@@ -3115,6 +3115,8 @@ async fn main() -> anyhow::Result<()> {
         } => {
             if quant == "q1g" {
                 requant::cmd_requant_q1g(&model, output.as_deref(), in_place, allow_tol, tol)
+            } else if quant == "q1" && !allow_tol {
+                requant::cmd_requant_q1(&model, output.as_deref(), in_place)
             } else if allow_tol {
                 Err(anyhow::anyhow!("--allow-tol only applies to --quant q1g"))
             } else {
