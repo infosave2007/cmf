@@ -1505,7 +1505,7 @@ pub fn run_convert_blr(
                 }
                 let tc = tl.elapsed().as_secs_f64();
                 #[cfg(feature = "gpu")]
-                if gpu {
+                if gpu && std::env::var("CMF_NVG_ENC_CPU").as_deref() != Ok("1") {
                     // The layer's input contexts once each, then its tensors
                     // on the device with up to CMF_NVG_JOBS (default 3) in
                     // flight.

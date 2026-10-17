@@ -1505,7 +1505,7 @@ fn gv_block(@builtin(local_invocation_index) t: u32) {
                 for (var q = 0u; q < NQ; q = q + 1u) { s[q] = -s[q]; ks[q] = -ks[q]; }
                 g2 = -g2;
             }
-            let done = nf == 0u || abs(g2 - gj) <= 1.0e-6 * abs(gj);
+            let done = nf == 0u || abs(g2 - gj) <= p.f1 * abs(gj);
             gj = g2;
             if (done) { break; }
         }
@@ -1654,7 +1654,7 @@ fn gv_block_sg(@builtin(local_invocation_index) t: u32, @builtin(subgroup_invoca
     let _ = writeln!(s, "            let d2 = sum2(t, lane, sg, nsg, {dot1}, {dot2});");
     s.push_str("            var g2 = d2.x / max(d2.y, 1.0e-30);\n            if (g2 < 0.0) {\n");
     q(&mut s, &|k| format!("                s{k} = -s{k}; ks{k} = -ks{k};\n"));
-    s.push_str("                g2 = -g2;\n            }\n            let done = nf == 0u || abs(g2 - gj) <= 1.0e-6 * abs(gj);\n            gj = g2;\n            if (done) { break; }\n        }\n");
+    s.push_str("                g2 = -g2;\n            }\n            let done = nf == 0u || abs(g2 - gj) <= p.f1 * abs(gj);\n            gj = g2;\n            if (done) { break; }\n        }\n");
     s.push_str("        let ujj = R[j * n + j];\n");
     q(&mut s, &|k| format!(
         "        if (x{k} < r) {{ EG[(j - b0) * r + x{k}] = (bv{k} - gj * ks{k}) / ujj; O[j * r + x{k}] = s{k}; }}\n"
@@ -1881,6 +1881,12 @@ pub fn flipu_blocked(su: &DMat, qs: &DMat, whb: &DMat, q: &DMat, h: &DMat, l: &D
     Some(total)
 }
 
+/// Relative convergence of the column scale between flip rounds
+/// (`CMF_NVG_GJ_TOL`, default 1e-8; the f64 host uses 1e-9).
+fn gj_tol() -> f32 {
+    std::env::var("CMF_NVG_GJ_TOL").ok().and_then(|v| v.parse().ok()).unwrap_or(1e-8)
+}
+
 /// The largest rank [`gv_block`] takes (16 lanes per thread × 256).
 pub const GV_MAX_RANK: usize = 4096;
 
@@ -1925,7 +1931,7 @@ fn gv_block_ws(bv: &DMat, s: &DMat, ks0: &DMat, k: &DMat, uc: &DMat, eg: &DMat, 
     let md = if sg_ok(cx) { gv_sg(cx, r, ws) } else { None }.or_else(|| knot(cx, r.div_ceil(256))).expect("nvg knot pipelines");
     let dp = Disp {
         pipe: md.p.get("gv_block_sg").unwrap_or_else(|| &md.p["gv_block"]),
-        uni: uni(&[n as u32, r as u32, b0 as u32, b1 as u32, max_flips as u32], &[tol]),
+        uni: uni(&[n as u32, r as u32, b0 as u32, b1 as u32, max_flips as u32], &[tol, gj_tol()]),
         bufs: vec![(1, &ks0.buf), (2, &k.buf), (3, &uc.buf), (5, &bv.buf), (6, &s.buf), (8, &eg.buf), (9, &cnt.buf)],
         grid: (1, 1, 1),
     };

@@ -167,7 +167,10 @@ Stage for stage the CPU encoder; what changes is where and how each stage runs.
   `BV[b1:] −= Uc[b0:b1, b1:]ᵀ·E` is a GEMM.
 * *Errors* `tr(E X Eᵀ)` (X = H, the raw fit Gram, the held-out Gram) from the factor-sized
   expansion `tr(WXWᵀ) − 2Σ⟨hsl_p, WX·gs_p⟩ + Σ⟨hsl_pᵀhsl_q, gs_pᵀX gs_q⟩`, read back at once.
-* Flip tolerances are 1e-6 relative in f32 (1e-12 in f64 on the host).
+* Flip tolerances are 1e-7 relative in f32 and the column scale converges to 1e-8
+  between flip rounds (1e-12 / 1e-9 in f64 on the host; `CMF_NVG_FLIP_TOL`,
+  `CMF_NVG_GJ_TOL`). 1e-6 / 1e-6 stopped the search early enough to cost ~2 % ppl end to
+  end on the 0.8B (686.5 vs 672.5).
 * A layer's tensors run `CMF_NVG_JOBS` (default 3) at a time; `CMF_NVG_PROF=1` prints a
   per-stage profile per tensor (with one job: the stage timers synchronise the device).
 
