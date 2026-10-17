@@ -28,6 +28,9 @@ mod music;
 mod npy;
 mod nvg;
 mod nvg_linalg;
+mod nvgbench;
+#[cfg(feature = "gpu")]
+mod nvg_gpu;
 mod qwen_imagepack;
 mod recall;
 mod requant;
@@ -527,6 +530,11 @@ enum Commands {
         /// an existing one is reused instead of reconverting.
         #[arg(long = "blr-keep-src")]
         blr_keep_src: bool,
+        /// NVG encoder device: `gpu` (f32 on the wgpu device, calibration on
+        /// per-op device GEMMs), `cpu` (the f64 reference), `auto` = gpu when
+        /// a wgpu adapter is up (not on macOS).
+        #[arg(long = "blr-device", default_value = "auto", value_name = "auto|cpu|gpu")]
+        blr_device: String,
     },
     /// Embeddings from an EmbeddingGemma 2 .cmf (`cortiq convert --model
     /// <google/embeddinggemma-2 dir>`): texts, images (--image), videos
@@ -946,6 +954,41 @@ enum Commands {
         /// Output .cmf (the student with the trained metric)
         #[arg(long)]
         output: String,
+    },
+    /// One tensor through the NVG `blr` encoder with a per-stage profile, on
+    /// the CPU reference path and/or the device path, from Grams captured
+    /// once (layers 0..=l of the model's own forward) and cached. Without
+    /// --tensor: list the encoder's body linears with their shapes.
+    NvgBench {
+        /// Model .cmf (the calibration forward runs on it)
+        #[arg(long)]
+        model: String,
+        /// Tensor name (e.g. model.layers.0.mlp.down_proj.weight)
+        #[arg(long)]
+        tensor: Option<String>,
+        /// Calibration text (needed until the --gram-cache files exist)
+        #[arg(long)]
+        calib: Option<String>,
+        #[arg(long = "fit-tokens", default_value = "14848")]
+        fit_tokens: usize,
+        #[arg(long = "sel-tokens", default_value = "3072")]
+        sel_tokens: usize,
+        #[arg(long, default_value = "0.55")]
+        bpw: f64,
+        #[arg(long = "kv-factor", default_value = "1.0")]
+        kv_factor: f64,
+        #[arg(long, default_value = "auto", value_name = "auto|1|2")]
+        paths: String,
+        /// cpu | gpu | both
+        #[arg(long, default_value = "cpu")]
+        device: String,
+        #[arg(long, default_value = "16")]
+        threads: usize,
+        #[arg(long, default_value = "0.03")]
+        rho: f64,
+        /// Path prefix of the cached Grams (`<prefix>.fit.gram`, `.sel.gram`)
+        #[arg(long = "gram-cache")]
+        gram_cache: Option<String>,
     },
     /// Chat with a model (applies the file's chat template), or one-shot
     /// with --prompt
@@ -3100,6 +3143,7 @@ async fn main() -> anyhow::Result<()> {
             blr_rho,
             blr_threads,
             blr_keep_src,
+            blr_device,
         } => {
             if quant
                 .as_deref()
@@ -3156,6 +3200,7 @@ async fn main() -> anyhow::Result<()> {
                     rho: blr_rho,
                     threads,
                     keep_src: blr_keep_src,
+                    device: nvg::BlrDevice::resolve(&blr_device)?,
                 };
                 nvg::run_convert_blr(&model, &output, hf_token.as_deref(), &opts)?;
                 println!("✓ wrote {output}");
@@ -3458,6 +3503,41 @@ async fn main() -> anyhow::Result<()> {
         }
         #[cfg(not(feature = "gpu"))]
         Commands::NvgTrain { .. } => Err(anyhow::anyhow!("nvg-train needs a build with the gpu feature")),
+        Commands::NvgBench {
+            model,
+            tensor,
+            calib,
+            fit_tokens,
+            sel_tokens,
+            bpw,
+            kv_factor,
+            paths,
+            device,
+            threads,
+            rho,
+            gram_cache,
+        } => {
+            let paths = match paths.as_str() {
+                "auto" => nvg::PathsChoice::Auto,
+                "1" => nvg::PathsChoice::One,
+                "2" => nvg::PathsChoice::Two,
+                other => anyhow::bail!("--paths {other}: expected auto, 1 or 2"),
+            };
+            nvgbench::run(&nvgbench::BenchOpts {
+                model: &model,
+                tensor: tensor.as_deref(),
+                calib: calib.as_deref(),
+                fit_tokens,
+                sel_tokens,
+                bpw,
+                kv_factor,
+                paths,
+                device: &device,
+                threads,
+                rho,
+                gram_cache: gram_cache.as_deref(),
+            })
+        }
         Commands::QuantizeGptq {
             input,
             calib,
@@ -9518,6 +9598,8 @@ mod tests {
                     "0.125",
                     "--blr-fit-tokens",
                     "1024",
+                    "--blr-device",
+                    "cpu",
                 ])
                 .unwrap()
             })
@@ -9535,8 +9617,12 @@ mod tests {
                 blr_fit_tokens,
                 blr_sel_tokens,
                 blr_kv_factor,
+                blr_device,
                 ..
             } => {
+                assert_eq!(blr_device, "cpu");
+                assert_eq!(nvg::BlrDevice::resolve(&blr_device).unwrap(), nvg::BlrDevice::Cpu);
+                assert!(nvg::BlrDevice::resolve("tpu").is_err());
                 assert_eq!(quant.as_deref(), Some("blr"));
                 assert_eq!(blr_bpw, 1.0);
                 assert_eq!(blr_method, "dual-svid");

@@ -797,6 +797,79 @@ fn fold_inner(h_id: u64, n: usize, lambda: f64) -> Option<u64> {
     Some(id)
 }
 
+/// Blocked lower Cholesky of the dense `n×n` f32 matrix in `a`, in place
+/// (the fold's `chol_diag`/`chol_panel`/`chol_update` steps on a caller's
+/// buffer; the strict upper triangle outside the diagonal tiles is left
+/// alone, inside them it is overwritten). `Some(false)` when a pivot is
+/// not positive (or NaN).
+pub(crate) fn chol_lower(a: &wgpu::Buffer, n: usize) -> Option<bool> {
+    let c = ctx()?;
+    let pp = pipes(c)?;
+    let flag = buf(c, "chol_flag", 16, wgpu::BufferUsages::empty())?;
+    let dummy = buf(c, "chol_dummy", 16, wgpu::BufferUsages::empty())?;
+    c.queue.write_buffer(&flag, 0, bytemuck::cast_slice(&[0u32; 4]));
+    let nb = n.div_ceil(64);
+    let list: Vec<[u32; 8]> = (0..nb).map(|k| [n as u32, (k * 64) as u32, 0, 0, 0, 0, 0, 0]).collect();
+    let prm = params(c, &list);
+    let bg = bind(c, pp, &prm, &[a, &dummy, &dummy, &dummy, &flag, &dummy, &dummy, &dummy, &dummy, &dummy, &dummy, &dummy, &dummy]);
+    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("chol_lower") });
+    {
+        let mut ps = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+        for k in 0..nb {
+            let rest = n.saturating_sub(k * 64 + 64);
+            ps.set_bind_group(0, &bg, &[(k as u64 * PSTRIDE) as u32]);
+            ps.set_pipeline(&pp.p["chol_diag"]);
+            ps.dispatch_workgroups(1, 1, 1);
+            if rest > 0 {
+                ps.set_pipeline(&pp.p["chol_panel"]);
+                ps.dispatch_workgroups(rest.div_ceil(256) as u32, 1, 1);
+                let t = rest.div_ceil(64) as u32;
+                ps.set_pipeline(&pp.p["chol_update"]);
+                ps.dispatch_workgroups(t, t, 1);
+            }
+        }
+    }
+    submit(c, enc.finish());
+    Some(read_u32(c, &flag)? == 0)
+}
+
+/// `x = L⁻¹` for the lower factor `L` held in `a` (dense `n×n`, as
+/// [`chol_lower`] leaves it): the fold's blocked right-looking inverse.
+pub(crate) fn tri_inv_lower(a: &wgpu::Buffer, x: &wgpu::Buffer, n: usize) -> Option<()> {
+    let c = ctx()?;
+    let pp = pipes(c)?;
+    let dummy = buf(c, "inv_dummy", 16, wgpu::BufferUsages::empty())?;
+    let mi = buf(c, "inv_mi", 4096 * 4, wgpu::BufferUsages::empty())?;
+    let nb = n.div_ceil(64);
+    let nt = n.div_ceil(16) as u32;
+    let list: Vec<[u32; 8]> = (0..=nb).map(|k| [n as u32, (k * 64).min(n) as u32, 0, 0, 0, 0, 0, 0]).collect();
+    let prm = params(c, &list);
+    let bg = bind(c, pp, &prm, &[a, x, &dummy, &dummy, &dummy, &dummy, &dummy, &dummy, &dummy, &dummy, &dummy, &dummy, &mi]);
+    let last = (nb as u64 * PSTRIDE) as u32;
+    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tri_inv_lower") });
+    {
+        let mut ps = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+        ps.set_bind_group(0, &bg, &[last]);
+        ps.set_pipeline(&pp.p["eye"]);
+        ps.dispatch_workgroups(nt, nt, 1);
+        for k in 0..nb {
+            let k0 = k * 64;
+            ps.set_bind_group(0, &bg, &[(k as u64 * PSTRIDE) as u32]);
+            ps.set_pipeline(&pp.p["inv_diag"]);
+            ps.dispatch_workgroups(1, 1, 1);
+            ps.set_pipeline(&pp.p["inv_rows"]);
+            ps.dispatch_workgroups((k0 + 64).min(n).div_ceil(64) as u32, 1, 1);
+            let rest = n.saturating_sub(k0 + 64);
+            if rest > 0 {
+                ps.set_pipeline(&pp.p["inv_update"]);
+                ps.dispatch_workgroups((k0 + 64).min(n).div_ceil(64) as u32, rest.div_ceil(64) as u32, 1);
+            }
+        }
+    }
+    submit(c, enc.finish());
+    Some(())
+}
+
 fn read_u32(c: &Ctx, src: &wgpu::Buffer) -> Option<u32> {
     let v = read_f32(c, src, 1)?;
     Some(v[0].to_bits())

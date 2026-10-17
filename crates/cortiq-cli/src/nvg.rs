@@ -35,6 +35,61 @@ fn sgn(v: f64) -> f64 {
     if v >= 0.0 { 1.0 } else { -1.0 }
 }
 
+// ───────────────────────────── stage profile ─────────────────────────────
+
+/// Per-stage wall time and counters of one tensor's encode (`nvg-bench`,
+/// and the converter's `CMF_NVG_PROF=1` lines). Timing only: it never
+/// changes a result.
+#[derive(Default)]
+pub struct Prof {
+    m: std::sync::Mutex<Vec<(&'static str, f64, u64)>>,
+}
+
+impl Prof {
+    pub fn add(&self, k: &'static str, secs: f64, n: u64) {
+        let mut g = self.m.lock().unwrap();
+        match g.iter_mut().find(|e| e.0 == k) {
+            Some(e) => {
+                e.1 += secs;
+                e.2 += n;
+            }
+            None => g.push((k, secs, n)),
+        }
+    }
+    pub fn entries(&self) -> Vec<(&'static str, f64, u64)> {
+        self.m.lock().unwrap().clone()
+    }
+    /// `stage secs [count]` pairs in first-seen order.
+    pub fn line(&self) -> String {
+        self.entries()
+            .iter()
+            .map(|(k, s, n)| if *n > 0 { format!("{k} {s:.2}s/{n}") } else { format!("{k} {s:.2}s") })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+}
+
+/// Time `f` under stage `k` (no-op without a profile).
+#[inline]
+pub fn pt<T>(p: Option<&Prof>, k: &'static str, f: impl FnOnce() -> T) -> T {
+    match p {
+        Some(p) => {
+            let t = Instant::now();
+            let v = f();
+            p.add(k, t.elapsed().as_secs_f64(), 0);
+            v
+        }
+        None => f(),
+    }
+}
+
+#[inline]
+fn pcount(p: Option<&Prof>, k: &'static str, n: u64) {
+    if let Some(p) = p {
+        p.add(k, 0.0, n);
+    }
+}
+
 // ───────────────────────────── model of one tensor ─────────────────────────────
 
 #[derive(Clone)]
@@ -194,11 +249,12 @@ impl HCtx {
 }
 
 /// One tensor's fitting context.
-struct TCtx<'a> {
-    w: &'a Mat,
-    wh: Mat,
-    hc: &'a HCtx,
-    pool: Option<&'a Pool>,
+pub(crate) struct TCtx<'a> {
+    pub(crate) w: &'a Mat,
+    pub(crate) wh: Mat,
+    pub(crate) hc: &'a HCtx,
+    pub(crate) pool: Option<&'a Pool>,
+    pub(crate) prof: Option<&'a Prof>,
 }
 
 // ───────────────────────────── initialisers ─────────────────────────────
@@ -206,15 +262,21 @@ struct TCtx<'a> {
 /// Rank-`r` latents `U′ (m×r)`, `V′ (n×r)` with `U′V′ᵀ` the best rank-`r`
 /// approximation of `t` in the metric `L Lᵀ` (identity when `l` is None):
 /// `U′ = U_r Σ^{1/2}`, `V′ = tᵀ U_r Σ^{-1/2}`.
-fn latents(pool: Option<&Pool>, t: &Mat, r: usize, l: Option<&Mat>) -> (Mat, Mat) {
+pub(crate) fn latents(
+    pool: Option<&Pool>,
+    t: &Mat,
+    r: usize,
+    l: Option<&Mat>,
+    prof: Option<&Prof>,
+) -> (Mat, Mat) {
     let (m, n) = (t.r, t.c);
-    let tl = match l {
+    let tl = pt(prof, "lat.gemm", || match l {
         Some(l) => gemm(pool, t, false, l, false),
         None => t.clone(),
-    };
+    });
     let (sig, ur) = if m <= n {
-        let g = gemm(pool, &tl, false, &tl, true);
-        let (lam, e) = sym_eig(pool, &g);
+        let g = pt(prof, "lat.gemm", || gemm(pool, &tl, false, &tl, true));
+        let (lam, e) = pt(prof, "lat.eig", || sym_eig(pool, &g));
         let sig: Vec<f64> = lam[..r].iter().map(|v| v.max(0.0).sqrt()).collect();
         let mut ur = Mat::zeros(m, r);
         for i in 0..m {
@@ -222,14 +284,14 @@ fn latents(pool: Option<&Pool>, t: &Mat, r: usize, l: Option<&Mat>) -> (Mat, Mat
         }
         (sig, ur)
     } else {
-        let g = gemm(pool, &tl, true, &tl, false);
-        let (lam, e) = sym_eig(pool, &g);
+        let g = pt(prof, "lat.gemm", || gemm(pool, &tl, true, &tl, false));
+        let (lam, e) = pt(prof, "lat.eig", || sym_eig(pool, &g));
         let sig: Vec<f64> = lam[..r].iter().map(|v| v.max(0.0).sqrt()).collect();
         let mut vr = Mat::zeros(n, r);
         for j in 0..n {
             vr.row_mut(j).copy_from_slice(&e.row(j)[..r]);
         }
-        let mut ur = gemm(pool, &tl, false, &vr, false);
+        let mut ur = pt(prof, "lat.gemm", || gemm(pool, &tl, false, &vr, false));
         let floor = sig[0].max(1e-300) * 1e-15;
         for i in 0..m {
             let row = ur.row_mut(i);
@@ -247,7 +309,7 @@ fn latents(pool: Option<&Pool>, t: &Mat, r: usize, l: Option<&Mat>) -> (Mat, Mat
             row[k] *= sig[k].sqrt();
         }
     }
-    let mut vp = gemm(pool, t, true, &ur, false);
+    let mut vp = pt(prof, "lat.gemm", || gemm(pool, t, true, &ur, false));
     for j in 0..n {
         let row = vp.row_mut(j);
         for k in 0..r {
@@ -265,13 +327,14 @@ fn row_norms(a: &Mat) -> Vec<f64> {
 
 /// H-weighted ITQ gauge: orthogonal `R` making the row-normalised
 /// `[U′; V′] R` closest to the hypercube, rows weighted by `w²`.
-fn itq_weighted(
+pub(crate) fn itq_weighted(
     pool: Option<&Pool>,
     up: &Mat,
     vp: &Mat,
     wu: &[f64],
     wv: &[f64],
     iters: usize,
+    prof: Option<&Prof>,
 ) -> (Mat, Mat) {
     let (m, n, r) = (up.r, vp.r, up.c);
     let nn = m + n;
@@ -293,20 +356,22 @@ fn itq_weighted(
     let mut rot = Mat::eye(r);
     let mut bw = Mat::zeros(nn, r);
     for _ in 0..iters {
-        let xr = gemm(pool, &x, false, &rot, false);
+        let xr = pt(prof, "itq.gemm", || gemm(pool, &x, false, &rot, false));
         for i in 0..nn {
             let (src, dst) = (xr.row(i), &mut bw.d[i * r..(i + 1) * r]);
             for k in 0..r {
                 dst[k] = sgn(src[k]) * w2[i];
             }
         }
-        let mm = gemm(pool, &x, true, &bw, false);
-        rot = polar(pool, &mm);
+        let mm = pt(prof, "itq.gemm", || gemm(pool, &x, true, &bw, false));
+        rot = pt(prof, "itq.polar", || polar(pool, &mm));
     }
-    (
-        gemm(pool, up, false, &rot, false),
-        gemm(pool, vp, false, &rot, false),
-    )
+    pt(prof, "itq.gemm", || {
+        (
+            gemm(pool, up, false, &rot, false),
+            gemm(pool, vp, false, &rot, false),
+        )
+    })
 }
 
 /// Non-negative rank-1 fit `M ≈ left · rightᵀ` by power iteration from 1/√c.
@@ -354,7 +419,7 @@ fn rank1_pos(mabs: &Mat) -> (Vec<f64>, Vec<f64>) {
 }
 
 /// Signs of the latents plus rank-1 magnitude fits (the dual-SVID step).
-fn svid_path(up: &Mat, vp: &Mat) -> BlrPath {
+pub(crate) fn svid_path(up: &Mat, vp: &Mat) -> BlrPath {
     let su = Mat::from_vec(up.r, up.c, up.d.iter().map(|&v| sgn(v)).collect());
     let sv = Mat::from_vec(vp.r, vp.c, vp.d.iter().map(|&v| sgn(v)).collect());
     let ua = Mat::from_vec(up.r, up.c, up.d.iter().map(|v| v.abs()).collect());
@@ -367,7 +432,7 @@ fn svid_path(up: &Mat, vp: &Mat) -> BlrPath {
 
 /// The data-free dual-SVID initialiser (the LittleBit baseline).
 pub fn build_dual_svid(pool: Option<&Pool>, w: &Mat, r: usize, paths: usize) -> BlrModel {
-    let (up, vp) = latents(pool, w, r, None);
+    let (up, vp) = latents(pool, w, r, None, None);
     let mut md = BlrModel {
         paths: vec![svid_path(&up, &vp)],
         m: w.r,
@@ -376,7 +441,7 @@ pub fn build_dual_svid(pool: Option<&Pool>, w: &Mat, r: usize, paths: usize) -> 
     };
     if paths == 2 {
         let res = w.sub(&md.recon(pool, None));
-        let (up, vp) = latents(pool, &res, r, None);
+        let (up, vp) = latents(pool, &res, r, None, None);
         md.paths.push(svid_path(&up, &vp));
     }
     md
@@ -401,14 +466,16 @@ fn hstack(ms: &[Mat]) -> Mat {
 /// Exact block least squares in the H metric: ℓ (joint over paths), h (per
 /// row, joint over paths), g (per path). Each block solve is a minimum, so
 /// the error never increases.
-fn als(md: &mut BlrModel, c: &TCtx, sweeps: usize) {
+pub(crate) fn als(md: &mut BlrModel, c: &TCtx, sweeps: usize) {
     let (m, n, r) = (md.m, md.n, md.r);
     let np = md.paths.len();
     let pr = np * r;
     let pool = c.pool;
     let hf = &c.hc.hf;
+    let prof = c.prof;
     for _ in 0..sweeps {
         // ℓ
+        let t_l = Instant::now();
         let bs: Vec<Mat> = (0..np).map(|p| md.gs(p)).collect();
         let b = hstack(&bs);
         let hb = gemm(pool, hf, false, &b, false);
@@ -431,6 +498,10 @@ fn als(md: &mut BlrModel, c: &TCtx, sweeps: usize) {
         for p in 0..np {
             md.paths[p].l.copy_from_slice(&lam[p * r..(p + 1) * r]);
         }
+        if let Some(pf) = prof {
+            pf.add("als.l", t_l.elapsed().as_secs_f64(), 1);
+        }
+        let t_h = Instant::now();
         // h (B unchanged since the ℓ step: reuse its blocks)
         let ms: Vec<Mat> = (0..np)
             .map(|p| {
@@ -491,6 +562,10 @@ fn als(md: &mut BlrModel, c: &TCtx, sweeps: usize) {
                 md.paths[1].h[i] = h1;
             }
         }
+        if let Some(pf) = prof {
+            pf.add("als.h", t_h.elapsed().as_secs_f64(), 1);
+        }
+        let t_g = Instant::now();
         // g
         for p in 0..np {
             let wt_h = if np > 1 {
@@ -515,6 +590,9 @@ fn als(md: &mut BlrModel, c: &TCtx, sweeps: usize) {
             }
             md.paths[p].g = solve_spd(pool, &ctc, &rhs, 1e-10);
         }
+        if let Some(pf) = prof {
+            pf.add("als.g", t_g.elapsed().as_secs_f64(), 1);
+        }
     }
 }
 
@@ -527,7 +605,17 @@ unsafe impl Sync for SP {}
 
 /// Output-side knots: per row, exact single-bit flip deltas of the binary QP,
 /// greedy passes until no flip (≤ 4), monotone.
-fn flip_u(md: &mut BlrModel, c: &TCtx, pi: usize) -> usize {
+pub(crate) fn flip_u(md: &mut BlrModel, c: &TCtx, pi: usize) -> usize {
+    let t0 = Instant::now();
+    let n = flip_u_inner(md, c, pi);
+    if let Some(pf) = c.prof {
+        pf.add("flip_u", t0.elapsed().as_secs_f64(), 1);
+        pf.add("flip_u.flips", 0.0, n as u64);
+    }
+    n
+}
+
+fn flip_u_inner(md: &mut BlrModel, c: &TCtx, pi: usize) -> usize {
     let (m, r) = (md.m, md.r);
     let pool = c.pool;
     let hf = &c.hc.hf;
@@ -590,7 +678,16 @@ fn flip_u(md: &mut BlrModel, c: &TCtx, pi: usize) -> usize {
 
 /// Input-side knots: column-sequential argmin with Schur-complement (H⁻¹)
 /// error feedback (OBS/GPTQ style), act order, lazy 128-column blocks.
-fn gptq_v(md: &mut BlrModel, c: &TCtx, pi: usize) {
+pub(crate) fn gptq_v(md: &mut BlrModel, c: &TCtx, pi: usize) {
+    let t0 = Instant::now();
+    let flips = gptq_v_inner(md, c, pi);
+    if let Some(pf) = c.prof {
+        pf.add("gptq_v", t0.elapsed().as_secs_f64(), 1);
+        pf.add("gptq_v.flips", 0.0, flips);
+    }
+}
+
+fn gptq_v_inner(md: &mut BlrModel, c: &TCtx, pi: usize) -> u64 {
     let (m, n, r) = (md.m, md.n, md.r);
     let pool = c.pool;
     let wt = if md.paths.len() > 1 {
@@ -620,6 +717,7 @@ fn gptq_v(md: &mut BlrModel, c: &TCtx, pi: usize) {
         g[j] = md.paths[pi].g[perm[j]];
     }
     let max_flips = 4 * r;
+    let mut total_flips = 0u64;
     let block = 128usize;
     let mut b0 = 0;
     let mut bv = vec![0f64; r];
@@ -676,6 +774,7 @@ fn gptq_v(md: &mut BlrModel, c: &TCtx, pi: usize) {
                     s[best] = -sb;
                     nf += 1;
                 }
+                total_flips += nf as u64;
                 let mut g2 = dot(&bv, s) / dot(s, &ks).max(1e-300);
                 if g2 < 0.0 {
                     s.iter_mut().for_each(|v| *v = -*v);
@@ -724,13 +823,15 @@ fn gptq_v(md: &mut BlrModel, c: &TCtx, pi: usize) {
         path.sv.row_mut(perm[j]).copy_from_slice(s_all.row(j));
         path.g[perm[j]] = g[j];
     }
+    total_flips
 }
 
 /// Discrete-knot refinement alternating with the exact metric; a step is kept
 /// only when it lowers the fit error.
 fn refine(mut md: BlrModel, c: &TCtx, sweeps: usize) -> BlrModel {
     let pool = c.pool;
-    let mut cur = herr(pool, &c.w.sub(&md.recon(pool, None)), &c.hc.hf);
+    let prof = c.prof;
+    let mut cur = pt(prof, "err", || herr(pool, &c.w.sub(&md.recon(pool, None)), &c.hc.hf));
     for _ in 0..sweeps {
         for pi in 0..md.paths.len() {
             for kind in 0..2 {
@@ -741,7 +842,7 @@ fn refine(mut md: BlrModel, c: &TCtx, sweeps: usize) -> BlrModel {
                     gptq_v(&mut trial, c, pi);
                 }
                 als(&mut trial, c, 3);
-                let e = herr(pool, &c.w.sub(&trial.recon(pool, None)), &c.hc.hf);
+                let e = pt(prof, "err", || herr(pool, &c.w.sub(&trial.recon(pool, None)), &c.hc.hf));
                 if e < cur {
                     md = trial;
                     cur = e;
@@ -754,18 +855,19 @@ fn refine(mut md: BlrModel, c: &TCtx, sweeps: usize) -> BlrModel {
 
 /// Whitened topology, H-weighted ITQ gauge, closed-form metric; the
 /// residual path on the H-residual of the refitted primary.
-fn build_nvg_init(c: &TCtx, r: usize, paths: usize) -> BlrModel {
+pub(crate) fn build_nvg_init(c: &TCtx, r: usize, paths: usize) -> BlrModel {
     let pool = c.pool;
+    let prof = c.prof;
     let lat = |t: &Mat| {
-        let (up, vp) = latents(pool, t, r, Some(&c.hc.l));
+        let (up, vp) = latents(pool, t, r, Some(&c.hc.l), prof);
         let wu = row_norms(&up);
         let wv: Vec<f64> = row_norms(&vp)
             .iter()
             .zip(&c.hc.sqd)
             .map(|(a, b)| a * b)
             .collect();
-        let (up, vp) = itq_weighted(pool, &up, &vp, &wu, &wv, 50);
-        svid_path(&up, &vp)
+        let (up, vp) = itq_weighted(pool, &up, &vp, &wu, &wv, 50, prof);
+        pt(prof, "svid", || svid_path(&up, &vp))
     };
     let mut md = BlrModel {
         paths: vec![lat(c.w)],
@@ -775,7 +877,7 @@ fn build_nvg_init(c: &TCtx, r: usize, paths: usize) -> BlrModel {
     };
     als(&mut md, c, 3);
     if paths == 2 {
-        let res = c.w.sub(&md.recon(pool, None));
+        let res = pt(prof, "recon", || c.w.sub(&md.recon(pool, None)));
         md.paths.push(lat(&res));
         als(&mut md, c, 6);
     }
@@ -916,20 +1018,22 @@ pub fn encode_nvg(
     b: f64,
     mult: f64,
     choice: PathsChoice,
+    prof: Option<&Prof>,
 ) -> Option<Encoded> {
     let (m, n) = (w.r, w.c);
     let c = TCtx {
         w,
-        wh: gemm(pool, w, false, &hc.hf, false),
+        wh: pt(prof, "wh", || gemm(pool, w, false, &hc.hf, false)),
         hc,
         pool,
+        prof,
     };
     let mut cands: Vec<(usize, BlrModel)> = Vec::new();
     let mut notes = Vec::new();
     if choice != PathsChoice::One {
         let r2 = blr_rank(m, n, b, 2, mult);
         let n3 = build_nvg_init(&c, r2, 2);
-        let e3 = rel(pool, w, &n3.recon(pool, None), hsel);
+        let e3 = pt(prof, "select", || rel(pool, w, &n3.recon(pool, None), hsel));
         let n4 = refine(n3, &c, 2);
         notes.push(format!("init {e3:.4}"));
         cands.push((2, n4));
@@ -941,7 +1045,7 @@ pub fn encode_nvg(
     }
     let mut best: Option<(f64, usize)> = None;
     for (ci, (p, md)) in cands.iter().enumerate() {
-        let e = rel(pool, w, &md.recon(pool, None), hsel);
+        let e = pt(prof, "select", || rel(pool, w, &md.recon(pool, None), hsel));
         notes.push(format!("P{p} {e:.4}"));
         if best.is_none_or(|(be, _)| e < be) {
             best = Some((e, ci));
@@ -950,8 +1054,10 @@ pub fn encode_nvg(
     let (_, bi) = best?;
     let (p, md) = cands.swap_remove(bi);
     let (bytes, st) = pack(&md)?;
-    let rhat = st.recon(pool, None);
-    let (ef, es) = (rel(pool, w, &rhat, hfit), rel(pool, w, &rhat, hsel));
+    let (ef, es) = pt(prof, "select", || {
+        let rhat = st.recon(pool, None);
+        (rel(pool, w, &rhat, hfit), rel(pool, w, &rhat, hsel))
+    });
     Some(Encoded {
         bytes,
         paths: p,
@@ -967,6 +1073,48 @@ pub fn encode_nvg(
 
 // ───────────────────────────── conversion driver ─────────────────────────────
 
+/// Where the NVG encoder and its calibration run.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum BlrDevice {
+    /// f64 on the host (the reference), calibration on the CPU prefill
+    Cpu,
+    /// f32 on the wgpu device, calibration on per-op device GEMMs with
+    /// device Grams (`nvg_gpu.rs`)
+    Gpu,
+}
+
+impl BlrDevice {
+    pub fn name(self) -> &'static str {
+        match self {
+            BlrDevice::Cpu => "cpu",
+            BlrDevice::Gpu => "gpu",
+        }
+    }
+    /// `auto`: the device when a wgpu adapter is up (not on macOS, whose
+    /// Metal chunk graph runs layer spans out of the capture hook's sight).
+    pub fn resolve(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "cpu" => Ok(BlrDevice::Cpu),
+            "gpu" => {
+                anyhow::ensure!(cfg!(feature = "gpu"), "--blr-device gpu needs a build with the gpu feature");
+                Ok(BlrDevice::Gpu)
+            }
+            "auto" => Ok(
+                if cfg!(feature = "gpu")
+                    && !cfg!(target_os = "macos")
+                    && std::env::var("CMF_GPU").as_deref() != Ok("0")
+                    && cortiq_engine::gpu::backend_available()
+                {
+                    BlrDevice::Gpu
+                } else {
+                    BlrDevice::Cpu
+                },
+            ),
+            other => anyhow::bail!("--blr-device {other}: expected auto, cpu or gpu"),
+        }
+    }
+}
+
 pub struct BlrOpts {
     pub bpw: f64,
     pub method: Method,
@@ -979,13 +1127,55 @@ pub struct BlrOpts {
     pub rho: f64,
     pub threads: usize,
     pub keep_src: bool,
+    pub device: BlrDevice,
+}
+
+/// The calibration work file of layer `l`: only layers `0..=l` (later
+/// layers are never run), no MTP head. None when the architecture carries
+/// per-layer structure this cut does not know how to shorten.
+fn truncated_header(header: &cortiq_core::format::CmfHeader, l: usize) -> Option<cortiq_core::format::CmfHeader> {
+    let a = &header.arch;
+    if a.moe.is_some()
+        || a.qwen4_exp.is_some()
+        || a.mla.is_some()
+        || a.linear_core.is_some()
+        || a.anchor_core.is_some()
+        || a.g3n.is_some()
+        || a.prism_hadamard.is_some()
+        || a.deepseek_v41.is_some()
+        || a.num_loops > 1
+        || l + 1 >= a.num_layers
+    {
+        return None;
+    }
+    let mut h = header.clone();
+    let nl = l + 1;
+    h.arch.num_layers = nl;
+    if h.arch.layer_types.len() > nl {
+        h.arch.layer_types.truncate(nl);
+    }
+    for v in [&mut h.arch.attention_heads_per_layer, &mut h.arch.kv_heads_per_layer].into_iter().flatten() {
+        v.truncate(nl);
+    }
+    h.arch.mtp = None;
+    Some(h)
+}
+
+fn keep_in_truncated(name: &str, l: usize) -> bool {
+    if name.starts_with("model.mtp.") || name.starts_with("mtp.") {
+        return false;
+    }
+    match name.strip_prefix("model.layers.").and_then(|r| r.split_once('.')).and_then(|(k, _)| k.parse::<usize>().ok()) {
+        Some(k) => k <= l,
+        None => true,
+    }
 }
 
 /// Body linears the encoder replaces: `model.layers.{l}.{tail}` → (l, short).
 /// Attention q/k/v/o, dense FFN gate/up/down, and the GDN block's
 /// in_proj_qkv / in_proj_z / out_proj (its tiny in_proj_a/b stay f16 — the
 /// converter's force-f16 rule).
-fn body_linear(name: &str) -> Option<(usize, &'static str)> {
+pub(crate) fn body_linear(name: &str) -> Option<(usize, &'static str)> {
     let rest = name.strip_prefix("model.layers.")?;
     let (l, tail) = rest.split_once('.')?;
     let l: usize = l.parse().ok()?;
@@ -1007,7 +1197,7 @@ fn body_linear(name: &str) -> Option<(usize, &'static str)> {
 
 /// The tensor whose input Gram a body linear shares (q/k/v → q, gate/up →
 /// gate, GDN qkv/z → qkv).
-fn input_lead(short: &str) -> &'static str {
+pub(crate) fn input_lead(short: &str) -> &'static str {
     match short {
         "q" | "k" | "v" => "q",
         "o" => "o",
@@ -1018,7 +1208,7 @@ fn input_lead(short: &str) -> &'static str {
     }
 }
 
-fn lead_name(l: usize, lead: &str) -> String {
+pub(crate) fn lead_name(l: usize, lead: &str) -> String {
     match lead {
         "q" => format!("model.layers.{l}.self_attn.q_proj.weight"),
         "o" => format!("model.layers.{l}.self_attn.o_proj.weight"),
@@ -1040,7 +1230,7 @@ fn is_layer_projection(name: &str, shape: &[usize]) -> bool {
             .is_some_and(|last| last.contains("proj"))
 }
 
-fn load_f64(model: &CmfModel, idx: usize) -> anyhow::Result<Mat> {
+pub(crate) fn load_f64(model: &CmfModel, idx: usize) -> anyhow::Result<Mat> {
     let e = &model.tensors[idx];
     let (r, c) = (e.shape[0], e.shape[1]);
     let mut v = vec![0f32; r * c];
@@ -1052,7 +1242,7 @@ fn load_f64(model: &CmfModel, idx: usize) -> anyhow::Result<Mat> {
     ))
 }
 
-fn mean_gram(acc: &cortiq_engine::gptq_capture::HessianAcc) -> Mat {
+pub(crate) fn mean_gram(acc: &cortiq_engine::gptq_capture::HessianAcc) -> Mat {
     let n = acc.cols;
     let t = acc.count.max(1) as f64;
     Mat::from_vec(n, n, acc.h.iter().map(|v| v / t).collect())
@@ -1070,13 +1260,26 @@ pub fn run_convert_blr(
         "--blr-rho {} must be finite and non-negative",
         o.rho
     );
+    let gpu = o.method == Method::Nvg && o.device == BlrDevice::Gpu;
     if o.method == Method::Nvg {
         anyhow::ensure!(o.calib.is_some(), "--blr-method nvg needs --calib FILE");
-        // Calibration runs the CPU batched prefill (the capture hook lives in
-        // matmat). The GPU gate is process-wide and read at backend init, so
-        // it is set before anything (the f16 source conversion included).
-        // SAFETY: single-threaded here — before any pipeline/pool spawn.
-        unsafe { std::env::set_var("CMF_GPU", "0") };
+        if gpu {
+            // As quantize-gptq: per-op device GEMMs keep every projection's
+            // input in the capture hook's sight (the resident token graph
+            // would hide it), the already-encoded blr layers run on the
+            // device, and the Grams accumulate there.
+            // SAFETY: single-threaded here — before any pipeline/pool spawn.
+            if std::env::var("CMF_GPU_WGPU_GRAPH").is_err() {
+                unsafe { std::env::set_var("CMF_GPU_WGPU_GRAPH", "0") };
+            }
+            cortiq_engine::gptq_capture::set_device(true);
+        } else {
+            // Calibration runs the CPU batched prefill (the capture hook lives in
+            // matmat). The GPU gate is process-wide and read at backend init, so
+            // it is set before anything (the f16 source conversion included).
+            // SAFETY: single-threaded here — before any pipeline/pool spawn.
+            unsafe { std::env::set_var("CMF_GPU", "0") };
+        }
     }
     let t0 = Instant::now();
     let src = format!("{output}.src-f16.cmf");
@@ -1119,9 +1322,10 @@ pub fn run_convert_blr(
         });
     }
     eprintln!(
-        "blr: {} body linears over {nl} layers, method {}, target {} BPW, kv×{} ({}), paths {}",
+        "blr: {} body linears over {nl} layers, method {} ({}), target {} BPW, kv×{} ({}), paths {}",
         cand.len(),
         o.method.name(),
+        if o.method == Method::Nvg { o.device.name() } else { "cpu" },
         o.bpw,
         o.kv_factor,
         if gqa { "GQA" } else { "MHA" },
@@ -1216,8 +1420,21 @@ pub fn run_convert_blr(
                 let tl = Instant::now();
                 let work = &works[l % 2];
                 let _ = std::fs::remove_file(work);
-                CmfModel::write(work, &header, &specs, None, srcm.vocab.as_deref())
-                    .map_err(|e| anyhow::anyhow!("write {work}: {e}"))?;
+                // The device calibration runs only layers 0..=l: a work file
+                // cut there (the blr layers below are small) instead of the
+                // whole model per layer.
+                match truncated_header(&header, l).filter(|_| gpu) {
+                    Some(th) => {
+                        let cut: Vec<TensorSpec> = specs
+                            .iter()
+                            .filter(|t| keep_in_truncated(&t.name, l))
+                            .map(|t| TensorSpec { name: t.name.clone(), dtype: t.dtype, shape: t.shape.clone(), data: t.data.clone() })
+                            .collect();
+                        CmfModel::write(work, &th, &cut, None, srcm.vocab.as_deref())
+                    }
+                    None => CmfModel::write(work, &header, &specs, None, srcm.vocab.as_deref()),
+                }
+                .map_err(|e| anyhow::anyhow!("write {work}: {e}"))?;
                 let wm = Arc::new(CmfModel::open(work)?);
                 let mut pipe = cortiq_engine::Pipeline::from_model(
                     &wm,
@@ -1255,13 +1472,21 @@ pub fn run_convert_blr(
                 let keep = names.clone();
                 cortiq_engine::gptq_capture::begin_filtered(true, move |n| keep.contains(n));
                 for wv in &fit_w {
-                    fit_ppl += pipe.ppl_ids(wv).map_err(|e| anyhow::anyhow!(e))?.ln();
+                    if gpu {
+                        pipe.calib_forward(wv, l + 1, window).map_err(|e| anyhow::anyhow!(e))?;
+                    } else {
+                        fit_ppl += pipe.ppl_ids(wv).map_err(|e| anyhow::anyhow!(e))?.ln();
+                    }
                 }
                 let hf = cortiq_engine::gptq_capture::end();
                 let keep = names.clone();
                 cortiq_engine::gptq_capture::begin_filtered(true, move |n| keep.contains(n));
                 for wv in &sel_w {
-                    pipe.ppl_ids(wv).map_err(|e| anyhow::anyhow!(e))?;
+                    if gpu {
+                        pipe.calib_forward(wv, l + 1, window).map_err(|e| anyhow::anyhow!(e))?;
+                    } else {
+                        pipe.ppl_ids(wv).map_err(|e| anyhow::anyhow!(e))?;
+                    }
                 }
                 let hs = cortiq_engine::gptq_capture::end();
                 drop(pipe);
@@ -1277,6 +1502,66 @@ pub fn run_convert_blr(
                     grams.insert(lead, (mean_gram(a), mean_gram(b)));
                 }
                 let tc = tl.elapsed().as_secs_f64();
+                #[cfg(feature = "gpu")]
+                if gpu {
+                    // One tensor at a time on the device, grouped by input so
+                    // each input's context is built once and freed after.
+                    let pool = Pool::new(threads.saturating_sub(1).max(1));
+                    let mut results: Vec<(usize, Option<Encoded>)> = Vec::new();
+                    for &lead in &leads {
+                        let (hfit, hsel) = &grams[lead];
+                        let th = Instant::now();
+                        let hc = crate::nvg_gpu::HCtxD::new(hfit, hsel, o.rho)?;
+                        let thc = th.elapsed().as_secs_f64();
+                        for &(slot, _, short) in mine.iter().filter(|m| input_lead(m.2) == lead) {
+                            let w = load_f64(&srcm, slot)?;
+                            let te = Instant::now();
+                            let prof = Prof::default();
+                            let want_prof = std::env::var("CMF_NVG_PROF").as_deref() == Ok("1");
+                            let enc = crate::nvg_gpu::encode_nvg_dev(
+                                Some(&pool),
+                                &w,
+                                &hc,
+                                o.bpw,
+                                mult_of(short),
+                                o.paths,
+                                want_prof.then_some(&prof),
+                            )?;
+                            if let Some(e) = &enc {
+                                eprintln!(
+                                    "  L{l} {short:4} {}x{} {} ({:.1}s)",
+                                    w.r,
+                                    w.c,
+                                    e.line,
+                                    te.elapsed().as_secs_f64()
+                                );
+                            }
+                            if want_prof {
+                                eprintln!("    profile: hctx {thc:.2}s | {}", prof.line());
+                            }
+                            results.push((slot, enc));
+                        }
+                    }
+                    for (slot, enc) in results {
+                        let e = &srcm.tensors[slot];
+                        match enc {
+                            Some(enc) => {
+                                total_bits += enc.bits;
+                                total_w += (e.shape[0] * e.shape[1]) as u64;
+                                report.push(format!("{} P{} r{} {}", e.name, enc.paths, enc.rank, enc.line));
+                                specs[slot].dtype = TensorDtype::BinaryLowRank;
+                                specs[slot].data = enc.bytes;
+                            }
+                            None => eprintln!("  {}: blr refused, kept q8_2f", e.name),
+                        }
+                    }
+                    eprintln!(
+                        "blr: layer {l}/{nl} done — calib {tc:.1}s, layer {:.1}s, total {:.0}s",
+                        tl.elapsed().as_secs_f64(),
+                        t0.elapsed().as_secs_f64()
+                    );
+                    continue;
+                }
                 // per-input contexts (parallel over the inputs)
                 let nlead = leads.len().max(1);
                 let hctx: HashMap<&str, HCtx> = std::thread::scope(|s| {
@@ -1322,6 +1607,7 @@ pub fn run_convert_blr(
                                     o.bpw,
                                     mult_of(short),
                                     o.paths,
+                                    None,
                                 );
                                 if let Some(e) = &enc {
                                     eprintln!(
@@ -1406,6 +1692,7 @@ pub fn run_convert_blr(
             "fit_tokens": o.fit_tokens, "sel_tokens": o.sel_tokens, "window": o.window, "rho": o.rho,
             "sequential": true,
         })),
+        "encoder_device": if o.method == Method::Nvg { o.device.name() } else { "cpu" },
         "embeddings": "q8_2f",
     });
     header.provenance = Some(prov);
@@ -1476,6 +1763,7 @@ mod tests {
             wh: gemm(p, &w, false, &hc.hf, false),
             hc: &hc,
             pool: p,
+            prof: None,
         };
         let r = 16;
         let e = |md: &BlrModel| herr(p, &w.sub(&md.recon(p, None)), &hc.hf);
@@ -1549,7 +1837,7 @@ mod tests {
         assert_eq!(d.bits, blr_bits(96, 64, d.rank, 2));
         assert!(cortiq_core::blr::validate_blr(&[96, 64], &d.bytes).is_ok());
         let hc = HCtx::new(p, &h, 0.03).unwrap();
-        let n = encode_nvg(p, &w, &hc, &h, &h, b, 1.0, PathsChoice::Auto).unwrap();
+        let n = encode_nvg(p, &w, &hc, &h, &h, b, 1.0, PathsChoice::Auto, None).unwrap();
         assert_eq!(n.rank, blr_rank(96, 64, b, n.paths, 1.0));
         assert_eq!(n.bits, blr_bits(96, 64, n.rank, n.paths));
         assert!(cortiq_core::blr::validate_blr(&[96, 64], &n.bytes).is_ok());
