@@ -2354,42 +2354,69 @@ fn debias_tiled_hessian(
     let (params, codes) = rest.split_at_mut(co - po);
     let (plane, codes) = (&*plane, &*codes);
     let per = rows.div_ceil(threads.max(1)).max(1);
+    // Rows per pass over H: each H row is streamed once for DB weight rows
+    // and the multiply-adds vectorize across them.
+    const DB: usize = 8;
     std::thread::scope(|s| {
         for (ci, chunk) in params.chunks_mut(per * 4).enumerate() {
             s.spawn(move || {
-                let (mut y, mut wh) = (vec![0f64; cols], vec![0f32; cols]);
-                for (k, p) in chunk.chunks_exact_mut(4).enumerate() {
-                    let r = ci * per + k;
-                    let wr = &w0[r * cols..(r + 1) * cols];
-                    // Ŵ_r through the encoder's own (machine-independent) ladder.
-                    let tab = if two_bit {
-                        crate::convert::det_q2tp_ladder(p, 0)
-                    } else {
-                        crate::convert::det_q4tp_ladder(p, 0)
-                    };
-                    let crow = &codes[r * stride..(r + 1) * stride];
-                    for g in 0..gpr {
-                        let sg = tab[q4tp_code(crow, g)];
-                        let ch = &plane[(r * gpr + g) * chunk_b..(r * gpr + g + 1) * chunk_b];
-                        let dst = &mut wh[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
-                        for (b, &byte) in ch.iter().enumerate() {
-                            if two_bit {
-                                for j in 0..4 {
-                                    dst[b * 4 + j] = (((byte >> (2 * j)) & 3) as f32 - 1.5) * sg;
-                                }
-                            } else {
-                                dst[b * 2] = ((byte & 0x0F) as f32 - 8.0) * sg;
-                                dst[b * 2 + 1] = (((byte >> 4) & 0x0F) as f32 - 8.0) * sg;
-                            }
+                let (mut wt, mut ys) = (vec![0f64; cols * DB], vec![0f64; cols * DB]);
+                let mut wh = vec![0f32; cols];
+                let nrows = chunk.len() / 4;
+                let mut k0 = 0;
+                while k0 < nrows {
+                    let rb = (nrows - k0).min(DB);
+                    let r0 = ci * per + k0;
+                    wt.fill(0.0);
+                    for k in 0..rb {
+                        for (j, &v) in w0[(r0 + k) * cols..(r0 + k + 1) * cols].iter().enumerate() {
+                            wt[j * DB + k] = v as f64;
                         }
                     }
-                    for (i, yi) in y.iter_mut().enumerate() {
-                        let hrow = &h[i * cols..(i + 1) * cols];
-                        *yi = hrow.iter().zip(wr).map(|(&a, &b)| a * b as f64).sum();
+                    // y = H·w for the block. Per (i, row) the sum runs over j
+                    // in order from −0.0 — exactly `Iterator::sum` on that
+                    // row alone — so the block changes no bit.
+                    for i in 0..cols {
+                        let mut acc = [-0.0f64; DB];
+                        for (j, &hv) in h[i * cols..(i + 1) * cols].iter().enumerate() {
+                            let wj: &[f64; DB] = wt[j * DB..(j + 1) * DB].try_into().unwrap();
+                            for k in 0..DB {
+                                acc[k] += hv * wj[k];
+                            }
+                        }
+                        ys[i * DB..(i + 1) * DB].copy_from_slice(&acc);
                     }
-                    let num: f64 = wh.iter().zip(&y).map(|(&a, &b)| a as f64 * b).sum();
-                    let den: f64 = wr.iter().zip(&y).map(|(&a, &b)| a as f64 * b).sum();
-                    crate::convert::q2tp_unshrink_row(p, num, den);
+                    for k in 0..rb {
+                        let r = r0 + k;
+                        let p = &mut chunk[(k0 + k) * 4..(k0 + k + 1) * 4];
+                        let wr = &w0[r * cols..(r + 1) * cols];
+                        // Ŵ_r through the encoder's own (machine-independent) ladder.
+                        let tab = if two_bit {
+                            crate::convert::det_q2tp_ladder(p, 0)
+                        } else {
+                            crate::convert::det_q4tp_ladder(p, 0)
+                        };
+                        let crow = &codes[r * stride..(r + 1) * stride];
+                        for g in 0..gpr {
+                            let sg = tab[q4tp_code(crow, g)];
+                            let ch = &plane[(r * gpr + g) * chunk_b..(r * gpr + g + 1) * chunk_b];
+                            let dst = &mut wh[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+                            for (b, &byte) in ch.iter().enumerate() {
+                                if two_bit {
+                                    for j in 0..4 {
+                                        dst[b * 4 + j] = (((byte >> (2 * j)) & 3) as f32 - 1.5) * sg;
+                                    }
+                                } else {
+                                    dst[b * 2] = ((byte & 0x0F) as f32 - 8.0) * sg;
+                                    dst[b * 2 + 1] = (((byte >> 4) & 0x0F) as f32 - 8.0) * sg;
+                                }
+                            }
+                        }
+                        let num: f64 = wh.iter().enumerate().map(|(i, &a)| a as f64 * ys[i * DB + k]).sum();
+                        let den: f64 = wr.iter().enumerate().map(|(i, &a)| a as f64 * ys[i * DB + k]).sum();
+                        crate::convert::q2tp_unshrink_row(p, num, den);
+                    }
+                    k0 += rb;
                 }
             });
         }
@@ -3055,6 +3082,68 @@ mod tests {
             unit += ((b1 - 1.0).abs() < 0.01) as usize;
         }
         assert!(unit > rows / 2, "most rows must come back to a unit slope ({unit}/{rows})");
+    }
+
+    /// The row-blocked debias writes exactly what the plain per-row version
+    /// (y = H·w by `Iterator::sum`, row at a time) writes, on both layouts,
+    /// with a partial last block.
+    #[test]
+    fn blocked_debias_matches_per_row_reference() {
+        let (rows, cols, t) = (13usize, 96usize, 300usize);
+        let (w, _, h) = q2_problem_with(rows, cols, t, 404, 3.0);
+        let hdiag: Vec<f32> = (0..cols).map(|i| h[i * cols + i] as f32).collect();
+        let (u, dead) = gptq_fold_operator(h.clone(), cols, 0.01);
+        let reference = |bytes: &mut [u8], two_bit: bool| {
+            let mut deq = vec![0f32; rows * cols];
+            let po = if two_bit {
+                let d = bytes.to_vec();
+                // decode through the det ladder, like the kernel
+                let (po, co, stride) = cortiq_core::quant::q2tp_sections(rows, cols);
+                for r in 0..rows {
+                    let tab = crate::convert::det_q2tp_ladder(&d[po..], r);
+                    for c in 0..cols {
+                        let g = c / GROUP_SIZE;
+                        let s = tab[cortiq_core::quant::q4tp_code(&d[co + r * stride..], g)];
+                        let byte = d[(r * (cols / GROUP_SIZE) + g) * 8 + (c % GROUP_SIZE) / 4];
+                        deq[r * cols + c] = (((byte >> (2 * (c % 4))) & 3) as f32 - 1.5) * s;
+                    }
+                }
+                po
+            } else {
+                let d = bytes.to_vec();
+                let (po, co, stride) = cortiq_core::quant::q4tp_sections(rows, cols);
+                for r in 0..rows {
+                    let tab = crate::convert::det_q4tp_ladder(&d[po..], r);
+                    for c in 0..cols {
+                        let g = c / GROUP_SIZE;
+                        let s = tab[cortiq_core::quant::q4tp_code(&d[co + r * stride..], g)];
+                        let byte = d[(r * (cols / GROUP_SIZE) + g) * 16 + (c % GROUP_SIZE) / 2];
+                        let nib = if c % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+                        deq[r * cols + c] = (nib as f32 - 8.0) * s;
+                    }
+                }
+                po
+            };
+            for r in 0..rows {
+                let wr = &w[r * cols..(r + 1) * cols];
+                let y: Vec<f64> = (0..cols)
+                    .map(|i| h[i * cols..(i + 1) * cols].iter().zip(wr).map(|(&a, &b)| a * b as f64).sum())
+                    .collect();
+                let num: f64 = deq[r * cols..(r + 1) * cols].iter().zip(&y).map(|(&a, &b)| a as f64 * b).sum();
+                let den: f64 = wr.iter().zip(&y).map(|(&a, &b)| a as f64 * b).sum();
+                crate::convert::q2tp_unshrink_row(&mut bytes[po + r * 4..po + r * 4 + 4], num, den);
+            }
+        };
+        let g2 = gptq_quantize_q2tp(&w, rows, cols, &u, &dead, &hdiag, Q2tpRule::Placed, None, 1);
+        let (mut a, mut b) = (g2.clone(), g2);
+        q2tp_debias_hessian(&mut a, &w, rows, cols, &h, 2);
+        reference(&mut b, true);
+        assert_eq!(a, b, "q2tp");
+        let g4 = gptq_quantize_q4tp(&w, rows, cols, &u, &dead, &hdiag, 1);
+        let (mut a, mut b) = (g4.clone(), g4);
+        q4tp_debias_hessian(&mut a, &w, rows, cols, &h, 3);
+        reference(&mut b, false);
+        assert_eq!(a, b, "q4tp");
     }
 
     /// The q4tp debias: same contract on the 4-bit layout — nibbles, rungs
