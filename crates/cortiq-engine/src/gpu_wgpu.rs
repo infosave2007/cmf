@@ -45,6 +45,8 @@ pub(crate) mod dense_mv;
 pub(crate) mod gram;
 /// GPTQ fold operator and q4tp row sweep on the device.
 pub(crate) mod gptq_dev;
+/// GatedDeltaNet forward and BPTT backward on the device (training).
+pub mod gdn_train;
 
 /// Workgroup limit per dimension (WebGPU minimum; lm_head has more
 /// rows — we use grid-stride in the shader).
