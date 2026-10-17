@@ -954,6 +954,25 @@ fn scale_rsqrt(@builtin(global_invocation_id) g: vec3<u32>) {
     C[i] = A[i] / sqrt(max(RG[p.u5], 1.0e-30));
 }
 
+// Block of u2 reflectors starting at i0 = u3 (reflectors below the
+// subdiagonal of the k x k A, k = u0) as a dense k x u2 matrix C: column c
+// is reflector i = i0 + c (1 at row i+1, A[row][i] below, 0 above).
+@compute @workgroup_size(256)
+fn vblock(@builtin(global_invocation_id) g: vec3<u32>) {
+    let k = p.u0;
+    let b = p.u2;
+    let e = g.x + g.y * 65535u * 256u;
+    if (e >= k * b) { return; }
+    let row = e / b;
+    let c = e % b;
+    let i = p.u3 + c;
+    var v = 0.0;
+    if (i + 1u < k) {
+        if (row == i + 1u) { v = 1.0; } else if (row > i + 1u) { v = A[row * k + i]; }
+    }
+    C[e] = v;
+}
+
 // Compact-WY T of one reflector block (dlarft, forward, columnwise), one
 // workgroup: A = V^T V (bb x bb, u1 = bb), R = tau (offset u3), b = u2 live
 // columns; T (bb x bb) into C.
@@ -981,7 +1000,7 @@ fn wy_t(@builtin(local_invocation_index) t: u32) {
 "#;
 
 fn vecm(c: &Ctx) -> Option<&'static Mod> {
-    train_ops::module(c, "nvg_vec", VEC_SRC, &["diag_ridge", "equil_rg", "div_vec", "colsum_red", "hsolve", "scatter_vec", "sum_into", "scale_rsqrt", "wy_t"])
+    train_ops::module(c, "nvg_vec", VEC_SRC, &["diag_ridge", "equil_rg", "div_vec", "colsum_red", "hsolve", "scatter_vec", "sum_into", "scale_rsqrt", "wy_t", "vblock"])
 }
 
 fn vgrid(n: usize) -> (u32, u32, u32) {
@@ -2377,61 +2396,49 @@ unsafe impl Sync for SendPtr {}
 pub fn sym_eig_top(a: &DMat, r: usize, pool: Option<&crate::pool::Pool>) -> (Vec<f64>, DMat) {
     let k = a.r;
     let r = r.min(k);
+    let trace = std::env::var("CMF_NVG_EIG_TRACE").as_deref() == Ok("1");
+    let t0 = std::time::Instant::now();
     let de = tridiag(a);
+    let t1 = t0.elapsed().as_secs_f64();
     let (d, e) = (&de[..k], &de[k..2 * k - 1]);
     let dev_de = DMat::from_f64(1, 3 * k, &de);
-    let td = DMat::zeros(32, 32);
     let (lam, z) = tridiag_top(d, e, r, pool);
+    let t2 = t0.elapsed().as_secs_f64();
     let zd = DMat::from_f64(k, r, &z);
     // x = H_0 H_1 ⋯ H_{k-2} z, blocks of reflectors applied last-first.
     let c = dev();
-    let pp = eig_pipes(c).expect("nvg eig pipelines");
     let bsz = 32usize;
     let nref = k - 1;
-    let vb = DMat::zeros(k, bsz);
     let mut blocks: Vec<usize> = (0..nref).step_by(bsz).collect();
     blocks.reverse();
-    let w = DMat::zeros(bsz, r);
-    let w2 = DMat::zeros(bsz, r);
-    for i0 in blocks {
-        let b = bsz.min(nref - i0);
-        let prm = c.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("nvg_eig_vb"),
-            size: 16,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        c.queue.write_buffer(&prm, 0, bytemuck::cast_slice(&[k as u32, i0 as u32, bsz as u32, 0]));
-        let bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("nvg_eig_vb"),
-            layout: &pp.layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &prm, offset: 0, size: std::num::NonZeroU64::new(16) }) },
-                wgpu::BindGroupEntry { binding: 1, resource: a.buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: dummy(c).as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: dummy(c).as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: dummy(c).as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: dummy(c).as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: vb.buf.as_entire_binding() },
-            ],
-        });
-        let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("nvg_vblock") });
-        {
-            let mut ps = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
-            ps.set_bind_group(0, &bg, &[0]);
-            ps.set_pipeline(&pp.p["hh_vblock"]);
-            let g = elt_fold(k * bsz);
-            ps.dispatch_workgroups(g.0, g.1, 1);
+    let vm = vecm(c).expect("nvg vec pipelines");
+    // per block: V, VᵀV, T, then z −= V (T (Vᵀ z)); all recorded, a few submissions
+    let vbs: Vec<DMat> = (0..blocks.len().clamp(1, 16)).map(|_| DMat::zeros(k, bsz)).collect();
+    let vtvs: Vec<DMat> = (0..vbs.len()).map(|_| DMat::zeros(bsz, bsz)).collect();
+    let tds: Vec<DMat> = (0..vbs.len()).map(|_| DMat::zeros(bsz, bsz)).collect();
+    let ws: Vec<DMat> = (0..vbs.len()).map(|_| DMat::zeros(bsz, r)).collect();
+    let w2s: Vec<DMat> = (0..vbs.len()).map(|_| DMat::zeros(bsz, r)).collect();
+    for chunk in blocks.chunks(vbs.len()) {
+        let mut ds: Vec<Disp> = Vec::new();
+        for (slot, &i0) in chunk.iter().enumerate() {
+            let b = bsz.min(nref - i0);
+            let (vb, vtv, td, w, w2) = (&vbs[slot], &vtvs[slot], &tds[slot], &ws[slot], &w2s[slot]);
+            ds.push(Disp { pipe: &vm.p["vblock"], uni: uni(&[k as u32, 0, bsz as u32, i0 as u32], &[]), bufs: vec![(1, &a.buf), (5, &vb.buf)], grid: elt_fold(k * bsz) });
+            ds.push(gemm_disp(c, bsz, bsz, k, 1.0, V::t(vb), V::n(vb), 0.0, vtv, 0, bsz, None, false));
+            ds.push(Disp { pipe: &vm.p["wy_t"], uni: uni(&[0, bsz as u32, b as u32, (2 * k + i0) as u32], &[]), bufs: vec![(1, &vtv.buf), (3, &dev_de.buf), (5, &td.buf)], grid: (1, 1, 1) });
+            ds.push(gemm_disp(c, bsz, r, k, 1.0, V::t(vb), V::n(&zd), 0.0, w, 0, r, None, false));
+            ds.push(gemm_disp(c, bsz, r, bsz, 1.0, V::n(td), V::n(w), 0.0, w2, 0, r, None, false));
+            ds.push(gemm_disp(c, k, r, bsz, -1.0, V::n(vb), V::n(w2), 1.0, &zd, 0, r, None, false));
         }
-        submit(c, enc.finish());
-        // T (dlarft, forward, columnwise) from VᵀV and tau, on the device
-        let vtv = mm(&vb, true, &vb, false);
-        let vm = vecm(c).expect("nvg vec pipelines");
-        train_ops::run(c, &[Disp { pipe: &vm.p["wy_t"], uni: uni(&[0, bsz as u32, b as u32, (2 * k + i0) as u32], &[]), bufs: vec![(1, &vtv.buf), (3, &dev_de.buf), (5, &td.buf)], grid: (1, 1, 1) }]);
-        // z -= V (T (Vᵀ z))
-        gemm(1.0, &vb, true, &zd, false, 0.0, &w);
-        gemm(1.0, &td, false, &w, false, 0.0, &w2);
-        gemm(-1.0, &vb, false, &w2, false, 1.0, &zd);
+        train_ops::run(c, &ds);
+    }
+    if trace {
+        sync();
+        eprintln!(
+            "sym_eig_top k={k} r={r}: tridiag {t1:.3}s, host bisection+inverse iteration {:.3}s, back-transform {:.3}s",
+            t2 - t1,
+            t0.elapsed().as_secs_f64() - t2
+        );
     }
     (lam, zd)
 }
