@@ -53809,7 +53809,14 @@ fn main() {
             assert!(readback(c, enc, y, &stage, (n * 4) as u64, &mut got));
             got
         };
-        for &(rows, cols, b) in &[(33usize, 256usize, 70usize), (7, 2048, 5), (130, 128, 64)] {
+        // (3, 384): an odd group count (9) — the last scale word is half
+        // payload, half padding, and the payload is not a word multiple.
+        for &(rows, cols, b) in &[
+            (33usize, 256usize, 70usize),
+            (7, 2048, 5),
+            (130, 128, 64),
+            (3, 384, 9),
+        ] {
             let tiles = rows * cols / 32;
             let mut q1 = Vec::with_capacity(tiles * Q1_TILE);
             for t in 0..tiles {
