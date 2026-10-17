@@ -20,6 +20,12 @@ static ON: AtomicBool = AtomicBool::new(false);
 /// ~100 GB across the model).
 static FULL_H: AtomicBool = AtomicBool::new(true);
 static REG: Mutex<Option<HashMap<String, HessianAcc>>> = Mutex::new(None);
+/// Which tensors to capture (`None` = all). A dense Hessian costs
+/// `8·cols²` bytes — 300 MB for one 6144-wide `down_proj` — so a caller that
+/// quantizes only some linears, or a model a few layers at a time, keeps
+/// everything else out of RAM and skips its O(b·cols²) accumulation.
+type CaptureFilter = Box<dyn Fn(&str) -> bool + Send>;
+static FILTER: Mutex<Option<CaptureFilter>> = Mutex::new(None);
 
 /// Accumulated input statistics of one linear layer over the calibration set.
 pub struct HessianAcc {
@@ -43,9 +49,17 @@ impl HessianAcc {
 /// Start capturing (clears any prior registry). `full_h` = accumulate the
 /// dense Hessian (fold path); false = diagonal-only (ternary + correction).
 pub fn begin(full_h: bool) {
+    *FILTER.lock().unwrap() = None;
     *REG.lock().unwrap() = Some(HashMap::new());
     FULL_H.store(full_h, Ordering::SeqCst);
     ON.store(true, Ordering::SeqCst);
+}
+
+/// [`begin`], capturing only the tensors whose name passes `keep`. The
+/// others cost one closure call per matmat and no memory.
+pub fn begin_filtered(full_h: bool, keep: impl Fn(&str) -> bool + Send + 'static) {
+    begin(full_h);
+    *FILTER.lock().unwrap() = Some(Box::new(keep));
 }
 
 /// Stop capturing and take the accumulated Hessians. `accumulate` fills
@@ -53,6 +67,7 @@ pub fn begin(full_h: bool) {
 /// consumer sees the full symmetric matrix.
 pub fn end() -> HashMap<String, HessianAcc> {
     ON.store(false, Ordering::SeqCst);
+    *FILTER.lock().unwrap() = None;
     let mut map = REG.lock().unwrap().take().unwrap_or_default();
     for acc in map.values_mut() {
         let n = acc.cols;
@@ -74,6 +89,11 @@ pub fn capturing() -> bool {
 
 /// Fold a batch of `b` input vectors (`xs = [b·cols]`) into `name`'s Hessian.
 pub fn accumulate(name: &str, xs: &[f32], b: usize, cols: usize) {
+    if let Some(keep) = FILTER.lock().unwrap().as_ref()
+        && !keep(name)
+    {
+        return;
+    }
     let mut guard = REG.lock().unwrap();
     let Some(map) = guard.as_mut() else {
         return;
@@ -239,6 +259,32 @@ fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A filtered capture keeps only the named tensors, accumulates them
+    /// exactly as an unfiltered one would, and `end()` clears the filter.
+    #[test]
+    fn filtered_capture_keeps_only_the_named_tensors() {
+        let (b, cols) = (5usize, 6usize);
+        let xs: Vec<f32> = (0..b * cols).map(|k| (k as f32 * 0.37).sin()).collect();
+        begin_filtered(true, |n| n.ends_with(".keep"));
+        accumulate("l0.keep", &xs, b, cols);
+        accumulate("l0.drop", &xs, b, cols);
+        let got = end();
+        assert_eq!(got.len(), 1, "only the filtered name is captured");
+        let acc = &got["l0.keep"];
+        assert_eq!(acc.count, b);
+        let mut want = vec![0f64; cols * cols];
+        gram_upper_add(&mut want, &xs, b, cols);
+        for i in 0..cols {
+            for j in i..cols {
+                assert_eq!(acc.h[i * cols + j], want[i * cols + j]);
+                assert_eq!(acc.h[j * cols + i], want[i * cols + j], "mirrored");
+            }
+        }
+        begin(true);
+        accumulate("l0.drop", &xs, b, cols);
+        assert_eq!(end().len(), 1, "a later unfiltered capture sees everything");
+    }
 
     #[test]
     fn gram_matches_rank1_reference() {
