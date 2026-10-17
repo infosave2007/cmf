@@ -828,8 +828,8 @@ enum Commands {
         #[arg(long)]
         q2tp_debias: bool,
     },
-    /// GPTQ for the routed experts of a Flash-Next-class MoE (qwen4_exp):
-    /// gate/up into q2tp, down into q4tp, on the GPU; the calibration file
+    /// GPTQ for the experts of a Flash-Next-class MoE (qwen4_exp), routed
+    /// and shared: gate/up into q2tp, down into q4tp, on the GPU; the calibration file
     /// (a q4tp CMF of the model) supplies the activations and every
     /// non-expert tensor, the original safetensors checkpoint the
     /// full-precision expert weights (fetched one layer at a time).
@@ -859,8 +859,12 @@ enum Commands {
         scratch: String,
         #[arg(long, default_value = "16")]
         threads: usize,
+        #[arg(long, required_unless_present = "patch_shared")]
+        output: Option<String>,
+        /// Re-encode only the shared experts of this existing quantize-moe
+        /// output, in place (no --output file is written)
         #[arg(long)]
-        output: String,
+        patch_shared: Option<String>,
     },
     /// NVG Ť: light distillation training of a compressed model's metric
     /// (the h, ℓ, g scales of its binary low-rank tensors and every RMSNorm
@@ -3291,7 +3295,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         #[cfg(feature = "gpu")]
-        Commands::QuantizeMoe { calib_model, hf, calib, tokens, window, layers_per_pass, lambda, min_rows, scratch, threads, output } => {
+        Commands::QuantizeMoe { calib_model, hf, calib, tokens, window, layers_per_pass, lambda, min_rows, scratch, threads, output, patch_shared } => {
             moegptq::run(&moegptq::MoeOpts {
                 calib_model: &calib_model,
                 hf: &hf,
@@ -3303,7 +3307,8 @@ async fn main() -> anyhow::Result<()> {
                 min_rows,
                 scratch: &scratch,
                 threads,
-                output: &output,
+                output: output.as_deref().unwrap_or(""),
+                patch_shared: patch_shared.as_deref(),
             })
         }
         #[cfg(not(feature = "gpu"))]

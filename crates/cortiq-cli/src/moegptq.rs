@@ -1,27 +1,31 @@
-//! `cortiq quantize-moe`: GPTQ for the routed experts of a Flash-Next-class
-//! MoE (`qwen4_exp`): gate/up into q2tp, down into q4tp, every other tensor
-//! copied from the calibration file.
+//! `cortiq quantize-moe`: GPTQ for the experts of a Flash-Next-class MoE
+//! (`qwen4_exp`): routed and shared experts get gate/up in q2tp and down in
+//! q4tp (the layout the q2tp device path expects for every expert slot);
+//! every other tensor is copied from the calibration file.
 //!
 //! * Calibration: the calibration model (a q4tp file of the same model) runs
 //!   its ordinary device frames over the corpus; each layer frame in the
 //!   captured range copies its MoE input rows and router logits out right
-//!   after routing (`Pipeline::qwen4_capture`). A token's experts are the
-//!   top-k of its logits.
-//! * Per expert, on the GPU: the input Hessian of gate/up from the rows
-//!   routed to it, the device fold, the q2tp sweep (placed rule, debiased);
-//!   the down input `silu(X·W_gᵀ)⊙(X·W_uᵀ)` from the full-precision weights
-//!   (f16 planes, matrix units), its Hessian, the fold and the q4tp sweep.
+//!   after routing (`Pipeline::qwen4_capture`). A token's routed experts are
+//!   the top-k of its logits; the shared expert sees every token.
+//! * Per expert, on the GPU: the input Hessian of gate/up from its rows, the
+//!   down input `silu(X·W_gᵀ)⊙(X·W_uᵀ)` from the full-precision weights (f16
+//!   planes, matrix units) and its Hessian, both accumulated in row chunks;
+//!   then the device folds, the q2tp sweeps (placed rule, debiased) and the
+//!   q4tp sweep.
 //! * Full-precision weights come from the original safetensors shards,
-//!   fetched one layer at a time and deleted when done; the output is
-//!   streamed, so neither the bf16 checkpoint nor the result is ever held
-//!   whole.
+//!   fetched one layer at a time (the next layer's in the background) and
+//!   deleted when done; the output is streamed, so neither the bf16
+//!   checkpoint nor the result is ever held whole.
+//! * `--patch-shared FILE` re-encodes only the shared experts of an existing
+//!   output in place (their q2tp payloads fit the old slots).
 
 use crate::convert::{Quant, fetch, open_safetensors, quantize_2d, to_f32};
 use crate::gptq::{CalibSource, calib_source_tokens, gemm_rows_square, gptq_quantize_q2tp_dev, gptq_quantize_q4tp_dev, q2tp_debias_rows, split_calib_budget};
 use cortiq_core::format::{CmfModel, CmfStreamWriter};
 use cortiq_core::quant::f32_to_f16;
 use cortiq_core::types::TensorDtype;
-use cortiq_engine::gpu_wgpu::{train_mm as tm, train_ops as to};
+use cortiq_engine::gpu_wgpu::{Ctx, train_mm as tm, train_ops as to};
 use cortiq_engine::{Pipeline, SamplerConfig};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -40,7 +44,11 @@ pub struct MoeOpts<'a> {
     pub scratch: &'a str,
     pub threads: usize,
     pub output: &'a str,
+    pub patch_shared: Option<&'a str>,
 }
+
+/// Input rows per device pass of one expert.
+const CHUNK: usize = 16384;
 
 pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     let t0 = Instant::now();
@@ -55,7 +63,11 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     let ne = dirs0.len();
     let top_k = arch.moe.as_ref().map(|m| m.top_k).unwrap_or(10);
     let inter = cmodel.tensors[dirs0[0].0].shape[0];
-    eprintln!("quantize-moe: {nl} layers, {ne} experts, top-{top_k}, hidden {hidden}, expert width {inter}");
+    let patch = o.patch_shared;
+    eprintln!(
+        "quantize-moe: {nl} layers, {ne} experts, top-{top_k}, hidden {hidden}, expert width {inter}{}",
+        if patch.is_some() { " — shared experts only, patched in place" } else { "" }
+    );
 
     // calibration windows
     let srcs: Vec<CalibSource> = o.calib.iter().map(|s| CalibSource::parse(s)).collect::<anyhow::Result<_>>()?;
@@ -81,32 +93,78 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     fetch(&agent, &format!("{base}/model.safetensors.index.json"), &idx_path, token.as_deref(), true, 8)?;
     let idx: serde_json::Value = serde_json::from_slice(&std::fs::read(&idx_path)?)?;
     let wmap = idx["weight_map"].as_object().ok_or_else(|| anyhow::anyhow!("bad index"))?.clone();
+    // `part` below `….layers.{li}.mlp.` → (source name, shard)
     let src_name = |li: usize, part: &str| -> anyhow::Result<(String, String)> {
         for prefix in ["model.language_model.layers", "model.layers"] {
-            let n = format!("{prefix}.{li}.mlp.experts.{part}");
+            let n = format!("{prefix}.{li}.mlp.{part}");
             if let Some(s) = wmap.get(&n).and_then(|v| v.as_str()) {
                 return Ok((n, s.to_string()));
             }
         }
-        anyhow::bail!("layer {li}: no {part} in the source index")
+        anyhow::bail!("layer {li}: no mlp.{part} in the source index")
+    };
+    const ROUTED: [&str; 2] = ["experts.gate_up_proj", "experts.down_proj"];
+    const SHARED: [&str; 3] = ["shared_expert.gate_proj.weight", "shared_expert.up_proj.weight", "shared_expert.down_proj.weight"];
+
+    let mut expert_slots: HashSet<usize> = HashSet::new();
+    let mut layer_dirs = Vec::with_capacity(nl);
+    let mut shared_dirs = Vec::with_capacity(nl);
+    for li in 0..nl {
+        let (d, s) = pipe.qwen4_expert_dirs(li).ok_or_else(|| anyhow::anyhow!("layer {li}: no experts"))?;
+        for &(g, u, dn) in d.iter().chain(s.iter()) {
+            expert_slots.extend([g, u, dn]);
+        }
+        layer_dirs.push(d);
+        shared_dirs.push(s);
+    }
+    let inter_s = shared_dirs.iter().flatten().map(|&(g, _, _)| cmodel.tensors[g].shape[0]).max().unwrap_or(0);
+    let layer_shards = |li: usize| -> anyhow::Result<Vec<String>> {
+        let mut v = Vec::new();
+        if patch.is_none() {
+            for p in ROUTED {
+                v.push(src_name(li, p)?.1);
+            }
+        }
+        if shared_dirs[li].is_some() {
+            for p in SHARED {
+                v.push(src_name(li, p)?.1);
+            }
+        }
+        v.sort();
+        v.dedup();
+        Ok(v)
     };
 
     // output: the experts layer by layer (gate, up, down of an expert
     // adjacent, so the expert store reads each in one request), then every
-    // other tensor straight from the calibration file
-    let mut expert_slots: HashSet<usize> = HashSet::new();
-    let mut layer_dirs = Vec::with_capacity(nl);
-    for li in 0..nl {
-        let (d, _) = pipe.qwen4_expert_dirs(li).ok_or_else(|| anyhow::anyhow!("layer {li}: no experts"))?;
-        for &(g, u, dn) in &d {
-            expert_slots.extend([g, u, dn]);
+    // other tensor straight from the calibration file. Patch mode collects
+    // the shared experts' payloads for the existing file instead.
+    let target = patch.map(CmfModel::open_sharded).transpose()?;
+    let mut patches: Vec<(usize, TensorDtype, Vec<u8>)> = Vec::new();
+    let mut out = match patch {
+        None => {
+            let avg_name = cmodel.tensors.iter().map(|e| e.name.len()).sum::<usize>() / cmodel.tensors.len().max(1);
+            Some(CmfStreamWriter::new(o.output, CmfStreamWriter::head_reserve_for(cmodel.tensors.len(), avg_name))?)
         }
-        layer_dirs.push(d);
-    }
-    let avg_name = cmodel.tensors.iter().map(|e| e.name.len()).sum::<usize>() / cmodel.tensors.len().max(1);
-    let mut out = CmfStreamWriter::new(o.output, CmfStreamWriter::head_reserve_for(cmodel.tensors.len(), avg_name))?;
+        Some(_) => None,
+    };
+    let mut emit = |name: &str, dt: TensorDtype, shape: &[usize], bytes: Vec<u8>| -> anyhow::Result<()> {
+        match (&mut out, &target) {
+            (Some(w), _) => w.push(name, dt, shape, &bytes).map_err(Into::into),
+            (None, Some(t)) => {
+                let i = t.tensor_index(name).ok_or_else(|| anyhow::anyhow!("{name} not in the patched file"))?;
+                anyhow::ensure!(t.tensors[i].shape == shape, "{name}: shape differs in the patched file");
+                anyhow::ensure!(bytes.len() as u64 <= t.tensors[i].nbytes, "{name}: new payload larger than its slot");
+                patches.push((i, dt, bytes));
+                Ok(())
+            }
+            (None, None) => unreachable!(),
+        }
+    };
 
     let width = hidden + ne;
+    let inter_max = inter.max(inter_s);
+    let main_bufs = wgpu_bufs::Bufs::new(c, CHUNK, hidden, inter_max);
     let mut stats = (0usize, 0usize);
     let mut prefetch: Option<std::thread::JoinHandle<anyhow::Result<()>>> = None;
     let pass = o.layers_per_pass.max(1);
@@ -127,49 +185,20 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
             let tl = Instant::now();
             let lr = &rows[li - lo];
             let n = lr.len() / width;
-            // routing: top-k of the logits per token
-            let mut lists: Vec<Vec<u32>> = vec![Vec::new(); ne];
-            let mut lg = vec![0f32; ne];
-            for t in 0..n {
-                for (e, v) in lg.iter_mut().enumerate() {
-                    *v = cortiq_core::quant::f16_to_f32(lr[t * width + hidden + e]);
-                }
-                let mut ord: Vec<usize> = (0..ne).collect();
-                ord.select_nth_unstable_by(top_k - 1, |&a, &b| lg[b].partial_cmp(&lg[a]).unwrap_or(std::cmp::Ordering::Equal));
-                for &e in &ord[..top_k] {
-                    lists[e].push(t as u32);
-                }
-            }
-            {
-                let mut cnt: Vec<usize> = lists.iter().map(Vec::len).collect();
-                cnt.sort_unstable();
-                eprintln!(
-                    "  layer {li}: routed rows per expert min {} median {} max {}; {} experts under {} rows",
-                    cnt[0],
-                    cnt[ne / 2],
-                    cnt[ne - 1],
-                    cnt.iter().filter(|&&v| v < o.min_rows).count(),
-                    o.min_rows
-                );
-            }
             let tf = Instant::now();
             // full-precision weights of this layer (the next layer's shards
             // download in the background meanwhile)
             if let Some(h) = prefetch.take() {
                 h.join().map_err(|_| anyhow::anyhow!("prefetch thread panicked"))??;
             }
-            let (gu_name, gu_shard) = src_name(li, "gate_up_proj")?;
-            let (dn_name, dn_shard) = src_name(li, "down_proj")?;
             let mut shards = HashMap::new();
-            for sh in [&gu_shard, &dn_shard] {
-                if !shards.contains_key(sh) {
-                    let p = scratch.join(sh);
-                    fetch(&agent, &format!("{base}/{sh}"), &p, token.as_deref(), true, 16)?;
-                    shards.insert(sh.clone(), open_safetensors(&p)?);
-                }
+            for sh in layer_shards(li)? {
+                let p = scratch.join(&sh);
+                fetch(&agent, &format!("{base}/{sh}"), &p, token.as_deref(), true, 16)?;
+                shards.insert(sh, open_safetensors(&p)?);
             }
             if li + 1 < nl {
-                let next = [src_name(li + 1, "gate_up_proj")?.1, src_name(li + 1, "down_proj")?.1];
+                let next = layer_shards(li + 1)?;
                 let (agent, base, token, scratch) = (agent.clone(), base.clone(), token.clone(), scratch.clone());
                 prefetch = Some(std::thread::spawn(move || -> anyhow::Result<()> {
                     for sh in next {
@@ -178,133 +207,133 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
                     Ok(())
                 }));
             }
-            let find = |sh: &str, name: &str| {
-                let st = &shards[sh];
-                st.tensors.iter().find(|m| m.name == name).map(|m| (st, m)).ok_or_else(|| anyhow::anyhow!("{name} not in {sh}"))
+            let find = |part: &str| {
+                let (name, sh) = src_name(li, part)?;
+                find_in(&shards, &name, &sh)
             };
             let t_fetch = tf.elapsed().as_secs_f64();
-            // stage seconds summed over workers: gram+read, fold, q2tp sweeps+debias, down input, down fold+sweep
-            let (gst, gm) = find(&gu_shard, &gu_name)?;
-            let (dst, dm) = find(&dn_shard, &dn_name)?;
-            anyhow::ensure!(gm.shape == [ne, 2 * inter, hidden] && dm.shape == [ne, hidden, inter], "layer {li}: unexpected expert layout {:?} / {:?}", gm.shape, dm.shape);
-            let gbytes = gst.bytes(gm);
-            let dbytes = dst.bytes(dm);
-            let esz = |shape: &[usize]| shape[1] * shape[2] * 2; // bf16
-            let (gsz, dsz) = (esz(&gm.shape), esz(&dm.shape));
-            // experts in parallel: each worker owns its device scratch and a
-            // share of the host threads; results are pushed in expert order
-            let workers = std::env::var("CMF_MOE_WORKERS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4).clamp(1, 16);
-            let wthreads = (o.threads / workers).max(1);
-            let next = std::sync::atomic::AtomicUsize::new(0);
-            let results: Vec<std::sync::Mutex<Option<[Vec<u8>; 3]>>> = (0..ne).map(|_| std::sync::Mutex::new(None)).collect();
-            let timers = std::sync::Mutex::new([0f64; 5]);
-            let (n_gptq, n_rtn) = (std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0));
-            let worker = || -> anyhow::Result<()> {
-                let mut tim = [0f64; 5];
-                let mut scratch_dev: Option<(usize, wgpu_bufs::Bufs)> = None;
-                loop {
-                    let e = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if e >= ne {
-                        break;
-                    }
-                    let gu = to_f32(&gm.dtype, &gbytes[e * gsz..(e + 1) * gsz])?;
-                    let wd = to_f32(&dm.dtype, &dbytes[e * dsz..(e + 1) * dsz])?;
-                    let (wg, wu) = gu.split_at(inter * hidden);
-                    let ce = lists[e].len();
-                    let enc = if ce < o.min_rows {
-                        n_rtn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        [quantize_2d(Quant::Q2TiledP, wg, inter, hidden).1, quantize_2d(Quant::Q2TiledP, wu, inter, hidden).1, quantize_2d(Quant::Q4TiledP, &wd, hidden, inter).1]
-                    } else {
-                        n_gptq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let pr = tm::pad_rows(ce);
-                        if scratch_dev.as_ref().is_none_or(|(cap, _)| *cap < pr) {
-                            // grow to the layer's busiest expert at once
-                            let want = tm::pad_rows(cmax_of(&lists).max(ce));
-                            scratch_dev = Some((want, wgpu_bufs::Bufs::new(c, want, hidden, inter)));
-                        }
-                        let bufs = &scratch_dev.as_ref().unwrap().1;
-                        let ts = Instant::now();
-                        let mut xe = vec![0f32; ce * hidden];
-                        xe.par_chunks_rows(hidden, wthreads, |r, row| {
-                            let t = lists[e][r] as usize;
-                            for (d, &s) in row.iter_mut().zip(&lr[t * width..t * width + hidden]) {
-                                *d = cortiq_core::quant::f16_to_f32(s);
-                            }
-                        });
-                        to::write(c, &bufs.x, &xe);
-                        drop(xe);
-                        // gate/up: Hessian of the routed rows, fold, q2tp sweeps
-                        let hid = cortiq_engine::gpu::gram_alloc(hidden).ok_or_else(|| anyhow::anyhow!("gram alloc"))?;
-                        anyhow::ensure!(cortiq_engine::gpu::gram_add_dev(hid, &bufs.x, ce), "gram");
-                        let hgu = cortiq_engine::gpu::gram_read(hid).ok_or_else(|| anyhow::anyhow!("gram read"))?;
-                        tim[0] += ts.elapsed().as_secs_f64();
-                        let ts = Instant::now();
-                        let fid = cortiq_engine::gpu::gptq_fold_dev(hid, hidden, o.lambda).ok_or_else(|| anyhow::anyhow!("fold"))?;
-                        let (dead, hdiag, _) = cortiq_engine::gpu::gptq_fold_info(fid).unwrap_or_default();
-                        tim[1] += ts.elapsed().as_secs_f64();
-                        let ts = Instant::now();
-                        let mut gb = gptq_quantize_q2tp_dev(wg, inter, hidden, fid, &dead, &hdiag, wthreads).ok_or_else(|| anyhow::anyhow!("q2tp sweep"))?;
-                        let mut ub = gptq_quantize_q2tp_dev(wu, inter, hidden, fid, &dead, &hdiag, wthreads).ok_or_else(|| anyhow::anyhow!("q2tp sweep"))?;
-                        cortiq_engine::gpu::gptq_fold_free(fid);
-                        // debias: H·w for every gate/up row in one GEMM [W_g; W_u]·H
-                        let h32: Vec<f32> = hgu.iter().map(|&v| v as f32).collect();
-                        drop(hgu);
-                        let hw = gemm_rows_square(&gu, 2 * inter, hidden, &h32, wthreads);
-                        q2tp_debias_rows(&mut gb, wg, inter, hidden, &hw[..inter * hidden], wthreads);
-                        q2tp_debias_rows(&mut ub, wu, inter, hidden, &hw[inter * hidden..], wthreads);
-                        tim[2] += ts.elapsed().as_secs_f64();
-                        let ts = Instant::now();
-                        // down: input silu(X·W_gᵀ)⊙(X·W_uᵀ) from the full-precision planes
-                        let (pg, pu) = (tm::f16_from_f32(c, wg), tm::f16_from_f32(c, wu));
-                        tm::plane_linear(c, &pg, &bufs.x, &bufs.act16, &bufs.yg, ce, inter, hidden, 1.0).ok_or_else(|| anyhow::anyhow!("gemm"))?;
-                        tm::plane_linear(c, &pu, &bufs.x, &bufs.act16, &bufs.yu, ce, inter, hidden, 1.0).ok_or_else(|| anyhow::anyhow!("gemm"))?;
-                        to::run(c, &[to::elt(c, "swiglu_fwd", ce * inter, &bufs.yg, &bufs.yu, Some(&bufs.yd), None, None, None).ok_or_else(|| anyhow::anyhow!("swiglu"))?]);
-                        tim[3] += ts.elapsed().as_secs_f64();
-                        let ts = Instant::now();
-                        let did = cortiq_engine::gpu::gram_alloc(inter).ok_or_else(|| anyhow::anyhow!("gram alloc"))?;
-                        anyhow::ensure!(cortiq_engine::gpu::gram_add_dev(did, &bufs.yd, ce), "gram");
-                        let fd = cortiq_engine::gpu::gptq_fold_dev(did, inter, o.lambda).ok_or_else(|| anyhow::anyhow!("fold"))?;
-                        let (dd, _, _) = cortiq_engine::gpu::gptq_fold_info(fd).unwrap_or_default();
-                        let db = gptq_quantize_q4tp_dev(&wd, hidden, inter, fd, &dd).ok_or_else(|| anyhow::anyhow!("q4tp sweep"))?;
-                        cortiq_engine::gpu::gptq_fold_free(fd);
-                        tim[4] += ts.elapsed().as_secs_f64();
-                        [gb, ub, db]
-                    };
-                    *results[e].lock().unwrap() = Some(enc);
-                }
-                let mut t = timers.lock().unwrap();
-                for (a, b) in t.iter_mut().zip(tim) {
-                    *a += b;
-                }
-                Ok(())
-            };
-            std::thread::scope(|sc| -> anyhow::Result<()> {
-                let hs: Vec<_> = (0..workers).map(|_| sc.spawn(&worker)).collect();
-                for h in hs {
-                    h.join().map_err(|_| anyhow::anyhow!("expert worker panicked"))??;
-                }
-                Ok(())
-            })?;
-            let tim = *timers.lock().unwrap();
-            stats.0 += n_gptq.into_inner();
-            stats.1 += n_rtn.into_inner();
+            // stage seconds summed over workers: inputs (gather, grams, down input), gate/up fold, q2tp sweeps + debias, down fold, q4tp sweep
+            let mut tim = [0f64; 5];
             let te = &cmodel.tensors;
-            for (e, slot) in results.into_iter().enumerate() {
-                let [gate_b, up_b, down_b] = slot.into_inner().unwrap().ok_or_else(|| anyhow::anyhow!("expert {e} missing"))?;
-                let (gi, ui, di) = layer_dirs[li][e];
-                out.push(&te[gi].name, TensorDtype::Q2TiledP, &te[gi].shape, &gate_b)?;
-                out.push(&te[ui].name, TensorDtype::Q2TiledP, &te[ui].shape, &up_b)?;
-                out.push(&te[di].name, TensorDtype::Q4TiledP, &te[di].shape, &down_b)?;
+
+            if patch.is_none() {
+                // routing: top-k of the logits per token
+                let mut lists: Vec<Vec<u32>> = vec![Vec::new(); ne];
+                let mut lg = vec![0f32; ne];
+                for t in 0..n {
+                    for (e, v) in lg.iter_mut().enumerate() {
+                        *v = cortiq_core::quant::f16_to_f32(lr[t * width + hidden + e]);
+                    }
+                    let mut ord: Vec<usize> = (0..ne).collect();
+                    ord.select_nth_unstable_by(top_k - 1, |&a, &b| lg[b].partial_cmp(&lg[a]).unwrap_or(std::cmp::Ordering::Equal));
+                    for &e in &ord[..top_k] {
+                        lists[e].push(t as u32);
+                    }
+                }
+                {
+                    let mut cnt: Vec<usize> = lists.iter().map(Vec::len).collect();
+                    cnt.sort_unstable();
+                    eprintln!(
+                        "  layer {li}: routed rows per expert min {} median {} max {}; {} experts under {} rows",
+                        cnt[0],
+                        cnt[ne / 2],
+                        cnt[ne - 1],
+                        cnt.iter().filter(|&&v| v < o.min_rows).count(),
+                        o.min_rows
+                    );
+                }
+                let (gst, gm) = find(ROUTED[0])?;
+                let (dst, dm) = find(ROUTED[1])?;
+                anyhow::ensure!(gm.shape == [ne, 2 * inter, hidden] && dm.shape == [ne, hidden, inter], "layer {li}: unexpected expert layout {:?} / {:?}", gm.shape, dm.shape);
+                let gbytes = gst.bytes(gm);
+                let dbytes = dst.bytes(dm);
+                let esz = |shape: &[usize]| shape[1] * shape[2] * 2; // bf16
+                let (gsz, dsz) = (esz(&gm.shape), esz(&dm.shape));
+                // experts in parallel: each worker owns its device scratch and a
+                // share of the host threads; results are pushed in expert order
+                let workers = std::env::var("CMF_MOE_WORKERS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4).clamp(1, 16);
+                let wthreads = (o.threads / workers).max(1);
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                let results: Vec<std::sync::Mutex<Option<[Vec<u8>; 3]>>> = (0..ne).map(|_| std::sync::Mutex::new(None)).collect();
+                let timers = std::sync::Mutex::new([0f64; 5]);
+                let (n_gptq, n_rtn) = (std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0));
+                let worker = || -> anyhow::Result<()> {
+                    let mut wt = [0f64; 5];
+                    let mut bufs: Option<wgpu_bufs::Bufs> = None;
+                    loop {
+                        let e = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if e >= ne {
+                            break;
+                        }
+                        let gu = to_f32(&gm.dtype, &gbytes[e * gsz..(e + 1) * gsz])?;
+                        let wd = to_f32(&dm.dtype, &dbytes[e * dsz..(e + 1) * dsz])?;
+                        let (wg, wu) = gu.split_at(inter * hidden);
+                        let enc = if lists[e].len() < o.min_rows {
+                            n_rtn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            [quantize_2d(Quant::Q2TiledP, wg, inter, hidden).1, quantize_2d(Quant::Q2TiledP, wu, inter, hidden).1, quantize_2d(Quant::Q4TiledP, &wd, hidden, inter).1]
+                        } else {
+                            n_gptq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let b = bufs.get_or_insert_with(|| wgpu_bufs::Bufs::new(c, CHUNK, hidden, inter));
+                            encode_expert(c, b, lr, width, hidden, &lists[e], wg, wu, &wd, inter, o.lambda, wthreads, &mut wt)?
+                        };
+                        *results[e].lock().unwrap() = Some(enc);
+                    }
+                    let mut t = timers.lock().unwrap();
+                    for (a, b) in t.iter_mut().zip(wt) {
+                        *a += b;
+                    }
+                    Ok(())
+                };
+                std::thread::scope(|sc| -> anyhow::Result<()> {
+                    let hs: Vec<_> = (0..workers).map(|_| sc.spawn(&worker)).collect();
+                    for h in hs {
+                        h.join().map_err(|_| anyhow::anyhow!("expert worker panicked"))??;
+                    }
+                    Ok(())
+                })?;
+                tim = *timers.lock().unwrap();
+                stats.0 += n_gptq.into_inner();
+                stats.1 += n_rtn.into_inner();
+                for (e, slot) in results.into_iter().enumerate() {
+                    let [gate_b, up_b, down_b] = slot.into_inner().unwrap().ok_or_else(|| anyhow::anyhow!("expert {e} missing"))?;
+                    let (gi, ui, di) = layer_dirs[li][e];
+                    emit(&te[gi].name, TensorDtype::Q2TiledP, &te[gi].shape, gate_b)?;
+                    emit(&te[ui].name, TensorDtype::Q2TiledP, &te[ui].shape, up_b)?;
+                    emit(&te[di].name, TensorDtype::Q4TiledP, &te[di].shape, down_b)?;
+                }
             }
+
+            // the shared expert: every token is its input
+            let mut t_shared = 0.0;
+            if let Some((gi, ui, di)) = shared_dirs[li] {
+                let ts = Instant::now();
+                let is = te[gi].shape[0];
+                let get = |part: &str, shape: [usize; 2]| -> anyhow::Result<Vec<f32>> {
+                    let (st, m) = find(part)?;
+                    anyhow::ensure!(m.shape == shape, "layer {li}: {part} has shape {:?}, want {shape:?}", m.shape);
+                    to_f32(&m.dtype, st.bytes(m))
+                };
+                let wg = get(SHARED[0], [is, hidden])?;
+                let wu = get(SHARED[1], [is, hidden])?;
+                let wd = get(SHARED[2], [hidden, is])?;
+                let all: Vec<u32> = (0..n as u32).collect();
+                let mut st = [0f64; 5];
+                let [gate_b, up_b, down_b] = encode_expert(c, &main_bufs, lr, width, hidden, &all, &wg, &wu, &wd, is, o.lambda, o.threads, &mut st)?;
+                emit(&te[gi].name, TensorDtype::Q2TiledP, &te[gi].shape, gate_b)?;
+                emit(&te[ui].name, TensorDtype::Q2TiledP, &te[ui].shape, up_b)?;
+                emit(&te[di].name, TensorDtype::Q4TiledP, &te[di].shape, down_b)?;
+                t_shared = ts.elapsed().as_secs_f64();
+            }
+
             // shards this layer was the last user of
+            let keep: Vec<String> = if li + 1 < nl { layer_shards(li + 1)? } else { Vec::new() };
             for sh in shards.keys() {
-                let next_needs = li + 1 < nl && [src_name(li + 1, "gate_up_proj")?.1, src_name(li + 1, "down_proj")?.1].contains(sh);
-                if !next_needs {
+                if !keep.contains(sh) {
                     let _ = std::fs::remove_file(scratch.join(sh));
                 }
             }
             eprintln!(
-                "  layer {li}: {n} tokens, experts GPTQ {} / RTN {} so far, {:.0}s ({:.0}s total); fetch wait {t_fetch:.1}s, gram {:.1} fold {:.1} q2tp {:.1} down-in {:.1} down {:.1}",
+                "  layer {li}: {n} tokens, experts GPTQ {} / RTN {} so far, {:.0}s ({:.0}s total); fetch wait {t_fetch:.1}s, inputs {:.1} fold {:.1} q2tp {:.1} down fold {:.1} q4tp {:.1}, shared {t_shared:.1}s",
                 stats.0,
                 stats.1,
                 tl.elapsed().as_secs_f64(),
@@ -320,6 +349,15 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
             }
         }
     }
+    drop(emit);
+    if let Some(path) = patch {
+        drop(target);
+        let n = patches.len();
+        CmfModel::recode_entries_in_place(path, &patches).map_err(|e| anyhow::anyhow!("patch {path}: {e}"))?;
+        eprintln!("patched {n} shared-expert tensors in place in {path} in {:.0}s", t0.elapsed().as_secs_f64());
+        return Ok(());
+    }
+    let mut out = out.expect("stream writer in full mode");
     for (slot, e) in cmodel.tensors.iter().enumerate() {
         if !expert_slots.contains(&slot) {
             out.push_bounded(&e.name, e.dtype, &e.shape, cmodel.entry_bytes(e), 1 << 28)?;
@@ -330,7 +368,7 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     let mut prov = header.provenance.clone().unwrap_or_else(|| serde_json::json!({}));
     prov["weight_quant"] = serde_json::json!("q2tp");
     prov["gptq_moe"] = serde_json::json!({
-        "experts": "gate/up q2tp (placed, debiased), down q4tp",
+        "experts": "routed and shared: gate/up q2tp (placed, debiased), down q4tp",
         "calibration_tokens": ntok,
         "window": o.window,
         "lambda": o.lambda,
@@ -346,33 +384,105 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmax_of(lists: &[Vec<u32>]) -> usize {
-    lists.iter().map(Vec::len).max().unwrap_or(0).max(1)
-}
-
-trait ParRows {
-    fn par_chunks_rows(&mut self, width: usize, threads: usize, f: impl Fn(usize, &mut [f32]) + Sync);
-}
-
-impl ParRows for Vec<f32> {
-    /// `f(row, row_slice)` over the `width`-wide rows, split across `threads`.
-    fn par_chunks_rows(&mut self, width: usize, threads: usize, f: impl Fn(usize, &mut [f32]) + Sync) {
-        let rows = self.len() / width;
-        let per = rows.div_ceil(threads.max(1)).max(1);
-        let f = &f;
-        std::thread::scope(|s| {
-            for (ci, chunk) in self.chunks_mut(per * width).enumerate() {
-                s.spawn(move || {
-                    for (k, row) in chunk.chunks_exact_mut(width).enumerate() {
-                        f(ci * per + k, row);
-                    }
-                });
+/// GPTQ of one expert from its input rows (`rows` index the captured
+/// `width`-wide f16 rows `lr`, input first): both input Hessians accumulate
+/// over `CHUNK`-row device passes, then gate/up fold + q2tp sweeps + debias,
+/// down fold + q4tp sweep. Returns the gate, up and down payloads.
+#[allow(clippy::too_many_arguments)]
+fn encode_expert(
+    c: &Ctx,
+    bufs: &wgpu_bufs::Bufs,
+    lr: &[u16],
+    width: usize,
+    hidden: usize,
+    rows: &[u32],
+    wg: &[f32],
+    wu: &[f32],
+    wd: &[f32],
+    inter: usize,
+    lambda: f64,
+    threads: usize,
+    tim: &mut [f64; 5],
+) -> anyhow::Result<[Vec<u8>; 3]> {
+    use cortiq_engine::gpu;
+    let ts = Instant::now();
+    let hid = gpu::gram_alloc(hidden).ok_or_else(|| anyhow::anyhow!("gram alloc"))?;
+    let did = gpu::gram_alloc(inter).ok_or_else(|| anyhow::anyhow!("gram alloc"))?;
+    let (pg, pu) = (tm::f16_from_f32(c, wg), tm::f16_from_f32(c, wu));
+    let mut xe = vec![0f32; CHUNK.min(rows.len()) * hidden];
+    for part in rows.chunks(CHUNK) {
+        let m = part.len();
+        let xs = &mut xe[..m * hidden];
+        par_rows(xs, hidden, threads, |r, row| {
+            let t = part[r] as usize;
+            for (d, &s) in row.iter_mut().zip(&lr[t * width..t * width + hidden]) {
+                *d = cortiq_core::quant::f16_to_f32(s);
             }
         });
+        to::write(c, &bufs.x, xs);
+        anyhow::ensure!(gpu::gram_add_dev(hid, &bufs.x, m), "gram");
+        tm::plane_linear(c, &pg, &bufs.x, &bufs.act16, &bufs.yg, m, inter, hidden, 1.0).ok_or_else(|| anyhow::anyhow!("gemm"))?;
+        tm::plane_linear(c, &pu, &bufs.x, &bufs.act16, &bufs.yu, m, inter, hidden, 1.0).ok_or_else(|| anyhow::anyhow!("gemm"))?;
+        to::run(c, &[to::elt(c, "swiglu_fwd", m * inter, &bufs.yg, &bufs.yu, Some(&bufs.yd), None, None, None).ok_or_else(|| anyhow::anyhow!("swiglu"))?]);
+        anyhow::ensure!(gpu::gram_add_dev(did, &bufs.yd, m), "gram");
     }
+    drop(xe);
+    let hgu = gpu::gram_read(hid).ok_or_else(|| anyhow::anyhow!("gram read"))?;
+    tim[0] += ts.elapsed().as_secs_f64();
+    let ts = Instant::now();
+    let fid = gpu::gptq_fold_dev(hid, hidden, lambda).ok_or_else(|| anyhow::anyhow!("fold"))?;
+    let (dead, hdiag, _) = gpu::gptq_fold_info(fid).unwrap_or_default();
+    tim[1] += ts.elapsed().as_secs_f64();
+    let ts = Instant::now();
+    let mut gb = gptq_quantize_q2tp_dev(wg, inter, hidden, fid, &dead, &hdiag, threads).ok_or_else(|| anyhow::anyhow!("q2tp sweep"))?;
+    let mut ub = gptq_quantize_q2tp_dev(wu, inter, hidden, fid, &dead, &hdiag, threads).ok_or_else(|| anyhow::anyhow!("q2tp sweep"))?;
+    gpu::gptq_fold_free(fid);
+    // debias: H·w for every gate/up row from two GEMMs W·H
+    let h32: Vec<f32> = hgu.iter().map(|&v| v as f32).collect();
+    drop(hgu);
+    let hwg = gemm_rows_square(wg, inter, hidden, &h32, threads);
+    q2tp_debias_rows(&mut gb, wg, inter, hidden, &hwg, threads);
+    drop(hwg);
+    let hwu = gemm_rows_square(wu, inter, hidden, &h32, threads);
+    q2tp_debias_rows(&mut ub, wu, inter, hidden, &hwu, threads);
+    tim[2] += ts.elapsed().as_secs_f64();
+    let ts = Instant::now();
+    let fd = gpu::gptq_fold_dev(did, inter, lambda).ok_or_else(|| anyhow::anyhow!("fold"))?;
+    let (dd, _, _) = gpu::gptq_fold_info(fd).unwrap_or_default();
+    tim[3] += ts.elapsed().as_secs_f64();
+    let ts = Instant::now();
+    let db = gptq_quantize_q4tp_dev(wd, hidden, inter, fd, &dd).ok_or_else(|| anyhow::anyhow!("q4tp sweep"))?;
+    gpu::gptq_fold_free(fd);
+    tim[4] += ts.elapsed().as_secs_f64();
+    Ok([gb, ub, db])
 }
 
-/// Per-worker device scratch of the expert pass.
+fn find_in<'a>(
+    shards: &'a HashMap<String, crate::convert::SafeTensors>,
+    name: &str,
+    sh: &str,
+) -> anyhow::Result<(&'a crate::convert::SafeTensors, &'a crate::convert::TensorMeta)> {
+    let st = shards.get(sh).ok_or_else(|| anyhow::anyhow!("shard {sh} not open"))?;
+    st.tensors.iter().find(|m| m.name == name).map(|m| (st, m)).ok_or_else(|| anyhow::anyhow!("{name} not in {sh}"))
+}
+
+/// `f(row, row_slice)` over the `width`-wide rows of `v`, split across `threads`.
+fn par_rows(v: &mut [f32], width: usize, threads: usize, f: impl Fn(usize, &mut [f32]) + Sync) {
+    let rows = v.len() / width;
+    let per = rows.div_ceil(threads.max(1)).max(1);
+    let f = &f;
+    std::thread::scope(|s| {
+        for (ci, chunk) in v.chunks_mut(per * width).enumerate() {
+            s.spawn(move || {
+                for (k, row) in chunk.chunks_exact_mut(width).enumerate() {
+                    f(ci * per + k, row);
+                }
+            });
+        }
+    });
+}
+
+/// Device scratch of the expert pass (`CHUNK` rows).
 mod wgpu_bufs {
     use cortiq_engine::gpu_wgpu::{train_mm as tm, train_ops as to};
     pub struct Bufs {
@@ -384,6 +494,7 @@ mod wgpu_bufs {
     }
     impl Bufs {
         pub fn new(c: &cortiq_engine::gpu_wgpu::Ctx, rows: usize, hidden: usize, inter: usize) -> Self {
+            let rows = tm::pad_rows(rows);
             Bufs {
                 x: to::zeros(c, rows * hidden),
                 act16: tm::f16_buf(c, rows * hidden),
