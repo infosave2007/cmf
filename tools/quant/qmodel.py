@@ -26,6 +26,7 @@ same kernels, so they produce bit-identical numbers; boundary activations live o
 """
 import math
 import os
+import warnings
 
 import numpy as np
 import torch
@@ -167,12 +168,18 @@ class Arch:
 
 
 # ----------------------------------------------------------------------------- weights
-def _pinned(arr, pin):
-    """an owned (writable) host copy, page-locked when it will feed a device"""
+def _host(arr, pin):
+    """host tensor for a weight section: a page-locked copy when it will be streamed to the
+    device every step (pin), otherwise zero-copy over the array — for file sections that is
+    the read-only mmap, so an unpinned 54 GB teacher costs page cache, not RAM"""
+    arr = np.ascontiguousarray(arr)
     if pin and torch.cuda.is_available():
-        return torch.from_numpy(np.ascontiguousarray(arr)).pin_memory() if np.asarray(arr).flags.writeable \
-            else torch.from_numpy(np.array(arr)).pin_memory()
-    return torch.from_numpy(np.array(arr))
+        return torch.from_numpy(np.array(arr)).pin_memory()
+    if not arr.flags.writeable:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)    # never written through
+            return torch.from_numpy(arr)
+    return torch.from_numpy(arr)
 
 
 class QLinear:
@@ -189,18 +196,18 @@ class QLinear:
         self.dev = {}
         if self.dtype in TILED:
             t = self.tiled = cc.Tiled(self.dtype, payload, self.rows, self.cols)
-            self.host = {"codes": _pinned(t.codes, pin), "s0": _pinned(t.scales(), pin),
-                         "k": _pinned(t.rung_power(), pin)}
+            self.host = {"codes": _host(t.codes, pin), "s0": _host(t.scales(), pin),
+                         "k": _host(t.rung_power(), pin)}
             self.st = cc.f16_val(t.st).astype(np.float32)
             self.trainable = bool(train)
             self.step = bool(train and step)
         elif self.dtype == "Q8_2f":
             q = self.q8 = cc.Q8_2f(payload, self.rows, self.cols)
-            self.host = {"q": _pinned(q.q, pin), "rs": _pinned(q.rs, pin), "cs": _pinned(q.cs, pin)}
+            self.host = {"q": _host(q.q, pin), "rs": _host(q.rs, pin), "cs": _host(q.cs, pin)}
             self.trainable, self.step = bool(train), False
         elif self.dtype in FLOATS:
             raw = np.asarray(payload).view("<u2" if self.dtype != "F32" else "<f4").reshape(self.rows, self.cols)
-            self.host = {"w": _pinned(raw.view(np.int16) if self.dtype != "F32" else raw, pin)}
+            self.host = {"w": _host(raw.view(np.int16) if self.dtype != "F32" else raw, pin)}
             self.trainable, self.step = False, False
         else:
             raise SystemExit(f"{name}: dtype {self.dtype} not supported by the refit tools")
@@ -744,13 +751,14 @@ class Model:
         self.act_device = torch.device(act_device or ("cpu" if self.stream_mode else dev))
         self.vchunk = vchunk
         self.log = log
-        pin = pin and self.dev.type == "cuda"
+        # page-locked host copies only pay off for what is streamed every step
+        pin = pin and self.dev.type == "cuda" and self.stream_mode
         self.pin = pin
         self.layers = [Layer(A, l, cmf, train, step, train_norms, pin) for l in range(A.n_layers)]
         self.final = Gain(A.final_norm, cmf.tensor(A.final_norm), cmf.payload(A.final_norm), A.norm_offset,
                           train=train_norms)
         self.embed = Embed(cmf, A.embed_name, A.embed_mult)
-        self.head = Head(cmf, A.head_name, A.logit_mult, pin)
+        self.head = Head(cmf, A.head_name, A.logit_mult, pin=False)
         for x in self.layers:
             x.init_params(self.dev)
         self.final.init_params(self.dev)

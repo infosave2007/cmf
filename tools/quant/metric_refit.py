@@ -63,7 +63,9 @@ def get_args(argv=None):
     ap.add_argument("--warmup", type=int, default=8)
     ap.add_argument("--epochs", type=float, default=1.0)
     ap.add_argument("--bs", type=int, default=8)
-    ap.add_argument("--mb", type=int, default=0, help="windows per micro-batch (default: --bs)")
+    ap.add_argument("--mb", type=int, default=0, help="windows per training micro-batch (default: --bs)")
+    ap.add_argument("--eval-mb", type=int, default=8, help="windows per micro-batch of the forward-only passes "
+                    "(teacher cache, held-out evals)")
     ap.add_argument("--eval-every", type=int, default=16)
     ap.add_argument("--max-steps", type=int, default=0, help="stop after N steps (smoke tests)")
     ap.add_argument("--seed", type=int, default=0)
@@ -190,10 +192,11 @@ def main(argv=None):
         return qmodel.Model(cmf, dev, residency=residency, act_device=args.act_device, vchunk=args.vchunk,
                             log=log, **kw)
 
-    # the teacher (a float reference, 2-4x the student's bytes) always streams
+    # the teacher (a float reference, 2-4x the student's bytes) streams straight from the
+    # page cache: one pass per block, nothing pinned
     teacher = calib.teacher_cache(args.teacher_cache or os.path.join(args.out, "teacher"), args.teacher, corpora,
-                                  args.wl, args.topk, lambda c: make(c, "stream"), block=args.teacher_block,
-                                  mb=args.mb, log=log)
+                                  args.wl, args.topk, lambda c: make(c, "stream", pin=False),
+                                  block=args.teacher_block, mb=args.eval_mb, log=log)
     src = cmfio.CmfFile(args.model)
     model = make(src, train=True, step=args.step, train_norms=not args.no_norm)
     lins = list(model.linears())
@@ -230,7 +233,7 @@ def main(argv=None):
         step, hist, best, perm, t_train = s["step"], s["hist"], s["best"], s["perm"], s.get("t_train", 0.0)
         log(f"resumed at step {step}")
     if not hist:
-        hkl, hce, per = held_eval(model, held_w, teacher, owner, len(corpora), args.mb, args.wl)
+        hkl, hce, per = held_eval(model, held_w, teacher, owner, len(corpora), args.eval_mb, args.wl)
         hist.append({"step": 0, "held_kl": hkl, "held_ce": hce, "held_ce_corpus": per})
         best = (hce, 0, snapshot(model))
         log(f"step 0: held-out KL {hkl:.5f} CE {hce:.5f} (teacher {teacher['meta']['held_ce']:.5f}); "
@@ -254,7 +257,7 @@ def main(argv=None):
         run_kl += kl / count
         t_train += time.time() - t0
         if step % args.eval_every == 0 or step == total:
-            hkl, hce, per = held_eval(model, held_w, teacher, owner, len(corpora), args.mb, args.wl)
+            hkl, hce, per = held_eval(model, held_w, teacher, owner, len(corpora), args.eval_mb, args.wl)
             n_since = args.eval_every if step % args.eval_every == 0 else step % args.eval_every
             hist.append({"step": step, "train_kl": run_kl / n_since, "held_kl": hkl, "held_ce": hce,
                          "held_ce_corpus": per})
@@ -274,7 +277,7 @@ def main(argv=None):
                         **{f"b|{k}": v for k, v in snap["b"].items()}, **{f"n|{k}": v for k, v in snap["n"].items()})
     paths, eff, st = write_payloads(model, snap, os.path.join(args.out, "raw"))
     load_values(model, eff)
-    skl, sce, _ = held_eval(model, held_w, teacher, owner, len(corpora), args.mb, args.wl)
+    skl, sce, _ = held_eval(model, held_w, teacher, owner, len(corpora), args.eval_mb, args.wl)
     log(f"f16-snapped checkpoint: held-out KL {skl:.5f} CE {sce:.5f} (unsnapped {best[0]:.5f}); "
         f"lo changed in {st['rows_lo_changed']}/{st['rows']} rows, step in {st['rows_step_changed']}")
     man = {"args": vars(args), "corpora": calib.describe(corpora), "hist": hist, "best_step": best[1],
