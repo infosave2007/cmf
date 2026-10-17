@@ -17,6 +17,8 @@ pub mod egemma2_vision;
 pub(crate) mod expert_store;
 pub mod fcd;
 pub mod fcd_ops;
+#[cfg(feature = "gpu")]
+pub mod nvg_train;
 pub mod f32_backend;
 pub mod g3n;
 pub mod gptq_capture;

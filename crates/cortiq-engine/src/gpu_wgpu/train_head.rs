@@ -72,10 +72,109 @@ fn kl_rows(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index
         LG[base + id] = LG[base + id] - TP[row * p.k + q] * p.coef;
     }
 }
+
+// Teacher top-k per row: each thread keeps its best 8 of a strided scan,
+// the 2048 candidates are bitonic-sorted in shared memory, the first k
+// are written with probabilities renormalized over them.
+var<workgroup> cv: array<f32, 2048>;
+var<workgroup> ci: array<u32, 2048>;
+@compute @workgroup_size(256)
+fn topk_rows(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let row = wg.x + wg.y * 65535u;
+    if (row >= p.ntok) { return; }
+    let base = row * p.v;
+    var bv: array<f32, 8>;
+    var bi: array<u32, 8>;
+    for (var q = 0u; q < 8u; q = q + 1u) { bv[q] = -3.0e38; bi[q] = 0u; }
+    for (var j = t; j < p.v; j = j + 256u) {
+        let x = LG[base + j];
+        if (x > bv[7]) {
+            var pos = 7u;
+            loop {
+                if (pos == 0u || bv[pos - 1u] >= x) { break; }
+                bv[pos] = bv[pos - 1u];
+                bi[pos] = bi[pos - 1u];
+                pos = pos - 1u;
+            }
+            bv[pos] = x;
+            bi[pos] = j;
+        }
+    }
+    for (var q = 0u; q < 8u; q = q + 1u) { cv[t * 8u + q] = bv[q]; ci[t * 8u + q] = bi[q]; }
+    workgroupBarrier();
+    // bitonic sort, descending
+    for (var kk = 2u; kk <= 2048u; kk = kk << 1u) {
+        for (var jj = kk >> 1u; jj > 0u; jj = jj >> 1u) {
+            for (var e = t; e < 2048u; e = e + 256u) {
+                let x = e ^ jj;
+                if (x > e) {
+                    let desc = (e & kk) == 0u;
+                    let a = cv[e];
+                    let b = cv[x];
+                    if ((desc && a < b) || (!desc && a > b)) {
+                        cv[e] = b; cv[x] = a;
+                        let ti = ci[e]; ci[e] = ci[x]; ci[x] = ti;
+                    }
+                }
+            }
+            workgroupBarrier();
+        }
+    }
+    // renormalized probabilities over the top k (softmax restricted to them)
+    let mx = cv[0];
+    var s = 0.0;
+    for (var q = t; q < p.k; q = q + 256u) { s = s + exp(cv[q] - mx); }
+    red[t] = s;
+    workgroupBarrier();
+    for (var st = 128u; st > 0u; st = st >> 1u) {
+        if (t < st) { red[t] = red[t] + red[t + st]; }
+        workgroupBarrier();
+    }
+    let z = red[0];
+    for (var q = t; q < p.k; q = q + 256u) {
+        TID[row * p.k + q] = ci[q];
+        TP[row * p.k + q] = exp(cv[q] - mx) / z;
+    }
+}
 "#;
 
 fn module(c: &Ctx) -> Option<&'static train_ops::Mod> {
-    train_ops::module(c, "train_head", SRC, &["kl_rows"])
+    train_ops::module(c, "train_head", SRC, &["kl_rows", "topk_rows"])
+}
+
+/// Teacher top-k of `ntok` normed hidden rows: (ids, renormalized probs),
+/// `[ntok][k]` each, k ≤ 2048.
+pub fn topk(c: &Ctx, head: &Head, s: &HeadScratch, x: &wgpu::Buffer, ntok: usize, k: usize) -> Option<(Vec<u32>, Vec<f32>)> {
+    let (v, hs) = (head.v, head.hs);
+    let m = module(c)?;
+    let mut ids = Vec::with_capacity(ntok * k);
+    let mut probs = Vec::with_capacity(ntok * k);
+    let mut r0 = 0;
+    while r0 < ntok {
+        let rows = (ntok - r0).min(s.chunk);
+        let xin = train_ops::zeros(c, train_mm::pad_rows(rows) * hs);
+        let tidc = train_ops::zeros(c, rows * k);
+        let tpc = train_ops::zeros(c, rows * k);
+        let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("topk_in") });
+        enc.copy_buffer_to_buffer(x, (r0 * hs * 4) as u64, &xin, 0, (rows * hs * 4) as u64);
+        super::submit(c, enc.finish());
+        let ops = vec![
+            Op::D(train_mm::cvt(c, &xin, None, &s.act, rows, hs, 1.0)?),
+            Op::M(train_mm::mm(c, &head.w, &s.act, &s.logits, rows, v, hs, 1.0)?),
+            Op::D(Disp {
+                pipe: &m.p["topk_rows"],
+                uni: vec![rows as u32, v as u32, k as u32, 0, 0, 0, 0, 0],
+                bufs: vec![(1, &s.logits), (2, &tidc), (3, &tpc)],
+                grid: train_ops::wg_fold(rows),
+            }),
+        ];
+        train_mm::run(c, &ops);
+        let t_raw = train_ops::download(c, &tidc, rows * k)?;
+        ids.extend(t_raw.iter().map(|f| f.to_bits()));
+        probs.extend(train_ops::download(c, &tpc, rows * k)?);
+        r0 += rows;
+    }
+    Some((ids, probs))
 }
 
 /// The KL rows dispatch: loss per token into `loss`, logits replaced by

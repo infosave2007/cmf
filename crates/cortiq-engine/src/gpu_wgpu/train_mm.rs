@@ -83,6 +83,70 @@ fn colsum_prod(@builtin(global_invocation_id) g: vec3<u32>) {
     OUT[col] = OUT[col] + acc;
 }
 
+// Small dense f32 linear: OUT[m][r] (+)= A[m][k] · B[r][k]ᵀ  (rows flag: accumulate)
+// one thread per output element; for the few-row projections (GDN a/b).
+@compute @workgroup_size(256)
+fn dense_fwd(@builtin(global_invocation_id) g: vec3<u32>) {
+    let i = idx(g);
+    if (i >= p.m * p.r) { return; }
+    let row = i / p.r;
+    let o = i % p.r;
+    var acc = 0.0;
+    for (var j = 0u; j < p.k; j = j + 1u) { acc = acc + A[row * p.k + j] * B[o * p.k + j]; }
+    if (p.rows == 1u) { OUT[i] = OUT[i] + acc; } else { OUT[i] = acc; }
+}
+
+// OUT[m][k] += A[m][r] · B[r][k]   (input gradient of dense_fwd)
+@compute @workgroup_size(256)
+fn dense_bwd(@builtin(global_invocation_id) g: vec3<u32>) {
+    let i = idx(g);
+    if (i >= p.m * p.k) { return; }
+    let row = i / p.k;
+    let j = i % p.k;
+    var acc = 0.0;
+    for (var o = 0u; o < p.r; o = o + 1u) { acc = acc + A[row * p.r + o] * B[o * p.k + j]; }
+    OUT[i] = OUT[i] + acc;
+}
+
+// Per-head [q(hd); gate(hd)] rows of A ([m][heads][2hd]) -> OUT = q, B = gate
+// (rows flag 0); rows flag 1: the reverse (OUT, B -> A).  k = heads·hd, r = hd.
+@compute @workgroup_size(256)
+fn split_qg(@builtin(global_invocation_id) g: vec3<u32>) {
+    let i = idx(g);
+    if (i >= p.m * p.k) { return; }
+    let row = i / p.k;
+    let c = i % p.k;
+    let h = c / p.r;
+    let d = c % p.r;
+    let src = row * 2u * p.k + h * 2u * p.r + d;
+    if (p.rows == 0u) {
+        OUT[i] = A[src];
+        B[i] = A[src + p.r];
+    } else {
+        A[src] = OUT[i];
+        A[src + p.r] = B[i];
+    }
+}
+
+// Adam (no weight decay) over k entries: SRC = params, A = grads,
+// B = first moment, OUT = second moment, COL = mask (rows = 1: masked).
+// scale = lr, f1 = beta1, f2 = beta2, f3 = eps, m = step (1-based).
+@compute @workgroup_size(256)
+fn adam(@builtin(global_invocation_id) g: vec3<u32>) {
+    let i = idx(g);
+    if (i >= p.k) { return; }
+    if (p.rows == 1u && COL[i] == 0.0) { return; }
+    let gr = A[i];
+    let m1 = p.f1 * B[i] + (1.0 - p.f1) * gr;
+    let m2 = p.f2 * OUT[i] + (1.0 - p.f2) * gr * gr;
+    B[i] = m1;
+    OUT[i] = m2;
+    let t = f32(p.m);
+    let mh = m1 / (1.0 - pow(p.f1, t));
+    let vh = m2 / (1.0 - pow(p.f2, t));
+    SRC[i] = SRC[i] - p.scale * mh / (sqrt(vh) + p.f3);
+}
+
 // OUT[m][k] (+)= A[m][k]·COL[k]   (rows = 1: accumulate, 0: overwrite)
 @compute @workgroup_size(256)
 fn scale_acc(@builtin(global_invocation_id) g: vec3<u32>) {
@@ -94,7 +158,7 @@ fn scale_acc(@builtin(global_invocation_id) g: vec3<u32>) {
 "#;
 
 fn module(c: &Ctx) -> Option<&'static train_ops::Mod> {
-    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "expand", "colsum_prod", "scale_acc"])
+    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "expand", "colsum_prod", "scale_acc", "dense_fwd", "dense_bwd", "split_qg", "adam"])
 }
 
 /// One step of a trainer pass: an elementwise/reduction dispatch or a GEMM.
@@ -215,12 +279,74 @@ pub fn scale_acc<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, col: &'a wgpu::Buffer, out
     })
 }
 
+/// Small dense linear `out[m][r] (+)= a[m][k]·w[r][k]ᵀ` in f32.
+#[allow(clippy::too_many_arguments)]
+pub fn dense_fwd<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, w: &'a wgpu::Buffer, out: &'a wgpu::Buffer, m: usize, k: usize, r: usize, acc: bool) -> Option<Disp<'a>> {
+    let md = module(c)?;
+    Some(Disp {
+        pipe: &md.p["dense_fwd"],
+        uni: vec![m as u32, k as u32, 0, acc as u32, r as u32, 0, 0, 0, 0, 0, 0, 0],
+        bufs: vec![(7, a), (8, w), (9, out)],
+        grid: elt_fold(m * r),
+    })
+}
+
+/// Input gradient of [`dense_fwd`]: `dx[m][k] += dy[m][r]·w[r][k]`.
+#[allow(clippy::too_many_arguments)]
+pub fn dense_bwd<'a>(c: &'a Ctx, dy: &'a wgpu::Buffer, w: &'a wgpu::Buffer, dx: &'a wgpu::Buffer, m: usize, k: usize, r: usize) -> Option<Disp<'a>> {
+    let md = module(c)?;
+    Some(Disp {
+        pipe: &md.p["dense_bwd"],
+        uni: vec![m as u32, k as u32, 0, 0, r as u32, 0, 0, 0, 0, 0, 0, 0],
+        bufs: vec![(7, dy), (8, w), (9, dx)],
+        grid: elt_fold(m * k),
+    })
+}
+
+/// Split the per-head `[q; gate]` projection rows into q and gate
+/// (`merge` = the reverse, for the gradients).
+#[allow(clippy::too_many_arguments)]
+pub fn split_qg<'a>(c: &'a Ctx, qg: &'a wgpu::Buffer, q: &'a wgpu::Buffer, gate: &'a wgpu::Buffer, m: usize, heads: usize, hd: usize, merge: bool) -> Option<Disp<'a>> {
+    let md = module(c)?;
+    Some(Disp {
+        pipe: &md.p["split_qg"],
+        uni: vec![m as u32, (heads * hd) as u32, 0, merge as u32, hd as u32, 0, 0, 0, 0, 0, 0, 0],
+        bufs: vec![(7, qg), (8, gate), (9, q)],
+        grid: elt_fold(m * heads * hd),
+    })
+}
+
+/// One Adam update of `n` parameters (`mask` 0 = frozen entry).
+#[allow(clippy::too_many_arguments)]
+pub fn adam<'a>(c: &'a Ctx, w: &'a wgpu::Buffer, g: &'a wgpu::Buffer, m1: &'a wgpu::Buffer, m2: &'a wgpu::Buffer, mask: Option<&'a wgpu::Buffer>, n: usize, lr: f32, step: u32, b1: f32, b2: f32, eps: f32) -> Option<Disp<'a>> {
+    let md = module(c)?;
+    // The mask binding is statically used: without a mask it aliases the
+    // parameters (never read: the flag is off).
+    let bufs = vec![(1, w), (2, mask.unwrap_or(w)), (7, g), (8, m1), (9, m2)];
+    Some(Disp {
+        pipe: &md.p["adam"],
+        uni: vec![step, n as u32, 0, mask.is_some() as u32, 0, 0, 0, 0, lr.to_bits(), b1.to_bits(), b2.to_bits(), eps.to_bits()],
+        bufs,
+        grid: elt_fold(n),
+    })
+}
+
 /// `out[m][n] = act[m][k] · plane[n][k]ᵀ · oscale` on the matrix units.
 #[allow(clippy::too_many_arguments)]
 pub fn mm(c: &Ctx, plane: &wgpu::Buffer, act: &wgpu::Buffer, out: &wgpu::Buffer, m: usize, n: usize, k: usize, oscale: f32) -> Option<zi::MmCall> {
     let g = zi::default_cfg(Epi::F32);
     let a = zi::MmArgs { m: m as u32, n: n as u32, k: k as u32, ldo: n as u32, ocol: 0, arow: 0, oscale, conv: [0; 3] };
     zi::mm_call(c, g, &a, plane, act, out)
+}
+
+/// `y[ntok][n] = (x[ntok][k] · scale) · plane[n][k]ᵀ / scale` through the
+/// staging buffer `act16`: one dense frozen linear (or its transpose for
+/// the input gradient, with a gradient `scale`).
+#[allow(clippy::too_many_arguments)]
+pub fn plane_linear(c: &Ctx, plane: &wgpu::Buffer, x: &wgpu::Buffer, act16: &wgpu::Buffer, y: &wgpu::Buffer, ntok: usize, n: usize, k: usize, scale: f32) -> Option<()> {
+    let ops = vec![Op::D(cvt(c, x, None, act16, ntok, k, scale)?), Op::M(mm(c, plane, act16, y, ntok, n, k, 1.0 / scale)?)];
+    run(c, &ops);
+    Some(())
 }
 
 /// Device state of one binary low-rank path (signs as bitmaps, the metric
