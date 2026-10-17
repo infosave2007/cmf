@@ -59,12 +59,19 @@ Sizing for Qwen3.8-27B q4tp (hidden 5120, 64 layers, vocab 248320), batch 8 x 51
 
 | | host RAM | GPU |
 |---|---:|---:|
-| student body, compact (streamed) | ~18 GB pinned | 2 layers, ~0.6 GB |
-| boundary activations (65 x 8 x 512 x 5120 f32) | 5.5 GB | — |
+| student body, compact (streamed) | ~18 GB pinned (~22 GB of pinned blocks, see below) | 2 layers, ~0.6 GB |
+| boundary activations (65 x 8 x 512 x 5120 f32) | 5.5 GB (8.3 GB of pinned blocks) | — |
 | head q4tp (compact, resident) | — | ~0.8 GB |
 | per-layer working set, micro-batch 4 | — | ~2–4 GB |
 | teacher top-64 cache, 1024 windows | 0.27 GB | — |
-| teacher (f16 CMF, 54 GB, streamed once per block from the page cache) | block of 1024 windows: 11 GB | 1 layer + f16 head 2.5 GB |
+| teacher (f16 CMF, 54 GB, streamed once per block from the page cache) | block of 1024 windows: one boundary set, 11 GB (16 GB of pinned blocks), + the 11 GB embedded inputs while layer 0 runs | 1 layer + f16 head 2.5 GB |
+
+Page-locked memory comes from torch's caching host allocator, which rounds every block up to a
+power of two (an 84 MB micro-batch boundary takes a 128 MB block) and keeps freed blocks for
+reuse, so plan for the pinned-block figures, not the raw sizes. A forward-only pass (teacher
+cache, held-out evaluation, `ppl.py`, escort re-runs) replaces each boundary in place as soon as
+its successor exists and so holds one set of boundaries; a training step keeps all of them for
+the backward.
 
 ## metric_refit.py — metric genesis
 
