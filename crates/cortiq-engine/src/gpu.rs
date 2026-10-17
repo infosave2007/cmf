@@ -3743,6 +3743,35 @@ pub fn gptq_sweep_q4tp_dev(
     false
 }
 
+/// The q2tp GPTQ sweep ("placed" rule) on the device.
+pub fn gptq_sweep_q2tp_dev(
+    id: u64,
+    w: &[f32],
+    rows: usize,
+    tab: &[f32],
+    hw: &[f32],
+    chunks: &mut [u8],
+    codes: &mut [u32],
+) -> bool {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::gptq_dev::sweep_q2tp(id, w, rows, tab, hw, chunks, codes);
+    }
+    let _ = (id, w, rows, tab, hw, chunks, codes);
+    false
+}
+
+/// A device Hessian read back as a full symmetric f64 matrix, left on the
+/// device.
+pub fn gram_read(id: u64) -> Option<Vec<f64>> {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::gram::read(id);
+    }
+    let _ = id;
+    None
+}
+
 /// Free every device Hessian (an aborted calibration pass).
 pub fn gram_clear() {
     #[cfg(feature = "gpu")]

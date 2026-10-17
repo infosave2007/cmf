@@ -384,6 +384,65 @@ fn q4tp_group(@builtin(global_invocation_id) g: vec3<u32>) {
     for (var t = 0u; t < 4u; t = t + 1u) { QN[base + t] = words[t]; }
 }
 
+fn q2_level(x: f32) -> f32 { return clamp(round(clamp(x, -1.0, 4.0)), 0.0, 3.0); }
+
+// One q2tp group per row, the "placed" rule: the best of rungs 1..31 by
+// H_ii-weighted rounding error (rung 0 = an all-zero group), rounding onto
+// ±0.5/±1.5 with in-group feedback; 2-bit codes into QN (8 bytes a group).
+@compute @workgroup_size(128)
+fn q2tp_group(@builtin(global_invocation_id) g: vec3<u32>) {
+    let n = p.n;
+    let rows = p.m;
+    let grp = p.k0;
+    let row = g.x;
+    if (row >= rows) { return; }
+    let c0 = grp * 32u;
+    var w: array<f32, 32>;
+    var amax = 0.0;
+    for (var t = 0u; t < 32u; t = t + 1u) {
+        w[t] = W[row * n + c0 + t];
+        amax = max(amax, abs(w[t]));
+    }
+    var best_c = 0u;
+    if (amax > 0.0) {
+        var best_e = 3.4e38;
+        best_c = 1u;
+        for (var cand = 1u; cand < 32u; cand = cand + 1u) {
+            let s_c = TAB[row * 32u + cand];
+            if (!(s_c > 0.0)) { continue; }
+            let iv = 1.0 / s_c;
+            var err = 0.0;
+            for (var t = 0u; t < 32u; t = t + 1u) {
+                let d = w[t] - (q2_level(w[t] * iv + 1.5) - 1.5) * s_c;
+                err = err + HD[c0 + t] * d * d;
+            }
+            if (err < best_e) { best_e = err; best_c = cand; }
+        }
+    }
+    let s = TAB[row * 32u + best_c];
+    CODES[row * (n / 32u) + grp] = best_c;
+    var words: array<u32, 2>;
+    words[0] = 0u;
+    words[1] = 0u;
+    for (var j = 0u; j < 32u; j = j + 1u) {
+        var q = 0.0;
+        if (s > 0.0) { q = q2_level(w[j] / s + 1.5); }
+        words[j / 16u] = words[j / 16u] | (u32(q) << (2u * (j % 16u)));
+        let dj = A[(c0 + j) * n + c0 + j];
+        var e = 0.0;
+        if (dj > 0.0) { e = (w[j] - (q - 1.5) * s) / dj; }
+        E[row * 32u + j] = e;
+        if (e != 0.0) {
+            for (var t = j + 1u; t < 32u; t = t + 1u) {
+                w[t] = w[t] - e * A[(c0 + j) * n + c0 + t];
+            }
+        }
+    }
+    let base = (row * (n / 32u) + grp) * 2u;
+    QN[base] = words[0];
+    QN[base + 1u] = words[1];
+}
+
 // W[:, c0+32..] -= E · U[c0..c0+32, c0+32..] (64x64 tiles, K = 32).
 @compute @workgroup_size(16, 16)
 fn q4tp_trail(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32,
@@ -430,9 +489,9 @@ fn q4tp_trail(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_in
 }
 "#;
 
-const ENTRIES: [&str; 12] = [
+const ENTRIES: [&str; 13] = [
     "diag_get", "build_a", "chol_diag", "chol_panel", "chol_update", "eye", "inv_diag", "inv_rows",
-    "inv_update", "make_u", "q4tp_group", "q4tp_trail",
+    "inv_update", "make_u", "q4tp_group", "q2tp_group", "q4tp_trail",
 ];
 const NBIND: u32 = 14;
 /// Per-dispatch parameter stride (the uniform offset alignment).
@@ -777,6 +836,28 @@ pub fn sweep_q4tp(
     nib: &mut [u8],
     codes: &mut [u32],
 ) -> bool {
+    sweep(id, w, rows, tab, lost, None, nib, codes)
+}
+
+/// The q2tp GPTQ sweep (the "placed" rule) of `w` against fold `id`:
+/// `tab` = each row's ladder with rung 0 = 0, `hw` = the clipped `H_ii`;
+/// writes the 2-bit chunk plane (`rows·n/4` bytes) and the rung codes.
+pub fn sweep_q2tp(id: u64, w: &[f32], rows: usize, tab: &[f32], hw: &[f32], chunks: &mut [u8], codes: &mut [u32]) -> bool {
+    let lost = vec![0f32; rows * 2];
+    sweep(id, w, rows, tab, &lost, Some(hw), chunks, codes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sweep(
+    id: u64,
+    w: &[f32],
+    rows: usize,
+    tab: &[f32],
+    lost: &[f32],
+    q2_hw: Option<&[f32]>,
+    nib: &mut [u8],
+    codes: &mut [u32],
+) -> bool {
     let Some(c) = ctx() else { return false };
     let Some(pp) = pipes(c) else { return false };
     let g = FOLDS.lock().unwrap();
@@ -786,7 +867,8 @@ pub fn sweep_q4tp(
     if n % 32 != 0 || w.len() != rows * n || tab.len() != rows * 32 || lost.len() != rows * 2 {
         return false;
     }
-    if nib.len() != rows * n / 2 || codes.len() != rows * gpr {
+    let plane = if q2_hw.is_some() { rows * n / 4 } else { rows * n / 2 };
+    if nib.len() != plane || codes.len() != rows * gpr {
         return false;
     }
     let mk = |label: &str, bytes: u64| buf(c, label, bytes, wgpu::BufferUsages::empty());
@@ -805,7 +887,7 @@ pub fn sweep_q4tp(
     c.queue.write_buffer(&wb, 0, bytemuck::cast_slice(w));
     c.queue.write_buffer(&tb, 0, bytemuck::cast_slice(tab));
     c.queue.write_buffer(&lb, 0, bytemuck::cast_slice(lost));
-    c.queue.write_buffer(&hb, 0, bytemuck::cast_slice(&f.hdiag));
+    c.queue.write_buffer(&hb, 0, bytemuck::cast_slice(q2_hw.unwrap_or(&f.hdiag)));
     let list: Vec<[u32; 8]> = (0..gpr).map(|k| [n as u32, k as u32, rows as u32, 0, 0, 0, 0, 0]).collect();
     let prm = params(c, &list);
     let bg = bind(c, pp, &prm, &[&f.u, &dummy, &dummy, &dummy, &dummy, &wb, &tb, &lb, &hb, &qb, &cb, &eb, &dummy]);
@@ -814,7 +896,7 @@ pub fn sweep_q4tp(
         let mut ps = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
         for k in 0..gpr {
             ps.set_bind_group(0, &bg, &[(k as u64 * PSTRIDE) as u32]);
-            ps.set_pipeline(&pp.p["q4tp_group"]);
+            ps.set_pipeline(&pp.p[if q2_hw.is_some() { "q2tp_group" } else { "q4tp_group" }]);
             ps.dispatch_workgroups(rows.div_ceil(128) as u32, 1, 1);
             let rest = n - (k + 1) * 32;
             if rest > 0 {
