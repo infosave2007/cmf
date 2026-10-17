@@ -68,9 +68,21 @@ same information at 1.125 bits/weight instead of 1.5.
       backend.
     - Wired through `ProjKind::Q1g` / `proj_abs` / `encode_proj` (block graph
       and dense fast path), plus the batch layout and the per-op entry.
-    - **Not run on Metal hardware.** The Rust host code is type-checked with
-      `cargo check --tests --target aarch64-apple-darwin`. The MSL source has
-      not been compiled (no Metal toolchain was available).
+    - **Kernels checked on an Apple M4, outside cargo**:
+      `tools/metal_q1g_parity.swift` compiles `MSL` and `MSL_Q1G` straight
+      from `gpu_metal.rs` (MSL 3.0, default options) and runs `q1_matvec(_h)`
+      against `q1g_matvec(_h)` with the engine's dispatch shape. The first
+      version was NOT bit-identical: written as `acc += s * sum`, fast math
+      folds `acc + s·A + s·B` into `acc + s·(A + B)` once one scale serves
+      both tiles, and 65 % of rows (f32 kernel) and up to 37 % (half kernel,
+      6144-column rows) differed from q1 by float rounding. The scale step is
+      now an explicit `fma`, which is what q1's two-scale form compiles to:
+      0 differing rows in both kernels on 11 shapes × 2 seeds, up to the
+      151669×2048 head.
+    - The Rust host path (file arena, `q1g_ready`, per-op entry, batch) has
+      the test `gpu_metal::tests::gpu_q1g_matvec_equals_q1`; it is
+      type-checked (`cargo check --tests --target aarch64-apple-darwin`) but
+      has not been run on a Mac yet.
 
 ### How to use
 
@@ -107,8 +119,13 @@ cortiq requant bonsai-1.7b-q1g.cmf --quant q1 --output bonsai-1.7b-q1-again.cmf 
   - Bit-exact against q1 on the device: staged and subgroup matvec, GEMM and
     the shortlisted head.
   - Also checked against the CPU dequant.
+  - Shapes include 3×384: an odd group count, so the payload is not a word
+    multiple and the last scale word is half padding.
   - It fails if the subgroup module is rejected on a device that has 32-wide
     subgroups.
+- **Metal**: `tools/metal_q1g_parity.swift` (no cargo; kernels, run on an
+  M4) and `gpu_metal::tests::gpu_q1g_matvec_equals_q1` (host path,
+  type-checked only).
 - **speed** (ignored): `gpu_wgpu::tests::q1g_matvec_speed` and
   `qtensor::tests::q1g_cpu_matvec_speed`.
 
@@ -231,11 +248,47 @@ interleaved rounds, final binary `917b0857`:
 - **Why the absolute numbers swing between rounds:** co-tenant load. Only
   the interleaved ratios carry over.
 
+#### Independent verification (second build, 2026-10-17)
+
+Rebuilt from this branch and from master `5d6f1830` on the 5090 pod
+(binaries `245dbbca` and `18e0fc9a`), tests re-run, Bonsai-1.7B re-measured:
+- **Tests:** core `q1g_*` (5), cli `q1g_repack…` + all `requant` (7) +
+  the skill codec test, engine `q1` filter (11, wgpu on the device),
+  `x86_gemm::q1_blocked_vs_per_row`; `cargo check --tests --target
+  aarch64-apple-darwin` clean.
+- **Repack** reproduces bit for bit: strict refuses with 393 of 13,436,752
+  groups (max rel 1.848e-3) and writes nothing; `--allow-tol` gives sha256
+  `724a34dc…8bac`, `--quant q1` gives `f5abb584…2486` (both equal to the
+  first build's files); `--in-place` verifies.
+- **Window NLL** (`exact_nll`, windows 00 / 10):
+
+  | path | master q1 | branch q1 | q1g | q1u | q1g in place |
+  |---|---|---|---|---|---|
+  | GPU wgpu | 1515.638304 / 2111.166368 | same | 1515.638440 / 2111.165933 | same as q1g | same as q1g |
+  | CPU (ppl, float activations) | 1515.638184 / — | same | 1515.638154 / — | same as q1g | — |
+
+- **CPU A8W8 decode** (ppl never reaches the int8 kernels): 32 greedy steps
+  with every step's logits dumped (`CMF_LOGIT_DUMP_ALL`) — master q1 vs
+  branch q1 and q1g vs q1u byte-identical on all 32 steps, on the CPU run
+  and on the `CMF_GPU=wgpu` run.
+- **CPU kernel A/B** (`q1g_cpu_matvec_speed`, quieter window): q1g/q1 time
+  0.472 / 0.483 / 0.463 (gate/up, down, lm_head) at 6 threads, 0.458 /
+  0.444 / 0.240 at 1 thread.
+- A 3-round GPU bench pair was pure noise on the shared card (37–139 tok/s
+  within one arm); every token ran on the whole-token graph (127/127) and
+  the upload was 241.9 vs 322.5 MB.
+
 ### Open issues
 
-- **Metal:** the kernels have not run on Apple hardware, and the MSL has not
-  been compiled. The first run on a Mac should compare `q1g_matvec` with
-  `q1_matvec` on the same repack; they must match bit for bit, as on wgpu.
+- **Metal:** the kernels are verified on an M4 by the Swift harness (see
+  above), the host path is not. First thing on a Mac:
+  `cargo test -p cortiq-engine --release --lib gpu_q1g_matvec_equals_q1`,
+  then a Bonsai q1 vs q1g perplexity pair. Re-run
+  `tools/metal_q1g_parity.swift` after any edit to either MSL source.
+- **wgpu on macOS (`CMF_GPU=wgpu`) is unchecked.** wgpu-hal compiles Naga's
+  MSL with default (fast-math) options, the setting that broke q1g/q1 parity
+  in the native kernels; the WGSL `q1g_matvec` may differ from `q1_matvec`
+  there by rounding. Vulkan (5090, RTX 2000 Ada) is bit-exact.
 - **q1 x86 kernels:** applying `q1g_hsum4` to them would give q1 the same
   CPU speedup, bit for bit. It was not applied, to keep q1 untouched in
   this change.
