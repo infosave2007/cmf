@@ -67,7 +67,9 @@ def get_args(argv=None):
     ap.add_argument("--eval-mb", type=int, default=8, help="windows per micro-batch of the forward-only passes "
                     "(teacher cache, held-out evals)")
     ap.add_argument("--eval-every", type=int, default=16)
-    ap.add_argument("--max-steps", type=int, default=0, help="stop after N steps (smoke tests)")
+    ap.add_argument("--max-steps", type=int, default=0, help="train N steps (smoke tests; the schedule spans N)")
+    ap.add_argument("--stop-after", type=int, default=0, help="stop at step N of the full schedule without "
+                    "writing (checks; resume continues it)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--residency", choices=("resident", "stream"), default="resident")
     ap.add_argument("--act-device", default=None, help="boundary activations: cpu or cuda (default: cpu when streaming)")
@@ -116,6 +118,15 @@ def snapshot(model):
         if g.n is not None:
             s["n"][g.name] = g.n.detach().cpu().numpy().copy()
     return s
+
+
+def values_digest(model):
+    """sha1 of every trainable value in a fixed order (bit-for-bit comparison of runs)"""
+    import hashlib
+    h = hashlib.sha1()
+    for p in model.params():
+        h.update(p.detach().cpu().numpy().tobytes())
+    return h.hexdigest()[:16]
 
 
 def load_values(model, snap):
@@ -260,7 +271,7 @@ def main(argv=None):
             hkl, hce, per = held_eval(model, held_w, teacher, owner, len(corpora), args.eval_mb, args.wl)
             n_since = args.eval_every if step % args.eval_every == 0 else step % args.eval_every
             hist.append({"step": step, "train_kl": run_kl / n_since, "held_kl": hkl, "held_ce": hce,
-                         "held_ce_corpus": per})
+                         "held_ce_corpus": per, "values_sha1": values_digest(model)})
             peak = torch.cuda.max_memory_allocated(dev) / 2 ** 30 if dev.type == "cuda" else 0
             log(f"step {step}/{total} train KL {run_kl / n_since:.5f}  held-out KL {hkl:.5f} CE {hce:.5f}  "
                 f"({t_train / step:.1f} s/step, GPU peak {peak:.2f} GiB)")
@@ -270,6 +281,13 @@ def main(argv=None):
             torch.save({"values": snapshot(model), "opt": opt.state_dict(), "gen": gen.get_state(), "step": step,
                         "hist": hist, "best": best, "perm": perm, "t_train": t_train}, state_p + ".tmp")
             os.replace(state_p + ".tmp", state_p)
+            if args.stop_after and step >= args.stop_after:
+                break
+    if args.stop_after and step < total:
+        with open(os.path.join(args.out, "manifest.json"), "w") as f:
+            json.dump({"args": vars(args), "hist": hist, "stopped_at": step, "train_seconds": t_train}, f, indent=1)
+        log(f"stopped at step {step} of {total} (--stop-after); state in {state_p}")
+        return None
     log(f"best held-out CE {best[0]:.5f} at step {best[1]} (step 0: {hist[0]['held_ce']:.5f}, "
         f"teacher {teacher['meta']['held_ce']:.5f})")
     snap = best[2]
