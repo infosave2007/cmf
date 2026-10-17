@@ -11,6 +11,7 @@ windows are placed first; train window j starts at j * ((n - WL - 1 - 4096) // N
 forward in steps of 128 tokens while it overlaps a held-out window. Held-out windows choose
 the checkpoint; the evaluation sets of a study must not be among the corpora.
 """
+import gc
 import hashlib
 import json
 import os
@@ -170,8 +171,13 @@ def teacher_cache(cache_dir, teacher_path, corpora, wl, k, make_model, block=256
     qmodel.set_tf32(prev)
     meta["seconds"] = time.time() - t0
     json.dump(meta, open(meta_p, "w"), indent=1)
-    cmf.close()
+    # the model's host tensors are zero-copy views of the mapping: drop them before unmapping
     del model
+    gc.collect()
+    try:
+        cmf.close()
+    except BufferError:
+        pass
     torch.cuda.empty_cache()
     log(f"teacher cached: train CE {meta['train_ce']:.5f}, held CE {meta['held_ce']:.5f} ({meta['seconds']:.0f}s)")
     out = {n: np.load(os.path.join(cache_dir, f"{n}.npy"), mmap_mode="r") for n in names}

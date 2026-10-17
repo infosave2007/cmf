@@ -60,6 +60,7 @@ def get_args(argv=None):
     ap.add_argument("--write", help="write the escorted model for the first budget here")
     ap.add_argument("--cortiq", default="cortiq")
     ap.add_argument("--gpu-cap-gb", type=float, default=0)
+    ap.add_argument("--resume", action="store_true", help="reuse the one-shot measurements in OUT/sens_partial.json")
     ap.add_argument("--device", default="cuda")
     return ap.parse_args(argv)
 
@@ -160,9 +161,17 @@ def main(argv=None):
     picked, sens_all, used_total = [], {}, 0
     remaining = list(cands)
     by_name = {c[2]: c for c in cands}
+    partial_p = os.path.join(args.out, "sens_partial.json")
+    partial = {}
+    if args.resume and rounds == 1 and os.path.exists(partial_p):
+        partial = json.load(open(partial_p))
+        log(f"resuming: {len(partial)} tensors already measured")
     for r in range(rounds):
         sens = {}
         for i, (l, role, name, h, extra, params) in enumerate(remaining):
+            if name in partial:
+                sens[name] = partial[name]
+                continue
             hi = qmodel.QLinear(name, h.tensor(name), h.payload(name), pin=model.pin)
             old = model.swap(l, role, hi)
             loss = scorer.with_layer_from(l)
@@ -174,6 +183,10 @@ def main(argv=None):
                           "round": r}
             if (i + 1) % 25 == 0 or i + 1 == len(remaining):
                 log(f"round {r}: {i + 1}/{len(remaining)} measured (last {name}: {gain:+.5f})")
+                if rounds == 1:
+                    with open(partial_p + ".tmp", "w") as f:
+                        json.dump(sens, f)
+                    os.replace(partial_p + ".tmp", partial_p)
         sens_all.update(sens)
         if rounds == 1:
             break

@@ -399,6 +399,36 @@ class ModelTest(unittest.TestCase):
         np.testing.assert_allclose(n_eff, 0.5, atol=3e-3)
 
 
+class EscortTest(unittest.TestCase):
+    def test_sensitivity_and_waterfill(self):
+        import escort
+        qmodel.setup_torch(0, tf32=False)
+        m = tiny_cmf("llama", seed=21)
+        hi = tiny_cmf("llama", seed=21, lin_dtype="Q8_2f")
+        model = qmodel.Model(m, "cpu")
+        cands = escort.candidates(model, [hi], None, r"mlp\.down")
+        self.assertEqual(len(cands), 2 * 6)                 # 7 linears per layer minus down_proj
+        self.assertTrue(all(c[3] is hi and c[4] > 0 for c in cands))
+        w = np.random.default_rng(3).integers(0, 300, size=(3, 33))
+        sc = escort.Scorer(model, w, "nll", None, 2)
+        full = model.evaluate(w, mb=2)["nll"].sum() / (3 * 32)
+        self.assertAlmostEqual(sc.base, full, places=5)
+        l, role, name, h, extra, _ = cands[0]
+        new = qmodel.QLinear(name, h.tensor(name), h.payload(name), pin=False)
+        old = model.swap(l, role, new)
+        swapped = sc.with_layer_from(l)
+        ref = model.evaluate(w, mb=2)["nll"].sum() / (3 * 32)
+        self.assertAlmostEqual(swapped, ref, places=5)       # cached block inputs == a full rerun
+        self.assertNotAlmostEqual(swapped, sc.base, places=4)
+        model.swap(l, role, old)
+        self.assertAlmostEqual(sc.with_layer_from(0), sc.base, places=6)
+        sens = {f"t{i}": {"gain": g, "extra_bytes": b, "gain_per_byte": g / b}
+                for i, (g, b) in enumerate([(3.0, 10), (1.0, 1), (5.0, 100), (-1.0, 1), (0.5, 5)])}
+        pick, used = escort.waterfill(sens, 12)
+        self.assertEqual(pick, ["t1", "t0"])                # 1.0/B, 0.3/B fit; t4 (0.1/B) would overflow
+        self.assertEqual(used, 11)
+
+
 class CalibTest(unittest.TestCase):
     def test_study_window_placement(self):
         """the q2tp/q4tp studies' e2e_metric.py placement, verbatim"""
