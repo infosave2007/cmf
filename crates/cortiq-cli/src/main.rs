@@ -728,13 +728,19 @@ enum Commands {
     /// two-field `|W|·RMS(x)` outlier mask. Norms/embeddings/lm_head (no
     /// captured Hessian) are copied verbatim. Pair with `skill bake` (FCD)
     /// on the tail layers to recover the last of the quality.
+    /// `--codec q4tp|q2tp` writes the converter's q4tp / q2tp profile instead,
+    /// every linear GPTQ-rounded in its own codec (2 bits need ≥ 32k
+    /// calibration tokens: on 2048 GPTQ-q2tp is worse than rounding).
     QuantizeGptq {
         /// Input .cmf (f16 or q8 — higher precision ⇒ a better fold)
         input: String,
-        /// Calibration corpus: a `.txt`, or a `.json` array of
-        /// `[prompt, text]` pairs (the DTG-MA cache) whose texts concatenate
-        #[arg(long)]
-        calib: String,
+        /// Calibration corpus: a `.txt`, a `.jsonl` (one `{"text": …}` or
+        /// string per line), or a `.json` array of `[prompt, text]` pairs
+        /// (the DTG-MA cache) whose texts concatenate. q4tp/q2tp: repeat it
+        /// to mix corpora, `PATH=SHARE` giving each its share of --tokens
+        /// (e.g. `--calib wiki.train.raw=0.75 --calib c4.jsonl=0.25`)
+        #[arg(long, required = true)]
+        calib: Vec<String>,
         /// Output .cmf path
         #[arg(long)]
         output: String,
@@ -747,35 +753,61 @@ enum Commands {
         /// Relative Hessian damping λ (adds `λ·mean(diag)` to the diagonal)
         #[arg(long, default_value = "0.01")]
         lambda: f64,
-        /// Target codec: q1s (default; the 1-bit error-feedback path) or
-        /// q4tp (GPTQ-rounded q4tp — same layout and kernels as `convert
-        /// --quant q4tp`; give it an f16 export as INPUT)
+        /// Target codec: q1s (default; the 1-bit error-feedback path), q4tp
+        /// (GPTQ-rounded q4tp — same layout and kernels as `convert --quant
+        /// q4tp`), or q2tp (the `convert --quant q2tp` profile: gate/up
+        /// GPTQ'd into q2tp, the other linears into q4tp). Give q4tp/q2tp
+        /// an f16 export as INPUT
         #[arg(long, default_value = "q1s")]
         codec: String,
-        /// q4tp: the file the calibration forward runs on (default INPUT).
-        /// The Hessian hook only sees memory-mapped quantized tensors, so an
-        /// f16 INPUT needs its q8/q8_2f sibling here
+        /// q4tp/q2tp: the file the calibration forward runs on (default
+        /// INPUT). The Hessian hook only sees memory-mapped quantized
+        /// tensors, so an f16 INPUT needs its q8/q8_2f sibling here
         #[arg(long)]
         calib_model: Option<String>,
-        /// q4tp: calibration window length (each window a fresh context)
+        /// q4tp/q2tp: calibration window length (each window a fresh context)
         #[arg(long, default_value = "2048")]
         window: usize,
-        /// q4tp: per-tensor override for the tensors GPTQ does not touch,
-        /// PATTERN=QUANT as in `convert --tensor-quant` (e.g.
-        /// `lm_head.weight=q8_2f`)
+        /// q4tp/q2tp: per-tensor codec override, PATTERN=QUANT as in
+        /// `convert --tensor-quant` (e.g. `lm_head.weight=q8_2f`). A q4tp or
+        /// q2tp override stays GPTQ (an escort:
+        /// `model.layers.7.mlp.gate_proj.weight=q4tp`); others are encoded
+        /// by the converter
         #[arg(long = "tensor-quant", value_name = "PATTERN=QUANT")]
         tensor_quant: Vec<String>,
-        /// q4tp: worker threads (default: all cores)
+        /// q4tp/q2tp: worker threads (default: all cores)
         #[arg(long)]
         threads: Option<usize>,
-        /// q4tp: act-order GPTQ (channels by descending input energy, tile
-        /// rungs fixed up front from the original weights)
+        /// q4tp/q2tp: act-order GPTQ (channels by descending input energy,
+        /// group rungs fixed up front from the original weights)
         #[arg(long)]
         act_order: bool,
-        /// q4tp: Hessian cache file — loaded when it exists (calibration
-        /// skipped), written after calibrating when it does not
+        /// q4tp/q2tp: Hessian cache file — loaded when it exists (calibration
+        /// skipped), written after calibrating when it does not (one file
+        /// per chunk, PATH.L{first}-{last}, with --calib-chunk-layers)
         #[arg(long)]
         hessians: Option<String>,
+        /// q4tp/q2tp: capture the Hessians of this many layers per
+        /// calibration pass (0 = all at once). Bounds RAM — a dense Hessian
+        /// is 8·cols² bytes, ~0.5 GB per layer of a 2B model — at the price of
+        /// one calibration forward per pass
+        #[arg(long, default_value = "0")]
+        calib_chunk_layers: usize,
+        /// q2tp: how group scales are placed — `placed` (default: ladder at
+        /// the H-weighted MSE-optimal scales, full 31-rung search) or
+        /// `cortiq` (the q4tp rule on the 4-level grid: converter ladder,
+        /// rung from absmax over nominal−2..+1)
+        #[arg(long)]
+        q2tp_rule: Option<String>,
+        /// q2tp: per-tensor rule override, PATTERN=RULE (first match wins),
+        /// e.g. `model.layers.7.mlp.*=cortiq` for a layer whose outlier
+        /// weights the MSE-optimal scales clip
+        #[arg(long = "q2tp-rule-tensor", value_name = "PATTERN=RULE")]
+        q2tp_rule_tensor: Vec<String>,
+        /// q2tp: remove each row's output shrinkage in the calibration metric
+        /// (slope (ŴHWᵀ)/(WHWᵀ), through the row's f16 `lo` — zero bits)
+        #[arg(long)]
+        q2tp_debias: bool,
     },
     /// Chat with a model (applies the file's chat template), or one-shot
     /// with --prompt
@@ -3152,36 +3184,66 @@ async fn main() -> anyhow::Result<()> {
             threads,
             act_order,
             hessians,
+            calib_chunk_layers,
+            q2tp_rule,
+            q2tp_rule_tensor,
+            q2tp_debias,
         } => {
-            match codec.to_ascii_lowercase().as_str() {
-                "q4tp" => {
+            let codec = codec.to_ascii_lowercase();
+            let q2tp_flags = q2tp_rule.is_some() || !q2tp_rule_tensor.is_empty() || q2tp_debias;
+            match codec.as_str() {
+                "q4tp" | "q2tp" => {
+                    let profile = convert::parse_quant(&codec)?;
+                    anyhow::ensure!(
+                        codec == "q2tp" || !q2tp_flags,
+                        "--q2tp-rule / --q2tp-rule-tensor / --q2tp-debias apply to --codec q2tp"
+                    );
                     convert::set_tensor_quant_overrides(&tensor_quant)?;
                     let threads = threads.unwrap_or_else(|| {
                         std::thread::available_parallelism()
                             .map(|n| n.get())
                             .unwrap_or(4)
                     });
-                    gptq::run_quantize_gptq_q4tp(
-                        &input,
-                        calib_model.as_deref(),
-                        &calib,
-                        &output,
+                    let opts = gptq::GptqTiledOpts {
+                        input: &input,
+                        calib_model: calib_model.as_deref(),
+                        calib: calib
+                            .iter()
+                            .map(|s| gptq::CalibSource::parse(s))
+                            .collect::<anyhow::Result<Vec<_>>>()?,
+                        output: &output,
                         tokens,
                         window,
                         lambda,
                         threads,
                         act_order,
-                        hessians.as_deref(),
-                    )?;
+                        hessians: hessians.as_deref(),
+                        profile,
+                        q2tp_rule: gptq::Q2tpRule::parse(q2tp_rule.as_deref().unwrap_or("placed"))?,
+                        q2tp_rule_overrides: q2tp_rule_tensor
+                            .iter()
+                            .map(|s| gptq::parse_q2tp_rule_override(s))
+                            .collect::<anyhow::Result<Vec<_>>>()?,
+                        q2tp_debias,
+                        chunk_layers: calib_chunk_layers,
+                    };
+                    gptq::run_quantize_gptq_tiled(&opts)?;
                 }
                 "q1s" => {
                     anyhow::ensure!(
-                        calib_model.is_none() && tensor_quant.is_empty(),
-                        "--calib-model / --tensor-quant apply to --codec q4tp"
+                        calib_model.is_none()
+                            && tensor_quant.is_empty()
+                            && !q2tp_flags
+                            && calib_chunk_layers == 0,
+                        "--calib-model / --tensor-quant / --calib-chunk-layers / --q2tp-* apply to --codec q4tp|q2tp"
                     );
-                    gptq::run_quantize_gptq(&input, &calib, &output, keep, tokens, lambda)?
+                    anyhow::ensure!(
+                        calib.len() == 1,
+                        "--codec q1s reads one --calib corpus"
+                    );
+                    gptq::run_quantize_gptq(&input, &calib[0], &output, keep, tokens, lambda)?
                 }
-                other => anyhow::bail!("--codec {other}: expected q1s or q4tp"),
+                other => anyhow::bail!("--codec {other}: expected q1s, q4tp or q2tp"),
             }
             println!("✓ wrote {output}");
             Ok(())
