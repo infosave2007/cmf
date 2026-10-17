@@ -1448,7 +1448,7 @@ fn q2tp_search() -> bool {
 /// `CMF_Q2TP_ENCODER=v1` restores the absmax-pinned q2tp encoder byte for
 /// byte; anything else (or nothing) runs v2. Read per tensor for the same
 /// reason as [`q2tp_search`].
-pub(crate) fn q2tp_encoder_is_v1() -> bool {
+fn q2tp_encoder_is_v1() -> bool {
     std::env::var("CMF_Q2TP_ENCODER")
         .map(|v| v.trim().eq_ignore_ascii_case("v1"))
         .unwrap_or(false)
@@ -1704,7 +1704,7 @@ pub(crate) fn q2tp_best_rung(
 /// Group `g` of a row and of its channel weights, as fixed-size arrays (the
 /// error kernel's bounds checks then vanish).
 #[inline(always)]
-pub(crate) fn q2tp_group_pair<'a>(
+fn q2tp_group_pair<'a>(
     row: &'a [f32],
     hw: &'a [f32],
     g: usize,
