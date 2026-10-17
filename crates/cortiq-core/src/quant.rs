@@ -319,7 +319,11 @@ pub struct Q1gRepack {
 /// spread exceeds `tol`.
 pub fn repack_q1_to_q1g(bytes: &[u8], rows: usize, cols: usize, tol: f64) -> Q1gRepack {
     assert_eq!(cols % Q1G_GROUP, 0, "q1g needs cols % 128 == 0");
-    assert_eq!(bytes.len(), rows * (cols / GROUP_SIZE) * Q1_TILE, "q1 payload length");
+    assert_eq!(
+        bytes.len(),
+        rows * (cols / GROUP_SIZE) * Q1_TILE,
+        "q1 payload length"
+    );
     let groups = rows * (cols / Q1G_GROUP);
     let sc_off = q1g_scale_offset(rows, cols);
     let mut data = vec![0u8; sc_off + groups * 2];
@@ -351,7 +355,10 @@ pub fn repack_q1_to_q1g(bytes: &[u8], rows: usize, cols: usize, tol: f64) -> Q1g
                         f64::INFINITY
                     }
                 })
-                .fold(0f64, |a, b| if b.is_nan() { f64::INFINITY } else { a.max(b) });
+                .fold(
+                    0f64,
+                    |a, b| if b.is_nan() { f64::INFINITY } else { a.max(b) },
+                );
             max_rel = max_rel.max(rel);
             if rel.is_nan() || rel > tol {
                 over_tol += 1;
@@ -1286,9 +1293,9 @@ mod q1g_tests {
                 let s = wb[0].abs();
                 assert!(wb.iter().all(|v| v.abs() == s));
                 assert!(wa.iter().zip(wb).all(|(x, y)| x.signum() == y.signum()));
-                let (lo, hi) = wa
-                    .iter()
-                    .fold((f32::MAX, 0f32), |(l, h), v| (l.min(v.abs()), h.max(v.abs())));
+                let (lo, hi) = wa.iter().fold((f32::MAX, 0f32), |(l, h), v| {
+                    (l.min(v.abs()), h.max(v.abs()))
+                });
                 assert!(s >= lo && s <= hi, "{s} outside [{lo}, {hi}]");
             } else {
                 assert!(wa.iter().zip(wb).all(|(x, y)| x.to_bits() == y.to_bits()));
