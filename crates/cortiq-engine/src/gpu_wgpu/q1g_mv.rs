@@ -135,17 +135,19 @@ pub(crate) fn sg32(c: &Ctx) -> bool {
 /// (`CMF_Q1G_SG=1`), and then only for rows of ≥ 4096 columns, because the
 /// measurements disagree by device (`q1g_matvec_speed`, interleaved runs,
 /// both cards shared with another job):
-/// - RTX 5090: down_proj 2048×6144 took 23-25 µs against 43-61 staged and
-///   44-54 for q1 (four runs). lm_head 151669×2048 took 239-419 against
-///   117-168 staged: every row re-reads the activation from L1, where the
-///   staged kernel shares one shared-memory copy across eight rows.
-/// - RTX 2000 Ada: slower on every shape, down_proj included (329-367
-///   against 219-252 staged).
+/// - RTX 5090: down_proj 2048×6144 took 23-25 µs against 43-61 for the
+///   (then un-hoisted) staged kernel in a busy window, but 21-24 against
+///   24-27 once the staged kernel fetched its weights ahead of the barrier
+///   in a quieter one. lm_head 151669×2048 took 180-419 against 73-168
+///   staged in every window: each row re-reads the activation from L1,
+///   where the staged kernel shares one shared-memory copy across 8 rows.
+/// - RTX 2000 Ada: slower on every shape, down_proj included (253-414
+///   against 153-292 staged).
 ///
-/// End to end (Bonsai-1.7B decode, tok/s, medians of 6), staged-only vs
-/// with this kernel on down_proj: 113.8 vs 116.1 on the 5090, 25.9 vs 24.2
-/// on the 2000 Ada (q1: 110.5 and 25.0). The default stays the staged kernel.
-/// Same bits either way.
+/// End to end (Bonsai-1.7B decode, tok/s, medians of 6, measured before the
+/// staged kernel's hoist), staged-only vs with this kernel on down_proj:
+/// 113.8 vs 116.1 on the 5090, 25.9 vs 24.2 on the 2000 Ada (q1: 110.5 and
+/// 25.0). The default stays the staged kernel. Same bits either way.
 pub(crate) fn wanted(cols: usize) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("CMF_Q1G_SG").as_deref() == Ok("1")) && cols >= 4096
