@@ -464,7 +464,9 @@ fn cgroup_used_bytes() -> Option<u64> {
         .or_else(|| read("/sys/fs/cgroup/memory/memory.usage_in_bytes"))
 }
 
-fn physical_total_bytes() -> Option<u64> {
+/// Physical RAM total — the cgroup's limit when the container has a lower
+/// one. Also the ceiling `quantize-gptq` plans its Hessian RAM against.
+pub fn physical_total_bytes() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
         let out = std::process::Command::new("sysctl")
