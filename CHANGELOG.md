@@ -17,7 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of their four f16-rounded scales, −9.3e-8 nats/token). Kernels on CPU, wgpu
   and Metal return q1's f32 bit for bit on uniform scales; CPU decode is
   ~2× q1 on x86 (group-level reduction), GPU decode equal or better. The
-  Metal kernels have not been run on Apple hardware yet.
+  Metal kernels are checked on an M4 by `tools/metal_q1g_parity.swift`
+  (their scale step is an explicit `fma`: fast math otherwise folds the
+  pair's shared scale and drifts from q1 by rounding); the Metal host path
+  has not been run on a Mac yet.
 
 ## [0.8.19] - 2026-10-15
 
