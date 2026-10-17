@@ -136,7 +136,7 @@ fn adam(@builtin(global_invocation_id) g: vec3<u32>) {
     let i = idx(g);
     if (i >= p.k) { return; }
     if (p.rows == 1u && COL[i] == 0.0) { return; }
-    let gr = A[i];
+    let gr = A[i] * bitcast<f32>(p.pad0);
     let m1 = p.f1 * B[i] + (1.0 - p.f1) * gr;
     let m2 = p.f2 * OUT[i] + (1.0 - p.f2) * gr * gr;
     B[i] = m1;
@@ -145,6 +145,22 @@ fn adam(@builtin(global_invocation_id) g: vec3<u32>) {
     let mh = m1 / (1.0 - pow(p.f1, t));
     let vh = m2 / (1.0 - pow(p.f2, t));
     SRC[i] = SRC[i] - p.scale * mh / (sqrt(vh) + p.f3);
+}
+
+// Partial sums of squares of A[0..k] per workgroup into OUT[wg]
+// (non-finite values propagate, which is the point: the host checks).
+var<workgroup> ssq: array<f32, 256>;
+@compute @workgroup_size(256)
+fn sumsq(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3<u32>) {
+    var acc = 0.0;
+    for (var i = g.x; i < p.k; i = i + 256u * p.m) { acc = acc + A[i] * A[i]; }
+    ssq[t] = acc;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {
+        if (t < s) { ssq[t] = ssq[t] + ssq[t + s]; }
+        workgroupBarrier();
+    }
+    if (t == 0u) { OUT[wg.x] = ssq[0]; }
 }
 
 // OUT[m][k] (+)= A[m][k]·COL[k]   (rows = 1: accumulate, 0: overwrite)
@@ -158,7 +174,7 @@ fn scale_acc(@builtin(global_invocation_id) g: vec3<u32>) {
 "#;
 
 fn module(c: &Ctx) -> Option<&'static train_ops::Mod> {
-    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "expand", "colsum_prod", "scale_acc", "dense_fwd", "dense_bwd", "split_qg", "adam"])
+    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "expand", "colsum_prod", "scale_acc", "dense_fwd", "dense_bwd", "split_qg", "adam", "sumsq"])
 }
 
 /// One step of a trainer pass: an elementwise/reduction dispatch or a GEMM.
@@ -230,6 +246,17 @@ pub fn f16_buf(c: &Ctx, n: usize) -> wgpu::Buffer {
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     })
+}
+
+/// An f16 plane holding `v` (row-major, as given).
+pub fn f16_from_f32(c: &Ctx, v: &[f32]) -> wgpu::Buffer {
+    let mut h: Vec<u16> = v.iter().map(|&f| cortiq_core::quant::f32_to_f16(f)).collect();
+    if h.len() % 2 == 1 {
+        h.push(0);
+    }
+    let b = f16_buf(c, h.len());
+    c.queue.write_buffer(&b, 0, bytemuck::cast_slice(&h));
+    b
 }
 
 /// Stage `src` (`[m][k]` f32) as an f16 activation operand, rows padded,
@@ -318,17 +345,26 @@ pub fn split_qg<'a>(c: &'a Ctx, qg: &'a wgpu::Buffer, q: &'a wgpu::Buffer, gate:
 
 /// One Adam update of `n` parameters (`mask` 0 = frozen entry).
 #[allow(clippy::too_many_arguments)]
-pub fn adam<'a>(c: &'a Ctx, w: &'a wgpu::Buffer, g: &'a wgpu::Buffer, m1: &'a wgpu::Buffer, m2: &'a wgpu::Buffer, mask: Option<&'a wgpu::Buffer>, n: usize, lr: f32, step: u32, b1: f32, b2: f32, eps: f32) -> Option<Disp<'a>> {
+pub fn adam<'a>(c: &'a Ctx, w: &'a wgpu::Buffer, g: &'a wgpu::Buffer, m1: &'a wgpu::Buffer, m2: &'a wgpu::Buffer, mask: Option<&'a wgpu::Buffer>, n: usize, lr: f32, step: u32, b1: f32, b2: f32, eps: f32, gmul: f32) -> Option<Disp<'a>> {
     let md = module(c)?;
     // The mask binding is statically used: without a mask it aliases the
     // parameters (never read: the flag is off).
     let bufs = vec![(1, w), (2, mask.unwrap_or(w)), (7, g), (8, m1), (9, m2)];
     Some(Disp {
         pipe: &md.p["adam"],
-        uni: vec![step, n as u32, 0, mask.is_some() as u32, 0, 0, 0, 0, lr.to_bits(), b1.to_bits(), b2.to_bits(), eps.to_bits()],
+        uni: vec![step, n as u32, 0, mask.is_some() as u32, 0, 0, gmul.to_bits(), 0, lr.to_bits(), b1.to_bits(), b2.to_bits(), eps.to_bits()],
         bufs,
         grid: elt_fold(n),
     })
+}
+
+/// Sum of squares of `n` floats of `a` (64 workgroup partials summed on the host).
+pub fn sumsq(c: &Ctx, a: &wgpu::Buffer, n: usize) -> Option<f64> {
+    let md = module(c)?;
+    let out = train_ops::zeros(c, 64);
+    let d = Disp { pipe: &md.p["sumsq"], uni: vec![64, n as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], bufs: vec![(7, a), (9, &out)], grid: (64, 1, 1) };
+    run(c, &[Op::D(d)]);
+    Some(train_ops::download(c, &out, 64)?.iter().map(|&x| x as f64).sum())
 }
 
 /// `out[m][n] = act[m][k] · plane[n][k]ᵀ · oscale` on the matrix units.

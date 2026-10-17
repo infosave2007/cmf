@@ -869,6 +869,13 @@ pub fn upload(c: &Ctx, data: &[f32]) -> wgpu::Buffer {
     b
 }
 
+/// Overwrite the start of `b` with `data`.
+pub fn write(c: &Ctx, b: &wgpu::Buffer, data: &[f32]) {
+    if !data.is_empty() {
+        c.queue.write_buffer(b, 0, bytemuck::cast_slice(data));
+    }
+}
+
 pub fn zeros(c: &Ctx, n: usize) -> wgpu::Buffer {
     upload(c, &vec![0f32; n.max(1)])
 }

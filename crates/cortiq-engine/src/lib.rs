@@ -27,6 +27,10 @@ pub mod gpu;
 pub mod gpu_metal;
 #[cfg(feature = "gpu")]
 pub mod gpu_wgpu;
+/// The wgpu crate the device types of `gpu_wgpu` come from (offline tools
+/// hold buffers across calls).
+#[cfg(feature = "gpu")]
+pub use wgpu;
 pub mod imagegen;
 pub mod inference;
 pub mod kv_cache;

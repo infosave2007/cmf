@@ -11,6 +11,10 @@ mod egemma2pack;
 mod embed;
 mod gguf;
 mod gptq;
+#[cfg(feature = "gpu")]
+mod nvgtrain;
+#[cfg(feature = "gpu")]
+mod moegptq;
 mod growth;
 mod http_range;
 mod imagepack;
@@ -823,6 +827,85 @@ enum Commands {
         /// (slope (ŴHWᵀ)/(WHWᵀ), through the row's f16 `lo` — zero bits)
         #[arg(long)]
         q2tp_debias: bool,
+    },
+    /// GPTQ for the routed experts of a Flash-Next-class MoE (qwen4_exp):
+    /// gate/up into q2tp, down into q4tp, on the GPU; the calibration file
+    /// (a q4tp CMF of the model) supplies the activations and every
+    /// non-expert tensor, the original safetensors checkpoint the
+    /// full-precision expert weights (fetched one layer at a time).
+    QuantizeMoe {
+        /// Calibration .cmf (q4tp of the same model)
+        calib_model: String,
+        /// Original checkpoint on the Hub (e.g. Qwen/Qwen3.8-Flash-Next); HF_TOKEN from the environment
+        #[arg(long)]
+        hf: String,
+        /// Calibration text, PATH or PATH=SHARE (repeatable)
+        #[arg(long, required = true)]
+        calib: Vec<String>,
+        #[arg(long, default_value = "131072")]
+        tokens: usize,
+        #[arg(long, default_value = "2048")]
+        window: usize,
+        /// Layers captured per calibration pass (host RAM: ~6 KB per token per layer)
+        #[arg(long, default_value = "24")]
+        layers_per_pass: usize,
+        #[arg(long, default_value = "0.01")]
+        lambda: f64,
+        /// Experts routed fewer tokens than this keep the converter's encoding
+        #[arg(long, default_value = "32")]
+        min_rows: usize,
+        /// Directory for the source shards in flight
+        #[arg(long, default_value = "/tmp/cortiq-moe")]
+        scratch: String,
+        #[arg(long, default_value = "16")]
+        threads: usize,
+        #[arg(long)]
+        output: String,
+    },
+    /// NVG Ť: light distillation training of a compressed model's metric
+    /// (the h, ℓ, g scales of its binary low-rank tensors and every RMSNorm
+    /// gain; signs and every other weight frozen) against its
+    /// full-precision teacher, on the GPU. Qwen3.5-family models.
+    NvgTrain {
+        /// Student .cmf (binary low-rank tensors to train)
+        student: String,
+        /// Teacher .cmf (full precision, same architecture and tokenizer)
+        #[arg(long)]
+        teacher: String,
+        /// Training text, PATH or PATH=SHARE (repeatable), as quantize-gptq
+        #[arg(long, required = true)]
+        calib: Vec<String>,
+        /// Training tokens (per epoch)
+        #[arg(long, default_value = "1048576")]
+        tokens: usize,
+        /// Window length (each window a fresh context)
+        #[arg(long, default_value = "2048")]
+        window: usize,
+        /// Windows per step
+        #[arg(long, default_value = "2")]
+        batch: usize,
+        #[arg(long, default_value = "1")]
+        epochs: usize,
+        /// Peak Adam learning rate (cosine decay after a 2 % warm-up)
+        #[arg(long, default_value = "1e-4")]
+        lr: f64,
+        /// Teacher distribution kept per token
+        #[arg(long, default_value = "64")]
+        topk: usize,
+        /// Held-out windows (best-checkpoint selection)
+        #[arg(long, default_value = "8")]
+        eval_windows: usize,
+        /// Steps between held-out evaluations
+        #[arg(long, default_value = "50")]
+        eval_every: usize,
+        /// Global gradient-norm clip
+        #[arg(long, default_value = "1.0")]
+        clip: f64,
+        #[arg(long, default_value = "42")]
+        seed: u64,
+        /// Output .cmf (the student with the trained metric)
+        #[arg(long)]
+        output: String,
     },
     /// Chat with a model (applies the file's chat template), or one-shot
     /// with --prompt
@@ -3207,6 +3290,60 @@ async fn main() -> anyhow::Result<()> {
             println!("✓ wrote {output}");
             Ok(())
         }
+        #[cfg(feature = "gpu")]
+        Commands::QuantizeMoe { calib_model, hf, calib, tokens, window, layers_per_pass, lambda, min_rows, scratch, threads, output } => {
+            moegptq::run(&moegptq::MoeOpts {
+                calib_model: &calib_model,
+                hf: &hf,
+                calib: &calib,
+                tokens,
+                window,
+                layers_per_pass,
+                lambda,
+                min_rows,
+                scratch: &scratch,
+                threads,
+                output: &output,
+            })
+        }
+        #[cfg(not(feature = "gpu"))]
+        Commands::QuantizeMoe { .. } => Err(anyhow::anyhow!("quantize-moe needs a build with the gpu feature")),
+        #[cfg(feature = "gpu")]
+        Commands::NvgTrain {
+            student,
+            teacher,
+            calib,
+            tokens,
+            window,
+            batch,
+            epochs,
+            lr,
+            topk,
+            eval_windows,
+            eval_every,
+            clip,
+            seed,
+            output,
+        } => {
+            nvgtrain::run(&nvgtrain::NvgTrainOpts {
+                student: &student,
+                teacher: &teacher,
+                calib: &calib,
+                tokens,
+                window,
+                batch,
+                epochs,
+                lr,
+                topk,
+                eval_windows,
+                eval_every,
+                clip,
+                seed,
+                output: &output,
+            })
+        }
+        #[cfg(not(feature = "gpu"))]
+        Commands::NvgTrain { .. } => Err(anyhow::anyhow!("nvg-train needs a build with the gpu feature")),
         Commands::QuantizeGptq {
             input,
             calib,
