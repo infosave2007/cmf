@@ -8801,12 +8801,15 @@ pub(crate) mod tests {
     /// Everything that touches those variables takes this first.
     pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Pin both switches for the duration of a test, whatever ran before.
+    /// Pin the encoder switches for the duration of a test, whatever ran
+    /// before — including the default q2tp encoder: a test that panicked
+    /// while it held `CMF_Q2TP_ENCODER=v1` must not leak it into the rest.
     pub(crate) fn env_guard(threads: &str, search: &str) -> std::sync::MutexGuard<'static, ()> {
         let g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("CMF_ENCODE_THREADS", threads);
             std::env::set_var("CMF_Q2TP_SEARCH", search);
+            std::env::remove_var("CMF_Q2TP_ENCODER");
         }
         g
     }
