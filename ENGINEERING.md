@@ -33,13 +33,14 @@ See `tools/quant/README.md` (commands, memory model, 27B sizing, recipes q4tp-v2
 - `cargo test -p cortiq-cli --bin cortiq -- dequant_raw` (5090 pod):
   `dequant_raw_and_patch_raw_round_trip_payloads_verbatim` ok.
 - `python -m unittest discover -s tools/quant/tests` (5090 pod, CPU + two CUDA tests): 20 tests ok
-  in 12.7 s — codecs (round trip, field splice, sequential f32 ladder), device decode == the numpy
+  in 12.7 s; 21 with the in-place forward test (pod B, 6.1 s) — codecs (round trip, field splice, sequential f32 ladder), device decode == the numpy
   decoder bit for bit, row-blocked == one-block matmul, the custom matmul and the chunked KL head
   against dense autograd, batched head == per-window head (also over streamed, host-parked
   boundaries on CUDA), the chunked gated delta rule against
   the token recurrence (f64), stream == resident bit for bit over 4 training steps on tiny llama
   and qwen3_5 models (CPU and CUDA), escort candidates / cached block inputs / water-fill, the
-  studies' window placement verbatim, mixed corpora, snapped write-back touches only f16 fields.
+  studies' window placement verbatim, mixed corpora, snapped write-back touches only f16 fields,
+  the in-place forward-only pass == the kept-boundary pass.
 - `tests/cortiq_parity.py --refit` (tiny random llama + qwen3_5 checkpoints converted by cortiq to
   f16 / q4tp / q2tp): torch NLL vs `cortiq ppl` (CPU exact) per window, worst relative difference
   5.2e-8; then `metric_refit.py` end to end on the q4tp and q2tp files of both architectures (f16
@@ -66,6 +67,24 @@ Speed on the shared pod: 28–39 s/step (streaming, mb 2) while three other jobs
 alone (the study's script: 6.5 s/step at 7.9 GiB). Qwen3.8-27B geometry (scale probe on the 5090,
 1.95 GB cap): 1.62 GiB peak for one 512-token window through a training step, 0.25–0.32 s/layer.
 
+### Independent verification (second agent, same day)
+
+Re-run from the committed branch with a separate build (`cargo build --release` on the 5090 pod):
+the CLI test passes; 21 Python tests pass on pod B (CPU + CUDA); `cortiq_parity.py --refit` with
+the new binary: worst torch vs cortiq 7.9e-8, all four refit chains ok (0 bytes outside the f16
+fields). `cmfcodec` decode == `cortiq dequant --dtype f32` bit for bit (q4tp, q2tp, q8_2f tensors);
+`dequant --dtype raw` == the reader's payloads. G-C2s sha256 = the journal's; it differs from C2
+only in the 294 q4tp row-param blocks and 85 f16 gains (R2t vs W128dh likewise); C2-esc = C2 with
+the 46 listed tensors replaced by q8_2f.cmf's payloads verbatim. `ppl.py` on G-C2s: 19.1319 again.
+The engine itself (`cortiq ppl`, Vulkan, probe off, 160 × 512): C2 19.562 → G-C2s 19.132,
+−2.199 % ± 0.089 paired over cortiq's own window NLLs (torch: −2.195 % ± 0.089). A fresh resident
+`metric_refit.py` run of the G-C2 recipe reproduces the streaming run's step-16 value digest
+(`b6d124542cbe8374`). Scale probe at 27B shapes: 1.62 GiB train / 0.92 GiB forward, as above.
+Fixed: forward-only passes held the inputs, the current and the next boundary set at once; they
+now replace boundaries in place (C2, 160 windows in one streamed block: peak RSS 6.27 → 5.05 GiB,
+NLLs byte-identical; ~16 GB of pinned blocks fewer at 27B with `--teacher-block 1024`), and the
+README's 27B table counts the power-of-two rounding of pinned blocks.
+
 ### Open issues
 
 - GPTQ on 32 k mixed tokens with cortiq (`quantize-gptq --tokens 32768`) was not run here; C1/C2
@@ -78,3 +97,10 @@ alone (the study's script: 6.5 s/step at 7.9 GiB). Qwen3.8-27B geometry (scale p
   `quantize-gptq` captures Hessians for all 400 hybrid linears is unverified.
 - Not done: decode caching across micro-batches, bf16 matmuls, CUDA graphs (the shared pod was
   launch-bound).
+- Qwen3.8-27B-cmf decodes with MTP speculation by default. The refit leaves the `mtp.*` tensors
+  byte-identical but retunes the trunk it drafts from: output stays exact (the trunk verifies), but
+  re-measure acceptance / tok/s of the refit file before release.
+- The f16 `lo` field moves in steps of 2^-8 log2 (0.27 % row gain) at |lo| in [4, 8) and 2^-7
+  (0.54 %) in [8, 16) — C2's rows split 65 / 35 — the same size as the trained gains (mean |a|
+  0.0055–0.0072): snapping costs part of the gain (G-C2 held-out CE 3.10660 unsnapped vs 3.10692
+  snapped). A format limit, not a tool bug.
