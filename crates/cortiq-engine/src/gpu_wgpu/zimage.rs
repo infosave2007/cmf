@@ -1399,7 +1399,7 @@ pub(super) struct MmCall {
     pub(super) grid: (u32, u32),
 }
 
-fn mm_call(
+pub(super) fn mm_call(
     c: &Ctx,
     g: MmCfg,
     a: &MmArgs,

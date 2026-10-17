@@ -49,6 +49,8 @@ pub(crate) mod gptq_dev;
 pub mod gdn_train;
 /// Trainer kernels: RMSNorm, SwiGLU, gate, q/k norm + RoPE, attention.
 pub mod train_ops;
+/// Trainer GEMMs (zi_mm) and the binary low-rank layer forward/backward.
+pub mod train_mm;
 
 /// Workgroup limit per dimension (WebGPU minimum; lm_head has more
 /// rows — we use grid-stride in the shader).
