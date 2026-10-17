@@ -176,11 +176,12 @@ At 4 bits the genesis gain is mostly in-domain (study: −0.3 … −0.8 % on do
 ### q2tp-v2 (gate/up 2-bit, everything else q4tp)
 
 1. Exports as above plus a q4tp file (escort hi file for the 2-bit tensors).
-2. GPTQ into q2tp on 32–131 k tokens — **not in cortiq yet** (`quantize-gptq` has q1s / q4tp);
-   the q2tp study's scripts: the placed ladder (per group the MSE-optimal scale instead of
-   absmax/1.5) with the full 31-rung search at sweep time (W0), the super-weight layer's gate/up
-   coded by cortiq's absmax rule (MiniCPM5 layer 7, max/rms 94), output debias (a per-row `lo`
-   shift that undoes the MSE shrinkage, zero bits).
+2. GPTQ into q2tp on 32–131 k tokens: `cortiq quantize-gptq f16.cmf --codec q2tp --calib-model
+   q8_2f.cmf ...` (see the q2tp section of `ENGINEERING.md`). Its defaults are the study's placed
+   ladder (per group the MSE-optimal scale instead of absmax/1.5) with the full 31-rung search
+   at sweep time (W0) plus the output debias (a per-row `lo` shift that undoes the MSE
+   shrinkage, zero bits): W0cd, 27.76 on MiniCPM5 at 32 k tokens. Not ported from the study:
+   its H-metric refit and code/scale alternation (the remaining gap to W128dh's 25.62).
 3. Escort with both hi files and greedy re-measure (one layer dominates at 2 bits):
    `escort.py --model q2tp.cmf --hi q4tp.cmf --hi q8_2f.cmf --greedy 2 --bpw 0.1 --write ...`
 4. Metric genesis with `--step` — the largest single step at 2 bits.
@@ -204,7 +205,9 @@ bits it is mostly in-domain (see above), so the 4-bit pass must be trained on a 
 cortiq convert --model Qwen/Qwen3.8-27B --quant f16   --output q27-f16.cmf     # 54 GB teacher
 cortiq convert --model Qwen/Qwen3.8-27B --quant q8_2f --output q27-q8_2f.cmf   # 27 GB calib/hi
 cortiq quantize-gptq q27-f16.cmf --codec q4tp --calib-model q27-q8_2f.cmf --calib mix.txt \
-    --tokens 32768 --window 2048 --hessians q27.hess --output q27-gptq.cmf
+    --tokens 32768 --window 2048 --hessians q27.hess --calib-chunk-layers 16 \
+    --tensor-quant lm_head.weight=q8_2f --tensor-quant model.embed_tokens.weight=q8_2f \
+    --output q27-gptq.cmf   # ~3.6 GB of Hessians per layer: 16 layers per pass on 128 GB
 python tools/quant/escort.py --model q27-gptq.cmf --hi q27-q8_2f.cmf --corpus mix.ids,held=0:16 \
     --bpw 0.1 --residency stream --write q27-esc.cmf --cortiq cortiq
 python tools/quant/metric_refit.py --model q27-esc.cmf --teacher q27-f16.cmf --out run27 \
