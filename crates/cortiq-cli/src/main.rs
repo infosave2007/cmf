@@ -806,9 +806,11 @@ enum Commands {
         #[arg(long = "q2tp-rule-tensor", value_name = "PATTERN=RULE")]
         q2tp_rule_tensor: Vec<String>,
         /// q2tp: remove each row's output shrinkage in the calibration metric
-        /// (slope (ŴHWᵀ)/(WHWᵀ), through the row's f16 `lo` — zero bits)
-        #[arg(long)]
-        q2tp_debias: bool,
+        /// (slope (ŴHWᵀ)/(WHWᵀ), through the row's f16 `lo` — zero bits):
+        /// `on` (default; −11 % ppl on MiniCPM5's placed arm) or `off`
+        /// (the plain GPTQ arms of the q2tp study)
+        #[arg(long, value_name = "on|off")]
+        q2tp_debias: Option<String>,
     },
     /// Chat with a model (applies the file's chat template), or one-shot
     /// with --prompt
@@ -3191,7 +3193,13 @@ async fn main() -> anyhow::Result<()> {
             q2tp_debias,
         } => {
             let codec = codec.to_ascii_lowercase();
-            let q2tp_flags = q2tp_rule.is_some() || !q2tp_rule_tensor.is_empty() || q2tp_debias;
+            let q2tp_flags =
+                q2tp_rule.is_some() || !q2tp_rule_tensor.is_empty() || q2tp_debias.is_some();
+            let q2tp_debias = match q2tp_debias.as_deref().map(str::to_ascii_lowercase).as_deref() {
+                None | Some("on" | "true" | "1") => true,
+                Some("off" | "false" | "0") => false,
+                Some(other) => anyhow::bail!("--q2tp-debias {other}: expected on or off"),
+            };
             match codec.as_str() {
                 "q4tp" | "q2tp" => {
                     let profile = convert::parse_quant(&codec)?;
