@@ -232,6 +232,7 @@ Setup:
 | **W0cd** | **placed + debias (the CLI defaults)** | **27.756** | W0: −12.36 % ± 0.67 |
 | W0cdh | W0cd + layer 7 on the cortiq rule (equal size) | **27.753** | W128dh 25.622: +8.32 % ± 0.51 (W128dh adds refit, alternation and 131k tokens) |
 | W0cd7 | W0cd + layer-7 gate/up q4tp (+0.025 bpw) | **27.485** | W7d 25.899: +6.12 % ± 0.46 (W7d adds refit and alternation) |
+| W0ca | placed + `--act-order`, debias off | 42.220 | W0c: +34.70 % ± 1.20 (static rungs; the runner now warns) |
 
 Paired differences:
 - N1c vs Q0h_v2: −57.8 % ± 1.4.
@@ -340,4 +341,6 @@ QWEN06_PLACEHOLDER
   placed scale would remove most of that cost, but it would need a parity
   check against the full search.
 - **Act order with q2tp** uses static rungs, so there is no rung choice at
-  sweep time. This was not measured in the study.
+  sweep time. Measured +35 % ppl against natural order (W0ca vs W0c), so
+  the runner warns. Act order would need sweep-time rungs, which a permuted
+  sweep cannot pick group by group.

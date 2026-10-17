@@ -1239,6 +1239,12 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
             rtn.push(slot);
         }
     }
+    if o.act_order && o.profile == Quant::Q2TiledP {
+        // Act order must fix each group's rung before its channels arrive;
+        // at 2 bits the rung chosen from the error-corrected weights is
+        // worth more than the order (MiniCPM5: 42.2 vs 31.3 ppl).
+        eprintln!("warning: --act-order fixes q2tp rungs up front — measured worse than natural order at 2 bits");
+    }
     let chunks = gptq_layer_chunks(&model, &cand, o.chunk_layers);
     eprintln!(
         "GPTQ ({codec}): {} candidate linears in {} calibration pass(es); {} tensors by the converter policy",
