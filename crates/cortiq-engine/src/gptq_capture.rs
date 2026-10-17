@@ -21,16 +21,13 @@ static ON: AtomicBool = AtomicBool::new(false);
 static FULL_H: AtomicBool = AtomicBool::new(true);
 static REG: Mutex<Option<State>> = Mutex::new(None);
 /// Keep the dense Hessians on the device (`set_device`): each distinct input
-/// gets a `gpu::gram_*` accumulator, its rows staged here and folded
-/// `STAGE_ROWS` at a time.
+/// gets a `gpu::gram_*` accumulator, every batch one `H += XᵀX` dispatch, and
+/// `Σx²` is read off the diagonal at the end instead of summed on the host.
 static DEVICE: AtomicBool = AtomicBool::new(false);
-/// Rows a device accumulator collects before one `H += XᵀX` dispatch.
-const STAGE_ROWS: usize = 1024;
 
 struct Entry {
     acc: HessianAcc,
     dev: Option<u64>,
-    stage: Vec<f32>,
 }
 
 /// One capture pass. Projections that read the same panel (q/k/v, gate/up,
@@ -40,8 +37,8 @@ struct Entry {
 struct State {
     map: HashMap<String, Entry>,
     alias: HashMap<String, String>,
-    /// The owner of the last folded input and a copy of that input.
-    last: Option<(String, Vec<f32>)>,
+    /// The owner of the last folded input, its length and content hash.
+    last: Option<(String, usize, u64)>,
     /// Aliases whose input later differed from their owner's, and device
     /// accumulators that failed: their Hessians are not valid.
     broken: Vec<String>,
@@ -153,21 +150,20 @@ fn end_impl(lazy: bool) -> Captured {
     for (name, mut e) in st.map {
         if let Some(id) = e.dev {
             on_device += 1;
-            let n = e.acc.cols;
-            let rows = e.stage.len() / n.max(1);
-            let flushed = rows == 0 || crate::gpu::gram_add(id, &e.stage, rows);
             if lazy {
-                if flushed {
-                    device.insert(name.clone(), id);
-                    hess.insert(name, e.acc);
-                } else {
-                    broken.push(name);
-                }
+                // Σx² is the diagonal; a lazy owner's stays empty until its
+                // Hessian is read back (the GPTQ fold does not use it).
+                device.insert(name.clone(), id);
+                hess.insert(name, e.acc);
                 continue;
             }
             match crate::gpu::gram_take(id) {
-                Some(h) if flushed => e.acc.h = h,
-                _ => {
+                Some(h) => {
+                    let n = e.acc.cols;
+                    e.acc.sumsq = (0..n).map(|i| h[i * n + i]).collect();
+                    e.acc.h = h;
+                }
+                None => {
                     broken.push(name);
                     continue;
                 }
@@ -231,18 +227,20 @@ fn accumulate_inner(name: &str, xs: &[f32], b: usize, cols: usize) {
         return;
     };
     let full = FULL_H.load(Ordering::Relaxed);
+    let hash = if full { content_hash(xs) } else { 0 };
     if full {
         if let Some(owner) = st.alias.get(name) {
-            let same = matches!(&st.last, Some((o, x)) if o == owner && x.as_slice() == xs);
+            let same = matches!(&st.last, Some((o, l, h)) if o == owner && *l == xs.len() && *h == hash);
             if !same && !st.broken.iter().any(|n| n == name) {
                 st.broken.push(name.to_string());
             }
             return;
         }
         if !st.map.contains_key(name)
-            && let Some((owner, x)) = &st.last
+            && let Some((owner, l, h)) = &st.last
             && owner != name
-            && x.as_slice() == xs
+            && *l == xs.len()
+            && *h == hash
             && st.map.get(owner).is_some_and(|e| e.acc.cols == cols)
         {
             st.alias.insert(name.to_string(), owner.clone());
@@ -263,34 +261,29 @@ fn accumulate_inner(name: &str, xs: &[f32], b: usize, cols: usize) {
                 } else {
                     Vec::new()
                 },
-                sumsq: vec![0.0; cols],
+                sumsq: if dev.is_some() { Vec::new() } else { vec![0.0; cols] },
                 count: 0,
             },
             dev,
-            stage: Vec::new(),
         }
     });
     if e.acc.cols != cols {
         return; // shape mismatch — skip defensively
     }
-    for bi in 0..b {
-        let x = &xs[bi * cols..(bi + 1) * cols];
-        for (i, &xi) in x.iter().enumerate() {
-            e.acc.sumsq[i] += xi as f64 * xi as f64;
-        }
-        e.acc.count += 1;
-    }
+    e.acc.count += b;
     let mut failed = false;
-    if full {
-        match e.dev {
-            Some(id) => {
-                e.stage.extend_from_slice(xs);
-                if e.stage.len() >= STAGE_ROWS * cols {
-                    failed = !crate::gpu::gram_add(id, &e.stage, e.stage.len() / cols);
-                    e.stage.clear();
+    match e.dev {
+        Some(id) => failed = !crate::gpu::gram_add(id, xs, b),
+        None => {
+            for bi in 0..b {
+                let x = &xs[bi * cols..(bi + 1) * cols];
+                for (i, &xi) in x.iter().enumerate() {
+                    e.acc.sumsq[i] += xi as f64 * xi as f64;
                 }
             }
-            None => gram_upper_add(&mut e.acc.h, xs, b, cols),
+            if full {
+                gram_upper_add(&mut e.acc.h, xs, b, cols);
+            }
         }
     }
     if failed && !st.broken.iter().any(|n| n == name) {
@@ -298,15 +291,59 @@ fn accumulate_inner(name: &str, xs: &[f32], b: usize, cols: usize) {
     }
     if full {
         match &mut st.last {
-            Some((o, x)) => {
+            Some((o, l, h)) => {
                 o.clear();
                 o.push_str(name);
-                x.clear();
-                x.extend_from_slice(xs);
+                *l = xs.len();
+                *h = hash;
             }
-            None => st.last = Some((name.to_string(), xs.to_vec())),
+            None => st.last = Some((name.to_string(), xs.len(), hash)),
         }
     }
+}
+
+/// 64-bit content hash of an activation panel (its f32 bit patterns), the
+/// identity the aliasing compares: a q/k/v or gate/up panel is hashed, never
+/// copied. Large panels hash in parallel slices, combined in order.
+fn content_hash(xs: &[f32]) -> u64 {
+    fn mix(xs: &[f32], seed: u64) -> u64 {
+        let mut h = seed ^ 0x9E37_79B9_7F4A_7C15;
+        let mut acc = [h, h.rotate_left(17), h.rotate_left(31), h.rotate_left(47)];
+        let chunks = xs.chunks_exact(8);
+        let rest = chunks.remainder();
+        for c in chunks {
+            for l in 0..4 {
+                let v = (c[2 * l].to_bits() as u64) | ((c[2 * l + 1].to_bits() as u64) << 32);
+                acc[l] = (acc[l] ^ v).wrapping_mul(0xFF51_AFD7_ED55_8CCD).rotate_left(29);
+            }
+        }
+        for &v in rest {
+            h = (h ^ v.to_bits() as u64).wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+        }
+        for a in acc {
+            h = (h ^ a).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(27);
+        }
+        h ^ xs.len() as u64
+    }
+    const SLICE: usize = 1 << 18;
+    if xs.len() < 4 * SLICE {
+        return mix(xs, 0);
+    }
+    let parts: Vec<&[f32]> = xs.chunks(SLICE).collect();
+    let mut hs = vec![0u64; parts.len()];
+    let nth = std::thread::available_parallelism().map_or(4, |p| p.get()).min(parts.len());
+    std::thread::scope(|sc| {
+        for (t, out) in hs.chunks_mut(parts.len().div_ceil(nth)).enumerate() {
+            let parts = &parts;
+            sc.spawn(move || {
+                let k0 = t * parts.len().div_ceil(nth);
+                for (k, o) in out.iter_mut().enumerate() {
+                    *o = mix(parts[k0 + k], (k0 + k) as u64);
+                }
+            });
+        }
+    });
+    hs.iter().fold(0u64, |h, &v| (h ^ v).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(23))
 }
 
 /// `H[i][j] += Σ_t x_t[i]·x_t[j]` for `j ≥ i` (upper triangle only; `end()`

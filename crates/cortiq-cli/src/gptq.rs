@@ -1264,7 +1264,23 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
     // switched off: the batched host prefill then sends each projection to
     // a per-op device GEMM with host-side input, and the hook folds that
     // input before the dispatch exactly as it does on the CPU.
-    let gpu_calib = std::env::var("CMF_GPTQ_GPU").as_deref() == Ok("1");
+    // `CMF_GPTQ_GPU=1|0` forces the choice; by default a build with a live
+    // wgpu adapter calibrates on the card. macOS stays on the host: Metal's
+    // chunk graph runs whole layer spans on the device, out of the hook's
+    // sight.
+    let gpu_calib = match std::env::var("CMF_GPTQ_GPU").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => {
+            !cfg!(target_os = "macos")
+                && std::env::var("CMF_GPU").as_deref() != Ok("0")
+                && cortiq_engine::gpu::backend_available()
+        }
+    };
+    eprintln!(
+        "calibration device: {}",
+        if gpu_calib { "GPU (per-op device GEMMs, device Hessians)" } else { "CPU" }
+    );
     // …and the Hessians themselves accumulate on the card (CMF_GPTQ_GPU_HESS=0
     // keeps the host fold).
     cortiq_engine::gptq_capture::set_device(
