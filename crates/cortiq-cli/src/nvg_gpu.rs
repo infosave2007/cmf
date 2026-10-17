@@ -142,9 +142,10 @@ impl HCtxD {
 // ───────────────────────────── model on the device ─────────────────────────────
 
 struct PathD {
-    h: Vec<f64>,
-    l: Vec<f64>,
-    g: Vec<f64>,
+    /// scales on the device (1 × m, 1 × r, 1 × n)
+    h: DMat,
+    l: DMat,
+    g: DMat,
     /// ±1, m × r
     su: DMat,
     /// ±1, n × r
@@ -157,9 +158,9 @@ struct PathD {
 impl PathD {
     fn dup(&self) -> PathD {
         PathD {
-            h: self.h.clone(),
-            l: self.l.clone(),
-            g: self.g.clone(),
+            h: self.h.dup(),
+            l: self.l.dup(),
+            g: self.g.dup(),
             su: self.su.dup(),
             sv: self.sv.dup(),
             hg: RefCell::new(self.hg.borrow().as_ref().map(|m| m.dup())),
@@ -187,28 +188,28 @@ impl ModelD {
     fn gs(&self, p: usize) -> DMat {
         let q = &self.paths[p];
         let o = DMat::zeros(self.n, self.r);
-        dv::scale_into(&q.sv, &o, Some(&vec_dev(&q.g)), None, 0, 1.0);
+        dv::scale_into(&q.sv, &o, Some(&q.g), None, 0, 1.0);
         o
     }
     /// `diag(h) S_U diag(ℓ)` (m × r)
     fn hsl(&self, p: usize) -> DMat {
         let q = &self.paths[p];
         let o = DMat::zeros(self.m, self.r);
-        dv::scale_into(&q.su, &o, Some(&vec_dev(&q.h)), Some(&vec_dev(&q.l)), 0, 1.0);
+        dv::scale_into(&q.su, &o, Some(&q.h), Some(&q.l), 0, 1.0);
         o
     }
     /// `diag(h) S_U` (m × r)
     fn hs(&self, p: usize) -> DMat {
         let q = &self.paths[p];
         let o = DMat::zeros(self.m, self.r);
-        dv::scale_into(&q.su, &o, Some(&vec_dev(&q.h)), None, 0, 1.0);
+        dv::scale_into(&q.su, &o, Some(&q.h), None, 0, 1.0);
         o
     }
     /// `S_U diag(ℓ)` (m × r)
     fn sl(&self, p: usize) -> DMat {
         let q = &self.paths[p];
         let o = DMat::zeros(self.m, self.r);
-        dv::scale_into(&q.su, &o, None, Some(&vec_dev(&q.l)), 0, 1.0);
+        dv::scale_into(&q.su, &o, None, Some(&q.l), 0, 1.0);
         o
     }
     fn ensure_caches(&self, p: usize, c: &TCtxD) {
@@ -238,11 +239,11 @@ impl ModelD {
             .paths
             .iter()
             .map(|q| BlrPath {
-                h: q.h.clone(),
+                h: q.h.to_f64(),
                 su: Mat::from_vec(self.m, self.r, q.su.to_f64()),
-                l: q.l.clone(),
+                l: q.l.to_f64(),
                 sv: Mat::from_vec(self.n, self.r, q.sv.to_f64()),
-                g: q.g.clone(),
+                g: q.g.to_f64(),
             })
             .collect();
         BlrModel { paths, m: self.m, n: self.n, r: self.r }
@@ -273,24 +274,35 @@ enum Metric {
     Sel,
 }
 
-/// `tr((W−Ŵ) X (W−Ŵ)ᵀ)` by the factor-sized expansion.
+/// `tr((W−Ŵ) X (W−Ŵ)ᵀ)` by the factor-sized expansion (all the inner
+/// products read back together).
 fn herr_d(md: &ModelD, c: &TCtxD, x: Metric) -> f64 {
     let np = md.paths.len();
     let (m, r) = (md.m, md.r);
     let gss: Vec<DMat> = (0..np).map(|p| md.gs(p)).collect();
     let hsls: Vec<DMat> = (0..np).map(|p| md.hsl(p)).collect();
-    let mut b = 0f64;
-    let mut cc = 0f64;
+    let mut fb = dv::FrobBatch::new();
+    let mut keep: Vec<DMat> = Vec::new();
+    let mut bslots = Vec::new();
+    let mut fslots = Vec::new();
     for p in 0..np {
-        b += match x {
-            Metric::H | Metric::Fit => dv::frob(&hsls[p], &md.whg(p, c), m * r),
-            Metric::Sel => dv::frob(&hsls[p], &dv::mm(&c.whsel, false, &gss[p], false), m * r),
-        };
+        match x {
+            Metric::H | Metric::Fit => bslots.push(fb.add(&hsls[p], &md.whg(p, c), m * r)),
+            Metric::Sel => {
+                let t = dv::mm(&c.whsel, false, &gss[p], false);
+                bslots.push(fb.add(&hsls[p], &t, m * r));
+                keep.push(t);
+            }
+        }
         if x == Metric::Fit {
-            b -= c.hc.c_fit * dv::frob(&hsls[p], &dv::mm(&c.w, false, &gss[p], false), m * r);
+            let t = dv::mm(&c.w, false, &gss[p], false);
+            fslots.push(fb.add(&hsls[p], &t, m * r));
+            keep.push(t);
         }
     }
     let xg: Vec<Option<DMat>> = (0..np).map(|q| (x == Metric::Sel).then(|| dv::mm(&c.hc.hsel, false, &gss[q], false))).collect();
+    let mut cslots = Vec::new();
+    let mut c2slots = Vec::new();
     for p in 0..np {
         for q in 0..np {
             let t = dv::mm(&hsls[p], true, &hsls[q], false);
@@ -298,13 +310,20 @@ fn herr_d(md: &ModelD, c: &TCtxD, x: Metric) -> f64 {
                 Metric::Sel => dv::mm(&gss[p], true, xg[q].as_ref().unwrap(), false),
                 _ => dv::mm(&gss[p], true, &md.hg(q, c), false),
             };
-            cc += dv::frob(&t, &u, r * r);
+            cslots.push(fb.add(&t, &u, r * r));
             if x == Metric::Fit {
                 let u2 = dv::mm(&gss[p], true, &gss[q], false);
-                cc -= c.hc.c_fit * dv::frob(&t, &u2, r * r);
+                c2slots.push(fb.add(&t, &u2, r * r));
+                keep.push(u2);
             }
+            keep.push(t);
+            keep.push(u);
         }
     }
+    let v = fb.read();
+    drop(keep);
+    let b: f64 = bslots.iter().map(|&k| v[k]).sum::<f64>() - c.hc.c_fit * fslots.iter().map(|&k| v[k]).sum::<f64>();
+    let cc: f64 = cslots.iter().map(|&k| v[k]).sum::<f64>() - c.hc.c_fit * c2slots.iter().map(|&k| v[k]).sum::<f64>();
     let a = match x {
         Metric::H => c.a_h,
         Metric::Fit => c.a_h - c.hc.c_fit * c.w2,
@@ -376,25 +395,35 @@ fn latents_d(c: &TCtxD, t: &DMat, th: Option<&DMat>, r: usize) -> anyhow::Result
 
 /// Orthogonal polar factor of the square `mm` by Newton–Schulz
 /// (`X ← X(3I − XᵀX)/2` from `M/‖M‖_F`), until `‖XᵀX − I‖_F ≤ 1e-4`.
-fn polar_d(mm: &DMat) -> DMat {
+fn polar_d(mm: &DMat, prof: Option<&Prof>) -> DMat {
     let r = mm.r;
-    let f = dv::frob(mm, mm, r * r).sqrt().max(1e-30);
     let mut x = DMat::zeros(r, r);
-    dv::scale_into(mm, &x, None, None, 0, (1.0 / f) as f32);
+    dv::normalize_frob(mm, &x);
     let mut y = DMat::zeros(r, r);
     let a = DMat::zeros(r, r);
-    for it in 0..60 {
+    // Checked after NS_FIRST iterations and then every NS_STEP: each check
+    // is a readback, so they are few.
+    const NS_FIRST: usize = 12;
+    const NS_STEP: usize = 4;
+    let mut it = 0;
+    loop {
         dv::gemm(1.0, &x, true, &x, false, 0.0, &a);
-        if it >= 6 && it % 3 == 0 {
-            let fa = dv::frob(&a, &a, r * r);
+        if it >= NS_FIRST && (it - NS_FIRST) % NS_STEP == 0 {
+            let mut fb = dv::FrobBatch::new();
+            fb.add(&a, &a, r * r);
+            let fa = fb.read()[0];
             let tr: f64 = dv::diag(&a, r, 0, r).iter().sum();
-            if (fa - 2.0 * tr + r as f64).max(0.0).sqrt() <= 1e-4 {
+            if (fa - 2.0 * tr + r as f64).max(0.0).sqrt() <= 1e-4 || it >= 60 {
                 break;
             }
         }
         dv::gemm(1.0, &x, false, &a, false, 0.0, &y);
         dv::axpby(1.5, &x, -0.5, &y);
         std::mem::swap(&mut x, &mut y);
+        it += 1;
+    }
+    if let Some(p) = prof {
+        p.add("itq.ns_iters", 0.0, it as u64);
     }
     x
 }
@@ -425,7 +454,7 @@ fn itq_d(c: &TCtxD, up: &DMat, vp: &DMat, wu: &[f64], wv: &[f64], iters: usize) 
             dv::scale_rc(nn, r, None, (&xr, 0, r), Some(&w2d), None, INPLACE | SIGN, 1.0, 0.0);
             dv::gemm(1.0, &x, true, &xr, false, 0.0, &mm);
         });
-        rot = ps(prof, "itq.polar", || polar_d(&mm));
+        rot = ps(prof, "itq.polar", || polar_d(&mm, prof));
     }
     ps(prof, "itq.gemm", || (dv::mm(up, false, &rot, false), dv::mm(vp, false, &rot, false)))
 }
@@ -478,8 +507,8 @@ fn svid_d(c: &TCtxD, up: &DMat, vp: &DMat) -> PathD {
     let va = DMat::zeros(n, r);
     dv::scale_into(vp, &va, None, None, ABS, 1.0);
     let (g, lv) = rank1_d(c, &va);
-    let l = lu.iter().zip(&lv).map(|(a, b)| a * b).collect();
-    PathD { h, l, g, su, sv, hg: RefCell::new(None), whg: RefCell::new(None) }
+    let l: Vec<f64> = lu.iter().zip(&lv).map(|(a, b)| a * b).collect();
+    PathD { h: vec_dev(&h), l: vec_dev(&l), g: vec_dev(&g), su, sv, hg: RefCell::new(None), whg: RefCell::new(None) }
 }
 
 // ───────────────────────────── closed-form metric (Ť) ─────────────────────────────
@@ -488,7 +517,9 @@ fn host_solve() -> bool {
     std::env::var("CMF_NVG_HOST_SOLVE").as_deref() == Ok("1")
 }
 
-/// Exact block least squares for ℓ (joint), h (per row), g (per path).
+/// Exact block least squares for ℓ (joint), h (per row), g (per path), the
+/// scales staying on the device (one readback per factorisation: its pivot
+/// flag).
 fn als_d(md: &mut ModelD, c: &TCtxD, sweeps: usize) {
     let (m, n, r) = (md.m, md.n, md.r);
     let np = md.paths.len();
@@ -496,7 +527,7 @@ fn als_d(md: &mut ModelD, c: &TCtxD, sweeps: usize) {
     let prof = c.prof;
     for _ in 0..sweeps {
         // ℓ
-        let (bhb, lam) = ps(prof, "als.l", || {
+        let bhb = ps(prof, "als.l", || {
             let gss: Vec<DMat> = (0..np).map(|p| md.gs(p)).collect();
             let hss: Vec<DMat> = (0..np).map(|p| md.hs(p)).collect();
             let bhb = DMat::zeros(pr, pr);
@@ -512,55 +543,41 @@ fn als_d(md: &mut ModelD, c: &TCtxD, sweeps: usize) {
                     dv::gemm_v(r, r, m, 1.0, V::t(&hss[p]), V::n(&hss[q]), 0.0, &sys, p * r * pr + q * r, pr, Some(&bhb));
                 }
             }
-            let mut rhs = Vec::with_capacity(pr);
+            let rhs = DMat::zeros(1, pr);
             for p in 0..np {
-                rhs.extend(dv::colsum_prod(m, r, &hss[p], 0, r, &md.whg(p, c), 0, r));
+                dv::colsum_dev(m, r, &hss[p], 0, r, &md.whg(p, c), 0, r, &rhs, p * r);
             }
             let lam = if host_solve() {
-                solve_spd(c.pool, &Mat::from_vec(pr, pr, sys.to_f64()), &rhs, 1e-10)
+                let x = solve_spd(c.pool, &Mat::from_vec(pr, pr, sys.to_f64()), &rhs.to_f64(), 1e-10);
+                vec_dev(&x)
             } else {
-                dv::spd_solve(&sys, &rhs, 1e-10)
+                dv::spd_solve_d(&sys, &rhs, 1e-10)
             };
-            (bhb, lam)
+            for p in 0..np {
+                dv::copy_range(&lam, p * r, &md.paths[p].l, 0, r);
+            }
+            bhb
         });
-        for p in 0..np {
-            md.paths[p].l.copy_from_slice(&lam[p * r..(p + 1) * r]);
-        }
         // h (B unchanged since the ℓ step: reuse its blocks)
         ps(prof, "als.h", || {
             let sls: Vec<DMat> = (0..np).map(|p| md.sl(p)).collect();
-            let rowv = DMat::zeros(1, m);
-            let mut rh = vec![[0f64; 2]; m];
-            let mut gm = vec![[[0f64; 2]; 2]; m];
+            let rh: Vec<DMat> = (0..2).map(|_| DMat::zeros(1, m)).collect();
+            let gm: Vec<DMat> = (0..3).map(|_| DMat::zeros(1, m)).collect();
             for a in 0..np {
-                dv::rowdot(m, r, &md.whg(a, c), 0, r, &sls[a], 0, r, &rowv);
-                for (i, v) in rowv.to_f64().into_iter().enumerate() {
-                    rh[i][a] = v;
-                }
+                dv::rowdot(m, r, &md.whg(a, c), 0, r, &sls[a], 0, r, &rh[a]);
                 for cq in a..np {
                     let mk = DMat::zeros(m, r);
                     let kac = V { m: &bhb, off: a * r * pr + cq * r, ld: pr, t: false };
                     dv::gemm_v(m, r, r, 1.0, V::n(&sls[a]), kac, 0.0, &mk, 0, r, None);
-                    dv::rowdot(m, r, &mk, 0, r, &sls[cq], 0, r, &rowv);
-                    for (i, v) in rowv.to_f64().into_iter().enumerate() {
-                        gm[i][a][cq] = v;
-                        gm[i][cq][a] = v;
-                    }
+                    dv::rowdot(m, r, &mk, 0, r, &sls[cq], 0, r, &gm[a + cq]);
                 }
             }
-            for i in 0..m {
-                let tr: f64 = (0..np).map(|a| gm[i][a][a]).sum::<f64>() / np as f64;
-                let ridge = 1e-10 * tr.max(1e-300);
-                if np == 1 {
-                    md.paths[0].h[i] = rh[i][0] / (gm[i][0][0] + ridge);
-                } else {
-                    let (a11, a12, a22) = (gm[i][0][0] + ridge, gm[i][0][1], gm[i][1][1] + ridge);
-                    let det = a11 * a22 - a12 * a12;
-                    if det.abs() > 0.0 {
-                        md.paths[0].h[i] = (a22 * rh[i][0] - a12 * rh[i][1]) / det;
-                        md.paths[1].h[i] = (a11 * rh[i][1] - a12 * rh[i][0]) / det;
-                    }
-                }
+            if np == 1 {
+                let unused = DMat::zeros(1, 4);
+                dv::hsolve(m, 1, &rh[0], &rh[1], &gm[0], &gm[1], &gm[2], &md.paths[0].h, &unused);
+            } else {
+                let (p0, p1) = md.paths.split_at(1);
+                dv::hsolve(m, 2, &rh[0], &rh[1], &gm[0], &gm[1], &gm[2], &p0[0].h, &p1[0].h);
             }
         });
         drop(bhb);
@@ -576,16 +593,15 @@ fn als_d(md: &mut ModelD, c: &TCtxD, sweeps: usize) {
                     let t = dv::mm(&md.hsl(q), true, &hsl, false);
                     dv::gemm(-1.0, &md.hg(q, c), false, &t, false, 1.0, &y);
                 }
-                let rhsd = DMat::zeros(1, n);
-                dv::rowdot(n, r, &md.paths[p].sv, 0, r, &y, 0, r, &rhsd);
+                let rhs = DMat::zeros(1, n);
+                dv::rowdot(n, r, &md.paths[p].sv, 0, r, &y, 0, r, &rhs);
                 drop(y);
-                let rhs = rhsd.to_f64();
                 let k = dv::mm(&hsl, true, &hsl, false);
                 let svk = dv::mm(&md.paths[p].sv, false, &k, false);
                 let ctc = DMat::zeros(n, n);
                 dv::gemm_v(n, n, r, 1.0, V::n(&svk), V::t(&md.paths[p].sv), 0.0, &ctc, 0, n, Some(&c.hc.h));
                 drop(svk);
-                md.paths[p].g = dv::spd_solve(&ctc, &rhs, 1e-10);
+                md.paths[p].g = dv::spd_solve_d(&ctc, &rhs, 1e-10);
                 md.paths[p].invalidate();
             }
         });
@@ -611,10 +627,10 @@ fn flip_u_d(md: &mut ModelD, c: &TCtxD, pi: usize) -> u64 {
             dv::gemm(-1.0, &md.hsl(q), false, &kqp, false, 1.0, &whb);
         }
         let qm = DMat::zeros(r, r);
-        let ld = vec_dev(&md.paths[pi].l);
-        dv::scale_into(&k, &qm, Some(&ld), Some(&ld), 0, 1.0);
+        let ld = &md.paths[pi].l;
+        dv::scale_into(&k, &qm, Some(ld), Some(ld), 0, 1.0);
         let qs = dv::mm(&md.paths[pi].su, false, &qm, false);
-        if let Some(n) = dv::flipu_blocked(&md.paths[pi].su, &qs, &whb, &qm, &vec_dev(&md.paths[pi].h), &ld, m, r, FLIP_TOL) {
+        if let Some(n) = dv::flipu_blocked(&md.paths[pi].su, &qs, &whb, &qm, &md.paths[pi].h, ld, m, r, FLIP_TOL) {
             return n;
         }
     }
@@ -627,11 +643,11 @@ fn flip_u_d(md: &mut ModelD, c: &TCtxD, pi: usize) -> u64 {
         dv::gemm(-1.0, &kpq, false, &md.hsl(q), true, 1.0, &whbt);
     }
     let q = DMat::zeros(r, r);
-    let ld = vec_dev(&md.paths[pi].l);
-    dv::scale_into(&k, &q, Some(&ld), Some(&ld), 0, 1.0);
+    let ld = &md.paths[pi].l;
+    dv::scale_into(&k, &q, Some(ld), Some(ld), 0, 1.0);
     let qst = dv::mm(&q, false, &md.paths[pi].su, true);
     let sut = dv::transpose(&md.paths[pi].su);
-    let flips = dv::flipu(&sut, &qst, &whbt, &q, &vec_dev(&md.paths[pi].h), &ld, m, r, FLIP_TOL);
+    let flips = dv::flipu(&sut, &qst, &whbt, &q, &md.paths[pi].h, ld, m, r, FLIP_TOL);
     md.paths[pi].su = dv::transpose(&sut);
     flips
 }
@@ -665,10 +681,7 @@ fn gptq_v_d(md: &mut ModelD, c: &TCtxD, pi: usize) -> u64 {
         b0 = b1;
     }
     dv::permute_rows(&s, &md.paths[pi].sv, &c.hc.perm_buf, true);
-    let egh = eg.to_f32();
-    for j in 0..n {
-        md.paths[pi].g[c.hc.perm[j]] = egh[128 * r + j] as f64;
-    }
+    dv::scatter_vec(&eg, 128 * r, &md.paths[pi].g, &c.hc.perm_buf, n);
     md.paths[pi].invalidate();
     cnt.to_f32()[0].to_bits() as u64
 }
@@ -799,9 +812,9 @@ pub fn encode_nvg_dev(
     let Some((bytes, st)) = ps(prof, "select", || pack(&md.to_host())) else { return Ok(None) };
     // the stored (rebalanced, f16-rounded) scales, same signs
     for (q, s) in md.paths.iter_mut().zip(&st.paths) {
-        q.h = s.h.clone();
-        q.l = s.l.clone();
-        q.g = s.g.clone();
+        q.h = vec_dev(&s.h);
+        q.l = vec_dev(&s.l);
+        q.g = vec_dev(&s.g);
         q.invalidate();
     }
     let (ef, es) = ps(prof, "select", || (rel_d(&md, &c, Metric::Fit), rel_d(&md, &c, Metric::Sel)));
@@ -844,9 +857,9 @@ fn model_to_dev(md: &BlrModel) -> ModelD {
         .paths
         .iter()
         .map(|q| PathD {
-            h: q.h.clone(),
-            l: q.l.clone(),
-            g: q.g.clone(),
+            h: vec_dev(&q.h),
+            l: vec_dev(&q.l),
+            g: vec_dev(&q.g),
             su: DMat::from_f64(md.m, md.r, &q.su.d),
             sv: DMat::from_f64(md.n, md.r, &q.sv.d),
             hg: RefCell::new(None),
@@ -985,7 +998,7 @@ mod tests {
         let mut s = 3u64;
         let mm = Mat::from_vec(40, 40, (0..1600).map(|_| rnd(&mut s)).collect());
         let want = crate::nvg_linalg::polar(None, &mm);
-        let got = polar_d(&DMat::from_f64(40, 40, &mm.d)).to_f64();
+        let got = polar_d(&DMat::from_f64(40, 40, &mm.d), None).to_f64();
         assert!(reld(&got, &want.d) < 1e-4, "polar {}", reld(&got, &want.d));
     }
 
@@ -1002,9 +1015,10 @@ mod tests {
         let mut ad = model_to_dev(&base);
         als_d(&mut ad, &c, 1);
         for p in 0..2 {
-            assert!(reld(&ad.paths[p].l, &a.paths[p].l) < 2e-3, "l{p} {}", reld(&ad.paths[p].l, &a.paths[p].l));
-            assert!(reld(&ad.paths[p].h, &a.paths[p].h) < 2e-3, "h{p} {}", reld(&ad.paths[p].h, &a.paths[p].h));
-            assert!(reld(&ad.paths[p].g, &a.paths[p].g) < 2e-3, "g{p} {}", reld(&ad.paths[p].g, &a.paths[p].g));
+            let (l, h, g) = (ad.paths[p].l.to_f64(), ad.paths[p].h.to_f64(), ad.paths[p].g.to_f64());
+            assert!(reld(&l, &a.paths[p].l) < 2e-3, "l{p} {}", reld(&l, &a.paths[p].l));
+            assert!(reld(&h, &a.paths[p].h) < 2e-3, "h{p} {}", reld(&h, &a.paths[p].h));
+            assert!(reld(&g, &a.paths[p].g) < 2e-3, "g{p} {}", reld(&g, &a.paths[p].g));
         }
         let (e, ed) = (err_cpu(&f, &a, &f.hc.hf), herr_d(&ad, &c, Metric::H));
         assert!((e - ed).abs() <= 1e-3 * e, "als err {ed} vs {e}");
@@ -1024,7 +1038,8 @@ mod tests {
         let sv = gd.paths[1].sv.to_f64();
         let diff = sv.iter().zip(&g.paths[1].sv.d).filter(|(x, y)| x != y).count();
         assert!(diff * 100 <= sv.len(), "gptq_v: {diff} of {} signs differ", sv.len());
-        assert!(reld(&gd.paths[1].g, &g.paths[1].g) < 2e-2, "gptq_v g {}", reld(&gd.paths[1].g, &g.paths[1].g));
+        let gg = gd.paths[1].g.to_f64();
+        assert!(reld(&gg, &g.paths[1].g) < 2e-2, "gptq_v g {}", reld(&gg, &g.paths[1].g));
         let (e, ed) = (err_cpu(&f, &g, &f.hc.hf), herr_d(&gd, &c, Metric::H));
         assert!((e - ed).abs() <= 1e-2 * e, "gptq_v err {ed} vs {e}");
     }

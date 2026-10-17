@@ -301,7 +301,8 @@ fn run_layer(model: &Arc<CmfModel>, o: &BenchOpts, l: usize) -> anyhow::Result<(
             jobs.push(crate::nvg_gpu::Job { w: nvg::load_f64(model, slot)?, hc: &hctx[nvg::input_lead(short)], mult: mult_of(short) });
         }
         let te = Instant::now();
-        let done = crate::nvg_gpu::encode_many(&jobs, o.bpw, o.paths, o.threads, o.jobs, true, &|i, d| {
+        // stage syncs would serialise concurrent tensors: profile only with one job
+        let done = crate::nvg_gpu::encode_many(&jobs, o.bpw, o.paths, o.threads, o.jobs, o.jobs == 1, &|i, d| {
             let name = &model.tensors[mine[i].0].name;
             match &d.enc {
                 Ok(Some(e)) => println!("[gpu] {name} {}x{} {} ({:.1}s)", jobs[i].w.r, jobs[i].w.c, e.line, d.secs),
