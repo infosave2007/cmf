@@ -122,7 +122,7 @@ impl Param {
 /// (teacher), or a small dense f32 matrix (frozen).
 pub enum Lin {
     Blr { blr: Blr, role: &'static str, params: Vec<[Param; 3]> },
-    Plane { w: wgpu::Buffer, wt: wgpu::Buffer, m: usize, k: usize },
+    Plane { w: wgpu::Buffer, wt: Option<wgpu::Buffer>, m: usize, k: usize },
     Dense { w: wgpu::Buffer, m: usize, k: usize },
 }
 
@@ -256,7 +256,7 @@ fn load_blr(c: Ctx, bytes: &[u8], role: &'static str) -> Result<Lin, String> {
     Ok(Lin::Blr { blr: Blr { m, n, r: rp, paths }, role, params })
 }
 
-fn load_lin(c: Ctx, m: &CmfModel, name: &str, role: &'static str, as_plane: bool) -> Result<Lin, String> {
+fn load_lin(c: Ctx, m: &CmfModel, name: &str, role: &'static str, as_plane: bool, bwd: bool) -> Result<Lin, String> {
     let e = m.tensor(name).ok_or_else(|| format!("missing tensor {name}"))?;
     if e.dtype as u8 == 19 {
         return load_blr(c, m.entry_bytes(e), role);
@@ -264,8 +264,8 @@ fn load_lin(c: Ctx, m: &CmfModel, name: &str, role: &'static str, as_plane: bool
     let (v, shape) = deq(m, name)?;
     let (rows, cols) = (shape[0], shape[1]);
     if as_plane && rows % 128 == 0 && cols % 32 == 0 {
-        let wt = transpose(&v, rows, cols);
-        Ok(Lin::Plane { w: f16_plane(c, &v), wt: f16_plane(c, &wt), m: rows, k: cols })
+        let wt = bwd.then(|| f16_plane(c, &transpose(&v, rows, cols)));
+        Ok(Lin::Plane { w: f16_plane(c, &v), wt, m: rows, k: cols })
     } else {
         Ok(Lin::Dense { w: to::upload(c, &v), m: rows, k: cols })
     }
@@ -275,19 +275,19 @@ impl Net {
     /// Device copy of `model` (`plane` = frozen f16 planes for every
     /// non-binary linear: the teacher; the student's binary low-rank
     /// tensors always load as such).
-    pub fn load(c: Ctx, model: &CmfModel, plane: bool) -> Result<Self, String> {
+    pub fn load(c: Ctx, model: &CmfModel, plane: bool, bwd: bool) -> Result<Self, String> {
         let geom = Geom::from_model(model)?;
         let norm = |name: &str| -> Result<Param, String> { Ok(Param::new(c, &deq(model, name)?.0, None)) };
         let mut layers = Vec::with_capacity(geom.nl);
         for li in 0..geom.nl {
             let p = format!("model.layers.{li}.");
-            let lin = |n: &str, role: &'static str| load_lin(c, model, &format!("{p}{n}"), role, plane);
+            let lin = |n: &str, role: &'static str| load_lin(c, model, &format!("{p}{n}"), role, plane, bwd);
             let mix = if geom.gdn_layer[li] {
                 Mix::Gdn {
                     qkv: lin("linear_attn.in_proj_qkv.weight", "gdn.qkv")?,
                     z: lin("linear_attn.in_proj_z.weight", "gdn.z")?,
-                    a: load_lin(c, model, &format!("{p}linear_attn.in_proj_a.weight"), "gdn.a", false)?,
-                    b: load_lin(c, model, &format!("{p}linear_attn.in_proj_b.weight"), "gdn.b", false)?,
+                    a: load_lin(c, model, &format!("{p}linear_attn.in_proj_a.weight"), "gdn.a", false, bwd)?,
+                    b: load_lin(c, model, &format!("{p}linear_attn.in_proj_b.weight"), "gdn.b", false, bwd)?,
                     out: lin("linear_attn.out_proj.weight", "gdn.out")?,
                     a_log: deq(model, &format!("{p}linear_attn.A_log"))?.0,
                     dt_bias: deq(model, &format!("{p}linear_attn.dt_bias"))?.0,
@@ -317,7 +317,10 @@ impl Net {
         let (emb, eshape) = deq(model, "model.embed_tokens.weight")?;
         let head_w = if model.tensor("lm_head.weight").is_some() { deq(model, "lm_head.weight")?.0 } else { emb.clone() };
         let (v, hs) = (eshape[0], eshape[1]);
-        let head = Head { v, hs, w: f16_plane(c, &head_w), wt: f16_plane(c, &transpose(&head_w, v, hs)) };
+        // The teacher only needs the head's forward plane; a 1-element stub
+        // stands in for the transpose it never reads.
+        let wt = if bwd { f16_plane(c, &transpose(&head_w, v, hs)) } else { tm::f16_buf(c, 2) };
+        let head = Head { v, hs, w: f16_plane(c, &head_w), wt };
         let embed = emb.iter().map(|&f| f32_to_f16(f)).collect();
         Ok(Net { geom, layers, final_norm, head, embed })
     }
@@ -513,6 +516,7 @@ fn lin_bwd(c: Ctx, w: &Work, lin: &Lin, x: &wgpu::Buffer, dy: &wgpu::Buffer, dx:
             }
         }
         Lin::Plane { wt, m, k, .. } => {
+            let wt = wt.as_ref()?;
             let target = if acc { w.get("tmp_h") } else { dx };
             tm::plane_linear(c, wt, dy, &w.act16, target, ntok, *k, *m, gscale)?;
             if acc {
@@ -740,13 +744,43 @@ pub fn step(c: Ctx, net: &Net, w: &Work, ids: &[u32], tid: &[u32], tp: &[f32], k
     Some(StepStats { loss, finite: loss.is_finite() })
 }
 
-/// Adam over every parameter (masked entries stay put); clears the grads.
-pub fn adam(c: Ctx, net: &Net, lr: f32, step_no: u32, b1: f32, b2: f32, eps: f32) -> Option<()> {
+/// Global gradient norm over every parameter (NaN/inf when a gradient is).
+pub fn grad_norm(c: Ctx, net: &Net) -> Option<f64> {
+    let mut s = 0f64;
     for p in net.params() {
-        tm::run(c, &[Op::D(tm::adam(c, &p.w, &p.g, &p.m1, &p.m2, p.mask.as_ref(), p.n, lr, step_no, b1, b2, eps)?)]);
+        s += tm::sumsq(c, &p.g, p.n)?;
+    }
+    Some(s.sqrt())
+}
+
+/// Clear every gradient (a skipped step).
+pub fn zero_grads(c: Ctx, net: &Net) {
+    for p in net.params() {
+        zero(c, &p.g, p.n);
+    }
+}
+
+/// Adam over every parameter (masked entries stay put), the gradients
+/// multiplied by `gmul` (clipping); clears the grads.
+#[allow(clippy::too_many_arguments)]
+pub fn adam(c: Ctx, net: &Net, lr: f32, step_no: u32, b1: f32, b2: f32, eps: f32, gmul: f32) -> Option<()> {
+    for p in net.params() {
+        tm::run(c, &[Op::D(tm::adam(c, &p.w, &p.g, &p.m1, &p.m2, p.mask.as_ref(), p.n, lr, step_no, b1, b2, eps, gmul)?)]);
         zero(c, &p.g, p.n);
     }
     Some(())
+}
+
+/// Host copy of every parameter's values (best-checkpoint keeping).
+pub fn snapshot(c: Ctx, net: &Net) -> Option<Vec<Vec<f32>>> {
+    net.params().iter().map(|p| to::download(c, &p.w, p.n)).collect()
+}
+
+/// Restore a [`snapshot`].
+pub fn restore(c: Ctx, net: &Net, snap: &[Vec<f32>]) {
+    for (p, v) in net.params().iter().zip(snap) {
+        c.queue.write_buffer(&p.w, 0, bytemuck::cast_slice(v));
+    }
 }
 
 /// Copy the trained metric of every binary low-rank tensor and every norm
@@ -845,8 +879,8 @@ mod tests {
         let Ok(path) = std::env::var("CMF_TRAIN_TEST_MODEL") else { return };
         let Some(c) = to::dev() else { return };
         let model = CmfModel::open_sharded(&path).expect("model");
-        let teacher = Net::load(c, &model, true).expect("teacher");
-        let student = Net::load(c, &model, true).expect("student");
+        let teacher = Net::load(c, &model, true, false).expect("teacher");
+        let student = Net::load(c, &model, true, true).expect("student");
         let (nb, t, k) = (2usize, 64usize, 32usize);
         let w = Work::new(c, &teacher, nb, t);
         let vocab = teacher.geom.vocab as u64;

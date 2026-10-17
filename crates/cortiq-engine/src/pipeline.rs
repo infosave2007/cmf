@@ -8659,6 +8659,21 @@ impl Pipeline {
         result
     }
 
+    /// GPTQ calibration of a Flash-Next-class MoE (`qwen4_exp`): MoE input
+    /// rows and router logits of layers `lo..hi` for `ids` (a fresh
+    /// sequence), per layer `[ids.len()][hidden + n_experts]`.
+    #[cfg(feature = "gpu")]
+    pub fn qwen4_capture(&mut self, ids: &[u32], lo: usize, hi: usize) -> Result<Vec<Vec<f32>>, String> {
+        let b = self.qwen4_exp.as_mut().ok_or("not a qwen4_exp model")?;
+        crate::qwen4_exp::capture_window(&b.0, &b.1, &b.2, &mut b.3, ids, lo, hi, &self.inv_freq, self.pool.as_deref())
+    }
+
+    /// Expert directory triples of a `qwen4_exp` layer (routed, shared).
+    pub fn qwen4_expert_dirs(&self, li: usize) -> Option<(Vec<(usize, usize, usize)>, Option<(usize, usize, usize)>)> {
+        let b = self.qwen4_exp.as_ref()?;
+        crate::qwen4_exp::expert_dirs(&b.1, li)
+    }
+
     /// DTG-MA calibration pass (Patent 2): run `ids` through the model
     /// (CPU path, per position) and return each layer's per-neuron
     /// activation mass Σ|silu(gate)·up| — the statistic the task-guided

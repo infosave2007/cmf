@@ -6084,7 +6084,7 @@ fn with_retry<T>(attempts: u32, mut f: impl FnMut() -> anyhow::Result<T>) -> any
 /// Fetch one file into `dest` (cached). Large range-capable files are pulled in
 /// parallel 32 MiB chunks over `threads` reused connections; otherwise a single
 /// stream. Returns false on 404 when `required` is false.
-fn fetch(
+pub(crate) fn fetch(
     agent: &ureq::Agent,
     url: &str,
     dest: &Path,
