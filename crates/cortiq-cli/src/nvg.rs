@@ -1133,12 +1133,12 @@ pub struct BlrOpts {
 /// The calibration work file of layer `l`: only layers `0..=l` (later
 /// layers are never run), no MTP head. None when the architecture carries
 /// per-layer structure this cut does not know how to shorten.
-fn truncated_header(header: &cortiq_core::format::CmfHeader, l: usize) -> Option<cortiq_core::format::CmfHeader> {
+pub(crate) fn truncated_header(header: &cortiq_core::format::CmfHeader, l: usize) -> Option<cortiq_core::format::CmfHeader> {
     let a = &header.arch;
     if a.moe.is_some()
         || a.qwen4_exp.is_some()
         || a.mla.is_some()
-        || a.linear_core.is_some()
+        || a.linear_core.as_ref().is_some_and(|lc| lc.kind != "gated_delta_net" || lc.phase_delta_layers.is_some())
         || a.anchor_core.is_some()
         || a.g3n.is_some()
         || a.prism_hadamard.is_some()
@@ -1161,7 +1161,7 @@ fn truncated_header(header: &cortiq_core::format::CmfHeader, l: usize) -> Option
     Some(h)
 }
 
-fn keep_in_truncated(name: &str, l: usize) -> bool {
+pub(crate) fn keep_in_truncated(name: &str, l: usize) -> bool {
     if name.starts_with("model.mtp.") || name.starts_with("mtp.") {
         return false;
     }
@@ -1504,43 +1504,39 @@ pub fn run_convert_blr(
                 let tc = tl.elapsed().as_secs_f64();
                 #[cfg(feature = "gpu")]
                 if gpu {
-                    // One tensor at a time on the device, grouped by input so
-                    // each input's context is built once and freed after.
-                    let pool = Pool::new(threads.saturating_sub(1).max(1));
-                    let mut results: Vec<(usize, Option<Encoded>)> = Vec::new();
+                    // The layer's input contexts once each, then its tensors
+                    // on the device with up to CMF_NVG_JOBS (default 3) in
+                    // flight.
+                    let th = Instant::now();
+                    let mut hctx: HashMap<&str, crate::nvg_gpu::HCtxD> = HashMap::new();
                     for &lead in &leads {
                         let (hfit, hsel) = &grams[lead];
-                        let th = Instant::now();
-                        let hc = crate::nvg_gpu::HCtxD::new(hfit, hsel, o.rho)?;
-                        let thc = th.elapsed().as_secs_f64();
-                        for &(slot, _, short) in mine.iter().filter(|m| input_lead(m.2) == lead) {
-                            let w = load_f64(&srcm, slot)?;
-                            let te = Instant::now();
-                            let prof = Prof::default();
-                            let want_prof = std::env::var("CMF_NVG_PROF").as_deref() == Ok("1");
-                            let enc = crate::nvg_gpu::encode_nvg_dev(
-                                Some(&pool),
-                                &w,
-                                &hc,
-                                o.bpw,
-                                mult_of(short),
-                                o.paths,
-                                want_prof.then_some(&prof),
-                            )?;
-                            if let Some(e) = &enc {
-                                eprintln!(
-                                    "  L{l} {short:4} {}x{} {} ({:.1}s)",
-                                    w.r,
-                                    w.c,
-                                    e.line,
-                                    te.elapsed().as_secs_f64()
-                                );
-                            }
-                            if want_prof {
-                                eprintln!("    profile: hctx {thc:.2}s | {}", prof.line());
-                            }
-                            results.push((slot, enc));
+                        hctx.insert(lead, crate::nvg_gpu::HCtxD::new(hfit, hsel, o.rho)?);
+                    }
+                    drop(grams);
+                    let thc = th.elapsed().as_secs_f64();
+                    let mut jobs = Vec::new();
+                    for &(slot, _, short) in &mine {
+                        jobs.push(crate::nvg_gpu::Job { w: load_f64(&srcm, slot)?, hc: &hctx[input_lead(short)], mult: mult_of(short) });
+                    }
+                    let njobs: usize = std::env::var("CMF_NVG_JOBS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+                    let want_prof = std::env::var("CMF_NVG_PROF").as_deref() == Ok("1");
+                    let te = Instant::now();
+                    let done = crate::nvg_gpu::encode_many(&jobs, o.bpw, o.paths, threads, njobs, want_prof, &|i, d| {
+                        let (_, _, short) = mine[i];
+                        if let Ok(Some(e)) = &d.enc {
+                            eprintln!("  L{l} {short:4} {}x{} {} ({:.1}s)", jobs[i].w.r, jobs[i].w.c, e.line, d.secs);
                         }
+                        if let Some(p) = &d.prof {
+                            eprintln!("    profile L{l} {short}: {p}");
+                        }
+                    });
+                    let tenc = te.elapsed().as_secs_f64();
+                    drop(jobs);
+                    drop(hctx);
+                    let mut results: Vec<(usize, Option<Encoded>)> = Vec::new();
+                    for (k, d) in done.into_iter().enumerate() {
+                        results.push((mine[k].0, d.enc?));
                     }
                     for (slot, enc) in results {
                         let e = &srcm.tensors[slot];
@@ -1556,7 +1552,7 @@ pub fn run_convert_blr(
                         }
                     }
                     eprintln!(
-                        "blr: layer {l}/{nl} done — calib {tc:.1}s, layer {:.1}s, total {:.0}s",
+                        "blr: layer {l}/{nl} done — calib {tc:.1}s, input contexts {thc:.1}s, encode {tenc:.1}s, layer {:.1}s, total {:.0}s",
                         tl.elapsed().as_secs_f64(),
                         t0.elapsed().as_secs_f64()
                     );
