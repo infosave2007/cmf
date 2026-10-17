@@ -60,6 +60,11 @@ pub struct Captured {
 pub fn set_device(on: bool) {
     DEVICE.store(on, Ordering::SeqCst);
 }
+
+/// Whether the next capture accumulates its Hessians on the device.
+pub fn device_on() -> bool {
+    DEVICE.load(Ordering::SeqCst)
+}
 /// Which tensors to capture (`None` = all). A dense Hessian costs
 /// `8·cols²` bytes — 300 MB for one 6144-wide `down_proj` — so a caller that
 /// quantizes only some linears, or a model a few layers at a time, keeps

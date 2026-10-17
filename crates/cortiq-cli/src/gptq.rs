@@ -1421,7 +1421,12 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
                     .sum();
                 let layers: std::collections::HashSet<Option<usize>> =
                     slots.iter().map(|&s| layer_index(&model.tensors[s].name)).collect();
-                check_capture_fits(need, ram_total, layers.len(), o.chunk_layers)?;
+                // Device Hessians (packed f32 on the card, aliased inputs
+                // shared) never sit whole in host RAM: the folds read one
+                // group back at a time. The guard is for the host capture.
+                if !cortiq_engine::gptq_capture::device_on() {
+                    check_capture_fits(need, ram_total, layers.len(), o.chunk_layers)?;
+                }
                 let gb = need / 1e9;
                 if calib.is_none() {
                     calib = Some(CalibRun::new(o)?);
