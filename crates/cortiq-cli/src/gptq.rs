@@ -907,8 +907,11 @@ pub(crate) struct GptqTiledOpts<'a> {
     pub q2tp_rule: Q2tpRule,
     /// `--q2tp-rule-tensor PATTERN=RULE`: first match wins.
     pub q2tp_rule_overrides: Vec<(String, Q2tpRule)>,
-    /// Remove each q2tp row's output shrinkage in the calibration metric.
+    /// Remove each q2tp row's output shrinkage in the calibration metric
+    /// (the CLI default: −11.5 % ppl on MiniCPM5's placed arm, zero bits).
     pub q2tp_debias: bool,
+    /// The same for q4tp tensors (opt-in: the 4-bit shrinkage is small).
+    pub q4tp_debias: bool,
     /// Capture this many layers per calibration pass (0 = all at once):
     /// bounds the Hessian RAM at the price of one forward per pass.
     pub chunk_layers: usize,
@@ -1229,6 +1232,51 @@ fn gptq_layer_chunks(
         .collect()
 }
 
+/// Refuse a calibration pass whose dense Hessians cannot fit: `need` bytes
+/// (q/k/v and gate/up are captured separately and deduplicated only after
+/// the pass) against 90 % of `total`, the machine's RAM (`None` = unknown,
+/// no check). The capture allocates on the first forward, so without this a
+/// Qwen3.8-27B run at the default `--calib-chunk-layers 0` (~3.6 GB a layer,
+/// ~230 GB) dies an OOM kill into its first CPU window. The error names a
+/// chunk size whose pass takes ≤ 60 % of RAM, leaving the folds room.
+fn check_capture_fits(need: f64, total: Option<f64>, layers: usize, chunk_layers: usize) -> anyhow::Result<()> {
+    let Some(total) = total.filter(|&t| t > 0.0) else {
+        return Ok(());
+    };
+    if need <= 0.9 * total {
+        return Ok(());
+    }
+    let per_layer = need / layers.max(1) as f64;
+    let fit = ((0.6 * total / per_layer) as usize).max(1);
+    let now = if chunk_layers == 0 { "all layers in one pass".to_string() } else { format!("{chunk_layers} layers a pass") };
+    anyhow::bail!(
+        "calibration would capture ~{:.0} GB of dense Hessians ({now}, ~{:.1} GB a layer) but this machine has {:.0} GB: \
+         pass --calib-chunk-layers {fit} or fewer",
+        need / 1e9,
+        per_layer / 1e9,
+        total / 1e9
+    )
+}
+
+/// How many Hessian groups to fold at once, given one group's in-flight
+/// `peak` bytes. `CMF_GPTQ_MEM_GB` (`env_gb`) is the budget for the folds
+/// alone, as it always was; otherwise 85 % of the machine's RAM (`total`)
+/// less what the run already `held` (the chunk's Hessians, the tensors
+/// written so far). Without that default the widest-first order starts the
+/// widest folds together — sixteen 17408-wide `down_proj` folds of a 27B are
+/// ~140 GB by this estimate on top of the chunk. `usize::MAX` = no cap.
+fn fold_concurrency(peak: f64, held: f64, env_gb: Option<f64>, total: Option<f64>) -> usize {
+    if !(peak > 0.0) {
+        return usize::MAX;
+    }
+    let budget = match (env_gb, total) {
+        (Some(gb), _) => gb * 1e9,
+        (None, Some(t)) if t > 0.0 => 0.85 * t - held,
+        _ => return usize::MAX,
+    };
+    ((budget / peak).max(0.0) as usize).max(1)
+}
+
 /// `cortiq quantize-gptq --codec q4tp|q2tp`: a q4tp or q2tp-profile file
 /// whose linears are GPTQ-rounded against calibration Hessians instead of
 /// round-to-nearest — the same layout, readers and kernels as `convert
@@ -1325,6 +1373,12 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
             rtn.push(slot);
         }
     }
+    if o.act_order && o.profile == Quant::Q2TiledP {
+        // Act order must fix each group's rung before its channels arrive;
+        // at 2 bits the rung chosen from the error-corrected weights is
+        // worth more than the order (MiniCPM5: 42.2 vs 31.3 ppl).
+        eprintln!("warning: --act-order fixes q2tp rungs up front — measured worse than natural order at 2 bits");
+    }
     let chunks = gptq_layer_chunks(&model, &cand, o.chunk_layers);
     eprintln!(
         "GPTQ ({codec}): {} candidate linears in {} calibration pass(es); {} tensors by the converter policy",
@@ -1335,6 +1389,7 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
 
     let mut calib: Option<CalibRun> = None;
     let mut no_hessian: Vec<usize> = Vec::new();
+    let ram_total = cortiq_engine::fcd::physical_total_bytes().map(|b| b as f64);
     let results = std::sync::Mutex::new(Vec::<(usize, TensorDtype, Vec<u8>)>::new());
     let n_gptq = std::sync::atomic::AtomicUsize::new(0);
     let failed = std::sync::Mutex::new(Vec::<String>::new());
@@ -1358,16 +1413,19 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
                 groups_from_cache(&model, p, slots, &mut no_hessian)?
             }
             _ => {
+                let names: std::collections::HashSet<String> =
+                    slots.iter().map(|&s| model.tensors[s].name.clone()).collect();
+                let need: f64 = slots
+                    .iter()
+                    .map(|&s| (model.tensors[s].shape[1] as f64).powi(2) * 8.0)
+                    .sum();
+                let layers: std::collections::HashSet<Option<usize>> =
+                    slots.iter().map(|&s| layer_index(&model.tensors[s].name)).collect();
+                check_capture_fits(need, ram_total, layers.len(), o.chunk_layers)?;
+                let gb = need / 1e9;
                 if calib.is_none() {
                     calib = Some(CalibRun::new(o)?);
                 }
-                let names: std::collections::HashSet<String> =
-                    slots.iter().map(|&s| model.tensors[s].name.clone()).collect();
-                let gb: f64 = slots
-                    .iter()
-                    .map(|&s| (model.tensors[s].shape[1] as f64).powi(2) * 8.0)
-                    .sum::<f64>()
-                    / 1e9;
                 if o.chunk_layers > 0 {
                     eprintln!("layers {lo}..={hi}: capturing {} linears (≤{gb:.1} GB of Hessians) …", slots.len());
                 } else {
@@ -1415,14 +1473,23 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
         // Workers take whole groups: the O(n³) fold operator dominates, so
         // many groups run at once and each fold and row sweep gets the
         // threads left over. A group holds ~3·n² f64 + n² f32 at its peak
-        // (1 GB at n = 6144, 8 GB at 17408): `CMF_GPTQ_MEM_GB` caps how many
-        // run together, trading parallel groups for parallel folds.
+        // (1 GB at n = 6144, 8 GB at 17408), so [`fold_concurrency`] caps how
+        // many run together by the RAM left (`CMF_GPTQ_MEM_GB` overrides),
+        // trading parallel groups for parallel folds — the bytes are the same.
         let peak = groups.iter().map(|g| 28.0 * (g.cols as f64).powi(2)).fold(0.0, f64::max);
-        let mem_cap = std::env::var("CMF_GPTQ_MEM_GB")
+        let env_gb = std::env::var("CMF_GPTQ_MEM_GB")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
-            .filter(|&gb| gb > 0.0 && peak > 0.0)
-            .map_or(usize::MAX, |gb| ((gb * 1e9 / peak) as usize).max(1));
+            .filter(|&gb| gb > 0.0);
+        // Already resident: the chunk's captured Hessians and every tensor
+        // written so far (the output is assembled in RAM).
+        let held = groups
+            .iter()
+            .filter(|g| matches!(g.src, HSrc::Mem(_)))
+            .map(|g| 8.0 * (g.cols as f64).powi(2))
+            .sum::<f64>()
+            + results.lock().unwrap().iter().map(|r| r.2.len() as f64).sum::<f64>();
+        let mem_cap = fold_concurrency(peak, held, env_gb, ram_total);
         let outer = o.threads.clamp(1, 16).min(groups.len().max(1)).min(mem_cap);
         let inner = (o.threads / outer).max(1);
         // Widest Hessians first (longest-processing-time order): a 6144-wide
@@ -1469,7 +1536,9 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
                         let hdiag: Vec<f32> = (0..n).map(|i| h[i * n + i] as f32).collect();
                         let quants: Vec<Quant> =
                             grp.slots.iter().map(|&s| quant_of(&model.tensors[s].name)).collect();
-                        let keep_h = (o.q2tp_debias && quants.contains(&Quant::Q2TiledP)).then(|| h.clone());
+                        let keep_h = ((o.q2tp_debias && quants.contains(&Quant::Q2TiledP))
+                            || (o.q4tp_debias && quants.contains(&Quant::Q4TiledP)))
+                        .then(|| h.clone());
                         let perm = o.act_order.then(|| act_order_perm(&hdiag));
                         let (u, dead) = match &perm {
                             Some(p) => {
@@ -1489,14 +1558,18 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
                                 continue;
                             }
                             let out = match (q, &perm) {
-                                (Quant::Q4TiledP, Some(p)) => (
-                                    TensorDtype::Q4TiledP,
-                                    gptq_quantize_q4tp_act_order(&w, rows, cols, &u, &dead, p, inner),
-                                ),
-                                (Quant::Q4TiledP, None) => (
-                                    TensorDtype::Q4TiledP,
-                                    gptq_quantize_q4tp(&w, rows, cols, &u, &dead, &hdiag, inner),
-                                ),
+                                (Quant::Q4TiledP, _) => {
+                                    let mut b = match &perm {
+                                        Some(p) => gptq_quantize_q4tp_act_order(&w, rows, cols, &u, &dead, p, inner),
+                                        None => gptq_quantize_q4tp(&w, rows, cols, &u, &dead, &hdiag, inner),
+                                    };
+                                    if o.q4tp_debias
+                                        && let Some(h) = &keep_h
+                                    {
+                                        q4tp_debias_gemm(&mut b, &w, rows, cols, h, inner);
+                                    }
+                                    (TensorDtype::Q4TiledP, b)
+                                }
                                 _ => {
                                     let rule = o.q2tp_rule_for(&entry.name);
                                     let mut b = gptq_quantize_q2tp(
@@ -1510,7 +1583,9 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
                                         perm.as_deref(),
                                         inner,
                                     );
-                                    if let Some(h) = &keep_h {
+                                    if o.q2tp_debias
+                                        && let Some(h) = &keep_h
+                                    {
                                         q2tp_debias_gemm(&mut b, &w, rows, cols, h, inner);
                                     }
                                     (TensorDtype::Q2TiledP, b)
@@ -1678,6 +1753,9 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
                 .map(|(p, r)| format!("{p}={}", r.name()))
                 .collect::<Vec<_>>());
         }
+    }
+    if o.q4tp_debias {
+        gptq["q4tp_debias"] = serde_json::json!(true);
     }
     if o.calib.len() > 1 {
         if let Some(used) = &calib_used {
@@ -1882,6 +1960,8 @@ fn par_rows(n: usize, threads: usize, f: &(dyn Fn(usize) + Sync)) {
 /// `e = (w_j − q_j)/U_jj` into `w_{k>j} −= e·U_jk` is the exact OBS update
 /// with `H⁻¹` re-conditioned after every eliminated column — the reference
 /// GPTQ formulation (the raw `H⁻¹` row is only exact for the first column).
+/// (Single-threaded form; the runner calls [`gptq_fold_operator_par`].)
+#[cfg(test)]
 pub fn gptq_fold_operator(h: Vec<f64>, n: usize, lambda: f64) -> (Vec<f32>, Vec<bool>) {
     gptq_fold_operator_par(h, n, lambda, 1)
 }
@@ -2625,35 +2705,174 @@ fn q2_trailing_impl(w: &mut [f32], rb: usize, cols: usize, e: &[f32], b0: usize,
 /// rule) shrinks every output by its error energy, the same way in every
 /// layer; on MiniCPM5 this removed 5–20 % of ppl on such arms.
 pub fn q2tp_debias_hessian(bytes: &mut [u8], w0: &[f32], rows: usize, cols: usize, h: &[f64], threads: usize) {
+    debias_tiled_hessian(bytes, w0, rows, cols, h, threads, true);
+}
+
+/// [`q2tp_debias_hessian`] for a q4tp tensor (the same `lo` shift: every
+/// q4tp rung of a row is `2^(lo + c·step)`). The shrinkage is ~16× smaller
+/// at 4 bits than at 2, so this is opt-in (`--q4tp-debias`).
+pub fn q4tp_debias_hessian(bytes: &mut [u8], w0: &[f32], rows: usize, cols: usize, h: &[f64], threads: usize) {
+    debias_tiled_hessian(bytes, w0, rows, cols, h, threads, false);
+}
+
+fn debias_tiled_hessian(
+    bytes: &mut [u8],
+    w0: &[f32],
+    rows: usize,
+    cols: usize,
+    h: &[f64],
+    threads: usize,
+    two_bit: bool,
+) {
+    use cortiq_core::quant::{Q2TP_CHUNK, Q4TP_NIB, q2tp_sections, q4tp_code, q4tp_sections};
     assert_eq!(h.len(), cols * cols);
-    q2tp_debias_core(bytes, w0, rows, cols, threads, |r, y| {
-        let wr = &w0[r * cols..(r + 1) * cols];
-        for (i, yi) in y.iter_mut().enumerate() {
-            let hrow = &h[i * cols..(i + 1) * cols];
-            *yi = hrow.iter().zip(wr).map(|(&a, &b)| a * b as f64).sum();
+    assert_eq!(w0.len(), rows * cols);
+    let gpr = cols / GROUP_SIZE;
+    let (po, co, stride) = if two_bit { q2tp_sections(rows, cols) } else { q4tp_sections(rows, cols) };
+    let chunk_b = if two_bit { Q2TP_CHUNK } else { Q4TP_NIB };
+    let (plane, rest) = bytes.split_at_mut(po);
+    let (params, codes) = rest.split_at_mut(co - po);
+    let (plane, codes) = (&*plane, &*codes);
+    let per = rows.div_ceil(threads.max(1)).max(1);
+    // Rows per pass over H: each H row is streamed once for DB weight rows
+    // and the multiply-adds vectorize across them.
+    const DB: usize = 8;
+    std::thread::scope(|s| {
+        for (ci, chunk) in params.chunks_mut(per * 4).enumerate() {
+            s.spawn(move || {
+                let (mut wt, mut ys) = (vec![0f64; cols * DB], vec![0f64; cols * DB]);
+                let mut wh = vec![0f32; cols];
+                let nrows = chunk.len() / 4;
+                let mut k0 = 0;
+                while k0 < nrows {
+                    let rb = (nrows - k0).min(DB);
+                    let r0 = ci * per + k0;
+                    wt.fill(0.0);
+                    for k in 0..rb {
+                        for (j, &v) in w0[(r0 + k) * cols..(r0 + k + 1) * cols].iter().enumerate() {
+                            wt[j * DB + k] = v as f64;
+                        }
+                    }
+                    // y = H·w for the block. Per (i, row) the sum runs over j
+                    // in order from −0.0 — exactly `Iterator::sum` on that
+                    // row alone — so the block changes no bit.
+                    for i in 0..cols {
+                        let mut acc = [-0.0f64; DB];
+                        for (j, &hv) in h[i * cols..(i + 1) * cols].iter().enumerate() {
+                            let wj: &[f64; DB] = wt[j * DB..(j + 1) * DB].try_into().unwrap();
+                            for k in 0..DB {
+                                acc[k] += hv * wj[k];
+                            }
+                        }
+                        ys[i * DB..(i + 1) * DB].copy_from_slice(&acc);
+                    }
+                    for k in 0..rb {
+                        let r = r0 + k;
+                        let p = &mut chunk[(k0 + k) * 4..(k0 + k + 1) * 4];
+                        let wr = &w0[r * cols..(r + 1) * cols];
+                        // Ŵ_r through the encoder's own (machine-independent) ladder.
+                        let tab = if two_bit {
+                            crate::convert::det_q2tp_ladder(p, 0)
+                        } else {
+                            crate::convert::det_q4tp_ladder(p, 0)
+                        };
+                        let crow = &codes[r * stride..(r + 1) * stride];
+                        for g in 0..gpr {
+                            let sg = tab[q4tp_code(crow, g)];
+                            let ch = &plane[(r * gpr + g) * chunk_b..(r * gpr + g + 1) * chunk_b];
+                            let dst = &mut wh[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+                            for (b, &byte) in ch.iter().enumerate() {
+                                if two_bit {
+                                    for j in 0..4 {
+                                        dst[b * 4 + j] = (((byte >> (2 * j)) & 3) as f32 - 1.5) * sg;
+                                    }
+                                } else {
+                                    dst[b * 2] = ((byte & 0x0F) as f32 - 8.0) * sg;
+                                    dst[b * 2 + 1] = (((byte >> 4) & 0x0F) as f32 - 8.0) * sg;
+                                }
+                            }
+                        }
+                        let num: f64 = wh.iter().enumerate().map(|(i, &a)| a as f64 * ys[i * DB + k]).sum();
+                        let den: f64 = wr.iter().enumerate().map(|(i, &a)| a as f64 * ys[i * DB + k]).sum();
+                        crate::convert::q2tp_unshrink_row(p, num, den);
+                    }
+                    k0 += rb;
+                }
+            });
         }
     });
 }
 
-/// `q2tp_debias_hessian` with `H·w_r` precomputed for every row (`hw`,
+/// [`q2tp_debias_hessian`] with `H·w` for every row precomputed (`hw`,
 /// `rows × cols`, e.g. one GEMM `W·H` for the whole matrix).
 pub fn q2tp_debias_rows(bytes: &mut [u8], w0: &[f32], rows: usize, cols: usize, hw: &[f32], threads: usize) {
-    assert_eq!(hw.len(), rows * cols);
-    q2tp_debias_core(bytes, w0, rows, cols, threads, |r, y| {
-        for (d, &s) in y.iter_mut().zip(&hw[r * cols..(r + 1) * cols]) {
-            *d = s as f64;
-        }
-    });
+    debias_tiled_rows(bytes, w0, rows, cols, hw, threads, true);
 }
 
-/// `q2tp_debias_hessian` with `H·w` for all rows from one f32 GEMM `W·H`
-/// split over `threads` (the f64 per-row products cost rows·cols² scalar
-/// multiply-adds: 1.5 T for a 27B down projection).
+/// [`q2tp_debias_hessian`] with `H·w` for all rows from one f32 GEMM `W·H`
+/// split over `threads` — what `quantize-gptq` and `quantize-moe` run: the
+/// f64 per-row products cost rows·cols² scalar multiply-adds (1.5 T for a
+/// 27B down projection). Same parameters up to f32 rounding of `H·w`.
 pub fn q2tp_debias_gemm(bytes: &mut [u8], w0: &[f32], rows: usize, cols: usize, h: &[f64], threads: usize) {
+    debias_gemm(bytes, w0, rows, cols, h, threads, true);
+}
+
+/// [`q4tp_debias_hessian`] in the GEMM form of [`q2tp_debias_gemm`].
+pub fn q4tp_debias_gemm(bytes: &mut [u8], w0: &[f32], rows: usize, cols: usize, h: &[f64], threads: usize) {
+    debias_gemm(bytes, w0, rows, cols, h, threads, false);
+}
+
+fn debias_gemm(bytes: &mut [u8], w0: &[f32], rows: usize, cols: usize, h: &[f64], threads: usize, two_bit: bool) {
     assert_eq!(h.len(), cols * cols);
     let h32: Vec<f32> = h.iter().map(|&v| v as f32).collect();
     let hw = gemm_rows_square(w0, rows, cols, &h32, threads);
-    q2tp_debias_rows(bytes, w0, rows, cols, &hw, threads);
+    debias_tiled_rows(bytes, w0, rows, cols, &hw, threads, two_bit);
+}
+
+fn debias_tiled_rows(bytes: &mut [u8], w0: &[f32], rows: usize, cols: usize, hw: &[f32], threads: usize, two_bit: bool) {
+    use cortiq_core::quant::{Q2TP_CHUNK, Q4TP_NIB, q2tp_sections, q4tp_code, q4tp_sections};
+    assert_eq!(w0.len(), rows * cols);
+    assert_eq!(hw.len(), rows * cols);
+    let gpr = cols / GROUP_SIZE;
+    let (po, co, stride) = if two_bit { q2tp_sections(rows, cols) } else { q4tp_sections(rows, cols) };
+    let chunk_b = if two_bit { Q2TP_CHUNK } else { Q4TP_NIB };
+    let (plane, rest) = bytes.split_at_mut(po);
+    let (params, codes) = rest.split_at_mut(co - po);
+    let (plane, codes) = (&*plane, &*codes);
+    let per = rows.div_ceil(threads.max(1)).max(1);
+    std::thread::scope(|s| {
+        for (ci, chunk) in params.chunks_mut(per * 4).enumerate() {
+            s.spawn(move || {
+                let mut wh = vec![0f32; cols];
+                for (k, p) in chunk.chunks_exact_mut(4).enumerate() {
+                    let r = ci * per + k;
+                    let wr = &w0[r * cols..(r + 1) * cols];
+                    let y = &hw[r * cols..(r + 1) * cols];
+                    // Ŵ_r through the encoder's own (machine-independent) ladder.
+                    let tab = if two_bit { crate::convert::det_q2tp_ladder(p, 0) } else { crate::convert::det_q4tp_ladder(p, 0) };
+                    let crow = &codes[r * stride..(r + 1) * stride];
+                    for g in 0..gpr {
+                        let sg = tab[q4tp_code(crow, g)];
+                        let ch = &plane[(r * gpr + g) * chunk_b..(r * gpr + g + 1) * chunk_b];
+                        let dst = &mut wh[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+                        for (b, &byte) in ch.iter().enumerate() {
+                            if two_bit {
+                                for j in 0..4 {
+                                    dst[b * 4 + j] = (((byte >> (2 * j)) & 3) as f32 - 1.5) * sg;
+                                }
+                            } else {
+                                dst[b * 2] = ((byte & 0x0F) as f32 - 8.0) * sg;
+                                dst[b * 2 + 1] = (((byte >> 4) & 0x0F) as f32 - 8.0) * sg;
+                            }
+                        }
+                    }
+                    let num: f64 = wh.iter().zip(y).map(|(&a, &b)| a as f64 * b as f64).sum();
+                    let den: f64 = wr.iter().zip(y).map(|(&a, &b)| a as f64 * b as f64).sum();
+                    crate::convert::q2tp_unshrink_row(p, num, den);
+                }
+            });
+        }
+    });
 }
 
 /// `A·B` for row-major `a` (`m × k`) and a square `b` (`k × k`), rows split
@@ -2670,45 +2889,6 @@ pub(crate) fn gemm_rows_square(a: &[f32], m: usize, k: usize, b: &[f32], threads
         }
     });
     out
-}
-
-fn q2tp_debias_core(bytes: &mut [u8], w0: &[f32], rows: usize, cols: usize, threads: usize, hw_row: impl Fn(usize, &mut [f64]) + Sync) {
-    use cortiq_core::quant::{Q2TP_CHUNK, q2tp_sections, q4tp_code};
-    assert_eq!(w0.len(), rows * cols);
-    let hw_row = &hw_row;
-    let gpr = cols / GROUP_SIZE;
-    let (po, co, stride) = q2tp_sections(rows, cols);
-    let (plane, rest) = bytes.split_at_mut(po);
-    let (params, codes) = rest.split_at_mut(co - po);
-    let (plane, codes) = (&*plane, &*codes);
-    let per = rows.div_ceil(threads.max(1)).max(1);
-    std::thread::scope(|s| {
-        for (ci, chunk) in params.chunks_mut(per * 4).enumerate() {
-            s.spawn(move || {
-                let (mut y, mut wh) = (vec![0f64; cols], vec![0f32; cols]);
-                for (k, p) in chunk.chunks_exact_mut(4).enumerate() {
-                    let r = ci * per + k;
-                    let wr = &w0[r * cols..(r + 1) * cols];
-                    // Ŵ_r through the encoder's own (machine-independent) ladder.
-                    let tab = crate::convert::det_q2tp_ladder(p, 0);
-                    let crow = &codes[r * stride..(r + 1) * stride];
-                    for g in 0..gpr {
-                        let sg = tab[q4tp_code(crow, g)];
-                        let ch = &plane[(r * gpr + g) * Q2TP_CHUNK..(r * gpr + g + 1) * Q2TP_CHUNK];
-                        for (b, &byte) in ch.iter().enumerate() {
-                            for j in 0..4 {
-                                wh[g * GROUP_SIZE + b * 4 + j] = (((byte >> (2 * j)) & 3) as f32 - 1.5) * sg;
-                            }
-                        }
-                    }
-                    hw_row(r, &mut y);
-                    let num: f64 = wh.iter().zip(&y).map(|(&a, &b)| a as f64 * b).sum();
-                    let den: f64 = wr.iter().zip(&y).map(|(&a, &b)| a as f64 * b).sum();
-                    crate::convert::q2tp_unshrink_row(p, num, den);
-                }
-            });
-        }
-    });
 }
 
 const HESS_MAGIC: &[u8; 8] = b"CMFHESS1";
@@ -3484,6 +3664,101 @@ mod tests {
         assert!(differ <= rows / 8, "{differ} bytes differ between the f64 and the GEMM debias");
     }
 
+    /// The row-blocked debias writes exactly what the plain per-row version
+    /// (y = H·w by `Iterator::sum`, row at a time) writes, on both layouts,
+    /// with a partial last block.
+    #[test]
+    fn blocked_debias_matches_per_row_reference() {
+        let (rows, cols, t) = (13usize, 96usize, 300usize);
+        let (w, _, h) = q2_problem_with(rows, cols, t, 404, 3.0);
+        let hdiag: Vec<f32> = (0..cols).map(|i| h[i * cols + i] as f32).collect();
+        let (u, dead) = gptq_fold_operator(h.clone(), cols, 0.01);
+        let reference = |bytes: &mut [u8], two_bit: bool| {
+            let mut deq = vec![0f32; rows * cols];
+            let po = if two_bit {
+                let d = bytes.to_vec();
+                // decode through the det ladder, like the kernel
+                let (po, co, stride) = cortiq_core::quant::q2tp_sections(rows, cols);
+                for r in 0..rows {
+                    let tab = crate::convert::det_q2tp_ladder(&d[po..], r);
+                    for c in 0..cols {
+                        let g = c / GROUP_SIZE;
+                        let s = tab[cortiq_core::quant::q4tp_code(&d[co + r * stride..], g)];
+                        let byte = d[(r * (cols / GROUP_SIZE) + g) * 8 + (c % GROUP_SIZE) / 4];
+                        deq[r * cols + c] = (((byte >> (2 * (c % 4))) & 3) as f32 - 1.5) * s;
+                    }
+                }
+                po
+            } else {
+                let d = bytes.to_vec();
+                let (po, co, stride) = cortiq_core::quant::q4tp_sections(rows, cols);
+                for r in 0..rows {
+                    let tab = crate::convert::det_q4tp_ladder(&d[po..], r);
+                    for c in 0..cols {
+                        let g = c / GROUP_SIZE;
+                        let s = tab[cortiq_core::quant::q4tp_code(&d[co + r * stride..], g)];
+                        let byte = d[(r * (cols / GROUP_SIZE) + g) * 16 + (c % GROUP_SIZE) / 2];
+                        let nib = if c % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+                        deq[r * cols + c] = (nib as f32 - 8.0) * s;
+                    }
+                }
+                po
+            };
+            for r in 0..rows {
+                let wr = &w[r * cols..(r + 1) * cols];
+                let y: Vec<f64> = (0..cols)
+                    .map(|i| h[i * cols..(i + 1) * cols].iter().zip(wr).map(|(&a, &b)| a * b as f64).sum())
+                    .collect();
+                let num: f64 = deq[r * cols..(r + 1) * cols].iter().zip(&y).map(|(&a, &b)| a as f64 * b).sum();
+                let den: f64 = wr.iter().zip(&y).map(|(&a, &b)| a as f64 * b).sum();
+                crate::convert::q2tp_unshrink_row(&mut bytes[po + r * 4..po + r * 4 + 4], num, den);
+            }
+        };
+        let g2 = gptq_quantize_q2tp(&w, rows, cols, &u, &dead, &hdiag, Q2tpRule::Placed, None, 1);
+        let (mut a, mut b) = (g2.clone(), g2);
+        q2tp_debias_hessian(&mut a, &w, rows, cols, &h, 2);
+        reference(&mut b, true);
+        assert_eq!(a, b, "q2tp");
+        let g4 = gptq_quantize_q4tp(&w, rows, cols, &u, &dead, &hdiag, 1);
+        let (mut a, mut b) = (g4.clone(), g4);
+        q4tp_debias_hessian(&mut a, &w, rows, cols, &h, 3);
+        reference(&mut b, false);
+        assert_eq!(a, b, "q4tp");
+    }
+
+    /// The q4tp debias: same contract on the 4-bit layout — nibbles, rungs
+    /// and steps untouched, each row's metric slope back to ~1.
+    #[test]
+    fn q4tp_debias_hessian_restores_unit_slope() {
+        let (rows, cols, t) = (16usize, 128usize, 400usize);
+        let (w, _, h) = q2_problem_with(rows, cols, t, 31, 2.0);
+        let hdiag: Vec<f32> = (0..cols).map(|i| h[i * cols + i] as f32).collect();
+        let (u, dead) = gptq_fold_operator(h.clone(), cols, 0.01);
+        let g = gptq_quantize_q4tp(&w, rows, cols, &u, &dead, &hdiag, 2);
+        let mut d = g.clone();
+        q4tp_debias_hessian(&mut d, &w, rows, cols, &h, 3);
+        let (po, co, _) = cortiq_core::quant::q4tp_sections(rows, cols);
+        assert_eq!(&g[..po], &d[..po], "nibbles untouched");
+        assert_eq!(&g[co..], &d[co..], "rungs untouched");
+        let slope = |bytes: &[u8], r: usize| -> f64 {
+            let mut deq = vec![0f32; rows * cols];
+            cortiq_core::quant::dequant_q4tp(bytes, rows, cols, &mut deq);
+            let (mut num, mut den) = (0f64, 0f64);
+            for i in 0..cols {
+                let yi: f64 = (0..cols).map(|j| h[i * cols + j] * w[r * cols + j] as f64).sum();
+                num += deq[r * cols + i] as f64 * yi;
+                den += w[r * cols + i] as f64 * yi;
+            }
+            num / den
+        };
+        for r in 0..rows {
+            assert_eq!(g[po + r * 4 + 2..po + r * 4 + 4], d[po + r * 4 + 2..po + r * 4 + 4], "step untouched");
+            let (b0, b1) = (slope(&g, r), slope(&d, r));
+            let want = b0 / b0.clamp(0.8, 1.25);
+            assert!((b1 - want).abs() < 0.005, "row {r}: slope {b0:.5} → {b1:.5}");
+        }
+    }
+
     /// The fold operator as it was before blocking and threads: row
     /// Cholesky, one column of L⁻¹ at a time, one row of H⁻¹ at a time.
     fn fold_reference(mut h: Vec<f64>, n: usize, lambda: f64) -> Vec<f32> {
@@ -3753,6 +4028,7 @@ mod tests {
                 q2tp_rule: Q2tpRule::Placed,
                 q2tp_rule_overrides: Vec::new(),
                 q2tp_debias: false,
+                q4tp_debias: false,
                 chunk_layers: chunk,
             })
             .unwrap();
@@ -3822,6 +4098,26 @@ mod tests {
             ("model.layers.7.mlp.*".to_string(), Q2tpRule::Cortiq)
         );
         assert!(parse_q2tp_rule_override("x=bogus").is_err());
+    }
+
+    /// The RAM guards: a capture that cannot fit is refused with a chunk
+    /// size that does, and the number of folds in flight follows the RAM
+    /// left after what the run holds.
+    #[test]
+    fn ram_guards_refuse_impossible_captures_and_cap_folds() {
+        let gb = 1e9;
+        // Qwen3.8-27B-like: 64 layers × ~3.6 GB of Hessians on a 128 GB box.
+        let err = check_capture_fits(64.0 * 3.6 * gb, Some(128.0 * gb), 64, 0).unwrap_err().to_string();
+        assert!(err.contains("--calib-chunk-layers 21 "), "{err}");
+        assert!(check_capture_fits(16.0 * 3.6 * gb, Some(128.0 * gb), 16, 16).is_ok());
+        assert!(check_capture_fits(1e15, None, 64, 0).is_ok(), "unknown RAM: no check");
+        let peak = 28.0 * 17408f64.powi(2); // one 27B down_proj fold, ~8.5 GB
+        assert_eq!(fold_concurrency(peak, 0.0, None, None), usize::MAX, "unknown RAM: no cap");
+        assert_eq!(fold_concurrency(peak, 0.0, Some(20.0), Some(128.0 * gb)), 2, "CMF_GPTQ_MEM_GB wins");
+        // 0.85 · 128 − 50 GB held = 58.8 GB → 6 folds.
+        assert_eq!(fold_concurrency(peak, 50.0 * gb, None, Some(128.0 * gb)), 6);
+        assert_eq!(fold_concurrency(peak, 200.0 * gb, None, Some(128.0 * gb)), 1, "never below one");
+        assert_eq!(fold_concurrency(0.0, 0.0, None, Some(128.0 * gb)), usize::MAX);
     }
 
     /// With an identity Hessian GPTQ has nothing to fold: it must reproduce

@@ -785,15 +785,17 @@ enum Commands {
         /// q4tp/q2tp: per-tensor codec override, PATTERN=QUANT as in
         /// `convert --tensor-quant` (e.g. `lm_head.weight=q8_2f`). A q4tp or
         /// q2tp override stays GPTQ (an escort:
-        /// `model.layers.7.mlp.gate_proj.weight=q4tp`); others are encoded
-        /// by the converter
+        /// `model.layers.7.mlp.gate_proj.weight=q4tp`); any other codec
+        /// skips GPTQ and is encoded by the converter (the q8_2f escort
+        /// lists from tools/quant/escort.py)
         #[arg(long = "tensor-quant", value_name = "PATTERN=QUANT")]
         tensor_quant: Vec<String>,
         /// q4tp/q2tp: worker threads (default: all cores)
         #[arg(long)]
         threads: Option<usize>,
         /// q4tp/q2tp: act-order GPTQ (channels by descending input energy,
-        /// group rungs fixed up front from the original weights)
+        /// group rungs fixed up front from the original weights — at 2 bits
+        /// that costs more than the order gains: not for q2tp)
         #[arg(long)]
         act_order: bool,
         /// q4tp/q2tp: Hessian cache file — loaded when it exists (calibration
@@ -824,9 +826,15 @@ enum Commands {
         #[arg(long = "q2tp-rule-tensor", value_name = "PATTERN=RULE")]
         q2tp_rule_tensor: Vec<String>,
         /// q2tp: remove each row's output shrinkage in the calibration metric
-        /// (slope (ŴHWᵀ)/(WHWᵀ), through the row's f16 `lo` — zero bits)
+        /// (slope (ŴHWᵀ)/(WHWᵀ), through the row's f16 `lo` — zero bits):
+        /// `on` (default; −11 % ppl on MiniCPM5's placed arm) or `off`
+        /// (the plain GPTQ arms of the q2tp study)
+        #[arg(long, value_name = "on|off")]
+        q2tp_debias: Option<String>,
+        /// q4tp/q2tp: the same output debias for the q4tp tensors (opt-in:
+        /// at 4 bits the shrinkage is ~16× smaller than at 2)
         #[arg(long)]
-        q2tp_debias: bool,
+        q4tp_debias: bool,
     },
     /// GPTQ for the experts of a Flash-Next-class MoE (qwen4_exp), routed
     /// and shared: gate/up into q2tp, down into q4tp, on the GPU; the calibration file
@@ -3367,9 +3375,16 @@ async fn main() -> anyhow::Result<()> {
             q2tp_rule,
             q2tp_rule_tensor,
             q2tp_debias,
+            q4tp_debias,
         } => {
             let codec = codec.to_ascii_lowercase();
-            let q2tp_flags = q2tp_rule.is_some() || !q2tp_rule_tensor.is_empty() || q2tp_debias;
+            let q2tp_flags =
+                q2tp_rule.is_some() || !q2tp_rule_tensor.is_empty() || q2tp_debias.is_some();
+            let q2tp_debias = match q2tp_debias.as_deref().map(str::to_ascii_lowercase).as_deref() {
+                None | Some("on" | "true" | "1") => true,
+                Some("off" | "false" | "0") => false,
+                Some(other) => anyhow::bail!("--q2tp-debias {other}: expected on or off"),
+            };
             match codec.as_str() {
                 "q4tp" | "q2tp" => {
                     let profile = convert::parse_quant(&codec)?;
@@ -3404,6 +3419,7 @@ async fn main() -> anyhow::Result<()> {
                             .map(|s| gptq::parse_q2tp_rule_override(s))
                             .collect::<anyhow::Result<Vec<_>>>()?,
                         q2tp_debias,
+                        q4tp_debias,
                         chunk_layers: calib_chunk_layers,
                     };
                     gptq::run_quantize_gptq_tiled(&opts)?;
@@ -3413,8 +3429,9 @@ async fn main() -> anyhow::Result<()> {
                         calib_model.is_none()
                             && tensor_quant.is_empty()
                             && !q2tp_flags
+                            && !q4tp_debias
                             && calib_chunk_layers == 0,
-                        "--calib-model / --tensor-quant / --calib-chunk-layers / --q2tp-* apply to --codec q4tp|q2tp"
+                        "--calib-model / --tensor-quant / --calib-chunk-layers / --q2tp-* / --q4tp-debias apply to --codec q4tp|q2tp"
                     );
                     anyhow::ensure!(
                         calib.len() == 1,

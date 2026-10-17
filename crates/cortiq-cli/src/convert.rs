@@ -1448,7 +1448,7 @@ fn q2tp_search() -> bool {
 /// `CMF_Q2TP_ENCODER=v1` restores the absmax-pinned q2tp encoder byte for
 /// byte; anything else (or nothing) runs v2. Read per tensor for the same
 /// reason as [`q2tp_search`].
-pub(crate) fn q2tp_encoder_is_v1() -> bool {
+fn q2tp_encoder_is_v1() -> bool {
     std::env::var("CMF_Q2TP_ENCODER")
         .map(|v| v.trim().eq_ignore_ascii_case("v1"))
         .unwrap_or(false)
@@ -1704,7 +1704,7 @@ pub(crate) fn q2tp_best_rung(
 /// Group `g` of a row and of its channel weights, as fixed-size arrays (the
 /// error kernel's bounds checks then vanish).
 #[inline(always)]
-pub(crate) fn q2tp_group_pair<'a>(
+fn q2tp_group_pair<'a>(
     row: &'a [f32],
     hw: &'a [f32],
     g: usize,
@@ -1967,7 +1967,7 @@ pub(crate) fn det_exp2(y: f32) -> f32 {
 /// `q4tp_ladder` with [`det_exp2`]: the rung table the encoders choose codes
 /// against (the runtime keeps the core ladder; the two differ by at most an
 /// ulp, which only matters to the encoder's near-tie choices).
-fn det_q4tp_ladder(params: &[u8], r: usize) -> [f32; 32] {
+pub(crate) fn det_q4tp_ladder(params: &[u8], r: usize) -> [f32; 32] {
     let lo = f16_to_f32(u16::from_le_bytes([params[r * 4], params[r * 4 + 1]]));
     let st = f16_to_f32(u16::from_le_bytes([params[r * 4 + 2], params[r * 4 + 3]]));
     let ratio = det_exp2(st);
@@ -8801,12 +8801,15 @@ pub(crate) mod tests {
     /// Everything that touches those variables takes this first.
     pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Pin both switches for the duration of a test, whatever ran before.
+    /// Pin the encoder switches for the duration of a test, whatever ran
+    /// before — including the default q2tp encoder: a test that panicked
+    /// while it held `CMF_Q2TP_ENCODER=v1` must not leak it into the rest.
     pub(crate) fn env_guard(threads: &str, search: &str) -> std::sync::MutexGuard<'static, ()> {
         let g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("CMF_ENCODE_THREADS", threads);
             std::env::set_var("CMF_Q2TP_SEARCH", search);
+            std::env::remove_var("CMF_Q2TP_ENCODER");
         }
         g
     }

@@ -381,6 +381,41 @@ class ModelTest(unittest.TestCase):
         for g1, g3 in zip(*grads):
             torch.testing.assert_close(g1, g3, rtol=1e-4, atol=1e-8)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "no CUDA")
+    def test_batched_head_streaming_cuda(self):
+        """host-parked (page-locked, async) boundaries through the batched head"""
+        m = tiny_cmf("llama", seed=16)
+        w = np.random.default_rng(4).integers(0, 300, size=(6, 33))
+        lp, ix = teacher_of(qmodel.Model(perturbed(m), "cuda"), w, 8)
+        res = []
+        for hw in (1, 4):
+            mod = qmodel.Model(m, "cuda", residency="stream", act_device="cpu", head_windows=hw)
+            res.append(mod.evaluate(w, mb=3, teacher=(lp.numpy(), ix.numpy())))
+        self.assertTrue(np.all(np.isfinite(res[1]["nll"])) and np.all(np.isfinite(res[1]["kl"])))
+        np.testing.assert_allclose(res[0]["nll"], res[1]["nll"], rtol=1e-5)
+        np.testing.assert_allclose(res[0]["kl"], res[1]["kl"], rtol=1e-4, atol=1e-6)
+
+    def test_forward_in_place_equals_kept_boundaries(self):
+        """the forward-only pass replaces boundaries in place: same values as the kept-boundary
+        pass, the caller's list untouched unless handed over (own=True)"""
+        m = tiny_cmf("qwen35", seed=17)
+        model = qmodel.Model(m, "cpu")
+        w = np.random.default_rng(5).integers(0, 300, size=(5, 33))
+        xs = [model.embed_ids(w[i:i + 2]) for i in range(0, 5, 2)]
+        ref = model.forward_layers(xs, keep=True)
+        mid = list(ref[2])
+        out = model.forward_layers(ref[2], l0=2)
+        for a, b in zip(out, ref[-1]):
+            self.assertTrue(torch.equal(a, b))
+        for a, c in zip(ref[2], mid):
+            self.assertIs(a, c)                              # escort's cached block inputs survive
+        mine = list(xs)
+        out = model.forward_layers(mine, own=True)
+        self.assertIs(out, mine)
+        for a, b, x in zip(out, ref[-1], xs):
+            self.assertTrue(torch.equal(a, b))
+            self.assertFalse(a is x)
+
     def test_teacher_of_itself_has_zero_kl(self):
         m = tiny_cmf("qwen35", seed=12)
         model = qmodel.Model(m, "cpu")
