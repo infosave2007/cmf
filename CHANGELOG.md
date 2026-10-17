@@ -37,7 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged. `CMF_Q2TP_ENCODER=v1` restores the previous encoder byte for
   byte.
 - The GPTQ fold operator runs on several threads and gives bit-identical
-  results. `CMF_GPTQ_MEM_GB` caps how many Hessian groups are in flight.
+  results. The Hessian groups in flight are capped by the RAM left
+  (`CMF_GPTQ_MEM_GB` overrides), and a calibration pass whose Hessians
+  cannot fit in RAM is refused with a `--calib-chunk-layers` that does.
 
 ### Performance
 - MiniCPM5-2B, q2tp profile with head and embeddings q8_2f (1.31 GB),

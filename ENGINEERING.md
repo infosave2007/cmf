@@ -90,7 +90,11 @@ kernels are unchanged: every file decodes as before.
   - It is bit-identical to the original serial operator because every entry
     is the same `dot64` over the same slices, computed by a single worker.
   - Hessian groups are processed widest first, which shortens the tail.
-  - `CMF_GPTQ_MEM_GB` limits how many groups are processed at once.
+  - The number of groups processed at once is capped by the RAM left after
+    the chunk's Hessians and the tensors already written (85 % of the
+    machine's RAM, the cgroup limit in a container); `CMF_GPTQ_MEM_GB`
+    overrides it. A calibration pass whose Hessians exceed 90 % of RAM is
+    refused up front with a `--calib-chunk-layers` value that fits.
 
 **`crates/cortiq-engine/src/gptq_capture.rs`**: adds `begin_filtered`.
 
@@ -322,6 +326,53 @@ defaults brings 2-bit gate/up to +57 % over f16 at a quarter of the size.
 The 7 MB difference between the files is container padding: the converter's
 streaming writer pads more than `CmfModel::write`.
 
+### Independent verification
+
+A second agent re-checked this branch from a fresh copy of the worktree on
+the 5090 pod. It built its own binary and treated the study directories as
+read-only.
+
+- **Tests.** The 36 targeted tests pass, and the full `cortiq-cli` suite
+  passes 193 tests with 1 ignored. With the fixes below the counts are 37 and
+  194. The engine's `gptq_capture` and `fcd` tests pass.
+- **Converter v2.** `convert --quant q2tp` with head and embeddings q8_2f
+  produced a file byte-identical to `Q0h_v2.cmf` (sha256 83d36e66…, torch
+  ppl 89.464). It took 30 s.
+- **GPTQ-q2tp with the CLI defaults** from the 32k cache produced a file
+  byte-identical to the evaluated `W0cd.cmf` (sha256 81f35e49…, ppl 27.756).
+  The cache-blocked fold and the row-blocked debias are therefore
+  bit-identical at full scale. The run took 510 s with a peak RSS of 10.0 GB.
+  cortiq CPU `ppl --windows 12 --window-len 512` on that file gives
+  24.9453, the same as the torch evaluator's w12 value of 24.9453.
+- **q4tp against master, with no cache.** Master's binary and this branch
+  each calibrated from scratch on the same 2048 WikiText-2 train tokens
+  (`--codec q4tp`, head and embeddings q8_2f) and wrote byte-identical files
+  (sha256 c939b1fd…). This also checks that the budgeted calibration reader
+  yields the same windows as master's whole-file read. Peak RSS was 23.2 GB
+  on this branch and 23.4 GB on master.
+- **Code review.** No correctness bug was found in the q2tp v2 writer
+  against the unchanged reader and kernels, in the GPTQ sweep, the blocked
+  trailing update, the threaded Cholesky and inverse, the Hessian cache
+  reader and writer, or the calibration reader. Three fixes were committed:
+  1. RAM guards for 27B-scale runs.
+     - At the default `--calib-chunk-layers 0`, a Qwen3.8-27B capture needs
+       about 230 GB and was not checked; it would have died with an OOM kill
+       during its first CPU window. It is now refused before the forward
+       runs, with a chunk size that fits.
+     - The widest-first order starts all the widest folds together. Without
+       `CMF_GPTQ_MEM_GB` nothing capped them; the RAM left now does.
+     - The bytes do not change. The fixed binary rebuilt W0cd from the
+       cache on 6 threads, byte-identical (sha256 81f35e49…).
+  2. `env_guard` now also clears `CMF_Q2TP_ENCODER`, so a panicking test
+     cannot leak the v1 encoder into later tests.
+  3. `par.sh` now passes `--q2tp-debias off`. The study's N1 and W0 arms
+     have no debias, and the CLI default is now on.
+- **Behaviour change outside quantization.** The DSpark draft requantizes its
+  gate/up experts from q4tp to q2tp at upload, through `encode_q2tp`. It now
+  runs v2, which does about 6× the search work of v1. The draft may encode
+  better, but GPU upload of the draft takes longer. `CMF_Q2TP_ENCODER=v1`
+  restores the old encoder.
+
 ### Open issues
 
 - **The calibration forward is CPU-only, and this is the bottleneck for
@@ -345,7 +396,7 @@ streaming writer pads more than `CmfModel::write`.
     f32.
 - **Fold operator.** In flight, one group holds 3n² f64 + n² f32 (8 GB at
   n = 17408). It is O(n³), about 3.5 T multiply-adds per 27B `down_proj`.
-  - The threaded version and `CMF_GPTQ_MEM_GB` handle this.
+  - The threaded version and the RAM cap on concurrent groups handle this.
   - On MiniCPM5 one GPTQ-only arm took 14–20 min on the shared pod, about
     7 min per 21-layer chunk, mostly the 6144-wide folds.
   - The cache blocking made no measurable difference there (W0c_blocked
