@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- CMF dtype 20 `q1g`: 1-bit signs with one f16 scale per 128-weight group
+  (1.125 bpw), sign and scale planes. `cortiq requant --quant q1g` repacks a
+  `q1` file of a natively 128-grouped 1-bit model losslessly; a group whose
+  four tile scales are not byte-identical refuses the run unless
+  `--allow-tol`. `--quant q1` writes `q1` back exactly. Bonsai-1.7B: file
+  334.2 → 253.8 MB, PPL 28.3705 on both (393 of 13.4 M groups take the mean
+  of their four f16-rounded scales, −9.3e-8 nats/token). Kernels on CPU, wgpu
+  and Metal return q1's f32 bit for bit on uniform scales; CPU decode is
+  ~2× q1 on x86 (group-level reduction), GPU decode equal or better. The
+  Metal kernels have not been run on Apple hardware yet.
+
 ## [0.8.19] - 2026-10-15
 
 ### Added
