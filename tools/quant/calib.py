@@ -110,10 +110,12 @@ def describe(corpora):
 
 
 # ----------------------------------------------------------------------------- teacher cache
-def _teacher_key(teacher_path, corpora, wl, k):
-    st = os.stat(teacher_path)
-    return {"teacher": os.path.abspath(teacher_path), "teacher_bytes": st.st_size, "wl": wl, "topk": k,
-            "corpora": [{key: v for key, v in d.items()} for d in describe(corpora)]}
+def _teacher_key(teacher_path, corpora, wl, k, teacher_bytes=None):
+    """identity of a cache: the teacher file (name + size) and every window (corpus digest +
+    starts) — no absolute paths, so a cache moves with the run directory"""
+    size = os.stat(teacher_path).st_size if teacher_bytes is None else teacher_bytes
+    return {"teacher": os.path.basename(teacher_path), "teacher_bytes": size, "wl": wl, "topk": k,
+            "corpora": [{key: v for key, v in d.items() if key != "path"} for d in describe(corpora)]}
 
 
 def teacher_cache(cache_dir, teacher_path, corpora, wl, k, make_model, block=256, mb=8, log=print):
@@ -121,11 +123,17 @@ def teacher_cache(cache_dir, teacher_path, corpora, wl, k, make_model, block=256
     (exact f32, no TF32, the teacher streamed layer by layer) and memory-mapped afterwards.
     make_model(cmf) -> qmodel.Model of the teacher. Returns dict of arrays + meta."""
     os.makedirs(cache_dir, exist_ok=True)
-    key = _teacher_key(teacher_path, corpora, wl, k)
     meta_p = os.path.join(cache_dir, "meta.json")
     names = ("train_lp", "train_ix", "held_lp", "held_ix")
-    if os.path.exists(meta_p):
-        meta = json.load(open(meta_p))
+    meta = json.load(open(meta_p)) if os.path.exists(meta_p) else None
+    if not os.path.exists(teacher_path):
+        # a cache made elsewhere can be used without the teacher file itself
+        if meta is None:
+            raise SystemExit(f"teacher {teacher_path} not found and no cache in {cache_dir}")
+        key = _teacher_key(teacher_path, corpora, wl, k, teacher_bytes=meta["key"]["teacher_bytes"])
+    else:
+        key = _teacher_key(teacher_path, corpora, wl, k)
+    if meta is not None:
         if meta.get("key") == key and all(os.path.exists(os.path.join(cache_dir, f"{n}.npy")) for n in names):
             log(f"teacher cache {cache_dir} (train CE {meta['train_ce']:.5f}, held CE {meta['held_ce']:.5f})")
             out = {n: np.load(os.path.join(cache_dir, f"{n}.npy"), mmap_mode="r") for n in names}

@@ -145,7 +145,7 @@ def main(argv=None):
         if not args.teacher:
             raise SystemExit("--metric kl needs --teacher")
         teacher = calib.teacher_cache(os.path.join(args.out, "teacher"), args.teacher, corpora, args.wl, args.topk,
-                                      lambda c: qmodel.Model(c, dev, residency="stream", vchunk=args.vchunk),
+                                      lambda c: qmodel.Model(c, dev, residency="stream", vchunk=args.vchunk, pin=False),
                                       mb=args.mb, log=log)
     src = cmfio.CmfFile(args.model)
     his = [cmfio.CmfFile(p) for p in args.hi]
