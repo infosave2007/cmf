@@ -5,6 +5,45 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `cortiq quantize-gptq --codec q2tp` GPTQ-rounds the converter's q2tp
+  profile: gate/up are GPTQ'd into q2tp and every other linear into q4tp.
+  A q4tp or q2tp `--tensor-quant` override stays GPTQ (an escort).
+  - Two rung rules: `--q2tp-rule placed` (the default; the ladder sits at
+    the H-weighted MSE-optimal group scales, with a full 31-rung search) and
+    `cortiq` (the q4tp rule on the 4-level grid). `--q2tp-rule-tensor` sets
+    the rule per tensor. `--act-order` is also available.
+  - `--q2tp-debias on|off` (default `on`) removes each row's output
+    shrinkage in the calibration metric at zero bits. `--q4tp-debias`
+    (opt-in) does the same for q4tp tensors.
+  - The output bytes do not depend on the thread count. Same layout, reader
+    and kernels.
+- Calibration for `quantize-gptq --codec q4tp|q2tp`:
+  - `--calib` can be repeated as `PATH=SHARE` to mix corpora; `.jsonl`
+    input is accepted.
+  - Text is read in budgeted prefixes, not whole files.
+  - Hessians are captured only for the linears GPTQ will quantize.
+  - `--calib-chunk-layers N` bounds Hessian RAM by capturing N layers per
+    pass.
+  - The Hessian cache is read one group at a time.
+
+### Changed
+- The q2tp encoder (`convert --quant q2tp` and every other q2tp writer)
+  now places each row ladder at the per-group MSE-optimal scale, searches
+  all 31 rungs, and removes the resulting output shrinkage through the row
+  `lo`. This needs no data and no extra bits, and the reader and kernels are
+  unchanged. `CMF_Q2TP_ENCODER=v1` restores the previous encoder byte for
+  byte.
+- The GPTQ fold operator runs on several threads and gives bit-identical
+  results. `CMF_GPTQ_MEM_GB` caps how many Hessian groups are in flight.
+
+### Performance
+- MiniCPM5-2B, q2tp profile with head and embeddings q8_2f, WikiText-2 test
+  (160 × 512): `convert --quant q2tp` perplexity goes from 206.6 to 89.5.
+  Further results are in `ENGINEERING.md`.
+
 ## [0.8.19] - 2026-10-15
 
 ### Added
