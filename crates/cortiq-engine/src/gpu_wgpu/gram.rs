@@ -236,6 +236,45 @@ pub fn add(id: u64, xs: &[f32], b: usize) -> bool {
     true
 }
 
+/// `H[id] += XᵀX` for `b` rows of a device buffer `x` (`[b·cols]` f32).
+pub fn add_dev(id: u64, x: &wgpu::Buffer, b: usize) -> bool {
+    let Some(c) = ctx() else { return false };
+    let Some(p) = pipe(c) else { return false };
+    let mut g = REG.lock().unwrap();
+    let Some(r) = g.as_mut() else { return false };
+    let Some((h, cols)) = r.slots.get(&id) else { return false };
+    let cols = *cols;
+    if b == 0 {
+        return true;
+    }
+    let prm = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("gram_p"),
+        size: 16,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    c.queue.write_buffer(&prm, 0, bytemuck::cast_slice(&[b as u32, cols as u32, 0, 0]));
+    let bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("gram_bg"),
+        layout: &p.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: x, offset: 0, size: std::num::NonZeroU64::new((b * cols * 4) as u64) }) },
+            wgpu::BindGroupEntry { binding: 1, resource: h.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: prm.as_entire_binding() },
+        ],
+    });
+    let nt = cols.div_ceil(64) as u32;
+    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gram") });
+    {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("gram"), timestamp_writes: None });
+        pass.set_pipeline(p);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(nt, nt, 1);
+    }
+    submit(c, enc.finish());
+    true
+}
+
 /// Read `H[id]` back as a full symmetric f64 matrix and free the buffer.
 pub fn take(id: u64) -> Option<Vec<f64>> {
     let out = read(id)?;

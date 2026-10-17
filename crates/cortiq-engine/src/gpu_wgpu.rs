@@ -48,6 +48,14 @@ pub(crate) mod gptq_dev;
 /// Binary low-rank (`blr`) per-op kernels: two ±1 stages, decode and batched.
 pub(crate) mod blr;
 pub use blr::blr_matmat;
+/// GatedDeltaNet forward and BPTT backward on the device (training).
+pub mod gdn_train;
+/// Trainer kernels: RMSNorm, SwiGLU, gate, q/k norm + RoPE, attention.
+pub mod train_ops;
+/// Trainer GEMMs (zi_mm) and the binary low-rank layer forward/backward.
+pub mod train_mm;
+/// Trainer loss: frozen vocabulary head + KL against the teacher top-k.
+pub mod train_head;
 
 /// Workgroup limit per dimension (WebGPU minimum; lm_head has more
 /// rows — we use grid-stride in the shader).
@@ -18788,7 +18796,7 @@ struct Q2LadderCache {
     row_ids: wgpu::Buffer,
 }
 
-struct Ctx {
+pub struct Ctx {
     /// The instance and adapter the device came from, kept for exactly as
     /// long as the device — which Vulkan requires and we were not doing.
     /// They were locals in `init()`, so `VkInstance` was destroyed while a
@@ -18799,8 +18807,8 @@ struct Ctx {
     /// double-linked list` abort that has been landing after correct answers.
     _instance: wgpu::Instance,
     _adapter: wgpu::Adapter,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    pub(crate) device: wgpu::Device,
+    pub(crate) queue: wgpu::Queue,
     /// Compiled pipelines, kept between runs where the driver supports
     /// it. `None` when it does not, or when the cache is switched off.
     pipeline_cache: Option<wgpu::PipelineCache>,
@@ -43105,6 +43113,14 @@ fn note_submit(c: &Ctx) {
 fn submit(c: &Ctx, buf: wgpu::CommandBuffer) {
     note_submit(c);
     c.queue.submit(Some(buf));
+}
+
+/// The device context as the trainer outside this module holds it.
+pub type CtxRef = &'static Ctx;
+
+/// [`submit`] for the trainer (`crate::nvg_train`).
+pub fn submit_pub(c: &Ctx, buf: wgpu::CommandBuffer) {
+    submit(c, buf);
 }
 
 #[inline]

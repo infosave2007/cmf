@@ -164,7 +164,7 @@ fn read_calib_text_budget(path: &str, budget: usize) -> anyhow::Result<(String, 
 /// text as that takes (≈8 bytes a token, doubled until it suffices). A cut
 /// can only disturb the last few tokens, so a margin past `want` is required
 /// before the prefix counts as final.
-fn calib_source_tokens(
+pub(crate) fn calib_source_tokens(
     path: &str,
     want: usize,
     encode: &dyn Fn(&str) -> Vec<u32>,
@@ -1511,7 +1511,7 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
                                         inner,
                                     );
                                     if let Some(h) = &keep_h {
-                                        q2tp_debias_hessian(&mut b, &w, rows, cols, h, inner);
+                                        q2tp_debias_gemm(&mut b, &w, rows, cols, h, inner);
                                     }
                                     (TensorDtype::Q2TiledP, b)
                                 }
@@ -1559,7 +1559,7 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
                             let out = if q == Quant::Q2TiledP {
                                 gptq_quantize_q2tp_dev(&w, rows, cols, fid, &dead, &hdiag, o.threads).map(|mut b| {
                                     if let Some(h) = &keep_h {
-                                        q2tp_debias_hessian(&mut b, &w, rows, cols, h, o.threads.max(1));
+                                        q2tp_debias_gemm(&mut b, &w, rows, cols, h, o.threads.max(1));
                                     }
                                     (TensorDtype::Q2TiledP, b)
                                 })
@@ -2139,7 +2139,7 @@ pub fn gptq_quantize_q4tp(
 /// (`gpu::gptq_fold_dev`): the same ladder (the converter's, from the
 /// dead-zeroed weights), rung rule and nibble layout; f32 instead of the
 /// host's f64 operator, so codes can differ at rounding boundaries.
-fn gptq_quantize_q4tp_dev(w0: &[f32], rows: usize, cols: usize, fold: u64, dead: &[bool]) -> Option<Vec<u8>> {
+pub(crate) fn gptq_quantize_q4tp_dev(w0: &[f32], rows: usize, cols: usize, fold: u64, dead: &[bool]) -> Option<Vec<u8>> {
     use cortiq_core::quant::{q4tp_ladder, q4tp_put_code, q4tp_sections};
     if cols % GROUP_SIZE != 0 || dead.len() != cols {
         return None;
@@ -2186,7 +2186,7 @@ fn gptq_quantize_q4tp_dev(w0: &[f32], rows: usize, cols: usize, fold: u64, dead:
 /// [`gptq_quantize_q2tp`] with the `placed` rule on the device against a
 /// device fold: ladders placed on the host (from the dead-zeroed weights, as
 /// the host sweep places them), the sweep and its rung search on the card.
-fn gptq_quantize_q2tp_dev(
+pub(crate) fn gptq_quantize_q2tp_dev(
     w0: &[f32],
     rows: usize,
     cols: usize,
@@ -2625,9 +2625,57 @@ fn q2_trailing_impl(w: &mut [f32], rb: usize, cols: usize, e: &[f32], b0: usize,
 /// rule) shrinks every output by its error energy, the same way in every
 /// layer; on MiniCPM5 this removed 5–20 % of ppl on such arms.
 pub fn q2tp_debias_hessian(bytes: &mut [u8], w0: &[f32], rows: usize, cols: usize, h: &[f64], threads: usize) {
-    use cortiq_core::quant::{Q2TP_CHUNK, q2tp_sections, q4tp_code};
     assert_eq!(h.len(), cols * cols);
+    q2tp_debias_core(bytes, w0, rows, cols, threads, |r, y| {
+        let wr = &w0[r * cols..(r + 1) * cols];
+        for (i, yi) in y.iter_mut().enumerate() {
+            let hrow = &h[i * cols..(i + 1) * cols];
+            *yi = hrow.iter().zip(wr).map(|(&a, &b)| a * b as f64).sum();
+        }
+    });
+}
+
+/// `q2tp_debias_hessian` with `H·w_r` precomputed for every row (`hw`,
+/// `rows × cols`, e.g. one GEMM `W·H` for the whole matrix).
+pub fn q2tp_debias_rows(bytes: &mut [u8], w0: &[f32], rows: usize, cols: usize, hw: &[f32], threads: usize) {
+    assert_eq!(hw.len(), rows * cols);
+    q2tp_debias_core(bytes, w0, rows, cols, threads, |r, y| {
+        for (d, &s) in y.iter_mut().zip(&hw[r * cols..(r + 1) * cols]) {
+            *d = s as f64;
+        }
+    });
+}
+
+/// `q2tp_debias_hessian` with `H·w` for all rows from one f32 GEMM `W·H`
+/// split over `threads` (the f64 per-row products cost rows·cols² scalar
+/// multiply-adds: 1.5 T for a 27B down projection).
+pub fn q2tp_debias_gemm(bytes: &mut [u8], w0: &[f32], rows: usize, cols: usize, h: &[f64], threads: usize) {
+    assert_eq!(h.len(), cols * cols);
+    let h32: Vec<f32> = h.iter().map(|&v| v as f32).collect();
+    let hw = gemm_rows_square(w0, rows, cols, &h32, threads);
+    q2tp_debias_rows(bytes, w0, rows, cols, &hw, threads);
+}
+
+/// `A·B` for row-major `a` (`m × k`) and a square `b` (`k × k`), rows split
+/// across `threads`.
+pub(crate) fn gemm_rows_square(a: &[f32], m: usize, k: usize, b: &[f32], threads: usize) -> Vec<f32> {
+    assert!(a.len() >= m * k && b.len() >= k * k);
+    let mut out = vec![0f32; m * k];
+    let per = m.div_ceil(threads.max(1)).max(1);
+    std::thread::scope(|s| {
+        for (ci, chunk) in out.chunks_mut(per * k).enumerate() {
+            let rows = chunk.len() / k;
+            let src = &a[ci * per * k..(ci * per + rows) * k];
+            s.spawn(move || cortiq_engine::qtensor::sgemm_public(rows, k, k, 1.0, src, k, b, k, false, chunk, k));
+        }
+    });
+    out
+}
+
+fn q2tp_debias_core(bytes: &mut [u8], w0: &[f32], rows: usize, cols: usize, threads: usize, hw_row: impl Fn(usize, &mut [f64]) + Sync) {
+    use cortiq_core::quant::{Q2TP_CHUNK, q2tp_sections, q4tp_code};
     assert_eq!(w0.len(), rows * cols);
+    let hw_row = &hw_row;
     let gpr = cols / GROUP_SIZE;
     let (po, co, stride) = q2tp_sections(rows, cols);
     let (plane, rest) = bytes.split_at_mut(po);
@@ -2653,10 +2701,7 @@ pub fn q2tp_debias_hessian(bytes: &mut [u8], w0: &[f32], rows: usize, cols: usiz
                             }
                         }
                     }
-                    for (i, yi) in y.iter_mut().enumerate() {
-                        let hrow = &h[i * cols..(i + 1) * cols];
-                        *yi = hrow.iter().zip(wr).map(|(&a, &b)| a * b as f64).sum();
-                    }
+                    hw_row(r, &mut y);
                     let num: f64 = wh.iter().zip(&y).map(|(&a, &b)| a as f64 * b).sum();
                     let den: f64 = wr.iter().zip(&y).map(|(&a, &b)| a as f64 * b).sum();
                     crate::convert::q2tp_unshrink_row(p, num, den);
@@ -3420,6 +3465,23 @@ mod tests {
             unit += ((b1 - 1.0).abs() < 0.01) as usize;
         }
         assert!(unit > rows / 2, "most rows must come back to a unit slope ({unit}/{rows})");
+    }
+
+    /// The GEMM debias (`H·w` for every row from one f32 `W·H`, as
+    /// `quantize-gptq` and `quantize-moe` run it) lands on the same
+    /// parameters as the f64 per-row form.
+    #[test]
+    fn q2tp_debias_rows_matches_hessian_form() {
+        let (rows, cols, t) = (24usize, 256usize, 600usize);
+        let (w, _, h) = q2_problem_with(rows, cols, t, 91, 2.0);
+        let hdiag: Vec<f32> = (0..cols).map(|i| h[i * cols + i] as f32).collect();
+        let (u, dead) = gptq_fold_operator(h.clone(), cols, 0.01);
+        let g = gptq_quantize_q2tp(&w, rows, cols, &u, &dead, &hdiag, Q2tpRule::Placed, None, 2);
+        let (mut a, mut b) = (g.clone(), g.clone());
+        q2tp_debias_hessian(&mut a, &w, rows, cols, &h, 3);
+        q2tp_debias_gemm(&mut b, &w, rows, cols, &h, 3);
+        let differ = a.iter().zip(&b).filter(|(x, y)| x != y).count();
+        assert!(differ <= rows / 8, "{differ} bytes differ between the f64 and the GEMM debias");
     }
 
     /// The fold operator as it was before blocking and threads: row

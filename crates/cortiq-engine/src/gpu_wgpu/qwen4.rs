@@ -6733,6 +6733,7 @@ pub(crate) fn encode_layer(
         );
     }
     ts_pass(&mut pass, 6);
+    capture_rows(c, &mut pass, li, nt, &x2, hs, &logits, es(g.n_experts * 4), hidden, g.n_experts);
     if !skip("experts") {
         // resident experts straight from the global arena, every token in
         // one dispatch (the kernels take the token as their batch index)
@@ -9277,6 +9278,134 @@ mod expert4_tests {
             );
         }
     }
+}
+
+// ───────────────────── GPTQ calibration capture ─────────────────────
+//
+// `capture_begin(lo, hi)` makes every layer frame in [lo, hi) copy its MoE
+// input rows (`x2`, the vector the router and the experts read) and its
+// router logits into a per-layer buffer right after routing; the caller
+// reads them after each `forward_tokens` (≤ TMAX tokens). The experts'
+// input Hessians are then built from these rows on the host side.
+
+struct Capture {
+    lo: usize,
+    hi: usize,
+    width: usize,
+    bufs: Vec<wgpu::Buffer>,
+    written: usize,
+    pipe: wgpu::ComputePipeline,
+}
+
+static CAPTURE: std::sync::Mutex<Option<Capture>> = std::sync::Mutex::new(None);
+
+const CAPTURE_SRC: &str = r#"
+struct P { nt: u32, hidden: u32, ne: u32, xs: u32, ls: u32, p0: u32, p1: u32, p2: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> x2: array<f32>;
+@group(0) @binding(2) var<storage, read> lg: array<f32>;
+@group(0) @binding(3) var<storage, read_write> dst: array<f32>;
+@compute @workgroup_size(256)
+fn cap_rows(@builtin(global_invocation_id) g: vec3<u32>) {
+    let w = p.hidden + p.ne;
+    let i = g.x;
+    if (i >= p.nt * w) { return; }
+    let t = i / w;
+    let c = i % w;
+    if (c < p.hidden) { dst[i] = x2[t * p.xs + c]; } else { dst[i] = lg[t * p.ls + (c - p.hidden)]; }
+}
+"#;
+
+/// Start capturing layers `lo..hi` (`hidden` input width, `ne` experts).
+pub fn capture_begin(lo: usize, hi: usize, hidden: usize, ne: usize) -> bool {
+    let Some(c) = ctx() else { return false };
+    let m = c.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("qwen4-capture"),
+        source: wgpu::ShaderSource::Wgsl(CAPTURE_SRC.into()),
+    });
+    let pipe = c.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("qwen4-capture"),
+        layout: None,
+        module: &m,
+        entry_point: Some("cap_rows"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let width = hidden + ne;
+    let bufs = (lo..hi)
+        .map(|_| {
+            c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("qwen4-capture"),
+                size: (TMAX * width * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        })
+        .collect();
+    *CAPTURE.lock().unwrap() = Some(Capture { lo, hi, width, bufs, written: 0, pipe });
+    true
+}
+
+pub fn capture_end() {
+    *CAPTURE.lock().unwrap() = None;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_rows(c: &Ctx, pass: &mut wgpu::ComputePass<'_>, li: usize, nt: usize, x2: &wgpu::Buffer, xs: u32, lg: &wgpu::Buffer, ls: u32, hidden: usize, ne: usize) {
+    let mut g = CAPTURE.lock().unwrap();
+    let Some(cap) = g.as_mut() else { return };
+    if li < cap.lo || li >= cap.hi || cap.width != hidden + ne {
+        return;
+    }
+    let u = uniform_u32x8(c, [nt as u32, hidden as u32, ne as u32, xs, ls, 0, 0, 0]);
+    let bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("qwen4-capture"),
+        layout: &cap.pipe.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: u.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: x2.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: lg.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: cap.bufs[li - cap.lo].as_entire_binding() },
+        ],
+    });
+    pass.set_pipeline(&cap.pipe);
+    pass.set_bind_group(0, &bg, &[]);
+    pass.dispatch_workgroups(((nt * cap.width).div_ceil(256)) as u32, 1, 1);
+    cap.written += 1;
+}
+
+/// The captured rows of the last forward (`nt` tokens): per layer of the
+/// range, `nt × (hidden + ne)` floats (MoE input then router logits), and
+/// how many layer frames wrote since the last read.
+pub fn capture_read(nt: usize) -> Option<(Vec<Vec<f32>>, usize)> {
+    let c = ctx()?;
+    let mut g = CAPTURE.lock().unwrap();
+    let cap = g.as_mut()?;
+    let n = nt * cap.width;
+    let size = (n * 4) as u64;
+    let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("qwen4-capture-rb"),
+        size: size * cap.bufs.len() as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("qwen4-capture-rb") });
+    for (k, b) in cap.bufs.iter().enumerate() {
+        enc.copy_buffer_to_buffer(b, 0, &stage, size * k as u64, size);
+    }
+    submit(c, enc.finish());
+    let slice = stage.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    c.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+    let out = {
+        let data = slice.get_mapped_range().ok()?;
+        let all: &[f32] = bytemuck::cast_slice(&data);
+        (0..cap.bufs.len()).map(|k| all[k * n..(k + 1) * n].to_vec()).collect()
+    };
+    stage.unmap();
+    let w = cap.written;
+    cap.written = 0;
+    Some((out, w))
 }
 
 #[cfg(test)]
