@@ -56,6 +56,7 @@ def get_args(argv=None):
     ap.add_argument("--mb", type=int, default=8)
     ap.add_argument("--residency", choices=("resident", "stream"), default="resident")
     ap.add_argument("--vchunk", type=int, default=16384)
+    ap.add_argument("--head-windows", type=int, default=1, help="windows per vocabulary scan of the head")
     ap.add_argument("--tf32", action="store_true", help="TF32 matmuls (default exact f32)")
     ap.add_argument("--write", help="write the escorted model for the first budget here")
     ap.add_argument("--cortiq", default="cortiq")
@@ -150,7 +151,7 @@ def main(argv=None):
                                       mb=args.mb, log=log)
     src = cmfio.CmfFile(args.model)
     his = [cmfio.CmfFile(p) for p in args.hi]
-    model = qmodel.Model(src, dev, residency=args.residency, vchunk=args.vchunk)
+    model = qmodel.Model(src, dev, residency=args.residency, vchunk=args.vchunk, head_windows=args.head_windows)
     cands = candidates(model, his, args.include, args.exclude)
     body = sum(l.rows * l.cols for l in model.linears())
     log(f"{len(held_w)} held-out windows of {args.wl}; {len(cands)} candidates; body {body} parameters")
