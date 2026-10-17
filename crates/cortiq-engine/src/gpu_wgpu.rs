@@ -3689,11 +3689,12 @@ fn q1_matvec(@builtin(workgroup_id) wid: vec3<u32>,
 // word q1p._p0 (the third param word, which q1_matvec leaves unused; the
 // batch kernels of this module read it as their batch count instead).
 // The workgroup/lane walk, the staging, the per-lane
-// `acc + s·Σ(tile0) + s·Σ(tile1)` and the reduction are q1_matvec's, line
-// for line: a lane still owns a 64-col tile pair (half a 128-group), only
-// its words come from the plane and its scale from the scale plane — so a
-// q1g repack of a uniform-scale q1 tensor gives q1_matvec's output bit for
-// bit, while streaming 4.5 bytes per 32 weights instead of 6.
+// `acc + s·Σ(tile0) + s·Σ(tile1)` and the reduction are q1_matvec's: a lane
+// still owns a 64-col tile pair (half a 128-group), only its words come from
+// the plane and its scale from the scale plane (fetched ahead of the
+// staging barrier) — so a q1g repack of a uniform-scale q1 tensor gives
+// q1_matvec's output bit for bit, while streaming 4.5 bytes per 32 weights
+// instead of 6.
 @compute @workgroup_size(Q1_WG)
 fn q1g_matvec(@builtin(workgroup_id) wid: vec3<u32>,
               @builtin(num_workgroups) nwg: vec3<u32>,
@@ -3710,6 +3711,20 @@ fn q1g_matvec(@builtin(workgroup_id) wid: vec3<u32>,
         var ti = 0u;
         loop {
             if (ti >= q1p.np) { break; }
+            // This lane's two sign words and its group scale are fetched
+            // BEFORE the activation staging and its barrier: the scale
+            // lives in a second plane, and issuing both streams early lets
+            // their latency hide behind the staging (same values, same sums).
+            let pi = ti + lane;
+            let live = row < q1p.rows && pi < q1p.np;
+            var b0 = 0u; var b1 = 0u; var s = 0.0;
+            if (live) {
+                let base = row * gpr + pi * 2u;
+                b0 = q1w[base]; b1 = q1w[base + 1u];
+                let g = row * (gpr >> 2u) + (pi >> 1u);
+                let sw = unpack2x16float(q1w[q1p._p0 + (g >> 1u)]);
+                s = select(sw.x, sw.y, (g & 1u) == 1u);
+            }
             let c0 = ti * 64u;
             var k = lid;
             loop {
@@ -3719,13 +3734,7 @@ fn q1g_matvec(@builtin(workgroup_id) wid: vec3<u32>,
                 k = k + Q1_WG;
             }
             workgroupBarrier();
-            let pi = ti + lane;
-            if (row < q1p.rows && pi < q1p.np) {
-                let base = row * gpr + pi * 2u;
-                let b0 = q1w[base]; let b1 = q1w[base + 1u];
-                let g = row * (gpr >> 2u) + (pi >> 1u);
-                let sw = unpack2x16float(q1w[q1p._p0 + (g >> 1u)]);
-                let s = select(sw.x, sw.y, (g & 1u) == 1u);
+            if (live) {
                 let xb = lane * 64u;
                 acc = acc + s * q1_tile_sum(b0, xb) + s * q1_tile_sum(b1, xb + 32u);
             }
