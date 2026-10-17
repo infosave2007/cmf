@@ -1520,7 +1520,8 @@ pub fn run_convert_blr(
                         jobs.push(crate::nvg_gpu::Job { w: load_f64(&srcm, slot)?, hc: &hctx[input_lead(short)], mult: mult_of(short) });
                     }
                     let njobs: usize = std::env::var("CMF_NVG_JOBS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
-                    let want_prof = std::env::var("CMF_NVG_PROF").as_deref() == Ok("1");
+                    // stage syncs would serialise concurrent tensors
+                    let want_prof = std::env::var("CMF_NVG_PROF").as_deref() == Ok("1") && njobs == 1;
                     let te = Instant::now();
                     let done = crate::nvg_gpu::encode_many(&jobs, o.bpw, o.paths, threads, njobs, want_prof, &|i, d| {
                         let (_, _, short) = mine[i];

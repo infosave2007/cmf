@@ -100,15 +100,15 @@ fn download(b: &wgpu::Buffer, n: usize) -> Vec<f32> {
     if size > 0 {
         enc.copy_buffer_to_buffer(b, 0, &st, 0, size);
     }
-    let idx = c.queue.submit(Some(enc.finish()));
+    c.queue.submit(Some(enc.finish()));
     if size == 0 {
         return Vec::new();
     }
     let slice = st.slice(..size);
-    slice.map_async(wgpu::MapMode::Read, |_| {});
-    c.device
-        .poll(wgpu::PollType::Wait { submission_index: Some(idx), timeout: None })
-        .expect("nvg_dev readback wait");
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let f2 = flag.clone();
+    slice.map_async(wgpu::MapMode::Read, move |_| f2.store(true, std::sync::atomic::Ordering::Release));
+    spin_until(&flag);
     let out = {
         let data = slice.get_mapped_range().expect("nvg_dev mapped range");
         let mut v = vec![0f32; n];
@@ -128,9 +128,33 @@ pub fn copy(src: &DMat, dst: &DMat) {
     submit(c, enc.finish());
 }
 
-/// Wait until every submitted dispatch has finished (stage timing).
+/// Non-blocking polls until `flag` is set by a completion callback: a
+/// blocking `poll(Wait)` holds the device's fence while it sleeps, which
+/// stalls every other thread's submissions (tensors encoded concurrently).
+fn spin_until(flag: &std::sync::atomic::AtomicBool) {
+    let c = dev();
+    let mut spins = 0u32;
+    while !flag.load(std::sync::atomic::Ordering::Acquire) {
+        let _ = c.device.poll(wgpu::PollType::Poll);
+        if flag.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        spins += 1;
+        if spins < 64 {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(std::time::Duration::from_micros(40));
+        }
+    }
+}
+
+/// Wait until everything submitted so far has finished (stage timing).
 pub fn sync() {
-    let _ = dev().device.poll(wgpu::PollType::wait_indefinitely());
+    let c = dev();
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let f2 = flag.clone();
+    c.queue.on_submitted_work_done(move || f2.store(true, std::sync::atomic::Ordering::Release));
+    spin_until(&flag);
 }
 
 // ───────────────────────────── GEMM ─────────────────────────────
@@ -810,6 +834,310 @@ pub fn transpose(a: &DMat) -> DMat {
     c
 }
 
+const VEC_SRC: &str = r#"
+struct P { u0: u32, u1: u32, u2: u32, u3: u32, u4: u32, u5: u32, u6: u32, u7: u32, u8: u32, u9: u32, u10: u32, u11: u32, f0: f32, f1: f32, f2: f32, f3: f32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> A: array<f32>;
+@group(0) @binding(2) var<storage, read> B: array<f32>;
+@group(0) @binding(3) var<storage, read> R: array<f32>;
+@group(0) @binding(4) var<storage, read> S: array<f32>;
+@group(0) @binding(5) var<storage, read_write> C: array<f32>;
+@group(0) @binding(6) var<storage, read_write> O: array<f32>;
+@group(0) @binding(7) var<storage, read> U: array<u32>;
+@group(0) @binding(8) var<storage, read_write> RG: array<f32>;
+var<workgroup> red: array<f32, 256>;
+
+fn wsum(t: u32, v: f32) -> f32 {
+    red[t] = v;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {
+        if (t < s) { red[t] = red[t] + red[t + s]; }
+        workgroupBarrier();
+    }
+    let r = red[0];
+    workgroupBarrier();
+    return r;
+}
+
+// One workgroup: mean diagonal of the n x n A (u0 = n); RG[0] = ridge =
+// f0 * mean (u6 = 0) or RG[0] * 100 (u6 = 1, a failed factorisation),
+// RG[1] = mean; C[i] = sqrt(max(A_ii + ridge, tiny)).
+@compute @workgroup_size(256)
+fn diag_ridge(@builtin(local_invocation_index) t: u32) {
+    let n = p.u0;
+    var acc = 0.0;
+    for (var i = t; i < n; i = i + 256u) { acc = acc + A[i * n + i]; }
+    let mean = wsum(t, acc) / f32(n);
+    var ridge = p.f0 * max(mean, 1.0e-30);
+    if (p.u6 == 1u) { ridge = RG[0] * 100.0; }
+    workgroupBarrier();
+    if (t == 0u) { RG[0] = ridge; RG[1] = mean; }
+    for (var i = t; i < n; i = i + 256u) { C[i] = sqrt(max(A[i * n + i] + ridge, 1.0e-30)); }
+}
+
+// F = (A + RG[0] I) / (d d^T), d = R. u0 = n.
+@compute @workgroup_size(256)
+fn equil_rg(@builtin(global_invocation_id) g: vec3<u32>) {
+    let t = g.x + g.y * 65535u * 256u;
+    let n = p.u0;
+    if (t >= n * n) { return; }
+    let i = t / n;
+    let j = t % n;
+    var v = A[t];
+    if (i == j) { v = v + RG[0]; }
+    C[t] = v / (R[i] * R[j]);
+}
+
+// C[oc + i] = A[oa + i] / R[i]  (u0 = len, u3 = oa, u5 = oc)
+@compute @workgroup_size(256)
+fn div_vec(@builtin(global_invocation_id) g: vec3<u32>) {
+    let i = g.x + g.y * 65535u * 256u;
+    if (i >= p.u0) { return; }
+    C[p.u5 + i] = A[p.u3 + i] / R[i];
+}
+
+// Column partial sums reduced: C[oc + j] = sum_ch A[ch * u1 + j]  (u0 = chunks, u1 = cols)
+@compute @workgroup_size(256)
+fn colsum_red(@builtin(global_invocation_id) g: vec3<u32>) {
+    let j = g.x;
+    if (j >= p.u1) { return; }
+    var acc = 0.0;
+    for (var ch = 0u; ch < p.u0; ch = ch + 1u) { acc = acc + A[ch * p.u1 + j]; }
+    C[p.u5 + j] = acc;
+}
+
+// Per-row h solve (P = u1 in {1, 2}) as the host ALS: A = rh0, B = rh1,
+// R = g00, S = g01, RG = g11; C = h0, O = h1 (old values kept when singular).
+@compute @workgroup_size(256)
+fn hsolve(@builtin(global_invocation_id) g: vec3<u32>) {
+    let i = g.x + g.y * 65535u * 256u;
+    if (i >= p.u0) { return; }
+    if (p.u1 == 1u) {
+        let ridge = 1.0e-10 * max(R[i], 1.0e-30);
+        C[i] = A[i] / (R[i] + ridge);
+        return;
+    }
+    let tr = 0.5 * (R[i] + RG[i]);
+    let ridge = 1.0e-10 * max(tr, 1.0e-30);
+    let a11 = R[i] + ridge;
+    let a12 = S[i];
+    let a22 = RG[i] + ridge;
+    let det = a11 * a22 - a12 * a12;
+    if (abs(det) > 0.0) {
+        C[i] = (a22 * A[i] - a12 * B[i]) / det;
+        O[i] = (a11 * B[i] - a12 * A[i]) / det;
+    }
+}
+
+// C[U[j]] = A[u3 + j], j < u0 (scatter of an act-order vector)
+@compute @workgroup_size(256)
+fn scatter_vec(@builtin(global_invocation_id) g: vec3<u32>) {
+    let j = g.x + g.y * 65535u * 256u;
+    if (j >= p.u0) { return; }
+    C[U[j]] = A[p.u3 + j];
+}
+
+// One workgroup: RG[u5] = sum of the u0 partials in A.
+@compute @workgroup_size(256)
+fn sum_into(@builtin(local_invocation_index) t: u32) {
+    var acc = 0.0;
+    for (var i = t; i < p.u0; i = i + 256u) { acc = acc + A[i]; }
+    let s = wsum(t, acc);
+    if (t == 0u) { RG[p.u5] = s; }
+}
+
+// C[i] = A[i] / sqrt(RG[u5])  (u0 = len): scale by a device-held norm²
+@compute @workgroup_size(256)
+fn scale_rsqrt(@builtin(global_invocation_id) g: vec3<u32>) {
+    let i = g.x + g.y * 65535u * 256u;
+    if (i >= p.u0) { return; }
+    C[i] = A[i] / sqrt(max(RG[p.u5], 1.0e-30));
+}
+
+// Compact-WY T of one reflector block (dlarft, forward, columnwise), one
+// workgroup: A = V^T V (bb x bb, u1 = bb), R = tau (offset u3), b = u2 live
+// columns; T (bb x bb) into C.
+@compute @workgroup_size(64)
+fn wy_t(@builtin(local_invocation_index) t: u32) {
+    let bb = p.u1;
+    let b = p.u2;
+    let to = p.u3;
+    for (var e = t; e < bb * bb; e = e + 64u) { C[e] = 0.0; }
+    workgroupBarrier();
+    for (var i = 0u; i < b; i = i + 1u) {
+        let ti = R[to + i];
+        // T[0:i, i] = -tau_i * T[0:i, 0:i] * VtV[0:i, i]
+        var v = 0.0;
+        if (t < i && ti != 0.0) {
+            for (var q = t; q < i; q = q + 1u) { v = v + C[t * bb + q] * A[q * bb + i]; }
+            v = -ti * v;
+        }
+        workgroupBarrier();
+        if (t < i) { C[t * bb + i] = v; }
+        if (t == 0u) { C[i * bb + i] = ti; }
+        workgroupBarrier();
+    }
+}
+"#;
+
+fn vecm(c: &Ctx) -> Option<&'static Mod> {
+    train_ops::module(c, "nvg_vec", VEC_SRC, &["diag_ridge", "equil_rg", "div_vec", "colsum_red", "hsolve", "scatter_vec", "sum_into", "scale_rsqrt", "wy_t"])
+}
+
+fn vgrid(n: usize) -> (u32, u32, u32) {
+    elt_fold(n)
+}
+
+/// Copy `len` floats `src[so..] → dst[do_..]`.
+pub fn copy_range(src: &DMat, so: usize, dst: &DMat, do_: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let c = dev();
+    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("nvg_copy_range") });
+    enc.copy_buffer_to_buffer(&src.buf, (so * 4) as u64, &dst.buf, (do_ * 4) as u64, (len * 4) as u64);
+    submit(c, enc.finish());
+}
+
+/// [`spd_solve`] with the right-hand side and the solution on the device:
+/// the mean diagonal, ridge and equilibration computed there, one readback
+/// per factorisation attempt (its pivot flag).
+pub fn spd_solve_d(a: &DMat, b: &DMat, rel: f64) -> DMat {
+    let n = a.r;
+    let cx = dev();
+    let md = vecm(cx).expect("nvg vec pipelines");
+    let d = dummy(cx);
+    let dvec = DMat::zeros(1, n);
+    let rg = DMat::zeros(1, 4);
+    let f = DMat::zeros(n, n);
+    for attempt in 0..12 {
+        let ds = vec![
+            Disp { pipe: &md.p["diag_ridge"], uni: uni(&[n as u32, 0, 0, 0, 0, 0, (attempt > 0) as u32], &[rel as f32]), bufs: vec![(1, &a.buf), (5, &dvec.buf), (8, &rg.buf)], grid: (1, 1, 1) },
+            Disp { pipe: &md.p["equil_rg"], uni: uni(&[n as u32], &[]), bufs: vec![(1, &a.buf), (3, &dvec.buf), (5, &f.buf), (8, &rg.buf)], grid: vgrid(n * n) },
+        ];
+        train_ops::run(cx, &ds);
+        if chol_in_place(&f) == Some(true) {
+            let y = DMat::zeros(1, n);
+            train_ops::run(cx, &[Disp { pipe: &md.p["div_vec"], uni: uni(&[n as u32, 0, 0, 0, 0, 0], &[]), bufs: vec![(1, &b.buf), (3, &dvec.buf), (5, &y.buf)], grid: vgrid(n) }]);
+            chol_solve_dev(&f, &y);
+            let x = DMat::zeros(1, n);
+            train_ops::run(cx, &[Disp { pipe: &md.p["div_vec"], uni: uni(&[n as u32, 0, 0, 0, 0, 0], &[]), bufs: vec![(1, &y.buf), (3, &dvec.buf), (5, &x.buf)], grid: vgrid(n) }]);
+            return x;
+        }
+        let r = rg.to_f32();
+        if r[0] as f64 > (r[1].abs() as f64) * 10.0 + 1e-30 {
+            break;
+        }
+    }
+    let _ = d;
+    DMat::zeros(1, n)
+}
+
+/// `out[oo + j] = Σ_i A[oa+i·lda+j]·B[ob+i·ldb+j]` on the device (no readback).
+#[allow(clippy::too_many_arguments)]
+pub fn colsum_dev(rows: usize, cols: usize, a: &DMat, oa: usize, lda: usize, b: &DMat, ob: usize, ldb: usize, out: &DMat, oo: usize) {
+    let cx = dev();
+    let el = elt(cx).expect("nvg elt pipelines");
+    let md = vecm(cx).expect("nvg vec pipelines");
+    let per = 64usize.max(rows.div_ceil(256));
+    let nch = rows.div_ceil(per).max(1);
+    let part = DMat::zeros(nch, cols);
+    let ds = vec![
+        Disp {
+            pipe: &el.p["colsum_part"],
+            uni: uni(&[rows as u32, cols as u32, lda as u32, oa as u32, ldb as u32, ob as u32, per as u32], &[]),
+            bufs: vec![(1, &a.buf), (2, &b.buf), (6, &part.buf)],
+            grid: (cols.div_ceil(256) as u32, nch as u32, 1),
+        },
+        Disp { pipe: &md.p["colsum_red"], uni: uni(&[nch as u32, cols as u32, 0, 0, 0, oo as u32], &[]), bufs: vec![(1, &part.buf), (5, &out.buf)], grid: (cols.div_ceil(256) as u32, 1, 1) },
+    ];
+    train_ops::run(cx, &ds);
+}
+
+/// Per-row h solve on the device (see the kernel); `h1` unused for P = 1.
+#[allow(clippy::too_many_arguments)]
+pub fn hsolve(m: usize, np: usize, rh0: &DMat, rh1: &DMat, g00: &DMat, g01: &DMat, g11: &DMat, h0: &DMat, h1: &DMat) {
+    let cx = dev();
+    let md = vecm(cx).expect("nvg vec pipelines");
+    let dp = Disp {
+        pipe: &md.p["hsolve"],
+        uni: uni(&[m as u32, np as u32], &[]),
+        bufs: vec![(1, &rh0.buf), (2, &rh1.buf), (3, &g00.buf), (4, &g01.buf), (8, &g11.buf), (5, &h0.buf), (6, &h1.buf)],
+        grid: vgrid(m),
+    };
+    train_ops::run(cx, &[dp]);
+}
+
+/// `dst[perm[j]] = src[so + j]` for `n` entries.
+pub fn scatter_vec(src: &DMat, so: usize, dst: &DMat, perm: &wgpu::Buffer, n: usize) {
+    let cx = dev();
+    let md = vecm(cx).expect("nvg vec pipelines");
+    let dp = Disp { pipe: &md.p["scatter_vec"], uni: uni(&[n as u32, 0, 0, so as u32], &[]), bufs: vec![(1, &src.buf), (5, &dst.buf), (7, perm)], grid: vgrid(n) };
+    train_ops::run(cx, &[dp]);
+}
+
+/// `out = a / ‖a‖_F` on the device (no readback).
+pub fn normalize_frob(a: &DMat, out: &DMat) {
+    let cx = dev();
+    let el = elt(cx).expect("nvg elt pipelines");
+    let md = vecm(cx).expect("nvg vec pipelines");
+    let len = a.len();
+    let nwg = 512usize.min(len.div_ceil(256)).max(1);
+    let part = DMat::zeros(1, nwg);
+    let rg = DMat::zeros(1, 4);
+    let ds = vec![
+        Disp { pipe: &el.p["frob_part"], uni: uni(&[len as u32, nwg as u32], &[]), bufs: vec![(1, &a.buf), (2, &a.buf), (6, &part.buf)], grid: (nwg as u32, 1, 1) },
+        Disp { pipe: &md.p["sum_into"], uni: uni(&[nwg as u32, 0, 0, 0, 0, 0], &[]), bufs: vec![(1, &part.buf), (8, &rg.buf)], grid: (1, 1, 1) },
+        Disp { pipe: &md.p["scale_rsqrt"], uni: uni(&[len as u32, 0, 0, 0, 0, 0], &[]), bufs: vec![(1, &a.buf), (5, &out.buf), (8, &rg.buf)], grid: vgrid(len) },
+    ];
+    train_ops::run(cx, &ds);
+}
+
+/// Several `Σ A⊙B` read back together: `add` queues one (no readback),
+/// `read` returns them all in f64 after one wait.
+pub struct FrobBatch {
+    parts: Vec<DMat>,
+}
+
+impl FrobBatch {
+    pub fn new() -> Self {
+        FrobBatch { parts: Vec::new() }
+    }
+    /// Queue `Σ_{i<len} a[i]·b[i]`; returns its slot.
+    pub fn add(&mut self, a: &DMat, b: &DMat, len: usize) -> usize {
+        let cx = dev();
+        let el = elt(cx).expect("nvg elt pipelines");
+        let nwg = 512usize.min(len.div_ceil(256)).max(1);
+        let part = DMat::zeros(1, nwg);
+        train_ops::run(cx, &[Disp { pipe: &el.p["frob_part"], uni: uni(&[len as u32, nwg as u32], &[]), bufs: vec![(1, &a.buf), (2, &b.buf), (6, &part.buf)], grid: (nwg as u32, 1, 1) }]);
+        self.parts.push(part);
+        self.parts.len() - 1
+    }
+    pub fn read(self) -> Vec<f64> {
+        let total: usize = self.parts.iter().map(|p| p.len()).sum();
+        let all = DMat::zeros(1, total.max(1));
+        let mut off = 0;
+        for p in &self.parts {
+            copy_range(p, 0, &all, off, p.len());
+            off += p.len();
+        }
+        let v = all.to_f32();
+        let mut out = Vec::with_capacity(self.parts.len());
+        let mut off = 0;
+        for p in &self.parts {
+            out.push(v[off..off + p.len()].iter().map(|&x| x as f64).sum());
+            off += p.len();
+        }
+        out
+    }
+}
+
+impl Default for FrobBatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Solve `L Lᵀ x = b` in place (`y` holds b; `l` the dense lower factor).
 pub fn chol_solve_dev(l: &DMat, y: &DMat) {
     let n = l.r;
@@ -1326,9 +1654,10 @@ fn sg_ok(c: &Ctx) -> bool {
         && c.adapter_info.subgroup_max_size <= 256
 }
 
-/// Threads of the subgroup search workgroup (`CMF_NVG_GV_WS`, default 256).
+/// Threads of the subgroup search workgroup (`CMF_NVG_GV_WS`, default 512:
+/// fastest per flip of 256/512/1024 on the RTX PRO 6000).
 fn gv_ws() -> usize {
-    std::env::var("CMF_NVG_GV_WS").ok().and_then(|v| v.parse().ok()).filter(|w| [32usize, 64, 128, 256, 512, 1024].contains(w)).unwrap_or(256)
+    std::env::var("CMF_NVG_GV_WS").ok().and_then(|v| v.parse().ok()).filter(|w| [32usize, 64, 128, 256, 512, 1024].contains(w)).unwrap_or(512)
 }
 
 fn gv_sg(c: &Ctx, r: usize, ws: usize) -> Option<&'static Mod> {
@@ -2049,7 +2378,9 @@ pub fn sym_eig_top(a: &DMat, r: usize, pool: Option<&crate::pool::Pool>) -> (Vec
     let k = a.r;
     let r = r.min(k);
     let de = tridiag(a);
-    let (d, e, tau) = (&de[..k], &de[k..2 * k - 1], &de[2 * k..3 * k]);
+    let (d, e) = (&de[..k], &de[k..2 * k - 1]);
+    let dev_de = DMat::from_f64(1, 3 * k, &de);
+    let td = DMat::zeros(32, 32);
     let (lam, z) = tridiag_top(d, e, r, pool);
     let zd = DMat::from_f64(k, r, &z);
     // x = H_0 H_1 ⋯ H_{k-2} z, blocks of reflectors applied last-first.
@@ -2093,24 +2424,10 @@ pub fn sym_eig_top(a: &DMat, r: usize, pool: Option<&crate::pool::Pool>) -> (Vec
             ps.dispatch_workgroups(g.0, g.1, 1);
         }
         submit(c, enc.finish());
-        // T (dlarft, forward, columnwise) from VᵀV and tau on the host
-        let vtv = mm(&vb, true, &vb, false).to_f64();
-        let mut t = vec![0f64; bsz * bsz];
-        for i in 0..b {
-            let ti = tau[i0 + i];
-            t[i * bsz + i] = ti;
-            if i > 0 && ti != 0.0 {
-                // T[0:i, i] = -tau_i · T[0:i, 0:i] · (Vᵀ v_i)[0:i]
-                for row in 0..i {
-                    let mut acc = 0.0;
-                    for q in row..i {
-                        acc += t[row * bsz + q] * vtv[q * bsz + i];
-                    }
-                    t[row * bsz + i] = -ti * acc;
-                }
-            }
-        }
-        let td = DMat::from_f64(bsz, bsz, &t);
+        // T (dlarft, forward, columnwise) from VᵀV and tau, on the device
+        let vtv = mm(&vb, true, &vb, false);
+        let vm = vecm(c).expect("nvg vec pipelines");
+        train_ops::run(c, &[Disp { pipe: &vm.p["wy_t"], uni: uni(&[0, bsz as u32, b as u32, (2 * k + i0) as u32], &[]), bufs: vec![(1, &vtv.buf), (3, &dev_de.buf), (5, &td.buf)], grid: (1, 1, 1) }]);
         // z -= V (T (Vᵀ z))
         gemm(1.0, &vb, true, &zd, false, 0.0, &w);
         gemm(1.0, &td, false, &w, false, 0.0, &w2);
