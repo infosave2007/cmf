@@ -328,6 +328,19 @@ pub fn take(id: u64) -> Option<Vec<f64>> {
     Some(out)
 }
 
+/// The packed accumulator `id` for another device stage (the GPTQ fold),
+/// left in the registry: (buffer handle, cols).
+pub(super) fn buffer(id: u64) -> Option<(wgpu::Buffer, usize)> {
+    REG.lock().unwrap().as_ref()?.slots.get(&id).map(|(b, n)| (b.clone(), *n))
+}
+
+/// Free accumulator `id` without reading it.
+pub fn free(id: u64) {
+    if let Some(r) = REG.lock().unwrap().as_mut() {
+        r.slots.remove(&id);
+    }
+}
+
 /// Drop every accumulator (a pass that failed half way).
 pub fn clear() {
     if let Some(r) = REG.lock().unwrap().as_mut() {

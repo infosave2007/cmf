@@ -1428,23 +1428,34 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
         // Widest Hessians first (longest-processing-time order): a 6144-wide
         // fold costs ~27× a 2048-wide one, and one started last is the tail.
         // The order cannot change any byte — results are keyed by slot.
-        let mut order: Vec<usize> = (0..groups.len()).collect();
+        // Device groups: a Hessian still on the card whose members are all
+        // q4tp (natural order) is folded and swept there by one thread
+        // (`gpu::gptq_fold_dev`); CMF_GPTQ_GPU_FOLD=0 keeps the host fold.
+        let dev_fold = std::env::var("CMF_GPTQ_GPU_FOLD").as_deref() != Ok("0") && !o.act_order;
+        let on_device = |g: &HGroup| {
+            dev_fold
+                && matches!(g.src, HSrc::Device(_))
+                && g.slots.iter().all(|&s| quant_of(&model.tensors[s].name) == Quant::Q4TiledP)
+        };
+        let mut order: Vec<usize> = (0..groups.len()).filter(|&g| !on_device(&groups[g])).collect();
         order.sort_by_key(|&g| std::cmp::Reverse(groups[g].cols));
+        let mut dev_order: Vec<usize> = (0..groups.len()).filter(|&g| on_device(&groups[g])).collect();
+        dev_order.sort_by_key(|&g| std::cmp::Reverse(groups[g].cols));
+        if !dev_order.is_empty() {
+            eprintln!("  {} Hessian groups fold on the device, {} on the host", dev_order.len(), order.len());
+        }
         let next = std::sync::atomic::AtomicUsize::new(0);
         let n_chunk: usize = groups.iter().map(|g| g.slots.len()).sum();
         let done = std::sync::atomic::AtomicUsize::new(0);
-        std::thread::scope(|s| {
-            for _ in 0..outer {
-                s.spawn(|| {
-                    loop {
-                        let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(&gi) = order.get(k) else { break };
+        // One Hessian group on the host: fold operator, then every member's
+        // sweep (`inner` threads each).
+        let host_group = |gi: usize, inner: usize| {
                         let grp = &groups[gi];
                         let h = match grp.take_h() {
                             Ok(h) => h,
                             Err(e) => {
                                 failed.lock().unwrap().push(format!("group {gi}: {e}"));
-                                continue;
+                                return;
                             }
                         };
                         let n = grp.cols;
@@ -1503,6 +1514,55 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
                             let k = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                             eprint!("\r  gptq {k}/{n_chunk}  {:.0}s   ", t0.elapsed().as_secs_f64());
                         }
+        };
+        std::thread::scope(|s| {
+            if !dev_order.is_empty() {
+                s.spawn(|| {
+                    for &gi in &dev_order {
+                        let grp = &groups[gi];
+                        let HSrc::Device(m) = &grp.src else { continue };
+                        let Some(hid) = m.lock().unwrap().take() else { continue };
+                        let n = grp.cols;
+                        let Some(fid) = cortiq_engine::gpu::gptq_fold_dev(hid, n, o.lambda) else {
+                            // Not on the card after all: hand the group to
+                            // the host workers with its Hessian read back.
+                            eprintln!("\n  group {gi} (n = {n}): device fold declined — host fold");
+                            *m.lock().unwrap() = Some(hid);
+                            host_group(gi, o.threads.max(1));
+                            continue;
+                        };
+                        let (dead, _hdiag, _lam) = cortiq_engine::gpu::gptq_fold_info(fid).unwrap_or_default();
+                        for &slot in &grp.slots {
+                            let entry = &model.tensors[slot];
+                            let (rows, cols) = (entry.shape[0], entry.shape[1]);
+                            let mut w = vec![0f32; rows * cols];
+                            if let Err(e) = dequant_tensor(entry, model.entry_bytes(entry), &mut w) {
+                                failed.lock().unwrap().push(format!("{}: {e}", entry.name));
+                                continue;
+                            }
+                            match gptq_quantize_q4tp_dev(&w, rows, cols, fid, &dead) {
+                                Some(b) => {
+                                    results.lock().unwrap().push((slot, TensorDtype::Q4TiledP, b));
+                                    n_gptq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                None => {
+                                    failed.lock().unwrap().push(format!("{}: device sweep failed", entry.name));
+                                    continue;
+                                }
+                            }
+                            let k = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            eprint!("\r  gptq {k}/{n_chunk}  {:.0}s   ", t0.elapsed().as_secs_f64());
+                        }
+                        cortiq_engine::gpu::gptq_fold_free(fid);
+                    }
+                });
+            }
+            for _ in 0..outer.min(order.len().max(1)) {
+                s.spawn(|| {
+                    loop {
+                        let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&gi) = order.get(k) else { break };
+                        host_group(gi, inner);
                     }
                 });
             }
@@ -2047,6 +2107,54 @@ pub fn gptq_quantize_q4tp(
         }
     });
     out
+}
+
+/// [`gptq_quantize_q4tp`] on the device against a device fold
+/// (`gpu::gptq_fold_dev`): the same ladder (the converter's, from the
+/// dead-zeroed weights), rung rule and nibble layout; f32 instead of the
+/// host's f64 operator, so codes can differ at rounding boundaries.
+fn gptq_quantize_q4tp_dev(w0: &[f32], rows: usize, cols: usize, fold: u64, dead: &[bool]) -> Option<Vec<u8>> {
+    use cortiq_core::quant::{q4tp_ladder, q4tp_put_code, q4tp_sections};
+    if cols % GROUP_SIZE != 0 || dead.len() != cols {
+        return None;
+    }
+    let gpr = cols / GROUP_SIZE;
+    let mut w_init = w0.to_vec();
+    if dead.iter().any(|&d| d) {
+        for row in w_init.chunks_exact_mut(cols) {
+            for (v, &d) in row.iter_mut().zip(dead) {
+                if d {
+                    *v = 0.0;
+                }
+            }
+        }
+    }
+    let mut out = crate::convert::encode_q4tp(&w_init, rows, cols);
+    let (params_off, codes_off, stride) = q4tp_sections(rows, cols);
+    if params_off != rows * cols / 2 {
+        return None;
+    }
+    let params = out[params_off..params_off + rows * 4].to_vec();
+    let mut tab = vec![0f32; rows * 32];
+    let mut lost = vec![0f32; rows * 2];
+    for r in 0..rows {
+        tab[r * 32..r * 32 + 32].copy_from_slice(&q4tp_ladder(&params, r));
+        let p = &params[r * 4..r * 4 + 4];
+        lost[r * 2] = f16_to_f32(u16::from_le_bytes([p[0], p[1]]));
+        lost[r * 2 + 1] = f16_to_f32(u16::from_le_bytes([p[2], p[3]]));
+    }
+    let mut codes = vec![0u32; rows * gpr];
+    if !cortiq_engine::gpu::gptq_sweep_q4tp_dev(fold, &w_init, rows, &tab, &lost, &mut out[..params_off], &mut codes) {
+        return None;
+    }
+    let cs = &mut out[codes_off..codes_off + rows * stride];
+    cs.fill(0);
+    for r in 0..rows {
+        for g in 0..gpr {
+            q4tp_put_code(&mut cs[r * stride..(r + 1) * stride], g, codes[r * gpr + g] as usize);
+        }
+    }
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -2778,6 +2886,79 @@ pub fn gptq_quantize_q4tp_act_order(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The device fold + q4tp sweep against the host's f64 operator and
+    /// sweep on the same calibration data: U agrees to f32 rounding, and the
+    /// device codes are as good (output error within 1 %). Skips without a
+    /// wgpu device.
+    #[test]
+    fn device_fold_and_sweep_match_host() {
+        let (n, rows, t) = (160usize, 48usize, 700usize);
+        let Some(hid) = cortiq_engine::gpu::gram_alloc(n) else {
+            eprintln!("no device — skipped");
+            return;
+        };
+        // Correlated inputs with a few loud channels, as activations are.
+        let mut x = vec![0f32; t * n];
+        for r in 0..t {
+            let base = ((r * 37 % 101) as f32 - 50.0) / 29.0;
+            for c in 0..n {
+                let v = ((r * 7919 + c * 104729) % 1009) as f32 / 1009.0 - 0.5;
+                let loud = if c % 41 == 3 { 30.0 } else { 1.0 };
+                x[r * n + c] = (v + 0.3 * base) * loud;
+            }
+        }
+        for c in [17usize, 90] {
+            for r in 0..t {
+                x[r * n + c] = 0.0; // dead channels
+            }
+        }
+        assert!(cortiq_engine::gpu::gram_add(hid, &x, t));
+        let mut h = vec![0f64; n * n];
+        for r in 0..t {
+            for i in 0..n {
+                for j in 0..n {
+                    h[i * n + j] += x[r * n + i] as f64 * x[r * n + j] as f64;
+                }
+            }
+        }
+        let w: Vec<f32> = (0..rows * n).map(|k| (((k * 2654435761usize) % 2003) as f32 / 2003.0 - 0.5) * 0.08).collect();
+        let fid = cortiq_engine::gpu::gptq_fold_dev(hid, n, 0.01).expect("device fold");
+        let (dead, hd_dev, _) = cortiq_engine::gpu::gptq_fold_info(fid).unwrap();
+        let u_dev = cortiq_engine::gpu::gptq_fold_read(fid).unwrap();
+        let hdiag: Vec<f32> = (0..n).map(|i| h[i * n + i] as f32).collect();
+        let (u, dead_h) = gptq_fold_operator(h.clone(), n, 0.01);
+        assert_eq!(dead, dead_h);
+        for i in 0..n {
+            assert!((hd_dev[i] - hdiag[i]).abs() <= 1e-4 * hdiag[i].abs().max(1.0), "diag {i}");
+        }
+        let scale = u.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let worst = u.iter().zip(&u_dev).fold(0f32, |m, (a, b)| m.max((a - b).abs())) / scale;
+        assert!(worst < 2e-3, "U relative deviation {worst:e}");
+        let host = gptq_quantize_q4tp(&w, rows, n, &u, &dead_h, &hdiag, 1);
+        let dev = gptq_quantize_q4tp_dev(&w, rows, n, fid, &dead).expect("device sweep");
+        cortiq_engine::gpu::gptq_fold_free(fid);
+        assert_eq!(host.len(), dev.len());
+        let out_err = |bytes: &[u8]| {
+            let mut wq = vec![0f32; rows * n];
+            cortiq_core::quant::dequant_q4tp(bytes, rows, n, &mut wq);
+            let mut e = 0f64;
+            for r in 0..rows {
+                for i in 0..n {
+                    for j in 0..n {
+                        let di = (w[r * n + i] - wq[r * n + i]) as f64;
+                        let dj = (w[r * n + j] - wq[r * n + j]) as f64;
+                        e += di * h[i * n + j] * dj;
+                    }
+                }
+            }
+            e
+        };
+        let (eh, ed) = (out_err(&host), out_err(&dev));
+        assert!(ed <= eh * 1.05, "device output error {ed:e} vs host {eh:e}");
+        let same = host[..rows * n / 2].iter().zip(&dev[..rows * n / 2]).filter(|(a, b)| a == b).count();
+        assert!(same * 10 >= rows * n / 2 * 8, "nibble bytes equal: {same}/{}", rows * n / 2);
+    }
     use cortiq_core::quant::{dequant_q1s, dequant_q1t};
 
     /// GPTQ-q4tp decodes through the ordinary q4tp reader, and on correlated

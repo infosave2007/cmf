@@ -3682,6 +3682,67 @@ pub fn gram_take(id: u64) -> Option<Vec<f64>> {
     None
 }
 
+/// GPTQ fold of the device Hessian `h_id` on the device: the upper Cholesky
+/// factor of `(H + λ·mean(diag)·I)⁻¹` stays there under the returned id and
+/// the Hessian is freed. None (no wgpu device, it does not fit, it does not
+/// factor): the Hessian is left for `gram_take`.
+pub fn gptq_fold_dev(h_id: u64, n: usize, lambda: f64) -> Option<u64> {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::gptq_dev::fold(h_id, n, lambda);
+    }
+    let _ = (h_id, n, lambda);
+    None
+}
+
+/// (dead channels, raw H diagonal, damping used) of a device fold.
+pub fn gptq_fold_info(id: u64) -> Option<(Vec<bool>, Vec<f32>, f64)> {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::gptq_dev::info(id);
+    }
+    let _ = id;
+    None
+}
+
+/// A device fold's operator read back (n×n f32, upper).
+pub fn gptq_fold_read(id: u64) -> Option<Vec<f32>> {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::gptq_dev::read_u(id);
+    }
+    let _ = id;
+    None
+}
+
+/// Free a device fold.
+pub fn gptq_fold_free(id: u64) {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        crate::gpu_wgpu::gptq_dev::free(id);
+    }
+    let _ = id;
+}
+
+/// The q4tp GPTQ sweep on the device (see `gpu_wgpu::gptq_dev::sweep_q4tp`).
+#[allow(clippy::too_many_arguments)]
+pub fn gptq_sweep_q4tp_dev(
+    id: u64,
+    w: &[f32],
+    rows: usize,
+    tab: &[f32],
+    lost: &[f32],
+    nib: &mut [u8],
+    codes: &mut [u32],
+) -> bool {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::gptq_dev::sweep_q4tp(id, w, rows, tab, lost, nib, codes);
+    }
+    let _ = (id, w, rows, tab, lost, nib, codes);
+    false
+}
+
 /// Free every device Hessian (an aborted calibration pass).
 pub fn gram_clear() {
     #[cfg(feature = "gpu")]
