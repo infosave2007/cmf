@@ -76,6 +76,8 @@ def get_args(argv=None):
     ap.add_argument("--teacher-cache", default=None, help="teacher top-K cache dir (default OUT/teacher)")
     ap.add_argument("--teacher-block", type=int, default=256)
     ap.add_argument("--vchunk", type=int, default=16384, help="vocabulary rows per head chunk")
+    ap.add_argument("--head-windows", type=int, default=1, help="windows per vocabulary scan of the head "
+                    "(more = fewer, larger kernels; 1 reproduces the studies' per-window head bit for bit)")
     ap.add_argument("--no-tf32", action="store_true", help="exact f32 matmuls in training (default TF32, as the studies)")
     ap.add_argument("--gpu-cap-gb", type=float, default=0, help="cap this process's CUDA allocator (shared GPUs)")
     ap.add_argument("--threads", type=int, default=0)
@@ -201,7 +203,7 @@ def main(argv=None):
 
     def make(cmf, residency=args.residency, **kw):
         return qmodel.Model(cmf, dev, residency=residency, act_device=args.act_device, vchunk=args.vchunk,
-                            log=log, **kw)
+                            head_windows=args.head_windows, log=log, **kw)
 
     # the teacher (a float reference, 2-4x the student's bytes) streams straight from the
     # page cache: one pass per block, nothing pinned

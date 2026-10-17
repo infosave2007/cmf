@@ -786,7 +786,7 @@ class Model:
     norm) gets per-channel n. Embedding and head are always frozen."""
 
     def __init__(self, cmf, dev="cuda", residency="resident", act_device=None, train=False, step=False,
-                 train_norms=False, pin=True, vchunk=16384, log=print):
+                 train_norms=False, pin=True, vchunk=16384, head_windows=1, log=print):
         self.cmf, self.dev = cmf, torch.device(dev)
         self.arch = A = Arch(cmf)
         if residency not in ("resident", "stream"):
@@ -794,6 +794,9 @@ class Model:
         self.stream_mode = residency == "stream"
         self.act_device = torch.device(act_device or ("cpu" if self.stream_mode else dev))
         self.vchunk = vchunk
+        # windows per vocabulary scan of the head (1 = per window; more = fewer, larger
+        # kernels: faster on a launch-bound host, same values up to GEMM blocking)
+        self.head_windows = head_windows
         self.log = log
         # page-locked host copies only pay off for what is streamed every step
         pin = pin and self.dev.type == "cuda" and self.stream_mode
@@ -907,20 +910,40 @@ class Model:
 
     def head_eval(self, x, tgt, lp_t=None, ix_t=None, topk=0):
         """x [b, T, H] final hidden -> per window: CE sum, KL sum (or None) and, with topk,
-        the (log-prob, index) top-k of every position (teacher caching)"""
+        the (log-prob, index) top-k of every position (teacher caching). `head_windows`
+        windows share one vocabulary scan."""
         b, T, H = x.shape
         out_ce, out_kl, tops = [], [], []
+        hw = max(1, self.head_windows)
         with torch.no_grad():
-            for i in range(b):
-                xn = rms(self.to_dev(x[i, :T - 1]), self.final.eff(), self.arch.eps)
-                t = torch.from_numpy(np.asarray(tgt[i, 1:], dtype=np.int64)).to(self.dev)
-                ix = None if ix_t is None else ix_t[i].to(self.dev).long()
+            if hw == 1:
+                # the per-window path, kept op for op (reproducible against earlier runs)
+                for i in range(b):
+                    xn = rms(self.to_dev(x[i, :T - 1]), self.final.eff(), self.arch.eps)
+                    t = torch.from_numpy(np.asarray(tgt[i, 1:], dtype=np.int64)).to(self.dev)
+                    ix = None if ix_t is None else ix_t[i].to(self.dev).long()
+                    lse, z_ix, z_t, tv, ti = self.head.scan(xn, self.vchunk, ix=ix, tgt=t, topk=topk)
+                    out_ce.append(float((lse - z_t).double().sum()))
+                    if ix is not None:
+                        out_kl.append(float(kl_terms(lp_t[i].to(self.dev), z_ix - lse[:, None]).double().sum()))
+                    if topk:
+                        tops.append(((tv - lse[:, None]).cpu(), ti.to(torch.int32).cpu()))
+                return out_ce, (out_kl if ix_t is not None else None), tops
+            for i0 in range(0, b, hw):
+                i1 = min(b, i0 + hw)
+                n = i1 - i0
+                xn = rms(self.to_dev(x[i0:i1, :T - 1]).reshape(n * (T - 1), H), self.final.eff(), self.arch.eps)
+                t = torch.from_numpy(np.asarray(tgt[i0:i1, 1:], dtype=np.int64).reshape(-1)).to(self.dev)
+                ix = None if ix_t is None else ix_t[i0:i1].reshape(n * (T - 1), -1).to(self.dev).long()
                 lse, z_ix, z_t, tv, ti = self.head.scan(xn, self.vchunk, ix=ix, tgt=t, topk=topk)
-                out_ce.append(float((lse - z_t).double().sum()))
+                out_ce += [float(v) for v in (lse - z_t).double().view(n, T - 1).sum(1)]
                 if ix is not None:
-                    out_kl.append(float(kl_terms(lp_t[i].to(self.dev), z_ix - lse[:, None]).double().sum()))
+                    k = kl_terms(lp_t[i0:i1].reshape(n * (T - 1), -1).to(self.dev), z_ix - lse[:, None])
+                    out_kl += [float(v) for v in k.double().view(n, T - 1).sum(1)]
                 if topk:
-                    tops.append(((tv - lse[:, None]).cpu(), ti.to(torch.int32).cpu()))
+                    lp_top = (tv - lse[:, None]).view(n, T - 1, -1).cpu()
+                    ix_top = ti.to(torch.int32).view(n, T - 1, -1).cpu()
+                    tops += [(lp_top[k_], ix_top[k_]) for k_ in range(n)]
         return out_ce, (out_kl if ix_t is not None else None), tops
 
     def evaluate(self, windows, mb=8, teacher=None, topk=0, block=None):
@@ -965,12 +988,16 @@ class Model:
         for j, x in enumerate(bounds[-1]):
             s0 = j * mb
             xl = self.to_dev(x).requires_grad_(True)
-            b = xl.shape[0]
+            b, H = xl.shape[0], xl.shape[2]
+            hw = max(1, self.head_windows)
             kl = 0.0
-            for i in range(b):
-                xn = rms(xl[i, :T - 1], self.final.eff(), self.arch.eps)
-                kl = kl + _HeadKL.apply(xn, self.head, lp_t[s0 + i].to(self.dev),
-                                        ix_t[s0 + i].to(self.dev).long(), self.vchunk)
+            for i0 in range(0, b, hw):
+                i1 = min(b, i0 + hw)
+                n = i1 - i0
+                xn = rms(xl[i0:i1, :T - 1].reshape(n * (T - 1), H), self.final.eff(), self.arch.eps)
+                kl = kl + _HeadKL.apply(xn, self.head, lp_t[s0 + i0:s0 + i1].reshape(n * (T - 1), -1).to(self.dev),
+                                        ix_t[s0 + i0:s0 + i1].reshape(n * (T - 1), -1).to(self.dev).long(),
+                                        self.vchunk)
             loss = kl / count
             loss.backward()
             kl_tot += float(kl.detach())

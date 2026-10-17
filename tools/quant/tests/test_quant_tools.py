@@ -361,6 +361,26 @@ class ModelTest(unittest.TestCase):
         for kind in ("llama", "qwen35"):
             self.check_modes(kind, "cuda")
 
+    def test_batched_head_matches_per_window(self):
+        m = tiny_cmf("qwen35", seed=15)
+        w = np.random.default_rng(2).integers(0, 300, size=(5, 33))
+        a = qmodel.Model(m, "cpu")
+        lp, ix = teacher_of(qmodel.Model(perturbed(m), "cpu"), w, 8)
+        r1 = a.evaluate(w, mb=4, teacher=(lp.numpy(), ix.numpy()), topk=4)
+        a.head_windows = 3
+        r3 = a.evaluate(w, mb=4, teacher=(lp.numpy(), ix.numpy()), topk=4)
+        np.testing.assert_allclose(r1["nll"], r3["nll"], rtol=1e-6)
+        np.testing.assert_allclose(r1["kl"], r3["kl"], rtol=1e-5, atol=1e-7)
+        np.testing.assert_array_equal(r1["ix"], r3["ix"])
+        # training gradients agree too
+        grads = []
+        for hw in (1, 3):
+            s = qmodel.Model(m, "cpu", train=True, step=True, train_norms=True, head_windows=hw)
+            s.train_step(w[:4], lp[:4], ix[:4], 4, 4 * 32)
+            grads.append([p.grad.clone() for p in s.params()])
+        for g1, g3 in zip(*grads):
+            torch.testing.assert_close(g1, g3, rtol=1e-4, atol=1e-8)
+
     def test_teacher_of_itself_has_zero_kl(self):
         m = tiny_cmf("qwen35", seed=12)
         model = qmodel.Model(m, "cpu")
