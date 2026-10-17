@@ -3672,6 +3672,15 @@ pub fn gram_add(id: u64, xs: &[f32], b: usize) -> bool {
     false
 }
 
+/// `H[id] += XᵀX` over `b` rows of a device-resident f32 buffer.
+#[cfg(feature = "gpu")]
+pub fn gram_add_dev(id: u64, x: &wgpu::Buffer, b: usize) -> bool {
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::gram::add_dev(id, x, b);
+    }
+    false
+}
+
 /// The accumulated Hessian as a full symmetric f64 matrix (frees it).
 pub fn gram_take(id: u64) -> Option<Vec<f64>> {
     #[cfg(feature = "gpu")]

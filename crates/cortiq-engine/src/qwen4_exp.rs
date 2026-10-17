@@ -3243,6 +3243,60 @@ pub fn forward_tokens(
     }
 }
 
+/// GPTQ calibration capture: `ids` from position 0 through the device
+/// frames, with the MoE input rows and router logits of layers `lo..hi`
+/// copied out after routing. Returns per layer `[ids.len()][hidden + n_experts]`.
+#[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
+pub fn capture_window(
+    globals: &Globals,
+    layers: &[Layer],
+    cfg: &Cfg,
+    state: &mut State,
+    ids: &[u32],
+    lo: usize,
+    hi: usize,
+    inv_freq: &[f32],
+    pool: Option<&Pool>,
+) -> Result<Vec<Vec<f32>>, String> {
+    use crate::gpu_wgpu::qwen4 as q4;
+    let first = layers.first().ok_or("no layers")?;
+    let hidden = first.moe.experts.first().ok_or("no experts")?.gate_proj.cols();
+    let ne = first.moe.experts.len();
+    let hi = hi.min(layers.len());
+    if lo >= hi || !q4::capture_begin(lo, hi, hidden, ne) {
+        return Err("capture unavailable".into());
+    }
+    let mut out = vec![Vec::with_capacity(ids.len() * (hidden + ne)); hi - lo];
+    let chunk = prefill_chunk();
+    let mut pos = 0;
+    let res = (|| {
+        while pos < ids.len() {
+            let end = (pos + chunk).min(ids.len());
+            let mut lg = Vec::new();
+            forward_tokens(globals, layers, cfg, state, &ids[pos..end], pos, inv_freq, pool, &mut lg, false);
+            let (rows, written) = q4::capture_read(end - pos).ok_or("capture readback")?;
+            if written < hi - lo {
+                return Err(format!("the device path ran {written} of {} captured layer frames (host fallback?)", hi - lo));
+            }
+            for (k, r) in rows.into_iter().enumerate() {
+                out[k].extend(r);
+            }
+            pos = end;
+        }
+        Ok(())
+    })();
+    q4::capture_end();
+    res.map(|_| out)
+}
+
+/// Directory triples (gate, up, down tensor indices) of layer `li`'s routed
+/// experts, and of its shared expert when it has one.
+pub fn expert_dirs(layers: &[Layer], li: usize) -> Option<(Vec<(usize, usize, usize)>, Option<(usize, usize, usize)>)> {
+    let l = layers.get(li)?;
+    Some((l.expert_ids.clone(), l.shared_ids))
+}
+
 #[cfg(feature = "gpu")]
 #[allow(clippy::too_many_arguments)]
 fn forward_token_device(
