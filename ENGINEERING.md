@@ -515,7 +515,8 @@ README's 27B table counts the power-of-two rounding of pinned blocks.
 
 - GPTQ on 32 k mixed tokens with cortiq (`quantize-gptq --tokens 32768`) was not run here; C1/C2
   came from the q4tp study's torch GPTQ (same rule). The H-metric scale refit (C1 → C2, −0.31 %)
-  is still a study script; q2tp GPTQ (placed ladder, layer-7 rule, debias) is not in cortiq.
+  is still a study script. (q2tp GPTQ — placed ladder, debias, per-tensor rule — is in cortiq since the
+  merge with the q2tp pipeline: `quantize-gptq --codec q2tp`, see its section above.)
 - The genesis runs here train on WikiText only (to reproduce the studies); at 4 bits the gain is
   mostly in-domain, so a release needs the broad mixed corpus the tool supports (not measured).
 - Qwen3.8-27B was not run (no checkpoint on the stands): the qwen3_5 path is validated on tiny
