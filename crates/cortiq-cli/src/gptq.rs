@@ -1618,7 +1618,9 @@ fn dot64(a: &[f64], b: &[f64]) -> f64 {
 
 /// Row-oriented in-place lower Cholesky (reads the lower triangle only,
 /// zeroes the upper). Same result as `cholesky_lower`, but every inner loop
-/// is a contiguous dot product.
+/// is a contiguous dot product. The reference [`cholesky_lower_par`] must
+/// reproduce bit for bit.
+#[cfg(test)]
 fn cholesky_lower_rows(a: &mut [f64], n: usize) -> bool {
     for i in 0..n {
         for j in 0..=i {
@@ -1655,57 +1657,93 @@ struct SharedMat(*mut f64);
 unsafe impl Send for SharedMat {}
 unsafe impl Sync for SharedMat {}
 
-/// [`cholesky_lower_rows`] on `threads` workers: left-looking by columns,
-/// the entries below each pivot dealt round-robin over the workers, one
-/// barrier per column. Every entry is the same expression over the same
-/// slices as in the serial version (the pivot is recomputed identically by
-/// every worker), so the factor is bit-identical whatever the thread count.
+/// Columns per block of the cache-blocked fold phases. While a block's rows
+/// of `L` (or `L⁻¹`) stay cache-resident every other row streams past once
+/// per block instead of once per column, so a 6144-wide Cholesky moves
+/// ~10 GB from DRAM instead of ~310 GB — what made 13 concurrent folds
+/// starve each other (one fold took ~3 min of a 7.5-min GPTQ pass).
+const FOLD_BLOCK: usize = 32;
+
+/// The row-oriented lower Cholesky (`cholesky_lower_rows`, kept as the test
+/// reference), cache-blocked and on `threads` workers:
+/// left-looking by blocks of [`FOLD_BLOCK`] columns — the block's diagonal
+/// part on one worker, then the panel below it with rows dealt round-robin,
+/// two barriers per block. Every entry is the same `dot64` over the same
+/// slices, divided by the same pivot, as in the serial version, so the
+/// factor is bit-identical whatever the thread count (the upper triangle is
+/// zeroed at the end instead of row by row).
 fn cholesky_lower_par(a: &mut [f64], n: usize, threads: usize) -> bool {
     let t = threads.clamp(1, n.max(1));
-    if t == 1 {
-        return cholesky_lower_rows(a, n);
-    }
-    let mut diag = vec![0f64; n];
     let failed = std::sync::atomic::AtomicBool::new(false);
     let barrier = std::sync::Barrier::new(t);
-    let (m, dp) = (SharedMat(a.as_mut_ptr()), SharedMat(diag.as_mut_ptr()));
-    std::thread::scope(|s| {
-        for w in 0..t {
-            let (barrier, failed) = (&barrier, &failed);
-            s.spawn(move || {
-                let (m, dp) = (m, dp);
-                for j in 0..n {
-                    // SAFETY: during column j nobody writes row j's prefix
-                    // 0..=j (the diagonal stays H's until the end), and each
-                    // row i > j is written only by its owner (i % t == w).
-                    let rj = unsafe { std::slice::from_raw_parts(m.0.add(j * n), j) };
-                    let sd = unsafe { *m.0.add(j * n + j) } - dot64(rj, rj);
-                    if !(sd > 0.0) || !sd.is_finite() {
-                        // Every worker sees the same pivot and stops here.
-                        failed.store(true, std::sync::atomic::Ordering::Relaxed);
-                        return;
+    let m = SharedMat(a.as_mut_ptr());
+    // SAFETY (all accesses below): row prefixes `0..j` read here are final
+    // (written in an earlier block, or earlier in this block by the same
+    // worker before a barrier); each entry is written by exactly one worker
+    // — diagonal blocks by worker 0, panel rows by their owner `i % t`.
+    let entry = move |i: usize, j: usize| -> f64 {
+        let m = m;
+        let (ri, rj) = unsafe {
+            (
+                std::slice::from_raw_parts(m.0.add(i * n), j),
+                std::slice::from_raw_parts(m.0.add(j * n), j),
+            )
+        };
+        let hij = unsafe { *m.0.add(i * n + j) };
+        hij - dot64(ri, rj)
+    };
+    let (failed_r, barrier_r) = (&failed, &barrier);
+    let work = move |w: usize| {
+        let (m, failed, barrier) = (m, failed_r, barrier_r);
+        let mut jb = 0;
+        while jb < n {
+            let je = (jb + FOLD_BLOCK).min(n);
+            if w == 0 {
+                'diag: for i in jb..je {
+                    for j in jb..=i {
+                        let s = entry(i, j);
+                        if i == j {
+                            if !(s > 0.0) || !s.is_finite() {
+                                failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                                break 'diag;
+                            }
+                            unsafe { *m.0.add(i * n + i) = s.sqrt() };
+                        } else {
+                            unsafe { *m.0.add(i * n + j) = s / *m.0.add(j * n + j) };
+                        }
                     }
-                    let d = sd.sqrt();
-                    if j % t == w {
-                        unsafe { *dp.0.add(j) = d };
-                    }
-                    let mut i = j + 1 + (w + t - (j + 1) % t) % t;
-                    while i < n {
-                        let ri = unsafe { std::slice::from_raw_parts_mut(m.0.add(i * n), j + 1) };
-                        let v = ri[j] - dot64(&ri[..j], rj);
-                        ri[j] = v / d;
-                        i += t;
-                    }
-                    barrier.wait();
                 }
-            });
+            }
+            barrier.wait();
+            if failed.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let mut i = je + (w + t - je % t) % t;
+            while i < n {
+                for j in jb..je {
+                    let s = entry(i, j);
+                    unsafe { *m.0.add(i * n + j) = s / *m.0.add(j * n + j) };
+                }
+                i += t;
+            }
+            barrier.wait();
+            jb = je;
         }
-    });
+    };
+    if t == 1 {
+        work(0);
+    } else {
+        std::thread::scope(|s| {
+            for w in 0..t {
+                let work = &work;
+                s.spawn(move || work(w));
+            }
+        });
+    }
     if failed.into_inner() {
         return false;
     }
     for i in 0..n {
-        a[i * n + i] = diag[i];
         a[i * n + i + 1..(i + 1) * n].fill(0.0);
     }
     true
@@ -1746,10 +1784,11 @@ pub fn gptq_fold_operator(h: Vec<f64>, n: usize, lambda: f64) -> (Vec<f32>, Vec<
     gptq_fold_operator_par(h, n, lambda, 1)
 }
 
-/// [`gptq_fold_operator`] on `threads` workers — bit-identical for any
-/// thread count (every entry is the serial expression, each computed by one
-/// worker). It is O(n³): ~0.15 T multiply-adds for a 6144-wide `down_proj`,
-/// ~3.5 T at 17408 (Qwen3.8-27B), where one core takes most of an hour.
+/// [`gptq_fold_operator`] on `threads` workers, every phase cache-blocked
+/// ([`FOLD_BLOCK`]) — bit-identical to the original serial operator for any
+/// thread count (every entry is the same `dot64` over the same slices,
+/// computed by one worker). It is O(n³): ~0.15 T multiply-adds for a
+/// 6144-wide `down_proj`, ~3.5 T at 17408 (Qwen3.8-27B).
 pub fn gptq_fold_operator_par(mut h: Vec<f64>, n: usize, lambda: f64, threads: usize) -> (Vec<f32>, Vec<bool>) {
     assert_eq!(h.len(), n * n);
     let dead: Vec<bool> = (0..n).map(|i| !(h[i * n + i] > 0.0)).collect();
@@ -1785,30 +1824,46 @@ pub fn gptq_fold_operator_par(mut h: Vec<f64>, n: usize, lambda: f64, threads: u
     };
     drop(h);
     // Columns of L⁻¹, stored as rows: lt[j][i] = (L⁻¹)[i][j], i ≥ j. Each
-    // column is its own forward substitution, so columns run in parallel.
+    // column is its own forward substitution; a block of FOLD_BLOCK columns
+    // is solved together (row i of L read once for all of them), blocks in
+    // parallel. Each column's sequence of dot products is the serial one.
     let mut lt = vec![0f64; n * n];
+    let nblk = n.div_ceil(FOLD_BLOCK);
     {
         let (av, ltp) = (&a, SharedMat(lt.as_mut_ptr()));
-        par_rows(n, threads, &move |j| {
+        par_rows(nblk, threads, &move |b| {
             let ltp = ltp;
-            // SAFETY: column j writes only row j of `lt`.
-            let x = unsafe { std::slice::from_raw_parts_mut(ltp.0.add(j * n), n) };
-            x[j] = 1.0 / av[j * n + j];
-            for i in (j + 1)..n {
-                let s = dot64(&av[i * n + j..i * n + i], &x[j..i]);
-                x[i] = -s / av[i * n + i];
+            let (c0, c1) = (b * FOLD_BLOCK, ((b + 1) * FOLD_BLOCK).min(n));
+            for i in c0..n {
+                let ai = &av[i * n..i * n + i + 1];
+                for j in c0..c1.min(i + 1) {
+                    // SAFETY: block b writes only rows c0..c1 of `lt`.
+                    let x = unsafe { std::slice::from_raw_parts_mut(ltp.0.add(j * n), n) };
+                    let v = if i == j {
+                        1.0 / ai[i]
+                    } else {
+                        -dot64(&ai[j..i], &x[j..i]) / ai[i]
+                    };
+                    x[i] = v;
+                }
             }
         });
     }
-    // H⁻¹ = L⁻ᵀ·L⁻¹: (H⁻¹)[i][k] = Σ_{m ≥ i} lt[i][m]·lt[k][m] for k ≤ i.
+    // H⁻¹ = L⁻ᵀ·L⁻¹: (H⁻¹)[i][k] = Σ_{m ≥ i} lt[i][m]·lt[k][m] for k ≤ i,
+    // a block of FOLD_BLOCK rows at a time (each lt row k read once for the
+    // whole block), blocks in parallel.
     {
         let (ltv, ap) = (&lt, SharedMat(a.as_mut_ptr()));
-        par_rows(n, threads, &move |i| {
+        par_rows(nblk, threads, &move |b| {
             let ap = ap;
-            // SAFETY: row i writes only its own lower part of `a`.
-            let row = unsafe { std::slice::from_raw_parts_mut(ap.0.add(i * n), i + 1) };
-            for (k, v) in row.iter_mut().enumerate() {
-                *v = dot64(&ltv[i * n + i..i * n + n], &ltv[k * n + i..k * n + n]);
+            let (i0, i1) = (b * FOLD_BLOCK, ((b + 1) * FOLD_BLOCK).min(n));
+            for k in 0..i1 {
+                let lk = &ltv[k * n..(k + 1) * n];
+                for i in i0.max(k)..i1 {
+                    let v = dot64(&ltv[i * n + i..i * n + n], &lk[i..n]);
+                    // SAFETY: block b writes only rows i0..i1 of `a`.
+                    unsafe { *ap.0.add(i * n + k) = v };
+                }
             }
         });
     }
@@ -3053,30 +3108,80 @@ mod tests {
         assert!(unit > rows / 2, "most rows must come back to a unit slope ({unit}/{rows})");
     }
 
-    /// The threaded fold operator is the serial one bit for bit, at any
-    /// thread count (odd size, a dead channel, a near-singular direction).
+    /// The fold operator as it was before blocking and threads: row
+    /// Cholesky, one column of L⁻¹ at a time, one row of H⁻¹ at a time.
+    fn fold_reference(mut h: Vec<f64>, n: usize, lambda: f64) -> Vec<f32> {
+        for i in 0..n {
+            if !(h[i * n + i] > 0.0) {
+                for k in 0..n {
+                    h[i * n + k] = 0.0;
+                    h[k * n + i] = 0.0;
+                }
+                h[i * n + i] = 1.0;
+            }
+        }
+        let base = ((0..n).map(|i| h[i * n + i]).sum::<f64>() / n as f64).max(1e-12);
+        let mut lam = lambda;
+        let mut a = loop {
+            let mut a = h.clone();
+            for i in 0..n {
+                a[i * n + i] += lam * base;
+            }
+            if cholesky_lower_rows(&mut a, n) {
+                break a;
+            }
+            lam = if lam == 0.0 { 1e-4 } else { lam * 10.0 };
+        };
+        let mut lt = vec![0f64; n * n];
+        let mut x = vec![0f64; n];
+        for j in 0..n {
+            x[j] = 1.0 / a[j * n + j];
+            for i in (j + 1)..n {
+                let s = dot64(&a[i * n + j..i * n + i], &x[j..i]);
+                x[i] = -s / a[i * n + i];
+            }
+            lt[j * n + j..j * n + n].copy_from_slice(&x[j..n]);
+        }
+        for i in 0..n {
+            for k in 0..=i {
+                a[i * n + k] = dot64(&lt[i * n + i..i * n + n], &lt[k * n + i..k * n + n]);
+            }
+        }
+        assert!(cholesky_lower_rows(&mut a, n));
+        let mut u = vec![0f32; n * n];
+        for j in 0..n {
+            for c in 0..=j {
+                u[c * n + j] = a[j * n + c] as f32;
+            }
+        }
+        u
+    }
+
+    /// The blocked, threaded fold operator is the original serial one bit
+    /// for bit, at any thread count (sizes with a partial last block, a dead
+    /// channel, a singular H that needs its damping).
     #[test]
     fn parallel_fold_operator_is_bit_identical() {
-        let (_, _, mut h) = q2_problem(1, 97, 40, 5); // 40 samples < 97 channels: singular
-        let n = 97;
-        for k in 0..n {
-            h[13 * n + k] = 0.0;
-            h[k * n + 13] = 0.0;
-        }
-        let (u1, d1) = gptq_fold_operator(h.clone(), n, 0.01);
-        for t in [2usize, 3, 8] {
-            let (ut, dt) = gptq_fold_operator_par(h.clone(), n, 0.01, t);
-            assert_eq!(d1, dt);
-            assert!(u1.iter().zip(&ut).all(|(a, b)| a.to_bits() == b.to_bits()), "{t} threads");
-            let mut a1 = h.clone();
-            for i in 0..n {
-                a1[i * n + i] += 1.0;
+        for (n, samples) in [(97usize, 40usize), (130, 400)] {
+            let (_, _, mut h) = q2_problem(1, n, samples, 5 + n as u64);
+            for k in 0..n {
+                h[13 * n + k] = 0.0;
+                h[k * n + 13] = 0.0;
             }
-            let mut at = a1.clone();
-            assert_eq!(cholesky_lower_rows(&mut a1, n), cholesky_lower_par(&mut at, n, t));
-            assert!(a1.iter().zip(&at).all(|(a, b)| a.to_bits() == b.to_bits()));
+            let want = fold_reference(h.clone(), n, 0.01);
+            for t in [1usize, 2, 3, 8] {
+                let (ut, dt) = gptq_fold_operator_par(h.clone(), n, 0.01, t);
+                assert!(dt[13] && dt.iter().filter(|&&d| d).count() == 1);
+                assert!(want.iter().zip(&ut).all(|(a, b)| a.to_bits() == b.to_bits()), "n {n}, {t} threads");
+                let mut a1 = h.clone();
+                for i in 0..n {
+                    a1[i * n + i] += 1.0;
+                }
+                let mut at = a1.clone();
+                assert_eq!(cholesky_lower_rows(&mut a1, n), cholesky_lower_par(&mut at, n, t));
+                assert!(a1.iter().zip(&at).all(|(a, b)| a.to_bits() == b.to_bits()), "cholesky n {n}, {t}");
+            }
         }
-        assert!(d1[13] && d1.iter().filter(|&&d| d).count() == 1);
     }
 
     /// The register-tiled trailing update is bit-identical to the plain
