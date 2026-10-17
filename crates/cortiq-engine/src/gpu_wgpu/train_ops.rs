@@ -580,13 +580,13 @@ fn attn_dq(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index
 }
 "#;
 
-struct Mod {
-    p: HashMap<&'static str, wgpu::ComputePipeline>,
+pub(super) struct Mod {
+    pub(super) p: HashMap<&'static str, wgpu::ComputePipeline>,
 }
 
 static MODS: OnceLock<Mutex<HashMap<&'static str, Option<&'static Mod>>>> = OnceLock::new();
 
-fn module(c: &Ctx, name: &'static str, src: &'static str, entries: &[&'static str]) -> Option<&'static Mod> {
+pub(super) fn module(c: &Ctx, name: &'static str, src: &'static str, entries: &[&'static str]) -> Option<&'static Mod> {
     let map = MODS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut g = map.lock().unwrap();
     if let Some(m) = g.get(name) {
@@ -640,10 +640,10 @@ fn attn_mod(c: &Ctx) -> Option<&'static Mod> {
 
 /// A dispatch: pipeline, uniform words, (binding, buffer) pairs, grid.
 pub struct Disp<'a> {
-    pipe: &'a wgpu::ComputePipeline,
-    uni: Vec<u32>,
-    bufs: Vec<(u32, &'a wgpu::Buffer)>,
-    grid: (u32, u32, u32),
+    pub(super) pipe: &'a wgpu::ComputePipeline,
+    pub(super) uni: Vec<u32>,
+    pub(super) bufs: Vec<(u32, &'a wgpu::Buffer)>,
+    pub(super) grid: (u32, u32, u32),
 }
 
 /// Encode dispatches into one compute pass and submit.
@@ -686,10 +686,10 @@ pub fn run(c: &Ctx, ds: &[Disp]) {
     submit(c, enc.finish());
 }
 
-fn wg_fold(n: usize) -> (u32, u32, u32) {
+pub(super) fn wg_fold(n: usize) -> (u32, u32, u32) {
     if n <= 65535 { (n as u32, 1, 1) } else { (65535, n.div_ceil(65535) as u32, 1) }
 }
-fn elt_fold(n: usize) -> (u32, u32, u32) {
+pub(super) fn elt_fold(n: usize) -> (u32, u32, u32) {
     let g = n.div_ceil(256);
     if g <= 65535 { (g as u32, 1, 1) } else { (65535, g.div_ceil(65535) as u32, 1) }
 }
