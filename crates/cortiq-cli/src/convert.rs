@@ -1967,7 +1967,7 @@ pub(crate) fn det_exp2(y: f32) -> f32 {
 /// `q4tp_ladder` with [`det_exp2`]: the rung table the encoders choose codes
 /// against (the runtime keeps the core ladder; the two differ by at most an
 /// ulp, which only matters to the encoder's near-tie choices).
-fn det_q4tp_ladder(params: &[u8], r: usize) -> [f32; 32] {
+pub(crate) fn det_q4tp_ladder(params: &[u8], r: usize) -> [f32; 32] {
     let lo = f16_to_f32(u16::from_le_bytes([params[r * 4], params[r * 4 + 1]]));
     let st = f16_to_f32(u16::from_le_bytes([params[r * 4 + 2], params[r * 4 + 3]]));
     let ratio = det_exp2(st);

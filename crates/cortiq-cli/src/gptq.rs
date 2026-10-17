@@ -910,6 +910,8 @@ pub(crate) struct GptqTiledOpts<'a> {
     /// Remove each q2tp row's output shrinkage in the calibration metric
     /// (the CLI default: −11.5 % ppl on MiniCPM5's placed arm, zero bits).
     pub q2tp_debias: bool,
+    /// The same for q4tp tensors (opt-in: the 4-bit shrinkage is small).
+    pub q4tp_debias: bool,
     /// Capture this many layers per calibration pass (0 = all at once):
     /// bounds the Hessian RAM at the price of one forward per pass.
     pub chunk_layers: usize,
@@ -1339,7 +1341,9 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
                         let hdiag: Vec<f32> = (0..n).map(|i| h[i * n + i] as f32).collect();
                         let quants: Vec<Quant> =
                             grp.slots.iter().map(|&s| quant_of(&model.tensors[s].name)).collect();
-                        let keep_h = (o.q2tp_debias && quants.contains(&Quant::Q2TiledP)).then(|| h.clone());
+                        let keep_h = ((o.q2tp_debias && quants.contains(&Quant::Q2TiledP))
+                            || (o.q4tp_debias && quants.contains(&Quant::Q4TiledP)))
+                        .then(|| h.clone());
                         let perm = o.act_order.then(|| act_order_perm(&hdiag));
                         let (u, dead) = match &perm {
                             Some(p) => {
@@ -1359,14 +1363,18 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
                                 continue;
                             }
                             let out = match (q, &perm) {
-                                (Quant::Q4TiledP, Some(p)) => (
-                                    TensorDtype::Q4TiledP,
-                                    gptq_quantize_q4tp_act_order(&w, rows, cols, &u, &dead, p, inner),
-                                ),
-                                (Quant::Q4TiledP, None) => (
-                                    TensorDtype::Q4TiledP,
-                                    gptq_quantize_q4tp(&w, rows, cols, &u, &dead, &hdiag, inner),
-                                ),
+                                (Quant::Q4TiledP, _) => {
+                                    let mut b = match &perm {
+                                        Some(p) => gptq_quantize_q4tp_act_order(&w, rows, cols, &u, &dead, p, inner),
+                                        None => gptq_quantize_q4tp(&w, rows, cols, &u, &dead, &hdiag, inner),
+                                    };
+                                    if o.q4tp_debias
+                                        && let Some(h) = &keep_h
+                                    {
+                                        q4tp_debias_hessian(&mut b, &w, rows, cols, h, inner);
+                                    }
+                                    (TensorDtype::Q4TiledP, b)
+                                }
                                 _ => {
                                     let rule = o.q2tp_rule_for(&entry.name);
                                     let mut b = gptq_quantize_q2tp(
@@ -1380,7 +1388,9 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
                                         perm.as_deref(),
                                         inner,
                                     );
-                                    if let Some(h) = &keep_h {
+                                    if o.q2tp_debias
+                                        && let Some(h) = &keep_h
+                                    {
                                         q2tp_debias_hessian(&mut b, &w, rows, cols, h, inner);
                                     }
                                     (TensorDtype::Q2TiledP, b)
@@ -1480,6 +1490,9 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
                 .map(|(p, r)| format!("{p}={}", r.name()))
                 .collect::<Vec<_>>());
         }
+    }
+    if o.q4tp_debias {
+        gptq["q4tp_debias"] = serde_json::json!(true);
     }
     if o.calib.len() > 1 {
         if let Some(used) = &calib_used {
@@ -1684,6 +1697,8 @@ fn par_rows(n: usize, threads: usize, f: &(dyn Fn(usize) + Sync)) {
 /// `e = (w_j − q_j)/U_jj` into `w_{k>j} −= e·U_jk` is the exact OBS update
 /// with `H⁻¹` re-conditioned after every eliminated column — the reference
 /// GPTQ formulation (the raw `H⁻¹` row is only exact for the first column).
+/// (Single-threaded form; the runner calls [`gptq_fold_operator_par`].)
+#[cfg(test)]
 pub fn gptq_fold_operator(h: Vec<f64>, n: usize, lambda: f64) -> (Vec<f32>, Vec<bool>) {
     gptq_fold_operator_par(h, n, lambda, 1)
 }
@@ -2310,11 +2325,31 @@ fn q2_trailing_impl(w: &mut [f32], rb: usize, cols: usize, e: &[f32], b0: usize,
 /// rule) shrinks every output by its error energy, the same way in every
 /// layer; on MiniCPM5 this removed 5–20 % of ppl on such arms.
 pub fn q2tp_debias_hessian(bytes: &mut [u8], w0: &[f32], rows: usize, cols: usize, h: &[f64], threads: usize) {
-    use cortiq_core::quant::{Q2TP_CHUNK, q2tp_sections, q4tp_code};
+    debias_tiled_hessian(bytes, w0, rows, cols, h, threads, true);
+}
+
+/// [`q2tp_debias_hessian`] for a q4tp tensor (the same `lo` shift: every
+/// q4tp rung of a row is `2^(lo + c·step)`). The shrinkage is ~16× smaller
+/// at 4 bits than at 2, so this is opt-in (`--q4tp-debias`).
+pub fn q4tp_debias_hessian(bytes: &mut [u8], w0: &[f32], rows: usize, cols: usize, h: &[f64], threads: usize) {
+    debias_tiled_hessian(bytes, w0, rows, cols, h, threads, false);
+}
+
+fn debias_tiled_hessian(
+    bytes: &mut [u8],
+    w0: &[f32],
+    rows: usize,
+    cols: usize,
+    h: &[f64],
+    threads: usize,
+    two_bit: bool,
+) {
+    use cortiq_core::quant::{Q2TP_CHUNK, Q4TP_NIB, q2tp_sections, q4tp_code, q4tp_sections};
     assert_eq!(h.len(), cols * cols);
     assert_eq!(w0.len(), rows * cols);
     let gpr = cols / GROUP_SIZE;
-    let (po, co, stride) = q2tp_sections(rows, cols);
+    let (po, co, stride) = if two_bit { q2tp_sections(rows, cols) } else { q4tp_sections(rows, cols) };
+    let chunk_b = if two_bit { Q2TP_CHUNK } else { Q4TP_NIB };
     let (plane, rest) = bytes.split_at_mut(po);
     let (params, codes) = rest.split_at_mut(co - po);
     let (plane, codes) = (&*plane, &*codes);
@@ -2327,14 +2362,24 @@ pub fn q2tp_debias_hessian(bytes: &mut [u8], w0: &[f32], rows: usize, cols: usiz
                     let r = ci * per + k;
                     let wr = &w0[r * cols..(r + 1) * cols];
                     // Ŵ_r through the encoder's own (machine-independent) ladder.
-                    let tab = crate::convert::det_q2tp_ladder(p, 0);
+                    let tab = if two_bit {
+                        crate::convert::det_q2tp_ladder(p, 0)
+                    } else {
+                        crate::convert::det_q4tp_ladder(p, 0)
+                    };
                     let crow = &codes[r * stride..(r + 1) * stride];
                     for g in 0..gpr {
                         let sg = tab[q4tp_code(crow, g)];
-                        let ch = &plane[(r * gpr + g) * Q2TP_CHUNK..(r * gpr + g + 1) * Q2TP_CHUNK];
+                        let ch = &plane[(r * gpr + g) * chunk_b..(r * gpr + g + 1) * chunk_b];
+                        let dst = &mut wh[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
                         for (b, &byte) in ch.iter().enumerate() {
-                            for j in 0..4 {
-                                wh[g * GROUP_SIZE + b * 4 + j] = (((byte >> (2 * j)) & 3) as f32 - 1.5) * sg;
+                            if two_bit {
+                                for j in 0..4 {
+                                    dst[b * 4 + j] = (((byte >> (2 * j)) & 3) as f32 - 1.5) * sg;
+                                }
+                            } else {
+                                dst[b * 2] = ((byte & 0x0F) as f32 - 8.0) * sg;
+                                dst[b * 2 + 1] = (((byte >> 4) & 0x0F) as f32 - 8.0) * sg;
                             }
                         }
                     }
@@ -3012,6 +3057,39 @@ mod tests {
         assert!(unit > rows / 2, "most rows must come back to a unit slope ({unit}/{rows})");
     }
 
+    /// The q4tp debias: same contract on the 4-bit layout — nibbles, rungs
+    /// and steps untouched, each row's metric slope back to ~1.
+    #[test]
+    fn q4tp_debias_hessian_restores_unit_slope() {
+        let (rows, cols, t) = (16usize, 128usize, 400usize);
+        let (w, _, h) = q2_problem_with(rows, cols, t, 31, 2.0);
+        let hdiag: Vec<f32> = (0..cols).map(|i| h[i * cols + i] as f32).collect();
+        let (u, dead) = gptq_fold_operator(h.clone(), cols, 0.01);
+        let g = gptq_quantize_q4tp(&w, rows, cols, &u, &dead, &hdiag, 2);
+        let mut d = g.clone();
+        q4tp_debias_hessian(&mut d, &w, rows, cols, &h, 3);
+        let (po, co, _) = cortiq_core::quant::q4tp_sections(rows, cols);
+        assert_eq!(&g[..po], &d[..po], "nibbles untouched");
+        assert_eq!(&g[co..], &d[co..], "rungs untouched");
+        let slope = |bytes: &[u8], r: usize| -> f64 {
+            let mut deq = vec![0f32; rows * cols];
+            cortiq_core::quant::dequant_q4tp(bytes, rows, cols, &mut deq);
+            let (mut num, mut den) = (0f64, 0f64);
+            for i in 0..cols {
+                let yi: f64 = (0..cols).map(|j| h[i * cols + j] * w[r * cols + j] as f64).sum();
+                num += deq[r * cols + i] as f64 * yi;
+                den += w[r * cols + i] as f64 * yi;
+            }
+            num / den
+        };
+        for r in 0..rows {
+            assert_eq!(g[po + r * 4 + 2..po + r * 4 + 4], d[po + r * 4 + 2..po + r * 4 + 4], "step untouched");
+            let (b0, b1) = (slope(&g, r), slope(&d, r));
+            let want = b0 / b0.clamp(0.8, 1.25);
+            assert!((b1 - want).abs() < 0.005, "row {r}: slope {b0:.5} → {b1:.5}");
+        }
+    }
+
     /// The fold operator as it was before blocking and threads: row
     /// Cholesky, one column of L⁻¹ at a time, one row of H⁻¹ at a time.
     fn fold_reference(mut h: Vec<f64>, n: usize, lambda: f64) -> Vec<f32> {
@@ -3281,6 +3359,7 @@ mod tests {
                 q2tp_rule: Q2tpRule::Placed,
                 q2tp_rule_overrides: Vec::new(),
                 q2tp_debias: false,
+                q4tp_debias: false,
                 chunk_layers: chunk,
             })
             .unwrap();
