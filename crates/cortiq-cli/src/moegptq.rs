@@ -79,6 +79,36 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     }
     let ntok: usize = windows.iter().map(Vec::len).sum();
     eprintln!("calibrating on {ntok} tokens ({} windows)", windows.len());
+    // CMF_MOE_DIAG="0,2560,…": per-expert output error on held-out windows
+    // (every CMF_MOE_HOLDOUT-th, default 8th), round-to-nearest against GPTQ
+    // with each listed prior (pseudo-rows, 0 = none); no file is written.
+    // CMF_MOE_PRIOR = n0: the prior the production encode uses (n0/4 for
+    // down), from CMF_MOE_PRIOR_S (8192) evenly spaced calibration tokens.
+    // CMF_MOE_RANGE = lo..hi restricts the layers.
+    let env_f = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(d);
+    let diag: Option<Vec<f64>> = std::env::var("CMF_MOE_DIAG").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect());
+    let holdout = if diag.is_some() { env_f("CMF_MOE_HOLDOUT", 8.0) as usize } else { 0 };
+    let prior_n0 = env_f("CMF_MOE_PRIOR", 0.0);
+    let prior_s = env_f("CMF_MOE_PRIOR_S", 8192.0) as usize;
+    let mut held: Vec<bool> = Vec::with_capacity(ntok);
+    for (wi, w) in windows.iter().enumerate() {
+        held.extend(std::iter::repeat_n(holdout > 0 && wi % holdout == holdout - 1, w.len()));
+    }
+    let (range_lo, range_hi) = std::env::var("CMF_MOE_RANGE")
+        .ok()
+        .and_then(|v| v.split_once("..").and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))))
+        .unwrap_or((0, nl));
+    let (range_lo, range_hi) = (range_lo.min(nl), range_hi.min(nl));
+    if let Some(v) = &diag {
+        eprintln!("DIAG: held-out every {holdout}th window, priors {v:?} (pseudo-rows), layers {range_lo}..{range_hi}; no file is written");
+    }
+    if prior_n0 > 0.0 {
+        eprintln!("prior: {prior_n0} pseudo-rows (down {}) from {prior_s} calibration tokens", prior_n0 / 4.0);
+    }
+    // diag accumulators per row-count bin: (experts, Σ‖out‖², Σ err RTN, Σ err per prior)
+    const BINS: [usize; 4] = [640, 2560, 10240, usize::MAX];
+    let nvar = diag.as_ref().map_or(0, Vec::len);
+    let diag_tot = std::sync::Mutex::new(vec![(0usize, 0f64, vec![0f64; nvar + 1]); BINS.len()]);
 
     // full-precision source: the safetensors index of the original checkpoint
     let scratch = PathBuf::from(o.scratch);
@@ -142,11 +172,11 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     let target = patch.map(CmfModel::open_sharded).transpose()?;
     let mut patches: Vec<(usize, TensorDtype, Vec<u8>)> = Vec::new();
     let mut out = match patch {
-        None => {
+        None if diag.is_none() => {
             let avg_name = cmodel.tensors.iter().map(|e| e.name.len()).sum::<usize>() / cmodel.tensors.len().max(1);
             Some(CmfStreamWriter::new(o.output, CmfStreamWriter::head_reserve_for(cmodel.tensors.len(), avg_name))?)
         }
-        Some(_) => None,
+        _ => None,
     };
     let mut emit = |name: &str, dt: TensorDtype, shape: &[usize], bytes: Vec<u8>| -> anyhow::Result<()> {
         match (&mut out, &target) {
@@ -158,7 +188,7 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
                 patches.push((i, dt, bytes));
                 Ok(())
             }
-            (None, None) => unreachable!(),
+            (None, None) => Ok(()), // diagnostics: nothing is written
         }
     };
 
@@ -168,8 +198,8 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     let mut stats = (0usize, 0usize);
     let mut prefetch: Option<std::thread::JoinHandle<anyhow::Result<()>>> = None;
     let pass = o.layers_per_pass.max(1);
-    for lo in (0..nl).step_by(pass) {
-        let hi = (lo + pass).min(nl);
+    for lo in (range_lo..range_hi).step_by(pass) {
+        let hi = (lo + pass).min(range_hi);
         // ── capture ──
         let tc = Instant::now();
         let mut rows: Vec<Vec<u16>> = (lo..hi).map(|_| Vec::with_capacity(ntok * width)).collect();
@@ -219,6 +249,7 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
             if patch.is_none() {
                 // routing: top-k of the logits per token
                 let mut lists: Vec<Vec<u32>> = vec![Vec::new(); ne];
+                let mut lists_ho: Vec<Vec<u32>> = vec![Vec::new(); ne];
                 let mut lg = vec![0f32; ne];
                 for t in 0..n {
                     for (e, v) in lg.iter_mut().enumerate() {
@@ -227,7 +258,7 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
                     let mut ord: Vec<usize> = (0..ne).collect();
                     ord.select_nth_unstable_by(top_k - 1, |&a, &b| lg[b].partial_cmp(&lg[a]).unwrap_or(std::cmp::Ordering::Equal));
                     for &e in &ord[..top_k] {
-                        lists[e].push(t as u32);
+                        if held[t] { lists_ho[e].push(t as u32) } else { lists[e].push(t as u32) }
                     }
                 }
                 {
@@ -242,6 +273,11 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
                         o.min_rows
                     );
                 }
+                // the prior's sample: evenly spaced calibration tokens
+                let cal: Vec<u32> = (0..n).filter(|&t| !held[t]).map(|t| t as u32).collect();
+                let sample: Vec<u32> = cal.iter().step_by((cal.len() / prior_s.max(1)).max(1)).take(prior_s).copied().collect();
+                let prod_prior = (prior_n0 > 0.0).then(|| Prior { rows: &sample, n0: prior_n0, n0_down: prior_n0 / 4.0 });
+                let diag_layer = std::sync::Mutex::new(vec![(0usize, 0f64, vec![0f64; nvar + 1]); BINS.len()]);
                 let (gst, gm) = find(ROUTED[0])?;
                 let (dst, dm) = find(ROUTED[1])?;
                 anyhow::ensure!(gm.shape == [ne, 2 * inter, hidden] && dm.shape == [ne, hidden, inter], "layer {li}: unexpected expert layout {:?} / {:?}", gm.shape, dm.shape);
@@ -268,13 +304,51 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
                         let gu = to_f32(&gm.dtype, &gbytes[e * gsz..(e + 1) * gsz])?;
                         let wd = to_f32(&dm.dtype, &dbytes[e * dsz..(e + 1) * dsz])?;
                         let (wg, wu) = gu.split_at(inter * hidden);
+                        if let Some(vars) = &diag {
+                            let (ho, ce) = (&lists_ho[e], lists[e].len());
+                            if ho.is_empty() || ce < o.min_rows {
+                                continue;
+                            }
+                            let m = ho.len();
+                            let mut xh = vec![0f32; m * hidden];
+                            par_rows(&mut xh, hidden, wthreads, |r, row| {
+                                let t = ho[r] as usize;
+                                for (d, &s) in row.iter_mut().zip(&lr[t * width..t * width + hidden]) {
+                                    *d = cortiq_core::quant::f16_to_f32(s);
+                                }
+                            });
+                            let o_fp = expert_out(&xh, m, hidden, wg, wu, &wd, inter, wthreads);
+                            let base: f64 = o_fp.iter().map(|&v| (v as f64) * (v as f64)).sum();
+                            let err_of = |enc: &[Vec<u8>; 3]| -> f64 {
+                                let [qg, qu, qd] = dequant_expert(enc, inter, hidden);
+                                let oq = expert_out(&xh, m, hidden, &qg, &qu, &qd, inter, wthreads);
+                                oq.iter().zip(&o_fp).map(|(&a, &b)| ((a - b) as f64).powi(2)).sum()
+                            };
+                            let rtn = [quantize_2d(Quant::Q2TiledP, wg, inter, hidden).1, quantize_2d(Quant::Q2TiledP, wu, inter, hidden).1, quantize_2d(Quant::Q4TiledP, &wd, hidden, inter).1];
+                            let mut errs = vec![err_of(&rtn)];
+                            let b = bufs.get_or_insert_with(|| wgpu_bufs::Bufs::new(c, CHUNK, hidden, inter));
+                            for &n0 in vars {
+                                let pr = (n0 > 0.0).then(|| Prior { rows: &sample, n0, n0_down: n0 / 4.0 });
+                                let enc = encode_expert(c, b, lr, width, hidden, &lists[e], wg, wu, &wd, inter, o.lambda, wthreads, pr, &mut wt)?;
+                                errs.push(err_of(&enc));
+                            }
+                            let bin = BINS.iter().position(|&lim| ce < lim).unwrap_or(BINS.len() - 1);
+                            let mut d = diag_layer.lock().unwrap();
+                            d[bin].0 += 1;
+                            d[bin].1 += base;
+                            for (a, v) in d[bin].2.iter_mut().zip(errs) {
+                                *a += v;
+                            }
+                            n_gptq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            continue;
+                        }
                         let enc = if lists[e].len() < o.min_rows {
                             n_rtn.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             [quantize_2d(Quant::Q2TiledP, wg, inter, hidden).1, quantize_2d(Quant::Q2TiledP, wu, inter, hidden).1, quantize_2d(Quant::Q4TiledP, &wd, hidden, inter).1]
                         } else {
                             n_gptq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let b = bufs.get_or_insert_with(|| wgpu_bufs::Bufs::new(c, CHUNK, hidden, inter));
-                            encode_expert(c, b, lr, width, hidden, &lists[e], wg, wu, &wd, inter, o.lambda, wthreads, &mut wt)?
+                            encode_expert(c, b, lr, width, hidden, &lists[e], wg, wu, &wd, inter, o.lambda, wthreads, prod_prior, &mut wt)?
                         };
                         *results[e].lock().unwrap() = Some(enc);
                     }
@@ -294,7 +368,26 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
                 tim = *timers.lock().unwrap();
                 stats.0 += n_gptq.into_inner();
                 stats.1 += n_rtn.into_inner();
+                if let Some(vars) = &diag {
+                    let d = diag_layer.into_inner().unwrap();
+                    let mut tot = diag_tot.lock().unwrap();
+                    for (bi, (cnt, base, errs)) in d.iter().enumerate() {
+                        if *cnt == 0 {
+                            continue;
+                        }
+                        let rel: Vec<String> = errs.iter().map(|e| format!("{:.4}", e / base)).collect();
+                        eprintln!("  DIAG layer {li} rows<{}: {cnt} experts, rel. output error RTN {} | priors {vars:?}: {}", if BINS[bi] == usize::MAX { "∞".into() } else { BINS[bi].to_string() }, rel[0], rel[1..].join(" "));
+                        tot[bi].0 += cnt;
+                        tot[bi].1 += base;
+                        for (a, v) in tot[bi].2.iter_mut().zip(errs) {
+                            *a += v;
+                        }
+                    }
+                }
                 for (e, slot) in results.into_iter().enumerate() {
+                    if diag.is_some() {
+                        break;
+                    }
                     let [gate_b, up_b, down_b] = slot.into_inner().unwrap().ok_or_else(|| anyhow::anyhow!("expert {e} missing"))?;
                     let (gi, ui, di) = layer_dirs[li][e];
                     emit(&te[gi].name, TensorDtype::Q2TiledP, &te[gi].shape, gate_b)?;
@@ -305,7 +398,7 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
 
             // the shared expert: every token is its input
             let mut t_shared = 0.0;
-            if let Some((gi, ui, di)) = shared_dirs[li] {
+            if let (Some((gi, ui, di)), None) = (shared_dirs[li], &diag) {
                 let ts = Instant::now();
                 let is = te[gi].shape[0];
                 let get = |part: &str, shape: [usize; 2]| -> anyhow::Result<Vec<f32>> {
@@ -316,9 +409,9 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
                 let wg = get(SHARED[0], [is, hidden])?;
                 let wu = get(SHARED[1], [is, hidden])?;
                 let wd = get(SHARED[2], [hidden, is])?;
-                let all: Vec<u32> = (0..n as u32).collect();
+                let all: Vec<u32> = (0..n).filter(|&t| !held[t]).map(|t| t as u32).collect();
                 let mut st = [0f64; 5];
-                let [gate_b, up_b, down_b] = encode_expert(c, &main_bufs, lr, width, hidden, &all, &wg, &wu, &wd, is, o.lambda, o.threads, &mut st)?;
+                let [gate_b, up_b, down_b] = encode_expert(c, &main_bufs, lr, width, hidden, &all, &wg, &wu, &wd, is, o.lambda, o.threads, None, &mut st)?;
                 emit(&te[gi].name, TensorDtype::Q2TiledP, &te[gi].shape, gate_b)?;
                 emit(&te[ui].name, TensorDtype::Q2TiledP, &te[ui].shape, up_b)?;
                 emit(&te[di].name, TensorDtype::Q4TiledP, &te[di].shape, down_b)?;
@@ -350,6 +443,17 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
         }
     }
     drop(emit);
+    if let Some(vars) = &diag {
+        eprintln!("DIAG total, layers {range_lo}..{range_hi}, relative expert output error on held-out rows:");
+        for (bi, (cnt, base, errs)) in diag_tot.into_inner().unwrap().iter().enumerate() {
+            if *cnt == 0 {
+                continue;
+            }
+            let rel: Vec<String> = errs.iter().map(|e| format!("{:.4}", e / base)).collect();
+            eprintln!("  rows<{}: {cnt} experts | RTN {} | GPTQ priors {vars:?}: {}", if BINS[bi] == usize::MAX { "∞".into() } else { BINS[bi].to_string() }, rel[0], rel[1..].join(" "));
+        }
+        return Ok(());
+    }
     if let Some(path) = patch {
         drop(target);
         let n = patches.len();
@@ -388,6 +492,18 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
 /// `width`-wide f16 rows `lr`, input first): both input Hessians accumulate
 /// over `CHUNK`-row device passes, then gate/up fold + q2tp sweeps + debias,
 /// down fold + q4tp sweep. Returns the gate, up and down payloads.
+/// Layer-wide prior of the expert Hessians: `rows` (a sample of the layer's
+/// tokens) enter both input Hessians as `n0` / `n0_down` pseudo-rows, so
+/// directions an expert's own rows never visit carry the layer's statistics
+/// instead of nothing (an expert routed fewer tokens than its input width
+/// has a rank-deficient Hessian of its own).
+#[derive(Clone, Copy)]
+struct Prior<'a> {
+    rows: &'a [u32],
+    n0: f64,
+    n0_down: f64,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_expert(
     c: &Ctx,
@@ -402,6 +518,7 @@ fn encode_expert(
     inter: usize,
     lambda: f64,
     threads: usize,
+    prior: Option<Prior>,
     tim: &mut [f64; 5],
 ) -> anyhow::Result<[Vec<u8>; 3]> {
     use cortiq_engine::gpu;
@@ -409,22 +526,47 @@ fn encode_expert(
     let hid = gpu::gram_alloc(hidden).ok_or_else(|| anyhow::anyhow!("gram alloc"))?;
     let did = gpu::gram_alloc(inter).ok_or_else(|| anyhow::anyhow!("gram alloc"))?;
     let (pg, pu) = (tm::f16_from_f32(c, wg), tm::f16_from_f32(c, wu));
-    let mut xe = vec![0f32; CHUNK.min(rows.len()) * hidden];
-    for part in rows.chunks(CHUNK) {
-        let m = part.len();
-        let xs = &mut xe[..m * hidden];
+    let gather = |xs: &mut [f32], part: &[u32], scale: f32| {
         par_rows(xs, hidden, threads, |r, row| {
             let t = part[r] as usize;
             for (d, &s) in row.iter_mut().zip(&lr[t * width..t * width + hidden]) {
-                *d = cortiq_core::quant::f16_to_f32(s);
+                *d = cortiq_core::quant::f16_to_f32(s) * scale;
             }
         });
+    };
+    let mut xe = vec![0f32; CHUNK.min(rows.len().max(prior.map_or(0, |p| p.rows.len()))) * hidden];
+    for part in rows.chunks(CHUNK) {
+        let m = part.len();
+        let xs = &mut xe[..m * hidden];
+        gather(xs, part, 1.0);
         to::write(c, &bufs.x, xs);
         anyhow::ensure!(gpu::gram_add_dev(hid, &bufs.x, m), "gram");
         tm::plane_linear(c, &pg, &bufs.x, &bufs.act16, &bufs.yg, m, inter, hidden, 1.0).ok_or_else(|| anyhow::anyhow!("gemm"))?;
         tm::plane_linear(c, &pu, &bufs.x, &bufs.act16, &bufs.yu, m, inter, hidden, 1.0).ok_or_else(|| anyhow::anyhow!("gemm"))?;
         to::run(c, &[to::elt(c, "swiglu_fwd", m * inter, &bufs.yg, &bufs.yu, Some(&bufs.yd), None, None, None).ok_or_else(|| anyhow::anyhow!("swiglu"))?]);
         anyhow::ensure!(gpu::gram_add_dev(did, &bufs.yd, m), "gram");
+    }
+    if let Some(pr) = prior.filter(|p| !p.rows.is_empty() && p.n0 > 0.0) {
+        // S sample rows as n0 pseudo-rows: gram of a·x with a = √(n0/S); the
+        // down input of the sample through √(n0_down/S)·W_u (silu(g)⊙(b·u) = b·y)
+        let s = pr.rows.len() as f64;
+        let (a, b) = ((pr.n0 / s).sqrt() as f32, (pr.n0_down / s).sqrt() as f32);
+        let wub: Vec<f32> = wu.iter().map(|&v| v * b).collect();
+        let pub_ = tm::f16_from_f32(c, &wub);
+        drop(wub);
+        for part in pr.rows.chunks(CHUNK) {
+            let m = part.len();
+            let xs = &mut xe[..m * hidden];
+            gather(xs, part, a);
+            to::write(c, &bufs.x, xs);
+            anyhow::ensure!(gpu::gram_add_dev(hid, &bufs.x, m), "gram");
+            gather(xs, part, 1.0);
+            to::write(c, &bufs.x, xs);
+            tm::plane_linear(c, &pg, &bufs.x, &bufs.act16, &bufs.yg, m, inter, hidden, 1.0).ok_or_else(|| anyhow::anyhow!("gemm"))?;
+            tm::plane_linear(c, &pub_, &bufs.x, &bufs.act16, &bufs.yu, m, inter, hidden, 1.0).ok_or_else(|| anyhow::anyhow!("gemm"))?;
+            to::run(c, &[to::elt(c, "swiglu_fwd", m * inter, &bufs.yg, &bufs.yu, Some(&bufs.yd), None, None, None).ok_or_else(|| anyhow::anyhow!("swiglu"))?]);
+            anyhow::ensure!(gpu::gram_add_dev(did, &bufs.yd, m), "gram");
+        }
     }
     drop(xe);
     let hgu = gpu::gram_read(hid).ok_or_else(|| anyhow::anyhow!("gram read"))?;
@@ -464,6 +606,41 @@ fn find_in<'a>(
 ) -> anyhow::Result<(&'a crate::convert::SafeTensors, &'a crate::convert::TensorMeta)> {
     let st = shards.get(sh).ok_or_else(|| anyhow::anyhow!("shard {sh} not open"))?;
     st.tensors.iter().find(|m| m.name == name).map(|m| (st, m)).ok_or_else(|| anyhow::anyhow!("{name} not in {sh}"))
+}
+
+/// `A·Wᵀ` for row-major `a` (`m × k`) and `w` (`n × k`), rows of `a` split
+/// across `threads`.
+fn gemm_nt(a: &[f32], m: usize, k: usize, w: &[f32], n: usize, threads: usize) -> Vec<f32> {
+    let mut out = vec![0f32; m * n];
+    if m == 0 {
+        return out;
+    }
+    let per = m.div_ceil(threads.max(1)).max(1);
+    std::thread::scope(|s| {
+        for (ci, chunk) in out.chunks_mut(per * n).enumerate() {
+            let rows = chunk.len() / n;
+            let src = &a[ci * per * k..(ci * per + rows) * k];
+            s.spawn(move || cortiq_engine::qtensor::sgemm_public(rows, n, k, 1.0, src, k, w, k, true, chunk, n));
+        }
+    });
+    out
+}
+
+/// Expert output `swiglu(X·W_gᵀ, X·W_uᵀ)·W_dᵀ` of the rows `x` (`m × hidden`).
+fn expert_out(x: &[f32], m: usize, hidden: usize, wg: &[f32], wu: &[f32], wd: &[f32], inter: usize, threads: usize) -> Vec<f32> {
+    let g = gemm_nt(x, m, hidden, wg, inter, threads);
+    let u = gemm_nt(x, m, hidden, wu, inter, threads);
+    let y: Vec<f32> = g.iter().zip(&u).map(|(&g, &u)| g / (1.0 + (-g).exp()) * u).collect();
+    gemm_nt(&y, m, inter, wd, hidden, threads)
+}
+
+/// Dequantized gate, up, down of an encoded expert.
+fn dequant_expert(enc: &[Vec<u8>; 3], inter: usize, hidden: usize) -> [Vec<f32>; 3] {
+    let (mut g, mut u, mut d) = (vec![0f32; inter * hidden], vec![0f32; inter * hidden], vec![0f32; hidden * inter]);
+    cortiq_core::quant::dequant_q2tp(&enc[0], inter, hidden, &mut g);
+    cortiq_core::quant::dequant_q2tp(&enc[1], inter, hidden, &mut u);
+    cortiq_core::quant::dequant_q4tp(&enc[2], hidden, inter, &mut d);
+    [g, u, d]
 }
 
 /// `f(row, row_slice)` over the `width`-wide rows of `v`, split across `threads`.
