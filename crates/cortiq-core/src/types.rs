@@ -103,8 +103,14 @@ pub enum TensorDtype {
     /// Raw little-endian `u64` words (spec §9.5.2: a lookup record's
     /// `keys.hash` and `entries.off` tables): `n × 8` bytes, raw.
     U64 = 18,
-    // 19 is held by the LittleBit codec (`lb`) on its research branch;
-    // never reuse it here.
+    /// Binary low-rank weights (`blr`, docs/BLR_NVG.md §2): `P ∈ {1,2}`
+    /// paths `diag(h)·S_U·diag(ℓ)·S_Vᵀ·diag(g)` with packed ±1 sign bits and
+    /// f16 scales (the factorization layout of LittleBit, Lee et al. 2025).
+    /// Self-describing variable-length payload (16-byte header with the
+    /// rank); the directory keeps the logical `[d_out, d_in]` shape. Id and
+    /// bytes match the research branch's `lb` files.
+    #[serde(rename = "blr")]
+    BinaryLowRank = 19,
     /// 1-bit binary weights with ONE f16 scale per 128-weight group — the
     /// native group of 1-bit-trained checkpoints (Bonsai class). A `q1`
     /// file of such a model stores every 128-group scale four times (once
@@ -144,6 +150,7 @@ impl TensorDtype {
             16 => Self::Q2TiledP,
             17 => Self::U32,
             18 => Self::U64,
+            19 => Self::BinaryLowRank,
             20 => Self::Q1G,
             _ => return None,
         })
@@ -181,6 +188,7 @@ impl TensorDtype {
             Self::Q2TiledP => "q2tp",
             Self::U32 => "u32",
             Self::U64 => "u64",
+            Self::BinaryLowRank => "blr",
             Self::Q1G => "q1g",
         }
     }
@@ -206,6 +214,7 @@ impl TensorDtype {
                 | Self::Q1G
                 | Self::Q4TiledP
                 | Self::Q2TiledP
+                | Self::BinaryLowRank
         )
     }
 }

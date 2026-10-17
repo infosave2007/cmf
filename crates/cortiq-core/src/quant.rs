@@ -793,6 +793,10 @@ fn has_fixed_payload_size(dtype: TensorDtype) -> bool {
 /// on the per-row bit widths stored in the payload itself — the exact
 /// length is computed from the (validated) width header.
 pub fn validate_payload(dtype: TensorDtype, shape: &[usize], bytes: &[u8]) -> Result<(), String> {
+    if dtype == TensorDtype::BinaryLowRank {
+        // Self-describing variable length: the header carries the rank.
+        return crate::blr::validate_blr(shape, bytes).map(|_| ());
+    }
     if dtype == TensorDtype::Q4TiledP {
         // Say WHY the shape is wrong; the generic length check below cannot,
         // since expected_nbytes has to fold both causes into None.
@@ -996,6 +1000,13 @@ pub fn dequant_tensor(entry: &TensorEntry, bytes: &[u8], dst: &mut [f32]) -> Res
             }
             dequant_q1t(bytes, entry.shape[0], entry.shape[1], dst);
         }
+        TensorDtype::BinaryLowRank => {
+            if entry.shape.len() != 2 {
+                return Err(format!("blr tensor '{}' must be 2-D", entry.name));
+            }
+            crate::blr::dequant_blr(bytes, entry.shape[0], entry.shape[1], dst)
+                .map_err(|e| format!("'{}': {e}", entry.name))?;
+        }
         TensorDtype::Vbit => {
             if entry.shape.len() != 2 {
                 return Err(format!("vbit tensor '{}' must be 2-D", entry.name));
@@ -1049,6 +1060,9 @@ pub fn bytes_per_weight(dtype: TensorDtype) -> f32 {
         TensorDtype::U8 => 1.0,
         TensorDtype::U32 => 4.0,
         TensorDtype::U64 => 8.0,
+        // Shape- and rank-dependent (`blr::blr_bits` is exact); ~0.55
+        // bits/weight, informational only.
+        TensorDtype::BinaryLowRank => 0.07,
     }
 }
 
