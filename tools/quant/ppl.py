@@ -37,6 +37,7 @@ def main(argv=None):
     ap.add_argument("--block", type=int, default=32, help="windows per streamed pass")
     ap.add_argument("--residency", choices=("resident", "stream"), default="stream")
     ap.add_argument("--vchunk", type=int, default=16384)
+    ap.add_argument("--head-windows", type=int, default=1, help="windows per vocabulary scan of the head")
     ap.add_argument("--out", help="prefix for per-window NLLs (<out>_w<N>.npy) and <out>.json")
     ap.add_argument("--ref", help="prefix of a reference run: print the paired change vs it")
     ap.add_argument("--gpu-cap-gb", type=float, default=0)
@@ -47,7 +48,7 @@ def main(argv=None):
     t0 = time.time()
     ids = cmfio.load_ids(args.ids)
     cmf = cmfio.CmfFile(args.model)
-    model = qmodel.Model(cmf, dev, residency=args.residency, vchunk=args.vchunk)
+    model = qmodel.Model(cmf, dev, residency=args.residency, vchunk=args.vchunk, head_windows=args.head_windows)
     res = {"model": os.path.abspath(args.model), "ids": os.path.abspath(args.ids), "wl": args.wl}
     for n in [args.windows] + list(args.also):
         w = calib.gather(ids, calib.even_starts(len(ids), n, args.wl), args.wl)
