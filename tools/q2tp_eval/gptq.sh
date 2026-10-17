@@ -15,7 +15,7 @@ cd $W
 CAL=()
 for c in ${CALIB:-data/wiki.train.raw}; do CAL+=(--calib "$c"); done
 echo "=== $(date -u +%FT%TZ) $TAG ${CAL[*]} $*" >> $L/gptq_runs.log
-python3 /root/cmfbuild/q2tp_scripts/timerun.py ./bin/cortiq quantize-gptq f16.cmf --calib-model q8_2f.cmf "${CAL[@]}" \
+python3 /root/cmfbuild/q2tp_scripts/timerun.py ${BIN:-./bin/cortiq} quantize-gptq f16.cmf --calib-model q8_2f.cmf "${CAL[@]}" \
   --tokens ${TOKENS:-32768} --window 2048 --threads ${THREADS:-13} \
   --tensor-quant lm_head.weight=q8_2f --tensor-quant model.embed_tokens.weight=q8_2f \
   --hessians ${HESS:-hess/H32k.hess} --calib-chunk-layers ${CHUNK:-21} \
