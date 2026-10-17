@@ -881,6 +881,10 @@ class Model:
         return t.to(self.act_device)
 
     def to_dev(self, t):
+        """host -> device; a page-locked boundary must arrive whole (contiguous): the CPU never
+        reads it, so the copy stays ordered after the asynchronous device -> host copy"""
+        if t.device.type == "cpu" and t.is_pinned() and not t.is_contiguous():
+            raise AssertionError("strided slice of an in-flight page-locked activation; slice on the device")
         return t.to(self.dev, non_blocking=True)
 
     # -- inputs
@@ -932,7 +936,10 @@ class Model:
             for i0 in range(0, b, hw):
                 i1 = min(b, i0 + hw)
                 n = i1 - i0
-                xn = rms(self.to_dev(x[i0:i1, :T - 1]).reshape(n * (T - 1), H), self.final.eff(), self.arch.eps)
+                # move the contiguous block first and slice on the device: a strided slice of a
+                # page-locked boundary would be gathered by the CPU while its async copy is in flight
+                xd = self.to_dev(x[i0:i1])
+                xn = rms(xd[:, :T - 1].reshape(n * (T - 1), H), self.final.eff(), self.arch.eps)
                 t = torch.from_numpy(np.asarray(tgt[i0:i1, 1:], dtype=np.int64).reshape(-1)).to(self.dev)
                 ix = None if ix_t is None else ix_t[i0:i1].reshape(n * (T - 1), -1).to(self.dev).long()
                 lse, z_ix, z_t, tv, ti = self.head.scan(xn, self.vchunk, ix=ix, tgt=t, topk=topk)
