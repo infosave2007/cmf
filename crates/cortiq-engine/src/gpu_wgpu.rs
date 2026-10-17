@@ -45,6 +45,9 @@ pub(crate) mod dense_mv;
 pub(crate) mod gram;
 /// GPTQ fold operator and q4tp row sweep on the device.
 pub(crate) mod gptq_dev;
+/// Binary low-rank (`blr`) per-op kernels: two ±1 stages, decode and batched.
+pub(crate) mod blr;
+pub use blr::blr_matmat;
 
 /// Workgroup limit per dimension (WebGPU minimum; lm_head has more
 /// rows — we use grid-stride in the shader).

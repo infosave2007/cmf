@@ -3846,6 +3846,22 @@ pub fn q2tp_affine_matmat(
     }
 }
 
+/// Binary low-rank (`blr`) product on the device: `out[b·rows] = xs[b·cols] ·
+/// Wᵀ` through the two ±1 stages (V then U). `b = 1` is the decode GEMV.
+/// False = not taken (no wgpu backend — Metal has no blr kernel yet — or a
+/// shape outside the kernel's contract): the caller runs the CPU kernels.
+pub fn blr_matmat(t: &crate::blr::BlrTensor, xs: &[f32], b: usize, out: &mut [f32]) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::blr_matmat(t, xs, b, out),
+        #[allow(unreachable_patterns)]
+        _ => {
+            let _ = (t, xs, b, out);
+            false
+        }
+    }
+}
+
 /// Single-token q2tp matvec through the ordinary (center=1.5) WGSL kernel.
 pub fn q2tp_matvec(
     model: &Arc<CmfModel>,
