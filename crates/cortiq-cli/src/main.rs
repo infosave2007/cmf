@@ -989,6 +989,12 @@ enum Commands {
         /// Path prefix of the cached Grams (`<prefix>.fit.gram`, `.sel.gram`)
         #[arg(long = "gram-cache")]
         gram_cache: Option<String>,
+        /// Encode every body linear of this layer instead of one tensor
+        #[arg(long)]
+        layer: Option<usize>,
+        /// Tensors in flight on the device (--layer)
+        #[arg(long, default_value = "3")]
+        jobs: usize,
     },
     /// Chat with a model (applies the file's chat template), or one-shot
     /// with --prompt
@@ -3516,6 +3522,8 @@ async fn main() -> anyhow::Result<()> {
             threads,
             rho,
             gram_cache,
+            layer,
+            jobs,
         } => {
             let paths = match paths.as_str() {
                 "auto" => nvg::PathsChoice::Auto,
@@ -3536,6 +3544,8 @@ async fn main() -> anyhow::Result<()> {
                 threads,
                 rho,
                 gram_cache: gram_cache.as_deref(),
+                layer,
+                jobs,
             })
         }
         Commands::QuantizeGptq {

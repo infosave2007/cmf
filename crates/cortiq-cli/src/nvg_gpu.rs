@@ -75,7 +75,7 @@ pub struct HCtxD {
     perm_buf: cortiq_engine::wgpu::Buffer,
     pub uc: DMat,
     d: Vec<f64>,
-    l: RefCell<Option<DMat>>,
+    l: std::sync::Mutex<Option<std::sync::Arc<DMat>>>,
 }
 
 impl HCtxD {
@@ -119,12 +119,13 @@ impl HCtxD {
         let dp: Vec<f64> = perm.iter().map(|&p| sqd[p]).collect();
         let uc = DMat::zeros(n, n);
         dv::make_uc(&x, &vec_dev(&dp), &uc);
-        Ok(HCtxD { n, h, hsel: hsel_d, c_fit, sqd: sqd.clone(), perm, perm_buf, uc, d: sqd, l: RefCell::new(None) })
+        Ok(HCtxD { n, h, hsel: hsel_d, c_fit, sqd: sqd.clone(), perm, perm_buf, uc, d: sqd, l: std::sync::Mutex::new(None) })
     }
 
-    /// Lower Cholesky factor of `H` (built on first use).
-    fn l(&self) -> anyhow::Result<std::cell::Ref<'_, DMat>> {
-        if self.l.borrow().is_none() {
+    /// Lower Cholesky factor of `H` (built on first use; shared by threads).
+    fn l(&self) -> anyhow::Result<std::sync::Arc<DMat>> {
+        let mut g = self.l.lock().unwrap();
+        if g.is_none() {
             let n = self.n;
             let f = DMat::zeros(n, n);
             let dvv = vec_dev(&self.d);
@@ -132,9 +133,9 @@ impl HCtxD {
             anyhow::ensure!(dv::chol_in_place(&f) == Some(true), "calibration Gram not SPD on the device");
             // L = D·L̃ (lower)
             dv::scale_rc(n, n, None, (&f, 0, n), Some(&dvv), None, INPLACE | LOWER, 1.0, 0.0);
-            *self.l.borrow_mut() = Some(f);
+            *g = Some(std::sync::Arc::new(f));
         }
-        Ok(std::cell::Ref::map(self.l.borrow(), |o| o.as_ref().unwrap()))
+        Ok(g.as_ref().unwrap().clone())
     }
 }
 
@@ -1047,4 +1048,63 @@ mod tests {
         eprintln!("cpu: {}\ngpu: {}", cpu.line, gpu.line);
         assert!(eg <= ec * 1.02, "held-out error gpu {eg} vs cpu {ec}");
     }
+}
+
+/// One tensor of a concurrent batch ([`encode_many`]).
+pub struct Job<'a> {
+    pub w: Mat,
+    pub hc: &'a HCtxD,
+    pub mult: f64,
+}
+
+/// What [`encode_many`] reports per job: the encoding, its wall seconds and
+/// (when profiling) the stage line.
+pub struct Done {
+    pub enc: anyhow::Result<Option<Encoded>>,
+    pub secs: f64,
+    pub prof: Option<String>,
+}
+
+/// Encode `jobs` on the device with up to `njobs` tensors in flight (one host
+/// thread each, with its own pool of `threads / njobs` workers): the column
+/// search of a tensor occupies one multiprocessor, so tensors overlap on the
+/// card. Largest tensors start first. `on_done(i, &done)` runs as each
+/// finishes; results come back in job order.
+pub fn encode_many(
+    jobs: &[Job],
+    b: f64,
+    choice: PathsChoice,
+    threads: usize,
+    njobs: usize,
+    profile: bool,
+    on_done: &(dyn Fn(usize, &Done) + Sync),
+) -> Vec<Done> {
+    let njobs = njobs.clamp(1, jobs.len().max(1));
+    let per = (threads / njobs).max(2);
+    let mut order: Vec<usize> = (0..jobs.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(jobs[i].w.r * jobs[i].w.c));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out: std::sync::Mutex<Vec<Option<Done>>> = std::sync::Mutex::new((0..jobs.len()).map(|_| None).collect());
+    std::thread::scope(|s| {
+        for _ in 0..njobs {
+            s.spawn(|| {
+                let pool = Pool::new(per - 1);
+                loop {
+                    let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if k >= order.len() {
+                        break;
+                    }
+                    let i = order[k];
+                    let j = &jobs[i];
+                    let prof = Prof::default();
+                    let t = Instant::now();
+                    let enc = encode_nvg_dev(Some(&pool), &j.w, j.hc, b, j.mult, choice, profile.then_some(&prof));
+                    let done = Done { enc, secs: t.elapsed().as_secs_f64(), prof: profile.then(|| prof.line()) };
+                    on_done(i, &done);
+                    out.lock().unwrap()[i] = Some(done);
+                }
+            });
+        }
+    });
+    out.into_inner().unwrap().into_iter().map(|d| d.expect("every job ran")).collect()
 }

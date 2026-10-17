@@ -72,7 +72,7 @@ impl DMat {
         self.len() == 0
     }
     pub fn to_f32(&self) -> Vec<f32> {
-        train_ops::download(dev(), &self.buf, self.len()).expect("nvg_dev readback")
+        download(&self.buf, self.len())
     }
     pub fn to_f64(&self) -> Vec<f64> {
         self.to_f32().into_iter().map(|x| x as f64).collect()
@@ -83,6 +83,40 @@ impl DMat {
         copy(self, &o);
         o
     }
+}
+
+/// Read `n` floats back, waiting for this copy's own submission only (other
+/// threads' later work does not delay it).
+fn download(b: &wgpu::Buffer, n: usize) -> Vec<f32> {
+    let c = dev();
+    let size = (n * 4) as u64;
+    let st = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("nvg_rb"),
+        size: size.max(4),
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("nvg_rb") });
+    if size > 0 {
+        enc.copy_buffer_to_buffer(b, 0, &st, 0, size);
+    }
+    let idx = c.queue.submit(Some(enc.finish()));
+    if size == 0 {
+        return Vec::new();
+    }
+    let slice = st.slice(..size);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    c.device
+        .poll(wgpu::PollType::Wait { submission_index: Some(idx), timeout: None })
+        .expect("nvg_dev readback wait");
+    let out = {
+        let data = slice.get_mapped_range().expect("nvg_dev mapped range");
+        let mut v = vec![0f32; n];
+        super::par_copy(&mut v, bytemuck::cast_slice(&data[..size as usize]));
+        v
+    };
+    st.unmap();
+    out
 }
 
 /// `dst ← src` (same element count).
@@ -119,6 +153,7 @@ var<workgroup> sb: array<f32, 2112>;
 fn gemm(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let row0 = wg.y * 128u;
     let col0 = wg.x * 128u;
+    if ((p.flags & 4u) != 0u && col0 > row0 + 127u) { return; }
     let tx = li % 16u;
     let ty = li / 16u;
 "#,
@@ -282,19 +317,25 @@ pub fn gemm_v(m: usize, n: usize, k: usize, alpha: f32, a: V, b: V, beta: f32, c
         return;
     }
     let cx = dev();
+    train_ops::run(cx, &[gemm_disp(cx, m, n, k, alpha, a, b, beta, c, oc, ldc, e, false)]);
+}
+
+/// The dispatch of [`gemm_v`]; `lower` skips the output tiles strictly
+/// above the diagonal of the view (a symmetric rank-k update).
+#[allow(clippy::too_many_arguments)]
+fn gemm_disp<'a>(cx: &'a Ctx, m: usize, n: usize, k: usize, alpha: f32, a: V<'a>, b: V<'a>, beta: f32, c: &'a DMat, oc: usize, ldc: usize, e: Option<&'a DMat>, lower: bool) -> Disp<'a> {
     let md = gemm_mod(cx, a.t, b.t).expect("nvg gemm pipeline");
-    let flags = (e.is_some() as u32) | (((beta != 0.0) as u32) << 1);
+    let flags = (e.is_some() as u32) | (((beta != 0.0) as u32) << 1) | ((lower as u32) << 2);
     let uni = vec![
         m as u32, n as u32, k as u32, a.ld as u32, b.ld as u32, ldc as u32, a.off as u32, b.off as u32, oc as u32, flags,
         alpha.to_bits(), beta.to_bits(),
     ];
-    let d = Disp {
+    Disp {
         pipe: &md.p["gemm"],
         uni,
         bufs: vec![(1, &a.m.buf), (2, &b.m.buf), (3, &c.buf), (4, e.map(|x| &x.buf).unwrap_or(dummy(cx)))],
         grid: (n.div_ceil(128) as u32, m.div_ceil(128) as u32, 1),
-    };
-    train_ops::run(cx, &[d]);
+    }
 }
 
 /// `C = α·op(A)·op(B) + β·C` on whole matrices.
@@ -794,9 +835,139 @@ pub fn chol_solve_dev(l: &DMat, y: &DMat) {
     train_ops::run(cx, &ds);
 }
 
+const CHOL_SRC: &str = r#"
+struct P { u0: u32, u1: u32, u2: u32, u3: u32, u4: u32, u5: u32, u6: u32, u7: u32, u8: u32, u9: u32, u10: u32, u11: u32, f0: f32, f1: f32, f2: f32, f3: f32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(5) var<storage, read_write> C: array<f32>;
+@group(0) @binding(6) var<storage, read_write> O: array<f32>;
+@group(0) @binding(9) var<storage, read_write> FLAG: array<u32>;
+var<workgroup> lt: array<f32, 8256>;
+var<workgroup> col: array<f32, 128>;
+
+fn li(i: u32, j: u32) -> u32 { return i * (i + 1u) / 2u + j; }
+
+// Factor the bs x bs (bs = min(128, n - k0)) diagonal block of C (n = u0,
+// k0 = u1) in workgroup memory (packed lower triangle): L11 back into C
+// (lower), then L11^-1 in place (dtrtri order, right to left) into O
+// (128 x 128, dense, zero above). A pivot that is not positive sets FLAG.
+@compute @workgroup_size(256)
+fn chol_blk(@builtin(local_invocation_index) t: u32) {
+    let n = p.u0;
+    let k0 = p.u1;
+    let bs = min(128u, n - k0);
+    let tx = t % 16u;
+    let ty = t / 16u;
+    for (var i = ty; i < bs; i = i + 16u) {
+        for (var j = tx; j <= i; j = j + 16u) { lt[li(i, j)] = C[(k0 + i) * n + k0 + j]; }
+    }
+    workgroupBarrier();
+    for (var c = 0u; c < bs; c = c + 1u) {
+        if (t == 0u) {
+            var piv = lt[li(c, c)];
+            if (!(piv > 0.0)) { FLAG[0] = 1u; piv = 1.0; }
+            lt[li(c, c)] = sqrt(piv);
+        }
+        workgroupBarrier();
+        let dc = lt[li(c, c)];
+        for (var i = c + 1u + t; i < bs; i = i + 256u) { lt[li(i, c)] = lt[li(i, c)] / dc; }
+        workgroupBarrier();
+        for (var i = c + 1u + ty; i < bs; i = i + 16u) {
+            let lic = lt[li(i, c)];
+            let base = i * (i + 1u) / 2u;
+            for (var j = c + 1u + tx; j <= i; j = j + 16u) { lt[base + j] = lt[base + j] - lic * lt[li(j, c)]; }
+        }
+        workgroupBarrier();
+    }
+    for (var i = ty; i < bs; i = i + 16u) {
+        for (var j = tx; j <= i; j = j + 16u) { C[(k0 + i) * n + k0 + j] = lt[li(i, j)]; }
+    }
+    // in-place inverse: for j from bs-1 down: X[j][j] = 1/L[j][j],
+    // X[i][j] = -X[j][j] * sum_{q=j+1}^{i} X[i][q] L[q][j]  (i > j)
+    for (var jj = 0u; jj < bs; jj = jj + 1u) {
+        let j = bs - 1u - jj;
+        if (t > j && t < bs) { col[t] = lt[li(t, j)]; }
+        workgroupBarrier();
+        let xjj = 1.0 / lt[li(j, j)];
+        if (t > j && t < bs) {
+            let i = t;
+            let base = i * (i + 1u) / 2u;
+            var acc = 0.0;
+            for (var q = j + 1u; q <= i; q = q + 1u) { acc = acc + lt[base + q] * col[q]; }
+            lt[base + j] = -xjj * acc;
+        }
+        workgroupBarrier();
+        if (t == 0u) { lt[li(j, j)] = xjj; }
+        workgroupBarrier();
+    }
+    for (var e = t; e < 16384u; e = e + 256u) {
+        let i = e / 128u;
+        let j = e % 128u;
+        var v = 0.0;
+        if (i < bs && j <= i) { v = lt[li(i, j)]; }
+        O[e] = v;
+    }
+}
+"#;
+
+fn chol_mod(c: &Ctx) -> Option<&'static Mod> {
+    train_ops::module(c, "nvg_chol", CHOL_SRC, &["chol_blk"])
+}
+
+/// Blocked lower Cholesky of the square `a` in place: 128-wide diagonal
+/// blocks factored (and inverted) in workgroup memory, the panel
+/// `L21 = A21·L11⁻ᵀ` and the trailing update `A22 −= L21·L21ᵀ` (lower tiles
+/// only) through the f32 GEMM. One submission; `Some(false)` when a pivot
+/// failed. The strict upper triangle is left undefined.
+pub fn chol_blocked(a: &DMat) -> Option<bool> {
+    let n = a.r;
+    let cx = dev();
+    let md = chol_mod(cx)?;
+    let flag = DMat::zeros(1, 4);
+    let linv = DMat::zeros(128, 128);
+    let panel = DMat::zeros(n.saturating_sub(128).max(1), 128);
+    let mut ds: Vec<Disp> = Vec::new();
+    let mut k0 = 0;
+    while k0 < n {
+        let bs = 128.min(n - k0);
+        let k1 = k0 + bs;
+        ds.push(Disp {
+            pipe: &md.p["chol_blk"],
+            uni: uni(&[n as u32, k0 as u32], &[]),
+            bufs: vec![(5, &a.buf), (6, &linv.buf), (9, &flag.buf)],
+            grid: (1, 1, 1),
+        });
+        if k1 < n {
+            let rest = n - k1;
+            // panel = A21 · L11⁻ᵀ
+            ds.push(gemm_disp(cx, rest, bs, bs, 1.0, V { m: a, off: k1 * n + k0, ld: n, t: false }, V { m: &linv, off: 0, ld: 128, t: true }, 0.0, &panel, 0, 128, None, false));
+            // A21 ← panel
+            let el = elt(cx)?;
+            ds.push(Disp {
+                pipe: &el.p["scale_rc"],
+                uni: uni(&[rest as u32, bs as u32, 128, 0, n as u32, (k1 * n + k0) as u32, 0], &[1.0, 0.0]),
+                bufs: vec![(1, &panel.buf), (3, dummy(cx)), (4, dummy(cx)), (5, &a.buf)],
+                grid: elt_fold(rest * bs),
+            });
+            // A22 −= panel · panelᵀ (lower tiles)
+            ds.push(gemm_disp(cx, rest, rest, bs, -1.0, V { m: &panel, off: 0, ld: 128, t: false }, V { m: &panel, off: 0, ld: 128, t: true }, 1.0, a, k1 * n + k1, n, None, true));
+        }
+        k0 = k1;
+        if ds.len() >= 256 {
+            train_ops::run(cx, &ds);
+            ds.clear();
+        }
+    }
+    train_ops::run(cx, &ds);
+    Some(flag.to_f32()[0].to_bits() == 0)
+}
+
 /// Lower Cholesky of the square `a` in place (`Some(false)`: a pivot failed).
+/// The blocked GEMM version; `CMF_NVG_CHOL=fold` takes the GPTQ fold's kernels.
 pub fn chol_in_place(a: &DMat) -> Option<bool> {
-    super::gptq_dev::chol_lower(&a.buf, a.r)
+    if std::env::var("CMF_NVG_CHOL").as_deref() == Ok("fold") {
+        return super::gptq_dev::chol_lower(&a.buf, a.r);
+    }
+    chol_blocked(a)
 }
 
 /// `x = L⁻¹` (`l` as [`chol_in_place`] leaves it).
@@ -1030,7 +1201,7 @@ fn knot(c: &Ctx, nq: usize) -> Option<&'static Mod> {
 // across subgroups through one exchange (two barriers per flip instead of
 // the tree's ten). In its own module: subgroup builtins must never reach a
 // device without the feature (naga 30 takes them without an `enable`).
-fn gv_sg_src(nq: usize) -> String {
+fn gv_sg_src(nq: usize, ws: usize) -> String {
     use std::fmt::Write;
     let mut s = String::new();
     s.push_str(
@@ -1080,7 +1251,7 @@ fn gv_block_sg(@builtin(local_invocation_index) t: u32, @builtin(subgroup_invoca
             s.push_str(&f(k));
         }
     };
-    q(&mut s, &|k| format!("    let x{k} = t + {}u;\n    var kd{k} = 0.0;\n    var s{k} = 0.0;\n    var ks{k} = 0.0;\n    var bv{k} = 0.0;\n    if (x{k} < r) {{ kd{k} = B[x{k} * r + x{k}]; }}\n", 256 * k));
+    q(&mut s, &|k| format!("    let x{k} = t + {}u;\n    var kd{k} = 0.0;\n    var s{k} = 0.0;\n    var ks{k} = 0.0;\n    var bv{k} = 0.0;\n    if (x{k} < r) {{ kd{k} = B[x{k} * r + x{k}]; }}\n", ws * k));
     s.push_str("    var flips = 0u;\n    for (var j = b0; j < b1; j = j + 1u) {\n");
     q(&mut s, &|k| format!(
         "        s{k} = 0.0; ks{k} = 0.0; bv{k} = 0.0;\n        if (x{k} < r) {{ s{k} = O[j * r + x{k}]; ks{k} = A[j * r + x{k}]; bv{k} = C[j * r + x{k}]; }}\n"
@@ -1142,7 +1313,8 @@ fn gv_block_sg(@builtin(local_invocation_index) t: u32, @builtin(subgroup_invoca
         "        if (x{k} < r) {{ EG[(j - b0) * r + x{k}] = (bv{k} - gj * ks{k}) / ujj; O[j * r + x{k}] = s{k}; }}\n"
     ));
     s.push_str("        if (t == 0u) { EG[goff + j] = gj; }\n    }\n    if (t == 0u) { atomicAdd(&CNT[0], flips); }\n}\n");
-    s
+    s.replace("@compute @workgroup_size(256)\nfn gv_block_sg", &format!("@compute @workgroup_size({ws})\nfn gv_block_sg"))
+        .replace("let nsg = 256u / ssz;", &format!("let nsg = max({ws}u / ssz, 1u);"))
 }
 
 /// The subgroup search kernel is usable: the device has subgroups of at
@@ -1154,20 +1326,25 @@ fn sg_ok(c: &Ctx) -> bool {
         && c.adapter_info.subgroup_max_size <= 256
 }
 
-fn gv_sg(c: &Ctx, r: usize) -> Option<&'static Mod> {
-    static SRCS: std::sync::Mutex<Vec<(usize, &'static str, &'static str)>> = std::sync::Mutex::new(Vec::new());
-    let nq = r.div_ceil(256).max(1);
-    if nq > 16 {
+/// Threads of the subgroup search workgroup (`CMF_NVG_GV_WS`, default 256).
+fn gv_ws() -> usize {
+    std::env::var("CMF_NVG_GV_WS").ok().and_then(|v| v.parse().ok()).filter(|w| [32usize, 64, 128, 256, 512, 1024].contains(w)).unwrap_or(256)
+}
+
+fn gv_sg(c: &Ctx, r: usize, ws: usize) -> Option<&'static Mod> {
+    static SRCS: std::sync::Mutex<Vec<(usize, usize, &'static str, &'static str)>> = std::sync::Mutex::new(Vec::new());
+    let nq = r.div_ceil(ws).max(1);
+    if nq > 128 {
         return None;
     }
     let (name, src) = {
         let mut g = SRCS.lock().unwrap();
-        match g.iter().find(|e| e.0 == nq) {
-            Some(e) => (e.1, e.2),
+        match g.iter().find(|e| e.0 == nq && e.1 == ws) {
+            Some(e) => (e.2, e.3),
             None => {
-                let name: &'static str = Box::leak(format!("nvg_gv_sg{nq}").into_boxed_str());
-                let src: &'static str = Box::leak(gv_sg_src(nq).into_boxed_str());
-                g.push((nq, name, src));
+                let name: &'static str = Box::leak(format!("nvg_gv_sg{nq}w{ws}").into_boxed_str());
+                let src: &'static str = Box::leak(gv_sg_src(nq, ws).into_boxed_str());
+                g.push((nq, ws, name, src));
                 (name, src)
             }
         }
@@ -1390,9 +1567,14 @@ pub fn flipu(sut: &DMat, qst: &DMat, whbt: &DMat, q: &DMat, h: &DMat, l: &DMat, 
 /// `cnt` accumulates the flips.
 #[allow(clippy::too_many_arguments)]
 pub fn gv_block(bv: &DMat, s: &DMat, ks0: &DMat, k: &DMat, uc: &DMat, eg: &DMat, cnt: &DMat, b0: usize, b1: usize, max_flips: usize, tol: f32) {
+    gv_block_ws(bv, s, ks0, k, uc, eg, cnt, b0, b1, max_flips, tol, gv_ws())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gv_block_ws(bv: &DMat, s: &DMat, ks0: &DMat, k: &DMat, uc: &DMat, eg: &DMat, cnt: &DMat, b0: usize, b1: usize, max_flips: usize, tol: f32, ws: usize) {
     let (n, r) = (bv.r, bv.c);
     let cx = dev();
-    let md = if sg_ok(cx) { gv_sg(cx, r) } else { None }.or_else(|| knot(cx, r.div_ceil(256))).expect("nvg knot pipelines");
+    let md = if sg_ok(cx) { gv_sg(cx, r, ws) } else { None }.or_else(|| knot(cx, r.div_ceil(256))).expect("nvg knot pipelines");
     let dp = Disp {
         pipe: md.p.get("gv_block_sg").unwrap_or_else(|| &md.p["gv_block"]),
         uni: uni(&[n as u32, r as u32, b0 as u32, b1 as u32, max_flips as u32], &[tol]),
@@ -2117,6 +2299,64 @@ mod tests {
                 assert!((d - if j == jj { 1.0 } else { 0.0 }).abs() < 1e-3, "orthogonality {j},{jj}: {d}");
             }
         }
+    }
+
+    /// Time per flip of the input-side search kernel by workgroup size
+    /// (`--ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn gv_block_flip_rate() {
+        if !available() {
+            return;
+        }
+        for &(n, r, m) in &[(1024usize, 1064usize, 2048usize), (512, 2152, 4096)] {
+            let mm = DMat::from_f64(m, r, &rnd(m * r, 5));
+            let k = mm_(&mm);
+            let w = DMat::from_f64(m, n, &rnd(m * n, 6));
+            let bv0 = mm_t(&w, &mm);
+            let s0 = DMat::from_f64(n, r, &rnd(n * r, 7).iter().map(|v| if *v >= 0.0 { 1.0 } else { -1.0 }).collect::<Vec<_>>());
+            let ks0 = mm_ab(&s0, &k);
+            let mut ucv = vec![0f64; n * n];
+            for i in 0..n {
+                ucv[i * n + i] = 1.0;
+                for j in i + 1..n.min(i + 8) {
+                    ucv[i * n + j] = 0.05;
+                }
+            }
+            let uc = DMat::from_f64(n, n, &ucv);
+            for &ws in &[256usize, 512, 1024] {
+                let bv = bv0.dup();
+                let s = s0.dup();
+                let eg = DMat::zeros(1, 128 * r + n);
+                let cnt = DMat::zeros(1, 4);
+                gv_block_ws(&bv, &s, &ks0, &k, &uc, &eg, &cnt, 0, 1, 4 * r, 1e-6, ws); // compile
+                sync();
+                let cnt = DMat::zeros(1, 4);
+                let bv = bv0.dup();
+                let s = s0.dup();
+                let t = std::time::Instant::now();
+                let mut b0 = 0;
+                while b0 < n {
+                    let b1 = (b0 + 128).min(n);
+                    gv_block_ws(&bv, &s, &ks0, &k, &uc, &eg, &cnt, b0, b1, 4 * r, 1e-6, ws);
+                    b0 = b1;
+                }
+                sync();
+                let el = t.elapsed().as_secs_f64();
+                let f = cnt.to_f32()[0].to_bits() as f64;
+                eprintln!("gv n {n} r {r} ws {ws}: {:.3} s, {f} flips, {:.2} us/flip", el, el / f.max(1.0) * 1e6);
+            }
+        }
+    }
+
+    fn mm_(a: &DMat) -> DMat {
+        mm(a, true, a, false)
+    }
+    fn mm_t(w: &DMat, m: &DMat) -> DMat {
+        mm(w, true, m, false)
+    }
+    fn mm_ab(a: &DMat, b: &DMat) -> DMat {
+        mm(a, false, b, false)
     }
 
     /// Dense SPD solve (equilibrated device Cholesky + triangular solves)

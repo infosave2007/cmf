@@ -29,6 +29,9 @@ pub struct BenchOpts<'a> {
     pub threads: usize,
     pub rho: f64,
     pub gram_cache: Option<&'a str>,
+    /// Encode every body linear of this layer (device: `jobs` in flight)
+    pub layer: Option<usize>,
+    pub jobs: usize,
 }
 
 const MAGIC: u32 = 0x4E56_4747; // "NVGG"
@@ -71,6 +74,25 @@ fn load_gram(path: &str) -> anyhow::Result<(Mat, usize)> {
 fn capture(model: &Arc<CmfModel>, o: &BenchOpts, l: usize, lead: &str) -> anyhow::Result<(Mat, Mat)> {
     let calib = o.calib.ok_or_else(|| anyhow::anyhow!("no --gram-cache file yet: --calib FILE is needed"))?;
     let text = std::fs::read_to_string(calib)?;
+    // NVG_BENCH_TRUNC=<path>: capture from a copy cut after layer l, the
+    // converter's calibration work file (a check of the cut).
+    let cut;
+    let model = match std::env::var("NVG_BENCH_TRUNC") {
+        Ok(path) => {
+            let th = nvg::truncated_header(&model.header, l).ok_or_else(|| anyhow::anyhow!("architecture not cut"))?;
+            let specs: Vec<cortiq_core::format::TensorSpec> = model
+                .tensors
+                .iter()
+                .filter(|e| nvg::keep_in_truncated(&e.name, l))
+                .map(|e| cortiq_core::format::TensorSpec { name: e.name.clone(), dtype: e.dtype, shape: e.shape.clone(), data: model.entry_bytes(e).to_vec() })
+                .collect();
+            CmfModel::write(&path, &th, &specs, None, model.vocab.as_deref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+            cut = Arc::new(CmfModel::open(&path)?);
+            eprintln!("nvg-bench: capturing from {path} ({} layers)", th.arch.num_layers);
+            &cut
+        }
+        Err(_) => model,
+    };
     let mut pipe = cortiq_engine::Pipeline::from_model(model, cortiq_engine::SamplerConfig::default())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     pipe.set_confidence(false);
@@ -122,6 +144,9 @@ pub fn run(o: &BenchOpts) -> anyhow::Result<()> {
     }
     cortiq_engine::gptq_capture::set_device(gpu_calib);
     let model = Arc::new(CmfModel::open_sharded(o.model)?);
+    if let (None, Some(l)) = (o.tensor, o.layer) {
+        return run_layer(&model, o, l);
+    }
     let Some(tname) = o.tensor else {
         for e in &model.tensors {
             if nvg::body_linear(&e.name).is_some() {
@@ -187,6 +212,140 @@ pub fn run(o: &BenchOpts) -> anyhow::Result<()> {
             None => println!("[{dev}] {tname}: blr refused"),
         }
         println!("[{dev}] profile: {}", prof.line());
+    }
+    Ok(())
+}
+
+/// `--layer L`: every body linear of layer L, the input contexts once per
+/// input, the tensors with `--jobs` in flight on the device.
+fn run_layer(model: &Arc<CmfModel>, o: &BenchOpts, l: usize) -> anyhow::Result<()> {
+    let mine: Vec<(usize, &'static str)> = model
+        .tensors
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, e)| nvg::body_linear(&e.name).filter(|(ll, _)| *ll == l).map(|(_, short)| (slot, short)))
+        .collect();
+    anyhow::ensure!(!mine.is_empty(), "layer {l}: no encoder body linears");
+    let mut leads: Vec<&'static str> = Vec::new();
+    for &(_, short) in &mine {
+        let lead = nvg::input_lead(short);
+        if !leads.contains(&lead) {
+            leads.push(lead);
+        }
+    }
+    let path = |lead: &str, kind: &str| o.gram_cache.map(|p| format!("{p}.{lead}.{kind}.gram"));
+    let mut grams: std::collections::HashMap<&str, (Mat, Mat)> = std::collections::HashMap::new();
+    let missing: Vec<&str> = leads
+        .iter()
+        .copied()
+        .filter(|lead| path(lead, "fit").is_none_or(|p| !std::path::Path::new(&p).exists()))
+        .collect();
+    for &lead in &leads {
+        if !missing.contains(&lead) {
+            let (a, _) = load_gram(&path(lead, "fit").unwrap())?;
+            let (b, _) = load_gram(&path(lead, "sel").unwrap())?;
+            grams.insert(lead, (a, b));
+        }
+    }
+    if !missing.is_empty() {
+        let calib = o.calib.ok_or_else(|| anyhow::anyhow!("--calib FILE is needed to capture the Grams"))?;
+        let text = std::fs::read_to_string(calib)?;
+        let mut pipe = cortiq_engine::Pipeline::from_model(model, cortiq_engine::SamplerConfig::default())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        pipe.set_confidence(false);
+        let ids = pipe.tokenizer.encode(&text);
+        let need = o.fit_tokens + o.sel_tokens;
+        anyhow::ensure!(ids.len() >= need, "calibration text has {} tokens, need {need}", ids.len());
+        let names: std::collections::HashSet<String> = missing.iter().map(|lead| nvg::lead_name(l, lead)).collect();
+        let mut caps = Vec::new();
+        for (a, b) in [(0, o.fit_tokens), (o.fit_tokens, need)] {
+            let keep = names.clone();
+            cortiq_engine::gptq_capture::begin_filtered(true, move |n| keep.contains(n));
+            let t = Instant::now();
+            for w in ids[a..b].chunks(512).filter(|c| c.len() >= 2) {
+                pipe.calib_forward(w, l + 1, 512).map_err(|e| anyhow::anyhow!(e))?;
+            }
+            caps.push(cortiq_engine::gptq_capture::end());
+            eprintln!("nvg-bench: layer {l} capture of {} inputs over {} tokens in {:.1}s", names.len(), b - a, t.elapsed().as_secs_f64());
+        }
+        for &lead in &missing {
+            let nm = nvg::lead_name(l, lead);
+            let fit = caps[0].get(&nm).ok_or_else(|| anyhow::anyhow!("no capture for {nm}"))?;
+            let sel = caps[1].get(&nm).ok_or_else(|| anyhow::anyhow!("no capture for {nm}"))?;
+            let (a, b) = (nvg::mean_gram(fit), nvg::mean_gram(sel));
+            if let (Some(pf), Some(ps)) = (path(lead, "fit"), path(lead, "sel")) {
+                save_gram(&pf, &a, fit.count)?;
+                save_gram(&ps, &b, sel.count)?;
+            }
+            grams.insert(lead, (a, b));
+        }
+    }
+    let gqa = model.arch().num_kv_heads < model.arch().num_attention_heads;
+    let mult_of = |short: &str| if gqa && (short == "k" || short == "v") { o.kv_factor } else { 1.0 };
+    anyhow::ensure!(o.device == "gpu" || o.device == "both", "--layer runs the device encoder (--device gpu|both)");
+    let sel_of = |line: &str| -> Option<f64> { line.rsplit("sel ").next()?.trim().parse().ok() };
+    let mut gpu_sel: Vec<Option<f64>> = vec![None; mine.len()];
+    #[cfg(feature = "gpu")]
+    {
+        let t0 = Instant::now();
+        let th = Instant::now();
+        let mut hctx = std::collections::HashMap::new();
+        for &lead in &leads {
+            let (a, b) = &grams[lead];
+            hctx.insert(lead, crate::nvg_gpu::HCtxD::new(a, b, o.rho)?);
+        }
+        cortiq_engine::gpu_wgpu::nvg_dev::sync();
+        let thc = th.elapsed().as_secs_f64();
+        let mut jobs = Vec::new();
+        for &(slot, short) in &mine {
+            jobs.push(crate::nvg_gpu::Job { w: nvg::load_f64(model, slot)?, hc: &hctx[nvg::input_lead(short)], mult: mult_of(short) });
+        }
+        let te = Instant::now();
+        let done = crate::nvg_gpu::encode_many(&jobs, o.bpw, o.paths, o.threads, o.jobs, true, &|i, d| {
+            let name = &model.tensors[mine[i].0].name;
+            match &d.enc {
+                Ok(Some(e)) => println!("[gpu] {name} {}x{} {} ({:.1}s)", jobs[i].w.r, jobs[i].w.c, e.line, d.secs),
+                Ok(None) => println!("[gpu] {name}: blr refused"),
+                Err(e) => println!("[gpu] {name}: error {e}"),
+            }
+            if let Some(p) = &d.prof {
+                println!("[gpu] {name} profile: {p}");
+            }
+        });
+        let tenc = te.elapsed().as_secs_f64();
+        for (k, d) in done.iter().enumerate() {
+            if let Ok(Some(e)) = &d.enc {
+                gpu_sel[k] = sel_of(&e.line);
+            }
+        }
+        let sum: f64 = done.iter().map(|d| d.secs).sum();
+        println!(
+            "[gpu] layer {l}: {} tensors, input contexts {thc:.1}s, encode {tenc:.1}s wall ({sum:.1}s summed over tensors, jobs {}), total {:.1}s",
+            jobs.len(),
+            o.jobs,
+            t0.elapsed().as_secs_f64()
+        );
+    }
+    if o.device == "both" {
+        // the f64 host encoder on the same Grams, tensor by tensor
+        let pool = Pool::new(o.threads.saturating_sub(1).max(1));
+        let mut hc = std::collections::HashMap::new();
+        for &lead in &leads {
+            hc.insert(lead, HCtx::new(Some(&pool), &grams[lead].0, o.rho)?);
+        }
+        for (k, &(slot, short)) in mine.iter().enumerate() {
+            let w = nvg::load_f64(model, slot)?;
+            let (hfit, hsel) = &grams[nvg::input_lead(short)];
+            let t = Instant::now();
+            let enc = nvg::encode_nvg(Some(&pool), &w, &hc[nvg::input_lead(short)], hfit, hsel, o.bpw, mult_of(short), o.paths, None);
+            let name = &model.tensors[slot].name;
+            if let Some(e) = &enc {
+                println!("[cpu] {name} {}x{} {} ({:.1}s)", w.r, w.c, e.line, t.elapsed().as_secs_f64());
+                if let (Some(c), Some(g)) = (sel_of(&e.line), gpu_sel[k]) {
+                    println!("[cmp] {name} sel cpu {c:.4} gpu {g:.4} rel {:+.3}%", (g - c) / c * 100.0);
+                }
+            }
+        }
     }
     Ok(())
 }
