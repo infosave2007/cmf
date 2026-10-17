@@ -760,9 +760,10 @@ enum Commands {
         /// q4tp: calibration window length (each window a fresh context)
         #[arg(long, default_value = "2048")]
         window: usize,
-        /// q4tp: per-tensor override for the tensors GPTQ does not touch,
-        /// PATTERN=QUANT as in `convert --tensor-quant` (e.g.
-        /// `lm_head.weight=q8_2f`)
+        /// q4tp: per-tensor override, PATTERN=QUANT as in `convert
+        /// --tensor-quant` (e.g. `lm_head.weight=q8_2f`); an overridden linear
+        /// skips GPTQ and takes the override (escort lists from
+        /// tools/quant/escort.py)
         #[arg(long = "tensor-quant", value_name = "PATTERN=QUANT")]
         tensor_quant: Vec<String>,
         /// q4tp: worker threads (default: all cores)
