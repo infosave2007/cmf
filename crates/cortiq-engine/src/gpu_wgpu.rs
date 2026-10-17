@@ -41,6 +41,8 @@ pub(crate) mod dense_batch;
 pub(crate) mod gemma_batch;
 /// Warp-per-row q4tp decode matvecs (bit-identical to the 16nl rows).
 pub(crate) mod dense_mv;
+/// Subgroup q1g decode matvec (bit-identical to `q1g_matvec`, no barriers).
+pub(crate) mod q1g_mv;
 
 /// Workgroup limit per dimension (WebGPU minimum; lm_head has more
 /// rows — we use grid-stride in the shader).
@@ -3682,6 +3684,79 @@ fn q1_matvec(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// q1g: the same signs as PLANES — u32 words [rows·gpr] (word r·gpr+t = tile
+// t's 32 bits) then f16 scales [rows·gpr/4], one per 128-group, starting at
+// word q1p._p0 (the third param word, which q1_matvec leaves unused; the
+// batch kernels of this module read it as their batch count instead).
+// The workgroup/lane walk, the staging, the per-lane
+// `acc + s·Σ(tile0) + s·Σ(tile1)` and the reduction are q1_matvec's: a lane
+// still owns a 64-col tile pair (half a 128-group), only its words come from
+// the plane and its scale from the scale plane (fetched ahead of the
+// staging barrier) — so a q1g repack of a uniform-scale q1 tensor gives
+// q1_matvec's output bit for bit, while streaming 4.5 bytes per 32 weights
+// instead of 6.
+@compute @workgroup_size(Q1_WG)
+fn q1g_matvec(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(num_workgroups) nwg: vec3<u32>,
+              @builtin(local_invocation_index) lid: u32) {
+    let cols = q1p.np * 64u;
+    let gpr = q1p.np * 2u;
+    let r = lid / 16u;
+    let lane = lid % 16u;
+    var row0 = wid.x * Q1_ROWS;
+    loop {
+        if (row0 >= q1p.rows) { break; }
+        let row = row0 + r;
+        var acc = 0.0;
+        var ti = 0u;
+        loop {
+            if (ti >= q1p.np) { break; }
+            // This lane's two sign words and its group scale are fetched
+            // BEFORE the activation staging and its barrier: the scale
+            // lives in a second plane, and issuing both streams early lets
+            // their latency hide behind the staging (same values, same sums).
+            let pi = ti + lane;
+            let live = row < q1p.rows && pi < q1p.np;
+            var b0 = 0u; var b1 = 0u; var s = 0.0;
+            if (live) {
+                let base = row * gpr + pi * 2u;
+                b0 = q1w[base]; b1 = q1w[base + 1u];
+                let g = row * (gpr >> 2u) + (pi >> 1u);
+                let sw = unpack2x16float(q1w[q1p._p0 + (g >> 1u)]);
+                s = select(sw.x, sw.y, (g & 1u) == 1u);
+            }
+            let c0 = ti * 64u;
+            var k = lid;
+            loop {
+                if (k >= 1024u) { break; }
+                let c = c0 + k;
+                q1xs[(k >> 5u) * 33u + (k & 31u)] = select(0.0, q1x[c], c < cols);
+                k = k + Q1_WG;
+            }
+            workgroupBarrier();
+            if (live) {
+                let xb = lane * 64u;
+                acc = acc + s * q1_tile_sum(b0, xb) + s * q1_tile_sum(b1, xb + 32u);
+            }
+            workgroupBarrier();
+            ti = ti + 16u;
+        }
+        partial_q1[lid] = acc;
+        workgroupBarrier();
+        if (lane < 8u) { partial_q1[lid] = partial_q1[lid] + partial_q1[lid + 8u]; }
+        workgroupBarrier();
+        if (lane < 4u) { partial_q1[lid] = partial_q1[lid] + partial_q1[lid + 4u]; }
+        workgroupBarrier();
+        if (lane < 2u) { partial_q1[lid] = partial_q1[lid] + partial_q1[lid + 2u]; }
+        workgroupBarrier();
+        if (lane < 1u) { partial_q1[lid] = partial_q1[lid] + partial_q1[lid + 1u]; }
+        workgroupBarrier();
+        if (lane == 0u && row < q1p.rows) { q1y[row] = partial_q1[lid]; }
+        workgroupBarrier();
+        row0 = row0 + nwg.x * Q1_ROWS;
+    }
+}
+
 // Tiled GEMM for wide prefill batches (the WGSL cousin of Metal's
 // q8_mul_mm; WGSL has no subgroup matrices, so this is the classic
 // register-blocked form): a 64(b)×64(rows) C-tile per 16×16 workgroup,
@@ -3856,6 +3931,94 @@ fn q1_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
             var wv = vec4<f32>(0.0);
             if (n0 + n < pm.rows && (k0 / 4u) + k4 < pm.cols4) {
                 wv = q1_w4(n0 + n, k0 + k4 * 4u, np);
+            }
+            let dst = n * 16u + k4 * 4u;
+            mm_wt[dst] = wv.x; mm_wt[dst + 1u] = wv.y; mm_wt[dst + 2u] = wv.z; mm_wt[dst + 3u] = wv.w;
+        }
+        workgroupBarrier();
+        let ab = lid.y * 64u;
+        let wb = lid.x * 64u;
+        for (var k = 0u; k < 16u; k = k + 1u) {
+            let x0 = mm_at[ab + k];
+            let x1 = mm_at[ab + 16u + k];
+            let x2 = mm_at[ab + 32u + k];
+            let x3 = mm_at[ab + 48u + k];
+            let y0 = mm_wt[wb + k];
+            let y1 = mm_wt[wb + 16u + k];
+            let y2 = mm_wt[wb + 32u + k];
+            let y3 = mm_wt[wb + 48u + k];
+            a00 = a00 + x0 * y0; a01 = a01 + x0 * y1;
+            a02 = a02 + x0 * y2; a03 = a03 + x0 * y3;
+            a10 = a10 + x1 * y0; a11 = a11 + x1 * y1;
+            a12 = a12 + x1 * y2; a13 = a13 + x1 * y3;
+            a20 = a20 + x2 * y0; a21 = a21 + x2 * y1;
+            a22 = a22 + x2 * y2; a23 = a23 + x2 * y3;
+            a30 = a30 + x3 * y0; a31 = a31 + x3 * y1;
+            a32 = a32 + x3 * y2; a33 = a33 + x3 * y3;
+        }
+        workgroupBarrier();
+        k0 = k0 + 16u;
+    }
+    let mb = m0 + lid.y * 4u;
+    let nb2 = n0 + lid.x * 4u;
+    q1m_store4(mb, nb2, a00, a01, a02, a03);
+    q1m_store4(mb + 1u, nb2, a10, a11, a12, a13);
+    q1m_store4(mb + 2u, nb2, a20, a21, a22, a23);
+    q1m_store4(mb + 3u, nb2, a30, a31, a32, a33);
+}
+
+// q1g twin of q1_w4: tile t = k/32 is word n·gpr+t of the sign plane, the
+// 128-group's f16 scale sits in the plane starting at word pm._pad (the
+// MMParams spare word, unused by every other GEMM here). Same ±scale
+// values as q1_w4 on a uniform-scale repack, so q1g_mul_mm == q1_mul_mm.
+fn q1g_w4(n: u32, k: u32, gpr: u32) -> vec4<f32> {
+    let t = k / 32u;
+    let bits = qm[n * gpr + t];
+    let g = n * (gpr >> 2u) + (t >> 2u);
+    let sw = unpack2x16float(qm[pm._pad + (g >> 1u)]);
+    let scale = select(sw.x, sw.y, (g & 1u) == 1u);
+    let bo = k & 31u;
+    let m = vec4<u32>(
+        (((bits >> bo)        & 1u) ^ 1u) << 31u,
+        (((bits >> (bo + 1u)) & 1u) ^ 1u) << 31u,
+        (((bits >> (bo + 2u)) & 1u) ^ 1u) << 31u,
+        (((bits >> (bo + 3u)) & 1u) ^ 1u) << 31u);
+    let sv = vec4<f32>(scale, scale, scale, scale);
+    return bitcast<vec4<f32>>(bitcast<vec4<u32>>(sv) ^ m);
+}
+
+@compute @workgroup_size(16, 16)
+fn q1g_mul_mm(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_id) lid: vec3<u32>) {
+    let cols = pm.cols4 * 4u;
+    let gpr = pm.cols4 / 8u;
+    let m0 = wid.y * 64u;
+    let n0 = wid.x * 64u;
+    let tid = lid.y * 16u + lid.x;
+    var a00 = 0.0; var a01 = 0.0; var a02 = 0.0; var a03 = 0.0;
+    var a10 = 0.0; var a11 = 0.0; var a12 = 0.0; var a13 = 0.0;
+    var a20 = 0.0; var a21 = 0.0; var a22 = 0.0; var a23 = 0.0;
+    var a30 = 0.0; var a31 = 0.0; var a32 = 0.0; var a33 = 0.0;
+    var k0 = 0u;
+    loop {
+        if (k0 >= cols) { break; }
+        for (var t = tid; t < 64u * 4u; t = t + 256u) {
+            let m = t / 4u;
+            let k4 = t % 4u;
+            var xv = vec4<f32>(0.0);
+            if (m0 + m < pm.nb && (k0 / 4u) + k4 < pm.cols4) {
+                let xi = (m0 + m) * cols + k0 + k4 * 4u;
+                xv = vec4<f32>(xsm[xi], xsm[xi + 1u], xsm[xi + 2u], xsm[xi + 3u]);
+            }
+            let dst = m * 16u + k4 * 4u;
+            mm_at[dst] = xv.x; mm_at[dst + 1u] = xv.y; mm_at[dst + 2u] = xv.z; mm_at[dst + 3u] = xv.w;
+        }
+        for (var t = tid; t < 64u * 4u; t = t + 256u) {
+            let n = t / 4u;
+            let k4 = t % 4u;
+            var wv = vec4<f32>(0.0);
+            if (n0 + n < pm.rows && (k0 / 4u) + k4 < pm.cols4) {
+                wv = q1g_w4(n0 + n, k0 + k4 * 4u, gpr);
             }
             let dst = n * 16u + k4 * 4u;
             mm_wt[dst] = wv.x; mm_wt[dst + 1u] = wv.y; mm_wt[dst + 2u] = wv.z; mm_wt[dst + 3u] = wv.w;
@@ -18667,6 +18830,10 @@ struct Ctx {
     q1: wgpu::ComputePipeline,
     /// Rows handled by this adapter's specialized q1 workgroup.
     q1_rows: u32,
+    /// q1g twins (sign + scale planes) of `q1` / `q1_mm`; `q1g` takes the
+    /// same workgroup shape (`q1_rows`).
+    q1g: wgpu::ComputePipeline,
+    q1g_mm: wgpu::ComputePipeline,
     q1t: wgpu::ComputePipeline,
     q4b: wgpu::ComputePipeline,
     q4t_mv: wgpu::ComputePipeline,
@@ -19000,6 +19167,8 @@ struct Ctx {
     g4_sandwich_pipe: std::sync::OnceLock<Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>>,
     /// Warp-per-row q4tp decode matvecs (`dense_mv`).
     dense_mv_pipes: std::sync::OnceLock<Option<dense_mv::MvSg>>,
+    /// Subgroup q1g decode matvec (`q1g_mv`).
+    q1g_sg_pipes: std::sync::OnceLock<Option<q1g_mv::Q1gSg>>,
     /// Subgroup-tree GDN step twins (`dense_mv::gdn`).
     gdn_sg_pipes: std::sync::OnceLock<Option<dense_mv::GdnSg>>,
     moe_down_q4tp_b2: wgpu::ComputePipeline,
@@ -19020,6 +19189,8 @@ struct Ctx {
     layout_gate_mul: wgpu::BindGroupLayout,
     layout_zero: wgpu::BindGroupLayout,
     layout_q1: wgpu::BindGroupLayout,
+    layout_q1g: wgpu::BindGroupLayout,
+    layout_q1gmm: wgpu::BindGroupLayout,
     layout_rmsnorm: wgpu::BindGroupLayout,
     layout_add_rmsnorm: wgpu::BindGroupLayout,
     layout_rmsnorm_b: wgpu::BindGroupLayout,
@@ -20602,6 +20773,18 @@ fn init(dev: usize) -> Result<Ctx, String> {
         },
         cache: pcache.as_ref(),
     });
+    let q1g = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("q1g_matvec"),
+        layout: None,
+        module: &module,
+        entry_point: Some("q1g_matvec"),
+        compilation_options: wgpu::PipelineCompilationOptions {
+            constants: &q1_constants,
+            ..Default::default()
+        },
+        cache: pcache.as_ref(),
+    });
+    let q1g_mm = pipe("q1g_mul_mm");
     let q1t = pipe("q1t_matvec");
     let q4b = pipe("q4b_matvec");
     let q4t_mv = pipe("q4t_matvec");
@@ -21214,6 +21397,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let layout_moe_dn_q4tp = moe_down_q4tp.get_bind_group_layout(0);
     let layout = matvec.get_bind_group_layout(0);
     let layout_q1 = q1.get_bind_group_layout(0);
+    let layout_q1g = q1g.get_bind_group_layout(0);
+    let layout_q1gmm = q1g_mm.get_bind_group_layout(0);
     let layout_rmsnorm = rmsnorm.get_bind_group_layout(0);
     let layout_add_rmsnorm = add_rmsnorm.get_bind_group_layout(0);
     let layout_rmsnorm_b = rmsnorm_b.get_bind_group_layout(0);
@@ -21486,6 +21671,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
         zero,
         q1,
         q1_rows,
+        q1g,
+        q1g_mm,
         q1t,
         q4b,
         q4t_mv,
@@ -21700,6 +21887,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         g4_dec_pipe: std::sync::OnceLock::new(),
         g4_sandwich_pipe: std::sync::OnceLock::new(),
         dense_mv_pipes: std::sync::OnceLock::new(),
+        q1g_sg_pipes: std::sync::OnceLock::new(),
         gdn_sg_pipes: std::sync::OnceLock::new(),
         moe_down_q4tp_b2,
         moe_down_q4tp_part,
@@ -21719,6 +21907,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
         layout_gate_mul,
         layout_zero,
         layout_q1,
+        layout_q1g,
+        layout_q1gmm,
         layout_rmsnorm,
         layout_add_rmsnorm,
         layout_rmsnorm_b,
@@ -25122,6 +25312,48 @@ pub fn q1_matvec(
     )
 }
 
+/// q1g matvec: raw f32 activations, sign + scale planes. The whole tensor
+/// is resident (its scale plane sits behind ALL rows, so a row prefix is
+/// not a valid q1g payload — `rows` must be the tensor's). false = CPU.
+pub fn q1g_matvec(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
+    if rows == 0 || cols % 128 != 0 || xs.len() < cols || out.len() < rows {
+        return false;
+    }
+    let entry = &model.tensors[idx];
+    if entry.shape.first().copied() != Some(rows) || entry.shape.get(1).copied() != Some(cols) {
+        return false;
+    }
+    let Some(abs) = model.entry_abs_offset(entry) else {
+        return false;
+    };
+    let bytes = model.primary_bytes();
+    let plen = rows * cols / 8 + rows * cols / 64;
+    if abs + plen > bytes.len() {
+        return false;
+    }
+    dispatch_q1g(
+        c,
+        {
+            note_layer((model.uid() as usize, idx), &model.tensors[idx].name);
+            Some((model.uid() as usize, idx))
+        },
+        &bytes[abs..abs + plen],
+        xs,
+        rows,
+        cols,
+        out,
+    )
+}
+
 /// GPU RMSNorm of one row — the token-graph building block that keeps the
 /// hidden state resident across the norm→matvec boundary. One workgroup,
 /// direct buffers (no residency cache). Returns false without a GPU context.
@@ -26155,7 +26387,7 @@ pub fn forward_token_graph(
                     affine: gw.affine,
                 })
             }
-            2 | 3 | 5 | 6 | 7 | 9 => {
+            2 | 3 | 5 | 6 | 7 | 9 | 10 => {
                 // The int8 body must end on a word, because the per-ROW f16
                 // plane right after it is still word-indexed (`rs0`). Rows
                 // are byte-addressed, so an odd `cols` is fine — an odd
@@ -26167,10 +26399,10 @@ pub fn forward_token_graph(
                 if gw.kind == 7 && (rows * cols) % 4 != 0 {
                     return None;
                 }
-                // q4_block / q1t / q4_tiled / q4tp / q8_2f: the tensor
-                // carries its own byte length (tiles, q1t's sparse
-                // overlay, q8_2f's two scale planes) — fetch whole,
-                // device-local.
+                // q4_block / q1t / q4_tiled / q4tp / q8_2f / q1g: the
+                // tensor carries its own byte length (tiles, q1t's sparse
+                // overlay, q8_2f's two scale planes, q1g's scale plane) —
+                // fetch whole, device-local.
                 let entry = model.tensors.get(gw.idx)?;
                 if *entry.shape.first()? != rows || *entry.shape.get(1)? != cols {
                     // A silent refusal here is what made this model look
@@ -27494,6 +27726,7 @@ pub fn forward_token_graph(
         match m.kind {
             0 => encode_matvec(c, enc, &m.buf, xs, m.rs.as_ref().unwrap(), y, rows, cols),
             1 => encode_matvec_q1(c, enc, &m.buf, xs, y, rows, cols),
+            10 => encode_matvec_q1g(c, enc, &m.buf, xs, y, rows, cols),
             2 => encode_q1t_like(c, enc, &c.q4b, &m.buf, xs, y, rows, cols),
             3 => encode_q1t_like(c, enc, &c.q1t, &m.buf, xs, y, rows, cols),
             5 => {
@@ -27640,6 +27873,7 @@ pub fn forward_token_graph(
                 });
                 Some((&c.q1, bind, (rows as u32).div_ceil(c.q1_rows).min(MAX_WG)))
             }
+            10 => Some(prep_matvec_q1g(c, &m.buf, xs, y, rows, cols)),
             4 => {
                 let p_buf = uniform_u32x4(c, [cols as u32, rows as u32, 0, 0]);
                 let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -30714,6 +30948,10 @@ pub fn forward_token_graph(
         };
         if lrows < ltotal && lm.kind == 6 && hidden % 32 == 0 && hidden / 32 > 64 {
             encode_q4tp_mv16w_shortlist(c, &mut enc, &lm.buf, &lm_in, &lbuf, lrows, hidden, ltotal);
+        } else if lm.kind == 10 {
+            // q1g's scale plane follows ALL rows: a shortlisted head still
+            // locates it from the tensor's own row count.
+            encode_matvec_q1g_rows(c, &mut enc, &lm.buf, &lm_in, &lbuf, lrows, ltotal, hidden);
         } else if lm.kind == 7
             && lrows == ltotal
             && c.use_q82_mv4
@@ -31329,7 +31567,8 @@ pub fn forward_batch_graph_at(
             // Leaving these out is what kept every q4t/q4tp model off the
             // batched path — including its GDN projections, which is where
             // the refusal actually landed.
-            k @ (5 | 6 | 9) => {
+            // q1g (10) is a whole-tensor buffer too (signs, then scales).
+            k @ (5 | 6 | 9 | 10) => {
                 let (b, r, cc) = tile_weight(c, model, gw.idx)?;
                 if r != rows || cc != cols {
                     return None;
@@ -31350,8 +31589,9 @@ pub fn forward_batch_graph_at(
     // is what kept every q4tp model off the batched path.
     // 9 (the 2-bit plane) has the tile GEMM `q2tp_mm`; without it a q2tp
     // file's speculative verify declined every round and spun.
+    // 10 (q1g) has `q1g_mul_mm`, q1's GEMM on the plane layout.
     let gemmable =
-        |m: &GMat| matches!(m.kind, 0 | 1 | 5 | 6 | 9) || (m.kind == 7 && c.graph_x.is_some());
+        |m: &GMat| matches!(m.kind, 0 | 1 | 5 | 6 | 9 | 10) || (m.kind == 7 && c.graph_x.is_some());
     let t_resolve = std::time::Instant::now();
     let mut lws = Vec::with_capacity(layers.len());
     let mut gdn_dims: Option<(usize, usize, usize, usize, usize, usize)> = None;
@@ -32181,6 +32421,7 @@ pub fn forward_batch_graph_at(
                  cols: usize| {
         match m.kind {
             0 => encode_q8_mm(c, enc, &m.buf, m.rs.as_ref().unwrap(), xs, y, rows, cols, k),
+            10 => encode_q1g_mm(c, enc, &m.buf, xs, y, rows, cols, k),
             5 => encode_q4_tile_mm(c, enc, &c.q4t_mm, &m.buf, xs, y, rows, cols, k),
             // Gemma-4's prompt chunks: the register-blocked int8 GEMM (each
             // weight word read once per 64 batch rows, exact f32 sums in
@@ -32397,6 +32638,7 @@ pub fn forward_batch_graph_at(
         match m.kind {
             0 => encode_matvec(c, enc, &m.buf, xs, m.rs.as_ref().unwrap(), y, rows, cols),
             1 => encode_matvec_q1(c, enc, &m.buf, xs, y, rows, cols),
+            10 => encode_matvec_q1g(c, enc, &m.buf, xs, y, rows, cols),
             5 => {
                 if c.use_mv4 {
                     let gpr = cols / 32;
@@ -36677,6 +36919,64 @@ fn dispatch_q1(
     ok
 }
 
+/// q1g kernel body (weight_key = None — no residency cache; test path).
+/// `payload` is the WHOLE q1g tensor: both planes.
+fn dispatch_q1g(
+    c: &Ctx,
+    weight_key: Option<(usize, usize)>,
+    payload: &[u8],
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    let q_buf = match weight_key {
+        Some(k) => match weight_buffer(c, k, payload) {
+            Some(b) => b,
+            None => return false, // over VRAM budget — honest CPU path
+        },
+        None => c
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("q1g-weights"),
+                contents: payload,
+                usage: wgpu::BufferUsages::STORAGE,
+            }),
+    };
+    let mut sc = c.scratch.lock().unwrap();
+    let xs_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.xs,
+        (cols * 4) as u64,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        "q1-xs",
+    );
+    c.queue
+        .write_buffer(&xs_buf, 0, bytemuck::cast_slice(&xs[..cols]));
+    let y_size = (rows * 4) as u64;
+    let y_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.y,
+        y_size,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        "q1-y",
+    );
+    let stage_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        y_size,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "q1-stage",
+    );
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("q1g") });
+    encode_matvec_q1g(c, &mut enc, &q_buf, &xs_buf, &y_buf, rows, cols);
+    let ok = readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..rows]);
+    drop(sc);
+    ok
+}
+
 /// GEMM of the prefill batch: `pre` are prescaled inputs row-major [b, cols],
 /// out — row-major [b, rows]. Weights are resident in VRAM. false = CPU path.
 #[allow(clippy::too_many_arguments)]
@@ -37329,6 +37629,79 @@ pub fn q1_matmat(
             1,
         );
     }
+    let ok = readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..b * rows]);
+    drop(sc);
+    ok
+}
+
+/// Batched q1g GEMM (prefill): `q1_matmat` with the plane decoder
+/// (`q1g_mul_mm`). The whole tensor is resident; `rows` must be the
+/// tensor's own (the scale plane follows every row).
+pub fn q1g_matmat(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    pre: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
+    if cols % 128 != 0 || rows == 0 || b == 0 || pre.len() < b * cols || out.len() < b * rows {
+        return false;
+    }
+    let entry = &model.tensors[idx];
+    if entry.shape.first().copied() != Some(rows) || entry.shape.get(1).copied() != Some(cols) {
+        return false;
+    }
+    let Some(abs) = model.entry_abs_offset(entry) else {
+        return false;
+    };
+    let bytes = model.primary_bytes();
+    let plen = entry.nbytes as usize;
+    if abs + plen > bytes.len() {
+        return false;
+    }
+    let Some(w) = weight_buffer_l(
+        c,
+        (model.uid() as usize, idx),
+        &bytes[abs..abs + plen],
+        layer_of_name(&model.tensors[idx].name),
+    ) else {
+        return false; // over VRAM budget → CPU path
+    };
+    let mut sc = c.scratch.lock().unwrap();
+    let xs_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.xs,
+        (b * cols * 4) as u64,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        "q1mm-xs",
+    );
+    c.queue
+        .write_buffer(&xs_buf, 0, bytemuck::cast_slice(&pre[..b * cols]));
+    let y_size = (b * rows * 4) as u64;
+    let y_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.y,
+        y_size,
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        "q1mm-y",
+    );
+    let stage_buf = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        y_size,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "q1mm-stage",
+    );
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("q1gmm"),
+        });
+    encode_q1g_mm(c, &mut enc, &w, &xs_buf, &y_buf, rows, cols, b);
     let ok = readback(c, enc, &y_buf, &stage_buf, y_size, &mut out[..b * rows]);
     drop(sc);
     ok
@@ -44984,6 +45357,139 @@ fn encode_matvec_q1(
     pass.dispatch_workgroups((rows as u32).div_ceil(c.q1_rows).min(MAX_WG), 1, 1);
 }
 
+/// `encode_matvec_q1` for q1g: params `[cols/64, rows, scale-plane word
+/// offset, 0]`; the buffer holds the whole tensor (both planes).
+fn encode_matvec_q1g(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+) {
+    encode_matvec_q1g_rows(c, enc, weight, xs, y, rows, rows, cols)
+}
+
+/// q1g matvec over the first `rows` of a `trows`-row tensor (a shortlisted
+/// head): the scale plane starts after all `trows` rows of signs.
+#[allow(clippy::too_many_arguments)]
+fn encode_matvec_q1g_rows(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    trows: usize,
+    cols: usize,
+) {
+    let (pipe, bind, groups) = prep_matvec_q1g_rows(c, weight, xs, y, rows, trows, cols);
+    let mut pass = begin_pass(enc);
+    pass.set_pipeline(pipe);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups(groups, 1, 1);
+}
+
+/// Pipeline + bind group + workgroup count of one q1g matvec (the graph's
+/// `prep` shares a pass between independent matvecs).
+fn prep_matvec_q1g<'a>(
+    c: &'a Ctx,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+) -> (&'a wgpu::ComputePipeline, wgpu::BindGroup, u32) {
+    prep_matvec_q1g_rows(c, weight, xs, y, rows, rows, cols)
+}
+
+/// The staged `q1g_matvec`, or — opt-in, long rows, 32-wide subgroups
+/// (`q1g_mv::wanted`) — the barrier-free subgroup kernel. The same bits
+/// either way (both are q1_matvec's sums;
+/// `wgpu_q1g_kernels_equal_q1_bit_for_bit` checks both).
+fn prep_matvec_q1g_rows<'a>(
+    c: &'a Ctx,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    trows: usize,
+    cols: usize,
+) -> (&'a wgpu::ComputePipeline, wgpu::BindGroup, u32) {
+    let sg = if q1g_mv::wanted(cols) {
+        q1g_mv::pipes(c)
+    } else {
+        None
+    };
+    prep_matvec_q1g_with(c, sg, weight, xs, y, rows, trows, cols)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prep_matvec_q1g_with<'a>(
+    c: &'a Ctx,
+    sg: Option<&'a q1g_mv::Q1gSg>,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    trows: usize,
+    cols: usize,
+) -> (&'a wgpu::ComputePipeline, wgpu::BindGroup, u32) {
+    let sbase = trows * cols / 32;
+    let p_buf = uniform_u32x4(c, [(cols / 64) as u32, rows as u32, sbase as u32, 0]);
+    let (pipe, layout, per) = match sg {
+        Some(p) => (&p.mv, &p.layout, q1g_mv::ROWS_PER_WG),
+        None => (&c.q1g, &c.layout_q1g, c.q1_rows),
+    };
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout,
+        entries: &[
+            bind_buf(0, weight),
+            bind_buf(1, xs),
+            bind_buf(2, y),
+            bind_buf(3, &p_buf),
+        ],
+    });
+    (pipe, bind, (rows as u32).div_ceil(per).min(MAX_WG))
+}
+
+/// `encode_q1_mm` for q1g: params `[cols/4, rows, k, scale-plane word
+/// offset]`.
+#[allow(clippy::too_many_arguments)]
+fn encode_q1g_mm(
+    c: &Ctx,
+    enc: &mut wgpu::CommandEncoder,
+    weight: &wgpu::Buffer,
+    xs: &wgpu::Buffer,
+    y: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+    k: usize,
+) {
+    let sbase = rows * cols / 32;
+    let p_buf = uniform_u32x4(c, [(cols / 4) as u32, rows as u32, k as u32, sbase as u32]);
+    let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &c.layout_q1gmm,
+        entries: &[
+            bind_buf(0, weight),
+            bind_buf(1, xs),
+            bind_buf(3, y),
+            bind_buf(4, &p_buf),
+        ],
+    });
+    let mut pass = begin_pass(enc);
+    pass.set_pipeline(&c.q1g_mm);
+    pass.set_bind_group(0, &bind, &[]);
+    pass.dispatch_workgroups(
+        (rows as u32).div_ceil(64).min(MAX_WG),
+        (k as u32).div_ceil(64),
+        1,
+    );
+}
+
 /// Encode a resident q1 GEMM (batched prefill): Y[k,rows] = X[k,cols] @ Wᵀ, all
 /// buffers already on the device. q1_mul_mm omits binding 2 (no row scale).
 #[allow(dead_code)] // wired by forward_batch_graph (batched prefill, in progress)
@@ -46446,7 +46952,17 @@ fn matvec_batch_q1(model: &Arc<CmfModel>, jobs: &[BatchJob], out: &mut [&mut [f3
         let Some(abs) = model.entry_abs_offset(entry) else {
             return false;
         };
-        let plen = j.rows * gpr * 6;
+        // q1g keeps its scale plane behind every row: only the whole
+        // tensor is a valid payload.
+        let q1g = j.layout == crate::gpu::BatchLayout::Q1g;
+        if q1g && (j.cols % 128 != 0 || entry.shape.first().copied() != Some(j.rows)) {
+            return false;
+        }
+        let plen = if q1g {
+            j.rows * j.cols / 8 + j.rows * j.cols / 64
+        } else {
+            j.rows * gpr * 6
+        };
         if abs + plen > bytes.len() {
             return false;
         }
@@ -46465,7 +46981,11 @@ fn matvec_batch_q1(model: &Arc<CmfModel>, jobs: &[BatchJob], out: &mut [&mut [f3
     for (j, w) in jobs.iter().zip(&weights) {
         let xs_b = storage_bytes(c, bytemuck::cast_slice(&j.xs[..j.cols]));
         let y_b = rw_f32(c, j.rows, true);
-        encode_matvec_q1(c, &mut enc, w, &xs_b, &y_b, j.rows, j.cols);
+        if j.layout == crate::gpu::BatchLayout::Q1g {
+            encode_matvec_q1g(c, &mut enc, w, &xs_b, &y_b, j.rows, j.cols);
+        } else {
+            encode_matvec_q1(c, &mut enc, w, &xs_b, &y_b, j.rows, j.cols);
+        }
         y_bufs.push(y_b);
     }
     // ONE pooled staging buffer for all outputs, one map (mirror the q8 path).
@@ -46710,9 +47230,15 @@ pub fn matvec_batch(model: &Arc<CmfModel>, jobs: &[BatchJob], out: &mut [&mut [f
     }) {
         return false;
     }
+    // q1 and q1g (binary weights, raw xs) share the binary batch encoder.
     let n_q1 = jobs
         .iter()
-        .filter(|j| j.layout == crate::gpu::BatchLayout::Q1)
+        .filter(|j| {
+            matches!(
+                j.layout,
+                crate::gpu::BatchLayout::Q1 | crate::gpu::BatchLayout::Q1g
+            )
+        })
         .count();
     if n_q1 == jobs.len() {
         return matvec_batch_q1(model, jobs, out);
@@ -53255,6 +53781,258 @@ fn main() {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(max_d < 1e-3, "wgpu q1_mul_mm ≠ CPU: max|Δ| = {max_d}");
+    }
+
+    /// q1g on the device returns q1's f32 BIT FOR BIT on a uniform-scale
+    /// repack — matvec (`q1g_matvec` vs `q1_matvec`), the tiled GEMM
+    /// (`q1g_mul_mm` vs `q1_mul_mm`) and a shortlisted head (first rows of
+    /// a taller tensor) — and matches the CPU dequant reference.
+    #[test]
+    fn wgpu_q1g_kernels_equal_q1_bit_for_bit() {
+        use cortiq_core::quant::{Q1_TILE, dequant_q1, f32_to_f16, repack_q1_to_q1g};
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping q1g parity test");
+            return;
+        };
+        let _op = c.op_gate.enter();
+        let run = |enc: wgpu::CommandEncoder, y: &wgpu::Buffer, n: usize| -> Vec<f32> {
+            let mut sc = c.scratch.lock().unwrap();
+            let stage = Scratch::ensure(
+                &c.device,
+                &mut sc.stage,
+                (n * 4) as u64,
+                wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                "q1g-test-stage",
+            );
+            let mut got = vec![0f32; n];
+            assert!(readback(c, enc, y, &stage, (n * 4) as u64, &mut got));
+            got
+        };
+        // (3, 384): an odd group count (9) — the last scale word is half
+        // payload, half padding, and the payload is not a word multiple.
+        for &(rows, cols, b) in &[
+            (33usize, 256usize, 70usize),
+            (7, 2048, 5),
+            (130, 128, 64),
+            (3, 384, 9),
+        ] {
+            let tiles = rows * cols / 32;
+            let mut q1 = Vec::with_capacity(tiles * Q1_TILE);
+            for t in 0..tiles {
+                let s = 0.003 + ((t / 4 * 19 + rows) % 23) as f32 * 0.0013;
+                q1.extend_from_slice(&f32_to_f16(s).to_le_bytes());
+                let bits = ((t * 2_654_435_761) as u32).rotate_left((t % 29) as u32);
+                q1.extend_from_slice(&bits.to_le_bytes());
+            }
+            let rp = repack_q1_to_q1g(&q1, rows, cols, 0.0);
+            assert_eq!(rp.differing, 0);
+            let q1g = rp.data;
+            let xs: Vec<f32> = (0..b * cols)
+                .map(|i| {
+                    (((i * 7 + 3) % 29) as f32 / 29.0 - 0.5) * if i % 97 == 0 { 40.0 } else { 1.0 }
+                })
+                .collect();
+            let x = &xs[..cols];
+            // matvec: kernel vs kernel bit-exact, both vs the dequant.
+            let (mut ga, mut gb) = (vec![0f32; rows], vec![0f32; rows]);
+            assert!(dispatch_q1(c, None, &q1, x, rows, cols, &mut ga));
+            assert!(dispatch_q1g(c, None, &q1g, x, rows, cols, &mut gb));
+            assert_eq!(
+                ga.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                gb.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "{rows}x{cols}: q1g_matvec != q1_matvec"
+            );
+            let mut w = vec![0f32; rows * cols];
+            dequant_q1(&q1, &mut w);
+            let max_d = (0..rows)
+                .map(|o| {
+                    let want: f32 = (0..cols).map(|i| w[o * cols + i] * x[i]).sum();
+                    (want - gb[o]).abs() / want.abs().max(1.0)
+                })
+                .fold(0f32, f32::max);
+            assert!(max_d < 1e-4, "{rows}x{cols}: q1g vs dequant {max_d}");
+            let wb = storage_bytes(c, &q1g);
+            let xb = storage_bytes(c, bytemuck::cast_slice(x));
+            // Both q1g decode kernels explicitly: the staged twin and the
+            // subgroup one (when this device has 32-wide subgroups — then
+            // its module must also compile).
+            if let Some(e) = q1g_mv::module_error(c) {
+                panic!("q1g subgroup module rejected on a 32-wide-subgroup device: {e}");
+            }
+            assert_eq!(q1g_mv::pipes(c).is_some(), q1g_mv::sg32(c));
+            let kernels: Vec<(&str, Option<&q1g_mv::Q1gSg>)> = match q1g_mv::pipes(c) {
+                Some(p) => vec![("staged", None), ("subgroup", Some(p))],
+                None => vec![("staged", None)],
+            };
+            for (kname, sg) in kernels {
+                let yb = rw_f32(c, rows, true);
+                let mut enc = c
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                let (pipe, bind, groups) =
+                    prep_matvec_q1g_with(c, sg, &wb, &xb, &yb, rows, rows, cols);
+                {
+                    let mut pass = begin_pass(&mut enc);
+                    pass.set_pipeline(pipe);
+                    pass.set_bind_group(0, &bind, &[]);
+                    pass.dispatch_workgroups(groups, 1, 1);
+                }
+                let got = run(enc, &yb, rows);
+                assert_eq!(
+                    ga.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "{rows}x{cols}: q1g {kname} kernel != q1_matvec"
+                );
+            }
+            // Shortlisted head: the first rows of the same q1g tensor.
+            let part = rows.div_ceil(3);
+            let yb = rw_f32(c, part, true);
+            let mut enc = c
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            encode_matvec_q1g_rows(c, &mut enc, &wb, &xb, &yb, part, rows, cols);
+            assert_eq!(
+                run(enc, &yb, part),
+                gb[..part],
+                "{rows}x{cols}: shortlisted head"
+            );
+            // GEMM: both tiled kernels, bit-exact.
+            let gemm = |q1g_layout: bool| -> Vec<f32> {
+                let wbuf = storage_bytes(c, if q1g_layout { &q1g } else { &q1 });
+                let xbuf = storage_bytes(c, bytemuck::cast_slice(&xs));
+                let ybuf = rw_f32(c, b * rows, true);
+                let mut enc = c
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                if q1g_layout {
+                    encode_q1g_mm(c, &mut enc, &wbuf, &xbuf, &ybuf, rows, cols, b);
+                } else {
+                    encode_q1_mm(c, &mut enc, &wbuf, &xbuf, &ybuf, rows, cols, b);
+                }
+                run(enc, &ybuf, b * rows)
+            };
+            let (ma, mb) = (gemm(false), gemm(true));
+            assert_eq!(
+                ma.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                mb.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "{rows}x{cols}x{b}: q1g_mul_mm != q1_mul_mm"
+            );
+            let max_d = (0..rows)
+                .map(|o| (ma[o] - ga[o]).abs() / ga[o].abs().max(1.0))
+                .fold(0f32, f32::max);
+            assert!(max_d < 1e-4, "{rows}x{cols}: GEMM row 0 vs matvec {max_d}");
+        }
+    }
+
+    /// Kernel-level A/B, q1_matvec vs q1g_matvec, on Bonsai-1.7B's decode
+    /// shapes: resident weights, 64 matvecs per submit, arms alternated
+    /// every round (a shared card drifts — only interleaved medians mean
+    /// anything). Prints µs/matvec and the effective weight stream rate.
+    /// `cargo test -p cortiq-engine --features gpu --release --lib
+    /// q1g_matvec_speed -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn q1g_matvec_speed() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping");
+            return;
+        };
+        let _op = c.op_gate.enter();
+        eprintln!(
+            "subgroups: feature {} size {}..{} → q1g subgroup kernel {}",
+            c.device.features().contains(wgpu::Features::SUBGROUP),
+            c.adapter_info.subgroup_min_size,
+            c.adapter_info.subgroup_max_size,
+            q1g_mv::pipes(c).is_some()
+        );
+        let (reps, per) = (15usize, 64usize);
+        for &(name, rows, cols) in &[
+            ("q_proj/o_proj", 2048usize, 2048usize),
+            ("gate/up_proj", 6144, 2048),
+            ("down_proj", 2048, 6144),
+            ("lm_head", 151_669, 2048),
+        ] {
+            let tiles = rows * cols / 32;
+            let mut q1 = vec![0u8; tiles * 6];
+            for t in 0..tiles {
+                let h = cortiq_core::quant::f32_to_f16(0.01 + (t / 4 % 7) as f32 * 1e-3);
+                q1[t * 6..t * 6 + 2].copy_from_slice(&h.to_le_bytes());
+                let b = (t as u32).wrapping_mul(2_654_435_761);
+                q1[t * 6 + 2..t * 6 + 6].copy_from_slice(&b.to_le_bytes());
+            }
+            let q1g = cortiq_core::quant::repack_q1_to_q1g(&q1, rows, cols, 0.0).data;
+            let (wa, wb) = (storage_bytes(c, &q1), storage_bytes(c, &q1g));
+            let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.01).sin()).collect();
+            let xb = storage_bytes(c, bytemuck::cast_slice(&x));
+            let yb = rw_f32(c, rows, true);
+            // arm 0: q1_matvec, 1: staged q1g_matvec, 2: subgroup q1g.
+            let sg = q1g_mv::pipes(c);
+            let time = |arm: usize| -> f64 {
+                let mut enc = c
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                for _ in 0..per {
+                    if arm == 0 {
+                        encode_matvec_q1(c, &mut enc, &wa, &xb, &yb, rows, cols);
+                    } else {
+                        let (pipe, bind, groups) = prep_matvec_q1g_with(
+                            c,
+                            if arm == 2 { sg } else { None },
+                            &wb,
+                            &xb,
+                            &yb,
+                            rows,
+                            rows,
+                            cols,
+                        );
+                        let mut pass = begin_pass(&mut enc);
+                        pass.set_pipeline(pipe);
+                        pass.set_bind_group(0, &bind, &[]);
+                        pass.dispatch_workgroups(groups, 1, 1);
+                    }
+                }
+                let t0 = std::time::Instant::now();
+                submit(c, finish_enc(enc));
+                let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+                t0.elapsed().as_secs_f64() / per as f64
+            };
+            let arms: Vec<usize> = if sg.is_some() {
+                vec![0, 1, 2]
+            } else {
+                vec![0, 1]
+            };
+            for &a in &arms {
+                let _ = time(a); // warm every pipeline
+            }
+            let mut ts: Vec<Vec<f64>> = vec![Vec::new(); 3];
+            for r in 0..reps {
+                // rotate the arm order every round
+                for k in 0..arms.len() {
+                    let a = arms[(k + r) % arms.len()];
+                    ts[a].push(time(a));
+                }
+            }
+            let med = |v: &mut Vec<f64>| {
+                if v.is_empty() {
+                    return f64::NAN;
+                }
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            let (ma, mb, mc) = (med(&mut ts[0]), med(&mut ts[1]), med(&mut ts[2]));
+            eprintln!(
+                "wgpu {name:>14} {rows}x{cols}: q1 {:8.1} us ({:5.0} GB/s) | q1g staged {:8.1} us ({:5.0} GB/s) | q1g subgroup {:8.1} us ({:5.0} GB/s) | best q1g/q1 time {:.3}",
+                ma * 1e6,
+                q1.len() as f64 / ma / 1e9,
+                mb * 1e6,
+                q1g.len() as f64 / mb / 1e9,
+                mc * 1e6,
+                q1g.len() as f64 / mc / 1e9,
+                mb.min(if mc.is_nan() { f64::INFINITY } else { mc }) / ma
+            );
+        }
     }
 }
 

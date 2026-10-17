@@ -235,6 +235,10 @@ fn dtype_to_quant(d: TensorDtype, weight_quant: Option<&str>) -> Option<Quant> {
         // conservative q1 fallback and can still request --skill-quant q1p.
         TensorDtype::Q1 if weight_quant == Some("q1p") => Quant::Q1p,
         TensorDtype::Q1 => Quant::Q1,
+        // q1g is a lossless repack of q1 (one scale per 128-group); a graft
+        // is encoded on the same ±s grid as q1 tiles (`requant --quant q1g`
+        // can fold it afterwards).
+        TensorDtype::Q1G => Quant::Q1,
         TensorDtype::Q1S => Quant::Q1s,
         TensorDtype::Q1T => Quant::Q1t,
         _ => return None,
@@ -2364,6 +2368,7 @@ mod tests {
             (TensorDtype::VbitRo, None, Quant::Vbit),
             (TensorDtype::Q1, None, Quant::Q1),
             (TensorDtype::Q1, Some("q1p"), Quant::Q1p),
+            (TensorDtype::Q1G, None, Quant::Q1),
             (TensorDtype::Q1S, None, Quant::Q1s),
             (TensorDtype::Q1T, None, Quant::Q1t),
             (TensorDtype::F16, None, Quant::F16),

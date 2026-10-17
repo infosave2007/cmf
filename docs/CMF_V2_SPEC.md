@@ -308,6 +308,7 @@ Numbering shared with `.vmfc` (ids are never reused):
 | 13 | `q1s`     | ✅ read/write — `q1` base + sparse high-precision outlier overlay (1-bit PTQ of normal checkpoints) |
 | 14 | `q1t`     | ✅ read/write — ternary `{−s, 0, +s}` base-3 tiles + per-row outlier overlay (~2.25 bpw + overlay) |
 | 15 | `q4tp`    | ✅ read/write — `q4_tiled` nibbles with the per-tile scale as a 5-bit rung on a per-row ladder (`--quant q4tp`, or `requant` in place) |
+| 20 | `q1g`     | ✅ read/write — 1-bit binary with ONE f16 scale per 128-group, sign and scale planes (1.125 bpw); lossless `requant --quant q1g` of a `q1` file whose tile scales agree per 128-group (Bonsai class), `requant --quant q1` back |
 
 ### 3.2 Quant layouts (canon = `.vmfc`: "quants first, then scales")
 
@@ -369,6 +370,18 @@ Numbering shared with `.vmfc` (ids are never reused):
   levels and the encoding is lossless up to f16; as post-training
   quantization of a normal checkpoint it destroys quality, so
   converters expose it only as an explicit opt-in.
+- **`q1g`** (2-D only, `in % 128 == 0`):
+  `[sign bits: rows·in/8][f16 scales: rows·in/128]` — planes, not tiles,
+  so each 128-group's 16 sign bytes are 16-byte aligned. Bit k of byte j
+  (LSB-first) is weight j·8+k of the row, `w = scale[r, i/128]·(2·bit − 1)`.
+  A row's sign plane is byte-identical to the concatenated bit fields of
+  its `q1` tiles: a `q1` tensor whose four tile scales are equal in every
+  128-group (1-bit-trained models with a native 128-group, where `q1`
+  stores each scale four times) converts with no change in any weight,
+  1.5 → 1.125 bits/weight. `requant --quant q1g` refuses a group whose
+  tile scales differ unless `--allow-tol`, which accepts f16-rounding
+  spreads (≤ `--tol`, default 2⁻⁸ relative) and stores the f16 nearest the
+  mean of the four scales; `requant --quant q1` writes `q1` back exactly.
 - **`q1s`** (2-D only, `in % 32 == 0`): a `q1` base (identical 6-byte
   tiles; outliers are EXCLUDED from the group scale) followed by a
   sparse high-precision overlay: `[u32 count]` then

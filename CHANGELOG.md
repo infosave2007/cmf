@@ -29,6 +29,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     pass.
   - The Hessian cache is read one group at a time.
 
+- `cortiq dequant --dtype raw` writes a tensor's encoded payload verbatim and
+  `cortiq patch-tensor --raw` stores an already encoded payload verbatim
+  (length checked by the reader's own rule, hashes recomputed).
+- `tools/quant/`: metric genesis (`metric_refit.py`: KL-to-teacher training of
+  the f16 row fields and norm gains of a real CMF, codes untouched), escort
+  (`escort.py`: per-tensor sensitivity water-filled into a bpw budget) and an
+  exact perplexity evaluator (`ppl.py`), for the llama family and the
+  `qwen3_5` hybrid, with layer streaming for 27B-class models on one GPU.
+  MiniCPM5-2B q4tp, GPTQ-32k + H-metric refit: 19.56 → 19.13 after genesis
+  (bf16 18.89).
+- CMF dtype 20 `q1g`: 1-bit signs with one f16 scale per 128-weight group
+  (1.125 bpw), sign and scale planes. `cortiq requant --quant q1g` repacks a
+  `q1` file of a natively 128-grouped 1-bit model losslessly; a group whose
+  four tile scales are not byte-identical refuses the run unless
+  `--allow-tol`. `--quant q1` writes `q1` back exactly. Bonsai-1.7B: file
+  334.2 → 253.8 MB, PPL 28.3705 on both (393 of 13.4 M groups take the mean
+  of their four f16-rounded scales, −9.3e-8 nats/token). Kernels on CPU, wgpu
+  and Metal return q1's f32 bit for bit on uniform scales; CPU decode is
+  ~2× q1 on x86 (group-level reduction), GPU decode equal or better. The
+  Metal kernels are checked on an M4 by `tools/metal_q1g_parity.swift`
+  (their scale step is an explicit `fma`: fast math otherwise folds the
+  pair's shared scale and drifts from q1 by rounding); the Metal host path
+  has not been run on a Mac yet.
+
 ### Changed
 - The q2tp encoder (`convert --quant q2tp` and every other q2tp writer)
   now places each row ladder at the per-group MSE-optimal scale, searches

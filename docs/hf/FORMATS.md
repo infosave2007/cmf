@@ -23,6 +23,7 @@ Short version:
 | `q2tp` | 2.17 | the model is a MoE and you are trading experts for size |
 | `q1t` | ~2.25 + overlay | a normal checkpoint pushed below q4, with calibration |
 | `q1` | 1.5 | the model was *trained* at 1 bit (BitNet/Bonsai class) |
+| `q1g` | 1.125 | the same 1-bit model, one scale per 128 weights instead of four copies of it |
 | `vbit` | 3–8, per row | one file has to fit an awkward memory budget exactly |
 
 Normalization weights, biases and anything one-dimensional are **always f16**,

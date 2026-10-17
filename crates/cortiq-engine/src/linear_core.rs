@@ -900,6 +900,24 @@ fn gdn_projs_gpu(w: &GdnWeights, x: &[f32], qkv: &mut [f32], z: &mut [f32]) -> b
                     layout: crate::gpu::BatchLayout::Q1,
                 },
             )),
+            QTensor::Mapped {
+                model,
+                idx,
+                dtype: TensorDtype::Q1G,
+                rows,
+                cols,
+                ..
+            } => Some((
+                model.clone(),
+                BatchJob {
+                    idx: *idx,
+                    rows: *rows,
+                    cols: *cols,
+                    row_scale: &[],
+                    xs: x.to_vec(),
+                    layout: crate::gpu::BatchLayout::Q1g,
+                },
+            )),
             // q4t/q4tp: same tile-embedded-scale contract as q1, different
             // stride. Missing here, a hybrid model's GDN projections fell to
             // the CPU on every layer while its experts rode the device.
