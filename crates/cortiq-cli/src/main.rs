@@ -784,7 +784,8 @@ enum Commands {
         act_order: bool,
         /// q4tp/q2tp: Hessian cache file — loaded when it exists (calibration
         /// skipped), written after calibrating when it does not (one file
-        /// per chunk, PATH.L{first}-{last}, with --calib-chunk-layers)
+        /// per chunk, PATH.L{first}-{last}, with --calib-chunk-layers; an
+        /// existing whole-model PATH serves any chunking)
         #[arg(long)]
         hessians: Option<String>,
         /// q4tp/q2tp: capture the Hessians of this many layers per

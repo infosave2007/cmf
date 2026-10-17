@@ -898,7 +898,8 @@ pub(crate) struct GptqTiledOpts<'a> {
     pub act_order: bool,
     /// Hessian cache: read when it exists (calibration skipped), written
     /// after calibrating when it does not. With `chunk_layers` one file per
-    /// chunk, `PATH.L{first}-{last}`.
+    /// chunk, `PATH.L{first}-{last}`; an existing whole-model `PATH` serves
+    /// any chunking (its entries are read lazily).
     pub hessians: Option<&'a str>,
     /// `Q4TiledP` or `Q2TiledP`: the profile whose per-tensor policy (and
     /// `--tensor-quant` overrides) decides each tensor's codec.
@@ -1256,8 +1257,13 @@ pub(crate) fn run_quantize_gptq_tiled(o: &GptqTiledOpts) -> anyhow::Result<()> {
                 format!("{p}.L{lo}-{hi}")
             }
         });
-        let groups = match cache.as_deref() {
-            Some(p) if std::path::Path::new(p).exists() => {
+        // A whole-model cache serves any chunking: entries are read lazily.
+        let existing = cache
+            .as_deref()
+            .filter(|p| std::path::Path::new(p).exists())
+            .or(o.hessians.filter(|p| std::path::Path::new(p).exists()));
+        let groups = match existing {
+            Some(p) => {
                 eprintln!("Hessians from cache {p} (calibration skipped) …");
                 groups_from_cache(&model, p, slots, &mut no_hessian)?
             }
@@ -3047,6 +3053,178 @@ mod tests {
         assert_eq!(got, all[..700].to_vec());
         let got = calib_source_tokens(txt.to_str().unwrap(), 1_000_000, &enc).unwrap();
         assert_eq!(got, all, "an exhausted source returns all it has");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The whole `quantize-gptq --codec q2tp` runner on a two-layer f16 file
+    /// with a Hessian cache (no calibration forward): codec per tensor from
+    /// the q2tp profile, a q4tp override that stays GPTQ, RTN for tensors the
+    /// cache lacks, bytes equal to the kernels called directly, identical
+    /// output for 1 and 4 threads, and a whole-model cache serving a chunked
+    /// run.
+    #[test]
+    fn tiled_runner_from_cache_follows_profile_overrides_and_threads() {
+        use crate::convert::Quant;
+        use cortiq_core::format::{CmfModel, TensorSpec};
+        use cortiq_core::types::TensorDtype;
+        let _env = crate::convert::tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("cortiq-gptq-run-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = |f: &str| dir.join(f).to_str().unwrap().to_string();
+        let (hid, inter) = (64usize, 96usize);
+        let shapes: Vec<(String, Vec<usize>)> = (0..2)
+            .flat_map(|l| {
+                [
+                    (format!("model.layers.{l}.self_attn.q_proj.weight"), vec![hid, hid]),
+                    (format!("model.layers.{l}.mlp.gate_proj.weight"), vec![inter, hid]),
+                    (format!("model.layers.{l}.mlp.up_proj.weight"), vec![inter, hid]),
+                    (format!("model.layers.{l}.mlp.down_proj.weight"), vec![hid, inter]),
+                    (format!("model.layers.{l}.input_layernorm.weight"), vec![hid]),
+                ]
+            })
+            .collect();
+        let mut weights = std::collections::HashMap::new();
+        let mut specs = Vec::new();
+        for (k, (name, shape)) in shapes.iter().enumerate() {
+            let n: usize = shape.iter().product();
+            let mut s = 100 + k as u64;
+            // Heavy-ish tails, rounded through f16 so the runner reads exactly these values.
+            let w: Vec<f32> = (0..n)
+                .map(|i| {
+                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    let v = ((s >> 33) as f64 / (1u64 << 31) as f64) as f32 - 0.5;
+                    f16_to_f32(f32_to_f16(if i % 97 == 0 { v * 6.0 } else { v }))
+                })
+                .collect();
+            specs.push(TensorSpec {
+                name: name.clone(),
+                dtype: TensorDtype::F16,
+                shape: shape.clone(),
+                data: crate::convert::encode_f16(&w),
+            });
+            weights.insert(name.clone(), w);
+        }
+        let header: cortiq_core::CmfHeader = serde_json::from_value(serde_json::json!({
+            "format": "cmf",
+            "version": cortiq_core::CMF_VERSION,
+            "arch": {
+                "arch_name": "llama", "hidden_size": hid, "intermediate_size": inter,
+                "num_layers": 2, "num_attention_heads": 1, "num_kv_heads": 1, "head_dim": hid,
+                "vocab_size": 16, "layer_types": ["FullAttention", "FullAttention"],
+                "rms_norm_eps": 1e-6, "norm_style": "qwen", "hidden_act": "silu",
+                "max_position_embeddings": 64
+            },
+            "quant_type": "Q4_BLOCK"
+        }))
+        .unwrap();
+        CmfModel::write(&p("in.cmf"), &header, &specs, None, None).unwrap();
+        // Layer 0's Hessians only: q_proj, gate+up (one shared input), down.
+        let (_, _, h64) = q2_problem(1, hid, 300, 7);
+        let (_, _, h96) = q2_problem(1, inter, 300, 8);
+        let diag = |h: &[f64], n: usize| -> Vec<f64> { (0..n).map(|i| h[i * n + i]).collect() };
+        let (d64, d96) = (diag(&h64, hid), diag(&h96, inter));
+        write_hessian_cache(
+            &p("h.hess"),
+            &[
+                HessCacheItem {
+                    names: vec!["model.layers.0.self_attn.q_proj.weight"],
+                    cols: hid,
+                    count: 300,
+                    sumsq: &d64,
+                    h: &h64,
+                },
+                HessCacheItem {
+                    names: vec!["model.layers.0.mlp.gate_proj.weight", "model.layers.0.mlp.up_proj.weight"],
+                    cols: hid,
+                    count: 300,
+                    sumsq: &d64,
+                    h: &h64,
+                },
+                HessCacheItem {
+                    names: vec!["model.layers.0.mlp.down_proj.weight"],
+                    cols: inter,
+                    count: 300,
+                    sumsq: &d96,
+                    h: &h96,
+                },
+            ],
+        )
+        .unwrap();
+        crate::convert::set_tensor_quant_overrides(&["model.layers.0.mlp.up_proj.weight=q4tp".to_string()])
+            .unwrap();
+        let run = |out: &str, threads: usize, chunk: usize| {
+            let (input, output, hess) = (p("in.cmf"), p(out), p("h.hess"));
+            run_quantize_gptq_tiled(&GptqTiledOpts {
+                input: &input,
+                calib_model: None,
+                calib: vec![CalibSource { path: p("absent.txt"), share: 1.0 }],
+                output: &output,
+                tokens: 2048,
+                window: 2048,
+                lambda: 0.01,
+                threads,
+                act_order: false,
+                hessians: Some(&hess),
+                profile: Quant::Q2TiledP,
+                q2tp_rule: Q2tpRule::Placed,
+                q2tp_rule_overrides: Vec::new(),
+                q2tp_debias: false,
+                chunk_layers: chunk,
+            })
+            .unwrap();
+            std::fs::read(&output).unwrap()
+        };
+        let (a, b) = (run("a.cmf", 1, 0), run("b.cmf", 4, 0));
+        let _ = run("c.cmf", 3, 1);
+        crate::convert::set_tensor_quant_overrides(&[]).unwrap();
+        assert_eq!(a, b, "output depends on the thread count");
+        let m = CmfModel::open(&p("a.cmf")).unwrap();
+        let mc = CmfModel::open(&p("c.cmf")).unwrap();
+        fn by<'a>(m: &'a CmfModel, n: &str) -> &'a cortiq_core::format::TensorEntry {
+            m.tensors.iter().find(|t| t.name == n).unwrap()
+        }
+        let hd: Vec<f32> = d64.iter().map(|&v| v as f32).collect();
+        let (u, dead) = gptq_fold_operator(h64.clone(), hid, 0.01);
+        let w = |n: &str| weights[n].clone();
+        let checks: [(&str, TensorDtype, Vec<u8>); 5] = [
+            (
+                "model.layers.0.mlp.gate_proj.weight",
+                TensorDtype::Q2TiledP,
+                gptq_quantize_q2tp(&w("model.layers.0.mlp.gate_proj.weight"), inter, hid, &u, &dead, &hd, Q2tpRule::Placed, None, 2),
+            ),
+            (
+                "model.layers.0.mlp.up_proj.weight",
+                TensorDtype::Q4TiledP,
+                gptq_quantize_q4tp(&w("model.layers.0.mlp.up_proj.weight"), inter, hid, &u, &dead, &hd, 2),
+            ),
+            (
+                "model.layers.0.self_attn.q_proj.weight",
+                TensorDtype::Q4TiledP,
+                gptq_quantize_q4tp(&w("model.layers.0.self_attn.q_proj.weight"), hid, hid, &u, &dead, &hd, 2),
+            ),
+            (
+                "model.layers.1.mlp.gate_proj.weight",
+                TensorDtype::Q2TiledP,
+                crate::convert::encode_q2tp(&w("model.layers.1.mlp.gate_proj.weight"), inter, hid),
+            ),
+            (
+                "model.layers.1.self_attn.q_proj.weight",
+                TensorDtype::Q4TiledP,
+                crate::convert::encode_q4tp(&w("model.layers.1.self_attn.q_proj.weight"), hid, hid),
+            ),
+        ];
+        for (name, dtype, want) in checks {
+            for mm in [&m, &mc] {
+                let e = by(mm, name);
+                assert_eq!(e.dtype, dtype, "{name}");
+                assert_eq!(mm.entry_bytes(e), &want[..], "{name}: not the kernel's bytes");
+            }
+        }
+        assert_eq!(by(&m, "model.layers.0.input_layernorm.weight").dtype, TensorDtype::F16);
+        let prov = m.header.provenance.as_ref().unwrap();
+        assert_eq!(prov["weight_quant"], "q2tp");
+        assert_eq!(prov["gptq"]["q2tp_rule"], "placed");
+        assert_eq!(prov["gptq"]["linears"], 4);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
