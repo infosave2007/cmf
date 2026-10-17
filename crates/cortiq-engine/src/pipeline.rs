@@ -8839,7 +8839,14 @@ impl Pipeline {
                 // The layer chunk is large (grouping positions by MoE experts
                 // wins with size), lm_head in sub-blocks (logit buffer
                 // 32×vocab ≈ 32MB instead of 128×).
-                const CHUNK: usize = 128;
+                // CMF_NLL_CHUNK: positions per prefill step (default 128).
+                // A device scorer pays one round trip per projection per
+                // step, so a 512-position step quarters them.
+                let chunk_len: usize = std::env::var("CMF_NLL_CHUNK")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&c: &usize| c > 0)
+                    .unwrap_or(128);
                 const LM_SUB: usize = 32;
                 let n = ids.len().saturating_sub(1);
                 let hs = self.hidden_size;
@@ -8847,7 +8854,7 @@ impl Pipeline {
                 let mut pos = 0usize;
                 let state_trace = std::env::var("CMF_STATE_TRACE").is_ok();
                 while pos < n {
-                    let end = (pos + CHUNK).min(n);
+                    let end = (pos + chunk_len).min(n);
                     let bsz = end - pos;
                     let hb = self.prefill_rows(&ids[pos..end], pos, task_mask)?;
                     self.nll_check_graph("batched prefill", pos)?;

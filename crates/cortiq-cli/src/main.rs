@@ -800,8 +800,12 @@ enum Commands {
         hessians: Option<String>,
         /// q4tp/q2tp: capture the Hessians of this many layers per
         /// calibration pass (0 = all at once). Bounds RAM — a dense Hessian
-        /// is 8·cols² bytes, ~0.5 GB per layer of a 2B model — at the price of
-        /// one calibration forward per pass
+        /// is 8·cols² bytes on the host, ~0.5 GB per layer of a 2B model — at
+        /// the price of one calibration forward per pass. With a wgpu GPU
+        /// (the default where one is present; `CMF_GPTQ_GPU=0` keeps the
+        /// CPU) the forward runs on the card and the Hessians accumulate
+        /// there as packed f32 triangles, read back one group at a time by
+        /// the fold: Qwen3.8-27B's 64 layers take ~50 GB, one pass
         #[arg(long, default_value = "0")]
         calib_chunk_layers: usize,
         /// q2tp: how group scales are placed — `placed` (default: ladder at
