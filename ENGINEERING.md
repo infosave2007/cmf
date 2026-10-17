@@ -299,7 +299,28 @@ Notes on these two rows:
   nothing at 4 bits, because the q4tp cortiq rule's absmax scales are
   already unbiased. It stays opt-in.
 
-QWEN06_PLACEHOLDER
+**Long, mixed budget on a second model: Qwen3-0.6B.**
+
+Setup:
+- `quantize-gptq --codec q2tp --tokens 131072 --calib wiki.train.raw=0.75
+  --calib docs.txt=0.25`, defaults (placed rule, debias on), one pass.
+- 64 windows of 2048 tokens. The calibration forward took 56 min on the
+  shared pod and GPTQ 80 s; peak RSS was 6.4 GB.
+- cortiq CPU ppl on WikiText-2 test, the first 10 windows of the 40-window
+  512-token placement, the same windows for every file.
+- Head and embeddings stay at the converter's q4tp (tied embeddings).
+
+| file | bytes | ppl (10 × 512) |
+|---|---:|---:|
+| f16 | 1 521 935 294 | 24.98 |
+| `convert --quant q2tp`, `CMF_Q2TP_ENCODER=v1` | 367 817 662 | 2201.1 |
+| `convert --quant q2tp` (v2) | 367 817 662 | 416.1 |
+| GPTQ-q2tp, 131k tokens | 360 821 694 | **39.25** |
+
+The v2 encoder improves the converter 5.3× here as well. GPTQ with the
+defaults brings 2-bit gate/up to +57 % over f16 at a quarter of the size.
+The 7 MB difference between the files is container padding: the converter's
+streaming writer pads more than `CmfModel::write`.
 
 ### Open issues
 
@@ -307,7 +328,8 @@ QWEN06_PLACEHOLDER
   Qwen3.8-27B.** The Hessian hook lives in the CPU `QTensor::matmat`.
   - MiniCPM5-2B (q8_2f model, 13 threads): about 155 s per 2048-token
     window, roughly 13 tok/s. 32k tokens take about 40 min per pass; 131k
-    tokens take about 2.8 h.
+    tokens take about 2.8 h. For that reason the MiniCPM5 131k arm was not
+    run; the long budget was shown on Qwen3-0.6B instead (52 s per window).
   - At 27B the same path costs about 13× more per token.
   - The tools below are ready for that scale; the forward is not. The next
     step is GPU-side capture: accumulate `XᵀX` for the four distinct
@@ -324,8 +346,16 @@ QWEN06_PLACEHOLDER
 - **Fold operator.** In flight, one group holds 3n² f64 + n² f32 (8 GB at
   n = 17408). It is O(n³), about 3.5 T multiply-adds per 27B `down_proj`.
   - The threaded version and `CMF_GPTQ_MEM_GB` handle this.
-  - On MiniCPM5 the GPTQ phase is a few minutes, so folding is not the
-    bottleneck there.
+  - On MiniCPM5 one GPTQ-only arm took 14–20 min on the shared pod, about
+    7 min per 21-layer chunk, mostly the 6144-wide folds.
+  - The cache blocking made no measurable difference there (W0c_blocked
+    879 s against W0c 829 s, same bytes, both under contention). At this
+    size the folds are compute-bound in `dot64`. A faster `dot64` with more
+    accumulators would change the summation order, and with it the q4tp
+    bytes, so it was not done.
+- **Mixed calibration** has only been checked functionally (detM, and the
+  Qwen3-0.6B run). Its effect on quality against WikiText-only calibration
+  was not isolated.
 - **Not ported from the q2tp study:**
   - the H-metric refit and the code/scale alternation (with layer 7 fixed:
     −12 % on the cortiq line, −9 % on the placed line; they need held-out

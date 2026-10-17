@@ -40,9 +40,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   results. `CMF_GPTQ_MEM_GB` caps how many Hessian groups are in flight.
 
 ### Performance
-- MiniCPM5-2B, q2tp profile with head and embeddings q8_2f, WikiText-2 test
-  (160 × 512): `convert --quant q2tp` perplexity goes from 206.6 to 89.5.
-  Further results are in `ENGINEERING.md`.
+- MiniCPM5-2B, q2tp profile with head and embeddings q8_2f (1.31 GB),
+  WikiText-2 test, 160 × 512 windows:
+
+  | method | ppl |
+  |---|---:|
+  | bf16 reference | 18.89 |
+  | `convert --quant q2tp`, before this release | 206.6 |
+  | `convert --quant q2tp` (v2 encoder) | 89.5 |
+  | `quantize-gptq --codec q2tp`, 32k tokens, cortiq rule | 37.7 |
+  | the same, placed rule | 31.3 |
+  | placed rule + debias (the defaults) | 27.8 |
+
+- `--codec q4tp` on the same 32k calibration gives 19.62, against 20.23
+  for the shipped 2048-token recipe.
+- Details are in `ENGINEERING.md`.
 
 ## [0.8.19] - 2026-10-15
 
