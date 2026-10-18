@@ -1,7 +1,8 @@
 # DeepSeek-V4.1 wave 1, task A: fixture, loader, encoding, act_quant(o)
 
 Branch `dsv41-fixes` (worktree `cmf-dsv41a`), based on `origin/master` =
-cortiq 0.8.23 (`336b0e75`). Mac-only work (Apple M4): CPU builds and tests,
+cortiq 0.8.23 (`336b0e75`); integration pass on `dsv41-int-a` (see "Lane A
+integration pass" below). Mac-only work (Apple M4): CPU builds and tests,
 no pod, no model files. Reference: `deepseek-ai/DeepSeek-V4.1-Flash-1017`
 revision `1bae0e10` (MIT). The 1017 release changes weights only; config,
 `model.py`, index and safetensors headers are identical to V4.1-Flash.
@@ -66,12 +67,17 @@ Measured on the M4 (aarch64):
 | strict with one BF16 boundary removed (mutation check) | 0/12 exact, worst 5.0e-2 (test fails) | |
 
 The exact positions mean every BF16 boundary, quantizer, rope pair, hc
-transpose, router, index top-k and candidate rule agrees; the one 3e-3
-position is a single f32-vs-f64 BF16 flip carried by the FP4 caches.
-Tests assert: strict >= 2/3 positions within 1e-5 and worst < 0.15;
-default worst < 0.25 and argmax >= 10/12; two runs and pool/no-pool
-bit-identical (default and strict); `Pipeline::from_model` parses the same
-`Dsv41Cfg` and `dsv41_serial_logits` equals the direct walk bit for bit.
+transpose, router, index top-k and candidate rule agrees. The one 3e-3
+position is position index 4: a local BF16 flip in L4's hc_pre/input-norm
+output, absorbed by L4's FP8 window KV (positions 5..11 are exact again),
+not carried by the FP4 caches.
+Tests assert (`assert_strict_agreement`): on aarch64, where this was
+measured, strict >= 10/12 positions within 1e-5 and worst < 2e-2,
+candidates-off and O_FP8 12/12; on other targets the median position within
+1e-5 and worst < 0.15 (see below). Default worst < 0.25 and argmax >= 10/12;
+two runs and pool/no-pool bit-identical (default and strict);
+`Pipeline::from_model` parses the same `Dsv41Cfg` and `dsv41_serial_logits`
+equals the direct walk bit for bit.
 
 Known differences between cortiq and the official kernels (the reference
 can emulate both, `RefOpts`):
@@ -79,17 +85,28 @@ can emulate both, `RefOpts`):
   (`acc_s_cast`) before the PV GEMM; cortiq keeps f32.
 - `sparse_attn` writes BF16 `o` and the inverse RoPE reads it; cortiq
   rotates the f32 accumulator and rounds once.
-Each alone moves the fixture logits by up to ~7.5e-2 (same scale as one
-BF16 flip propagating through the FP4 caches), so their effect on the real
-model is unknown; candidates for a later parity pass, not changed here.
+Each alone moves the fixture logits by up to ~7.5e-2 (the scale of one
+BF16 flip at an unlucky position: the A8W8 CPU run and the device run both
+show 7.5e-2 at position 8), so their effect on the real model is unknown;
+candidates for a later parity pass, not changed here.
 
 Not covered by the fixture: the multimodal path (vision tower, image spans,
 VL routing bias), DSpark/MTP, prefill batching (V4.1 prefill is token
 serial), long contexts (> window 4, index top-k 3 only at toy scale).
 
-The CPU tests run in CI on ubuntu (x86 AVX2) and macOS; the bounds were
-measured on ARM only. The x86 strict path regroups f32 sums (AVX2), which
-changes where BF16 flips land, not whether the structure agrees.
+The CPU tests run in CI on ubuntu (x86 AVX2) and macOS (Apple Silicon); the
+bounds were measured on ARM only. The macOS runner executes the same NEON
+f32 kernels as the M4 (the only CPU-dispatched aarch64 kernels are the int8
+dotprod/i8mm ones, which the strict path does not use), so the measured
+counts are asserted there. The x86 strict path regroups f32 sums (AVX2),
+which changes where BF16 flips land, not whether the structure agrees; it
+could not be measured here (Rosetta on the M4 reports no AVX/AVX2, so an
+x86_64 build would run the scalar kernels, not CI's). Two other summation
+orders on this fixture, the A8W8 CPU path and the device kernels, each put a
+7.5e-2 flip on position 8, so on x86 the strict tests assert the median
+per-position error (< 1e-5: a structural regression moves every position)
+and keep worst < 0.15. The pod run of the CPU binaries on x86 is the place
+to tighten that.
 
 The CPU binaries set `CMF_GPU=0` before any engine call: `cargo test
 --workspace` unifies `cortiq-engine/gpu` (the CLI enables it by default),
@@ -99,11 +116,35 @@ in a `--features gpu` build on the M4 (same numbers).
 
 ### GPU (wgpu) fixture run on the M4 (Metal through wgpu)
 
-`cargo test -p cortiq-engine --features gpu --test dsv41_fixture_gpu --
---nocapture`: worst relative logit error 7.5e-2, argmax 12/12, 1.9 s.
-`CMF_DSV41_PROF` counters: attention tail 48 device calls, 12 fallbacks
-(L4, whose F32 attention linears the q4tp frame does not take); MoE 36
-device calls, 24 host calls, 3 cold experts.
+`CMF_GPU=wgpu cargo test -p cortiq-engine --features gpu --test
+dsv41_fixture_gpu -- --nocapture` (on macOS the GPU binaries skip unless
+`CMF_GPU=wgpu` is exported; elsewhere they select wgpu themselves). The host
+parts run exact (`float_activations_scope`), so the error is the device
+kernels'. Two variants in one process: the fixture as built (q4tp gate/up
+on L0/L2/L4, so a q4tp bank) and `Fixture::build_q2_even` (q2tp on
+L0/L2/L4, so the q2tp bank runs on the device). The test asserts the
+`CMF_DSV41_PROF` counters through `dsv41::profile_counters()`: 48 device
+attention tails + 12 fallbacks (L4, whose F32 attention linears the q4tp
+frame does not take) and device MoE calls where the adapter can hold the
+segmented bank (`dsv4_global_moe_supported()`). M4: 48/12, MoE 36 device /
+24 host for both variants.
+
+Per-position relative logit error, with two broken device paths for scale
+(`CMF_DSV41_TEST_MUTATE=sink` hands the frame zero sinks, `=rope` shifts
+its inverse RoPE by one position; both must fail the test):
+
+| run (M4) | median | worst |
+|---|---|---|
+| q4tp bank, clean | 1.04e-2 | 7.5e-2 |
+| q2tp bank, clean | 6.1e-3 | 8.2e-3 |
+| O_FP8, q4tp bank, against the act_quant(o) reference | 8.6e-3 | 7.3e-2 |
+| zero sinks, q4tp / q2tp / O_FP8 | 4.9e-2 / 3.8e-2 / 4.7e-2 | 9.6e-2 / 8.2e-2 / 1.0e-1 |
+| inverse RoPE off by one, q4tp / q2tp / O_FP8 | 5.2e-2 / 4.2e-2 / 5.1e-2 | 1.45e-1 / 1.42e-1 / 1.3e-1 |
+
+The worst position does not separate clean from broken (the old bound,
+worst < 0.25, passed both mutations); the median does, by 3.6x or more.
+Bounds now: median < 2.5e-2 and worst < 0.12. Other cards round
+differently; the median has 2.4x headroom over the M4's clean q4tp run.
 
 Findings for the pod run:
 - The dynamic expert bank is created once per state with the first MoE
@@ -111,7 +152,8 @@ Findings for the pod run:
   `dynamic_moe_gpu`). Layers with the other layout (here the q2tp layers
   L1/L3 after the q4tp L0) are refused and run on the host. Correct, but a
   checkpoint mixing q4tp and q2tp gate/up across layers gets only one of
-  them on the card.
+  them on the card. Both layouts are now exercised on the device by the
+  two fixture variants.
 - On an adapter without a VRAM budget (`device_vram_budget() = u64::MAX`,
   Apple unified memory through wgpu) the bank is sized from that value:
   `resident_bytes` 96 GiB on paper, 18 s of device waits per token
@@ -203,9 +245,9 @@ float8_e8m0fnu, inplace=True)`, then the BF16 `einsum` with `wo_a`. cortiq:
 the CPU attention tail after the inverse RoPE and BF16 boundary, before
 `o_project`. The group width (release 64*512/8 = 4096, fixture 64) is a
 multiple of 32, so the per-group 32-blocks are contiguous runs of the flat
-output. With the flag set the device attention tail is skipped (it has no
-quantizer), so the flag means reference semantics on every backend, at CPU
-attention speed.
+output. The device attention tail applies the same quantizer with its own
+kernel (below), so the flag means reference semantics on every backend
+without leaving the device frame.
 
 `fp8_activation_inplace` (also the window-KV quantizer) now computes the
 scale exactly as the kernel: `amax * f32(1/448)` and the bit-level
@@ -226,40 +268,104 @@ process): strict CPU with the flag matches the reference with `act_quant(o)`
 at 12/12 positions (worst 1.2e-7) and differs from the reference without it
 by 8.0e-2.
 
-GPU path, not built (per task): the DSV4 attention frame
+GPU path (lane A integration): the DSV4 attention frame
 (`gpu_wgpu::dsv4_attn_frame`) runs `encode_sparse_attend2` ->
 `encode_rope_heads(inverse)` -> `encode_bf16_round(attn)` (cache key 40) ->
-`o_lora_a`. A kernel `fp8_act_quant32` belongs between the BF16 round and
-`o_lora_a`, in place on `attn` (`nh*hd` floats): one 32-lane group per
-32-value block (subgroup or workgroup reduction), `amax = max(|x|, 1e-4)`,
-`t = amax * (1.0 / 448.0)` in f32 (the f32-rounded constant, as the
-kernel and the host use), `e = ((bits(t) >> 23) & 0xff) - 127 +
-(mantissa(t) != 0)`, `s = bitcast<f32>((e + 127) << 23)`; per value
-`v = clamp(x / s, -448, 448)` rounded to E4M3FN nearest-even in integer
-arithmetic on the f32 bits (normal: keep 3 mantissa bits with RNE carry;
-below 2^-6: round `v * 512` to an integer, ties to even), times `s`, then a
-BF16 round (exact, but keep the boundary). WGSL has no FP8 type and the
-repo has no device E4M3 helper yet; the host `e4m3_round` is the oracle.
-Once the kernel exists and the skip below is lifted, the existing
-`CMF_DSV41_TAIL_TAP=mid` diagnostic prints the device and host `wo_a`
-outputs for the same token (the fixture GPU test can then run with the flag
-in its own binary, like `dsv41_fixture_o_fp8.rs`). Fusing it into the inverse-RoPE kernel (which
-already owns `attn`) needs a 32-element block per lane group instead of the
-per-head rotation stride, so a separate dispatch is simpler. Until then
-`CMF_DSV41_O_FP8=1` forces the CPU attention tail. The upstream DSpark
-attention has the same `act_quant(o)`; cortiq's V4.1 runtime has no DSpark
-head, so nothing to change there.
+`fp8_act_quant32` (new, cache key 47, only when `Dsv4AttnGeom::o_fp8`) ->
+`o_lora_a`. The V4.1 caller sets `o_fp8` from `CMF_DSV41_O_FP8`; DSV4 and
+the layer frames keep it false, so their encoders are unchanged. The kernel
+(`gpu_wgpu/fp8_act.rs`, lazily built module) gives one invocation per
+32-value block and works on the f32 bits: the block amax is an integer max
+of the magnitudes floored at `1e-4f32`, `t = amax * f32(1/448)` is the one
+float operation (a correctly rounded multiply of a normal number),
+`e = fast_log2_ceil(t)`, `x / 2^e` is an exponent subtraction, E4M3FN
+rounding is nearest-even on the mantissa (3 kept bits for normals, the 2^-9
+grid below 2^-6, the carry into the exponent), clamped at 448, `q * 2^e` an
+exponent addition, then the BF16 round (exact, kept). It follows the host
+sign rule: an exact zero becomes +0, a nonzero value that rounds to zero
+keeps its sign unless the host's f32 quotient itself underflows to zero. No
+step depends on denormal or fast-math behaviour. A device that rejects the
+module declines the frame before encoding, and the host tail quantizes.
+
+Tests: `dsv41::tests::fp8_act_quant32_device_matches_host_bits` (runs where a
+wgpu adapter is selected; `CMF_GPU=wgpu` on macOS) compares device and host
+bits on the reference set above plus 2000 full-mantissa f32 blocks over the
+whole finite range (f32 subnormals included) and the underflow corner of the
+sign rule: 0 of 4008 blocks differ on the M4; three kernel mutations (ties
+away in the normal branch, `>=` in the subnormal tie, no underflow zero) are
+each caught. `tests/dsv41_fixture_gpu_o_fp8.rs` runs the fixture with the
+flag on the device: 48 device tails (the frame is no longer skipped), median
+8.6e-3 / worst 7.3e-2 against the act_quant(o) reference. A tap at position
+5 (`CMF_DSV41_TAIL_TAP=attn CMF_DSV41_TRACE=1 CMF_DSV41_TRACE_FULL=1
+CMF_DSV41_TRACE_POS=5`) shows the device frame's attended output on the
+E4M3 grid (128/128 values with at most 3 mantissa bits, against 6-9 without
+the flag) and equal to the host's quantized output in all 128 values of
+L0..L3. The upstream DSpark attention has the same `act_quant(o)`; cortiq's
+V4.1 runtime has no DSpark head, so nothing to change there.
+
+Cost. Device tail: one extra compute pass per layer in the frame's existing
+encoder (no submit, no readback); for the release output (32768 values,
+1024 blocks = 16 workgroups of 64) its arithmetic is negligible against the
+grouped `wo_a` that follows, so the cost is the per-pass overhead, a few
+microseconds per layer (an estimate; not measured at release size).
+Host tail: `fp8_activation_inplace` costs 0.62 ms per 32768-value layer
+output on one M4 core (18.9 ns per value, measured with the function copied
+into an `-O` microbenchmark), about 25 ms per token over 40 layers, single
+threaded; read `attention_other` in the `CMF_DSV41_PROF` report.
+
+## Lane A integration pass (branch `dsv41-int-a`)
+
+- act_quant(o) on the device tail (Part 4 above); `CMF_DSV41_O_FP8=1` no
+  longer forces the CPU tail. Still off by default.
+- `dsv4_global_moe_create_for_dsv41` picks S16 on its own when the request,
+  after the workspace carve-out, exceeds what eight segment buffers address
+  (`per_segment` = binding range / max(gu_len, d_len)) and the adapter is
+  S16-capable, building the S16 pipelines on first need. The decision is the
+  one `dsv4_global_moe_create_slots` already made, now shared
+  (`dsv4_global_moe_pick_segments`). `CMF_DSV41_GLOBAL_SEGMENTS=8` forces S8,
+  `=16` keeps the eager opt-in. One `tracing` info line per process names
+  the family and capacity. Release geometry on a 2 GiB binding range: S8
+  addresses 2792 slots; a 3900-slot request gets 3888 under S16. On the M4
+  the fixture bank stays S8 (budget-limited); `=16` gives identical logits.
+- GPU fixture: device-path counters asserted, both bank layouts, bound from
+  a mutation check (GPU section above); `dsv41::profile_counters()`.
+- `Dsv41Cfg::from_source`: a null candidate key is skipped (the other
+  spelling or the release default applies), an integral float (`20.0`) is
+  an integer, and the error names the key it read.
+- Fixture containers are written to a temp directory that is removed as
+  soon as the model is open (`Fixture::open`).
+- Strict CPU bounds: measured counts on aarch64, median per-position on
+  other targets (Part 1).
+- `cargo test --workspace` on CI: the CPU binaries pin `CMF_GPU=0`. The GPU
+  binaries (`dsv41_fixture_gpu`, `dsv41_fixture_gpu_o_fp8`) skip on the
+  ubuntu runner (no adapter) and, on macOS, run only with `CMF_GPU=wgpu`
+  exported, so the CI's macOS VM (paravirtual Metal, not a reference device:
+  the repo's Metal exactness tests are kept off it for the same reason)
+  skips them; the M4 and the pod run them. The fp8 device unit test follows
+  the lib's convention (runs wherever wgpu is selected; it is bit-exact
+  integer arithmetic, so it does not depend on the device's rounding).
+- The dsv41-int merge had left the lib tests uncompiled (`tiny_stack` still
+  built `candidate_source: 99`); now `Some(99)`, same behaviour.
 
 ## Open issues for the lead
 
-- Pod: run `cargo test -p cortiq-engine --features gpu --test dsv41_fixture_gpu
-  -- --nocapture` on the target card and read the `[dsv41-profile]` counters
-  (expect 48 device attention calls; MoE device calls depend on the card's
-  budget and the layout note above). Also the CPU binaries on x86 (CI does
-  this on ubuntu): `--test dsv41_fixture --test dsv41_fixture_o_fp8`.
+- Pod: `cargo test -p cortiq-engine --features gpu --test dsv41_fixture_gpu
+  --test dsv41_fixture_gpu_o_fp8 -- --nocapture` on the target card. The
+  tests assert 48 device attention tails and device MoE calls themselves;
+  read the printed medians against the M4's (bound 2.5e-2). Also the CPU
+  binaries on x86, `--test dsv41_fixture --test dsv41_fixture_o_fp8`, and
+  the per-position errors they print: if x86 is as exact as ARM, the
+  aarch64 bounds of `assert_strict_agreement` can apply there too.
 - `CMF_DSV41_O_FP8` is off by default; its effect on the released weights
-  (perplexity / answers, with the 1017 checkpoint) is unmeasured. The device
-  kernel is sketched above; with the flag the attention tail is CPU-only.
+  (perplexity / answers, with the 1017 checkpoint) is unmeasured. Measure
+  `O_FP8=1` against `O_FP8=0` with the SAME attention path in both arms:
+  the device tail (default; both arms now keep it, so the comparison is the
+  quantizer alone, at a few microseconds per layer), and, for the CPU-tail
+  check, `CMF_DSV41_GPU_ATTN=0` in both arms (there the flag also costs
+  ~0.6 ms per layer, ~25 ms per token on an M4-class core, so compare
+  tokens/s only within one tail). Before this pass `O_FP8=1` silently moved
+  attention to the CPU, so an `O_FP8=1` vs default run mixed the quantizer
+  with the tail change.
 - Two journaled BF16 boundaries in sparse attention differ from the
   official kernel (probabilities before PV, `o` before the inverse RoPE);
   candidates for a parity pass on the real model, not changed.
