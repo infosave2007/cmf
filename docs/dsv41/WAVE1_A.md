@@ -91,7 +91,35 @@ The CPU tests run in CI on ubuntu (x86 AVX2) and macOS; the bounds were
 measured on ARM only. The x86 strict path regroups f32 sums (AVX2), which
 changes where BF16 flips land, not whether the structure agrees.
 
-GPU test: see "GPU" below.
+The CPU binaries set `CMF_GPU=0` before any engine call: `cargo test
+--workspace` unifies `cortiq-engine/gpu` (the CLI enables it by default),
+and on a host with an adapter the V4.1 attention tail and MoE would move to
+the device under the strict assertions. Checked by running the CPU binaries
+in a `--features gpu` build on the M4 (same numbers).
+
+### GPU (wgpu) fixture run on the M4 (Metal through wgpu)
+
+`cargo test -p cortiq-engine --features gpu --test dsv41_fixture_gpu --
+--nocapture`: worst relative logit error 7.5e-2, argmax 12/12, 1.9 s.
+`CMF_DSV41_PROF` counters: attention tail 48 device calls, 12 fallbacks
+(L4, whose F32 attention linears the q4tp frame does not take); MoE 36
+device calls, 24 host calls, 3 cold experts.
+
+Findings for the pod run:
+- The dynamic expert bank is created once per state with the first MoE
+  layer's gate/up layout (`QwenGpuPool::create_for_dsv41(.., gu_q2)` in
+  `dynamic_moe_gpu`). Layers with the other layout (here the q2tp layers
+  L1/L3 after the q4tp L0) are refused and run on the host. Correct, but a
+  checkpoint mixing q4tp and q2tp gate/up across layers gets only one of
+  them on the card.
+- On an adapter without a VRAM budget (`device_vram_budget() = u64::MAX`,
+  Apple unified memory through wgpu) the bank is sized from that value:
+  `resident_bytes` 96 GiB on paper, 18 s of device waits per token
+  (`gpu_moe_wait_ms` 215 674 over 60 calls) and still zero device MoE calls.
+  `CMF_GPU_VRAM_MB=4096` gives a 1 GiB bank and 36 device calls; 2048 leaves
+  no bank (workspace reserve). The GPU test therefore defaults
+  `CMF_GPU_VRAM_MB=4096` when unset. The sizing itself is shared Qwen/V4.1
+  pool code and was not changed here.
 
 ## Part 2: loader hardening
 
@@ -204,7 +232,8 @@ GPU path, not built (per task): the DSV4 attention frame
 `o_lora_a`. A kernel `fp8_act_quant32` belongs between the BF16 round and
 `o_lora_a`, in place on `attn` (`nh*hd` floats): one 32-lane group per
 32-value block (subgroup or workgroup reduction), `amax = max(|x|, 1e-4)`,
-`t = amax * 0.002232142857` as f32, `e = ((bits(t) >> 23) & 0xff) - 127 +
+`t = amax * (1.0 / 448.0)` in f32 (the f32-rounded constant, as the
+kernel and the host use), `e = ((bits(t) >> 23) & 0xff) - 127 +
 (mantissa(t) != 0)`, `s = bitcast<f32>((e + 127) << 23)`; per value
 `v = clamp(x / s, -448, 448)` rounded to E4M3FN nearest-even in integer
 arithmetic on the f32 bits (normal: keep 3 mantissa bits with RNE carry;

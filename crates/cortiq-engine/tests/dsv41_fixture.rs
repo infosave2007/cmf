@@ -28,6 +28,17 @@ use cortiq_engine::qtensor::float_activations_scope;
 use dsv41_fixture::*;
 use std::sync::Arc;
 
+/// These are CPU tests. A workspace build unifies `cortiq-engine/gpu`
+/// (the CLI enables it by default), and on a host with an adapter the V4.1
+/// attention tail and MoE would then move to the device and the strict
+/// comparisons would measure the GPU kernels. `CMF_GPU=0` before any
+/// backend initialization is the only process-wide off switch.
+fn cpu_only() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    // SAFETY: every test calls this first; the value never changes after.
+    ONCE.call_once(|| unsafe { std::env::set_var("CMF_GPU", "0") });
+}
+
 struct Loaded {
     model: Arc<CmfModel>,
     cfg: Dsv41Cfg,
@@ -35,6 +46,7 @@ struct Loaded {
 }
 
 fn load_fixture(fx: &Fixture, tag: &str) -> Loaded {
+    cpu_only();
     let path = fx.write(tag);
     let model = Arc::new(CmfModel::open(&path).expect("open fixture"));
     let source = model

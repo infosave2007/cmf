@@ -12,7 +12,11 @@
 //!
 //! The run prints the `CMF_DSV41_PROF` counters: a device path that refuses
 //! the fixture geometry falls back to the host silently and still passes the
-//! numeric check, so read `gpu_attn_calls` / `gpu_moe_calls` there.
+//! numeric check, so read `gpu_attn_calls` / `gpu_moe_calls` there. Expected
+//! on an M4 (wgpu/Metal): attention 48 device calls + 12 fallbacks (L4 has
+//! F32 attention linears; the frame takes q4tp), MoE 36 device calls + 24
+//! host calls (the bank is created with the first layer's q4tp gate/up
+//! layout; the q2tp layers L1/L3 stay on the host).
 
 #![cfg(feature = "gpu")]
 // The fixture's `json!` config nests past the default macro depth.
@@ -33,6 +37,15 @@ fn gpu_forward_tracks_f64_reference() {
     unsafe {
         std::env::set_var("CMF_GPU", "wgpu");
         std::env::set_var("CMF_DSV41_PROF", "1");
+        // An adapter that reports no VRAM budget (Apple unified memory via
+        // wgpu) sizes the V4.1 expert bank from u64::MAX: ~96 GiB of slots
+        // on paper, ~18 s of device waits per token, and every MoE call
+        // falling back to the host. The bank allocator keeps a workspace
+        // reserve below the budget: 2 GiB leaves no bank at all, 4 GiB gives
+        // a 1 GiB bank (measured on the M4), plenty for the fixture.
+        if std::env::var_os("CMF_GPU_VRAM_MB").is_none() {
+            std::env::set_var("CMF_GPU_VRAM_MB", "4096");
+        }
     }
     if !cortiq_engine::gpu_wgpu::enabled() {
         eprintln!("skipped: no WGPU adapter");
