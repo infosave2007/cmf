@@ -826,6 +826,33 @@ mod tests {
     /// exported to the host. Skips without an adapter or descriptor indexing.
     #[test]
     fn global_bank_frame_runs_mxfp4_experts() {
+        global_bank_case("bank", 128, 64, 0.5, 16, 0.02);
+    }
+
+    /// [`global_bank_frame_runs_mxfp4_experts`] at the V4.1 release expert
+    /// geometry (gate/up 2304x5120, down 5120x2304): 160 groups per gate/up
+    /// row, so each lane of `dsv4_global_gate_up_mxfp4` walks 2-3 groups,
+    /// and 72 per down row, so the down kernel's flat `slot · gpr + g` walk
+    /// hands one lane groups of different slots (lane 10: slot 0 g10, slot
+    /// 1 g2, slot 1 g66, slot 2 g58). V4.1's SwiGLU limit 10. Eight slots
+    /// (150 MB) of bank.
+    #[test]
+    fn global_bank_frame_runs_mxfp4_experts_at_release_geometry() {
+        global_bank_case("bank-1017", 5120, 2304, 10.0, 8, 0.01);
+    }
+
+    /// One bank-frame comparison: four routed experts plus a shared one,
+    /// `[inter, dim]` gate/up and `[dim, inter]` down, three routes (the
+    /// last with a cold winner), bounded by `max_nrmse` and cos > 0.999
+    /// against the host.
+    fn global_bank_case(
+        tag: &str,
+        dim: usize,
+        inter: usize,
+        limit: f32,
+        extra_slots: usize,
+        max_nrmse: f64,
+    ) {
         unsafe { std::env::set_var("CMF_GPU", "wgpu") };
         let Some(c) = ctx() else {
             eprintln!("no wgpu adapter — skipping mxfp4 global bank test");
@@ -837,10 +864,10 @@ mod tests {
             return;
         }
         eprintln!(
-            "mxfp4 global bank on the device: {} ({:?})",
+            "mxfp4 global bank {dim}x{inter} on the device: {} ({:?})",
             c.adapter_info.name, c.adapter_info.backend
         );
-        let (dim, inter, n_exp) = (128usize, 64usize, 4usize);
+        let n_exp = 4usize;
         let mut tensors = Vec::new();
         let names: Vec<[String; 3]> = (0..=n_exp)
             .map(|e| {
@@ -861,14 +888,14 @@ mod tests {
             tensors.push((n[1].as_str(), inter, dim, payload(inter, dim, 10 * e + 2)));
             tensors.push((n[2].as_str(), dim, inter, payload(dim, inter, 10 * e + 3)));
         }
-        let (model, dir) = model_with("bank", &tensors);
+        let (model, dir) = model_with(tag, &tensors);
         let triples: Vec<(usize, usize, usize)> =
             (0..=n_exp).map(|e| (3 * e, 3 * e + 1, 3 * e + 2)).collect();
         let (gu_len, d_len) = MoeBankCodec::Mxfp4.lens(inter, dim).unwrap();
         let gib = 1024u64 * 1024 * 1024;
         let budget = dsv4_vram_budget().unwrap();
         let workspace = (budget / 10).clamp(2 * gib, 4 * gib);
-        let request = (workspace / (2 * gu_len + d_len) as u64) as usize + 16;
+        let request = (workspace / (2 * gu_len + d_len) as u64) as usize + extra_slots;
         let Some((capacity, segment_slots)) = dsv4_global_moe_create_for_dsv41_codec(
             &model,
             request,
@@ -880,7 +907,10 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             return;
         };
-        assert!(capacity >= 8);
+        assert!(
+            capacity >= 8 && capacity <= extra_slots,
+            "capacity {capacity}"
+        );
         // A second create for another codec on the same model is refused.
         assert!(
             dsv4_global_moe_create_for_dsv41_codec(&model, request, inter, dim, MoeBankCodec::Q4tp)
@@ -896,7 +926,6 @@ mod tests {
                     .map(|name| crate::qtensor::QTensor::from_model(&model, &name).unwrap())
             })
             .collect();
-        let limit = 0.5f32;
         let host_expert = |e: usize, x: &[f32], wgt: f32| -> Vec<f32> {
             let (mut g, mut u) = (vec![0f32; inter], vec![0f32; inter]);
             crate::gpu::cpu_scope(|| {
@@ -1006,11 +1035,12 @@ mod tests {
                 gg += (*a as f64).powi(2);
             }
             let cos = dot / (den * gg).sqrt();
+            let nrmse = (num / den).sqrt();
+            eprintln!("  {tag} case {case}: nrmse {nrmse:.3e} cos {cos:.7}");
             assert!(den > 0.0, "case {case}: the experts contribute nothing");
             assert!(
-                (num / den).sqrt() < 0.02 && cos > 0.999,
-                "case {case}: nrmse {} cos {cos}",
-                (num / den).sqrt()
+                nrmse < max_nrmse && cos > 0.999,
+                "case {case}: nrmse {nrmse} cos {cos}"
             );
         }
         drop(q);
