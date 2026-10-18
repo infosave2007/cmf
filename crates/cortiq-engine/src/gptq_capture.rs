@@ -19,7 +19,58 @@ static ON: AtomicBool = AtomicBool::new(false);
 /// path needs — and the only thing that fits for a 12B (full H would be
 /// ~100 GB across the model).
 static FULL_H: AtomicBool = AtomicBool::new(true);
-static REG: Mutex<Option<HashMap<String, HessianAcc>>> = Mutex::new(None);
+static REG: Mutex<Option<State>> = Mutex::new(None);
+/// Keep the dense Hessians on the device (`set_device`): each distinct input
+/// gets a `gpu::gram_*` accumulator, every batch one `H += XᵀX` dispatch, and
+/// `Σx²` is read off the diagonal at the end instead of summed on the host.
+static DEVICE: AtomicBool = AtomicBool::new(false);
+
+struct Entry {
+    acc: HessianAcc,
+    dev: Option<u64>,
+}
+
+/// One capture pass. Projections that read the same panel (q/k/v, gate/up,
+/// a GDN block's qkv/z) arrive back to back with byte-identical input: the
+/// first one owns the Hessian, the others alias it and cost a memcmp.
+#[derive(Default)]
+struct State {
+    map: HashMap<String, Entry>,
+    alias: HashMap<String, String>,
+    /// The owner of the last folded input, its length and content hash.
+    last: Option<(String, usize, u64)>,
+    /// Aliases whose input later differed from their owner's, and device
+    /// accumulators that failed: their Hessians are not valid.
+    broken: Vec<String>,
+}
+
+/// What a capture pass produced: Hessians by owner, `(alias, owner)` pairs
+/// for the projections that shared an owner's input, and the names whose
+/// capture is invalid (see [`State::broken`]).
+pub struct Captured {
+    pub hess: HashMap<String, HessianAcc>,
+    pub alias: Vec<(String, String)>,
+    pub broken: Vec<String>,
+    /// [`end_shared_lazy`] only: owners whose dense Hessian is still on the
+    /// device (their `h` is empty) — `gpu::gram_take(id)` reads it back.
+    pub device: HashMap<String, u64>,
+}
+
+/// Accumulate dense Hessians on the device from the next `begin` on.
+pub fn set_device(on: bool) {
+    DEVICE.store(on, Ordering::SeqCst);
+}
+
+/// Whether the next capture accumulates its Hessians on the device.
+pub fn device_on() -> bool {
+    DEVICE.load(Ordering::SeqCst)
+}
+/// Which tensors to capture (`None` = all). A dense Hessian costs
+/// `8·cols²` bytes — 300 MB for one 6144-wide `down_proj` — so a caller that
+/// quantizes only some linears, or a model a few layers at a time, keeps
+/// everything else out of RAM and skips its O(b·cols²) accumulation.
+type CaptureFilter = Box<dyn Fn(&str) -> bool + Send>;
+static FILTER: Mutex<Option<CaptureFilter>> = Mutex::new(None);
 
 /// Accumulated input statistics of one linear layer over the calibration set.
 pub struct HessianAcc {
@@ -43,28 +94,116 @@ impl HessianAcc {
 /// Start capturing (clears any prior registry). `full_h` = accumulate the
 /// dense Hessian (fold path); false = diagonal-only (ternary + correction).
 pub fn begin(full_h: bool) {
-    *REG.lock().unwrap() = Some(HashMap::new());
+    *FILTER.lock().unwrap() = None;
+    crate::gpu::gram_clear();
+    *REG.lock().unwrap() = Some(State::default());
     FULL_H.store(full_h, Ordering::SeqCst);
     ON.store(true, Ordering::SeqCst);
 }
 
-/// Stop capturing and take the accumulated Hessians. `accumulate` fills
-/// only the upper triangle of each dense `H`; it is mirrored here so every
-/// consumer sees the full symmetric matrix.
+/// [`begin`], capturing only the tensors whose name passes `keep`. The
+/// others cost one closure call per matmat and no memory.
+pub fn begin_filtered(full_h: bool, keep: impl Fn(&str) -> bool + Send + 'static) {
+    begin(full_h);
+    *FILTER.lock().unwrap() = Some(Box::new(keep));
+}
+
+/// Stop capturing and take the accumulated Hessians by name. An alias gets
+/// its own copy of its owner's Hessian; invalid captures are left out.
 pub fn end() -> HashMap<String, HessianAcc> {
+    let Captured { mut hess, alias, broken, .. } = end_shared();
+    for (a, owner) in alias {
+        if let Some(src) = hess.get(&owner) {
+            let copy = HessianAcc {
+                cols: src.cols,
+                h: src.h.clone(),
+                sumsq: src.sumsq.clone(),
+                count: src.count,
+            };
+            hess.insert(a, copy);
+        }
+    }
+    for n in &broken {
+        hess.remove(n);
+    }
+    hess
+}
+
+/// Stop capturing: owners' Hessians (dense ones full and symmetric),
+/// aliases and invalid names, without copying any shared Hessian.
+pub fn end_shared() -> Captured {
+    end_impl(false)
+}
+
+/// [`end_shared`], leaving device-accumulated Hessians on the device: a
+/// 27B's 64 layers hold ~50 GB of packed f32 triangles there, ~200 GB as
+/// host f64 — the caller reads each back when its fold needs it.
+pub fn end_shared_lazy() -> Captured {
+    end_impl(true)
+}
+
+fn end_impl(lazy: bool) -> Captured {
     ON.store(false, Ordering::SeqCst);
-    let mut map = REG.lock().unwrap().take().unwrap_or_default();
-    for acc in map.values_mut() {
-        let n = acc.cols;
-        if acc.h.len() == n * n {
-            for i in 0..n {
-                for j in (i + 1)..n {
-                    acc.h[j * n + i] = acc.h[i * n + j];
+    *FILTER.lock().unwrap() = None;
+    let ns = ACC_NS.swap(0, Ordering::Relaxed);
+    let st = REG.lock().unwrap().take().unwrap_or_default();
+    let t0 = std::time::Instant::now();
+    let mut broken = st.broken;
+    let mut hess = HashMap::with_capacity(st.map.len());
+    let mut on_device = 0usize;
+    let mut device = HashMap::new();
+    for (name, mut e) in st.map {
+        if let Some(id) = e.dev {
+            on_device += 1;
+            if lazy {
+                // Σx² is the diagonal; a lazy owner's stays empty until its
+                // Hessian is read back (the GPTQ fold does not use it).
+                device.insert(name.clone(), id);
+                hess.insert(name, e.acc);
+                continue;
+            }
+            match crate::gpu::gram_take(id) {
+                Some(h) => {
+                    let n = e.acc.cols;
+                    e.acc.sumsq = (0..n).map(|i| h[i * n + i]).collect();
+                    e.acc.h = h;
+                }
+                None => {
+                    broken.push(name);
+                    continue;
+                }
+            }
+        } else {
+            let n = e.acc.cols;
+            let acc = &mut e.acc;
+            if acc.h.len() == n * n {
+                for i in 0..n {
+                    for j in (i + 1)..n {
+                        acc.h[j * n + i] = acc.h[i * n + j];
+                    }
                 }
             }
         }
+        hess.insert(name, e.acc);
     }
-    map
+    if ns > 0 {
+        eprintln!(
+            "gptq_capture: {:.1} s folding inputs ({} Hessians, {on_device} on the device, {} aliases; read back in {:.1} s)",
+            ns as f64 * 1e-9,
+            hess.len(),
+            st.alias.len(),
+            t0.elapsed().as_secs_f64()
+        );
+    }
+    let alias = st
+        .alias
+        .into_iter()
+        .filter(|(a, o)| !broken.contains(a) && hess.contains_key(o))
+        .collect();
+    if !broken.is_empty() {
+        eprintln!("gptq_capture: {} invalid captures: {broken:?}", broken.len());
+    }
+    Captured { hess, alias, broken, device }
 }
 
 #[inline]
@@ -74,34 +213,142 @@ pub fn capturing() -> bool {
 
 /// Fold a batch of `b` input vectors (`xs = [b·cols]`) into `name`'s Hessian.
 pub fn accumulate(name: &str, xs: &[f32], b: usize, cols: usize) {
+    let t0 = std::time::Instant::now();
+    accumulate_inner(name, xs, b, cols);
+    ACC_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// Wall time spent inside `accumulate` since the last `end()`.
+static ACC_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn accumulate_inner(name: &str, xs: &[f32], b: usize, cols: usize) {
+    if let Some(keep) = FILTER.lock().unwrap().as_ref()
+        && !keep(name)
+    {
+        return;
+    }
     let mut guard = REG.lock().unwrap();
-    let Some(map) = guard.as_mut() else {
+    let Some(st) = guard.as_mut() else {
         return;
     };
     let full = FULL_H.load(Ordering::Relaxed);
-    let acc = map.entry(name.to_string()).or_insert_with(|| HessianAcc {
-        cols,
-        h: if full {
-            vec![0.0; cols * cols]
-        } else {
-            Vec::new()
-        },
-        sumsq: vec![0.0; cols],
-        count: 0,
+    let hash = if full { content_hash(xs) } else { 0 };
+    if full {
+        if let Some(owner) = st.alias.get(name) {
+            let same = matches!(&st.last, Some((o, l, h)) if o == owner && *l == xs.len() && *h == hash);
+            if !same && !st.broken.iter().any(|n| n == name) {
+                st.broken.push(name.to_string());
+            }
+            return;
+        }
+        if !st.map.contains_key(name)
+            && let Some((owner, l, h)) = &st.last
+            && owner != name
+            && *l == xs.len()
+            && *h == hash
+            && st.map.get(owner).is_some_and(|e| e.acc.cols == cols)
+        {
+            st.alias.insert(name.to_string(), owner.clone());
+            return;
+        }
+    }
+    let device = full && DEVICE.load(Ordering::Relaxed);
+    let e = st.map.entry(name.to_string()).or_insert_with(|| {
+        let dev = if device { crate::gpu::gram_alloc(cols) } else { None };
+        if device && dev.is_none() {
+            eprintln!("gptq_capture: no device Hessian for {name} ({cols}²) — host fold");
+        }
+        Entry {
+            acc: HessianAcc {
+                cols,
+                h: if full && dev.is_none() {
+                    vec![0.0; cols * cols]
+                } else {
+                    Vec::new()
+                },
+                sumsq: if dev.is_some() { Vec::new() } else { vec![0.0; cols] },
+                count: 0,
+            },
+            dev,
+        }
     });
-    if acc.cols != cols {
+    if e.acc.cols != cols {
         return; // shape mismatch — skip defensively
     }
-    for bi in 0..b {
-        let x = &xs[bi * cols..(bi + 1) * cols];
-        for (i, &xi) in x.iter().enumerate() {
-            acc.sumsq[i] += xi as f64 * xi as f64;
+    e.acc.count += b;
+    let mut failed = false;
+    match e.dev {
+        Some(id) => failed = !crate::gpu::gram_add(id, xs, b),
+        None => {
+            for bi in 0..b {
+                let x = &xs[bi * cols..(bi + 1) * cols];
+                for (i, &xi) in x.iter().enumerate() {
+                    e.acc.sumsq[i] += xi as f64 * xi as f64;
+                }
+            }
+            if full {
+                gram_upper_add(&mut e.acc.h, xs, b, cols);
+            }
         }
-        acc.count += 1;
+    }
+    if failed && !st.broken.iter().any(|n| n == name) {
+        st.broken.push(name.to_string());
     }
     if full {
-        gram_upper_add(&mut acc.h, xs, b, cols);
+        match &mut st.last {
+            Some((o, l, h)) => {
+                o.clear();
+                o.push_str(name);
+                *l = xs.len();
+                *h = hash;
+            }
+            None => st.last = Some((name.to_string(), xs.len(), hash)),
+        }
     }
+}
+
+/// 64-bit content hash of an activation panel (its f32 bit patterns), the
+/// identity the aliasing compares: a q/k/v or gate/up panel is hashed, never
+/// copied. Large panels hash in parallel slices, combined in order.
+fn content_hash(xs: &[f32]) -> u64 {
+    fn mix(xs: &[f32], seed: u64) -> u64 {
+        let mut h = seed ^ 0x9E37_79B9_7F4A_7C15;
+        let mut acc = [h, h.rotate_left(17), h.rotate_left(31), h.rotate_left(47)];
+        let chunks = xs.chunks_exact(8);
+        let rest = chunks.remainder();
+        for c in chunks {
+            for l in 0..4 {
+                let v = (c[2 * l].to_bits() as u64) | ((c[2 * l + 1].to_bits() as u64) << 32);
+                acc[l] = (acc[l] ^ v).wrapping_mul(0xFF51_AFD7_ED55_8CCD).rotate_left(29);
+            }
+        }
+        for &v in rest {
+            h = (h ^ v.to_bits() as u64).wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+        }
+        for a in acc {
+            h = (h ^ a).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(27);
+        }
+        h ^ xs.len() as u64
+    }
+    const SLICE: usize = 1 << 18;
+    if xs.len() < 4 * SLICE {
+        return mix(xs, 0);
+    }
+    let parts: Vec<&[f32]> = xs.chunks(SLICE).collect();
+    let mut hs = vec![0u64; parts.len()];
+    let nth = std::thread::available_parallelism().map_or(4, |p| p.get()).min(parts.len());
+    std::thread::scope(|sc| {
+        for (t, out) in hs.chunks_mut(parts.len().div_ceil(nth)).enumerate() {
+            let parts = &parts;
+            sc.spawn(move || {
+                let k0 = t * parts.len().div_ceil(nth);
+                for (k, o) in out.iter_mut().enumerate() {
+                    *o = mix(parts[k0 + k], (k0 + k) as u64);
+                }
+            });
+        }
+    });
+    hs.iter().fold(0u64, |h, &v| (h ^ v).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(23))
 }
 
 /// `H[i][j] += Σ_t x_t[i]·x_t[j]` for `j ≥ i` (upper triangle only; `end()`
@@ -239,6 +486,97 @@ fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The capture registry is process-global: tests that begin/end a pass
+    /// take this so the harness's parallel threads do not interleave them.
+    static CAPTURE_TEST: Mutex<()> = Mutex::new(());
+
+    /// A filtered capture keeps only the named tensors, accumulates them
+    /// exactly as an unfiltered one would, and `end()` clears the filter.
+    #[test]
+    fn filtered_capture_keeps_only_the_named_tensors() {
+        let _g = CAPTURE_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let (b, cols) = (5usize, 6usize);
+        let xs: Vec<f32> = (0..b * cols).map(|k| (k as f32 * 0.37).sin()).collect();
+        begin_filtered(true, |n| n.ends_with(".keep"));
+        accumulate("l0.keep", &xs, b, cols);
+        accumulate("l0.drop", &xs, b, cols);
+        let got = end();
+        assert_eq!(got.len(), 1, "only the filtered name is captured");
+        let acc = &got["l0.keep"];
+        assert_eq!(acc.count, b);
+        let mut want = vec![0f64; cols * cols];
+        gram_upper_add(&mut want, &xs, b, cols);
+        for i in 0..cols {
+            for j in i..cols {
+                assert_eq!(acc.h[i * cols + j], want[i * cols + j]);
+                assert_eq!(acc.h[j * cols + i], want[i * cols + j], "mirrored");
+            }
+        }
+        begin(true);
+        accumulate("l0.drop", &xs, b, cols);
+        assert_eq!(end().len(), 1, "a later unfiltered capture sees everything");
+    }
+
+    /// Back-to-back projections of one panel share one Hessian; an alias
+    /// whose input later differs from its owner's is reported invalid.
+    #[test]
+    fn identical_inputs_alias_one_hessian() {
+        let _g = CAPTURE_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let (b, cols) = (4usize, 8usize);
+        let xs: Vec<f32> = (0..b * cols).map(|k| (k as f32 * 0.21).cos()).collect();
+        let ys: Vec<f32> = xs.iter().map(|v| v * 1.5 + 0.1).collect();
+        begin(true);
+        accumulate("l.q", &xs, b, cols);
+        accumulate("l.k", &xs, b, cols);
+        accumulate("l.o", &ys, b, cols);
+        accumulate("l.q", &ys, b, cols);
+        accumulate("l.k", &ys, b, cols);
+        let c = end_shared();
+        assert_eq!(c.alias, vec![("l.k".to_string(), "l.q".to_string())]);
+        assert_eq!(c.hess.len(), 2, "q and o own Hessians, k aliases q");
+        assert_eq!(c.hess["l.q"].count, 2 * b);
+        assert!(c.broken.is_empty());
+        begin(true);
+        accumulate("l.q", &xs, b, cols);
+        accumulate("l.k", &xs, b, cols);
+        accumulate("l.q", &ys, b, cols);
+        accumulate("l.k", &xs, b, cols);
+        let c = end_shared();
+        assert_eq!(c.broken, vec!["l.k".to_string()]);
+        assert!(c.alias.is_empty(), "a broken alias is not handed out");
+        begin(true);
+        accumulate("l.q", &xs, b, cols);
+        accumulate("l.k", &xs, b, cols);
+        let m = end();
+        assert_eq!(m["l.k"].h, m["l.q"].h, "end() copies the owner's Hessian");
+    }
+
+    /// The device accumulator (two staged batches, a width that is not a
+    /// tile multiple) against an f64 reference. Skips without a device.
+    #[test]
+    fn device_gram_matches_host() {
+        let (cols, b1, b2) = (200usize, 37usize, 300usize);
+        let Some(id) = crate::gpu::gram_alloc(cols) else {
+            eprintln!("no device — skipped");
+            return;
+        };
+        let x: Vec<f32> = (0..(b1 + b2) * cols)
+            .map(|k| ((k * 7919 % 1013) as f32 - 506.0) / 97.0)
+            .collect();
+        assert!(crate::gpu::gram_add(id, &x[..b1 * cols], b1));
+        assert!(crate::gpu::gram_add(id, &x[b1 * cols..], b2));
+        let h = crate::gpu::gram_take(id).expect("readback");
+        let mut worst = 0f64;
+        for i in 0..cols {
+            for j in 0..cols {
+                let r: f64 = (0..b1 + b2).map(|t| x[t * cols + i] as f64 * x[t * cols + j] as f64).sum();
+                let e = (h[i * cols + j] - r).abs() / (1.0 + r.abs());
+                worst = worst.max(e);
+            }
+        }
+        assert!(worst < 1e-5, "relative error {worst:e}");
+    }
 
     #[test]
     fn gram_matches_rank1_reference() {

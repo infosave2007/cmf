@@ -5,6 +5,166 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.20] - 2026-10-18
+
+### Added
+- `cortiq quantize-gptq --codec q2tp` GPTQ-rounds the converter's q2tp
+  profile: gate/up are GPTQ'd into q2tp and every other linear into q4tp.
+  A q4tp or q2tp `--tensor-quant` override stays GPTQ (an escort).
+  - Two rung rules: `--q2tp-rule placed` (the default; the ladder sits at
+    the H-weighted MSE-optimal group scales, with a full 31-rung search) and
+    `cortiq` (the q4tp rule on the 4-level grid). `--q2tp-rule-tensor` sets
+    the rule per tensor. `--act-order` is also available.
+  - `--q2tp-debias on|off` (default `on`) removes each row's output
+    shrinkage in the calibration metric at zero bits. `--q4tp-debias`
+    (opt-in) does the same for q4tp tensors.
+  - The output bytes do not depend on the thread count. Same layout, reader
+    and kernels.
+- Calibration for `quantize-gptq --codec q4tp|q2tp`:
+  - `--calib` can be repeated as `PATH=SHARE` to mix corpora; `.jsonl`
+    input is accepted.
+  - Text is read in budgeted prefixes, not whole files.
+  - Hessians are captured only for the linears GPTQ will quantize.
+  - `--calib-chunk-layers N` bounds Hessian RAM by capturing N layers per
+    pass.
+  - The Hessian cache is read one group at a time.
+
+- `cortiq dequant --dtype raw` writes a tensor's encoded payload verbatim and
+  `cortiq patch-tensor --raw` stores an already encoded payload verbatim
+  (length checked by the reader's own rule, hashes recomputed).
+- `tools/quant/`: metric genesis (`metric_refit.py`: KL-to-teacher training of
+  the f16 row fields and norm gains of a real CMF, codes untouched), escort
+  (`escort.py`: per-tensor sensitivity water-filled into a bpw budget) and an
+  exact perplexity evaluator (`ppl.py`), for the llama family and the
+  `qwen3_5` hybrid, with layer streaming for 27B-class models on one GPU.
+  MiniCPM5-2B q4tp, GPTQ-32k + H-metric refit: 19.56 → 19.13 after genesis
+  (bf16 18.89).
+- CMF dtype 20 `q1g`: 1-bit signs with one f16 scale per 128-weight group
+  (1.125 bpw), sign and scale planes. `cortiq requant --quant q1g` repacks a
+  `q1` file of a natively 128-grouped 1-bit model losslessly; a group whose
+  four tile scales are not byte-identical refuses the run unless
+  `--allow-tol`. `--quant q1` writes `q1` back exactly. Bonsai-1.7B: file
+  334.2 → 253.8 MB, PPL 28.3705 on both (393 of 13.4 M groups take the mean
+  of their four f16-rounded scales, −9.3e-8 nats/token). Kernels on CPU, wgpu
+  and Metal return q1's f32 bit for bit on uniform scales; CPU decode is
+  ~2× q1 on x86 (group-level reduction), GPU decode equal or better. The
+  Metal kernels are checked on an M4 by `tools/metal_q1g_parity.swift`
+  (their scale step is an explicit `fma`: fast math otherwise folds the
+  pair's shared scale and drifts from q1 by rounding); the Metal host path
+  has not been run on a Mac yet.
+
+- GPTQ on the GPU in `cortiq quantize-gptq` (q4tp and q2tp): calibration
+  through the batched prefill with the Hessians accumulated on the device
+  (packed upper triangle in f32; the inputs that q/k/v, gate/up and the GDN
+  projections share are deduplicated by content hash), the fold operator
+  (equilibrated blocked Cholesky and triangular inverse) and the q4tp/q2tp
+  column sweeps on the device. It is the default where a wgpu adapter is
+  present outside macOS; `CMF_GPTQ_GPU=0` keeps the host path. The batched
+  prefill runs the GatedDeltaNet recurrence as a chunked scan, bit-identical
+  to the per-step recurrence (`CMF_GDN_SCAN=0` restores it).
+- `cortiq quantize-moe CALIB.cmf --hf REPO --output OUT.cmf`: GPTQ for every
+  expert of a Qwen3.8-Flash-Next-class MoE (`qwen4_exp`), gate/up into q2tp
+  and down into q4tp, on the GPU. The calibration model (the q4tp file) runs
+  its ordinary device frames and each layer frame copies its MoE input and
+  router logits; the bf16 expert shards are fetched one layer at a time.
+  Experts routed fewer tokens than their input width get a layer-wide prior
+  in both input Hessians (`CMF_MOE_PRIOR`); the shared expert sees every
+  token. `--patch-shared FILE` re-encodes only the shared experts of an
+  existing output in place.
+- CMF dtype 19 `blr`: a linear layer stored as one or two binary low-rank
+  paths `diag(h)·S_U·diag(ℓ)·S_Vᵀ·diag(g)` (the factorization layout of
+  LittleBit, Lee et al., NeurIPS 2025), with CPU and wgpu kernels that never
+  materialize the weight. `cortiq convert --quant blr --bpw B` encodes it
+  with `--blr-method nvg` (the NVG encoder: activation-whitened sign
+  topology, closed-form metric, exact discrete sign refinement; on the GPU
+  with `--blr-device gpu`) or `dual-svid` (LittleBit's data-free
+  initializer, as a baseline). `cortiq nvg-bench` profiles one tensor.
+  The NVG encoder runs on the GPU by default where a wgpu adapter exists
+  (`--blr-device auto|cpu|gpu`; Qwen3.8-27B gate projection at 0.55 bpw:
+  23.6 s against 2254 s for the f64 CPU encoder, same error). Its
+  calibration is layer-streamed: each window keeps the hidden state after
+  the layers already encoded, so a layer costs one pass of the layer below
+  and one of itself; `CMF_NVG_RESUME=FILE` resumes an interrupted
+  conversion from its work file.
+- `cortiq requant --quant blr-q8_2f` expands every `blr` tensor to a dense
+  q8_2f weight, so a `blr` model's perplexity runs on the dense paths.
+- `cortiq nvg-train STUDENT --teacher T --calib …`: distillation of a `blr`
+  model's metric (h, ℓ, g and the norm gains) against the teacher's top-k
+  next-token distribution, entirely on the GPU (GatedDeltaNet forward with
+  full BPTT, flash-style attention, matrix-unit GEMMs, layer checkpointing).
+  The metric scales take Adam steps relative to their magnitude (ℓ carries
+  the weight's amplitude, h and g sit near 1); the head is held in
+  vocabulary slices so a 248k-entry head fits the 2 GiB storage-binding
+  limit; uploads are flushed per layer so a 27B teacher loads.
+
+### Fixed
+- A GPU driver that crashes while compiling a shader (reported on an AMD
+  Radeon RX 6600M under Windows, infosave2007/cmf#34) used to end the run
+  without a message. `CMF_GPU_TRACE_PIPELINES=1` now names every startup
+  pipeline before the driver compiles it, and the pipeline-cache line says
+  how to find the shader and that `CMF_GPU=0` runs on the CPU.
+
+### Changed
+- The q2tp encoder (`convert --quant q2tp` and every other q2tp writer)
+  now places each row ladder at the per-group MSE-optimal scale, searches
+  all 31 rungs, and removes the resulting output shrinkage through the row
+  `lo`. This needs no data and no extra bits, and the reader and kernels are
+  unchanged. `CMF_Q2TP_ENCODER=v1` restores the previous encoder byte for
+  byte.
+- The GPTQ fold operator runs on several threads and gives bit-identical
+  results. The Hessian groups in flight are capped by the RAM left
+  (`CMF_GPTQ_MEM_GB` overrides), and a calibration pass whose Hessians
+  cannot fit in RAM is refused with a `--calib-chunk-layers` that does.
+
+- The q2tp/q4tp output debias in `quantize-gptq` and `quantize-moe` takes
+  `H·w` for all rows from one f32 GEMM `W·H` instead of per-row f64 sums
+  (1.5 T multiply-adds for a 27B down projection); the f64 form stays as the
+  reference. `sgemm_public` on x86 runs matrixmultiply.
+- The host RAM guard of `quantize-gptq` applies to host Hessians only; the
+  default GPU calibration keeps them on the card.
+
+### Performance
+- MiniCPM5-2B, q2tp profile with head and embeddings q8_2f (1.31 GB),
+  WikiText-2 test, 160 × 512 windows:
+
+  | method | ppl |
+  |---|---:|
+  | bf16 reference | 18.89 |
+  | `convert --quant q2tp`, before this release | 206.6 |
+  | `convert --quant q2tp` (v2 encoder) | 89.5 |
+  | `quantize-gptq --codec q2tp`, 32k tokens, cortiq rule | 37.7 |
+  | the same, placed rule | 31.3 |
+  | placed rule + debias (the defaults) | 27.8 |
+
+- `--codec q4tp` on the same 32k calibration gives 19.62, against 20.23
+  for the shipped 2048-token recipe.
+- Details are in `ENGINEERING.md`.
+- Qwen3.8-27B on one RTX PRO 6000, perplexity on the batched prefill path
+  (WikiText-2 12×512 / 64×512, C4 64×512, docs 32×512, Rust source 32×512):
+
+  | file | size | wiki12 | wiki64 | C4 | docs | code |
+  |---|---:|---:|---:|---:|---:|---:|
+  | q8_2f | 27.38 GB | 8.477 | 8.372 | 12.510 | 7.965 | 4.106 |
+  | q4tp, converter | 14.27 GB | 8.794 | 8.707 | 13.026 | 8.285 | 4.213 |
+  | q4tp, GPU GPTQ (65,536 tokens, 21 min) | 14.26 GB | 8.707 | 8.572 | 12.787 | 8.165 | 4.179 |
+  | q2tp, converter (v2 encoder) | 11.42 GB | 12.137 | 12.460 | 16.635 | 11.643 | 5.519 |
+  | q2tp, GPU GPTQ (131,072 tokens) | 11.41 GB | 9.574 | 9.506 | 14.057 | 9.573 | 4.627 |
+
+- Qwen3.8-Flash-Next q2tp (`quantize-moe`, 262,144 tokens, 84 min on one
+  RTX PRO 6000) against the converter's q2tp: Rust source 1,536 tokens
+  4.438 vs 4.763, WikiText-2 12×512 6.063 vs 7.359, Rust source 32×512
+  5.575 vs 5.426 (q4tp: 4.111, 5.428, 4.983).
+- `blr` at 1.0 bpw on Qwen3.5-0.8B (WikiText-2 16×512, q8_2f 24.27): NVG
+  656.4 (CPU encoder) / 672.5 (GPU encoder), dual-svid 2,719,570, all
+  without training; after `nvg-train` on 1 M tokens 135.8. CPU and wgpu
+  kernels give the same perplexity. The greedy text of that 0.8B file is
+  still not coherent: `blr` decode in this release runs on per-operation
+  device kernels and is slow (2–4 tok/s on the 0.8B).
+- Qwen3.8-27B to `blr` at 0.55 bpw (NVG on the GPU, 32,768 calibration
+  tokens): 4.89 GB file (0.547 bpw over the 24.1 B encoded weights, 0.626
+  over all layer projections), 3.5 h on one RTX PRO 6000; WikiText-2
+  12×512 perplexity 148.6 before training (q8_2f 8.48).
+
 ## [0.8.19] - 2026-10-15
 
 ### Added

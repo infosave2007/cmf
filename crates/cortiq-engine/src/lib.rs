@@ -4,6 +4,7 @@ pub mod attention;
 pub mod chat_template;
 pub mod cpuprof;
 pub mod audiovae;
+pub mod blr;
 pub mod bounded;
 pub mod dit;
 pub mod dsv4;
@@ -17,6 +18,8 @@ pub mod egemma2_vision;
 pub(crate) mod expert_store;
 pub mod fcd;
 pub mod fcd_ops;
+#[cfg(feature = "gpu")]
+pub mod nvg_train;
 pub mod f32_backend;
 pub mod g3n;
 pub mod gptq_capture;
@@ -25,6 +28,10 @@ pub mod gpu;
 pub mod gpu_metal;
 #[cfg(feature = "gpu")]
 pub mod gpu_wgpu;
+/// The wgpu crate the device types of `gpu_wgpu` come from (offline tools
+/// hold buffers across calls).
+#[cfg(feature = "gpu")]
+pub use wgpu;
 pub mod imagegen;
 pub mod inference;
 pub mod kv_cache;
@@ -186,3 +193,5 @@ pub fn gpu_q1_matvec_for_test(
     gpu_metal::q1_matvec(model, idx, xs, rows, cols, out)
 }
 pub use sampler::SamplerConfig;
+/// Re-exported for offline tools (the NVG encoder's f64 GEMMs in the CLI).
+pub use matrixmultiply;

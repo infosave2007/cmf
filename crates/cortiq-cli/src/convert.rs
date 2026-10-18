@@ -1014,7 +1014,7 @@ pub fn set_tensor_quant_overrides(specs: &[String]) -> anyhow::Result<()> {
 }
 
 /// `*`-glob match (the only wildcard; it matches any run, dots included).
-fn glob_match(pat: &str, name: &str) -> bool {
+pub(crate) fn glob_match(pat: &str, name: &str) -> bool {
     let (p, n) = (pat.as_bytes(), name.as_bytes());
     let (mut pi, mut ni) = (0usize, 0usize);
     let (mut star, mut mark) = (None::<usize>, 0usize);
@@ -1445,7 +1445,32 @@ fn q2tp_search() -> bool {
         .unwrap_or(true)
 }
 
+/// `CMF_Q2TP_ENCODER=v1` restores the absmax-pinned q2tp encoder byte for
+/// byte; anything else (or nothing) runs v2. Read per tensor for the same
+/// reason as [`q2tp_search`].
+fn q2tp_encoder_is_v1() -> bool {
+    std::env::var("CMF_Q2TP_ENCODER")
+        .map(|v| v.trim().eq_ignore_ascii_case("v1"))
+        .unwrap_or(false)
+}
+
+/// Encode a `[out_dim, in_dim]` matrix as `q2tp`. The default is the v2
+/// encoder ([`encode_q2tp_v2`]); `CMF_Q2TP_ENCODER=v1` selects the old one,
+/// and `CMF_Q2TP_SEARCH=0` the plain absmax rule with no search at all.
+/// Both write the same layout for the same reader and kernels.
 pub(crate) fn encode_q2tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
+    let search = q2tp_search();
+    if search && !q2tp_encoder_is_v1() {
+        encode_q2tp_v2(vals, out_dim, in_dim)
+    } else {
+        encode_q2tp_v1(vals, out_dim, in_dim, search)
+    }
+}
+
+/// The v1 `q2tp` encoder: the outer level pinned to absmax, rungs searched
+/// over nominal−2..+1, ladder top over four fractions. Kept verbatim — it is
+/// also the "cortiq rung rule" ladder `quantize-gptq --codec q2tp` starts from.
+pub(crate) fn encode_q2tp_v1(vals: &[f32], out_dim: usize, in_dim: usize, search: bool) -> Vec<u8> {
     debug_assert_eq!(vals.len(), out_dim * in_dim);
     debug_assert_eq!(in_dim % GROUP_SIZE, 0);
     let gpr = in_dim / GROUP_SIZE;
@@ -1453,7 +1478,6 @@ pub(crate) fn encode_q2tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
     let mut chunks = vec![0u8; out_dim * gpr * Q2TP_CHUNK];
     let mut params = vec![0u8; out_dim * 4];
     let mut codes = vec![0u8; out_dim * stride];
-    let search = q2tp_search();
 
     encode_rows_parallel(
         out_dim,
@@ -1614,6 +1638,269 @@ pub(crate) fn encode_q2tp(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8
     chunks
 }
 
+/// Multipliers `m` of `absmax/1.5` the placed ladder tries per group:
+/// 0.300, 0.325, …, 1.050. The 4-level optimum of a real gate/up group sits
+/// at 0.6–0.75 (MiniCPM5), out of reach of v1's −2..+1 rung window, which
+/// spans only ~6 % in scale on a typical ladder.
+const Q2TP_PLACE_MULTS: usize = 31;
+
+#[inline]
+fn q2tp_place_mult(k: usize) -> f32 {
+    ((300 + 25 * k) as f64 / 1000.0) as f32
+}
+
+/// `x.round_ties_even().clamp(0.0, 3.0)` for the 2-bit grid, written so it
+/// vectorizes on baseline x86-64 (no SSE4.1 round): after the clamp to
+/// [−1, 4], adding and subtracting 1.5·2^23 rounds to the nearest integer
+/// with ties to even (IEEE default rounding) — the same value as
+/// `round_ties_even` (only a −0 comes back as +0, which no code or product
+/// can tell apart). Rust never folds the pair away.
+#[inline(always)]
+pub(crate) fn q2_level(x: f32) -> f32 {
+    const MAGIC: f32 = 12_582_912.0;
+    let c = x.clamp(-1.0, 4.0);
+    ((c + MAGIC) - MAGIC).clamp(0.0, 3.0)
+}
+
+/// Weighted squared error of one 32-group rounded onto the 2-bit grid at
+/// scale `s` (`hw` = per-channel weights; all ones in weight space). Eight
+/// fixed lanes reduced in a fixed order: it vectorizes and the sum does not
+/// depend on the machine.
+#[inline(always)]
+pub(crate) fn q2tp_group_err(tile: &[f32; GROUP_SIZE], hw: &[f32; GROUP_SIZE], s: f32) -> f32 {
+    let inv = 1.0 / s;
+    let mut acc = [0f32; 8];
+    for c in 0..GROUP_SIZE / 8 {
+        for l in 0..8 {
+            let w = tile[c * 8 + l];
+            let d = w - (q2_level(w * inv + 1.5) - 1.5) * s;
+            acc[l] += hw[c * 8 + l] * d * d;
+        }
+    }
+    ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]))
+}
+
+/// Best rung 1..=31 of one group by (weighted) round-to-nearest error over
+/// the whole ladder; a tie keeps the lower rung.
+#[inline]
+pub(crate) fn q2tp_best_rung(
+    tile: &[f32; GROUP_SIZE],
+    hw: &[f32; GROUP_SIZE],
+    tab: &[f32; 32],
+) -> (f32, usize) {
+    let mut best = (f32::INFINITY, 1usize);
+    for (c, &s) in tab.iter().enumerate().skip(1) {
+        if !(s > 0.0) {
+            continue;
+        }
+        let e = q2tp_group_err(tile, hw, s);
+        if e < best.0 {
+            best = (e, c);
+        }
+    }
+    best
+}
+
+/// Group `g` of a row and of its channel weights, as fixed-size arrays (the
+/// error kernel's bounds checks then vanish).
+#[inline(always)]
+fn q2tp_group_pair<'a>(
+    row: &'a [f32],
+    hw: &'a [f32],
+    g: usize,
+) -> (&'a [f32; GROUP_SIZE], &'a [f32; GROUP_SIZE]) {
+    let r = g * GROUP_SIZE..(g + 1) * GROUP_SIZE;
+    (row[r.clone()].try_into().unwrap(), hw[r].try_into().unwrap())
+}
+
+/// Row params of a q2tp ladder with rung 1 at `lo_h` whose rung 31 provably
+/// reaches `top` (step walked up by single ULPs, as in v1).
+fn q2tp_row_params(lo_h: u16, top: f32) -> [u8; 4] {
+    let lo_r = f16_to_f32(lo_h);
+    let span = (top - lo_r).max(0.0);
+    let mut st_h = f32_to_f16(span / Q2TP_LMAX as f32);
+    for _ in 0..64 {
+        let st = f16_to_f32(st_h);
+        if st > 0.0 && lo_r + Q2TP_LMAX as f32 * st >= top {
+            break;
+        }
+        st_h += 1;
+    }
+    let mut p = [0u8; 4];
+    p[0..2].copy_from_slice(&lo_h.to_le_bytes());
+    p[2..4].copy_from_slice(&st_h.to_le_bytes());
+    p
+}
+
+/// The placed q2tp row ladder (v2 encoder, and the `placed` GPTQ rule).
+///
+/// Per live group the scale `m·absmax/1.5` (`m` over [`q2tp_place_mult`])
+/// with the lowest `hw`-weighted rounding error; the row ladder spans those
+/// scales, four ladder tops are tried as in v1, and the one whose FULL
+/// 31-rung search reconstructs the row best is kept. Writes the row params
+/// and each group's best rung (0 = an all-zero group). Zero bits: same
+/// layout, reader and kernels — only where the scales sit changes.
+pub(crate) fn q2tp_place_row(row: &[f32], hw: &[f32], params: &mut [u8], rungs: &mut [u8]) {
+    debug_assert_eq!(row.len() % GROUP_SIZE, 0);
+    debug_assert_eq!(row.len(), hw.len());
+    let gpr = row.len() / GROUP_SIZE;
+    let tile_at = |g: usize| q2tp_group_pair(row, hw, g);
+    let mut lg = vec![0f32; gpr];
+    let mut dead = vec![false; gpr];
+    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+    for g in 0..gpr {
+        let (tile, h) = tile_at(g);
+        let absmax = tile.iter().fold(0f32, |m, v| m.max(v.abs()));
+        dead[g] = absmax == 0.0;
+        let base = absmax / 1.5;
+        let mut best = (f32::INFINITY, base);
+        if !dead[g] {
+            for k in 0..Q2TP_PLACE_MULTS {
+                let s = base * q2tp_place_mult(k);
+                if !(s > 0.0) {
+                    continue;
+                }
+                let e = q2tp_group_err(tile, h, s);
+                if e < best.0 {
+                    best = (e, s);
+                }
+            }
+        }
+        lg[g] = det_log2(f16_scale(best.1));
+        if !dead[g] {
+            lo = lo.min(lg[g]);
+            hi = hi.max(lg[g]);
+        }
+    }
+    if !lo.is_finite() {
+        lo = lg[0];
+        hi = lo;
+    }
+    let lo_h = f32_to_f16(lo);
+    let lo_r = f16_to_f32(lo_h);
+    let mut best: Option<(f64, [u8; 4])> = None;
+    let mut cand = vec![0u8; gpr];
+    for frac in [1.0f32, 0.9, 0.8, 0.7] {
+        let p = q2tp_row_params(lo_h, lo_r + (hi - lo_r) * frac);
+        let tab = det_q2tp_ladder(&p, 0);
+        let mut err = 0f64;
+        for g in 0..gpr {
+            cand[g] = if dead[g] {
+                0
+            } else {
+                let (tile, h) = tile_at(g);
+                let (e, c) = q2tp_best_rung(tile, h, &tab);
+                err += e as f64;
+                c as u8
+            };
+        }
+        if best.as_ref().is_none_or(|b| err < b.0) {
+            best = Some((err, p));
+            rungs[..gpr].copy_from_slice(&cand);
+        }
+    }
+    params[..4].copy_from_slice(&best.expect("four candidate ladders").1);
+}
+
+/// Round one row onto its ladder at the given rungs and pack the 2-bit plane
+/// and the 5-bit rung codes (`codes_row` must start zeroed).
+fn q2tp_pack_rtn(row: &[f32], params_row: &[u8], rungs: &[u8], chunks_row: &mut [u8], codes_row: &mut [u8]) {
+    let tab = det_q2tp_ladder(params_row, 0);
+    for (g, &c) in rungs.iter().enumerate() {
+        let c = c as usize;
+        q4tp_put_code(codes_row, g, c);
+        let inv = if tab[c] > 0.0 { 1.0 / tab[c] } else { 0.0 };
+        let tile = &row[g * GROUP_SIZE..(g + 1) * GROUP_SIZE];
+        for (k, d) in chunks_row[g * Q2TP_CHUNK..(g + 1) * Q2TP_CHUNK].iter_mut().enumerate() {
+            let mut b = 0u8;
+            for j in 0..4 {
+                b |= (q2_level(tile[k * 4 + j] * inv + 1.5) as u8) << (2 * j);
+            }
+            *d = b;
+        }
+    }
+}
+
+/// Multiply a whole q2tp row by `1/b`, `b = clip(num/den, 0.8, 1.25)` the
+/// row's output regression slope. Every rung of a row is
+/// `2^(lo + (c−1)·step)`, so that is exactly a shift of the f16 `lo` by
+/// `−log2 b`: codes, rungs, step and bytes stay as they are.
+///
+/// Why: MSE-optimal 2-bit codes satisfy ⟨Ŵ, W − Ŵ⟩ ≈ 0, so every row comes
+/// back SHRUNK by its error energy (~3.5 % at 2 bits on MiniCPM5 gate/up,
+/// the same sign in all 84 tensors). Random error averages out through the
+/// residual stream; a coherent shrink does not.
+pub(crate) fn q2tp_unshrink_row(params_row: &mut [u8], num: f64, den: f64) {
+    if !(den > 0.0) {
+        return;
+    }
+    let b = num / den;
+    if !b.is_finite() {
+        return;
+    }
+    let b = b.clamp(0.8, 1.25);
+    let lo = f16_to_f32(u16::from_le_bytes([params_row[0], params_row[1]]));
+    let shifted = (lo as f64 - det_log2(b as f32) as f64) as f32;
+    params_row[0..2].copy_from_slice(&f32_to_f16(shifted).to_le_bytes());
+}
+
+/// Weight-space debias of one encoded q2tp row: the slope
+/// `b = ⟨W, Ŵ⟩ / ⟨W, W⟩` (no data — the identity metric) removed through `lo`.
+fn q2tp_debias_row_weight_space(row: &[f32], chunks_row: &[u8], params_row: &mut [u8], codes_row: &[u8]) {
+    let tab = det_q2tp_ladder(params_row, 0);
+    let (mut num, mut den) = (0f64, 0f64);
+    for (g, tile) in row.chunks_exact(GROUP_SIZE).enumerate() {
+        let s = tab[cortiq_core::quant::q4tp_code(codes_row, g)];
+        let chunk = &chunks_row[g * Q2TP_CHUNK..(g + 1) * Q2TP_CHUNK];
+        for (k, &byte) in chunk.iter().enumerate() {
+            for j in 0..4 {
+                let w = tile[k * 4 + j] as f64;
+                let wh = ((((byte >> (2 * j)) & 3) as f32 - 1.5) * s) as f64;
+                num += w * wh;
+                den += w * w;
+            }
+        }
+    }
+    q2tp_unshrink_row(params_row, num, den);
+}
+
+/// The v2 `q2tp` encoder (default): the zero-bit, data-free fix measured
+/// on MiniCPM5-2B (q2tp profile, head/embed q8_2f: WikiText-2 ppl
+/// 206.6 → 89.5). Three steps per row:
+///
+/// 1. place the ladder at the per-group MSE-optimal scale instead of
+///    absmax/1.5 ([`q2tp_place_row`]) — weight MSE −40 %;
+/// 2. pick each group's rung by a full 31-rung search and round to nearest;
+/// 3. remove the output shrinkage those MSE-optimal codes cause, per row,
+///    through the f16 `lo` ([`q2tp_unshrink_row`]) — worth −49 % ppl alone.
+///
+/// Same bytes per tensor, same reader, same kernels.
+pub(crate) fn encode_q2tp_v2(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
+    debug_assert_eq!(vals.len(), out_dim * in_dim);
+    debug_assert_eq!(in_dim % GROUP_SIZE, 0);
+    let gpr = in_dim / GROUP_SIZE;
+    let stride = q4tp_code_stride(gpr);
+    let mut chunks = vec![0u8; out_dim * gpr * Q2TP_CHUNK];
+    let mut params = vec![0u8; out_dim * 4];
+    let mut codes = vec![0u8; out_dim * stride];
+    let ones = vec![1.0f32; in_dim];
+    encode_rows_parallel(
+        out_dim,
+        [gpr * Q2TP_CHUNK, 4, stride],
+        [&mut chunks, &mut params, &mut codes],
+        &|r, chunks_row, params_row, codes_row| {
+            let row = &vals[r * in_dim..(r + 1) * in_dim];
+            let mut rungs = vec![0u8; gpr];
+            q2tp_place_row(row, &ones, params_row, &mut rungs);
+            q2tp_pack_rtn(row, params_row, &rungs, chunks_row, codes_row);
+            q2tp_debias_row_weight_space(row, chunks_row, params_row, codes_row);
+        },
+    );
+    chunks.extend_from_slice(&params);
+    chunks.extend_from_slice(&codes);
+    chunks
+}
+
 /// `log2` for the ladder encoders in plain f64 IEEE arithmetic. The
 /// platform libm (macOS vs glibc) disagrees in the last bit on some inputs,
 /// which flips near-tie rung choices: the same source packed to different
@@ -1680,7 +1967,7 @@ pub(crate) fn det_exp2(y: f32) -> f32 {
 /// `q4tp_ladder` with [`det_exp2`]: the rung table the encoders choose codes
 /// against (the runtime keeps the core ladder; the two differ by at most an
 /// ulp, which only matters to the encoder's near-tie choices).
-fn det_q4tp_ladder(params: &[u8], r: usize) -> [f32; 32] {
+pub(crate) fn det_q4tp_ladder(params: &[u8], r: usize) -> [f32; 32] {
     let lo = f16_to_f32(u16::from_le_bytes([params[r * 4], params[r * 4 + 1]]));
     let st = f16_to_f32(u16::from_le_bytes([params[r * 4 + 2], params[r * 4 + 3]]));
     let ratio = det_exp2(st);
@@ -1693,7 +1980,7 @@ fn det_q4tp_ladder(params: &[u8], r: usize) -> [f32; 32] {
 }
 
 /// `q2tp_ladder` over [`det_q4tp_ladder`] (rung 0 = the exact zero).
-fn det_q2tp_ladder(params: &[u8], r: usize) -> [f32; 32] {
+pub(crate) fn det_q2tp_ladder(params: &[u8], r: usize) -> [f32; 32] {
     let base = det_q4tp_ladder(params, r);
     let mut t = [0f32; 32];
     t[1..32].copy_from_slice(&base[..31]);
@@ -5797,7 +6084,7 @@ fn with_retry<T>(attempts: u32, mut f: impl FnMut() -> anyhow::Result<T>) -> any
 /// Fetch one file into `dest` (cached). Large range-capable files are pulled in
 /// parallel 32 MiB chunks over `threads` reused connections; otherwise a single
 /// stream. Returns false on 404 when `required` is false.
-fn fetch(
+pub(crate) fn fetch(
     agent: &ureq::Agent,
     url: &str,
     dest: &Path,
@@ -8514,12 +8801,15 @@ pub(crate) mod tests {
     /// Everything that touches those variables takes this first.
     pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Pin both switches for the duration of a test, whatever ran before.
+    /// Pin the encoder switches for the duration of a test, whatever ran
+    /// before — including the default q2tp encoder: a test that panicked
+    /// while it held `CMF_Q2TP_ENCODER=v1` must not leak it into the rest.
     pub(crate) fn env_guard(threads: &str, search: &str) -> std::sync::MutexGuard<'static, ()> {
         let g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("CMF_ENCODE_THREADS", threads);
             std::env::set_var("CMF_Q2TP_SEARCH", search);
+            std::env::remove_var("CMF_Q2TP_ENCODER");
         }
         g
     }
@@ -9036,6 +9326,185 @@ pub(crate) mod tests {
             back[3 * cols..4 * cols].iter().all(|x| *x == 0.0),
             "an all-zero row must dequantize to exact zeros"
         );
+    }
+
+    /// Weights shaped like a real gate/up plane: heavy-tailed (a Gaussian
+    /// scale mixture), a log-normal spread of row scales, per-channel
+    /// amplitude drift, and rare outliers of `outlier`–1.7·`outlier` × RMS.
+    fn q2tp_realistic_matrix(rows: usize, cols: usize, seed: u64) -> Vec<f32> {
+        q2tp_synth_matrix(rows, cols, seed, 12.0)
+    }
+
+    fn q2tp_synth_matrix(rows: usize, cols: usize, seed: u64, outlier: f32) -> Vec<f32> {
+        let mut s = seed | 1;
+        let mut uni = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+        };
+        let mut gauss = || {
+            let (a, b) = (uni(), uni());
+            ((-2.0 * a.ln()).sqrt() * (std::f64::consts::TAU * b).cos()) as f32
+        };
+        let chan: Vec<f32> = (0..cols).map(|_| (0.35 * gauss()).exp()).collect();
+        let mut v = vec![0f32; rows * cols];
+        for r in 0..rows {
+            let row_scale = 0.02 * (0.5 * gauss()).exp();
+            for c in 0..cols {
+                let mix = if (r * 131 + c * 31) % 7 == 0 { 2.2 } else { 1.0 };
+                let mut x = gauss() * mix * chan[c] * row_scale;
+                if (r * 977 + c * 613) % 499 == 0 {
+                    x *= outlier * (1.0 + (c % 3) as f32 / 3.0);
+                }
+                v[r * cols + c] = x;
+            }
+        }
+        v
+    }
+
+    fn q2tp_decode(blob: &[u8], rows: usize, cols: usize) -> Vec<f32> {
+        let mut back = vec![0f32; rows * cols];
+        cortiq_core::quant::dequant_q2tp(blob, rows, cols, &mut back);
+        back
+    }
+
+    fn sq_err(a: &[f32], b: &[f32]) -> f64 {
+        a.iter().zip(b).map(|(x, y)| ((x - y) as f64).powi(2)).sum()
+    }
+
+    /// The 2-bit rounding helper must equal `round_ties_even().clamp(0, 3)`
+    /// — ties, negatives, the clamp edges and far outliers (a −0 result may
+    /// come back as +0: same code, same product).
+    #[test]
+    fn q2_level_is_round_ties_even_clamped() {
+        let mut xs: Vec<f32> = (-4000..4000).map(|k| k as f32 / 1000.0).collect();
+        xs.extend([-0.5, 0.5, 1.5, 2.5, 3.5, 4.5, -1e30, 1e30, f32::MIN_POSITIVE, -0.0, 0.0]);
+        xs.extend((0..64).map(|k| 0.5 + k as f32 * 0.5 + f32::EPSILON * k as f32));
+        xs.extend((0..64).map(|k| k as f32 * 0.5 - 0.5 - f32::EPSILON));
+        for x in xs {
+            let want = x.round_ties_even().clamp(0.0, 3.0);
+            let got = q2_level(x);
+            assert!(got == want && got.to_bits() & 0x7FFF_FFFF == want.to_bits() & 0x7FFF_FFFF, "x = {x}");
+            assert_eq!(got as u8, want as u8, "x = {x}");
+        }
+    }
+
+    /// v2 must cut the weight error against v1 on weights shaped like real
+    /// gate/up planes — after its own debias, which by construction gives
+    /// back ~1/b of the error it removed — and keep the payload layout.
+    #[test]
+    fn q2tp_v2_weight_mse_beats_v1_on_realistic_tensors() {
+        for (rows, cols, seed) in [(64usize, 2048usize, 7u64), (48, 1024, 0x9E37), (32, 4096, 99)] {
+            let w = q2tp_realistic_matrix(rows, cols, seed);
+            let v1 = encode_q2tp_v1(&w, rows, cols, true);
+            let v2 = encode_q2tp_v2(&w, rows, cols);
+            assert_eq!(v1.len(), v2.len(), "same bytes per tensor");
+            let (e1, e2) = (sq_err(&w, &q2tp_decode(&v1, rows, cols)), sq_err(&w, &q2tp_decode(&v2, rows, cols)));
+            println!("q2tp {rows}x{cols}: weight SSE v1 {e1:.4e} → v2 {e2:.4e} ({:+.1} %)", 100.0 * (e2 / e1 - 1.0));
+            assert!(e2 < 0.9 * e1, "v2 {e2:.4e} must beat v1 {e1:.4e} by >10 %");
+        }
+        // The q2tp test matrix (rows spanning 10^-3..10^3, tilted groups) too.
+        let (rows, cols) = (21usize, 512usize);
+        let w = q2tp_test_matrix(rows, cols);
+        let e1 = sq_err(&w, &q2tp_decode(&encode_q2tp_v1(&w, rows, cols, true), rows, cols));
+        let e2 = sq_err(&w, &q2tp_decode(&encode_q2tp_v2(&w, rows, cols), rows, cols));
+        assert!(e2 < e1, "v2 {e2:.4e} vs v1 {e1:.4e} on the tilted matrix");
+    }
+
+    /// The placed ladder's codes are MSE-optimal, so the rows come back
+    /// shrunk; the debias step must bring each row's slope back to ~1 (to
+    /// within the f16 `lo` granularity; the gain is clipped to 0.8..1.25)
+    /// without touching codes or rungs.
+    #[test]
+    fn q2tp_v2_debias_restores_unit_slope_and_keeps_codes() {
+        let (rows, cols) = (24usize, 1024usize);
+        let w = q2tp_synth_matrix(rows, cols, 1234, 3.0);
+        let v2 = encode_q2tp_v2(&w, rows, cols);
+        // The same placement + RTN without the debias step.
+        let gpr = cols / GROUP_SIZE;
+        let ones = vec![1f32; cols];
+        let (po, co, stride) = cortiq_core::quant::q2tp_sections(rows, cols);
+        let mut raw = vec![0u8; v2.len()];
+        for r in 0..rows {
+            let row = &w[r * cols..(r + 1) * cols];
+            let mut rungs = vec![0u8; gpr];
+            let (chunks, rest) = raw.split_at_mut(po);
+            let (params, codes) = rest.split_at_mut(rows * 4);
+            q2tp_place_row(row, &ones, &mut params[r * 4..r * 4 + 4], &mut rungs);
+            q2tp_pack_rtn(
+                row,
+                &params[r * 4..r * 4 + 4],
+                &rungs,
+                &mut chunks[r * gpr * Q2TP_CHUNK..(r + 1) * gpr * Q2TP_CHUNK],
+                &mut codes[r * stride..(r + 1) * stride],
+            );
+        }
+        assert_eq!(&v2[..po], &raw[..po], "2-bit plane unchanged by the debias");
+        assert_eq!(&v2[co..], &raw[co..], "rung codes unchanged by the debias");
+        for r in 0..rows {
+            assert_eq!(v2[po + r * 4 + 2..po + r * 4 + 4], raw[po + r * 4 + 2..po + r * 4 + 4], "step unchanged");
+        }
+        let slope = |blob: &[u8], r: usize| -> f64 {
+            let d = q2tp_decode(blob, rows, cols);
+            let (mut n, mut dd) = (0f64, 0f64);
+            for c in 0..cols {
+                let x = w[r * cols + c] as f64;
+                n += x * d[r * cols + c] as f64;
+                dd += x * x;
+            }
+            n / dd
+        };
+        let (mut shrunk, mut unit) = (0usize, 0usize);
+        for r in 0..rows {
+            let (b0, b2) = (slope(&raw, r), slope(&v2, r));
+            shrunk += (b0 < 0.99) as usize;
+            let want = b0 / b0.clamp(0.8, 1.25);
+            assert!((b2 - want).abs() < 0.01, "row {r}: slope {b0:.4} → {b2:.4} (want {want:.4})");
+            unit += ((b2 - 1.0).abs() < 0.01) as usize;
+        }
+        assert!(shrunk > rows / 2, "MSE-optimal codes are expected to shrink most rows");
+        assert!(unit > rows / 2, "most rows must come back to a unit slope ({unit}/{rows})");
+    }
+
+    /// `CMF_Q2TP_ENCODER=v1` is the escape hatch: byte-identical to the old
+    /// encoder; the default is v2; `CMF_Q2TP_SEARCH=0` stays the absmax arm.
+    #[test]
+    fn q2tp_encoder_switch_selects_v1_or_v2() {
+        let (rows, cols) = (11usize, 256usize);
+        let w = q2tp_realistic_matrix(rows, cols, 5);
+        let _g = env_guard("1", "1");
+        unsafe { std::env::remove_var("CMF_Q2TP_ENCODER") };
+        assert_eq!(encode_q2tp(&w, rows, cols), encode_q2tp_v2(&w, rows, cols), "default = v2");
+        unsafe { std::env::set_var("CMF_Q2TP_ENCODER", "v1") };
+        assert_eq!(encode_q2tp(&w, rows, cols), encode_q2tp_v1(&w, rows, cols, true), "v1 fallback");
+        unsafe {
+            std::env::remove_var("CMF_Q2TP_ENCODER");
+            std::env::set_var("CMF_Q2TP_SEARCH", "0");
+        }
+        assert_eq!(encode_q2tp(&w, rows, cols), encode_q2tp_v1(&w, rows, cols, false), "search off");
+        unsafe { std::env::set_var("CMF_Q2TP_SEARCH", "1") };
+    }
+
+    /// v2 with many threads writes the same bytes as with one, and every
+    /// payload it writes passes the reader's own validation.
+    #[test]
+    fn q2tp_v2_parallel_bytes_and_reader_validation() {
+        use cortiq_core::quant::validate_payload;
+        let (rows, cols) = (37usize, 512usize);
+        let mut w = q2tp_realistic_matrix(rows, cols, 77);
+        w[5 * cols..6 * cols].fill(0.0); // a dead row
+        w[9 * cols + 32..9 * cols + 64].fill(0.0); // a dead group
+        let _g = env_guard("1", "1");
+        let serial = encode_q2tp_v2(&w, rows, cols);
+        unsafe { std::env::set_var("CMF_ENCODE_THREADS", "8") };
+        let parallel = encode_q2tp_v2(&w, rows, cols);
+        unsafe { std::env::set_var("CMF_ENCODE_THREADS", "1") };
+        assert_eq!(serial, parallel, "v2 bytes depend on the thread count");
+        assert!(validate_payload(TensorDtype::Q2TiledP, &[rows, cols], &serial).is_ok());
+        let back = q2tp_decode(&serial, rows, cols);
+        assert!(back[5 * cols..6 * cols].iter().all(|x| *x == 0.0), "dead row");
+        assert!(back[9 * cols + 32..9 * cols + 64].iter().all(|x| *x == 0.0), "dead group");
     }
 
     #[test]
