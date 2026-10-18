@@ -197,6 +197,9 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     let t0 = Instant::now();
     let codec = Codec::parse(o.codec)?;
     anyhow::ensure!(!(o.in_place && !o.output.is_empty()), "--output and --in-place are exclusive (--in-place writes into the calibration file)");
+    // CMF_MOE_CAPTURE_ONLY=1: one calibration forward over the layers into
+    // CMF_MOE_CAPTURE_DIR, then stop (no expert is encoded, no file written)
+    let capture_only = std::env::var("CMF_MOE_CAPTURE_ONLY").is_ok_and(|v| v != "0");
     // The host path is exact but far too slow for a full model: it runs
     // only when asked for, never as a silent fallback.
     let host_forced = std::env::var("CMF_MOE_HOST").is_ok_and(|v| v != "0");
@@ -205,12 +208,15 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
         Engine::Host
     } else {
         match to::dev() {
+            // a capture-only run encodes nothing: the device runs the forward
+            Some(c) if capture_only => Engine::Gpu(c),
             // the device grams and GEMMs run on the matrix units
             // (cooperative matrices): without them the first expert would
             // fail after the whole capture
-            Some(_) if !tm::matrix_units() => {
-                anyhow::bail!("quantize-moe: the wgpu device has no matrix units (cooperative matrices) for the device encode (set CMF_MOE_HOST=1 to run on the host)")
-            }
+            Some(_) if !tm::matrix_units() => anyhow::bail!(
+                "quantize-moe: the wgpu device has no matrix units (cooperative matrices) for the device encode{} (set CMF_MOE_HOST=1 to run on the host)",
+                if std::env::var("CMF_COOP").as_deref() == Ok("0") { "; CMF_COOP=0 is set and turns them off: unset it" } else { "" }
+            ),
             Some(c) => Engine::Gpu(c),
             None => anyhow::bail!("quantize-moe: no wgpu GPU (set CMF_MOE_HOST=1 to run on the host)"),
         }
@@ -342,9 +348,6 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
         .unwrap_or((0, nl));
     let (range_lo, range_hi) = (range_lo.min(nl), range_hi.min(nl));
     anyhow::ensure!(range_lo < range_hi, "CMF_MOE_RANGE {range_lo}..{range_hi} is empty");
-    // CMF_MOE_CAPTURE_ONLY=1: one calibration forward over the layers into
-    // CMF_MOE_CAPTURE_DIR, then stop (no expert is encoded, no file written)
-    let capture_only = std::env::var("CMF_MOE_CAPTURE_ONLY").is_ok_and(|v| v != "0");
     if capture_only {
         anyhow::ensure!(std::env::var_os("CMF_MOE_CAPTURE_DIR").is_some(), "CMF_MOE_CAPTURE_ONLY=1 needs CMF_MOE_CAPTURE_DIR");
         anyhow::ensure!(!o.in_place && patch.is_none() && diag.is_none(), "CMF_MOE_CAPTURE_ONLY=1 writes nothing: run it without --in-place, --patch-shared and CMF_MOE_DIAG");
@@ -432,8 +435,8 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
 
     let ec = EncodeCfg { codec, limit, lambda: o.lambda, threads: o.threads.max(1) };
     let main_bufs = match engine {
-        Engine::Gpu(c) => Some(wgpu_bufs::Bufs::new(c, CHUNK, hidden, inter.max(inter_s))),
-        Engine::Host => None,
+        Engine::Gpu(c) if !capture_only => Some(wgpu_bufs::Bufs::new(c, CHUNK, hidden, inter.max(inter_s))),
+        _ => None,
     };
     let mut stats = (0usize, 0usize);
     let mut prefetch: Option<std::thread::JoinHandle<anyhow::Result<()>>> = None;
