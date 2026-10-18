@@ -82,3 +82,6 @@ ash = { version = "0.38", optional = true }
 [dev-dependencies]
 # Tests opt into `RUST_LOG` to see the resident-graph refusals (warn!).
 tracing-subscriber = { workspace = true }
+# examples/shader_stats: WGSL -> SPIR-V for the driver's per-pipeline
+# statistics (the same naga wgpu builds with).
+naga = { version = "30", features = ["wgsl-in", "spv-out"] }

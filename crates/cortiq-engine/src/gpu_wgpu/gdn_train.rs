@@ -752,8 +752,7 @@ fn rec_bwd2(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_inde
         n2 = (cs * 2).max(4)
     );
     o += &v16(&|r| format!("    var ds{r} = 0.0;\n    var s{r} = 0.0;"));
-    o += "\n    var sp0 = vec4<f32>(0.0); var sp1 = vec4<f32>(0.0); var sp2 = vec4<f32>(0.0); var sp3 = vec4<f32>(0.0);\n";
-    o += "    var pn0 = vec4<f32>(0.0); var pn1 = vec4<f32>(0.0); var pn2 = vec4<f32>(0.0); var pn3 = vec4<f32>(0.0);\n";
+    o += "\n";
     o += &format!(
         "    var par = 0u;
     for (var sgi = 0u; sgi < p.nseg; sgi = sgi + 1u) {{
@@ -804,81 +803,80 @@ fn rec_bwd2(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_inde
                 {}
             }}
         }}
-        // S_{{t-1}} of the last step of the segment
-        if (nst > 1u) {{
-            let sb = scb4 + (nst - 2u) * 1024u;
-            sp0 = SCR4[sb]; sp1 = SCR4[sb + 1u]; sp2 = SCR4[sb + 2u]; sp3 = SCR4[sb + 3u];
-        }} else if (nst == 1u && seg > 0u) {{
-            let sb = ckb4 + seg * 4096u;
-            sp0 = CK4[sb]; sp1 = CK4[sb + 1u]; sp2 = CK4[sb + 2u]; sp3 = CK4[sb + 3u];
-        }} else {{
-            sp0 = vec4<f32>(0.0); sp1 = vec4<f32>(0.0); sp2 = vec4<f32>(0.0); sp3 = vec4<f32>(0.0);
-        }}
         for (var rr = 0u; rr < nst; rr = rr + 1u) {{
             let j = nst - 1u - rr;
             let ti = t0 + j;
             let bt = bidx * p.t + ti;
-            // prefetch S_{{t-2}} for the next step
-            if (j >= 2u) {{
-                let sb = scb4 + (j - 2u) * 1024u;
-                pn0 = SCR4[sb]; pn1 = SCR4[sb + 1u]; pn2 = SCR4[sb + 2u]; pn3 = SCR4[sb + 3u];
-            }} else if (j == 1u && seg > 0u) {{
-                let sb = ckb4 + seg * 4096u;
-                pn0 = CK4[sb]; pn1 = CK4[sb + 1u]; pn2 = CK4[sb + 2u]; pn3 = CK4[sb + 3u];
-            }} else {{
-                pn0 = vec4<f32>(0.0); pn1 = vec4<f32>(0.0); pn2 = vec4<f32>(0.0); pn3 = vec4<f32>(0.0);
-            }}
-",
-        st4("SCR4", "sb", "s")
-    );
-    o += "            let sp0_ = sp0; let sp1_ = sp1; let sp2_ = sp2; let sp3_ = sp3;\n";
-    o += &(0..16).map(|r| format!("            let sp{r}s = sp{}_.{};", r / 4, ["x", "y", "z", "w"][r % 4])).collect::<Vec<_>>().join("\n");
-    o += "
             let g = bgb[2u * j];
             let beta = bgb[2u * j + 1u];
             let vc = bv[j * 32u + cw] - bkv[j * 32u + cw];
             let u = beta * vc;
             let dd = bdo[j * 32u + cw];
-";
-    o += &ld4("            ", "k", "bk", "j * 32u + r4");
-    o += "\n";
+            let wb = par * 2080u + warp * PW;
+",
+        st4("SCR4", "sb", "s")
+    );
+    // Live ranges kept short (151 -> fewer registers): dq̂ is reduced right
+    // after it is formed, S_{t-1} and k̂ are read only after that, dk̂ is
+    // reduced before the dS update.
+    // Row partials over the warp's 4 columns, 4 rows at a time (rows i,
+    // i+4, i+8, i+12 meet in one shuffle pattern): `val(r)` is the WGSL
+    // expression of row r, so only four values are live at once.
+    let red = |val: &dyn Fn(usize) -> String, off: &str| -> String {
+        (0..4)
+            .map(|i| {
+                format!(
+                    "            {{
+                let x0 = {}; let x4 = {}; let x8 = {}; let x12 = {};
+                let a0 = select(x0, x8, hi0) + subgroupShuffleXor(select(x8, x0, hi0), 8u);
+                let a1 = select(x4, x12, hi0) + subgroupShuffleXor(select(x12, x4, hi0), 8u);
+                wpart[wb + {off} + rowq + {i}u] = select(a0, a1, hi1) + subgroupShuffleXor(select(a1, a0, hi1), 16u);
+            }}
+",
+                    val(i),
+                    val(i + 4),
+                    val(i + 8),
+                    val(i + 12)
+                )
+            })
+            .collect()
+    };
     o += &ld4("            ", "q", "bq", "j * 32u + r4");
     o += "\n";
-    o += &v16(&|r| format!("            ds{r} = fma(q{r}, dd, ds{r});\n            let dq{r} = s{r} * dd;"));
+    o += &v16(&|r| format!("            ds{r} = fma(q{r}, dd, ds{r});"));
+    o += "\n";
+    o += &red(&|r| format!("s{r} * dd"), "0u");
+    // S_{t-1}: the scratch slot j-1, the segment's checkpoint, or zero
+    o += "            var spa = vec4<f32>(0.0); var spb = vec4<f32>(0.0); var spc = vec4<f32>(0.0); var spd = vec4<f32>(0.0);
+            if (j > 0u) {
+                let sb = scb4 + (j - 1u) * 1024u;
+                spa = SCR4[sb]; spb = SCR4[sb + 1u]; spc = SCR4[sb + 2u]; spd = SCR4[sb + 3u];
+            } else if (seg > 0u) {
+                let sb = ckb4 + seg * 4096u;
+                spa = CK4[sb]; spb = CK4[sb + 1u]; spc = CK4[sb + 2u]; spd = CK4[sb + 3u];
+            }
+";
+    o += &(0..16).map(|r| format!("            let sp{r}s = sp{}.{};", ["a", "b", "c", "d"][r / 4], ["x", "y", "z", "w"][r % 4])).collect::<Vec<_>>().join("\n");
+    o += "\n";
+    o += &ld4("            ", "k", "bk", "j * 32u + r4");
     o += "\n";
     o += &chain("            ", "d", "ds", "k");
     o += "
             let du = rsum8(d0 + d1);
             let dkv = -(beta * du);
 ";
-    o += &v16(&|r| format!("            let dk{r} = fma(ds{r}, u, (sp{r}s * g) * dkv);\n            let e{r} = fma(k{r}, dkv, ds{r});"));
-    o += "\n";
-    o += "            var g0 = e0 * sp0s;\n            var g1 = e1 * sp1s;\n";
-    o += &(2..16).map(|r| format!("            g{} = fma(e{r}, sp{r}s, g{});", r % 2, r % 2)).collect::<Vec<_>>().join("\n");
-    o += "\n";
-    o += &v16(&|r| format!("            ds{r} = g * e{r};"));
+    o += &red(&|r| format!("fma(ds{r}, u, (sp{r}s * g) * dkv)"), "128u");
+    o += "            let e0 = fma(k0, dkv, ds0);\n            let e1 = fma(k1, dkv, ds1);\n";
+    o += "            var g0 = e0 * sp0s;\n            var g1 = e1 * sp1s;\n            ds0 = g * e0;\n            ds1 = g * e1;\n";
+    o += &(2..16)
+        .map(|r| format!("            let e{r} = fma(k{r}, dkv, ds{r});\n            g{} = fma(e{r}, sp{r}s, g{});\n            ds{r} = g * e{r};", r % 2, r % 2))
+        .collect::<Vec<_>>()
+        .join("\n");
     o += "
             let dgw = csum4(rsum8(g0 + g1));
             let dbw = csum4(du * vc);
             if (first) { DCQ[bt * p.c_dim + 2u * p.kd + h * 128u + col] = beta * du; }
-            let wb = par * 2080u + warp * PW;
-";
-    for (nm, off) in [("dq", "0u"), ("dk", "128u")] {
-        for i in 0..4 {
-            o += &format!(
-                "            {{
-                let a0 = select({nm}{i}, {nm}{j8}, hi0) + subgroupShuffleXor(select({nm}{j8}, {nm}{i}, hi0), 8u);
-                let a1 = select({nm}{j4}, {nm}{j12}, hi0) + subgroupShuffleXor(select({nm}{j12}, {nm}{j4}, hi0), 8u);
-                wpart[wb + {off} + rowq + {i}u] = select(a0, a1, hi1) + subgroupShuffleXor(select(a1, a0, hi1), 16u);
-            }}
-",
-                j8 = i + 8,
-                j4 = i + 4,
-                j12 = i + 12
-            );
-        }
-    }
-    o += "            if (lane == 0u) {
+            if (lane == 0u) {
                 wpart[wb + 256u] = dbw;
                 wpart[wb + 257u] = dgw;
             }
@@ -897,12 +895,20 @@ fn rec_bwd2(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_inde
 ";
     o += &(0..16).map(|r| format!("            s{r} = sp{r}s;")).collect::<Vec<_>>().join("\n");
     o += "
-            sp0 = pn0; sp1 = pn1; sp2 = pn2; sp3 = pn3;
         }
     }
 }
 ";
     o
+}
+
+/// The WGSL of the trainer's GDN modules with their entry points
+/// (examples/shader_stats: driver statistics per pipeline).
+pub fn debug_sources() -> Vec<(&'static str, String, Vec<&'static str>)> {
+    vec![
+        ("gdn_train", format!("{HEAD}{SRC}"), ENTRIES.to_vec()),
+        ("gdn_train_sg", format!("{HEAD}{SRC2}{}", rec_src(ckpt_interval())), ENTRIES2.to_vec()),
+    ]
 }
 
 const ENTRIES: [&str; 7] = ["conv_fwd", "conv_bwd", "qk_prep", "gate_prep", "rec_fwd", "rec_bwd", "qk_bwd"];
