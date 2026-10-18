@@ -1126,6 +1126,10 @@ pub struct Dsv41State {
     /// bounded by the GPU policy and cold experts complete on the host.
     #[cfg(feature = "gpu")]
     gpu_pool: Option<crate::qwen4_exp::QwenGpuPool>,
+    /// MoE calls the dynamic GPU expert bank served (diagnostics; survives
+    /// [`Dsv41State::clear`] like the bank).
+    #[cfg(feature = "gpu")]
+    gpu_moe_calls: u64,
     /// GPTQ calibration capture (`cortiq quantize-moe`); `None` outside a
     /// capture. Survives [`Dsv41State::clear`]: [`capture_window`] owns it.
     pub moe_capture: Option<Dsv41MoeCapture>,
@@ -1179,8 +1183,22 @@ impl Dsv41State {
             gpu_kv_id,
             #[cfg(feature = "gpu")]
             gpu_pool: None,
+            #[cfg(feature = "gpu")]
+            gpu_moe_calls: 0,
             moe_capture: None,
         }
+    }
+
+    /// The dynamic GPU MoE as this state saw it: how many MoE calls the
+    /// device expert bank served, and the bank's codec (`q4tp`, `q2tp` or
+    /// `mxfp4`; None until a bank exists). Diagnostics for tests and
+    /// reports — counted with or without `CMF_DSV41_PROF`.
+    #[cfg(feature = "gpu")]
+    pub fn gpu_moe_stats(&self) -> (u64, Option<&'static str>) {
+        (
+            self.gpu_moe_calls,
+            self.gpu_pool.as_ref().map(|p| p.codec.label()),
+        )
     }
 
     pub fn clear(&mut self) {
@@ -2915,6 +2933,7 @@ fn moe(
         out,
     ) {
         prof::note_gpu_moe();
+        state.gpu_moe_calls += 1;
         return;
     }
     prof::note_cpu_moe();
