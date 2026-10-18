@@ -427,40 +427,46 @@ fn build_global(c: &Ctx, segments: usize) -> Option<GlobalPipes> {
         count: count.and_then(std::num::NonZeroU32::new),
     };
     let seg = Some(segments as u32);
-    let gu0 = c.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("mxfp4-global-gu0"),
-        entries: &[
-            storage(0, true, seg),
-            storage(1, true, seg),
-            storage(2, true, None),
-            storage(3, true, None),
-            storage(4, false, None),
-            storage(5, true, None),
-        ],
-    });
-    let dn0 = c.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("mxfp4-global-dn0"),
-        entries: &[
-            storage(0, true, seg),
-            storage(1, true, None),
-            storage(2, true, None),
-            storage(3, true, None),
-            storage(4, false, None),
-        ],
-    });
-    let params = c.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("mxfp4-global-params"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        }],
-    });
+    let gu0 = c
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mxfp4-global-gu0"),
+            entries: &[
+                storage(0, true, seg),
+                storage(1, true, seg),
+                storage(2, true, None),
+                storage(3, true, None),
+                storage(4, false, None),
+                storage(5, true, None),
+            ],
+        });
+    let dn0 = c
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mxfp4-global-dn0"),
+            entries: &[
+                storage(0, true, seg),
+                storage(1, true, None),
+                storage(2, true, None),
+                storage(3, true, None),
+                storage(4, false, None),
+            ],
+        });
+    let params = c
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mxfp4-global-params"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
     let layout = |l0: &wgpu::BindGroupLayout, label: &str| {
         c.device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -469,7 +475,10 @@ fn build_global(c: &Ctx, segments: usize) -> Option<GlobalPipes> {
                 immediate_size: 0,
             })
     };
-    let (gl, dl) = (layout(&gu0, "mxfp4-global-gu"), layout(&dn0, "mxfp4-global-dn"));
+    let (gl, dl) = (
+        layout(&gu0, "mxfp4-global-gu"),
+        layout(&dn0, "mxfp4-global-dn"),
+    );
     let mk = |entry: &str, l: &wgpu::PipelineLayout| {
         trace_pipeline(entry);
         c.device
@@ -600,11 +609,18 @@ pub fn matmat(
     let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("mxfp4"),
         layout: &pipe.get_bind_group_layout(0),
-        entries: &[bind_buf(0, &w), bind_buf(1, &xb), bind_buf(2, &yb), bind_buf(3, &u)],
+        entries: &[
+            bind_buf(0, &w),
+            bind_buf(1, &xb),
+            bind_buf(2, &yb),
+            bind_buf(3, &u),
+        ],
     });
     let mut enc = c
         .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("mxfp4") });
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("mxfp4"),
+        });
     {
         let mut pass = begin_pass(&mut enc);
         pass.set_pipeline(pipe);
@@ -667,7 +683,10 @@ mod tests {
     }
 
     /// A CMF holding the given `[rows, cols]` mxfp4 tensors.
-    fn model_with(tag: &str, tensors: &[(&str, usize, usize, Vec<u8>)]) -> (Arc<CmfModel>, std::path::PathBuf) {
+    fn model_with(
+        tag: &str,
+        tensors: &[(&str, usize, usize, Vec<u8>)],
+    ) -> (Arc<CmfModel>, std::path::PathBuf) {
         use cortiq_core::{CmfHeader, TensorSpec};
         let header: CmfHeader = serde_json::from_value(serde_json::json!({
             "format": "cmf", "version": cortiq_core::CMF_VERSION,
@@ -738,7 +757,10 @@ mod tests {
             let (rows, cols) = (*rows, *cols);
             let x = act(cols, i);
             let mut got = vec![0f32; rows];
-            assert!(matmat(&model, i, &x, 1, rows, cols, &mut got), "matvec {rows}x{cols}");
+            assert!(
+                matmat(&model, i, &x, 1, rows, cols, &mut got),
+                "matvec {rows}x{cols}"
+            );
             let (want, mag) = reference(p, &x, rows, cols);
             for r in 0..rows {
                 let tol = mag[r] * 4e-6 + 1e-30;
@@ -758,9 +780,19 @@ mod tests {
                 assert!(matmat(&model, i, &xs, b, rows, cols, &mut mm), "batch {b}");
                 for t in 0..b {
                     let mut one = vec![0f32; rows];
-                    assert!(matmat(&model, i, &xs[t * cols..(t + 1) * cols], 1, rows, cols, &mut one));
+                    assert!(matmat(
+                        &model,
+                        i,
+                        &xs[t * cols..(t + 1) * cols],
+                        1,
+                        rows,
+                        cols,
+                        &mut one
+                    ));
                     assert!(
-                        one.iter().zip(&mm[t * rows..(t + 1) * rows]).all(|(a, b)| a.to_bits() == b.to_bits()),
+                        one.iter()
+                            .zip(&mm[t * rows..(t + 1) * rows])
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
                         "{rows}x{cols} batch {b} token {t} differs from its matvec"
                     );
                 }
@@ -818,28 +850,39 @@ mod tests {
             tensors.push((n[2].as_str(), dim, inter, payload(dim, inter, 10 * e + 3)));
         }
         let (model, dir) = model_with("bank", &tensors);
-        let triples: Vec<(usize, usize, usize)> = (0..=n_exp).map(|e| (3 * e, 3 * e + 1, 3 * e + 2)).collect();
+        let triples: Vec<(usize, usize, usize)> =
+            (0..=n_exp).map(|e| (3 * e, 3 * e + 1, 3 * e + 2)).collect();
         let (gu_len, d_len) = MoeBankCodec::Mxfp4.lens(inter, dim).unwrap();
         let gib = 1024u64 * 1024 * 1024;
         let budget = dsv4_vram_budget().unwrap();
         let workspace = (budget / 10).clamp(2 * gib, 4 * gib);
         let request = (workspace / (2 * gu_len + d_len) as u64) as usize + 16;
-        let Some((capacity, segment_slots)) =
-            dsv4_global_moe_create_for_dsv41_codec(&model, request, inter, dim, MoeBankCodec::Mxfp4)
-        else {
+        let Some((capacity, segment_slots)) = dsv4_global_moe_create_for_dsv41_codec(
+            &model,
+            request,
+            inter,
+            dim,
+            MoeBankCodec::Mxfp4,
+        ) else {
             eprintln!("global mxfp4 bank could not be allocated here — skipping");
             let _ = std::fs::remove_dir_all(&dir);
             return;
         };
         assert!(capacity >= 8);
         // A second create for another codec on the same model is refused.
-        assert!(dsv4_global_moe_create_for_dsv41_codec(&model, request, inter, dim, MoeBankCodec::Q4tp).is_none());
+        assert!(
+            dsv4_global_moe_create_for_dsv41_codec(&model, request, inter, dim, MoeBankCodec::Q4tp)
+                .is_none()
+        );
         for (slot, t) in triples.iter().copied().enumerate() {
             assert!(dsv4_global_slot_fill(&model, slot, t), "fill slot {slot}");
         }
         let q: Vec<[crate::qtensor::QTensor; 3]> = names
             .iter()
-            .map(|n| n.clone().map(|name| crate::qtensor::QTensor::from_model(&model, &name).unwrap()))
+            .map(|n| {
+                n.clone()
+                    .map(|name| crate::qtensor::QTensor::from_model(&model, &name).unwrap())
+            })
             .collect();
         let limit = 0.5f32;
         let host_expert = |e: usize, x: &[f32], wgt: f32| -> Vec<f32> {
@@ -874,7 +917,9 @@ mod tests {
             let mut weights = vec![0f32; n_exp];
             weights[picks[0]] = wts[0];
             weights[picks[1]] = wts[1];
-            let logits: Vec<f32> = (0..n_exp).map(|e| if picks.contains(&e) { 1.0 } else { 0.0 }).collect();
+            let logits: Vec<f32> = (0..n_exp)
+                .map(|e| if picks.contains(&e) { 1.0 } else { 0.0 })
+                .collect();
             let mut remap: Vec<u32> = (0..n_exp as u32).collect();
             if cold {
                 remap[picks[1]] = u32::MAX;
@@ -908,7 +953,17 @@ mod tests {
             };
             let (mut got, mut cold_ids, mut cold_x) = (vec![0f32; dim], Vec::new(), Vec::new());
             assert!(
-                dsv4_moe_frame(&model, &w, geom, &x, &mut cold_ids, &mut cold_x, None, None, &mut got),
+                dsv4_moe_frame(
+                    &model,
+                    &w,
+                    geom,
+                    &x,
+                    &mut cold_ids,
+                    &mut cold_x,
+                    None,
+                    None,
+                    &mut got
+                ),
                 "frame case {case}"
             );
             let mut want = vec![0f32; dim];
@@ -940,7 +995,11 @@ mod tests {
             }
             let cos = dot / (den * gg).sqrt();
             assert!(den > 0.0, "case {case}: the experts contribute nothing");
-            assert!((num / den).sqrt() < 0.02 && cos > 0.999, "case {case}: nrmse {} cos {cos}", (num / den).sqrt());
+            assert!(
+                (num / den).sqrt() < 0.02 && cos > 0.999,
+                "case {case}: nrmse {} cos {cos}",
+                (num / den).sqrt()
+            );
         }
         drop(q);
         drop(model);

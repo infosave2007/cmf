@@ -111,7 +111,9 @@ pub fn dequant(bytes: &[u8], rows: usize, cols: usize, dst: &mut [f32]) {
 /// float decoders refuse it, rather than carried into a model.
 pub fn repack(codes: &[u8], scales: &[u8], rows: usize, cols: usize) -> Result<Vec<u8>, String> {
     if cols == 0 || cols % GROUP != 0 {
-        return Err(format!("mxfp4: cols {cols} not a positive multiple of {GROUP}"));
+        return Err(format!(
+            "mxfp4: cols {cols} not a positive multiple of {GROUP}"
+        ));
     }
     let gpr = cols / GROUP;
     if codes.len() != rows * cols / 2 || scales.len() != rows * gpr {
@@ -242,7 +244,11 @@ mod tests {
     #[test]
     fn tables_match_the_ocp_definition() {
         for code in 0..16u8 {
-            assert_eq!(E2M1_LUT[code as usize] as f64, e2m1_ref(code), "code {code}");
+            assert_eq!(
+                E2M1_LUT[code as usize] as f64,
+                e2m1_ref(code),
+                "code {code}"
+            );
             assert_eq!(E2M1_X2_I8[code as usize] as f64, 2.0 * e2m1_ref(code));
         }
         assert_eq!(E2M1_LUT[8].to_bits(), (-0.0f32).to_bits());
@@ -431,7 +437,11 @@ mod tests {
                 let codes: Vec<u8> = (0..16)
                     .map(|j| {
                         let a = ((j * 5 + k as usize) % (top as usize + 1)) as u8;
-                        let b = if j == 3 { top | 8 } else { (j as u8 * 3) % (top + 1) };
+                        let b = if j == 3 {
+                            top | 8
+                        } else {
+                            (j as u8 * 3) % (top + 1)
+                        };
                         a | (b << 4)
                     })
                     .collect();
@@ -474,7 +484,10 @@ mod tests {
                 // Inside the grid: half the local step (≤ 1·s between 4 and
                 // 6); in the clipped band [6, 8): the distance to 6·s.
                 let bound = if q >= 6.0 { q * s - 6.0 * s } else { s };
-                assert!(err <= bound + 1e-12, "group {g} elem {j}: err {err} bound {bound}");
+                assert!(
+                    err <= bound + 1e-12,
+                    "group {g} elem {j}: err {err} bound {bound}"
+                );
             }
         }
         // Values already on the grid survive a quantize → dequant unchanged,
