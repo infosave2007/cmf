@@ -367,7 +367,10 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
         eprintln!();
         if hi >= range_hi {
             // the last pass: the model's device state is not needed any more
+            // (its expert bank and cached weights live in the device context,
+            // keyed by the model, and outlive the pipeline unless released)
             pipe = None;
+            cortiq_engine::gpu_wgpu::release_model_buffers(&cmodel);
         }
         for li in lo..hi {
             let tl = Instant::now();
