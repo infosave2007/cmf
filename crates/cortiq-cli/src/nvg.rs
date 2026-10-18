@@ -83,12 +83,6 @@ pub fn pt<T>(p: Option<&Prof>, k: &'static str, f: impl FnOnce() -> T) -> T {
     }
 }
 
-#[inline]
-fn pcount(p: Option<&Prof>, k: &'static str, n: u64) {
-    if let Some(p) = p {
-        p.add(k, 0.0, n);
-    }
-}
 
 // ───────────────────────────── model of one tensor ─────────────────────────────
 
@@ -1471,9 +1465,11 @@ pub fn run_convert_blr(
                 let mut fit_ppl = 0f64;
                 let keep = names.clone();
                 cortiq_engine::gptq_capture::begin_filtered(true, move |n| keep.contains(n));
+                // The device pass feeds the positions the host's scored
+                // forward feeds (a window's last token has no target there).
                 for wv in &fit_w {
                     if gpu {
-                        pipe.calib_forward(wv, l + 1, window).map_err(|e| anyhow::anyhow!(e))?;
+                        pipe.calib_forward(&wv[..wv.len() - 1], l + 1, window).map_err(|e| anyhow::anyhow!(e))?;
                     } else {
                         fit_ppl += pipe.ppl_ids(wv).map_err(|e| anyhow::anyhow!(e))?.ln();
                     }
@@ -1483,7 +1479,7 @@ pub fn run_convert_blr(
                 cortiq_engine::gptq_capture::begin_filtered(true, move |n| keep.contains(n));
                 for wv in &sel_w {
                     if gpu {
-                        pipe.calib_forward(wv, l + 1, window).map_err(|e| anyhow::anyhow!(e))?;
+                        pipe.calib_forward(&wv[..wv.len() - 1], l + 1, window).map_err(|e| anyhow::anyhow!(e))?;
                     } else {
                         pipe.ppl_ids(wv).map_err(|e| anyhow::anyhow!(e))?;
                     }
@@ -1503,7 +1499,7 @@ pub fn run_convert_blr(
                 }
                 let tc = tl.elapsed().as_secs_f64();
                 #[cfg(feature = "gpu")]
-                if gpu {
+                if gpu && std::env::var("CMF_NVG_ENC_CPU").as_deref() != Ok("1") {
                     // The layer's input contexts once each, then its tensors
                     // on the device with up to CMF_NVG_JOBS (default 3) in
                     // flight.
