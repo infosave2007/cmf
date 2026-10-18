@@ -18,6 +18,7 @@
 //! ```
 
 use super::train_ops::{self, Disp, elt_fold};
+use super::train_sign;
 use super::zimage::{self as zi, Epi};
 use super::{Ctx, submit};
 
@@ -69,6 +70,31 @@ fn cvt_cols(@builtin(global_invocation_id) g: vec3<u32>) {
     var v = 0.0;
     if (row < p.m) { v = SRC[row * p.words + p.r + i % p.k] * p.scale; }
     DST[i] = f16(v);
+}
+
+// Transposed staging: DST[rows][mpad] = f16(SRC[t][row] · COL[row] (r = 1) ·
+// scale) for t < m tokens, row < k; zero for padded tokens and rows.
+// SRC is [m][k] f32; rows = pad_rows(k), mpad = the padded token count.
+var<workgroup> tile: array<f32, 1056>;
+@compute @workgroup_size(32, 8)
+fn cvt_t(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>) {
+    let t0 = wg.x * 32u;
+    let r0 = wg.y * 32u;
+    for (var j = 0u; j < 32u; j = j + 8u) {
+        let t = t0 + l.y + j;
+        let row = r0 + l.x;
+        var v = 0.0;
+        if (t < p.m && row < p.k) {
+            if (p.r == 1u) { v = SRC[t * p.k + row] * COL[row] * p.scale; } else { v = SRC[t * p.k + row] * p.scale; }
+        }
+        tile[(l.y + j) * 33u + l.x] = v;
+    }
+    workgroupBarrier();
+    for (var j = 0u; j < 32u; j = j + 8u) {
+        let row = r0 + l.y + j;
+        let t = t0 + l.x;
+        DST[row * p.mpad + t] = f16(tile[l.x * 33u + l.y + j]);
+    }
 }
 
 // Sign bitmap [rows][words] (bit j of word w = rank 32w+j, 1 = +1) →
@@ -193,7 +219,7 @@ fn scale_acc(@builtin(global_invocation_id) g: vec3<u32>) {
 "#;
 
 fn module(c: &Ctx) -> Option<&'static train_ops::Mod> {
-    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "cvt_cols", "expand", "colsum_prod", "scale_acc", "dense_fwd", "dense_bwd", "split_qg", "adam", "sumsq"])
+    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "cvt_cols", "cvt_t", "expand", "colsum_prod", "scale_acc", "dense_fwd", "dense_bwd", "split_qg", "adam", "sumsq"])
 }
 
 /// One step of a trainer pass: an elementwise/reduction dispatch or a GEMM.
@@ -299,6 +325,20 @@ pub fn cvt_cols<'a>(c: &'a Ctx, src: &'a wgpu::Buffer, dst: &'a wgpu::Buffer, m:
     let mpad = pad_rows(m);
     let uni = vec![m as u32, k as u32, mpad as u32, 0, col0 as u32, stride as u32, 0, 0, scale.to_bits(), 0, 0, 0];
     Some(Disp { pipe: &md.p["cvt_cols"], uni, bufs: vec![(1, src), (3, dst)], grid: elt_fold(mpad * k) })
+}
+
+/// Transposed staging: `dst` (f16 `[pad_rows(k)][kpad]`, kpad = `ntok`
+/// padded to 32) = `src` (f32 `[ntok][k]`) transposed, each source column
+/// multiplied by `col[k]` (if given) and everything by `scale`; padded
+/// tokens and rows are zero. Element for element the values [`cvt`] stages.
+#[allow(clippy::too_many_arguments)]
+pub fn cvt_t<'a>(c: &'a Ctx, src: &'a wgpu::Buffer, col: Option<&'a wgpu::Buffer>, dst: &'a wgpu::Buffer, ntok: usize, k: usize, scale: f32) -> Option<Disp<'a>> {
+    let md = module(c)?;
+    let kpad = ntok.div_ceil(32) * 32;
+    let rows = pad_rows(k);
+    // without a column factor COL aliases SRC (statically bound, never read)
+    let uni = vec![ntok as u32, k as u32, kpad as u32, rows as u32, col.is_some() as u32, 0, 0, 0, scale.to_bits(), 0, 0, 0];
+    Some(Disp { pipe: &md.p["cvt_t"], uni, bufs: vec![(1, src), (2, col.unwrap_or(src)), (3, dst)], grid: ((kpad / 32) as u32, (rows / 32) as u32, 1) })
 }
 
 /// Expand a sign bitmap `[rows][ceil(r/32)]` into `pl` `[rows][r]` and `plt` `[r][rows]`.
@@ -440,6 +480,8 @@ pub struct BlrPath {
     pub dh: wgpu::Buffer,
     pub dl: wgpu::Buffer,
     pub dg: wgpu::Buffer,
+    /// Sign latents and optimizer state (sign training only).
+    pub sign: Option<train_sign::SignPath>,
 }
 
 /// A binary low-rank linear `y = Σ_p Ŵ_p x` of shape m×n, rank r per path
@@ -459,10 +501,10 @@ pub struct BlrScratch {
     pl_v: wgpu::Buffer,
     plt_v: wgpu::Buffer,
     xh: wgpu::Buffer,   // f16 act [pad(ntok)][max(m,n,r)]
-    a: Vec<wgpu::Buffer>, // f32 [ntok][r] per path
+    pub(super) a: Vec<wgpu::Buffer>, // f32 [ntok][r] per path
     cbuf: Vec<wgpu::Buffer>, // f32 [ntok][m] per path (pre-h output)
     t1: wgpu::Buffer,   // f32 [ntok][max(m,n)]
-    t2: wgpu::Buffer,   // f32 [ntok][r]
+    pub(super) t2: wgpu::Buffer, // f32 [ntok][r]
 }
 
 impl BlrScratch {
@@ -507,11 +549,18 @@ pub fn blr_forward(c: &Ctx, layer: &Blr, s: &BlrScratch, x: &wgpu::Buffer, y: &w
 /// accumulate into each path's dh/dℓ/dg; `dx` (`[ntok][n]`) is overwritten
 /// with the input gradient. `gscale` is the power of two the gradients are
 /// staged under in f16.
+///
+/// With `sign` (and sign state on the path), the sign gradients follow in
+/// the same pass, then each matrix's latent/bitmap update (see
+/// `train_sign`): G_U = diag(h)·dyᵀ·a·diag(ℓ) from the transposed operands
+/// `dy⊙h·gs` and `a⊙ℓ`, then G_V = diag(g)·xᵀ·b·diag(ℓ) from `x⊙g` and
+/// `b⊙ℓ·gs` (b = t2, overwritten by the next path: G_V stays inside this
+/// path's op list). The input gradient was already formed from the old bits.
 #[allow(clippy::too_many_arguments)]
-pub fn blr_backward(c: &Ctx, layer: &Blr, s: &BlrScratch, x: &wgpu::Buffer, dy: &wgpu::Buffer, dx: &wgpu::Buffer, ntok: usize, gscale: f32) -> Option<()> {
+pub fn blr_backward(c: &Ctx, layer: &Blr, s: &BlrScratch, x: &wgpu::Buffer, dy: &wgpu::Buffer, dx: &wgpu::Buffer, ntok: usize, gscale: f32, sign: Option<&train_sign::SignCtx>) -> Option<()> {
     let (m, n, r) = (layer.m, layer.n, layer.r);
     for (pi, p) in layer.paths.iter().enumerate() {
-        let ops = vec![
+        let mut ops = vec![
             Op::D(expand(c, &p.bits_u, &s.pl_u, &s.plt_u, m, r)?),
             Op::D(expand(c, &p.bits_v, &s.pl_v, &s.plt_v, n, r)?),
             Op::D(colsum_prod(c, dy, &s.cbuf[pi], &p.dh, ntok, m)?),
@@ -523,6 +572,18 @@ pub fn blr_backward(c: &Ctx, layer: &Blr, s: &BlrScratch, x: &wgpu::Buffer, dy: 
             Op::D(colsum_prod(c, x, &s.t1, &p.dg, ntok, n)?),
             Op::D(scale_acc(c, &s.t1, &p.g, dx, ntok, n, pi > 0)?),
         ];
+        if let (Some(ctx), Some(sp)) = (sign, p.sign.as_ref()) {
+            let sc = ctx.sc;
+            let kpad = sc.kpad;
+            ops.push(Op::D(cvt_t(c, dy, Some(&p.h), &sc.t_big, ntok, m, gscale)?));
+            ops.push(Op::D(cvt_t(c, &s.a[pi], Some(&p.l), &sc.t_small, ntok, r, 1.0)?));
+            ops.push(Op::M(mm(c, &sc.t_small, &sc.t_big, &sc.g, m, r, kpad, 1.0 / gscale)?));
+            ops.extend(train_sign::grad_consumer_ops(c, ctx, &sp.u, &p.bits_u, 0)?);
+            ops.push(Op::D(cvt_t(c, x, Some(&p.g), &sc.t_big, ntok, n, 1.0)?));
+            ops.push(Op::D(cvt_t(c, &s.t2, Some(&p.l), &sc.t_small, ntok, r, gscale)?));
+            ops.push(Op::M(mm(c, &sc.t_small, &sc.t_big, &sc.g, n, r, kpad, 1.0 / gscale)?));
+            ops.extend(train_sign::grad_consumer_ops(c, ctx, &sp.v, &p.bits_v, 1)?);
+        }
         run(c, &ops);
     }
     Some(())
@@ -582,7 +643,7 @@ mod tests {
                 c.queue.write_buffer(&b, 0, bytemuck::cast_slice(v));
                 b
             };
-            paths.push(BlrPath { bits_u: ub(&bu), bits_v: ub(&bv), h: upload(c, &h), l: upload(c, &l), g: upload(c, &g), dh: zeros(c, m), dl: zeros(c, r), dg: zeros(c, n) });
+            paths.push(BlrPath { bits_u: ub(&bu), bits_v: ub(&bv), h: upload(c, &h), l: upload(c, &l), g: upload(c, &g), dh: zeros(c, m), dl: zeros(c, r), dg: zeros(c, n), sign: None });
             paths_h.push((su, sv, h, l, g));
         }
         let layer = Blr { m, n, r, paths };
@@ -591,7 +652,7 @@ mod tests {
         let s = BlrScratch::new(c, ntok, m, n, r, np);
         let (bx, by, bdy, bdx) = (upload(c, &x), zeros(c, pad_rows(ntok) * m), upload(c, &dy), zeros(c, pad_rows(ntok) * n));
         blr_forward(c, &layer, &s, &bx, &by, ntok).expect("forward");
-        blr_backward(c, &layer, &s, &bx, &bdy, &bdx, ntok, 1024.0).expect("backward");
+        blr_backward(c, &layer, &s, &bx, &bdy, &bdx, ntok, 1024.0, None).expect("backward");
         // f64 reference
         let mut y = vec![0f64; ntok * m];
         let mut dx = vec![0f64; ntok * n];
@@ -633,5 +694,258 @@ mod tests {
             rel(&format!("dl{pi}"), &download(c, &layer.paths[pi].dl, r).unwrap(), dl);
             rel(&format!("dg{pi}"), &download(c, &layer.paths[pi].dg, n).unwrap(), dg);
         }
+    }
+
+    fn pack_bits(s: &[f32], rows: usize, r: usize) -> Vec<u32> {
+        let w = r.div_ceil(32);
+        let mut b = vec![0u32; rows * w];
+        for row in 0..rows {
+            for j in 0..r {
+                if s[row * r + j] > 0.0 {
+                    b[row * w + j / 32] |= 1 << (j % 32);
+                }
+            }
+        }
+        b
+    }
+
+    fn ubuf(c: &Ctx, v: &[u32]) -> wgpu::Buffer {
+        let b = train_ops::zeros_u32(c, v.len());
+        c.queue.write_buffer(&b, 0, bytemuck::cast_slice(v));
+        b
+    }
+
+    fn f16_bits(c: &Ctx, b: &wgpu::Buffer, n: usize) -> Vec<u16> {
+        let w = train_ops::download_u32(c, b, n.div_ceil(2)).unwrap();
+        let mut out: Vec<u16> = w.iter().flat_map(|&x| [x as u16, (x >> 16) as u16]).collect();
+        out.truncate(n);
+        out
+    }
+
+    /// `cvt_t` is the transpose of `cvt`, bit for bit in f16, padded rows
+    /// and tokens zero (ntok 70 → 96 padded tokens, k 200 → 256 rows).
+    #[test]
+    fn cvt_t_matches_cvt() {
+        let Some(c) = train_ops::dev() else { return };
+        let (ntok, k) = (70usize, 200usize);
+        let kpad = 96usize;
+        let src = upload(c, &rnd(ntok * k, 3, 3.0));
+        let col = upload(c, &rnd(k, 4, 2.0));
+        for (cb, scale) in [(Some(&col), 1024.0f32), (None, 0.5)] {
+            let a = f16_buf(c, pad_rows(ntok) * k);
+            let t = f16_buf(c, pad_rows(k) * kpad);
+            // poison the transposed buffer so unwritten pads would show
+            c.queue.write_buffer(&t, 0, bytemuck::cast_slice(&vec![0x3c00_3c00u32; (pad_rows(k) * kpad).div_ceil(2)]));
+            run(c, &[Op::D(cvt(c, &src, cb, &a, ntok, k, scale).unwrap()), Op::D(cvt_t(c, &src, cb, &t, ntok, k, scale).unwrap())]);
+            let av = f16_bits(c, &a, pad_rows(ntok) * k);
+            let tv = f16_bits(c, &t, pad_rows(k) * kpad);
+            let mut bad = 0;
+            for row in 0..pad_rows(k) {
+                for tok in 0..kpad {
+                    let want = if row < k && tok < ntok { av[tok * k + row] } else { 0 };
+                    if tv[row * kpad + tok] != want {
+                        bad += 1;
+                    }
+                }
+            }
+            eprintln!("cvt_t (col {}): {bad} mismatches of {}", cb.is_some(), pad_rows(k) * kpad);
+            assert_eq!(bad, 0);
+        }
+    }
+
+    struct SignLayer {
+        layer: Blr,
+        host: Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)>,
+    }
+
+    /// A blr layer with sign state on every path (deferred: the gradients are kept).
+    #[allow(clippy::too_many_arguments)]
+    fn sign_layer(c: &Ctx, m: usize, n: usize, r: usize, np: usize, exact: bool) -> SignLayer {
+        let sgn = |v: &f32| if *v >= 0.0 { 1.0 } else { -1.0 };
+        let mut host = Vec::new();
+        let mut paths = Vec::new();
+        let mut id = 0u32;
+        for pi in 0..np {
+            let su: Vec<f32> = rnd(m * r, 10 + pi as u64, 1.0).iter().map(sgn).collect();
+            let sv: Vec<f32> = rnd(n * r, 20 + pi as u64, 1.0).iter().map(sgn).collect();
+            let h: Vec<f32> = rnd(m, 30 + pi as u64, 0.5).iter().map(|v| 0.02 + v.abs() * 0.05).collect();
+            // exact: ℓ and g powers of two, so every f16 operand of the forward is exact
+            let l: Vec<f32> = if exact {
+                rnd(r, 40 + pi as u64, 1.0).iter().map(|v| [0.5f32, 1.0, 2.0][((v.abs() * 2.999) as usize).min(2)]).collect()
+            } else {
+                rnd(r, 40 + pi as u64, 0.5).iter().map(|v| 0.5 + v.abs()).collect()
+            };
+            let g: Vec<f32> = if exact {
+                rnd(n, 50 + pi as u64, 1.0).iter().map(|v| if *v >= 0.0 { 1.0 } else { 0.5 }).collect()
+            } else {
+                rnd(n, 50 + pi as u64, 0.5).iter().map(|v| 0.1 + v.abs() * 0.2).collect()
+            };
+            let bu = ubuf(c, &pack_bits(&su, m, r));
+            let bv = ubuf(c, &pack_bits(&sv, n, r));
+            let init = train_sign::SignInit { opt: train_sign::SignOpt::Fact, tau: 0.25, seed: 1, keep_bits0: false, defer: true };
+            let u = train_sign::init_mat(c, &bu, m, r, r, &init, id).unwrap();
+            let v = train_sign::init_mat(c, &bv, n, r, r, &init, id + 1).unwrap();
+            id += 2;
+            paths.push(BlrPath {
+                bits_u: bu,
+                bits_v: bv,
+                h: upload(c, &h),
+                l: upload(c, &l),
+                g: upload(c, &g),
+                dh: zeros(c, m),
+                dl: zeros(c, r),
+                dg: zeros(c, n),
+                sign: Some(train_sign::SignPath { u, v }),
+            });
+            host.push((su, sv, h, l, g));
+        }
+        SignLayer { layer: Blr { m, n, r, paths }, host }
+    }
+
+    fn defer_cfg() -> train_sign::SignStepCfg {
+        train_sign::SignStepCfg { opt: train_sign::SignOpt::Fact, eta: 0.0, step: 1, b1: 0.9, b2: 0.999, eps: 1e-3, clamp: 4.0, hyst: 0.0, k_ss: 8.0, seed: 1, defer: true }
+    }
+
+    /// f64 sign gradients of a layer: per path (G_U [m][r], G_V [n][r], a [ntok][r]).
+    #[allow(clippy::type_complexity)]
+    fn host_sign_grads(sl: &SignLayer, x: &[f32], dy: &[f32], ntok: usize) -> Vec<(Vec<f64>, Vec<f64>, Vec<f64>)> {
+        let Blr { m, n, r, .. } = sl.layer;
+        sl.host
+            .iter()
+            .map(|(su, sv, h, l, g)| {
+                let mut a = vec![0f64; ntok * r];
+                let mut b = vec![0f64; ntok * r];
+                for t in 0..ntok {
+                    for k in 0..r {
+                        a[t * r + k] = (0..n).map(|j| x[t * n + j] as f64 * g[j] as f64 * sv[j * r + k] as f64).sum();
+                        b[t * r + k] = (0..m).map(|i| dy[t * m + i] as f64 * h[i] as f64 * su[i * r + k] as f64).sum();
+                    }
+                }
+                let mut gu = vec![0f64; m * r];
+                let mut gv = vec![0f64; n * r];
+                for k in 0..r {
+                    for i in 0..m {
+                        gu[i * r + k] = h[i] as f64 * l[k] as f64 * (0..ntok).map(|t| dy[t * m + i] as f64 * a[t * r + k]).sum::<f64>();
+                    }
+                    for j in 0..n {
+                        gv[j * r + k] = g[j] as f64 * l[k] as f64 * (0..ntok).map(|t| x[t * n + j] as f64 * b[t * r + k]).sum::<f64>();
+                    }
+                }
+                (gu, gv, a)
+            })
+            .collect()
+    }
+
+    /// The device sign gradients G_U, G_V of a two-path layer (formed inside
+    /// `blr_backward`, kept by the deferred mode) against f64.
+    #[test]
+    fn blr_sign_grad_matches_host() {
+        let Some(c) = train_ops::dev() else { return };
+        if !matrix_units() {
+            eprintln!("no cooperative matrices on this device — skipping");
+            return;
+        }
+        let (m, n, r, ntok, np) = (256usize, 384usize, 128usize, 70usize, 2usize);
+        let sl = sign_layer(c, m, n, r, np, false);
+        let x = rnd(ntok * n, 60, 2.0);
+        let dy = rnd(ntok * m, 61, 1e-3);
+        let s = BlrScratch::new(c, ntok, m, n, r, np);
+        let sc = train_sign::SignScratch::new(c, ntok, m.max(n), r);
+        let cfg = defer_cfg();
+        let ctx = train_sign::SignCtx { sc: &sc, cfg: &cfg, role: 0 };
+        let (bx, by, bdy, bdx) = (upload(c, &x), zeros(c, pad_rows(ntok) * m), upload(c, &dy), zeros(c, pad_rows(ntok) * n));
+        blr_forward(c, &sl.layer, &s, &bx, &by, ntok).unwrap();
+        blr_backward(c, &sl.layer, &s, &bx, &bdy, &bdx, ntok, 1024.0, Some(&ctx)).unwrap();
+        let want = host_sign_grads(&sl, &x, &dy, ntok);
+        for (pi, (gu, gv, _)) in want.iter().enumerate() {
+            let sp = sl.layer.paths[pi].sign.as_ref().unwrap();
+            for (name, mat, w) in [("G_U", &sp.u, gu), ("G_V", &sp.v, gv)] {
+                let got = download(c, mat.gsave.as_ref().unwrap(), mat.rows * r).unwrap();
+                let num: f64 = got.iter().zip(w).map(|(g, w)| (*g as f64 - w).powi(2)).sum();
+                let den: f64 = w.iter().map(|w| w * w).sum::<f64>().max(1e-30);
+                let e = (num / den).sqrt();
+                eprintln!("{name}{pi}: relative error {e:e}");
+                assert!(e < 3e-3, "{name}{pi}: relative error {e:e}");
+            }
+        }
+    }
+
+    /// Discrete flips on the device: with L = ½‖y − y*‖², L is quadratic in
+    /// each sign, so flipping U[i,k] changes it by exactly
+    /// −2s·G_U + 2h_i²ℓ_k²·Σ_t a_tk², and V[j,k] by
+    /// −2s·G_V + 2g_j²ℓ_k²·(Σ_t x_tj²)(Σ_i h_i²). Inputs on a grid that keeps
+    /// every f16 operand of the forward exact; each flip rewrites the bitmap
+    /// and reruns the device forward (this also checks the bit mapping).
+    #[test]
+    fn blr_sign_flip_exact() {
+        let Some(c) = train_ops::dev() else { return };
+        if !matrix_units() {
+            eprintln!("no cooperative matrices on this device — skipping");
+            return;
+        }
+        let (m, n, r, ntok, np) = (256usize, 384usize, 128usize, 70usize, 2usize);
+        let sl = sign_layer(c, m, n, r, np, true);
+        let x: Vec<f32> = rnd(ntok * n, 70, 1.0).iter().map(|v| ((v * 4.0).round()) / 8.0).collect();
+        let s = BlrScratch::new(c, ntok, m, n, r, np);
+        let sc = train_sign::SignScratch::new(c, ntok, m.max(n), r);
+        let (bx, by, bdx) = (upload(c, &x), zeros(c, pad_rows(ntok) * m), zeros(c, pad_rows(ntok) * n));
+        blr_forward(c, &sl.layer, &s, &bx, &by, ntok).unwrap();
+        let y0 = download(c, &by, ntok * m).unwrap();
+        let rms = (y0.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / y0.len() as f64).sqrt() as f32;
+        let ystar: Vec<f32> = y0.iter().zip(rnd(ntok * m, 71, 1.0)).map(|(y, z)| y + 0.7 * rms * z).collect();
+        let dy: Vec<f32> = y0.iter().zip(&ystar).map(|(y, s)| y - s).collect();
+        let loss = |y: &[f32]| -> Vec<f64> { y.iter().zip(&ystar).map(|(a, b)| 0.5 * (*a as f64 - *b as f64).powi(2)).collect() };
+        let l0 = loss(&y0);
+        let bdy = upload(c, &dy);
+        let cfg = defer_cfg();
+        let ctx = train_sign::SignCtx { sc: &sc, cfg: &cfg, role: 0 };
+        blr_backward(c, &sl.layer, &s, &bx, &bdy, &bdx, ntok, 1024.0, Some(&ctx)).unwrap();
+        let want = host_sign_grads(&sl, &x, &dy, ntok);
+        let (mut worst_dev, mut worst_host) = (0f64, 0f64);
+        let picks = [(0usize, 0usize), (1, 31), (2, 32), (255, 127), (17, 63), (100, 64), (200, 95), (5, 96)];
+        for pi in 0..np {
+            let (su, sv, h, l, g) = &sl.host[pi];
+            let (gu_h, gv_h, a) = &want[pi];
+            let sp = sl.layer.paths[pi].sign.as_ref().unwrap();
+            let gu_d = download(c, sp.u.gsave.as_ref().unwrap(), m * r).unwrap();
+            let gv_d = download(c, sp.v.gsave.as_ref().unwrap(), n * r).unwrap();
+            let sum_h2: f64 = h.iter().map(|v| (*v as f64).powi(2)).sum();
+            for side in 0..2 {
+                let (rows, bits_buf, signs) = if side == 0 { (m, &sl.layer.paths[pi].bits_u, su) } else { (n, &sl.layer.paths[pi].bits_v, sv) };
+                let base = pack_bits(signs, rows, r);
+                for (q, &(i0, k0)) in picks.iter().enumerate() {
+                    let i = (i0 + 37 * q * side) % rows;
+                    let k = (k0 + 11 * pi) % r;
+                    let s0 = signs[i * r + k] as f64;
+                    let (gd, gh, quad) = if side == 0 {
+                        let sa: f64 = (0..ntok).map(|t| a[t * r + k].powi(2)).sum();
+                        (gu_d[i * r + k] as f64, gu_h[i * r + k], 2.0 * (h[i] as f64).powi(2) * (l[k] as f64).powi(2) * sa)
+                    } else {
+                        let sx: f64 = (0..ntok).map(|t| (x[t * n + i] as f64).powi(2)).sum();
+                        (gv_d[i * r + k] as f64, gv_h[i * r + k], 2.0 * (g[i] as f64).powi(2) * (l[k] as f64).powi(2) * sx * sum_h2)
+                    };
+                    let mut fl = base.clone();
+                    fl[i * (r / 32) + k / 32] ^= 1 << (k % 32);
+                    c.queue.write_buffer(bits_buf, 0, bytemuck::cast_slice(&fl));
+                    blr_forward(c, &sl.layer, &s, &bx, &by, ntok).unwrap();
+                    let l1 = loss(&download(c, &by, ntok * m).unwrap());
+                    c.queue.write_buffer(bits_buf, 0, bytemuck::cast_slice(&base));
+                    let meas: f64 = l1.iter().zip(&l0).map(|(a, b)| a - b).sum();
+                    let scale = 2.0 * gh.abs() + quad;
+                    let ed = (meas - (-2.0 * s0 * gd + quad)).abs() / scale;
+                    let eh = (meas - (-2.0 * s0 * gh + quad)).abs() / scale;
+                    worst_dev = worst_dev.max(ed);
+                    worst_host = worst_host.max(eh);
+                    if q < 2 {
+                        eprintln!("path {pi} {} [{i},{k}]: ΔL {meas:.6e}  pred(dev G) {:.6e}  pred(f64 G) {:.6e}", ["U", "V"][side], -2.0 * s0 * gd + quad, -2.0 * s0 * gh + quad);
+                    }
+                }
+            }
+        }
+        eprintln!("flip ΔL vs prediction: worst {worst_dev:e} (device G), {worst_host:e} (f64 G), relative to 2|G| + quad");
+        // f32 rounding of the two-path sum over 17920 outputs leaves ~1e-4 of
+        // the term scale; a wrong bit index or formula is off by O(1)
+        assert!(worst_host < 5e-4, "identity/bit mapping: {worst_host:e}");
+        assert!(worst_dev < 2e-3, "device G: {worst_dev:e}");
     }
 }
