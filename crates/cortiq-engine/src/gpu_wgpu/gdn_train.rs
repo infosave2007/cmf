@@ -494,61 +494,6 @@ fn csum4(v: f32) -> f32 {
     return x + subgroupShuffleXor(x, 16u);
 }
 
-@compute @workgroup_size(256)
-fn rec_fwd2(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) lid: u32, @builtin(subgroup_invocation_id) lane: u32) {
-    let bh = wg.x / NWG;
-    let bidx = bh / p.nv;
-    let h = bh % p.nv;
-    let ko = h / p.rep;
-    let col = (wg.x % NWG) * 32u + (lid / 32u) * 4u + (lane >> 3u);
-    let r0 = (lane & 7u) * 16u;
-    let first = (lane & 7u) == 0u;
-    let n_bt = p.nb * p.t;
-    let keep = p.seg == 1u;
-    let ckb = bh * (p.nseg + 1u) * 16384u + col * 128u + r0;
-    var s: array<f32, 16>;
-    var k: array<f32, 16>;
-    for (var r = 0u; r < 16u; r = r + 1u) { s[r] = 0.0; }
-    for (var ti = 0u; ti < p.t; ti = ti + 1u) {
-        let bt = bidx * p.t + ti;
-        let qb = (bt * p.nk + ko) * 128u + r0;
-        let kb = ((n_bt + bt) * p.nk + ko) * 128u + r0;
-        let g = GB[bt * p.nv + h];
-        let beta = GB[(n_bt + bt) * p.nv + h];
-        let vi = bt * p.vd + h * 128u + col;
-        let v = CQ[bt * p.c_dim + 2u * p.kd + h * 128u + col];
-        var p0 = 0.0;
-        var p1 = 0.0;
-        for (var r = 0u; r < 16u; r = r + 2u) {
-            k[r] = QKN[kb + r];
-            k[r + 1u] = QKN[kb + r + 1u];
-            s[r] = s[r] * g;
-            s[r + 1u] = s[r + 1u] * g;
-            p0 = fma(s[r], k[r], p0);
-            p1 = fma(s[r + 1u], k[r + 1u], p1);
-        }
-        let kv = rsum8(p0 + p1);
-        let u = beta * (v - kv);
-        var o0 = 0.0;
-        var o1 = 0.0;
-        for (var r = 0u; r < 16u; r = r + 2u) {
-            s[r] = fma(k[r], u, s[r]);
-            s[r + 1u] = fma(k[r + 1u], u, s[r + 1u]);
-            o0 = fma(s[r], QKN[qb + r], o0);
-            o1 = fma(s[r + 1u], QKN[qb + r + 1u], o1);
-        }
-        let o = rsum8(o0 + o1);
-        if (first) {
-            OS[vi] = o;
-            if (keep) { KVS[vi] = kv; }
-        }
-        if (keep && (ti + 1u) % p.cs == 0u) {
-            let cb = ckb + ((ti + 1u) / p.cs) * 16384u;
-            for (var r = 0u; r < 16u; r = r + 1u) { CK[cb + r] = s[r]; }
-        }
-    }
-}
-
 // ---- gated RMSNorm over each (token, head) row of o: one warp per row ----
 @compute @workgroup_size(256)
 fn norm_fwd2(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) lid: u32, @builtin(subgroup_invocation_id) lane: u32) {
@@ -601,140 +546,9 @@ fn norm_bwd2(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_ind
 }
 
 var<workgroup> wpart: array<f32, 4160>;   // [2][8 warps][PW]
-
-@compute @workgroup_size(256)
-fn rec_bwd2(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) lid: u32, @builtin(subgroup_invocation_id) lane: u32) {
-    let bh = wg.x / NWG;
-    let wgc = wg.x % NWG;
-    let bidx = bh / p.nv;
-    let h = bh % p.nv;
-    let ko = h / p.rep;
-    let warp = lid / 32u;
-    let c = lane >> 3u;
-    let rg = lane & 7u;
-    let col = wgc * 32u + warp * 4u + c;
-    let r0 = rg * 16u;
-    let first = rg == 0u;
-    let hi0 = (c & 1u) == 1u;
-    let hi1 = c >= 2u;
-    let rowq = r0 + (c & 1u) * 8u + (c >> 1u) * 4u;
-    let n_bt = p.nb * p.t;
-    let ckb = bh * (p.nseg + 1u) * 16384u + col * 128u + r0;
-    let scb = wg.x * p.cs * 4096u + (warp * 4u + c) * 128u + r0;
-    var ds: array<f32, 16>;
-    var s: array<f32, 16>;
-    var sp: array<f32, 16>;
-    var k: array<f32, 16>;
-    var dq: array<f32, 16>;
-    var dk: array<f32, 16>;
-    for (var r = 0u; r < 16u; r = r + 1u) { ds[r] = 0.0; }
-    var par = 0u;
-    for (var sgi = 0u; sgi < p.nseg; sgi = sgi + 1u) {
-        let seg = p.nseg - 1u - sgi;
-        let t0 = seg * p.cs;
-        let t1 = min(t0 + p.cs, p.t);
-        // replay the segment from its checkpoint (S_{t0-1}) into the scratch
-        if (seg > 0u) {
-            for (var r = 0u; r < 16u; r = r + 1u) { s[r] = CK[ckb + seg * 16384u + r]; }
-        } else {
-            for (var r = 0u; r < 16u; r = r + 1u) { s[r] = 0.0; }
-        }
-        for (var ti = t0; ti < t1; ti = ti + 1u) {
-            let bt = bidx * p.t + ti;
-            let kb = ((n_bt + bt) * p.nk + ko) * 128u + r0;
-            let g = GB[bt * p.nv + h];
-            let beta = GB[(n_bt + bt) * p.nv + h];
-            let u = beta * (CQ[bt * p.c_dim + 2u * p.kd + h * 128u + col] - KVS[bt * p.vd + h * 128u + col]);
-            for (var r = 0u; r < 16u; r = r + 1u) {
-                s[r] = s[r] * g;
-                s[r] = fma(QKN[kb + r], u, s[r]);
-            }
-            if (ti + 1u < t1) {
-                let sb = scb + (ti - t0) * 4096u;
-                for (var r = 0u; r < 16u; r = r + 1u) { SCR[sb + r] = s[r]; }
-            }
-        }
-        // reverse sweep: s = S_t, sp = S_{t-1}
-        for (var rr = 0u; rr < t1 - t0; rr = rr + 1u) {
-            let ti = t1 - 1u - rr;
-            let bt = bidx * p.t + ti;
-            if (ti > t0) {
-                let sb = scb + (ti - 1u - t0) * 4096u;
-                for (var r = 0u; r < 16u; r = r + 1u) { sp[r] = SCR[sb + r]; }
-            } else if (seg > 0u) {
-                for (var r = 0u; r < 16u; r = r + 1u) { sp[r] = CK[ckb + seg * 16384u + r]; }
-            } else {
-                for (var r = 0u; r < 16u; r = r + 1u) { sp[r] = 0.0; }
-            }
-            let qb = (bt * p.nk + ko) * 128u + r0;
-            let kb = ((n_bt + bt) * p.nk + ko) * 128u + r0;
-            let g = GB[bt * p.nv + h];
-            let beta = GB[(n_bt + bt) * p.nv + h];
-            let vi = bt * p.vd + h * 128u + col;
-            let vc = CQ[bt * p.c_dim + 2u * p.kd + h * 128u + col] - KVS[vi];
-            let u = beta * vc;
-            let dd = OS[vi];
-            // dS += q̂ ⊗ do ; dq̂ = S_t·do ; du = dSᵀ k̂
-            var d0 = 0.0;
-            var d1 = 0.0;
-            for (var r = 0u; r < 16u; r = r + 2u) {
-                k[r] = QKN[kb + r];
-                k[r + 1u] = QKN[kb + r + 1u];
-                ds[r] = fma(QKN[qb + r], dd, ds[r]);
-                ds[r + 1u] = fma(QKN[qb + r + 1u], dd, ds[r + 1u]);
-                dq[r] = s[r] * dd;
-                dq[r + 1u] = s[r + 1u] * dd;
-                d0 = fma(ds[r], k[r], d0);
-                d1 = fma(ds[r + 1u], k[r + 1u], d1);
-            }
-            let du = rsum8(d0 + d1);
-            let dkv = -(beta * du);
-            // dk̂ = dS·u + (g·S_{t-1})·dkv ; dS_pre = dS + k̂⊗dkv ; dg = <dS_pre, S_{t-1}> ; dS = g·dS_pre
-            var g0 = 0.0;
-            var g1 = 0.0;
-            for (var r = 0u; r < 16u; r = r + 2u) {
-                dk[r] = fma(ds[r], u, (sp[r] * g) * dkv);
-                dk[r + 1u] = fma(ds[r + 1u], u, (sp[r + 1u] * g) * dkv);
-                let e0 = fma(k[r], dkv, ds[r]);
-                let e1 = fma(k[r + 1u], dkv, ds[r + 1u]);
-                g0 = fma(e0, sp[r], g0);
-                g1 = fma(e1, sp[r + 1u], g1);
-                ds[r] = g * e0;
-                ds[r + 1u] = g * e1;
-            }
-            let dgw = csum4(rsum8(g0 + g1));
-            let dbw = csum4(du * vc);
-            if (first) { DCQ[bt * p.c_dim + 2u * p.kd + h * 128u + col] = beta * du; }
-            // dq̂, dk̂ over the warp's 4 columns: this lane keeps rows rowq..rowq+3
-            let wb = par * 2080u + warp * PW;
-            for (var i = 0u; i < 4u; i = i + 1u) {
-                let a0 = select(dq[i], dq[8u + i], hi0) + subgroupShuffleXor(select(dq[8u + i], dq[i], hi0), 8u);
-                let a1 = select(dq[4u + i], dq[12u + i], hi0) + subgroupShuffleXor(select(dq[12u + i], dq[4u + i], hi0), 8u);
-                wpart[wb + rowq + i] = select(a0, a1, hi1) + subgroupShuffleXor(select(a1, a0, hi1), 16u);
-                let b0 = select(dk[i], dk[8u + i], hi0) + subgroupShuffleXor(select(dk[8u + i], dk[i], hi0), 8u);
-                let b1 = select(dk[4u + i], dk[12u + i], hi0) + subgroupShuffleXor(select(dk[12u + i], dk[4u + i], hi0), 8u);
-                wpart[wb + 128u + rowq + i] = select(b0, b1, hi1) + subgroupShuffleXor(select(b1, b0, hi1), 16u);
-            }
-            if (lane == 0u) {
-                wpart[wb + 256u] = dbw;
-                wpart[wb + 257u] = dgw;
-            }
-            workgroupBarrier();
-            let ob = ((bt * p.nv + h) * NWG + wgc) * 258u;
-            let rb = par * 2080u;
-            var acc = 0.0;
-            for (var w = 0u; w < 8u; w = w + 1u) { acc = acc + wpart[rb + w * PW + lid]; }
-            DQK[ob + lid] = acc;
-            if (lid < 2u) {
-                var a2 = 0.0;
-                for (var w = 0u; w < 8u; w = w + 1u) { a2 = a2 + wpart[rb + w * PW + 256u + lid]; }
-                DQK[ob + 256u + lid] = a2;
-            }
-            par = par ^ 1u;
-            for (var r = 0u; r < 16u; r = r + 1u) { s[r] = sp[r]; }
-        }
-    }
-}
+@group(0) @binding(21) var<storage, read_write> QKN4: array<vec4<f32>>;
+@group(0) @binding(22) var<storage, read_write> CK4: array<vec4<f32>>;
+@group(0) @binding(23) var<storage, read_write> SCR4: array<vec4<f32>>;
 
 // ---- q/k backward over the column-block partials, and dβ/dg -> a, b ----
 @compute @workgroup_size(128)
@@ -792,9 +606,308 @@ fn qk_bwd2(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index
 var<workgroup> red2: array<f32, 256>;
 "#;
 
+/// The two recurrence kernels of `SRC2`, generated with the state block in
+/// named registers (`s0..s15`, …) rather than arrays a driver may spill.
+/// Every per-step operand (q̂, k̂, g, β, v, kv, do) is staged through
+/// workgroup memory a block of steps at a time (one coalesced load and two
+/// barriers per block instead of a global-latency stall every step), and
+/// the backward prefetches the next step's S_{t-1} from the scratch while
+/// it computes the current one. Bindings 21-23 are vec4 views of QKN, CK, SCR.
+fn rec_src(cs: usize) -> String {
+    const TS: usize = 16; // forward staging block (steps)
+    let v16 = |f: &dyn Fn(usize) -> String| (0..16).map(f).collect::<Vec<_>>().join("\n");
+    // 16 floats from 4 consecutive vec4 of `arr` at `base`: `{dst}{r}` scalars
+    let ld4 = |ind: &str, dst: &str, arr: &str, base: &str| {
+        (0..4)
+            .map(|q| format!("{ind}let {dst}v{q} = {arr}[{base} + {q}u]; let {dst}{a} = {dst}v{q}.x; let {dst}{b} = {dst}v{q}.y; let {dst}{c} = {dst}v{q}.z; let {dst}{d} = {dst}v{q}.w;", a = 4 * q, b = 4 * q + 1, c = 4 * q + 2, d = 4 * q + 3))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let st4 = |arr: &str, base: &str, src: &str| (0..4).map(|q| format!("{arr}[{base} + {q}u] = vec4<f32>({src}{}, {src}{}, {src}{}, {src}{});", 4 * q, 4 * q + 1, 4 * q + 2, 4 * q + 3)).collect::<Vec<_>>().join(" ");
+    let chain = |ind: &str, acc: &str, a: &str, b: &str| {
+        let mut o = format!("{ind}var {acc}0 = {a}0 * {b}0;\n{ind}var {acc}1 = {a}1 * {b}1;\n");
+        o += &(2..16).map(|r| format!("{ind}{acc}{} = fma({a}{r}, {b}{r}, {acc}{});", r % 2, r % 2)).collect::<Vec<_>>().join("\n");
+        o
+    };
+    let mut o = String::new();
+    // ---------------- forward ----------------
+    o += &format!(
+        "var<workgroup> fq: array<vec4<f32>, {n4}>;
+var<workgroup> fk: array<vec4<f32>, {n4}>;
+var<workgroup> fv: array<f32, {n32}>;
+var<workgroup> fgb: array<f32, {n2}>;
+@compute @workgroup_size(256)
+fn rec_fwd2(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) lid: u32, @builtin(subgroup_invocation_id) lane: u32) {{
+    let bh = wg.x / NWG;
+    let wgc = wg.x % NWG;
+    let bidx = bh / p.nv;
+    let h = bh % p.nv;
+    let ko = h / p.rep;
+    let cw = (lid / 32u) * 4u + (lane >> 3u);
+    let col = wgc * 32u + cw;
+    let r4 = (lane & 7u) * 4u;
+    let first = (lane & 7u) == 0u;
+    let n_bt = p.nb * p.t;
+    let keep = p.seg == 1u;
+    let ckb4 = (bh * (p.nseg + 1u) * 16384u + col * 128u) / 4u + r4;
+",
+        n4 = TS * 32,
+        n32 = TS * 32,
+        n2 = (TS * 2).max(4)
+    );
+    o += &v16(&|r| format!("    var s{r} = 0.0;"));
+    o += &format!(
+        "
+    for (var tb = 0u; tb < p.t; tb = tb + {TS}u) {{
+        let nst = min({TS}u, p.t - tb);
+        workgroupBarrier();
+        for (var e = lid; e < {n4}u; e = e + 256u) {{
+            let j = e / 32u;
+            if (j < nst) {{
+                let bt = bidx * p.t + tb + j;
+                fq[e] = QKN4[(bt * p.nk + ko) * 32u + e % 32u];
+                fk[e] = QKN4[((n_bt + bt) * p.nk + ko) * 32u + e % 32u];
+                fv[e] = CQ[bt * p.c_dim + 2u * p.kd + h * 128u + wgc * 32u + e % 32u];
+            }}
+        }}
+        if (lid < {n2}u) {{
+            let j = lid / 2u;
+            if (j < nst) {{ fgb[lid] = GB[((lid % 2u) * n_bt + bidx * p.t + tb + j) * p.nv + h]; }}
+        }}
+        workgroupBarrier();
+        for (var j = 0u; j < nst; j = j + 1u) {{
+            let ti = tb + j;
+            let bt = bidx * p.t + ti;
+            let g = fgb[2u * j];
+            let beta = fgb[2u * j + 1u];
+            let v = fv[j * 32u + cw];
+            let vi = bt * p.vd + h * 128u + col;
+",
+        n4 = TS * 32,
+        n2 = TS * 2
+    );
+    o += &ld4("            ", "k", "fk", "j * 32u + r4");
+    o += "\n";
+    o += &v16(&|r| format!("            s{r} = s{r} * g;"));
+    o += "\n";
+    o += &chain("            ", "p", "s", "k");
+    o += "
+            let kv = rsum8(p0 + p1);
+            let u = beta * (v - kv);
+";
+    o += &v16(&|r| format!("            s{r} = fma(k{r}, u, s{r});"));
+    o += "\n";
+    o += &ld4("            ", "q", "fq", "j * 32u + r4");
+    o += "\n";
+    o += &chain("            ", "o", "s", "q");
+    o += &format!(
+        "
+            let o = rsum8(o0 + o1);
+            if (first) {{
+                OS[vi] = o;
+                if (keep) {{ KVS[vi] = kv; }}
+            }}
+            if (keep && (ti + 1u) % p.cs == 0u) {{
+                let cb = ckb4 + ((ti + 1u) / p.cs) * 4096u;
+                {}
+            }}
+        }}
+    }}
+}}
+",
+        st4("CK4", "cb", "s")
+    );
+    // ---------------- backward ----------------
+    let n4 = cs * 32;
+    o += &format!(
+        "var<workgroup> bq: array<vec4<f32>, {n4}>;
+var<workgroup> bk: array<vec4<f32>, {n4}>;
+var<workgroup> bv: array<f32, {n32}>;
+var<workgroup> bkv: array<f32, {n32}>;
+var<workgroup> bdo: array<f32, {n32}>;
+var<workgroup> bgb: array<f32, {n2}>;
+@compute @workgroup_size(256)
+fn rec_bwd2(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) lid: u32, @builtin(subgroup_invocation_id) lane: u32) {{
+    let bh = wg.x / NWG;
+    let wgc = wg.x % NWG;
+    let bidx = bh / p.nv;
+    let h = bh % p.nv;
+    let ko = h / p.rep;
+    let warp = lid / 32u;
+    let c = lane >> 3u;
+    let rg = lane & 7u;
+    let cw = warp * 4u + c;
+    let col = wgc * 32u + cw;
+    let r0 = rg * 16u;
+    let r4 = rg * 4u;
+    let first = rg == 0u;
+    let hi0 = (c & 1u) == 1u;
+    let hi1 = c >= 2u;
+    let rowq = r0 + (c & 1u) * 8u + (c >> 1u) * 4u;
+    let n_bt = p.nb * p.t;
+    let ckb4 = (bh * (p.nseg + 1u) * 16384u + col * 128u) / 4u + r4;
+    let scb4 = (wg.x * p.cs * 4096u + cw * 128u) / 4u + r4;
+",
+        n32 = cs * 32,
+        n2 = (cs * 2).max(4)
+    );
+    o += &v16(&|r| format!("    var ds{r} = 0.0;\n    var s{r} = 0.0;"));
+    o += "\n    var sp0 = vec4<f32>(0.0); var sp1 = vec4<f32>(0.0); var sp2 = vec4<f32>(0.0); var sp3 = vec4<f32>(0.0);\n";
+    o += "    var pn0 = vec4<f32>(0.0); var pn1 = vec4<f32>(0.0); var pn2 = vec4<f32>(0.0); var pn3 = vec4<f32>(0.0);\n";
+    o += &format!(
+        "    var par = 0u;
+    for (var sgi = 0u; sgi < p.nseg; sgi = sgi + 1u) {{
+        let seg = p.nseg - 1u - sgi;
+        let t0 = seg * p.cs;
+        let nst = min(p.cs, p.t - t0);
+        workgroupBarrier();
+        for (var e = lid; e < {n4}u; e = e + 256u) {{
+            let j = e / 32u;
+            if (j < nst) {{
+                let bt = bidx * p.t + t0 + j;
+                bq[e] = QKN4[(bt * p.nk + ko) * 32u + e % 32u];
+                bk[e] = QKN4[((n_bt + bt) * p.nk + ko) * 32u + e % 32u];
+                let ci = bt * p.vd + h * 128u + wgc * 32u + e % 32u;
+                bv[e] = CQ[bt * p.c_dim + 2u * p.kd + h * 128u + wgc * 32u + e % 32u];
+                bkv[e] = KVS[ci];
+                bdo[e] = OS[ci];
+            }}
+        }}
+        if (lid < {n2}u) {{
+            let j = lid / 2u;
+            if (j < nst) {{ bgb[lid] = GB[((lid % 2u) * n_bt + bidx * p.t + t0 + j) * p.nv + h]; }}
+        }}
+        workgroupBarrier();
+        // replay the segment from its checkpoint (S_{{t0-1}}) into the scratch
+        if (seg > 0u) {{
+",
+        n2 = cs * 2
+    );
+    o += &ld4("            ", "c", "CK4", "ckb4 + seg * 4096u");
+    o += "\n";
+    o += &v16(&|r| format!("            s{r} = c{r};"));
+    o += "\n        } else {\n";
+    o += &v16(&|r| format!("            s{r} = 0.0;"));
+    o += "
+        }
+        for (var j = 0u; j < nst; j = j + 1u) {
+            let g = bgb[2u * j];
+            let u = bgb[2u * j + 1u] * (bv[j * 32u + cw] - bkv[j * 32u + cw]);
+";
+    o += &ld4("            ", "k", "bk", "j * 32u + r4");
+    o += "\n";
+    o += &v16(&|r| format!("            s{r} = s{r} * g;\n            s{r} = fma(k{r}, u, s{r});"));
+    o += &format!(
+        "
+            if (j + 1u < nst) {{
+                let sb = scb4 + j * 1024u;
+                {}
+            }}
+        }}
+        // S_{{t-1}} of the last step of the segment
+        if (nst > 1u) {{
+            let sb = scb4 + (nst - 2u) * 1024u;
+            sp0 = SCR4[sb]; sp1 = SCR4[sb + 1u]; sp2 = SCR4[sb + 2u]; sp3 = SCR4[sb + 3u];
+        }} else if (nst == 1u && seg > 0u) {{
+            let sb = ckb4 + seg * 4096u;
+            sp0 = CK4[sb]; sp1 = CK4[sb + 1u]; sp2 = CK4[sb + 2u]; sp3 = CK4[sb + 3u];
+        }} else {{
+            sp0 = vec4<f32>(0.0); sp1 = vec4<f32>(0.0); sp2 = vec4<f32>(0.0); sp3 = vec4<f32>(0.0);
+        }}
+        for (var rr = 0u; rr < nst; rr = rr + 1u) {{
+            let j = nst - 1u - rr;
+            let ti = t0 + j;
+            let bt = bidx * p.t + ti;
+            // prefetch S_{{t-2}} for the next step
+            if (j >= 2u) {{
+                let sb = scb4 + (j - 2u) * 1024u;
+                pn0 = SCR4[sb]; pn1 = SCR4[sb + 1u]; pn2 = SCR4[sb + 2u]; pn3 = SCR4[sb + 3u];
+            }} else if (j == 1u && seg > 0u) {{
+                let sb = ckb4 + seg * 4096u;
+                pn0 = CK4[sb]; pn1 = CK4[sb + 1u]; pn2 = CK4[sb + 2u]; pn3 = CK4[sb + 3u];
+            }} else {{
+                pn0 = vec4<f32>(0.0); pn1 = vec4<f32>(0.0); pn2 = vec4<f32>(0.0); pn3 = vec4<f32>(0.0);
+            }}
+",
+        st4("SCR4", "sb", "s")
+    );
+    o += "            let sp0_ = sp0; let sp1_ = sp1; let sp2_ = sp2; let sp3_ = sp3;\n";
+    o += &(0..16).map(|r| format!("            let sp{r}s = sp{}_.{};", r / 4, ["x", "y", "z", "w"][r % 4])).collect::<Vec<_>>().join("\n");
+    o += "
+            let g = bgb[2u * j];
+            let beta = bgb[2u * j + 1u];
+            let vc = bv[j * 32u + cw] - bkv[j * 32u + cw];
+            let u = beta * vc;
+            let dd = bdo[j * 32u + cw];
+";
+    o += &ld4("            ", "k", "bk", "j * 32u + r4");
+    o += "\n";
+    o += &ld4("            ", "q", "bq", "j * 32u + r4");
+    o += "\n";
+    o += &v16(&|r| format!("            ds{r} = fma(q{r}, dd, ds{r});\n            let dq{r} = s{r} * dd;"));
+    o += "\n";
+    o += &chain("            ", "d", "ds", "k");
+    o += "
+            let du = rsum8(d0 + d1);
+            let dkv = -(beta * du);
+";
+    o += &v16(&|r| format!("            let dk{r} = fma(ds{r}, u, (sp{r}s * g) * dkv);\n            let e{r} = fma(k{r}, dkv, ds{r});"));
+    o += "\n";
+    o += "            var g0 = e0 * sp0s;\n            var g1 = e1 * sp1s;\n";
+    o += &(2..16).map(|r| format!("            g{} = fma(e{r}, sp{r}s, g{});", r % 2, r % 2)).collect::<Vec<_>>().join("\n");
+    o += "\n";
+    o += &v16(&|r| format!("            ds{r} = g * e{r};"));
+    o += "
+            let dgw = csum4(rsum8(g0 + g1));
+            let dbw = csum4(du * vc);
+            if (first) { DCQ[bt * p.c_dim + 2u * p.kd + h * 128u + col] = beta * du; }
+            let wb = par * 2080u + warp * PW;
+";
+    for (nm, off) in [("dq", "0u"), ("dk", "128u")] {
+        for i in 0..4 {
+            o += &format!(
+                "            {{
+                let a0 = select({nm}{i}, {nm}{j8}, hi0) + subgroupShuffleXor(select({nm}{j8}, {nm}{i}, hi0), 8u);
+                let a1 = select({nm}{j4}, {nm}{j12}, hi0) + subgroupShuffleXor(select({nm}{j12}, {nm}{j4}, hi0), 8u);
+                wpart[wb + {off} + rowq + {i}u] = select(a0, a1, hi1) + subgroupShuffleXor(select(a1, a0, hi1), 16u);
+            }}
+",
+                j8 = i + 8,
+                j4 = i + 4,
+                j12 = i + 12
+            );
+        }
+    }
+    o += "            if (lane == 0u) {
+                wpart[wb + 256u] = dbw;
+                wpart[wb + 257u] = dgw;
+            }
+            workgroupBarrier();
+            let ob = ((bt * p.nv + h) * NWG + wgc) * 258u;
+            let rb = par * 2080u;
+            var acc = 0.0;
+            for (var w = 0u; w < 8u; w = w + 1u) { acc = acc + wpart[rb + w * PW + lid]; }
+            DQK[ob + lid] = acc;
+            if (lid < 2u) {
+                var a2 = 0.0;
+                for (var w = 0u; w < 8u; w = w + 1u) { a2 = a2 + wpart[rb + w * PW + 256u + lid]; }
+                DQK[ob + 256u + lid] = a2;
+            }
+            par = par ^ 1u;
+";
+    o += &(0..16).map(|r| format!("            s{r} = sp{r}s;")).collect::<Vec<_>>().join("\n");
+    o += "
+            sp0 = pn0; sp1 = pn1; sp2 = pn2; sp3 = pn3;
+        }
+    }
+}
+";
+    o
+}
+
 const ENTRIES: [&str; 7] = ["conv_fwd", "conv_bwd", "qk_prep", "gate_prep", "rec_fwd", "rec_bwd", "qk_bwd"];
 const ENTRIES2: [&str; 5] = ["rec_fwd2", "norm_fwd2", "norm_bwd2", "rec_bwd2", "qk_bwd2"];
-const NBIND: u32 = 21;
+const NBIND: u32 = 24;
 /// Column blocks (workgroups) per (window, head) of the subgroup kernels.
 const NWG: usize = 4;
 
@@ -881,7 +994,7 @@ fn pipes(c: &Ctx) -> Option<&'static Pipes> {
                 && c.adapter_info.subgroup_min_size == 32
                 && c.adapter_info.subgroup_max_size == 32
                 && std::env::var("CMF_GDN_SG").as_deref() != Ok("0")
-                && build(c, &pl, "gdn_train_sg", &format!("{HEAD}{SRC2}"), &ENTRIES2, &mut p);
+                && build(c, &pl, "gdn_train_sg", &format!("{HEAD}{SRC2}{}", rec_src(ckpt_interval())), &ENTRIES2, &mut p);
             for (ep, pipe) in &p {
                 super::train_prof::name_pipe(pipe, ep);
             }
@@ -1169,6 +1282,10 @@ fn bind(c: &Ctx, pp: &Pipes, uni: &wgpu::Buffer, bufs: &[wgpu::Buffer]) -> wgpu:
     for (k, b) in bufs.iter().enumerate() {
         entries.push(wgpu::BindGroupEntry { binding: k as u32 + 1, resource: b.as_entire_binding() });
     }
+    // vec4 views of QKN, CK and SCR for the subgroup kernels
+    for (k, i) in [(21u32, 5usize), (22, 11), (23, 12)] {
+        entries.push(wgpu::BindGroupEntry { binding: k, resource: bufs[i].as_entire_binding() });
+    }
     c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("gdn_train"), layout: &pp.layout, entries: &entries })
 }
 
@@ -1198,6 +1315,55 @@ mod tests {
                 (((s >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0) as f32 * scale as f32
             })
             .collect()
+    }
+
+    /// Timing of the device forward (with the tape) and backward at the
+    /// 27B student's shape (8 windows of 512 tokens, 48 v-heads, 16 k-heads):
+    /// `cargo test --release -p cortiq-engine --features gpu --lib gdn_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn gdn_bench() {
+        let nb: usize = std::env::var("GDN_BENCH_NB").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        let (nv, nk, kk, t) = (48usize, 16usize, 4usize, 512usize);
+        let (kd, vd) = (nk * 128, nv * 128);
+        let c_dim = 2 * kd + vd;
+        let conv = rnd(c_dim * kk, 1, 0.5);
+        let a_log: Vec<f32> = (0..nv).map(|h| -0.5 + 0.03 * h as f32).collect();
+        let dt_bias = rnd(nv, 2, 0.5);
+        let norm: Vec<f32> = rnd(128, 3, 0.3).iter().map(|v| 1.0 + v).collect();
+        let cfg = GdnTrainCfg { nv, nk, kk, rms_eps: 1e-6, a_log: &a_log, dt_bias: &dt_bias, norm: &norm, conv: &conv };
+        let Some(c) = ctx() else { return };
+        let Some(tape) = gdn_tape(&cfg, nb, t) else { return };
+        let n = nb * t;
+        c.queue.write_buffer(&tape.bufs[0], 0, bytemuck::cast_slice(&rnd(n * c_dim, 4, 1.0)));
+        c.queue.write_buffer(&tape.bufs[2], 0, bytemuck::cast_slice(&rnd(n * vd, 5, 1.0)));
+        c.queue.write_buffer(&tape.bufs[3], 0, bytemuck::cast_slice(&rnd(2 * n * nv, 6, 1.0)));
+        c.queue.write_buffer(&tape.bufs[14], 0, bytemuck::cast_slice(&rnd(n * vd, 8, 1.0)));
+        let sync = || {
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        };
+        sync();
+        let reps = 5;
+        let (mut tf, mut tf0, mut tb) = (0f64, 0f64, 0f64);
+        for i in 0..=reps {
+            let t0 = std::time::Instant::now();
+            gdn_forward_dev(&tape, nk, nv, c_dim, false).unwrap();
+            sync();
+            let t1 = std::time::Instant::now();
+            gdn_forward_dev(&tape, nk, nv, c_dim, true).unwrap();
+            sync();
+            let t2 = std::time::Instant::now();
+            gdn_backward_dev(&tape, nk, nv, c_dim).unwrap();
+            sync();
+            let t3 = std::time::Instant::now();
+            if i > 0 {
+                tf0 += (t1 - t0).as_secs_f64();
+                tf += (t2 - t1).as_secs_f64();
+                tb += (t3 - t2).as_secs_f64();
+            }
+        }
+        let ms = |x: f64| 1e3 * x / reps as f64;
+        eprintln!("gdn_bench nb {nb} cs {}: forward {:.3} ms (with tape {:.3} ms), backward {:.3} ms", ckpt_interval(), ms(tf0), ms(tf), ms(tb));
     }
 
     /// Device forward and BPTT against the f64 host reference: two windows,
