@@ -668,8 +668,9 @@ fn gdn_params(c: Ctx, w: &Work, g: &Geom, a_log: &[f32], dt_bias: &[f32], norm: 
 }
 
 /// Forward of layer `l` from `x` (`w.x` is the input) to `y`; intermediates
-/// stay in the workspace for the backward.
-fn layer_fwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, y: &wgpu::Buffer) -> Option<()> {
+/// stay in the workspace for the backward (`rec`: the recompute right before
+/// the layer's backward — only it records the GDN tape's checkpoints).
+fn layer_fwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, y: &wgpu::Buffer, rec: bool) -> Option<()> {
     let g = &net.geom;
     let ly = &net.layers[l];
     let n = w.ntok;
@@ -685,7 +686,7 @@ fn layer_fwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, y: &wgpu::
             copy_off(c, w.get("gout"), 0, tape.ab(), 0, n * g.nv);
             lin_fwd(c, w, b, w.get("n1"), w.get("gout"), false)?;
             copy_off(c, w.get("gout"), 0, tape.ab(), n * g.nv, n * g.nv);
-            gdn::gdn_forward_dev(tape, g.nk, g.nv, g.c_dim())?;
+            gdn::gdn_forward_dev(tape, g.nk, g.nv, g.c_dim(), rec)?;
             copy(c, tape.out(), w.get("gout"), n * g.vd());
             lin_fwd(c, w, out, w.get("gout"), w.get("mix"), false)?;
         }
@@ -807,7 +808,7 @@ fn forward(c: Ctx, net: &Net, w: &Work, ids: &[u32]) -> Option<()> {
     embed(c, net, w, ids);
     for l in 0..net.geom.nl {
         let _p = prof::phase(if net.geom.gdn_layer[l] { "fwd.gdn" } else { "fwd.attn" });
-        layer_fwd(c, net, w, l, &w.ckpt[l], &w.ckpt[l + 1])?;
+        layer_fwd(c, net, w, l, &w.ckpt[l], &w.ckpt[l + 1], false)?;
     }
     let g = &net.geom;
     let _p = prof::phase("fwd.final_norm");
@@ -877,7 +878,7 @@ pub fn step(c: Ctx, net: &Net, w: &Work, ids: &[u32], tid: &[u32], tp: &[f32], k
     for l in (0..g.nl).rev() {
         let gdn = g.gdn_layer[l];
         let ph = prof::phase(if gdn { "recomp.gdn" } else { "recomp.attn" });
-        layer_fwd(c, net, w, l, &w.ckpt[l], w.get("x"))?;
+        layer_fwd(c, net, w, l, &w.ckpt[l], w.get("x"), true)?;
         drop(ph);
         let _p = prof::phase(if gdn { "bwd.gdn" } else { "bwd.attn" });
         layer_bwd(c, net, w, l, &w.ckpt[l], cur, nxt, gscale, sign)?;
