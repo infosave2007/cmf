@@ -54,6 +54,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   A sign step costs 8.5 % over a metric-only step. The 0.8B greedy text is
   still not coherent at 1.0 bpw after 1 M tokens.
+- Sign training on Qwen3.8-27B at 0.55 bpw, the same A/B (same untrained
+  file, 1 M tokens, schedule, seed and held-out windows; q8_2f teacher;
+  perplexities on the dense expansion, 512-token windows; one RTX PRO 6000,
+  83 GB, 21.9 s per 4096-token step):
+
+  | training | held-out KL | WikiText-2 12×512 | WikiText-2 64×512 | C4 64×512 | docs 32×512 | code 32×512 |
+  |---|---:|---:|---:|---:|---:|---:|
+  | q8_2f (teacher) | — | 8.48 | 8.37 | 12.51 | 7.97 | 4.11 |
+  | metric only | 2.514 | 48.31 | 55.09 | 89.70 | 192.46 | 68.91 |
+  | metric + signs, `fact-mom` | 1.663 | 31.86 | 35.90 | 60.88 | 148.18 | 30.11 |
+
+  0.91 % of the 12.96 G signs change. Raw completions get some facts right
+  but repeat; chat mode still collapses, so the file is not a working model.
 
 ## [0.8.20] - 2026-10-18
 
