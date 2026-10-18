@@ -52,6 +52,8 @@ DTYPES = {
     14: "q1t",
     15: "q4tp",
     16: "q2tp",
+    # 17/18 are raw u32/u64 tables, 19 blr, 20 q1g (not emitted for V4.1).
+    21: "mxfp4",
 }
 SHARD_RE = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.cmf$")
 LAYER_RE = re.compile(r"^layers\.(\d+)\.(.*)$")
@@ -152,6 +154,11 @@ def expected_nbytes(dtype: str, shape: tuple[int, ...]) -> int | None:
         code_stride = (groups * 5 + 7) // 8
         nibble_bytes = 16 if dtype == "q4tp" else 8
         return rows * groups * nibble_bytes + rows * 4 + rows * code_stride
+    if dtype == "mxfp4" and len(shape) == 2 and shape[1] > 0:
+        # E2M1 code plane (n/2) + E8M0 scale plane (n/32), cols % 32 == 0.
+        if shape[1] % GROUP_SIZE:
+            return None
+        return n // 2 + n // GROUP_SIZE
     # vbit, q1s, q1t and reserved formats have self-describing or undefined
     # spans.  Bounds and the directory's own nbytes are still checked.
     return None
@@ -260,7 +267,7 @@ def parse_artifact(path: Path) -> Artifact:
                 raise CheckError(
                     f"{path}: tensor {name} {dtype}{shape} has {nbytes} bytes, expected {expected}"
                 )
-            if dtype in ("q4tp", "q2tp") and (len(shape) != 2 or shape[1] % GROUP_SIZE):
+            if dtype in ("q4tp", "q2tp", "mxfp4") and (len(shape) != 2 or shape[1] % GROUP_SIZE):
                 raise CheckError(f"{path}: {dtype} tensor {name} has invalid shape {shape}")
             entries.append(Entry(name, dtype, shape, off, nbytes, digest, path.name))
         header_hash, dir_hash = struct.unpack_from("<QQ", envelope, 0x70)
@@ -756,6 +763,8 @@ def self_test() -> None:
     assert canonical_name("layers.3.attn.wkv.scale") == "model.layers.3.self_attn.wkv.scale"
     assert expected_nbytes("q4tp", (8, 64)) == 8 * 2 * 16 + 8 * 4 + 8 * 2
     assert expected_nbytes("q2tp", (8, 64)) == 8 * 2 * 8 + 8 * 4 + 8 * 2
+    assert expected_nbytes("mxfp4", (2304, 5120)) == 2304 * 5120 * 17 // 32
+    assert expected_nbytes("mxfp4", (8, 48)) is None
     print("self-test PASS: independent mapping and fixed payload formulas")
 
 

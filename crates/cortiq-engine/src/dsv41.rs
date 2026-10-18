@@ -2645,17 +2645,36 @@ fn dynamic_moe_gpu(
         Some(model) => model,
         None => return false,
     };
-    let gu_q2 = first.w1.model_dtype() == Some(TensorDtype::Q2TiledP)
+    // `convert --quant fp4`: gate, up and down all mxfp4 (one bank codec).
+    let fp4 = [&first.w1, &first.w3, &first.w2]
+        .iter()
+        .all(|t| t.model_dtype() == Some(TensorDtype::Mxfp4));
+    let gu_q2 = !fp4
+        && first.w1.model_dtype() == Some(TensorDtype::Q2TiledP)
         && first.w3.model_dtype() == Some(TensorDtype::Q2TiledP);
-    if first.w2.model_dtype() != Some(TensorDtype::Q4TiledP) {
+    if !fp4 && first.w2.model_dtype() != Some(TensorDtype::Q4TiledP) {
         return false;
     }
     // The global bank has one gate/up layout and one down layout.  Refuse a
     // mixed or synthetic layer rather than reinterpreting a tensor's bytes.
-    let gu_dtype = if gu_q2 {
-        TensorDtype::Q2TiledP
+    let (gu_dtype, dn_dtype, codec) = if fp4 {
+        (
+            TensorDtype::Mxfp4,
+            TensorDtype::Mxfp4,
+            crate::gpu_wgpu::MoeBankCodec::Mxfp4,
+        )
+    } else if gu_q2 {
+        (
+            TensorDtype::Q2TiledP,
+            TensorDtype::Q4TiledP,
+            crate::gpu_wgpu::MoeBankCodec::Q2tpGateUp,
+        )
     } else {
-        TensorDtype::Q4TiledP
+        (
+            TensorDtype::Q4TiledP,
+            TensorDtype::Q4TiledP,
+            crate::gpu_wgpu::MoeBankCodec::Q4tp,
+        )
     };
     let same_layout = layer.experts.iter().all(|expert| {
         expert
@@ -2672,7 +2691,7 @@ fn dynamic_moe_gpu(
                 .is_some_and(|m| m.uid() == model.uid())
             && expert.w1.model_dtype() == Some(gu_dtype)
             && expert.w3.model_dtype() == Some(gu_dtype)
-            && expert.w2.model_dtype() == Some(TensorDtype::Q4TiledP)
+            && expert.w2.model_dtype() == Some(dn_dtype)
     });
     let shared_layout = layer
         .shared
@@ -2691,19 +2710,23 @@ fn dynamic_moe_gpu(
             .is_some_and(|m| m.uid() == model.uid())
         && layer.shared.w1.model_dtype() == Some(gu_dtype)
         && layer.shared.w3.model_dtype() == Some(gu_dtype)
-        && layer.shared.w2.model_dtype() == Some(TensorDtype::Q4TiledP);
+        && layer.shared.w2.model_dtype() == Some(dn_dtype);
     if !same_layout || !shared_layout || layer_index >= n_layers {
         return false;
     }
     if state.gpu_pool.is_none() {
-        state.gpu_pool = crate::qwen4_exp::QwenGpuPool::create_for_dsv41(
+        state.gpu_pool = crate::qwen4_exp::QwenGpuPool::create_for_dsv41_codec(
             &model,
             cfg.moe_inter,
             cfg.dim,
             n_layers,
             cfg.n_routed_experts,
-            gu_q2,
+            codec,
         );
+    }
+    // One bank, one codec: a layer stored differently stays on the host.
+    if state.gpu_pool.as_ref().is_some_and(|p| p.codec != codec) {
+        return false;
     }
     let (remap, shared_slot, segment_slots) = {
         let Some(gpu_pool) = state.gpu_pool.as_mut() else {
@@ -4209,7 +4232,7 @@ mod tests {
             index_heads: 1,
             index_head_dim: 32,
             index_topk: 4,
-            candidate_source: 99,
+            candidate_source: Some(99),
             candidate_topk_blocks: 2,
             candidate_block_size: 8,
             kv_sources: Vec::new(),

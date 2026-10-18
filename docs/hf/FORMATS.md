@@ -24,6 +24,7 @@ Short version:
 | `q1t` | ~2.25 + overlay | a normal checkpoint pushed below q4, with calibration |
 | `q1` | 1.5 | the model was *trained* at 1 bit (BitNet/Bonsai class) |
 | `q1g` | 1.125 | the same 1-bit model, one scale per 128 weights instead of four copies of it |
+| `mxfp4` / `fp4` | 4.25 | the source ships native FP4 experts (DeepSeek-V4.1): kept byte for byte, OCP MX format |
 | `vbit` | 3–8, per row | one file has to fit an awkward memory budget exactly |
 
 Normalization weights, biases and anything one-dimensional are **always f16**,
