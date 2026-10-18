@@ -4078,11 +4078,21 @@ mod tests {
     /// The device `fp8_act_quant32` kernel (the V4.1 attention frame's
     /// act_quant(o)) against the host quantizer, bit for bit: the reference
     /// test set above, plus full-mantissa f32 blocks over the whole finite
-    /// range and the f32-underflow corner of the sign rule. Runs where a
-    /// wgpu adapter is selected (`CMF_GPU=wgpu` on macOS), skips otherwise.
+    /// range and the f32-underflow corner of the sign rule. The repo's GPU
+    /// test convention: skips unless `CMF_GPU` selects wgpu, fails when it
+    /// does and no context comes up, and with a context up a missing result
+    /// (module rejected, readback failed) is a failure, not a skip.
     #[cfg(feature = "gpu")]
     #[test]
     fn fp8_act_quant32_device_matches_host_bits() {
+        match crate::gpu_wgpu::selected_and_up() {
+            None => {
+                crate::gpu_wgpu::skip_or_fail(module_path!());
+                return;
+            }
+            Some(false) => panic!("CMF_GPU selects wgpu but no wgpu context came up"),
+            Some(true) => {}
+        }
         let mut blocks = act_quant_test_blocks();
         let mut state = 0xF8A7_u64;
         let mut next = || {
@@ -4135,10 +4145,9 @@ mod tests {
         b[1] = f32::from_bits(1);
         blocks.push(b);
         let flat: Vec<f32> = blocks.iter().flatten().copied().collect();
-        let Some(got) = crate::gpu_wgpu::fp8_act::act_quant32_for_test(&flat) else {
-            eprintln!("skipped: no wgpu adapter (set CMF_GPU=wgpu on macOS)");
-            return;
-        };
+        let got = crate::gpu_wgpu::fp8_act::act_quant32_for_test(&flat).expect(
+            "wgpu is up but fp8_act_quant32 gave no result (module rejected or readback failed)",
+        );
         let mut want = flat.clone();
         fp8_activation_inplace(&mut want);
         let mut bad = 0usize;

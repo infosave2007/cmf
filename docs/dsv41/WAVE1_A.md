@@ -117,8 +117,9 @@ in a `--features gpu` build on the M4 (same numbers).
 ### GPU (wgpu) fixture run on the M4 (Metal through wgpu)
 
 `CMF_GPU=wgpu cargo test -p cortiq-engine --features gpu --test
-dsv41_fixture_gpu -- --nocapture` (on macOS the GPU binaries skip unless
-`CMF_GPU=wgpu` is exported; elsewhere they select wgpu themselves). The host
+dsv41_fixture_gpu -- --nocapture` (the GPU binaries skip unless
+`CMF_GPU=wgpu` is exported, and fail when it is and no wgpu context comes
+up, the repo's `selected_and_up`/`skip_or_fail` convention). The host
 parts run exact (`float_activations_scope`), so the error is the device
 kernels'. Two variants in one process: the fixture as built (q4tp gate/up
 on L0/L2/L4, so a q4tp bank) and `Fixture::build_q2_even` (q2tp on
@@ -287,21 +288,22 @@ keeps its sign unless the host's f32 quotient itself underflows to zero. No
 step depends on denormal or fast-math behaviour. A device that rejects the
 module declines the frame before encoding, and the host tail quantizes.
 
-Tests: `dsv41::tests::fp8_act_quant32_device_matches_host_bits` (runs where a
-wgpu adapter is selected; `CMF_GPU=wgpu` on macOS) compares device and host
-bits on the reference set above plus 2000 full-mantissa f32 blocks over the
-whole finite range (f32 subnormals included) and the underflow corner of the
-sign rule: 0 of 4008 blocks differ on the M4; three kernel mutations (ties
-away in the normal branch, `>=` in the subnormal tie, no underflow zero) are
-each caught. `tests/dsv41_fixture_gpu_o_fp8.rs` runs the fixture with the
-flag on the device: 48 device tails (the frame is no longer skipped), median
-8.6e-3 / worst 7.3e-2 against the act_quant(o) reference. A tap at position
-5 (`CMF_DSV41_TAIL_TAP=attn CMF_DSV41_TRACE=1 CMF_DSV41_TRACE_FULL=1
-CMF_DSV41_TRACE_POS=5`) shows the device frame's attended output on the
-E4M3 grid (128/128 values with at most 3 mantissa bits, against 6-9 without
-the flag) and equal to the host's quantized output in all 128 values of
-L0..L3. The upstream DSpark attention has the same `act_quant(o)`; cortiq's
-V4.1 runtime has no DSpark head, so nothing to change there.
+Tests: `dsv41::tests::fp8_act_quant32_device_matches_host_bits` (runs with
+`CMF_GPU=wgpu`; fails if the context or the module does not come up)
+compares device and host bits on the reference set above plus 2000
+full-mantissa f32 blocks over the whole finite range (f32 subnormals
+included) and the underflow corner of the sign rule: 0 of 4008 blocks differ
+on the M4; three kernel mutations (ties away in the normal branch, `>=` in
+the subnormal tie, no underflow zero) are each caught.
+`tests/dsv41_fixture_gpu_o_fp8.rs` runs the fixture with the flag on the
+device: 48 device tails (the frame is no longer skipped), median 8.6e-3 /
+worst 7.3e-2 against the act_quant(o) reference. A tap at position 5
+(`CMF_DSV41_TAIL_TAP=attn CMF_DSV41_TRACE=1 CMF_DSV41_TRACE_FULL=1
+CMF_DSV41_TRACE_POS=5`) shows the device frame's attended output on the E4M3
+grid (128/128 values with at most 3 mantissa bits, against 6-9 without the
+flag) and equal to the host's quantized output in all 128 values of L0..L3.
+The upstream DSpark attention has the same `act_quant(o)`; cortiq's V4.1
+runtime has no DSpark head, so nothing to change there.
 
 Cost. Device tail: one extra compute pass per layer in the frame's existing
 encoder (no submit, no readback); for the release output (32768 values,
@@ -337,25 +339,30 @@ threaded; read `attention_other` in the `CMF_DSV41_PROF` report.
 - Strict CPU bounds: measured counts on aarch64, median per-position on
   other targets (Part 1).
 - `cargo test --workspace` on CI: the CPU binaries pin `CMF_GPU=0`. The GPU
-  binaries (`dsv41_fixture_gpu`, `dsv41_fixture_gpu_o_fp8`) skip on the
-  ubuntu runner (no adapter) and, on macOS, run only with `CMF_GPU=wgpu`
-  exported, so the CI's macOS VM (paravirtual Metal, not a reference device:
-  the repo's Metal exactness tests are kept off it for the same reason)
-  skips them; the M4 and the pod run them. The fp8 device unit test follows
-  the lib's convention (runs wherever wgpu is selected; it is bit-exact
-  integer arithmetic, so it does not depend on the device's rounding).
+  binaries (`dsv41_fixture_gpu`, `dsv41_fixture_gpu_o_fp8`) and the fp8
+  device unit test follow the DSV4 parity tests' convention
+  (`gpu_wgpu::selected_and_up` + `skip_or_fail`): they run only when
+  `CMF_GPU` selects wgpu, so the CI runners (ubuntu without an adapter, the
+  macOS VM with its paravirtual Metal, not a reference device: the repo's
+  Metal exactness tests are kept off it for the same reason) skip them, and
+  they FAIL when `CMF_GPU=wgpu` is set and no context comes up, so a broken
+  Vulkan bring-up on the pod cannot pass as a skip. The unit test also fails
+  when the context is up but the kernel gives no result (module rejected).
+  The M4 and the pod run them with `CMF_GPU=wgpu` exported.
 - The dsv41-int merge had left the lib tests uncompiled (`tiny_stack` still
   built `candidate_source: 99`); now `Some(99)`, same behaviour.
 
 ## Open issues for the lead
 
-- Pod: `cargo test -p cortiq-engine --features gpu --test dsv41_fixture_gpu
-  --test dsv41_fixture_gpu_o_fp8 -- --nocapture` on the target card. The
-  tests assert 48 device attention tails and device MoE calls themselves;
-  read the printed medians against the M4's (bound 2.5e-2). Also the CPU
-  binaries on x86, `--test dsv41_fixture --test dsv41_fixture_o_fp8`, and
-  the per-position errors they print: if x86 is as exact as ARM, the
-  aarch64 bounds of `assert_strict_agreement` can apply there too.
+- Pod: `CMF_GPU=wgpu cargo test -p cortiq-engine --features gpu --test
+  dsv41_fixture_gpu --test dsv41_fixture_gpu_o_fp8 -- --nocapture` on the
+  target card (without `CMF_GPU=wgpu` they skip; with it and no adapter they
+  fail). The tests assert 48 device attention tails and device MoE calls
+  themselves; read the printed medians against the M4's (bound 2.5e-2). Also
+  the CPU binaries on x86, `--test dsv41_fixture --test
+  dsv41_fixture_o_fp8`, and the per-position errors they print: if x86 is as
+  exact as ARM, the aarch64 bounds of `assert_strict_agreement` can apply
+  there too.
 - `CMF_DSV41_O_FP8` is off by default; its effect on the released weights
   (perplexity / answers, with the 1017 checkpoint) is unmeasured. Measure
   `O_FP8=1` against `O_FP8=0` with the SAME attention path in both arms:
