@@ -1,7 +1,8 @@
 //! Native FP4 in the converter: the `mxfp4` codec, the `fp4` profile's
-//! byte-identical DeepSeek-V4.1 expert path, and the NVIDIA ModelOpt NVFP4
-//! source decoder. Every source here is a synthetic safetensors file written
-//! by the test; nothing is downloaded.
+//! byte-identical DeepSeek-V4.1 expert path, the NVIDIA ModelOpt NVFP4
+//! source decoder, and `--exclude-tensors` (the 1017 fp4 file drops its MTP
+//! stack to fit one Hugging Face file). Every source here is a synthetic
+//! safetensors file written by the test; nothing is downloaded.
 
 use super::tests::ENV_LOCK;
 use super::*;
@@ -249,6 +250,11 @@ const HC: usize = 2;
 const LAYERS: usize = 2;
 
 fn dsv41_config() -> serde_json::Value {
+    dsv41_config_mtp(0)
+}
+
+/// [`dsv41_config`] declaring `mtp` next-token-prediction layers.
+fn dsv41_config_mtp(mtp: usize) -> serde_json::Value {
     serde_json::json!({
         "architectures": ["DeepseekV41ForCausalLM"],
         "model_type": "deepseek_v41",
@@ -270,7 +276,7 @@ fn dsv41_config() -> serde_json::Value {
             "norm_topk_prob": true, "routed_scaling_factor": 1.5,
             "sliding_window": 16, "compress_ratios": [0, 0], "compress_rope_theta": 160000,
             "hc_mult": HC, "hc_sinkhorn_iters": 3, "hc_eps": 1e-6,
-            "engram_layer_ids": [], "num_nextn_predict_layers": 0
+            "engram_layer_ids": [], "num_nextn_predict_layers": mtp
         }
     })
 }
@@ -330,9 +336,98 @@ struct Dsv41Src {
 }
 
 fn write_dsv41_source(tag: &str) -> Dsv41Src {
+    write_dsv41_source_with(tag, false)
+}
+
+/// The 1017 checkpoint's MTP/DSpark stage in its own spelling (`mtp.0.*`:
+/// attention, mHC head, `main_proj`, router, FP4 routed and FP8 shared
+/// experts, the DSpark Markov and confidence heads). The converter maps it
+/// to `model.mtp.0.*`; the V4.1 runtime never executes it.
+fn push_dsv41_mtp_stage(t: &mut Vec<Raw>) {
+    let p = "mtp.0";
+    let bf = |name: &str, shape: Vec<usize>, seed: u64, amp: f32| -> Raw {
+        let n = shape.iter().product();
+        (
+            format!("{p}.{name}"),
+            "BF16",
+            shape,
+            bf16_bytes(n, seed, amp),
+        )
+    };
+    for (name, n, seed) in [
+        ("attn_norm.weight", DIM, 901),
+        ("ffn_norm.weight", DIM, 902),
+        ("main_norm.weight", DIM, 903),
+        ("norm.weight", DIM, 904),
+    ] {
+        t.push(bf(name, vec![n], seed, 0.2));
+    }
+    t.push(bf("attn.wq_a.weight", vec![QLORA, DIM], 905, 0.4));
+    t.push(bf("attn.wkv.weight", vec![HD, DIM], 906, 0.4));
+    fp8_pair(&format!("{p}.attn.wo_b"), DIM, OGROUPS * OLORA, 907, t);
+    t.push(bf("main_proj.weight", vec![DIM, 2 * DIM], 908, 0.3));
+    t.push((
+        format!("{p}.hc_head_fn"),
+        "F32",
+        vec![HC, HC * DIM],
+        f32_bytes(&vec![0.01; HC * HC * DIM]),
+    ));
+    t.push((
+        format!("{p}.hc_head_base"),
+        "F32",
+        vec![HC],
+        f32_bytes(&[0.0, 0.1]),
+    ));
+    t.push((
+        format!("{p}.hc_head_scale"),
+        "F32",
+        vec![1],
+        f32_bytes(&[1.0]),
+    ));
+    t.push(bf("ffn.gate.weight", vec![NEXP, DIM], 909, 0.5));
+    t.push((
+        format!("{p}.ffn.gate.bias"),
+        "F32",
+        vec![NEXP],
+        f32_bytes(&[0.0, 0.01, -0.01, 0.02]),
+    ));
+    for e in 0..NEXP {
+        for (w, rows, cols) in [("w1", MI, DIM), ("w3", MI, DIM), ("w2", DIM, MI)] {
+            fp4_pair(
+                &format!("{p}.ffn.experts.{e}.{w}"),
+                rows,
+                cols,
+                950 + 3 * e as u64 + w.len() as u64 * 7 + rows as u64,
+                t,
+            );
+        }
+    }
+    for (w, rows, cols) in [("w1", MI, DIM), ("w3", MI, DIM), ("w2", DIM, MI)] {
+        fp8_pair(
+            &format!("{p}.ffn.shared_experts.{w}"),
+            rows,
+            cols,
+            990 + rows as u64,
+            t,
+        );
+    }
+    t.push(bf("markov_head.markov_w1.weight", vec![DIM, DIM], 995, 0.3));
+    t.push(bf("confidence_head.proj.weight", vec![1, DIM], 996, 0.3));
+}
+
+/// [`write_dsv41_source`], optionally with the MTP/DSpark stage (and a
+/// config declaring one MTP layer).
+fn write_dsv41_source_with(tag: &str, mtp: bool) -> Dsv41Src {
     let dir = tmp(tag);
-    fs::write(dir.join("config.json"), dsv41_config().to_string()).unwrap();
+    fs::write(
+        dir.join("config.json"),
+        dsv41_config_mtp(usize::from(mtp)).to_string(),
+    )
+    .unwrap();
     let mut t: Vec<Raw> = Vec::new();
+    if mtp {
+        push_dsv41_mtp_stage(&mut t);
+    }
     let mut fp4 = HashMap::new();
     let mix = (2 + HC) * HC;
     t.push((
@@ -754,6 +849,320 @@ fn tensor_quant_mxfp4_override_repacks_and_refuses_nan_scales() {
     .unwrap_err()
     .to_string();
     assert!(e.contains("NaN scale"), "{e}");
+    let _ = fs::remove_dir_all(&src.dir);
+}
+
+// ── --exclude-tensors ───────────────────────────────────────────────────
+
+#[test]
+fn exclude_tensors_parses_and_counts() {
+    assert_eq!(
+        parse_tensor_exclusions(&["model.mtp.*, lm_head.weight".into(), "model.mtp.*".into()])
+            .unwrap(),
+        vec!["model.mtp.*".to_string(), "lm_head.weight".to_string()]
+    );
+    assert!(parse_tensor_exclusions(&["model.mtp.*,".into()]).is_err());
+    assert!(parse_tensor_exclusions(&[" ".into()]).is_err());
+    assert!(parse_tensor_exclusions(&[]).unwrap().is_empty());
+    let ex = TensorExclusion::new(&["model.mtp.*".into(), "*.markov_head.*".into()]);
+    assert!(!ex.is_empty());
+    assert!(ex.skip_source("model.mtp.0.ffn.experts.3.w1.weight", 1000));
+    assert!(ex.skip_source("model.mtp.0.ffn.experts.3.w1.scale", 64));
+    assert!(!ex.skip_source("model.layers.0.mlp.experts.3.gate_proj.weight", 1000));
+    assert!(!ex.skip_source("model.mtpx.0.w", 1));
+    assert_eq!(ex.source_tensors.get(), 2);
+    assert_eq!(ex.source_bytes.get(), 1064);
+    assert_eq!(
+        ex.hits.iter().map(|h| h.get()).collect::<Vec<_>>(),
+        vec![2, 0]
+    );
+    assert!(ex.skip_output("x.markov_head.w"));
+    assert!(!ex.skip_output("model.layers.1.mlp.gate.weight"));
+    assert!(TensorExclusion::new(&[]).is_empty());
+    assert!(!TensorExclusion::new(&[]).skip_output("model.mtp.0.norm.weight"));
+}
+
+/// A pattern over a name only a split produces (`up_proj` of a fused
+/// `gate_up_proj`) holds at the writer, beside a source-level pattern; the
+/// sibling split part stays.
+#[test]
+fn exclude_tensors_holds_for_split_produced_names() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_convert_env();
+    let dir = tmp("exclude-split");
+    let (h, inter, heads, kv, hd, vocab) = (64usize, 128usize, 2usize, 1usize, 32usize, 64usize);
+    fs::write(
+        dir.join("config.json"),
+        serde_json::json!({
+            "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3",
+            "hidden_size": h, "intermediate_size": inter, "num_hidden_layers": 1,
+            "num_attention_heads": heads, "num_key_value_heads": kv, "head_dim": hd,
+            "vocab_size": vocab, "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
+            "max_position_embeddings": 512, "tie_word_embeddings": false
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let p = "model.layers.0";
+    let mut t: Vec<Raw> = vec![
+        (
+            "model.embed_tokens.weight".into(),
+            "BF16",
+            vec![vocab, h],
+            bf16_bytes(vocab * h, 1, 0.5),
+        ),
+        (
+            "lm_head.weight".into(),
+            "BF16",
+            vec![vocab, h],
+            bf16_bytes(vocab * h, 2, 0.5),
+        ),
+        (
+            "model.norm.weight".into(),
+            "BF16",
+            vec![h],
+            bf16_bytes(h, 3, 0.1),
+        ),
+    ];
+    for (n, shape) in [
+        ("input_layernorm.weight", vec![h]),
+        ("post_attention_layernorm.weight", vec![h]),
+        ("self_attn.q_norm.weight", vec![hd]),
+        ("self_attn.k_norm.weight", vec![hd]),
+        ("self_attn.q_proj.weight", vec![heads * hd, h]),
+        ("self_attn.k_proj.weight", vec![kv * hd, h]),
+        ("self_attn.v_proj.weight", vec![kv * hd, h]),
+        ("self_attn.o_proj.weight", vec![h, heads * hd]),
+        ("mlp.gate_up_proj.weight", vec![2 * inter, h]),
+        ("mlp.down_proj.weight", vec![h, inter]),
+    ] {
+        let n_el = shape.iter().product();
+        t.push((
+            format!("{p}.{n}"),
+            "BF16",
+            shape,
+            bf16_bytes(n_el, n_el as u64, 0.3),
+        ));
+    }
+    fs::write(dir.join("model.safetensors"), raw_st(&t)).unwrap();
+    let out = dir.join("q8.cmf");
+    run_convert_multi_excluding(
+        dir.to_str().unwrap(),
+        &[("q8".into(), out.to_str().unwrap().into())],
+        None,
+        None,
+        None,
+        false,
+        MimoTowers::TextOnly,
+        &parse_tensor_exclusions(&["model.layers.0.mlp.up_proj.weight,lm_head.weight".into()])
+            .unwrap(),
+        |_| {},
+    )
+    .unwrap();
+    let m = CmfModel::open(&out).unwrap();
+    assert!(m.verify().is_empty(), "{:?}", m.verify());
+    assert!(m.tensor("model.layers.0.mlp.gate_proj.weight").is_some());
+    assert!(m.tensor("model.layers.0.mlp.down_proj.weight").is_some());
+    assert!(m.tensor("model.layers.0.mlp.up_proj.weight").is_none());
+    assert!(m.tensor("lm_head.weight").is_none());
+    assert!(m.tensor("model.embed_tokens.weight").is_some());
+    assert_eq!(
+        m.header
+            .provenance
+            .as_ref()
+            .and_then(|p| p.get("excluded_tensors")),
+        Some(&serde_json::json!([
+            "model.layers.0.mlp.up_proj.weight",
+            "lm_head.weight"
+        ]))
+    );
+    drop(m);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `--exclude-tensors 'model.mtp.*'` on a synthetic DeepSeek-V4.1 checkpoint
+/// that carries the MTP/DSpark stage (1 layer declared), through the real
+/// converter, in one pass to `fp4` and (`--also-output`) `q4tp`:
+/// - neither output holds a `model.mtp.*` tensor, both verify, and both
+///   record `excluded_tensors` in the provenance; every other tensor is
+///   byte-identical to the conversion without the flag (which does hold the
+///   stage);
+/// - the V4.1 loader takes the file without the stage and the CPU forward
+///   of a few tokens equals, bit for bit, the forward of the file with it
+///   (the runtime never executes the stage);
+/// - an excluded tensor is never decoded: with a NaN scale planted in an
+///   MTP expert, the conversion without the flag fails on it and the one
+///   with the flag succeeds.
+#[test]
+fn dsv41_exclude_mtp_drops_the_stack_and_keeps_the_forward() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_convert_env();
+    let src = write_dsv41_source_with("dsv41-mtp", true);
+    let source = open_safetensors(&src.dir.join("model.safetensors")).unwrap();
+    let mtp_source: Vec<String> = source
+        .tensors
+        .iter()
+        .filter(|t| t.name.starts_with("mtp."))
+        .map(|t| t.name.clone())
+        .collect();
+    // Weights only: an E8M0 `.scale` plane rides with its weight.
+    let mtp_written = mtp_source.iter().filter(|n| !n.ends_with(".scale")).count();
+    assert!(mtp_written > 20, "fixture stage too small: {mtp_written}");
+    drop(source);
+    let path = |n: &str| src.dir.join(n).to_str().unwrap().to_string();
+
+    // Without the flag: the stage is in the file.
+    run_convert_multi(
+        src.dir.to_str().unwrap(),
+        &[("fp4".into(), path("full.cmf"))],
+        None,
+        None,
+        None,
+        false,
+        |_| {},
+    )
+    .unwrap();
+    let full = Arc::new(CmfModel::open(path("full.cmf")).unwrap());
+    let in_full: Vec<&str> = full
+        .tensors
+        .iter()
+        .map(|e| e.name.as_str())
+        .filter(|n| n.starts_with("model.mtp."))
+        .collect();
+    assert_eq!(in_full.len(), mtp_written, "{in_full:?}");
+    assert!(full.tensor("model.mtp.0.ffn.experts.2.w1.weight").is_some());
+    assert!(
+        full.tensor("model.mtp.0.markov_head.markov_w1.weight")
+            .is_some()
+    );
+
+    // With it: one pass, two outputs.
+    let exclude = parse_tensor_exclusions(&["model.mtp.*".into()]).unwrap();
+    run_convert_multi_excluding(
+        src.dir.to_str().unwrap(),
+        &[
+            ("fp4".into(), path("nomtp.cmf")),
+            ("q4tp".into(), path("nomtp-q4tp.cmf")),
+        ],
+        None,
+        None,
+        None,
+        false,
+        MimoTowers::TextOnly,
+        &exclude,
+        |_| {},
+    )
+    .unwrap();
+    let cut = Arc::new(CmfModel::open(path("nomtp.cmf")).unwrap());
+    let cut_q4 = CmfModel::open(path("nomtp-q4tp.cmf")).unwrap();
+    for (label, m) in [("fp4", &*cut), ("q4tp", &cut_q4)] {
+        assert!(m.verify().is_empty(), "{label}: {:?}", m.verify());
+        let stray: Vec<&str> = m
+            .tensors
+            .iter()
+            .map(|e| e.name.as_str())
+            .filter(|n| n.starts_with("model.mtp."))
+            .collect();
+        assert!(stray.is_empty(), "{label}: {stray:?}");
+        assert_eq!(
+            m.header
+                .provenance
+                .as_ref()
+                .and_then(|p| p.get("excluded_tensors")),
+            Some(&serde_json::json!(["model.mtp.*"])),
+            "{label}"
+        );
+        assert_eq!(m.tensors.len(), full.tensors.len() - mtp_written, "{label}");
+    }
+    assert!(
+        full.header
+            .provenance
+            .as_ref()
+            .is_some_and(|p| p.get("excluded_tensors").is_none())
+    );
+    for e in &cut.tensors {
+        let f = full.tensor(&e.name).unwrap();
+        assert_eq!((e.dtype, &e.shape), (f.dtype, &f.shape), "{}", e.name);
+        assert_eq!(cut.entry_bytes(e), full.entry_bytes(f), "{}", e.name);
+    }
+    drop(cut_q4);
+
+    // The V4.1 runtime loads the file without the stage; the forward is the
+    // same bits as with it.
+    let ids = [3u32, 9, 27, 1, 44, 8];
+    let logits = |m: &Arc<CmfModel>| {
+        let mut p = cortiq_engine::Pipeline::from_model(
+            m,
+            cortiq_engine::sampler::SamplerConfig::default(),
+        )
+        .unwrap();
+        p.forward_ids(&ids, None).unwrap()
+    };
+    let (a, b) = {
+        let _cpu = cortiq_engine::gpu::pause_gpu();
+        cortiq_engine::qtensor::with_float_activations(|| (logits(&full), logits(&cut)))
+    };
+    assert_eq!(a.len(), VOCAB);
+    assert!(b.iter().all(|v| v.is_finite()));
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&a), bits(&b), "the MTP stage changed the forward");
+    drop((full, cut));
+
+    // Never decoded: a NaN scale in an MTP expert fails the plain conversion
+    // and passes unread under the flag.
+    let st = open_safetensors(&src.dir.join("model.safetensors")).unwrap();
+    let mut raw: Vec<Raw> = st
+        .tensors
+        .iter()
+        .map(|t| {
+            let dt: &'static str = match t.dtype.as_str() {
+                "BF16" => "BF16",
+                "F32" => "F32",
+                "I8" => "I8",
+                "F8_E8M0" => "F8_E8M0",
+                "F8_E4M3" => "F8_E4M3",
+                other => panic!("{other}"),
+            };
+            (t.name.clone(), dt, t.shape.clone(), st.bytes(t).to_vec())
+        })
+        .collect();
+    drop(st);
+    raw.iter_mut()
+        .find(|t| t.0 == "mtp.0.ffn.experts.1.w2.scale")
+        .unwrap()
+        .3[5] = 255;
+    fs::write(src.dir.join("model.safetensors"), raw_st(&raw)).unwrap();
+    let e = run_convert(
+        src.dir.to_str().unwrap(),
+        "fp4",
+        &path("nan.cmf"),
+        None,
+        None,
+        None,
+        false,
+        |_| {},
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("NaN scale"), "{e}");
+    run_convert_multi_excluding(
+        src.dir.to_str().unwrap(),
+        &[("fp4".into(), path("nan-nomtp.cmf"))],
+        None,
+        None,
+        None,
+        false,
+        MimoTowers::TextOnly,
+        &exclude,
+        |_| {},
+    )
+    .unwrap();
+    assert!(
+        CmfModel::open(path("nan-nomtp.cmf"))
+            .unwrap()
+            .verify()
+            .is_empty()
+    );
     let _ = fs::remove_dir_all(&src.dir);
 }
 

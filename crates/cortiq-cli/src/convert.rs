@@ -1054,6 +1054,124 @@ pub(crate) fn effective_quant(arch: &ModelArch, requested: Quant, name: &str) ->
     tensor_quant_override(name).unwrap_or_else(|| profile_quant(arch, requested, name))
 }
 
+/// Parse `cortiq convert --exclude-tensors` values: each one a
+/// comma-separated list of globs over CANONICAL output tensor names (the
+/// `--tensor-quant` glob: `*` is the only wildcard and spans dots).
+/// Duplicates collapse; an empty pattern is refused.
+pub fn parse_tensor_exclusions(specs: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for spec in specs {
+        for p in spec.split(',') {
+            let p = p.trim();
+            anyhow::ensure!(
+                !p.is_empty(),
+                "--exclude-tensors '{spec}': empty pattern (expected comma-separated globs, e.g. 'model.mtp.*')"
+            );
+            if !out.iter().any(|q| q == p) {
+                out.push(p.to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `cortiq convert --exclude-tensors PATTERNS`: tensors left out of every
+/// output of a conversion. A source tensor whose canonical name matches is
+/// skipped before its payload is read — no decode, no requant, no write —
+/// and counted (tensors and source bytes). A name only a split produces (one
+/// expert of a packed tensor, q/k/v of a fused projection) is also checked
+/// when it reaches the writer, so a pattern over such names holds too; that
+/// source tensor was decoded for its other parts. The patterns are recorded
+/// in `header.provenance.excluded_tensors`.
+///
+/// DeepSeek-V4.1-Flash-1017 with `--quant fp4` is 504.51 GB with its
+/// MTP/DSpark stack and 496.96 GB without; `model.mtp.*` drops that stack,
+/// which the V4.1 runtime never executes, and brings the file under Hugging
+/// Face's 500 GB per-file limit.
+pub(crate) struct TensorExclusion {
+    patterns: Vec<String>,
+    /// Source tensors excluded per pattern (first match).
+    hits: Vec<std::cell::Cell<usize>>,
+    source_tensors: std::cell::Cell<usize>,
+    source_bytes: std::cell::Cell<u64>,
+    /// Split-produced names dropped at the writer (unique names).
+    derived: std::cell::RefCell<HashSet<String>>,
+}
+
+impl TensorExclusion {
+    pub(crate) fn new(patterns: &[String]) -> Self {
+        Self {
+            patterns: patterns.to_vec(),
+            hits: patterns.iter().map(|_| std::cell::Cell::new(0)).collect(),
+            source_tensors: std::cell::Cell::new(0),
+            source_bytes: std::cell::Cell::new(0),
+            derived: std::cell::RefCell::new(HashSet::new()),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
+
+    fn matching(&self, name: &str) -> Option<usize> {
+        self.patterns.iter().position(|p| glob_match(p, name))
+    }
+
+    /// Whether the source tensor with canonical `name` (payload `bytes`
+    /// long) is excluded; counts it if so.
+    fn skip_source(&self, name: &str, bytes: usize) -> bool {
+        let Some(i) = self.matching(name) else {
+            return false;
+        };
+        self.hits[i].set(self.hits[i].get() + 1);
+        self.source_tensors.set(self.source_tensors.get() + 1);
+        self.source_bytes
+            .set(self.source_bytes.get().saturating_add(bytes as u64));
+        true
+    }
+
+    /// Whether an output tensor about to be written is excluded (a name the
+    /// source-side check could not see).
+    fn skip_output(&self, name: &str) -> bool {
+        if self.patterns.is_empty() || self.matching(name).is_none() {
+            return false;
+        }
+        self.derived.borrow_mut().insert(name.to_string());
+        true
+    }
+
+    fn report(&self) {
+        if self.patterns.is_empty() {
+            return;
+        }
+        let per: Vec<String> = self
+            .patterns
+            .iter()
+            .zip(&self.hits)
+            .map(|(p, h)| format!("'{p}' ×{}", h.get()))
+            .collect();
+        eprintln!(
+            "  --exclude-tensors: {} source tensors excluded, {} source bytes ({:.2} GB; {}){}",
+            self.source_tensors.get(),
+            self.source_bytes.get(),
+            self.source_bytes.get() as f64 / 1e9,
+            per.join(", "),
+            match self.derived.borrow().len() {
+                0 => String::new(),
+                n => format!("; {n} split-produced tensors dropped at write"),
+            }
+        );
+        for (p, h) in self.patterns.iter().zip(&self.hits) {
+            if h.get() == 0 && !self.derived.borrow().iter().any(|n| glob_match(p, n)) {
+                eprintln!(
+                    "  warning: --exclude-tensors '{p}' matched no tensor in this run \
+                     (patterns match canonical CMF names, e.g. 'model.mtp.*')"
+                );
+            }
+        }
+    }
+}
+
 /// Quantization choice for 2-D weight matrices.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Quant {
@@ -2660,8 +2778,12 @@ fn push_raw_u8_tensor(
 fn drain_to_writer(
     tensors: &mut Vec<TensorSpec>,
     writer: &mut cortiq_core::format::CmfStreamWriter,
+    exclusion: &TensorExclusion,
 ) -> anyhow::Result<()> {
     for t in tensors.drain(..) {
+        if exclusion.skip_output(&t.name) {
+            continue;
+        }
         writer
             .push(&t.name, t.dtype, &t.shape, &t.data)
             .map_err(|e| anyhow::anyhow!("write tensor '{}': {e}", t.name))?;
@@ -6970,6 +7092,7 @@ pub fn run_convert_multi(
 /// companion (no text tensors are read); `Multimodal` adds the towers, the
 /// audio tokenizer encoder and the config blobs to each text output.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))] // the CLI calls run_convert_multi_excluding
 pub fn run_convert_multi_towers(
     model: &str,
     outputs: &[(String, String)],
@@ -6978,13 +7101,46 @@ pub fn run_convert_multi_towers(
     o1_hint: Option<serde_json::Value>,
     resume: bool,
     towers: MimoTowers,
+    progress: impl FnMut(f32),
+) -> anyhow::Result<()> {
+    run_convert_multi_excluding(
+        model,
+        outputs,
+        hf_token,
+        defrag,
+        o1_hint,
+        resume,
+        towers,
+        &[],
+        progress,
+    )
+}
+
+/// [`run_convert_multi_towers`] leaving out every tensor whose canonical
+/// name matches one of `exclude` (`cortiq convert --exclude-tensors`, see
+/// [`TensorExclusion`]) — in every output, on every source path of the walk
+/// (resident local shards, local-ready streaming, Hugging Face streaming,
+/// resume). The packers that do not go through the walk (the MiMo-V2
+/// `mm-only` companion, EmbeddingGemma 2) refuse a non-empty `exclude`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_convert_multi_excluding(
+    model: &str,
+    outputs: &[(String, String)],
+    hf_token: Option<&str>,
+    defrag: Option<&str>,
+    o1_hint: Option<serde_json::Value>,
+    resume: bool,
+    towers: MimoTowers,
+    exclude: &[String],
     mut progress: impl FnMut(f32),
 ) -> anyhow::Result<()> {
     anyhow::ensure!(!outputs.is_empty(), "at least one output is required");
+    let exclusion = TensorExclusion::new(exclude);
     if towers == MimoTowers::MmOnly {
         anyhow::ensure!(
-            defrag.is_none() && o1_hint.is_none() && !resume,
-            "--mimo-towers mm-only writes only the towers: --defrag, --o1 and --resume do not apply"
+            defrag.is_none() && o1_hint.is_none() && !resume && exclusion.is_empty(),
+            "--mimo-towers mm-only writes only the towers: --defrag, --o1, --resume and \
+             --exclude-tensors do not apply"
         );
         return crate::mimo_towers::run_convert_mimo_mm(model, outputs, progress);
     }
@@ -6997,8 +7153,12 @@ pub fn run_convert_multi_towers(
             .is_some_and(|c| c.get("model_type").and_then(|v| v.as_str()) == Some("embedding_gemma2"))
     }) {
         anyhow::ensure!(
-            defrag.is_none() && o1_hint.is_none() && !resume && towers == MimoTowers::TextOnly,
-            "embedding_gemma2: --defrag, --o1, --resume and --mimo-towers do not apply"
+            defrag.is_none()
+                && o1_hint.is_none()
+                && !resume
+                && towers == MimoTowers::TextOnly
+                && exclusion.is_empty(),
+            "embedding_gemma2: --defrag, --o1, --resume, --mimo-towers and --exclude-tensors do not apply"
         );
         for (q, path) in outputs {
             crate::egemma2pack::convert(dir, q, path)?;
@@ -7122,6 +7282,12 @@ pub fn run_convert_multi_towers(
     let nvfp4_src = nvfp4_source(dir, &config)?;
     if let Some(g) = nvfp4_src {
         eprintln!("  source: NVIDIA ModelOpt NVFP4 (E2M1 + E4M3 scale per {g} + per-tensor scale)");
+    }
+    if !exclusion.is_empty() {
+        eprintln!(
+            "  --exclude-tensors: leaving out canonical names matching {}",
+            exclude.join(", ")
+        );
     }
     let consume_source_shards =
         stream_repo.is_none() && arch.deepseek_v41.is_some() && consume_source_shards_enabled();
@@ -7440,6 +7606,9 @@ pub fn run_convert_multi_towers(
             if arch.arch_name == MIMO_V2
                 && cortiq_engine::mimo_mm::MimoTowerGroup::of(&name).is_some()
             {
+                if exclusion.skip_source(&name, file.bytes(m).len()) {
+                    continue;
+                }
                 crate::mimo_towers::emit_tower(
                     batches,
                     profiles,
@@ -7494,6 +7663,12 @@ pub fn run_convert_multi_towers(
                     _ => name,
                 }
             };
+            // `--exclude-tensors`: the canonical name is final here (a split
+            // below is checked again at the writer). Nothing has read the
+            // payload yet — the slice length is mmap metadata.
+            if exclusion.skip_source(&name, file.bytes(m).len()) {
+                continue;
+            }
 
             // DeepSeek-V4.1 Engram tables are native FP8 byte planes. Keep
             // both planes lossless as explicit U8 auxiliary tensors before
@@ -8568,7 +8743,7 @@ pub fn run_convert_multi_towers(
                 let writer = writers[i].as_mut().ok_or_else(|| {
                     anyhow::anyhow!("output {} is already finalized", outputs[i].1)
                 })?;
-                drain_to_writer(&mut tensors[i], writer)?;
+                drain_to_writer(&mut tensors[i], writer, &exclusion)?;
                 // Only now is this shard's work durable in the output file.
                 writer
                     .mark(sname)
@@ -8627,7 +8802,7 @@ pub fn run_convert_multi_towers(
                 let writer = writers[i].as_mut().ok_or_else(|| {
                     anyhow::anyhow!("output {} is already finalized", outputs[i].1)
                 })?;
-                drain_to_writer(&mut tensors[i], writer)?;
+                drain_to_writer(&mut tensors[i], writer, &exclusion)?;
                 writer
                     .mark(&file_name)
                     .map_err(|e| anyhow::anyhow!("manifest: {e}"))?;
@@ -8803,6 +8978,15 @@ pub fn run_convert_multi_towers(
         }
         None => provenance,
     };
+    // `--exclude-tensors`: what the file deliberately leaves out of the
+    // source (checkers subtract these from the expected inventory).
+    let provenance = if exclusion.is_empty() {
+        provenance
+    } else {
+        let mut p = provenance;
+        p["excluded_tensors"] = serde_json::json!(exclude);
+        p
+    };
     let provenance = if let Some(prism) = arch.prism_hadamard.as_ref() {
         let mut p = provenance;
         p["prism_hadamard"] = serde_json::json!({
@@ -8915,7 +9099,7 @@ pub fn run_convert_multi_towers(
             .take()
             .ok_or_else(|| anyhow::anyhow!("output {} has no writer", outputs[i].1))?;
         let mut writer = writer;
-        drain_to_writer(&mut tensors[i], &mut writer)?;
+        drain_to_writer(&mut tensors[i], &mut writer, &exclusion)?;
         writer
             .finish(&header_for(i), None, vocab.as_deref())
             .map_err(|e| anyhow::anyhow!("write {}: {e}", outputs[i].1))?;
@@ -8923,6 +9107,7 @@ pub fn run_convert_multi_towers(
         // until every requested output has finalized, so a crash between two
         // finish calls can detect the already-valid sibling on resume.
     }
+    exclusion.report();
     for manifest_path in manifests {
         let _ = std::fs::remove_file(manifest_path);
     }
