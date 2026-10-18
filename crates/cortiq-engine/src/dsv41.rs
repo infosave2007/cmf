@@ -1274,9 +1274,14 @@ fn gpu_attention_tail_enabled() -> bool {
 /// `rope` shifts the position the frame's inverse RoPE uses by one (the
 /// host has already rotated the query unless `CMF_DSV41_FUSED_Q=1`). Each is
 /// a broken device path the GPU fixture's bound has to catch; see
-/// `tests/dsv41_fixture_gpu.rs`. Read once per process.
+/// `tests/dsv41_fixture_gpu.rs`. Read once per process, and only in builds
+/// with debug assertions (`cargo test`'s default profile): a release binary
+/// never reads the variable, so a stray one cannot corrupt its output.
 #[cfg(feature = "gpu")]
 fn gpu_tail_mutation() -> Option<&'static str> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
     static M: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     M.get_or_init(|| {
         let m = std::env::var("CMF_DSV41_TEST_MUTATE").ok()?;
