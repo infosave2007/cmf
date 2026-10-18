@@ -53853,6 +53853,18 @@ fn main() {
             return;
         };
         let _op = c.op_gate.enter();
+        // wgpu on Metal compiles WGSL through MSL with fast math, which may
+        // apply the shared group scale in another order than the q1 kernel:
+        // there the two agree to 1e-5 of the output scale, on Vulkan bit for bit.
+        let metal = c._adapter.get_info().backend == wgpu::Backend::Metal;
+        let same = |a: &[f32], b: &[f32], what: &str| {
+            assert_eq!(a.len(), b.len(), "{what}: lengths");
+            let scale = b.iter().fold(0f32, |m, v| m.max(v.abs()));
+            for (i, (x, y)) in a.iter().zip(b).enumerate() {
+                let ok = if metal { (x - y).abs() <= 1e-5 * scale } else { x.to_bits() == y.to_bits() };
+                assert!(ok, "{what}: element {i}: {x} vs {y} (scale {scale})");
+            }
+        };
         let run = |enc: wgpu::CommandEncoder, y: &wgpu::Buffer, n: usize| -> Vec<f32> {
             let mut sc = c.scratch.lock().unwrap();
             let stage = Scratch::ensure(
@@ -53895,11 +53907,7 @@ fn main() {
             let (mut ga, mut gb) = (vec![0f32; rows], vec![0f32; rows]);
             assert!(dispatch_q1(c, None, &q1, x, rows, cols, &mut ga));
             assert!(dispatch_q1g(c, None, &q1g, x, rows, cols, &mut gb));
-            assert_eq!(
-                ga.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                gb.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                "{rows}x{cols}: q1g_matvec != q1_matvec"
-            );
+            same(&ga, &gb, &format!("{rows}x{cols}: q1g_matvec vs q1_matvec"));
             let mut w = vec![0f32; rows * cols];
             dequant_q1(&q1, &mut w);
             let max_d = (0..rows)
@@ -53936,11 +53944,7 @@ fn main() {
                     pass.dispatch_workgroups(groups, 1, 1);
                 }
                 let got = run(enc, &yb, rows);
-                assert_eq!(
-                    ga.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                    got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                    "{rows}x{cols}: q1g {kname} kernel != q1_matvec"
-                );
+                same(&ga, &got, &format!("{rows}x{cols}: q1g {kname} kernel vs q1_matvec"));
             }
             // Shortlisted head: the first rows of the same q1g tensor.
             let part = rows.div_ceil(3);
@@ -53970,11 +53974,7 @@ fn main() {
                 run(enc, &ybuf, b * rows)
             };
             let (ma, mb) = (gemm(false), gemm(true));
-            assert_eq!(
-                ma.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                mb.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                "{rows}x{cols}x{b}: q1g_mul_mm != q1_mul_mm"
-            );
+            same(&ma, &mb, &format!("{rows}x{cols}x{b}: q1g_mul_mm vs q1_mul_mm"));
             let max_d = (0..rows)
                 .map(|o| (ma[o] - ga[o]).abs() / ga[o].abs().max(1.0))
                 .fold(0f32, f32::max);

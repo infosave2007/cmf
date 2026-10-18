@@ -405,6 +405,12 @@ pub fn mm(c: &Ctx, plane: &wgpu::Buffer, act: &wgpu::Buffer, out: &wgpu::Buffer,
     zi::mm_call(c, g, &a, plane, act, out)
 }
 
+/// Whether this device runs the trainer's matrix-unit GEMMs (cooperative
+/// matrices, f16, 32-wide subgroups); without them every `mm` declines.
+pub fn matrix_units() -> bool {
+    zi::zctx().is_some()
+}
+
 /// [`mm`] into columns `ocol..ocol+n` of an output with row stride `ldo`.
 #[allow(clippy::too_many_arguments)]
 pub fn mm_cols(c: &Ctx, plane: &wgpu::Buffer, act: &wgpu::Buffer, out: &wgpu::Buffer, m: usize, n: usize, k: usize, ldo: usize, ocol: usize, oscale: f32) -> Option<zi::MmCall> {
@@ -544,6 +550,10 @@ mod tests {
     #[test]
     fn blr_layer_matches_host() {
         let Some(c) = train_ops::dev() else { return };
+        if !matrix_units() {
+            eprintln!("no cooperative matrices on this device — skipping");
+            return;
+        }
         let (m, n, r, ntok, np) = (256usize, 384usize, 128usize, 70usize, 2usize);
         let mut paths_h = Vec::new();
         let mut paths = Vec::new();
