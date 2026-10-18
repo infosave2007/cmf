@@ -130,7 +130,8 @@ fn split_qg(@builtin(global_invocation_id) g: vec3<u32>) {
 
 // Adam (no weight decay) over k entries: SRC = params, A = grads,
 // B = first moment, OUT = second moment, COL = mask (rows = 1: masked).
-// scale = lr, f1 = beta1, f2 = beta2, f3 = eps, m = step (1-based).
+// scale = lr, f1 = beta1, f2 = beta2, f3 = eps, m = step (1-based);
+// r = 1: relative steps (× max(|w|, pad1)).
 @compute @workgroup_size(256)
 fn adam(@builtin(global_invocation_id) g: vec3<u32>) {
     let i = idx(g);
@@ -144,7 +145,13 @@ fn adam(@builtin(global_invocation_id) g: vec3<u32>) {
     let t = f32(p.m);
     let mh = m1 / (1.0 - pow(p.f1, t));
     let vh = m2 / (1.0 - pow(p.f2, t));
-    SRC[i] = SRC[i] - p.scale * mh / (sqrt(vh) + p.f3);
+    let st = p.scale * mh / (sqrt(vh) + p.f3);
+    // r = 1: the step is relative to the value's magnitude, floored at pad1
+    if (p.r == 1u) {
+        SRC[i] = SRC[i] - st * max(abs(SRC[i]), bitcast<f32>(p.pad1));
+    } else {
+        SRC[i] = SRC[i] - st;
+    }
 }
 
 // Partial sums of squares of A[0..k] per workgroup into OUT[wg]
@@ -345,14 +352,15 @@ pub fn split_qg<'a>(c: &'a Ctx, qg: &'a wgpu::Buffer, q: &'a wgpu::Buffer, gate:
 
 /// One Adam update of `n` parameters (`mask` 0 = frozen entry).
 #[allow(clippy::too_many_arguments)]
-pub fn adam<'a>(c: &'a Ctx, w: &'a wgpu::Buffer, g: &'a wgpu::Buffer, m1: &'a wgpu::Buffer, m2: &'a wgpu::Buffer, mask: Option<&'a wgpu::Buffer>, n: usize, lr: f32, step: u32, b1: f32, b2: f32, eps: f32, gmul: f32) -> Option<Disp<'a>> {
+#[allow(clippy::too_many_arguments)]
+pub fn adam<'a>(c: &'a Ctx, w: &'a wgpu::Buffer, g: &'a wgpu::Buffer, m1: &'a wgpu::Buffer, m2: &'a wgpu::Buffer, mask: Option<&'a wgpu::Buffer>, n: usize, lr: f32, step: u32, b1: f32, b2: f32, eps: f32, gmul: f32, rel: f32) -> Option<Disp<'a>> {
     let md = module(c)?;
     // The mask binding is statically used: without a mask it aliases the
     // parameters (never read: the flag is off).
     let bufs = vec![(1, w), (2, mask.unwrap_or(w)), (7, g), (8, m1), (9, m2)];
     Some(Disp {
         pipe: &md.p["adam"],
-        uni: vec![step, n as u32, 0, mask.is_some() as u32, 0, 0, gmul.to_bits(), 0, lr.to_bits(), b1.to_bits(), b2.to_bits(), eps.to_bits()],
+        uni: vec![step, n as u32, 0, mask.is_some() as u32, (rel > 0.0) as u32, 0, gmul.to_bits(), rel.to_bits(), lr.to_bits(), b1.to_bits(), b2.to_bits(), eps.to_bits()],
         bufs,
         grid: elt_fold(n),
     })
