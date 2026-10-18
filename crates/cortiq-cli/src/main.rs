@@ -884,15 +884,18 @@ enum Commands {
         #[arg(long)]
         q4tp_debias: bool,
     },
-    /// GPTQ for the experts of a Flash-Next-class MoE (qwen4_exp), routed
-    /// and shared: gate/up into q2tp, down into q4tp, on the GPU; the calibration file
+    /// GPTQ for the experts of a Flash-Next-class MoE (qwen4_exp) or of
+    /// DeepSeek-V4.1 (deepseek_v41), routed and shared: `--codec q2tp`
+    /// (gate/up q2tp, down q4tp) or `q4tp`, on the GPU; the calibration file
     /// (a q4tp CMF of the model) supplies the activations and every
     /// non-expert tensor, the original safetensors checkpoint the
     /// full-precision expert weights (fetched one layer at a time).
     QuantizeMoe {
         /// Calibration .cmf (q4tp of the same model)
         calib_model: String,
-        /// Original checkpoint on the Hub (e.g. Qwen/Qwen3.8-Flash-Next); HF_TOKEN from the environment
+        /// Original checkpoint: a Hub repo (e.g. Qwen/Qwen3.8-Flash-Next;
+        /// HF_TOKEN from the environment), or a local directory with its
+        /// index and shards (read in place, never deleted)
         #[arg(long)]
         hf: String,
         /// Calibration text, PATH or PATH=SHARE (repeatable)
@@ -915,12 +918,20 @@ enum Commands {
         scratch: String,
         #[arg(long, default_value = "16")]
         threads: usize,
-        #[arg(long, required_unless_present = "patch_shared")]
+        #[arg(long, required_unless_present_any = ["patch_shared", "in_place"])]
         output: Option<String>,
         /// Re-encode only the shared experts of this existing quantize-moe
         /// output, in place (no --output file is written)
         #[arg(long)]
         patch_shared: Option<String>,
+        /// Expert layout: q2tp (gate/up q2tp, down q4tp) or q4tp (all q4tp)
+        #[arg(long, default_value = "q2tp")]
+        codec: String,
+        /// Rewrite the experts inside the calibration file itself, one layer
+        /// at a time, for disks that cannot hold the model twice (all layers
+        /// are captured in one pass first; q2tp slack is released on Linux)
+        #[arg(long, default_value_t = false)]
+        in_place: bool,
     },
     /// NVG Ť: light distillation training of a compressed model's metric
     /// (the h, ℓ, g scales of its binary low-rank tensors and every RMSNorm
@@ -3533,7 +3544,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         #[cfg(feature = "gpu")]
-        Commands::QuantizeMoe { calib_model, hf, calib, tokens, window, layers_per_pass, lambda, min_rows, scratch, threads, output, patch_shared } => {
+        Commands::QuantizeMoe { calib_model, hf, calib, tokens, window, layers_per_pass, lambda, min_rows, scratch, threads, output, patch_shared, codec, in_place } => {
             moegptq::run(&moegptq::MoeOpts {
                 calib_model: &calib_model,
                 hf: &hf,
@@ -3547,6 +3558,8 @@ async fn main() -> anyhow::Result<()> {
                 threads,
                 output: output.as_deref().unwrap_or(""),
                 patch_shared: patch_shared.as_deref(),
+                codec: &codec,
+                in_place,
             })
         }
         #[cfg(not(feature = "gpu"))]

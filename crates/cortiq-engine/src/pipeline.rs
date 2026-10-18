@@ -8622,6 +8622,26 @@ impl Pipeline {
         Ok(rows)
     }
 
+    /// GPTQ calibration of DeepSeek-V4.1 (`cortiq quantize-moe`): the MoE
+    /// input rows and routed expert ids of layers `lo..hi` for `ids` (a fresh
+    /// sequence), see [`crate::dsv41::Dsv41MoeCapture`].
+    pub fn dsv41_moe_capture(&mut self, ids: &[u32], lo: usize, hi: usize) -> Result<crate::dsv41::Dsv41MoeCapture, String> {
+        #[cfg(target_os = "macos")]
+        crate::gpu_metal::set_io_namespace(self.graph_kv_id);
+        if ids.is_empty() {
+            return Err("empty id sequence".to_string());
+        }
+        self.dsv41.as_ref().ok_or_else(|| "not a DeepSeek-V4.1 model".to_string())?;
+        self.clear_sequence_state();
+        let res = {
+            let pool = self.pool.clone();
+            let b = self.dsv41.as_mut().expect("dsv41 checked above");
+            crate::dsv41::capture_window(&b.0, &b.1, &b.2, &mut b.3, ids, lo, hi, pool.as_deref())
+        };
+        self.clear_sequence_state();
+        res
+    }
+
     /// Teacher-forced perplexity over a token sequence (phase-C gate:
     /// honest quant comparisons instead of prompt vibes).
     ///

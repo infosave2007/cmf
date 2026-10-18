@@ -901,6 +901,30 @@ pub struct Dsv41State {
     /// bounded by the GPU policy and cold experts complete on the host.
     #[cfg(feature = "gpu")]
     gpu_pool: Option<crate::qwen4_exp::QwenGpuPool>,
+    /// GPTQ calibration capture (`cortiq quantize-moe`); `None` outside a
+    /// capture. Survives [`Dsv41State::clear`]: [`capture_window`] owns it.
+    pub moe_capture: Option<Dsv41MoeCapture>,
+}
+
+/// What a GPTQ calibration window records at layers `lo..hi`: every
+/// token's MoE input (the RMS-normed mHC fold that `moe` receives, the input
+/// of the routed experts and of the shared expert) and the experts its route
+/// selected. Routing is resolved on the host in both the CPU and the dynamic
+/// GPU MoE paths, so the record is taken before either runs.
+#[derive(Debug, Clone, Default)]
+pub struct Dsv41MoeCapture {
+    pub lo: usize,
+    pub hi: usize,
+    /// End each token after layer `hi - 1`. No layer reads state written by
+    /// a later layer (KV, index and candidate sources sit at or below their
+    /// consumers), so the captured rows are the same and the rest of the
+    /// stack and the head are skipped.
+    pub stop_after_hi: bool,
+    /// Per captured layer: `dim` f16 values per token.
+    pub x: Vec<Vec<u16>>,
+    /// Per captured layer: `top_k` routed expert ids per token, in route
+    /// order (`u16::MAX` pads a route cut short by non-finite scores).
+    pub picks: Vec<Vec<u16>>,
 }
 
 impl Dsv41State {
@@ -930,6 +954,7 @@ impl Dsv41State {
             gpu_kv_id,
             #[cfg(feature = "gpu")]
             gpu_pool: None,
+            moe_capture: None,
         }
     }
 
@@ -2564,6 +2589,15 @@ fn moe(
         shifted[i] = f32::NEG_INFINITY;
     }
     trace_moe(position, layer, image, &logits, &scores, bias, &picks);
+    if let Some(cap) = state.moe_capture.as_mut() {
+        if (cap.lo..cap.hi).contains(&layer) {
+            let k = layer - cap.lo;
+            cap.x[k].extend(x[..cfg.dim].iter().map(|&v| cortiq_core::quant::f32_to_f16(v)));
+            cap.picks[k].extend(
+                (0..cfg.top_k).map(|j| picks.get(j).map_or(u16::MAX, |&e| e as u16)),
+            );
+        }
+    }
     let sum = picks.iter().map(|&i| scores[i]).sum::<f32>().max(1e-20);
     let mut mix_weights = vec![0.0f32; cfg.n_routed_experts];
     if cfg.norm_topk_prob {
@@ -2865,6 +2899,16 @@ fn forward_token_impl(
         pre_mix.copy_from_slice(&fp);
         trace_stats("block", position, Some(li), &h);
         trace_stats("pre", position, Some(li), &pre_mix);
+        if st
+            .moe_capture
+            .as_ref()
+            .is_some_and(|c| c.stop_after_hi && li + 1 >= c.hi)
+        {
+            // Calibration capture: nothing at or above `hi` is recorded.
+            logits.clear();
+            prof::add(&prof::TOTAL_NS, total_t0);
+            return;
+        }
     }
     let head_t0 = prof::start();
     let mut final_h = vec![0.0f32; cfg.dim];
@@ -2946,6 +2990,68 @@ pub fn forward_chunk_masked_with_embeddings(
             i + 1 == ids.len(),
         );
     }
+}
+
+/// GPTQ calibration capture (`cortiq quantize-moe`): `ids` as a fresh
+/// sequence from position 0, recording the MoE input rows and routed expert
+/// ids of layers `lo..hi` ([`Dsv41MoeCapture`]); each token stops after
+/// layer `hi - 1`. The sequence state is cleared before and after.
+#[allow(clippy::too_many_arguments)]
+pub fn capture_window(
+    globals: &Dsv41Globals,
+    layers: &[Dsv41Layer],
+    cfg: &Dsv41Cfg,
+    st: &mut Dsv41State,
+    ids: &[u32],
+    lo: usize,
+    hi: usize,
+    pool: Option<&Pool>,
+) -> Result<Dsv41MoeCapture, String> {
+    let hi = hi.min(layers.len());
+    if lo >= hi {
+        return Err(format!("capture range {lo}..{hi} is empty"));
+    }
+    if cfg.n_routed_experts > u16::MAX as usize {
+        return Err(format!("{} experts do not fit a u16 id", cfg.n_routed_experts));
+    }
+    st.clear();
+    st.moe_capture = Some(Dsv41MoeCapture {
+        lo,
+        hi,
+        stop_after_hi: true,
+        x: (lo..hi).map(|_| Vec::with_capacity(ids.len() * cfg.dim)).collect(),
+        picks: (lo..hi).map(|_| Vec::with_capacity(ids.len() * cfg.top_k)).collect(),
+    });
+    let mut logits = Vec::new();
+    for (pos, &id) in ids.iter().enumerate() {
+        forward_token_masked_with_embedding(
+            globals,
+            layers,
+            cfg,
+            st,
+            id,
+            pos,
+            true,
+            None,
+            pool,
+            &mut logits,
+            false,
+        );
+    }
+    let cap = st.moe_capture.take().unwrap_or_default();
+    st.clear();
+    for (k, (x, p)) in cap.x.iter().zip(&cap.picks).enumerate() {
+        if x.len() != ids.len() * cfg.dim || p.len() != ids.len() * cfg.top_k {
+            return Err(format!(
+                "layer {}: captured {} rows / {} routes for {} tokens",
+                lo + k,
+                x.len() / cfg.dim.max(1),
+                p.len() / cfg.top_k.max(1),
+                ids.len()
+            ));
+        }
+    }
+    Ok(cap)
 }
 
 /// Compact, row-addressable CSA2 global KV storage.
@@ -3518,5 +3624,168 @@ mod tests {
         let mut compressed = vec![0.0; 16];
         fp4_inplace(&mut compressed, 16, false);
         assert_eq!(compressed, vec![0.0; 16]);
+    }
+
+    /// A tiny window-only V4.1 stack of f32 tensors (no compressor, indexer
+    /// or Engram): enough for the full per-token forward on the host.
+    fn tiny_stack(n_layers: usize) -> (Dsv41Globals, Vec<Dsv41Layer>, Dsv41Cfg) {
+        let cfg = Dsv41Cfg {
+            dim: 32,
+            n_heads: 2,
+            head_dim: 16,
+            rope_head_dim: 4,
+            q_lora_rank: 8,
+            o_lora_rank: 4,
+            o_groups: 2,
+            hc_mult: 2,
+            hc_sinkhorn_iters: 3,
+            hc_eps: 1e-6,
+            norm_eps: 1e-6,
+            n_routed_experts: 8,
+            top_k: 2,
+            moe_inter: 16,
+            gate_temp: 1.0,
+            norm_topk_prob: true,
+            route_scale: 1.5,
+            swiglu_limit: 10.0,
+            window: 8,
+            rope_theta: 10_000.0,
+            compress_rope_theta: 160_000.0,
+            rope_factor: 1.0,
+            original_seq_len: 64,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            index_heads: 1,
+            index_head_dim: 32,
+            index_topk: 4,
+            candidate_source: 99,
+            candidate_topk_blocks: 2,
+            candidate_block_size: 8,
+            kv_sources: Vec::new(),
+            index_sources: Vec::new(),
+            compress_ratios: vec![0; n_layers],
+            engram_layers: Vec::new(),
+            engram_vocab: 0,
+            engram_embeddings: Vec::new(),
+            engram_max_ngram: 4,
+            engram_heads: 1,
+            engram_head_dim: 16,
+            engram_compressed_vocab: 0,
+            engram_pad_id: 2,
+            vocab: 16,
+        };
+        let mut seed = 0x5eed_u64;
+        let mut rnd = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed = splitmix64(seed);
+                    ((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0 * scale
+                })
+                .collect()
+        };
+        let q = |v: Vec<f32>, r: usize, c: usize| QTensor::from_f32(v, r, c);
+        let (d, hc) = (cfg.dim, cfg.hc_mult);
+        let mix_n = (2 + hc) * hc;
+        let globals = Dsv41Globals {
+            embed: q(rnd(cfg.vocab * d, 1.0), cfg.vocab, d),
+            norm: vec![1.0; d],
+            head: q(rnd(cfg.vocab * d, 0.3), cfg.vocab, d),
+            inv_freq_compress: vec![1.0, 0.01],
+            inv_freq_window: vec![1.0, 0.01],
+        };
+        let mut layers = Vec::new();
+        for _ in 0..n_layers {
+            let mut expert = |rnd: &mut dyn FnMut(usize, f32) -> Vec<f32>| Dsv41Expert {
+                w1: q(rnd(cfg.moe_inter * d, 0.4), cfg.moe_inter, d),
+                w2: q(rnd(d * cfg.moe_inter, 0.4), d, cfg.moe_inter),
+                w3: q(rnd(cfg.moe_inter * d, 0.4), cfg.moe_inter, d),
+            };
+            let experts = (0..cfg.n_routed_experts).map(|_| expert(&mut rnd)).collect();
+            let shared = expert(&mut rnd);
+            let per_group = cfg.n_heads * cfg.head_dim / cfg.o_groups;
+            layers.push(Dsv41Layer {
+                attn_norm: vec![1.0; d],
+                ffn_norm: vec![1.0; d],
+                wq_a: q(rnd(cfg.q_lora_rank * d, 0.4), cfg.q_lora_rank, d),
+                q_norm: vec![1.0; cfg.q_lora_rank],
+                wq_b: q(rnd(cfg.n_heads * cfg.head_dim * cfg.q_lora_rank, 0.4), cfg.n_heads * cfg.head_dim, cfg.q_lora_rank),
+                wkv: q(rnd(cfg.head_dim * d, 0.4), cfg.head_dim, d),
+                kv_norm: vec![1.0; cfg.head_dim],
+                wo_a: q(rnd(cfg.o_groups * cfg.o_lora_rank * per_group, 0.4), cfg.o_groups * cfg.o_lora_rank, per_group),
+                wo_b: q(rnd(d * cfg.o_groups * cfg.o_lora_rank, 0.4), d, cfg.o_groups * cfg.o_lora_rank),
+                attn_sink: vec![0.0; cfg.n_heads],
+                compressor: None,
+                indexer: None,
+                hc_attn_fn: rnd(mix_n * hc * d, 0.1),
+                hc_attn_base: rnd(mix_n, 0.5),
+                hc_attn_scale: [1.0, 1.0, 1.0],
+                hc_ffn_fn: rnd(mix_n * hc * d, 0.1),
+                hc_ffn_base: rnd(mix_n, 0.5),
+                hc_ffn_scale: [1.0, 1.0, 1.0],
+                gate: q(rnd(cfg.n_routed_experts * d, 1.0), cfg.n_routed_experts, d),
+                gate_bias: rnd(cfg.n_routed_experts, 0.2),
+                gate_bias_vl: None,
+                experts,
+                shared,
+                engram: None,
+                gpu_expert_ids: Vec::new(),
+                gpu_shared_ids: None,
+            });
+        }
+        (globals, layers, cfg)
+    }
+
+    /// The quantize-moe capture records the MoE input and the route of
+    /// every token at the captured layers through the real forward; ending
+    /// each token after the last captured layer leaves the record unchanged.
+    #[test]
+    fn moe_capture_records_inputs_and_routes() {
+        let (g, layers, cfg) = tiny_stack(3);
+        let ids: Vec<u32> = (0..13).map(|i| (i * 5 % 16) as u32).collect();
+        let mut st = Dsv41State::new(&cfg, None);
+        let cap = capture_window(&g, &layers, &cfg, &mut st, &ids, 1, 2, None).unwrap();
+        assert_eq!((cap.lo, cap.hi), (1, 2));
+        assert_eq!(cap.x.len(), 1);
+        assert_eq!(cap.x[0].len(), ids.len() * cfg.dim);
+        assert_eq!(cap.picks[0].len(), ids.len() * cfg.top_k);
+        assert!(st.moe_capture.is_none(), "the capture is handed back, not left on the state");
+
+        // the same record through the whole stack (no early stop)
+        st.clear();
+        st.moe_capture = Some(Dsv41MoeCapture {
+            lo: 0,
+            hi: 2,
+            stop_after_hi: false,
+            x: vec![Vec::new(); 2],
+            picks: vec![Vec::new(); 2],
+        });
+        let mut logits = Vec::new();
+        for (pos, &id) in ids.iter().enumerate() {
+            forward_token_masked_with_embedding(&g, &layers, &cfg, &mut st, id, pos, true, None, None, &mut logits, true);
+        }
+        assert_eq!(logits.len(), cfg.vocab, "a full forward still produces logits");
+        let full = st.moe_capture.take().unwrap();
+        assert_eq!(full.x[1], cap.x[0], "early stop changes no captured row");
+        assert_eq!(full.picks[1], cap.picks[0]);
+        assert_ne!(full.x[0], full.x[1], "layers capture their own inputs");
+
+        // the route is V4.1's: sqrt-softplus scores + bias, top-k, from the captured row
+        let l = &layers[1];
+        for t in 0..ids.len() {
+            let x: Vec<f32> = cap.x[0][t * cfg.dim..(t + 1) * cfg.dim]
+                .iter()
+                .map(|&h| cortiq_core::quant::f16_to_f32(h))
+                .collect();
+            let mut lg = vec![0f32; cfg.n_routed_experts];
+            l.gate.matvec(&x, &mut lg, None);
+            let mut sh: Vec<(f32, usize)> = lg
+                .iter()
+                .enumerate()
+                .map(|(e, &v)| ((1.0 + v.exp()).ln().sqrt() + l.gate_bias[e], e))
+                .collect();
+            sh.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            let want: Vec<u16> = sh[..cfg.top_k].iter().map(|&(_, e)| e as u16).collect();
+            assert_eq!(&cap.picks[0][t * cfg.top_k..(t + 1) * cfg.top_k], &want[..], "token {t}");
+        }
     }
 }
