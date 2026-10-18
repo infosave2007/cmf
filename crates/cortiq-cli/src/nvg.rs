@@ -83,12 +83,6 @@ pub fn pt<T>(p: Option<&Prof>, k: &'static str, f: impl FnOnce() -> T) -> T {
     }
 }
 
-#[inline]
-fn pcount(p: Option<&Prof>, k: &'static str, n: u64) {
-    if let Some(p) = p {
-        p.add(k, 0.0, n);
-    }
-}
 
 // ───────────────────────────── model of one tensor ─────────────────────────────
 

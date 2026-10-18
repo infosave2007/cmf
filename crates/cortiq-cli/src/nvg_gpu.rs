@@ -75,6 +75,7 @@ pub struct HCtxD {
     pub hsel: DMat,
     pub c_fit: f64,
     pub sqd: Vec<f64>,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub perm: Vec<usize>,
     perm_buf: cortiq_engine::wgpu::Buffer,
     pub uc: DMat,
