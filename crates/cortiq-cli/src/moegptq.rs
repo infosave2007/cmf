@@ -1098,14 +1098,15 @@ impl Source {
     }
 
     /// Fetch (remote) and map every shard of one layer. A failed download
-    /// is retried `FETCH_ATTEMPTS` times with a growing pause.
+    /// is retried for up to `fetch_wait()` (a pause of 20 s·k, at most 5
+    /// minutes, after the k-th failure).
     fn open_layer(&self, shards: &[String]) -> anyhow::Result<LayerSrc> {
         let mut files = HashMap::new();
         let mut index = HashMap::new();
         for sh in shards {
             let p = self.path(sh);
             if self.local.is_none() {
-                with_attempts(FETCH_ATTEMPTS, std::time::Duration::from_secs(20), sh, || {
+                with_retries(fetch_wait(), std::time::Duration::from_secs(20), std::time::Duration::from_secs(300), sh, || {
                     fetch(&self.agent, &format!("{}/{sh}", self.base), &p, self.token.as_deref(), true, 16).map(|_| ())
                 })?;
             }
@@ -1146,22 +1147,37 @@ impl Source {
     }
 }
 
-/// Attempts at a synchronous shard download before the run gives up.
-const FETCH_ATTEMPTS: usize = 6;
+/// How long a synchronous shard download keeps being retried before the
+/// run gives up: `CMF_MOE_FETCH_WAIT` minutes, default 240. A run that
+/// stops after its capture, or halfway through an `--output` file (which
+/// cannot resume), loses hours: waiting out a Hub outage is cheaper.
+fn fetch_wait() -> std::time::Duration {
+    let min = std::env::var("CMF_MOE_FETCH_WAIT").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|m| *m >= 0.0).unwrap_or(240.0);
+    std::time::Duration::from_secs_f64(min * 60.0)
+}
 
-/// `f` until it succeeds, at most `attempts` times, pausing `pause`·k after
-/// the k-th failure; the last error is returned.
-fn with_attempts(attempts: usize, pause: std::time::Duration, what: &str, mut f: impl FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
-    let mut k = 1;
+/// `f` until it succeeds, retried while the next pause still ends within
+/// `budget` of the first attempt; the pause after the k-th failure is
+/// `pause`·k, at most `max_pause`. The last error is returned.
+fn with_retries(budget: std::time::Duration, pause: std::time::Duration, max_pause: std::time::Duration, what: &str, mut f: impl FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
+    let t0 = Instant::now();
+    let mut k = 1u32;
     loop {
         match f() {
             Ok(()) => return Ok(()),
-            Err(e) if k < attempts => {
-                eprintln!("  {what}: attempt {k}/{attempts} failed ({e:#}); retrying in {:.0}s", (pause * k as u32).as_secs_f64());
-                std::thread::sleep(pause * k as u32);
+            Err(e) => {
+                let wait = (pause * k).min(max_pause);
+                if t0.elapsed() + wait > budget {
+                    return Err(e.context(format!("{what}: {k} attempts failed over {:.0} min (CMF_MOE_FETCH_WAIT sets the minutes)", t0.elapsed().as_secs_f64() / 60.0)));
+                }
+                eprintln!(
+                    "  {what}: attempt {k} failed ({e:#}); retrying in {:.0}s (giving up {:.0} min after the first attempt)",
+                    wait.as_secs_f64(),
+                    budget.as_secs_f64() / 60.0
+                );
+                std::thread::sleep(wait);
                 k += 1;
             }
-            Err(e) => return Err(e.context(format!("{what}: {attempts} attempts failed"))),
         }
     }
 }
@@ -2734,24 +2750,38 @@ mod tests {
     }
 
     /// A shard download is retried until it succeeds, and gives up with
-    /// the last error after the allowed attempts.
+    /// the last error once the next pause would end past the time budget
+    /// (growing pauses, capped).
     #[test]
     fn downloads_are_retried() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
         let mut calls = 0;
-        with_attempts(4, std::time::Duration::ZERO, "shard", || {
+        with_retries(Duration::from_secs(60), Duration::ZERO, Duration::ZERO, "shard", || {
             calls += 1;
             if calls < 3 { anyhow::bail!("transient {calls}") } else { Ok(()) }
         })
         .unwrap();
         assert_eq!(calls, 3);
+        // pauses 10, 20, 30, 30, … ms within a 100 ms budget: the pauses
+        // after attempts 1..4 end at 10, 30, 60, 90 ms, the one after the
+        // 5th would end at 120 > 100 (4 when the sleeps overshoot)
         let mut calls = 0;
-        let e = with_attempts(2, std::time::Duration::ZERO, "shard", || {
+        let e = with_retries(ms(100), ms(10), ms(30), "shard", || {
             calls += 1;
             anyhow::bail!("down {calls}")
         })
         .unwrap_err();
-        assert_eq!(calls, 2);
-        assert!(format!("{e:#}").contains("down 2"), "{e:#}");
+        assert!((4..=5).contains(&calls), "{calls} attempts");
+        assert!(format!("{e:#}").contains(&format!("down {calls}")) && format!("{e:#}").contains("CMF_MOE_FETCH_WAIT"), "{e:#}");
+        // a zero budget: one attempt
+        let mut calls = 0;
+        assert!(with_retries(Duration::ZERO, ms(10), ms(10), "shard", || {
+            calls += 1;
+            anyhow::bail!("down")
+        })
+        .is_err());
+        assert_eq!(calls, 1);
     }
 
     /// Calibration windows: plain chunks without a BOS (Flash-Next, as
