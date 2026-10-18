@@ -1355,10 +1355,19 @@ fn mm_loop_2stage(
 }
 
 pub(super) fn mm_pipe(c: &Ctx, g: MmCfg) -> Option<Arc<wgpu::ComputePipeline>> {
+    // Per-config memo: the trainer asks for a pipeline per GEMM (thousands a
+    // step); the key and the WGSL text are built only on the first ask.
+    static MEMO: std::sync::OnceLock<Mutex<HashMap<MmCfg, Arc<wgpu::ComputePipeline>>>> = std::sync::OnceLock::new();
+    let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(p) = memo.lock().ok()?.get(&g) {
+        return Some(p.clone());
+    }
     if !g.valid() || g.shared_bytes() > c.device.limits().max_compute_workgroup_storage_size {
         return None;
     }
-    pipeline(c, &g.key(), &mm_src(g), "zi_mm")
+    let p = pipeline(c, &g.key(), &mm_src(g), "zi_mm")?;
+    memo.lock().ok()?.insert(g, p.clone());
+    Some(p)
 }
 
 /// Uniform of one `zi_mm` dispatch.

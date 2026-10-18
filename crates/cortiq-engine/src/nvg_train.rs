@@ -555,7 +555,12 @@ impl Work {
             add(&l.up);
             add(&l.down);
         }
-        let blr: HashMap<_, _> = dims.into_iter().map(|(role, (m, n, r, np))| (role, BlrScratch::new(c, ntok, m, n, r, np))).collect();
+        // one set of transient blr buffers for every role (one layer runs at a time)
+        let sh = {
+            let mx = |f: &dyn Fn(&(usize, usize, usize, usize)) -> usize| dims.values().map(f).max().unwrap_or(1).max(1);
+            tm::BlrShared::new(c, ntok, mx(&|d| d.0 * d.2), mx(&|d| d.1 * d.2), mx(&|d| d.0.max(d.1).max(d.2)), mx(&|d| d.0.max(d.1)), mx(&|d| d.2))
+        };
+        let blr: HashMap<_, _> = dims.into_iter().map(|(role, (m, _n, r, np))| (role, BlrScratch::with_shared(c, ntok, m, r, np, &sh))).collect();
         let tape = g.gdn_layer.iter().any(|&x| x).then(|| {
             let zeros = vec![0f32; g.nv];
             let conv = vec![0f32; g.c_dim() * g.kk];
