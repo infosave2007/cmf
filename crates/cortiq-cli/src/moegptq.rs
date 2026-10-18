@@ -424,54 +424,110 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     };
     let mut stats = (0usize, 0usize);
     let mut prefetch: Option<std::thread::JoinHandle<anyhow::Result<()>>> = None;
-    // In place, every layer is captured before the first one is rewritten:
-    // a later pass would otherwise run over experts already replaced.
-    let pass = if o.in_place { (range_hi - range_lo).max(1) } else { o.layers_per_pass.max(1) };
-    for lo in (range_lo..range_hi).step_by(pass) {
-        let hi = (lo + pass).min(range_hi);
+    let passes = plan_passes(range_lo, range_hi, o.layers_per_pass, o.in_place);
+    // CMF_MOE_CAPTURE_DIR: captured rows are saved per layer and reused by
+    // a later run on the same calibration tokens (another codec, a resume)
+    let has_w = family == Family::Dsv41;
+    let mut saved: Option<(PathBuf, CaptureMeta)> = match std::env::var_os("CMF_MOE_CAPTURE_DIR") {
+        Some(d) => {
+            let want = CaptureMeta {
+                token_hash: token_hash(&windows),
+                ntok,
+                window: o.window,
+                windows: windows.len(),
+                hidden,
+                top_k,
+                ne,
+                family: format!("{family:?}"),
+                calib_model: o.calib_model.to_string(),
+                calib_size: std::fs::metadata(o.calib_model).map(|m| m.len()).unwrap_or(0),
+                has_w,
+                layers: Vec::new(),
+            };
+            let dir = PathBuf::from(d);
+            let meta = capture_open(&dir, &want)?;
+            eprintln!(
+                "capture directory {}: {} of the layers {range_lo}..{range_hi} saved, {:.2} GB per layer",
+                dir.display(),
+                (range_lo..range_hi).filter(|li| meta.layers.contains(li)).count(),
+                meta.layer_bytes() as f64 / 1e9
+            );
+            Some((dir, meta))
+        }
+        None => None,
+    };
+    let is_saved = |saved: &Option<(PathBuf, CaptureMeta)>, lo: usize, hi: usize| saved.as_ref().is_some_and(|(_, m)| (lo..hi).all(|li| m.layers.contains(&li)));
+    // the calibration forward is needed up to the last pass not on disk
+    let last_forward = passes.iter().rposition(|&(lo, hi)| !is_saved(&saved, lo, hi));
+    if last_forward.is_none() {
+        eprintln!("every layer's capture is on disk: no calibration forward");
+        pipe = None;
+        cortiq_engine::gpu_wgpu::release_model_buffers(&cmodel);
+    }
+    for (pi, &(lo, hi)) in passes.iter().enumerate() {
         eprintln!(
             "  layers {lo}..{hi}: capture holds ~{:.1} GB of input rows",
-            ((hi - lo) * ntok * (hidden * 2 + top_k * 2)) as f64 / 1e9
+            ((hi - lo) * ntok * (hidden * 2 + top_k * 2 + if has_w { top_k * 4 } else { 0 })) as f64 / 1e9
         );
-        // ── capture ──
         let tc = Instant::now();
-        let nw = if family == Family::Dsv41 { ntok * top_k } else { 0 };
-        let mut rows: Vec<LayerRows> = (lo..hi).map(|_| LayerRows { x: Vec::with_capacity(ntok * hidden), picks: Vec::with_capacity(ntok * top_k), w: Vec::with_capacity(nw) }).collect();
-        {
-            let p = pipe.as_mut().expect("pipeline alive while layers remain");
-            for (wi, w) in windows.iter().enumerate() {
-                match family {
-                    Family::Qwen4 => {
-                        let cap = p.qwen4_capture(w, lo, hi).map_err(|e| anyhow::anyhow!("capture: {e}"))?;
-                        for (k, r) in cap.into_iter().enumerate() {
-                            qwen4_layer_rows(&r, hidden, ne, top_k, &mut rows[k]);
+        let rows: Vec<LayerRows> = if is_saved(&saved, lo, hi) {
+            let (dir, meta) = saved.as_ref().expect("saved");
+            let rows = (lo..hi).map(|li| capture_load_layer(dir, meta, li)).collect::<anyhow::Result<Vec<_>>>()?;
+            eprintln!("  layers {lo}..{hi}: loaded from {} in {:.0}s", dir.display(), tc.elapsed().as_secs_f64());
+            rows
+        } else {
+            // ── capture ──
+            let nw = if has_w { ntok * top_k } else { 0 };
+            let mut rows: Vec<LayerRows> = (lo..hi).map(|_| LayerRows { x: Vec::with_capacity(ntok * hidden), picks: Vec::with_capacity(ntok * top_k), w: Vec::with_capacity(nw) }).collect();
+            {
+                let p = pipe.as_mut().expect("pipeline alive while layers remain");
+                for (wi, w) in windows.iter().enumerate() {
+                    match family {
+                        Family::Qwen4 => {
+                            let cap = p.qwen4_capture(w, lo, hi).map_err(|e| anyhow::anyhow!("capture: {e}"))?;
+                            for (k, r) in cap.into_iter().enumerate() {
+                                qwen4_layer_rows(&r, hidden, ne, top_k, &mut rows[k]);
+                            }
+                        }
+                        Family::Dsv41 => {
+                            let cap = p.dsv41_moe_capture(w, lo, hi).map_err(|e| anyhow::anyhow!("capture: {e}"))?;
+                            for (k, ((x, pk), w)) in cap.x.into_iter().zip(cap.picks).zip(cap.w).enumerate() {
+                                rows[k].x.extend(x);
+                                rows[k].picks.extend(pk);
+                                rows[k].w.extend(w);
+                            }
                         }
                     }
-                    Family::Dsv41 => {
-                        let cap = p.dsv41_moe_capture(w, lo, hi).map_err(|e| anyhow::anyhow!("capture: {e}"))?;
-                        for (k, ((x, pk), w)) in cap.x.into_iter().zip(cap.picks).zip(cap.w).enumerate() {
-                            rows[k].x.extend(x);
-                            rows[k].picks.extend(pk);
-                            rows[k].w.extend(w);
-                        }
+                    eprint!(
+                        "\r  layers {lo}..{hi}: captured {}/{} windows  {:.1} tok/s   ",
+                        wi + 1,
+                        windows.len(),
+                        rows[0].x.len() as f64 / hidden as f64 / tc.elapsed().as_secs_f64()
+                    );
+                }
+            }
+            eprintln!();
+            if Some(pi) == last_forward {
+                // the last forward: the model's device state is not needed any
+                // more (its expert bank and cached weights live in the device
+                // context, keyed by the model, and outlive the pipeline unless
+                // released)
+                pipe = None;
+                cortiq_engine::gpu_wgpu::release_model_buffers(&cmodel);
+            }
+            if let Some((dir, meta)) = saved.as_mut() {
+                eprintln!("  layers {lo}..{hi}: saving the capture to {} ({:.1} GB)", dir.display(), ((hi - lo) as u64 * meta.layer_bytes()) as f64 / 1e9);
+                for (k, li) in (lo..hi).enumerate() {
+                    capture_save_layer(dir, meta, li, &rows[k])?;
+                    if !meta.layers.contains(&li) {
+                        meta.layers.push(li);
                     }
                 }
-                eprint!(
-                    "\r  layers {lo}..{hi}: captured {}/{} windows  {:.1} tok/s   ",
-                    wi + 1,
-                    windows.len(),
-                    rows[0].x.len() as f64 / hidden as f64 / tc.elapsed().as_secs_f64()
-                );
+                meta.layers.sort_unstable();
+                capture_save_meta(dir, meta)?;
             }
-        }
-        eprintln!();
-        if hi >= range_hi {
-            // the last pass: the model's device state is not needed any more
-            // (its expert bank and cached weights live in the device context,
-            // keyed by the model, and outlive the pipeline unless released)
-            pipe = None;
-            cortiq_engine::gpu_wgpu::release_model_buffers(&cmodel);
-        }
+            rows
+        };
         for li in lo..hi {
             let tl = Instant::now();
             let lr = &rows[li - lo];
@@ -1062,6 +1118,229 @@ fn qwen4_layer_rows(r: &[f32], hidden: usize, ne: usize, top_k: usize, out: &mut
         ord.select_nth_unstable_by(top_k - 1, |&a, &b| lg[b].partial_cmp(&lg[a]).unwrap_or(std::cmp::Ordering::Equal));
         out.picks.extend(ord[..top_k].iter().map(|&e| e as u16));
     }
+}
+
+/// The capture passes over layers `lo..hi`: `per` layers each, or one pass
+/// over the whole range in place (every layer is captured before the first
+/// is rewritten: a later pass would run over experts already replaced).
+fn plan_passes(lo: usize, hi: usize, per: usize, in_place: bool) -> Vec<(usize, usize)> {
+    let per = if in_place { (hi - lo).max(1) } else { per.max(1) };
+    (lo..hi).step_by(per).map(|a| (a, (a + per).min(hi))).collect()
+}
+
+// ── saved capture (CMF_MOE_CAPTURE_DIR) ──────────────────────────────────
+//
+// Per layer: `L{li}.x` (the f16 input rows, raw little-endian u16),
+// `L{li}.picks` (u16 expert ids), `L{li}.w` (f32 route weights, V4.1), and
+// one `meta.json`. Every file is written to a `.tmp` sibling and renamed;
+// `meta.json` lists a layer only after its files are complete.
+
+/// What a saved capture was taken from, and which layers it holds.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CaptureMeta {
+    /// SHA-256 of the calibration windows (each window's length, then its ids).
+    pub token_hash: String,
+    pub ntok: usize,
+    pub window: usize,
+    pub windows: usize,
+    pub hidden: usize,
+    pub top_k: usize,
+    pub ne: usize,
+    pub family: String,
+    pub calib_model: String,
+    pub calib_size: u64,
+    /// Route weights saved (`L{li}.w`).
+    pub has_w: bool,
+    pub layers: Vec<usize>,
+}
+
+const CAPTURE_FORMAT: &str = "cortiq-moe-capture-1";
+
+impl CaptureMeta {
+    /// Bytes one layer takes on disk.
+    pub(crate) fn layer_bytes(&self) -> u64 {
+        (self.ntok * (self.hidden * 2 + self.top_k * 2 + if self.has_w { self.top_k * 4 } else { 0 })) as u64
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "format": CAPTURE_FORMAT,
+            "token_hash": self.token_hash,
+            "ntok": self.ntok,
+            "window": self.window,
+            "windows": self.windows,
+            "hidden": self.hidden,
+            "top_k": self.top_k,
+            "ne": self.ne,
+            "family": self.family,
+            "calibration_model": self.calib_model,
+            "calibration_model_bytes": self.calib_size,
+            "route_weights": self.has_w,
+            "layers": self.layers,
+            "cortiq_version": env!("CARGO_PKG_VERSION"),
+        })
+    }
+
+    fn from_json(v: &serde_json::Value) -> anyhow::Result<Self> {
+        anyhow::ensure!(v["format"].as_str() == Some(CAPTURE_FORMAT), "format {:?}, want {CAPTURE_FORMAT}", v["format"]);
+        let us = |k: &str| v[k].as_u64().map(|x| x as usize).ok_or_else(|| anyhow::anyhow!("no {k}"));
+        let st = |k: &str| v[k].as_str().map(str::to_string).ok_or_else(|| anyhow::anyhow!("no {k}"));
+        Ok(Self {
+            token_hash: st("token_hash")?,
+            ntok: us("ntok")?,
+            window: us("window")?,
+            windows: us("windows")?,
+            hidden: us("hidden")?,
+            top_k: us("top_k")?,
+            ne: us("ne")?,
+            family: st("family")?,
+            calib_model: st("calibration_model")?,
+            calib_size: v["calibration_model_bytes"].as_u64().unwrap_or(0),
+            has_w: v["route_weights"].as_bool().unwrap_or(false),
+            layers: v["layers"].as_array().ok_or_else(|| anyhow::anyhow!("no layers"))?.iter().filter_map(|x| x.as_u64().map(|x| x as usize)).collect(),
+        })
+    }
+
+    /// Why this saved capture cannot serve a run described by `want` (the
+    /// layers aside); `None` if it can.
+    fn mismatch(&self, want: &CaptureMeta) -> Option<String> {
+        let mut why = Vec::new();
+        if self.token_hash != want.token_hash || self.ntok != want.ntok {
+            why.push(format!("calibration tokens differ ({} tokens in {} windows saved, {} in {} now)", self.ntok, self.windows, want.ntok, want.windows));
+        }
+        for (k, a, b) in [("hidden", self.hidden, want.hidden), ("top_k", self.top_k, want.top_k), ("experts", self.ne, want.ne)] {
+            if a != b {
+                why.push(format!("{k} {a} saved, {b} now"));
+            }
+        }
+        if self.family != want.family {
+            why.push(format!("family {} saved, {} now", self.family, want.family));
+        }
+        if want.has_w && !self.has_w {
+            why.push("no route weights saved".to_string());
+        }
+        (!why.is_empty()).then(|| why.join("; "))
+    }
+}
+
+/// SHA-256 of the calibration windows: each window's length (u32 LE), then
+/// its ids (u32 LE).
+pub(crate) fn token_hash(windows: &[Vec<u32>]) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    for w in windows {
+        h.update((w.len() as u32).to_le_bytes());
+        for &id in w {
+            h.update(id.to_le_bytes());
+        }
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The saved capture in `dir` for a run described by `want`: its meta (with
+/// the layers it holds), or `want` with no layers for a new directory. A
+/// capture of a different run is refused, never overwritten.
+pub(crate) fn capture_open(dir: &Path, want: &CaptureMeta) -> anyhow::Result<CaptureMeta> {
+    let mp = dir.join("meta.json");
+    if !mp.exists() {
+        std::fs::create_dir_all(dir).map_err(|e| anyhow::anyhow!("CMF_MOE_CAPTURE_DIR {}: {e}", dir.display()))?;
+        return Ok(CaptureMeta { layers: Vec::new(), ..want.clone() });
+    }
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&mp)?).map_err(|e| anyhow::anyhow!("{}: {e}", mp.display()))?;
+    let have = CaptureMeta::from_json(&v).map_err(|e| anyhow::anyhow!("{}: {e}", mp.display()))?;
+    if let Some(why) = have.mismatch(want) {
+        anyhow::bail!(
+            "CMF_MOE_CAPTURE_DIR {} holds the capture of another run ({why}); run with the same --calib/--tokens/--window, \
+             or point CMF_MOE_CAPTURE_DIR at an empty directory",
+            dir.display()
+        );
+    }
+    if (have.calib_model.as_str(), have.calib_size) != (want.calib_model.as_str(), want.calib_size) {
+        eprintln!(
+            "note: the saved capture was taken with {} ({} B), this run calibrates with {} ({} B); the same tokens, so it is reused",
+            have.calib_model, have.calib_size, want.calib_model, want.calib_size
+        );
+    }
+    Ok(have)
+}
+
+/// `path` written through a `.tmp` sibling and renamed into place.
+fn write_atomic(path: &Path, fill: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::io::Result<()>) -> anyhow::Result<()> {
+    let name = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = path.with_file_name(format!("{name}.tmp"));
+    {
+        let mut w = std::io::BufWriter::with_capacity(1 << 22, std::fs::File::create(&tmp).map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?);
+        fill(&mut w).map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?;
+        w.into_inner().map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?.sync_all()?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| anyhow::anyhow!("{} → {}: {e}", tmp.display(), path.display()))?;
+    Ok(())
+}
+
+/// Little-endian values in 1 MiB-element blocks.
+fn write_le<T: Copy, const N: usize>(w: &mut impl std::io::Write, v: &[T], le: impl Fn(T) -> [u8; N]) -> std::io::Result<()> {
+    let mut buf = Vec::with_capacity((1 << 20) * N);
+    for c in v.chunks(1 << 20) {
+        buf.clear();
+        buf.extend(c.iter().flat_map(|&x| le(x)));
+        w.write_all(&buf)?;
+    }
+    Ok(())
+}
+
+/// `n` little-endian values of `N` bytes from `path` (its size must match).
+fn read_le<T, const N: usize>(path: &Path, n: usize, from: impl Fn([u8; N]) -> T) -> anyhow::Result<Vec<T>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    let len = f.metadata()?.len();
+    anyhow::ensure!(len == (n * N) as u64, "{}: {len} B, want {} B (delete the layer's files to capture it again)", path.display(), n * N);
+    let mut out = Vec::with_capacity(n);
+    let mut buf = vec![0u8; (1 << 20) * N];
+    let mut left = n;
+    while left > 0 {
+        let k = left.min(1 << 20);
+        f.read_exact(&mut buf[..k * N])?;
+        out.extend(buf[..k * N].chunks_exact(N).map(|b| from(b.try_into().expect("N bytes"))));
+        left -= k;
+    }
+    Ok(out)
+}
+
+fn capture_path(dir: &Path, li: usize, ext: &str) -> PathBuf {
+    dir.join(format!("L{li}.{ext}"))
+}
+
+/// Save one layer's captured rows (`meta.json` is written separately).
+pub(crate) fn capture_save_layer(dir: &Path, meta: &CaptureMeta, li: usize, r: &LayerRows) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        r.x.len() == meta.ntok * meta.hidden && r.picks.len() == meta.ntok * meta.top_k && (!meta.has_w || r.w.len() == r.picks.len()),
+        "layer {li}: {} rows / {} picks / {} weights for {} tokens",
+        r.x.len() / meta.hidden.max(1),
+        r.picks.len(),
+        r.w.len(),
+        meta.ntok
+    );
+    write_atomic(&capture_path(dir, li, "x"), |w| write_le(w, &r.x, u16::to_le_bytes))?;
+    write_atomic(&capture_path(dir, li, "picks"), |w| write_le(w, &r.picks, u16::to_le_bytes))?;
+    if meta.has_w {
+        write_atomic(&capture_path(dir, li, "w"), |w| write_le(w, &r.w, f32::to_le_bytes))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn capture_save_meta(dir: &Path, meta: &CaptureMeta) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec_pretty(&meta.to_json())?;
+    write_atomic(&dir.join("meta.json"), |w| std::io::Write::write_all(w, &bytes))
+}
+
+/// One saved layer's rows.
+pub(crate) fn capture_load_layer(dir: &Path, meta: &CaptureMeta, li: usize) -> anyhow::Result<LayerRows> {
+    anyhow::ensure!(meta.layers.contains(&li), "layer {li} is not in the saved capture {}", dir.display());
+    Ok(LayerRows {
+        x: read_le(&capture_path(dir, li, "x"), meta.ntok * meta.hidden, u16::from_le_bytes)?,
+        picks: read_le(&capture_path(dir, li, "picks"), meta.ntok * meta.top_k, u16::from_le_bytes)?,
+        w: if meta.has_w { read_le(&capture_path(dir, li, "w"), meta.ntok * meta.top_k, f32::from_le_bytes)? } else { Vec::new() },
+    })
 }
 
 // ── output ───────────────────────────────────────────────────────────────
@@ -2096,6 +2375,84 @@ mod tests {
             got.sort_unstable();
             assert_eq!(got, want, "token {t}");
         }
+    }
+
+    /// The pass plan: `per` layers a pass, one pass in place.
+    #[test]
+    fn passes_cover_the_range() {
+        assert_eq!(plan_passes(0, 40, 24, false), vec![(0, 24), (24, 40)]);
+        assert_eq!(plan_passes(0, 40, 40, false), vec![(0, 40)]);
+        assert_eq!(plan_passes(20, 22, 24, false), vec![(20, 22)]);
+        assert_eq!(plan_passes(0, 40, 24, true), vec![(0, 40)]);
+        assert_eq!(plan_passes(3, 10, 0, false).len(), 7, "per 0 means one layer a pass");
+    }
+
+    /// A saved capture loads back bit for bit; a directory holding the
+    /// capture of another run (other tokens, other geometry) is refused,
+    /// and no temporary file is left behind.
+    #[test]
+    fn capture_dir_round_trip_and_refusal() {
+        let dir = std::env::temp_dir().join(format!("cortiq-moe-capture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut rng = Rng(41);
+        let windows: Vec<Vec<u32>> = (0..3).map(|k| (0..20u32).map(|i| i * 7 + k).collect()).collect();
+        let (hidden, top_k, ne) = (16usize, 2usize, 5usize);
+        let ntok = 60;
+        let want = CaptureMeta {
+            token_hash: token_hash(&windows),
+            ntok,
+            window: 20,
+            windows: 3,
+            hidden,
+            top_k,
+            ne,
+            family: "Dsv41".into(),
+            calib_model: "/pod/calib.cmf".into(),
+            calib_size: 123,
+            has_w: true,
+            layers: Vec::new(),
+        };
+        let mut meta = capture_open(&dir, &want).unwrap();
+        assert!(meta.layers.is_empty());
+        let mk = |rng: &mut Rng| LayerRows {
+            x: (0..ntok * hidden).map(|_| f32_to_f16(rng.normal())).collect(),
+            picks: (0..ntok * top_k).map(|_| (rng.next() % ne as u64) as u16).collect(),
+            w: (0..ntok * top_k).map(|_| rng.uni()).collect(),
+        };
+        let rows = [mk(&mut rng), mk(&mut rng)];
+        for (k, li) in [3usize, 4].into_iter().enumerate() {
+            capture_save_layer(&dir, &meta, li, &rows[k]).unwrap();
+            meta.layers.push(li);
+        }
+        capture_save_meta(&dir, &meta).unwrap();
+        assert_eq!(meta.layer_bytes(), (ntok * (hidden * 2 + top_k * 6)) as u64);
+        assert_eq!(std::fs::metadata(dir.join("L3.x")).unwrap().len(), (ntok * hidden * 2) as u64);
+        assert!(std::fs::read_dir(&dir).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+        // the same run (another calibration file path is only a note) loads it
+        let again = capture_open(&dir, &CaptureMeta { calib_model: "/elsewhere.cmf".into(), ..want.clone() }).unwrap();
+        assert_eq!(again.layers, vec![3, 4]);
+        for (k, li) in [3usize, 4].into_iter().enumerate() {
+            let got = capture_load_layer(&dir, &again, li).unwrap();
+            assert_eq!((got.x, got.picks), (rows[k].x.clone(), rows[k].picks.clone()), "layer {li}");
+            assert_eq!(got.w.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), rows[k].w.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        }
+        assert!(capture_load_layer(&dir, &again, 5).is_err(), "a layer not saved");
+        // another run is refused
+        let mut other = windows.clone();
+        other[1][5] += 1;
+        let e = capture_open(&dir, &CaptureMeta { token_hash: token_hash(&other), ..want.clone() }).unwrap_err().to_string();
+        assert!(e.contains("calibration tokens differ"), "{e}");
+        let e = capture_open(&dir, &CaptureMeta { hidden: 32, ..want.clone() }).unwrap_err().to_string();
+        assert!(e.contains("hidden 16 saved, 32 now"), "{e}");
+        let e = capture_open(&dir, &CaptureMeta { top_k: 3, ne: 6, ..want.clone() }).unwrap_err().to_string();
+        assert!(e.contains("top_k") && e.contains("experts"), "{e}");
+        // a truncated layer file is an error, not short rows
+        std::fs::write(dir.join("L4.picks"), [0u8; 10]).unwrap();
+        assert!(capture_load_layer(&dir, &again, 4).is_err());
+        // a window split differently is another run, even with the same ids
+        let flat: Vec<u32> = windows.concat();
+        assert_ne!(token_hash(&[flat]), token_hash(&windows));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A shard download is retried until it succeeds, and gives up with
