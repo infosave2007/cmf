@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.22] - 2026-10-18
+
+### Fixed
+- AMD RDNA1/RDNA2 GPUs (Navi 1x/2x, e.g. RX 6600M) on Windows: the process
+  exited without an error while compiling the cooperative-matrix GEMM
+  (#34). These cards have no matrix units, but recent drivers advertise
+  `VK_KHR_cooperative_matrix`; cortiq now leaves cooperative matrices off on
+  their device ids and logs it. `CMF_COOP=1` forces them on, `CMF_COOP=0`
+  still turns them off everywhere.
+
 ## [0.8.21] - 2026-10-18
 
 ### Added

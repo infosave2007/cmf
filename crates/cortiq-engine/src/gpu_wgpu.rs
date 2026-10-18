@@ -20166,6 +20166,29 @@ pub fn selected() -> bool {
     }
 }
 
+/// AMD RDNA1/RDNA2 (Navi 1x/2x: PCI ids 0x7310–0x73FF, and Navi 24 at
+/// 0x743F) have no matrix units; RDNA3 (0x744x, 0x747x, 0x748x) and newer do.
+fn amd_without_matrix_units(vendor: u32, device: u32) -> bool {
+    vendor == 0x1002 && ((0x7310..=0x73ff).contains(&device) || device == 0x743f)
+}
+
+#[cfg(test)]
+mod amd_matrix_unit_tests {
+    use super::amd_without_matrix_units;
+
+    #[test]
+    fn rdna1_rdna2_have_no_matrix_units() {
+        // RX 5700 XT (Navi 10), RX 6900 XT (Navi 21), RX 6600M (Navi 23, issue #34), RX 6500 XT (Navi 24)
+        for d in [0x731f, 0x73bf, 0x73ff, 0x743f] {
+            assert!(amd_without_matrix_units(0x1002, d), "{d:#x}");
+        }
+        // RX 7900 XTX (Navi 31), RX 7600 (Navi 33), Radeon 780M (Phoenix), and other vendors
+        for (v, d) in [(0x1002, 0x744c), (0x1002, 0x7480), (0x1002, 0x15bf), (0x10de, 0x73ff), (0x8086, 0x7310)] {
+            assert!(!amd_without_matrix_units(v, d), "{v:#x}:{d:#x}");
+        }
+    }
+}
+
 fn ctx() -> Option<&'static Ctx> {
     ctx_for(crate::gpu::current_device())
 }
@@ -20625,12 +20648,26 @@ fn init(dev: usize) -> Result<Ctx, String> {
             && c.ab_type == wgpu::CooperativeScalarType::F16
             && c.cr_type == wgpu::CooperativeScalarType::F32
     });
+    // AMD RDNA1/RDNA2 (Navi 1x/2x) have no matrix units, yet recent Windows
+    // drivers advertise VK_KHR_cooperative_matrix there; compiling the coop
+    // GEMM killed the process without an error on an RX 6600M (issue #34:
+    // the log ends in the q4tp-coop module, right before its pipeline).
+    // Off on those device ids unless CMF_COOP=1 forces it.
+    let coop_env = std::env::var("CMF_COOP").ok();
+    let amd_no_wmma = amd_without_matrix_units(adapter_info.vendor, adapter_info.device);
+    if amd_no_wmma && coop_shape && coop_env.as_deref() != Some("1") {
+        tracing::info!(
+            "cooperative matrices off on {} (AMD RDNA1/RDNA2, no matrix units); CMF_COOP=1 forces them",
+            adapter_info.name
+        );
+    }
     let want_coop = adapter
         .features()
         .contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
         && adapter.features().contains(wgpu::Features::SHADER_F16)
         && coop_shape
-        && std::env::var("CMF_COOP").map(|v| v != "0").unwrap_or(true);
+        && coop_env.as_deref() != Some("0")
+        && (!amd_no_wmma || coop_env.as_deref() == Some("1"));
     // Half precision, where the card has it: the matrix units take f16
     // operands, and without this the shader cannot even name the type.
     let want_f16 = adapter.features().contains(wgpu::Features::SHADER_F16);
