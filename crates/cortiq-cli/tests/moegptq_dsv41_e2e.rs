@@ -70,7 +70,21 @@ fn write_source(dir: &Path) {
 fn cortiq(args: &[&str], env: &[(&str, &str)]) -> (bool, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cortiq"));
     cmd.args(args).env("CMF_GPU", "0").env("CMF_MOE_WORKERS", "2");
-    for k in ["CMF_MOE_HOST", "CMF_MOE_DIAG", "CMF_MOE_RANGE", "CMF_MOE_PRIOR", "CMF_MOE_ROUTE_W", "CMF_MOE_CAPTURE_DIR", "CMF_MOE_NO_PUNCH", "CMF_MOE_STOP_AFTER", "CMF_MOE_HOLDOUT"] {
+    for k in [
+        "CMF_MOE_HOST",
+        "CMF_MOE_DIAG",
+        "CMF_MOE_RANGE",
+        "CMF_MOE_PRIOR",
+        "CMF_MOE_ROUTE_W",
+        "CMF_MOE_CAPTURE_DIR",
+        "CMF_MOE_CAPTURE_ONLY",
+        "CMF_MOE_CAPTURE_FORCE",
+        "CMF_MOE_NO_PUNCH",
+        "CMF_MOE_NO_SPACE_CHECK",
+        "CMF_MOE_STOP_AFTER",
+        "CMF_MOE_HOLDOUT",
+        "CMF_DSV41_O_FP8",
+    ] {
         cmd.env_remove(k);
     }
     cmd.envs(env.iter().copied());
@@ -139,6 +153,11 @@ fn quantize_moe_on_the_v41_fixture() {
     assert!(m1.verify().is_empty(), "{:?}", m1.verify());
     let prov = &m1.header.provenance.as_ref().unwrap()["gptq_moe"];
     assert_eq!((prov["prior"].as_f64(), prov["codec"].as_str()), (Some(64.0), Some("q2tp")));
+    // the provenance names the capture: its tokens, forward settings, binary
+    let cp = &prov["calibration_capture"];
+    assert_eq!(cp["token_hash"], meta["token_hash"]);
+    assert_eq!((cp["env"]["CMF_GPU"].as_str(), meta["env"]["CMF_GPU"].as_str()), (Some("0"), Some("0")));
+    assert!(cp["binary"].as_str().is_some_and(|b| b.contains("cortiq")), "{cp}");
     let gate = m1.tensor("model.layers.0.mlp.experts.0.gate_proj.weight").unwrap();
     assert_eq!(gate.dtype, cortiq_core::types::TensorDtype::Q2TiledP);
 
@@ -167,6 +186,11 @@ fn quantize_moe_on_the_v41_fixture() {
     // 3: other tokens: the saved capture is refused, never overwritten
     let (ok, err) = cortiq(&args(&base(&root.join("x.cmf"), "120")), &[host, capdir]);
     assert!(!ok && err.contains("holds the capture of another run") && err.contains("calibration tokens differ"), "{err}");
+    // the same tokens with another forward setting (the reference
+    // act_quant(o)): refused unless forced
+    let (ok, err) = cortiq(&args(&base(&root.join("x.cmf"), "100")), &[host, capdir, ("CMF_DSV41_O_FP8", "1")]);
+    assert!(!ok && err.contains("CMF_DSV41_O_FP8 unset saved, \"1\" now") && err.contains("CMF_MOE_CAPTURE_FORCE=1"), "{err}");
+    assert!(!root.join("x.cmf").exists(), "refused before the output is opened");
 
     // 4: DIAG with both down Hessians on two layers, from the saved capture
     let ad: Vec<String> = base(Path::new("/dev/null"), "100").into_iter().chain(["--min-rows".into(), "8".into()]).collect();
@@ -192,7 +216,12 @@ fn quantize_moe_on_the_v41_fixture() {
         assert!(!ok && err.contains("CMF_MOE_NO_PUNCH=1"), "{err}");
     }
     let before = std::fs::read(&inplace).unwrap();
+    // the capture was taken from the original file: another calibration
+    // file path is refused unless forced (the copy holds the same bytes)
     let (ok, err) = cortiq(&args(&a2), &[host, capdir, ("CMF_MOE_NO_PUNCH", "1")]);
+    assert!(!ok && err.contains("captured differently") && err.contains("calibration file"), "{err}");
+    assert_eq!(std::fs::read(&inplace).unwrap(), before, "refused before anything is written");
+    let (ok, err) = cortiq(&args(&a2), &[host, capdir, ("CMF_MOE_NO_PUNCH", "1"), ("CMF_MOE_CAPTURE_FORCE", "1")]);
     assert!(ok, "q2tp in place failed:\n{err}");
     assert!(err.contains("no calibration forward"), "{err}");
     let mi = cortiq_core::CmfModel::open(&inplace).unwrap();

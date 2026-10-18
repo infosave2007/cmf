@@ -441,24 +441,36 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     // CMF_MOE_CAPTURE_DIR: captured rows are saved per layer and reused by
     // a later run on the same calibration tokens (another codec, a resume)
     let has_w = family == Family::Dsv41;
+    // what this run's calibration forward is: its tokens, the calibration
+    // file, the settings and the binary that run it
+    let this_capture = CaptureMeta {
+        token_hash: token_hash(&windows),
+        ntok,
+        window: o.window,
+        windows: windows.len(),
+        hidden,
+        top_k,
+        ne,
+        family: format!("{family:?}"),
+        calib_model: std::fs::canonicalize(o.calib_model).map(|p| p.display().to_string()).unwrap_or_else(|_| o.calib_model.to_string()),
+        calib_size: std::fs::metadata(o.calib_model).map(|m| m.len()).unwrap_or(0),
+        has_w,
+        env: capture_env(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        binary: binary_id(),
+        layers: Vec::new(),
+    };
+    let mut capture_prov = this_capture.provenance();
     let mut saved: Option<(PathBuf, CaptureMeta)> = match std::env::var_os("CMF_MOE_CAPTURE_DIR") {
         Some(d) => {
-            let want = CaptureMeta {
-                token_hash: token_hash(&windows),
-                ntok,
-                window: o.window,
-                windows: windows.len(),
-                hidden,
-                top_k,
-                ne,
-                family: format!("{family:?}"),
-                calib_model: o.calib_model.to_string(),
-                calib_size: std::fs::metadata(o.calib_model).map(|m| m.len()).unwrap_or(0),
-                has_w,
-                layers: Vec::new(),
-            };
             let dir = PathBuf::from(d);
-            let meta = capture_open(&dir, &want)?;
+            let force = std::env::var("CMF_MOE_CAPTURE_FORCE").is_ok_and(|v| v != "0");
+            let (meta, despite) = capture_open(&dir, &this_capture, force)?;
+            capture_prov = meta.provenance();
+            capture_prov["dir"] = serde_json::json!(dir.display().to_string());
+            if !despite.is_empty() {
+                capture_prov["reused_despite"] = serde_json::json!(despite);
+            }
             eprintln!(
                 "capture directory {}: {} of the layers {range_lo}..{range_hi} saved, {:.2} GB per layer",
                 dir.display(),
@@ -697,6 +709,7 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
         "experts_gptq": stats.0,
         "experts_rtn": stats.1,
         "min_rows": o.min_rows,
+        "calibration_capture": capture_prov,
     });
     sink.finish(&cmodel, &expert_slots, codec, prov_info, o.output, t0)
 }
@@ -1387,14 +1400,42 @@ pub(crate) struct CaptureMeta {
     pub top_k: usize,
     pub ne: usize,
     pub family: String,
+    /// The calibration file (canonical path) and its length.
     pub calib_model: String,
     pub calib_size: u64,
     /// Route weights saved (`L{li}.w`).
     pub has_w: bool,
+    /// The `CMF_*` settings of the capturing process (`CMF_MOE_*` aside);
+    /// the ones in `FORWARD_ENV` must match for a reuse.
+    pub env: std::collections::BTreeMap<String, String>,
+    /// cortiq version and the binary (path, size, mtime) that captured.
+    pub version: String,
+    pub binary: String,
     pub layers: Vec<usize>,
 }
 
 const CAPTURE_FORMAT: &str = "cortiq-moe-capture-1";
+
+/// Settings that change the rows a calibration forward produces: the
+/// backend, and the V4.1 forward's switches (`CMF_DSV41_O_FP8` is the
+/// reference `act_quant(o)`, which also forces the CPU attention tail).
+const FORWARD_ENV: &[&str] = &["CMF_GPU", "CMF_GPU_PROBE", "CMF_DSV41_O_FP8", "CMF_DSV41_GPU_ATTN", "CMF_DSV41_DYNAMIC_MOE", "CMF_DSV41_FUSED_Q", "CMF_DSV41_TAIL_TAP"];
+
+/// The `CMF_*` environment of this process, `CMF_MOE_*` aside.
+fn capture_env() -> std::collections::BTreeMap<String, String> {
+    std::env::vars().filter(|(k, _)| k.starts_with("CMF_") && !k.starts_with("CMF_MOE_")).collect()
+}
+
+/// This binary: its path, size and modification time (seconds since 1970).
+fn binary_id() -> String {
+    let Ok(exe) = std::env::current_exe() else {
+        return String::new();
+    };
+    let m = std::fs::metadata(&exe).ok();
+    let len = m.as_ref().map_or(0, |m| m.len());
+    let mtime = m.and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+    format!("{} ({len} B, mtime {mtime})", exe.display())
+}
 
 impl CaptureMeta {
     /// Bytes one layer takes on disk.
@@ -1416,8 +1457,10 @@ impl CaptureMeta {
             "calibration_model": self.calib_model,
             "calibration_model_bytes": self.calib_size,
             "route_weights": self.has_w,
+            "env": self.env,
+            "cortiq_version": self.version,
+            "binary": self.binary,
             "layers": self.layers,
-            "cortiq_version": env!("CARGO_PKG_VERSION"),
         })
     }
 
@@ -1437,29 +1480,61 @@ impl CaptureMeta {
             calib_model: st("calibration_model")?,
             calib_size: v["calibration_model_bytes"].as_u64().unwrap_or(0),
             has_w: v["route_weights"].as_bool().unwrap_or(false),
+            // a capture written before these were recorded: unknown, which
+            // differs from any run's (a reuse then needs CMF_MOE_CAPTURE_FORCE)
+            env: v["env"].as_object().map(|m| m.iter().filter_map(|(k, x)| Some((k.clone(), x.as_str()?.to_string()))).collect()).unwrap_or_default(),
+            version: v["cortiq_version"].as_str().unwrap_or("").to_string(),
+            binary: v["binary"].as_str().unwrap_or("").to_string(),
             layers: v["layers"].as_array().ok_or_else(|| anyhow::anyhow!("no layers"))?.iter().filter_map(|x| x.as_u64().map(|x| x as usize)).collect(),
         })
     }
 
+    /// What the output provenance says about the capture its Hessians come
+    /// from (the layers aside).
+    fn provenance(&self) -> serde_json::Value {
+        let mut v = self.to_json();
+        if let Some(m) = v.as_object_mut() {
+            m.remove("format");
+            m.remove("layers");
+        }
+        v
+    }
+
     /// Why this saved capture cannot serve a run described by `want` (the
-    /// layers aside); `None` if it can.
-    fn mismatch(&self, want: &CaptureMeta) -> Option<String> {
-        let mut why = Vec::new();
+    /// layers aside): `hard`, another calibration set (tokens, geometry,
+    /// family), never reused; `soft`, the same tokens taken from another
+    /// calibration file, by another cortiq version or with other forward
+    /// settings, reused only with `CMF_MOE_CAPTURE_FORCE=1`.
+    fn mismatch(&self, want: &CaptureMeta) -> (Vec<String>, Vec<String>) {
+        let mut hard = Vec::new();
         if self.token_hash != want.token_hash || self.ntok != want.ntok {
-            why.push(format!("calibration tokens differ ({} tokens in {} windows saved, {} in {} now)", self.ntok, self.windows, want.ntok, want.windows));
+            hard.push(format!("calibration tokens differ ({} tokens in {} windows saved, {} in {} now)", self.ntok, self.windows, want.ntok, want.windows));
         }
         for (k, a, b) in [("hidden", self.hidden, want.hidden), ("top_k", self.top_k, want.top_k), ("experts", self.ne, want.ne)] {
             if a != b {
-                why.push(format!("{k} {a} saved, {b} now"));
+                hard.push(format!("{k} {a} saved, {b} now"));
             }
         }
         if self.family != want.family {
-            why.push(format!("family {} saved, {} now", self.family, want.family));
+            hard.push(format!("family {} saved, {} now", self.family, want.family));
         }
         if want.has_w && !self.has_w {
-            why.push("no route weights saved".to_string());
+            hard.push("no route weights saved".to_string());
         }
-        (!why.is_empty()).then(|| why.join("; "))
+        let mut soft = Vec::new();
+        if (self.calib_model.as_str(), self.calib_size) != (want.calib_model.as_str(), want.calib_size) {
+            soft.push(format!("calibration file {} ({} B) saved, {} ({} B) now", self.calib_model, self.calib_size, want.calib_model, want.calib_size));
+        }
+        if self.version != want.version {
+            soft.push(format!("cortiq {:?} saved, {:?} now", self.version, want.version));
+        }
+        let shown = |m: &std::collections::BTreeMap<String, String>, k: &str| m.get(k).map_or("unset".to_string(), |v| format!("{v:?}"));
+        for &k in FORWARD_ENV {
+            if self.env.get(k) != want.env.get(k) {
+                soft.push(format!("{k} {} saved, {} now", shown(&self.env, k), shown(&want.env, k)));
+            }
+        }
+        (hard, soft)
     }
 }
 
@@ -1478,30 +1553,42 @@ pub(crate) fn token_hash(windows: &[Vec<u32>]) -> String {
 }
 
 /// The saved capture in `dir` for a run described by `want`: its meta (with
-/// the layers it holds), or `want` with no layers for a new directory. A
-/// capture of a different run is refused, never overwritten.
-pub(crate) fn capture_open(dir: &Path, want: &CaptureMeta) -> anyhow::Result<CaptureMeta> {
+/// the layers it holds), or `want` with no layers for a new directory, and
+/// the differences a `force` reuse went past. A capture of other tokens is
+/// refused, never overwritten; one from another calibration file, cortiq
+/// version or forward setting is refused unless `force`.
+pub(crate) fn capture_open(dir: &Path, want: &CaptureMeta, force: bool) -> anyhow::Result<(CaptureMeta, Vec<String>)> {
     let mp = dir.join("meta.json");
     if !mp.exists() {
         std::fs::create_dir_all(dir).map_err(|e| anyhow::anyhow!("CMF_MOE_CAPTURE_DIR {}: {e}", dir.display()))?;
-        return Ok(CaptureMeta { layers: Vec::new(), ..want.clone() });
+        return Ok((CaptureMeta { layers: Vec::new(), ..want.clone() }, Vec::new()));
     }
     let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&mp)?).map_err(|e| anyhow::anyhow!("{}: {e}", mp.display()))?;
     let have = CaptureMeta::from_json(&v).map_err(|e| anyhow::anyhow!("{}: {e}", mp.display()))?;
-    if let Some(why) = have.mismatch(want) {
+    let (hard, soft) = have.mismatch(want);
+    if !hard.is_empty() {
         anyhow::bail!(
-            "CMF_MOE_CAPTURE_DIR {} holds the capture of another run ({why}); run with the same --calib/--tokens/--window, \
+            "CMF_MOE_CAPTURE_DIR {} holds the capture of another run ({}); run with the same --calib/--tokens/--window, \
              or point CMF_MOE_CAPTURE_DIR at an empty directory",
-            dir.display()
+            dir.display(),
+            hard.join("; ")
         );
     }
-    if (have.calib_model.as_str(), have.calib_size) != (want.calib_model.as_str(), want.calib_size) {
-        eprintln!(
-            "note: the saved capture was taken with {} ({} B), this run calibrates with {} ({} B); the same tokens, so it is reused",
-            have.calib_model, have.calib_size, want.calib_model, want.calib_size
-        );
+    if !soft.is_empty() {
+        if !force {
+            anyhow::bail!(
+                "CMF_MOE_CAPTURE_DIR {} holds these tokens, but captured differently ({}); set CMF_MOE_CAPTURE_FORCE=1 to reuse it anyway, \
+                 or point CMF_MOE_CAPTURE_DIR at an empty directory",
+                dir.display(),
+                soft.join("; ")
+            );
+        }
+        eprintln!("CMF_MOE_CAPTURE_FORCE=1: the saved capture is reused although {}", soft.join("; "));
     }
-    Ok(have)
+    if have.binary != want.binary {
+        eprintln!("note: the saved capture was taken by {}, this is {}", have.binary, want.binary);
+    }
+    Ok((have, soft))
 }
 
 /// `path` written through a `.tmp` sibling and renamed into place.
@@ -2704,10 +2791,13 @@ mod tests {
             calib_model: "/pod/calib.cmf".into(),
             calib_size: 123,
             has_w: true,
+            env: [("CMF_DSV41_PROF".to_string(), "1".to_string())].into_iter().collect(),
+            version: "0.8.23".into(),
+            binary: "/pod/cortiq (1 B, mtime 1)".into(),
             layers: Vec::new(),
         };
-        let mut meta = capture_open(&dir, &want).unwrap();
-        assert!(meta.layers.is_empty());
+        let (mut meta, despite) = capture_open(&dir, &want, false).unwrap();
+        assert!(meta.layers.is_empty() && despite.is_empty());
         let mk = |rng: &mut Rng| LayerRows {
             x: (0..ntok * hidden).map(|_| f32_to_f16(rng.normal())).collect(),
             picks: (0..ntok * top_k).map(|_| (rng.next() % ne as u64) as u16).collect(),
@@ -2722,9 +2812,28 @@ mod tests {
         assert_eq!(meta.layer_bytes(), (ntok * (hidden * 2 + top_k * 6)) as u64);
         assert_eq!(std::fs::metadata(dir.join("L3.x")).unwrap().len(), (ntok * hidden * 2) as u64);
         assert!(std::fs::read_dir(&dir).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
-        // the same run (another calibration file path is only a note) loads it
-        let again = capture_open(&dir, &CaptureMeta { calib_model: "/elsewhere.cmf".into(), ..want.clone() }).unwrap();
-        assert_eq!(again.layers, vec![3, 4]);
+        // the meta records the forward settings, version and binary
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json")).unwrap()).unwrap();
+        assert_eq!((v["env"]["CMF_DSV41_PROF"].as_str(), v["cortiq_version"].as_str()), (Some("1"), Some("0.8.23")));
+        // the same run loads it; another binary is a note, and so is a
+        // setting that does not change the forward
+        let (again, despite) = capture_open(&dir, &CaptureMeta { binary: "/elsewhere/cortiq (2 B, mtime 2)".into(), env: Default::default(), ..want.clone() }, false).unwrap();
+        assert_eq!((again.layers.clone(), despite.len()), (vec![3, 4], 0));
+        assert_eq!(again.provenance()["token_hash"], serde_json::json!(want.token_hash));
+        // the same tokens from another calibration file, by another version
+        // or with another forward setting: refused unless forced
+        let o_fp8 = CaptureMeta { env: [("CMF_DSV41_O_FP8".to_string(), "1".to_string())].into_iter().collect(), ..want.clone() };
+        for (other, what) in [
+            (CaptureMeta { calib_model: "/elsewhere.cmf".into(), ..want.clone() }, "calibration file /pod/calib.cmf (123 B) saved, /elsewhere.cmf (123 B) now"),
+            (CaptureMeta { calib_size: 124, ..want.clone() }, "calibration file"),
+            (CaptureMeta { version: "0.8.24".into(), ..want.clone() }, "cortiq \"0.8.23\" saved, \"0.8.24\" now"),
+            (o_fp8, "CMF_DSV41_O_FP8 unset saved, \"1\" now"),
+        ] {
+            let e = capture_open(&dir, &other, false).unwrap_err().to_string();
+            assert!(e.contains(what) && e.contains("CMF_MOE_CAPTURE_FORCE=1"), "{e}");
+            let (forced, despite) = capture_open(&dir, &other, true).unwrap();
+            assert_eq!((forced.layers, despite.len()), (vec![3, 4], 1));
+        }
         for (k, li) in [3usize, 4].into_iter().enumerate() {
             let got = capture_load_layer(&dir, &again, li).unwrap();
             assert_eq!((got.x, got.picks), (rows[k].x.clone(), rows[k].picks.clone()), "layer {li}");
@@ -2734,11 +2843,12 @@ mod tests {
         // another run is refused
         let mut other = windows.clone();
         other[1][5] += 1;
-        let e = capture_open(&dir, &CaptureMeta { token_hash: token_hash(&other), ..want.clone() }).unwrap_err().to_string();
+        // (CMF_MOE_CAPTURE_FORCE does not cover other tokens or geometry)
+        let e = capture_open(&dir, &CaptureMeta { token_hash: token_hash(&other), ..want.clone() }, true).unwrap_err().to_string();
         assert!(e.contains("calibration tokens differ"), "{e}");
-        let e = capture_open(&dir, &CaptureMeta { hidden: 32, ..want.clone() }).unwrap_err().to_string();
+        let e = capture_open(&dir, &CaptureMeta { hidden: 32, ..want.clone() }, true).unwrap_err().to_string();
         assert!(e.contains("hidden 16 saved, 32 now"), "{e}");
-        let e = capture_open(&dir, &CaptureMeta { top_k: 3, ne: 6, ..want.clone() }).unwrap_err().to_string();
+        let e = capture_open(&dir, &CaptureMeta { top_k: 3, ne: 6, ..want.clone() }, false).unwrap_err().to_string();
         assert!(e.contains("top_k") && e.contains("experts"), "{e}");
         // a truncated layer file is an error, not short rows
         std::fs::write(dir.join("L4.picks"), [0u8; 10]).unwrap();
