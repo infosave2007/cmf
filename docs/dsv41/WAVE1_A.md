@@ -166,3 +166,55 @@ repr (`None`, `True`, `{'a': 1}`); OpenAI tool messages carry strings or
 block lists, so this was left alone. The V4.1-Flash repo also gained a chat
 template (`2cba9e42`, 2026-10-01) which cortiq does not use (it encodes with
 this port).
+
+## Part 4: act_quant(o) before the grouped wo_a (CMF_DSV41_O_FP8)
+
+Reference `4dd75a8b`: `o.view(groups, -1)`, then `act_quant(o, 32, "ue8m0",
+float8_e8m0fnu, inplace=True)`, then the BF16 `einsum` with `wo_a`. cortiq:
+`CMF_DSV41_O_FP8=1` (default off) applies `quantize_attention_output` on
+the CPU attention tail after the inverse RoPE and BF16 boundary, before
+`o_project`. The group width (release 64*512/8 = 4096, fixture 64) is a
+multiple of 32, so the per-group 32-blocks are contiguous runs of the flat
+output. With the flag set the device attention tail is skipped (it has no
+quantizer), so the flag means reference semantics on every backend, at CPU
+attention speed.
+
+`fp8_activation_inplace` (also the window-KV quantizer) now computes the
+scale exactly as the kernel: `amax * f32(1/448)` and the bit-level
+`fast_log2_ceil`/`fast_pow2` instead of `(amax/448).log2().ceil()`. For BF16
+inputs (everything the runtime feeds it) the two are identical, since amax/448
+cannot land within an f32 rounding of a power of two unless it is one; the
+fixture logits did not move. The old form picks the smaller scale for an
+amax one f32 ulp above 448*2^k, which the new unit test shows (a value at
+1.5 subnormal quanta rounds differently).
+
+Tests: `fp8_activation_matches_kernel_act_quant` compares bit for bit with an
+independent f64 implementation of the kernel (2000 random BF16 blocks over
+2^-30..2^9, all-zero block with the 1e-4 floor, signed zeros, exact 448*2^k
+maxima, the f32-ulp-above case, subnormal grid, nearest-even ties 17->16,
+19->20, 3.5 quanta->4); `attention_output_quantizes_per_32_block`; and a
+separate binary `tests/dsv41_fixture_o_fp8.rs` (the switch is read once per
+process): strict CPU with the flag matches the reference with `act_quant(o)`
+at 12/12 positions (worst 1.2e-7) and differs from the reference without it
+by 8.0e-2.
+
+GPU path, not built (per task): the DSV4 attention frame
+(`gpu_wgpu::dsv4_attn_frame`) runs `encode_sparse_attend2` ->
+`encode_rope_heads(inverse)` -> `encode_bf16_round(attn)` (cache key 40) ->
+`o_lora_a`. A kernel `fp8_act_quant32` belongs between the BF16 round and
+`o_lora_a`, in place on `attn` (`nh*hd` floats): one 32-lane group per
+32-value block (subgroup or workgroup reduction), `amax = max(|x|, 1e-4)`,
+`t = amax * 0.002232142857` as f32, `e = ((bits(t) >> 23) & 0xff) - 127 +
+(mantissa(t) != 0)`, `s = bitcast<f32>((e + 127) << 23)`; per value
+`v = clamp(x / s, -448, 448)` rounded to E4M3FN nearest-even in integer
+arithmetic on the f32 bits (normal: keep 3 mantissa bits with RNE carry;
+below 2^-6: round `v * 512` to an integer, ties to even), times `s`, then a
+BF16 round (exact, but keep the boundary). WGSL has no FP8 type and the
+repo has no device E4M3 helper yet; the host `e4m3_round` is the oracle,
+and `CMF_DSV41_TAIL_TAP=attn/mid` already prints both sides of that
+boundary for a parity check. Fusing it into the inverse-RoPE kernel (which
+already owns `attn`) needs a 32-element block per lane group instead of the
+per-head rotation stride, so a separate dispatch is simpler. Until then
+`CMF_DSV41_O_FP8=1` forces the CPU attention tail. The upstream DSpark
+attention has the same `act_quant(o)`; cortiq's V4.1 runtime has no DSpark
+head, so nothing to change there.

@@ -1846,14 +1846,51 @@ fn fp4_inplace(v: &mut [f32], block: usize, e8m0_scale_fmt: bool) {
     }
 }
 
+/// `fast_log2_ceil` of the reference kernels: the biased exponent plus one
+/// when any mantissa bit is set. Exact for normal inputs, unlike a rounded
+/// `log2().ceil()` just above a power of two.
+#[inline]
+fn fast_log2_ceil(x: f32) -> i32 {
+    let bits = x.to_bits();
+    ((bits >> 23) & 0xff) as i32 - 127 + i32::from(bits & 0x7f_ffff != 0)
+}
+
+/// `act_quant(x, 32, "ue8m0", float8_e8m0fnu, inplace=True)`: per 32-value
+/// block, `s = 2^ceil(log2(max(amax, 1e-4) / 448))` (the kernel multiplies by
+/// the f32 constant 1/448), values quantized to E4M3FN (nearest-even,
+/// saturating) and dequantized, stored as BF16.
 fn fp8_activation_inplace(v: &mut [f32]) {
+    const FP8_MAX_INV: f32 = 1.0 / 448.0;
     for chunk in v.chunks_mut(32) {
-        let max = chunk.iter().map(|x| x.abs()).fold(1e-4f32, f32::max);
-        let scale = 2.0f32.powf((max / 448.0).log2().ceil());
+        let amax = chunk.iter().map(|x| x.abs()).fold(1e-4f32, f32::max);
+        let scale = f32::from_bits(((fast_log2_ceil(amax * FP8_MAX_INV) + 127) as u32) << 23);
         for x in chunk {
             *x = bf16_roundtrip(e4m3_round((*x / scale).clamp(-448.0, 448.0)) * scale);
         }
     }
+}
+
+/// `CMF_DSV41_O_FP8=1`: quantize the attention output to FP8 (E4M3, 32-value
+/// blocks, power-of-two scales) before the grouped `wo_a`, as the reference
+/// does since commit 4dd75a8b (`act_quant(o, ...)` before the einsum). Off
+/// by default until a run on the released weights shows its effect. The
+/// device attention tail has no such quantizer yet, so the flag keeps V4.1
+/// attention on the CPU tail.
+fn v41_o_fp8_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_DSV41_O_FP8").is_ok_and(|value| value == "1"))
+}
+
+/// The attention output boundary before `wo_a`: the reference views `o` as
+/// `[groups, n_heads*head_dim/groups]` and quantizes the last axis in blocks
+/// of 32, so with a 32-multiple group width the blocks are contiguous runs
+/// of the flat output.
+fn quantize_attention_output(attended: &mut [f32], o_groups: usize) {
+    debug_assert!(
+        attended.len() % o_groups.max(1) == 0 && (attended.len() / o_groups.max(1)) % 32 == 0,
+        "act_quant(o) needs a 32-multiple group width"
+    );
+    fp8_activation_inplace(attended);
 }
 
 struct IndexResult {
@@ -2185,7 +2222,7 @@ fn attention(
     // current bounded window plus the selected compressed rows; no
     // whole-history upload or clone is created here.
     #[cfg(feature = "gpu")]
-    if gpu_attention_tail_enabled() {
+    if gpu_attention_tail_enabled() && !v41_o_fp8_enabled() {
         let n_comp = selected_comp_positions.len();
         let cache_cap = (cfg.window + n_comp.next_power_of_two().max(64)) * cfg.head_dim;
         let cache_ok =
@@ -2331,6 +2368,9 @@ fn attention(
             true,
         );
         bf16_inplace(&mut attended[h * cfg.head_dim..(h + 1) * cfg.head_dim]);
+    }
+    if v41_o_fp8_enabled() {
+        quantize_attention_output(&mut attended, cfg.o_groups);
     }
     trace_stats("attended", st.pos, Some(li), &attended);
     if gpu_tail_tap().is_some_and(|tap| tap == "mid") {
@@ -3674,6 +3714,115 @@ mod tests {
         }
         // The old (1 + e^x).ln() form returned exactly zero here.
         assert_eq!((1.0f32 + (-30.0f32).exp()).ln(), 0.0);
+    }
+
+    /// kernel.py `act_quant(..., inplace=True)` written out independently:
+    /// f64 arithmetic, an explicit E4M3FN grid with nearest-even ties, and
+    /// the bit-level `fast_log2_ceil`/`fast_pow2` scale.
+    fn act_quant_reference(block: &[f32]) -> Vec<f32> {
+        let amax = block.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-4);
+        let t = amax * (1.0f32 / 448.0);
+        let bits = t.to_bits();
+        let e = ((bits >> 23) & 0xff) as i32 - 127 + i32::from(bits & 0x7f_ffff != 0);
+        let s = 2f64.powi(e);
+        block
+            .iter()
+            .map(|&x| {
+                let v = (x as f64 / s).clamp(-448.0, 448.0);
+                let a = v.abs();
+                let q = if a == 0.0 {
+                    0.0
+                } else {
+                    let quantum = if a < 2f64.powi(-6) {
+                        2f64.powi(-9)
+                    } else {
+                        2f64.powi(((a.to_bits() >> 52) & 0x7ff) as i32 - 1023 - 3)
+                    };
+                    let n = a / quantum;
+                    let f = n.floor();
+                    let r = if n - f > 0.5 || (n - f == 0.5 && f % 2.0 != 0.0) {
+                        f + 1.0
+                    } else {
+                        f
+                    };
+                    (r * quantum).min(448.0)
+                };
+                let y = if v < 0.0 { -q } else { q } * s;
+                // `T.Cast(bf16, ...)`: the product is BF16-exact already.
+                assert_eq!(y as f32 as f64, y);
+                y as f32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fp8_activation_matches_kernel_act_quant() {
+        let mut state = 0x5EED_u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let mut blocks: Vec<Vec<f32>> = Vec::new();
+        // Random BF16 blocks over a wide dynamic range.
+        for _ in 0..2000 {
+            let exp = (next() % 40) as i32 - 30;
+            blocks.push(
+                (0..32)
+                    .map(|_| {
+                        let m = (next() % 65536) as f32 / 32768.0 - 1.0;
+                        bf16_roundtrip(m * 2f32.powi(exp))
+                    })
+                    .collect(),
+            );
+        }
+        // Edge blocks: all zeros (the 1e-4 amax floor), a signed zero, an
+        // exact 448*2^k maximum (scale boundary), a maximum one f32 ulp above
+        // it (where a rounded log2 picks the smaller scale), tiny values on
+        // the E4M3 subnormal grid, and exact nearest-even ties.
+        blocks.push(vec![0.0; 32]);
+        let mut b = vec![-0.0f32; 32];
+        b[3] = 1e-6;
+        blocks.push(b);
+        let mut b = vec![1.0f32; 32];
+        b[0] = 448.0 * 2f32.powi(-3);
+        blocks.push(b);
+        let mut b = vec![0.3f32; 32];
+        b[5] = f32::from_bits((448.0f32 * 2f32.powi(-10)).to_bits() + 1);
+        // 1.5 subnormal quanta at the correct scale 2^-9 (tie -> 2), but an
+        // exact 3 quanta at the 2^-10 a rounded log2 would choose.
+        b[7] = 3.0 * 2f32.powi(-19);
+        blocks.push(b);
+        let mut b: Vec<f32> = (0..32).map(|i| i as f32 * 2f32.powi(-17)).collect();
+        b[31] = 448.0 * 2f32.powi(-8);
+        blocks.push(b);
+        // With s = 1 (amax 448 / 2^0): 17 lies between 16 and 18 (tie ->
+        // 16), 19 between 18 and 20 (tie -> 20), 0.0068359375 = 3.5*2^-9.
+        let mut b = vec![17.0f32, 19.0, -17.0, 0.0068359375, 300.0, 448.0];
+        b.resize(32, 1.0);
+        blocks.push(b);
+        for (i, block) in blocks.iter().enumerate() {
+            let mut got = block.clone();
+            fp8_activation_inplace(&mut got);
+            let want = act_quant_reference(block);
+            for (j, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(g.to_bits(), w.to_bits(), "block {i} value {j}: {g} vs {w}");
+            }
+        }
+        let tie = &blocks[blocks.len() - 1];
+        let mut q = tie.clone();
+        fp8_activation_inplace(&mut q);
+        assert_eq!(&q[..4], &[16.0, 20.0, -16.0, 4.0 * 2f32.powi(-9)]);
+    }
+
+    #[test]
+    fn attention_output_quantizes_per_32_block() {
+        // Two 64-wide groups: four independent blocks with their own scales.
+        let mut o: Vec<f32> = (0..128)
+            .map(|i| bf16_roundtrip(((i * 37 % 101) as f32 - 50.0) * 2f32.powi(-(i as i32 / 32) * 3)))
+            .collect();
+        let want: Vec<f32> = o.chunks(32).flat_map(act_quant_reference).collect();
+        quantize_attention_output(&mut o, 2);
+        assert_eq!(o, want);
     }
 
     #[test]
