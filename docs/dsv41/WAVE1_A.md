@@ -297,13 +297,28 @@ on the M4; three kernel mutations (ties away in the normal branch, `>=` in
 the subnormal tie, no underflow zero) are each caught.
 `tests/dsv41_fixture_gpu_o_fp8.rs` runs the fixture with the flag on the
 device: 48 device tails (the frame is no longer skipped), median 8.6e-3 /
-worst 7.3e-2 against the act_quant(o) reference. A tap at position 5
-(`CMF_DSV41_TAIL_TAP=attn CMF_DSV41_TRACE=1 CMF_DSV41_TRACE_FULL=1
-CMF_DSV41_TRACE_POS=5`) shows the device frame's attended output on the E4M3
-grid (128/128 values with at most 3 mantissa bits, against 6-9 without the
-flag) and equal to the host's quantized output in all 128 values of L0..L3.
-The upstream DSpark attention has the same `act_quant(o)`; cortiq's V4.1
-runtime has no DSpark head, so nothing to change there.
+worst 7.3e-2 against the act_quant(o) reference. Those bounds cannot tell
+whether the frame quantized (the same decode with the quantizer skipped
+gives median 1.36e-2 and passes), so the binary also asserts 48 kernel
+encodes over the decode (`gpu_wgpu::fp8_act::frame_encodes()`, doc-hidden;
+`dsv41_fixture_gpu` asserts 0 with the flag off) and checks the frame's
+wiring directly (`frame_wiring`): one L0 attention tail with a fixed BF16
+query and cache, run with `o_fp8` off and on, read back at the frame's taps
+(`CMF_DSV4_FRAME_TAP`). The `attn` tap with the flag equals the fixture's
+`act_quant_fp8` of the tap without it in 128/128 values (122/128 moved), and
+each arm's `mid` (BF16 grouped `wo_a`) equals the host's `wo_a` of its own
+`attn` (relative distance 0 on the M4) against 2.1e-2 from the other arm's;
+the assertion is own x4 < other. Mutations, each fails the binary: the
+quantizer skipped (0 encodes), quantizing half the buffer (61/128 differ),
+the quantizer moved after `o_lora_a` (`mid` on is 2.1e-2 from its own
+`attn`, 0 from the unquantized one); the decode median passes all three
+(1.36e-2 / 1.40e-2 / 1.36e-2). A tap at position 5 (`CMF_DSV41_TAIL_TAP=attn
+CMF_DSV41_TRACE=1 CMF_DSV41_TRACE_FULL=1 CMF_DSV41_TRACE_POS=5`) shows the
+device frame's attended output on the E4M3 grid (128/128 values with at most
+3 mantissa bits, against 6-9 without the flag) and equal to the host's
+quantized output in all 128 values of L0..L3. The upstream DSpark attention
+has the same `act_quant(o)`; cortiq's V4.1 runtime has no DSpark head, so
+nothing to change there.
 
 Cost. Device tail: one extra compute pass per layer in the frame's existing
 encoder (no submit, no readback); for the release output (32768 values,
@@ -330,7 +345,9 @@ threaded; read `attention_other` in the `CMF_DSV41_PROF` report.
   addresses 2792 slots; a 3900-slot request gets 3888 under S16. On the M4
   the fixture bank stays S8 (budget-limited); `=16` gives identical logits.
 - GPU fixture: device-path counters asserted, both bank layouts, bound from
-  a mutation check (GPU section above); `dsv41::profile_counters()`.
+  a mutation check (GPU section above); `dsv41::profile_counters()`. The
+  O_FP8 binary also asserts the kernel encodes and the frame's act_quant(o)
+  wiring through its taps (Part 4).
 - `Dsv41Cfg::from_source`: a null candidate key is skipped (the other
   spelling or the release default applies), an integral float (`20.0`) is
   an integer, and the error names the key it read.
