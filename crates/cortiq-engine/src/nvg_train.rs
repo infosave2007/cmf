@@ -415,13 +415,17 @@ impl Work {
             z("dnorm_scratch", g.vd());
         }
         z("loss", 1);
-        let mut blr = HashMap::new();
+        // One scratch per role, sized for the largest instance: the encoder
+        // picks one or two paths and their rank per tensor, so a role's
+        // layers differ in both.
+        let mut dims: HashMap<_, (usize, usize, usize, usize)> = HashMap::new();
         let mut act_w = g.hs.max(g.inter).max(2 * qd).max(g.c_dim().max(g.vd()));
         for l in &net.layers {
             let mut add = |lin: &Lin| {
                 if let Lin::Blr { blr: bl, role, .. } = lin {
                     act_w = act_w.max(bl.m).max(bl.n).max(bl.r);
-                    blr.entry(*role).or_insert_with(|| BlrScratch::new(c, ntok, bl.m, bl.n, bl.r, bl.paths.len()));
+                    let d = dims.entry(*role).or_insert((0, 0, 0, 0));
+                    *d = (d.0.max(bl.m), d.1.max(bl.n), d.2.max(bl.r), d.3.max(bl.paths.len()));
                 }
             };
             match &l.mix {
@@ -441,6 +445,7 @@ impl Work {
             add(&l.up);
             add(&l.down);
         }
+        let blr: HashMap<_, _> = dims.into_iter().map(|(role, (m, n, r, np))| (role, BlrScratch::new(c, ntok, m, n, r, np))).collect();
         let tape = g.gdn_layer.iter().any(|&x| x).then(|| {
             let zeros = vec![0f32; g.nv];
             let conv = vec![0f32; g.c_dim() * g.kk];
