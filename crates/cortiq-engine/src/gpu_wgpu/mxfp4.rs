@@ -826,7 +826,17 @@ mod tests {
     /// exported to the host. Skips without an adapter or descriptor indexing.
     #[test]
     fn global_bank_frame_runs_mxfp4_experts() {
-        global_bank_case("bank", 128, 64, 0.5, 16, 0.02);
+        global_bank_case("bank", 128, 64, 0.5, 16, 0.02, Dsv41Segments::Auto);
+    }
+
+    /// [`global_bank_frame_runs_mxfp4_experts`] on an S16 bank (the
+    /// `CMF_DSV41_GLOBAL_SEGMENTS=16` policy, which for mxfp4 builds the
+    /// mxfp4 S16 kernels on first need): 32 slots, two per segment, so the
+    /// five experts land in segments 0, 0, 1, 1, 2 and a wrong segment or
+    /// local index costs O(1). Skips where the adapter cannot do S16.
+    #[test]
+    fn global_bank_frame_runs_mxfp4_experts_on_s16() {
+        global_bank_case("bank-s16", 128, 64, 0.5, 32, 0.02, Dsv41Segments::Eager16);
     }
 
     /// [`global_bank_frame_runs_mxfp4_experts`] at the V4.1 release expert
@@ -838,13 +848,14 @@ mod tests {
     /// (150 MB) of bank.
     #[test]
     fn global_bank_frame_runs_mxfp4_experts_at_release_geometry() {
-        global_bank_case("bank-1017", 5120, 2304, 10.0, 8, 0.01);
+        global_bank_case("bank-1017", 5120, 2304, 10.0, 8, 0.01, Dsv41Segments::Auto);
     }
 
     /// One bank-frame comparison: four routed experts plus a shared one,
     /// `[inter, dim]` gate/up and `[dim, inter]` down, three routes (the
     /// last with a cold winner), bounded by `max_nrmse` and cos > 0.999
-    /// against the host.
+    /// against the host. `policy` is the V4.1 bank's segment policy; under
+    /// `Eager16` the bank must come out S16.
     fn global_bank_case(
         tag: &str,
         dim: usize,
@@ -852,6 +863,7 @@ mod tests {
         limit: f32,
         extra_slots: usize,
         max_nrmse: f64,
+        policy: Dsv41Segments,
     ) {
         unsafe { std::env::set_var("CMF_GPU", "wgpu") };
         let Some(c) = ctx() else {
@@ -861,6 +873,14 @@ mod tests {
         let _drain = Drain(c.device.clone());
         if !dsv4_global_moe_supported() || global_pipes(c, DSV4_GLOBAL_MOE_SEGMENTS).is_none() {
             eprintln!("descriptor-indexed global bank unavailable — skipping");
+            return;
+        }
+        let want_s16 = policy == Dsv41Segments::Eager16;
+        if want_s16
+            && !(c.dsv4_global_s16_capable
+                && global_pipes(c, DSV4_GLOBAL_MOE_SEGMENTS_S16).is_some())
+        {
+            eprintln!("S16 mxfp4 bank unavailable on this adapter — skipping");
             return;
         }
         eprintln!(
@@ -896,12 +916,13 @@ mod tests {
         let budget = dsv4_vram_budget().unwrap();
         let workspace = (budget / 10).clamp(2 * gib, 4 * gib);
         let request = (workspace / (2 * gu_len + d_len) as u64) as usize + extra_slots;
-        let Some((capacity, segment_slots)) = dsv4_global_moe_create_for_dsv41_codec(
+        let Some((capacity, segment_slots)) = dsv41_global_moe_create_with_policy(
             &model,
             request,
             inter,
             dim,
             MoeBankCodec::Mxfp4,
+            policy,
         ) else {
             eprintln!("global mxfp4 bank could not be allocated here — skipping");
             let _ = std::fs::remove_dir_all(&dir);
@@ -911,10 +932,28 @@ mod tests {
             capacity >= 8 && capacity <= extra_slots,
             "capacity {capacity}"
         );
+        let segments = if want_s16 {
+            DSV4_GLOBAL_MOE_SEGMENTS_S16
+        } else {
+            DSV4_GLOBAL_MOE_SEGMENTS
+        };
+        assert_eq!(
+            dsv4_global_moe_geometry(&model),
+            Some((segments, capacity)),
+            "bank segment family"
+        );
+        assert_eq!(capacity, segments * segment_slots);
         // A second create for another codec on the same model is refused.
         assert!(
-            dsv4_global_moe_create_for_dsv41_codec(&model, request, inter, dim, MoeBankCodec::Q4tp)
-                .is_none()
+            dsv41_global_moe_create_with_policy(
+                &model,
+                request,
+                inter,
+                dim,
+                MoeBankCodec::Q4tp,
+                policy
+            )
+            .is_none()
         );
         for (slot, t) in triples.iter().copied().enumerate() {
             assert!(dsv4_global_slot_fill(&model, slot, t), "fill slot {slot}");
