@@ -69,6 +69,10 @@ pub struct GpuRun {
     /// `dsv41::profile_counters()` over this run:
     /// `(gpu_attn, gpu_attn_fallbacks, gpu_moe, cpu_moe)`.
     pub counters: (u64, u64, u64, u64),
+    /// Encodes of the frame's act_quant(o) kernel over this run
+    /// (`gpu_wgpu::fp8_act::frame_encodes()`): one per device attention
+    /// tail under `CMF_DSV41_O_FP8=1`, none otherwise.
+    pub fp8_encodes: u64,
 }
 
 /// Decode `TOKENS` through the loader and `forward_token` with the device
@@ -81,6 +85,7 @@ pub fn run_gpu(fx: &Fixture, tag: &str) -> GpuRun {
     let source = model.arch().deepseek_v41.clone().expect("source config");
     let (cfg, n_layers) = Dsv41Cfg::from_source(&source, model.arch()).expect("parse cfg");
     let before = dsv41::profile_counters();
+    let fp8_before = cortiq_engine::gpu_wgpu::fp8_act::frame_encodes();
     let logits = float_activations_scope(|| {
         let (globals, layers, hash) =
             dsv41::load(&model, &cfg, n_layers, fx.token_map()).expect("load layers");
@@ -96,6 +101,7 @@ pub fn run_gpu(fx: &Fixture, tag: &str) -> GpuRun {
             .collect::<Vec<_>>()
     });
     let after = dsv41::profile_counters();
+    let fp8_encodes = cortiq_engine::gpu_wgpu::fp8_act::frame_encodes() - fp8_before;
     cortiq_engine::gpu_wgpu::release_model_buffers(&model);
     GpuRun {
         logits,
@@ -105,6 +111,7 @@ pub fn run_gpu(fx: &Fixture, tag: &str) -> GpuRun {
             after.2 - before.2,
             after.3 - before.3,
         ),
+        fp8_encodes,
     }
 }
 

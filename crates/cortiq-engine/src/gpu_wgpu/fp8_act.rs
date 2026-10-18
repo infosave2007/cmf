@@ -157,6 +157,19 @@ pub(crate) fn pipe(c: &Ctx) -> Option<&Pipe> {
     c.fp8_act_pipe.get_or_init(|| build(c)).as_ref()
 }
 
+/// Encodes of the kernel by `encode` (the attention frame), cumulative for
+/// the process.
+static ENCODES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times the attention frame encoded `fp8_act_quant32`, cumulative
+/// for the process. For tests that must prove the frame quantized: its
+/// numeric output alone cannot tell a skipped act_quant(o) from the device's
+/// own rounding.
+#[doc(hidden)]
+pub fn frame_encodes() -> u64 {
+    ENCODES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Quantize `n` floats of `x` in place (`n` a multiple of 32). The caller
 /// has checked `pipe(c)`.
 pub(crate) fn encode(
@@ -182,6 +195,7 @@ pub(crate) fn encode(
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, &bind, &[]);
     pass.dispatch_workgroups(blocks.div_ceil(64), 1, 1);
+    ENCODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The kernel alone on `x` (a multiple of 32 values), for the bit-exactness
