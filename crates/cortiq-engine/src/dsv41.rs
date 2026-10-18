@@ -1262,6 +1262,22 @@ fn gpu_attention_tail_enabled() -> bool {
     })
 }
 
+/// Test-only mutation of the device attention tail
+/// (`CMF_DSV41_TEST_MUTATE`): `sink` hands the frame zero attention sinks,
+/// `rope` shifts the position the frame's inverse RoPE uses by one (the
+/// host has already rotated the query unless `CMF_DSV41_FUSED_Q=1`). Each is
+/// a broken device path the GPU fixture's bound has to catch; see
+/// `tests/dsv41_fixture_gpu.rs`. Read once per process.
+#[cfg(feature = "gpu")]
+fn gpu_tail_mutation() -> Option<&'static str> {
+    static M: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = std::env::var("CMF_DSV41_TEST_MUTATE").ok()?;
+        matches!(m.as_str(), "sink" | "rope").then_some(m)
+    })
+    .as_deref()
+}
+
 /// One-shot stage capture for the V4.1 adapter repair. The frame reads the
 /// same tap names as the generic DSV4 proof, but the adapter falls through to
 /// the CPU path after logging the GPU value so one call carries both sides.
@@ -2287,6 +2303,16 @@ fn attention(
         // buffer contract.
         let qn_in = fused_q.then_some(qr.as_slice());
         let q_in = q.as_deref();
+        let mutation = gpu_tail_mutation();
+        let sink: &[f32] = if mutation == Some("sink") {
+            // One stable zero buffer: the frame keys constants by address.
+            static ZERO: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+            let zero = ZERO.get_or_init(|| vec![0.0; 4096]);
+            &zero[..l.attn_sink.len().min(zero.len())]
+        } else {
+            &l.attn_sink
+        };
+        let frame_pos = st.pos + usize::from(mutation == Some("rope"));
         let gpu_ok = cache_ok
             && model.is_some_and(|model| {
                 let w = crate::gpu_wgpu::Dsv4AttnW {
@@ -2295,7 +2321,7 @@ fn attention(
                     wo_a: l.wo_a.model_idx().unwrap_or(usize::MAX),
                     wo_b: l.wo_b.model_idx().unwrap_or(usize::MAX),
                     q_norm: &l.q_norm,
-                    sink: &l.attn_sink,
+                    sink,
                 };
                 let g = crate::gpu_wgpu::Dsv4AttnGeom {
                     dim: cfg.dim,
@@ -2322,7 +2348,7 @@ fn attention(
                     li,
                     &idx32,
                     inv_freq,
-                    st.pos,
+                    frame_pos,
                     None,
                     &mut gpu_attended,
                 )
@@ -3206,6 +3232,22 @@ fn forward_token_impl(
 /// Print the opt-in V4.1 stage profile from the CLI's normal completion path.
 pub fn profile_report() {
     prof::report();
+}
+
+/// The `CMF_DSV41_PROF` path counters, cumulative for the process:
+/// `(gpu_attn, gpu_attn_fallbacks, gpu_moe, cpu_moe)`. Zero unless the
+/// profile is on. For tests that must prove a device path ran: a refused
+/// device frame falls back to the host silently and still passes a numeric
+/// check.
+#[doc(hidden)]
+pub fn profile_counters() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        prof::GPU_ATTN_CALLS.load(Relaxed),
+        prof::GPU_ATTN_FALLBACKS.load(Relaxed),
+        prof::GPU_MOE_CALLS.load(Relaxed),
+        prof::CPU_MOE_CALLS.load(Relaxed),
+    )
 }
 
 pub fn forward_chunk(
