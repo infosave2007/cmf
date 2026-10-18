@@ -1177,7 +1177,10 @@ mod tests {
                     let mut bit_bad = 0;
                     // GPU tanh/sqrt are a few ulp off: measure against the step taken,
                     // at least η (where the preset second moment is tiny the Adam step is
-                    // hundreds of η, and a few ulp of it exceeded 1e-2·η on a CI Metal GPU)
+                    // hundreds of η). Metal's fast tanh loses relative precision of
+                    // 1 − tanh² near saturation: 6e-5 on an M4, 1.6e-2 on the CI runner's
+                    // GPU; the bits and the flip count must still match exactly.
+                    let tol = if c.adapter_info.backend == wgpu::Backend::Metal { 5e-2 } else { 1e-2 };
                     for e in 0..rows * rp {
                         let step = (lat[e] - latf[e]).abs().max(cfg.eta);
                         worst = worst.max((lat_d[e] - lat[e]).abs() / step);
@@ -1186,7 +1189,7 @@ mod tests {
                         bit_bad += (a ^ b).count_ones();
                     }
                     eprintln!("ref: latent worst |Δ|/max(η, |step|) {worst:e}, bit mismatches {bit_bad}, flips dev {} host {flips}", cnt[3]);
-                    assert!(worst < 1e-2);
+                    assert!(worst < tol, "ref latent error {worst:e} ≥ {tol:e}");
                     assert_eq!(bit_bad, 0);
                     assert_eq!(cnt[3] as u64, flips);
                 }
