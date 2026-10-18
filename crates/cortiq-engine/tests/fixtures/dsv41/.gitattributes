@@ -1,0 +1,2 @@
+# Reference fixtures are compared byte for byte; never rewrite line endings.
+* -text

@@ -133,7 +133,7 @@ fn cfg() -> Dsv41Cfg {
         index_heads: 32,
         index_head_dim: 64,
         index_topk: 64,
-        candidate_source: 3,
+        candidate_source: Some(3),
         candidate_topk_blocks: 2,
         candidate_block_size: 8,
         kv_sources: vec![1, 3],
