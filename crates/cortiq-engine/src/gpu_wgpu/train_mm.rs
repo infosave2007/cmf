@@ -50,6 +50,34 @@ fn cvt_col(@builtin(global_invocation_id) g: vec3<u32>) {
     DST[i] = f16(v);
 }
 
+// cvt_col into up to four outputs from one read of SRC (paths sharing an
+// input): DST·COL, PL·A, PLT·B, DST4·OUT (rows = number of outputs); each
+// value as cvt_col computes it.
+@group(0) @binding(11) var<storage, read_write> DST4: array<f16>;
+@compute @workgroup_size(256)
+fn cvt_multi(@builtin(global_invocation_id) g: vec3<u32>) {
+    let i = idx(g);
+    if (i >= p.mpad * p.k) { return; }
+    let row = i / p.k;
+    let col = i % p.k;
+    var x = 0.0;
+    if (row < p.m) { x = SRC[i]; }
+    var v0 = 0.0;
+    var v1 = 0.0;
+    var v2 = 0.0;
+    var v3 = 0.0;
+    if (row < p.m) {
+        v0 = x * COL[col] * p.scale;
+        v1 = x * A[col] * p.scale;
+        v2 = x * B[col] * p.scale;
+        v3 = x * OUT[col] * p.scale;
+    }
+    DST[i] = f16(v0);
+    if (p.rows > 1u) { PL[i] = f16(v1); }
+    if (p.rows > 2u) { PLT[i] = f16(v2); }
+    if (p.rows > 3u) { DST4[i] = f16(v3); }
+}
+
 // Same without the column factor.
 @compute @workgroup_size(256)
 fn cvt(@builtin(global_invocation_id) g: vec3<u32>) {
@@ -574,7 +602,7 @@ fn scale_acc(@builtin(global_invocation_id) g: vec3<u32>) {
 "#;
 
 fn module(c: &Ctx) -> Option<&'static train_ops::Mod> {
-    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "cvt_cols", "cvt_t", "expand", "expand_n", "expand_t", "colsum_prod", "colsum_part", "colsum_fin", "colsum_fused", "colsum_fused_t", "scale_acc", "dense_fwd", "dense_bwd", "dense_fwd_t", "dense_bwd_t", "split_qg", "adam", "sumsq", "adam_cat", "sumsq_cat", "f16_to_f32", "scale_acc2"])
+    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "cvt_cols", "cvt_t", "cvt_multi", "expand", "expand_n", "expand_t", "colsum_prod", "colsum_part", "colsum_fin", "colsum_fused", "colsum_fused_t", "scale_acc", "dense_fwd", "dense_bwd", "dense_fwd_t", "dense_bwd_t", "split_qg", "adam", "sumsq", "adam_cat", "sumsq_cat", "f16_to_f32", "scale_acc2"])
 }
 
 /// One step of a trainer pass: an elementwise/reduction dispatch or a GEMM.
@@ -693,6 +721,27 @@ pub fn cvt<'a>(c: &'a Ctx, src: &'a wgpu::Buffer, col: Option<&'a wgpu::Buffer>,
     Some(match col {
         Some(cb) => Disp { pipe: &md.p["cvt_col"], uni, bufs: vec![(1, src), (2, cb), (3, dst)], grid: elt_fold(mpad * k) },
         None => Disp { pipe: &md.p["cvt"], uni, bufs: vec![(1, src), (3, dst)], grid: elt_fold(mpad * k) },
+    })
+}
+
+/// [`cvt`] with column factors into up to four staging buffers from one read
+/// of `src` (`cols[i]` → `dsts[i]`, 1 ≤ n ≤ 4).
+#[allow(clippy::too_many_arguments)]
+pub fn cvt_multi<'a>(c: &'a Ctx, src: &'a wgpu::Buffer, cols: &[&'a wgpu::Buffer], dsts: &[&'a wgpu::Buffer], m: usize, k: usize, scale: f32) -> Option<Disp<'a>> {
+    let md = module(c)?;
+    let n = cols.len();
+    if n == 0 || n > 4 || dsts.len() != n {
+        return None;
+    }
+    let mpad = pad_rows(m);
+    let col = |i: usize| cols[i.min(n - 1)];
+    let dst = |i: usize| dsts[i.min(n - 1)];
+    let uni = vec![m as u32, k as u32, mpad as u32, n as u32, 0, 0, 0, 0, scale.to_bits(), 0, 0, 0];
+    Some(Disp {
+        pipe: &md.p["cvt_multi"],
+        uni,
+        bufs: vec![(1, src), (2, col(0)), (7, col(1)), (8, col(2)), (9, col(3)), (3, dst(0)), (5, dst(1)), (6, dst(2)), (11, dst(3))],
+        grid: elt_fold(mpad * k),
     })
 }
 
@@ -1194,18 +1243,28 @@ impl BlrScratch {
 /// Forward of `layer` on `x` (`[ntok][n]`) into `y` (`[ntok][m]`, overwritten).
 /// Keeps a and c of every path in the scratch for [`blr_backward`].
 pub fn blr_forward(c: &Ctx, layer: &Blr, s: &BlrScratch, x: &wgpu::Buffer, y: &wgpu::Buffer, ntok: usize) -> Option<()> {
+    blr_forward_staged(c, layer, s, x, y, ntok, None)
+}
+
+/// [`blr_forward`] with each path's input staging `f16(x⊙g_p)` already done
+/// (`xin[p]`, e.g. by one [`cvt_multi`] for every path reading `x`).
+pub fn blr_forward_staged(c: &Ctx, layer: &Blr, s: &BlrScratch, x: &wgpu::Buffer, y: &wgpu::Buffer, ntok: usize, xin: Option<&[wgpu::Buffer]>) -> Option<()> {
     let (m, n, r) = (layer.m, layer.n, layer.r);
     let np = layer.paths.len();
     for (pi, p) in layer.paths.iter().enumerate() {
         let w = r / 32;
-        let mut ops = match (mm_bits(c, &p.bits_v, w, true, &s.xh, &s.a[pi], ntok, r, n, 1.0), mm_bits(c, &p.bits_u, w, false, &s.xh, &s.cbuf[pi], ntok, m, r, 1.0)) {
+        let xs = xin.map(|v| &v[pi]);
+        let mut ops = match (mm_bits(c, &p.bits_v, w, true, xs.unwrap_or(&s.xh), &s.a[pi], ntok, r, n, 1.0), mm_bits(c, &p.bits_u, w, false, &s.xh, &s.cbuf[pi], ntok, m, r, 1.0)) {
             // the GEMMs read the bitmaps themselves
-            (Some(g1), Some(g2)) => vec![
-                Op::D(cvt(c, x, Some(&p.g), &s.xh, ntok, n, 1.0)?),
-                Op::M(g1),
-                Op::D(cvt(c, &s.a[pi], Some(&p.l), &s.xh, ntok, r, 1.0)?),
-                Op::M(g2),
-            ],
+            (Some(g1), Some(g2)) => {
+                let mut v = Vec::with_capacity(5);
+                if xs.is_none() {
+                    v.push(Op::D(cvt(c, x, Some(&p.g), &s.xh, ntok, n, 1.0)?));
+                }
+                v.extend([Op::M(g1), Op::D(cvt(c, &s.a[pi], Some(&p.l), &s.xh, ntok, r, 1.0)?), Op::M(g2)]);
+                v
+            }
+            // expanded planes (stages its own input into xh)
             _ => vec![
                 Op::D(expand1(c, &p.bits_u, &s.pl_u, m, r, false)?),
                 Op::D(expand1(c, &p.bits_v, &s.plt_v, n, r, true)?),
