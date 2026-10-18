@@ -52,12 +52,16 @@ pub use blr::blr_matmat;
 pub mod gdn_train;
 /// Trainer kernels: RMSNorm, SwiGLU, gate, q/k norm + RoPE, attention.
 pub mod train_ops;
+/// Trainer attention on the matrix units (materialized causal scores).
+pub mod train_attn;
 /// Trainer GEMMs (zi_mm) and the binary low-rank layer forward/backward.
 pub mod train_mm;
 /// Sign training of the binary low-rank paths (STE latents, factored optimizer).
 pub mod train_sign;
 /// Trainer loss: frozen vocabulary head + KL against the teacher top-k.
 pub mod train_head;
+/// Opt-in trainer profiler (`CMF_NVG_PROF`): per-phase/per-kernel GPU timestamps and step counts.
+pub mod train_prof;
 /// Subgroup q1g decode matvec (bit-identical to `q1g_matvec`, no barriers).
 pub(crate) mod q1g_mv;
 /// Device linear algebra of the NVG `blr` encoder (f32 GEMM, SPD solves,
@@ -43403,6 +43407,13 @@ fn note_submit(c: &Ctx) {
 #[inline]
 fn submit(c: &Ctx, buf: wgpu::CommandBuffer) {
     note_submit(c);
+    if train_prof::on() {
+        // trainer profiler: time the host spends inside queue.submit
+        let t = std::time::Instant::now();
+        c.queue.submit(Some(buf));
+        train_prof::submit_ns(t.elapsed().as_nanos() as u64);
+        return;
+    }
     c.queue.submit(Some(buf));
 }
 

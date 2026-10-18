@@ -50,6 +50,34 @@ fn cvt_col(@builtin(global_invocation_id) g: vec3<u32>) {
     DST[i] = f16(v);
 }
 
+// cvt_col into up to four outputs from one read of SRC (paths sharing an
+// input): DST·COL, PL·A, PLT·B, DST4·OUT (rows = number of outputs); each
+// value as cvt_col computes it.
+@group(0) @binding(11) var<storage, read_write> DST4: array<f16>;
+@compute @workgroup_size(256)
+fn cvt_multi(@builtin(global_invocation_id) g: vec3<u32>) {
+    let i = idx(g);
+    if (i >= p.mpad * p.k) { return; }
+    let row = i / p.k;
+    let col = i % p.k;
+    var x = 0.0;
+    if (row < p.m) { x = SRC[i]; }
+    var v0 = 0.0;
+    var v1 = 0.0;
+    var v2 = 0.0;
+    var v3 = 0.0;
+    if (row < p.m) {
+        v0 = x * COL[col] * p.scale;
+        v1 = x * A[col] * p.scale;
+        v2 = x * B[col] * p.scale;
+        v3 = x * OUT[col] * p.scale;
+    }
+    DST[i] = f16(v0);
+    if (p.rows > 1u) { PL[i] = f16(v1); }
+    if (p.rows > 2u) { PLT[i] = f16(v2); }
+    if (p.rows > 3u) { DST4[i] = f16(v3); }
+}
+
 // Same without the column factor.
 @compute @workgroup_size(256)
 fn cvt(@builtin(global_invocation_id) g: vec3<u32>) {
@@ -111,6 +139,29 @@ fn expand(@builtin(global_invocation_id) g: vec3<u32>) {
     PLT[j * p.rows + row] = v;
 }
 
+// Only one orientation of the expansion (each GEMM phase reads one of each
+// matrix): PL[rows][r] ...
+@compute @workgroup_size(256)
+fn expand_n(@builtin(global_invocation_id) g: vec3<u32>) {
+    let i = idx(g);
+    if (i >= p.rows * p.r) { return; }
+    let row = i / p.r;
+    let j = i % p.r;
+    let bit = (BITS[row * p.words + j / 32u] >> (j % 32u)) & 1u;
+    PL[i] = select(f16(-1.0), f16(1.0), bit == 1u);
+}
+
+// ... or PLT[r][rows], consecutive threads along rows (coalesced stores).
+@compute @workgroup_size(256)
+fn expand_t(@builtin(global_invocation_id) g: vec3<u32>) {
+    let i = idx(g);
+    if (i >= p.rows * p.r) { return; }
+    let j = i / p.rows;
+    let row = i % p.rows;
+    let bit = (BITS[row * p.words + j / 32u] >> (j % 32u)) & 1u;
+    PLT[i] = select(f16(-1.0), f16(1.0), bit == 1u);
+}
+
 // OUT[col] += Σ_row A[row][col]·B[row][col]   (one thread per column)
 @compute @workgroup_size(256)
 fn colsum_prod(@builtin(global_invocation_id) g: vec3<u32>) {
@@ -119,6 +170,121 @@ fn colsum_prod(@builtin(global_invocation_id) g: vec3<u32>) {
     var acc = 0.0;
     for (var row = 0u; row < p.m; row = row + 1u) { acc = acc + A[row * p.k + col] * B[row * p.k + col]; }
     OUT[col] = OUT[col] + acc;
+}
+
+// Two-pass column reduction, pass 1: SRC[blk][k] = Σ over the rows of block
+// blk (r rows per block) of A·B (rows = 0), A·B·COL[row] (1) or A (2).
+@compute @workgroup_size(256)
+fn colsum_part(@builtin(global_invocation_id) g: vec3<u32>, @builtin(workgroup_id) wg: vec3<u32>) {
+    let col = g.x;
+    if (col >= p.k) { return; }
+    let r0 = wg.y * p.r;
+    let r1 = min(r0 + p.r, p.m);
+    var acc = 0.0;
+    if (p.rows == 0u) {
+        for (var row = r0; row < r1; row = row + 1u) { acc = acc + A[row * p.k + col] * B[row * p.k + col]; }
+    } else if (p.rows == 1u) {
+        for (var row = r0; row < r1; row = row + 1u) { acc = acc + A[row * p.k + col] * B[row * p.k + col] * COL[row]; }
+    } else {
+        for (var row = r0; row < r1; row = row + 1u) { acc = acc + A[row * p.k + col]; }
+    }
+    SRC[wg.y * p.k + col] = acc;
+}
+
+// colsum_part (A·B) fused with the elementwise op on one of its operands, so
+// that operand is read once: rows = 0: DST = f16(A·COL[col]·scale) (cvt_col of
+// A), 1: DST = f16(B·COL[col]·scale) (cvt_col of B), 2: OUT (+)= B·COL[col]
+// (scale_acc of B, pad1 = 1: accumulate). Same partials, same element ops.
+@compute @workgroup_size(256)
+fn colsum_fused(@builtin(global_invocation_id) g: vec3<u32>, @builtin(workgroup_id) wg: vec3<u32>) {
+    let col = g.x;
+    if (col >= p.k) { return; }
+    let r0 = wg.y * p.r;
+    let r1 = min(r0 + p.r, p.m);
+    let cf = COL[col];
+    var acc = 0.0;
+    if (p.rows == 0u) {
+        for (var row = r0; row < r1; row = row + 1u) {
+            let i = row * p.k + col;
+            let a = A[i];
+            acc = acc + a * B[i];
+            DST[i] = f16(a * cf * p.scale);
+        }
+    } else if (p.rows == 1u) {
+        for (var row = r0; row < r1; row = row + 1u) {
+            let i = row * p.k + col;
+            let b = B[i];
+            acc = acc + A[i] * b;
+            DST[i] = f16(b * cf * p.scale);
+        }
+    } else {
+        for (var row = r0; row < r1; row = row + 1u) {
+            let i = row * p.k + col;
+            let b = B[i];
+            acc = acc + A[i] * b;
+            let v = b * cf;
+            if (p.pad1 == 1u) { OUT[i] = OUT[i] + v; } else { OUT[i] = v; }
+        }
+    }
+    SRC[wg.y * p.k + col] = acc;
+}
+
+// colsum_fused that also writes the transposed f16 operand of the sign
+// gradient GEMM (DSTT[col][kpad], kpad = mpad): rows = 0: the DST value
+// (dy·h·gs), 1: the DST value (t2·l·gs), 2: f16(A·COL·f1) (x·g) — the values
+// cvt_t would stage, from the operand this pass reads anyway. The 256×64
+// transposed block goes through workgroup memory and leaves as coalesced
+// 128-byte rows. Row blocks of exactly 64 rows.
+@group(0) @binding(10) var<storage, read_write> DSTT: array<vec4<f16>>;
+var<workgroup> ttile: array<f16, 16896>;   // [256 cols][66] (64 rows + pad)
+@compute @workgroup_size(256)
+fn colsum_fused_t(@builtin(global_invocation_id) g: vec3<u32>, @builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let col = g.x;
+    let live = col < p.k;
+    let r0 = wg.y * 64u;
+    let r1 = min(r0 + 64u, p.m);
+    var cf = 0.0;
+    if (live) { cf = COL[col]; }
+    var acc = 0.0;
+    for (var row = r0; row < r1; row = row + 1u) {
+        var tv = f16(0.0);
+        if (live) {
+            let i = row * p.k + col;
+            if (p.rows == 0u) {
+                let a = A[i]; acc = acc + a * B[i]; let hv = f16(a * cf * p.scale); DST[i] = hv; tv = hv;
+            } else if (p.rows == 1u) {
+                let b = B[i]; acc = acc + A[i] * b; let hv = f16(b * cf * p.scale); DST[i] = hv; tv = hv;
+            } else {
+                let a = A[i]; let b = B[i]; acc = acc + a * b; let v = b * cf;
+                if (p.pad1 == 1u) { OUT[i] = OUT[i] + v; } else { OUT[i] = v; }
+                tv = f16(a * cf * p.f1);
+            }
+        }
+        ttile[t * 66u + (row - r0)] = tv;
+    }
+    if (live) { SRC[wg.y * p.k + col] = acc; }
+    workgroupBarrier();
+    // 256 columns × 16 vec4 (64 rows): 16 lanes per column row of DSTT
+    let c0 = wg.x * 256u;
+    for (var e = 0u; e < 16u; e = e + 1u) {
+        let v = t + 256u * e;
+        let cl = v / 16u;
+        let q = v % 16u;
+        if (c0 + cl < p.k && r0 + q * 4u < r1) {
+            let b = cl * 66u + q * 4u;
+            DSTT[((c0 + cl) * p.mpad + r0) / 4u + q] = vec4<f16>(ttile[b], ttile[b + 1u], ttile[b + 2u], ttile[b + 3u]);
+        }
+    }
+}
+
+// Pass 2: OUT[col] (+)= Σ_blk SRC[blk][col]  (words = blocks, pad0 = 1: accumulate).
+@compute @workgroup_size(256)
+fn colsum_fin(@builtin(global_invocation_id) g: vec3<u32>) {
+    let col = g.x;
+    if (col >= p.k) { return; }
+    var acc = 0.0;
+    for (var b = 0u; b < p.words; b = b + 1u) { acc = acc + SRC[b * p.k + col]; }
+    if (p.pad0 == 1u) { OUT[col] = OUT[col] + acc; } else { OUT[col] = acc; }
 }
 
 // Small dense f32 linear: OUT[m][r] (+)= A[m][k] · B[r][k]ᵀ  (rows flag: accumulate)
@@ -132,6 +298,158 @@ fn dense_fwd(@builtin(global_invocation_id) g: vec3<u32>) {
     var acc = 0.0;
     for (var j = 0u; j < p.k; j = j + 1u) { acc = acc + A[row * p.k + j] * B[o * p.k + j]; }
     if (p.rows == 1u) { OUT[i] = OUT[i] + acc; } else { OUT[i] = acc; }
+}
+
+// dense_fwd for r ≤ 48 outputs, tiled: a workgroup = 64 rows × all outputs,
+// thread (row group ty: 4 rows, lane tx) owns outputs tx, tx+16, tx+32 of
+// its 4 rows; k staged through workgroup memory in chunks of 64 (vec4
+// loads). Each output still sums j = 0..k-1 in order with one fma per term,
+// as dense_fwd's `acc + a·b` does.
+var<workgroup> dta: array<f32, 4160>;   // [64][65]
+var<workgroup> dtb: array<f32, 3120>;   // [48][65]
+@compute @workgroup_size(256)
+fn dense_fwd_t(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) tid: u32) {
+    let r0 = wg.x * 64u;
+    let ty = tid / 16u;
+    let tx = tid % 16u;
+    var a00 = 0.0;
+    var a01 = 0.0;
+    var a02 = 0.0;
+    var a10 = 0.0;
+    var a11 = 0.0;
+    var a12 = 0.0;
+    var a20 = 0.0;
+    var a21 = 0.0;
+    var a22 = 0.0;
+    var a30 = 0.0;
+    var a31 = 0.0;
+    var a32 = 0.0;
+    for (var k0 = 0u; k0 < p.k; k0 = k0 + 64u) {
+        for (var e = tid; e < 1024u; e = e + 256u) {
+            let rr = e / 16u;
+            let kq = (e % 16u) * 4u;
+            var v = vec4<f32>(0.0);
+            if (r0 + rr < p.m && k0 + kq < p.k) {
+                let b = (r0 + rr) * p.k + k0 + kq;
+                v = vec4<f32>(A[b], A[b + 1u], A[b + 2u], A[b + 3u]);
+            }
+            let d = rr * 65u + kq;
+            dta[d] = v.x; dta[d + 1u] = v.y; dta[d + 2u] = v.z; dta[d + 3u] = v.w;
+        }
+        for (var e = tid; e < 768u; e = e + 256u) {
+            let o = e / 16u;
+            let kq = (e % 16u) * 4u;
+            var v = vec4<f32>(0.0);
+            if (o < p.r && k0 + kq < p.k) {
+                let b = o * p.k + k0 + kq;
+                v = vec4<f32>(B[b], B[b + 1u], B[b + 2u], B[b + 3u]);
+            }
+            let d = o * 65u + kq;
+            dtb[d] = v.x; dtb[d + 1u] = v.y; dtb[d + 2u] = v.z; dtb[d + 3u] = v.w;
+        }
+        workgroupBarrier();
+        let kn = min(64u, p.k - k0);
+        for (var kk = 0u; kk < kn; kk = kk + 1u) {
+            let x0 = dta[(ty * 4u + 0u) * 65u + kk];
+            let x1 = dta[(ty * 4u + 1u) * 65u + kk];
+            let x2 = dta[(ty * 4u + 2u) * 65u + kk];
+            let x3 = dta[(ty * 4u + 3u) * 65u + kk];
+            let w0 = dtb[(tx + 0u) * 65u + kk];
+            let w1 = dtb[(tx + 16u) * 65u + kk];
+            let w2 = dtb[(tx + 32u) * 65u + kk];
+            a00 = fma(x0, w0, a00);
+            a01 = fma(x0, w1, a01);
+            a02 = fma(x0, w2, a02);
+            a10 = fma(x1, w0, a10);
+            a11 = fma(x1, w1, a11);
+            a12 = fma(x1, w2, a12);
+            a20 = fma(x2, w0, a20);
+            a21 = fma(x2, w1, a21);
+            a22 = fma(x2, w2, a22);
+            a30 = fma(x3, w0, a30);
+            a31 = fma(x3, w1, a31);
+            a32 = fma(x3, w2, a32);
+        }
+        workgroupBarrier();
+    }
+    if (r0 + ty * 4u + 0u < p.m && tx + 0u < p.r) {
+        let i = (r0 + ty * 4u + 0u) * p.r + tx + 0u;
+        if (p.rows == 1u) { OUT[i] = OUT[i] + a00; } else { OUT[i] = a00; }
+    }
+    if (r0 + ty * 4u + 0u < p.m && tx + 16u < p.r) {
+        let i = (r0 + ty * 4u + 0u) * p.r + tx + 16u;
+        if (p.rows == 1u) { OUT[i] = OUT[i] + a01; } else { OUT[i] = a01; }
+    }
+    if (r0 + ty * 4u + 0u < p.m && tx + 32u < p.r) {
+        let i = (r0 + ty * 4u + 0u) * p.r + tx + 32u;
+        if (p.rows == 1u) { OUT[i] = OUT[i] + a02; } else { OUT[i] = a02; }
+    }
+    if (r0 + ty * 4u + 1u < p.m && tx + 0u < p.r) {
+        let i = (r0 + ty * 4u + 1u) * p.r + tx + 0u;
+        if (p.rows == 1u) { OUT[i] = OUT[i] + a10; } else { OUT[i] = a10; }
+    }
+    if (r0 + ty * 4u + 1u < p.m && tx + 16u < p.r) {
+        let i = (r0 + ty * 4u + 1u) * p.r + tx + 16u;
+        if (p.rows == 1u) { OUT[i] = OUT[i] + a11; } else { OUT[i] = a11; }
+    }
+    if (r0 + ty * 4u + 1u < p.m && tx + 32u < p.r) {
+        let i = (r0 + ty * 4u + 1u) * p.r + tx + 32u;
+        if (p.rows == 1u) { OUT[i] = OUT[i] + a12; } else { OUT[i] = a12; }
+    }
+    if (r0 + ty * 4u + 2u < p.m && tx + 0u < p.r) {
+        let i = (r0 + ty * 4u + 2u) * p.r + tx + 0u;
+        if (p.rows == 1u) { OUT[i] = OUT[i] + a20; } else { OUT[i] = a20; }
+    }
+    if (r0 + ty * 4u + 2u < p.m && tx + 16u < p.r) {
+        let i = (r0 + ty * 4u + 2u) * p.r + tx + 16u;
+        if (p.rows == 1u) { OUT[i] = OUT[i] + a21; } else { OUT[i] = a21; }
+    }
+    if (r0 + ty * 4u + 2u < p.m && tx + 32u < p.r) {
+        let i = (r0 + ty * 4u + 2u) * p.r + tx + 32u;
+        if (p.rows == 1u) { OUT[i] = OUT[i] + a22; } else { OUT[i] = a22; }
+    }
+    if (r0 + ty * 4u + 3u < p.m && tx + 0u < p.r) {
+        let i = (r0 + ty * 4u + 3u) * p.r + tx + 0u;
+        if (p.rows == 1u) { OUT[i] = OUT[i] + a30; } else { OUT[i] = a30; }
+    }
+    if (r0 + ty * 4u + 3u < p.m && tx + 16u < p.r) {
+        let i = (r0 + ty * 4u + 3u) * p.r + tx + 16u;
+        if (p.rows == 1u) { OUT[i] = OUT[i] + a31; } else { OUT[i] = a31; }
+    }
+    if (r0 + ty * 4u + 3u < p.m && tx + 32u < p.r) {
+        let i = (r0 + ty * 4u + 3u) * p.r + tx + 32u;
+        if (p.rows == 1u) { OUT[i] = OUT[i] + a32; } else { OUT[i] = a32; }
+    }
+}
+
+// dense_bwd with 4 rows per thread (each weight load serves 4 outputs);
+// every output sums o = 0..r-1 in order, as dense_bwd does.
+@compute @workgroup_size(256)
+fn dense_bwd_t(@builtin(global_invocation_id) g: vec3<u32>) {
+    let j = g.x;
+    let row0 = g.y * 4u;
+    if (j >= p.k) { return; }
+    var a0 = 0.0;
+    var a1 = 0.0;
+    var a2 = 0.0;
+    var a3 = 0.0;
+    let ok1 = row0 + 1u < p.m;
+    let ok2 = row0 + 2u < p.m;
+    let ok3 = row0 + 3u < p.m;
+    let i1 = select(row0, row0 + 1u, ok1);
+    let i2 = select(row0, row0 + 2u, ok2);
+    let i3 = select(row0, row0 + 3u, ok3);
+    for (var o = 0u; o < p.r; o = o + 1u) {
+        let b = B[o * p.k + j];
+        a0 = a0 + A[row0 * p.r + o] * b;
+        a1 = a1 + A[i1 * p.r + o] * b;
+        a2 = a2 + A[i2 * p.r + o] * b;
+        a3 = a3 + A[i3 * p.r + o] * b;
+    }
+    OUT[row0 * p.k + j] = OUT[row0 * p.k + j] + a0;
+    if (ok1) { OUT[i1 * p.k + j] = OUT[i1 * p.k + j] + a1; }
+    if (ok2) { OUT[i2 * p.k + j] = OUT[i2 * p.k + j] + a2; }
+    if (ok3) { OUT[i3 * p.k + j] = OUT[i3 * p.k + j] + a3; }
 }
 
 // OUT[m][k] += A[m][r] · B[r][k]   (input gradient of dense_fwd)
@@ -208,6 +526,71 @@ fn sumsq(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_
     if (t == 0u) { OUT[wg.x] = ssq[0]; }
 }
 
+// adam over a concatenation of parameters (one dispatch for all of them):
+// COL = per-element mask (0: frozen), BITS = per-element relative floor
+// (f32 bits; 0: plain steps); the arithmetic of `adam` element for element.
+@compute @workgroup_size(256)
+fn adam_cat(@builtin(global_invocation_id) g: vec3<u32>) {
+    let i = idx(g);
+    if (i >= p.k) { return; }
+    if (COL[i] == 0.0) { return; }
+    let gr = A[i] * bitcast<f32>(p.pad0);
+    let m1 = p.f1 * B[i] + (1.0 - p.f1) * gr;
+    let m2 = p.f2 * OUT[i] + (1.0 - p.f2) * gr * gr;
+    B[i] = m1;
+    OUT[i] = m2;
+    let t = f32(p.m);
+    let mh = m1 / (1.0 - pow(p.f1, t));
+    let vh = m2 / (1.0 - pow(p.f2, t));
+    let st = p.scale * mh / (sqrt(vh) + p.f3);
+    let rf = bitcast<f32>(BITS[i]);
+    if (rf > 0.0) {
+        SRC[i] = SRC[i] - st * max(abs(SRC[i]), rf);
+    } else {
+        SRC[i] = SRC[i] - st;
+    }
+}
+
+// `sumsq` for every parameter of a concatenation: workgroup (x < 64, y =
+// parameter), BITS[2y], BITS[2y+1] = its offset and length; OUT[64y + x].
+@compute @workgroup_size(256)
+fn sumsq_cat(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3<u32>) {
+    let off = BITS[2u * wg.y];
+    let n = BITS[2u * wg.y + 1u];
+    var acc = 0.0;
+    for (var i = wg.x * 256u + t; i < n; i = i + 256u * p.m) { acc = acc + A[off + i] * A[off + i]; }
+    ssq[t] = acc;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {
+        if (t < s) { ssq[t] = ssq[t] + ssq[t + s]; }
+        workgroupBarrier();
+    }
+    if (t == 0u) { OUT[wg.y * p.m + wg.x] = ssq[0]; }
+}
+
+// OUT = A·COL[k] + B·SRC[k]: the two paths of a blr linear in one pass,
+// rounded as scale_acc twice (overwrite, then accumulate): fl(fl(a0c0) +
+// fl(a1c1)). Each product passes through an xor with a uniform zero (words),
+// so the driver cannot fuse either into the sum (left to itself it does,
+// and which one depends on the surrounding code).
+@compute @workgroup_size(256)
+fn scale_acc2(@builtin(global_invocation_id) g: vec3<u32>) {
+    let i = idx(g);
+    if (i >= p.m * p.k) { return; }
+    let c = i % p.k;
+    let v0 = bitcast<f32>(bitcast<u32>(A[i] * COL[c]) ^ p.words);
+    let v1 = bitcast<f32>(bitcast<u32>(B[i] * SRC[c]) ^ p.words);
+    OUT[i] = v0 + v1;
+}
+
+// OUT[i] = f32(DST[i]) for i < k (the embedding rows, uploaded as f16).
+@compute @workgroup_size(256)
+fn f16_to_f32(@builtin(global_invocation_id) g: vec3<u32>) {
+    let i = idx(g);
+    if (i >= p.k) { return; }
+    OUT[i] = f32(DST[i]);
+}
+
 // OUT[m][k] (+)= A[m][k]·COL[k]   (rows = 1: accumulate, 0: overwrite)
 @compute @workgroup_size(256)
 fn scale_acc(@builtin(global_invocation_id) g: vec3<u32>) {
@@ -219,7 +602,7 @@ fn scale_acc(@builtin(global_invocation_id) g: vec3<u32>) {
 "#;
 
 fn module(c: &Ctx) -> Option<&'static train_ops::Mod> {
-    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "cvt_cols", "cvt_t", "expand", "colsum_prod", "scale_acc", "dense_fwd", "dense_bwd", "split_qg", "adam", "sumsq"])
+    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "cvt_cols", "cvt_t", "cvt_multi", "expand", "expand_n", "expand_t", "colsum_prod", "colsum_part", "colsum_fin", "colsum_fused", "colsum_fused_t", "scale_acc", "dense_fwd", "dense_bwd", "dense_fwd_t", "dense_bwd_t", "split_qg", "adam", "sumsq", "adam_cat", "sumsq_cat", "f16_to_f32", "scale_acc2"])
 }
 
 /// One step of a trainer pass: an elementwise/reduction dispatch or a GEMM.
@@ -230,6 +613,13 @@ pub enum Op<'a> {
 
 /// Record every op into one compute pass and submit.
 pub fn run(c: &Ctx, ops: &[Op]) {
+    run_tagged(c, ops, usize::MAX, "");
+}
+
+/// [`run`], with the ops from index `from` on attributed to `tag` by the
+/// profiler (`train_prof`); identical recording.
+pub fn run_tagged(c: &Ctx, ops: &[Op], from: usize, tag: &'static str) {
+    let prof = super::train_prof::on();
     let mut keep = Vec::new();
     let mut groups = Vec::new();
     for op in ops {
@@ -237,6 +627,13 @@ pub fn run(c: &Ctx, ops: &[Op]) {
             let mut words = d.uni.clone();
             while words.len() % 4 != 0 {
                 words.push(0);
+            }
+            if prof {
+                use super::train_prof::{Cnt, count};
+                count(Cnt::Buf, 1);
+                count(Cnt::Write, 1);
+                count(Cnt::WriteBytes, (words.len() * 4) as u64);
+                count(Cnt::BindGroup, 1);
             }
             let u = c.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("train_p"),
@@ -262,7 +659,8 @@ pub fn run(c: &Ctx, ops: &[Op]) {
     let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("train_mm") });
     {
         let mut ps = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
-        for (op, bg) in ops.iter().zip(&groups) {
+        let mut mk = super::train_prof::pass_begin(c, &mut ps);
+        for (i, (op, bg)) in ops.iter().zip(&groups).enumerate() {
             match op {
                 Op::D(d) => {
                     ps.set_pipeline(d.pipe);
@@ -270,6 +668,14 @@ pub fn run(c: &Ctx, ops: &[Op]) {
                     ps.dispatch_workgroups(d.grid.0, d.grid.1, d.grid.2);
                 }
                 Op::M(m) => m.record(&mut ps),
+            }
+            if prof {
+                let (name, mnk) = match op {
+                    Op::D(d) => (super::train_prof::pipe_name(d.pipe), [0; 3]),
+                    Op::M(m) => ("mm", m.mnk),
+                };
+                let name = if i >= from { super::train_prof::tagged(tag, name) } else { name };
+                super::train_prof::pass_mark(c, &mut ps, &mut mk, name, mnk);
             }
         }
     }
@@ -285,6 +691,7 @@ pub fn pad_rows(m: usize) -> usize {
 
 /// f16 buffer of `n` halves (rounded up to whole words).
 pub fn f16_buf(c: &Ctx, n: usize) -> wgpu::Buffer {
+    super::train_prof::count(super::train_prof::Cnt::Buf, 1);
     c.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("train_f16"),
         size: ((n.div_ceil(2) * 4).max(16)) as u64,
@@ -314,6 +721,27 @@ pub fn cvt<'a>(c: &'a Ctx, src: &'a wgpu::Buffer, col: Option<&'a wgpu::Buffer>,
     Some(match col {
         Some(cb) => Disp { pipe: &md.p["cvt_col"], uni, bufs: vec![(1, src), (2, cb), (3, dst)], grid: elt_fold(mpad * k) },
         None => Disp { pipe: &md.p["cvt"], uni, bufs: vec![(1, src), (3, dst)], grid: elt_fold(mpad * k) },
+    })
+}
+
+/// [`cvt`] with column factors into up to four staging buffers from one read
+/// of `src` (`cols[i]` → `dsts[i]`, 1 ≤ n ≤ 4).
+#[allow(clippy::too_many_arguments)]
+pub fn cvt_multi<'a>(c: &'a Ctx, src: &'a wgpu::Buffer, cols: &[&'a wgpu::Buffer], dsts: &[&'a wgpu::Buffer], m: usize, k: usize, scale: f32) -> Option<Disp<'a>> {
+    let md = module(c)?;
+    let n = cols.len();
+    if n == 0 || n > 4 || dsts.len() != n {
+        return None;
+    }
+    let mpad = pad_rows(m);
+    let col = |i: usize| cols[i.min(n - 1)];
+    let dst = |i: usize| dsts[i.min(n - 1)];
+    let uni = vec![m as u32, k as u32, mpad as u32, n as u32, 0, 0, 0, 0, scale.to_bits(), 0, 0, 0];
+    Some(Disp {
+        pipe: &md.p["cvt_multi"],
+        uni,
+        bufs: vec![(1, src), (2, col(0)), (7, col(1)), (8, col(2)), (9, col(3)), (3, dst(0)), (5, dst(1)), (6, dst(2)), (11, dst(3))],
+        grid: elt_fold(mpad * k),
     })
 }
 
@@ -352,15 +780,141 @@ pub fn expand<'a>(c: &'a Ctx, bits: &'a wgpu::Buffer, pl: &'a wgpu::Buffer, plt:
     })
 }
 
-/// `out[k] += Σ_rows a[row][k]·b[row][k]`.
-pub fn colsum_prod<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, b: &'a wgpu::Buffer, out: &'a wgpu::Buffer, m: usize, k: usize) -> Option<Disp<'a>> {
+/// Words of the shared partial-sum buffer of the column reductions.
+const PART_WORDS: usize = 256 * 32768;
+
+/// The column reductions' partial sums (one buffer: every op is ordered).
+fn part_buf(c: &Ctx) -> &'static wgpu::Buffer {
+    static PART: std::sync::OnceLock<wgpu::Buffer> = std::sync::OnceLock::new();
+    PART.get_or_init(|| train_ops::zeros(c, PART_WORDS))
+}
+
+/// Term of a column reduction.
+#[derive(Clone, Copy)]
+pub enum ColTerm<'a> {
+    /// a·b
+    Prod(&'a wgpu::Buffer),
+    /// a·b·f[row]
+    ProdRow(&'a wgpu::Buffer, &'a wgpu::Buffer),
+    /// a
+    Plain,
+}
+
+/// Column reduction `out[k] (+)= Σ_rows term(a[row][k], …)` over `m` rows in
+/// two passes (row blocks of ≥ 64 rows, at most 256 blocks, then the block
+/// partials in order): latency-free where a thread-per-column loop over
+/// thousands of rows ran on a handful of workgroups. Deterministic.
+#[allow(clippy::too_many_arguments)]
+pub fn colsum<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, term: ColTerm<'a>, out: &'a wgpu::Buffer, m: usize, k: usize, acc: bool) -> Option<[Disp<'a>; 2]> {
     let md = module(c)?;
-    Some(Disp {
-        pipe: &md.p["colsum_prod"],
-        uni: vec![m as u32, k as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        bufs: vec![(7, a), (8, b), (9, out)],
+    let rpb = 64usize.max(m.div_ceil(256));
+    let nblk = m.div_ceil(rpb).max(1);
+    if nblk * k > PART_WORDS {
+        return None;
+    }
+    let part = part_buf(c);
+    let (mode, b, f) = match term {
+        ColTerm::Prod(b) => (0u32, b, a),
+        ColTerm::ProdRow(b, f) => (1, b, f),
+        ColTerm::Plain => (2, a, a),
+    };
+    let p1 = Disp {
+        pipe: &md.p["colsum_part"],
+        uni: vec![m as u32, k as u32, 0, mode, rpb as u32, 0, 0, 0, 0, 0, 0, 0],
+        bufs: vec![(1, part), (2, f), (7, a), (8, b)],
+        grid: (k.div_ceil(256) as u32, nblk as u32, 1),
+    };
+    let p2 = Disp {
+        pipe: &md.p["colsum_fin"],
+        uni: vec![m as u32, k as u32, 0, 0, 0, nblk as u32, acc as u32, 0, 0, 0, 0, 0],
+        bufs: vec![(1, part), (9, out)],
         grid: (k.div_ceil(256) as u32, 1, 1),
+    };
+    Some([p1, p2])
+}
+
+/// One orientation of [`expand`]: `pl` `[rows][r]` (`trans` false) or
+/// `[r][rows]` (`trans` true).
+pub fn expand1<'a>(c: &'a Ctx, bits: &'a wgpu::Buffer, pl: &'a wgpu::Buffer, rows: usize, r: usize, trans: bool) -> Option<Disp<'a>> {
+    let md = module(c)?;
+    let (ep, b) = if trans { ("expand_t", 6) } else { ("expand_n", 5) };
+    Some(Disp {
+        pipe: &md.p[ep],
+        uni: vec![0, 0, 0, rows as u32, r as u32, r.div_ceil(32) as u32, 0, 0, 0, 0, 0, 0],
+        bufs: vec![(4, bits), (b, pl)],
+        grid: elt_fold(rows * r),
     })
+}
+
+/// The elementwise op fused into a column reduction's first pass.
+#[derive(Clone, Copy)]
+pub enum Fuse<'a> {
+    /// `dst = f16(a·col·scale)` (the [`cvt`] of `a` with a column factor)
+    CvtA(&'a wgpu::Buffer, &'a wgpu::Buffer, f32),
+    /// `dst = f16(b·col·scale)`
+    CvtB(&'a wgpu::Buffer, &'a wgpu::Buffer, f32),
+    /// `out (+)= b·col` (the [`scale_acc`] of `b`)
+    ScaleB(&'a wgpu::Buffer, &'a wgpu::Buffer, bool),
+}
+
+/// `sum[k] += Σ_rows a·b` fused with one elementwise op on `a` or `b`
+/// (each operand read once). Same partials and element arithmetic as
+/// [`colsum_prod`] followed by the separate op; `None` where the separate
+/// ops must run (the f16 staging needs `m` = its padded row count).
+#[allow(clippy::too_many_arguments)]
+pub fn colsum_fused<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, b: &'a wgpu::Buffer, sum: &'a wgpu::Buffer, m: usize, k: usize, op: Fuse<'a>) -> Option<[Disp<'a>; 2]> {
+    colsum_fused_tr(c, a, b, sum, m, k, op, None)
+}
+
+/// [`colsum_fused`] that also writes the transposed f16 operand of the sign
+/// gradient GEMM into `tr` = `[k][m]` (`m` tokens, a multiple of 32): the
+/// staged value of `Fuse::CvtA`/`CvtB`, or `f16(a·col)` for `Fuse::ScaleB` —
+/// what [`cvt_t`] would write.
+#[allow(clippy::too_many_arguments)]
+pub fn colsum_fused_tr<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, b: &'a wgpu::Buffer, sum: &'a wgpu::Buffer, m: usize, k: usize, op: Fuse<'a>, tr: Option<&'a wgpu::Buffer>) -> Option<[Disp<'a>; 2]> {
+    let md = module(c)?;
+    if pad_rows(m) != m || (tr.is_some() && (m % 32 != 0 || 64usize.max(m.div_ceil(256)) != 64)) {
+        return None;
+    }
+    let rpb = 64usize.max(m.div_ceil(256));
+    let nblk = m.div_ceil(rpb).max(1);
+    if nblk * k > PART_WORDS {
+        return None;
+    }
+    let part = part_buf(c);
+    // DST (f16) and OUT (f32) are both statically bound; the one the mode
+    // does not write aliases the partials buffer
+    let (mode, col, scale, accf, dst, out): (u32, &wgpu::Buffer, f32, u32, &wgpu::Buffer, &wgpu::Buffer) = match op {
+        Fuse::CvtA(colv, dst, sc) => (0, colv, sc, 0, dst, part),
+        Fuse::CvtB(colv, dst, sc) => (1, colv, sc, 0, dst, part),
+        Fuse::ScaleB(colv, out, acc) => (2, colv, 1.0, acc as u32, part, out),
+    };
+    let p1 = match tr {
+        None => Disp {
+            pipe: &md.p["colsum_fused"],
+            uni: vec![m as u32, k as u32, 0, mode, rpb as u32, 0, 0, accf, scale.to_bits(), 0, 0, 0],
+            bufs: vec![(1, part), (2, col), (3, dst), (7, a), (8, b), (9, out)],
+            grid: (k.div_ceil(256) as u32, nblk as u32, 1),
+        },
+        Some(t) => Disp {
+            pipe: &md.p["colsum_fused_t"],
+            uni: vec![m as u32, k as u32, m as u32, mode, rpb as u32, 0, 0, accf, scale.to_bits(), 1f32.to_bits(), 0, 0],
+            bufs: vec![(1, part), (2, col), (3, dst), (7, a), (8, b), (9, out), (10, t)],
+            grid: (k.div_ceil(256) as u32, nblk as u32, 1),
+        },
+    };
+    let p2 = Disp {
+        pipe: &md.p["colsum_fin"],
+        uni: vec![m as u32, k as u32, 0, 0, 0, nblk as u32, 1, 0, 0, 0, 0, 0],
+        bufs: vec![(1, part), (9, sum)],
+        grid: (k.div_ceil(256) as u32, 1, 1),
+    };
+    Some([p1, p2])
+}
+
+/// `out[k] += Σ_rows a[row][k]·b[row][k]` (two dispatches, see [`colsum`]).
+pub fn colsum_prod<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, b: &'a wgpu::Buffer, out: &'a wgpu::Buffer, m: usize, k: usize) -> Option<[Disp<'a>; 2]> {
+    colsum(c, a, ColTerm::Prod(b), out, m, k, true)
 }
 
 /// `out = a ⊙ col` per row (or `out += …` with `acc`).
@@ -375,10 +929,37 @@ pub fn scale_acc<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, col: &'a wgpu::Buffer, out
     })
 }
 
+/// `out[i] = f32(src[i])` for `n` halves of `src`.
+pub fn f16_to_f32<'a>(c: &'a Ctx, src: &'a wgpu::Buffer, out: &'a wgpu::Buffer, n: usize) -> Option<Disp<'a>> {
+    let md = module(c)?;
+    Some(Disp { pipe: &md.p["f16_to_f32"], uni: vec![0, n as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], bufs: vec![(3, src), (9, out)], grid: elt_fold(n) })
+}
+
+/// `out = a0 ⊙ col0 + a1 ⊙ col1` per row: [`scale_acc`] of path 0 then path 1
+/// (accumulating) in one pass, the same rounding.
+#[allow(clippy::too_many_arguments)]
+pub fn scale_acc2<'a>(c: &'a Ctx, a0: &'a wgpu::Buffer, col0: &'a wgpu::Buffer, a1: &'a wgpu::Buffer, col1: &'a wgpu::Buffer, out: &'a wgpu::Buffer, m: usize, k: usize) -> Option<Disp<'a>> {
+    let md = module(c)?;
+    Some(Disp {
+        pipe: &md.p["scale_acc2"],
+        uni: vec![m as u32, k as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        bufs: vec![(1, col1), (2, col0), (7, a0), (8, a1), (9, out)],
+        grid: elt_fold(m * k),
+    })
+}
+
 /// Small dense linear `out[m][r] (+)= a[m][k]·w[r][k]ᵀ` in f32.
 #[allow(clippy::too_many_arguments)]
 pub fn dense_fwd<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, w: &'a wgpu::Buffer, out: &'a wgpu::Buffer, m: usize, k: usize, r: usize, acc: bool) -> Option<Disp<'a>> {
     let md = module(c)?;
+    if r <= 48 && k % 4 == 0 && m.div_ceil(64) <= 65535 {
+        return Some(Disp {
+            pipe: &md.p["dense_fwd_t"],
+            uni: vec![m as u32, k as u32, 0, acc as u32, r as u32, 0, 0, 0, 0, 0, 0, 0],
+            bufs: vec![(7, a), (8, w), (9, out)],
+            grid: (m.div_ceil(64) as u32, 1, 1),
+        });
+    }
     Some(Disp {
         pipe: &md.p["dense_fwd"],
         uni: vec![m as u32, k as u32, 0, acc as u32, r as u32, 0, 0, 0, 0, 0, 0, 0],
@@ -391,6 +972,14 @@ pub fn dense_fwd<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, w: &'a wgpu::Buffer, out: 
 #[allow(clippy::too_many_arguments)]
 pub fn dense_bwd<'a>(c: &'a Ctx, dy: &'a wgpu::Buffer, w: &'a wgpu::Buffer, dx: &'a wgpu::Buffer, m: usize, k: usize, r: usize) -> Option<Disp<'a>> {
     let md = module(c)?;
+    if m.div_ceil(4) <= 65535 {
+        return Some(Disp {
+            pipe: &md.p["dense_bwd_t"],
+            uni: vec![m as u32, k as u32, 0, 0, r as u32, 0, 0, 0, 0, 0, 0, 0],
+            bufs: vec![(7, dy), (8, w), (9, dx)],
+            grid: (k.div_ceil(256) as u32, m.div_ceil(4) as u32, 1),
+        });
+    }
     Some(Disp {
         pipe: &md.p["dense_bwd"],
         uni: vec![m as u32, k as u32, 0, 0, r as u32, 0, 0, 0, 0, 0, 0, 0],
@@ -428,6 +1017,84 @@ pub fn adam<'a>(c: &'a Ctx, w: &'a wgpu::Buffer, g: &'a wgpu::Buffer, m1: &'a wg
     })
 }
 
+/// [`adam`] over a concatenation of `n` parameter entries (`mask`: 0 =
+/// frozen; `relf`: per-entry relative floor as f32 bits, 0 = plain steps).
+#[allow(clippy::too_many_arguments)]
+pub fn adam_cat<'a>(c: &'a Ctx, w: &'a wgpu::Buffer, g: &'a wgpu::Buffer, m1: &'a wgpu::Buffer, m2: &'a wgpu::Buffer, mask: &'a wgpu::Buffer, relf: &'a wgpu::Buffer, n: usize, lr: f32, step: u32, b1: f32, b2: f32, eps: f32, gmul: f32) -> Option<Disp<'a>> {
+    let md = module(c)?;
+    Some(Disp {
+        pipe: &md.p["adam_cat"],
+        uni: vec![step, n as u32, 0, 0, 0, 0, gmul.to_bits(), 0, lr.to_bits(), b1.to_bits(), b2.to_bits(), eps.to_bits()],
+        bufs: vec![(1, w), (2, mask), (4, relf), (7, g), (8, m1), (9, m2)],
+        grid: elt_fold(n),
+    })
+}
+
+/// [`sumsq`] partials of `np` parameters of a concatenation `a` (`tab`:
+/// offset, length per parameter) into `out[64·np]`.
+pub fn sumsq_cat<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, tab: &'a wgpu::Buffer, out: &'a wgpu::Buffer, np: usize) -> Option<Disp<'a>> {
+    let md = module(c)?;
+    Some(Disp { pipe: &md.p["sumsq_cat"], uni: vec![64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], bufs: vec![(4, tab), (7, a), (9, out)], grid: (64, np as u32, 1) })
+}
+
+/// Record `ops` as one compute pass into `enc` (no submit).
+pub fn record(c: &Ctx, enc: &mut wgpu::CommandEncoder, ops: &[Op]) {
+    let prof = super::train_prof::on();
+    let mut groups = Vec::new();
+    for op in ops {
+        if let Op::D(d) = op {
+            let mut words = d.uni.clone();
+            while words.len() % 4 != 0 {
+                words.push(0);
+            }
+            if prof {
+                use super::train_prof::{Cnt, count};
+                count(Cnt::Buf, 1);
+                count(Cnt::Write, 1);
+                count(Cnt::WriteBytes, (words.len() * 4) as u64);
+                count(Cnt::BindGroup, 1);
+            }
+            let u = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("train_p"),
+                size: (words.len() * 4) as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            c.queue.write_buffer(&u, 0, bytemuck::cast_slice(&words));
+            let mut entries = vec![wgpu::BindGroupEntry { binding: 0, resource: u.as_entire_binding() }];
+            for &(b, buf) in &d.bufs {
+                entries.push(wgpu::BindGroupEntry { binding: b, resource: buf.as_entire_binding() });
+            }
+            groups.push(Some(c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("train"),
+                layout: &d.pipe.get_bind_group_layout(0),
+                entries: &entries,
+            })));
+        } else {
+            groups.push(None);
+        }
+    }
+    let mut ps = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+    let mut mk = super::train_prof::pass_begin(c, &mut ps);
+    for (op, bg) in ops.iter().zip(&groups) {
+        match op {
+            Op::D(d) => {
+                ps.set_pipeline(d.pipe);
+                ps.set_bind_group(0, bg.as_ref().unwrap(), &[]);
+                ps.dispatch_workgroups(d.grid.0, d.grid.1, d.grid.2);
+            }
+            Op::M(m) => m.record(&mut ps),
+        }
+        if prof {
+            let (name, mnk) = match op {
+                Op::D(d) => (super::train_prof::pipe_name(d.pipe), [0; 3]),
+                Op::M(m) => ("mm", m.mnk),
+            };
+            super::train_prof::pass_mark(c, &mut ps, &mut mk, name, mnk);
+        }
+    }
+}
+
 /// Sum of squares of `n` floats of `a` (64 workgroup partials summed on the host).
 pub fn sumsq(c: &Ctx, a: &wgpu::Buffer, n: usize) -> Option<f64> {
     let md = module(c)?;
@@ -449,6 +1116,21 @@ pub fn mm(c: &Ctx, plane: &wgpu::Buffer, act: &wgpu::Buffer, out: &wgpu::Buffer,
 /// matrices, f16, 32-wide subgroups); without them every `mm` declines.
 pub fn matrix_units() -> bool {
     zi::zctx().is_some()
+}
+
+/// [`mm`] with the plane given as a sign bitmap of `words` u32 per row,
+/// expanded to ±1 inside the GEMM's staging (no f16 plane, no expand pass):
+/// `trans` false = bits `[n][words]` (the plane's own rows), true = bits
+/// `[k][words]` (the plane is the bitmap's transpose). Same products as
+/// [`mm`] on the expanded plane. `None` where unavailable (`CMF_MM_BITS=0`).
+#[allow(clippy::too_many_arguments)]
+pub fn mm_bits(c: &Ctx, bits: &wgpu::Buffer, words: usize, trans: bool, act: &wgpu::Buffer, out: &wgpu::Buffer, m: usize, n: usize, k: usize, oscale: f32) -> Option<zi::MmCall> {
+    if std::env::var("CMF_MM_BITS").as_deref() == Ok("0") {
+        return None;
+    }
+    let g = zi::MmCfg { bits: if trans { 2 } else { 1 }, ..zi::default_cfg(Epi::F32) };
+    let a = zi::MmArgs { m: m as u32, n: n as u32, k: k as u32, ldo: n as u32, ocol: 0, arow: 0, oscale, conv: [words as u32, 0, 0] };
+    zi::mm_call(c, g, &a, bits, act, out)
 }
 
 /// [`mm`] into columns `ocol..ocol+n` of an output with row stride `ldo`.
@@ -507,21 +1189,53 @@ pub struct BlrScratch {
     pub(super) t2: wgpu::Buffer, // f32 [ntok][r]
 }
 
+/// The transient buffers of the blr ops — each lives only inside one path's
+/// op list — shared by the scratch of every role (one layer runs at a time).
+/// A path's forward reads S_U and S_Vᵀ, its backward S_Uᵀ and S_V, so one
+/// plane buffer per factor serves both orientations.
+pub struct BlrShared {
+    pu: wgpu::Buffer,
+    pv: wgpu::Buffer,
+    xh: wgpu::Buffer,
+    t1: wgpu::Buffer,
+    t2: wgpu::Buffer,
+}
+
+impl BlrShared {
+    /// For roles of at most `mr` = m·r and `nr` = n·r plane entries, `mx` =
+    /// max(m, n, r), `mn` = max(m, n) and rank `r`.
+    pub fn new(c: &Ctx, ntok: usize, mr: usize, nr: usize, mx: usize, mn: usize, r: usize) -> Self {
+        let pr = pad_rows(ntok);
+        BlrShared {
+            pu: f16_buf(c, mr),
+            pv: f16_buf(c, nr),
+            xh: f16_buf(c, pr * mx),
+            t1: train_ops::zeros_u32(c, pr * mn),
+            t2: train_ops::zeros_u32(c, pr * r),
+        }
+    }
+}
+
 impl BlrScratch {
     pub fn new(c: &Ctx, ntok: usize, m: usize, n: usize, r: usize, paths: usize) -> Self {
-        let mx = m.max(n).max(r);
-        let z = |len: usize| train_ops::zeros(c, len);
+        let sh = BlrShared::new(c, ntok, m * r, n * r, m.max(n).max(r), m.max(n), r);
+        Self::with_shared(c, ntok, m, r, paths, &sh)
+    }
+
+    /// A role's scratch: its own a and c per path, the transients from `sh`.
+    pub fn with_shared(c: &Ctx, ntok: usize, m: usize, r: usize, paths: usize, sh: &BlrShared) -> Self {
+        let z = |len: usize| train_ops::zeros_u32(c, len);
         BlrScratch {
             ntok,
-            pl_u: f16_buf(c, m * r),
-            plt_u: f16_buf(c, m * r),
-            pl_v: f16_buf(c, n * r),
-            plt_v: f16_buf(c, n * r),
-            xh: f16_buf(c, pad_rows(ntok) * mx),
+            pl_u: sh.pu.clone(),
+            plt_u: sh.pu.clone(),
+            pl_v: sh.pv.clone(),
+            plt_v: sh.pv.clone(),
+            xh: sh.xh.clone(),
             a: (0..paths).map(|_| z(pad_rows(ntok) * r)).collect(),
             cbuf: (0..paths).map(|_| z(pad_rows(ntok) * m)).collect(),
-            t1: z(pad_rows(ntok) * m.max(n)),
-            t2: z(pad_rows(ntok) * r),
+            t1: sh.t1.clone(),
+            t2: sh.t2.clone(),
         }
     }
 }
@@ -529,17 +1243,43 @@ impl BlrScratch {
 /// Forward of `layer` on `x` (`[ntok][n]`) into `y` (`[ntok][m]`, overwritten).
 /// Keeps a and c of every path in the scratch for [`blr_backward`].
 pub fn blr_forward(c: &Ctx, layer: &Blr, s: &BlrScratch, x: &wgpu::Buffer, y: &wgpu::Buffer, ntok: usize) -> Option<()> {
+    blr_forward_staged(c, layer, s, x, y, ntok, None)
+}
+
+/// [`blr_forward`] with each path's input staging `f16(x⊙g_p)` already done
+/// (`xin[p]`, e.g. by one [`cvt_multi`] for every path reading `x`).
+pub fn blr_forward_staged(c: &Ctx, layer: &Blr, s: &BlrScratch, x: &wgpu::Buffer, y: &wgpu::Buffer, ntok: usize, xin: Option<&[wgpu::Buffer]>) -> Option<()> {
     let (m, n, r) = (layer.m, layer.n, layer.r);
+    let np = layer.paths.len();
     for (pi, p) in layer.paths.iter().enumerate() {
-        let ops = vec![
-            Op::D(expand(c, &p.bits_u, &s.pl_u, &s.plt_u, m, r)?),
-            Op::D(expand(c, &p.bits_v, &s.pl_v, &s.plt_v, n, r)?),
-            Op::D(cvt(c, x, Some(&p.g), &s.xh, ntok, n, 1.0)?),
-            Op::M(mm(c, &s.plt_v, &s.xh, &s.a[pi], ntok, r, n, 1.0)?),
-            Op::D(cvt(c, &s.a[pi], Some(&p.l), &s.xh, ntok, r, 1.0)?),
-            Op::M(mm(c, &s.pl_u, &s.xh, &s.cbuf[pi], ntok, m, r, 1.0)?),
-            Op::D(scale_acc(c, &s.cbuf[pi], &p.h, y, ntok, m, pi > 0)?),
-        ];
+        let w = r / 32;
+        let xs = xin.map(|v| &v[pi]);
+        let mut ops = match (mm_bits(c, &p.bits_v, w, true, xs.unwrap_or(&s.xh), &s.a[pi], ntok, r, n, 1.0), mm_bits(c, &p.bits_u, w, false, &s.xh, &s.cbuf[pi], ntok, m, r, 1.0)) {
+            // the GEMMs read the bitmaps themselves
+            (Some(g1), Some(g2)) => {
+                let mut v = Vec::with_capacity(5);
+                if xs.is_none() {
+                    v.push(Op::D(cvt(c, x, Some(&p.g), &s.xh, ntok, n, 1.0)?));
+                }
+                v.extend([Op::M(g1), Op::D(cvt(c, &s.a[pi], Some(&p.l), &s.xh, ntok, r, 1.0)?), Op::M(g2)]);
+                v
+            }
+            // expanded planes (stages its own input into xh)
+            _ => vec![
+                Op::D(expand1(c, &p.bits_u, &s.pl_u, m, r, false)?),
+                Op::D(expand1(c, &p.bits_v, &s.plt_v, n, r, true)?),
+                Op::D(cvt(c, x, Some(&p.g), &s.xh, ntok, n, 1.0)?),
+                Op::M(mm(c, &s.plt_v, &s.xh, &s.a[pi], ntok, r, n, 1.0)?),
+                Op::D(cvt(c, &s.a[pi], Some(&p.l), &s.xh, ntok, r, 1.0)?),
+                Op::M(mm(c, &s.pl_u, &s.xh, &s.cbuf[pi], ntok, m, r, 1.0)?),
+            ],
+        };
+        // y = Σ_p h_p ⊙ c_p: a two-path linear in one pass after its second path
+        if np != 2 {
+            ops.push(Op::D(scale_acc(c, &s.cbuf[pi], &p.h, y, ntok, m, pi > 0)?));
+        } else if pi == 1 {
+            ops.push(Op::D(scale_acc2(c, &s.cbuf[0], &layer.paths[0].h, &s.cbuf[1], &p.h, y, ntok, m)?));
+        }
         run(c, &ops);
     }
     Some(())
@@ -560,31 +1300,87 @@ pub fn blr_forward(c: &Ctx, layer: &Blr, s: &BlrScratch, x: &wgpu::Buffer, y: &w
 pub fn blr_backward(c: &Ctx, layer: &Blr, s: &BlrScratch, x: &wgpu::Buffer, dy: &wgpu::Buffer, dx: &wgpu::Buffer, ntok: usize, gscale: f32, sign: Option<&train_sign::SignCtx>) -> Option<()> {
     let (m, n, r) = (layer.m, layer.n, layer.r);
     for (pi, p) in layer.paths.iter().enumerate() {
-        let mut ops = vec![
-            Op::D(expand(c, &p.bits_u, &s.pl_u, &s.plt_u, m, r)?),
-            Op::D(expand(c, &p.bits_v, &s.pl_v, &s.plt_v, n, r)?),
-            Op::D(colsum_prod(c, dy, &s.cbuf[pi], &p.dh, ntok, m)?),
-            Op::D(cvt(c, dy, Some(&p.h), &s.xh, ntok, m, gscale)?),
-            Op::M(mm(c, &s.plt_u, &s.xh, &s.t2, ntok, r, m, 1.0 / gscale)?),
-            Op::D(colsum_prod(c, &s.a[pi], &s.t2, &p.dl, ntok, r)?),
-            Op::D(cvt(c, &s.t2, Some(&p.l), &s.xh, ntok, r, gscale)?),
-            Op::M(mm(c, &s.pl_v, &s.xh, &s.t1, ntok, n, r, 1.0 / gscale)?),
-            Op::D(colsum_prod(c, x, &s.t1, &p.dg, ntok, n)?),
-            Op::D(scale_acc(c, &s.t1, &p.g, dx, ntok, n, pi > 0)?),
-        ];
+        let w = r / 32;
+        let bits_mm = (mm_bits(c, &p.bits_u, w, true, &s.xh, &s.t2, ntok, r, m, 1.0 / gscale), mm_bits(c, &p.bits_v, w, false, &s.xh, &s.t1, ntok, n, r, 1.0 / gscale));
+        let (g_t2, g_t1) = match bits_mm {
+            (Some(a), Some(b)) => (a, b),
+            _ => (mm(c, &s.plt_u, &s.xh, &s.t2, ntok, r, m, 1.0 / gscale)?, mm(c, &s.pl_v, &s.xh, &s.t1, ntok, n, r, 1.0 / gscale)?),
+        };
+        let mut ops = Vec::new();
+        if !g_t2.reads_bits() {
+            ops.push(Op::D(expand1(c, &p.bits_u, &s.plt_u, m, r, true)?));
+            ops.push(Op::D(expand1(c, &p.bits_v, &s.pl_v, n, r, false)?));
+        }
+        // each column reduction fused with the elementwise op that reads the
+        // same operand (dy, t2, t1 read once); with sign training the same
+        // passes also write the transposed f16 operands of the sign
+        // gradients (dy·h·gs, t2·l·gs, x·g); separate ops where they cannot
+        let sgn = match (sign, p.sign.as_ref()) {
+            (Some(ctx), Some(_)) => Some(ctx.sc),
+            _ => None,
+        };
+        let (mut tr_dy, mut tr_t2, mut tr_x) = (false, false, false);
+        match colsum_fused_tr(c, dy, &s.cbuf[pi], &p.dh, ntok, m, Fuse::CvtA(&p.h, &s.xh, gscale), sgn.map(|sc| &sc.t_big)) {
+            Some([a, b]) => {
+                tr_dy = sgn.is_some();
+                ops.extend([Op::D(a), Op::D(b)]);
+            }
+            None => match colsum_fused(c, dy, &s.cbuf[pi], &p.dh, ntok, m, Fuse::CvtA(&p.h, &s.xh, gscale)) {
+                Some([a, b]) => ops.extend([Op::D(a), Op::D(b)]),
+                None => {
+                    let [a, b] = colsum_prod(c, dy, &s.cbuf[pi], &p.dh, ntok, m)?;
+                    ops.extend([Op::D(a), Op::D(b), Op::D(cvt(c, dy, Some(&p.h), &s.xh, ntok, m, gscale)?)]);
+                }
+            },
+        }
+        ops.push(Op::M(g_t2));
+        match colsum_fused_tr(c, &s.a[pi], &s.t2, &p.dl, ntok, r, Fuse::CvtB(&p.l, &s.xh, gscale), sgn.map(|sc| &sc.t_small2)) {
+            Some([a, b]) => {
+                tr_t2 = sgn.is_some();
+                ops.extend([Op::D(a), Op::D(b)]);
+            }
+            None => match colsum_fused(c, &s.a[pi], &s.t2, &p.dl, ntok, r, Fuse::CvtB(&p.l, &s.xh, gscale)) {
+                Some([a, b]) => ops.extend([Op::D(a), Op::D(b)]),
+                None => {
+                    let [a, b] = colsum_prod(c, &s.a[pi], &s.t2, &p.dl, ntok, r)?;
+                    ops.extend([Op::D(a), Op::D(b), Op::D(cvt(c, &s.t2, Some(&p.l), &s.xh, ntok, r, gscale)?)]);
+                }
+            },
+        }
+        ops.push(Op::M(g_t1));
+        match colsum_fused_tr(c, x, &s.t1, &p.dg, ntok, n, Fuse::ScaleB(&p.g, dx, pi > 0), sgn.map(|sc| &sc.t_big2)) {
+            Some([a, b]) => {
+                tr_x = sgn.is_some();
+                ops.extend([Op::D(a), Op::D(b)]);
+            }
+            None => match colsum_fused(c, x, &s.t1, &p.dg, ntok, n, Fuse::ScaleB(&p.g, dx, pi > 0)) {
+                Some([a, b]) => ops.extend([Op::D(a), Op::D(b)]),
+                None => {
+                    let [a, b] = colsum_prod(c, x, &s.t1, &p.dg, ntok, n)?;
+                    ops.extend([Op::D(a), Op::D(b), Op::D(scale_acc(c, &s.t1, &p.g, dx, ntok, n, pi > 0)?)]);
+                }
+            },
+        }
+        let sign_from = ops.len();
         if let (Some(ctx), Some(sp)) = (sign, p.sign.as_ref()) {
             let sc = ctx.sc;
             let kpad = sc.kpad;
-            ops.push(Op::D(cvt_t(c, dy, Some(&p.h), &sc.t_big, ntok, m, gscale)?));
+            if !tr_dy {
+                ops.push(Op::D(cvt_t(c, dy, Some(&p.h), &sc.t_big, ntok, m, gscale)?));
+            }
             ops.push(Op::D(cvt_t(c, &s.a[pi], Some(&p.l), &sc.t_small, ntok, r, 1.0)?));
             ops.push(Op::M(mm(c, &sc.t_small, &sc.t_big, &sc.g, m, r, kpad, 1.0 / gscale)?));
             ops.extend(train_sign::grad_consumer_ops(c, ctx, &sp.u, &p.bits_u, 0)?);
-            ops.push(Op::D(cvt_t(c, x, Some(&p.g), &sc.t_big, ntok, n, 1.0)?));
-            ops.push(Op::D(cvt_t(c, &s.t2, Some(&p.l), &sc.t_small, ntok, r, gscale)?));
-            ops.push(Op::M(mm(c, &sc.t_small, &sc.t_big, &sc.g, n, r, kpad, 1.0 / gscale)?));
+            if !tr_x {
+                ops.push(Op::D(cvt_t(c, x, Some(&p.g), &sc.t_big2, ntok, n, 1.0)?));
+            }
+            if !tr_t2 {
+                ops.push(Op::D(cvt_t(c, &s.t2, Some(&p.l), &sc.t_small2, ntok, r, gscale)?));
+            }
+            ops.push(Op::M(mm(c, &sc.t_small2, &sc.t_big2, &sc.g, n, r, kpad, 1.0 / gscale)?));
             ops.extend(train_sign::grad_consumer_ops(c, ctx, &sp.v, &p.bits_v, 1)?);
         }
-        run(c, &ops);
+        run_tagged(c, &ops, sign_from, "sign");
     }
     Some(())
 }
@@ -604,6 +1400,26 @@ mod tests {
                 (((s >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0) as f32 * scale
             })
             .collect()
+    }
+
+    /// The one-pass two-path scale gives the bits of scale_acc twice.
+    #[test]
+    fn scale_acc2_matches_two_passes() {
+        let Some(c) = train_ops::dev() else { return };
+        let (m, k) = (64usize, 1024usize);
+        let a0 = rnd(m * k, 1, 1.0);
+        let a1 = rnd(m * k, 2, 1.0);
+        let c0 = rnd(k, 3, 1.0);
+        let c1 = rnd(k, 4, 1.0);
+        let (ba0, ba1, bc0, bc1) = (upload(c, &a0), upload(c, &a1), upload(c, &c0), upload(c, &c1));
+        let y = zeros(c, m * k);
+        run(c, &[Op::D(scale_acc(c, &ba0, &bc0, &y, m, k, false).unwrap()), Op::D(scale_acc(c, &ba1, &bc1, &y, m, k, true).unwrap())]);
+        let want = download(c, &y, m * k).unwrap();
+        let out = zeros(c, m * k);
+        run(c, &[Op::D(scale_acc2(c, &ba0, &bc0, &ba1, &bc1, &out, m, k).unwrap())]);
+        let got = download(c, &out, m * k).unwrap();
+        let diff = got.iter().zip(&want).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        assert_eq!(diff, 0, "{diff} of {} differ", m * k);
     }
 
     /// Two-path blr layer forward and backward against an f64 reference

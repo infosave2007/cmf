@@ -24,12 +24,16 @@ use crate::gpu_wgpu::gdn_train::{self as gdn, GdnTape, GdnTrainCfg};
 use crate::gpu_wgpu::train_head::{self as th, Head, HeadScratch};
 use crate::gpu_wgpu::train_mm::{self as tm, Blr, BlrPath, BlrScratch, Op};
 use crate::gpu_wgpu::train_sign::{self as ts, SignCtx, SignInit, SignScratch, SignStepCfg};
+use crate::gpu_wgpu::train_attn::{self as ta, AttScratch};
 use crate::gpu_wgpu::train_ops::{self as to, AttnGeom, QkrGeom};
 use cortiq_core::quant::{dequant_tensor, f16_to_f32, f32_to_f16};
 use cortiq_core::{CmfModel, LayerType, NormStyle};
 use std::collections::HashMap;
 
 type Ctx = crate::gpu_wgpu::CtxRef;
+
+/// The opt-in step profiler (`CMF_NVG_PROF`, see `gpu_wgpu::train_prof`).
+pub use crate::gpu_wgpu::train_prof as prof;
 
 // ───────────────────────────── geometry ─────────────────────────────
 
@@ -173,6 +177,25 @@ pub struct Layer {
     pub down: Lin,
 }
 
+/// Every parameter laid end to end, for the optimizer: one dispatch for all
+/// gradient norms and one for all Adam steps instead of thousands (values,
+/// moments and gradients are copied in and back; the arithmetic per entry
+/// is that of `train_mm::{sumsq, adam}`).
+struct OptCat {
+    off: Vec<usize>,
+    total: usize,
+    g: wgpu::Buffer,
+    w: wgpu::Buffer,
+    m1: wgpu::Buffer,
+    m2: wgpu::Buffer,
+    mask: wgpu::Buffer,
+    relf: wgpu::Buffer,
+    tab: wgpu::Buffer,
+    part: wgpu::Buffer,
+    /// `g` holds this step's gradients (set by `grad_norm`).
+    g_fresh: std::sync::atomic::AtomicBool,
+}
+
 pub struct Net {
     pub geom: Geom,
     pub layers: Vec<Layer>,
@@ -182,6 +205,7 @@ pub struct Net {
     embed: Vec<u16>,
     /// Sign matrices with training state (ids 0..n_sign_mats).
     pub n_sign_mats: u32,
+    opt: std::sync::OnceLock<OptCat>,
 }
 
 fn deq(m: &CmfModel, name: &str) -> Result<(Vec<f32>, Vec<usize>), String> {
@@ -365,7 +389,7 @@ impl Net {
         // vocabulary slices keep each plane within one storage binding.
         let head = Head::new(c, &head_w, v, hs, bwd, None);
         let embed = emb.iter().map(|&f| f32_to_f16(f)).collect();
-        Ok(Net { geom, layers, final_norm, head, embed, n_sign_mats: next_id })
+        Ok(Net { geom, layers, final_norm, head, embed, n_sign_mats: next_id, opt: std::sync::OnceLock::new() })
     }
 
     /// Every binary low-rank linear with its tensor name, in a fixed order
@@ -456,6 +480,19 @@ pub struct Work {
     head: HeadScratch,
     /// Sign-training workspace (when the net carries sign state).
     pub sg: Option<SignScratch>,
+    /// Matrix-unit attention scratch (when the geometry allows it).
+    att: Option<AttScratch>,
+    /// The step's embedding rows as f16: a persistent mapped upload buffer
+    /// (re-mapped right after its copy; `emb_mapped` set by the callback)
+    /// and its device copy, converted to f32 into the first checkpoint.
+    emb_up: wgpu::Buffer,
+    emb16: wgpu::Buffer,
+    emb_mapped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Input staging f16(x⊙g) of up to four blr paths reading the same x
+    /// (`lin_fwd_shared`): two buffers for the widest input, two for
+    /// `stage_small` columns.
+    stage: Vec<wgpu::Buffer>,
+    stage_small: usize,
 }
 
 impl Work {
@@ -529,7 +566,12 @@ impl Work {
             add(&l.up);
             add(&l.down);
         }
-        let blr: HashMap<_, _> = dims.into_iter().map(|(role, (m, n, r, np))| (role, BlrScratch::new(c, ntok, m, n, r, np))).collect();
+        // one set of transient blr buffers for every role (one layer runs at a time)
+        let sh = {
+            let mx = |f: &dyn Fn(&(usize, usize, usize, usize)) -> usize| dims.values().map(f).max().unwrap_or(1).max(1);
+            tm::BlrShared::new(c, ntok, mx(&|d| d.0 * d.2), mx(&|d| d.1 * d.2), mx(&|d| d.0.max(d.1).max(d.2)), mx(&|d| d.0.max(d.1)), mx(&|d| d.2))
+        };
+        let blr: HashMap<_, _> = dims.into_iter().map(|(role, (m, _n, r, np))| (role, BlrScratch::with_shared(c, ntok, m, r, np, &sh))).collect();
         let tape = g.gdn_layer.iter().any(|&x| x).then(|| {
             let zeros = vec![0f32; g.nv];
             let conv = vec![0f32; g.c_dim() * g.kk];
@@ -555,8 +597,44 @@ impl Work {
             act16: tm::f16_buf(c, pr * act_w),
             tape,
             rope: to::upload(c, &tab),
-            head: HeadScratch::new(c, 256.min(ntok), g.vocab, g.hs),
+            // 1024-row chunks: 4x fewer passes over the head planes, and the
+            // dlogits·W GEMM gets 320 workgroups instead of 80 (the logits
+            // buffer, 1 GB at a 248k vocabulary, stays under the binding limit)
+            head: HeadScratch::new(c, 1024.min(ntok), g.vocab, g.hs),
             sg: (sg_rows > 0).then(|| SignScratch::new(c, ntok, sg_rows, sg_rp)),
+            att: g
+                .gdn_layer
+                .iter()
+                .any(|&x| !x)
+                .then_some(AttnGeom { nb, t, nh: g.nh, nkv: g.nkv, hd: g.hd })
+                .filter(|ag| ta::usable(c, ag))
+                .map(|ag| AttScratch::new(c, &ag)),
+            emb_up: c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("nvg_emb_up"),
+                size: ((ntok * g.hs).div_ceil(2) * 4) as u64,
+                usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: true,
+            }),
+            emb16: tm::f16_buf(c, ntok * g.hs),
+            emb_mapped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            stage: {
+                let wide = net
+                    .layers
+                    .iter()
+                    .flat_map(|l| {
+                        let mut v = vec![&l.gate, &l.up, &l.down];
+                        match &l.mix {
+                            Mix::Gdn { qkv, z, out, .. } => v.extend([qkv, z, out]),
+                            Mix::Attn { q, k, v: vv, o, .. } => v.extend([q, k, vv, o]),
+                        }
+                        v
+                    })
+                    .filter_map(|l| if let Lin::Blr { blr, .. } = l { Some(blr.n) } else { None })
+                    .max()
+                    .unwrap_or(0);
+                [wide, wide, g.hs, g.hs].iter().map(|&n| tm::f16_buf(c, pr * n.max(1))).collect()
+            },
+            stage_small: g.hs,
         }
     }
     fn get(&self, n: &str) -> &wgpu::Buffer {
@@ -586,6 +664,59 @@ fn lin_fwd(c: Ctx, w: &Work, lin: &Lin, x: &wgpu::Buffer, y: &wgpu::Buffer, acc:
             Some(())
         }
     }
+}
+
+/// Forward of linears that all read `x` (each into its own output): the
+/// input staging f16(x⊙g) of every binary low-rank path is done by one
+/// `cvt_multi` per group of up to four paths, so `x` is read once a group
+/// instead of once a path. The other linears run as [`lin_fwd`].
+fn lin_fwd_shared(c: Ctx, w: &Work, lins: &[(&Lin, &wgpu::Buffer)], x: &wgpu::Buffer) -> Option<()> {
+    let ntok = w.ntok;
+    let paths = |l: &Lin| if let Lin::Blr { blr, .. } = l { blr.paths.len() } else { 0 };
+    let mut i = 0;
+    while i < lins.len() {
+        let Lin::Blr { blr, .. } = lins[i].0 else {
+            lin_fwd(c, w, lins[i].0, x, lins[i].1, false)?;
+            i += 1;
+            continue;
+        };
+        // a group of consecutive blr linears: ≤ 4 paths, buffers 2 and 3 only
+        // for inputs that fit them
+        let n = blr.n;
+        let (mut j, mut np) = (i, 0usize);
+        while j < lins.len() {
+            let pj = paths(lins[j].0);
+            let nj = if let Lin::Blr { blr: b, .. } = lins[j].0 { b.n } else { usize::MAX };
+            if pj == 0 || nj != n || np + pj > 4 || (np + pj > 2 && n > w.stage_small) {
+                break;
+            }
+            np += pj;
+            j += 1;
+        }
+        if np < 2 {
+            lin_fwd(c, w, lins[i].0, x, lins[i].1, false)?;
+            i += 1;
+            continue;
+        }
+        let mut cols: Vec<&wgpu::Buffer> = Vec::with_capacity(np);
+        for (l, _) in &lins[i..j] {
+            if let Lin::Blr { blr, .. } = l {
+                cols.extend(blr.paths.iter().map(|p| &p.g));
+            }
+        }
+        let dsts: Vec<&wgpu::Buffer> = w.stage[..np].iter().collect();
+        tm::run(c, &[Op::D(tm::cvt_multi(c, x, &cols, &dsts, ntok, n, 1.0)?)]);
+        let mut k = 0;
+        for (l, y) in &lins[i..j] {
+            if let Lin::Blr { blr, role, .. } = l {
+                let pn = blr.paths.len();
+                tm::blr_forward_staged(c, blr, &w.blr[role], x, y, ntok, Some(&w.stage[k..k + pn]))?;
+                k += pn;
+            }
+        }
+        i = j;
+    }
+    Some(())
 }
 
 /// Input gradient into `dx` (overwritten, or accumulated with `acc`), metric
@@ -632,7 +763,9 @@ fn lin_bwd(c: Ctx, w: &Work, lin: &Lin, x: &wgpu::Buffer, dy: &wgpu::Buffer, dx:
 
 fn zero(c: Ctx, b: &wgpu::Buffer, n: usize) {
     let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("zero") });
+    let mut mk = prof::enc_begin(c, &mut enc);
     enc.clear_buffer(b, 0, Some((n * 4) as u64));
+    prof::enc_mark(c, &mut enc, &mut mk, "clear");
     crate::gpu_wgpu::submit_pub(c, enc.finish());
 }
 
@@ -642,7 +775,9 @@ fn copy(c: Ctx, src: &wgpu::Buffer, dst: &wgpu::Buffer, n: usize) {
 
 fn copy_off(c: Ctx, src: &wgpu::Buffer, so: usize, dst: &wgpu::Buffer, d_o: usize, n: usize) {
     let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("copy") });
+    let mut mk = prof::enc_begin(c, &mut enc);
     enc.copy_buffer_to_buffer(src, (so * 4) as u64, dst, (d_o * 4) as u64, (n * 4) as u64);
+    prof::enc_mark(c, &mut enc, &mut mk, "copy");
     crate::gpu_wgpu::submit_pub(c, enc.finish());
 }
 
@@ -655,12 +790,15 @@ fn gdn_params(c: Ctx, w: &Work, g: &Geom, a_log: &[f32], dt_bias: &[f32], norm: 
     prm.extend_from_slice(dt_bias);
     prm.extend_from_slice(norm);
     prm.extend_from_slice(conv);
+    prof::count(prof::Cnt::Write, 1);
+    prof::count(prof::Cnt::WriteBytes, (prm.len() * 4) as u64);
     c.queue.write_buffer(tape.prm(), 0, bytemuck::cast_slice(&prm));
 }
 
 /// Forward of layer `l` from `x` (`w.x` is the input) to `y`; intermediates
-/// stay in the workspace for the backward.
-fn layer_fwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, y: &wgpu::Buffer) -> Option<()> {
+/// stay in the workspace for the backward (`rec`: the recompute right before
+/// the layer's backward — only it records the GDN tape's checkpoints).
+fn layer_fwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, y: &wgpu::Buffer, rec: bool) -> Option<()> {
     let g = &net.geom;
     let ly = &net.layers[l];
     let n = w.ntok;
@@ -669,44 +807,51 @@ fn layer_fwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, y: &wgpu::
         Mix::Gdn { qkv, z, a, b, out, a_log, dt_bias, norm, conv } => {
             let tape = w.tape.as_ref().unwrap();
             gdn_params(c, w, g, a_log, dt_bias, norm, conv);
-            lin_fwd(c, w, qkv, w.get("n1"), tape.raw(), false)?;
-            lin_fwd(c, w, z, w.get("n1"), tape.z(), false)?;
+            lin_fwd_shared(c, w, &[(qkv, tape.raw()), (z, tape.z())], w.get("n1"))?;
             // a and b into the two halves of the tape's a|b buffer
             lin_fwd(c, w, a, w.get("n1"), w.get("gout"), false)?;
             copy_off(c, w.get("gout"), 0, tape.ab(), 0, n * g.nv);
             lin_fwd(c, w, b, w.get("n1"), w.get("gout"), false)?;
             copy_off(c, w.get("gout"), 0, tape.ab(), n * g.nv, n * g.nv);
-            gdn::gdn_forward_dev(tape, g.nk, g.nv, g.c_dim())?;
+            gdn::gdn_forward_dev(tape, g.nk, g.nv, g.c_dim(), rec)?;
             copy(c, tape.out(), w.get("gout"), n * g.vd());
-            lin_fwd(c, w, out, w.get("gout"), w.get("mix"), false)?;
+            lin_fwd_shared(c, w, &[(out, w.get("mix"))], w.get("gout"))?;
         }
         Mix::Attn { q, k, v, o, qn, kn } => {
             let (qd, kd) = (g.nh * g.hd, g.nkv * g.hd);
-            lin_fwd(c, w, q, w.get("n1"), w.get("qg"), false)?;
-            lin_fwd(c, w, k, w.get("n1"), w.get("k"), false)?;
-            lin_fwd(c, w, v, w.get("n1"), w.get("v"), false)?;
+            lin_fwd_shared(c, w, &[(q, w.get("qg")), (k, w.get("k")), (v, w.get("v"))], w.get("n1"))?;
             let qg = QkrGeom { n, heads: g.nh, hd: g.hd, half: g.half, t: w.t, gemma: g.gemma, eps: g.eps };
             let kg = QkrGeom { heads: g.nkv, ..qg };
             let ag = AttnGeom { nb: w.nb, t: w.t, nh: g.nh, nkv: g.nkv, hd: g.hd };
-            tm::run(c, &[Op::D(tm::split_qg(c, w.get("qg"), w.get("q"), w.get("gate"), n, g.nh, g.hd, false)?)]);
-            to::run(c, &[
-                to::qkr_fwd(c, qg, w.get("q"), &qn.w, w.get("qr"), w.get("qinv"), &w.rope)?,
-                to::qkr_fwd(c, kg, w.get("k"), &kn.w, w.get("kr"), w.get("kinv"), &w.rope)?,
-                to::attn_fwd(c, ag, w.get("qr"), w.get("kr"), w.get("v"), w.get("o"), w.get("lse"))?,
-                to::elt(c, "gate_fwd", n * qd, w.get("o"), w.get("gate"), Some(w.get("og")), None, None, None)?,
-            ]);
+            if let Some(sc) = w.att.as_ref() {
+                let mut ops = vec![
+                    Op::D(tm::split_qg(c, w.get("qg"), w.get("q"), w.get("gate"), n, g.nh, g.hd, false)?),
+                    Op::D(to::qkr_fwd(c, qg, w.get("q"), &qn.w, w.get("qr"), w.get("qinv"), &w.rope)?),
+                    Op::D(to::qkr_fwd(c, kg, w.get("k"), &kn.w, w.get("kr"), w.get("kinv"), &w.rope)?),
+                ];
+                ops.extend(ta::fwd_ops(c, ag, sc, w.get("qr"), w.get("kr"), w.get("v"), w.get("o"), w.get("lse"))?);
+                ops.push(Op::D(to::elt(c, "gate_fwd", n * qd, w.get("o"), w.get("gate"), Some(w.get("og")), None, None, None)?));
+                tm::run(c, &ops);
+            } else {
+                tm::run(c, &[Op::D(tm::split_qg(c, w.get("qg"), w.get("q"), w.get("gate"), n, g.nh, g.hd, false)?)]);
+                to::run(c, &[
+                    to::qkr_fwd(c, qg, w.get("q"), &qn.w, w.get("qr"), w.get("qinv"), &w.rope)?,
+                    to::qkr_fwd(c, kg, w.get("k"), &kn.w, w.get("kr"), w.get("kinv"), &w.rope)?,
+                    to::attn_fwd(c, ag, w.get("qr"), w.get("kr"), w.get("v"), w.get("o"), w.get("lse"))?,
+                    to::elt(c, "gate_fwd", n * qd, w.get("o"), w.get("gate"), Some(w.get("og")), None, None, None)?,
+                ]);
+            }
             let _ = kd;
-            lin_fwd(c, w, o, w.get("og"), w.get("mix"), false)?;
+            lin_fwd_shared(c, w, &[(o, w.get("mix"))], w.get("og"))?;
         }
     }
     to::run(c, &[
         to::elt(c, "add", n * g.hs, x, w.get("mix"), Some(w.get("x2")), None, None, None)?,
         to::rms_fwd(c, w.get("x2"), &ly.ln2.w, w.get("n2"), w.get("inv2"), n, g.hs, g.eps, g.gemma)?,
     ]);
-    lin_fwd(c, w, &ly.gate, w.get("n2"), w.get("gg"), false)?;
-    lin_fwd(c, w, &ly.up, w.get("n2"), w.get("uu"), false)?;
+    lin_fwd_shared(c, w, &[(&ly.gate, w.get("gg")), (&ly.up, w.get("uu"))], w.get("n2"))?;
     to::run(c, &[to::elt(c, "swiglu_fwd", n * g.inter, w.get("gg"), w.get("uu"), Some(w.get("hh")), None, None, None)?]);
-    lin_fwd(c, w, &ly.down, w.get("hh"), w.get("mix"), false)?;
+    lin_fwd_shared(c, w, &[(&ly.down, w.get("mix"))], w.get("hh"))?;
     to::run(c, &[to::elt(c, "add", n * g.hs, w.get("x2"), w.get("mix"), Some(y), None, None, None)?]);
     Some(())
 }
@@ -723,9 +868,11 @@ fn layer_bwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, dy: &wgpu:
     to::run(c, &[to::elt(c, "swiglu_bwd", n * g.inter, w.get("gg"), w.get("uu"), None, Some(w.get("dhh")), Some(w.get("dgg")), Some(w.get("duu")))?]);
     lin_bwd(c, w, &ly.gate, w.get("n2"), w.get("dgg"), w.get("dn2"), false, gs, sg)?;
     lin_bwd(c, w, &ly.up, w.get("n2"), w.get("duu"), w.get("dn2"), true, gs, sg)?;
+    let [dw1, dw2] = to::rms_dw(c, w.get("x2"), w.get("inv2"), w.get("dn2"), &ly.ln2.g, n, g.hs)?;
     to::run(c, &[
         to::rms_bwd(c, w.get("x2"), &ly.ln2.w, w.get("inv2"), w.get("dn2"), w.get("dx2"), n, g.hs, g.gemma)?,
-        to::rms_dw(c, w.get("x2"), w.get("inv2"), w.get("dn2"), &ly.ln2.g, n, g.hs)?,
+        dw1,
+        dw2,
         to::elt(c, "add", n * g.hs, w.get("dx2"), dy, Some(w.get("dx2")), None, None, None)?,
     ]);
     // mixer: x2 = x + mix(n1)
@@ -747,29 +894,37 @@ fn layer_bwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, dy: &wgpu:
             let kg = QkrGeom { heads: g.nkv, ..qg };
             let ag = AttnGeom { nb: w.nb, t: w.t, nh: g.nh, nkv: g.nkv, hd: g.hd };
             lin_bwd(c, w, o, w.get("og"), w.get("dx2"), w.get("dog"), false, gs, sg)?;
-            to::run(c, &[to::elt(c, "gate_bwd", n * qd, w.get("o"), w.get("gate"), None, Some(w.get("dog")), Some(w.get("do")), Some(w.get("dgate")))?]);
-            to::run(c, &to::attn_bwd(c, ag, w.get("qr"), w.get("kr"), w.get("v"), w.get("o"), w.get("lse"), w.get("do"), w.get("dsum"), w.get("dqr"), w.get("dkr"), w.get("dv"))?);
+            let gate_b = to::elt(c, "gate_bwd", n * qd, w.get("o"), w.get("gate"), None, Some(w.get("dog")), Some(w.get("do")), Some(w.get("dgate")))?;
+            let ab = to::attn_bwd(c, ag, w.get("qr"), w.get("kr"), w.get("v"), w.get("o"), w.get("lse"), w.get("do"), w.get("dsum"), w.get("dqr"), w.get("dkr"), w.get("dv"))?;
+            if let Some(sc) = w.att.as_ref() {
+                // D = Σ dO⊙O (the f32 kernel's first pass), then the matrix-unit backward
+                let dsum = ab.into_iter().next()?;
+                let mut ops = vec![Op::D(gate_b), Op::D(dsum)];
+                ops.extend(ta::bwd_ops(c, ag, sc, w.get("lse"), w.get("do"), w.get("dsum"), w.get("dqr"), w.get("dkr"), w.get("dv"), gs)?);
+                tm::run(c, &ops);
+            } else {
+                to::run(c, &[gate_b]);
+                to::run(c, &ab);
+            }
             to::run(c, &[
                 to::qkr_bwd(c, qg, w.get("q"), &qn.w, w.get("qinv"), &w.rope, w.get("dqr"), w.get("dq"), w.get("dwq"))?,
                 to::qkr_bwd(c, kg, w.get("k"), &kn.w, w.get("kinv"), &w.rope, w.get("dkr"), w.get("dk"), w.get("dwk"))?,
             ]);
             // gain grads (summed over rows·heads) into the norms' gradients
-            let gq = to::zeros(c, g.hd);
-            let gk = to::zeros(c, g.hd);
-            to::run(c, &[to::qkr_dw(c, qg, w.get("dwq"), &gq)?, to::qkr_dw(c, kg, w.get("dwk"), &gk)?]);
-            to::run(c, &[
-                to::elt(c, "add", g.hd, &qn.g, &gq, Some(&qn.g), None, None, None)?,
-                to::elt(c, "add", g.hd, &kn.g, &gk, Some(&kn.g), None, None, None)?,
-            ]);
+            let [q1, q2] = to::qkr_dw(c, qg, w.get("dwq"), &qn.g, true)?;
+            let [k1, k2] = to::qkr_dw(c, kg, w.get("dwk"), &kn.g, true)?;
+            to::run(c, &[q1, q2, k1, k2]);
             tm::run(c, &[Op::D(tm::split_qg(c, w.get("dqg"), w.get("dq"), w.get("dgate"), n, g.nh, g.hd, true)?)]);
             lin_bwd(c, w, q, w.get("n1"), w.get("dqg"), w.get("dn1"), false, gs, sg)?;
             lin_bwd(c, w, k, w.get("n1"), w.get("dk"), w.get("dn1"), true, gs, sg)?;
             lin_bwd(c, w, v, w.get("n1"), w.get("dv"), w.get("dn1"), true, gs, sg)?;
         }
     }
+    let [dw1, dw2] = to::rms_dw(c, x, w.get("inv1"), w.get("dn1"), &ly.ln1.g, n, g.hs)?;
     to::run(c, &[
         to::rms_bwd(c, x, &ly.ln1.w, w.get("inv1"), w.get("dn1"), dx, n, g.hs, g.gemma)?,
-        to::rms_dw(c, x, w.get("inv1"), w.get("dn1"), &ly.ln1.g, n, g.hs)?,
+        dw1,
+        dw2,
         to::elt(c, "add", n * g.hs, dx, w.get("dx2"), Some(dx), None, None, None)?,
     ]);
     Some(())
@@ -778,15 +933,55 @@ fn layer_bwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, dy: &wgpu:
 // ───────────────────────────── forward / step ─────────────────────────────
 
 fn embed(c: Ctx, net: &Net, w: &Work, ids: &[u32]) {
+    use std::sync::atomic::Ordering;
+    let _p = prof::phase("embed");
     let hs = net.geom.hs;
-    let mut rows = vec![0f32; ids.len() * hs];
-    for (t, &id) in ids.iter().enumerate() {
-        let src = &net.embed[id as usize * hs..(id as usize + 1) * hs];
-        for (d, &s) in rows[t * hs..(t + 1) * hs].iter_mut().zip(src) {
-            *d = f16_to_f32(s);
-        }
+    let n = ids.len() * hs;
+    // the upload buffer was re-mapped after the last step's copy; wait only if
+    // that has not completed yet (first use: mapped at creation)
+    if !w.emb_mapped.load(Ordering::Acquire) {
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
     }
-    c.queue.write_buffer(&w.ckpt[0], 0, bytemuck::cast_slice(&rows));
+    let bytes = n.div_ceil(2) * 4;
+    {
+        let mut view = w.emb_up.slice(..bytes as u64).get_mapped_range_mut().expect("embedding upload buffer mapped");
+        // write-only mapped memory: each thread copies its rows' f16 bits to
+        // a disjoint range (the conversion to f32 runs on the card)
+        let mut dst = view.slice(..);
+        let base = dst.as_raw_element_ptr().as_ptr() as usize;
+        let per = ids.len().div_ceil(16).max(1);
+        std::thread::scope(|sc| {
+            for (ci, chunk) in ids.chunks(per).enumerate() {
+                let emb = &net.embed;
+                sc.spawn(move || {
+                    for (t, &id) in chunk.iter().enumerate() {
+                        let src = &emb[id as usize * hs..(id as usize + 1) * hs];
+                        let at = base + ((ci * per + t) * hs) * 2;
+                        // SAFETY: [at, at + 2·hs) lies inside the mapped write
+                        // range (row ci·per + t < ids.len()) and no other thread
+                        // writes it; `src` is host memory.
+                        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr() as *const u8, at as *mut u8, hs * 2) }
+                    }
+                });
+            }
+        });
+    }
+    w.emb_up.unmap();
+    w.emb_mapped.store(false, Ordering::Release);
+    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("embed") });
+    let mut mk = prof::enc_begin(c, &mut enc);
+    enc.copy_buffer_to_buffer(&w.emb_up, 0, &w.emb16, 0, bytes as u64);
+    prof::enc_mark(c, &mut enc, &mut mk, "copy");
+    if let Some(d) = tm::f16_to_f32(c, &w.emb16, &w.ckpt[0], n) {
+        tm::record(c, &mut enc, &[Op::D(d)]);
+    }
+    crate::gpu_wgpu::submit_pub(c, enc.finish());
+    let flag = w.emb_mapped.clone();
+    w.emb_up.slice(..).map_async(wgpu::MapMode::Write, move |r| {
+        if r.is_ok() {
+            flag.store(true, Ordering::Release);
+        }
+    });
 }
 
 /// Forward of all layers from the embedded `ids` (checkpoints filled);
@@ -794,9 +989,11 @@ fn embed(c: Ctx, net: &Net, w: &Work, ids: &[u32]) {
 fn forward(c: Ctx, net: &Net, w: &Work, ids: &[u32]) -> Option<()> {
     embed(c, net, w, ids);
     for l in 0..net.geom.nl {
-        layer_fwd(c, net, w, l, &w.ckpt[l], &w.ckpt[l + 1])?;
+        let _p = prof::phase(if net.geom.gdn_layer[l] { "fwd.gdn" } else { "fwd.attn" });
+        layer_fwd(c, net, w, l, &w.ckpt[l], &w.ckpt[l + 1], false)?;
     }
     let g = &net.geom;
+    let _p = prof::phase("fwd.final_norm");
     to::run(c, &[to::rms_fwd(c, &w.ckpt[g.nl], &net.final_norm.w, w.get("n1"), w.get("invf"), w.ntok, g.hs, g.eps, g.gemma)?]);
     Some(())
 }
@@ -832,35 +1029,49 @@ pub struct StepStats {
 pub fn step(c: Ctx, net: &Net, w: &Work, ids: &[u32], tid: &[u32], tp: &[f32], k: usize, gscale: f32, sign: Option<&SignStepCfg>) -> Option<StepStats> {
     let g = &net.geom;
     let n = w.ntok;
+    prof::step_begin();
     let sign = if w.sg.is_some() { sign } else { None };
     if let (Some(_), Some(sc)) = (sign, w.sg.as_ref()) {
+        let _p = prof::phase("counters");
         ts::reset_counters(c, sc);
     }
     forward(c, net, w, ids)?;
+    let ph = prof::phase("head");
     let btid = to::zeros(c, n * k);
+    prof::count(prof::Cnt::Write, 1);
+    prof::count(prof::Cnt::WriteBytes, (tid.len() * 4) as u64);
     c.queue.write_buffer(&btid, 0, bytemuck::cast_slice(tid));
     let btp = to::upload(c, tp);
     th::head_kl(c, &net.head, &w.head, w.get("n1"), &btid, &btp, k, w.get("dn1"), w.get("loss"), n, n, gscale)?;
-    let loss: f64 = to::download(c, w.get("loss"), n)?.iter().map(|&x| x as f64).sum::<f64>() / n as f64;
-    let mut st = StepStats { loss, finite: loss.is_finite(), ..Default::default() };
-    if sign.is_some() && !st.finite {
-        return Some(st);
+    // The backward is queued without reading the loss back (that drain left
+    // the card idle): with sign training the card itself turns every
+    // sign-state write off when a loss is not finite, which is what skipping
+    // the backward did; the loss is read after the sweep.
+    if let (Some(_), Some(sc)) = (sign, w.sg.as_ref()) {
+        to::run(c, &[ts::loss_flag_op(c, sc, w.get("loss"), n)?]);
     }
+    drop(ph);
+    let mut st = StepStats::default();
     // final norm backward: dx at the last checkpoint
     let (da, db) = (w.get("dx"), w.get("dmix"));
-    to::run(c, &[
-        to::rms_bwd(c, &w.ckpt[g.nl], &net.final_norm.w, w.get("invf"), w.get("dn1"), da, n, g.hs, g.gemma)?,
-        to::rms_dw(c, &w.ckpt[g.nl], w.get("invf"), w.get("dn1"), &net.final_norm.g, n, g.hs)?,
-    ]);
+    let ph = prof::phase("bwd.final_norm");
+    let [dw1, dw2] = to::rms_dw(c, &w.ckpt[g.nl], w.get("invf"), w.get("dn1"), &net.final_norm.g, n, g.hs)?;
+    to::run(c, &[to::rms_bwd(c, &w.ckpt[g.nl], &net.final_norm.w, w.get("invf"), w.get("dn1"), da, n, g.hs, g.gemma)?, dw1, dw2]);
+    drop(ph);
     let mut cur = da;
     let mut nxt = db;
     for l in (0..g.nl).rev() {
-        layer_fwd(c, net, w, l, &w.ckpt[l], w.get("x"))?;
+        let gdn = g.gdn_layer[l];
+        let ph = prof::phase(if gdn { "recomp.gdn" } else { "recomp.attn" });
+        layer_fwd(c, net, w, l, &w.ckpt[l], w.get("x"), true)?;
+        drop(ph);
+        let _p = prof::phase(if gdn { "bwd.gdn" } else { "bwd.attn" });
         layer_bwd(c, net, w, l, &w.ckpt[l], cur, nxt, gscale, sign)?;
         std::mem::swap(&mut cur, &mut nxt);
     }
     st.backward = true;
     if let (Some(_), Some(sc)) = (sign, w.sg.as_ref()) {
+        let _p = prof::phase("counters");
         let cnt = ts::read_reset_counters(c, sc)?;
         for (i, f) in st.flips_role.iter_mut().enumerate() {
             *f = cnt[i] as u64;
@@ -869,6 +1080,13 @@ pub fn step(c: Ctx, net: &Net, w: &Work, ids: &[u32], tid: &[u32], tp: &[f32], k
         st.g_nonfinite = cnt[ts::CNT_NONFINITE] as u64;
         st.saturated = cnt[ts::CNT_SATURATED] as u64;
         st.clamped = cnt[ts::CNT_CLAMPED] as u64;
+    }
+    st.loss = to::download(c, w.get("loss"), n)?.iter().map(|&x| x as f64).sum::<f64>() / n as f64;
+    st.finite = st.loss.is_finite();
+    if sign.is_some() && !st.finite {
+        // the sign updates were skipped on the card: report the step as one
+        // without a backward, as before
+        st.backward = false;
     }
     Some(st)
 }
@@ -928,17 +1146,83 @@ pub fn sign_stats(c: Ctx, net: &Net) -> Option<Vec<(String, u64, u64)>> {
             .collect(),
     )
 }
-/// Global gradient norm over every parameter (NaN/inf when a gradient is).
+fn opt_cat(c: Ctx, net: &Net) -> &OptCat {
+    net.opt.get_or_init(|| {
+        let ps = net.params();
+        let mut off = Vec::with_capacity(ps.len());
+        let mut total = 0usize;
+        let mut tab = Vec::with_capacity(2 * ps.len());
+        let mut relf: Vec<u32> = Vec::new();
+        for p in &ps {
+            off.push(total);
+            tab.push(total as u32);
+            tab.push(p.n as u32);
+            relf.extend(std::iter::repeat_n(p.rel.to_bits(), p.n));
+            total += p.n;
+        }
+        let mask = to::upload(c, &vec![1f32; total]);
+        let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("opt_cat") });
+        for (p, &o) in ps.iter().zip(&off) {
+            if let Some(m) = &p.mask {
+                enc.copy_buffer_to_buffer(m, 0, &mask, (o * 4) as u64, (p.n * 4) as u64);
+            }
+        }
+        crate::gpu_wgpu::submit_pub(c, enc.finish());
+        let relf_b = to::zeros_u32(c, total);
+        c.queue.write_buffer(&relf_b, 0, bytemuck::cast_slice(&relf));
+        let tab_b = to::zeros_u32(c, tab.len());
+        c.queue.write_buffer(&tab_b, 0, bytemuck::cast_slice(&tab));
+        OptCat {
+            g: to::zeros(c, total),
+            w: to::zeros(c, total),
+            m1: to::zeros(c, total),
+            m2: to::zeros(c, total),
+            mask,
+            relf: relf_b,
+            tab: tab_b,
+            part: to::zeros(c, 64 * ps.len()),
+            off,
+            total,
+            g_fresh: std::sync::atomic::AtomicBool::new(false),
+        }
+    })
+}
+
+/// Copy every parameter's gradient into the concatenation.
+fn gather_grads(enc: &mut wgpu::CommandEncoder, ps: &[&Param], oc: &OptCat) {
+    for (p, &o) in ps.iter().zip(&oc.off) {
+        enc.copy_buffer_to_buffer(&p.g, 0, &oc.g, (o * 4) as u64, (p.n * 4) as u64);
+    }
+}
+
+/// Global gradient norm over every parameter (NaN/inf when a gradient is):
+/// each parameter's 64 partial sums of squares (the `sumsq` grid) summed on
+/// the host in f64, parameters in [`Net::params`] order.
 pub fn grad_norm(c: Ctx, net: &Net) -> Option<f64> {
+    let _p = prof::phase("opt.grad_norm");
+    let oc = opt_cat(c, net);
+    let ps = net.params();
+    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("grad_norm") });
+    let mut mk = prof::enc_begin(c, &mut enc);
+    gather_grads(&mut enc, &ps, oc);
+    prof::enc_mark(c, &mut enc, &mut mk, "copy");
+    tm::record(c, &mut enc, &[Op::D(tm::sumsq_cat(c, &oc.g, &oc.tab, &oc.part, ps.len())?)]);
+    crate::gpu_wgpu::submit_pub(c, enc.finish());
+    oc.g_fresh.store(true, std::sync::atomic::Ordering::Relaxed);
+    let part = to::download(c, &oc.part, 64 * ps.len())?;
     let mut s = 0f64;
-    for p in net.params() {
-        s += tm::sumsq(c, &p.g, p.n)?;
+    for i in 0..ps.len() {
+        s += part[64 * i..64 * (i + 1)].iter().map(|&x| x as f64).sum::<f64>();
     }
     Some(s.sqrt())
 }
 
 /// Clear every gradient (a skipped step).
 pub fn zero_grads(c: Ctx, net: &Net) {
+    let _p = prof::phase("opt.zero");
+    if let Some(oc) = net.opt.get() {
+        oc.g_fresh.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
     for p in net.params() {
         zero(c, &p.g, p.n);
     }
@@ -948,10 +1232,32 @@ pub fn zero_grads(c: Ctx, net: &Net) {
 /// multiplied by `gmul` (clipping); clears the grads.
 #[allow(clippy::too_many_arguments)]
 pub fn adam(c: Ctx, net: &Net, lr: f32, step_no: u32, b1: f32, b2: f32, eps: f32, gmul: f32) -> Option<()> {
-    for p in net.params() {
-        tm::run(c, &[Op::D(tm::adam(c, &p.w, &p.g, &p.m1, &p.m2, p.mask.as_ref(), p.n, lr, step_no, b1, b2, eps, gmul, p.rel)?)]);
-        zero(c, &p.g, p.n);
+    let _p = prof::phase("opt.adam");
+    let oc = opt_cat(c, net);
+    let ps = net.params();
+    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("adam") });
+    let mut mk = prof::enc_begin(c, &mut enc);
+    if !oc.g_fresh.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        gather_grads(&mut enc, &ps, oc);
     }
+    for (p, &o) in ps.iter().zip(&oc.off) {
+        let (bo, nb) = ((o * 4) as u64, (p.n * 4) as u64);
+        enc.copy_buffer_to_buffer(&p.w, 0, &oc.w, bo, nb);
+        enc.copy_buffer_to_buffer(&p.m1, 0, &oc.m1, bo, nb);
+        enc.copy_buffer_to_buffer(&p.m2, 0, &oc.m2, bo, nb);
+    }
+    prof::enc_mark(c, &mut enc, &mut mk, "copy");
+    tm::record(c, &mut enc, &[Op::D(tm::adam_cat(c, &oc.w, &oc.g, &oc.m1, &oc.m2, &oc.mask, &oc.relf, oc.total, lr, step_no, b1, b2, eps, gmul)?)]);
+    let mut mk = prof::enc_begin(c, &mut enc);
+    for (p, &o) in ps.iter().zip(&oc.off) {
+        let (bo, nb) = ((o * 4) as u64, (p.n * 4) as u64);
+        enc.copy_buffer_to_buffer(&oc.w, bo, &p.w, 0, nb);
+        enc.copy_buffer_to_buffer(&oc.m1, bo, &p.m1, 0, nb);
+        enc.copy_buffer_to_buffer(&oc.m2, bo, &p.m2, 0, nb);
+        enc.clear_buffer(&p.g, 0, Some(nb));
+    }
+    prof::enc_mark(c, &mut enc, &mut mk, "copy");
+    crate::gpu_wgpu::submit_pub(c, enc.finish());
     Some(())
 }
 

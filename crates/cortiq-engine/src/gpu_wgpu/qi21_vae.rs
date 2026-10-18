@@ -409,7 +409,7 @@ fn mmc(c: &Ctx, g: MmCfg, w: [u32; 12], plane: &wgpu::Buffer, act: Bind, out: Bi
         layout: &pipe.get_bind_group_layout(0),
         entries: &[super::bind_buf(0, plane), entry(1, &act), entry(2, &out), super::bind_buf(3, &u)],
     });
-    Some(MmCall { pipe, bg, grid: (n / g.bn, m.div_ceil(g.bm)) })
+    Some(MmCall { pipe, bg, grid: (n / g.bn, m.div_ceil(g.bm)), mnk: [m, n, k], bits: false })
 }
 
 /// The GEMM tile of a conv writing `cout_p` channels (128×128 when it
