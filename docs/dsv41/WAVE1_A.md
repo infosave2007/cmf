@@ -239,11 +239,34 @@ kernel and the host use), `e = ((bits(t) >> 23) & 0xff) - 127 +
 arithmetic on the f32 bits (normal: keep 3 mantissa bits with RNE carry;
 below 2^-6: round `v * 512` to an integer, ties to even), times `s`, then a
 BF16 round (exact, but keep the boundary). WGSL has no FP8 type and the
-repo has no device E4M3 helper yet; the host `e4m3_round` is the oracle,
-and `CMF_DSV41_TAIL_TAP=attn/mid` already prints both sides of that
-boundary for a parity check. Fusing it into the inverse-RoPE kernel (which
+repo has no device E4M3 helper yet; the host `e4m3_round` is the oracle.
+Once the kernel exists and the skip below is lifted, the existing
+`CMF_DSV41_TAIL_TAP=mid` diagnostic prints the device and host `wo_a`
+outputs for the same token (the fixture GPU test can then run with the flag
+in its own binary, like `dsv41_fixture_o_fp8.rs`). Fusing it into the inverse-RoPE kernel (which
 already owns `attn`) needs a 32-element block per lane group instead of the
 per-head rotation stride, so a separate dispatch is simpler. Until then
 `CMF_DSV41_O_FP8=1` forces the CPU attention tail. The upstream DSpark
 attention has the same `act_quant(o)`; cortiq's V4.1 runtime has no DSpark
 head, so nothing to change there.
+
+## Open issues for the lead
+
+- Pod: run `cargo test -p cortiq-engine --features gpu --test dsv41_fixture_gpu
+  -- --nocapture` on the target card and read the `[dsv41-profile]` counters
+  (expect 48 device attention calls; MoE device calls depend on the card's
+  budget and the layout note above). Also the CPU binaries on x86 (CI does
+  this on ubuntu): `--test dsv41_fixture --test dsv41_fixture_o_fp8`.
+- `CMF_DSV41_O_FP8` is off by default; its effect on the released weights
+  (perplexity / answers, with the 1017 checkpoint) is unmeasured. The device
+  kernel is sketched above; with the flag the attention tail is CPU-only.
+- Two journaled BF16 boundaries in sparse attention differ from the
+  official kernel (probabilities before PV, `o` before the inverse RoPE);
+  candidates for a parity pass on the real model, not changed.
+- Dynamic MoE bank: one gate/up layout per state; budget-less adapters size
+  it from u64::MAX (both above). Shared pool code, not changed.
+- Engram hash multipliers for layer ids other than 1/14 or a compressed
+  vocabulary other than 99092 fall back to SplitMix in cortiq, while the
+  reference derives them from NumPy PCG64 (`default_rng(10007 * layer)`).
+  Only matters for a non-release checkpoint; the fixture uses layer 1 and
+  99092 for that reason.
