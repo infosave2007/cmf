@@ -1397,10 +1397,56 @@ pub fn run_convert_blr(
             let window = o.window.max(16);
             let mut fit_w: Vec<Vec<u32>> = Vec::new();
             let mut sel_w: Vec<Vec<u32>> = Vec::new();
+            // Device calibration is layer-streamed: per window the hidden
+            // state after the layers already final (encoded below `bound`)
+            // is kept, so layer l costs one pass of layer l−1 (encoded) and
+            // one of layer l (captured) instead of the whole stack below it.
+            let (mut bound_fit, mut bound_sel): (Vec<Vec<f32>>, Vec<Vec<f32>>) = (Vec::new(), Vec::new());
+            let mut bound = 0usize;
+            // CMF_NVG_RESUME=FILE takes every candidate already stored as blr
+            // in FILE (a work file of an interrupted run) and skips the layers
+            // whose candidates are all there.
+            let mut resumed: HashSet<usize> = HashSet::new();
+            if let Ok(rp) = std::env::var("CMF_NVG_RESUME") {
+                let rm = CmfModel::open(&rp)?;
+                let mut have: HashMap<usize, (usize, usize)> = HashMap::new();
+                for &(slot, l, _) in &cand {
+                    let e = &srcm.tensors[slot];
+                    let ent = have.entry(l).or_insert((0, 0));
+                    ent.1 += 1;
+                    if let Some(i) = rm.tensor_index(&e.name) {
+                        let r = &rm.tensors[i];
+                        if r.dtype == TensorDtype::BinaryLowRank && r.shape == e.shape {
+                            ent.0 += 1;
+                        }
+                    }
+                }
+                for (&l, &(got, all)) in &have {
+                    if got == all && all > 0 {
+                        resumed.insert(l);
+                    }
+                }
+                for &(slot, l, _) in &cand {
+                    if !resumed.contains(&l) {
+                        continue;
+                    }
+                    let e = &srcm.tensors[slot];
+                    let r = &rm.tensors[rm.tensor_index(&e.name).expect("checked")];
+                    let bytes = rm.entry_bytes(r).to_vec();
+                    total_bits += (bytes.len() as u64 - 16) * 8;
+                    total_w += (e.shape[0] * e.shape[1]) as u64;
+                    report.push(format!("{} resumed from {rp}", e.name));
+                    specs[slot].dtype = TensorDtype::BinaryLowRank;
+                    specs[slot].data = bytes;
+                }
+                let mut rl: Vec<usize> = resumed.iter().copied().collect();
+                rl.sort_unstable();
+                eprintln!("blr: resumed {} layers from {rp}: {rl:?}", rl.len());
+            }
             for l in 0..nl {
                 let mine: Vec<(usize, usize, &'static str)> =
                     cand.iter().filter(|c| c.1 == l).cloned().collect();
-                if mine.is_empty() {
+                if mine.is_empty() || resumed.contains(&l) {
                     continue;
                 }
                 // The inputs this layer's candidates read, in a fixed order.
@@ -1467,9 +1513,15 @@ pub fn run_convert_blr(
                 cortiq_engine::gptq_capture::begin_filtered(true, move |n| keep.contains(n));
                 // The device pass feeds the positions the host's scored
                 // forward feeds (a window's last token has no target there).
-                for wv in &fit_w {
+                let advance = gpu && l > bound;
+                let mut next_fit = Vec::new();
+                for (wi, wv) in fit_w.iter().enumerate() {
                     if gpu {
-                        pipe.calib_forward(&wv[..wv.len() - 1], l + 1, window).map_err(|e| anyhow::anyhow!(e))?;
+                        let inp = bound_fit.get(wi).filter(|_| bound > 0).map(Vec::as_slice);
+                        let h = pipe.calib_window_span(&wv[..wv.len() - 1], inp, bound, l, l + 1).map_err(|e| anyhow::anyhow!(e))?;
+                        if advance {
+                            next_fit.push(h);
+                        }
                     } else {
                         fit_ppl += pipe.ppl_ids(wv).map_err(|e| anyhow::anyhow!(e))?.ln();
                     }
@@ -1477,14 +1529,22 @@ pub fn run_convert_blr(
                 let hf = cortiq_engine::gptq_capture::end();
                 let keep = names.clone();
                 cortiq_engine::gptq_capture::begin_filtered(true, move |n| keep.contains(n));
-                for wv in &sel_w {
+                let mut next_sel = Vec::new();
+                for (wi, wv) in sel_w.iter().enumerate() {
                     if gpu {
-                        pipe.calib_forward(&wv[..wv.len() - 1], l + 1, window).map_err(|e| anyhow::anyhow!(e))?;
+                        let inp = bound_sel.get(wi).filter(|_| bound > 0).map(Vec::as_slice);
+                        let h = pipe.calib_window_span(&wv[..wv.len() - 1], inp, bound, l, l + 1).map_err(|e| anyhow::anyhow!(e))?;
+                        if advance {
+                            next_sel.push(h);
+                        }
                     } else {
                         pipe.ppl_ids(wv).map_err(|e| anyhow::anyhow!(e))?;
                     }
                 }
                 let hs = cortiq_engine::gptq_capture::end();
+                if advance {
+                    (bound_fit, bound_sel, bound) = (next_fit, next_sel, l);
+                }
                 drop(pipe);
                 drop(wm);
                 for &lead in &leads {

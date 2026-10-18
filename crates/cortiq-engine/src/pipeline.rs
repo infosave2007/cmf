@@ -8659,6 +8659,42 @@ impl Pipeline {
         result
     }
 
+    /// Layer-streamed calibration of one fresh window: layers `from..mid` run
+    /// on `input` (the hidden state entering layer `from`; `None` = the
+    /// token embeddings of `ids`) and their output is returned, then layers
+    /// `mid..upto` run on that output for the capture hooks (their output is
+    /// dropped). A caller that keeps the returned state per window runs each
+    /// layer once over the whole conversion instead of re-running the stack
+    /// below every layer. With `mid == from` the input is returned as is
+    /// (`None` input: an empty vector).
+    pub fn calib_window_span(&mut self, ids: &[u32], input: Option<&[f32]>, from: usize, mid: usize, upto: usize) -> Result<Vec<f32>, String> {
+        if !self.can_prefill_batched() {
+            return Err("calib_window_span: this architecture has no batched prefill".into());
+        }
+        self.nll_begin()?;
+        let result: Result<Vec<f32>, String> = (|| {
+            let h = if mid > from {
+                let inp = match input {
+                    Some(h) => PrefillIn::Hidden(h),
+                    None => PrefillIn::Ids(ids),
+                };
+                let h = self.prefill_batch_span(inp, 0, None, from, mid);
+                self.nll_check_graph("calibration span", 0)?;
+                h
+            } else {
+                input.map(<[f32]>::to_vec).unwrap_or_default()
+            };
+            if upto > mid {
+                let inp = if mid > from || input.is_some() { PrefillIn::Hidden(&h) } else { PrefillIn::Ids(ids) };
+                let _ = self.prefill_batch_span(inp, 0, None, mid, upto);
+                self.nll_check_graph("calibration span", 0)?;
+            }
+            Ok(h)
+        })();
+        self.nll_end();
+        result
+    }
+
     /// GPTQ calibration of a Flash-Next-class MoE (`qwen4_exp`): MoE input
     /// rows and router logits of layers `lo..hi` for `ids` (a fresh
     /// sequence), per layer `[ids.len()][hidden + n_experts]`.
