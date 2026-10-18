@@ -605,6 +605,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// CPU speed of the mxfp4 kernels against q4tp on DeepSeek-V4.1 expert
+    /// shapes (2304×5120 gate/up, 5120×2304 down). Measurement only:
+    /// `cargo test -p cortiq-engine --release --lib
+    ///  qtensor::mxfp4::tests::cpu_matvec_speed -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn cpu_matvec_speed() {
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let pool = Pool::new(threads);
+        let best = |f: &mut dyn FnMut()| {
+            for _ in 0..3 {
+                f();
+            }
+            let mut best = f64::MAX;
+            for _ in 0..7 {
+                let t = std::time::Instant::now();
+                for _ in 0..20 {
+                    f();
+                }
+                best = best.min(t.elapsed().as_secs_f64() / 20.0);
+            }
+            best * 1e6
+        };
+        for (rows, cols) in [(2304usize, 5120usize), (5120, 2304)] {
+            let p = payload(rows, cols, 1);
+            // q4tp of the same shape: random nibbles and codes, a valid
+            // ladder (kernel speed does not depend on the values).
+            let gpr = cols / GROUP;
+            let stride = cortiq_core::quant::q4tp_code_stride(gpr);
+            let mut q4 = bytes_of(rows * gpr * 16, 3);
+            for _ in 0..rows {
+                q4.extend_from_slice(&cortiq_core::quant::f32_to_f16(-6.0).to_le_bytes());
+                q4.extend_from_slice(&cortiq_core::quant::f32_to_f16(0.1).to_le_bytes());
+            }
+            q4.extend(bytes_of(rows * stride, 4).iter().map(|b| b & 0x7F));
+            let x = act(cols, 2);
+            let mut out = vec![0f32; rows];
+            let mx_a8 = best(&mut || matvec(&p, &x, rows, cols, &mut out, Some(&pool)));
+            let mx_ex = best(&mut || {
+                float_activations_scope(|| matvec(&p, &x, rows, cols, &mut out, Some(&pool)))
+            });
+            let q4_a8 = best(&mut || q4tp_matvec(&q4, &x, rows, cols, &mut out, Some(&pool)));
+            let mx_1t = best(&mut || matvec(&p, &x, rows, cols, &mut out, None));
+            let q4_1t = best(&mut || q4tp_matvec(&q4, &x, rows, cols, &mut out, None));
+            let gb = |us: f64, len: usize| len as f64 / us / 1e3;
+            eprintln!(
+                "cpu x{threads} a8w8={} {rows}x{cols}: mxfp4 a8w8 {mx_a8:7.1} us ({:5.1} GB/s) | mxfp4 exact {mx_ex:7.1} us | q4tp a8w8 {q4_a8:7.1} us ({:5.1} GB/s) | 1 thread: mxfp4 {mx_1t:7.1} us, q4tp {q4_1t:7.1} us",
+                a8w8_enabled(),
+                gb(mx_a8, p.len()),
+                gb(q4_a8, q4.len()),
+            );
+        }
+    }
+
+    fn bytes_of(n: usize, seed: usize) -> Vec<u8> {
+        (0..n)
+            .map(|i| (i.wrapping_mul(2654435761).wrapping_add(seed * 7919) >> 11) as u8)
+            .collect()
+    }
+
     /// The A8W8 contract: every kernel (SIMD, scalar, decoded-row) gives the
     /// same f32 bit for bit, matmat equals matvec per token, and the result
     /// stays within the int8 activation rounding of the f64 reference.

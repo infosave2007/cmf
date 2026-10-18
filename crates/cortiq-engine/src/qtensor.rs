@@ -2690,15 +2690,69 @@ impl QTensor {
 }
 
 impl QTensor {
-    /// `mxfp4` matvec: the CPU kernels of `qtensor::mxfp4`.
+    /// `mxfp4` matvec: the wgpu kernel for lm_head/expert-class shapes when
+    /// the probe prefers the device, else the CPU kernels of
+    /// `qtensor::mxfp4` (always on native Metal, which has no mxfp4 kernel).
     fn mxfp4_matvec(&self, x: &[f32], out: &mut [f32], pool: Option<&Pool>) {
         let (rows, cols) = (self.rows(), self.cols());
+        if let Self::Mapped { model, idx, .. } = self {
+            if rows * cols >= 8_388_608 && crate::gpu::enabled_here() {
+                let t0 = std::time::Instant::now();
+                let cls = crate::gpu::matvec_class(rows, cols);
+                match crate::gpu::probe_arm(cls) {
+                    crate::gpu::ProbeArm::Gpu => {
+                        if crate::gpu::mxfp4_matvec(model, *idx, x, rows, cols, out) {
+                            crate::gpu::probe_record(cls, true, t0.elapsed());
+                            return;
+                        }
+                    }
+                    crate::gpu::ProbeArm::CpuTimed => {
+                        mxfp4::matvec(self.quant_bytes(), x, rows, cols, out, pool);
+                        crate::gpu::probe_record(cls, false, t0.elapsed());
+                        return;
+                    }
+                    crate::gpu::ProbeArm::Cpu => {}
+                }
+            }
+        }
         mxfp4::matvec(self.quant_bytes(), x, rows, cols, out, pool);
     }
 
-    /// `mxfp4` batched matvec (`xs` `[b, cols]` → `out` `[b, rows]`).
+    /// `mxfp4` batched matvec (`xs` `[b, cols]` → `out` `[b, rows]`): the
+    /// device's batched kernel behind the same probe as the other codecs'
+    /// GEMMs (never for row-exact batches — the device sums in another
+    /// order than the host matvec), else the CPU kernels.
     fn mxfp4_matmat(&self, xs: &[f32], b: usize, out: &mut [f32], pool: Option<&Pool>) {
         let (rows, cols) = (self.rows(), self.cols());
+        if let Self::Mapped { model, idx, .. } = self {
+            if b >= 2
+                && b * rows * cols >= 33_554_432
+                && !row_exact()
+                && !crate::gpu::mm_killed()
+                && crate::gpu::enabled_here()
+            {
+                let class = if b >= 128 {
+                    crate::gpu::OpClass::MatmatWide
+                } else {
+                    crate::gpu::OpClass::Matmat
+                };
+                let t0 = std::time::Instant::now();
+                match crate::gpu::probe_arm(class) {
+                    crate::gpu::ProbeArm::Gpu => {
+                        if crate::gpu::mxfp4_matmat(model, *idx, xs, b, rows, cols, out) {
+                            crate::gpu::probe_record(class, true, t0.elapsed());
+                            return;
+                        }
+                    }
+                    crate::gpu::ProbeArm::CpuTimed => {
+                        mxfp4::matmat(self.quant_bytes(), xs, b, rows, cols, out, pool);
+                        crate::gpu::probe_record(class, false, t0.elapsed());
+                        return;
+                    }
+                    crate::gpu::ProbeArm::Cpu => {}
+                }
+            }
+        }
         mxfp4::matmat(self.quant_bytes(), xs, b, rows, cols, out, pool);
     }
 }

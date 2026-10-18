@@ -64,6 +64,10 @@ pub mod train_head;
 pub mod train_prof;
 /// Subgroup q1g decode matvec (bit-identical to `q1g_matvec`, no barriers).
 pub(crate) mod q1g_mv;
+/// `mxfp4` (OCP MX FP4): per-op matvec/batched matvec and the global MoE
+/// bank kernels.
+pub mod mxfp4;
+pub use mxfp4::MoeBankCodec;
 /// Device linear algebra of the NVG `blr` encoder (f32 GEMM, SPD solves,
 /// discrete-knot kernels).
 pub mod nvg_dev;
@@ -19193,6 +19197,10 @@ pub struct Ctx {
     dense_mv_pipes: std::sync::OnceLock<Option<dense_mv::MvSg>>,
     /// Subgroup q1g decode matvec (`q1g_mv`).
     q1g_sg_pipes: std::sync::OnceLock<Option<q1g_mv::Q1gSg>>,
+    /// mxfp4 per-op kernels and the S8/S16 global-bank kernels (`mxfp4`).
+    mxfp4_pipes: std::sync::OnceLock<Option<mxfp4::Pipes>>,
+    mxfp4_global_s8: std::sync::OnceLock<Option<mxfp4::GlobalPipes>>,
+    mxfp4_global_s16: std::sync::OnceLock<Option<mxfp4::GlobalPipes>>,
     /// Subgroup-tree GDN step twins (`dense_mv::gdn`).
     gdn_sg_pipes: std::sync::OnceLock<Option<dense_mv::GdnSg>>,
     moe_down_q4tp_b2: wgpu::ComputePipeline,
@@ -19574,7 +19582,20 @@ struct Dsv4GlobalMoeBufs {
     gu_len: usize,
     d_len: usize,
     gu_q2: bool,
+    /// mxfp4 bank (gate/up/down): its own pipelines (`mxfp4::global_pipes`)
+    /// and strides; `gu_q2` is false.
+    fp4: bool,
     segments: usize,
+}
+
+impl Dsv4GlobalMoeBufs {
+    fn codec(&self) -> MoeBankCodec {
+        if self.fp4 {
+            MoeBankCodec::Mxfp4
+        } else {
+            MoeBankCodec::from_gu_q2(self.gu_q2)
+        }
+    }
 }
 
 struct KvMirror {
@@ -21966,6 +21987,9 @@ fn init(dev: usize) -> Result<Ctx, String> {
         g4_sandwich_pipe: std::sync::OnceLock::new(),
         dense_mv_pipes: std::sync::OnceLock::new(),
         q1g_sg_pipes: std::sync::OnceLock::new(),
+        mxfp4_pipes: std::sync::OnceLock::new(),
+        mxfp4_global_s8: std::sync::OnceLock::new(),
+        mxfp4_global_s16: std::sync::OnceLock::new(),
         gdn_sg_pipes: std::sync::OnceLock::new(),
         moe_down_q4tp_b2,
         moe_down_q4tp_part,
@@ -24220,6 +24244,24 @@ fn moe_expert_bufs(
     } else {
         plen(hidden, inter)?
     };
+    // The packed stacks are read as the declared layout: refuse any expert
+    // stored in another codec (an mxfp4 matrix can match a q4tp length).
+    let four = if q4tp {
+        cortiq_core::TensorDtype::Q4TiledP
+    } else {
+        cortiq_core::TensorDtype::Q4Tiled
+    };
+    let (gu_dt, dn_dt) = (
+        if gu_q2 { cortiq_core::TensorDtype::Q2TiledP } else { four },
+        if dn_q2 { cortiq_core::TensorDtype::Q2TiledP } else { four },
+    );
+    let dtype_of = |i: usize| model.tensors.get(i).map(|e| e.dtype);
+    if experts.iter().any(|&(g, u, d)| {
+        dtype_of(g) != Some(gu_dt) || dtype_of(u) != Some(gu_dt) || dtype_of(d) != Some(dn_dt)
+    }) {
+        graph_refused("moe_expert_bufs: expert codec differs from the layer layout");
+        return None;
+    }
     moe_expert_upload(c, model, experts, inter, hidden, gu_len, d_len)
 }
 
@@ -55415,7 +55457,8 @@ fn encode_moe_chain_p(
         let Some(gb) = c.dsv4_global_moe.lock().unwrap().get(&gl.pool_uid).cloned() else {
             return;
         };
-        if gb.gu_q2 != g.gu_q2 {
+        // an mxfp4 bank has no kernels on this frame
+        if gb.gu_q2 != g.gu_q2 || gb.fp4 {
             return;
         }
         let Some((p_gu, p_dn)) = dsv4_global_moe_pipelines(c, g.gu_q2, gb.segments) else {
@@ -57574,7 +57617,7 @@ pub fn dspark_graph(
         if s.global.is_some() && global_bufs.is_none() {
             return false;
         }
-        if global_bufs.as_ref().is_some_and(|b| b.gu_q2 != g.gu_q2) {
+        if global_bufs.as_ref().is_some_and(|b| b.gu_q2 != g.gu_q2 || b.fp4) {
             return false;
         }
         let local_bufs = if global_bufs.is_none() {
@@ -60616,10 +60659,28 @@ pub fn dsv4_global_moe_create_for_dsv41(
     hidden: usize,
     gu_q2: bool,
 ) -> Option<(usize, usize)> {
+    dsv4_global_moe_create_for_dsv41_codec(
+        model,
+        requested,
+        inter,
+        hidden,
+        MoeBankCodec::from_gu_q2(gu_q2),
+    )
+}
+
+/// [`dsv4_global_moe_create_for_dsv41`] for any bank codec — the mxfp4 bank
+/// of a `convert --quant fp4` file included.
+pub fn dsv4_global_moe_create_for_dsv41_codec(
+    model: &Arc<CmfModel>,
+    requested: usize,
+    inter: usize,
+    hidden: usize,
+    codec: MoeBankCodec,
+) -> Option<(usize, usize)> {
     let c = ctx()?;
     let _op = c.op_gate.enter();
     let segments = dsv4_global_moe_segments_for_dsv41(&c);
-    dsv4_global_moe_create_with_segments(model, requested, inter, hidden, gu_q2, segments)
+    dsv4_global_moe_create_inner(model, requested, inter, hidden, codec, segments, true)
 }
 
 /// The S8 bank with exactly `slots` slots (rounded down to whole segments),
@@ -60673,7 +60734,15 @@ pub fn dsv4_global_moe_create_slots(
     {
         segments = DSV4_GLOBAL_MOE_SEGMENTS_S16;
     }
-    dsv4_global_moe_create_inner(model, slots, inter, hidden, gu_q2, segments, false)
+    dsv4_global_moe_create_inner(
+        model,
+        slots,
+        inter,
+        hidden,
+        MoeBankCodec::from_gu_q2(gu_q2),
+        segments,
+        false,
+    )
 }
 
 /// The S8 bank with exactly `slots` slots and no workspace carve-out, for
@@ -60692,7 +60761,7 @@ pub fn dsv4_global_moe_create_s8_exact(
         slots,
         inter,
         hidden,
-        gu_q2,
+        MoeBankCodec::from_gu_q2(gu_q2),
         DSV4_GLOBAL_MOE_SEGMENTS,
         false,
     )
@@ -60706,7 +60775,15 @@ fn dsv4_global_moe_create_with_segments(
     gu_q2: bool,
     segments: usize,
 ) -> Option<(usize, usize)> {
-    dsv4_global_moe_create_inner(model, requested, inter, hidden, gu_q2, segments, true)
+    dsv4_global_moe_create_inner(
+        model,
+        requested,
+        inter,
+        hidden,
+        MoeBankCodec::from_gu_q2(gu_q2),
+        segments,
+        true,
+    )
 }
 
 fn dsv4_global_moe_create_inner(
@@ -60714,30 +60791,28 @@ fn dsv4_global_moe_create_inner(
     requested: usize,
     inter: usize,
     hidden: usize,
-    gu_q2: bool,
+    codec: MoeBankCodec,
     segments: usize,
     carve_workspace: bool,
 ) -> Option<(usize, usize)> {
     use std::sync::atomic::Ordering;
     let c = ctx()?;
     let _op = c.op_gate.enter();
-    if dsv4_global_moe_pipelines(&c, gu_q2, segments).is_none() {
+    let gu_q2 = codec.gu_q2();
+    let fp4 = codec == MoeBankCodec::Mxfp4;
+    let have_pipes = if fp4 {
+        mxfp4::global_pipes(c, segments).is_some()
+    } else {
+        dsv4_global_moe_pipelines(&c, gu_q2, segments).is_some()
+    };
+    if !have_pipes {
         return None;
     }
     if let Some(b) = c.dsv4_global_moe.lock().unwrap().get(&model.uid()).cloned() {
-        return (b.gu_q2 == gu_q2 && b.segments == segments)
+        return (b.codec() == codec && b.segments == segments)
             .then_some((b.capacity, b.segment_slots));
     }
-    let gu_len = cortiq_core::quant::expected_nbytes(
-        if gu_q2 {
-            cortiq_core::TensorDtype::Q2TiledP
-        } else {
-            cortiq_core::TensorDtype::Q4TiledP
-        },
-        &[inter, hidden],
-    )?;
-    let d_len =
-        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[hidden, inter])?;
+    let (gu_len, d_len) = codec.lens(inter, hidden)?;
     let per = 2usize.checked_mul(gu_len)?.checked_add(d_len)?;
     let range = c
         .device
@@ -60786,6 +60861,7 @@ fn dsv4_global_moe_create_inner(
         gu_len,
         d_len,
         gu_q2,
+        fp4,
         segments,
     });
     c.resident.fetch_add(total, Ordering::Relaxed);
@@ -60797,7 +60873,7 @@ fn dsv4_global_moe_create_inner(
         segments,
         segment_slots,
         total / 1024 / 1024,
-        if gu_q2 { "q2tp" } else { "q4tp" },
+        codec.label(),
         requested,
     );
     Some((capacity, segment_slots))
@@ -60875,11 +60951,20 @@ pub fn dsv4_global_slot_fill(model: &Arc<CmfModel>, slot: usize, t: (usize, usiz
     let seg = slot / b.segment_slots;
     let local = slot % b.segment_slots;
     let bytes = model.primary_bytes();
-    let put = |buf: &wgpu::Buffer, idx: usize, plen: usize| -> bool {
+    // The bank's codec fixes each buffer's dtype: never reinterpret a
+    // tensor's bytes (an mxfp4 and a q4tp matrix can have equal lengths).
+    let (gu_dt, dn_dt) = match b.codec() {
+        MoeBankCodec::Q4tp => (cortiq_core::TensorDtype::Q4TiledP, cortiq_core::TensorDtype::Q4TiledP),
+        MoeBankCodec::Q2tpGateUp => {
+            (cortiq_core::TensorDtype::Q2TiledP, cortiq_core::TensorDtype::Q4TiledP)
+        }
+        MoeBankCodec::Mxfp4 => (cortiq_core::TensorDtype::Mxfp4, cortiq_core::TensorDtype::Mxfp4),
+    };
+    let put = |buf: &wgpu::Buffer, idx: usize, plen: usize, want: cortiq_core::TensorDtype| -> bool {
         let Some(e) = model.tensors.get(idx) else {
             return false;
         };
-        if e.nbytes as usize != plen {
+        if e.nbytes as usize != plen || e.dtype != want {
             return false;
         }
         let Some(abs) = model.entry_abs_offset(e) else {
@@ -60929,9 +61014,9 @@ pub fn dsv4_global_slot_fill(model: &Arc<CmfModel>, slot: usize, t: (usize, usiz
         }
         true
     };
-    let ok = put(&b.gate[seg], t.0, b.gu_len)
-        && put(&b.up[seg], t.1, b.gu_len)
-        && put(&b.down[seg], t.2, b.d_len);
+    let ok = put(&b.gate[seg], t.0, b.gu_len, gu_dt)
+        && put(&b.up[seg], t.1, b.gu_len, gu_dt)
+        && put(&b.down[seg], t.2, b.d_len, dn_dt);
     if ok {
         DSV4_FILLS.fetch_add(1, Ordering::Relaxed);
         DSV4_FILL_BYTES.fetch_add((2 * b.gu_len + b.d_len) as u64, Ordering::Relaxed);
@@ -66568,12 +66653,18 @@ pub fn dsv4_slot_fill(
     let (Some(gu_len), Some(d_len)) = (gu_len, plen4(hidden, inter)) else {
         return false;
     };
+    let gu_dt = if gu_q2 {
+        cortiq_core::TensorDtype::Q2TiledP
+    } else {
+        cortiq_core::TensorDtype::Q4TiledP
+    };
     let bytes = model.primary_bytes();
-    let put = |buf: &wgpu::Buffer, idx: usize, plen: usize| -> bool {
+    let put = |buf: &wgpu::Buffer, idx: usize, plen: usize, want: cortiq_core::TensorDtype| -> bool {
         let Some(e) = model.tensors.get(idx) else {
             return false;
         };
-        if e.nbytes as usize != plen {
+        // dtype as well as length: never reinterpret another codec's bytes
+        if e.nbytes as usize != plen || e.dtype != want {
             return false;
         }
         let Some(abs) = model.entry_abs_offset(e) else {
@@ -66608,7 +66699,9 @@ pub fn dsv4_slot_fill(
         }
         true
     };
-    let ok = put(&g, t.0, gu_len) && put(&u, t.1, gu_len) && put(&d, t.2, d_len);
+    let ok = put(&g, t.0, gu_len, gu_dt)
+        && put(&u, t.1, gu_len, gu_dt)
+        && put(&d, t.2, d_len, cortiq_core::TensorDtype::Q4TiledP);
     if ok {
         DSV4_FILLS.fetch_add(1, Ordering::Relaxed);
         DSV4_FILL_BYTES.fetch_add((2 * gu_len + d_len) as u64, Ordering::Relaxed);
@@ -70189,13 +70282,22 @@ pub fn dsv4_moe_frame(
         };
         (cortiq_core::quant::expected_nbytes(dt, &[rows, cols]).unwrap_or(0) / 2) as u32
     };
+    // An mxfp4 bank strides by its own slot lengths (the kernels address a
+    // slot's word base as local · mat16/2); q4tp/q2tp follow the geometry.
+    let (gu_mat16, dn_mat16) = match global_bufs.as_ref() {
+        Some(gb) if gb.fp4 => ((gb.gu_len / 2) as u32, (gb.d_len / 2) as u32),
+        _ => (
+            stride16(g.inter, g.hidden, g.gu_q2),
+            stride16(g.hidden, g.inter, false),
+        ),
+    };
     let gu_u = uniform_u32x8(
         c,
         [
             (g.hidden / 32) as u32,
             g.inter as u32,
             slots as u32,
-            stride16(g.inter, g.hidden, g.gu_q2),
+            gu_mat16,
             g.swiglu_limit.to_bits(),
             w.global.map_or(0, |gl| gl.segment_slots),
             u32::from(g.bf16),
@@ -70218,7 +70320,7 @@ pub fn dsv4_moe_frame(
                 (g.inter / 32) as u32,
                 g.hidden as u32,
                 slots as u32,
-                stride16(g.hidden, g.inter, false),
+                dn_mat16,
                 gl.segment_slots,
                 u32::from(g.bf16),
                 0,
@@ -70228,7 +70330,12 @@ pub fn dsv4_moe_frame(
     });
     let gu_r4 = global_bufs.is_none() && g.inter % 4 == 0 && bt_gu_r4_on();
     let (p_gu, p_dn) = if let Some(gb) = global_bufs.as_ref() {
-        let Some(pipes) = dsv4_global_moe_pipelines(c, g.gu_q2, gb.segments) else {
+        let pipes = if gb.fp4 {
+            mxfp4::global_pipes(c, gb.segments)
+        } else {
+            dsv4_global_moe_pipelines(c, g.gu_q2, gb.segments)
+        };
+        let Some(pipes) = pipes else {
             no!("global MoE cache has no matching pipeline geometry");
         };
         pipes
