@@ -749,6 +749,9 @@ fn dsv41_fp4_profile_is_byte_identical_and_forward_matches_f32_experts() {
         .unwrap();
         p.forward_ids(&ids, None).unwrap()
     };
+    // The CPU contract: with the wgpu backend up (`CMF_GPU=wgpu`, the
+    // device test below) the fp4 experts would take the dynamic GPU bank.
+    let cpu = cortiq_engine::gpu::pause_gpu();
     let (a, b) = cortiq_engine::qtensor::with_float_activations(|| (logits(&fp4), logits(&twin)));
     assert_eq!(a.len(), VOCAB);
     assert!(a.iter().all(|v| v.is_finite()));
@@ -772,6 +775,7 @@ fn dsv41_fp4_profile_is_byte_identical_and_forward_matches_f32_experts() {
         c.iter().all(|v| v.is_finite()) && dmax <= 0.25 * span,
         "A8W8 drift {dmax} of {span}"
     );
+    drop(cpu);
     drop((fp4, q4, twin));
     let _ = fs::remove_dir_all(&src.dir);
 }
@@ -849,6 +853,112 @@ fn tensor_quant_mxfp4_override_repacks_and_refuses_nan_scales() {
     .unwrap_err()
     .to_string();
     assert!(e.contains("NaN scale"), "{e}");
+    let _ = fs::remove_dir_all(&src.dir);
+}
+
+/// The synthetic V4.1 `fp4` file end to end on the wgpu device: the
+/// `Pipeline` forward routes its MoE through the dynamic GPU expert bank
+/// (mxfp4 codec, `dsv4_global_*_mxfp4` kernels, host-resolved V4.1 route)
+/// and its logits match the CPU forward of the same file.
+///
+/// Runs only where the wgpu backend was asked for and came up — on macOS
+/// `CMF_GPU=wgpu` (wgpu over Metal), on Linux/Windows `CMF_GPU=1` or
+/// `wgpu` — and skips otherwise (CI without a GPU, macOS CI without the
+/// variable). It does not set `CMF_GPU` itself: in this binary that would
+/// move every later test onto the device. The CPU reference pauses the
+/// device (`gpu::pause_gpu`), so both forwards run in one process.
+#[cfg(feature = "gpu")]
+#[test]
+fn dsv41_fp4_dynamic_gpu_moe_matches_the_cpu_forward() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear_convert_env();
+    use cortiq_engine::gpu_wgpu as gw;
+    if gw::selected_and_up() != Some(true) {
+        eprintln!("wgpu backend not requested (CMF_GPU=wgpu) or no adapter — skipping");
+        return;
+    }
+    if !gw::dsv4_global_moe_supported() {
+        eprintln!("descriptor-indexed global expert bank unavailable — skipping");
+        return;
+    }
+    let src = write_dsv41_source("dsv41-gpu");
+    let out = src.dir.join("fp4.cmf");
+    run_convert(
+        src.dir.to_str().unwrap(),
+        "fp4",
+        out.to_str().unwrap(),
+        None,
+        None,
+        None,
+        false,
+        |_| {},
+    )
+    .unwrap();
+    let fp4 = Arc::new(CmfModel::open(&out).unwrap());
+    // A bank just above the allocator's 2-4 GiB workspace carve-out: 64
+    // slots (the whole model needs 2 x (4 + shared)), 0.4 MB instead of
+    // the default 75 % of the card.
+    let (gu, dn) = gw::MoeBankCodec::Mxfp4.lens(MI, DIM).unwrap();
+    let gib = 1u64 << 30;
+    let workspace = (gw::dsv4_vram_budget().unwrap() / 10).clamp(2 * gib, 4 * gib);
+    let slots = workspace / (2 * gu + dn) as u64 + 64;
+    unsafe {
+        std::env::set_var("CMF_DSV41_EXPERT_SLOTS", slots.to_string());
+        // The pool's creation line ("dynamic-pool capacity=… gu=mxfp4").
+        std::env::set_var("CMF_DSV41_PROF", "1");
+    }
+    let ids = [1u32, 7, 3, 60, 12, 33, 5];
+    let run = |m: &Arc<CmfModel>| {
+        let mut p = cortiq_engine::Pipeline::from_model(
+            m,
+            cortiq_engine::sampler::SamplerConfig::default(),
+        )
+        .unwrap();
+        let logits = p.forward_ids(&ids, None).unwrap();
+        let stats = p.dsv41.as_ref().expect("V4.1 executor").3.gpu_moe_stats();
+        (logits, stats)
+    };
+    let (cpu, cpu_stats) = {
+        let _host = cortiq_engine::gpu::pause_gpu();
+        cortiq_engine::qtensor::with_float_activations(|| run(&fp4))
+    };
+    let fills = gw::DSV4_FILLS.load(std::sync::atomic::Ordering::Relaxed);
+    let (gpu, (calls, codec)) = cortiq_engine::qtensor::with_float_activations(|| run(&fp4));
+    let fills = gw::DSV4_FILLS.load(std::sync::atomic::Ordering::Relaxed) - fills;
+    unsafe {
+        std::env::remove_var("CMF_DSV41_EXPERT_SLOTS");
+        std::env::remove_var("CMF_DSV41_PROF");
+    }
+    assert_eq!(
+        cpu_stats,
+        (0, None),
+        "the paused reference touched the device"
+    );
+    // Every MoE call of the forward (7 tokens x 2 layers) on the device bank.
+    assert_eq!(
+        codec,
+        Some("mxfp4"),
+        "the dynamic pool is not the mxfp4 bank"
+    );
+    assert_eq!(calls, (ids.len() * LAYERS) as u64, "gpu_moe calls");
+    assert!(fills > 0, "no expert reached the bank");
+    let (mut num, mut den) = (0f64, 0f64);
+    for (g, c) in gpu.iter().zip(&cpu) {
+        num += ((g - c) as f64).powi(2);
+        den += (*c as f64).powi(2);
+    }
+    let nrmse = (num / den).sqrt();
+    eprintln!(
+        "dsv41 fp4 dynamic GPU MoE: {calls} bank calls, {fills} slot fills, logits nrmse vs CPU {nrmse:.3e}"
+    );
+    assert!(gpu.iter().all(|v| v.is_finite()));
+    // Measured 6.37e-3 on wgpu-over-Metal (Apple M4; the review measured
+    // 6.2e-3): the bank and the host sum each expert in a different order
+    // and both round to BF16 at three boundaries per expert, so a few
+    // roundings land one BF16 step apart. A wrong group/scale/slot index
+    // costs O(1) (the kernel tests' mutations: nrmse 0.85-1.4).
+    assert!(nrmse < 0.02, "logits nrmse {nrmse}");
+    drop(fp4);
     let _ = fs::remove_dir_all(&src.dir);
 }
 
