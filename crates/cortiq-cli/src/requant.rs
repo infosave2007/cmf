@@ -28,7 +28,7 @@ use cortiq_core::types::TensorDtype;
 use std::sync::Arc;
 
 use crate::convert::{
-    Quant, encode_q2tp, encode_q4tp, encode_q8_row, parse_quant, q2tp_expert_gate_or_up,
+    Quant, encode_q2tp, encode_q4tp, encode_q8_row, parse_quant, q2tp_expert_gate_or_up, quantize_2d,
 };
 
 enum Mode {
@@ -1032,4 +1032,74 @@ mod tests {
             None
         );
     }
+}
+
+/// `requant --quant blr-q8_2f`: every `blr` tensor expanded to its dense
+/// weight `Σ_p (S_U·diag h·diag ℓ)(S_V·diag g)ᵀ` (one GEMM per tensor, rows
+/// split over the cores) and stored as q8_2f; every other tensor copied. The
+/// result runs on the ordinary dense paths — what the perplexity tables of a
+/// `blr` model use, since the `blr` kernels serve decode, not long prefills.
+pub fn cmd_requant_blr_q8(model_path: &str, output: &str) -> anyhow::Result<()> {
+    use cortiq_core::blr::{blr_f16s, blr_path_offsets, validate_blr};
+    use cortiq_core::format::CmfStreamWriter;
+    let t0 = std::time::Instant::now();
+    let model = CmfModel::open_sharded(model_path)?;
+    crate::knowledge::refuse_genome_rewrite(&model, "requant")?;
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    let bit = |b: &[u8], off: usize, i: usize| (b[off + i / 8] >> (i % 8)) & 1 == 1;
+    let avg = model.tensors.iter().map(|e| e.name.len()).sum::<usize>() / model.tensors.len().max(1);
+    let mut out = CmfStreamWriter::new(output, CmfStreamWriter::head_reserve_for(model.tensors.len(), avg))?;
+    let mut n_blr = 0usize;
+    for e in &model.tensors {
+        let bytes = model.entry_bytes(e);
+        if e.dtype != TensorDtype::BinaryLowRank {
+            out.push_bounded(&e.name, e.dtype, &e.shape, bytes, 1 << 28)?;
+            continue;
+        }
+        let (rows, cols) = (e.shape[0], e.shape[1]);
+        let h = validate_blr(&e.shape, bytes).map_err(anyhow::Error::msg)?;
+        let (r, np) = (h.rank, h.paths);
+        let kk = r * np;
+        // A = [S_U,p·diag(h_p)·diag(ℓ_p)]_p (rows × P·r), B = [diag(g_p)·S_V,p]_p stacked (P·r × cols)
+        let mut a = vec![0f32; rows * kk];
+        let mut b = vec![0f32; kk * cols];
+        for p in 0..np {
+            let o = blr_path_offsets(&h, p);
+            let (hv, gv, lv) = (blr_f16s(bytes, o.h, rows), blr_f16s(bytes, o.g, cols), blr_f16s(bytes, o.l, r));
+            for i in 0..rows {
+                for k in 0..r {
+                    let s = if bit(bytes, o.u + i * (r / 8), k) { 1.0 } else { -1.0 };
+                    a[i * kk + p * r + k] = s * hv[i] * lv[k];
+                }
+            }
+            for k in 0..r {
+                for j in 0..cols {
+                    let s = if bit(bytes, o.v + k * (cols / 8), j) { 1.0 } else { -1.0 };
+                    b[(p * r + k) * cols + j] = s * gv[j];
+                }
+            }
+        }
+        let mut w = vec![0f32; rows * cols];
+        let per = rows.div_ceil(threads).max(1);
+        std::thread::scope(|s| {
+            for (ci, chunk) in w.chunks_mut(per * cols).enumerate() {
+                let m = chunk.len() / cols;
+                let src = &a[ci * per * kk..(ci * per + m) * kk];
+                let b = &b;
+                s.spawn(move || cortiq_engine::qtensor::sgemm_public(m, cols, kk, 1.0, src, kk, b, cols, false, chunk, cols));
+            }
+        });
+        drop((a, b));
+        let (dt, enc) = quantize_2d(Quant::Q8_2f, &w, rows, cols);
+        out.push(&e.name, dt, &e.shape, &enc)?;
+        n_blr += 1;
+    }
+    let mut header = model.header.clone();
+    header.section_hashes = None;
+    let mut prov = header.provenance.clone().unwrap_or_else(|| serde_json::json!({}));
+    prov["blr_expanded"] = serde_json::json!({ "to": "q8_2f", "tensors": n_blr, "source": std::path::Path::new(model_path).file_name().map(|f| f.to_string_lossy().into_owned()) });
+    header.provenance = Some(prov);
+    out.finish(&header, None, model.vocab.as_deref())?;
+    eprintln!("requant blr-q8_2f: {n_blr} blr tensors expanded to q8_2f → {output} in {:.0}s", t0.elapsed().as_secs_f64());
+    Ok(())
 }

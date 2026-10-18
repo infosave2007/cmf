@@ -676,7 +676,7 @@ enum Commands {
         /// Output .cmf path (omit with --in-place)
         #[arg(long)]
         output: Option<String>,
-        /// Target layout: q4tp (re-express scales), q4tp-quantize (float weights → q4tp), q2tp-draft (MTP inputs), q1g (lossless q1 repack: one scale per 128-group, 1.5 → 1.125 bpw), q1 (q1g back to q1 tiles, exact, for older readers), or embryo-q8-head (experimental tied Embryo vocabulary only; new output required)
+        /// Target layout: blr-q8_2f (every blr tensor expanded to a dense q8_2f weight, for evaluation on the dense paths), q4tp (re-express scales), q4tp-quantize (float weights → q4tp), q2tp-draft (MTP inputs), q1g (lossless q1 repack: one scale per 128-group, 1.5 → 1.125 bpw), q1 (q1g back to q1 tiles, exact, for older readers), or embryo-q8-head (experimental tied Embryo vocabulary only; new output required)
         #[arg(long, default_value = "q4tp")]
         quant: String,
         /// Rewrite tensors inside the source file itself — for disks that
@@ -3420,7 +3420,10 @@ async fn main() -> anyhow::Result<()> {
             allow_tol,
             tol,
         } => {
-            if quant == "q1g" {
+            if quant == "blr-q8_2f" {
+                let out = output.as_deref().ok_or_else(|| anyhow::anyhow!("--quant blr-q8_2f needs --output"))?;
+                requant::cmd_requant_blr_q8(&model, out)
+            } else if quant == "q1g" {
                 requant::cmd_requant_q1g(&model, output.as_deref(), in_place, allow_tol, tol)
             } else if quant == "q1" && !allow_tol {
                 requant::cmd_requant_q1(&model, output.as_deref(), in_place)
