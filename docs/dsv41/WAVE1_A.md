@@ -324,8 +324,14 @@ nothing to change there.
 Cost. Device tail: one extra compute pass per layer in the frame's existing
 encoder (no submit, no readback); for the release output (32768 values,
 1024 blocks = 16 workgroups of 64) its arithmetic is negligible against the
-grouped `wo_a` that follows, so the cost is the per-pass overhead, a few
-microseconds per layer (an estimate; not measured at release size).
+grouped `wo_a` that follows, so the cost is the pass and its dispatch.
+`dsv4_attn_frame` does not opt into pass merging (`PassMergeGuard`), and
+the repo's own measurement on its Vulkan stack (the pass-merge note in
+`gpu_wgpu.rs`: 700 one-dispatch passes 9.7 ms against 3.4 ms for the same
+dispatches in one pass) puts a pass boundary at ~9 µs and a dispatch at
+~5 µs: about 14 µs per layer, ~0.4-0.6 ms per token over 40 layers. An
+estimate, not measured at release size; if it shows, the quantizer can be
+fused into the `o_lora_a` pass or the frame can merge its passes.
 Host tail: `fp8_activation_inplace` costs 0.62 ms per 32768-value layer
 output on one M4 core (18.9 ns per value, measured with the function copied
 into an `-O` microbenchmark), about 25 ms per token over 40 layers, single
@@ -391,14 +397,14 @@ threaded; read `attention_other` in the `CMF_DSV41_PROF` report.
   there too.
 - `CMF_DSV41_O_FP8` is off by default; its effect on the released weights
   (perplexity / answers, with the 1017 checkpoint) is unmeasured. Measure
-  `O_FP8=1` against `O_FP8=0` with the SAME attention path in both arms:
-  the device tail (default; both arms now keep it, so the comparison is the
-  quantizer alone, at a few microseconds per layer), and, for the CPU-tail
-  check, `CMF_DSV41_GPU_ATTN=0` in both arms (there the flag also costs
-  ~0.6 ms per layer, ~25 ms per token on an M4-class core, so compare
-  tokens/s only within one tail). Before this pass `O_FP8=1` silently moved
-  attention to the CPU, so an `O_FP8=1` vs default run mixed the quantizer
-  with the tail change.
+  `O_FP8=1` against `O_FP8=0` with the SAME attention path in both arms: the
+  device tail (default; both arms now keep it, so the comparison is the
+  quantizer alone, an estimated ~14 µs per layer on Vulkan, see Part 4),
+  and, for the CPU-tail check, `CMF_DSV41_GPU_ATTN=0` in both arms (there
+  the flag also costs ~0.6 ms per layer, ~25 ms per token on an M4-class
+  core, so compare tokens/s only within one tail). Before this pass
+  `O_FP8=1` silently moved attention to the CPU, so an `O_FP8=1` vs default
+  run mixed the quantizer with the tail change.
 - Two journaled BF16 boundaries in sparse attention differ from the
   official kernel (probabilities before PV, `o` before the inverse RoPE);
   candidates for a parity pass on the real model, not changed.
