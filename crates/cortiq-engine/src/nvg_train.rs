@@ -482,6 +482,12 @@ pub struct Work {
     pub sg: Option<SignScratch>,
     /// Matrix-unit attention scratch (when the geometry allows it).
     att: Option<AttScratch>,
+    /// The step's embedding rows as f16: a persistent mapped upload buffer
+    /// (re-mapped right after its copy; `emb_mapped` set by the callback)
+    /// and its device copy, converted to f32 into the first checkpoint.
+    emb_up: wgpu::Buffer,
+    emb16: wgpu::Buffer,
+    emb_mapped: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Work {
@@ -598,6 +604,14 @@ impl Work {
                 .then_some(AttnGeom { nb, t, nh: g.nh, nkv: g.nkv, hd: g.hd })
                 .filter(|ag| ta::usable(c, ag))
                 .map(|ag| AttScratch::new(c, &ag)),
+            emb_up: c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("nvg_emb_up"),
+                size: ((ntok * g.hs).div_ceil(2) * 4) as u64,
+                usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: true,
+            }),
+            emb16: tm::f16_buf(c, ntok * g.hs),
+            emb_mapped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
     fn get(&self, n: &str) -> &wgpu::Buffer {
@@ -847,28 +861,55 @@ fn layer_bwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, dy: &wgpu:
 // ───────────────────────────── forward / step ─────────────────────────────
 
 fn embed(c: Ctx, net: &Net, w: &Work, ids: &[u32]) {
+    use std::sync::atomic::Ordering;
     let _p = prof::phase("embed");
     let hs = net.geom.hs;
-    let mut rows = vec![0f32; ids.len() * hs];
-    // f16 -> f32 row gather on a few threads (the GPU idles meanwhile)
-    let per = ids.len().div_ceil(16).max(1);
-    std::thread::scope(|sc| {
-        for (ci, chunk) in rows.chunks_mut(per * hs).enumerate() {
-            let ids = &ids[ci * per..];
-            let emb = &net.embed;
-            sc.spawn(move || {
-                for (t, row) in chunk.chunks_mut(hs).enumerate() {
-                    let id = ids[t] as usize;
-                    for (d, &s) in row.iter_mut().zip(&emb[id * hs..(id + 1) * hs]) {
-                        *d = f16_to_f32(s);
+    let n = ids.len() * hs;
+    // the upload buffer was re-mapped after the last step's copy; wait only if
+    // that has not completed yet (first use: mapped at creation)
+    if !w.emb_mapped.load(Ordering::Acquire) {
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+    }
+    let bytes = n.div_ceil(2) * 4;
+    {
+        let mut view = w.emb_up.slice(..bytes as u64).get_mapped_range_mut().expect("embedding upload buffer mapped");
+        // write-only mapped memory: each thread copies its rows' f16 bits to
+        // a disjoint range (the conversion to f32 runs on the card)
+        let mut dst = view.slice(..);
+        let base = dst.as_raw_element_ptr().as_ptr() as usize;
+        let per = ids.len().div_ceil(16).max(1);
+        std::thread::scope(|sc| {
+            for (ci, chunk) in ids.chunks(per).enumerate() {
+                let emb = &net.embed;
+                sc.spawn(move || {
+                    for (t, &id) in chunk.iter().enumerate() {
+                        let src = &emb[id as usize * hs..(id as usize + 1) * hs];
+                        let at = base + ((ci * per + t) * hs) * 2;
+                        // SAFETY: [at, at + 2·hs) lies inside the mapped write
+                        // range (row ci·per + t < ids.len()) and no other thread
+                        // writes it; `src` is host memory.
+                        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr() as *const u8, at as *mut u8, hs * 2) }
                     }
-                }
-            });
+                });
+            }
+        });
+    }
+    w.emb_up.unmap();
+    w.emb_mapped.store(false, Ordering::Release);
+    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("embed") });
+    let mut mk = prof::enc_begin(c, &mut enc);
+    enc.copy_buffer_to_buffer(&w.emb_up, 0, &w.emb16, 0, bytes as u64);
+    prof::enc_mark(c, &mut enc, &mut mk, "copy");
+    if let Some(d) = tm::f16_to_f32(c, &w.emb16, &w.ckpt[0], n) {
+        tm::record(c, &mut enc, &[Op::D(d)]);
+    }
+    crate::gpu_wgpu::submit_pub(c, enc.finish());
+    let flag = w.emb_mapped.clone();
+    w.emb_up.slice(..).map_async(wgpu::MapMode::Write, move |r| {
+        if r.is_ok() {
+            flag.store(true, Ordering::Release);
         }
     });
-    prof::count(prof::Cnt::Write, 1);
-    prof::count(prof::Cnt::WriteBytes, (rows.len() * 4) as u64);
-    c.queue.write_buffer(&w.ckpt[0], 0, bytemuck::cast_slice(&rows));
 }
 
 /// Forward of all layers from the embedded `ids` (checkpoints filled);

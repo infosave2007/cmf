@@ -470,6 +470,14 @@ fn sumsq_cat(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg:
     if (t == 0u) { OUT[wg.y * p.m + wg.x] = ssq[0]; }
 }
 
+// OUT[i] = f32(DST[i]) for i < k (the embedding rows, uploaded as f16).
+@compute @workgroup_size(256)
+fn f16_to_f32(@builtin(global_invocation_id) g: vec3<u32>) {
+    let i = idx(g);
+    if (i >= p.k) { return; }
+    OUT[i] = f32(DST[i]);
+}
+
 // OUT[m][k] (+)= A[m][k]·COL[k]   (rows = 1: accumulate, 0: overwrite)
 @compute @workgroup_size(256)
 fn scale_acc(@builtin(global_invocation_id) g: vec3<u32>) {
@@ -481,7 +489,7 @@ fn scale_acc(@builtin(global_invocation_id) g: vec3<u32>) {
 "#;
 
 fn module(c: &Ctx) -> Option<&'static train_ops::Mod> {
-    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "cvt_cols", "cvt_t", "expand", "expand_n", "expand_t", "colsum_prod", "colsum_part", "colsum_fin", "colsum_fused", "colsum_fused_t", "scale_acc", "dense_fwd", "dense_bwd", "dense_fwd_t", "dense_bwd_t", "split_qg", "adam", "sumsq", "adam_cat", "sumsq_cat"])
+    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "cvt_cols", "cvt_t", "expand", "expand_n", "expand_t", "colsum_prod", "colsum_part", "colsum_fin", "colsum_fused", "colsum_fused_t", "scale_acc", "dense_fwd", "dense_bwd", "dense_fwd_t", "dense_bwd_t", "split_qg", "adam", "sumsq", "adam_cat", "sumsq_cat", "f16_to_f32"])
 }
 
 /// One step of a trainer pass: an elementwise/reduction dispatch or a GEMM.
@@ -785,6 +793,12 @@ pub fn scale_acc<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, col: &'a wgpu::Buffer, out
         bufs: vec![(2, col), (7, a), (9, out)],
         grid: elt_fold(m * k),
     })
+}
+
+/// `out[i] = f32(src[i])` for `n` halves of `src`.
+pub fn f16_to_f32<'a>(c: &'a Ctx, src: &'a wgpu::Buffer, out: &'a wgpu::Buffer, n: usize) -> Option<Disp<'a>> {
+    let md = module(c)?;
+    Some(Disp { pipe: &md.p["f16_to_f32"], uni: vec![0, n as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], bufs: vec![(3, src), (9, out)], grid: elt_fold(n) })
 }
 
 /// Small dense linear `out[m][r] (+)= a[m][k]·w[r][k]ᵀ` in f32.
