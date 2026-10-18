@@ -20166,6 +20166,29 @@ pub fn selected() -> bool {
     }
 }
 
+/// AMD RDNA1/RDNA2 (Navi 1x/2x: PCI ids 0x7310–0x73FF, and Navi 24 at
+/// 0x743F) have no matrix units; RDNA3 (0x744x, 0x747x, 0x748x) and newer do.
+fn amd_without_matrix_units(vendor: u32, device: u32) -> bool {
+    vendor == 0x1002 && ((0x7310..=0x73ff).contains(&device) || device == 0x743f)
+}
+
+#[cfg(test)]
+mod amd_matrix_unit_tests {
+    use super::amd_without_matrix_units;
+
+    #[test]
+    fn rdna1_rdna2_have_no_matrix_units() {
+        // RX 5700 XT (Navi 10), RX 6900 XT (Navi 21), RX 6600M (Navi 23, issue #34), RX 6500 XT (Navi 24)
+        for d in [0x731f, 0x73bf, 0x73ff, 0x743f] {
+            assert!(amd_without_matrix_units(0x1002, d), "{d:#x}");
+        }
+        // RX 7900 XTX (Navi 31), RX 7600 (Navi 33), Radeon 780M (Phoenix), and other vendors
+        for (v, d) in [(0x1002, 0x744c), (0x1002, 0x7480), (0x1002, 0x15bf), (0x10de, 0x73ff), (0x8086, 0x7310)] {
+            assert!(!amd_without_matrix_units(v, d), "{v:#x}:{d:#x}");
+        }
+    }
+}
+
 fn ctx() -> Option<&'static Ctx> {
     ctx_for(crate::gpu::current_device())
 }
@@ -20631,8 +20654,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     // the log ends in the q4tp-coop module, right before its pipeline).
     // Off on those device ids unless CMF_COOP=1 forces it.
     let coop_env = std::env::var("CMF_COOP").ok();
-    let amd_no_wmma = adapter_info.vendor == 0x1002
-        && ((0x7310..=0x73ff).contains(&adapter_info.device) || adapter_info.device == 0x743f);
+    let amd_no_wmma = amd_without_matrix_units(adapter_info.vendor, adapter_info.device);
     if amd_no_wmma && coop_shape && coop_env.as_deref() != Some("1") {
         tracing::info!(
             "cooperative matrices off on {} (AMD RDNA1/RDNA2, no matrix units); CMF_COOP=1 forces them",
