@@ -581,15 +581,30 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
                 cortiq_engine::gpu_wgpu::release_model_buffers(&cmodel);
             }
             if let Some((dir, meta)) = saved.as_mut() {
-                eprintln!("  layers {lo}..{hi}: saving the capture to {} ({:.1} GB)", dir.display(), ((hi - lo) as u64 * meta.layer_bytes()) as f64 / 1e9);
-                for (k, li) in (lo..hi).enumerate() {
-                    capture_save_layer(dir, meta, li, &rows[k])?;
-                    if !meta.layers.contains(&li) {
+                // the layers of this pass not saved yet (a saved one keeps its files)
+                let new: Vec<usize> = (lo..hi).filter(|li| !meta.layers.contains(li)).collect();
+                eprintln!("  layers {lo}..{hi}: saving the capture of {} layers to {} ({:.1} GB)", new.len(), dir.display(), (new.len() as u64 * meta.layer_bytes()) as f64 / 1e9);
+                for li in new {
+                    // meta.json is rewritten after each layer: a failure
+                    // keeps every layer saved before it
+                    let r = (|| -> anyhow::Result<()> {
+                        capture_save_layer(dir, meta, li, &rows[li - lo])?;
                         meta.layers.push(li);
+                        meta.layers.sort_unstable();
+                        capture_save_meta(dir, meta)
+                    })();
+                    if let Err(e) = r {
+                        meta.layers.retain(|&l| l != li);
+                        capture_remove_layer(dir, li);
+                        if capture_only {
+                            return Err(e.context(format!("saving layer {li}'s capture to {}", dir.display())));
+                        }
+                        // the rows are in memory: losing the forward to a
+                        // full disk would cost far more than the files
+                        eprintln!("  warning: saving layer {li}'s capture failed ({e:#}); the run goes on from the rows in memory, without saving the rest of this pass");
+                        break;
                     }
                 }
-                meta.layers.sort_unstable();
-                capture_save_meta(dir, meta)?;
             }
             rows
         };
@@ -1592,16 +1607,21 @@ pub(crate) fn capture_open(dir: &Path, want: &CaptureMeta, force: bool) -> anyho
 }
 
 /// `path` written through a `.tmp` sibling and renamed into place.
+/// A failed write removes its `.tmp` (a full disk keeps no partial file).
 fn write_atomic(path: &Path, fill: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::io::Result<()>) -> anyhow::Result<()> {
     let name = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
     let tmp = path.with_file_name(format!("{name}.tmp"));
-    {
+    let r = (|| -> anyhow::Result<()> {
         let mut w = std::io::BufWriter::with_capacity(1 << 22, std::fs::File::create(&tmp).map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?);
         fill(&mut w).map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?;
         w.into_inner().map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?.sync_all()?;
+        std::fs::rename(&tmp, path).map_err(|e| anyhow::anyhow!("{} → {}: {e}", tmp.display(), path.display()))?;
+        Ok(())
+    })();
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    std::fs::rename(&tmp, path).map_err(|e| anyhow::anyhow!("{} → {}: {e}", tmp.display(), path.display()))?;
-    Ok(())
+    r
 }
 
 /// Little-endian values in 1 MiB-element blocks.
@@ -1653,6 +1673,16 @@ pub(crate) fn capture_save_layer(dir: &Path, meta: &CaptureMeta, li: usize, r: &
         write_atomic(&capture_path(dir, li, "w"), |w| write_le(w, &r.w, f32::to_le_bytes))?;
     }
     Ok(())
+}
+
+/// Remove the files of a layer that `meta.json` does not list (a save that
+/// failed part way).
+fn capture_remove_layer(dir: &Path, li: usize) {
+    for ext in ["x", "picks", "w"] {
+        let p = capture_path(dir, li, ext);
+        let _ = std::fs::remove_file(p.with_file_name(format!("L{li}.{ext}.tmp")));
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 pub(crate) fn capture_save_meta(dir: &Path, meta: &CaptureMeta) -> anyhow::Result<()> {
@@ -2850,6 +2880,13 @@ mod tests {
         assert!(e.contains("hidden 16 saved, 32 now"), "{e}");
         let e = capture_open(&dir, &CaptureMeta { top_k: 3, ne: 6, ..want.clone() }, false).unwrap_err().to_string();
         assert!(e.contains("top_k") && e.contains("experts"), "{e}");
+        // a failed write leaves neither the file nor its .tmp
+        assert!(write_atomic(&dir.join("L9.x"), |_| Err(std::io::Error::other("disk full"))).is_err());
+        assert!(!dir.join("L9.x").exists() && !dir.join("L9.x.tmp").exists());
+        // the files of a layer that failed part way are removed
+        capture_save_layer(&dir, &meta, 9, &rows[0]).unwrap();
+        capture_remove_layer(&dir, 9);
+        assert!(["x", "picks", "w"].iter().all(|e| !dir.join(format!("L9.{e}")).exists()));
         // a truncated layer file is an error, not short rows
         std::fs::write(dir.join("L4.picks"), [0u8; 10]).unwrap();
         assert!(capture_load_layer(&dir, &again, 4).is_err());
