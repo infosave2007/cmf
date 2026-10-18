@@ -857,11 +857,17 @@ pub struct MmCfg {
     /// f32 accumulators exactly (stored through the idle staging arrays,
     /// reloaded as an A operand, multiplied by the identity).
     pub acc16: u32,
+    /// The plane operand as sign bitmaps (±1, exact in f16), expanded in
+    /// the staging loop instead of read as f16: 0 = f16 plane `[N][K]`;
+    /// 1 = bits `[N][words]` (bit k%32 of word k/32 = element (n, k));
+    /// 2 = bits `[K][words]` (bit n%32 of word n/32 = element (n, k)).
+    /// `words` per bitmap row in `MmArgs::conv[0]`. The nvg-train blr GEMMs.
+    pub bits: u32,
 }
 
 impl MmCfg {
     pub const fn new(bm: u32, bn: u32, bk: u32, wm: u32, wn: u32, epi: Epi) -> Self {
-        Self { bm, bn, bk, wm, wn, epi, direct: false, acc16_probe: false, stages: 1, conv: 0, acc16: 0 }
+        Self { bm, bn, bk, wm, wn, epi, direct: false, acc16_probe: false, stages: 1, conv: 0, acc16: 0, bits: 0 }
     }
     pub fn valid(&self) -> bool {
         let nt = self.wm * self.wn * 32;
@@ -880,6 +886,16 @@ impl MmCfg {
             && (self.conv == 0 || (!self.direct && self.stages == 1 && !self.acc16_probe && nt % vpr == 0))
             && (self.acc16 == 0 || (!self.direct && self.stages == 1 && !self.acc16_probe && self.conv == 0))
             && (self.acc16 == 0 || self.flush_slots().0 + self.flush_slots().1 > 0)
+            && (self.bits == 0
+                || (self.bits <= 2
+                    && !self.direct
+                    && self.stages == 1
+                    && !self.acc16_probe
+                    && self.conv == 0
+                    && self.acc16 == 0
+                    && self.bk % 32 == 0
+                    && self.bn % 32 == 0
+                    && (self.bn * self.bk / 32) % nt == 0))
     }
     /// Flush slots (16x16 f16 fragments) per subgroup in the staging
     /// arrays `sa`, `sb` (acc16 arm).
@@ -907,6 +923,8 @@ impl MmCfg {
                 format!("_conv{}", self.conv)
             } else if self.acc16 != 0 {
                 format!("_a{}", self.acc16)
+            } else if self.bits != 0 {
+                format!("_b{}", self.bits)
             } else {
                 String::new()
             }
@@ -960,7 +978,7 @@ pub fn mm_src(g: MmCfg) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "enable f16;\nenable wgpu_cooperative_matrix;");
     let _ = writeln!(s, "diagnostic(off, derivative_uniformity);");
-    if g.conv == 0 {
+    if g.conv == 0 && g.bits == 0 {
         let _ = writeln!(
             s,
             "struct MmP {{ m: u32, n: u32, k: u32, ldo: u32, ocol: u32, arow: u32, oscale: f32, _p: u32 }};"
@@ -977,7 +995,11 @@ pub fn mm_src(g: MmCfg) -> String {
         let _ = writeln!(s, "@group(0) @binding(0) var<storage, read> wt: array<f16>;");
         let _ = writeln!(s, "@group(0) @binding(1) var<storage, read> act: array<f16>;");
     } else {
-        let _ = writeln!(s, "@group(0) @binding(0) var<storage, read> wt: array<vec4<f16>>;");
+        if g.bits != 0 {
+            let _ = writeln!(s, "@group(0) @binding(0) var<storage, read> wt: array<u32>;");
+        } else {
+            let _ = writeln!(s, "@group(0) @binding(0) var<storage, read> wt: array<vec4<f16>>;");
+        }
         let _ = writeln!(s, "@group(0) @binding(1) var<storage, read> act: array<vec4<f16>>;");
     }
     match g.epi {
@@ -1097,23 +1119,56 @@ pub fn mm_src(g: MmCfg) -> String {
                 );
             }
         }
-        for t in 0..lb {
-            let _ = writeln!(
-                s,
-                "  var rb{t} = wt[(n0 + (tid + {o}u) / {vpr}u) * kq + (tid + {o}u) % {vpr}u];",
-                o = t * nt
-            );
+        // bits planes: `nbw` words per thread per K slice (see `MmCfg::bits`)
+        let nbw = g.bn * g.bk / 32 / nt;
+        let bw_load = |t: u32, kt: &str| -> String {
+            let o = t * nt;
+            if g.bits == 1 {
+                format!("wt[(n0 + (tid + {o}u) / {wps}u) * p.cw + {kt} * {wps}u + (tid + {o}u) % {wps}u]", wps = g.bk / 32)
+            } else {
+                format!("wt[({kt} * {bk}u + (tid + {o}u) / {wpn}u) * p.cw + n0 / 32u + (tid + {o}u) % {wpn}u]", bk = g.bk, wpn = g.bn / 32)
+            }
+        };
+        if g.bits != 0 {
+            for t in 0..nbw {
+                let _ = writeln!(s, "  var rb{t} = {};", bw_load(t, "0u"));
+            }
+        } else {
+            for t in 0..lb {
+                let _ = writeln!(
+                    s,
+                    "  var rb{t} = wt[(n0 + (tid + {o}u) / {vpr}u) * kq + (tid + {o}u) % {vpr}u];",
+                    o = t * nt
+                );
+            }
         }
         if g.stages == 2 {
             mm_loop_2stage(&mut s, g, nt, tm, tn, fm, fnn, lds, vpr, la, lb);
         } else {
             let _ = writeln!(s, "  for (var kt = 0u; kt < nkt; kt = kt + 1u) {{");
-            for (arr, reg, cnt) in [("sa", "ra", la), ("sb", "rb", lb)] {
+            for (arr, reg, cnt) in [("sa", "ra", la), ("sb", "rb", if g.bits != 0 { 0 } else { lb })] {
                 for t in 0..cnt {
                     let _ = writeln!(
                         s,
                         "    {{ let d = ((tid + {o}u) / {vpr}u) * {lds}u + ((tid + {o}u) % {vpr}u) * 4u; {arr}[d] = {reg}{t}.x; {arr}[d + 1u] = {reg}{t}.y; {arr}[d + 2u] = {reg}{t}.z; {arr}[d + 3u] = {reg}{t}.w; }}",
                         o = t * nt
+                    );
+                }
+            }
+            // bits planes: each word expanded into 32 ±1 halves of sb
+            for t in 0..if g.bits != 0 { nbw } else { 0 } {
+                let o = t * nt;
+                if g.bits == 1 {
+                    let _ = writeln!(
+                        s,
+                        "    {{ let d = ((tid + {o}u) / {wps}u) * {lds}u + ((tid + {o}u) % {wps}u) * 32u; let w = rb{t}; for (var e = 0u; e < 32u; e = e + 1u) {{ sb[d + e] = select(-1.0h, 1.0h, ((w >> e) & 1u) == 1u); }} }}",
+                        wps = g.bk / 32
+                    );
+                } else {
+                    let _ = writeln!(
+                        s,
+                        "    {{ let d = ((tid + {o}u) % {wpn}u) * 32u * {lds}u + (tid + {o}u) / {wpn}u; let w = rb{t}; for (var e = 0u; e < 32u; e = e + 1u) {{ sb[d + e * {lds}u] = select(-1.0h, 1.0h, ((w >> e) & 1u) == 1u); }} }}",
+                        wpn = g.bn / 32
                     );
                 }
             }
@@ -1130,12 +1185,18 @@ pub fn mm_src(g: MmCfg) -> String {
                     );
                 }
             }
-            for t in 0..lb {
-                let _ = writeln!(
-                    s,
-                    "      rb{t} = wt[(n0 + (tid + {o}u) / {vpr}u) * kq + kb + (tid + {o}u) % {vpr}u];",
-                    o = t * nt
-                );
+            if g.bits != 0 {
+                for t in 0..nbw {
+                    let _ = writeln!(s, "      rb{t} = {};", bw_load(t, "(kt + 1u)"));
+                }
+            } else {
+                for t in 0..lb {
+                    let _ = writeln!(
+                        s,
+                        "      rb{t} = wt[(n0 + (tid + {o}u) / {vpr}u) * kq + kb + (tid + {o}u) % {vpr}u];",
+                        o = t * nt
+                    );
+                }
             }
             let _ = writeln!(s, "    }}");
             for kk in 0..g.bk / 16 {
@@ -1355,10 +1416,19 @@ fn mm_loop_2stage(
 }
 
 pub(super) fn mm_pipe(c: &Ctx, g: MmCfg) -> Option<Arc<wgpu::ComputePipeline>> {
+    // Per-config memo: the trainer asks for a pipeline per GEMM (thousands a
+    // step); the key and the WGSL text are built only on the first ask.
+    static MEMO: std::sync::OnceLock<Mutex<HashMap<MmCfg, Arc<wgpu::ComputePipeline>>>> = std::sync::OnceLock::new();
+    let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(p) = memo.lock().ok()?.get(&g) {
+        return Some(p.clone());
+    }
     if !g.valid() || g.shared_bytes() > c.device.limits().max_compute_workgroup_storage_size {
         return None;
     }
-    pipeline(c, &g.key(), &mm_src(g), "zi_mm")
+    let p = pipeline(c, &g.key(), &mm_src(g), "zi_mm")?;
+    memo.lock().ok()?.insert(g, p.clone());
+    Some(p)
 }
 
 /// Uniform of one `zi_mm` dispatch.
@@ -1397,6 +1467,10 @@ pub(super) struct MmCall {
     pub(super) pipe: Arc<wgpu::ComputePipeline>,
     pub(super) bg: wgpu::BindGroup,
     pub(super) grid: (u32, u32),
+    /// (m, n, k) of the product, for the trainer profiler's FLOP rates.
+    pub(super) mnk: [u32; 3],
+    /// The plane operand is a sign bitmap ([`MmCfg::bits`]).
+    pub(super) bits: bool,
 }
 
 pub(super) fn mm_call(
@@ -1412,6 +1486,10 @@ pub(super) fn mm_call(
     }
     let pipe = mm_pipe(c, g)?;
     let u = mm_uniform(c, a);
+    if super::train_prof::on() {
+        super::train_prof::count(super::train_prof::Cnt::Buf, 1);
+        super::train_prof::count(super::train_prof::Cnt::BindGroup, 1);
+    }
     let bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("zi_mm"),
         layout: &pipe.get_bind_group_layout(0),
@@ -1426,10 +1504,16 @@ pub(super) fn mm_call(
         pipe,
         bg,
         grid: (a.n / g.bn, a.m.div_ceil(g.bm)),
+        mnk: [a.m, a.n, a.k],
+        bits: g.bits != 0,
     })
 }
 
 impl MmCall {
+    /// Whether this GEMM reads its plane as a sign bitmap.
+    pub(super) fn reads_bits(&self) -> bool {
+        self.bits
+    }
     pub(super) fn record(&self, pass: &mut wgpu::ComputePass) {
         pass.set_pipeline(&self.pipe);
         pass.set_bind_group(0, &self.bg, &[]);
@@ -4326,7 +4410,7 @@ fn vae_decode_dev(a: &crate::vae::VaeChainArgs, z: &[f32], h0: usize, w0: usize,
                     super::bind_buf(3, &u),
                 ],
             });
-            r.calls.push_mm(Class::Io, MmCall { pipe, bg: bgr, grid: (a.n / g.bn, a.m.div_ceil(g.bm)) });
+            r.calls.push_mm(Class::Io, MmCall { pipe, bg: bgr, grid: (a.n / g.bn, a.m.div_ceil(g.bm)), mnk: [a.m, a.n, a.k], bits: false });
             q0 += rq;
         }
         r.cast(&o32, Some(&at.v.bias), m, mp, cc, &bufs.xn)?;

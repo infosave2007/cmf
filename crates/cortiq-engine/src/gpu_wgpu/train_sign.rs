@@ -49,6 +49,9 @@ struct P {
 @group(0) @binding(10) var<storage, read_write> CNT: array<atomic<u32>>;
 @group(0) @binding(11) var<storage, read_write> BITS0: array<u32>;
 @group(0) @binding(12) var<storage, read_write> GOUT: array<f32>;
+// CNT[CNT_SKIP] != 0: the step's loss is not finite — every sign-state write
+// is skipped (set by loss_flag; the per-step counter reset clears it).
+const CNT_SKIP: u32 = 63u;
 
 fn idx(g: vec3<u32>) -> u32 { return g.x + g.y * 65535u * 256u; }
 fn pcg(v: u32) -> u32 {
@@ -166,10 +169,27 @@ fn g_rowsq(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index
         }
         workgroupBarrier();
     }
-    if (t == 0u) {
+    if (t == 0u && atomicLoad(&CNT[CNT_SKIP]) == 0u) {
         VROW[row] = p.b2 * VROW[row] + (1.0 - p.b2) * (red[0] / f32(p.r));
         if (redn[0] > 0u) { atomicAdd(&CNT[40], redn[0]); }
     }
+}
+
+// CNT[CNT_SKIP] = 1 when any of the step's `rows` per-token losses (in G) is
+// not finite. One workgroup.
+@compute @workgroup_size(256)
+fn loss_flag(@builtin(local_invocation_index) t: u32) {
+    var bad = 0u;
+    for (var i = t; i < p.rows; i = i + 256u) {
+        if (!fin(G[i])) { bad = 1u; }
+    }
+    redn[t] = bad;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {
+        if (t < s) { redn[t] = max(redn[t], redn[t + s]); }
+        workgroupBarrier();
+    }
+    if (t == 0u && redn[0] != 0u) { atomicStore(&CNT[CNT_SKIP], 1u); }
 }
 
 // Column partial sums of G² over 512-row chunks: PART[chunk][col].
@@ -191,7 +211,7 @@ fn g_colsq(@builtin(global_invocation_id) g: vec3<u32>, @builtin(workgroup_id) w
 @compute @workgroup_size(256)
 fn g_colfin(@builtin(global_invocation_id) g: vec3<u32>) {
     let col = g.x;
-    if (col >= p.r) { return; }
+    if (col >= p.r || atomicLoad(&CNT[CNT_SKIP]) != 0u) { return; }
     var s = 0.0;
     for (var c = 0u; c < p.chunks; c = c + 1u) { s = s + PART[c * p.rp + col]; }
     VCOL[col] = p.b2 * VCOL[col] + (1.0 - p.b2) * (s / f32(p.rows));
@@ -208,10 +228,13 @@ fn g_cmean(@builtin(local_invocation_index) t: u32) {
         if (t < s) { red[t] = red[t] + red[t + s]; }
         workgroupBarrier();
     }
-    if (t == 0u) { SCAL[0] = red[0] / f32(p.r); }
+    if (t == 0u && atomicLoad(&CNT[CNT_SKIP]) == 0u) { SCAL[0] = red[0] / f32(p.r); }
 }
 
 var<workgroup> wflip: atomic<u32>;
+// CNT[CNT_SKIP] read once per workgroup (by wg_reset): one atomic load a
+// workgroup instead of one per thread on the same word.
+var<workgroup> wskip: u32;
 var<workgroup> wsat: atomic<u32>;
 var<workgroup> wclp: atomic<u32>;
 
@@ -231,6 +254,7 @@ fn wg_reset(t: u32) {
         atomicStore(&wflip, 0u);
         atomicStore(&wsat, 0u);
         atomicStore(&wclp, 0u);
+        wskip = atomicLoad(&CNT[CNT_SKIP]);
     }
     workgroupBarrier();
 }
@@ -240,7 +264,7 @@ fn wg_reset(t: u32) {
 fn sign_upd(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_index) t: u32) {
     wg_reset(t);
     let i = idx(g);
-    if (i < p.rows * p.wpr) {
+    if (i < p.rows * p.wpr && wskip == 0u) {
         let row = i / p.wpr;
         let w = i % p.wpr;
         let live = live_mask(w);
@@ -297,7 +321,7 @@ fn sign_upd(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocati
 fn sign_upd_mom(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_index) t: u32) {
     wg_reset(t);
     let i = idx(g);
-    if (i < p.rows * p.wpr) {
+    if (i < p.rows * p.wpr && wskip == 0u) {
         let row = i / p.wpr;
         let w = i % p.wpr;
         let live = live_mask(w);
@@ -361,7 +385,7 @@ fn sign_upd_mom(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invo
 fn sign_upd_ref(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_index) t: u32) {
     wg_reset(t);
     let i = idx(g);
-    if (i < p.rows * p.wpr) {
+    if (i < p.rows * p.wpr && wskip == 0u) {
         let row = i / p.wpr;
         let w = i % p.wpr;
         let live = live_mask(w);
@@ -431,8 +455,98 @@ fn module(c: &Ctx) -> Option<&'static train_ops::Mod> {
         c,
         "train_sign",
         SRC,
-        &["lat_init", "lat_init_f32", "g_rowsq", "g_colsq", "g_colfin", "g_cmean", "sign_upd", "sign_upd_mom", "sign_upd_ref", "bits_diff", "g_copy"],
+        &["lat_init", "lat_init_f32", "g_rowsq", "g_colsq", "g_colfin", "g_cmean", "sign_upd", "sign_upd_mom", "sign_upd_ref", "bits_diff", "g_copy", "loss_flag"],
     )
+}
+
+// `sign_upd_mom` with one 32-lane subgroup per bitmap word and one lane per
+// sign: the gradient, latent and moment reads are coalesced (the original's
+// thread walks its word's 32 entries, lanes 128 B apart), the word comes back
+// with a ballot, the int16 pairs with one shuffle. Per entry the arithmetic
+// and the rounding stream are those of `sign_upd_mom`.
+const MOM2_SRC: &str = r#"
+@compute @workgroup_size(256)
+fn sign_upd_mom2(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32, @builtin(subgroup_invocation_id) lane: u32) {
+    wg_reset(t);
+    let i = (wg.x + wg.y * 65535u) * 8u + t / 32u;
+    let valid = i < p.rows * p.wpr;
+    let ii = select(0u, i, valid);
+    let row = ii / p.wpr;
+    let w = ii % p.wpr;
+    let live = select(0u, live_mask(w), valid);
+    let k = w * 32u + lane;
+    let e = row * p.rp + k;
+    let li = e / 2u;
+    let h = lane & 1u;
+    let pw = LAT[li];
+    let mw = MOM[li];
+    var q = half_of(pw, h);
+    var mb = (mw >> (16u * h)) & 0xffffu;
+    let bw = BITS[ii];
+    let ob = (bw >> lane) & 1u;
+    var nbit = ob;
+    var sat = 0u;
+    var clp = 0u;
+    if (((live >> lane) & 1u) == 1u) {
+        let mm = SCAL[0];
+        let inv = 1.0 / (mm * p.bc2);
+        let epsd = p.eps * sqrt(mm / p.bc2);
+        let rv = VROW[row];
+        let base = pcg(p.seed ^ pcg(p.step ^ pcg(p.id ^ 0x2545f491u)));
+        var gv = G[e];
+        if (!fin(gv)) { gv = 0.0; }
+        let mn = p.b1 * bitcast<f32>(mb << 16u) + (1.0 - p.b1) * gv;
+        mb = bf16(mn);
+        let den = sqrt(max(rv * VCOL[k] * inv, 0.0)) + epsd;
+        var u = 0.0;
+        if (den > 0.0) { u = (mn / p.bc1) / den; }
+        if (!fin(u)) { u = 0.0; }
+        if (abs(u) > p.clampv) { u = clamp(u, -p.clampv, p.clampv); clp = 1u; }
+        let st = qstep(q, u, pcg(base ^ pcg(e)));
+        q = st.x;
+        sat = u32(st.y);
+        nbit = newbit(q, ob);
+    }
+    let qb = bitcast<u32>(q) & 0xffffu;
+    let qo = subgroupShuffleXor(qb, 1u);
+    let mo = subgroupShuffleXor(mb, 1u);
+    let nw = subgroupBallot(nbit == 1u).x;
+    let ns = subgroupAdd(sat);
+    let nc = subgroupAdd(clp);
+    if (live != 0u && wskip == 0u) {
+        if (h == 0u) {
+            LAT[li] = qb | (qo << 16u);
+            MOM[li] = mb | (mo << 16u);
+        }
+        if (lane == 0u) {
+            BITS[ii] = nw;
+            let f = countOneBits(bw ^ nw);
+            if (f > 0u) { atomicAdd(&wflip, f); }
+            if (ns > 0u) { atomicAdd(&wsat, ns); }
+            if (nc > 0u) { atomicAdd(&wclp, nc); }
+        }
+    }
+    wg_flush(t);
+}
+"#;
+
+/// The subgroup module (`sign_upd_mom2`), where 32-wide subgroups exist.
+fn module_sg(c: &Ctx) -> Option<&'static train_ops::Mod> {
+    if !c.device.features().contains(wgpu::Features::SUBGROUP)
+        || c.adapter_info.subgroup_min_size != 32
+        || c.adapter_info.subgroup_max_size != 32
+        || std::env::var("CMF_SIGN_SG").as_deref() == Ok("0")
+    {
+        return None;
+    }
+    static SRC2: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    let src = SRC2.get_or_init(|| {
+        let head = &SRC[..SRC.find("// int16 latents from the bitmap").expect("train_sign layout")];
+        let a = SRC.find("var<workgroup> wflip").expect("train_sign layout");
+        let b = SRC.find("// Factored-second-moment step").expect("train_sign layout");
+        Box::leak(format!("{head}{}{MOM2_SRC}", &SRC[a..b]).into_boxed_str())
+    });
+    train_ops::module(c, "train_sign_sg", src, &["sign_upd_mom2"])
 }
 
 /// Roles of the binary low-rank linears (flip counters are kept per role and side).
@@ -548,6 +662,10 @@ pub struct SignScratch {
     pub t_big: wgpu::Buffer,
     /// f16 transposed plane operand `[rp_max][kpad]`.
     pub t_small: wgpu::Buffer,
+    /// The G_V operands (`x⊙g`, `b⊙ℓ·gs` transposed), written by the
+    /// backward's column reductions before G_U has read `t_big`/`t_small`.
+    pub t_big2: wgpu::Buffer,
+    pub t_small2: wgpu::Buffer,
     pub part: wgpu::Buffer,
     pub scal: wgpu::Buffer,
     /// u32[64] counters (see the CNT_* slots).
@@ -569,6 +687,8 @@ impl SignScratch {
             g: storage(c, pr * rp_max),
             t_big: super::train_mm::f16_buf(c, pr * kpad),
             t_small: super::train_mm::f16_buf(c, rp_max * kpad),
+            t_big2: super::train_mm::f16_buf(c, pr * kpad),
+            t_small2: super::train_mm::f16_buf(c, rp_max * kpad),
             part: storage(c, max_rows.div_ceil(512) * rp_max),
             scal: storage(c, 4),
             cnt: storage(c, CNT_LEN),
@@ -579,7 +699,7 @@ impl SignScratch {
     }
     /// Device bytes of this scratch.
     pub fn bytes(&self) -> u64 {
-        self.g.size() + self.t_big.size() + self.t_small.size() + self.part.size() + self.scal.size() + self.cnt.size()
+        self.g.size() + self.t_big.size() + self.t_small.size() + self.t_big2.size() + self.t_small2.size() + self.part.size() + self.scal.size() + self.cnt.size()
     }
 }
 
@@ -701,15 +821,17 @@ pub fn update_ops<'a>(c: &'a Ctx, cfg: &SignStepCfg, sc: &'a SignScratch, mat: &
         bufs: vec![(1, g), (8, &sc.part)],
         grid: (rp.div_ceil(256) as u32, rows.div_ceil(512) as u32, 1),
     }));
-    ops.push(Op::D(Disp { pipe: &md.p["g_colfin"], uni: u.clone(), bufs: vec![(6, &mat.vcol), (8, &sc.part)], grid: (rp.div_ceil(256) as u32, 1, 1) }));
-    ops.push(Op::D(Disp { pipe: &md.p["g_cmean"], uni: u.clone(), bufs: vec![(6, &mat.vcol), (9, &sc.scal)], grid: (1, 1, 1) }));
+    ops.push(Op::D(Disp { pipe: &md.p["g_colfin"], uni: u.clone(), bufs: vec![(6, &mat.vcol), (8, &sc.part), (10, &sc.cnt)], grid: (rp.div_ceil(256) as u32, 1, 1) }));
+    ops.push(Op::D(Disp { pipe: &md.p["g_cmean"], uni: u.clone(), bufs: vec![(6, &mat.vcol), (9, &sc.scal), (10, &sc.cnt)], grid: (1, 1, 1) }));
     let mut bufs = vec![(1, g), (2, &mat.lat), (5, &mat.vrow), (6, &mat.vcol), (7, bits), (9, &sc.scal), (10, &sc.cnt)];
-    let ep = if mat.opt == SignOpt::FactMom {
+    if mat.opt == SignOpt::FactMom {
         bufs.push((3, mat.mom.as_ref()?));
-        "sign_upd_mom"
-    } else {
-        "sign_upd"
-    };
+        if let Some(m2) = module_sg(c) {
+            ops.push(Op::D(Disp { pipe: &m2.p["sign_upd_mom2"], uni: u, bufs, grid: train_ops::wg_fold(words.div_ceil(8)) }));
+            return Some(ops);
+        }
+    }
+    let ep = if mat.opt == SignOpt::FactMom { "sign_upd_mom" } else { "sign_upd" };
     ops.push(Op::D(Disp { pipe: &md.p[ep], uni: u, bufs, grid: elt_fold(words) }));
     Some(ops)
 }
@@ -753,6 +875,16 @@ pub fn bits_diff_op<'a>(c: &'a Ctx, mat: &'a SignMat, bits: &'a wgpu::Buffer, di
     })
 }
 
+/// Flag the step's sign-state writes off when any of the `n` per-token
+/// losses in `loss` is not finite (decided on the card: the backward is
+/// queued without waiting for the loss).
+pub fn loss_flag_op<'a>(c: &'a Ctx, sc: &'a SignScratch, loss: &'a wgpu::Buffer, n: usize) -> Option<Disp<'a>> {
+    let md = module(c)?;
+    let mut u = vec![0u32; 20];
+    u[0] = n as u32;
+    Some(Disp { pipe: &md.p["loss_flag"], uni: u, bufs: vec![(1, loss), (10, &sc.cnt)], grid: (1, 1, 1) })
+}
+
 /// Read the step counters and zero them.
 pub fn read_reset_counters(c: &Ctx, sc: &SignScratch) -> Option<[u32; CNT_LEN]> {
     let v = train_ops::download_u32(c, &sc.cnt, CNT_LEN)?;
@@ -764,7 +896,9 @@ pub fn read_reset_counters(c: &Ctx, sc: &SignScratch) -> Option<[u32; CNT_LEN]> 
 
 pub fn reset_counters(c: &Ctx, sc: &SignScratch) {
     let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("sign_cnt") });
+    let mut mk = super::train_prof::enc_begin(c, &mut enc);
     enc.clear_buffer(&sc.cnt, 0, None);
+    super::train_prof::enc_mark(c, &mut enc, &mut mk, "clear");
     super::submit(c, enc.finish());
 }
 
