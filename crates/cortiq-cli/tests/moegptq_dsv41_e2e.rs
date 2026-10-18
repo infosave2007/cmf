@@ -233,7 +233,7 @@ fn quantize_moe_on_the_v41_fixture() {
     a[1] = inplace.to_str().unwrap().into();
     let a4: Vec<String> = a.iter().cloned().chain(["--in-place".into(), "--codec".into(), "q4tp".into()]).collect();
     let (ok, err) = cortiq(&args(&a4), &[host, capdir]);
-    assert!(!ok && err.contains("fits only a q4tp or a q4tp slot") && !err.contains("captured"), "{err}");
+    assert!(!ok && err.contains("a q4tp payload fits only a q4tp slot") && !err.contains("captured"), "{err}");
     // q2tp in place: the hole-punching probe first
     let a2: Vec<String> = a.iter().cloned().chain(["--in-place".into(), "--codec".into(), "q2tp".into()]).collect();
     if cfg!(not(target_os = "linux")) {

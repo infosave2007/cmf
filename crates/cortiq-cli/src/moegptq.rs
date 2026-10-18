@@ -868,12 +868,12 @@ fn check_slots(cm: &CmfModel, triples: &[(usize, usize, usize)], codec: Codec, t
                 None => {
                     anyhow::ensure!(
                         e.dtype == want || e.dtype == TensorDtype::Q4TiledP,
-                        "--in-place --codec {}: {} is {} in the calibration file, and a {} payload fits only a {} or a q4tp slot",
+                        "--in-place --codec {}: {} is {} in the calibration file, and a {} payload fits only a {} slot",
                         codec.name(),
                         e.name,
                         e.dtype.name(),
                         want.name(),
-                        want.name()
+                        if want == TensorDtype::Q4TiledP { "q4tp".to_string() } else { format!("{} or a q4tp", want.name()) }
                     );
                     anyhow::ensure!(
                         e.nbytes >= need,
@@ -3532,7 +3532,7 @@ mod tests {
         check_slots(&cm, &triples(&cm), Codec::Q2tp, None).unwrap();
         check_slots(&r2, &triples(&r2), Codec::Q2tp, None).unwrap();
         let e = check_slots(&r2, &triples(&r2), Codec::Q4tp, None).unwrap_err().to_string();
-        assert!(e.contains("fits only a q4tp"), "{e}");
+        assert!(e.contains("a q4tp payload fits only a q4tp slot"), "{e}");
         check_slots(&cm, &shared_of(&cm), Codec::Q2tp, Some(("ref2", &r2))).unwrap();
         let e = check_slots(&cm, &shared_of(&cm), Codec::Q4tp, Some(("ref2", &r2))).unwrap_err().to_string();
         assert!(e.contains("pass --codec q2tp"), "{e}");
