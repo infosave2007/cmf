@@ -352,7 +352,9 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     let n_cal = held.iter().filter(|&&h| !h).count();
     let prior_env = std::env::var("CMF_MOE_PRIOR").ok().and_then(|v| v.trim().parse::<f64>().ok());
     let (prior_n0, prior_why) = production_prior(family, prior_env, n_cal, top_k, ne, hidden);
-    if prior_n0 > 0.0 {
+    if diag.is_some() {
+        // DIAG measures its own list of priors
+    } else if prior_n0 > 0.0 {
         eprintln!("prior: n0 = {prior_n0} pseudo-rows (down {}) from {prior_s} calibration tokens — {prior_why}", prior_n0 / 4.0);
     } else {
         eprintln!("prior: none — {prior_why}");
