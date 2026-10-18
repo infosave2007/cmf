@@ -6,8 +6,9 @@ access and no model files. The GPU encode path is compiled but has not been run
 (see "Not verified").
 
 Round 2 (branch `dsv41-int-b`, worktree `/Users/oleg/dev/cmf-dsv41ib`, from
-`dsv41-int`): the review items B1–B12, see "Round 2" below. The pod commands
-in "Pod plan" are the round-2 sequence.
+`dsv41-int`): the review items B1–B12, see "Round 2" below. Round 2 review
+fixes on the same branch: see "Round 2 review fixes". The pod commands in
+"Pod plan" are the current sequence.
 
 ## Goal
 
@@ -127,8 +128,10 @@ layout).
   `no wgpu GPU (set CMF_MOE_HOST=1 to run on the host)`. It also stops on a
   device without matrix units (cooperative matrices). The device grams and
   GEMMs need them, so before this the first expert failed with `gemm` after
-  the whole capture. This happens on the M4 through wgpu/Metal. Tests call
-  `encode_layer` with `Engine::Host` and are unaffected.
+  the whole capture. This happens on the M4 through wgpu/Metal, and on any
+  card with `CMF_COOP=0` exported (the message then says so). A
+  `CMF_MOE_CAPTURE_ONLY=1` run encodes nothing and needs no matrix units.
+  Tests call `encode_layer` with `Engine::Host` and are unaffected.
 - B2, slot checks before the capture.
   - `--in-place`: every expert slot of the range must be the codec's dtype
     or q4tp, and hold at least the codec payload (`expected_nbytes`, the
@@ -160,9 +163,12 @@ layout).
     pipeline is opened for the tokenizer and config, then dropped, and its
     device buffers are released.
   - A capture of another run is refused, never overwritten. "Another run"
-    means other tokens, hidden, top_k or experts. A different calibration
-    file path or size only prints a note, so a resumed `--in-place` run on a
-    half-rewritten file reuses the pristine capture.
+    means other tokens, hidden, top_k or experts. Since the review fixes, the
+    same tokens captured from another calibration file (canonical path or
+    size), by another cortiq version, or with another forward setting are
+    refused too unless `CMF_MOE_CAPTURE_FORCE=1` (see "Round 2 review
+    fixes"). A resumed `--in-place` run still reuses its capture: in place
+    keeps both the path and the length of the file.
   - `CMF_MOE_CAPTURE_ONLY=1` captures all layers of the range in one forward,
     saves them and stops. Nothing is encoded or written; the run still needs
     `--output` for clap (`/dev/null`).
@@ -186,8 +192,10 @@ layout).
     error the MoE output sees. Variant labels are `n0` and `n0+w`.
   - Flash-Next is unchanged.
 - B7, prefetch failures. A failed background shard prefetch is logged. The
-  layer then fetches the shard synchronously, with up to 6 attempts and
-  20/40/60/80/100 s pauses.
+  layer then fetches the shard synchronously. Since the review fixes it keeps
+  retrying for up to `CMF_MOE_FETCH_WAIT` minutes (default 240), with pauses
+  of 20 s·k capped at 5 minutes; round 2 gave up after 6 attempts (about 10
+  minutes).
 - B8: `--output` together with `--in-place` is refused, by a clap conflict and
   again in `run`.
 - B9: every V4.1 calibration window starts with BOS: the tokenizer's id, or 0.
@@ -205,11 +213,20 @@ layout).
     | host (Accelerate AMX, 10 threads) | 1032–1385 GFLOP/s | |
 
     Both run in-order FMA chains, which is why the products are
-    bit-identical. 0 of 4608 debiased q2tp rows differ.
-  - So the f32 GEMM error does not reach the payload, and no diag measurement
-    was needed.
-  - On the pod, the host GEMM is matrixmultiply on x86. Its speed was not
-    measured; compare the per-layer `gate/up` stage time with round 1.
+    bit-identical on the M4, and why 0 of 4608 debiased q2tp rows differ
+    there. That count is trivial when the products are identical: it does
+    not show how a product difference would reach the payload.
+  - What is shown: the device product is accurate (worst error against f64
+    9e-8 of Σ|terms|). The effect on the payload is measured on the pod by
+    `gpu_debias_product_matches_host` in step 0b: the x86 host GEMM
+    (matrixmultiply) rounds differently, and the test asserts that at most
+    1 % of the debiased rows change.
+  - The device product also serves Flash-Next GPU q2tp runs (the item allows
+    it). Their gate/up bytes can therefore differ from round-1 outputs at
+    the f16 rounding of the row parameters; they are not byte-identical to
+    files made before this change.
+  - On the pod, the host GEMM speed was not measured; compare the per-layer
+    `gate/up` stage time with round 1.
 - B11, tests: see the table below.
 - The merged `dsv41-int` lib tests did not compile: `tiny_stack` set
   `candidate_source: 99`, an `Option` since the `-1` fix. Fixed.
@@ -218,12 +235,15 @@ layout).
 
 | variable | effect |
 |---|---|
-| `CMF_MOE_HOST=1` | run the encode on the host; otherwise a wgpu device with matrix units is required |
+| `CMF_MOE_HOST=1` | run the encode on the host; otherwise a wgpu device with matrix units is required (`CMF_COOP=0` turns them off: leave it unset for quantize-moe) |
 | `CMF_MOE_PRIOR=n0` | the layer prior (pseudo-rows; down n0/4). V4.1 default: hidden when mean rows per expert < hidden; `0` = none |
 | `CMF_MOE_PRIOR_S` | prior sample tokens (8192) |
 | `CMF_MOE_ROUTE_W=0\|1\|diag` | route-weighted down Hessian: off (default) / on / both under DIAG |
 | `CMF_MOE_CAPTURE_DIR=dir` | save the capture there and reuse it when it matches |
-| `CMF_MOE_CAPTURE_ONLY=1` | capture all layers in one forward into the directory, then stop |
+| `CMF_MOE_CAPTURE_ONLY=1` | capture all layers in one forward into the directory, then stop (no matrix units needed) |
+| `CMF_MOE_CAPTURE_FORCE=1` | reuse a saved capture of the same tokens although its calibration file, cortiq version or forward settings differ |
+| `CMF_MOE_NO_SPACE_CHECK=1` | run although the free-space check finds too little room |
+| `CMF_MOE_FETCH_WAIT=min` | how long a shard download is retried before the run gives up (240) |
 | `CMF_MOE_NO_PUNCH=1` | q2tp `--in-place` without hole punching (slack stays allocated) |
 | `CMF_MOE_DIAG=n0,…` / `CMF_MOE_HOLDOUT` / `CMF_MOE_RANGE` / `CMF_MOE_WORKERS` / `CMF_MOE_STOP_AFTER` | as in round 1 |
 | `CMF_MOE_GPU_TEST=1` | run the opt-in GPU tests (macOS also needs `CMF_GPU=wgpu`) |
@@ -278,6 +298,102 @@ The Linux-only code (the probe, `punch_holes`) was type-checked for
 `rustc --emit=metadata` against the target's `libc`; an injected type error is
 reported. A full `cargo check --target x86_64-unknown-linux-gnu` fails on the
 Mac only because `ring` needs a cross C compiler.
+
+## Round 2 review fixes
+
+Two reviews of round 2. Every change below is one commit on `dsv41-int-b`.
+
+- `--output` or `--patch-shared` naming the calibration file is refused
+  before the pipeline loads, also through a symlink or a hard link (device
+  and inode). `CmfStreamWriter::new` opens the output with truncation, so
+  this used to truncate the mapped 499 GB file.
+- Free-space check, before the capture and before the output is opened (the
+  output is now created only after the checks). Per filesystem it adds up
+  what the run will write and compares with `statvfs` `f_bavail`:
+  - `--output`: every tensor of the calibration file, the expert slots at the
+    codec's payload size, each padded to 4 KiB, plus the head reserve and
+    the vocabulary. An earlier output at the same path counts as free space,
+    since opening it truncates it (when it has no other hard link);
+  - a Hub source: two layers of source shards (the layer encoded and the one
+    prefetched), from the shard sizes the Hub reports, minus what is already
+    in the scratch directory;
+  - the capture layers still to save.
+  The run prints one `free space:` line per filesystem and stops on a
+  shortfall unless `CMF_MOE_NO_SPACE_CHECK=1`. Not checked: logs, cargo
+  output and the smoke run's leftovers, which the pod commands now remove.
+- A shard download is retried for up to `CMF_MOE_FETCH_WAIT` minutes
+  (default 240), pausing 20 s·k after the k-th failure, at most 5 minutes.
+  Step 3 cannot resume, so a Hub outage longer than the old 10 minutes would
+  have lost every layer encoded so far.
+- Saved-capture provenance (`meta.json`):
+  - new fields: `env` (every `CMF_*` variable of the capturing process,
+    `CMF_MOE_*` aside), `cortiq_version`, `binary` (path, size, mtime of the
+    executable); `calibration_model` is now the canonical path;
+  - a reuse compares the calibration file (path and size), the version and
+    the forward settings `CMF_GPU`, `CMF_GPU_PROBE`, `CMF_DSV41_O_FP8`,
+    `CMF_DSV41_GPU_ATTN`, `CMF_DSV41_DYNAMIC_MOE`, `CMF_DSV41_FUSED_Q`,
+    `CMF_DSV41_TAIL_TAP` (set or unset, and the value). A difference is
+    refused unless `CMF_MOE_CAPTURE_FORCE=1`; another binary is only a note.
+    Other tokens or geometry are refused even with the override;
+  - the output provenance (`gptq_moe.calibration_capture`) carries the
+    capture's token hash, settings, version, binary, directory, and the
+    differences a forced reuse went past (`reused_despite`).
+  - The build's git commit is not recorded: the binary has no build script
+    that embeds it, and adding one to `cortiq-cli` for this is out of
+    proportion. The binary's path, size and mtime identify the build on the
+    pod.
+- Saving the capture:
+  - `meta.json` is rewritten after every saved layer;
+  - a layer already listed is not written again;
+  - a failed write removes its `.tmp` and the layer's partial files;
+  - outside `CMF_MOE_CAPTURE_ONLY` a save failure (a full disk) is a
+    warning, and the run goes on from the rows in memory. A capture-only
+    run still fails, since saving is all it does.
+- `--in-place` writes its recipe to `<file>.gptq_moe.json`: one record per
+  run with the codec, the prior, the route weighting, the layer range and
+  the capture. The header cannot grow in place (`recode_entries_in_place`
+  rewrites only the directory), so the header still carries the converter's
+  `weight_quant`. A resumed run adds its own record.
+- The hole-punching probe writes pseudo-random bytes. A constant pattern
+  takes almost no blocks on a compressing filesystem (zfs lz4, btrfs), so
+  the probe could fail where punching works. The Linux-only code (probe,
+  `punch_holes`, the `statvfs` call) was type-checked for
+  `x86_64-unknown-linux-gnu` with `rustc --emit=metadata -D warnings`
+  against that target's `libc`; injected type errors in the new branches are
+  reported.
+- The q4tp slot-check message says "a q4tp payload fits only a q4tp slot".
+
+Not done:
+
+- A DIAG variant that weights the gate/up Hessians by w² as well
+  (`Σ w_t²·x xᵀ`, the weighting consistent with the MoE output error, as
+  the reviewer notes). The device grams read the captured rows unscaled, so
+  this needs a row-scaling pass for gate/up and the debias Hessian. It is a
+  candidate for step 2b if `+w` wins clearly.
+- A checkpoint inside a capture pass. The capture-only forward is one pass
+  over all 40 layers; if it dies, the next run starts it again. Splitting it
+  with `CMF_MOE_RANGE` does not help much, because a later range still runs
+  the forward through every layer below it.
+- On the M4, a capture-only run with `CMF_GPU=wgpu` now passes the device
+  check, but the V4.1 forward sizes the dynamic MoE pool from an unbounded
+  budget (98 GB on a 24 GB Mac, the WAVE1_A open issue) and does not finish.
+  Lane A's shared pool code; not changed here.
+
+Tests added or changed:
+
+| test | checks | result |
+|---|---|---|
+| `moegptq::tests::output_naming_the_calibration_file_is_caught` | same file through a symlink and a hard link; another file and a missing one are not | ok |
+| `moegptq::tests::free_space_check_refuses_what_does_not_fit` | fits, shortfall, override, needs on one filesystem add up, a file about to be truncated counts as free unless hard-linked | ok |
+| `moegptq::tests::capture_dir_round_trip_and_refusal` | also: the meta records env and version; another binary or a non-forward setting loads; another calibration file, size, version or `CMF_DSV41_O_FP8` is refused and loads with the override; other tokens or hidden are refused even with it; a failed write leaves no file and no `.tmp` | ok |
+| `moegptq::tests::downloads_are_retried` | retries within a time budget, growing capped pauses, one attempt with a zero budget | ok |
+| `moegptq::tests::dsv41_layers_write_the_converter_layout` | also: the free-space estimate of the new q2tp file is at least its size and at most one 4 KiB pad per tensor plus 4 MiB above it | ok |
+| `moegptq_dsv41_e2e::quantize_moe_on_the_v41_fixture` | also: `--output` = the calibration file (directly and through a symlink) refused with the file untouched; provenance names the capture; a capture with `CMF_DSV41_O_FP8=1` refused before the output exists; a read-only capture directory warns and writes the same tensors, capture-only fails and leaves nothing; in place from a capture of another path refused, then forced; the sidecar records the run | ok |
+
+On the M4 with `CMF_GPU=wgpu` (binary run by hand): `--output` stops with
+the matrix-units message, with `CMF_COOP=0` it adds "CMF_COOP=0 is set and
+turns them off: unset it", and capture-only passes the check and starts the
+forward.
 
 ## Tests (Mac, CPU)
 
@@ -344,8 +460,10 @@ cargo test -p cortiq-cli --bin cortiq moegptq                                   
    `cargo test --release -p cortiq-engine --features gpu --lib rms_and_elementwise_match_host -- --nocapture`.
 2. The V4.1 capture on the real model: the full forward has not run since 0.6.7
    (task A fixes it). quantize-moe must run with a binary that has task A's
-   forward fixes merged (4dd75a8b act_quant(o) and others), because the captured
-   rows are whatever that forward produces.
+   forward fixes merged, because the captured rows are whatever that forward
+   produces. Task A's `act_quant(o)` (4dd75a8b) is behind
+   `CMF_DSV41_O_FP8=1`, off by default; the pod plan captures without it (see
+   "Commands"), and the capture records which way it ran.
 3. Speed and quality on 1017. Nothing has been measured yet.
 
 ## Pod plan (RunPod 103.196.86.153:18691)
@@ -413,7 +531,7 @@ head.
 - Flash-Next's best mix was 0.8 text / 0.2 code. A 0.5/0.5 mix was worse on
   every set.
 
-### Commands (round 2)
+### Commands
 
 The plan:
 
@@ -428,7 +546,19 @@ one forward serves all three steps, and a failed step resumes without a new
 forward.
 
 The four runs must use the same `--calib` / `--tokens` / `--window`, or the
-saved capture is refused.
+saved capture is refused. They must also use the same calibration file, the
+same binary version and the same forward settings (`CMF_GPU`,
+`CMF_DSV41_O_FP8`, …), or the capture is refused unless
+`CMF_MOE_CAPTURE_FORCE=1`.
+
+`CMF_DSV41_O_FP8`: step 2a runs without it. The capture then holds the rows
+of the forward that cortiq runs by default, the one the quantized files are
+served with: GPU attention tail, no `act_quant(o)`. The flag gives the
+reference semantics but forces the CPU attention tail, so the capture would
+be slower. The choice is recorded in `meta.json` (`env`) and in the output
+provenance, and the later steps refuse a capture taken the other way. If the
+lead makes `act_quant(o)` the runtime default before the capture, export
+`CMF_DSV41_O_FP8=1` once for all four steps.
 
 ```bash
 # 0. build on the pod (dsv41-int + lane A's forward fixes + this branch merged)
@@ -446,15 +576,21 @@ mkdir -p /root/logs /root/moescratch $CAP
 #     product; then swiglu_lim(_rows) against f64
 CMF_MOE_GPU_TEST=1 cargo test --release -p cortiq-cli --bin cortiq gpu_ -- --nocapture --test-threads 1 2>&1 | tee /root/logs/moe-gputest.log
 cargo test --release -p cortiq-engine --features gpu --lib rms_and_elementwise_match_host -- --nocapture
+#    the binary is copied: the release target directory (build + two test
+#    builds) is not needed on the disk any more
+rm -rf /root/cmf/target
 
 # 1. smoke: 2048 tokens, no capture directory (other tokens than the
 #    production capture); stops after layer 0 is encoded
 CMF_MOE_STOP_AFTER=1 CMF_MOE_WORKERS=8 /root/cortiq-moe quantize-moe $CALIB --hf $SRC \
   --calib /root/data/calib.mix.txt --tokens 2048 --window 2048 --layers-per-pass 40 --codec q2tp \
   --scratch /root/moescratch --threads 13 --output /root/moescratch/smoke.cmf > /root/logs/moe-smoke.log 2>&1
-rm -f /root/moescratch/smoke.cmf
+rm -f /root/moescratch/smoke.cmf /root/moescratch/*.safetensors /root/moescratch/*.part
 #   read: capture tok/s, "routed rows per expert", "prior: n0 = …", layer-0 stage
-#   times (gate/up now includes the device debias), fetch wait
+#   times (gate/up now includes the device debias), fetch wait, "free space:"
+#   (the smoke's check counts the whole q2tp output plus two shards, ~423 GB,
+#   though it stops after layer 0; about 450 GB are free at that point. If
+#   the check stops the smoke, add CMF_MOE_NO_SPACE_CHECK=1 to the smoke only)
 
 # 2a. the production capture: one forward over all 40 layers, saved, nothing encoded
 CMF_MOE_CAPTURE_DIR=$CAP CMF_MOE_CAPTURE_ONLY=1 /root/cortiq-moe quantize-moe $CALIB --hf $SRC $CAL $TOK \
@@ -469,7 +605,9 @@ CMF_MOE_CAPTURE_DIR=$CAP CMF_MOE_DIAG=2560,5120,10240 CMF_MOE_ROUTE_W=diag CMF_M
 #   plain and route-weighted error. Pick N0 (the best prior) and W (1 if "+w"
 #   wins in the route-weighted error, else 0)
 
-# 3. GPTQ q2tp into a new file, from the capture (no forward)
+# 3. GPTQ q2tp into a new file, from the capture (no forward); the run checks
+#    the free space itself (needs ~408 GB output + 2 shards), df for the record
+df -B1 /root | tee /root/logs/df-step3.txt
 CMF_MOE_CAPTURE_DIR=$CAP CMF_MOE_PRIOR=$N0 CMF_MOE_ROUTE_W=$W CMF_MOE_WORKERS=8 \
   /root/cortiq-moe quantize-moe $CALIB --hf $SRC $CAL $TOK --layers-per-pass 40 --min-rows 32 --lambda 0.01 \
   --codec q2tp --scratch /root/moescratch --threads 13 --output /root/<1017>-q2tp-gptq.cmf > /root/logs/moe-q2tp.log 2>&1
@@ -481,6 +619,7 @@ CMF_MOE_CAPTURE_DIR=$CAP CMF_MOE_PRIOR=$N0 CMF_MOE_ROUTE_W=$W CMF_MOE_WORKERS=8 
   /root/cortiq-moe quantize-moe $CALIB --hf $SRC $CAL $TOK --min-rows 32 --lambda 0.01 \
   --codec q4tp --in-place --scratch /root/moescratch --threads 13 > /root/logs/moe-q4tp.log 2>&1
 /root/cortiq-moe verify $CALIB
+cat $CALIB.gptq_moe.json                         # the recipe (the header keeps the converter's); keep the log too
 rm -r $CAP                                       # once both files are evaluated
 ```
 
@@ -488,15 +627,23 @@ Notes on the commands:
 
 - The logs of steps 2b, 3 and 4 must show `every layer's capture is on disk:
   no calibration forward`.
-- A failed step 3 or 4 is rerun with the same command. Step 4 then re-encodes
-  from layer 0 with the capture of the pristine file. Add
-  `CMF_MOE_RANGE=<first layer not written>..40` to skip the layers already
-  rewritten; the log of every finished layer says which ones they are.
+- A failed step 3 or 4 is rerun with the same command. Step 3 cannot
+  resume: it starts again at layer 0. Step 4 re-encodes from layer 0 with the
+  capture of the pristine file (in place keeps the file's path and length,
+  so the capture is accepted). Add `CMF_MOE_RANGE=<first layer not
+  written>..40` to skip the layers already rewritten; the log of every
+  finished layer says which ones they are. Each finished run adds a record
+  with its range to `$CALIB.gptq_moe.json`.
+- A Hub outage: a shard download is retried for up to 4 hours
+  (`CMF_MOE_FETCH_WAIT`, minutes) before the run gives up.
 - Without `CMF_MOE_PRIOR`, the V4.1 default already applies at 32,768 tokens:
   512 mean rows per expert < 5120, so n0 = 5120.
-- Each of steps 3 and 4 streams the 40 source shards from the Hub again,
-  about 510 GB of downloads per run. `--hf` can point at a local copy instead,
-  but a local copy does not fit on this disk next to the other files.
+- Each of steps 3 and 4 streams the 40 layer shards from the Hub again
+  (model-00003 … model-00042, 7.39 GB each): about 296 GB of downloads per
+  run. The checkpoint's 510 GB total also counts the two 101.5 GB Engram
+  shards (47, 48), MTP and vision, which quantize-moe never fetches. `--hf`
+  can point at a local copy of the layer shards instead, but 296 GB does not
+  fit on this disk next to the other files.
 - `--layers-per-pass 40` in step 3 only matters without a saved capture: it
   keeps the forward to one pass, where 24 per pass would run two.
 - 65,536 tokens: the same commands with `--tokens 65536`. The capture is then
@@ -511,6 +658,12 @@ Notes on the commands:
 | 3, q2tp `--output` | 499 + ~408 + 13.5 + ~15 shards = 936 GB | 499 + ~408 + 26.9 + ~15 = 949 GB |
 | 4, q4tp in place | 499 + 408 (the q2tp file, if kept) + 13.5 + ~15 = 936 GB | 949 GB |
 
+The table counts the model files, the capture and the shards in flight;
+logs, the toolchain and the OS come on top. The commands remove the cargo
+target directory after step 0b and the smoke's shards after step 1, which
+the margin would not cover. Every run prints its own `free space:` line and
+stops before the capture when the filesystem is short.
+
 Recommendation: 32,768 tokens. That leaves about 30 GB free during steps 3
 and 4, against about 17 GB at 65,536. Upstream of this, the DIAG at 32,768
 tokens can say whether more rows still pay: compare the rows<640 and
@@ -521,9 +674,11 @@ rows<2560 bins.
 - The q2tp debias `[W_g;W_u]·H` (about 242 GFLOP per expert, about 3.7 PFLOP
   for the model) runs on the device since round 2 (B10). Check the per-layer
   `gate/up` stage time on the smoke run.
-- The provenance of an in-place file stays the converter's. Its `weight_quant`
-  still says q4tp after the q2tp pass, and the file has no `gptq_moe` record.
-  The engine reads only per-tensor dtypes. The HF card has to state the recipe.
+- The header provenance of an in-place file stays the converter's. Its
+  `weight_quant` still says q4tp after the q2tp pass, and the header has no
+  `gptq_moe` record; the recipe is in `<file>.gptq_moe.json` next to it.
+  The engine reads only per-tensor dtypes. The HF card has to state the
+  recipe.
 - The host q4tp GPTQ sweep and the converter use different rung-window centres
   (libm `log2` vs `det_log2`). This is existing code; the effect is 4 of 1024
   groups under an identity Hessian. Left alone: it is shared by `quantize-gptq`
