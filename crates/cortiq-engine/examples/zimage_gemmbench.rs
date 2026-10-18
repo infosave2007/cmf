@@ -140,6 +140,37 @@ mod imp {
         }
     }
 
+    /// `mmt [cfg …]`: the nvg-train GEMM shapes of the 27B student
+    /// (tokens 4096; blr forward/backward and the sign gradients), F32 epilogue.
+    fn cmd_mmt(args: &[String]) {
+        const SH: [(&str, usize, usize, usize); 9] = [
+            ("a=xS_V gate/up", 4096, 1152, 5120),
+            ("c=aS_U^T gate/up", 4096, 17408, 1152),
+            ("t2 down bwd", 4096, 1152, 17408),
+            ("c out 5120", 4096, 5120, 1152),
+            ("G_U gate/up", 17408, 1152, 4096),
+            ("G_V gate/up", 5120, 1152, 4096),
+            ("a z/out r768", 4096, 768, 6144),
+            ("c qkv", 4096, 10240, 1024),
+            ("a r2176", 4096, 2176, 5120),
+        ];
+        for cfg in parse_cfgs(args, Epi::F32) {
+            println!("{:?}", (cfg.bm, cfg.bn, cfg.bk, cfg.wm, cfg.wn, cfg.direct, cfg.stages));
+            let (mut fl, mut t) = (0f64, 0f64);
+            for &(name, m, n, k) in &SH {
+                match bench::mm_time(cfg, m, k, n) {
+                    Some(s) => {
+                        fl += 2.0 * (m * n * k) as f64;
+                        t += s;
+                        println!("  {name:>18} M{m} N{n} K{k}: {:.3} ms {:.1} TF", s * 1e3, tflops(m, n, k, s));
+                    }
+                    None => println!("  {name:>18}: n/a"),
+                }
+            }
+            println!("  total {:.3} ms {:.1} TF", t * 1e3, fl / t / 1e12);
+        }
+    }
+
     /// zi_mm vs an f64 host reference on f16-rounded operands (so the number is
     /// the kernel's accumulation error, plus the f16 output rounding for the
     /// f16 epilogues). Rows sampled to keep the host side cheap.
@@ -1024,6 +1055,7 @@ mod imp {
             Some("info") | None => cmd_info(),
             Some("existing") => cmd_existing(rest),
             Some("mm") => cmd_mm(rest),
+            Some("mmt") => cmd_mmt(rest),
             Some("prec") => cmd_prec(rest),
             Some("flash") => cmd_flash(rest),
             Some("flashdbg") => cmd_flashdbg(rest),

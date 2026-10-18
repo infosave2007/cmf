@@ -5,6 +5,46 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.23] - 2026-10-18
+
+### Added
+- `CMF_NVG_PROF=1`: an opt-in step profiler for `nvg-train` (GPU timestamps
+  per phase and kernel family, host time inside submits; `=2` drains at each
+  phase change). It costs nothing when unset.
+- `CMF_TRAIN_CHECKED=1` builds the trainer's shader modules with naga's
+  bounds checks and loop bounding (off by default since this release).
+
+### Changed
+- `nvg-train` tokenizes its training text with the added tokens recognized
+  (`<|im_start|>`, `<think>`, …), so chat-format text trains the real special
+  tokens; plain text tokenizes as before.
+
+### Performance
+- `nvg-train` on Qwen3.8-27B at 0.55 bpw with `--train-signs` (RTX PRO 6000,
+  4096 tokens a step): 4.93 s/step, 831 tok/s (was 21.5 s/step, 190 tok/s;
+  mean over the first 14 steps); Qwen3.5-0.8B at 1.0 bpw: about 0.67 s/step (was 4.12). The
+  scheduling and buffer changes are bit-identical; the kernel rewrites (GDN
+  recurrence, attention on the matrix units, column reductions) pass their
+  host-reference tests. On the 27B the metric-only steps 1–10 match the
+  0.8.21 losses within 1.5e-4 relative; once signs flip (8,357,769 against
+  8,340,655 at the first sign step) the discrete updates amplify last-bit
+  differences and the next losses differ by up to 1.5 %. Main
+  changes:
+  - GatedDeltaNet recurrence forward/backward: state in named registers,
+    split by state columns over 32-wide subgroups, shorter live ranges
+    (backward 122 → about 10 ms a call on the 27B);
+  - column reductions of the blr backward (dh, dℓ, dg, norm gains) in two
+    passes and fused with the op that reads the same operand (3.9 → 0.5 s
+    a step);
+  - causal GQA attention on the matrix units (1.8 → 0.04 s a step);
+  - blr GEMMs read the sign bitmaps directly; one staging pass per
+    activation for all paths; two-path outputs combined in one pass;
+  - optimizer in two dispatches (all gradient norms, all Adam steps) instead
+    of one blocking round trip per parameter; no mid-step loss drain;
+  - head in 1024-row chunks with persistent buffers, embedding rows as f16
+    through a persistent mapped buffer, one set of transient blr buffers for
+    all roles (peak device memory on the 27B about 91 GB).
+
 ## [0.8.22] - 2026-10-18
 
 ### Fixed

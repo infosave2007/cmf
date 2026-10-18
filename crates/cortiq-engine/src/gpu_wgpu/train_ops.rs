@@ -580,6 +580,22 @@ fn attn_dq(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index
 }
 "#;
 
+/// A trainer shader module. Built without naga's injected bounds checks
+/// and loop bounding (as `zimage` builds `zi_mm`): the clamps and the loop
+/// guard keep the drivers from unrolling the kernels' serial loops (column
+/// reductions, the GDN recurrence), so every iteration paid a full memory
+/// latency. `CMF_TRAIN_CHECKED=1` restores the checked build.
+pub(super) fn trainer_module(c: &Ctx, name: &str, src: &str) -> wgpu::ShaderModule {
+    let desc = wgpu::ShaderModuleDescriptor { label: Some(name), source: wgpu::ShaderSource::Wgsl(src.into()) };
+    if std::env::var("CMF_TRAIN_CHECKED").as_deref() == Ok("1") {
+        return c.device.create_shader_module(desc);
+    }
+    // SAFETY: every trainer kernel guards its own indices against the
+    // dispatch geometry, the buffers are sized by their owners for that
+    // geometry, and every loop has a uniform, finite trip count.
+    unsafe { c.device.create_shader_module_trusted(desc, wgpu::ShaderRuntimeChecks::unchecked()) }
+}
+
 pub(super) struct Mod {
     pub(super) p: HashMap<&'static str, wgpu::ComputePipeline>,
 }
@@ -594,10 +610,7 @@ pub(super) fn module(c: &Ctx, name: &'static str, src: &'static str, entries: &[
     }
     let built = (|| {
         let sc = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let m = c.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(name),
-            source: wgpu::ShaderSource::Wgsl(src.into()),
-        });
+        let m = trainer_module(c, name, src);
         if let Some(e) = pollster::block_on(sc.pop()) {
             tracing::warn!("{name} module rejected: {e}");
             return None;
@@ -619,7 +632,11 @@ pub(super) fn module(c: &Ctx, name: &'static str, src: &'static str, entries: &[
             }
             p.insert(ep, pipe);
         }
-        Some(&*Box::leak(Box::new(Mod { p })))
+        let leaked: &'static Mod = Box::leak(Box::new(Mod { p }));
+        for (ep, pipe) in &leaked.p {
+            super::train_prof::name_pipe(pipe, ep);
+        }
+        Some(leaked)
     })();
     g.insert(name, built);
     built
@@ -648,12 +665,20 @@ pub struct Disp<'a> {
 
 /// Encode dispatches into one compute pass and submit.
 pub fn run(c: &Ctx, ds: &[Disp]) {
+    let prof = super::train_prof::on();
     let mut keep = Vec::new();
     let mut groups = Vec::new();
     for d in ds {
         let mut words = d.uni.clone();
         while words.len() % 4 != 0 {
             words.push(0);
+        }
+        if prof {
+            use super::train_prof::{Cnt, count};
+            count(Cnt::Buf, 1);
+            count(Cnt::Write, 1);
+            count(Cnt::WriteBytes, (words.len() * 4) as u64);
+            count(Cnt::BindGroup, 1);
         }
         let u = c.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("train_p"),
@@ -677,10 +702,14 @@ pub fn run(c: &Ctx, ds: &[Disp]) {
     let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("train") });
     {
         let mut ps = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+        let mut mk = super::train_prof::pass_begin(c, &mut ps);
         for (d, bg) in ds.iter().zip(&groups) {
             ps.set_pipeline(d.pipe);
             ps.set_bind_group(0, bg, &[]);
             ps.dispatch_workgroups(d.grid.0, d.grid.1, d.grid.2);
+            if prof {
+                super::train_prof::pass_mark(c, &mut ps, &mut mk, super::train_prof::pipe_name(d.pipe), [0; 3]);
+            }
         }
     }
     submit(c, enc.finish());
@@ -717,15 +746,10 @@ pub fn rms_bwd<'a>(c: &'a Ctx, x: &'a wgpu::Buffer, w: &'a wgpu::Buffer, inv: &'
     })
 }
 
-/// RMSNorm gain gradient, accumulated into `dw`.
-pub fn rms_dw<'a>(c: &'a Ctx, x: &'a wgpu::Buffer, inv: &'a wgpu::Buffer, dy: &'a wgpu::Buffer, dw: &'a wgpu::Buffer, n: usize, d: usize) -> Option<Disp<'a>> {
-    let m = norm_mod(c)?;
-    Some(Disp {
-        pipe: &m.p["rms_dw"],
-        uni: vec![n as u32, d as u32, 0, 0, 0, 0, 0, 0],
-        bufs: vec![(1, x), (4, inv), (5, dy), (7, dw)],
-        grid: ((d.div_ceil(256)) as u32, 1, 1),
-    })
+/// RMSNorm gain gradient `dw[j] += Σ_r dy·x·inv`, accumulated into `dw`
+/// (the two-pass column reduction of `train_mm`).
+pub fn rms_dw<'a>(c: &'a Ctx, x: &'a wgpu::Buffer, inv: &'a wgpu::Buffer, dy: &'a wgpu::Buffer, dw: &'a wgpu::Buffer, n: usize, d: usize) -> Option<[Disp<'a>; 2]> {
+    super::train_mm::colsum(c, dy, super::train_mm::ColTerm::ProdRow(x, inv), dw, n, d, true)
 }
 
 /// Elementwise ops: `swiglu_fwd` (C = silu(A)·B), `swiglu_bwd`
@@ -779,10 +803,10 @@ pub fn qkr_bwd<'a>(c: &'a Ctx, g: QkrGeom, x: &'a wgpu::Buffer, w: &'a wgpu::Buf
     })
 }
 
-/// Sum the gain partials of [`qkr_bwd`] into `dw` (overwritten).
-pub fn qkr_dw<'a>(c: &'a Ctx, g: QkrGeom, dwp: &'a wgpu::Buffer, dw: &'a wgpu::Buffer) -> Option<Disp<'a>> {
-    let m = qkr_mod(c)?;
-    Some(Disp { pipe: &m.p["qkr_dw"], uni: g.uni(), bufs: vec![(2, dw), (8, dwp)], grid: ((g.hd.div_ceil(256)) as u32, 1, 1) })
+/// Sum the gain partials of [`qkr_bwd`] into `dw` (overwritten, or
+/// accumulated with `acc`), as a two-pass column reduction.
+pub fn qkr_dw<'a>(c: &'a Ctx, g: QkrGeom, dwp: &'a wgpu::Buffer, dw: &'a wgpu::Buffer, acc: bool) -> Option<[Disp<'a>; 2]> {
+    super::train_mm::colsum(c, dwp, super::train_mm::ColTerm::Plain, dw, g.n * g.heads, g.hd, acc)
 }
 
 /// Geometry of a causal GQA attention over `nb` windows of `t` tokens.
@@ -857,6 +881,12 @@ pub fn attn_bwd<'a>(
 
 /// A storage buffer holding `data` (or zeros of `n` floats).
 pub fn upload(c: &Ctx, data: &[f32]) -> wgpu::Buffer {
+    if super::train_prof::on() {
+        use super::train_prof::{Cnt, count};
+        count(Cnt::Buf, 1);
+        count(Cnt::Write, !data.is_empty() as u64);
+        count(Cnt::WriteBytes, (data.len() * 4) as u64);
+    }
     let b = c.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("train_buf"),
         size: (data.len().max(4) * 4) as u64,
@@ -871,6 +901,10 @@ pub fn upload(c: &Ctx, data: &[f32]) -> wgpu::Buffer {
 
 /// Overwrite the start of `b` with `data`.
 pub fn write(c: &Ctx, b: &wgpu::Buffer, data: &[f32]) {
+    if super::train_prof::on() {
+        super::train_prof::count(super::train_prof::Cnt::Write, 1);
+        super::train_prof::count(super::train_prof::Cnt::WriteBytes, (data.len() * 4) as u64);
+    }
     if !data.is_empty() {
         c.queue.write_buffer(b, 0, bytemuck::cast_slice(data));
     }
@@ -889,11 +923,22 @@ pub fn download(c: &Ctx, b: &wgpu::Buffer, n: usize) -> Option<Vec<f32>> {
         mapped_at_creation: false,
     });
     let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    let prof = super::train_prof::on();
+    let mut mk = super::train_prof::enc_begin(c, &mut enc);
     enc.copy_buffer_to_buffer(b, 0, &st, 0, size);
+    if prof {
+        super::train_prof::count(super::train_prof::Cnt::Buf, 1);
+        super::train_prof::enc_mark(c, &mut enc, &mut mk, "readback");
+    }
     submit(c, enc.finish());
     let slice = st.slice(..size);
     slice.map_async(wgpu::MapMode::Read, |_| {});
+    let tw = prof.then(std::time::Instant::now);
     c.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+    if let Some(tw) = tw {
+        super::train_prof::count(super::train_prof::Cnt::Wait, 1);
+        super::train_prof::count(super::train_prof::Cnt::WaitNs, tw.elapsed().as_nanos() as u64);
+    }
     let out = {
         let data = slice.get_mapped_range().ok()?;
         let mut v = vec![0f32; n];
@@ -914,11 +959,22 @@ pub fn download_u32(c: &Ctx, b: &wgpu::Buffer, n: usize) -> Option<Vec<u32>> {
         mapped_at_creation: false,
     });
     let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    let prof = super::train_prof::on();
+    let mut mk = super::train_prof::enc_begin(c, &mut enc);
     enc.copy_buffer_to_buffer(b, 0, &st, 0, size);
+    if prof {
+        super::train_prof::count(super::train_prof::Cnt::Buf, 1);
+        super::train_prof::enc_mark(c, &mut enc, &mut mk, "readback");
+    }
     submit(c, enc.finish());
     let slice = st.slice(..size);
     slice.map_async(wgpu::MapMode::Read, |_| {});
+    let tw = prof.then(std::time::Instant::now);
     c.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+    if let Some(tw) = tw {
+        super::train_prof::count(super::train_prof::Cnt::Wait, 1);
+        super::train_prof::count(super::train_prof::Cnt::WaitNs, tw.elapsed().as_nanos() as u64);
+    }
     let out = {
         let data = slice.get_mapped_range().ok()?;
         bytemuck::cast_slice::<u8, u32>(&data[..size as usize]).to_vec()
@@ -930,6 +986,7 @@ pub fn download_u32(c: &Ctx, b: &wgpu::Buffer, n: usize) -> Option<Vec<u32>> {
 /// A zero-filled storage buffer of `n` u32 words (no host staging: wgpu
 /// zero-initializes new buffers).
 pub fn zeros_u32(c: &Ctx, n: usize) -> wgpu::Buffer {
+    super::train_prof::count(super::train_prof::Cnt::Buf, 1);
     c.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("train_u32"),
         size: (n.max(4) * 4) as u64,
@@ -979,10 +1036,12 @@ mod tests {
         let dy = rnd(n * d, 3, 1.0);
         for gemma in [false, true] {
             let (bx, bw, by, binv, bdy, bdx, bdw) = (upload(c, &x), upload(c, &w), zeros(c, n * d), zeros(c, n), upload(c, &dy), zeros(c, n * d), zeros(c, d));
+            let [dw1, dw2] = rms_dw(c, &bx, &binv, &bdy, &bdw, n, d).unwrap();
             let ds = vec![
                 rms_fwd(c, &bx, &bw, &by, &binv, n, d, 1e-6, gemma).unwrap(),
                 rms_bwd(c, &bx, &bw, &binv, &bdy, &bdx, n, d, gemma).unwrap(),
-                rms_dw(c, &bx, &binv, &bdy, &bdw, n, d).unwrap(),
+                dw1,
+                dw2,
             ];
             run(c, &ds);
             let (xf, wf, dyf) = (f64v(&x), f64v(&w), f64v(&dy));
@@ -1025,7 +1084,7 @@ mod tests {
         let g = QkrGeom { n, heads, hd, half, t, gemma: true, eps: 1e-6 };
         let (bx, bw, by, binv, brope, bdy, bdx, bdwp, bdw) = (upload(c, &x), upload(c, &w), zeros(c, x.len()), zeros(c, n * heads), upload(c, &tab), upload(c, &dy), zeros(c, x.len()), zeros(c, x.len()), zeros(c, hd));
         run(c, &[qkr_fwd(c, g, &bx, &bw, &by, &binv, &brope).unwrap(), qkr_bwd(c, g, &bx, &bw, &binv, &brope, &bdy, &bdx, &bdwp).unwrap()]);
-        run(c, &[qkr_dw(c, g, &bdwp, &bdw).unwrap()]);
+        run(c, &qkr_dw(c, g, &bdwp, &bdw, false).unwrap());
         let (xf, wf) = (f64v(&x), f64v(&w));
         let (mut y, mut dx, mut dw) = (vec![0f64; x.len()], vec![0f64; x.len()], vec![0f64; hd]);
         for u in 0..n * heads {

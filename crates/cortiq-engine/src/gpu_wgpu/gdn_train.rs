@@ -22,7 +22,7 @@
 use super::{Ctx, ctx, submit};
 use std::sync::OnceLock;
 
-const SRC: &str = r#"
+const HEAD: &str = r#"
 struct P {
     nb: u32, t: u32, nv: u32, nk: u32,
     c_dim: u32, vd: u32, kd: u32, rep: u32,
@@ -52,6 +52,14 @@ struct P {
 @group(0) @binding(19) var<storage, read_write> DQK: array<f32>;  // [2][B,T,nv,128] per-v-head dq̂, dk̂
 @group(0) @binding(20) var<storage, read_write> DRAW: array<f32>; // [B,T,c_dim]
 
+fn sigm(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
+fn silu(x: f32) -> f32 { return x / (1.0 + exp(-x)); }
+fn silu_bwd(x: f32) -> f32 { let s = sigm(x); return s * (1.0 + x * (1.0 - s)); }
+fn softplus(x: f32) -> f32 { if (x > 20.0) { return x; } return log(1.0 + exp(x)); }
+
+"#;
+
+const SRC: &str = r#"
 var<workgroup> red: array<f32, 2048>;
 var<workgroup> sq: array<f32, 128>;
 var<workgroup> sk: array<f32, 128>;
@@ -60,11 +68,6 @@ var<workgroup> va: array<f32, 128>;
 var<workgroup> vb: array<f32, 128>;
 var<workgroup> vc: array<f32, 128>;
 var<workgroup> scal: array<f32, 8>;
-
-fn sigm(x: f32) -> f32 { return 1.0 / (1.0 + exp(-x)); }
-fn silu(x: f32) -> f32 { return x / (1.0 + exp(-x)); }
-fn silu_bwd(x: f32) -> f32 { let s = sigm(x); return s * (1.0 + x * (1.0 - s)); }
-fn softplus(x: f32) -> f32 { if (x > 20.0) { return x; } return log(1.0 + exp(x)); }
 
 // ---- conv + silu forward: one thread per (b, t, c) ----
 @compute @workgroup_size(256)
@@ -466,21 +469,494 @@ fn qk_bwd(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index)
 }
 "#;
 
+// ---- column-split recurrence on 32-wide subgroups ----
+// Workgroup = (window, v-head, block of 32 state columns) — four per head;
+// warp w = columns 4w..4w+3 of the block; lane = (c = lane>>3: column in the
+// warp, rg = lane&7: rows 16·rg..16·rg+15). Columns of S evolve
+// independently in the forward, so the forward needs no workgroup memory;
+// reductions over rows are three shuffles. The forward keeps kv per step
+// (KVS) and S every `cs` steps (CK, [B,nv,nseg+1][col][row]); the backward
+// replays a segment elementwise from them (u = β(v − kv) bit for bit) into
+// the scratch (SCR, [B·nv·4][cs][32 cols][128 rows]). Row reductions over
+// columns (dq̂, dk̂) and the scalar ones (dβ, dg) leave the recurrence as
+// per-block partials (DQK, [B,T,nv][4][258]) summed by qk_bwd2.
+const SRC2: &str = r#"
+const NWG: u32 = 4u;      // workgroups (column blocks) per (window, head)
+const PW: u32 = 260u;     // words per warp in the partial buffer
+
+fn rsum8(v: f32) -> f32 {
+    var x = v + subgroupShuffleXor(v, 1u);
+    x = x + subgroupShuffleXor(x, 2u);
+    return x + subgroupShuffleXor(x, 4u);
+}
+fn csum4(v: f32) -> f32 {
+    let x = v + subgroupShuffleXor(v, 8u);
+    return x + subgroupShuffleXor(x, 16u);
+}
+
+// ---- gated RMSNorm over each (token, head) row of o: one warp per row ----
+@compute @workgroup_size(256)
+fn norm_fwd2(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) lid: u32, @builtin(subgroup_invocation_id) lane: u32) {
+    let row = (wg.x + wg.y * 65535u) * 8u + lid / 32u;   // bt*nv + h
+    let live = row < p.nb * p.t * p.nv;
+    let rw = select(0u, row, live);
+    let bt = rw / p.nv;
+    let h = rw % p.nv;
+    let base = bt * p.vd + h * 128u + lane * 4u;
+    var o: array<f32, 4>;
+    var ss = 0.0;
+    for (var j = 0u; j < 4u; j = j + 1u) { o[j] = OS[base + j]; ss = fma(o[j], o[j], ss); }
+    ss = csum4(rsum8(ss));
+    let inv = 1.0 / sqrt(ss / 128.0 + p.eps);
+    if (live) {
+        for (var j = 0u; j < 4u; j = j + 1u) {
+            OUT[base + j] = o[j] * inv * PRM[p.off_norm + lane * 4u + j] * silu(Z[base + j]);
+        }
+        if (lane == 0u) { INV[rw] = inv; }
+    }
+}
+
+// ---- its backward: DZ, and do written over o (OS) for rec_bwd2 ----
+@compute @workgroup_size(256)
+fn norm_bwd2(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) lid: u32, @builtin(subgroup_invocation_id) lane: u32) {
+    let row = (wg.x + wg.y * 65535u) * 8u + lid / 32u;
+    let live = row < p.nb * p.t * p.nv;
+    let rw = select(0u, row, live);
+    let bt = rw / p.nv;
+    let h = rw % p.nv;
+    let base = bt * p.vd + h * 128u + lane * 4u;
+    let inv = INV[rw];
+    var o: array<f32, 4>;
+    var a: array<f32, 4>;   // w·silu(z)·d
+    var red = 0.0;
+    for (var j = 0u; j < 4u; j = j + 1u) {
+        o[j] = OS[base + j];
+        let zz = Z[base + j];
+        let w = PRM[p.off_norm + lane * 4u + j];
+        let d = DOUT[base + j];
+        a[j] = w * silu(zz) * d;
+        red = fma(a[j], o[j], red);
+        if (live) { DZ[base + j] = d * o[j] * inv * w * silu_bwd(zz); }
+    }
+    red = csum4(rsum8(red));
+    let coef = red / 128.0 * inv * inv * inv;
+    if (live) {
+        for (var j = 0u; j < 4u; j = j + 1u) { OS[base + j] = inv * a[j] - o[j] * coef; }
+    }
+}
+
+var<workgroup> wpart: array<f32, 4160>;   // [2][8 warps][PW]
+@group(0) @binding(21) var<storage, read_write> QKN4: array<vec4<f32>>;
+@group(0) @binding(22) var<storage, read_write> CK4: array<vec4<f32>>;
+@group(0) @binding(23) var<storage, read_write> SCR4: array<vec4<f32>>;
+
+// ---- q/k backward over the column-block partials, and dβ/dg -> a, b ----
+@compute @workgroup_size(128)
+fn qk_bwd2(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let idx = wg.x + wg.y * 65535u;   // (b*T + ti)*nk + ko
+    if (idx >= p.nb * p.t * p.nk) { return; }
+    let ko = idx % p.nk;
+    let bt = idx / p.nk;
+    let n_bt = p.nb * p.t;
+    var dq = 0.0;
+    var dk = 0.0;
+    for (var hh = 0u; hh < p.rep; hh = hh + 1u) {
+        let h = ko * p.rep + hh;
+        for (var w = 0u; w < NWG; w = w + 1u) {
+            let pb = ((bt * p.nv + h) * NWG + w) * 258u;
+            dq = dq + DQK[pb + t];
+            dk = dk + DQK[pb + 128u + t];
+        }
+    }
+    if (t < p.rep) {
+        let h = ko * p.rep + t;
+        var dg = 0.0;
+        var db = 0.0;
+        for (var w = 0u; w < NWG; w = w + 1u) {
+            let pb = ((bt * p.nv + h) * NWG + w) * 258u;
+            db = db + DQK[pb + 256u];
+            dg = dg + DQK[pb + 257u];
+        }
+        let g = GB[bt * p.nv + h];
+        let beta = GB[(n_bt + bt) * p.nv + h];
+        let arg = GB[(2u * n_bt + bt) * p.nv + h];
+        DAB[bt * p.nv + h] = dg * g * (-exp(PRM[h])) * sigm(arg);
+        DAB[(n_bt + bt) * p.nv + h] = db * beta * (1.0 - beta);
+    }
+    let q = CQ[bt * p.c_dim + ko * 128u + t];
+    let k = CQ[bt * p.c_dim + p.kd + ko * 128u + t];
+    red2[t] = dq * q;
+    red2[128u + t] = dk * k;
+    workgroupBarrier();
+    for (var s = 64u; s > 0u; s = s >> 1u) {
+        if (t < s) {
+            red2[t] = red2[t] + red2[t + s];
+            red2[128u + t] = red2[128u + t] + red2[128u + t + s];
+        }
+        workgroupBarrier();
+    }
+    let n = p.nb * p.t * p.nk;
+    let nq2 = NQ[idx];
+    let nk2 = NQ[n + idx];
+    let invq = 1.0 / (sqrt(nq2) * sqrt(128.0));
+    let invk = 1.0 / sqrt(nk2);
+    DCQ[bt * p.c_dim + ko * 128u + t] = invq * dq - q * red2[0] * invq / nq2;
+    DCQ[bt * p.c_dim + p.kd + ko * 128u + t] = invk * dk - k * red2[128] * invk / nk2;
+}
+var<workgroup> red2: array<f32, 256>;
+"#;
+
+/// The two recurrence kernels of `SRC2`, generated with the state block in
+/// named registers (`s0..s15`, …) rather than arrays a driver may spill.
+/// Every per-step operand (q̂, k̂, g, β, v, kv, do) is staged through
+/// workgroup memory a block of steps at a time (one coalesced load and two
+/// barriers per block instead of a global-latency stall every step), and
+/// the backward prefetches the next step's S_{t-1} from the scratch while
+/// it computes the current one. Bindings 21-23 are vec4 views of QKN, CK, SCR.
+fn rec_src(cs: usize) -> String {
+    const TS: usize = 16; // forward staging block (steps)
+    let v16 = |f: &dyn Fn(usize) -> String| (0..16).map(f).collect::<Vec<_>>().join("\n");
+    // 16 floats from 4 consecutive vec4 of `arr` at `base`: `{dst}{r}` scalars
+    let ld4 = |ind: &str, dst: &str, arr: &str, base: &str| {
+        (0..4)
+            .map(|q| format!("{ind}let {dst}v{q} = {arr}[{base} + {q}u]; let {dst}{a} = {dst}v{q}.x; let {dst}{b} = {dst}v{q}.y; let {dst}{c} = {dst}v{q}.z; let {dst}{d} = {dst}v{q}.w;", a = 4 * q, b = 4 * q + 1, c = 4 * q + 2, d = 4 * q + 3))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let st4 = |arr: &str, base: &str, src: &str| (0..4).map(|q| format!("{arr}[{base} + {q}u] = vec4<f32>({src}{}, {src}{}, {src}{}, {src}{});", 4 * q, 4 * q + 1, 4 * q + 2, 4 * q + 3)).collect::<Vec<_>>().join(" ");
+    let chain = |ind: &str, acc: &str, a: &str, b: &str| {
+        let mut o = format!("{ind}var {acc}0 = {a}0 * {b}0;\n{ind}var {acc}1 = {a}1 * {b}1;\n");
+        o += &(2..16).map(|r| format!("{ind}{acc}{} = fma({a}{r}, {b}{r}, {acc}{});", r % 2, r % 2)).collect::<Vec<_>>().join("\n");
+        o
+    };
+    let mut o = String::new();
+    // ---------------- forward ----------------
+    o += &format!(
+        "var<workgroup> fq: array<vec4<f32>, {n4}>;
+var<workgroup> fk: array<vec4<f32>, {n4}>;
+var<workgroup> fv: array<f32, {n32}>;
+var<workgroup> fgb: array<f32, {n2}>;
+@compute @workgroup_size(256)
+fn rec_fwd2(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) lid: u32, @builtin(subgroup_invocation_id) lane: u32) {{
+    let bh = wg.x / NWG;
+    let wgc = wg.x % NWG;
+    let bidx = bh / p.nv;
+    let h = bh % p.nv;
+    let ko = h / p.rep;
+    let cw = (lid / 32u) * 4u + (lane >> 3u);
+    let col = wgc * 32u + cw;
+    let r4 = (lane & 7u) * 4u;
+    let first = (lane & 7u) == 0u;
+    let n_bt = p.nb * p.t;
+    let keep = p.seg == 1u;
+    let ckb4 = (bh * (p.nseg + 1u) * 16384u + col * 128u) / 4u + r4;
+",
+        n4 = TS * 32,
+        n32 = TS * 32,
+        n2 = (TS * 2).max(4)
+    );
+    o += &v16(&|r| format!("    var s{r} = 0.0;"));
+    o += &format!(
+        "
+    for (var tb = 0u; tb < p.t; tb = tb + {TS}u) {{
+        let nst = min({TS}u, p.t - tb);
+        workgroupBarrier();
+        for (var e = lid; e < {n4}u; e = e + 256u) {{
+            let j = e / 32u;
+            if (j < nst) {{
+                let bt = bidx * p.t + tb + j;
+                fq[e] = QKN4[(bt * p.nk + ko) * 32u + e % 32u];
+                fk[e] = QKN4[((n_bt + bt) * p.nk + ko) * 32u + e % 32u];
+                fv[e] = CQ[bt * p.c_dim + 2u * p.kd + h * 128u + wgc * 32u + e % 32u];
+            }}
+        }}
+        if (lid < {n2}u) {{
+            let j = lid / 2u;
+            if (j < nst) {{ fgb[lid] = GB[((lid % 2u) * n_bt + bidx * p.t + tb + j) * p.nv + h]; }}
+        }}
+        workgroupBarrier();
+        for (var j = 0u; j < nst; j = j + 1u) {{
+            let ti = tb + j;
+            let bt = bidx * p.t + ti;
+            let g = fgb[2u * j];
+            let beta = fgb[2u * j + 1u];
+            let v = fv[j * 32u + cw];
+            let vi = bt * p.vd + h * 128u + col;
+",
+        n4 = TS * 32,
+        n2 = TS * 2
+    );
+    o += &ld4("            ", "k", "fk", "j * 32u + r4");
+    o += "\n";
+    o += &v16(&|r| format!("            s{r} = s{r} * g;"));
+    o += "\n";
+    o += &chain("            ", "p", "s", "k");
+    o += "
+            let kv = rsum8(p0 + p1);
+            let u = beta * (v - kv);
+";
+    o += &v16(&|r| format!("            s{r} = fma(k{r}, u, s{r});"));
+    o += "\n";
+    o += &ld4("            ", "q", "fq", "j * 32u + r4");
+    o += "\n";
+    o += &chain("            ", "o", "s", "q");
+    o += &format!(
+        "
+            let o = rsum8(o0 + o1);
+            if (first) {{
+                OS[vi] = o;
+                if (keep) {{ KVS[vi] = kv; }}
+            }}
+            if (keep && (ti + 1u) % p.cs == 0u) {{
+                let cb = ckb4 + ((ti + 1u) / p.cs) * 4096u;
+                {}
+            }}
+        }}
+    }}
+}}
+",
+        st4("CK4", "cb", "s")
+    );
+    // ---------------- backward ----------------
+    let n4 = cs * 32;
+    o += &format!(
+        "var<workgroup> bq: array<vec4<f32>, {n4}>;
+var<workgroup> bk: array<vec4<f32>, {n4}>;
+var<workgroup> bv: array<f32, {n32}>;
+var<workgroup> bkv: array<f32, {n32}>;
+var<workgroup> bdo: array<f32, {n32}>;
+var<workgroup> bgb: array<f32, {n2}>;
+@compute @workgroup_size(256)
+fn rec_bwd2(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) lid: u32, @builtin(subgroup_invocation_id) lane: u32) {{
+    let bh = wg.x / NWG;
+    let wgc = wg.x % NWG;
+    let bidx = bh / p.nv;
+    let h = bh % p.nv;
+    let ko = h / p.rep;
+    let warp = lid / 32u;
+    let c = lane >> 3u;
+    let rg = lane & 7u;
+    let cw = warp * 4u + c;
+    let col = wgc * 32u + cw;
+    let r0 = rg * 16u;
+    let r4 = rg * 4u;
+    let first = rg == 0u;
+    let hi0 = (c & 1u) == 1u;
+    let hi1 = c >= 2u;
+    let rowq = r0 + (c & 1u) * 8u + (c >> 1u) * 4u;
+    let n_bt = p.nb * p.t;
+    let ckb4 = (bh * (p.nseg + 1u) * 16384u + col * 128u) / 4u + r4;
+    let scb4 = (wg.x * p.cs * 4096u + cw * 128u) / 4u + r4;
+",
+        n32 = cs * 32,
+        n2 = (cs * 2).max(4)
+    );
+    o += &v16(&|r| format!("    var ds{r} = 0.0;\n    var s{r} = 0.0;"));
+    o += "\n";
+    o += &format!(
+        "    var par = 0u;
+    for (var sgi = 0u; sgi < p.nseg; sgi = sgi + 1u) {{
+        let seg = p.nseg - 1u - sgi;
+        let t0 = seg * p.cs;
+        let nst = min(p.cs, p.t - t0);
+        workgroupBarrier();
+        for (var e = lid; e < {n4}u; e = e + 256u) {{
+            let j = e / 32u;
+            if (j < nst) {{
+                let bt = bidx * p.t + t0 + j;
+                bq[e] = QKN4[(bt * p.nk + ko) * 32u + e % 32u];
+                bk[e] = QKN4[((n_bt + bt) * p.nk + ko) * 32u + e % 32u];
+                let ci = bt * p.vd + h * 128u + wgc * 32u + e % 32u;
+                bv[e] = CQ[bt * p.c_dim + 2u * p.kd + h * 128u + wgc * 32u + e % 32u];
+                bkv[e] = KVS[ci];
+                bdo[e] = OS[ci];
+            }}
+        }}
+        if (lid < {n2}u) {{
+            let j = lid / 2u;
+            if (j < nst) {{ bgb[lid] = GB[((lid % 2u) * n_bt + bidx * p.t + t0 + j) * p.nv + h]; }}
+        }}
+        workgroupBarrier();
+        // replay the segment from its checkpoint (S_{{t0-1}}) into the scratch
+        if (seg > 0u) {{
+",
+        n2 = cs * 2
+    );
+    o += &ld4("            ", "c", "CK4", "ckb4 + seg * 4096u");
+    o += "\n";
+    o += &v16(&|r| format!("            s{r} = c{r};"));
+    o += "\n        } else {\n";
+    o += &v16(&|r| format!("            s{r} = 0.0;"));
+    o += "
+        }
+        for (var j = 0u; j < nst; j = j + 1u) {
+            let g = bgb[2u * j];
+            let u = bgb[2u * j + 1u] * (bv[j * 32u + cw] - bkv[j * 32u + cw]);
+";
+    o += &ld4("            ", "k", "bk", "j * 32u + r4");
+    o += "\n";
+    o += &v16(&|r| format!("            s{r} = s{r} * g;\n            s{r} = fma(k{r}, u, s{r});"));
+    o += &format!(
+        "
+            if (j + 1u < nst) {{
+                let sb = scb4 + j * 1024u;
+                {}
+            }}
+        }}
+        for (var rr = 0u; rr < nst; rr = rr + 1u) {{
+            let j = nst - 1u - rr;
+            let ti = t0 + j;
+            let bt = bidx * p.t + ti;
+            let g = bgb[2u * j];
+            let beta = bgb[2u * j + 1u];
+            let vc = bv[j * 32u + cw] - bkv[j * 32u + cw];
+            let u = beta * vc;
+            let dd = bdo[j * 32u + cw];
+            let wb = par * 2080u + warp * PW;
+",
+        st4("SCR4", "sb", "s")
+    );
+    // Live ranges kept short (151 -> fewer registers): dq̂ is reduced right
+    // after it is formed, S_{t-1} and k̂ are read only after that, dk̂ is
+    // reduced before the dS update.
+    // Row partials over the warp's 4 columns, 4 rows at a time (rows i,
+    // i+4, i+8, i+12 meet in one shuffle pattern): `val(r)` is the WGSL
+    // expression of row r, so only four values are live at once.
+    let red = |val: &dyn Fn(usize) -> String, off: &str| -> String {
+        (0..4)
+            .map(|i| {
+                format!(
+                    "            {{
+                let x0 = {}; let x4 = {}; let x8 = {}; let x12 = {};
+                let a0 = select(x0, x8, hi0) + subgroupShuffleXor(select(x8, x0, hi0), 8u);
+                let a1 = select(x4, x12, hi0) + subgroupShuffleXor(select(x12, x4, hi0), 8u);
+                wpart[wb + {off} + rowq + {i}u] = select(a0, a1, hi1) + subgroupShuffleXor(select(a1, a0, hi1), 16u);
+            }}
+",
+                    val(i),
+                    val(i + 4),
+                    val(i + 8),
+                    val(i + 12)
+                )
+            })
+            .collect()
+    };
+    o += &ld4("            ", "q", "bq", "j * 32u + r4");
+    o += "\n";
+    o += &v16(&|r| format!("            ds{r} = fma(q{r}, dd, ds{r});"));
+    o += "\n";
+    o += &red(&|r| format!("s{r} * dd"), "0u");
+    // S_{t-1}: the scratch slot j-1, the segment's checkpoint, or zero
+    o += "            var spa = vec4<f32>(0.0); var spb = vec4<f32>(0.0); var spc = vec4<f32>(0.0); var spd = vec4<f32>(0.0);
+            if (j > 0u) {
+                let sb = scb4 + (j - 1u) * 1024u;
+                spa = SCR4[sb]; spb = SCR4[sb + 1u]; spc = SCR4[sb + 2u]; spd = SCR4[sb + 3u];
+            } else if (seg > 0u) {
+                let sb = ckb4 + seg * 4096u;
+                spa = CK4[sb]; spb = CK4[sb + 1u]; spc = CK4[sb + 2u]; spd = CK4[sb + 3u];
+            }
+";
+    o += &(0..16).map(|r| format!("            let sp{r}s = sp{}.{};", ["a", "b", "c", "d"][r / 4], ["x", "y", "z", "w"][r % 4])).collect::<Vec<_>>().join("\n");
+    o += "\n";
+    o += &ld4("            ", "k", "bk", "j * 32u + r4");
+    o += "\n";
+    o += &chain("            ", "d", "ds", "k");
+    o += "
+            let du = rsum8(d0 + d1);
+            let dkv = -(beta * du);
+";
+    o += &red(&|r| format!("fma(ds{r}, u, (sp{r}s * g) * dkv)"), "128u");
+    o += "            let e0 = fma(k0, dkv, ds0);\n            let e1 = fma(k1, dkv, ds1);\n";
+    o += "            var g0 = e0 * sp0s;\n            var g1 = e1 * sp1s;\n            ds0 = g * e0;\n            ds1 = g * e1;\n";
+    o += &(2..16)
+        .map(|r| format!("            let e{r} = fma(k{r}, dkv, ds{r});\n            g{} = fma(e{r}, sp{r}s, g{});\n            ds{r} = g * e{r};", r % 2, r % 2))
+        .collect::<Vec<_>>()
+        .join("\n");
+    o += "
+            let dgw = csum4(rsum8(g0 + g1));
+            let dbw = csum4(du * vc);
+            if (first) { DCQ[bt * p.c_dim + 2u * p.kd + h * 128u + col] = beta * du; }
+            if (lane == 0u) {
+                wpart[wb + 256u] = dbw;
+                wpart[wb + 257u] = dgw;
+            }
+            workgroupBarrier();
+            let ob = ((bt * p.nv + h) * NWG + wgc) * 258u;
+            let rb = par * 2080u;
+            var acc = 0.0;
+            for (var w = 0u; w < 8u; w = w + 1u) { acc = acc + wpart[rb + w * PW + lid]; }
+            DQK[ob + lid] = acc;
+            if (lid < 2u) {
+                var a2 = 0.0;
+                for (var w = 0u; w < 8u; w = w + 1u) { a2 = a2 + wpart[rb + w * PW + 256u + lid]; }
+                DQK[ob + 256u + lid] = a2;
+            }
+            par = par ^ 1u;
+";
+    o += &(0..16).map(|r| format!("            s{r} = sp{r}s;")).collect::<Vec<_>>().join("\n");
+    o += "
+        }
+    }
+}
+";
+    o
+}
+
+/// The WGSL of the trainer's GDN modules with their entry points
+/// (examples/shader_stats: driver statistics per pipeline).
+pub fn debug_sources() -> Vec<(&'static str, String, Vec<&'static str>)> {
+    vec![
+        ("gdn_train", format!("{HEAD}{SRC}"), ENTRIES.to_vec()),
+        ("gdn_train_sg", format!("{HEAD}{SRC2}{}", rec_src(ckpt_interval())), ENTRIES2.to_vec()),
+    ]
+}
+
 const ENTRIES: [&str; 7] = ["conv_fwd", "conv_bwd", "qk_prep", "gate_prep", "rec_fwd", "rec_bwd", "qk_bwd"];
-const NBIND: u32 = 21;
+const ENTRIES2: [&str; 5] = ["rec_fwd2", "norm_fwd2", "norm_bwd2", "rec_bwd2", "qk_bwd2"];
+const NBIND: u32 = 24;
+/// Column blocks (workgroups) per (window, head) of the subgroup kernels.
+const NWG: usize = 4;
 
 struct Pipes {
     layout: wgpu::BindGroupLayout,
     p: std::collections::HashMap<&'static str, wgpu::ComputePipeline>,
+    /// The column-split subgroup kernels (`SRC2`) are built.
+    sg: bool,
 }
 
 static PIPES: OnceLock<Option<Pipes>> = OnceLock::new();
+
+fn build(c: &Ctx, pl: &wgpu::PipelineLayout, label: &str, src: &str, entries: &[&'static str], p: &mut std::collections::HashMap<&'static str, wgpu::ComputePipeline>) -> bool {
+    let sc = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let m = super::train_ops::trainer_module(c, label, src);
+    if let Some(e) = pollster::block_on(sc.pop()) {
+        tracing::warn!("{label} module rejected: {e}");
+        return false;
+    }
+    for &ep in entries {
+        let sc = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let pipe = c.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(ep),
+            layout: Some(pl),
+            module: &m,
+            entry_point: Some(ep),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        if let Some(e) = pollster::block_on(sc.pop()) {
+            tracing::warn!("{label} pipeline {ep} rejected: {e}");
+            return false;
+        }
+        p.insert(ep, pipe);
+    }
+    true
+}
 
 fn pipes(c: &Ctx) -> Option<&'static Pipes> {
     PIPES
         .get_or_init(|| {
             let lim = c.device.limits();
-            if lim.max_storage_buffers_per_shader_stage < NBIND - 1 || lim.max_compute_workgroup_storage_size < 10240 {
+            if lim.max_storage_buffers_per_shader_stage < NBIND - 1 || lim.max_compute_workgroup_storage_size < 17408 {
                 return None;
             }
             let mut entries = vec![wgpu::BindGroupLayoutEntry {
@@ -514,33 +990,21 @@ fn pipes(c: &Ctx) -> Option<&'static Pipes> {
                 bind_group_layouts: &[Some(&layout)],
                 immediate_size: 0,
             });
-            let sc = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
-            let m = c.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("gdn_train"),
-                source: wgpu::ShaderSource::Wgsl(SRC.into()),
-            });
-            if let Some(e) = pollster::block_on(sc.pop()) {
-                tracing::warn!("gdn_train module rejected: {e}");
+            let mut p = std::collections::HashMap::new();
+            if !build(c, &pl, "gdn_train", &format!("{HEAD}{SRC}"), &ENTRIES, &mut p) {
                 return None;
             }
-            let mut p = std::collections::HashMap::new();
-            for ep in ENTRIES {
-                let sc = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
-                let pipe = c.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some(ep),
-                    layout: Some(&pl),
-                    module: &m,
-                    entry_point: Some(ep),
-                    compilation_options: Default::default(),
-                    cache: None,
-                });
-                if let Some(e) = pollster::block_on(sc.pop()) {
-                    tracing::warn!("gdn_train pipeline {ep} rejected: {e}");
-                    return None;
-                }
-                p.insert(ep, pipe);
+            // The subgroup kernels assume 32-wide subgroups (lane bits = rows
+            // and columns of the state block); elsewhere the per-head kernels run.
+            let sg = c.device.features().contains(wgpu::Features::SUBGROUP)
+                && c.adapter_info.subgroup_min_size == 32
+                && c.adapter_info.subgroup_max_size == 32
+                && std::env::var("CMF_GDN_SG").as_deref() != Ok("0")
+                && build(c, &pl, "gdn_train_sg", &format!("{HEAD}{SRC2}{}", rec_src(ckpt_interval())), &ENTRIES2, &mut p);
+            for (ep, pipe) in &p {
+                super::train_prof::name_pipe(pipe, ep);
             }
-            Some(Pipes { layout, p })
+            Some(Pipes { layout, p, sg })
         })
         .as_ref()
 }
@@ -557,13 +1021,14 @@ pub struct GdnTrainCfg<'a> {
     pub conv: &'a [f32],
 }
 
-/// Device buffers of one forward, kept for its backward.
+/// Device buffers of one forward, kept for its backward, with their bind
+/// groups (`bg[1]` records the tape — checkpoints and kv — for a backward,
+/// `bg[0]` is a forward whose backward never runs).
 pub struct GdnTape {
     nb: usize,
     t: usize,
     bufs: Vec<wgpu::Buffer>,
-    uni: wgpu::Buffer,
-    nseg: usize,
+    bg: [wgpu::BindGroup; 2],
 }
 
 fn sbuf(c: &Ctx, n: usize) -> wgpu::Buffer {
@@ -599,8 +1064,71 @@ fn read(c: &Ctx, b: &wgpu::Buffer, n: usize) -> Option<Vec<f32>> {
     Some(out)
 }
 
-/// Checkpoint interval of the state (steps per replay segment).
-const CS: usize = 32;
+/// Checkpoint interval of the state (steps per replay segment); the
+/// subgroup backward's scratch is `nb·nv·cs` states (`CMF_GDN_CS`).
+fn ckpt_interval() -> usize {
+    std::env::var("CMF_GDN_CS").ok().and_then(|v| v.parse().ok()).filter(|&v: &usize| v >= 2).unwrap_or(8)
+}
+
+/// Device-resident tape of one GDN layer for `nb` windows of `t` tokens:
+/// its buffers are allocated once and reused by every step.
+pub fn gdn_tape(cfg: &GdnTrainCfg, nb: usize, t: usize) -> Option<GdnTape> {
+    let c = ctx()?;
+    let pp = pipes(c)?;
+    let (nv, nk, kk) = (cfg.nv, cfg.nk, cfg.kk);
+    let kd = nk * 128;
+    let vd = nv * 128;
+    let c_dim = 2 * kd + vd;
+    let n_bt = nb * t;
+    let cs = ckpt_interval();
+    let nseg = t.div_ceil(cs);
+    let mut prm = Vec::with_capacity(2 * nv + 128 + c_dim * kk);
+    prm.extend_from_slice(cfg.a_log);
+    prm.extend_from_slice(cfg.dt_bias);
+    prm.extend_from_slice(cfg.norm);
+    prm.extend_from_slice(cfg.conv);
+    let sizes = [
+        n_bt * c_dim,                                  // 1 RAW
+        n_bt * c_dim,                                  // 2 CQ
+        n_bt * vd,                                     // 3 Z
+        2 * n_bt * nv,                                 // 4 AB
+        prm.len(),                                     // 5 PRM
+        2 * n_bt * nk * 128,                           // 6 QKN
+        2 * n_bt * nk,                                 // 7 NQ
+        3 * n_bt * nv,                                 // 8 GB
+        n_bt * vd,                                     // 9 OUT
+        n_bt * vd,                                     // 10 OS
+        n_bt * nv,                                     // 11 INV
+        nb * nv * (nseg + 1) * 16384,                  // 12 CK
+        nb * nv * cs * 16384,                          // 13 SCR
+        (n_bt * vd).max(nb * nv * cs * 128),           // 14 KVS (kv per step | per segment)
+        n_bt * vd,                                     // 15 DOUT
+        n_bt * c_dim,                                  // 16 DCQ
+        n_bt * vd,                                     // 17 DZ
+        2 * n_bt * nv,                                 // 18 DAB
+        (n_bt * nv * NWG * 258).max(2 * n_bt * nv * 128), // 19 DQK (block partials | per head)
+        n_bt * c_dim,                                  // 20 DRAW
+    ];
+    let bufs: Vec<wgpu::Buffer> = sizes.iter().map(|&n| sbuf(c, n)).collect();
+    c.queue.write_buffer(&bufs[4], 0, bytemuck::cast_slice(&prm));
+    let mk = |keep: u32| {
+        let u: [u32; 20] = [
+            nb as u32, t as u32, nv as u32, nk as u32, c_dim as u32, vd as u32, kd as u32, (nv / nk) as u32,
+            kk as u32, cs as u32, nseg as u32, nv as u32, (2 * nv) as u32, (2 * nv + 128) as u32, keep, 0,
+            (cfg.rms_eps as f32).to_bits(), 0, 0, 0,
+        ];
+        let uni = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gdn_train_p"),
+            size: 80,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        c.queue.write_buffer(&uni, 0, bytemuck::cast_slice(&u));
+        bind(c, pp, &uni, &bufs)
+    };
+    let bg = [mk(0), mk(1)];
+    Some(GdnTape { nb, t, bufs, bg })
+}
 
 /// Forward of one GDN layer over `nb` windows of `t` tokens from the raw
 /// projections (qkv `[nb·t, c_dim]`, z `[nb·t, nv·128]`, a/b `[nb·t, nv]`).
@@ -616,81 +1144,19 @@ pub fn gdn_forward(
     b: &[f32],
 ) -> Option<(Vec<f32>, GdnTape)> {
     let c = ctx()?;
-    let pp = pipes(c)?;
-    let (nv, nk, kk) = (cfg.nv, cfg.nk, cfg.kk);
-    let kd = nk * 128;
+    let (nv, nk) = (cfg.nv, cfg.nk);
     let vd = nv * 128;
-    let c_dim = 2 * kd + vd;
+    let c_dim = 2 * nk * 128 + vd;
     let n_bt = nb * t;
     if nv % nk != 0 || qkv.len() != n_bt * c_dim || z.len() != n_bt * vd || a.len() != n_bt * nv || b.len() != n_bt * nv {
         return None;
     }
-    let nseg = t.div_ceil(CS);
-    let mut prm = Vec::with_capacity(2 * nv + 128 + c_dim * kk);
-    prm.extend_from_slice(cfg.a_log);
-    prm.extend_from_slice(cfg.dt_bias);
-    prm.extend_from_slice(cfg.norm);
-    prm.extend_from_slice(cfg.conv);
-    let sizes = [
-        n_bt * c_dim,             // 1 RAW
-        n_bt * c_dim,             // 2 CQ
-        n_bt * vd,                // 3 Z
-        2 * n_bt * nv,            // 4 AB
-        prm.len(),                // 5 PRM
-        2 * n_bt * nk * 128,      // 6 QKN
-        2 * n_bt * nk,            // 7 NQ
-        3 * n_bt * nv,            // 8 GB
-        n_bt * vd,                // 9 OUT
-        n_bt * vd,                // 10 OS
-        n_bt * nv,                // 11 INV
-        nb * nv * (nseg + 1) * 16384, // 12 CK
-        nb * nv * CS * 16384,     // 13 SCR
-        nb * nv * CS * 128,       // 14 KVS
-        n_bt * vd,                // 15 DOUT
-        n_bt * c_dim,             // 16 DCQ
-        n_bt * vd,                // 17 DZ
-        2 * n_bt * nv,            // 18 DAB
-        2 * n_bt * nv * 128,      // 19 DQK
-        n_bt * c_dim,             // 20 DRAW
-    ];
-    let bufs: Vec<wgpu::Buffer> = sizes.iter().map(|&n| sbuf(c, n)).collect();
-    c.queue.write_buffer(&bufs[0], 0, bytemuck::cast_slice(qkv));
-    c.queue.write_buffer(&bufs[2], 0, bytemuck::cast_slice(z));
-    c.queue.write_buffer(&bufs[3], 0, bytemuck::cast_slice(a));
-    c.queue.write_buffer(&bufs[3], (n_bt * nv * 4) as u64, bytemuck::cast_slice(b));
-    c.queue.write_buffer(&bufs[4], 0, bytemuck::cast_slice(&prm));
-    let u: [u32; 20] = [
-        nb as u32, t as u32, nv as u32, nk as u32,
-        c_dim as u32, vd as u32, kd as u32, (nv / nk) as u32,
-        kk as u32, CS as u32, nseg as u32, nv as u32,
-        (2 * nv) as u32, (2 * nv + 128) as u32, 0, 0,
-        (cfg.rms_eps as f32).to_bits(), 0, 0, 0,
-    ];
-    let uni = c.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("gdn_train_p"),
-        size: 80,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    c.queue.write_buffer(&uni, 0, bytemuck::cast_slice(&u));
-    let tape = GdnTape { nb, t, bufs, uni, nseg };
-    let bg = bind(c, pp, &tape);
-    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gdn_fwd") });
-    {
-        let mut ps = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
-        ps.set_bind_group(0, &bg, &[]);
-        let (gx, gy) = grid(n_bt * c_dim, 256);
-        ps.set_pipeline(&pp.p["conv_fwd"]);
-        ps.dispatch_workgroups(gx, gy, 1);
-        let (wx, wy) = wg_grid(n_bt * nk);
-        ps.set_pipeline(&pp.p["qk_prep"]);
-        ps.dispatch_workgroups(wx, wy, 1);
-        ps.set_pipeline(&pp.p["gate_prep"]);
-        ps.dispatch_workgroups((n_bt * nv).div_ceil(256) as u32, 1, 1);
-        ps.set_pipeline(&pp.p["rec_fwd"]);
-        ps.dispatch_workgroups((nb * nv) as u32, 1, 1);
-    }
-    submit(c, enc.finish());
+    let tape = gdn_tape(cfg, nb, t)?;
+    c.queue.write_buffer(&tape.bufs[0], 0, bytemuck::cast_slice(qkv));
+    c.queue.write_buffer(&tape.bufs[2], 0, bytemuck::cast_slice(z));
+    c.queue.write_buffer(&tape.bufs[3], 0, bytemuck::cast_slice(a));
+    c.queue.write_buffer(&tape.bufs[3], (n_bt * nv * 4) as u64, bytemuck::cast_slice(b));
+    gdn_forward_dev(&tape, nk, nv, c_dim, true)?;
     let out = read(c, &tape.bufs[8], n_bt * vd)?;
     Some((out, tape))
 }
@@ -701,7 +1167,6 @@ pub fn gdn_forward(
 #[allow(clippy::type_complexity)]
 pub fn gdn_backward(cfg: &GdnTrainCfg, tape: &GdnTape, dout: &[f32]) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
     let c = ctx()?;
-    let pp = pipes(c)?;
     let (nv, nk) = (cfg.nv, cfg.nk);
     let n_bt = tape.nb * tape.t;
     let vd = nv * 128;
@@ -710,65 +1175,12 @@ pub fn gdn_backward(cfg: &GdnTrainCfg, tape: &GdnTape, dout: &[f32]) -> Option<(
         return None;
     }
     c.queue.write_buffer(&tape.bufs[14], 0, bytemuck::cast_slice(dout));
-    let bg = bind(c, pp, tape);
-    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gdn_bwd") });
-    {
-        let mut ps = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
-        ps.set_bind_group(0, &bg, &[]);
-        ps.set_pipeline(&pp.p["rec_bwd"]);
-        ps.dispatch_workgroups((tape.nb * nv) as u32, 1, 1);
-        let (wx, wy) = wg_grid(n_bt * nk);
-        ps.set_pipeline(&pp.p["qk_bwd"]);
-        ps.dispatch_workgroups(wx, wy, 1);
-        let (gx, gy) = grid(n_bt * c_dim, 256);
-        ps.set_pipeline(&pp.p["conv_bwd"]);
-        ps.dispatch_workgroups(gx, gy, 1);
-    }
-    submit(c, enc.finish());
+    gdn_backward_dev(tape, nk, nv, c_dim)?;
     let draw = read(c, &tape.bufs[19], n_bt * c_dim)?;
     let dz = read(c, &tape.bufs[16], n_bt * vd)?;
     let dab = read(c, &tape.bufs[17], 2 * n_bt * nv)?;
     let (da, db) = dab.split_at(n_bt * nv);
-    let _ = tape.nseg;
     Some((draw, dz, da.to_vec(), db.to_vec()))
-}
-
-/// Device-resident tape of one GDN layer for `nb` windows of `t` tokens:
-/// its buffers are allocated once and reused by every step.
-pub fn gdn_tape(cfg: &GdnTrainCfg, nb: usize, t: usize) -> Option<GdnTape> {
-    let c = ctx()?;
-    pipes(c)?;
-    let (nv, nk, kk) = (cfg.nv, cfg.nk, cfg.kk);
-    let kd = nk * 128;
-    let vd = nv * 128;
-    let c_dim = 2 * kd + vd;
-    let n_bt = nb * t;
-    let nseg = t.div_ceil(CS);
-    let mut prm = Vec::with_capacity(2 * nv + 128 + c_dim * kk);
-    prm.extend_from_slice(cfg.a_log);
-    prm.extend_from_slice(cfg.dt_bias);
-    prm.extend_from_slice(cfg.norm);
-    prm.extend_from_slice(cfg.conv);
-    let sizes = [
-        n_bt * c_dim, n_bt * c_dim, n_bt * vd, 2 * n_bt * nv, prm.len(), 2 * n_bt * nk * 128, 2 * n_bt * nk,
-        3 * n_bt * nv, n_bt * vd, n_bt * vd, n_bt * nv, nb * nv * (nseg + 1) * 16384, nb * nv * CS * 16384,
-        nb * nv * CS * 128, n_bt * vd, n_bt * c_dim, n_bt * vd, 2 * n_bt * nv, 2 * n_bt * nv * 128, n_bt * c_dim,
-    ];
-    let bufs: Vec<wgpu::Buffer> = sizes.iter().map(|&n| sbuf(c, n)).collect();
-    c.queue.write_buffer(&bufs[4], 0, bytemuck::cast_slice(&prm));
-    let u: [u32; 20] = [
-        nb as u32, t as u32, nv as u32, nk as u32, c_dim as u32, vd as u32, kd as u32, (nv / nk) as u32,
-        kk as u32, CS as u32, nseg as u32, nv as u32, (2 * nv) as u32, (2 * nv + 128) as u32, 0, 0,
-        (cfg.rms_eps as f32).to_bits(), 0, 0, 0,
-    ];
-    let uni = c.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("gdn_train_p"),
-        size: 80,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    c.queue.write_buffer(&uni, 0, bytemuck::cast_slice(&u));
-    Some(GdnTape { nb, t, bufs, uni, nseg })
 }
 
 impl GdnTape {
@@ -789,58 +1201,96 @@ impl GdnTape {
 }
 
 /// Forward on the tape's input buffers (filled by the caller); the output
-/// stays in `tape.out()`.
-pub fn gdn_forward_dev(tape: &GdnTape, nk: usize, nv: usize, c_dim: usize) -> Option<()> {
+/// stays in `tape.out()`. `keep`: record what the backward reads
+/// (checkpoints, kv); a forward that is recomputed before its backward
+/// (the first pass of a step) skips it.
+pub fn gdn_forward_dev(tape: &GdnTape, nk: usize, nv: usize, c_dim: usize, keep: bool) -> Option<()> {
     let c = ctx()?;
     let pp = pipes(c)?;
     let n_bt = tape.nb * tape.t;
-    let bg = bind(c, pp, tape);
     let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gdn_fwd") });
     {
         let mut ps = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
-        ps.set_bind_group(0, &bg, &[]);
+        let mut mk = super::train_prof::pass_begin(c, &mut ps);
+        ps.set_bind_group(0, &tape.bg[keep as usize], &[]);
         let (gx, gy) = grid(n_bt * c_dim, 256);
         ps.set_pipeline(&pp.p["conv_fwd"]);
         ps.dispatch_workgroups(gx, gy, 1);
+        super::train_prof::pass_mark(c, &mut ps, &mut mk, "gdn.conv_fwd", [0; 3]);
         let (wx, wy) = wg_grid(n_bt * nk);
         ps.set_pipeline(&pp.p["qk_prep"]);
         ps.dispatch_workgroups(wx, wy, 1);
+        super::train_prof::pass_mark(c, &mut ps, &mut mk, "gdn.qk_prep", [0; 3]);
         ps.set_pipeline(&pp.p["gate_prep"]);
         ps.dispatch_workgroups((n_bt * nv).div_ceil(256) as u32, 1, 1);
-        ps.set_pipeline(&pp.p["rec_fwd"]);
-        ps.dispatch_workgroups((tape.nb * nv) as u32, 1, 1);
+        super::train_prof::pass_mark(c, &mut ps, &mut mk, "gdn.gate_prep", [0; 3]);
+        if pp.sg {
+            ps.set_pipeline(&pp.p["rec_fwd2"]);
+            ps.dispatch_workgroups((tape.nb * nv * NWG) as u32, 1, 1);
+            super::train_prof::pass_mark(c, &mut ps, &mut mk, "gdn.rec_fwd", [0; 3]);
+            let (rx, ry) = wg_grid((n_bt * nv).div_ceil(8));
+            ps.set_pipeline(&pp.p["norm_fwd2"]);
+            ps.dispatch_workgroups(rx, ry, 1);
+            super::train_prof::pass_mark(c, &mut ps, &mut mk, "gdn.norm_fwd", [0; 3]);
+        } else {
+            ps.set_pipeline(&pp.p["rec_fwd"]);
+            ps.dispatch_workgroups((tape.nb * nv) as u32, 1, 1);
+            super::train_prof::pass_mark(c, &mut ps, &mut mk, "gdn.rec_fwd", [0; 3]);
+        }
     }
     submit(c, enc.finish());
     Some(())
 }
 
-/// Backward for the gradient the caller wrote into `tape.dout()`.
+/// Backward for the gradient the caller wrote into `tape.dout()` (the
+/// tape of a `keep` forward).
 pub fn gdn_backward_dev(tape: &GdnTape, nk: usize, nv: usize, c_dim: usize) -> Option<()> {
     let c = ctx()?;
     let pp = pipes(c)?;
     let n_bt = tape.nb * tape.t;
-    let bg = bind(c, pp, tape);
     let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gdn_bwd") });
     {
         let mut ps = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
-        ps.set_bind_group(0, &bg, &[]);
-        ps.set_pipeline(&pp.p["rec_bwd"]);
-        ps.dispatch_workgroups((tape.nb * nv) as u32, 1, 1);
+        let mut mk = super::train_prof::pass_begin(c, &mut ps);
+        ps.set_bind_group(0, &tape.bg[1], &[]);
         let (wx, wy) = wg_grid(n_bt * nk);
-        ps.set_pipeline(&pp.p["qk_bwd"]);
-        ps.dispatch_workgroups(wx, wy, 1);
+        if pp.sg {
+            let (rx, ry) = wg_grid((n_bt * nv).div_ceil(8));
+            ps.set_pipeline(&pp.p["norm_bwd2"]);
+            ps.dispatch_workgroups(rx, ry, 1);
+            super::train_prof::pass_mark(c, &mut ps, &mut mk, "gdn.norm_bwd", [0; 3]);
+            ps.set_pipeline(&pp.p["rec_bwd2"]);
+            ps.dispatch_workgroups((tape.nb * nv * NWG) as u32, 1, 1);
+            super::train_prof::pass_mark(c, &mut ps, &mut mk, "gdn.rec_bwd", [0; 3]);
+            ps.set_pipeline(&pp.p["qk_bwd2"]);
+            ps.dispatch_workgroups(wx, wy, 1);
+            super::train_prof::pass_mark(c, &mut ps, &mut mk, "gdn.qk_bwd", [0; 3]);
+        } else {
+            ps.set_pipeline(&pp.p["rec_bwd"]);
+            ps.dispatch_workgroups((tape.nb * nv) as u32, 1, 1);
+            super::train_prof::pass_mark(c, &mut ps, &mut mk, "gdn.rec_bwd", [0; 3]);
+            ps.set_pipeline(&pp.p["qk_bwd"]);
+            ps.dispatch_workgroups(wx, wy, 1);
+            super::train_prof::pass_mark(c, &mut ps, &mut mk, "gdn.qk_bwd", [0; 3]);
+        }
         let (gx, gy) = grid(n_bt * c_dim, 256);
         ps.set_pipeline(&pp.p["conv_bwd"]);
         ps.dispatch_workgroups(gx, gy, 1);
+        super::train_prof::pass_mark(c, &mut ps, &mut mk, "gdn.conv_bwd", [0; 3]);
     }
     submit(c, enc.finish());
     Some(())
 }
 
-fn bind(c: &Ctx, pp: &Pipes, tape: &GdnTape) -> wgpu::BindGroup {
-    let mut entries = vec![wgpu::BindGroupEntry { binding: 0, resource: tape.uni.as_entire_binding() }];
-    for (k, b) in tape.bufs.iter().enumerate() {
+fn bind(c: &Ctx, pp: &Pipes, uni: &wgpu::Buffer, bufs: &[wgpu::Buffer]) -> wgpu::BindGroup {
+    super::train_prof::count(super::train_prof::Cnt::BindGroup, 1);
+    let mut entries = vec![wgpu::BindGroupEntry { binding: 0, resource: uni.as_entire_binding() }];
+    for (k, b) in bufs.iter().enumerate() {
         entries.push(wgpu::BindGroupEntry { binding: k as u32 + 1, resource: b.as_entire_binding() });
+    }
+    // vec4 views of QKN, CK and SCR for the subgroup kernels
+    for (k, i) in [(21u32, 5usize), (22, 11), (23, 12)] {
+        entries.push(wgpu::BindGroupEntry { binding: k, resource: bufs[i].as_entire_binding() });
     }
     c.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("gdn_train"), layout: &pp.layout, entries: &entries })
 }
@@ -871,6 +1321,55 @@ mod tests {
                 (((s >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0) as f32 * scale as f32
             })
             .collect()
+    }
+
+    /// Timing of the device forward (with the tape) and backward at the
+    /// 27B student's shape (8 windows of 512 tokens, 48 v-heads, 16 k-heads):
+    /// `cargo test --release -p cortiq-engine --features gpu --lib gdn_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn gdn_bench() {
+        let nb: usize = std::env::var("GDN_BENCH_NB").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        let (nv, nk, kk, t) = (48usize, 16usize, 4usize, 512usize);
+        let (kd, vd) = (nk * 128, nv * 128);
+        let c_dim = 2 * kd + vd;
+        let conv = rnd(c_dim * kk, 1, 0.5);
+        let a_log: Vec<f32> = (0..nv).map(|h| -0.5 + 0.03 * h as f32).collect();
+        let dt_bias = rnd(nv, 2, 0.5);
+        let norm: Vec<f32> = rnd(128, 3, 0.3).iter().map(|v| 1.0 + v).collect();
+        let cfg = GdnTrainCfg { nv, nk, kk, rms_eps: 1e-6, a_log: &a_log, dt_bias: &dt_bias, norm: &norm, conv: &conv };
+        let Some(c) = ctx() else { return };
+        let Some(tape) = gdn_tape(&cfg, nb, t) else { return };
+        let n = nb * t;
+        c.queue.write_buffer(&tape.bufs[0], 0, bytemuck::cast_slice(&rnd(n * c_dim, 4, 1.0)));
+        c.queue.write_buffer(&tape.bufs[2], 0, bytemuck::cast_slice(&rnd(n * vd, 5, 1.0)));
+        c.queue.write_buffer(&tape.bufs[3], 0, bytemuck::cast_slice(&rnd(2 * n * nv, 6, 1.0)));
+        c.queue.write_buffer(&tape.bufs[14], 0, bytemuck::cast_slice(&rnd(n * vd, 8, 1.0)));
+        let sync = || {
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        };
+        sync();
+        let reps = 5;
+        let (mut tf, mut tf0, mut tb) = (0f64, 0f64, 0f64);
+        for i in 0..=reps {
+            let t0 = std::time::Instant::now();
+            gdn_forward_dev(&tape, nk, nv, c_dim, false).unwrap();
+            sync();
+            let t1 = std::time::Instant::now();
+            gdn_forward_dev(&tape, nk, nv, c_dim, true).unwrap();
+            sync();
+            let t2 = std::time::Instant::now();
+            gdn_backward_dev(&tape, nk, nv, c_dim).unwrap();
+            sync();
+            let t3 = std::time::Instant::now();
+            if i > 0 {
+                tf0 += (t1 - t0).as_secs_f64();
+                tf += (t2 - t1).as_secs_f64();
+                tb += (t3 - t2).as_secs_f64();
+            }
+        }
+        let ms = |x: f64| 1e3 * x / reps as f64;
+        eprintln!("gdn_bench nb {nb} cs {}: forward {:.3} ms (with tape {:.3} ms), backward {:.3} ms", ckpt_interval(), ms(tf0), ms(tf), ms(tb));
     }
 
     /// Device forward and BPTT against the f64 host reference: two windows,
