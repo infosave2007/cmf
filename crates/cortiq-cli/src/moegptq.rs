@@ -22,8 +22,9 @@
 //!   `silu(X·W_gᵀ)⊙(X·W_uᵀ)` (V4.1: `silu(min(g, L))⊙clamp(u, −L, L)`, its
 //!   `swiglu_limit` L) from the full-precision weights and its Hessian, both
 //!   accumulated in row chunks; then the folds, the gate/up sweeps and the
-//!   down q4tp sweep. On the GPU by default (device grams, folds, sweeps);
-//!   `CMF_MOE_HOST=1`, or no wgpu adapter, runs the same steps on the host.
+//!   down q4tp sweep. On the GPU (device grams, folds, sweeps); without a
+//!   wgpu adapter the run stops, `CMF_MOE_HOST=1` runs the same steps on
+//!   the host.
 //! * Full-precision weights come from the original safetensors shards, one
 //!   layer at a time (the next layer's in the background), deleted when done
 //!   — or read in place when `--hf` names a local directory. Flash-Next's are
@@ -39,7 +40,7 @@
 //!   output in place (their payloads fit the old slots).
 
 use crate::convert::{Quant, fetch, open_safetensors, quantize_2d, to_f32, unpack_fp8_blocks, unpack_mxfp4};
-use crate::gptq::{CalibSource, Q2tpRule, calib_source_tokens, gemm_rows_square, gptq_fold_operator_par, gptq_quantize_q2tp, gptq_quantize_q2tp_dev, gptq_quantize_q4tp, gptq_quantize_q4tp_dev, q2tp_debias_gemm, q2tp_debias_rows, split_calib_budget};
+use crate::gptq::{CalibSource, Q2tpRule, calib_source_tokens, gptq_fold_operator_par, gptq_quantize_q2tp, gptq_quantize_q2tp_dev, gptq_quantize_q4tp, gptq_quantize_q4tp_dev, q2tp_debias_gemm, q2tp_debias_rows, split_calib_budget};
 use cortiq_core::format::{CmfModel, CmfStreamWriter};
 use cortiq_core::quant::{f16_to_f32, f32_to_f16};
 use cortiq_core::types::TensorDtype;
@@ -113,10 +114,50 @@ impl Codec {
 }
 
 /// One layer's calibration record: `n` MoE input rows (f16, `hidden` wide,
-/// row-major) and `top_k` routed expert ids per token (`u16::MAX` = none).
+/// row-major), `top_k` routed expert ids per token (`u16::MAX` = none) and
+/// each pick's route weight (V4.1; empty when not captured — Flash-Next).
 pub(crate) struct LayerRows {
     pub x: Vec<u16>,
     pub picks: Vec<u16>,
+    pub w: Vec<f32>,
+}
+
+/// Route weights in the down Hessian (`CMF_MOE_ROUTE_W`). The reference
+/// expert multiplies its SwiGLU activation by the route weight before
+/// `w2`, so `w2`'s true input Hessian is `Σ w_t²·y_t y_tᵀ`; gate/up read the
+/// unscaled input either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RouteW {
+    /// Unweighted rows (the default; Flash-Next always).
+    Off,
+    /// Each down-input row scaled by its route weight.
+    On,
+    /// `CMF_MOE_DIAG` only: both encodes, side by side.
+    Diag,
+}
+
+impl RouteW {
+    fn parse(v: Option<&str>) -> anyhow::Result<Self> {
+        match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("0") => Ok(Self::Off),
+            Some("1") => Ok(Self::On),
+            Some("diag") => Ok(Self::Diag),
+            Some(other) => anyhow::bail!("CMF_MOE_ROUTE_W={other}: expected 0, 1 or diag"),
+        }
+    }
+}
+
+/// The encodes a `CMF_MOE_DIAG` run measures per expert: each listed prior,
+/// with the unweighted and/or the route-weighted down Hessian.
+pub(crate) fn diag_variants(priors: &[f64], route_w: RouteW) -> Vec<(f64, bool)> {
+    priors
+        .iter()
+        .flat_map(|&n0| match route_w {
+            RouteW::Off => vec![(n0, false)],
+            RouteW::On => vec![(n0, true)],
+            RouteW::Diag => vec![(n0, false), (n0, true)],
+        })
+        .collect()
 }
 
 /// Full-precision weights of one expert: gate and up `[inter, hidden]`,
@@ -155,19 +196,59 @@ enum Family {
 pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     let t0 = Instant::now();
     let codec = Codec::parse(o.codec)?;
+    anyhow::ensure!(!(o.in_place && !o.output.is_empty()), "--output and --in-place are exclusive (--in-place writes into the calibration file)");
+    // CMF_MOE_CAPTURE_ONLY=1: one calibration forward over the layers into
+    // CMF_MOE_CAPTURE_DIR, then stop (no expert is encoded, no file written)
+    let capture_only = std::env::var("CMF_MOE_CAPTURE_ONLY").is_ok_and(|v| v != "0");
+    // The host path is exact but far too slow for a full model: it runs
+    // only when asked for, never as a silent fallback.
     let host_forced = std::env::var("CMF_MOE_HOST").is_ok_and(|v| v != "0");
-    let gpu = if host_forced { None } else { to::dev() };
-    let engine = match gpu {
-        Some(c) => Engine::Gpu(c),
-        None => {
-            eprintln!(
-                "quantize-moe: {} — Hessians, folds and sweeps run on the host (exact, much slower)",
-                if host_forced { "CMF_MOE_HOST=1" } else { "no wgpu GPU" }
-            );
-            Engine::Host
+    let engine = if host_forced {
+        eprintln!("quantize-moe: CMF_MOE_HOST=1 — Hessians, folds and sweeps run on the host (exact, much slower)");
+        Engine::Host
+    } else {
+        match to::dev() {
+            // a capture-only run encodes nothing: the device runs the forward
+            Some(c) if capture_only => Engine::Gpu(c),
+            // the device grams and GEMMs run on the matrix units
+            // (cooperative matrices): without them the first expert would
+            // fail after the whole capture
+            Some(_) if !tm::matrix_units() => anyhow::bail!(
+                "quantize-moe: the wgpu device has no matrix units (cooperative matrices) for the device encode{} (set CMF_MOE_HOST=1 to run on the host)",
+                if std::env::var("CMF_COOP").as_deref() == Ok("0") { "; CMF_COOP=0 is set and turns them off: unset it" } else { "" }
+            ),
+            Some(c) => Engine::Gpu(c),
+            None => anyhow::bail!("quantize-moe: no wgpu GPU (set CMF_MOE_HOST=1 to run on the host)"),
         }
     };
+    // q2tp in place releases each slot's slack by hole punching: probe the
+    // filesystem now, not after the capture
+    if o.in_place && codec == Codec::Q2tp && std::env::var_os("CMF_MOE_DIAG").is_none() {
+        if no_punch() {
+            eprintln!("quantize-moe: CMF_MOE_NO_PUNCH=1 — the q2tp slack stays allocated (the file keeps its q4tp size on disk until `cortiq compact`)");
+        } else {
+            let dir = Path::new(o.calib_model).parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            if let Err(why) = probe_hole_punching(dir) {
+                anyhow::bail!(
+                    "--in-place --codec q2tp releases each expert slot's slack by hole punching, and {} does not: {why}. \
+                     Set CMF_MOE_NO_PUNCH=1 to run anyway (the slack, about a third of the expert bytes, then stays allocated until `cortiq compact`)",
+                    dir.display()
+                );
+            }
+            eprintln!("quantize-moe: hole punching works on {}", dir.display());
+        }
+    }
     let cmodel = Arc::new(CmfModel::open_sharded(o.calib_model)?);
+    // a new file is opened with truncation: never the calibration model
+    // (mapped, read by the forward, the input of a later --in-place run)
+    for f in calib_files(o.calib_model, &cmodel) {
+        if !o.output.is_empty() && same_file(Path::new(o.output), &f) {
+            anyhow::bail!("--output {} is the calibration file {} (writing it would truncate it): write to another path, or use --in-place", o.output, f.display());
+        }
+        if let Some(t) = o.patch_shared.filter(|t| same_file(Path::new(t), &f)) {
+            anyhow::bail!("--patch-shared {t} is the calibration file {}: it patches an existing quantize-moe output (--in-place rewrites the calibration file)", f.display());
+        }
+    }
     let arch = cmodel.arch().clone();
     let nl = arch.num_layers;
     let hidden = arch.hidden_size;
@@ -194,7 +275,7 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
                 layer_dirs.push(d);
                 shared_dirs.push(s);
             }
-            (arch.moe.as_ref().map(|m| m.top_k).unwrap_or(10), 0.0f32, 0usize)
+            (qwen4_top_k(&arch), 0.0f32, 0usize)
         }
         Family::Dsv41 => {
             let cfg = &p.dsv41.as_ref().expect("dsv41").2;
@@ -204,16 +285,7 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
                 layer_dirs.push(d);
                 shared_dirs.push(Some(s));
             }
-            let block = arch
-                .deepseek_v41
-                .as_ref()
-                .and_then(|c| c.get("quantization_config"))
-                .and_then(|q| q.get("weight_block_size"))
-                .and_then(|v| v.as_array())
-                .and_then(|a| a.first()?.as_u64())
-                .map(|b| b as usize)
-                .unwrap_or(32);
-            (cfg.top_k, cfg.swiglu_limit.max(0.0), block)
+            dsv41_settings(cfg, arch.deepseek_v41.as_ref())
         }
     };
     let ne = layer_dirs[0].len();
@@ -240,10 +312,19 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     // calibration windows
     let srcs: Vec<CalibSource> = o.calib.iter().map(|s| CalibSource::parse(s)).collect::<anyhow::Result<_>>()?;
     let budgets = split_calib_budget(&srcs, o.tokens);
+    // V4.1: every window is a sequence of its own from position 0, so it
+    // starts with BOS as every request does (not mid-text at position 0)
+    let bos = match family {
+        Family::Dsv41 => Some(p.tokenizer.bos_token_id.unwrap_or(0)),
+        Family::Qwen4 => None,
+    };
     let mut windows: Vec<Vec<u32>> = Vec::new();
     for (src, &n) in srcs.iter().zip(&budgets) {
         let ids = calib_source_tokens(&src.path, n, &|t| p.tokenizer.encode(t))?;
-        windows.extend(ids.chunks(o.window).filter(|w| w.len() >= 16).map(<[u32]>::to_vec));
+        windows.extend(calib_windows(&ids, o.window, bos));
+    }
+    if let Some(b) = bos {
+        eprintln!("every calibration window starts with BOS (id {b})");
     }
     let ntok: usize = windows.iter().map(Vec::len).sum();
     eprintln!("calibrating on {ntok} tokens ({} windows)", windows.len());
@@ -256,7 +337,6 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     let env_f = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(d);
     let diag: Option<Vec<f64>> = std::env::var("CMF_MOE_DIAG").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect());
     let holdout = if diag.is_some() { env_f("CMF_MOE_HOLDOUT", 8.0) as usize } else { 0 };
-    let prior_n0 = env_f("CMF_MOE_PRIOR", 0.0);
     let prior_s = env_f("CMF_MOE_PRIOR_S", 8192.0) as usize;
     let mut held: Vec<bool> = Vec::with_capacity(ntok);
     for (wi, w) in windows.iter().enumerate() {
@@ -268,18 +348,40 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
         .unwrap_or((0, nl));
     let (range_lo, range_hi) = (range_lo.min(nl), range_hi.min(nl));
     anyhow::ensure!(range_lo < range_hi, "CMF_MOE_RANGE {range_lo}..{range_hi} is empty");
+    if capture_only {
+        anyhow::ensure!(std::env::var_os("CMF_MOE_CAPTURE_DIR").is_some(), "CMF_MOE_CAPTURE_ONLY=1 needs CMF_MOE_CAPTURE_DIR");
+        anyhow::ensure!(!o.in_place && patch.is_none() && diag.is_none(), "CMF_MOE_CAPTURE_ONLY=1 writes nothing: run it without --in-place, --patch-shared and CMF_MOE_DIAG");
+        eprintln!("CMF_MOE_CAPTURE_ONLY=1: layers {range_lo}..{range_hi} are captured in one forward and saved; nothing is encoded or written");
+    }
     anyhow::ensure!(
-        diag.is_some() || o.in_place || patch.is_some() || (range_lo, range_hi) == (0, nl),
+        capture_only || diag.is_some() || o.in_place || patch.is_some() || (range_lo, range_hi) == (0, nl),
         "CMF_MOE_RANGE {range_lo}..{range_hi} with --output would leave the other layers' experts out of the file \
          (use it with --in-place, --patch-shared or CMF_MOE_DIAG)"
     );
     if let Some(v) = &diag {
         eprintln!("DIAG: held-out every {holdout}th window, priors {v:?} (pseudo-rows), layers {range_lo}..{range_hi}; no file is written");
     }
-    if prior_n0 > 0.0 {
-        eprintln!("prior: {prior_n0} pseudo-rows (down {}) from {prior_s} calibration tokens", prior_n0 / 4.0);
+    let n_cal = held.iter().filter(|&&h| !h).count();
+    let prior_env = std::env::var("CMF_MOE_PRIOR").ok().and_then(|v| v.trim().parse::<f64>().ok());
+    let (prior_n0, prior_why) = production_prior(family, prior_env, n_cal, top_k, ne, hidden);
+    if diag.is_some() {
+        // DIAG measures its own list of priors
+    } else if prior_n0 > 0.0 {
+        eprintln!("prior: n0 = {prior_n0} pseudo-rows (down {}) from {prior_s} calibration tokens — {prior_why}", prior_n0 / 4.0);
+    } else {
+        eprintln!("prior: none — {prior_why}");
     }
-    let nvar = diag.as_ref().map_or(0, Vec::len);
+    let route_w = RouteW::parse(std::env::var("CMF_MOE_ROUTE_W").ok().as_deref())?;
+    anyhow::ensure!(route_w == RouteW::Off || family == Family::Dsv41, "CMF_MOE_ROUTE_W: route weights are captured for DeepSeek-V4.1 only");
+    anyhow::ensure!(route_w != RouteW::Diag || diag.is_some(), "CMF_MOE_ROUTE_W=diag compares both down Hessians under CMF_MOE_DIAG only");
+    match route_w {
+        RouteW::Off => eprintln!("down Hessian: unweighted rows (CMF_MOE_ROUTE_W=1 weights them by the route weight)"),
+        RouteW::On => eprintln!("down Hessian: each row scaled by its route weight (Σ w²·y yᵀ, CMF_MOE_ROUTE_W=1)"),
+        RouteW::Diag => eprintln!("DIAG: every prior with the unweighted and the route-weighted down Hessian (CMF_MOE_ROUTE_W=diag)"),
+    }
+    let variants = diag.as_deref().map(|v| diag_variants(v, route_w)).unwrap_or_default();
+    let labels: Vec<String> = variants.iter().map(|&(n0, rw)| format!("{n0}{}", if rw { "+w" } else { "" })).collect();
+    let nvar = variants.len();
     let mut diag_tot = vec![DiagBin::new(nvar); BINS.len()];
 
     // full-precision source
@@ -300,77 +402,217 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
         source.shards_of(&names)
     };
 
-    // output
-    let mut sink = if diag.is_some() {
-        Sink::Diag
-    } else if let Some(path) = patch {
-        Sink::Patch { path: path.to_string(), target: CmfModel::open_sharded(path)?, patches: Vec::new() }
-    } else if o.in_place {
+    // output (the sink itself is created after the checks below: a new
+    // file is opened with truncation)
+    let writes = !(diag.is_some() || capture_only);
+    let patch_target = match patch {
+        Some(path) if writes => Some(CmfModel::open_sharded(path)?),
+        _ => None,
+    };
+    let in_place = writes && patch.is_none() && o.in_place;
+    let stream = writes && patch.is_none() && !o.in_place;
+    if in_place {
         anyhow::ensure!(
             cmodel.tensors.iter().all(|t| t.shard == 0),
             "--in-place needs a single-file calibration model ({} has sibling shards)",
             o.calib_model
         );
-        Sink::InPlace { path: o.calib_model.to_string(), pending: Vec::new(), before: 0, after: 0, punched: 0 }
-    } else {
+    }
+    if stream {
         anyhow::ensure!(!o.output.is_empty(), "--output is required (or --in-place / --patch-shared)");
-        let avg_name = cmodel.tensors.iter().map(|e| e.name.len()).sum::<usize>() / cmodel.tensors.len().max(1);
-        Sink::Stream(CmfStreamWriter::new(o.output, CmfStreamWriter::head_reserve_for(cmodel.tensors.len(), avg_name))?)
-    };
+    }
     let expert_slots: HashSet<usize> = layer_dirs.iter().flatten().chain(shared_dirs.iter().flatten()).flat_map(|&(g, u, d)| [g, u, d]).collect();
+    // every slot this run rewrites must take the codec's payload: checked
+    // now, not hours later when the first layer is written
+    let written: Vec<(usize, usize, usize)> = (range_lo..range_hi)
+        .flat_map(|li| if patch.is_none() { layer_dirs[li].clone() } else { Vec::new() }.into_iter().chain(shared_dirs[li]))
+        .collect();
+    if in_place {
+        check_slots(&cmodel, &written, codec, None)?;
+    } else if let (Some(path), Some(target)) = (patch, patch_target.as_ref()) {
+        check_slots(&cmodel, &written, codec, Some((path, target)))?;
+    }
 
     let ec = EncodeCfg { codec, limit, lambda: o.lambda, threads: o.threads.max(1) };
     let main_bufs = match engine {
-        Engine::Gpu(c) => Some(wgpu_bufs::Bufs::new(c, CHUNK, hidden, inter.max(inter_s))),
-        Engine::Host => None,
+        Engine::Gpu(c) if !capture_only => Some(wgpu_bufs::Bufs::new(c, CHUNK, hidden, inter.max(inter_s))),
+        _ => None,
     };
     let mut stats = (0usize, 0usize);
     let mut prefetch: Option<std::thread::JoinHandle<anyhow::Result<()>>> = None;
-    // In place, every layer is captured before the first one is rewritten:
-    // a later pass would otherwise run over experts already replaced.
-    let pass = if o.in_place { (range_hi - range_lo).max(1) } else { o.layers_per_pass.max(1) };
-    for lo in (range_lo..range_hi).step_by(pass) {
-        let hi = (lo + pass).min(range_hi);
-        eprintln!(
-            "  layers {lo}..{hi}: capture holds ~{:.1} GB of input rows",
-            ((hi - lo) * ntok * (hidden * 2 + top_k * 2)) as f64 / 1e9
-        );
-        // ── capture ──
-        let tc = Instant::now();
-        let mut rows: Vec<LayerRows> = (lo..hi).map(|_| LayerRows { x: Vec::with_capacity(ntok * hidden), picks: Vec::with_capacity(ntok * top_k) }).collect();
-        {
-            let p = pipe.as_mut().expect("pipeline alive while layers remain");
-            for (wi, w) in windows.iter().enumerate() {
-                match family {
-                    Family::Qwen4 => {
-                        let cap = p.qwen4_capture(w, lo, hi).map_err(|e| anyhow::anyhow!("capture: {e}"))?;
-                        for (k, r) in cap.into_iter().enumerate() {
-                            qwen4_layer_rows(&r, hidden, ne, top_k, &mut rows[k]);
-                        }
-                    }
-                    Family::Dsv41 => {
-                        let cap = p.dsv41_moe_capture(w, lo, hi).map_err(|e| anyhow::anyhow!("capture: {e}"))?;
-                        for (k, (x, pk)) in cap.x.into_iter().zip(cap.picks).enumerate() {
-                            rows[k].x.extend(x);
-                            rows[k].picks.extend(pk);
-                        }
-                    }
+    let passes = plan_passes(range_lo, range_hi, o.layers_per_pass, o.in_place || capture_only);
+    // CMF_MOE_CAPTURE_DIR: captured rows are saved per layer and reused by
+    // a later run on the same calibration tokens (another codec, a resume)
+    let has_w = family == Family::Dsv41;
+    // what this run's calibration forward is: its tokens, the calibration
+    // file, the settings and the binary that run it
+    let this_capture = CaptureMeta {
+        token_hash: token_hash(&windows),
+        ntok,
+        window: o.window,
+        windows: windows.len(),
+        hidden,
+        top_k,
+        ne,
+        family: format!("{family:?}"),
+        calib_model: std::fs::canonicalize(o.calib_model).map(|p| p.display().to_string()).unwrap_or_else(|_| o.calib_model.to_string()),
+        calib_size: std::fs::metadata(o.calib_model).map(|m| m.len()).unwrap_or(0),
+        has_w,
+        env: capture_env(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        binary: binary_id(),
+        layers: Vec::new(),
+    };
+    let mut capture_prov = this_capture.provenance();
+    let mut saved: Option<(PathBuf, CaptureMeta)> = match std::env::var_os("CMF_MOE_CAPTURE_DIR") {
+        Some(d) => {
+            let dir = PathBuf::from(d);
+            let force = std::env::var("CMF_MOE_CAPTURE_FORCE").is_ok_and(|v| v != "0");
+            let (meta, despite) = capture_open(&dir, &this_capture, force)?;
+            capture_prov = meta.provenance();
+            capture_prov["dir"] = serde_json::json!(dir.display().to_string());
+            if !despite.is_empty() {
+                capture_prov["reused_despite"] = serde_json::json!(despite);
+            }
+            eprintln!(
+                "capture directory {}: {} of the layers {range_lo}..{range_hi} saved, {:.2} GB per layer",
+                dir.display(),
+                (range_lo..range_hi).filter(|li| meta.layers.contains(li)).count(),
+                meta.layer_bytes() as f64 / 1e9
+            );
+            Some((dir, meta))
+        }
+        None => None,
+    };
+    // free disk space for what this run will write, checked now: an --output
+    // file gets its last ~200 GB (the non-expert tensors) at the very end
+    {
+        let mut needs: Vec<(PathBuf, String, u64)> = Vec::new();
+        let mut credit: Vec<(PathBuf, u64)> = Vec::new();
+        if stream {
+            let gu = codec.gate_up().0;
+            let slot_dt: HashMap<usize, TensorDtype> =
+                layer_dirs.iter().flatten().chain(shared_dirs.iter().flatten()).flat_map(|&(g, u, d)| [(g, gu), (u, gu), (d, TensorDtype::Q4TiledP)]).collect();
+            needs.push((PathBuf::from(o.output), format!("--output {}", o.output), stream_output_bytes(&cmodel, &slot_dt)?));
+            // an earlier run's output is truncated when the new one opens it
+            credit.push((PathBuf::from(o.output), sole_file_bytes(Path::new(o.output))));
+        }
+        if !capture_only && source.local.is_none() {
+            // the layer being encoded and the next one, prefetched
+            let first = shard_names(range_lo)?;
+            match source.remote_sizes(&first) {
+                Some(b) => {
+                    let present: u64 = first.iter().map(|sh| std::fs::metadata(source.path(sh)).map(|m| m.len()).unwrap_or(0)).sum();
+                    needs.push((source.scratch.clone(), format!("source shards in {}", source.scratch.display()), (2 * b).saturating_sub(present)));
                 }
-                eprint!(
-                    "\r  layers {lo}..{hi}: captured {}/{} windows  {:.1} tok/s   ",
-                    wi + 1,
-                    windows.len(),
-                    rows[0].x.len() as f64 / hidden as f64 / tc.elapsed().as_secs_f64()
-                );
+                None => eprintln!("free space: the size of the source shards is unknown (no size from the Hub); not counted"),
             }
         }
-        eprintln!();
-        if hi >= range_hi {
-            // the last pass: the model's device state is not needed any more
-            // (its expert bank and cached weights live in the device context,
-            // keyed by the model, and outlive the pipeline unless released)
-            pipe = None;
-            cortiq_engine::gpu_wgpu::release_model_buffers(&cmodel);
+        if let Some((dir, meta)) = &saved {
+            let left = (range_lo..range_hi).filter(|li| !meta.layers.contains(li)).count() as u64;
+            needs.push((dir.clone(), format!("capture in {}", dir.display()), left * meta.layer_bytes()));
+        }
+        check_free_space(&needs, &credit, std::env::var("CMF_MOE_NO_SPACE_CHECK").is_ok_and(|v| v != "0"))?;
+    }
+    let mut sink = if !writes {
+        Sink::Diag
+    } else if let (Some(path), Some(target)) = (patch, patch_target) {
+        Sink::Patch { path: path.to_string(), target, patches: Vec::new() }
+    } else if in_place {
+        Sink::InPlace { path: o.calib_model.to_string(), pending: Vec::new(), before: 0, after: 0, punched: 0 }
+    } else {
+        let avg_name = cmodel.tensors.iter().map(|e| e.name.len()).sum::<usize>() / cmodel.tensors.len().max(1);
+        Sink::Stream(CmfStreamWriter::new(o.output, CmfStreamWriter::head_reserve_for(cmodel.tensors.len(), avg_name))?)
+    };
+    let is_saved =|saved: &Option<(PathBuf, CaptureMeta)>, lo: usize, hi: usize| saved.as_ref().is_some_and(|(_, m)| (lo..hi).all(|li| m.layers.contains(&li)));
+    // the calibration forward is needed up to the last pass not on disk
+    let last_forward = passes.iter().rposition(|&(lo, hi)| !is_saved(&saved, lo, hi));
+    if last_forward.is_none() {
+        eprintln!("every layer's capture is on disk: no calibration forward");
+        pipe = None;
+        cortiq_engine::gpu_wgpu::release_model_buffers(&cmodel);
+    }
+    for (pi, &(lo, hi)) in passes.iter().enumerate() {
+        eprintln!(
+            "  layers {lo}..{hi}: capture holds ~{:.1} GB of input rows",
+            ((hi - lo) * ntok * (hidden * 2 + top_k * 2 + if has_w { top_k * 4 } else { 0 })) as f64 / 1e9
+        );
+        let tc = Instant::now();
+        let rows: Vec<LayerRows> = if is_saved(&saved, lo, hi) {
+            let (dir, meta) = saved.as_ref().expect("saved");
+            let rows = (lo..hi).map(|li| capture_load_layer(dir, meta, li)).collect::<anyhow::Result<Vec<_>>>()?;
+            eprintln!("  layers {lo}..{hi}: loaded from {} in {:.0}s", dir.display(), tc.elapsed().as_secs_f64());
+            rows
+        } else {
+            // ── capture ──
+            let nw = if has_w { ntok * top_k } else { 0 };
+            let mut rows: Vec<LayerRows> = (lo..hi).map(|_| LayerRows { x: Vec::with_capacity(ntok * hidden), picks: Vec::with_capacity(ntok * top_k), w: Vec::with_capacity(nw) }).collect();
+            {
+                let p = pipe.as_mut().expect("pipeline alive while layers remain");
+                for (wi, w) in windows.iter().enumerate() {
+                    match family {
+                        Family::Qwen4 => {
+                            let cap = p.qwen4_capture(w, lo, hi).map_err(|e| anyhow::anyhow!("capture: {e}"))?;
+                            for (k, r) in cap.into_iter().enumerate() {
+                                qwen4_layer_rows(&r, hidden, ne, top_k, &mut rows[k]);
+                            }
+                        }
+                        Family::Dsv41 => {
+                            let cap = p.dsv41_moe_capture(w, lo, hi).map_err(|e| anyhow::anyhow!("capture: {e}"))?;
+                            for (k, ((x, pk), w)) in cap.x.into_iter().zip(cap.picks).zip(cap.w).enumerate() {
+                                rows[k].x.extend(x);
+                                rows[k].picks.extend(pk);
+                                rows[k].w.extend(w);
+                            }
+                        }
+                    }
+                    eprint!(
+                        "\r  layers {lo}..{hi}: captured {}/{} windows  {:.1} tok/s   ",
+                        wi + 1,
+                        windows.len(),
+                        rows[0].x.len() as f64 / hidden as f64 / tc.elapsed().as_secs_f64()
+                    );
+                }
+            }
+            eprintln!();
+            if Some(pi) == last_forward {
+                // the last forward: the model's device state is not needed any
+                // more (its expert bank and cached weights live in the device
+                // context, keyed by the model, and outlive the pipeline unless
+                // released)
+                pipe = None;
+                cortiq_engine::gpu_wgpu::release_model_buffers(&cmodel);
+            }
+            if let Some((dir, meta)) = saved.as_mut() {
+                // the layers of this pass not saved yet (a saved one keeps its files)
+                let new: Vec<usize> = (lo..hi).filter(|li| !meta.layers.contains(li)).collect();
+                eprintln!("  layers {lo}..{hi}: saving the capture of {} layers to {} ({:.1} GB)", new.len(), dir.display(), (new.len() as u64 * meta.layer_bytes()) as f64 / 1e9);
+                for li in new {
+                    // meta.json is rewritten after each layer: a failure
+                    // keeps every layer saved before it
+                    let r = (|| -> anyhow::Result<()> {
+                        capture_save_layer(dir, meta, li, &rows[li - lo])?;
+                        meta.layers.push(li);
+                        meta.layers.sort_unstable();
+                        capture_save_meta(dir, meta)
+                    })();
+                    if let Err(e) = r {
+                        meta.layers.retain(|&l| l != li);
+                        capture_remove_layer(dir, li);
+                        if capture_only {
+                            return Err(e.context(format!("saving layer {li}'s capture to {}", dir.display())));
+                        }
+                        // the rows are in memory: losing the forward to a
+                        // full disk would cost far more than the files
+                        eprintln!("  warning: saving layer {li}'s capture failed ({e:#}); the run goes on from the rows in memory, without saving the rest of this pass");
+                        break;
+                    }
+                }
+            }
+            rows
+        };
+        if capture_only {
+            continue;
         }
         for li in lo..hi {
             let tl = Instant::now();
@@ -380,8 +622,12 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
             // full-precision weights of this layer (the next layer's shards
             // download in the background meanwhile)
             let tf = Instant::now();
-            if let Some(h) = prefetch.take() {
-                h.join().map_err(|_| anyhow::anyhow!("prefetch thread panicked"))??;
+            // a failed background download costs a synchronous one, never
+            // the run (the capture before it can take hours)
+            match prefetch.take().map(|h| h.join()) {
+                None | Some(Ok(Ok(()))) => {}
+                Some(Ok(Err(e))) => eprintln!("  layer {li}: background shard prefetch failed ({e:#}); fetching the shards again now"),
+                Some(Err(_)) => eprintln!("  layer {li}: background shard prefetch panicked; fetching the shards again now"),
             }
             let shards = shard_names(li)?;
             let src = source.open_layer(&shards)?;
@@ -395,16 +641,20 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
                     Family::Dsv41 => dsv41_expert(&src, li, part, e, hidden, if matches!(part, Part::Shared) { inter_s } else { inter }, fp8_block),
                 }
             };
-            let job = LayerJob { li, hidden, ne, inter, top_k, min_rows: o.min_rows, prior_n0, prior_s, held: &held };
+            let job = LayerJob { li, hidden, ne, inter, top_k, min_rows: o.min_rows, prior_n0, prior_s, held: &held, route_w };
             let out = encode_layer(engine, &ec, &job, lr, patch.is_none(), shared_dirs[li].is_some() && diag.is_none(), main_bufs.as_ref(), diag.as_deref(), &get)?;
+            let weighted_metric = !lr.w.is_empty();
             stats.0 += out.n_gptq;
             stats.1 += out.n_rtn;
-            if let Some(vars) = &diag {
+            if diag.is_some() {
                 for (bi, b) in out.diag.iter().enumerate() {
                     if b.count == 0 {
                         continue;
                     }
-                    eprintln!("  DIAG layer {li} rows<{}: {} experts, rel. output error RTN {} | priors {vars:?}: {}", bin_label(bi), b.count, b.rel(0), (1..=nvar).map(|i| b.rel(i)).collect::<Vec<_>>().join(" "));
+                    eprintln!("  DIAG layer {li} rows<{}: {} experts, rel. output error RTN {} | GPTQ {labels:?}: {}", bin_label(bi), b.count, b.rel(0), b.rels(nvar));
+                    if weighted_metric {
+                        eprintln!("  DIAG layer {li} rows<{}: route-weighted error (Σ w²·|Δ|²) RTN {} | GPTQ {labels:?}: {}", bin_label(bi), b.rel_w(0), b.rels_w(nvar));
+                    }
                     diag_tot[bi].add(b);
                 }
             }
@@ -440,13 +690,20 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
             }
         }
     }
-    if let Some(vars) = &diag {
-        eprintln!("DIAG total, layers {range_lo}..{range_hi}, relative expert output error on held-out rows:");
+    if capture_only {
+        eprintln!("capture of layers {range_lo}..{range_hi} saved in {:.0}s; no expert was encoded", t0.elapsed().as_secs_f64());
+        return Ok(());
+    }
+    if diag.is_some() {
+        eprintln!("DIAG total, layers {range_lo}..{range_hi}, relative expert output error on held-out rows (GPTQ variants: prior n0, +w = route-weighted down Hessian):");
         for (bi, b) in diag_tot.iter().enumerate() {
             if b.count == 0 {
                 continue;
             }
-            eprintln!("  rows<{}: {} experts | RTN {} | GPTQ priors {vars:?}: {}", bin_label(bi), b.count, b.rel(0), (1..=nvar).map(|i| b.rel(i)).collect::<Vec<_>>().join(" "));
+            eprintln!("  rows<{}: {} experts | RTN {} | GPTQ {labels:?}: {}", bin_label(bi), b.count, b.rel(0), b.rels(nvar));
+            if b.base_w > 0.0 {
+                eprintln!("  rows<{}: route-weighted | RTN {} | GPTQ {labels:?}: {}", bin_label(bi), b.rel_w(0), b.rels_w(nvar));
+            }
         }
         return Ok(());
     }
@@ -462,11 +719,16 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
         "window": o.window,
         "lambda": o.lambda,
         "prior": prior_n0,
+        "route_weighted_down_hessian": route_w == RouteW::On,
+        "prior_source": prior_why,
+        "prior_tokens": prior_s,
         "source": o.hf,
         "calibration_model": Path::new(o.calib_model).file_name().map(|f| f.to_string_lossy().into_owned()),
         "experts_gptq": stats.0,
         "experts_rtn": stats.1,
         "min_rows": o.min_rows,
+        "layers": format!("{range_lo}..{range_hi}"),
+        "calibration_capture": capture_prov,
     });
     sink.finish(&cmodel, &expert_slots, codec, prov_info, o.output, t0)
 }
@@ -504,9 +766,23 @@ impl Sink {
                 Ok(())
             }
             Sink::InPlace { path, before, after, punched, .. } => {
+                // the header cannot grow in place: the recipe goes into a
+                // sidecar, one record per run (a resumed run adds its range)
+                let side = format!("{path}.gptq_moe.json");
+                let mut runs = std::fs::read(&side)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                    .and_then(|v| v.get("runs").and_then(|r| r.as_array()).cloned())
+                    .unwrap_or_default();
+                let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                runs.push(serde_json::json!({ "finished_unix": unix, "weight_quant": codec.name(), "gptq_moe": prov_info.clone() }));
+                let doc = serde_json::to_vec_pretty(&serde_json::json!({ "file": Path::new(&path).file_name().map(|f| f.to_string_lossy().into_owned()), "runs": runs }))?;
+                if let Err(e) = write_atomic(Path::new(&side), |w| std::io::Write::write_all(w, &doc)) {
+                    eprintln!("warning: the recipe could not be written to {side} ({e:#}); it is: {prov_info}");
+                }
                 eprintln!(
                     "rewrote expert tensors in place in {path}: payload {:.2} GB → {:.2} GB, {:.2} GB of slack released; {:.0}s. \
-                     The header provenance is the calibration file's ({prov_info})",
+                     The header provenance is the calibration file's; the recipe is in {side}",
                     before as f64 / 1e9,
                     after as f64 / 1e9,
                     punched as f64 / 1e9,
@@ -531,6 +807,257 @@ impl Sink {
                 Ok(())
             }
         }
+    }
+}
+
+/// Flash-Next top-k from the header (10 when it has no `moe` block).
+fn qwen4_top_k(arch: &cortiq_core::types::ModelArch) -> usize {
+    arch.moe.as_ref().map(|m| m.top_k).unwrap_or(10)
+}
+
+/// A V4.1 model's top-k and SwiGLU limit (the runtime config; a negative
+/// limit is none) and its FP8 weight block, from the preserved source
+/// config's `quantization_config.weight_block_size` (32 when absent).
+fn dsv41_settings(cfg: &cortiq_engine::dsv41::Dsv41Cfg, source: Option<&serde_json::Value>) -> (usize, f32, usize) {
+    let block = source
+        .and_then(|c| c.get("quantization_config"))
+        .and_then(|q| q.get("weight_block_size"))
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first()?.as_u64())
+        .map(|b| b as usize)
+        .unwrap_or(32);
+    (cfg.top_k, cfg.swiglu_limit.max(0.0), block)
+}
+
+/// One source's calibration ids cut into windows of `window` tokens; with
+/// `bos` each window starts with it and carries `window − 1` text tokens.
+/// Windows under 16 tokens are dropped.
+fn calib_windows(ids: &[u32], window: usize, bos: Option<u32>) -> Vec<Vec<u32>> {
+    match bos {
+        None => ids.chunks(window.max(1)).filter(|w| w.len() >= 16).map(<[u32]>::to_vec).collect(),
+        Some(b) => ids
+            .chunks(window.max(2) - 1)
+            .map(|c| {
+                let mut w = Vec::with_capacity(c.len() + 1);
+                if c.first() != Some(&b) {
+                    w.push(b);
+                }
+                w.extend_from_slice(c);
+                w
+            })
+            .filter(|w| w.len() >= 16)
+            .collect(),
+    }
+}
+
+/// The layer prior of the production encode (`n0` pseudo-rows, 0 = none)
+/// and why: `CMF_MOE_PRIOR` when set (0 turns it off); for V4.1, when the
+/// mean expert is routed fewer calibration rows than its input width
+/// (`n_cal·top_k/ne < hidden`: most experts' own Hessians are rank
+/// deficient), one hidden width, the value measured best on Flash-Next.
+fn production_prior(family: Family, env: Option<f64>, n_cal: usize, top_k: usize, ne: usize, hidden: usize) -> (f64, String) {
+    let mean = (n_cal * top_k) as f64 / ne.max(1) as f64;
+    match env {
+        Some(v) => (v.max(0.0), format!("CMF_MOE_PRIOR={v}")),
+        None if family == Family::Dsv41 && mean < hidden as f64 => {
+            (hidden as f64, format!("V4.1 default: {mean:.0} routed rows per expert on average, below hidden {hidden} (CMF_MOE_PRIOR overrides)"))
+        }
+        None => (0.0, format!("{mean:.0} routed rows per expert on average (CMF_MOE_PRIOR sets one)")),
+    }
+}
+
+/// Whether the slots `triples` (gate, up, down directory indices of the
+/// calibration file) take this codec's payloads. In place (`target` None)
+/// a slot keeps its directory entry and is rewritten with the codec's dtype:
+/// it must be that dtype or q4tp (a q4tp slot holds either layout) and hold
+/// at least the payload's bytes. `--patch-shared` rewrites an existing
+/// output, whose layout the codec must match.
+fn check_slots(cm: &CmfModel, triples: &[(usize, usize, usize)], codec: Codec, target: Option<(&str, &CmfModel)>) -> anyhow::Result<()> {
+    let dts = codec.dtypes();
+    for &(g, u, d) in triples {
+        for (slot, want) in [g, u, d].into_iter().zip(dts) {
+            let e = &cm.tensors[slot];
+            let need = cortiq_core::quant::expected_nbytes(want, &e.shape)
+                .ok_or_else(|| anyhow::anyhow!("{}: shape {:?} has no {} layout", e.name, e.shape, want.name()))? as u64;
+            match target {
+                None => {
+                    anyhow::ensure!(
+                        e.dtype == want || e.dtype == TensorDtype::Q4TiledP,
+                        "--in-place --codec {}: {} is {} in the calibration file, and a {} payload fits only a {} slot",
+                        codec.name(),
+                        e.name,
+                        e.dtype.name(),
+                        want.name(),
+                        if want == TensorDtype::Q4TiledP { "q4tp".to_string() } else { format!("{} or a q4tp", want.name()) }
+                    );
+                    anyhow::ensure!(
+                        e.nbytes >= need,
+                        "--in-place --codec {}: the slot of {} holds {} B, its {} payload needs {need} B",
+                        codec.name(),
+                        e.name,
+                        e.nbytes,
+                        want.name()
+                    );
+                }
+                Some((path, t)) => {
+                    let te = t.tensor(&e.name).ok_or_else(|| anyhow::anyhow!("--patch-shared: {} is not in {path}", e.name))?;
+                    let hint = match te.dtype {
+                        TensorDtype::Q2TiledP => " (pass --codec q2tp)",
+                        TensorDtype::Q4TiledP if want == TensorDtype::Q2TiledP => " (pass --codec q4tp)",
+                        _ => "",
+                    };
+                    anyhow::ensure!(
+                        te.dtype == want,
+                        "--patch-shared --codec {}: {} is {} in {path}, the codec writes {}{hint}",
+                        codec.name(),
+                        e.name,
+                        te.dtype.name(),
+                        want.name()
+                    );
+                    anyhow::ensure!(te.shape == e.shape && te.nbytes >= need, "--patch-shared: {} has shape {:?} / {} B in {path}, want {:?} / {need} B", e.name, te.shape, te.nbytes, e.shape);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bytes a new `--output` file takes: every tensor of the calibration file,
+/// the expert slots at their codec payload (`slot_dt`), each padded to the
+/// data alignment, plus the head reserve and the vocabulary.
+fn stream_output_bytes(cm: &CmfModel, slot_dt: &HashMap<usize, TensorDtype>) -> anyhow::Result<u64> {
+    use cortiq_core::format::DATA_ALIGNMENT;
+    let avg_name = cm.tensors.iter().map(|e| e.name.len()).sum::<usize>() / cm.tensors.len().max(1);
+    let mut total = CmfStreamWriter::head_reserve_for(cm.tensors.len(), avg_name) + cm.vocab.as_ref().map_or(0, |v| v.len() as u64);
+    for (slot, e) in cm.tensors.iter().enumerate() {
+        let n = match slot_dt.get(&slot) {
+            Some(&dt) => cortiq_core::quant::expected_nbytes(dt, &e.shape).ok_or_else(|| anyhow::anyhow!("{}: shape {:?} has no {} layout", e.name, e.shape, dt.name()))? as u64,
+            None => e.nbytes,
+        };
+        total += n.div_ceil(DATA_ALIGNMENT) * DATA_ALIGNMENT;
+    }
+    Ok(total)
+}
+
+/// The bytes a regular file at `path` has allocated when it is its only
+/// name (no other hard link keeps them), else 0: what truncating it frees.
+fn sole_file_bytes(path: &Path) -> u64 {
+    let Ok(m) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !m.is_file() {
+        return 0;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if m.nlink() == 1 { m.blocks() * 512 } else { 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        m.len()
+    }
+}
+
+/// The filesystem holding `path` (its nearest existing ancestor): its
+/// device id and the bytes available to this user. `None` off unix, or
+/// when it cannot be read.
+fn fs_space(path: &Path) -> Option<(u64, u64)> {
+    let base = std::iter::successors(Some(path), |p| p.parent()).find(|p| !p.as_os_str().is_empty() && p.exists()).unwrap_or(Path::new("."));
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        let dev = std::fs::metadata(base).ok()?.dev();
+        let c = std::ffi::CString::new(base.as_os_str().as_bytes()).ok()?;
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        Some((dev, u64::from(st.f_bavail).saturating_mul(u64::from(st.f_frsize))))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = base;
+        None
+    }
+}
+
+/// Whether each filesystem has room for what the run writes to it: `needs`
+/// are (path, what, bytes), `credit` (path, bytes) space the run frees
+/// there first (an old output it truncates). A shortfall stops the run
+/// unless `allow` (`CMF_MOE_NO_SPACE_CHECK=1`).
+fn check_free_space(needs: &[(PathBuf, String, u64)], credit: &[(PathBuf, u64)], allow: bool) -> anyhow::Result<()> {
+    let gb = |b: u64| b as f64 / 1e9;
+    // per filesystem: (a path on it, available, needed, what)
+    let mut fss: Vec<(u64, PathBuf, u64, u64, Vec<String>)> = Vec::new();
+    for (path, what, bytes) in needs.iter().filter(|n| n.2 > 0) {
+        let Some((dev, avail)) = fs_space(path) else {
+            eprintln!("free space: cannot read the filesystem of {} ({what}); not checked", path.display());
+            continue;
+        };
+        let i = match fss.iter().position(|f| f.0 == dev) {
+            Some(i) => i,
+            None => {
+                fss.push((dev, path.clone(), avail, 0, Vec::new()));
+                fss.len() - 1
+            }
+        };
+        fss[i].3 += bytes;
+        fss[i].4.push(format!("{what} {:.1} GB", gb(*bytes)));
+    }
+    for (path, bytes) in credit {
+        if let Some(f) = fs_space(path).and_then(|(dev, _)| fss.iter_mut().find(|f| f.0 == dev)) {
+            f.2 += bytes;
+        }
+    }
+    let mut short = Vec::new();
+    for (_, path, avail, need, what) in &fss {
+        let line = format!("{}: needs {:.1} GB ({}), {:.1} GB available", path.display(), gb(*need), what.join(", "), gb(*avail));
+        eprintln!("free space: {line}");
+        if need > avail {
+            short.push(line);
+        }
+    }
+    if short.is_empty() {
+        return Ok(());
+    }
+    if allow {
+        eprintln!("free space: CMF_MOE_NO_SPACE_CHECK=1 — running although {}", short.join("; "));
+        return Ok(());
+    }
+    anyhow::bail!("not enough free disk space: {}. Free some, or set CMF_MOE_NO_SPACE_CHECK=1 to run anyway", short.join("; "))
+}
+
+/// The files of the calibration model: the one given and, when it is shard
+/// 1 of a sharded model, its siblings (`…-{no:05}-of-{count:05}.cmf`).
+fn calib_files(path: &str, cm: &CmfModel) -> Vec<PathBuf> {
+    let p = Path::new(path);
+    let mut files = vec![p.to_path_buf()];
+    if let Some(info) = cm.header.shard.as_ref() {
+        let tag1 = format!("-{:05}-of-{:05}.cmf", 1, info.count);
+        if let Some(stem) = p.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(&tag1)) {
+            files.extend((2..=info.count).map(|no| p.with_file_name(format!("{stem}-{no:05}-of-{:05}.cmf", info.count))));
+        }
+    }
+    files
+}
+
+/// Whether `a` and `b` are the same existing file, also through a symlink
+/// or a hard link (unix: device and inode; elsewhere the canonical paths).
+fn same_file(a: &Path, b: &Path) -> bool {
+    let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ma.dev() == mb.dev() && ma.ino() == mb.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (ma, mb);
+        matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(x), Ok(y)) if x == y)
     }
 }
 
@@ -616,14 +1143,18 @@ impl Source {
         }
     }
 
-    /// Fetch (remote) and map every shard of one layer.
+    /// Fetch (remote) and map every shard of one layer. A failed download
+    /// is retried for up to `fetch_wait()` (a pause of 20 s·k, at most 5
+    /// minutes, after the k-th failure).
     fn open_layer(&self, shards: &[String]) -> anyhow::Result<LayerSrc> {
         let mut files = HashMap::new();
         let mut index = HashMap::new();
         for sh in shards {
             let p = self.path(sh);
             if self.local.is_none() {
-                fetch(&self.agent, &format!("{}/{sh}", self.base), &p, self.token.as_deref(), true, 16)?;
+                with_retries(fetch_wait(), std::time::Duration::from_secs(20), std::time::Duration::from_secs(300), sh, || {
+                    fetch(&self.agent, &format!("{}/{sh}", self.base), &p, self.token.as_deref(), true, 16).map(|_| ())
+                })?;
             }
             let st = open_safetensors(&p)?;
             for (i, m) in st.tensors.iter().enumerate() {
@@ -648,10 +1179,51 @@ impl Source {
         }))
     }
 
+    /// Total bytes of remote `shards` (a 1-byte range request each); `None`
+    /// when the Hub reports no size for one of them.
+    fn remote_sizes(&self, shards: &[String]) -> Option<u64> {
+        shards.iter().map(|sh| crate::convert::probe_size(&self.agent, &format!("{}/{sh}", self.base), self.token.as_deref())).sum()
+    }
+
     /// Delete a fetched shard (a local source is left alone).
     fn release(&self, sh: &str) {
         if self.local.is_none() {
             let _ = std::fs::remove_file(self.scratch.join(sh));
+        }
+    }
+}
+
+/// How long a synchronous shard download keeps being retried before the
+/// run gives up: `CMF_MOE_FETCH_WAIT` minutes, default 240. A run that
+/// stops after its capture, or halfway through an `--output` file (which
+/// cannot resume), loses hours: waiting out a Hub outage is cheaper.
+fn fetch_wait() -> std::time::Duration {
+    let min = std::env::var("CMF_MOE_FETCH_WAIT").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|m| *m >= 0.0).unwrap_or(240.0);
+    std::time::Duration::from_secs_f64(min * 60.0)
+}
+
+/// `f` until it succeeds, retried while the next pause still ends within
+/// `budget` of the first attempt; the pause after the k-th failure is
+/// `pause`·k, at most `max_pause`. The last error is returned.
+fn with_retries(budget: std::time::Duration, pause: std::time::Duration, max_pause: std::time::Duration, what: &str, mut f: impl FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
+    let t0 = Instant::now();
+    let mut k = 1u32;
+    loop {
+        match f() {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let wait = (pause * k).min(max_pause);
+                if t0.elapsed() + wait > budget {
+                    return Err(e.context(format!("{what}: {k} attempts failed over {:.0} min (CMF_MOE_FETCH_WAIT sets the minutes)", t0.elapsed().as_secs_f64() / 60.0)));
+                }
+                eprintln!(
+                    "  {what}: attempt {k} failed ({e:#}); retrying in {:.0}s (giving up {:.0} min after the first attempt)",
+                    wait.as_secs_f64(),
+                    budget.as_secs_f64() / 60.0
+                );
+                std::thread::sleep(wait);
+                k += 1;
+            }
         }
     }
 }
@@ -834,6 +1406,318 @@ fn qwen4_layer_rows(r: &[f32], hidden: usize, ne: usize, top_k: usize, out: &mut
     }
 }
 
+/// The capture passes over layers `lo..hi`: `per` layers each, or one pass
+/// over the whole range in place (every layer is captured before the first
+/// is rewritten: a later pass would run over experts already replaced).
+fn plan_passes(lo: usize, hi: usize, per: usize, in_place: bool) -> Vec<(usize, usize)> {
+    let per = if in_place { (hi - lo).max(1) } else { per.max(1) };
+    (lo..hi).step_by(per).map(|a| (a, (a + per).min(hi))).collect()
+}
+
+// ── saved capture (CMF_MOE_CAPTURE_DIR) ──────────────────────────────────
+//
+// Per layer: `L{li}.x` (the f16 input rows, raw little-endian u16),
+// `L{li}.picks` (u16 expert ids), `L{li}.w` (f32 route weights, V4.1), and
+// one `meta.json`. Every file is written to a `.tmp` sibling and renamed;
+// `meta.json` lists a layer only after its files are complete.
+
+/// What a saved capture was taken from, and which layers it holds.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CaptureMeta {
+    /// SHA-256 of the calibration windows (each window's length, then its ids).
+    pub token_hash: String,
+    pub ntok: usize,
+    pub window: usize,
+    pub windows: usize,
+    pub hidden: usize,
+    pub top_k: usize,
+    pub ne: usize,
+    pub family: String,
+    /// The calibration file (canonical path) and its length.
+    pub calib_model: String,
+    pub calib_size: u64,
+    /// Route weights saved (`L{li}.w`).
+    pub has_w: bool,
+    /// The `CMF_*` settings of the capturing process (`CMF_MOE_*` aside);
+    /// the ones in `FORWARD_ENV` must match for a reuse.
+    pub env: std::collections::BTreeMap<String, String>,
+    /// cortiq version and the binary (path, size, mtime) that captured.
+    pub version: String,
+    pub binary: String,
+    pub layers: Vec<usize>,
+}
+
+const CAPTURE_FORMAT: &str = "cortiq-moe-capture-1";
+
+/// Settings that change the rows a calibration forward produces: the
+/// backend, and the V4.1 forward's switches (`CMF_DSV41_O_FP8` is the
+/// reference `act_quant(o)`, which also forces the CPU attention tail).
+const FORWARD_ENV: &[&str] = &["CMF_GPU", "CMF_GPU_PROBE", "CMF_DSV41_O_FP8", "CMF_DSV41_GPU_ATTN", "CMF_DSV41_DYNAMIC_MOE", "CMF_DSV41_FUSED_Q", "CMF_DSV41_TAIL_TAP"];
+
+/// The `CMF_*` environment of this process, `CMF_MOE_*` aside.
+fn capture_env() -> std::collections::BTreeMap<String, String> {
+    std::env::vars().filter(|(k, _)| k.starts_with("CMF_") && !k.starts_with("CMF_MOE_")).collect()
+}
+
+/// This binary: its path, size and modification time (seconds since 1970).
+fn binary_id() -> String {
+    let Ok(exe) = std::env::current_exe() else {
+        return String::new();
+    };
+    let m = std::fs::metadata(&exe).ok();
+    let len = m.as_ref().map_or(0, |m| m.len());
+    let mtime = m.and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+    format!("{} ({len} B, mtime {mtime})", exe.display())
+}
+
+impl CaptureMeta {
+    /// Bytes one layer takes on disk.
+    pub(crate) fn layer_bytes(&self) -> u64 {
+        (self.ntok * (self.hidden * 2 + self.top_k * 2 + if self.has_w { self.top_k * 4 } else { 0 })) as u64
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "format": CAPTURE_FORMAT,
+            "token_hash": self.token_hash,
+            "ntok": self.ntok,
+            "window": self.window,
+            "windows": self.windows,
+            "hidden": self.hidden,
+            "top_k": self.top_k,
+            "ne": self.ne,
+            "family": self.family,
+            "calibration_model": self.calib_model,
+            "calibration_model_bytes": self.calib_size,
+            "route_weights": self.has_w,
+            "env": self.env,
+            "cortiq_version": self.version,
+            "binary": self.binary,
+            "layers": self.layers,
+        })
+    }
+
+    fn from_json(v: &serde_json::Value) -> anyhow::Result<Self> {
+        anyhow::ensure!(v["format"].as_str() == Some(CAPTURE_FORMAT), "format {:?}, want {CAPTURE_FORMAT}", v["format"]);
+        let us = |k: &str| v[k].as_u64().map(|x| x as usize).ok_or_else(|| anyhow::anyhow!("no {k}"));
+        let st = |k: &str| v[k].as_str().map(str::to_string).ok_or_else(|| anyhow::anyhow!("no {k}"));
+        Ok(Self {
+            token_hash: st("token_hash")?,
+            ntok: us("ntok")?,
+            window: us("window")?,
+            windows: us("windows")?,
+            hidden: us("hidden")?,
+            top_k: us("top_k")?,
+            ne: us("ne")?,
+            family: st("family")?,
+            calib_model: st("calibration_model")?,
+            calib_size: v["calibration_model_bytes"].as_u64().unwrap_or(0),
+            has_w: v["route_weights"].as_bool().unwrap_or(false),
+            // a capture written before these were recorded: unknown, which
+            // differs from any run's (a reuse then needs CMF_MOE_CAPTURE_FORCE)
+            env: v["env"].as_object().map(|m| m.iter().filter_map(|(k, x)| Some((k.clone(), x.as_str()?.to_string()))).collect()).unwrap_or_default(),
+            version: v["cortiq_version"].as_str().unwrap_or("").to_string(),
+            binary: v["binary"].as_str().unwrap_or("").to_string(),
+            layers: v["layers"].as_array().ok_or_else(|| anyhow::anyhow!("no layers"))?.iter().filter_map(|x| x.as_u64().map(|x| x as usize)).collect(),
+        })
+    }
+
+    /// What the output provenance says about the capture its Hessians come
+    /// from (the layers aside).
+    fn provenance(&self) -> serde_json::Value {
+        let mut v = self.to_json();
+        if let Some(m) = v.as_object_mut() {
+            m.remove("format");
+            m.remove("layers");
+        }
+        v
+    }
+
+    /// Why this saved capture cannot serve a run described by `want` (the
+    /// layers aside): `hard`, another calibration set (tokens, geometry,
+    /// family), never reused; `soft`, the same tokens taken from another
+    /// calibration file, by another cortiq version or with other forward
+    /// settings, reused only with `CMF_MOE_CAPTURE_FORCE=1`.
+    fn mismatch(&self, want: &CaptureMeta) -> (Vec<String>, Vec<String>) {
+        let mut hard = Vec::new();
+        if self.token_hash != want.token_hash || self.ntok != want.ntok {
+            hard.push(format!("calibration tokens differ ({} tokens in {} windows saved, {} in {} now)", self.ntok, self.windows, want.ntok, want.windows));
+        }
+        for (k, a, b) in [("hidden", self.hidden, want.hidden), ("top_k", self.top_k, want.top_k), ("experts", self.ne, want.ne)] {
+            if a != b {
+                hard.push(format!("{k} {a} saved, {b} now"));
+            }
+        }
+        if self.family != want.family {
+            hard.push(format!("family {} saved, {} now", self.family, want.family));
+        }
+        if want.has_w && !self.has_w {
+            hard.push("no route weights saved".to_string());
+        }
+        let mut soft = Vec::new();
+        if (self.calib_model.as_str(), self.calib_size) != (want.calib_model.as_str(), want.calib_size) {
+            soft.push(format!("calibration file {} ({} B) saved, {} ({} B) now", self.calib_model, self.calib_size, want.calib_model, want.calib_size));
+        }
+        if self.version != want.version {
+            soft.push(format!("cortiq {:?} saved, {:?} now", self.version, want.version));
+        }
+        let shown = |m: &std::collections::BTreeMap<String, String>, k: &str| m.get(k).map_or("unset".to_string(), |v| format!("{v:?}"));
+        for &k in FORWARD_ENV {
+            if self.env.get(k) != want.env.get(k) {
+                soft.push(format!("{k} {} saved, {} now", shown(&self.env, k), shown(&want.env, k)));
+            }
+        }
+        (hard, soft)
+    }
+}
+
+/// SHA-256 of the calibration windows: each window's length (u32 LE), then
+/// its ids (u32 LE).
+pub(crate) fn token_hash(windows: &[Vec<u32>]) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    for w in windows {
+        h.update((w.len() as u32).to_le_bytes());
+        for &id in w {
+            h.update(id.to_le_bytes());
+        }
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The saved capture in `dir` for a run described by `want`: its meta (with
+/// the layers it holds), or `want` with no layers for a new directory, and
+/// the differences a `force` reuse went past. A capture of other tokens is
+/// refused, never overwritten; one from another calibration file, cortiq
+/// version or forward setting is refused unless `force`.
+pub(crate) fn capture_open(dir: &Path, want: &CaptureMeta, force: bool) -> anyhow::Result<(CaptureMeta, Vec<String>)> {
+    let mp = dir.join("meta.json");
+    if !mp.exists() {
+        std::fs::create_dir_all(dir).map_err(|e| anyhow::anyhow!("CMF_MOE_CAPTURE_DIR {}: {e}", dir.display()))?;
+        return Ok((CaptureMeta { layers: Vec::new(), ..want.clone() }, Vec::new()));
+    }
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&mp)?).map_err(|e| anyhow::anyhow!("{}: {e}", mp.display()))?;
+    let have = CaptureMeta::from_json(&v).map_err(|e| anyhow::anyhow!("{}: {e}", mp.display()))?;
+    let (hard, soft) = have.mismatch(want);
+    if !hard.is_empty() {
+        anyhow::bail!(
+            "CMF_MOE_CAPTURE_DIR {} holds the capture of another run ({}); run with the same --calib/--tokens/--window, \
+             or point CMF_MOE_CAPTURE_DIR at an empty directory",
+            dir.display(),
+            hard.join("; ")
+        );
+    }
+    if !soft.is_empty() {
+        if !force {
+            anyhow::bail!(
+                "CMF_MOE_CAPTURE_DIR {} holds these tokens, but captured differently ({}); set CMF_MOE_CAPTURE_FORCE=1 to reuse it anyway, \
+                 or point CMF_MOE_CAPTURE_DIR at an empty directory",
+                dir.display(),
+                soft.join("; ")
+            );
+        }
+        eprintln!("CMF_MOE_CAPTURE_FORCE=1: the saved capture is reused although {}", soft.join("; "));
+    }
+    if have.binary != want.binary {
+        eprintln!("note: the saved capture was taken by {}, this is {}", have.binary, want.binary);
+    }
+    Ok((have, soft))
+}
+
+/// `path` written through a `.tmp` sibling and renamed into place.
+/// A failed write removes its `.tmp` (a full disk keeps no partial file).
+fn write_atomic(path: &Path, fill: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::io::Result<()>) -> anyhow::Result<()> {
+    let name = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = path.with_file_name(format!("{name}.tmp"));
+    let r = (|| -> anyhow::Result<()> {
+        let mut w = std::io::BufWriter::with_capacity(1 << 22, std::fs::File::create(&tmp).map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?);
+        fill(&mut w).map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?;
+        w.into_inner().map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?.sync_all()?;
+        std::fs::rename(&tmp, path).map_err(|e| anyhow::anyhow!("{} → {}: {e}", tmp.display(), path.display()))?;
+        Ok(())
+    })();
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r
+}
+
+/// Little-endian values in 1 MiB-element blocks.
+fn write_le<T: Copy, const N: usize>(w: &mut impl std::io::Write, v: &[T], le: impl Fn(T) -> [u8; N]) -> std::io::Result<()> {
+    let mut buf = Vec::with_capacity((1 << 20) * N);
+    for c in v.chunks(1 << 20) {
+        buf.clear();
+        buf.extend(c.iter().flat_map(|&x| le(x)));
+        w.write_all(&buf)?;
+    }
+    Ok(())
+}
+
+/// `n` little-endian values of `N` bytes from `path` (its size must match).
+fn read_le<T, const N: usize>(path: &Path, n: usize, from: impl Fn([u8; N]) -> T) -> anyhow::Result<Vec<T>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    let len = f.metadata()?.len();
+    anyhow::ensure!(len == (n * N) as u64, "{}: {len} B, want {} B (delete the layer's files to capture it again)", path.display(), n * N);
+    let mut out = Vec::with_capacity(n);
+    let mut buf = vec![0u8; (1 << 20) * N];
+    let mut left = n;
+    while left > 0 {
+        let k = left.min(1 << 20);
+        f.read_exact(&mut buf[..k * N])?;
+        out.extend(buf[..k * N].chunks_exact(N).map(|b| from(b.try_into().expect("N bytes"))));
+        left -= k;
+    }
+    Ok(out)
+}
+
+fn capture_path(dir: &Path, li: usize, ext: &str) -> PathBuf {
+    dir.join(format!("L{li}.{ext}"))
+}
+
+/// Save one layer's captured rows (`meta.json` is written separately).
+pub(crate) fn capture_save_layer(dir: &Path, meta: &CaptureMeta, li: usize, r: &LayerRows) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        r.x.len() == meta.ntok * meta.hidden && r.picks.len() == meta.ntok * meta.top_k && (!meta.has_w || r.w.len() == r.picks.len()),
+        "layer {li}: {} rows / {} picks / {} weights for {} tokens",
+        r.x.len() / meta.hidden.max(1),
+        r.picks.len(),
+        r.w.len(),
+        meta.ntok
+    );
+    write_atomic(&capture_path(dir, li, "x"), |w| write_le(w, &r.x, u16::to_le_bytes))?;
+    write_atomic(&capture_path(dir, li, "picks"), |w| write_le(w, &r.picks, u16::to_le_bytes))?;
+    if meta.has_w {
+        write_atomic(&capture_path(dir, li, "w"), |w| write_le(w, &r.w, f32::to_le_bytes))?;
+    }
+    Ok(())
+}
+
+/// Remove the files of a layer that `meta.json` does not list (a save that
+/// failed part way).
+fn capture_remove_layer(dir: &Path, li: usize) {
+    for ext in ["x", "picks", "w"] {
+        let p = capture_path(dir, li, ext);
+        let _ = std::fs::remove_file(p.with_file_name(format!("L{li}.{ext}.tmp")));
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+pub(crate) fn capture_save_meta(dir: &Path, meta: &CaptureMeta) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec_pretty(&meta.to_json())?;
+    write_atomic(&dir.join("meta.json"), |w| std::io::Write::write_all(w, &bytes))
+}
+
+/// One saved layer's rows.
+pub(crate) fn capture_load_layer(dir: &Path, meta: &CaptureMeta, li: usize) -> anyhow::Result<LayerRows> {
+    anyhow::ensure!(meta.layers.contains(&li), "layer {li} is not in the saved capture {}", dir.display());
+    Ok(LayerRows {
+        x: read_le(&capture_path(dir, li, "x"), meta.ntok * meta.hidden, u16::from_le_bytes)?,
+        picks: read_le(&capture_path(dir, li, "picks"), meta.ntok * meta.top_k, u16::from_le_bytes)?,
+        w: if meta.has_w { read_le(&capture_path(dir, li, "w"), meta.ntok * meta.top_k, f32::from_le_bytes)? } else { Vec::new() },
+    })
+}
+
 // ── output ───────────────────────────────────────────────────────────────
 
 enum Sink {
@@ -905,11 +1789,77 @@ impl Sink {
     }
 }
 
+/// `CMF_MOE_NO_PUNCH=1`: never punch holes (the q2tp slack in q4tp slots
+/// stays allocated).
+fn no_punch() -> bool {
+    std::env::var("CMF_MOE_NO_PUNCH").is_ok_and(|v| v != "0")
+}
+
+/// Whether the filesystem of `dir` releases punched holes: a 1 MiB file is
+/// written there, one hole punched into it, and its allocated blocks are
+/// counted before and after. Linux only (`fallocate`); elsewhere never.
+fn probe_hole_punching(dir: &Path) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::io::AsRawFd;
+        const LEN: usize = 1 << 20;
+        let p = dir.join(format!(".cortiq-moe-punch-probe-{}", std::process::id()));
+        let probe = || -> Result<(), String> {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&p)
+                .map_err(|e| format!("create {}: {e}", p.display()))?;
+            // incompressible bytes: a compressing filesystem (zfs lz4, btrfs)
+            // would store a constant pattern in almost no blocks
+            let mut s = 0x9E37_79B9_7F4A_7C15u64;
+            let bytes: Vec<u8> = (0..LEN / 8)
+                .flat_map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    s.to_le_bytes()
+                })
+                .collect();
+            f.write_all(&bytes).map_err(|e| format!("write {}: {e}", p.display()))?;
+            f.sync_all().map_err(|e| format!("sync {}: {e}", p.display()))?;
+            let before = f.metadata().map_err(|e| format!("stat {}: {e}", p.display()))?.blocks();
+            let r = unsafe { libc::fallocate(f.as_raw_fd(), libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, (LEN / 4) as libc::off_t, (LEN / 2) as libc::off_t) };
+            if r != 0 {
+                return Err(format!("fallocate(PUNCH_HOLE): {}", std::io::Error::last_os_error()));
+            }
+            f.sync_all().map_err(|e| format!("sync {}: {e}", p.display()))?;
+            let md = f.metadata().map_err(|e| format!("stat {}: {e}", p.display()))?;
+            if md.len() != LEN as u64 || md.blocks() >= before {
+                return Err(format!(
+                    "fallocate(PUNCH_HOLE) succeeded, but the probe file kept {} of {before} allocated 512-byte blocks (length {} of {LEN})",
+                    md.blocks(),
+                    md.len()
+                ));
+            }
+            Ok(())
+        };
+        let r = probe();
+        let _ = std::fs::remove_file(&p);
+        r
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = dir;
+        Err("hole punching is implemented on Linux only".to_string())
+    }
+}
+
 /// Release whole filesystem blocks inside `[start, end)` ranges of `path`
 /// (Linux `fallocate` hole punching; the file length is unchanged and the
-/// ranges read back as zeros). Returns the bytes released (0 elsewhere).
+/// ranges read back as zeros). Returns the bytes released (0 elsewhere, and
+/// with `CMF_MOE_NO_PUNCH=1`).
 fn punch_holes(path: &str, ranges: &[(u64, u64)]) -> anyhow::Result<u64> {
-    if ranges.is_empty() {
+    if ranges.is_empty() || no_punch() {
         return Ok(0);
     }
     #[cfg(target_os = "linux")]
@@ -954,31 +1904,63 @@ pub(crate) struct LayerJob<'a> {
     pub prior_s: usize,
     /// Per token: held out of the calibration (diagnostics).
     pub held: &'a [bool],
+    pub route_w: RouteW,
 }
 
 /// Diagnostic accumulators of one row-count bin: experts, Σ‖out‖², Σ error
-/// for RTN and for each prior.
+/// for RTN and for each variant, and the same with every held-out row
+/// weighted by its route weight squared (`_w`; the error the MoE output
+/// sees, when the capture has route weights).
 #[derive(Clone)]
 pub(crate) struct DiagBin {
     pub count: usize,
     pub base: f64,
     pub err: Vec<f64>,
+    pub base_w: f64,
+    pub err_w: Vec<f64>,
 }
 
 impl DiagBin {
     fn new(nvar: usize) -> Self {
-        Self { count: 0, base: 0.0, err: vec![0.0; nvar + 1] }
+        Self { count: 0, base: 0.0, err: vec![0.0; nvar + 1], base_w: 0.0, err_w: vec![0.0; nvar + 1] }
     }
     fn add(&mut self, o: &DiagBin) {
         self.count += o.count;
         self.base += o.base;
+        self.base_w += o.base_w;
         for (a, b) in self.err.iter_mut().zip(&o.err) {
+            *a += b;
+        }
+        for (a, b) in self.err_w.iter_mut().zip(&o.err_w) {
             *a += b;
         }
     }
     fn rel(&self, i: usize) -> String {
         format!("{:.4}", self.err[i] / self.base)
     }
+    fn rel_w(&self, i: usize) -> String {
+        format!("{:.4}", self.err_w[i] / self.base_w)
+    }
+    fn rels(&self, nvar: usize) -> String {
+        (1..=nvar).map(|i| self.rel(i)).collect::<Vec<_>>().join(" ")
+    }
+    fn rels_w(&self, nvar: usize) -> String {
+        (1..=nvar).map(|i| self.rel_w(i)).collect::<Vec<_>>().join(" ")
+    }
+}
+
+/// Σ‖a_r − b_r‖² over the `m` rows (`width` wide), unweighted and weighted
+/// by `w_r²` (`w` empty: the weighted sum is 0).
+fn row_err(a: &[f32], b: &[f32], width: usize, w: &[f32]) -> (f64, f64) {
+    let (mut e, mut ew) = (0f64, 0f64);
+    for (r, (ra, rb)) in a.chunks_exact(width).zip(b.chunks_exact(width)).enumerate() {
+        let v: f64 = ra.iter().zip(rb).map(|(&x, &y)| ((x - y) as f64).powi(2)).sum();
+        e += v;
+        if let Some(&wr) = w.get(r) {
+            ew += (wr as f64).powi(2) * v;
+        }
+    }
+    (e, ew)
 }
 
 const BINS: [usize; 4] = [640, 2560, 10240, usize::MAX];
@@ -1019,7 +2001,11 @@ pub(crate) fn encode_layer(
     let (hidden, ne, inter, top_k) = (job.hidden, job.ne, job.inter, job.top_k);
     let n = lr.x.len() / hidden;
     let held = job.held;
-    let nvar = diag.map_or(0, <[f64]>::len);
+    let variants = diag.map(|v| diag_variants(v, job.route_w)).unwrap_or_default();
+    let nvar = variants.len();
+    // route weights per pick, when captured
+    let has_w = lr.w.len() == n * top_k && n > 0;
+    anyhow::ensure!(job.route_w == RouteW::Off || has_w, "layer {}: route weighting needs the captured route weights ({} for {} picks)", job.li, lr.w.len(), n * top_k);
     let mut out = LayerOut { routed: Vec::new(), shared: None, n_gptq: 0, n_rtn: 0, diag: vec![DiagBin::new(nvar); BINS.len()], tim: [0.0; 5], t_shared: 0.0 };
     // the prior's sample: evenly spaced calibration tokens
     let cal: Vec<u32> = (0..n).filter(|&t| !held[t]).map(|t| t as u32).collect();
@@ -1028,13 +2014,20 @@ pub(crate) fn encode_layer(
         // routing: each token's experts
         let mut lists: Vec<Vec<u32>> = vec![Vec::new(); ne];
         let mut lists_ho: Vec<Vec<u32>> = vec![Vec::new(); ne];
+        // each list entry's route weight (when captured)
+        let mut wl: Vec<Vec<f32>> = vec![Vec::new(); ne];
+        let mut wl_ho: Vec<Vec<f32>> = vec![Vec::new(); ne];
         for t in 0..n {
-            for &e in &lr.picks[t * top_k..(t + 1) * top_k] {
-                let e = e as usize;
+            for j in t * top_k..(t + 1) * top_k {
+                let e = lr.picks[j] as usize;
                 if e >= ne {
                     continue;
                 }
-                if held[t] { lists_ho[e].push(t as u32) } else { lists[e].push(t as u32) }
+                let (l, w) = if held[t] { (&mut lists_ho[e], &mut wl_ho[e]) } else { (&mut lists[e], &mut wl[e]) };
+                l.push(t as u32);
+                if has_w {
+                    w.push(lr.w[j]);
+                }
             }
         }
         {
@@ -1050,7 +2043,13 @@ pub(crate) fn encode_layer(
                 job.min_rows
             );
         }
-        let prod_prior = (job.prior_n0 > 0.0).then(|| Prior { rows: &sample, n0: job.prior_n0, n0_down: job.prior_n0 / 4.0 });
+        // the prior with n0 pseudo-rows; route-weighted, the down prior's
+        // rows carry the expert's mean squared route weight (pseudo-rows of
+        // the average weighted row), so its share of the down Hessian stays
+        let prior_for = |n0: f64, rw: Option<&[f32]>| -> Option<Prior> {
+            let msw = rw.filter(|w| !w.is_empty()).map_or(1.0, |w| w.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / w.len() as f64);
+            (n0 > 0.0).then(|| Prior { rows: &sample, n0, n0_down: n0 / 4.0 * msw })
+        };
         let diag_layer = std::sync::Mutex::new(vec![DiagBin::new(nvar); BINS.len()]);
         // experts in parallel: each worker owns its device scratch and a
         // share of the host threads; results are kept in expert order
@@ -1068,7 +2067,7 @@ pub(crate) fn encode_layer(
                 if e >= ne {
                     break;
                 }
-                if let Some(vars) = diag {
+                if diag.is_some() {
                     let (ho, ce) = (&lists_ho[e], lists[e].len());
                     if ho.is_empty() || ce < job.min_rows {
                         continue;
@@ -1077,24 +2076,26 @@ pub(crate) fn encode_layer(
                     let xh = gather_rows(&lr.x, hidden, ho, 1.0, wec.threads);
                     let m = ho.len();
                     let o_fp = expert_out(&xh, m, hidden, &w.g, &w.u, &w.d, inter, ec.limit, wec.threads);
-                    let base: f64 = o_fp.iter().map(|&v| (v as f64) * (v as f64)).sum();
-                    let err_of = |enc: &[Vec<u8>; 3]| -> f64 {
+                    let (base, base_w) = row_err(&o_fp, &vec![0f32; o_fp.len()], hidden, &wl_ho[e]);
+                    let err_of = |enc: &[Vec<u8>; 3]| -> (f64, f64) {
                         let [qg, qu, qd] = dequant_expert(enc, inter, hidden, ec.codec);
                         let oq = expert_out(&xh, m, hidden, &qg, &qu, &qd, inter, ec.limit, wec.threads);
-                        oq.iter().zip(&o_fp).map(|(&a, &b)| ((a - b) as f64).powi(2)).sum()
+                        row_err(&oq, &o_fp, hidden, &wl_ho[e])
                     };
                     let mut errs = vec![err_of(&rtn_expert(ec.codec, &w, inter, hidden))];
-                    for &n0 in vars {
-                        let pr = (n0 > 0.0).then(|| Prior { rows: &sample, n0, n0_down: n0 / 4.0 });
-                        let enc = encode_expert(engine, &mut bufs, hidden, inter, &lr.x, &lists[e], &w, &wec, pr, &mut wt)?;
+                    for &(n0, weighted) in &variants {
+                        let rw = weighted.then(|| &wl[e][..]);
+                        let enc = encode_expert(engine, &mut bufs, hidden, inter, &lr.x, &lists[e], rw, &w, &wec, prior_for(n0, rw), &mut wt)?;
                         errs.push(err_of(&enc));
                     }
                     let bin = BINS.iter().position(|&lim| ce < lim).unwrap_or(BINS.len() - 1);
                     let mut d = diag_layer.lock().unwrap();
                     d[bin].count += 1;
                     d[bin].base += base;
-                    for (a, v) in d[bin].err.iter_mut().zip(errs) {
-                        *a += v;
+                    d[bin].base_w += base_w;
+                    for (k, (v, vw)) in errs.into_iter().enumerate() {
+                        d[bin].err[k] += v;
+                        d[bin].err_w[k] += vw;
                     }
                     n_gptq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     continue;
@@ -1105,7 +2106,8 @@ pub(crate) fn encode_layer(
                     rtn_expert(ec.codec, &w, inter, hidden)
                 } else {
                     n_gptq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    encode_expert(engine, &mut bufs, hidden, inter, &lr.x, &lists[e], &w, &wec, prod_prior, &mut wt)?
+                    let rw = (job.route_w == RouteW::On).then(|| &wl[e][..]);
+                    encode_expert(engine, &mut bufs, hidden, inter, &lr.x, &lists[e], rw, &w, &wec, prior_for(job.prior_n0, rw), &mut wt)?
                 };
                 *results[e].lock().unwrap() = Some(enc);
             }
@@ -1142,8 +2144,8 @@ pub(crate) fn encode_layer(
         let mut st = [0f64; 5];
         let mut own: Option<wgpu_bufs::Bufs> = None;
         let enc = match (engine, main_bufs) {
-            (Engine::Gpu(c), Some(b)) => encode_expert_gpu(c, b, hidden, is, &lr.x, &cal, &w, ec, None, &mut st)?,
-            _ => encode_expert(engine, &mut own, hidden, is, &lr.x, &cal, &w, ec, None, &mut st)?,
+            (Engine::Gpu(c), Some(b)) => encode_expert_gpu(c, b, hidden, is, &lr.x, &cal, None, &w, ec, None, &mut st)?,
+            _ => encode_expert(engine, &mut own, hidden, is, &lr.x, &cal, None, &w, ec, None, &mut st)?,
         };
         out.shared = Some(enc);
         out.t_shared = ts.elapsed().as_secs_f64();
@@ -1170,8 +2172,9 @@ pub(crate) struct Prior<'a> {
 }
 
 /// GPTQ of one expert from its input rows (`rows` index the captured f16
-/// rows `x`, `hidden` wide) on `engine`. Returns the gate, up and down
-/// payloads.
+/// rows `x`, `hidden` wide) on `engine`. `rw`: one route weight per row,
+/// scaling that row's down input (`None`: unweighted). Returns the gate, up
+/// and down payloads.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_expert(
     engine: Engine,
@@ -1180,17 +2183,19 @@ pub(crate) fn encode_expert(
     inter: usize,
     x: &[u16],
     rows: &[u32],
+    rw: Option<&[f32]>,
     w: &ExpertW,
     ec: &EncodeCfg,
     prior: Option<Prior>,
     tim: &mut [f64; 5],
 ) -> anyhow::Result<[Vec<u8>; 3]> {
+    anyhow::ensure!(rw.is_none_or(|v| v.len() == rows.len()), "{} route weights for {} rows", rw.map_or(0, <[f32]>::len), rows.len());
     match engine {
         Engine::Gpu(c) => {
             let b = bufs.get_or_insert_with(|| wgpu_bufs::Bufs::new(c, CHUNK, hidden, inter));
-            encode_expert_gpu(c, b, hidden, inter, x, rows, w, ec, prior, tim)
+            encode_expert_gpu(c, b, hidden, inter, x, rows, rw, w, ec, prior, tim)
         }
-        Engine::Host => encode_expert_host(hidden, inter, x, rows, w, ec, prior, tim),
+        Engine::Host => encode_expert_host(hidden, inter, x, rows, rw, w, ec, prior, tim),
     }
 }
 
@@ -1205,6 +2210,7 @@ fn encode_expert_gpu(
     inter: usize,
     lr: &[u16],
     rows: &[u32],
+    rw: Option<&[f32]>,
     w: &ExpertW,
     ec: &EncodeCfg,
     prior: Option<Prior>,
@@ -1226,9 +2232,12 @@ fn encode_expert_gpu(
         });
     };
     // the down input of the m rows in bufs.x (gate/up in yg/yu) into yd,
-    // times `scale`: the clamped SwiGLU when the model has a limit
-    let act = |m: usize, scale: f32| -> anyhow::Result<()> {
-        let d = if ec.limit > 0.0 {
+    // times `scale` (and, with `per_row`, each row's weight in bufs.rw):
+    // the clamped SwiGLU when the model has a limit
+    let act = |m: usize, scale: f32, per_row: bool| -> anyhow::Result<()> {
+        let d = if per_row {
+            to::swiglu_lim_rows(c, m * inter, &bufs.yg, &bufs.yu, &bufs.yd, &bufs.rw, inter, ec.limit, scale)
+        } else if ec.limit > 0.0 {
             to::swiglu_lim(c, m * inter, &bufs.yg, &bufs.yu, &bufs.yd, ec.limit, scale)
         } else {
             to::elt(c, "swiglu_fwd", m * inter, &bufs.yg, &bufs.yu, Some(&bufs.yd), None, None, None)
@@ -1237,7 +2246,7 @@ fn encode_expert_gpu(
         Ok(())
     };
     let mut xe = vec![0f32; CHUNK.min(rows.len().max(prior.map_or(0, |p| p.rows.len()))) * hidden];
-    for part in rows.chunks(CHUNK) {
+    for (ci, part) in rows.chunks(CHUNK).enumerate() {
         let m = part.len();
         let xs = &mut xe[..m * hidden];
         gather(xs, part, 1.0);
@@ -1245,7 +2254,10 @@ fn encode_expert_gpu(
         anyhow::ensure!(gpu::gram_add_dev(hid, &bufs.x, m), "gram");
         tm::plane_linear(c, &pg, &bufs.x, &bufs.act16, &bufs.yg, m, inter, hidden, 1.0).ok_or_else(|| anyhow::anyhow!("gemm"))?;
         tm::plane_linear(c, &pu, &bufs.x, &bufs.act16, &bufs.yu, m, inter, hidden, 1.0).ok_or_else(|| anyhow::anyhow!("gemm"))?;
-        act(m, 1.0)?;
+        if let Some(rw) = rw {
+            to::write(c, &bufs.rw, &rw[ci * CHUNK..ci * CHUNK + m]);
+        }
+        act(m, 1.0, rw.is_some())?;
         anyhow::ensure!(gpu::gram_add_dev(did, &bufs.yd, m), "gram");
     }
     if let Some(pr) = prior.filter(|p| !p.rows.is_empty() && p.n0 > 0.0) {
@@ -1271,7 +2283,7 @@ fn encode_expert_gpu(
             to::write(c, &bufs.x, xs);
             tm::plane_linear(c, &pg, &bufs.x, &bufs.act16, &bufs.yg, m, inter, hidden, 1.0).ok_or_else(|| anyhow::anyhow!("gemm"))?;
             tm::plane_linear(c, pub_.as_ref().unwrap_or(&pu), &bufs.x, &bufs.act16, &bufs.yu, m, inter, hidden, 1.0).ok_or_else(|| anyhow::anyhow!("gemm"))?;
-            act(m, if pub_.is_some() { 1.0 } else { b })?;
+            act(m, if pub_.is_some() { 1.0 } else { b }, false)?;
             anyhow::ensure!(gpu::gram_add_dev(did, &bufs.yd, m), "gram");
         }
     }
@@ -1292,13 +2304,12 @@ fn encode_expert_gpu(
             let mut gb = gptq_quantize_q2tp_dev(wg, inter, hidden, fid, &dead, &hdiag, threads).ok_or_else(|| anyhow::anyhow!("q2tp sweep"))?;
             let mut ub = gptq_quantize_q2tp_dev(wu, inter, hidden, fid, &dead, &hdiag, threads).ok_or_else(|| anyhow::anyhow!("q2tp sweep"))?;
             gpu::gptq_fold_free(fid);
-            // debias: H·w for every gate/up row from two GEMMs W·H
+            // debias: H·w for every gate/up row, one device GEMM [W_g; W_u]·H
             let h32: Vec<f32> = hgu.iter().map(|&v| v as f32).collect();
             drop(hgu);
-            let hwg = gemm_rows_square(wg, inter, hidden, &h32, threads);
+            let (hwg, hwu) = debias_products_dev(wg, wu, inter, hidden, &h32);
+            drop(h32);
             q2tp_debias_rows(&mut gb, wg, inter, hidden, &hwg, threads);
-            drop(hwg);
-            let hwu = gemm_rows_square(wu, inter, hidden, &h32, threads);
             q2tp_debias_rows(&mut ub, wu, inter, hidden, &hwu, threads);
             (gb, ub)
         }
@@ -1321,6 +2332,27 @@ fn encode_expert_gpu(
     Ok([gb, ub, db])
 }
 
+/// `W_g·H` and `W_u·H` (`inter × hidden` each, `h32` the `hidden²` gate/up
+/// Hessian) for the q2tp debias, as one device GEMM `[W_g; W_u]·H` in exact
+/// f32 FMA (the NVG encoder's GEMM; never the matrix units, whose operands
+/// are f16/tf32 class) — the product the host path computes with an f32
+/// GEMM too (`gemm_rows_square`), 2·inter·hidden² multiply-adds that cost
+/// the host most of the q2tp gate/up stage.
+pub(crate) fn debias_products_dev(wg: &[f32], wu: &[f32], inter: usize, hidden: usize, h32: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    use cortiq_engine::gpu_wgpu::nvg_dev::{DMat, gemm};
+    let mut w = Vec::with_capacity(2 * inter * hidden);
+    w.extend_from_slice(&wg[..inter * hidden]);
+    w.extend_from_slice(&wu[..inter * hidden]);
+    let a = DMat::from_f32(2 * inter, hidden, &w);
+    drop(w);
+    let h = DMat::from_f32(hidden, hidden, &h32[..hidden * hidden]);
+    let c = DMat::zeros(2 * inter, hidden);
+    gemm(1.0, &a, false, &h, false, 0.0, &c);
+    let mut hwg = c.to_f32();
+    let hwu = hwg.split_off(inter * hidden);
+    (hwg, hwu)
+}
+
 /// [`encode_expert`] on the host: f64 Hessians from f32 chunk grams, the
 /// host fold operator and the host sweeps (the reference the device path
 /// approximates in f32).
@@ -1330,6 +2362,7 @@ fn encode_expert_host(
     inter: usize,
     lr: &[u16],
     rows: &[u32],
+    rw: Option<&[f32]>,
     w: &ExpertW,
     ec: &EncodeCfg,
     prior: Option<Prior>,
@@ -1340,28 +2373,27 @@ fn encode_expert_host(
     let ts = Instant::now();
     let mut hgu = vec![0f64; hidden * hidden];
     let mut hd = vec![0f64; inter * inter];
-    let mut acc = |part: &[u32], sx: f64, sy: f32, gram_x: bool, gram_y: bool| {
+    // `pw`: per-row weights of the down input (route weights)
+    let mut acc = |part: &[u32], pw: Option<&[f32]>, sx: f64, sy: f32| {
         let x = gather_rows(lr, hidden, part, 1.0, threads);
         let m = part.len();
-        if gram_x {
-            gram_add_host(&mut hgu, &x, m, hidden, sx, threads);
+        gram_add_host(&mut hgu, &x, m, hidden, sx, threads);
+        let mut y = swiglu_rows(&x, m, hidden, &w.g, &w.u, inter, ec.limit, threads);
+        match pw {
+            Some(pw) => y.chunks_exact_mut(inter).zip(pw).for_each(|(row, &wr)| row.iter_mut().for_each(|v| *v *= wr * sy)),
+            None if sy != 1.0 => y.iter_mut().for_each(|v| *v *= sy),
+            None => {}
         }
-        if gram_y {
-            let mut y = swiglu_rows(&x, m, hidden, &w.g, &w.u, inter, ec.limit, threads);
-            if sy != 1.0 {
-                y.iter_mut().for_each(|v| *v *= sy);
-            }
-            gram_add_host(&mut hd, &y, m, inter, 1.0, threads);
-        }
+        gram_add_host(&mut hd, &y, m, inter, 1.0, threads);
     };
-    for part in rows.chunks(HCHUNK) {
-        acc(part, 1.0, 1.0, true, true);
+    for (ci, part) in rows.chunks(HCHUNK).enumerate() {
+        acc(part, rw.map(|v| &v[ci * HCHUNK..ci * HCHUNK + part.len()]), 1.0, 1.0);
     }
     if let Some(pr) = prior.filter(|p| !p.rows.is_empty() && p.n0 > 0.0) {
         let s = pr.rows.len() as f64;
         let (a2, b) = (pr.n0 / s, (pr.n0_down / s).sqrt() as f32);
         for part in pr.rows.chunks(HCHUNK) {
-            acc(part, a2, b, true, true);
+            acc(part, None, a2, b);
         }
     }
     tim[0] += ts.elapsed().as_secs_f64();
@@ -1519,6 +2551,8 @@ pub(crate) mod wgpu_bufs {
         pub yg: cortiq_engine::wgpu::Buffer,
         pub yu: cortiq_engine::wgpu::Buffer,
         pub yd: cortiq_engine::wgpu::Buffer,
+        /// One route weight per row.
+        pub rw: cortiq_engine::wgpu::Buffer,
     }
     impl Bufs {
         pub fn new(c: &cortiq_engine::gpu_wgpu::Ctx, rows: usize, hidden: usize, inter: usize) -> Self {
@@ -1529,6 +2563,7 @@ pub(crate) mod wgpu_bufs {
                 yg: to::zeros(c, rows * inter),
                 yu: to::zeros(c, rows * inter),
                 yd: to::zeros(c, rows * inter),
+                rw: to::zeros(c, rows),
             }
         }
     }
@@ -1731,7 +2766,7 @@ mod tests {
         let (hidden, ne, top_k, n) = (8usize, 12usize, 3usize, 50usize);
         let mut rng = Rng(5);
         let r: Vec<f32> = (0..n * (hidden + ne)).map(|_| rng.normal()).collect();
-        let mut out = LayerRows { x: Vec::new(), picks: Vec::new() };
+        let mut out = LayerRows { x: Vec::new(), picks: Vec::new(), w: Vec::new() };
         qwen4_layer_rows(&r, hidden, ne, top_k, &mut out);
         assert_eq!((out.x.len(), out.picks.len()), (n * hidden, n * top_k));
         for t in 0..n {
@@ -1746,6 +2781,286 @@ mod tests {
             got.sort_unstable();
             assert_eq!(got, want, "token {t}");
         }
+    }
+
+    /// Settings read from the header: V4.1 top-k and SwiGLU limit from the
+    /// runtime config, the FP8 block from the preserved quantization config;
+    /// Flash-Next's top-k from its `moe` block.
+    #[test]
+    fn header_derived_settings() {
+        let arch = |moe: Option<serde_json::Value>| -> cortiq_core::types::ModelArch {
+            let mut v = serde_json::json!({
+                "arch_name": "deepseek_v41", "hidden_size": 64, "intermediate_size": 32, "num_layers": 2,
+                "num_attention_heads": 1, "num_kv_heads": 1, "head_dim": 32, "vocab_size": 16,
+                "layer_types": ["FullAttention", "FullAttention"], "rms_norm_eps": 1e-6, "max_position_embeddings": 64,
+                "linear_conv_kernel_dim": 0, "linear_num_key_heads": 0, "linear_num_value_heads": 0,
+            });
+            if let Some(m) = moe {
+                v["moe"] = m;
+            }
+            serde_json::from_value(v).unwrap()
+        };
+        let a = arch(None);
+        let src = |limit: f64, block: Option<serde_json::Value>| {
+            let mut v = serde_json::json!({"text_config": {"hidden_size": 64, "num_hidden_layers": 2, "num_experts_per_tok": 6, "n_routed_experts": 384, "swiglu_limit": limit, "scoring_func": "sqrtsoftplus"}});
+            if let Some(b) = block {
+                v["quantization_config"] = serde_json::json!({"weight_block_size": b});
+            }
+            v
+        };
+        let settings = |s: &serde_json::Value| dsv41_settings(&cortiq_engine::dsv41::Dsv41Cfg::from_source(s, &a).unwrap().0, Some(s));
+        assert_eq!(settings(&src(10.0, Some(serde_json::json!([128, 128])))), (6, 10.0, 128));
+        assert_eq!(settings(&src(7.5, None)), (6, 7.5, 32), "no quantization_config: 32×32 tiles");
+        assert_eq!(settings(&src(-1.0, Some(serde_json::json!([32, 32])))), (6, 0.0, 32), "a negative limit is none");
+        assert_eq!(qwen4_top_k(&a), 10, "no moe block");
+        let m = serde_json::json!({"num_experts": 512, "top_k": 8, "moe_intermediate_size": 128, "routed_scaling_factor": 1.0});
+        assert_eq!(qwen4_top_k(&arch(Some(m))), 8);
+    }
+
+    /// The pass plan: `per` layers a pass, one pass in place.
+    #[test]
+    fn passes_cover_the_range() {
+        assert_eq!(plan_passes(0, 40, 24, false), vec![(0, 24), (24, 40)]);
+        assert_eq!(plan_passes(0, 40, 40, false), vec![(0, 40)]);
+        assert_eq!(plan_passes(20, 22, 24, false), vec![(20, 22)]);
+        assert_eq!(plan_passes(0, 40, 24, true), vec![(0, 40)]);
+        assert_eq!(plan_passes(3, 10, 0, false).len(), 7, "per 0 means one layer a pass");
+    }
+
+    /// A saved capture loads back bit for bit; a directory holding the
+    /// capture of another run (other tokens, other geometry) is refused,
+    /// and no temporary file is left behind.
+    #[test]
+    fn capture_dir_round_trip_and_refusal() {
+        let dir = std::env::temp_dir().join(format!("cortiq-moe-capture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut rng = Rng(41);
+        let windows: Vec<Vec<u32>> = (0..3).map(|k| (0..20u32).map(|i| i * 7 + k).collect()).collect();
+        let (hidden, top_k, ne) = (16usize, 2usize, 5usize);
+        let ntok = 60;
+        let want = CaptureMeta {
+            token_hash: token_hash(&windows),
+            ntok,
+            window: 20,
+            windows: 3,
+            hidden,
+            top_k,
+            ne,
+            family: "Dsv41".into(),
+            calib_model: "/pod/calib.cmf".into(),
+            calib_size: 123,
+            has_w: true,
+            env: [("CMF_DSV41_PROF".to_string(), "1".to_string())].into_iter().collect(),
+            version: "0.8.23".into(),
+            binary: "/pod/cortiq (1 B, mtime 1)".into(),
+            layers: Vec::new(),
+        };
+        let (mut meta, despite) = capture_open(&dir, &want, false).unwrap();
+        assert!(meta.layers.is_empty() && despite.is_empty());
+        let mk = |rng: &mut Rng| LayerRows {
+            x: (0..ntok * hidden).map(|_| f32_to_f16(rng.normal())).collect(),
+            picks: (0..ntok * top_k).map(|_| (rng.next() % ne as u64) as u16).collect(),
+            w: (0..ntok * top_k).map(|_| rng.uni()).collect(),
+        };
+        let rows = [mk(&mut rng), mk(&mut rng)];
+        for (k, li) in [3usize, 4].into_iter().enumerate() {
+            capture_save_layer(&dir, &meta, li, &rows[k]).unwrap();
+            meta.layers.push(li);
+        }
+        capture_save_meta(&dir, &meta).unwrap();
+        assert_eq!(meta.layer_bytes(), (ntok * (hidden * 2 + top_k * 6)) as u64);
+        assert_eq!(std::fs::metadata(dir.join("L3.x")).unwrap().len(), (ntok * hidden * 2) as u64);
+        assert!(std::fs::read_dir(&dir).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+        // the meta records the forward settings, version and binary
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json")).unwrap()).unwrap();
+        assert_eq!((v["env"]["CMF_DSV41_PROF"].as_str(), v["cortiq_version"].as_str()), (Some("1"), Some("0.8.23")));
+        // the same run loads it; another binary is a note, and so is a
+        // setting that does not change the forward
+        let (again, despite) = capture_open(&dir, &CaptureMeta { binary: "/elsewhere/cortiq (2 B, mtime 2)".into(), env: Default::default(), ..want.clone() }, false).unwrap();
+        assert_eq!((again.layers.clone(), despite.len()), (vec![3, 4], 0));
+        assert_eq!(again.provenance()["token_hash"], serde_json::json!(want.token_hash));
+        // the same tokens from another calibration file, by another version
+        // or with another forward setting: refused unless forced
+        let o_fp8 = CaptureMeta { env: [("CMF_DSV41_O_FP8".to_string(), "1".to_string())].into_iter().collect(), ..want.clone() };
+        for (other, what) in [
+            (CaptureMeta { calib_model: "/elsewhere.cmf".into(), ..want.clone() }, "calibration file /pod/calib.cmf (123 B) saved, /elsewhere.cmf (123 B) now"),
+            (CaptureMeta { calib_size: 124, ..want.clone() }, "calibration file"),
+            (CaptureMeta { version: "0.8.24".into(), ..want.clone() }, "cortiq \"0.8.23\" saved, \"0.8.24\" now"),
+            (o_fp8, "CMF_DSV41_O_FP8 unset saved, \"1\" now"),
+        ] {
+            let e = capture_open(&dir, &other, false).unwrap_err().to_string();
+            assert!(e.contains(what) && e.contains("CMF_MOE_CAPTURE_FORCE=1"), "{e}");
+            let (forced, despite) = capture_open(&dir, &other, true).unwrap();
+            assert_eq!((forced.layers, despite.len()), (vec![3, 4], 1));
+        }
+        for (k, li) in [3usize, 4].into_iter().enumerate() {
+            let got = capture_load_layer(&dir, &again, li).unwrap();
+            assert_eq!((got.x, got.picks), (rows[k].x.clone(), rows[k].picks.clone()), "layer {li}");
+            assert_eq!(got.w.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), rows[k].w.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        }
+        assert!(capture_load_layer(&dir, &again, 5).is_err(), "a layer not saved");
+        // another run is refused
+        let mut other = windows.clone();
+        other[1][5] += 1;
+        // (CMF_MOE_CAPTURE_FORCE does not cover other tokens or geometry)
+        let e = capture_open(&dir, &CaptureMeta { token_hash: token_hash(&other), ..want.clone() }, true).unwrap_err().to_string();
+        assert!(e.contains("calibration tokens differ"), "{e}");
+        let e = capture_open(&dir, &CaptureMeta { hidden: 32, ..want.clone() }, true).unwrap_err().to_string();
+        assert!(e.contains("hidden 16 saved, 32 now"), "{e}");
+        let e = capture_open(&dir, &CaptureMeta { top_k: 3, ne: 6, ..want.clone() }, false).unwrap_err().to_string();
+        assert!(e.contains("top_k") && e.contains("experts"), "{e}");
+        // a failed write leaves neither the file nor its .tmp
+        assert!(write_atomic(&dir.join("L9.x"), |_| Err(std::io::Error::other("disk full"))).is_err());
+        assert!(!dir.join("L9.x").exists() && !dir.join("L9.x.tmp").exists());
+        // the files of a layer that failed part way are removed
+        capture_save_layer(&dir, &meta, 9, &rows[0]).unwrap();
+        capture_remove_layer(&dir, 9);
+        assert!(["x", "picks", "w"].iter().all(|e| !dir.join(format!("L9.{e}")).exists()));
+        // a truncated layer file is an error, not short rows
+        std::fs::write(dir.join("L4.picks"), [0u8; 10]).unwrap();
+        assert!(capture_load_layer(&dir, &again, 4).is_err());
+        // a window split differently is another run, even with the same ids
+        let flat: Vec<u32> = windows.concat();
+        assert_ne!(token_hash(&[flat]), token_hash(&windows));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A shard download is retried until it succeeds, and gives up with
+    /// the last error once the next pause would end past the time budget
+    /// (growing pauses, capped).
+    #[test]
+    fn downloads_are_retried() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        let mut calls = 0;
+        with_retries(Duration::from_secs(60), Duration::ZERO, Duration::ZERO, "shard", || {
+            calls += 1;
+            if calls < 3 { anyhow::bail!("transient {calls}") } else { Ok(()) }
+        })
+        .unwrap();
+        assert_eq!(calls, 3);
+        // pauses 10, 20, 30, 30, … ms within a 100 ms budget: the pauses
+        // after attempts 1..4 end at 10, 30, 60, 90 ms, the one after the
+        // 5th would end at 120 > 100 (4 when the sleeps overshoot)
+        let mut calls = 0;
+        let e = with_retries(ms(100), ms(10), ms(30), "shard", || {
+            calls += 1;
+            anyhow::bail!("down {calls}")
+        })
+        .unwrap_err();
+        assert!((4..=5).contains(&calls), "{calls} attempts");
+        assert!(format!("{e:#}").contains(&format!("down {calls}")) && format!("{e:#}").contains("CMF_MOE_FETCH_WAIT"), "{e:#}");
+        // a zero budget: one attempt
+        let mut calls = 0;
+        assert!(with_retries(Duration::ZERO, ms(10), ms(10), "shard", || {
+            calls += 1;
+            anyhow::bail!("down")
+        })
+        .is_err());
+        assert_eq!(calls, 1);
+    }
+
+    /// Calibration windows: plain chunks without a BOS (Flash-Next, as
+    /// before); with one, every window starts with it at `window` tokens.
+    #[test]
+    fn calib_windows_start_with_bos() {
+        let ids: Vec<u32> = (1..=100).collect();
+        let plain = calib_windows(&ids, 32, None);
+        assert_eq!(plain, ids.chunks(32).take(3).map(<[u32]>::to_vec).collect::<Vec<_>>(), "the 4-token tail is dropped");
+        let w = calib_windows(&ids, 32, Some(0));
+        assert_eq!(w.len(), 3, "the 7-token tail (8 with BOS) is dropped");
+        for (k, win) in w.iter().enumerate() {
+            assert_eq!(win.len(), 32);
+            assert_eq!(win[0], 0);
+            assert_eq!(&win[1..], &ids[k * 31..(k + 1) * 31]);
+        }
+        // a chunk that already starts with BOS gets no second one
+        let w = calib_windows(&[7u32; 40], 20, Some(7));
+        assert!(w.iter().all(|x| x[0] == 7 && x.len() == 19));
+    }
+
+    /// The V4.1 prior defaults to one hidden width while the mean expert
+    /// sees fewer rows than that; CMF_MOE_PRIOR always wins; Flash-Next keeps
+    /// no default.
+    #[test]
+    fn production_prior_defaults() {
+        let (n0, why) = production_prior(Family::Dsv41, None, 32768, 6, 384, 5120);
+        assert_eq!(n0, 5120.0, "{why}");
+        assert!(why.contains("512 routed rows"), "{why}");
+        assert_eq!(production_prior(Family::Dsv41, None, 400_000, 6, 384, 5120).0, 0.0, "enough rows: no default");
+        assert_eq!(production_prior(Family::Dsv41, Some(2560.0), 32768, 6, 384, 5120).0, 2560.0);
+        assert_eq!(production_prior(Family::Dsv41, Some(0.0), 32768, 6, 384, 5120).0, 0.0, "CMF_MOE_PRIOR=0 turns it off");
+        assert_eq!(production_prior(Family::Qwen4, None, 32768, 10, 512, 2560).0, 0.0, "Flash-Next unchanged");
+    }
+
+    /// `--output` / `--patch-shared` naming the calibration file are caught
+    /// through a symlink and a hard link too; another file, or one that does
+    /// not exist yet, is not the same file.
+    #[test]
+    fn output_naming_the_calibration_file_is_caught() {
+        let dir = std::env::temp_dir().join(format!("cortiq-moe-same-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calib = dir.join("calib.cmf");
+        std::fs::write(&calib, b"calibration").unwrap();
+        std::fs::write(dir.join("other.cmf"), b"calibration").unwrap();
+        assert!(same_file(&calib, &calib));
+        assert!(same_file(&dir.join(".").join("calib.cmf"), &calib));
+        assert!(!same_file(&dir.join("other.cmf"), &calib));
+        assert!(!same_file(&dir.join("new.cmf"), &calib));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&calib, dir.join("link.cmf")).unwrap();
+            std::fs::hard_link(&calib, dir.join("hard.cmf")).unwrap();
+            assert!(same_file(&dir.join("link.cmf"), &calib));
+            assert!(same_file(&dir.join("hard.cmf"), &calib));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The free-space check: what fits passes, a shortfall stops the run
+    /// (unless allowed), needs on one filesystem add up, a file about to be
+    /// truncated counts as free, and a path that does not exist yet is
+    /// measured on its nearest existing ancestor.
+    #[test]
+    #[cfg(unix)]
+    fn free_space_check_refuses_what_does_not_fit() {
+        let dir = std::env::temp_dir().join(format!("cortiq-moe-space-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (_, avail) = fs_space(&dir.join("not/yet/out.cmf")).expect("statvfs");
+        assert!(avail > 0);
+        let need = |b: u64| (dir.join("out.cmf"), "--output".to_string(), b);
+        check_free_space(&[need(1 << 20)], &[], false).unwrap();
+        let e = check_free_space(&[need(avail + (1 << 40))], &[], false).unwrap_err().to_string();
+        assert!(e.contains("not enough free disk space") && e.contains("CMF_MOE_NO_SPACE_CHECK=1"), "{e}");
+        check_free_space(&[need(avail + (1 << 40))], &[], true).unwrap();
+        // two needs on one filesystem are summed
+        let half = avail / 2 + (1 << 30);
+        assert!(check_free_space(&[need(half), (dir.join("cap"), "capture".into(), half)], &[], false).is_err());
+        // an old output that the run truncates first is space it can use
+        let old = dir.join("old.cmf");
+        std::fs::write(&old, vec![1u8; 1 << 22]).unwrap();
+        assert!(sole_file_bytes(&old) >= 1 << 22);
+        assert_eq!(sole_file_bytes(&dir.join("missing.cmf")), 0);
+        std::fs::hard_link(&old, dir.join("old-link.cmf")).unwrap();
+        assert_eq!(sole_file_bytes(&old), 0, "another name keeps the blocks");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The hole-punching probe answers without leaving its file behind:
+    /// unsupported off Linux, and on Linux whatever the temp filesystem does.
+    #[test]
+    fn hole_punch_probe_cleans_up() {
+        let dir = std::env::temp_dir().join(format!("cortiq-moe-punch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = probe_hole_punching(&dir);
+        eprintln!("hole punching in {}: {r:?}", dir.display());
+        if cfg!(not(target_os = "linux")) {
+            assert!(r.is_err());
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "the probe file is removed");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The FP4 and FP8 source tensors decode bit for bit to the weights
@@ -1857,28 +3172,250 @@ mod tests {
         for codec in [Codec::Q4tp, Codec::Q2tp] {
             let ec = EncodeCfg { codec, limit, lambda: 0.01, threads: 3 };
             let rtn = err(&rtn_expert(codec, &w, inter, hidden), codec);
-            let gptq = err(&encode_expert(Engine::Host, &mut None, hidden, inter, &x, &rows, &w, &ec, None, &mut [0.0; 5]).unwrap(), codec);
+            let gptq = err(&encode_expert(Engine::Host, &mut None, hidden, inter, &x, &rows, None, &w, &ec, None, &mut [0.0; 5]).unwrap(), codec);
             let prior = Prior { rows: &sample, n0: hidden as f64, n0_down: hidden as f64 / 4.0 };
-            let gptq_p = err(&encode_expert(Engine::Host, &mut None, hidden, inter, &x, &rows, &w, &ec, Some(prior), &mut [0.0; 5]).unwrap(), codec);
+            let gptq_p = err(&encode_expert(Engine::Host, &mut None, hidden, inter, &x, &rows, None, &w, &ec, Some(prior), &mut [0.0; 5]).unwrap(), codec);
             eprintln!("{codec:?}: held-out relative output error RTN {rtn:.5}, GPTQ {gptq:.5}, GPTQ + prior {gptq_p:.5}");
             assert!(gptq < 0.9 * rtn, "{codec:?}: GPTQ {gptq} not better than RTN {rtn}");
             assert!(gptq_p < rtn, "{codec:?}: GPTQ with the prior {gptq_p} not better than RTN {rtn}");
         }
     }
 
+    /// The down input with DeepSeek's clamp against hand values: the gate
+    /// is clamped from above only (12 → 10, −12 stays), the up branch on both
+    /// sides (−15 → −10, 3 stays); without a limit nothing is clamped.
+    #[test]
+    fn swiglu_rows_clamp_matches_hand_values() {
+        let x = [1.0f32, 0.0, 0.0, 0.0]; // picks the first column of each weight row
+        let wg = [12.0f32, 0.5, 0.5, 0.5, -12.0, 0.5, 0.5, 0.5];
+        let wu = [-15.0f32, 0.5, 0.5, 0.5, 3.0, 0.5, 0.5, 0.5];
+        let silu = |v: f64| v / (1.0 + (-v).exp());
+        let close = |got: &[f32], want: [f64; 2]| {
+            for (g, w) in got.iter().zip(want) {
+                assert!((*g as f64 - w).abs() <= 1e-6 * w.abs(), "{got:?} vs {want:?}");
+            }
+        };
+        close(&swiglu_rows(&x, 1, 4, &wg, &wu, 2, 10.0, 1), [silu(10.0) * -10.0, silu(-12.0) * 3.0]);
+        close(&swiglu_rows(&x, 1, 4, &wg, &wu, 2, 0.0, 1), [silu(12.0) * -15.0, silu(-12.0) * 3.0]);
+    }
+
+    /// An expert routed fewer rows than its input width at hidden 256.
+    struct LowRows {
+        hidden: usize,
+        inter: usize,
+        x: Vec<u16>,
+        xh: Vec<f32>,
+        n_ho: usize,
+        sample: Vec<u32>,
+        w: ExpertW,
+    }
+
+    /// 2048 layer rows (the prior's sample: every 4th) and 256 held-out rows
+    /// of one correlated distribution; the expert's own rows are the first
+    /// rows of the layer.
+    fn low_rows_case() -> LowRows {
+        let mut rng = Rng(47);
+        let (hidden, inter, n_layer, n_ho) = (256, 128, 2048, 256);
+        let x32 = inputs(&mut rng, n_layer + n_ho, hidden);
+        let x: Vec<u16> = x32.iter().map(|&v| f32_to_f16(v)).collect();
+        let xh: Vec<f32> = x[n_layer * hidden..].iter().map(|&h| f16_to_f32(h)).collect();
+        let w = ExpertW { g: weights(&mut rng, inter, hidden, 0.15), u: weights(&mut rng, inter, hidden, 0.15), d: weights(&mut rng, hidden, inter, 0.1) };
+        LowRows { hidden, inter, x, xh, n_ho, sample: (0..n_layer as u32).step_by(4).collect(), w }
+    }
+
+    /// Held-out relative output error of RTN, GPTQ and GPTQ with the prior
+    /// (n0 = hidden) for an expert of `m` rows, on `engine`.
+    fn low_rows_errors(case: &LowRows, engine: Engine, m: usize, codec: Codec, limit: f32) -> (f64, f64, f64) {
+        let LowRows { hidden, inter, ref x, ref xh, n_ho, ref sample, ref w } = *case;
+        let o_fp = expert_out(xh, n_ho, hidden, &w.g, &w.u, &w.d, inter, limit, 2);
+        let err = |enc: &[Vec<u8>; 3]| -> f64 {
+            let [g, u, d] = dequant_expert(enc, inter, hidden, codec);
+            let o = expert_out(xh, n_ho, hidden, &g, &u, &d, inter, limit, 2);
+            o.iter().zip(&o_fp).map(|(&a, &b)| ((a - b) as f64).powi(2)).sum::<f64>() / o_fp.iter().map(|&v| (v as f64).powi(2)).sum::<f64>()
+        };
+        let ec = EncodeCfg { codec, limit, lambda: 0.01, threads: 3 };
+        let rows: Vec<u32> = (0..m as u32).collect();
+        let prior = Prior { rows: sample, n0: hidden as f64, n0_down: hidden as f64 / 4.0 };
+        let rtn = err(&rtn_expert(codec, w, inter, hidden));
+        let gptq = err(&encode_expert(engine, &mut None, hidden, inter, x, &rows, None, w, &ec, None, &mut [0.0; 5]).unwrap());
+        let gptq_p = err(&encode_expert(engine, &mut None, hidden, inter, x, &rows, None, w, &ec, Some(prior), &mut [0.0; 5]).unwrap());
+        (rtn, gptq, gptq_p)
+    }
+
+    /// Experts routed 48, 128 or 192 rows at hidden 256 have rank-deficient
+    /// Hessians of their own (most V4.1 experts at 32k–65k calibration
+    /// tokens: 512–1024 rows for 5120 inputs). With the layer prior GPTQ
+    /// still beats rounding on held-out rows, in both layouts; plain GPTQ
+    /// is reported, not required to win.
+    #[test]
+    fn prior_carries_experts_with_fewer_rows_than_hidden() {
+        let _env = env_guard("4", "1");
+        let case = low_rows_case();
+        for m in [48, 128, 192] {
+            for codec in [Codec::Q4tp, Codec::Q2tp] {
+                let (rtn, gptq, gptq_p) = low_rows_errors(&case, Engine::Host, m, codec, 1.0);
+                eprintln!("{m} rows, {codec:?}: held-out relative output error RTN {rtn:.5}, GPTQ {gptq:.5}, GPTQ + prior {gptq_p:.5}");
+                assert!(gptq_p < rtn, "{m} rows {codec:?}: GPTQ with the prior {gptq_p} not better than RTN {rtn}");
+            }
+        }
+    }
+
+    /// Route weights that follow the input (as the router's do): rows of
+    /// one input cluster weigh 1, rows of a louder second cluster 0.05. On
+    /// held-out rows, in the error the MoE output sees (each row weighted by
+    /// w²), the route-weighted down Hessian beats the unweighted one; both
+    /// beat rounding. The gate/up Hessians are the same in both encodes.
+    #[test]
+    fn route_weighted_down_hessian_tracks_weighted_error() {
+        let _env = env_guard("4", "1");
+        let mut rng = Rng(37);
+        let (hidden, inter, n_half, n_ho_half) = (128, 64, 512, 128);
+        let xa = inputs(&mut rng, n_half + n_ho_half, hidden);
+        let xb: Vec<f32> = inputs(&mut rng, n_half + n_ho_half, hidden).iter().map(|v| v * 4.0).collect();
+        // calibration: a then b; held out: a then b
+        let mut x32 = Vec::new();
+        x32.extend_from_slice(&xa[..n_half * hidden]);
+        x32.extend_from_slice(&xb[..n_half * hidden]);
+        x32.extend_from_slice(&xa[n_half * hidden..]);
+        x32.extend_from_slice(&xb[n_half * hidden..]);
+        let x: Vec<u16> = x32.iter().map(|&v| f32_to_f16(v)).collect();
+        let n_cal = 2 * n_half;
+        let n_ho = 2 * n_ho_half;
+        let xh: Vec<f32> = x[n_cal * hidden..].iter().map(|&h| f16_to_f32(h)).collect();
+        let wt = |t: usize, half: usize| if t < half { 1.0f32 } else { 0.05 };
+        let rw: Vec<f32> = (0..n_cal).map(|t| wt(t, n_half)).collect();
+        let w_ho: Vec<f32> = (0..n_ho).map(|t| wt(t, n_ho_half)).collect();
+        let w = ExpertW { g: weights(&mut rng, inter, hidden, 0.15), u: weights(&mut rng, inter, hidden, 0.15), d: weights(&mut rng, hidden, inter, 0.1) };
+        let limit = 1.0;
+        let o_fp = expert_out(&xh, n_ho, hidden, &w.g, &w.u, &w.d, inter, limit, 2);
+        let (_, base_w) = row_err(&o_fp, &vec![0f32; o_fp.len()], hidden, &w_ho);
+        // (full expert error, error of the down projection alone: exact gate/up)
+        let err_w = |enc: &[Vec<u8>; 3], codec: Codec| -> (f64, f64) {
+            let [g, u, d] = dequant_expert(enc, inter, hidden, codec);
+            let o = expert_out(&xh, n_ho, hidden, &g, &u, &d, inter, limit, 2);
+            let od = expert_out(&xh, n_ho, hidden, &w.g, &w.u, &d, inter, limit, 2);
+            (row_err(&o, &o_fp, hidden, &w_ho).1 / base_w, row_err(&od, &o_fp, hidden, &w_ho).1 / base_w)
+        };
+        let rows: Vec<u32> = (0..n_cal as u32).collect();
+        for codec in [Codec::Q4tp, Codec::Q2tp] {
+            let ec = EncodeCfg { codec, limit, lambda: 0.01, threads: 3 };
+            let rtn = err_w(&rtn_expert(codec, &w, inter, hidden), codec);
+            let plain = err_w(&encode_expert(Engine::Host, &mut None, hidden, inter, &x, &rows, None, &w, &ec, None, &mut [0.0; 5]).unwrap(), codec);
+            let weighted = err_w(&encode_expert(Engine::Host, &mut None, hidden, inter, &x, &rows, Some(&rw), &w, &ec, None, &mut [0.0; 5]).unwrap(), codec);
+            eprintln!(
+                "{codec:?}: route-weighted held-out error, expert (down alone): RTN {:.5} ({:.5}), GPTQ unweighted {:.5} ({:.5}), GPTQ route-weighted {:.5} ({:.5})",
+                rtn.0, rtn.1, plain.0, plain.1, weighted.0, weighted.1
+            );
+            assert!(plain.0 < rtn.0 && weighted.0 < rtn.0, "{codec:?}: GPTQ not better than RTN: {rtn:?} {plain:?} {weighted:?}");
+            assert!(weighted.1 < 0.95 * plain.1, "{codec:?}: the route-weighted down Hessian does not cut the weighted down error: {plain:?} vs {weighted:?}");
+        }
+        // the per-row weights must match the rows
+        let ec = EncodeCfg { codec: Codec::Q4tp, limit, lambda: 0.01, threads: 3 };
+        assert!(encode_expert(Engine::Host, &mut None, hidden, inter, &x, &rows, Some(&rw[1..]), &w, &ec, None, &mut [0.0; 5]).is_err());
+    }
+
+    /// The q2tp debias product `[W_g; W_u]·H` on the device against the
+    /// host's f32 GEMM, at the V4.1 expert geometry (2304 × 5120, a Hessian
+    /// of 512 correlated rows plus damping): relative error of the product,
+    /// how many debiased q2tp rows come out different, and the speed of
+    /// both. Opt-in (`CMF_MOE_GPU_TEST=1`; on macOS also `CMF_GPU=wgpu`);
+    /// needs a wgpu device but not the matrix units, so it runs on the M4.
+    #[test]
+    fn gpu_debias_product_matches_host() {
+        if std::env::var("CMF_MOE_GPU_TEST").ok().as_deref() != Some("1") {
+            eprintln!("CMF_MOE_GPU_TEST unset — skipped");
+            return;
+        }
+        assert!(to::dev().is_some(), "CMF_MOE_GPU_TEST=1 but no wgpu device (on macOS set CMF_GPU=wgpu)");
+        let (inter, hidden, n) = (2304usize, 5120usize, 512usize);
+        let threads = std::thread::available_parallelism().map_or(4, |v| v.get());
+        let mut rng = Rng(43);
+        let wg = weights(&mut rng, inter, hidden, 0.02);
+        let wu = weights(&mut rng, inter, hidden, 0.02);
+        let rank = 64;
+        let basis: Vec<f32> = (0..rank * hidden).map(|_| rng.normal()).collect();
+        let z: Vec<f32> = (0..n * rank).map(|_| rng.normal()).collect();
+        let mut x = gemm_nt(&z, n, rank, &transpose(&basis, rank, hidden), hidden, threads);
+        x.iter_mut().for_each(|v| *v += 0.1 * rng.normal());
+        let mut h = vec![0f64; hidden * hidden];
+        gram_add_host(&mut h, &x, n, hidden, 1.0, threads);
+        let mean_d = (0..hidden).map(|i| h[i * hidden + i]).sum::<f64>() / hidden as f64;
+        for i in 0..hidden {
+            h[i * hidden + i] += 0.01 * mean_d;
+        }
+        let h32: Vec<f32> = h.iter().map(|&v| v as f32).collect();
+        let flop = 2.0 * 2.0 * inter as f64 * hidden as f64 * hidden as f64;
+        let _ = debias_products_dev(&wg[..32 * hidden], &wu[..32 * hidden], 32, hidden, &h32); // warm the pipeline
+        let t = Instant::now();
+        let (dg, du) = debias_products_dev(&wg, &wu, inter, hidden, &h32);
+        let t_dev = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let hg = crate::gptq::gemm_rows_square(&wg, inter, hidden, &h32, threads);
+        let hu = crate::gptq::gemm_rows_square(&wu, inter, hidden, &h32, threads);
+        let t_host = t.elapsed().as_secs_f64();
+        eprintln!(
+            "[W_g; W_u]·H ({inter}×{hidden}·{hidden}²): device {t_dev:.3}s = {:.0} GFLOP/s, host f32 GEMM on {threads} threads {t_host:.3}s = {:.0} GFLOP/s",
+            flop / t_dev / 1e9,
+            flop / t_host / 1e9
+        );
+        let rel = |a: &[f32], b: &[f32]| -> f64 {
+            let num: f64 = a.iter().zip(b).map(|(&x, &y)| ((x - y) as f64).powi(2)).sum();
+            (num / b.iter().map(|&y| (y as f64).powi(2)).sum::<f64>()).sqrt()
+        };
+        let (eg, eu) = (rel(&dg, &hg), rel(&du, &hu));
+        // both against f64 on sampled entries (on the M4 the device kernel's
+        // in-order FMA chain can match Accelerate's AMX bit for bit)
+        let mut worst = 0f64;
+        for _ in 0..64 {
+            let (r, c) = ((rng.next() % inter as u64) as usize, (rng.next() % hidden as u64) as usize);
+            let want: f64 = (0..hidden).map(|k| wg[r * hidden + k] as f64 * h32[k * hidden + c] as f64).sum();
+            let scale: f64 = (0..hidden).map(|k| (wg[r * hidden + k] as f64 * h32[k * hidden + c] as f64).abs()).sum();
+            worst = worst.max((dg[r * hidden + c] as f64 - want).abs() / scale.max(1e-30));
+        }
+        eprintln!("device product against f64 on 64 sampled entries: worst error {worst:.2e} of Σ|terms|");
+        assert!(worst < 1e-5, "device product off against f64: {worst:e}");
+        assert!(dg.iter().any(|&v| v != 0.0));
+        // the debias reads H·w only through two dot products per row (its
+        // f16 row parameters): count the rows the device product changes
+        let mut changed = 0usize;
+        for (w, d, hh) in [(&wg, &dg, &hg), (&wu, &du, &hu)] {
+            let base = quantize_2d(Quant::Q2TiledP, w, inter, hidden).1;
+            let (mut a, mut b) = (base.clone(), base);
+            q2tp_debias_rows(&mut a, w, inter, hidden, d, threads);
+            q2tp_debias_rows(&mut b, w, inter, hidden, hh, threads);
+            let (po, _, _) = cortiq_core::quant::q2tp_sections(inter, hidden);
+            assert_eq!(a[..po], b[..po], "the debias touches only the row parameters");
+            changed += (0..inter).filter(|&r| a[po + r * 4..po + r * 4 + 4] != b[po + r * 4..po + r * 4 + 4]).count();
+        }
+        eprintln!("device vs host product: relative error gate {eg:.2e}, up {eu:.2e}; debiased q2tp rows that differ: {changed} of {}", 2 * inter);
+        assert!(eg < 1e-5 && eu < 1e-5, "device product off: {eg:e} / {eu:e}");
+        assert!(changed * 100 <= 2 * inter, "{changed} of {} debiased rows differ", 2 * inter);
+    }
+
+    /// Row-major transpose of a `rows × cols` matrix.
+    fn transpose(a: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+        let mut t = vec![0f32; rows * cols];
+        for r in 0..rows {
+            for c in 0..cols {
+                t[c * rows + r] = a[r * cols + c];
+            }
+        }
+        t
+    }
+
     /// The device encode against the host reference (the lead runs it on a
     /// GPU stand: `CMF_MOE_GPU_TEST=1`; device folds and sweeps are f32, so
-    /// the comparison is by held-out error, not bytes).
+    /// the comparison is by held-out error, not bytes). The device encode
+    /// needs the matrix units (cooperative matrices): without them, or
+    /// without a device, the opted-in test fails instead of passing green.
     #[test]
     fn gpu_encode_tracks_the_host_reference() {
         if std::env::var("CMF_MOE_GPU_TEST").ok().as_deref() != Some("1") {
             eprintln!("CMF_MOE_GPU_TEST unset — skipped");
             return;
         }
-        let Some(c) = to::dev() else {
-            eprintln!("no wgpu device — skipped");
-            return;
-        };
+        let c = to::dev().expect("CMF_MOE_GPU_TEST=1 but no wgpu device (on macOS set CMF_GPU=wgpu)");
+        assert!(tm::matrix_units(), "CMF_MOE_GPU_TEST=1 but the wgpu device has no matrix units (cooperative matrices): the device encode cannot run here");
         let _env = env_guard("4", "1");
         let mut rng = Rng(29);
         let (hidden, inter, n_cal, n_ho) = (256, 128, 2048, 256);
@@ -1898,11 +3435,28 @@ mod tests {
             for codec in [Codec::Q4tp, Codec::Q2tp] {
                 let ec = EncodeCfg { codec, limit, lambda: 0.01, threads: 4 };
                 let prior = Some(Prior { rows: &sample, n0: hidden as f64, n0_down: hidden as f64 / 4.0 });
-                let host = err(&encode_expert(Engine::Host, &mut None, hidden, inter, &x, &rows, &w, &ec, prior, &mut [0.0; 5]).unwrap(), codec);
-                let dev = err(&encode_expert(Engine::Gpu(c), &mut None, hidden, inter, &x, &rows, &w, &ec, prior, &mut [0.0; 5]).unwrap(), codec);
+                let host = err(&encode_expert(Engine::Host, &mut None, hidden, inter, &x, &rows, None, &w, &ec, prior, &mut [0.0; 5]).unwrap(), codec);
+                let dev = err(&encode_expert(Engine::Gpu(c), &mut None, hidden, inter, &x, &rows, None, &w, &ec, prior, &mut [0.0; 5]).unwrap(), codec);
                 let rtn = err(&rtn_expert(codec, &w, inter, hidden), codec);
                 eprintln!("limit {limit} {codec:?}: RTN {rtn:.5} host {host:.5} device {dev:.5}");
                 assert!(dev < rtn && (dev - host).abs() < 0.05 * host + 1e-6, "limit {limit} {codec:?}: device {dev} vs host {host} (RTN {rtn})");
+                // route-weighted down Hessian (per-row weights on the device)
+                let rw: Vec<f32> = (0..n_cal).map(|t| 0.05 + (t % 7) as f32 * 0.2).collect();
+                let host = err(&encode_expert(Engine::Host, &mut None, hidden, inter, &x, &rows, Some(&rw), &w, &ec, prior, &mut [0.0; 5]).unwrap(), codec);
+                let dev = err(&encode_expert(Engine::Gpu(c), &mut None, hidden, inter, &x, &rows, Some(&rw), &w, &ec, prior, &mut [0.0; 5]).unwrap(), codec);
+                eprintln!("limit {limit} {codec:?} route-weighted: host {host:.5} device {dev:.5}");
+                assert!(dev < rtn && (dev - host).abs() < 0.05 * host + 1e-6, "limit {limit} {codec:?} route-weighted: device {dev} vs host {host} (RTN {rtn})");
+            }
+        }
+        // experts with fewer rows than hidden: the prior carries the device
+        // encode as it carries the host's
+        let case = low_rows_case();
+        for m in [48, 128, 192] {
+            for codec in [Codec::Q4tp, Codec::Q2tp] {
+                let (rtn, _, host_p) = low_rows_errors(&case, Engine::Host, m, codec, 1.0);
+                let (_, dev, dev_p) = low_rows_errors(&case, Engine::Gpu(c), m, codec, 1.0);
+                eprintln!("{m} rows, {codec:?}: RTN {rtn:.5}, device GPTQ {dev:.5}, GPTQ + prior host {host_p:.5} device {dev_p:.5}");
+                assert!(dev_p < rtn && (dev_p - host_p).abs() < 0.1 * host_p + 1e-6, "{m} rows {codec:?}: device {dev_p} vs host {host_p} (RTN {rtn})");
             }
         }
     }
@@ -1984,6 +3538,21 @@ mod tests {
             }
         }
         let slots: HashSet<usize> = dirs.iter().flat_map(|(d, s)| d.iter().chain(std::iter::once(s)).flat_map(|&(g, u, dn)| [g, u, dn])).collect();
+        // the slot checks run before any capture: a q4tp file takes either
+        // codec in place, a q2tp file only q2tp; --patch-shared needs the codec
+        // of the patched file
+        let triples = |m: &CmfModel| -> Vec<(usize, usize, usize)> { (0..nl).flat_map(|li| { let (d, s) = dsv41_dirs(m, li, ne).unwrap(); d.into_iter().chain([s]) }).collect() };
+        let shared_of = |m: &CmfModel| -> Vec<(usize, usize, usize)> { (0..nl).map(|li| dsv41_dirs(m, li, ne).unwrap().1).collect() };
+        check_slots(&cm, &triples(&cm), Codec::Q4tp, None).unwrap();
+        check_slots(&cm, &triples(&cm), Codec::Q2tp, None).unwrap();
+        check_slots(&r2, &triples(&r2), Codec::Q2tp, None).unwrap();
+        let e = check_slots(&r2, &triples(&r2), Codec::Q4tp, None).unwrap_err().to_string();
+        assert!(e.contains("a q4tp payload fits only a q4tp slot"), "{e}");
+        check_slots(&cm, &shared_of(&cm), Codec::Q2tp, Some(("ref2", &r2))).unwrap();
+        let e = check_slots(&cm, &shared_of(&cm), Codec::Q4tp, Some(("ref2", &r2))).unwrap_err().to_string();
+        assert!(e.contains("pass --codec q2tp"), "{e}");
+        let e = check_slots(&r2, &shared_of(&r2), Codec::Q2tp, Some(("calib", &cm))).unwrap_err().to_string();
+        assert!(e.contains("pass --codec q4tp"), "{e}");
 
         // synthetic captured rows and routes per layer
         let n = 640;
@@ -2000,7 +3569,9 @@ mod tests {
                         picks.push(ids[k] as u16);
                     }
                 }
-                LayerRows { x, picks }
+                // route weights in (0.05, 1.45]
+                let w: Vec<f32> = (0..n * top_k).map(|_| 0.75 + 0.7 * rng.uni()).collect();
+                LayerRows { x, picks, w }
             })
             .collect();
         // the local source directory, read in place
@@ -2014,7 +3585,7 @@ mod tests {
                 assert_eq!(shards, vec![format!("model-{:05}-of-{:05}.safetensors", li + 1, nl + 1)]);
                 let src = source.open_layer(&shards).unwrap();
                 let get = |part: Part, e: usize| dsv41_expert(&src, li, part, e, hidden, inter, 32);
-                let job = LayerJob { li, hidden, ne, inter, top_k, min_rows: 8, prior_n0: hidden as f64, prior_s: 128, held: &held };
+                let job = LayerJob { li, hidden, ne, inter, top_k, min_rows: 8, prior_n0: hidden as f64, prior_s: 128, held: &held, route_w: RouteW::Off };
                 let out = encode_layer(Engine::Host, &ec, &job, &rows[li], true, true, None, None, &get).unwrap();
                 assert_eq!((out.routed.len(), out.n_gptq + out.n_rtn), (ne, ne));
                 // the GPTQ'd payloads are the encode of this source, not the calibration's bytes
@@ -2047,20 +3618,30 @@ mod tests {
         // the held-out diagnostic (CMF_MOE_DIAG) on the same layer: every 4th
         // block of 80 tokens held out, RTN against GPTQ without and with the
         // prior, per row-count bin; GPTQ is never worse than rounding
+        // with CMF_MOE_ROUTE_W=diag each prior runs with the unweighted and
+        // the route-weighted down Hessian, and the error is also reported
+        // weighted by w² (what the MoE output sees)
         let held_d: Vec<bool> = (0..n).map(|t| (t / 80) % 4 == 3).collect();
-        for codec in [Codec::Q4tp, Codec::Q2tp] {
+        for (codec, route_w) in [(Codec::Q4tp, RouteW::Off), (Codec::Q2tp, RouteW::Off), (Codec::Q4tp, RouteW::Diag), (Codec::Q2tp, RouteW::Diag)] {
             let ec = EncodeCfg { codec, limit: 10.0, lambda: 0.01, threads: 2 };
             let names = dsv41_src_names(&source, 0, ne, true);
             let src = source.open_layer(&source.shards_of(&names).unwrap()).unwrap();
             let get = |part: Part, e: usize| dsv41_expert(&src, 0, part, e, hidden, inter, 32);
-            let job = LayerJob { li: 0, hidden, ne, inter, top_k, min_rows: 8, prior_n0: 0.0, prior_s: 128, held: &held_d };
-            let out = encode_layer(Engine::Host, &ec, &job, &rows[0], true, false, None, Some(&[0.0, hidden as f64]), &get).unwrap();
+            let job = LayerJob { li: 0, hidden, ne, inter, top_k, min_rows: 8, prior_n0: 0.0, prior_s: 128, held: &held_d, route_w };
+            let priors = [0.0, hidden as f64];
+            let out = encode_layer(Engine::Host, &ec, &job, &rows[0], true, false, None, Some(&priors), &get).unwrap();
             assert!(out.routed.is_empty() && out.shared.is_none(), "diagnostics write nothing");
             let measured: usize = out.diag.iter().map(|b| b.count).sum();
             assert_eq!(measured, ne, "every expert measured");
+            let vars = diag_variants(&priors, route_w);
+            assert_eq!(vars.len(), if route_w == RouteW::Diag { 4 } else { 2 });
             for b in out.diag.iter().filter(|b| b.count > 0) {
-                eprintln!("{codec:?} diag: {} experts, RTN {} GPTQ {} GPTQ+prior {}", b.count, b.rel(0), b.rel(1), b.rel(2));
-                assert!(b.err[1] <= b.err[0] && b.err[2] <= b.err[0], "{codec:?}: GPTQ worse than rounding on held-out rows: {:?}", b.err);
+                eprintln!("{codec:?} {route_w:?} diag: {} experts, RTN {} GPTQ {vars:?} {} | route-weighted RTN {} GPTQ {}", b.count, b.rel(0), b.rels(vars.len()), b.rel_w(0), b.rels_w(vars.len()));
+                assert!(b.base_w > 0.0, "the weighted metric is measured");
+                for (k, &(_, weighted)) in vars.iter().enumerate() {
+                    let (e, rtn) = if weighted { (b.err_w[k + 1], b.err_w[0]) } else { (b.err[k + 1], b.err[0]) };
+                    assert!(e <= rtn, "{codec:?} variant {:?}: GPTQ worse than rounding on held-out rows: {e} > {rtn}", vars[k]);
+                }
             }
         }
 
@@ -2071,6 +3652,12 @@ mod tests {
         sink.finish(&cm, &slots, Codec::Q2tp, serde_json::json!({"test": true}), out2.to_str().unwrap(), Instant::now()).unwrap();
         let m2 = CmfModel::open(&out2).unwrap();
         same_layout(&m2, &r2, "q2tp output");
+        // the free-space estimate of an --output file covers the file written
+        let gu = Codec::Q2tp.gate_up().0;
+        let slot_dt: HashMap<usize, TensorDtype> =
+            dirs.iter().flat_map(|(r, s)| r.iter().chain(std::iter::once(s))).flat_map(|&(g, u, d)| [(g, gu), (u, gu), (d, TensorDtype::Q4TiledP)]).collect();
+        let (est, len) = (stream_output_bytes(&cm, &slot_dt).unwrap(), std::fs::metadata(&out2).unwrap().len());
+        assert!(est >= len && est <= len + cm.tensors.len() as u64 * 4096 + (4 << 20), "estimate {est} B for a {len} B file");
         non_experts_kept(&m2, "q2tp output");
         let prov = m2.header.provenance.as_ref().unwrap();
         assert_eq!((prov["weight_quant"].as_str(), prov["gptq_moe"]["test"].as_bool()), (Some("q2tp"), Some(true)));

@@ -68,6 +68,9 @@ pub(crate) mod q1g_mv;
 /// bank kernels.
 pub mod mxfp4;
 pub use mxfp4::MoeBankCodec;
+/// `act_quant(o)` of the V4.1 attention output (FP8 E4M3, 32-value blocks).
+#[doc(hidden)]
+pub mod fp8_act;
 /// Device linear algebra of the NVG `blr` encoder (f32 GEMM, SPD solves,
 /// discrete-knot kernels).
 pub mod nvg_dev;
@@ -19201,6 +19204,8 @@ pub struct Ctx {
     mxfp4_pipes: std::sync::OnceLock<Option<mxfp4::Pipes>>,
     mxfp4_global_s8: std::sync::OnceLock<Option<mxfp4::GlobalPipes>>,
     mxfp4_global_s16: std::sync::OnceLock<Option<mxfp4::GlobalPipes>>,
+    /// V4.1 `act_quant(o)` (`fp8_act`).
+    fp8_act_pipe: std::sync::OnceLock<Option<fp8_act::Pipe>>,
     /// Subgroup-tree GDN step twins (`dense_mv::gdn`).
     gdn_sg_pipes: std::sync::OnceLock<Option<dense_mv::GdnSg>>,
     moe_down_q4tp_b2: wgpu::ComputePipeline,
@@ -21990,6 +21995,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         mxfp4_pipes: std::sync::OnceLock::new(),
         mxfp4_global_s8: std::sync::OnceLock::new(),
         mxfp4_global_s16: std::sync::OnceLock::new(),
+        fp8_act_pipe: std::sync::OnceLock::new(),
         gdn_sg_pipes: std::sync::OnceLock::new(),
         moe_down_q4tp_b2,
         moe_down_q4tp_part,
@@ -60607,16 +60613,118 @@ fn dsv4_global_moe_pipelines(
     }
 }
 
-fn dsv4_global_moe_segments_for_dsv41(c: &Ctx) -> usize {
-    if std::env::var("CMF_DSV41_GLOBAL_SEGMENTS").as_deref() == Ok("16")
-        && c.dsv4_global_gu_s16.is_some()
-        && c.dsv4_global_gu_q2_s16.is_some()
-        && c.dsv4_global_dn_s16.is_some()
-    {
+/// The V4.1 bank's segment policy, from `CMF_DSV41_GLOBAL_SEGMENTS`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dsv41Segments {
+    /// `=8`: the S8 bank whatever its size.
+    Force8,
+    /// `=16`: the S16 family built eagerly at device init (S8 when the
+    /// adapter could not build it). An mxfp4 bank has no eager family: its
+    /// S16 kernels are built on first need, S8 when they cannot be.
+    Eager16,
+    /// Unset (or anything else): S8 until S16 would hold more slots than S8
+    /// (`dsv41_auto_wants_s16`), then S16 built on first need, and S8 again
+    /// when the larger S16 bank does not fit the residency budget.
+    Auto,
+}
+
+fn dsv41_segments_policy(env: Option<&str>) -> Dsv41Segments {
+    match env {
+        Some("8") => Dsv41Segments::Force8,
+        Some("16") => Dsv41Segments::Eager16,
+        _ => Dsv41Segments::Auto,
+    }
+}
+
+/// Slots one segment buffer holds: the binding range over the larger of the
+/// gate/up and down payloads (the bank's buffers are per matrix).
+fn dsv4_global_moe_per_segment(c: &Ctx, gu_len: usize, d_len: usize) -> usize {
+    let range = c
+        .device
+        .limits()
+        .max_storage_buffer_binding_size
+        .min(c.device.limits().max_buffer_size);
+    (range / gu_len.max(d_len).max(1) as u64) as usize
+}
+
+/// Auto's rule: S16 only when it holds strictly more slots than S8 for this
+/// request. Past S8's capacity is not enough: S16 rounds the bank down to
+/// whole 16-slot segments, so just above it (release geometry: 2793..2799
+/// slots wanted after the workspace) S16 would hold 2784 against S8's 2792.
+fn dsv41_auto_wants_s16(
+    requested: usize,
+    per: usize,
+    max_len: usize,
+    range: u64,
+    workspace: u64,
+) -> bool {
+    let capacity = |segments| {
+        dsv4_global_moe_capacity(requested, per, max_len, range, workspace, segments)
+            .map_or(0, |(capacity, _)| capacity)
+    };
+    capacity(DSV4_GLOBAL_MOE_SEGMENTS_S16) > capacity(DSV4_GLOBAL_MOE_SEGMENTS)
+}
+
+/// More slots than eight segment buffers of `per_segment` slots address.
+fn dsv4_global_moe_needs_s16(slots: usize, per_segment: usize) -> bool {
+    slots > per_segment.saturating_mul(DSV4_GLOBAL_MOE_SEGMENTS)
+}
+
+/// Whether the S16 global-bank family for `codec` can be had: for q4tp/q2tp
+/// the eager family device init built (`CMF_DSV41_GLOBAL_SEGMENTS=16`), else
+/// on an S16-capable adapter the family built here on first need; for mxfp4
+/// its own S16 kernels (`mxfp4::global_pipes`, always built on first need)
+/// on an S16-capable adapter.
+fn dsv4_global_moe_s16_available(c: &Ctx, codec: MoeBankCodec) -> bool {
+    if codec == MoeBankCodec::Mxfp4 {
+        return c.dsv4_global_s16_capable
+            && mxfp4::global_pipes(c, DSV4_GLOBAL_MOE_SEGMENTS_S16).is_some();
+    }
+    if c.dsv4_global_gu_s16.is_some() {
+        return true;
+    }
+    if c.dsv4_global_s16_capable {
+        let built = c.dsv4_global_s16_lazy.get_or_init(|| {
+            build_global_moe_pipelines(
+                &c.device,
+                c.pipeline_cache.as_ref(),
+                DSV4_GLOBAL_MOE_SEGMENTS_S16,
+            )
+        });
+        let gu = if codec.gu_q2() {
+            built.1.is_some()
+        } else {
+            built.0.is_some()
+        };
+        return gu && built.2.is_some();
+    }
+    false
+}
+
+/// The segment family for a bank of `slots` slots: S8 while eight segment
+/// buffers address them; past S8's capacity, S16 (the eager family when
+/// device init built it, else built here on first need) on an S16-capable
+/// adapter; S8 when S16 cannot be had (the allocator then caps the bank).
+fn dsv4_global_moe_pick_segments(
+    c: &Ctx,
+    slots: usize,
+    per_segment: usize,
+    codec: MoeBankCodec,
+) -> usize {
+    if dsv4_global_moe_needs_s16(slots, per_segment) && dsv4_global_moe_s16_available(c, codec) {
         DSV4_GLOBAL_MOE_SEGMENTS_S16
     } else {
         DSV4_GLOBAL_MOE_SEGMENTS
     }
+}
+
+/// The 2-4 GiB of VRAM the carving allocator keeps out of the bank: binding
+/// array descriptors, per-layer activation/cold-readback buffers, KV growth
+/// and queue staging are physical VRAM too but are not counted as resident
+/// weights.
+fn dsv4_global_moe_workspace(c: &Ctx) -> u64 {
+    let gib = 1024 * 1024 * 1024u64;
+    (c.vram_budget / 10).clamp(2 * gib, 4 * gib)
 }
 
 /// Pure capacity calculation shared by the allocator and its bounded geometry
@@ -60657,10 +60765,14 @@ pub fn dsv4_global_moe_create(
     )
 }
 
-/// Allocate the V4.1 global bank, selecting S16 only when the explicit
-/// `CMF_DSV41_GLOBAL_SEGMENTS=16` request was accepted during device init.
-/// If the adapter or shader family cannot provide S16, this safely falls back
-/// to the existing S8 pool.
+/// Allocate the V4.1 global bank. Its segment family follows
+/// `CMF_DSV41_GLOBAL_SEGMENTS` (see [`Dsv41Segments`]): by default S8, and
+/// S16 when it holds more of the request, after the workspace carve-out,
+/// than S8 does (a 96 GB card at the 75 % default: ~3900 release slots
+/// against S8's 2792 on a 2 GiB binding range). If the adapter or shader
+/// family cannot provide S16, or the S16 bank fails the residency budget,
+/// this safely falls back to the S8 pool. The chosen family and capacity
+/// are logged once per process.
 pub fn dsv4_global_moe_create_for_dsv41(
     model: &Arc<CmfModel>,
     requested: usize,
@@ -60678,7 +60790,9 @@ pub fn dsv4_global_moe_create_for_dsv41(
 }
 
 /// [`dsv4_global_moe_create_for_dsv41`] for any bank codec — the mxfp4 bank
-/// of a `convert --quant fp4` file included.
+/// of a `convert --quant fp4` file included. The segment policy is the same
+/// for every codec; slot lengths come from [`MoeBankCodec::lens`], and an
+/// mxfp4 bank that goes S16 uses the mxfp4 S16 kernels (built on first need).
 pub fn dsv4_global_moe_create_for_dsv41_codec(
     model: &Arc<CmfModel>,
     requested: usize,
@@ -60688,8 +60802,67 @@ pub fn dsv4_global_moe_create_for_dsv41_codec(
 ) -> Option<(usize, usize)> {
     let c = ctx()?;
     let _op = c.op_gate.enter();
-    let segments = dsv4_global_moe_segments_for_dsv41(&c);
-    dsv4_global_moe_create_inner(model, requested, inter, hidden, codec, segments, true)
+    let (gu_len, d_len) = codec.lens(inter, hidden)?;
+    let per = 2usize.checked_mul(gu_len)?.checked_add(d_len)?;
+    let per_segment = dsv4_global_moe_per_segment(c, gu_len, d_len);
+    let policy =
+        dsv41_segments_policy(std::env::var("CMF_DSV41_GLOBAL_SEGMENTS").ok().as_deref());
+    let mut segments = match policy {
+        Dsv41Segments::Force8 => DSV4_GLOBAL_MOE_SEGMENTS,
+        // mxfp4 has no eager family: its S16 kernels are built here.
+        Dsv41Segments::Eager16 if codec == MoeBankCodec::Mxfp4 => {
+            if dsv4_global_moe_s16_available(c, codec) {
+                DSV4_GLOBAL_MOE_SEGMENTS_S16
+            } else {
+                DSV4_GLOBAL_MOE_SEGMENTS
+            }
+        }
+        Dsv41Segments::Eager16
+            if c.dsv4_global_gu_s16.is_some()
+                && c.dsv4_global_gu_q2_s16.is_some()
+                && c.dsv4_global_dn_s16.is_some() =>
+        {
+            DSV4_GLOBAL_MOE_SEGMENTS_S16
+        }
+        Dsv41Segments::Eager16 => DSV4_GLOBAL_MOE_SEGMENTS,
+        Dsv41Segments::Auto => {
+            let workspace = dsv4_global_moe_workspace(c);
+            let range = c
+                .device
+                .limits()
+                .max_storage_buffer_binding_size
+                .min(c.device.limits().max_buffer_size);
+            if dsv41_auto_wants_s16(requested, per, gu_len.max(d_len), range, workspace) {
+                // The slots the allocator will try to place: the request
+                // less the workspace it carves out.
+                let wanted = requested.saturating_sub((workspace / per as u64) as usize);
+                dsv4_global_moe_pick_segments(c, wanted, per_segment, codec)
+            } else {
+                DSV4_GLOBAL_MOE_SEGMENTS
+            }
+        }
+    };
+    let mut made =
+        dsv4_global_moe_create_inner(model, requested, inter, hidden, codec, segments, true);
+    if made.is_none() && policy == Dsv41Segments::Auto && segments == DSV4_GLOBAL_MOE_SEGMENTS_S16 {
+        // The larger S16 bank can fail the residency budget where S8 fits.
+        segments = DSV4_GLOBAL_MOE_SEGMENTS;
+        made = dsv4_global_moe_create_inner(model, requested, inter, hidden, codec, segments, true);
+    }
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| match made {
+        Some((capacity, segment_slots)) => tracing::info!(
+            "V4.1 expert bank ({}): S{segments} ({policy:?}), capacity {capacity} slots \
+             ({segment_slots} per segment), requested {requested}; S8 addresses at most {} slots",
+            codec.label(),
+            per_segment.saturating_mul(DSV4_GLOBAL_MOE_SEGMENTS)
+        ),
+        None => tracing::info!(
+            "V4.1 expert bank ({}): S{segments} ({policy:?}) not allocated for {requested} requested slots",
+            codec.label()
+        ),
+    });
+    made
 }
 
 /// The S8 bank with exactly `slots` slots (rounded down to whole segments),
@@ -60707,51 +60880,11 @@ pub fn dsv4_global_moe_create_slots(
     let _op = c.op_gate.enter();
     // One segment buffer is bounded by the binding range; past S8's
     // capacity the S16 family (built here on first need) doubles it.
-    let gu_len = cortiq_core::quant::expected_nbytes(
-        if gu_q2 {
-            cortiq_core::TensorDtype::Q2TiledP
-        } else {
-            cortiq_core::TensorDtype::Q4TiledP
-        },
-        &[inter, hidden],
-    )?;
-    let d_len =
-        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[hidden, inter])?;
-    let range = c
-        .device
-        .limits()
-        .max_storage_buffer_binding_size
-        .min(c.device.limits().max_buffer_size);
-    let per_segment = (range / gu_len.max(d_len).max(1) as u64) as usize;
-    let mut segments = DSV4_GLOBAL_MOE_SEGMENTS;
-    if slots > per_segment.saturating_mul(DSV4_GLOBAL_MOE_SEGMENTS)
-        && c.dsv4_global_s16_capable
-        && c.dsv4_global_gu_s16.is_none()
-    {
-        let built = c.dsv4_global_s16_lazy.get_or_init(|| {
-            build_global_moe_pipelines(
-                &c.device,
-                c.pipeline_cache.as_ref(),
-                DSV4_GLOBAL_MOE_SEGMENTS_S16,
-            )
-        });
-        if built.0.is_some() && built.2.is_some() {
-            segments = DSV4_GLOBAL_MOE_SEGMENTS_S16;
-        }
-    } else if slots > per_segment.saturating_mul(DSV4_GLOBAL_MOE_SEGMENTS)
-        && c.dsv4_global_gu_s16.is_some()
-    {
-        segments = DSV4_GLOBAL_MOE_SEGMENTS_S16;
-    }
-    dsv4_global_moe_create_inner(
-        model,
-        slots,
-        inter,
-        hidden,
-        MoeBankCodec::from_gu_q2(gu_q2),
-        segments,
-        false,
-    )
+    let codec = MoeBankCodec::from_gu_q2(gu_q2);
+    let (gu_len, d_len) = codec.lens(inter, hidden)?;
+    let per_segment = dsv4_global_moe_per_segment(c, gu_len, d_len);
+    let segments = dsv4_global_moe_pick_segments(c, slots, per_segment, codec);
+    dsv4_global_moe_create_inner(model, slots, inter, hidden, codec, segments, false)
 }
 
 /// The S8 bank with exactly `slots` slots and no workspace carve-out, for
@@ -60828,12 +60961,9 @@ fn dsv4_global_moe_create_inner(
         .limits()
         .max_storage_buffer_binding_size
         .min(c.device.limits().max_buffer_size);
-    // Binding-array descriptors, per-layer activation/cold-readback buffers,
-    // KV growth and queue staging are physical VRAM too but are not counted
-    // as resident weights. Reserve 2-4 GiB before rounding the logical bank.
-    let gib = 1024 * 1024 * 1024u64;
+    // Reserve 2-4 GiB before rounding the logical bank.
     let workspace = if carve_workspace {
-        (c.vram_budget / 10).clamp(2 * gib, 4 * gib)
+        dsv4_global_moe_workspace(c)
     } else {
         0
     };
@@ -60890,7 +61020,10 @@ fn dsv4_global_moe_create_inner(
 
 #[cfg(test)]
 mod global_moe_capacity_tests {
-    use super::{dsv4_global_moe_capacity, host_tier_cache_admissible};
+    use super::{
+        Dsv41Segments, dsv4_global_moe_capacity, dsv4_global_moe_needs_s16, dsv41_auto_wants_s16,
+        dsv41_segments_policy, host_tier_cache_admissible,
+    };
 
     const RANGE: u64 = (1u64 << 31) - 1;
     const PER: usize = 18_424_832;
@@ -60910,6 +61043,52 @@ mod global_moe_capacity_tests {
             dsv4_global_moe_capacity(3146, PER, MAX_LEN, RANGE, 4 * GIB, 8),
             Some((2792, 349))
         );
+    }
+
+    /// `CMF_DSV41_GLOBAL_SEGMENTS`: 8 forces S8, 16 keeps the eager opt-in,
+    /// anything else is the automatic choice.
+    #[test]
+    fn dsv41_segment_policy_parses_the_env() {
+        assert_eq!(dsv41_segments_policy(None), Dsv41Segments::Auto);
+        assert_eq!(dsv41_segments_policy(Some("8")), Dsv41Segments::Force8);
+        assert_eq!(dsv41_segments_policy(Some("16")), Dsv41Segments::Eager16);
+        assert_eq!(dsv41_segments_policy(Some("12")), Dsv41Segments::Auto);
+    }
+
+    /// The release geometry on a 2 GiB binding range: 349 slots a segment,
+    /// so S8 addresses 2792 slots and one more needs S16, which then holds
+    /// the whole request instead of S8's cap. Auto takes S16 only from 2800
+    /// wanted slots on: below that S16's 16-slot rounding holds fewer.
+    #[test]
+    fn auto_s16_starts_past_the_s8_capacity() {
+        let per_segment = (RANGE / MAX_LEN as u64) as usize;
+        assert_eq!(per_segment, 349);
+        assert!(!dsv4_global_moe_needs_s16(2792, per_segment));
+        assert!(dsv4_global_moe_needs_s16(2793, per_segment));
+        // 3900 slots wanted after the 4 GiB workspace (~233 slots).
+        let requested = 3900 + (4 * GIB / PER as u64) as usize;
+        assert_eq!(
+            dsv4_global_moe_capacity(requested, PER, MAX_LEN, RANGE, 4 * GIB, 8),
+            Some((2792, 349))
+        );
+        assert_eq!(
+            dsv4_global_moe_capacity(requested, PER, MAX_LEN, RANGE, 4 * GIB, 16),
+            Some((3888, 243))
+        );
+        let workspace_slots = (4 * GIB / PER as u64) as usize;
+        let auto = |wanted: usize| {
+            dsv41_auto_wants_s16(wanted + workspace_slots, PER, MAX_LEN, RANGE, 4 * GIB)
+        };
+        assert!(!auto(2792));
+        // Past S8's capacity, but S16 would hold 2784 against S8's 2792.
+        assert!(!auto(2793));
+        assert!(!auto(2799));
+        assert_eq!(
+            dsv4_global_moe_capacity(2799 + workspace_slots, PER, MAX_LEN, RANGE, 4 * GIB, 16),
+            Some((2784, 174))
+        );
+        assert!(auto(2800));
+        assert!(auto(3900));
     }
 
     #[test]
@@ -60935,6 +61114,16 @@ mod global_moe_capacity_tests {
 
 pub fn dsv4_global_moe_ready(model: &Arc<CmfModel>) -> bool {
     ctx().is_some_and(|c| c.dsv4_global_moe.lock().unwrap().contains_key(&model.uid()))
+}
+
+/// The model's global expert bank as `(segments, capacity)`, when one is
+/// allocated. For tests that must see which segment family a run used: an
+/// S8 and an S16 bank give identical results.
+#[doc(hidden)]
+pub fn dsv4_global_moe_geometry(model: &CmfModel) -> Option<(usize, usize)> {
+    let c = ctx()?;
+    let banks = c.dsv4_global_moe.lock().unwrap();
+    banks.get(&model.uid()).map(|b| (b.segments, b.capacity))
 }
 
 /// Install one `(layer, expert)` triple into a flat global slot. Slot metadata
@@ -69108,7 +69297,7 @@ pub fn dsv4_cache_write(kv_id: u64, li: usize, off: usize, data: &[f32], cap: us
 /// * `frame_up_pos` (tag)     — 1, 79–80, 97, 108
 /// * `uni_slot` (tag, kv, li) — 84–85, 101, 130–131, 134, 136, 138, 140,
 ///                              142–164 (blit, even), 166, 168, 170
-/// * `cached_bind` (tag,kv,li)— 30–33, 36–42, 50–64, 80–101, 120–129,
+/// * `cached_bind` (tag,kv,li)— 30–33, 36–42, 47, 50–64, 80–101, 120–129,
 ///                              132–141, 143–165 (blit, odd), 167, 169–171,
 ///                              180–199, 213–254 (batch/DSpark), 210–212,
 ///                              215 (MiniCPM prepared tail)
@@ -69307,6 +69496,11 @@ pub struct Dsv4AttnGeom {
     /// Whether the query heads receive DSV4's second RMSNorm after `wq_b`.
     /// V4.1's official attention path has only the LoRA-rank `q_norm`.
     pub q_rms: bool,
+    /// V4.1 `act_quant(o)` (`CMF_DSV41_O_FP8`): the attended output is
+    /// quantized to FP8 E4M3 in 32-value blocks after its BF16 boundary and
+    /// before the grouped `wo_a`. Read by `dsv4_attn_frame` only; DSV4 and
+    /// the layer frames keep it false.
+    pub o_fp8: bool,
 }
 
 /// DeepSeek-V4's attention block, start to finish, in ONE submission.
@@ -69395,6 +69589,7 @@ pub fn dsv4_attn_frame(
         || idxs.is_empty()
         || idxs.len() > 1024
         || inv_freq.len() * 2 < g.rd
+        || (g.o_fp8 && (g.nh * g.hd / g.o_groups.max(1)) % 32 != 0)
     {
         no!(
             "формы: hidden {} dim {} out {} sink {} nh {} q_norm {} q_lora {} idx {} freq {} rd {}",
@@ -69409,6 +69604,11 @@ pub fn dsv4_attn_frame(
             inv_freq.len(),
             g.rd
         );
+    }
+    // Declined before anything is encoded: the caller's host tail then
+    // quantizes instead.
+    if g.o_fp8 && fp8_act::pipe(c).is_none() {
+        no!("act_quant(o) недоступен на этом устройстве");
     }
     let bytes = model.primary_bytes();
     // Every weight q4tp, or the frame declines: a mixed layer would need the
@@ -69577,6 +69777,11 @@ pub fn dsv4_attn_frame(
     );
     if g.bf16 {
         encode_bf16_round(c, &mut enc, &attn, g.nh * g.hd, (40, kv_id, li));
+    }
+    if g.o_fp8 {
+        // In place on the BF16 output; the per-group 32-blocks are
+        // contiguous runs of the flat buffer (32-multiple group width).
+        fp8_act::encode(c, &mut enc, &attn, g.nh * g.hd, (47, kv_id, li));
     }
     {
         let rows = g.o_groups * g.o_lora;

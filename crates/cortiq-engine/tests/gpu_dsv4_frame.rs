@@ -151,6 +151,7 @@ fn the_fused_attention_block_matches_the_cpu() {
         scale,
         bf16: false,
         q_rms: true,
+        o_fp8: false,
     };
     // Stage by stage, then whole. The first stage that moves is the wiring
     // fault; comparing only the output tells you there is one and no more.

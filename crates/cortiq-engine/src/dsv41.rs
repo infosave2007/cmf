@@ -926,21 +926,28 @@ impl Dsv41Cfg {
             }
         }
         // `candidate_source_layer < 0 turns it off` (reference ModelArgs). An
-        // absent key keeps the release layer, like every other default here.
+        // absent key keeps the release layer, like every other default here;
+        // a null one counts as absent (the other spelling is then read). An
+        // integral float (`20.0`, as some JSON writers emit) is an integer.
         let candidate_source = match ["candidate_source_layer", "candidate_source_layer_id"]
             .iter()
-            .find_map(|key| tc.get(key))
+            .find_map(|key| tc.get(*key).filter(|v| !v.is_null()).map(|v| (*key, v)))
         {
             None => Some(20),
-            Some(v) => match v.as_i64() {
-                Some(layer) if layer < 0 => None,
-                Some(layer) => Some(layer as usize),
-                None => {
-                    return Err(format!(
-                        "text_config.candidate_source_layer_id = {v} is not an integer"
-                    ));
+            Some((key, v)) => {
+                let layer = v.as_i64().or_else(|| {
+                    v.as_f64()
+                        .filter(|f| f.fract() == 0.0 && f.abs() < (1u64 << 53) as f64)
+                        .map(|f| f as i64)
+                });
+                match layer {
+                    Some(layer) if layer < 0 => None,
+                    Some(layer) => Some(layer as usize),
+                    None => {
+                        return Err(format!("text_config.{key} = {v} is not an integer"));
+                    }
                 }
-            },
+            }
         };
         let engram_layers = array_of("engram_layer_ids");
         let engram_embeddings = array_of("engram_num_embeddings");
@@ -1154,6 +1161,10 @@ pub struct Dsv41MoeCapture {
     /// Per captured layer: `top_k` routed expert ids per token, in route
     /// order (`u16::MAX` pads a route cut short by non-finite scores).
     pub picks: Vec<Vec<u16>>,
+    /// Per captured layer: the route weight of each pick (the factor the
+    /// expert's SwiGLU activation is multiplied by before `w2`, as in the
+    /// reference `Expert.forward`; 0 for a padded pick).
+    pub w: Vec<Vec<f32>>,
 }
 
 impl Dsv41State {
@@ -1278,6 +1289,27 @@ fn gpu_attention_tail_enabled() -> bool {
         }
         live
     })
+}
+
+/// Test-only mutation of the device attention tail
+/// (`CMF_DSV41_TEST_MUTATE`): `sink` hands the frame zero attention sinks,
+/// `rope` shifts the position the frame's inverse RoPE uses by one (the
+/// host has already rotated the query unless `CMF_DSV41_FUSED_Q=1`). Each is
+/// a broken device path the GPU fixture's bound has to catch; see
+/// `tests/dsv41_fixture_gpu.rs`. Read once per process, and only in builds
+/// with debug assertions (`cargo test`'s default profile): a release binary
+/// never reads the variable, so a stray one cannot corrupt its output.
+#[cfg(feature = "gpu")]
+fn gpu_tail_mutation() -> Option<&'static str> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    static M: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = std::env::var("CMF_DSV41_TEST_MUTATE").ok()?;
+        matches!(m.as_str(), "sink" | "rope").then_some(m)
+    })
+    .as_deref()
 }
 
 /// One-shot stage capture for the V4.1 adapter repair. The frame reads the
@@ -1916,9 +1948,9 @@ fn fp8_activation_inplace(v: &mut [f32]) {
 /// `CMF_DSV41_O_FP8=1`: quantize the attention output to FP8 (E4M3, 32-value
 /// blocks, power-of-two scales) before the grouped `wo_a`, as the reference
 /// does since commit 4dd75a8b (`act_quant(o, ...)` before the einsum). Off
-/// by default until a run on the released weights shows its effect. The
-/// device attention tail has no such quantizer yet, so the flag keeps V4.1
-/// attention on the CPU tail.
+/// by default until a run on the released weights shows its effect. Both
+/// tails apply it: the CPU tail here, the device frame with its
+/// `fp8_act_quant32` kernel (bit-identical to `fp8_activation_inplace`).
 fn v41_o_fp8_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("CMF_DSV41_O_FP8").is_ok_and(|value| value == "1"))
@@ -2265,7 +2297,7 @@ fn attention(
     // current bounded window plus the selected compressed rows; no
     // whole-history upload or clone is created here.
     #[cfg(feature = "gpu")]
-    if gpu_attention_tail_enabled() && !v41_o_fp8_enabled() {
+    if gpu_attention_tail_enabled() {
         let n_comp = selected_comp_positions.len();
         let cache_cap = (cfg.window + n_comp.next_power_of_two().max(64)) * cfg.head_dim;
         let cache_ok =
@@ -2305,6 +2337,16 @@ fn attention(
         // buffer contract.
         let qn_in = fused_q.then_some(qr.as_slice());
         let q_in = q.as_deref();
+        let mutation = gpu_tail_mutation();
+        let sink: &[f32] = if mutation == Some("sink") {
+            // One stable zero buffer: the frame keys constants by address.
+            static ZERO: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+            let zero = ZERO.get_or_init(|| vec![0.0; 4096]);
+            &zero[..l.attn_sink.len().min(zero.len())]
+        } else {
+            &l.attn_sink
+        };
+        let frame_pos = st.pos + usize::from(mutation == Some("rope"));
         let gpu_ok = cache_ok
             && model.is_some_and(|model| {
                 let w = crate::gpu_wgpu::Dsv4AttnW {
@@ -2313,7 +2355,7 @@ fn attention(
                     wo_a: l.wo_a.model_idx().unwrap_or(usize::MAX),
                     wo_b: l.wo_b.model_idx().unwrap_or(usize::MAX),
                     q_norm: &l.q_norm,
-                    sink: &l.attn_sink,
+                    sink,
                 };
                 let g = crate::gpu_wgpu::Dsv4AttnGeom {
                     dim: cfg.dim,
@@ -2327,6 +2369,7 @@ fn attention(
                     scale: (cfg.head_dim as f32).powf(-0.5),
                     bf16: true,
                     q_rms: false,
+                    o_fp8: v41_o_fp8_enabled(),
                 };
                 crate::gpu_wgpu::dsv4_attn_frame(
                     &model,
@@ -2339,7 +2382,7 @@ fn attention(
                     li,
                     &idx32,
                     inv_freq,
-                    st.pos,
+                    frame_pos,
                     None,
                     &mut gpu_attended,
                 )
@@ -2896,15 +2939,6 @@ fn moe(
         shifted[i] = f32::NEG_INFINITY;
     }
     trace_moe(position, layer, image, &logits, &scores, bias, &picks);
-    if let Some(cap) = state.moe_capture.as_mut() {
-        if (cap.lo..cap.hi).contains(&layer) {
-            let k = layer - cap.lo;
-            cap.x[k].extend(x[..cfg.dim].iter().map(|&v| cortiq_core::quant::f32_to_f16(v)));
-            cap.picks[k].extend(
-                (0..cfg.top_k).map(|j| picks.get(j).map_or(u16::MAX, |&e| e as u16)),
-            );
-        }
-    }
     // `weights /= weights.sum() + 1e-20` only when more than one expert is
     // chosen (Gate.forward); the epsilon is not norm_eps.
     let sum = picks.iter().map(|&i| scores[i]).sum::<f32>() + 1e-20;
@@ -2916,6 +2950,16 @@ fn moe(
     } else {
         for &e in &picks {
             mix_weights[e] = scores[e] * cfg.route_scale;
+        }
+    }
+    if let Some(cap) = state.moe_capture.as_mut() {
+        if (cap.lo..cap.hi).contains(&layer) {
+            let k = layer - cap.lo;
+            cap.x[k].extend(x[..cfg.dim].iter().map(|&v| cortiq_core::quant::f32_to_f16(v)));
+            cap.picks[k].extend(
+                (0..cfg.top_k).map(|j| picks.get(j).map_or(u16::MAX, |&e| e as u16)),
+            );
+            cap.w[k].extend((0..cfg.top_k).map(|j| picks.get(j).map_or(0.0, |&e| mix_weights[e])));
         }
     }
     #[cfg(feature = "gpu")]
@@ -3249,6 +3293,22 @@ pub fn profile_report() {
     prof::report();
 }
 
+/// The `CMF_DSV41_PROF` path counters, cumulative for the process:
+/// `(gpu_attn, gpu_attn_fallbacks, gpu_moe, cpu_moe)`. Zero unless the
+/// profile is on. For tests that must prove a device path ran: a refused
+/// device frame falls back to the host silently and still passes a numeric
+/// check.
+#[doc(hidden)]
+pub fn profile_counters() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        prof::GPU_ATTN_CALLS.load(Relaxed),
+        prof::GPU_ATTN_FALLBACKS.load(Relaxed),
+        prof::GPU_MOE_CALLS.load(Relaxed),
+        prof::CPU_MOE_CALLS.load(Relaxed),
+    )
+}
+
 pub fn forward_chunk(
     globals: &Dsv41Globals,
     layers: &[Dsv41Layer],
@@ -3339,6 +3399,7 @@ pub fn capture_window(
         stop_after_hi: true,
         x: (lo..hi).map(|_| Vec::with_capacity(ids.len() * cfg.dim)).collect(),
         picks: (lo..hi).map(|_| Vec::with_capacity(ids.len() * cfg.top_k)).collect(),
+        w: (lo..hi).map(|_| Vec::with_capacity(ids.len() * cfg.top_k)).collect(),
     });
     let mut logits = Vec::new();
     for (pos, &id) in ids.iter().enumerate() {
@@ -3358,8 +3419,8 @@ pub fn capture_window(
     }
     let cap = st.moe_capture.take().unwrap_or_default();
     st.clear();
-    for (k, (x, p)) in cap.x.iter().zip(&cap.picks).enumerate() {
-        if x.len() != ids.len() * cfg.dim || p.len() != ids.len() * cfg.top_k {
+    for (k, ((x, p), w)) in cap.x.iter().zip(&cap.picks).zip(&cap.w).enumerate() {
+        if x.len() != ids.len() * cfg.dim || p.len() != ids.len() * cfg.top_k || w.len() != p.len() {
             return Err(format!(
                 "layer {}: captured {} rows / {} routes for {} tokens",
                 lo + k,
@@ -3851,6 +3912,53 @@ mod tests {
         assert_eq!(cfg.candidate_source, Some(20), "absent keeps the release layer");
     }
 
+    /// A null candidate key is skipped (the other spelling, or the release
+    /// default, applies); an integral float is an integer; a fractional one
+    /// or a string is refused with the key it came from.
+    #[test]
+    fn candidate_source_skips_null_and_accepts_integral_float() {
+        let with = |pairs: &[(&str, serde_json::Value)]| {
+            let mut tc = release_text_config();
+            let obj = tc.as_object_mut().unwrap();
+            obj.remove("candidate_source_layer_id");
+            for (k, v) in pairs {
+                obj.insert((*k).into(), v.clone());
+            }
+            Dsv41Cfg::from_source(&tc, &decoy_arch()).map(|(cfg, _)| cfg.candidate_source)
+        };
+        let null = serde_json::Value::Null;
+        assert_eq!(
+            with(&[("candidate_source_layer_id", serde_json::json!(20.0))]),
+            Ok(Some(20))
+        );
+        assert_eq!(
+            with(&[("candidate_source_layer", serde_json::json!(-1.0))]),
+            Ok(None)
+        );
+        assert_eq!(
+            with(&[
+                ("candidate_source_layer", null.clone()),
+                ("candidate_source_layer_id", serde_json::json!(7)),
+            ]),
+            Ok(Some(7)),
+            "a null first spelling falls through to the second"
+        );
+        assert_eq!(
+            with(&[("candidate_source_layer_id", null.clone())]),
+            Ok(Some(20)),
+            "null alone is absent"
+        );
+        for bad in [serde_json::json!(20.5), serde_json::json!("20")] {
+            let err = with(&[("candidate_source_layer_id", bad.clone())]).unwrap_err();
+            assert!(err.contains("candidate_source_layer_id"), "{bad}: {err}");
+        }
+        let err = with(&[("candidate_source_layer", serde_json::json!(1.5))]).unwrap_err();
+        assert!(
+            err.contains("text_config.candidate_source_layer ="),
+            "{err}"
+        );
+    }
+
     #[test]
     fn sqrt_softplus_keeps_negative_logits_positive() {
         for x in [-40.0f32, -30.0, -17.5, -3.0, 0.0, 1.5, 19.9, 20.0, 25.0] {
@@ -3903,8 +4011,9 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn fp8_activation_matches_kernel_act_quant() {
+    /// The act_quant(o) test set: 2000 random BF16 blocks and the edge
+    /// blocks listed inside. The last block is the nearest-even tie block.
+    fn act_quant_test_blocks() -> Vec<Vec<f32>> {
         let mut state = 0x5EED_u64;
         let mut next = || {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -3948,6 +4057,12 @@ mod tests {
         let mut b = vec![17.0f32, 19.0, -17.0, 0.0068359375, 300.0, 448.0];
         b.resize(32, 1.0);
         blocks.push(b);
+        blocks
+    }
+
+    #[test]
+    fn fp8_activation_matches_kernel_act_quant() {
+        let blocks = act_quant_test_blocks();
         for (i, block) in blocks.iter().enumerate() {
             let mut got = block.clone();
             fp8_activation_inplace(&mut got);
@@ -4011,6 +4126,107 @@ mod tests {
         assert_eq!(e4m3_round(272.0), 256.0);
         assert_eq!(e4m3_round(304.0), 320.0);
         assert_eq!(e4m3_round(432.0), 448.0);
+    }
+
+    /// The device `fp8_act_quant32` kernel (the V4.1 attention frame's
+    /// act_quant(o)) against the host quantizer, bit for bit: the reference
+    /// test set above, plus full-mantissa f32 blocks over the whole finite
+    /// range and the f32-underflow corner of the sign rule. The repo's GPU
+    /// test convention: skips unless `CMF_GPU` selects wgpu, fails when it
+    /// does and no context comes up, and with a context up a missing result
+    /// (module rejected, readback failed) is a failure, not a skip.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn fp8_act_quant32_device_matches_host_bits() {
+        match crate::gpu_wgpu::selected_and_up() {
+            None => {
+                crate::gpu_wgpu::skip_or_fail(module_path!());
+                return;
+            }
+            Some(false) => panic!("CMF_GPU selects wgpu but no wgpu context came up"),
+            Some(true) => {}
+        }
+        let mut blocks = act_quant_test_blocks();
+        let mut state = 0xF8A7_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 32) as u32
+        };
+        for _ in 0..2000 {
+            // A block exponent anywhere in the finite range, values up to 40
+            // binades below it (f32 subnormals included), any mantissa.
+            let top = (next() % 250) as i32 - 125;
+            blocks.push(
+                (0..32)
+                    .map(|_| {
+                        let e = (top - (next() % 40) as i32).clamp(-149, 126);
+                        let m = 1.0 + (next() & 0x7f_ffff) as f32 / 8_388_608.0;
+                        let v = m * 2f32.powi(e.max(-126)) * 2f32.powi((e + 126).min(0));
+                        if next() & 1 == 1 { -v } else { v }
+                    })
+                    .collect(),
+            );
+        }
+        // Scale 2^25: these negative values divide to an f32 subnormal (the
+        // host keeps the sign of the zero they round to) or underflow to an
+        // exact zero (the host returns +0); f32 subnormal inputs too.
+        let mut b = vec![0.0f32; 32];
+        b[0] = 448.0 * 2f32.powi(25);
+        for (i, v) in [
+            -2f32.powi(-126),
+            -2f32.powi(-124),
+            -3.0 * 2f32.powi(-127),
+            -2f32.powi(-125),
+            -1.5 * 2f32.powi(-125),
+            -5.0 * 2f32.powi(-149),
+            -f32::from_bits(0x007f_ffff),
+            1e-30,
+            -1e-30,
+            -0.0,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            b[i + 1] = v;
+        }
+        blocks.push(b);
+        // Scale 2^-5: f32 subnormal inputs divide to a nonzero quotient.
+        let mut b = vec![-f32::from_bits(3); 32];
+        b[0] = 14.0;
+        b[1] = f32::from_bits(1);
+        blocks.push(b);
+        let flat: Vec<f32> = blocks.iter().flatten().copied().collect();
+        let got = crate::gpu_wgpu::fp8_act::act_quant32_for_test(&flat).expect(
+            "wgpu is up but fp8_act_quant32 gave no result (module rejected or readback failed)",
+        );
+        let mut want = flat.clone();
+        fp8_activation_inplace(&mut want);
+        let mut bad = 0usize;
+        for (i, ((g, w), x)) in got.iter().zip(&want).zip(&flat).enumerate() {
+            if g.to_bits() != w.to_bits() {
+                if bad < 8 {
+                    eprintln!(
+                        "block {} value {}: x {x:e} ({:#010x}) device {g:e} ({:#010x}) host {w:e} ({:#010x})",
+                        i / 32,
+                        i % 32,
+                        x.to_bits(),
+                        g.to_bits(),
+                        w.to_bits()
+                    );
+                }
+                bad += 1;
+            }
+        }
+        eprintln!(
+            "fp8_act_quant32: {} blocks, {bad} values differ from the host",
+            blocks.len()
+        );
+        assert_eq!(
+            bad, 0,
+            "device act_quant(o) is not bit-identical to the host"
+        );
     }
 
     #[test]
@@ -4251,7 +4467,7 @@ mod tests {
             index_heads: 1,
             index_head_dim: 32,
             index_topk: 4,
-            candidate_source: Some(99),
+            candidate_source: None,
             candidate_topk_blocks: 2,
             candidate_block_size: 8,
             kv_sources: Vec::new(),
@@ -4351,6 +4567,7 @@ mod tests {
             stop_after_hi: false,
             x: vec![Vec::new(); 2],
             picks: vec![Vec::new(); 2],
+            w: vec![Vec::new(); 2],
         });
         let mut logits = Vec::new();
         for (pos, &id) in ids.iter().enumerate() {
@@ -4360,6 +4577,7 @@ mod tests {
         let full = st.moe_capture.take().unwrap();
         assert_eq!(full.x[1], cap.x[0], "early stop changes no captured row");
         assert_eq!(full.picks[1], cap.picks[0]);
+        assert_eq!(full.w[1], cap.w[0]);
         assert_ne!(full.x[0], full.x[1], "layers capture their own inputs");
 
         // the route is V4.1's: sqrt-softplus scores + bias, top-k, from the captured row
@@ -4379,6 +4597,15 @@ mod tests {
             sh.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
             let want: Vec<u16> = sh[..cfg.top_k].iter().map(|&(_, e)| e as u16).collect();
             assert_eq!(&cap.picks[0][t * cfg.top_k..(t + 1) * cfg.top_k], &want[..], "token {t}");
+            // route weights: the picks' scores normalised to route_scale
+            let sc: Vec<f32> = want.iter().map(|&e| (1.0 + lg[e as usize].exp()).ln().sqrt()).collect();
+            let sum: f32 = sc.iter().sum();
+            for (j, &v) in sc.iter().enumerate() {
+                let got = cap.w[0][t * cfg.top_k + j];
+                assert!((got - v / sum * cfg.route_scale).abs() <= 1e-5 * cfg.route_scale, "token {t} pick {j}: weight {got}");
+            }
+            let tot: f32 = cap.w[0][t * cfg.top_k..(t + 1) * cfg.top_k].iter().sum();
+            assert!((tot - cfg.route_scale).abs() < 1e-4, "token {t}: weights sum to {tot}");
         }
     }
 }
