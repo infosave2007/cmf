@@ -47,8 +47,7 @@ struct Loaded {
 
 fn load_fixture(fx: &Fixture, tag: &str) -> Loaded {
     cpu_only();
-    let path = fx.write(tag);
-    let model = Arc::new(CmfModel::open(&path).expect("open fixture"));
+    let model = fx.open(tag);
     let source = model
         .arch()
         .deepseek_v41
@@ -73,27 +72,6 @@ fn run(l: &Loaded, token_map: Vec<u32>, tokens: &[u32], pool: Option<&Pool>) -> 
         out.push(logits);
     }
     out
-}
-
-fn per_position(got: &[Vec<f32>], want: &[Vec<f64>]) -> Vec<f64> {
-    got.iter()
-        .zip(want)
-        .map(|(g, w)| worst_rel(std::slice::from_ref(g), std::slice::from_ref(w)).0)
-        .collect()
-}
-
-fn fmt_errs(errs: &[f64]) -> String {
-    errs.iter()
-        .map(|e| format!("{e:.1e}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn argmax_agree(got: &[Vec<f32>], want: &[Vec<f64>]) -> usize {
-    got.iter()
-        .zip(want)
-        .filter(|(g, w)| argmax32(g) == argmax64(w))
-        .count()
 }
 
 fn bits_equal(a: &[Vec<f32>], b: &[Vec<f32>]) -> bool {
@@ -150,10 +128,12 @@ fn fixture_config_parses_to_its_geometry() {
 /// accumulator, the runtime and the reference agree to ~1e-7 relative:
 /// every BF16 boundary, quantizer, rope pair, hc transpose, top-k and
 /// candidate rule is the same. Where one value does land on the other side
-/// of a boundary, the FP4/FP8 caches can carry the one-ulp flip into a
-/// visible logit change (measured ~3e-3). A structural regression moves
-/// every position, so the test asks most positions to be exact and bounds
-/// the rest.
+/// of a boundary, the one-ulp flip shows in the logits: on the M4 that is
+/// position 4 (3.0e-3), a local BF16 flip in L4's hc_pre/input-norm output
+/// that L4's FP8 window KV absorbs, so the following positions are exact
+/// again. A structural regression moves every position, so the test asks
+/// most positions to be exact and bounds the rest (see
+/// `assert_strict_agreement` for the per-target bounds).
 #[test]
 fn strict_cpu_forward_matches_f64_reference() {
     let fx = Fixture::build(RELEASE_COMPRESSED_VOCAB);
@@ -161,7 +141,7 @@ fn strict_cpu_forward_matches_f64_reference() {
     let got = float_activations_scope(|| run(&l, fx.token_map(), &TOKENS, None));
     let want = reference_logits(&fx, &TOKENS, RefOpts::cortiq());
     let errs = per_position(&got, &want);
-    let exact = errs.iter().filter(|&&e| e < 1e-5).count();
+    let exact = errs.iter().filter(|&&e| e < EXACT).count();
     let (worst, at) = worst_rel(&got, &want);
     let (kern, kern_at) = worst_rel(&got, &reference_logits(&fx, &TOKENS, RefOpts::kernels()));
     println!(
@@ -175,16 +155,8 @@ fn strict_cpu_forward_matches_f64_reference() {
         TOKENS.len()
     );
     assert!(got.iter().flatten().all(|v| v.is_finite()), "non-finite logits");
-    assert!(
-        exact * 3 >= TOKENS.len() * 2,
-        "only {exact}/{} positions agree with the reference to 1e-5: [{}]",
-        TOKENS.len(),
-        fmt_errs(&errs)
-    );
-    assert!(
-        worst < 0.15,
-        "strict CPU V4.1 forward drifted from the reference: {worst:.3e} at position {at}"
-    );
+    // Measured on the M4: 11/12 exact, the other (position 4) 3.0e-3.
+    assert_strict_agreement("strict CPU", &errs, 10, 2e-2);
 }
 
 /// `candidate_source_layer_id: -1` turns candidate pre-filtering off (it
@@ -199,7 +171,7 @@ fn negative_candidate_source_runs_without_prefiltering() {
     let got = float_activations_scope(|| run(&l, fx.token_map(), &TOKENS, None));
     let want = reference_logits(&fx, &TOKENS, RefOpts::cortiq());
     let errs = per_position(&got, &want);
-    let exact = errs.iter().filter(|&&e| e < 1e-5).count();
+    let exact = errs.iter().filter(|&&e| e < EXACT).count();
     let with = Fixture::build(RELEASE_COMPRESSED_VOCAB);
     let (apart, _) = worst_rel(&got, &reference_logits(&with, &TOKENS, RefOpts::cortiq()));
     println!(
@@ -208,7 +180,8 @@ fn negative_candidate_source_runs_without_prefiltering() {
         fmt_errs(&errs),
         TOKENS.len()
     );
-    assert!(exact * 3 >= TOKENS.len() * 2, "[{}]", fmt_errs(&errs));
+    // Measured on the M4: 12/12 exact (worst 1.4e-7).
+    assert_strict_agreement("without candidates", &errs, TOKENS.len(), EXACT);
     assert!(apart > 1e-3, "candidate pre-filtering never changed a pick");
 }
 
@@ -282,4 +255,49 @@ fn pipeline_loads_fixture_and_matches_direct_walk() {
         bits_equal(&serial, &direct),
         "pipeline and direct walk differ"
     );
+}
+
+/// The quantize-moe capture (`capture_window`) ends every token after its
+/// last captured layer. Over the fixture's compressed-KV + index source
+/// with Engram (layer 1), the second KV source that is also the candidate
+/// source (layer 2) and the index consumer (layer 3), that record — MoE
+/// input rows, routed ids and route weights — equals the one taken through
+/// the whole stack: no layer reads state that a later layer writes.
+#[test]
+fn moe_capture_early_stop_matches_full_forward() {
+    let fx = Fixture::build(1);
+    let l = load_fixture(&fx, "moecap");
+    let (globals, layers, hash) =
+        dsv41::load(&l.model, &l.cfg, l.n_layers, fx.token_map()).expect("load fixture layers");
+    assert!(hash.is_some() && layers[ENGRAM_LAYER].engram.is_some(), "the fixture has an Engram layer");
+    assert!(layers[1].compressor.is_some() && layers[1].indexer.is_some(), "layer 1 is a compressed KV + index source");
+    let mut st = Dsv41State::new(&l.cfg, hash.clone());
+    st.moe_capture = Some(dsv41::Dsv41MoeCapture {
+        lo: 0,
+        hi: N_LAYERS,
+        stop_after_hi: false,
+        x: vec![Vec::new(); N_LAYERS],
+        picks: vec![Vec::new(); N_LAYERS],
+        w: vec![Vec::new(); N_LAYERS],
+    });
+    let mut logits = Vec::new();
+    for (p, &t) in TOKENS.iter().enumerate() {
+        dsv41::forward_token(&globals, &layers, &l.cfg, &mut st, t, p, None, &mut logits);
+    }
+    assert_eq!(logits.len(), VOCAB, "the full forward reaches the head");
+    let full = st.moe_capture.take().expect("full record");
+    for (lo, hi) in [(1, 2), (2, 3), (3, 4), (1, 3)] {
+        let mut st = Dsv41State::new(&l.cfg, hash.clone());
+        let cap = dsv41::capture_window(&globals, &layers, &l.cfg, &mut st, &TOKENS, lo, hi, None)
+            .expect("capture");
+        for k in 0..hi - lo {
+            let li = lo + k;
+            assert_eq!(cap.x[k].len(), TOKENS.len() * DIM);
+            assert_eq!(cap.x[k], full.x[li], "{lo}..{hi}: layer {li} rows");
+            assert_eq!(cap.picks[k], full.picks[li], "{lo}..{hi}: layer {li} routes");
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&cap.w[k]), bits(&full.w[li]), "{lo}..{hi}: layer {li} route weights");
+        }
+    }
+    assert_ne!(full.x[1], full.x[2], "layers record their own inputs");
 }
