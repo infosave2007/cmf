@@ -25,7 +25,7 @@ use std::time::Instant;
 pub struct SignOpts {
     pub opt: ts::SignOpt,
     pub tau: f64,
-    /// Peak sign learning rate; None = auto (0.15·τ/√steps).
+    /// Peak sign learning rate; None = auto (min(0.15·τ/√steps, 4e-3·τ)).
     pub lr: Option<f64>,
     /// Sign steps at η = 0 while the second-moment statistics settle.
     pub warm: usize,
@@ -225,7 +225,10 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
     let sw = nt::Work::new(c, &snet, o.batch, o.window);
     let train_signs = o.signs.is_some();
     let live = snet.sign_live();
-    let eta0 = o.signs.as_ref().map(|s| s.lr.unwrap_or(0.15 * s.tau / (total_steps.max(1) as f64).sqrt())).unwrap_or(0.0);
+    // auto: the random-walk spread of the reference QAT run (0.15·τ/√steps),
+    // capped at its per-step move (lr/τ = 4e-3): on the 0.8B the uncapped
+    // 2.3e-3 for 256 steps flipped 0.2 % of the signs in one step and diverged
+    let eta0 = o.signs.as_ref().map(|s| s.lr.unwrap_or((0.15 * s.tau / (total_steps.max(1) as f64).sqrt()).min(4e-3 * s.tau))).unwrap_or(0.0);
     if let Some(s) = &o.signs {
         eprintln!(
             "sign training: {} signs in {} matrices, optimizer {} ({} B/sign state ≈ {:.2} GB, scratch {:.2} GB), τ {}, η0 {:.3e}{}, warm {} sign steps",
@@ -237,7 +240,7 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
             sw.sg.as_ref().map(|x| x.bytes() as f64 / 1e9).unwrap_or(0.0),
             s.tau,
             eta0,
-            if s.lr.is_none() { " (auto 0.15·τ/√steps)" } else { "" },
+            if s.lr.is_none() { " (auto min(0.15·τ/√steps, 4e-3·τ))" } else { "" },
             s.warm
         );
     }
