@@ -47,8 +47,7 @@ struct Loaded {
 
 fn load_fixture(fx: &Fixture, tag: &str) -> Loaded {
     cpu_only();
-    let path = fx.write(tag);
-    let model = Arc::new(CmfModel::open(&path).expect("open fixture"));
+    let model = fx.open(tag);
     let source = model
         .arch()
         .deepseek_v41

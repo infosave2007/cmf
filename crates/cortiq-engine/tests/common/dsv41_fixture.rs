@@ -497,7 +497,20 @@ impl Fixture {
         }
     }
 
+    /// Write the container, open it and remove its temporary directory.
+    /// The mapping keeps the unlinked file alive for the model's lifetime
+    /// (unix), so nothing is left in the temp dir after the test.
+    pub fn open(&self, tag: &str) -> std::sync::Arc<cortiq_core::CmfModel> {
+        let path = self.write(tag);
+        let model = cortiq_core::CmfModel::open(&path).expect("open fixture");
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        std::sync::Arc::new(model)
+    }
+
     /// Write the container into a fresh directory and return its path.
+    /// Prefer `open`, which also cleans the directory up.
     pub fn write(&self, tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "cmf-dsv41-fixture-{tag}-{}-{}",
