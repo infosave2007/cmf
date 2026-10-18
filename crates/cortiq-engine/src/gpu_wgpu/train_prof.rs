@@ -502,7 +502,7 @@ fn family(kern: &str) -> &'static str {
         "mm" => "gemm",
         "expand" | "expand_n" | "expand_t" => "blr.expand",
         "cvt" | "cvt_col" | "cvt_cols" => "stage.cvt",
-        "scale_acc" => "blr.scale_acc",
+        "scale_acc" | "scale_acc2" => "blr.scale_acc",
         "colsum_prod" | "colsum_part" | "colsum_fin" => "colsum(all)",
         "colsum_fused" | "colsum_fused_t" => "colsum+eltwise",
         "rms_fwd" | "rms_bwd" => "norm",
