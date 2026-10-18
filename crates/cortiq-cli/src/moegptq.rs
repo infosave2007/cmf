@@ -275,7 +275,6 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     let env_f = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(d);
     let diag: Option<Vec<f64>> = std::env::var("CMF_MOE_DIAG").ok().map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect());
     let holdout = if diag.is_some() { env_f("CMF_MOE_HOLDOUT", 8.0) as usize } else { 0 };
-    let prior_n0 = env_f("CMF_MOE_PRIOR", 0.0);
     let prior_s = env_f("CMF_MOE_PRIOR_S", 8192.0) as usize;
     let mut held: Vec<bool> = Vec::with_capacity(ntok);
     for (wi, w) in windows.iter().enumerate() {
@@ -295,8 +294,13 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     if let Some(v) = &diag {
         eprintln!("DIAG: held-out every {holdout}th window, priors {v:?} (pseudo-rows), layers {range_lo}..{range_hi}; no file is written");
     }
+    let n_cal = held.iter().filter(|&&h| !h).count();
+    let prior_env = std::env::var("CMF_MOE_PRIOR").ok().and_then(|v| v.trim().parse::<f64>().ok());
+    let (prior_n0, prior_why) = production_prior(family, prior_env, n_cal, top_k, ne, hidden);
     if prior_n0 > 0.0 {
-        eprintln!("prior: {prior_n0} pseudo-rows (down {}) from {prior_s} calibration tokens", prior_n0 / 4.0);
+        eprintln!("prior: n0 = {prior_n0} pseudo-rows (down {}) from {prior_s} calibration tokens — {prior_why}", prior_n0 / 4.0);
+    } else {
+        eprintln!("prior: none — {prior_why}");
     }
     let nvar = diag.as_ref().map_or(0, Vec::len);
     let mut diag_tot = vec![DiagBin::new(nvar); BINS.len()];
@@ -491,6 +495,8 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
         "window": o.window,
         "lambda": o.lambda,
         "prior": prior_n0,
+        "prior_source": prior_why,
+        "prior_tokens": prior_s,
         "source": o.hf,
         "calibration_model": Path::new(o.calib_model).file_name().map(|f| f.to_string_lossy().into_owned()),
         "experts_gptq": stats.0,
@@ -560,6 +566,22 @@ impl Sink {
                 Ok(())
             }
         }
+    }
+}
+
+/// The layer prior of the production encode (`n0` pseudo-rows, 0 = none)
+/// and why: `CMF_MOE_PRIOR` when set (0 turns it off); for V4.1, when the
+/// mean expert is routed fewer calibration rows than its input width
+/// (`n_cal·top_k/ne < hidden`: most experts' own Hessians are rank
+/// deficient), one hidden width, the value measured best on Flash-Next.
+fn production_prior(family: Family, env: Option<f64>, n_cal: usize, top_k: usize, ne: usize, hidden: usize) -> (f64, String) {
+    let mean = (n_cal * top_k) as f64 / ne.max(1) as f64;
+    match env {
+        Some(v) => (v.max(0.0), format!("CMF_MOE_PRIOR={v}")),
+        None if family == Family::Dsv41 && mean < hidden as f64 => {
+            (hidden as f64, format!("V4.1 default: {mean:.0} routed rows per expert on average, below hidden {hidden} (CMF_MOE_PRIOR overrides)"))
+        }
+        None => (0.0, format!("{mean:.0} routed rows per expert on average (CMF_MOE_PRIOR sets one)")),
     }
 }
 
@@ -1886,6 +1908,20 @@ mod tests {
             got.sort_unstable();
             assert_eq!(got, want, "token {t}");
         }
+    }
+
+    /// The V4.1 prior defaults to one hidden width while the mean expert
+    /// sees fewer rows than that; CMF_MOE_PRIOR always wins; Flash-Next keeps
+    /// no default.
+    #[test]
+    fn production_prior_defaults() {
+        let (n0, why) = production_prior(Family::Dsv41, None, 32768, 6, 384, 5120);
+        assert_eq!(n0, 5120.0, "{why}");
+        assert!(why.contains("512 routed rows"), "{why}");
+        assert_eq!(production_prior(Family::Dsv41, None, 400_000, 6, 384, 5120).0, 0.0, "enough rows: no default");
+        assert_eq!(production_prior(Family::Dsv41, Some(2560.0), 32768, 6, 384, 5120).0, 2560.0);
+        assert_eq!(production_prior(Family::Dsv41, Some(0.0), 32768, 6, 384, 5120).0, 0.0, "CMF_MOE_PRIOR=0 turns it off");
+        assert_eq!(production_prior(Family::Qwen4, None, 32768, 10, 512, 2560).0, 0.0, "Flash-Next unchanged");
     }
 
     /// The hole-punching probe answers without leaving its file behind:
