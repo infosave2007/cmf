@@ -28211,7 +28211,8 @@ pub fn forward_token_graph(
     // blr tensors of ONE input `x` (≤ 3; `act` = gate, up → act(gate)·up
     // into the gate's output): stage V + stage U, two dispatches. `site` ≠ 0
     // caches the two bind groups per (site, layer) like the rest of the
-    // graph (sites 80..97 are blr's: V at `site`, U at `site + 1`).
+    // graph: sites 80..103 are blr's, four per call site (V at `site`, U at
+    // `site + 1`, a second chunk of three at `site + 2/3`).
     let blr_enc = |enc: &mut wgpu::CommandEncoder,
                    mats: &[(&GMat, &wgpu::Buffer)],
                    x: &wgpu::Buffer,
