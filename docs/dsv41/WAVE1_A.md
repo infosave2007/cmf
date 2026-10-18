@@ -126,3 +126,43 @@ GPU test: see "GPU" below.
 Not changed: `dsv4::route` (V4 base) still uses `(1 + e^x).ln()`; V4 is out
 of scope for this wave. `topk_method` is not validated (only `noaux_tc`
 exists for V4.1).
+
+## Part 3: encoding fix 314113f8 ported
+
+`dsv41_encoding.rs` now follows `encoding.py` after `314113f8`:
+- `encode_messages` validates image placeholders on the raw context and
+  messages first, merges tool messages, sorts tool results by call order
+  over context + current turn as one list (the Python dicts are shared, so
+  the context is sorted too) and slices the current turn off by the merged
+  context length, and only then collects images. Images inside tool results
+  therefore come out in prompt order. `encode_messages_text` no longer merges
+  or sorts (it receives preprocessed messages, as `_encode_messages_text`).
+- `merge_tool_messages`: a tool message with `content_blocks` (and non-string
+  `content`) keeps its blocks as the tool_result content; a user message
+  whose `content` is a list uses it as `content_blocks` directly.
+- `last_user_index` (`find_last_user_index`) skips user/mid-system messages
+  whose non-empty `content_blocks` hold no text/image block, i.e. merged
+  tool results: the reasoning of the assistant turn that called the tools is
+  kept and the generation header after the tool results opens `<think>`.
+- `load_cases` ports the reference loader (single case, bare message list,
+  case list; case-level `tools` move onto the first message);
+  `encode_case` treats an empty `thinking_mode` as absent (`or`).
+- Unsupported block placeholders print `None` for a missing type, as the
+  Python f-string does.
+
+Tests: the five official goldens (`encoding/tests/test_input_N.json` ->
+`test_output_N.txt`, copied to `tests/fixtures/dsv41/encoding/`, kept
+byte-exact by a `-text` gitattribute) encode byte-exact through
+`load_cases` + `encode_case(case, chat)`; ports of the reference tests
+`test_v41_tool_result_images_follow_prompt_order` (4 input formats),
+`test_v41_drop_thinking_without_tools`, placeholder rejection for user and
+tool, `merge_tool_messages`, task token. Checked: the three behavioural
+tests fail against the pre-port encoder; the goldens already passed there
+(none of them has a tool result after a thinking turn or tool images).
+
+Remaining divergence (unchanged): a non-string, non-list tool result is
+rendered with JSON (`to_json`) where Python's `str.format` prints a Python
+repr (`None`, `True`, `{'a': 1}`); OpenAI tool messages carry strings or
+block lists, so this was left alone. The V4.1-Flash repo also gained a chat
+template (`2cba9e42`, 2026-10-01) which cortiq does not use (it encodes with
+this port).

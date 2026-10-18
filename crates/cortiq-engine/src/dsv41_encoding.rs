@@ -628,10 +628,21 @@ pub fn merge_tool_messages(messages: &[Value]) -> Result<Vec<Value>, EncodingErr
         let message = object(original)?.clone();
         let message_role = message.get("role").and_then(Value::as_str).unwrap_or("");
         if message_role == "tool" {
+            // A tool result may arrive as structured blocks (text and
+            // images); keep them so the images are collected in prompt
+            // order after the results are sorted.
+            let content = match (message.get("content_blocks"), message.get("content")) {
+                (Some(blocks), content)
+                    if json_truthy(blocks) && !content.is_some_and(Value::is_string) =>
+                {
+                    blocks.clone()
+                }
+                (_, content) => content.cloned().unwrap_or(Value::String(String::new())),
+            };
             let block = json!({
                 "type":"tool_result",
                 "tool_use_id": message.get("tool_call_id").cloned().unwrap_or(Value::String(String::new())),
-                "content": message.get("content").cloned().unwrap_or(Value::String(String::new())),
+                "content": content,
             });
             let can_append = merged.last().is_some_and(|m: &Value| {
                 m.get("role").and_then(Value::as_str) == Some("user")
@@ -650,8 +661,13 @@ pub fn merge_tool_messages(messages: &[Value]) -> Result<Vec<Value>, EncodingErr
                 .get("content_blocks")
                 .filter(|value| !value.is_null())
                 .cloned()
-                .unwrap_or_else(|| {
-                    json!([{"type":"text", "text": message.get("content").cloned().unwrap_or(Value::String(String::new()))}])
+                .unwrap_or_else(|| match message.get("content") {
+                    // OpenAI-style structured content is already a block list.
+                    Some(Value::Array(blocks)) => Value::Array(blocks.clone()),
+                    content => json!([{
+                        "type":"text",
+                        "text": content.cloned().unwrap_or(Value::String(String::new()))
+                    }]),
                 });
             let can_append = merged.last().is_some_and(|m: &Value| {
                 m.get("role").and_then(Value::as_str) == Some("user")
@@ -733,6 +749,10 @@ pub fn sort_tool_results_by_call_order(messages: &mut [Value]) {
     }
 }
 
+/// Index of the message that opened the current turn. Mid-conversation
+/// system messages count as user turns; a user message holding only tool
+/// results does not start a new turn, so the reasoning of the assistant
+/// message that called the tools stays in the prompt.
 fn last_user_index(messages: &[Value]) -> isize {
     messages
         .iter()
@@ -740,7 +760,18 @@ fn last_user_index(messages: &[Value]) -> isize {
         .rev()
         .find(|(idx, m)| {
             let role = m.get("role").and_then(Value::as_str);
-            role == Some("user") || (role == Some("system") && *idx > 0)
+            if !(role == Some("user") || (role == Some("system") && *idx > 0)) {
+                return false;
+            }
+            match m.get("content_blocks").and_then(Value::as_array) {
+                Some(blocks) if !blocks.is_empty() => blocks.iter().any(|block| {
+                    matches!(
+                        block.get("type").and_then(Value::as_str),
+                        Some("text" | "image" | "image_url")
+                    )
+                }),
+                _ => true,
+            }
         })
         .map(|(i, _)| i as isize)
         .unwrap_or(-1)
@@ -775,10 +806,7 @@ fn render_content_blocks(blocks: &[Value]) -> String {
                             if part.get("type").and_then(Value::as_str) == Some("text") {
                                 text(part.get("text"))
                             } else {
-                                format!(
-                                    "[Unsupported {}]",
-                                    part.get("type").and_then(Value::as_str).unwrap_or("block")
-                                )
+                                format!("[Unsupported {}]", python_type_label(part))
                             }
                         })
                         .collect::<Vec<_>>()
@@ -797,11 +825,19 @@ fn render_content_blocks(blocks: &[Value]) -> String {
                 };
                 format!("<tool_result>{rendered}</tool_result>")
             }
-            Some(kind) => format!("[Unsupported {kind}]"),
-            None => String::new(),
+            _ => format!("[Unsupported {}]", python_type_label(block)),
         })
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// `f"{block.get('type')}"` for the unsupported-block placeholder.
+fn python_type_label(block: &Value) -> String {
+    match block.get("type") {
+        None | Some(Value::Null) => "None".to_string(),
+        Some(Value::String(kind)) => kind.clone(),
+        Some(other) => to_json(other),
+    }
 }
 
 fn task_token(task: &str) -> Option<&'static str> {
@@ -986,50 +1022,34 @@ fn drop_thinking_messages(messages: &[Value]) -> Vec<Value> {
         .collect()
 }
 
+/// Render already preprocessed messages (tool messages merged, tool
+/// results sorted, image blocks replaced) after `context`.
 fn encode_messages_text(
     messages: &[Value],
     options: &EncodeOptions,
     context: &[Value],
 ) -> Result<String, EncodingError> {
-    let mut current = merge_tool_messages(messages)?;
-    // The reference sorts the original context plus the merged current turn,
-    // then slices back to the current portion using the original context
-    // length.  It subsequently merges/sorts context independently.  Keep
-    // that ordering: tool results belonging to a prior assistant call must
-    // never move across the context/current boundary.
-    let original_context_len = context.len();
-    let mut sorted_current = context.to_vec();
-    sorted_current.append(&mut current);
-    sort_tool_results_by_call_order(&mut sorted_current);
-    let current = sorted_current
-        .into_iter()
-        .skip(original_context_len)
-        .collect::<Vec<_>>();
-    let mut ctx = merge_tool_messages(context)?;
-    sort_tool_results_by_call_order(&mut ctx);
-    let mut full = ctx.clone();
-    full.extend(current.iter().cloned());
+    let mut full = context.to_vec();
+    full.extend(messages.iter().cloned());
     let mut prompt = if options.add_default_bos_token && context.is_empty() {
         BOS_TOKEN.to_string()
     } else {
         String::new()
     };
+    // Any message carrying tools keeps every turn's reasoning.
     let effective_drop = options.drop_thinking
-        && !full.iter().any(|m| {
-            m.get("tools")
-                .and_then(Value::as_array)
-                .is_some_and(|tools| !tools.is_empty())
-        });
+        && !full
+            .iter()
+            .any(|m| m.get("tools").is_some_and(json_truthy));
     let (render_messages, render_count, context_len) =
         if options.thinking_mode == ThinkingMode::Thinking && effective_drop {
             let reduced_full = drop_thinking_messages(&full);
-            let reduced_context = drop_thinking_messages(&ctx);
+            let reduced_context = drop_thinking_messages(context);
             let count = reduced_full.len().saturating_sub(reduced_context.len());
-            (reduced_full, count, reduced_context.len())
+            let context_len = reduced_full.len() - count;
+            (reduced_full, count, context_len)
         } else {
-            // `current` may gain/lose entries while tool messages are merged; the
-            // official implementation renders the merged current list.
-            (full, current.len(), ctx.len())
+            (full, messages.len(), context.len())
         };
     let render_options = EncodeOptions {
         drop_thinking: effective_drop,
@@ -1051,15 +1071,27 @@ pub fn encode_messages(
     messages: &[Value],
     options: &EncodeOptions,
 ) -> Result<EncodedPrompt, EncodingError> {
-    let (processed_context, _) = if options.context.is_empty() {
+    // Validate before merging can discard message-level textual fields.
+    for message in options.context.iter().chain(messages) {
+        validate_no_image_tokens(message)?;
+    }
+    // Collect images only after tool results are in their final prompt
+    // order. The reference sorts context and current turn as one list (its
+    // dicts are shared, so the context is sorted in place as well) and then
+    // slices the current turn back off by the merged context length.
+    let context = merge_tool_messages(&options.context)?;
+    let context_len = context.len();
+    let mut all = context;
+    all.extend(merge_tool_messages(messages)?);
+    sort_tool_results_by_call_order(&mut all);
+    let current = all.split_off(context_len);
+    let (processed_context, _) = if all.is_empty() {
         (Vec::new(), Vec::new())
     } else {
-        process_image_messages(&options.context)?
+        process_image_messages(&all)?
     };
-    let (processed, images) = process_image_messages(messages)?;
-    let mut render_options = options.clone();
-    render_options.context = processed_context;
-    let prompt = encode_messages_text(&processed, &render_options, &render_options.context)?;
+    let (processed, images) = process_image_messages(&current)?;
+    let prompt = encode_messages_text(&processed, options, &processed_context)?;
     Ok(EncodedPrompt { prompt, images })
 }
 
@@ -1076,6 +1108,59 @@ pub fn encode_messages_simple(
     )
 }
 
+/// Normalize the reference's JSON case files (`encoding/tests/*.json`): a
+/// single case object, a bare message list, or a list of cases. A
+/// case-level `tools` list moves onto the first message, as the official
+/// `load_cases` does.
+pub fn load_cases(data: &Value) -> Result<Vec<Value>, EncodingError> {
+    let cases: Vec<Value> = match data {
+        Value::Object(_) => vec![data.clone()],
+        Value::Array(items)
+            if items
+                .first()
+                .is_some_and(|first| first.get("role").is_some()) =>
+        {
+            vec![json!({ "messages": items })]
+        }
+        Value::Array(items) => items.clone(),
+        _ => {
+            return Err(EncodingError::InvalidMessage(
+                "case file must hold an object or a list".to_string(),
+            ));
+        }
+    };
+    let mut out = Vec::with_capacity(cases.len());
+    for case in cases {
+        let map = object(&case)?;
+        let mut messages = map
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .ok_or_else(|| {
+                EncodingError::InvalidMessage("case has no messages array".to_string())
+            })?;
+        if let Some(tools) = map.get("tools") {
+            let first = messages.first_mut().ok_or_else(|| {
+                EncodingError::InvalidMessage(
+                    "a case with tools must contain at least one message".to_string(),
+                )
+            })?;
+            let first = first.as_object_mut().ok_or_else(|| {
+                EncodingError::InvalidMessage("expected a JSON object".to_string())
+            })?;
+            first.insert("tools".to_string(), tools.clone());
+        }
+        let field = |key: &str| map.get(key).cloned().unwrap_or(Value::Null);
+        out.push(json!({
+            "messages": messages,
+            "context": field("context"),
+            "thinking_mode": field("thinking_mode"),
+            "reasoning_effort": field("reasoning_effort"),
+        }));
+    }
+    Ok(out)
+}
+
 pub fn encode_case(
     case: &Value,
     default_mode: ThinkingMode,
@@ -1085,9 +1170,11 @@ pub fn encode_case(
         .get("messages")
         .and_then(Value::as_array)
         .ok_or_else(|| EncodingError::InvalidMessage("case has no messages array".to_string()))?;
+    // `case.get("thinking_mode") or thinking_mode`: an empty value falls back.
     let mode = map
         .get("thinking_mode")
         .and_then(Value::as_str)
+        .filter(|mode| !mode.is_empty())
         .map(ThinkingMode::parse)
         .transpose()?
         .unwrap_or(default_mode);
@@ -1408,6 +1495,218 @@ mod tests {
             parsed["tool_calls"][0]["function"]["arguments"],
             "{\"q\": \"Paris\"}"
         );
+    }
+
+    /// The official golden fixtures (`encoding/tests/test_input_*.json` ->
+    /// `test_output_*.txt`, DeepSeek-V4.1-Flash-1017), encoded the way
+    /// `test_examples_encoding_golden_outputs` does: `load_cases`, first case,
+    /// `encode_case(case, "chat")`, byte-exact.
+    #[test]
+    fn reference_golden_fixtures_encode_byte_exact() {
+        let cases: [(&str, &str); 5] = [
+            (
+                include_str!("../tests/fixtures/dsv41/encoding/test_input_1.json"),
+                include_str!("../tests/fixtures/dsv41/encoding/test_output_1.txt"),
+            ),
+            (
+                include_str!("../tests/fixtures/dsv41/encoding/test_input_2.json"),
+                include_str!("../tests/fixtures/dsv41/encoding/test_output_2.txt"),
+            ),
+            (
+                include_str!("../tests/fixtures/dsv41/encoding/test_input_3.json"),
+                include_str!("../tests/fixtures/dsv41/encoding/test_output_3.txt"),
+            ),
+            (
+                include_str!("../tests/fixtures/dsv41/encoding/test_input_4.json"),
+                include_str!("../tests/fixtures/dsv41/encoding/test_output_4.txt"),
+            ),
+            (
+                include_str!("../tests/fixtures/dsv41/encoding/test_input_5.json"),
+                include_str!("../tests/fixtures/dsv41/encoding/test_output_5.txt"),
+            ),
+        ];
+        for (i, (input, output)) in cases.iter().enumerate() {
+            let data: Value = serde_json::from_str(input).unwrap();
+            let case = load_cases(&data).unwrap().remove(0);
+            let encoded = encode_case(&case, ThinkingMode::Chat).unwrap();
+            assert_eq!(encoded.prompt, *output, "test_output_{}.txt", i + 1);
+        }
+        // Case 5 carries two images in prompt order.
+        let data: Value = serde_json::from_str(cases[4].0).unwrap();
+        let case = load_cases(&data).unwrap().remove(0);
+        let images = encode_case(&case, ThinkingMode::Chat).unwrap().images;
+        assert_eq!(
+            images,
+            vec![
+                json!({"type":"image","url":"examples/images/carrots.jpeg"}),
+                json!({"type":"image","url":"examples/images/corn.jpeg"}),
+            ]
+        );
+    }
+
+    /// `test_v41_tool_result_images_follow_prompt_order` (reference commit
+    /// 314113f8): tool results are sorted into call order before image
+    /// records are collected, for results given as content blocks, as tool
+    /// messages with list content, as tool messages with `content_blocks`,
+    /// and across the context boundary.
+    #[test]
+    fn tool_result_images_follow_prompt_order() {
+        let history = vec![
+            json!({"role":"user","content":[{"type":"image_url","image_url":{"url":"history.png"}}]}),
+            json!({"role":"assistant","tool_calls":[
+                {"id":"a","type":"function","function":{"name":"a","arguments":"{}"}},
+                {"id":"b","type":"function","function":{"name":"b","arguments":"{}"}},
+            ]}),
+        ];
+        let results: Vec<Value> = ["b", "a"]
+            .iter()
+            .map(|name| {
+                json!({"type":"tool_result","tool_use_id":name,"content":[
+                    {"type":"text","text":format!("result {name}")},
+                    {"type":"image_url","image_url":{"url":format!("{name}.png")}},
+                ]})
+            })
+            .collect();
+        for format in [
+            "content_blocks",
+            "tool_messages",
+            "tool_content_blocks",
+            "context",
+        ] {
+            let (messages, context) = match format {
+                "tool_messages" | "tool_content_blocks" => {
+                    let field = if format == "tool_content_blocks" {
+                        "content_blocks"
+                    } else {
+                        "content"
+                    };
+                    let mut messages = history.clone();
+                    for block in &results {
+                        let mut m = Map::new();
+                        m.insert("role".into(), json!("tool"));
+                        m.insert("tool_call_id".into(), block["tool_use_id"].clone());
+                        m.insert(field.into(), block["content"].clone());
+                        messages.push(Value::Object(m));
+                    }
+                    (messages, Vec::new())
+                }
+                "context" => (
+                    vec![json!({"role":"user","content_blocks":results})],
+                    history.clone(),
+                ),
+                _ => {
+                    let mut messages = history.clone();
+                    messages.push(json!({"role":"user","content_blocks":results}));
+                    (messages, Vec::new())
+                }
+            };
+            let original = (messages.clone(), context.clone());
+            let encoded = encode_messages(
+                &messages,
+                &EncodeOptions {
+                    context: context.clone(),
+                    ..EncodeOptions::default()
+                },
+            )
+            .unwrap();
+            assert!(
+                encoded.prompt.ends_with(&format!(
+                    "<｜User｜><tool_result>result a\n\n{IMAGE_PLACEHOLDER}</tool_result>\n\n\
+                     <tool_result>result b\n\n{IMAGE_PLACEHOLDER}</tool_result><｜Assistant｜></think>"
+                )),
+                "{format}: {}",
+                encoded.prompt
+            );
+            let urls: &[&str] = if context.is_empty() {
+                &["history.png", "a.png", "b.png"]
+            } else {
+                &["a.png", "b.png"]
+            };
+            let expected: Vec<Value> = urls
+                .iter()
+                .map(|url| json!({"type":"image","url":url}))
+                .collect();
+            assert_eq!(encoded.images, expected, "{format}");
+            assert_eq!((messages, context), original, "{format}: inputs mutated");
+        }
+    }
+
+    /// `test_v41_drop_thinking_without_tools` (314113f8): completed turns
+    /// lose their reasoning, the current turn keeps it across tool results,
+    /// and a following user message closes that turn.
+    #[test]
+    fn current_turn_thinking_survives_tool_results() {
+        let messages = vec![
+            json!({"role":"user","content":"q1"}),
+            json!({"role":"assistant","content":"a1","reasoning_content":"r1"}),
+            json!({"role":"user","content":"q2"}),
+            json!({"role":"assistant","reasoning_content":"r2","tool_calls":[
+                {"id":"c1","type":"function","function":{"name":"lookup","arguments":"{}"}}
+            ]}),
+            json!({"role":"tool","tool_call_id":"c1","content":"value"}),
+        ];
+        let options = EncodeOptions {
+            thinking_mode: ThinkingMode::Thinking,
+            drop_thinking: true,
+            ..EncodeOptions::default()
+        };
+        let prompt = encode_messages(&messages, &options).unwrap().prompt;
+        assert!(prompt.contains("<｜User｜>q1<｜Assistant｜></think>a1<｜end▁of▁sentence｜>"));
+        assert!(!prompt.contains("r1"));
+        assert!(prompt.contains("<think>r2</think>"), "{prompt}");
+        assert!(
+            prompt.ends_with("<tool_result>value</tool_result><｜Assistant｜><think>"),
+            "{prompt}"
+        );
+        let mut next = messages.clone();
+        next.push(json!({"role":"user","content":"q3"}));
+        let next_turn = encode_messages(&next, &options).unwrap().prompt;
+        assert!(!next_turn.contains("r2"), "{next_turn}");
+        assert!(next_turn.ends_with("q3<｜Assistant｜><think>"));
+    }
+
+    /// The reference reference-tests around the same change: placeholders in
+    /// user or tool text are refused before merging; tool messages merge
+    /// into one user message of tool_result blocks; a task token replaces the
+    /// assistant header.
+    #[test]
+    fn reference_preprocessing_rules() {
+        for role in ["user", "tool"] {
+            let err = encode_messages(
+                &[json!({"role":role,"content":format!("hi {IMAGE_PLACEHOLDER}")})],
+                &EncodeOptions::default(),
+            );
+            assert!(err.is_err(), "{role} placeholder accepted");
+        }
+        let merged = merge_tool_messages(&[
+            json!({"role":"assistant","content":"","tool_calls":[]}),
+            json!({"role":"tool","tool_call_id":"a","content":"r1"}),
+            json!({"role":"tool","tool_call_id":"b","content":"r2"}),
+        ])
+        .unwrap();
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[1]["role"], "user");
+        let kinds: Vec<&str> = merged[1]["content_blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["tool_result", "tool_result"]);
+        let prompt = encode_messages(
+            &[json!({"role":"user","content":"classify me","task":"query"})],
+            &EncodeOptions::default(),
+        )
+        .unwrap()
+        .prompt;
+        assert!(prompt.ends_with("classify me<｜query｜>"));
+        assert!(!prompt.contains(ASSISTANT_SP_TOKEN));
+        // A user turn holding only tool results does not open a new turn.
+        let only_tools = [
+            json!({"role":"user","content":"q"}),
+            json!({"role":"user","content_blocks":[{"type":"tool_result","tool_use_id":"x","content":"v"}]}),
+        ];
+        assert_eq!(last_user_index(&only_tools), 0);
     }
 
     #[test]
