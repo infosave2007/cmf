@@ -1396,10 +1396,13 @@ mod tests {
     }
 
     /// Throughput of the graph kernels at Qwen3.8-27B's NVG 0.55 bpw shapes
-    /// (random payloads of the file's ranks): per group the best of several
-    /// submits of `BLR_BENCH_REPS` (200) back-to-back V+U pairs, as µs per pair and as the
-    /// payload's effective read bandwidth. `--ignored --nocapture`.
-    /// `BLR_BENCH_STAGE=v|u` times one stage alone (the other is skipped).
+    /// (random payloads of the file's ranks), in the DRAM regime the token
+    /// graph sees: each group is uploaded `BLR_BENCH_COPIES` times (default:
+    /// enough copies for ~512 MB, past any L2) and one submit runs every
+    /// copy's V+U pair once; device timestamps around the block, best of
+    /// `BLR_BENCH_TRIES` (12). µs per pair and the payload's effective read
+    /// bandwidth. `BLR_BENCH_STAGE=v|u` times one stage alone.
+    /// `--ignored --nocapture`.
     #[test]
     #[ignore]
     fn wgpu_blr_graph_throughput_27b_shapes() {
@@ -1411,15 +1414,15 @@ mod tests {
         let _op = c.op_gate.enter();
         let g = graph_pipes(c).expect("graph kernels");
         let mut rng = crate::blr::tests::Rng(7);
-        let reps: usize = std::env::var("BLR_BENCH_REPS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(200);
         let stage = match std::env::var("BLR_BENCH_STAGE").as_deref() {
             Ok("v") => Some(0usize),
             Ok("u") => Some(1usize),
             _ => None,
         };
+        let env_n = |k: &str, d: usize| -> usize {
+            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        };
+        let tries = env_n("BLR_BENCH_TRIES", 12);
         // (label, d_in, [(d_out, r, P)], act)
         let groups: &[(&str, usize, &[(usize, usize, usize)], bool)] = &[
             ("gdn qkv|z", 5120, &[(10240, 920, 2), (6144, 744, 2)], false),
@@ -1431,26 +1434,54 @@ mod tests {
             ("0.8B gate|up act", 1024, &[(3584, 376, 2), (3584, 376, 2)], true),
             ("0.8B down", 3584, &[(1024, 776, 1)], false),
         ];
+        let qs = c
+            .device
+            .features()
+            .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
+            .then(|| {
+                c.device.create_query_set(&wgpu::QuerySetDescriptor {
+                    label: Some("blr-bench-ts"),
+                    ty: wgpu::QueryType::Timestamp,
+                    count: 2,
+                })
+            });
+        let qres = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("blr-bench-qres"),
+            size: 16,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let qstage = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("blr-bench-qstage"),
+            size: 16,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         for &(label, d_in, specs, act) in groups {
             let payloads: Vec<Vec<u8>> = specs
                 .iter()
                 .map(|&(d_out, r, np)| crate::blr::tests::make(&mut rng, d_out, d_in, r, np))
                 .collect();
             let bytes: usize = payloads.iter().map(|p| p.len()).sum();
-            let bufs: Vec<wgpu::Buffer> = payloads
-                .iter()
-                .map(|p| {
-                    c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("blr-bench-w"),
-                        contents: p,
-                        usage: wgpu::BufferUsages::STORAGE,
-                    })
+            let copies = env_n("BLR_BENCH_COPIES", (512usize << 20).div_ceil(bytes).clamp(1, 96));
+            // Per copy: the payloads and their f32 g.
+            let bufs: Vec<Vec<(wgpu::Buffer, wgpu::Buffer)>> = (0..copies)
+                .map(|_| {
+                    specs
+                        .iter()
+                        .zip(&payloads)
+                        .map(|(&(d_out, _, _), p)| {
+                            (
+                                c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                    label: Some("blr-bench-w"),
+                                    contents: p,
+                                    usage: wgpu::BufferUsages::STORAGE,
+                                }),
+                                g_f32_upload(c, &[d_out, d_in], p).unwrap(),
+                            )
+                        })
+                        .collect()
                 })
-                .collect();
-            let gbufs: Vec<wgpu::Buffer> = specs
-                .iter()
-                .zip(&payloads)
-                .map(|(&(d_out, _, _), p)| g_f32_upload(c, &[d_out, d_in], p).unwrap())
                 .collect();
             let x: Vec<f32> = (0..d_in).map(|_| rng.f()).collect();
             let x_buf = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1469,74 +1500,49 @@ mod tests {
                     })
                 })
                 .collect();
-            let mats: Vec<GroupMat<'_>> = specs
-                .iter()
-                .enumerate()
-                .map(|(j, &(d_out, r, np))| GroupMat {
-                    buf: &bufs[j],
-                    g: &gbufs[j],
-                    dims: BlrDims {
-                        rows: d_out,
-                        cols: d_in,
-                        r,
-                        np,
-                    },
-                    y: &ys[j],
-                })
-                .collect();
+            let dims = |j: usize| BlrDims {
+                rows: specs[j].0,
+                cols: d_in,
+                r: specs[j].1,
+                np: specs[j].2,
+            };
+            let lat: usize = (0..specs.len()).map(|j| dims(j).latents()).sum();
             let t_buf = c.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("blr-bench-t"),
-                size: (group_latents(&mats) * 4) as u64,
+                size: (lat * 4) as u64,
                 usage: wgpu::BufferUsages::STORAGE,
                 mapped_at_creation: false,
             });
             let code = act.then_some(0u32);
-            let mut best = f64::MAX;
-            let tries: usize = std::env::var("BLR_BENCH_TRIES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(12);
-            // Device timestamps around the block when the device has them
-            // (a shared card's submit latency and time slices stay out of
-            // the shortest block), else the host clock.
-            let ts = c
-                .device
-                .features()
-                .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
-            let qs = ts.then(|| {
-                c.device.create_query_set(&wgpu::QuerySetDescriptor {
-                    label: Some("blr-bench-ts"),
-                    ty: wgpu::QueryType::Timestamp,
-                    count: 2,
+            let prepped: Vec<[StageDispatch<'_>; 2]> = bufs
+                .iter()
+                .map(|cp| {
+                    let mats: Vec<GroupMat<'_>> = cp
+                        .iter()
+                        .enumerate()
+                        .map(|(j, (w, gb))| GroupMat {
+                            buf: w,
+                            g: gb,
+                            dims: dims(j),
+                            y: &ys[j],
+                        })
+                        .collect();
+                    prep_group(c, &g, &mats, &x_buf, &t_buf, code, &|_, l, b| plain_bind(c, l, b))
+                        .expect("contract")
                 })
-            });
-            let qres = c.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("blr-bench-qres"),
-                size: 16,
-                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            });
-            let qstage = c.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("blr-bench-qstage"),
-                size: 16,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+                .collect();
+            let mut best = f64::MAX;
             for _ in 0..tries {
                 let mut enc = c
                     .device
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-                let [v, u] = prep_group(c, &g, &mats, &x_buf, &t_buf, code, &|_, l, b| {
-                    plain_bind(c, l, b)
-                })
-                .expect("contract");
                 if let Some(q) = &qs {
                     enc.write_timestamp(q, 0);
                 }
                 {
                     let mut pass = begin_pass(&mut enc);
-                    for _ in 0..reps {
-                        for (si, (p, b, n)) in [&v, &u].into_iter().enumerate() {
+                    for vu in &prepped {
+                        for (si, (p, b, n)) in vu.iter().enumerate() {
                             if stage.is_some_and(|s| s != si) {
                                 continue;
                             }
@@ -1573,9 +1579,9 @@ mod tests {
                 };
                 best = best.min(dt);
             }
-            let us = best * 1e6 / reps as f64;
+            let us = best * 1e6 / copies as f64;
             eprintln!(
-                "blr-bench {label:18} {:7.2} MB  {us:8.1} us/pair  {:7.1} GB/s",
+                "blr-bench {label:18} {:7.2} MB x{copies:<3} {us:8.1} us/pair  {:7.1} GB/s",
                 bytes as f64 / 1e6,
                 bytes as f64 / (us * 1e-6) / 1e9
             );

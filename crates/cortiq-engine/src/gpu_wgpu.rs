@@ -29705,6 +29705,7 @@ pub fn forward_token_graph(
                             88,
                             li,
                         );
+                        ts_point!(enc, 53); // CMF_GRAPH_TS_ALL: GDN projections (fallback arm)
                         go(
                             &mut enc,
                             &c.gdn_conv,
@@ -29731,6 +29732,7 @@ pub fn forward_token_graph(
                                 *nv as u32,
                             );
                         }
+                        ts_point!(enc, 54); // conv + recurrent step + norm
                         let Some(out_in) = prism_input(&mut enc, &[out], &gdo_b, nv * dv) else {
                             graph_decline("Prism GDN output transform unavailable");
                             return token_graph_outcome(o1_started || state_started, false);
@@ -30163,6 +30165,7 @@ pub fn forward_token_graph(
                                 96,
                                 li,
                             );
+                            ts_point!(enc, 56); // blr gate|up + act
                         } else {
                             group_mats_at(
                                 &mut enc,
@@ -31292,6 +31295,9 @@ pub fn forward_token_graph(
                     (45, _) => "|ffn:tail",
                     (50, _) => "|pre-fwht-span",
                     (51, _) => "|fwht-dispatch-span",
+                    (53, _) => "|gdn:proj",
+                    (54, _) => "|gdn:rec",
+                    (56, _) => "|ffn:gu",
                     _ => "start",
                 };
                     let mut line = String::from("gpu-ts: timeline spans (later-stamp attribution):");
