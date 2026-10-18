@@ -732,9 +732,11 @@ fn layer_bwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, dy: &wgpu:
     to::run(c, &[to::elt(c, "swiglu_bwd", n * g.inter, w.get("gg"), w.get("uu"), None, Some(w.get("dhh")), Some(w.get("dgg")), Some(w.get("duu")))?]);
     lin_bwd(c, w, &ly.gate, w.get("n2"), w.get("dgg"), w.get("dn2"), false, gs, sg)?;
     lin_bwd(c, w, &ly.up, w.get("n2"), w.get("duu"), w.get("dn2"), true, gs, sg)?;
+    let [dw1, dw2] = to::rms_dw(c, w.get("x2"), w.get("inv2"), w.get("dn2"), &ly.ln2.g, n, g.hs)?;
     to::run(c, &[
         to::rms_bwd(c, w.get("x2"), &ly.ln2.w, w.get("inv2"), w.get("dn2"), w.get("dx2"), n, g.hs, g.gemma)?,
-        to::rms_dw(c, w.get("x2"), w.get("inv2"), w.get("dn2"), &ly.ln2.g, n, g.hs)?,
+        dw1,
+        dw2,
         to::elt(c, "add", n * g.hs, w.get("dx2"), dy, Some(w.get("dx2")), None, None, None)?,
     ]);
     // mixer: x2 = x + mix(n1)
@@ -763,22 +765,20 @@ fn layer_bwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, dy: &wgpu:
                 to::qkr_bwd(c, kg, w.get("k"), &kn.w, w.get("kinv"), &w.rope, w.get("dkr"), w.get("dk"), w.get("dwk"))?,
             ]);
             // gain grads (summed over rows·heads) into the norms' gradients
-            let gq = to::zeros(c, g.hd);
-            let gk = to::zeros(c, g.hd);
-            to::run(c, &[to::qkr_dw(c, qg, w.get("dwq"), &gq)?, to::qkr_dw(c, kg, w.get("dwk"), &gk)?]);
-            to::run(c, &[
-                to::elt(c, "add", g.hd, &qn.g, &gq, Some(&qn.g), None, None, None)?,
-                to::elt(c, "add", g.hd, &kn.g, &gk, Some(&kn.g), None, None, None)?,
-            ]);
+            let [q1, q2] = to::qkr_dw(c, qg, w.get("dwq"), &qn.g, true)?;
+            let [k1, k2] = to::qkr_dw(c, kg, w.get("dwk"), &kn.g, true)?;
+            to::run(c, &[q1, q2, k1, k2]);
             tm::run(c, &[Op::D(tm::split_qg(c, w.get("dqg"), w.get("dq"), w.get("dgate"), n, g.nh, g.hd, true)?)]);
             lin_bwd(c, w, q, w.get("n1"), w.get("dqg"), w.get("dn1"), false, gs, sg)?;
             lin_bwd(c, w, k, w.get("n1"), w.get("dk"), w.get("dn1"), true, gs, sg)?;
             lin_bwd(c, w, v, w.get("n1"), w.get("dv"), w.get("dn1"), true, gs, sg)?;
         }
     }
+    let [dw1, dw2] = to::rms_dw(c, x, w.get("inv1"), w.get("dn1"), &ly.ln1.g, n, g.hs)?;
     to::run(c, &[
         to::rms_bwd(c, x, &ly.ln1.w, w.get("inv1"), w.get("dn1"), dx, n, g.hs, g.gemma)?,
-        to::rms_dw(c, x, w.get("inv1"), w.get("dn1"), &ly.ln1.g, n, g.hs)?,
+        dw1,
+        dw2,
         to::elt(c, "add", n * g.hs, dx, w.get("dx2"), Some(dx), None, None, None)?,
     ]);
     Some(())
@@ -869,10 +869,8 @@ pub fn step(c: Ctx, net: &Net, w: &Work, ids: &[u32], tid: &[u32], tp: &[f32], k
     // final norm backward: dx at the last checkpoint
     let (da, db) = (w.get("dx"), w.get("dmix"));
     let ph = prof::phase("bwd.final_norm");
-    to::run(c, &[
-        to::rms_bwd(c, &w.ckpt[g.nl], &net.final_norm.w, w.get("invf"), w.get("dn1"), da, n, g.hs, g.gemma)?,
-        to::rms_dw(c, &w.ckpt[g.nl], w.get("invf"), w.get("dn1"), &net.final_norm.g, n, g.hs)?,
-    ]);
+    let [dw1, dw2] = to::rms_dw(c, &w.ckpt[g.nl], w.get("invf"), w.get("dn1"), &net.final_norm.g, n, g.hs)?;
+    to::run(c, &[to::rms_bwd(c, &w.ckpt[g.nl], &net.final_norm.w, w.get("invf"), w.get("dn1"), da, n, g.hs, g.gemma)?, dw1, dw2]);
     drop(ph);
     let mut cur = da;
     let mut nxt = db;
