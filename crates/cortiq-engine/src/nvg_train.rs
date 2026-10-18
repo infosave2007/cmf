@@ -31,6 +31,9 @@ use std::collections::HashMap;
 
 type Ctx = crate::gpu_wgpu::CtxRef;
 
+/// The opt-in step profiler (`CMF_NVG_PROF`, see `gpu_wgpu::train_prof`).
+pub use crate::gpu_wgpu::train_prof as prof;
+
 // ───────────────────────────── geometry ─────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -632,7 +635,9 @@ fn lin_bwd(c: Ctx, w: &Work, lin: &Lin, x: &wgpu::Buffer, dy: &wgpu::Buffer, dx:
 
 fn zero(c: Ctx, b: &wgpu::Buffer, n: usize) {
     let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("zero") });
+    let mut mk = prof::enc_begin(c, &mut enc);
     enc.clear_buffer(b, 0, Some((n * 4) as u64));
+    prof::enc_mark(c, &mut enc, &mut mk, "clear");
     crate::gpu_wgpu::submit_pub(c, enc.finish());
 }
 
@@ -642,7 +647,9 @@ fn copy(c: Ctx, src: &wgpu::Buffer, dst: &wgpu::Buffer, n: usize) {
 
 fn copy_off(c: Ctx, src: &wgpu::Buffer, so: usize, dst: &wgpu::Buffer, d_o: usize, n: usize) {
     let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("copy") });
+    let mut mk = prof::enc_begin(c, &mut enc);
     enc.copy_buffer_to_buffer(src, (so * 4) as u64, dst, (d_o * 4) as u64, (n * 4) as u64);
+    prof::enc_mark(c, &mut enc, &mut mk, "copy");
     crate::gpu_wgpu::submit_pub(c, enc.finish());
 }
 
@@ -655,6 +662,8 @@ fn gdn_params(c: Ctx, w: &Work, g: &Geom, a_log: &[f32], dt_bias: &[f32], norm: 
     prm.extend_from_slice(dt_bias);
     prm.extend_from_slice(norm);
     prm.extend_from_slice(conv);
+    prof::count(prof::Cnt::Write, 1);
+    prof::count(prof::Cnt::WriteBytes, (prm.len() * 4) as u64);
     c.queue.write_buffer(tape.prm(), 0, bytemuck::cast_slice(&prm));
 }
 
@@ -778,6 +787,7 @@ fn layer_bwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, dy: &wgpu:
 // ───────────────────────────── forward / step ─────────────────────────────
 
 fn embed(c: Ctx, net: &Net, w: &Work, ids: &[u32]) {
+    let _p = prof::phase("embed");
     let hs = net.geom.hs;
     let mut rows = vec![0f32; ids.len() * hs];
     for (t, &id) in ids.iter().enumerate() {
@@ -786,6 +796,8 @@ fn embed(c: Ctx, net: &Net, w: &Work, ids: &[u32]) {
             *d = f16_to_f32(s);
         }
     }
+    prof::count(prof::Cnt::Write, 1);
+    prof::count(prof::Cnt::WriteBytes, (rows.len() * 4) as u64);
     c.queue.write_buffer(&w.ckpt[0], 0, bytemuck::cast_slice(&rows));
 }
 
@@ -794,9 +806,11 @@ fn embed(c: Ctx, net: &Net, w: &Work, ids: &[u32]) {
 fn forward(c: Ctx, net: &Net, w: &Work, ids: &[u32]) -> Option<()> {
     embed(c, net, w, ids);
     for l in 0..net.geom.nl {
+        let _p = prof::phase(if net.geom.gdn_layer[l] { "fwd.gdn" } else { "fwd.attn" });
         layer_fwd(c, net, w, l, &w.ckpt[l], &w.ckpt[l + 1])?;
     }
     let g = &net.geom;
+    let _p = prof::phase("fwd.final_norm");
     to::run(c, &[to::rms_fwd(c, &w.ckpt[g.nl], &net.final_norm.w, w.get("n1"), w.get("invf"), w.ntok, g.hs, g.eps, g.gemma)?]);
     Some(())
 }
@@ -832,35 +846,48 @@ pub struct StepStats {
 pub fn step(c: Ctx, net: &Net, w: &Work, ids: &[u32], tid: &[u32], tp: &[f32], k: usize, gscale: f32, sign: Option<&SignStepCfg>) -> Option<StepStats> {
     let g = &net.geom;
     let n = w.ntok;
+    prof::step_begin();
     let sign = if w.sg.is_some() { sign } else { None };
     if let (Some(_), Some(sc)) = (sign, w.sg.as_ref()) {
+        let _p = prof::phase("counters");
         ts::reset_counters(c, sc);
     }
     forward(c, net, w, ids)?;
+    let ph = prof::phase("head");
     let btid = to::zeros(c, n * k);
+    prof::count(prof::Cnt::Write, 1);
+    prof::count(prof::Cnt::WriteBytes, (tid.len() * 4) as u64);
     c.queue.write_buffer(&btid, 0, bytemuck::cast_slice(tid));
     let btp = to::upload(c, tp);
     th::head_kl(c, &net.head, &w.head, w.get("n1"), &btid, &btp, k, w.get("dn1"), w.get("loss"), n, n, gscale)?;
     let loss: f64 = to::download(c, w.get("loss"), n)?.iter().map(|&x| x as f64).sum::<f64>() / n as f64;
+    drop(ph);
     let mut st = StepStats { loss, finite: loss.is_finite(), ..Default::default() };
     if sign.is_some() && !st.finite {
         return Some(st);
     }
     // final norm backward: dx at the last checkpoint
     let (da, db) = (w.get("dx"), w.get("dmix"));
+    let ph = prof::phase("bwd.final_norm");
     to::run(c, &[
         to::rms_bwd(c, &w.ckpt[g.nl], &net.final_norm.w, w.get("invf"), w.get("dn1"), da, n, g.hs, g.gemma)?,
         to::rms_dw(c, &w.ckpt[g.nl], w.get("invf"), w.get("dn1"), &net.final_norm.g, n, g.hs)?,
     ]);
+    drop(ph);
     let mut cur = da;
     let mut nxt = db;
     for l in (0..g.nl).rev() {
+        let gdn = g.gdn_layer[l];
+        let ph = prof::phase(if gdn { "recomp.gdn" } else { "recomp.attn" });
         layer_fwd(c, net, w, l, &w.ckpt[l], w.get("x"))?;
+        drop(ph);
+        let _p = prof::phase(if gdn { "bwd.gdn" } else { "bwd.attn" });
         layer_bwd(c, net, w, l, &w.ckpt[l], cur, nxt, gscale, sign)?;
         std::mem::swap(&mut cur, &mut nxt);
     }
     st.backward = true;
     if let (Some(_), Some(sc)) = (sign, w.sg.as_ref()) {
+        let _p = prof::phase("counters");
         let cnt = ts::read_reset_counters(c, sc)?;
         for (i, f) in st.flips_role.iter_mut().enumerate() {
             *f = cnt[i] as u64;
@@ -930,6 +957,7 @@ pub fn sign_stats(c: Ctx, net: &Net) -> Option<Vec<(String, u64, u64)>> {
 }
 /// Global gradient norm over every parameter (NaN/inf when a gradient is).
 pub fn grad_norm(c: Ctx, net: &Net) -> Option<f64> {
+    let _p = prof::phase("opt.grad_norm");
     let mut s = 0f64;
     for p in net.params() {
         s += tm::sumsq(c, &p.g, p.n)?;
@@ -939,6 +967,7 @@ pub fn grad_norm(c: Ctx, net: &Net) -> Option<f64> {
 
 /// Clear every gradient (a skipped step).
 pub fn zero_grads(c: Ctx, net: &Net) {
+    let _p = prof::phase("opt.zero");
     for p in net.params() {
         zero(c, &p.g, p.n);
     }
@@ -948,6 +977,7 @@ pub fn zero_grads(c: Ctx, net: &Net) {
 /// multiplied by `gmul` (clipping); clears the grads.
 #[allow(clippy::too_many_arguments)]
 pub fn adam(c: Ctx, net: &Net, lr: f32, step_no: u32, b1: f32, b2: f32, eps: f32, gmul: f32) -> Option<()> {
+    let _p = prof::phase("opt.adam");
     for p in net.params() {
         tm::run(c, &[Op::D(tm::adam(c, &p.w, &p.g, &p.m1, &p.m2, p.mask.as_ref(), p.n, lr, step_no, b1, b2, eps, gmul, p.rel)?)]);
         zero(c, &p.g, p.n);

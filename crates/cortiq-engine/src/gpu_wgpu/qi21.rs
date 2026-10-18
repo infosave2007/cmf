@@ -620,6 +620,7 @@ fn mm(c: &Ctx, g: MmCfg, a: &MmArgs, extra: u32, plane: &wgpu::Buffer, act: &wgp
         pipe,
         bg,
         grid: (a.n / g.bn, a.m.div_ceil(g.bm)),
+        mnk: [a.m, a.n, a.k],
     })
 }
 

@@ -619,7 +619,11 @@ pub(super) fn module(c: &Ctx, name: &'static str, src: &'static str, entries: &[
             }
             p.insert(ep, pipe);
         }
-        Some(&*Box::leak(Box::new(Mod { p })))
+        let leaked: &'static Mod = Box::leak(Box::new(Mod { p }));
+        for (ep, pipe) in &leaked.p {
+            super::train_prof::name_pipe(pipe, ep);
+        }
+        Some(leaked)
     })();
     g.insert(name, built);
     built
@@ -648,12 +652,20 @@ pub struct Disp<'a> {
 
 /// Encode dispatches into one compute pass and submit.
 pub fn run(c: &Ctx, ds: &[Disp]) {
+    let prof = super::train_prof::on();
     let mut keep = Vec::new();
     let mut groups = Vec::new();
     for d in ds {
         let mut words = d.uni.clone();
         while words.len() % 4 != 0 {
             words.push(0);
+        }
+        if prof {
+            use super::train_prof::{Cnt, count};
+            count(Cnt::Buf, 1);
+            count(Cnt::Write, 1);
+            count(Cnt::WriteBytes, (words.len() * 4) as u64);
+            count(Cnt::BindGroup, 1);
         }
         let u = c.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("train_p"),
@@ -677,10 +689,14 @@ pub fn run(c: &Ctx, ds: &[Disp]) {
     let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("train") });
     {
         let mut ps = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+        let mut mk = super::train_prof::pass_begin(c, &mut ps);
         for (d, bg) in ds.iter().zip(&groups) {
             ps.set_pipeline(d.pipe);
             ps.set_bind_group(0, bg, &[]);
             ps.dispatch_workgroups(d.grid.0, d.grid.1, d.grid.2);
+            if prof {
+                super::train_prof::pass_mark(c, &mut ps, &mut mk, super::train_prof::pipe_name(d.pipe), [0; 3]);
+            }
         }
     }
     submit(c, enc.finish());
@@ -857,6 +873,12 @@ pub fn attn_bwd<'a>(
 
 /// A storage buffer holding `data` (or zeros of `n` floats).
 pub fn upload(c: &Ctx, data: &[f32]) -> wgpu::Buffer {
+    if super::train_prof::on() {
+        use super::train_prof::{Cnt, count};
+        count(Cnt::Buf, 1);
+        count(Cnt::Write, !data.is_empty() as u64);
+        count(Cnt::WriteBytes, (data.len() * 4) as u64);
+    }
     let b = c.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("train_buf"),
         size: (data.len().max(4) * 4) as u64,
@@ -871,6 +893,10 @@ pub fn upload(c: &Ctx, data: &[f32]) -> wgpu::Buffer {
 
 /// Overwrite the start of `b` with `data`.
 pub fn write(c: &Ctx, b: &wgpu::Buffer, data: &[f32]) {
+    if super::train_prof::on() {
+        super::train_prof::count(super::train_prof::Cnt::Write, 1);
+        super::train_prof::count(super::train_prof::Cnt::WriteBytes, (data.len() * 4) as u64);
+    }
     if !data.is_empty() {
         c.queue.write_buffer(b, 0, bytemuck::cast_slice(data));
     }
@@ -889,11 +915,22 @@ pub fn download(c: &Ctx, b: &wgpu::Buffer, n: usize) -> Option<Vec<f32>> {
         mapped_at_creation: false,
     });
     let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    let prof = super::train_prof::on();
+    let mut mk = super::train_prof::enc_begin(c, &mut enc);
     enc.copy_buffer_to_buffer(b, 0, &st, 0, size);
+    if prof {
+        super::train_prof::count(super::train_prof::Cnt::Buf, 1);
+        super::train_prof::enc_mark(c, &mut enc, &mut mk, "readback");
+    }
     submit(c, enc.finish());
     let slice = st.slice(..size);
     slice.map_async(wgpu::MapMode::Read, |_| {});
+    let tw = prof.then(std::time::Instant::now);
     c.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+    if let Some(tw) = tw {
+        super::train_prof::count(super::train_prof::Cnt::Wait, 1);
+        super::train_prof::count(super::train_prof::Cnt::WaitNs, tw.elapsed().as_nanos() as u64);
+    }
     let out = {
         let data = slice.get_mapped_range().ok()?;
         let mut v = vec![0f32; n];
@@ -914,11 +951,22 @@ pub fn download_u32(c: &Ctx, b: &wgpu::Buffer, n: usize) -> Option<Vec<u32>> {
         mapped_at_creation: false,
     });
     let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    let prof = super::train_prof::on();
+    let mut mk = super::train_prof::enc_begin(c, &mut enc);
     enc.copy_buffer_to_buffer(b, 0, &st, 0, size);
+    if prof {
+        super::train_prof::count(super::train_prof::Cnt::Buf, 1);
+        super::train_prof::enc_mark(c, &mut enc, &mut mk, "readback");
+    }
     submit(c, enc.finish());
     let slice = st.slice(..size);
     slice.map_async(wgpu::MapMode::Read, |_| {});
+    let tw = prof.then(std::time::Instant::now);
     c.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+    if let Some(tw) = tw {
+        super::train_prof::count(super::train_prof::Cnt::Wait, 1);
+        super::train_prof::count(super::train_prof::Cnt::WaitNs, tw.elapsed().as_nanos() as u64);
+    }
     let out = {
         let data = slice.get_mapped_range().ok()?;
         bytemuck::cast_slice::<u8, u32>(&data[..size as usize]).to_vec()
@@ -930,6 +978,7 @@ pub fn download_u32(c: &Ctx, b: &wgpu::Buffer, n: usize) -> Option<Vec<u32>> {
 /// A zero-filled storage buffer of `n` u32 words (no host staging: wgpu
 /// zero-initializes new buffers).
 pub fn zeros_u32(c: &Ctx, n: usize) -> wgpu::Buffer {
+    super::train_prof::count(super::train_prof::Cnt::Buf, 1);
     c.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("train_u32"),
         size: (n.max(4) * 4) as u64,

@@ -1397,6 +1397,8 @@ pub(super) struct MmCall {
     pub(super) pipe: Arc<wgpu::ComputePipeline>,
     pub(super) bg: wgpu::BindGroup,
     pub(super) grid: (u32, u32),
+    /// (m, n, k) of the product, for the trainer profiler's FLOP rates.
+    pub(super) mnk: [u32; 3],
 }
 
 pub(super) fn mm_call(
@@ -1412,6 +1414,10 @@ pub(super) fn mm_call(
     }
     let pipe = mm_pipe(c, g)?;
     let u = mm_uniform(c, a);
+    if super::train_prof::on() {
+        super::train_prof::count(super::train_prof::Cnt::Buf, 1);
+        super::train_prof::count(super::train_prof::Cnt::BindGroup, 1);
+    }
     let bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("zi_mm"),
         layout: &pipe.get_bind_group_layout(0),
@@ -1426,6 +1432,7 @@ pub(super) fn mm_call(
         pipe,
         bg,
         grid: (a.n / g.bn, a.m.div_ceil(g.bm)),
+        mnk: [a.m, a.n, a.k],
     })
 }
 
@@ -4326,7 +4333,7 @@ fn vae_decode_dev(a: &crate::vae::VaeChainArgs, z: &[f32], h0: usize, w0: usize,
                     super::bind_buf(3, &u),
                 ],
             });
-            r.calls.push_mm(Class::Io, MmCall { pipe, bg: bgr, grid: (a.n / g.bn, a.m.div_ceil(g.bm)) });
+            r.calls.push_mm(Class::Io, MmCall { pipe, bg: bgr, grid: (a.n / g.bn, a.m.div_ceil(g.bm)), mnk: [a.m, a.n, a.k] });
             q0 += rq;
         }
         r.cast(&o32, Some(&at.v.bias), m, mp, cc, &bufs.xn)?;

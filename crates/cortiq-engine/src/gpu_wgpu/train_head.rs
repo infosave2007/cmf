@@ -307,9 +307,11 @@ pub fn head_kl(
         let tpc = train_ops::zeros(c, rows * k);
         let lossc = train_ops::zeros(c, rows);
         let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("head_in") });
+        let mut mk = super::train_prof::enc_begin(c, &mut enc);
         enc.copy_buffer_to_buffer(x, (r0 * hs * 4) as u64, &xin, 0, (rows * hs * 4) as u64);
         enc.copy_buffer_to_buffer(tid, (r0 * k * 4) as u64, &tidc, 0, (rows * k * 4) as u64);
         enc.copy_buffer_to_buffer(tp, (r0 * k * 4) as u64, &tpc, 0, (rows * k * 4) as u64);
+        super::train_prof::enc_mark(c, &mut enc, &mut mk, "copy");
         super::submit(c, enc.finish());
         let m = module(c)?;
         let mut ops = vec![Op::D(train_mm::cvt(c, &xin, None, &s.act, rows, hs, 1.0)?)];
@@ -333,8 +335,10 @@ pub fn head_kl(
         }
         train_mm::run(c, &ops);
         let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("head_out") });
+        let mut mk = super::train_prof::enc_begin(c, &mut enc);
         enc.copy_buffer_to_buffer(&s.dact, 0, dx, (r0 * hs * 4) as u64, (rows * hs * 4) as u64);
         enc.copy_buffer_to_buffer(&lossc, 0, loss, (r0 * 4) as u64, (rows * 4) as u64);
+        super::train_prof::enc_mark(c, &mut enc, &mut mk, "copy");
         super::submit(c, enc.finish());
         r0 += rows;
     }
