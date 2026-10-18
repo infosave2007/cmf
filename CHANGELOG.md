@@ -19,10 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     (2 bytes, no first moment; it diverged on the 0.8B at every rate tried).
   - `--sign-lr auto` = min(0.15·τ/√steps, 4e-3·τ); `--sign-tau`,
     `--sign-warm`, `--sign-b1/--sign-b2/--sign-eps/--sign-clamp/--sign-hyst`
-    and two runaway guards (`--sign-max-step-flip`, `--sign-max-total-flip`).
-  - `--topk-cache FILE` keeps the teacher top-k on disk (reused when the
-    teacher and every data argument match), so the teacher and a large
-    student never share the card. `--sign-state DIR` saves a resumable
+    and rate guards that halve the sign rate (`--sign-max-step-flip`,
+    `--sign-max-total-flip`, and a held-out KL above 1.05× its best at two
+    consecutive evaluations).
+  - `--topk-cache FILE` keeps the teacher top-k on disk, so a repeated or
+    resumed run with the same teacher and data arguments skips the teacher
+    pass (the teacher is freed before the student loads either way).
+    `--sign-state DIR` saves a resumable
     state every `--sign-state-every` steps, `--resume DIR` continues from it
     (a resumed run is byte-identical to an uninterrupted one);
     `--sign-state-replace` keeps one state on disk instead of two.
@@ -34,10 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 - `blr` decode (RTX PRO 6000, `bench --core`): Qwen3.8-27B NVG 0.55 bpw
-  73.7 tok/s (about 1 tok/s in 0.8.20, when every FFN tensor exceeded the old
-  kernel's paths × rank limit and ran on the CPU); Qwen3.5-0.8B NVG 1.0 bpw
-  346.5 tok/s against 3.9 (q8_2f 352.8). Greedy text and perplexity are
-  identical to the per-operation path.
+  73.7 tok/s (not measured on 0.8.20, where every FFN tensor exceeded the old
+  kernel's paths × rank limit and ran on the CPU; about 1 tok/s expected);
+  Qwen3.5-0.8B NVG 1.0 bpw 346.5 tok/s (q8_2f 352.8; 3.9 on the 0.8.20
+  per-operation path, measured on a shared card). The 0.8B greedy text and
+  perplexity are identical to the per-operation path.
 - Sign training on Qwen3.5-0.8B at 1.0 bpw (same 1 M tokens, schedule and
   held-out windows as metric-only training; WikiText-2 and C4 at 512-token
   windows on the dense expansion):
