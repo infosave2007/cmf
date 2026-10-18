@@ -924,8 +924,8 @@ enum Commands {
     },
     /// NVG Ť: light distillation training of a compressed model's metric
     /// (the h, ℓ, g scales of its binary low-rank tensors and every RMSNorm
-    /// gain; signs and every other weight frozen) against its
-    /// full-precision teacher, on the GPU. Qwen3.5-family models.
+    /// gain; with --train-signs also the signs; every other weight frozen)
+    /// against its full-precision teacher, on the GPU. Qwen3.5-family models.
     NvgTrain {
         /// Student .cmf (binary low-rank tensors to train)
         student: String,
@@ -966,6 +966,68 @@ enum Commands {
         /// Output .cmf (the student with the trained metric)
         #[arg(long)]
         output: String,
+        /// Also train the signs (straight-through latents, updated inside
+        /// the reverse sweep; the best held-out snapshot's bits are exported)
+        #[arg(long)]
+        train_signs: bool,
+        /// Sign optimizer: fact-mom (4 B/sign) | fact (2 B, no momentum:
+        /// diverged on the 0.8B at every rate tried) | ref (12 B, small models)
+        #[arg(long, default_value = "fact-mom")]
+        sign_opt: String,
+        /// RMS of the initial |latent| (magnitudes τ·|z|, sign from the bit)
+        #[arg(long, default_value = "0.25")]
+        sign_tau: f64,
+        /// Peak sign learning rate, or auto = min(0.15·τ/√steps, 4e-3·τ)
+        /// (the second term caps the per-step move at the stable rate)
+        #[arg(long, default_value = "auto")]
+        sign_lr: String,
+        /// Sign steps at η = 0 while the second-moment statistics settle
+        #[arg(long, default_value = "10")]
+        sign_warm: usize,
+        #[arg(long, default_value = "0.9")]
+        sign_b1: f64,
+        #[arg(long, default_value = "0.999")]
+        sign_b2: f64,
+        /// ε of the factored optimizer, relative to the gradient RMS
+        #[arg(long, default_value = "1e-3")]
+        sign_eps: f64,
+        /// Clamp of the normalized sign step
+        #[arg(long, default_value = "4")]
+        sign_clamp: f64,
+        /// Hysteresis of the bit against the latent (0 = sign of the latent)
+        #[arg(long, default_value = "0")]
+        sign_hyst: f64,
+        /// Halve the sign rate when the per-step flip rate exceeds this 3
+        /// steps running (a runaway guard: at the auto rate the latents near
+        /// zero alone flip ~0.3 % per step on a 256-step run)
+        #[arg(long, default_value = "2e-2")]
+        sign_max_step_flip: f64,
+        /// Halve the sign rate when this fraction of the signs has flipped
+        #[arg(long, default_value = "0.15")]
+        sign_max_total_flip: f64,
+        /// Seed of the latent init and the stochastic rounding (default: --seed)
+        #[arg(long)]
+        sign_seed: Option<u64>,
+        /// Cache file of the teacher top-k (reused when the teacher file and
+        /// every data argument match)
+        #[arg(long)]
+        topk_cache: Option<String>,
+        /// Directory for the resumable training state (metric + Adam moments,
+        /// bits, sign latents and statistics, best snapshot, counters); use
+        /// local disk, a 27B state is tens of GB
+        #[arg(long)]
+        sign_state: Option<String>,
+        /// Steps between state saves
+        #[arg(long, default_value = "500")]
+        sign_state_every: usize,
+        /// Delete the previous state before writing the next, so one state
+        /// sits on disk instead of two (a 27B fact-mom state is ~57 GB); a
+        /// crash during that save leaves nothing to resume from
+        #[arg(long)]
+        sign_state_replace: bool,
+        /// Resume from the latest state in this directory (same arguments)
+        #[arg(long)]
+        resume: Option<String>,
     },
     /// One tensor through the NVG `blr` encoder with a per-stage profile, on
     /// the CPU reference path and/or the device path, from Grams captured
@@ -3505,7 +3567,45 @@ async fn main() -> anyhow::Result<()> {
             clip,
             seed,
             output,
+            train_signs,
+            sign_opt,
+            sign_tau,
+            sign_lr,
+            sign_warm,
+            sign_b1,
+            sign_b2,
+            sign_eps,
+            sign_clamp,
+            sign_hyst,
+            sign_max_step_flip,
+            sign_max_total_flip,
+            sign_seed,
+            topk_cache,
+            sign_state,
+            sign_state_every,
+            sign_state_replace,
+            resume,
         } => {
+            let signs = if train_signs {
+                let opt = cortiq_engine::gpu_wgpu::train_sign::SignOpt::parse(&sign_opt).ok_or_else(|| anyhow::anyhow!("--sign-opt: fact | fact-mom | ref"))?;
+                let lr = if sign_lr == "auto" { None } else { Some(sign_lr.parse::<f64>().map_err(|_| anyhow::anyhow!("--sign-lr: auto or a number"))?) };
+                Some(nvgtrain::SignOpts {
+                    opt,
+                    tau: sign_tau,
+                    lr,
+                    warm: sign_warm,
+                    b1: sign_b1,
+                    b2: sign_b2,
+                    eps: sign_eps,
+                    clamp: sign_clamp,
+                    hyst: sign_hyst,
+                    max_step_flip: sign_max_step_flip,
+                    max_total_flip: sign_max_total_flip,
+                    seed: sign_seed.unwrap_or(seed),
+                })
+            } else {
+                None
+            };
             nvgtrain::run(&nvgtrain::NvgTrainOpts {
                 student: &student,
                 teacher: &teacher,
@@ -3521,6 +3621,12 @@ async fn main() -> anyhow::Result<()> {
                 clip,
                 seed,
                 output: &output,
+                signs,
+                topk_cache: topk_cache.as_deref(),
+                state_dir: sign_state.as_deref(),
+                state_every: sign_state_every,
+                state_replace: sign_state_replace,
+                resume: resume.as_deref(),
             })
         }
         #[cfg(not(feature = "gpu"))]
