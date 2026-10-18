@@ -1799,7 +1799,18 @@ fn probe_hole_punching(dir: &Path) -> Result<(), String> {
                 .truncate(true)
                 .open(&p)
                 .map_err(|e| format!("create {}: {e}", p.display()))?;
-            f.write_all(&vec![0xA5u8; LEN]).map_err(|e| format!("write {}: {e}", p.display()))?;
+            // incompressible bytes: a compressing filesystem (zfs lz4, btrfs)
+            // would store a constant pattern in almost no blocks
+            let mut s = 0x9E37_79B9_7F4A_7C15u64;
+            let bytes: Vec<u8> = (0..LEN / 8)
+                .flat_map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    s.to_le_bytes()
+                })
+                .collect();
+            f.write_all(&bytes).map_err(|e| format!("write {}: {e}", p.display()))?;
             f.sync_all().map_err(|e| format!("sync {}: {e}", p.display()))?;
             let before = f.metadata().map_err(|e| format!("stat {}: {e}", p.display()))?.blocks();
             let r = unsafe { libc::fallocate(f.as_raw_fd(), libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, (LEN / 4) as libc::off_t, (LEN / 2) as libc::off_t) };
