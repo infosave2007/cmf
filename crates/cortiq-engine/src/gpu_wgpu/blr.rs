@@ -161,17 +161,20 @@ fn blr_u(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) li
 //   `c` shifted by `8c` (`t_c[m] = t[m − 8c]`, zero outside `[8c, r + 8c)`):
 //   the bits of the neighbouring rows that share a word meet zeros. Tensor
 //   j's copies sit at `toff_j`, path p, copy c at `(4p + c)·(rpad + 32)`,
-//   `rpad = ⌈r/32⌉·32`. Rows `i ≡ k (mod 4)` share σ, so a warp that owns
-//   rows `k, k+4, k+8, k+12` reads one copy for all four.
+//   `rpad = ⌈r/32⌉·32`, each copy stored word-transposed (vec4 c of word w
+//   at `c·(rpad/32 + 1) + w`: lanes that walk words read consecutive vec4s).
+//   Rows `i ≡ k (mod 4)` share σ, so a subgroup that owns rows `k, k+4,
+//   k+8, k+12` reads one copy for all four.
 // * Stage V: a set of `LV` lanes (32: one subgroup, or 128: a workgroup,
-//   chosen by the input width) owns 4 latent rows; the lanes walk the rows'
-//   sign words two at a time (coalesced), `z = x ⊙ g_p` is formed per word in
-//   registers and shared by the 4 rows; subgroup sums (or, without 32-wide
-//   subgroups, workgroup-memory sums) close each row, which is written to its
-//   four copies (and the copies' zero borders by the k = 0 set).
+//   chosen by the input width) owns 8 latent rows; the lanes walk the rows'
+//   sign words four at a time (coalesced), `z = x ⊙ g_p` is formed per word in
+//   registers (g resident as word-transposed f32) and shared by the 8 rows;
+//   subgroup sums (or, without 32-wide subgroups, workgroup-memory sums)
+//   close each row, which is written to its four copies (and the copies'
+//   zero borders by the k = 0 set).
 // * Stage U: a subgroup owns 4 output rows of one tensor (`blr_gu_act`: the
 //   same 4 rows of gate and of up). Its lanes walk the rows' words over all
-//   paths as one flattened sequence, two words a lane in flight; the latent
+//   paths as one flattened sequence, four words a lane in flight; the latent
 //   words a lane needs are the same for the 4 rows. A subgroup sum per (row,
 //   path), then `y = Σ_p h_p·s_p`; `blr_gu_act` writes act(gate)·up.
 //
@@ -202,7 +205,8 @@ struct GvP { cols: u32, e0: u32, e1: u32, nm: u32, m0: vec4<u32>, m1: vec4<u32>,
 @group(0) @binding(6) var<storage, read> gvg0: array<vec4<f32>>;
 @group(0) @binding(7) var<storage, read> gvg1: array<vec4<f32>>;
 @group(0) @binding(8) var<storage, read> gvg2: array<vec4<f32>>;
-var<workgroup> gvred: array<vec4<f32>, GV_WG>;
+var<workgroup> gvred: array<vec4<f32>, GV_WG2>;
+struct GvD { a: vec4<f32>, b: vec4<f32> };
 // Position of latent slot m in a copy stored word-transposed: the c-th vec4
 // of every word is contiguous across words (stage U's lanes walk words and
 // read the same vec4 of consecutive words — one coalesced access).
@@ -226,14 +230,14 @@ fn gv_f16_J(byte_off: u32) -> f32 {
 fn gv_z_J(xo: u32, go: u32, c: u32, nw: u32) -> vec4<f32> {
   return gvx[xo + c] * GB[go + c * nw];
 }
-// The sign words of the 4 rows at word w (none past the row).
+// The sign words of 4 rows at word w (none past the row).
 fn gv_w4_J(rows: vec4<u32>, w: u32, nw: u32) -> vec4<u32> {
   if (w >= nw) { return vec4<u32>(0u); }
   return vec4<u32>(WB[rows.x + w], WB[rows.y + w], WB[rows.z + w], WB[rows.w + w]);
 }
-// The 4 rows' binary dots over word w (zero past the row).
-fn gv_dot_J(w: u32, nw: u32, gw: u32, b: vec4<u32>) -> vec4<f32> {
-  if (w >= nw) { return vec4<f32>(0.0); }
+// The 8 rows' binary dots over word w, z formed once (zero past the row).
+fn gv_dot_J(w: u32, nw: u32, gw: u32, ba: vec4<u32>, bb: vec4<u32>) -> GvD {
+  if (w >= nw) { return GvD(vec4<f32>(0.0), vec4<f32>(0.0)); }
   let xo = w * 8u;
   let go = gw + w;
   let z0 = gv_z_J(xo, go, 0u, nw);
@@ -244,10 +248,20 @@ fn gv_dot_J(w: u32, nw: u32, gw: u32, b: vec4<u32>) -> vec4<f32> {
   let z5 = gv_z_J(xo, go, 5u, nw);
   let z6 = gv_z_J(xo, go, 6u, nw);
   let z7 = gv_z_J(xo, go, 7u, nw);
-  return vec4<f32>(bsd32(b.x, z0, z1, z2, z3, z4, z5, z6, z7),
-                   bsd32(b.y, z0, z1, z2, z3, z4, z5, z6, z7),
-                   bsd32(b.z, z0, z1, z2, z3, z4, z5, z6, z7),
-                   bsd32(b.w, z0, z1, z2, z3, z4, z5, z6, z7));
+  return GvD(vec4<f32>(bsd32(ba.x, z0, z1, z2, z3, z4, z5, z6, z7),
+                       bsd32(ba.y, z0, z1, z2, z3, z4, z5, z6, z7),
+                       bsd32(ba.z, z0, z1, z2, z3, z4, z5, z6, z7),
+                       bsd32(ba.w, z0, z1, z2, z3, z4, z5, z6, z7)),
+             vec4<f32>(bsd32(bb.x, z0, z1, z2, z3, z4, z5, z6, z7),
+                       bsd32(bb.y, z0, z1, z2, z3, z4, z5, z6, z7),
+                       bsd32(bb.z, z0, z1, z2, z3, z4, z5, z6, z7),
+                       bsd32(bb.w, z0, z1, z2, z3, z4, z5, z6, z7)));
+}
+fn gv_l4_J(lb: u32, k: u32, r: u32, s: vec4<f32>) -> vec4<f32> {
+  return vec4<f32>(select(0.0, s.x * gv_f16_J(lb + 2u * k), k < r),
+                   select(0.0, s.y * gv_f16_J(lb + 2u * k + 2u), k + 1u < r),
+                   select(0.0, s.z * gv_f16_J(lb + 2u * k + 4u), k + 2u < r),
+                   select(0.0, s.w * gv_f16_J(lb + 2u * k + 6u), k + 3u < r));
 }
 fn gv_run_J(blk: u32, tid: u32, lane: u32, warp: u32) {
   let m = MJ;
@@ -262,9 +276,10 @@ fn gv_run_J(blk: u32, tid: u32, lane: u32, warp: u32) {
   let nrows = np * rpad;
   let vset = tid / GV_LVu;
   let li = tid - vset * GV_LVu;
-  var q0 = (blk * GV_SETSu + vset) * 4u;
+  // 8 latent rows a set (rpad % 32 == 0: never across a path).
+  var q0 = (blk * GV_SETSu + vset) * 8u;
   let ok = q0 < nrows;
-  q0 = min(q0, nrows - 4u);
+  q0 = min(q0, nrows - 8u);
   let p = q0 / rpad;
   let k0 = q0 - p * rpad;
   let s = 2u * (d_out + cols + r) + (r >> 3u) * (d_out + cols);
@@ -272,48 +287,59 @@ fn gv_run_J(blk: u32, tid: u32, lane: u32, warp: u32) {
   let gw = p * (cols >> 2u);
   let lb = base + 2u * (d_out + cols);
   let vw = (lb + 2u * r + d_out * (r >> 3u)) >> 2u;
-  let rows = vec4<u32>(vw + min(k0, r - 1u) * nw, vw + min(k0 + 1u, r - 1u) * nw,
-                       vw + min(k0 + 2u, r - 1u) * nw, vw + min(k0 + 3u, r - 1u) * nw);
-  var acc = vec4<f32>(0.0);
+  let rk = r - 1u;
+  let rowa = vec4<u32>(vw + min(k0, rk) * nw, vw + min(k0 + 1u, rk) * nw,
+                       vw + min(k0 + 2u, rk) * nw, vw + min(k0 + 3u, rk) * nw);
+  let rowb = vec4<u32>(vw + min(k0 + 4u, rk) * nw, vw + min(k0 + 5u, rk) * nw,
+                       vw + min(k0 + 6u, rk) * nw, vw + min(k0 + 7u, rk) * nw);
+  var acca = vec4<f32>(0.0);
+  var accb = vec4<f32>(0.0);
   var w = li;
   loop {
     if (w >= nw) { break; }
     // Every sign word of the round in flight before the first add.
-    let b0 = gv_w4_J(rows, w, nw);
-    let b1 = gv_w4_J(rows, w + GV_LVu, nw);
-    let b2 = gv_w4_J(rows, w + 2u * GV_LVu, nw);
-    let b3 = gv_w4_J(rows, w + 3u * GV_LVu, nw);
-    acc = acc + (gv_dot_J(w, nw, gw, b0) + gv_dot_J(w + GV_LVu, nw, gw, b1))
-              + (gv_dot_J(w + 2u * GV_LVu, nw, gw, b2) + gv_dot_J(w + 3u * GV_LVu, nw, gw, b3));
+    let a0 = gv_w4_J(rowa, w, nw);
+    let b0 = gv_w4_J(rowb, w, nw);
+    let a1 = gv_w4_J(rowa, w + GV_LVu, nw);
+    let b1 = gv_w4_J(rowb, w + GV_LVu, nw);
+    let a2 = gv_w4_J(rowa, w + 2u * GV_LVu, nw);
+    let b2 = gv_w4_J(rowb, w + 2u * GV_LVu, nw);
+    let a3 = gv_w4_J(rowa, w + 3u * GV_LVu, nw);
+    let b3 = gv_w4_J(rowb, w + 3u * GV_LVu, nw);
+    let d0 = gv_dot_J(w, nw, gw, a0, b0);
+    let d1 = gv_dot_J(w + GV_LVu, nw, gw, a1, b1);
+    let d2 = gv_dot_J(w + 2u * GV_LVu, nw, gw, a2, b2);
+    let d3 = gv_dot_J(w + 3u * GV_LVu, nw, gw, a3, b3);
+    acca = acca + ((d0.a + d1.a) + (d2.a + d3.a));
+    accb = accb + ((d0.b + d1.b) + (d2.b + d3.b));
     w = w + 4u * GV_LVu;
   }
-  let a0 = acc.x;
-  let a1 = acc.y;
-  let a2 = acc.z;
-  let a3 = acc.w;
 GV_REDUCE
   let tp = toff + p * 4u * ts;
   let nwt = ts >> 5u;
   if (ok && li == 0u) {
-    let l0 = select(0.0, s0 * gv_f16_J(lb + 2u * k0), k0 < r);
-    let l1 = select(0.0, s1 * gv_f16_J(lb + 2u * k0 + 2u), k0 + 1u < r);
-    let l2 = select(0.0, s2 * gv_f16_J(lb + 2u * k0 + 4u), k0 + 2u < r);
-    let l3 = select(0.0, s3 * gv_f16_J(lb + 2u * k0 + 6u), k0 + 3u < r);
-    // k0 % 4 == 0 and 8c % 4 == 0: the four latents are one vec4 slot.
+    let la = gv_l4_J(lb, k0, r, sa);
+    let lc = gv_l4_J(lb, k0 + 4u, r, sb);
+    // k0 % 8 == 0 and 8c % 4 == 0: each run of four latents is one vec4 slot.
     for (var c = 0u; c < 4u; c = c + 1u) {
       let o = tp + c * ts + gv_tpos(k0 + 8u * c, nwt);
-      gvt[o] = l0;
-      gvt[o + 1u] = l1;
-      gvt[o + 2u] = l2;
-      gvt[o + 3u] = l3;
+      gvt[o] = la.x;
+      gvt[o + 1u] = la.y;
+      gvt[o + 2u] = la.z;
+      gvt[o + 3u] = la.w;
+      let o2 = tp + c * ts + gv_tpos(k0 + 4u + 8u * c, nwt);
+      gvt[o2] = lc.x;
+      gvt[o2 + 1u] = lc.y;
+      gvt[o2 + 2u] = lc.z;
+      gvt[o2 + 3u] = lc.w;
     }
   }
   // The copies' zero borders, [0, 8c) and [rpad + 8c, rpad + 32).
   if (ok && k0 == 0u && li < 32u) {
     for (var c = 0u; c < 4u; c = c + 1u) {
       let o = tp + c * ts;
-      let m = select(rpad + li, li, li < 8u * c);
-      gvt[o + gv_tpos(m, nwt)] = 0.0;
+      let mm = select(rpad + li, li, li < 8u * c);
+      gvt[o + gv_tpos(mm, nwt)] = 0.0;
     }
   }
 }
@@ -321,47 +347,41 @@ GV_REDUCE
 
 /// Stage-V row sums, one subgroup a set.
 const GV_REDUCE_SG32: &str = r#"
-  let s0 = subgroupAdd(a0);
-  let s1 = subgroupAdd(a1);
-  let s2 = subgroupAdd(a2);
-  let s3 = subgroupAdd(a3);
+  let sa = subgroupAdd(acca);
+  let sb = subgroupAdd(accb);
 "#;
 
 /// Stage-V row sums, several subgroups a set (LV ≥ 128: one set a
 /// workgroup).
 const GV_REDUCE_SGN: &str = r#"
-  let r0 = subgroupAdd(a0);
-  let r1 = subgroupAdd(a1);
-  let r2 = subgroupAdd(a2);
-  let r3 = subgroupAdd(a3);
+  let ra = subgroupAdd(acca);
+  let rb = subgroupAdd(accb);
   if (lane == 0u) {
-    gvred[warp] = vec4<f32>(r0, r1, r2, r3);
+    gvred[2u * warp] = ra;
+    gvred[2u * warp + 1u] = rb;
   }
   workgroupBarrier();
-  var sv = vec4<f32>(0.0);
+  var sa = vec4<f32>(0.0);
+  var sb = vec4<f32>(0.0);
   for (var i = 0u; i < GV_LVu / 32u; i = i + 1u) {
-    sv = sv + gvred[i];
+    sa = sa + gvred[2u * i];
+    sb = sb + gvred[2u * i + 1u];
   }
-  let s0 = sv.x;
-  let s1 = sv.y;
-  let s2 = sv.z;
-  let s3 = sv.w;
 "#;
 
 /// Stage-V row sums through workgroup memory (no 32-wide subgroups).
 const GV_REDUCE_WG: &str = r#"
-  gvred[tid] = vec4<f32>(a0, a1, a2, a3);
+  gvred[2u * tid] = acca;
+  gvred[2u * tid + 1u] = accb;
   workgroupBarrier();
-  var sv = vec4<f32>(0.0);
+  var sa = vec4<f32>(0.0);
+  var sb = vec4<f32>(0.0);
   if (li == 0u) {
     for (var i = 0u; i < GV_LVu; i = i + 1u) {
-      sv = sv + gvred[vset * GV_LVu + i];
+      sa = sa + gvred[2u * (vset * GV_LVu + i)];
+      sb = sb + gvred[2u * (vset * GV_LVu + i) + 1u];
     }
   }
-  let s0 = sv.x;
-  let s1 = sv.y;
-  let s2 = sv.z;
-  let s3 = sv.w;
 "#;
 
 const GV_ENTRY_SG: &str = r#"
@@ -682,6 +702,7 @@ fn gv_source(sg: bool, lv: usize) -> String {
     s.push_str(if sg { GV_ENTRY_SG } else { GV_ENTRY_WG });
     s.replace("GV_LVu", &format!("{lv}u"))
         .replace("GV_SETSu", &format!("{}u", gv_wg(lv) / lv))
+        .replace("GV_WG2", &format!("{}", 2 * gv_wg(lv)))
         .replace("GV_WG", &format!("{}", gv_wg(lv)))
 }
 
@@ -997,8 +1018,8 @@ pub(super) fn prep_group<'g>(
     // (r, P, toff, d_out) per slot; unused slots repeat slot 0 with empty
     // workgroup ranges.
     let lv = gv_lanes(cols);
-    // Latent rows a stage-V workgroup covers: 4 per set.
-    let v_rows_wg = 4 * (gv_wg(lv) / lv);
+    // Latent rows a stage-V workgroup covers: 8 per set.
+    let v_rows_wg = 8 * (gv_wg(lv) / lv);
     let mut mw = [0u32; 12];
     let mut toff = 0usize;
     let mut ev = [0u32; 3];
