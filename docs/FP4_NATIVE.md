@@ -167,6 +167,14 @@ contracts, as for every 4-bit codec:
   other MoE file with mxfp4 experts runs them on the CPU/per-op path.
 - Both shader modules are separate and built lazily; a driver that rejects
   them leaves every other codec untouched and mxfp4 on the CPU.
+- Segment family (after the merge with `dsv41-int`): the V4.1 bank's policy
+  is one code path for every codec — `CMF_DSV41_GLOBAL_SEGMENTS=8` forces
+  S8, `=16` takes S16, unset = Auto (S16 only when it holds more slots than
+  S8 and the adapter can, S8 retry when the S16 bank misses the residency
+  budget, one log line naming codec, family and capacity). Slot lengths come
+  from `MoeBankCodec::lens`; an mxfp4 bank that goes S16 uses the mxfp4 S16
+  kernels, built on first need on an S16-capable adapter (S8 when they
+  cannot be built). q4tp/q2tp keep `dsv41-int`'s behaviour.
 
 ### Metal
 
@@ -180,7 +188,7 @@ and the CPU kernels run (A8W8 on Apple Silicon). wgpu-over-Metal
 |---|---|
 | `cargo test -p cortiq-core` | all pass (9 mxfp4 tests: tables vs OCP definition, all codes × all scales exact, repack = source planes + NaN refusal, RNE/saturation, OCP exponent rule incl. zero/NaN/inf/clamps, error bound, grid round trip, value-exact re-quantization) |
 | `cargo test -p cortiq-engine --features gpu --lib qtensor::mxfp4` | 3 pass: exact matvec/matvec2/matmat == `matvec_rows` on the dequantized matrix bit for bit (± pool); A8W8 SIMD == scalar == decoded-row, == f64 emulation of the A8W8 contract, matmat == matvec per token; mapped CMF tensor == dequantized F32 twin through every QTensor entry point |
-| `CMF_GPU=wgpu cargo test -p cortiq-engine --features gpu --lib gpu_wgpu::mxfp4 -- --test-threads=1` | 5 pass on wgpu-over-Metal: WGSL validates (naga, S8 + S16); device matvec within 4e-6·Σ|w·x| of f64 on 300×2304, 70000×64 (2-D grid), 5×5120; batch b ∈ {2, 8, 9, 19} == per-token matvec bit for bit; **global bank frame** (mxfp4 bank, forced + preweighted + BF16, shared slot, one cold winner) matches the host experts at 128×64 (nrmse 1.9–2.5e-3, bound 0.02) and at the **release geometry** gate/up 2304×5120, down 5120×2304 (nrmse 2.1–3.0e-3, cos ≥ 0.9999955, bound 0.01). The fixture's E8M0 scales vary per group, so a wrong scale index fails (see below) |
+| `CMF_GPU=wgpu cargo test -p cortiq-engine --features gpu --lib gpu_wgpu::mxfp4 -- --test-threads=1` | 6 pass on wgpu-over-Metal: WGSL validates (naga, S8 + S16); device matvec within 4e-6·Σ|w·x| of f64 on 300×2304, 70000×64 (2-D grid), 5×5120; batch b ∈ {2, 8, 9, 19} == per-token matvec bit for bit; **global bank frame** (mxfp4 bank, forced + preweighted + BF16, shared slot, one cold winner) matches the host experts at 128×64 (nrmse 1.9–2.5e-3, bound 0.02) and at the **release geometry** gate/up 2304×5120, down 5120×2304 (nrmse 2.1–3.0e-3, cos ≥ 0.9999955, bound 0.01), and on an **S16 bank** (`=16` policy, 32 slots, two per segment, geometry asserted (16, 32); nrmse 1.9–2.5e-3, the S8 values). The fixture's E8M0 scales vary per group, so a wrong scale index fails (see below) |
 | `cargo test -p cortiq-cli --bin cortiq fp4_tests` | 11 pass (the GPU one skips without `CMF_GPU`), incl. the end-to-end synthetic V4.1 checkpoint and `--exclude-tensors` (below) |
 | `CMF_GPU=wgpu cargo test -p cortiq-cli --bin cortiq fp4_tests -- --test-threads=1 --nocapture` | 11 pass; `dsv41_fp4_dynamic_gpu_moe_matches_the_cpu_forward` runs: 14 of 14 MoE calls on the mxfp4 bank, 9 slot fills, logits nrmse vs CPU **6.37e-3** (bound 0.02) |
 | `cargo test -p cortiq-cli --bin cortiq` | 226 pass, 1 ignored (whole bin) |
@@ -250,6 +258,18 @@ GPU (`gpu_wgpu/mxfp4.rs`, wgpu-over-Metal, Apple M4):
   forwards; unpaused under `CMF_GPU=wgpu` it took 213 s and drove the 24 GB
   Mac into swap. Real-model runs on a Mac with `CMF_GPU=wgpu` should pin
   `CMF_DSV41_EXPERT_SLOTS` (or `CMF_GPU_VRAM_MB`).
+- The same test failed on the RTX PRO 6000 pod (before the pause): the wgpu
+  backend self-selects on a Linux GPU host, the fp4 experts ran in the bank
+  and the f32 twin on the host (bits differ by summation order), and the
+  first run hit a wgpu OOM (75 % of the 96 GB card while another process
+  held 75 GB). Now: `CMF_GPU` is read once per process and the bin test
+  process is shared, so the comparison is pinned with `gpu::pause_gpu` (a
+  count of live guards, so no other holder can lift it) and the pin is
+  checked — `gpu::enabled()` false and 0 bank calls in every forward of the
+  comparison; with the pause removed the check fires (10 bank calls on the
+  M4) instead of a bare bit mismatch. Every fp4 test that runs a forward
+  sets `CMF_GPU_VRAM_MB=4096` unless the caller set one (the V4.1 GPU
+  fixture's default), before the backend comes up.
 
 Measured CPU speed: see §5. Vulkan behaviour (NVIDIA) is still to be verified
 on a pod — §6.
