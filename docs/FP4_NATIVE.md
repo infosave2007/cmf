@@ -51,6 +51,37 @@ this branch refuses the file at open (`UnknownDtype(21)`).
 | `--quant fp4` | every routed and shared expert matrix (gate/up/down, `.experts.`, `.shared_expert(s).`, `w1/w2/w3`) → `mxfp4`; every other tensor exactly what `--quant q4tp` gives it (skeleton q8_2f rules, f16/f32 force rules, vision f16) |
 | `--quant mxfp4` | every quantizable matrix → `mxfp4` |
 | `--tensor-quant PATTERN=mxfp4` | per-tensor codec (any profile); `fp4` is refused as a per-tensor choice |
+| `--exclude-tensors PATTERNS` | leave tensors out of the file (any profile, every output); see below |
+
+### `--exclude-tensors` (one-file 1017 upload)
+
+Comma-separated globs over the **canonical output** tensor names (repeatable;
+`*` is the only wildcard and spans dots — the `--tensor-quant` glob).
+
+- A source tensor whose canonical name matches is skipped before its payload
+  is read: never decoded, requantized or written — in every output
+  (`--also-output` included) and on every source path of the walk (resident
+  local shards, `CMF_LOCAL_READY_DIR` streaming, Hugging Face streaming,
+  `--resume`). A name only a split produces (one expert of a packed tensor,
+  q/k/v of a fused projection) is checked again at the writer.
+- The run prints `--exclude-tensors: N source tensors excluded, B source
+  bytes (… GB; 'pattern' ×n, …)` and warns about a pattern that matched
+  nothing (patterns are canonical CMF names: `model.mtp.*`, not `mtp.*`).
+- The patterns are recorded in `header.provenance.excluded_tensors`.
+  `scripts/check_dsv41_cmf.py` reads them: excluded names are no longer
+  expected, must be absent, and `--dspark-policy include` refuses such a file.
+- Packers outside the walk refuse the flag: `--quant blr`, `--mtp-sidecar`,
+  `--dspark-sidecar`, MiMo `--mimo-towers mm-only`, EmbeddingGemma 2.
+- `arch.mtp` stays as the source declares it (the header carries the source
+  config verbatim anyway); the loader decides by presence, as before.
+
+Why: Hugging Face refuses a file over 500 GB (500e9 bytes). Measured from the
+real 1017 tensor list, the `--quant fp4` payload is **504.51 GB** with the
+MTP/DSpark tensors (`model.mtp.*`, 7.4 GB in q4tp) and **496.96 GB** without.
+The cortiq V4.1 runtime never reads `model.mtp.*`: `dsv41::load` has no MTP
+stage, and the generic MTP loader keys on `model.mtp.layers.0.*` /
+`model.mtp.eh_proj.weight`, which V4.1's `model.mtp.0.*` names never match
+(tested: the forward is bit-identical with and without the stage).
 
 Source handling:
 
@@ -149,9 +180,10 @@ and the CPU kernels run (A8W8 on Apple Silicon). wgpu-over-Metal
 |---|---|
 | `cargo test -p cortiq-core` | all pass (9 mxfp4 tests: tables vs OCP definition, all codes × all scales exact, repack = source planes + NaN refusal, RNE/saturation, OCP exponent rule incl. zero/NaN/inf/clamps, error bound, grid round trip, value-exact re-quantization) |
 | `cargo test -p cortiq-engine --features gpu --lib qtensor::mxfp4` | 3 pass: exact matvec/matvec2/matmat == `matvec_rows` on the dequantized matrix bit for bit (± pool); A8W8 SIMD == scalar == decoded-row, == f64 emulation of the A8W8 contract, matmat == matvec per token; mapped CMF tensor == dequantized F32 twin through every QTensor entry point |
-| `CMF_GPU=wgpu cargo test -p cortiq-engine --features gpu --lib gpu_wgpu::mxfp4 -- --test-threads=1` | 4 pass on wgpu-over-Metal: WGSL validates (naga, S8 + S16); device matvec within 4e-6·Σ|w·x| of f64 on 300×2304, 70000×64 (2-D grid), 5×5120; batch b ∈ {2, 8, 9, 19} == per-token matvec bit for bit; **global bank frame** (mxfp4 bank, forced + preweighted + BF16, shared slot, one cold winner) matches the host experts (nrmse < 2 %, cos > 0.999) |
-| `cargo test -p cortiq-cli --bin cortiq fp4_tests` | 7 pass, incl. the end-to-end synthetic V4.1 checkpoint (below) |
-| `cargo test -p cortiq-cli --bin cortiq` | 216 pass, 1 ignored (whole bin) |
+| `CMF_GPU=wgpu cargo test -p cortiq-engine --features gpu --lib gpu_wgpu::mxfp4 -- --test-threads=1` | 5 pass on wgpu-over-Metal: WGSL validates (naga, S8 + S16); device matvec within 4e-6·Σ|w·x| of f64 on 300×2304, 70000×64 (2-D grid), 5×5120; batch b ∈ {2, 8, 9, 19} == per-token matvec bit for bit; **global bank frame** (mxfp4 bank, forced + preweighted + BF16, shared slot, one cold winner) matches the host experts at 128×64 (nrmse 1.9–2.5e-3, bound 0.02) and at the **release geometry** gate/up 2304×5120, down 5120×2304 (nrmse 2.1–3.0e-3, cos ≥ 0.9999955, bound 0.01). The fixture's E8M0 scales vary per group, so a wrong scale index fails (see below) |
+| `cargo test -p cortiq-cli --bin cortiq fp4_tests` | 11 pass (the GPU one skips without `CMF_GPU`), incl. the end-to-end synthetic V4.1 checkpoint and `--exclude-tensors` (below) |
+| `CMF_GPU=wgpu cargo test -p cortiq-cli --bin cortiq fp4_tests -- --test-threads=1 --nocapture` | 11 pass; `dsv41_fp4_dynamic_gpu_moe_matches_the_cpu_forward` runs: 14 of 14 MoE calls on the mxfp4 bank, 9 slot fills, logits nrmse vs CPU **6.37e-3** (bound 0.02) |
+| `cargo test -p cortiq-cli --bin cortiq` | 226 pass, 1 ignored (whole bin) |
 | `cargo test -p cortiq-engine --features gpu --lib` | 590 pass, 34 ignored (whole lib, 16 min debug); after the upload dtype guards re-run with filters `mxfp4`, `moe`, `dsv4`, `qwen4`, `global`: all pass |
 | `cargo check -p cortiq-engine` (no `gpu`) | builds |
 | `python3 -I scripts/check_dsv41_cmf.py --self-test` | PASS (mxfp4 sizes) |
@@ -168,6 +200,56 @@ the default A8W8 kernels it stays within 25 % of the logit span. NVFP4: a tiny
 ModelOpt Qwen3 (all linears NVFP4, AWQ pre-quant scale on down_proj, k/v/input
 scalars) converts in one pass to f16 (== f16 of the formula, bit for bit),
 q4tp, q2tp and mxfp4, with no companion tensor in any output.
+
+`--exclude-tensors` (`convert_fp4_tests.rs`):
+- `dsv41_exclude_mtp_drops_the_stack_and_keeps_the_forward`: the synthetic
+  V4.1 checkpoint gains an MTP/DSpark stage in the 1017 spelling (`mtp.0.*`:
+  attention, `main_proj`, mHC head, router, FP4 routed + FP8 shared experts,
+  Markov and confidence heads; 46 source tensors, config
+  `num_nextn_predict_layers: 1`). Without the flag the fp4 file holds its 30
+  `model.mtp.*` tensors; with `model.mtp.*` one pass writes fp4 and q4tp
+  (`--also-output`) with none, both verify, both record `excluded_tensors`,
+  every other tensor is byte-identical, and the V4.1 `Pipeline` forward
+  (6 tokens, CPU, exact contract) is bit-identical with and without the
+  stage. A NaN scale planted in an MTP expert fails the plain conversion
+  ("NaN scale") and passes under the flag — the tensor is never decoded.
+- `exclude_tensors_holds_for_split_produced_names`: `up_proj` of a fused
+  `gate_up_proj` (dropped at the writer) and `lm_head.weight` (at the source).
+- `exclude_tensors_parses_and_counts`: parser (commas, duplicates, empty
+  patterns refused) and the tensor/byte counters.
+- `scripts/check_dsv41_cmf.py --self-test` covers the glob and the provenance
+  read; a synthetic V4.1 fp4 file converted with the flag passes the checker
+  (21 source-derived tensors excluded, none present), the HEAD checker failed
+  it ("missing 21 source-derived tensors").
+
+GPU (`gpu_wgpu/mxfp4.rs`, wgpu-over-Metal, Apple M4):
+- The payload fixture's scale was `119 + ((i*5 + seed) % 5)` — constant per
+  tensor, so a kernel reading another group's scale passed. Now
+  `119 + ((i*7 + i/3 + seed) % 5)` (adjacent groups always differ). A
+  temporary mutation reading the neighbour group's scale (`g ^ 1`) in
+  `mxfp4_mv`, `dsv4_global_gate_up_mxfp4` and `dsv4_global_down_mxfp4`:
+  old fixture — all 4 tests pass (blind); new fixture — device matvec fails
+  (300×2304 row 0: −0.7812 vs 0.4772, tol 1.2e-4) and the bank frame fails
+  (nrmse 1.37, cos 0.068); the down-kernel mutation alone: nrmse 0.858,
+  cos 0.657.
+- The release-geometry bank case is the only one where the lane loops
+  iterate (160 groups per gate/up row; the down walk over `slot·72 + g`
+  hands one lane groups of different slots). A temporary mutation of both
+  lane strides (64 → 128) passes the 128×64 case and fails the release case
+  (nrmse 0.850, cos 0.884).
+- `dsv41_fp4_dynamic_gpu_moe_matches_the_cpu_forward` (cortiq-cli, needs
+  `CMF_GPU`): the synthetic fp4 file through `Pipeline::forward_ids` with the
+  dynamic GPU MoE vs the same forward under `gpu::pause_gpu`. It pins the bank
+  to 64 slots (`CMF_DSV41_EXPERT_SLOTS` = workspace carve-out / slot + 64) and
+  reads `Dsv41State::gpu_moe_stats()` (bank calls, codec label — counted
+  without `CMF_DSV41_PROF`).
+- Trap found on the way: wgpu-over-Metal reports an "unlimited" weight budget
+  (UMA → `u64::MAX`), so an unpinned default V4.1 pool there asks for 75 % of
+  that and maps the binding-range maximum, 15.8 M slots (~103 GB) on the
+  synthetic model. The CPU-contract test now pauses the device for its
+  forwards; unpaused under `CMF_GPU=wgpu` it took 213 s and drove the 24 GB
+  Mac into swap. Real-model runs on a Mac with `CMF_GPU=wgpu` should pin
+  `CMF_DSV41_EXPERT_SLOTS` (or `CMF_GPU_VRAM_MB`).
 
 Measured CPU speed: see §5. Vulkan behaviour (NVIDIA) is still to be verified
 on a pod — §6.
@@ -198,25 +280,31 @@ Metal only correctness was checked.
 Build: `cargo build --release -p cortiq-cli` on the pod (Vulkan, `--features
 gpu` is the CLI default).
 
-Vulkan kernel tests (NVIDIA; no `CMF_GPU` needed off macOS, it is set by the
-tests):
+Vulkan kernel tests (NVIDIA; the engine's GPU tests set `CMF_GPU` themselves;
+the cortiq-cli end-to-end GPU test needs it from the environment):
 
 ```bash
 cargo test -p cortiq-engine --features gpu --release --lib gpu_wgpu::mxfp4 -- --test-threads=1 --nocapture
 cargo test -p cortiq-engine --features gpu --release --lib qtensor::mxfp4 -- --nocapture
 cargo test -p cortiq-engine --features gpu --release --lib qtensor::mxfp4::tests::cpu_matvec_speed -- --ignored --nocapture
-cargo test -p cortiq-cli --release --bin cortiq fp4_tests -- --test-threads=1
+CMF_GPU=1 cargo test -p cortiq-cli --release --bin cortiq fp4_tests -- --test-threads=1 --nocapture
+# expect "dsv41 fp4 dynamic GPU MoE: 14 bank calls, … logits nrmse vs CPU …" (Metal: 6.37e-3)
 ```
 
-1017 conversion with FP4 experts (source streamed one shard at a time; put the
-output on local disk or `/dev/shm`, never on a network FS):
+1017 conversion with FP4 experts, **as one Hugging Face file** (source
+streamed one shard at a time; put the output on local disk or `/dev/shm`,
+never on a network FS). The MTP/DSpark stack must go — 504.51 GB with it,
+496.96 GB without, the limit is 500 GB per file:
 
 ```bash
-cortiq convert --model deepseek-ai/DeepSeek-V4.1-Flash-1017 \
-  --quant fp4 --output /dev/shm/dsv41-1017-fp4.cmf
-# both files from one streamed pass:
-cortiq convert --model deepseek-ai/DeepSeek-V4.1-Flash-1017 \
-  --quant fp4 --output /dev/shm/dsv41-1017-fp4.cmf \
+cortiq convert --model deepseek-ai/DeepSeek-V4.1-Flash-1017 --quant fp4 \
+  --exclude-tensors "model.mtp.*" --output /dev/shm/dsv41-1017-fp4.cmf
+# expect: "--exclude-tensors: N source tensors excluded, B source bytes (… GB; 'model.mtp.*' ×N)"
+# check before uploading: stat -c %s /dev/shm/dsv41-1017-fp4.cmf  (must be < 500000000000)
+
+# both files from one streamed pass (the exclusion applies to both):
+cortiq convert --model deepseek-ai/DeepSeek-V4.1-Flash-1017 --quant fp4 \
+  --exclude-tensors "model.mtp.*" --output /dev/shm/dsv41-1017-fp4.cmf \
   --also-output q4tp=/dev/shm/dsv41-1017-q4tp.cmf
 ```
 
@@ -229,6 +317,8 @@ dtype 21; it reads headers and the directory only):
 python3 scripts/check_dsv41_cmf.py --model /dev/shm/dsv41-1017-fp4.cmf \
   --source-index /root/dsv41/hf/model.safetensors.index.json \
   --source-config /root/dsv41/hf/config.json
+# with --exclude-tensors it also prints
+# "excluded by the file's provenance (--exclude-tensors model.mtp.*): N source-derived tensors; none present"
 ```
 
 Byte identity of one expert against its source shard (layer 3 lives in
@@ -265,6 +355,13 @@ card (the mxfp4 slot is 2.1 % larger than q4tp's: 6 266 880 vs 6 137 856 B for
   (I8 + E8M0 1×32) are copied byte for byte — no dequant/requant; an FP8
   shared expert is OCP-quantized so the expert bank has one codec. Also
   `--quant mxfp4` and `--tensor-quant PATTERN=mxfp4`.
+- **`cortiq convert --exclude-tensors PATTERNS`.** Comma-separated globs
+  over canonical tensor names; matching tensors are never decoded or
+  written, in every output; counts printed, patterns recorded in the
+  provenance (`excluded_tensors`). `--exclude-tensors "model.mtp.*"` puts
+  DeepSeek-V4.1-Flash-1017 `--quant fp4` in one Hugging Face file
+  (496.96 GB instead of 504.51 GB); the V4.1 runtime never reads the MTP
+  stack.
 - **NVIDIA ModelOpt NVFP4 sources.** `hf_quant_config.json` /
   `quantization_config` `quant_algo: NVFP4` checkpoints decode
   (`e2m1 · e4m3 · weight_scale_2`, AWQ pre-quant scale folded) and convert to
