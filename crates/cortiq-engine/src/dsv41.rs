@@ -4209,7 +4209,7 @@ mod tests {
             index_heads: 1,
             index_head_dim: 32,
             index_topk: 4,
-            candidate_source: 99,
+            candidate_source: Some(99),
             candidate_topk_blocks: 2,
             candidate_block_size: 8,
             kv_sources: Vec::new(),
