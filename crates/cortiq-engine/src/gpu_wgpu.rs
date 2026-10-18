@@ -52,6 +52,8 @@ pub use blr::blr_matmat;
 pub mod gdn_train;
 /// Trainer kernels: RMSNorm, SwiGLU, gate, q/k norm + RoPE, attention.
 pub mod train_ops;
+/// Trainer attention on the matrix units (materialized causal scores).
+pub mod train_attn;
 /// Trainer GEMMs (zi_mm) and the binary low-rank layer forward/backward.
 pub mod train_mm;
 /// Sign training of the binary low-rank paths (STE latents, factored optimizer).

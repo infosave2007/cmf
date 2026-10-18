@@ -24,6 +24,7 @@ use crate::gpu_wgpu::gdn_train::{self as gdn, GdnTape, GdnTrainCfg};
 use crate::gpu_wgpu::train_head::{self as th, Head, HeadScratch};
 use crate::gpu_wgpu::train_mm::{self as tm, Blr, BlrPath, BlrScratch, Op};
 use crate::gpu_wgpu::train_sign::{self as ts, SignCtx, SignInit, SignScratch, SignStepCfg};
+use crate::gpu_wgpu::train_attn::{self as ta, AttScratch};
 use crate::gpu_wgpu::train_ops::{self as to, AttnGeom, QkrGeom};
 use cortiq_core::quant::{dequant_tensor, f16_to_f32, f32_to_f16};
 use cortiq_core::{CmfModel, LayerType, NormStyle};
@@ -479,6 +480,8 @@ pub struct Work {
     head: HeadScratch,
     /// Sign-training workspace (when the net carries sign state).
     pub sg: Option<SignScratch>,
+    /// Matrix-unit attention scratch (when the geometry allows it).
+    att: Option<AttScratch>,
 }
 
 impl Work {
@@ -580,6 +583,13 @@ impl Work {
             rope: to::upload(c, &tab),
             head: HeadScratch::new(c, 256.min(ntok), g.vocab, g.hs),
             sg: (sg_rows > 0).then(|| SignScratch::new(c, ntok, sg_rows, sg_rp)),
+            att: g
+                .gdn_layer
+                .iter()
+                .any(|&x| !x)
+                .then_some(AttnGeom { nb, t, nh: g.nh, nkv: g.nkv, hd: g.hd })
+                .filter(|ag| ta::usable(c, ag))
+                .map(|ag| AttScratch::new(c, &ag)),
         }
     }
     fn get(&self, n: &str) -> &wgpu::Buffer {
@@ -718,13 +728,24 @@ fn layer_fwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, y: &wgpu::
             let qg = QkrGeom { n, heads: g.nh, hd: g.hd, half: g.half, t: w.t, gemma: g.gemma, eps: g.eps };
             let kg = QkrGeom { heads: g.nkv, ..qg };
             let ag = AttnGeom { nb: w.nb, t: w.t, nh: g.nh, nkv: g.nkv, hd: g.hd };
-            tm::run(c, &[Op::D(tm::split_qg(c, w.get("qg"), w.get("q"), w.get("gate"), n, g.nh, g.hd, false)?)]);
-            to::run(c, &[
-                to::qkr_fwd(c, qg, w.get("q"), &qn.w, w.get("qr"), w.get("qinv"), &w.rope)?,
-                to::qkr_fwd(c, kg, w.get("k"), &kn.w, w.get("kr"), w.get("kinv"), &w.rope)?,
-                to::attn_fwd(c, ag, w.get("qr"), w.get("kr"), w.get("v"), w.get("o"), w.get("lse"))?,
-                to::elt(c, "gate_fwd", n * qd, w.get("o"), w.get("gate"), Some(w.get("og")), None, None, None)?,
-            ]);
+            if let Some(sc) = w.att.as_ref() {
+                let mut ops = vec![
+                    Op::D(tm::split_qg(c, w.get("qg"), w.get("q"), w.get("gate"), n, g.nh, g.hd, false)?),
+                    Op::D(to::qkr_fwd(c, qg, w.get("q"), &qn.w, w.get("qr"), w.get("qinv"), &w.rope)?),
+                    Op::D(to::qkr_fwd(c, kg, w.get("k"), &kn.w, w.get("kr"), w.get("kinv"), &w.rope)?),
+                ];
+                ops.extend(ta::fwd_ops(c, ag, sc, w.get("qr"), w.get("kr"), w.get("v"), w.get("o"), w.get("lse"))?);
+                ops.push(Op::D(to::elt(c, "gate_fwd", n * qd, w.get("o"), w.get("gate"), Some(w.get("og")), None, None, None)?));
+                tm::run(c, &ops);
+            } else {
+                tm::run(c, &[Op::D(tm::split_qg(c, w.get("qg"), w.get("q"), w.get("gate"), n, g.nh, g.hd, false)?)]);
+                to::run(c, &[
+                    to::qkr_fwd(c, qg, w.get("q"), &qn.w, w.get("qr"), w.get("qinv"), &w.rope)?,
+                    to::qkr_fwd(c, kg, w.get("k"), &kn.w, w.get("kr"), w.get("kinv"), &w.rope)?,
+                    to::attn_fwd(c, ag, w.get("qr"), w.get("kr"), w.get("v"), w.get("o"), w.get("lse"))?,
+                    to::elt(c, "gate_fwd", n * qd, w.get("o"), w.get("gate"), Some(w.get("og")), None, None, None)?,
+                ]);
+            }
             let _ = kd;
             lin_fwd(c, w, o, w.get("og"), w.get("mix"), false)?;
         }
@@ -779,8 +800,18 @@ fn layer_bwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, dy: &wgpu:
             let kg = QkrGeom { heads: g.nkv, ..qg };
             let ag = AttnGeom { nb: w.nb, t: w.t, nh: g.nh, nkv: g.nkv, hd: g.hd };
             lin_bwd(c, w, o, w.get("og"), w.get("dx2"), w.get("dog"), false, gs, sg)?;
-            to::run(c, &[to::elt(c, "gate_bwd", n * qd, w.get("o"), w.get("gate"), None, Some(w.get("dog")), Some(w.get("do")), Some(w.get("dgate")))?]);
-            to::run(c, &to::attn_bwd(c, ag, w.get("qr"), w.get("kr"), w.get("v"), w.get("o"), w.get("lse"), w.get("do"), w.get("dsum"), w.get("dqr"), w.get("dkr"), w.get("dv"))?);
+            let gate_b = to::elt(c, "gate_bwd", n * qd, w.get("o"), w.get("gate"), None, Some(w.get("dog")), Some(w.get("do")), Some(w.get("dgate")))?;
+            let ab = to::attn_bwd(c, ag, w.get("qr"), w.get("kr"), w.get("v"), w.get("o"), w.get("lse"), w.get("do"), w.get("dsum"), w.get("dqr"), w.get("dkr"), w.get("dv"))?;
+            if let Some(sc) = w.att.as_ref() {
+                // D = Σ dO⊙O (the f32 kernel's first pass), then the matrix-unit backward
+                let dsum = ab.into_iter().next()?;
+                let mut ops = vec![Op::D(gate_b), Op::D(dsum)];
+                ops.extend(ta::bwd_ops(c, ag, sc, w.get("lse"), w.get("do"), w.get("dsum"), w.get("dqr"), w.get("dkr"), w.get("dv"), gs)?);
+                tm::run(c, &ops);
+            } else {
+                to::run(c, &[gate_b]);
+                to::run(c, &ab);
+            }
             to::run(c, &[
                 to::qkr_bwd(c, qg, w.get("q"), &qn.w, w.get("qinv"), &w.rope, w.get("dqr"), w.get("dq"), w.get("dwq"))?,
                 to::qkr_bwd(c, kg, w.get("k"), &kn.w, w.get("kinv"), &w.rope, w.get("dkr"), w.get("dk"), w.get("dwk"))?,
