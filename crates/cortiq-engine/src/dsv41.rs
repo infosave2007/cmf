@@ -1898,9 +1898,9 @@ fn fp8_activation_inplace(v: &mut [f32]) {
 /// `CMF_DSV41_O_FP8=1`: quantize the attention output to FP8 (E4M3, 32-value
 /// blocks, power-of-two scales) before the grouped `wo_a`, as the reference
 /// does since commit 4dd75a8b (`act_quant(o, ...)` before the einsum). Off
-/// by default until a run on the released weights shows its effect. The
-/// device attention tail has no such quantizer yet, so the flag keeps V4.1
-/// attention on the CPU tail.
+/// by default until a run on the released weights shows its effect. Both
+/// tails apply it: the CPU tail here, the device frame with its
+/// `fp8_act_quant32` kernel (bit-identical to `fp8_activation_inplace`).
 fn v41_o_fp8_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("CMF_DSV41_O_FP8").is_ok_and(|value| value == "1"))
@@ -2247,7 +2247,7 @@ fn attention(
     // current bounded window plus the selected compressed rows; no
     // whole-history upload or clone is created here.
     #[cfg(feature = "gpu")]
-    if gpu_attention_tail_enabled() && !v41_o_fp8_enabled() {
+    if gpu_attention_tail_enabled() {
         let n_comp = selected_comp_positions.len();
         let cache_cap = (cfg.window + n_comp.next_power_of_two().max(64)) * cfg.head_dim;
         let cache_ok =
@@ -2309,6 +2309,7 @@ fn attention(
                     scale: (cfg.head_dim as f32).powf(-0.5),
                     bf16: true,
                     q_rms: false,
+                    o_fp8: v41_o_fp8_enabled(),
                 };
                 crate::gpu_wgpu::dsv4_attn_frame(
                     &model,
@@ -3861,8 +3862,9 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn fp8_activation_matches_kernel_act_quant() {
+    /// The act_quant(o) test set: 2000 random BF16 blocks and the edge
+    /// blocks listed inside. The last block is the nearest-even tie block.
+    fn act_quant_test_blocks() -> Vec<Vec<f32>> {
         let mut state = 0x5EED_u64;
         let mut next = || {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -3906,6 +3908,12 @@ mod tests {
         let mut b = vec![17.0f32, 19.0, -17.0, 0.0068359375, 300.0, 448.0];
         b.resize(32, 1.0);
         blocks.push(b);
+        blocks
+    }
+
+    #[test]
+    fn fp8_activation_matches_kernel_act_quant() {
+        let blocks = act_quant_test_blocks();
         for (i, block) in blocks.iter().enumerate() {
             let mut got = block.clone();
             fp8_activation_inplace(&mut got);
@@ -3969,6 +3977,98 @@ mod tests {
         assert_eq!(e4m3_round(272.0), 256.0);
         assert_eq!(e4m3_round(304.0), 320.0);
         assert_eq!(e4m3_round(432.0), 448.0);
+    }
+
+    /// The device `fp8_act_quant32` kernel (the V4.1 attention frame's
+    /// act_quant(o)) against the host quantizer, bit for bit: the reference
+    /// test set above, plus full-mantissa f32 blocks over the whole finite
+    /// range and the f32-underflow corner of the sign rule. Runs where a
+    /// wgpu adapter is selected (`CMF_GPU=wgpu` on macOS), skips otherwise.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn fp8_act_quant32_device_matches_host_bits() {
+        let mut blocks = act_quant_test_blocks();
+        let mut state = 0xF8A7_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 32) as u32
+        };
+        for _ in 0..2000 {
+            // A block exponent anywhere in the finite range, values up to 40
+            // binades below it (f32 subnormals included), any mantissa.
+            let top = (next() % 250) as i32 - 125;
+            blocks.push(
+                (0..32)
+                    .map(|_| {
+                        let e = (top - (next() % 40) as i32).clamp(-149, 126);
+                        let m = 1.0 + (next() & 0x7f_ffff) as f32 / 8_388_608.0;
+                        let v = m * 2f32.powi(e.max(-126)) * 2f32.powi((e + 126).min(0));
+                        if next() & 1 == 1 { -v } else { v }
+                    })
+                    .collect(),
+            );
+        }
+        // Scale 2^25: these negative values divide to an f32 subnormal (the
+        // host keeps the sign of the zero they round to) or underflow to an
+        // exact zero (the host returns +0); f32 subnormal inputs too.
+        let mut b = vec![0.0f32; 32];
+        b[0] = 448.0 * 2f32.powi(25);
+        for (i, v) in [
+            -2f32.powi(-126),
+            -2f32.powi(-124),
+            -3.0 * 2f32.powi(-127),
+            -2f32.powi(-125),
+            -1.5 * 2f32.powi(-125),
+            -5.0 * 2f32.powi(-149),
+            -f32::from_bits(0x007f_ffff),
+            1e-30,
+            -1e-30,
+            -0.0,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            b[i + 1] = v;
+        }
+        blocks.push(b);
+        // Scale 2^-5: f32 subnormal inputs divide to a nonzero quotient.
+        let mut b = vec![-f32::from_bits(3); 32];
+        b[0] = 14.0;
+        b[1] = f32::from_bits(1);
+        blocks.push(b);
+        let flat: Vec<f32> = blocks.iter().flatten().copied().collect();
+        let Some(got) = crate::gpu_wgpu::fp8_act::act_quant32_for_test(&flat) else {
+            eprintln!("skipped: no wgpu adapter (set CMF_GPU=wgpu on macOS)");
+            return;
+        };
+        let mut want = flat.clone();
+        fp8_activation_inplace(&mut want);
+        let mut bad = 0usize;
+        for (i, ((g, w), x)) in got.iter().zip(&want).zip(&flat).enumerate() {
+            if g.to_bits() != w.to_bits() {
+                if bad < 8 {
+                    eprintln!(
+                        "block {} value {}: x {x:e} ({:#010x}) device {g:e} ({:#010x}) host {w:e} ({:#010x})",
+                        i / 32,
+                        i % 32,
+                        x.to_bits(),
+                        g.to_bits(),
+                        w.to_bits()
+                    );
+                }
+                bad += 1;
+            }
+        }
+        eprintln!(
+            "fp8_act_quant32: {} blocks, {bad} values differ from the host",
+            blocks.len()
+        );
+        assert_eq!(
+            bad, 0,
+            "device act_quant(o) is not bit-identical to the host"
+        );
     }
 
     #[test]

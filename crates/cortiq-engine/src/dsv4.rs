@@ -1407,6 +1407,7 @@ fn attn_frame(
         scale,
         bf16: false,
         q_rms: true,
+        o_fp8: false,
     };
     // The host fold, explicitly. The frame used to read this half's input
     // from the pooled x2 slot — which a device MoE frame of the SAME layer
@@ -2414,6 +2415,7 @@ fn dsv4_layer_loop(
                 scale: (hd as f32).powf(-0.5),
                 bf16: false,
                 q_rms: true,
+                o_fp8: false,
             },
             moe: crate::gpu_wgpu::Dsv4MoeGeom {
                 hidden: dim,
@@ -2914,6 +2916,7 @@ fn dsv4_chain1_layer(
             scale: (hd as f32).powf(-0.5),
             bf16: false,
             q_rms: true,
+            o_fp8: false,
         },
         moe: crate::gpu_wgpu::Dsv4MoeGeom {
             hidden: dim,
@@ -3407,6 +3410,7 @@ fn dsv4_chain_run(
                 scale: (hd as f32).powf(-0.5),
                 bf16: false,
                 q_rms: true,
+                o_fp8: false,
             },
             moe: crate::gpu_wgpu::Dsv4MoeGeom {
                 hidden: dim,
@@ -6772,6 +6776,7 @@ fn partial_layer_batch(
             scale: (hd as f32).powf(-0.5),
             bf16: false,
             q_rms: true,
+            o_fp8: false,
         },
         moe: crate::gpu_wgpu::Dsv4MoeGeom {
             hidden: dim,

@@ -64,6 +64,9 @@ pub mod train_head;
 pub mod train_prof;
 /// Subgroup q1g decode matvec (bit-identical to `q1g_matvec`, no barriers).
 pub(crate) mod q1g_mv;
+/// `act_quant(o)` of the V4.1 attention output (FP8 E4M3, 32-value blocks).
+#[doc(hidden)]
+pub mod fp8_act;
 /// Device linear algebra of the NVG `blr` encoder (f32 GEMM, SPD solves,
 /// discrete-knot kernels).
 pub mod nvg_dev;
@@ -19193,6 +19196,8 @@ pub struct Ctx {
     dense_mv_pipes: std::sync::OnceLock<Option<dense_mv::MvSg>>,
     /// Subgroup q1g decode matvec (`q1g_mv`).
     q1g_sg_pipes: std::sync::OnceLock<Option<q1g_mv::Q1gSg>>,
+    /// V4.1 `act_quant(o)` (`fp8_act`).
+    fp8_act_pipe: std::sync::OnceLock<Option<fp8_act::Pipe>>,
     /// Subgroup-tree GDN step twins (`dense_mv::gdn`).
     gdn_sg_pipes: std::sync::OnceLock<Option<dense_mv::GdnSg>>,
     moe_down_q4tp_b2: wgpu::ComputePipeline,
@@ -21966,6 +21971,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         g4_sandwich_pipe: std::sync::OnceLock::new(),
         dense_mv_pipes: std::sync::OnceLock::new(),
         q1g_sg_pipes: std::sync::OnceLock::new(),
+        fp8_act_pipe: std::sync::OnceLock::new(),
         gdn_sg_pipes: std::sync::OnceLock::new(),
         moe_down_q4tp_b2,
         moe_down_q4tp_part,
@@ -69015,7 +69021,7 @@ pub fn dsv4_cache_write(kv_id: u64, li: usize, off: usize, data: &[f32], cap: us
 /// * `frame_up_pos` (tag)     — 1, 79–80, 97, 108
 /// * `uni_slot` (tag, kv, li) — 84–85, 101, 130–131, 134, 136, 138, 140,
 ///                              142–164 (blit, even), 166, 168, 170
-/// * `cached_bind` (tag,kv,li)— 30–33, 36–42, 50–64, 80–101, 120–129,
+/// * `cached_bind` (tag,kv,li)— 30–33, 36–42, 47, 50–64, 80–101, 120–129,
 ///                              132–141, 143–165 (blit, odd), 167, 169–171,
 ///                              180–199, 213–254 (batch/DSpark), 210–212,
 ///                              215 (MiniCPM prepared tail)
@@ -69214,6 +69220,11 @@ pub struct Dsv4AttnGeom {
     /// Whether the query heads receive DSV4's second RMSNorm after `wq_b`.
     /// V4.1's official attention path has only the LoRA-rank `q_norm`.
     pub q_rms: bool,
+    /// V4.1 `act_quant(o)` (`CMF_DSV41_O_FP8`): the attended output is
+    /// quantized to FP8 E4M3 in 32-value blocks after its BF16 boundary and
+    /// before the grouped `wo_a`. Read by `dsv4_attn_frame` only; DSV4 and
+    /// the layer frames keep it false.
+    pub o_fp8: bool,
 }
 
 /// DeepSeek-V4's attention block, start to finish, in ONE submission.
@@ -69302,6 +69313,7 @@ pub fn dsv4_attn_frame(
         || idxs.is_empty()
         || idxs.len() > 1024
         || inv_freq.len() * 2 < g.rd
+        || (g.o_fp8 && (g.nh * g.hd / g.o_groups.max(1)) % 32 != 0)
     {
         no!(
             "формы: hidden {} dim {} out {} sink {} nh {} q_norm {} q_lora {} idx {} freq {} rd {}",
@@ -69316,6 +69328,11 @@ pub fn dsv4_attn_frame(
             inv_freq.len(),
             g.rd
         );
+    }
+    // Declined before anything is encoded: the caller's host tail then
+    // quantizes instead.
+    if g.o_fp8 && fp8_act::pipe(c).is_none() {
+        no!("act_quant(o) недоступен на этом устройстве");
     }
     let bytes = model.primary_bytes();
     // Every weight q4tp, or the frame declines: a mixed layer would need the
@@ -69484,6 +69501,11 @@ pub fn dsv4_attn_frame(
     );
     if g.bf16 {
         encode_bf16_round(c, &mut enc, &attn, g.nh * g.hd, (40, kv_id, li));
+    }
+    if g.o_fp8 {
+        // In place on the BF16 output; the per-group 32-blocks are
+        // contiguous runs of the flat buffer (32-multiple group width).
+        fp8_act::encode(c, &mut enc, &attn, g.nh * g.hd, (47, kv_id, li));
     }
     {
         let rows = g.o_groups * g.o_lora;
