@@ -121,6 +121,35 @@ fn colsum_prod(@builtin(global_invocation_id) g: vec3<u32>) {
     OUT[col] = OUT[col] + acc;
 }
 
+// Two-pass column reduction, pass 1: SRC[blk][k] = Σ over the rows of block
+// blk (r rows per block) of A·B (rows = 0), A·B·COL[row] (1) or A (2).
+@compute @workgroup_size(256)
+fn colsum_part(@builtin(global_invocation_id) g: vec3<u32>, @builtin(workgroup_id) wg: vec3<u32>) {
+    let col = g.x;
+    if (col >= p.k) { return; }
+    let r0 = wg.y * p.r;
+    let r1 = min(r0 + p.r, p.m);
+    var acc = 0.0;
+    if (p.rows == 0u) {
+        for (var row = r0; row < r1; row = row + 1u) { acc = acc + A[row * p.k + col] * B[row * p.k + col]; }
+    } else if (p.rows == 1u) {
+        for (var row = r0; row < r1; row = row + 1u) { acc = acc + A[row * p.k + col] * B[row * p.k + col] * COL[row]; }
+    } else {
+        for (var row = r0; row < r1; row = row + 1u) { acc = acc + A[row * p.k + col]; }
+    }
+    SRC[wg.y * p.k + col] = acc;
+}
+
+// Pass 2: OUT[col] (+)= Σ_blk SRC[blk][col]  (words = blocks, pad0 = 1: accumulate).
+@compute @workgroup_size(256)
+fn colsum_fin(@builtin(global_invocation_id) g: vec3<u32>) {
+    let col = g.x;
+    if (col >= p.k) { return; }
+    var acc = 0.0;
+    for (var b = 0u; b < p.words; b = b + 1u) { acc = acc + SRC[b * p.k + col]; }
+    if (p.pad0 == 1u) { OUT[col] = OUT[col] + acc; } else { OUT[col] = acc; }
+}
+
 // Small dense f32 linear: OUT[m][r] (+)= A[m][k] · B[r][k]ᵀ  (rows flag: accumulate)
 // one thread per output element; for the few-row projections (GDN a/b).
 @compute @workgroup_size(256)
@@ -219,7 +248,7 @@ fn scale_acc(@builtin(global_invocation_id) g: vec3<u32>) {
 "#;
 
 fn module(c: &Ctx) -> Option<&'static train_ops::Mod> {
-    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "cvt_cols", "cvt_t", "expand", "colsum_prod", "scale_acc", "dense_fwd", "dense_bwd", "split_qg", "adam", "sumsq"])
+    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "cvt_cols", "cvt_t", "expand", "colsum_prod", "colsum_part", "colsum_fin", "scale_acc", "dense_fwd", "dense_bwd", "split_qg", "adam", "sumsq"])
 }
 
 /// One step of a trainer pass: an elementwise/reduction dispatch or a GEMM.
@@ -376,15 +405,62 @@ pub fn expand<'a>(c: &'a Ctx, bits: &'a wgpu::Buffer, pl: &'a wgpu::Buffer, plt:
     })
 }
 
-/// `out[k] += Σ_rows a[row][k]·b[row][k]`.
-pub fn colsum_prod<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, b: &'a wgpu::Buffer, out: &'a wgpu::Buffer, m: usize, k: usize) -> Option<Disp<'a>> {
+/// Words of the shared partial-sum buffer of the column reductions.
+const PART_WORDS: usize = 256 * 32768;
+
+/// The column reductions' partial sums (one buffer: every op is ordered).
+fn part_buf(c: &Ctx) -> &'static wgpu::Buffer {
+    static PART: std::sync::OnceLock<wgpu::Buffer> = std::sync::OnceLock::new();
+    PART.get_or_init(|| train_ops::zeros(c, PART_WORDS))
+}
+
+/// Term of a column reduction.
+#[derive(Clone, Copy)]
+pub enum ColTerm<'a> {
+    /// a·b
+    Prod(&'a wgpu::Buffer),
+    /// a·b·f[row]
+    ProdRow(&'a wgpu::Buffer, &'a wgpu::Buffer),
+    /// a
+    Plain,
+}
+
+/// Column reduction `out[k] (+)= Σ_rows term(a[row][k], …)` over `m` rows in
+/// two passes (row blocks of ≥ 64 rows, at most 256 blocks, then the block
+/// partials in order): latency-free where a thread-per-column loop over
+/// thousands of rows ran on a handful of workgroups. Deterministic.
+#[allow(clippy::too_many_arguments)]
+pub fn colsum<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, term: ColTerm<'a>, out: &'a wgpu::Buffer, m: usize, k: usize, acc: bool) -> Option<[Disp<'a>; 2]> {
     let md = module(c)?;
-    Some(Disp {
-        pipe: &md.p["colsum_prod"],
-        uni: vec![m as u32, k as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        bufs: vec![(7, a), (8, b), (9, out)],
+    let rpb = 64usize.max(m.div_ceil(256));
+    let nblk = m.div_ceil(rpb).max(1);
+    if nblk * k > PART_WORDS {
+        return None;
+    }
+    let part = part_buf(c);
+    let (mode, b, f) = match term {
+        ColTerm::Prod(b) => (0u32, b, a),
+        ColTerm::ProdRow(b, f) => (1, b, f),
+        ColTerm::Plain => (2, a, a),
+    };
+    let p1 = Disp {
+        pipe: &md.p["colsum_part"],
+        uni: vec![m as u32, k as u32, 0, mode, rpb as u32, 0, 0, 0, 0, 0, 0, 0],
+        bufs: vec![(1, part), (2, f), (7, a), (8, b)],
+        grid: (k.div_ceil(256) as u32, nblk as u32, 1),
+    };
+    let p2 = Disp {
+        pipe: &md.p["colsum_fin"],
+        uni: vec![m as u32, k as u32, 0, 0, 0, nblk as u32, acc as u32, 0, 0, 0, 0, 0],
+        bufs: vec![(1, part), (9, out)],
         grid: (k.div_ceil(256) as u32, 1, 1),
-    })
+    };
+    Some([p1, p2])
+}
+
+/// `out[k] += Σ_rows a[row][k]·b[row][k]` (two dispatches, see [`colsum`]).
+pub fn colsum_prod<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, b: &'a wgpu::Buffer, out: &'a wgpu::Buffer, m: usize, k: usize) -> Option<[Disp<'a>; 2]> {
+    colsum(c, a, ColTerm::Prod(b), out, m, k, true)
 }
 
 /// `out = a ⊙ col` per row (or `out += …` with `acc`).
@@ -584,16 +660,22 @@ pub fn blr_forward(c: &Ctx, layer: &Blr, s: &BlrScratch, x: &wgpu::Buffer, y: &w
 pub fn blr_backward(c: &Ctx, layer: &Blr, s: &BlrScratch, x: &wgpu::Buffer, dy: &wgpu::Buffer, dx: &wgpu::Buffer, ntok: usize, gscale: f32, sign: Option<&train_sign::SignCtx>) -> Option<()> {
     let (m, n, r) = (layer.m, layer.n, layer.r);
     for (pi, p) in layer.paths.iter().enumerate() {
+        let [dh1, dh2] = colsum_prod(c, dy, &s.cbuf[pi], &p.dh, ntok, m)?;
+        let [dl1, dl2] = colsum_prod(c, &s.a[pi], &s.t2, &p.dl, ntok, r)?;
+        let [dg1, dg2] = colsum_prod(c, x, &s.t1, &p.dg, ntok, n)?;
         let mut ops = vec![
             Op::D(expand(c, &p.bits_u, &s.pl_u, &s.plt_u, m, r)?),
             Op::D(expand(c, &p.bits_v, &s.pl_v, &s.plt_v, n, r)?),
-            Op::D(colsum_prod(c, dy, &s.cbuf[pi], &p.dh, ntok, m)?),
+            Op::D(dh1),
+            Op::D(dh2),
             Op::D(cvt(c, dy, Some(&p.h), &s.xh, ntok, m, gscale)?),
             Op::M(mm(c, &s.plt_u, &s.xh, &s.t2, ntok, r, m, 1.0 / gscale)?),
-            Op::D(colsum_prod(c, &s.a[pi], &s.t2, &p.dl, ntok, r)?),
+            Op::D(dl1),
+            Op::D(dl2),
             Op::D(cvt(c, &s.t2, Some(&p.l), &s.xh, ntok, r, gscale)?),
             Op::M(mm(c, &s.pl_v, &s.xh, &s.t1, ntok, n, r, 1.0 / gscale)?),
-            Op::D(colsum_prod(c, x, &s.t1, &p.dg, ntok, n)?),
+            Op::D(dg1),
+            Op::D(dg2),
             Op::D(scale_acc(c, &s.t1, &p.g, dx, ntok, n, pi > 0)?),
         ];
         let sign_from = ops.len();

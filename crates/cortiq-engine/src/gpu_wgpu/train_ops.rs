@@ -746,15 +746,10 @@ pub fn rms_bwd<'a>(c: &'a Ctx, x: &'a wgpu::Buffer, w: &'a wgpu::Buffer, inv: &'
     })
 }
 
-/// RMSNorm gain gradient, accumulated into `dw`.
-pub fn rms_dw<'a>(c: &'a Ctx, x: &'a wgpu::Buffer, inv: &'a wgpu::Buffer, dy: &'a wgpu::Buffer, dw: &'a wgpu::Buffer, n: usize, d: usize) -> Option<Disp<'a>> {
-    let m = norm_mod(c)?;
-    Some(Disp {
-        pipe: &m.p["rms_dw"],
-        uni: vec![n as u32, d as u32, 0, 0, 0, 0, 0, 0],
-        bufs: vec![(1, x), (4, inv), (5, dy), (7, dw)],
-        grid: ((d.div_ceil(256)) as u32, 1, 1),
-    })
+/// RMSNorm gain gradient `dw[j] += Σ_r dy·x·inv`, accumulated into `dw`
+/// (the two-pass column reduction of `train_mm`).
+pub fn rms_dw<'a>(c: &'a Ctx, x: &'a wgpu::Buffer, inv: &'a wgpu::Buffer, dy: &'a wgpu::Buffer, dw: &'a wgpu::Buffer, n: usize, d: usize) -> Option<[Disp<'a>; 2]> {
+    super::train_mm::colsum(c, dy, super::train_mm::ColTerm::ProdRow(x, inv), dw, n, d, true)
 }
 
 /// Elementwise ops: `swiglu_fwd` (C = silu(A)·B), `swiglu_bwd`
@@ -808,10 +803,10 @@ pub fn qkr_bwd<'a>(c: &'a Ctx, g: QkrGeom, x: &'a wgpu::Buffer, w: &'a wgpu::Buf
     })
 }
 
-/// Sum the gain partials of [`qkr_bwd`] into `dw` (overwritten).
-pub fn qkr_dw<'a>(c: &'a Ctx, g: QkrGeom, dwp: &'a wgpu::Buffer, dw: &'a wgpu::Buffer) -> Option<Disp<'a>> {
-    let m = qkr_mod(c)?;
-    Some(Disp { pipe: &m.p["qkr_dw"], uni: g.uni(), bufs: vec![(2, dw), (8, dwp)], grid: ((g.hd.div_ceil(256)) as u32, 1, 1) })
+/// Sum the gain partials of [`qkr_bwd`] into `dw` (overwritten, or
+/// accumulated with `acc`), as a two-pass column reduction.
+pub fn qkr_dw<'a>(c: &'a Ctx, g: QkrGeom, dwp: &'a wgpu::Buffer, dw: &'a wgpu::Buffer, acc: bool) -> Option<[Disp<'a>; 2]> {
+    super::train_mm::colsum(c, dwp, super::train_mm::ColTerm::Plain, dw, g.n * g.heads, g.hd, acc)
 }
 
 /// Geometry of a causal GQA attention over `nb` windows of `t` tokens.
@@ -1041,10 +1036,12 @@ mod tests {
         let dy = rnd(n * d, 3, 1.0);
         for gemma in [false, true] {
             let (bx, bw, by, binv, bdy, bdx, bdw) = (upload(c, &x), upload(c, &w), zeros(c, n * d), zeros(c, n), upload(c, &dy), zeros(c, n * d), zeros(c, d));
+            let [dw1, dw2] = rms_dw(c, &bx, &binv, &bdy, &bdw, n, d).unwrap();
             let ds = vec![
                 rms_fwd(c, &bx, &bw, &by, &binv, n, d, 1e-6, gemma).unwrap(),
                 rms_bwd(c, &bx, &bw, &binv, &bdy, &bdx, n, d, gemma).unwrap(),
-                rms_dw(c, &bx, &binv, &bdy, &bdw, n, d).unwrap(),
+                dw1,
+                dw2,
             ];
             run(c, &ds);
             let (xf, wf, dyf) = (f64v(&x), f64v(&w), f64v(&dy));
@@ -1087,7 +1084,7 @@ mod tests {
         let g = QkrGeom { n, heads, hd, half, t, gemma: true, eps: 1e-6 };
         let (bx, bw, by, binv, brope, bdy, bdx, bdwp, bdw) = (upload(c, &x), upload(c, &w), zeros(c, x.len()), zeros(c, n * heads), upload(c, &tab), upload(c, &dy), zeros(c, x.len()), zeros(c, x.len()), zeros(c, hd));
         run(c, &[qkr_fwd(c, g, &bx, &bw, &by, &binv, &brope).unwrap(), qkr_bwd(c, g, &bx, &bw, &binv, &brope, &bdy, &bdx, &bdwp).unwrap()]);
-        run(c, &[qkr_dw(c, g, &bdwp, &bdw).unwrap()]);
+        run(c, &qkr_dw(c, g, &bdwp, &bdw, false).unwrap());
         let (xf, wf) = (f64v(&x), f64v(&w));
         let (mut y, mut dx, mut dw) = (vec![0f64; x.len()], vec![0f64; x.len()], vec![0f64; hd]);
         for u in 0..n * heads {
