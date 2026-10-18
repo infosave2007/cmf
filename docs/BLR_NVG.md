@@ -263,10 +263,13 @@ Same card, `bench --core --ignore-eos`, a quiet window (the card is otherwise sh
 |---|---|---|
 | Qwen3.5-0.8B q8_2f | 352.8 | — |
 | Qwen3.5-0.8B NVG 1.0 bpw (trained) | 346.5 | 3.9 |
-| Qwen3.8-27B NVG 0.55 bpw | 73.7 (32 tokens; prefill 79 tok/s) | ~1 (the FFN on the CPU: `P·r > 2048`) |
+| Qwen3.8-27B NVG 0.55 bpw | 73.7 (32 tokens; prefill 79 tok/s) | not measured (the FFN on the CPU: `P·r > 2048`; ~1 expected) |
 
+Only the token-graph column was measured in the quiet window; the 0.8B per-op 3.9 is the
+0.8.20 baseline on the card shared with the 27B training (q8_2f 107.0 tok/s there), a lower bound.
 Greedy text of the 0.8B identical to the per-op path, PPL 135.764 on both (16 × 512).
-27B on the device: 11.8 ms a token, ~184 µs a layer, the q8_2f head 0.85 ms. A projection
+27B on the device: a decoded token ~12.7 ms = the 64 layers ~11.8 ms (~184 µs a layer) plus the
+final norm and q8_2f head 0.85 ms. A projection
 group costs its V and U dispatches plus their dependency barriers (DRAM regime, V+U pair:
 GDN qkv|z ~30 µs, out ~27, gate|up+act ~28, down ~35 against 2–8 µs of bytes at full
 bandwidth); stage V of `down` (17408 columns, 272 row sets each re-reading z) is the slowest

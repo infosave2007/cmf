@@ -1175,14 +1175,17 @@ mod tests {
                     let lat_d = download(c, &mat.lat, rows * rp).unwrap();
                     let mut worst = 0f32;
                     let mut bit_bad = 0;
-                    // GPU tanh/sqrt are a few ulp off: measure against the step size η
+                    // GPU tanh/sqrt are a few ulp off: measure against the step taken,
+                    // at least η (where the preset second moment is tiny the Adam step is
+                    // hundreds of η, and a few ulp of it exceeded 1e-2·η on a CI Metal GPU)
                     for e in 0..rows * rp {
-                        worst = worst.max((lat_d[e] - lat[e]).abs() / cfg.eta);
+                        let step = (lat[e] - latf[e]).abs().max(cfg.eta);
+                        worst = worst.max((lat_d[e] - lat[e]).abs() / step);
                     }
                     for (a, b) in bits_d.iter().zip(&bits_h) {
                         bit_bad += (a ^ b).count_ones();
                     }
-                    eprintln!("ref: latent worst |Δ|/η {worst:e}, bit mismatches {bit_bad}, flips dev {} host {flips}", cnt[3]);
+                    eprintln!("ref: latent worst |Δ|/max(η, |step|) {worst:e}, bit mismatches {bit_bad}, flips dev {} host {flips}", cnt[3]);
                     assert!(worst < 1e-2);
                     assert_eq!(bit_bad, 0);
                     assert_eq!(cnt[3] as u64, flips);
