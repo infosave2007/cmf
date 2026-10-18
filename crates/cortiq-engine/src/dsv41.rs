@@ -926,21 +926,28 @@ impl Dsv41Cfg {
             }
         }
         // `candidate_source_layer < 0 turns it off` (reference ModelArgs). An
-        // absent key keeps the release layer, like every other default here.
+        // absent key keeps the release layer, like every other default here;
+        // a null one counts as absent (the other spelling is then read). An
+        // integral float (`20.0`, as some JSON writers emit) is an integer.
         let candidate_source = match ["candidate_source_layer", "candidate_source_layer_id"]
             .iter()
-            .find_map(|key| tc.get(key))
+            .find_map(|key| tc.get(*key).filter(|v| !v.is_null()).map(|v| (*key, v)))
         {
             None => Some(20),
-            Some(v) => match v.as_i64() {
-                Some(layer) if layer < 0 => None,
-                Some(layer) => Some(layer as usize),
-                None => {
-                    return Err(format!(
-                        "text_config.candidate_source_layer_id = {v} is not an integer"
-                    ));
+            Some((key, v)) => {
+                let layer = v.as_i64().or_else(|| {
+                    v.as_f64()
+                        .filter(|f| f.fract() == 0.0 && f.abs() < (1u64 << 53) as f64)
+                        .map(|f| f as i64)
+                });
+                match layer {
+                    Some(layer) if layer < 0 => None,
+                    Some(layer) => Some(layer as usize),
+                    None => {
+                        return Err(format!("text_config.{key} = {v} is not an integer"));
+                    }
                 }
-            },
+            }
         };
         let engram_layers = array_of("engram_layer_ids");
         let engram_embeddings = array_of("engram_num_embeddings");
@@ -3850,6 +3857,53 @@ mod tests {
             .remove("candidate_source_layer_id");
         let (cfg, _) = Dsv41Cfg::from_source(&tc, &decoy_arch()).unwrap();
         assert_eq!(cfg.candidate_source, Some(20), "absent keeps the release layer");
+    }
+
+    /// A null candidate key is skipped (the other spelling, or the release
+    /// default, applies); an integral float is an integer; a fractional one
+    /// or a string is refused with the key it came from.
+    #[test]
+    fn candidate_source_skips_null_and_accepts_integral_float() {
+        let with = |pairs: &[(&str, serde_json::Value)]| {
+            let mut tc = release_text_config();
+            let obj = tc.as_object_mut().unwrap();
+            obj.remove("candidate_source_layer_id");
+            for (k, v) in pairs {
+                obj.insert((*k).into(), v.clone());
+            }
+            Dsv41Cfg::from_source(&tc, &decoy_arch()).map(|(cfg, _)| cfg.candidate_source)
+        };
+        let null = serde_json::Value::Null;
+        assert_eq!(
+            with(&[("candidate_source_layer_id", serde_json::json!(20.0))]),
+            Ok(Some(20))
+        );
+        assert_eq!(
+            with(&[("candidate_source_layer", serde_json::json!(-1.0))]),
+            Ok(None)
+        );
+        assert_eq!(
+            with(&[
+                ("candidate_source_layer", null.clone()),
+                ("candidate_source_layer_id", serde_json::json!(7)),
+            ]),
+            Ok(Some(7)),
+            "a null first spelling falls through to the second"
+        );
+        assert_eq!(
+            with(&[("candidate_source_layer_id", null.clone())]),
+            Ok(Some(20)),
+            "null alone is absent"
+        );
+        for bad in [serde_json::json!(20.5), serde_json::json!("20")] {
+            let err = with(&[("candidate_source_layer_id", bad.clone())]).unwrap_err();
+            assert!(err.contains("candidate_source_layer_id"), "{bad}: {err}");
+        }
+        let err = with(&[("candidate_source_layer", serde_json::json!(1.5))]).unwrap_err();
+        assert!(
+            err.contains("text_config.candidate_source_layer ="),
+            "{err}"
+        );
     }
 
     #[test]
