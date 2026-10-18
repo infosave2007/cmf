@@ -924,8 +924,8 @@ enum Commands {
     },
     /// NVG Ť: light distillation training of a compressed model's metric
     /// (the h, ℓ, g scales of its binary low-rank tensors and every RMSNorm
-    /// gain; signs and every other weight frozen) against its
-    /// full-precision teacher, on the GPU. Qwen3.5-family models.
+    /// gain; with --train-signs also the signs; every other weight frozen)
+    /// against its full-precision teacher, on the GPU. Qwen3.5-family models.
     NvgTrain {
         /// Student .cmf (binary low-rank tensors to train)
         student: String,
@@ -966,6 +966,48 @@ enum Commands {
         /// Output .cmf (the student with the trained metric)
         #[arg(long)]
         output: String,
+        /// Also train the signs (straight-through latents, updated inside
+        /// the reverse sweep; the best held-out snapshot's bits are exported)
+        #[arg(long)]
+        train_signs: bool,
+        /// Sign optimizer: fact (2 B/sign) | fact-mom (4 B) | ref (12 B, small models)
+        #[arg(long, default_value = "fact")]
+        sign_opt: String,
+        /// RMS of the initial |latent| (magnitudes τ·|z|, sign from the bit)
+        #[arg(long, default_value = "0.25")]
+        sign_tau: f64,
+        /// Peak sign learning rate, or auto = 0.15·τ/√steps
+        #[arg(long, default_value = "auto")]
+        sign_lr: String,
+        /// Sign steps at η = 0 while the second-moment statistics settle
+        #[arg(long, default_value = "10")]
+        sign_warm: usize,
+        #[arg(long, default_value = "0.9")]
+        sign_b1: f64,
+        #[arg(long, default_value = "0.999")]
+        sign_b2: f64,
+        /// ε of the factored optimizer, relative to the gradient RMS
+        #[arg(long, default_value = "1e-3")]
+        sign_eps: f64,
+        /// Clamp of the normalized sign step
+        #[arg(long, default_value = "4")]
+        sign_clamp: f64,
+        /// Hysteresis of the bit against the latent (0 = sign of the latent)
+        #[arg(long, default_value = "0")]
+        sign_hyst: f64,
+        /// Halve the sign rate when the per-step flip rate exceeds this 3 steps running
+        #[arg(long, default_value = "5e-4")]
+        sign_max_step_flip: f64,
+        /// Halve the sign rate when this fraction of the signs has flipped
+        #[arg(long, default_value = "0.15")]
+        sign_max_total_flip: f64,
+        /// Seed of the latent init and the stochastic rounding (default: --seed)
+        #[arg(long)]
+        sign_seed: Option<u64>,
+        /// Cache file of the teacher top-k (reused when the teacher file and
+        /// every data argument match)
+        #[arg(long)]
+        topk_cache: Option<String>,
     },
     /// One tensor through the NVG `blr` encoder with a per-stage profile, on
     /// the CPU reference path and/or the device path, from Grams captured
@@ -3505,7 +3547,41 @@ async fn main() -> anyhow::Result<()> {
             clip,
             seed,
             output,
+            train_signs,
+            sign_opt,
+            sign_tau,
+            sign_lr,
+            sign_warm,
+            sign_b1,
+            sign_b2,
+            sign_eps,
+            sign_clamp,
+            sign_hyst,
+            sign_max_step_flip,
+            sign_max_total_flip,
+            sign_seed,
+            topk_cache,
         } => {
+            let signs = if train_signs {
+                let opt = cortiq_engine::gpu_wgpu::train_sign::SignOpt::parse(&sign_opt).ok_or_else(|| anyhow::anyhow!("--sign-opt: fact | fact-mom | ref"))?;
+                let lr = if sign_lr == "auto" { None } else { Some(sign_lr.parse::<f64>().map_err(|_| anyhow::anyhow!("--sign-lr: auto or a number"))?) };
+                Some(nvgtrain::SignOpts {
+                    opt,
+                    tau: sign_tau,
+                    lr,
+                    warm: sign_warm,
+                    b1: sign_b1,
+                    b2: sign_b2,
+                    eps: sign_eps,
+                    clamp: sign_clamp,
+                    hyst: sign_hyst,
+                    max_step_flip: sign_max_step_flip,
+                    max_total_flip: sign_max_total_flip,
+                    seed: sign_seed.unwrap_or(seed),
+                })
+            } else {
+                None
+            };
             nvgtrain::run(&nvgtrain::NvgTrainOpts {
                 student: &student,
                 teacher: &teacher,
@@ -3521,6 +3597,8 @@ async fn main() -> anyhow::Result<()> {
                 clip,
                 seed,
                 output: &output,
+                signs,
+                topk_cache: topk_cache.as_deref(),
             })
         }
         #[cfg(not(feature = "gpu"))]
