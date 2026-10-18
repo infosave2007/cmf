@@ -60800,13 +60800,26 @@ pub fn dsv4_global_moe_create_for_dsv41_codec(
     hidden: usize,
     codec: MoeBankCodec,
 ) -> Option<(usize, usize)> {
+    let policy =
+        dsv41_segments_policy(std::env::var("CMF_DSV41_GLOBAL_SEGMENTS").ok().as_deref());
+    dsv41_global_moe_create_with_policy(model, requested, inter, hidden, codec, policy)
+}
+
+/// [`dsv4_global_moe_create_for_dsv41_codec`] under an explicit segment
+/// policy (the env-free entry point the bank tests use).
+fn dsv41_global_moe_create_with_policy(
+    model: &Arc<CmfModel>,
+    requested: usize,
+    inter: usize,
+    hidden: usize,
+    codec: MoeBankCodec,
+    policy: Dsv41Segments,
+) -> Option<(usize, usize)> {
     let c = ctx()?;
     let _op = c.op_gate.enter();
     let (gu_len, d_len) = codec.lens(inter, hidden)?;
     let per = 2usize.checked_mul(gu_len)?.checked_add(d_len)?;
     let per_segment = dsv4_global_moe_per_segment(c, gu_len, d_len);
-    let policy =
-        dsv41_segments_policy(std::env::var("CMF_DSV41_GLOBAL_SEGMENTS").ok().as_deref());
     let mut segments = match policy {
         Dsv41Segments::Force8 => DSV4_GLOBAL_MOE_SEGMENTS,
         // mxfp4 has no eager family: its S16 kernels are built here.
