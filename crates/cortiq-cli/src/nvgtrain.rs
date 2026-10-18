@@ -353,6 +353,8 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
             let gmul = if gn > o.clip { (o.clip / gn) as f32 } else { 1.0 };
             nt::adam(c, &snet, lr as f32, done as u32, 0.9, 0.999, 1e-8, gmul).ok_or_else(|| anyhow::anyhow!("adam failed"))?;
             step_secs += tstep.elapsed().as_secs_f64();
+            // CMF_NVG_PROF: resolve this step's timestamps (outside the timer)
+            nt::prof::step_end();
             let mut sign_note = String::new();
             if let (Some(s), Some(cf)) = (&o.signs, &cfg) {
                 let rate = st.flips as f64 / live.max(1) as f64;
@@ -463,6 +465,7 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
         step_secs / (done - done0).max(1) as f64,
         train_secs
     );
+    nt::prof::report();
     nt::restore(c, &snet, &best.1);
     let mut sign_prov = serde_json::Value::Null;
     if let Some(s) = &o.signs {

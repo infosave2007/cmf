@@ -230,6 +230,13 @@ pub enum Op<'a> {
 
 /// Record every op into one compute pass and submit.
 pub fn run(c: &Ctx, ops: &[Op]) {
+    run_tagged(c, ops, usize::MAX, "");
+}
+
+/// [`run`], with the ops from index `from` on attributed to `tag` by the
+/// profiler (`train_prof`); identical recording.
+pub fn run_tagged(c: &Ctx, ops: &[Op], from: usize, tag: &'static str) {
+    let prof = super::train_prof::on();
     let mut keep = Vec::new();
     let mut groups = Vec::new();
     for op in ops {
@@ -237,6 +244,13 @@ pub fn run(c: &Ctx, ops: &[Op]) {
             let mut words = d.uni.clone();
             while words.len() % 4 != 0 {
                 words.push(0);
+            }
+            if prof {
+                use super::train_prof::{Cnt, count};
+                count(Cnt::Buf, 1);
+                count(Cnt::Write, 1);
+                count(Cnt::WriteBytes, (words.len() * 4) as u64);
+                count(Cnt::BindGroup, 1);
             }
             let u = c.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("train_p"),
@@ -262,7 +276,8 @@ pub fn run(c: &Ctx, ops: &[Op]) {
     let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("train_mm") });
     {
         let mut ps = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
-        for (op, bg) in ops.iter().zip(&groups) {
+        let mut mk = super::train_prof::pass_begin(c, &mut ps);
+        for (i, (op, bg)) in ops.iter().zip(&groups).enumerate() {
             match op {
                 Op::D(d) => {
                     ps.set_pipeline(d.pipe);
@@ -270,6 +285,14 @@ pub fn run(c: &Ctx, ops: &[Op]) {
                     ps.dispatch_workgroups(d.grid.0, d.grid.1, d.grid.2);
                 }
                 Op::M(m) => m.record(&mut ps),
+            }
+            if prof {
+                let (name, mnk) = match op {
+                    Op::D(d) => (super::train_prof::pipe_name(d.pipe), [0; 3]),
+                    Op::M(m) => ("mm", m.mnk),
+                };
+                let name = if i >= from { super::train_prof::tagged(tag, name) } else { name };
+                super::train_prof::pass_mark(c, &mut ps, &mut mk, name, mnk);
             }
         }
     }
@@ -285,6 +308,7 @@ pub fn pad_rows(m: usize) -> usize {
 
 /// f16 buffer of `n` halves (rounded up to whole words).
 pub fn f16_buf(c: &Ctx, n: usize) -> wgpu::Buffer {
+    super::train_prof::count(super::train_prof::Cnt::Buf, 1);
     c.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("train_f16"),
         size: ((n.div_ceil(2) * 4).max(16)) as u64,
@@ -572,6 +596,7 @@ pub fn blr_backward(c: &Ctx, layer: &Blr, s: &BlrScratch, x: &wgpu::Buffer, dy: 
             Op::D(colsum_prod(c, x, &s.t1, &p.dg, ntok, n)?),
             Op::D(scale_acc(c, &s.t1, &p.g, dx, ntok, n, pi > 0)?),
         ];
+        let sign_from = ops.len();
         if let (Some(ctx), Some(sp)) = (sign, p.sign.as_ref()) {
             let sc = ctx.sc;
             let kpad = sc.kpad;
@@ -584,7 +609,7 @@ pub fn blr_backward(c: &Ctx, layer: &Blr, s: &BlrScratch, x: &wgpu::Buffer, dy: 
             ops.push(Op::M(mm(c, &sc.t_small, &sc.t_big, &sc.g, n, r, kpad, 1.0 / gscale)?));
             ops.extend(train_sign::grad_consumer_ops(c, ctx, &sp.v, &p.bits_v, 1)?);
         }
-        run(c, &ops);
+        run_tagged(c, &ops, sign_from, "sign");
     }
     Some(())
 }

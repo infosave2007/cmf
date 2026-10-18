@@ -764,7 +764,9 @@ pub fn read_reset_counters(c: &Ctx, sc: &SignScratch) -> Option<[u32; CNT_LEN]> 
 
 pub fn reset_counters(c: &Ctx, sc: &SignScratch) {
     let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("sign_cnt") });
+    let mut mk = super::train_prof::enc_begin(c, &mut enc);
     enc.clear_buffer(&sc.cnt, 0, None);
+    super::train_prof::enc_mark(c, &mut enc, &mut mk, "clear");
     super::submit(c, enc.finish());
 }
 

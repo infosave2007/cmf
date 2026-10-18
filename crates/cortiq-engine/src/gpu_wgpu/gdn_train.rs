@@ -714,15 +714,19 @@ pub fn gdn_backward(cfg: &GdnTrainCfg, tape: &GdnTape, dout: &[f32]) -> Option<(
     let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gdn_bwd") });
     {
         let mut ps = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+        let mut mk = super::train_prof::pass_begin(c, &mut ps);
         ps.set_bind_group(0, &bg, &[]);
         ps.set_pipeline(&pp.p["rec_bwd"]);
         ps.dispatch_workgroups((tape.nb * nv) as u32, 1, 1);
+        super::train_prof::pass_mark(c, &mut ps, &mut mk, "gdn.rec_bwd", [0; 3]);
         let (wx, wy) = wg_grid(n_bt * nk);
         ps.set_pipeline(&pp.p["qk_bwd"]);
         ps.dispatch_workgroups(wx, wy, 1);
+        super::train_prof::pass_mark(c, &mut ps, &mut mk, "gdn.qk_bwd", [0; 3]);
         let (gx, gy) = grid(n_bt * c_dim, 256);
         ps.set_pipeline(&pp.p["conv_bwd"]);
         ps.dispatch_workgroups(gx, gy, 1);
+        super::train_prof::pass_mark(c, &mut ps, &mut mk, "gdn.conv_bwd", [0; 3]);
     }
     submit(c, enc.finish());
     let draw = read(c, &tape.bufs[19], n_bt * c_dim)?;
@@ -798,17 +802,22 @@ pub fn gdn_forward_dev(tape: &GdnTape, nk: usize, nv: usize, c_dim: usize) -> Op
     let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gdn_fwd") });
     {
         let mut ps = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+        let mut mk = super::train_prof::pass_begin(c, &mut ps);
         ps.set_bind_group(0, &bg, &[]);
         let (gx, gy) = grid(n_bt * c_dim, 256);
         ps.set_pipeline(&pp.p["conv_fwd"]);
         ps.dispatch_workgroups(gx, gy, 1);
+        super::train_prof::pass_mark(c, &mut ps, &mut mk, "gdn.conv_fwd", [0; 3]);
         let (wx, wy) = wg_grid(n_bt * nk);
         ps.set_pipeline(&pp.p["qk_prep"]);
         ps.dispatch_workgroups(wx, wy, 1);
+        super::train_prof::pass_mark(c, &mut ps, &mut mk, "gdn.qk_prep", [0; 3]);
         ps.set_pipeline(&pp.p["gate_prep"]);
         ps.dispatch_workgroups((n_bt * nv).div_ceil(256) as u32, 1, 1);
+        super::train_prof::pass_mark(c, &mut ps, &mut mk, "gdn.gate_prep", [0; 3]);
         ps.set_pipeline(&pp.p["rec_fwd"]);
         ps.dispatch_workgroups((tape.nb * nv) as u32, 1, 1);
+        super::train_prof::pass_mark(c, &mut ps, &mut mk, "gdn.rec_fwd", [0; 3]);
     }
     submit(c, enc.finish());
     Some(())
@@ -823,21 +832,26 @@ pub fn gdn_backward_dev(tape: &GdnTape, nk: usize, nv: usize, c_dim: usize) -> O
     let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gdn_bwd") });
     {
         let mut ps = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+        let mut mk = super::train_prof::pass_begin(c, &mut ps);
         ps.set_bind_group(0, &bg, &[]);
         ps.set_pipeline(&pp.p["rec_bwd"]);
         ps.dispatch_workgroups((tape.nb * nv) as u32, 1, 1);
+        super::train_prof::pass_mark(c, &mut ps, &mut mk, "gdn.rec_bwd", [0; 3]);
         let (wx, wy) = wg_grid(n_bt * nk);
         ps.set_pipeline(&pp.p["qk_bwd"]);
         ps.dispatch_workgroups(wx, wy, 1);
+        super::train_prof::pass_mark(c, &mut ps, &mut mk, "gdn.qk_bwd", [0; 3]);
         let (gx, gy) = grid(n_bt * c_dim, 256);
         ps.set_pipeline(&pp.p["conv_bwd"]);
         ps.dispatch_workgroups(gx, gy, 1);
+        super::train_prof::pass_mark(c, &mut ps, &mut mk, "gdn.conv_bwd", [0; 3]);
     }
     submit(c, enc.finish());
     Some(())
 }
 
 fn bind(c: &Ctx, pp: &Pipes, tape: &GdnTape) -> wgpu::BindGroup {
+    super::train_prof::count(super::train_prof::Cnt::BindGroup, 1);
     let mut entries = vec![wgpu::BindGroupEntry { binding: 0, resource: tape.uni.as_entire_binding() }];
     for (k, b) in tape.bufs.iter().enumerate() {
         entries.push(wgpu::BindGroupEntry { binding: k as u32 + 1, resource: b.as_entire_binding() });
