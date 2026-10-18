@@ -5477,7 +5477,7 @@ pub(crate) fn encode_layer(
         dev.forget_layer(li);
     }
     let global = c.dsv4_global_moe.lock().unwrap().get(&uid).cloned()?;
-    if global.gu_q2 != g.gu_q2 {
+    if global.gu_q2 != g.gu_q2 || global.fp4 {
         return None;
     }
     let (p_gu, p_dn) = dsv4_global_moe_pipelines(c, g.gu_q2, global.segments)?;
