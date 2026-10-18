@@ -470,6 +470,21 @@ fn sumsq_cat(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg:
     if (t == 0u) { OUT[wg.y * p.m + wg.x] = ssq[0]; }
 }
 
+// OUT = A·COL[k] + B·SRC[k]: the two paths of a blr linear in one pass,
+// rounded as scale_acc twice (overwrite, then accumulate): fl(fl(a0c0) +
+// fl(a1c1)). Each product passes through an xor with a uniform zero (words),
+// so the driver cannot fuse either into the sum (left to itself it does,
+// and which one depends on the surrounding code).
+@compute @workgroup_size(256)
+fn scale_acc2(@builtin(global_invocation_id) g: vec3<u32>) {
+    let i = idx(g);
+    if (i >= p.m * p.k) { return; }
+    let c = i % p.k;
+    let v0 = bitcast<f32>(bitcast<u32>(A[i] * COL[c]) ^ p.words);
+    let v1 = bitcast<f32>(bitcast<u32>(B[i] * SRC[c]) ^ p.words);
+    OUT[i] = v0 + v1;
+}
+
 // OUT[i] = f32(DST[i]) for i < k (the embedding rows, uploaded as f16).
 @compute @workgroup_size(256)
 fn f16_to_f32(@builtin(global_invocation_id) g: vec3<u32>) {
@@ -489,7 +504,7 @@ fn scale_acc(@builtin(global_invocation_id) g: vec3<u32>) {
 "#;
 
 fn module(c: &Ctx) -> Option<&'static train_ops::Mod> {
-    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "cvt_cols", "cvt_t", "expand", "expand_n", "expand_t", "colsum_prod", "colsum_part", "colsum_fin", "colsum_fused", "colsum_fused_t", "scale_acc", "dense_fwd", "dense_bwd", "dense_fwd_t", "dense_bwd_t", "split_qg", "adam", "sumsq", "adam_cat", "sumsq_cat", "f16_to_f32"])
+    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "cvt_cols", "cvt_t", "expand", "expand_n", "expand_t", "colsum_prod", "colsum_part", "colsum_fin", "colsum_fused", "colsum_fused_t", "scale_acc", "dense_fwd", "dense_bwd", "dense_fwd_t", "dense_bwd_t", "split_qg", "adam", "sumsq", "adam_cat", "sumsq_cat", "f16_to_f32", "scale_acc2"])
 }
 
 /// One step of a trainer pass: an elementwise/reduction dispatch or a GEMM.
@@ -801,6 +816,19 @@ pub fn f16_to_f32<'a>(c: &'a Ctx, src: &'a wgpu::Buffer, out: &'a wgpu::Buffer, 
     Some(Disp { pipe: &md.p["f16_to_f32"], uni: vec![0, n as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], bufs: vec![(3, src), (9, out)], grid: elt_fold(n) })
 }
 
+/// `out = a0 ⊙ col0 + a1 ⊙ col1` per row: [`scale_acc`] of path 0 then path 1
+/// (accumulating) in one pass, the same rounding.
+#[allow(clippy::too_many_arguments)]
+pub fn scale_acc2<'a>(c: &'a Ctx, a0: &'a wgpu::Buffer, col0: &'a wgpu::Buffer, a1: &'a wgpu::Buffer, col1: &'a wgpu::Buffer, out: &'a wgpu::Buffer, m: usize, k: usize) -> Option<Disp<'a>> {
+    let md = module(c)?;
+    Some(Disp {
+        pipe: &md.p["scale_acc2"],
+        uni: vec![m as u32, k as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        bufs: vec![(1, col1), (2, col0), (7, a0), (8, a1), (9, out)],
+        grid: elt_fold(m * k),
+    })
+}
+
 /// Small dense linear `out[m][r] (+)= a[m][k]·w[r][k]ᵀ` in f32.
 #[allow(clippy::too_many_arguments)]
 pub fn dense_fwd<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, w: &'a wgpu::Buffer, out: &'a wgpu::Buffer, m: usize, k: usize, r: usize, acc: bool) -> Option<Disp<'a>> {
@@ -1097,6 +1125,7 @@ impl BlrScratch {
 /// Keeps a and c of every path in the scratch for [`blr_backward`].
 pub fn blr_forward(c: &Ctx, layer: &Blr, s: &BlrScratch, x: &wgpu::Buffer, y: &wgpu::Buffer, ntok: usize) -> Option<()> {
     let (m, n, r) = (layer.m, layer.n, layer.r);
+    let np = layer.paths.len();
     for (pi, p) in layer.paths.iter().enumerate() {
         let w = r / 32;
         let mut ops = match (mm_bits(c, &p.bits_v, w, true, &s.xh, &s.a[pi], ntok, r, n, 1.0), mm_bits(c, &p.bits_u, w, false, &s.xh, &s.cbuf[pi], ntok, m, r, 1.0)) {
@@ -1116,7 +1145,12 @@ pub fn blr_forward(c: &Ctx, layer: &Blr, s: &BlrScratch, x: &wgpu::Buffer, y: &w
                 Op::M(mm(c, &s.pl_u, &s.xh, &s.cbuf[pi], ntok, m, r, 1.0)?),
             ],
         };
-        ops.push(Op::D(scale_acc(c, &s.cbuf[pi], &p.h, y, ntok, m, pi > 0)?));
+        // y = Σ_p h_p ⊙ c_p: a two-path linear in one pass after its second path
+        if np != 2 {
+            ops.push(Op::D(scale_acc(c, &s.cbuf[pi], &p.h, y, ntok, m, pi > 0)?));
+        } else if pi == 1 {
+            ops.push(Op::D(scale_acc2(c, &s.cbuf[0], &layer.paths[0].h, &s.cbuf[1], &p.h, y, ntok, m)?));
+        }
         run(c, &ops);
     }
     Some(())
@@ -1237,6 +1271,26 @@ mod tests {
                 (((s >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0) as f32 * scale
             })
             .collect()
+    }
+
+    /// The one-pass two-path scale gives the bits of scale_acc twice.
+    #[test]
+    fn scale_acc2_matches_two_passes() {
+        let Some(c) = train_ops::dev() else { return };
+        let (m, k) = (64usize, 1024usize);
+        let a0 = rnd(m * k, 1, 1.0);
+        let a1 = rnd(m * k, 2, 1.0);
+        let c0 = rnd(k, 3, 1.0);
+        let c1 = rnd(k, 4, 1.0);
+        let (ba0, ba1, bc0, bc1) = (upload(c, &a0), upload(c, &a1), upload(c, &c0), upload(c, &c1));
+        let y = zeros(c, m * k);
+        run(c, &[Op::D(scale_acc(c, &ba0, &bc0, &y, m, k, false).unwrap()), Op::D(scale_acc(c, &ba1, &bc1, &y, m, k, true).unwrap())]);
+        let want = download(c, &y, m * k).unwrap();
+        let out = zeros(c, m * k);
+        run(c, &[Op::D(scale_acc2(c, &ba0, &bc0, &ba1, &bc1, &out, m, k).unwrap())]);
+        let got = download(c, &out, m * k).unwrap();
+        let diff = got.iter().zip(&want).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        assert_eq!(diff, 0, "{diff} of {} differ", m * k);
     }
 
     /// Two-path blr layer forward and backward against an f64 reference
