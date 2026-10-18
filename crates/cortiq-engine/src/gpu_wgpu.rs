@@ -60578,8 +60578,9 @@ enum Dsv41Segments {
     /// `=16`: the S16 family built eagerly at device init (S8 when the
     /// adapter could not build it).
     Eager16,
-    /// Unset (or anything else): S8 until the bank needs more slots than
-    /// eight segment buffers address, then S16 built on first need.
+    /// Unset (or anything else): S8 until S16 would hold more slots than S8
+    /// (`dsv41_auto_wants_s16`), then S16 built on first need, and S8 again
+    /// when the larger S16 bank does not fit the residency budget.
     Auto,
 }
 
@@ -60600,6 +60601,24 @@ fn dsv4_global_moe_per_segment(c: &Ctx, gu_len: usize, d_len: usize) -> usize {
         .max_storage_buffer_binding_size
         .min(c.device.limits().max_buffer_size);
     (range / gu_len.max(d_len).max(1) as u64) as usize
+}
+
+/// Auto's rule: S16 only when it holds strictly more slots than S8 for this
+/// request. Past S8's capacity is not enough: S16 rounds the bank down to
+/// whole 16-slot segments, so just above it (release geometry: 2793..2799
+/// slots wanted after the workspace) S16 would hold 2784 against S8's 2792.
+fn dsv41_auto_wants_s16(
+    requested: usize,
+    per: usize,
+    max_len: usize,
+    range: u64,
+    workspace: u64,
+) -> bool {
+    let capacity = |segments| {
+        dsv4_global_moe_capacity(requested, per, max_len, range, workspace, segments)
+            .map_or(0, |(capacity, _)| capacity)
+    };
+    capacity(DSV4_GLOBAL_MOE_SEGMENTS_S16) > capacity(DSV4_GLOBAL_MOE_SEGMENTS)
 }
 
 /// More slots than eight segment buffers of `per_segment` slots address.
@@ -60683,11 +60702,12 @@ pub fn dsv4_global_moe_create(
 
 /// Allocate the V4.1 global bank. Its segment family follows
 /// `CMF_DSV41_GLOBAL_SEGMENTS` (see [`Dsv41Segments`]): by default S8, and
-/// S16 when the request, after the workspace carve-out, exceeds what eight
-/// segment buffers address (a 96 GB card at the 75 % default: ~3900 release
-/// slots against S8's 2792 on a 2 GiB binding range). If the adapter or
-/// shader family cannot provide S16, this safely falls back to the S8 pool.
-/// The chosen family and capacity are logged once per process.
+/// S16 when it holds more of the request, after the workspace carve-out,
+/// than S8 does (a 96 GB card at the 75 % default: ~3900 release slots
+/// against S8's 2792 on a 2 GiB binding range). If the adapter or shader
+/// family cannot provide S16, or the S16 bank fails the residency budget,
+/// this safely falls back to the S8 pool. The chosen family and capacity
+/// are logged once per process.
 pub fn dsv4_global_moe_create_for_dsv41(
     model: &Arc<CmfModel>,
     requested: usize,
@@ -60711,7 +60731,7 @@ pub fn dsv4_global_moe_create_for_dsv41(
     let per_segment = dsv4_global_moe_per_segment(c, gu_len, d_len);
     let policy =
         dsv41_segments_policy(std::env::var("CMF_DSV41_GLOBAL_SEGMENTS").ok().as_deref());
-    let segments = match policy {
+    let mut segments = match policy {
         Dsv41Segments::Force8 => DSV4_GLOBAL_MOE_SEGMENTS,
         Dsv41Segments::Eager16
             if c.dsv4_global_gu_s16.is_some()
@@ -60722,15 +60742,30 @@ pub fn dsv4_global_moe_create_for_dsv41(
         }
         Dsv41Segments::Eager16 => DSV4_GLOBAL_MOE_SEGMENTS,
         Dsv41Segments::Auto => {
-            // The slots the allocator will try to place: the request less
-            // the workspace it carves out below.
-            let wanted =
-                requested.saturating_sub((dsv4_global_moe_workspace(c) / per as u64) as usize);
-            dsv4_global_moe_pick_segments(c, wanted, per_segment, gu_q2)
+            let workspace = dsv4_global_moe_workspace(c);
+            let range = c
+                .device
+                .limits()
+                .max_storage_buffer_binding_size
+                .min(c.device.limits().max_buffer_size);
+            if dsv41_auto_wants_s16(requested, per, gu_len.max(d_len), range, workspace) {
+                // The slots the allocator will try to place: the request
+                // less the workspace it carves out.
+                let wanted = requested.saturating_sub((workspace / per as u64) as usize);
+                dsv4_global_moe_pick_segments(c, wanted, per_segment, gu_q2)
+            } else {
+                DSV4_GLOBAL_MOE_SEGMENTS
+            }
         }
     };
-    let made =
+    let mut made =
         dsv4_global_moe_create_with_segments(model, requested, inter, hidden, gu_q2, segments);
+    if made.is_none() && policy == Dsv41Segments::Auto && segments == DSV4_GLOBAL_MOE_SEGMENTS_S16 {
+        // The larger S16 bank can fail the residency budget where S8 fits.
+        segments = DSV4_GLOBAL_MOE_SEGMENTS;
+        made =
+            dsv4_global_moe_create_with_segments(model, requested, inter, hidden, gu_q2, segments);
+    }
     static LOGGED: std::sync::Once = std::sync::Once::new();
     LOGGED.call_once(|| match made {
         Some((capacity, segment_slots)) => tracing::info!(
@@ -60902,8 +60937,8 @@ fn dsv4_global_moe_create_inner(
 #[cfg(test)]
 mod global_moe_capacity_tests {
     use super::{
-        Dsv41Segments, dsv4_global_moe_capacity, dsv4_global_moe_needs_s16, dsv41_segments_policy,
-        host_tier_cache_admissible,
+        Dsv41Segments, dsv4_global_moe_capacity, dsv4_global_moe_needs_s16, dsv41_auto_wants_s16,
+        dsv41_segments_policy, host_tier_cache_admissible,
     };
 
     const RANGE: u64 = (1u64 << 31) - 1;
@@ -60938,7 +60973,8 @@ mod global_moe_capacity_tests {
 
     /// The release geometry on a 2 GiB binding range: 349 slots a segment,
     /// so S8 addresses 2792 slots and one more needs S16, which then holds
-    /// the whole request instead of S8's cap.
+    /// the whole request instead of S8's cap. Auto takes S16 only from 2800
+    /// wanted slots on: below that S16's 16-slot rounding holds fewer.
     #[test]
     fn auto_s16_starts_past_the_s8_capacity() {
         let per_segment = (RANGE / MAX_LEN as u64) as usize;
@@ -60955,6 +60991,20 @@ mod global_moe_capacity_tests {
             dsv4_global_moe_capacity(requested, PER, MAX_LEN, RANGE, 4 * GIB, 16),
             Some((3888, 243))
         );
+        let workspace_slots = (4 * GIB / PER as u64) as usize;
+        let auto = |wanted: usize| {
+            dsv41_auto_wants_s16(wanted + workspace_slots, PER, MAX_LEN, RANGE, 4 * GIB)
+        };
+        assert!(!auto(2792));
+        // Past S8's capacity, but S16 would hold 2784 against S8's 2792.
+        assert!(!auto(2793));
+        assert!(!auto(2799));
+        assert_eq!(
+            dsv4_global_moe_capacity(2799 + workspace_slots, PER, MAX_LEN, RANGE, 4 * GIB, 16),
+            Some((2784, 174))
+        );
+        assert!(auto(2800));
+        assert!(auto(3900));
     }
 
     #[test]
