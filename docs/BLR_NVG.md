@@ -252,11 +252,15 @@ Whole 0.8B at 1.0 bpw (sequential calibration, `ppl --windows 16 --window-len 51
 |---|---|---|---|
 | host f64 (`--blr-device cpu`) | 656.37 | 682.16 | 7143 s / 7114 s |
 | device, flip tolerance 1e-6 | 686.52 | 710.88 | 1307 s (shared card) |
-| device, flip tolerance 1e-7 (default) | 672.52 | — | 758 s |
+| device, flip tolerance 1e-7 (default) | 672.52 | 715.80 | 758 s |
 
 The host reference itself moves 3.9 % for a 0.3 % change of ρ: at this compression the
 end-to-end perplexity is sensitive to any perturbation of the sequential chain, and
-per-tensor errors of two host runs agree within 1 % for only 53 of 150 tensors.
+per-tensor errors of two host runs agree within 1 % for only 53 of 150 tensors. Over the
+four matched device runs the device sits ~4 % above the host on average (672.5–715.8
+against 656.4–682.2); whether that offset comes from the f32 encoder or from the chain's
+sensitivity alone is not settled (the run with device calibration and the host encoder
+was stopped before the end).
 
 Qwen3.8-27B at 0.55 bpw, one layer encoded on the device from its cached Grams (card
 mostly free):
