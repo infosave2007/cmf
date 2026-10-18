@@ -1475,14 +1475,16 @@ mod tests {
     fn sign_step_cost() {
         let env = |n: &str, d: usize| std::env::var(n).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
         let (nb, t, reps) = (env("CMF_TRAIN_TEST_NB", 8), env("CMF_TRAIN_TEST_T", 512), env("CMF_TRAIN_TEST_REPS", 5));
-        let init = SignInit { opt: ts::SignOpt::Fact, tau: 0.25, seed: 42, keep_bits0: true, defer: false };
+        let opt = ts::SignOpt::parse(&std::env::var("CMF_TRAIN_TEST_OPT").unwrap_or_else(|_| "fact-mom".into())).expect("CMF_TRAIN_TEST_OPT");
+        let init = SignInit { opt, tau: 0.25, seed: 42, keep_bits0: true, defer: false };
         let Some((c, _m, net, w, ids, tid, tp, k)) = blr_fixture_sized(Some(&init), nb, t, 64) else { return };
         let live = net.sign_live();
         eprintln!(
-            "{} signs, {} matrices; latents {:.3} GB, sign scratch {:.3} GB",
+            "{} signs, {} matrices; {} state {:.3} GB, sign scratch {:.3} GB",
             live,
             net.n_sign_mats,
-            live as f64 * 2.0 / 1e9,
+            opt.name(),
+            live as f64 * opt.bytes_per_sign() as f64 / 1e9,
             w.sg.as_ref().map(|s| s.bytes() as f64 / 1e9).unwrap_or(0.0)
         );
         let time = |sign: Option<&SignStepCfg>| -> f64 {
@@ -1494,10 +1496,12 @@ mod tests {
             dt
         };
         let _ = time(None);
-        let _ = time(Some(&sign_cfg(1e-3, false)));
+        let mut cfg0 = sign_cfg(1e-3, false);
+        cfg0.opt = opt;
+        let _ = time(Some(&cfg0));
         let (mut a, mut b) = (Vec::new(), Vec::new());
         for r in 0..reps {
-            let mut cfg = sign_cfg(1e-3, false);
+            let mut cfg = cfg0;
             cfg.step = 2 + r as u32;
             if r % 2 == 0 {
                 a.push(time(None));

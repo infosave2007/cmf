@@ -970,13 +970,15 @@ enum Commands {
         /// the reverse sweep; the best held-out snapshot's bits are exported)
         #[arg(long)]
         train_signs: bool,
-        /// Sign optimizer: fact (2 B/sign) | fact-mom (4 B) | ref (12 B, small models)
-        #[arg(long, default_value = "fact")]
+        /// Sign optimizer: fact-mom (4 B/sign) | fact (2 B, no momentum:
+        /// diverged on the 0.8B at every rate tried) | ref (12 B, small models)
+        #[arg(long, default_value = "fact-mom")]
         sign_opt: String,
         /// RMS of the initial |latent| (magnitudes τ·|z|, sign from the bit)
         #[arg(long, default_value = "0.25")]
         sign_tau: f64,
-        /// Peak sign learning rate, or auto = 0.15·τ/√steps
+        /// Peak sign learning rate, or auto = min(0.15·τ/√steps, 4e-3·τ)
+        /// (the second term caps the per-step move at the stable rate)
         #[arg(long, default_value = "auto")]
         sign_lr: String,
         /// Sign steps at η = 0 while the second-moment statistics settle
