@@ -361,6 +361,10 @@ mod tests {
     #[test]
     fn head_kl_matches_host() {
         let Some(c) = train_ops::dev() else { return };
+        if !train_mm::matrix_units() {
+            eprintln!("no cooperative matrices on this device — skipping");
+            return;
+        }
         let (v, hs, ntok, k) = (1024usize, 256usize, 45usize, 16usize);
         let w = rnd(v * hs, 1, 0.1);
         let x = rnd(ntok * hs, 2, 1.0);
