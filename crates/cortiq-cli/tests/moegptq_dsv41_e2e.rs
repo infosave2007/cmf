@@ -128,6 +128,21 @@ fn quantize_moe_on_the_v41_fixture() {
     let gate = m1.tensor("model.layers.0.mlp.experts.0.gate_proj.weight").unwrap();
     assert_eq!(gate.dtype, cortiq_core::types::TensorDtype::Q2TiledP);
 
+    // capture only, into a second directory: the same rows as the first
+    // run saved, and no output file
+    let cap2 = root.join("capture2");
+    let none = root.join("not-written.cmf");
+    let (ok, err) = cortiq(&args(&base(&none, "100")), &[host, ("CMF_MOE_CAPTURE_DIR", cap2.to_str().unwrap()), ("CMF_MOE_CAPTURE_ONLY", "1")]);
+    assert!(ok, "capture-only run failed:\n{err}");
+    assert!(err.contains("no expert was encoded") && !err.contains("layer 0: routed rows"), "{err}");
+    assert!(!none.exists(), "capture only writes no model file");
+    for li in 0..N_LAYERS {
+        for ext in ["x", "picks", "w"] {
+            let f = format!("L{li}.{ext}");
+            assert_eq!(std::fs::read(cap.join(&f)).unwrap(), std::fs::read(cap2.join(&f)).unwrap(), "{f}");
+        }
+    }
+
     // 2: the same tokens again: loaded from the capture directory, no
     // forward, the same bytes
     let (ok, err) = cortiq(&args(&base(&out2, "100")), &[host, capdir]);

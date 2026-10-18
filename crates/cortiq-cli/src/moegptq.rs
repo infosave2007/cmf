@@ -332,8 +332,16 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
         .unwrap_or((0, nl));
     let (range_lo, range_hi) = (range_lo.min(nl), range_hi.min(nl));
     anyhow::ensure!(range_lo < range_hi, "CMF_MOE_RANGE {range_lo}..{range_hi} is empty");
+    // CMF_MOE_CAPTURE_ONLY=1: one calibration forward over the layers into
+    // CMF_MOE_CAPTURE_DIR, then stop (no expert is encoded, no file written)
+    let capture_only = std::env::var("CMF_MOE_CAPTURE_ONLY").is_ok_and(|v| v != "0");
+    if capture_only {
+        anyhow::ensure!(std::env::var_os("CMF_MOE_CAPTURE_DIR").is_some(), "CMF_MOE_CAPTURE_ONLY=1 needs CMF_MOE_CAPTURE_DIR");
+        anyhow::ensure!(!o.in_place && patch.is_none() && diag.is_none(), "CMF_MOE_CAPTURE_ONLY=1 writes nothing: run it without --in-place, --patch-shared and CMF_MOE_DIAG");
+        eprintln!("CMF_MOE_CAPTURE_ONLY=1: layers {range_lo}..{range_hi} are captured in one forward and saved; nothing is encoded or written");
+    }
     anyhow::ensure!(
-        diag.is_some() || o.in_place || patch.is_some() || (range_lo, range_hi) == (0, nl),
+        capture_only || diag.is_some() || o.in_place || patch.is_some() || (range_lo, range_hi) == (0, nl),
         "CMF_MOE_RANGE {range_lo}..{range_hi} with --output would leave the other layers' experts out of the file \
          (use it with --in-place, --patch-shared or CMF_MOE_DIAG)"
     );
@@ -382,7 +390,7 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     };
 
     // output
-    let mut sink = if diag.is_some() {
+    let mut sink = if diag.is_some() || capture_only {
         Sink::Diag
     } else if let Some(path) = patch {
         Sink::Patch { path: path.to_string(), target: CmfModel::open_sharded(path)?, patches: Vec::new() }
@@ -417,7 +425,7 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     };
     let mut stats = (0usize, 0usize);
     let mut prefetch: Option<std::thread::JoinHandle<anyhow::Result<()>>> = None;
-    let passes = plan_passes(range_lo, range_hi, o.layers_per_pass, o.in_place);
+    let passes = plan_passes(range_lo, range_hi, o.layers_per_pass, o.in_place || capture_only);
     // CMF_MOE_CAPTURE_DIR: captured rows are saved per layer and reused by
     // a later run on the same calibration tokens (another codec, a resume)
     let has_w = family == Family::Dsv41;
@@ -521,6 +529,9 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
             }
             rows
         };
+        if capture_only {
+            continue;
+        }
         for li in lo..hi {
             let tl = Instant::now();
             let lr = &rows[li - lo];
@@ -596,6 +607,10 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
                 );
             }
         }
+    }
+    if capture_only {
+        eprintln!("capture of layers {range_lo}..{range_hi} saved in {:.0}s; no expert was encoded", t0.elapsed().as_secs_f64());
+        return Ok(());
     }
     if diag.is_some() {
         eprintln!("DIAG total, layers {range_lo}..{range_hi}, relative expert output error on held-out rows (GPTQ variants: prior n0, +w = route-weighted down Hessian):");
