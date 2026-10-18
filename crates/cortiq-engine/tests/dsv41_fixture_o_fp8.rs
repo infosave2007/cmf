@@ -22,7 +22,12 @@ use std::sync::Arc;
 #[test]
 fn o_fp8_follows_reference_act_quant() {
     // SAFETY: the only test in this binary, before any V4.1 code runs.
-    unsafe { std::env::set_var("CMF_DSV41_O_FP8", "1") };
+    // CMF_GPU=0: a workspace build carries the gpu feature; keep the MoE on
+    // the host as well so the comparison is the strict CPU path.
+    unsafe {
+        std::env::set_var("CMF_DSV41_O_FP8", "1");
+        std::env::set_var("CMF_GPU", "0");
+    }
     let fx = Fixture::build(RELEASE_COMPRESSED_VOCAB);
     let path = fx.write("ofp8");
     let model = Arc::new(CmfModel::open(&path).expect("open fixture"));
