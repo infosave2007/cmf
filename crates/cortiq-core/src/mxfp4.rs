@@ -417,6 +417,39 @@ mod tests {
         assert_eq!(encode_group(&g).1, 252);
     }
 
+    /// A float detour cannot lose an MXFP4 value: OCP re-quantization of any
+    /// decoded group (every finite scale byte, every largest-magnitude code,
+    /// zeros) dequantizes to the same f32s — the shared exponent may move
+    /// down by up to 3 (codes ×2/×4/×8 stay on the grid), never the values.
+    /// This is why non-DeepSeek MXFP4 sources (Kimi-K3, MiMo-V2), which reach
+    /// the encoder through their f32 decoders, keep their weights exactly.
+    #[test]
+    fn ocp_requantization_of_any_decoded_group_is_value_exact() {
+        let mut checked = 0usize;
+        for k in 0..=252u8 {
+            for top in 0..8u8 {
+                let codes: Vec<u8> = (0..16)
+                    .map(|j| {
+                        let a = ((j * 5 + k as usize) % (top as usize + 1)) as u8;
+                        let b = if j == 3 { top | 8 } else { (j as u8 * 3) % (top + 1) };
+                        a | (b << 4)
+                    })
+                    .collect();
+                let p = repack(&codes, &[k], 1, 32).unwrap();
+                let mut d = [0f32; 32];
+                dequant(&p, 1, 32, &mut d);
+                let q = quantize(&d, 1, 32);
+                let mut d2 = [0f32; 32];
+                dequant(&q, 1, 32, &mut d2);
+                for j in 0..32 {
+                    assert_eq!(d[j], d2[j], "scale {k} top {top} elem {j}");
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 253 * 8);
+    }
+
     #[test]
     fn quantize_dequant_error_is_bounded_and_grid_values_round_trip() {
         let (rows, cols) = (8usize, 96usize);
