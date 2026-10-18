@@ -150,7 +150,8 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
     let budgets = split_calib_budget(&srcs, want);
     let mut windows: Vec<Vec<u32>> = Vec::new();
     for (src, &n) in srcs.iter().zip(&budgets) {
-        let ids = calib_source_tokens(&src.path, n, &|t| tok.encode_plain(t))?;
+        // added tokens recognized, so chat-format text trains the real <|im_start|>… ids
+        let ids = calib_source_tokens(&src.path, n, &|t| tok.encode(t))?;
         windows.extend(ids.chunks(o.window).filter(|w| w.len() == o.window).map(<[u32]>::to_vec));
     }
     anyhow::ensure!(windows.len() > o.eval_windows + o.batch, "too few {}-token windows ({})", o.window, windows.len());
