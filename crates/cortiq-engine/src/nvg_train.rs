@@ -332,15 +332,19 @@ impl Net {
                 up: lin("mlp.up_proj.weight", "mlp.up")?,
                 down: lin("mlp.down_proj.weight", "mlp.down")?,
             });
+            // Every upload is a queue write staged until the next submission;
+            // a 27B teacher's ~49 GB of f16 planes would otherwise sit in
+            // staging next to the planes themselves and exhaust the card.
+            c.queue.submit(std::iter::empty());
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
         }
         let final_norm = norm("model.norm.weight")?;
         let (emb, eshape) = deq(model, "model.embed_tokens.weight")?;
         let head_w = if model.tensor("lm_head.weight").is_some() { deq(model, "lm_head.weight")?.0 } else { emb.clone() };
         let (v, hs) = (eshape[0], eshape[1]);
-        // The teacher only needs the head's forward plane; a 1-element stub
-        // stands in for the transpose it never reads.
-        let wt = if bwd { f16_plane(c, &transpose(&head_w, v, hs)) } else { tm::f16_buf(c, 2) };
-        let head = Head { v, hs, w: f16_plane(c, &head_w), wt };
+        // The teacher only needs the head's forward planes (no transposes);
+        // vocabulary slices keep each plane within one storage binding.
+        let head = Head::new(c, &head_w, v, hs, bwd, None);
         let embed = emb.iter().map(|&f| f32_to_f16(f)).collect();
         Ok(Net { geom, layers, final_norm, head, embed })
     }

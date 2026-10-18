@@ -73,6 +73,15 @@ fn kl_rows(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index
     }
 }
 
+// LG[i] += TP[i] for i < ntok (= the element count): the input gradient of a
+// later vocabulary slice added to the first one's.
+@compute @workgroup_size(256)
+fn acc_add(@builtin(global_invocation_id) g: vec3<u32>) {
+    let i = g.x + g.y * 65535u * 256u;
+    if (i >= p.ntok) { return; }
+    LG[i] = LG[i] + TP[i];
+}
+
 // Teacher top-k per row: each thread keeps its best 8 of a strided scan,
 // the 2048 candidates are bitonic-sorted in shared memory, the first k
 // are written with probabilities renormalized over them.
@@ -139,7 +148,7 @@ fn topk_rows(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_ind
 "#;
 
 fn module(c: &Ctx) -> Option<&'static train_ops::Mod> {
-    train_ops::module(c, "train_head", SRC, &["kl_rows", "topk_rows"])
+    train_ops::module(c, "train_head", SRC, &["kl_rows", "topk_rows", "acc_add"])
 }
 
 /// Teacher top-k of `ntok` normed hidden rows: (ids, renormalized probs),
@@ -160,14 +169,19 @@ pub fn topk(c: &Ctx, head: &Head, s: &HeadScratch, x: &wgpu::Buffer, ntok: usize
         super::submit(c, enc.finish());
         let ops = vec![
             Op::D(train_mm::cvt(c, &xin, None, &s.act, rows, hs, 1.0)?),
-            Op::M(train_mm::mm(c, &head.w, &s.act, &s.logits, rows, v, hs, 1.0)?),
+        ];
+        let mut ops = ops;
+        for (si, &(off, vs)) in head.cuts.iter().enumerate() {
+            ops.push(Op::M(train_mm::mm_cols(c, &head.w[si], &s.act, &s.logits, rows, vs, hs, v, off, 1.0)?));
+        }
+        ops.extend([
             Op::D(Disp {
                 pipe: &m.p["topk_rows"],
                 uni: vec![rows as u32, v as u32, k as u32, 0, 0, 0, 0, 0],
                 bufs: vec![(1, &s.logits), (2, &tidc), (3, &tpc)],
                 grid: train_ops::wg_fold(rows),
             }),
-        ];
+        ]);
         train_mm::run(c, &ops);
         let t_raw = train_ops::download(c, &tidc, rows * k)?;
         ids.extend(t_raw.iter().map(|f| f.to_bits()));
@@ -190,12 +204,55 @@ pub fn kl_rows<'a>(c: &'a Ctx, logits: &'a wgpu::Buffer, tid: &'a wgpu::Buffer, 
     })
 }
 
-/// The frozen head: `w` as an f16 plane `[v][hs]` and its transpose `[hs][v]`.
+/// The frozen head in vocabulary slices (`cuts`: column offset, width), each
+/// an f16 plane `w[s]` `[width][hs]` and its transpose `wt[s]` `[hs][width]`
+/// (empty for a forward-only teacher): a 248k × 5120 head is 2.5 GB, past
+/// the 2 GiB a storage binding may span.
 pub struct Head {
     pub v: usize,
     pub hs: usize,
-    pub w: wgpu::Buffer,
-    pub wt: wgpu::Buffer,
+    pub cuts: Vec<(usize, usize)>,
+    pub w: Vec<wgpu::Buffer>,
+    pub wt: Vec<wgpu::Buffer>,
+}
+
+impl Head {
+    /// Slices of at most `max_rows` vocabulary rows (multiples of 128; None:
+    /// the largest that fits a 2 GiB binding) from the f32 head `w` `[v][hs]`.
+    pub fn new(c: &Ctx, w: &[f32], v: usize, hs: usize, with_t: bool, max_rows: Option<usize>) -> Self {
+        let cap = max_rows.unwrap_or(((1usize << 31) - 4) / (2 * hs)) / 128 * 128;
+        let n = v.div_ceil(cap.max(128));
+        let per = v.div_ceil(n).div_ceil(128) * 128;
+        let mut cuts = Vec::new();
+        let mut off = 0;
+        while off < v {
+            let width = per.min(v - off);
+            cuts.push((off, width));
+            off += width;
+        }
+        let plane = |vals: &[f32]| {
+            let mut h: Vec<u16> = vals.iter().map(|&f| cortiq_core::quant::f32_to_f16(f)).collect();
+            if h.len() % 2 == 1 {
+                h.push(0);
+            }
+            let b = train_mm::f16_buf(c, h.len());
+            c.queue.write_buffer(&b, 0, bytemuck::cast_slice(&h));
+            b
+        };
+        let mut wv = Vec::new();
+        let mut wtv = Vec::new();
+        for &(off, width) in &cuts {
+            let sl = &w[off * hs..(off + width) * hs];
+            wv.push(plane(sl));
+            if with_t {
+                let t: Vec<f32> = (0..hs * width).map(|i| sl[(i % width) * hs + i / width]).collect();
+                wtv.push(plane(&t));
+            }
+            c.queue.submit(std::iter::empty());
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        }
+        Head { v, hs, cuts, w: wv, wt: wtv }
+    }
 }
 
 /// Scratch for `chunk` tokens at a time.
@@ -204,6 +261,7 @@ pub struct HeadScratch {
     act: wgpu::Buffer,
     logits: wgpu::Buffer,
     dact: wgpu::Buffer,
+    dpart: wgpu::Buffer,
 }
 
 impl HeadScratch {
@@ -213,6 +271,7 @@ impl HeadScratch {
             act: train_mm::f16_buf(c, train_mm::pad_rows(chunk) * hs.max(v)),
             logits: train_ops::zeros(c, train_mm::pad_rows(chunk) * v),
             dact: train_ops::zeros(c, train_mm::pad_rows(chunk) * hs),
+            dpart: train_ops::zeros(c, train_mm::pad_rows(chunk) * hs),
         }
     }
 }
@@ -252,13 +311,26 @@ pub fn head_kl(
         enc.copy_buffer_to_buffer(tid, (r0 * k * 4) as u64, &tidc, 0, (rows * k * 4) as u64);
         enc.copy_buffer_to_buffer(tp, (r0 * k * 4) as u64, &tpc, 0, (rows * k * 4) as u64);
         super::submit(c, enc.finish());
-        let ops = vec![
-            Op::D(train_mm::cvt(c, &xin, None, &s.act, rows, hs, 1.0)?),
-            Op::M(train_mm::mm(c, &head.w, &s.act, &s.logits, rows, v, hs, 1.0)?),
-            Op::D(kl_rows(c, &s.logits, &tidc, &tpc, &lossc, rows, v, k, gscale / total as f32)?),
-            Op::D(train_mm::cvt(c, &s.logits, None, &s.act, rows, v, 1.0)?),
-            Op::M(train_mm::mm(c, &head.wt, &s.act, &s.dact, rows, hs, v, 1.0 / gscale)?),
-        ];
+        let m = module(c)?;
+        let mut ops = vec![Op::D(train_mm::cvt(c, &xin, None, &s.act, rows, hs, 1.0)?)];
+        for (si, &(off, vs)) in head.cuts.iter().enumerate() {
+            ops.push(Op::M(train_mm::mm_cols(c, &head.w[si], &s.act, &s.logits, rows, vs, hs, v, off, 1.0)?));
+        }
+        ops.push(Op::D(kl_rows(c, &s.logits, &tidc, &tpc, &lossc, rows, v, k, gscale / total as f32)?));
+        // dh = Σ_slices dlogits[:, slice] · W[slice]
+        for (si, &(off, vs)) in head.cuts.iter().enumerate() {
+            ops.push(Op::D(train_mm::cvt_cols(c, &s.logits, &s.act, rows, vs, v, off, 1.0)?));
+            let dst = if si == 0 { &s.dact } else { &s.dpart };
+            ops.push(Op::M(train_mm::mm(c, &head.wt[si], &s.act, dst, rows, hs, vs, 1.0 / gscale)?));
+            if si > 0 {
+                ops.push(Op::D(Disp {
+                    pipe: &m.p["acc_add"],
+                    uni: vec![(rows * hs) as u32, 0, 0, 0, 0, 0, 0, 0],
+                    bufs: vec![(1, &s.dact), (3, &s.dpart)],
+                    grid: train_ops::elt_fold(rows * hs),
+                }));
+            }
+        }
         train_mm::run(c, &ops);
         let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("head_out") });
         enc.copy_buffer_to_buffer(&s.dact, 0, dx, (r0 * hs * 4) as u64, (rows * hs * 4) as u64);
@@ -314,7 +386,10 @@ mod tests {
             c.queue.write_buffer(&b, 0, bytemuck::cast_slice(&padded));
             b
         };
-        let head = Head { v, hs, w: buf16(&to16(&w)), wt: buf16(&to16(&wt)) };
+        let _ = (&wt, &buf16, &to16);
+        // three vocabulary slices (the multi-slice path a 248k head takes)
+        let head = Head::new(c, &w, v, hs, true, Some(384));
+        assert_eq!(head.cuts.len(), 3);
         let sc = HeadScratch::new(c, 32, v, hs);
         let ub = |vals: &[u32]| {
             let b = zeros(c, vals.len());

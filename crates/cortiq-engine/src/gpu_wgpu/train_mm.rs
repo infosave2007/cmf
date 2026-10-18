@@ -59,6 +59,18 @@ fn cvt(@builtin(global_invocation_id) g: vec3<u32>) {
     DST[i] = f16(v);
 }
 
+// DST[mpad][k] = f16(SRC[m][words] columns r..r+k · scale), zero rows past m
+// (a column block of a wider f32 matrix, e.g. one vocabulary slice).
+@compute @workgroup_size(256)
+fn cvt_cols(@builtin(global_invocation_id) g: vec3<u32>) {
+    let i = idx(g);
+    if (i >= p.mpad * p.k) { return; }
+    let row = i / p.k;
+    var v = 0.0;
+    if (row < p.m) { v = SRC[row * p.words + p.r + i % p.k] * p.scale; }
+    DST[i] = f16(v);
+}
+
 // Sign bitmap [rows][words] (bit j of word w = rank 32w+j, 1 = +1) →
 // plane PL[rows][r] and its transpose PLT[r][rows].
 @compute @workgroup_size(256)
@@ -181,7 +193,7 @@ fn scale_acc(@builtin(global_invocation_id) g: vec3<u32>) {
 "#;
 
 fn module(c: &Ctx) -> Option<&'static train_ops::Mod> {
-    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "expand", "colsum_prod", "scale_acc", "dense_fwd", "dense_bwd", "split_qg", "adam", "sumsq"])
+    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "cvt_cols", "expand", "colsum_prod", "scale_acc", "dense_fwd", "dense_bwd", "split_qg", "adam", "sumsq"])
 }
 
 /// One step of a trainer pass: an elementwise/reduction dispatch or a GEMM.
@@ -277,6 +289,16 @@ pub fn cvt<'a>(c: &'a Ctx, src: &'a wgpu::Buffer, col: Option<&'a wgpu::Buffer>,
         Some(cb) => Disp { pipe: &md.p["cvt_col"], uni, bufs: vec![(1, src), (2, cb), (3, dst)], grid: elt_fold(mpad * k) },
         None => Disp { pipe: &md.p["cvt"], uni, bufs: vec![(1, src), (3, dst)], grid: elt_fold(mpad * k) },
     })
+}
+
+/// `dst` (f16 `[pad_rows(m)][k]`) = columns `col0..col0+k` of `src`
+/// (f32 `[m][stride]`) · `scale`.
+#[allow(clippy::too_many_arguments)]
+pub fn cvt_cols<'a>(c: &'a Ctx, src: &'a wgpu::Buffer, dst: &'a wgpu::Buffer, m: usize, k: usize, stride: usize, col0: usize, scale: f32) -> Option<Disp<'a>> {
+    let md = module(c)?;
+    let mpad = pad_rows(m);
+    let uni = vec![m as u32, k as u32, mpad as u32, 0, col0 as u32, stride as u32, 0, 0, scale.to_bits(), 0, 0, 0];
+    Some(Disp { pipe: &md.p["cvt_cols"], uni, bufs: vec![(1, src), (3, dst)], grid: elt_fold(mpad * k) })
 }
 
 /// Expand a sign bitmap `[rows][ceil(r/32)]` into `pl` `[rows][r]` and `plt` `[r][rows]`.
@@ -380,6 +402,14 @@ pub fn sumsq(c: &Ctx, a: &wgpu::Buffer, n: usize) -> Option<f64> {
 pub fn mm(c: &Ctx, plane: &wgpu::Buffer, act: &wgpu::Buffer, out: &wgpu::Buffer, m: usize, n: usize, k: usize, oscale: f32) -> Option<zi::MmCall> {
     let g = zi::default_cfg(Epi::F32);
     let a = zi::MmArgs { m: m as u32, n: n as u32, k: k as u32, ldo: n as u32, ocol: 0, arow: 0, oscale, conv: [0; 3] };
+    zi::mm_call(c, g, &a, plane, act, out)
+}
+
+/// [`mm`] into columns `ocol..ocol+n` of an output with row stride `ldo`.
+#[allow(clippy::too_many_arguments)]
+pub fn mm_cols(c: &Ctx, plane: &wgpu::Buffer, act: &wgpu::Buffer, out: &wgpu::Buffer, m: usize, n: usize, k: usize, ldo: usize, ocol: usize, oscale: f32) -> Option<zi::MmCall> {
+    let g = zi::default_cfg(Epi::F32);
+    let a = zi::MmArgs { m: m as u32, n: n as u32, k: k as u32, ldo: ldo as u32, ocol: ocol as u32, arow: 0, oscale, conv: [0; 3] };
     zi::mm_call(c, g, &a, plane, act, out)
 }
 
