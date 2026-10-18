@@ -205,8 +205,7 @@ struct GvP { cols: u32, e0: u32, e1: u32, nm: u32, m0: vec4<u32>, m1: vec4<u32>,
 @group(0) @binding(6) var<storage, read> gvg0: array<vec4<f32>>;
 @group(0) @binding(7) var<storage, read> gvg1: array<vec4<f32>>;
 @group(0) @binding(8) var<storage, read> gvg2: array<vec4<f32>>;
-var<workgroup> gvred: array<vec4<f32>, GV_WG2>;
-struct GvD { a: vec4<f32>, b: vec4<f32> };
+var<workgroup> gvred: array<vec4<f32>, GV_RED>;
 // Position of latent slot m in a copy stored word-transposed: the c-th vec4
 // of every word is contiguous across words (stage U's lanes walk words and
 // read the same vec4 of consecutive words — one coalesced access).
@@ -219,7 +218,10 @@ fn gv_tpos(m: u32, nwt: u32) -> u32 {
 
 /// Stage V, the body for one tensor slot (`WB` its payload, `MJ` its
 /// (r, P, toff, d_out) word, `_J` the slot suffix).
-const GV_BODY: &str = r#"
+/// Stage V, the helpers of one tensor slot (`WB` its payload, `GB` its f32
+/// g, `_J` the slot suffix). The row walk itself is generated
+/// ([`gv_run_src`]) for 8 or 16 rows a set.
+const GV_HELPERS: &str = r#"
 fn gv_f16_J(byte_off: u32) -> f32 {
   let v = unpack2x16float(WB[byte_off >> 2u]);
   return select(v.x, v.y, (byte_off & 2u) != 0u);
@@ -235,27 +237,12 @@ fn gv_w4_J(rows: vec4<u32>, w: u32, nw: u32) -> vec4<u32> {
   if (w >= nw) { return vec4<u32>(0u); }
   return vec4<u32>(WB[rows.x + w], WB[rows.y + w], WB[rows.z + w], WB[rows.w + w]);
 }
-// The 8 rows' binary dots over word w, z formed once (zero past the row).
-fn gv_dot_J(w: u32, nw: u32, gw: u32, ba: vec4<u32>, bb: vec4<u32>) -> GvD {
-  if (w >= nw) { return GvD(vec4<f32>(0.0), vec4<f32>(0.0)); }
-  let xo = w * 8u;
-  let go = gw + w;
-  let z0 = gv_z_J(xo, go, 0u, nw);
-  let z1 = gv_z_J(xo, go, 1u, nw);
-  let z2 = gv_z_J(xo, go, 2u, nw);
-  let z3 = gv_z_J(xo, go, 3u, nw);
-  let z4 = gv_z_J(xo, go, 4u, nw);
-  let z5 = gv_z_J(xo, go, 5u, nw);
-  let z6 = gv_z_J(xo, go, 6u, nw);
-  let z7 = gv_z_J(xo, go, 7u, nw);
-  return GvD(vec4<f32>(bsd32(ba.x, z0, z1, z2, z3, z4, z5, z6, z7),
-                       bsd32(ba.y, z0, z1, z2, z3, z4, z5, z6, z7),
-                       bsd32(ba.z, z0, z1, z2, z3, z4, z5, z6, z7),
-                       bsd32(ba.w, z0, z1, z2, z3, z4, z5, z6, z7)),
-             vec4<f32>(bsd32(bb.x, z0, z1, z2, z3, z4, z5, z6, z7),
-                       bsd32(bb.y, z0, z1, z2, z3, z4, z5, z6, z7),
-                       bsd32(bb.z, z0, z1, z2, z3, z4, z5, z6, z7),
-                       bsd32(bb.w, z0, z1, z2, z3, z4, z5, z6, z7)));
+fn gv_d4_J(b: vec4<u32>, z0: vec4<f32>, z1: vec4<f32>, z2: vec4<f32>, z3: vec4<f32>,
+           z4: vec4<f32>, z5: vec4<f32>, z6: vec4<f32>, z7: vec4<f32>) -> vec4<f32> {
+  return vec4<f32>(bsd32(b.x, z0, z1, z2, z3, z4, z5, z6, z7),
+                   bsd32(b.y, z0, z1, z2, z3, z4, z5, z6, z7),
+                   bsd32(b.z, z0, z1, z2, z3, z4, z5, z6, z7),
+                   bsd32(b.w, z0, z1, z2, z3, z4, z5, z6, z7));
 }
 fn gv_l4_J(lb: u32, k: u32, r: u32, s: vec4<f32>) -> vec4<f32> {
   return vec4<f32>(select(0.0, s.x * gv_f16_J(lb + 2u * k), k < r),
@@ -263,7 +250,42 @@ fn gv_l4_J(lb: u32, k: u32, r: u32, s: vec4<f32>) -> vec4<f32> {
                    select(0.0, s.z * gv_f16_J(lb + 2u * k + 4u), k + 2u < r),
                    select(0.0, s.w * gv_f16_J(lb + 2u * k + 6u), k + 3u < r));
 }
-fn gv_run_J(blk: u32, tid: u32, lane: u32, warp: u32) {
+"#;
+
+/// The stage-V row walk of one slot for `rg` groups of 4 rows: `ns` words a
+/// lane in flight per row group and round, z formed once per word for all
+/// `4·rg` rows, then the row sums (`reduce`: "sg32" one subgroup a set,
+/// "sgn" several subgroups a set, "wg" workgroup memory) and the writes of
+/// the four shifted latent copies.
+fn gv_run_src(rg: usize, ns: usize, reduce: &str) -> String {
+    let mut o = String::new();
+    let g = |f: &dyn Fn(usize) -> String, sep: &str| -> String {
+        (0..rg).map(f).collect::<Vec<_>>().join(sep)
+    };
+    // The dot of word w for every row group (z formed once).
+    o.push_str(&format!(
+        "struct GvD_J {{ {} }};\n",
+        g(&|i| format!("d{i}: vec4<f32>"), ", ")
+    ));
+    o.push_str(&format!(
+        "fn gv_dot_J(w: u32, nw: u32, gw: u32, {}) -> GvD_J {{\n",
+        g(&|i| format!("b{i}: vec4<u32>"), ", ")
+    ));
+    o.push_str(&format!(
+        "  if (w >= nw) {{ return GvD_J({}); }}\n",
+        g(&|_| "vec4<f32>(0.0)".to_string(), ", ")
+    ));
+    o.push_str("  let xo = w * 8u;\n  let go = gw + w;\n");
+    for c in 0..8 {
+        o.push_str(&format!("  let z{c} = gv_z_J(xo, go, {c}u, nw);\n"));
+    }
+    o.push_str(&format!(
+        "  return GvD_J({});\n}}\n",
+        g(&|i| format!("gv_d4_J(b{i}, z0, z1, z2, z3, z4, z5, z6, z7)"), ", ")
+    ));
+    let r = 4 * rg;
+    o.push_str(&format!(
+        r#"fn gv_run_J(blk: u32, tid: u32, lane: u32, warp: u32) {{
   let m = MJ;
   let r = m.x;
   let np = m.y;
@@ -276,10 +298,10 @@ fn gv_run_J(blk: u32, tid: u32, lane: u32, warp: u32) {
   let nrows = np * rpad;
   let vset = tid / GV_LVu;
   let li = tid - vset * GV_LVu;
-  // 8 latent rows a set (rpad % 32 == 0: never across a path).
-  var q0 = (blk * GV_SETSu + vset) * 8u;
+  // {r} latent rows a set (rpad % 32 == 0: never across a path).
+  var q0 = (blk * GV_SETSu + vset) * {r}u;
   let ok = q0 < nrows;
-  q0 = min(q0, nrows - 8u);
+  q0 = min(q0, nrows - {r}u);
   let p = q0 / rpad;
   let k0 = q0 - p * rpad;
   let s = 2u * (d_out + cols + r) + (r >> 3u) * (d_out + cols);
@@ -288,51 +310,102 @@ fn gv_run_J(blk: u32, tid: u32, lane: u32, warp: u32) {
   let lb = base + 2u * (d_out + cols);
   let vw = (lb + 2u * r + d_out * (r >> 3u)) >> 2u;
   let rk = r - 1u;
-  let rowa = vec4<u32>(vw + min(k0, rk) * nw, vw + min(k0 + 1u, rk) * nw,
-                       vw + min(k0 + 2u, rk) * nw, vw + min(k0 + 3u, rk) * nw);
-  let rowb = vec4<u32>(vw + min(k0 + 4u, rk) * nw, vw + min(k0 + 5u, rk) * nw,
-                       vw + min(k0 + 6u, rk) * nw, vw + min(k0 + 7u, rk) * nw);
-  var acca = vec4<f32>(0.0);
-  var accb = vec4<f32>(0.0);
-  var w = li;
-  loop {
-    if (w >= nw) { break; }
-    // Every sign word of the round in flight before the first add.
-    let a0 = gv_w4_J(rowa, w, nw);
-    let b0 = gv_w4_J(rowb, w, nw);
-    let a1 = gv_w4_J(rowa, w + GV_LVu, nw);
-    let b1 = gv_w4_J(rowb, w + GV_LVu, nw);
-    let a2 = gv_w4_J(rowa, w + 2u * GV_LVu, nw);
-    let b2 = gv_w4_J(rowb, w + 2u * GV_LVu, nw);
-    let a3 = gv_w4_J(rowa, w + 3u * GV_LVu, nw);
-    let b3 = gv_w4_J(rowb, w + 3u * GV_LVu, nw);
-    let d0 = gv_dot_J(w, nw, gw, a0, b0);
-    let d1 = gv_dot_J(w + GV_LVu, nw, gw, a1, b1);
-    let d2 = gv_dot_J(w + 2u * GV_LVu, nw, gw, a2, b2);
-    let d3 = gv_dot_J(w + 3u * GV_LVu, nw, gw, a3, b3);
-    acca = acca + ((d0.a + d1.a) + (d2.a + d3.a));
-    accb = accb + ((d0.b + d1.b) + (d2.b + d3.b));
-    w = w + 4u * GV_LVu;
-  }
-GV_REDUCE
-  let tp = toff + p * 4u * ts;
-  let nwt = ts >> 5u;
-  if (ok && li == 0u) {
-    let la = gv_l4_J(lb, k0, r, sa);
-    let lc = gv_l4_J(lb, k0 + 4u, r, sb);
-    // k0 % 8 == 0 and 8c % 4 == 0: each run of four latents is one vec4 slot.
-    for (var c = 0u; c < 4u; c = c + 1u) {
-      let o = tp + c * ts + gv_tpos(k0 + 8u * c, nwt);
-      gvt[o] = la.x;
-      gvt[o + 1u] = la.y;
-      gvt[o + 2u] = la.z;
-      gvt[o + 3u] = la.w;
-      let o2 = tp + c * ts + gv_tpos(k0 + 4u + 8u * c, nwt);
-      gvt[o2] = lc.x;
-      gvt[o2 + 1u] = lc.y;
-      gvt[o2 + 2u] = lc.z;
-      gvt[o2 + 3u] = lc.w;
+"#
+    ));
+    for i in 0..rg {
+        let k = 4 * i;
+        o.push_str(&format!(
+            "  let row{i} = vec4<u32>(vw + min(k0 + {k}u, rk) * nw, vw + min(k0 + {}u, rk) * nw, vw + min(k0 + {}u, rk) * nw, vw + min(k0 + {}u, rk) * nw);\n",
+            k + 1,
+            k + 2,
+            k + 3
+        ));
+        o.push_str(&format!("  var acc{i} = vec4<f32>(0.0);\n"));
     }
+    o.push_str("  var w = li;\n  loop {\n    if (w >= nw) { break; }\n");
+    o.push_str("    // Every sign word of the round in flight before the first add.\n");
+    for sl in 0..ns {
+        for i in 0..rg {
+            o.push_str(&format!(
+                "    let b{sl}_{i} = gv_w4_J(row{i}, w + {sl}u * GV_LVu, nw);\n"
+            ));
+        }
+    }
+    for sl in 0..ns {
+        o.push_str(&format!(
+            "    let d{sl} = gv_dot_J(w + {sl}u * GV_LVu, nw, gw, {});\n",
+            g(&|i| format!("b{sl}_{i}"), ", ")
+        ));
+    }
+    for i in 0..rg {
+        let sum = (0..ns)
+            .map(|sl| format!("d{sl}.d{i}"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        o.push_str(&format!("    acc{i} = acc{i} + ({sum});\n"));
+    }
+    o.push_str(&format!("    w = w + {ns}u * GV_LVu;\n  }}\n"));
+    match reduce {
+        "sg32" => {
+            for i in 0..rg {
+                o.push_str(&format!("  let s{i} = subgroupAdd(acc{i});\n"));
+            }
+        }
+        "sgn" => {
+            for i in 0..rg {
+                o.push_str(&format!("  let sq{i} = subgroupAdd(acc{i});\n"));
+            }
+            o.push_str("  if (lane == 0u) {\n");
+            for i in 0..rg {
+                o.push_str(&format!("    gvred[{rg}u * warp + {i}u] = sq{i};\n"));
+            }
+            o.push_str("  }\n  workgroupBarrier();\n");
+            for i in 0..rg {
+                o.push_str(&format!("  var s{i} = vec4<f32>(0.0);\n"));
+            }
+            o.push_str("  for (var i = 0u; i < GV_LVu / 32u; i = i + 1u) {\n");
+            for i in 0..rg {
+                o.push_str(&format!("    s{i} = s{i} + gvred[{rg}u * i + {i}u];\n"));
+            }
+            o.push_str("  }\n");
+        }
+        _ => {
+            for i in 0..rg {
+                o.push_str(&format!("  gvred[{rg}u * tid + {i}u] = acc{i};\n"));
+            }
+            o.push_str("  workgroupBarrier();\n");
+            for i in 0..rg {
+                o.push_str(&format!("  var s{i} = vec4<f32>(0.0);\n"));
+            }
+            o.push_str("  if (li == 0u) {\n    for (var i = 0u; i < GV_LVu; i = i + 1u) {\n");
+            for i in 0..rg {
+                o.push_str(&format!(
+                    "      s{i} = s{i} + gvred[{rg}u * (vset * GV_LVu + i) + {i}u];\n"
+                ));
+            }
+            o.push_str("    }\n  }\n");
+        }
+    }
+    o.push_str(
+        "  let tp = toff + p * 4u * ts;\n  let nwt = ts >> 5u;\n  if (ok && li == 0u) {\n",
+    );
+    for i in 0..rg {
+        let k = 4 * i;
+        o.push_str(&format!(
+            "    let l{i} = gv_l4_J(lb, k0 + {k}u, r, s{i});\n"
+        ));
+    }
+    o.push_str(
+        "    // k0 % 8 == 0 and 8c % 4 == 0: each run of four latents is one vec4 slot.\n    for (var c = 0u; c < 4u; c = c + 1u) {\n",
+    );
+    for i in 0..rg {
+        let k = 4 * i;
+        o.push_str(&format!(
+            "      let o{i} = tp + c * ts + gv_tpos(k0 + {k}u + 8u * c, nwt);\n      gvt[o{i}] = l{i}.x;\n      gvt[o{i} + 1u] = l{i}.y;\n      gvt[o{i} + 2u] = l{i}.z;\n      gvt[o{i} + 3u] = l{i}.w;\n"
+        ));
+    }
+    o.push_str(
+        r#"    }
   }
   // The copies' zero borders, [0, 8c) and [rpad + 8c, rpad + 32).
   if (ok && k0 == 0u && li < 32u) {
@@ -343,46 +416,10 @@ GV_REDUCE
     }
   }
 }
-"#;
-
-/// Stage-V row sums, one subgroup a set.
-const GV_REDUCE_SG32: &str = r#"
-  let sa = subgroupAdd(acca);
-  let sb = subgroupAdd(accb);
-"#;
-
-/// Stage-V row sums, several subgroups a set (LV ≥ 128: one set a
-/// workgroup).
-const GV_REDUCE_SGN: &str = r#"
-  let ra = subgroupAdd(acca);
-  let rb = subgroupAdd(accb);
-  if (lane == 0u) {
-    gvred[2u * warp] = ra;
-    gvred[2u * warp + 1u] = rb;
-  }
-  workgroupBarrier();
-  var sa = vec4<f32>(0.0);
-  var sb = vec4<f32>(0.0);
-  for (var i = 0u; i < GV_LVu / 32u; i = i + 1u) {
-    sa = sa + gvred[2u * i];
-    sb = sb + gvred[2u * i + 1u];
-  }
-"#;
-
-/// Stage-V row sums through workgroup memory (no 32-wide subgroups).
-const GV_REDUCE_WG: &str = r#"
-  gvred[2u * tid] = acca;
-  gvred[2u * tid + 1u] = accb;
-  workgroupBarrier();
-  var sa = vec4<f32>(0.0);
-  var sb = vec4<f32>(0.0);
-  if (li == 0u) {
-    for (var i = 0u; i < GV_LVu; i = i + 1u) {
-      sa = sa + gvred[2u * (vset * GV_LVu + i)];
-      sb = sb + gvred[2u * (vset * GV_LVu + i) + 1u];
-    }
-  }
-"#;
+"#,
+    );
+    o
+}
 
 const GV_ENTRY_SG: &str = r#"
 @compute @workgroup_size(GV_WG)
@@ -652,26 +689,30 @@ GU_LANE_LET
 /// Output rows per stage-U workgroup (4 subgroups × 4 rows).
 const GU_ROWS_WG: usize = 16;
 
-/// Stage-V lane-set widths with a pipeline each.
-const GV_LANES: [usize; 4] = [32, 128, 256, 512];
+/// Stage-V variants with a pipeline each: (lanes a set, row groups of 4).
+const GV_VARIANTS: [(usize, usize); 7] =
+    [(32, 2), (128, 2), (256, 2), (512, 2), (128, 4), (256, 4), (512, 4)];
 
-/// Stage-V lanes per row set: 32 (one subgroup, 4 sets a workgroup) below
-/// 2048 columns, else 128 (one set a workgroup). Measured at the 27B and
-/// 0.8B shapes (device timestamps, `wgpu_blr_graph_throughput_27b_shapes`):
-/// 256 and 512 lanes were no faster at 5120/6144 columns and slower at
-/// 17408. `CMF_BLR_LV=32|128|256|512` pins it.
-fn gv_lanes(cols: usize) -> usize {
-    if let Some(v) = std::env::var("CMF_BLR_LV")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| GV_LANES.contains(v))
-    {
-        return v;
-    }
-    if cols >= 2048 {
-        128
+/// Stage-V variant for an input `cols` wide: 32 lanes (one subgroup, 4 sets
+/// a workgroup) below 2048 columns, else 128 lanes (one set a workgroup);
+/// 8 rows a set. The 16-row and wider sets were measured at the 27B shapes
+/// (device timestamps, DRAM regime, V+U pairs as the graph runs them): no
+/// gain, the 17408-wide FFN down included (35.1 us with 128x8 against
+/// 36.7 / 37.3 with 512x16 / 256x16; stage V alone looked 1.7x faster with
+/// 512x16 only because back-to-back V dispatches overlap). `CMF_BLR_LV=32|
+/// 128|256|512` and `CMF_BLR_VROWS=8|16` pin it (a pair without a pipeline
+/// falls back to the default).
+fn gv_variant(cols: usize) -> (usize, usize) {
+    let lv = if cols >= 2048 { 128 } else { 32 };
+    let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
+    let pinned = (
+        env("CMF_BLR_LV").unwrap_or(lv),
+        env("CMF_BLR_VROWS").map(|r| r / 4).unwrap_or(2),
+    );
+    if GV_VARIANTS.contains(&pinned) {
+        pinned
     } else {
-        32
+        (lv, 2)
     }
 }
 
@@ -680,19 +721,21 @@ fn gv_wg(lv: usize) -> usize {
     lv.max(128)
 }
 
-fn gv_source(sg: bool, lv: usize) -> String {
+fn gv_source(sg: bool, lv: usize, rg: usize) -> String {
     let reduce = match (sg, lv) {
-        (true, 32) => GV_REDUCE_SG32,
-        (true, _) => GV_REDUCE_SGN,
-        (false, _) => GV_REDUCE_WG,
+        (true, 32) => "sg32",
+        (true, _) => "sgn",
+        (false, _) => "wg",
     };
+    // Words a lane fetches a round per row group: 4 (8 rows) or 2 (16 rows).
+    let ns = if rg >= 4 { 2 } else { 4 };
+    let run = gv_run_src(rg, ns, reduce);
     let mut s = String::new();
     s.push_str(GV_HEAD);
     s.push_str(GCOMMON);
     for j in 0..3 {
         s.push_str(
-            &GV_BODY
-                .replace("GV_REDUCE", reduce)
+            &format!("{GV_HELPERS}\n{run}")
                 .replace("WB", &format!("gvw{j}"))
                 .replace("GB", &format!("gvg{j}"))
                 .replace("MJ", &format!("gvp.m{j}"))
@@ -702,7 +745,7 @@ fn gv_source(sg: bool, lv: usize) -> String {
     s.push_str(if sg { GV_ENTRY_SG } else { GV_ENTRY_WG });
     s.replace("GV_LVu", &format!("{lv}u"))
         .replace("GV_SETSu", &format!("{}u", gv_wg(lv) / lv))
-        .replace("GV_WG2", &format!("{}", 2 * gv_wg(lv)))
+        .replace("GV_RED", &format!("{}", rg * gv_wg(lv)))
         .replace("GV_WG", &format!("{}", gv_wg(lv)))
 }
 
@@ -734,8 +777,11 @@ fn gu_source(sg: bool) -> String {
 
 /// The graph kernels of one device context.
 pub(super) struct BlrGraph {
-    /// Stage V per lane-set width ([`GV_LANES`]), with its layout.
-    v: Vec<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    /// Stage V per variant ([`GV_VARIANTS`]) with its layout: the defaults
+    /// compiled up front, a pinned variant on first use.
+    v: std::sync::Mutex<
+        std::collections::HashMap<(usize, usize), (wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    >,
     u: wgpu::ComputePipeline,
     ua: wgpu::ComputePipeline,
     u_l: wgpu::BindGroupLayout,
@@ -746,12 +792,8 @@ pub(super) struct BlrGraph {
     pub(super) sg: bool,
 }
 
-fn compile_graph(c: &Ctx) -> Option<BlrGraph> {
-    let sg = c.device.features().contains(wgpu::Features::SUBGROUP)
-        && c.adapter_info.subgroup_min_size == 32
-        && c.adapter_info.subgroup_max_size == 32
-        && std::env::var("CMF_BLR_SG").as_deref() != Ok("0");
-    let mk = |label: &str, src: &str, ep: &str| -> Option<wgpu::ComputePipeline> {
+fn compile_pipe(c: &Ctx, label: &str, src: &str, ep: &str) -> Option<wgpu::ComputePipeline> {
+    {
         let scope = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let m = c.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(label),
@@ -775,20 +817,45 @@ fn compile_graph(c: &Ctx) -> Option<BlrGraph> {
             return None;
         }
         Some(p)
-    };
-    let gu = gu_source(sg);
-    let mut v = Vec::new();
-    for lv in GV_LANES {
-        let p = mk(&format!("blr-gv{lv}"), &gv_source(sg, lv), "blr_gv")?;
-        let l = p.get_bind_group_layout(0);
-        v.push((p, l));
     }
-    let u = mk("blr-gu", &gu, "blr_gu")?;
-    let ua = mk("blr-gu-act", &gu, "blr_gu_act")?;
-    Some(BlrGraph {
+}
+
+impl BlrGraph {
+    /// The stage-V pipeline and layout of variant (lanes, row groups).
+    fn v_pipe(
+        &self,
+        c: &Ctx,
+        lv: usize,
+        rg: usize,
+    ) -> Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)> {
+        let mut m = self.v.lock().unwrap();
+        if let Some(e) = m.get(&(lv, rg)) {
+            return Some(e.clone());
+        }
+        let p = compile_pipe(
+            c,
+            &format!("blr-gv{lv}x{}", 4 * rg),
+            &gv_source(self.sg, lv, rg),
+            "blr_gv",
+        )?;
+        let l = p.get_bind_group_layout(0);
+        m.insert((lv, rg), (p.clone(), l.clone()));
+        Some((p, l))
+    }
+}
+
+fn compile_graph(c: &Ctx) -> Option<BlrGraph> {
+    let sg = c.device.features().contains(wgpu::Features::SUBGROUP)
+        && c.adapter_info.subgroup_min_size == 32
+        && c.adapter_info.subgroup_max_size == 32
+        && std::env::var("CMF_BLR_SG").as_deref() != Ok("0");
+    let gu = gu_source(sg);
+    let u = compile_pipe(c, "blr-gu", &gu, "blr_gu")?;
+    let ua = compile_pipe(c, "blr-gu-act", &gu, "blr_gu_act")?;
+    let g = BlrGraph {
         u_l: u.get_bind_group_layout(0),
         ua_l: ua.get_bind_group_layout(0),
-        v,
+        v: std::sync::Mutex::new(std::collections::HashMap::new()),
         u,
         ua,
         dummy_y: c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -798,7 +865,12 @@ fn compile_graph(c: &Ctx) -> Option<BlrGraph> {
             mapped_at_creation: false,
         }),
         sg,
-    })
+    };
+    // The default stage-V variants up front: a device that rejects them
+    // keeps the per-op path from the start.
+    g.v_pipe(c, 32, 2)?;
+    g.v_pipe(c, 128, 2)?;
+    Some(g)
 }
 
 /// Geometry of a `blr` payload (from its validated header).
@@ -983,7 +1055,7 @@ pub(super) fn encode_group(
     };
     let mut pass = begin_pass(enc);
     for (p, b, n) in [&v, &u] {
-        pass.set_pipeline(p);
+        pass.set_pipeline(p.as_ref());
         pass.set_bind_group(0, b, &[]);
         pass.dispatch_workgroups(*n, 1, 1);
     }
@@ -991,7 +1063,7 @@ pub(super) fn encode_group(
 }
 
 /// One stage dispatch: pipeline, bind group, workgroups.
-pub(super) type StageDispatch<'a> = (&'a wgpu::ComputePipeline, wgpu::BindGroup, u32);
+pub(super) type StageDispatch<'a> = (std::borrow::Cow<'a, wgpu::ComputePipeline>, wgpu::BindGroup, u32);
 
 /// The two dispatches of [`encode_group`] (stage V, stage U) without
 /// encoding them. None = outside the kernels' contract.
@@ -1017,9 +1089,9 @@ pub(super) fn prep_group<'g>(
     }
     // (r, P, toff, d_out) per slot; unused slots repeat slot 0 with empty
     // workgroup ranges.
-    let lv = gv_lanes(cols);
-    // Latent rows a stage-V workgroup covers: 8 per set.
-    let v_rows_wg = 8 * (gv_wg(lv) / lv);
+    let (lv, rg) = gv_variant(cols);
+    // Latent rows a stage-V workgroup covers: 4·rg per set.
+    let v_rows_wg = 4 * rg * (gv_wg(lv) / lv);
     let mut mw = [0u32; 12];
     let mut toff = 0usize;
     let mut ev = [0u32; 3];
@@ -1051,12 +1123,9 @@ pub(super) fn prep_group<'g>(
         ],
     );
     let w = |j: usize| mats.get(j).unwrap_or(&mats[0]).buf;
-    let (pipe_v, layout_v) = {
-        let i = GV_LANES.iter().position(|&l| l == lv).expect("listed width");
-        (&g.v[i].0, &g.v[i].1)
-    };
+    let (pipe_v, layout_v) = g.v_pipe(c, lv, rg)?;
     let gb = |j: usize| mats.get(j).unwrap_or(&mats[0]).g;
-    let bv = bind(0, layout_v, &[w(0), w(1), w(2), x, t, &pv, gb(0), gb(1), gb(2)]);
+    let bv = bind(0, &layout_v, &[w(0), w(1), w(2), x, t, &pv, gb(0), gb(1), gb(2)]);
     let (pipe_u, bu, groups_u) = match act {
         Some(code) => {
             let pu = uniform16(
@@ -1092,7 +1161,10 @@ pub(super) fn prep_group<'g>(
             )
         }
     };
-    Some([(pipe_v, bv, accv as u32), (pipe_u, bu, groups_u)])
+    Some([
+        (std::borrow::Cow::Owned(pipe_v), bv, accv as u32),
+        (std::borrow::Cow::Borrowed(pipe_u), bu, groups_u),
+    ])
 }
 
 /// A bind group over `bufs` at bindings 0.. in order (the uncached maker).
@@ -1546,7 +1618,7 @@ mod tests {
                             if stage.is_some_and(|s| s != si) {
                                 continue;
                             }
-                            pass.set_pipeline(p);
+                            pass.set_pipeline(p.as_ref());
                             pass.set_bind_group(0, b, &[]);
                             pass.dispatch_workgroups(*n, 1, 1);
                         }
@@ -1626,11 +1698,13 @@ mod tests {
         ];
         // Every stage-V lane-set width on every group (the default picks
         // the width from the row length).
-        for (g, lv) in variants
+        for (g, (lvn, rgn)) in variants
             .iter()
-            .flat_map(|g| [(g, "32"), (g, "128"), (g, "256"), (g, "512")])
+            .flat_map(|g| GV_VARIANTS.iter().map(move |v| (g, *v)))
         {
-            unsafe { std::env::set_var("CMF_BLR_LV", lv) };
+            let lv = format!("{lvn}x{}", 4 * rgn);
+            unsafe { std::env::set_var("CMF_BLR_LV", lvn.to_string()) };
+            unsafe { std::env::set_var("CMF_BLR_VROWS", (4 * rgn).to_string()) };
             for &(d_in, specs) in groups {
                 let x: Vec<f32> = (0..d_in).map(|_| rng.f()).collect();
                 let x_buf = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1778,5 +1852,6 @@ mod tests {
             }
         }
         unsafe { std::env::remove_var("CMF_BLR_LV") };
+        unsafe { std::env::remove_var("CMF_BLR_VROWS") };
     }
 }
