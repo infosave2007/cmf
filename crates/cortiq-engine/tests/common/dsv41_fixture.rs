@@ -11,6 +11,8 @@
 //!       q2tp gate/up experts
 //!   L4  ratio 0 after the sources (window only), F32 attention linears
 //!
+//! (`Fixture::build_q2_even` flips the gate/up layout: q2tp on L0/L2/L4.)
+//!
 //! The reference follows the BF16 checkpoint mode of `model.py` (weights
 //! are already dequantized, so `linear()` is a plain BF16 GEMM): every
 //! tensor the reference materializes as BF16 is rounded here as well, and
@@ -241,6 +243,23 @@ impl Fixture {
 
     /// Same weights (one seed), with candidate pre-filtering on or off.
     pub fn build_with(compressed_vocab: usize, candidate_source: Option<usize>) -> Self {
+        Self::build_impl(compressed_vocab, candidate_source, 1)
+    }
+
+    /// The gate/up layout flipped: q2tp on the even layers (L0, L2, L4),
+    /// q4tp on L1 and L3. The device MoE bank takes the first MoE layer's
+    /// layout, so this is the variant that puts the q2tp bank on the card.
+    /// Different weights from `build` (the payload sizes move the seed).
+    pub fn build_q2_even(compressed_vocab: usize) -> Self {
+        Self::build_impl(compressed_vocab, Some(CANDIDATE_SOURCE), 0)
+    }
+
+    /// `q2_parity`: the layers with `li % 2 == q2_parity` get q2tp gate/up.
+    fn build_impl(
+        compressed_vocab: usize,
+        candidate_source: Option<usize>,
+        q2_parity: usize,
+    ) -> Self {
         let mut fx = Self {
             specs: Vec::new(),
             w: HashMap::new(),
@@ -304,7 +323,7 @@ impl Fixture {
             // The router is an FP32 linear in the reference.
             fx.vec_bf16(&format!("{p}.mlp.gate.weight"), &[EXPERTS, DIM], 0.4, 0.0);
             fx.vec_f32(&format!("{p}.mlp.expert_bias"), &[EXPERTS], 0.1, 0.0);
-            let gu = if li % 2 == 1 { Kind::Q2tp } else { Kind::Q4tp };
+            let gu = if li % 2 == q2_parity { Kind::Q2tp } else { Kind::Q4tp };
             for e in 0..EXPERTS {
                 let x = format!("{p}.mlp.experts.{e}");
                 fx.linear(&format!("{x}.gate_proj.weight"), INTER, DIM, gu);
