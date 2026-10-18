@@ -2809,17 +2809,17 @@ mod tests {
 
     /// The device encode against the host reference (the lead runs it on a
     /// GPU stand: `CMF_MOE_GPU_TEST=1`; device folds and sweeps are f32, so
-    /// the comparison is by held-out error, not bytes).
+    /// the comparison is by held-out error, not bytes). The device encode
+    /// needs the matrix units (cooperative matrices): without them, or
+    /// without a device, the opted-in test fails instead of passing green.
     #[test]
     fn gpu_encode_tracks_the_host_reference() {
         if std::env::var("CMF_MOE_GPU_TEST").ok().as_deref() != Some("1") {
             eprintln!("CMF_MOE_GPU_TEST unset — skipped");
             return;
         }
-        let Some(c) = to::dev() else {
-            eprintln!("no wgpu device — skipped");
-            return;
-        };
+        let c = to::dev().expect("CMF_MOE_GPU_TEST=1 but no wgpu device (on macOS set CMF_GPU=wgpu)");
+        assert!(tm::matrix_units(), "CMF_MOE_GPU_TEST=1 but the wgpu device has no matrix units (cooperative matrices): the device encode cannot run here");
         let _env = env_guard("4", "1");
         let mut rng = Rng(29);
         let (hidden, inter, n_cal, n_ho) = (256, 128, 2048, 256);
