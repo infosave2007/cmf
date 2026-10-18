@@ -15,11 +15,15 @@
 //!   gradients of the trainable metric (binary low-rank h, ℓ, g of every
 //!   path and every RMSNorm gain);
 //! * Adam on the metric; ℓ entries that only pad the rank to the GEMM tile
-//!   stay zero (masked), so the bit budget never grows.
+//!   stay zero (masked), so the bit budget never grows;
+//! * optionally the signs themselves (`SignInit` at load, a `SignStepCfg`
+//!   per step): one straight-through latent per sign, updated inside each
+//!   path's backward right after its gradient is formed (`gpu_wgpu::train_sign`).
 
 use crate::gpu_wgpu::gdn_train::{self as gdn, GdnTape, GdnTrainCfg};
 use crate::gpu_wgpu::train_head::{self as th, Head, HeadScratch};
 use crate::gpu_wgpu::train_mm::{self as tm, Blr, BlrPath, BlrScratch, Op};
+use crate::gpu_wgpu::train_sign::{self as ts, SignCtx, SignInit, SignScratch, SignStepCfg};
 use crate::gpu_wgpu::train_ops::{self as to, AttnGeom, QkrGeom};
 use cortiq_core::quant::{dequant_tensor, f16_to_f32, f32_to_f16};
 use cortiq_core::{CmfModel, LayerType, NormStyle};
@@ -176,6 +180,8 @@ pub struct Net {
     pub head: Head,
     /// Embedding rows on the host (f16 bits), gathered per step.
     embed: Vec<u16>,
+    /// Sign matrices with training state (ids 0..n_sign_mats).
+    pub n_sign_mats: u32,
 }
 
 fn deq(m: &CmfModel, name: &str) -> Result<(Vec<f32>, Vec<usize>), String> {
@@ -210,7 +216,7 @@ fn transpose(v: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 /// 16-byte header, then per path h f16[m], g f16[n], ℓ f16[r], U bits
 /// [m][r/8], V bits [r][n/8]) into device paths, padding the rank to a
 /// multiple of 128 with ℓ = 0 (masked).
-fn load_blr(c: Ctx, bytes: &[u8], role: &'static str) -> Result<Lin, String> {
+fn load_blr(c: Ctx, bytes: &[u8], role: &'static str, sign: Option<&SignInit>, next_id: &mut u32) -> Result<Lin, String> {
     if bytes.len() < 16 || bytes[0] != 0x4C {
         return Err(format!("{role}: not a binary low-rank payload"));
     }
@@ -260,6 +266,15 @@ fn load_blr(c: Ctx, bytes: &[u8], role: &'static str) -> Result<Lin, String> {
         let ph = Param::new_metric(c, &h, None);
         let pl = Param::new_metric(c, &l, Some(&mask));
         let pg = Param::new_metric(c, &g, None);
+        let sp = match sign {
+            Some(init) => {
+                let u = ts::init_mat(c, &ub_buf, m, r, rp, init, *next_id).ok_or("sign init")?;
+                let v = ts::init_mat(c, &vb_buf, n, r, rp, init, *next_id + 1).ok_or("sign init")?;
+                *next_id += 2;
+                Some(ts::SignPath { u, v })
+            }
+            None => None,
+        };
         // The path reads the Param buffers directly (same wgpu::Buffer handles).
         paths.push(BlrPath {
             bits_u: ub_buf,
@@ -270,16 +285,18 @@ fn load_blr(c: Ctx, bytes: &[u8], role: &'static str) -> Result<Lin, String> {
             dh: ph.g.clone(),
             dl: pl.g.clone(),
             dg: pg.g.clone(),
+            sign: sp,
         });
         params.push([ph, pl, pg]);
     }
     Ok(Lin::Blr { blr: Blr { m, n, r: rp, paths }, role, params })
 }
 
-fn load_lin(c: Ctx, m: &CmfModel, name: &str, role: &'static str, as_plane: bool, bwd: bool) -> Result<Lin, String> {
+#[allow(clippy::too_many_arguments)]
+fn load_lin(c: Ctx, m: &CmfModel, name: &str, role: &'static str, as_plane: bool, bwd: bool, sign: Option<&SignInit>, next_id: &mut u32) -> Result<Lin, String> {
     let e = m.tensor(name).ok_or_else(|| format!("missing tensor {name}"))?;
     if e.dtype as u8 == 19 {
-        return load_blr(c, m.entry_bytes(e), role);
+        return load_blr(c, m.entry_bytes(e), role, sign, next_id);
     }
     let (v, shape) = deq(m, name)?;
     let (rows, cols) = (shape[0], shape[1]);
@@ -295,19 +312,21 @@ impl Net {
     /// Device copy of `model` (`plane` = frozen f16 planes for every
     /// non-binary linear: the teacher; the student's binary low-rank
     /// tensors always load as such).
-    pub fn load(c: Ctx, model: &CmfModel, plane: bool, bwd: bool) -> Result<Self, String> {
+    /// `sign`: give every binary low-rank path sign latents (sign training).
+    pub fn load(c: Ctx, model: &CmfModel, plane: bool, bwd: bool, sign: Option<&SignInit>) -> Result<Self, String> {
         let geom = Geom::from_model(model)?;
         let norm = |name: &str| -> Result<Param, String> { Ok(Param::new(c, &deq(model, name)?.0, None)) };
         let mut layers = Vec::with_capacity(geom.nl);
+        let mut next_id = 0u32;
         for li in 0..geom.nl {
             let p = format!("model.layers.{li}.");
-            let lin = |n: &str, role: &'static str| load_lin(c, model, &format!("{p}{n}"), role, plane, bwd);
+            let mut lin = |n: &str, role: &'static str| load_lin(c, model, &format!("{p}{n}"), role, plane, bwd, sign, &mut next_id);
             let mix = if geom.gdn_layer[li] {
                 Mix::Gdn {
                     qkv: lin("linear_attn.in_proj_qkv.weight", "gdn.qkv")?,
                     z: lin("linear_attn.in_proj_z.weight", "gdn.z")?,
-                    a: load_lin(c, model, &format!("{p}linear_attn.in_proj_a.weight"), "gdn.a", false, bwd)?,
-                    b: load_lin(c, model, &format!("{p}linear_attn.in_proj_b.weight"), "gdn.b", false, bwd)?,
+                    a: load_lin(c, model, &format!("{p}linear_attn.in_proj_a.weight"), "gdn.a", false, bwd, None, &mut 0)?,
+                    b: load_lin(c, model, &format!("{p}linear_attn.in_proj_b.weight"), "gdn.b", false, bwd, None, &mut 0)?,
                     out: lin("linear_attn.out_proj.weight", "gdn.out")?,
                     a_log: deq(model, &format!("{p}linear_attn.A_log"))?.0,
                     dt_bias: deq(model, &format!("{p}linear_attn.dt_bias"))?.0,
@@ -346,7 +365,41 @@ impl Net {
         // vocabulary slices keep each plane within one storage binding.
         let head = Head::new(c, &head_w, v, hs, bwd, None);
         let embed = emb.iter().map(|&f| f32_to_f16(f)).collect();
-        Ok(Net { geom, layers, final_norm, head, embed })
+        Ok(Net { geom, layers, final_norm, head, embed, n_sign_mats: next_id })
+    }
+
+    /// Every binary low-rank linear with its tensor name, in a fixed order
+    /// (the order of [`Net::params`]).
+    pub fn blr_lins(&self) -> Vec<(String, &Lin)> {
+        let mut v: Vec<(String, &Lin)> = Vec::new();
+        for (li, ly) in self.layers.iter().enumerate() {
+            let mut list: Vec<(&str, &Lin)> = match &ly.mix {
+                Mix::Gdn { qkv, z, out, .. } => vec![("linear_attn.in_proj_qkv.weight", qkv), ("linear_attn.in_proj_z.weight", z), ("linear_attn.out_proj.weight", out)],
+                Mix::Attn { q, k, v: vv, o, .. } => vec![("self_attn.q_proj.weight", q), ("self_attn.k_proj.weight", k), ("self_attn.v_proj.weight", vv), ("self_attn.o_proj.weight", o)],
+            };
+            list.extend([("mlp.gate_proj.weight", &ly.gate), ("mlp.up_proj.weight", &ly.up), ("mlp.down_proj.weight", &ly.down)]);
+            for (n, l) in list {
+                if matches!(l, Lin::Blr { .. }) {
+                    v.push((format!("model.layers.{li}.{n}"), l));
+                }
+            }
+        }
+        v
+    }
+
+    /// Live signs under training (Σ rows · true rank over every sign matrix).
+    pub fn sign_live(&self) -> u64 {
+        let mut s = 0;
+        for (_, lin) in self.blr_lins() {
+            if let Lin::Blr { blr, .. } = lin {
+                for p in &blr.paths {
+                    if let Some(sp) = &p.sign {
+                        s += sp.u.live() + sp.v.live();
+                    }
+                }
+            }
+        }
+        s
     }
 
     /// Every trainable parameter (metric of the binary low-rank paths, all
@@ -401,6 +454,8 @@ pub struct Work {
     tape: Option<GdnTape>,
     rope: wgpu::Buffer,
     head: HeadScratch,
+    /// Sign-training workspace (when the net carries sign state).
+    pub sg: Option<SignScratch>,
 }
 
 impl Work {
@@ -444,12 +499,17 @@ impl Work {
         // layers differ in both.
         let mut dims: HashMap<_, (usize, usize, usize, usize)> = HashMap::new();
         let mut act_w = g.hs.max(g.inter).max(2 * qd).max(g.c_dim().max(g.vd()));
+        let (mut sg_rows, mut sg_rp) = (0usize, 0usize);
         for l in &net.layers {
             let mut add = |lin: &Lin| {
                 if let Lin::Blr { blr: bl, role, .. } = lin {
                     act_w = act_w.max(bl.m).max(bl.n).max(bl.r);
                     let d = dims.entry(*role).or_insert((0, 0, 0, 0));
                     *d = (d.0.max(bl.m), d.1.max(bl.n), d.2.max(bl.r), d.3.max(bl.paths.len()));
+                    if bl.paths.iter().any(|p| p.sign.is_some()) {
+                        sg_rows = sg_rows.max(bl.m).max(bl.n);
+                        sg_rp = sg_rp.max(bl.r);
+                    }
                 }
             };
             match &l.mix {
@@ -496,6 +556,7 @@ impl Work {
             tape,
             rope: to::upload(c, &tab),
             head: HeadScratch::new(c, 256.min(ntok), g.vocab, g.hs),
+            sg: (sg_rows > 0).then(|| SignScratch::new(c, ntok, sg_rows, sg_rp)),
         }
     }
     fn get(&self, n: &str) -> &wgpu::Buffer {
@@ -529,19 +590,25 @@ fn lin_fwd(c: Ctx, w: &Work, lin: &Lin, x: &wgpu::Buffer, y: &wgpu::Buffer, acc:
 
 /// Input gradient into `dx` (overwritten, or accumulated with `acc`), metric
 /// gradients accumulated. Blr needs the scratch of its own last forward.
+/// With `sign`, a blr linear's sign latents/bits are updated in the same
+/// pass (after its input gradient is formed from the old bits).
 #[allow(clippy::too_many_arguments)]
-fn lin_bwd(c: Ctx, w: &Work, lin: &Lin, x: &wgpu::Buffer, dy: &wgpu::Buffer, dx: &wgpu::Buffer, acc: bool, gscale: f32) -> Option<()> {
+fn lin_bwd(c: Ctx, w: &Work, lin: &Lin, x: &wgpu::Buffer, dy: &wgpu::Buffer, dx: &wgpu::Buffer, acc: bool, gscale: f32, sign: Option<&SignStepCfg>) -> Option<()> {
     let ntok = w.ntok;
     match lin {
         Lin::Blr { blr, role, .. } => {
+            let ctx = match (sign, w.sg.as_ref()) {
+                (Some(cfg), Some(sc)) => Some(SignCtx { sc, cfg, role: ts::role_id(role) }),
+                _ => None,
+            };
             if acc {
                 let tmp = w.get("tmp_h");
                 // tmp_h is hs wide: accumulation is only used for hs-wide inputs
-                tm::blr_backward(c, blr, &w.blr[role], x, dy, tmp, ntok, gscale)?;
+                tm::blr_backward(c, blr, &w.blr[role], x, dy, tmp, ntok, gscale, ctx.as_ref())?;
                 tm::run(c, &[Op::D(to::elt(c, "add", ntok * blr.n, dx, tmp, Some(dx), None, None, None)?)]);
                 Some(())
             } else {
-                tm::blr_backward(c, blr, &w.blr[role], x, dy, dx, ntok, gscale)
+                tm::blr_backward(c, blr, &w.blr[role], x, dy, dx, ntok, gscale, ctx.as_ref())
             }
         }
         Lin::Plane { wt, m, k, .. } => {
@@ -646,15 +713,16 @@ fn layer_fwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, y: &wgpu::
 
 /// Backward of layer `l` (its forward just recomputed from `x`): `dy` is the
 /// gradient at the layer output; `dx` gets the gradient at its input.
-fn layer_bwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, dy: &wgpu::Buffer, dx: &wgpu::Buffer, gs: f32) -> Option<()> {
+#[allow(clippy::too_many_arguments)]
+fn layer_bwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, dy: &wgpu::Buffer, dx: &wgpu::Buffer, gs: f32, sg: Option<&SignStepCfg>) -> Option<()> {
     let g = &net.geom;
     let ly = &net.layers[l];
     let n = w.ntok;
     // MLP: y = x2 + down(swiglu(gate(n2), up(n2)))
-    lin_bwd(c, w, &ly.down, w.get("hh"), dy, w.get("dhh"), false, gs)?;
+    lin_bwd(c, w, &ly.down, w.get("hh"), dy, w.get("dhh"), false, gs, sg)?;
     to::run(c, &[to::elt(c, "swiglu_bwd", n * g.inter, w.get("gg"), w.get("uu"), None, Some(w.get("dhh")), Some(w.get("dgg")), Some(w.get("duu")))?]);
-    lin_bwd(c, w, &ly.gate, w.get("n2"), w.get("dgg"), w.get("dn2"), false, gs)?;
-    lin_bwd(c, w, &ly.up, w.get("n2"), w.get("duu"), w.get("dn2"), true, gs)?;
+    lin_bwd(c, w, &ly.gate, w.get("n2"), w.get("dgg"), w.get("dn2"), false, gs, sg)?;
+    lin_bwd(c, w, &ly.up, w.get("n2"), w.get("duu"), w.get("dn2"), true, gs, sg)?;
     to::run(c, &[
         to::rms_bwd(c, w.get("x2"), &ly.ln2.w, w.get("inv2"), w.get("dn2"), w.get("dx2"), n, g.hs, g.gemma)?,
         to::rms_dw(c, w.get("x2"), w.get("inv2"), w.get("dn2"), &ly.ln2.g, n, g.hs)?,
@@ -664,21 +732,21 @@ fn layer_bwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, dy: &wgpu:
     match &ly.mix {
         Mix::Gdn { qkv, z, a, b, out, .. } => {
             let tape = w.tape.as_ref().unwrap();
-            lin_bwd(c, w, out, w.get("gout"), w.get("dx2"), tape.dout(), false, gs)?;
+            lin_bwd(c, w, out, w.get("gout"), w.get("dx2"), tape.dout(), false, gs, sg)?;
             gdn::gdn_backward_dev(tape, g.nk, g.nv, g.c_dim())?;
-            lin_bwd(c, w, qkv, w.get("n1"), tape.draw(), w.get("dn1"), false, gs)?;
-            lin_bwd(c, w, z, w.get("n1"), tape.dz(), w.get("dn1"), true, gs)?;
+            lin_bwd(c, w, qkv, w.get("n1"), tape.draw(), w.get("dn1"), false, gs, sg)?;
+            lin_bwd(c, w, z, w.get("n1"), tape.dz(), w.get("dn1"), true, gs, sg)?;
             copy_off(c, tape.dab(), 0, w.get("dgout"), 0, n * g.nv);
-            lin_bwd(c, w, a, w.get("n1"), w.get("dgout"), w.get("dn1"), true, gs)?;
+            lin_bwd(c, w, a, w.get("n1"), w.get("dgout"), w.get("dn1"), true, gs, sg)?;
             copy_off(c, tape.dab(), n * g.nv, w.get("dgout"), 0, n * g.nv);
-            lin_bwd(c, w, b, w.get("n1"), w.get("dgout"), w.get("dn1"), true, gs)?;
+            lin_bwd(c, w, b, w.get("n1"), w.get("dgout"), w.get("dn1"), true, gs, sg)?;
         }
         Mix::Attn { q, k, v, o, qn, kn } => {
             let qd = g.nh * g.hd;
             let qg = QkrGeom { n, heads: g.nh, hd: g.hd, half: g.half, t: w.t, gemma: g.gemma, eps: g.eps };
             let kg = QkrGeom { heads: g.nkv, ..qg };
             let ag = AttnGeom { nb: w.nb, t: w.t, nh: g.nh, nkv: g.nkv, hd: g.hd };
-            lin_bwd(c, w, o, w.get("og"), w.get("dx2"), w.get("dog"), false, gs)?;
+            lin_bwd(c, w, o, w.get("og"), w.get("dx2"), w.get("dog"), false, gs, sg)?;
             to::run(c, &[to::elt(c, "gate_bwd", n * qd, w.get("o"), w.get("gate"), None, Some(w.get("dog")), Some(w.get("do")), Some(w.get("dgate")))?]);
             to::run(c, &to::attn_bwd(c, ag, w.get("qr"), w.get("kr"), w.get("v"), w.get("o"), w.get("lse"), w.get("do"), w.get("dsum"), w.get("dqr"), w.get("dkr"), w.get("dv"))?);
             to::run(c, &[
@@ -694,9 +762,9 @@ fn layer_bwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, dy: &wgpu:
                 to::elt(c, "add", g.hd, &kn.g, &gk, Some(&kn.g), None, None, None)?,
             ]);
             tm::run(c, &[Op::D(tm::split_qg(c, w.get("dqg"), w.get("dq"), w.get("dgate"), n, g.nh, g.hd, true)?)]);
-            lin_bwd(c, w, q, w.get("n1"), w.get("dqg"), w.get("dn1"), false, gs)?;
-            lin_bwd(c, w, k, w.get("n1"), w.get("dk"), w.get("dn1"), true, gs)?;
-            lin_bwd(c, w, v, w.get("n1"), w.get("dv"), w.get("dn1"), true, gs)?;
+            lin_bwd(c, w, q, w.get("n1"), w.get("dqg"), w.get("dn1"), false, gs, sg)?;
+            lin_bwd(c, w, k, w.get("n1"), w.get("dk"), w.get("dn1"), true, gs, sg)?;
+            lin_bwd(c, w, v, w.get("n1"), w.get("dv"), w.get("dn1"), true, gs, sg)?;
         }
     }
     to::run(c, &[
@@ -744,19 +812,40 @@ pub fn teacher_topk(c: Ctx, net: &Net, w: &Work, ids: &[u32], k: usize) -> Optio
 pub struct StepStats {
     pub loss: f64,
     pub finite: bool,
+    /// The backward ran (false: non-finite loss with sign training on).
+    pub backward: bool,
+    /// Sign flips this step, per role and side (`2·role + side`, see `train_sign::ROLES`).
+    pub flips_role: [u64; 20],
+    pub flips: u64,
+    /// Non-finite sign-gradient entries (treated as 0).
+    pub g_nonfinite: u64,
+    /// Latent steps clipped at ±1, and steps clamped at ±c.
+    pub saturated: u64,
+    pub clamped: u64,
 }
 
 /// One forward + backward on `ids` against the teacher top-k; gradients
 /// accumulate into the parameters' `g` buffers (zeroed by the caller).
-pub fn step(c: Ctx, net: &Net, w: &Work, ids: &[u32], tid: &[u32], tp: &[f32], k: usize, gscale: f32) -> Option<StepStats> {
+/// With `sign`, every sign matrix is updated during the reverse sweep; a
+/// non-finite loss then skips the backward (no sign update runs).
+#[allow(clippy::too_many_arguments)]
+pub fn step(c: Ctx, net: &Net, w: &Work, ids: &[u32], tid: &[u32], tp: &[f32], k: usize, gscale: f32, sign: Option<&SignStepCfg>) -> Option<StepStats> {
     let g = &net.geom;
     let n = w.ntok;
+    let sign = if w.sg.is_some() { sign } else { None };
+    if let (Some(_), Some(sc)) = (sign, w.sg.as_ref()) {
+        ts::reset_counters(c, sc);
+    }
     forward(c, net, w, ids)?;
     let btid = to::zeros(c, n * k);
     c.queue.write_buffer(&btid, 0, bytemuck::cast_slice(tid));
     let btp = to::upload(c, tp);
     th::head_kl(c, &net.head, &w.head, w.get("n1"), &btid, &btp, k, w.get("dn1"), w.get("loss"), n, n, gscale)?;
     let loss: f64 = to::download(c, w.get("loss"), n)?.iter().map(|&x| x as f64).sum::<f64>() / n as f64;
+    let mut st = StepStats { loss, finite: loss.is_finite(), ..Default::default() };
+    if sign.is_some() && !st.finite {
+        return Some(st);
+    }
     // final norm backward: dx at the last checkpoint
     let (da, db) = (w.get("dx"), w.get("dmix"));
     to::run(c, &[
@@ -767,12 +856,78 @@ pub fn step(c: Ctx, net: &Net, w: &Work, ids: &[u32], tid: &[u32], tp: &[f32], k
     let mut nxt = db;
     for l in (0..g.nl).rev() {
         layer_fwd(c, net, w, l, &w.ckpt[l], w.get("x"))?;
-        layer_bwd(c, net, w, l, &w.ckpt[l], cur, nxt, gscale)?;
+        layer_bwd(c, net, w, l, &w.ckpt[l], cur, nxt, gscale, sign)?;
         std::mem::swap(&mut cur, &mut nxt);
     }
-    Some(StepStats { loss, finite: loss.is_finite() })
+    st.backward = true;
+    if let (Some(_), Some(sc)) = (sign, w.sg.as_ref()) {
+        let cnt = ts::read_reset_counters(c, sc)?;
+        for (i, f) in st.flips_role.iter_mut().enumerate() {
+            *f = cnt[i] as u64;
+        }
+        st.flips = st.flips_role.iter().sum();
+        st.g_nonfinite = cnt[ts::CNT_NONFINITE] as u64;
+        st.saturated = cnt[ts::CNT_SATURATED] as u64;
+        st.clamped = cnt[ts::CNT_CLAMPED] as u64;
+    }
+    Some(st)
 }
 
+/// Every sign matrix with its bitmap and counter slot, in [`Net::blr_lins`] order.
+fn sign_mats(net: &Net) -> Vec<(&ts::SignMat, &wgpu::Buffer, u32)> {
+    let mut v = Vec::new();
+    for (_, lin) in net.blr_lins() {
+        if let Lin::Blr { blr, role, .. } = lin {
+            let rid = ts::role_id(role);
+            for p in &blr.paths {
+                if let Some(sp) = &p.sign {
+                    v.push((&sp.u, &p.bits_u, 2 * rid));
+                    v.push((&sp.v, &p.bits_v, 2 * rid + 1));
+                }
+            }
+        }
+    }
+    v
+}
+
+/// Deferred mode (tests): apply every matrix's update from the gradient
+/// its backward saved; returns the flips per counter slot.
+pub fn apply_deferred(c: Ctx, net: &Net, w: &Work, cfg: &SignStepCfg) -> Option<[u32; ts::CNT_LEN]> {
+    let sc = w.sg.as_ref()?;
+    ts::reset_counters(c, sc);
+    for (mat, bits, slot) in sign_mats(net) {
+        ts::apply_deferred(c, cfg, sc, mat, bits, slot)?;
+    }
+    ts::read_reset_counters(c, sc)
+}
+
+/// Distinct flips against the starting bits per role and side:
+/// (`role.U` / `role.V`, flipped, live). Needs `SignInit::keep_bits0`.
+pub fn sign_stats(c: Ctx, net: &Net) -> Option<Vec<(String, u64, u64)>> {
+    let mats = sign_mats(net);
+    if mats.is_empty() {
+        return Some(Vec::new());
+    }
+    let diff = to::zeros_u32(c, net.n_sign_mats as usize);
+    // one submission per batch of matrices keeps the bind groups bounded
+    for chunk in mats.chunks(64) {
+        let ds: Vec<_> = chunk.iter().map(|(mat, bits, _)| ts::bits_diff_op(c, mat, bits, &diff, mat.id)).collect::<Option<Vec<_>>>()?;
+        to::run(c, &ds);
+    }
+    let dv = to::download_u32(c, &diff, net.n_sign_mats as usize)?;
+    let mut acc = [(0u64, 0u64); 20];
+    for (mat, _, slot) in &mats {
+        acc[*slot as usize].0 += dv[mat.id as usize] as u64;
+        acc[*slot as usize].1 += mat.live();
+    }
+    Some(
+        acc.iter()
+            .enumerate()
+            .filter(|(_, (_, live))| *live > 0)
+            .map(|(i, &(f, live))| (format!("{}.{}", ts::ROLES[i / 2], ["U", "V"][i % 2]), f, live))
+            .collect(),
+    )
+}
 /// Global gradient norm over every parameter (NaN/inf when a gradient is).
 pub fn grad_norm(c: Ctx, net: &Net) -> Option<f64> {
     let mut s = 0f64;
@@ -800,21 +955,48 @@ pub fn adam(c: Ctx, net: &Net, lr: f32, step_no: u32, b1: f32, b2: f32, eps: f32
     Some(())
 }
 
-/// Host copy of every parameter's values (best-checkpoint keeping).
-pub fn snapshot(c: Ctx, net: &Net) -> Option<Vec<Vec<f32>>> {
-    net.params().iter().map(|p| to::download(c, &p.w, p.n)).collect()
+/// Host copy of every parameter's values and every sign bitmap
+/// (best-checkpoint keeping).
+pub struct Snap {
+    pub params: Vec<Vec<f32>>,
+    pub bits: Vec<Vec<u32>>,
+}
+
+/// Every path's bitmaps (U then V) with their word counts, in [`Net::blr_lins`] order.
+fn bitmaps(net: &Net) -> Vec<(&wgpu::Buffer, usize)> {
+    let mut v = Vec::new();
+    for (_, lin) in net.blr_lins() {
+        if let Lin::Blr { blr, .. } = lin {
+            for p in &blr.paths {
+                v.push((&p.bits_u, blr.m * blr.r / 32));
+                v.push((&p.bits_v, blr.n * blr.r / 32));
+            }
+        }
+    }
+    v
+}
+
+/// `with_bits`: also copy the sign bitmaps (sign training).
+pub fn snapshot(c: Ctx, net: &Net, with_bits: bool) -> Option<Snap> {
+    let params = net.params().iter().map(|p| to::download(c, &p.w, p.n)).collect::<Option<Vec<_>>>()?;
+    let bits = if with_bits { bitmaps(net).iter().map(|(b, n)| to::download_u32(c, b, *n)).collect::<Option<Vec<_>>>()? } else { Vec::new() };
+    Some(Snap { params, bits })
 }
 
 /// Restore a [`snapshot`].
-pub fn restore(c: Ctx, net: &Net, snap: &[Vec<f32>]) {
-    for (p, v) in net.params().iter().zip(snap) {
+pub fn restore(c: Ctx, net: &Net, snap: &Snap) {
+    for (p, v) in net.params().iter().zip(&snap.params) {
         c.queue.write_buffer(&p.w, 0, bytemuck::cast_slice(v));
     }
+    for ((b, _), v) in bitmaps(net).iter().zip(&snap.bits) {
+        c.queue.write_buffer(b, 0, bytemuck::cast_slice(v));
+    }
+    c.queue.submit(std::iter::empty());
 }
 
-/// Copy the trained metric of every binary low-rank tensor and every norm
-/// gain back into payloads of `model` (same layout and sizes): returns
-/// (tensor name, new bytes) for every changed entry.
+/// Copy the trained metric and the sign bits of every binary low-rank tensor
+/// and every norm gain back into payloads of `model` (same layout and
+/// sizes): returns (tensor name, new bytes) for every changed entry.
 pub fn export(c: Ctx, net: &Net, model: &CmfModel) -> Result<Vec<(String, Vec<u8>)>, String> {
     let mut out = Vec::new();
     let to_bytes_f16 = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|&f| f32_to_f16(f).to_le_bytes()).collect() };
@@ -839,14 +1021,18 @@ pub fn export(c: Ctx, net: &Net, model: &CmfModel) -> Result<Vec<(String, Vec<u8
             norm(format!("{p}self_attn.k_norm.weight"), kn)?;
         }
     }
-    let mut blr = |name: String, lin: &Lin| -> Result<(), String> {
-        let Lin::Blr { blr, params, .. } = lin else { return Ok(()) };
+    for (name, lin) in net.blr_lins() {
+        let Lin::Blr { blr, params, .. } = lin else { continue };
         let e = model.tensor(&name).ok_or_else(|| format!("missing {name}"))?;
         let mut bytes = model.entry_bytes(e).to_vec();
         let r = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
         let (m, n) = (blr.m, blr.n);
+        if r % 8 != 0 || n % 8 != 0 {
+            return Err(format!("{name}: rank {r} / width {n} not byte-aligned"));
+        }
+        let wpr = blr.r / 32;
         let mut off = 16;
-        for pr in params {
+        for (pr, path) in params.iter().zip(&blr.paths) {
             let h = to::download(c, &pr[0].w, m).ok_or("download")?;
             let l = to::download(c, &pr[1].w, pr[1].n).ok_or("download")?;
             let g = to::download(c, &pr[2].w, n).ok_or("download")?;
@@ -855,31 +1041,50 @@ pub fn export(c: Ctx, net: &Net, model: &CmfModel) -> Result<Vec<(String, Vec<u8
             bytes[off..off + 2 * n].copy_from_slice(&to_bytes_f16(&g));
             off += 2 * n;
             bytes[off..off + 2 * r].copy_from_slice(&to_bytes_f16(&l[..r]));
-            off += 2 * r + m * r / 8 + r * n / 8;
+            off += 2 * r;
+            // signs: U [m][r/8] (rank-minor), V [r][n/8] (rank-major); pad ranks never written
+            let bu = to::download_u32(c, &path.bits_u, m * wpr).ok_or("download")?;
+            u_bits_to_file(&bu, m, r, wpr, &mut bytes[off..off + m * r / 8]);
+            off += m * r / 8;
+            let bv = to::download_u32(c, &path.bits_v, n * wpr).ok_or("download")?;
+            v_bits_to_file(&bv, n, r, wpr, &mut bytes[off..off + r * n / 8]);
+            off += r * n / 8;
         }
         out.push((name, bytes));
-        Ok(())
-    };
-    for (li, ly) in net.layers.iter().enumerate() {
-        let p = format!("model.layers.{li}.");
-        match &ly.mix {
-            Mix::Gdn { qkv, z, out: o, .. } => {
-                blr(format!("{p}linear_attn.in_proj_qkv.weight"), qkv)?;
-                blr(format!("{p}linear_attn.in_proj_z.weight"), z)?;
-                blr(format!("{p}linear_attn.out_proj.weight"), o)?;
-            }
-            Mix::Attn { q, k, v, o, .. } => {
-                blr(format!("{p}self_attn.q_proj.weight"), q)?;
-                blr(format!("{p}self_attn.k_proj.weight"), k)?;
-                blr(format!("{p}self_attn.v_proj.weight"), v)?;
-                blr(format!("{p}self_attn.o_proj.weight"), o)?;
-            }
-        }
-        blr(format!("{p}mlp.gate_proj.weight"), &ly.gate)?;
-        blr(format!("{p}mlp.up_proj.weight"), &ly.up)?;
-        blr(format!("{p}mlp.down_proj.weight"), &ly.down)?;
     }
     Ok(out)
+}
+
+/// Device U bitmap `[m][wpr]` → file `[m][r/8]` (byte b of row i = ranks 8b..8b+7).
+fn u_bits_to_file(bu: &[u32], m: usize, r: usize, wpr: usize, out: &mut [u8]) {
+    for i in 0..m {
+        for b in 0..r / 8 {
+            out[i * r / 8 + b] = ((bu[i * wpr + (8 * b) / 32] >> ((8 * b) % 32)) & 0xff) as u8;
+        }
+    }
+}
+
+/// Device V bitmap `[n][wpr]` (rank bits per input row) → file `[r][n/8]`
+/// (input bits per rank): a bit transpose, parallel over ranks.
+fn v_bits_to_file(bv: &[u32], n: usize, r: usize, wpr: usize, out: &mut [u8]) {
+    let row = n / 8;
+    let lanes = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(4).min(16);
+    let per = r.div_ceil(lanes).max(1);
+    std::thread::scope(|sc| {
+        for (ci, chunk) in out.chunks_mut(per * row).enumerate() {
+            sc.spawn(move || {
+                for (kk, dst) in chunk.chunks_mut(row).enumerate() {
+                    let k = ci * per + kk;
+                    dst.fill(0);
+                    for j in 0..n {
+                        if (bv[j * wpr + k / 32] >> (k % 32)) & 1 == 1 {
+                            dst[j / 8] |= 1 << (j % 8);
+                        }
+                    }
+                }
+            });
+        }
+    });
 }
 
 /// Mean KL of `ids` against the teacher top-k (forward only).
@@ -908,8 +1113,8 @@ mod tests {
         let Ok(path) = std::env::var("CMF_TRAIN_TEST_MODEL") else { return };
         let Some(c) = to::dev() else { return };
         let model = CmfModel::open_sharded(&path).expect("model");
-        let teacher = Net::load(c, &model, true, false).expect("teacher");
-        let student = Net::load(c, &model, true, true).expect("student");
+        let teacher = Net::load(c, &model, true, false, None).expect("teacher");
+        let student = Net::load(c, &model, true, true, None).expect("student");
         let (nb, t, k) = (2usize, 64usize, 32usize);
         let w = Work::new(c, &teacher, nb, t);
         let vocab = teacher.geom.vocab as u64;
@@ -920,7 +1125,7 @@ mod tests {
         let ln = to::download(c, &student.layers[0].ln1.w, hs).unwrap();
         let pert: Vec<f32> = ln.iter().map(|v| v * 1.03).collect();
         c.queue.write_buffer(&student.layers[0].ln1.w, 0, bytemuck::cast_slice(&pert));
-        let st = step(c, &student, &w, &ids, &tid, &tp, k, 1024.0).expect("step");
+        let st = step(c, &student, &w, &ids, &tid, &tp, k, 1024.0, None).expect("step");
         eprintln!("loss {:.6}", st.loss);
         let g_ln = to::download(c, &student.layers[0].ln1.g, hs).unwrap();
         let g_fin = to::download(c, &student.final_norm.g, hs).unwrap();
@@ -945,5 +1150,186 @@ mod tests {
                 eprintln!("{name}[{j}]: analytic {:.5e}  fd(2%) {:.5e}  fd(8%) {:.5e}", grad[j], fds[0], fds[1]);
             }
         }
+    }
+
+    /// Teacher top-k on one small batch of the 0.8B check models
+    /// (`CMF_TRAIN_TEST_BLR` = blr student, `CMF_TRAIN_TEST_TEACHER` = its teacher).
+    #[allow(clippy::type_complexity)]
+    fn blr_fixture(sign: Option<&SignInit>) -> Option<(Ctx, CmfModel, Net, Work, Vec<u32>, Vec<u32>, Vec<f32>, usize)> {
+        let sp = std::env::var("CMF_TRAIN_TEST_BLR").ok()?;
+        let tp_path = std::env::var("CMF_TRAIN_TEST_TEACHER").ok()?;
+        let c = to::dev()?;
+        let (nb, t, k) = (2usize, 64usize, 32usize);
+        let ids: Vec<u32>;
+        let (tid, tp);
+        {
+            let tmodel = CmfModel::open_sharded(&tp_path).expect("teacher model");
+            let teacher = Net::load(c, &tmodel, true, false, None).expect("teacher");
+            let tw = Work::new(c, &teacher, nb, t);
+            let vocab = teacher.geom.vocab as u64;
+            ids = (0..(nb * t) as u64).map(|i| ((i * 7919 + 13) % vocab.min(30000)) as u32).collect();
+            (tid, tp) = teacher_topk(c, &teacher, &tw, &ids, k).expect("topk");
+        }
+        let smodel = CmfModel::open_sharded(&sp).expect("student model");
+        let student = Net::load(c, &smodel, true, true, sign).expect("student");
+        let w = Work::new(c, &student, nb, t);
+        Some((c, smodel, student, w, ids, tid, tp, k))
+    }
+
+    fn sign_cfg(eta: f32, defer: bool) -> SignStepCfg {
+        SignStepCfg { opt: ts::SignOpt::Fact, eta, step: 1, b1: 0.9, b2: 0.999, eps: 1e-3, clamp: 4.0, hyst: 0.0, k_ss: 8.0, seed: 42, defer }
+    }
+
+    fn grads(c: Ctx, net: &Net) -> Vec<Vec<u32>> {
+        net.params().iter().map(|p| to::download_u32(c, &p.g, p.n).unwrap()).collect()
+    }
+
+    /// With η = 0 the sign ops change nothing the metric path reads: bits
+    /// unchanged, loss and every metric gradient bit-identical to a step
+    /// without sign training (guards buffer aliasing and hazards).
+    #[test]
+    #[ignore]
+    fn step_sign_lr0_equals_metric_only() {
+        let init = SignInit { opt: ts::SignOpt::Fact, tau: 0.25, seed: 42, keep_bits0: true, defer: false };
+        let Some((c, _m, net, w, ids, tid, tp, k)) = blr_fixture(Some(&init)) else { return };
+        let b0 = snapshot(c, &net, true).unwrap().bits;
+        let a = step(c, &net, &w, &ids, &tid, &tp, k, 1024.0, None).unwrap();
+        let ga = grads(c, &net);
+        zero_grads(c, &net);
+        let b = step(c, &net, &w, &ids, &tid, &tp, k, 1024.0, Some(&sign_cfg(0.0, false))).unwrap();
+        let gb = grads(c, &net);
+        let b1 = snapshot(c, &net, true).unwrap().bits;
+        let gdiff: usize = ga.iter().zip(&gb).map(|(x, y)| x.iter().zip(y).filter(|(p, q)| p != q).count()).sum();
+        let bdiff: usize = b0.iter().zip(&b1).map(|(x, y)| x.iter().zip(y).filter(|(p, q)| p != q).count()).sum();
+        eprintln!("loss {:.9} vs {:.9}; metric-gradient words differing {gdiff}; bitmap words differing {bdiff}; flips {}", a.loss, b.loss, b.flips);
+        assert_eq!(a.loss.to_bits(), b.loss.to_bits());
+        assert_eq!(gdiff, 0);
+        assert_eq!(bdiff, 0);
+        assert_eq!(b.flips, 0);
+        let st = sign_stats(c, &net).unwrap();
+        assert!(st.iter().all(|(_, f, _)| *f == 0));
+    }
+
+    /// Latent words and bitmaps of every sign matrix (fused vs deferred comparison).
+    fn sign_state(c: Ctx, net: &Net) -> Vec<Vec<u32>> {
+        let mut v = Vec::new();
+        for (mat, bits, _) in sign_mats(net) {
+            v.push(to::download_u32(c, &mat.lat, mat.lat_words()).unwrap());
+            v.push(to::download_u32(c, bits, mat.rows * mat.wpr()).unwrap());
+            v.push(to::download_u32(c, &mat.vrow, mat.rows).unwrap());
+            v.push(to::download_u32(c, &mat.vcol, mat.rp).unwrap());
+        }
+        v
+    }
+
+    fn set_sign_state(c: Ctx, net: &Net, st: &[Vec<u32>]) {
+        for ((mat, bits, _), ch) in sign_mats(net).iter().zip(st.chunks(4)) {
+            c.queue.write_buffer(&mat.lat, 0, bytemuck::cast_slice(&ch[0]));
+            c.queue.write_buffer(bits, 0, bytemuck::cast_slice(&ch[1]));
+            c.queue.write_buffer(&mat.vrow, 0, bytemuck::cast_slice(&ch[2]));
+            c.queue.write_buffer(&mat.vcol, 0, bytemuck::cast_slice(&ch[3]));
+        }
+        c.queue.submit(std::iter::empty());
+    }
+
+    /// The in-place update inside the reverse sweep equals updating every
+    /// matrix after the sweep from saved gradients: identical bits and latents.
+    #[test]
+    #[ignore]
+    fn fused_equals_deferred() {
+        let init = SignInit { opt: ts::SignOpt::Fact, tau: 0.25, seed: 42, keep_bits0: true, defer: true };
+        let Some((c, _m, net, w, ids, tid, tp, k)) = blr_fixture(Some(&init)) else { return };
+        let s0 = sign_state(c, &net);
+        let a = step(c, &net, &w, &ids, &tid, &tp, k, 1024.0, Some(&sign_cfg(1e-2, false))).unwrap();
+        let sa = sign_state(c, &net);
+        set_sign_state(c, &net, &s0);
+        zero_grads(c, &net);
+        let b = step(c, &net, &w, &ids, &tid, &tp, k, 1024.0, Some(&sign_cfg(1e-2, true))).unwrap();
+        let cnt = apply_deferred(c, &net, &w, &sign_cfg(1e-2, true)).unwrap();
+        let sb = sign_state(c, &net);
+        let fl_b: u64 = cnt[..20].iter().map(|&x| x as u64).sum();
+        let diff: usize = sa.iter().zip(&sb).map(|(x, y)| x.iter().zip(y).filter(|(p, q)| p != q).count()).sum();
+        let live = net.sign_live();
+        eprintln!("loss {:.6} / {:.6}; flips fused {} deferred {fl_b} of {live} signs; state words differing {diff}", a.loss, b.loss, a.flips);
+        assert!(a.flips > 0);
+        assert_eq!(a.flips, fl_b);
+        assert_eq!(diff, 0);
+    }
+
+    /// Export writes the bits: no training → payloads byte-identical; known
+    /// flips survive export and a reload of the payload.
+    #[test]
+    #[ignore]
+    fn export_bits_roundtrip() {
+        let Some((c, model, net, _w, ..)) = blr_fixture(None) else { return };
+        let out = export(c, &net, &model).unwrap();
+        let mut nblr = 0;
+        for (name, bytes) in &out {
+            let e = model.tensor(name).unwrap();
+            assert_eq!(bytes.as_slice(), model.entry_bytes(e), "{name} changed without training");
+            nblr += (e.dtype as u8 == 19) as usize;
+        }
+        // flip known bits of the first blr tensor's first path
+        let (name, lin) = net.blr_lins().into_iter().next().unwrap();
+        let Lin::Blr { blr, role, .. } = lin else { unreachable!() };
+        let p0 = &blr.paths[0];
+        let wpr = blr.r / 32;
+        let mut bu = to::download_u32(c, &p0.bits_u, blr.m * wpr).unwrap();
+        let mut bv = to::download_u32(c, &p0.bits_v, blr.n * wpr).unwrap();
+        for &(i, k) in &[(0usize, 0usize), (3, 5), (blr.m - 1, 9), (10, 31)] {
+            bu[i * wpr + k / 32] ^= 1 << (k % 32);
+        }
+        for &(j, k) in &[(0usize, 0usize), (7, 9), (blr.n - 1, 33), (100, 1)] {
+            bv[j * wpr + k / 32] ^= 1 << (k % 32);
+        }
+        c.queue.write_buffer(&p0.bits_u, 0, bytemuck::cast_slice(&bu));
+        c.queue.write_buffer(&p0.bits_v, 0, bytemuck::cast_slice(&bv));
+        let out = export(c, &net, &model).unwrap();
+        let bytes = &out.iter().find(|(n, _)| *n == name).unwrap().1;
+        let re = load_blr(c, bytes, role, None, &mut 0).unwrap();
+        let Lin::Blr { blr: rb, .. } = &re else { unreachable!() };
+        let ru = to::download_u32(c, &rb.paths[0].bits_u, blr.m * wpr).unwrap();
+        let rv = to::download_u32(c, &rb.paths[0].bits_v, blr.n * wpr).unwrap();
+        eprintln!("{nblr} blr payloads round-tripped; {name}: reloaded U equal {}, V equal {}", ru == bu, rv == bv);
+        assert_eq!(ru, bu);
+        assert_eq!(rv, bv);
+    }
+
+    /// On the real network: flipping one of the 32 largest-|G| signs of the
+    /// layer-0 gate changes the loss in the direction −2s·G predicts for at
+    /// least 90 % of them.
+    #[test]
+    #[ignore]
+    fn net_sign_flip_check() {
+        let init = SignInit { opt: ts::SignOpt::Fact, tau: 0.25, seed: 42, keep_bits0: true, defer: true };
+        let Some((c, _m, net, w, ids, tid, tp, k)) = blr_fixture(Some(&init)) else { return };
+        let st = step(c, &net, &w, &ids, &tid, &tp, k, 1024.0, Some(&sign_cfg(0.0, true))).unwrap();
+        let Lin::Blr { blr, .. } = &net.layers[0].gate else { panic!("layer-0 gate is not blr") };
+        let p0 = &blr.paths[0];
+        let sp = p0.sign.as_ref().unwrap();
+        let (rows, rp, r) = (sp.u.rows, sp.u.rp, sp.u.r_true);
+        let g = to::download(c, sp.u.gsave.as_ref().unwrap(), rows * rp).unwrap();
+        let bits = to::download_u32(c, &p0.bits_u, rows * rp / 32).unwrap();
+        let mut idx: Vec<usize> = (0..rows * rp).filter(|e| e % rp < r).collect();
+        idx.sort_by(|&a, &b| g[b].abs().partial_cmp(&g[a].abs()).unwrap());
+        let base = loss_only(c, &net, &w, &ids, &tid, &tp, k).unwrap();
+        eprintln!("loss {:.6} (step {:.6})", base, st.loss);
+        let mut agree = 0;
+        for &e in idx.iter().take(32) {
+            let (i, kk) = (e / rp, e % rp);
+            let word = i * (rp / 32) + kk / 32;
+            let s = if (bits[word] >> (kk % 32)) & 1 == 1 { 1.0 } else { -1.0 };
+            let mut fl = bits.clone();
+            fl[word] ^= 1 << (kk % 32);
+            c.queue.write_buffer(&p0.bits_u, 0, bytemuck::cast_slice(&fl));
+            let l1 = loss_only(c, &net, &w, &ids, &tid, &tp, k).unwrap();
+            c.queue.write_buffer(&p0.bits_u, 0, bytemuck::cast_slice(&bits));
+            let pred = -2.0 * s * g[e] as f64;
+            let meas = l1 - base;
+            agree += (meas.signum() == pred.signum()) as usize;
+            eprintln!("  U[{i},{kk}] G {:+.3e}  ΔL {meas:+.3e}  first-order {pred:+.3e}", g[e]);
+        }
+        eprintln!("sign agreement {agree}/32");
+        assert!(agree >= 29, "only {agree}/32 flips moved the loss as predicted");
     }
 }
