@@ -334,16 +334,21 @@ threaded; read `attention_other` in the `CMF_DSV41_PROF` report.
 
 - act_quant(o) on the device tail (Part 4 above); `CMF_DSV41_O_FP8=1` no
   longer forces the CPU tail. Still off by default.
-- `dsv4_global_moe_create_for_dsv41` picks S16 on its own when the request,
-  after the workspace carve-out, exceeds what eight segment buffers address
-  (`per_segment` = binding range / max(gu_len, d_len)) and the adapter is
-  S16-capable, building the S16 pipelines on first need. The decision is the
-  one `dsv4_global_moe_create_slots` already made, now shared
-  (`dsv4_global_moe_pick_segments`). `CMF_DSV41_GLOBAL_SEGMENTS=8` forces S8,
-  `=16` keeps the eager opt-in. One `tracing` info line per process names
-  the family and capacity. Release geometry on a 2 GiB binding range: S8
-  addresses 2792 slots; a 3900-slot request gets 3888 under S16. On the M4
-  the fixture bank stays S8 (budget-limited); `=16` gives identical logits.
+- `dsv4_global_moe_create_for_dsv41` picks S16 on its own when S16 holds
+  more of the request, after the workspace carve-out, than S8
+  (`dsv41_auto_wants_s16`), i.e. past what eight segment buffers address
+  (`per_segment` = binding range / max(gu_len, d_len)) by at least one
+  whole 16-slot segment, and the adapter is S16-capable, building the S16
+  pipelines on first need (`dsv4_global_moe_pick_segments`, shared with
+  `dsv4_global_moe_create_slots`). If the larger S16 bank then fails the
+  residency budget, it retries with S8. `CMF_DSV41_GLOBAL_SEGMENTS=8`
+  forces S8, `=16` keeps the eager opt-in. One `tracing` info line per
+  process names the family and capacity. Release geometry on a 2 GiB
+  binding range: S8 addresses 2792 slots; 2793..2799 wanted slots stay S8
+  (S16 would hold 2784), from 2800 S16; a 3900-slot request gets 3888 under
+  S16. On the M4 the fixture bank stays S8 (budget-limited); `=16` gives
+  identical logits. The Auto S16 device path itself has not run anywhere
+  (it needs a card whose budget passes S8's capacity, e.g. 96 GB).
 - GPU fixture: device-path counters asserted, both bank layouts, bound from
   a mutation check (GPU section above); `dsv41::profile_counters()`. The
   O_FP8 binary also asserts the kernel encodes and the frame's act_quant(o)
