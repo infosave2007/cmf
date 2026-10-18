@@ -20754,6 +20754,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let pcache = pipeline_cache_load(&device, &info, want_pcache);
     // Auto layout: the bind group layout is inferred from the shader.
     let pipe = |ep: &str| {
+        trace_pipeline(ep);
         device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(ep),
             layout: None, // auto: layout is inferred from the shader
@@ -20780,6 +20781,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         ("Q1_WG", (q1_rows * 16) as f64),
         ("Q1_ROWS", q1_rows as f64),
     ];
+    trace_pipeline("q1_matvec");
     let q1 = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("q1_matvec"),
         layout: None,
@@ -20791,6 +20793,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         },
         cache: pcache.as_ref(),
     });
+    trace_pipeline("q1g_matvec");
     let q1g = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("q1g_matvec"),
         layout: None,
@@ -20903,6 +20906,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
                 return None;
             }
             let sc = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            trace_pipeline("q4tp_mm_coop");
             let p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("q4tp_mm_coop"),
                 layout: None,
@@ -20939,6 +20943,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
             return None;
         }
         let sc = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        trace_pipeline(entry);
         let p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(entry),
             layout: None,
@@ -21017,6 +21022,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
             return None;
         }
         let sc = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        trace_pipeline(entry);
         let p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(entry),
             layout: None,
@@ -21043,6 +21049,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
             label: Some(mod_label),
             source: wgpu::ShaderSource::Wgsl(src.into()),
         });
+        trace_pipeline(entry);
         device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(entry),
             layout: None,
@@ -21166,6 +21173,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
             label: Some("cmf-pair-v4"),
             source: wgpu::ShaderSource::Wgsl(PAIR_V4_SRC.into()),
         });
+        trace_pipeline("matvec_pair_v4");
         device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("matvec_pair_v4"),
             layout: None,
@@ -21193,6 +21201,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let q4tp_mv4_bk8: Vec<wgpu::ComputePipeline> = (0..=8u32)
         .map(|nb| {
             let cs = [("NB8", nb.clamp(2, 8) as f64)];
+            trace_pipeline("q4tp_matvec4_bk8");
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("q4tp_matvec4_bk8"),
                 layout: None,
@@ -21211,6 +21220,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
             (0..=8u32)
                 .map(|nb| {
                     let cs = [("NB8", nb.clamp(2, 8) as f64)];
+                    trace_pipeline("q4tp_matvec4_bk8s");
                     device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                         label: Some("q4tp_matvec4_bk8s"),
                         layout: None,
@@ -21228,6 +21238,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let q4tp_mv4_bk8h: Vec<wgpu::ComputePipeline> = (0..=8u32)
         .map(|nb| {
             let cs = [("NB8", nb.clamp(2, 8) as f64)];
+            trace_pipeline("q4tp_matvec4_bk8h");
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("q4tp_matvec4_bk8h"),
                 layout: None,
@@ -21298,6 +21309,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
                 None
             } else {
                 let sc = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                trace_pipeline("q2tp_matvec16w_sg");
                 let p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some("q2tp_matvec16w_sg"),
                     layout: None,
@@ -21430,6 +21442,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         source: wgpu::ShaderSource::Wgsl(ATTEND_SPLIT_SRC.into()),
     });
     let pipe_split = |ep: &str| {
+        trace_pipeline(ep);
         device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(ep),
             layout: None,
@@ -21465,6 +21478,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         } else {
             let sc = device.push_error_scope(wgpu::ErrorFilter::Validation);
             let px = |ep: &str| {
+                trace_pipeline(ep);
                 device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(ep),
                     layout: None,
@@ -21563,6 +21577,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
                     label: Some("q82-short"),
                     source: wgpu::ShaderSource::Wgsl(q82_short_source(rows).into()),
                 });
+                trace_pipeline("q82-short");
                 let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some("q82-short"), layout: None, module: &module,
                     entry_point: Some("q8_2f_matvec_b"),
@@ -22224,6 +22239,7 @@ fn build_global_moe_pipelines(
         immediate_size: 0,
     });
     let gp = |entry: &str| {
+        trace_pipeline(entry);
         device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(entry),
             layout: Some(if entry == "dsv4_global_down_q4tp" {
@@ -22242,6 +22258,19 @@ fn build_global_moe_pipelines(
         Some(gp("dsv4_global_gate_up_q2tp")),
         Some(gp("dsv4_global_down_q4tp")),
     )
+}
+
+/// `CMF_GPU_TRACE_PIPELINES=1`: name every startup pipeline on stderr
+/// (flushed) before the driver compiles it. A driver that dies inside a
+/// shader compile takes the process down without an error; the last line
+/// printed then names the shader.
+fn trace_pipeline(label: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var("CMF_GPU_TRACE_PIPELINES").is_ok_and(|v| v == "1")) {
+        use std::io::Write;
+        eprintln!("[cortiq] compiling GPU pipeline {label}");
+        let _ = std::io::stderr().flush();
+    }
 }
 
 fn pipeline_cache_load(
@@ -22269,7 +22298,9 @@ fn pipeline_cache_load(
         if had > 0 {
             format!("{had} B loaded")
         } else {
-            "empty, will compile".to_string()
+            "empty, will compile — if the process exits here without an error, the driver crashed in a \
+             shader compile: CMF_GPU_TRACE_PIPELINES=1 names the shader, CMF_GPU=0 runs on the CPU"
+                .to_string()
         },
         path.display()
     );

@@ -97,6 +97,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   vocabulary slices so a 248k-entry head fits the 2 GiB storage-binding
   limit; uploads are flushed per layer so a 27B teacher loads.
 
+### Fixed
+- A GPU driver that crashes while compiling a shader (reported on an AMD
+  Radeon RX 6600M under Windows, infosave2007/cmf#34) used to end the run
+  without a message. `CMF_GPU_TRACE_PIPELINES=1` now names every startup
+  pipeline before the driver compiles it, and the pipeline-cache line says
+  how to find the shader and that `CMF_GPU=0` runs on the CPU.
+
 ### Changed
 - The q2tp encoder (`convert --quant q2tp` and every other q2tp writer)
   now places each row ladder at the per-group MSE-optimal scale, searches
