@@ -49,6 +49,9 @@ struct P {
 @group(0) @binding(10) var<storage, read_write> CNT: array<atomic<u32>>;
 @group(0) @binding(11) var<storage, read_write> BITS0: array<u32>;
 @group(0) @binding(12) var<storage, read_write> GOUT: array<f32>;
+// CNT[CNT_SKIP] != 0: the step's loss is not finite — every sign-state write
+// is skipped (set by loss_flag; the per-step counter reset clears it).
+const CNT_SKIP: u32 = 63u;
 
 fn idx(g: vec3<u32>) -> u32 { return g.x + g.y * 65535u * 256u; }
 fn pcg(v: u32) -> u32 {
@@ -166,10 +169,27 @@ fn g_rowsq(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index
         }
         workgroupBarrier();
     }
-    if (t == 0u) {
+    if (t == 0u && atomicLoad(&CNT[CNT_SKIP]) == 0u) {
         VROW[row] = p.b2 * VROW[row] + (1.0 - p.b2) * (red[0] / f32(p.r));
         if (redn[0] > 0u) { atomicAdd(&CNT[40], redn[0]); }
     }
+}
+
+// CNT[CNT_SKIP] = 1 when any of the step's `rows` per-token losses (in G) is
+// not finite. One workgroup.
+@compute @workgroup_size(256)
+fn loss_flag(@builtin(local_invocation_index) t: u32) {
+    var bad = 0u;
+    for (var i = t; i < p.rows; i = i + 256u) {
+        if (!fin(G[i])) { bad = 1u; }
+    }
+    redn[t] = bad;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {
+        if (t < s) { redn[t] = max(redn[t], redn[t + s]); }
+        workgroupBarrier();
+    }
+    if (t == 0u && redn[0] != 0u) { atomicStore(&CNT[CNT_SKIP], 1u); }
 }
 
 // Column partial sums of G² over 512-row chunks: PART[chunk][col].
@@ -191,7 +211,7 @@ fn g_colsq(@builtin(global_invocation_id) g: vec3<u32>, @builtin(workgroup_id) w
 @compute @workgroup_size(256)
 fn g_colfin(@builtin(global_invocation_id) g: vec3<u32>) {
     let col = g.x;
-    if (col >= p.r) { return; }
+    if (col >= p.r || atomicLoad(&CNT[CNT_SKIP]) != 0u) { return; }
     var s = 0.0;
     for (var c = 0u; c < p.chunks; c = c + 1u) { s = s + PART[c * p.rp + col]; }
     VCOL[col] = p.b2 * VCOL[col] + (1.0 - p.b2) * (s / f32(p.rows));
@@ -208,10 +228,13 @@ fn g_cmean(@builtin(local_invocation_index) t: u32) {
         if (t < s) { red[t] = red[t] + red[t + s]; }
         workgroupBarrier();
     }
-    if (t == 0u) { SCAL[0] = red[0] / f32(p.r); }
+    if (t == 0u && atomicLoad(&CNT[CNT_SKIP]) == 0u) { SCAL[0] = red[0] / f32(p.r); }
 }
 
 var<workgroup> wflip: atomic<u32>;
+// CNT[CNT_SKIP] read once per workgroup (by wg_reset): one atomic load a
+// workgroup instead of one per thread on the same word.
+var<workgroup> wskip: u32;
 var<workgroup> wsat: atomic<u32>;
 var<workgroup> wclp: atomic<u32>;
 
@@ -231,6 +254,7 @@ fn wg_reset(t: u32) {
         atomicStore(&wflip, 0u);
         atomicStore(&wsat, 0u);
         atomicStore(&wclp, 0u);
+        wskip = atomicLoad(&CNT[CNT_SKIP]);
     }
     workgroupBarrier();
 }
@@ -240,7 +264,7 @@ fn wg_reset(t: u32) {
 fn sign_upd(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_index) t: u32) {
     wg_reset(t);
     let i = idx(g);
-    if (i < p.rows * p.wpr) {
+    if (i < p.rows * p.wpr && wskip == 0u) {
         let row = i / p.wpr;
         let w = i % p.wpr;
         let live = live_mask(w);
@@ -297,7 +321,7 @@ fn sign_upd(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocati
 fn sign_upd_mom(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_index) t: u32) {
     wg_reset(t);
     let i = idx(g);
-    if (i < p.rows * p.wpr) {
+    if (i < p.rows * p.wpr && wskip == 0u) {
         let row = i / p.wpr;
         let w = i % p.wpr;
         let live = live_mask(w);
@@ -361,7 +385,7 @@ fn sign_upd_mom(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invo
 fn sign_upd_ref(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_index) t: u32) {
     wg_reset(t);
     let i = idx(g);
-    if (i < p.rows * p.wpr) {
+    if (i < p.rows * p.wpr && wskip == 0u) {
         let row = i / p.wpr;
         let w = i % p.wpr;
         let live = live_mask(w);
@@ -431,7 +455,7 @@ fn module(c: &Ctx) -> Option<&'static train_ops::Mod> {
         c,
         "train_sign",
         SRC,
-        &["lat_init", "lat_init_f32", "g_rowsq", "g_colsq", "g_colfin", "g_cmean", "sign_upd", "sign_upd_mom", "sign_upd_ref", "bits_diff", "g_copy"],
+        &["lat_init", "lat_init_f32", "g_rowsq", "g_colsq", "g_colfin", "g_cmean", "sign_upd", "sign_upd_mom", "sign_upd_ref", "bits_diff", "g_copy", "loss_flag"],
     )
 }
 
@@ -489,7 +513,7 @@ fn sign_upd_mom2(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation
     let nw = subgroupBallot(nbit == 1u).x;
     let ns = subgroupAdd(sat);
     let nc = subgroupAdd(clp);
-    if (live != 0u) {
+    if (live != 0u && wskip == 0u) {
         if (h == 0u) {
             LAT[li] = qb | (qo << 16u);
             MOM[li] = mb | (mo << 16u);
@@ -797,8 +821,8 @@ pub fn update_ops<'a>(c: &'a Ctx, cfg: &SignStepCfg, sc: &'a SignScratch, mat: &
         bufs: vec![(1, g), (8, &sc.part)],
         grid: (rp.div_ceil(256) as u32, rows.div_ceil(512) as u32, 1),
     }));
-    ops.push(Op::D(Disp { pipe: &md.p["g_colfin"], uni: u.clone(), bufs: vec![(6, &mat.vcol), (8, &sc.part)], grid: (rp.div_ceil(256) as u32, 1, 1) }));
-    ops.push(Op::D(Disp { pipe: &md.p["g_cmean"], uni: u.clone(), bufs: vec![(6, &mat.vcol), (9, &sc.scal)], grid: (1, 1, 1) }));
+    ops.push(Op::D(Disp { pipe: &md.p["g_colfin"], uni: u.clone(), bufs: vec![(6, &mat.vcol), (8, &sc.part), (10, &sc.cnt)], grid: (rp.div_ceil(256) as u32, 1, 1) }));
+    ops.push(Op::D(Disp { pipe: &md.p["g_cmean"], uni: u.clone(), bufs: vec![(6, &mat.vcol), (9, &sc.scal), (10, &sc.cnt)], grid: (1, 1, 1) }));
     let mut bufs = vec![(1, g), (2, &mat.lat), (5, &mat.vrow), (6, &mat.vcol), (7, bits), (9, &sc.scal), (10, &sc.cnt)];
     if mat.opt == SignOpt::FactMom {
         bufs.push((3, mat.mom.as_ref()?));
@@ -849,6 +873,16 @@ pub fn bits_diff_op<'a>(c: &'a Ctx, mat: &'a SignMat, bits: &'a wgpu::Buffer, di
         bufs: vec![(7, bits), (10, diff), (11, mat.bits0.as_ref()?)],
         grid: elt_fold(mat.rows * mat.rp / 32),
     })
+}
+
+/// Flag the step's sign-state writes off when any of the `n` per-token
+/// losses in `loss` is not finite (decided on the card: the backward is
+/// queued without waiting for the loss).
+pub fn loss_flag_op<'a>(c: &'a Ctx, sc: &'a SignScratch, loss: &'a wgpu::Buffer, n: usize) -> Option<Disp<'a>> {
+    let md = module(c)?;
+    let mut u = vec![0u32; 20];
+    u[0] = n as u32;
+    Some(Disp { pipe: &md.p["loss_flag"], uni: u, bufs: vec![(1, loss), (10, &sc.cnt)], grid: (1, 1, 1) })
 }
 
 /// Read the step counters and zero them.

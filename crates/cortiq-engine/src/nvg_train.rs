@@ -971,12 +971,15 @@ pub fn step(c: Ctx, net: &Net, w: &Work, ids: &[u32], tid: &[u32], tp: &[f32], k
     c.queue.write_buffer(&btid, 0, bytemuck::cast_slice(tid));
     let btp = to::upload(c, tp);
     th::head_kl(c, &net.head, &w.head, w.get("n1"), &btid, &btp, k, w.get("dn1"), w.get("loss"), n, n, gscale)?;
-    let loss: f64 = to::download(c, w.get("loss"), n)?.iter().map(|&x| x as f64).sum::<f64>() / n as f64;
-    drop(ph);
-    let mut st = StepStats { loss, finite: loss.is_finite(), ..Default::default() };
-    if sign.is_some() && !st.finite {
-        return Some(st);
+    // The backward is queued without reading the loss back (that drain left
+    // the card idle): with sign training the card itself turns every
+    // sign-state write off when a loss is not finite, which is what skipping
+    // the backward did; the loss is read after the sweep.
+    if let (Some(_), Some(sc)) = (sign, w.sg.as_ref()) {
+        to::run(c, &[ts::loss_flag_op(c, sc, w.get("loss"), n)?]);
     }
+    drop(ph);
+    let mut st = StepStats::default();
     // final norm backward: dx at the last checkpoint
     let (da, db) = (w.get("dx"), w.get("dmix"));
     let ph = prof::phase("bwd.final_norm");
@@ -1005,6 +1008,13 @@ pub fn step(c: Ctx, net: &Net, w: &Work, ids: &[u32], tid: &[u32], tp: &[f32], k
         st.g_nonfinite = cnt[ts::CNT_NONFINITE] as u64;
         st.saturated = cnt[ts::CNT_SATURATED] as u64;
         st.clamped = cnt[ts::CNT_CLAMPED] as u64;
+    }
+    st.loss = to::download(c, w.get("loss"), n)?.iter().map(|&x| x as f64).sum::<f64>() / n as f64;
+    st.finite = st.loss.is_finite();
+    if sign.is_some() && !st.finite {
+        // the sign updates were skipped on the card: report the step as one
+        // without a backward, as before
+        st.backward = false;
     }
     Some(st)
 }
