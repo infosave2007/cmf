@@ -163,6 +163,44 @@ fn colsum_part(@builtin(global_invocation_id) g: vec3<u32>, @builtin(workgroup_i
     SRC[wg.y * p.k + col] = acc;
 }
 
+// colsum_part (A·B) fused with the elementwise op on one of its operands, so
+// that operand is read once: rows = 0: DST = f16(A·COL[col]·scale) (cvt_col of
+// A), 1: DST = f16(B·COL[col]·scale) (cvt_col of B), 2: OUT (+)= B·COL[col]
+// (scale_acc of B, pad1 = 1: accumulate). Same partials, same element ops.
+@compute @workgroup_size(256)
+fn colsum_fused(@builtin(global_invocation_id) g: vec3<u32>, @builtin(workgroup_id) wg: vec3<u32>) {
+    let col = g.x;
+    if (col >= p.k) { return; }
+    let r0 = wg.y * p.r;
+    let r1 = min(r0 + p.r, p.m);
+    let cf = COL[col];
+    var acc = 0.0;
+    if (p.rows == 0u) {
+        for (var row = r0; row < r1; row = row + 1u) {
+            let i = row * p.k + col;
+            let a = A[i];
+            acc = acc + a * B[i];
+            DST[i] = f16(a * cf * p.scale);
+        }
+    } else if (p.rows == 1u) {
+        for (var row = r0; row < r1; row = row + 1u) {
+            let i = row * p.k + col;
+            let b = B[i];
+            acc = acc + A[i] * b;
+            DST[i] = f16(b * cf * p.scale);
+        }
+    } else {
+        for (var row = r0; row < r1; row = row + 1u) {
+            let i = row * p.k + col;
+            let b = B[i];
+            acc = acc + A[i] * b;
+            let v = b * cf;
+            if (p.pad1 == 1u) { OUT[i] = OUT[i] + v; } else { OUT[i] = v; }
+        }
+    }
+    SRC[wg.y * p.k + col] = acc;
+}
+
 // Pass 2: OUT[col] (+)= Σ_blk SRC[blk][col]  (words = blocks, pad0 = 1: accumulate).
 @compute @workgroup_size(256)
 fn colsum_fin(@builtin(global_invocation_id) g: vec3<u32>) {
@@ -395,7 +433,7 @@ fn scale_acc(@builtin(global_invocation_id) g: vec3<u32>) {
 "#;
 
 fn module(c: &Ctx) -> Option<&'static train_ops::Mod> {
-    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "cvt_cols", "cvt_t", "expand", "expand_n", "expand_t", "colsum_prod", "colsum_part", "colsum_fin", "scale_acc", "dense_fwd", "dense_bwd", "dense_fwd_t", "dense_bwd_t", "split_qg", "adam", "sumsq", "adam_cat", "sumsq_cat"])
+    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "cvt_cols", "cvt_t", "expand", "expand_n", "expand_t", "colsum_prod", "colsum_part", "colsum_fin", "colsum_fused", "scale_acc", "dense_fwd", "dense_bwd", "dense_fwd_t", "dense_bwd_t", "split_qg", "adam", "sumsq", "adam_cat", "sumsq_cat"])
 }
 
 /// One step of a trainer pass: an elementwise/reduction dispatch or a GEMM.
@@ -616,6 +654,55 @@ pub fn expand1<'a>(c: &'a Ctx, bits: &'a wgpu::Buffer, pl: &'a wgpu::Buffer, row
         bufs: vec![(4, bits), (b, pl)],
         grid: elt_fold(rows * r),
     })
+}
+
+/// The elementwise op fused into a column reduction's first pass.
+#[derive(Clone, Copy)]
+pub enum Fuse<'a> {
+    /// `dst = f16(a·col·scale)` (the [`cvt`] of `a` with a column factor)
+    CvtA(&'a wgpu::Buffer, &'a wgpu::Buffer, f32),
+    /// `dst = f16(b·col·scale)`
+    CvtB(&'a wgpu::Buffer, &'a wgpu::Buffer, f32),
+    /// `out (+)= b·col` (the [`scale_acc`] of `b`)
+    ScaleB(&'a wgpu::Buffer, &'a wgpu::Buffer, bool),
+}
+
+/// `sum[k] += Σ_rows a·b` fused with one elementwise op on `a` or `b`
+/// (each operand read once). Same partials and element arithmetic as
+/// [`colsum_prod`] followed by the separate op; `None` where the separate
+/// ops must run (the f16 staging needs `m` = its padded row count).
+#[allow(clippy::too_many_arguments)]
+pub fn colsum_fused<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, b: &'a wgpu::Buffer, sum: &'a wgpu::Buffer, m: usize, k: usize, op: Fuse<'a>) -> Option<[Disp<'a>; 2]> {
+    let md = module(c)?;
+    if pad_rows(m) != m {
+        return None;
+    }
+    let rpb = 64usize.max(m.div_ceil(256));
+    let nblk = m.div_ceil(rpb).max(1);
+    if nblk * k > PART_WORDS {
+        return None;
+    }
+    let part = part_buf(c);
+    // DST (f16) and OUT (f32) are both statically bound; the one the mode
+    // does not write aliases the partials buffer
+    let (mode, col, scale, accf, dst, out): (u32, &wgpu::Buffer, f32, u32, &wgpu::Buffer, &wgpu::Buffer) = match op {
+        Fuse::CvtA(colv, dst, sc) => (0, colv, sc, 0, dst, part),
+        Fuse::CvtB(colv, dst, sc) => (1, colv, sc, 0, dst, part),
+        Fuse::ScaleB(colv, out, acc) => (2, colv, 1.0, acc as u32, part, out),
+    };
+    let p1 = Disp {
+        pipe: &md.p["colsum_fused"],
+        uni: vec![m as u32, k as u32, 0, mode, rpb as u32, 0, 0, accf, scale.to_bits(), 0, 0, 0],
+        bufs: vec![(1, part), (2, col), (3, dst), (7, a), (8, b), (9, out)],
+        grid: (k.div_ceil(256) as u32, nblk as u32, 1),
+    };
+    let p2 = Disp {
+        pipe: &md.p["colsum_fin"],
+        uni: vec![m as u32, k as u32, 0, 0, 0, nblk as u32, 1, 0, 0, 0, 0, 0],
+        bufs: vec![(1, part), (9, sum)],
+        grid: (k.div_ceil(256) as u32, 1, 1),
+    };
+    Some([p1, p2])
 }
 
 /// `out[k] += Σ_rows a[row][k]·b[row][k]` (two dispatches, see [`colsum`]).
@@ -914,24 +1001,35 @@ pub fn blr_forward(c: &Ctx, layer: &Blr, s: &BlrScratch, x: &wgpu::Buffer, y: &w
 pub fn blr_backward(c: &Ctx, layer: &Blr, s: &BlrScratch, x: &wgpu::Buffer, dy: &wgpu::Buffer, dx: &wgpu::Buffer, ntok: usize, gscale: f32, sign: Option<&train_sign::SignCtx>) -> Option<()> {
     let (m, n, r) = (layer.m, layer.n, layer.r);
     for (pi, p) in layer.paths.iter().enumerate() {
-        let [dh1, dh2] = colsum_prod(c, dy, &s.cbuf[pi], &p.dh, ntok, m)?;
-        let [dl1, dl2] = colsum_prod(c, &s.a[pi], &s.t2, &p.dl, ntok, r)?;
-        let [dg1, dg2] = colsum_prod(c, x, &s.t1, &p.dg, ntok, n)?;
         let mut ops = vec![
             Op::D(expand1(c, &p.bits_u, &s.plt_u, m, r, true)?),
             Op::D(expand1(c, &p.bits_v, &s.pl_v, n, r, false)?),
-            Op::D(dh1),
-            Op::D(dh2),
-            Op::D(cvt(c, dy, Some(&p.h), &s.xh, ntok, m, gscale)?),
-            Op::M(mm(c, &s.plt_u, &s.xh, &s.t2, ntok, r, m, 1.0 / gscale)?),
-            Op::D(dl1),
-            Op::D(dl2),
-            Op::D(cvt(c, &s.t2, Some(&p.l), &s.xh, ntok, r, gscale)?),
-            Op::M(mm(c, &s.pl_v, &s.xh, &s.t1, ntok, n, r, 1.0 / gscale)?),
-            Op::D(dg1),
-            Op::D(dg2),
-            Op::D(scale_acc(c, &s.t1, &p.g, dx, ntok, n, pi > 0)?),
         ];
+        // each column reduction fused with the elementwise op that reads the
+        // same operand (dy, t2, t1 read once); separate ops where it cannot
+        match colsum_fused(c, dy, &s.cbuf[pi], &p.dh, ntok, m, Fuse::CvtA(&p.h, &s.xh, gscale)) {
+            Some([a, b]) => ops.extend([Op::D(a), Op::D(b)]),
+            None => {
+                let [a, b] = colsum_prod(c, dy, &s.cbuf[pi], &p.dh, ntok, m)?;
+                ops.extend([Op::D(a), Op::D(b), Op::D(cvt(c, dy, Some(&p.h), &s.xh, ntok, m, gscale)?)]);
+            }
+        }
+        ops.push(Op::M(mm(c, &s.plt_u, &s.xh, &s.t2, ntok, r, m, 1.0 / gscale)?));
+        match colsum_fused(c, &s.a[pi], &s.t2, &p.dl, ntok, r, Fuse::CvtB(&p.l, &s.xh, gscale)) {
+            Some([a, b]) => ops.extend([Op::D(a), Op::D(b)]),
+            None => {
+                let [a, b] = colsum_prod(c, &s.a[pi], &s.t2, &p.dl, ntok, r)?;
+                ops.extend([Op::D(a), Op::D(b), Op::D(cvt(c, &s.t2, Some(&p.l), &s.xh, ntok, r, gscale)?)]);
+            }
+        }
+        ops.push(Op::M(mm(c, &s.pl_v, &s.xh, &s.t1, ntok, n, r, 1.0 / gscale)?));
+        match colsum_fused(c, x, &s.t1, &p.dg, ntok, n, Fuse::ScaleB(&p.g, dx, pi > 0)) {
+            Some([a, b]) => ops.extend([Op::D(a), Op::D(b)]),
+            None => {
+                let [a, b] = colsum_prod(c, x, &s.t1, &p.dg, ntok, n)?;
+                ops.extend([Op::D(a), Op::D(b), Op::D(scale_acc(c, &s.t1, &p.g, dx, ntok, n, pi > 0)?)]);
+            }
+        }
         let sign_from = ops.len();
         if let (Some(ctx), Some(sp)) = (sign, p.sign.as_ref()) {
             let sc = ctx.sc;
