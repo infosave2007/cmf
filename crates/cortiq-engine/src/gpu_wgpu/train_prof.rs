@@ -500,7 +500,7 @@ fn family(kern: &str) -> &'static str {
     }
     match k {
         "mm" => "gemm",
-        "expand" => "blr.expand",
+        "expand" | "expand_n" | "expand_t" => "blr.expand",
         "cvt" | "cvt_col" | "cvt_cols" => "stage.cvt",
         "scale_acc" => "blr.scale_acc",
         "colsum_prod" | "colsum_part" | "colsum_fin" => "colsum(all)",
