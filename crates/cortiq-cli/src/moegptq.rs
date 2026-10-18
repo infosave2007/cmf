@@ -1721,6 +1721,30 @@ mod tests {
         x
     }
 
+    /// Flash-Next capture rows → f16 inputs and the top-k of the f16-rounded
+    /// router logits (the routing the Flash-Next path always used).
+    #[test]
+    fn qwen4_rows_route_by_f16_logit_topk() {
+        let (hidden, ne, top_k, n) = (8usize, 12usize, 3usize, 50usize);
+        let mut rng = Rng(5);
+        let r: Vec<f32> = (0..n * (hidden + ne)).map(|_| rng.normal()).collect();
+        let mut out = LayerRows { x: Vec::new(), picks: Vec::new() };
+        qwen4_layer_rows(&r, hidden, ne, top_k, &mut out);
+        assert_eq!((out.x.len(), out.picks.len()), (n * hidden, n * top_k));
+        for t in 0..n {
+            let row = &r[t * (hidden + ne)..(t + 1) * (hidden + ne)];
+            assert!(out.x[t * hidden..(t + 1) * hidden].iter().zip(row).all(|(&h, &v)| h == f32_to_f16(v)));
+            let lg: Vec<f32> = row[hidden..].iter().map(|&v| f16_to_f32(f32_to_f16(v))).collect();
+            let mut want: Vec<usize> = (0..ne).collect();
+            want.sort_by(|&a, &b| lg[b].partial_cmp(&lg[a]).unwrap());
+            let mut want: Vec<u16> = want[..top_k].iter().map(|&e| e as u16).collect();
+            let mut got = out.picks[t * top_k..(t + 1) * top_k].to_vec();
+            want.sort_unstable();
+            got.sort_unstable();
+            assert_eq!(got, want, "token {t}");
+        }
+    }
+
     /// The FP4 and FP8 source tensors decode bit for bit to the weights
     /// they encode (the GPTQ target is the exact source, as the converter
     /// sees it).
@@ -2016,6 +2040,26 @@ mod tests {
                 }
             }
         };
+
+        // the held-out diagnostic (CMF_MOE_DIAG) on the same layer: every 4th
+        // block of 80 tokens held out, RTN against GPTQ without and with the
+        // prior, per row-count bin; GPTQ is never worse than rounding
+        let held_d: Vec<bool> = (0..n).map(|t| (t / 80) % 4 == 3).collect();
+        for codec in [Codec::Q4tp, Codec::Q2tp] {
+            let ec = EncodeCfg { codec, limit: 10.0, lambda: 0.01, threads: 2 };
+            let names = dsv41_src_names(&source, 0, ne, true);
+            let src = source.open_layer(&source.shards_of(&names).unwrap()).unwrap();
+            let get = |part: Part, e: usize| dsv41_expert(&src, 0, part, e, hidden, inter, 32);
+            let job = LayerJob { li: 0, hidden, ne, inter, top_k, min_rows: 8, prior_n0: 0.0, prior_s: 128, held: &held_d };
+            let out = encode_layer(Engine::Host, &ec, &job, &rows[0], true, false, None, Some(&[0.0, hidden as f64]), &get).unwrap();
+            assert!(out.routed.is_empty() && out.shared.is_none(), "diagnostics write nothing");
+            let measured: usize = out.diag.iter().map(|b| b.count).sum();
+            assert_eq!(measured, ne, "every expert measured");
+            for b in out.diag.iter().filter(|b| b.count > 0) {
+                eprintln!("{codec:?} diag: {} experts, RTN {} GPTQ {} GPTQ+prior {}", b.count, b.rel(0), b.rel(1), b.rel(2));
+                assert!(b.err[1] <= b.err[0] && b.err[2] <= b.err[0], "{codec:?}: GPTQ worse than rounding on held-out rows: {:?}", b.err);
+            }
+        }
 
         // a new q2tp file: the converter's q2tp layout
         let out2 = root.join("moe-q2tp.cmf");
