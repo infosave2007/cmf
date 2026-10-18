@@ -22735,6 +22735,15 @@ impl Drop for ImageStageGuard {
     }
 }
 
+/// [`release_idle_model_buffers`] for a caller outside the engine that is
+/// done running `model` (its pipeline dropped) but keeps the process and the
+/// device for other work: `cortiq quantize-moe` frees the calibration model's
+/// cached weights and expert banks (a V4.1 bank takes up to 85 % of the card)
+/// before its own GPTQ buffers are allocated.
+pub fn release_model_buffers(model: &CmfModel) {
+    release_idle_model_buffers(model.uid());
+}
+
 /// Drop only model-owned wgpu cache entries after all submitted work drains.
 /// This is intentionally narrower than a device/cache reset: shared scratch,
 /// content-keyed buffers, KV state, and every other model UID survive.
