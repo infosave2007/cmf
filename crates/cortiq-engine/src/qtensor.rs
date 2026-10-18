@@ -385,6 +385,32 @@ impl QTensor {
         matches!(self, Self::Blr(_))
     }
 
+    /// (model, idx) of a `blr` tensor, for the wgpu graphs only (their
+    /// `blr` stage kernels, kind [`crate::gpu::GRAPH_KIND_BLR`]). Kept apart
+    /// from [`graph_weight`](Self::graph_weight), which stays None for
+    /// `blr`: every other graph consumer keys its kernels on that answer.
+    /// A file with a Prism contract keeps the per-op path.
+    pub fn graph_blr(&self) -> Option<(&Arc<CmfModel>, usize)> {
+        match self {
+            Self::Blr(t) if !crate::prism::has_contract(&t.model) => Some((&t.model, t.idx)),
+            _ => None,
+        }
+    }
+
+    /// [`graph_weight`](Self::graph_weight), then the Prism descriptor
+    /// form, then a `blr` tensor as kind [`crate::gpu::GRAPH_KIND_BLR`] —
+    /// the wgpu token and batch graph builders' lookup.
+    pub(crate) fn graph_weight_or_blr(
+        &self,
+    ) -> Option<(&std::sync::Arc<CmfModel>, usize, u8, &[f32])> {
+        self.graph_weight()
+            .or_else(|| self.graph_weight_descriptor())
+            .or_else(|| {
+                self.graph_blr()
+                    .map(|(m, i)| (m, i, crate::gpu::GRAPH_KIND_BLR, &[][..]))
+            })
+    }
+
     /// Binary-weight-mapped tensor, q1 or q1g? (GPU gates: the binary CPU
     /// kernels are compute-bound, so offload pays at much smaller shapes
     /// than q8.)
