@@ -422,8 +422,12 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
             // full-precision weights of this layer (the next layer's shards
             // download in the background meanwhile)
             let tf = Instant::now();
-            if let Some(h) = prefetch.take() {
-                h.join().map_err(|_| anyhow::anyhow!("prefetch thread panicked"))??;
+            // a failed background download costs a synchronous one, never
+            // the run (the capture before it can take hours)
+            match prefetch.take().map(|h| h.join()) {
+                None | Some(Ok(Ok(()))) => {}
+                Some(Ok(Err(e))) => eprintln!("  layer {li}: background shard prefetch failed ({e:#}); fetching the shards again now"),
+                Some(Err(_)) => eprintln!("  layer {li}: background shard prefetch panicked; fetching the shards again now"),
             }
             let shards = shard_names(li)?;
             let src = source.open_layer(&shards)?;
@@ -753,14 +757,17 @@ impl Source {
         }
     }
 
-    /// Fetch (remote) and map every shard of one layer.
+    /// Fetch (remote) and map every shard of one layer. A failed download
+    /// is retried `FETCH_ATTEMPTS` times with a growing pause.
     fn open_layer(&self, shards: &[String]) -> anyhow::Result<LayerSrc> {
         let mut files = HashMap::new();
         let mut index = HashMap::new();
         for sh in shards {
             let p = self.path(sh);
             if self.local.is_none() {
-                fetch(&self.agent, &format!("{}/{sh}", self.base), &p, self.token.as_deref(), true, 16)?;
+                with_attempts(FETCH_ATTEMPTS, std::time::Duration::from_secs(20), sh, || {
+                    fetch(&self.agent, &format!("{}/{sh}", self.base), &p, self.token.as_deref(), true, 16).map(|_| ())
+                })?;
             }
             let st = open_safetensors(&p)?;
             for (i, m) in st.tensors.iter().enumerate() {
@@ -789,6 +796,26 @@ impl Source {
     fn release(&self, sh: &str) {
         if self.local.is_none() {
             let _ = std::fs::remove_file(self.scratch.join(sh));
+        }
+    }
+}
+
+/// Attempts at a synchronous shard download before the run gives up.
+const FETCH_ATTEMPTS: usize = 6;
+
+/// `f` until it succeeds, at most `attempts` times, pausing `pause`·k after
+/// the k-th failure; the last error is returned.
+fn with_attempts(attempts: usize, pause: std::time::Duration, what: &str, mut f: impl FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
+    let mut k = 1;
+    loop {
+        match f() {
+            Ok(()) => return Ok(()),
+            Err(e) if k < attempts => {
+                eprintln!("  {what}: attempt {k}/{attempts} failed ({e:#}); retrying in {:.0}s", (pause * k as u32).as_secs_f64());
+                std::thread::sleep(pause * k as u32);
+                k += 1;
+            }
+            Err(e) => return Err(e.context(format!("{what}: {attempts} attempts failed"))),
         }
     }
 }
@@ -1938,6 +1965,27 @@ mod tests {
             got.sort_unstable();
             assert_eq!(got, want, "token {t}");
         }
+    }
+
+    /// A shard download is retried until it succeeds, and gives up with
+    /// the last error after the allowed attempts.
+    #[test]
+    fn downloads_are_retried() {
+        let mut calls = 0;
+        with_attempts(4, std::time::Duration::ZERO, "shard", || {
+            calls += 1;
+            if calls < 3 { anyhow::bail!("transient {calls}") } else { Ok(()) }
+        })
+        .unwrap();
+        assert_eq!(calls, 3);
+        let mut calls = 0;
+        let e = with_attempts(2, std::time::Duration::ZERO, "shard", || {
+            calls += 1;
+            anyhow::bail!("down {calls}")
+        })
+        .unwrap_err();
+        assert_eq!(calls, 2);
+        assert!(format!("{e:#}").contains("down 2"), "{e:#}");
     }
 
     /// Calibration windows: plain chunks without a BOS (Flash-Next, as
