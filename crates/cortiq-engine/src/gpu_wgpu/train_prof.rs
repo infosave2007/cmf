@@ -515,7 +515,7 @@ fn family(kern: &str) -> &'static str {
         "gdn.rec_fwd" => "gdn.rec_fwd",
         "gdn.rec_bwd" => "gdn.rec_bwd",
         "gdn.qk_bwd" | "gdn.conv_bwd" => "gdn.prep_bwd",
-        "dense_fwd" | "dense_bwd" => "dense(a,b)",
+        "dense_fwd" | "dense_bwd" | "dense_fwd_t" | "dense_bwd_t" => "dense(a,b)",
         "copy" | "clear" | "readback" => "copy/clear",
         "kl_rows" => "head.kl_rows",
         "adam" | "sumsq" => "optimizer",

@@ -163,6 +163,88 @@ fn dense_fwd(@builtin(global_invocation_id) g: vec3<u32>) {
     if (p.rows == 1u) { OUT[i] = OUT[i] + acc; } else { OUT[i] = acc; }
 }
 
+// dense_fwd for r ≤ 48 outputs, tiled: a workgroup = 16 rows × all outputs,
+// thread (row ty, lane tx) owns outputs tx, tx+16, tx+32; k staged through
+// workgroup memory in chunks of 32. Each output still sums j = 0..k-1 in
+// order, as dense_fwd does.
+var<workgroup> dta: array<f32, 528>;    // [16][33]
+var<workgroup> dtb: array<f32, 1584>;   // [48][33]
+@compute @workgroup_size(256)
+fn dense_fwd_t(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) tid: u32) {
+    let r0 = wg.x * 16u;
+    let ty = tid / 16u;
+    let tx = tid % 16u;
+    var acc0 = 0.0;
+    var acc1 = 0.0;
+    var acc2 = 0.0;
+    for (var k0 = 0u; k0 < p.k; k0 = k0 + 32u) {
+        for (var e = tid; e < 512u; e = e + 256u) {
+            let rr = e / 32u;
+            let kk = e % 32u;
+            var v = 0.0;
+            if (r0 + rr < p.m && k0 + kk < p.k) { v = A[(r0 + rr) * p.k + k0 + kk]; }
+            dta[rr * 33u + kk] = v;
+        }
+        for (var e = tid; e < 1536u; e = e + 256u) {
+            let o = e / 32u;
+            let kk = e % 32u;
+            var v = 0.0;
+            if (o < p.r && k0 + kk < p.k) { v = B[o * p.k + k0 + kk]; }
+            dtb[o * 33u + kk] = v;
+        }
+        workgroupBarrier();
+        let kn = min(32u, p.k - k0);
+        for (var kk = 0u; kk < kn; kk = kk + 1u) {
+            let a = dta[ty * 33u + kk];
+            acc0 = acc0 + a * dtb[tx * 33u + kk];
+            acc1 = acc1 + a * dtb[(tx + 16u) * 33u + kk];
+            acc2 = acc2 + a * dtb[(tx + 32u) * 33u + kk];
+        }
+        workgroupBarrier();
+    }
+    let row = r0 + ty;
+    if (row < p.m) {
+        var accs = array<f32, 3>(acc0, acc1, acc2);
+        for (var j = 0u; j < 3u; j = j + 1u) {
+            let o = tx + 16u * j;
+            if (o < p.r) {
+                let i = row * p.r + o;
+                if (p.rows == 1u) { OUT[i] = OUT[i] + accs[j]; } else { OUT[i] = accs[j]; }
+            }
+        }
+    }
+}
+
+// dense_bwd with 4 rows per thread (each weight load serves 4 outputs);
+// every output sums o = 0..r-1 in order, as dense_bwd does.
+@compute @workgroup_size(256)
+fn dense_bwd_t(@builtin(global_invocation_id) g: vec3<u32>) {
+    let j = g.x;
+    let row0 = g.y * 4u;
+    if (j >= p.k) { return; }
+    var a0 = 0.0;
+    var a1 = 0.0;
+    var a2 = 0.0;
+    var a3 = 0.0;
+    let ok1 = row0 + 1u < p.m;
+    let ok2 = row0 + 2u < p.m;
+    let ok3 = row0 + 3u < p.m;
+    let i1 = select(row0, row0 + 1u, ok1);
+    let i2 = select(row0, row0 + 2u, ok2);
+    let i3 = select(row0, row0 + 3u, ok3);
+    for (var o = 0u; o < p.r; o = o + 1u) {
+        let b = B[o * p.k + j];
+        a0 = a0 + A[row0 * p.r + o] * b;
+        a1 = a1 + A[i1 * p.r + o] * b;
+        a2 = a2 + A[i2 * p.r + o] * b;
+        a3 = a3 + A[i3 * p.r + o] * b;
+    }
+    OUT[row0 * p.k + j] = OUT[row0 * p.k + j] + a0;
+    if (ok1) { OUT[i1 * p.k + j] = OUT[i1 * p.k + j] + a1; }
+    if (ok2) { OUT[i2 * p.k + j] = OUT[i2 * p.k + j] + a2; }
+    if (ok3) { OUT[i3 * p.k + j] = OUT[i3 * p.k + j] + a3; }
+}
+
 // OUT[m][k] += A[m][r] · B[r][k]   (input gradient of dense_fwd)
 @compute @workgroup_size(256)
 fn dense_bwd(@builtin(global_invocation_id) g: vec3<u32>) {
@@ -290,7 +372,7 @@ fn scale_acc(@builtin(global_invocation_id) g: vec3<u32>) {
 "#;
 
 fn module(c: &Ctx) -> Option<&'static train_ops::Mod> {
-    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "cvt_cols", "cvt_t", "expand", "colsum_prod", "colsum_part", "colsum_fin", "scale_acc", "dense_fwd", "dense_bwd", "split_qg", "adam", "sumsq", "adam_cat", "sumsq_cat"])
+    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "cvt_cols", "cvt_t", "expand", "colsum_prod", "colsum_part", "colsum_fin", "scale_acc", "dense_fwd", "dense_bwd", "dense_fwd_t", "dense_bwd_t", "split_qg", "adam", "sumsq", "adam_cat", "sumsq_cat"])
 }
 
 /// One step of a trainer pass: an elementwise/reduction dispatch or a GEMM.
@@ -521,6 +603,14 @@ pub fn scale_acc<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, col: &'a wgpu::Buffer, out
 #[allow(clippy::too_many_arguments)]
 pub fn dense_fwd<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, w: &'a wgpu::Buffer, out: &'a wgpu::Buffer, m: usize, k: usize, r: usize, acc: bool) -> Option<Disp<'a>> {
     let md = module(c)?;
+    if r <= 48 && m.div_ceil(16) <= 65535 {
+        return Some(Disp {
+            pipe: &md.p["dense_fwd_t"],
+            uni: vec![m as u32, k as u32, 0, acc as u32, r as u32, 0, 0, 0, 0, 0, 0, 0],
+            bufs: vec![(7, a), (8, w), (9, out)],
+            grid: (m.div_ceil(16) as u32, 1, 1),
+        });
+    }
     Some(Disp {
         pipe: &md.p["dense_fwd"],
         uni: vec![m as u32, k as u32, 0, acc as u32, r as u32, 0, 0, 0, 0, 0, 0, 0],
@@ -533,6 +623,14 @@ pub fn dense_fwd<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, w: &'a wgpu::Buffer, out: 
 #[allow(clippy::too_many_arguments)]
 pub fn dense_bwd<'a>(c: &'a Ctx, dy: &'a wgpu::Buffer, w: &'a wgpu::Buffer, dx: &'a wgpu::Buffer, m: usize, k: usize, r: usize) -> Option<Disp<'a>> {
     let md = module(c)?;
+    if m.div_ceil(4) <= 65535 {
+        return Some(Disp {
+            pipe: &md.p["dense_bwd_t"],
+            uni: vec![m as u32, k as u32, 0, 0, r as u32, 0, 0, 0, 0, 0, 0, 0],
+            bufs: vec![(7, dy), (8, w), (9, dx)],
+            grid: (k.div_ceil(256) as u32, m.div_ceil(4) as u32, 1),
+        });
+    }
     Some(Disp {
         pipe: &md.p["dense_bwd"],
         uni: vec![m as u32, k as u32, 0, 0, r as u32, 0, 0, 0, 0, 0, 0, 0],
