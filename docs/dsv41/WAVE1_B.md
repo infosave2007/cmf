@@ -120,6 +120,7 @@ layout).
 | `moegptq::tests::identity_hessian_gptq_is_plain_rounding` | Identity Hessian, production `encode_with_hessians` (see the list below the table) | ok |
 | `moegptq::tests::gptq_beats_rounding_on_held_out_rows` | Correlated synthetic inputs, clamp exercised (L = 1), 1024 calibration rows and 256 held-out rows. Relative held-out output error, RTN → GPTQ → GPTQ + prior: q4tp 0.0463 → 0.0104 → 0.0105; q2tp 0.388 → 0.066 → 0.068 | ok |
 | `moegptq::tests::dsv41_layers_write_the_converter_layout` | End to end (see the list below the table) | ok |
+| `moegptq::tests::qwen4_rows_route_by_f16_logit_topk` | Flash-Next capture rows are converted to f16 inputs plus the top-k of the f16-rounded logits, the routing the Flash-Next path has always used | ok |
 | `moegptq::tests::gpu_encode_tracks_the_host_reference` | Device encode vs host reference, by held-out error, with and without the limit, both codecs. Opt-in: `CMF_MOE_GPU_TEST=1` | skipped on the Mac (for the pod) |
 
 What `identity_hessian_gptq_is_plain_rounding` checks:
@@ -149,12 +150,17 @@ What `dsv41_layers_write_the_converter_layout` covers:
   - keep every non-expert tensor byte for byte;
   - actually change the expert payloads.
 - The new file's provenance has `weight_quant` and `gptq_moe`.
+- The same test also runs the held-out diagnostic (`CMF_MOE_DIAG`) through
+  `encode_layer`, with every 4th block of tokens held out. Relative expert output
+  error on the held-out rows, RTN → GPTQ → GPTQ + prior: q4tp 0.0324 → 0.0078 →
+  0.0076, q2tp 0.342 → 0.038 → 0.035. GPTQ is required to be no worse than RTN
+  in every row bin.
 
 Commands:
 
 ```
 cargo test -p cortiq-engine --features gpu --lib -- dsv41 elt_wgsl_validates   # 22 + 1 ok
-cargo test -p cortiq-cli --bin cortiq moegptq                                    # 5 ok
+cargo test -p cortiq-cli --bin cortiq moegptq                                    # 6 ok (GPU test skips)
 ```
 
 ## Not verified (pod work for the lead)
