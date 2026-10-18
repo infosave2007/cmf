@@ -103,6 +103,10 @@ pub struct Param {
     m1: wgpu::Buffer,
     m2: wgpu::Buffer,
     mask: Option<wgpu::Buffer>,
+    /// 0: plain Adam steps. > 0: steps relative to each value's magnitude
+    /// (floored at this), for the metric scales whose magnitudes span orders
+    /// (h, g ~ 1, ℓ carrying the weight's amplitude).
+    rel: f32,
 }
 
 impl Param {
@@ -114,7 +118,23 @@ impl Param {
             m1: to::zeros(c, v.len()),
             m2: to::zeros(c, v.len()),
             mask: mask.map(|m| to::upload(c, m)),
+            rel: 0.0,
         }
+    }
+
+    /// A metric scale: relative steps floored at 5 % of the live values' RMS.
+    fn new_metric(c: Ctx, v: &[f32], mask: Option<&[f32]>) -> Self {
+        let (mut ss, mut n) = (0f64, 0usize);
+        for (i, &x) in v.iter().enumerate() {
+            if mask.is_none_or(|m| m[i] != 0.0) {
+                ss += (x as f64) * (x as f64);
+                n += 1;
+            }
+        }
+        let rms = (ss / n.max(1) as f64).sqrt() as f32;
+        let mut p = Param::new(c, v, mask);
+        p.rel = if rms > 0.0 { 0.05 * rms } else { 0.0 };
+        p
     }
 }
 
@@ -237,9 +257,9 @@ fn load_blr(c: Ctx, bytes: &[u8], role: &'static str) -> Result<Lin, String> {
         c.queue.write_buffer(&ub_buf, 0, bytemuck::cast_slice(&bu));
         let vb_buf = to::zeros(c, bv.len());
         c.queue.write_buffer(&vb_buf, 0, bytemuck::cast_slice(&bv));
-        let ph = Param::new(c, &h, None);
-        let pl = Param::new(c, &l, Some(&mask));
-        let pg = Param::new(c, &g, None);
+        let ph = Param::new_metric(c, &h, None);
+        let pl = Param::new_metric(c, &l, Some(&mask));
+        let pg = Param::new_metric(c, &g, None);
         // The path reads the Param buffers directly (same wgpu::Buffer handles).
         paths.push(BlrPath {
             bits_u: ub_buf,
@@ -770,7 +790,7 @@ pub fn zero_grads(c: Ctx, net: &Net) {
 #[allow(clippy::too_many_arguments)]
 pub fn adam(c: Ctx, net: &Net, lr: f32, step_no: u32, b1: f32, b2: f32, eps: f32, gmul: f32) -> Option<()> {
     for p in net.params() {
-        tm::run(c, &[Op::D(tm::adam(c, &p.w, &p.g, &p.m1, &p.m2, p.mask.as_ref(), p.n, lr, step_no, b1, b2, eps, gmul)?)]);
+        tm::run(c, &[Op::D(tm::adam(c, &p.w, &p.g, &p.m1, &p.m2, p.mask.as_ref(), p.n, lr, step_no, b1, b2, eps, gmul, p.rel)?)]);
         zero(c, &p.g, p.n);
     }
     Some(())
