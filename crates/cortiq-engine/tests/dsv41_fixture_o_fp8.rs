@@ -53,11 +53,8 @@ fn o_fp8_follows_reference_act_quant() {
         },
     );
     let without = reference_logits(&fx, &TOKENS, RefOpts::cortiq());
-    let exact = got
-        .iter()
-        .zip(&with)
-        .filter(|(g, w)| worst_rel(std::slice::from_ref(*g), std::slice::from_ref(*w)).0 < 1e-5)
-        .count();
+    let errs = per_position(&got, &with);
+    let exact = errs.iter().filter(|&&e| e < EXACT).count();
     let (worst, at) = worst_rel(&got, &with);
     let (apart, _) = worst_rel(&got, &without);
     println!(
@@ -65,7 +62,7 @@ fn o_fp8_follows_reference_act_quant() {
          worst {worst:.3e} at {at}; {apart:.3e} away from the reference without it",
         TOKENS.len()
     );
-    assert!(exact * 3 >= TOKENS.len() * 2, "{exact}/{} exact", TOKENS.len());
-    assert!(worst < 0.15, "O_FP8 forward: {worst:.3e} at {at}");
+    // Measured on the M4: 12/12 exact (worst 1.2e-7).
+    assert_strict_agreement("O_FP8", &errs, TOKENS.len(), EXACT);
     assert!(apart > 1e-4, "act_quant(o) did not change the logits");
 }

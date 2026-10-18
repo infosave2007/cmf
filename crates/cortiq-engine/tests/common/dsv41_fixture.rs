@@ -1475,3 +1475,84 @@ pub fn argmax64(v: &[f64]) -> usize {
         .map(|(i, _)| i)
         .unwrap()
 }
+
+/// Per-position relative logit errors (`worst_rel` of each position).
+pub fn per_position(got: &[Vec<f32>], want: &[Vec<f64>]) -> Vec<f64> {
+    got.iter()
+        .zip(want)
+        .map(|(g, w)| worst_rel(std::slice::from_ref(g), std::slice::from_ref(w)).0)
+        .collect()
+}
+
+pub fn median(errs: &[f64]) -> f64 {
+    let mut v = errs.to_vec();
+    v.sort_by(f64::total_cmp);
+    let n = v.len();
+    if n == 0 {
+        0.0
+    } else if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        0.5 * (v[n / 2 - 1] + v[n / 2])
+    }
+}
+
+pub fn fmt_errs(errs: &[f64]) -> String {
+    errs.iter()
+        .map(|e| format!("{e:.1e}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub fn argmax_agree(got: &[Vec<f32>], want: &[Vec<f64>]) -> usize {
+    got.iter()
+        .zip(want)
+        .filter(|(g, w)| argmax32(g) == argmax64(w))
+        .count()
+}
+
+/// A position "agrees" with the reference within this relative error.
+pub const EXACT: f64 = 1e-5;
+
+/// The strict CPU path (exact activations) against the f64 reference.
+///
+/// aarch64, where the bounds were measured (M4; the macOS CI runner is Apple
+/// Silicon and runs the same NEON f32 kernels, none of them dispatched on a
+/// CPU feature): at least `min_exact` positions within `EXACT` and the worst
+/// below `worst_max`. Other targets (x86 AVX2 on the ubuntu CI) group the f32
+/// sums differently, which moves where a value lands on the other side of a
+/// BF16 boundary. That path is not measured, so there the median position
+/// must agree within `EXACT` (a structural regression moves every position)
+/// and the worst stay below 0.15: two other summation orders on this
+/// fixture, the A8W8 CPU path and the device kernels, each put a 7.5e-2
+/// flip on position 8, which the ARM strict path happens not to have.
+pub fn assert_strict_agreement(label: &str, errs: &[f64], min_exact: usize, worst_max: f64) {
+    let exact = errs.iter().filter(|&&e| e < EXACT).count();
+    let worst = errs.iter().copied().fold(0.0f64, f64::max);
+    let med = median(errs);
+    if cfg!(target_arch = "aarch64") {
+        assert!(
+            exact >= min_exact,
+            "{label}: only {exact}/{} positions agree with the reference to {EXACT:e} \
+             (want {min_exact}): [{}]",
+            errs.len(),
+            fmt_errs(errs)
+        );
+        assert!(
+            worst < worst_max,
+            "{label}: worst position {worst:.3e} (bound {worst_max:e}): [{}]",
+            fmt_errs(errs)
+        );
+    } else {
+        assert!(
+            med < EXACT,
+            "{label}: median position {med:.3e} is not exact: [{}]",
+            fmt_errs(errs)
+        );
+        assert!(
+            worst < 0.15,
+            "{label}: worst position {worst:.3e}: [{}]",
+            fmt_errs(errs)
+        );
+    }
+}
