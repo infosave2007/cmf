@@ -111,6 +111,29 @@ fn expand(@builtin(global_invocation_id) g: vec3<u32>) {
     PLT[j * p.rows + row] = v;
 }
 
+// Only one orientation of the expansion (each GEMM phase reads one of each
+// matrix): PL[rows][r] ...
+@compute @workgroup_size(256)
+fn expand_n(@builtin(global_invocation_id) g: vec3<u32>) {
+    let i = idx(g);
+    if (i >= p.rows * p.r) { return; }
+    let row = i / p.r;
+    let j = i % p.r;
+    let bit = (BITS[row * p.words + j / 32u] >> (j % 32u)) & 1u;
+    PL[i] = select(f16(-1.0), f16(1.0), bit == 1u);
+}
+
+// ... or PLT[r][rows], consecutive threads along rows (coalesced stores).
+@compute @workgroup_size(256)
+fn expand_t(@builtin(global_invocation_id) g: vec3<u32>) {
+    let i = idx(g);
+    if (i >= p.rows * p.r) { return; }
+    let j = i / p.rows;
+    let row = i % p.rows;
+    let bit = (BITS[row * p.words + j / 32u] >> (j % 32u)) & 1u;
+    PLT[i] = select(f16(-1.0), f16(1.0), bit == 1u);
+}
+
 // OUT[col] += Σ_row A[row][col]·B[row][col]   (one thread per column)
 @compute @workgroup_size(256)
 fn colsum_prod(@builtin(global_invocation_id) g: vec3<u32>) {
@@ -372,7 +395,7 @@ fn scale_acc(@builtin(global_invocation_id) g: vec3<u32>) {
 "#;
 
 fn module(c: &Ctx) -> Option<&'static train_ops::Mod> {
-    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "cvt_cols", "cvt_t", "expand", "colsum_prod", "colsum_part", "colsum_fin", "scale_acc", "dense_fwd", "dense_bwd", "dense_fwd_t", "dense_bwd_t", "split_qg", "adam", "sumsq", "adam_cat", "sumsq_cat"])
+    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "cvt_cols", "cvt_t", "expand", "expand_n", "expand_t", "colsum_prod", "colsum_part", "colsum_fin", "scale_acc", "dense_fwd", "dense_bwd", "dense_fwd_t", "dense_bwd_t", "split_qg", "adam", "sumsq", "adam_cat", "sumsq_cat"])
 }
 
 /// One step of a trainer pass: an elementwise/reduction dispatch or a GEMM.
@@ -580,6 +603,19 @@ pub fn colsum<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, term: ColTerm<'a>, out: &'a w
         grid: (k.div_ceil(256) as u32, 1, 1),
     };
     Some([p1, p2])
+}
+
+/// One orientation of [`expand`]: `pl` `[rows][r]` (`trans` false) or
+/// `[r][rows]` (`trans` true).
+pub fn expand1<'a>(c: &'a Ctx, bits: &'a wgpu::Buffer, pl: &'a wgpu::Buffer, rows: usize, r: usize, trans: bool) -> Option<Disp<'a>> {
+    let md = module(c)?;
+    let (ep, b) = if trans { ("expand_t", 6) } else { ("expand_n", 5) };
+    Some(Disp {
+        pipe: &md.p[ep],
+        uni: vec![0, 0, 0, rows as u32, r as u32, r.div_ceil(32) as u32, 0, 0, 0, 0, 0, 0],
+        bufs: vec![(4, bits), (b, pl)],
+        grid: elt_fold(rows * r),
+    })
 }
 
 /// `out[k] += Σ_rows a[row][k]·b[row][k]` (two dispatches, see [`colsum`]).
@@ -850,8 +886,8 @@ pub fn blr_forward(c: &Ctx, layer: &Blr, s: &BlrScratch, x: &wgpu::Buffer, y: &w
     let (m, n, r) = (layer.m, layer.n, layer.r);
     for (pi, p) in layer.paths.iter().enumerate() {
         let ops = vec![
-            Op::D(expand(c, &p.bits_u, &s.pl_u, &s.plt_u, m, r)?),
-            Op::D(expand(c, &p.bits_v, &s.pl_v, &s.plt_v, n, r)?),
+            Op::D(expand1(c, &p.bits_u, &s.pl_u, m, r, false)?),
+            Op::D(expand1(c, &p.bits_v, &s.plt_v, n, r, true)?),
             Op::D(cvt(c, x, Some(&p.g), &s.xh, ntok, n, 1.0)?),
             Op::M(mm(c, &s.plt_v, &s.xh, &s.a[pi], ntok, r, n, 1.0)?),
             Op::D(cvt(c, &s.a[pi], Some(&p.l), &s.xh, ntok, r, 1.0)?),
@@ -882,8 +918,8 @@ pub fn blr_backward(c: &Ctx, layer: &Blr, s: &BlrScratch, x: &wgpu::Buffer, dy: 
         let [dl1, dl2] = colsum_prod(c, &s.a[pi], &s.t2, &p.dl, ntok, r)?;
         let [dg1, dg2] = colsum_prod(c, x, &s.t1, &p.dg, ntok, n)?;
         let mut ops = vec![
-            Op::D(expand(c, &p.bits_u, &s.pl_u, &s.plt_u, m, r)?),
-            Op::D(expand(c, &p.bits_v, &s.pl_v, &s.plt_v, n, r)?),
+            Op::D(expand1(c, &p.bits_u, &s.plt_u, m, r, true)?),
+            Op::D(expand1(c, &p.bits_v, &s.pl_v, n, r, false)?),
             Op::D(dh1),
             Op::D(dh2),
             Op::D(cvt(c, dy, Some(&p.h), &s.xh, ntok, m, gscale)?),
