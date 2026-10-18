@@ -21,11 +21,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 - `nvg-train` on Qwen3.8-27B at 0.55 bpw with `--train-signs` (RTX PRO 6000,
-  4096 tokens a step): STEP27 (was 22.0 s/step, 187 tok/s); Qwen3.5-0.8B at
-  1.0 bpw: STEP08 (was 4.12 s/step). Per-step losses are bit-identical to
-  0.8.21 for the scheduling and buffer changes; the kernel rewrites (GDN
+  4096 tokens a step): 4.93 s/step, 831 tok/s (was 21.5 s/step, 190 tok/s;
+  mean over the first 14 steps); Qwen3.5-0.8B at 1.0 bpw: about 0.67 s/step (was 4.12). The
+  scheduling and buffer changes are bit-identical; the kernel rewrites (GDN
   recurrence, attention on the matrix units, column reductions) pass their
-  host-reference tests and stay within LOSSDEV of the 0.8.21 losses. Main
+  host-reference tests. On the 27B the metric-only steps 1–10 match the
+  0.8.21 losses within 1.5e-4 relative; once signs flip (8,357,769 against
+  8,340,655 at the first sign step) the discrete updates amplify last-bit
+  differences and the next losses differ by up to 1.5 %. Main
   changes:
   - GatedDeltaNet recurrence forward/backward: state in named registers,
     split by state columns over 32-wide subgroups, shorter live ranges
