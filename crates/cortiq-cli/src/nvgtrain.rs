@@ -61,6 +61,8 @@ pub struct NvgTrainOpts<'a> {
     /// Directory for the resumable state (written every `state_every` steps).
     pub state_dir: Option<&'a str>,
     pub state_every: usize,
+    /// Delete the previous state file before writing the next.
+    pub state_replace: bool,
     /// Resume from the latest state in this directory.
     pub resume: Option<&'a str>,
 }
@@ -422,6 +424,12 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
                 let ws = Instant::now();
                 std::fs::create_dir_all(dir)?;
                 let (sf, bf) = (format!("state-{done}.bin"), format!("best-{done}.bin"));
+                if o.state_replace {
+                    let old: Option<serde_json::Value> = std::fs::read(format!("{dir}/meta.json")).ok().and_then(|b| serde_json::from_slice(&b).ok());
+                    if let Some(f) = old.as_ref().and_then(|m| m["state"].as_str()) {
+                        let _ = std::fs::remove_file(format!("{dir}/{f}"));
+                    }
+                }
                 let nb = nt::save_state(c, &snet, std::path::Path::new(&format!("{dir}/{sf}"))).map_err(|e| anyhow::anyhow!(e))?;
                 nt::save_snap(&best.1, std::path::Path::new(&format!("{dir}/{bf}"))).map_err(|e| anyhow::anyhow!(e))?;
                 let m = serde_json::json!({

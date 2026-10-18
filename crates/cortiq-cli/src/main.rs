@@ -1020,6 +1020,11 @@ enum Commands {
         /// Steps between state saves
         #[arg(long, default_value = "500")]
         sign_state_every: usize,
+        /// Delete the previous state before writing the next, so one state
+        /// sits on disk instead of two (a 27B fact-mom state is ~57 GB); a
+        /// crash during that save leaves nothing to resume from
+        #[arg(long)]
+        sign_state_replace: bool,
         /// Resume from the latest state in this directory (same arguments)
         #[arg(long)]
         resume: Option<String>,
@@ -3578,6 +3583,7 @@ async fn main() -> anyhow::Result<()> {
             topk_cache,
             sign_state,
             sign_state_every,
+            sign_state_replace,
             resume,
         } => {
             let signs = if train_signs {
@@ -3619,6 +3625,7 @@ async fn main() -> anyhow::Result<()> {
                 topk_cache: topk_cache.as_deref(),
                 state_dir: sign_state.as_deref(),
                 state_every: sign_state_every,
+                state_replace: sign_state_replace,
                 resume: resume.as_deref(),
             })
         }

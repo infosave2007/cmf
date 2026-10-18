@@ -24,7 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     teacher and every data argument match), so the teacher and a large
     student never share the card. `--sign-state DIR` saves a resumable
     state every `--sign-state-every` steps, `--resume DIR` continues from it
-    (a resumed run is byte-identical to an uninterrupted one).
+    (a resumed run is byte-identical to an uninterrupted one);
+    `--sign-state-replace` keeps one state on disk instead of two.
 - `blr` on the wgpu whole-token graph: decode runs `blr` tensors resident in
   the weight cache, two dispatches per group of up to three tensors of one
   input (q|k|v, qkv|z; gate|up apply the activation in stage U), with no
