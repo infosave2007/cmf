@@ -2708,6 +2708,85 @@ mod tests {
         }
     }
 
+    /// The down input with DeepSeek's clamp against hand values: the gate
+    /// is clamped from above only (12 → 10, −12 stays), the up branch on both
+    /// sides (−15 → −10, 3 stays); without a limit nothing is clamped.
+    #[test]
+    fn swiglu_rows_clamp_matches_hand_values() {
+        let x = [1.0f32, 0.0, 0.0, 0.0]; // picks the first column of each weight row
+        let wg = [12.0f32, 0.5, 0.5, 0.5, -12.0, 0.5, 0.5, 0.5];
+        let wu = [-15.0f32, 0.5, 0.5, 0.5, 3.0, 0.5, 0.5, 0.5];
+        let silu = |v: f64| v / (1.0 + (-v).exp());
+        let close = |got: &[f32], want: [f64; 2]| {
+            for (g, w) in got.iter().zip(want) {
+                assert!((*g as f64 - w).abs() <= 1e-6 * w.abs(), "{got:?} vs {want:?}");
+            }
+        };
+        close(&swiglu_rows(&x, 1, 4, &wg, &wu, 2, 10.0, 1), [silu(10.0) * -10.0, silu(-12.0) * 3.0]);
+        close(&swiglu_rows(&x, 1, 4, &wg, &wu, 2, 0.0, 1), [silu(12.0) * -15.0, silu(-12.0) * 3.0]);
+    }
+
+    /// An expert routed fewer rows than its input width at hidden 256.
+    struct LowRows {
+        hidden: usize,
+        inter: usize,
+        x: Vec<u16>,
+        xh: Vec<f32>,
+        n_ho: usize,
+        sample: Vec<u32>,
+        w: ExpertW,
+    }
+
+    /// 2048 layer rows (the prior's sample: every 4th) and 256 held-out rows
+    /// of one correlated distribution; the expert's own rows are the first
+    /// rows of the layer.
+    fn low_rows_case() -> LowRows {
+        let mut rng = Rng(47);
+        let (hidden, inter, n_layer, n_ho) = (256, 128, 2048, 256);
+        let x32 = inputs(&mut rng, n_layer + n_ho, hidden);
+        let x: Vec<u16> = x32.iter().map(|&v| f32_to_f16(v)).collect();
+        let xh: Vec<f32> = x[n_layer * hidden..].iter().map(|&h| f16_to_f32(h)).collect();
+        let w = ExpertW { g: weights(&mut rng, inter, hidden, 0.15), u: weights(&mut rng, inter, hidden, 0.15), d: weights(&mut rng, hidden, inter, 0.1) };
+        LowRows { hidden, inter, x, xh, n_ho, sample: (0..n_layer as u32).step_by(4).collect(), w }
+    }
+
+    /// Held-out relative output error of RTN, GPTQ and GPTQ with the prior
+    /// (n0 = hidden) for an expert of `m` rows, on `engine`.
+    fn low_rows_errors(case: &LowRows, engine: Engine, m: usize, codec: Codec, limit: f32) -> (f64, f64, f64) {
+        let LowRows { hidden, inter, ref x, ref xh, n_ho, ref sample, ref w } = *case;
+        let o_fp = expert_out(xh, n_ho, hidden, &w.g, &w.u, &w.d, inter, limit, 2);
+        let err = |enc: &[Vec<u8>; 3]| -> f64 {
+            let [g, u, d] = dequant_expert(enc, inter, hidden, codec);
+            let o = expert_out(xh, n_ho, hidden, &g, &u, &d, inter, limit, 2);
+            o.iter().zip(&o_fp).map(|(&a, &b)| ((a - b) as f64).powi(2)).sum::<f64>() / o_fp.iter().map(|&v| (v as f64).powi(2)).sum::<f64>()
+        };
+        let ec = EncodeCfg { codec, limit, lambda: 0.01, threads: 3 };
+        let rows: Vec<u32> = (0..m as u32).collect();
+        let prior = Prior { rows: sample, n0: hidden as f64, n0_down: hidden as f64 / 4.0 };
+        let rtn = err(&rtn_expert(codec, w, inter, hidden));
+        let gptq = err(&encode_expert(engine, &mut None, hidden, inter, x, &rows, None, w, &ec, None, &mut [0.0; 5]).unwrap());
+        let gptq_p = err(&encode_expert(engine, &mut None, hidden, inter, x, &rows, None, w, &ec, Some(prior), &mut [0.0; 5]).unwrap());
+        (rtn, gptq, gptq_p)
+    }
+
+    /// Experts routed 48, 128 or 192 rows at hidden 256 have rank-deficient
+    /// Hessians of their own (most V4.1 experts at 32k–65k calibration
+    /// tokens: 512–1024 rows for 5120 inputs). With the layer prior GPTQ
+    /// still beats rounding on held-out rows, in both layouts; plain GPTQ
+    /// is reported, not required to win.
+    #[test]
+    fn prior_carries_experts_with_fewer_rows_than_hidden() {
+        let _env = env_guard("4", "1");
+        let case = low_rows_case();
+        for m in [48, 128, 192] {
+            for codec in [Codec::Q4tp, Codec::Q2tp] {
+                let (rtn, gptq, gptq_p) = low_rows_errors(&case, Engine::Host, m, codec, 1.0);
+                eprintln!("{m} rows, {codec:?}: held-out relative output error RTN {rtn:.5}, GPTQ {gptq:.5}, GPTQ + prior {gptq_p:.5}");
+                assert!(gptq_p < rtn, "{m} rows {codec:?}: GPTQ with the prior {gptq_p} not better than RTN {rtn}");
+            }
+        }
+    }
+
     /// Route weights that follow the input (as the router's do): rows of
     /// one input cluster weigh 1, rows of a louder second cluster 0.05. On
     /// held-out rows, in the error the MoE output sees (each row weighted by
@@ -2894,6 +2973,17 @@ mod tests {
                 let dev = err(&encode_expert(Engine::Gpu(c), &mut None, hidden, inter, &x, &rows, Some(&rw), &w, &ec, prior, &mut [0.0; 5]).unwrap(), codec);
                 eprintln!("limit {limit} {codec:?} route-weighted: host {host:.5} device {dev:.5}");
                 assert!(dev < rtn && (dev - host).abs() < 0.05 * host + 1e-6, "limit {limit} {codec:?} route-weighted: device {dev} vs host {host} (RTN {rtn})");
+            }
+        }
+        // experts with fewer rows than hidden: the prior carries the device
+        // encode as it carries the host's
+        let case = low_rows_case();
+        for m in [48, 128, 192] {
+            for codec in [Codec::Q4tp, Codec::Q2tp] {
+                let (rtn, _, host_p) = low_rows_errors(&case, Engine::Host, m, codec, 1.0);
+                let (_, dev, dev_p) = low_rows_errors(&case, Engine::Gpu(c), m, codec, 1.0);
+                eprintln!("{m} rows, {codec:?}: RTN {rtn:.5}, device GPTQ {dev:.5}, GPTQ + prior host {host_p:.5} device {dev_p:.5}");
+                assert!(dev_p < rtn && (dev_p - host_p).abs() < 0.1 * host_p + 1e-6, "{m} rows {codec:?}: device {dev_p} vs host {host_p} (RTN {rtn})");
             }
         }
     }
