@@ -205,6 +205,12 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
         Engine::Host
     } else {
         match to::dev() {
+            // the device grams and GEMMs run on the matrix units
+            // (cooperative matrices): without them the first expert would
+            // fail after the whole capture
+            Some(_) if !tm::matrix_units() => {
+                anyhow::bail!("quantize-moe: the wgpu device has no matrix units (cooperative matrices) for the device encode (set CMF_MOE_HOST=1 to run on the host)")
+            }
             Some(c) => Engine::Gpu(c),
             None => anyhow::bail!("quantize-moe: no wgpu GPU (set CMF_MOE_HOST=1 to run on the host)"),
         }
