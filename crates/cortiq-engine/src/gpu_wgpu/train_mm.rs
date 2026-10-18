@@ -948,21 +948,53 @@ pub struct BlrScratch {
     pub(super) t2: wgpu::Buffer, // f32 [ntok][r]
 }
 
+/// The transient buffers of the blr ops — each lives only inside one path's
+/// op list — shared by the scratch of every role (one layer runs at a time).
+/// A path's forward reads S_U and S_Vᵀ, its backward S_Uᵀ and S_V, so one
+/// plane buffer per factor serves both orientations.
+pub struct BlrShared {
+    pu: wgpu::Buffer,
+    pv: wgpu::Buffer,
+    xh: wgpu::Buffer,
+    t1: wgpu::Buffer,
+    t2: wgpu::Buffer,
+}
+
+impl BlrShared {
+    /// For roles of at most `mr` = m·r and `nr` = n·r plane entries, `mx` =
+    /// max(m, n, r), `mn` = max(m, n) and rank `r`.
+    pub fn new(c: &Ctx, ntok: usize, mr: usize, nr: usize, mx: usize, mn: usize, r: usize) -> Self {
+        let pr = pad_rows(ntok);
+        BlrShared {
+            pu: f16_buf(c, mr),
+            pv: f16_buf(c, nr),
+            xh: f16_buf(c, pr * mx),
+            t1: train_ops::zeros_u32(c, pr * mn),
+            t2: train_ops::zeros_u32(c, pr * r),
+        }
+    }
+}
+
 impl BlrScratch {
     pub fn new(c: &Ctx, ntok: usize, m: usize, n: usize, r: usize, paths: usize) -> Self {
-        let mx = m.max(n).max(r);
-        let z = |len: usize| train_ops::zeros(c, len);
+        let sh = BlrShared::new(c, ntok, m * r, n * r, m.max(n).max(r), m.max(n), r);
+        Self::with_shared(c, ntok, m, r, paths, &sh)
+    }
+
+    /// A role's scratch: its own a and c per path, the transients from `sh`.
+    pub fn with_shared(c: &Ctx, ntok: usize, m: usize, r: usize, paths: usize, sh: &BlrShared) -> Self {
+        let z = |len: usize| train_ops::zeros_u32(c, len);
         BlrScratch {
             ntok,
-            pl_u: f16_buf(c, m * r),
-            plt_u: f16_buf(c, m * r),
-            pl_v: f16_buf(c, n * r),
-            plt_v: f16_buf(c, n * r),
-            xh: f16_buf(c, pad_rows(ntok) * mx),
+            pl_u: sh.pu.clone(),
+            plt_u: sh.pu.clone(),
+            pl_v: sh.pv.clone(),
+            plt_v: sh.pv.clone(),
+            xh: sh.xh.clone(),
             a: (0..paths).map(|_| z(pad_rows(ntok) * r)).collect(),
             cbuf: (0..paths).map(|_| z(pad_rows(ntok) * m)).collect(),
-            t1: z(pad_rows(ntok) * m.max(n)),
-            t2: z(pad_rows(ntok) * r),
+            t1: sh.t1.clone(),
+            t2: sh.t2.clone(),
         }
     }
 }
