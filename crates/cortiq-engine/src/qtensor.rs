@@ -50,6 +50,12 @@ pub enum QTensor {
         /// an anonymous copy of the quants for mmap pages that go cold.
         repack: Vec<u8>,
     },
+    /// Binary low-rank (`blr`): ±1 paths, signs from the mmap, scales as
+    /// f32 (docs/BLR_NVG.md §3). Every device-graph accessor answers `None`
+    /// for it (whole-token graphs decline to per-op/host paths); the CPU
+    /// kernels live in `crate::blr`, the per-op wgpu kernels in
+    /// `gpu_wgpu::blr`.
+    Blr(Box<crate::blr::BlrTensor>),
 }
 
 /// Load-time q8 repack gate (see `Mapped::repack`). OPT-IN
@@ -320,7 +326,19 @@ impl QTensor {
                 repack: Vec::new(),
             }),
             // q1: binary sign-bit tiles from mmap (1-bit-trained models).
+            // q1g: the same signs as planes with one scale per 128-group.
             TensorDtype::Q1 if cols % GROUP_SIZE == 0 => Ok(Self::Mapped {
+                model: model.clone(),
+                idx,
+                dtype: entry.dtype,
+                rows,
+                cols,
+                row_scale: Vec::new(),
+                col_field: Vec::new(),
+                vbit_offsets: Vec::new(),
+                repack: Vec::new(),
+            }),
+            TensorDtype::Q1G if cols % cortiq_core::quant::Q1G_GROUP == 0 => Ok(Self::Mapped {
                 model: model.clone(),
                 idx,
                 dtype: entry.dtype,
@@ -345,6 +363,13 @@ impl QTensor {
                 vbit_offsets: Vec::new(),
                 repack: Vec::new(),
             }),
+            // blr: factored kernels over the packed signs. CMF_BLR_DENSE=1
+            // dequantizes to f32 instead (A/B parity runs).
+            TensorDtype::BinaryLowRank if std::env::var("CMF_BLR_DENSE").as_deref() != Ok("1") => {
+                Ok(Self::Blr(Box::new(crate::blr::BlrTensor::from_model(
+                    model, idx,
+                )?)))
+            }
             // No fused kernel yet → dequantize once (correct, more RAM).
             _ => {
                 let mut data = vec![0.0f32; rows * cols];
@@ -354,16 +379,41 @@ impl QTensor {
         }
     }
 
-    /// q1-mapped tensor? (GPU gates: the q1 CPU kernel is
-    /// compute-bound, so offload pays at much smaller shapes than q8.)
+    /// Binary low-rank tensor? Fused multi-tensor kernels refuse it and fall
+    /// back to per-tensor calls.
+    pub fn is_blr(&self) -> bool {
+        matches!(self, Self::Blr(_))
+    }
+
+    /// Binary-weight-mapped tensor, q1 or q1g? (GPU gates: the binary CPU
+    /// kernels are compute-bound, so offload pays at much smaller shapes
+    /// than q8.)
     pub(crate) fn is_q1(&self) -> bool {
         matches!(
             self,
             Self::Mapped {
-                dtype: TensorDtype::Q1,
+                dtype: TensorDtype::Q1 | TensorDtype::Q1G,
                 ..
             }
         )
+    }
+
+    /// The binary-weight view (q1 tiles or q1g planes) the shared CPU row
+    /// drivers take; None for every other storage.
+    fn bin_w(&self) -> Option<BinW<'_>> {
+        match self {
+            Self::Mapped {
+                dtype: TensorDtype::Q1,
+                ..
+            } => Some(BinW::Q1(self.quant_bytes())),
+            Self::Mapped {
+                dtype: TensorDtype::Q1G,
+                rows,
+                cols,
+                ..
+            } => Some(BinW::q1g(self.quant_bytes(), *rows, *cols)),
+            _ => None,
+        }
     }
 
     /// Owned-f32 view (data, rows, cols) — the GDN a/b gate projections
@@ -395,6 +445,7 @@ impl QTensor {
                 idx,
                 dtype:
                     TensorDtype::Q1
+                    | TensorDtype::Q1G
                     | TensorDtype::Q1T
                     | TensorDtype::Q4Block
                     | TensorDtype::Q4Tiled
@@ -557,6 +608,7 @@ impl QTensor {
     pub fn rows(&self) -> usize {
         match self {
             Self::F32 { rows, .. } | Self::Mapped { rows, .. } => *rows,
+            Self::Blr(t) => t.rows,
         }
     }
 
@@ -653,6 +705,7 @@ impl QTensor {
     pub fn cols(&self) -> usize {
         match self {
             Self::F32 { cols, .. } | Self::Mapped { cols, .. } => *cols,
+            Self::Blr(t) => t.cols,
         }
     }
 
@@ -676,7 +729,8 @@ impl QTensor {
     /// (model, idx, kind, row_scale) for a graph-capable mapped weight.
     /// kind: 0=q8_row (per-row scales), 1=q1, 2=q4_block, 3=q1t
     /// (tile-embedded, no rs), 5=q4_tiled, 6=q4tp, 7=q8_2f (both scale
-    /// planes live inside the tensor). None only for `vbit`.
+    /// planes live inside the tensor), 9=q2tp, 10=q1g (sign + scale
+    /// planes). None only for `vbit`.
     ///
     /// The old comment here claimed q4_block was unhandled while the arm
     /// right below mapped it, and it named q8_2f as unhandled after that
@@ -710,6 +764,14 @@ impl QTensor {
                 dtype: TensorDtype::Q1,
                 ..
             } => Some((model, *idx, 1, &[])),
+            // Kind 10, never 1: q1g's sign and scale planes are a different
+            // walk from q1's 6-byte tiles (the kind-2/5 mixup taught that).
+            Self::Mapped {
+                model,
+                idx,
+                dtype: TensorDtype::Q1G,
+                ..
+            } => Some((model, *idx, 10, &[])),
             // Q4Tiled is kind 5, NOT 2: both carried 2 historically, and
             // the wgpu token graph fed 18B interleaved tiles to the
             // split-layout q4b kernel — garbage output on q4t models
@@ -769,13 +831,14 @@ impl QTensor {
     pub fn as_f32(&self) -> Option<&[f32]> {
         match self {
             Self::F32 { data, .. } => Some(data),
-            Self::Mapped { .. } => None,
+            Self::Mapped { .. } | Self::Blr(_) => None,
         }
     }
 
     fn quant_bytes(&self) -> &[u8] {
         match self {
             Self::Mapped { model, idx, .. } => model.entry_bytes(&model.tensors[*idx]),
+            Self::Blr(t) => t.bytes(),
             Self::F32 { .. } => unreachable!("quant_bytes on F32"),
         }
     }
@@ -786,6 +849,7 @@ impl QTensor {
         debug_assert_eq!(dst.len(), cols);
         match self {
             Self::F32 { data, .. } => dst.copy_from_slice(&data[r * cols..(r + 1) * cols]),
+            Self::Blr(t) => t.row_f32(r, dst),
             Self::Mapped {
                 model,
                 idx,
@@ -883,6 +947,27 @@ impl QTensor {
                         let tile = &bytes[(r * gpr + gi) * Q1_TILE..(r * gpr + gi + 1) * Q1_TILE];
                         let s = f16_to_f32(u16::from_le_bytes([tile[0], tile[1]]));
                         for (j, &b) in tile[2..].iter().enumerate() {
+                            for k in 0..8 {
+                                dst[gi * GROUP_SIZE + j * 8 + k] =
+                                    (((b >> k) & 1) as f32 * 2.0 - 1.0) * s;
+                            }
+                        }
+                    }
+                    if crate::prism::is_inverse_embedding(model, &model.tensors[*idx].name) {
+                        crate::prism::inverse_embedding(model, dst);
+                    }
+                    return;
+                }
+                if *dtype == TensorDtype::Q1G {
+                    // The tied Bonsai embedding is q1g too: one row = cols/8
+                    // sign bytes + cols/128 scales, same ±s values as q1.
+                    let bytes = self.quant_bytes();
+                    let sc_off = cortiq_core::quant::q1g_scale_offset(self.rows(), cols);
+                    let gpr = cols / GROUP_SIZE;
+                    for gi in 0..gpr {
+                        let t = r * gpr + gi;
+                        let s = f16_to_f32(q1g_scale_bits(bytes, sc_off, t));
+                        for (j, &b) in bytes[t * 4..t * 4 + 4].iter().enumerate() {
                             for k in 0..8 {
                                 dst[gi * GROUP_SIZE + j * 8 + k] =
                                     (((b >> k) & 1) as f32 * 2.0 - 1.0) * s;
@@ -1010,6 +1095,7 @@ impl QTensor {
     pub fn sparse_col_ok(&self) -> bool {
         match self {
             Self::F32 { .. } => true,
+            Self::Blr(_) => false,
             Self::Mapped { dtype, .. } => {
                 matches!(dtype, TensorDtype::Q8Row | TensorDtype::Q8_2f)
             }
@@ -1029,6 +1115,7 @@ impl QTensor {
                     *o += w * data[k * inter + c];
                 }
             }
+            Self::Blr(t) => t.add_col_scaled(c, w, out),
             Self::Mapped {
                 dtype,
                 row_scale,
@@ -1097,6 +1184,13 @@ impl QTensor {
                     *o += w * v;
                 }
             }
+            Self::Blr(t) => {
+                let tmp = &mut scratch[..cols];
+                t.row_f32(r, tmp);
+                for (o, v) in out.iter_mut().zip(tmp.iter()) {
+                    *o += w * v;
+                }
+            }
             Self::Mapped {
                 dtype,
                 row_scale,
@@ -1136,6 +1230,11 @@ impl QTensor {
             Self::F32 { data, .. } => {
                 let row = &data[r * cols..(r + 1) * cols];
                 row.iter().zip(x).map(|(w, v)| w * v).sum()
+            }
+            Self::Blr(t) => {
+                let tmp = &mut scratch[..cols];
+                t.row_f32(r, tmp);
+                tmp.iter().zip(x).map(|(w, v)| w * v).sum()
             }
             Self::Mapped {
                 model,
@@ -1195,6 +1294,15 @@ impl QTensor {
                 if !crate::f32_backend::matvec(data, x, out) {
                     matvec_rows(pool, data, x, out);
                 }
+            }
+            Self::Blr(t) => {
+                if crate::gpu::enabled_here()
+                    && crate::blr::gpu_wanted()
+                    && crate::gpu::blr_matmat(t, &x[..t.cols], 1, &mut out[..t.rows])
+                {
+                    return;
+                }
+                t.matvec(x, out, pool)
             }
             Self::Mapped {
                 model,
@@ -1310,9 +1418,14 @@ impl QTensor {
                                 )
                             }
                         }
-                        TensorDtype::Q1 => {
-                            q1_matvec(self.quant_bytes(), &transformed, *rows, *cols, out, pool)
-                        }
+                        TensorDtype::Q1 | TensorDtype::Q1G => bin_matvec(
+                            self.bin_w().expect("binary dtype"),
+                            &transformed,
+                            *rows,
+                            *cols,
+                            out,
+                            pool,
+                        ),
                         TensorDtype::Q1T => {
                             q1t_matvec(self.quant_bytes(), &transformed, *rows, *cols, out, pool)
                         }
@@ -1430,11 +1543,12 @@ impl QTensor {
                     q2tp_matvec(self.quant_bytes(), x, *rows, *cols, out, pool);
                     return;
                 }
-                if *dtype == TensorDtype::Q1 {
+                if *dtype == TensorDtype::Q1 || *dtype == TensorDtype::Q1G {
                     // GPU route for large q1 matvecs (out_proj / lm_head
                     // class): the CPU q1 kernel is load-port-bound at
                     // ~4 GB/s/core, the GPU one is bandwidth-bound — the
                     // probe measures both arms and keeps the winner.
+                    let w = self.bin_w().expect("binary dtype");
                     if *rows * *cols >= 8_388_608 && crate::gpu::enabled_here() {
                         let t0 = std::time::Instant::now();
                         let arm = if crate::gpu::q1_force() {
@@ -1444,7 +1558,12 @@ impl QTensor {
                         };
                         match arm {
                             crate::gpu::ProbeArm::Gpu => {
-                                if crate::gpu::q1_matvec(model, *idx, x, *rows, *cols, out) {
+                                let ok = if *dtype == TensorDtype::Q1G {
+                                    crate::gpu::q1g_matvec(model, *idx, x, *rows, *cols, out)
+                                } else {
+                                    crate::gpu::q1_matvec(model, *idx, x, *rows, *cols, out)
+                                };
+                                if ok {
                                     crate::gpu::probe_record(
                                         crate::gpu::OpClass::Matvec,
                                         true,
@@ -1454,7 +1573,7 @@ impl QTensor {
                                 }
                             }
                             crate::gpu::ProbeArm::CpuTimed => {
-                                q1_matvec(self.quant_bytes(), x, *rows, *cols, out, pool);
+                                bin_matvec(w, x, *rows, *cols, out, pool);
                                 crate::gpu::probe_record(
                                     crate::gpu::OpClass::Matvec,
                                     false,
@@ -1465,7 +1584,7 @@ impl QTensor {
                             crate::gpu::ProbeArm::Cpu => {}
                         }
                     }
-                    q1_matvec(self.quant_bytes(), x, *rows, *cols, out, pool);
+                    bin_matvec(w, x, *rows, *cols, out, pool);
                     return;
                 }
                 if *dtype == TensorDtype::Q1T {
@@ -1643,6 +1762,10 @@ impl QTensor {
     ) {
         match self {
             Self::F32 { data, .. } => matvec_rows2(pool, data, x1, x2, o1, o2),
+            Self::Blr(_) => {
+                self.matvec(x1, o1, pool);
+                self.matvec(x2, o2, pool);
+            }
             Self::Mapped {
                 model,
                 idx,
@@ -1692,9 +1815,16 @@ impl QTensor {
                                 )
                             }
                         }
-                        TensorDtype::Q1 => {
-                            q1_matvec2(self.quant_bytes(), &tx1, &tx2, *rows, *cols, o1, o2, pool)
-                        }
+                        TensorDtype::Q1 | TensorDtype::Q1G => bin_matvec2(
+                            self.bin_w().expect("binary dtype"),
+                            &tx1,
+                            &tx2,
+                            *rows,
+                            *cols,
+                            o1,
+                            o2,
+                            pool,
+                        ),
                         TensorDtype::Q1T => {
                             q1t_matvec2(self.quant_bytes(), &tx1, &tx2, *rows, *cols, o1, o2, pool)
                         }
@@ -1742,8 +1872,8 @@ impl QTensor {
                     q2tp_matvec2(self.quant_bytes(), x1, x2, *rows, *cols, o1, o2, pool);
                     return;
                 }
-                if *dtype == TensorDtype::Q1 {
-                    q1_matvec2(self.quant_bytes(), x1, x2, *rows, *cols, o1, o2, pool);
+                if let Some(w) = self.bin_w() {
+                    bin_matvec2(w, x1, x2, *rows, *cols, o1, o2, pool);
                     return;
                 }
                 if *dtype == TensorDtype::Q1T {
@@ -1820,8 +1950,20 @@ impl QTensor {
             if let Self::Mapped { model, idx, .. } = self {
                 crate::gptq_capture::accumulate(&model.tensors[*idx].name, xs_all, b, cols);
             }
+            if let Self::Blr(t) = self {
+                crate::gptq_capture::accumulate(t.name(), xs_all, b, cols);
+            }
         }
         match self {
+            Self::Blr(t) => {
+                if crate::gpu::enabled_here()
+                    && crate::blr::gpu_wanted()
+                    && crate::gpu::blr_matmat(t, &xs_all[..b * cols], b, &mut out[..b * rows])
+                {
+                    return;
+                }
+                t.matmat(xs_all, b, out, pool)
+            }
             Self::F32 { data, .. } => {
                 if crate::f32_backend::matmat(data, xs_all, b, rows, cols, out) {
                     return;
@@ -1980,9 +2122,15 @@ impl QTensor {
                                 )
                             }
                         }
-                        TensorDtype::Q1 => {
-                            q1_matmat(self.quant_bytes(), &transformed, b, rows, cols, out, pool)
-                        }
+                        TensorDtype::Q1 | TensorDtype::Q1G => bin_matmat(
+                            self.bin_w().expect("binary dtype"),
+                            &transformed,
+                            b,
+                            rows,
+                            cols,
+                            out,
+                            pool,
+                        ),
                         TensorDtype::Q1T => {
                             q1t_matmat(self.quant_bytes(), &transformed, b, rows, cols, out, pool)
                         }
@@ -2247,9 +2395,11 @@ impl QTensor {
                     q4t_matmat(self.quant_bytes(), xs_all, b, rows, cols, out, pool);
                     return;
                 }
-                if *dtype == TensorDtype::Q1 {
+                if *dtype == TensorDtype::Q1 || *dtype == TensorDtype::Q1G {
                     // GPU batched q1 GEMM for wide prefill (q1_mul_mm on the
                     // device); the probe keeps whichever beats the CPU matmat.
+                    // q1g has the twin `q1g_mul_mm` (cols % 128 by format).
+                    let w = self.bin_w().expect("binary dtype");
                     if b >= 32
                         && b * rows * cols >= 128_000_000
                         && cols % 64 == 0
@@ -2259,9 +2409,16 @@ impl QTensor {
                             let t0 = std::time::Instant::now();
                             match crate::gpu::probe_arm(crate::gpu::OpClass::Matmat) {
                                 crate::gpu::ProbeArm::Gpu => {
-                                    if crate::gpu::q1_matmat(
-                                        model, *idx, xs_all, b, rows, cols, out,
-                                    ) {
+                                    let ok = if *dtype == TensorDtype::Q1G {
+                                        crate::gpu::q1g_matmat(
+                                            model, *idx, xs_all, b, rows, cols, out,
+                                        )
+                                    } else {
+                                        crate::gpu::q1_matmat(
+                                            model, *idx, xs_all, b, rows, cols, out,
+                                        )
+                                    };
+                                    if ok {
                                         crate::gpu::probe_record(
                                             crate::gpu::OpClass::Matmat,
                                             true,
@@ -2271,7 +2428,7 @@ impl QTensor {
                                     }
                                 }
                                 crate::gpu::ProbeArm::CpuTimed => {
-                                    q1_matmat(self.quant_bytes(), xs_all, b, rows, cols, out, pool);
+                                    bin_matmat(w, xs_all, b, rows, cols, out, pool);
                                     crate::gpu::probe_record(
                                         crate::gpu::OpClass::Matmat,
                                         false,
@@ -2283,7 +2440,7 @@ impl QTensor {
                             }
                         }
                     }
-                    q1_matmat(self.quant_bytes(), xs_all, b, rows, cols, out, pool);
+                    bin_matmat(w, xs_all, b, rows, cols, out, pool);
                     return;
                 }
                 if *dtype == TensorDtype::Q1T {
@@ -2503,10 +2660,11 @@ impl QTensor {
         pool: Option<&Pool>,
     ) {
         let total_rows: usize = ts.iter().map(|t| t.rows()).sum();
-        if ts.iter().any(|t| t.has_prism_contract()) {
+        if ts.iter().any(|t| t.has_prism_contract() || t.is_blr()) {
             // The fused range kernels have no transform descriptor.  Let
             // each tensor's ordinary matvec dispatch perform the explicit
             // signed FWHT (and retain CPU fallback for mixed q2tp/q4tp).
+            // blr has no row-range kernel either: per-tensor calls.
             for (t, o) in ts.iter().zip(outs.iter_mut()) {
                 t.matvec(x, o, pool);
             }
@@ -2546,15 +2704,10 @@ impl QTensor {
                 }
             )
         });
-        let uniform_q1 = ts.iter().all(|t| {
-            matches!(
-                t,
-                Self::Mapped {
-                    dtype: TensorDtype::Q1,
-                    ..
-                }
-            )
-        });
+        // q1 and q1g may mix freely: the shared activation split and group
+        // sums are layout-independent, only the row kernel differs.
+        let uniform_q1 =
+            ts.iter().all(|t| t.bin_w().is_some()) && ts.iter().all(|t| t.cols() == ts[0].cols());
         let uniform_q1t = ts.iter().all(|t| {
             matches!(
                 t,
@@ -2670,18 +2823,24 @@ impl QTensor {
                 let gsum = q1_group_sums(&act.xq, ts[0].cols() / GROUP_SIZE);
                 let (act, gsum) = (&act, &gsum);
                 let closures: [_; N] = std::array::from_fn(|i| {
-                    let (bytes, gpr, out) =
-                        (ts[i].quant_bytes(), ts[i].cols() / GROUP_SIZE, outs_addr[i]);
-                    move |s: usize, e: usize| q1_range_a8w8(bytes, gpr, act, gsum, out, s, e)
+                    let (w, gpr, out) = (
+                        ts[i].bin_w().expect("uniform_q1 checked"),
+                        ts[i].cols() / GROUP_SIZE,
+                        outs_addr[i],
+                    );
+                    move |s: usize, e: usize| bin_range_a8w8(w, gpr, act, gsum, out, s, e)
                 });
                 let parts: [(usize, &(dyn Fn(usize, usize) + Sync)); N] =
                     std::array::from_fn(|i| (ts[i].rows(), &closures[i] as _));
                 pool.run_many(&parts);
             } else {
                 let closures: [_; N] = std::array::from_fn(|i| {
-                    let (bytes, gpr, out) =
-                        (ts[i].quant_bytes(), ts[i].cols() / GROUP_SIZE, outs_addr[i]);
-                    move |s: usize, e: usize| q1_range_f32(bytes, gpr, x, out, s, e)
+                    let (w, gpr, out) = (
+                        ts[i].bin_w().expect("uniform_q1 checked"),
+                        ts[i].cols() / GROUP_SIZE,
+                        outs_addr[i],
+                    );
+                    move |s: usize, e: usize| bin_range_f32(w, gpr, x, out, s, e)
                 });
                 let parts: [(usize, &(dyn Fn(usize, usize) + Sync)); N] =
                     std::array::from_fn(|i| (ts[i].rows(), &closures[i] as _));
@@ -2915,7 +3074,7 @@ impl QTensor {
         pool: Option<&Pool>,
     ) {
         let total_rows: usize = ts.iter().map(|t| t.rows()).sum();
-        if ts.iter().any(|t| t.has_prism_contract()) {
+        if ts.iter().any(|t| t.has_prism_contract() || t.is_blr()) {
             for i in 0..N {
                 ts[i].matvec2(x1, x2, o1s[i], o2s[i], pool);
             }
@@ -3187,7 +3346,7 @@ impl QTensor {
         limit: f32,
         pool: Option<&Pool>,
     ) -> bool {
-        if gate.has_prism_contract() || up.has_prism_contract() {
+        if gate.has_prism_contract() || up.has_prism_contract() || gate.is_blr() || up.is_blr() {
             // The fused gate/up kernels consume x directly.  Prism requires
             // a per-matrix signed FWHT, so the caller must use two ordinary
             // descriptor-aware matvecs instead of an unrotated fast path.
@@ -3326,29 +3485,30 @@ impl QTensor {
             // activation group sums are shared by both streams. Without
             // this arm a q1 dense FFN paid two dispatches + a combine
             // loop — the exact barrier this function exists to remove.
+            // q1g (and a q1/q1g mix) rides the same arm through `BinW`.
             (
                 Self::Mapped {
-                    dtype: TensorDtype::Q1,
+                    dtype: TensorDtype::Q1 | TensorDtype::Q1G,
                     ..
                 },
                 Self::Mapped {
-                    dtype: TensorDtype::Q1,
+                    dtype: TensorDtype::Q1 | TensorDtype::Q1G,
                     ..
                 },
             ) => {
-                let g_bytes = gate.quant_bytes();
-                let u_bytes = up.quant_bytes();
+                let gw = gate.bin_w().expect("binary dtype matched");
+                let uw = up.bin_w().expect("binary dtype matched");
                 let gpr = gate.cols() / GROUP_SIZE;
                 let gsum = q1_group_sums(&act.xq, gpr);
                 let gsum = &gsum;
                 let run = move |start: usize, end: usize| {
                     for r in start..end {
-                        let mut gv = dot_q1_row_i8(g_bytes, r, gpr, &act.xq, gsum) * act.sx;
-                        let mut uv = dot_q1_row_i8(u_bytes, r, gpr, &act.xq, gsum) * act.sx;
+                        let mut gv = gw.dot_i8(r, gpr, &act.xq, gsum) * act.sx;
+                        let mut uv = uw.dot_i8(r, gpr, &act.xq, gsum) * act.sx;
                         for &(j, xv) in &act.outliers {
-                            let (w, s) = q1_outlier(g_bytes, r, gpr, j);
+                            let (w, s) = gw.outlier(r, gpr, j);
                             gv += w * s * xv;
-                            let (w, s) = q1_outlier(u_bytes, r, gpr, j);
+                            let (w, s) = uw.outlier(r, gpr, j);
                             uv += w * s * xv;
                         }
                         // SAFETY: disjoint row ranges per worker.
@@ -3504,6 +3664,9 @@ impl QTensor {
         if pairs.is_empty() || pairs.len() != outs.len() {
             return false;
         }
+        if pairs.iter().any(|(g, u)| g.is_blr() || u.is_blr()) {
+            return false;
+        }
         if !a8w8_enabled() {
             if limit > 0.0 {
                 // The exact-row fallback applies no SwiGLU clamp; the
@@ -3620,6 +3783,9 @@ impl QTensor {
         if downs.is_empty() || downs.len() != gs.len() || downs.len() != weights.len() {
             return false;
         }
+        if downs.iter().any(|d| d.is_blr()) {
+            return false;
+        }
         if !a8w8_enabled() {
             let mut terms = vec![vec![0.0; out.len()]; downs.len()];
             if !Self::moe_down_rows(downs, &vec![1; downs.len()], gs, &mut terms, pool) {
@@ -3708,6 +3874,9 @@ impl QTensor {
         pool: Option<&Pool>,
     ) -> bool {
         if pairs.is_empty() || pairs.len() != groups.len() {
+            return false;
+        }
+        if pairs.iter().any(|(g, u)| g.is_blr() || u.is_blr()) {
             return false;
         }
         let inter = pairs[0].0.rows();
@@ -3811,6 +3980,9 @@ impl QTensor {
         pool: Option<&Pool>,
     ) -> bool {
         if downs.is_empty() || downs.len() != group_lens.len() {
+            return false;
+        }
+        if downs.iter().any(|d| d.is_blr()) {
             return false;
         }
         let rows = downs[0].rows();
@@ -4060,25 +4232,36 @@ pub fn sgemm_public(
     {
         sgemm_rm(m, n, k, alpha, a, lda, b_mat, ldb, b_rows_are_n, c, ldc);
     }
-    // x86 without Accelerate has no sgemm_rm: the specialized paths there are
-    // quantized kernels, not an f32 GEMM. Only the offline AWNP pass reaches
-    // this, so correctness matters and throughput does not — a triple loop is
-    // the honest fallback rather than a reason to make the tool macOS-only.
+    // x86 without Accelerate has no sgemm_rm (the specialized paths there are
+    // quantized kernels): the packed AVX/FMA/AVX-512 kernels of
+    // matrixmultiply, single-threaded — offline callers split rows across
+    // their own threads.
     #[cfg(not(any(target_os = "macos", target_arch = "aarch64")))]
     {
-        for i in 0..m {
-            for j in 0..n {
-                let mut acc = 0f32;
-                for p in 0..k {
-                    let bv = if b_rows_are_n {
-                        b_mat[j * ldb + p]
-                    } else {
-                        b_mat[p * ldb + j]
-                    };
-                    acc += a[i * lda + p] * bv;
-                }
-                c[i * ldc + j] = alpha * acc;
-            }
+        if m == 0 || n == 0 {
+            return;
+        }
+        assert!(a.len() >= (m - 1) * lda + k && c.len() >= (m - 1) * ldc + n);
+        let (rsb, csb) = if b_rows_are_n { (1, ldb as isize) } else { (ldb as isize, 1) };
+        assert!(k == 0 || b_mat.len() > if b_rows_are_n { (n - 1) * ldb + k - 1 } else { (k - 1) * ldb + n - 1 });
+        // SAFETY: the asserts above bound every element the strides reach.
+        unsafe {
+            matrixmultiply::sgemm(
+                m,
+                k,
+                n,
+                alpha,
+                a.as_ptr(),
+                lda as isize,
+                1,
+                b_mat.as_ptr(),
+                rsb,
+                csb,
+                0.0,
+                c.as_mut_ptr(),
+                ldc as isize,
+                1,
+            );
         }
     }
 }
@@ -7594,11 +7777,11 @@ fn q1_row_exact(bytes: &[u8], r: usize, gpr: usize, x: &[f32]) -> f32 {
     acc
 }
 
-/// One q1 row range via A8W8 (the body of `q1_matvec`'s hot loop,
-/// extracted so multi-matrix jobs drive the same kernel).
+/// One binary-weight row range via A8W8 (the body of `bin_matvec`'s hot
+/// loop, extracted so multi-matrix jobs drive the same kernel).
 #[allow(clippy::too_many_arguments)]
-fn q1_range_a8w8(
-    bytes: &[u8],
+fn bin_range_a8w8(
+    w: BinW,
     gpr: usize,
     act: &SplitAct,
     gsum: &[i32],
@@ -7607,22 +7790,703 @@ fn q1_range_a8w8(
     end: usize,
 ) {
     for r in start..end {
-        let mut acc = dot_q1_row_i8(bytes, r, gpr, &act.xq, gsum) * act.sx;
+        let mut acc = w.dot_i8(r, gpr, &act.xq, gsum) * act.sx;
         for &(j, xv) in &act.outliers {
-            let (w, s) = q1_outlier(bytes, r, gpr, j);
-            acc += w * s * xv;
+            let (wv, s) = w.outlier(r, gpr, j);
+            acc += wv * s * xv;
         }
         // SAFETY: disjoint row ranges per worker.
         unsafe { *out.at(r) = acc };
     }
 }
 
-/// Exact-scalar q1 row range (CMF_SDOT=0 contract).
-fn q1_range_f32(bytes: &[u8], gpr: usize, x: &[f32], out: SendMut, start: usize, end: usize) {
+/// Exact-scalar binary-weight row range (CMF_SDOT=0 contract).
+fn bin_range_f32(w: BinW, gpr: usize, x: &[f32], out: SendMut, start: usize, end: usize) {
     for r in start..end {
         // SAFETY: disjoint row ranges per worker.
-        unsafe { *out.at(r) = q1_row_exact(bytes, r, gpr, x) };
+        unsafe { *out.at(r) = w.row_exact(r, gpr, x) };
     }
+}
+
+/// A binary (±s) weight in either of its layouts: `q1` 6-byte tiles, or
+/// `q1g` planes with one scale per 128-group. The row drivers — matvec,
+/// matvec2, matmat, the multi-projection job and the fused gate/up pair —
+/// are written once against this; only the per-row kernels differ, and
+/// the match costs one predictable branch per row. `gpr` is always the
+/// row's count of 32-tiles (cols / 32): the activation group sums and the
+/// tile walk are shared by both layouts.
+#[derive(Clone, Copy)]
+pub(crate) enum BinW<'a> {
+    Q1(&'a [u8]),
+    Q1g {
+        bytes: &'a [u8],
+        /// Byte offset of the f16 scale plane (= rows · cols/8).
+        sc_off: usize,
+        /// Row count: the q1 kernels treat the payload's final row
+        /// specially (see `dot_q1g_row_sdot`), and q1g mirrors that.
+        rows: usize,
+    },
+}
+
+impl<'a> BinW<'a> {
+    fn q1g(bytes: &'a [u8], rows: usize, cols: usize) -> Self {
+        Self::Q1g {
+            bytes,
+            sc_off: cortiq_core::quant::q1g_scale_offset(rows, cols),
+            rows,
+        }
+    }
+
+    #[inline]
+    fn dot_i8(self, r: usize, gpr: usize, xq: &[i8], gsum: &[i32]) -> f32 {
+        match self {
+            Self::Q1(b) => dot_q1_row_i8(b, r, gpr, xq, gsum),
+            Self::Q1g {
+                bytes,
+                sc_off,
+                rows,
+            } => dot_q1g_row_i8(bytes, sc_off, rows, r, gpr, xq, gsum),
+        }
+    }
+
+    #[inline]
+    fn row_exact(self, r: usize, gpr: usize, x: &[f32]) -> f32 {
+        match self {
+            Self::Q1(b) => q1_row_exact(b, r, gpr, x),
+            Self::Q1g { bytes, sc_off, .. } => q1g_row_exact(bytes, sc_off, r, gpr, x),
+        }
+    }
+
+    #[inline]
+    fn outlier(self, r: usize, gpr: usize, j: usize) -> (f32, f32) {
+        match self {
+            Self::Q1(b) => q1_outlier(b, r, gpr, j),
+            Self::Q1g { bytes, sc_off, .. } => q1g_outlier(bytes, sc_off, r, gpr, j),
+        }
+    }
+
+    /// Blocked 1×4 row (one unpack, four activation streams).
+    ///
+    /// # Safety
+    /// The SDOT/dotprod target feature must be present (`sdot_enabled`).
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    unsafe fn dot_1x4_sdot(
+        self,
+        r: usize,
+        gpr: usize,
+        xs: [&[i8]; 4],
+        gs: [&[i32]; 4],
+    ) -> [f32; 4] {
+        // SAFETY: forwarded caller contract.
+        unsafe {
+            match self {
+                Self::Q1(b) => dot_q1_row_1x4_sdot(b, r, gpr, xs, gs),
+                Self::Q1g {
+                    bytes,
+                    sc_off,
+                    rows,
+                } => dot_q1g_row_1x4_sdot(bytes, sc_off, rows, r, gpr, xs, gs),
+            }
+        }
+    }
+
+    /// Blocked 1×4 row on x86 (VNNI when the tile switch is on).
+    ///
+    /// # Safety
+    /// AVX2 must be present (`avx2_enabled`).
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    unsafe fn dot_1x4_x86(self, r: usize, gpr: usize, xs: [&[i8]; 4], gs: [&[i32]; 4]) -> [f32; 4] {
+        // SAFETY: forwarded caller contract.
+        unsafe {
+            match (self, vnni_tiles_enabled()) {
+                (Self::Q1(b), true) => dot_q1_row_1x4_vnni(b, r, gpr, xs, gs),
+                (Self::Q1(b), false) => dot_q1_row_1x4_avx2(b, r, gpr, xs, gs),
+                (Self::Q1g { bytes, sc_off, .. }, true) => {
+                    dot_q1g_row_1x4_vnni(bytes, sc_off, r, gpr, xs, gs)
+                }
+                (Self::Q1g { bytes, sc_off, .. }, false) => {
+                    dot_q1g_row_1x4_avx2(bytes, sc_off, r, gpr, xs, gs)
+                }
+            }
+        }
+    }
+}
+
+// ── q1g (dtype 20): binary weights, ONE f16 scale per 128-group, in sign
+// and scale PLANES (`[bits: rows·cols/8][f16: rows·cols/128]`). Same
+// kernel family as q1 and — deliberately — the same float accumulation
+// order (one `acc += d·s` per 32-tile, the group's scale reused four
+// times), so a q1g repack of a q1 tensor whose tile scales agree gives
+// the same f32 outputs bit for bit on every path. The win is the stream:
+// 18 bytes per 128 weights instead of 24, the bits 16-byte aligned. ──
+
+/// Sign bits of q1g tile `t` (flat 32-tile index `r·gpr + gi`).
+#[inline]
+fn q1g_bits(bytes: &[u8], t: usize) -> u32 {
+    u32::from_le_bytes([
+        bytes[t * 4],
+        bytes[t * 4 + 1],
+        bytes[t * 4 + 2],
+        bytes[t * 4 + 3],
+    ])
+}
+
+/// Raw f16 bits of the scale of the 128-group holding q1g tile `t`.
+#[inline]
+fn q1g_scale_bits(bytes: &[u8], sc_off: usize, t: usize) -> u16 {
+    let o = sc_off + (t / 4) * 2;
+    u16::from_le_bytes([bytes[o], bytes[o + 1]])
+}
+
+/// One q1g row via the A8W8 int8 path (dispatch twin of `dot_q1_row_i8`).
+#[allow(unreachable_code)]
+#[allow(clippy::too_many_arguments)]
+fn dot_q1g_row_i8(
+    bytes: &[u8],
+    sc_off: usize,
+    rows: usize,
+    r: usize,
+    gpr: usize,
+    xq: &[i8],
+    gsum: &[i32],
+) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        return dot_q1g_row_sdot(bytes, sc_off, rows, r, gpr, xq, gsum);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if avx2_enabled() {
+        unsafe {
+            if vnni_tiles_enabled() {
+                return dot_q1g_row_vnni(bytes, sc_off, r, gpr, xq, gsum);
+            }
+            return dot_q1g_row_avx2(bytes, sc_off, r, gpr, xq, gsum);
+        }
+    }
+    let _ = (gsum, rows);
+    let mut acc = 0f32;
+    for gi in 0..gpr {
+        let t = r * gpr + gi;
+        let s = f16_to_f32(q1g_scale_bits(bytes, sc_off, t));
+        let bits = q1g_bits(bytes, t);
+        let mut d = 0i32;
+        for k in 0..GROUP_SIZE {
+            let w = ((bits >> k) & 1) as i32 * 2 - 1;
+            d += w * xq[gi * GROUP_SIZE + k] as i32;
+        }
+        acc += d as f32 * s;
+    }
+    acc
+}
+
+/// Four tiles' unreduced `i32×8` partial sums → `[Σ0, Σ1, Σ2, Σ3]` in one
+/// hadd tree: 3 hadds + 1 add for four tiles where the per-tile reduce of
+/// the q1 kernels costs 7 ops each. Integer math, so any order gives the
+/// q1 kernel's per-tile sums exactly.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn q1g_hsum4(
+    d0: core::arch::x86_64::__m256i,
+    d1: core::arch::x86_64::__m256i,
+    d2: core::arch::x86_64::__m256i,
+    d3: core::arch::x86_64::__m256i,
+) -> core::arch::x86_64::__m128i {
+    // SAFETY: pure register math.
+    unsafe {
+        use core::arch::x86_64::*;
+        let h = _mm256_hadd_epi32(_mm256_hadd_epi32(d0, d1), _mm256_hadd_epi32(d2, d3));
+        _mm_add_epi32(_mm256_castsi256_si128(h), _mm256_extracti128_si256::<1>(h))
+    }
+}
+
+/// One 128-group's epilogue, in q1's float order: `d = 2·Σset − Σx` per
+/// tile (exact i32 → exact f32), then `acc += d·s` tile by tile — four
+/// separately rounded multiply/add pairs, the q1 kernels' sequence.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn q1g_group_acc(
+    acc: f32,
+    msum4: core::arch::x86_64::__m128i,
+    gsum4: &[i32],
+    s: f32,
+) -> f32 {
+    // SAFETY: gsum4 holds the group's four tile sums (callers slice it).
+    unsafe {
+        use core::arch::x86_64::*;
+        let g = _mm_loadu_si128(gsum4.as_ptr() as *const __m128i);
+        let d = _mm_cvtepi32_ps(_mm_sub_epi32(_mm_slli_epi32::<1>(msum4), g));
+        let mut f = [0f32; 4];
+        _mm_storeu_ps(f.as_mut_ptr(), d);
+        let mut acc = acc;
+        for v in f {
+            acc += v * s;
+        }
+        acc
+    }
+}
+
+/// AVX2 q1g row: `dot_q1_row_avx2`'s mask/select/maddubs per tile, but the
+/// four tiles of a 128-group reduce together (`q1g_hsum4`) and the scale
+/// converts once per group — bit-identical results (integer sums, then
+/// q1's per-tile float sequence), fewer horizontal ops and f16 decodes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_q1g_row_avx2(
+    bytes: &[u8],
+    sc_off: usize,
+    r: usize,
+    gpr: usize,
+    xq: &[i8],
+    gsum: &[i32],
+) -> f32 {
+    // SAFETY: callers uphold the plane-length and xq/gsum contracts
+    // (gpr % 4 == 0, xq.len() == gpr·32, gsum.len() == gpr).
+    unsafe {
+        use core::arch::x86_64::*;
+        let expand = _mm256_setr_epi8(
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3,
+            3, 3, 3,
+        );
+        let bitsel = _mm256_setr_epi8(
+            1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64,
+            -128, 1, 2, 4, 8, 16, 32, 64, -128,
+        );
+        let ones8 = _mm256_set1_epi8(1);
+        let ones16 = _mm256_set1_epi16(1);
+        let bp = bytes.as_ptr().add(r * gpr * 4);
+        let mut acc = 0f32;
+        let mut gi = 0;
+        while gi < gpr {
+            let s = f16_to_f32(q1g_scale_bits(bytes, sc_off, r * gpr + gi));
+            let mut d = [_mm256_setzero_si256(); 4];
+            for (k, dk) in d.iter_mut().enumerate() {
+                let t = gi + k;
+                let bits = (bp.add(t * 4) as *const u32).read_unaligned();
+                let bc = _mm256_shuffle_epi8(_mm256_set1_epi32(bits as i32), expand);
+                let mask = _mm256_cmpeq_epi8(_mm256_and_si256(bc, bitsel), bitsel);
+                let x = _mm256_loadu_si256(xq.as_ptr().add(t * GROUP_SIZE) as *const __m256i);
+                let sel = _mm256_and_si256(x, mask);
+                *dk = _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, sel), ones16);
+            }
+            let m4 = q1g_hsum4(d[0], d[1], d[2], d[3]);
+            acc = q1g_group_acc(acc, m4, &gsum[gi..gi + 4], s);
+            gi += 4;
+        }
+        acc
+    }
+}
+
+/// VNNI twin of `dot_q1g_row_avx2`: `vpdpbusd(1u8, sel)` per tile (the
+/// same i32 lanes as maddubs+madd — bounded products), same group reduce.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vnni")]
+unsafe fn dot_q1g_row_vnni(
+    bytes: &[u8],
+    sc_off: usize,
+    r: usize,
+    gpr: usize,
+    xq: &[i8],
+    gsum: &[i32],
+) -> f32 {
+    // SAFETY: callers uphold the plane-length and xq/gsum contracts.
+    unsafe {
+        use core::arch::x86_64::*;
+        let expand = _mm256_setr_epi8(
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3,
+            3, 3, 3,
+        );
+        let bitsel = _mm256_setr_epi8(
+            1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64,
+            -128, 1, 2, 4, 8, 16, 32, 64, -128,
+        );
+        let ones8 = _mm256_set1_epi8(1);
+        let bp = bytes.as_ptr().add(r * gpr * 4);
+        let mut acc = 0f32;
+        let mut gi = 0;
+        while gi < gpr {
+            let s = f16_to_f32(q1g_scale_bits(bytes, sc_off, r * gpr + gi));
+            let mut d = [_mm256_setzero_si256(); 4];
+            for (k, dk) in d.iter_mut().enumerate() {
+                let t = gi + k;
+                let bits = (bp.add(t * 4) as *const u32).read_unaligned();
+                let bc = _mm256_shuffle_epi8(_mm256_set1_epi32(bits as i32), expand);
+                let mask = _mm256_cmpeq_epi8(_mm256_and_si256(bc, bitsel), bitsel);
+                let x = _mm256_loadu_si256(xq.as_ptr().add(t * GROUP_SIZE) as *const __m256i);
+                *dk = _mm256_dpbusd_epi32(_mm256_setzero_si256(), ones8, _mm256_and_si256(x, mask));
+            }
+            let m4 = q1g_hsum4(d[0], d[1], d[2], d[3]);
+            acc = q1g_group_acc(acc, m4, &gsum[gi..gi + 4], s);
+            gi += 4;
+        }
+        acc
+    }
+}
+
+/// Blocked 1×4 AVX2 q1g row: each tile's mask is built once and serves
+/// four activation streams; per stream, the group reduce and float order
+/// of `dot_q1g_row_avx2` (so batch == matvec bit for bit).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_q1g_row_1x4_avx2(
+    bytes: &[u8],
+    sc_off: usize,
+    r: usize,
+    gpr: usize,
+    xs: [&[i8]; 4],
+    gsums: [&[i32]; 4],
+) -> [f32; 4] {
+    // SAFETY: callers uphold the plane-length and xq/gsum contracts.
+    unsafe {
+        use core::arch::x86_64::*;
+        let expand = _mm256_setr_epi8(
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3,
+            3, 3, 3,
+        );
+        let bitsel = _mm256_setr_epi8(
+            1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64,
+            -128, 1, 2, 4, 8, 16, 32, 64, -128,
+        );
+        let ones8 = _mm256_set1_epi8(1);
+        let ones16 = _mm256_set1_epi16(1);
+        let bp = bytes.as_ptr().add(r * gpr * 4);
+        let mut acc = [0f32; 4];
+        let mut gi = 0;
+        while gi < gpr {
+            let s = f16_to_f32(q1g_scale_bits(bytes, sc_off, r * gpr + gi));
+            // d[stream][tile]
+            let mut d = [[_mm256_setzero_si256(); 4]; 4];
+            for t in 0..4 {
+                let bits = (bp.add((gi + t) * 4) as *const u32).read_unaligned();
+                let bc = _mm256_shuffle_epi8(_mm256_set1_epi32(bits as i32), expand);
+                let mask = _mm256_cmpeq_epi8(_mm256_and_si256(bc, bitsel), bitsel);
+                for (k, xq) in xs.iter().enumerate() {
+                    let x = _mm256_loadu_si256(
+                        xq.as_ptr().add((gi + t) * GROUP_SIZE) as *const __m256i
+                    );
+                    let sel = _mm256_and_si256(x, mask);
+                    d[k][t] = _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, sel), ones16);
+                }
+            }
+            for k in 0..4 {
+                let m4 = q1g_hsum4(d[k][0], d[k][1], d[k][2], d[k][3]);
+                acc[k] = q1g_group_acc(acc[k], m4, &gsums[k][gi..gi + 4], s);
+            }
+            gi += 4;
+        }
+        acc
+    }
+}
+
+/// VNNI twin of `dot_q1g_row_1x4_avx2`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avx512f,avx512bw,avx512vl,avx512vnni")]
+unsafe fn dot_q1g_row_1x4_vnni(
+    bytes: &[u8],
+    sc_off: usize,
+    r: usize,
+    gpr: usize,
+    xs: [&[i8]; 4],
+    gsums: [&[i32]; 4],
+) -> [f32; 4] {
+    // SAFETY: callers uphold the plane-length and xq/gsum contracts.
+    unsafe {
+        use core::arch::x86_64::*;
+        let expand = _mm256_setr_epi8(
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3,
+            3, 3, 3,
+        );
+        let bitsel = _mm256_setr_epi8(
+            1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64,
+            -128, 1, 2, 4, 8, 16, 32, 64, -128,
+        );
+        let ones8 = _mm256_set1_epi8(1);
+        let bp = bytes.as_ptr().add(r * gpr * 4);
+        let mut acc = [0f32; 4];
+        let mut gi = 0;
+        while gi < gpr {
+            let s = f16_to_f32(q1g_scale_bits(bytes, sc_off, r * gpr + gi));
+            let mut d = [[_mm256_setzero_si256(); 4]; 4];
+            for t in 0..4 {
+                let bits = (bp.add((gi + t) * 4) as *const u32).read_unaligned();
+                let bc = _mm256_shuffle_epi8(_mm256_set1_epi32(bits as i32), expand);
+                let mask = _mm256_cmpeq_epi8(_mm256_and_si256(bc, bitsel), bitsel);
+                for (k, xq) in xs.iter().enumerate() {
+                    let x = _mm256_loadu_si256(
+                        xq.as_ptr().add((gi + t) * GROUP_SIZE) as *const __m256i
+                    );
+                    d[k][t] = _mm256_dpbusd_epi32(
+                        _mm256_setzero_si256(),
+                        ones8,
+                        _mm256_and_si256(x, mask),
+                    );
+                }
+            }
+            for k in 0..4 {
+                let m4 = q1g_hsum4(d[k][0], d[k][1], d[k][2], d[k][3]);
+                acc[k] = q1g_group_acc(acc[k], m4, &gsums[k][gi..gi + 4], s);
+            }
+            gi += 4;
+        }
+        acc
+    }
+}
+
+/// SDOT q1g row: the `dot_q1_row_sdot` math on the plane layout. One
+/// aligned 16-byte load carries a whole 128-group's signs (q1 needs two
+/// pair loads and a TBL gather of four scales for the same weights), TBL
+/// replicates each sign byte across 8 lanes for vtst, and the group's ONE
+/// scale converts once (FCVTL, exact) and broadcasts. Lane order, the
+/// vpaddq tree, the fma into the four lane accumulators and the tail are
+/// the q1 kernel's — including its quirk: q1's pair load reads 4 bytes
+/// past the 4th tile, so the payload's final four tiles (last row) take
+/// the scalar tail there. q1g has no overread, but takes the same tail on
+/// the last row to stay bit-identical to q1.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn dot_q1g_row_sdot(
+    bytes: &[u8],
+    sc_off: usize,
+    rows: usize,
+    r: usize,
+    gpr: usize,
+    xq: &[i8],
+    gsum: &[i32],
+) -> f32 {
+    // SAFETY: callers uphold the plane-length and xq/gsum contracts
+    // (gpr % 4 == 0, xq.len() == gpr·32, gsum.len() == gpr).
+    unsafe {
+        use core::arch::aarch64::*;
+        use core::arch::asm;
+        const MASKS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+        // Tile t of the group = sign bytes 4t..4t+4 of the 16-byte load.
+        const IW: [[u8; 16]; 8] = [
+            [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1],
+            [2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3],
+            [4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5],
+            [6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7],
+            [8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9],
+            [
+                10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11,
+            ],
+            [
+                12, 12, 12, 12, 12, 12, 12, 12, 13, 13, 13, 13, 13, 13, 13, 13,
+            ],
+            [
+                14, 14, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15,
+            ],
+        ];
+        let m = vld1q_u8(MASKS.as_ptr());
+        let iw: [uint8x16_t; 8] = core::array::from_fn(|i| vld1q_u8(IW[i].as_ptr()));
+        macro_rules! tile_dot {
+            ($w0:expr, $w1:expr, $x:expr) => {{
+                let x0 = vld1q_s8($x);
+                let x1 = vld1q_s8($x.add(16));
+                let (mut a0, mut a1) = (vdupq_n_s32(0), vdupq_n_s32(0));
+                asm!(
+                    "sdot {a0:v}.4s, {w0:v}.16b, {x0:v}.16b",
+                    "sdot {a1:v}.4s, {w1:v}.16b, {x1:v}.16b",
+                    a0 = inout(vreg) a0, a1 = inout(vreg) a1,
+                    w0 = in(vreg) $w0, x0 = in(vreg) x0, w1 = in(vreg) $w1, x1 = in(vreg) x1,
+                    options(pure, nomem, nostack),
+                );
+                vaddq_s32(a0, a1)
+            }};
+        }
+        macro_rules! tbl_mask {
+            ($ld:expr, $i:expr) => {
+                vreinterpretq_s8_u8(vtstq_u8(vqtbl1q_u8($ld, iw[$i]), m))
+            };
+        }
+        let bp = bytes.as_ptr().add(r * gpr * 4);
+        let xp = xq.as_ptr();
+        let gp = gsum.as_ptr();
+        let vec_end = if r + 1 == rows { gpr - 4 } else { gpr };
+        let mut accv = vdupq_n_f32(0.0);
+        let mut gi = 0;
+        while gi + 4 <= vec_end {
+            let ld = vld1q_u8(bp.add(gi * 4));
+            let d0 = tile_dot!(tbl_mask!(ld, 0), tbl_mask!(ld, 1), xp.add(gi * GROUP_SIZE));
+            let d1 = tile_dot!(
+                tbl_mask!(ld, 2),
+                tbl_mask!(ld, 3),
+                xp.add((gi + 1) * GROUP_SIZE)
+            );
+            let d2 = tile_dot!(
+                tbl_mask!(ld, 4),
+                tbl_mask!(ld, 5),
+                xp.add((gi + 2) * GROUP_SIZE)
+            );
+            let d3 = tile_dot!(
+                tbl_mask!(ld, 6),
+                tbl_mask!(ld, 7),
+                xp.add((gi + 3) * GROUP_SIZE)
+            );
+            let neg = vpaddq_s32(vpaddq_s32(d0, d1), vpaddq_s32(d2, d3));
+            let g = vld1q_s32(gp.add(gi));
+            let dots = vnegq_s32(vaddq_s32(vshlq_n_s32::<1>(neg), g));
+            let h = vdup_n_u16(q1g_scale_bits(bytes, sc_off, r * gpr + gi));
+            let scf: float32x4_t;
+            asm!(
+                "fcvtl {o:v}.4s, {i:v}.4h",
+                o = out(vreg) scf, i = in(vreg) h,
+                options(pure, nomem, nostack),
+            );
+            accv = vfmaq_f32(accv, vcvtq_f32_s32(dots), scf);
+            gi += 4;
+        }
+        let mut acc = vaddvq_f32(accv);
+        while gi < gpr {
+            let t = bp.add(gi * 4);
+            let s = f16_to_f32(q1g_scale_bits(bytes, sc_off, r * gpr + gi));
+            let v0 = vcombine_u8(vdup_n_u8(*t), vdup_n_u8(*t.add(1)));
+            let v1 = vcombine_u8(vdup_n_u8(*t.add(2)), vdup_n_u8(*t.add(3)));
+            let w0 = vreinterpretq_s8_u8(vtstq_u8(v0, m));
+            let w1 = vreinterpretq_s8_u8(vtstq_u8(v1, m));
+            let d = vaddvq_s32(tile_dot!(w0, w1, xp.add(gi * GROUP_SIZE)));
+            acc += (-(2 * d + *gp.add(gi))) as f32 * s;
+            gi += 1;
+        }
+        acc
+    }
+}
+
+/// Blocked q1g 1×4: one unpack of the group serves four activation
+/// streams; per stream bit-identical to `dot_q1g_row_sdot` (and so to the
+/// q1 1×4 kernel, same last-row tail).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn dot_q1g_row_1x4_sdot(
+    bytes: &[u8],
+    sc_off: usize,
+    rows: usize,
+    r: usize,
+    gpr: usize,
+    xs: [&[i8]; 4],
+    gs: [&[i32]; 4],
+) -> [f32; 4] {
+    // SAFETY: same contracts as `dot_q1g_row_sdot`, ×4.
+    unsafe {
+        use core::arch::aarch64::*;
+        use core::arch::asm;
+        const MASKS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+        const IW: [[u8; 16]; 8] = [
+            [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1],
+            [2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3],
+            [4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5],
+            [6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7],
+            [8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9],
+            [
+                10, 10, 10, 10, 10, 10, 10, 10, 11, 11, 11, 11, 11, 11, 11, 11,
+            ],
+            [
+                12, 12, 12, 12, 12, 12, 12, 12, 13, 13, 13, 13, 13, 13, 13, 13,
+            ],
+            [
+                14, 14, 14, 14, 14, 14, 14, 14, 15, 15, 15, 15, 15, 15, 15, 15,
+            ],
+        ];
+        let m = vld1q_u8(MASKS.as_ptr());
+        let iw: [uint8x16_t; 8] = core::array::from_fn(|i| vld1q_u8(IW[i].as_ptr()));
+        macro_rules! sdot2 {
+            ($w0:expr, $w1:expr, $x:expr) => {{
+                let x0 = vld1q_s8($x);
+                let x1 = vld1q_s8($x.add(16));
+                let (mut a0, mut a1) = (vdupq_n_s32(0), vdupq_n_s32(0));
+                asm!(
+                    "sdot {a0:v}.4s, {w0:v}.16b, {x0:v}.16b",
+                    "sdot {a1:v}.4s, {w1:v}.16b, {x1:v}.16b",
+                    a0 = inout(vreg) a0, a1 = inout(vreg) a1,
+                    w0 = in(vreg) $w0, x0 = in(vreg) x0, w1 = in(vreg) $w1, x1 = in(vreg) x1,
+                    options(pure, nomem, nostack),
+                );
+                vaddq_s32(a0, a1)
+            }};
+        }
+        let bp = bytes.as_ptr().add(r * gpr * 4);
+        let vec_end = if r + 1 == rows { gpr - 4 } else { gpr };
+        let mut accv = [vdupq_n_f32(0.0); 4];
+        let mut gi = 0;
+        while gi + 4 <= vec_end {
+            let ld = vld1q_u8(bp.add(gi * 4));
+            // Unpack ONCE — eight ±mask vectors serve all four streams.
+            let w: [int8x16_t; 8] =
+                core::array::from_fn(|i| vreinterpretq_s8_u8(vtstq_u8(vqtbl1q_u8(ld, iw[i]), m)));
+            let h = vdup_n_u16(q1g_scale_bits(bytes, sc_off, r * gpr + gi));
+            let scf: float32x4_t;
+            asm!(
+                "fcvtl {o:v}.4s, {i:v}.4h",
+                o = out(vreg) scf, i = in(vreg) h,
+                options(pure, nomem, nostack),
+            );
+            for k in 0..4 {
+                let xp = xs[k].as_ptr();
+                let d0 = sdot2!(w[0], w[1], xp.add(gi * GROUP_SIZE));
+                let d1 = sdot2!(w[2], w[3], xp.add((gi + 1) * GROUP_SIZE));
+                let d2 = sdot2!(w[4], w[5], xp.add((gi + 2) * GROUP_SIZE));
+                let d3 = sdot2!(w[6], w[7], xp.add((gi + 3) * GROUP_SIZE));
+                let neg = vpaddq_s32(vpaddq_s32(d0, d1), vpaddq_s32(d2, d3));
+                let g = vld1q_s32(gs[k].as_ptr().add(gi));
+                let dots = vnegq_s32(vaddq_s32(vshlq_n_s32::<1>(neg), g));
+                accv[k] = vfmaq_f32(accv[k], vcvtq_f32_s32(dots), scf);
+            }
+            gi += 4;
+        }
+        let mut acc = [
+            vaddvq_f32(accv[0]),
+            vaddvq_f32(accv[1]),
+            vaddvq_f32(accv[2]),
+            vaddvq_f32(accv[3]),
+        ];
+        while gi < gpr {
+            let t = bp.add(gi * 4);
+            let sc = f16_to_f32(q1g_scale_bits(bytes, sc_off, r * gpr + gi));
+            let v0 = vcombine_u8(vdup_n_u8(*t), vdup_n_u8(*t.add(1)));
+            let v1 = vcombine_u8(vdup_n_u8(*t.add(2)), vdup_n_u8(*t.add(3)));
+            let w0 = vreinterpretq_s8_u8(vtstq_u8(v0, m));
+            let w1 = vreinterpretq_s8_u8(vtstq_u8(v1, m));
+            for k in 0..4 {
+                let d = vaddvq_s32(sdot2!(w0, w1, xs[k].as_ptr().add(gi * GROUP_SIZE)));
+                acc[k] += (-(2 * d + *gs[k].as_ptr().add(gi))) as f32 * sc;
+            }
+            gi += 1;
+        }
+        acc
+    }
+}
+
+/// (weight ±1, scale) of one q1g element — the exact outlier term.
+#[inline]
+fn q1g_outlier(bytes: &[u8], sc_off: usize, r: usize, gpr: usize, j: usize) -> (f32, f32) {
+    let t = r * gpr + j / GROUP_SIZE;
+    let k = j % GROUP_SIZE;
+    let s = f16_to_f32(q1g_scale_bits(bytes, sc_off, t));
+    let bit = (bytes[t * 4 + k / 8] >> (k % 8)) & 1;
+    ((bit as i32 * 2 - 1) as f32, s)
+}
+
+/// Exact scalar q1g row (CMF_SDOT=0 contract) — `q1_row_exact`'s order.
+#[inline]
+fn q1g_row_exact(bytes: &[u8], sc_off: usize, r: usize, gpr: usize, x: &[f32]) -> f32 {
+    let mut acc = 0f32;
+    for gi in 0..gpr {
+        let t = r * gpr + gi;
+        let s = f16_to_f32(q1g_scale_bits(bytes, sc_off, t));
+        let xg = &x[gi * GROUP_SIZE..(gi + 1) * GROUP_SIZE];
+        let mut ga = 0f32;
+        for (j, &b) in bytes[t * 4..t * 4 + 4].iter().enumerate() {
+            for k in 0..8 {
+                ga += (((b >> k) & 1) as f32 * 2.0 - 1.0) * xg[j * 8 + k];
+            }
+        }
+        acc += ga * s;
+    }
+    acc
 }
 
 /// q1t per-row overlay locator. After the base (`base_len`) come
@@ -8538,6 +9402,9 @@ fn q1t_matmat(
     dispatch_rows(pool, rows, &run);
 }
 
+/// q1-tile entry points of the binary drivers (the tests' handles; the
+/// runtime goes through `QTensor::bin_w`).
+#[cfg(test)]
 fn q1_matvec(
     bytes: &[u8],
     x: &[f32],
@@ -8546,6 +9413,12 @@ fn q1_matvec(
     out: &mut [f32],
     pool: Option<&Pool>,
 ) {
+    bin_matvec(BinW::Q1(bytes), x, rows, cols, out, pool)
+}
+
+/// Binary-weight matvec (q1 or q1g): A8W8 rows with the shared group
+/// sums, or the exact scalar walk under CMF_SDOT=0.
+fn bin_matvec(w: BinW, x: &[f32], rows: usize, cols: usize, out: &mut [f32], pool: Option<&Pool>) {
     debug_assert_eq!(out.len(), rows);
     let gpr = cols / GROUP_SIZE;
     let out_addr = SendMut(out.as_mut_ptr());
@@ -8553,20 +9426,35 @@ fn q1_matvec(
         let act = split_act(x);
         let gsum = q1_group_sums(&act.xq, gpr);
         let (act, gsum) = (&act, &gsum);
-        let run = move |start: usize, end: usize| {
-            q1_range_a8w8(bytes, gpr, act, gsum, out_addr, start, end)
-        };
+        let run =
+            move |start: usize, end: usize| bin_range_a8w8(w, gpr, act, gsum, out_addr, start, end);
         dispatch_rows(pool, rows, &run);
         return;
     }
-    let run = move |start: usize, end: usize| q1_range_f32(bytes, gpr, x, out_addr, start, end);
+    let run = move |start: usize, end: usize| bin_range_f32(w, gpr, x, out_addr, start, end);
     dispatch_rows(pool, rows, &run);
 }
 
 /// Fused two-input q1 matvec (weights read once per pair).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn q1_matvec2(
     bytes: &[u8],
+    x1: &[f32],
+    x2: &[f32],
+    rows: usize,
+    cols: usize,
+    o1: &mut [f32],
+    o2: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    bin_matvec2(BinW::Q1(bytes), x1, x2, rows, cols, o1, o2, pool)
+}
+
+/// Fused two-input binary-weight matvec (q1 or q1g).
+#[allow(clippy::too_many_arguments)]
+fn bin_matvec2(
+    w: BinW,
     x1: &[f32],
     x2: &[f32],
     rows: usize,
@@ -8586,15 +9474,15 @@ fn q1_matvec2(
         let (a1, a2, g1, g2) = (&a1, &a2, &g1, &g2);
         let run = move |start: usize, end: usize| {
             for r in start..end {
-                let mut v1 = dot_q1_row_i8(bytes, r, gpr, &a1.xq, g1) * a1.sx;
-                let mut v2 = dot_q1_row_i8(bytes, r, gpr, &a2.xq, g2) * a2.sx;
+                let mut v1 = w.dot_i8(r, gpr, &a1.xq, g1) * a1.sx;
+                let mut v2 = w.dot_i8(r, gpr, &a2.xq, g2) * a2.sx;
                 for &(j, xv) in &a1.outliers {
-                    let (w, s) = q1_outlier(bytes, r, gpr, j);
-                    v1 += w * s * xv;
+                    let (wv, s) = w.outlier(r, gpr, j);
+                    v1 += wv * s * xv;
                 }
                 for &(j, xv) in &a2.outliers {
-                    let (w, s) = q1_outlier(bytes, r, gpr, j);
-                    v2 += w * s * xv;
+                    let (wv, s) = w.outlier(r, gpr, j);
+                    v2 += wv * s * xv;
                 }
                 // SAFETY: disjoint row ranges per worker.
                 unsafe {
@@ -8610,8 +9498,8 @@ fn q1_matvec2(
         for r in start..end {
             // SAFETY: disjoint row ranges per worker.
             unsafe {
-                *p1.at(r) = q1_row_exact(bytes, r, gpr, x1);
-                *p2.at(r) = q1_row_exact(bytes, r, gpr, x2);
+                *p1.at(r) = w.row_exact(r, gpr, x1);
+                *p2.at(r) = w.row_exact(r, gpr, x2);
             }
         }
     };
@@ -8619,9 +9507,24 @@ fn q1_matvec2(
 }
 
 /// Batched q1 matmat: each row's tiles stream once per microbatch.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn q1_matmat(
     bytes: &[u8],
+    xs_all: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+    pool: Option<&Pool>,
+) {
+    bin_matmat(BinW::Q1(bytes), xs_all, b, rows, cols, out, pool)
+}
+
+/// Batched binary-weight matmat (q1 or q1g).
+#[allow(clippy::too_many_arguments)]
+fn bin_matmat(
+    w: BinW,
     xs_all: &[f32],
     b: usize,
     rows: usize,
@@ -8665,13 +9568,14 @@ fn q1_matmat(
                             acts[bi + 2].1.as_slice(),
                             acts[bi + 3].1.as_slice(),
                         ];
-                        let d = unsafe { dot_q1_row_1x4_sdot(bytes, r, gpr, xs, gs) };
+                        // SAFETY: blocked_ok checked SDOT.
+                        let d = unsafe { w.dot_1x4_sdot(r, gpr, xs, gs) };
                         for k in 0..4 {
                             let (act, _) = &acts[bi + k];
                             let mut acc = d[k] * act.sx;
                             for &(j, xv) in &act.outliers {
-                                let (w, sc) = q1_outlier(bytes, r, gpr, j);
-                                acc += w * sc * xv;
+                                let (wv, sc) = w.outlier(r, gpr, j);
+                                acc += wv * sc * xv;
                             }
                             // SAFETY: disjoint (bi, r) cells per worker.
                             unsafe { *out_addr.at((bi + k) * rows + r) = acc };
@@ -8694,19 +9598,14 @@ fn q1_matmat(
                             acts[bi + 2].1.as_slice(),
                             acts[bi + 3].1.as_slice(),
                         ];
-                        let d = unsafe {
-                            if vnni_tiles_enabled() {
-                                dot_q1_row_1x4_vnni(bytes, r, gpr, xs, gs)
-                            } else {
-                                dot_q1_row_1x4_avx2(bytes, r, gpr, xs, gs)
-                            }
-                        };
+                        // SAFETY: blocked_ok checked AVX2.
+                        let d = unsafe { w.dot_1x4_x86(r, gpr, xs, gs) };
                         for k in 0..4 {
                             let (act, _) = &acts[bi + k];
                             let mut acc = d[k] * act.sx;
                             for &(j, xv) in &act.outliers {
-                                let (w, sc) = q1_outlier(bytes, r, gpr, j);
-                                acc += w * sc * xv;
+                                let (wv, sc) = w.outlier(r, gpr, j);
+                                acc += wv * sc * xv;
                             }
                             // SAFETY: disjoint (bi, r) cells per worker.
                             unsafe { *out_addr.at((bi + k) * rows + r) = acc };
@@ -8716,10 +9615,10 @@ fn q1_matmat(
                 }
                 while bi < acts.len() {
                     let (act, gsum) = &acts[bi];
-                    let mut acc = dot_q1_row_i8(bytes, r, gpr, &act.xq, gsum) * act.sx;
+                    let mut acc = w.dot_i8(r, gpr, &act.xq, gsum) * act.sx;
                     for &(j, xv) in &act.outliers {
-                        let (w, s) = q1_outlier(bytes, r, gpr, j);
-                        acc += w * s * xv;
+                        let (wv, s) = w.outlier(r, gpr, j);
+                        acc += wv * s * xv;
                     }
                     // SAFETY: disjoint (bi, r) cells per worker range.
                     unsafe { *out_addr.at(bi * rows + r) = acc };
@@ -8735,7 +9634,7 @@ fn q1_matmat(
             for bi in 0..b {
                 let x = &xs_all[bi * cols..(bi + 1) * cols];
                 // SAFETY: disjoint (bi, r) cells per worker range.
-                unsafe { *out_addr.at(bi * rows + r) = q1_row_exact(bytes, r, gpr, x) };
+                unsafe { *out_addr.at(bi * rows + r) = w.row_exact(r, gpr, x) };
             }
         }
     };
@@ -9555,6 +10454,25 @@ pub(crate) fn gpu_batch_job<'a>(
                 row_scale: &[],
                 xs: x.to_vec(),
                 layout: crate::gpu::BatchLayout::Q1,
+            },
+        )),
+        // q1g: same raw-f32 contract, sign + scale planes.
+        QTensor::Mapped {
+            model,
+            idx,
+            dtype: TensorDtype::Q1G,
+            rows,
+            cols,
+            ..
+        } => Some((
+            model.clone(),
+            crate::gpu::BatchJob {
+                idx: *idx,
+                rows: *rows,
+                cols: *cols,
+                row_scale: &[],
+                xs: x.to_vec(),
+                layout: crate::gpu::BatchLayout::Q1g,
             },
         )),
         // q4_tiled / q4tp: raw f32 activations; the scales live in the
@@ -11765,6 +12683,421 @@ mod tests {
         q1_matmat(&bytes, &xs, 2, rows, cols, &mut mm, None);
         assert_eq!(&mm[..rows], got.as_slice());
         assert_eq!(&mm[rows..], a2.as_slice());
+    }
+
+    /// A Bonsai-shaped q1 payload (one f16 scale per 128-group, stored in
+    /// all four tiles; pseudo-random signs) and its q1g repack.
+    fn q1_q1g_pair(rows: usize, cols: usize, salt: usize) -> (Vec<u8>, Vec<u8>) {
+        let tiles = rows * cols / GROUP_SIZE;
+        let mut q1 = Vec::with_capacity(tiles * Q1_TILE);
+        for t in 0..tiles {
+            let s = 0.004 + ((t / 4 * 37 + salt) % 29) as f32 * 0.0011;
+            q1.extend_from_slice(&cortiq_core::quant::f32_to_f16(s).to_le_bytes());
+            let bits = ((t * 2_654_435_761 + salt * 40_503) as u32).rotate_left((t % 31) as u32);
+            q1.extend_from_slice(&bits.to_le_bytes());
+        }
+        let rp = cortiq_core::quant::repack_q1_to_q1g(&q1, rows, cols, 0.0);
+        assert_eq!(rp.differing, 0, "uniform scales repack exactly");
+        (q1, rp.data)
+    }
+
+    /// Activations off the int8 grid with two outlier channels, so the
+    /// A8W8 path quantizes AND takes the exact outlier correction.
+    fn q1g_test_x(cols: usize, salt: usize) -> Vec<f32> {
+        let mut x: Vec<f32> = (0..cols)
+            .map(|i| ((i * 13 + salt * 7) as f32 * 0.071).sin() * 0.9)
+            .collect();
+        x[3 % cols] = 41.0;
+        x[(cols / 2 + 5) % cols] = -37.5;
+        x
+    }
+
+    /// Every CPU row kernel of q1g returns the q1 kernel's f32 BIT FOR BIT
+    /// on a uniform-scale repack: A8W8 rows (SIMD of this machine, and the
+    /// x86 AVX2/VNNI twins directly), the exact scalar rows (CMF_SDOT=0
+    /// contract), the outlier term, the drivers (matvec, matvec2, matmat
+    /// with the blocked 1×4 quad + remainder) — including gpr = 4 and the
+    /// last row, where q1's pair load falls back to its scalar tail.
+    #[test]
+    fn q1g_cpu_kernels_equal_q1_bit_for_bit() {
+        for &(rows, cols) in &[(3usize, 128usize), (5, 256), (9, 2048), (2, 6144)] {
+            let gpr = cols / GROUP_SIZE;
+            let (q1, q1g) = q1_q1g_pair(rows, cols, rows + cols);
+            let (wa, wb) = (BinW::Q1(&q1), BinW::q1g(&q1g, rows, cols));
+            let x = q1g_test_x(cols, rows);
+            let act = split_act(&x);
+            assert!(!act.outliers.is_empty(), "test wants the outlier path");
+            let gsum = q1_group_sums(&act.xq, gpr);
+            for r in 0..rows {
+                let (a, b) = (wa.row_exact(r, gpr, &x), wb.row_exact(r, gpr, &x));
+                assert_eq!(a.to_bits(), b.to_bits(), "{rows}x{cols} exact row {r}");
+                let (a, b) = (
+                    wa.dot_i8(r, gpr, &act.xq, &gsum),
+                    wb.dot_i8(r, gpr, &act.xq, &gsum),
+                );
+                assert_eq!(a.to_bits(), b.to_bits(), "{rows}x{cols} i8 row {r}");
+                for j in [0, 31, 32, 127, cols - 1] {
+                    let (a, b) = (wa.outlier(r, gpr, j), wb.outlier(r, gpr, j));
+                    assert_eq!(
+                        (a.0.to_bits(), a.1.to_bits()),
+                        (b.0.to_bits(), b.1.to_bits())
+                    );
+                }
+                #[cfg(target_arch = "x86_64")]
+                if avx2_enabled() {
+                    let sc = cortiq_core::quant::q1g_scale_offset(rows, cols);
+                    // SAFETY: AVX2 checked; payloads sized for (rows, cols).
+                    unsafe {
+                        let a = dot_q1_row_avx2(&q1, r, gpr, &act.xq, &gsum);
+                        let b = dot_q1g_row_avx2(&q1g, sc, r, gpr, &act.xq, &gsum);
+                        assert_eq!(a.to_bits(), b.to_bits(), "avx2 row {r}");
+                    }
+                    if std::is_x86_feature_detected!("avx512vnni")
+                        && std::is_x86_feature_detected!("avx512bw")
+                        && std::is_x86_feature_detected!("avx512vl")
+                    {
+                        // SAFETY: VNNI family detected just above.
+                        unsafe {
+                            let a = dot_q1_row_vnni(&q1, r, gpr, &act.xq, &gsum);
+                            let b = dot_q1g_row_vnni(&q1g, sc, r, gpr, &act.xq, &gsum);
+                            assert_eq!(a.to_bits(), b.to_bits(), "vnni row {r}");
+                        }
+                    }
+                }
+            }
+            // Drivers: single, pair, batch (b = 5: one blocked quad + one).
+            let (mut ga, mut gb) = (vec![0f32; rows], vec![0f32; rows]);
+            bin_matvec(wa, &x, rows, cols, &mut ga, None);
+            bin_matvec(wb, &x, rows, cols, &mut gb, None);
+            assert_eq!(ga, gb, "{rows}x{cols} matvec");
+            let x2 = q1g_test_x(cols, rows + 1);
+            let (mut a1, mut a2, mut b1, mut b2) = (
+                vec![0f32; rows],
+                vec![0f32; rows],
+                vec![0f32; rows],
+                vec![0f32; rows],
+            );
+            bin_matvec2(wa, &x, &x2, rows, cols, &mut a1, &mut a2, None);
+            bin_matvec2(wb, &x, &x2, rows, cols, &mut b1, &mut b2, None);
+            assert_eq!((&a1, &a2), (&b1, &b2), "{rows}x{cols} matvec2");
+            let b = 5usize;
+            let xs: Vec<f32> = (0..b).flat_map(|k| q1g_test_x(cols, k * 3 + 2)).collect();
+            let (mut ma, mut mb) = (vec![0f32; b * rows], vec![0f32; b * rows]);
+            bin_matmat(wa, &xs, b, rows, cols, &mut ma, None);
+            bin_matmat(wb, &xs, b, rows, cols, &mut mb, None);
+            assert_eq!(ma, mb, "{rows}x{cols} matmat");
+            // The blocked 1×4 kernels directly (the driver only takes them
+            // under CMF_X86_BLOCKED / SDOT, a process-wide switch).
+            let acts: Vec<(SplitAct, Vec<i32>)> = (0..4)
+                .map(|k| {
+                    let a = split_act(&xs[k * cols..(k + 1) * cols]);
+                    let g = q1_group_sums(&a.xq, gpr);
+                    (a, g)
+                })
+                .collect();
+            let xq4: [&[i8]; 4] = std::array::from_fn(|k| acts[k].0.xq.as_slice());
+            let gs4: [&[i32]; 4] = std::array::from_fn(|k| acts[k].1.as_slice());
+            for r in 0..rows {
+                #[cfg(target_arch = "x86_64")]
+                if avx2_enabled() {
+                    // SAFETY: AVX2 checked; payloads sized for (rows, cols).
+                    let (a, b) = unsafe {
+                        (
+                            wa.dot_1x4_x86(r, gpr, xq4, gs4),
+                            wb.dot_1x4_x86(r, gpr, xq4, gs4),
+                        )
+                    };
+                    assert_eq!(a.map(f32::to_bits), b.map(f32::to_bits), "1x4 row {r}");
+                }
+                #[cfg(target_arch = "aarch64")]
+                if sdot_enabled() {
+                    // SAFETY: SDOT checked; payloads sized for (rows, cols).
+                    let (a, b) = unsafe {
+                        (
+                            wa.dot_1x4_sdot(r, gpr, xq4, gs4),
+                            wb.dot_1x4_sdot(r, gpr, xq4, gs4),
+                        )
+                    };
+                    assert_eq!(a.map(f32::to_bits), b.map(f32::to_bits), "1x4 row {r}");
+                }
+                let _ = (r, &xq4, &gs4);
+            }
+        }
+    }
+
+    /// CPU kernel A/B, q1 vs q1g matvec (A8W8 path of this machine, the
+    /// exact path too), Bonsai-1.7B decode shapes, arms alternated every
+    /// round, medians printed. `CMF_THREADS` sets the pool (default 8).
+    /// `cargo test -p cortiq-engine --release --lib q1g_cpu_matvec_speed --
+    /// --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn q1g_cpu_matvec_speed() {
+        use crate::pool::Pool;
+        let threads = std::env::var("CMF_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8usize);
+        let pool = Pool::new(threads);
+        for &(name, rows, cols, reps) in &[
+            ("gate/up_proj", 6144usize, 2048usize, 41usize),
+            ("down_proj", 2048, 6144, 41),
+            ("lm_head", 151_669, 2048, 9),
+        ] {
+            let (q1, q1g) = q1_q1g_pair(rows, cols, 3);
+            let (wa, wb) = (BinW::Q1(&q1), BinW::q1g(&q1g, rows, cols));
+            let x = q1g_test_x(cols, 1);
+            let mut out = vec![0f32; rows];
+            let mut time = |w: BinW| {
+                let t0 = std::time::Instant::now();
+                bin_matvec(w, &x, rows, cols, &mut out, Some(&pool));
+                t0.elapsed().as_secs_f64()
+            };
+            let _ = (time(wa), time(wb));
+            let (mut ta, mut tb) = (Vec::new(), Vec::new());
+            for r in 0..reps {
+                if r % 2 == 0 {
+                    ta.push(time(wa));
+                    tb.push(time(wb));
+                } else {
+                    tb.push(time(wb));
+                    ta.push(time(wa));
+                }
+            }
+            ta.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            tb.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let (ma, mb) = (ta[reps / 2], tb[reps / 2]);
+            eprintln!(
+                "cpu x{threads} a8w8={} {name:>12} {rows}x{cols}: q1 {:8.1} us | q1g {:8.1} us | q1g/q1 time {:.3}",
+                a8w8_enabled(),
+                ma * 1e6,
+                mb * 1e6,
+                mb / ma
+            );
+        }
+    }
+
+    /// The mapped QTensor paths a real Bonsai q1g file takes — matvec, the
+    /// multi-projection job (all-q1g and q1/q1g mixed), the fused gate/up
+    /// with SiLU, matmat, matvec2 and the embedding row — equal the q1
+    /// tensor they were repacked from, bit for bit.
+    #[test]
+    fn q1g_mapped_tensor_paths_equal_q1() {
+        use crate::pool::Pool;
+        use cortiq_core::{CmfHeader, CmfModel, TensorSpec};
+        let (rows, cols) = (300usize, 256usize);
+        let (gq1, gq1g) = q1_q1g_pair(rows, cols, 1);
+        let (uq1, uq1g) = q1_q1g_pair(rows, cols, 2);
+        let header: CmfHeader = serde_json::from_value(serde_json::json!({
+            "format": "cmf", "version": cortiq_core::CMF_VERSION,
+            "arch": {"arch_name": "tiny-q1g", "hidden_size": cols,
+                "intermediate_size": rows, "num_layers": 1, "num_attention_heads": 2,
+                "num_kv_heads": 1, "head_dim": 128, "vocab_size": rows,
+                "layer_types": ["FullAttention"], "rms_norm_eps": 1e-6,
+                "max_position_embeddings": 8},
+            "quant_type": "VBIT"
+        }))
+        .unwrap();
+        let spec = |name: &str, dtype, data: &Vec<u8>| TensorSpec {
+            name: name.into(),
+            dtype,
+            shape: vec![rows, cols],
+            data: data.clone(),
+        };
+        let specs = [
+            spec("g1", TensorDtype::Q1, &gq1),
+            spec("u1", TensorDtype::Q1, &uq1),
+            spec("gg", TensorDtype::Q1G, &gq1g),
+            spec("ug", TensorDtype::Q1G, &uq1g),
+        ];
+        let dir = std::env::temp_dir().join(format!("cmf-q1g-mapped-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.cmf");
+        CmfModel::write(&path, &header, &specs, None, None).unwrap();
+        let model = Arc::new(CmfModel::open(&path).unwrap());
+        assert!(model.verify().is_empty(), "{:?}", model.verify());
+        let t = |n: &str| QTensor::from_model(&model, n).unwrap();
+        let (g1, u1, gg, ug) = (t("g1"), t("u1"), t("gg"), t("ug"));
+        assert_eq!(gg.model_dtype(), Some(TensorDtype::Q1G));
+        assert!(gg.is_q1() && gg.graph_weight().map(|w| w.2) == Some(10));
+        let pool = Pool::new(3);
+        let x = q1g_test_x(cols, 4);
+        let run = |a: &QTensor| {
+            let mut o = vec![0f32; rows];
+            a.matvec(&x, &mut o, Some(&pool));
+            o
+        };
+        assert_eq!(run(&g1), run(&gg), "matvec");
+        let many = |a: &QTensor, b: &QTensor| {
+            let (mut oa, mut ob) = (vec![0f32; rows], vec![0f32; rows]);
+            QTensor::matvec_many([a, b], &x, [&mut oa, &mut ob], Some(&pool));
+            (oa, ob)
+        };
+        let want = many(&g1, &u1);
+        assert_eq!(want, many(&gg, &ug), "matvec_many q1g");
+        assert_eq!(want, many(&g1, &ug), "matvec_many mixed");
+        assert_eq!(want, (run(&g1), run(&u1)), "matvec_many == singles");
+        let fused = |g: &QTensor, u: &QTensor| {
+            let mut o = vec![0f32; rows];
+            let ok = QTensor::matvec_silu_mul(g, u, &x, &mut o, Some(&pool));
+            (ok, o)
+        };
+        let (ok_a, fa) = fused(&g1, &u1);
+        let (ok_b, fb) = fused(&gg, &ug);
+        assert_eq!(ok_a, ok_b, "q1g takes the fused arm whenever q1 does");
+        assert_eq!(fa, fb, "fused gate/up");
+        let b = 6usize;
+        let xs: Vec<f32> = (0..b).flat_map(|k| q1g_test_x(cols, k + 9)).collect();
+        let mm = |a: &QTensor| {
+            let mut o = vec![0f32; b * rows];
+            a.matmat(&xs, b, &mut o, Some(&pool));
+            o
+        };
+        assert_eq!(mm(&g1), mm(&gg), "matmat");
+        let x2 = q1g_test_x(cols, 77);
+        let pair = |a: &QTensor| {
+            let (mut o1, mut o2) = (vec![0f32; rows], vec![0f32; rows]);
+            a.matvec2(&x, &x2, &mut o1, &mut o2, Some(&pool));
+            (o1, o2)
+        };
+        assert_eq!(pair(&g1), pair(&gg), "matvec2");
+        for r in [0, 1, rows / 2, rows - 1] {
+            let (mut ra, mut rb) = (vec![0f32; cols], vec![0f32; cols]);
+            g1.row_f32(r, &mut ra);
+            gg.row_f32(r, &mut rb);
+            assert_eq!(ra, rb, "embedding row {r}");
+        }
+        drop((g1, u1, gg, ug, model));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `blr` tensor read from a real CMF file: it maps to the factored
+    /// arm (not a dense copy), declines every device-graph accessor, and
+    /// every QTensor entry point a layer may take — matvec, matvec2,
+    /// matmat (table loop and GEMM sizes), the multi-tensor job mixed with
+    /// a q8_row sibling, the fused gate/up refusal, rows and columns — equals
+    /// the dense reference built by the core dequant.
+    #[test]
+    fn blr_mapped_tensor_paths_equal_dense() {
+        use crate::pool::Pool;
+        use cortiq_core::{CmfHeader, CmfModel, TensorSpec};
+        let (rows, cols, r) = (96usize, 128usize, 16usize);
+        let mut rng = crate::blr::tests::Rng(41);
+        let gate = crate::blr::tests::make(&mut rng, rows, cols, r, 2);
+        let up = crate::blr::tests::make(&mut rng, rows, cols, r, 1);
+        // q8_row sibling: [int8 rows·cols][f16 row scale · rows].
+        let mut q8: Vec<u8> = (0..rows * cols)
+            .map(|i| (((i * 89) % 253) as i32 - 126) as i8 as u8)
+            .collect();
+        for o in 0..rows {
+            q8.extend_from_slice(&cortiq_core::quant::f32_to_f16(0.002 + o as f32 * 1e-4).to_le_bytes());
+        }
+        let header: CmfHeader = serde_json::from_value(serde_json::json!({
+            "format": "cmf", "version": cortiq_core::CMF_VERSION,
+            "arch": {"arch_name": "tiny-blr", "hidden_size": cols,
+                "intermediate_size": rows, "num_layers": 1, "num_attention_heads": 2,
+                "num_kv_heads": 1, "head_dim": 64, "vocab_size": rows,
+                "layer_types": ["FullAttention"], "rms_norm_eps": 1e-6,
+                "max_position_embeddings": 8},
+            "quant_type": "Q8_2F"
+        }))
+        .unwrap();
+        let specs = [
+            TensorSpec {
+                name: "g".into(),
+                dtype: TensorDtype::BinaryLowRank,
+                shape: vec![rows, cols],
+                data: gate.clone(),
+            },
+            TensorSpec {
+                name: "u".into(),
+                dtype: TensorDtype::BinaryLowRank,
+                shape: vec![rows, cols],
+                data: up.clone(),
+            },
+            TensorSpec {
+                name: "q".into(),
+                dtype: TensorDtype::Q8Row,
+                shape: vec![rows, cols],
+                data: q8,
+            },
+        ];
+        let dir = std::env::temp_dir().join(format!("cmf-blr-mapped-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("m.cmf");
+        CmfModel::write(&path, &header, &specs, None, None).unwrap();
+        let model = Arc::new(CmfModel::open(&path).unwrap());
+        assert!(model.verify().is_empty(), "{:?}", model.verify());
+        let t = |n: &str| QTensor::from_model(&model, n).unwrap();
+        let (g, u, q) = (t("g"), t("u"), t("q"));
+        assert!(g.is_blr() && u.is_blr() && !q.is_blr());
+        assert!(g.graph_weight().is_none() && g.graph_weight_descriptor().is_none());
+        assert!(g.as_f32().is_none() && g.model_idx().is_none());
+        assert!(g.mapped_device_gemm().is_none() && g.q1_parts().is_none());
+        assert!(!g.sparse_col_ok());
+        assert_eq!((g.rows(), g.cols()), (rows, cols));
+        let deq = |bytes: &[u8]| {
+            let mut w = vec![0f32; rows * cols];
+            cortiq_core::blr::dequant_blr(bytes, rows, cols, &mut w).unwrap();
+            w
+        };
+        let (wg, wu) = (deq(&gate), deq(&up));
+        let mv = |w: &[f32], x: &[f32]| -> Vec<f32> {
+            (0..rows)
+                .map(|i| (0..cols).map(|j| w[i * cols + j] * x[j]).sum())
+                .collect()
+        };
+        let close = |a: &[f32], b: &[f32], what: &str| {
+            let s = b.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-30);
+            let e = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>().sqrt();
+            assert!(e / s < 1e-5, "{what}: rel {}", e / s);
+        };
+        let pool = Pool::new(3);
+        let x: Vec<f32> = (0..cols).map(|_| rng.f()).collect();
+        let x2: Vec<f32> = (0..cols).map(|_| rng.f()).collect();
+        let mut o = vec![0f32; rows];
+        g.matvec(&x, &mut o, Some(&pool));
+        close(&o, &mv(&wg, &x), "matvec");
+        let (mut o1, mut o2) = (vec![0f32; rows], vec![0f32; rows]);
+        g.matvec2(&x, &x2, &mut o1, &mut o2, Some(&pool));
+        close(&o1, &mv(&wg, &x), "matvec2 a");
+        close(&o2, &mv(&wg, &x2), "matvec2 b");
+        for b in [2usize, 5] {
+            let xs: Vec<f32> = (0..b * cols).map(|_| rng.f()).collect();
+            let mut om = vec![0f32; b * rows];
+            g.matmat(&xs, b, &mut om, Some(&pool));
+            for t in 0..b {
+                close(
+                    &om[t * rows..(t + 1) * rows],
+                    &mv(&wg, &xs[t * cols..(t + 1) * cols]),
+                    "matmat",
+                );
+            }
+        }
+        // Multi-tensor job mixed with a q8_row sibling: per-tensor fallback,
+        // the q8_row output identical to its own matvec.
+        let (mut a, mut bq, mut c) = (vec![0f32; rows], vec![0f32; rows], vec![0f32; rows]);
+        QTensor::matvec_many([&g, &q, &u], &x, [&mut a, &mut bq, &mut c], Some(&pool));
+        close(&a, &mv(&wg, &x), "matvec_many blr gate");
+        close(&c, &mv(&wu, &x), "matvec_many blr up");
+        let mut qo = vec![0f32; rows];
+        q.matvec(&x, &mut qo, Some(&pool));
+        assert_eq!(bq, qo, "matvec_many q8_row sibling");
+        let mut f = vec![0f32; rows];
+        assert!(!QTensor::matvec_silu_mul(&g, &u, &x, &mut f, Some(&pool)));
+        let mut row = vec![0f32; cols];
+        g.row_f32(rows / 3, &mut row);
+        close(&row, &wg[(rows / 3) * cols..(rows / 3 + 1) * cols], "row_f32");
+        let mut scratch = vec![0f32; cols];
+        let d = g.row_dot(7, &x, &mut scratch);
+        let want: f32 = (0..cols).map(|j| wg[7 * cols + j] * x[j]).sum();
+        assert!((d - want).abs() < 1e-4 * (1.0 + want.abs()), "row_dot");
+        let mut col = vec![0f32; rows];
+        g.add_col_scaled(cols / 2, 1.5, &mut col);
+        let want: Vec<f32> = (0..rows).map(|i| 1.5 * wg[i * cols + cols / 2]).collect();
+        close(&col, &want, "add_col_scaled");
+        drop((g, u, q, model));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

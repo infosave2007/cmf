@@ -1470,9 +1470,13 @@ pub fn qwen_attention_batch(
     // calls upload the SAME normed chunk three times and pay three round
     // trips per layer. Falls through to the per-projection path on any
     // refusal (non-q4t weights, no device, contention kill).
+    // GPTQ calibration needs every projection's input folded on the host
+    // (`QTensor::matmat`); the fused device submissions below skip it.
+    let capturing = crate::gptq_capture::capturing();
     let fused = crate::gpu::enabled_here()
         && !crate::gpu::mm_killed()
         && b >= 32
+        && !capturing
         && match (wq.mapped_q4t(), wk.mapped_q4t(), wv.mapped_q4t()) {
             (Some((model, iq)), Some((_, ik)), Some((_, iv))) => {
                 let (rk, rv) = (wk.rows(), wv.rows());
@@ -1507,6 +1511,7 @@ pub fn qwen_attention_batch(
         || (crate::gpu::enabled_here()
             && !crate::gpu::mm_killed()
             && b >= 32
+            && !capturing
             && std::env::var("CMF_QKV_KEEP").as_deref() != Ok("0")
             && match (
                 wq.mapped_device_gemm(),

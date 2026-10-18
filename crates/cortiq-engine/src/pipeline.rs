@@ -2861,7 +2861,7 @@ impl Pipeline {
             use cortiq_core::TensorDtype as D;
             matches!(
                 model.tensors[t.0].dtype,
-                D::Q4TiledP | D::Q4Tiled | D::Q4Block | D::Q8Row | D::Q8_2f | D::Q1
+                D::Q4TiledP | D::Q4Tiled | D::Q4Block | D::Q8Row | D::Q8_2f | D::Q1 | D::Q1G
             )
         };
         let dense_fast = plan.iter().all(|it| match it {
@@ -8633,6 +8633,83 @@ impl Pipeline {
         Ok((nll / cnt.max(1) as f64).exp())
     }
 
+    /// GPTQ calibration forward: `ids` through layers `0..upto` only, in
+    /// layer-major chunks of `chunk` positions, with no vocabulary head and
+    /// no scoring. The Hessian hook (`gptq_capture`) folds every
+    /// projection's input on the way; the layers above the captured span
+    /// and the head would only cost time. Falls back to a scored forward
+    /// where the batched prefill does not apply.
+    pub fn calib_forward(&mut self, ids: &[u32], upto: usize, chunk: usize) -> Result<(), String> {
+        if !self.can_prefill_batched() {
+            return self.nll_ids_from(ids, 0).map(|_| ());
+        }
+        self.nll_begin()?;
+        let result: Result<(), String> = (|| {
+            let chunk = chunk.max(1);
+            let mut pos = 0usize;
+            while pos < ids.len() {
+                let end = (pos + chunk).min(ids.len());
+                let _ = self.prefill_batch_span(PrefillIn::Ids(&ids[pos..end]), pos, None, 0, upto);
+                self.nll_check_graph("calibration prefill", pos)?;
+                pos = end;
+            }
+            Ok(())
+        })();
+        self.nll_end();
+        result
+    }
+
+    /// Layer-streamed calibration of one fresh window: layers `from..mid` run
+    /// on `input` (the hidden state entering layer `from`; `None` = the
+    /// token embeddings of `ids`) and their output is returned, then layers
+    /// `mid..upto` run on that output for the capture hooks (their output is
+    /// dropped). A caller that keeps the returned state per window runs each
+    /// layer once over the whole conversion instead of re-running the stack
+    /// below every layer. With `mid == from` the input is returned as is
+    /// (`None` input: an empty vector).
+    pub fn calib_window_span(&mut self, ids: &[u32], input: Option<&[f32]>, from: usize, mid: usize, upto: usize) -> Result<Vec<f32>, String> {
+        if !self.can_prefill_batched() {
+            return Err("calib_window_span: this architecture has no batched prefill".into());
+        }
+        self.nll_begin()?;
+        let result: Result<Vec<f32>, String> = (|| {
+            let h = if mid > from {
+                let inp = match input {
+                    Some(h) => PrefillIn::Hidden(h),
+                    None => PrefillIn::Ids(ids),
+                };
+                let h = self.prefill_batch_span(inp, 0, None, from, mid);
+                self.nll_check_graph("calibration span", 0)?;
+                h
+            } else {
+                input.map(<[f32]>::to_vec).unwrap_or_default()
+            };
+            if upto > mid {
+                let inp = if mid > from || input.is_some() { PrefillIn::Hidden(&h) } else { PrefillIn::Ids(ids) };
+                let _ = self.prefill_batch_span(inp, 0, None, mid, upto);
+                self.nll_check_graph("calibration span", 0)?;
+            }
+            Ok(h)
+        })();
+        self.nll_end();
+        result
+    }
+
+    /// GPTQ calibration of a Flash-Next-class MoE (`qwen4_exp`): MoE input
+    /// rows and router logits of layers `lo..hi` for `ids` (a fresh
+    /// sequence), per layer `[ids.len()][hidden + n_experts]`.
+    #[cfg(feature = "gpu")]
+    pub fn qwen4_capture(&mut self, ids: &[u32], lo: usize, hi: usize) -> Result<Vec<Vec<f32>>, String> {
+        let b = self.qwen4_exp.as_mut().ok_or("not a qwen4_exp model")?;
+        crate::qwen4_exp::capture_window(&b.0, &b.1, &b.2, &mut b.3, ids, lo, hi, &self.inv_freq, self.pool.as_deref())
+    }
+
+    /// Expert directory triples of a `qwen4_exp` layer (routed, shared).
+    pub fn qwen4_expert_dirs(&self, li: usize) -> Option<(Vec<(usize, usize, usize)>, Option<(usize, usize, usize)>)> {
+        let b = self.qwen4_exp.as_ref()?;
+        crate::qwen4_exp::expert_dirs(&b.1, li)
+    }
+
     /// DTG-MA calibration pass (Patent 2): run `ids` through the model
     /// (CPU path, per position) and return each layer's per-neuron
     /// activation mass Σ|silu(gate)·up| — the statistic the task-guided
@@ -8813,7 +8890,14 @@ impl Pipeline {
                 // The layer chunk is large (grouping positions by MoE experts
                 // wins with size), lm_head in sub-blocks (logit buffer
                 // 32×vocab ≈ 32MB instead of 128×).
-                const CHUNK: usize = 128;
+                // CMF_NLL_CHUNK: positions per prefill step (default 128).
+                // A device scorer pays one round trip per projection per
+                // step, so a 512-position step quarters them.
+                let chunk_len: usize = std::env::var("CMF_NLL_CHUNK")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&c: &usize| c > 0)
+                    .unwrap_or(128);
                 const LM_SUB: usize = 32;
                 let n = ids.len().saturating_sub(1);
                 let hs = self.hidden_size;
@@ -8821,7 +8905,7 @@ impl Pipeline {
                 let mut pos = 0usize;
                 let state_trace = std::env::var("CMF_STATE_TRACE").is_ok();
                 while pos < n {
-                    let end = (pos + CHUNK).min(n);
+                    let end = (pos + chunk_len).min(n);
                     let bsz = end - pos;
                     let hb = self.prefill_rows(&ids[pos..end], pos, task_mask)?;
                     self.nll_check_graph("batched prefill", pos)?;
@@ -17113,6 +17197,10 @@ fn dense_ffn_batch(
         // a fused batch would leave it summing nothing — a probe that
         // reports zeros rather than failing, which is worse.
         && !ffn_probe_active()
+        // GPTQ calibration folds every projection's input on the host
+        // (`QTensor::matmat`); the fused chain would hand gate/up/down
+        // their inputs on the card and leave the FFN uncalibrated.
+        && !crate::gptq_capture::capturing()
     {
         if let (Some((model, w1)), Some((_, w3)), Some((_, w2))) = (
             d.gate_proj.mapped_q4t(),

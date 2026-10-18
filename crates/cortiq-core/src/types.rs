@@ -103,6 +103,29 @@ pub enum TensorDtype {
     /// Raw little-endian `u64` words (spec §9.5.2: a lookup record's
     /// `keys.hash` and `entries.off` tables): `n × 8` bytes, raw.
     U64 = 18,
+    /// Binary low-rank weights (`blr`, docs/BLR_NVG.md §2): `P ∈ {1,2}`
+    /// paths `diag(h)·S_U·diag(ℓ)·S_Vᵀ·diag(g)` with packed ±1 sign bits and
+    /// f16 scales (the factorization layout of LittleBit, Lee et al. 2025).
+    /// Self-describing variable-length payload (16-byte header with the
+    /// rank); the directory keeps the logical `[d_out, d_in]` shape. Id and
+    /// bytes match the research branch's `lb` files.
+    #[serde(rename = "blr")]
+    BinaryLowRank = 19,
+    /// 1-bit binary weights with ONE f16 scale per 128-weight group — the
+    /// native group of 1-bit-trained checkpoints (Bonsai class). A `q1`
+    /// file of such a model stores every 128-group scale four times (once
+    /// per 32-tile, 99.997 % byte-identical on Bonsai-1.7B); this dtype
+    /// keeps exactly that information at 1.125 bits/weight instead of 1.5.
+    ///
+    /// `[sign bits: rows · cols/8][f16 scales: rows · cols/128]` — planes,
+    /// not tiles, so each group's 16 sign bytes are 16-byte aligned for
+    /// vector loads (tiles would be 18 B). Bit k of byte j (LSB-first) is
+    /// weight j·8+k of the row; value = scale · (2·bit − 1) ∈ {−s, +s}:
+    /// the bit plane of a row is byte-identical to the concatenated bit
+    /// fields of the same row's `q1` tiles. 2-D tensors with
+    /// cols % 128 == 0 only.
+    #[serde(rename = "q1g")]
+    Q1G = 20,
 }
 
 impl TensorDtype {
@@ -127,6 +150,8 @@ impl TensorDtype {
             16 => Self::Q2TiledP,
             17 => Self::U32,
             18 => Self::U64,
+            19 => Self::BinaryLowRank,
+            20 => Self::Q1G,
             _ => return None,
         })
     }
@@ -163,6 +188,8 @@ impl TensorDtype {
             Self::Q2TiledP => "q2tp",
             Self::U32 => "u32",
             Self::U64 => "u64",
+            Self::BinaryLowRank => "blr",
+            Self::Q1G => "q1g",
         }
     }
 
@@ -184,8 +211,10 @@ impl TensorDtype {
                 | Self::Q1
                 | Self::Q1S
                 | Self::Q1T
+                | Self::Q1G
                 | Self::Q4TiledP
                 | Self::Q2TiledP
+                | Self::BinaryLowRank
         )
     }
 }

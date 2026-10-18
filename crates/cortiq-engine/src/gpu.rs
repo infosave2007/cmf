@@ -1107,6 +1107,8 @@ pub struct BatchJob<'a> {
 pub enum BatchLayout {
     Q8,
     Q1,
+    /// q1g: sign + scale planes, one scale per 128 (q1's raw-xs contract).
+    Q1g,
     Q4t,
     Q4tp,
 }
@@ -1494,6 +1496,27 @@ pub fn q1_matvec(
         Backend::Metal => crate::gpu_metal::q1_matvec(model, idx, xs, rows, cols, out),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::q1_matvec(model, idx, xs, rows, cols, out),
+        Backend::None => false,
+    }
+}
+
+/// q1g matvec (sign + scale planes, raw f32 activations); the q1 kernel's
+/// walk and sums, so a uniform-scale repack matches `q1_matvec` bit for
+/// bit. false = CPU fallback.
+#[allow(unused_variables)]
+pub fn q1g_matvec(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::q1g_matvec(model, idx, xs, rows, cols, out),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::q1g_matvec(model, idx, xs, rows, cols, out),
         Backend::None => false,
     }
 }
@@ -2259,6 +2282,24 @@ pub fn q1_matmat(
     match backend() {
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::q1_matmat(model, idx, xs, b, rows, cols, out),
+        #[allow(unused_variables)]
+        _ => false,
+    }
+}
+
+/// Batched q1g GEMM (prefill). wgpu only, like `q1_matmat`.
+pub fn q1g_matmat(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::q1g_matmat(model, idx, xs, b, rows, cols, out),
         #[allow(unused_variables)]
         _ => false,
     }
@@ -3610,6 +3651,144 @@ pub fn dit_attention(
     }
 }
 
+/// GPTQ calibration: a zeroed `cols × cols` Hessian accumulator on the
+/// device (wgpu only), or None — the caller keeps the host fold then.
+pub fn gram_alloc(cols: usize) -> Option<u64> {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::gram::alloc(cols);
+    }
+    let _ = cols;
+    None
+}
+
+/// `H[id] += XᵀX` over `b` rows of `xs` (`[b·cols]`).
+pub fn gram_add(id: u64, xs: &[f32], b: usize) -> bool {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::gram::add(id, xs, b);
+    }
+    let _ = (id, xs, b);
+    false
+}
+
+/// `H[id] += XᵀX` over `b` rows of a device-resident f32 buffer.
+#[cfg(feature = "gpu")]
+pub fn gram_add_dev(id: u64, x: &wgpu::Buffer, b: usize) -> bool {
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::gram::add_dev(id, x, b);
+    }
+    false
+}
+
+/// The accumulated Hessian as a full symmetric f64 matrix (frees it).
+pub fn gram_take(id: u64) -> Option<Vec<f64>> {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::gram::take(id);
+    }
+    let _ = id;
+    None
+}
+
+/// GPTQ fold of the device Hessian `h_id` on the device: the upper Cholesky
+/// factor of `(H + λ·mean(diag)·I)⁻¹` stays there under the returned id and
+/// the Hessian is freed. None (no wgpu device, it does not fit, it does not
+/// factor): the Hessian is left for `gram_take`.
+pub fn gptq_fold_dev(h_id: u64, n: usize, lambda: f64) -> Option<u64> {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::gptq_dev::fold(h_id, n, lambda);
+    }
+    let _ = (h_id, n, lambda);
+    None
+}
+
+/// (dead channels, raw H diagonal, damping used) of a device fold.
+pub fn gptq_fold_info(id: u64) -> Option<(Vec<bool>, Vec<f32>, f64)> {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::gptq_dev::info(id);
+    }
+    let _ = id;
+    None
+}
+
+/// A device fold's operator read back (n×n f32, upper).
+pub fn gptq_fold_read(id: u64) -> Option<Vec<f32>> {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::gptq_dev::read_u(id);
+    }
+    let _ = id;
+    None
+}
+
+/// Free a device fold.
+pub fn gptq_fold_free(id: u64) {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        crate::gpu_wgpu::gptq_dev::free(id);
+    }
+    let _ = id;
+}
+
+/// The q4tp GPTQ sweep on the device (see `gpu_wgpu::gptq_dev::sweep_q4tp`).
+#[allow(clippy::too_many_arguments)]
+pub fn gptq_sweep_q4tp_dev(
+    id: u64,
+    w: &[f32],
+    rows: usize,
+    tab: &[f32],
+    lost: &[f32],
+    nib: &mut [u8],
+    codes: &mut [u32],
+) -> bool {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::gptq_dev::sweep_q4tp(id, w, rows, tab, lost, nib, codes);
+    }
+    let _ = (id, w, rows, tab, lost, nib, codes);
+    false
+}
+
+/// The q2tp GPTQ sweep ("placed" rule) on the device.
+pub fn gptq_sweep_q2tp_dev(
+    id: u64,
+    w: &[f32],
+    rows: usize,
+    tab: &[f32],
+    hw: &[f32],
+    chunks: &mut [u8],
+    codes: &mut [u32],
+) -> bool {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::gptq_dev::sweep_q2tp(id, w, rows, tab, hw, chunks, codes);
+    }
+    let _ = (id, w, rows, tab, hw, chunks, codes);
+    false
+}
+
+/// A device Hessian read back as a full symmetric f64 matrix, left on the
+/// device.
+pub fn gram_read(id: u64) -> Option<Vec<f64>> {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::gram::read(id);
+    }
+    let _ = id;
+    None
+}
+
+/// Free every device Hessian (an aborted calibration pass).
+pub fn gram_clear() {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        crate::gpu_wgpu::gram::clear();
+    }
+}
+
 /// Batched q4t GEMM on the device (imagegen DiT prefill shapes).
 /// Metal: q4t_mul_mm decodes the mmap-resident tiles inside the
 /// GEMM's K loop. wgpu (Vulkan/DX12 → NVIDIA/AMD/Intel/Adreno/Mali):
@@ -3673,6 +3852,22 @@ pub fn q2tp_affine_matmat(
         Backend::Wgpu => crate::gpu_wgpu::q2tp_affine_matmat(model, idx, xs, b, rows, cols, out),
         #[allow(unreachable_patterns)]
         _ => false,
+    }
+}
+
+/// Binary low-rank (`blr`) product on the device: `out[b·rows] = xs[b·cols] ·
+/// Wᵀ` through the two ±1 stages (V then U). `b = 1` is the decode GEMV.
+/// False = not taken (no wgpu backend — Metal has no blr kernel yet — or a
+/// shape outside the kernel's contract): the caller runs the CPU kernels.
+pub fn blr_matmat(t: &crate::blr::BlrTensor, xs: &[f32], b: usize, out: &mut [f32]) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::blr_matmat(t, xs, b, out),
+        #[allow(unreachable_patterns)]
+        _ => {
+            let _ = (t, xs, b, out);
+            false
+        }
     }
 }
 

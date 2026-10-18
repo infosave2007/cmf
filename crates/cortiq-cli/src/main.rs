@@ -11,6 +11,10 @@ mod egemma2pack;
 mod embed;
 mod gguf;
 mod gptq;
+#[cfg(feature = "gpu")]
+mod nvgtrain;
+#[cfg(feature = "gpu")]
+mod moegptq;
 mod growth;
 mod http_range;
 mod imagepack;
@@ -22,6 +26,11 @@ mod mimo_towers;
 mod moedefrag;
 mod music;
 mod npy;
+mod nvg;
+mod nvg_linalg;
+mod nvgbench;
+#[cfg(feature = "gpu")]
+mod nvg_gpu;
 mod qwen_imagepack;
 mod recall;
 mod requant;
@@ -392,9 +401,10 @@ enum Commands {
         /// or a hub repo id like `Qwen/Qwen2.5-0.5B-Instruct` (downloaded)
         #[arg(long)]
         model: String,
-        /// Quantization for 2-D weights: q8 | q8_2f | q4 | q4t | q4tp | q2tp | q1 | q1p | q1s | q1t | f16 | vbit | auto.
+        /// Quantization for 2-D weights: q8 | q8_2f | q4 | q4t | q4tp | q2tp | q1 | q1p | q1s | q1t | f16 | vbit | blr | auto.
         /// Default (or `auto`): q8, except MiMo-V2 (`mimo_v2`), which converts to
-        /// q4tp experts with a q8_2f skeleton.
+        /// q4tp experts with a q8_2f skeleton. `blr` = binary low-rank layer
+        /// projections at `--bpw` (encoder `--blr-method`, docs/BLR_NVG.md).
         #[arg(long)]
         quant: Option<String>,
         /// Output .cmf path
@@ -483,6 +493,48 @@ enum Commands {
         /// request fields still override it.
         #[arg(long, value_name = "KEY=VALUE,...")]
         sampling: Option<String>,
+        /// `--quant blr`: target bits per weight of the layer projections
+        /// (strict container count; embeddings/lm_head stay q8_2f, norms float).
+        #[arg(long = "bpw", visible_alias = "blr-bpw", default_value = "0.55")]
+        blr_bpw: f64,
+        /// `--quant blr` encoder: `nvg` (data-aware, needs --calib; sequential
+        /// per-layer calibration) or `dual-svid` (the data-free LittleBit
+        /// initialiser, kept as the comparison baseline).
+        #[arg(long = "blr-method", default_value = "nvg", value_name = "nvg|dual-svid")]
+        blr_method: String,
+        /// Calibration text for `--quant blr --blr-method nvg` (plain text;
+        /// never the evaluation split).
+        #[arg(long)]
+        calib: Option<String>,
+        /// K/V rank multiplier for GQA models (1 keeps the body at the named
+        /// budget; LittleBit used 4).
+        #[arg(long = "blr-kv-factor", default_value = "1.0")]
+        blr_kv_factor: f64,
+        /// Paths per tensor: auto (nvg: P=2 vs P=1 at the same bits, chosen on
+        /// the held-out calibration slice; dual-svid: 2) | 1 | 2.
+        #[arg(long = "blr-paths", default_value = "auto", value_name = "auto|1|2")]
+        blr_paths: String,
+        /// NVG calibration tokens used for fitting (512-token windows).
+        #[arg(long = "blr-fit-tokens", default_value = "14848")]
+        blr_fit_tokens: usize,
+        /// NVG held-out calibration tokens for the P=1/P=2 selection.
+        #[arg(long = "blr-sel-tokens", default_value = "3072")]
+        blr_sel_tokens: usize,
+        /// NVG relative Gram damping ρ.
+        #[arg(long = "blr-rho", default_value = "0.03")]
+        blr_rho: f64,
+        /// Encoder threads (default: all cores).
+        #[arg(long = "blr-threads")]
+        blr_threads: Option<usize>,
+        /// Keep the intermediate f16 source file (`<output>.src-f16.cmf`);
+        /// an existing one is reused instead of reconverting.
+        #[arg(long = "blr-keep-src")]
+        blr_keep_src: bool,
+        /// NVG encoder device: `gpu` (f32 on the wgpu device, calibration on
+        /// per-op device GEMMs), `cpu` (the f64 reference), `auto` = gpu when
+        /// a wgpu adapter is up (not on macOS).
+        #[arg(long = "blr-device", default_value = "auto", value_name = "auto|cpu|gpu")]
+        blr_device: String,
     },
     /// Embeddings from an EmbeddingGemma 2 .cmf (`cortiq convert --model
     /// <google/embeddinggemma-2 dir>`): texts, images (--image), videos
@@ -624,13 +676,23 @@ enum Commands {
         /// Output .cmf path (omit with --in-place)
         #[arg(long)]
         output: Option<String>,
-        /// Target layout: q4tp (re-express scales), q4tp-quantize (float weights → q4tp), q2tp-draft (MTP inputs), or embryo-q8-head (experimental tied Embryo vocabulary only; new output required)
+        /// Target layout: blr-q8_2f (every blr tensor expanded to a dense q8_2f weight, for evaluation on the dense paths), q4tp (re-express scales), q4tp-quantize (float weights → q4tp), q2tp-draft (MTP inputs), q1g (lossless q1 repack: one scale per 128-group, 1.5 → 1.125 bpw), q1 (q1g back to q1 tiles, exact, for older readers), or embryo-q8-head (experimental tied Embryo vocabulary only; new output required)
         #[arg(long, default_value = "q4tp")]
         quant: String,
         /// Rewrite tensors inside the source file itself — for disks that
         /// cannot hold the model twice. New payloads must fit their slots.
         #[arg(long, default_value_t = false)]
         in_place: bool,
+        /// q1g only: accept 128-groups whose four q1 tile scales are not
+        /// byte-identical but agree within `--tol` (f16 rounding of the
+        /// native scale). Without it any such group refuses the whole run.
+        #[arg(long, default_value_t = false)]
+        allow_tol: bool,
+        /// q1g only: relative tolerance `|s_tile − s_group| / s_group` for
+        /// `--allow-tol` (default 2^-8 = 0.39 %: a few f16 ulps). Tensors
+        /// with a group beyond it stay q1, byte for byte.
+        #[arg(long, default_value_t = 0.00390625)]
+        tol: f64,
     },
     /// Bake a task's expert restriction as a switchable task mask
     /// (spec §5 expert fields): the full expert set stays, `run --task`
@@ -728,13 +790,19 @@ enum Commands {
     /// two-field `|W|·RMS(x)` outlier mask. Norms/embeddings/lm_head (no
     /// captured Hessian) are copied verbatim. Pair with `skill bake` (FCD)
     /// on the tail layers to recover the last of the quality.
+    /// `--codec q4tp|q2tp` writes the converter's q4tp / q2tp profile instead,
+    /// every linear GPTQ-rounded in its own codec (2 bits need ≥ 32k
+    /// calibration tokens: on 2048 GPTQ-q2tp is worse than rounding).
     QuantizeGptq {
         /// Input .cmf (f16 or q8 — higher precision ⇒ a better fold)
         input: String,
-        /// Calibration corpus: a `.txt`, or a `.json` array of
-        /// `[prompt, text]` pairs (the DTG-MA cache) whose texts concatenate
-        #[arg(long)]
-        calib: String,
+        /// Calibration corpus: a `.txt`, a `.jsonl` (one `{"text": …}` or
+        /// string per line), or a `.json` array of `[prompt, text]` pairs
+        /// (the DTG-MA cache) whose texts concatenate. q4tp/q2tp: repeat it
+        /// to mix corpora, `PATH=SHARE` giving each its share of --tokens
+        /// (e.g. `--calib wiki.train.raw=0.75 --calib c4.jsonl=0.25`)
+        #[arg(long, required = true)]
+        calib: Vec<String>,
         /// Output .cmf path
         #[arg(long)]
         output: String,
@@ -747,35 +815,198 @@ enum Commands {
         /// Relative Hessian damping λ (adds `λ·mean(diag)` to the diagonal)
         #[arg(long, default_value = "0.01")]
         lambda: f64,
-        /// Target codec: q1s (default; the 1-bit error-feedback path) or
-        /// q4tp (GPTQ-rounded q4tp — same layout and kernels as `convert
-        /// --quant q4tp`; give it an f16 export as INPUT)
+        /// Target codec: q1s (default; the 1-bit error-feedback path), q4tp
+        /// (GPTQ-rounded q4tp — same layout and kernels as `convert --quant
+        /// q4tp`), or q2tp (the `convert --quant q2tp` profile: gate/up
+        /// GPTQ'd into q2tp, the other linears into q4tp). Give q4tp/q2tp
+        /// an f16 export as INPUT
         #[arg(long, default_value = "q1s")]
         codec: String,
-        /// q4tp: the file the calibration forward runs on (default INPUT).
-        /// The Hessian hook only sees memory-mapped quantized tensors, so an
-        /// f16 INPUT needs its q8/q8_2f sibling here
+        /// q4tp/q2tp: the file the calibration forward runs on (default
+        /// INPUT). The Hessian hook only sees memory-mapped quantized
+        /// tensors, so an f16 INPUT needs its q8/q8_2f sibling here
         #[arg(long)]
         calib_model: Option<String>,
-        /// q4tp: calibration window length (each window a fresh context)
+        /// q4tp/q2tp: calibration window length (each window a fresh context)
         #[arg(long, default_value = "2048")]
         window: usize,
-        /// q4tp: per-tensor override for the tensors GPTQ does not touch,
-        /// PATTERN=QUANT as in `convert --tensor-quant` (e.g.
-        /// `lm_head.weight=q8_2f`)
+        /// q4tp/q2tp: per-tensor codec override, PATTERN=QUANT as in
+        /// `convert --tensor-quant` (e.g. `lm_head.weight=q8_2f`). A q4tp or
+        /// q2tp override stays GPTQ (an escort:
+        /// `model.layers.7.mlp.gate_proj.weight=q4tp`); any other codec
+        /// skips GPTQ and is encoded by the converter (the q8_2f escort
+        /// lists from tools/quant/escort.py)
         #[arg(long = "tensor-quant", value_name = "PATTERN=QUANT")]
         tensor_quant: Vec<String>,
-        /// q4tp: worker threads (default: all cores)
+        /// q4tp/q2tp: worker threads (default: all cores)
         #[arg(long)]
         threads: Option<usize>,
-        /// q4tp: act-order GPTQ (channels by descending input energy, tile
-        /// rungs fixed up front from the original weights)
+        /// q4tp/q2tp: act-order GPTQ (channels by descending input energy,
+        /// group rungs fixed up front from the original weights — at 2 bits
+        /// that costs more than the order gains: not for q2tp)
         #[arg(long)]
         act_order: bool,
-        /// q4tp: Hessian cache file — loaded when it exists (calibration
-        /// skipped), written after calibrating when it does not
+        /// q4tp/q2tp: Hessian cache file — loaded when it exists (calibration
+        /// skipped), written after calibrating when it does not (one file
+        /// per chunk, PATH.L{first}-{last}, with --calib-chunk-layers; an
+        /// existing whole-model PATH serves any chunking)
         #[arg(long)]
         hessians: Option<String>,
+        /// q4tp/q2tp: capture the Hessians of this many layers per
+        /// calibration pass (0 = all at once). Bounds RAM — a dense Hessian
+        /// is 8·cols² bytes on the host, ~0.5 GB per layer of a 2B model — at
+        /// the price of one calibration forward per pass. With a wgpu GPU
+        /// (the default where one is present; `CMF_GPTQ_GPU=0` keeps the
+        /// CPU) the forward runs on the card and the Hessians accumulate
+        /// there as packed f32 triangles, read back one group at a time by
+        /// the fold: Qwen3.8-27B's 64 layers take ~50 GB, one pass
+        #[arg(long, default_value = "0")]
+        calib_chunk_layers: usize,
+        /// q2tp: how group scales are placed — `placed` (default: ladder at
+        /// the H-weighted MSE-optimal scales, full 31-rung search) or
+        /// `cortiq` (the q4tp rule on the 4-level grid: converter ladder,
+        /// rung from absmax over nominal−2..+1)
+        #[arg(long)]
+        q2tp_rule: Option<String>,
+        /// q2tp: per-tensor rule override, PATTERN=RULE (first match wins),
+        /// e.g. `model.layers.7.mlp.*=cortiq` for a layer whose outlier
+        /// weights the MSE-optimal scales clip
+        #[arg(long = "q2tp-rule-tensor", value_name = "PATTERN=RULE")]
+        q2tp_rule_tensor: Vec<String>,
+        /// q2tp: remove each row's output shrinkage in the calibration metric
+        /// (slope (ŴHWᵀ)/(WHWᵀ), through the row's f16 `lo` — zero bits):
+        /// `on` (default; −11 % ppl on MiniCPM5's placed arm) or `off`
+        /// (the plain GPTQ arms of the q2tp study)
+        #[arg(long, value_name = "on|off")]
+        q2tp_debias: Option<String>,
+        /// q4tp/q2tp: the same output debias for the q4tp tensors (opt-in:
+        /// at 4 bits the shrinkage is ~16× smaller than at 2)
+        #[arg(long)]
+        q4tp_debias: bool,
+    },
+    /// GPTQ for the experts of a Flash-Next-class MoE (qwen4_exp), routed
+    /// and shared: gate/up into q2tp, down into q4tp, on the GPU; the calibration file
+    /// (a q4tp CMF of the model) supplies the activations and every
+    /// non-expert tensor, the original safetensors checkpoint the
+    /// full-precision expert weights (fetched one layer at a time).
+    QuantizeMoe {
+        /// Calibration .cmf (q4tp of the same model)
+        calib_model: String,
+        /// Original checkpoint on the Hub (e.g. Qwen/Qwen3.8-Flash-Next); HF_TOKEN from the environment
+        #[arg(long)]
+        hf: String,
+        /// Calibration text, PATH or PATH=SHARE (repeatable)
+        #[arg(long, required = true)]
+        calib: Vec<String>,
+        #[arg(long, default_value = "131072")]
+        tokens: usize,
+        #[arg(long, default_value = "2048")]
+        window: usize,
+        /// Layers captured per calibration pass (host RAM: ~6 KB per token per layer)
+        #[arg(long, default_value = "24")]
+        layers_per_pass: usize,
+        #[arg(long, default_value = "0.01")]
+        lambda: f64,
+        /// Experts routed fewer tokens than this keep the converter's encoding
+        #[arg(long, default_value = "32")]
+        min_rows: usize,
+        /// Directory for the source shards in flight
+        #[arg(long, default_value = "/tmp/cortiq-moe")]
+        scratch: String,
+        #[arg(long, default_value = "16")]
+        threads: usize,
+        #[arg(long, required_unless_present = "patch_shared")]
+        output: Option<String>,
+        /// Re-encode only the shared experts of this existing quantize-moe
+        /// output, in place (no --output file is written)
+        #[arg(long)]
+        patch_shared: Option<String>,
+    },
+    /// NVG Ť: light distillation training of a compressed model's metric
+    /// (the h, ℓ, g scales of its binary low-rank tensors and every RMSNorm
+    /// gain; signs and every other weight frozen) against its
+    /// full-precision teacher, on the GPU. Qwen3.5-family models.
+    NvgTrain {
+        /// Student .cmf (binary low-rank tensors to train)
+        student: String,
+        /// Teacher .cmf (full precision, same architecture and tokenizer)
+        #[arg(long)]
+        teacher: String,
+        /// Training text, PATH or PATH=SHARE (repeatable), as quantize-gptq
+        #[arg(long, required = true)]
+        calib: Vec<String>,
+        /// Training tokens (per epoch)
+        #[arg(long, default_value = "1048576")]
+        tokens: usize,
+        /// Window length (each window a fresh context)
+        #[arg(long, default_value = "2048")]
+        window: usize,
+        /// Windows per step
+        #[arg(long, default_value = "2")]
+        batch: usize,
+        #[arg(long, default_value = "1")]
+        epochs: usize,
+        /// Peak Adam learning rate (cosine decay after a 2 % warm-up)
+        #[arg(long, default_value = "1e-4")]
+        lr: f64,
+        /// Teacher distribution kept per token
+        #[arg(long, default_value = "64")]
+        topk: usize,
+        /// Held-out windows (best-checkpoint selection)
+        #[arg(long, default_value = "8")]
+        eval_windows: usize,
+        /// Steps between held-out evaluations
+        #[arg(long, default_value = "50")]
+        eval_every: usize,
+        /// Global gradient-norm clip
+        #[arg(long, default_value = "1.0")]
+        clip: f64,
+        #[arg(long, default_value = "42")]
+        seed: u64,
+        /// Output .cmf (the student with the trained metric)
+        #[arg(long)]
+        output: String,
+    },
+    /// One tensor through the NVG `blr` encoder with a per-stage profile, on
+    /// the CPU reference path and/or the device path, from Grams captured
+    /// once (layers 0..=l of the model's own forward) and cached. Without
+    /// --tensor: list the encoder's body linears with their shapes.
+    NvgBench {
+        /// Model .cmf (the calibration forward runs on it)
+        #[arg(long)]
+        model: String,
+        /// Tensor name (e.g. model.layers.0.mlp.down_proj.weight)
+        #[arg(long)]
+        tensor: Option<String>,
+        /// Calibration text (needed until the --gram-cache files exist)
+        #[arg(long)]
+        calib: Option<String>,
+        #[arg(long = "fit-tokens", default_value = "14848")]
+        fit_tokens: usize,
+        #[arg(long = "sel-tokens", default_value = "3072")]
+        sel_tokens: usize,
+        #[arg(long, default_value = "0.55")]
+        bpw: f64,
+        #[arg(long = "kv-factor", default_value = "1.0")]
+        kv_factor: f64,
+        #[arg(long, default_value = "auto", value_name = "auto|1|2")]
+        paths: String,
+        /// cpu | gpu | both
+        #[arg(long, default_value = "cpu")]
+        device: String,
+        #[arg(long, default_value = "16")]
+        threads: usize,
+        #[arg(long, default_value = "0.03")]
+        rho: f64,
+        /// Path prefix of the cached Grams (`<prefix>.fit.gram`, `.sel.gram`)
+        #[arg(long = "gram-cache")]
+        gram_cache: Option<String>,
+        /// Encode every body linear of this layer instead of one tensor
+        #[arg(long)]
+        layer: Option<usize>,
+        /// Tensors in flight on the device (--layer)
+        #[arg(long, default_value = "3")]
+        jobs: usize,
     },
     /// Chat with a model (applies the file's chat template), or one-shot
     /// with --prompt
@@ -1005,6 +1236,9 @@ enum Commands {
     /// (the FCD/fold experiments read a quantized model's exact numerics
     /// this way instead of re-implementing the codecs). `--name` may be a
     /// prefix with `--all`: one file per tensor under `--out` (a dir).
+    /// `--dtype raw` writes the entry's ENCODED payload verbatim instead —
+    /// the input of tools that re-encode payload fields themselves and
+    /// store the result back with `patch-tensor --raw`.
     Dequant {
         /// Path to .cmf model file
         model: String,
@@ -1014,7 +1248,7 @@ enum Commands {
         /// Output file (or directory with --all)
         #[arg(long)]
         out: String,
-        /// f32 (default) or bf16
+        /// f32 (default), bf16, or raw (the encoded payload verbatim)
         #[arg(long, default_value = "f32")]
         dtype: String,
         /// Treat --name as a prefix and dump every matching tensor
@@ -1024,21 +1258,28 @@ enum Commands {
     /// Re-encode one 2-D tensor of a .cmf IN PLACE from raw f32 (row-major,
     /// rows×cols as in the directory) with the entry's OWN quantization —
     /// the payload keeps its slot; hashes are recomputed. Verify after.
+    /// With `--raw` every `--set` file is an already ENCODED payload that
+    /// is stored verbatim (its length is checked against the dtype/shape).
     PatchTensor {
         /// Path to .cmf model file (modified in place unless --output)
         model: String,
         /// `name=path.f32` — repeatable; raw f32 rows×cols little-endian
+        /// (with --raw: the encoded payload)
         #[arg(long = "set")]
         sets: Vec<String>,
         /// Encode the patched tensors as this dtype instead of their own
         /// (f16 | q8_2f | q4tp | q2tp); needs --output when the payload
-        /// grows
+        /// grows. With --raw: the dtype the payloads are encoded in
         #[arg(long)]
         dtype: Option<String>,
         /// Write a new file (all other tensors copied verbatim) instead
         /// of patching in place
         #[arg(long)]
         output: Option<String>,
+        /// Each `--set` path holds an already ENCODED payload (the entry's
+        /// own dtype, or `--dtype`), stored verbatim — no re-encoding
+        #[arg(long, default_value_t = false)]
+        raw: bool,
     },
     /// Show model information
     Info {
@@ -2910,7 +3151,83 @@ async fn main() -> anyhow::Result<()> {
             dspark_sidecar,
             mimo_towers,
             sampling,
+            blr_bpw,
+            blr_method,
+            calib,
+            blr_kv_factor,
+            blr_paths,
+            blr_fit_tokens,
+            blr_sel_tokens,
+            blr_rho,
+            blr_threads,
+            blr_keep_src,
+            blr_device,
         } => {
+            if quant
+                .as_deref()
+                .is_some_and(|q| q.eq_ignore_ascii_case("blr"))
+            {
+                anyhow::ensure!(
+                    also_output.is_empty()
+                        && !mtp_sidecar
+                        && !dspark_sidecar
+                        && tensor_quant.is_empty()
+                        && !resume
+                        && defrag.is_none()
+                        && o1.is_none(),
+                    "--quant blr runs its own encoder: --also-output, --mtp-sidecar, \
+                     --dspark-sidecar, --tensor-quant, --resume, --defrag and --o1 do not apply"
+                );
+                let method = match blr_method.to_ascii_lowercase().as_str() {
+                    "nvg" => nvg::Method::Nvg,
+                    "dual-svid" | "dualsvid" => nvg::Method::DualSvid,
+                    other => anyhow::bail!("--blr-method {other}: expected nvg or dual-svid"),
+                };
+                let paths = match blr_paths.as_str() {
+                    "auto" => nvg::PathsChoice::Auto,
+                    "1" => nvg::PathsChoice::One,
+                    "2" => nvg::PathsChoice::Two,
+                    other => anyhow::bail!("--blr-paths {other}: expected auto, 1 or 2"),
+                };
+                anyhow::ensure!(
+                    blr_bpw > 0.0 && blr_bpw < 16.0,
+                    "--bpw {blr_bpw} out of range"
+                );
+                anyhow::ensure!(
+                    blr_kv_factor.is_finite() && blr_kv_factor > 0.0,
+                    "--blr-kv-factor {blr_kv_factor} must be finite and positive"
+                );
+                anyhow::ensure!(
+                    blr_fit_tokens >= 2 && blr_sel_tokens >= 2,
+                    "--blr-fit-tokens and --blr-sel-tokens must be at least 2"
+                );
+                let threads = blr_threads.unwrap_or_else(|| {
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(4)
+                });
+                let opts = nvg::BlrOpts {
+                    bpw: blr_bpw,
+                    method,
+                    calib,
+                    kv_factor: blr_kv_factor,
+                    paths,
+                    fit_tokens: blr_fit_tokens,
+                    sel_tokens: blr_sel_tokens,
+                    window: 512,
+                    rho: blr_rho,
+                    threads,
+                    keep_src: blr_keep_src,
+                    device: nvg::BlrDevice::resolve(&blr_device)?,
+                };
+                nvg::run_convert_blr(&model, &output, hf_token.as_deref(), &opts)?;
+                println!("✓ wrote {output}");
+                return Ok(());
+            }
+            anyhow::ensure!(
+                calib.is_none(),
+                "--calib is the NVG calibration text of --quant blr"
+            );
             anyhow::ensure!(
                 !mtp_sidecar || also_output.is_empty(),
                 "--also-output cannot be combined with --mtp-sidecar"
@@ -3100,7 +3417,22 @@ async fn main() -> anyhow::Result<()> {
             output,
             quant,
             in_place,
-        } => requant::cmd_requant(&model, output.as_deref(), &quant, in_place),
+            allow_tol,
+            tol,
+        } => {
+            if quant == "blr-q8_2f" {
+                let out = output.as_deref().ok_or_else(|| anyhow::anyhow!("--quant blr-q8_2f needs --output"))?;
+                requant::cmd_requant_blr_q8(&model, out)
+            } else if quant == "q1g" {
+                requant::cmd_requant_q1g(&model, output.as_deref(), in_place, allow_tol, tol)
+            } else if quant == "q1" && !allow_tol {
+                requant::cmd_requant_q1(&model, output.as_deref(), in_place)
+            } else if allow_tol {
+                Err(anyhow::anyhow!("--allow-tol only applies to --quant q1g"))
+            } else {
+                requant::cmd_requant(&model, output.as_deref(), &quant, in_place)
+            }
+        }
         Commands::TubeBake {
             model,
             plan,
@@ -3138,6 +3470,100 @@ async fn main() -> anyhow::Result<()> {
             println!("✓ wrote {output}");
             Ok(())
         }
+        #[cfg(feature = "gpu")]
+        Commands::QuantizeMoe { calib_model, hf, calib, tokens, window, layers_per_pass, lambda, min_rows, scratch, threads, output, patch_shared } => {
+            moegptq::run(&moegptq::MoeOpts {
+                calib_model: &calib_model,
+                hf: &hf,
+                calib: &calib,
+                tokens,
+                window,
+                layers_per_pass,
+                lambda,
+                min_rows,
+                scratch: &scratch,
+                threads,
+                output: output.as_deref().unwrap_or(""),
+                patch_shared: patch_shared.as_deref(),
+            })
+        }
+        #[cfg(not(feature = "gpu"))]
+        Commands::QuantizeMoe { .. } => Err(anyhow::anyhow!("quantize-moe needs a build with the gpu feature")),
+        #[cfg(feature = "gpu")]
+        Commands::NvgTrain {
+            student,
+            teacher,
+            calib,
+            tokens,
+            window,
+            batch,
+            epochs,
+            lr,
+            topk,
+            eval_windows,
+            eval_every,
+            clip,
+            seed,
+            output,
+        } => {
+            nvgtrain::run(&nvgtrain::NvgTrainOpts {
+                student: &student,
+                teacher: &teacher,
+                calib: &calib,
+                tokens,
+                window,
+                batch,
+                epochs,
+                lr,
+                topk,
+                eval_windows,
+                eval_every,
+                clip,
+                seed,
+                output: &output,
+            })
+        }
+        #[cfg(not(feature = "gpu"))]
+        Commands::NvgTrain { .. } => Err(anyhow::anyhow!("nvg-train needs a build with the gpu feature")),
+        Commands::NvgBench {
+            model,
+            tensor,
+            calib,
+            fit_tokens,
+            sel_tokens,
+            bpw,
+            kv_factor,
+            paths,
+            device,
+            threads,
+            rho,
+            gram_cache,
+            layer,
+            jobs,
+        } => {
+            let paths = match paths.as_str() {
+                "auto" => nvg::PathsChoice::Auto,
+                "1" => nvg::PathsChoice::One,
+                "2" => nvg::PathsChoice::Two,
+                other => anyhow::bail!("--paths {other}: expected auto, 1 or 2"),
+            };
+            nvgbench::run(&nvgbench::BenchOpts {
+                model: &model,
+                tensor: tensor.as_deref(),
+                calib: calib.as_deref(),
+                fit_tokens,
+                sel_tokens,
+                bpw,
+                kv_factor,
+                paths,
+                device: &device,
+                threads,
+                rho,
+                gram_cache: gram_cache.as_deref(),
+                layer,
+                jobs,
+            })
+        }
         Commands::QuantizeGptq {
             input,
             calib,
@@ -3152,36 +3578,75 @@ async fn main() -> anyhow::Result<()> {
             threads,
             act_order,
             hessians,
+            calib_chunk_layers,
+            q2tp_rule,
+            q2tp_rule_tensor,
+            q2tp_debias,
+            q4tp_debias,
         } => {
-            match codec.to_ascii_lowercase().as_str() {
-                "q4tp" => {
+            let codec = codec.to_ascii_lowercase();
+            let q2tp_flags =
+                q2tp_rule.is_some() || !q2tp_rule_tensor.is_empty() || q2tp_debias.is_some();
+            let q2tp_debias = match q2tp_debias.as_deref().map(str::to_ascii_lowercase).as_deref() {
+                None | Some("on" | "true" | "1") => true,
+                Some("off" | "false" | "0") => false,
+                Some(other) => anyhow::bail!("--q2tp-debias {other}: expected on or off"),
+            };
+            match codec.as_str() {
+                "q4tp" | "q2tp" => {
+                    let profile = convert::parse_quant(&codec)?;
+                    anyhow::ensure!(
+                        codec == "q2tp" || !q2tp_flags,
+                        "--q2tp-rule / --q2tp-rule-tensor / --q2tp-debias apply to --codec q2tp"
+                    );
                     convert::set_tensor_quant_overrides(&tensor_quant)?;
                     let threads = threads.unwrap_or_else(|| {
                         std::thread::available_parallelism()
                             .map(|n| n.get())
                             .unwrap_or(4)
                     });
-                    gptq::run_quantize_gptq_q4tp(
-                        &input,
-                        calib_model.as_deref(),
-                        &calib,
-                        &output,
+                    let opts = gptq::GptqTiledOpts {
+                        input: &input,
+                        calib_model: calib_model.as_deref(),
+                        calib: calib
+                            .iter()
+                            .map(|s| gptq::CalibSource::parse(s))
+                            .collect::<anyhow::Result<Vec<_>>>()?,
+                        output: &output,
                         tokens,
                         window,
                         lambda,
                         threads,
                         act_order,
-                        hessians.as_deref(),
-                    )?;
+                        hessians: hessians.as_deref(),
+                        profile,
+                        q2tp_rule: gptq::Q2tpRule::parse(q2tp_rule.as_deref().unwrap_or("placed"))?,
+                        q2tp_rule_overrides: q2tp_rule_tensor
+                            .iter()
+                            .map(|s| gptq::parse_q2tp_rule_override(s))
+                            .collect::<anyhow::Result<Vec<_>>>()?,
+                        q2tp_debias,
+                        q4tp_debias,
+                        chunk_layers: calib_chunk_layers,
+                    };
+                    gptq::run_quantize_gptq_tiled(&opts)?;
                 }
                 "q1s" => {
                     anyhow::ensure!(
-                        calib_model.is_none() && tensor_quant.is_empty(),
-                        "--calib-model / --tensor-quant apply to --codec q4tp"
+                        calib_model.is_none()
+                            && tensor_quant.is_empty()
+                            && !q2tp_flags
+                            && !q4tp_debias
+                            && calib_chunk_layers == 0,
+                        "--calib-model / --tensor-quant / --calib-chunk-layers / --q2tp-* / --q4tp-debias apply to --codec q4tp|q2tp"
                     );
-                    gptq::run_quantize_gptq(&input, &calib, &output, keep, tokens, lambda)?
+                    anyhow::ensure!(
+                        calib.len() == 1,
+                        "--codec q1s reads one --calib corpus"
+                    );
+                    gptq::run_quantize_gptq(&input, &calib[0], &output, keep, tokens, lambda)?
                 }
-                other => anyhow::bail!("--codec {other}: expected q1s or q4tp"),
+                other => anyhow::bail!("--codec {other}: expected q1s, q4tp or q2tp"),
             }
             println!("✓ wrote {output}");
             Ok(())
@@ -3619,7 +4084,8 @@ async fn main() -> anyhow::Result<()> {
             sets,
             dtype,
             output,
-        } => cmd_patch_tensor(&model, &sets, dtype.as_deref(), output.as_deref()),
+            raw,
+        } => cmd_patch_tensor(&model, &sets, dtype.as_deref(), output.as_deref(), raw),
         Commands::Story { model } => cmd_story(&model),
         Commands::Diff { a, b } => cmd_diff(&a, &b),
         Commands::Imagine {
@@ -6950,27 +7416,7 @@ fn cmd_dequant(
             .tensor(n)
             .ok_or_else(|| anyhow::anyhow!("no tensor '{n}'"))?;
         let bytes = model.tensor_bytes(n)?;
-        let mut vals = vec![0f32; e.n_elems()];
-        cortiq_core::quant::dequant_tensor(e, bytes, &mut vals)
-            .map_err(|er| anyhow::anyhow!("dequant {n}: {er}"))?;
-        let mut buf: Vec<u8> = Vec::with_capacity(vals.len() * 4);
-        match dtype {
-            "f32" => {
-                for v in &vals {
-                    buf.extend_from_slice(&v.to_le_bytes());
-                }
-            }
-            "bf16" => {
-                for v in &vals {
-                    // round-to-nearest-even to bf16
-                    let b = v.to_bits();
-                    let lsb = (b >> 16) & 1;
-                    let r = b.wrapping_add(0x7FFF + lsb) >> 16;
-                    buf.extend_from_slice(&(r as u16).to_le_bytes());
-                }
-            }
-            other => anyhow::bail!("dtype {other}: f32 or bf16"),
-        }
+        let buf = dequant_dump_bytes(e, bytes, dtype)?;
         let path = if all {
             format!("{out}/{}.bin", n)
         } else {
@@ -6988,11 +7434,77 @@ fn cmd_dequant(
     Ok(())
 }
 
+/// The bytes `cortiq dequant --dtype DTYPE` writes for one tensor: the
+/// decoded values as little-endian f32 or bf16 (round-to-nearest-even),
+/// or with `raw` the entry's encoded payload verbatim (no decode at all).
+fn dequant_dump_bytes<'a>(
+    e: &cortiq_core::format::TensorEntry,
+    bytes: &'a [u8],
+    dtype: &str,
+) -> anyhow::Result<std::borrow::Cow<'a, [u8]>> {
+    if dtype == "raw" {
+        return Ok(std::borrow::Cow::Borrowed(bytes));
+    }
+    if dtype != "f32" && dtype != "bf16" {
+        anyhow::bail!("dtype {dtype}: f32, bf16 or raw");
+    }
+    let mut vals = vec![0f32; e.n_elems()];
+    cortiq_core::quant::dequant_tensor(e, bytes, &mut vals)
+        .map_err(|er| anyhow::anyhow!("dequant {}: {er}", e.name))?;
+    let mut buf: Vec<u8> = Vec::with_capacity(vals.len() * 4);
+    if dtype == "f32" {
+        for v in &vals {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+    } else {
+        for v in &vals {
+            // round-to-nearest-even to bf16
+            let b = v.to_bits();
+            let lsb = (b >> 16) & 1;
+            let r = b.wrapping_add(0x7FFF + lsb) >> 16;
+            buf.extend_from_slice(&(r as u16).to_le_bytes());
+        }
+    }
+    Ok(std::borrow::Cow::Owned(buf))
+}
+
+/// Dtype of an already ENCODED payload for `patch-tensor --raw`, checked
+/// against the entry's shape: the entry's own dtype, or — with `--dtype` —
+/// the dtype the encoder emits for this shape (q4tp/q2tp fall back to
+/// q8_2f when the input dim is not a multiple of the group, exactly as
+/// `quantize_2d` does). The length check is `validate_payload`'s, i.e. the
+/// reader's own rule, so a payload that passes here also passes `open()`.
+fn raw_patch_dtype(
+    e: &cortiq_core::format::TensorEntry,
+    forced: Option<convert::Quant>,
+    payload: &[u8],
+) -> anyhow::Result<TensorDtype> {
+    let dt = match forced {
+        None => e.dtype,
+        Some(convert::Quant::F16) => TensorDtype::F16,
+        Some(q) => {
+            anyhow::ensure!(
+                e.shape.len() == 2,
+                "{}: raw {q:?} wants a 2-D tensor (shape {:?})",
+                e.name,
+                e.shape
+            );
+            // A one-row probe picks the dtype without encoding the tensor.
+            let cols = e.shape[1];
+            convert::quantize_2d(q, &vec![0f32; cols], 1, cols).0
+        }
+    };
+    cortiq_core::quant::validate_payload(dt, &e.shape, payload)
+        .map_err(|er| anyhow::anyhow!("{}: raw {dt:?} payload: {er}", e.name))?;
+    Ok(dt)
+}
+
 fn cmd_patch_tensor(
     model_path: &str,
     sets: &[String],
     dtype: Option<&str>,
     output: Option<&str>,
+    raw_payload: bool,
 ) -> anyhow::Result<()> {
     if sets.is_empty() {
         anyhow::bail!("nothing to patch: pass --set name=path.f32 (repeatable)");
@@ -7026,6 +7538,26 @@ fn cmd_patch_tensor(
         let e = &model.tensors[idx];
         let n = e.n_elems();
         let raw = std::fs::read(path)?;
+        if raw_payload {
+            // Verbatim payload: no re-encode, only the reader's own
+            // length rule for the target dtype and the in-place slot.
+            let dt = raw_patch_dtype(e, forced, &raw).map_err(|er| anyhow::anyhow!("{path}: {er}"))?;
+            if output.is_none() {
+                anyhow::ensure!(
+                    e.shard == 0,
+                    "{name} lives in a sibling shard; in-place needs shard 0"
+                );
+                anyhow::ensure!(
+                    raw.len() as u64 <= e.nbytes,
+                    "{name}: payload {} bytes > slot {} — use --output",
+                    raw.len(),
+                    e.nbytes
+                );
+            }
+            eprintln!("{name}: {:?} → {dt:?} raw ({} bytes)", e.dtype, raw.len());
+            patches.push((idx, dt, raw));
+            continue;
+        }
         if raw.len() != n * 4 {
             anyhow::bail!(
                 "{path}: {} bytes, want {} (= {:?} f32)",
@@ -9072,6 +9604,201 @@ mod tests {
             }
             _ => panic!("wrong subcommand"),
         }
+    }
+
+    #[test]
+    fn convert_blr_options_parse() {
+        let cli = std::thread::Builder::new()
+            .name("convert-blr-parser".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                Cli::try_parse_from([
+                    "cortiq",
+                    "convert",
+                    "--model",
+                    "hf08",
+                    "--quant",
+                    "blr",
+                    "--output",
+                    "m.cmf",
+                    "--bpw",
+                    "1.0",
+                    "--blr-method",
+                    "dual-svid",
+                    "--calib",
+                    "calib.txt",
+                    "--blr-paths",
+                    "2",
+                    "--blr-rho",
+                    "0.125",
+                    "--blr-fit-tokens",
+                    "1024",
+                    "--blr-device",
+                    "cpu",
+                ])
+                .unwrap()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        match cli.command {
+            Commands::Convert {
+                quant,
+                blr_bpw,
+                blr_method,
+                calib,
+                blr_paths,
+                blr_rho,
+                blr_fit_tokens,
+                blr_sel_tokens,
+                blr_kv_factor,
+                blr_device,
+                ..
+            } => {
+                assert_eq!(blr_device, "cpu");
+                assert_eq!(nvg::BlrDevice::resolve(&blr_device).unwrap(), nvg::BlrDevice::Cpu);
+                assert!(nvg::BlrDevice::resolve("tpu").is_err());
+                assert_eq!(quant.as_deref(), Some("blr"));
+                assert_eq!(blr_bpw, 1.0);
+                assert_eq!(blr_method, "dual-svid");
+                assert_eq!(calib.as_deref(), Some("calib.txt"));
+                assert_eq!(blr_paths, "2");
+                assert_eq!(blr_rho, 0.125);
+                assert_eq!(blr_fit_tokens, 1024);
+                assert_eq!(blr_sel_tokens, 3072);
+                assert_eq!(blr_kv_factor, 1.0);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    /// A small q4tp + f16 container for the raw dequant/patch round trips.
+    fn raw_patch_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+        use cortiq_core::format::TensorSpec;
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("src.cmf");
+        let header: cortiq_core::CmfHeader = serde_json::from_value(serde_json::json!({
+            "format": "cmf", "version": cortiq_core::CMF_VERSION,
+            "arch": {"arch_name": "llama", "hidden_size": 64,
+                "intermediate_size": 128, "num_layers": 1, "num_attention_heads": 1,
+                "num_kv_heads": 1, "head_dim": 64, "vocab_size": 64,
+                "layer_types": ["FullAttention"], "tie_word_embeddings": true,
+                "rms_norm_eps": 1e-6, "max_position_embeddings": 64},
+            "quant_type": "F32"
+        }))
+        .unwrap();
+        let w: Vec<f32> = (0..96 * 64).map(|i| (i as f32 * 0.37).sin() * 0.05).collect();
+        let (q_dt, q_bytes) = convert::quantize_2d(convert::Quant::Q4TiledP, &w, 96, 64);
+        assert_eq!(q_dt, TensorDtype::Q4TiledP);
+        let g: Vec<f32> = (0..64).map(|i| 1.0 + i as f32 / 128.0).collect();
+        let specs = vec![
+            TensorSpec {
+                name: "model.layers.0.mlp.up_proj.weight".into(),
+                dtype: q_dt,
+                shape: vec![96, 64],
+                data: q_bytes,
+            },
+            TensorSpec {
+                name: "model.layers.0.input_layernorm.weight".into(),
+                dtype: TensorDtype::F16,
+                shape: vec![64],
+                data: convert::encode_f16(&g),
+            },
+        ];
+        CmfModel::write(path.to_str().unwrap(), &header, &specs, None, None).unwrap();
+        path
+    }
+
+    #[test]
+    fn dequant_raw_and_patch_raw_round_trip_payloads_verbatim() {
+        let dir = std::env::temp_dir().join(format!("cmf-raw-patch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src = raw_patch_fixture(&dir);
+        let s = src.to_str().unwrap();
+        let lin = "model.layers.0.mlp.up_proj.weight";
+        let norm = "model.layers.0.input_layernorm.weight";
+
+        // dequant --dtype raw: one file per tensor, the payload verbatim.
+        let dump = dir.join("dump");
+        cmd_dequant(s, "model.", dump.to_str().unwrap(), "raw", true).unwrap();
+        let model = CmfModel::open(s).unwrap();
+        for n in [lin, norm] {
+            let got = std::fs::read(dump.join(format!("{n}.bin"))).unwrap();
+            assert_eq!(got.as_slice(), model.tensor_bytes(n).unwrap(), "{n}");
+        }
+        // f32 / bf16 dumps are unchanged by the raw branch.
+        let e = model.tensor(norm).unwrap();
+        let f32s = dequant_dump_bytes(e, model.tensor_bytes(norm).unwrap(), "f32").unwrap();
+        assert_eq!(f32s.len(), 64 * 4);
+        assert_eq!(f32::from_le_bytes(f32s[4..8].try_into().unwrap()), 1.0 + 1.0 / 128.0);
+        assert!(dequant_dump_bytes(e, model.tensor_bytes(norm).unwrap(), "f8").is_err());
+
+        // Edit only payload FIELDS the way the offline refit does: the q4tp
+        // row params (f16 lo of row 0) and one f16 norm gain.
+        let mut q = model.tensor_bytes(lin).unwrap().to_vec();
+        let nib = 96 * 2 * 16;
+        q[nib] ^= 1;
+        let mut g = model.tensor_bytes(norm).unwrap().to_vec();
+        g[0] ^= 1;
+        drop(model);
+        let (qp, gp) = (dir.join("q.bin"), dir.join("g.bin"));
+        std::fs::write(&qp, &q).unwrap();
+        std::fs::write(&gp, &g).unwrap();
+        let sets = vec![
+            format!("{lin}={}", qp.display()),
+            format!("{norm}={}", gp.display()),
+        ];
+
+        // --output: a new file with exactly these payloads, hashes valid.
+        let out = dir.join("out.cmf");
+        cmd_patch_tensor(s, &sets, None, Some(out.to_str().unwrap()), true).unwrap();
+        let m = CmfModel::open(out.to_str().unwrap()).unwrap();
+        assert!(m.verify().is_empty(), "{:?}", m.verify());
+        assert_eq!(m.tensor_bytes(lin).unwrap(), q.as_slice());
+        assert_eq!(m.tensor_bytes(norm).unwrap(), g.as_slice());
+        assert_eq!(m.tensor(lin).unwrap().dtype, TensorDtype::Q4TiledP);
+        drop(m);
+
+        // In place (same sizes): identical payloads, hashes recomputed.
+        let inplace = dir.join("inplace.cmf");
+        std::fs::copy(&src, &inplace).unwrap();
+        cmd_patch_tensor(inplace.to_str().unwrap(), &sets, None, None, true).unwrap();
+        let m = CmfModel::open(inplace.to_str().unwrap()).unwrap();
+        assert!(m.verify().is_empty(), "{:?}", m.verify());
+        assert_eq!(m.tensor_bytes(lin).unwrap(), q.as_slice());
+        assert_eq!(m.tensor_bytes(norm).unwrap(), g.as_slice());
+        drop(m);
+
+        // A payload of the wrong length is refused before anything is written.
+        std::fs::write(&qp, &q[..q.len() - 1]).unwrap();
+        let before = std::fs::read(&inplace).unwrap();
+        let err = cmd_patch_tensor(inplace.to_str().unwrap(), &sets[..1], None, None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("payload length"), "{err}");
+        assert_eq!(std::fs::read(&inplace).unwrap(), before);
+
+        // --dtype: a q8_2f payload for the q4tp entry. It does not fit the
+        // slot in place; with --output the entry changes dtype.
+        let w: Vec<f32> = (0..96 * 64).map(|i| (i as f32 * 0.11).cos() * 0.02).collect();
+        let (dt8, q8) = convert::quantize_2d(convert::Quant::Q8_2f, &w, 96, 64);
+        assert_eq!(dt8, TensorDtype::Q8_2f);
+        std::fs::write(&qp, &q8).unwrap();
+        let err = cmd_patch_tensor(inplace.to_str().unwrap(), &sets[..1], Some("q8_2f"), None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("use --output"), "{err}");
+        let out8 = dir.join("out8.cmf");
+        cmd_patch_tensor(s, &sets[..1], Some("q8_2f"), Some(out8.to_str().unwrap()), true).unwrap();
+        let m = CmfModel::open(out8.to_str().unwrap()).unwrap();
+        assert!(m.verify().is_empty());
+        assert_eq!(m.tensor(lin).unwrap().dtype, TensorDtype::Q8_2f);
+        assert_eq!(m.tensor_bytes(lin).unwrap(), q8.as_slice());
+        drop(m);
+        // A q4tp-sized payload declared q8_2f is a length error.
+        std::fs::write(&qp, &q).unwrap();
+        assert!(cmd_patch_tensor(s, &sets[..1], Some("q8_2f"), Some(out8.to_str().unwrap()), true).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

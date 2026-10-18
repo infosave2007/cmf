@@ -1009,7 +1009,8 @@ fn raw_u8_u32_u64_dtypes_are_fixed_size_and_round_trip_the_directory() {
         assert_eq!(expected_nbytes(d, &[0]), Some(0));
     }
     assert!(!TensorDtype::F32.is_raw());
-    assert_eq!(TensorDtype::from_id(19), None, "the next id is unknown");
+    // 19 is `blr`, 20 is `q1g`.
+    assert_eq!(TensorDtype::from_id(21), None, "the next id is unknown");
 
     // A writer refuses a raw payload that disagrees with its shape …
     let dir = tempdir("raw");
