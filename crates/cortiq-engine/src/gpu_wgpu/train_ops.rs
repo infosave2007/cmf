@@ -904,6 +904,40 @@ pub fn download(c: &Ctx, b: &wgpu::Buffer, n: usize) -> Option<Vec<f32>> {
     Some(out)
 }
 
+/// `n` u32 words of `b` (bit patterns kept exactly).
+pub fn download_u32(c: &Ctx, b: &wgpu::Buffer, n: usize) -> Option<Vec<u32>> {
+    let size = (n * 4) as u64;
+    let st = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("train_rb_u32"),
+        size: size.max(4),
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    enc.copy_buffer_to_buffer(b, 0, &st, 0, size);
+    submit(c, enc.finish());
+    let slice = st.slice(..size);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    c.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+    let out = {
+        let data = slice.get_mapped_range().ok()?;
+        bytemuck::cast_slice::<u8, u32>(&data[..size as usize]).to_vec()
+    };
+    st.unmap();
+    Some(out)
+}
+
+/// A zero-filled storage buffer of `n` u32 words (no host staging: wgpu
+/// zero-initializes new buffers).
+pub fn zeros_u32(c: &Ctx, n: usize) -> wgpu::Buffer {
+    c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("train_u32"),
+        size: (n.max(4) * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
 /// The device context, for callers outside `gpu_wgpu`.
 pub fn dev() -> Option<&'static Ctx> {
     ctx()

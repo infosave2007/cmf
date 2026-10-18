@@ -54,6 +54,8 @@ pub mod gdn_train;
 pub mod train_ops;
 /// Trainer GEMMs (zi_mm) and the binary low-rank layer forward/backward.
 pub mod train_mm;
+/// Sign training of the binary low-rank paths (STE latents, factored optimizer).
+pub mod train_sign;
 /// Trainer loss: frozen vocabulary head + KL against the teacher top-k.
 pub mod train_head;
 /// Subgroup q1g decode matvec (bit-identical to `q1g_matvec`, no barriers).
