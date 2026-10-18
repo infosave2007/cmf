@@ -73,6 +73,36 @@ fn clear_convert_env() {
     set_tensor_quant_overrides(&[]).unwrap();
 }
 
+/// A bounded device budget (4 GiB unless the caller set `CMF_GPU_VRAM_MB`,
+/// as the V4.1 GPU fixture does) for every test here that runs a forward:
+/// the wgpu backend self-selects on a Linux/Windows host with an adapter,
+/// and without a budget the V4.1 expert bank sizes itself from the whole
+/// card (75 % of a 96 GB card that another process may be holding: an
+/// OOM) or from u64::MAX on wgpu-over-Metal. The budget is read once, when
+/// the backend comes up: a context another test of this binary already
+/// brought up keeps its own, which is why the device test also pins its
+/// bank's slot count.
+fn bound_device_budget() {
+    if std::env::var_os("CMF_GPU_VRAM_MB").is_none() {
+        // SAFETY: under ENV_LOCK, like every env write in these tests.
+        unsafe { std::env::set_var("CMF_GPU_VRAM_MB", "4096") };
+    }
+}
+
+/// MoE calls the V4.1 executor's device expert bank served so far (0 in a
+/// build without the wgpu backend).
+fn bank_calls(p: &cortiq_engine::Pipeline) -> u64 {
+    #[cfg(feature = "gpu")]
+    {
+        p.dsv41.as_ref().map_or(0, |d| d.3.gpu_moe_stats().0)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = p;
+        0
+    }
+}
+
 // ── codec plumbing ──────────────────────────────────────────────────────
 
 #[test]
@@ -623,11 +653,13 @@ fn scaled_twin(model: &CmfModel, out: &Path, k: f32) {
 /// - the q4tp output still decodes the experts through f32 (mixed outputs);
 /// - the CPU forward of the fp4 file equals, bit for bit, the forward of the
 ///   same file with its FP4 tensors dequantized to f32 (exact contract), and
-///   stays finite on the default A8W8 kernels.
+///   stays finite on the default A8W8 kernels — on a GPU host too: the
+///   forwards are pinned to the host (`gpu::pause_gpu`, checked).
 #[test]
 fn dsv41_fp4_profile_is_byte_identical_and_forward_matches_f32_experts() {
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_convert_env();
+    bound_device_budget();
     let src = write_dsv41_source("dsv41");
     let fp4_out = src.dir.join("fp4.cmf");
     let q4_out = src.dir.join("q4tp.cmf");
@@ -747,11 +779,28 @@ fn dsv41_fp4_profile_is_byte_identical_and_forward_matches_f32_experts() {
             cortiq_engine::sampler::SamplerConfig::default(),
         )
         .unwrap();
-        p.forward_ids(&ids, None).unwrap()
+        let out = p.forward_ids(&ids, None).unwrap();
+        assert_eq!(
+            bank_calls(&p),
+            0,
+            "the CPU-contract forward ran MoE calls on the device bank"
+        );
+        out
     };
-    // The CPU contract: with the wgpu backend up (`CMF_GPU=wgpu`, the
-    // device test below) the fp4 experts would take the dynamic GPU bank.
+    // The CPU contract: both forwards on the host. Where the wgpu backend is
+    // up — self-selected on a Linux/Windows GPU host, `CMF_GPU=wgpu` on
+    // macOS — the fp4 file's experts would take the dynamic mxfp4 bank while
+    // the twin's f32 experts cannot, and the bits would differ by the bank's
+    // summation order (the pod run on an RTX PRO 6000 did exactly that).
+    // `CMF_GPU` is read once per process and this binary is shared, so
+    // `CMF_GPU=0` cannot be set from here; `gpu::pause_gpu` is the
+    // process-wide pin instead (every device path — the V4.1 bank and
+    // attention tail, the per-op kernels — asks `gpu::enabled` first, and the
+    // pause is a count of guards, so no other holder can lift it). The pin
+    // is checked, not assumed: `enabled()` is false and no forward below
+    // served a MoE call from the bank, so the comparison stays bit-exact.
     let cpu = cortiq_engine::gpu::pause_gpu();
+    assert!(!cortiq_engine::gpu::enabled(), "the GPU pause did not hold");
     let (a, b) = cortiq_engine::qtensor::with_float_activations(|| (logits(&fp4), logits(&twin)));
     assert_eq!(a.len(), VOCAB);
     assert!(a.iter().all(|v| v.is_finite()));
@@ -872,6 +921,8 @@ fn tensor_quant_mxfp4_override_repacks_and_refuses_nan_scales() {
 fn dsv41_fp4_dynamic_gpu_moe_matches_the_cpu_forward() {
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_convert_env();
+    // Before `selected_and_up` brings the backend up.
+    bound_device_budget();
     use cortiq_engine::gpu_wgpu as gw;
     if gw::selected_and_up() != Some(true) {
         eprintln!("wgpu backend not requested (CMF_GPU=wgpu) or no adapter — skipping");
@@ -1107,6 +1158,7 @@ fn exclude_tensors_holds_for_split_produced_names() {
 fn dsv41_exclude_mtp_drops_the_stack_and_keeps_the_forward() {
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     clear_convert_env();
+    bound_device_budget();
     let src = write_dsv41_source_with("dsv41-mtp", true);
     let source = open_safetensors(&src.dir.join("model.safetensors")).unwrap();
     let mtp_source: Vec<String> = source

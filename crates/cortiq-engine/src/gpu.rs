@@ -1165,11 +1165,36 @@ pub fn backend_available() -> bool {
 /// *phase* off the device — a prompt encoder whose weights live in a part of
 /// the file the hot loop never touches, on a machine that cannot keep both
 /// wired — has to say so globally.
-static GPU_PAUSED: AtomicBool = AtomicBool::new(false);
+static GPU_PAUSED: PauseGate = PauseGate::new();
 
-/// Park the device for every thread until the returned guard drops.
+/// The pause as a count of live guards, not a flag: with a flag, the first
+/// guard to drop lifted every other holder's pause too — two overlapping
+/// phases, or two tests of one binary (a bit-exact CPU reference whose
+/// neighbour's guard drops mid-forward), put the device back early.
+struct PauseGate(std::sync::atomic::AtomicUsize);
+
+impl PauseGate {
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicUsize::new(0))
+    }
+
+    fn enter(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn leave(&self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn paused(&self) -> bool {
+        self.0.load(Ordering::Relaxed) != 0
+    }
+}
+
+/// Park the device for every thread until the returned guard drops (and
+/// every other live guard with it).
 pub fn pause_gpu() -> GpuPause {
-    GPU_PAUSED.store(true, Ordering::Relaxed);
+    GPU_PAUSED.enter();
     GpuPause(())
 }
 
@@ -1177,12 +1202,31 @@ pub struct GpuPause(());
 
 impl Drop for GpuPause {
     fn drop(&mut self) {
-        GPU_PAUSED.store(false, Ordering::Relaxed);
+        GPU_PAUSED.leave();
     }
 }
 
 pub fn enabled() -> bool {
-    !GPU_PAUSED.load(Ordering::Relaxed) && backend() != Backend::None
+    !GPU_PAUSED.paused() && backend() != Backend::None
+}
+
+#[cfg(test)]
+mod pause_gate_tests {
+    use super::PauseGate;
+
+    /// Overlapping holders: the pause lasts until the last one leaves (a
+    /// local gate, so the process-wide one other tests see is untouched).
+    #[test]
+    fn pause_holds_until_the_last_guard() {
+        let g = PauseGate::new();
+        assert!(!g.paused());
+        g.enter();
+        g.enter();
+        g.leave();
+        assert!(g.paused(), "one holder left, the other's pause was lifted");
+        g.leave();
+        assert!(!g.paused());
+    }
 }
 
 /// Default-on condition for the wgpu whole-token graph: the wgpu
