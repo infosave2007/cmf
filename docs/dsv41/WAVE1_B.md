@@ -253,7 +253,8 @@ CALIB=/root/<plain q4tp 1017 file>.cmf          # the converter's output, single
 export XDG_RUNTIME_DIR=/tmp
 mkdir -p /root/logs /root/moescratch
 
-# 1. smoke: capture + layer 0 only, nothing written (CMF_MOE_STOP_AFTER bails before the output is finished)
+# 1. smoke: capture of all 40 layers on 2048 tokens, then layer 0 only (CMF_MOE_STOP_AFTER bails before the
+#    output is finished; delete the partial smoke.cmf afterwards)
 CMF_MOE_STOP_AFTER=1 CMF_MOE_WORKERS=8 /root/cortiq-moe quantize-moe $CALIB \
   --hf deepseek-ai/DeepSeek-V4.1-Flash-1017 --calib /root/data/calib.mix.txt \
   --tokens 2048 --window 2048 --layers-per-pass 40 --codec q4tp \
@@ -295,10 +296,13 @@ Notes on the commands:
   5120-wide input. Most experts would be rank-deficient without the prior.
 - `--hf` can point at a local copy of the source shards instead. They are then
   never deleted.
-- The pod's plain conversion consumes the source shards (the converter's
-  consume mode), so the default is to stream them again from the Hub. That is
+- The 510 GB source cannot stay on disk next to the 499 GB calibration file
+  (1009 GB > 900 GB), so the commands stream it again from the Hub. That is
   40 layer shards of about 7.3 GB each, two in flight (one being encoded, one
   prefetched), about 15 GB of scratch.
+- Keep `$CALIB` and `--scratch` on the pod's local disk, not on `/workspace`.
+  mmap from that network filesystem (MooseFS) runs at about 1 % CPU and looks
+  like a hang.
 - `/dev/null` as `--output` in step 2 is never opened: diag writes nothing.
 
 ### Disk at each step (900 GB)
