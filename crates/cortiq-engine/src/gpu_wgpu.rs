@@ -26261,8 +26261,8 @@ pub fn forward_token_graph(
         kind: u8,
         prism: crate::gpu::GraphPrismOp,
         affine: bool,
-        /// `blr` geometry (kind GRAPH_KIND_BLR only).
-        blr: Option<blr::BlrDims>,
+        /// `blr` geometry and f32 input scales (kind GRAPH_KIND_BLR only).
+        blr: Option<(blr::BlrDims, wgpu::Buffer)>,
     }
     enum LAttn {
         Full {
@@ -26485,6 +26485,7 @@ pub fn forward_token_graph(
                     &bytes[abs..abs + plen],
                     layer_of_name(&entry.name),
                 )?;
+                let g = blr::g_f32(c, model, gw.idx)?;
                 Some(GMat {
                     buf: b,
                     rs: None,
@@ -26492,7 +26493,7 @@ pub fn forward_token_graph(
                     kind: crate::gpu::GRAPH_KIND_BLR,
                     prism: gw.prism,
                     affine: gw.affine,
-                    blr: Some(d),
+                    blr: Some((d, g)),
                 })
             }
             4 => {
@@ -27083,7 +27084,10 @@ pub fn forward_token_graph(
             if let LFfn::Dense { gate, up, down, .. } = &lw.ffn {
                 v.extend([gate, up, down]);
             }
-            v.iter().filter_map(|m| m.blr).map(|d| d.latents()).sum::<usize>()
+            v.iter()
+                .filter_map(|m| m.blr.as_ref())
+                .map(|(d, _)| d.latents())
+                .sum::<usize>()
         })
         .max()
         .unwrap_or(0);
@@ -27904,9 +27908,11 @@ pub fn forward_token_graph(
                 let g = blr_graph
                     .as_ref()
                     .expect("blr weight resolved without the blr graph kernels");
+                let (dims, g_buf) = m.blr.as_ref().expect("blr GMat carries its geometry");
                 let gm = [blr::GroupMat {
                     buf: &m.buf,
-                    dims: m.blr.expect("blr GMat carries its geometry"),
+                    g: g_buf,
+                    dims: *dims,
                     y,
                 }];
                 debug_assert_eq!((gm[0].dims.rows, gm[0].dims.cols), (rows, cols));
@@ -28217,10 +28223,14 @@ pub fn forward_token_graph(
             .expect("blr weight resolved without the blr graph kernels");
         let gm: Vec<blr::GroupMat<'_>> = mats
             .iter()
-            .map(|(m, y)| blr::GroupMat {
-                buf: &m.buf,
-                dims: m.blr.expect("blr GMat carries its geometry"),
-                y,
+            .map(|(m, y)| {
+                let (dims, g_buf) = m.blr.as_ref().expect("blr GMat carries its geometry");
+                blr::GroupMat {
+                    buf: &m.buf,
+                    g: g_buf,
+                    dims: *dims,
+                    y,
+                }
             })
             .collect();
         let bind = |stage: u32, l: &wgpu::BindGroupLayout, b: &[&wgpu::Buffer]| {

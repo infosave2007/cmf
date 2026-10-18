@@ -150,21 +150,30 @@ fn blr_u(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) li
 // resident token graph: no upload, no readback, the latents stay in a graph
 // scratch. One dispatch serves up to three tensors of one input (q|k|v,
 // qkv|z, gate|up), so a group of `blr` projections costs two dispatches.
+// Decode reads every sign bit once a token, so both stages are written for
+// memory-level parallelism: coalesced 32-bit sign words, two words of every
+// row a lane in flight before the first add, and no dependent load chains.
 //
-// * The latents of tensor j sit at `toff_j` in `t`, path p at `p·rpad`,
-//   `rpad = ⌈r/32⌉·32`, the pad entries written as 0 — stage U then reads
-//   whole sign words without masking (the bits past `r` meet zeros).
-// * Stage V: a 32-lane subgroup owns 4 latent rows, the lanes walk the row's
-//   32-bit sign words (coalesced), `z = x ⊙ g_p` is formed per word in
-//   registers and shared by the 4 rows, and a subgroup sum (or, without
-//   32-wide subgroups, a workgroup-memory sum) closes each row.
-// * Stage U: one thread per output row, 32 rows a workgroup. The rows'
-//   sign bits are staged through workgroup memory in chunks of ≤ 32 words
-//   (row-major U rows are byte-aligned, so a lane funnel-shifts two words;
-//   the loads of one chunk row are 32 consecutive words), then every thread
-//   walks its own row against the latents, which all threads read at the
-//   same address (a broadcast). `blr_gu_act` computes gate and up of the
-//   same rows and writes act(gate)·up.
+// * Latents. Stage U reads a row's sign words where they lie: a U row
+//   starts at bit `i·r` of its section, `r % 8 == 0`, so the start sits
+//   `σ = i·r mod 32 ∈ {0, 8, 16, 24}` bits into a word. Instead of
+//   funnel-shifting the bits, the latents are stored four times, copy
+//   `c` shifted by `8c` (`t_c[m] = t[m − 8c]`, zero outside `[8c, r + 8c)`):
+//   the bits of the neighbouring rows that share a word meet zeros. Tensor
+//   j's copies sit at `toff_j`, path p, copy c at `(4p + c)·(rpad + 32)`,
+//   `rpad = ⌈r/32⌉·32`. Rows `i ≡ k (mod 4)` share σ, so a warp that owns
+//   rows `k, k+4, k+8, k+12` reads one copy for all four.
+// * Stage V: a set of `LV` lanes (32: one subgroup, or 128: a workgroup,
+//   chosen by the input width) owns 4 latent rows; the lanes walk the rows'
+//   sign words two at a time (coalesced), `z = x ⊙ g_p` is formed per word in
+//   registers and shared by the 4 rows; subgroup sums (or, without 32-wide
+//   subgroups, workgroup-memory sums) close each row, which is written to its
+//   four copies (and the copies' zero borders by the k = 0 set).
+// * Stage U: a subgroup owns 4 output rows of one tensor (`blr_gu_act`: the
+//   same 4 rows of gate and of up). Its lanes walk the rows' words over all
+//   paths as one flattened sequence, two words a lane in flight; the latent
+//   words a lane needs are the same for the 4 rows. A subgroup sum per (row,
+//   path), then `y = Σ_p h_p·s_p`; `blr_gu_act` writes act(gate)·up.
 //
 // Sign rule: bit 1 → +v, bit 0 → −v, applied by flipping the f32 sign bit
 // (`~bits` shifted to bit 31, xor), three instructions a bit.
@@ -182,94 +191,6 @@ fn bsd32(b: u32, z0: vec4<f32>, z1: vec4<f32>, z2: vec4<f32>, z3: vec4<f32>,
 }
 "#;
 
-/// Stage V, the body for one tensor slot (`WB` its payload, `MJ` its
-/// (r, P, toff, d_out) word, `J` the slot).
-const GV_BODY: &str = r#"
-fn gv_f16_J(byte_off: u32) -> f32 {
-  let v = unpack2x16float(WB[byte_off >> 2u]);
-  return select(v.x, v.y, (byte_off & 2u) != 0u);
-}
-fn gv_run_J(blk: u32, warp: u32, lane: u32, lid: u32) {
-  let m = MJ;
-  let r = m.x;
-  let np = m.y;
-  let toff = m.z;
-  let d_out = m.w;
-  let cols = gvp.cols;
-  let nw = cols >> 5u;
-  let rpad = (r + 31u) & ~31u;
-  let nrows = np * rpad;
-  var q0 = (blk * GV_WARPSu + warp) * 4u;
-  let ok = q0 < nrows;
-  q0 = min(q0, nrows - 4u);
-  let p = q0 / rpad;
-  let k0 = q0 - p * rpad;
-  let s = 2u * (d_out + cols + r) + (r >> 3u) * (d_out + cols);
-  let base = 16u + p * s;
-  let gw = (base + 2u * d_out) >> 2u;
-  let lb = base + 2u * (d_out + cols);
-  let vw = (lb + 2u * r + d_out * (r >> 3u)) >> 2u;
-  let ra = vw + min(k0, r - 1u) * nw;
-  let rb = vw + min(k0 + 1u, r - 1u) * nw;
-  let rc = vw + min(k0 + 2u, r - 1u) * nw;
-  let rd = vw + min(k0 + 3u, r - 1u) * nw;
-  var a0 = 0.0;
-  var a1 = 0.0;
-  var a2 = 0.0;
-  var a3 = 0.0;
-  for (var w = lane; w < nw; w = w + 32u) {
-    let xo = w * 8u;
-    let go = gw + w * 16u;
-    let ba = WB[ra + w];
-    let bb = WB[rb + w];
-    let bc = WB[rc + w];
-    let bd = WB[rd + w];
-    let z0 = gvx[xo] * vec4<f32>(unpack2x16float(WB[go]), unpack2x16float(WB[go + 1u]));
-    let z1 = gvx[xo + 1u] * vec4<f32>(unpack2x16float(WB[go + 2u]), unpack2x16float(WB[go + 3u]));
-    let z2 = gvx[xo + 2u] * vec4<f32>(unpack2x16float(WB[go + 4u]), unpack2x16float(WB[go + 5u]));
-    let z3 = gvx[xo + 3u] * vec4<f32>(unpack2x16float(WB[go + 6u]), unpack2x16float(WB[go + 7u]));
-    let z4 = gvx[xo + 4u] * vec4<f32>(unpack2x16float(WB[go + 8u]), unpack2x16float(WB[go + 9u]));
-    let z5 = gvx[xo + 5u] * vec4<f32>(unpack2x16float(WB[go + 10u]), unpack2x16float(WB[go + 11u]));
-    let z6 = gvx[xo + 6u] * vec4<f32>(unpack2x16float(WB[go + 12u]), unpack2x16float(WB[go + 13u]));
-    let z7 = gvx[xo + 7u] * vec4<f32>(unpack2x16float(WB[go + 14u]), unpack2x16float(WB[go + 15u]));
-    a0 = a0 + bsd32(ba, z0, z1, z2, z3, z4, z5, z6, z7);
-    a1 = a1 + bsd32(bb, z0, z1, z2, z3, z4, z5, z6, z7);
-    a2 = a2 + bsd32(bc, z0, z1, z2, z3, z4, z5, z6, z7);
-    a3 = a3 + bsd32(bd, z0, z1, z2, z3, z4, z5, z6, z7);
-  }
-GV_REDUCE
-  if (ok && lane == 0u) {
-    let o = toff + q0;
-    gvt[o] = select(0.0, s0 * gv_f16_J(lb + 2u * k0), k0 < r);
-    gvt[o + 1u] = select(0.0, s1 * gv_f16_J(lb + 2u * k0 + 2u), k0 + 1u < r);
-    gvt[o + 2u] = select(0.0, s2 * gv_f16_J(lb + 2u * k0 + 4u), k0 + 2u < r);
-    gvt[o + 3u] = select(0.0, s3 * gv_f16_J(lb + 2u * k0 + 6u), k0 + 3u < r);
-  }
-}
-"#;
-
-const GV_REDUCE_SG: &str = r#"
-  let s0 = subgroupAdd(a0);
-  let s1 = subgroupAdd(a1);
-  let s2 = subgroupAdd(a2);
-  let s3 = subgroupAdd(a3);
-"#;
-
-const GV_REDUCE_WG: &str = r#"
-  gvred[lid] = vec4<f32>(a0, a1, a2, a3);
-  workgroupBarrier();
-  var sv = vec4<f32>(0.0);
-  if (lane == 0u) {
-    for (var i = 0u; i < 32u; i = i + 1u) {
-      sv = sv + gvred[warp * 32u + i];
-    }
-  }
-  let s0 = sv.x;
-  let s1 = sv.y;
-  let s2 = sv.z;
-  let s3 = sv.w;
-"#;
-
 const GV_HEAD: &str = r#"
 struct GvP { cols: u32, e0: u32, e1: u32, nm: u32, m0: vec4<u32>, m1: vec4<u32>, m2: vec4<u32> };
 @group(0) @binding(0) var<storage, read> gvw0: array<u32>;
@@ -278,94 +199,202 @@ struct GvP { cols: u32, e0: u32, e1: u32, nm: u32, m0: vec4<u32>, m1: vec4<u32>,
 @group(0) @binding(3) var<storage, read> gvx: array<vec4<f32>>;
 @group(0) @binding(4) var<storage, read_write> gvt: array<f32>;
 @group(0) @binding(5) var<uniform> gvp: GvP;
-"#;
-
-const GV_ENTRY_SG: &str = r#"
-@compute @workgroup_size(GV_THREADS)
-fn blr_gv(@builtin(workgroup_id) wid: vec3<u32>,
-          @builtin(local_invocation_index) lid: u32,
-          @builtin(subgroup_invocation_id) lane: u32) {
-  let g = wid.x;
-  let warp = lid >> 5u;
-  if (g < gvp.e0) {
-    gv_run_0(g, warp, lane, lid);
-  } else if (g < gvp.e1) {
-    gv_run_1(g - gvp.e0, warp, lane, lid);
-  } else {
-    gv_run_2(g - gvp.e1, warp, lane, lid);
-  }
+@group(0) @binding(6) var<storage, read> gvg0: array<vec4<f32>>;
+@group(0) @binding(7) var<storage, read> gvg1: array<vec4<f32>>;
+@group(0) @binding(8) var<storage, read> gvg2: array<vec4<f32>>;
+var<workgroup> gvred: array<vec4<f32>, GV_WG>;
+// Position of latent slot m in a copy stored word-transposed: the c-th vec4
+// of every word is contiguous across words (stage U's lanes walk words and
+// read the same vec4 of consecutive words — one coalesced access).
+fn gv_tpos(m: u32, nwt: u32) -> u32 {
+  let w = m >> 5u;
+  let j = m & 31u;
+  return ((j >> 2u) * nwt + w) * 4u + (j & 3u);
 }
 "#;
 
-const GV_ENTRY_WG: &str = r#"
-var<workgroup> gvred: array<vec4<f32>, GV_THREADS>;
-@compute @workgroup_size(GV_THREADS)
-fn blr_gv(@builtin(workgroup_id) wid: vec3<u32>,
-          @builtin(local_invocation_index) lid: u32) {
-  let g = wid.x;
-  let warp = lid >> 5u;
-  let lane = lid & 31u;
-  if (g < gvp.e0) {
-    gv_run_0(g, warp, lane, lid);
-  } else if (g < gvp.e1) {
-    gv_run_1(g - gvp.e0, warp, lane, lid);
-  } else {
-    gv_run_2(g - gvp.e1, warp, lane, lid);
-  }
-}
-"#;
-
-/// Stage U, the per-row dot of one tensor slot.
-const GU_BODY: &str = r#"
-fn gu_f16_J(byte_off: u32) -> f32 {
+/// Stage V, the body for one tensor slot (`WB` its payload, `MJ` its
+/// (r, P, toff, d_out) word, `_J` the slot suffix).
+const GV_BODY: &str = r#"
+fn gv_f16_J(byte_off: u32) -> f32 {
   let v = unpack2x16float(WB[byte_off >> 2u]);
   return select(v.x, v.y, (byte_off & 2u) != 0u);
 }
-fn gu_dot_J(i0: u32, lid: u32) -> f32 {
+// z = x ⊙ g for vec4 c of word w; g is stored word-transposed (vec4 c of
+// word w at c·nw + w), so a subgroup reading consecutive words reads
+// consecutive g vec4s. x keeps the producer's layout.
+fn gv_z_J(xo: u32, go: u32, c: u32, nw: u32) -> vec4<f32> {
+  return gvx[xo + c] * GB[go + c * nw];
+}
+// The sign words of the 4 rows at word w (none past the row).
+fn gv_w4_J(rows: vec4<u32>, w: u32, nw: u32) -> vec4<u32> {
+  if (w >= nw) { return vec4<u32>(0u); }
+  return vec4<u32>(WB[rows.x + w], WB[rows.y + w], WB[rows.z + w], WB[rows.w + w]);
+}
+// The 4 rows' binary dots over word w (zero past the row).
+fn gv_dot_J(w: u32, nw: u32, gw: u32, b: vec4<u32>) -> vec4<f32> {
+  if (w >= nw) { return vec4<f32>(0.0); }
+  let xo = w * 8u;
+  let go = gw + w;
+  let z0 = gv_z_J(xo, go, 0u, nw);
+  let z1 = gv_z_J(xo, go, 1u, nw);
+  let z2 = gv_z_J(xo, go, 2u, nw);
+  let z3 = gv_z_J(xo, go, 3u, nw);
+  let z4 = gv_z_J(xo, go, 4u, nw);
+  let z5 = gv_z_J(xo, go, 5u, nw);
+  let z6 = gv_z_J(xo, go, 6u, nw);
+  let z7 = gv_z_J(xo, go, 7u, nw);
+  return vec4<f32>(bsd32(b.x, z0, z1, z2, z3, z4, z5, z6, z7),
+                   bsd32(b.y, z0, z1, z2, z3, z4, z5, z6, z7),
+                   bsd32(b.z, z0, z1, z2, z3, z4, z5, z6, z7),
+                   bsd32(b.w, z0, z1, z2, z3, z4, z5, z6, z7));
+}
+fn gv_run_J(blk: u32, tid: u32, lane: u32, warp: u32) {
   let m = MJ;
   let r = m.x;
   let np = m.y;
   let toff = m.z;
   let d_out = m.w;
-  let cols = gup.cols;
+  let cols = gvp.cols;
+  let nw = cols >> 5u;
   let rpad = (r + 31u) & ~31u;
+  let ts = rpad + 32u;
+  let nrows = np * rpad;
+  let vset = tid / GV_LVu;
+  let li = tid - vset * GV_LVu;
+  var q0 = (blk * GV_SETSu + vset) * 4u;
+  let ok = q0 < nrows;
+  q0 = min(q0, nrows - 4u);
+  let p = q0 / rpad;
+  let k0 = q0 - p * rpad;
   let s = 2u * (d_out + cols + r) + (r >> 3u) * (d_out + cols);
-  let i = min(i0 + lid, d_out - 1u);
-  let nwr = rpad >> 5u;
-  let nch = (nwr + 31u) >> 5u;
-  let cw = (nwr + nch - 1u) / nch;
-  var y = 0.0;
-  for (var p = 0u; p < np; p = p + 1u) {
-    let base = 16u + p * s;
-    let ubit = (base + 2u * (d_out + cols + r)) * 8u;
-    var acc = 0.0;
-    for (var c = 0u; c < nch; c = c + 1u) {
-      let w0 = c * cw;
-      let nwc = min(cw, nwr - w0);
-      if (lid < nwc) {
-        let cb = ubit + (w0 + lid) * 32u;
-        for (var rr = 0u; rr < 32u; rr = rr + 1u) {
-          let bit = cb + min(i0 + rr, d_out - 1u) * r;
-          let wi = bit >> 5u;
-          let sh = bit & 31u;
-          let lo = WB[wi];
-          let hi = WB[wi + 1u];
-          gusb[rr * 33u + lid] = select((lo >> sh) | (hi << ((32u - sh) & 31u)), lo, sh == 0u);
-        }
-      }
-      workgroupBarrier();
-      let tb = (toff + p * rpad + w0 * 32u) >> 2u;
-      for (var k = 0u; k < nwc; k = k + 1u) {
-        let b = gusb[lid * 33u + k];
-        let t = tb + k * 8u;
-        acc = acc + bsd32(b, gut[t], gut[t + 1u], gut[t + 2u], gut[t + 3u],
-                          gut[t + 4u], gut[t + 5u], gut[t + 6u], gut[t + 7u]);
-      }
-      workgroupBarrier();
-    }
-    y = y + gu_f16_J(base + 2u * i) * acc;
+  let base = 16u + p * s;
+  let gw = p * (cols >> 2u);
+  let lb = base + 2u * (d_out + cols);
+  let vw = (lb + 2u * r + d_out * (r >> 3u)) >> 2u;
+  let rows = vec4<u32>(vw + min(k0, r - 1u) * nw, vw + min(k0 + 1u, r - 1u) * nw,
+                       vw + min(k0 + 2u, r - 1u) * nw, vw + min(k0 + 3u, r - 1u) * nw);
+  var acc = vec4<f32>(0.0);
+  var w = li;
+  loop {
+    if (w >= nw) { break; }
+    // Every sign word of the round in flight before the first add.
+    let b0 = gv_w4_J(rows, w, nw);
+    let b1 = gv_w4_J(rows, w + GV_LVu, nw);
+    let b2 = gv_w4_J(rows, w + 2u * GV_LVu, nw);
+    let b3 = gv_w4_J(rows, w + 3u * GV_LVu, nw);
+    acc = acc + (gv_dot_J(w, nw, gw, b0) + gv_dot_J(w + GV_LVu, nw, gw, b1))
+              + (gv_dot_J(w + 2u * GV_LVu, nw, gw, b2) + gv_dot_J(w + 3u * GV_LVu, nw, gw, b3));
+    w = w + 4u * GV_LVu;
   }
-  return y;
+  let a0 = acc.x;
+  let a1 = acc.y;
+  let a2 = acc.z;
+  let a3 = acc.w;
+GV_REDUCE
+  let tp = toff + p * 4u * ts;
+  let nwt = ts >> 5u;
+  if (ok && li == 0u) {
+    let l0 = select(0.0, s0 * gv_f16_J(lb + 2u * k0), k0 < r);
+    let l1 = select(0.0, s1 * gv_f16_J(lb + 2u * k0 + 2u), k0 + 1u < r);
+    let l2 = select(0.0, s2 * gv_f16_J(lb + 2u * k0 + 4u), k0 + 2u < r);
+    let l3 = select(0.0, s3 * gv_f16_J(lb + 2u * k0 + 6u), k0 + 3u < r);
+    // k0 % 4 == 0 and 8c % 4 == 0: the four latents are one vec4 slot.
+    for (var c = 0u; c < 4u; c = c + 1u) {
+      let o = tp + c * ts + gv_tpos(k0 + 8u * c, nwt);
+      gvt[o] = l0;
+      gvt[o + 1u] = l1;
+      gvt[o + 2u] = l2;
+      gvt[o + 3u] = l3;
+    }
+  }
+  // The copies' zero borders, [0, 8c) and [rpad + 8c, rpad + 32).
+  if (ok && k0 == 0u && li < 32u) {
+    for (var c = 0u; c < 4u; c = c + 1u) {
+      let o = tp + c * ts;
+      let m = select(rpad + li, li, li < 8u * c);
+      gvt[o + gv_tpos(m, nwt)] = 0.0;
+    }
+  }
+}
+"#;
+
+/// Stage-V row sums, one subgroup a set.
+const GV_REDUCE_SG32: &str = r#"
+  let s0 = subgroupAdd(a0);
+  let s1 = subgroupAdd(a1);
+  let s2 = subgroupAdd(a2);
+  let s3 = subgroupAdd(a3);
+"#;
+
+/// Stage-V row sums, several subgroups a set (LV ≥ 128: one set a
+/// workgroup).
+const GV_REDUCE_SGN: &str = r#"
+  let r0 = subgroupAdd(a0);
+  let r1 = subgroupAdd(a1);
+  let r2 = subgroupAdd(a2);
+  let r3 = subgroupAdd(a3);
+  if (lane == 0u) {
+    gvred[warp] = vec4<f32>(r0, r1, r2, r3);
+  }
+  workgroupBarrier();
+  var sv = vec4<f32>(0.0);
+  for (var i = 0u; i < GV_LVu / 32u; i = i + 1u) {
+    sv = sv + gvred[i];
+  }
+  let s0 = sv.x;
+  let s1 = sv.y;
+  let s2 = sv.z;
+  let s3 = sv.w;
+"#;
+
+/// Stage-V row sums through workgroup memory (no 32-wide subgroups).
+const GV_REDUCE_WG: &str = r#"
+  gvred[tid] = vec4<f32>(a0, a1, a2, a3);
+  workgroupBarrier();
+  var sv = vec4<f32>(0.0);
+  if (li == 0u) {
+    for (var i = 0u; i < GV_LVu; i = i + 1u) {
+      sv = sv + gvred[vset * GV_LVu + i];
+    }
+  }
+  let s0 = sv.x;
+  let s1 = sv.y;
+  let s2 = sv.z;
+  let s3 = sv.w;
+"#;
+
+const GV_ENTRY_SG: &str = r#"
+@compute @workgroup_size(GV_WG)
+fn blr_gv(@builtin(workgroup_id) wid: vec3<u32>,
+          @builtin(local_invocation_index) tid: u32,
+          @builtin(subgroup_invocation_id) lane: u32) {
+  let g = wid.x;
+  let warp = tid >> 5u;
+  if (g < gvp.e0) {
+    gv_run_0(g, tid, lane, warp);
+  } else if (g < gvp.e1) {
+    gv_run_1(g - gvp.e0, tid, lane, warp);
+  } else {
+    gv_run_2(g - gvp.e1, tid, lane, warp);
+  }
+}
+"#;
+
+const GV_ENTRY_WG: &str = r#"
+@compute @workgroup_size(GV_WG)
+fn blr_gv(@builtin(workgroup_id) wid: vec3<u32>,
+          @builtin(local_invocation_index) tid: u32) {
+  let g = wid.x;
+  let warp = tid >> 5u;
+  let lane = tid & 31u;
+  if (g < gvp.e0) {
+    gv_run_0(g, tid, lane, warp);
+  } else if (g < gvp.e1) {
+    gv_run_1(g - gvp.e0, tid, lane, warp);
+  } else {
+    gv_run_2(g - gvp.e1, tid, lane, warp);
+  }
 }
 "#;
 
@@ -379,7 +408,20 @@ struct GuP { cols: u32, e0: u32, e1: u32, act: u32, m0: vec4<u32>, m1: vec4<u32>
 @group(0) @binding(5) var<storage, read_write> guy1: array<f32>;
 @group(0) @binding(6) var<storage, read_write> guy2: array<f32>;
 @group(0) @binding(7) var<uniform> gup: GuP;
-var<workgroup> gusb: array<u32, 1056>;
+var<workgroup> gured: array<vec4<f32>, 128>;
+var<workgroup> gured2: array<vec4<f32>, 4>;
+
+// One stream walk of a subgroup's 4 rows: the paths' word rows (each
+// `rpad/32 + 1` words: the shifted latent copy needs the spill word)
+// flattened into `ntot` words.
+struct GuGeo {
+  np: u32, toff: u32, ts: u32, nwp: u32,
+  ntot: u32, sidx: u32, uw0: u32, ps: u32,
+  ro: vec4<u32>,
+  i: vec4<u32>,
+};
+// Four word slots (f, f+32, f+64, f+96) of the 4 rows.
+struct GuW { a: vec4<u32>, b: vec4<u32>, c: vec4<u32>, d: vec4<u32> };
 
 fn gu_erf(x: f32) -> f32 {
   let a = abs(x);
@@ -392,38 +434,192 @@ fn gu_erf(x: f32) -> f32 {
   return select(y, -y, x < 0.0);
 }
 
-@compute @workgroup_size(32)
+// The 32 latents a word slot multiplies, dotted with the 4 rows' words,
+// accumulated into its path (nothing past the walk).
+fn gu_acc(g: GuGeo, f: u32, b: vec4<u32>, a0: ptr<function, vec4<f32>>, a1: ptr<function, vec4<f32>>) {
+  if (f >= g.ntot) { return; }
+  let p = select(0u, 1u, f >= g.nwp);
+  let w = f - p * g.nwp;
+  // Word-transposed copy: vec4 c of word w at c·nwp + w.
+  let tb = ((g.toff + (p * 4u + g.sidx) * g.ts) >> 2u) + w;
+  let n = g.nwp;
+  let x0 = gut[tb];
+  let x1 = gut[tb + n];
+  let x2 = gut[tb + 2u * n];
+  let x3 = gut[tb + 3u * n];
+  let x4 = gut[tb + 4u * n];
+  let x5 = gut[tb + 5u * n];
+  let x6 = gut[tb + 6u * n];
+  let x7 = gut[tb + 7u * n];
+  let d = vec4<f32>(bsd32(b.x, x0, x1, x2, x3, x4, x5, x6, x7),
+                    bsd32(b.y, x0, x1, x2, x3, x4, x5, x6, x7),
+                    bsd32(b.z, x0, x1, x2, x3, x4, x5, x6, x7),
+                    bsd32(b.w, x0, x1, x2, x3, x4, x5, x6, x7));
+  if (p == 0u) {
+    *a0 = *a0 + d;
+  } else {
+    *a1 = *a1 + d;
+  }
+}
+"#;
+
+/// Stage U, the 4 rows `rbase + 4ρ` of one tensor slot: geometry, word
+/// fetch, and the h-scaled sum.
+const GU_BODY: &str = r#"
+fn gu_f16_J(byte_off: u32) -> f32 {
+  let v = unpack2x16float(WB[byte_off >> 2u]);
+  return select(v.x, v.y, (byte_off & 2u) != 0u);
+}
+fn gu_geo_J(rbase: u32) -> GuGeo {
+  let m = MJ;
+  let r = m.x;
+  let d_out = m.w;
+  let cols = gup.cols;
+  let rpad = (r + 31u) & ~31u;
+  let nwp = (rpad >> 5u) + 1u;
+  let i = vec4<u32>(min(rbase, d_out - 1u), min(rbase + 4u, d_out - 1u),
+                    min(rbase + 8u, d_out - 1u), min(rbase + 12u, d_out - 1u));
+  var g: GuGeo;
+  g.np = m.y;
+  g.toff = m.z;
+  g.ts = rpad + 32u;
+  g.nwp = nwp;
+  g.ntot = m.y * nwp;
+  g.sidx = ((i.x * r) & 31u) >> 3u;
+  g.uw0 = (16u + 2u * (d_out + cols + r)) >> 2u;
+  g.ps = 2u * (d_out + cols + r) + (r >> 3u) * (d_out + cols);
+  g.ro = (i * r) >> vec4<u32>(5u);
+  g.i = i;
+  return g;
+}
+fn gu_w4_J(g: GuGeo, f: u32) -> vec4<u32> {
+  if (f >= g.ntot) { return vec4<u32>(0u); }
+  let p = select(0u, 1u, f >= g.nwp);
+  let ub = g.uw0 + ((p * g.ps) >> 2u) + f - p * g.nwp;
+  return vec4<u32>(WB[ub + g.ro.x], WB[ub + g.ro.y], WB[ub + g.ro.z], WB[ub + g.ro.w]);
+}
+fn gu_fetch_J(g: GuGeo, f: u32) -> GuW {
+  return GuW(gu_w4_J(g, f), gu_w4_J(g, f + 32u), gu_w4_J(g, f + 64u), gu_w4_J(g, f + 96u));
+}
+fn gu_h_J(g: GuGeo, s0: vec4<f32>, s1: vec4<f32>) -> vec4<f32> {
+  var y = vec4<f32>(gu_f16_J(16u + 2u * g.i.x), gu_f16_J(16u + 2u * g.i.y),
+                    gu_f16_J(16u + 2u * g.i.z), gu_f16_J(16u + 2u * g.i.w)) * s0;
+  if (g.np > 1u) {
+    let h1 = 16u + g.ps;
+    y = y + vec4<f32>(gu_f16_J(h1 + 2u * g.i.x), gu_f16_J(h1 + 2u * g.i.y),
+                      gu_f16_J(h1 + 2u * g.i.z), gu_f16_J(h1 + 2u * g.i.w)) * s1;
+  }
+  return y;
+}
+fn gu_rows_J(rbase: u32, lane: u32, warp: u32, tid: u32) -> vec4<f32> {
+  let g = gu_geo_J(rbase);
+  var a0 = vec4<f32>(0.0);
+  var a1 = vec4<f32>(0.0);
+  var f = lane;
+  loop {
+    if (f >= g.ntot) { break; }
+    let w = gu_fetch_J(g, f);
+    gu_acc(g, f, w.a, &a0, &a1);
+    gu_acc(g, f + 32u, w.b, &a0, &a1);
+    gu_acc(g, f + 64u, w.c, &a0, &a1);
+    gu_acc(g, f + 96u, w.d, &a0, &a1);
+    f = f + 128u;
+  }
+  let s0 = gu_red(a0, lane, warp, tid);
+  let s1 = gu_red(a1, lane, warp, tid);
+  return gu_h_J(g, s0, s1);
+}
+"#;
+
+const GU_REDUCE_SG: &str = r#"
+fn gu_red(v: vec4<f32>, lane: u32, warp: u32, tid: u32) -> vec4<f32> {
+  return subgroupAdd(v);
+}
+"#;
+
+const GU_REDUCE_WG: &str = r#"
+fn gu_red(v: vec4<f32>, lane: u32, warp: u32, tid: u32) -> vec4<f32> {
+  gured[tid] = v;
+  workgroupBarrier();
+  if (lane == 0u) {
+    var s = vec4<f32>(0.0);
+    for (var i = 0u; i < 32u; i = i + 1u) {
+      s = s + gured[warp * 32u + i];
+    }
+    gured2[warp] = s;
+  }
+  workgroupBarrier();
+  let r = gured2[warp];
+  workgroupBarrier();
+  return r;
+}
+"#;
+
+const GU_ENTRY: &str = r#"
+@compute @workgroup_size(128)
 fn blr_gu(@builtin(workgroup_id) wid: vec3<u32>,
-          @builtin(local_invocation_index) lid: u32) {
+          @builtin(local_invocation_index) tid: uGU_LANE_ARG) {
+  let warp = tid >> 5u;
+GU_LANE_LET
   let g = wid.x;
   if (g < gup.e0) {
-    let i0 = g * 32u;
-    let y = gu_dot_0(i0, lid);
-    if (i0 + lid < gup.m0.w) { guy0[i0 + lid] = y; }
+    let rb = g * 16u + warp;
+    let y = gu_rows_0(rb, lane, warp, tid);
+    if (lane < 4u && rb + 4u * lane < gup.m0.w) { guy0[rb + 4u * lane] = y[lane]; }
   } else if (g < gup.e1) {
-    let i0 = (g - gup.e0) * 32u;
-    let y = gu_dot_1(i0, lid);
-    if (i0 + lid < gup.m1.w) { guy1[i0 + lid] = y; }
+    let rb = (g - gup.e0) * 16u + warp;
+    let y = gu_rows_1(rb, lane, warp, tid);
+    if (lane < 4u && rb + 4u * lane < gup.m1.w) { guy1[rb + 4u * lane] = y[lane]; }
   } else {
-    let i0 = (g - gup.e1) * 32u;
-    let y = gu_dot_2(i0, lid);
-    if (i0 + lid < gup.m2.w) { guy2[i0 + lid] = y; }
+    let rb = (g - gup.e1) * 16u + warp;
+    let y = gu_rows_2(rb, lane, warp, tid);
+    if (lane < 4u && rb + 4u * lane < gup.m2.w) { guy2[rb + 4u * lane] = y[lane]; }
   }
 }
 
-// act(gate)·up of the same rows: slot 0 gate, slot 1 up, out in y0.
+// act(gate)·up of the same rows: slot 0 gate, slot 1 up, out in y0. The
+// two tensors' sign words of a round are fetched together.
 // `act` = `GraphAct::code`: 0 SiLU, 1 exact GELU, 2 tanh GELU (the formulas
 // of `silu_mul_pre`).
-@compute @workgroup_size(32)
+@compute @workgroup_size(128)
 fn blr_gu_act(@builtin(workgroup_id) wid: vec3<u32>,
-              @builtin(local_invocation_index) lid: u32) {
-  let i0 = wid.x * 32u;
-  let gv = gu_dot_0(i0, lid);
-  let uv = gu_dot_1(i0, lid);
-  var v = (gv / (1.0 + exp(-gv))) * uv;
-  if (gup.act == 1u) { v = 0.5 * gv * (1.0 + gu_erf(gv * 0.70710678)) * uv; }
-  if (gup.act == 2u) { v = 0.5 * gv * (1.0 + tanh(0.7978846 * (gv + 0.044715 * gv * gv * gv))) * uv; }
-  if (i0 + lid < gup.m0.w) { guy0[i0 + lid] = v; }
+              @builtin(local_invocation_index) tid: uGU_LANE_ARG) {
+  let warp = tid >> 5u;
+GU_LANE_LET
+  let rb = wid.x * 16u + warp;
+  let gg = gu_geo_0(rb);
+  let gu = gu_geo_1(rb);
+  var ga0 = vec4<f32>(0.0);
+  var ga1 = vec4<f32>(0.0);
+  var ua0 = vec4<f32>(0.0);
+  var ua1 = vec4<f32>(0.0);
+  let nt = max(gg.ntot, gu.ntot);
+  var f = lane;
+  loop {
+    if (f >= nt) { break; }
+    let wg = gu_fetch_0(gg, f);
+    let wu = gu_fetch_1(gu, f);
+    gu_acc(gg, f, wg.a, &ga0, &ga1);
+    gu_acc(gg, f + 32u, wg.b, &ga0, &ga1);
+    gu_acc(gg, f + 64u, wg.c, &ga0, &ga1);
+    gu_acc(gg, f + 96u, wg.d, &ga0, &ga1);
+    gu_acc(gu, f, wu.a, &ua0, &ua1);
+    gu_acc(gu, f + 32u, wu.b, &ua0, &ua1);
+    gu_acc(gu, f + 64u, wu.c, &ua0, &ua1);
+    gu_acc(gu, f + 96u, wu.d, &ua0, &ua1);
+    f = f + 128u;
+  }
+  let gy = gu_h_0(gg, gu_red(ga0, lane, warp, tid), gu_red(ga1, lane, warp, tid));
+  let uy = gu_h_1(gu, gu_red(ua0, lane, warp, tid), gu_red(ua1, lane, warp, tid));
+  if (lane < 4u) {
+    let gv = gy[lane];
+    let uv = uy[lane];
+    var v = (gv / (1.0 + exp(-gv))) * uv;
+    if (gup.act == 1u) { v = 0.5 * gv * (1.0 + gu_erf(gv * 0.70710678)) * uv; }
+    if (gup.act == 2u) { v = 0.5 * gv * (1.0 + tanh(0.7978846 * (gv + 0.044715 * gv * gv * gv))) * uv; }
+    let row = rb + 4u * lane;
+    if (row < gup.m0.w) { guy0[row] = v; }
+  }
   // Never taken: keeps bindings 2, 5 and 6 in the derived layout, so both
   // stage-U entry points bind the same eight buffers in order.
   if (gup.act == 0xFFFFFFFFu) {
@@ -433,35 +629,67 @@ fn blr_gu_act(@builtin(workgroup_id) wid: vec3<u32>,
 }
 "#;
 
-/// Warps (32 lanes) per stage-V workgroup; each owns 4 latent rows.
-const GV_WARPS: usize = 4;
-/// Latent rows per stage-V workgroup.
-const GV_ROWS_WG: usize = 4 * GV_WARPS;
-/// Output rows per stage-U workgroup.
-const GU_ROWS_WG: usize = 32;
+/// Output rows per stage-U workgroup (4 subgroups × 4 rows).
+const GU_ROWS_WG: usize = 16;
 
-fn gv_source(sg: bool) -> String {
+/// Stage-V lane-set widths with a pipeline each.
+const GV_LANES: [usize; 4] = [32, 128, 256, 512];
+
+/// Stage-V lanes per row set: 32 (one subgroup, 4 sets a workgroup) below
+/// 2048 columns, else 128 (one set a workgroup). Measured at the 27B and
+/// 0.8B shapes (device timestamps, `wgpu_blr_graph_throughput_27b_shapes`):
+/// 256 and 512 lanes were no faster at 5120/6144 columns and slower at
+/// 17408. `CMF_BLR_LV=32|128|256|512` pins it.
+fn gv_lanes(cols: usize) -> usize {
+    if let Some(v) = std::env::var("CMF_BLR_LV")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| GV_LANES.contains(v))
+    {
+        return v;
+    }
+    if cols >= 2048 {
+        128
+    } else {
+        32
+    }
+}
+
+/// Threads of a stage-V workgroup for lane-set width `lv`.
+fn gv_wg(lv: usize) -> usize {
+    lv.max(128)
+}
+
+fn gv_source(sg: bool, lv: usize) -> String {
+    let reduce = match (sg, lv) {
+        (true, 32) => GV_REDUCE_SG32,
+        (true, _) => GV_REDUCE_SGN,
+        (false, _) => GV_REDUCE_WG,
+    };
     let mut s = String::new();
     s.push_str(GV_HEAD);
     s.push_str(GCOMMON);
     for j in 0..3 {
         s.push_str(
             &GV_BODY
-                .replace("GV_REDUCE", if sg { GV_REDUCE_SG } else { GV_REDUCE_WG })
+                .replace("GV_REDUCE", reduce)
                 .replace("WB", &format!("gvw{j}"))
+                .replace("GB", &format!("gvg{j}"))
                 .replace("MJ", &format!("gvp.m{j}"))
                 .replace("_J", &format!("_{j}")),
         );
     }
     s.push_str(if sg { GV_ENTRY_SG } else { GV_ENTRY_WG });
-    s.replace("GV_WARPSu", &format!("{GV_WARPS}u"))
-        .replace("GV_THREADS", &format!("{}", 32 * GV_WARPS))
+    s.replace("GV_LVu", &format!("{lv}u"))
+        .replace("GV_SETSu", &format!("{}u", gv_wg(lv) / lv))
+        .replace("GV_WG", &format!("{}", gv_wg(lv)))
 }
 
-fn gu_source() -> String {
+fn gu_source(sg: bool) -> String {
     let mut s = String::new();
     s.push_str(GU_HEAD);
     s.push_str(GCOMMON);
+    s.push_str(if sg { GU_REDUCE_SG } else { GU_REDUCE_WG });
     for j in 0..3 {
         s.push_str(
             &GU_BODY
@@ -470,20 +698,30 @@ fn gu_source() -> String {
                 .replace("_J", &format!("_{j}")),
         );
     }
+    let (arg, let_) = if sg {
+        (",\n          @builtin(subgroup_invocation_id) lane: u32", "")
+    } else {
+        ("", "  let lane = tid & 31u;")
+    };
+    s.push_str(
+        &GU_ENTRY
+            .replace("uGU_LANE_ARG", &format!("u32{arg}"))
+            .replace("GU_LANE_LET", let_),
+    );
     s
 }
 
 /// The graph kernels of one device context.
 pub(super) struct BlrGraph {
-    v: wgpu::ComputePipeline,
+    /// Stage V per lane-set width ([`GV_LANES`]), with its layout.
+    v: Vec<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
     u: wgpu::ComputePipeline,
     ua: wgpu::ComputePipeline,
-    v_l: wgpu::BindGroupLayout,
     u_l: wgpu::BindGroupLayout,
     ua_l: wgpu::BindGroupLayout,
     /// Never-written output for the unused stage-U slots.
     dummy_y: wgpu::Buffer,
-    /// Stage V reduces with subgroup sums (32-wide subgroups).
+    /// The row sums are subgroup sums (32-wide subgroups).
     pub(super) sg: bool,
 }
 
@@ -510,16 +748,23 @@ fn compile_graph(c: &Ctx) -> Option<BlrGraph> {
             });
         if let Some(e) = pollster::block_on(scope.pop()) {
             tracing::warn!("{label} module rejected ({e}): blr keeps the per-op path");
+            if cfg!(test) || std::env::var("CMF_GPU_DEBUG").is_ok() {
+                eprintln!("{label} module rejected: {e}");
+            }
             return None;
         }
         Some(p)
     };
-    let gu = gu_source();
-    let v = mk("blr-gv", &gv_source(sg), "blr_gv")?;
+    let gu = gu_source(sg);
+    let mut v = Vec::new();
+    for lv in GV_LANES {
+        let p = mk(&format!("blr-gv{lv}"), &gv_source(sg, lv), "blr_gv")?;
+        let l = p.get_bind_group_layout(0);
+        v.push((p, l));
+    }
     let u = mk("blr-gu", &gu, "blr_gu")?;
     let ua = mk("blr-gu-act", &gu, "blr_gu_act")?;
     Some(BlrGraph {
-        v_l: v.get_bind_group_layout(0),
         u_l: u.get_bind_group_layout(0),
         ua_l: ua.get_bind_group_layout(0),
         v,
@@ -545,13 +790,14 @@ pub(crate) struct BlrDims {
 }
 
 impl BlrDims {
-    /// Latents per path as stored in the graph scratch (whole sign words).
+    /// Latents per path rounded to whole sign words.
     pub fn rpad(&self) -> usize {
         self.r.div_ceil(32) * 32
     }
-    /// Scratch floats this tensor's latents take.
+    /// Scratch floats this tensor's latents take: four shifted copies of
+    /// `rpad + 32` per path.
     pub fn latents(&self) -> usize {
-        self.np * self.rpad()
+        self.np * 4 * (self.rpad() + 32)
     }
 }
 
@@ -592,6 +838,7 @@ pub(super) fn graph_pipes(c: &Ctx) -> Option<Arc<BlrGraph>> {
         t: None,
         graph: None,
         u16: std::collections::HashMap::new(),
+        gbufs: std::collections::HashMap::new(),
     });
     if s.graph.is_none() {
         s.graph = Some(compile_graph(c).map(Arc::new));
@@ -609,6 +856,7 @@ fn uniform16(c: &Ctx, v: [u32; 16]) -> wgpu::Buffer {
         t: None,
         graph: None,
         u16: std::collections::HashMap::new(),
+        gbufs: std::collections::HashMap::new(),
     });
     s.u16
         .entry(v)
@@ -624,9 +872,66 @@ fn uniform16(c: &Ctx, v: [u32; 16]) -> wgpu::Buffer {
         .clone()
 }
 
+/// The input scales of every path of a `blr` tensor as f32 (path p at
+/// `p·cols`), resident once per (model, tensor): stage V multiplies them
+/// into `x` per sign word, and an f16 unpack there costs as much as the
+/// sign walk itself (measured: stage V without g took half the time).
+pub(super) fn g_f32(c: &Ctx, model: &cortiq_core::CmfModel, idx: usize) -> Option<wgpu::Buffer> {
+    let key = c as *const Ctx as usize;
+    let mkey = (model.uid() as usize, idx);
+    {
+        let st = states().lock().unwrap();
+        if let Some(b) = st.get(&key).and_then(|s| s.gbufs.get(&mkey)) {
+            return Some(b.clone());
+        }
+    }
+    let e = model.tensors.get(idx)?;
+    let b = g_f32_upload(c, &e.shape, model.entry_bytes(e))?;
+    crate::gpu::probe_note_cold();
+    let mut st = states().lock().unwrap();
+    let s = st.entry(key).or_insert_with(|| BlrState {
+        pipes: Arc::new(build_pipes(c)),
+        t: None,
+        graph: None,
+        u16: std::collections::HashMap::new(),
+        gbufs: std::collections::HashMap::new(),
+    });
+    s.gbufs.insert(mkey, b.clone());
+    Some(b)
+}
+
+/// [`g_f32`]'s buffer from a payload (uncached).
+pub(super) fn g_f32_upload(c: &Ctx, shape: &[usize], bytes: &[u8]) -> Option<wgpu::Buffer> {
+    let h = cortiq_core::blr::validate_blr(shape, bytes).ok()?;
+    // Word-transposed per path (as the latent copies): vec4 c of sign word
+    // w at `p·d_in/4 + c·(d_in/32) + w`, so stage V's lanes, which walk
+    // words, read consecutive vec4s.
+    let nw = h.d_in / 32;
+    let mut g = vec![0f32; h.paths * h.d_in];
+    for p in 0..h.paths {
+        let o = cortiq_core::blr::blr_path_offsets(&h, p);
+        let gp = cortiq_core::blr::blr_f16s(bytes, o.g, h.d_in);
+        for (j, v) in gp.into_iter().enumerate() {
+            let (w, jj) = (j / 32, j % 32);
+            g[p * h.d_in + ((jj / 4) * nw + w) * 4 + jj % 4] = v;
+        }
+    }
+    use wgpu::util::DeviceExt;
+    Some(
+        c.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("blr-g-f32"),
+                contents: bytemuck::cast_slice(&g),
+                usage: wgpu::BufferUsages::STORAGE,
+            }),
+    )
+}
+
 /// One tensor of a graph group: its resident payload, geometry and output.
 pub(super) struct GroupMat<'a> {
     pub buf: &'a wgpu::Buffer,
+    /// The paths' input scales g as f32, path p at `p·cols` ([`g_f32`]).
+    pub g: &'a wgpu::Buffer,
     pub dims: BlrDims,
     pub y: &'a wgpu::Buffer,
 }
@@ -652,18 +957,48 @@ pub(super) fn encode_group(
     act: Option<u32>,
     bind: &dyn Fn(u32, &wgpu::BindGroupLayout, &[&wgpu::Buffer]) -> wgpu::BindGroup,
 ) -> bool {
-    if mats.is_empty() || mats.len() > 3 {
+    let Some([v, u]) = prep_group(c, g, mats, x, t, act, bind) else {
         return false;
+    };
+    let mut pass = begin_pass(enc);
+    for (p, b, n) in [&v, &u] {
+        pass.set_pipeline(p);
+        pass.set_bind_group(0, b, &[]);
+        pass.dispatch_workgroups(*n, 1, 1);
+    }
+    true
+}
+
+/// One stage dispatch: pipeline, bind group, workgroups.
+pub(super) type StageDispatch<'a> = (&'a wgpu::ComputePipeline, wgpu::BindGroup, u32);
+
+/// The two dispatches of [`encode_group`] (stage V, stage U) without
+/// encoding them. None = outside the kernels' contract.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prep_group<'g>(
+    c: &Ctx,
+    g: &'g BlrGraph,
+    mats: &[GroupMat<'_>],
+    x: &wgpu::Buffer,
+    t: &wgpu::Buffer,
+    act: Option<u32>,
+    bind: &dyn Fn(u32, &wgpu::BindGroupLayout, &[&wgpu::Buffer]) -> wgpu::BindGroup,
+) -> Option<[StageDispatch<'g>; 2]> {
+    if mats.is_empty() || mats.len() > 3 {
+        return None;
     }
     let cols = mats[0].dims.cols;
     if mats.iter().any(|m| m.dims.cols != cols) {
-        return false;
+        return None;
     }
     if act.is_some() && (mats.len() != 2 || mats[0].dims.rows != mats[1].dims.rows) {
-        return false;
+        return None;
     }
     // (r, P, toff, d_out) per slot; unused slots repeat slot 0 with empty
     // workgroup ranges.
+    let lv = gv_lanes(cols);
+    // Latent rows a stage-V workgroup covers: 4 per set.
+    let v_rows_wg = 4 * (gv_wg(lv) / lv);
     let mut mw = [0u32; 12];
     let mut toff = 0usize;
     let mut ev = [0u32; 3];
@@ -678,14 +1013,14 @@ pub(super) fn encode_group(
         mw[4 * j + 3] = d.rows as u32;
         if j < mats.len() {
             toff += d.latents();
-            accv += d.latents().div_ceil(GV_ROWS_WG);
+            accv += (d.np * d.rpad()).div_ceil(v_rows_wg);
             accu += d.rows.div_ceil(GU_ROWS_WG);
         }
         ev[j] = accv as u32;
         eu[j] = accu as u32;
     }
     if accv as u32 > 65_535 || accu as u32 > 65_535 {
-        return false;
+        return None;
     }
     let pv = uniform16(
         c,
@@ -695,7 +1030,12 @@ pub(super) fn encode_group(
         ],
     );
     let w = |j: usize| mats.get(j).unwrap_or(&mats[0]).buf;
-    let bv = bind(0, &g.v_l, &[w(0), w(1), w(2), x, t, &pv]);
+    let (pipe_v, layout_v) = {
+        let i = GV_LANES.iter().position(|&l| l == lv).expect("listed width");
+        (&g.v[i].0, &g.v[i].1)
+    };
+    let gb = |j: usize| mats.get(j).unwrap_or(&mats[0]).g;
+    let bv = bind(0, layout_v, &[w(0), w(1), w(2), x, t, &pv, gb(0), gb(1), gb(2)]);
     let (pipe_u, bu, groups_u) = match act {
         Some(code) => {
             let pu = uniform16(
@@ -731,14 +1071,7 @@ pub(super) fn encode_group(
             )
         }
     };
-    let mut pass = begin_pass(enc);
-    pass.set_pipeline(&g.v);
-    pass.set_bind_group(0, &bv, &[]);
-    pass.dispatch_workgroups(accv as u32, 1, 1);
-    pass.set_pipeline(pipe_u);
-    pass.set_bind_group(0, &bu, &[]);
-    pass.dispatch_workgroups(groups_u, 1, 1);
-    true
+    Some([(pipe_v, bv, accv as u32), (pipe_u, bu, groups_u)])
 }
 
 /// A bind group over `bufs` at bindings 0.. in order (the uncached maker).
@@ -771,6 +1104,8 @@ struct BlrState {
     /// The graph kernels (None inside = the device rejected them).
     graph: Option<Option<Arc<BlrGraph>>>,
     u16: std::collections::HashMap<[u32; 16], wgpu::Buffer>,
+    /// f32 input scales per (model uid, tensor idx), see [`g_f32`].
+    gbufs: std::collections::HashMap<(usize, usize), wgpu::Buffer>,
 }
 
 fn states() -> &'static std::sync::Mutex<std::collections::HashMap<usize, BlrState>> {
@@ -857,6 +1192,7 @@ fn dispatch_blr(
             t: None,
             graph: None,
             u16: std::collections::HashMap::new(),
+            gbufs: std::collections::HashMap::new(),
         });
         let need = (b * np * r * 4) as u64;
         let tb = Scratch::ensure(
@@ -1038,6 +1374,193 @@ mod tests {
             / scale
     }
 
+    /// Throughput of the graph kernels at Qwen3.8-27B's NVG 0.55 bpw shapes
+    /// (random payloads of the file's ranks): per group the best of several
+    /// submits of `BLR_BENCH_REPS` (200) back-to-back V+U pairs, as µs per pair and as the
+    /// payload's effective read bandwidth. `--ignored --nocapture`.
+    /// `BLR_BENCH_STAGE=v|u` times one stage alone (the other is skipped).
+    #[test]
+    #[ignore]
+    fn wgpu_blr_graph_throughput_27b_shapes() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping");
+            return;
+        };
+        let _op = c.op_gate.enter();
+        let g = graph_pipes(c).expect("graph kernels");
+        let mut rng = crate::blr::tests::Rng(7);
+        let reps: usize = std::env::var("BLR_BENCH_REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200);
+        let stage = match std::env::var("BLR_BENCH_STAGE").as_deref() {
+            Ok("v") => Some(0usize),
+            Ok("u") => Some(1usize),
+            _ => None,
+        };
+        // (label, d_in, [(d_out, r, P)], act)
+        let groups: &[(&str, usize, &[(usize, usize, usize)], bool)] = &[
+            ("gdn qkv|z", 5120, &[(10240, 920, 2), (6144, 744, 2)], false),
+            ("gdn out", 6144, &[(5120, 744, 2)], false),
+            ("attn q|k|v", 5120, &[(12288, 976, 2), (1024, 216, 2), (1024, 216, 2)], false),
+            ("ffn gate|up act", 5120, &[(17408, 1064, 2), (17408, 1064, 2)], true),
+            ("ffn down P2", 17408, &[(5120, 1064, 2)], false),
+            ("ffn down P1", 17408, &[(5120, 2152, 1)], false),
+            ("0.8B gate|up act", 1024, &[(3584, 376, 2), (3584, 376, 2)], true),
+            ("0.8B down", 3584, &[(1024, 776, 1)], false),
+        ];
+        for &(label, d_in, specs, act) in groups {
+            let payloads: Vec<Vec<u8>> = specs
+                .iter()
+                .map(|&(d_out, r, np)| crate::blr::tests::make(&mut rng, d_out, d_in, r, np))
+                .collect();
+            let bytes: usize = payloads.iter().map(|p| p.len()).sum();
+            let bufs: Vec<wgpu::Buffer> = payloads
+                .iter()
+                .map(|p| {
+                    c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("blr-bench-w"),
+                        contents: p,
+                        usage: wgpu::BufferUsages::STORAGE,
+                    })
+                })
+                .collect();
+            let gbufs: Vec<wgpu::Buffer> = specs
+                .iter()
+                .zip(&payloads)
+                .map(|(&(d_out, _, _), p)| g_f32_upload(c, &[d_out, d_in], p).unwrap())
+                .collect();
+            let x: Vec<f32> = (0..d_in).map(|_| rng.f()).collect();
+            let x_buf = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("blr-bench-x"),
+                contents: bytemuck::cast_slice(&x),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let ys: Vec<wgpu::Buffer> = specs
+                .iter()
+                .map(|&(d_out, _, _)| {
+                    c.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("blr-bench-y"),
+                        size: (d_out * 4) as u64,
+                        usage: wgpu::BufferUsages::STORAGE,
+                        mapped_at_creation: false,
+                    })
+                })
+                .collect();
+            let mats: Vec<GroupMat<'_>> = specs
+                .iter()
+                .enumerate()
+                .map(|(j, &(d_out, r, np))| GroupMat {
+                    buf: &bufs[j],
+                    g: &gbufs[j],
+                    dims: BlrDims {
+                        rows: d_out,
+                        cols: d_in,
+                        r,
+                        np,
+                    },
+                    y: &ys[j],
+                })
+                .collect();
+            let t_buf = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("blr-bench-t"),
+                size: (group_latents(&mats) * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            let code = act.then_some(0u32);
+            let mut best = f64::MAX;
+            let tries: usize = std::env::var("BLR_BENCH_TRIES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(12);
+            // Device timestamps around the block when the device has them
+            // (a shared card's submit latency and time slices stay out of
+            // the shortest block), else the host clock.
+            let ts = c
+                .device
+                .features()
+                .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
+            let qs = ts.then(|| {
+                c.device.create_query_set(&wgpu::QuerySetDescriptor {
+                    label: Some("blr-bench-ts"),
+                    ty: wgpu::QueryType::Timestamp,
+                    count: 2,
+                })
+            });
+            let qres = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("blr-bench-qres"),
+                size: 16,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let qstage = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("blr-bench-qstage"),
+                size: 16,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            for _ in 0..tries {
+                let mut enc = c
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                let [v, u] = prep_group(c, &g, &mats, &x_buf, &t_buf, code, &|_, l, b| {
+                    plain_bind(c, l, b)
+                })
+                .expect("contract");
+                if let Some(q) = &qs {
+                    enc.write_timestamp(q, 0);
+                }
+                {
+                    let mut pass = begin_pass(&mut enc);
+                    for _ in 0..reps {
+                        for (si, (p, b, n)) in [&v, &u].into_iter().enumerate() {
+                            if stage.is_some_and(|s| s != si) {
+                                continue;
+                            }
+                            pass.set_pipeline(p);
+                            pass.set_bind_group(0, b, &[]);
+                            pass.dispatch_workgroups(*n, 1, 1);
+                        }
+                    }
+                }
+                if let Some(q) = &qs {
+                    enc.write_timestamp(q, 1);
+                    enc.resolve_query_set(q, 0..2, &qres, 0);
+                    enc.copy_buffer_to_buffer(&qres, 0, &qstage, 0, 16);
+                }
+                let t0 = std::time::Instant::now();
+                c.queue.submit([enc.finish()]);
+                let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+                let host = t0.elapsed().as_secs_f64();
+                let dt = if qs.is_some() {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    qstage.map_async(wgpu::MapMode::Read, ..16, move |r| {
+                        let _ = tx.send(r);
+                    });
+                    let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+                    rx.recv().unwrap().unwrap();
+                    let t: Vec<u64> = {
+                        let raw = qstage.get_mapped_range(..16).unwrap();
+                        bytemuck::cast_slice::<u8, u64>(&raw).to_vec()
+                    };
+                    qstage.unmap();
+                    t[1].saturating_sub(t[0]) as f64 * c.queue.get_timestamp_period() as f64 * 1e-9
+                } else {
+                    host
+                };
+                best = best.min(dt);
+            }
+            let us = best * 1e6 / reps as f64;
+            eprintln!(
+                "blr-bench {label:18} {:7.2} MB  {us:8.1} us/pair  {:7.1} GB/s",
+                bytes as f64 / 1e6,
+                bytes as f64 / (us * 1e-6) / 1e9
+            );
+        }
+    }
+
     /// The graph kernels (`encode_group`) against the codec's dequant: one,
     /// two and three tensors of one input, ranks that are not whole sign
     /// words (r % 32 ≠ 0, the stage-U funnel shift and the zeroed latent
@@ -1072,8 +1595,15 @@ mod tests {
             (256, &[(36, 32, 2), (68, 40, 1), (132, 128, 2)]),
             (512, &[(1028, 216, 2), (1028, 504, 1)]),
             (2048, &[(1092, 1064, 2), (1092, 1088, 1)]),
+            (4096, &[(36, 24, 2), (36, 32, 1)]),
         ];
-        for g in &variants {
+        // Every stage-V lane-set width on every group (the default picks
+        // the width from the row length).
+        for (g, lv) in variants
+            .iter()
+            .flat_map(|g| [(g, "32"), (g, "128"), (g, "256"), (g, "512")])
+        {
+            unsafe { std::env::set_var("CMF_BLR_LV", lv) };
             for &(d_in, specs) in groups {
                 let x: Vec<f32> = (0..d_in).map(|_| rng.f()).collect();
                 let x_buf = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1095,6 +1625,11 @@ mod tests {
                         })
                     })
                     .collect();
+                let gbufs: Vec<wgpu::Buffer> = specs
+                    .iter()
+                    .zip(&payloads)
+                    .map(|(&(d_out, _, _), p)| g_f32_upload(c, &[d_out, d_in], p).unwrap())
+                    .collect();
                 let ys: Vec<wgpu::Buffer> = specs
                     .iter()
                     .map(|&(d_out, _, _)| {
@@ -1111,6 +1646,7 @@ mod tests {
                     .enumerate()
                     .map(|(j, &(d_out, r, np))| GroupMat {
                         buf: &bufs[j],
+                        g: &gbufs[j],
                         dims: BlrDims {
                             rows: d_out,
                             cols: d_in,
@@ -1148,7 +1684,7 @@ mod tests {
                     let e = rel_err(&got, &want);
                     assert!(
                         e < 1e-5,
-                        "sg={} {d_out}x{d_in} r{r} P{np} (slot {j} of {}): rel {e}",
+                        "sg={} lv={lv} {d_out}x{d_in} r{r} P{np} (slot {j} of {}): rel {e}",
                         g.sg,
                         specs.len()
                     );
@@ -1162,11 +1698,13 @@ mod tests {
                     let pair = [
                         GroupMat {
                             buf: &bufs[gi],
+                            g: &gbufs[gi],
                             dims: mats[gi].dims,
                             y: &ys[gi],
                         },
                         GroupMat {
                             buf: &bufs[ui],
+                            g: &gbufs[ui],
                             dims: mats[ui].dims,
                             y: &ys[ui],
                         },
@@ -1203,7 +1741,7 @@ mod tests {
                         let e = rel_err(&got, &want);
                         assert!(
                             e < 2e-5,
-                            "sg={} act {code} {d_out}x{d_in}: rel {e} got {:?} want {:?}",
+                            "sg={} lv={lv} act {code} {d_out}x{d_in}: rel {e} got {:?} want {:?}",
                             g.sg,
                             &got[..4],
                             &want[..4]
@@ -1212,5 +1750,6 @@ mod tests {
                 }
             }
         }
+        unsafe { std::env::remove_var("CMF_BLR_LV") };
     }
 }
