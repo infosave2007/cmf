@@ -355,6 +355,22 @@ def canonical_name(raw: str) -> str | None:
     return raw
 
 
+def glob_match(pattern: str, name: str) -> bool:
+    """The converter's `--tensor-quant` / `--exclude-tensors` glob: `*` is the
+    only wildcard and spans dots; every other character is literal."""
+    regex = ".*".join(re.escape(part) for part in pattern.split("*"))
+    return re.fullmatch(regex, name, flags=re.DOTALL) is not None
+
+
+def excluded_patterns(header: dict) -> list[str]:
+    """`cortiq convert --exclude-tensors` patterns the file records."""
+    provenance = header.get("provenance") or {}
+    patterns = provenance.get("excluded_tensors") or []
+    if not isinstance(patterns, list) or not all(isinstance(p, str) and p for p in patterns):
+        raise CheckError(f"provenance.excluded_tensors is not a list of patterns: {patterns!r}")
+    return patterns
+
+
 def expected_names(weight_map: dict[str, str]) -> tuple[dict[str, str], set[str], int]:
     expected: dict[str, str] = {}
     optional_dspark: set[str] = set()
@@ -563,6 +579,27 @@ def check_coverage(
         if entry.name in actual:
             errors.append(f"duplicate tensor across CMF shards: {entry.name}")
         actual[entry.name] = entry
+    # Tensors the converter was told to leave out (`--exclude-tensors`,
+    # recorded in the provenance) are not expected, and must not be present.
+    patterns = excluded_patterns(artifacts[0].header)
+    source_dspark = len(optional_dspark)
+    excluded = {name for name in expected if any(glob_match(p, name) for p in patterns)}
+    expected = {name: raw for name, raw in expected.items() if name not in excluded}
+    excluded_dspark = optional_dspark & excluded
+    optional_dspark = optional_dspark - excluded
+    if dspark_policy == "include" and excluded_dspark:
+        errors.append(
+            f"DSpark inclusion requested but the file excludes {len(excluded_dspark)} DSpark "
+            f"tensors (provenance.excluded_tensors={patterns})"
+        )
+    present_excluded = sorted(
+        name for name in actual if any(glob_match(p, name) for p in patterns)
+    )
+    if present_excluded:
+        errors.append(
+            f"CMF contains {len(present_excluded)} tensors its provenance excludes: "
+            f"{', '.join(present_excluded[:8])}"
+        )
     if dspark_policy == "exclude":
         expected = {name: raw for name, raw in expected.items() if name not in optional_dspark}
     expected_set = set(expected)
@@ -725,7 +762,9 @@ def check_coverage(
         "expected_entries": len(expected_set),
         "actual_entries": len(actual_set),
         "omitted_quant_scales": omitted_scales,
-        "dspark_entries": len(optional_dspark),
+        "dspark_entries": source_dspark,
+        "excluded_entries": len(excluded),
+        "excluded_patterns": patterns,
         "layers": n_layers,
         "experts_per_layer": n_experts,
         "full_inventory": int(full_inventory),
@@ -765,6 +804,13 @@ def self_test() -> None:
     assert expected_nbytes("q2tp", (8, 64)) == 8 * 2 * 8 + 8 * 4 + 8 * 2
     assert expected_nbytes("mxfp4", (2304, 5120)) == 2304 * 5120 * 17 // 32
     assert expected_nbytes("mxfp4", (8, 48)) is None
+    assert glob_match("model.mtp.*", "model.mtp.0.ffn.experts.7.w1.weight")
+    assert glob_match("model.mtp.*", canonical_name("mtp.2.attn.wq_a.weight"))
+    assert not glob_match("model.mtp.*", "model.layers.3.mlp.experts.7.gate_proj.weight")
+    assert glob_match("model.layers.*.mlp.experts.*", "model.layers.3.mlp.experts.7.up_proj.weight")
+    assert not glob_match("model.mtp.?", "model.mtp.0")  # `?` is literal
+    assert excluded_patterns({"provenance": {"excluded_tensors": ["model.mtp.*"]}}) == ["model.mtp.*"]
+    assert excluded_patterns({"provenance": {}}) == []
     print("self-test PASS: independent mapping and fixed payload formulas")
 
 
@@ -821,6 +867,11 @@ def main(argv: list[str]) -> int:
             "native_window={rope_native_window}".format(**stats)
         )
     print(f"  DSpark policy: {args.dspark_policy}; source DSpark entries: {stats['dspark_entries']}")
+    if stats["excluded_patterns"]:
+        print(
+            "  excluded by the file's provenance (--exclude-tensors {}): {} source-derived tensors; "
+            "none present".format(",".join(stats["excluded_patterns"]), stats["excluded_entries"])
+        )
     print("  CMF hashes/bounds, canonical coverage, metadata, Engram U8 geometry, and duplicates: PASS")
     return 0
 

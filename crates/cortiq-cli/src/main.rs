@@ -432,6 +432,18 @@ enum Commands {
         /// head at 8 bits; `--tensor-quant 'model.layers.*.mlp.down_proj.weight=q8_2f'`.
         #[arg(long = "tensor-quant", value_name = "PATTERN=QUANT")]
         tensor_quant: Vec<String>,
+        /// Leave tensors out of the file: comma-separated globs over the
+        /// CANONICAL output tensor names (repeatable; `*` is the only
+        /// wildcard and spans dots). A matching source tensor is never
+        /// decoded or written, in every output (`--also-output` included);
+        /// the count and source bytes left out are printed and the patterns
+        /// recorded in the header provenance (`excluded_tensors`). E.g.
+        /// `--exclude-tensors 'model.mtp.*'` drops a DeepSeek-V4/V4.1
+        /// MTP/DSpark stack (the V4.1 runtime never executes it): the 1017
+        /// `--quant fp4` file goes from 504.51 to 496.96 GB, under Hugging
+        /// Face's 500 GB per-file limit.
+        #[arg(long = "exclude-tensors", value_name = "PATTERNS")]
+        exclude_tensors: Vec<String>,
         /// Continue a conversion that was interrupted. Keeps the payloads
         /// already in <output> and skips every source shard its manifest
         /// records as done — the download included, which is where a
@@ -3219,6 +3231,7 @@ async fn main() -> anyhow::Result<()> {
             hf_token,
             mean_bits,
             tensor_quant,
+            exclude_tensors,
             resume,
             defrag,
             o1,
@@ -3250,11 +3263,13 @@ async fn main() -> anyhow::Result<()> {
                         && !mtp_sidecar
                         && !dspark_sidecar
                         && tensor_quant.is_empty()
+                        && exclude_tensors.is_empty()
                         && !resume
                         && defrag.is_none()
                         && o1.is_none(),
                     "--quant blr runs its own encoder: --also-output, --mtp-sidecar, \
-                     --dspark-sidecar, --tensor-quant, --resume, --defrag and --o1 do not apply"
+                     --dspark-sidecar, --tensor-quant, --exclude-tensors, --resume, --defrag \
+                     and --o1 do not apply"
                 );
                 let method = match blr_method.to_ascii_lowercase().as_str() {
                     "nvg" => nvg::Method::Nvg,
@@ -3318,6 +3333,11 @@ async fn main() -> anyhow::Result<()> {
                 !dspark_sidecar || mimo_towers == "text",
                 "--mimo-towers cannot be combined with --dspark-sidecar"
             );
+            let exclude_tensors = convert::parse_tensor_exclusions(&exclude_tensors)?;
+            anyhow::ensure!(
+                exclude_tensors.is_empty() || !dspark_sidecar,
+                "--exclude-tensors cannot be combined with --dspark-sidecar (the sidecar is a fixed tensor set)"
+            );
             if dspark_sidecar {
                 let q = match quant.as_deref() {
                     None => "q8_2f",
@@ -3353,6 +3373,10 @@ async fn main() -> anyhow::Result<()> {
                 output
             };
             if mtp_sidecar && !qwen4_mtp {
+                anyhow::ensure!(
+                    exclude_tensors.is_empty(),
+                    "--exclude-tensors cannot be combined with --mtp-sidecar (the sidecar is a fixed tensor set)"
+                );
                 let q = match quant.as_deref() {
                     None => "q8_2f",
                     Some(q) if q.eq_ignore_ascii_case(convert::AUTO_QUANT) => "q8_2f",
@@ -3406,7 +3430,7 @@ async fn main() -> anyhow::Result<()> {
                     additional_output.to_string(),
                 ));
             }
-            convert::run_convert_multi_towers(
+            convert::run_convert_multi_excluding(
                 &model,
                 &outputs,
                 hf_token.as_deref(),
@@ -3414,6 +3438,7 @@ async fn main() -> anyhow::Result<()> {
                 o1_hint,
                 resume,
                 towers,
+                &exclude_tensors,
                 progress_reporter("converting"),
             )?;
             for (_, output) in &outputs {
