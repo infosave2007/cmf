@@ -97,8 +97,12 @@ layout).
 - `CMF_MOE_RANGE` together with `--output` is now refused, because the other
   layers' experts would be missing from the file. It is allowed with
   `--in-place`, `--patch-shared` or `CMF_MOE_DIAG`.
-- After the last capture pass the calibration pipeline is dropped. Its GPU
-  expert pool and caches are released before the encode starts.
+- After the last capture pass the calibration pipeline is dropped, and its
+  device caches are released with `gpu_wgpu::release_model_buffers` (new, a pub
+  wrapper over `release_idle_model_buffers`). The V4.1 global expert bank lives
+  in the device context, keyed by the model, so dropping the pipeline alone does
+  not free it. By default it takes `CMF_DSV41_POOL_PCT=75` % of the card (at
+  most 85 %).
 - Refactor: `encode_layer` (routing lists → workers → routed and shared
   experts), `Sink` (Stream / InPlace / Patch / Diag), `encode_with_hessians`.
   Flash-Next keeps its behaviour:
@@ -215,8 +219,10 @@ disk.
 - Per worker: about 1 GB of scratch (16,384-row chunks at hidden 5120), plus
   packed Hessians (5120² and 2304²) and device folds.
 - 8 workers come to roughly 10 GB.
-- The calibration pipeline (V4.1 dynamic MoE pool) is dropped before the encode
-  starts.
+- The calibration pipeline is dropped and its cached weights and expert bank are
+  released (`release_model_buffers`) before the encode starts.
+- During the capture, the shared expert's scratch (about 1 GB) is already
+  allocated next to the bank.
 
 ### Capture time
 
