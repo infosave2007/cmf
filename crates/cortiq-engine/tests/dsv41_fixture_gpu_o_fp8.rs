@@ -70,6 +70,7 @@ fn gpu_o_fp8_follows_reference_act_quant() {
     // The O_FP8 path must not lose the device frame (it used to force the
     // CPU tail), and every device tail must quantize.
     assert_device_paths("O_FP8", run.counters);
+    assert_bank_family("O_FP8", run.bank);
     assert_eq!(
         run.fp8_encodes, GPU_ATTN_CALLS,
         "act_quant(o) encodes over the device attention tails"

@@ -61032,6 +61032,16 @@ pub fn dsv4_global_moe_ready(model: &Arc<CmfModel>) -> bool {
     ctx().is_some_and(|c| c.dsv4_global_moe.lock().unwrap().contains_key(&model.uid()))
 }
 
+/// The model's global expert bank as `(segments, capacity)`, when one is
+/// allocated. For tests that must see which segment family a run used: an
+/// S8 and an S16 bank give identical results.
+#[doc(hidden)]
+pub fn dsv4_global_moe_geometry(model: &CmfModel) -> Option<(usize, usize)> {
+    let c = ctx()?;
+    let banks = c.dsv4_global_moe.lock().unwrap();
+    banks.get(&model.uid()).map(|b| (b.segments, b.capacity))
+}
+
 /// Install one `(layer, expert)` triple into a flat global slot. Slot metadata
 /// is committed by the caller only after all three ordered queue writes
 /// succeed, so a remap never exposes partially replaced weights.
