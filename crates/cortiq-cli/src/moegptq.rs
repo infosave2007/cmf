@@ -267,6 +267,12 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
         .and_then(|v| v.split_once("..").and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))))
         .unwrap_or((0, nl));
     let (range_lo, range_hi) = (range_lo.min(nl), range_hi.min(nl));
+    anyhow::ensure!(range_lo < range_hi, "CMF_MOE_RANGE {range_lo}..{range_hi} is empty");
+    anyhow::ensure!(
+        diag.is_some() || o.in_place || patch.is_some() || (range_lo, range_hi) == (0, nl),
+        "CMF_MOE_RANGE {range_lo}..{range_hi} with --output would leave the other layers' experts out of the file \
+         (use it with --in-place, --patch-shared or CMF_MOE_DIAG)"
+    );
     if let Some(v) = &diag {
         eprintln!("DIAG: held-out every {holdout}th window, priors {v:?} (pseudo-rows), layers {range_lo}..{range_hi}; no file is written");
     }

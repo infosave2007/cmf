@@ -905,7 +905,9 @@ enum Commands {
         tokens: usize,
         #[arg(long, default_value = "2048")]
         window: usize,
-        /// Layers captured per calibration pass (host RAM: ~6 KB per token per layer)
+        /// Layers captured per calibration pass (host RAM: 2·hidden bytes per
+        /// token per layer — ~5 KB Flash-Next, ~10 KB DeepSeek-V4.1; one pass
+        /// over all layers with --in-place)
         #[arg(long, default_value = "24")]
         layers_per_pass: usize,
         #[arg(long, default_value = "0.01")]
