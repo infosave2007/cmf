@@ -21466,11 +21466,17 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Serializes the tests that set the process-wide `Q1_KERNEL_OVERRIDE`:
+    /// run in parallel, one test switched the kernel between another's
+    /// per-op and batch calls (a flaky bit mismatch on the CI runner).
+    static Q1_OVERRIDE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// GPU q1 kernel == exact f32 reference over a real mmap. The GPU
     /// math is plain f32 (no A8 quantization), so the tolerance is pure
     /// float-summation noise. Skipped without a Metal device.
     #[test]
     fn gpu_q1_matvec_matches_reference() {
+        let _lock = Q1_OVERRIDE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Two shapes: single-chunk (cols ≤ 4096) and the CHUNKED path
         // (cols 6144 → two threadgroup-memory chunks — the out_proj
         // shape that a small parity test would never touch).
@@ -21643,6 +21649,7 @@ mod tests {
     /// covered without cargo by `tools/metal_q1g_parity.swift`.
     #[test]
     fn gpu_q1g_matvec_equals_q1() {
+        let _lock = Q1_OVERRIDE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("CMF_GPU", "1") };
         if !enabled() {
             eprintln!("gpu test skipped: no Metal device");
