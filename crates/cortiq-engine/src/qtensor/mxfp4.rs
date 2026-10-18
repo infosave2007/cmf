@@ -261,7 +261,10 @@ fn dot_decoded_i8(w: &[i8], scales: &[u8], xq: &[i8]) -> f32 {
     let mut acc = 0f32;
     if simd {
         for (g, &k) in scales.iter().enumerate() {
-            let d = dot_i8_i8(&wu[g * GROUP..(g + 1) * GROUP], &xq[g * GROUP..(g + 1) * GROUP]);
+            let d = dot_i8_i8(
+                &wu[g * GROUP..(g + 1) * GROUP],
+                &xq[g * GROUP..(g + 1) * GROUP],
+            );
             acc += d as f32 * e8m0_half_to_f32(k);
         }
     } else {
@@ -454,7 +457,11 @@ mod tests {
                 // 8·rms threshold) exercise the exact outlier term; on a
                 // short row one such value would BE the rms and stay in
                 // the int8 bulk, which only tests int8 rounding.
-                if cols >= 1024 && j % 97 == 13 { 30.0f32.copysign(v) } else { v }
+                if cols >= 1024 && j % 97 == 13 {
+                    30.0f32.copysign(v)
+                } else {
+                    v
+                }
             })
             .collect()
     }
@@ -468,7 +475,11 @@ mod tests {
     /// f64 reference of the dequantized matrix.
     fn reference(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f64> {
         (0..rows)
-            .map(|r| (0..cols).map(|j| w[r * cols + j] as f64 * x[j] as f64).sum())
+            .map(|r| {
+                (0..cols)
+                    .map(|j| w[r * cols + j] as f64 * x[j] as f64)
+                    .sum()
+            })
             .collect()
     }
 
@@ -488,7 +499,9 @@ mod tests {
                 let mut got = vec![0f32; rows];
                 float_activations_scope(|| matvec(&p, &x, rows, cols, &mut got, pl));
                 assert!(
-                    want.iter().zip(&got).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    want.iter()
+                        .zip(&got)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
                     "{rows}x{cols} pool={}",
                     pl.is_some()
                 );
@@ -497,12 +510,17 @@ mod tests {
             let norm: f64 = x.iter().map(|v| (*v as f64).abs()).sum::<f64>()
                 * w.iter().fold(0f64, |m, v| m.max((*v as f64).abs()));
             for (g, r) in want.iter().zip(&r64) {
-                assert!((*g as f64 - r).abs() <= norm * cols as f64 * 1.2e-7, "{g} vs {r}");
+                assert!(
+                    (*g as f64 - r).abs() <= norm * cols as f64 * 1.2e-7,
+                    "{g} vs {r}"
+                );
             }
             // matvec2 and matmat keep per-token equality in the exact mode.
             let x2 = act(cols, cols + 3);
             let (mut a, mut b2) = (vec![0f32; rows], vec![0f32; rows]);
-            float_activations_scope(|| matvec2(&p, &x, &x2, rows, cols, &mut a, &mut b2, Some(&pool)));
+            float_activations_scope(|| {
+                matvec2(&p, &x, &x2, rows, cols, &mut a, &mut b2, Some(&pool))
+            });
             let mut want2 = vec![0f32; rows];
             matvec_rows(None, &w, &x2, &mut want2);
             assert_eq!(a, want);
@@ -514,7 +532,11 @@ mod tests {
             for t in 0..bt {
                 let mut one = vec![0f32; rows];
                 matvec_rows(None, &w, &xs[t * cols..(t + 1) * cols], &mut one);
-                assert!(one.iter().zip(&mm[t * rows..(t + 1) * rows]).all(|(a, b)| a.to_bits() == b.to_bits()));
+                assert!(
+                    one.iter()
+                        .zip(&mm[t * rows..(t + 1) * rows])
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                );
             }
         }
     }
@@ -564,7 +586,10 @@ mod tests {
         let t = |n: &str| QTensor::from_model(&model, n).unwrap();
         let (q, q2, f, f2) = (t("q"), t("q2"), t("f"), t("f2"));
         assert_eq!(q.model_dtype(), Some(TensorDtype::Mxfp4));
-        assert!(q.is_mxfp4() && q.as_f32().is_none(), "mapped, not dequantized");
+        assert!(
+            q.is_mxfp4() && q.as_f32().is_none(),
+            "mapped, not dequantized"
+        );
         assert!(q.graph_weight().is_none() && q.q1_parts().is_none());
         assert!(q.mapped_q4tp().is_none() && q.mapped_device_gemm().is_none());
         let pool = Pool::new(3);
@@ -612,7 +637,9 @@ mod tests {
     #[test]
     #[ignore]
     fn cpu_matvec_speed() {
-        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
         let pool = Pool::new(threads);
         let best = |f: &mut dyn FnMut()| {
             for _ in 0..3 {
@@ -701,9 +728,13 @@ mod tests {
                     let (w, s) = m.weight(r, j);
                     acc += w * s * xv;
                 }
-                let mag: f64 = (0..cols).map(|j| (wf0[r * cols + j] as f64 * x[j] as f64).abs()).sum();
-                assert!((acc as f64 - e).abs() <= mag * 1e-5, "row {r}: {acc} vs emulated {e}");
-
+                let mag: f64 = (0..cols)
+                    .map(|j| (wf0[r * cols + j] as f64 * x[j] as f64).abs())
+                    .sum();
+                assert!(
+                    (acc as f64 - e).abs() <= mag * 1e-5,
+                    "row {r}: {acc} vs emulated {e}"
+                );
             }
             if !a8w8_enabled() {
                 continue; // no dot-product ISA here: matvec takes the exact path
@@ -711,15 +742,24 @@ mod tests {
             let mut mv = vec![0f32; rows];
             matvec(&p, &x, rows, cols, &mut mv, Some(&pool));
             let bt = 5usize;
-            let xs: Vec<f32> = (0..bt).flat_map(|t| if t == 2 { x.clone() } else { act(cols, t + 11) }).collect();
+            let xs: Vec<f32> = (0..bt)
+                .flat_map(|t| if t == 2 { x.clone() } else { act(cols, t + 11) })
+                .collect();
             let mut mm = vec![0f32; bt * rows];
             matmat(&p, &xs, bt, rows, cols, &mut mm, Some(&pool));
-            assert!(mv.iter().zip(&mm[2 * rows..3 * rows]).all(|(a, b)| a.to_bits() == b.to_bits()));
+            assert!(
+                mv.iter()
+                    .zip(&mm[2 * rows..3 * rows])
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+            );
             let wf = dequant(&p, rows, cols);
             let r64 = reference(&wf, &x, rows, cols);
             let scale = r64.iter().fold(0f64, |m, v| m.max(v.abs()));
             for (g, r) in mv.iter().zip(&r64) {
-                assert!((*g as f64 - r).abs() <= 0.02 * scale, "{g} vs {r} (scale {scale})");
+                assert!(
+                    (*g as f64 - r).abs() <= 0.02 * scale,
+                    "{g} vs {r} (scale {scale})"
+                );
             }
         }
     }

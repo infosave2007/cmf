@@ -82,7 +82,10 @@ fn mxfp4_and_fp4_parse_and_resolve_per_tensor() {
     assert_eq!(quant_name(Quant::Mxfp4), "mxfp4");
     assert_eq!(quant_name(Quant::Fp4), "fp4");
     let (pat, q) = parse_tensor_quant("model.layers.*.mlp.experts.*=mxfp4").unwrap();
-    assert_eq!((pat.as_str(), q), ("model.layers.*.mlp.experts.*", Quant::Mxfp4));
+    assert_eq!(
+        (pat.as_str(), q),
+        ("model.layers.*.mlp.experts.*", Quant::Mxfp4)
+    );
     let e = parse_tensor_quant("x=fp4").unwrap_err().to_string();
     assert!(e.contains("whole-file profile"), "{e}");
 
@@ -94,7 +97,11 @@ fn mxfp4_and_fp4_parse_and_resolve_per_tensor() {
         "model.layers.3.mlp.shared_expert.down_proj.weight",
         "model.mtp.0.ffn.experts.4.w1.weight",
     ] {
-        assert_eq!(profile_quant(&arch, Quant::Fp4, name), Quant::Mxfp4, "{name}");
+        assert_eq!(
+            profile_quant(&arch, Quant::Fp4, name),
+            Quant::Mxfp4,
+            "{name}"
+        );
     }
     for name in [
         "model.layers.3.self_attn.wq_a.weight",
@@ -110,11 +117,16 @@ fn mxfp4_and_fp4_parse_and_resolve_per_tensor() {
     }
     // The codec itself: OCP quantization of float values, q8_2f fallback on
     // a shape the format does not allow (like every grouped codec).
-    let vals: Vec<f32> = (0..4 * 64).map(|i| ((i * 7) % 19) as f32 * 0.03 - 0.25).collect();
+    let vals: Vec<f32> = (0..4 * 64)
+        .map(|i| ((i * 7) % 19) as f32 * 0.03 - 0.25)
+        .collect();
     let (dt, data) = quantize_2d(Quant::Mxfp4, &vals, 4, 64);
     assert_eq!(dt, TensorDtype::Mxfp4);
     assert_eq!(data, cortiq_core::mxfp4::quantize(&vals, 4, 64));
-    assert_eq!(quantize_2d(Quant::Mxfp4, &vals[..4 * 48], 4, 48).0, TensorDtype::Q8_2f);
+    assert_eq!(
+        quantize_2d(Quant::Mxfp4, &vals[..4 * 48], 4, 48).0,
+        TensorDtype::Q8_2f
+    );
 }
 
 /// The historical float decoder and the dtype's dequant agree bit for bit on
@@ -154,7 +166,11 @@ fn e4m3_ref(b: u8) -> f64 {
 fn e2m1_ref(code: u8) -> f64 {
     let e = ((code >> 1) & 3) as i32;
     let m = (code & 1) as f64;
-    let mag = if e == 0 { m * 0.5 } else { (1.0 + m / 2.0) * 2f64.powi(e - 1) };
+    let mag = if e == 0 {
+        m * 0.5
+    } else {
+        (1.0 + m / 2.0) * 2f64.powi(e - 1)
+    };
     if code & 8 != 0 { -mag } else { mag }
 }
 
@@ -176,7 +192,11 @@ fn nvfp4_unpack_matches_the_modelopt_formula() {
             let b = packed[r * cols / 2 + c / 2];
             let code = if c % 2 == 0 { b & 15 } else { b >> 4 };
             let want = (e2m1_ref(code) as f32) * s;
-            assert_eq!(out[r * cols + c].to_bits(), want.to_bits(), "row {r} col {c}");
+            assert_eq!(
+                out[r * cols + c].to_bits(),
+                want.to_bits(),
+                "row {r} col {c}"
+            );
         }
     }
     // NaN block scale and a non-finite global are refused; shapes checked.
@@ -195,9 +215,11 @@ fn nvfp4_detection_reads_hf_quant_config_and_quantization_config() {
         "quant_method": "modelopt", "quant_algo": "NVFP4",
         "config_groups": {"group_0": {"weights": {"num_bits": 4, "type": "float", "group_size": 16}}}}});
     assert_eq!(nvfp4_source(&d, &modelopt).unwrap(), Some(16));
-    let w4a16 = serde_json::json!({"quantization_config": {"quant_algo": "W4A16_NVFP4", "group_size": 16}});
+    let w4a16 =
+        serde_json::json!({"quantization_config": {"quant_algo": "W4A16_NVFP4", "group_size": 16}});
     assert_eq!(nvfp4_source(&d, &w4a16).unwrap(), Some(16));
-    let bad_group = serde_json::json!({"quantization_config": {"quant_algo": "NVFP4", "group_size": 32}});
+    let bad_group =
+        serde_json::json!({"quantization_config": {"quant_algo": "NVFP4", "group_size": 32}});
     assert!(nvfp4_source(&d, &bad_group).is_err());
     let ct = serde_json::json!({"quantization_config": {"quant_method": "compressed-tensors",
         "format": "nvfp4-pack-quantized"}});
@@ -254,14 +276,30 @@ fn dsv41_config() -> serde_json::Value {
 }
 
 /// I8 FP4 weight `[rows, cols/2]` + F8_E8M0 `.scale` `[rows, cols/32]`.
-fn fp4_pair(stem: &str, rows: usize, cols: usize, seed: u64, out: &mut Vec<Raw>) -> (Vec<u8>, Vec<u8>) {
+fn fp4_pair(
+    stem: &str,
+    rows: usize,
+    cols: usize,
+    seed: u64,
+    out: &mut Vec<Raw>,
+) -> (Vec<u8>, Vec<u8>) {
     let codes = bytes(rows * cols / 2, seed);
     let scales: Vec<u8> = bytes(rows * cols / 32, seed + 1000)
         .iter()
         .map(|b| 119 + b % 5)
         .collect();
-    out.push((format!("{stem}.weight"), "I8", vec![rows, cols / 2], codes.clone()));
-    out.push((format!("{stem}.scale"), "F8_E8M0", vec![rows, cols / 32], scales.clone()));
+    out.push((
+        format!("{stem}.weight"),
+        "I8",
+        vec![rows, cols / 2],
+        codes.clone(),
+    ));
+    out.push((
+        format!("{stem}.scale"),
+        "F8_E8M0",
+        vec![rows, cols / 32],
+        scales.clone(),
+    ));
     (codes, scales)
 }
 
@@ -297,15 +335,35 @@ fn write_dsv41_source(tag: &str) -> Dsv41Src {
     let mut t: Vec<Raw> = Vec::new();
     let mut fp4 = HashMap::new();
     let mix = (2 + HC) * HC;
-    t.push(("embed.weight".into(), "BF16", vec![VOCAB, DIM], bf16_bytes(VOCAB * DIM, 1, 0.5)));
-    t.push(("head.weight".into(), "BF16", vec![VOCAB, DIM], bf16_bytes(VOCAB * DIM, 2, 0.5)));
-    t.push(("norm.weight".into(), "BF16", vec![DIM], bf16_bytes(DIM, 3, 0.2)));
+    t.push((
+        "embed.weight".into(),
+        "BF16",
+        vec![VOCAB, DIM],
+        bf16_bytes(VOCAB * DIM, 1, 0.5),
+    ));
+    t.push((
+        "head.weight".into(),
+        "BF16",
+        vec![VOCAB, DIM],
+        bf16_bytes(VOCAB * DIM, 2, 0.5),
+    ));
+    t.push((
+        "norm.weight".into(),
+        "BF16",
+        vec![DIM],
+        bf16_bytes(DIM, 3, 0.2),
+    ));
     for li in 0..LAYERS {
         let p = format!("layers.{li}");
         let s = 100 * (li as u64 + 1);
         let bf = |name: &str, shape: Vec<usize>, seed: u64, amp: f32| -> Raw {
             let n = shape.iter().product();
-            (format!("{p}.{name}"), "BF16", shape, bf16_bytes(n, seed, amp))
+            (
+                format!("{p}.{name}"),
+                "BF16",
+                shape,
+                bf16_bytes(n, seed, amp),
+            )
         };
         // RMS norm weights near one.
         let ones = |name: &str, n: usize, seed: u64| -> Raw {
@@ -325,21 +383,56 @@ fn write_dsv41_source(tag: &str) -> Dsv41Src {
         t.push(bf("attn.wq_a.weight", vec![QLORA, DIM], s + 5, 0.4));
         t.push(bf("attn.wq_b.weight", vec![HEADS * HD, QLORA], s + 6, 0.4));
         t.push(bf("attn.wkv.weight", vec![HD, DIM], s + 7, 0.4));
-        t.push(bf("attn.wo_a.weight", vec![OGROUPS * OLORA, HEADS * HD / OGROUPS], s + 8, 0.3));
-        t.push(bf("attn.wo_b.weight", vec![DIM, OGROUPS * OLORA], s + 9, 0.3));
-        t.push((format!("{p}.attn.attn_sink"), "F32", vec![HEADS], f32_bytes(&[0.1, -0.2, 0.0, 0.3])));
+        t.push(bf(
+            "attn.wo_a.weight",
+            vec![OGROUPS * OLORA, HEADS * HD / OGROUPS],
+            s + 8,
+            0.3,
+        ));
+        t.push(bf(
+            "attn.wo_b.weight",
+            vec![DIM, OGROUPS * OLORA],
+            s + 9,
+            0.3,
+        ));
+        t.push((
+            format!("{p}.attn.attn_sink"),
+            "F32",
+            vec![HEADS],
+            f32_bytes(&[0.1, -0.2, 0.0, 0.3]),
+        ));
         for (part, seed) in [("attn", s + 10), ("ffn", s + 20)] {
             let fnw: Vec<f32> = bytes(mix * HC * DIM, seed)
                 .iter()
                 .map(|&b| (b as f32 / 255.0 - 0.5) * 0.02)
                 .collect();
             let base: Vec<f32> = (0..mix).map(|i| (i % 3) as f32 * 0.1 - 0.1).collect();
-            t.push((format!("{p}.hc_{part}_fn"), "F32", vec![mix, HC * DIM], f32_bytes(&fnw)));
-            t.push((format!("{p}.hc_{part}_base"), "F32", vec![mix], f32_bytes(&base)));
-            t.push((format!("{p}.hc_{part}_scale"), "F32", vec![3], f32_bytes(&[1.0, 0.5, 0.25])));
+            t.push((
+                format!("{p}.hc_{part}_fn"),
+                "F32",
+                vec![mix, HC * DIM],
+                f32_bytes(&fnw),
+            ));
+            t.push((
+                format!("{p}.hc_{part}_base"),
+                "F32",
+                vec![mix],
+                f32_bytes(&base),
+            ));
+            t.push((
+                format!("{p}.hc_{part}_scale"),
+                "F32",
+                vec![3],
+                f32_bytes(&[1.0, 0.5, 0.25]),
+            ));
         }
         t.push(bf("ffn.gate.weight", vec![NEXP, DIM], s + 30, 0.5));
-        t.push((format!("{p}.ffn.gate.bias"), "F32", vec![NEXP], f32_bytes(&[0.0, 0.05, -0.05, 0.02])));
+        t.push((
+            format!("{p}.ffn.gate.bias"),
+            "F32",
+            vec![NEXP],
+            f32_bytes(&[0.0, 0.05, -0.05, 0.02]),
+        ));
         for e in 0..NEXP {
             for (w, canon, rows, cols) in [
                 ("w1", "gate_proj", MI, DIM),
@@ -353,7 +446,10 @@ fn write_dsv41_source(tag: &str) -> Dsv41Src {
                     s + 40 + 3 * e as u64 + w.len() as u64 * 7 + rows as u64,
                     &mut t,
                 );
-                fp4.insert(format!("model.layers.{li}.mlp.experts.{e}.{canon}.weight"), pair);
+                fp4.insert(
+                    format!("model.layers.{li}.mlp.experts.{e}.{canon}.weight"),
+                    pair,
+                );
             }
         }
         // Layer 0's shared expert is FP4 (re-packed byte for byte); layer
@@ -367,7 +463,10 @@ fn write_dsv41_source(tag: &str) -> Dsv41Src {
             let stem = format!("{p}.ffn.shared_experts.{w}");
             if li == 0 {
                 let pair = fp4_pair(&stem, rows, cols, s + 90 + rows as u64, &mut t);
-                fp4.insert(format!("model.layers.{li}.mlp.shared_expert.{canon}.weight"), pair);
+                fp4.insert(
+                    format!("model.layers.{li}.mlp.shared_expert.{canon}.weight"),
+                    pair,
+                );
             } else {
                 fp8_pair(&stem, rows, cols, s + 95 + rows as u64, &mut t);
             }
@@ -410,7 +509,14 @@ fn scaled_twin(model: &CmfModel, out: &Path, k: f32) {
             }
         })
         .collect();
-    CmfModel::write(out, &model.header, &specs, Some(&model.masks), model.vocab.as_deref()).unwrap();
+    CmfModel::write(
+        out,
+        &model.header,
+        &specs,
+        Some(&model.masks),
+        model.vocab.as_deref(),
+    )
+    .unwrap();
 }
 
 /// `--quant fp4` on a synthetic DeepSeek-V4.1 checkpoint, through the real
@@ -456,7 +562,11 @@ fn dsv41_fp4_profile_is_byte_identical_and_forward_matches_f32_experts() {
         let mut want = codes.clone();
         want.extend_from_slice(scales);
         assert_eq!(fp4.entry_bytes(e), &want[..], "{name}: not byte-identical");
-        assert_eq!(q4.tensor(name).unwrap().dtype, TensorDtype::Q4TiledP, "{name} in q4tp");
+        assert_eq!(
+            q4.tensor(name).unwrap().dtype,
+            TensorDtype::Q4TiledP,
+            "{name} in q4tp"
+        );
     }
     // The FP8 shared expert: mxfp4 by the OCP rule, within its error bound
     // of the FP8 decode (one E2M1 step of the group scale at most).
@@ -476,15 +586,26 @@ fn dsv41_fp4_profile_is_byte_identical_and_forward_matches_f32_experts() {
                 _ => "w2",
             }
         );
-        let w = source.tensors.iter().find(|t| t.name == format!("{stem}.weight")).unwrap();
-        let s = source.tensors.iter().find(|t| t.name == format!("{stem}.scale")).unwrap();
+        let w = source
+            .tensors
+            .iter()
+            .find(|t| t.name == format!("{stem}.weight"))
+            .unwrap();
+        let s = source
+            .tensors
+            .iter()
+            .find(|t| t.name == format!("{stem}.scale"))
+            .unwrap();
         let fp8 = unpack_fp8_blocks(source.bytes(w), source.bytes(s), rows, cols, 32).unwrap();
         for g in 0..rows * cols / 32 {
             let grp = &fp8[g * 32..(g + 1) * 32];
             let amax = grp.iter().fold(0f32, |m, v| m.max(v.abs()));
             let step = 2f32.powi(amax.log2().floor() as i32 - 2);
             for j in 0..32 {
-                assert!((got[g * 32 + j] - grp[j]).abs() <= step * 2.0 + 1e-12, "{name} g{g}");
+                assert!(
+                    (got[g * 32 + j] - grp[j]).abs() <= step * 2.0 + 1e-12,
+                    "{name} g{g}"
+                );
             }
         }
     }
@@ -494,7 +615,9 @@ fn dsv41_fp4_profile_is_byte_identical_and_forward_matches_f32_experts() {
         if fp4_expert_matrix(&e.name) {
             continue;
         }
-        let f = fp4.tensor(&e.name).unwrap_or_else(|| panic!("{} missing in fp4", e.name));
+        let f = fp4
+            .tensor(&e.name)
+            .unwrap_or_else(|| panic!("{} missing in fp4", e.name));
         assert_eq!((f.dtype, &f.shape), (e.dtype, &e.shape), "{}", e.name);
         assert_eq!(fp4.entry_bytes(f), q4.entry_bytes(e), "{}", e.name);
         skeleton += 1;
@@ -502,11 +625,19 @@ fn dsv41_fp4_profile_is_byte_identical_and_forward_matches_f32_experts() {
     assert!(skeleton > 20);
     assert_eq!(fp4.tensors.len(), q4.tensors.len());
     assert_eq!(
-        fp4.header.provenance.as_ref().and_then(|p| p.get("weight_quant")).and_then(|v| v.as_str()),
+        fp4.header
+            .provenance
+            .as_ref()
+            .and_then(|p| p.get("weight_quant"))
+            .and_then(|v| v.as_str()),
         Some("fp4")
     );
     assert_eq!(
-        q4.header.provenance.as_ref().and_then(|p| p.get("weight_quant")).and_then(|v| v.as_str()),
+        q4.header
+            .provenance
+            .as_ref()
+            .and_then(|p| p.get("weight_quant"))
+            .and_then(|v| v.as_str()),
         Some("q4tp")
     );
 
@@ -538,8 +669,14 @@ fn dsv41_fp4_profile_is_byte_identical_and_forward_matches_f32_experts() {
     // Default kernels (A8W8 where the ISA has it): finite and close.
     let c = logits(&fp4);
     let span = a.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-3);
-    let dmax = a.iter().zip(&c).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
-    assert!(c.iter().all(|v| v.is_finite()) && dmax <= 0.25 * span, "A8W8 drift {dmax} of {span}");
+    let dmax = a
+        .iter()
+        .zip(&c)
+        .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+    assert!(
+        c.iter().all(|v| v.is_finite()) && dmax <= 0.25 * span,
+        "A8W8 drift {dmax} of {span}"
+    );
     drop((fp4, q4, twin));
     let _ = fs::remove_dir_all(&src.dir);
 }
@@ -652,9 +789,24 @@ fn nvfp4_checkpoint_converts_to_every_profile_with_the_formula_values() {
     .unwrap();
     fs::write(dir.join("tokenizer.json"), b"{}").unwrap();
     let mut t: Vec<Raw> = vec![
-        ("model.embed_tokens.weight".into(), "BF16", vec![vocab, h], bf16_bytes(vocab * h, 1, 0.5)),
-        ("lm_head.weight".into(), "BF16", vec![vocab, h], bf16_bytes(vocab * h, 2, 0.5)),
-        ("model.norm.weight".into(), "BF16", vec![h], bf16_bytes(h, 3, 0.1)),
+        (
+            "model.embed_tokens.weight".into(),
+            "BF16",
+            vec![vocab, h],
+            bf16_bytes(vocab * h, 1, 0.5),
+        ),
+        (
+            "lm_head.weight".into(),
+            "BF16",
+            vec![vocab, h],
+            bf16_bytes(vocab * h, 2, 0.5),
+        ),
+        (
+            "model.norm.weight".into(),
+            "BF16",
+            vec![h],
+            bf16_bytes(h, 3, 0.1),
+        ),
     ];
     let p = "model.layers.0";
     for (n, len) in [
@@ -663,7 +815,12 @@ fn nvfp4_checkpoint_converts_to_every_profile_with_the_formula_values() {
         ("self_attn.q_norm.weight", hd),
         ("self_attn.k_norm.weight", hd),
     ] {
-        t.push((format!("{p}.{n}"), "BF16", vec![len], bf16_bytes(len, len as u64, 0.1)));
+        t.push((
+            format!("{p}.{n}"),
+            "BF16",
+            vec![len],
+            bf16_bytes(len, len as u64, 0.1),
+        ));
     }
     let mut expect: HashMap<String, Vec<f32>> = HashMap::new();
     let linears = [
@@ -685,15 +842,40 @@ fn nvfp4_checkpoint_converts_to_every_profile_with_the_formula_values() {
             .map(|b| 0x30 + (b % 24))
             .collect();
         let global = 0.004_f32 * (1.0 + li as f32 * 0.37);
-        t.push((format!("{stem}.weight"), "U8", vec![rows, cols / 2], packed.clone()));
-        t.push((format!("{stem}.weight_scale"), "F8_E4M3", vec![rows, cols / 16], sf.clone()));
-        t.push((format!("{stem}.weight_scale_2"), "F32", vec![], f32_bytes(&[global])));
-        t.push((format!("{stem}.input_scale"), "F32", vec![], f32_bytes(&[0.5])));
+        t.push((
+            format!("{stem}.weight"),
+            "U8",
+            vec![rows, cols / 2],
+            packed.clone(),
+        ));
+        t.push((
+            format!("{stem}.weight_scale"),
+            "F8_E4M3",
+            vec![rows, cols / 16],
+            sf.clone(),
+        ));
+        t.push((
+            format!("{stem}.weight_scale_2"),
+            "F32",
+            vec![],
+            f32_bytes(&[global]),
+        ));
+        t.push((
+            format!("{stem}.input_scale"),
+            "F32",
+            vec![],
+            f32_bytes(&[0.5]),
+        ));
         // The down projection carries an AWQ pre-quant scale.
         let pqs: Option<Vec<f32>> = (*n == "mlp.down_proj")
             .then(|| (0..cols).map(|j| 0.75 + (j % 5) as f32 * 0.125).collect());
         if let Some(v) = &pqs {
-            t.push((format!("{stem}.pre_quant_scale"), "F32", vec![cols], f32_bytes(v)));
+            t.push((
+                format!("{stem}.pre_quant_scale"),
+                "F32",
+                vec![cols],
+                f32_bytes(v),
+            ));
         }
         let mut w = vec![0f32; rows * cols];
         for r in 0..rows {
@@ -710,8 +892,18 @@ fn nvfp4_checkpoint_converts_to_every_profile_with_the_formula_values() {
         }
         expect.insert(format!("{stem}.weight"), w);
     }
-    t.push((format!("{p}.self_attn.k_proj.k_scale"), "F32", vec![], f32_bytes(&[1.0])));
-    t.push((format!("{p}.self_attn.v_proj.v_scale"), "F32", vec![], f32_bytes(&[1.0])));
+    t.push((
+        format!("{p}.self_attn.k_proj.k_scale"),
+        "F32",
+        vec![],
+        f32_bytes(&[1.0]),
+    ));
+    t.push((
+        format!("{p}.self_attn.v_proj.v_scale"),
+        "F32",
+        vec![],
+        f32_bytes(&[1.0]),
+    ));
     fs::write(dir.join("model.safetensors"), raw_st(&t)).unwrap();
 
     let outs: Vec<(String, PathBuf)> = ["f16", "q4tp", "q2tp", "mxfp4"]
@@ -722,20 +914,32 @@ fn nvfp4_checkpoint_converts_to_every_profile_with_the_formula_values() {
         .iter()
         .map(|(q, p)| (q.clone(), p.to_str().unwrap().to_string()))
         .collect();
-    run_convert_multi(dir.to_str().unwrap(), &spec, None, None, None, false, |_| {}).unwrap();
+    run_convert_multi(
+        dir.to_str().unwrap(),
+        &spec,
+        None,
+        None,
+        None,
+        false,
+        |_| {},
+    )
+    .unwrap();
     for (q, path) in &outs {
         let m = CmfModel::open(path).unwrap();
         assert!(m.verify().is_empty(), "{q}: {:?}", m.verify());
         for e in &m.tensors {
             assert!(
-                !(e.name.ends_with("_scale") || e.name.ends_with("_scale_2")
+                !(e.name.ends_with("_scale")
+                    || e.name.ends_with("_scale_2")
                     || e.name.contains("pre_quant")),
                 "{q}: stray {}",
                 e.name
             );
         }
         for (name, want) in &expect {
-            let e = m.tensor(name).unwrap_or_else(|| panic!("{q}: {name} missing"));
+            let e = m
+                .tensor(name)
+                .unwrap_or_else(|| panic!("{q}: {name} missing"));
             let mut got = vec![0f32; want.len()];
             cortiq_core::quant::dequant_tensor(e, m.entry_bytes(e), &mut got).unwrap();
             match q.as_str() {
@@ -761,7 +965,11 @@ fn nvfp4_checkpoint_converts_to_every_profile_with_the_formula_values() {
                 }
                 _ => {
                     // q4tp / q2tp: the profile's codecs on the decoded values.
-                    let num: f64 = got.iter().zip(want).map(|(a, b)| ((a - b) as f64).powi(2)).sum();
+                    let num: f64 = got
+                        .iter()
+                        .zip(want)
+                        .map(|(a, b)| ((a - b) as f64).powi(2))
+                        .sum();
                     let den: f64 = want.iter().map(|b| (*b as f64).powi(2)).sum();
                     let tol = if q == "q4tp" { 0.05 } else { 0.5 };
                     assert!(num / den < tol, "{q} {name}: rel. error {}", num / den);
