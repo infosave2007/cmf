@@ -40,7 +40,7 @@
 //!   output in place (their payloads fit the old slots).
 
 use crate::convert::{Quant, fetch, open_safetensors, quantize_2d, to_f32, unpack_fp8_blocks, unpack_mxfp4};
-use crate::gptq::{CalibSource, Q2tpRule, calib_source_tokens, gemm_rows_square, gptq_fold_operator_par, gptq_quantize_q2tp, gptq_quantize_q2tp_dev, gptq_quantize_q4tp, gptq_quantize_q4tp_dev, q2tp_debias_gemm, q2tp_debias_rows, split_calib_budget};
+use crate::gptq::{CalibSource, Q2tpRule, calib_source_tokens, gptq_fold_operator_par, gptq_quantize_q2tp, gptq_quantize_q2tp_dev, gptq_quantize_q4tp, gptq_quantize_q4tp_dev, q2tp_debias_gemm, q2tp_debias_rows, split_calib_budget};
 use cortiq_core::format::{CmfModel, CmfStreamWriter};
 use cortiq_core::quant::{f16_to_f32, f32_to_f16};
 use cortiq_core::types::TensorDtype;
@@ -1920,13 +1920,12 @@ fn encode_expert_gpu(
             let mut gb = gptq_quantize_q2tp_dev(wg, inter, hidden, fid, &dead, &hdiag, threads).ok_or_else(|| anyhow::anyhow!("q2tp sweep"))?;
             let mut ub = gptq_quantize_q2tp_dev(wu, inter, hidden, fid, &dead, &hdiag, threads).ok_or_else(|| anyhow::anyhow!("q2tp sweep"))?;
             gpu::gptq_fold_free(fid);
-            // debias: H·w for every gate/up row from two GEMMs W·H
+            // debias: H·w for every gate/up row, one device GEMM [W_g; W_u]·H
             let h32: Vec<f32> = hgu.iter().map(|&v| v as f32).collect();
             drop(hgu);
-            let hwg = gemm_rows_square(wg, inter, hidden, &h32, threads);
+            let (hwg, hwu) = debias_products_dev(wg, wu, inter, hidden, &h32);
+            drop(h32);
             q2tp_debias_rows(&mut gb, wg, inter, hidden, &hwg, threads);
-            drop(hwg);
-            let hwu = gemm_rows_square(wu, inter, hidden, &h32, threads);
             q2tp_debias_rows(&mut ub, wu, inter, hidden, &hwu, threads);
             (gb, ub)
         }
@@ -1947,6 +1946,27 @@ fn encode_expert_gpu(
     gpu::gptq_fold_free(fd);
     tim[4] += ts.elapsed().as_secs_f64();
     Ok([gb, ub, db])
+}
+
+/// `W_g·H` and `W_u·H` (`inter × hidden` each, `h32` the `hidden²` gate/up
+/// Hessian) for the q2tp debias, as one device GEMM `[W_g; W_u]·H` in exact
+/// f32 FMA (the NVG encoder's GEMM; never the matrix units, whose operands
+/// are f16/tf32 class) — the product the host path computes with an f32
+/// GEMM too (`gemm_rows_square`), 2·inter·hidden² multiply-adds that cost
+/// the host most of the q2tp gate/up stage.
+pub(crate) fn debias_products_dev(wg: &[f32], wu: &[f32], inter: usize, hidden: usize, h32: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    use cortiq_engine::gpu_wgpu::nvg_dev::{DMat, gemm};
+    let mut w = Vec::with_capacity(2 * inter * hidden);
+    w.extend_from_slice(&wg[..inter * hidden]);
+    w.extend_from_slice(&wu[..inter * hidden]);
+    let a = DMat::from_f32(2 * inter, hidden, &w);
+    drop(w);
+    let h = DMat::from_f32(hidden, hidden, &h32[..hidden * hidden]);
+    let c = DMat::zeros(2 * inter, hidden);
+    gemm(1.0, &a, false, &h, false, 0.0, &c);
+    let mut hwg = c.to_f32();
+    let hwu = hwg.split_off(inter * hidden);
+    (hwg, hwu)
 }
 
 /// [`encode_expert`] on the host: f64 Hessians from f32 chunk grams, the
@@ -2696,6 +2716,95 @@ mod tests {
         // the per-row weights must match the rows
         let ec = EncodeCfg { codec: Codec::Q4tp, limit, lambda: 0.01, threads: 3 };
         assert!(encode_expert(Engine::Host, &mut None, hidden, inter, &x, &rows, Some(&rw[1..]), &w, &ec, None, &mut [0.0; 5]).is_err());
+    }
+
+    /// The q2tp debias product `[W_g; W_u]·H` on the device against the
+    /// host's f32 GEMM, at the V4.1 expert geometry (2304 × 5120, a Hessian
+    /// of 512 correlated rows plus damping): relative error of the product,
+    /// how many debiased q2tp rows come out different, and the speed of
+    /// both. Opt-in (`CMF_MOE_GPU_TEST=1`; on macOS also `CMF_GPU=wgpu`);
+    /// needs a wgpu device but not the matrix units, so it runs on the M4.
+    #[test]
+    fn gpu_debias_product_matches_host() {
+        if std::env::var("CMF_MOE_GPU_TEST").ok().as_deref() != Some("1") {
+            eprintln!("CMF_MOE_GPU_TEST unset — skipped");
+            return;
+        }
+        assert!(to::dev().is_some(), "CMF_MOE_GPU_TEST=1 but no wgpu device (on macOS set CMF_GPU=wgpu)");
+        let (inter, hidden, n) = (2304usize, 5120usize, 512usize);
+        let threads = std::thread::available_parallelism().map_or(4, |v| v.get());
+        let mut rng = Rng(43);
+        let wg = weights(&mut rng, inter, hidden, 0.02);
+        let wu = weights(&mut rng, inter, hidden, 0.02);
+        let rank = 64;
+        let basis: Vec<f32> = (0..rank * hidden).map(|_| rng.normal()).collect();
+        let z: Vec<f32> = (0..n * rank).map(|_| rng.normal()).collect();
+        let mut x = gemm_nt(&z, n, rank, &transpose(&basis, rank, hidden), hidden, threads);
+        x.iter_mut().for_each(|v| *v += 0.1 * rng.normal());
+        let mut h = vec![0f64; hidden * hidden];
+        gram_add_host(&mut h, &x, n, hidden, 1.0, threads);
+        let mean_d = (0..hidden).map(|i| h[i * hidden + i]).sum::<f64>() / hidden as f64;
+        for i in 0..hidden {
+            h[i * hidden + i] += 0.01 * mean_d;
+        }
+        let h32: Vec<f32> = h.iter().map(|&v| v as f32).collect();
+        let flop = 2.0 * 2.0 * inter as f64 * hidden as f64 * hidden as f64;
+        let _ = debias_products_dev(&wg[..32 * hidden], &wu[..32 * hidden], 32, hidden, &h32); // warm the pipeline
+        let t = Instant::now();
+        let (dg, du) = debias_products_dev(&wg, &wu, inter, hidden, &h32);
+        let t_dev = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let hg = crate::gptq::gemm_rows_square(&wg, inter, hidden, &h32, threads);
+        let hu = crate::gptq::gemm_rows_square(&wu, inter, hidden, &h32, threads);
+        let t_host = t.elapsed().as_secs_f64();
+        eprintln!(
+            "[W_g; W_u]·H ({inter}×{hidden}·{hidden}²): device {t_dev:.3}s = {:.0} GFLOP/s, host f32 GEMM on {threads} threads {t_host:.3}s = {:.0} GFLOP/s",
+            flop / t_dev / 1e9,
+            flop / t_host / 1e9
+        );
+        let rel = |a: &[f32], b: &[f32]| -> f64 {
+            let num: f64 = a.iter().zip(b).map(|(&x, &y)| ((x - y) as f64).powi(2)).sum();
+            (num / b.iter().map(|&y| (y as f64).powi(2)).sum::<f64>()).sqrt()
+        };
+        let (eg, eu) = (rel(&dg, &hg), rel(&du, &hu));
+        // both against f64 on sampled entries (on the M4 the device kernel's
+        // in-order FMA chain can match Accelerate's AMX bit for bit)
+        let mut worst = 0f64;
+        for _ in 0..64 {
+            let (r, c) = ((rng.next() % inter as u64) as usize, (rng.next() % hidden as u64) as usize);
+            let want: f64 = (0..hidden).map(|k| wg[r * hidden + k] as f64 * h32[k * hidden + c] as f64).sum();
+            let scale: f64 = (0..hidden).map(|k| (wg[r * hidden + k] as f64 * h32[k * hidden + c] as f64).abs()).sum();
+            worst = worst.max((dg[r * hidden + c] as f64 - want).abs() / scale.max(1e-30));
+        }
+        eprintln!("device product against f64 on 64 sampled entries: worst error {worst:.2e} of Σ|terms|");
+        assert!(worst < 1e-5, "device product off against f64: {worst:e}");
+        assert!(dg.iter().any(|&v| v != 0.0));
+        // the debias reads H·w only through two dot products per row (its
+        // f16 row parameters): count the rows the device product changes
+        let mut changed = 0usize;
+        for (w, d, hh) in [(&wg, &dg, &hg), (&wu, &du, &hu)] {
+            let base = quantize_2d(Quant::Q2TiledP, w, inter, hidden).1;
+            let (mut a, mut b) = (base.clone(), base);
+            q2tp_debias_rows(&mut a, w, inter, hidden, d, threads);
+            q2tp_debias_rows(&mut b, w, inter, hidden, hh, threads);
+            let (po, _, _) = cortiq_core::quant::q2tp_sections(inter, hidden);
+            assert_eq!(a[..po], b[..po], "the debias touches only the row parameters");
+            changed += (0..inter).filter(|&r| a[po + r * 4..po + r * 4 + 4] != b[po + r * 4..po + r * 4 + 4]).count();
+        }
+        eprintln!("device vs host product: relative error gate {eg:.2e}, up {eu:.2e}; debiased q2tp rows that differ: {changed} of {}", 2 * inter);
+        assert!(eg < 1e-5 && eu < 1e-5, "device product off: {eg:e} / {eu:e}");
+        assert!(changed * 100 <= 2 * inter, "{changed} of {} debiased rows differ", 2 * inter);
+    }
+
+    /// Row-major transpose of a `rows × cols` matrix.
+    fn transpose(a: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+        let mut t = vec![0f32; rows * cols];
+        for r in 0..rows {
+            for c in 0..cols {
+                t[c * rows + r] = a[r * cols + c];
+            }
+        }
+        t
     }
 
     /// The device encode against the host reference (the lead runs it on a
