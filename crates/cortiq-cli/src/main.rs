@@ -995,8 +995,10 @@ enum Commands {
         /// Hysteresis of the bit against the latent (0 = sign of the latent)
         #[arg(long, default_value = "0")]
         sign_hyst: f64,
-        /// Halve the sign rate when the per-step flip rate exceeds this 3 steps running
-        #[arg(long, default_value = "5e-4")]
+        /// Halve the sign rate when the per-step flip rate exceeds this 3
+        /// steps running (a runaway guard: at the auto rate the latents near
+        /// zero alone flip ~0.3 % per step on a 256-step run)
+        #[arg(long, default_value = "2e-2")]
         sign_max_step_flip: f64,
         /// Halve the sign rate when this fraction of the signs has flipped
         #[arg(long, default_value = "0.15")]
@@ -1008,6 +1010,17 @@ enum Commands {
         /// every data argument match)
         #[arg(long)]
         topk_cache: Option<String>,
+        /// Directory for the resumable training state (metric + Adam moments,
+        /// bits, sign latents and statistics, best snapshot, counters); use
+        /// local disk, a 27B state is tens of GB
+        #[arg(long)]
+        sign_state: Option<String>,
+        /// Steps between state saves
+        #[arg(long, default_value = "500")]
+        sign_state_every: usize,
+        /// Resume from the latest state in this directory (same arguments)
+        #[arg(long)]
+        resume: Option<String>,
     },
     /// One tensor through the NVG `blr` encoder with a per-stage profile, on
     /// the CPU reference path and/or the device path, from Grams captured
@@ -3561,6 +3574,9 @@ async fn main() -> anyhow::Result<()> {
             sign_max_total_flip,
             sign_seed,
             topk_cache,
+            sign_state,
+            sign_state_every,
+            resume,
         } => {
             let signs = if train_signs {
                 let opt = cortiq_engine::gpu_wgpu::train_sign::SignOpt::parse(&sign_opt).ok_or_else(|| anyhow::anyhow!("--sign-opt: fact | fact-mom | ref"))?;
@@ -3599,6 +3615,9 @@ async fn main() -> anyhow::Result<()> {
                 output: &output,
                 signs,
                 topk_cache: topk_cache.as_deref(),
+                state_dir: sign_state.as_deref(),
+                state_every: sign_state_every,
+                resume: resume.as_deref(),
             })
         }
         #[cfg(not(feature = "gpu"))]

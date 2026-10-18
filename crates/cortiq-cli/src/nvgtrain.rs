@@ -58,6 +58,11 @@ pub struct NvgTrainOpts<'a> {
     pub output: &'a str,
     pub signs: Option<SignOpts>,
     pub topk_cache: Option<&'a str>,
+    /// Directory for the resumable state (written every `state_every` steps).
+    pub state_dir: Option<&'a str>,
+    pub state_every: usize,
+    /// Resume from the latest state in this directory.
+    pub resume: Option<&'a str>,
 }
 
 const TOPK_MAGIC: &[u8; 8] = b"NVGTOPK1";
@@ -245,7 +250,23 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
         }
         Ok(s / n_eval_b.max(1) as f64)
     };
-    let e0 = eval_loss(&snet)?;
+    // resumed run: the state's metric, Adam moments, bits and sign state, the
+    // best snapshot, and the loop counters (meta.json)
+    let meta: Option<serde_json::Value> = match o.resume {
+        Some(dir) => {
+            let m: serde_json::Value = serde_json::from_slice(&std::fs::read(format!("{dir}/meta.json"))?)?;
+            nt::load_state(c, &snet, std::path::Path::new(&format!("{dir}/{}", m["state"].as_str().unwrap_or("")))).map_err(|e| anyhow::anyhow!(e))?;
+            eprintln!("resumed {dir} at step {} (epoch {}, batch {} of the epoch)", m["done"], m["epoch"], m["consumed"]);
+            Some(m)
+        }
+        None => None,
+    };
+    let mu = |k: &str| meta.as_ref().and_then(|m| m[k].as_u64()).unwrap_or(0);
+    let mf = |k: &str, d: f64| meta.as_ref().and_then(|m| m[k].as_f64()).unwrap_or(d);
+    let e0 = match &meta {
+        Some(m) => m["e0"].as_f64().unwrap_or(f64::NAN),
+        None => eval_loss(&snet)?,
+    };
     eprintln!("held-out KL before training: {e0:.5}");
     let warm = (total_steps / 50).max(1);
     let shape = |d: usize| -> f64 {
@@ -257,23 +278,38 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
         }
     };
     let mut best = (e0, nt::snapshot(c, &snet, train_signs).ok_or_else(|| anyhow::anyhow!("snapshot"))?, 0usize);
-    let mut gscale = 4096f32;
-    let mut done = 0usize;
-    let mut skipped = 0usize;
-    let mut sign_steps = 0u32;
-    let mut eta_mul = 1.0f64;
-    let (mut hi_streak, mut bad_evals) = (0usize, 0usize);
-    let (mut step_flips_total, mut sat_total, mut clamp_total) = (0u64, 0u64, 0u64);
+    if let (Some(m), Some(dir)) = (&meta, o.resume) {
+        let snap = nt::load_snap(&best.1, std::path::Path::new(&format!("{dir}/{}", m["best"].as_str().unwrap_or("")))).map_err(|e| anyhow::anyhow!(e))?;
+        best = (m["best_kl"].as_f64().unwrap_or(e0), snap, m["best_step"].as_u64().unwrap_or(0) as usize);
+    }
+    let mut gscale = mf("gscale", 4096.0) as f32;
+    let mut done = mu("done") as usize;
+    let mut skipped = mu("skipped") as usize;
+    let mut sign_steps = mu("sign_steps") as u32;
+    let mut eta_mul = mf("eta_mul", 1.0);
+    let (mut hi_streak, mut bad_evals) = (mu("hi_streak") as usize, mu("bad_evals") as usize);
+    let (mut step_flips_total, mut sat_total, mut clamp_total) = (mu("step_flips_total"), mu("sat_total"), mu("clamp_total"));
     let mut last_distinct = 0u64;
     let mut step_secs = 0f64;
-    let mut eval_log: Vec<serde_json::Value> = Vec::new();
+    let done0 = done;
+    let mut eval_log: Vec<serde_json::Value> = meta.as_ref().and_then(|m| m["evals"].as_array().cloned()).unwrap_or_default();
+    let (resume_ep, resume_pos) = (mu("epoch") as usize, mu("consumed") as usize);
+    // probe runs: stop after this many steps (the schedule still spans the full run)
+    let stop_after: usize = std::env::var("CMF_NVG_STOP_AFTER").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
     let ts0 = Instant::now();
     let mut order: Vec<usize> = (0..n_train_b).collect();
     for ep in 0..o.epochs {
         for i in (1..order.len()).rev() {
             order.swap(i, (next() % (i as u64 + 1)) as usize);
         }
-        for &b in &order {
+        if meta.is_some() && ep < resume_ep {
+            continue;
+        }
+        let first = if meta.is_some() && ep == resume_ep { resume_pos } else { 0 };
+        for (pos, &b) in order.iter().enumerate().skip(first) {
+            if done >= stop_after {
+                break;
+            }
             let tstep = Instant::now();
             let cfg = o.signs.as_ref().map(|s| {
                 let sn = sign_steps + 1;
@@ -333,7 +369,7 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
                 st.loss,
                 gn,
                 lr,
-                step_secs / done as f64
+                step_secs / (done - done0).max(1) as f64
             );
             if done % o.eval_every == 0 || done == total_steps {
                 let e = eval_loss(&snet)?;
@@ -375,6 +411,37 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
                     best = (e, nt::snapshot(c, &snet, train_signs).ok_or_else(|| anyhow::anyhow!("snapshot"))?, done);
                 }
             }
+            if let Some(dir) = o.state_dir
+                && o.state_every > 0
+                && done % o.state_every == 0
+                && done < total_steps
+            {
+                let ws = Instant::now();
+                std::fs::create_dir_all(dir)?;
+                let (sf, bf) = (format!("state-{done}.bin"), format!("best-{done}.bin"));
+                let nb = nt::save_state(c, &snet, std::path::Path::new(&format!("{dir}/{sf}"))).map_err(|e| anyhow::anyhow!(e))?;
+                nt::save_snap(&best.1, std::path::Path::new(&format!("{dir}/{bf}"))).map_err(|e| anyhow::anyhow!(e))?;
+                let m = serde_json::json!({
+                    "state": sf, "best": bf, "done": done, "epoch": ep, "consumed": pos + 1, "skipped": skipped,
+                    "sign_steps": sign_steps, "gscale": gscale, "eta_mul": eta_mul, "hi_streak": hi_streak, "bad_evals": bad_evals,
+                    "step_flips_total": step_flips_total, "sat_total": sat_total, "clamp_total": clamp_total,
+                    "best_kl": best.0, "best_step": best.2, "e0": e0, "evals": eval_log.clone(),
+                });
+                let tmp = format!("{dir}/meta.json.tmp");
+                std::fs::write(&tmp, serde_json::to_vec_pretty(&m)?)?;
+                let old: Option<serde_json::Value> = std::fs::read(format!("{dir}/meta.json")).ok().and_then(|b| serde_json::from_slice(&b).ok());
+                std::fs::rename(&tmp, format!("{dir}/meta.json"))?;
+                if let Some(old) = old {
+                    for key in ["state", "best"] {
+                        if let Some(f) = old[key].as_str()
+                            && f != m[key].as_str().unwrap_or("")
+                        {
+                            let _ = std::fs::remove_file(format!("{dir}/{f}"));
+                        }
+                    }
+                }
+                eprintln!("\n  state saved: {dir}/{sf} ({:.2} GB, {:.0} s)", nb as f64 / 1e9, ws.elapsed().as_secs_f64());
+            }
         }
     }
     let train_secs = ts0.elapsed().as_secs_f64();
@@ -382,7 +449,7 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
         "\nbest held-out KL {:.5} at step {} (start {e0:.5}); {skipped} non-finite steps skipped; {:.2} s/step over {done} steps ({:.0} s training incl. evals)",
         best.0,
         best.2,
-        step_secs / done.max(1) as f64,
+        step_secs / (done - done0).max(1) as f64,
         train_secs
     );
     nt::restore(c, &snet, &best.1);
