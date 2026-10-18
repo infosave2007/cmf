@@ -58,8 +58,12 @@ fn vec_dev(v: &[f64]) -> DMat {
     DMat::from_f64(1, v.len(), v)
 }
 
-/// f32 flip tolerance (relative; the f64 host path uses 1e-12).
-const FLIP_TOL: f32 = 1e-6;
+/// f32 flip tolerance, relative (the f64 host path uses 1e-12;
+/// `CMF_NVG_FLIP_TOL` overrides). 1e-7 sits at the f32 resolution: 1e-6
+/// stopped the discrete search early enough to cost ~2 % ppl end to end on
+/// Qwen3.5-0.8B at 1.0 bpw (686.5 vs 672.5; host reference 656.4).
+static FLIP_TOL_V: std::sync::LazyLock<f32> =
+    std::sync::LazyLock::new(|| std::env::var("CMF_NVG_FLIP_TOL").ok().and_then(|v| v.parse().ok()).unwrap_or(1e-7));
 
 // ───────────────────────────── per-input context ─────────────────────────────
 
@@ -71,6 +75,7 @@ pub struct HCtxD {
     pub hsel: DMat,
     pub c_fit: f64,
     pub sqd: Vec<f64>,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub perm: Vec<usize>,
     perm_buf: cortiq_engine::wgpu::Buffer,
     pub uc: DMat,
@@ -630,7 +635,7 @@ fn flip_u_d(md: &mut ModelD, c: &TCtxD, pi: usize) -> u64 {
         let ld = &md.paths[pi].l;
         dv::scale_into(&k, &qm, Some(ld), Some(ld), 0, 1.0);
         let qs = dv::mm(&md.paths[pi].su, false, &qm, false);
-        if let Some(n) = dv::flipu_blocked(&md.paths[pi].su, &qs, &whb, &qm, &md.paths[pi].h, ld, m, r, FLIP_TOL) {
+        if let Some(n) = dv::flipu_blocked(&md.paths[pi].su, &qs, &whb, &qm, &md.paths[pi].h, ld, m, r, *FLIP_TOL_V) {
             return n;
         }
     }
@@ -647,7 +652,7 @@ fn flip_u_d(md: &mut ModelD, c: &TCtxD, pi: usize) -> u64 {
     dv::scale_into(&k, &q, Some(ld), Some(ld), 0, 1.0);
     let qst = dv::mm(&q, false, &md.paths[pi].su, true);
     let sut = dv::transpose(&md.paths[pi].su);
-    let flips = dv::flipu(&sut, &qst, &whbt, &q, &md.paths[pi].h, ld, m, r, FLIP_TOL);
+    let flips = dv::flipu(&sut, &qst, &whbt, &q, &md.paths[pi].h, ld, m, r, *FLIP_TOL_V);
     md.paths[pi].su = dv::transpose(&sut);
     flips
 }
@@ -677,7 +682,7 @@ fn gptq_v_d(md: &mut ModelD, c: &TCtxD, pi: usize) -> u64 {
     let mut b0 = 0;
     while b0 < n {
         let b1 = (b0 + 128).min(n);
-        dv::gv_block(&bv, &s, &ks0, &k, &c.hc.uc, &eg, &cnt, b0, b1, 4 * r, FLIP_TOL);
+        dv::gv_block(&bv, &s, &ks0, &k, &c.hc.uc, &eg, &cnt, b0, b1, 4 * r, *FLIP_TOL_V);
         b0 = b1;
     }
     dv::permute_rows(&s, &md.paths[pi].sv, &c.hc.perm_buf, true);

@@ -17,7 +17,9 @@ baseline is the NVG method.
 | codec: header, validation, packing, reference dequant | `crates/cortiq-core/src/blr.rs`, `types.rs` (`TensorDtype::BinaryLowRank`), `quant.rs` |
 | CPU kernels (table matvec, GEMM matmat) | `crates/cortiq-engine/src/blr.rs`, `QTensor::Blr` in `qtensor.rs` |
 | wgpu kernels | `crates/cortiq-engine/src/gpu_wgpu/blr.rs`, `gpu::blr_matmat` |
-| encoders, `convert --quant blr` | `crates/cortiq-cli/src/nvg.rs`, `nvg_linalg.rs` |
+| encoders, `convert --quant blr` | `crates/cortiq-cli/src/nvg.rs`, `nvg_linalg.rs` (CPU f64 reference) |
+| NVG encoder on the device | `crates/cortiq-cli/src/nvg_gpu.rs` over `crates/cortiq-engine/src/gpu_wgpu/nvg_dev.rs` |
+| per-tensor / per-layer bench | `crates/cortiq-cli/src/nvgbench.rs` (`cortiq nvg-bench`) |
 
 ## 1. Bits and rank
 
@@ -88,8 +90,9 @@ Per token and path: `z = x ⊙ g_p`; stage V `t_p[k] = ℓ_p[k]·Σ_j V_p(k,j) z
 
 ## 4. Encoders
 
-Both run per tensor in f64 on the CPU (`nvg_linalg.rs`: parallel GEMM, blocked
-Cholesky, triangular inverse, symmetric eigensolver, polar factor). Scales are
+`dual-svid` and the reference `nvg` run per tensor in f64 on the CPU (`nvg_linalg.rs`:
+parallel GEMM, blocked Cholesky, triangular inverse, symmetric eigensolver, polar
+factor); `nvg` also runs on the wgpu device in f32 (§4.1, `--blr-device`). Scales are
 rebalanced before f16 rounding (`h/rms h`, `g/rms g`, magnitude into `ℓ`); a tensor
 whose scales do not fit f16 stays `q8_2f`.
 
@@ -119,8 +122,57 @@ from calibration inputs `X` of that layer:
 Calibration is sequential: layer `l` is fitted on activations the engine produces with
 layers `< l` already `blr` (the not-yet-encoded layers run as `q8_2f`). Inputs are shared
 per Gram: q/k/v (attention), gate/up (FFN), in_proj_qkv/in_proj_z (GDN), and o, down,
-out_proj each on their own. The capture uses the engine's GPTQ hook in the CPU batched
-prefill (the converter sets `CMF_GPU=0` for `nvg`).
+out_proj each on their own. The capture uses the engine's GPTQ hook: with
+`--blr-device cpu` in the CPU batched prefill of the scored forward (the converter sets
+`CMF_GPU=0`); with `--blr-device gpu` as quantize-gptq does — per-op device GEMMs
+(`CMF_GPU_WGPU_GRAPH=0`), the already-encoded `blr` layers through the wgpu `blr`
+kernels, the Grams accumulated on the device, and only layers `0..=l` run
+(`calib_forward`) from a work file cut after layer `l` (bit-identical Grams; the same
+positions as the scored forward, i.e. a window's last token is not fed).
+
+### 4.1 The NVG encoder on the device (`--blr-device gpu`, f32)
+
+Stage for stage the CPU encoder; what changes is where and how each stage runs.
+
+* *Per input*: `H` (damped), the held-out Gram, act order and `Uc` (the upper Cholesky
+  factor of the permuted `H⁻¹`: equilibrated f32 Cholesky + blocked inverse), and the
+  lower factor `L` when a tensor reading the input has `m > n`.
+* *f32 GEMM*: 128×128×16 tiles, register prefetch, 8×8 outputs per thread, any operand
+  transposed or a sub-matrix view, α/β, a Hadamard epilogue, lower-tiles-only mode;
+  19–30 TFLOP/s on the RTX PRO 6000. Never the matrix units (their operands are f16/tf32).
+* *SPD solves* (ℓ jointly, g per path): Jacobi equilibration and the ridge on the device,
+  blocked Cholesky (128-wide diagonal blocks factored and inverted in workgroup memory,
+  panel and lower-tile trailing update through the GEMM; n = 17408 in ~0.26 s), blocked
+  triangular solves; one readback per factorisation (its pivot flag) — the ridge grows
+  ×100 on a failed pivot as on the host. `CMF_NVG_HOST_SOLVE=1` solves ℓ on the host in f64.
+* *Latents*: the min(m, n)-sized Gram on the device; its r largest eigenpairs by
+  Householder tridiagonalisation on the device, bisection + inverse iteration of the
+  tridiagonal on the host in f64, and a compact-WY back-transform on the device
+  (`CMF_NVG_HOST_EIG=1`: the host `sym_eig`). Eigenvector signs may differ from the host
+  solver's; ITQ and the model are invariant to them.
+* *ITQ*: device GEMMs and a Newton–Schulz polar factor (Frobenius scaling on the device,
+  ~16 steps on real cross terms) instead of the host's r×r eigendecomposition.
+* *Ť*: the ℓ/h/g block least squares from device GEMMs; `H·gs_p` and `WH·gs_p` cached per
+  path and recomputed only when that path's g or V-signs change; h, ℓ, g stay on the
+  device (per-row 2×2 h solve as a kernel).
+* *Output-side knots*: blocks of 32 bits — one thread per row decides the block's bits in
+  order with the block's qs entries in registers (the 32×32 corner of `Q` in workgroup
+  memory) and records the flips; the rest of every row's qs moves with one GEMM
+  `qs −= F·Q[block, :]`. The decisions are the host's sequential pass.
+* *Input-side knots*: the column-sequential search carried in the latent space: `Mᵀw_j`
+  for every column is one GEMM up front, and a column's error reaches the others as
+  `Mᵀe_j = (Mᵀw_j − g_j K s_j)/Uc[j,j]` (no m-length vector in the sequential part); a
+  128-column block runs in one 512-thread workgroup (lanes unrolled in registers, argmin
+  and dot products by subgroup operations, two barriers per flip), the trailing feedback
+  `BV[b1:] −= Uc[b0:b1, b1:]ᵀ·E` is a GEMM.
+* *Errors* `tr(E X Eᵀ)` (X = H, the raw fit Gram, the held-out Gram) from the factor-sized
+  expansion `tr(WXWᵀ) − 2Σ⟨hsl_p, WX·gs_p⟩ + Σ⟨hsl_pᵀhsl_q, gs_pᵀX gs_q⟩`, read back at once.
+* Flip tolerances are 1e-7 relative in f32 and the column scale converges to 1e-8
+  between flip rounds (1e-12 / 1e-9 in f64 on the host; `CMF_NVG_FLIP_TOL`,
+  `CMF_NVG_GJ_TOL`). 1e-6 / 1e-6 stopped the search early enough to cost ~2 % ppl end to
+  end on the 0.8B (686.5 vs 672.5).
+* A layer's tensors run `CMF_NVG_JOBS` (default 3) at a time; `CMF_NVG_PROF=1` prints a
+  per-stage profile per tensor (with one job: the stage timers synchronise the device).
 
 Covered tensors: `model.layers.{l}.self_attn.{q,k,v,o}_proj`, `mlp.{gate,up,down}_proj`,
 `linear_attn.{in_proj_qkv,in_proj_z,out_proj}` with `d_in % 32 == 0`, `d_out % 16 == 0`.
@@ -132,9 +184,18 @@ MoE experts are not covered (they stay `q8_2f`); GDN `in_proj_a/b` stay f16.
 cortiq convert --model <hf dir> --quant blr --output m.cmf --bpw 1.0 \
     --blr-method nvg --calib calib.txt [--blr-paths auto|1|2] [--blr-kv-factor 1] \
     [--blr-fit-tokens 14848] [--blr-sel-tokens 3072] [--blr-rho 0.03] \
-    [--blr-threads N] [--blr-keep-src]
+    [--blr-threads N] [--blr-keep-src] [--blr-device auto|cpu|gpu]
 cortiq convert --model <hf dir> --quant blr --output m.cmf --bpw 1.0 --blr-method dual-svid
+cortiq nvg-bench --model m.cmf --tensor NAME | --layer L [--jobs J] --bpw 0.55 \
+    --device cpu|gpu|both --gram-cache PREFIX --calib calib.txt
 ```
+
+`--blr-device auto` (default) encodes on the device when a wgpu adapter is up (not on
+macOS, whose Metal chunk graph runs layer spans out of the capture hook's sight).
+`nvg-bench` captures the FIT/SEL Grams of one tensor's (or one layer's) inputs through
+layers `0..=l` of the given model once, caches them as f32 files, and encodes from them
+with a per-stage profile; `--device both` adds the CPU encoder on the same Grams and
+prints the per-tensor comparison.
 
 The converter first writes an f16 source `<output>.src-f16.cmf` (reused if present,
 deleted afterwards unless `--blr-keep-src`), prints per-tensor rank, path choice and
@@ -147,9 +208,13 @@ and the calibration parameters under `provenance.blr`.
 cargo test --release -p cortiq-core blr                       # rank rule, round trip, validation, generic entry points
 cargo test --release -p cortiq-engine --features gpu --lib blr   # CPU kernels vs dense, QTensor paths from a CMF, wgpu vs CPU
 cargo test --release -p cortiq-cli --bin cortiq -- nvg convert_blr   # monotone ALS/refine, V-search factor, drivers, coverage, CLI parse
+cargo test --release -p cortiq-engine --features gpu --lib nvg_dev   # GEMM variants, SPD solve + Uc, top-r eigenpairs vs a known spectrum
+cargo test --release -p cortiq-cli --bin cortiq -- nvg_gpu            # device vs host per stage: contexts/errors, latents/ITQ/polar,
+                                                                      # one ALS sweep, flip_u, gptq_v, the whole-tensor driver
+cargo test --release -p cortiq-engine --features gpu --lib nvg_dev -- --ignored --nocapture   # GEMM/Cholesky/flip-rate throughput
 ```
 
-The wgpu parity test skips when no adapter is present.
+The wgpu tests skip when no adapter is present.
 
 ## 7. Measured (Qwen3.5-0.8B, 17.10.2026)
 
@@ -170,3 +235,45 @@ path runs. `CMF_BLR_DENSE=1` (dense f32 at load) gives 2 719 569 for the dual-sv
 equal to the factored kernels. The file is mostly the q8_2f embedding (248 320 × 1024)
 and the q8_2f MTP head; the 497 M projection weights take 61.4 MB. Encoding time: dual-svid
 7.4 min, NVG 2 h (f64 CPU, sequential calibration ~1.5 min per layer, ~4 min of encoding).
+
+### 7.1 The device encoder (18.10.2026)
+
+Same card; the CPU side has a 27-core quota. Most device runs shared the card with
+another process (NVIDIA time-slices two processes), so device timings are upper bounds.
+
+Per tensor on identical Grams (q8_2f calibration of layers 3 and 17 of the 0.8B, 13
+tensors at 1.0 bpw): held-out error within ±0.43 % and fit error within ±0.76 % of the
+host encoder (the GPU marginally lower on average). Qwen3.8-27B L0 `gate_proj` at
+0.55 bpw: held-out 0.3758 against the host's 0.3759 in 39 s against 2254 s.
+
+Whole 0.8B at 1.0 bpw (sequential calibration, `ppl --windows 16 --window-len 512`):
+
+| encoder | ρ = 0.03 | ρ = 0.0301 | convert |
+|---|---|---|---|
+| host f64 (`--blr-device cpu`) | 656.37 | 682.16 | 7143 s / 7114 s |
+| device, flip tolerance 1e-6 | 686.52 | 710.88 | 1307 s (shared card) |
+| device, flip tolerance 1e-7 (default) | 672.52 | 715.80 | 758 s |
+
+The host reference itself moves 3.9 % for a 0.3 % change of ρ: at this compression the
+end-to-end perplexity is sensitive to any perturbation of the sequential chain, and
+per-tensor errors of two host runs agree within 1 % for only 53 of 150 tensors. Over the
+four matched device runs the device sits ~4 % above the host on average (672.5–715.8
+against 656.4–682.2); whether that offset comes from the f32 encoder or from the chain's
+sensitivity alone is not settled (the run with device calibration and the host encoder
+was stopped before the end).
+
+Qwen3.8-27B at 0.55 bpw, one layer encoded on the device from its cached Grams (card
+mostly free):
+
+| layer | tensors (encode seconds, one at a time) | layer encode |
+|---|---|---|
+| 0 (GDN) | down 76.9, gate 23.6, up 23.6, in_proj_qkv 20.0, in_proj_z 17.8, out_proj 14.5 | 176 s (162 s with 3 in flight) |
+| 3 (attention) | down 74.5, gate 21.4, up 21.2, q 17.5, o 17.0, k 6.2, v 6.0 | 164 s (155 s with 3 in flight) |
+
+Plus ~3–4.5 s per layer for the input contexts (the 17408-wide `down_proj` input
+dominates) and the calibration pass. Where the time goes (layer 0, one at a time): the
+column-sequential V search 45 % (34.3 M flips on `down_proj` alone, ~1.3 µs each on one
+multiprocessor), the g solves 23 % (n = 17408 Cholesky per g step for `down_proj`), the
+eigensolver 9 %, the polar factor 7 %. Tensors in flight overlap little: a Vulkan queue
+orders every barrier after all earlier work, so the one-multiprocessor column search of
+one tensor holds back the others.
