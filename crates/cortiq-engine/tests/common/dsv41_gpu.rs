@@ -23,28 +23,22 @@ pub const GPU_WORST: f64 = 0.12;
 pub const GPU_ATTN_CALLS: u64 = 48;
 pub const GPU_ATTN_FALLBACKS: u64 = 12;
 
-/// Select the wgpu backend for this process before anything initializes it,
-/// turn the V4.1 path counters on, and size the expert bank. Returns false
+/// Turn the V4.1 path counters on and size the expert bank before anything
+/// initializes the backend, then follow the repo's GPU-test convention
+/// (`gpu_wgpu::selected_and_up` / `skip_or_fail`, as the DSV4 parity tests):
+/// skip when nobody asked for wgpu, FAIL when `CMF_GPU=wgpu` was set and no
+/// context came up (a broken driver must not pass as a skip). Returns false
 /// (after saying why) when the binary should skip.
 ///
-/// On macOS the binary runs only when the caller exported `CMF_GPU=wgpu`,
-/// like the other wgpu runs there: `cargo test --workspace` on the CI's
-/// macOS VM would otherwise take its paravirtual Metal adapter, which is not
-/// a reference device (binding arrays, limits and Metal's own rounding
-/// differ). Elsewhere the binary selects wgpu itself and skips without an
-/// adapter (the ubuntu CI).
+/// Nobody asked means `CMF_GPU` unset or naming another backend: the CI
+/// runners (`cargo test --workspace`), i.e. ubuntu without an adapter and
+/// the macOS VM, whose paravirtual Metal adapter is not a reference device
+/// (binding arrays, limits and Metal's own rounding differ). The M4 and the
+/// pod run these binaries with `CMF_GPU=wgpu` exported.
 pub fn select_wgpu() -> bool {
     // SAFETY: the first call of the single test in each GPU binary, before
     // any backend or V4.1 code runs.
     unsafe {
-        if cfg!(target_os = "macos") {
-            if std::env::var("CMF_GPU").as_deref() != Ok("wgpu") {
-                eprintln!("skipped: run with CMF_GPU=wgpu on macOS");
-                return false;
-            }
-        } else {
-            std::env::set_var("CMF_GPU", "wgpu");
-        }
         std::env::set_var("CMF_DSV41_PROF", "1");
         // An adapter that reports no VRAM budget (Apple unified memory via
         // wgpu) sizes the V4.1 expert bank from u64::MAX: ~96 GiB of slots
@@ -56,11 +50,18 @@ pub fn select_wgpu() -> bool {
             std::env::set_var("CMF_GPU_VRAM_MB", "4096");
         }
     }
-    if !cortiq_engine::gpu_wgpu::enabled() {
-        eprintln!("skipped: no WGPU adapter");
-        return false;
+    match cortiq_engine::gpu_wgpu::selected_and_up() {
+        None => {
+            cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());
+            false
+        }
+        Some(false) => panic!(
+            "{}: CMF_GPU={} selects wgpu but no wgpu context came up",
+            module_path!(),
+            std::env::var("CMF_GPU").unwrap_or_default()
+        ),
+        Some(true) => true,
     }
-    true
 }
 
 pub struct GpuRun {

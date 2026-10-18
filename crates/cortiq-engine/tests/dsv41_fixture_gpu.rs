@@ -7,9 +7,9 @@
 //! dynamic MoE bank. A separate test binary because the GPU backend is
 //! process-global: `CMF_GPU` has to be set before it initializes, and a CPU
 //! comparison cannot be produced in the same process afterwards; the f64
-//! reference stands in for it. On macOS it runs only with `CMF_GPU=wgpu`
-//! exported (see `common/dsv41_gpu.rs`); elsewhere it skips without an
-//! adapter.
+//! reference stands in for it. It runs only with `CMF_GPU=wgpu` exported
+//! (skips otherwise, as the CI runners do) and fails when that is set and no
+//! wgpu context comes up (see `common/dsv41_gpu.rs`).
 //!
 //! A device path that refuses the fixture geometry falls back to the host
 //! silently and still passes a numeric check, so the test also asserts the
