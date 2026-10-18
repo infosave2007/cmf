@@ -956,6 +956,10 @@ pub(crate) fn parse_tensor_quant(spec: &str) -> anyhow::Result<(String, Quant)> 
         !matches!(quant, Quant::Q2TiledPAffine),
         "--tensor-quant '{spec}': q2tp_affine is a whole-file profile, not a per-tensor choice"
     );
+    anyhow::ensure!(
+        !matches!(quant, Quant::Fp4),
+        "--tensor-quant '{spec}': fp4 is a whole-file profile; the per-tensor codec is mxfp4"
+    );
     Ok((pat.to_string(), quant))
 }
 
@@ -1090,6 +1094,38 @@ pub(crate) enum Quant {
     /// checkpoint survive 1-bit.
     Q1s,
     Q1t,
+    /// OCP MX FP4 (`mxfp4` dtype 21): E2M1 codes + one E8M0 scale per 32
+    /// elements, 4.25 bits/weight. As a per-tensor codec (`--tensor-quant
+    /// PATTERN=mxfp4`) or a whole-file `--quant mxfp4`, float sources are
+    /// quantized by the OCP rule; an OCP MXFP4 source tensor (DeepSeek-V4/
+    /// V4.1 `I8` experts + `F8_E8M0` 1×32 scales) is re-packed byte for
+    /// byte instead.
+    Mxfp4,
+    /// `--quant fp4`: the native-FP4 MoE profile. Every routed and shared
+    /// expert matrix (gate/up/down) is `mxfp4` — byte-identical to an OCP
+    /// MXFP4 source, OCP-quantized from any other source so the expert bank
+    /// keeps one codec — and every other tensor gets exactly what the
+    /// `q4tp` profile gives it.
+    Fp4,
+}
+
+/// Whether `name` is a routed or shared expert's gate/up/down matrix — the
+/// tensors the `fp4` profile stores as `mxfp4`.
+pub(crate) fn fp4_expert_matrix(name: &str) -> bool {
+    let expert = name.contains(".experts.")
+        || name.contains(".shared_expert.")
+        || name.contains(".shared_experts.");
+    expert
+        && [
+            ".gate_proj.weight",
+            ".up_proj.weight",
+            ".down_proj.weight",
+            ".w1.weight",
+            ".w2.weight",
+            ".w3.weight",
+        ]
+        .iter()
+        .any(|s| name.ends_with(s))
 }
 
 /// Quantize a 2-D matrix `[out_dim, in_dim]` per the chosen scheme.
@@ -1144,6 +1180,14 @@ pub(crate) fn quantize_2d(
             crate::gptq::quantize_q1t(vals, out_dim, in_dim, &vec![1.0; in_dim], 0.0),
         ),
         Quant::Q1t => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
+        Quant::Mxfp4 if in_dim % GROUP_SIZE == 0 => (
+            TensorDtype::Mxfp4,
+            cortiq_core::mxfp4::quantize(vals, out_dim, in_dim),
+        ),
+        Quant::Mxfp4 => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
+        // The profile resolves per tensor (`profile_quant`); a direct caller
+        // gets the profile's expert codec.
+        Quant::Fp4 => quantize_2d(Quant::Mxfp4, vals, out_dim, in_dim),
     }
 }
 
@@ -1162,8 +1206,10 @@ pub(crate) fn parse_quant(s: &str) -> anyhow::Result<Quant> {
         "q1p" | "q1_ptq" => Quant::Q1p,
         "q1s" | "q1_mask" => Quant::Q1s,
         "q1t" | "q1_ternary" => Quant::Q1t,
+        "mxfp4" | "mx_fp4" => Quant::Mxfp4,
+        "fp4" => Quant::Fp4,
         other => anyhow::bail!(
-            "unknown quant '{other}' (use q8, q8_2f, q4, q4t, q4tp, q2tp, q2tp_affine, f16, vbit, q1, q1p, q1s, or q1t)"
+            "unknown quant '{other}' (use q8, q8_2f, q4, q4t, q4tp, q2tp, q2tp_affine, f16, vbit, q1, q1p, q1s, q1t, mxfp4, or fp4)"
         ),
     })
 }
@@ -1183,6 +1229,8 @@ pub(crate) fn quant_name(quant: Quant) -> &'static str {
         Quant::Q1p => "q1p",
         Quant::Q1s => "q1s",
         Quant::Q1t => "q1t",
+        Quant::Mxfp4 => "mxfp4",
+        Quant::Fp4 => "fp4",
     }
 }
 
@@ -1192,6 +1240,15 @@ pub(crate) fn quant_name(quant: Quant) -> &'static str {
 /// on q2tp. Keeping this decision here means every requested output sees the
 /// same decoded source tensor and only the encoder differs.
 fn profile_quant(arch: &ModelArch, requested: Quant, name: &str) -> Quant {
+    if matches!(requested, Quant::Fp4) {
+        // Experts on the native FP4 codec, everything else exactly as the
+        // q4tp profile places it (skeleton q8_2f rules included).
+        return if fp4_expert_matrix(name) {
+            Quant::Mxfp4
+        } else {
+            profile_quant(arch, Quant::Q4TiledP, name)
+        };
+    }
     if matches!(requested, Quant::Q2TiledPAffine) {
         // Prism weights are all trained ternary projections in one rotated
         // basis; never apply q2tp's mixed expert-only policy.
@@ -2765,6 +2822,240 @@ pub(crate) fn unpack_mxfp4(
         Ok(())
     })?;
     Ok(out)
+}
+
+/// NVIDIA ModelOpt NVFP4 (`hf_quant_config.json` / `quantization_config`
+/// `quant_algo: NVFP4`): `weight` U8 `[rows, cols/2]` E2M1 pairs (LOW nibble
+/// = even element, as MXFP4), `weight_scale` F8_E4M3 `[rows, cols/16]` (one
+/// per 16 elements, linear row-major on disk — not the swizzled runtime
+/// layout), `weight_scale_2` F32 scalar (the per-tensor decode multiplier,
+/// `amax / (6·448)`). Decoded as vLLM's `dequantize_to_dtype` does:
+/// `w = e2m1 · (f32(e4m3_scale) · weight_scale_2)`, the two scales multiplied
+/// first. A NaN block scale (E4M3 `0x7F`/`0xFF`) or a non-finite global
+/// scale is refused.
+pub(crate) fn unpack_nvfp4(
+    packed: &[u8],
+    scales_e4m3: &[u8],
+    global_scale: f32,
+    rows: usize,
+    cols_packed: usize,
+) -> anyhow::Result<Vec<f32>> {
+    const BLOCK: usize = 16;
+    let cols = cols_packed * 2;
+    anyhow::ensure!(cols % BLOCK == 0, "nvfp4: cols {cols} not a multiple of {BLOCK}");
+    anyhow::ensure!(
+        global_scale.is_finite(),
+        "nvfp4: non-finite weight_scale_2 {global_scale}"
+    );
+    let bpr = cols / BLOCK;
+    anyhow::ensure!(
+        packed.len() == rows * cols_packed && scales_e4m3.len() == rows * bpr,
+        "nvfp4: packed {} / scales {} vs rows {rows} cols {cols}",
+        packed.len(),
+        scales_e4m3.len()
+    );
+    let lut = &cortiq_core::mxfp4::E2M1_LUT;
+    let mut out = vec![0.0f32; rows * cols];
+    if rows == 0 {
+        return Ok(out);
+    }
+    let threads = encode_threads().min(rows).max(1);
+    let rows_per_thread = rows.div_ceil(threads);
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        let mut workers = Vec::with_capacity(threads);
+        for (chunk_index, out_chunk) in out.chunks_mut(rows_per_thread * cols).enumerate() {
+            let first_row = chunk_index * rows_per_thread;
+            workers.push(scope.spawn(move || -> anyhow::Result<()> {
+                for (local_row, out_row) in out_chunk.chunks_mut(cols).enumerate() {
+                    let r = first_row + local_row;
+                    for b in 0..bpr {
+                        let sf = fp8_e4m3_to_f32(scales_e4m3[r * bpr + b]);
+                        anyhow::ensure!(sf.is_finite(), "nvfp4: NaN block scale at row {r} block {b}");
+                        let s = sf * global_scale;
+                        for j in 0..BLOCK / 2 {
+                            let byte = packed[r * cols_packed + b * (BLOCK / 2) + j];
+                            out_row[b * BLOCK + 2 * j] = lut[(byte & 0x0F) as usize] * s;
+                            out_row[b * BLOCK + 2 * j + 1] = lut[(byte >> 4) as usize] * s;
+                        }
+                    }
+                }
+                Ok(())
+            }));
+        }
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("nvfp4 worker panicked"))??;
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// The NVFP4 group size when the checkpoint declares ModelOpt NVFP4, either
+/// in `hf_quant_config.json` (`{"quantization": {"quant_algo": "NVFP4",
+/// "group_size": 16}}`) or in `config.json`'s `quantization_config`
+/// (`quant_algo` NVFP4 / W4A16_NVFP4, `quant_method` modelopt). None for
+/// every other checkpoint. compressed-tensors' `nvfp4-pack-quantized`
+/// (packed `weight_packed`, an INVERSE `weight_global_scale`) is a different
+/// layout and is refused rather than misread as MXFP4.
+pub(crate) fn nvfp4_source(dir: &Path, config: &serde_json::Value) -> anyhow::Result<Option<usize>> {
+    let algo_is_nvfp4 = |q: &serde_json::Value| {
+        q.get("quant_algo")
+            .and_then(|v| v.as_str())
+            .is_some_and(|a| a.to_ascii_uppercase().contains("NVFP4"))
+    };
+    let group_of = |q: &serde_json::Value| -> anyhow::Result<usize> {
+        let g = q
+            .get("group_size")
+            .and_then(|v| v.as_u64())
+            .or_else(|| {
+                q.get("config_groups")?
+                    .as_object()?
+                    .values()
+                    .find_map(|g| g.get("weights")?.get("group_size")?.as_u64())
+            })
+            .unwrap_or(16) as usize;
+        anyhow::ensure!(g == 16, "NVFP4 checkpoint declares group_size {g}; only 16 is defined");
+        Ok(g)
+    };
+    let hf_quant = dir.join("hf_quant_config.json");
+    if let Ok(text) = fs::read(&hf_quant) {
+        let v: serde_json::Value = serde_json::from_slice(&text)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", hf_quant.display()))?;
+        let q = v.get("quantization").unwrap_or(&v);
+        if algo_is_nvfp4(q) {
+            return group_of(q).map(Some);
+        }
+    }
+    let Some(q) = config
+        .get("quantization_config")
+        .or_else(|| config.get("text_config")?.get("quantization_config"))
+    else {
+        return Ok(None);
+    };
+    let ct_format = q.get("format").and_then(|v| v.as_str()).or_else(|| {
+        q.get("config_groups")?
+            .as_object()?
+            .values()
+            .find_map(|g| g.get("format")?.as_str())
+    });
+    anyhow::ensure!(
+        ct_format != Some("nvfp4-pack-quantized"),
+        "compressed-tensors nvfp4-pack-quantized checkpoints are not supported \
+         (only NVIDIA ModelOpt NVFP4: weight / weight_scale / weight_scale_2)"
+    );
+    if algo_is_nvfp4(q) {
+        return group_of(q).map(Some);
+    }
+    Ok(None)
+}
+
+/// Find a companion tensor by exact source name in any shard.
+fn companion<'a>(files: &'a [SafeTensors], name: &str) -> Option<(&'a SafeTensors, &'a TensorMeta)> {
+    files
+        .iter()
+        .find_map(|f| f.tensors.iter().find(|t| t.name == name).map(|t| (f, t)))
+}
+
+/// Decode one ModelOpt NVFP4 `.weight` (U8) with its `.weight_scale`
+/// (F8_E4M3 per 16) and `.weight_scale_2` (F32 scalar) companions, folding an
+/// optional AWQ `.pre_quant_scale` (`y = W·(x ⊙ s)`, so column i of W is
+/// multiplied by `s[i]`). Returns `(shape, values)`.
+fn nvfp4_decode(
+    m: &TensorMeta,
+    file: &SafeTensors,
+    files: &[SafeTensors],
+) -> anyhow::Result<(Vec<usize>, Vec<f32>)> {
+    let name = &m.name;
+    anyhow::ensure!(m.shape.len() == 2, "{name}: NVFP4 weight must be 2-D, got {:?}", m.shape);
+    let (rows, cp) = (m.shape[0], m.shape[1]);
+    let cols = cp * 2;
+    let stem = name.strip_suffix(".weight").expect("suffix checked by caller");
+    let (sf, sm) = companion(files, &format!("{stem}.weight_scale"))
+        .ok_or_else(|| anyhow::anyhow!("{name}: NVFP4 weight without {stem}.weight_scale"))?;
+    anyhow::ensure!(
+        sm.dtype == "F8_E4M3" && sm.shape == vec![rows, cols / 16],
+        "{name}: {stem}.weight_scale is {} {:?}, expected F8_E4M3 [{rows}, {}]",
+        sm.dtype,
+        sm.shape,
+        cols / 16
+    );
+    let (gf, gm) = companion(files, &format!("{stem}.weight_scale_2"))
+        .ok_or_else(|| anyhow::anyhow!("{name}: NVFP4 weight without {stem}.weight_scale_2"))?;
+    let global = to_f32(&gm.dtype, gf.bytes(gm))?;
+    anyhow::ensure!(
+        global.len() == 1,
+        "{name}: weight_scale_2 must be one value, got {}",
+        global.len()
+    );
+    let mut vals = unpack_nvfp4(file.bytes(m), sf.bytes(sm), global[0], rows, cp)?;
+    if let Some((pf, pm)) = companion(files, &format!("{stem}.pre_quant_scale")) {
+        let pqs = to_f32(&pm.dtype, pf.bytes(pm))?;
+        anyhow::ensure!(
+            pqs.len() == cols,
+            "{name}: pre_quant_scale has {} values for {cols} columns",
+            pqs.len()
+        );
+        for row in vals.chunks_mut(cols) {
+            for (w, s) in row.iter_mut().zip(&pqs) {
+                *w *= s;
+            }
+        }
+    }
+    Ok((vec![rows, cols], vals))
+}
+
+/// The byte-identical MXFP4 path for a DeepSeek-V4/V4.1 source tensor: when
+/// `m` is an `I8` FP4 weight `[rows, cols/2]` with an E8M0 `.scale`
+/// companion `[rows, cols/32]` and at least one active output resolves this
+/// tensor to `mxfp4` (the `fp4` profile's experts, or a `--tensor-quant`
+/// override), returns the re-packed payload, its logical shape and, per
+/// output, whether that output takes it. None = not such a tensor, or no
+/// output wants it (the f32 decode then serves everyone as before).
+#[allow(clippy::too_many_arguments)]
+fn dsv4_raw_mxfp4(
+    arch: &ModelArch,
+    name: &str,
+    m: &TensorMeta,
+    file: &SafeTensors,
+    files: &[SafeTensors],
+    profiles: &[Quant],
+    active: &[bool],
+    no_defrag: bool,
+) -> anyhow::Result<Option<(Vec<u8>, Vec<usize>, Vec<bool>)>> {
+    if m.dtype != "I8" || m.shape.len() != 2 || name.ends_with(".scale") || !no_defrag {
+        return Ok(None);
+    }
+    let (rows, cp) = (m.shape[0], m.shape[1]);
+    let cols = cp * 2;
+    if cols % 32 != 0 || force_f32(name) || force_f16(name) {
+        return Ok(None);
+    }
+    let took: Vec<bool> = profiles
+        .iter()
+        .zip(active)
+        .map(|(&q, &a)| a && effective_quant(arch, q, name) == Quant::Mxfp4)
+        .collect();
+    if !took.iter().any(|&t| t) {
+        return Ok(None);
+    }
+    let scale_name = format!("{}.scale", m.name.trim_end_matches(".weight"));
+    let Some((sf, sm)) = companion(files, &scale_name) else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        matches!(sm.dtype.as_str(), "F8_E8M0" | "U8") && sm.shape == vec![rows, cols / 32],
+        "{name}: FP4 source {} [{rows}, {cp}] with {scale_name} {} {:?} is not OCP MXFP4 \
+         (expected E8M0 [{rows}, {}])",
+        m.dtype,
+        sm.dtype,
+        sm.shape,
+        cols / 32
+    );
+    let payload = cortiq_core::mxfp4::repack(file.bytes(m), sf.bytes(sm), rows, cols)
+        .map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+    Ok(Some((payload, vec![rows, cols], took)))
 }
 
 /// OCP FP8 E4M3 → f32. 1 sign, 4 exp (bias 7), 3 mantissa; no infinities,
@@ -6254,6 +6545,9 @@ pub(crate) fn hf_download_opts(
         // identity.  It is optional for ordinary HF models and therefore
         // fetched best-effort here.
         ("hadamard.json", false),
+        // NVIDIA ModelOpt checkpoints declare NVFP4 here rather than (or
+        // as well as) in config.json's quantization_config.
+        ("hf_quant_config.json", false),
         // Kimi ships tiktoken.model instead of tokenizer.json — either
         // satisfies the bundle (checked after conversion).
         ("tokenizer.json", false),
@@ -6823,6 +7117,12 @@ pub fn run_convert_multi_towers(
         );
     }
     let source_fp8_block = source_fp8_block(&config);
+    // NVIDIA ModelOpt NVFP4 checkpoints decode to f32 first (then any
+    // profile, mxfp4 included, re-encodes them).
+    let nvfp4_src = nvfp4_source(dir, &config)?;
+    if let Some(g) = nvfp4_src {
+        eprintln!("  source: NVIDIA ModelOpt NVFP4 (E2M1 + E4M3 scale per {g} + per-tensor scale)");
+    }
     let consume_source_shards =
         stream_repo.is_none() && arch.deepseek_v41.is_some() && consume_source_shards_enabled();
     if consume_source_shards {
@@ -7292,6 +7592,23 @@ pub fn run_convert_multi_towers(
             if name.ends_with(".weight_scale_inv") {
                 continue;
             }
+            // NVFP4 (ModelOpt): block and global weight scales ride with
+            // their `.weight`; activation and KV-cache calibration scalars
+            // and the AWQ pre-quant scale (folded below) are not weights.
+            if nvfp4_src.is_some()
+                && [
+                    ".weight_scale",
+                    ".weight_scale_2",
+                    ".input_scale",
+                    ".k_scale",
+                    ".v_scale",
+                    ".pre_quant_scale",
+                ]
+                .iter()
+                .any(|s| m.name.ends_with(s))
+            {
+                continue;
+            }
             // MiMo-V2 fused qkv: TP-chunked rows AND a TP-chunked scale grid.
             // It must be decoded here, before the generic FP8 path: that
             // path tiles the scales continuously, which refuses the
@@ -7389,6 +7706,41 @@ pub fn run_convert_multi_towers(
             } else {
                 None
             };
+            // `fp4` profile / `mxfp4` tensor quant: an OCP MXFP4 source
+            // (DeepSeek-V4/V4.1 experts: I8 [rows, cols/2] nibble pairs +
+            // E8M0 [rows, cols/32] scales) goes into the file as its own two
+            // planes — no dequant, no requant. Outputs that want another
+            // codec still take the f32 decode below.
+            let raw_fp4_rest: Vec<bool>;
+            let active: &[bool] = match dsv4_raw_mxfp4(
+                &arch,
+                &name,
+                m,
+                file,
+                files,
+                profiles,
+                active,
+                defrag_plan.is_none(),
+            )? {
+                Some((payload, shape, took)) => {
+                    for ((batch, &t), &a) in batches.iter_mut().zip(&took).zip(active) {
+                        if t && a {
+                            batch.push(TensorSpec {
+                                name: name.clone(),
+                                dtype: TensorDtype::Mxfp4,
+                                shape: shape.clone(),
+                                data: payload.clone(),
+                            });
+                        }
+                    }
+                    raw_fp4_rest = active.iter().zip(&took).map(|(&a, &t)| a && !t).collect();
+                    if !raw_fp4_rest.iter().any(|&a| a) {
+                        continue;
+                    }
+                    &raw_fp4_rest
+                }
+                None => active,
+            };
             // Its own two quantizations, decoded to f32 so the rest of the
             // pipeline (defrag, requant to q4tp/q2tp) is layout-agnostic:
             //   * experts  — I8 holding two FP4 (E2M1) values per byte with
@@ -7451,6 +7803,11 @@ pub fn run_convert_multi_towers(
                     vec![rows, cp * 2],
                     unpack_mxfp4(file.bytes(m), scales, rows, cp)?,
                 ))
+            } else if nvfp4_src.is_some() && m.dtype == "U8" && m.name.ends_with(".weight") {
+                // NVIDIA ModelOpt NVFP4: decode with the E4M3 block scales and
+                // the per-tensor `weight_scale_2`, fold an AWQ pre-quant scale
+                // into the columns, then continue as an ordinary f32 tensor.
+                Some(nvfp4_decode(m, file, files)?)
             } else if m.dtype == "U8" && m.name.ends_with(".weight") {
                 // MXFP4 under the plain `.weight` name (MiMo-V2 experts): U8
                 // [rows, cols/2] nibble pairs + a U8 E8M0 sibling
@@ -8356,9 +8713,12 @@ pub fn run_convert_multi_towers(
         Quant::Q4Block => QuantType::Q4Block,
         Quant::F16 => QuantType::F16,
         Quant::Vbit => QuantType::Vbit,
-        Quant::Q4Tiled | Quant::Q4TiledP | Quant::Q2TiledP | Quant::Q2TiledPAffine => {
-            QuantType::Q4Block
-        }
+        Quant::Q4Tiled
+        | Quant::Q4TiledP
+        | Quant::Q2TiledP
+        | Quant::Q2TiledPAffine
+        | Quant::Mxfp4
+        | Quant::Fp4 => QuantType::Q4Block,
         // File-level label only (per-tensor truth is in the directory);
         // Vbit is the closest existing informational bucket for q1.
         Quant::Q1 | Quant::Q1p | Quant::Q1s | Quant::Q1t => QuantType::Vbit,
@@ -13691,3 +14051,8 @@ mod dspark_sidecar_tests {
         let _ = fs::remove_dir_all(&dir);
     }
 }
+
+/// Native FP4: the `mxfp4` codec, the `fp4` profile and the NVFP4 decoder.
+#[cfg(test)]
+#[path = "convert_fp4_tests.rs"]
+mod fp4_tests;
