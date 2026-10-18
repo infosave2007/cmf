@@ -61,10 +61,12 @@ fn fp8_one(b: u32, e: i32) -> u32 {
     let ex = select(1, i32(ab >> 23u), normal);
     let qf = ex - e;
     if (!normal || qf <= 0) {
-        // The quotient is below 2^-126 (a subnormal x always is: e >= -22),
-        // so E4M3 rounds it to zero. The host's f32 division returns an exact
-        // zero, whose sign it drops, when the quotient is at most half of
-        // 2^-149: m * 2^qf <= 1.
+        // The quotient is below 2^-104 (a subnormal x: |x| < 2^-126 and
+        // e >= -22) or below 2^-126 (a normal x with qf <= 0), far under
+        // E4M3's smallest half step 2^-10, so E4M3 rounds it to zero. The
+        // host's f32 division returns an exact zero, whose sign it drops,
+        // when the quotient is at most half of 2^-149: m * 2^qf <= 1, which
+        // needs qf <= 0 (with qf >= 1 the quotient is at least |x|).
         var exact_zero = false;
         if (qf <= 0) {
             let k = u32(-qf);
