@@ -1087,6 +1087,135 @@ fn v_bits_to_file(bv: &[u32], n: usize, r: usize, wpr: usize, out: &mut [u8]) {
     });
 }
 
+// ───────────────────────────── resumable state ─────────────────────────────
+
+/// Every device buffer a resumed run needs, in a fixed order: each
+/// parameter with its Adam moments, every bitmap, every sign matrix's
+/// latents, moments, factored statistics and starting bits.
+fn state_bufs(net: &Net) -> Vec<(&wgpu::Buffer, usize)> {
+    let mut v = Vec::new();
+    for p in net.params() {
+        v.push((&p.w, p.n));
+        v.push((&p.m1, p.n));
+        v.push((&p.m2, p.n));
+    }
+    v.extend(bitmaps(net));
+    for (mat, _, _) in sign_mats(net) {
+        v.push((&mat.lat, mat.lat_words()));
+        if let Some(m) = &mat.mom {
+            v.push((m, mat.mom_words()));
+        }
+        if let Some(x) = &mat.v {
+            v.push((x, mat.rows * mat.rp));
+        }
+        v.push((&mat.vrow, mat.rows));
+        v.push((&mat.vcol, mat.rp));
+        if let Some(b0) = &mat.bits0 {
+            v.push((b0, mat.rows * mat.wpr()));
+        }
+    }
+    v
+}
+
+const STATE_MAGIC: &[u8; 8] = b"NVGSTAT1";
+
+fn write_words(path: &std::path::Path, parts: &mut dyn Iterator<Item = Result<Vec<u32>, String>>, sizes: &[usize]) -> Result<u64, String> {
+    use std::io::Write;
+    let tmp = path.with_extension("tmp");
+    let mut f = std::io::BufWriter::with_capacity(16 << 20, std::fs::File::create(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?);
+    let io = |e: std::io::Error| e.to_string();
+    f.write_all(STATE_MAGIC).map_err(io)?;
+    f.write_all(&(sizes.len() as u64).to_le_bytes()).map_err(io)?;
+    for &n in sizes {
+        f.write_all(&(n as u64).to_le_bytes()).map_err(io)?;
+    }
+    let mut bytes = 0u64;
+    for v in parts {
+        let v = v?;
+        f.write_all(bytemuck::cast_slice(&v)).map_err(io)?;
+        bytes += v.len() as u64 * 4;
+    }
+    f.flush().map_err(io)?;
+    drop(f);
+    std::fs::rename(&tmp, path).map_err(io)?;
+    Ok(bytes)
+}
+
+fn read_words(path: &std::path::Path, sizes: &[usize], mut each: impl FnMut(usize, &[u32])) -> Result<(), String> {
+    use std::io::Read;
+    let mut f = std::io::BufReader::with_capacity(16 << 20, std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?);
+    let io = |e: std::io::Error| e.to_string();
+    let mut hdr = [0u8; 16];
+    f.read_exact(&mut hdr).map_err(io)?;
+    if &hdr[..8] != STATE_MAGIC || u64::from_le_bytes(hdr[8..16].try_into().unwrap()) != sizes.len() as u64 {
+        return Err(format!("{}: not a state file of this net", path.display()));
+    }
+    for &n in sizes {
+        let mut w = [0u8; 8];
+        f.read_exact(&mut w).map_err(io)?;
+        if u64::from_le_bytes(w) != n as u64 {
+            return Err(format!("{}: buffer sizes differ from this net", path.display()));
+        }
+    }
+    for (i, &n) in sizes.iter().enumerate() {
+        let mut v = vec![0u32; n];
+        f.read_exact(bytemuck::cast_slice_mut(&mut v)).map_err(io)?;
+        each(i, &v);
+    }
+    Ok(())
+}
+
+/// Write the training state (see [`state_bufs`]) to `path` (atomic rename).
+/// Returns the bytes written.
+pub fn save_state(c: Ctx, net: &Net, path: &std::path::Path) -> Result<u64, String> {
+    let bufs = state_bufs(net);
+    let sizes: Vec<usize> = bufs.iter().map(|b| b.1).collect();
+    let mut it = bufs.iter().map(|(b, n)| to::download_u32(c, b, *n).ok_or_else(|| "download".to_string()));
+    write_words(path, &mut it, &sizes)
+}
+
+/// Load a [`save_state`] file into a net of the same layout and options.
+pub fn load_state(c: Ctx, net: &Net, path: &std::path::Path) -> Result<(), String> {
+    let bufs = state_bufs(net);
+    let sizes: Vec<usize> = bufs.iter().map(|b| b.1).collect();
+    let mut pending = 0usize;
+    read_words(path, &sizes, |i, v| {
+        c.queue.write_buffer(bufs[i].0, 0, bytemuck::cast_slice(v));
+        pending += v.len() * 4;
+        // flush the staged writes every ~1 GB (a 27B state is tens of GB)
+        if pending > 1 << 30 {
+            c.queue.submit(std::iter::empty());
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+            pending = 0;
+        }
+    })?;
+    c.queue.submit(std::iter::empty());
+    let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+    Ok(())
+}
+
+/// Write a [`Snap`] (best checkpoint) to `path`.
+pub fn save_snap(snap: &Snap, path: &std::path::Path) -> Result<u64, String> {
+    let sizes: Vec<usize> = snap.params.iter().map(|v| v.len()).chain(snap.bits.iter().map(|v| v.len())).collect();
+    let mut it = snap.params.iter().map(|v| Ok(v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>())).chain(snap.bits.iter().map(|v| Ok(v.clone())));
+    write_words(path, &mut it, &sizes)
+}
+
+/// Read a [`save_snap`] file shaped like `like` (a snapshot of the same net).
+pub fn load_snap(like: &Snap, path: &std::path::Path) -> Result<Snap, String> {
+    let np = like.params.len();
+    let sizes: Vec<usize> = like.params.iter().map(|v| v.len()).chain(like.bits.iter().map(|v| v.len())).collect();
+    let mut out = Snap { params: Vec::new(), bits: Vec::new() };
+    read_words(path, &sizes, |i, v| {
+        if i < np {
+            out.params.push(v.iter().map(|&w| f32::from_bits(w)).collect());
+        } else {
+            out.bits.push(v.to_vec());
+        }
+    })?;
+    Ok(out)
+}
+
 /// Mean KL of `ids` against the teacher top-k (forward only).
 pub fn loss_only(c: Ctx, net: &Net, w: &Work, ids: &[u32], tid: &[u32], tp: &[f32], k: usize) -> Option<f64> {
     let n = w.ntok;
@@ -1156,10 +1285,14 @@ mod tests {
     /// (`CMF_TRAIN_TEST_BLR` = blr student, `CMF_TRAIN_TEST_TEACHER` = its teacher).
     #[allow(clippy::type_complexity)]
     fn blr_fixture(sign: Option<&SignInit>) -> Option<(Ctx, CmfModel, Net, Work, Vec<u32>, Vec<u32>, Vec<f32>, usize)> {
+        blr_fixture_sized(sign, 2, 64, 32)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn blr_fixture_sized(sign: Option<&SignInit>, nb: usize, t: usize, k: usize) -> Option<(Ctx, CmfModel, Net, Work, Vec<u32>, Vec<u32>, Vec<f32>, usize)> {
         let sp = std::env::var("CMF_TRAIN_TEST_BLR").ok()?;
         let tp_path = std::env::var("CMF_TRAIN_TEST_TEACHER").ok()?;
         let c = to::dev()?;
-        let (nb, t, k) = (2usize, 64usize, 32usize);
         let ids: Vec<u32>;
         let (tid, tp);
         {
@@ -1331,5 +1464,54 @@ mod tests {
         }
         eprintln!("sign agreement {agree}/32");
         assert!(agree >= 29, "only {agree}/32 flips moved the loss as predicted");
+    }
+
+    /// Cost of sign training per step: the same net and batch, steps with and
+    /// without the sign ops alternating (in-process timers, so a shared card
+    /// slows both arms alike). `CMF_TRAIN_TEST_NB` × `CMF_TRAIN_TEST_T`
+    /// tokens (default 8 × 512, the A/B's step), `CMF_TRAIN_TEST_REPS` pairs.
+    #[test]
+    #[ignore]
+    fn sign_step_cost() {
+        let env = |n: &str, d: usize| std::env::var(n).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let (nb, t, reps) = (env("CMF_TRAIN_TEST_NB", 8), env("CMF_TRAIN_TEST_T", 512), env("CMF_TRAIN_TEST_REPS", 5));
+        let init = SignInit { opt: ts::SignOpt::Fact, tau: 0.25, seed: 42, keep_bits0: true, defer: false };
+        let Some((c, _m, net, w, ids, tid, tp, k)) = blr_fixture_sized(Some(&init), nb, t, 64) else { return };
+        let live = net.sign_live();
+        eprintln!(
+            "{} signs, {} matrices; latents {:.3} GB, sign scratch {:.3} GB",
+            live,
+            net.n_sign_mats,
+            live as f64 * 2.0 / 1e9,
+            w.sg.as_ref().map(|s| s.bytes() as f64 / 1e9).unwrap_or(0.0)
+        );
+        let time = |sign: Option<&SignStepCfg>| -> f64 {
+            let t0 = std::time::Instant::now();
+            step(c, &net, &w, &ids, &tid, &tp, k, 1024.0, sign).unwrap();
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+            let dt = t0.elapsed().as_secs_f64();
+            zero_grads(c, &net);
+            dt
+        };
+        let _ = time(None);
+        let _ = time(Some(&sign_cfg(1e-3, false)));
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for r in 0..reps {
+            let mut cfg = sign_cfg(1e-3, false);
+            cfg.step = 2 + r as u32;
+            if r % 2 == 0 {
+                a.push(time(None));
+                b.push(time(Some(&cfg)));
+            } else {
+                b.push(time(Some(&cfg)));
+                a.push(time(None));
+            }
+        }
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            v[v.len() / 2]
+        };
+        let (ma, mb) = (med(&mut a), med(&mut b));
+        eprintln!("{} tokens per step: metric only {ma:.3} s, with signs {mb:.3} s (median of {reps}; +{:.3} s, ×{:.3})", nb * t, mb - ma, mb / ma);
     }
 }
