@@ -114,10 +114,50 @@ impl Codec {
 }
 
 /// One layer's calibration record: `n` MoE input rows (f16, `hidden` wide,
-/// row-major) and `top_k` routed expert ids per token (`u16::MAX` = none).
+/// row-major), `top_k` routed expert ids per token (`u16::MAX` = none) and
+/// each pick's route weight (V4.1; empty when not captured — Flash-Next).
 pub(crate) struct LayerRows {
     pub x: Vec<u16>,
     pub picks: Vec<u16>,
+    pub w: Vec<f32>,
+}
+
+/// Route weights in the down Hessian (`CMF_MOE_ROUTE_W`). The reference
+/// expert multiplies its SwiGLU activation by the route weight before
+/// `w2`, so `w2`'s true input Hessian is `Σ w_t²·y_t y_tᵀ`; gate/up read the
+/// unscaled input either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RouteW {
+    /// Unweighted rows (the default; Flash-Next always).
+    Off,
+    /// Each down-input row scaled by its route weight.
+    On,
+    /// `CMF_MOE_DIAG` only: both encodes, side by side.
+    Diag,
+}
+
+impl RouteW {
+    fn parse(v: Option<&str>) -> anyhow::Result<Self> {
+        match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("0") => Ok(Self::Off),
+            Some("1") => Ok(Self::On),
+            Some("diag") => Ok(Self::Diag),
+            Some(other) => anyhow::bail!("CMF_MOE_ROUTE_W={other}: expected 0, 1 or diag"),
+        }
+    }
+}
+
+/// The encodes a `CMF_MOE_DIAG` run measures per expert: each listed prior,
+/// with the unweighted and/or the route-weighted down Hessian.
+pub(crate) fn diag_variants(priors: &[f64], route_w: RouteW) -> Vec<(f64, bool)> {
+    priors
+        .iter()
+        .flat_map(|&n0| match route_w {
+            RouteW::Off => vec![(n0, false)],
+            RouteW::On => vec![(n0, true)],
+            RouteW::Diag => vec![(n0, false), (n0, true)],
+        })
+        .collect()
 }
 
 /// Full-precision weights of one expert: gate and up `[inter, hidden]`,
@@ -311,7 +351,17 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     } else {
         eprintln!("prior: none — {prior_why}");
     }
-    let nvar = diag.as_ref().map_or(0, Vec::len);
+    let route_w = RouteW::parse(std::env::var("CMF_MOE_ROUTE_W").ok().as_deref())?;
+    anyhow::ensure!(route_w == RouteW::Off || family == Family::Dsv41, "CMF_MOE_ROUTE_W: route weights are captured for DeepSeek-V4.1 only");
+    anyhow::ensure!(route_w != RouteW::Diag || diag.is_some(), "CMF_MOE_ROUTE_W=diag compares both down Hessians under CMF_MOE_DIAG only");
+    match route_w {
+        RouteW::Off => eprintln!("down Hessian: unweighted rows (CMF_MOE_ROUTE_W=1 weights them by the route weight)"),
+        RouteW::On => eprintln!("down Hessian: each row scaled by its route weight (Σ w²·y yᵀ, CMF_MOE_ROUTE_W=1)"),
+        RouteW::Diag => eprintln!("DIAG: every prior with the unweighted and the route-weighted down Hessian (CMF_MOE_ROUTE_W=diag)"),
+    }
+    let variants = diag.as_deref().map(|v| diag_variants(v, route_w)).unwrap_or_default();
+    let labels: Vec<String> = variants.iter().map(|&(n0, rw)| format!("{n0}{}", if rw { "+w" } else { "" })).collect();
+    let nvar = variants.len();
     let mut diag_tot = vec![DiagBin::new(nvar); BINS.len()];
 
     // full-precision source
@@ -379,7 +429,8 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
         );
         // ── capture ──
         let tc = Instant::now();
-        let mut rows: Vec<LayerRows> = (lo..hi).map(|_| LayerRows { x: Vec::with_capacity(ntok * hidden), picks: Vec::with_capacity(ntok * top_k) }).collect();
+        let nw = if family == Family::Dsv41 { ntok * top_k } else { 0 };
+        let mut rows: Vec<LayerRows> = (lo..hi).map(|_| LayerRows { x: Vec::with_capacity(ntok * hidden), picks: Vec::with_capacity(ntok * top_k), w: Vec::with_capacity(nw) }).collect();
         {
             let p = pipe.as_mut().expect("pipeline alive while layers remain");
             for (wi, w) in windows.iter().enumerate() {
@@ -392,9 +443,10 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
                     }
                     Family::Dsv41 => {
                         let cap = p.dsv41_moe_capture(w, lo, hi).map_err(|e| anyhow::anyhow!("capture: {e}"))?;
-                        for (k, (x, pk)) in cap.x.into_iter().zip(cap.picks).enumerate() {
+                        for (k, ((x, pk), w)) in cap.x.into_iter().zip(cap.picks).zip(cap.w).enumerate() {
                             rows[k].x.extend(x);
                             rows[k].picks.extend(pk);
+                            rows[k].w.extend(w);
                         }
                     }
                 }
@@ -441,16 +493,20 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
                     Family::Dsv41 => dsv41_expert(&src, li, part, e, hidden, if matches!(part, Part::Shared) { inter_s } else { inter }, fp8_block),
                 }
             };
-            let job = LayerJob { li, hidden, ne, inter, top_k, min_rows: o.min_rows, prior_n0, prior_s, held: &held };
+            let job = LayerJob { li, hidden, ne, inter, top_k, min_rows: o.min_rows, prior_n0, prior_s, held: &held, route_w };
             let out = encode_layer(engine, &ec, &job, lr, patch.is_none(), shared_dirs[li].is_some() && diag.is_none(), main_bufs.as_ref(), diag.as_deref(), &get)?;
+            let weighted_metric = !lr.w.is_empty();
             stats.0 += out.n_gptq;
             stats.1 += out.n_rtn;
-            if let Some(vars) = &diag {
+            if diag.is_some() {
                 for (bi, b) in out.diag.iter().enumerate() {
                     if b.count == 0 {
                         continue;
                     }
-                    eprintln!("  DIAG layer {li} rows<{}: {} experts, rel. output error RTN {} | priors {vars:?}: {}", bin_label(bi), b.count, b.rel(0), (1..=nvar).map(|i| b.rel(i)).collect::<Vec<_>>().join(" "));
+                    eprintln!("  DIAG layer {li} rows<{}: {} experts, rel. output error RTN {} | GPTQ {labels:?}: {}", bin_label(bi), b.count, b.rel(0), b.rels(nvar));
+                    if weighted_metric {
+                        eprintln!("  DIAG layer {li} rows<{}: route-weighted error (Σ w²·|Δ|²) RTN {} | GPTQ {labels:?}: {}", bin_label(bi), b.rel_w(0), b.rels_w(nvar));
+                    }
                     diag_tot[bi].add(b);
                 }
             }
@@ -486,13 +542,16 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
             }
         }
     }
-    if let Some(vars) = &diag {
-        eprintln!("DIAG total, layers {range_lo}..{range_hi}, relative expert output error on held-out rows:");
+    if diag.is_some() {
+        eprintln!("DIAG total, layers {range_lo}..{range_hi}, relative expert output error on held-out rows (GPTQ variants: prior n0, +w = route-weighted down Hessian):");
         for (bi, b) in diag_tot.iter().enumerate() {
             if b.count == 0 {
                 continue;
             }
-            eprintln!("  rows<{}: {} experts | RTN {} | GPTQ priors {vars:?}: {}", bin_label(bi), b.count, b.rel(0), (1..=nvar).map(|i| b.rel(i)).collect::<Vec<_>>().join(" "));
+            eprintln!("  rows<{}: {} experts | RTN {} | GPTQ {labels:?}: {}", bin_label(bi), b.count, b.rel(0), b.rels(nvar));
+            if b.base_w > 0.0 {
+                eprintln!("  rows<{}: route-weighted | RTN {} | GPTQ {labels:?}: {}", bin_label(bi), b.rel_w(0), b.rels_w(nvar));
+            }
         }
         return Ok(());
     }
@@ -508,6 +567,7 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
         "window": o.window,
         "lambda": o.lambda,
         "prior": prior_n0,
+        "route_weighted_down_hessian": route_w == RouteW::On,
         "prior_source": prior_why,
         "prior_tokens": prior_s,
         "source": o.hf,
@@ -1173,31 +1233,63 @@ pub(crate) struct LayerJob<'a> {
     pub prior_s: usize,
     /// Per token: held out of the calibration (diagnostics).
     pub held: &'a [bool],
+    pub route_w: RouteW,
 }
 
 /// Diagnostic accumulators of one row-count bin: experts, Σ‖out‖², Σ error
-/// for RTN and for each prior.
+/// for RTN and for each variant, and the same with every held-out row
+/// weighted by its route weight squared (`_w`; the error the MoE output
+/// sees, when the capture has route weights).
 #[derive(Clone)]
 pub(crate) struct DiagBin {
     pub count: usize,
     pub base: f64,
     pub err: Vec<f64>,
+    pub base_w: f64,
+    pub err_w: Vec<f64>,
 }
 
 impl DiagBin {
     fn new(nvar: usize) -> Self {
-        Self { count: 0, base: 0.0, err: vec![0.0; nvar + 1] }
+        Self { count: 0, base: 0.0, err: vec![0.0; nvar + 1], base_w: 0.0, err_w: vec![0.0; nvar + 1] }
     }
     fn add(&mut self, o: &DiagBin) {
         self.count += o.count;
         self.base += o.base;
+        self.base_w += o.base_w;
         for (a, b) in self.err.iter_mut().zip(&o.err) {
+            *a += b;
+        }
+        for (a, b) in self.err_w.iter_mut().zip(&o.err_w) {
             *a += b;
         }
     }
     fn rel(&self, i: usize) -> String {
         format!("{:.4}", self.err[i] / self.base)
     }
+    fn rel_w(&self, i: usize) -> String {
+        format!("{:.4}", self.err_w[i] / self.base_w)
+    }
+    fn rels(&self, nvar: usize) -> String {
+        (1..=nvar).map(|i| self.rel(i)).collect::<Vec<_>>().join(" ")
+    }
+    fn rels_w(&self, nvar: usize) -> String {
+        (1..=nvar).map(|i| self.rel_w(i)).collect::<Vec<_>>().join(" ")
+    }
+}
+
+/// Σ‖a_r − b_r‖² over the `m` rows (`width` wide), unweighted and weighted
+/// by `w_r²` (`w` empty: the weighted sum is 0).
+fn row_err(a: &[f32], b: &[f32], width: usize, w: &[f32]) -> (f64, f64) {
+    let (mut e, mut ew) = (0f64, 0f64);
+    for (r, (ra, rb)) in a.chunks_exact(width).zip(b.chunks_exact(width)).enumerate() {
+        let v: f64 = ra.iter().zip(rb).map(|(&x, &y)| ((x - y) as f64).powi(2)).sum();
+        e += v;
+        if let Some(&wr) = w.get(r) {
+            ew += (wr as f64).powi(2) * v;
+        }
+    }
+    (e, ew)
 }
 
 const BINS: [usize; 4] = [640, 2560, 10240, usize::MAX];
@@ -1238,7 +1330,11 @@ pub(crate) fn encode_layer(
     let (hidden, ne, inter, top_k) = (job.hidden, job.ne, job.inter, job.top_k);
     let n = lr.x.len() / hidden;
     let held = job.held;
-    let nvar = diag.map_or(0, <[f64]>::len);
+    let variants = diag.map(|v| diag_variants(v, job.route_w)).unwrap_or_default();
+    let nvar = variants.len();
+    // route weights per pick, when captured
+    let has_w = lr.w.len() == n * top_k && n > 0;
+    anyhow::ensure!(job.route_w == RouteW::Off || has_w, "layer {}: route weighting needs the captured route weights ({} for {} picks)", job.li, lr.w.len(), n * top_k);
     let mut out = LayerOut { routed: Vec::new(), shared: None, n_gptq: 0, n_rtn: 0, diag: vec![DiagBin::new(nvar); BINS.len()], tim: [0.0; 5], t_shared: 0.0 };
     // the prior's sample: evenly spaced calibration tokens
     let cal: Vec<u32> = (0..n).filter(|&t| !held[t]).map(|t| t as u32).collect();
@@ -1247,13 +1343,20 @@ pub(crate) fn encode_layer(
         // routing: each token's experts
         let mut lists: Vec<Vec<u32>> = vec![Vec::new(); ne];
         let mut lists_ho: Vec<Vec<u32>> = vec![Vec::new(); ne];
+        // each list entry's route weight (when captured)
+        let mut wl: Vec<Vec<f32>> = vec![Vec::new(); ne];
+        let mut wl_ho: Vec<Vec<f32>> = vec![Vec::new(); ne];
         for t in 0..n {
-            for &e in &lr.picks[t * top_k..(t + 1) * top_k] {
-                let e = e as usize;
+            for j in t * top_k..(t + 1) * top_k {
+                let e = lr.picks[j] as usize;
                 if e >= ne {
                     continue;
                 }
-                if held[t] { lists_ho[e].push(t as u32) } else { lists[e].push(t as u32) }
+                let (l, w) = if held[t] { (&mut lists_ho[e], &mut wl_ho[e]) } else { (&mut lists[e], &mut wl[e]) };
+                l.push(t as u32);
+                if has_w {
+                    w.push(lr.w[j]);
+                }
             }
         }
         {
@@ -1269,7 +1372,13 @@ pub(crate) fn encode_layer(
                 job.min_rows
             );
         }
-        let prod_prior = (job.prior_n0 > 0.0).then(|| Prior { rows: &sample, n0: job.prior_n0, n0_down: job.prior_n0 / 4.0 });
+        // the prior with n0 pseudo-rows; route-weighted, the down prior's
+        // rows carry the expert's mean squared route weight (pseudo-rows of
+        // the average weighted row), so its share of the down Hessian stays
+        let prior_for = |n0: f64, rw: Option<&[f32]>| -> Option<Prior> {
+            let msw = rw.filter(|w| !w.is_empty()).map_or(1.0, |w| w.iter().map(|&v| (v as f64).powi(2)).sum::<f64>() / w.len() as f64);
+            (n0 > 0.0).then(|| Prior { rows: &sample, n0, n0_down: n0 / 4.0 * msw })
+        };
         let diag_layer = std::sync::Mutex::new(vec![DiagBin::new(nvar); BINS.len()]);
         // experts in parallel: each worker owns its device scratch and a
         // share of the host threads; results are kept in expert order
@@ -1287,7 +1396,7 @@ pub(crate) fn encode_layer(
                 if e >= ne {
                     break;
                 }
-                if let Some(vars) = diag {
+                if diag.is_some() {
                     let (ho, ce) = (&lists_ho[e], lists[e].len());
                     if ho.is_empty() || ce < job.min_rows {
                         continue;
@@ -1296,24 +1405,26 @@ pub(crate) fn encode_layer(
                     let xh = gather_rows(&lr.x, hidden, ho, 1.0, wec.threads);
                     let m = ho.len();
                     let o_fp = expert_out(&xh, m, hidden, &w.g, &w.u, &w.d, inter, ec.limit, wec.threads);
-                    let base: f64 = o_fp.iter().map(|&v| (v as f64) * (v as f64)).sum();
-                    let err_of = |enc: &[Vec<u8>; 3]| -> f64 {
+                    let (base, base_w) = row_err(&o_fp, &vec![0f32; o_fp.len()], hidden, &wl_ho[e]);
+                    let err_of = |enc: &[Vec<u8>; 3]| -> (f64, f64) {
                         let [qg, qu, qd] = dequant_expert(enc, inter, hidden, ec.codec);
                         let oq = expert_out(&xh, m, hidden, &qg, &qu, &qd, inter, ec.limit, wec.threads);
-                        oq.iter().zip(&o_fp).map(|(&a, &b)| ((a - b) as f64).powi(2)).sum()
+                        row_err(&oq, &o_fp, hidden, &wl_ho[e])
                     };
                     let mut errs = vec![err_of(&rtn_expert(ec.codec, &w, inter, hidden))];
-                    for &n0 in vars {
-                        let pr = (n0 > 0.0).then(|| Prior { rows: &sample, n0, n0_down: n0 / 4.0 });
-                        let enc = encode_expert(engine, &mut bufs, hidden, inter, &lr.x, &lists[e], &w, &wec, pr, &mut wt)?;
+                    for &(n0, weighted) in &variants {
+                        let rw = weighted.then(|| &wl[e][..]);
+                        let enc = encode_expert(engine, &mut bufs, hidden, inter, &lr.x, &lists[e], rw, &w, &wec, prior_for(n0, rw), &mut wt)?;
                         errs.push(err_of(&enc));
                     }
                     let bin = BINS.iter().position(|&lim| ce < lim).unwrap_or(BINS.len() - 1);
                     let mut d = diag_layer.lock().unwrap();
                     d[bin].count += 1;
                     d[bin].base += base;
-                    for (a, v) in d[bin].err.iter_mut().zip(errs) {
-                        *a += v;
+                    d[bin].base_w += base_w;
+                    for (k, (v, vw)) in errs.into_iter().enumerate() {
+                        d[bin].err[k] += v;
+                        d[bin].err_w[k] += vw;
                     }
                     n_gptq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     continue;
@@ -1324,7 +1435,8 @@ pub(crate) fn encode_layer(
                     rtn_expert(ec.codec, &w, inter, hidden)
                 } else {
                     n_gptq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    encode_expert(engine, &mut bufs, hidden, inter, &lr.x, &lists[e], &w, &wec, prod_prior, &mut wt)?
+                    let rw = (job.route_w == RouteW::On).then(|| &wl[e][..]);
+                    encode_expert(engine, &mut bufs, hidden, inter, &lr.x, &lists[e], rw, &w, &wec, prior_for(job.prior_n0, rw), &mut wt)?
                 };
                 *results[e].lock().unwrap() = Some(enc);
             }
@@ -1361,8 +1473,8 @@ pub(crate) fn encode_layer(
         let mut st = [0f64; 5];
         let mut own: Option<wgpu_bufs::Bufs> = None;
         let enc = match (engine, main_bufs) {
-            (Engine::Gpu(c), Some(b)) => encode_expert_gpu(c, b, hidden, is, &lr.x, &cal, &w, ec, None, &mut st)?,
-            _ => encode_expert(engine, &mut own, hidden, is, &lr.x, &cal, &w, ec, None, &mut st)?,
+            (Engine::Gpu(c), Some(b)) => encode_expert_gpu(c, b, hidden, is, &lr.x, &cal, None, &w, ec, None, &mut st)?,
+            _ => encode_expert(engine, &mut own, hidden, is, &lr.x, &cal, None, &w, ec, None, &mut st)?,
         };
         out.shared = Some(enc);
         out.t_shared = ts.elapsed().as_secs_f64();
@@ -1389,8 +1501,9 @@ pub(crate) struct Prior<'a> {
 }
 
 /// GPTQ of one expert from its input rows (`rows` index the captured f16
-/// rows `x`, `hidden` wide) on `engine`. Returns the gate, up and down
-/// payloads.
+/// rows `x`, `hidden` wide) on `engine`. `rw`: one route weight per row,
+/// scaling that row's down input (`None`: unweighted). Returns the gate, up
+/// and down payloads.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_expert(
     engine: Engine,
@@ -1399,17 +1512,19 @@ pub(crate) fn encode_expert(
     inter: usize,
     x: &[u16],
     rows: &[u32],
+    rw: Option<&[f32]>,
     w: &ExpertW,
     ec: &EncodeCfg,
     prior: Option<Prior>,
     tim: &mut [f64; 5],
 ) -> anyhow::Result<[Vec<u8>; 3]> {
+    anyhow::ensure!(rw.is_none_or(|v| v.len() == rows.len()), "{} route weights for {} rows", rw.map_or(0, <[f32]>::len), rows.len());
     match engine {
         Engine::Gpu(c) => {
             let b = bufs.get_or_insert_with(|| wgpu_bufs::Bufs::new(c, CHUNK, hidden, inter));
-            encode_expert_gpu(c, b, hidden, inter, x, rows, w, ec, prior, tim)
+            encode_expert_gpu(c, b, hidden, inter, x, rows, rw, w, ec, prior, tim)
         }
-        Engine::Host => encode_expert_host(hidden, inter, x, rows, w, ec, prior, tim),
+        Engine::Host => encode_expert_host(hidden, inter, x, rows, rw, w, ec, prior, tim),
     }
 }
 
@@ -1424,6 +1539,7 @@ fn encode_expert_gpu(
     inter: usize,
     lr: &[u16],
     rows: &[u32],
+    rw: Option<&[f32]>,
     w: &ExpertW,
     ec: &EncodeCfg,
     prior: Option<Prior>,
@@ -1445,9 +1561,12 @@ fn encode_expert_gpu(
         });
     };
     // the down input of the m rows in bufs.x (gate/up in yg/yu) into yd,
-    // times `scale`: the clamped SwiGLU when the model has a limit
-    let act = |m: usize, scale: f32| -> anyhow::Result<()> {
-        let d = if ec.limit > 0.0 {
+    // times `scale` (and, with `per_row`, each row's weight in bufs.rw):
+    // the clamped SwiGLU when the model has a limit
+    let act = |m: usize, scale: f32, per_row: bool| -> anyhow::Result<()> {
+        let d = if per_row {
+            to::swiglu_lim_rows(c, m * inter, &bufs.yg, &bufs.yu, &bufs.yd, &bufs.rw, inter, ec.limit, scale)
+        } else if ec.limit > 0.0 {
             to::swiglu_lim(c, m * inter, &bufs.yg, &bufs.yu, &bufs.yd, ec.limit, scale)
         } else {
             to::elt(c, "swiglu_fwd", m * inter, &bufs.yg, &bufs.yu, Some(&bufs.yd), None, None, None)
@@ -1456,7 +1575,7 @@ fn encode_expert_gpu(
         Ok(())
     };
     let mut xe = vec![0f32; CHUNK.min(rows.len().max(prior.map_or(0, |p| p.rows.len()))) * hidden];
-    for part in rows.chunks(CHUNK) {
+    for (ci, part) in rows.chunks(CHUNK).enumerate() {
         let m = part.len();
         let xs = &mut xe[..m * hidden];
         gather(xs, part, 1.0);
@@ -1464,7 +1583,10 @@ fn encode_expert_gpu(
         anyhow::ensure!(gpu::gram_add_dev(hid, &bufs.x, m), "gram");
         tm::plane_linear(c, &pg, &bufs.x, &bufs.act16, &bufs.yg, m, inter, hidden, 1.0).ok_or_else(|| anyhow::anyhow!("gemm"))?;
         tm::plane_linear(c, &pu, &bufs.x, &bufs.act16, &bufs.yu, m, inter, hidden, 1.0).ok_or_else(|| anyhow::anyhow!("gemm"))?;
-        act(m, 1.0)?;
+        if let Some(rw) = rw {
+            to::write(c, &bufs.rw, &rw[ci * CHUNK..ci * CHUNK + m]);
+        }
+        act(m, 1.0, rw.is_some())?;
         anyhow::ensure!(gpu::gram_add_dev(did, &bufs.yd, m), "gram");
     }
     if let Some(pr) = prior.filter(|p| !p.rows.is_empty() && p.n0 > 0.0) {
@@ -1490,7 +1612,7 @@ fn encode_expert_gpu(
             to::write(c, &bufs.x, xs);
             tm::plane_linear(c, &pg, &bufs.x, &bufs.act16, &bufs.yg, m, inter, hidden, 1.0).ok_or_else(|| anyhow::anyhow!("gemm"))?;
             tm::plane_linear(c, pub_.as_ref().unwrap_or(&pu), &bufs.x, &bufs.act16, &bufs.yu, m, inter, hidden, 1.0).ok_or_else(|| anyhow::anyhow!("gemm"))?;
-            act(m, if pub_.is_some() { 1.0 } else { b })?;
+            act(m, if pub_.is_some() { 1.0 } else { b }, false)?;
             anyhow::ensure!(gpu::gram_add_dev(did, &bufs.yd, m), "gram");
         }
     }
@@ -1549,6 +1671,7 @@ fn encode_expert_host(
     inter: usize,
     lr: &[u16],
     rows: &[u32],
+    rw: Option<&[f32]>,
     w: &ExpertW,
     ec: &EncodeCfg,
     prior: Option<Prior>,
@@ -1559,28 +1682,27 @@ fn encode_expert_host(
     let ts = Instant::now();
     let mut hgu = vec![0f64; hidden * hidden];
     let mut hd = vec![0f64; inter * inter];
-    let mut acc = |part: &[u32], sx: f64, sy: f32, gram_x: bool, gram_y: bool| {
+    // `pw`: per-row weights of the down input (route weights)
+    let mut acc = |part: &[u32], pw: Option<&[f32]>, sx: f64, sy: f32| {
         let x = gather_rows(lr, hidden, part, 1.0, threads);
         let m = part.len();
-        if gram_x {
-            gram_add_host(&mut hgu, &x, m, hidden, sx, threads);
+        gram_add_host(&mut hgu, &x, m, hidden, sx, threads);
+        let mut y = swiglu_rows(&x, m, hidden, &w.g, &w.u, inter, ec.limit, threads);
+        match pw {
+            Some(pw) => y.chunks_exact_mut(inter).zip(pw).for_each(|(row, &wr)| row.iter_mut().for_each(|v| *v *= wr * sy)),
+            None if sy != 1.0 => y.iter_mut().for_each(|v| *v *= sy),
+            None => {}
         }
-        if gram_y {
-            let mut y = swiglu_rows(&x, m, hidden, &w.g, &w.u, inter, ec.limit, threads);
-            if sy != 1.0 {
-                y.iter_mut().for_each(|v| *v *= sy);
-            }
-            gram_add_host(&mut hd, &y, m, inter, 1.0, threads);
-        }
+        gram_add_host(&mut hd, &y, m, inter, 1.0, threads);
     };
-    for part in rows.chunks(HCHUNK) {
-        acc(part, 1.0, 1.0, true, true);
+    for (ci, part) in rows.chunks(HCHUNK).enumerate() {
+        acc(part, rw.map(|v| &v[ci * HCHUNK..ci * HCHUNK + part.len()]), 1.0, 1.0);
     }
     if let Some(pr) = prior.filter(|p| !p.rows.is_empty() && p.n0 > 0.0) {
         let s = pr.rows.len() as f64;
         let (a2, b) = (pr.n0 / s, (pr.n0_down / s).sqrt() as f32);
         for part in pr.rows.chunks(HCHUNK) {
-            acc(part, a2, b, true, true);
+            acc(part, None, a2, b);
         }
     }
     tim[0] += ts.elapsed().as_secs_f64();
@@ -1738,6 +1860,8 @@ pub(crate) mod wgpu_bufs {
         pub yg: cortiq_engine::wgpu::Buffer,
         pub yu: cortiq_engine::wgpu::Buffer,
         pub yd: cortiq_engine::wgpu::Buffer,
+        /// One route weight per row.
+        pub rw: cortiq_engine::wgpu::Buffer,
     }
     impl Bufs {
         pub fn new(c: &cortiq_engine::gpu_wgpu::Ctx, rows: usize, hidden: usize, inter: usize) -> Self {
@@ -1748,6 +1872,7 @@ pub(crate) mod wgpu_bufs {
                 yg: to::zeros(c, rows * inter),
                 yu: to::zeros(c, rows * inter),
                 yd: to::zeros(c, rows * inter),
+                rw: to::zeros(c, rows),
             }
         }
     }
@@ -1950,7 +2075,7 @@ mod tests {
         let (hidden, ne, top_k, n) = (8usize, 12usize, 3usize, 50usize);
         let mut rng = Rng(5);
         let r: Vec<f32> = (0..n * (hidden + ne)).map(|_| rng.normal()).collect();
-        let mut out = LayerRows { x: Vec::new(), picks: Vec::new() };
+        let mut out = LayerRows { x: Vec::new(), picks: Vec::new(), w: Vec::new() };
         qwen4_layer_rows(&r, hidden, ne, top_k, &mut out);
         assert_eq!((out.x.len(), out.picks.len()), (n * hidden, n * top_k));
         for t in 0..n {
@@ -2145,13 +2270,67 @@ mod tests {
         for codec in [Codec::Q4tp, Codec::Q2tp] {
             let ec = EncodeCfg { codec, limit, lambda: 0.01, threads: 3 };
             let rtn = err(&rtn_expert(codec, &w, inter, hidden), codec);
-            let gptq = err(&encode_expert(Engine::Host, &mut None, hidden, inter, &x, &rows, &w, &ec, None, &mut [0.0; 5]).unwrap(), codec);
+            let gptq = err(&encode_expert(Engine::Host, &mut None, hidden, inter, &x, &rows, None, &w, &ec, None, &mut [0.0; 5]).unwrap(), codec);
             let prior = Prior { rows: &sample, n0: hidden as f64, n0_down: hidden as f64 / 4.0 };
-            let gptq_p = err(&encode_expert(Engine::Host, &mut None, hidden, inter, &x, &rows, &w, &ec, Some(prior), &mut [0.0; 5]).unwrap(), codec);
+            let gptq_p = err(&encode_expert(Engine::Host, &mut None, hidden, inter, &x, &rows, None, &w, &ec, Some(prior), &mut [0.0; 5]).unwrap(), codec);
             eprintln!("{codec:?}: held-out relative output error RTN {rtn:.5}, GPTQ {gptq:.5}, GPTQ + prior {gptq_p:.5}");
             assert!(gptq < 0.9 * rtn, "{codec:?}: GPTQ {gptq} not better than RTN {rtn}");
             assert!(gptq_p < rtn, "{codec:?}: GPTQ with the prior {gptq_p} not better than RTN {rtn}");
         }
+    }
+
+    /// Route weights that follow the input (as the router's do): rows of
+    /// one input cluster weigh 1, rows of a louder second cluster 0.05. On
+    /// held-out rows, in the error the MoE output sees (each row weighted by
+    /// w²), the route-weighted down Hessian beats the unweighted one; both
+    /// beat rounding. The gate/up Hessians are the same in both encodes.
+    #[test]
+    fn route_weighted_down_hessian_tracks_weighted_error() {
+        let _env = env_guard("4", "1");
+        let mut rng = Rng(37);
+        let (hidden, inter, n_half, n_ho_half) = (128, 64, 512, 128);
+        let xa = inputs(&mut rng, n_half + n_ho_half, hidden);
+        let xb: Vec<f32> = inputs(&mut rng, n_half + n_ho_half, hidden).iter().map(|v| v * 4.0).collect();
+        // calibration: a then b; held out: a then b
+        let mut x32 = Vec::new();
+        x32.extend_from_slice(&xa[..n_half * hidden]);
+        x32.extend_from_slice(&xb[..n_half * hidden]);
+        x32.extend_from_slice(&xa[n_half * hidden..]);
+        x32.extend_from_slice(&xb[n_half * hidden..]);
+        let x: Vec<u16> = x32.iter().map(|&v| f32_to_f16(v)).collect();
+        let n_cal = 2 * n_half;
+        let n_ho = 2 * n_ho_half;
+        let xh: Vec<f32> = x[n_cal * hidden..].iter().map(|&h| f16_to_f32(h)).collect();
+        let wt = |t: usize, half: usize| if t < half { 1.0f32 } else { 0.05 };
+        let rw: Vec<f32> = (0..n_cal).map(|t| wt(t, n_half)).collect();
+        let w_ho: Vec<f32> = (0..n_ho).map(|t| wt(t, n_ho_half)).collect();
+        let w = ExpertW { g: weights(&mut rng, inter, hidden, 0.15), u: weights(&mut rng, inter, hidden, 0.15), d: weights(&mut rng, hidden, inter, 0.1) };
+        let limit = 1.0;
+        let o_fp = expert_out(&xh, n_ho, hidden, &w.g, &w.u, &w.d, inter, limit, 2);
+        let (_, base_w) = row_err(&o_fp, &vec![0f32; o_fp.len()], hidden, &w_ho);
+        // (full expert error, error of the down projection alone: exact gate/up)
+        let err_w = |enc: &[Vec<u8>; 3], codec: Codec| -> (f64, f64) {
+            let [g, u, d] = dequant_expert(enc, inter, hidden, codec);
+            let o = expert_out(&xh, n_ho, hidden, &g, &u, &d, inter, limit, 2);
+            let od = expert_out(&xh, n_ho, hidden, &w.g, &w.u, &d, inter, limit, 2);
+            (row_err(&o, &o_fp, hidden, &w_ho).1 / base_w, row_err(&od, &o_fp, hidden, &w_ho).1 / base_w)
+        };
+        let rows: Vec<u32> = (0..n_cal as u32).collect();
+        for codec in [Codec::Q4tp, Codec::Q2tp] {
+            let ec = EncodeCfg { codec, limit, lambda: 0.01, threads: 3 };
+            let rtn = err_w(&rtn_expert(codec, &w, inter, hidden), codec);
+            let plain = err_w(&encode_expert(Engine::Host, &mut None, hidden, inter, &x, &rows, None, &w, &ec, None, &mut [0.0; 5]).unwrap(), codec);
+            let weighted = err_w(&encode_expert(Engine::Host, &mut None, hidden, inter, &x, &rows, Some(&rw), &w, &ec, None, &mut [0.0; 5]).unwrap(), codec);
+            eprintln!(
+                "{codec:?}: route-weighted held-out error, expert (down alone): RTN {:.5} ({:.5}), GPTQ unweighted {:.5} ({:.5}), GPTQ route-weighted {:.5} ({:.5})",
+                rtn.0, rtn.1, plain.0, plain.1, weighted.0, weighted.1
+            );
+            assert!(plain.0 < rtn.0 && weighted.0 < rtn.0, "{codec:?}: GPTQ not better than RTN: {rtn:?} {plain:?} {weighted:?}");
+            assert!(weighted.1 < 0.95 * plain.1, "{codec:?}: the route-weighted down Hessian does not cut the weighted down error: {plain:?} vs {weighted:?}");
+        }
+        // the per-row weights must match the rows
+        let ec = EncodeCfg { codec: Codec::Q4tp, limit, lambda: 0.01, threads: 3 };
+        assert!(encode_expert(Engine::Host, &mut None, hidden, inter, &x, &rows, Some(&rw[1..]), &w, &ec, None, &mut [0.0; 5]).is_err());
     }
 
     /// The device encode against the host reference (the lead runs it on a
@@ -2186,11 +2365,17 @@ mod tests {
             for codec in [Codec::Q4tp, Codec::Q2tp] {
                 let ec = EncodeCfg { codec, limit, lambda: 0.01, threads: 4 };
                 let prior = Some(Prior { rows: &sample, n0: hidden as f64, n0_down: hidden as f64 / 4.0 });
-                let host = err(&encode_expert(Engine::Host, &mut None, hidden, inter, &x, &rows, &w, &ec, prior, &mut [0.0; 5]).unwrap(), codec);
-                let dev = err(&encode_expert(Engine::Gpu(c), &mut None, hidden, inter, &x, &rows, &w, &ec, prior, &mut [0.0; 5]).unwrap(), codec);
+                let host = err(&encode_expert(Engine::Host, &mut None, hidden, inter, &x, &rows, None, &w, &ec, prior, &mut [0.0; 5]).unwrap(), codec);
+                let dev = err(&encode_expert(Engine::Gpu(c), &mut None, hidden, inter, &x, &rows, None, &w, &ec, prior, &mut [0.0; 5]).unwrap(), codec);
                 let rtn = err(&rtn_expert(codec, &w, inter, hidden), codec);
                 eprintln!("limit {limit} {codec:?}: RTN {rtn:.5} host {host:.5} device {dev:.5}");
                 assert!(dev < rtn && (dev - host).abs() < 0.05 * host + 1e-6, "limit {limit} {codec:?}: device {dev} vs host {host} (RTN {rtn})");
+                // route-weighted down Hessian (per-row weights on the device)
+                let rw: Vec<f32> = (0..n_cal).map(|t| 0.05 + (t % 7) as f32 * 0.2).collect();
+                let host = err(&encode_expert(Engine::Host, &mut None, hidden, inter, &x, &rows, Some(&rw), &w, &ec, prior, &mut [0.0; 5]).unwrap(), codec);
+                let dev = err(&encode_expert(Engine::Gpu(c), &mut None, hidden, inter, &x, &rows, Some(&rw), &w, &ec, prior, &mut [0.0; 5]).unwrap(), codec);
+                eprintln!("limit {limit} {codec:?} route-weighted: host {host:.5} device {dev:.5}");
+                assert!(dev < rtn && (dev - host).abs() < 0.05 * host + 1e-6, "limit {limit} {codec:?} route-weighted: device {dev} vs host {host} (RTN {rtn})");
             }
         }
     }
@@ -2303,7 +2488,9 @@ mod tests {
                         picks.push(ids[k] as u16);
                     }
                 }
-                LayerRows { x, picks }
+                // route weights in (0.05, 1.45]
+                let w: Vec<f32> = (0..n * top_k).map(|_| 0.75 + 0.7 * rng.uni()).collect();
+                LayerRows { x, picks, w }
             })
             .collect();
         // the local source directory, read in place
@@ -2317,7 +2504,7 @@ mod tests {
                 assert_eq!(shards, vec![format!("model-{:05}-of-{:05}.safetensors", li + 1, nl + 1)]);
                 let src = source.open_layer(&shards).unwrap();
                 let get = |part: Part, e: usize| dsv41_expert(&src, li, part, e, hidden, inter, 32);
-                let job = LayerJob { li, hidden, ne, inter, top_k, min_rows: 8, prior_n0: hidden as f64, prior_s: 128, held: &held };
+                let job = LayerJob { li, hidden, ne, inter, top_k, min_rows: 8, prior_n0: hidden as f64, prior_s: 128, held: &held, route_w: RouteW::Off };
                 let out = encode_layer(Engine::Host, &ec, &job, &rows[li], true, true, None, None, &get).unwrap();
                 assert_eq!((out.routed.len(), out.n_gptq + out.n_rtn), (ne, ne));
                 // the GPTQ'd payloads are the encode of this source, not the calibration's bytes
@@ -2350,20 +2537,30 @@ mod tests {
         // the held-out diagnostic (CMF_MOE_DIAG) on the same layer: every 4th
         // block of 80 tokens held out, RTN against GPTQ without and with the
         // prior, per row-count bin; GPTQ is never worse than rounding
+        // with CMF_MOE_ROUTE_W=diag each prior runs with the unweighted and
+        // the route-weighted down Hessian, and the error is also reported
+        // weighted by w² (what the MoE output sees)
         let held_d: Vec<bool> = (0..n).map(|t| (t / 80) % 4 == 3).collect();
-        for codec in [Codec::Q4tp, Codec::Q2tp] {
+        for (codec, route_w) in [(Codec::Q4tp, RouteW::Off), (Codec::Q2tp, RouteW::Off), (Codec::Q4tp, RouteW::Diag), (Codec::Q2tp, RouteW::Diag)] {
             let ec = EncodeCfg { codec, limit: 10.0, lambda: 0.01, threads: 2 };
             let names = dsv41_src_names(&source, 0, ne, true);
             let src = source.open_layer(&source.shards_of(&names).unwrap()).unwrap();
             let get = |part: Part, e: usize| dsv41_expert(&src, 0, part, e, hidden, inter, 32);
-            let job = LayerJob { li: 0, hidden, ne, inter, top_k, min_rows: 8, prior_n0: 0.0, prior_s: 128, held: &held_d };
-            let out = encode_layer(Engine::Host, &ec, &job, &rows[0], true, false, None, Some(&[0.0, hidden as f64]), &get).unwrap();
+            let job = LayerJob { li: 0, hidden, ne, inter, top_k, min_rows: 8, prior_n0: 0.0, prior_s: 128, held: &held_d, route_w };
+            let priors = [0.0, hidden as f64];
+            let out = encode_layer(Engine::Host, &ec, &job, &rows[0], true, false, None, Some(&priors), &get).unwrap();
             assert!(out.routed.is_empty() && out.shared.is_none(), "diagnostics write nothing");
             let measured: usize = out.diag.iter().map(|b| b.count).sum();
             assert_eq!(measured, ne, "every expert measured");
+            let vars = diag_variants(&priors, route_w);
+            assert_eq!(vars.len(), if route_w == RouteW::Diag { 4 } else { 2 });
             for b in out.diag.iter().filter(|b| b.count > 0) {
-                eprintln!("{codec:?} diag: {} experts, RTN {} GPTQ {} GPTQ+prior {}", b.count, b.rel(0), b.rel(1), b.rel(2));
-                assert!(b.err[1] <= b.err[0] && b.err[2] <= b.err[0], "{codec:?}: GPTQ worse than rounding on held-out rows: {:?}", b.err);
+                eprintln!("{codec:?} {route_w:?} diag: {} experts, RTN {} GPTQ {vars:?} {} | route-weighted RTN {} GPTQ {}", b.count, b.rel(0), b.rels(vars.len()), b.rel_w(0), b.rels_w(vars.len()));
+                assert!(b.base_w > 0.0, "the weighted metric is measured");
+                for (k, &(_, weighted)) in vars.iter().enumerate() {
+                    let (e, rtn) = if weighted { (b.err_w[k + 1], b.err_w[0]) } else { (b.err[k + 1], b.err[0]) };
+                    assert!(e <= rtn, "{codec:?} variant {:?}: GPTQ worse than rounding on held-out rows: {e} > {rtn}", vars[k]);
+                }
             }
         }
 

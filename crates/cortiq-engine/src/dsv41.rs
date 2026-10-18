@@ -1150,6 +1150,10 @@ pub struct Dsv41MoeCapture {
     /// Per captured layer: `top_k` routed expert ids per token, in route
     /// order (`u16::MAX` pads a route cut short by non-finite scores).
     pub picks: Vec<Vec<u16>>,
+    /// Per captured layer: the route weight of each pick (the factor the
+    /// expert's SwiGLU activation is multiplied by before `w2`, as in the
+    /// reference `Expert.forward`; 0 for a padded pick).
+    pub w: Vec<Vec<f32>>,
 }
 
 impl Dsv41State {
@@ -2855,15 +2859,6 @@ fn moe(
         shifted[i] = f32::NEG_INFINITY;
     }
     trace_moe(position, layer, image, &logits, &scores, bias, &picks);
-    if let Some(cap) = state.moe_capture.as_mut() {
-        if (cap.lo..cap.hi).contains(&layer) {
-            let k = layer - cap.lo;
-            cap.x[k].extend(x[..cfg.dim].iter().map(|&v| cortiq_core::quant::f32_to_f16(v)));
-            cap.picks[k].extend(
-                (0..cfg.top_k).map(|j| picks.get(j).map_or(u16::MAX, |&e| e as u16)),
-            );
-        }
-    }
     // `weights /= weights.sum() + 1e-20` only when more than one expert is
     // chosen (Gate.forward); the epsilon is not norm_eps.
     let sum = picks.iter().map(|&i| scores[i]).sum::<f32>() + 1e-20;
@@ -2875,6 +2870,16 @@ fn moe(
     } else {
         for &e in &picks {
             mix_weights[e] = scores[e] * cfg.route_scale;
+        }
+    }
+    if let Some(cap) = state.moe_capture.as_mut() {
+        if (cap.lo..cap.hi).contains(&layer) {
+            let k = layer - cap.lo;
+            cap.x[k].extend(x[..cfg.dim].iter().map(|&v| cortiq_core::quant::f32_to_f16(v)));
+            cap.picks[k].extend(
+                (0..cfg.top_k).map(|j| picks.get(j).map_or(u16::MAX, |&e| e as u16)),
+            );
+            cap.w[k].extend((0..cfg.top_k).map(|j| picks.get(j).map_or(0.0, |&e| mix_weights[e])));
         }
     }
     #[cfg(feature = "gpu")]
@@ -3297,6 +3302,7 @@ pub fn capture_window(
         stop_after_hi: true,
         x: (lo..hi).map(|_| Vec::with_capacity(ids.len() * cfg.dim)).collect(),
         picks: (lo..hi).map(|_| Vec::with_capacity(ids.len() * cfg.top_k)).collect(),
+        w: (lo..hi).map(|_| Vec::with_capacity(ids.len() * cfg.top_k)).collect(),
     });
     let mut logits = Vec::new();
     for (pos, &id) in ids.iter().enumerate() {
@@ -3316,8 +3322,8 @@ pub fn capture_window(
     }
     let cap = st.moe_capture.take().unwrap_or_default();
     st.clear();
-    for (k, (x, p)) in cap.x.iter().zip(&cap.picks).enumerate() {
-        if x.len() != ids.len() * cfg.dim || p.len() != ids.len() * cfg.top_k {
+    for (k, ((x, p), w)) in cap.x.iter().zip(&cap.picks).zip(&cap.w).enumerate() {
+        if x.len() != ids.len() * cfg.dim || p.len() != ids.len() * cfg.top_k || w.len() != p.len() {
             return Err(format!(
                 "layer {}: captured {} rows / {} routes for {} tokens",
                 lo + k,
@@ -4309,6 +4315,7 @@ mod tests {
             stop_after_hi: false,
             x: vec![Vec::new(); 2],
             picks: vec![Vec::new(); 2],
+            w: vec![Vec::new(); 2],
         });
         let mut logits = Vec::new();
         for (pos, &id) in ids.iter().enumerate() {
@@ -4318,6 +4325,7 @@ mod tests {
         let full = st.moe_capture.take().unwrap();
         assert_eq!(full.x[1], cap.x[0], "early stop changes no captured row");
         assert_eq!(full.picks[1], cap.picks[0]);
+        assert_eq!(full.w[1], cap.w[0]);
         assert_ne!(full.x[0], full.x[1], "layers capture their own inputs");
 
         // the route is V4.1's: sqrt-softplus scores + bias, top-k, from the captured row
@@ -4337,6 +4345,15 @@ mod tests {
             sh.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
             let want: Vec<u16> = sh[..cfg.top_k].iter().map(|&(_, e)| e as u16).collect();
             assert_eq!(&cap.picks[0][t * cfg.top_k..(t + 1) * cfg.top_k], &want[..], "token {t}");
+            // route weights: the picks' scores normalised to route_scale
+            let sc: Vec<f32> = want.iter().map(|&e| (1.0 + lg[e as usize].exp()).ln().sqrt()).collect();
+            let sum: f32 = sc.iter().sum();
+            for (j, &v) in sc.iter().enumerate() {
+                let got = cap.w[0][t * cfg.top_k + j];
+                assert!((got - v / sum * cfg.route_scale).abs() <= 1e-5 * cfg.route_scale, "token {t} pick {j}: weight {got}");
+            }
+            let tot: f32 = cap.w[0][t * cfg.top_k..(t + 1) * cfg.top_k].iter().sum();
+            assert!((tot - cfg.route_scale).abs() < 1e-4, "token {t}: weights sum to {tot}");
         }
     }
 }
