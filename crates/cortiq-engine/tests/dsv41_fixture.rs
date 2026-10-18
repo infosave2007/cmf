@@ -120,8 +120,8 @@ fn fixture_config_parses_to_its_geometry() {
         (IH, ID, INDEX_TOPK)
     );
     assert_eq!(
-        (c.candidate_topk_blocks, c.candidate_block_size),
-        (CAND_BLOCKS, CAND_BS)
+        (c.candidate_source, c.candidate_topk_blocks, c.candidate_block_size),
+        (Some(CANDIDATE_SOURCE), CAND_BLOCKS, CAND_BS)
     );
     assert_eq!(c.engram_layers, vec![ENGRAM_LAYER]);
     assert_eq!(c.engram_embeddings, vec![ENGRAM_ROWS]);
@@ -173,6 +173,31 @@ fn strict_cpu_forward_matches_f64_reference() {
         worst < 0.15,
         "strict CPU V4.1 forward drifted from the reference: {worst:.3e} at position {at}"
     );
+}
+
+/// `candidate_source_layer_id: -1` turns candidate pre-filtering off (it
+/// used to map to the release layer 20). With it off, the index consumer
+/// L3 ranks every compressed row, and the logits follow the reference
+/// without candidates, not the one with them.
+#[test]
+fn negative_candidate_source_runs_without_prefiltering() {
+    let fx = Fixture::build_with(RELEASE_COMPRESSED_VOCAB, None);
+    let l = load_fixture(&fx, "nocand");
+    assert_eq!(l.cfg.candidate_source, None);
+    let got = float_activations_scope(|| run(&l, fx.token_map(), &TOKENS, None));
+    let want = reference_logits(&fx, &TOKENS, RefOpts::cortiq());
+    let errs = per_position(&got, &want);
+    let exact = errs.iter().filter(|&&e| e < 1e-5).count();
+    let with = Fixture::build(RELEASE_COMPRESSED_VOCAB);
+    let (apart, _) = worst_rel(&got, &reference_logits(&with, &TOKENS, RefOpts::cortiq()));
+    println!(
+        "dsv41 fixture without candidates: [{}]; {exact}/{} exact; the run with \
+         candidates differs by up to {apart:.3e}",
+        fmt_errs(&errs),
+        TOKENS.len()
+    );
+    assert!(exact * 3 >= TOKENS.len() * 2, "[{}]", fmt_errs(&errs));
+    assert!(apart > 1e-3, "candidate pre-filtering never changed a pick");
 }
 
 /// The default CPU path (A8W8 activations where the host has the int8

@@ -91,4 +91,38 @@ The CPU tests run in CI on ubuntu (x86 AVX2) and macOS; the bounds were
 measured on ARM only. The x86 strict path regroups f32 sums (AVX2), which
 changes where BF16 flips land, not whether the structure agrees.
 
-GPU test: see part 1 GPU section below.
+GPU test: see "GPU" below.
+
+## Part 2: loader hardening
+
+- `text_config.scoring_func` (alias `score_func`, the inference/ModelArgs
+  spelling) is read; anything but `"sqrtsoftplus"` is refused with an error
+  naming the key and the supported rule. Absent = sqrtsoftplus (release and
+  reference default). The CPU router and the preweighted GPU bank implement
+  only sqrt-softplus, so a softmax/sigmoid config used to be routed with the
+  wrong rule silently.
+- `candidate_source_layer_id` (alias `candidate_source_layer`) is read as a
+  signed integer; negative = pre-filtering off (`Dsv41Cfg.candidate_source:
+  Option<usize>`). Before, `-1` failed `as_u64()` and fell back to 20, so
+  every layer after 20 would have masked its index scores with candidates the
+  config had disabled. An absent key still means the release layer 20, like
+  every other release-shaped default of this parser (the reference default
+  is -1; no published config omits the key). A non-integer is refused.
+- Router softplus is `exp(x).ln_1p()` (torch `log1p(exp(x))`, linear past
+  20): `(1 + e^x).ln()` returned an exact zero score below x ~ -17.
+- Router normalization follows `Gate.forward`: divide by `sum + 1e-20` only
+  when `norm_topk_prob && top_k > 1` (it was `max(1e-20)` and also for
+  top-1).
+- Config fixtures: `tests/fixtures/dsv41/config_1017.json` (HF layout) and
+  `inference_config_1017.json` (flat ModelArgs keys), byte copies from the
+  1017 repo (sha256 `8be45ce0...e21879` for config.json). Both parse to the
+  same explicit release `Dsv41Cfg` with an arch whose every fallback is
+  wrong; the test passed against the 0.8.23 parser before the changes
+  above (candidate source was then the bare `20`).
+- The fixture has an end-to-end variant with `candidate_source_layer_id: -1`:
+  strict CPU matches the no-candidate reference at 12/12 positions, while the
+  candidate run differs from it by up to 0.29 (so the switch is observable).
+
+Not changed: `dsv4::route` (V4 base) still uses `(1 + e^x).ln()`; V4 is out
+of scope for this wave. `topk_method` is not validated (only `noaux_tc`
+exists for V4.1).

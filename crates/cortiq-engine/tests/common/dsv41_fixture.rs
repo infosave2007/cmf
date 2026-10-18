@@ -175,6 +175,9 @@ pub struct Fixture {
     pub engram_scales: Vec<u8>,
     pub source: Value,
     pub compressed_vocab: usize,
+    /// `Some(CANDIDATE_SOURCE)`, or `None` written as
+    /// `candidate_source_layer_id: -1` (pre-filtering off).
+    pub candidate_source: Option<usize>,
     rng: Rng,
 }
 
@@ -233,6 +236,11 @@ impl Fixture {
     /// loaded through `Pipeline` without a tokenizer (every id then decodes
     /// to the same empty key).
     pub fn build(compressed_vocab: usize) -> Self {
+        Self::build_with(compressed_vocab, Some(CANDIDATE_SOURCE))
+    }
+
+    /// Same weights (one seed), with candidate pre-filtering on or off.
+    pub fn build_with(compressed_vocab: usize, candidate_source: Option<usize>) -> Self {
         let mut fx = Self {
             specs: Vec::new(),
             w: HashMap::new(),
@@ -240,9 +248,10 @@ impl Fixture {
             engram_scales: Vec::new(),
             source: Value::Null,
             compressed_vocab,
+            candidate_source,
             rng: Rng::new(0xD541_F1C5),
         };
-        fx.source = source_config(compressed_vocab);
+        fx.source = source_config(compressed_vocab, candidate_source);
         fx.vec_bf16("model.embed_tokens.weight", &[VOCAB, DIM], 1.0, 0.0);
         fx.vec_bf16("model.norm.weight", &[DIM], 0.1, 1.0);
         fx.linear("lm_head.weight", VOCAB, DIM, Kind::Bf16);
@@ -533,7 +542,8 @@ impl Fixture {
 
 /// The `config.json` preserved in the container, shaped like the release
 /// file (`text_config` nesting, HF key spellings).
-pub fn source_config(compressed_vocab: usize) -> Value {
+pub fn source_config(compressed_vocab: usize, candidate_source: Option<usize>) -> Value {
+    let candidate = candidate_source.map_or(-1, |layer| layer as i64);
     json!({
         "architectures": ["DeepseekV41ForCausalLM"],
         "model_type": "deepseek_v41",
@@ -584,7 +594,7 @@ pub fn source_config(compressed_vocab: usize) -> Value {
             "index_n_heads": IH,
             "index_head_dim": ID,
             "index_topk": INDEX_TOPK,
-            "candidate_source_layer_id": CANDIDATE_SOURCE,
+            "candidate_source_layer_id": candidate,
             "candidate_topk_blocks": CAND_BLOCKS,
             "candidate_block_size": CAND_BS,
             "hc_mult": HC,
@@ -1110,9 +1120,9 @@ fn indexer(
         }
         *score = bf(s);
     }
-    if li == CANDIDATE_SOURCE {
+    if fx.candidate_source == Some(li) {
         st.candidates = select_candidate_blocks(&scores, compress_len);
-    } else if CANDIDATE_SOURCE < li {
+    } else if fx.candidate_source.is_some_and(|c| c < li) {
         for (t, score) in scores.iter_mut().enumerate() {
             if !st.candidates.get(t).copied().unwrap_or(false) {
                 *score = f64::NEG_INFINITY;

@@ -770,7 +770,9 @@ pub struct Dsv41Cfg {
     pub index_heads: usize,
     pub index_head_dim: usize,
     pub index_topk: usize,
-    pub candidate_source: usize,
+    /// Candidate pre-filtering source layer; `None` disables the two-level
+    /// top-k (`candidate_source_layer_id < 0` in the source config).
+    pub candidate_source: Option<usize>,
     pub candidate_topk_blocks: usize,
     pub candidate_block_size: usize,
     pub kv_sources: Vec<usize>,
@@ -910,6 +912,36 @@ impl Dsv41Cfg {
                 a
             }
         };
+        // The router: V4.1 scores experts with sqrt(softplus(logits)). The
+        // reference also implements softmax and sigmoid scoring; this runtime
+        // (CPU and the preweighted GPU bank) implements only sqrtsoftplus, so
+        // any other value is refused rather than routed with the wrong rule.
+        // An absent key is the release (and the reference default).
+        if let Some(func) = tc.get("scoring_func").or_else(|| tc.get("score_func")) {
+            if func.as_str() != Some("sqrtsoftplus") {
+                return Err(format!(
+                    "text_config.scoring_func = {func} is not supported; the DeepSeek-V4.1 \
+                     runtime implements only \"sqrtsoftplus\" routing (sqrt(softplus(logits)))"
+                ));
+            }
+        }
+        // `candidate_source_layer < 0 turns it off` (reference ModelArgs). An
+        // absent key keeps the release layer, like every other default here.
+        let candidate_source = match ["candidate_source_layer", "candidate_source_layer_id"]
+            .iter()
+            .find_map(|key| tc.get(key))
+        {
+            None => Some(20),
+            Some(v) => match v.as_i64() {
+                Some(layer) if layer < 0 => None,
+                Some(layer) => Some(layer as usize),
+                None => {
+                    return Err(format!(
+                        "text_config.candidate_source_layer_id = {v} is not an integer"
+                    ));
+                }
+            },
+        };
         let engram_layers = array_of("engram_layer_ids");
         let engram_embeddings = array_of("engram_num_embeddings");
         let cfg = Dsv41Cfg {
@@ -978,10 +1010,7 @@ impl Dsv41Cfg {
             index_heads: usize_any(&["index_n_heads", "indexer_n_heads"], 32),
             index_head_dim: usize_any(&["index_head_dim", "indexer_head_dim"], 128),
             index_topk: usize_any(&["index_topk", "indexer_topk"], 512),
-            candidate_source: usize_any(
-                &["candidate_source_layer", "candidate_source_layer_id"],
-                20,
-            ),
+            candidate_source,
             candidate_topk_blocks: usize_any(&["candidate_topk_blocks"], 2048),
             candidate_block_size: usize_any(&["candidate_block_size"], 8),
             kv_sources,
@@ -2027,7 +2056,9 @@ fn attention(
         let comp_len = st.packed.main_rows(si);
         if comp_len > 0 {
             if let Some(ix) = &l.indexer {
-                let candidates = if li > cfg.candidate_source && !st.candidates.is_empty() {
+                let candidates = if cfg.candidate_source.is_some_and(|c| li > c)
+                    && !st.candidates.is_empty()
+                {
                     Some(st.candidates.as_slice())
                 } else {
                     None
@@ -2047,7 +2078,7 @@ fn attention(
                     pool,
                 );
                 trace_indices(st.pos, li, &result.picked);
-                if cfg.candidate_source == li {
+                if cfg.candidate_source == Some(li) {
                     st.candidates = candidate_blocks(
                         &result.scores,
                         cfg.candidate_topk_blocks,
@@ -2732,12 +2763,11 @@ fn moe(
     } else {
         &l.gate_bias
     };
-    let mut scores = Vec::with_capacity(logits.len());
     let temperature = cfg.gate_temp.max(f32::MIN_POSITIVE);
-    for &v in &logits {
-        let v = v / temperature;
-        scores.push(if v > 20.0 { v } else { (1.0 + v.exp()).ln() }.sqrt());
-    }
+    let scores: Vec<f32> = logits
+        .iter()
+        .map(|&v| sqrt_softplus(v / temperature))
+        .collect();
     let mut shifted: Vec<f32> = scores
         .iter()
         .enumerate()
@@ -2760,9 +2790,11 @@ fn moe(
         shifted[i] = f32::NEG_INFINITY;
     }
     trace_moe(position, layer, image, &logits, &scores, bias, &picks);
-    let sum = picks.iter().map(|&i| scores[i]).sum::<f32>().max(1e-20);
+    // `weights /= weights.sum() + 1e-20` only when more than one expert is
+    // chosen (Gate.forward); the epsilon is not norm_eps.
+    let sum = picks.iter().map(|&i| scores[i]).sum::<f32>() + 1e-20;
     let mut mix_weights = vec![0.0f32; cfg.n_routed_experts];
-    if cfg.norm_topk_prob {
+    if cfg.norm_topk_prob && cfg.top_k > 1 {
         for &e in &picks {
             mix_weights[e] = scores[e] / sum * cfg.route_scale;
         }
@@ -2831,6 +2863,14 @@ fn moe(
     // MoE returns `y.type_as(x)` after accumulating routed and shared
     // branches in f32.
     bf16_inplace(out);
+}
+
+/// `F.softplus(x).sqrt()`: `log1p(exp(x))`, linear past torch's threshold
+/// of 20. `ln_1p` keeps strongly negative logits positive; `(1 + e^x).ln()`
+/// rounds them to an exact zero score below x ~ -17.
+#[inline]
+fn sqrt_softplus(v: f32) -> f32 {
+    if v > 20.0 { v } else { v.exp().ln_1p() }.sqrt()
 }
 
 fn hc_mixes(
@@ -3469,6 +3509,172 @@ pub mod packed_kv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fallback-only arch: every value differs from the release, so a key
+    /// the parser fails to read from the source config shows up as a
+    /// mismatch instead of silently agreeing.
+    fn decoy_arch() -> cortiq_core::ModelArch {
+        serde_json::from_value(serde_json::json!({
+            "arch_name": "deepseek_v41",
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_layers": 3,
+            "num_attention_heads": 2,
+            "num_kv_heads": 1,
+            "head_dim": 4,
+            "vocab_size": 32,
+            "layer_types": ["FullAttention", "FullAttention", "FullAttention"],
+            "rms_norm_eps": 0.5,
+            "max_position_embeddings": 64,
+            "linear_conv_kernel_dim": 0,
+            "linear_num_key_heads": 0,
+            "linear_num_value_heads": 0,
+            "rope_theta": 7.0,
+            "sliding_window": 3,
+        }))
+        .unwrap()
+    }
+
+    fn release_1017_cfg() -> Dsv41Cfg {
+        let mut compress_ratios = vec![0, 0];
+        compress_ratios.extend(std::iter::repeat_n(2, 18));
+        compress_ratios.extend(std::iter::repeat_n(1, 20));
+        Dsv41Cfg {
+            dim: 5120,
+            n_heads: 64,
+            head_dim: 512,
+            rope_head_dim: 64,
+            q_lora_rank: 1280,
+            o_lora_rank: 1024,
+            o_groups: 8,
+            hc_mult: 4,
+            hc_sinkhorn_iters: 20,
+            hc_eps: 1e-6,
+            norm_eps: 1e-20,
+            n_routed_experts: 384,
+            top_k: 6,
+            moe_inter: 2304,
+            gate_temp: 1.0,
+            norm_topk_prob: true,
+            route_scale: 1.5,
+            swiglu_limit: 10.0,
+            window: 128,
+            rope_theta: 10_000.0,
+            compress_rope_theta: 160_000.0,
+            rope_factor: 16.0,
+            original_seq_len: 65_536,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            index_heads: 32,
+            index_head_dim: 128,
+            index_topk: 512,
+            candidate_source: Some(20),
+            candidate_topk_blocks: 2048,
+            candidate_block_size: 8,
+            kv_sources: vec![2, 8, 14, 20],
+            index_sources: vec![2, 8, 14, 20, 24, 28, 32, 36],
+            compress_ratios,
+            engram_layers: vec![1, 14],
+            engram_vocab: 16_000_000,
+            engram_embeddings: vec![384_006_168, 384_016_682],
+            engram_max_ngram: 4,
+            engram_heads: 8,
+            engram_head_dim: 256,
+            engram_compressed_vocab: 99_092,
+            engram_pad_id: 2,
+            vocab: 129_280,
+        }
+    }
+
+    /// The published DeepSeek-V4.1-Flash-1017 `config.json` (HF layout,
+    /// `text_config`) and its `inference/config.json` (flat ModelArgs keys)
+    /// both parse to the release geometry, independent of the arch
+    /// fallbacks. The expected values were checked against the parser as it
+    /// stood in cortiq 0.8.23.
+    #[test]
+    fn release_1017_configs_parse_to_release_geometry() {
+        let hf: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/dsv41/config_1017.json")).unwrap();
+        let flat: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/dsv41/inference_config_1017.json"
+        ))
+        .unwrap();
+        for (name, source) in [("config.json", &hf), ("inference/config.json", &flat)] {
+            let (cfg, n_layers) = Dsv41Cfg::from_source(source, &decoy_arch()).unwrap();
+            assert_eq!(n_layers, 40, "{name}");
+            assert_eq!(cfg, release_1017_cfg(), "{name}");
+        }
+    }
+
+    fn release_text_config() -> serde_json::Value {
+        let hf: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/dsv41/config_1017.json")).unwrap();
+        hf["text_config"].clone()
+    }
+
+    #[test]
+    fn scoring_func_other_than_sqrtsoftplus_is_refused() {
+        for key in ["scoring_func", "score_func"] {
+            for bad in [
+                serde_json::json!("softmax"),
+                serde_json::json!("sigmoid"),
+                serde_json::json!(1),
+            ] {
+                let mut tc = release_text_config();
+                tc.as_object_mut().unwrap().remove("scoring_func");
+                tc[key] = bad.clone();
+                let err = Dsv41Cfg::from_source(&tc, &decoy_arch()).unwrap_err();
+                assert!(
+                    err.contains("scoring_func") && err.contains("sqrtsoftplus"),
+                    "{key}={bad}: {err}"
+                );
+            }
+            let mut tc = release_text_config();
+            tc.as_object_mut().unwrap().remove("scoring_func");
+            tc[key] = serde_json::json!("sqrtsoftplus");
+            assert!(Dsv41Cfg::from_source(&tc, &decoy_arch()).is_ok(), "{key}");
+        }
+        let mut tc = release_text_config();
+        tc.as_object_mut().unwrap().remove("scoring_func");
+        assert!(Dsv41Cfg::from_source(&tc, &decoy_arch()).is_ok(), "absent");
+    }
+
+    #[test]
+    fn negative_candidate_source_disables_candidates() {
+        for key in ["candidate_source_layer_id", "candidate_source_layer"] {
+            let mut tc = release_text_config();
+            tc.as_object_mut()
+                .unwrap()
+                .remove("candidate_source_layer_id");
+            tc[key] = serde_json::json!(-1);
+            let (cfg, _) = Dsv41Cfg::from_source(&tc, &decoy_arch()).unwrap();
+            assert_eq!(cfg.candidate_source, None, "{key}");
+            tc[key] = serde_json::json!(7);
+            let (cfg, _) = Dsv41Cfg::from_source(&tc, &decoy_arch()).unwrap();
+            assert_eq!(cfg.candidate_source, Some(7), "{key}");
+            tc[key] = serde_json::json!("20");
+            assert!(Dsv41Cfg::from_source(&tc, &decoy_arch()).is_err(), "{key}");
+        }
+        let mut tc = release_text_config();
+        tc.as_object_mut()
+            .unwrap()
+            .remove("candidate_source_layer_id");
+        let (cfg, _) = Dsv41Cfg::from_source(&tc, &decoy_arch()).unwrap();
+        assert_eq!(cfg.candidate_source, Some(20), "absent keeps the release layer");
+    }
+
+    #[test]
+    fn sqrt_softplus_keeps_negative_logits_positive() {
+        for x in [-40.0f32, -30.0, -17.5, -3.0, 0.0, 1.5, 19.9, 20.0, 25.0] {
+            let xd = x as f64;
+            let want = if xd > 20.0 { xd } else { xd.exp().ln_1p() }.sqrt();
+            let got = sqrt_softplus(x) as f64;
+            assert!(got > 0.0, "x={x}");
+            assert!((got - want).abs() <= want * 1e-6, "x={x}: {got} vs {want}");
+        }
+        // The old (1 + e^x).ln() form returned exactly zero here.
+        assert_eq!((1.0f32 + (-30.0f32).exp()).ln(), 0.0);
+    }
 
     #[test]
     fn fp8_reference_points() {
