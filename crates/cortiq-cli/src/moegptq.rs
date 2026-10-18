@@ -156,6 +156,7 @@ enum Family {
 pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     let t0 = Instant::now();
     let codec = Codec::parse(o.codec)?;
+    anyhow::ensure!(!(o.in_place && !o.output.is_empty()), "--output and --in-place are exclusive (--in-place writes into the calibration file)");
     // The host path is exact but far too slow for a full model: it runs
     // only when asked for, never as a silent fallback.
     let host_forced = std::env::var("CMF_MOE_HOST").is_ok_and(|v| v != "0");

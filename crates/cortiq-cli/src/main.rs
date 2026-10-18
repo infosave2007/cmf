@@ -920,7 +920,7 @@ enum Commands {
         scratch: String,
         #[arg(long, default_value = "16")]
         threads: usize,
-        #[arg(long, required_unless_present_any = ["patch_shared", "in_place"])]
+        #[arg(long, required_unless_present_any = ["patch_shared", "in_place"], conflicts_with = "in_place")]
         output: Option<String>,
         /// Re-encode only the shared experts of this existing quantize-moe
         /// output, in place (no --output file is written)
@@ -9683,6 +9683,27 @@ mod tests {
             }
             _ => panic!("wrong subcommand"),
         }
+    }
+
+    /// `quantize-moe --in-place` writes into the calibration file, so an
+    /// `--output` next to it is refused at parse time.
+    #[test]
+    fn moegptq_output_conflicts_with_in_place() {
+        let parse = |args: &'static [&'static str]| {
+            std::thread::Builder::new()
+                .name("quantize-moe-parser".into())
+                .stack_size(8 * 1024 * 1024)
+                .spawn(move || Cli::try_parse_from(args).map(|_| ()).map_err(|e| e.kind()))
+                .unwrap()
+                .join()
+                .unwrap()
+        };
+        let base = ["cortiq", "quantize-moe", "calib.cmf", "--hf", "src", "--calib", "c.txt"];
+        let with = |extra: &[&'static str]| -> &'static [&'static str] { Box::leak([&base[..], extra].concat().into_boxed_slice()) };
+        assert_eq!(parse(with(&["--in-place", "--output", "x.cmf"])), Err(clap::error::ErrorKind::ArgumentConflict));
+        assert_eq!(parse(with(&["--in-place"])), Ok(()));
+        assert_eq!(parse(with(&["--output", "x.cmf"])), Ok(()));
+        assert_eq!(parse(with(&[])), Err(clap::error::ErrorKind::MissingRequiredArgument));
     }
 
     #[test]
