@@ -259,10 +259,19 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     // calibration windows
     let srcs: Vec<CalibSource> = o.calib.iter().map(|s| CalibSource::parse(s)).collect::<anyhow::Result<_>>()?;
     let budgets = split_calib_budget(&srcs, o.tokens);
+    // V4.1: every window is a sequence of its own from position 0, so it
+    // starts with BOS as every request does (not mid-text at position 0)
+    let bos = match family {
+        Family::Dsv41 => Some(p.tokenizer.bos_token_id.unwrap_or(0)),
+        Family::Qwen4 => None,
+    };
     let mut windows: Vec<Vec<u32>> = Vec::new();
     for (src, &n) in srcs.iter().zip(&budgets) {
         let ids = calib_source_tokens(&src.path, n, &|t| p.tokenizer.encode(t))?;
-        windows.extend(ids.chunks(o.window).filter(|w| w.len() >= 16).map(<[u32]>::to_vec));
+        windows.extend(calib_windows(&ids, o.window, bos));
+    }
+    if let Some(b) = bos {
+        eprintln!("every calibration window starts with BOS (id {b})");
     }
     let ntok: usize = windows.iter().map(Vec::len).sum();
     eprintln!("calibrating on {ntok} tokens ({} windows)", windows.len());
@@ -566,6 +575,27 @@ impl Sink {
                 Ok(())
             }
         }
+    }
+}
+
+/// One source's calibration ids cut into windows of `window` tokens; with
+/// `bos` each window starts with it and carries `window − 1` text tokens.
+/// Windows under 16 tokens are dropped.
+fn calib_windows(ids: &[u32], window: usize, bos: Option<u32>) -> Vec<Vec<u32>> {
+    match bos {
+        None => ids.chunks(window.max(1)).filter(|w| w.len() >= 16).map(<[u32]>::to_vec).collect(),
+        Some(b) => ids
+            .chunks(window.max(2) - 1)
+            .map(|c| {
+                let mut w = Vec::with_capacity(c.len() + 1);
+                if c.first() != Some(&b) {
+                    w.push(b);
+                }
+                w.extend_from_slice(c);
+                w
+            })
+            .filter(|w| w.len() >= 16)
+            .collect(),
     }
 }
 
@@ -1908,6 +1938,25 @@ mod tests {
             got.sort_unstable();
             assert_eq!(got, want, "token {t}");
         }
+    }
+
+    /// Calibration windows: plain chunks without a BOS (Flash-Next, as
+    /// before); with one, every window starts with it at `window` tokens.
+    #[test]
+    fn calib_windows_start_with_bos() {
+        let ids: Vec<u32> = (1..=100).collect();
+        let plain = calib_windows(&ids, 32, None);
+        assert_eq!(plain, ids.chunks(32).take(3).map(<[u32]>::to_vec).collect::<Vec<_>>(), "the 4-token tail is dropped");
+        let w = calib_windows(&ids, 32, Some(0));
+        assert_eq!(w.len(), 3, "the 7-token tail (8 with BOS) is dropped");
+        for (k, win) in w.iter().enumerate() {
+            assert_eq!(win.len(), 32);
+            assert_eq!(win[0], 0);
+            assert_eq!(&win[1..], &ids[k * 31..(k + 1) * 31]);
+        }
+        // a chunk that already starts with BOS gets no second one
+        let w = calib_windows(&[7u32; 40], 20, Some(7));
+        assert!(w.iter().all(|x| x[0] == 7 && x.len() == 19));
     }
 
     /// The V4.1 prior defaults to one hidden width while the mean expert
