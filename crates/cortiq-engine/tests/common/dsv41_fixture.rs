@@ -11,6 +11,8 @@
 //!       q2tp gate/up experts
 //!   L4  ratio 0 after the sources (window only), F32 attention linears
 //!
+//! (`Fixture::build_q2_even` flips the gate/up layout: q2tp on L0/L2/L4.)
+//!
 //! The reference follows the BF16 checkpoint mode of `model.py` (weights
 //! are already dequantized, so `linear()` is a plain BF16 GEMM): every
 //! tensor the reference materializes as BF16 is rounded here as well, and
@@ -241,6 +243,23 @@ impl Fixture {
 
     /// Same weights (one seed), with candidate pre-filtering on or off.
     pub fn build_with(compressed_vocab: usize, candidate_source: Option<usize>) -> Self {
+        Self::build_impl(compressed_vocab, candidate_source, 1)
+    }
+
+    /// The gate/up layout flipped: q2tp on the even layers (L0, L2, L4),
+    /// q4tp on L1 and L3. The device MoE bank takes the first MoE layer's
+    /// layout, so this is the variant that puts the q2tp bank on the card.
+    /// Different weights from `build` (the payload sizes move the seed).
+    pub fn build_q2_even(compressed_vocab: usize) -> Self {
+        Self::build_impl(compressed_vocab, Some(CANDIDATE_SOURCE), 0)
+    }
+
+    /// `q2_parity`: the layers with `li % 2 == q2_parity` get q2tp gate/up.
+    fn build_impl(
+        compressed_vocab: usize,
+        candidate_source: Option<usize>,
+        q2_parity: usize,
+    ) -> Self {
         let mut fx = Self {
             specs: Vec::new(),
             w: HashMap::new(),
@@ -304,7 +323,7 @@ impl Fixture {
             // The router is an FP32 linear in the reference.
             fx.vec_bf16(&format!("{p}.mlp.gate.weight"), &[EXPERTS, DIM], 0.4, 0.0);
             fx.vec_f32(&format!("{p}.mlp.expert_bias"), &[EXPERTS], 0.1, 0.0);
-            let gu = if li % 2 == 1 { Kind::Q2tp } else { Kind::Q4tp };
+            let gu = if li % 2 == q2_parity { Kind::Q2tp } else { Kind::Q4tp };
             for e in 0..EXPERTS {
                 let x = format!("{p}.mlp.experts.{e}");
                 fx.linear(&format!("{x}.gate_proj.weight"), INTER, DIM, gu);
@@ -497,7 +516,20 @@ impl Fixture {
         }
     }
 
+    /// Write the container, open it and remove its temporary directory.
+    /// The mapping keeps the unlinked file alive for the model's lifetime
+    /// (unix), so nothing is left in the temp dir after the test.
+    pub fn open(&self, tag: &str) -> std::sync::Arc<cortiq_core::CmfModel> {
+        let path = self.write(tag);
+        let model = cortiq_core::CmfModel::open(&path).expect("open fixture");
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        std::sync::Arc::new(model)
+    }
+
     /// Write the container into a fresh directory and return its path.
+    /// Prefer `open`, which also cleans the directory up.
     pub fn write(&self, tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "cmf-dsv41-fixture-{tag}-{}-{}",
@@ -1442,4 +1474,85 @@ pub fn argmax64(v: &[f64]) -> usize {
         .max_by(|a, b| a.1.total_cmp(b.1))
         .map(|(i, _)| i)
         .unwrap()
+}
+
+/// Per-position relative logit errors (`worst_rel` of each position).
+pub fn per_position(got: &[Vec<f32>], want: &[Vec<f64>]) -> Vec<f64> {
+    got.iter()
+        .zip(want)
+        .map(|(g, w)| worst_rel(std::slice::from_ref(g), std::slice::from_ref(w)).0)
+        .collect()
+}
+
+pub fn median(errs: &[f64]) -> f64 {
+    let mut v = errs.to_vec();
+    v.sort_by(f64::total_cmp);
+    let n = v.len();
+    if n == 0 {
+        0.0
+    } else if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        0.5 * (v[n / 2 - 1] + v[n / 2])
+    }
+}
+
+pub fn fmt_errs(errs: &[f64]) -> String {
+    errs.iter()
+        .map(|e| format!("{e:.1e}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub fn argmax_agree(got: &[Vec<f32>], want: &[Vec<f64>]) -> usize {
+    got.iter()
+        .zip(want)
+        .filter(|(g, w)| argmax32(g) == argmax64(w))
+        .count()
+}
+
+/// A position "agrees" with the reference within this relative error.
+pub const EXACT: f64 = 1e-5;
+
+/// The strict CPU path (exact activations) against the f64 reference.
+///
+/// aarch64, where the bounds were measured (M4; the macOS CI runner is Apple
+/// Silicon and runs the same NEON f32 kernels, none of them dispatched on a
+/// CPU feature): at least `min_exact` positions within `EXACT` and the worst
+/// below `worst_max`. Other targets (x86 AVX2 on the ubuntu CI) group the f32
+/// sums differently, which moves where a value lands on the other side of a
+/// BF16 boundary. That path is not measured, so there the median position
+/// must agree within `EXACT` (a structural regression moves every position)
+/// and the worst stay below 0.15: two other summation orders on this
+/// fixture, the A8W8 CPU path and the device kernels, each put a 7.5e-2
+/// flip on position 8, which the ARM strict path happens not to have.
+pub fn assert_strict_agreement(label: &str, errs: &[f64], min_exact: usize, worst_max: f64) {
+    let exact = errs.iter().filter(|&&e| e < EXACT).count();
+    let worst = errs.iter().copied().fold(0.0f64, f64::max);
+    let med = median(errs);
+    if cfg!(target_arch = "aarch64") {
+        assert!(
+            exact >= min_exact,
+            "{label}: only {exact}/{} positions agree with the reference to {EXACT:e} \
+             (want {min_exact}): [{}]",
+            errs.len(),
+            fmt_errs(errs)
+        );
+        assert!(
+            worst < worst_max,
+            "{label}: worst position {worst:.3e} (bound {worst_max:e}): [{}]",
+            fmt_errs(errs)
+        );
+    } else {
+        assert!(
+            med < EXACT,
+            "{label}: median position {med:.3e} is not exact: [{}]",
+            fmt_errs(errs)
+        );
+        assert!(
+            worst < 0.15,
+            "{label}: worst position {worst:.3e}: [{}]",
+            fmt_errs(errs)
+        );
+    }
 }
