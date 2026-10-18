@@ -233,6 +233,16 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
         }
     }
     let cmodel = Arc::new(CmfModel::open_sharded(o.calib_model)?);
+    // a new file is opened with truncation: never the calibration model
+    // (mapped, read by the forward, the input of a later --in-place run)
+    for f in calib_files(o.calib_model, &cmodel) {
+        if !o.output.is_empty() && same_file(Path::new(o.output), &f) {
+            anyhow::bail!("--output {} is the calibration file {} (writing it would truncate it): write to another path, or use --in-place", o.output, f.display());
+        }
+        if let Some(t) = o.patch_shared.filter(|t| same_file(Path::new(t), &f)) {
+            anyhow::bail!("--patch-shared {t} is the calibration file {}: it patches an existing quantize-moe output (--in-place rewrites the calibration file)", f.display());
+        }
+    }
     let arch = cmodel.arch().clone();
     let nl = arch.num_layers;
     let hidden = arch.hidden_size;
@@ -822,6 +832,38 @@ fn check_slots(cm: &CmfModel, triples: &[(usize, usize, usize)], codec: Codec, t
         }
     }
     Ok(())
+}
+
+/// The files of the calibration model: the one given and, when it is shard
+/// 1 of a sharded model, its siblings (`…-{no:05}-of-{count:05}.cmf`).
+fn calib_files(path: &str, cm: &CmfModel) -> Vec<PathBuf> {
+    let p = Path::new(path);
+    let mut files = vec![p.to_path_buf()];
+    if let Some(info) = cm.header.shard.as_ref() {
+        let tag1 = format!("-{:05}-of-{:05}.cmf", 1, info.count);
+        if let Some(stem) = p.file_name().and_then(|n| n.to_str()).and_then(|n| n.strip_suffix(&tag1)) {
+            files.extend((2..=info.count).map(|no| p.with_file_name(format!("{stem}-{no:05}-of-{:05}.cmf", info.count))));
+        }
+    }
+    files
+}
+
+/// Whether `a` and `b` are the same existing file, also through a symlink
+/// or a hard link (unix: device and inode; elsewhere the canonical paths).
+fn same_file(a: &Path, b: &Path) -> bool {
+    let (Ok(ma), Ok(mb)) = (std::fs::metadata(a), std::fs::metadata(b)) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ma.dev() == mb.dev() && ma.ino() == mb.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (ma, mb);
+        matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(x), Ok(y)) if x == y)
+    }
 }
 
 /// The expert triples (gate, up, down directory indices) of a V4.1 layer:
@@ -2588,6 +2630,31 @@ mod tests {
         assert_eq!(production_prior(Family::Dsv41, Some(2560.0), 32768, 6, 384, 5120).0, 2560.0);
         assert_eq!(production_prior(Family::Dsv41, Some(0.0), 32768, 6, 384, 5120).0, 0.0, "CMF_MOE_PRIOR=0 turns it off");
         assert_eq!(production_prior(Family::Qwen4, None, 32768, 10, 512, 2560).0, 0.0, "Flash-Next unchanged");
+    }
+
+    /// `--output` / `--patch-shared` naming the calibration file are caught
+    /// through a symlink and a hard link too; another file, or one that does
+    /// not exist yet, is not the same file.
+    #[test]
+    fn output_naming_the_calibration_file_is_caught() {
+        let dir = std::env::temp_dir().join(format!("cortiq-moe-same-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calib = dir.join("calib.cmf");
+        std::fs::write(&calib, b"calibration").unwrap();
+        std::fs::write(dir.join("other.cmf"), b"calibration").unwrap();
+        assert!(same_file(&calib, &calib));
+        assert!(same_file(&dir.join(".").join("calib.cmf"), &calib));
+        assert!(!same_file(&dir.join("other.cmf"), &calib));
+        assert!(!same_file(&dir.join("new.cmf"), &calib));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&calib, dir.join("link.cmf")).unwrap();
+            std::fs::hard_link(&calib, dir.join("hard.cmf")).unwrap();
+            assert!(same_file(&dir.join("link.cmf"), &calib));
+            assert!(same_file(&dir.join("hard.cmf"), &calib));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The hole-punching probe answers without leaving its file behind:

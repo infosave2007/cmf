@@ -110,6 +110,20 @@ fn quantize_moe_on_the_v41_fixture() {
     let (ok, err) = cortiq(&args(&base(&out1, "100")), &[]);
     assert!(!ok && err.contains("no wgpu GPU (set CMF_MOE_HOST=1"), "{err}");
 
+    // --output naming the calibration file (here through a symlink) is
+    // refused before anything opens it for writing
+    let calib_bytes = std::fs::read(&calib).unwrap();
+    #[cfg(unix)]
+    {
+        let link = root.join("calib-link.cmf");
+        std::os::unix::fs::symlink(&calib, &link).unwrap();
+        let (ok, err) = cortiq(&args(&base(&link, "100")), &[host]);
+        assert!(!ok && err.contains("is the calibration file"), "{err}");
+    }
+    let (ok, err) = cortiq(&args(&base(&calib, "100")), &[host]);
+    assert!(!ok && err.contains("is the calibration file"), "{err}");
+    assert_eq!(std::fs::read(&calib).unwrap(), calib_bytes, "the calibration file is untouched");
+
     // 1: q2tp into a new file; the capture is saved
     let (ok, err) = cortiq(&args(&base(&out1, "100")), &[host, capdir]);
     eprintln!("{err}");
