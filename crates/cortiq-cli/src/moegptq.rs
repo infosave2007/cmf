@@ -320,6 +320,16 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
         Sink::Stream(CmfStreamWriter::new(o.output, CmfStreamWriter::head_reserve_for(cmodel.tensors.len(), avg_name))?)
     };
     let expert_slots: HashSet<usize> = layer_dirs.iter().flatten().chain(shared_dirs.iter().flatten()).flat_map(|&(g, u, d)| [g, u, d]).collect();
+    // every slot this run rewrites must take the codec's payload: checked
+    // now, not hours later when the first layer is written
+    let written: Vec<(usize, usize, usize)> = (range_lo..range_hi)
+        .flat_map(|li| if patch.is_none() { layer_dirs[li].clone() } else { Vec::new() }.into_iter().chain(shared_dirs[li]))
+        .collect();
+    match &sink {
+        Sink::InPlace { .. } => check_slots(&cmodel, &written, codec, None)?,
+        Sink::Patch { path, target, .. } => check_slots(&cmodel, &written, codec, Some((path, target)))?,
+        Sink::Stream(_) | Sink::Diag => {}
+    }
 
     let ec = EncodeCfg { codec, limit, lambda: o.lambda, threads: o.threads.max(1) };
     let main_bufs = match engine {
@@ -534,6 +544,62 @@ impl Sink {
             }
         }
     }
+}
+
+/// Whether the slots `triples` (gate, up, down directory indices of the
+/// calibration file) take this codec's payloads. In place (`target` None)
+/// a slot keeps its directory entry and is rewritten with the codec's dtype:
+/// it must be that dtype or q4tp (a q4tp slot holds either layout) and hold
+/// at least the payload's bytes. `--patch-shared` rewrites an existing
+/// output, whose layout the codec must match.
+fn check_slots(cm: &CmfModel, triples: &[(usize, usize, usize)], codec: Codec, target: Option<(&str, &CmfModel)>) -> anyhow::Result<()> {
+    let dts = codec.dtypes();
+    for &(g, u, d) in triples {
+        for (slot, want) in [g, u, d].into_iter().zip(dts) {
+            let e = &cm.tensors[slot];
+            let need = cortiq_core::quant::expected_nbytes(want, &e.shape)
+                .ok_or_else(|| anyhow::anyhow!("{}: shape {:?} has no {} layout", e.name, e.shape, want.name()))? as u64;
+            match target {
+                None => {
+                    anyhow::ensure!(
+                        e.dtype == want || e.dtype == TensorDtype::Q4TiledP,
+                        "--in-place --codec {}: {} is {} in the calibration file, and a {} payload fits only a {} or a q4tp slot",
+                        codec.name(),
+                        e.name,
+                        e.dtype.name(),
+                        want.name(),
+                        want.name()
+                    );
+                    anyhow::ensure!(
+                        e.nbytes >= need,
+                        "--in-place --codec {}: the slot of {} holds {} B, its {} payload needs {need} B",
+                        codec.name(),
+                        e.name,
+                        e.nbytes,
+                        want.name()
+                    );
+                }
+                Some((path, t)) => {
+                    let te = t.tensor(&e.name).ok_or_else(|| anyhow::anyhow!("--patch-shared: {} is not in {path}", e.name))?;
+                    let hint = match te.dtype {
+                        TensorDtype::Q2TiledP => " (pass --codec q2tp)",
+                        TensorDtype::Q4TiledP if want == TensorDtype::Q2TiledP => " (pass --codec q4tp)",
+                        _ => "",
+                    };
+                    anyhow::ensure!(
+                        te.dtype == want,
+                        "--patch-shared --codec {}: {} is {} in {path}, the codec writes {}{hint}",
+                        codec.name(),
+                        e.name,
+                        te.dtype.name(),
+                        want.name()
+                    );
+                    anyhow::ensure!(te.shape == e.shape && te.nbytes >= need, "--patch-shared: {} has shape {:?} / {} B in {path}, want {:?} / {need} B", e.name, te.shape, te.nbytes, e.shape);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The expert triples (gate, up, down directory indices) of a V4.1 layer:
@@ -1986,6 +2052,21 @@ mod tests {
             }
         }
         let slots: HashSet<usize> = dirs.iter().flat_map(|(d, s)| d.iter().chain(std::iter::once(s)).flat_map(|&(g, u, dn)| [g, u, dn])).collect();
+        // the slot checks run before any capture: a q4tp file takes either
+        // codec in place, a q2tp file only q2tp; --patch-shared needs the codec
+        // of the patched file
+        let triples = |m: &CmfModel| -> Vec<(usize, usize, usize)> { (0..nl).flat_map(|li| { let (d, s) = dsv41_dirs(m, li, ne).unwrap(); d.into_iter().chain([s]) }).collect() };
+        let shared_of = |m: &CmfModel| -> Vec<(usize, usize, usize)> { (0..nl).map(|li| dsv41_dirs(m, li, ne).unwrap().1).collect() };
+        check_slots(&cm, &triples(&cm), Codec::Q4tp, None).unwrap();
+        check_slots(&cm, &triples(&cm), Codec::Q2tp, None).unwrap();
+        check_slots(&r2, &triples(&r2), Codec::Q2tp, None).unwrap();
+        let e = check_slots(&r2, &triples(&r2), Codec::Q4tp, None).unwrap_err().to_string();
+        assert!(e.contains("fits only a q4tp"), "{e}");
+        check_slots(&cm, &shared_of(&cm), Codec::Q2tp, Some(("ref2", &r2))).unwrap();
+        let e = check_slots(&cm, &shared_of(&cm), Codec::Q4tp, Some(("ref2", &r2))).unwrap_err().to_string();
+        assert!(e.contains("pass --codec q2tp"), "{e}");
+        let e = check_slots(&r2, &shared_of(&r2), Codec::Q2tp, Some(("calib", &cm))).unwrap_err().to_string();
+        assert!(e.contains("pass --codec q4tp"), "{e}");
 
         // synthetic captured rows and routes per layer
         let n = 640;
