@@ -488,6 +488,11 @@ pub struct Work {
     emb_up: wgpu::Buffer,
     emb16: wgpu::Buffer,
     emb_mapped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Input staging f16(x⊙g) of up to four blr paths reading the same x
+    /// (`lin_fwd_shared`): two buffers for the widest input, two for
+    /// `stage_small` columns.
+    stage: Vec<wgpu::Buffer>,
+    stage_small: usize,
 }
 
 impl Work {
@@ -612,6 +617,24 @@ impl Work {
             }),
             emb16: tm::f16_buf(c, ntok * g.hs),
             emb_mapped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            stage: {
+                let wide = net
+                    .layers
+                    .iter()
+                    .flat_map(|l| {
+                        let mut v = vec![&l.gate, &l.up, &l.down];
+                        match &l.mix {
+                            Mix::Gdn { qkv, z, out, .. } => v.extend([qkv, z, out]),
+                            Mix::Attn { q, k, v: vv, o, .. } => v.extend([q, k, vv, o]),
+                        }
+                        v
+                    })
+                    .filter_map(|l| if let Lin::Blr { blr, .. } = l { Some(blr.n) } else { None })
+                    .max()
+                    .unwrap_or(0);
+                [wide, wide, g.hs, g.hs].iter().map(|&n| tm::f16_buf(c, pr * n.max(1))).collect()
+            },
+            stage_small: g.hs,
         }
     }
     fn get(&self, n: &str) -> &wgpu::Buffer {
@@ -641,6 +664,59 @@ fn lin_fwd(c: Ctx, w: &Work, lin: &Lin, x: &wgpu::Buffer, y: &wgpu::Buffer, acc:
             Some(())
         }
     }
+}
+
+/// Forward of linears that all read `x` (each into its own output): the
+/// input staging f16(x⊙g) of every binary low-rank path is done by one
+/// `cvt_multi` per group of up to four paths, so `x` is read once a group
+/// instead of once a path. The other linears run as [`lin_fwd`].
+fn lin_fwd_shared(c: Ctx, w: &Work, lins: &[(&Lin, &wgpu::Buffer)], x: &wgpu::Buffer) -> Option<()> {
+    let ntok = w.ntok;
+    let paths = |l: &Lin| if let Lin::Blr { blr, .. } = l { blr.paths.len() } else { 0 };
+    let mut i = 0;
+    while i < lins.len() {
+        let Lin::Blr { blr, .. } = lins[i].0 else {
+            lin_fwd(c, w, lins[i].0, x, lins[i].1, false)?;
+            i += 1;
+            continue;
+        };
+        // a group of consecutive blr linears: ≤ 4 paths, buffers 2 and 3 only
+        // for inputs that fit them
+        let n = blr.n;
+        let (mut j, mut np) = (i, 0usize);
+        while j < lins.len() {
+            let pj = paths(lins[j].0);
+            let nj = if let Lin::Blr { blr: b, .. } = lins[j].0 { b.n } else { usize::MAX };
+            if pj == 0 || nj != n || np + pj > 4 || (np + pj > 2 && n > w.stage_small) {
+                break;
+            }
+            np += pj;
+            j += 1;
+        }
+        if np < 2 {
+            lin_fwd(c, w, lins[i].0, x, lins[i].1, false)?;
+            i += 1;
+            continue;
+        }
+        let mut cols: Vec<&wgpu::Buffer> = Vec::with_capacity(np);
+        for (l, _) in &lins[i..j] {
+            if let Lin::Blr { blr, .. } = l {
+                cols.extend(blr.paths.iter().map(|p| &p.g));
+            }
+        }
+        let dsts: Vec<&wgpu::Buffer> = w.stage[..np].iter().collect();
+        tm::run(c, &[Op::D(tm::cvt_multi(c, x, &cols, &dsts, ntok, n, 1.0)?)]);
+        let mut k = 0;
+        for (l, y) in &lins[i..j] {
+            if let Lin::Blr { blr, role, .. } = l {
+                let pn = blr.paths.len();
+                tm::blr_forward_staged(c, blr, &w.blr[role], x, y, ntok, Some(&w.stage[k..k + pn]))?;
+                k += pn;
+            }
+        }
+        i = j;
+    }
+    Some(())
 }
 
 /// Input gradient into `dx` (overwritten, or accumulated with `acc`), metric
@@ -731,8 +807,7 @@ fn layer_fwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, y: &wgpu::
         Mix::Gdn { qkv, z, a, b, out, a_log, dt_bias, norm, conv } => {
             let tape = w.tape.as_ref().unwrap();
             gdn_params(c, w, g, a_log, dt_bias, norm, conv);
-            lin_fwd(c, w, qkv, w.get("n1"), tape.raw(), false)?;
-            lin_fwd(c, w, z, w.get("n1"), tape.z(), false)?;
+            lin_fwd_shared(c, w, &[(qkv, tape.raw()), (z, tape.z())], w.get("n1"))?;
             // a and b into the two halves of the tape's a|b buffer
             lin_fwd(c, w, a, w.get("n1"), w.get("gout"), false)?;
             copy_off(c, w.get("gout"), 0, tape.ab(), 0, n * g.nv);
@@ -740,13 +815,11 @@ fn layer_fwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, y: &wgpu::
             copy_off(c, w.get("gout"), 0, tape.ab(), n * g.nv, n * g.nv);
             gdn::gdn_forward_dev(tape, g.nk, g.nv, g.c_dim(), rec)?;
             copy(c, tape.out(), w.get("gout"), n * g.vd());
-            lin_fwd(c, w, out, w.get("gout"), w.get("mix"), false)?;
+            lin_fwd_shared(c, w, &[(out, w.get("mix"))], w.get("gout"))?;
         }
         Mix::Attn { q, k, v, o, qn, kn } => {
             let (qd, kd) = (g.nh * g.hd, g.nkv * g.hd);
-            lin_fwd(c, w, q, w.get("n1"), w.get("qg"), false)?;
-            lin_fwd(c, w, k, w.get("n1"), w.get("k"), false)?;
-            lin_fwd(c, w, v, w.get("n1"), w.get("v"), false)?;
+            lin_fwd_shared(c, w, &[(q, w.get("qg")), (k, w.get("k")), (v, w.get("v"))], w.get("n1"))?;
             let qg = QkrGeom { n, heads: g.nh, hd: g.hd, half: g.half, t: w.t, gemma: g.gemma, eps: g.eps };
             let kg = QkrGeom { heads: g.nkv, ..qg };
             let ag = AttnGeom { nb: w.nb, t: w.t, nh: g.nh, nkv: g.nkv, hd: g.hd };
@@ -769,17 +842,16 @@ fn layer_fwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, y: &wgpu::
                 ]);
             }
             let _ = kd;
-            lin_fwd(c, w, o, w.get("og"), w.get("mix"), false)?;
+            lin_fwd_shared(c, w, &[(o, w.get("mix"))], w.get("og"))?;
         }
     }
     to::run(c, &[
         to::elt(c, "add", n * g.hs, x, w.get("mix"), Some(w.get("x2")), None, None, None)?,
         to::rms_fwd(c, w.get("x2"), &ly.ln2.w, w.get("n2"), w.get("inv2"), n, g.hs, g.eps, g.gemma)?,
     ]);
-    lin_fwd(c, w, &ly.gate, w.get("n2"), w.get("gg"), false)?;
-    lin_fwd(c, w, &ly.up, w.get("n2"), w.get("uu"), false)?;
+    lin_fwd_shared(c, w, &[(&ly.gate, w.get("gg")), (&ly.up, w.get("uu"))], w.get("n2"))?;
     to::run(c, &[to::elt(c, "swiglu_fwd", n * g.inter, w.get("gg"), w.get("uu"), Some(w.get("hh")), None, None, None)?]);
-    lin_fwd(c, w, &ly.down, w.get("hh"), w.get("mix"), false)?;
+    lin_fwd_shared(c, w, &[(&ly.down, w.get("mix"))], w.get("hh"))?;
     to::run(c, &[to::elt(c, "add", n * g.hs, w.get("x2"), w.get("mix"), Some(y), None, None, None)?]);
     Some(())
 }
