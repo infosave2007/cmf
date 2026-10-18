@@ -183,6 +183,31 @@ fn quantize_moe_on_the_v41_fixture() {
     assert!(err.contains("no calibration forward") && !err.contains("captured "), "{err}");
     assert_eq!(std::fs::read(&out1).unwrap(), std::fs::read(&out2).unwrap(), "a reused capture writes the same file");
 
+    // a capture directory that cannot be written: the run warns and goes on
+    // from the rows in memory (the same file); capture-only fails
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let ro = root.join("capture-ro");
+        std::fs::create_dir_all(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(ro.join("probe"), b"").is_err() {
+            let out3 = root.join("q2tp-3.cmf");
+            let (ok, err) = cortiq(&args(&base(&out3, "100")), &[host, ("CMF_MOE_CAPTURE_DIR", ro.to_str().unwrap())]);
+            assert!(ok && err.contains("warning: saving layer 0's capture failed"), "{err}");
+            // the same tensors (the provenance names another capture directory)
+            let m3 = cortiq_core::CmfModel::open(&out3).unwrap();
+            assert_eq!(m3.tensors.len(), m1.tensors.len());
+            for t in &m1.tensors {
+                assert_eq!(m3.entry_bytes(m3.tensor(&t.name).unwrap()), m1.entry_bytes(t), "{}", t.name);
+            }
+            let (ok, err) = cortiq(&args(&base(&none, "100")), &[host, ("CMF_MOE_CAPTURE_DIR", ro.to_str().unwrap()), ("CMF_MOE_CAPTURE_ONLY", "1")]);
+            assert!(!ok && err.contains("saving layer 0's capture"), "{err}");
+            assert_eq!(std::fs::read_dir(&ro).unwrap().count(), 0, "no partial file is left");
+        }
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     // 3: other tokens: the saved capture is refused, never overwritten
     let (ok, err) = cortiq(&args(&base(&root.join("x.cmf"), "120")), &[host, capdir]);
     assert!(!ok && err.contains("holds the capture of another run") && err.contains("calibration tokens differ"), "{err}");
