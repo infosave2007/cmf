@@ -892,6 +892,21 @@ pub fn matrix_units() -> bool {
     zi::zctx().is_some()
 }
 
+/// [`mm`] with the plane given as a sign bitmap of `words` u32 per row,
+/// expanded to ±1 inside the GEMM's staging (no f16 plane, no expand pass):
+/// `trans` false = bits `[n][words]` (the plane's own rows), true = bits
+/// `[k][words]` (the plane is the bitmap's transpose). Same products as
+/// [`mm`] on the expanded plane. `None` where unavailable (`CMF_MM_BITS=0`).
+#[allow(clippy::too_many_arguments)]
+pub fn mm_bits(c: &Ctx, bits: &wgpu::Buffer, words: usize, trans: bool, act: &wgpu::Buffer, out: &wgpu::Buffer, m: usize, n: usize, k: usize, oscale: f32) -> Option<zi::MmCall> {
+    if std::env::var("CMF_MM_BITS").as_deref() == Ok("0") {
+        return None;
+    }
+    let g = zi::MmCfg { bits: if trans { 2 } else { 1 }, ..zi::default_cfg(Epi::F32) };
+    let a = zi::MmArgs { m: m as u32, n: n as u32, k: k as u32, ldo: n as u32, ocol: 0, arow: 0, oscale, conv: [words as u32, 0, 0] };
+    zi::mm_call(c, g, &a, bits, act, out)
+}
+
 /// [`mm`] into columns `ocol..ocol+n` of an output with row stride `ldo`.
 #[allow(clippy::too_many_arguments)]
 pub fn mm_cols(c: &Ctx, plane: &wgpu::Buffer, act: &wgpu::Buffer, out: &wgpu::Buffer, m: usize, n: usize, k: usize, ldo: usize, ocol: usize, oscale: f32) -> Option<zi::MmCall> {
@@ -1004,15 +1019,25 @@ impl BlrScratch {
 pub fn blr_forward(c: &Ctx, layer: &Blr, s: &BlrScratch, x: &wgpu::Buffer, y: &wgpu::Buffer, ntok: usize) -> Option<()> {
     let (m, n, r) = (layer.m, layer.n, layer.r);
     for (pi, p) in layer.paths.iter().enumerate() {
-        let ops = vec![
-            Op::D(expand1(c, &p.bits_u, &s.pl_u, m, r, false)?),
-            Op::D(expand1(c, &p.bits_v, &s.plt_v, n, r, true)?),
-            Op::D(cvt(c, x, Some(&p.g), &s.xh, ntok, n, 1.0)?),
-            Op::M(mm(c, &s.plt_v, &s.xh, &s.a[pi], ntok, r, n, 1.0)?),
-            Op::D(cvt(c, &s.a[pi], Some(&p.l), &s.xh, ntok, r, 1.0)?),
-            Op::M(mm(c, &s.pl_u, &s.xh, &s.cbuf[pi], ntok, m, r, 1.0)?),
-            Op::D(scale_acc(c, &s.cbuf[pi], &p.h, y, ntok, m, pi > 0)?),
-        ];
+        let w = r / 32;
+        let mut ops = match (mm_bits(c, &p.bits_v, w, true, &s.xh, &s.a[pi], ntok, r, n, 1.0), mm_bits(c, &p.bits_u, w, false, &s.xh, &s.cbuf[pi], ntok, m, r, 1.0)) {
+            // the GEMMs read the bitmaps themselves
+            (Some(g1), Some(g2)) => vec![
+                Op::D(cvt(c, x, Some(&p.g), &s.xh, ntok, n, 1.0)?),
+                Op::M(g1),
+                Op::D(cvt(c, &s.a[pi], Some(&p.l), &s.xh, ntok, r, 1.0)?),
+                Op::M(g2),
+            ],
+            _ => vec![
+                Op::D(expand1(c, &p.bits_u, &s.pl_u, m, r, false)?),
+                Op::D(expand1(c, &p.bits_v, &s.plt_v, n, r, true)?),
+                Op::D(cvt(c, x, Some(&p.g), &s.xh, ntok, n, 1.0)?),
+                Op::M(mm(c, &s.plt_v, &s.xh, &s.a[pi], ntok, r, n, 1.0)?),
+                Op::D(cvt(c, &s.a[pi], Some(&p.l), &s.xh, ntok, r, 1.0)?),
+                Op::M(mm(c, &s.pl_u, &s.xh, &s.cbuf[pi], ntok, m, r, 1.0)?),
+            ],
+        };
+        ops.push(Op::D(scale_acc(c, &s.cbuf[pi], &p.h, y, ntok, m, pi > 0)?));
         run(c, &ops);
     }
     Some(())
@@ -1033,10 +1058,17 @@ pub fn blr_forward(c: &Ctx, layer: &Blr, s: &BlrScratch, x: &wgpu::Buffer, y: &w
 pub fn blr_backward(c: &Ctx, layer: &Blr, s: &BlrScratch, x: &wgpu::Buffer, dy: &wgpu::Buffer, dx: &wgpu::Buffer, ntok: usize, gscale: f32, sign: Option<&train_sign::SignCtx>) -> Option<()> {
     let (m, n, r) = (layer.m, layer.n, layer.r);
     for (pi, p) in layer.paths.iter().enumerate() {
-        let mut ops = vec![
-            Op::D(expand1(c, &p.bits_u, &s.plt_u, m, r, true)?),
-            Op::D(expand1(c, &p.bits_v, &s.pl_v, n, r, false)?),
-        ];
+        let w = r / 32;
+        let bits_mm = (mm_bits(c, &p.bits_u, w, true, &s.xh, &s.t2, ntok, r, m, 1.0 / gscale), mm_bits(c, &p.bits_v, w, false, &s.xh, &s.t1, ntok, n, r, 1.0 / gscale));
+        let (g_t2, g_t1) = match bits_mm {
+            (Some(a), Some(b)) => (a, b),
+            _ => (mm(c, &s.plt_u, &s.xh, &s.t2, ntok, r, m, 1.0 / gscale)?, mm(c, &s.pl_v, &s.xh, &s.t1, ntok, n, r, 1.0 / gscale)?),
+        };
+        let mut ops = Vec::new();
+        if !g_t2.reads_bits() {
+            ops.push(Op::D(expand1(c, &p.bits_u, &s.plt_u, m, r, true)?));
+            ops.push(Op::D(expand1(c, &p.bits_v, &s.pl_v, n, r, false)?));
+        }
         // each column reduction fused with the elementwise op that reads the
         // same operand (dy, t2, t1 read once); separate ops where it cannot
         match colsum_fused(c, dy, &s.cbuf[pi], &p.dh, ntok, m, Fuse::CvtA(&p.h, &s.xh, gscale)) {
@@ -1046,7 +1078,7 @@ pub fn blr_backward(c: &Ctx, layer: &Blr, s: &BlrScratch, x: &wgpu::Buffer, dy: 
                 ops.extend([Op::D(a), Op::D(b), Op::D(cvt(c, dy, Some(&p.h), &s.xh, ntok, m, gscale)?)]);
             }
         }
-        ops.push(Op::M(mm(c, &s.plt_u, &s.xh, &s.t2, ntok, r, m, 1.0 / gscale)?));
+        ops.push(Op::M(g_t2));
         match colsum_fused(c, &s.a[pi], &s.t2, &p.dl, ntok, r, Fuse::CvtB(&p.l, &s.xh, gscale)) {
             Some([a, b]) => ops.extend([Op::D(a), Op::D(b)]),
             None => {
@@ -1054,7 +1086,7 @@ pub fn blr_backward(c: &Ctx, layer: &Blr, s: &BlrScratch, x: &wgpu::Buffer, dy: 
                 ops.extend([Op::D(a), Op::D(b), Op::D(cvt(c, &s.t2, Some(&p.l), &s.xh, ntok, r, gscale)?)]);
             }
         }
-        ops.push(Op::M(mm(c, &s.pl_v, &s.xh, &s.t1, ntok, n, r, 1.0 / gscale)?));
+        ops.push(Op::M(g_t1));
         match colsum_fused(c, x, &s.t1, &p.dg, ntok, n, Fuse::ScaleB(&p.g, dx, pi > 0)) {
             Some([a, b]) => ops.extend([Op::D(a), Op::D(b)]),
             None => {
