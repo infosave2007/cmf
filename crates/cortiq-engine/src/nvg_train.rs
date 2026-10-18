@@ -176,6 +176,25 @@ pub struct Layer {
     pub down: Lin,
 }
 
+/// Every parameter laid end to end, for the optimizer: one dispatch for all
+/// gradient norms and one for all Adam steps instead of thousands (values,
+/// moments and gradients are copied in and back; the arithmetic per entry
+/// is that of `train_mm::{sumsq, adam}`).
+struct OptCat {
+    off: Vec<usize>,
+    total: usize,
+    g: wgpu::Buffer,
+    w: wgpu::Buffer,
+    m1: wgpu::Buffer,
+    m2: wgpu::Buffer,
+    mask: wgpu::Buffer,
+    relf: wgpu::Buffer,
+    tab: wgpu::Buffer,
+    part: wgpu::Buffer,
+    /// `g` holds this step's gradients (set by `grad_norm`).
+    g_fresh: std::sync::atomic::AtomicBool,
+}
+
 pub struct Net {
     pub geom: Geom,
     pub layers: Vec<Layer>,
@@ -185,6 +204,7 @@ pub struct Net {
     embed: Vec<u16>,
     /// Sign matrices with training state (ids 0..n_sign_mats).
     pub n_sign_mats: u32,
+    opt: std::sync::OnceLock<OptCat>,
 }
 
 fn deq(m: &CmfModel, name: &str) -> Result<(Vec<f32>, Vec<usize>), String> {
@@ -368,7 +388,7 @@ impl Net {
         // vocabulary slices keep each plane within one storage binding.
         let head = Head::new(c, &head_w, v, hs, bwd, None);
         let embed = emb.iter().map(|&f| f32_to_f16(f)).collect();
-        Ok(Net { geom, layers, final_norm, head, embed, n_sign_mats: next_id })
+        Ok(Net { geom, layers, final_norm, head, embed, n_sign_mats: next_id, opt: std::sync::OnceLock::new() })
     }
 
     /// Every binary low-rank linear with its tensor name, in a fixed order
@@ -954,12 +974,73 @@ pub fn sign_stats(c: Ctx, net: &Net) -> Option<Vec<(String, u64, u64)>> {
             .collect(),
     )
 }
-/// Global gradient norm over every parameter (NaN/inf when a gradient is).
+fn opt_cat(c: Ctx, net: &Net) -> &OptCat {
+    net.opt.get_or_init(|| {
+        let ps = net.params();
+        let mut off = Vec::with_capacity(ps.len());
+        let mut total = 0usize;
+        let mut tab = Vec::with_capacity(2 * ps.len());
+        let mut relf: Vec<u32> = Vec::new();
+        for p in &ps {
+            off.push(total);
+            tab.push(total as u32);
+            tab.push(p.n as u32);
+            relf.extend(std::iter::repeat_n(p.rel.to_bits(), p.n));
+            total += p.n;
+        }
+        let mask = to::upload(c, &vec![1f32; total]);
+        let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("opt_cat") });
+        for (p, &o) in ps.iter().zip(&off) {
+            if let Some(m) = &p.mask {
+                enc.copy_buffer_to_buffer(m, 0, &mask, (o * 4) as u64, (p.n * 4) as u64);
+            }
+        }
+        crate::gpu_wgpu::submit_pub(c, enc.finish());
+        let relf_b = to::zeros_u32(c, total);
+        c.queue.write_buffer(&relf_b, 0, bytemuck::cast_slice(&relf));
+        let tab_b = to::zeros_u32(c, tab.len());
+        c.queue.write_buffer(&tab_b, 0, bytemuck::cast_slice(&tab));
+        OptCat {
+            g: to::zeros(c, total),
+            w: to::zeros(c, total),
+            m1: to::zeros(c, total),
+            m2: to::zeros(c, total),
+            mask,
+            relf: relf_b,
+            tab: tab_b,
+            part: to::zeros(c, 64 * ps.len()),
+            off,
+            total,
+            g_fresh: std::sync::atomic::AtomicBool::new(false),
+        }
+    })
+}
+
+/// Copy every parameter's gradient into the concatenation.
+fn gather_grads(enc: &mut wgpu::CommandEncoder, ps: &[&Param], oc: &OptCat) {
+    for (p, &o) in ps.iter().zip(&oc.off) {
+        enc.copy_buffer_to_buffer(&p.g, 0, &oc.g, (o * 4) as u64, (p.n * 4) as u64);
+    }
+}
+
+/// Global gradient norm over every parameter (NaN/inf when a gradient is):
+/// each parameter's 64 partial sums of squares (the `sumsq` grid) summed on
+/// the host in f64, parameters in [`Net::params`] order.
 pub fn grad_norm(c: Ctx, net: &Net) -> Option<f64> {
     let _p = prof::phase("opt.grad_norm");
+    let oc = opt_cat(c, net);
+    let ps = net.params();
+    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("grad_norm") });
+    let mut mk = prof::enc_begin(c, &mut enc);
+    gather_grads(&mut enc, &ps, oc);
+    prof::enc_mark(c, &mut enc, &mut mk, "copy");
+    tm::record(c, &mut enc, &[Op::D(tm::sumsq_cat(c, &oc.g, &oc.tab, &oc.part, ps.len())?)]);
+    crate::gpu_wgpu::submit_pub(c, enc.finish());
+    oc.g_fresh.store(true, std::sync::atomic::Ordering::Relaxed);
+    let part = to::download(c, &oc.part, 64 * ps.len())?;
     let mut s = 0f64;
-    for p in net.params() {
-        s += tm::sumsq(c, &p.g, p.n)?;
+    for i in 0..ps.len() {
+        s += part[64 * i..64 * (i + 1)].iter().map(|&x| x as f64).sum::<f64>();
     }
     Some(s.sqrt())
 }
@@ -967,6 +1048,9 @@ pub fn grad_norm(c: Ctx, net: &Net) -> Option<f64> {
 /// Clear every gradient (a skipped step).
 pub fn zero_grads(c: Ctx, net: &Net) {
     let _p = prof::phase("opt.zero");
+    if let Some(oc) = net.opt.get() {
+        oc.g_fresh.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
     for p in net.params() {
         zero(c, &p.g, p.n);
     }
@@ -977,10 +1061,31 @@ pub fn zero_grads(c: Ctx, net: &Net) {
 #[allow(clippy::too_many_arguments)]
 pub fn adam(c: Ctx, net: &Net, lr: f32, step_no: u32, b1: f32, b2: f32, eps: f32, gmul: f32) -> Option<()> {
     let _p = prof::phase("opt.adam");
-    for p in net.params() {
-        tm::run(c, &[Op::D(tm::adam(c, &p.w, &p.g, &p.m1, &p.m2, p.mask.as_ref(), p.n, lr, step_no, b1, b2, eps, gmul, p.rel)?)]);
-        zero(c, &p.g, p.n);
+    let oc = opt_cat(c, net);
+    let ps = net.params();
+    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("adam") });
+    let mut mk = prof::enc_begin(c, &mut enc);
+    if !oc.g_fresh.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        gather_grads(&mut enc, &ps, oc);
     }
+    for (p, &o) in ps.iter().zip(&oc.off) {
+        let (bo, nb) = ((o * 4) as u64, (p.n * 4) as u64);
+        enc.copy_buffer_to_buffer(&p.w, 0, &oc.w, bo, nb);
+        enc.copy_buffer_to_buffer(&p.m1, 0, &oc.m1, bo, nb);
+        enc.copy_buffer_to_buffer(&p.m2, 0, &oc.m2, bo, nb);
+    }
+    prof::enc_mark(c, &mut enc, &mut mk, "copy");
+    tm::record(c, &mut enc, &[Op::D(tm::adam_cat(c, &oc.w, &oc.g, &oc.m1, &oc.m2, &oc.mask, &oc.relf, oc.total, lr, step_no, b1, b2, eps, gmul)?)]);
+    let mut mk = prof::enc_begin(c, &mut enc);
+    for (p, &o) in ps.iter().zip(&oc.off) {
+        let (bo, nb) = ((o * 4) as u64, (p.n * 4) as u64);
+        enc.copy_buffer_to_buffer(&oc.w, bo, &p.w, 0, nb);
+        enc.copy_buffer_to_buffer(&oc.m1, bo, &p.m1, 0, nb);
+        enc.copy_buffer_to_buffer(&oc.m2, bo, &p.m2, 0, nb);
+        enc.clear_buffer(&p.g, 0, Some(nb));
+    }
+    prof::enc_mark(c, &mut enc, &mut mk, "copy");
+    crate::gpu_wgpu::submit_pub(c, enc.finish());
     Some(())
 }
 

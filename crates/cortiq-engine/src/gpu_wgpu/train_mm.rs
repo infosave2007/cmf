@@ -237,6 +237,48 @@ fn sumsq(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_
     if (t == 0u) { OUT[wg.x] = ssq[0]; }
 }
 
+// adam over a concatenation of parameters (one dispatch for all of them):
+// COL = per-element mask (0: frozen), BITS = per-element relative floor
+// (f32 bits; 0: plain steps); the arithmetic of `adam` element for element.
+@compute @workgroup_size(256)
+fn adam_cat(@builtin(global_invocation_id) g: vec3<u32>) {
+    let i = idx(g);
+    if (i >= p.k) { return; }
+    if (COL[i] == 0.0) { return; }
+    let gr = A[i] * bitcast<f32>(p.pad0);
+    let m1 = p.f1 * B[i] + (1.0 - p.f1) * gr;
+    let m2 = p.f2 * OUT[i] + (1.0 - p.f2) * gr * gr;
+    B[i] = m1;
+    OUT[i] = m2;
+    let t = f32(p.m);
+    let mh = m1 / (1.0 - pow(p.f1, t));
+    let vh = m2 / (1.0 - pow(p.f2, t));
+    let st = p.scale * mh / (sqrt(vh) + p.f3);
+    let rf = bitcast<f32>(BITS[i]);
+    if (rf > 0.0) {
+        SRC[i] = SRC[i] - st * max(abs(SRC[i]), rf);
+    } else {
+        SRC[i] = SRC[i] - st;
+    }
+}
+
+// `sumsq` for every parameter of a concatenation: workgroup (x < 64, y =
+// parameter), BITS[2y], BITS[2y+1] = its offset and length; OUT[64y + x].
+@compute @workgroup_size(256)
+fn sumsq_cat(@builtin(local_invocation_index) t: u32, @builtin(workgroup_id) wg: vec3<u32>) {
+    let off = BITS[2u * wg.y];
+    let n = BITS[2u * wg.y + 1u];
+    var acc = 0.0;
+    for (var i = wg.x * 256u + t; i < n; i = i + 256u * p.m) { acc = acc + A[off + i] * A[off + i]; }
+    ssq[t] = acc;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {
+        if (t < s) { ssq[t] = ssq[t] + ssq[t + s]; }
+        workgroupBarrier();
+    }
+    if (t == 0u) { OUT[wg.y * p.m + wg.x] = ssq[0]; }
+}
+
 // OUT[m][k] (+)= A[m][k]·COL[k]   (rows = 1: accumulate, 0: overwrite)
 @compute @workgroup_size(256)
 fn scale_acc(@builtin(global_invocation_id) g: vec3<u32>) {
@@ -248,7 +290,7 @@ fn scale_acc(@builtin(global_invocation_id) g: vec3<u32>) {
 "#;
 
 fn module(c: &Ctx) -> Option<&'static train_ops::Mod> {
-    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "cvt_cols", "cvt_t", "expand", "colsum_prod", "colsum_part", "colsum_fin", "scale_acc", "dense_fwd", "dense_bwd", "split_qg", "adam", "sumsq"])
+    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "cvt_cols", "cvt_t", "expand", "colsum_prod", "colsum_part", "colsum_fin", "scale_acc", "dense_fwd", "dense_bwd", "split_qg", "adam", "sumsq", "adam_cat", "sumsq_cat"])
 }
 
 /// One step of a trainer pass: an elementwise/reduction dispatch or a GEMM.
@@ -526,6 +568,84 @@ pub fn adam<'a>(c: &'a Ctx, w: &'a wgpu::Buffer, g: &'a wgpu::Buffer, m1: &'a wg
         bufs,
         grid: elt_fold(n),
     })
+}
+
+/// [`adam`] over a concatenation of `n` parameter entries (`mask`: 0 =
+/// frozen; `relf`: per-entry relative floor as f32 bits, 0 = plain steps).
+#[allow(clippy::too_many_arguments)]
+pub fn adam_cat<'a>(c: &'a Ctx, w: &'a wgpu::Buffer, g: &'a wgpu::Buffer, m1: &'a wgpu::Buffer, m2: &'a wgpu::Buffer, mask: &'a wgpu::Buffer, relf: &'a wgpu::Buffer, n: usize, lr: f32, step: u32, b1: f32, b2: f32, eps: f32, gmul: f32) -> Option<Disp<'a>> {
+    let md = module(c)?;
+    Some(Disp {
+        pipe: &md.p["adam_cat"],
+        uni: vec![step, n as u32, 0, 0, 0, 0, gmul.to_bits(), 0, lr.to_bits(), b1.to_bits(), b2.to_bits(), eps.to_bits()],
+        bufs: vec![(1, w), (2, mask), (4, relf), (7, g), (8, m1), (9, m2)],
+        grid: elt_fold(n),
+    })
+}
+
+/// [`sumsq`] partials of `np` parameters of a concatenation `a` (`tab`:
+/// offset, length per parameter) into `out[64·np]`.
+pub fn sumsq_cat<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, tab: &'a wgpu::Buffer, out: &'a wgpu::Buffer, np: usize) -> Option<Disp<'a>> {
+    let md = module(c)?;
+    Some(Disp { pipe: &md.p["sumsq_cat"], uni: vec![64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], bufs: vec![(4, tab), (7, a), (9, out)], grid: (64, np as u32, 1) })
+}
+
+/// Record `ops` as one compute pass into `enc` (no submit).
+pub fn record(c: &Ctx, enc: &mut wgpu::CommandEncoder, ops: &[Op]) {
+    let prof = super::train_prof::on();
+    let mut groups = Vec::new();
+    for op in ops {
+        if let Op::D(d) = op {
+            let mut words = d.uni.clone();
+            while words.len() % 4 != 0 {
+                words.push(0);
+            }
+            if prof {
+                use super::train_prof::{Cnt, count};
+                count(Cnt::Buf, 1);
+                count(Cnt::Write, 1);
+                count(Cnt::WriteBytes, (words.len() * 4) as u64);
+                count(Cnt::BindGroup, 1);
+            }
+            let u = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("train_p"),
+                size: (words.len() * 4) as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            c.queue.write_buffer(&u, 0, bytemuck::cast_slice(&words));
+            let mut entries = vec![wgpu::BindGroupEntry { binding: 0, resource: u.as_entire_binding() }];
+            for &(b, buf) in &d.bufs {
+                entries.push(wgpu::BindGroupEntry { binding: b, resource: buf.as_entire_binding() });
+            }
+            groups.push(Some(c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("train"),
+                layout: &d.pipe.get_bind_group_layout(0),
+                entries: &entries,
+            })));
+        } else {
+            groups.push(None);
+        }
+    }
+    let mut ps = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+    let mut mk = super::train_prof::pass_begin(c, &mut ps);
+    for (op, bg) in ops.iter().zip(&groups) {
+        match op {
+            Op::D(d) => {
+                ps.set_pipeline(d.pipe);
+                ps.set_bind_group(0, bg.as_ref().unwrap(), &[]);
+                ps.dispatch_workgroups(d.grid.0, d.grid.1, d.grid.2);
+            }
+            Op::M(m) => m.record(&mut ps),
+        }
+        if prof {
+            let (name, mnk) = match op {
+                Op::D(d) => (super::train_prof::pipe_name(d.pipe), [0; 3]),
+                Op::M(m) => ("mm", m.mnk),
+            };
+            super::train_prof::pass_mark(c, &mut ps, &mut mk, name, mnk);
+        }
+    }
 }
 
 /// Sum of squares of `n` floats of `a` (64 workgroup partials summed on the host).
