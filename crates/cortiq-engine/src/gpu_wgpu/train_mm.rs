@@ -272,55 +272,125 @@ fn dense_fwd(@builtin(global_invocation_id) g: vec3<u32>) {
     if (p.rows == 1u) { OUT[i] = OUT[i] + acc; } else { OUT[i] = acc; }
 }
 
-// dense_fwd for r ≤ 48 outputs, tiled: a workgroup = 16 rows × all outputs,
-// thread (row ty, lane tx) owns outputs tx, tx+16, tx+32; k staged through
-// workgroup memory in chunks of 32. Each output still sums j = 0..k-1 in
-// order, as dense_fwd does.
-var<workgroup> dta: array<f32, 528>;    // [16][33]
-var<workgroup> dtb: array<f32, 1584>;   // [48][33]
+// dense_fwd for r ≤ 48 outputs, tiled: a workgroup = 64 rows × all outputs,
+// thread (row group ty: 4 rows, lane tx) owns outputs tx, tx+16, tx+32 of
+// its 4 rows; k staged through workgroup memory in chunks of 64 (vec4
+// loads). Each output still sums j = 0..k-1 in order with one fma per term,
+// as dense_fwd's `acc + a·b` does.
+var<workgroup> dta: array<f32, 4160>;   // [64][65]
+var<workgroup> dtb: array<f32, 3120>;   // [48][65]
 @compute @workgroup_size(256)
 fn dense_fwd_t(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) tid: u32) {
-    let r0 = wg.x * 16u;
+    let r0 = wg.x * 64u;
     let ty = tid / 16u;
     let tx = tid % 16u;
-    var acc0 = 0.0;
-    var acc1 = 0.0;
-    var acc2 = 0.0;
-    for (var k0 = 0u; k0 < p.k; k0 = k0 + 32u) {
-        for (var e = tid; e < 512u; e = e + 256u) {
-            let rr = e / 32u;
-            let kk = e % 32u;
-            var v = 0.0;
-            if (r0 + rr < p.m && k0 + kk < p.k) { v = A[(r0 + rr) * p.k + k0 + kk]; }
-            dta[rr * 33u + kk] = v;
+    var a00 = 0.0;
+    var a01 = 0.0;
+    var a02 = 0.0;
+    var a10 = 0.0;
+    var a11 = 0.0;
+    var a12 = 0.0;
+    var a20 = 0.0;
+    var a21 = 0.0;
+    var a22 = 0.0;
+    var a30 = 0.0;
+    var a31 = 0.0;
+    var a32 = 0.0;
+    for (var k0 = 0u; k0 < p.k; k0 = k0 + 64u) {
+        for (var e = tid; e < 1024u; e = e + 256u) {
+            let rr = e / 16u;
+            let kq = (e % 16u) * 4u;
+            var v = vec4<f32>(0.0);
+            if (r0 + rr < p.m && k0 + kq < p.k) {
+                let b = (r0 + rr) * p.k + k0 + kq;
+                v = vec4<f32>(A[b], A[b + 1u], A[b + 2u], A[b + 3u]);
+            }
+            let d = rr * 65u + kq;
+            dta[d] = v.x; dta[d + 1u] = v.y; dta[d + 2u] = v.z; dta[d + 3u] = v.w;
         }
-        for (var e = tid; e < 1536u; e = e + 256u) {
-            let o = e / 32u;
-            let kk = e % 32u;
-            var v = 0.0;
-            if (o < p.r && k0 + kk < p.k) { v = B[o * p.k + k0 + kk]; }
-            dtb[o * 33u + kk] = v;
+        for (var e = tid; e < 768u; e = e + 256u) {
+            let o = e / 16u;
+            let kq = (e % 16u) * 4u;
+            var v = vec4<f32>(0.0);
+            if (o < p.r && k0 + kq < p.k) {
+                let b = o * p.k + k0 + kq;
+                v = vec4<f32>(B[b], B[b + 1u], B[b + 2u], B[b + 3u]);
+            }
+            let d = o * 65u + kq;
+            dtb[d] = v.x; dtb[d + 1u] = v.y; dtb[d + 2u] = v.z; dtb[d + 3u] = v.w;
         }
         workgroupBarrier();
-        let kn = min(32u, p.k - k0);
+        let kn = min(64u, p.k - k0);
         for (var kk = 0u; kk < kn; kk = kk + 1u) {
-            let a = dta[ty * 33u + kk];
-            acc0 = acc0 + a * dtb[tx * 33u + kk];
-            acc1 = acc1 + a * dtb[(tx + 16u) * 33u + kk];
-            acc2 = acc2 + a * dtb[(tx + 32u) * 33u + kk];
+            let x0 = dta[(ty * 4u + 0u) * 65u + kk];
+            let x1 = dta[(ty * 4u + 1u) * 65u + kk];
+            let x2 = dta[(ty * 4u + 2u) * 65u + kk];
+            let x3 = dta[(ty * 4u + 3u) * 65u + kk];
+            let w0 = dtb[(tx + 0u) * 65u + kk];
+            let w1 = dtb[(tx + 16u) * 65u + kk];
+            let w2 = dtb[(tx + 32u) * 65u + kk];
+            a00 = fma(x0, w0, a00);
+            a01 = fma(x0, w1, a01);
+            a02 = fma(x0, w2, a02);
+            a10 = fma(x1, w0, a10);
+            a11 = fma(x1, w1, a11);
+            a12 = fma(x1, w2, a12);
+            a20 = fma(x2, w0, a20);
+            a21 = fma(x2, w1, a21);
+            a22 = fma(x2, w2, a22);
+            a30 = fma(x3, w0, a30);
+            a31 = fma(x3, w1, a31);
+            a32 = fma(x3, w2, a32);
         }
         workgroupBarrier();
     }
-    let row = r0 + ty;
-    if (row < p.m) {
-        var accs = array<f32, 3>(acc0, acc1, acc2);
-        for (var j = 0u; j < 3u; j = j + 1u) {
-            let o = tx + 16u * j;
-            if (o < p.r) {
-                let i = row * p.r + o;
-                if (p.rows == 1u) { OUT[i] = OUT[i] + accs[j]; } else { OUT[i] = accs[j]; }
-            }
-        }
+    if (r0 + ty * 4u + 0u < p.m && tx + 0u < p.r) {
+        let i = (r0 + ty * 4u + 0u) * p.r + tx + 0u;
+        if (p.rows == 1u) { OUT[i] = OUT[i] + a00; } else { OUT[i] = a00; }
+    }
+    if (r0 + ty * 4u + 0u < p.m && tx + 16u < p.r) {
+        let i = (r0 + ty * 4u + 0u) * p.r + tx + 16u;
+        if (p.rows == 1u) { OUT[i] = OUT[i] + a01; } else { OUT[i] = a01; }
+    }
+    if (r0 + ty * 4u + 0u < p.m && tx + 32u < p.r) {
+        let i = (r0 + ty * 4u + 0u) * p.r + tx + 32u;
+        if (p.rows == 1u) { OUT[i] = OUT[i] + a02; } else { OUT[i] = a02; }
+    }
+    if (r0 + ty * 4u + 1u < p.m && tx + 0u < p.r) {
+        let i = (r0 + ty * 4u + 1u) * p.r + tx + 0u;
+        if (p.rows == 1u) { OUT[i] = OUT[i] + a10; } else { OUT[i] = a10; }
+    }
+    if (r0 + ty * 4u + 1u < p.m && tx + 16u < p.r) {
+        let i = (r0 + ty * 4u + 1u) * p.r + tx + 16u;
+        if (p.rows == 1u) { OUT[i] = OUT[i] + a11; } else { OUT[i] = a11; }
+    }
+    if (r0 + ty * 4u + 1u < p.m && tx + 32u < p.r) {
+        let i = (r0 + ty * 4u + 1u) * p.r + tx + 32u;
+        if (p.rows == 1u) { OUT[i] = OUT[i] + a12; } else { OUT[i] = a12; }
+    }
+    if (r0 + ty * 4u + 2u < p.m && tx + 0u < p.r) {
+        let i = (r0 + ty * 4u + 2u) * p.r + tx + 0u;
+        if (p.rows == 1u) { OUT[i] = OUT[i] + a20; } else { OUT[i] = a20; }
+    }
+    if (r0 + ty * 4u + 2u < p.m && tx + 16u < p.r) {
+        let i = (r0 + ty * 4u + 2u) * p.r + tx + 16u;
+        if (p.rows == 1u) { OUT[i] = OUT[i] + a21; } else { OUT[i] = a21; }
+    }
+    if (r0 + ty * 4u + 2u < p.m && tx + 32u < p.r) {
+        let i = (r0 + ty * 4u + 2u) * p.r + tx + 32u;
+        if (p.rows == 1u) { OUT[i] = OUT[i] + a22; } else { OUT[i] = a22; }
+    }
+    if (r0 + ty * 4u + 3u < p.m && tx + 0u < p.r) {
+        let i = (r0 + ty * 4u + 3u) * p.r + tx + 0u;
+        if (p.rows == 1u) { OUT[i] = OUT[i] + a30; } else { OUT[i] = a30; }
+    }
+    if (r0 + ty * 4u + 3u < p.m && tx + 16u < p.r) {
+        let i = (r0 + ty * 4u + 3u) * p.r + tx + 16u;
+        if (p.rows == 1u) { OUT[i] = OUT[i] + a31; } else { OUT[i] = a31; }
+    }
+    if (r0 + ty * 4u + 3u < p.m && tx + 32u < p.r) {
+        let i = (r0 + ty * 4u + 3u) * p.r + tx + 32u;
+        if (p.rows == 1u) { OUT[i] = OUT[i] + a32; } else { OUT[i] = a32; }
     }
 }
 
@@ -833,12 +903,12 @@ pub fn scale_acc2<'a>(c: &'a Ctx, a0: &'a wgpu::Buffer, col0: &'a wgpu::Buffer, 
 #[allow(clippy::too_many_arguments)]
 pub fn dense_fwd<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, w: &'a wgpu::Buffer, out: &'a wgpu::Buffer, m: usize, k: usize, r: usize, acc: bool) -> Option<Disp<'a>> {
     let md = module(c)?;
-    if r <= 48 && m.div_ceil(16) <= 65535 {
+    if r <= 48 && k % 4 == 0 && m.div_ceil(64) <= 65535 {
         return Some(Disp {
             pipe: &md.p["dense_fwd_t"],
             uni: vec![m as u32, k as u32, 0, acc as u32, r as u32, 0, 0, 0, 0, 0, 0, 0],
             bufs: vec![(7, a), (8, w), (9, out)],
-            grid: (m.div_ceil(16) as u32, 1, 1),
+            grid: (m.div_ceil(64) as u32, 1, 1),
         });
     }
     Some(Disp {
