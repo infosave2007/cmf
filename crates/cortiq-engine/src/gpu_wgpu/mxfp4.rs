@@ -665,13 +665,17 @@ mod tests {
         }
     }
 
-    /// Deterministic MXFP4 payload with moderate scales (2^-8 .. 2^-4).
+    /// Deterministic MXFP4 payload with moderate scales (2^-8 .. 2^-4). The
+    /// scale changes from group to group (adjacent groups always differ:
+    /// the step is 7 or 8 mod 5), so a kernel that reads another group's
+    /// scale byte fails the comparison instead of passing on a constant
+    /// plane.
     fn payload(rows: usize, cols: usize, seed: usize) -> Vec<u8> {
         let codes: Vec<u8> = (0..rows * cols / 2)
             .map(|i| (i.wrapping_mul(2654435761).wrapping_add(seed * 977) >> 9) as u8)
             .collect();
         let scales: Vec<u8> = (0..rows * cols / 32)
-            .map(|i| 119 + ((i * 5 + seed) % 5) as u8)
+            .map(|i| 119 + ((i * 7 + i / 3 + seed) % 5) as u8)
             .collect();
         cortiq_core::mxfp4::repack(&codes, &scales, rows, cols).unwrap()
     }
@@ -746,6 +750,10 @@ mod tests {
             eprintln!("mxfp4 pipelines unavailable on this adapter — skipping");
             return;
         }
+        eprintln!(
+            "mxfp4 matvec on the device: {} ({:?})",
+            c.adapter_info.name, c.adapter_info.backend
+        );
         let shapes = [(300usize, 2304usize), (70_000, 64), (5, 5120)];
         let tensors: Vec<(&str, usize, usize, Vec<u8>)> = shapes
             .iter()
@@ -828,6 +836,10 @@ mod tests {
             eprintln!("descriptor-indexed global bank unavailable — skipping");
             return;
         }
+        eprintln!(
+            "mxfp4 global bank on the device: {} ({:?})",
+            c.adapter_info.name, c.adapter_info.backend
+        );
         let (dim, inter, n_exp) = (128usize, 64usize, 4usize);
         let mut tensors = Vec::new();
         let names: Vec<[String; 3]> = (0..=n_exp)
