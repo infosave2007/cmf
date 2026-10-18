@@ -5,6 +5,69 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.21] - 2026-10-18
+
+### Added
+- `cortiq nvg-train --train-signs` also trains the signs of the `blr` paths
+  (S_U, S_V), not only the metric. Each sign has an int16 straight-through
+  latent; the latent gradients G_U and G_V are formed on the matrix units
+  inside the reverse sweep and applied there, path by path. The best
+  held-out snapshot's bits are exported.
+  - `--sign-opt fact-mom` (the default, 4 bytes per sign: the latent plus a
+    bf16 first moment, factored second moment), `ref` (12 bytes per sign,
+    f32 latent and Adam over a smooth sign, for small models) and `fact`
+    (2 bytes, no first moment; it diverged on the 0.8B at every rate tried).
+  - `--sign-lr auto` = min(0.15·τ/√steps, 4e-3·τ); `--sign-tau`,
+    `--sign-warm`, `--sign-b1/--sign-b2/--sign-eps/--sign-clamp/--sign-hyst`
+    and rate guards that halve the sign rate (`--sign-max-step-flip`,
+    `--sign-max-total-flip`, and a held-out KL above 1.05× its best at two
+    consecutive evaluations).
+  - `--topk-cache FILE` keeps the teacher top-k on disk, so a repeated or
+    resumed run with the same teacher and data arguments skips the teacher
+    pass (the teacher is freed before the student loads either way).
+    `--sign-state DIR` saves a resumable
+    state every `--sign-state-every` steps, `--resume DIR` continues from it
+    (a resumed run is byte-identical to an uninterrupted one);
+    `--sign-state-replace` keeps one state on disk instead of two.
+- `blr` on the wgpu whole-token graph: decode runs `blr` tensors resident in
+  the weight cache, two dispatches per group of up to three tensors of one
+  input (q|k|v, qkv|z; gate|up apply the activation in stage U), with no
+  limit on paths × rank. `CMF_BLR_GRAPH=0` restores the per-operation path,
+  `CMF_BLR_LV=32|128|256|512` pins the stage-V lane set.
+
+### Performance
+- `blr` decode (RTX PRO 6000, `bench --core`): Qwen3.8-27B NVG 0.55 bpw
+  73.7 tok/s (not measured on 0.8.20, where every FFN tensor exceeded the old
+  kernel's paths × rank limit and ran on the CPU; about 1 tok/s expected);
+  Qwen3.5-0.8B NVG 1.0 bpw 346.5 tok/s (q8_2f 352.8; 3.9 on the 0.8.20
+  per-operation path, measured on a shared card). The 0.8B greedy text and
+  perplexity are identical to the per-operation path.
+- Sign training on Qwen3.5-0.8B at 1.0 bpw (same 1 M tokens, schedule and
+  held-out windows as metric-only training; WikiText-2 and C4 at 512-token
+  windows on the dense expansion):
+
+  | training | held-out KL | WikiText-2 16×512 | WikiText-2 64×512 | C4 64×512 | signs flipped |
+  |---|---:|---:|---:|---:|---:|
+  | metric only | 2.005 | 135.84 | 134.54 | 182.03 | 0 |
+  | metric + signs, `fact-mom` | 1.449 | 80.35 | 78.93 | 116.58 | 0.90 % |
+  | metric + signs, `ref` | 1.445 | 80.27 | 79.07 | 116.84 | 0.89 % |
+
+  A sign step costs 8.5 % over a metric-only step. The 0.8B greedy text is
+  still not coherent at 1.0 bpw after 1 M tokens.
+- Sign training on Qwen3.8-27B at 0.55 bpw, the same A/B (same untrained
+  file, 1 M tokens, schedule, seed and held-out windows; q8_2f teacher;
+  perplexities on the dense expansion, 512-token windows; one RTX PRO 6000,
+  83 GB, 21.9 s per 4096-token step):
+
+  | training | held-out KL | WikiText-2 12×512 | WikiText-2 64×512 | C4 64×512 | docs 32×512 | code 32×512 |
+  |---|---:|---:|---:|---:|---:|---:|
+  | q8_2f (teacher) | — | 8.48 | 8.37 | 12.51 | 7.97 | 4.11 |
+  | metric only | 2.514 | 48.31 | 55.09 | 89.70 | 192.46 | 68.91 |
+  | metric + signs, `fact-mom` | 1.663 | 31.86 | 35.90 | 60.88 | 148.18 | 30.11 |
+
+  0.91 % of the 12.96 G signs change. Raw completions get some facts right
+  but repeat; chat mode still collapses, so the file is not a working model.
+
 ## [0.8.20] - 2026-10-18
 
 ### Added

@@ -54,6 +54,8 @@ pub mod gdn_train;
 pub mod train_ops;
 /// Trainer GEMMs (zi_mm) and the binary low-rank layer forward/backward.
 pub mod train_mm;
+/// Sign training of the binary low-rank paths (STE latents, factored optimizer).
+pub mod train_sign;
 /// Trainer loss: frozen vocabulary head + KL against the teacher top-k.
 pub mod train_head;
 /// Subgroup q1g decode matvec (bit-identical to `q1g_matvec`, no barriers).
@@ -20089,6 +20091,8 @@ struct GraphScratch {
     ids_stage: Option<(wgpu::Buffer, u64)>,
     am_pv: Option<(wgpu::Buffer, u64)>,
     am_pi: Option<(wgpu::Buffer, u64)>,
+    /// blr latents of the group in flight (stage V writes, stage U reads).
+    blr_t: Option<(wgpu::Buffer, u64)>,
 }
 
 impl GraphScratch {
@@ -26290,6 +26294,8 @@ pub fn forward_token_graph(
         kind: u8,
         prism: crate::gpu::GraphPrismOp,
         affine: bool,
+        /// `blr` geometry and f32 input scales (kind GRAPH_KIND_BLR only).
+        blr: Option<(blr::BlrDims, wgpu::Buffer)>,
     }
     enum LAttn {
         Full {
@@ -26420,6 +26426,7 @@ pub fn forward_token_graph(
                     kind: 0,
                     prism: gw.prism,
                     affine: gw.affine,
+                    blr: None,
                 })
             }
             1 => {
@@ -26434,6 +26441,7 @@ pub fn forward_token_graph(
                     kind: 1,
                     prism: gw.prism,
                     affine: gw.affine,
+                    blr: None,
                 })
             }
             2 | 3 | 5 | 6 | 7 | 9 | 10 => {
@@ -26485,6 +26493,40 @@ pub fn forward_token_graph(
                     kind: gw.kind,
                     prism: gw.prism,
                     affine: gw.affine,
+                    blr: None,
+                })
+            }
+            crate::gpu::GRAPH_KIND_BLR => {
+                // blr: the whole payload resident; the stage kernels walk
+                // its sections in place (gpu_wgpu/blr.rs).
+                blr::graph_pipes(c)?;
+                let d = blr::graph_dims(model, gw.idx)?;
+                if d.rows != rows || d.cols != cols || gw.prism != crate::gpu::GraphPrismOp::None {
+                    return None;
+                }
+                let entry = model.tensors.get(gw.idx)?;
+                let abs = model.entry_abs_offset(entry)?;
+                let plen = entry.nbytes as usize;
+                let bytes = model.primary_bytes();
+                if abs + plen > bytes.len() {
+                    return None;
+                }
+                WEIGHT_BYTES.fetch_add(plen as u64, std::sync::atomic::Ordering::Relaxed);
+                let b = weight_buffer_l(
+                    c,
+                    (model.uid() as usize, gw.idx),
+                    &bytes[abs..abs + plen],
+                    layer_of_name(&entry.name),
+                )?;
+                let g = blr::g_f32(c, model, gw.idx)?;
+                Some(GMat {
+                    buf: b,
+                    rs: None,
+                    idx: gw.idx,
+                    kind: crate::gpu::GRAPH_KIND_BLR,
+                    prism: gw.prism,
+                    affine: gw.affine,
+                    blr: Some((d, g)),
                 })
             }
             4 => {
@@ -26523,6 +26565,7 @@ pub fn forward_token_graph(
                     kind: 4,
                     prism: gw.prism,
                     affine: gw.affine,
+                    blr: None,
                 })
             }
             _ => None,
@@ -27057,6 +27100,39 @@ pub fn forward_token_graph(
     let gbuf = GraphScratch::ensure(&c.device, &mut gs.gbuf, (inter * 4) as u64, st, "g-gbuf");
     let ubuf = GraphScratch::ensure(&c.device, &mut gs.ubuf, (inter * 4) as u64, st, "g-ubuf");
     let abuf = GraphScratch::ensure(&c.device, &mut gs.abuf, (inter * 4) as u64, st, "g-abuf");
+    // blr latents: the widest layer's sum over its blr tensors bounds every
+    // group of that layer (a group is a subset of one layer's tensors).
+    let blr_lat = lws
+        .iter()
+        .map(|lw| {
+            let mut v: Vec<&GMat> = Vec::new();
+            match &lw.attn {
+                LAttn::Full { wq, wk, wv, wo, hg, .. } => {
+                    v.extend([wq, wk, wv, wo]);
+                    v.extend(hg.iter());
+                }
+                LAttn::Gdn { qkv, z, a, b, out, .. } => v.extend([qkv, z, a, b, out]),
+                LAttn::Conv { inp, out, .. } => v.extend([inp, out]),
+            }
+            if let LFfn::Dense { gate, up, down, .. } = &lw.ffn {
+                v.extend([gate, up, down]);
+            }
+            v.iter()
+                .filter_map(|m| m.blr.as_ref())
+                .map(|(d, _)| d.latents())
+                .sum::<usize>()
+        })
+        .max()
+        .unwrap_or(0);
+    let blr_graph = if blr_lat > 0 { blr::graph_pipes(c) } else { None };
+    let blr_t = {
+        let need = (blr_lat.max(1) * 4) as u64;
+        if gs.blr_t.as_ref().is_some_and(|(_, cap)| *cap < need) {
+            // Cached bind groups hold the old buffer: a grow is a cold event.
+            crate::gpu::probe_note_cold();
+        }
+        GraphScratch::ensure(&c.device, &mut gs.blr_t, need, st, "g-blr-t")
+    };
     // MoE routing scratch, sized to the largest MoE layer (absent → skipped).
     let moe_geom = lws
         .iter()
@@ -27859,6 +27935,24 @@ pub fn forward_token_graph(
                 pass.set_bind_group(0, &bind, &[]);
                 pass.dispatch_workgroups(mv_grid((rows as u32).div_ceil(16)), 1, 1);
             }
+            crate::gpu::GRAPH_KIND_BLR => {
+                // A lone blr projection at a site without its own cached
+                // binding (short conv, head gate): V + U, fresh bind groups.
+                let g = blr_graph
+                    .as_ref()
+                    .expect("blr weight resolved without the blr graph kernels");
+                let (dims, g_buf) = m.blr.as_ref().expect("blr GMat carries its geometry");
+                let gm = [blr::GroupMat {
+                    buf: &m.buf,
+                    g: g_buf,
+                    dims: *dims,
+                    y,
+                }];
+                debug_assert_eq!((gm[0].dims.rows, gm[0].dims.cols), (rows, cols));
+                assert!(blr::encode_group(c, g, enc, &gm, xs, &blr_t, None, &|_, l, b| {
+                    blr::plain_bind(c, l, b)
+                }));
+            }
             _ => encode_f32matvec(c, enc, &m.buf, xs, y, rows, cols),
         }
     };
@@ -28145,6 +28239,82 @@ pub fn forward_token_graph(
             }
             for (m, xs, y, r, cc) in mats {
                 emat(enc, m, xs, y, *r, *cc);
+            }
+        };
+    // blr tensors of ONE input `x` (≤ 3; `act` = gate, up → act(gate)·up
+    // into the gate's output): stage V + stage U, two dispatches. `site` ≠ 0
+    // caches the two bind groups per (site, layer) like the rest of the
+    // graph: sites 80..103 are blr's, four per call site (V at `site`, U at
+    // `site + 1`, a second chunk of three at `site + 2/3`).
+    let blr_enc = |enc: &mut wgpu::CommandEncoder,
+                   mats: &[(&GMat, &wgpu::Buffer)],
+                   x: &wgpu::Buffer,
+                   act: Option<u32>,
+                   site: u32,
+                   li: usize| {
+        let g = blr_graph
+            .as_ref()
+            .expect("blr weight resolved without the blr graph kernels");
+        let gm: Vec<blr::GroupMat<'_>> = mats
+            .iter()
+            .map(|(m, y)| {
+                let (dims, g_buf) = m.blr.as_ref().expect("blr GMat carries its geometry");
+                blr::GroupMat {
+                    buf: &m.buf,
+                    g: g_buf,
+                    dims: *dims,
+                    y,
+                }
+            })
+            .collect();
+        let bind = |stage: u32, l: &wgpu::BindGroupLayout, b: &[&wgpu::Buffer]| {
+            if site == 0 {
+                blr::plain_bind(c, l, b)
+            } else {
+                bgc(site + stage, li, l, b)
+            }
+        };
+        assert!(blr::encode_group(c, g, enc, &gm, x, &blr_t, act, &bind));
+    };
+    // `group_mats` with the blr tensors split out: those sharing an input
+    // go through `blr_enc` three at a time (bind groups cached at `site`),
+    // everything else through `group_mats` exactly as before.
+    let group_mats_at =
+        |enc: &mut wgpu::CommandEncoder,
+         mats: &[(&GMat, &wgpu::Buffer, &wgpu::Buffer, usize, usize)],
+         site: u32,
+         li: usize| {
+            if !mats.iter().any(|m| m.0.kind == crate::gpu::GRAPH_KIND_BLR) {
+                group_mats(enc, mats);
+                return;
+            }
+            let rest: Vec<_> = mats
+                .iter()
+                .filter(|m| m.0.kind != crate::gpu::GRAPH_KIND_BLR)
+                .copied()
+                .collect();
+            let mut bl: Vec<_> = mats
+                .iter()
+                .filter(|m| m.0.kind == crate::gpu::GRAPH_KIND_BLR)
+                .copied()
+                .collect();
+            let mut sub = 0u32;
+            while !bl.is_empty() {
+                let x0 = bl[0].1;
+                let c0 = bl[0].4;
+                let (take, keep): (Vec<_>, Vec<_>) =
+                    bl.into_iter().partition(|m| m.1 == x0 && m.4 == c0);
+                bl = keep;
+                for chunk in take.chunks(3) {
+                    let ms: Vec<(&GMat, &wgpu::Buffer)> =
+                        chunk.iter().map(|m| (m.0, m.2)).collect();
+                    let s = if site == 0 { 0 } else { site + 2 * sub };
+                    blr_enc(enc, &ms, x0, None, s, li);
+                    sub += 1;
+                }
+            }
+            if !rest.is_empty() {
+                group_mats(enc, &rest);
             }
         };
     // Two projections of the same input under ONE dispatch. `false` = a
@@ -28499,13 +28669,15 @@ pub fn forward_token_graph(
                             pass.set_bind_group(0, &b2, &[]);
                             pass.dispatch_workgroups(w2, 1, 1);
                         }
-                        _ => group_mats(
+                        _ => group_mats_at(
                             &mut enc,
                             &[
                                 (wq, &qkv_in, &qraw, qrows, hidden),
                                 (wk, &qkv_in, &kb, lnkv * hd, hidden),
                                 (wv, &qkv_in, &vb, lnkv * ldv, hidden),
                             ],
+                            80,
+                            li,
                         ),
                     }
                     }
@@ -29277,7 +29449,11 @@ pub fn forward_token_graph(
                                 &[(&wo.buf, &ob, hidden)],
                             ))
                         {
-                            emat(&mut enc, wo, &wo_in, &ob, hidden, nh * ldv);
+                            if wo.kind == crate::gpu::GRAPH_KIND_BLR {
+                                blr_enc(&mut enc, &[(wo, &ob)], &wo_in, None, 84, li);
+                            } else {
+                                emat(&mut enc, wo, &wo_in, &ob, hidden, nh * ldv);
+                            }
                         }
                     }
                 }
@@ -29552,7 +29728,7 @@ pub fn forward_token_graph(
                             tsp!(pass, fine, 14); // out-proj
                         }
                     } else {
-                        group_mats(
+                        group_mats_at(
                             &mut enc,
                             &[
                                 (qkv, &qz_in, &qkv_b, *cdim, hidden),
@@ -29560,7 +29736,10 @@ pub fn forward_token_graph(
                                 (a, &n1, &a_b, *nv, hidden),
                                 (b, &n1, &b_b, *nv, hidden),
                             ],
+                            88,
+                            li,
                         );
+                        ts_point!(enc, 53); // CMF_GRAPH_TS_ALL: GDN projections (fallback arm)
                         go(
                             &mut enc,
                             &c.gdn_conv,
@@ -29587,11 +29766,16 @@ pub fn forward_token_graph(
                                 *nv as u32,
                             );
                         }
+                        ts_point!(enc, 54); // conv + recurrent step + norm
                         let Some(out_in) = prism_input(&mut enc, &[out], &gdo_b, nv * dv) else {
                             graph_decline("Prism GDN output transform unavailable");
                             return token_graph_outcome(o1_started || state_started, false);
                         };
-                        emat(&mut enc, out, &out_in, &ob, hidden, nv * dv);
+                        if out.kind == crate::gpu::GRAPH_KIND_BLR {
+                            blr_enc(&mut enc, &[(out, &ob)], &out_in, None, 92, li);
+                        } else {
+                            emat(&mut enc, out, &out_in, &ob, hidden, nv * dv);
+                        }
                     }
                 }
                 (
@@ -29999,13 +30183,32 @@ pub fn forward_token_graph(
                                 tsp!(pass, fine, 45); // residual + next norm
                                 down_rode_along = true;
                             }
+                        } else if gate.kind == crate::gpu::GRAPH_KIND_BLR
+                            && up.kind == crate::gpu::GRAPH_KIND_BLR
+                        {
+                            // blr gate/up: stage V of both, then stage U
+                            // computing act(gate)·up straight into `abuf`.
+                            if let Some((p, b, w)) = ffn_pre.take() {
+                                go(&mut enc, p, &b, w);
+                            }
+                            blr_enc(
+                                &mut enc,
+                                &[(gate, &abuf), (up, &abuf)],
+                                &ffn_in,
+                                Some(act),
+                                96,
+                                li,
+                            );
+                            ts_point!(enc, 56); // blr gate|up + act
                         } else {
-                            group_mats(
+                            group_mats_at(
                                 &mut enc,
                                 &[
                                     (gate, &ffn_in, &gbuf, inter, hidden),
                                     (up, &ffn_in, &ubuf, inter, hidden),
                                 ],
+                                96,
+                                li,
                             );
                             go(
                                 &mut enc,
@@ -30026,7 +30229,11 @@ pub fn forward_token_graph(
                                 graph_decline("Prism FFN down transform unavailable");
                                 return token_graph_outcome(o1_started || state_started, false);
                             };
-                            emat(&mut enc, down, &down_in, &ob, hidden, inter);
+                            if down.kind == crate::gpu::GRAPH_KIND_BLR {
+                                blr_enc(&mut enc, &[(down, &ob)], &down_in, None, 100, li);
+                            } else {
+                                emat(&mut enc, down, &down_in, &ob, hidden, inter);
+                            }
                         }
                     } // !continue_ffn
                 }
@@ -31122,6 +31329,9 @@ pub fn forward_token_graph(
                     (45, _) => "|ffn:tail",
                     (50, _) => "|pre-fwht-span",
                     (51, _) => "|fwht-dispatch-span",
+                    (53, _) => "|gdn:proj",
+                    (54, _) => "|gdn:rec",
+                    (56, _) => "|ffn:gu",
                     _ => "start",
                 };
                     let mut line = String::from("gpu-ts: timeline spans (later-stamp attribution):");

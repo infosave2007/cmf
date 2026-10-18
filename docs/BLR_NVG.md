@@ -75,18 +75,34 @@ Per token and path: `z = x ⊙ g_p`; stage V `t_p[k] = ℓ_p[k]·Σ_j V_p(k,j) z
   independent accumulators; rows split over the pool.
 * **CPU batch** (`b ≥ 4`) — signs unpacked once to ±1 f32, two `sgemm`s per path
   (`Z·Vᵀ`, `T·Uᵀ`) split over the pool.
-* **wgpu** (`b = 1` decode and `b > 1` prefill) — `blr_v`: one workgroup per latent row
-  and block of 4 tokens, signs 16 at a time, f16 scales via `unpack2x16float`;
-  `blr_u`: one thread per output row, the token's latents staged in workgroup memory.
-  The payload goes into the resident weight cache once. Contract: `d_in % 32 == 0`,
-  `d_out % 4 == 0`, `P·r ≤ 2048`; outside it the CPU kernel runs. Metal has no `blr`
-  kernel yet (CPU fallback).
+* **wgpu per-op** (`gpu::blr_matmat`, `b = 1` and `b > 1`) — `blr_v`: one workgroup per
+  latent row and block of 4 tokens, signs 16 at a time, f16 scales via
+  `unpack2x16float`; `blr_u`: one thread per output row, the token's latents staged in
+  workgroup memory. One upload, two dispatches and one readback per call. Contract:
+  `d_in % 32 == 0`, `d_out % 4 == 0`, `P·r ≤ 2048`; outside it the CPU kernel runs.
+  Metal has no `blr` kernel yet (CPU fallback).
+* **wgpu whole-token graph** (decode, `b = 1`; `gpu_wgpu/blr.rs`: `blr_gv`, `blr_gu`,
+  `blr_gu_act`) — the payload resident in the weight cache, the latents in a graph
+  scratch, two dispatches per group of up to three tensors of one input (q|k|v,
+  qkv|z; gate|up compute act(gate)·up in stage U and write the FFN activation).
+  Stage V: a set of 32 lanes (128 from 2048 columns) owns 8 latent rows, lanes over
+  32-bit sign words, four words a lane in flight, `z = x ⊙ g` formed once per word for
+  the 8 rows (g resident as a word-transposed f32 copy), subgroup sums. Stage U reads
+  U rows where they lie: a row starts `σ = i·r mod 32 ∈ {0, 8, 16, 24}` bits into a
+  word, so the latents are stored four times shifted by σ (the neighbouring rows' bits
+  meet zeros) and word-transposed (lanes walking words read consecutive vec4s); a
+  subgroup owns rows k, k+4, k+8, k+12 (one shift copy) and walks all paths as one
+  word sequence. Without 32-wide subgroups both stages sum through workgroup memory.
+  Contract: `d_in % 32 == 0`, `d_out % 4 == 0`, no `P·r` limit. `CMF_BLR_GRAPH=0`
+  restores the per-op path; `CMF_BLR_LV=32|128|256|512` pins the stage-V lane set.
 * **Engine wiring** — `QTensor::Blr`: `matvec`, `matvec2`, `matmat` (GPU first when the
   device is up, `CMF_BLR_GPU=0` keeps it on the CPU); multi-tensor jobs and fused
   gate/up refuse `blr` and fall back to per-tensor calls; rows/columns reconstructed on
-  the fly for the rare paths. Every device-graph accessor (`graph_weight`,
-  `mapped_device_gemm`, `q1_parts`, …) answers `None`, so whole-token and batch graphs
-  decline to the per-op path. `CMF_BLR_DENSE=1` dequantizes to f32 at load (A/B parity).
+  the fly for the rare paths. `graph_weight` and the other device-graph accessors
+  answer `None`; only the wgpu token-graph builder asks `graph_weight_or_blr`, which
+  hands a `blr` tensor over as kind `GRAPH_KIND_BLR` (11). The batch graph still
+  declines `blr` (prefill walks positions through the token graph).
+  `CMF_BLR_DENSE=1` dequantizes to f32 at load (A/B parity).
 
 ## 4. Encoders
 
@@ -206,7 +222,10 @@ and the calibration parameters under `provenance.blr`.
 
 ```
 cargo test --release -p cortiq-core blr                       # rank rule, round trip, validation, generic entry points
-cargo test --release -p cortiq-engine --features gpu --lib blr   # CPU kernels vs dense, QTensor paths from a CMF, wgpu vs CPU
+cargo test --release -p cortiq-engine --features gpu --lib blr   # CPU kernels vs dense, QTensor paths from a CMF, wgpu vs CPU,
+                                                                  # graph kernels vs dequant (both reductions, every lane set)
+cargo test --release -p cortiq-engine --features gpu --lib wgpu_blr_graph_throughput -- --ignored --nocapture
+                                                                  # graph kernels at the 27B shapes, DRAM regime, device timestamps
 cargo test --release -p cortiq-cli --bin cortiq -- nvg convert_blr   # monotone ALS/refine, V-search factor, drivers, coverage, CLI parse
 cargo test --release -p cortiq-engine --features gpu --lib nvg_dev   # GEMM variants, SPD solve + Uc, top-r eigenpairs vs a known spectrum
 cargo test --release -p cortiq-cli --bin cortiq -- nvg_gpu            # device vs host per stage: contexts/errors, latents/ITQ/polar,
@@ -235,6 +254,26 @@ path runs. `CMF_BLR_DENSE=1` (dense f32 at load) gives 2 719 569 for the dual-sv
 equal to the factored kernels. The file is mostly the q8_2f embedding (248 320 × 1024)
 and the q8_2f MTP head; the 497 M projection weights take 61.4 MB. Encoding time: dual-svid
 7.4 min, NVG 2 h (f64 CPU, sequential calibration ~1.5 min per layer, ~4 min of encoding).
+
+### 7.0 Decode on the wgpu token graph (18.10.2026)
+
+Same card, `bench --core --ignore-eos`, a quiet window (the card is otherwise shared):
+
+| file | decode tok/s | before (per-op `blr`) |
+|---|---|---|
+| Qwen3.5-0.8B q8_2f | 352.8 | — |
+| Qwen3.5-0.8B NVG 1.0 bpw (trained) | 346.5 | 3.9 |
+| Qwen3.8-27B NVG 0.55 bpw | 73.7 (32 tokens; prefill 79 tok/s) | not measured (the FFN on the CPU: `P·r > 2048`; ~1 expected) |
+
+Only the token-graph column was measured in the quiet window; the 0.8B per-op 3.9 is the
+0.8.20 baseline on the card shared with the 27B training (q8_2f 107.0 tok/s there), a lower bound.
+Greedy text of the 0.8B identical to the per-op path, PPL 135.764 on both (16 × 512).
+27B on the device: a decoded token ~12.7 ms = the 64 layers ~11.8 ms (~184 µs a layer) plus the
+final norm and q8_2f head 0.85 ms. A projection
+group costs its V and U dispatches plus their dependency barriers (DRAM regime, V+U pair:
+GDN qkv|z ~30 µs, out ~27, gate|up+act ~28, down ~35 against 2–8 µs of bytes at full
+bandwidth); stage V of `down` (17408 columns, 272 row sets each re-reading z) is the slowest
+single stage.
 
 ### 7.1 The device encoder (18.10.2026)
 

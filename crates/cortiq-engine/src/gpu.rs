@@ -1572,8 +1572,13 @@ pub enum GraphPrismOp {
     InverseEmbedding,
 }
 
+/// Graph kind of a binary low-rank (`blr`, dtype 19) weight: two stage
+/// dispatches (V, U) over the resident payload instead of one matvec. Only
+/// the wgpu token graph builder asks for it (`QTensor::graph_weight_or_blr`).
+pub const GRAPH_KIND_BLR: u8 = 11;
+
 /// One weight in the whole-token graph: tensor idx + a codec tag (0=q8_row,
-/// 1=q1, 2=q4_tiled, 3=q1t, 4=f32) + per-row scales (q8_row only) + the raw f32
+/// 1=q1, 2=q4_tiled, 3=q1t, 4=f32, … 11=blr) + per-row scales (q8_row only) + the raw f32
 /// data (kind 4 only — small unquantized projections like GDN in_proj_a/b).
 pub struct GraphW<'a> {
     pub idx: usize,
