@@ -252,6 +252,12 @@ fn quantize_moe_on_the_v41_fixture() {
     let mi = cortiq_core::CmfModel::open(&inplace).unwrap();
     assert!(mi.verify().is_empty(), "{:?}", mi.verify());
     assert_eq!(std::fs::metadata(&inplace).unwrap().len() as usize, before.len(), "in place keeps the file length");
+    // the header keeps the converter's provenance; the recipe is in a sidecar
+    let side: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("inplace.cmf.gptq_moe.json")).unwrap()).unwrap();
+    let run0 = &side["runs"][0];
+    assert_eq!((run0["weight_quant"].as_str(), run0["gptq_moe"]["layers"].as_str()), (Some("q2tp"), Some("0..5")), "{side}");
+    assert_eq!(run0["gptq_moe"]["calibration_capture"]["token_hash"], meta["token_hash"]);
+    assert!(run0["gptq_moe"]["calibration_capture"]["reused_despite"][0].as_str().is_some_and(|w| w.contains("calibration file")), "{side}");
     // the in-place experts are the --output run's experts
     for li in 0..N_LAYERS {
         for name in [format!("model.layers.{li}.mlp.experts.1.up_proj.weight"), format!("model.layers.{li}.mlp.shared_experts.down_proj.weight")] {

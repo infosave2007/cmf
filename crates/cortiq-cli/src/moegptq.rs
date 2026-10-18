@@ -727,6 +727,7 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
         "experts_gptq": stats.0,
         "experts_rtn": stats.1,
         "min_rows": o.min_rows,
+        "layers": format!("{range_lo}..{range_hi}"),
         "calibration_capture": capture_prov,
     });
     sink.finish(&cmodel, &expert_slots, codec, prov_info, o.output, t0)
@@ -765,9 +766,23 @@ impl Sink {
                 Ok(())
             }
             Sink::InPlace { path, before, after, punched, .. } => {
+                // the header cannot grow in place: the recipe goes into a
+                // sidecar, one record per run (a resumed run adds its range)
+                let side = format!("{path}.gptq_moe.json");
+                let mut runs = std::fs::read(&side)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                    .and_then(|v| v.get("runs").and_then(|r| r.as_array()).cloned())
+                    .unwrap_or_default();
+                let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                runs.push(serde_json::json!({ "finished_unix": unix, "weight_quant": codec.name(), "gptq_moe": prov_info.clone() }));
+                let doc = serde_json::to_vec_pretty(&serde_json::json!({ "file": Path::new(&path).file_name().map(|f| f.to_string_lossy().into_owned()), "runs": runs }))?;
+                if let Err(e) = write_atomic(Path::new(&side), |w| std::io::Write::write_all(w, &doc)) {
+                    eprintln!("warning: the recipe could not be written to {side} ({e:#}); it is: {prov_info}");
+                }
                 eprintln!(
                     "rewrote expert tensors in place in {path}: payload {:.2} GB → {:.2} GB, {:.2} GB of slack released; {:.0}s. \
-                     The header provenance is the calibration file's ({prov_info})",
+                     The header provenance is the calibration file's; the recipe is in {side}",
                     before as f64 / 1e9,
                     after as f64 / 1e9,
                     punched as f64 / 1e9,
