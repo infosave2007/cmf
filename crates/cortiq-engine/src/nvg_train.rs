@@ -581,7 +581,10 @@ impl Work {
             act16: tm::f16_buf(c, pr * act_w),
             tape,
             rope: to::upload(c, &tab),
-            head: HeadScratch::new(c, 256.min(ntok), g.vocab, g.hs),
+            // 1024-row chunks: 4x fewer passes over the head planes, and the
+            // dlogits·W GEMM gets 320 workgroups instead of 80 (the logits
+            // buffer, 1 GB at a 248k vocabulary, stays under the binding limit)
+            head: HeadScratch::new(c, 1024.min(ntok), g.vocab, g.hs),
             sg: (sg_rows > 0).then(|| SignScratch::new(c, ntok, sg_rows, sg_rp)),
             att: g
                 .gdn_layer
@@ -842,12 +845,22 @@ fn embed(c: Ctx, net: &Net, w: &Work, ids: &[u32]) {
     let _p = prof::phase("embed");
     let hs = net.geom.hs;
     let mut rows = vec![0f32; ids.len() * hs];
-    for (t, &id) in ids.iter().enumerate() {
-        let src = &net.embed[id as usize * hs..(id as usize + 1) * hs];
-        for (d, &s) in rows[t * hs..(t + 1) * hs].iter_mut().zip(src) {
-            *d = f16_to_f32(s);
+    // f16 -> f32 row gather on a few threads (the GPU idles meanwhile)
+    let per = ids.len().div_ceil(16).max(1);
+    std::thread::scope(|sc| {
+        for (ci, chunk) in rows.chunks_mut(per * hs).enumerate() {
+            let ids = &ids[ci * per..];
+            let emb = &net.embed;
+            sc.spawn(move || {
+                for (t, row) in chunk.chunks_mut(hs).enumerate() {
+                    let id = ids[t] as usize;
+                    for (d, &s) in row.iter_mut().zip(&emb[id * hs..(id + 1) * hs]) {
+                        *d = f16_to_f32(s);
+                    }
+                }
+            });
         }
-    }
+    });
     prof::count(prof::Cnt::Write, 1);
     prof::count(prof::Cnt::WriteBytes, (rows.len() * 4) as u64);
     c.queue.write_buffer(&w.ckpt[0], 0, bytemuck::cast_slice(&rows));
