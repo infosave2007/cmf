@@ -259,7 +259,7 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
                 layer_dirs.push(d);
                 shared_dirs.push(s);
             }
-            (arch.moe.as_ref().map(|m| m.top_k).unwrap_or(10), 0.0f32, 0usize)
+            (qwen4_top_k(&arch), 0.0f32, 0usize)
         }
         Family::Dsv41 => {
             let cfg = &p.dsv41.as_ref().expect("dsv41").2;
@@ -269,16 +269,7 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
                 layer_dirs.push(d);
                 shared_dirs.push(Some(s));
             }
-            let block = arch
-                .deepseek_v41
-                .as_ref()
-                .and_then(|c| c.get("quantization_config"))
-                .and_then(|q| q.get("weight_block_size"))
-                .and_then(|v| v.as_array())
-                .and_then(|a| a.first()?.as_u64())
-                .map(|b| b as usize)
-                .unwrap_or(32);
-            (cfg.top_k, cfg.swiglu_limit.max(0.0), block)
+            dsv41_settings(cfg, arch.deepseek_v41.as_ref())
         }
     };
     let ne = layer_dirs[0].len();
@@ -704,6 +695,25 @@ impl Sink {
             }
         }
     }
+}
+
+/// Flash-Next top-k from the header (10 when it has no `moe` block).
+fn qwen4_top_k(arch: &cortiq_core::types::ModelArch) -> usize {
+    arch.moe.as_ref().map(|m| m.top_k).unwrap_or(10)
+}
+
+/// A V4.1 model's top-k and SwiGLU limit (the runtime config; a negative
+/// limit is none) and its FP8 weight block, from the preserved source
+/// config's `quantization_config.weight_block_size` (32 when absent).
+fn dsv41_settings(cfg: &cortiq_engine::dsv41::Dsv41Cfg, source: Option<&serde_json::Value>) -> (usize, f32, usize) {
+    let block = source
+        .and_then(|c| c.get("quantization_config"))
+        .and_then(|q| q.get("weight_block_size"))
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first()?.as_u64())
+        .map(|b| b as usize)
+        .unwrap_or(32);
+    (cfg.top_k, cfg.swiglu_limit.max(0.0), block)
 }
 
 /// One source's calibration ids cut into windows of `window` tokens; with
@@ -2397,6 +2407,40 @@ mod tests {
             got.sort_unstable();
             assert_eq!(got, want, "token {t}");
         }
+    }
+
+    /// Settings read from the header: V4.1 top-k and SwiGLU limit from the
+    /// runtime config, the FP8 block from the preserved quantization config;
+    /// Flash-Next's top-k from its `moe` block.
+    #[test]
+    fn header_derived_settings() {
+        let arch = |moe: Option<serde_json::Value>| -> cortiq_core::types::ModelArch {
+            let mut v = serde_json::json!({
+                "arch_name": "deepseek_v41", "hidden_size": 64, "intermediate_size": 32, "num_layers": 2,
+                "num_attention_heads": 1, "num_kv_heads": 1, "head_dim": 32, "vocab_size": 16,
+                "layer_types": ["FullAttention", "FullAttention"], "rms_norm_eps": 1e-6, "max_position_embeddings": 64,
+                "linear_conv_kernel_dim": 0, "linear_num_key_heads": 0, "linear_num_value_heads": 0,
+            });
+            if let Some(m) = moe {
+                v["moe"] = m;
+            }
+            serde_json::from_value(v).unwrap()
+        };
+        let a = arch(None);
+        let src = |limit: f64, block: Option<serde_json::Value>| {
+            let mut v = serde_json::json!({"text_config": {"hidden_size": 64, "num_hidden_layers": 2, "num_experts_per_tok": 6, "n_routed_experts": 384, "swiglu_limit": limit, "scoring_func": "sqrtsoftplus"}});
+            if let Some(b) = block {
+                v["quantization_config"] = serde_json::json!({"weight_block_size": b});
+            }
+            v
+        };
+        let settings = |s: &serde_json::Value| dsv41_settings(&cortiq_engine::dsv41::Dsv41Cfg::from_source(s, &a).unwrap().0, Some(s));
+        assert_eq!(settings(&src(10.0, Some(serde_json::json!([128, 128])))), (6, 10.0, 128));
+        assert_eq!(settings(&src(7.5, None)), (6, 7.5, 32), "no quantization_config: 32×32 tiles");
+        assert_eq!(settings(&src(-1.0, Some(serde_json::json!([32, 32])))), (6, 0.0, 32), "a negative limit is none");
+        assert_eq!(qwen4_top_k(&a), 10, "no moe block");
+        let m = serde_json::json!({"num_experts": 512, "top_k": 8, "moe_intermediate_size": 128, "routed_scaling_factor": 1.0});
+        assert_eq!(qwen4_top_k(&arch(Some(m))), 8);
     }
 
     /// The pass plan: `per` layers a pass, one pass in place.
