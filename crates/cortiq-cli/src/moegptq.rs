@@ -22,8 +22,9 @@
 //!   `silu(X·W_gᵀ)⊙(X·W_uᵀ)` (V4.1: `silu(min(g, L))⊙clamp(u, −L, L)`, its
 //!   `swiglu_limit` L) from the full-precision weights and its Hessian, both
 //!   accumulated in row chunks; then the folds, the gate/up sweeps and the
-//!   down q4tp sweep. On the GPU by default (device grams, folds, sweeps);
-//!   `CMF_MOE_HOST=1`, or no wgpu adapter, runs the same steps on the host.
+//!   down q4tp sweep. On the GPU (device grams, folds, sweeps); without a
+//!   wgpu adapter the run stops, `CMF_MOE_HOST=1` runs the same steps on
+//!   the host.
 //! * Full-precision weights come from the original safetensors shards, one
 //!   layer at a time (the next layer's in the background), deleted when done
 //!   — or read in place when `--hf` names a local directory. Flash-Next's are
@@ -155,16 +156,16 @@ enum Family {
 pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     let t0 = Instant::now();
     let codec = Codec::parse(o.codec)?;
+    // The host path is exact but far too slow for a full model: it runs
+    // only when asked for, never as a silent fallback.
     let host_forced = std::env::var("CMF_MOE_HOST").is_ok_and(|v| v != "0");
-    let gpu = if host_forced { None } else { to::dev() };
-    let engine = match gpu {
-        Some(c) => Engine::Gpu(c),
-        None => {
-            eprintln!(
-                "quantize-moe: {} — Hessians, folds and sweeps run on the host (exact, much slower)",
-                if host_forced { "CMF_MOE_HOST=1" } else { "no wgpu GPU" }
-            );
-            Engine::Host
+    let engine = if host_forced {
+        eprintln!("quantize-moe: CMF_MOE_HOST=1 — Hessians, folds and sweeps run on the host (exact, much slower)");
+        Engine::Host
+    } else {
+        match to::dev() {
+            Some(c) => Engine::Gpu(c),
+            None => anyhow::bail!("quantize-moe: no wgpu GPU (set CMF_MOE_HOST=1 to run on the host)"),
         }
     };
     let cmodel = Arc::new(CmfModel::open_sharded(o.calib_model)?);
