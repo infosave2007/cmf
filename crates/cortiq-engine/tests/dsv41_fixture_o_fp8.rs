@@ -13,11 +13,9 @@
 #[path = "common/dsv41_fixture.rs"]
 mod dsv41_fixture;
 
-use cortiq_core::CmfModel;
 use cortiq_engine::dsv41::{self, Dsv41Cfg, Dsv41State};
 use cortiq_engine::qtensor::float_activations_scope;
 use dsv41_fixture::*;
-use std::sync::Arc;
 
 #[test]
 fn o_fp8_follows_reference_act_quant() {
@@ -29,8 +27,7 @@ fn o_fp8_follows_reference_act_quant() {
         std::env::set_var("CMF_GPU", "0");
     }
     let fx = Fixture::build(RELEASE_COMPRESSED_VOCAB);
-    let path = fx.write("ofp8");
-    let model = Arc::new(CmfModel::open(&path).expect("open fixture"));
+    let model = fx.open("ofp8");
     let source = model.arch().deepseek_v41.clone().expect("source config");
     let (cfg, n_layers) = Dsv41Cfg::from_source(&source, model.arch()).expect("parse cfg");
     let got = float_activations_scope(|| {
