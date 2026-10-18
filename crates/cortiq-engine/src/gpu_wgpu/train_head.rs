@@ -262,16 +262,32 @@ pub struct HeadScratch {
     logits: wgpu::Buffer,
     dact: wgpu::Buffer,
     dpart: wgpu::Buffer,
+    /// Per-chunk views of the inputs (fully overwritten before use; the
+    /// activation staging zeroes its own padding rows).
+    xin: wgpu::Buffer,
+    tidc: wgpu::Buffer,
+    tpc: wgpu::Buffer,
+    lossc: wgpu::Buffer,
+    k_max: usize,
 }
+
+/// Top-k entries per token the per-chunk scratch holds.
+const K_MAX: usize = 256;
 
 impl HeadScratch {
     pub fn new(c: &Ctx, chunk: usize, v: usize, hs: usize) -> Self {
+        let pr = train_mm::pad_rows(chunk);
         HeadScratch {
             chunk,
-            act: train_mm::f16_buf(c, train_mm::pad_rows(chunk) * hs.max(v)),
-            logits: train_ops::zeros(c, train_mm::pad_rows(chunk) * v),
-            dact: train_ops::zeros(c, train_mm::pad_rows(chunk) * hs),
-            dpart: train_ops::zeros(c, train_mm::pad_rows(chunk) * hs),
+            act: train_mm::f16_buf(c, pr * hs.max(v)),
+            logits: train_ops::zeros_u32(c, pr * v),
+            dact: train_ops::zeros_u32(c, pr * hs),
+            dpart: train_ops::zeros_u32(c, pr * hs),
+            xin: train_ops::zeros_u32(c, pr * hs),
+            tidc: train_ops::zeros_u32(c, chunk * K_MAX),
+            tpc: train_ops::zeros_u32(c, chunk * K_MAX),
+            lossc: train_ops::zeros_u32(c, chunk),
+            k_max: K_MAX,
         }
     }
 }
@@ -302,21 +318,23 @@ pub fn head_kl(
     while r0 < ntok {
         let rows = (ntok - r0).min(ch);
         // views of this chunk: copy rows in/out (small relative to the GEMMs)
-        let xin = train_ops::zeros(c, train_mm::pad_rows(rows) * hs);
-        let tidc = train_ops::zeros(c, rows * k);
-        let tpc = train_ops::zeros(c, rows * k);
-        let lossc = train_ops::zeros(c, rows);
+        if k > s.k_max {
+            return None;
+        }
+        let (xin, tidc, tpc, lossc) = (&s.xin, &s.tidc, &s.tpc, &s.lossc);
         let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("head_in") });
-        enc.copy_buffer_to_buffer(x, (r0 * hs * 4) as u64, &xin, 0, (rows * hs * 4) as u64);
-        enc.copy_buffer_to_buffer(tid, (r0 * k * 4) as u64, &tidc, 0, (rows * k * 4) as u64);
-        enc.copy_buffer_to_buffer(tp, (r0 * k * 4) as u64, &tpc, 0, (rows * k * 4) as u64);
+        let mut mk = super::train_prof::enc_begin(c, &mut enc);
+        enc.copy_buffer_to_buffer(x, (r0 * hs * 4) as u64, xin, 0, (rows * hs * 4) as u64);
+        enc.copy_buffer_to_buffer(tid, (r0 * k * 4) as u64, tidc, 0, (rows * k * 4) as u64);
+        enc.copy_buffer_to_buffer(tp, (r0 * k * 4) as u64, tpc, 0, (rows * k * 4) as u64);
+        super::train_prof::enc_mark(c, &mut enc, &mut mk, "copy");
         super::submit(c, enc.finish());
         let m = module(c)?;
-        let mut ops = vec![Op::D(train_mm::cvt(c, &xin, None, &s.act, rows, hs, 1.0)?)];
+        let mut ops = vec![Op::D(train_mm::cvt(c, xin, None, &s.act, rows, hs, 1.0)?)];
         for (si, &(off, vs)) in head.cuts.iter().enumerate() {
             ops.push(Op::M(train_mm::mm_cols(c, &head.w[si], &s.act, &s.logits, rows, vs, hs, v, off, 1.0)?));
         }
-        ops.push(Op::D(kl_rows(c, &s.logits, &tidc, &tpc, &lossc, rows, v, k, gscale / total as f32)?));
+        ops.push(Op::D(kl_rows(c, &s.logits, tidc, tpc, lossc, rows, v, k, gscale / total as f32)?));
         // dh = Σ_slices dlogits[:, slice] · W[slice]
         for (si, &(off, vs)) in head.cuts.iter().enumerate() {
             ops.push(Op::D(train_mm::cvt_cols(c, &s.logits, &s.act, rows, vs, v, off, 1.0)?));
@@ -333,8 +351,10 @@ pub fn head_kl(
         }
         train_mm::run(c, &ops);
         let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("head_out") });
+        let mut mk = super::train_prof::enc_begin(c, &mut enc);
         enc.copy_buffer_to_buffer(&s.dact, 0, dx, (r0 * hs * 4) as u64, (rows * hs * 4) as u64);
-        enc.copy_buffer_to_buffer(&lossc, 0, loss, (r0 * 4) as u64, (rows * 4) as u64);
+        enc.copy_buffer_to_buffer(lossc, 0, loss, (r0 * 4) as u64, (rows * 4) as u64);
+        super::train_prof::enc_mark(c, &mut enc, &mut mk, "copy");
         super::submit(c, enc.finish());
         r0 += rows;
     }
