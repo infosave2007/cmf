@@ -6023,7 +6023,7 @@ fn auth(mut req: ureq::Request, token: Option<&str>) -> ureq::Request {
 
 /// Total size of a remote file via a `Range: bytes=0-0` probe (Content-Range),
 /// or None if the server doesn't support/report ranges (→ single stream).
-fn probe_size(agent: &ureq::Agent, url: &str, token: Option<&str>) -> Option<u64> {
+pub(crate) fn probe_size(agent: &ureq::Agent, url: &str, token: Option<&str>) -> Option<u64> {
     let resp = auth(agent.get(url).set("Range", "bytes=0-0"), token)
         .call()
         .ok()?;
