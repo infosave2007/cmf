@@ -637,7 +637,8 @@ GU_LANE_LET
 // act(gate)·up of the same rows: slot 0 gate, slot 1 up, out in y0. The
 // two tensors' sign words of a round are fetched together.
 // `act` = `GraphAct::code`: 0 SiLU, 1 exact GELU, 2 tanh GELU (the formulas
-// of `silu_mul_pre`).
+// of `silu_mul_pre`). The tanh argument is clamped to ±10, exact in f32
+// (tanh rounds to ±1 from ±9); Metal's tanh returns NaN for large arguments.
 @compute @workgroup_size(128)
 fn blr_gu_act(@builtin(workgroup_id) wid: vec3<u32>,
               @builtin(local_invocation_index) tid: uGU_LANE_ARG) {
@@ -673,7 +674,7 @@ GU_LANE_LET
     let uv = uy[lane];
     var v = (gv / (1.0 + exp(-gv))) * uv;
     if (gup.act == 1u) { v = 0.5 * gv * (1.0 + gu_erf(gv * 0.70710678)) * uv; }
-    if (gup.act == 2u) { v = 0.5 * gv * (1.0 + tanh(0.7978846 * (gv + 0.044715 * gv * gv * gv))) * uv; }
+    if (gup.act == 2u) { v = 0.5 * gv * (1.0 + tanh(clamp(0.7978846 * (gv + 0.044715 * gv * gv * gv), -10.0, 10.0))) * uv; }
     let row = rb + 4u * lane;
     if (row < gup.m0.w) { guy0[row] = v; }
   }
@@ -1833,7 +1834,7 @@ mod tests {
                                 let a = a as f32;
                                 let v = match code {
                                     0 => a / (1.0 + (-a).exp()),
-                                    1 => 0.5 * a * (1.0 + crate::inference::erf_f32(a * 0.70710678)),
+                                    1 => 0.5 * a * (1.0 + crate::inference::erf_f32(a * std::f32::consts::FRAC_1_SQRT_2)),
                                     _ => 0.5 * a * (1.0 + (0.7978846 * (a + 0.044715 * a * a * a)).tanh()),
                                 };
                                 v as f64 * u
