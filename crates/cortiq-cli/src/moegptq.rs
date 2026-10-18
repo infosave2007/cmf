@@ -399,33 +399,35 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
         source.shards_of(&names)
     };
 
-    // output
-    let mut sink = if diag.is_some() || capture_only {
-        Sink::Diag
-    } else if let Some(path) = patch {
-        Sink::Patch { path: path.to_string(), target: CmfModel::open_sharded(path)?, patches: Vec::new() }
-    } else if o.in_place {
+    // output (the sink itself is created after the checks below: a new
+    // file is opened with truncation)
+    let writes = !(diag.is_some() || capture_only);
+    let patch_target = match patch {
+        Some(path) if writes => Some(CmfModel::open_sharded(path)?),
+        _ => None,
+    };
+    let in_place = writes && patch.is_none() && o.in_place;
+    let stream = writes && patch.is_none() && !o.in_place;
+    if in_place {
         anyhow::ensure!(
             cmodel.tensors.iter().all(|t| t.shard == 0),
             "--in-place needs a single-file calibration model ({} has sibling shards)",
             o.calib_model
         );
-        Sink::InPlace { path: o.calib_model.to_string(), pending: Vec::new(), before: 0, after: 0, punched: 0 }
-    } else {
+    }
+    if stream {
         anyhow::ensure!(!o.output.is_empty(), "--output is required (or --in-place / --patch-shared)");
-        let avg_name = cmodel.tensors.iter().map(|e| e.name.len()).sum::<usize>() / cmodel.tensors.len().max(1);
-        Sink::Stream(CmfStreamWriter::new(o.output, CmfStreamWriter::head_reserve_for(cmodel.tensors.len(), avg_name))?)
-    };
+    }
     let expert_slots: HashSet<usize> = layer_dirs.iter().flatten().chain(shared_dirs.iter().flatten()).flat_map(|&(g, u, d)| [g, u, d]).collect();
     // every slot this run rewrites must take the codec's payload: checked
     // now, not hours later when the first layer is written
     let written: Vec<(usize, usize, usize)> = (range_lo..range_hi)
         .flat_map(|li| if patch.is_none() { layer_dirs[li].clone() } else { Vec::new() }.into_iter().chain(shared_dirs[li]))
         .collect();
-    match &sink {
-        Sink::InPlace { .. } => check_slots(&cmodel, &written, codec, None)?,
-        Sink::Patch { path, target, .. } => check_slots(&cmodel, &written, codec, Some((path, target)))?,
-        Sink::Stream(_) | Sink::Diag => {}
+    if in_place {
+        check_slots(&cmodel, &written, codec, None)?;
+    } else if let (Some(path), Some(target)) = (patch, patch_target.as_ref()) {
+        check_slots(&cmodel, &written, codec, Some((path, target)))?;
     }
 
     let ec = EncodeCfg { codec, limit, lambda: o.lambda, threads: o.threads.max(1) };
@@ -467,7 +469,47 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
         }
         None => None,
     };
-    let is_saved = |saved: &Option<(PathBuf, CaptureMeta)>, lo: usize, hi: usize| saved.as_ref().is_some_and(|(_, m)| (lo..hi).all(|li| m.layers.contains(&li)));
+    // free disk space for what this run will write, checked now: an --output
+    // file gets its last ~200 GB (the non-expert tensors) at the very end
+    {
+        let mut needs: Vec<(PathBuf, String, u64)> = Vec::new();
+        let mut credit: Vec<(PathBuf, u64)> = Vec::new();
+        if stream {
+            let gu = codec.gate_up().0;
+            let slot_dt: HashMap<usize, TensorDtype> =
+                layer_dirs.iter().flatten().chain(shared_dirs.iter().flatten()).flat_map(|&(g, u, d)| [(g, gu), (u, gu), (d, TensorDtype::Q4TiledP)]).collect();
+            needs.push((PathBuf::from(o.output), format!("--output {}", o.output), stream_output_bytes(&cmodel, &slot_dt)?));
+            // an earlier run's output is truncated when the new one opens it
+            credit.push((PathBuf::from(o.output), sole_file_bytes(Path::new(o.output))));
+        }
+        if !capture_only && source.local.is_none() {
+            // the layer being encoded and the next one, prefetched
+            let first = shard_names(range_lo)?;
+            match source.remote_sizes(&first) {
+                Some(b) => {
+                    let present: u64 = first.iter().map(|sh| std::fs::metadata(source.path(sh)).map(|m| m.len()).unwrap_or(0)).sum();
+                    needs.push((source.scratch.clone(), format!("source shards in {}", source.scratch.display()), (2 * b).saturating_sub(present)));
+                }
+                None => eprintln!("free space: the size of the source shards is unknown (no size from the Hub); not counted"),
+            }
+        }
+        if let Some((dir, meta)) = &saved {
+            let left = (range_lo..range_hi).filter(|li| !meta.layers.contains(li)).count() as u64;
+            needs.push((dir.clone(), format!("capture in {}", dir.display()), left * meta.layer_bytes()));
+        }
+        check_free_space(&needs, &credit, std::env::var("CMF_MOE_NO_SPACE_CHECK").is_ok_and(|v| v != "0"))?;
+    }
+    let mut sink = if !writes {
+        Sink::Diag
+    } else if let (Some(path), Some(target)) = (patch, patch_target) {
+        Sink::Patch { path: path.to_string(), target, patches: Vec::new() }
+    } else if in_place {
+        Sink::InPlace { path: o.calib_model.to_string(), pending: Vec::new(), before: 0, after: 0, punched: 0 }
+    } else {
+        let avg_name = cmodel.tensors.iter().map(|e| e.name.len()).sum::<usize>() / cmodel.tensors.len().max(1);
+        Sink::Stream(CmfStreamWriter::new(o.output, CmfStreamWriter::head_reserve_for(cmodel.tensors.len(), avg_name))?)
+    };
+    let is_saved =|saved: &Option<(PathBuf, CaptureMeta)>, lo: usize, hi: usize| saved.as_ref().is_some_and(|(_, m)| (lo..hi).all(|li| m.layers.contains(&li)));
     // the calibration forward is needed up to the last pass not on disk
     let last_forward = passes.iter().rposition(|&(lo, hi)| !is_saved(&saved, lo, hi));
     if last_forward.is_none() {
@@ -834,6 +876,113 @@ fn check_slots(cm: &CmfModel, triples: &[(usize, usize, usize)], codec: Codec, t
     Ok(())
 }
 
+/// Bytes a new `--output` file takes: every tensor of the calibration file,
+/// the expert slots at their codec payload (`slot_dt`), each padded to the
+/// data alignment, plus the head reserve and the vocabulary.
+fn stream_output_bytes(cm: &CmfModel, slot_dt: &HashMap<usize, TensorDtype>) -> anyhow::Result<u64> {
+    use cortiq_core::format::DATA_ALIGNMENT;
+    let avg_name = cm.tensors.iter().map(|e| e.name.len()).sum::<usize>() / cm.tensors.len().max(1);
+    let mut total = CmfStreamWriter::head_reserve_for(cm.tensors.len(), avg_name) + cm.vocab.as_ref().map_or(0, |v| v.len() as u64);
+    for (slot, e) in cm.tensors.iter().enumerate() {
+        let n = match slot_dt.get(&slot) {
+            Some(&dt) => cortiq_core::quant::expected_nbytes(dt, &e.shape).ok_or_else(|| anyhow::anyhow!("{}: shape {:?} has no {} layout", e.name, e.shape, dt.name()))? as u64,
+            None => e.nbytes,
+        };
+        total += n.div_ceil(DATA_ALIGNMENT) * DATA_ALIGNMENT;
+    }
+    Ok(total)
+}
+
+/// The bytes a regular file at `path` has allocated when it is its only
+/// name (no other hard link keeps them), else 0: what truncating it frees.
+fn sole_file_bytes(path: &Path) -> u64 {
+    let Ok(m) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !m.is_file() {
+        return 0;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if m.nlink() == 1 { m.blocks() * 512 } else { 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        m.len()
+    }
+}
+
+/// The filesystem holding `path` (its nearest existing ancestor): its
+/// device id and the bytes available to this user. `None` off unix, or
+/// when it cannot be read.
+fn fs_space(path: &Path) -> Option<(u64, u64)> {
+    let base = std::iter::successors(Some(path), |p| p.parent()).find(|p| !p.as_os_str().is_empty() && p.exists()).unwrap_or(Path::new("."));
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        let dev = std::fs::metadata(base).ok()?.dev();
+        let c = std::ffi::CString::new(base.as_os_str().as_bytes()).ok()?;
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        Some((dev, u64::from(st.f_bavail).saturating_mul(u64::from(st.f_frsize))))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = base;
+        None
+    }
+}
+
+/// Whether each filesystem has room for what the run writes to it: `needs`
+/// are (path, what, bytes), `credit` (path, bytes) space the run frees
+/// there first (an old output it truncates). A shortfall stops the run
+/// unless `allow` (`CMF_MOE_NO_SPACE_CHECK=1`).
+fn check_free_space(needs: &[(PathBuf, String, u64)], credit: &[(PathBuf, u64)], allow: bool) -> anyhow::Result<()> {
+    let gb = |b: u64| b as f64 / 1e9;
+    // per filesystem: (a path on it, available, needed, what)
+    let mut fss: Vec<(u64, PathBuf, u64, u64, Vec<String>)> = Vec::new();
+    for (path, what, bytes) in needs.iter().filter(|n| n.2 > 0) {
+        let Some((dev, avail)) = fs_space(path) else {
+            eprintln!("free space: cannot read the filesystem of {} ({what}); not checked", path.display());
+            continue;
+        };
+        let i = match fss.iter().position(|f| f.0 == dev) {
+            Some(i) => i,
+            None => {
+                fss.push((dev, path.clone(), avail, 0, Vec::new()));
+                fss.len() - 1
+            }
+        };
+        fss[i].3 += bytes;
+        fss[i].4.push(format!("{what} {:.1} GB", gb(*bytes)));
+    }
+    for (path, bytes) in credit {
+        if let Some(f) = fs_space(path).and_then(|(dev, _)| fss.iter_mut().find(|f| f.0 == dev)) {
+            f.2 += bytes;
+        }
+    }
+    let mut short = Vec::new();
+    for (_, path, avail, need, what) in &fss {
+        let line = format!("{}: needs {:.1} GB ({}), {:.1} GB available", path.display(), gb(*need), what.join(", "), gb(*avail));
+        eprintln!("free space: {line}");
+        if need > avail {
+            short.push(line);
+        }
+    }
+    if short.is_empty() {
+        return Ok(());
+    }
+    if allow {
+        eprintln!("free space: CMF_MOE_NO_SPACE_CHECK=1 — running although {}", short.join("; "));
+        return Ok(());
+    }
+    anyhow::bail!("not enough free disk space: {}. Free some, or set CMF_MOE_NO_SPACE_CHECK=1 to run anyway", short.join("; "))
+}
+
 /// The files of the calibration model: the one given and, when it is shard
 /// 1 of a sharded model, its siblings (`…-{no:05}-of-{count:05}.cmf`).
 fn calib_files(path: &str, cm: &CmfModel) -> Vec<PathBuf> {
@@ -981,6 +1130,12 @@ impl Source {
             }
             Ok(())
         }))
+    }
+
+    /// Total bytes of remote `shards` (a 1-byte range request each); `None`
+    /// when the Hub reports no size for one of them.
+    fn remote_sizes(&self, shards: &[String]) -> Option<u64> {
+        shards.iter().map(|sh| crate::convert::probe_size(&self.agent, &format!("{}/{sh}", self.base), self.token.as_deref())).sum()
     }
 
     /// Delete a fetched shard (a local source is left alone).
@@ -2657,6 +2812,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The free-space check: what fits passes, a shortfall stops the run
+    /// (unless allowed), needs on one filesystem add up, a file about to be
+    /// truncated counts as free, and a path that does not exist yet is
+    /// measured on its nearest existing ancestor.
+    #[test]
+    #[cfg(unix)]
+    fn free_space_check_refuses_what_does_not_fit() {
+        let dir = std::env::temp_dir().join(format!("cortiq-moe-space-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (_, avail) = fs_space(&dir.join("not/yet/out.cmf")).expect("statvfs");
+        assert!(avail > 0);
+        let need = |b: u64| (dir.join("out.cmf"), "--output".to_string(), b);
+        check_free_space(&[need(1 << 20)], &[], false).unwrap();
+        let e = check_free_space(&[need(avail + (1 << 40))], &[], false).unwrap_err().to_string();
+        assert!(e.contains("not enough free disk space") && e.contains("CMF_MOE_NO_SPACE_CHECK=1"), "{e}");
+        check_free_space(&[need(avail + (1 << 40))], &[], true).unwrap();
+        // two needs on one filesystem are summed
+        let half = avail / 2 + (1 << 30);
+        assert!(check_free_space(&[need(half), (dir.join("cap"), "capture".into(), half)], &[], false).is_err());
+        // an old output that the run truncates first is space it can use
+        let old = dir.join("old.cmf");
+        std::fs::write(&old, vec![1u8; 1 << 22]).unwrap();
+        assert!(sole_file_bytes(&old) >= 1 << 22);
+        assert_eq!(sole_file_bytes(&dir.join("missing.cmf")), 0);
+        std::fs::hard_link(&old, dir.join("old-link.cmf")).unwrap();
+        assert_eq!(sole_file_bytes(&old), 0, "another name keeps the blocks");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The hole-punching probe answers without leaving its file behind:
     /// unsupported off Linux, and on Linux whatever the temp filesystem does.
     #[test]
@@ -3261,6 +3446,12 @@ mod tests {
         sink.finish(&cm, &slots, Codec::Q2tp, serde_json::json!({"test": true}), out2.to_str().unwrap(), Instant::now()).unwrap();
         let m2 = CmfModel::open(&out2).unwrap();
         same_layout(&m2, &r2, "q2tp output");
+        // the free-space estimate of an --output file covers the file written
+        let gu = Codec::Q2tp.gate_up().0;
+        let slot_dt: HashMap<usize, TensorDtype> =
+            dirs.iter().flat_map(|(r, s)| r.iter().chain(std::iter::once(s))).flat_map(|&(g, u, d)| [(g, gu), (u, gu), (d, TensorDtype::Q4TiledP)]).collect();
+        let (est, len) = (stream_output_bytes(&cm, &slot_dt).unwrap(), std::fs::metadata(&out2).unwrap().len());
+        assert!(est >= len && est <= len + cm.tensors.len() as u64 * 4096 + (4 << 20), "estimate {est} B for a {len} B file");
         non_experts_kept(&m2, "q2tp output");
         let prov = m2.header.provenance.as_ref().unwrap();
         assert_eq!((prov["weight_quant"].as_str(), prov["gptq_moe"]["test"].as_bool()), (Some("q2tp"), Some(true)));
