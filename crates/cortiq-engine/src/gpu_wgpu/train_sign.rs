@@ -638,6 +638,10 @@ pub struct SignScratch {
     pub t_big: wgpu::Buffer,
     /// f16 transposed plane operand `[rp_max][kpad]`.
     pub t_small: wgpu::Buffer,
+    /// The G_V operands (`x⊙g`, `b⊙ℓ·gs` transposed), written by the
+    /// backward's column reductions before G_U has read `t_big`/`t_small`.
+    pub t_big2: wgpu::Buffer,
+    pub t_small2: wgpu::Buffer,
     pub part: wgpu::Buffer,
     pub scal: wgpu::Buffer,
     /// u32[64] counters (see the CNT_* slots).
@@ -659,6 +663,8 @@ impl SignScratch {
             g: storage(c, pr * rp_max),
             t_big: super::train_mm::f16_buf(c, pr * kpad),
             t_small: super::train_mm::f16_buf(c, rp_max * kpad),
+            t_big2: super::train_mm::f16_buf(c, pr * kpad),
+            t_small2: super::train_mm::f16_buf(c, rp_max * kpad),
             part: storage(c, max_rows.div_ceil(512) * rp_max),
             scal: storage(c, 4),
             cnt: storage(c, CNT_LEN),
@@ -669,7 +675,7 @@ impl SignScratch {
     }
     /// Device bytes of this scratch.
     pub fn bytes(&self) -> u64 {
-        self.g.size() + self.t_big.size() + self.t_small.size() + self.part.size() + self.scal.size() + self.cnt.size()
+        self.g.size() + self.t_big.size() + self.t_small.size() + self.t_big2.size() + self.t_small2.size() + self.part.size() + self.scal.size() + self.cnt.size()
     }
 }
 

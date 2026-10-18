@@ -201,6 +201,54 @@ fn colsum_fused(@builtin(global_invocation_id) g: vec3<u32>, @builtin(workgroup_
     SRC[wg.y * p.k + col] = acc;
 }
 
+// colsum_fused that also writes the transposed f16 operand of the sign
+// gradient GEMM (DSTT[col][kpad], kpad = mpad): rows = 0: the DST value
+// (dy·h·gs), 1: the DST value (t2·l·gs), 2: f16(A·COL·f1) (x·g) — the values
+// cvt_t would stage, from the operand this pass reads anyway. The 256×64
+// transposed block goes through workgroup memory and leaves as coalesced
+// 128-byte rows. Row blocks of exactly 64 rows.
+@group(0) @binding(10) var<storage, read_write> DSTT: array<vec4<f16>>;
+var<workgroup> ttile: array<f16, 16896>;   // [256 cols][66] (64 rows + pad)
+@compute @workgroup_size(256)
+fn colsum_fused_t(@builtin(global_invocation_id) g: vec3<u32>, @builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
+    let col = g.x;
+    let live = col < p.k;
+    let r0 = wg.y * 64u;
+    let r1 = min(r0 + 64u, p.m);
+    var cf = 0.0;
+    if (live) { cf = COL[col]; }
+    var acc = 0.0;
+    for (var row = r0; row < r1; row = row + 1u) {
+        var tv = f16(0.0);
+        if (live) {
+            let i = row * p.k + col;
+            if (p.rows == 0u) {
+                let a = A[i]; acc = acc + a * B[i]; let hv = f16(a * cf * p.scale); DST[i] = hv; tv = hv;
+            } else if (p.rows == 1u) {
+                let b = B[i]; acc = acc + A[i] * b; let hv = f16(b * cf * p.scale); DST[i] = hv; tv = hv;
+            } else {
+                let a = A[i]; let b = B[i]; acc = acc + a * b; let v = b * cf;
+                if (p.pad1 == 1u) { OUT[i] = OUT[i] + v; } else { OUT[i] = v; }
+                tv = f16(a * cf * p.f1);
+            }
+        }
+        ttile[t * 66u + (row - r0)] = tv;
+    }
+    if (live) { SRC[wg.y * p.k + col] = acc; }
+    workgroupBarrier();
+    // 256 columns × 16 vec4 (64 rows): 16 lanes per column row of DSTT
+    let c0 = wg.x * 256u;
+    for (var e = 0u; e < 16u; e = e + 1u) {
+        let v = t + 256u * e;
+        let cl = v / 16u;
+        let q = v % 16u;
+        if (c0 + cl < p.k && r0 + q * 4u < r1) {
+            let b = cl * 66u + q * 4u;
+            DSTT[((c0 + cl) * p.mpad + r0) / 4u + q] = vec4<f16>(ttile[b], ttile[b + 1u], ttile[b + 2u], ttile[b + 3u]);
+        }
+    }
+}
+
 // Pass 2: OUT[col] (+)= Σ_blk SRC[blk][col]  (words = blocks, pad0 = 1: accumulate).
 @compute @workgroup_size(256)
 fn colsum_fin(@builtin(global_invocation_id) g: vec3<u32>) {
@@ -433,7 +481,7 @@ fn scale_acc(@builtin(global_invocation_id) g: vec3<u32>) {
 "#;
 
 fn module(c: &Ctx) -> Option<&'static train_ops::Mod> {
-    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "cvt_cols", "cvt_t", "expand", "expand_n", "expand_t", "colsum_prod", "colsum_part", "colsum_fin", "colsum_fused", "scale_acc", "dense_fwd", "dense_bwd", "dense_fwd_t", "dense_bwd_t", "split_qg", "adam", "sumsq", "adam_cat", "sumsq_cat"])
+    train_ops::module(c, "train_mm", SRC, &["cvt_col", "cvt", "cvt_cols", "cvt_t", "expand", "expand_n", "expand_t", "colsum_prod", "colsum_part", "colsum_fin", "colsum_fused", "colsum_fused_t", "scale_acc", "dense_fwd", "dense_bwd", "dense_fwd_t", "dense_bwd_t", "split_qg", "adam", "sumsq", "adam_cat", "sumsq_cat"])
 }
 
 /// One step of a trainer pass: an elementwise/reduction dispatch or a GEMM.
@@ -673,8 +721,17 @@ pub enum Fuse<'a> {
 /// ops must run (the f16 staging needs `m` = its padded row count).
 #[allow(clippy::too_many_arguments)]
 pub fn colsum_fused<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, b: &'a wgpu::Buffer, sum: &'a wgpu::Buffer, m: usize, k: usize, op: Fuse<'a>) -> Option<[Disp<'a>; 2]> {
+    colsum_fused_tr(c, a, b, sum, m, k, op, None)
+}
+
+/// [`colsum_fused`] that also writes the transposed f16 operand of the sign
+/// gradient GEMM into `tr` = `[k][m]` (`m` tokens, a multiple of 32): the
+/// staged value of `Fuse::CvtA`/`CvtB`, or `f16(a·col)` for `Fuse::ScaleB` —
+/// what [`cvt_t`] would write.
+#[allow(clippy::too_many_arguments)]
+pub fn colsum_fused_tr<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, b: &'a wgpu::Buffer, sum: &'a wgpu::Buffer, m: usize, k: usize, op: Fuse<'a>, tr: Option<&'a wgpu::Buffer>) -> Option<[Disp<'a>; 2]> {
     let md = module(c)?;
-    if pad_rows(m) != m {
+    if pad_rows(m) != m || (tr.is_some() && (m % 32 != 0 || 64usize.max(m.div_ceil(256)) != 64)) {
         return None;
     }
     let rpb = 64usize.max(m.div_ceil(256));
@@ -690,11 +747,19 @@ pub fn colsum_fused<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, b: &'a wgpu::Buffer, su
         Fuse::CvtB(colv, dst, sc) => (1, colv, sc, 0, dst, part),
         Fuse::ScaleB(colv, out, acc) => (2, colv, 1.0, acc as u32, part, out),
     };
-    let p1 = Disp {
-        pipe: &md.p["colsum_fused"],
-        uni: vec![m as u32, k as u32, 0, mode, rpb as u32, 0, 0, accf, scale.to_bits(), 0, 0, 0],
-        bufs: vec![(1, part), (2, col), (3, dst), (7, a), (8, b), (9, out)],
-        grid: (k.div_ceil(256) as u32, nblk as u32, 1),
+    let p1 = match tr {
+        None => Disp {
+            pipe: &md.p["colsum_fused"],
+            uni: vec![m as u32, k as u32, 0, mode, rpb as u32, 0, 0, accf, scale.to_bits(), 0, 0, 0],
+            bufs: vec![(1, part), (2, col), (3, dst), (7, a), (8, b), (9, out)],
+            grid: (k.div_ceil(256) as u32, nblk as u32, 1),
+        },
+        Some(t) => Disp {
+            pipe: &md.p["colsum_fused_t"],
+            uni: vec![m as u32, k as u32, m as u32, mode, rpb as u32, 0, 0, accf, scale.to_bits(), 1f32.to_bits(), 0, 0],
+            bufs: vec![(1, part), (2, col), (3, dst), (7, a), (8, b), (9, out), (10, t)],
+            grid: (k.div_ceil(256) as u32, nblk as u32, 1),
+        },
     };
     let p2 = Disp {
         pipe: &md.p["colsum_fin"],
@@ -1070,41 +1135,72 @@ pub fn blr_backward(c: &Ctx, layer: &Blr, s: &BlrScratch, x: &wgpu::Buffer, dy: 
             ops.push(Op::D(expand1(c, &p.bits_v, &s.pl_v, n, r, false)?));
         }
         // each column reduction fused with the elementwise op that reads the
-        // same operand (dy, t2, t1 read once); separate ops where it cannot
-        match colsum_fused(c, dy, &s.cbuf[pi], &p.dh, ntok, m, Fuse::CvtA(&p.h, &s.xh, gscale)) {
-            Some([a, b]) => ops.extend([Op::D(a), Op::D(b)]),
-            None => {
-                let [a, b] = colsum_prod(c, dy, &s.cbuf[pi], &p.dh, ntok, m)?;
-                ops.extend([Op::D(a), Op::D(b), Op::D(cvt(c, dy, Some(&p.h), &s.xh, ntok, m, gscale)?)]);
+        // same operand (dy, t2, t1 read once); with sign training the same
+        // passes also write the transposed f16 operands of the sign
+        // gradients (dy·h·gs, t2·l·gs, x·g); separate ops where they cannot
+        let sgn = match (sign, p.sign.as_ref()) {
+            (Some(ctx), Some(_)) => Some(ctx.sc),
+            _ => None,
+        };
+        let (mut tr_dy, mut tr_t2, mut tr_x) = (false, false, false);
+        match colsum_fused_tr(c, dy, &s.cbuf[pi], &p.dh, ntok, m, Fuse::CvtA(&p.h, &s.xh, gscale), sgn.map(|sc| &sc.t_big)) {
+            Some([a, b]) => {
+                tr_dy = sgn.is_some();
+                ops.extend([Op::D(a), Op::D(b)]);
             }
+            None => match colsum_fused(c, dy, &s.cbuf[pi], &p.dh, ntok, m, Fuse::CvtA(&p.h, &s.xh, gscale)) {
+                Some([a, b]) => ops.extend([Op::D(a), Op::D(b)]),
+                None => {
+                    let [a, b] = colsum_prod(c, dy, &s.cbuf[pi], &p.dh, ntok, m)?;
+                    ops.extend([Op::D(a), Op::D(b), Op::D(cvt(c, dy, Some(&p.h), &s.xh, ntok, m, gscale)?)]);
+                }
+            },
         }
         ops.push(Op::M(g_t2));
-        match colsum_fused(c, &s.a[pi], &s.t2, &p.dl, ntok, r, Fuse::CvtB(&p.l, &s.xh, gscale)) {
-            Some([a, b]) => ops.extend([Op::D(a), Op::D(b)]),
-            None => {
-                let [a, b] = colsum_prod(c, &s.a[pi], &s.t2, &p.dl, ntok, r)?;
-                ops.extend([Op::D(a), Op::D(b), Op::D(cvt(c, &s.t2, Some(&p.l), &s.xh, ntok, r, gscale)?)]);
+        match colsum_fused_tr(c, &s.a[pi], &s.t2, &p.dl, ntok, r, Fuse::CvtB(&p.l, &s.xh, gscale), sgn.map(|sc| &sc.t_small2)) {
+            Some([a, b]) => {
+                tr_t2 = sgn.is_some();
+                ops.extend([Op::D(a), Op::D(b)]);
             }
+            None => match colsum_fused(c, &s.a[pi], &s.t2, &p.dl, ntok, r, Fuse::CvtB(&p.l, &s.xh, gscale)) {
+                Some([a, b]) => ops.extend([Op::D(a), Op::D(b)]),
+                None => {
+                    let [a, b] = colsum_prod(c, &s.a[pi], &s.t2, &p.dl, ntok, r)?;
+                    ops.extend([Op::D(a), Op::D(b), Op::D(cvt(c, &s.t2, Some(&p.l), &s.xh, ntok, r, gscale)?)]);
+                }
+            },
         }
         ops.push(Op::M(g_t1));
-        match colsum_fused(c, x, &s.t1, &p.dg, ntok, n, Fuse::ScaleB(&p.g, dx, pi > 0)) {
-            Some([a, b]) => ops.extend([Op::D(a), Op::D(b)]),
-            None => {
-                let [a, b] = colsum_prod(c, x, &s.t1, &p.dg, ntok, n)?;
-                ops.extend([Op::D(a), Op::D(b), Op::D(scale_acc(c, &s.t1, &p.g, dx, ntok, n, pi > 0)?)]);
+        match colsum_fused_tr(c, x, &s.t1, &p.dg, ntok, n, Fuse::ScaleB(&p.g, dx, pi > 0), sgn.map(|sc| &sc.t_big2)) {
+            Some([a, b]) => {
+                tr_x = sgn.is_some();
+                ops.extend([Op::D(a), Op::D(b)]);
             }
+            None => match colsum_fused(c, x, &s.t1, &p.dg, ntok, n, Fuse::ScaleB(&p.g, dx, pi > 0)) {
+                Some([a, b]) => ops.extend([Op::D(a), Op::D(b)]),
+                None => {
+                    let [a, b] = colsum_prod(c, x, &s.t1, &p.dg, ntok, n)?;
+                    ops.extend([Op::D(a), Op::D(b), Op::D(scale_acc(c, &s.t1, &p.g, dx, ntok, n, pi > 0)?)]);
+                }
+            },
         }
         let sign_from = ops.len();
         if let (Some(ctx), Some(sp)) = (sign, p.sign.as_ref()) {
             let sc = ctx.sc;
             let kpad = sc.kpad;
-            ops.push(Op::D(cvt_t(c, dy, Some(&p.h), &sc.t_big, ntok, m, gscale)?));
+            if !tr_dy {
+                ops.push(Op::D(cvt_t(c, dy, Some(&p.h), &sc.t_big, ntok, m, gscale)?));
+            }
             ops.push(Op::D(cvt_t(c, &s.a[pi], Some(&p.l), &sc.t_small, ntok, r, 1.0)?));
             ops.push(Op::M(mm(c, &sc.t_small, &sc.t_big, &sc.g, m, r, kpad, 1.0 / gscale)?));
             ops.extend(train_sign::grad_consumer_ops(c, ctx, &sp.u, &p.bits_u, 0)?);
-            ops.push(Op::D(cvt_t(c, x, Some(&p.g), &sc.t_big, ntok, n, 1.0)?));
-            ops.push(Op::D(cvt_t(c, &s.t2, Some(&p.l), &sc.t_small, ntok, r, gscale)?));
-            ops.push(Op::M(mm(c, &sc.t_small, &sc.t_big, &sc.g, n, r, kpad, 1.0 / gscale)?));
+            if !tr_x {
+                ops.push(Op::D(cvt_t(c, x, Some(&p.g), &sc.t_big2, ntok, n, 1.0)?));
+            }
+            if !tr_t2 {
+                ops.push(Op::D(cvt_t(c, &s.t2, Some(&p.l), &sc.t_small2, ntok, r, gscale)?));
+            }
+            ops.push(Op::M(mm(c, &sc.t_small2, &sc.t_big2, &sc.g, n, r, kpad, 1.0 / gscale)?));
             ops.extend(train_sign::grad_consumer_ops(c, ctx, &sp.v, &p.bits_v, 1)?);
         }
         run_tagged(c, &ops, sign_from, "sign");
