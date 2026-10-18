@@ -73,6 +73,9 @@ pub struct GpuRun {
     /// (`gpu_wgpu::fp8_act::frame_encodes()`): one per device attention
     /// tail under `CMF_DSV41_O_FP8=1`, none otherwise.
     pub fp8_encodes: u64,
+    /// The model's expert bank at the end of the run, `(segments,
+    /// capacity)` (`gpu_wgpu::dsv4_global_moe_geometry`).
+    pub bank: Option<(usize, usize)>,
 }
 
 /// Decode `TOKENS` through the loader and `forward_token` with the device
@@ -102,6 +105,7 @@ pub fn run_gpu(fx: &Fixture, tag: &str) -> GpuRun {
     });
     let after = dsv41::profile_counters();
     let fp8_encodes = cortiq_engine::gpu_wgpu::fp8_act::frame_encodes() - fp8_before;
+    let bank = cortiq_engine::gpu_wgpu::dsv4_global_moe_geometry(&model);
     cortiq_engine::gpu_wgpu::release_model_buffers(&model);
     GpuRun {
         logits,
@@ -112,6 +116,7 @@ pub fn run_gpu(fx: &Fixture, tag: &str) -> GpuRun {
             after.3 - before.3,
         ),
         fp8_encodes,
+        bank,
     }
 }
 
@@ -135,5 +140,22 @@ pub fn assert_device_paths(name: &str, counters: (u64, u64, u64, u64)) {
             "[{name}] this adapter cannot hold the segmented expert bank \
              (no binding arrays): MoE device check not applicable"
         );
+    }
+}
+
+/// The segment family of the run's expert bank (S8 and S16 give identical
+/// logits, so only the bank itself shows which ran). Printed always; with
+/// `CMF_DSV41_GLOBAL_SEGMENTS=8` or `=16` the bank must be that family (an
+/// S8 bank under `=16` means the adapter could not build the S16 kernels).
+pub fn assert_bank_family(name: &str, bank: Option<(usize, usize)>) {
+    if !cortiq_engine::gpu_wgpu::dsv4_global_moe_supported() {
+        return;
+    }
+    let (segments, capacity) = bank.unwrap_or_else(|| panic!("[{name}] no expert bank"));
+    println!("dsv41 fixture gpu [{name}]: expert bank S{segments}, {capacity} slots");
+    match std::env::var("CMF_DSV41_GLOBAL_SEGMENTS").as_deref() {
+        Ok("8") => assert_eq!(segments, 8, "[{name}] CMF_DSV41_GLOBAL_SEGMENTS=8"),
+        Ok("16") => assert_eq!(segments, 16, "[{name}] CMF_DSV41_GLOBAL_SEGMENTS=16"),
+        _ => {}
     }
 }

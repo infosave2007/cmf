@@ -82,6 +82,7 @@ fn gpu_forward_tracks_f64_reference() {
             "[{name}] non-finite logits"
         );
         assert_device_paths(name, run.counters);
+        assert_bank_family(name, run.bank);
         // CMF_DSV41_O_FP8 is off: the frame must not quantize.
         assert_eq!(
             run.fp8_encodes, 0,
