@@ -283,3 +283,48 @@ fn pipeline_loads_fixture_and_matches_direct_walk() {
         "pipeline and direct walk differ"
     );
 }
+
+/// The quantize-moe capture (`capture_window`) ends every token after its
+/// last captured layer. Over the fixture's compressed-KV + index source
+/// with Engram (layer 1), the second KV source that is also the candidate
+/// source (layer 2) and the index consumer (layer 3), that record — MoE
+/// input rows, routed ids and route weights — equals the one taken through
+/// the whole stack: no layer reads state that a later layer writes.
+#[test]
+fn moe_capture_early_stop_matches_full_forward() {
+    let fx = Fixture::build(1);
+    let l = load_fixture(&fx, "moecap");
+    let (globals, layers, hash) =
+        dsv41::load(&l.model, &l.cfg, l.n_layers, fx.token_map()).expect("load fixture layers");
+    assert!(hash.is_some() && layers[ENGRAM_LAYER].engram.is_some(), "the fixture has an Engram layer");
+    assert!(layers[1].compressor.is_some() && layers[1].indexer.is_some(), "layer 1 is a compressed KV + index source");
+    let mut st = Dsv41State::new(&l.cfg, hash.clone());
+    st.moe_capture = Some(dsv41::Dsv41MoeCapture {
+        lo: 0,
+        hi: N_LAYERS,
+        stop_after_hi: false,
+        x: vec![Vec::new(); N_LAYERS],
+        picks: vec![Vec::new(); N_LAYERS],
+        w: vec![Vec::new(); N_LAYERS],
+    });
+    let mut logits = Vec::new();
+    for (p, &t) in TOKENS.iter().enumerate() {
+        dsv41::forward_token(&globals, &layers, &l.cfg, &mut st, t, p, None, &mut logits);
+    }
+    assert_eq!(logits.len(), VOCAB, "the full forward reaches the head");
+    let full = st.moe_capture.take().expect("full record");
+    for (lo, hi) in [(1, 2), (2, 3), (3, 4), (1, 3)] {
+        let mut st = Dsv41State::new(&l.cfg, hash.clone());
+        let cap = dsv41::capture_window(&globals, &layers, &l.cfg, &mut st, &TOKENS, lo, hi, None)
+            .expect("capture");
+        for k in 0..hi - lo {
+            let li = lo + k;
+            assert_eq!(cap.x[k].len(), TOKENS.len() * DIM);
+            assert_eq!(cap.x[k], full.x[li], "{lo}..{hi}: layer {li} rows");
+            assert_eq!(cap.picks[k], full.picks[li], "{lo}..{hi}: layer {li} routes");
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&cap.w[k]), bits(&full.w[li]), "{lo}..{hi}: layer {li} route weights");
+        }
+    }
+    assert_ne!(full.x[1], full.x[2], "layers record their own inputs");
+}
