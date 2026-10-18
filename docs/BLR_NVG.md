@@ -235,3 +235,41 @@ path runs. `CMF_BLR_DENSE=1` (dense f32 at load) gives 2 719 569 for the dual-sv
 equal to the factored kernels. The file is mostly the q8_2f embedding (248 320 × 1024)
 and the q8_2f MTP head; the 497 M projection weights take 61.4 MB. Encoding time: dual-svid
 7.4 min, NVG 2 h (f64 CPU, sequential calibration ~1.5 min per layer, ~4 min of encoding).
+
+### 7.1 The device encoder (18.10.2026)
+
+Same card; the CPU side has a 27-core quota. Most device runs shared the card with
+another process (NVIDIA time-slices two processes), so device timings are upper bounds.
+
+Per tensor on identical Grams (q8_2f calibration of layers 3 and 17 of the 0.8B, 13
+tensors at 1.0 bpw): held-out error within ±0.43 % and fit error within ±0.76 % of the
+host encoder (the GPU marginally lower on average). Qwen3.8-27B L0 `gate_proj` at
+0.55 bpw: held-out 0.3758 against the host's 0.3759 in 39 s against 2254 s.
+
+Whole 0.8B at 1.0 bpw (sequential calibration, `ppl --windows 16 --window-len 512`):
+
+| encoder | ρ = 0.03 | ρ = 0.0301 | convert |
+|---|---|---|---|
+| host f64 (`--blr-device cpu`) | 656.37 | 682.16 | 7143 s / 7114 s |
+| device, flip tolerance 1e-6 | 686.52 | 710.88 | 1307 s (shared card) |
+| device, flip tolerance 1e-7 (default) | 672.52 | — | 758 s |
+
+The host reference itself moves 3.9 % for a 0.3 % change of ρ: at this compression the
+end-to-end perplexity is sensitive to any perturbation of the sequential chain, and
+per-tensor errors of two host runs agree within 1 % for only 53 of 150 tensors.
+
+Qwen3.8-27B at 0.55 bpw, one layer encoded on the device from its cached Grams (card
+mostly free):
+
+| layer | tensors (encode seconds, one at a time) | layer encode |
+|---|---|---|
+| 0 (GDN) | down 76.9, gate 23.6, up 23.6, in_proj_qkv 20.0, in_proj_z 17.8, out_proj 14.5 | 176 s (162 s with 3 in flight) |
+| 3 (attention) | down 74.5, gate 21.4, up 21.2, q 17.5, o 17.0, k 6.2, v 6.0 | 164 s (155 s with 3 in flight) |
+
+Plus ~3–4.5 s per layer for the input contexts (the 17408-wide `down_proj` input
+dominates) and the calibration pass. Where the time goes (layer 0, one at a time): the
+column-sequential V search 45 % (34.3 M flips on `down_proj` alone, ~1.3 µs each on one
+multiprocessor), the g solves 23 % (n = 17408 Cholesky per g step for `down_proj`), the
+eigensolver 9 %, the polar factor 7 %. Tensors in flight overlap little: a Vulkan queue
+orders every barrier after all earlier work, so the one-multiprocessor column search of
+one tensor holds back the others.
