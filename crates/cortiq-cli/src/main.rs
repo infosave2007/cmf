@@ -3238,6 +3238,10 @@ async fn main() -> anyhow::Result<()> {
             blr_keep_src,
             blr_device,
         } => {
+            // The usual Hub token variables when --hf-token is absent: an
+            // anonymous multi-hundred-GB streamed conversion runs into the
+            // Hub's rate limit, and a token on the command line shows in ps.
+            let hf_token = hf_token.or_else(convert::hf_token_from_env);
             if quant
                 .as_deref()
                 .is_some_and(|q| q.eq_ignore_ascii_case("blr"))

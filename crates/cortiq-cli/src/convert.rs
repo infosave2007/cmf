@@ -6024,9 +6024,14 @@ fn auth(mut req: ureq::Request, token: Option<&str>) -> ureq::Request {
 /// Total size of a remote file via a `Range: bytes=0-0` probe (Content-Range),
 /// or None if the server doesn't support/report ranges (→ single stream).
 pub(crate) fn probe_size(agent: &ureq::Agent, url: &str, token: Option<&str>) -> Option<u64> {
-    let resp = auth(agent.get(url).set("Range", "bytes=0-0"), token)
-        .call()
-        .ok()?;
+    // A rate-limited probe would otherwise drop a 100 GB shard to the
+    // single-stream path.
+    let resp = with_retry(2, || {
+        auth(agent.get(url).set("Range", "bytes=0-0"), token)
+            .call()
+            .map_err(|e| anyhow::anyhow!("probe {url}: {e}"))
+    })
+    .ok()?;
     resp.header("Content-Range")?
         .rsplit('/')
         .next()?
@@ -6062,23 +6067,61 @@ fn write_at(path: &Path, offset: u64, data: &[u8]) -> std::io::Result<()> {
     f.write_all(data)
 }
 
+/// `HF_TOKEN`, else `HUGGING_FACE_HUB_TOKEN` (the variables `hf` and
+/// `huggingface_hub` read), when non-empty.
+pub(crate) fn hf_token_from_env() -> Option<String> {
+    ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|t| !t.trim().is_empty()))
+}
+
+/// An HTTP answer the Hub sends when it is busy or rate limiting (429, 5xx):
+/// worth waiting for, unlike a 404 or a refused token.
+fn hub_busy(e: &anyhow::Error) -> bool {
+    let s = format!("{e:#}");
+    ["status code 429", "status code 500", "status code 502", "status code 503", "status code 504"]
+        .iter()
+        .any(|code| s.contains(code))
+}
+
 /// Retry `f` with exponential backoff — smooths over transient network errors.
+/// A rate-limited or busy Hub (429/5xx) gets a much longer budget: pauses
+/// from 10 s doubling to 2 min, for up to `CMF_HF_BUSY_WAIT_MIN` minutes
+/// (default 30) — one 429 on the last shard must not end a streamed
+/// conversion of hundreds of GB.
 fn with_retry<T>(attempts: u32, mut f: impl FnMut() -> anyhow::Result<T>) -> anyhow::Result<T> {
     let mut delay = Duration::from_millis(400);
-    let mut last: Option<anyhow::Error> = None;
-    for a in 0..attempts {
+    let mut busy_delay = Duration::from_secs(10);
+    let busy_budget = Duration::from_secs(
+        60 * std::env::var("CMF_HF_BUSY_WAIT_MIN")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30),
+    );
+    let mut busy_waited = Duration::ZERO;
+    let mut a = 0;
+    loop {
         match f() {
             Ok(v) => return Ok(v),
+            Err(e) if hub_busy(&e) && busy_waited + busy_delay <= busy_budget => {
+                eprintln!(
+                    "\n    hub busy ({e:#}); retrying in {} s",
+                    busy_delay.as_secs()
+                );
+                std::thread::sleep(busy_delay);
+                busy_waited += busy_delay;
+                busy_delay = (busy_delay * 2).min(Duration::from_secs(120));
+            }
             Err(e) => {
-                last = Some(e);
-                if a + 1 < attempts {
-                    std::thread::sleep(delay);
-                    delay = (delay * 2).min(Duration::from_secs(8));
+                a += 1;
+                if a >= attempts {
+                    return Err(e);
                 }
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_secs(8));
             }
         }
     }
-    Err(last.unwrap())
 }
 
 /// Fetch one file into `dest` (cached). Large range-capable files are pulled in
@@ -13691,3 +13734,30 @@ mod dspark_sidecar_tests {
         let _ = fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod hub_retry_tests {
+    use super::*;
+
+    #[test]
+    fn hub_busy_codes_are_retried_long_others_are_not() {
+        for code in [429, 500, 502, 503, 504] {
+            let e = anyhow::anyhow!("download https://huggingface.co/x: status code {code}");
+            assert!(hub_busy(&e), "{code}");
+        }
+        for code in [401, 403, 404, 416] {
+            let e = anyhow::anyhow!("download https://huggingface.co/x: status code {code}");
+            assert!(!hub_busy(&e), "{code}");
+        }
+        assert!(!hub_busy(&anyhow::anyhow!("connection reset by peer")));
+        // a plain error still gives up after `attempts`
+        let mut calls = 0;
+        let r: anyhow::Result<()> = with_retry(2, || {
+            calls += 1;
+            anyhow::bail!("connection reset")
+        });
+        assert!(r.is_err());
+        assert_eq!(calls, 2);
+    }
+}
+
