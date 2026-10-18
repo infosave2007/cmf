@@ -11879,10 +11879,8 @@ impl Pipeline {
         let mut model = None;
         let dbg = std::env::var("CMF_GRAPH_DEBUG").is_ok();
         fn gw(t: &QTensor) -> Option<crate::gpu::GraphW<'_>> {
-            if let Some((m, i, kind, rs)) = t
-                .graph_weight()
-                .or_else(|| t.graph_weight_descriptor())
-            {
+            // `blr` rides as GRAPH_KIND_BLR (two stage dispatches).
+            if let Some((m, i, kind, rs)) = t.graph_weight_or_blr() {
                 let name = &m.tensors[i].name;
                 let prism = if crate::prism::is_inverse_embedding(m, name) {
                     crate::gpu::GraphPrismOp::InverseEmbedding
@@ -12164,9 +12162,7 @@ impl Pipeline {
                             return None;
                         }
                     };
-                    let (m, _, _, _) = wq
-                        .graph_weight()
-                        .or_else(|| wq.graph_weight_descriptor())?;
+                    let (m, _, _, _) = wq.graph_weight_or_blr()?;
                     model = Some(m.clone());
                     crate::gpu::GraphAttn::Full {
                         wq: gw(wq)?,
@@ -12189,10 +12185,7 @@ impl Pipeline {
                 }
                 AttnKind::LinearGdn(w) => {
                     let cfg = self.gdn_cfg?;
-                    let (m, _, _, _) = w
-                        .in_proj_qkv
-                        .graph_weight()
-                        .or_else(|| w.in_proj_qkv.graph_weight_descriptor())?;
+                    let (m, _, _, _) = w.in_proj_qkv.graph_weight_or_blr()?;
                     model = Some(m.clone());
                     crate::gpu::GraphAttn::Gdn {
                         qkv: gw(&w.in_proj_qkv)?,
