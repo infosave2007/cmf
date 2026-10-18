@@ -72,18 +72,20 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
     );
 
     // ── teacher pass ──
+    // Whole training batches, then the held-out batches: teacher batch b is
+    // exactly `batch_ids(b)` (a training count that is not a multiple of the
+    // batch would otherwise shift every held-out batch onto the wrong text).
     let k = o.topk;
     let mut t_ids: Vec<Vec<u32>> = Vec::new();
     let mut t_p: Vec<Vec<f32>> = Vec::new();
     {
         let tnet = nt::Net::load(c, &tmodel, true, false).map_err(|e| anyhow::anyhow!(e))?;
         let tw = nt::Work::new(c, &tnet, o.batch, o.window);
-        let all: Vec<&Vec<u32>> = train.iter().chain(eval.iter().take(eval_n)).collect();
+        let whole = train.len() / o.batch * o.batch;
+        let all: Vec<&Vec<u32>> = train[..whole].iter().chain(eval.iter().take(eval_n)).collect();
         let tt = Instant::now();
         for (bi, chunk) in all.chunks(o.batch).enumerate() {
-            if chunk.len() < o.batch {
-                break;
-            }
+            anyhow::ensure!(chunk.len() == o.batch, "teacher batch {bi}: {} windows", chunk.len());
             let ids: Vec<u32> = chunk.iter().flat_map(|w| w.iter().copied()).collect();
             let (ti, tp) = nt::teacher_topk(c, &tnet, &tw, &ids, k).ok_or_else(|| anyhow::anyhow!("teacher pass failed"))?;
             t_ids.push(ti);
