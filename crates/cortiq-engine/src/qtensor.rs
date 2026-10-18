@@ -10632,7 +10632,12 @@ thread_local! {
     static FLOAT_ACTIVATIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-pub(crate) fn float_activations_scope<R>(f: impl FnOnce() -> R) -> R {
+/// Run `f` with exact float activations on this thread (no A8W8 int8
+/// activation quantization in the quantized matvecs). Public for parity
+/// tests that compare the default kernels with the strict ones in one
+/// process; `CMF_SDOT=0` is the process-wide equivalent.
+#[doc(hidden)]
+pub fn float_activations_scope<R>(f: impl FnOnce() -> R) -> R {
     struct Restore(bool);
     impl Drop for Restore {
         fn drop(&mut self) {
