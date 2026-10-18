@@ -515,10 +515,7 @@ fn pipes(c: &Ctx) -> Option<&'static Pipes> {
                 immediate_size: 0,
             });
             let sc = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
-            let m = c.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("gdn_train"),
-                source: wgpu::ShaderSource::Wgsl(SRC.into()),
-            });
+            let m = super::train_ops::trainer_module(c, "gdn_train", SRC);
             if let Some(e) = pollster::block_on(sc.pop()) {
                 tracing::warn!("gdn_train module rejected: {e}");
                 return None;

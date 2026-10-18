@@ -580,6 +580,22 @@ fn attn_dq(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index
 }
 "#;
 
+/// A trainer shader module. Built without naga's injected bounds checks
+/// and loop bounding (as `zimage` builds `zi_mm`): the clamps and the loop
+/// guard keep the drivers from unrolling the kernels' serial loops (column
+/// reductions, the GDN recurrence), so every iteration paid a full memory
+/// latency. `CMF_TRAIN_CHECKED=1` restores the checked build.
+pub(super) fn trainer_module(c: &Ctx, name: &str, src: &str) -> wgpu::ShaderModule {
+    let desc = wgpu::ShaderModuleDescriptor { label: Some(name), source: wgpu::ShaderSource::Wgsl(src.into()) };
+    if std::env::var("CMF_TRAIN_CHECKED").as_deref() == Ok("1") {
+        return c.device.create_shader_module(desc);
+    }
+    // SAFETY: every trainer kernel guards its own indices against the
+    // dispatch geometry, the buffers are sized by their owners for that
+    // geometry, and every loop has a uniform, finite trip count.
+    unsafe { c.device.create_shader_module_trusted(desc, wgpu::ShaderRuntimeChecks::unchecked()) }
+}
+
 pub(super) struct Mod {
     pub(super) p: HashMap<&'static str, wgpu::ComputePipeline>,
 }
@@ -594,10 +610,7 @@ pub(super) fn module(c: &Ctx, name: &'static str, src: &'static str, entries: &[
     }
     let built = (|| {
         let sc = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let m = c.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(name),
-            source: wgpu::ShaderSource::Wgsl(src.into()),
-        });
+        let m = trainer_module(c, name, src);
         if let Some(e) = pollster::block_on(sc.pop()) {
             tracing::warn!("{name} module rejected: {e}");
             return None;
