@@ -241,6 +241,7 @@ fn dtype_to_quant(d: TensorDtype, weight_quant: Option<&str>) -> Option<Quant> {
         TensorDtype::Q1G => Quant::Q1,
         TensorDtype::Q1S => Quant::Q1s,
         TensorDtype::Q1T => Quant::Q1t,
+        TensorDtype::Mxfp4 => Quant::Mxfp4,
         _ => return None,
     })
 }
