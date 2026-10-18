@@ -401,10 +401,13 @@ enum Commands {
         /// or a hub repo id like `Qwen/Qwen2.5-0.5B-Instruct` (downloaded)
         #[arg(long)]
         model: String,
-        /// Quantization for 2-D weights: q8 | q8_2f | q4 | q4t | q4tp | q2tp | q1 | q1p | q1s | q1t | f16 | vbit | blr | auto.
+        /// Quantization for 2-D weights: q8 | q8_2f | q4 | q4t | q4tp | q2tp | q1 | q1p | q1s | q1t | f16 | vbit | mxfp4 | fp4 | blr | auto.
         /// Default (or `auto`): q8, except MiMo-V2 (`mimo_v2`), which converts to
         /// q4tp experts with a q8_2f skeleton. `blr` = binary low-rank layer
         /// projections at `--bpw` (encoder `--blr-method`, docs/BLR_NVG.md).
+        /// `fp4` = MoE experts as OCP MXFP4 (`mxfp4`, byte-identical to a
+        /// DeepSeek-V4/V4.1 FP4 source), the rest as the q4tp profile
+        /// (docs/FP4_NATIVE.md); `mxfp4` = every matrix in MXFP4.
         #[arg(long)]
         quant: Option<String>,
         /// Output .cmf path

@@ -3876,6 +3876,42 @@ pub fn blr_matmat(t: &crate::blr::BlrTensor, xs: &[f32], b: usize, out: &mut [f3
     }
 }
 
+/// `mxfp4` matvec on the device: the wgpu kernel (`gpu_wgpu::mxfp4`).
+/// Native Metal has no mxfp4 kernel and answers false, as does any shape or
+/// budget the device path refuses — the CPU kernels run then.
+pub fn mxfp4_matvec(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    mxfp4_matmat(model, idx, xs, 1, rows, cols, out)
+}
+
+/// Batched `mxfp4` matvec on the device (`xs` `[b, cols]` → `out`
+/// `[b, rows]`, up to eight tokens per workgroup). false = CPU fallback.
+pub fn mxfp4_matmat(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::mxfp4::matmat(model, idx, xs, b, rows, cols, out),
+        #[allow(unreachable_patterns)]
+        _ => {
+            let _ = (model, idx, xs, b, rows, cols, out);
+            false
+        }
+    }
+}
+
 /// Single-token q2tp matvec through the ordinary (center=1.5) WGSL kernel.
 pub fn q2tp_matvec(
     model: &Arc<CmfModel>,

@@ -8,6 +8,7 @@ pub mod hadamard;
 pub mod hash;
 pub mod knowledge;
 pub mod mask;
+pub mod mxfp4;
 pub mod quant;
 pub mod types;
 

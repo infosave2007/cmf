@@ -227,6 +227,9 @@ pub(crate) struct QwenGpuPool {
     /// The host tiers behind this arena (RAM tier, then the file), set by
     /// the device path; None reads experts straight from the memory map.
     pub(crate) store: Option<Arc<crate::expert_store::ExpertStore>>,
+    /// The bank's expert layout (q4tp, q2tp gate/up, or mxfp4).
+    #[cfg(feature = "gpu")]
+    pub(crate) codec: crate::gpu_wgpu::MoeBankCodec,
     pub(crate) segment_slots: usize,
     floor: usize,
     n_experts: usize,
@@ -465,7 +468,7 @@ impl QwenGpuPool {
             hidden,
             n_layers,
             n_experts,
-            gu_q2,
+            crate::gpu_wgpu::MoeBankCodec::from_gu_q2(gu_q2),
             "CMF_QWEN_POOL_PCT",
             75,
             25,
@@ -497,7 +500,7 @@ impl QwenGpuPool {
             hidden,
             n_layers,
             n_experts,
-            gu_q2,
+            crate::gpu_wgpu::MoeBankCodec::from_gu_q2(gu_q2),
             "CMF_QWEN_POOL_PCT",
             75,
             25,
@@ -586,7 +589,7 @@ impl QwenGpuPool {
             hidden,
             1,
             n_experts,
-            gu_q2,
+            crate::gpu_wgpu::MoeBankCodec::from_gu_q2(gu_q2),
             "CMF_QWEN_MTP_BANK",
             75,
             25,
@@ -1278,7 +1281,36 @@ impl QwenGpuPool {
             hidden,
             n_layers,
             n_experts,
-            gu_q2,
+            crate::gpu_wgpu::MoeBankCodec::from_gu_q2(gu_q2),
+            "CMF_DSV41_POOL_PCT",
+            75,
+            25,
+            85,
+            "CMF_DSV41_EXPERT_SLOTS",
+            "CMF_DSV41_FETCH_MAX",
+            "CMF_DSV41_FETCH_MIN_SEEN",
+            None,
+            0,
+        )
+    }
+
+    /// [`create_for_dsv41`](Self::create_for_dsv41) for any bank codec —
+    /// the mxfp4 experts of a `convert --quant fp4` file included.
+    pub(crate) fn create_for_dsv41_codec(
+        model: &Arc<CmfModel>,
+        inter: usize,
+        hidden: usize,
+        n_layers: usize,
+        n_experts: usize,
+        codec: crate::gpu_wgpu::MoeBankCodec,
+    ) -> Option<Self> {
+        Self::create_with_policy(
+            model,
+            inter,
+            hidden,
+            n_layers,
+            n_experts,
+            codec,
             "CMF_DSV41_POOL_PCT",
             75,
             25,
@@ -1312,7 +1344,7 @@ impl QwenGpuPool {
             hidden,
             n_layers,
             n_experts,
-            gu_q2,
+            crate::gpu_wgpu::MoeBankCodec::from_gu_q2(gu_q2),
             "CMF_GLM_POOL_PCT",
             40,
             20,
@@ -1331,7 +1363,7 @@ impl QwenGpuPool {
         hidden: usize,
         n_layers: usize,
         n_experts: usize,
-        gu_q2: bool,
+        codec: crate::gpu_wgpu::MoeBankCodec,
         pct_env: &str,
         default_pct: usize,
         min_pct: usize,
@@ -1345,18 +1377,12 @@ impl QwenGpuPool {
         if !crate::gpu_wgpu::dsv4_global_moe_supported() {
             return None;
         }
-        let gu = cortiq_core::quant::expected_nbytes(
-            if gu_q2 {
-                TensorDtype::Q2TiledP
-            } else {
-                TensorDtype::Q4TiledP
-            },
-            &[inter, hidden],
-        )?;
-        let dn = cortiq_core::quant::expected_nbytes(
-            cortiq_core::TensorDtype::Q4TiledP,
-            &[hidden, inter],
-        )?;
+        let gu_q2 = codec.gu_q2();
+        // Only the V4.1 allocator knows the mxfp4 bank.
+        if codec == crate::gpu_wgpu::MoeBankCodec::Mxfp4 && pct_env != "CMF_DSV41_POOL_PCT" {
+            return None;
+        }
+        let (gu, dn) = codec.lens(inter, hidden)?;
         let per = 2usize.checked_mul(gu)?.checked_add(dn)?;
         let budget = crate::gpu_wgpu::dsv4_vram_budget()? as usize;
         // The Q8_2f attention/GDN skeleton, f32 HyperConnection projections,
@@ -1404,8 +1430,8 @@ impl QwenGpuPool {
             ),
         };
         let (capacity, segment_slots) = if pct_env == "CMF_DSV41_POOL_PCT" {
-            crate::gpu_wgpu::dsv4_global_moe_create_for_dsv41(
-                model, requested, inter, hidden, gu_q2,
+            crate::gpu_wgpu::dsv4_global_moe_create_for_dsv41_codec(
+                model, requested, inter, hidden, codec,
             )?
         } else if explicit_slots.is_some() && pct_env == "CMF_QWEN_POOL_PCT" {
             // the device path: the caller already left its reserve and the
@@ -1451,7 +1477,7 @@ impl QwenGpuPool {
         {
             eprintln!(
                 "dynamic-pool capacity={capacity} segment_slots={segment_slots} requested={requested} pct={pool_pct} env={pct_env} fetch_quota={fetch_quota} min_seen={fetch_min_seen} gu={}",
-                if gu_q2 { "q2tp" } else { "q4tp" }
+                codec.label()
             );
         }
         let staging = staging.min(capacity / 2);
@@ -1466,6 +1492,7 @@ impl QwenGpuPool {
             tier: None,
             admit_pool: None,
             store: None,
+            codec,
             segment_slots,
             floor: (staging_base / n_layers.max(1)).max(2),
             n_experts,
