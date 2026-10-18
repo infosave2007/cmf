@@ -132,7 +132,8 @@ segmented bank (`dsv4_global_moe_supported()`). M4: 48/12, MoE 36 device /
 
 Per-position relative logit error, with two broken device paths for scale
 (`CMF_DSV41_TEST_MUTATE=sink` hands the frame zero sinks, `=rope` shifts
-its inverse RoPE by one position; both must fail the test):
+its inverse RoPE by one position; both must fail the test; the hook exists
+only in builds with debug assertions, so not under `--release`):
 
 | run (M4) | median | worst |
 |---|---|---|

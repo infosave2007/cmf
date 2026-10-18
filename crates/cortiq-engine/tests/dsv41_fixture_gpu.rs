@@ -24,8 +24,8 @@
 //! the device kernels' f32 arithmetic, amplified where a BF16 boundary flips
 //! and the FP4/FP8 caches carry it. Per-position relative logit error
 //! against the f64 reference, M4 (wgpu over Metal), with two broken device
-//! paths for scale (`CMF_DSV41_TEST_MUTATE=sink|rope`; both must FAIL this
-//! test and `dsv41_fixture_gpu_o_fp8`):
+//! paths for scale (`CMF_DSV41_TEST_MUTATE=sink|rope`, debug builds only;
+//! both must FAIL this test and `dsv41_fixture_gpu_o_fp8`):
 //!
 //! | run | median | worst |
 //! |---|---|---|
