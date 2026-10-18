@@ -169,6 +169,23 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
             None => anyhow::bail!("quantize-moe: no wgpu GPU (set CMF_MOE_HOST=1 to run on the host)"),
         }
     };
+    // q2tp in place releases each slot's slack by hole punching: probe the
+    // filesystem now, not after the capture
+    if o.in_place && codec == Codec::Q2tp && std::env::var_os("CMF_MOE_DIAG").is_none() {
+        if no_punch() {
+            eprintln!("quantize-moe: CMF_MOE_NO_PUNCH=1 — the q2tp slack stays allocated (the file keeps its q4tp size on disk until `cortiq compact`)");
+        } else {
+            let dir = Path::new(o.calib_model).parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+            if let Err(why) = probe_hole_punching(dir) {
+                anyhow::bail!(
+                    "--in-place --codec q2tp releases each expert slot's slack by hole punching, and {} does not: {why}. \
+                     Set CMF_MOE_NO_PUNCH=1 to run anyway (the slack, about a third of the expert bytes, then stays allocated until `cortiq compact`)",
+                    dir.display()
+                );
+            }
+            eprintln!("quantize-moe: hole punching works on {}", dir.display());
+        }
+    }
     let cmodel = Arc::new(CmfModel::open_sharded(o.calib_model)?);
     let arch = cmodel.arch().clone();
     let nl = arch.num_layers;
@@ -973,11 +990,66 @@ impl Sink {
     }
 }
 
+/// `CMF_MOE_NO_PUNCH=1`: never punch holes (the q2tp slack in q4tp slots
+/// stays allocated).
+fn no_punch() -> bool {
+    std::env::var("CMF_MOE_NO_PUNCH").is_ok_and(|v| v != "0")
+}
+
+/// Whether the filesystem of `dir` releases punched holes: a 1 MiB file is
+/// written there, one hole punched into it, and its allocated blocks are
+/// counted before and after. Linux only (`fallocate`); elsewhere never.
+fn probe_hole_punching(dir: &Path) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::io::AsRawFd;
+        const LEN: usize = 1 << 20;
+        let p = dir.join(format!(".cortiq-moe-punch-probe-{}", std::process::id()));
+        let probe = || -> Result<(), String> {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&p)
+                .map_err(|e| format!("create {}: {e}", p.display()))?;
+            f.write_all(&vec![0xA5u8; LEN]).map_err(|e| format!("write {}: {e}", p.display()))?;
+            f.sync_all().map_err(|e| format!("sync {}: {e}", p.display()))?;
+            let before = f.metadata().map_err(|e| format!("stat {}: {e}", p.display()))?.blocks();
+            let r = unsafe { libc::fallocate(f.as_raw_fd(), libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, (LEN / 4) as libc::off_t, (LEN / 2) as libc::off_t) };
+            if r != 0 {
+                return Err(format!("fallocate(PUNCH_HOLE): {}", std::io::Error::last_os_error()));
+            }
+            f.sync_all().map_err(|e| format!("sync {}: {e}", p.display()))?;
+            let md = f.metadata().map_err(|e| format!("stat {}: {e}", p.display()))?;
+            if md.len() != LEN as u64 || md.blocks() >= before {
+                return Err(format!(
+                    "fallocate(PUNCH_HOLE) succeeded, but the probe file kept {} of {before} allocated 512-byte blocks (length {} of {LEN})",
+                    md.blocks(),
+                    md.len()
+                ));
+            }
+            Ok(())
+        };
+        let r = probe();
+        let _ = std::fs::remove_file(&p);
+        r
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = dir;
+        Err("hole punching is implemented on Linux only".to_string())
+    }
+}
+
 /// Release whole filesystem blocks inside `[start, end)` ranges of `path`
 /// (Linux `fallocate` hole punching; the file length is unchanged and the
-/// ranges read back as zeros). Returns the bytes released (0 elsewhere).
+/// ranges read back as zeros). Returns the bytes released (0 elsewhere, and
+/// with `CMF_MOE_NO_PUNCH=1`).
 fn punch_holes(path: &str, ranges: &[(u64, u64)]) -> anyhow::Result<u64> {
-    if ranges.is_empty() {
+    if ranges.is_empty() || no_punch() {
         return Ok(0);
     }
     #[cfg(target_os = "linux")]
@@ -1814,6 +1886,21 @@ mod tests {
             got.sort_unstable();
             assert_eq!(got, want, "token {t}");
         }
+    }
+
+    /// The hole-punching probe answers without leaving its file behind:
+    /// unsupported off Linux, and on Linux whatever the temp filesystem does.
+    #[test]
+    fn hole_punch_probe_cleans_up() {
+        let dir = std::env::temp_dir().join(format!("cortiq-moe-punch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = probe_hole_punching(&dir);
+        eprintln!("hole punching in {}: {r:?}", dir.display());
+        if cfg!(not(target_os = "linux")) {
+            assert!(r.is_err());
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "the probe file is removed");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The FP4 and FP8 source tensors decode bit for bit to the weights
