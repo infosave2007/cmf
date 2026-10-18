@@ -107,40 +107,6 @@ pub fn run_gpu(fx: &Fixture, tag: &str) -> GpuRun {
     }
 }
 
-pub fn per_position(got: &[Vec<f32>], want: &[Vec<f64>]) -> Vec<f64> {
-    got.iter()
-        .zip(want)
-        .map(|(g, w)| worst_rel(std::slice::from_ref(g), std::slice::from_ref(w)).0)
-        .collect()
-}
-
-pub fn median(errs: &[f64]) -> f64 {
-    let mut v = errs.to_vec();
-    v.sort_by(f64::total_cmp);
-    let n = v.len();
-    if n == 0 {
-        0.0
-    } else if n % 2 == 1 {
-        v[n / 2]
-    } else {
-        0.5 * (v[n / 2 - 1] + v[n / 2])
-    }
-}
-
-pub fn fmt_errs(errs: &[f64]) -> String {
-    errs.iter()
-        .map(|e| format!("{e:.1e}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-pub fn argmax_agree(got: &[Vec<f32>], want: &[Vec<f64>]) -> usize {
-    got.iter()
-        .zip(want)
-        .filter(|(g, w)| argmax32(g) == argmax64(w))
-        .count()
-}
-
 /// The device-path assertions shared by the GPU binaries: every attention
 /// call of a q4tp layer ran the device frame, and, where the adapter can
 /// hold the segmented expert bank at all, the MoE ran on the device too.

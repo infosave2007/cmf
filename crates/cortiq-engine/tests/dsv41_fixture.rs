@@ -74,27 +74,6 @@ fn run(l: &Loaded, token_map: Vec<u32>, tokens: &[u32], pool: Option<&Pool>) -> 
     out
 }
 
-fn per_position(got: &[Vec<f32>], want: &[Vec<f64>]) -> Vec<f64> {
-    got.iter()
-        .zip(want)
-        .map(|(g, w)| worst_rel(std::slice::from_ref(g), std::slice::from_ref(w)).0)
-        .collect()
-}
-
-fn fmt_errs(errs: &[f64]) -> String {
-    errs.iter()
-        .map(|e| format!("{e:.1e}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn argmax_agree(got: &[Vec<f32>], want: &[Vec<f64>]) -> usize {
-    got.iter()
-        .zip(want)
-        .filter(|(g, w)| argmax32(g) == argmax64(w))
-        .count()
-}
-
 fn bits_equal(a: &[Vec<f32>], b: &[Vec<f32>]) -> bool {
     a.len() == b.len()
         && a.iter().zip(b).all(|(x, y)| {
@@ -149,10 +128,12 @@ fn fixture_config_parses_to_its_geometry() {
 /// accumulator, the runtime and the reference agree to ~1e-7 relative:
 /// every BF16 boundary, quantizer, rope pair, hc transpose, top-k and
 /// candidate rule is the same. Where one value does land on the other side
-/// of a boundary, the FP4/FP8 caches can carry the one-ulp flip into a
-/// visible logit change (measured ~3e-3). A structural regression moves
-/// every position, so the test asks most positions to be exact and bounds
-/// the rest.
+/// of a boundary, the one-ulp flip shows in the logits: on the M4 that is
+/// position 4 (3.0e-3), a local BF16 flip in L4's hc_pre/input-norm output
+/// that L4's FP8 window KV absorbs, so the following positions are exact
+/// again. A structural regression moves every position, so the test asks
+/// most positions to be exact and bounds the rest (see
+/// `assert_strict_agreement` for the per-target bounds).
 #[test]
 fn strict_cpu_forward_matches_f64_reference() {
     let fx = Fixture::build(RELEASE_COMPRESSED_VOCAB);
@@ -160,7 +141,7 @@ fn strict_cpu_forward_matches_f64_reference() {
     let got = float_activations_scope(|| run(&l, fx.token_map(), &TOKENS, None));
     let want = reference_logits(&fx, &TOKENS, RefOpts::cortiq());
     let errs = per_position(&got, &want);
-    let exact = errs.iter().filter(|&&e| e < 1e-5).count();
+    let exact = errs.iter().filter(|&&e| e < EXACT).count();
     let (worst, at) = worst_rel(&got, &want);
     let (kern, kern_at) = worst_rel(&got, &reference_logits(&fx, &TOKENS, RefOpts::kernels()));
     println!(
@@ -174,16 +155,8 @@ fn strict_cpu_forward_matches_f64_reference() {
         TOKENS.len()
     );
     assert!(got.iter().flatten().all(|v| v.is_finite()), "non-finite logits");
-    assert!(
-        exact * 3 >= TOKENS.len() * 2,
-        "only {exact}/{} positions agree with the reference to 1e-5: [{}]",
-        TOKENS.len(),
-        fmt_errs(&errs)
-    );
-    assert!(
-        worst < 0.15,
-        "strict CPU V4.1 forward drifted from the reference: {worst:.3e} at position {at}"
-    );
+    // Measured on the M4: 11/12 exact, the other (position 4) 3.0e-3.
+    assert_strict_agreement("strict CPU", &errs, 10, 2e-2);
 }
 
 /// `candidate_source_layer_id: -1` turns candidate pre-filtering off (it
@@ -198,7 +171,7 @@ fn negative_candidate_source_runs_without_prefiltering() {
     let got = float_activations_scope(|| run(&l, fx.token_map(), &TOKENS, None));
     let want = reference_logits(&fx, &TOKENS, RefOpts::cortiq());
     let errs = per_position(&got, &want);
-    let exact = errs.iter().filter(|&&e| e < 1e-5).count();
+    let exact = errs.iter().filter(|&&e| e < EXACT).count();
     let with = Fixture::build(RELEASE_COMPRESSED_VOCAB);
     let (apart, _) = worst_rel(&got, &reference_logits(&with, &TOKENS, RefOpts::cortiq()));
     println!(
@@ -207,7 +180,8 @@ fn negative_candidate_source_runs_without_prefiltering() {
         fmt_errs(&errs),
         TOKENS.len()
     );
-    assert!(exact * 3 >= TOKENS.len() * 2, "[{}]", fmt_errs(&errs));
+    // Measured on the M4: 12/12 exact (worst 1.4e-7).
+    assert_strict_agreement("without candidates", &errs, TOKENS.len(), EXACT);
     assert!(apart > 1e-3, "candidate pre-filtering never changed a pick");
 }
 
