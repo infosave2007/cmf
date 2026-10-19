@@ -60727,6 +60727,13 @@ fn dsv4_global_moe_workspace(c: &Ctx) -> u64 {
     (c.vram_budget / 10).clamp(2 * gib, 4 * gib)
 }
 
+/// Slots of `per` bytes the carving allocator takes off a request for its
+/// workspace ([`dsv4_global_moe_workspace`]); None without a context.
+pub fn dsv4_global_moe_workspace_slots(per: usize) -> Option<usize> {
+    let c = ctx()?;
+    Some((dsv4_global_moe_workspace(c) / per.max(1) as u64) as usize)
+}
+
 /// Pure capacity calculation shared by the allocator and its bounded geometry
 /// tests. `workspace` is reserved in units of bytes before segment rounding.
 fn dsv4_global_moe_capacity(

@@ -957,8 +957,9 @@ fn dsv41_fp4_dynamic_gpu_moe_matches_the_cpu_forward() {
     .unwrap();
     let fp4 = Arc::new(CmfModel::open(&out).unwrap());
     // A bank just above the allocator's 2-4 GiB workspace carve-out: 64
-    // slots (the whole model needs 2 x (4 + shared)), 0.4 MB instead of
-    // the default 75 % of the card.
+    // slots requested, which the pool caps at the model's experts (2 x (4 +
+    // shared), whole S16 segments: 16 slots), instead of the default 75 % of
+    // the card.
     let (gu, dn) = gw::MoeBankCodec::Mxfp4.lens(MI, DIM).unwrap();
     let gib = 1u64 << 30;
     let workspace = (gw::dsv4_vram_budget().unwrap() / 10).clamp(2 * gib, 4 * gib);
@@ -1003,6 +1004,12 @@ fn dsv41_fp4_dynamic_gpu_moe_matches_the_cpu_forward() {
     );
     assert_eq!(calls, (ids.len() * LAYERS) as u64, "gpu_moe calls");
     assert!(fills > 0, "no expert reached the bank");
+    // The 64 requested slots are capped at the model's experts.
+    assert_eq!(
+        gw::dsv4_global_moe_geometry(&fp4).map(|(_, capacity)| capacity),
+        Some((LAYERS * (NEXP + 1)).div_ceil(16) * 16),
+        "the V4.1 pool is not capped at the model's expert count"
+    );
     let (mut num, mut den) = (0f64, 0f64);
     for (g, c) in gpu.iter().zip(&cpu) {
         num += ((g - c) as f64).powi(2);

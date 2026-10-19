@@ -1429,6 +1429,26 @@ impl QwenGpuPool {
                 bounded_override,
             ),
         };
+        // V4.1: never more slots than the model has experts (each layer's
+        // routed experts and its shared one), whole S16 segments, plus the
+        // allocator's workspace carve-out (it subtracts that from the
+        // request). A small V4.1 file (the test fixtures) otherwise sized
+        // its bank from 75 % of the card: 147,168 slots for the five-layer
+        // GPU fixture under a 4 GiB budget, and without a budget bound most
+        // of a 96 GB card. No-op for the 1017 release (43 x 257 slots).
+        let requested = if pct_env == "CMF_DSV41_POOL_PCT" {
+            let needed = n_layers
+                .saturating_mul(n_experts.saturating_add(1))
+                .div_ceil(16)
+                .saturating_mul(16);
+            requested.min(
+                needed.saturating_add(
+                    crate::gpu_wgpu::dsv4_global_moe_workspace_slots(per).unwrap_or(0),
+                ),
+            )
+        } else {
+            requested
+        };
         let (capacity, segment_slots) = if pct_env == "CMF_DSV41_POOL_PCT" {
             crate::gpu_wgpu::dsv4_global_moe_create_for_dsv41_codec(
                 model, requested, inter, hidden, codec,
