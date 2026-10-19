@@ -910,12 +910,15 @@ fn tensor_quant_mxfp4_override_repacks_and_refuses_nan_scales() {
 /// (mxfp4 codec, `dsv4_global_*_mxfp4` kernels, host-resolved V4.1 route)
 /// and its logits match the CPU forward of the same file.
 ///
-/// Runs only where the wgpu backend was asked for and came up — on macOS
+/// Runs only where the wgpu backend was asked for — on macOS
 /// `CMF_GPU=wgpu` (wgpu over Metal), on Linux/Windows `CMF_GPU=1` or
 /// `wgpu` — and skips otherwise (CI without a GPU, macOS CI without the
-/// variable). It does not set `CMF_GPU` itself: in this binary that would
-/// move every later test onto the device. The CPU reference pauses the
-/// device (`gpu::pause_gpu`), so both forwards run in one process.
+/// variable); asked for and no context, it FAILS (the repo's
+/// `selected_and_up`/`skip_or_fail` convention), so a broken driver on the
+/// pod cannot pass as a skip. It does not set `CMF_GPU` itself: in this
+/// binary that would move every later test onto the device. The CPU
+/// reference pauses the device (`gpu::pause_gpu`), so both forwards run in
+/// one process.
 #[cfg(feature = "gpu")]
 #[test]
 fn dsv41_fp4_dynamic_gpu_moe_matches_the_cpu_forward() {
@@ -924,12 +927,19 @@ fn dsv41_fp4_dynamic_gpu_moe_matches_the_cpu_forward() {
     // Before `selected_and_up` brings the backend up.
     bound_device_budget();
     use cortiq_engine::gpu_wgpu as gw;
-    if gw::selected_and_up() != Some(true) {
-        eprintln!("wgpu backend not requested (CMF_GPU=wgpu) or no adapter — skipping");
-        return;
+    match gw::selected_and_up() {
+        None => {
+            gw::skip_or_fail(module_path!());
+            return;
+        }
+        Some(false) => panic!(
+            "CMF_GPU={} selects wgpu but no wgpu context came up",
+            std::env::var("CMF_GPU").unwrap_or_default()
+        ),
+        Some(true) => {}
     }
     if !gw::dsv4_global_moe_supported() {
-        eprintln!("descriptor-indexed global expert bank unavailable — skipping");
+        eprintln!("SKIPPED (dsv41 fp4 GPU e2e): no descriptor-indexed global expert bank here");
         return;
     }
     let src = write_dsv41_source("dsv41-gpu");
