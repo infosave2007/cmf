@@ -59,6 +59,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--hf-token` is not given. An anonymous 2-hour streamed conversion used to
   end on a single 429 for its last shard.
 
+### Fixed
+- `cortiq serve` with a DeepSeek-V4.1 file opens one slot: each slot built its
+  own expert slot map over the single per-model GPU expert bank, so with
+  several slots (the default on a multi-core host) one slot could compute with
+  an expert another had just overwritten.
+
 ### Models
 - [DeepSeek-V4.1-Flash-1017](https://huggingface.co/infosave/DeepSeek-V4.1-Flash-1017-cmf):
   single-file `fp4` (497.0 GB, bit-exact routed experts), `q4tp` (498.8 GB)

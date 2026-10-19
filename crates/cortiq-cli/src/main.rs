@@ -5152,6 +5152,14 @@ async fn cmd_serve(
         println!("    note: --peer forces 1 slot (the worker holds one KV session)");
         slots = 1;
     }
+    if slots != 1 && model.arch().arch_name == "deepseek_v41" {
+        // Every slot's pipeline builds its own expert slot map, but the
+        // GPU expert bank is one per model: two maps over the same
+        // physical slots would let one slot compute with an expert the
+        // other has just overwritten. One slot until the pool is shared.
+        println!("    note: deepseek_v41 serves with 1 slot (one GPU expert bank per model)");
+        slots = 1;
+    }
     if std::env::var("CMF_THREADS").is_err() {
         // Split the cores between slots instead of oversubscribing
         // N pools × (cores−1) workers. Explicit CMF_THREADS wins.
