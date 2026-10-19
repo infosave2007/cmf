@@ -1654,6 +1654,17 @@ pub fn load(
     for li in 0..n_layers {
         layers.push(load_layer(model, cfg, li)?);
     }
+    // The two Engram tables are ~203 GB of FP8 rows read ~48 rows a token.
+    // With the default read-around every row fault pulls a 128 KiB window
+    // and the table crowds the experts out of the page cache on hosts that
+    // cannot hold the whole file; random advice keeps a fault to its page.
+    // `CMF_DSV41_ENGRAM_ADVISE=0` keeps the kernel default.
+    if !cfg.engram_layers.is_empty()
+        && std::env::var("CMF_DSV41_ENGRAM_ADVISE").as_deref() != Ok("0")
+    {
+        let advised = crate::expert_store::advise_random(model, |n| n.contains(".engram.embed."));
+        tracing::debug!("deepseek_v41: MADV_RANDOM on {} MB of Engram rows", advised >> 20);
+    }
     let hash = if !cfg.engram_layers.is_empty() {
         Some(EngramHash::new(
             cfg.engram_layers.clone(),
