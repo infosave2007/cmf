@@ -434,14 +434,18 @@ enum Commands {
         tensor_quant: Vec<String>,
         /// Leave tensors out of the file: comma-separated globs over the
         /// CANONICAL output tensor names (repeatable; `*` is the only
-        /// wildcard and spans dots). A matching source tensor is never
-        /// decoded or written, in every output (`--also-output` included);
-        /// the count and source bytes left out are printed and the patterns
-        /// recorded in the header provenance (`excluded_tensors`). E.g.
-        /// `--exclude-tensors 'model.mtp.*'` drops a DeepSeek-V4/V4.1
-        /// MTP/DSpark stack (the V4.1 runtime never executes it): the 1017
-        /// `--quant fp4` file goes from 504.51 to 496.96 GB, under Hugging
-        /// Face's 500 GB per-file limit.
+        /// wildcard and spans dots). A source tensor whose canonical name
+        /// matches is never decoded or written, in every output
+        /// (`--also-output` included); a name only a split or a late rename
+        /// produces is dropped at the writer. The source index is checked
+        /// up front (a pattern matching nothing is flagged), the count and
+        /// source bytes left out are printed, and the patterns are recorded
+        /// in the header provenance (`excluded_tensors`); `--resume` must
+        /// repeat them. E.g. `--exclude-tensors 'model.mtp.*'` drops a
+        /// DeepSeek-V4/V4.1 MTP/DSpark stack (the V4.1 runtime never
+        /// executes it): the 1017 `--quant fp4` payload goes from 504.51 to
+        /// 496.96 GB (file ≈ 497.2 GB with its header), under Hugging Face's
+        /// 500 GB per-file limit.
         #[arg(long = "exclude-tensors", value_name = "PATTERNS")]
         exclude_tensors: Vec<String>,
         /// Continue a conversion that was interrupted. Keeps the payloads
