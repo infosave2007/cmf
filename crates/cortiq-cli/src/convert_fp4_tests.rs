@@ -1289,6 +1289,13 @@ fn dsv41_exclude_mtp_drops_the_stack_and_keeps_the_forward() {
             "{label}"
         );
         assert_eq!(m.tensors.len(), full.tensors.len() - mtp_written, "{label}");
+        // `info` must not claim the MTP head the header still declares.
+        assert!(m.arch().mtp.is_some(), "{label}");
+        assert_eq!(
+            crate::mtp_excluded_by(m).as_deref(),
+            Some("'model.mtp.*'"),
+            "{label}"
+        );
     }
     assert!(
         full.header
@@ -1296,6 +1303,7 @@ fn dsv41_exclude_mtp_drops_the_stack_and_keeps_the_forward() {
             .as_ref()
             .is_some_and(|p| p.get("excluded_tensors").is_none())
     );
+    assert_eq!(crate::mtp_excluded_by(&full), None);
     for e in &cut.tensors {
         let f = full.tensor(&e.name).unwrap();
         assert_eq!((e.dtype, &e.shape), (f.dtype, &f.shape), "{}", e.name);
