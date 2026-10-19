@@ -2941,14 +2941,15 @@ mod tests {
         assert_eq!(calls, 3);
         // pauses 10, 20, 30, 30, … ms within a 100 ms budget: the pauses
         // after attempts 1..4 end at 10, 30, 60, 90 ms, the one after the
-        // 5th would end at 120 > 100 (4 when the sleeps overshoot)
+        // 5th would end at 120 > 100 (fewer when the sleeps overshoot: a
+        // loaded macOS CI runner managed 3)
         let mut calls = 0;
         let e = with_retries(ms(100), ms(10), ms(30), "shard", || {
             calls += 1;
             anyhow::bail!("down {calls}")
         })
         .unwrap_err();
-        assert!((4..=5).contains(&calls), "{calls} attempts");
+        assert!((2..=5).contains(&calls), "{calls} attempts");
         assert!(format!("{e:#}").contains(&format!("down {calls}")) && format!("{e:#}").contains("CMF_MOE_FETCH_WAIT"), "{e:#}");
         // a zero budget: one attempt
         let mut calls = 0;
