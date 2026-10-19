@@ -5,6 +5,65 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.24] - 2026-10-19
+
+### Added
+- Native FP4: the `mxfp4` tensor dtype (id 21; OCP MX FP4 — E2M1 codes plus
+  an E8M0 scale per 32 weights, 4.25 bits per weight). `convert --quant mxfp4`
+  and `--tensor-quant PATTERN=mxfp4` quantize floats by the OCP rule;
+  `convert --quant fp4` is a profile that writes DeepSeek-V4/V4.1 FP4 experts
+  byte for byte (codes and scales are copied, no float round trip) and gives
+  every other tensor the q4tp profile's choice. NVFP4 (ModelOpt) checkpoints
+  decode to every profile. CPU kernels (exact and A8W8, mapped from the file),
+  wgpu matvec and batched matvec, and the DeepSeek-V4.1 dynamic GPU expert
+  bank on mxfp4 (S8/S16). Readers before 0.8.24 refuse such files
+  (`UnknownDtype(21)`).
+- `convert --exclude-tensors PATTERNS`: leave tensors out of every output
+  (globs over the canonical names), checked against the source index before
+  any shard is read and kept by `--resume`; recorded in the provenance.
+  `--exclude-tensors 'model.mtp.*'` drops the DeepSeek-V4.1 MTP/DSpark stack,
+  which the runtime does not execute (the 1017 `--quant fp4` file: 497.0 GB
+  instead of 504.8 GB, under Hugging Face's 500 GB per-file limit).
+- `quantize-moe` for DeepSeek-V4.1 (`--codec q4tp|q2tp`, routed and shared
+  experts): MoE inputs captured from the V4.1 forward, expert weights decoded
+  exactly from the FP4/FP8 checkpoint (streamed one layer at a time), output
+  to a new file or `--in-place`. A capture can be saved and reused
+  (`CMF_MOE_CAPTURE_DIR`, `CMF_MOE_CAPTURE_ONLY`); the V4.1 prior defaults to
+  hidden when experts see fewer rows than that; route-weighted down Hessians
+  (`CMF_MOE_ROUTE_W`); the q2tp debias product runs on the GPU in exact f32.
+  Before a multi-hour run it checks the GPU, the slots against the codec, the
+  free disk space, hole punching for in-place q2tp, and that `--output` is
+  not the calibration file; shard downloads are retried for hours.
+- DeepSeek-V4.1: `act_quant(o)` of the reference (FP8 E4M3 per 32 values
+  before the grouped `wo_a`) behind `CMF_DSV41_O_FP8=1`, bit-identical to the
+  reference on the CPU and on the GPU attention tail. Off by default: on the
+  1017 weights it measured no gain.
+
+### Changed
+- DeepSeek-V4.1 router follows `Gate.forward` exactly: softplus as
+  `log1p(exp(x))`, weights normalized by `sum + 1e-20` only for top-k > 1;
+  `candidate_source_layer_id = -1` disables candidate pre-filtering (it used
+  to fall back to layer 20); a `scoring_func` other than `sqrtsoftplus` is
+  refused.
+- DeepSeek-V4.1 prompt encoding follows the reference after its tool-result
+  fix: images inside tool results keep prompt order, and a turn that holds
+  only tool results keeps the calling turn's reasoning.
+- DeepSeek-V4.1 GPU expert bank: 16 segments are chosen automatically when
+  they hold more experts than 8 (and the adapter supports them), with a retry
+  on 8 when the larger bank misses the memory budget;
+  `CMF_DSV41_GLOBAL_SEGMENTS=8|16` still forces a family. The bank is capped
+  at the model's experts.
+- `convert` downloads from the Hub wait out rate limiting and server errors
+  (429/5xx: pauses from 10 s up to 2 min, for up to `CMF_HF_BUSY_WAIT_MIN`,
+  default 30 minutes), and read `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` when
+  `--hf-token` is not given. An anonymous 2-hour streamed conversion used to
+  end on a single 429 for its last shard.
+
+### Models
+- [DeepSeek-V4.1-Flash-1017](https://huggingface.co/infosave/DeepSeek-V4.1-Flash-1017-cmf):
+  single-file `fp4` (497.0 GB, bit-exact routed experts), `q4tp` (498.8 GB)
+  and `q2tp` CMF files.
+
 ## [0.8.23] - 2026-10-18
 
 ### Added
