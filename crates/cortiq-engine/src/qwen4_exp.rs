@@ -1435,7 +1435,8 @@ impl QwenGpuPool {
         // request). A small V4.1 file (the test fixtures) otherwise sized
         // its bank from 75 % of the card: 147,168 slots for the five-layer
         // GPU fixture under a 4 GiB budget, and without a budget bound most
-        // of a 96 GB card. No-op for the 1017 release (43 x 257 slots).
+        // of a 96 GB card. No-op for the 1017 release (40 x 385 = 15,400
+        // slots, far above any card's request).
         let requested = if pct_env == "CMF_DSV41_POOL_PCT" {
             let needed = n_layers
                 .saturating_mul(n_experts.saturating_add(1))

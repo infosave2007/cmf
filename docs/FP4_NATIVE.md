@@ -64,12 +64,37 @@ Comma-separated globs over the **canonical output** tensor names (repeatable;
   local shards, `CMF_LOCAL_READY_DIR` streaming, Hugging Face streaming,
   `--resume`). A name only a split produces (one expert of a packed tensor,
   q/k/v of a fused projection) is checked again at the writer.
-- The run prints `--exclude-tensors: N source tensors excluded, B source
-  bytes (… GB; 'pattern' ×n, …)` and warns about a pattern that matched
-  nothing (patterns are canonical CMF names: `model.mtp.*`, not `mtp.*`).
+- Matching: the canonical SOURCE name (after the architecture's canonical
+  renames, before the late per-family ones — Kimi `.weight_packed`, Gemma-4
+  `router.proj` → `mlp.gate`, the MiMo/Phi qkv and gate_up splits) and the
+  final OUTPUT name at the writer. A match on the output name alone drops
+  the tensor after its source was decoded; Gemma-4 `.router.scale` tensors
+  are read in a pre-pass whatever the patterns. None of this concerns V4.1,
+  whose `mtp.N.*` become `model.mtp.N.*` in the canonical pass.
+- Before any shard is read, the patterns are matched against the source
+  index (Hub streaming fetches it first; a sharded local checkpoint has it):
+  `--exclude-tensors: the source index lists N matching tensors ('p' ×n, …)`,
+  and a warning for a pattern that matches nothing there (patterns are
+  canonical CMF names: `model.mtp.*`, not `mtp.*`). Not refused — a name
+  only a split produces can still match at the writer.
+- The run ends with `--exclude-tensors: N source tensors excluded, B source
+  bytes (… GB; 'pattern' ×n, …)`. After a resume these count only the shards
+  that attempt converted, and the line says how many shards earlier attempts
+  finished; a pattern whose tensors sat in those gets a note, not the
+  "matched no tensor in this run" warning.
+- `--resume` must repeat the patterns: each new output records them next to
+  its manifest (`<output>.manifest.exclude`, removed with it), and a resume
+  with other patterns, without them, or (no record) with patterns matching a
+  tensor already written is refused before anything is written.
 - The patterns are recorded in `header.provenance.excluded_tensors`.
   `scripts/check_dsv41_cmf.py` reads them: excluded names are no longer
   expected, must be absent, and `--dspark-policy include` refuses such a file.
+  The gate does not take the file's word for it: every recorded pattern must
+  be allowed with `--allow-excluded` (default none), e.g.
+  `--allow-excluded 'model.mtp.*'`.
+- `cortiq info` / `cortiq story` say a declared MTP stack was excluded (with
+  the pattern) when the file holds no `model.mtp.*` tensor and its recorded
+  exclusion covers one, instead of "MTP: 1 block(s)" / "I carry an MTP head".
 - Packers outside the walk refuse the flag: `--quant blr`, `--mtp-sidecar`,
   `--dspark-sidecar`, MiMo `--mimo-towers mm-only`, EmbeddingGemma 2.
 - `arch.mtp` stays as the source declares it (the header carries the source
@@ -175,6 +200,12 @@ contracts, as for every 4-bit codec:
   from `MoeBankCodec::lens`; an mxfp4 bank that goes S16 uses the mxfp4 S16
   kernels, built on first need on an S16-capable adapter (S8 when they
   cannot be built). q4tp/q2tp keep `dsv41-int`'s behaviour.
+- Pool size: the V4.1 pool never asks for more slots than the model has
+  experts — layers × (routed + shared), rounded up to whole 16-slot
+  segments — plus the allocator's workspace carve-out. A small V4.1 file
+  (the test fixtures) used to take 75 % of the card (147,168 slots for the
+  five-layer GPU fixture under a 4 GiB budget, 32 now). No-op for the 1017
+  release: 40 × 385 = 15,400 slots, far above any card's request.
 
 ### Metal
 
@@ -188,9 +219,9 @@ and the CPU kernels run (A8W8 on Apple Silicon). wgpu-over-Metal
 |---|---|
 | `cargo test -p cortiq-core` | all pass (9 mxfp4 tests: tables vs OCP definition, all codes × all scales exact, repack = source planes + NaN refusal, RNE/saturation, OCP exponent rule incl. zero/NaN/inf/clamps, error bound, grid round trip, value-exact re-quantization) |
 | `cargo test -p cortiq-engine --features gpu --lib qtensor::mxfp4` | 3 pass: exact matvec/matvec2/matmat == `matvec_rows` on the dequantized matrix bit for bit (± pool); A8W8 SIMD == scalar == decoded-row, == f64 emulation of the A8W8 contract, matmat == matvec per token; mapped CMF tensor == dequantized F32 twin through every QTensor entry point |
-| `CMF_GPU=wgpu cargo test -p cortiq-engine --features gpu --lib gpu_wgpu::mxfp4 -- --test-threads=1` | 6 pass on wgpu-over-Metal: WGSL validates (naga, S8 + S16); device matvec within 4e-6·Σ|w·x| of f64 on 300×2304, 70000×64 (2-D grid), 5×5120; batch b ∈ {2, 8, 9, 19} == per-token matvec bit for bit; **global bank frame** (mxfp4 bank, forced + preweighted + BF16, shared slot, one cold winner) matches the host experts at 128×64 (nrmse 1.9–2.5e-3, bound 0.02) and at the **release geometry** gate/up 2304×5120, down 5120×2304 (nrmse 2.1–3.0e-3, cos ≥ 0.9999955, bound 0.01), and on an **S16 bank** (`=16` policy, 32 slots, two per segment, geometry asserted (16, 32); nrmse 1.9–2.5e-3, the S8 values). The fixture's E8M0 scales vary per group, so a wrong scale index fails (see below) |
-| `cargo test -p cortiq-cli --bin cortiq fp4_tests` | 11 pass (the GPU one skips without `CMF_GPU`), incl. the end-to-end synthetic V4.1 checkpoint and `--exclude-tensors` (below) |
-| `CMF_GPU=wgpu cargo test -p cortiq-cli --bin cortiq fp4_tests -- --test-threads=1 --nocapture` | 11 pass; `dsv41_fp4_dynamic_gpu_moe_matches_the_cpu_forward` runs: 14 of 14 MoE calls on the mxfp4 bank, 9 slot fills, logits nrmse vs CPU **6.37e-3** (bound 0.02) |
+| `CMF_GPU=wgpu cargo test -p cortiq-engine --features gpu --lib gpu_wgpu::mxfp4 -- --test-threads=1` | 6 pass on wgpu-over-Metal: WGSL validates (naga, S8 + S16); device matvec within 4e-6·Σ|w·x| of f64 on 300×2304, 70000×64 (2-D grid), 5×5120; batch b ∈ {2, 8, 9, 19} == per-token matvec bit for bit; **global bank frame** (mxfp4 bank, forced + preweighted + BF16, shared slot, one cold winner) matches the host experts at 128×64 (16 slots; nrmse 2.0–2.4e-3, bound 0.02), at the **release geometry** gate/up 2304×5120, down 5120×2304 (16 slots, 300 MB; nrmse 2.2–3.6e-3, cos ≥ 0.9999937, bound 0.01), and on an **S16 bank** (`=16` policy, 32 slots, geometry asserted (16, 32); the S8 values). Every bank case holds two slots per segment and every expert its own scale plane per role, and the fixture's E8M0 scales vary per group, so a wrong scale index, group or slot fails (see below). Once an adapter with the capability is up, a missing pipeline or bank fails instead of skipping |
+| `cargo test -p cortiq-cli --bin cortiq fp4_tests` | 12 pass (the GPU one skips without `CMF_GPU`), incl. the end-to-end synthetic V4.1 checkpoint and `--exclude-tensors` (below) |
+| `CMF_GPU=wgpu cargo test -p cortiq-cli --bin cortiq fp4_tests -- --test-threads=1 --nocapture` | 12 pass; `dsv41_fp4_dynamic_gpu_moe_matches_the_cpu_forward` runs: 14 of 14 MoE calls on the mxfp4 bank (16 slots: the pool's cap at the model's experts), 9 slot fills, logits nrmse vs CPU **6.37e-3** (bound 0.02) |
 | `cargo test -p cortiq-cli --bin cortiq` | 226 pass, 1 ignored (whole bin) |
 | `cargo test -p cortiq-engine --features gpu --lib` | 590 pass, 34 ignored (whole lib, 16 min debug); after the upload dtype guards re-run with filters `mxfp4`, `moe`, `dsv4`, `qwen4`, `global`: all pass |
 | `cargo check -p cortiq-engine` (no `gpu`) | builds |
@@ -225,6 +256,18 @@ q4tp, q2tp and mxfp4, with no companion tensor in any output.
   `gate_up_proj` (dropped at the writer) and `lm_head.weight` (at the source).
 - `exclude_tensors_parses_and_counts`: parser (commas, duplicates, empty
   patterns refused) and the tensor/byte counters.
+- `exclude_tensors_preview_and_resumed_report`: the up-front index check
+  (per-pattern counts, a warning for `mtp.*`) and the resumed report (a
+  note instead of the warning, the count of shards not re-read).
+- `convert::tests::resume_refuses_a_changed_tensor_exclusion`: started
+  without patterns and resumed with one matching a written tensor, started
+  with patterns and resumed without or with others — refused; the same
+  patterns finish the file without the tensor and remove the record;
+  started without patterns and nothing matching written yet — the resume
+  may add them. (The review reproduced both refused cases as exit 0 + a
+  passing `verify` on a synthetic 2-shard checkpoint.)
+- `dsv41_exclude_mtp_drops_the_stack_and_keeps_the_forward` also asserts
+  that `info` reports the MTP stack as excluded.
 - `scripts/check_dsv41_cmf.py --self-test` covers the glob and the provenance
   read; a synthetic V4.1 fp4 file converted with the flag passes the checker
   (21 source-derived tensors excluded, none present), the HEAD checker failed
@@ -245,10 +288,30 @@ GPU (`gpu_wgpu/mxfp4.rs`, wgpu-over-Metal, Apple M4):
   hands one lane groups of different slots). A temporary mutation of both
   lane strides (64 → 128) passes the 128×64 case and fails the release case
   (nrmse 0.850, cos 0.884).
+- Review of the five FP4-finish commits: the scale plane depends on the seed
+  only mod 5, and the seeds `10·e + k` gave all five experts one plane per
+  role; the release case held one slot per segment (in-segment offset always
+  0). A temporary mutation dropping the slot term from the scale offset in
+  both bank kernels (every slot reads its segment's first slot's scales)
+  passed all six tests with unchanged numbers. Now seeds `11·e + k`
+  (asserted: pairwise different planes per role), 16 release slots (two per
+  S8 segment) and ≥ 2 slots per segment asserted in every bank case: the
+  same mutation fails the 128×64, S16 and release cases (nrmse 0.794,
+  0.794, 2.753; cos 0.689, 0.689, −0.049).
+- Skips: these lib tests select wgpu themselves (the lib test binary is one
+  process where many GPU tests do, so `selected_and_up`/`skip_or_fail`
+  cannot tell an explicit request from a neighbour's `set_var` there; on a
+  runner without an adapter it would fail for the neighbour's sake). They
+  skip only without an adapter or without the capability (descriptor
+  indexing, S16), printing `SKIPPED (…)`; with the capability, a missing
+  pipeline or bank fails. The cortiq-cli GPU end-to-end test follows
+  `selected_and_up`/`skip_or_fail`: `CMF_GPU` asking for wgpu with no
+  context fails.
 - `dsv41_fp4_dynamic_gpu_moe_matches_the_cpu_forward` (cortiq-cli, needs
   `CMF_GPU`): the synthetic fp4 file through `Pipeline::forward_ids` with the
-  dynamic GPU MoE vs the same forward under `gpu::pause_gpu`. It pins the bank
-  to 64 slots (`CMF_DSV41_EXPERT_SLOTS` = workspace carve-out / slot + 64) and
+  dynamic GPU MoE vs the same forward under `gpu::pause_gpu`. It requests
+  64 slots (`CMF_DSV41_EXPERT_SLOTS` = workspace carve-out / slot + 64),
+  which the pool caps at the model's 2 × 5 experts (16 slots, asserted), and
   reads `Dsv41State::gpu_moe_stats()` (bank calls, codec label — counted
   without `CMF_DSV41_PROF`).
 - Trap found on the way: wgpu-over-Metal reports an "unlimited" weight budget
@@ -256,8 +319,9 @@ GPU (`gpu_wgpu/mxfp4.rs`, wgpu-over-Metal, Apple M4):
   that and maps the binding-range maximum, 15.8 M slots (~103 GB) on the
   synthetic model. The CPU-contract test now pauses the device for its
   forwards; unpaused under `CMF_GPU=wgpu` it took 213 s and drove the 24 GB
-  Mac into swap. Real-model runs on a Mac with `CMF_GPU=wgpu` should pin
-  `CMF_DSV41_EXPERT_SLOTS` (or `CMF_GPU_VRAM_MB`).
+  Mac into swap. The pool is now capped at the model's experts, which fixes
+  this for small files; real-model runs on a Mac with `CMF_GPU=wgpu` should
+  still pin `CMF_DSV41_EXPERT_SLOTS` (or `CMF_GPU_VRAM_MB`).
 - The same test failed on the RTX PRO 6000 pod (before the pause): the wgpu
   backend self-selects on a Linux GPU host, the fp4 experts ran in the bank
   and the f32 twin on the host (bits differ by summation order), and the
@@ -300,8 +364,10 @@ Metal only correctness was checked.
 Build: `cargo build --release -p cortiq-cli` on the pod (Vulkan, `--features
 gpu` is the CLI default).
 
-Vulkan kernel tests (NVIDIA; the engine's GPU tests set `CMF_GPU` themselves;
-the cortiq-cli end-to-end GPU test needs it from the environment):
+Vulkan kernel tests (NVIDIA; the engine's mxfp4 lib tests set `CMF_GPU`
+themselves and fail when the adapter is up but a pipeline or bank is not;
+the cortiq-cli end-to-end GPU test needs `CMF_GPU` from the environment and
+fails when it is set and no context comes up):
 
 ```bash
 cargo test -p cortiq-engine --features gpu --release --lib gpu_wgpu::mxfp4 -- --test-threads=1 --nocapture
@@ -312,20 +378,27 @@ CMF_GPU=1 cargo test -p cortiq-cli --release --bin cortiq fp4_tests -- --test-th
 ```
 
 1017 conversion with FP4 experts, **as one Hugging Face file** (source
-streamed one shard at a time; put the output on local disk or `/dev/shm`,
-never on a network FS). The MTP/DSpark stack must go — 504.51 GB with it,
-496.96 GB without, the limit is 500 GB per file:
+streamed one shard at a time; put the output on the pod's local disk, never
+on a network FS and not in `/dev/shm`, which is charged to the container's
+memory limit). The MTP/DSpark stack must go — payload 504.51 GB with it,
+496.96 GB without (file ≈ 497.2 GB with its 0.26 GB header); the limit is
+500e9 bytes per file:
 
 ```bash
 cortiq convert --model deepseek-ai/DeepSeek-V4.1-Flash-1017 --quant fp4 \
-  --exclude-tensors "model.mtp.*" --output /dev/shm/dsv41-1017-fp4.cmf
-# expect: "--exclude-tensors: N source tensors excluded, B source bytes (… GB; 'model.mtp.*' ×N)"
-# check before uploading: stat -c %s /dev/shm/dsv41-1017-fp4.cmf  (must be < 500000000000)
+  --exclude-tensors "model.mtp.*" --output /root/out/dsv41-1017-fp4.cmf
+# first lines: "--exclude-tensors: the source index lists N matching tensors ('model.mtp.*' ×N)"
+#   (a warning there means a wrong pattern: stop and fix it)
+# last lines: "--exclude-tensors: N source tensors excluded, B source bytes (… GB; 'model.mtp.*' ×N)"
+#   (after a --resume the count covers only that attempt's shards)
+# a retry: the same command plus --resume (the same --exclude-tensors, or it is refused)
+# check before uploading: stat -c %s /root/out/dsv41-1017-fp4.cmf  (must be < 500000000000)
 
-# both files from one streamed pass (the exclusion applies to both):
+# both files from one streamed pass (the exclusion applies to both; ≈ 988 GB
+# of output, so check the disk first):
 cortiq convert --model deepseek-ai/DeepSeek-V4.1-Flash-1017 --quant fp4 \
-  --exclude-tensors "model.mtp.*" --output /dev/shm/dsv41-1017-fp4.cmf \
-  --also-output q4tp=/dev/shm/dsv41-1017-q4tp.cmf
+  --exclude-tensors "model.mtp.*" --output /root/out/dsv41-1017-fp4.cmf \
+  --also-output q4tp=/root/out/dsv41-1017-q4tp.cmf
 ```
 
 Expected: routed experts `mxfp4` (40 layers × 384 × 3 matrices of 2304×5120 /
@@ -334,11 +407,12 @@ skeleton as in the q4tp file. Directory/coverage gate (the checker now knows
 dtype 21; it reads headers and the directory only):
 
 ```bash
-python3 scripts/check_dsv41_cmf.py --model /dev/shm/dsv41-1017-fp4.cmf \
+python3 scripts/check_dsv41_cmf.py --model /root/out/dsv41-1017-fp4.cmf \
   --source-index /root/dsv41/hf/model.safetensors.index.json \
-  --source-config /root/dsv41/hf/config.json
-# with --exclude-tensors it also prints
+  --source-config /root/dsv41/hf/config.json --allow-excluded 'model.mtp.*'
+# it also prints
 # "excluded by the file's provenance (--exclude-tensors model.mtp.*): N source-derived tensors; none present"
+# (without --allow-excluded the gate FAILS a file that excludes anything)
 ```
 
 Byte identity of one expert against its source shard (layer 3 lives in
@@ -351,10 +425,10 @@ Runtime on the pod (V4.1 dynamic GPU MoE must take the mxfp4 bank, cold
 experts on the CPU mxfp4 kernels):
 
 ```bash
-CMF_GPU=1 CMF_DSV41_PROF=1 cortiq run --model /dev/shm/dsv41-1017-fp4.cmf \
+CMF_GPU=1 CMF_DSV41_PROF=1 cortiq run --model /root/out/dsv41-1017-fp4.cmf \
   --prompt "The capital of France is" --max-tokens 64
 # look for: "dynamic-pool capacity=… gu=mxfp4" and "DSV4 unified global pool: … gate/up mxfp4"
-CMF_GPU=1 cortiq bench --model /dev/shm/dsv41-1017-fp4.cmf --ignore-eos
+CMF_GPU=1 cortiq bench --model /root/out/dsv41-1017-fp4.cmf --ignore-eos
 ```
 
 Open for the pod: decode tok/s of the mxfp4 bank vs the q4tp bank on the same
