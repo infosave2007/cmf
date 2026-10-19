@@ -1084,6 +1084,11 @@ pub fn parse_tensor_exclusions(specs: &[String]) -> anyhow::Result<Vec<String>> 
 /// source tensor was decoded for its other parts. The patterns are recorded
 /// in `header.provenance.excluded_tensors`.
 ///
+/// A resumed output must keep the patterns it was started with: they are
+/// recorded next to its manifest (`<output>.manifest.exclude`) and a resume
+/// with other patterns, or with patterns that match a tensor the output
+/// already holds, is refused.
+///
 /// DeepSeek-V4.1-Flash-1017 with `--quant fp4` is 504.51 GB with its
 /// MTP/DSpark stack and 496.96 GB without; `model.mtp.*` drops that stack,
 /// which the V4.1 runtime never executes, and brings the file under Hugging
@@ -1170,6 +1175,79 @@ impl TensorExclusion {
             }
         }
     }
+}
+
+/// Where a conversion records its `--exclude-tensors` patterns next to an
+/// output's resume manifest.
+fn exclusion_record_path(manifest_path: &str) -> String {
+    format!("{manifest_path}.exclude")
+}
+
+/// A new output records its exclusion patterns next to its manifest (none:
+/// a stale record from an earlier output of the same name is removed), so
+/// a resume can check it continues with the same ones.
+fn record_exclusion(manifest_path: &str, patterns: &[String]) -> std::io::Result<()> {
+    let path = exclusion_record_path(manifest_path);
+    if patterns.is_empty() {
+        return match fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+    }
+    fs::write(&path, serde_json::to_vec(patterns).map_err(std::io::Error::other)?)
+}
+
+/// A resumed output keeps the exclusion it was started with: shards done
+/// earlier were written under those patterns, and a different set would
+/// leave the file holding tensors its provenance says are excluded, or
+/// missing tensors its provenance does not mention. The record next to the
+/// manifest is compared when present; an output started before records
+/// existed (or without patterns) only has to hold no tensor the patterns
+/// match, and then gets a record.
+fn check_resume_exclusion(
+    output_path: &str,
+    manifest_path: &str,
+    patterns: &[String],
+    exclusion: &TensorExclusion,
+    written: &[String],
+) -> anyhow::Result<()> {
+    let shown = |p: &[String]| {
+        if p.is_empty() {
+            "none".to_string()
+        } else {
+            format!("'{}'", p.join(","))
+        }
+    };
+    let record = exclusion_record_path(manifest_path);
+    let recorded: Option<Vec<String>> = match fs::read(&record) {
+        Ok(b) => Some(serde_json::from_slice(&b).map_err(|e| {
+            anyhow::anyhow!("resume {output_path}: unreadable exclusion record {record}: {e}")
+        })?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => anyhow::bail!("resume {output_path}: read {record}: {e}"),
+    };
+    if let Some(rec) = recorded {
+        let set = |p: &[String]| p.iter().cloned().collect::<std::collections::BTreeSet<_>>();
+        anyhow::ensure!(
+            set(&rec) == set(patterns),
+            "resume {output_path}: the output was started with --exclude-tensors {} and is \
+             resumed with {}; resume with the same patterns or start a new output",
+            shown(&rec),
+            shown(patterns)
+        );
+        return Ok(());
+    }
+    if let Some((name, p)) = written
+        .iter()
+        .find_map(|n| exclusion.matching(n).map(|i| (n, &exclusion.patterns[i])))
+    {
+        anyhow::bail!(
+            "resume {output_path}: the output was started without --exclude-tensors and already \
+             holds '{name}', which '{p}' excludes; resume without the flag or start a new output"
+        );
+    }
+    record_exclusion(manifest_path, patterns)
+        .map_err(|e| anyhow::anyhow!("resume {output_path}: {e}"))
 }
 
 /// Quantization choice for 2-D weight matrices.
@@ -7486,6 +7564,7 @@ pub fn run_convert_multi_excluding(
         {
             let (w, st) = cortiq_core::format::CmfStreamWriter::resume(output_path, &manifest_path)
                 .map_err(|e| anyhow::anyhow!("resume {output_path}: {e}"))?;
+            check_resume_exclusion(output_path, &manifest_path, exclude, &exclusion, &st.names)?;
             tracing::info!(
                 "resuming {output_path}: {} tensors already written, {} source shards done",
                 st.names.len(),
@@ -7498,6 +7577,8 @@ pub fn run_convert_multi_excluding(
         } else {
             let w = cortiq_core::format::CmfStreamWriter::new(output_path, head_reserve)
                 .and_then(|w| w.with_manifest(&manifest_path))
+                .map_err(|e| anyhow::anyhow!("create {output_path}: {e}"))?;
+            record_exclusion(&manifest_path, exclude)
                 .map_err(|e| anyhow::anyhow!("create {output_path}: {e}"))?;
             (Some(w), std::collections::HashSet::new())
         };
@@ -9152,6 +9233,7 @@ pub fn run_convert_multi_excluding(
     }
     exclusion.report();
     for manifest_path in manifests {
+        let _ = std::fs::remove_file(exclusion_record_path(&manifest_path));
         let _ = std::fs::remove_file(manifest_path);
     }
     progress(1.0);
@@ -11964,6 +12046,140 @@ pub(crate) mod tests {
         unsafe {
             std::env::remove_var(CONSUME_SOURCE_SHARDS_ENV);
         }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `--resume` keeps the `--exclude-tensors` patterns the output was
+    /// started with: started without them and resumed with a pattern that
+    /// matches a tensor already written, or started with them and resumed
+    /// without (or with others), is refused before anything is written; the
+    /// same patterns finish the file without the excluded tensor, and the
+    /// record goes with the manifest.
+    #[test]
+    fn resume_refuses_a_changed_tensor_exclusion() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var(LOCAL_READY_DIR_ENV);
+            std::env::remove_var(SOURCE_SHARD_PRIORITY_ENV);
+            std::env::remove_var(CONSUME_SOURCE_SHARDS_ENV);
+            std::env::remove_var(CONVERT_ONLY_ENV);
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "cortiq-resume-exclude-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let first = "model-00001-of-00002.safetensors";
+        let second = "model-00002-of-00002.safetensors";
+        let first_values = vec![1.0f32, 2.0, 3.0, 4.0];
+        fs::write(
+            dir.join(first),
+            tiny_safetensors(&[("embed.weight", vec![2, 2], first_values.clone())]),
+        )
+        .unwrap();
+        fs::write(
+            dir.join(second),
+            tiny_safetensors(&[("norm.weight", vec![2], vec![1.0, 1.0])]),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "model_type": "deepseek_v41",
+                "text_config": {
+                    "model_type": "deepseek_v41_text", "hidden_size": 2,
+                    "intermediate_size": 4, "num_hidden_layers": 1,
+                    "num_attention_heads": 1, "num_key_value_heads": 1, "head_dim": 2,
+                    "vocab_size": 2, "rms_norm_eps": 1e-6
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "weight_map": {"embed.weight": first, "norm.weight": second}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let output = dir.join("resume.cmf");
+        let manifest = format!("{}.manifest", output.display());
+        let record = exclusion_record_path(&manifest);
+        // An interrupted run: the first shard written and marked.
+        let partial = |record_patterns: Option<&[&str]>| {
+            let _ = fs::remove_file(&output);
+            let _ = fs::remove_file(&manifest);
+            let _ = fs::remove_file(&record);
+            let mut w = cortiq_core::format::CmfStreamWriter::new(
+                &output,
+                cortiq_core::format::CmfStreamWriter::head_reserve_for(8192, 96),
+            )
+            .unwrap()
+            .with_manifest(&manifest)
+            .unwrap();
+            let bytes: Vec<u8> = first_values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            w.push("model.embed_tokens.weight", TensorDtype::F32, &[2, 2], &bytes)
+                .unwrap();
+            w.mark(first).unwrap();
+            drop(w);
+            if let Some(p) = record_patterns {
+                fs::write(&record, serde_json::to_vec(p).unwrap()).unwrap();
+            }
+        };
+        let resume = |exclude: &[&str]| {
+            let exclude: Vec<String> = exclude.iter().map(|s| s.to_string()).collect();
+            run_convert_multi_excluding(
+                dir.to_str().unwrap(),
+                &[("q8".into(), output.to_str().unwrap().into())],
+                None,
+                None,
+                None,
+                true,
+                MimoTowers::TextOnly,
+                &exclude,
+                |_| {},
+            )
+        };
+
+        partial(None);
+        let e = resume(&["model.embed_tokens.weight"]).unwrap_err().to_string();
+        assert!(e.contains("started without --exclude-tensors"), "{e}");
+        assert!(e.contains("model.embed_tokens.weight"), "{e}");
+
+        partial(Some(&["model.norm.weight"]));
+        let e = resume(&[]).unwrap_err().to_string();
+        assert!(
+            e.contains("started with --exclude-tensors 'model.norm.weight' and is resumed with none"),
+            "{e}"
+        );
+        let e = resume(&["model.norm.*"]).unwrap_err().to_string();
+        assert!(e.contains("resumed with 'model.norm.*'"), "{e}");
+
+        partial(Some(&["model.norm.weight"]));
+        resume(&["model.norm.weight"]).unwrap();
+        let model = CmfModel::open(&output).unwrap();
+        assert!(model.verify().is_empty(), "{:?}", model.verify());
+        let names: Vec<&str> = model.tensors.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"model.embed_tokens.weight"), "{names:?}");
+        assert!(!names.contains(&"model.norm.weight"), "{names:?}");
+        assert_eq!(
+            model.header.provenance.as_ref().unwrap()["excluded_tensors"],
+            serde_json::json!(["model.norm.weight"])
+        );
+        drop(model);
+        assert!(!std::path::Path::new(&manifest).exists());
+        assert!(!std::path::Path::new(&record).exists());
+
+        // Started without patterns, nothing excluded written yet: the resume
+        // may add them (the record is written for the next resume).
+        partial(None);
+        resume(&["model.norm.weight"]).unwrap();
+        let model = CmfModel::open(&output).unwrap();
+        assert!(!model.tensors.iter().any(|t| t.name == "model.norm.weight"));
+        drop(model);
         fs::remove_dir_all(&dir).unwrap();
     }
 
