@@ -1084,6 +1084,17 @@ pub fn parse_tensor_exclusions(specs: &[String]) -> anyhow::Result<Vec<String>> 
 /// source tensor was decoded for its other parts. The patterns are recorded
 /// in `header.provenance.excluded_tensors`.
 ///
+/// Patterns are matched twice: against the canonical SOURCE name (after the
+/// architecture's canonical renames, before the later per-family ones —
+/// Kimi `.weight_packed` → `.weight`, Gemma-4 `router.proj` →
+/// `mlp.gate`, the MiMo/Phi qkv and gate_up splits) and against the final
+/// OUTPUT name at the writer. A match on the output name alone drops the
+/// tensor after its source was decoded; a match on a pre-rename source name
+/// drops the tensor even though its output name differs. Gemma-4
+/// `.router.scale` tensors are read in a pre-pass whatever the patterns.
+/// None of this concerns DeepSeek-V4.1, whose `mtp.N.*` names become
+/// `model.mtp.N.*` in the canonical source pass.
+///
 /// A resumed output must keep the patterns it was started with: they are
 /// recorded next to its manifest (`<output>.manifest.exclude`) and a resume
 /// with other patterns, or with patterns that match a tensor the output
@@ -1145,9 +1156,61 @@ impl TensorExclusion {
         true
     }
 
-    fn report(&self) {
+    /// Before any shard is read: how many tensors of the source index each
+    /// pattern matches (canonical names), and a warning for a pattern that
+    /// matches none — a typo shows in the first seconds, not after a
+    /// multi-hour conversion. Such a pattern may still match a name only a
+    /// split produces, so it is not refused.
+    fn preview(&self, names: &[String]) {
+        for line in self.preview_lines(names) {
+            eprintln!("{line}");
+        }
+    }
+
+    fn preview_lines(&self, names: &[String]) -> Vec<String> {
+        if self.patterns.is_empty() || names.is_empty() {
+            return Vec::new();
+        }
+        let mut per = vec![0usize; self.patterns.len()];
+        for n in names {
+            if let Some(i) = self.matching(n) {
+                per[i] += 1;
+            }
+        }
+        let mut out = vec![format!(
+            "  --exclude-tensors: the source index lists {} matching tensors ({})",
+            per.iter().sum::<usize>(),
+            self.patterns
+                .iter()
+                .zip(&per)
+                .map(|(p, k)| format!("'{p}' ×{k}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )];
+        for (p, k) in self.patterns.iter().zip(&per) {
+            if *k == 0 {
+                out.push(format!(
+                    "  warning: --exclude-tensors '{p}' matches no tensor of the source index \
+                     (patterns match canonical CMF names, e.g. 'model.mtp.*'); only a name a \
+                     split produces at write time can still match it"
+                ));
+            }
+        }
+        out
+    }
+
+    /// The end-of-run summary. `shards_done_before`: source shards earlier
+    /// attempts of a resumed output had already converted — their tensors
+    /// were not re-read, so they are not in the counts.
+    fn report(&self, shards_done_before: usize) {
+        for line in self.report_lines(shards_done_before) {
+            eprintln!("{line}");
+        }
+    }
+
+    fn report_lines(&self, shards_done_before: usize) -> Vec<String> {
         if self.patterns.is_empty() {
-            return;
+            return Vec::new();
         }
         let per: Vec<String> = self
             .patterns
@@ -1155,8 +1218,8 @@ impl TensorExclusion {
             .zip(&self.hits)
             .map(|(p, h)| format!("'{p}' ×{}", h.get()))
             .collect();
-        eprintln!(
-            "  --exclude-tensors: {} source tensors excluded, {} source bytes ({:.2} GB; {}){}",
+        let mut out = vec![format!(
+            "  --exclude-tensors: {} source tensors excluded, {} source bytes ({:.2} GB; {}){}{}",
             self.source_tensors.get(),
             self.source_bytes.get(),
             self.source_bytes.get() as f64 / 1e9,
@@ -1164,16 +1227,32 @@ impl TensorExclusion {
             match self.derived.borrow().len() {
                 0 => String::new(),
                 n => format!("; {n} split-produced tensors dropped at write"),
+            },
+            match shards_done_before {
+                0 => String::new(),
+                n => format!(
+                    " — resumed: these count only the shards this run converted; {n} source \
+                     shards earlier attempts finished were not re-read"
+                ),
             }
-        );
+        )];
         for (p, h) in self.patterns.iter().zip(&self.hits) {
             if h.get() == 0 && !self.derived.borrow().iter().any(|n| glob_match(p, n)) {
-                eprintln!(
-                    "  warning: --exclude-tensors '{p}' matched no tensor in this run \
-                     (patterns match canonical CMF names, e.g. 'model.mtp.*')"
-                );
+                out.push(if shards_done_before == 0 {
+                    format!(
+                        "  warning: --exclude-tensors '{p}' matched no tensor in this run \
+                         (patterns match canonical CMF names, e.g. 'model.mtp.*')"
+                    )
+                } else {
+                    format!(
+                        "  note: --exclude-tensors '{p}' matched no tensor in the shards this \
+                         run converted (its tensors may sit in the {shards_done_before} shards \
+                         finished earlier)"
+                    )
+                });
             }
         }
+        out
     }
 }
 
@@ -7409,6 +7488,20 @@ pub fn run_convert_multi_excluding(
             "  --exclude-tensors: leaving out canonical names matching {}",
             exclude.join(", ")
         );
+        // The index is on disk for Hub streaming (fetched before the walk)
+        // and for a sharded local checkpoint.
+        let index_names: Vec<String> = fs::read(dir.join("model.safetensors.index.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| {
+                v.get("weight_map").and_then(|m| m.as_object()).map(|m| {
+                    m.keys()
+                        .filter_map(|k| canon_name_for_arch(&arch, k, towers))
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+        exclusion.preview(&index_names);
     }
     let consume_source_shards =
         stream_repo.is_none() && arch.deepseek_v41.is_some() && consume_source_shards_enabled();
@@ -7586,6 +7679,13 @@ pub fn run_convert_multi_excluding(
         done_shards.push(marks);
         writers.push(writer);
     }
+    // Source shards earlier attempts finished (for the exclusion report).
+    let shards_done_before = done_shards
+        .iter()
+        .map(|d| d.len())
+        .max()
+        .unwrap_or(0)
+        .max(completed_source_shards.len());
     let mut tensors: Vec<Vec<TensorSpec>> =
         outputs.iter().map(|_| Vec::with_capacity(total)).collect();
     let mut tower_stats = vec![crate::mimo_towers::TowerStats::default(); outputs.len()];
@@ -9231,7 +9331,7 @@ pub fn run_convert_multi_excluding(
         // until every requested output has finalized, so a crash between two
         // finish calls can detect the already-valid sibling on resume.
     }
-    exclusion.report();
+    exclusion.report(shards_done_before);
     for manifest_path in manifests {
         let _ = std::fs::remove_file(exclusion_record_path(&manifest_path));
         let _ = std::fs::remove_file(manifest_path);
