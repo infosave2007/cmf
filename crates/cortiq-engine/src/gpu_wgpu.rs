@@ -61243,11 +61243,10 @@ pub fn dsv4_global_slot_fill(model: &Arc<CmfModel>, slot: usize, t: (usize, usiz
         // the whole file keeps room for the experts it computes itself
         // (V4.1 on a 188 GB host read ~300 MB a token from disk with both
         // copies cached). Same switch, discrete adapters only.
-        if c.discrete
-            && std::env::var("CMF_UPLOAD_EVICT")
-                .map(|v| v != "0")
-                .unwrap_or(true)
-        {
+        // Opt-in only: on a small pool that churns, every re-fill of an
+        // evicted expert then comes from disk (V4.1, 16 GB budget: 0.84 vs
+        // 1.81 tok/s, twice the disk reads).
+        if c.discrete && std::env::var("CMF_DSV41_UPLOAD_EVICT").as_deref() == Ok("1") {
             let ranges: Vec<(usize, usize)> = [t.0, t.1, t.2]
                 .iter()
                 .filter_map(|&idx| {
