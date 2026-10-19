@@ -1060,6 +1060,43 @@ fn exclude_tensors_parses_and_counts() {
     assert!(!TensorExclusion::new(&[]).skip_output("model.mtp.0.norm.weight"));
 }
 
+/// The up-front check against the source index and the end-of-run report
+/// of a resumed run: a pattern that matches no index name is flagged before
+/// any shard is read; after a resume, a pattern whose tensors sat in shards
+/// an earlier attempt finished gets a note, not a "matched nothing" warning.
+#[test]
+fn exclude_tensors_preview_and_resumed_report() {
+    let ex = TensorExclusion::new(&["model.mtp.*".into(), "mtp.*".into()]);
+    let index: Vec<String> = [
+        "model.mtp.0.ffn.experts.0.w1.weight",
+        "model.mtp.0.norm.weight",
+        "model.layers.0.attn.wq_a.weight",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let lines = ex.preview_lines(&index);
+    assert!(
+        lines[0].contains("lists 2 matching tensors ('model.mtp.*' ×2, 'mtp.*' ×0)"),
+        "{lines:?}"
+    );
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[1].contains("warning: --exclude-tensors 'mtp.*' matches no tensor"), "{lines:?}");
+    assert!(ex.preview_lines(&[]).is_empty());
+
+    let ex = TensorExclusion::new(&["model.mtp.*".into()]);
+    let fresh = ex.report_lines(0);
+    assert!(fresh[0].contains("0 source tensors excluded"), "{fresh:?}");
+    assert!(fresh[1].contains("warning: --exclude-tensors 'model.mtp.*' matched no tensor in this run"));
+    let resumed = ex.report_lines(3);
+    assert!(
+        resumed[0].contains("resumed: these count only the shards this run converted; 3 source shards"),
+        "{resumed:?}"
+    );
+    assert!(resumed[1].starts_with("  note: "), "{resumed:?}");
+    assert!(!resumed.iter().any(|l| l.contains("warning")), "{resumed:?}");
+}
+
 /// A pattern over a name only a split produces (`up_proj` of a fused
 /// `gate_up_proj`) holds at the writer, beside a source-level pattern; the
 /// sibling split part stays.
