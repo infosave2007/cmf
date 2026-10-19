@@ -2679,6 +2679,54 @@ fn dsv41_cold_experts_cpu(
     out
 }
 
+/// `MADV_WILLNEED` over the three projections of each routed expert, issued
+/// right after the route: on a host that cannot cache the whole file the
+/// kernel then reads every missing expert with large asynchronous requests
+/// while the layer runs, instead of the cold-expert matvecs and the bank
+/// fills faulting them in page by page (measured on an NVMe RAID that reads
+/// 7.7–12 GB/s directly: ~0.6 GB/s through faults). Advisory; resident pages
+/// cost a page-cache walk. `CMF_DSV41_WILLNEED=0` turns it off.
+fn will_need_experts(layer: &Dsv41Layer, picks: &[usize]) {
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("CMF_DSV41_WILLNEED").as_deref() != Ok("0")) {
+            return;
+        }
+        let page = 4096usize;
+        for &e in picks {
+            let Some(expert) = layer.experts.get(e) else {
+                continue;
+            };
+            for t in [&expert.w1, &expert.w3, &expert.w2] {
+                let (Some(model), Some(idx)) = (t.model_arc(), t.model_idx()) else {
+                    continue;
+                };
+                let Some(entry) = model.tensors.get(idx) else {
+                    continue;
+                };
+                let Some(abs) = model.entry_abs_offset(entry) else {
+                    continue;
+                };
+                let bytes = model.primary_bytes();
+                if abs + entry.nbytes as usize > bytes.len() {
+                    continue;
+                }
+                let base = bytes.as_ptr() as usize;
+                let s = (base + abs) & !(page - 1);
+                let end = base + abs + entry.nbytes as usize;
+                // SAFETY: a range inside the model's read-only mapping;
+                // MADV_WILLNEED only schedules read-ahead.
+                unsafe {
+                    libc::madvise(s as *mut libc::c_void, end - s, libc::MADV_WILLNEED);
+                }
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    let _ = (layer, picks);
+}
+
 /// Execute V4.1's host-resolved route through the shared DSV4 segmented
 /// global expert bank.  V4.1 routing stays on the host because its VL bias
 /// and sqrt-softplus rule differ from the generic shader route.  Forced ids
@@ -2950,6 +2998,7 @@ fn moe(
         shifted[i] = f32::NEG_INFINITY;
     }
     trace_moe(position, layer, image, &logits, &scores, bias, &picks);
+    will_need_experts(l, &picks);
     // `weights /= weights.sum() + 1e-20` only when more than one expert is
     // chosen (Gate.forward); the epsilon is not norm_eps.
     let sum = picks.iter().map(|&i| scores[i]).sum::<f32>() + 1e-20;
