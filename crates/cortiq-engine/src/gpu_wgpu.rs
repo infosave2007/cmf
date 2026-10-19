@@ -61238,6 +61238,25 @@ pub fn dsv4_global_slot_fill(model: &Arc<CmfModel>, slot: usize, t: (usize, usiz
     if ok {
         DSV4_FILLS.fetch_add(1, Ordering::Relaxed);
         DSV4_FILL_BYTES.fetch_add((2 * b.gu_len + b.d_len) as u64, Ordering::Relaxed);
+        // The expert now lives on the card: drop its pages from the host
+        // page cache, as `moe_expert_bufs` does, so a host that cannot hold
+        // the whole file keeps room for the experts it computes itself
+        // (V4.1 on a 188 GB host read ~300 MB a token from disk with both
+        // copies cached). Same switch, discrete adapters only.
+        if c.discrete
+            && std::env::var("CMF_UPLOAD_EVICT")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+        {
+            let ranges: Vec<(usize, usize)> = [t.0, t.1, t.2]
+                .iter()
+                .filter_map(|&idx| {
+                    let e = model.tensors.get(idx)?;
+                    Some((model.entry_abs_offset(e)? as usize, e.nbytes as usize))
+                })
+                .collect();
+            model.evict_ranges(&ranges);
+        }
     }
     finish(ok)
 }
