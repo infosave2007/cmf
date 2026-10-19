@@ -11,6 +11,10 @@ Example (after conversion):
     --model /root/dsv41/dsv41-q4tp.cmf \
     --source-index /root/dsv41/hf/model.safetensors.index.json \
     --source-config /root/dsv41/hf/config.json
+
+A file converted with `--exclude-tensors` records its patterns in
+provenance.excluded_tensors; the gate fails it unless each pattern is named
+with `--allow-excluded` (the 1017 fp4 file: `--allow-excluded 'model.mtp.*'`).
 """
 
 from __future__ import annotations
@@ -362,6 +366,25 @@ def glob_match(pattern: str, name: str) -> bool:
     return re.fullmatch(regex, name, flags=re.DOTALL) is not None
 
 
+def parse_allowed(specs: list[str]) -> list[str]:
+    """`--allow-excluded` values: comma-separated patterns, repeatable."""
+    out: list[str] = []
+    for spec in specs:
+        for p in spec.split(","):
+            p = p.strip()
+            if not p:
+                raise CheckError(f"--allow-excluded {spec!r}: empty pattern")
+            if p not in out:
+                out.append(p)
+    return out
+
+
+def disallowed_exclusions(patterns: list[str], allowed: list[str]) -> list[str]:
+    """Patterns the file's provenance records that the caller did not allow:
+    the gate must not take the file's own word for what it may leave out."""
+    return [p for p in patterns if p not in allowed]
+
+
 def excluded_patterns(header: dict) -> list[str]:
     """`cortiq convert --exclude-tensors` patterns the file records."""
     provenance = header.get("provenance") or {}
@@ -570,6 +593,7 @@ def check_coverage(
     source_config: dict,
     weight_map: dict[str, str],
     dspark_policy: str,
+    allowed_excluded: list[str] | None = None,
 ) -> dict[str, int]:
     errors: list[str] = []
     expected, optional_dspark, omitted_scales = expected_names(weight_map)
@@ -582,6 +606,14 @@ def check_coverage(
     # Tensors the converter was told to leave out (`--exclude-tensors`,
     # recorded in the provenance) are not expected, and must not be present.
     patterns = excluded_patterns(artifacts[0].header)
+    not_allowed = disallowed_exclusions(patterns, allowed_excluded or [])
+    if not_allowed:
+        errors.append(
+            "the file's provenance excludes {} not allowed by --allow-excluded (pass "
+            "--allow-excluded '{}' when that is the intended file)".format(
+                ", ".join(repr(p) for p in not_allowed), ",".join(not_allowed)
+            )
+        )
     source_dspark = len(optional_dspark)
     excluded = {name for name in expected if any(glob_match(p, name) for p in patterns)}
     expected = {name: raw for name, raw in expected.items() if name not in excluded}
@@ -811,6 +843,18 @@ def self_test() -> None:
     assert not glob_match("model.mtp.?", "model.mtp.0")  # `?` is literal
     assert excluded_patterns({"provenance": {"excluded_tensors": ["model.mtp.*"]}}) == ["model.mtp.*"]
     assert excluded_patterns({"provenance": {}}) == []
+    assert parse_allowed(["model.mtp.*, lm_head.weight", "model.mtp.*"]) == [
+        "model.mtp.*",
+        "lm_head.weight",
+    ]
+    assert disallowed_exclusions(["model.mtp.*"], []) == ["model.mtp.*"]
+    assert disallowed_exclusions(["model.mtp.*"], ["model.mtp.*"]) == []
+    assert disallowed_exclusions(["model.*"], ["model.mtp.*"]) == ["model.*"]
+    try:
+        parse_allowed(["model.mtp.*,"])
+        raise AssertionError("an empty --allow-excluded pattern must be refused")
+    except CheckError:
+        pass
     print("self-test PASS: independent mapping and fixed payload formulas")
 
 
@@ -824,6 +868,15 @@ def main(argv: list[str]) -> int:
         choices=("match-source", "include", "exclude"),
         default="match-source",
         help="whether optional DSpark source tensors must be present (default: match-source)",
+    )
+    parser.add_argument(
+        "--allow-excluded",
+        action="append",
+        default=[],
+        metavar="PATTERNS",
+        help="exclusion patterns the file may record in provenance.excluded_tensors "
+        "(comma-separated, repeatable; default none: a file that excludes anything FAILS). "
+        "The 1017 fp4 file: --allow-excluded 'model.mtp.*'",
     )
     parser.add_argument("--self-test", action="store_true", help="run small pure-Python checks")
     args = parser.parse_args(argv)
@@ -842,7 +895,13 @@ def main(argv: list[str]) -> int:
         metadata_stats = check_metadata(artifacts[0].header, source_config, errors := [])
         if errors:
             raise CheckError("; ".join(errors))
-        stats = check_coverage(artifacts, source_config, weight_map, args.dspark_policy)
+        stats = check_coverage(
+            artifacts,
+            source_config,
+            weight_map,
+            args.dspark_policy,
+            parse_allowed(args.allow_excluded),
+        )
         stats.update(metadata_stats)
     except (OSError, json.JSONDecodeError, CheckError, struct.error) as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
