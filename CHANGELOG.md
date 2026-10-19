@@ -59,6 +59,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--hf-token` is not given. An anonymous 2-hour streamed conversion used to
   end on a single 429 for its last shard.
 
+### Performance
+- DeepSeek-V4.1 on a host whose RAM cannot hold the file: the routed experts are
+  advised `MADV_WILLNEED` right after the route (the kernel reads them with large
+  asynchronous requests instead of page by page) and the Engram tables
+  `MADV_RANDOM` (a row lookup no longer pulls a 128 KiB window into the page
+  cache). FP4 file, RTX PRO 6000, 188 GB RAM, one long-lived server, three
+  different 256-token answers: 16 GB budget 1.96 → 2.71 tok/s and 96 GB budget
+  2.58 → 3.61 tok/s, disk reads per token less than half. With every expert
+  already cached (one prompt repeated) the advice costs about 7 % (7.2 → 6.7
+  tok/s at 16 GB). `CMF_DSV41_WILLNEED=0` and `CMF_DSV41_ENGRAM_ADVISE=0` turn
+  them off.
+
 ### Fixed
 - `cortiq serve` with a DeepSeek-V4.1 file opens one slot: each slot built its
   own expert slot map over the single per-model GPU expert bank, so with
