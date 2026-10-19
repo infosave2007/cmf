@@ -669,7 +669,8 @@ mod tests {
     /// scale changes from group to group (adjacent groups always differ:
     /// the step is 7 or 8 mod 5), so a kernel that reads another group's
     /// scale byte fails the comparison instead of passing on a constant
-    /// plane.
+    /// plane. The scale plane depends on `seed` only mod 5: tensors whose
+    /// seeds agree mod 5 share it byte for byte (see [`scale_plane`]).
     fn payload(rows: usize, cols: usize, seed: usize) -> Vec<u8> {
         let codes: Vec<u8> = (0..rows * cols / 2)
             .map(|i| (i.wrapping_mul(2654435761).wrapping_add(seed * 977) >> 9) as u8)
@@ -678,6 +679,13 @@ mod tests {
             .map(|i| 119 + ((i * 7 + i / 3 + seed) % 5) as u8)
             .collect();
         cortiq_core::mxfp4::repack(&codes, &scales, rows, cols).unwrap()
+    }
+
+    /// The E8M0 scale bytes of a repacked `[rows, cols]` payload: they
+    /// follow the `rows · cols / 2` code bytes (the kernels' `rows · gpr ·
+    /// 16` byte offset).
+    fn scale_plane(p: &[u8], rows: usize, cols: usize) -> &[u8] {
+        &p[rows * cols / 2..]
     }
 
     fn act(n: usize, seed: usize) -> Vec<f32> {
@@ -736,20 +744,25 @@ mod tests {
     /// The device matvec and batched matvec against an f64 reference of the
     /// dequantized matrix (f32 summation noise only), the batch equal to the
     /// matvec per token bit for bit (one group walk, one reduction tree), and
-    /// a > 65535-row tensor through the two-dimensional grid. Run on macOS
-    /// with `CMF_GPU=wgpu` (wgpu over Metal); skips without an adapter.
+    /// a > 65535-row tensor through the two-dimensional grid. Selects wgpu
+    /// itself (wgpu over Metal on macOS; the convention is in
+    /// [`global_bank_case`]): skips without an adapter, fails when one is up
+    /// and the kernels are not.
     #[test]
     fn device_matvec_and_batch_match_the_reference() {
         unsafe { std::env::set_var("CMF_GPU", "wgpu") };
         let Some(c) = ctx() else {
-            eprintln!("no wgpu adapter — skipping mxfp4 device matvec test");
+            eprintln!("SKIPPED (mxfp4 device matvec): no wgpu adapter");
             return;
         };
         let _drain = Drain(c.device.clone());
-        if pipes(c).is_none() {
-            eprintln!("mxfp4 pipelines unavailable on this adapter — skipping");
-            return;
-        }
+        // An adapter is up: the per-op kernels need nothing optional, so a
+        // pipeline that did not build is a failure, not a skip.
+        assert!(
+            pipes(c).is_some(),
+            "mxfp4 per-op pipelines did not build on {}",
+            c.adapter_info.name
+        );
         eprintln!(
             "mxfp4 matvec on the device: {} ({:?})",
             c.adapter_info.name, c.adapter_info.backend
@@ -844,11 +857,13 @@ mod tests {
     /// row, so each lane of `dsv4_global_gate_up_mxfp4` walks 2-3 groups,
     /// and 72 per down row, so the down kernel's flat `slot · gpr + g` walk
     /// hands one lane groups of different slots (lane 10: slot 0 g10, slot
-    /// 1 g2, slot 1 g66, slot 2 g58). V4.1's SwiGLU limit 10. Eight slots
-    /// (150 MB) of bank.
+    /// 1 g2, slot 1 g66, slot 2 g58). V4.1's SwiGLU limit 10. Sixteen slots
+    /// (300 MB) of bank, two per S8 segment, so the slot offset inside a
+    /// segment (`local · mat16 / 2` words, codes and scales) is compared at
+    /// release size too; with one slot per segment it is always zero.
     #[test]
     fn global_bank_frame_runs_mxfp4_experts_at_release_geometry() {
-        global_bank_case("bank-1017", 5120, 2304, 10.0, 8, 0.01, Dsv41Segments::Auto);
+        global_bank_case("bank-1017", 5120, 2304, 10.0, 16, 0.01, Dsv41Segments::Auto);
     }
 
     /// One bank-frame comparison: four routed experts plus a shared one,
@@ -856,6 +871,22 @@ mod tests {
     /// last with a cold winner), bounded by `max_nrmse` and cos > 0.999
     /// against the host. `policy` is the V4.1 bank's segment policy; under
     /// `Eager16` the bank must come out S16.
+    ///
+    /// Every tensor of one role (gate, up, down) carries its own scale
+    /// plane and the bank holds two slots per segment, so a kernel that
+    /// reads the codes or the scales of another slot (e.g. the first slot
+    /// of its segment) fails. With seeds `10·e + k` all five experts shared
+    /// one plane per role (the plane depends on the seed mod 5) and that
+    /// mutation passed every case with unchanged numbers (M4).
+    ///
+    /// Device-test convention of this file: the lib test binary is one
+    /// process in which many GPU tests select wgpu themselves (`CMF_GPU`),
+    /// so `selected_and_up`/`skip_or_fail` cannot tell an explicit request
+    /// from a neighbour's `set_var` here (on a runner without an adapter
+    /// they would fail for the neighbour's sake). These tests select wgpu
+    /// themselves and skip only where no adapter comes up or the adapter
+    /// lacks the capability (descriptor indexing, S16); once an adapter
+    /// with the capability is up, a missing pipeline or bank FAILS.
     fn global_bank_case(
         tag: &str,
         dim: usize,
@@ -867,21 +898,33 @@ mod tests {
     ) {
         unsafe { std::env::set_var("CMF_GPU", "wgpu") };
         let Some(c) = ctx() else {
-            eprintln!("no wgpu adapter — skipping mxfp4 global bank test");
+            eprintln!("SKIPPED ({tag}): no wgpu adapter");
             return;
         };
         let _drain = Drain(c.device.clone());
-        if !dsv4_global_moe_supported() || global_pipes(c, DSV4_GLOBAL_MOE_SEGMENTS).is_none() {
-            eprintln!("descriptor-indexed global bank unavailable — skipping");
+        if !dsv4_global_moe_supported() {
+            eprintln!(
+                "SKIPPED ({tag}): {} has no descriptor-indexed global bank",
+                c.adapter_info.name
+            );
             return;
         }
+        assert!(
+            global_pipes(c, DSV4_GLOBAL_MOE_SEGMENTS).is_some(),
+            "{tag}: the q4tp/q2tp global bank pipelines built on {} but the mxfp4 S8 ones did not",
+            c.adapter_info.name
+        );
         let want_s16 = policy == Dsv41Segments::Eager16;
-        if want_s16
-            && !(c.dsv4_global_s16_capable
-                && global_pipes(c, DSV4_GLOBAL_MOE_SEGMENTS_S16).is_some())
-        {
-            eprintln!("S16 mxfp4 bank unavailable on this adapter — skipping");
-            return;
+        if want_s16 {
+            if !c.dsv4_global_s16_capable {
+                eprintln!("SKIPPED ({tag}): {} cannot run an S16 bank", c.adapter_info.name);
+                return;
+            }
+            assert!(
+                global_pipes(c, DSV4_GLOBAL_MOE_SEGMENTS_S16).is_some(),
+                "{tag}: {} is S16-capable but the mxfp4 S16 pipelines did not build",
+                c.adapter_info.name
+            );
         }
         eprintln!(
             "mxfp4 global bank {dim}x{inter} on the device: {} ({:?})",
@@ -903,10 +946,24 @@ mod tests {
                 ]
             })
             .collect();
+        // Seeds `11·e + k`: 11·e is e mod 5, so the five tensors of a role
+        // get five different scale planes (checked below).
         for (e, n) in names.iter().enumerate() {
-            tensors.push((n[0].as_str(), inter, dim, payload(inter, dim, 10 * e + 1)));
-            tensors.push((n[1].as_str(), inter, dim, payload(inter, dim, 10 * e + 2)));
-            tensors.push((n[2].as_str(), dim, inter, payload(dim, inter, 10 * e + 3)));
+            tensors.push((n[0].as_str(), inter, dim, payload(inter, dim, 11 * e + 1)));
+            tensors.push((n[1].as_str(), inter, dim, payload(inter, dim, 11 * e + 2)));
+            tensors.push((n[2].as_str(), dim, inter, payload(dim, inter, 11 * e + 3)));
+        }
+        for role in 0..3 {
+            let (rows, cols) = if role == 2 { (dim, inter) } else { (inter, dim) };
+            for a in 0..=n_exp {
+                for b in a + 1..=n_exp {
+                    assert_ne!(
+                        scale_plane(&tensors[3 * a + role].3, rows, cols),
+                        scale_plane(&tensors[3 * b + role].3, rows, cols),
+                        "{tag}: experts {a} and {b} share a role-{role} scale plane"
+                    );
+                }
+            }
         }
         let (model, dir) = model_with(tag, &tensors);
         let triples: Vec<(usize, usize, usize)> =
@@ -916,21 +973,29 @@ mod tests {
         let budget = dsv4_vram_budget().unwrap();
         let workspace = (budget / 10).clamp(2 * gib, 4 * gib);
         let request = (workspace / (2 * gu_len + d_len) as u64) as usize + extra_slots;
-        let Some((capacity, segment_slots)) = dsv41_global_moe_create_with_policy(
+        let made = dsv41_global_moe_create_with_policy(
             &model,
             request,
             inter,
             dim,
             MoeBankCodec::Mxfp4,
             policy,
-        ) else {
-            eprintln!("global mxfp4 bank could not be allocated here — skipping");
+        );
+        let Some((capacity, segment_slots)) = made else {
             let _ = std::fs::remove_dir_all(&dir);
-            return;
+            panic!(
+                "{tag}: no {request}-slot mxfp4 bank on {} (budget {budget} B)",
+                c.adapter_info.name
+            );
         };
         assert!(
             capacity >= 8 && capacity <= extra_slots,
             "capacity {capacity}"
+        );
+        assert!(
+            segment_slots >= 2,
+            "{tag}: {segment_slots} slot(s) per segment — a non-zero in-segment slot \
+             offset would go untested"
         );
         let segments = if want_s16 {
             DSV4_GLOBAL_MOE_SEGMENTS_S16
