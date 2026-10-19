@@ -7795,6 +7795,28 @@ fn cmd_patch_tensor(
     Ok(())
 }
 
+/// The `--exclude-tensors` patterns that left a declared MTP stack out of
+/// this file: the header keeps `arch.mtp` (the source's depth), so `info`
+/// asks whether the file holds `model.mtp.*` tensors and whether the
+/// recorded exclusion covers them. None when the file carries the stack or
+/// nothing in its provenance excluded it.
+fn mtp_excluded_by(model: &CmfModel) -> Option<String> {
+    if model.tensors.iter().any(|t| t.name.starts_with("model.mtp.")) {
+        return None;
+    }
+    let pats: Vec<&str> = model
+        .header
+        .provenance
+        .as_ref()?
+        .get("excluded_tensors")?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter(|p| crate::convert::glob_match(p, "model.mtp.0.norm.weight"))
+        .collect();
+    (!pats.is_empty()).then(|| format!("'{}'", pats.join(",")))
+}
+
 async fn cmd_info(model_path: &str, tensors: Option<&str>) -> anyhow::Result<()> {
     let model = CmfModel::open_sharded(model_path)?;
     let arch = model.arch();
@@ -7888,9 +7910,14 @@ async fn cmd_info(model_path: &str, tensors: Option<&str>) -> anyhow::Result<()>
     }
     println!(
         "  MTP:         {}",
-        match &arch.mtp {
-            Some(m) => format!("{} block(s), shared embed+lm_head", m.num_layers),
-            None => "—".to_string(),
+        match (&arch.mtp, mtp_excluded_by(&model)) {
+            (Some(m), Some(pats)) => format!(
+                "{} block(s) declared by the source, excluded from this file \
+                 (--exclude-tensors {pats})",
+                m.num_layers
+            ),
+            (Some(m), None) => format!("{} block(s), shared embed+lm_head", m.num_layers),
+            (None, _) => "—".to_string(),
         }
     );
     println!("  Sparse idx:  {} entries", model.sparse_index.len());
@@ -8511,10 +8538,17 @@ fn cmd_story(model_path: &str) -> anyhow::Result<()> {
         .collect();
     println!("{}.", parts.join(", "));
     if let Some(mtp) = &arch.mtp {
-        println!(
-            "I carry an MTP head ({} block) — I can speculatively speed up.",
-            mtp.num_layers
-        );
+        match mtp_excluded_by(&model) {
+            Some(pats) => println!(
+                "My source has an MTP head ({} block), but it was left out of this file \
+                 (--exclude-tensors {pats}): no speculative speed-up.",
+                mtp.num_layers
+            ),
+            None => println!(
+                "I carry an MTP head ({} block) — I can speculatively speed up.",
+                mtp.num_layers
+            ),
+        }
     }
 
     // ── Which skills I carry (swarm) ──
