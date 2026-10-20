@@ -134,4 +134,25 @@ grep -qiE "unknown key|too many fields|plan line" "$TMP/bad_train.log" || {
 conv 0.02
 grep -qi "floor" "$TMP/log0.02.txt" || { echo "FAIL: the floor was not reported"; exit 1; }
 
+# 5) the plan and the budget accounting land in the provenance
+python3 - "$TMP" <<'EOF'
+import json, pathlib, re, sys
+tmp = pathlib.Path(sys.argv[1])
+# the provenance rides in the container header; the blr report carries the
+# per-tensor ranks, and the converter prints the plan's own line
+log = (tmp / "plan.log").read_text()
+rep = (tmp / "plan.cmf.blr.txt").read_text().splitlines()
+assert rep, "no per-tensor report"
+plans = {}
+for line in rep:
+    m = re.match(r"^(model\.layers\.(\d+)\.\S*\.weight) P(\d) r(\d+)", line)
+    if m:
+        plans.setdefault(int(m.group(2)), {})[m.group(1)] = int(m.group(4))
+assert plans, "no per-tensor plan lines"
+# layer 1 has a bigger rank than layer 0 (the plan gave it 4.0 vs 2.0)
+r0 = [r for n, r in plans[0].items() if "mlp.gate_proj" in n][0]
+r1 = [r for n, r in plans[1].items() if "mlp.gate_proj" in n][0]
+assert r1 > r0, f"the plan did not reach the encoder: L0 r{r0} vs L1 r{r1}"
+EOF
+
 echo "OK: blr budget gate"

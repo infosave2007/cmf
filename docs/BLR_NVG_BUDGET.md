@@ -451,19 +451,32 @@ not optional at these budgets — see the price list in §7.
 | the frontier | the q2tp/q4tp arms at 2 and 4 bits | the **whole codec frontier** with two cliffs: the static 2-bit rule collapses (4270) while the data-aware 2-bit model is at 48.7; below 2 bits BLR is the only structure left |
 | the product | a script that reproduces the recipe | `--blr-plan` and `nvg-train --budget-plan`: the measured allocation is a file the tools read |
 
-**One correction the store forces.** The campaign's numbers are measured with
-the *non-sequential* calibration (every layer's Grams captured from the final
-model) and the teacher's weights as the encode target. The product's
-converter calibrates *sequentially* (each layer on the activations the layers
-below it actually produce) and encodes the model's own weights: the same
-1.0 bpw budget comes out at **672.52** instead of the 853.06 measured here.
-The protocol is therefore worth ~180 ppl — comparable to everything else in
-this article — and the absolute numbers below 1 bpw in this study are a
-*lower bound* on what the product's protocol would deliver at the same
-allocation. The allocation map itself is a statement about the *relative*
-value of a bit per layer and should carry over, but the honest thing is to
-re-measure the curve under the product protocol before the numbers go into a
-release note.
+**One correction the store forces — and one the campaign measures itself.**
+The published `nvg08s` (672.52 at 1.0 bpw) is the converter's own output:
+*sequential* calibration (each layer on the activations the layers below it
+actually produce) and the model's own weights as the encode target. This
+study used the *non-sequential* calibration (every layer's Grams captured from
+the final model) and the teacher's weights.
+
+Controlled comparison — same target (the teacher's weights), same 14848+3072
+calibration tokens, same byte count, only the protocol differs:
+
+| 0.55 bpw, the whole model | bytes | wiki ppl (4×512) |
+|---|---|---|
+| non-sequential (this study) | 324 440 878 | 1266.144 |
+| **sequential (the converter's protocol)** | 324 440 878 | **1257.555** |
+
+> The protocol is worth **8.6 ppl**, not the ~180 an uncontrolled comparison
+> against the published 1.0-bpw model suggested: that comparison mixed up the
+> protocol with the encode *target* and the calibration volume. The gap to
+> 672.52 is the *budget* and the target, not the protocol.
+
+And a consequence that matters for the product: **the sequential protocol
+forbids the model-level descent.** Changing one layer invalidates the Grams of
+every layer above it, so one trial costs a full re-conversion (40 min on the
+0.8B). In production the budget has to be decided *a priori* — by the formula
+of §5 — and the model-level descent is the instrument that validates it.
+
 
 ## 9. What became a product feature
 
