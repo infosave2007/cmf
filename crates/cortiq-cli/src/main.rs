@@ -514,8 +514,17 @@ enum Commands {
         sampling: Option<String>,
         /// `--quant blr`: target bits per weight of the layer projections
         /// (strict container count; embeddings/lm_head stay q8_2f, norms float).
+        /// Any value in (0, 16) is accepted: the rank rule turns it into a
+        /// per-tensor rank, and the report states what was delivered.
         #[arg(long = "bpw", visible_alias = "blr-bpw", default_value = "0.55")]
         blr_bpw: f64,
+        /// `--quant blr`: a bit-budget plan, one rule per line:
+        /// `layer <n> <bpw>` (every tensor of the layer) or
+        /// `tensor <name> <bpw>` (one tensor, wins over the layer rule).
+        /// `#` starts a comment. The global `--bpw` is the default for
+        /// everything the plan does not name.
+        #[arg(long = "blr-plan", value_name = "FILE")]
+        blr_plan: Option<String>,
         /// `--quant blr` encoder: `nvg` (data-aware, needs --calib; sequential
         /// per-layer calibration) or `dual-svid` (the data-free LittleBit
         /// initialiser, kept as the comparison baseline).
@@ -1060,6 +1069,27 @@ enum Commands {
         /// Resume from the latest state in this directory (same arguments)
         #[arg(long)]
         resume: Option<String>,
+        /// A bit-budget plan (`layer <n> <bpw>` / `tensor <name> <bpw>`): the
+        /// student's BLR tensors are re-encoded at the planned budget before
+        /// the training, with the teacher's weights as the encode target.
+        /// The layers the plan does not name keep their payloads.
+        #[arg(long, value_name = "FILE")]
+        budget_plan: Option<String>,
+        /// Directory with the cached input Grams of the re-encode
+        /// (`L{layer}.{lead}.{kind}.gram`); captured from the student otherwise.
+        #[arg(long, value_name = "DIR")]
+        budget_gram_cache: Option<String>,
+        /// The per-head row gauge (invE) on the re-encoded tensors.
+        #[arg(long)]
+        budget_rowweight: bool,
+        /// The re-encode's calibration tokens (FIT / SEL).
+        #[arg(long, default_value = "14848")]
+        budget_fit_tokens: usize,
+        #[arg(long, default_value = "3072")]
+        budget_sel_tokens: usize,
+        /// The device jobs of the re-encode.
+        #[arg(long, default_value = "3")]
+        budget_jobs: usize,
     },
     /// One tensor through the NVG `blr` encoder with a per-stage profile, on
     /// the CPU reference path and/or the device path, from Grams captured
@@ -3247,6 +3277,7 @@ async fn main() -> anyhow::Result<()> {
             mimo_towers,
             sampling,
             blr_bpw,
+            blr_plan,
             blr_method,
             calib,
             blr_kv_factor,
@@ -3307,8 +3338,18 @@ async fn main() -> anyhow::Result<()> {
                         .map(|n| n.get())
                         .unwrap_or(4)
                 });
+                let plan = match &blr_plan {
+                    Some(path) => {
+                        let text = std::fs::read_to_string(path)
+                            .map_err(|e| anyhow::anyhow!("--blr-plan {path}: {e}"))?;
+                        nvg::Plan::parse(&text)
+                            .map_err(|e| anyhow::anyhow!("--blr-plan {path}: {e}"))?
+                    }
+                    None => nvg::Plan::default(),
+                };
                 let opts = nvg::BlrOpts {
                     bpw: blr_bpw,
+                    plan,
                     method,
                     calib,
                     kv_factor: blr_kv_factor,
@@ -3636,6 +3677,12 @@ async fn main() -> anyhow::Result<()> {
             sign_state_every,
             sign_state_replace,
             resume,
+            budget_plan,
+            budget_gram_cache,
+            budget_rowweight,
+            budget_fit_tokens,
+            budget_sel_tokens,
+            budget_jobs,
         } => {
             let signs = if train_signs {
                 let opt = cortiq_engine::gpu_wgpu::train_sign::SignOpt::parse(&sign_opt).ok_or_else(|| anyhow::anyhow!("--sign-opt: fact | fact-mom | ref"))?;
@@ -3678,6 +3725,12 @@ async fn main() -> anyhow::Result<()> {
                 state_every: sign_state_every,
                 state_replace: sign_state_replace,
                 resume: resume.as_deref(),
+                budget_plan: budget_plan.as_deref(),
+                budget_gram_cache: budget_gram_cache.as_deref(),
+                budget_rowweight,
+                budget_fit_tokens,
+                budget_sel_tokens,
+                budget_jobs,
             })
         }
         #[cfg(not(feature = "gpu"))]
