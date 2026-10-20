@@ -5,9 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.8.24] - 2026-10-19
+## [0.8.25] - 2026-10-20
 
 ### Added
+- `--bpw` of the `blr` conversion accepts **any** value in `(0, 16)` — the
+  budget is a design space, not a preset. The delivered budget is now
+  *reported*: the rank moves in steps of 8, so the payload lands within one
+  rank step below the request, and a request below the container's own floor
+  (rank 8 plus the 16-bit row and column scales — 1.625 bpw for a 32×32
+  tensor) is reported as unspendable instead of being silently overspent.
+- `--blr-plan FILE`: a **bit-budget plan** — `layer <n> <bpw>` for a whole
+  layer, `tensor <name> <bpw>` for one tensor (the tensor rule wins), the
+  global `--bpw` for everything else. A malformed rule is an error, never a
+  silent fallback: an ignored plan would spend the wrong bytes. The plan, the
+  requested budget and the count of clipped tensors land in `provenance.blr`.
+- `cortiq nvg-train --budget-plan FILE`: the plan is applied **before** the
+  training — the planned layers are re-encoded (the teacher's weights as the
+  encode target, the student's own input Grams as the calibration) and the
+  sign training then optimizes the metric of the re-planned payloads. The
+  budget of a pole layer no longer has to be extracted after the fact.
+  `--budget-gram-cache DIR` reuses the cached Grams
+  (`L{layer}.{lead}.{kind}.gram`), `--budget-rowweight` applies the per-head
+  row gauge to the re-encoded tensors.
+- `docs/BLR_NVG_BUDGET.md`: the measured budget study behind the above — the
+  degradation law `Δnll ∝ B^−1.25` (R² = 0.834) on Qwen3.5-0.8B, the
+  non-monotone damage, the sign-trained pole layer that a *plain* 1.5-bpw
+  encode beats, the allocation by marginal value per byte (−300.7 ppl wiki and
+  −343.9 c4 at the same bytes), the composition problem (the per-layer winners
+  are not the best model), and the negative result that no local weight/Gram
+  metric predicts the end-to-end damage (|r| ≤ 0.4 over 12 predictors).
 - Native FP4: the `mxfp4` tensor dtype (id 21; OCP MX FP4 — E2M1 codes plus
   an E8M0 scale per 32 weights, 4.25 bits per weight). `convert --quant mxfp4`
   and `--tensor-quant PATTERN=mxfp4` quantize floats by the OCP rule;
@@ -58,6 +84,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default 30 minutes), and read `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` when
   `--hf-token` is not given. An anonymous 2-hour streamed conversion used to
   end on a single 429 for its last shard.
+- `nvg-bench --layer` accepts the encode target (`NVG_BENCH_W_FROM`), the
+  per-head row gauge (`NVG_BENCH_ROWWEIGHT=invE`) and a payload dump
+  (`NVG_BENCH_DUMP_DIR`); `NVG_BENCH_CAPTURE_ONLY=1` captures the Grams and
+  stops (the capture is a CPU forward, so doing it up front keeps the device
+  sweep free of CPU contention). The row gauge now covers the attention
+  `q`/`k`/`v` in GQA models (the head count was read from the kv heads).
 
 ### Performance
 - DeepSeek-V4.1 on a host whose RAM cannot hold the file: the routed experts are
