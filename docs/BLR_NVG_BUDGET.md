@@ -298,6 +298,33 @@ above, so a single trial costs a full re-conversion (40 min on the 0.8B). The
 budget has to be decided *a priori*, by the formula; the descent is the
 instrument that validates the formula.
 
+### The sequential trace is a trap: allocate from the isolated per-layer curve
+
+Three conversions in the converter's own protocol, the same average budget
+(0.55 bpw), the same 24 layers:
+
+| the plan | bytes | wiki (16×512) | c4 |
+|---|---|---|---|
+| uniform | 324 440 878 | 1616.861 | 1826.966 |
+| **from the isolated per-layer curve**: L0 1.5, L23 1.0, L7/L8/L10 0.1 | 324 588 334 | **995.050** | **1245.668** |
+| from the *cumulative* sequential trace: 12 layers at 1.0, 12 at 0.1 | 324 379 438 | 1757.635 | 2206.977 |
+
+The plan derived from the end-to-end trace is **worse than doing nothing**
+(1757.6 against 1616.9), while the plan from the isolated per-layer
+measurements is far better (995.1).
+
+> **The allocation must be computed from the isolated per-layer curve, not
+> from the sequential trace.** The cumulative trace mixes a layer's own error
+> with the damage it *passes on* to the layers above through the calibration: a
+> layer with a big cumulative increment may be a **victim** (its own budget is
+> fine; the stream above it was poisoned by the layers below) rather than a
+> cause. Starving a victim only makes it worse.
+
+This validates the campaign's original methodology (the isolated per-layer
+curve) *inside* the product's protocol, and it is the reason the product needs
+an a-priori plan: under the sequential protocol neither the model-level
+descent nor a plan derived from the end-to-end trace is available.
+
 ### The per-layer measurements do not compose
 
 The allocation above was measured **per layer** (one layer patched into the
