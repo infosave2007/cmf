@@ -1075,6 +1075,9 @@ pub struct Job<'a> {
     pub w: Mat,
     pub hc: &'a HCtxD,
     pub mult: f64,
+    /// The bit budget this tensor is encoded at (bits per weight). A plan
+    /// may give different tensors different budgets.
+    pub bpw: f64,
 }
 
 /// What [`encode_many`] reports per job: the encoding, its wall seconds and
@@ -1092,7 +1095,6 @@ pub struct Done {
 /// finishes; results come back in job order.
 pub fn encode_many(
     jobs: &[Job],
-    b: f64,
     choice: PathsChoice,
     threads: usize,
     njobs: usize,
@@ -1118,7 +1120,7 @@ pub fn encode_many(
                     let j = &jobs[i];
                     let prof = Prof::default();
                     let t = Instant::now();
-                    let enc = encode_nvg_dev(Some(&pool), &j.w, j.hc, b, j.mult, choice, profile.then_some(&prof));
+                    let enc = encode_nvg_dev(Some(&pool), &j.w, j.hc, j.bpw, j.mult, choice, profile.then_some(&prof));
                     let done = Done { enc, secs: t.elapsed().as_secs_f64(), prof: profile.then(|| prof.line()) };
                     on_done(i, &done);
                     out.lock().unwrap()[i] = Some(done);

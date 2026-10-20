@@ -66,15 +66,64 @@ pub fn blr_bits(d_out: usize, d_in: usize, r: usize, paths: usize) -> u64 {
 /// weight, times `mult` (the K/V factor) before rounding, floored to a
 /// multiple of 8, at least 8 and at most `min(d_out, d_in)` rounded down to 8.
 pub fn blr_rank(d_out: usize, d_in: usize, b: f64, paths: usize, mult: f64) -> usize {
+    let raw = blr_rank_raw(d_out, d_in, b, paths, mult);
+    let cap = (d_out.min(d_in) / 8) * 8;
+    (raw.max(8.0) as usize).min(cap.max(8))
+}
+
+/// The rank the budget asks for, before the floor (8) and the shape cap:
+/// the float `r*` of the budget rule, floored to a multiple of 8.
+/// `blr_rank` is this value clipped into `[8, min(d_out, d_in)]`.
+pub fn blr_rank_raw(d_out: usize, d_in: usize, b: f64, paths: usize, mult: f64) -> f64 {
     let (m, n) = (d_out as f64, d_in as f64);
     let s = if paths == 2 {
         (b * m * n - 32.0 * (m + n)) / (2.0 * (m + n + 16.0))
     } else {
         (b * m * n - 16.0 * (m + n)) / (m + n + 16.0)
     };
-    let r = ((s * mult / 8.0).floor() * 8.0).max(8.0) as usize;
+    (s * mult / 8.0).floor() * 8.0
+}
+
+/// Why the delivered rank differs from the request: the rank floor (8) or the
+/// shape cap (`min(d_out, d_in)`) clipped the rule's float rank. A clipped
+/// tensor gets *fewer* bits than requested — the budget cannot be spent.
+/// The floor also binds when the request sits exactly at it: the rank moves
+/// in steps of 8, so a request that lands on the floor is delivered exactly.
+pub fn blr_rank_clip(d_out: usize, d_in: usize, b: f64, paths: usize, mult: f64) -> &'static str {
+    let raw = blr_rank_raw(d_out, d_in, b, paths, mult);
     let cap = (d_out.min(d_in) / 8) * 8;
-    r.min(cap.max(8))
+    if raw <= 8.0 {
+        "floor"
+    } else if raw > cap as f64 {
+        "cap"
+    } else {
+        ""
+    }
+}
+
+/// The cost of one rank step (8 ranks) in bits per weight: the granularity a
+/// budget request is answered with. The delivered budget sits within one
+/// step of the request.
+pub fn blr_rank_step_bpw(d_out: usize, d_in: usize, paths: usize) -> f64 {
+    paths as f64 * (8.0 * (d_out + d_in) as f64 + 16.0 * 8.0) / (d_out * d_in) as f64
+}
+
+/// The bits a request of `b` bits per weight targets for a tensor of
+/// `d_out x d_in` at `paths` paths and the K/V factor `mult` — the rule's own
+/// target, before the rank is floored to a multiple of 8 and clipped to the
+/// shape. The delivered payload never costs more than this (the rank only
+/// moves down), and never less than the container's floor.
+pub fn blr_target_bits(d_out: usize, d_in: usize, b: f64, paths: usize, mult: f64) -> f64 {
+    let m = d_out as f64;
+    let n = d_in as f64;
+    let scale = if paths == 2 { 32.0 } else { 16.0 };
+    mult * (b * m * n - scale * (m + n)) + scale * (m + n)
+}
+
+/// The bits the container cannot go below: rank 8 plus the 16-bit row and
+/// column scales.
+pub fn blr_min_bits(d_out: usize, d_in: usize, paths: usize) -> u64 {
+    blr_bits(d_out, d_in, 8, paths)
 }
 
 /// Parse and sanity-check the 16-byte header (no length check).

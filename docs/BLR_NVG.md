@@ -200,11 +200,55 @@ MoE experts are not covered (they stay `q8_2f`); GDN `in_proj_a/b` stay f16.
 cortiq convert --model <hf dir> --quant blr --output m.cmf --bpw 1.0 \
     --blr-method nvg --calib calib.txt [--blr-paths auto|1|2] [--blr-kv-factor 1] \
     [--blr-fit-tokens 14848] [--blr-sel-tokens 3072] [--blr-rho 0.03] \
-    [--blr-threads N] [--blr-keep-src] [--blr-device auto|cpu|gpu]
+    [--blr-threads N] [--blr-keep-src] [--blr-device auto|cpu|gpu] [--blr-plan FILE]
 cortiq convert --model <hf dir> --quant blr --output m.cmf --bpw 1.0 --blr-method dual-svid
 cortiq nvg-bench --model m.cmf --tensor NAME | --layer L [--jobs J] --bpw 0.55 \
     --device cpu|gpu|both --gram-cache PREFIX --calib calib.txt
 ```
+
+### 5.1 The budget is a free number, and the plan refines it
+
+`--bpw` is any value in `(0, 16)`: the rank rule turns it into a per-tensor rank.
+`0.11`, `0.56`, `1.37` are as valid as `0.55`. The rule can only spend a budget
+*approximately*, and the report says what it delivered:
+
+* the rank moves in steps of 8, so the delivered budget sits within one rank
+  step **below** the request;
+* a request below the container's own floor (rank 8 plus the 16-bit row and
+  column scales) cannot be met at all — the floor is delivered and the tensor is
+  listed under "could not spend the requested budget";
+* the shape cap (`min(d_out, d_in)`) clips the other way: the tensor costs less
+  than asked.
+
+`--blr-plan FILE` gives the budget per layer and per tensor — the format the
+bit-allocation experiments produce, so a measured allocation can be replayed
+verbatim:
+
+```
+# a budget plan
+layer 0 1.0            # every tensor of layer 0
+layer 1 0.55
+tensor model.layers.0.mlp.down_proj.weight 0.11   # one tensor, wins over the layer rule
+```
+
+The global `--bpw` is the default for everything the plan does not name. A rule
+that cannot be honoured (unknown key, bad number, budget out of range) is an
+error — a silently ignored rule would spend the wrong bytes. The plan, the
+requested budget and the number of clipped tensors are recorded under
+`provenance.blr`; the per-tensor report (`<output>.blr.txt`) carries the rank
+and the path choice of every tensor.
+
+`cortiq nvg-train --budget-plan FILE` applies the plan **before** the
+training: the planned layers are re-encoded (the teacher's weights as the
+encode target, the student's own input Grams as the calibration — the same
+protocol the budget study measured) and the sign training then optimizes the
+metric of the re-planned payloads. The layers the plan does not name keep
+their payloads. `--budget-gram-cache DIR` reuses cached Grams
+(`L{layer}.{lead}.{kind}.gram`), `--budget-rowweight` applies the per-head row
+gauge to the re-encoded tensors.
+
+The budget study behind these knobs — the degradation law, the allocation and
+its measured effect — is in [BLR_NVG_BUDGET.md](BLR_NVG_BUDGET.md).
 
 `--blr-device auto` (default) encodes on the device when a wgpu adapter is up (not on
 macOS, whose Metal chunk graph runs layer spans out of the capture hook's sight).
@@ -227,6 +271,7 @@ cargo test --release -p cortiq-engine --features gpu --lib blr   # CPU kernels v
 cargo test --release -p cortiq-engine --features gpu --lib wgpu_blr_graph_throughput -- --ignored --nocapture
                                                                   # graph kernels at the 27B shapes, DRAM regime, device timestamps
 cargo test --release -p cortiq-cli --bin cortiq -- nvg convert_blr   # monotone ALS/refine, V-search factor, drivers, coverage, CLI parse
+bash tests/blr_budget_gate.sh                                     # free --bpw, the plan rules, the budget contract, a bad plan
 cargo test --release -p cortiq-engine --features gpu --lib nvg_dev   # GEMM variants, SPD solve + Uc, top-r eigenpairs vs a known spectrum
 cargo test --release -p cortiq-cli --bin cortiq -- nvg_gpu            # device vs host per stage: contexts/errors, latents/ITQ/polar,
                                                                       # one ALS sweep, flip_u, gptq_v, the whole-tensor driver
