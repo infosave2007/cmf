@@ -210,6 +210,27 @@ part of it). And left unconstrained the descent buys its quality with bytes:
 at 1.16 bpw it reaches 480.0, better than the *trained* 1.0-bpw model — the
 budget cap is what makes the comparison fair.
 
+### The allocated model, trained (0.8B, measured on the GPU box)
+
+The allocation and the training are complementary, and the combination is one
+command: `cortiq nvg-train --budget-plan FILE` re-encodes the planned layers
+and then trains the metric and the signs on top of them. On Qwen3.5-0.8B
+(1 M tokens, fact-mom):
+
+| model | body bpw | file | wiki (16×512) | c4 |
+|---|---|---|---|---|
+| NVG 1.0, no training | 0.989 | 336 MiB | 672.52 | 932.47 |
+| NVG 1.0 + metric training | 0.989 | 336 MiB | 135.76 | 182.0 |
+| NVG 1.0 + sign training | 0.989 | 336 MiB | **80.35** | 116.6 |
+| allocated 0.55, no training | 0.566 | 311 MiB | 901.49 | 1119.01 |
+| **allocated 0.55 + sign training** | **0.566** | **311 MiB** | **131.72** | **241.35** |
+
+The allocated-and-trained model at 0.566 bpw is **better than the trained
+1.0-bpw model with the metric alone (135.76) at 43 % less body** — and it
+gives up exactly the difference the sign training would have won (80.35) to
+the halved budget. So the allocation buys *almost twice the file* for about
+50 ppl, and the training then lands on top of whichever budget it is given.
+
 ### The per-layer measurements do not compose
 
 The allocation above was measured **per layer** (one layer patched into the
