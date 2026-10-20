@@ -263,6 +263,41 @@ Two readings, and they point in opposite directions:
   article's numbers are perplexities, and the KL is reported beside them, not
   instead of them.
 
+### In the product's own protocol the allocation is worth twice as much
+
+The converter calibrates *sequentially*: layer `l` is fitted on the activations
+the layers below it actually produce. Running that protocol end to end (the
+same driver, the same target — the teacher's weights — the same 14848+3072
+tokens) gives:
+
+| 0.55 bpw, the whole model | body bpw | bytes | wiki (16×512) | c4 |
+|---|---|---|---|---|
+| uniform, non-sequential (this study) | 0.545 | 324 440 878 | 1266.144 | 1500.364 |
+| uniform, **sequential (the converter's protocol)** | 0.545 | 324 440 878 | 1616.861 | 1826.966 |
+| allocated, non-sequential | 0.547 | 324 588 334 | 965.491 | 1156.508 |
+| **allocated, sequential** | **0.547** | 324 588 334 | **995.050** | **1245.668** |
+
+Two things fall out.
+
+**The sequential protocol punishes a badly served early layer twice.** Uniform
+0.55 is 350 ppl *worse* sequential than non-sequential: the layers above are
+calibrated on a stream that the badly-encoded layer 0 has already poisoned, so
+the calibration is wrong *and* the deployed stream is wrong. The allocation
+removes most of that penalty (1616.9 → 995.1) — which is why the allocation is
+worth **−622 ppl** in the product's protocol against **−301** in ours.
+
+**The reason is a compounding, and it is the real mechanism of the pole.** A
+layer's budget does two things: it sets that layer's own error, and it sets the
+calibration of every layer above it. At the pole the second effect dominates:
+layer 0 at 0.55 bpw costs 319 ppl on its own (739.9 → 420.7 when it gets 1.5
+bpw) and poisons the eleven layers above it besides.
+
+And a consequence for the product: **the sequential protocol forbids the
+model-level descent** — one changed layer invalidates the Grams of every layer
+above, so a single trial costs a full re-conversion (40 min on the 0.8B). The
+budget has to be decided *a priori*, by the formula; the descent is the
+instrument that validates the formula.
+
 ### The per-layer measurements do not compose
 
 The allocation above was measured **per layer** (one layer patched into the
