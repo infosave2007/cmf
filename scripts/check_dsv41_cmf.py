@@ -11,6 +11,10 @@ Example (after conversion):
     --model /root/dsv41/dsv41-q4tp.cmf \
     --source-index /root/dsv41/hf/model.safetensors.index.json \
     --source-config /root/dsv41/hf/config.json
+
+A file converted with `--exclude-tensors` records its patterns in
+provenance.excluded_tensors; the gate fails it unless each pattern is named
+with `--allow-excluded` (the 1017 fp4 file: `--allow-excluded 'model.mtp.*'`).
 """
 
 from __future__ import annotations
@@ -52,6 +56,8 @@ DTYPES = {
     14: "q1t",
     15: "q4tp",
     16: "q2tp",
+    # 17/18 are raw u32/u64 tables, 19 blr, 20 q1g (not emitted for V4.1).
+    21: "mxfp4",
 }
 SHARD_RE = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.cmf$")
 LAYER_RE = re.compile(r"^layers\.(\d+)\.(.*)$")
@@ -152,6 +158,11 @@ def expected_nbytes(dtype: str, shape: tuple[int, ...]) -> int | None:
         code_stride = (groups * 5 + 7) // 8
         nibble_bytes = 16 if dtype == "q4tp" else 8
         return rows * groups * nibble_bytes + rows * 4 + rows * code_stride
+    if dtype == "mxfp4" and len(shape) == 2 and shape[1] > 0:
+        # E2M1 code plane (n/2) + E8M0 scale plane (n/32), cols % 32 == 0.
+        if shape[1] % GROUP_SIZE:
+            return None
+        return n // 2 + n // GROUP_SIZE
     # vbit, q1s, q1t and reserved formats have self-describing or undefined
     # spans.  Bounds and the directory's own nbytes are still checked.
     return None
@@ -260,7 +271,7 @@ def parse_artifact(path: Path) -> Artifact:
                 raise CheckError(
                     f"{path}: tensor {name} {dtype}{shape} has {nbytes} bytes, expected {expected}"
                 )
-            if dtype in ("q4tp", "q2tp") and (len(shape) != 2 or shape[1] % GROUP_SIZE):
+            if dtype in ("q4tp", "q2tp", "mxfp4") and (len(shape) != 2 or shape[1] % GROUP_SIZE):
                 raise CheckError(f"{path}: {dtype} tensor {name} has invalid shape {shape}")
             entries.append(Entry(name, dtype, shape, off, nbytes, digest, path.name))
         header_hash, dir_hash = struct.unpack_from("<QQ", envelope, 0x70)
@@ -346,6 +357,41 @@ def canonical_name(raw: str) -> str | None:
     # V4.1 has no visual wrapper to drop. Preserve auxiliary source names
     # verbatim, matching the converter's final lfm2_canon fallback.
     return raw
+
+
+def glob_match(pattern: str, name: str) -> bool:
+    """The converter's `--tensor-quant` / `--exclude-tensors` glob: `*` is the
+    only wildcard and spans dots; every other character is literal."""
+    regex = ".*".join(re.escape(part) for part in pattern.split("*"))
+    return re.fullmatch(regex, name, flags=re.DOTALL) is not None
+
+
+def parse_allowed(specs: list[str]) -> list[str]:
+    """`--allow-excluded` values: comma-separated patterns, repeatable."""
+    out: list[str] = []
+    for spec in specs:
+        for p in spec.split(","):
+            p = p.strip()
+            if not p:
+                raise CheckError(f"--allow-excluded {spec!r}: empty pattern")
+            if p not in out:
+                out.append(p)
+    return out
+
+
+def disallowed_exclusions(patterns: list[str], allowed: list[str]) -> list[str]:
+    """Patterns the file's provenance records that the caller did not allow:
+    the gate must not take the file's own word for what it may leave out."""
+    return [p for p in patterns if p not in allowed]
+
+
+def excluded_patterns(header: dict) -> list[str]:
+    """`cortiq convert --exclude-tensors` patterns the file records."""
+    provenance = header.get("provenance") or {}
+    patterns = provenance.get("excluded_tensors") or []
+    if not isinstance(patterns, list) or not all(isinstance(p, str) and p for p in patterns):
+        raise CheckError(f"provenance.excluded_tensors is not a list of patterns: {patterns!r}")
+    return patterns
 
 
 def expected_names(weight_map: dict[str, str]) -> tuple[dict[str, str], set[str], int]:
@@ -547,6 +593,7 @@ def check_coverage(
     source_config: dict,
     weight_map: dict[str, str],
     dspark_policy: str,
+    allowed_excluded: list[str] | None = None,
 ) -> dict[str, int]:
     errors: list[str] = []
     expected, optional_dspark, omitted_scales = expected_names(weight_map)
@@ -556,6 +603,35 @@ def check_coverage(
         if entry.name in actual:
             errors.append(f"duplicate tensor across CMF shards: {entry.name}")
         actual[entry.name] = entry
+    # Tensors the converter was told to leave out (`--exclude-tensors`,
+    # recorded in the provenance) are not expected, and must not be present.
+    patterns = excluded_patterns(artifacts[0].header)
+    not_allowed = disallowed_exclusions(patterns, allowed_excluded or [])
+    if not_allowed:
+        errors.append(
+            "the file's provenance excludes {} not allowed by --allow-excluded (pass "
+            "--allow-excluded '{}' when that is the intended file)".format(
+                ", ".join(repr(p) for p in not_allowed), ",".join(not_allowed)
+            )
+        )
+    source_dspark = len(optional_dspark)
+    excluded = {name for name in expected if any(glob_match(p, name) for p in patterns)}
+    expected = {name: raw for name, raw in expected.items() if name not in excluded}
+    excluded_dspark = optional_dspark & excluded
+    optional_dspark = optional_dspark - excluded
+    if dspark_policy == "include" and excluded_dspark:
+        errors.append(
+            f"DSpark inclusion requested but the file excludes {len(excluded_dspark)} DSpark "
+            f"tensors (provenance.excluded_tensors={patterns})"
+        )
+    present_excluded = sorted(
+        name for name in actual if any(glob_match(p, name) for p in patterns)
+    )
+    if present_excluded:
+        errors.append(
+            f"CMF contains {len(present_excluded)} tensors its provenance excludes: "
+            f"{', '.join(present_excluded[:8])}"
+        )
     if dspark_policy == "exclude":
         expected = {name: raw for name, raw in expected.items() if name not in optional_dspark}
     expected_set = set(expected)
@@ -718,7 +794,9 @@ def check_coverage(
         "expected_entries": len(expected_set),
         "actual_entries": len(actual_set),
         "omitted_quant_scales": omitted_scales,
-        "dspark_entries": len(optional_dspark),
+        "dspark_entries": source_dspark,
+        "excluded_entries": len(excluded),
+        "excluded_patterns": patterns,
         "layers": n_layers,
         "experts_per_layer": n_experts,
         "full_inventory": int(full_inventory),
@@ -756,6 +834,27 @@ def self_test() -> None:
     assert canonical_name("layers.3.attn.wkv.scale") == "model.layers.3.self_attn.wkv.scale"
     assert expected_nbytes("q4tp", (8, 64)) == 8 * 2 * 16 + 8 * 4 + 8 * 2
     assert expected_nbytes("q2tp", (8, 64)) == 8 * 2 * 8 + 8 * 4 + 8 * 2
+    assert expected_nbytes("mxfp4", (2304, 5120)) == 2304 * 5120 * 17 // 32
+    assert expected_nbytes("mxfp4", (8, 48)) is None
+    assert glob_match("model.mtp.*", "model.mtp.0.ffn.experts.7.w1.weight")
+    assert glob_match("model.mtp.*", canonical_name("mtp.2.attn.wq_a.weight"))
+    assert not glob_match("model.mtp.*", "model.layers.3.mlp.experts.7.gate_proj.weight")
+    assert glob_match("model.layers.*.mlp.experts.*", "model.layers.3.mlp.experts.7.up_proj.weight")
+    assert not glob_match("model.mtp.?", "model.mtp.0")  # `?` is literal
+    assert excluded_patterns({"provenance": {"excluded_tensors": ["model.mtp.*"]}}) == ["model.mtp.*"]
+    assert excluded_patterns({"provenance": {}}) == []
+    assert parse_allowed(["model.mtp.*, lm_head.weight", "model.mtp.*"]) == [
+        "model.mtp.*",
+        "lm_head.weight",
+    ]
+    assert disallowed_exclusions(["model.mtp.*"], []) == ["model.mtp.*"]
+    assert disallowed_exclusions(["model.mtp.*"], ["model.mtp.*"]) == []
+    assert disallowed_exclusions(["model.*"], ["model.mtp.*"]) == ["model.*"]
+    try:
+        parse_allowed(["model.mtp.*,"])
+        raise AssertionError("an empty --allow-excluded pattern must be refused")
+    except CheckError:
+        pass
     print("self-test PASS: independent mapping and fixed payload formulas")
 
 
@@ -769,6 +868,15 @@ def main(argv: list[str]) -> int:
         choices=("match-source", "include", "exclude"),
         default="match-source",
         help="whether optional DSpark source tensors must be present (default: match-source)",
+    )
+    parser.add_argument(
+        "--allow-excluded",
+        action="append",
+        default=[],
+        metavar="PATTERNS",
+        help="exclusion patterns the file may record in provenance.excluded_tensors "
+        "(comma-separated, repeatable; default none: a file that excludes anything FAILS). "
+        "The 1017 fp4 file: --allow-excluded 'model.mtp.*'",
     )
     parser.add_argument("--self-test", action="store_true", help="run small pure-Python checks")
     args = parser.parse_args(argv)
@@ -787,7 +895,13 @@ def main(argv: list[str]) -> int:
         metadata_stats = check_metadata(artifacts[0].header, source_config, errors := [])
         if errors:
             raise CheckError("; ".join(errors))
-        stats = check_coverage(artifacts, source_config, weight_map, args.dspark_policy)
+        stats = check_coverage(
+            artifacts,
+            source_config,
+            weight_map,
+            args.dspark_policy,
+            parse_allowed(args.allow_excluded),
+        )
         stats.update(metadata_stats)
     except (OSError, json.JSONDecodeError, CheckError, struct.error) as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
@@ -812,6 +926,11 @@ def main(argv: list[str]) -> int:
             "native_window={rope_native_window}".format(**stats)
         )
     print(f"  DSpark policy: {args.dspark_policy}; source DSpark entries: {stats['dspark_entries']}")
+    if stats["excluded_patterns"]:
+        print(
+            "  excluded by the file's provenance (--exclude-tensors {}): {} source-derived tensors; "
+            "none present".format(",".join(stats["excluded_patterns"]), stats["excluded_entries"])
+        )
     print("  CMF hashes/bounds, canonical coverage, metadata, Engram U8 geometry, and duplicates: PASS")
     return 0
 

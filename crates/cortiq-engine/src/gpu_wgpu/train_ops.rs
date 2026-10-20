@@ -96,6 +96,40 @@ fn swiglu_fwd(@builtin(global_invocation_id) g: vec3<u32>) {
     C[i] = a * sigm(a) * B[i];
 }
 
+// C = s·silu(min(A, L))·clamp(B, −L, L): a SwiGLU with DeepSeek's
+// `swiglu_limit` L (bits in pad0; ≤ 0 = no clamp) and an output scale s
+// (bits in pad1).
+@compute @workgroup_size(256)
+fn swiglu_lim_fwd(@builtin(global_invocation_id) g: vec3<u32>) {
+    let i = idx(g);
+    if (i >= p.n) { return; }
+    let lim = bitcast<f32>(p.pad0);
+    var a = A[i];
+    var b = B[i];
+    if (lim > 0.0) {
+        a = min(a, lim);
+        b = clamp(b, -lim, lim);
+    }
+    C[i] = bitcast<f32>(p.pad1) * a * sigm(a) * b;
+}
+
+// swiglu_lim_fwd with a weight per row of `pad2` elements, from DC:
+// C = s·DC[i / pad2]·silu(min(A, L))·clamp(B, −L, L) — DeepSeek's route
+// weight on an expert's down input.
+@compute @workgroup_size(256)
+fn swiglu_lim_rows_fwd(@builtin(global_invocation_id) g: vec3<u32>) {
+    let i = idx(g);
+    if (i >= p.n) { return; }
+    let lim = bitcast<f32>(p.pad0);
+    var a = A[i];
+    var b = B[i];
+    if (lim > 0.0) {
+        a = min(a, lim);
+        b = clamp(b, -lim, lim);
+    }
+    C[i] = bitcast<f32>(p.pad1) * DC[i / p.pad2] * a * sigm(a) * b;
+}
+
 @compute @workgroup_size(256)
 fn swiglu_bwd(@builtin(global_invocation_id) g: vec3<u32>) {
     let i = idx(g);
@@ -646,7 +680,7 @@ fn norm_mod(c: &Ctx) -> Option<&'static Mod> {
     module(c, "train_norm", NORM_SRC, &["rms_fwd", "rms_bwd", "rms_dw"])
 }
 fn elt_mod(c: &Ctx) -> Option<&'static Mod> {
-    module(c, "train_elt", ELT_SRC, &["swiglu_fwd", "swiglu_bwd", "gate_fwd", "gate_bwd", "add"])
+    module(c, "train_elt", ELT_SRC, &["swiglu_fwd", "swiglu_lim_fwd", "swiglu_lim_rows_fwd", "swiglu_bwd", "gate_fwd", "gate_bwd", "add"])
 }
 fn qkr_mod(c: &Ctx) -> Option<&'static Mod> {
     module(c, "train_qkr", QKR_SRC, &["qkr_fwd", "qkr_bwd", "qkr_dw"])
@@ -766,6 +800,23 @@ pub fn elt<'a>(c: &'a Ctx, op: &str, n: usize, a: &'a wgpu::Buffer, b: &'a wgpu:
         _ => return None,
     };
     Some(Disp { pipe: &m.p[key], uni: vec![n as u32, 0, 0, 0], bufs, grid: elt_fold(n) })
+}
+
+/// `C = scale·silu(min(A, limit))·clamp(B, −limit, limit)` over `n`
+/// elements (`limit ≤ 0`: no clamp) — the expert activation of DeepSeek's
+/// `swiglu_limit`, with an output scale for weighted rows.
+pub fn swiglu_lim<'a>(c: &'a Ctx, n: usize, a: &'a wgpu::Buffer, b: &'a wgpu::Buffer, cc: &'a wgpu::Buffer, limit: f32, scale: f32) -> Option<Disp<'a>> {
+    let m = elt_mod(c)?;
+    Some(Disp { pipe: &m.p["swiglu_lim_fwd"], uni: vec![n as u32, limit.to_bits(), scale.to_bits(), 0], bufs: vec![(1, a), (2, b), (3, cc)], grid: elt_fold(n) })
+}
+
+/// [`swiglu_lim`] with one weight per row of `width` elements:
+/// `C = scale·rw[row]·silu(min(A, limit))·clamp(B, −limit, limit)` — the
+/// route-weighted down input of a DeepSeek expert.
+#[allow(clippy::too_many_arguments)]
+pub fn swiglu_lim_rows<'a>(c: &'a Ctx, n: usize, a: &'a wgpu::Buffer, b: &'a wgpu::Buffer, cc: &'a wgpu::Buffer, rw: &'a wgpu::Buffer, width: usize, limit: f32, scale: f32) -> Option<Disp<'a>> {
+    let m = elt_mod(c)?;
+    Some(Disp { pipe: &m.p["swiglu_lim_rows_fwd"], uni: vec![n as u32, limit.to_bits(), scale.to_bits(), width.max(1) as u32], bufs: vec![(1, a), (2, b), (3, cc), (4, rw)], grid: elt_fold(n) })
 }
 
 /// Geometry of a per-head norm + RoPE.
@@ -1005,6 +1056,20 @@ mod tests {
     use super::*;
     use crate::fcd_ops::{attn_head_bwd, attn_head_fwd, rmsnorm_bwd, rmsnorm_fwd, rope_bwd, rope_fwd};
 
+    /// The elementwise module (with the clamped SwiGLU entry) parses and
+    /// validates without a device: one bad entry would break every kernel
+    /// of the module.
+    #[test]
+    fn elt_wgsl_validates() {
+        let module = wgpu::naga::front::wgsl::parse_str(ELT_SRC).expect("ELT_SRC must parse");
+        wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(), wgpu::naga::valid::Capabilities::all())
+            .validate(&module)
+            .expect("ELT_SRC must validate");
+        for e in ["swiglu_fwd", "swiglu_lim_fwd", "swiglu_bwd", "gate_fwd", "gate_bwd", "add"] {
+            assert!(module.entry_points.iter().any(|p| p.name == e), "entry {e}");
+        }
+    }
+
     fn rnd(n: usize, seed: u64, scale: f32) -> Vec<f32> {
         let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
         (0..n)
@@ -1062,6 +1127,26 @@ mod tests {
         rel("swiglu", &download(c, &bc, 4097).unwrap(), &want, 1e-6);
         let wda: Vec<f64> = (0..4097).map(|i| { let (a, s) = (a[i] as f64, sg(a[i] as f64)); dc[i] as f64 * b[i] as f64 * s * (1.0 + a * (1.0 - s)) }).collect();
         rel("swiglu da", &download(c, &bda, 4097).unwrap(), &wda, 1e-6);
+        // the clamped, scaled form (DeepSeek swiglu_limit), limit inside the data range
+        let (lim, s) = (1.5f32, 0.75f32);
+        let bl = zeros(c, 4097);
+        run(c, &[swiglu_lim(c, 4097, &ba, &bb, &bl, lim, s).unwrap()]);
+        let want: Vec<f64> = a
+            .iter()
+            .zip(&b)
+            .map(|(&a, &b)| {
+                let (a, b) = ((a as f64).min(lim as f64), (b as f64).clamp(-lim as f64, lim as f64));
+                s as f64 * a * sg(a) * b
+            })
+            .collect();
+        rel("swiglu_lim", &download(c, &bl, 4097).unwrap(), &want, 1e-6);
+        // the same with a weight per row (17 rows of 241, the route weights)
+        let (rows, width) = (17usize, 241usize);
+        let rw: Vec<f32> = rnd(rows, 7, 1.0).iter().map(|v| v.abs()).collect();
+        let (brw, blr) = (upload(c, &rw), zeros(c, rows * width));
+        run(c, &[swiglu_lim_rows(c, rows * width, &ba, &bb, &blr, &brw, width, lim, s).unwrap()]);
+        let want_r: Vec<f64> = (0..rows * width).map(|i| want[i] * rw[i / width] as f64).collect();
+        rel("swiglu_lim_rows", &download(c, &blr, rows * width).unwrap(), &want_r, 1e-6);
     }
 
     #[test]

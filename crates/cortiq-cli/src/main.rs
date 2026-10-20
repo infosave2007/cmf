@@ -401,10 +401,13 @@ enum Commands {
         /// or a hub repo id like `Qwen/Qwen2.5-0.5B-Instruct` (downloaded)
         #[arg(long)]
         model: String,
-        /// Quantization for 2-D weights: q8 | q8_2f | q4 | q4t | q4tp | q2tp | q1 | q1p | q1s | q1t | f16 | vbit | blr | auto.
+        /// Quantization for 2-D weights: q8 | q8_2f | q4 | q4t | q4tp | q2tp | q1 | q1p | q1s | q1t | f16 | vbit | mxfp4 | fp4 | blr | auto.
         /// Default (or `auto`): q8, except MiMo-V2 (`mimo_v2`), which converts to
         /// q4tp experts with a q8_2f skeleton. `blr` = binary low-rank layer
         /// projections at `--bpw` (encoder `--blr-method`, docs/BLR_NVG.md).
+        /// `fp4` = MoE experts as OCP MXFP4 (`mxfp4`, byte-identical to a
+        /// DeepSeek-V4/V4.1 FP4 source), the rest as the q4tp profile
+        /// (docs/FP4_NATIVE.md); `mxfp4` = every matrix in MXFP4.
         #[arg(long)]
         quant: Option<String>,
         /// Output .cmf path
@@ -429,6 +432,22 @@ enum Commands {
         /// head at 8 bits; `--tensor-quant 'model.layers.*.mlp.down_proj.weight=q8_2f'`.
         #[arg(long = "tensor-quant", value_name = "PATTERN=QUANT")]
         tensor_quant: Vec<String>,
+        /// Leave tensors out of the file: comma-separated globs over the
+        /// CANONICAL output tensor names (repeatable; `*` is the only
+        /// wildcard and spans dots). A source tensor whose canonical name
+        /// matches is never decoded or written, in every output
+        /// (`--also-output` included); a name only a split or a late rename
+        /// produces is dropped at the writer. The source index is checked
+        /// up front (a pattern matching nothing is flagged), the count and
+        /// source bytes left out are printed, and the patterns are recorded
+        /// in the header provenance (`excluded_tensors`); `--resume` must
+        /// repeat them. E.g. `--exclude-tensors 'model.mtp.*'` drops a
+        /// DeepSeek-V4/V4.1 MTP/DSpark stack (the V4.1 runtime never
+        /// executes it): the 1017 `--quant fp4` payload goes from 504.51 to
+        /// 496.96 GB (file ≈ 497.2 GB with its header), under Hugging Face's
+        /// 500 GB per-file limit.
+        #[arg(long = "exclude-tensors", value_name = "PATTERNS")]
+        exclude_tensors: Vec<String>,
         /// Continue a conversion that was interrupted. Keeps the payloads
         /// already in <output> and skips every source shard its manifest
         /// records as done — the download included, which is where a
@@ -884,15 +903,18 @@ enum Commands {
         #[arg(long)]
         q4tp_debias: bool,
     },
-    /// GPTQ for the experts of a Flash-Next-class MoE (qwen4_exp), routed
-    /// and shared: gate/up into q2tp, down into q4tp, on the GPU; the calibration file
+    /// GPTQ for the experts of a Flash-Next-class MoE (qwen4_exp) or of
+    /// DeepSeek-V4.1 (deepseek_v41), routed and shared: `--codec q2tp`
+    /// (gate/up q2tp, down q4tp) or `q4tp`, on the GPU; the calibration file
     /// (a q4tp CMF of the model) supplies the activations and every
     /// non-expert tensor, the original safetensors checkpoint the
     /// full-precision expert weights (fetched one layer at a time).
     QuantizeMoe {
         /// Calibration .cmf (q4tp of the same model)
         calib_model: String,
-        /// Original checkpoint on the Hub (e.g. Qwen/Qwen3.8-Flash-Next); HF_TOKEN from the environment
+        /// Original checkpoint: a Hub repo (e.g. Qwen/Qwen3.8-Flash-Next;
+        /// HF_TOKEN from the environment), or a local directory with its
+        /// index and shards (read in place, never deleted)
         #[arg(long)]
         hf: String,
         /// Calibration text, PATH or PATH=SHARE (repeatable)
@@ -902,7 +924,9 @@ enum Commands {
         tokens: usize,
         #[arg(long, default_value = "2048")]
         window: usize,
-        /// Layers captured per calibration pass (host RAM: ~6 KB per token per layer)
+        /// Layers captured per calibration pass (host RAM: 2·hidden bytes per
+        /// token per layer — ~5 KB Flash-Next, ~10 KB DeepSeek-V4.1; one pass
+        /// over all layers with --in-place)
         #[arg(long, default_value = "24")]
         layers_per_pass: usize,
         #[arg(long, default_value = "0.01")]
@@ -915,12 +939,20 @@ enum Commands {
         scratch: String,
         #[arg(long, default_value = "16")]
         threads: usize,
-        #[arg(long, required_unless_present = "patch_shared")]
+        #[arg(long, required_unless_present_any = ["patch_shared", "in_place"], conflicts_with = "in_place")]
         output: Option<String>,
         /// Re-encode only the shared experts of this existing quantize-moe
         /// output, in place (no --output file is written)
         #[arg(long)]
         patch_shared: Option<String>,
+        /// Expert layout: q2tp (gate/up q2tp, down q4tp) or q4tp (all q4tp)
+        #[arg(long, default_value = "q2tp")]
+        codec: String,
+        /// Rewrite the experts inside the calibration file itself, one layer
+        /// at a time, for disks that cannot hold the model twice (all layers
+        /// are captured in one pass first; q2tp slack is released on Linux)
+        #[arg(long, default_value_t = false)]
+        in_place: bool,
     },
     /// NVG Ť: light distillation training of a compressed model's metric
     /// (the h, ℓ, g scales of its binary low-rank tensors and every RMSNorm
@@ -3203,6 +3235,7 @@ async fn main() -> anyhow::Result<()> {
             hf_token,
             mean_bits,
             tensor_quant,
+            exclude_tensors,
             resume,
             defrag,
             o1,
@@ -3225,6 +3258,10 @@ async fn main() -> anyhow::Result<()> {
             blr_keep_src,
             blr_device,
         } => {
+            // The usual Hub token variables when --hf-token is absent: an
+            // anonymous multi-hundred-GB streamed conversion runs into the
+            // Hub's rate limit, and a token on the command line shows in ps.
+            let hf_token = hf_token.or_else(convert::hf_token_from_env);
             if quant
                 .as_deref()
                 .is_some_and(|q| q.eq_ignore_ascii_case("blr"))
@@ -3234,11 +3271,13 @@ async fn main() -> anyhow::Result<()> {
                         && !mtp_sidecar
                         && !dspark_sidecar
                         && tensor_quant.is_empty()
+                        && exclude_tensors.is_empty()
                         && !resume
                         && defrag.is_none()
                         && o1.is_none(),
                     "--quant blr runs its own encoder: --also-output, --mtp-sidecar, \
-                     --dspark-sidecar, --tensor-quant, --resume, --defrag and --o1 do not apply"
+                     --dspark-sidecar, --tensor-quant, --exclude-tensors, --resume, --defrag \
+                     and --o1 do not apply"
                 );
                 let method = match blr_method.to_ascii_lowercase().as_str() {
                     "nvg" => nvg::Method::Nvg,
@@ -3302,6 +3341,11 @@ async fn main() -> anyhow::Result<()> {
                 !dspark_sidecar || mimo_towers == "text",
                 "--mimo-towers cannot be combined with --dspark-sidecar"
             );
+            let exclude_tensors = convert::parse_tensor_exclusions(&exclude_tensors)?;
+            anyhow::ensure!(
+                exclude_tensors.is_empty() || !dspark_sidecar,
+                "--exclude-tensors cannot be combined with --dspark-sidecar (the sidecar is a fixed tensor set)"
+            );
             if dspark_sidecar {
                 let q = match quant.as_deref() {
                     None => "q8_2f",
@@ -3337,6 +3381,10 @@ async fn main() -> anyhow::Result<()> {
                 output
             };
             if mtp_sidecar && !qwen4_mtp {
+                anyhow::ensure!(
+                    exclude_tensors.is_empty(),
+                    "--exclude-tensors cannot be combined with --mtp-sidecar (the sidecar is a fixed tensor set)"
+                );
                 let q = match quant.as_deref() {
                     None => "q8_2f",
                     Some(q) if q.eq_ignore_ascii_case(convert::AUTO_QUANT) => "q8_2f",
@@ -3390,7 +3438,7 @@ async fn main() -> anyhow::Result<()> {
                     additional_output.to_string(),
                 ));
             }
-            convert::run_convert_multi_towers(
+            convert::run_convert_multi_excluding(
                 &model,
                 &outputs,
                 hf_token.as_deref(),
@@ -3398,6 +3446,7 @@ async fn main() -> anyhow::Result<()> {
                 o1_hint,
                 resume,
                 towers,
+                &exclude_tensors,
                 progress_reporter("converting"),
             )?;
             for (_, output) in &outputs {
@@ -3533,7 +3582,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         #[cfg(feature = "gpu")]
-        Commands::QuantizeMoe { calib_model, hf, calib, tokens, window, layers_per_pass, lambda, min_rows, scratch, threads, output, patch_shared } => {
+        Commands::QuantizeMoe { calib_model, hf, calib, tokens, window, layers_per_pass, lambda, min_rows, scratch, threads, output, patch_shared, codec, in_place } => {
             moegptq::run(&moegptq::MoeOpts {
                 calib_model: &calib_model,
                 hf: &hf,
@@ -3547,6 +3596,8 @@ async fn main() -> anyhow::Result<()> {
                 threads,
                 output: output.as_deref().unwrap_or(""),
                 patch_shared: patch_shared.as_deref(),
+                codec: &codec,
+                in_place,
             })
         }
         #[cfg(not(feature = "gpu"))]
@@ -5099,6 +5150,14 @@ async fn cmd_serve(
         // One worker holds ONE KV session; more slots would interleave
         // sequences into it. Loud, not silent.
         println!("    note: --peer forces 1 slot (the worker holds one KV session)");
+        slots = 1;
+    }
+    if slots != 1 && model.arch().arch_name == "deepseek_v41" {
+        // Every slot's pipeline builds its own expert slot map, but the
+        // GPU expert bank is one per model: two maps over the same
+        // physical slots would let one slot compute with an expert the
+        // other has just overwritten. One slot until the pool is shared.
+        println!("    note: deepseek_v41 serves with 1 slot (one GPU expert bank per model)");
         slots = 1;
     }
     if std::env::var("CMF_THREADS").is_err() {
@@ -7748,6 +7807,28 @@ fn cmd_patch_tensor(
     Ok(())
 }
 
+/// The `--exclude-tensors` patterns that left a declared MTP stack out of
+/// this file: the header keeps `arch.mtp` (the source's depth), so `info`
+/// asks whether the file holds `model.mtp.*` tensors and whether the
+/// recorded exclusion covers them. None when the file carries the stack or
+/// nothing in its provenance excluded it.
+fn mtp_excluded_by(model: &CmfModel) -> Option<String> {
+    if model.tensors.iter().any(|t| t.name.starts_with("model.mtp.")) {
+        return None;
+    }
+    let pats: Vec<&str> = model
+        .header
+        .provenance
+        .as_ref()?
+        .get("excluded_tensors")?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter(|p| crate::convert::glob_match(p, "model.mtp.0.norm.weight"))
+        .collect();
+    (!pats.is_empty()).then(|| format!("'{}'", pats.join(",")))
+}
+
 async fn cmd_info(model_path: &str, tensors: Option<&str>) -> anyhow::Result<()> {
     let model = CmfModel::open_sharded(model_path)?;
     let arch = model.arch();
@@ -7841,9 +7922,14 @@ async fn cmd_info(model_path: &str, tensors: Option<&str>) -> anyhow::Result<()>
     }
     println!(
         "  MTP:         {}",
-        match &arch.mtp {
-            Some(m) => format!("{} block(s), shared embed+lm_head", m.num_layers),
-            None => "—".to_string(),
+        match (&arch.mtp, mtp_excluded_by(&model)) {
+            (Some(m), Some(pats)) => format!(
+                "{} block(s) declared by the source, excluded from this file \
+                 (--exclude-tensors {pats})",
+                m.num_layers
+            ),
+            (Some(m), None) => format!("{} block(s), shared embed+lm_head", m.num_layers),
+            (None, _) => "—".to_string(),
         }
     );
     println!("  Sparse idx:  {} entries", model.sparse_index.len());
@@ -8464,10 +8550,17 @@ fn cmd_story(model_path: &str) -> anyhow::Result<()> {
         .collect();
     println!("{}.", parts.join(", "));
     if let Some(mtp) = &arch.mtp {
-        println!(
-            "I carry an MTP head ({} block) — I can speculatively speed up.",
-            mtp.num_layers
-        );
+        match mtp_excluded_by(&model) {
+            Some(pats) => println!(
+                "My source has an MTP head ({} block), but it was left out of this file \
+                 (--exclude-tensors {pats}): no speculative speed-up.",
+                mtp.num_layers
+            ),
+            None => println!(
+                "I carry an MTP head ({} block) — I can speculatively speed up.",
+                mtp.num_layers
+            ),
+        }
     }
 
     // ── Which skills I carry (swarm) ──
@@ -9668,6 +9761,27 @@ mod tests {
             }
             _ => panic!("wrong subcommand"),
         }
+    }
+
+    /// `quantize-moe --in-place` writes into the calibration file, so an
+    /// `--output` next to it is refused at parse time.
+    #[test]
+    fn moegptq_output_conflicts_with_in_place() {
+        let parse = |args: &'static [&'static str]| {
+            std::thread::Builder::new()
+                .name("quantize-moe-parser".into())
+                .stack_size(8 * 1024 * 1024)
+                .spawn(move || Cli::try_parse_from(args).map(|_| ()).map_err(|e| e.kind()))
+                .unwrap()
+                .join()
+                .unwrap()
+        };
+        let base = ["cortiq", "quantize-moe", "calib.cmf", "--hf", "src", "--calib", "c.txt"];
+        let with = |extra: &[&'static str]| -> &'static [&'static str] { Box::leak([&base[..], extra].concat().into_boxed_slice()) };
+        assert_eq!(parse(with(&["--in-place", "--output", "x.cmf"])), Err(clap::error::ErrorKind::ArgumentConflict));
+        assert_eq!(parse(with(&["--in-place"])), Ok(()));
+        assert_eq!(parse(with(&["--output", "x.cmf"])), Ok(()));
+        assert_eq!(parse(with(&[])), Err(clap::error::ErrorKind::MissingRequiredArgument));
     }
 
     #[test]
