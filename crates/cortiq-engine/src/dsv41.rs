@@ -735,7 +735,7 @@ fn splitmix64(mut x: u64) -> u64 {
 /// V4.1 architecture geometry. Arrays are deliberately kept in this cfg,
 /// because the source config is part of the converted model metadata and
 /// there is no safe way to infer sharing from a missing tensor alone.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Dsv41Cfg {
     pub dim: usize,
     pub n_heads: usize,
@@ -770,7 +770,9 @@ pub struct Dsv41Cfg {
     pub index_heads: usize,
     pub index_head_dim: usize,
     pub index_topk: usize,
-    pub candidate_source: usize,
+    /// Candidate pre-filtering source layer; `None` disables the two-level
+    /// top-k (`candidate_source_layer_id < 0` in the source config).
+    pub candidate_source: Option<usize>,
     pub candidate_topk_blocks: usize,
     pub candidate_block_size: usize,
     pub kv_sources: Vec<usize>,
@@ -802,6 +804,236 @@ impl Dsv41Cfg {
             .copied()
             .filter(|&s| s <= li)
             .max()
+    }
+
+    /// Parse the preserved source `config.json` (the whole multimodal
+    /// object, or its `text_config`) into the runtime geometry. `arch` only
+    /// supplies fallbacks for keys a compact config omits. Returns the
+    /// configuration and the backbone layer count.
+    pub fn from_source(
+        source: &serde_json::Value,
+        arch: &cortiq_core::ModelArch,
+    ) -> Result<(Self, usize), String> {
+        let tc = source.get("text_config").unwrap_or(source);
+        let usize_of = |key: &str, fallback: usize| {
+            tc.get(key)
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(fallback)
+        };
+        let f32_of = |key: &str, fallback: f32| {
+            tc.get(key)
+                .and_then(|v| v.as_f64())
+                .map(|v| v as f32)
+                .unwrap_or(fallback)
+        };
+        let usize_any = |keys: &[&str], fallback: usize| {
+            keys.iter()
+                .find_map(|key| tc.get(key).and_then(|v| v.as_u64()))
+                .map(|v| v as usize)
+                .unwrap_or(fallback)
+        };
+        let f32_any = |keys: &[&str], fallback: f32| {
+            keys.iter()
+                .find_map(|key| tc.get(key).and_then(|v| v.as_f64()))
+                .map(|v| v as f32)
+                .unwrap_or(fallback)
+        };
+        let bool_of = |key: &str, fallback: bool| {
+            tc.get(key).and_then(|v| v.as_bool()).unwrap_or(fallback)
+        };
+        let array_of = |key: &str| -> Vec<usize> {
+            tc.get(key)
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_u64().map(|x| x as usize))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let array_alias = |keys: &[&str]| -> Vec<usize> {
+            keys.iter()
+                .find_map(|key| {
+                    let values = array_of(key);
+                    (!values.is_empty()).then_some(values)
+                })
+                .unwrap_or_default()
+        };
+        let dim = usize_any(&["hidden_size", "dim"], arch.hidden_size);
+        let n_layers = usize_any(&["num_hidden_layers", "n_layers"], arch.num_layers);
+        let n_heads = usize_any(
+            &["num_attention_heads", "n_heads"],
+            arch.num_attention_heads,
+        );
+        let head_dim = usize_any(&["head_dim"], arch.head_dim);
+        let rope_head_dim = usize_any(&["rope_head_dim", "qk_rope_head_dim"], 64.min(head_dim));
+        let moe_inter = usize_any(
+            &[
+                "moe_intermediate_size",
+                "moe_inter_dim",
+                "intermediate_size",
+            ],
+            arch.intermediate_size,
+        );
+        let n_experts = usize_any(
+            &["n_routed_experts"],
+            arch.moe.as_ref().map(|m| m.num_experts).unwrap_or(384),
+        );
+        let top_k = usize_any(
+            &["num_experts_per_tok", "n_activated_experts"],
+            arch.moe.as_ref().map(|m| m.top_k).unwrap_or(6),
+        );
+        let mut ratios = array_of("compress_ratios");
+        if ratios.len() >= n_layers {
+            ratios.truncate(n_layers);
+        } else {
+            ratios = (0..n_layers)
+                .map(|li| {
+                    if (2..20).contains(&li) {
+                        2
+                    } else if (20..40).contains(&li) {
+                        1
+                    } else {
+                        0
+                    }
+                })
+                .collect();
+        }
+        let kv_sources = {
+            let a = array_alias(&["kv_source_layers", "kv_source_layer_ids"]);
+            if a.is_empty() { vec![2, 8, 14, 20] } else { a }
+        };
+        let index_sources = {
+            let a = array_alias(&["index_source_layers", "index_source_layer_ids"]);
+            if a.is_empty() {
+                vec![2, 8, 14, 20, 24, 28, 32, 36]
+            } else {
+                a
+            }
+        };
+        // The router: V4.1 scores experts with sqrt(softplus(logits)). The
+        // reference also implements softmax and sigmoid scoring; this runtime
+        // (CPU and the preweighted GPU bank) implements only sqrtsoftplus, so
+        // any other value is refused rather than routed with the wrong rule.
+        // An absent key is the release (and the reference default).
+        if let Some(func) = tc.get("scoring_func").or_else(|| tc.get("score_func")) {
+            if func.as_str() != Some("sqrtsoftplus") {
+                return Err(format!(
+                    "text_config.scoring_func = {func} is not supported; the DeepSeek-V4.1 \
+                     runtime implements only \"sqrtsoftplus\" routing (sqrt(softplus(logits)))"
+                ));
+            }
+        }
+        // `candidate_source_layer < 0 turns it off` (reference ModelArgs). An
+        // absent key keeps the release layer, like every other default here;
+        // a null one counts as absent (the other spelling is then read). An
+        // integral float (`20.0`, as some JSON writers emit) is an integer.
+        let candidate_source = match ["candidate_source_layer", "candidate_source_layer_id"]
+            .iter()
+            .find_map(|key| tc.get(*key).filter(|v| !v.is_null()).map(|v| (*key, v)))
+        {
+            None => Some(20),
+            Some((key, v)) => {
+                let layer = v.as_i64().or_else(|| {
+                    v.as_f64()
+                        .filter(|f| f.fract() == 0.0 && f.abs() < (1u64 << 53) as f64)
+                        .map(|f| f as i64)
+                });
+                match layer {
+                    Some(layer) if layer < 0 => None,
+                    Some(layer) => Some(layer as usize),
+                    None => {
+                        return Err(format!("text_config.{key} = {v} is not an integer"));
+                    }
+                }
+            }
+        };
+        let engram_layers = array_of("engram_layer_ids");
+        let engram_embeddings = array_of("engram_num_embeddings");
+        let cfg = Dsv41Cfg {
+            dim,
+            n_heads,
+            head_dim,
+            rope_head_dim: rope_head_dim.min(head_dim) & !1,
+            q_lora_rank: usize_of("q_lora_rank", 1280),
+            o_lora_rank: usize_of("o_lora_rank", 1024),
+            o_groups: usize_of("o_groups", 8),
+            hc_mult: usize_of("hc_mult", 4),
+            hc_sinkhorn_iters: usize_of("hc_sinkhorn_iters", 20),
+            hc_eps: f32_of("hc_eps", 1e-6),
+            norm_eps: f32_any(&["norm_eps", "rms_norm_eps"], arch.rms_norm_eps as f32),
+            n_routed_experts: n_experts,
+            top_k,
+            moe_inter,
+            gate_temp: f32_of("gate_temp", 1.0),
+            norm_topk_prob: bool_of("norm_topk_prob", true),
+            route_scale: f32_any(
+                &["routed_scaling_factor", "route_scale"],
+                arch.moe
+                    .as_ref()
+                    .and_then(|m| m.routed_scaling_factor)
+                    .unwrap_or(1.5),
+            ),
+            swiglu_limit: f32_of("swiglu_limit", 10.0),
+            window: usize_any(
+                &["window_size", "sliding_window"],
+                arch.sliding_window.unwrap_or(128),
+            ),
+            rope_theta: f32_any(&["rope_theta"], arch.rope_theta as f32),
+            compress_rope_theta: f32_any(&["compress_rope_theta"], 160_000.0),
+            rope_factor: f32_any(
+                &["rope_factor"],
+                tc.get("rope_scaling")
+                    .and_then(|v| v.get("factor"))
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as f32)
+                    .unwrap_or(16.0),
+            ),
+            original_seq_len: usize_any(
+                &["original_seq_len", "original_max_position_embeddings"],
+                tc.get("rope_scaling")
+                    .and_then(|v| v.get("original_max_position_embeddings"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(65_536),
+            ),
+            beta_fast: f32_any(
+                &["beta_fast"],
+                tc.get("rope_scaling")
+                    .and_then(|v| v.get("beta_fast"))
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as f32)
+                    .unwrap_or(32.0),
+            ),
+            beta_slow: f32_any(
+                &["beta_slow"],
+                tc.get("rope_scaling")
+                    .and_then(|v| v.get("beta_slow"))
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as f32)
+                    .unwrap_or(1.0),
+            ),
+            index_heads: usize_any(&["index_n_heads", "indexer_n_heads"], 32),
+            index_head_dim: usize_any(&["index_head_dim", "indexer_head_dim"], 128),
+            index_topk: usize_any(&["index_topk", "indexer_topk"], 512),
+            candidate_source,
+            candidate_topk_blocks: usize_any(&["candidate_topk_blocks"], 2048),
+            candidate_block_size: usize_any(&["candidate_block_size"], 8),
+            kv_sources,
+            index_sources,
+            compress_ratios: ratios,
+            engram_layers,
+            engram_vocab: usize_any(&["engram_vocab_size"], 16_000_000),
+            engram_embeddings,
+            engram_max_ngram: usize_any(&["engram_max_ngram_size"], 4),
+            engram_heads: usize_any(&["engram_n_heads"], 8),
+            engram_head_dim: usize_any(&["engram_head_dim"], 256),
+            engram_compressed_vocab: usize_any(&["engram_compressed_vocab_size"], 99_092),
+            engram_pad_id: usize_any(&["engram_pad_id", "engram_pad_token_id"], 2),
+            vocab: usize_any(&["vocab_size"], arch.vocab_size),
+        };
+        Ok((cfg, n_layers))
     }
 }
 
@@ -901,6 +1133,38 @@ pub struct Dsv41State {
     /// bounded by the GPU policy and cold experts complete on the host.
     #[cfg(feature = "gpu")]
     gpu_pool: Option<crate::qwen4_exp::QwenGpuPool>,
+    /// MoE calls the dynamic GPU expert bank served (diagnostics; survives
+    /// [`Dsv41State::clear`] like the bank).
+    #[cfg(feature = "gpu")]
+    gpu_moe_calls: u64,
+    /// GPTQ calibration capture (`cortiq quantize-moe`); `None` outside a
+    /// capture. Survives [`Dsv41State::clear`]: [`capture_window`] owns it.
+    pub moe_capture: Option<Dsv41MoeCapture>,
+}
+
+/// What a GPTQ calibration window records at layers `lo..hi`: every
+/// token's MoE input (the RMS-normed mHC fold that `moe` receives, the input
+/// of the routed experts and of the shared expert) and the experts its route
+/// selected. Routing is resolved on the host in both the CPU and the dynamic
+/// GPU MoE paths, so the record is taken before either runs.
+#[derive(Debug, Clone, Default)]
+pub struct Dsv41MoeCapture {
+    pub lo: usize,
+    pub hi: usize,
+    /// End each token after layer `hi - 1`. No layer reads state written by
+    /// a later layer (KV, index and candidate sources sit at or below their
+    /// consumers), so the captured rows are the same and the rest of the
+    /// stack and the head are skipped.
+    pub stop_after_hi: bool,
+    /// Per captured layer: `dim` f16 values per token.
+    pub x: Vec<Vec<u16>>,
+    /// Per captured layer: `top_k` routed expert ids per token, in route
+    /// order (`u16::MAX` pads a route cut short by non-finite scores).
+    pub picks: Vec<Vec<u16>>,
+    /// Per captured layer: the route weight of each pick (the factor the
+    /// expert's SwiGLU activation is multiplied by before `w2`, as in the
+    /// reference `Expert.forward`; 0 for a padded pick).
+    pub w: Vec<Vec<f32>>,
 }
 
 impl Dsv41State {
@@ -930,7 +1194,22 @@ impl Dsv41State {
             gpu_kv_id,
             #[cfg(feature = "gpu")]
             gpu_pool: None,
+            #[cfg(feature = "gpu")]
+            gpu_moe_calls: 0,
+            moe_capture: None,
         }
+    }
+
+    /// The dynamic GPU MoE as this state saw it: how many MoE calls the
+    /// device expert bank served, and the bank's codec (`q4tp`, `q2tp` or
+    /// `mxfp4`; None until a bank exists). Diagnostics for tests and
+    /// reports — counted with or without `CMF_DSV41_PROF`.
+    #[cfg(feature = "gpu")]
+    pub fn gpu_moe_stats(&self) -> (u64, Option<&'static str>) {
+        (
+            self.gpu_moe_calls,
+            self.gpu_pool.as_ref().map(|p| p.codec.label()),
+        )
     }
 
     pub fn clear(&mut self) {
@@ -1010,6 +1289,27 @@ fn gpu_attention_tail_enabled() -> bool {
         }
         live
     })
+}
+
+/// Test-only mutation of the device attention tail
+/// (`CMF_DSV41_TEST_MUTATE`): `sink` hands the frame zero attention sinks,
+/// `rope` shifts the position the frame's inverse RoPE uses by one (the
+/// host has already rotated the query unless `CMF_DSV41_FUSED_Q=1`). Each is
+/// a broken device path the GPU fixture's bound has to catch; see
+/// `tests/dsv41_fixture_gpu.rs`. Read once per process, and only in builds
+/// with debug assertions (`cargo test`'s default profile): a release binary
+/// never reads the variable, so a stray one cannot corrupt its output.
+#[cfg(feature = "gpu")]
+fn gpu_tail_mutation() -> Option<&'static str> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    static M: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let m = std::env::var("CMF_DSV41_TEST_MUTATE").ok()?;
+        matches!(m.as_str(), "sink" | "rope").then_some(m)
+    })
+    .as_deref()
 }
 
 /// One-shot stage capture for the V4.1 adapter repair. The frame reads the
@@ -1354,6 +1654,17 @@ pub fn load(
     for li in 0..n_layers {
         layers.push(load_layer(model, cfg, li)?);
     }
+    // The two Engram tables are ~203 GB of FP8 rows read ~48 rows a token.
+    // With the default read-around every row fault pulls a 128 KiB window
+    // and the table crowds the experts out of the page cache on hosts that
+    // cannot hold the whole file; random advice keeps a fault to its page.
+    // `CMF_DSV41_ENGRAM_ADVISE=0` keeps the kernel default.
+    if !cfg.engram_layers.is_empty()
+        && std::env::var("CMF_DSV41_ENGRAM_ADVISE").as_deref() != Ok("0")
+    {
+        let advised = crate::expert_store::advise_random(model, |n| n.contains(".engram.embed."));
+        tracing::debug!("deepseek_v41: MADV_RANDOM on {} MB of Engram rows", advised >> 20);
+    }
     let hash = if !cfg.engram_layers.is_empty() {
         Some(EngramHash::new(
             cfg.engram_layers.clone(),
@@ -1621,14 +1932,51 @@ fn fp4_inplace(v: &mut [f32], block: usize, e8m0_scale_fmt: bool) {
     }
 }
 
+/// `fast_log2_ceil` of the reference kernels: the biased exponent plus one
+/// when any mantissa bit is set. Exact for normal inputs, unlike a rounded
+/// `log2().ceil()` just above a power of two.
+#[inline]
+fn fast_log2_ceil(x: f32) -> i32 {
+    let bits = x.to_bits();
+    ((bits >> 23) & 0xff) as i32 - 127 + i32::from(bits & 0x7f_ffff != 0)
+}
+
+/// `act_quant(x, 32, "ue8m0", float8_e8m0fnu, inplace=True)`: per 32-value
+/// block, `s = 2^ceil(log2(max(amax, 1e-4) / 448))` (the kernel multiplies by
+/// the f32 constant 1/448), values quantized to E4M3FN (nearest-even,
+/// saturating) and dequantized, stored as BF16.
 fn fp8_activation_inplace(v: &mut [f32]) {
+    const FP8_MAX_INV: f32 = 1.0 / 448.0;
     for chunk in v.chunks_mut(32) {
-        let max = chunk.iter().map(|x| x.abs()).fold(1e-4f32, f32::max);
-        let scale = 2.0f32.powf((max / 448.0).log2().ceil());
+        let amax = chunk.iter().map(|x| x.abs()).fold(1e-4f32, f32::max);
+        let scale = f32::from_bits(((fast_log2_ceil(amax * FP8_MAX_INV) + 127) as u32) << 23);
         for x in chunk {
             *x = bf16_roundtrip(e4m3_round((*x / scale).clamp(-448.0, 448.0)) * scale);
         }
     }
+}
+
+/// `CMF_DSV41_O_FP8=1`: quantize the attention output to FP8 (E4M3, 32-value
+/// blocks, power-of-two scales) before the grouped `wo_a`, as the reference
+/// does since commit 4dd75a8b (`act_quant(o, ...)` before the einsum). Off
+/// by default until a run on the released weights shows its effect. Both
+/// tails apply it: the CPU tail here, the device frame with its
+/// `fp8_act_quant32` kernel (bit-identical to `fp8_activation_inplace`).
+fn v41_o_fp8_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_DSV41_O_FP8").is_ok_and(|value| value == "1"))
+}
+
+/// The attention output boundary before `wo_a`: the reference views `o` as
+/// `[groups, n_heads*head_dim/groups]` and quantizes the last axis in blocks
+/// of 32, so with a 32-multiple group width the blocks are contiguous runs
+/// of the flat output.
+fn quantize_attention_output(attended: &mut [f32], o_groups: usize) {
+    debug_assert!(
+        attended.len() % o_groups.max(1) == 0 && (attended.len() / o_groups.max(1)) % 32 == 0,
+        "act_quant(o) needs a 32-multiple group width"
+    );
+    fp8_activation_inplace(attended);
 }
 
 struct IndexResult {
@@ -1831,7 +2179,9 @@ fn attention(
         let comp_len = st.packed.main_rows(si);
         if comp_len > 0 {
             if let Some(ix) = &l.indexer {
-                let candidates = if li > cfg.candidate_source && !st.candidates.is_empty() {
+                let candidates = if cfg.candidate_source.is_some_and(|c| li > c)
+                    && !st.candidates.is_empty()
+                {
                     Some(st.candidates.as_slice())
                 } else {
                     None
@@ -1851,7 +2201,7 @@ fn attention(
                     pool,
                 );
                 trace_indices(st.pos, li, &result.picked);
-                if cfg.candidate_source == li {
+                if cfg.candidate_source == Some(li) {
                     st.candidates = candidate_blocks(
                         &result.scores,
                         cfg.candidate_topk_blocks,
@@ -1998,6 +2348,16 @@ fn attention(
         // buffer contract.
         let qn_in = fused_q.then_some(qr.as_slice());
         let q_in = q.as_deref();
+        let mutation = gpu_tail_mutation();
+        let sink: &[f32] = if mutation == Some("sink") {
+            // One stable zero buffer: the frame keys constants by address.
+            static ZERO: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+            let zero = ZERO.get_or_init(|| vec![0.0; 4096]);
+            &zero[..l.attn_sink.len().min(zero.len())]
+        } else {
+            &l.attn_sink
+        };
+        let frame_pos = st.pos + usize::from(mutation == Some("rope"));
         let gpu_ok = cache_ok
             && model.is_some_and(|model| {
                 let w = crate::gpu_wgpu::Dsv4AttnW {
@@ -2006,7 +2366,7 @@ fn attention(
                     wo_a: l.wo_a.model_idx().unwrap_or(usize::MAX),
                     wo_b: l.wo_b.model_idx().unwrap_or(usize::MAX),
                     q_norm: &l.q_norm,
-                    sink: &l.attn_sink,
+                    sink,
                 };
                 let g = crate::gpu_wgpu::Dsv4AttnGeom {
                     dim: cfg.dim,
@@ -2020,6 +2380,7 @@ fn attention(
                     scale: (cfg.head_dim as f32).powf(-0.5),
                     bf16: true,
                     q_rms: false,
+                    o_fp8: v41_o_fp8_enabled(),
                 };
                 crate::gpu_wgpu::dsv4_attn_frame(
                     &model,
@@ -2032,7 +2393,7 @@ fn attention(
                     li,
                     &idx32,
                     inv_freq,
-                    st.pos,
+                    frame_pos,
                     None,
                     &mut gpu_attended,
                 )
@@ -2104,6 +2465,9 @@ fn attention(
             true,
         );
         bf16_inplace(&mut attended[h * cfg.head_dim..(h + 1) * cfg.head_dim]);
+    }
+    if v41_o_fp8_enabled() {
+        quantize_attention_output(&mut attended, cfg.o_groups);
     }
     trace_stats("attended", st.pos, Some(li), &attended);
     if gpu_tail_tap().is_some_and(|tap| tap == "mid") {
@@ -2315,6 +2679,54 @@ fn dsv41_cold_experts_cpu(
     out
 }
 
+/// `MADV_WILLNEED` over the three projections of each routed expert, issued
+/// right after the route: on a host that cannot cache the whole file the
+/// kernel then reads every missing expert with large asynchronous requests
+/// while the layer runs, instead of the cold-expert matvecs and the bank
+/// fills faulting them in page by page (measured on an NVMe RAID that reads
+/// 7.7–12 GB/s directly: ~0.6 GB/s through faults). Advisory; resident pages
+/// cost a page-cache walk. `CMF_DSV41_WILLNEED=0` turns it off.
+fn will_need_experts(layer: &Dsv41Layer, picks: &[usize]) {
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("CMF_DSV41_WILLNEED").as_deref() != Ok("0")) {
+            return;
+        }
+        let page = 4096usize;
+        for &e in picks {
+            let Some(expert) = layer.experts.get(e) else {
+                continue;
+            };
+            for t in [&expert.w1, &expert.w3, &expert.w2] {
+                let (Some(model), Some(idx)) = (t.model_arc(), t.model_idx()) else {
+                    continue;
+                };
+                let Some(entry) = model.tensors.get(idx) else {
+                    continue;
+                };
+                let Some(abs) = model.entry_abs_offset(entry) else {
+                    continue;
+                };
+                let bytes = model.primary_bytes();
+                if abs + entry.nbytes as usize > bytes.len() {
+                    continue;
+                }
+                let base = bytes.as_ptr() as usize;
+                let s = (base + abs) & !(page - 1);
+                let end = base + abs + entry.nbytes as usize;
+                // SAFETY: a range inside the model's read-only mapping;
+                // MADV_WILLNEED only schedules read-ahead.
+                unsafe {
+                    libc::madvise(s as *mut libc::c_void, end - s, libc::MADV_WILLNEED);
+                }
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    let _ = (layer, picks);
+}
+
 /// Execute V4.1's host-resolved route through the shared DSV4 segmented
 /// global expert bank.  V4.1 routing stays on the host because its VL bias
 /// and sqrt-softplus rule differ from the generic shader route.  Forced ids
@@ -2353,17 +2765,36 @@ fn dynamic_moe_gpu(
         Some(model) => model,
         None => return false,
     };
-    let gu_q2 = first.w1.model_dtype() == Some(TensorDtype::Q2TiledP)
+    // `convert --quant fp4`: gate, up and down all mxfp4 (one bank codec).
+    let fp4 = [&first.w1, &first.w3, &first.w2]
+        .iter()
+        .all(|t| t.model_dtype() == Some(TensorDtype::Mxfp4));
+    let gu_q2 = !fp4
+        && first.w1.model_dtype() == Some(TensorDtype::Q2TiledP)
         && first.w3.model_dtype() == Some(TensorDtype::Q2TiledP);
-    if first.w2.model_dtype() != Some(TensorDtype::Q4TiledP) {
+    if !fp4 && first.w2.model_dtype() != Some(TensorDtype::Q4TiledP) {
         return false;
     }
     // The global bank has one gate/up layout and one down layout.  Refuse a
     // mixed or synthetic layer rather than reinterpreting a tensor's bytes.
-    let gu_dtype = if gu_q2 {
-        TensorDtype::Q2TiledP
+    let (gu_dtype, dn_dtype, codec) = if fp4 {
+        (
+            TensorDtype::Mxfp4,
+            TensorDtype::Mxfp4,
+            crate::gpu_wgpu::MoeBankCodec::Mxfp4,
+        )
+    } else if gu_q2 {
+        (
+            TensorDtype::Q2TiledP,
+            TensorDtype::Q4TiledP,
+            crate::gpu_wgpu::MoeBankCodec::Q2tpGateUp,
+        )
     } else {
-        TensorDtype::Q4TiledP
+        (
+            TensorDtype::Q4TiledP,
+            TensorDtype::Q4TiledP,
+            crate::gpu_wgpu::MoeBankCodec::Q4tp,
+        )
     };
     let same_layout = layer.experts.iter().all(|expert| {
         expert
@@ -2380,7 +2811,7 @@ fn dynamic_moe_gpu(
                 .is_some_and(|m| m.uid() == model.uid())
             && expert.w1.model_dtype() == Some(gu_dtype)
             && expert.w3.model_dtype() == Some(gu_dtype)
-            && expert.w2.model_dtype() == Some(TensorDtype::Q4TiledP)
+            && expert.w2.model_dtype() == Some(dn_dtype)
     });
     let shared_layout = layer
         .shared
@@ -2399,19 +2830,23 @@ fn dynamic_moe_gpu(
             .is_some_and(|m| m.uid() == model.uid())
         && layer.shared.w1.model_dtype() == Some(gu_dtype)
         && layer.shared.w3.model_dtype() == Some(gu_dtype)
-        && layer.shared.w2.model_dtype() == Some(TensorDtype::Q4TiledP);
+        && layer.shared.w2.model_dtype() == Some(dn_dtype);
     if !same_layout || !shared_layout || layer_index >= n_layers {
         return false;
     }
     if state.gpu_pool.is_none() {
-        state.gpu_pool = crate::qwen4_exp::QwenGpuPool::create_for_dsv41(
+        state.gpu_pool = crate::qwen4_exp::QwenGpuPool::create_for_dsv41_codec(
             &model,
             cfg.moe_inter,
             cfg.dim,
             n_layers,
             cfg.n_routed_experts,
-            gu_q2,
+            codec,
         );
+    }
+    // One bank, one codec: a layer stored differently stays on the host.
+    if state.gpu_pool.as_ref().is_some_and(|p| p.codec != codec) {
+        return false;
     }
     let (remap, shared_slot, segment_slots) = {
         let Some(gpu_pool) = state.gpu_pool.as_mut() else {
@@ -2536,12 +2971,11 @@ fn moe(
     } else {
         &l.gate_bias
     };
-    let mut scores = Vec::with_capacity(logits.len());
     let temperature = cfg.gate_temp.max(f32::MIN_POSITIVE);
-    for &v in &logits {
-        let v = v / temperature;
-        scores.push(if v > 20.0 { v } else { (1.0 + v.exp()).ln() }.sqrt());
-    }
+    let scores: Vec<f32> = logits
+        .iter()
+        .map(|&v| sqrt_softplus(v / temperature))
+        .collect();
     let mut shifted: Vec<f32> = scores
         .iter()
         .enumerate()
@@ -2564,15 +2998,28 @@ fn moe(
         shifted[i] = f32::NEG_INFINITY;
     }
     trace_moe(position, layer, image, &logits, &scores, bias, &picks);
-    let sum = picks.iter().map(|&i| scores[i]).sum::<f32>().max(1e-20);
+    will_need_experts(l, &picks);
+    // `weights /= weights.sum() + 1e-20` only when more than one expert is
+    // chosen (Gate.forward); the epsilon is not norm_eps.
+    let sum = picks.iter().map(|&i| scores[i]).sum::<f32>() + 1e-20;
     let mut mix_weights = vec![0.0f32; cfg.n_routed_experts];
-    if cfg.norm_topk_prob {
+    if cfg.norm_topk_prob && cfg.top_k > 1 {
         for &e in &picks {
             mix_weights[e] = scores[e] / sum * cfg.route_scale;
         }
     } else {
         for &e in &picks {
             mix_weights[e] = scores[e] * cfg.route_scale;
+        }
+    }
+    if let Some(cap) = state.moe_capture.as_mut() {
+        if (cap.lo..cap.hi).contains(&layer) {
+            let k = layer - cap.lo;
+            cap.x[k].extend(x[..cfg.dim].iter().map(|&v| cortiq_core::quant::f32_to_f16(v)));
+            cap.picks[k].extend(
+                (0..cfg.top_k).map(|j| picks.get(j).map_or(u16::MAX, |&e| e as u16)),
+            );
+            cap.w[k].extend((0..cfg.top_k).map(|j| picks.get(j).map_or(0.0, |&e| mix_weights[e])));
         }
     }
     #[cfg(feature = "gpu")]
@@ -2590,6 +3037,7 @@ fn moe(
         out,
     ) {
         prof::note_gpu_moe();
+        state.gpu_moe_calls += 1;
         return;
     }
     prof::note_cpu_moe();
@@ -2635,6 +3083,14 @@ fn moe(
     // MoE returns `y.type_as(x)` after accumulating routed and shared
     // branches in f32.
     bf16_inplace(out);
+}
+
+/// `F.softplus(x).sqrt()`: `log1p(exp(x))`, linear past torch's threshold
+/// of 20. `ln_1p` keeps strongly negative logits positive; `(1 + e^x).ln()`
+/// rounds them to an exact zero score below x ~ -17.
+#[inline]
+fn sqrt_softplus(v: f32) -> f32 {
+    if v > 20.0 { v } else { v.exp().ln_1p() }.sqrt()
 }
 
 fn hc_mixes(
@@ -2865,6 +3321,16 @@ fn forward_token_impl(
         pre_mix.copy_from_slice(&fp);
         trace_stats("block", position, Some(li), &h);
         trace_stats("pre", position, Some(li), &pre_mix);
+        if st
+            .moe_capture
+            .as_ref()
+            .is_some_and(|c| c.stop_after_hi && li + 1 >= c.hi)
+        {
+            // Calibration capture: nothing at or above `hi` is recorded.
+            logits.clear();
+            prof::add(&prof::TOTAL_NS, total_t0);
+            return;
+        }
     }
     let head_t0 = prof::start();
     let mut final_h = vec![0.0f32; cfg.dim];
@@ -2885,6 +3351,22 @@ fn forward_token_impl(
 /// Print the opt-in V4.1 stage profile from the CLI's normal completion path.
 pub fn profile_report() {
     prof::report();
+}
+
+/// The `CMF_DSV41_PROF` path counters, cumulative for the process:
+/// `(gpu_attn, gpu_attn_fallbacks, gpu_moe, cpu_moe)`. Zero unless the
+/// profile is on. For tests that must prove a device path ran: a refused
+/// device frame falls back to the host silently and still passes a numeric
+/// check.
+#[doc(hidden)]
+pub fn profile_counters() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        prof::GPU_ATTN_CALLS.load(Relaxed),
+        prof::GPU_ATTN_FALLBACKS.load(Relaxed),
+        prof::GPU_MOE_CALLS.load(Relaxed),
+        prof::CPU_MOE_CALLS.load(Relaxed),
+    )
 }
 
 pub fn forward_chunk(
@@ -2946,6 +3428,69 @@ pub fn forward_chunk_masked_with_embeddings(
             i + 1 == ids.len(),
         );
     }
+}
+
+/// GPTQ calibration capture (`cortiq quantize-moe`): `ids` as a fresh
+/// sequence from position 0, recording the MoE input rows and routed expert
+/// ids of layers `lo..hi` ([`Dsv41MoeCapture`]); each token stops after
+/// layer `hi - 1`. The sequence state is cleared before and after.
+#[allow(clippy::too_many_arguments)]
+pub fn capture_window(
+    globals: &Dsv41Globals,
+    layers: &[Dsv41Layer],
+    cfg: &Dsv41Cfg,
+    st: &mut Dsv41State,
+    ids: &[u32],
+    lo: usize,
+    hi: usize,
+    pool: Option<&Pool>,
+) -> Result<Dsv41MoeCapture, String> {
+    let hi = hi.min(layers.len());
+    if lo >= hi {
+        return Err(format!("capture range {lo}..{hi} is empty"));
+    }
+    if cfg.n_routed_experts > u16::MAX as usize {
+        return Err(format!("{} experts do not fit a u16 id", cfg.n_routed_experts));
+    }
+    st.clear();
+    st.moe_capture = Some(Dsv41MoeCapture {
+        lo,
+        hi,
+        stop_after_hi: true,
+        x: (lo..hi).map(|_| Vec::with_capacity(ids.len() * cfg.dim)).collect(),
+        picks: (lo..hi).map(|_| Vec::with_capacity(ids.len() * cfg.top_k)).collect(),
+        w: (lo..hi).map(|_| Vec::with_capacity(ids.len() * cfg.top_k)).collect(),
+    });
+    let mut logits = Vec::new();
+    for (pos, &id) in ids.iter().enumerate() {
+        forward_token_masked_with_embedding(
+            globals,
+            layers,
+            cfg,
+            st,
+            id,
+            pos,
+            true,
+            None,
+            pool,
+            &mut logits,
+            false,
+        );
+    }
+    let cap = st.moe_capture.take().unwrap_or_default();
+    st.clear();
+    for (k, ((x, p), w)) in cap.x.iter().zip(&cap.picks).zip(&cap.w).enumerate() {
+        if x.len() != ids.len() * cfg.dim || p.len() != ids.len() * cfg.top_k || w.len() != p.len() {
+            return Err(format!(
+                "layer {}: captured {} rows / {} routes for {} tokens",
+                lo + k,
+                x.len() / cfg.dim.max(1),
+                p.len() / cfg.top_k.max(1),
+                ids.len()
+            ));
+        }
+    }
+    Ok(cap)
 }
 
 /// Compact, row-addressable CSA2 global KV storage.
@@ -3274,6 +3819,335 @@ pub mod packed_kv {
 mod tests {
     use super::*;
 
+    /// A fallback-only arch: every value differs from the release, so a key
+    /// the parser fails to read from the source config shows up as a
+    /// mismatch instead of silently agreeing.
+    fn decoy_arch() -> cortiq_core::ModelArch {
+        serde_json::from_value(serde_json::json!({
+            "arch_name": "deepseek_v41",
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_layers": 3,
+            "num_attention_heads": 2,
+            "num_kv_heads": 1,
+            "head_dim": 4,
+            "vocab_size": 32,
+            "layer_types": ["FullAttention", "FullAttention", "FullAttention"],
+            "rms_norm_eps": 0.5,
+            "max_position_embeddings": 64,
+            "linear_conv_kernel_dim": 0,
+            "linear_num_key_heads": 0,
+            "linear_num_value_heads": 0,
+            "rope_theta": 7.0,
+            "sliding_window": 3,
+        }))
+        .unwrap()
+    }
+
+    fn release_1017_cfg() -> Dsv41Cfg {
+        let mut compress_ratios = vec![0, 0];
+        compress_ratios.extend(std::iter::repeat_n(2, 18));
+        compress_ratios.extend(std::iter::repeat_n(1, 20));
+        Dsv41Cfg {
+            dim: 5120,
+            n_heads: 64,
+            head_dim: 512,
+            rope_head_dim: 64,
+            q_lora_rank: 1280,
+            o_lora_rank: 1024,
+            o_groups: 8,
+            hc_mult: 4,
+            hc_sinkhorn_iters: 20,
+            hc_eps: 1e-6,
+            norm_eps: 1e-20,
+            n_routed_experts: 384,
+            top_k: 6,
+            moe_inter: 2304,
+            gate_temp: 1.0,
+            norm_topk_prob: true,
+            route_scale: 1.5,
+            swiglu_limit: 10.0,
+            window: 128,
+            rope_theta: 10_000.0,
+            compress_rope_theta: 160_000.0,
+            rope_factor: 16.0,
+            original_seq_len: 65_536,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            index_heads: 32,
+            index_head_dim: 128,
+            index_topk: 512,
+            candidate_source: Some(20),
+            candidate_topk_blocks: 2048,
+            candidate_block_size: 8,
+            kv_sources: vec![2, 8, 14, 20],
+            index_sources: vec![2, 8, 14, 20, 24, 28, 32, 36],
+            compress_ratios,
+            engram_layers: vec![1, 14],
+            engram_vocab: 16_000_000,
+            engram_embeddings: vec![384_006_168, 384_016_682],
+            engram_max_ngram: 4,
+            engram_heads: 8,
+            engram_head_dim: 256,
+            engram_compressed_vocab: 99_092,
+            engram_pad_id: 2,
+            vocab: 129_280,
+        }
+    }
+
+    /// The published DeepSeek-V4.1-Flash-1017 `config.json` (HF layout,
+    /// `text_config`) and its `inference/config.json` (flat ModelArgs keys)
+    /// both parse to the release geometry, independent of the arch
+    /// fallbacks. The expected values were checked against the parser as it
+    /// stood in cortiq 0.8.23.
+    #[test]
+    fn release_1017_configs_parse_to_release_geometry() {
+        let hf: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/dsv41/config_1017.json")).unwrap();
+        let flat: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/dsv41/inference_config_1017.json"
+        ))
+        .unwrap();
+        for (name, source) in [("config.json", &hf), ("inference/config.json", &flat)] {
+            let (cfg, n_layers) = Dsv41Cfg::from_source(source, &decoy_arch()).unwrap();
+            assert_eq!(n_layers, 40, "{name}");
+            assert_eq!(cfg, release_1017_cfg(), "{name}");
+        }
+    }
+
+    fn release_text_config() -> serde_json::Value {
+        let hf: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/dsv41/config_1017.json")).unwrap();
+        hf["text_config"].clone()
+    }
+
+    #[test]
+    fn scoring_func_other_than_sqrtsoftplus_is_refused() {
+        for key in ["scoring_func", "score_func"] {
+            for bad in [
+                serde_json::json!("softmax"),
+                serde_json::json!("sigmoid"),
+                serde_json::json!(1),
+            ] {
+                let mut tc = release_text_config();
+                tc.as_object_mut().unwrap().remove("scoring_func");
+                tc[key] = bad.clone();
+                let err = Dsv41Cfg::from_source(&tc, &decoy_arch()).unwrap_err();
+                assert!(
+                    err.contains("scoring_func") && err.contains("sqrtsoftplus"),
+                    "{key}={bad}: {err}"
+                );
+            }
+            let mut tc = release_text_config();
+            tc.as_object_mut().unwrap().remove("scoring_func");
+            tc[key] = serde_json::json!("sqrtsoftplus");
+            assert!(Dsv41Cfg::from_source(&tc, &decoy_arch()).is_ok(), "{key}");
+        }
+        let mut tc = release_text_config();
+        tc.as_object_mut().unwrap().remove("scoring_func");
+        assert!(Dsv41Cfg::from_source(&tc, &decoy_arch()).is_ok(), "absent");
+    }
+
+    #[test]
+    fn negative_candidate_source_disables_candidates() {
+        for key in ["candidate_source_layer_id", "candidate_source_layer"] {
+            let mut tc = release_text_config();
+            tc.as_object_mut()
+                .unwrap()
+                .remove("candidate_source_layer_id");
+            tc[key] = serde_json::json!(-1);
+            let (cfg, _) = Dsv41Cfg::from_source(&tc, &decoy_arch()).unwrap();
+            assert_eq!(cfg.candidate_source, None, "{key}");
+            tc[key] = serde_json::json!(7);
+            let (cfg, _) = Dsv41Cfg::from_source(&tc, &decoy_arch()).unwrap();
+            assert_eq!(cfg.candidate_source, Some(7), "{key}");
+            tc[key] = serde_json::json!("20");
+            assert!(Dsv41Cfg::from_source(&tc, &decoy_arch()).is_err(), "{key}");
+        }
+        let mut tc = release_text_config();
+        tc.as_object_mut()
+            .unwrap()
+            .remove("candidate_source_layer_id");
+        let (cfg, _) = Dsv41Cfg::from_source(&tc, &decoy_arch()).unwrap();
+        assert_eq!(cfg.candidate_source, Some(20), "absent keeps the release layer");
+    }
+
+    /// A null candidate key is skipped (the other spelling, or the release
+    /// default, applies); an integral float is an integer; a fractional one
+    /// or a string is refused with the key it came from.
+    #[test]
+    fn candidate_source_skips_null_and_accepts_integral_float() {
+        let with = |pairs: &[(&str, serde_json::Value)]| {
+            let mut tc = release_text_config();
+            let obj = tc.as_object_mut().unwrap();
+            obj.remove("candidate_source_layer_id");
+            for (k, v) in pairs {
+                obj.insert((*k).into(), v.clone());
+            }
+            Dsv41Cfg::from_source(&tc, &decoy_arch()).map(|(cfg, _)| cfg.candidate_source)
+        };
+        let null = serde_json::Value::Null;
+        assert_eq!(
+            with(&[("candidate_source_layer_id", serde_json::json!(20.0))]),
+            Ok(Some(20))
+        );
+        assert_eq!(
+            with(&[("candidate_source_layer", serde_json::json!(-1.0))]),
+            Ok(None)
+        );
+        assert_eq!(
+            with(&[
+                ("candidate_source_layer", null.clone()),
+                ("candidate_source_layer_id", serde_json::json!(7)),
+            ]),
+            Ok(Some(7)),
+            "a null first spelling falls through to the second"
+        );
+        assert_eq!(
+            with(&[("candidate_source_layer_id", null.clone())]),
+            Ok(Some(20)),
+            "null alone is absent"
+        );
+        for bad in [serde_json::json!(20.5), serde_json::json!("20")] {
+            let err = with(&[("candidate_source_layer_id", bad.clone())]).unwrap_err();
+            assert!(err.contains("candidate_source_layer_id"), "{bad}: {err}");
+        }
+        let err = with(&[("candidate_source_layer", serde_json::json!(1.5))]).unwrap_err();
+        assert!(
+            err.contains("text_config.candidate_source_layer ="),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn sqrt_softplus_keeps_negative_logits_positive() {
+        for x in [-40.0f32, -30.0, -17.5, -3.0, 0.0, 1.5, 19.9, 20.0, 25.0] {
+            let xd = x as f64;
+            let want = if xd > 20.0 { xd } else { xd.exp().ln_1p() }.sqrt();
+            let got = sqrt_softplus(x) as f64;
+            assert!(got > 0.0, "x={x}");
+            assert!((got - want).abs() <= want * 1e-6, "x={x}: {got} vs {want}");
+        }
+        // The old (1 + e^x).ln() form returned exactly zero here.
+        assert_eq!((1.0f32 + (-30.0f32).exp()).ln(), 0.0);
+    }
+
+    /// kernel.py `act_quant(..., inplace=True)` written out independently:
+    /// f64 arithmetic, an explicit E4M3FN grid with nearest-even ties, and
+    /// the bit-level `fast_log2_ceil`/`fast_pow2` scale.
+    fn act_quant_reference(block: &[f32]) -> Vec<f32> {
+        let amax = block.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-4);
+        let t = amax * (1.0f32 / 448.0);
+        let bits = t.to_bits();
+        let e = ((bits >> 23) & 0xff) as i32 - 127 + i32::from(bits & 0x7f_ffff != 0);
+        let s = 2f64.powi(e);
+        block
+            .iter()
+            .map(|&x| {
+                let v = (x as f64 / s).clamp(-448.0, 448.0);
+                let a = v.abs();
+                let q = if a == 0.0 {
+                    0.0
+                } else {
+                    let quantum = if a < 2f64.powi(-6) {
+                        2f64.powi(-9)
+                    } else {
+                        2f64.powi(((a.to_bits() >> 52) & 0x7ff) as i32 - 1023 - 3)
+                    };
+                    let n = a / quantum;
+                    let f = n.floor();
+                    let r = if n - f > 0.5 || (n - f == 0.5 && f % 2.0 != 0.0) {
+                        f + 1.0
+                    } else {
+                        f
+                    };
+                    (r * quantum).min(448.0)
+                };
+                let y = if v < 0.0 { -q } else { q } * s;
+                // `T.Cast(bf16, ...)`: the product is BF16-exact already.
+                assert_eq!(y as f32 as f64, y);
+                y as f32
+            })
+            .collect()
+    }
+
+    /// The act_quant(o) test set: 2000 random BF16 blocks and the edge
+    /// blocks listed inside. The last block is the nearest-even tie block.
+    fn act_quant_test_blocks() -> Vec<Vec<f32>> {
+        let mut state = 0x5EED_u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let mut blocks: Vec<Vec<f32>> = Vec::new();
+        // Random BF16 blocks over a wide dynamic range.
+        for _ in 0..2000 {
+            let exp = (next() % 40) as i32 - 30;
+            blocks.push(
+                (0..32)
+                    .map(|_| {
+                        let m = (next() % 65536) as f32 / 32768.0 - 1.0;
+                        bf16_roundtrip(m * 2f32.powi(exp))
+                    })
+                    .collect(),
+            );
+        }
+        // Edge blocks: all zeros (the 1e-4 amax floor), a signed zero, an
+        // exact 448*2^k maximum (scale boundary), a maximum one f32 ulp above
+        // it (where a rounded log2 picks the smaller scale), tiny values on
+        // the E4M3 subnormal grid, and exact nearest-even ties.
+        blocks.push(vec![0.0; 32]);
+        let mut b = vec![-0.0f32; 32];
+        b[3] = 1e-6;
+        blocks.push(b);
+        let mut b = vec![1.0f32; 32];
+        b[0] = 448.0 * 2f32.powi(-3);
+        blocks.push(b);
+        let mut b = vec![0.3f32; 32];
+        b[5] = f32::from_bits((448.0f32 * 2f32.powi(-10)).to_bits() + 1);
+        // 1.5 subnormal quanta at the correct scale 2^-9 (tie -> 2), but an
+        // exact 3 quanta at the 2^-10 a rounded log2 would choose.
+        b[7] = 3.0 * 2f32.powi(-19);
+        blocks.push(b);
+        let mut b: Vec<f32> = (0..32).map(|i| i as f32 * 2f32.powi(-17)).collect();
+        b[31] = 448.0 * 2f32.powi(-8);
+        blocks.push(b);
+        // With s = 1 (amax 448 / 2^0): 17 lies between 16 and 18 (tie ->
+        // 16), 19 between 18 and 20 (tie -> 20), 0.0068359375 = 3.5*2^-9.
+        let mut b = vec![17.0f32, 19.0, -17.0, 0.0068359375, 300.0, 448.0];
+        b.resize(32, 1.0);
+        blocks.push(b);
+        blocks
+    }
+
+    #[test]
+    fn fp8_activation_matches_kernel_act_quant() {
+        let blocks = act_quant_test_blocks();
+        for (i, block) in blocks.iter().enumerate() {
+            let mut got = block.clone();
+            fp8_activation_inplace(&mut got);
+            let want = act_quant_reference(block);
+            for (j, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(g.to_bits(), w.to_bits(), "block {i} value {j}: {g} vs {w}");
+            }
+        }
+        let tie = &blocks[blocks.len() - 1];
+        let mut q = tie.clone();
+        fp8_activation_inplace(&mut q);
+        assert_eq!(&q[..4], &[16.0, 20.0, -16.0, 4.0 * 2f32.powi(-9)]);
+    }
+
+    #[test]
+    fn attention_output_quantizes_per_32_block() {
+        // Two 64-wide groups: four independent blocks with their own scales.
+        let mut o: Vec<f32> = (0..128)
+            .map(|i| bf16_roundtrip(((i * 37 % 101) as f32 - 50.0) * 2f32.powi(-(i as i32 / 32) * 3)))
+            .collect();
+        let want: Vec<f32> = o.chunks(32).flat_map(act_quant_reference).collect();
+        quantize_attention_output(&mut o, 2);
+        assert_eq!(o, want);
+    }
+
     #[test]
     fn fp8_reference_points() {
         assert_eq!(fp8_e4m3(0), 0.0);
@@ -3312,6 +4186,107 @@ mod tests {
         assert_eq!(e4m3_round(272.0), 256.0);
         assert_eq!(e4m3_round(304.0), 320.0);
         assert_eq!(e4m3_round(432.0), 448.0);
+    }
+
+    /// The device `fp8_act_quant32` kernel (the V4.1 attention frame's
+    /// act_quant(o)) against the host quantizer, bit for bit: the reference
+    /// test set above, plus full-mantissa f32 blocks over the whole finite
+    /// range and the f32-underflow corner of the sign rule. The repo's GPU
+    /// test convention: skips unless `CMF_GPU` selects wgpu, fails when it
+    /// does and no context comes up, and with a context up a missing result
+    /// (module rejected, readback failed) is a failure, not a skip.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn fp8_act_quant32_device_matches_host_bits() {
+        match crate::gpu_wgpu::selected_and_up() {
+            None => {
+                crate::gpu_wgpu::skip_or_fail(module_path!());
+                return;
+            }
+            Some(false) => panic!("CMF_GPU selects wgpu but no wgpu context came up"),
+            Some(true) => {}
+        }
+        let mut blocks = act_quant_test_blocks();
+        let mut state = 0xF8A7_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 32) as u32
+        };
+        for _ in 0..2000 {
+            // A block exponent anywhere in the finite range, values up to 40
+            // binades below it (f32 subnormals included), any mantissa.
+            let top = (next() % 250) as i32 - 125;
+            blocks.push(
+                (0..32)
+                    .map(|_| {
+                        let e = (top - (next() % 40) as i32).clamp(-149, 126);
+                        let m = 1.0 + (next() & 0x7f_ffff) as f32 / 8_388_608.0;
+                        let v = m * 2f32.powi(e.max(-126)) * 2f32.powi((e + 126).min(0));
+                        if next() & 1 == 1 { -v } else { v }
+                    })
+                    .collect(),
+            );
+        }
+        // Scale 2^25: these negative values divide to an f32 subnormal (the
+        // host keeps the sign of the zero they round to) or underflow to an
+        // exact zero (the host returns +0); f32 subnormal inputs too.
+        let mut b = vec![0.0f32; 32];
+        b[0] = 448.0 * 2f32.powi(25);
+        for (i, v) in [
+            -2f32.powi(-126),
+            -2f32.powi(-124),
+            -3.0 * 2f32.powi(-127),
+            -2f32.powi(-125),
+            -1.5 * 2f32.powi(-125),
+            -5.0 * 2f32.powi(-149),
+            -f32::from_bits(0x007f_ffff),
+            1e-30,
+            -1e-30,
+            -0.0,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            b[i + 1] = v;
+        }
+        blocks.push(b);
+        // Scale 2^-5: f32 subnormal inputs divide to a nonzero quotient.
+        let mut b = vec![-f32::from_bits(3); 32];
+        b[0] = 14.0;
+        b[1] = f32::from_bits(1);
+        blocks.push(b);
+        let flat: Vec<f32> = blocks.iter().flatten().copied().collect();
+        let got = crate::gpu_wgpu::fp8_act::act_quant32_for_test(&flat).expect(
+            "wgpu is up but fp8_act_quant32 gave no result (module rejected or readback failed)",
+        );
+        let mut want = flat.clone();
+        fp8_activation_inplace(&mut want);
+        let mut bad = 0usize;
+        for (i, ((g, w), x)) in got.iter().zip(&want).zip(&flat).enumerate() {
+            if g.to_bits() != w.to_bits() {
+                if bad < 8 {
+                    eprintln!(
+                        "block {} value {}: x {x:e} ({:#010x}) device {g:e} ({:#010x}) host {w:e} ({:#010x})",
+                        i / 32,
+                        i % 32,
+                        x.to_bits(),
+                        g.to_bits(),
+                        w.to_bits()
+                    );
+                }
+                bad += 1;
+            }
+        }
+        eprintln!(
+            "fp8_act_quant32: {} blocks, {bad} values differ from the host",
+            blocks.len()
+        );
+        assert_eq!(
+            bad, 0,
+            "device act_quant(o) is not bit-identical to the host"
+        );
     }
 
     #[test]
@@ -3518,5 +4493,179 @@ mod tests {
         let mut compressed = vec![0.0; 16];
         fp4_inplace(&mut compressed, 16, false);
         assert_eq!(compressed, vec![0.0; 16]);
+    }
+
+    /// A tiny window-only V4.1 stack of f32 tensors (no compressor, indexer
+    /// or Engram): enough for the full per-token forward on the host.
+    fn tiny_stack(n_layers: usize) -> (Dsv41Globals, Vec<Dsv41Layer>, Dsv41Cfg) {
+        let cfg = Dsv41Cfg {
+            dim: 32,
+            n_heads: 2,
+            head_dim: 16,
+            rope_head_dim: 4,
+            q_lora_rank: 8,
+            o_lora_rank: 4,
+            o_groups: 2,
+            hc_mult: 2,
+            hc_sinkhorn_iters: 3,
+            hc_eps: 1e-6,
+            norm_eps: 1e-6,
+            n_routed_experts: 8,
+            top_k: 2,
+            moe_inter: 16,
+            gate_temp: 1.0,
+            norm_topk_prob: true,
+            route_scale: 1.5,
+            swiglu_limit: 10.0,
+            window: 8,
+            rope_theta: 10_000.0,
+            compress_rope_theta: 160_000.0,
+            rope_factor: 1.0,
+            original_seq_len: 64,
+            beta_fast: 32.0,
+            beta_slow: 1.0,
+            index_heads: 1,
+            index_head_dim: 32,
+            index_topk: 4,
+            candidate_source: None,
+            candidate_topk_blocks: 2,
+            candidate_block_size: 8,
+            kv_sources: Vec::new(),
+            index_sources: Vec::new(),
+            compress_ratios: vec![0; n_layers],
+            engram_layers: Vec::new(),
+            engram_vocab: 0,
+            engram_embeddings: Vec::new(),
+            engram_max_ngram: 4,
+            engram_heads: 1,
+            engram_head_dim: 16,
+            engram_compressed_vocab: 0,
+            engram_pad_id: 2,
+            vocab: 16,
+        };
+        let mut seed = 0x5eed_u64;
+        let mut rnd = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed = splitmix64(seed);
+                    ((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 2.0 * scale
+                })
+                .collect()
+        };
+        let q = |v: Vec<f32>, r: usize, c: usize| QTensor::from_f32(v, r, c);
+        let (d, hc) = (cfg.dim, cfg.hc_mult);
+        let mix_n = (2 + hc) * hc;
+        let globals = Dsv41Globals {
+            embed: q(rnd(cfg.vocab * d, 1.0), cfg.vocab, d),
+            norm: vec![1.0; d],
+            head: q(rnd(cfg.vocab * d, 0.3), cfg.vocab, d),
+            inv_freq_compress: vec![1.0, 0.01],
+            inv_freq_window: vec![1.0, 0.01],
+        };
+        let mut layers = Vec::new();
+        for _ in 0..n_layers {
+            let mut expert = |rnd: &mut dyn FnMut(usize, f32) -> Vec<f32>| Dsv41Expert {
+                w1: q(rnd(cfg.moe_inter * d, 0.4), cfg.moe_inter, d),
+                w2: q(rnd(d * cfg.moe_inter, 0.4), d, cfg.moe_inter),
+                w3: q(rnd(cfg.moe_inter * d, 0.4), cfg.moe_inter, d),
+            };
+            let experts = (0..cfg.n_routed_experts).map(|_| expert(&mut rnd)).collect();
+            let shared = expert(&mut rnd);
+            let per_group = cfg.n_heads * cfg.head_dim / cfg.o_groups;
+            layers.push(Dsv41Layer {
+                attn_norm: vec![1.0; d],
+                ffn_norm: vec![1.0; d],
+                wq_a: q(rnd(cfg.q_lora_rank * d, 0.4), cfg.q_lora_rank, d),
+                q_norm: vec![1.0; cfg.q_lora_rank],
+                wq_b: q(rnd(cfg.n_heads * cfg.head_dim * cfg.q_lora_rank, 0.4), cfg.n_heads * cfg.head_dim, cfg.q_lora_rank),
+                wkv: q(rnd(cfg.head_dim * d, 0.4), cfg.head_dim, d),
+                kv_norm: vec![1.0; cfg.head_dim],
+                wo_a: q(rnd(cfg.o_groups * cfg.o_lora_rank * per_group, 0.4), cfg.o_groups * cfg.o_lora_rank, per_group),
+                wo_b: q(rnd(d * cfg.o_groups * cfg.o_lora_rank, 0.4), d, cfg.o_groups * cfg.o_lora_rank),
+                attn_sink: vec![0.0; cfg.n_heads],
+                compressor: None,
+                indexer: None,
+                hc_attn_fn: rnd(mix_n * hc * d, 0.1),
+                hc_attn_base: rnd(mix_n, 0.5),
+                hc_attn_scale: [1.0, 1.0, 1.0],
+                hc_ffn_fn: rnd(mix_n * hc * d, 0.1),
+                hc_ffn_base: rnd(mix_n, 0.5),
+                hc_ffn_scale: [1.0, 1.0, 1.0],
+                gate: q(rnd(cfg.n_routed_experts * d, 1.0), cfg.n_routed_experts, d),
+                gate_bias: rnd(cfg.n_routed_experts, 0.2),
+                gate_bias_vl: None,
+                experts,
+                shared,
+                engram: None,
+                gpu_expert_ids: Vec::new(),
+                gpu_shared_ids: None,
+            });
+        }
+        (globals, layers, cfg)
+    }
+
+    /// The quantize-moe capture records the MoE input and the route of
+    /// every token at the captured layers through the real forward; ending
+    /// each token after the last captured layer leaves the record unchanged.
+    #[test]
+    fn moe_capture_records_inputs_and_routes() {
+        let (g, layers, cfg) = tiny_stack(3);
+        let ids: Vec<u32> = (0..13).map(|i| (i * 5 % 16) as u32).collect();
+        let mut st = Dsv41State::new(&cfg, None);
+        let cap = capture_window(&g, &layers, &cfg, &mut st, &ids, 1, 2, None).unwrap();
+        assert_eq!((cap.lo, cap.hi), (1, 2));
+        assert_eq!(cap.x.len(), 1);
+        assert_eq!(cap.x[0].len(), ids.len() * cfg.dim);
+        assert_eq!(cap.picks[0].len(), ids.len() * cfg.top_k);
+        assert!(st.moe_capture.is_none(), "the capture is handed back, not left on the state");
+
+        // the same record through the whole stack (no early stop)
+        st.clear();
+        st.moe_capture = Some(Dsv41MoeCapture {
+            lo: 0,
+            hi: 2,
+            stop_after_hi: false,
+            x: vec![Vec::new(); 2],
+            picks: vec![Vec::new(); 2],
+            w: vec![Vec::new(); 2],
+        });
+        let mut logits = Vec::new();
+        for (pos, &id) in ids.iter().enumerate() {
+            forward_token_masked_with_embedding(&g, &layers, &cfg, &mut st, id, pos, true, None, None, &mut logits, true);
+        }
+        assert_eq!(logits.len(), cfg.vocab, "a full forward still produces logits");
+        let full = st.moe_capture.take().unwrap();
+        assert_eq!(full.x[1], cap.x[0], "early stop changes no captured row");
+        assert_eq!(full.picks[1], cap.picks[0]);
+        assert_eq!(full.w[1], cap.w[0]);
+        assert_ne!(full.x[0], full.x[1], "layers capture their own inputs");
+
+        // the route is V4.1's: sqrt-softplus scores + bias, top-k, from the captured row
+        let l = &layers[1];
+        for t in 0..ids.len() {
+            let x: Vec<f32> = cap.x[0][t * cfg.dim..(t + 1) * cfg.dim]
+                .iter()
+                .map(|&h| cortiq_core::quant::f16_to_f32(h))
+                .collect();
+            let mut lg = vec![0f32; cfg.n_routed_experts];
+            l.gate.matvec(&x, &mut lg, None);
+            let mut sh: Vec<(f32, usize)> = lg
+                .iter()
+                .enumerate()
+                .map(|(e, &v)| ((1.0 + v.exp()).ln().sqrt() + l.gate_bias[e], e))
+                .collect();
+            sh.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            let want: Vec<u16> = sh[..cfg.top_k].iter().map(|&(_, e)| e as u16).collect();
+            assert_eq!(&cap.picks[0][t * cfg.top_k..(t + 1) * cfg.top_k], &want[..], "token {t}");
+            // route weights: the picks' scores normalised to route_scale
+            let sc: Vec<f32> = want.iter().map(|&e| (1.0 + lg[e as usize].exp()).ln().sqrt()).collect();
+            let sum: f32 = sc.iter().sum();
+            for (j, &v) in sc.iter().enumerate() {
+                let got = cap.w[0][t * cfg.top_k + j];
+                assert!((got - v / sum * cfg.route_scale).abs() <= 1e-5 * cfg.route_scale, "token {t} pick {j}: weight {got}");
+            }
+            let tot: f32 = cap.w[0][t * cfg.top_k..(t + 1) * cfg.top_k].iter().sum();
+            assert!((tot - cfg.route_scale).abs() < 1e-4, "token {t}: weights sum to {tot}");
+        }
     }
 }

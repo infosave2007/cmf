@@ -309,6 +309,7 @@ Numbering shared with `.vmfc` (ids are never reused):
 | 14 | `q1t`     | ✅ read/write — ternary `{−s, 0, +s}` base-3 tiles + per-row outlier overlay (~2.25 bpw + overlay) |
 | 15 | `q4tp`    | ✅ read/write — `q4_tiled` nibbles with the per-tile scale as a 5-bit rung on a per-row ladder (`--quant q4tp`, or `requant` in place) |
 | 20 | `q1g`     | ✅ read/write — 1-bit binary with ONE f16 scale per 128-group, sign and scale planes (1.125 bpw); lossless `requant --quant q1g` of a `q1` file whose tile scales agree per 128-group (Bonsai class), `requant --quant q1` back |
+| 21 | `mxfp4`   | ✅ read/write — OCP MX FP4: E2M1 codes + one E8M0 scale per 32 elements, code and scale planes (4.25 bpw); lossless re-pack of OCP MXFP4 checkpoints (DeepSeek-V4/V4.1 experts) by `convert --quant fp4` / `--tensor-quant PATTERN=mxfp4`, OCP-rule quantization of float sources |
 
 ### 3.2 Quant layouts (canon = `.vmfc`: "quants first, then scales")
 
@@ -382,6 +383,22 @@ Numbering shared with `.vmfc` (ids are never reused):
   tile scales differ unless `--allow-tol`, which accepts f16-rounding
   spreads (≤ `--tol`, default 2⁻⁸ relative) and stores the f16 nearest the
   mean of the four scales; `requant --quant q1` writes `q1` back exactly.
+- **`mxfp4`** (2-D only, `in % 32 == 0`; OCP Microscaling spec v1.0):
+  `[E2M1 codes: rows·in/2][E8M0 scales: rows·in/32]` — planes. Byte j of a
+  row's code plane holds elements 2j (LOW nibble) and 2j+1 (high nibble);
+  scale byte g of row r covers elements 32g..32g+32 of that row.
+  `w = E2M1(code)·2^(scale − 127)`: code bit 3 is the sign, bits 2..0 index
+  `{0, 0.5, 1, 1.5, 2, 3, 4, 6}` (1 sign, 2 exponent bits, 1 mantissa bit,
+  bias 1); scale byte 255 is NaN. Dequantization to f32 is exact (only a
+  scale ≥ 253 with a large code leaves f32's range). The two planes are
+  exactly the two tensors of an OCP MXFP4 checkpoint (DeepSeek-V4/V4.1 `I8`
+  expert weights `[rows, in/2]` + `F8_E8M0` scales `[rows, in/32]`), so a
+  writer re-packs such a source by concatenation, never through a float;
+  a writer refuses a source NaN scale. Encoders quantizing floats follow the
+  OCP rule: shared exponent `floor(log2(amax)) − 2` clamped to `[−127, 127]`
+  (an all-zero group gets scale byte 0, a non-finite group scale 255),
+  elements divided by `2^e`, rounded to nearest-even on the E2M1 grid and
+  saturated to ±6; zero is code 0.
 - **`q1s`** (2-D only, `in % 32 == 0`): a `q1` base (identical 6-byte
   tiles; outliers are EXCLUDED from the group scale) followed by a
   sparse high-precision overlay: `[u32 count]` then

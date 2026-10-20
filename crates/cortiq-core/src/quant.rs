@@ -732,6 +732,14 @@ pub fn expected_nbytes(dtype: TensorDtype, shape: &[usize]) -> Option<usize> {
             }
             (n / 8).checked_add((n / Q1G_GROUP).checked_mul(2)?)
         }
+        TensorDtype::Mxfp4 => {
+            // [E2M1 code plane n/2][E8M0 scale plane n/32] — 2-D only,
+            // whole 32-groups per row.
+            if shape.len() != 2 {
+                return None;
+            }
+            crate::mxfp4::nbytes(shape[0], shape[1])
+        }
         TensorDtype::Q4TiledP => {
             // [nibbles][row params][row-aligned 5-bit codes] — needs the
             // row count, so 2-D only (the encoder emits nothing else).
@@ -785,6 +793,7 @@ fn has_fixed_payload_size(dtype: TensorDtype) -> bool {
             | TensorDtype::Q2TiledP
             | TensorDtype::Q1
             | TensorDtype::Q1G
+            | TensorDtype::Mxfp4
             | TensorDtype::Q8_2f
             | TensorDtype::U8
             | TensorDtype::U32
@@ -825,6 +834,18 @@ pub fn validate_payload(dtype: TensorDtype, shape: &[usize], bytes: &[u8]) -> Re
             return Err(format!(
                 "q1g cols {} not a positive multiple of {Q1G_GROUP}",
                 shape[1]
+            ));
+        }
+    }
+    if dtype == TensorDtype::Mxfp4 {
+        if shape.len() != 2 {
+            return Err(format!("mxfp4 tensor must be 2-D, got {shape:?}"));
+        }
+        if shape[1] == 0 || shape[1] % crate::mxfp4::GROUP != 0 {
+            return Err(format!(
+                "mxfp4 cols {} not a positive multiple of {}",
+                shape[1],
+                crate::mxfp4::GROUP
             ));
         }
     }
@@ -1000,6 +1021,23 @@ pub fn dequant_tensor(entry: &TensorEntry, bytes: &[u8], dst: &mut [f32]) -> Res
             }
             dequant_q1g(bytes, entry.shape[0], entry.shape[1], dst);
         }
+        TensorDtype::Mxfp4 => {
+            let need = expected_nbytes(TensorDtype::Mxfp4, &entry.shape).ok_or_else(|| {
+                format!(
+                    "mxfp4 tensor '{}' must be 2-D with cols % {} == 0",
+                    entry.name,
+                    crate::mxfp4::GROUP
+                )
+            })?;
+            if bytes.len() < need {
+                return Err(format!(
+                    "mxfp4 tensor '{}': payload {} < {need} bytes",
+                    entry.name,
+                    bytes.len()
+                ));
+            }
+            crate::mxfp4::dequant(bytes, entry.shape[0], entry.shape[1], dst);
+        }
         TensorDtype::Q1S => dequant_q1s(bytes, dst),
         TensorDtype::Q1T => {
             if entry.shape.len() != 2 {
@@ -1060,6 +1098,8 @@ pub fn bytes_per_weight(dtype: TensorDtype) -> f32 {
         TensorDtype::Vbit | TensorDtype::VbitRo => 0.5,
         TensorDtype::Q1 => 0.1875, // 6 bytes per 32 weights
         TensorDtype::Q1G => 0.140_625, // 18 bytes per 128 weights
+        // 16 B of E2M1 codes + 1 E8M0 byte per 32 weights: 4.25 bits.
+        TensorDtype::Mxfp4 => 0.531_25,
         // q1 base + a small sparse f16 overlay (informational; the true
         // size is the stored span, which grows with the outlier budget).
         TensorDtype::Q1S => 0.3125,

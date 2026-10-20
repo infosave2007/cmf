@@ -126,6 +126,21 @@ pub enum TensorDtype {
     /// cols % 128 == 0 only.
     #[serde(rename = "q1g")]
     Q1G = 20,
+    /// OCP Microscaling MXFP4 (OCP MX v1.0): FP4 E2M1 elements (1 sign, 2
+    /// exponent, 1 mantissa bit, bias 1 — magnitudes {0, 0.5, 1, 1.5, 2,
+    /// 3, 4, 6}) with ONE E8M0 scale byte per 32 consecutive elements of a
+    /// row (scale `2^(e−127)`, `e = 255` is NaN). 4.25 bits/weight.
+    ///
+    /// `[codes: rows · cols/2][scales: rows · cols/32]` — two planes, like
+    /// `Q1G`. Byte `j` of a row's code plane holds elements `2j` (LOW
+    /// nibble) and `2j+1` (high nibble): the OCP/DeepSeek-V4 packing, so a
+    /// source checkpoint's FP4 `[rows, cols/2]` bytes and its E8M0
+    /// `[rows, cols/32]` scales ARE the two planes — a lossless re-pack is
+    /// a concatenation. A group's 16 code bytes are 16-byte aligned (the
+    /// plane starts at the payload start). 2-D tensors with
+    /// cols % 32 == 0 only.
+    #[serde(rename = "mxfp4")]
+    Mxfp4 = 21,
 }
 
 impl TensorDtype {
@@ -152,6 +167,7 @@ impl TensorDtype {
             18 => Self::U64,
             19 => Self::BinaryLowRank,
             20 => Self::Q1G,
+            21 => Self::Mxfp4,
             _ => return None,
         })
     }
@@ -190,6 +206,7 @@ impl TensorDtype {
             Self::U64 => "u64",
             Self::BinaryLowRank => "blr",
             Self::Q1G => "q1g",
+            Self::Mxfp4 => "mxfp4",
         }
     }
 
@@ -215,6 +232,7 @@ impl TensorDtype {
                 | Self::Q4TiledP
                 | Self::Q2TiledP
                 | Self::BinaryLowRank
+                | Self::Mxfp4
         )
     }
 }

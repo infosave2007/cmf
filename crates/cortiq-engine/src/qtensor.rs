@@ -20,6 +20,9 @@ use cortiq_core::{CmfModel, TensorDtype};
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 
+/// `mxfp4` (OCP MX FP4) CPU kernels.
+mod mxfp4;
+
 pub enum QTensor {
     F32 {
         data: Vec<f32>,
@@ -349,6 +352,19 @@ impl QTensor {
                 vbit_offsets: Vec::new(),
                 repack: Vec::new(),
             }),
+            // mxfp4: E2M1 codes + E8M0 scales straight from the mmap (the
+            // native FP4 expert codec; `qtensor::mxfp4`).
+            TensorDtype::Mxfp4 if cols % cortiq_core::mxfp4::GROUP == 0 => Ok(Self::Mapped {
+                model: model.clone(),
+                idx,
+                dtype: entry.dtype,
+                rows,
+                cols,
+                row_scale: Vec::new(),
+                col_field: Vec::new(),
+                vbit_offsets: Vec::new(),
+                repack: Vec::new(),
+            }),
             // q1t (ternary + outlier overlay): fused per-row dequant kernel
             // reads straight from mmap — a 12B q1t stays ~its file size in
             // RAM instead of dequantizing to ~48 GB of f32.
@@ -383,6 +399,24 @@ impl QTensor {
     /// back to per-tensor calls.
     pub fn is_blr(&self) -> bool {
         matches!(self, Self::Blr(_))
+    }
+
+    /// Memory-mapped `mxfp4` tensor? Like `blr`, it has no row-range kernel
+    /// in the fused multi-tensor jobs: those run it per tensor.
+    pub fn is_mxfp4(&self) -> bool {
+        matches!(
+            self,
+            Self::Mapped {
+                dtype: TensorDtype::Mxfp4,
+                ..
+            }
+        )
+    }
+
+    /// Codecs the fused multi-tensor jobs (`matvec_many`, the SwiGLU and
+    /// MoE row kernels) do not carry: they fall back to per-tensor calls.
+    fn per_tensor_only(&self) -> bool {
+        self.is_blr() || self.is_mxfp4()
     }
 
     /// (model, idx) of a `blr` tensor, for the wgpu graphs only (their
@@ -966,6 +1000,13 @@ impl QTensor {
                     }
                     return;
                 }
+                if *dtype == TensorDtype::Mxfp4 {
+                    mxfp4::Mx::new(self.quant_bytes(), self.rows(), cols).row_f32(r, dst);
+                    if crate::prism::is_inverse_embedding(model, &model.tensors[*idx].name) {
+                        crate::prism::inverse_embedding(model, dst);
+                    }
+                    return;
+                }
                 if *dtype == TensorDtype::Q1 {
                     let bytes = self.quant_bytes();
                     let gpr = cols / GROUP_SIZE;
@@ -1455,6 +1496,9 @@ impl QTensor {
                         TensorDtype::Q1T => {
                             q1t_matvec(self.quant_bytes(), &transformed, *rows, *cols, out, pool)
                         }
+                        TensorDtype::Mxfp4 => {
+                            mxfp4::matvec(self.quant_bytes(), &transformed, *rows, *cols, out, pool)
+                        }
                         TensorDtype::Vbit | TensorDtype::VbitRo => vbitmatvec(
                             self.quant_bytes(),
                             vbit_offsets,
@@ -1567,6 +1611,10 @@ impl QTensor {
                 }
                 if *dtype == TensorDtype::Q2TiledP {
                     q2tp_matvec(self.quant_bytes(), x, *rows, *cols, out, pool);
+                    return;
+                }
+                if *dtype == TensorDtype::Mxfp4 {
+                    self.mxfp4_matvec(x, out, pool);
                     return;
                 }
                 if *dtype == TensorDtype::Q1 || *dtype == TensorDtype::Q1G {
@@ -1854,6 +1902,16 @@ impl QTensor {
                         TensorDtype::Q1T => {
                             q1t_matvec2(self.quant_bytes(), &tx1, &tx2, *rows, *cols, o1, o2, pool)
                         }
+                        TensorDtype::Mxfp4 => mxfp4::matvec2(
+                            self.quant_bytes(),
+                            &tx1,
+                            &tx2,
+                            *rows,
+                            *cols,
+                            o1,
+                            o2,
+                            pool,
+                        ),
                         TensorDtype::Vbit | TensorDtype::VbitRo => vbitmatvec2(
                             self.quant_bytes(),
                             vbit_offsets,
@@ -1896,6 +1954,10 @@ impl QTensor {
                 }
                 if *dtype == TensorDtype::Q2TiledP {
                     q2tp_matvec2(self.quant_bytes(), x1, x2, *rows, *cols, o1, o2, pool);
+                    return;
+                }
+                if *dtype == TensorDtype::Mxfp4 {
+                    mxfp4::matvec2(self.quant_bytes(), x1, x2, *rows, *cols, o1, o2, pool);
                     return;
                 }
                 if let Some(w) = self.bin_w() {
@@ -2160,6 +2222,9 @@ impl QTensor {
                         TensorDtype::Q1T => {
                             q1t_matmat(self.quant_bytes(), &transformed, b, rows, cols, out, pool)
                         }
+                        TensorDtype::Mxfp4 => {
+                            mxfp4::matmat(self.quant_bytes(), &transformed, b, rows, cols, out, pool)
+                        }
                         TensorDtype::Vbit | TensorDtype::VbitRo => vbitmatmat(
                             self.quant_bytes(),
                             vbit_offsets,
@@ -2188,6 +2253,10 @@ impl QTensor {
                 }
                 if *dtype == TensorDtype::Q4Block {
                     q4matmat(self.quant_bytes(), xs_all, b, rows, cols, out, pool);
+                    return;
+                }
+                if *dtype == TensorDtype::Mxfp4 {
+                    self.mxfp4_matmat(xs_all, b, out, pool);
                     return;
                 }
                 if *dtype == TensorDtype::Q4TiledP {
@@ -2621,6 +2690,74 @@ impl QTensor {
 }
 
 impl QTensor {
+    /// `mxfp4` matvec: the wgpu kernel for lm_head/expert-class shapes when
+    /// the probe prefers the device, else the CPU kernels of
+    /// `qtensor::mxfp4` (always on native Metal, which has no mxfp4 kernel).
+    fn mxfp4_matvec(&self, x: &[f32], out: &mut [f32], pool: Option<&Pool>) {
+        let (rows, cols) = (self.rows(), self.cols());
+        if let Self::Mapped { model, idx, .. } = self {
+            if rows * cols >= 8_388_608 && crate::gpu::enabled_here() {
+                let t0 = std::time::Instant::now();
+                let cls = crate::gpu::matvec_class(rows, cols);
+                match crate::gpu::probe_arm(cls) {
+                    crate::gpu::ProbeArm::Gpu => {
+                        if crate::gpu::mxfp4_matvec(model, *idx, x, rows, cols, out) {
+                            crate::gpu::probe_record(cls, true, t0.elapsed());
+                            return;
+                        }
+                    }
+                    crate::gpu::ProbeArm::CpuTimed => {
+                        mxfp4::matvec(self.quant_bytes(), x, rows, cols, out, pool);
+                        crate::gpu::probe_record(cls, false, t0.elapsed());
+                        return;
+                    }
+                    crate::gpu::ProbeArm::Cpu => {}
+                }
+            }
+        }
+        mxfp4::matvec(self.quant_bytes(), x, rows, cols, out, pool);
+    }
+
+    /// `mxfp4` batched matvec (`xs` `[b, cols]` → `out` `[b, rows]`): the
+    /// device's batched kernel behind the same probe as the other codecs'
+    /// GEMMs (never for row-exact batches — the device sums in another
+    /// order than the host matvec), else the CPU kernels.
+    fn mxfp4_matmat(&self, xs: &[f32], b: usize, out: &mut [f32], pool: Option<&Pool>) {
+        let (rows, cols) = (self.rows(), self.cols());
+        if let Self::Mapped { model, idx, .. } = self {
+            if b >= 2
+                && b * rows * cols >= 33_554_432
+                && !row_exact()
+                && !crate::gpu::mm_killed()
+                && crate::gpu::enabled_here()
+            {
+                let class = if b >= 128 {
+                    crate::gpu::OpClass::MatmatWide
+                } else {
+                    crate::gpu::OpClass::Matmat
+                };
+                let t0 = std::time::Instant::now();
+                match crate::gpu::probe_arm(class) {
+                    crate::gpu::ProbeArm::Gpu => {
+                        if crate::gpu::mxfp4_matmat(model, *idx, xs, b, rows, cols, out) {
+                            crate::gpu::probe_record(class, true, t0.elapsed());
+                            return;
+                        }
+                    }
+                    crate::gpu::ProbeArm::CpuTimed => {
+                        mxfp4::matmat(self.quant_bytes(), xs, b, rows, cols, out, pool);
+                        crate::gpu::probe_record(class, false, t0.elapsed());
+                        return;
+                    }
+                    crate::gpu::ProbeArm::Cpu => {}
+                }
+            }
+        }
+        mxfp4::matmat(self.quant_bytes(), xs, b, rows, cols, out, pool);
+    }
+}
+
+impl QTensor {
     /// The device GEMM this tensor would take, run once on the caller's
     /// data — the startup parity probe's arm, and the one place that knows
     /// which entry point each codec has.
@@ -2686,7 +2823,7 @@ impl QTensor {
         pool: Option<&Pool>,
     ) {
         let total_rows: usize = ts.iter().map(|t| t.rows()).sum();
-        if ts.iter().any(|t| t.has_prism_contract() || t.is_blr()) {
+        if ts.iter().any(|t| t.has_prism_contract() || t.per_tensor_only()) {
             // The fused range kernels have no transform descriptor.  Let
             // each tensor's ordinary matvec dispatch perform the explicit
             // signed FWHT (and retain CPU fallback for mixed q2tp/q4tp).
@@ -3100,7 +3237,7 @@ impl QTensor {
         pool: Option<&Pool>,
     ) {
         let total_rows: usize = ts.iter().map(|t| t.rows()).sum();
-        if ts.iter().any(|t| t.has_prism_contract() || t.is_blr()) {
+        if ts.iter().any(|t| t.has_prism_contract() || t.per_tensor_only()) {
             for i in 0..N {
                 ts[i].matvec2(x1, x2, o1s[i], o2s[i], pool);
             }
@@ -3372,7 +3509,11 @@ impl QTensor {
         limit: f32,
         pool: Option<&Pool>,
     ) -> bool {
-        if gate.has_prism_contract() || up.has_prism_contract() || gate.is_blr() || up.is_blr() {
+        if gate.has_prism_contract()
+            || up.has_prism_contract()
+            || gate.per_tensor_only()
+            || up.per_tensor_only()
+        {
             // The fused gate/up kernels consume x directly.  Prism requires
             // a per-matrix signed FWHT, so the caller must use two ordinary
             // descriptor-aware matvecs instead of an unrotated fast path.
@@ -3690,7 +3831,7 @@ impl QTensor {
         if pairs.is_empty() || pairs.len() != outs.len() {
             return false;
         }
-        if pairs.iter().any(|(g, u)| g.is_blr() || u.is_blr()) {
+        if pairs.iter().any(|(g, u)| g.per_tensor_only() || u.per_tensor_only()) {
             return false;
         }
         if !a8w8_enabled() {
@@ -3809,7 +3950,7 @@ impl QTensor {
         if downs.is_empty() || downs.len() != gs.len() || downs.len() != weights.len() {
             return false;
         }
-        if downs.iter().any(|d| d.is_blr()) {
+        if downs.iter().any(|d| d.per_tensor_only()) {
             return false;
         }
         if !a8w8_enabled() {
@@ -3902,7 +4043,7 @@ impl QTensor {
         if pairs.is_empty() || pairs.len() != groups.len() {
             return false;
         }
-        if pairs.iter().any(|(g, u)| g.is_blr() || u.is_blr()) {
+        if pairs.iter().any(|(g, u)| g.per_tensor_only() || u.per_tensor_only()) {
             return false;
         }
         let inter = pairs[0].0.rows();
@@ -4008,7 +4149,7 @@ impl QTensor {
         if downs.is_empty() || downs.len() != group_lens.len() {
             return false;
         }
-        if downs.iter().any(|d| d.is_blr()) {
+        if downs.iter().any(|d| d.per_tensor_only()) {
             return false;
         }
         let rows = downs[0].rows();
@@ -10632,7 +10773,20 @@ thread_local! {
     static FLOAT_ACTIVATIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-pub(crate) fn float_activations_scope<R>(f: impl FnOnce() -> R) -> R {
+/// Run `f` with the exact float-activation contract on this thread: the
+/// 4-bit and 8-bit kernels skip the int8 activation split (`CMF_SDOT=0`
+/// semantics, scoped). For parity tests and diagnostics — e.g. an `mxfp4`
+/// model then computes bit for bit what its dequantized f32 twin computes.
+pub fn with_float_activations<R>(f: impl FnOnce() -> R) -> R {
+    float_activations_scope(f)
+}
+
+/// Run `f` with exact float activations on this thread (no A8W8 int8
+/// activation quantization in the quantized matvecs). Public for parity
+/// tests that compare the default kernels with the strict ones in one
+/// process; `CMF_SDOT=0` is the process-wide equivalent.
+#[doc(hidden)]
+pub fn float_activations_scope<R>(f: impl FnOnce() -> R) -> R {
     struct Restore(bool);
     impl Drop for Restore {
         fn drop(&mut self) {

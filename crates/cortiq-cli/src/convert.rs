@@ -956,6 +956,10 @@ pub(crate) fn parse_tensor_quant(spec: &str) -> anyhow::Result<(String, Quant)> 
         !matches!(quant, Quant::Q2TiledPAffine),
         "--tensor-quant '{spec}': q2tp_affine is a whole-file profile, not a per-tensor choice"
     );
+    anyhow::ensure!(
+        !matches!(quant, Quant::Fp4),
+        "--tensor-quant '{spec}': fp4 is a whole-file profile; the per-tensor codec is mxfp4"
+    );
     Ok((pat.to_string(), quant))
 }
 
@@ -1050,6 +1054,281 @@ pub(crate) fn effective_quant(arch: &ModelArch, requested: Quant, name: &str) ->
     tensor_quant_override(name).unwrap_or_else(|| profile_quant(arch, requested, name))
 }
 
+/// Parse `cortiq convert --exclude-tensors` values: each one a
+/// comma-separated list of globs over CANONICAL output tensor names (the
+/// `--tensor-quant` glob: `*` is the only wildcard and spans dots).
+/// Duplicates collapse; an empty pattern is refused.
+pub fn parse_tensor_exclusions(specs: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for spec in specs {
+        for p in spec.split(',') {
+            let p = p.trim();
+            anyhow::ensure!(
+                !p.is_empty(),
+                "--exclude-tensors '{spec}': empty pattern (expected comma-separated globs, e.g. 'model.mtp.*')"
+            );
+            if !out.iter().any(|q| q == p) {
+                out.push(p.to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `cortiq convert --exclude-tensors PATTERNS`: tensors left out of every
+/// output of a conversion. A source tensor whose canonical name matches is
+/// skipped before its payload is read — no decode, no requant, no write —
+/// and counted (tensors and source bytes). A name only a split produces (one
+/// expert of a packed tensor, q/k/v of a fused projection) is also checked
+/// when it reaches the writer, so a pattern over such names holds too; that
+/// source tensor was decoded for its other parts. The patterns are recorded
+/// in `header.provenance.excluded_tensors`.
+///
+/// Patterns are matched twice: against the canonical SOURCE name (after the
+/// architecture's canonical renames, before the later per-family ones —
+/// Kimi `.weight_packed` → `.weight`, Gemma-4 `router.proj` →
+/// `mlp.gate`, the MiMo/Phi qkv and gate_up splits) and against the final
+/// OUTPUT name at the writer. A match on the output name alone drops the
+/// tensor after its source was decoded; a match on a pre-rename source name
+/// drops the tensor even though its output name differs. Gemma-4
+/// `.router.scale` tensors are read in a pre-pass whatever the patterns.
+/// None of this concerns DeepSeek-V4.1, whose `mtp.N.*` names become
+/// `model.mtp.N.*` in the canonical source pass.
+///
+/// A resumed output must keep the patterns it was started with: they are
+/// recorded next to its manifest (`<output>.manifest.exclude`) and a resume
+/// with other patterns, or with patterns that match a tensor the output
+/// already holds, is refused.
+///
+/// DeepSeek-V4.1-Flash-1017 with `--quant fp4` is 504.51 GB with its
+/// MTP/DSpark stack and 496.96 GB without; `model.mtp.*` drops that stack,
+/// which the V4.1 runtime never executes, and brings the file under Hugging
+/// Face's 500 GB per-file limit.
+pub(crate) struct TensorExclusion {
+    patterns: Vec<String>,
+    /// Source tensors excluded per pattern (first match).
+    hits: Vec<std::cell::Cell<usize>>,
+    source_tensors: std::cell::Cell<usize>,
+    source_bytes: std::cell::Cell<u64>,
+    /// Split-produced names dropped at the writer (unique names).
+    derived: std::cell::RefCell<HashSet<String>>,
+}
+
+impl TensorExclusion {
+    pub(crate) fn new(patterns: &[String]) -> Self {
+        Self {
+            patterns: patterns.to_vec(),
+            hits: patterns.iter().map(|_| std::cell::Cell::new(0)).collect(),
+            source_tensors: std::cell::Cell::new(0),
+            source_bytes: std::cell::Cell::new(0),
+            derived: std::cell::RefCell::new(HashSet::new()),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
+
+    fn matching(&self, name: &str) -> Option<usize> {
+        self.patterns.iter().position(|p| glob_match(p, name))
+    }
+
+    /// Whether the source tensor with canonical `name` (payload `bytes`
+    /// long) is excluded; counts it if so.
+    fn skip_source(&self, name: &str, bytes: usize) -> bool {
+        let Some(i) = self.matching(name) else {
+            return false;
+        };
+        self.hits[i].set(self.hits[i].get() + 1);
+        self.source_tensors.set(self.source_tensors.get() + 1);
+        self.source_bytes
+            .set(self.source_bytes.get().saturating_add(bytes as u64));
+        true
+    }
+
+    /// Whether an output tensor about to be written is excluded (a name the
+    /// source-side check could not see).
+    fn skip_output(&self, name: &str) -> bool {
+        if self.patterns.is_empty() || self.matching(name).is_none() {
+            return false;
+        }
+        self.derived.borrow_mut().insert(name.to_string());
+        true
+    }
+
+    /// Before any shard is read: how many tensors of the source index each
+    /// pattern matches (canonical names), and a warning for a pattern that
+    /// matches none — a typo shows in the first seconds, not after a
+    /// multi-hour conversion. Such a pattern may still match a name only a
+    /// split produces, so it is not refused.
+    fn preview(&self, names: &[String]) {
+        for line in self.preview_lines(names) {
+            eprintln!("{line}");
+        }
+    }
+
+    fn preview_lines(&self, names: &[String]) -> Vec<String> {
+        if self.patterns.is_empty() || names.is_empty() {
+            return Vec::new();
+        }
+        let mut per = vec![0usize; self.patterns.len()];
+        for n in names {
+            if let Some(i) = self.matching(n) {
+                per[i] += 1;
+            }
+        }
+        let mut out = vec![format!(
+            "  --exclude-tensors: the source index lists {} matching tensors ({})",
+            per.iter().sum::<usize>(),
+            self.patterns
+                .iter()
+                .zip(&per)
+                .map(|(p, k)| format!("'{p}' ×{k}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )];
+        for (p, k) in self.patterns.iter().zip(&per) {
+            if *k == 0 {
+                out.push(format!(
+                    "  warning: --exclude-tensors '{p}' matches no tensor of the source index \
+                     (patterns match canonical CMF names, e.g. 'model.mtp.*'); only a name a \
+                     split produces at write time can still match it"
+                ));
+            }
+        }
+        out
+    }
+
+    /// The end-of-run summary. `shards_done_before`: source shards earlier
+    /// attempts of a resumed output had already converted — their tensors
+    /// were not re-read, so they are not in the counts.
+    fn report(&self, shards_done_before: usize) {
+        for line in self.report_lines(shards_done_before) {
+            eprintln!("{line}");
+        }
+    }
+
+    fn report_lines(&self, shards_done_before: usize) -> Vec<String> {
+        if self.patterns.is_empty() {
+            return Vec::new();
+        }
+        let per: Vec<String> = self
+            .patterns
+            .iter()
+            .zip(&self.hits)
+            .map(|(p, h)| format!("'{p}' ×{}", h.get()))
+            .collect();
+        let mut out = vec![format!(
+            "  --exclude-tensors: {} source tensors excluded, {} source bytes ({:.2} GB; {}){}{}",
+            self.source_tensors.get(),
+            self.source_bytes.get(),
+            self.source_bytes.get() as f64 / 1e9,
+            per.join(", "),
+            match self.derived.borrow().len() {
+                0 => String::new(),
+                n => format!("; {n} split-produced tensors dropped at write"),
+            },
+            match shards_done_before {
+                0 => String::new(),
+                n => format!(
+                    " — resumed: these count only the shards this run converted; {n} source \
+                     shards earlier attempts finished were not re-read"
+                ),
+            }
+        )];
+        for (p, h) in self.patterns.iter().zip(&self.hits) {
+            if h.get() == 0 && !self.derived.borrow().iter().any(|n| glob_match(p, n)) {
+                out.push(if shards_done_before == 0 {
+                    format!(
+                        "  warning: --exclude-tensors '{p}' matched no tensor in this run \
+                         (patterns match canonical CMF names, e.g. 'model.mtp.*')"
+                    )
+                } else {
+                    format!(
+                        "  note: --exclude-tensors '{p}' matched no tensor in the shards this \
+                         run converted (its tensors may sit in the {shards_done_before} shards \
+                         finished earlier)"
+                    )
+                });
+            }
+        }
+        out
+    }
+}
+
+/// Where a conversion records its `--exclude-tensors` patterns next to an
+/// output's resume manifest.
+fn exclusion_record_path(manifest_path: &str) -> String {
+    format!("{manifest_path}.exclude")
+}
+
+/// A new output records its exclusion patterns next to its manifest (none:
+/// a stale record from an earlier output of the same name is removed), so
+/// a resume can check it continues with the same ones.
+fn record_exclusion(manifest_path: &str, patterns: &[String]) -> std::io::Result<()> {
+    let path = exclusion_record_path(manifest_path);
+    if patterns.is_empty() {
+        return match fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+    }
+    fs::write(&path, serde_json::to_vec(patterns).map_err(std::io::Error::other)?)
+}
+
+/// A resumed output keeps the exclusion it was started with: shards done
+/// earlier were written under those patterns, and a different set would
+/// leave the file holding tensors its provenance says are excluded, or
+/// missing tensors its provenance does not mention. The record next to the
+/// manifest is compared when present; an output started before records
+/// existed (or without patterns) only has to hold no tensor the patterns
+/// match, and then gets a record.
+fn check_resume_exclusion(
+    output_path: &str,
+    manifest_path: &str,
+    patterns: &[String],
+    exclusion: &TensorExclusion,
+    written: &[String],
+) -> anyhow::Result<()> {
+    let shown = |p: &[String]| {
+        if p.is_empty() {
+            "none".to_string()
+        } else {
+            format!("'{}'", p.join(","))
+        }
+    };
+    let record = exclusion_record_path(manifest_path);
+    let recorded: Option<Vec<String>> = match fs::read(&record) {
+        Ok(b) => Some(serde_json::from_slice(&b).map_err(|e| {
+            anyhow::anyhow!("resume {output_path}: unreadable exclusion record {record}: {e}")
+        })?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => anyhow::bail!("resume {output_path}: read {record}: {e}"),
+    };
+    if let Some(rec) = recorded {
+        let set = |p: &[String]| p.iter().cloned().collect::<std::collections::BTreeSet<_>>();
+        anyhow::ensure!(
+            set(&rec) == set(patterns),
+            "resume {output_path}: the output was started with --exclude-tensors {} and is \
+             resumed with {}; resume with the same patterns or start a new output",
+            shown(&rec),
+            shown(patterns)
+        );
+        return Ok(());
+    }
+    if let Some((name, p)) = written
+        .iter()
+        .find_map(|n| exclusion.matching(n).map(|i| (n, &exclusion.patterns[i])))
+    {
+        anyhow::bail!(
+            "resume {output_path}: the output was started without --exclude-tensors and already \
+             holds '{name}', which '{p}' excludes; resume without the flag or start a new output"
+        );
+    }
+    record_exclusion(manifest_path, patterns)
+        .map_err(|e| anyhow::anyhow!("resume {output_path}: {e}"))
+}
+
 /// Quantization choice for 2-D weight matrices.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Quant {
@@ -1090,6 +1369,38 @@ pub(crate) enum Quant {
     /// checkpoint survive 1-bit.
     Q1s,
     Q1t,
+    /// OCP MX FP4 (`mxfp4` dtype 21): E2M1 codes + one E8M0 scale per 32
+    /// elements, 4.25 bits/weight. As a per-tensor codec (`--tensor-quant
+    /// PATTERN=mxfp4`) or a whole-file `--quant mxfp4`, float sources are
+    /// quantized by the OCP rule; an OCP MXFP4 source tensor (DeepSeek-V4/
+    /// V4.1 `I8` experts + `F8_E8M0` 1×32 scales) is re-packed byte for
+    /// byte instead.
+    Mxfp4,
+    /// `--quant fp4`: the native-FP4 MoE profile. Every routed and shared
+    /// expert matrix (gate/up/down) is `mxfp4` — byte-identical to an OCP
+    /// MXFP4 source, OCP-quantized from any other source so the expert bank
+    /// keeps one codec — and every other tensor gets exactly what the
+    /// `q4tp` profile gives it.
+    Fp4,
+}
+
+/// Whether `name` is a routed or shared expert's gate/up/down matrix — the
+/// tensors the `fp4` profile stores as `mxfp4`.
+pub(crate) fn fp4_expert_matrix(name: &str) -> bool {
+    let expert = name.contains(".experts.")
+        || name.contains(".shared_expert.")
+        || name.contains(".shared_experts.");
+    expert
+        && [
+            ".gate_proj.weight",
+            ".up_proj.weight",
+            ".down_proj.weight",
+            ".w1.weight",
+            ".w2.weight",
+            ".w3.weight",
+        ]
+        .iter()
+        .any(|s| name.ends_with(s))
 }
 
 /// Quantize a 2-D matrix `[out_dim, in_dim]` per the chosen scheme.
@@ -1144,6 +1455,14 @@ pub(crate) fn quantize_2d(
             crate::gptq::quantize_q1t(vals, out_dim, in_dim, &vec![1.0; in_dim], 0.0),
         ),
         Quant::Q1t => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
+        Quant::Mxfp4 if in_dim % GROUP_SIZE == 0 => (
+            TensorDtype::Mxfp4,
+            cortiq_core::mxfp4::quantize(vals, out_dim, in_dim),
+        ),
+        Quant::Mxfp4 => (TensorDtype::Q8_2f, encode_q8_2f(vals, out_dim, in_dim)),
+        // The profile resolves per tensor (`profile_quant`); a direct caller
+        // gets the profile's expert codec.
+        Quant::Fp4 => quantize_2d(Quant::Mxfp4, vals, out_dim, in_dim),
     }
 }
 
@@ -1162,8 +1481,10 @@ pub(crate) fn parse_quant(s: &str) -> anyhow::Result<Quant> {
         "q1p" | "q1_ptq" => Quant::Q1p,
         "q1s" | "q1_mask" => Quant::Q1s,
         "q1t" | "q1_ternary" => Quant::Q1t,
+        "mxfp4" | "mx_fp4" => Quant::Mxfp4,
+        "fp4" => Quant::Fp4,
         other => anyhow::bail!(
-            "unknown quant '{other}' (use q8, q8_2f, q4, q4t, q4tp, q2tp, q2tp_affine, f16, vbit, q1, q1p, q1s, or q1t)"
+            "unknown quant '{other}' (use q8, q8_2f, q4, q4t, q4tp, q2tp, q2tp_affine, f16, vbit, q1, q1p, q1s, q1t, mxfp4, or fp4)"
         ),
     })
 }
@@ -1183,6 +1504,8 @@ pub(crate) fn quant_name(quant: Quant) -> &'static str {
         Quant::Q1p => "q1p",
         Quant::Q1s => "q1s",
         Quant::Q1t => "q1t",
+        Quant::Mxfp4 => "mxfp4",
+        Quant::Fp4 => "fp4",
     }
 }
 
@@ -1192,6 +1515,15 @@ pub(crate) fn quant_name(quant: Quant) -> &'static str {
 /// on q2tp. Keeping this decision here means every requested output sees the
 /// same decoded source tensor and only the encoder differs.
 fn profile_quant(arch: &ModelArch, requested: Quant, name: &str) -> Quant {
+    if matches!(requested, Quant::Fp4) {
+        // Experts on the native FP4 codec, everything else exactly as the
+        // q4tp profile places it (skeleton q8_2f rules included).
+        return if fp4_expert_matrix(name) {
+            Quant::Mxfp4
+        } else {
+            profile_quant(arch, Quant::Q4TiledP, name)
+        };
+    }
     if matches!(requested, Quant::Q2TiledPAffine) {
         // Prism weights are all trained ternary projections in one rotated
         // basis; never apply q2tp's mixed expert-only policy.
@@ -2603,8 +2935,12 @@ fn push_raw_u8_tensor(
 fn drain_to_writer(
     tensors: &mut Vec<TensorSpec>,
     writer: &mut cortiq_core::format::CmfStreamWriter,
+    exclusion: &TensorExclusion,
 ) -> anyhow::Result<()> {
     for t in tensors.drain(..) {
+        if exclusion.skip_output(&t.name) {
+            continue;
+        }
         writer
             .push(&t.name, t.dtype, &t.shape, &t.data)
             .map_err(|e| anyhow::anyhow!("write tensor '{}': {e}", t.name))?;
@@ -2765,6 +3101,240 @@ pub(crate) fn unpack_mxfp4(
         Ok(())
     })?;
     Ok(out)
+}
+
+/// NVIDIA ModelOpt NVFP4 (`hf_quant_config.json` / `quantization_config`
+/// `quant_algo: NVFP4`): `weight` U8 `[rows, cols/2]` E2M1 pairs (LOW nibble
+/// = even element, as MXFP4), `weight_scale` F8_E4M3 `[rows, cols/16]` (one
+/// per 16 elements, linear row-major on disk — not the swizzled runtime
+/// layout), `weight_scale_2` F32 scalar (the per-tensor decode multiplier,
+/// `amax / (6·448)`). Decoded as vLLM's `dequantize_to_dtype` does:
+/// `w = e2m1 · (f32(e4m3_scale) · weight_scale_2)`, the two scales multiplied
+/// first. A NaN block scale (E4M3 `0x7F`/`0xFF`) or a non-finite global
+/// scale is refused.
+pub(crate) fn unpack_nvfp4(
+    packed: &[u8],
+    scales_e4m3: &[u8],
+    global_scale: f32,
+    rows: usize,
+    cols_packed: usize,
+) -> anyhow::Result<Vec<f32>> {
+    const BLOCK: usize = 16;
+    let cols = cols_packed * 2;
+    anyhow::ensure!(cols % BLOCK == 0, "nvfp4: cols {cols} not a multiple of {BLOCK}");
+    anyhow::ensure!(
+        global_scale.is_finite(),
+        "nvfp4: non-finite weight_scale_2 {global_scale}"
+    );
+    let bpr = cols / BLOCK;
+    anyhow::ensure!(
+        packed.len() == rows * cols_packed && scales_e4m3.len() == rows * bpr,
+        "nvfp4: packed {} / scales {} vs rows {rows} cols {cols}",
+        packed.len(),
+        scales_e4m3.len()
+    );
+    let lut = &cortiq_core::mxfp4::E2M1_LUT;
+    let mut out = vec![0.0f32; rows * cols];
+    if rows == 0 {
+        return Ok(out);
+    }
+    let threads = encode_threads().min(rows).max(1);
+    let rows_per_thread = rows.div_ceil(threads);
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        let mut workers = Vec::with_capacity(threads);
+        for (chunk_index, out_chunk) in out.chunks_mut(rows_per_thread * cols).enumerate() {
+            let first_row = chunk_index * rows_per_thread;
+            workers.push(scope.spawn(move || -> anyhow::Result<()> {
+                for (local_row, out_row) in out_chunk.chunks_mut(cols).enumerate() {
+                    let r = first_row + local_row;
+                    for b in 0..bpr {
+                        let sf = fp8_e4m3_to_f32(scales_e4m3[r * bpr + b]);
+                        anyhow::ensure!(sf.is_finite(), "nvfp4: NaN block scale at row {r} block {b}");
+                        let s = sf * global_scale;
+                        for j in 0..BLOCK / 2 {
+                            let byte = packed[r * cols_packed + b * (BLOCK / 2) + j];
+                            out_row[b * BLOCK + 2 * j] = lut[(byte & 0x0F) as usize] * s;
+                            out_row[b * BLOCK + 2 * j + 1] = lut[(byte >> 4) as usize] * s;
+                        }
+                    }
+                }
+                Ok(())
+            }));
+        }
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("nvfp4 worker panicked"))??;
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// The NVFP4 group size when the checkpoint declares ModelOpt NVFP4, either
+/// in `hf_quant_config.json` (`{"quantization": {"quant_algo": "NVFP4",
+/// "group_size": 16}}`) or in `config.json`'s `quantization_config`
+/// (`quant_algo` NVFP4 / W4A16_NVFP4, `quant_method` modelopt). None for
+/// every other checkpoint. compressed-tensors' `nvfp4-pack-quantized`
+/// (packed `weight_packed`, an INVERSE `weight_global_scale`) is a different
+/// layout and is refused rather than misread as MXFP4.
+pub(crate) fn nvfp4_source(dir: &Path, config: &serde_json::Value) -> anyhow::Result<Option<usize>> {
+    let algo_is_nvfp4 = |q: &serde_json::Value| {
+        q.get("quant_algo")
+            .and_then(|v| v.as_str())
+            .is_some_and(|a| a.to_ascii_uppercase().contains("NVFP4"))
+    };
+    let group_of = |q: &serde_json::Value| -> anyhow::Result<usize> {
+        let g = q
+            .get("group_size")
+            .and_then(|v| v.as_u64())
+            .or_else(|| {
+                q.get("config_groups")?
+                    .as_object()?
+                    .values()
+                    .find_map(|g| g.get("weights")?.get("group_size")?.as_u64())
+            })
+            .unwrap_or(16) as usize;
+        anyhow::ensure!(g == 16, "NVFP4 checkpoint declares group_size {g}; only 16 is defined");
+        Ok(g)
+    };
+    let hf_quant = dir.join("hf_quant_config.json");
+    if let Ok(text) = fs::read(&hf_quant) {
+        let v: serde_json::Value = serde_json::from_slice(&text)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", hf_quant.display()))?;
+        let q = v.get("quantization").unwrap_or(&v);
+        if algo_is_nvfp4(q) {
+            return group_of(q).map(Some);
+        }
+    }
+    let Some(q) = config
+        .get("quantization_config")
+        .or_else(|| config.get("text_config")?.get("quantization_config"))
+    else {
+        return Ok(None);
+    };
+    let ct_format = q.get("format").and_then(|v| v.as_str()).or_else(|| {
+        q.get("config_groups")?
+            .as_object()?
+            .values()
+            .find_map(|g| g.get("format")?.as_str())
+    });
+    anyhow::ensure!(
+        ct_format != Some("nvfp4-pack-quantized"),
+        "compressed-tensors nvfp4-pack-quantized checkpoints are not supported \
+         (only NVIDIA ModelOpt NVFP4: weight / weight_scale / weight_scale_2)"
+    );
+    if algo_is_nvfp4(q) {
+        return group_of(q).map(Some);
+    }
+    Ok(None)
+}
+
+/// Find a companion tensor by exact source name in any shard.
+fn companion<'a>(files: &'a [SafeTensors], name: &str) -> Option<(&'a SafeTensors, &'a TensorMeta)> {
+    files
+        .iter()
+        .find_map(|f| f.tensors.iter().find(|t| t.name == name).map(|t| (f, t)))
+}
+
+/// Decode one ModelOpt NVFP4 `.weight` (U8) with its `.weight_scale`
+/// (F8_E4M3 per 16) and `.weight_scale_2` (F32 scalar) companions, folding an
+/// optional AWQ `.pre_quant_scale` (`y = W·(x ⊙ s)`, so column i of W is
+/// multiplied by `s[i]`). Returns `(shape, values)`.
+fn nvfp4_decode(
+    m: &TensorMeta,
+    file: &SafeTensors,
+    files: &[SafeTensors],
+) -> anyhow::Result<(Vec<usize>, Vec<f32>)> {
+    let name = &m.name;
+    anyhow::ensure!(m.shape.len() == 2, "{name}: NVFP4 weight must be 2-D, got {:?}", m.shape);
+    let (rows, cp) = (m.shape[0], m.shape[1]);
+    let cols = cp * 2;
+    let stem = name.strip_suffix(".weight").expect("suffix checked by caller");
+    let (sf, sm) = companion(files, &format!("{stem}.weight_scale"))
+        .ok_or_else(|| anyhow::anyhow!("{name}: NVFP4 weight without {stem}.weight_scale"))?;
+    anyhow::ensure!(
+        sm.dtype == "F8_E4M3" && sm.shape == vec![rows, cols / 16],
+        "{name}: {stem}.weight_scale is {} {:?}, expected F8_E4M3 [{rows}, {}]",
+        sm.dtype,
+        sm.shape,
+        cols / 16
+    );
+    let (gf, gm) = companion(files, &format!("{stem}.weight_scale_2"))
+        .ok_or_else(|| anyhow::anyhow!("{name}: NVFP4 weight without {stem}.weight_scale_2"))?;
+    let global = to_f32(&gm.dtype, gf.bytes(gm))?;
+    anyhow::ensure!(
+        global.len() == 1,
+        "{name}: weight_scale_2 must be one value, got {}",
+        global.len()
+    );
+    let mut vals = unpack_nvfp4(file.bytes(m), sf.bytes(sm), global[0], rows, cp)?;
+    if let Some((pf, pm)) = companion(files, &format!("{stem}.pre_quant_scale")) {
+        let pqs = to_f32(&pm.dtype, pf.bytes(pm))?;
+        anyhow::ensure!(
+            pqs.len() == cols,
+            "{name}: pre_quant_scale has {} values for {cols} columns",
+            pqs.len()
+        );
+        for row in vals.chunks_mut(cols) {
+            for (w, s) in row.iter_mut().zip(&pqs) {
+                *w *= s;
+            }
+        }
+    }
+    Ok((vec![rows, cols], vals))
+}
+
+/// The byte-identical MXFP4 path for a DeepSeek-V4/V4.1 source tensor: when
+/// `m` is an `I8` FP4 weight `[rows, cols/2]` with an E8M0 `.scale`
+/// companion `[rows, cols/32]` and at least one active output resolves this
+/// tensor to `mxfp4` (the `fp4` profile's experts, or a `--tensor-quant`
+/// override), returns the re-packed payload, its logical shape and, per
+/// output, whether that output takes it. None = not such a tensor, or no
+/// output wants it (the f32 decode then serves everyone as before).
+#[allow(clippy::too_many_arguments)]
+fn dsv4_raw_mxfp4(
+    arch: &ModelArch,
+    name: &str,
+    m: &TensorMeta,
+    file: &SafeTensors,
+    files: &[SafeTensors],
+    profiles: &[Quant],
+    active: &[bool],
+    no_defrag: bool,
+) -> anyhow::Result<Option<(Vec<u8>, Vec<usize>, Vec<bool>)>> {
+    if m.dtype != "I8" || m.shape.len() != 2 || name.ends_with(".scale") || !no_defrag {
+        return Ok(None);
+    }
+    let (rows, cp) = (m.shape[0], m.shape[1]);
+    let cols = cp * 2;
+    if cols % 32 != 0 || force_f32(name) || force_f16(name) {
+        return Ok(None);
+    }
+    let took: Vec<bool> = profiles
+        .iter()
+        .zip(active)
+        .map(|(&q, &a)| a && effective_quant(arch, q, name) == Quant::Mxfp4)
+        .collect();
+    if !took.iter().any(|&t| t) {
+        return Ok(None);
+    }
+    let scale_name = format!("{}.scale", m.name.trim_end_matches(".weight"));
+    let Some((sf, sm)) = companion(files, &scale_name) else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        matches!(sm.dtype.as_str(), "F8_E8M0" | "U8") && sm.shape == vec![rows, cols / 32],
+        "{name}: FP4 source {} [{rows}, {cp}] with {scale_name} {} {:?} is not OCP MXFP4 \
+         (expected E8M0 [{rows}, {}])",
+        m.dtype,
+        sm.dtype,
+        sm.shape,
+        cols / 32
+    );
+    let payload = cortiq_core::mxfp4::repack(file.bytes(m), sf.bytes(sm), rows, cols)
+        .map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+    Ok(Some((payload, vec![rows, cols], took)))
 }
 
 /// OCP FP8 E4M3 → f32. 1 sign, 4 exp (bias 7), 3 mantissa; no infinities,
@@ -6023,10 +6593,15 @@ fn auth(mut req: ureq::Request, token: Option<&str>) -> ureq::Request {
 
 /// Total size of a remote file via a `Range: bytes=0-0` probe (Content-Range),
 /// or None if the server doesn't support/report ranges (→ single stream).
-fn probe_size(agent: &ureq::Agent, url: &str, token: Option<&str>) -> Option<u64> {
-    let resp = auth(agent.get(url).set("Range", "bytes=0-0"), token)
-        .call()
-        .ok()?;
+pub(crate) fn probe_size(agent: &ureq::Agent, url: &str, token: Option<&str>) -> Option<u64> {
+    // A rate-limited probe would otherwise drop a 100 GB shard to the
+    // single-stream path.
+    let resp = with_retry(2, || {
+        auth(agent.get(url).set("Range", "bytes=0-0"), token)
+            .call()
+            .map_err(|e| anyhow::anyhow!("probe {url}: {e}"))
+    })
+    .ok()?;
     resp.header("Content-Range")?
         .rsplit('/')
         .next()?
@@ -6062,23 +6637,61 @@ fn write_at(path: &Path, offset: u64, data: &[u8]) -> std::io::Result<()> {
     f.write_all(data)
 }
 
+/// `HF_TOKEN`, else `HUGGING_FACE_HUB_TOKEN` (the variables `hf` and
+/// `huggingface_hub` read), when non-empty.
+pub(crate) fn hf_token_from_env() -> Option<String> {
+    ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|t| !t.trim().is_empty()))
+}
+
+/// An HTTP answer the Hub sends when it is busy or rate limiting (429, 5xx):
+/// worth waiting for, unlike a 404 or a refused token.
+fn hub_busy(e: &anyhow::Error) -> bool {
+    let s = format!("{e:#}");
+    ["status code 429", "status code 500", "status code 502", "status code 503", "status code 504"]
+        .iter()
+        .any(|code| s.contains(code))
+}
+
 /// Retry `f` with exponential backoff — smooths over transient network errors.
+/// A rate-limited or busy Hub (429/5xx) gets a much longer budget: pauses
+/// from 10 s doubling to 2 min, for up to `CMF_HF_BUSY_WAIT_MIN` minutes
+/// (default 30) — one 429 on the last shard must not end a streamed
+/// conversion of hundreds of GB.
 fn with_retry<T>(attempts: u32, mut f: impl FnMut() -> anyhow::Result<T>) -> anyhow::Result<T> {
     let mut delay = Duration::from_millis(400);
-    let mut last: Option<anyhow::Error> = None;
-    for a in 0..attempts {
+    let mut busy_delay = Duration::from_secs(10);
+    let busy_budget = Duration::from_secs(
+        60 * std::env::var("CMF_HF_BUSY_WAIT_MIN")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30),
+    );
+    let mut busy_waited = Duration::ZERO;
+    let mut a = 0;
+    loop {
         match f() {
             Ok(v) => return Ok(v),
+            Err(e) if hub_busy(&e) && busy_waited + busy_delay <= busy_budget => {
+                eprintln!(
+                    "\n    hub busy ({e:#}); retrying in {} s",
+                    busy_delay.as_secs()
+                );
+                std::thread::sleep(busy_delay);
+                busy_waited += busy_delay;
+                busy_delay = (busy_delay * 2).min(Duration::from_secs(120));
+            }
             Err(e) => {
-                last = Some(e);
-                if a + 1 < attempts {
-                    std::thread::sleep(delay);
-                    delay = (delay * 2).min(Duration::from_secs(8));
+                a += 1;
+                if a >= attempts {
+                    return Err(e);
                 }
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_secs(8));
             }
         }
     }
-    Err(last.unwrap())
 }
 
 /// Fetch one file into `dest` (cached). Large range-capable files are pulled in
@@ -6254,6 +6867,9 @@ pub(crate) fn hf_download_opts(
         // identity.  It is optional for ordinary HF models and therefore
         // fetched best-effort here.
         ("hadamard.json", false),
+        // NVIDIA ModelOpt checkpoints declare NVFP4 here rather than (or
+        // as well as) in config.json's quantization_config.
+        ("hf_quant_config.json", false),
         // Kimi ships tiktoken.model instead of tokenizer.json — either
         // satisfies the bundle (checked after conversion).
         ("tokenizer.json", false),
@@ -6676,6 +7292,7 @@ pub fn run_convert_multi(
 /// companion (no text tensors are read); `Multimodal` adds the towers, the
 /// audio tokenizer encoder and the config blobs to each text output.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))] // the CLI calls run_convert_multi_excluding
 pub fn run_convert_multi_towers(
     model: &str,
     outputs: &[(String, String)],
@@ -6684,13 +7301,46 @@ pub fn run_convert_multi_towers(
     o1_hint: Option<serde_json::Value>,
     resume: bool,
     towers: MimoTowers,
+    progress: impl FnMut(f32),
+) -> anyhow::Result<()> {
+    run_convert_multi_excluding(
+        model,
+        outputs,
+        hf_token,
+        defrag,
+        o1_hint,
+        resume,
+        towers,
+        &[],
+        progress,
+    )
+}
+
+/// [`run_convert_multi_towers`] leaving out every tensor whose canonical
+/// name matches one of `exclude` (`cortiq convert --exclude-tensors`, see
+/// [`TensorExclusion`]) — in every output, on every source path of the walk
+/// (resident local shards, local-ready streaming, Hugging Face streaming,
+/// resume). The packers that do not go through the walk (the MiMo-V2
+/// `mm-only` companion, EmbeddingGemma 2) refuse a non-empty `exclude`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_convert_multi_excluding(
+    model: &str,
+    outputs: &[(String, String)],
+    hf_token: Option<&str>,
+    defrag: Option<&str>,
+    o1_hint: Option<serde_json::Value>,
+    resume: bool,
+    towers: MimoTowers,
+    exclude: &[String],
     mut progress: impl FnMut(f32),
 ) -> anyhow::Result<()> {
     anyhow::ensure!(!outputs.is_empty(), "at least one output is required");
+    let exclusion = TensorExclusion::new(exclude);
     if towers == MimoTowers::MmOnly {
         anyhow::ensure!(
-            defrag.is_none() && o1_hint.is_none() && !resume,
-            "--mimo-towers mm-only writes only the towers: --defrag, --o1 and --resume do not apply"
+            defrag.is_none() && o1_hint.is_none() && !resume && exclusion.is_empty(),
+            "--mimo-towers mm-only writes only the towers: --defrag, --o1, --resume and \
+             --exclude-tensors do not apply"
         );
         return crate::mimo_towers::run_convert_mimo_mm(model, outputs, progress);
     }
@@ -6703,8 +7353,12 @@ pub fn run_convert_multi_towers(
             .is_some_and(|c| c.get("model_type").and_then(|v| v.as_str()) == Some("embedding_gemma2"))
     }) {
         anyhow::ensure!(
-            defrag.is_none() && o1_hint.is_none() && !resume && towers == MimoTowers::TextOnly,
-            "embedding_gemma2: --defrag, --o1, --resume and --mimo-towers do not apply"
+            defrag.is_none()
+                && o1_hint.is_none()
+                && !resume
+                && towers == MimoTowers::TextOnly
+                && exclusion.is_empty(),
+            "embedding_gemma2: --defrag, --o1, --resume, --mimo-towers and --exclude-tensors do not apply"
         );
         for (q, path) in outputs {
             crate::egemma2pack::convert(dir, q, path)?;
@@ -6823,6 +7477,32 @@ pub fn run_convert_multi_towers(
         );
     }
     let source_fp8_block = source_fp8_block(&config);
+    // NVIDIA ModelOpt NVFP4 checkpoints decode to f32 first (then any
+    // profile, mxfp4 included, re-encodes them).
+    let nvfp4_src = nvfp4_source(dir, &config)?;
+    if let Some(g) = nvfp4_src {
+        eprintln!("  source: NVIDIA ModelOpt NVFP4 (E2M1 + E4M3 scale per {g} + per-tensor scale)");
+    }
+    if !exclusion.is_empty() {
+        eprintln!(
+            "  --exclude-tensors: leaving out canonical names matching {}",
+            exclude.join(", ")
+        );
+        // The index is on disk for Hub streaming (fetched before the walk)
+        // and for a sharded local checkpoint.
+        let index_names: Vec<String> = fs::read(dir.join("model.safetensors.index.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .and_then(|v| {
+                v.get("weight_map").and_then(|m| m.as_object()).map(|m| {
+                    m.keys()
+                        .filter_map(|k| canon_name_for_arch(&arch, k, towers))
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+        exclusion.preview(&index_names);
+    }
     let consume_source_shards =
         stream_repo.is_none() && arch.deepseek_v41.is_some() && consume_source_shards_enabled();
     if consume_source_shards {
@@ -6977,6 +7657,7 @@ pub fn run_convert_multi_towers(
         {
             let (w, st) = cortiq_core::format::CmfStreamWriter::resume(output_path, &manifest_path)
                 .map_err(|e| anyhow::anyhow!("resume {output_path}: {e}"))?;
+            check_resume_exclusion(output_path, &manifest_path, exclude, &exclusion, &st.names)?;
             tracing::info!(
                 "resuming {output_path}: {} tensors already written, {} source shards done",
                 st.names.len(),
@@ -6990,12 +7671,21 @@ pub fn run_convert_multi_towers(
             let w = cortiq_core::format::CmfStreamWriter::new(output_path, head_reserve)
                 .and_then(|w| w.with_manifest(&manifest_path))
                 .map_err(|e| anyhow::anyhow!("create {output_path}: {e}"))?;
+            record_exclusion(&manifest_path, exclude)
+                .map_err(|e| anyhow::anyhow!("create {output_path}: {e}"))?;
             (Some(w), std::collections::HashSet::new())
         };
         manifests.push(manifest_path);
         done_shards.push(marks);
         writers.push(writer);
     }
+    // Source shards earlier attempts finished (for the exclusion report).
+    let shards_done_before = done_shards
+        .iter()
+        .map(|d| d.len())
+        .max()
+        .unwrap_or(0)
+        .max(completed_source_shards.len());
     let mut tensors: Vec<Vec<TensorSpec>> =
         outputs.iter().map(|_| Vec::with_capacity(total)).collect();
     let mut tower_stats = vec![crate::mimo_towers::TowerStats::default(); outputs.len()];
@@ -7140,6 +7830,9 @@ pub fn run_convert_multi_towers(
             if arch.arch_name == MIMO_V2
                 && cortiq_engine::mimo_mm::MimoTowerGroup::of(&name).is_some()
             {
+                if exclusion.skip_source(&name, file.bytes(m).len()) {
+                    continue;
+                }
                 crate::mimo_towers::emit_tower(
                     batches,
                     profiles,
@@ -7194,6 +7887,12 @@ pub fn run_convert_multi_towers(
                     _ => name,
                 }
             };
+            // `--exclude-tensors`: the canonical name is final here (a split
+            // below is checked again at the writer). Nothing has read the
+            // payload yet — the slice length is mmap metadata.
+            if exclusion.skip_source(&name, file.bytes(m).len()) {
+                continue;
+            }
 
             // DeepSeek-V4.1 Engram tables are native FP8 byte planes. Keep
             // both planes lossless as explicit U8 auxiliary tensors before
@@ -7290,6 +7989,23 @@ pub fn run_convert_multi_towers(
             }
             // Fine-grained FP8 scale planes ride with `.weight` below.
             if name.ends_with(".weight_scale_inv") {
+                continue;
+            }
+            // NVFP4 (ModelOpt): block and global weight scales ride with
+            // their `.weight`; activation and KV-cache calibration scalars
+            // and the AWQ pre-quant scale (folded below) are not weights.
+            if nvfp4_src.is_some()
+                && [
+                    ".weight_scale",
+                    ".weight_scale_2",
+                    ".input_scale",
+                    ".k_scale",
+                    ".v_scale",
+                    ".pre_quant_scale",
+                ]
+                .iter()
+                .any(|s| m.name.ends_with(s))
+            {
                 continue;
             }
             // MiMo-V2 fused qkv: TP-chunked rows AND a TP-chunked scale grid.
@@ -7389,6 +8105,41 @@ pub fn run_convert_multi_towers(
             } else {
                 None
             };
+            // `fp4` profile / `mxfp4` tensor quant: an OCP MXFP4 source
+            // (DeepSeek-V4/V4.1 experts: I8 [rows, cols/2] nibble pairs +
+            // E8M0 [rows, cols/32] scales) goes into the file as its own two
+            // planes — no dequant, no requant. Outputs that want another
+            // codec still take the f32 decode below.
+            let raw_fp4_rest: Vec<bool>;
+            let active: &[bool] = match dsv4_raw_mxfp4(
+                &arch,
+                &name,
+                m,
+                file,
+                files,
+                profiles,
+                active,
+                defrag_plan.is_none(),
+            )? {
+                Some((payload, shape, took)) => {
+                    for ((batch, &t), &a) in batches.iter_mut().zip(&took).zip(active) {
+                        if t && a {
+                            batch.push(TensorSpec {
+                                name: name.clone(),
+                                dtype: TensorDtype::Mxfp4,
+                                shape: shape.clone(),
+                                data: payload.clone(),
+                            });
+                        }
+                    }
+                    raw_fp4_rest = active.iter().zip(&took).map(|(&a, &t)| a && !t).collect();
+                    if !raw_fp4_rest.iter().any(|&a| a) {
+                        continue;
+                    }
+                    &raw_fp4_rest
+                }
+                None => active,
+            };
             // Its own two quantizations, decoded to f32 so the rest of the
             // pipeline (defrag, requant to q4tp/q2tp) is layout-agnostic:
             //   * experts  — I8 holding two FP4 (E2M1) values per byte with
@@ -7451,6 +8202,11 @@ pub fn run_convert_multi_towers(
                     vec![rows, cp * 2],
                     unpack_mxfp4(file.bytes(m), scales, rows, cp)?,
                 ))
+            } else if nvfp4_src.is_some() && m.dtype == "U8" && m.name.ends_with(".weight") {
+                // NVIDIA ModelOpt NVFP4: decode with the E4M3 block scales and
+                // the per-tensor `weight_scale_2`, fold an AWQ pre-quant scale
+                // into the columns, then continue as an ordinary f32 tensor.
+                Some(nvfp4_decode(m, file, files)?)
             } else if m.dtype == "U8" && m.name.ends_with(".weight") {
                 // MXFP4 under the plain `.weight` name (MiMo-V2 experts): U8
                 // [rows, cols/2] nibble pairs + a U8 E8M0 sibling
@@ -8211,7 +8967,7 @@ pub fn run_convert_multi_towers(
                 let writer = writers[i].as_mut().ok_or_else(|| {
                     anyhow::anyhow!("output {} is already finalized", outputs[i].1)
                 })?;
-                drain_to_writer(&mut tensors[i], writer)?;
+                drain_to_writer(&mut tensors[i], writer, &exclusion)?;
                 // Only now is this shard's work durable in the output file.
                 writer
                     .mark(sname)
@@ -8270,7 +9026,7 @@ pub fn run_convert_multi_towers(
                 let writer = writers[i].as_mut().ok_or_else(|| {
                     anyhow::anyhow!("output {} is already finalized", outputs[i].1)
                 })?;
-                drain_to_writer(&mut tensors[i], writer)?;
+                drain_to_writer(&mut tensors[i], writer, &exclusion)?;
                 writer
                     .mark(&file_name)
                     .map_err(|e| anyhow::anyhow!("manifest: {e}"))?;
@@ -8356,9 +9112,12 @@ pub fn run_convert_multi_towers(
         Quant::Q4Block => QuantType::Q4Block,
         Quant::F16 => QuantType::F16,
         Quant::Vbit => QuantType::Vbit,
-        Quant::Q4Tiled | Quant::Q4TiledP | Quant::Q2TiledP | Quant::Q2TiledPAffine => {
-            QuantType::Q4Block
-        }
+        Quant::Q4Tiled
+        | Quant::Q4TiledP
+        | Quant::Q2TiledP
+        | Quant::Q2TiledPAffine
+        | Quant::Mxfp4
+        | Quant::Fp4 => QuantType::Q4Block,
         // File-level label only (per-tensor truth is in the directory);
         // Vbit is the closest existing informational bucket for q1.
         Quant::Q1 | Quant::Q1p | Quant::Q1s | Quant::Q1t => QuantType::Vbit,
@@ -8442,6 +9201,15 @@ pub fn run_convert_multi_towers(
             p
         }
         None => provenance,
+    };
+    // `--exclude-tensors`: what the file deliberately leaves out of the
+    // source (checkers subtract these from the expected inventory).
+    let provenance = if exclusion.is_empty() {
+        provenance
+    } else {
+        let mut p = provenance;
+        p["excluded_tensors"] = serde_json::json!(exclude);
+        p
     };
     let provenance = if let Some(prism) = arch.prism_hadamard.as_ref() {
         let mut p = provenance;
@@ -8555,7 +9323,7 @@ pub fn run_convert_multi_towers(
             .take()
             .ok_or_else(|| anyhow::anyhow!("output {} has no writer", outputs[i].1))?;
         let mut writer = writer;
-        drain_to_writer(&mut tensors[i], &mut writer)?;
+        drain_to_writer(&mut tensors[i], &mut writer, &exclusion)?;
         writer
             .finish(&header_for(i), None, vocab.as_deref())
             .map_err(|e| anyhow::anyhow!("write {}: {e}", outputs[i].1))?;
@@ -8563,7 +9331,9 @@ pub fn run_convert_multi_towers(
         // until every requested output has finalized, so a crash between two
         // finish calls can detect the already-valid sibling on resume.
     }
+    exclusion.report(shards_done_before);
     for manifest_path in manifests {
+        let _ = std::fs::remove_file(exclusion_record_path(&manifest_path));
         let _ = std::fs::remove_file(manifest_path);
     }
     progress(1.0);
@@ -11379,6 +12149,140 @@ pub(crate) mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// `--resume` keeps the `--exclude-tensors` patterns the output was
+    /// started with: started without them and resumed with a pattern that
+    /// matches a tensor already written, or started with them and resumed
+    /// without (or with others), is refused before anything is written; the
+    /// same patterns finish the file without the excluded tensor, and the
+    /// record goes with the manifest.
+    #[test]
+    fn resume_refuses_a_changed_tensor_exclusion() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var(LOCAL_READY_DIR_ENV);
+            std::env::remove_var(SOURCE_SHARD_PRIORITY_ENV);
+            std::env::remove_var(CONSUME_SOURCE_SHARDS_ENV);
+            std::env::remove_var(CONVERT_ONLY_ENV);
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "cortiq-resume-exclude-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let first = "model-00001-of-00002.safetensors";
+        let second = "model-00002-of-00002.safetensors";
+        let first_values = vec![1.0f32, 2.0, 3.0, 4.0];
+        fs::write(
+            dir.join(first),
+            tiny_safetensors(&[("embed.weight", vec![2, 2], first_values.clone())]),
+        )
+        .unwrap();
+        fs::write(
+            dir.join(second),
+            tiny_safetensors(&[("norm.weight", vec![2], vec![1.0, 1.0])]),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "model_type": "deepseek_v41",
+                "text_config": {
+                    "model_type": "deepseek_v41_text", "hidden_size": 2,
+                    "intermediate_size": 4, "num_hidden_layers": 1,
+                    "num_attention_heads": 1, "num_key_value_heads": 1, "head_dim": 2,
+                    "vocab_size": 2, "rms_norm_eps": 1e-6
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("model.safetensors.index.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "weight_map": {"embed.weight": first, "norm.weight": second}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let output = dir.join("resume.cmf");
+        let manifest = format!("{}.manifest", output.display());
+        let record = exclusion_record_path(&manifest);
+        // An interrupted run: the first shard written and marked.
+        let partial = |record_patterns: Option<&[&str]>| {
+            let _ = fs::remove_file(&output);
+            let _ = fs::remove_file(&manifest);
+            let _ = fs::remove_file(&record);
+            let mut w = cortiq_core::format::CmfStreamWriter::new(
+                &output,
+                cortiq_core::format::CmfStreamWriter::head_reserve_for(8192, 96),
+            )
+            .unwrap()
+            .with_manifest(&manifest)
+            .unwrap();
+            let bytes: Vec<u8> = first_values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            w.push("model.embed_tokens.weight", TensorDtype::F32, &[2, 2], &bytes)
+                .unwrap();
+            w.mark(first).unwrap();
+            drop(w);
+            if let Some(p) = record_patterns {
+                fs::write(&record, serde_json::to_vec(p).unwrap()).unwrap();
+            }
+        };
+        let resume = |exclude: &[&str]| {
+            let exclude: Vec<String> = exclude.iter().map(|s| s.to_string()).collect();
+            run_convert_multi_excluding(
+                dir.to_str().unwrap(),
+                &[("q8".into(), output.to_str().unwrap().into())],
+                None,
+                None,
+                None,
+                true,
+                MimoTowers::TextOnly,
+                &exclude,
+                |_| {},
+            )
+        };
+
+        partial(None);
+        let e = resume(&["model.embed_tokens.weight"]).unwrap_err().to_string();
+        assert!(e.contains("started without --exclude-tensors"), "{e}");
+        assert!(e.contains("model.embed_tokens.weight"), "{e}");
+
+        partial(Some(&["model.norm.weight"]));
+        let e = resume(&[]).unwrap_err().to_string();
+        assert!(
+            e.contains("started with --exclude-tensors 'model.norm.weight' and is resumed with none"),
+            "{e}"
+        );
+        let e = resume(&["model.norm.*"]).unwrap_err().to_string();
+        assert!(e.contains("resumed with 'model.norm.*'"), "{e}");
+
+        partial(Some(&["model.norm.weight"]));
+        resume(&["model.norm.weight"]).unwrap();
+        let model = CmfModel::open(&output).unwrap();
+        assert!(model.verify().is_empty(), "{:?}", model.verify());
+        let names: Vec<&str> = model.tensors.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"model.embed_tokens.weight"), "{names:?}");
+        assert!(!names.contains(&"model.norm.weight"), "{names:?}");
+        assert_eq!(
+            model.header.provenance.as_ref().unwrap()["excluded_tensors"],
+            serde_json::json!(["model.norm.weight"])
+        );
+        drop(model);
+        assert!(!std::path::Path::new(&manifest).exists());
+        assert!(!std::path::Path::new(&record).exists());
+
+        // Started without patterns, nothing excluded written yet: the resume
+        // may add them (the record is written for the next resume).
+        partial(None);
+        resume(&["model.norm.weight"]).unwrap();
+        let model = CmfModel::open(&output).unwrap();
+        assert!(!model.tensors.iter().any(|t| t.name == "model.norm.weight"));
+        drop(model);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn convert_tiny_model_end_to_end() {
         // run_convert reads CMF_CONVERT_ONLY and the resume knobs, which
@@ -13691,3 +14595,35 @@ mod dspark_sidecar_tests {
         let _ = fs::remove_dir_all(&dir);
     }
 }
+
+/// Native FP4: the `mxfp4` codec, the `fp4` profile and the NVFP4 decoder.
+#[cfg(test)]
+#[path = "convert_fp4_tests.rs"]
+mod fp4_tests;
+
+#[cfg(test)]
+mod hub_retry_tests {
+    use super::*;
+
+    #[test]
+    fn hub_busy_codes_are_retried_long_others_are_not() {
+        for code in [429, 500, 502, 503, 504] {
+            let e = anyhow::anyhow!("download https://huggingface.co/x: status code {code}");
+            assert!(hub_busy(&e), "{code}");
+        }
+        for code in [401, 403, 404, 416] {
+            let e = anyhow::anyhow!("download https://huggingface.co/x: status code {code}");
+            assert!(!hub_busy(&e), "{code}");
+        }
+        assert!(!hub_busy(&anyhow::anyhow!("connection reset by peer")));
+        // a plain error still gives up after `attempts`
+        let mut calls = 0;
+        let r: anyhow::Result<()> = with_retry(2, || {
+            calls += 1;
+            anyhow::bail!("connection reset")
+        });
+        assert!(r.is_err());
+        assert_eq!(calls, 2);
+    }
+}
+
