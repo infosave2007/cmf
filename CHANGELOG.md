@@ -104,6 +104,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them off.
 
 ### Fixed
+- the `mxfp4` CPU kernel: the A8W8 path now dispatches on `a8w8_enabled()` like every
+  other SDOT kernel, so `CMF_SDOT=0` and the float-activation scopes keep the exact
+  contract; and its `sdot` asm is compiled with the `neon,dotprod` target feature,
+  which the iOS and Android targets need to build at all (0.8.24's FFI jobs failed
+  on it: `error: instruction requires: dotprod`).
 - `cortiq serve` with a DeepSeek-V4.1 file opens one slot: each slot built its
   own expert slot map over the single per-model GPU expert bank, so with
   several slots (the default on a multi-core host) one slot could compute with
