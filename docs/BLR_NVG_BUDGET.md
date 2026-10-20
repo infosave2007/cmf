@@ -231,6 +231,38 @@ gives up exactly the difference the sign training would have won (80.35) to
 the halved budget. So the allocation buys *almost twice the file* for about
 50 ppl, and the training then lands on top of whichever budget it is given.
 
+### Does it transfer to 27B? (measured on the GPU box)
+
+Qwen3.8-27B, NVG `blr` at 0.55 bpw (the published `q27-nvg055.cmf`, WikiText-2
+12×512 = **148.705** — the environment reproduces the published 148.6). The
+allocation's cheapest useful move at that scale: the **first four layers to
+1.0 bpw**, the rest untouched.
+
+| model | file | wiki12 | c4 |
+|---|---|---|---|
+| NVG 0.55, no training (the published base) | 4.893 GB | 148.705 | — |
+| **the first 4 layers at 1.0 bpw, no training** | 4.979 GB | **139.234** | 370.251 |
+| the base + metric training (published) | 4.893 GB | 48.31 | 89.70 |
+| the allocation + metric training (1 M tokens) | 4.979 GB | 59.772 | 147.213 |
+| the base + sign training (published, 3 M tokens) | 4.893 GB | 31.86 | 60.88 |
+| **the allocation + metric + sign training (2 M tokens)** | 4.979 GB | **34.487** | **79.421** |
+
+Two readings, and they point in opposite directions:
+
+* **The allocation transfers to the no-training conversion**: −6.4 % wiki12 for
+  +1.8 % of the file. The pole is the pole at 27B too.
+* **It does not survive the training**: after the training the published
+  uniform model is ahead (31.86 vs 34.49, and 60.88 vs 79.42 on c4 — partly
+  because it saw 3 M tokens against our 2 M). The training moves the model by
+  ×4.3 (148.7 → 34.5) while the allocation moves it by ×1.07. **The two
+  levers are not additive, and the training is the bigger one at scale** — the
+  allocation is worth having exactly where the training is not available.
+* And the two metrics disagree again: the allocated model's held-out KL after
+  the sign training is **1.552** against the published **1.663** — better — while
+  its perplexity is worse. The KL and the ppl are not the same objective; the
+  article's numbers are perplexities, and the KL is reported beside them, not
+  instead of them.
+
 ### The per-layer measurements do not compose
 
 The allocation above was measured **per layer** (one layer patched into the
