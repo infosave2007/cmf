@@ -149,8 +149,8 @@ impl<'a> Mx<'a> {
 #[allow(unreachable_code)]
 fn dot_i8(codes: &[u8], scales: &[u8], xq: &[i8]) -> f32 {
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        return dot_i8_sdot(codes, scales, xq);
+    if a8w8_enabled() {
+        return unsafe { dot_i8_sdot(codes, scales, xq) };
     }
     #[cfg(target_arch = "x86_64")]
     if avx2_enabled() {
@@ -177,6 +177,7 @@ fn dot_i8_scalar(codes: &[u8], scales: &[u8], xq: &[i8]) -> f32 {
 /// element order, two `sdot`s per group. Gated by `a8w8_enabled()` (which
 /// checks dotprod) like every other SDOT kernel.
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon,dotprod")]
 unsafe fn dot_i8_sdot(codes: &[u8], scales: &[u8], xq: &[i8]) -> f32 {
     // SAFETY: codes.len() == 16·gpr, xq.len() >= 32·gpr (callers).
     unsafe {
