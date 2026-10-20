@@ -895,9 +895,14 @@ pub fn pack(md: &BlrModel) -> Option<(Vec<u8>, BlrModel)> {
         p.g.iter_mut().for_each(|v| *v /= c);
         p.l.iter_mut().for_each(|v| *v *= a * c);
         let q = |v: f64| f16_to_f32(f32_to_f16(v as f32)) as f64;
-        for v in p.l.iter() {
-            if !v.is_finite() || (*v != 0.0 && (q(*v) == 0.0 || v.abs() < 6.1e-5)) {
+        for v in p.l.iter_mut() {
+            if !v.is_finite() {
                 return None;
+            }
+            // Sub-f16 terms are dead rank components: zero them instead of
+            // refusing the whole tensor (they contribute < 6.1e-5 each).
+            if *v != 0.0 && (q(*v) == 0.0 || v.abs() < 6.1e-5) {
+                *v = 0.0;
             }
         }
         if p.h
@@ -1111,6 +1116,7 @@ impl BlrDevice {
 
 pub struct BlrOpts {
     pub bpw: f64,
+    pub plan: Plan,
     pub method: Method,
     pub calib: Option<String>,
     pub kv_factor: f64,
@@ -1122,6 +1128,140 @@ pub struct BlrOpts {
     pub threads: usize,
     pub keep_src: bool,
     pub device: BlrDevice,
+}
+
+/// A bit-budget plan: the global `--bpw` is the default, a plan refines it per
+/// layer and per tensor.  One rule per line, `#` starts a comment:
+///
+/// ```text
+/// layer  <n>  <bpw>        # every tensor of layer n
+/// tensor <name> <bpw>     # one tensor (wins over the layer rule)
+/// ```
+///
+/// The budget a rule names is a *target*: the rank rule turns it into a rank,
+/// and the delivered bits can be slightly below it when the rank floor (8) or
+/// the shape cap clips the request (`blr_rank_clip`).  The conversion reports
+/// both numbers per tensor, so a plan is auditable.
+#[derive(Clone, Debug, Default)]
+pub struct Plan {
+    layers: std::collections::BTreeMap<usize, f64>,
+    tensors: std::collections::BTreeMap<String, f64>,
+}
+
+impl Plan {
+    /// Parse a plan file.  Unknown keys, bad numbers and out-of-range budgets
+    /// are errors — a silently ignored rule would spend the wrong bytes.
+    pub fn parse(text: &str) -> anyhow::Result<Self> {
+        let mut p = Plan::default();
+        for (i, line) in text.lines().enumerate() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            // a header row ("layer bpw") is skipped: the allocator writes one
+            if toks.len() == 2 && (toks[0] == "layer" || toks[0] == "tensor") && toks[1] == "bpw" {
+                continue;
+            }
+            let budget_of = |t: &str, i: usize| -> anyhow::Result<f64> {
+                let b: f64 = t
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("plan line {i}: '{t}' is not a number"))?;
+                anyhow::ensure!(
+                    b.is_finite() && b > 0.0 && b < 16.0,
+                    "plan line {i}: budget {b} out of range (0 < bpw < 16)"
+                );
+                Ok(b)
+            };
+            match toks[0] {
+                // `layer <n> <bpw>` / `tensor <name> <bpw>`
+                "layer" => {
+                    anyhow::ensure!(toks.len() >= 3, "plan line {}: expected a value", i + 1);
+                    anyhow::ensure!(toks.len() == 3, "plan line {}: too many fields", i + 1);
+                    let l: usize = toks[1]
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("plan line {}: '{}' is not a layer", i + 1, toks[1]))?;
+                    p.layers.insert(l, budget_of(toks[2], i + 1)?);
+                }
+                "tensor" => {
+                    anyhow::ensure!(toks.len() >= 3, "plan line {}: expected a value", i + 1);
+                    anyhow::ensure!(toks.len() == 3, "plan line {}: too many fields", i + 1);
+                    p.tensors.insert(toks[1].to_string(), budget_of(toks[2], i + 1)?);
+                }
+                // a bare layer number: the allocator's own output (`<n> <bpw>`)
+                other => {
+                    anyhow::ensure!(toks.len() >= 2, "plan line {}: expected a value", i + 1);
+                    anyhow::ensure!(toks.len() == 2, "plan line {}: too many fields", i + 1);
+                    let l: usize = other.parse().map_err(|_| {
+                        anyhow::anyhow!("plan line {}: unknown key '{other}' (layer|tensor|<layer number>)", i + 1)
+                    })?;
+                    p.layers.insert(l, budget_of(toks[1], i + 1)?);
+                }
+            }
+        }
+        Ok(p)
+    }
+
+    /// The budget of one tensor: its own rule, else the layer's, else the
+    /// global default.
+    pub fn bpw_for(&self, name: &str, layer: usize, default: f64) -> f64 {
+        if let Some(b) = self.tensors.get(name) {
+            return *b;
+        }
+        if let Some(b) = self.layers.get(&layer) {
+            return *b;
+        }
+        default
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.layers.is_empty() && self.tensors.is_empty()
+    }
+
+    pub fn layers(&self) -> &std::collections::BTreeMap<usize, f64> {
+        &self.layers
+    }
+    pub fn tensors(&self) -> &std::collections::BTreeMap<String, f64> {
+        &self.tensors
+    }
+}
+
+/// What a budget actually delivered for one tensor: the rank the rule gave,
+/// the bits it cost, and why the delivered budget may sit below the request.
+#[derive(Clone, Copy, Debug)]
+pub struct Delivered {
+    pub requested: f64,
+    pub achieved: f64,
+    pub rank: usize,
+    pub paths: usize,
+    pub clip: &'static str,
+}
+
+impl Delivered {
+    /// The budget a tensor of `m x n` got for a request of `bpw` bits.
+    pub fn of(m: usize, n: usize, bpw: f64, paths: usize, mult: f64) -> Self {
+        let rank = blr_rank(m, n, bpw, paths, mult);
+        Delivered {
+            requested: bpw,
+            achieved: blr_bits(m, n, rank, paths) as f64 / (m * n) as f64,
+            rank,
+            paths,
+            clip: cortiq_core::blr::blr_rank_clip(m, n, bpw, paths, mult),
+        }
+    }
+
+    /// The smallest budget a tensor of this shape can carry at all: the rank
+    /// floor (8) plus the 16-bit row and column scales. A request below it
+    /// is over-delivered — the container's own overhead is the floor.
+    pub fn min_bpw(m: usize, n: usize, paths: usize) -> f64 {
+        blr_bits(m, n, 8, paths) as f64 / (m * n) as f64
+    }
+
+    /// True when the request was below the container's own floor: the tensor
+    /// costs more than asked, and no encoder can do better.
+    pub fn over_budget(&self) -> bool {
+        self.achieved > self.requested + 1e-9
+    }
 }
 
 /// The calibration work file of layer `l`: only layers `0..=l` (later
@@ -1254,6 +1394,7 @@ pub fn run_convert_blr(
         "--blr-rho {} must be finite and non-negative",
         o.rho
     );
+    let plan = o.plan.clone();
     let gpu = o.method == Method::Nvg && o.device == BlrDevice::Gpu;
     if o.method == Method::Nvg {
         anyhow::ensure!(o.calib.is_some(), "--blr-method nvg needs --calib FILE");
@@ -1316,7 +1457,7 @@ pub fn run_convert_blr(
         });
     }
     eprintln!(
-        "blr: {} body linears over {nl} layers, method {} ({}), target {} BPW, kv×{} ({}), paths {}",
+        "blr: {} body linears over {nl} layers, method {} ({}), target {:.4} BPW, kv×{} ({}), paths {}",
         cand.len(),
         o.method.name(),
         if o.method == Method::Nvg { o.device.name() } else { "cpu" },
@@ -1356,13 +1497,18 @@ pub fn run_convert_blr(
                             if i >= cand.len() {
                                 break;
                             }
-                            let (slot, _, short) = cand[i];
+                            let (slot, layer, short) = cand[i];
                             let Ok(w) = load_f64(&srcm, slot) else {
                                 results.lock().unwrap().push((slot, None));
                                 continue;
                             };
-                            let enc =
-                                encode_dual_svid(Some(&pool), &w, o.bpw, mult_of(short), paths);
+                            let enc = encode_dual_svid(
+                                Some(&pool),
+                                &w,
+                                plan.bpw_for(&srcm.tensors[slot].name, layer, o.bpw),
+                                mult_of(short),
+                                paths,
+                            );
                             if let Some(e) = &enc {
                                 eprintln!(
                                     "  {} {}x{} {}",
@@ -1572,14 +1718,19 @@ pub fn run_convert_blr(
                     drop(grams);
                     let thc = th.elapsed().as_secs_f64();
                     let mut jobs = Vec::new();
-                    for &(slot, _, short) in &mine {
-                        jobs.push(crate::nvg_gpu::Job { w: load_f64(&srcm, slot)?, hc: &hctx[input_lead(short)], mult: mult_of(short) });
+                    for &(slot, layer, short) in &mine {
+                        jobs.push(crate::nvg_gpu::Job {
+                            w: load_f64(&srcm, slot)?,
+                            hc: &hctx[input_lead(short)],
+                            mult: mult_of(short),
+                            bpw: plan.bpw_for(&srcm.tensors[slot].name, layer, o.bpw),
+                        });
                     }
                     let njobs: usize = std::env::var("CMF_NVG_JOBS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
                     // stage syncs would serialise concurrent tensors
                     let want_prof = std::env::var("CMF_NVG_PROF").as_deref() == Ok("1") && njobs == 1;
                     let te = Instant::now();
-                    let done = crate::nvg_gpu::encode_many(&jobs, o.bpw, o.paths, threads, njobs, want_prof, &|i, d| {
+                    let done = crate::nvg_gpu::encode_many(&jobs, o.paths, threads, njobs, want_prof, &|i, d| {
                         let (_, _, short) = mine[i];
                         if let Ok(Some(e)) = &d.enc {
                             eprintln!("  L{l} {short:4} {}x{} {} ({:.1}s)", jobs[i].w.r, jobs[i].w.c, e.line, d.secs);
@@ -1640,10 +1791,11 @@ pub fn run_convert_blr(
                 .map(|(lead, c)| c.map(|c| (lead, c)))
                 .collect::<anyhow::Result<_>>()?;
                 let per = (threads / mine.len().max(1)).max(2);
+                let plan_ref = &plan;
                 let results: Vec<(usize, Option<Encoded>)> = std::thread::scope(|s| {
                     let hs: Vec<_> = mine
                         .iter()
-                        .map(|&(slot, _, short)| {
+                        .map(|&(slot, layer, short)| {
                             let (srcm, grams, hctx) = (&srcm, &grams, &hctx);
                             s.spawn(move || {
                                 let pool = Pool::new(per - 1);
@@ -1657,7 +1809,7 @@ pub fn run_convert_blr(
                                     &hctx[lead],
                                     hfit,
                                     hsel,
-                                    o.bpw,
+                                    plan_ref.bpw_for(&srcm.tensors[slot].name, layer, o.bpw),
                                     mult_of(short),
                                     o.paths,
                                     None,
@@ -1705,6 +1857,49 @@ pub fn run_convert_blr(
             }
         }
     }
+    // The budget contract: what was asked for, what the rank rule delivered.
+    // A clipped request (rank floor or shape cap) delivers *fewer* bits than
+    // asked — the report says so per tensor, so a plan is auditable.
+    let mut req_bits = 0f64;
+    let mut got_bits = 0f64;
+    let mut clipped: Vec<String> = Vec::new();
+    for (slot, layer, short) in &cand {
+        let e = &srcm.tensors[*slot];
+        if specs[*slot].dtype != TensorDtype::BinaryLowRank {
+            continue;
+        }
+        let b_req = plan.bpw_for(&e.name, *layer, o.bpw);
+        let mult = if gqa && (*short == "k" || *short == "v") { o.kv_factor } else { 1.0 };
+        let n = (e.shape[0] * e.shape[1]) as f64;
+        for p in 1..=2usize {
+            let d = Delivered::of(e.shape[0], e.shape[1], b_req, p, mult);
+            if d.clip.is_empty() {
+                continue;
+            }
+            let _ = d;
+        }
+        // the delivered plan is the one the encoder picked: read it back
+        if let Ok(h) = cortiq_core::blr::blr_parse_header(&specs[*slot].data) {
+            let d = Delivered::of(h.d_out, h.d_in, b_req, h.paths, mult);
+            req_bits += b_req * n;
+            got_bits += d.achieved * n;
+            if !d.clip.is_empty() {
+                clipped.push(format!("{} ({} bpw → {:.4} bpw, {})", e.name, b_req, d.achieved, d.clip));
+            }
+        }
+    }
+    if !clipped.is_empty() {
+        eprintln!(
+            "blr: {} tensor(s) could not spend the requested budget (rank floor / shape cap):",
+            clipped.len()
+        );
+        for c in clipped.iter().take(8) {
+            eprintln!("  {c}");
+        }
+        if clipped.len() > 8 {
+            eprintln!("  ... and {} more", clipped.len() - 8);
+        }
+    }
     // Strict accounting: the blr tensors alone (the container formula,
     // header excluded), and every projection of the layer stack whatever its
     // codec (blr bits + 8 · payload bytes of the rest) — the honest body
@@ -1734,6 +1929,12 @@ pub fn run_convert_blr(
     prov["blr"] = serde_json::json!({
         "method": o.method.name(),
         "target_bpw": o.bpw,
+        "plan": {
+            "layers": plan.layers(),
+            "tensors": plan.tensors(),
+        },
+        "requested_bpw": if req_bits > 0.0 { req_bits / (total_w.max(1) as f64) } else { o.bpw },
+        "clipped_tensors": clipped.len(),
         "blr_body_bpw": body_bpw,
         "blr_body_weights": total_w,
         "layer_projection_bpw": all_bpw,
@@ -1874,6 +2075,123 @@ mod tests {
                 assert_eq!(hc.uc.at(i, j), 0.0);
             }
         }
+    }
+
+    /// A budget plan parses layer and tensor rules; the tensor rule wins,
+    /// the layer rule covers its layer, and everything else falls back to
+    /// the global `--bpw`.
+    #[test]
+    fn plan_resolves_layer_tensor_and_default() {
+        let p = Plan::parse(
+            "# a comment\n\
+             layer 0 1.0\n\
+             \n\
+             layer 3 0.56   # inline comment\n\
+             tensor model.layers.1.mlp.down_proj.weight 0.11\n",
+        )
+        .unwrap();
+        assert_eq!(p.layers().len(), 2);
+        assert_eq!(p.tensors().len(), 1);
+        // the layer rule
+        assert_eq!(p.bpw_for("model.layers.0.mlp.gate_proj.weight", 0, 0.55), 1.0);
+        assert_eq!(p.bpw_for("model.layers.3.self_attn.q_proj.weight", 3, 0.55), 0.56);
+        // the tensor rule wins over the layer rule
+        assert_eq!(p.bpw_for("model.layers.1.mlp.down_proj.weight", 1, 0.55), 0.11);
+        // the default
+        assert_eq!(p.bpw_for("model.layers.2.mlp.gate_proj.weight", 2, 0.55), 0.55);
+        assert!(!p.is_empty());
+        assert!(Plan::default().is_empty());
+        // a header row (the allocator's output) is skipped
+        let p = Plan::parse("layer\tbpw\n0\t1.5\n7\t0.1\n").unwrap();
+        assert_eq!(p.layers().len(), 2);
+        assert_eq!(p.bpw_for("model.layers.0.mlp.gate_proj.weight", 0, 0.55), 1.5);
+        assert_eq!(p.bpw_for("model.layers.7.mlp.gate_proj.weight", 7, 0.55), 0.1);
+    }
+
+    /// A plan rule that cannot be honoured is an error, never a silent
+    /// fallback: a typo would spend the wrong bytes.
+    #[test]
+    fn plan_rejects_bad_rules() {
+        for bad in [
+            "layer 0",
+            "layer 0 abc",
+            "layer 0 0",
+            "layer 0 -1",
+            "layer 0 16",
+            "layer 0 1.0 extra",
+            "layers 0 1.0",
+            "tensor model.layers.0.mlp.gate_proj.weight",
+            "layer x 1.0",
+            "0 abc",
+            "0 1.0 extra",
+        ] {
+            assert!(Plan::parse(bad).is_err(), "should reject: {bad}");
+        }
+    }
+
+    /// The budget contract. A tensor costs what the rank rule gives it: never
+    /// more than the request — unless the request is below the container's own
+    /// floor (rank 8 plus the 16-bit row/column scales), which no encoder can
+    /// beat. The clip names which bound binds.
+    #[test]
+    fn delivered_budget_respects_the_request_or_names_the_floor() {
+        for &m in &[32usize, 64, 256, 1024, 2048] {
+            for &n in &[32usize, 64, 256, 1024, 3584] {
+                for &b in &[0.05f64, 0.11, 0.2, 0.55, 0.56, 1.0, 1.5, 4.0] {
+                    for &p in &[1usize, 2] {
+                        for &mult in &[0.5f64, 1.0, 2.0] {
+                            let d = Delivered::of(m, n, b, p, mult);
+                            let floor_bits = cortiq_core::blr::blr_min_bits(m, n, p) as f64;
+                            let target_bits = cortiq_core::blr::blr_target_bits(m, n, b, p, mult);
+                            let got_bits = d.achieved * (m * n) as f64;
+                            // never cheaper than the container's own floor
+                            assert!(
+                                got_bits >= floor_bits - 1e-9,
+                                "{m}x{n} b={b} p={p} mult={mult}: {got_bits} below the floor {floor_bits}"
+                            );
+                            if target_bits < floor_bits {
+                                // the request is below what the container can
+                                // hold: the floor is delivered, and named
+                                assert_eq!(d.clip, "floor");
+                                assert!((got_bits - floor_bits).abs() < 1e-9);
+                            } else {
+                                // the rank only moves down: the payload never
+                                // costs more than the rule's own target
+                                assert!(
+                                    got_bits <= target_bits + 1e-9,
+                                    "{m}x{n} b={b} p={p} mult={mult}: {got_bits} > target {target_bits}"
+                                );
+                            }
+                            assert_eq!(d.rank, blr_rank(m, n, b, p, mult));
+                        }
+                    }
+                }
+            }
+        }
+        // the rank floor binds: a tiny budget on a small tensor is
+        // over-delivered, and the clip names the bound.
+        let d = Delivered::of(32, 32, 0.05, 1, 1.0);
+        assert_eq!(d.clip, "floor");
+        assert!(d.over_budget());
+        assert!(d.achieved >= Delivered::min_bpw(32, 32, 1));
+        // the shape cap binds: a huge budget on a small tensor stops at the cap
+        // and costs *less* than asked.
+        let d = Delivered::of(64, 64, 8.0, 1, 1.0);
+        assert_eq!(d.clip, "cap");
+        assert_eq!(d.rank, 64);
+        assert!(!d.over_budget());
+        // a normal budget is delivered as asked, up to the rank step (the
+        // rank moves in steps of 8, so a request is answered from below)
+        let d = Delivered::of(1024, 1024, 0.56, 2, 1.0);
+        assert_eq!(d.clip, "");
+        assert!(!d.over_budget());
+        let step = cortiq_core::blr::blr_rank_step_bpw(1024, 1024, 2);
+        assert!(d.achieved <= 0.56, "delivered {}", d.achieved);
+        assert!(
+            0.56 - d.achieved <= step + 1e-9,
+            "delivered {} is more than a step ({step}) under the request",
+            d.achieved
+        );
     }
 
     /// Per-tensor drivers at a real budget: both methods emit a payload that

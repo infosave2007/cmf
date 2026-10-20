@@ -65,6 +65,19 @@ pub struct NvgTrainOpts<'a> {
     pub state_replace: bool,
     /// Resume from the latest state in this directory.
     pub resume: Option<&'a str>,
+    /// A bit-budget plan (`layer <n> <bpw>` / `tensor <name> <bpw>`): the
+    /// student's BLR tensors are re-encoded at the planned budget before the
+    /// training starts, with the teacher's weights as the encode target.
+    pub budget_plan: Option<&'a str>,
+    /// Directory with the cached input Grams (`L{layer}.{lead}.{kind}.gram`).
+    pub budget_gram_cache: Option<&'a str>,
+    /// The per-head row gauge on the re-encoded tensors.
+    pub budget_rowweight: bool,
+    /// The capture's FIT / SEL tokens for the re-encode.
+    pub budget_fit_tokens: usize,
+    pub budget_sel_tokens: usize,
+    /// The device jobs of the re-encode.
+    pub budget_jobs: usize,
 }
 
 const TOPK_MAGIC: &[u8; 8] = b"NVGTOPK1";
@@ -138,11 +151,212 @@ fn topk_save(path: &str, key: u64, ids: &[Vec<u32>], ps: &[Vec<f32>]) -> anyhow:
     Ok(())
 }
 
+/// The allocation step of the training pipeline: re-encode the student's BLR
+/// tensors whose budget the plan changes, with the teacher's weights as the
+/// encode target and the student's own input Grams as the calibration. The
+/// layers the plan does not name keep their payloads untouched.
+///
+/// Returns the re-planned student (a new model: the payloads of the re-encoded
+/// tensors differ, so the file is rewritten).
+fn apply_budget_plan(
+    student: &CmfModel,
+    teacher: &CmfModel,
+    plan: &crate::nvg::Plan,
+    o: &NvgTrainOpts,
+) -> anyhow::Result<CmfModel> {
+    let student = std::sync::Arc::new(CmfModel::open_sharded(&student.path)?);
+    let teacher = std::sync::Arc::new(CmfModel::open_sharded(&teacher.path)?);
+    use cortiq_core::blr::{blr_bits, blr_parse_header};
+    use cortiq_core::format::TensorSpec;
+    use cortiq_core::types::TensorDtype;
+    // the budget every tensor has now
+    let mut current: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for e in student.tensors.iter() {
+        if e.dtype != TensorDtype::BinaryLowRank {
+            continue;
+        }
+        let bytes = student.entry_bytes(e);
+        let Ok(h) = blr_parse_header(bytes) else { continue };
+        let n = (e.shape[0] * e.shape[1]) as f64;
+        current.insert(
+            e.name.clone(),
+            blr_bits(h.d_out, h.d_in, h.rank, h.paths) as f64 / n,
+        );
+    }
+    // the wanted budget per tensor: the plan's rule, else the tensor's own
+    let mut want: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    let mut layers: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for (name, cur) in &current {
+        let layer = crate::nvg::body_linear(name).map(|(l, _)| l);
+        let w = plan.bpw_for(name, layer.unwrap_or(0), *cur);
+        want.insert(name.clone(), w);
+        if (w - cur).abs() > 1e-9 {
+            if let Some(l) = layer {
+                layers.insert(l);
+            }
+        }
+    }
+    if layers.is_empty() {
+        eprintln!("nvg-train: the plan asks for the budget every tensor already has — nothing to re-encode");
+        return Ok(CmfModel::open_sharded(o.student)?);
+    }
+    eprintln!(
+        "nvg-train: budget plan — re-encoding {} layer(s) at the planned budget ({} layer rules, {} tensor rules)",
+        layers.len(),
+        plan.layers().len(),
+        plan.tensors().len()
+    );
+    let mut payloads: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    for &layer in &layers {
+        let names: Vec<String> = current
+            .keys()
+            .filter(|n| {
+                crate::nvg::body_linear(n.as_str())
+                    .is_some_and(|(l, _)| l == layer && (want[n.as_str()] - current[n.as_str()]).abs() > 1e-9)
+            })
+            .cloned()
+            .collect();
+        if names.is_empty() {
+            continue;
+        }
+        // the layer's input Grams: the cached ones, else the student's own forward
+        let mut leads: Vec<&'static str> = Vec::new();
+        for n in &names {
+            if let Some((_, short)) = crate::nvg::body_linear(n) {
+                let lead = crate::nvg::input_lead(short);
+                if !leads.contains(&lead) {
+                    leads.push(lead);
+                }
+            }
+        }
+        let mut grams: std::collections::HashMap<&'static str, (crate::nvg_linalg::Mat, crate::nvg_linalg::Mat)> =
+            std::collections::HashMap::new();
+        let mut missing: Vec<&'static str> = Vec::new();
+        for &lead in &leads {
+            let (a, b) = match o.budget_gram_cache {
+                Some(dir) => {
+                    let p = format!("{dir}/L{layer}.{lead}.fit.gram");
+                    let q = format!("{dir}/L{layer}.{lead}.sel.gram");
+                    match (std::fs::read(&p), std::fs::read(&q)) {
+                        (Ok(a), Ok(b)) => (load_gram_bytes(&a)?, load_gram_bytes(&b)?),
+                        _ => {
+                            missing.push(lead);
+                            continue;
+                        }
+                    }
+                }
+                None => {
+                    missing.push(lead);
+                    continue;
+                }
+            };
+            grams.insert(lead, (a, b));
+        }
+        if !missing.is_empty() {
+            let calib = o
+                .calib
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("--budget-plan needs --calib for the Gram capture"))?;
+            let path = calib.split('=').next().unwrap_or(calib);
+            let captured = crate::nvgbench::capture_layer_grams(
+                &student,
+                layer,
+                &missing,
+                path,
+                o.budget_fit_tokens,
+                o.budget_sel_tokens,
+            )?;
+            for lead in missing {
+                let (a, b, _, _) = captured[lead].clone();
+                grams.insert(lead, (a, b));
+            }
+        }
+        let t0 = Instant::now();
+        let done = crate::nvgbench::recode_layer(
+            &student,
+            Some(&teacher),
+            layer,
+            plan,
+            0.0,
+            &grams,
+            o.budget_rowweight,
+            0.03,
+            o.budget_jobs.max(1),
+            8,
+        )?;
+        for (name, bytes, achieved) in done {
+            eprintln!("  {name}: {} bytes, {:.4} bpw", bytes.len(), achieved);
+            payloads.insert(name, bytes);
+        }
+        eprintln!("  layer {layer} re-encoded in {:.0}s", t0.elapsed().as_secs_f64());
+    }
+    // the re-planned student
+    let specs: Vec<TensorSpec> = student
+        .tensors
+        .iter()
+        .map(|e| {
+            let data = payloads
+                .get(&e.name)
+                .cloned()
+                .unwrap_or_else(|| student.entry_bytes(e).to_vec());
+            TensorSpec {
+                name: e.name.clone(),
+                dtype: if payloads.contains_key(&e.name) {
+                    TensorDtype::BinaryLowRank
+                } else {
+                    e.dtype
+                },
+                shape: e.shape.clone(),
+                data,
+            }
+        })
+        .collect();
+    let mut header = student.header.clone();
+    header.section_hashes = None;
+    let path = format!("{}.planned.cmf", o.output);
+    CmfModel::write(&path, &header, &specs, None, student.vocab.as_deref())
+        .map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+    eprintln!("nvg-train: re-planned student → {path}");
+    Ok(CmfModel::open_sharded(&path)?)
+}
+
+/// Read a cached Gram file (the `nvg-bench` format: magic, n, count, f32 data).
+fn load_gram_bytes(raw: &[u8]) -> anyhow::Result<crate::nvg_linalg::Mat> {
+    anyhow::ensure!(raw.len() > 16, "gram file too short");
+    let n = u32::from_le_bytes(raw[4..8].try_into().unwrap()) as usize;
+    anyhow::ensure!(raw.len() >= 16 + n * n * 4, "gram file truncated");
+    let d: Vec<f64> = raw[16..16 + n * n * 4]
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64)
+        .collect();
+    Ok(crate::nvg_linalg::Mat::from_vec(n, n, d))
+}
+
 pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
     let t0 = Instant::now();
+    // The plan is parsed first: a malformed rule is a cheap error, and it
+    // must not be hidden behind a missing GPU or a missing model.
+    let plan = match o.budget_plan {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("--budget-plan {path}: {e}"))?;
+            Some(crate::nvg::Plan::parse(&text).map_err(|e| anyhow::anyhow!("--budget-plan {path}: {e}"))?)
+        }
+        None => None,
+    };
     let c = cortiq_engine::gpu_wgpu::train_ops::dev().ok_or_else(|| anyhow::anyhow!("nvg-train needs a wgpu GPU"))?;
     let tmodel = CmfModel::open_sharded(o.teacher)?;
-    let smodel = CmfModel::open_sharded(o.student)?;
+    // The allocation step: the plan moves the bits to the layers that need
+    // them, and the training then optimises the metric (and the signs) of the
+    // re-planned payloads. The layers the plan does not name keep their own
+    // budget — their payloads are not touched.
+    let smodel = match &plan {
+        Some(plan) => {
+            let base = CmfModel::open_sharded(o.student)?;
+            apply_budget_plan(&base, &tmodel, plan, o)?
+        }
+        None => CmfModel::open_sharded(o.student)?,
+    };
     let vocab = tmodel.vocab.as_deref().ok_or_else(|| anyhow::anyhow!("teacher has no embedded tokenizer"))?;
     let tok = cortiq_engine::tokenizer::Tokenizer::from_bytes(vocab).map_err(|e| anyhow::anyhow!("{e:?}"))?;
     let srcs: Vec<CalibSource> = o.calib.iter().map(|s| CalibSource::parse(s)).collect::<anyhow::Result<_>>()?;
