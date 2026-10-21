@@ -12543,8 +12543,25 @@ pub(crate) mod tests {
         assert_eq!(pipeline.rope_scale_local, 1.0);
         let full_yarn = cortiq_engine::attention::yarn_inv_freq(8, 500000.0, 16.0, 8192, 32.0, 1.0);
         let local_rope = cortiq_engine::attention::rope_inv_freq(8, 500000.0);
-        assert_eq!(pipeline.rope_inv_freq(), full_yarn.as_slice());
-        assert_eq!(pipeline.inv_freq_local.as_ref().unwrap().as_slice(), local_rope.as_slice());
+        // the frequencies are recomputed from the same numbers, but the pipeline
+        // keeps them in f32 while the helper may compute in f64: compare with a
+        // tolerance (an exact comparison is a 1-ULP coin flip per platform)
+        let close = |a: &[f32], b: &[f32]| {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(x, y)| (x - y).abs() <= 1e-6 * x.abs().max(1.0))
+        };
+        assert!(
+            close(pipeline.rope_inv_freq(), full_yarn.as_slice()),
+            "full YaRN frequencies differ: {:?} vs {:?}",
+            pipeline.rope_inv_freq(),
+            full_yarn.as_slice()
+        );
+        assert!(close(
+            pipeline.inv_freq_local.as_ref().unwrap().as_slice(),
+            local_rope.as_slice()
+        ));
         assert_ne!(full_yarn, local_rope, "full YaRN must not use the local profile");
         assert_eq!(pipeline.rotary_dim_local, Some(8));
         let logits = pipeline.forward_ids(&[0, 1], None).unwrap();
