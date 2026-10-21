@@ -1098,9 +1098,12 @@ impl BlrDevice {
                 anyhow::ensure!(cfg!(feature = "gpu"), "--blr-device gpu needs a build with the gpu feature");
                 Ok(BlrDevice::Gpu)
             }
+            // The GPU encoder is the wgpu path (Metal on macOS, CUDA elsewhere):
+            // macOS was excluded here, so every conversion on a Mac ran the
+            // f64 CPU encoder — measured 63 s per tensor against ~6 s on the
+            // device. The bench path already used the device there.
             "auto" => Ok(
                 if cfg!(feature = "gpu")
-                    && !cfg!(target_os = "macos")
                     && std::env::var("CMF_GPU").as_deref() != Ok("0")
                     && cortiq_engine::gpu::backend_available()
                 {
@@ -1146,6 +1149,11 @@ pub struct BlrOpts {
 pub struct Plan {
     layers: std::collections::BTreeMap<usize, f64>,
     tensors: std::collections::BTreeMap<String, f64>,
+    /// Layers (and tensors) that stay EXACT at the model's non-blr codec
+    /// (q8_2f): the damage of a stack of layers compounds, so leaving the
+    /// harmful ones untouched buys more than shaving bits off them.
+    keep_layers: std::collections::BTreeSet<usize>,
+    keep_tensors: std::collections::BTreeSet<String>,
 }
 
 impl Plan {
@@ -1174,6 +1182,33 @@ impl Plan {
                 Ok(b)
             };
             match toks[0] {
+                // `keep layer <n>` / `keep tensor <name>` / `keep <n>` — the
+                // layer stays exact (q8_2f) instead of being encoded.
+                "keep" => {
+                    anyhow::ensure!(toks.len() >= 2, "plan line {}: expected a layer or a tensor", i + 1);
+                    let what = &toks[1];
+                    if *what == "layer" || *what == "tensor" {
+                        anyhow::ensure!(toks.len() == 3, "plan line {}: too many fields", i + 1);
+                        if *what == "layer" {
+                            let l: usize = toks[2].parse().map_err(|_| {
+                                anyhow::anyhow!("plan line {}: '{}' is not a layer", i + 1, toks[2])
+                            })?;
+                            p.keep_layers.insert(l);
+                        } else {
+                            p.keep_tensors.insert(toks[2].to_string());
+                        }
+                    } else {
+                        anyhow::ensure!(toks.len() == 2, "plan line {}: too many fields", i + 1);
+                        let l: usize = what.parse().map_err(|_| {
+                            anyhow::anyhow!(
+                                "plan line {}: '{}' is not a layer or a tensor",
+                                i + 1,
+                                what
+                            )
+                        })?;
+                        p.keep_layers.insert(l);
+                    }
+                }
                 // `layer <n> <bpw>` / `tensor <name> <bpw>`
                 "layer" => {
                     anyhow::ensure!(toks.len() >= 3, "plan line {}: expected a value", i + 1);
@@ -1215,7 +1250,18 @@ impl Plan {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.layers.is_empty() && self.tensors.is_empty()
+        self.layers.is_empty() && self.tensors.is_empty() && self.keep_layers.is_empty()
+            && self.keep_tensors.is_empty()
+    }
+
+    /// Does this tensor stay exact? A tensor rule wins over the layer rule.
+    pub fn keeps(&self, name: &str, layer: usize) -> bool {
+        self.keep_tensors.contains(name) || self.keep_layers.contains(&layer)
+    }
+
+    /// The layers the plan keeps exact (for the report).
+    pub fn kept_layers(&self) -> &std::collections::BTreeSet<usize> {
+        &self.keep_layers
     }
 
     pub fn layers(&self) -> &std::collections::BTreeMap<usize, f64> {
@@ -1443,7 +1489,11 @@ pub fn run_convert_blr(
                 && e.shape[1] % 32 == 0
                 && e.shape[0] % 16 == 0
             {
-                cand.push((slot, l, short));
+                // a kept layer stays exact: its tensors keep the q8_2f spec
+                // written above and never enter the encoder
+                if !o.plan.keeps(&e.name, l) {
+                    cand.push((slot, l, short));
+                }
             }
             crate::convert::quantize_2d(crate::convert::Quant::Q8_2f, &v, e.shape[0], e.shape[1])
         } else {
