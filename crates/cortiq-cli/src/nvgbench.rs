@@ -140,12 +140,40 @@ pub fn run(o: &BenchOpts) -> anyhow::Result<()> {
     let gpu_calib = !cfg!(target_os = "macos")
         && std::env::var("CMF_GPU").as_deref() != Ok("0")
         && cortiq_engine::gpu::backend_available();
-    if gpu_calib && std::env::var("CMF_GPU_WGPU_GRAPH").is_err() {
+    // On macOS the device capture stays off by default (the wgpu/Metal path
+    // was excluded here), but the Gram folding is the dominant cost of a
+    // sequential conversion — so it can be turned on explicitly where the
+    // device capture is known to work (CMF_NVG_BENCH_DEVICE_CAPTURE=1).
+    let device_capture = gpu_calib
+        || (std::env::var("CMF_NVG_BENCH_DEVICE_CAPTURE").as_deref() == Ok("1")
+            && std::env::var("CMF_GPU").as_deref() != Ok("0")
+            && cortiq_engine::gpu::backend_available());
+    if device_capture && std::env::var("CMF_GPU_WGPU_GRAPH").is_err() {
         // SAFETY: single-threaded, before any pipeline exists.
         unsafe { std::env::set_var("CMF_GPU_WGPU_GRAPH", "0") };
     }
-    cortiq_engine::gptq_capture::set_device(gpu_calib);
+    cortiq_engine::gptq_capture::set_device(device_capture);
     let model = Arc::new(CmfModel::open_sharded(o.model)?);
+    if std::env::var("NVG_BENCH_CAPTURE_ALL").as_deref() == Ok("1") {
+        // every layer's input Grams in one forward pass
+        if device_capture && std::env::var("CMF_GPU_WGPU_GRAPH").is_err() {
+            // the resident token graph would hide the projection inputs from
+            // the capture hook — the per-op path keeps them visible
+            // SAFETY: single-threaded, before any pipeline exists.
+            unsafe { std::env::set_var("CMF_GPU_WGPU_GRAPH", "0") };
+        }
+        let layers: Vec<usize> = (0..model.arch().num_layers).collect();
+        let calib = o.calib.ok_or_else(|| anyhow::anyhow!("--calib FILE is needed to capture the Grams"))?;
+        let captured = capture_all_layers(&model, &layers, calib, o.fit_tokens, o.sel_tokens)?;
+        let cache = o.gram_cache.ok_or_else(|| anyhow::anyhow!("--gram-cache PREFIX is needed"))?;
+        for ((l, lead), (a, b, ca, cb)) in &captured {
+            // the same names the per-layer capture writes: "{prefix}{layer}.{lead}.{kind}"
+            save_gram(&format!("{cache}{l}.{lead}.fit.gram"), a, *ca)?;
+            save_gram(&format!("{cache}{l}.{lead}.sel.gram"), b, *cb)?;
+        }
+        println!("[gpu] captured {} layer input contexts in one pass", captured.len());
+        return Ok(());
+    }
     if let (None, Some(l)) = (o.tensor, o.layer) {
         return run_layer(&model, o, l);
     }
@@ -457,6 +485,66 @@ pub fn recode_layer(
         let achieved =
             cortiq_core::blr::blr_bits(h.d_out, h.d_in, h.rank, h.paths) as f64 / (h.d_out * h.d_in) as f64;
         out.push((model.tensors[mine[i].0].name.clone(), bytes, achieved));
+    }
+    Ok(out)
+}
+
+/// Capture the input Grams of EVERY layer's leads in ONE forward pass over the
+/// calibration text. The capture hook filters by tensor name, so one pass over
+/// the full stack collects every layer's inputs at once; the per-layer capture
+/// costs a forward per layer (O(n²) over the stack) — this is the difference
+/// between one minute and half an hour for a 28-layer model.
+///
+/// Returns (layer, lead) → (fit Gram, sel Gram, fit tokens, sel tokens).
+pub fn capture_all_layers(
+    model: &Arc<CmfModel>,
+    layers: &[usize],
+    calib: &str,
+    fit_tokens: usize,
+    sel_tokens: usize,
+) -> anyhow::Result<std::collections::HashMap<(usize, &'static str), (Mat, Mat, usize, usize)>> {
+    let text = std::fs::read_to_string(calib)?;
+    let nl = model.arch().num_layers;
+    let mut pipe = cortiq_engine::Pipeline::from_model(model, cortiq_engine::SamplerConfig::default())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    pipe.set_confidence(false);
+    let ids = pipe.tokenizer.encode(&text);
+    let need = fit_tokens + sel_tokens;
+    anyhow::ensure!(ids.len() >= need, "calibration text has {} tokens, need {need}", ids.len());
+    let mut names = std::collections::HashSet::new();
+    let mut lead_of: std::collections::HashMap<String, (usize, &'static str)> = std::collections::HashMap::new();
+    for e in model.tensors.iter() {
+        let Some((l, short)) = nvg::body_linear(&e.name) else { continue };
+        if !layers.contains(&l) {
+            continue;
+        }
+        let lead = nvg::input_lead(short);
+        let nm = nvg::lead_name(l, lead);
+        names.insert(nm.clone());
+        lead_of.insert(nm, (l, lead));
+    }
+    anyhow::ensure!(!names.is_empty(), "no body linears in the requested layers");
+    let mut caps = Vec::new();
+    for (a, b) in [(0, fit_tokens), (fit_tokens, need)] {
+        let keep = names.clone();
+        cortiq_engine::gptq_capture::begin_filtered(true, move |n| keep.contains(n));
+        let t = Instant::now();
+        for w in ids[a..b].chunks(512).filter(|c| c.len() >= 2) {
+            pipe.calib_forward(w, nl, 512).map_err(|e| anyhow::anyhow!(e))?;
+        }
+        caps.push(cortiq_engine::gptq_capture::end());
+        eprintln!(
+            "nvg-bench: one-pass capture of {} inputs over {} tokens in {:.1}s",
+            names.len(),
+            b - a,
+            t.elapsed().as_secs_f64()
+        );
+    }
+    let mut out = std::collections::HashMap::new();
+    for (nm, key) in lead_of {
+        let fit = caps[0].get(&nm).ok_or_else(|| anyhow::anyhow!("no capture for {nm}"))?;
+        let sel = caps[1].get(&nm).ok_or_else(|| anyhow::anyhow!("no capture for {nm}"))?;
+        out.insert(key, (nvg::mean_gram(fit), nvg::mean_gram(sel), fit.count, sel.count));
     }
     Ok(out)
 }
