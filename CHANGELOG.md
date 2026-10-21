@@ -5,6 +5,15 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `patch-tensor --dtype blr` stores a NVG-encoded BLR payload verbatim in a
+  slot of another dtype (the campaign had to patch an encoder's payload into a
+  q8_2f model to attribute the damage per tensor group; without it the tool
+  refused the payload). The BLR code is produced by the NVG encoder, so it has
+  no `Quant` counterpart — it is accepted verbatim with `--raw` only.
+
 ## [0.8.27] — 2026-10-21
 
 ### Fixed

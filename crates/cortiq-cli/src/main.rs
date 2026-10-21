@@ -7692,15 +7692,24 @@ fn dequant_dump_bytes<'a>(
 /// q8_2f when the input dim is not a multiple of the group, exactly as
 /// `quantize_2d` does). The length check is `validate_payload`'s, i.e. the
 /// reader's own rule, so a payload that passes here also passes `open()`.
+/// The dtype a patched payload is stored in: a re-encodable quantization, or a
+/// verbatim container dtype (the BLR code — its payload is produced by the
+/// NVG encoder, not by `quantize_2d`).
+enum PatchDtype {
+    Quant(convert::Quant),
+    Verbatim(TensorDtype),
+}
+
 fn raw_patch_dtype(
     e: &cortiq_core::format::TensorEntry,
-    forced: Option<convert::Quant>,
+    forced: Option<&PatchDtype>,
     payload: &[u8],
 ) -> anyhow::Result<TensorDtype> {
     let dt = match forced {
         None => e.dtype,
-        Some(convert::Quant::F16) => TensorDtype::F16,
-        Some(q) => {
+        Some(PatchDtype::Verbatim(dt)) => *dt,
+        Some(PatchDtype::Quant(convert::Quant::F16)) => TensorDtype::F16,
+        Some(PatchDtype::Quant(q)) => {
             anyhow::ensure!(
                 e.shape.len() == 2,
                 "{}: raw {q:?} wants a 2-D tensor (shape {:?})",
@@ -7709,7 +7718,7 @@ fn raw_patch_dtype(
             );
             // A one-row probe picks the dtype without encoding the tensor.
             let cols = e.shape[1];
-            convert::quantize_2d(q, &vec![0f32; cols], 1, cols).0
+            convert::quantize_2d(*q, &vec![0f32; cols], 1, cols).0
         }
     };
     cortiq_core::quant::validate_payload(dt, &e.shape, payload)
@@ -7738,9 +7747,14 @@ fn cmd_patch_tensor(
             other => anyhow::bail!("cannot re-encode dtype {other:?} here"),
         })
     };
-    let forced: Option<convert::Quant> = match dtype {
+    let forced: Option<PatchDtype> = match dtype {
         None => None,
-        Some(q) => Some(convert::parse_quant(q)?),
+        // The BLR code is produced by the NVG encoder and stored verbatim —
+        // it has no `Quant` counterpart (the converter runs its own encoder).
+        Some(q) if q.eq_ignore_ascii_case("blr") => {
+            Some(PatchDtype::Verbatim(TensorDtype::BinaryLowRank))
+        }
+        Some(q) => Some(PatchDtype::Quant(convert::parse_quant(q)?)),
     };
     // (directory index, dtype, payload)
     let mut patches: Vec<(usize, TensorDtype, Vec<u8>)> = Vec::new();
@@ -7759,7 +7773,7 @@ fn cmd_patch_tensor(
         if raw_payload {
             // Verbatim payload: no re-encode, only the reader's own
             // length rule for the target dtype and the in-place slot.
-            let dt = raw_patch_dtype(e, forced, &raw).map_err(|er| anyhow::anyhow!("{path}: {er}"))?;
+            let dt = raw_patch_dtype(e, forced.as_ref(), &raw).map_err(|er| anyhow::anyhow!("{path}: {er}"))?;
             if output.is_none() {
                 anyhow::ensure!(
                     e.shard == 0,
@@ -7789,7 +7803,12 @@ fn cmd_patch_tensor(
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         let quant = match forced {
-            Some(q) => q,
+            Some(PatchDtype::Quant(q)) => q,
+            // A verbatim dtype has no float source: it only exists as an
+            // already-encoded payload (--raw).
+            Some(PatchDtype::Verbatim(dt)) => anyhow::bail!(
+                "--dtype {dt:?} stores an already-encoded payload: pass it with --raw"
+            ),
             None => quant_of(e.dtype)?,
         };
         // Float targets take any shape (norms, biases, conv taps); the
