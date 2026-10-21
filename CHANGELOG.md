@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `nvg-bench`: `NVG_BENCH_CAPTURE_ALL=1` captures the input Grams of **every**
+  layer in ONE forward pass (the capture hook filters by tensor name, so one
+  pass over the stack collects them all). The per-layer capture costs a forward
+  per layer — O(n²) over the stack; on a 24-layer model this is 5.5× less
+  work, and the Grams are bit-identical to the per-layer ones (max relative
+  difference 4.7e-07, the f32 accumulation order). The file names match the
+  per-layer cache (`{prefix}{layer}.{lead}.{kind}.gram`), so a layer run
+  reuses them.
+- `nvg-bench`: `CMF_NVG_BENCH_DEVICE_CAPTURE=1` folds the Grams on the
+  device. macOS was excluded from the device capture (`!cfg!(target_os =
+  "macos")`), so the campaign's Grams were computed on the host; with the
+  device the folding drops from 7.7 s to 0.1 s and the Gram is unchanged
+  (max relative difference 2e-07).
+
 ## [0.8.26] - 2026-10-21
 
 ### Fixed
