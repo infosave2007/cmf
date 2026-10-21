@@ -23,6 +23,10 @@ The allocated model has the **same bytes** as the uniform one (+0.4 %) and is
 **−364.7 ppl** better on wiki and **−381.4** on c4. Nothing about the encoder
 changed: only *where the bits went* and *how the choice was made*.
 
+This is one model. On the second model of the campaign (Qwen3-0.6B) the same
+encoder **destroys the model at every budget** — §9 — which is why the product
+now needs a perplexity gate on the conversion.
+
 And the second table is the one that should stop a reader:
 
 | L0 (the pole layer) encoded at | wiki ppl (4×512) | vs the sign-trained student |
@@ -588,7 +592,57 @@ every layer above it, so one trial costs a full re-conversion (40 min on the
 of §5 — and the model-level descent is the instrument that validates it.
 
 
-## 9. What became a product feature
+## 9. The second model: Qwen3-0.6B, where the codec breaks
+
+The allocation result above is one model. The second model of the campaign is
+Qwen3-0.6B — a *plain attention* Qwen3 (no GDN layers), 28 layers, hidden
+1024. Measured with the same skeleton, the same encoder and the same protocol
+(wiki 16×512):
+
+| model | body bpw | wiki ppl |
+|---|---|---|
+| teacher (q8_2f) | 8.02 | **28.33** |
+| the product's NVG conversion, 1.0 bpw | 0.989 | **14 162.9** — destroyed |
+| uniform NVG, 0.55 bpw | 0.545 | **38 404.9** — destroyed |
+| allocated (L0–3 → 1.5, L24–27 → 0.3, rest 0.55) | ~0.55 | **25 420.0** — destroyed, but −34 % vs uniform |
+| "is it the budget?": first 8 layers at 2.5 bpw | — | 15 500–22 964 — still destroyed |
+
+Three facts come out of it, and the third is the uncomfortable one:
+
+1. **The applicability of the codec is architecture-dependent.** The same
+   encoder gives 672 ppl at 1.0 bpw on Qwen3.5-0.8B (a GDN hybrid) and
+   148.6 at 0.55 bpw on the 27B, but destroys the 0.6B at *every* budget
+   tried (0.55, 1.0, 2.5 on the first eight layers).
+2. **It is not the budget.** Giving the first eight layers 2.5 bpw — 2.5× the
+   product's budget — does not bring the model back.
+3. **The layer-local metric does not predict it either.** The 0.6B's mean layer
+   `sel` at 0.55 bpw is **0.264**, *better* than the 0.8B's 0.29, while its
+   model is four orders of magnitude worse. This is the third independent
+   confirmation of §4: the local weight error is blind to what matters.
+
+Two product consequences follow, and they are more valuable than the negative
+result itself:
+
+* **The conversion must be gated by a perplexity check.** A user asking for a
+  1-bit model must never receive a model with ppl 14 000 that looks like a
+  model. The pipeline is *convert → measure → threshold*, and the conversion
+  that fails the threshold is a failure of the conversion, not of the user's
+  hardware.
+* **Bits do not fix a broken fit.** The allocation still bought −34 % on the
+  0.6B, but a model at 25 420 ppl is a model that does not answer. The
+  allocation optimizes the *distribution* of the budget, and it cannot repair
+  a codec that does not fit the weights at all.
+
+And a methodological note, because the second model exposed two bugs in the
+campaign driver that the first model could not: the payload directory was
+shared between models of different sizes (a 0.8B payload was silently
+offered to a 0.6B slot), and the teacher was hard-wired to the 0.8B. Both were
+caught by the format itself — a `blr` payload whose header dimensions do not
+match the slot is refused — but the data had to be recomputed. The per-layer
+Grams were also re-checked for the same reason, which is where the
+one-pass capture came from (§10).
+
+## 10. What became a product feature
 
 The allocation is a first-class part of the tooling, because the measured
 allocation must be replayable verbatim:
@@ -616,11 +670,16 @@ allocation must be replayable verbatim:
 
 ---
 
-## 10. Reproduction
+## 11. Reproduction
 
 ```bash
-# 1. the waves of the student (one capture per layer, cached)
-NVG_BENCH_CAPTURE_ONLY=1 cortiq nvg-bench --model student.cmf --layer L \
+# 1. the waves of the student — ONE forward pass collects every layer's Grams
+#    (the capture hook filters by tensor name); the per-layer capture costs a
+#    forward per layer, i.e. O(n^2) over the stack. The Grams are bit-identical
+#    (max relative difference 4.7e-07) and the file names match the per-layer
+#    cache, so a layer run reuses them.
+NVG_BENCH_CAPTURE_ALL=1 CMF_NVG_BENCH_DEVICE_CAPTURE=1 \
+    cortiq nvg-bench --model student.cmf --device gpu \
     --gram-cache grams/student_L --calib calib.txt
 
 # 2. the curve: encode every layer at a budget, patch it, measure
@@ -647,11 +706,14 @@ weight) and the analysis scripts (`tools/curve.py`, `tools/alloc3.py`,
 
 ---
 
-## 11. What is still open
+## 12. What is still open
 
 * The damage law is measured on one model and one architecture. The exponent
   α = 1.25 and the shape of the layer curve (one pole, a flat middle, a tail
-  that does not care) need a second model to be a law and not a fact.
+  that does not care) need a second model to be a law and not a fact. The
+  second model that was measured (§9) does not produce a curve at all — its
+  model is destroyed at every budget — so the law is still a one-model fact;
+  the missing piece is a model the codec *fits* but that is not the 0.8B.
 * The allocation is currently *measured* per layer; making it *predicted*
   needs a signal that predicts the damage — and §4 shows that no local weight
   or Gram metric does. The candidate is the first-order loss sensitivity
@@ -660,3 +722,9 @@ weight) and the analysis scripts (`tools/curve.py`, `tools/alloc3.py`,
   of the *encoding*, and the sign training optimizes the metric inside the
   ranks it is given. Training *with* the allocation (a curriculum over the
   budget) is the natural next step.
+* **Why does the codec fit one architecture and destroy another?** The 0.6B
+  failure (§9) is not the budget and not the local metric; the candidates are
+  the attention block itself (the 0.8B that works is a GDN hybrid, the 0.6B
+  that fails is plain attention with q/k-norm) and the way the GQA heads share
+  the K/V input. Until that is answered, the only honest answer for a user is
+  the perplexity gate.
