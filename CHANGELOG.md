@@ -104,6 +104,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them off.
 
 ### Fixed
+- `import-gguf`: the native importer reads ggml type **41** (`Q1_0`, upstream
+  since April 2026) — the 1-bit format of the `Q1_0` models — and carries its
+  weights into the `q1` base unchanged: the source's per-128 block scale
+  becomes four per-32 groups with the same scale, so no weight moves (the body
+  grows from 1.125 to 1.5 bits per weight — the `q1` base is per 32). A row
+  that is not a multiple of 128 cannot be re-packed without changing a weight:
+  the values are kept, the tensor goes to the requested profile, and the import
+  says so.
+- `import-gguf`: ggml type **42** is decoded as upstream's `Q2_0` (64-element
+  blocks, the codes -1/0/+1/+2). The sparse-ternary format of the still-open
+  upstream PR #22836 carried the same number and is now used only when the
+  file's own data extent says so — before this, a real `Q2_0` file was
+  silently mis-decoded as sparse ternary.
 - the `mxfp4` CPU kernel: the A8W8 path now dispatches on `a8w8_enabled()` like every
   other SDOT kernel, so `CMF_SDOT=0` and the float-activation scopes keep the exact
   contract; and its `sdot` asm is compiled with the `neon,dotprod` target feature,
