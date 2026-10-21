@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `--blr-plan`: a `keep` rule leaves a layer (or a tensor) exact at the
+  model's non-blr codec instead of encoding it. The damage of a stack of
+  layers *compounds* — measured on Qwen3-0.6B, quantizing all 28 layers at
+  0.55 bpw gives 33 404 ppl, while quantizing only the twelve least damaging
+  ones and keeping the rest at q8_2f gives 190 ppl at 27 % less size. The
+  selection is measured, not guessed: one patch + one perplexity per layer.
+
+### Fixed
+- the NVG encoder ran on the CPU for every conversion on macOS
+  (`--blr-device auto` excluded the platform): 63 s per tensor against ~9 s
+  on the device (Metal via wgpu). The bench path already used the device
+  there.
 - `patch-tensor --dtype blr` stores a NVG-encoded BLR payload verbatim in a
   slot of another dtype (the campaign had to patch an encoder's payload into a
   q8_2f model to attribute the damage per tensor group; without it the tool

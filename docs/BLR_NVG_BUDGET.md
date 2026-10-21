@@ -667,6 +667,18 @@ allocation must be replayable verbatim:
   column scales) **cannot be met at all** — for a 32×32 tensor the floor is
   1.625 bpw, so "0.11 bpw" is a physical impossibility, and the conversion says
   so instead of silently spending more.
+* A plan rule can now **keep a layer exact**:
+  ```
+  keep layer 0
+  keep tensor model.layers.3.self_attn.v_proj.weight
+  ```
+  The kept tensors stay at the model's non-blr codec (q8_2f) and never enter
+  the encoder. This is the product form of §12: the damage of a stack of
+  layers compounds, so the cheapest working model is the one that quantizes
+  the harmless layers and leaves the harmful ones alone.
+* The NVG encoder runs on the **device** on macOS as well (`--blr-device
+  auto` used to exclude the platform): 63 s per tensor on the CPU against
+  ~9 s on Metal through wgpu.
 
 ---
 
@@ -706,7 +718,107 @@ weight) and the analysis scripts (`tools/curve.py`, `tools/alloc3.py`,
 
 ---
 
-## 12. What is still open
+## 12. The damage compounds: the cure is selection, not bits
+
+The per-layer numbers above are individually mild. One layer of the 0.8B at
+0.55 bpw costs between −0 and +15 ppl — except the pole layer 0 (+282) and
+the last layer (+60). Yet the *model* built from all of them scores 2278.
+That gap is not additive, and it is the whole story of the second model.
+
+### The cumulative curve
+
+Patch the first *k* layers with a fresh 0.55-bpw encode and leave the rest
+of the model exact (teacher weights, exact attention) — the same protocol for
+both models, the same encoder, the same budget:
+
+| layers replaced | Qwen3-0.6B (28 layers) | Qwen3.5-0.8B (24 layers) |
+|---|---|---|
+| 0 (the teacher) | 22.7 | 19.9 |
+| 1 | 1094.0 | 184.1 |
+| 2 | 3438.3 | 292.5 |
+| 3 | 8242.7 | 518.4 |
+| 5 | 27561.5 | 730.8 |
+| 10 | 62746.3 | 466.9 |
+| 16 | 37601.4 | 751.5 |
+| 20 | 41170.2 | 1025.9 |
+| 24 | 27603.6 | 2278.2 |
+| 28 (all) | 33404.5 | — |
+
+The 0.8B saturates: it wanders between 450 and 1100 from the third layer on,
+and the damage does not keep accumulating. The 0.6B does not saturate at all —
+it is at 27 000 after five layers and never comes back. The same encoder, the
+same budget, the same protocol; the difference is **how the architecture
+tolerates the accumulation**.
+
+### So: quantize fewer layers, not cheaper ones
+
+If the damage compounds, the cheapest way to a working model is to leave the
+harmful layers exact and quantize only the harmless ones. The per-layer
+measurement (one patch + one perplexity per layer, ≈30 s) gives the ranking;
+the selection is then free.
+
+On the 0.8B, quantizing only the *least damaging* layers at 0.55 bpw, the
+rest staying at 8 bits:
+
+| quantized layers | wiki ppl | size |
+|---|---|---|
+| 0 (teacher) | 19.9 | 709 MiB |
+| 4 | **25.5** | 675.9 MiB |
+| 8 | **37.5** | 602.0 MiB |
+| 12 | **72.8** | 525.4 MiB |
+| 16 | **169.9** | 454.3 MiB |
+| 24 (all) | 2278.2 | 309.4 MiB |
+
+And on the model that "breaks" — Qwen3-0.6B, whose full 0.55-bpw conversion
+scores 33 404:
+
+| quantized layers | wiki ppl | size |
+|---|---|---|
+| 0 (teacher) | 22.7 | 772.2 MiB |
+| 4 | **32.3** | 673.7 MiB |
+| 8 | **83.9** | 617.6 MiB |
+| 12 | **189.9** | 561.6 MiB |
+| 16 | 1038.6 | 505.5 MiB |
+| 24 | 17367.9 | 393.3 MiB |
+| 28 (all) | 33404.5 | 337.3 MiB |
+
+**The 0.6B is not a broken model — it is a model whose budget was allocated
+to all of its layers.** Quantize the twelve least damaging ones and it sits
+at 190 ppl with a 27 % smaller file; quantize all twenty-eight and it is
+rubbish. The selection is what makes the codec usable, and the selection is
+measured, not guessed.
+
+### What the selection is worth in bytes
+
+At 454 MiB the selective 0.8B scores 170 ppl. The uniform conversion would
+have to shrink to roughly a third of its size to reach the same perplexity —
+and the codec's own floor is 1.625 bpw on a 32×32 tensor, so it cannot.
+Selection buys what bits cannot.
+
+### The same structure appears in the O(1) attention conversion
+
+The selection argument is not specific to weights. The O(1) attention
+conversion (patent 16) also picks a *subset* of layers, and its published
+selection rule is "the N deepest". Measured on the 0.8B hybrid, the rule is
+worse than selecting by the measured cost: at three converted layers the
+depth rule gives ×1.115 and the cost-map selection gives **×1.015** — the
+quality of five layers by depth. And the attention state is a budget too: at
+the same number of state slots, three layers with a 256-wide window (780
+slots) score ×1.012 against ×1.153 for six layers with a 128-wide window
+(792 slots). Both results are free of training.
+
+### The attribution that started it
+
+The 0.6B's layer 0 is a catastrophe in isolation — replacing only its
+`v_proj` and `o_proj` takes the model from 22.7 to **2169** — while the same
+tensors in the 0.8B's first softmax layer cost +0.17. Not the architecture,
+not the budget of the model as a whole, and not the row-weight gauge (it is
+worse). It is those two tensors' own budget: at 1.5 bpw the pair costs 74.5,
+at 2.5 bpw it costs 25.3. Which is exactly what the plan mechanism is for,
+and exactly why the per-layer measurement has to be read *per tensor* when
+the first layer is involved.
+
+## 13. What is still open
 
 * The damage law is measured on one model and one architecture. The exponent
   α = 1.25 and the shape of the layer curve (one pole, a flat middle, a tail
@@ -716,15 +828,24 @@ weight) and the analysis scripts (`tools/curve.py`, `tools/alloc3.py`,
   the missing piece is a model the codec *fits* but that is not the 0.8B.
 * The allocation is currently *measured* per layer; making it *predicted*
   needs a signal that predicts the damage — and §4 shows that no local weight
-  or Gram metric does. The candidate is the first-order loss sensitivity
-  `g = ∂L/∂y` at each layer output, which the engine does not compute yet.
+  or Gram metric does. A new class was tested in this round: weighting the
+  layer's error by the energy of the signal that reaches the *next* layer
+  (`e_L · tr(G_{L+1})`, the first-order damage model `ΔL ≈ ½Δyᵀ H Δy` with
+  `H ≈ G_{L+1}`). It roughly doubles the correlation over the bare error
+  (Pearson r 0.28 → 0.48, Spearman 0.28 → 0.48 with the pole layer excluded)
+  — but 0.48 is still not a predictor, and the per-layer error measured at a
+  *different* budget flatters it (r 0.60), which is the trap to avoid. The
+  missing signal is still the loss sensitivity `g = ∂L/∂y` at each layer
+  output, which the engine does not compute yet.
 * The training itself still runs on a uniform budget: the plan moves the bits
   of the *encoding*, and the sign training optimizes the metric inside the
   ranks it is given. Training *with* the allocation (a curriculum over the
   budget) is the natural next step.
-* **Why does the codec fit one architecture and destroy another?** The 0.6B
-  failure (§9) is not the budget and not the local metric; the candidates are
-  the attention block itself (the 0.8B that works is a GDN hybrid, the 0.6B
-  that fails is plain attention with q/k-norm) and the way the GQA heads share
-  the K/V input. Until that is answered, the only honest answer for a user is
-  the perplexity gate.
+* **Why does the codec fit one architecture and destroy another?** Partly
+  answered (§12): the 0.6B's damage does not saturate the way the 0.8B's
+  does — the same per-layer error compounds into a 30 000-ppl model. The
+  remaining question is the *mechanism* of that non-saturation (what makes a
+  stack of small errors super-linear), and it is the same question as "which
+  architectures tolerate accumulation" — a property of the model, not of the
+  codec. The practical answer exists already (select the layers, keep the rest
+  exact) and needs no mechanism; the scientific one does not.
