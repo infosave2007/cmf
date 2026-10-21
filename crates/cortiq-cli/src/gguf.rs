@@ -409,29 +409,24 @@ fn dequant_q2_0(raw: &[u8], n: usize) -> Vec<f32> {
 /// 42, and the two block sizes differ: the file's own data extent tells which
 /// one it is. Upstream's own meaning (Q2_0) wins a tie.
 fn type42_is_stq1_0(g: &Gguf) -> bool {
-    let end_of = |stq: bool| -> usize {
-        g.tensors
-            .iter()
-            .filter(|t| t.ggml_type == GGML_Q2_0)
-            .map(|t| {
-                let n: usize = t.dims.iter().map(|&d| d as usize).product();
-                let sz = if stq { n.div_ceil(256) * 42 } else { n.div_ceil(64) * 18 };
-                t.offset as usize + sz
-            })
-            .max()
-            .unwrap_or(0)
-    };
-    let data = g.source_len.saturating_sub(g.data_start);
-    let (a, b) = (end_of(true), end_of(false));
-    match (a <= data, b <= data) {
-        // only one layout fits the file's data extent
-        (true, false) => true,
-        (false, true) => false,
-        // both fit: the tighter one is the file's (Q2_0's blocks are larger)
-        (true, true) => a > b,
-        // neither fits: trust upstream's numbering
-        (false, false) => false,
+    // the data section's size under each reading of the type number 42
+    let (mut stq, mut q2) = (0usize, 0usize);
+    for t in &g.tensors {
+        let n: usize = t.dims.iter().map(|&d| d as usize).product();
+        let (a, b) = if t.ggml_type == GGML_Q2_0 {
+            (n.div_ceil(256) * 42, n.div_ceil(64) * 18)
+        } else {
+            match nbytes(t.ggml_type, n) {
+                Ok(x) => (x, x),
+                Err(_) => continue,
+            }
+        };
+        stq += a;
+        q2 += b;
     }
+    let data = g.source_len.saturating_sub(g.data_start);
+    // the layout whose data extent matches the file's is the file's
+    data.abs_diff(stq) < data.abs_diff(q2)
 }
 
 /// The type as it must be decoded: 42 is either the open-PR sparse ternary or
@@ -3078,6 +3073,17 @@ mod stq1_0_tests {
         };
         assert!(type42_is_stq1_0(&mk(42)));
         assert!(!type42_is_stq1_0(&mk(72)));
+        // the type-42 tensor is not the last one: the rule reads the whole
+        // data section, not the end of one tensor
+        let mut g = mk(72);
+        g.tensors.push(GgufTensor {
+            name: "blk.0.attn_q.weight".to_string(),
+            dims: vec![64, 1],
+            ggml_type: GGML_F16,
+            offset: 72,
+        });
+        g.source_len = 72 + 64 * 2;
+        assert!(!type42_is_stq1_0(&g));
     }
 
     #[test]
