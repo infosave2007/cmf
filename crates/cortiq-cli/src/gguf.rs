@@ -17,7 +17,7 @@ use crate::http_range::read_http_range;
 use cortiq_core::format::{
     CmfHeader, CmfModel, CmfStreamWriter, TensorSpec, TokenizerBundle, CMF_VERSION,
 };
-use cortiq_core::quant::f16_to_f32;
+use cortiq_core::quant::{f16_to_f32, f32_to_f16};
 use cortiq_core::types::{LayerType, ModelArch, MoeConfig, NormStyle, QuantType, TensorDtype};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -57,8 +57,22 @@ const GGML_IQ4_NL: u32 = 20;
 const GGML_IQ4_XS: u32 = 23;
 const GGML_BF16: u32 = 30;
 /// Sparse ternary, 1.3125 bpw (Tencent AngelSlim "1.25-bit"; llama.cpp
-/// PR #22836). Imported EXACTLY as `q1t`, never requantized.
+/// PR #22836 — still OPEN, so upstream never assigned this number). Imported
+/// EXACTLY as `q1t`, never requantized. Upstream gave 42 to `Q2_0` in July
+/// 2026, so a file carrying 42 is one of the two — the payload size decides
+/// (see `type42_is_stq1_0`).
 const GGML_STQ1_0: u32 = 42;
+/// ggml type 41 (upstream, 2026-04): 128-element blocks of `[f16 d][16B
+/// bits]`, one bit per weight, the value `bit ? d : -d` — a binary 1-bit
+/// format with a per-block scale (1.125 bits per weight).
+const GGML_Q1_0: u32 = 41;
+/// ggml type 42 (upstream, 2026-07): 64-element blocks of `[f16 d][16B]`,
+/// two bits per weight, the code 00/01/10/11 = -1/0/+1/+2 (2.25 bits per
+/// weight).
+const GGML_Q2_0: u32 = 42;
+/// Internal marker: the type number 42 resolved to the open-PR sparse
+/// ternary (upstream calls it Q2_0). No ggml type uses 43.
+const GGML_STQ1_0_LEGACY: u32 = 43;
 
 /// STQ1_0 codebook: index `(sign << 4) | slot` → 4 packed 2-bit lanes
 /// (−1 → 0b00, 0 → 0b01, +1 → 0b10; lane p at bits 2p..2p+1). Every group
@@ -312,10 +326,12 @@ fn dequant(ggml_type: u32, raw: &[u8], n: usize) -> anyhow::Result<Vec<f32>> {
         GGML_Q8_K => dequant_q8_k(raw, n),
         GGML_IQ4_NL => dequant_iq4_nl(raw, n),
         GGML_IQ4_XS => dequant_iq4_xs(raw, n),
-        GGML_STQ1_0 => dequant_stq1_0(raw, n),
+        GGML_STQ1_0_LEGACY => dequant_stq1_0(raw, n),
+        GGML_Q1_0 => dequant_q1_0(raw, n),
+        GGML_Q2_0 => dequant_q2_0(raw, n),
         other => anyhow::bail!(
             "ggml tensor type {other} not supported by the native importer (supported: F32, F16, BF16, \
-             Q4_0/1, Q5_0/1, Q8_0, Q2_K..Q6_K, Q8_K, IQ4_NL, IQ4_XS, STQ1_0; the IQ1/IQ2/IQ3 grid codebooks are not)"
+             Q4_0/1, Q5_0/1, Q8_0, Q2_K..Q6_K, Q8_K, IQ4_NL, IQ4_XS, Q1_0, Q2_0, STQ1_0; the IQ1/IQ2/IQ3 grid codebooks are not)"
         ),
     })
 }
@@ -339,7 +355,9 @@ fn nbytes(ggml_type: u32, n: usize) -> anyhow::Result<usize> {
         GGML_Q8_K => blk(256, 292),
         GGML_IQ4_NL => blk(32, 18),
         GGML_IQ4_XS => blk(256, 136),
-        GGML_STQ1_0 => blk(256, 42),
+        GGML_STQ1_0_LEGACY => blk(256, 42),
+        GGML_Q1_0 => blk(128, 18),
+        GGML_Q2_0 => blk(64, 18),
         other => anyhow::bail!("ggml type {other} unsupported by the native importer"),
     })
 }
@@ -348,6 +366,112 @@ fn nbytes(ggml_type: u32, n: usize) -> anyhow::Result<usize> {
 // [sign[8]: 1 bit per group][d: f16]. The 4 lanes of group g (g in 0..64)
 // sit at stride 16 inside a 64-weight chunk: x[c·64 + (g % 16) + p·16],
 // c = g / 16, p = 0..4. Faithful port of ggml `dequantize_row_stq1_0`.
+/// Q1_0 (ggml type 41): 128 elements per block, `[f16 d][16B bits]`, the
+/// value is `bit ? d : -d` (the bit is the low bit of its byte).
+fn dequant_q1_0(raw: &[u8], n: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n];
+    for i in 0..n.div_ceil(128) {
+        let b = &raw[i * 18..(i + 1) * 18];
+        let d = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+        for j in 0..128 {
+            let idx = i * 128 + j;
+            if idx >= n {
+                break;
+            }
+            let bit = (b[2 + j / 8] >> (j % 8)) & 1;
+            out[idx] = if bit == 1 { d } else { -d };
+        }
+    }
+    out
+}
+
+/// Q2_0 (ggml type 42): 64 elements per block, `[f16 d][16B]`, two bits per
+/// weight, the code 00/01/10/11 = -1/0/+1/+2 (times the block scale).
+fn dequant_q2_0(raw: &[u8], n: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n];
+    for i in 0..n.div_ceil(64) {
+        let b = &raw[i * 18..(i + 1) * 18];
+        let d = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+        for j in 0..64 {
+            let idx = i * 64 + j;
+            if idx >= n {
+                break;
+            }
+            let q = (b[2 + j / 4] >> (2 * (j % 4))) & 0x03;
+            out[idx] = (q as i32 - 1) as f32 * d;
+        }
+    }
+    out
+}
+
+/// The sparse-ternary format of the OPEN upstream PR #22836 (42 B per 256
+/// elements) and the upstream Q2_0 (18 B per 64) both claim the type number
+/// 42, and the two block sizes differ: the file's own data extent tells which
+/// one it is. Upstream's own meaning (Q2_0) wins a tie.
+fn type42_is_stq1_0(g: &Gguf) -> bool {
+    let end_of = |stq: bool| -> usize {
+        g.tensors
+            .iter()
+            .filter(|t| t.ggml_type == GGML_Q2_0)
+            .map(|t| {
+                let n: usize = t.dims.iter().map(|&d| d as usize).product();
+                let sz = if stq { n.div_ceil(256) * 42 } else { n.div_ceil(64) * 18 };
+                t.offset as usize + sz
+            })
+            .max()
+            .unwrap_or(0)
+    };
+    let data = g.source_len.saturating_sub(g.data_start);
+    let (a, b) = (end_of(true), end_of(false));
+    match (a <= data, b <= data) {
+        // only one layout fits the file's data extent
+        (true, false) => true,
+        (false, true) => false,
+        // both fit: the tighter one is the file's (Q2_0's blocks are larger)
+        (true, true) => a > b,
+        // neither fits: trust upstream's numbering
+        (false, false) => false,
+    }
+}
+
+/// The type as it must be decoded: 42 is either the open-PR sparse ternary or
+/// upstream's Q2_0, and the file's own data extent decides which.
+fn resolve_type(g: &Gguf, ty: u32) -> u32 {
+    if ty == GGML_Q2_0 && type42_is_stq1_0(g) {
+        GGML_STQ1_0_LEGACY
+    } else {
+        ty
+    }
+}
+
+/// Pack dequantized Q1_0 values into the CMF `q1` base EXACTLY: per 32-group
+/// `[f16 scale][4B bits]`, the scale is the group's max |v| (the source
+/// block's own scale — every value in the group is ±d) and the bit is the
+/// sign. The values survive the import bit for bit; the body grows from 1.125
+/// to 1.5 bits per weight (the `q1` base is per 32, the source per 128).
+fn encode_q1_exact(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
+    const GROUP: usize = 32;
+    let n_groups = vals.len().div_ceil(GROUP);
+    let mut out = Vec::with_capacity(n_groups * 6);
+    for g in 0..n_groups {
+        let grp = &vals[g * GROUP..((g + 1) * GROUP).min(vals.len())];
+        let s = grp.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        out.extend_from_slice(&f32_to_f16(s).to_le_bytes());
+        for j in 0..GROUP / 8 {
+            let mut byte = 0u8;
+            for k in 0..8 {
+                let idx = g * GROUP + j * 8 + k;
+                if idx < vals.len() && vals[idx] >= 0.0 {
+                    byte |= 1 << k;
+                }
+            }
+            out.push(byte);
+        }
+    }
+    let _ = out_dim;
+    out
+}
+
 fn dequant_stq1_0(raw: &[u8], n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; n];
     let nb = n.div_ceil(256);
@@ -1803,10 +1927,11 @@ pub fn run_import_gguf(
                     .map(String::from),
             ) {
                 let numel: usize = t.dims.iter().map(|&d| d as usize).product();
-                let nb = nbytes(t.ggml_type, numel)?;
+                let ty = resolve_type(&g, t.ggml_type);
+                let nb = nbytes(ty, numel)?;
                 let raw = &g.bytes
                     [g.data_start + t.offset as usize..g.data_start + t.offset as usize + nb];
-                let vals = dequant(t.ggml_type, raw, numel)?;
+                let vals = dequant(ty, raw, numel)?;
                 let shape: Vec<usize> = t.dims.iter().rev().map(|&d| d as usize).collect();
                 let (nexp, out, inn) = (shape[0], shape[1], shape[2]);
                 for e in 0..nexp {
@@ -1826,9 +1951,10 @@ pub fn run_import_gguf(
             continue;
         };
         let numel: usize = t.dims.iter().map(|&d| d as usize).product();
-        let nb = nbytes(t.ggml_type, numel)?;
+        let ty = resolve_type(&g, t.ggml_type);
+        let nb = nbytes(ty, numel)?;
         let raw = &g.bytes[g.data_start + t.offset as usize..g.data_start + t.offset as usize + nb];
-        let mut vals = dequant(t.ggml_type, raw, numel)?;
+        let mut vals = dequant(ty, raw, numel)?;
         // HF shape = ggml dims reversed (ne[0] is fastest / the input dim).
         let shape: Vec<usize> = t.dims.iter().rev().map(|&d| d as usize).collect();
 
@@ -1922,7 +2048,22 @@ pub fn run_import_gguf(
             shape
         };
         let two_d = shape.len() == 2 && numel >= 32 && !keep_f32;
-        let (dt, data) = if two_d && t.ggml_type == GGML_STQ1_0 {
+        let (dt, data) = if two_d && ty == GGML_Q1_0 && shape[1] % 128 == 0 {
+            // Q1_0 source: carry the values over exactly into the `q1` base
+            // (the per-128 source scale becomes four per-32 groups with the
+            // same scale, so no weight changes).
+            (TensorDtype::Q1, encode_q1_exact(&vals, shape[0], shape[1]))
+        } else if two_d && ty == GGML_Q1_0 {
+            // A row that is not a multiple of the source's 128-element block
+            // cannot be re-packed into the per-32 `q1` base without changing a
+            // weight: fall back to the requested profile and say so.
+            eprintln!(
+                "  note: '{}' is Q1_0 with a row of {} elements (not a multiple of 128) — the \
+                 1-bit values are kept, but the tensor is re-encoded into the requested profile",
+                name, shape[1]
+            );
+            (convert::quantize_2d(quant, &vals, shape[0], shape[1]))
+        } else if two_d && ty == GGML_STQ1_0_LEGACY {
             // Sparse-ternary source: re-encode exactly as q1t, whatever the
             // requested profile — requantizing trained ternary weights can
             // only lose.
@@ -2342,6 +2483,118 @@ mod dequant_tests {
         (out, q6, f32_bias, img_in_weight)
     }
 
+    /// The whole path: a GGUF carrying a Q1_0 tensor (type 41) imports, and
+    /// the weights arrive unchanged in the `q1` base.
+    #[test]
+    fn q1_0_gguf_imports_and_keeps_every_weight() {
+        // 128 elements per block, scale 0.5, the sign bits of a fixed pattern
+        let d = 0.5f32;
+        let n = 128usize;
+        let mut q1_0 = vec![0u8; 18];
+        for j in 0..n {
+            if j % 5 == 0 {
+                q1_0[2 + j / 8] |= 1 << (j % 8);
+            }
+        }
+        q1_0[0..2].copy_from_slice(&cortiq_core::quant::f32_to_f16(d).to_le_bytes());
+        let f16 = |v: &[f32]| -> Vec<u8> {
+            v.iter()
+                .flat_map(|x| cortiq_core::quant::f32_to_f16(*x).to_le_bytes())
+                .collect()
+        };
+        let emb: Vec<f32> = (0..128 * 128).map(|i| (i as f32) * 0.001).collect();
+        let defs: Vec<(&str, Vec<u64>, u32, Vec<u8>)> = vec![
+            ("token_embd.weight", vec![128, 128], GGML_F16, f16(&emb)),
+            (
+                "blk.0.ffn_gate.weight",
+                vec![128, 128],
+                GGML_Q1_0,
+                q1_0.repeat(128),
+            ),
+        ];
+        let mut out = Vec::new();
+        out.extend_from_slice(b"GGUF");
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&(defs.len() as u64).to_le_bytes());
+        out.extend_from_slice(&4u64.to_le_bytes());
+        put_gstr(&mut out, "general.architecture");
+        out.extend_from_slice(&T_STR.to_le_bytes());
+        put_gstr(&mut out, "llama");
+        put_gstr(&mut out, "llama.block_count");
+        out.extend_from_slice(&T_U32.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        put_gstr(&mut out, "llama.embedding_length");
+        out.extend_from_slice(&T_U32.to_le_bytes());
+        out.extend_from_slice(&128u32.to_le_bytes());
+        put_gstr(&mut out, "llama.attention.head_count");
+        out.extend_from_slice(&T_U32.to_le_bytes());
+        out.extend_from_slice(&4u32.to_le_bytes());
+        let mut rel = 0usize;
+        let mut offsets = Vec::with_capacity(defs.len());
+        for (name, dims, ggml_type, data) in &defs {
+            rel = align_up(rel, 32);
+            offsets.push(rel);
+            put_gstr(&mut out, name);
+            out.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+            for &d in dims {
+                out.extend_from_slice(&d.to_le_bytes());
+            }
+            out.extend_from_slice(&ggml_type.to_le_bytes());
+            out.extend_from_slice(&(rel as u64).to_le_bytes());
+            rel += data.len();
+        }
+        let data_start = align_up(out.len(), 32);
+        out.resize(data_start, 0);
+        for ((_, _, _, data), &offset) in defs.iter().zip(&offsets) {
+            let start = data_start + offset;
+            if out.len() < start {
+                out.resize(start, 0);
+            }
+            out.extend_from_slice(data);
+        }
+        let id = format!(
+            "cortiq-q1-0-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let src = std::env::temp_dir().join(format!("{id}.gguf"));
+        let dst = std::env::temp_dir().join(format!("{id}.cmf"));
+        std::fs::write(&src, &out).unwrap();
+        run_import_gguf(
+            src.to_str().unwrap(),
+            "q8",
+            dst.to_str().unwrap(),
+            None,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        let model = cortiq_core::CmfModel::open(&dst).unwrap();
+        assert!(model.verify().is_empty());
+        let slot = model
+            .tensor_index("model.layers.0.mlp.gate_proj.weight")
+            .unwrap();
+        assert_eq!(
+            model.tensors[slot].dtype,
+            cortiq_core::types::TensorDtype::Q1,
+            "a Q1_0 source must land in the q1 base"
+        );
+        let bytes = model.entry_bytes(&model.tensors[slot]);
+        let mut got = vec![0.0f32; 128 * 128];
+        cortiq_core::quant::dequant_q1(bytes, &mut got);
+        // every weight is ±0.5 with the source's sign pattern
+        for (i, v) in got.iter().enumerate() {
+            // the source repeats the same 128-element block
+            let expect = if (i % 128) % 5 == 0 { d } else { -d };
+            assert_eq!(*v, expect, "weight {i} changed");
+        }
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+    }
+
     #[test]
     fn qwen_image_import_preserves_controls_and_requantizes_q6k() {
         let (gguf_bytes, q6_raw, f32_bias, img_in_weight) = test_qwen_image_gguf();
@@ -2751,6 +3004,82 @@ mod stq1_0_tests {
         out
     }
 
+    /// Q1_0 (ggml type 41): 128 elements per block, `[f16 d][16B bits]`,
+    /// the value `bit ? d : -d`, the bit the low bit of its byte.
+    #[test]
+    fn q1_0_decodes_sign_bits_against_the_block_scale() {
+        let mut raw = vec![0u8; 18];
+        raw[2] = 0b0000_0101; // elements 0 and 2 are positive
+        raw[3] = 0b0000_0001; // element 8 is positive
+        raw[0..2].copy_from_slice(&cortiq_core::quant::f32_to_f16(0.25).to_le_bytes());
+        let y = dequant_q1_0(&raw, 128);
+        assert_eq!(y[0], 0.25);
+        assert_eq!(y[1], -0.25);
+        assert_eq!(y[2], 0.25);
+        assert_eq!(y[3], -0.25);
+        assert_eq!(y[8], 0.25);
+        assert_eq!(y[9], -0.25);
+        assert_eq!(y[127], -0.25);
+        assert_eq!(nbytes(GGML_Q1_0, 128).unwrap(), 18);
+        assert_eq!(nbytes(GGML_Q1_0, 129).unwrap(), 36);
+    }
+
+    /// The Q1_0 values survive the import into the `q1` base unchanged: the
+    /// per-128 source scale becomes four per-32 groups with the same scale, so
+    /// no weight moves.
+    #[test]
+    fn q1_0_carries_into_the_q1_base_without_changing_a_weight() {
+        let mut raw = vec![0u8; 18];
+        for j in 0..128 {
+            if j % 3 == 0 {
+                raw[2 + j / 8] |= 1 << (j % 8);
+            }
+        }
+        raw[0..2].copy_from_slice(&cortiq_core::quant::f32_to_f16(0.75).to_le_bytes());
+        let vals = dequant_q1_0(&raw, 128);
+        let packed = encode_q1_exact(&vals, 1, 128);
+        let mut back = vec![0.0f32; 128];
+        cortiq_core::quant::dequant_q1(&packed, &mut back);
+        assert_eq!(back, vals, "the Q1_0 -> q1 carry-over must be exact");
+        // the body grows from 1.125 to 1.5 bits per weight — and stays exact
+        assert_eq!(packed.len(), 4 * 6);
+    }
+
+    /// Q2_0 (ggml type 42): 64 elements per block, `[f16 d][16B]`, two bits
+    /// per weight, the code 00/01/10/11 = -1/0/+1/+2.
+    #[test]
+    fn q2_0_decodes_the_four_levels() {
+        let mut raw = vec![0u8; 18];
+        raw[2] = 0b00_01_10_11; // four elements, all four levels (LSB first)
+        raw[0..2].copy_from_slice(&cortiq_core::quant::f32_to_f16(2.0).to_le_bytes());
+        let y = dequant_q2_0(&raw, 64);
+        // the code 00/01/10/11 = -1/0/+1/+2, low bits first
+        assert_eq!(&y[0..4], &[4.0, 2.0, 0.0, -2.0]);
+        assert_eq!(nbytes(GGML_Q2_0, 64).unwrap(), 18);
+        assert_eq!(nbytes(GGML_Q2_0, 65).unwrap(), 36);
+    }
+
+    /// The two layouts that claim the type number 42 differ in block size, so
+    /// the file's own data extent says which one it is.
+    #[test]
+    fn type_42_is_resolved_by_the_data_extent() {
+        // a 256-element tensor: sparse-ternary 42 B, Q2_0 72 B
+        let mk = |bytes: usize| Gguf {
+            md: BTreeMap::new(),
+            tensors: vec![GgufTensor {
+                name: "blk.0.attn_q.weight".to_string(),
+                dims: vec![256, 1],
+                ggml_type: GGML_Q2_0,
+                offset: 0,
+            }],
+            bytes: GgufBytes::Header(Vec::new()),
+            data_start: 0,
+            source_len: bytes,
+        };
+        assert!(type42_is_stq1_0(&mk(42)));
+        assert!(!type42_is_stq1_0(&mk(72)));
+    }
+
     #[test]
     fn stq1_0_decodes_the_documented_patterns() {
         // Block: d = 0.5; group 0 = slot 0 / sign 0 → lanes (0,+1,+1,+1) = 0xA9;
@@ -2772,7 +3101,7 @@ mod stq1_0_tests {
             .map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0)
             .collect();
         let raw = quantize_stq1_0_ref(&x);
-        assert_eq!(raw.len(), nbytes(GGML_STQ1_0, 512).unwrap());
+        assert_eq!(raw.len(), nbytes(GGML_STQ1_0_LEGACY, 512).unwrap());
         let y = dequant_stq1_0(&raw, 512);
         for (b, blk) in x.chunks(256).enumerate() {
             let amax = blk.iter().fold(0f32, |m, v| m.max(v.abs()));
