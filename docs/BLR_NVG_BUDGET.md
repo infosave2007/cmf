@@ -359,6 +359,20 @@ Two things follow, and they are the most important sentences in this article:
 > (a greedy answer plus one at T = 0.7 on a control prompt), next to the
 > perplexity, not after it.
 
+**And the threshold is not a bit count — it is a bit count *for a trained
+regime*.** The counter-example is a real one: `Boole-1.7B-Q1_0`, a *trained*
+1-bit model (Qwen3-1.7B in Q1_0, imported by this repository's GGUF path),
+runs at **1.125 bits per weight** and answers:
+
+> "Let me think... The capital of France is Paris. Yeah, that's right. ...
+> The capital of France is Paris."
+
+wiki ppl **34.0** at 102 tok/s on the CPU — against 135.8 for our *trained*
+1.0-bpw BLR model and 900+ for the untrained ones. So one bit per weight is
+not a barrier to a working model; what fails is a model that was never trained
+in that regime. The gap between the two is not the container, the codec or the
+budget — it is the training.
+
 ### The per-layer measurements do not compose
 
 The allocation above was measured **per layer** (one layer patched into the
