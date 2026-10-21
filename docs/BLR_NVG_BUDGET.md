@@ -325,6 +325,40 @@ curve) *inside* the product's protocol, and it is the reason the product needs
 an a-priori plan: under the sequential protocol neither the model-level
 descent nor a plan derived from the end-to-end trace is available.
 
+### Does the converted model actually work? (the honest answer)
+
+Perplexity ranks the variants; it does not say the model still talks. Running
+`cortiq run` (greedy, and at T = 0.7) on the converted Qwen3.5-0.8B:
+
+| model | bits | wiki ppl | greedy | T = 0.7 |
+|---|---|---|---|---|
+| the teacher (q8_2f) | 8.02 | 24.27 | "The capital of France is Paris." | the same |
+| **q4tp (4 bits)** | 4.18 | 28.45 | "The capital of France is Paris." | "The capital city of France is Paris." |
+| the trained 1.0-bpw student | 0.99 | 672.52 | ". . . . ." | filler |
+| the metric-trained 1.0-bpw model | 0.99 | 135.76 | "# 1005: # 3478 - @ 9465" | fluent, but meaningless |
+| the fresh 1.5-bpw encode | 1.49 | 512.71 | "The, The, The, ..." | — |
+| the allocated 0.55-bpw model | 0.55 | 995.05 | empty | empty |
+
+Two things follow, and they are the most important sentences in this article:
+
+* **The pipeline is healthy.** The engine loads the converted models, the
+  BLR/Q1/Q4TP kernels compute, the speed is the usual 60-90 tok/s, and the
+  4-bit conversion answers correctly. What fails is the *budget*, not the
+  conversion.
+* **Perplexity understates the behavioural damage.** Between 24.3 (the teacher)
+  and 135.8 (the metric-trained 1.0-bpw model) the perplexity grows ×5.6 —
+  and the model has already stopped answering the question: in greedy mode it
+  degenerates, at T = 0.7 it is fluent and empty. The usability threshold for a
+  0.8B model sits between 1.5 and 4 bits per weight.
+
+> Everything measured in this study (0.55-1.5 bpw) is therefore a **research
+> artefact**: it gives an honest, comparable ranking of the conversion
+> variants, but not a conversation. "Maximum accuracy" for a shipped model is
+> not only the lowest perplexity — it is the lowest perplexity **above the
+> usability threshold**, and that threshold has to be measured explicitly
+> (a greedy answer plus one at T = 0.7 on a control prompt), next to the
+> perplexity, not after it.
+
 ### The per-layer measurements do not compose
 
 The allocation above was measured **per layer** (one layer patched into the
