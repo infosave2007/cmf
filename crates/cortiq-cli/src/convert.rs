@@ -6323,6 +6323,18 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         final_logit_softcapping: tc.get("final_logit_softcapping").and_then(|v| v.as_f64()),
         attn_logit_softcapping: tc.get("attn_logit_softcapping").and_then(|v| v.as_f64()),
         mla,
+        // Recursive Flint: the 14 full-attention layers carry no positional
+        // encoding (RoPE only on the sliding-window layers), and every layer
+        // carries a learned per-head attention sink (`softmax_offset`).
+        no_rope_layers: (model_type == "flint").then(|| {
+            let idx: Vec<usize> = tc
+                .get("no_rope_layer_indices")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect())
+                .unwrap_or_default();
+            (0..n_layers).map(|l| idx.contains(&l)).collect()
+        }),
+        attention_sink: model_type == "flint",
         activation_situ_beta: tc.get("activation_situ_beta").and_then(|v| v.as_f64()),
         activation_situ_linear_beta: tc
             .get("activation_situ_linear_beta")

@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- the arch records two Recursive Flint traits the runtime needs: the
+  per-layer **no-RoPE** schedule (Flint's 14 full-attention layers carry no
+  positional encoding) and the **learned per-head attention sink**
+  (`self_attn.softmax_offset`). The weights, the MoE geometry (256 routed
+  experts + the always-active shared expert), the per-layer sliding-window
+  schedule and the top-k routing already convert through the generic path.
+
 ## [0.8.28] — 2026-10-22
 
 ### Fixed

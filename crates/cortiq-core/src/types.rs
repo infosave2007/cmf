@@ -533,6 +533,16 @@ pub struct ModelArch {
     /// DeepSeek-V2 MLA block; None for every other family.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mla: Option<MlaConfig>,
+    /// Per-layer flag: this layer runs WITHOUT RoPE (the full-attention layers
+    /// of Recursive Flint). The runtime keeps the position encoding off for
+    /// exactly these layers; every other layer rotates as usual.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_rope_layers: Option<Vec<bool>>,
+    /// The attention carries a learned per-head logit offset
+    /// (`self_attn.softmax_offset`, Recursive Flint's attention sinks). The
+    /// values live in the weights; this flag says the layer has them.
+    #[serde(default)]
+    pub attention_sink: bool,
     /// Kimi-K3 situ activation betas (hidden_act == "situ").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation_situ_beta: Option<f64>,
