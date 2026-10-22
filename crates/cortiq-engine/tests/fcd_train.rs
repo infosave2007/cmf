@@ -59,6 +59,8 @@ fn tiny_arch() -> ModelArch {
         rope_theta: 10_000.0,
         tie_word_embeddings: true,
         partial_rotary_factor: 1.0,
+        no_rope_layers: None,
+        attention_sink: false,
         yarn: None,
         attention_heads_per_layer: None,
         local_partial_rotary_factor: None,

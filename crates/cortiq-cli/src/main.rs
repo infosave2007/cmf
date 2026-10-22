@@ -9,6 +9,8 @@ mod decision;
 mod dialog;
 mod egemma2pack;
 mod embed;
+mod flint;
+mod flint_hybrid;
 mod gguf;
 mod gptq;
 #[cfg(feature = "gpu")]
@@ -1413,6 +1415,32 @@ enum Commands {
         /// (name, dtype, shape, bytes, hash64 of the bytes), with a per-prefix total.
         #[arg(long)]
         tensors: Option<String>,
+    },
+    /// Repair legacy Recursive Flint CMF metadata in place without touching
+    /// the tensor directory or quantized weight payloads.
+    RepairFlint {
+        /// Path to a Recursive Flint .cmf file
+        model: String,
+        /// Inspect and validate the file, but do not append the corrected header
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+    /// Build a standalone Recursive Flint layer-hybrid CMF by borrowing q4tp
+    /// routed gate/up payloads from a q4 donor and all remaining payloads
+    /// from a q2 base.  The output path must not already exist.
+    FlintHybrid {
+        /// Standalone q2tp Flint base (routed gate/up q2tp, shared/down q4tp)
+        q2_base: String,
+        /// Standalone q4tp Flint donor
+        q4_source: String,
+        /// New output CMF path (refuses to overwrite)
+        output: String,
+        /// Explicit routed layer selection: 2,7-10,48; or all / none
+        #[arg(long, value_name = "LAYER[,LAYER[-LAYER]...]")]
+        layers: String,
+        /// Verify inputs and print the exact payload plan, but do not write
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
     /// List available masks
     Masks {
@@ -4282,6 +4310,14 @@ async fn main() -> anyhow::Result<()> {
             )
         }
         Commands::Info { model, tensors } => cmd_info(&model, tensors.as_deref()).await,
+        Commands::RepairFlint { model, dry_run } => flint::cmd_repair_flint(&model, dry_run),
+        Commands::FlintHybrid {
+            q2_base,
+            q4_source,
+            output,
+            layers,
+            dry_run,
+        } => flint_hybrid::cmd_flint_hybrid(&q2_base, &q4_source, &output, &layers, dry_run),
         Commands::Dequant {
             model,
             name,
