@@ -1353,6 +1353,9 @@ impl QTensor {
     /// `out = W · x` (row-major). F32 delegates to the historical
     /// bit-exact path; Mapped runs the fused int8 kernel.
     pub fn matvec(&self, x: &[f32], out: &mut [f32], pool: Option<&Pool>) {
+        if self.flint_exact_cpu_default() {
+            return float_activations_scope(|| self.matvec(x, out, pool));
+        }
         match self {
             // NOTE: `out.len()` DRIVES this arm — it computes that many rows,
             // and `x.len()` is the stride. A short `out` is legitimate here,
@@ -1834,6 +1837,9 @@ impl QTensor {
         o2: &mut [f32],
         pool: Option<&Pool>,
     ) {
+        if self.flint_exact_cpu_default() {
+            return float_activations_scope(|| self.matvec2(x1, x2, o1, o2, pool));
+        }
         match self {
             Self::F32 { data, .. } => matvec_rows2(pool, data, x1, x2, o1, o2),
             Self::Blr(_) => {
@@ -2026,6 +2032,9 @@ impl QTensor {
     }
 
     pub fn matmat(&self, xs_all: &[f32], b: usize, out: &mut [f32], pool: Option<&Pool>) {
+        if self.flint_exact_cpu_default() {
+            return float_activations_scope(|| self.matmat(xs_all, b, out, pool));
+        }
         let cols = self.cols();
         let rows = self.rows();
         debug_assert_eq!(xs_all.len(), b * cols);
@@ -2822,6 +2831,9 @@ impl QTensor {
         mut outs: [&mut [f32]; N],
         pool: Option<&Pool>,
     ) {
+        if Self::any_flint_exact_cpu_default(&ts) {
+            return float_activations_scope(|| Self::matvec_many(ts, x, outs, pool));
+        }
         let total_rows: usize = ts.iter().map(|t| t.rows()).sum();
         if ts.iter().any(|t| t.has_prism_contract() || t.per_tensor_only()) {
             // The fused range kernels have no transform descriptor.  Let
@@ -3236,6 +3248,11 @@ impl QTensor {
         mut o2s: [&mut [f32]; N],
         pool: Option<&Pool>,
     ) {
+        if Self::any_flint_exact_cpu_default(&ts) {
+            return float_activations_scope(|| {
+                Self::matvec2_many(ts, x1, x2, o1s, o2s, pool)
+            });
+        }
         let total_rows: usize = ts.iter().map(|t| t.rows()).sum();
         if ts.iter().any(|t| t.has_prism_contract() || t.per_tensor_only()) {
             for i in 0..N {
@@ -3509,6 +3526,11 @@ impl QTensor {
         limit: f32,
         pool: Option<&Pool>,
     ) -> bool {
+        if gate.flint_exact_cpu_default() || up.flint_exact_cpu_default() {
+            return float_activations_scope(|| {
+                Self::matvec_silu_mul_limited(gate, up, x, out, limit, pool)
+            });
+        }
         if gate.has_prism_contract()
             || up.has_prism_contract()
             || gate.per_tensor_only()
@@ -3828,6 +3850,11 @@ impl QTensor {
         limit: f32,
         pool: Option<&Pool>,
     ) -> bool {
+        if Self::any_flint_exact_cpu_default_pairs(pairs) {
+            return float_activations_scope(|| {
+                Self::moe_gate_up_many_limited(pairs, x, outs, limit, pool)
+            });
+        }
         if pairs.is_empty() || pairs.len() != outs.len() {
             return false;
         }
@@ -3947,6 +3974,11 @@ impl QTensor {
         out: &mut [f32],
         pool: Option<&Pool>,
     ) -> bool {
+        if Self::any_flint_exact_cpu_default(downs) {
+            return float_activations_scope(|| {
+                Self::moe_down_many(downs, gs, weights, out, pool)
+            });
+        }
         if downs.is_empty() || downs.len() != gs.len() || downs.len() != weights.len() {
             return false;
         }
@@ -4040,6 +4072,11 @@ impl QTensor {
         outs: &mut [Vec<f32>],
         pool: Option<&Pool>,
     ) -> bool {
+        if Self::any_flint_exact_cpu_default_pairs(pairs) {
+            return float_activations_scope(|| {
+                Self::moe_gate_up_rows(pairs, groups, xs, outs, pool)
+            });
+        }
         if pairs.is_empty() || pairs.len() != groups.len() {
             return false;
         }
@@ -4146,6 +4183,11 @@ impl QTensor {
         outs: &mut [Vec<f32>],
         pool: Option<&Pool>,
     ) -> bool {
+        if Self::any_flint_exact_cpu_default(downs) {
+            return float_activations_scope(|| {
+                Self::moe_down_rows(downs, group_lens, gs, outs, pool)
+            });
+        }
         if downs.is_empty() || downs.len() != group_lens.len() {
             return false;
         }
@@ -10773,6 +10815,41 @@ thread_local! {
     static FLOAT_ACTIVATIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Flint's released Q2/Q4 profiles are unusually sensitive to activation
+/// quantization in the host-side attention path. With the normal A8W8
+/// default, a short greedy decode can diverge after the first token even
+/// though the selected-expert Metal path itself is unchanged. Keep the
+/// reference float-activation contract for Flint unless the operator has
+/// explicitly selected an `CMF_SDOT` policy.
+fn flint_exact_cpu_default_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CMF_SDOT").is_none())
+}
+
+impl QTensor {
+    #[inline]
+    fn flint_exact_cpu_default(&self) -> bool {
+        !FLOAT_ACTIVATIONS.get()
+            && flint_exact_cpu_default_enabled()
+            && matches!(
+                self,
+                Self::Mapped { model, .. } if model.header.arch.arch_name == "flint"
+            )
+    }
+
+    #[inline]
+    fn any_flint_exact_cpu_default(ts: &[&QTensor]) -> bool {
+        ts.iter().any(|t| t.flint_exact_cpu_default())
+    }
+
+    #[inline]
+    fn any_flint_exact_cpu_default_pairs(pairs: &[(&QTensor, &QTensor)]) -> bool {
+        pairs
+            .iter()
+            .any(|(gate, up)| gate.flint_exact_cpu_default() || up.flint_exact_cpu_default())
+    }
+}
+
 /// Run `f` with the exact float-activation contract on this thread: the
 /// 4-bit and 8-bit kernels skip the int8 activation split (`CMF_SDOT=0`
 /// semantics, scoped). For parity tests and diagnostics — e.g. an `mxfp4`
@@ -10781,19 +10858,44 @@ pub fn with_float_activations<R>(f: impl FnOnce() -> R) -> R {
     float_activations_scope(f)
 }
 
-/// Run `f` with exact float activations on this thread (no A8W8 int8
-/// activation quantization in the quantized matvecs). Public for parity
-/// tests that compare the default kernels with the strict ones in one
-/// process; `CMF_SDOT=0` is the process-wide equivalent.
+/// Active on the current thread. `Pool` snapshots this with its job
+/// descriptor and installs it on persistent workers, so a scoped quantized
+/// matvec cannot accidentally choose a different kernel on a worker.
+#[inline]
+pub(crate) fn float_activations_active() -> bool {
+    FLOAT_ACTIVATIONS.get()
+}
+
+/// Restores the current thread's float-activation state on drop. The `Rc`
+/// marker deliberately keeps the guard on the thread that created it: this
+/// policy is thread-local, not a portable capability.
+pub(crate) struct FloatActivationsScope {
+    previous: bool,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for FloatActivationsScope {
+    fn drop(&mut self) {
+        FLOAT_ACTIVATIONS.set(self.previous);
+    }
+}
+
+#[inline]
+pub(crate) fn enter_float_activations_scope() -> FloatActivationsScope {
+    FloatActivationsScope {
+        previous: FLOAT_ACTIVATIONS.replace(true),
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+/// Run `f` with exact float activations (no A8W8 int8 activation
+/// quantization in the quantized matvecs). The persistent row pool carries
+/// this scope into a dispatched job and restores each worker afterwards.
+/// Public for parity tests that compare the default kernels with the strict
+/// ones in one process; `CMF_SDOT=0` is the process-wide equivalent.
 #[doc(hidden)]
 pub fn float_activations_scope<R>(f: impl FnOnce() -> R) -> R {
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            FLOAT_ACTIVATIONS.set(self.0);
-        }
-    }
-    let _restore = Restore(FLOAT_ACTIVATIONS.replace(true));
+    let _scope = enter_float_activations_scope();
     f()
 }
 

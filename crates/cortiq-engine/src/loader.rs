@@ -31,6 +31,77 @@ use std::sync::Arc;
 pub const DECISION_MODEL_REFUSAL: &str =
     "this is a DECISION model; use `cortiq decide` or `cortiq serve`";
 
+const FLINT_NO_ROPE_LAYERS: [usize; 14] = [0, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 48];
+
+/// Flint's attention profile is an execution contract, not a converter hint.
+/// Reject headers produced before it was represented rather than silently
+/// decoding their learned sinks with RoPE/softmax semantics.
+fn validate_flint_profile(model: &CmfModel, arch: &ModelArch) -> Result<(), CmfError> {
+    if arch.arch_name != "flint" {
+        return Ok(());
+    }
+    if arch.num_layers != 49
+        || arch.hidden_size != 2048
+        || arch.num_attention_heads != 32
+        || arch.num_kv_heads != 4
+        || arch.head_dim != 128
+        || arch.vocab_size != 150_144
+    {
+        return Err(CmfError::Parse(
+            "Flint geometry is not the released RecursiveSI/flint profile".into(),
+        ));
+    }
+    if arch.sliding_window != Some(513) {
+        return Err(CmfError::Parse(
+            "Flint requires arch.sliding_window=513; run `cortiq repair-flint <model.cmf>` for legacy exports"
+                .into(),
+        ));
+    }
+    let expected_no_rope: Vec<bool> = (0..arch.num_layers)
+        .map(|li| FLINT_NO_ROPE_LAYERS.contains(&li))
+        .collect();
+    if arch.no_rope_layers.as_deref() != Some(expected_no_rope.as_slice()) {
+        return Err(CmfError::Parse(
+            "Flint requires its exact 14-layer no-RoPE schedule; run `cortiq repair-flint <model.cmf>` for legacy exports"
+                .into(),
+        ));
+    }
+    if !arch.attention_sink {
+        return Err(CmfError::Parse(
+            "Flint requires arch.attention_sink=true; run `cortiq repair-flint <model.cmf>` for legacy exports"
+                .into(),
+        ));
+    }
+    let Some(moe) = arch.moe.as_ref() else {
+        return Err(CmfError::Parse("Flint requires an MoE descriptor".into()));
+    };
+    if !(moe.router_sigmoid
+        && moe.norm_topk_prob
+        && moe.num_experts == 256
+        && moe.top_k == 6
+        && moe.moe_intermediate_size == 512
+        && moe.shared_expert_intermediate_size == Some(1024))
+    {
+        return Err(CmfError::Parse(
+            "Flint requires sigmoid top-6 normalized routing with its 256×512 + shared-1024 MoE profile"
+                .into(),
+        ));
+    }
+    for li in 0..arch.num_layers {
+        let name = format!("model.layers.{li}.self_attn.softmax_offset");
+        let Some(sink) = model.tensor(&name) else {
+            return Err(CmfError::MissingTensor(name));
+        };
+        if sink.shape.as_slice() != [arch.num_attention_heads] {
+            return Err(CmfError::Parse(format!(
+                "{name} has shape {:?}, expected [{}]",
+                sink.shape, arch.num_attention_heads
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Tensor source selector (spec §9): backbone, one skill's overlay, or
 /// a soft superposition of top-m skills (claim 14 working tensors).
 pub enum Overlay<'a> {
@@ -468,6 +539,10 @@ pub(crate) fn build_ffn_at(
         route_tau,
         norm_topk_prob: cfg.norm_topk_prob,
         router_sigmoid: cfg.router_sigmoid,
+        // Recursive Flint's official runtime renormalizes its selected
+        // sigmoid scores with `sum + 1e-20`; the otherwise equivalent
+        // LFM2/DeepSeek noaux contract uses `+1e-6`.
+        sigmoid_denom_eps: if arch.arch_name == "flint" { 1e-20 } else { 1e-6 },
         expert_bias,
         routed_scaling: cfg.routed_scaling_factor.unwrap_or(1.0),
         shared,
@@ -943,6 +1018,7 @@ impl Pipeline {
                 "model has SlidingAttention layers but no arch.sliding_window".into(),
             ));
         }
+        validate_flint_profile(model, &arch)?;
 
         // Masks × quantized mmap: only the HEAD-mask path needs f32
         // slices, so f32 is forced only when some mask actually restricts
@@ -2047,13 +2123,11 @@ impl Pipeline {
                 }
             }
         }
-        // Recursive Flint: RoPE only on the sliding-window layers — its
-        // full-attention layers carry no positional encoding at all. The
-        // schedule is already in `sliding_layers`; the flag follows from it.
+        // Flint serializes the no-RoPE schedule explicitly.  Do not infer it
+        // from a layer class: a later variant may combine a full window with
+        // RoPE, and changing it changes every attention score.
         if arch.arch_name == "flint" {
-            if let Some(sliding) = pipeline.sliding_layers.clone() {
-                pipeline.no_rope_layers = Some(sliding.iter().map(|is_local| !*is_local).collect());
-            }
+            pipeline.no_rope_layers = arch.no_rope_layers.clone();
         }
         if pipeline.kv_heads_per_layer.is_some()
             || pipeline.v_head_dim.is_some()

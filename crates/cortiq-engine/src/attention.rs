@@ -979,6 +979,16 @@ pub(crate) fn qk_norm_and_rope(
             }
         }
     };
+    // A layer with no RoPE still may have a non-empty pipeline-wide
+    // frequency table (Flint's full-attention layers are exactly that
+    // profile).  There is no zero-width head slice to rotate: constructing
+    // a table from the global frequencies and passing it to that slice used
+    // to index `x[0]` and panic before its first token.
+    if rd == 0 {
+        norm(q, k);
+        return;
+    }
+
     // One sin/cos table per position, shared by every head: the angle of
     // frequency i does not depend on the head, and `rope_rotate_scaled`
     // recomputed it for each of the nh + nkv heads — 1152 libm `sin_cos`
@@ -987,7 +997,7 @@ pub(crate) fn qk_norm_and_rope(
     let rope = |q: &mut [f32], k: &mut [f32]| {
         ROPE_TAB.with(|t| {
             let mut t = t.borrow_mut();
-            rope_table(&mut t, position, cfg.inv_freq);
+            rope_table(&mut t, position, &cfg.inv_freq[..rd / 2]);
             for h in 0..nh {
                 rope_rotate_table(&mut q[h * hd..h * hd + rd], &t, cfg.rope_scale);
             }
@@ -2508,6 +2518,48 @@ mod tests {
             pool,
             v_head_dim: 4,
         }
+    }
+
+    #[test]
+    fn no_rope_layer_skips_global_frequency_table() {
+        // Recursive Flint keeps the normal global frequency table in the
+        // pipeline, but its full-attention layers have rotary_dim=0.  A
+        // no-RoPE layer must be an identity transform, not a zero-width
+        // slice passed to every entry in that table.
+        let (nh, nkv, hd) = (2usize, 1usize, 8usize);
+        let inv = rope_inv_freq(hd, 10_000.0);
+        let cfg = QwenAttnCfg {
+            num_heads: nh,
+            num_kv_heads: nkv,
+            head_dim: hd,
+            hidden_size: nh * hd,
+            position: 17,
+            inv_freq: &inv,
+            rotary_dim: 0,
+            scale: 1.0 / (hd as f32).sqrt(),
+            softcap: 0.0,
+            window: None,
+            v_norm: false,
+            qk_norm_after_rope: false,
+            gate_sigmoid: false,
+            q_norm: None,
+            k_norm: None,
+            output_gate: false,
+            softplus_gate: None,
+            rope_scale: 1.0,
+            bias: None,
+            rms_eps: 1e-6,
+            norm_style: cortiq_core::NormStyle::Qwen,
+            pool: None,
+            v_head_dim: hd,
+        };
+        let mut q: Vec<f32> = (0..nh * hd).map(|i| i as f32 - 7.5).collect();
+        let mut k: Vec<f32> = (0..nkv * hd).map(|i| i as f32 * 0.25 - 1.0).collect();
+        let q_before = q.clone();
+        let k_before = k.clone();
+        qk_norm_and_rope(&cfg, &mut q, &mut k, nh, nkv, hd, cfg.position);
+        assert_eq!(q, q_before);
+        assert_eq!(k, k_before);
     }
 
     /// V heads narrower than Q/K (MiMo-V2: 128 vs 192): the padded-cache /

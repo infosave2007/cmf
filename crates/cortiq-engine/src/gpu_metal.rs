@@ -2387,12 +2387,16 @@ kernel void gqa_attend(
     device const float* vbuf [[buffer(2)]],
     device float*       outb [[buffer(3)]],
     device atomic_float* imp [[buffer(4)]],
-    constant uint& nh  [[buffer(5)]],
-    constant uint& hpk [[buffer(6)]],
-    constant uint& hd  [[buffer(7)]],
-    constant uint& cap [[buffer(8)]],
-    constant uint& n   [[buffer(9)]],
-    constant float& scale [[buffer(10)]],
+    // One optional value-less softmax column per Q head.  When
+    // `has_sink == 0`, this buffer is a one-float dummy and is not read.
+    device const float* sink [[buffer(5)]],
+    constant uint& nh  [[buffer(6)]],
+    constant uint& hpk [[buffer(7)]],
+    constant uint& hd  [[buffer(8)]],
+    constant uint& cap [[buffer(9)]],
+    constant uint& n   [[buffer(10)]],
+    constant uint& has_sink [[buffer(11)]],
+    constant float& scale [[buffer(12)]],
     threadgroup float* sh [[threadgroup(0)]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -2454,18 +2458,37 @@ kernel void gqa_attend(
     for (uint s = 0; s < sgs; ++s) gm = max(gm, sm[s]);
     float gl = 0.0f;
     for (uint s = 0; s < sgs; ++s) gl += sl[s] * exp(sm[s] - gm);
-    float invl = gl > 0.0f ? 1.0f / gl : 0.0f;
+    // A learned attention sink is a separate, value-less softmax column;
+    // it changes the normalizer, but contributes no V row.  Do not add it
+    // to every K score (that would cancel out of softmax).  Rebase the
+    // real-row partials once after their subgroup merge so the exact same
+    // denominator also feeds the importance pass below.
+    float final_m = gm;
+    float real_scale = 1.0f;
+    float sink_mass = 0.0f;
+    if (has_sink != 0u) {
+        float z = sink[h];
+        final_m = max(gm, z);
+        real_scale = gm == -INFINITY ? 0.0f : exp(gm - final_m);
+        sink_mass = exp(z - final_m);
+    }
+    float denom = gl * real_scale + sink_mass;
+    float invl = denom > 0.0f ? 1.0f / denom : 0.0f;
     if (sg == 0) {
         for (uint t = 0; t < nt; ++t) {
             uint d = t * 32u + lane;
             if (d < hd) {
                 float a = 0.0f;
-                for (uint s = 0; s < sgs; ++s) a += sacc[s * hd + d] * exp(sm[s] - gm);
+                if (gm != -INFINITY) {
+                    for (uint s = 0; s < sgs; ++s) {
+                        a += sacc[s * hd + d] * exp(sm[s] - gm) * real_scale;
+                    }
+                }
                 outb[(ulong)h * hd + d] = a * invl;
             }
         }
     }
-    m = gm; // the importance pass below wants the head's final max
+    m = final_m; // the importance pass below wants the full softmax max
     // Attention-importance pass: prob_p = exp(s_p − m)/l summed over heads.
     // The score is recomputed in the SAME lane-sliced layout as the main
     // loop. The obvious form — one position per lane, each lane walking
@@ -5584,6 +5607,7 @@ kernel void moe_topk_select(
     // softmax contract.
     constant uint&      flags  [[buffer(13)]],
     device const float* bias   [[buffer(14)]],
+    constant float&     denom_eps [[buffer(15)]],
     uint tid [[thread_position_in_grid]])
 {
     if (tid != 0u) return;
@@ -5620,9 +5644,10 @@ kernel void moe_topk_select(
         bdn[s] = dtbl[bi];
         key[bi] = -3.0e38f;
     }
-    // Sigmoid routers floor the renorm denominator (HF's + 1e-6); the
-    // routed scale multiplies the routed mix only — never the shared slot.
-    float wden = (msig && norm != 0u) ? (wsum + 1e-6f) : wsum;
+    // Sigmoid routers floor the renorm denominator by their source-model
+    // epsilon; the routed scale multiplies the routed mix only — never the
+    // shared slot.
+    float wden = (msig && norm != 0u) ? (wsum + denom_eps) : wsum;
     float div = (norm != 0u) ? (wden / scale) : (1.0f / scale);
     for (uint s = 0u; s < k; ++s) w[s] = w[s] / div;
     if (!shared) return;
@@ -5689,6 +5714,7 @@ kernel void moe_topk_select_sg(
     constant float&     scale  [[buffer(12)]],
     constant uint&      flags  [[buffer(13)]],
     device const float* bias   [[buffer(14)]],
+    constant float&     denom_eps [[buffer(15)]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg   [[simdgroup_index_in_threadgroup]])
 {
@@ -5760,7 +5786,7 @@ kernel void moe_topk_select_sg(
         }
     }
     if (lane != 0u) return;
-    float wden = (msig && norm != 0u) ? (wsum + 1e-6f) : wsum;
+    float wden = (msig && norm != 0u) ? (wsum + denom_eps) : wsum;
     float div = (norm != 0u) ? (wden / scale) : (1.0f / scale);
     for (uint s = 0u; s < k; ++s) w[s] = w[s] / div;
     if (!shared) return;
@@ -5905,6 +5931,101 @@ inline device const uchar* moe_job_base(ulong jb, device const uchar* q,
     uint wi = (uint)(jb / wstride);
     ulong rel = jb - (ulong)wi * wstride;
     return ((wi == 0u) ? q : (wi == 1u) ? qw1 : (wi == 2u) ? qw2 : qw3) + rel;
+}
+
+// Flint's selected routed gate/up pairs are Q2TP, unlike the ordinary
+// uniform Q4TP jobs bank. This is the dynamic-base twin of the direct-view
+// `q2tp_moe_gu_flint_views6`: the device top-k selector writes six routed
+// bases, so no CPU route/readback is needed between this layer's router and
+// its expert work. Q2 code zero is an exact zero ladder rung; codes 1..31
+// use the ordinary `lane - 1` exponent, exactly as `q2tp_matvec_jobs`.
+kernel void q2tp_moe_gu_m(
+    device const uchar*  q       [[buffer(0)]],
+    device const float*  x       [[buffer(1)]],
+    device float*        act     [[buffer(2)]],
+    constant uint&       gpr     [[buffer(3)]],
+    constant uint&       rows    [[buffer(4)]],
+    device const ulong*  bases   [[buffer(5)]],
+    constant uint&       tg_per  [[buffer(6)]],
+    constant uint&       ne      [[buffer(7)]],
+    device const uchar*  qw1     [[buffer(8)]],
+    device const uchar*  qw2     [[buffer(9)]],
+    device const uchar*  qw3     [[buffer(10)]],
+    constant ulong&      wstride [[buffer(11)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    // Four rows of G plus four rows of U for every one of at most eight
+    // simdgroups in the 256-thread launch.
+    threadgroup float lad[8u * 8u * 32u];
+    uint j = tgpos / tg_per;
+    uint tgl = tgpos - j * tg_per;
+    if (j >= ne) return;
+    device const uchar* qg = moe_job_base(bases[j], q, qw1, qw2, qw3, wstride);
+    device const uchar* qu = moe_job_base(bases[ne + j], q, qw1, qw2, qw3, wstride);
+    device float* aj = act + (ulong)j * (ulong)rows;
+    uint r0 = (tgl * sgs + sg) * 4u;
+    bool active = r0 < rows;
+    uint nr = active ? min(rows - r0, 4u) : 0u;
+    ulong params_off = (ulong)rows * (ulong)gpr * 8ul;
+    ulong codes_off = params_off + (ulong)rows * 4ul;
+    uint stride = (gpr * 5u + 7u) / 8u;
+    for (uint ri = 0u; ri < nr; ++ri) {
+        device const half* pg = (device const half*)(qg + params_off + (ulong)(r0 + ri) * 4ul);
+        device const half* pu = (device const half*)(qu + params_off + (ulong)(r0 + ri) * 4ul);
+        float gs = (lane == 0u) ? 0.0f
+            : exp2((float)pg[0] + (float)(lane - 1u) * (float)pg[1]);
+        float us = (lane == 0u) ? 0.0f
+            : exp2((float)pu[0] + (float)(lane - 1u) * (float)pu[1]);
+        lad[(sg * 8u + ri) * 32u + lane] = gs;
+        lad[(sg * 8u + 4u + ri) * 32u + lane] = us;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!active) return;
+    float ag0 = 0.0f, ag1 = 0.0f, ag2 = 0.0f, ag3 = 0.0f;
+    float au0 = 0.0f, au1 = 0.0f, au2 = 0.0f, au3 = 0.0f;
+    for (uint g = lane; g < gpr; g += 32u) {
+        uint xb = g * 32u;
+        device const float4* xv = (device const float4*)(x + xb);
+        float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+        float4 x4 = xv[4], x5 = xv[5], x6 = xv[6], x7 = xv[7];
+        uint bit = g * 5u;
+        uint cb = bit >> 3u;
+        uint shf = bit & 7u;
+        for (uint jj = 0u; jj < 2u * nr; ++jj) {
+            uint ri = jj >> 1u;
+            bool up = (jj & 1u) != 0u;
+            device const uchar* qw = up ? qu : qg;
+            uint r = r0 + ri;
+            device const uint* p32 = (device const uint*)(qw + ((ulong)r * gpr + (ulong)g) * 8ul);
+            uint b0 = p32[0], b1 = p32[1];
+            device const uchar* cp = qw + codes_off + (ulong)r * (ulong)stride + cb;
+            uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
+            float scale = lad[(sg * 8u + (up ? 4u : 0u) + ri) * 32u + code];
+            float gsum = q2_dot16(b0, x0, x1, x2, x3)
+                       + q2_dot16(b1, x4, x5, x6, x7);
+            float contrib = scale * gsum;
+            if (jj == 0u) ag0 += contrib;
+            else if (jj == 1u) au0 += contrib;
+            else if (jj == 2u) ag1 += contrib;
+            else if (jj == 3u) au1 += contrib;
+            else if (jj == 4u) ag2 += contrib;
+            else if (jj == 5u) au2 += contrib;
+            else if (jj == 6u) ag3 += contrib;
+            else au3 += contrib;
+        }
+    }
+    ag0 = simd_sum(ag0); ag1 = simd_sum(ag1); ag2 = simd_sum(ag2); ag3 = simd_sum(ag3);
+    au0 = simd_sum(au0); au1 = simd_sum(au1); au2 = simd_sum(au2); au3 = simd_sum(au3);
+    if (lane == 0u) {
+        float gv = ag0;
+        aj[r0] = (gv / (1.0f + exp(-gv))) * au0;
+        if (nr > 1u) { gv = ag1; aj[r0 + 1u] = (gv / (1.0f + exp(-gv))) * au1; }
+        if (nr > 2u) { gv = ag2; aj[r0 + 2u] = (gv / (1.0f + exp(-gv))) * au2; }
+        if (nr > 3u) { gv = ag3; aj[r0 + 3u] = (gv / (1.0f + exp(-gv))) * au3; }
+    }
 }
 
 // The routed experts' gate|up|SiLU in ONE dispatch, `q4tp_matvec_m_gu`'s
@@ -6077,6 +6198,82 @@ kernel void q4tp_moe_down_m(
     }
 }
 
+// No-residual twin of `q4tp_moe_down_m`. Flint must add the routed mix
+// before its detached shared branch, so the routed result first lands in a
+// scratch vector instead of modifying `h` in this dispatch. The serial
+// expert-slot loop intentionally preserves `moe_reduce_jobs` accumulation
+// order before the two ordered residual adds on the host encoder.
+kernel void q4tp_moe_down_out_m(
+    device const uchar*  q       [[buffer(0)]],
+    device const float*  a       [[buffer(1)]],
+    device float*        out     [[buffer(2)]],
+    constant uint&       gpr     [[buffer(3)]],
+    constant uint&       rows    [[buffer(4)]],
+    device const ulong*  bases   [[buffer(5)]],
+    device const float*  wmix    [[buffer(6)]],
+    constant uint&       ne      [[buffer(7)]],
+    device const uchar*  qw1     [[buffer(8)]],
+    device const uchar*  qw2     [[buffer(9)]],
+    device const uchar*  qw3     [[buffer(10)]],
+    constant ulong&      wstride [[buffer(11)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    uint r0 = (tgpos * sgs + sg) * 4u;
+    if (r0 >= rows) return;
+    uint nr = min(rows - r0, 4u);
+    ulong params_off = (ulong)rows * (ulong)gpr * 16ul;
+    ulong codes_off  = params_off + (ulong)rows * 4ul;
+    uint  stride     = (gpr * 5u + 7u) / 8u;
+    const float4 sc = float4(1.0f, 1.0f / 16.0f, 1.0f / 256.0f, 1.0f / 4096.0f);
+    float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+    for (uint e = 0u; e < ne; ++e) {
+        device const uchar* qe = moe_job_base(bases[e], q, qw1, qw2, qw3, wstride);
+        device const float* xe = a + (ulong)e * (ulong)gpr * 32ul;
+        float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+        for (uint g = lane; g < gpr; g += 32u) {
+            device const float4* xv = (device const float4*)(xe + g * 32u);
+            float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+            float4 x4 = xv[4], x5 = xv[5], x6 = xv[6], x7 = xv[7];
+            float4 s4 = x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+            float m8 = -8.0f * (s4.x + s4.y + s4.z + s4.w);
+            x0 *= sc; x1 *= sc; x2 *= sc; x3 *= sc; x4 *= sc; x5 *= sc; x6 *= sc; x7 *= sc;
+            uint bit = g * 5u;
+            uint cb  = bit >> 3u;
+            uint shf = bit & 7u;
+            for (uint ri = 0u; ri < nr; ++ri) {
+                uint r = r0 + ri;
+                uint4 b = *(device const uint4*)(qe + ((ulong)r * gpr + (ulong)g) * 16ul);
+                device const uchar* cp = qe + codes_off + (ulong)r * (ulong)stride + cb;
+                uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
+                device const half* ph = (device const half*)(qe + params_off + (ulong)r * 4ul);
+                float scale = exp2((float)ph[0] + (float)code * (float)ph[1]);
+                float gsum = dot(q4_nib4_scaled(b.x), x0) + dot(q4_nib4_scaled(b.x >> 16), x1)
+                           + dot(q4_nib4_scaled(b.y), x2) + dot(q4_nib4_scaled(b.y >> 16), x3)
+                           + dot(q4_nib4_scaled(b.z), x4) + dot(q4_nib4_scaled(b.z >> 16), x5)
+                           + dot(q4_nib4_scaled(b.w), x6) + dot(q4_nib4_scaled(b.w >> 16), x7);
+                float contrib = scale * (gsum + m8);
+                if (ri == 0u) acc0 += contrib;
+                else if (ri == 1u) acc1 += contrib;
+                else if (ri == 2u) acc2 += contrib;
+                else acc3 += contrib;
+            }
+        }
+        acc0 = simd_sum(acc0); acc1 = simd_sum(acc1);
+        acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+        float we = wmix[e];
+        o0 += we * acc0; o1 += we * acc1; o2 += we * acc2; o3 += we * acc3;
+    }
+    if (lane == 0u) {
+        out[r0] = o0;
+        if (nr > 1u) out[r0 + 1u] = o1;
+        if (nr > 2u) out[r0 + 2u] = o2;
+        if (nr > 3u) out[r0 + 3u] = o3;
+    }
+}
+
 // Exact-nine direct no-copy views for MiniCPM-V-4.7's top-8 plus shared
 // expert block.  The ordinary jobs kernels address a contiguous WeightArena;
 // these twins keep the same q4tp arithmetic but bind each routed tensor
@@ -6102,6 +6299,397 @@ inline device const uchar* moe_view9(uint i,
         case 6u: return q6;
         case 7u: return q7;
         default: return q8;
+    }
+}
+
+// Flint's routed set is fixed at six experts.  Keep a dedicated direct-view
+// selector rather than overloading the q4 nine-view kernels: Flint's routed
+// gate/up tensors are Q2TP while its detached shared expert is Q4TP and
+// twice as wide.  The small fixed selectors let the compiler retain direct
+// buffer references (no broad WeightArena binding) on UMA.
+inline device const uchar* flint_view6(uint i,
+                                       device const uchar* q0,
+                                       device const uchar* q1,
+                                       device const uchar* q2,
+                                       device const uchar* q3,
+                                       device const uchar* q4,
+                                       device const uchar* q5) {
+    switch (i) {
+        case 0u: return q0;
+        case 1u: return q1;
+        case 2u: return q2;
+        case 3u: return q3;
+        case 4u: return q4;
+        default: return q5;
+    }
+}
+
+inline device const uchar* flint_view7(uint i,
+                                       device const uchar* q0,
+                                       device const uchar* q1,
+                                       device const uchar* q2,
+                                       device const uchar* q3,
+                                       device const uchar* q4,
+                                       device const uchar* q5,
+                                       device const uchar* q6) {
+    switch (i) {
+        case 0u: return q0;
+        case 1u: return q1;
+        case 2u: return q2;
+        case 3u: return q3;
+        case 4u: return q4;
+        case 5u: return q5;
+        default: return q6;
+    }
+}
+
+// Six selected Q2TP Flint gate/up pairs in one dispatch.  This is the exact
+// direct-view equivalent of the standalone q2tp row matvec followed by
+// `moe_silu_jobs`: code 0 stays an exact zero ladder rung and ordinary Q2TP
+// uses the 1.5 centre.  The host admits only raw, equally prescaled Flint
+// inputs, so one x vector is correct for every routed expert.
+kernel void q2tp_moe_gu_flint_views6(
+    device const uchar* g0      [[buffer(0)]],
+    device const uchar* g1      [[buffer(1)]],
+    device const uchar* g2      [[buffer(2)]],
+    device const uchar* g3      [[buffer(3)]],
+    device const uchar* g4      [[buffer(4)]],
+    device const uchar* g5      [[buffer(5)]],
+    device const uchar* u0      [[buffer(6)]],
+    device const uchar* u1      [[buffer(7)]],
+    device const uchar* u2      [[buffer(8)]],
+    device const uchar* u3      [[buffer(9)]],
+    device const uchar* u4      [[buffer(10)]],
+    device const uchar* u5      [[buffer(11)]],
+    device const float* x       [[buffer(12)]],
+    device float*       act     [[buffer(13)]],
+    constant uint&       gpr     [[buffer(14)]],
+    constant uint&       rows    [[buffer(15)]],
+    constant uint&       tg_per  [[buffer(16)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    // Four rows of G plus four rows of U for each of up to eight
+    // simdgroups in the 256-thread launch.
+    threadgroup float lad[8u * 8u * 32u];
+    uint j = tgpos / tg_per;
+    uint tgl = tgpos - j * tg_per;
+    if (j >= 6u) return;
+    device const uchar* qg = flint_view6(j, g0, g1, g2, g3, g4, g5);
+    device const uchar* qu = flint_view6(j, u0, u1, u2, u3, u4, u5);
+    device float* aj = act + (ulong)j * (ulong)rows;
+    uint r0 = (tgl * sgs + sg) * 4u;
+    bool active = r0 < rows;
+    uint nr = active ? min(rows - r0, 4u) : 0u;
+    ulong params_off = (ulong)rows * (ulong)gpr * 8ul;
+    ulong codes_off = params_off + (ulong)rows * 4ul;
+    uint stride = (gpr * 5u + 7u) / 8u;
+    for (uint ri = 0u; ri < nr; ++ri) {
+        device const half* pg = (device const half*)(qg + params_off + (ulong)(r0 + ri) * 4ul);
+        device const half* pu = (device const half*)(qu + params_off + (ulong)(r0 + ri) * 4ul);
+        float gs = (lane == 0u) ? 0.0f
+            : exp2((float)pg[0] + (float)(lane - 1u) * (float)pg[1]);
+        float us = (lane == 0u) ? 0.0f
+            : exp2((float)pu[0] + (float)(lane - 1u) * (float)pu[1]);
+        lad[(sg * 8u + ri) * 32u + lane] = gs;
+        lad[(sg * 8u + 4u + ri) * 32u + lane] = us;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!active) return;
+    float ag0 = 0.0f, ag1 = 0.0f, ag2 = 0.0f, ag3 = 0.0f;
+    float au0 = 0.0f, au1 = 0.0f, au2 = 0.0f, au3 = 0.0f;
+    for (uint g = lane; g < gpr; g += 32u) {
+        uint xb = g * 32u;
+        device const float4* xv = (device const float4*)(x + xb);
+        float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+        float4 x4 = xv[4], x5 = xv[5], x6 = xv[6], x7 = xv[7];
+        uint bit = g * 5u;
+        uint cb = bit >> 3u;
+        uint shf = bit & 7u;
+        for (uint jj = 0u; jj < 2u * nr; ++jj) {
+            uint ri = jj >> 1u;
+            bool up = (jj & 1u) != 0u;
+            device const uchar* q = up ? qu : qg;
+            uint r = r0 + ri;
+            device const uint* p32 = (device const uint*)(q + ((ulong)r * gpr + (ulong)g) * 8ul);
+            uint b0 = p32[0], b1 = p32[1];
+            device const uchar* cp = q + codes_off + (ulong)r * (ulong)stride + cb;
+            uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
+            float scale = lad[(sg * 8u + (up ? 4u : 0u) + ri) * 32u + code];
+            float gsum = q2_dot16(b0, x0, x1, x2, x3)
+                       + q2_dot16(b1, x4, x5, x6, x7);
+            float contrib = scale * gsum;
+            if (jj == 0u) ag0 += contrib;
+            else if (jj == 1u) au0 += contrib;
+            else if (jj == 2u) ag1 += contrib;
+            else if (jj == 3u) au1 += contrib;
+            else if (jj == 4u) ag2 += contrib;
+            else if (jj == 5u) au2 += contrib;
+            else if (jj == 6u) ag3 += contrib;
+            else au3 += contrib;
+        }
+    }
+    ag0 = simd_sum(ag0); ag1 = simd_sum(ag1); ag2 = simd_sum(ag2); ag3 = simd_sum(ag3);
+    au0 = simd_sum(au0); au1 = simd_sum(au1); au2 = simd_sum(au2); au3 = simd_sum(au3);
+    if (lane == 0u) {
+        float gv = ag0;
+        aj[r0] = (gv / (1.0f + exp(-gv))) * au0;
+        if (nr > 1u) { gv = ag1; aj[r0 + 1u] = (gv / (1.0f + exp(-gv))) * au1; }
+        if (nr > 2u) { gv = ag2; aj[r0 + 2u] = (gv / (1.0f + exp(-gv))) * au2; }
+        if (nr > 3u) { gv = ag3; aj[r0 + 3u] = (gv / (1.0f + exp(-gv))) * au3; }
+    }
+}
+
+// Seven direct Q4TP down views plus the exact ordered Flint mixture.  Slots
+// 0..5 consume 512-wide routed activations; slot 6 is the detached 1024-wide
+// shared expert.  It is deliberately a separate kernel from the uniform
+// nine-view MiniCPM form: widening the shared activation must never make the
+// routed views use the wrong q4tp stride or activation offset.
+kernel void q4tp_moe_down_flint_views7(
+    device const uchar* d0      [[buffer(0)]],
+    device const uchar* d1      [[buffer(1)]],
+    device const uchar* d2      [[buffer(2)]],
+    device const uchar* d3      [[buffer(3)]],
+    device const uchar* d4      [[buffer(4)]],
+    device const uchar* d5      [[buffer(5)]],
+    device const uchar* d6      [[buffer(6)]],
+    device const float* a       [[buffer(7)]],
+    device float*       out     [[buffer(8)]],
+    device const float* wmix    [[buffer(9)]],
+    constant uint& routed_gpr   [[buffer(10)]],
+    constant uint& shared_gpr   [[buffer(11)]],
+    constant uint& rows         [[buffer(12)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    uint r0 = (tgpos * sgs + sg) * 4u;
+    if (r0 >= rows) return;
+    uint nr = min(rows - r0, 4u);
+    const float4 sc = float4(1.0f, 1.0f / 16.0f, 1.0f / 256.0f, 1.0f / 4096.0f);
+    float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+    for (uint e = 0u; e < 7u; ++e) {
+        bool shared = e == 6u;
+        uint gpr = shared ? shared_gpr : routed_gpr;
+        device const uchar* qe = flint_view7(e, d0, d1, d2, d3, d4, d5, d6);
+        device const float* xe = shared
+            ? a + (ulong)6u * (ulong)routed_gpr * 32ul
+            : a + (ulong)e * (ulong)routed_gpr * 32ul;
+        ulong params_off = (ulong)rows * (ulong)gpr * 16ul;
+        ulong codes_off = params_off + (ulong)rows * 4ul;
+        uint stride = (gpr * 5u + 7u) / 8u;
+        float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+        for (uint g = lane; g < gpr; g += 32u) {
+            device const float4* xv = (device const float4*)(xe + g * 32u);
+            float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+            float4 x4 = xv[4], x5 = xv[5], x6 = xv[6], x7 = xv[7];
+            float4 s4 = x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+            float m8 = -8.0f * (s4.x + s4.y + s4.z + s4.w);
+            x0 *= sc; x1 *= sc; x2 *= sc; x3 *= sc; x4 *= sc; x5 *= sc; x6 *= sc; x7 *= sc;
+            uint bit = g * 5u;
+            uint cb = bit >> 3u;
+            uint shf = bit & 7u;
+            for (uint ri = 0u; ri < nr; ++ri) {
+                uint r = r0 + ri;
+                uint4 b = *(device const uint4*)(qe + ((ulong)r * gpr + (ulong)g) * 16ul);
+                device const uchar* cp = qe + codes_off + (ulong)r * (ulong)stride + cb;
+                uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
+                device const half* ph = (device const half*)(qe + params_off + (ulong)r * 4ul);
+                float scale = exp2((float)ph[0] + (float)code * (float)ph[1]);
+                float gsum = dot(q4_nib4_scaled(b.x), x0) + dot(q4_nib4_scaled(b.x >> 16), x1)
+                           + dot(q4_nib4_scaled(b.y), x2) + dot(q4_nib4_scaled(b.y >> 16), x3)
+                           + dot(q4_nib4_scaled(b.z), x4) + dot(q4_nib4_scaled(b.z >> 16), x5)
+                           + dot(q4_nib4_scaled(b.w), x6) + dot(q4_nib4_scaled(b.w >> 16), x7);
+                float contrib = scale * (gsum + m8);
+                if (ri == 0u) acc0 += contrib;
+                else if (ri == 1u) acc1 += contrib;
+                else if (ri == 2u) acc2 += contrib;
+                else acc3 += contrib;
+            }
+        }
+        acc0 = simd_sum(acc0); acc1 = simd_sum(acc1);
+        acc2 = simd_sum(acc2); acc3 = simd_sum(acc3);
+        float we = wmix[e];
+        o0 += we * acc0; o1 += we * acc1; o2 += we * acc2; o3 += we * acc3;
+    }
+    if (lane == 0u) {
+        out[r0] = o0;
+        if (nr > 1u) out[r0 + 1u] = o1;
+        if (nr > 2u) out[r0 + 2u] = o2;
+        if (nr > 3u) out[r0 + 3u] = o3;
+    }
+}
+
+// Fixed-shape Flint down helpers.  The strict direct path admits only
+// H=2048, six routed 512-wide activations and one detached 1024-wide shared
+// activation.  Keeping those sizes in the MSL removes the seven-way view
+// selector and all shape/tail branches from the hot down projection while
+// retaining the ordinary q4tp arithmetic verbatim.
+inline float4 flint_q4tp_down_routed_fixed_acc(
+    device const uchar* qe,
+    device const float* xe,
+    uint r0,
+    uint lane)
+{
+    // rows=2048, gpr=16: params then 2048 four-byte ladder records, and
+    // ten packed 5-bit ladder codes per output row.
+    const ulong params_off = 524288ul;
+    const ulong codes_off = 532480ul;
+    const uint stride = 10u;
+    const float4 sc = float4(1.0f, 1.0f / 16.0f, 1.0f / 256.0f, 1.0f / 4096.0f);
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+
+    // This is exactly the g=lane iteration of the generic gpr=16 loop;
+    // lanes 16..31 contribute zero and remain in simd_sum below.
+    if (lane < 16u) {
+        uint g = lane;
+        device const float4* xv = (device const float4*)(xe + g * 32u);
+        float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+        float4 x4 = xv[4], x5 = xv[5], x6 = xv[6], x7 = xv[7];
+        float4 s4 = x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+        float m8 = -8.0f * (s4.x + s4.y + s4.z + s4.w);
+        x0 *= sc; x1 *= sc; x2 *= sc; x3 *= sc; x4 *= sc; x5 *= sc; x6 *= sc; x7 *= sc;
+        uint bit = g * 5u;
+        uint cb = bit >> 3u;
+        uint shf = bit & 7u;
+        // Four rows are always present in the strict 2048-row launch.
+        for (uint ri = 0u; ri < 4u; ++ri) {
+            uint r = r0 + ri;
+            uint4 b = *(device const uint4*)(qe + ((ulong)r * 16ul + (ulong)g) * 16ul);
+            device const uchar* cp = qe + codes_off + (ulong)r * (ulong)stride + cb;
+            uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
+            device const half* ph = (device const half*)(qe + params_off + (ulong)r * 4ul);
+            float scale = exp2((float)ph[0] + (float)code * (float)ph[1]);
+            float gsum = dot(q4_nib4_scaled(b.x), x0) + dot(q4_nib4_scaled(b.x >> 16), x1)
+                       + dot(q4_nib4_scaled(b.y), x2) + dot(q4_nib4_scaled(b.y >> 16), x3)
+                       + dot(q4_nib4_scaled(b.z), x4) + dot(q4_nib4_scaled(b.z >> 16), x5)
+                       + dot(q4_nib4_scaled(b.w), x6) + dot(q4_nib4_scaled(b.w >> 16), x7);
+            float contrib = scale * (gsum + m8);
+            if (ri == 0u) acc0 += contrib;
+            else if (ri == 1u) acc1 += contrib;
+            else if (ri == 2u) acc2 += contrib;
+            else acc3 += contrib;
+        }
+    }
+    return float4(acc0, acc1, acc2, acc3);
+}
+
+inline float4 flint_q4tp_down_shared_fixed_acc(
+    device const uchar* qe,
+    device const float* xe,
+    uint r0,
+    uint lane)
+{
+    // rows=2048, gpr=32: params then 2048 four-byte ladder records, and
+    // twenty packed 5-bit ladder codes per output row.
+    const ulong params_off = 1048576ul;
+    const ulong codes_off = 1056768ul;
+    const uint stride = 20u;
+    const float4 sc = float4(1.0f, 1.0f / 16.0f, 1.0f / 256.0f, 1.0f / 4096.0f);
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    uint g = lane;
+    device const float4* xv = (device const float4*)(xe + g * 32u);
+    float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+    float4 x4 = xv[4], x5 = xv[5], x6 = xv[6], x7 = xv[7];
+    float4 s4 = x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+    float m8 = -8.0f * (s4.x + s4.y + s4.z + s4.w);
+    x0 *= sc; x1 *= sc; x2 *= sc; x3 *= sc; x4 *= sc; x5 *= sc; x6 *= sc; x7 *= sc;
+    uint bit = g * 5u;
+    uint cb = bit >> 3u;
+    uint shf = bit & 7u;
+    for (uint ri = 0u; ri < 4u; ++ri) {
+        uint r = r0 + ri;
+        uint4 b = *(device const uint4*)(qe + ((ulong)r * 32ul + (ulong)g) * 16ul);
+        device const uchar* cp = qe + codes_off + (ulong)r * (ulong)stride + cb;
+        uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
+        device const half* ph = (device const half*)(qe + params_off + (ulong)r * 4ul);
+        float scale = exp2((float)ph[0] + (float)code * (float)ph[1]);
+        float gsum = dot(q4_nib4_scaled(b.x), x0) + dot(q4_nib4_scaled(b.x >> 16), x1)
+                   + dot(q4_nib4_scaled(b.y), x2) + dot(q4_nib4_scaled(b.y >> 16), x3)
+                   + dot(q4_nib4_scaled(b.z), x4) + dot(q4_nib4_scaled(b.z >> 16), x5)
+                   + dot(q4_nib4_scaled(b.w), x6) + dot(q4_nib4_scaled(b.w >> 16), x7);
+        float contrib = scale * (gsum + m8);
+        if (ri == 0u) acc0 += contrib;
+        else if (ri == 1u) acc1 += contrib;
+        else if (ri == 2u) acc2 += contrib;
+        else acc3 += contrib;
+    }
+    return float4(acc0, acc1, acc2, acc3);
+}
+
+// Fixed-shape direct Flint down projection.  This is intentionally not a
+// general fallback: its caller must submit exactly 128 threadgroups of 128
+// threads (four simdgroups), which covers the 2048 output rows without tails.
+// The explicit six routed additions followed by the detached shared addition
+// preserve the generic kernel's serial expert mix order exactly.
+kernel void q4tp_moe_down_flint_fixed7(
+    device const uchar* d0      [[buffer(0)]],
+    device const uchar* d1      [[buffer(1)]],
+    device const uchar* d2      [[buffer(2)]],
+    device const uchar* d3      [[buffer(3)]],
+    device const uchar* d4      [[buffer(4)]],
+    device const uchar* d5      [[buffer(5)]],
+    device const uchar* d6      [[buffer(6)]],
+    device const float* a       [[buffer(7)]],
+    device float*       out     [[buffer(8)]],
+    device const float* wmix    [[buffer(9)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]])
+{
+    uint r0 = (tgpos * 4u + sg) * 4u;
+    float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+
+    float4 acc = flint_q4tp_down_routed_fixed_acc(d0, a, r0, lane);
+    float a0 = simd_sum(acc.x), a1 = simd_sum(acc.y);
+    float a2 = simd_sum(acc.z), a3 = simd_sum(acc.w);
+    float we = wmix[0];
+    o0 += we * a0; o1 += we * a1; o2 += we * a2; o3 += we * a3;
+
+    acc = flint_q4tp_down_routed_fixed_acc(d1, a + 512ul, r0, lane);
+    a0 = simd_sum(acc.x); a1 = simd_sum(acc.y);
+    a2 = simd_sum(acc.z); a3 = simd_sum(acc.w);
+    we = wmix[1];
+    o0 += we * a0; o1 += we * a1; o2 += we * a2; o3 += we * a3;
+
+    acc = flint_q4tp_down_routed_fixed_acc(d2, a + 1024ul, r0, lane);
+    a0 = simd_sum(acc.x); a1 = simd_sum(acc.y);
+    a2 = simd_sum(acc.z); a3 = simd_sum(acc.w);
+    we = wmix[2];
+    o0 += we * a0; o1 += we * a1; o2 += we * a2; o3 += we * a3;
+
+    acc = flint_q4tp_down_routed_fixed_acc(d3, a + 1536ul, r0, lane);
+    a0 = simd_sum(acc.x); a1 = simd_sum(acc.y);
+    a2 = simd_sum(acc.z); a3 = simd_sum(acc.w);
+    we = wmix[3];
+    o0 += we * a0; o1 += we * a1; o2 += we * a2; o3 += we * a3;
+
+    acc = flint_q4tp_down_routed_fixed_acc(d4, a + 2048ul, r0, lane);
+    a0 = simd_sum(acc.x); a1 = simd_sum(acc.y);
+    a2 = simd_sum(acc.z); a3 = simd_sum(acc.w);
+    we = wmix[4];
+    o0 += we * a0; o1 += we * a1; o2 += we * a2; o3 += we * a3;
+
+    acc = flint_q4tp_down_routed_fixed_acc(d5, a + 2560ul, r0, lane);
+    a0 = simd_sum(acc.x); a1 = simd_sum(acc.y);
+    a2 = simd_sum(acc.z); a3 = simd_sum(acc.w);
+    we = wmix[5];
+    o0 += we * a0; o1 += we * a1; o2 += we * a2; o3 += we * a3;
+
+    acc = flint_q4tp_down_shared_fixed_acc(d6, a + 3072ul, r0, lane);
+    a0 = simd_sum(acc.x); a1 = simd_sum(acc.y);
+    a2 = simd_sum(acc.z); a3 = simd_sum(acc.w);
+    we = wmix[6];
+    o0 += we * a0; o1 += we * a1; o2 += we * a2; o3 += we * a3;
+
+    if (lane == 0u) {
+        out[r0] = o0;
+        out[r0 + 1u] = o1;
+        out[r0 + 2u] = o2;
+        out[r0 + 3u] = o3;
     }
 }
 
@@ -7592,10 +8180,23 @@ struct Ctx {
     moe_gu_m: ComputePipelineState,
     /// Routed experts' down + weighted mix + residual in one pass.
     moe_dn_m: ComputePipelineState,
+    /// Flint's selected Q2TP routed gate/up pairs through dynamic job bases.
+    flint_gu_q2_m: ComputePipelineState,
+    /// Flint routed Q4TP downs mixed into scratch, before detached shared add.
+    flint_dn_q4_out_m: ComputePipelineState,
     /// Exact-nine direct q4tp views: fused gate/up/SiLU.
     moe_gu_views9: ComputePipelineState,
     /// Exact-nine direct q4tp views: fused down plus ordered mix.
     moe_dn_views9: ComputePipelineState,
+    /// Strict Flint q2tp routed gate/up direct views: six experts in one
+    /// dispatch, including the exact SiLU product.
+    flint_gu_q2_views6: ComputePipelineState,
+    /// Strict Flint ragged down direct views: six routed 512-wide activations
+    /// plus the detached 1024-wide shared expert and ordered mixture.
+    flint_dn_views7: ComputePipelineState,
+    /// Strict Flint's fixed H=2048 direct down specialization.  It is bound
+    /// only by the exact six-routed-plus-shared selected-view path.
+    flint_dn_fixed7: ComputePipelineState,
     moesilu: ComputePipelineState,
     moered: ComputePipelineState,
     q4tmm: ComputePipelineState,
@@ -7687,6 +8288,11 @@ struct Ctx {
     /// buffer does not own its mmap bytes, and pointer-only cache keys can be
     /// reused after a model is dropped (cross-model data corruption).
     file_bufs: Mutex<HashMap<usize, (Arc<WeightArena>, Arc<CmfModel>)>>,
+    /// Bounded direct no-copy views for the strict Flint selected-expert
+    /// pager.  This is deliberately separate from `file_bufs`: retaining a
+    /// whole-file arena would reintroduce the oversized-model residency cliff
+    /// that the pager exists to avoid.
+    flint_view_cache: Mutex<FlintViewCache>,
     /// Zero-copy wraps of host state vectors (GDN [ring | S]) keyed by
     /// (address, byte length) — see `host_state_buffer`.
     st_wraps: Mutex<HashMap<(usize, usize), Buffer>>,
@@ -7869,8 +8475,13 @@ fn init() -> Result<Ctx, String> {
     let moesel_sg = pso("moe_topk_select_sg")?;
     let moe_gu_m = pso("q4tp_moe_gu_m")?;
     let moe_dn_m = pso("q4tp_moe_down_m")?;
+    let flint_gu_q2_m = pso("q2tp_moe_gu_m")?;
+    let flint_dn_q4_out_m = pso("q4tp_moe_down_out_m")?;
     let moe_gu_views9 = pso("q4tp_moe_gu_views9")?;
     let moe_dn_views9 = pso("q4tp_moe_down_views9")?;
+    let flint_gu_q2_views6 = pso("q2tp_moe_gu_flint_views6")?;
+    let flint_dn_views7 = pso("q4tp_moe_down_flint_views7")?;
+    let flint_dn_fixed7 = pso("q4tp_moe_down_flint_fixed7")?;
     let moesilu = pso("moe_silu_jobs")?;
     let moered = pso("moe_reduce_jobs")?;
     let q4tmm = pso("q4t_mul_mm")?;
@@ -7994,8 +8605,13 @@ fn init() -> Result<Ctx, String> {
         moesel_sg,
         moe_gu_m,
         moe_dn_m,
+        flint_gu_q2_m,
+        flint_dn_q4_out_m,
         moe_gu_views9,
         moe_dn_views9,
+        flint_gu_q2_views6,
+        flint_dn_views7,
+        flint_dn_fixed7,
         moesilu,
         moered,
         q4tmm,
@@ -8071,6 +8687,7 @@ fn init() -> Result<Ctx, String> {
         mm_fc: Mutex::new(HashMap::new()),
         kv_mirrors: Mutex::new(HashMap::new()),
         file_bufs: Mutex::new(HashMap::new()),
+        flint_view_cache: Mutex::new(FlintViewCache::default()),
         st_wraps: Mutex::new(HashMap::new()),
         o1m: Mutex::new(HashMap::new()),
         rs_bufs: Mutex::new(HashMap::new()),
@@ -8386,10 +9003,7 @@ impl WeightArena {
     }
     #[inline]
     fn contains(&self, abs: usize, bytes: usize) -> bool {
-        abs >= self.base
-            && abs
-                .checked_add(bytes)
-                .is_some_and(|end| end <= self.limit)
+        abs >= self.base && abs.checked_add(bytes).is_some_and(|end| end <= self.limit)
     }
     /// Offset for the jobs kernels' raw base tables.  Full arenas retain
     /// their historical absolute bases; a one-window transient page uses
@@ -8450,32 +9064,53 @@ pub fn working_set_bytes() -> u64 {
         .unwrap_or(0)
 }
 
+/// Common cap calculation for explicit pager users and Flint's narrow
+/// automatic page graph. It is never allowed above one Metal buffer or the
+/// recommended working set minus 2 GiB for KV/state/scratch.
+fn configured_moe_pager_cap_bytes() -> Option<usize> {
+    const MIB: usize = 1024 * 1024;
+    const GIB: usize = 1024 * MIB;
+    let requested = std::env::var("CMF_METAL_MOE_PAGER_MAX_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8 * 1024)
+        .checked_mul(MIB)?;
+    let max = max_buffer_bytes() as usize;
+    let working = working_set_bytes() as usize;
+    let allowed = max.min(working.saturating_sub(2 * GIB));
+    // A smaller page would turn each token into dozens of submissions;
+    // reject it rather than silently trading a residency stall for a
+    // synchronization stall.
+    (allowed >= 64 * MIB && requested >= 64 * MIB).then_some(requested.min(allowed))
+}
+
 /// `CMF_METAL_MOE_PAGER=1` admits an oversized MoE model as short-lived,
-/// sequential no-copy pages rather than binding its complete mmap.  The cap
-/// is deliberately conservative: it is never allowed above either one Metal
-/// buffer or the recommended working set minus 2 GiB for KV/state/scratch.
-/// An invalid setting is a refusal, not an unbounded allocation attempt.
+/// sequential no-copy pages rather than binding its complete mmap.
 pub(crate) fn moe_pager_cap_bytes() -> Option<usize> {
     static CAP: OnceLock<Option<usize>> = OnceLock::new();
     *CAP.get_or_init(|| {
-        if !metal_moe_pager_requested() {
-            return None;
-        }
-        const MIB: usize = 1024 * 1024;
-        const GIB: usize = 1024 * MIB;
-        let requested = std::env::var("CMF_METAL_MOE_PAGER_MAX_MB")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(8 * 1024)
-            .checked_mul(MIB)?;
-        let max = max_buffer_bytes() as usize;
-        let working = working_set_bytes() as usize;
-        let allowed = max.min(working.saturating_sub(2 * GIB));
-        // A smaller page would turn each token into dozens of submissions;
-        // reject it rather than silently trading a residency stall for a
-        // synchronization stall.
-        (allowed >= 64 * MIB && requested >= 64 * MIB).then_some(requested.min(allowed))
+        metal_moe_pager_requested()
+            .then(configured_moe_pager_cap_bytes)
+            .flatten()
     })
+}
+
+/// The full-bank Flint *page graph* is experimental: even two 8 GiB pages
+/// can churn unified memory much harder than the selected-expert pager.  It
+/// therefore requires its own opt-in and must never change Flint's default
+/// direct-view policy (`flint_oversized_moe_auto`).
+fn flint_page_graph_requested() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| metal_env_truthy("CMF_METAL_FLINT_PAGE_GRAPH"))
+}
+
+/// Page-graph cap for strict Flint only when explicitly requested with
+/// `CMF_METAL_FLINT_PAGE_GRAPH=1`.  The generic pager switch deliberately
+/// does not admit this mixed Q2/Q4 full-bank graph.
+pub(crate) fn flint_moe_pager_cap_bytes(model: &Arc<CmfModel>) -> Option<usize> {
+    (flint_page_graph_requested() && flint_oversized_moe_auto(model, working_set_bytes()))
+        .then(configured_moe_pager_cap_bytes)
+        .flatten()
 }
 
 /// Per-page host-side accounting for the bounded MoE pager.  These are
@@ -8668,7 +9303,12 @@ impl MoePagerPageScope {
         }
     }
 
-    pub(crate) fn finish(&mut self, layer_end: usize, stats: Option<MoePagerPageStats>, status: &str) {
+    pub(crate) fn finish(
+        &mut self,
+        layer_end: usize,
+        stats: Option<MoePagerPageStats>,
+        status: &str,
+    ) {
         if !self.enabled || self.finished {
             return;
         }
@@ -10133,7 +10773,8 @@ pub static FFN_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// Number of actual production Prism affine projections routed to the
 /// sign/zero-select kernel. These counters are incremented at encode time,
 /// not by a diagnostic helper, and are intentionally split by WCAT stage.
-pub static TERNARY_PROD_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static TERNARY_PROD_DISPATCHES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 pub static TERNARY_PROD_ROWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static TERNARY_PROD_BY_CAT: [std::sync::atomic::AtomicU64; 6] = [
     std::sync::atomic::AtomicU64::new(0),
@@ -10147,7 +10788,7 @@ pub static TERNARY_PROD_BY_CAT: [std::sync::atomic::AtomicU64; 6] = [
 fn note_weight_bytes(kind: &ProjKind, rows: usize, gpr: usize) {
     let tile: u64 = match kind {
         ProjKind::Q4t => 18,
-        ProjKind::Q4tp => 17, // 16 B codes + ~1 B/group amortized ladder
+        ProjKind::Q4tp => 17,       // 16 B codes + ~1 B/group amortized ladder
         ProjKind::Q2tp { .. } => 9, // 8 B two-bit plane + 5-bit ladder code
         ProjKind::Q4b => 18,
         ProjKind::Q1 | ProjKind::Q1t => 5,
@@ -11166,7 +11807,10 @@ fn chunk_moe_ffn(
         enc.set_buffer(2, Some(&gidx_b), 0);
         let n_u = hs as u32;
         enc.set_bytes(3, 4, &n_u as *const u32 as *const std::ffi::c_void);
-        enc.dispatch_threads(MTLSize::new(hs as u64, n_as as u64, 1), MTLSize::new(256, 1, 1));
+        enc.dispatch_threads(
+            MTLSize::new(hs as u64, n_as as u64, 1),
+            MTLSize::new(256, 1, 1),
+        );
         enc.end_encoding();
     }
     {
@@ -11181,12 +11825,20 @@ fn chunk_moe_ffn(
             }
             let (ga, ua, _) = mabs[e];
             if let Some(p) = q8p {
-                moe_q8::enc_mm_rows(p, enc, fbuf, ga, &xg_b, off[e], &g_b, off[e], n_e, inter, hs, true);
-                moe_q8::enc_mm_rows(p, enc, fbuf, ua, &xg_b, off[e], &u_b, off[e], n_e, inter, hs, true);
+                moe_q8::enc_mm_rows(
+                    p, enc, fbuf, ga, &xg_b, off[e], &g_b, off[e], n_e, inter, hs, true,
+                );
+                moe_q8::enc_mm_rows(
+                    p, enc, fbuf, ua, &xg_b, off[e], &u_b, off[e], n_e, inter, hs, true,
+                );
                 continue;
             }
-            enc_q4tp_mm_rows(c, enc, fbuf, ga, &xg_b, off[e], &g_b, off[e], n_e, inter, hs);
-            enc_q4tp_mm_rows(c, enc, fbuf, ua, &xg_b, off[e], &u_b, off[e], n_e, inter, hs);
+            enc_q4tp_mm_rows(
+                c, enc, fbuf, ga, &xg_b, off[e], &g_b, off[e], n_e, inter, hs,
+            );
+            enc_q4tp_mm_rows(
+                c, enc, fbuf, ua, &xg_b, off[e], &u_b, off[e], n_e, inter, hs,
+            );
         }
         enc.end_encoding();
     }
@@ -11202,7 +11854,9 @@ fn chunk_moe_ffn(
             if n_e == 0 {
                 continue;
             }
-            moe_q8::enc_act_rows(p, enc, fbuf, mabs[e].2, &g_b, &u_b, &act_b, &up_b, off[e], n_e, inter, hs);
+            moe_q8::enc_act_rows(
+                p, enc, fbuf, mabs[e].2, &g_b, &u_b, &act_b, &up_b, off[e], n_e, inter, hs,
+            );
         }
         enc.end_encoding();
     } else {
@@ -11227,10 +11881,14 @@ fn chunk_moe_ffn(
             }
             let (_, _, da) = mabs[e];
             if let Some(p) = q8p {
-                moe_q8::enc_mm_rows(p, enc, fbuf, da, &act_b, off[e], &eo_b, off[e], n_e, hs, inter, false);
+                moe_q8::enc_mm_rows(
+                    p, enc, fbuf, da, &act_b, off[e], &eo_b, off[e], n_e, hs, inter, false,
+                );
                 continue;
             }
-            enc_q4tp_mm_rows(c, enc, fbuf, da, &act_b, off[e], &eo_b, off[e], n_e, hs, inter);
+            enc_q4tp_mm_rows(
+                c, enc, fbuf, da, &act_b, off[e], &eo_b, off[e], n_e, hs, inter,
+            );
         }
         enc.end_encoding();
     }
@@ -11245,7 +11903,10 @@ fn chunk_moe_ffn(
         enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
         enc.set_bytes(5, 4, &k_u as *const u32 as *const std::ffi::c_void);
         enc.set_buffer(6, Some(&up_b), 0);
-        enc.dispatch_threads(MTLSize::new(hs as u64, b as u64, 1), MTLSize::new(256, 1, 1));
+        enc.dispatch_threads(
+            MTLSize::new(hs as u64, b as u64, 1),
+            MTLSize::new(256, 1, 1),
+        );
         enc.end_encoding();
     }
     true
@@ -11521,7 +12182,9 @@ pub fn chunk_run_gpu(
                 let q4 = |i: usize, r: usize, cc: usize| -> Option<usize> {
                     let e = l.model.tensors.get(i)?;
                     if m.q8 {
-                        if e.dtype != cortiq_core::TensorDtype::Q8_2f || e.shape.as_slice() != [r, cc] {
+                        if e.dtype != cortiq_core::TensorDtype::Q8_2f
+                            || e.shape.as_slice() != [r, cc]
+                        {
                             return None;
                         }
                         let a = l.model.entry_abs_offset(e)?;
@@ -11529,11 +12192,16 @@ pub fn chunk_run_gpu(
                         return (a % 4 == 0 && a + n <= safe_len && e.nbytes as usize >= n)
                             .then_some(a);
                     }
-                    if e.dtype != cortiq_core::TensorDtype::Q4TiledP || e.shape.as_slice() != [r, cc] {
+                    if e.dtype != cortiq_core::TensorDtype::Q4TiledP
+                        || e.shape.as_slice() != [r, cc]
+                    {
                         return None;
                     }
                     let a = l.model.entry_abs_offset(e)?;
-                    let n = cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[r, cc])?;
+                    let n = cortiq_core::quant::expected_nbytes(
+                        cortiq_core::TensorDtype::Q4TiledP,
+                        &[r, cc],
+                    )?;
                     (a + n <= safe_len).then_some(a)
                 };
                 match (q4(g, inter, hs), q4(u, inter, hs), q4(d, hs, inter)) {
@@ -11707,7 +12375,11 @@ pub fn chunk_run_gpu(
     // encoder ordering within one command buffer serializes access).
     // The widest layer's Q and KV rows (every layer's for all but Gemma-4).
     let qw = layers.iter().map(|l| l.nh * l.hd).max().unwrap_or(nh * hd);
-    let kvw = layers.iter().map(|l| l.nkv * l.hd).max().unwrap_or(nkv * hd);
+    let kvw = layers
+        .iter()
+        .map(|l| l.nkv * l.hd)
+        .max()
+        .unwrap_or(nkv * hd);
     let h_b = io_buf(c, 60_000_000_071 + b * hs, b * hs * 4);
     let n_b = io_buf(c, 61_000_000_091 + b * hs, b * hs * 4);
     let qraw = io_buf(c, 62_000_000_017 + b * qw, b * qw * 4);
@@ -11844,8 +12516,16 @@ pub fn chunk_run_gpu(
         // through the blob-addressed f32-tile GEMM and its attention GEMMs
         // with f32 tiles (`moe_q8`); every other layer keeps its kernels.
         let q8l = l.moe.as_ref().is_some_and(|m| m.q8);
-        let q8proj = if q8l && moe_q8::proj_on() { moe_q8::pipes(c) } else { None };
-        let q8att = if q8l && moe_q8::att_on() { moe_q8::pipes(c) } else { None };
+        let q8proj = if q8l && moe_q8::proj_on() {
+            moe_q8::pipes(c)
+        } else {
+            None
+        };
+        let q8att = if q8l && moe_q8::att_on() {
+            moe_q8::pipes(c)
+        } else {
+            None
+        };
         // Gemma-4: q8_2f projections through the blob GEMM (their input
         // fields read in place) and f32 attention tiles, always.
         let (q8proj, q8att) = if l.g4.is_some() {
@@ -11858,12 +12538,28 @@ pub fn chunk_run_gpu(
             // projection stages its x·col first; the serial encoder orders
             // the shared staging buffer).
             let enc = cmd.new_compute_command_encoder();
-            for (i, (t, y)) in [(&l.wq, &qraw), (&l.wk, &kraw), (&l.wv, &vraw)].into_iter().enumerate() {
+            for (i, (t, y)) in [(&l.wq, &qraw), (&l.wk, &kraw), (&l.wv, &vraw)]
+                .into_iter()
+                .enumerate()
+            {
                 let fits = |n: Option<usize>| n.is_some_and(|n| prep.abs[i] + n <= safe_len);
-                if let Some(p) = q8proj
-                    .filter(|_| !l.col[i].is_empty() && t.2 % 32 == 0 && fits(moe_q8::tensor_bytes(t.1, t.2)))
-                {
-                    moe_q8::enc_mm_rows(p, enc, &fbuf, prep.abs[i], &n_b, 0, y, 0, b, t.1, t.2, true);
+                if let Some(p) = q8proj.filter(|_| {
+                    !l.col[i].is_empty() && t.2 % 32 == 0 && fits(moe_q8::tensor_bytes(t.1, t.2))
+                }) {
+                    moe_q8::enc_mm_rows(
+                        p,
+                        enc,
+                        &fbuf,
+                        prep.abs[i],
+                        &n_b,
+                        0,
+                        y,
+                        0,
+                        b,
+                        t.1,
+                        t.2,
+                        true,
+                    );
                     continue;
                 }
                 let x = if l.col[i].is_empty() {
@@ -11872,7 +12568,19 @@ pub fn chunk_run_gpu(
                     col_scale(enc, &n_b, l.col[i], hs);
                     &xpre
                 };
-                enc_mul_mm(c, enc, &fbuf, prep.abs[i], &prep.rs[i], prep.kind[i], x, y, b, t.1, t.2);
+                enc_mul_mm(
+                    c,
+                    enc,
+                    &fbuf,
+                    prep.abs[i],
+                    &prep.rs[i],
+                    prep.kind[i],
+                    x,
+                    y,
+                    b,
+                    t.1,
+                    t.2,
+                );
             }
             enc.end_encoding();
         }
@@ -11919,7 +12627,11 @@ pub fn chunk_run_gpu(
             enc.set_bytes(20, 4, &l.eps as *const f32 as *const std::ffi::c_void);
             let nb_u = b as u32;
             enc.set_bytes(21, 4, &nb_u as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(22, 4, &l.rope_scale as *const f32 as *const std::ffi::c_void);
+            enc.set_bytes(
+                22,
+                4,
+                &l.rope_scale as *const f32 as *const std::ffi::c_void,
+            );
             let sgs = 8u64;
             enc.dispatch_thread_groups(
                 MTLSize::new(((nh + 2 * nkv) as u64).div_ceil(sgs), b as u64, 1),
@@ -11942,7 +12654,9 @@ pub fn chunk_run_gpu(
             // Grow-only per (nkv, chunk rows): every score the reads below
             // touch is written first, so a larger slot changes nothing.
             let scores = io_buf_grow(c, 72_000_000_089 + nkv * m_rows, nkv * m_rows * ncur * 4);
-            let scale = l.g4.as_ref().map_or(1.0f32 / (hd as f32).sqrt(), |g| g.scale);
+            let scale =
+                l.g4.as_ref()
+                    .map_or(1.0f32 / (hd as f32).sqrt(), |g| g.scale);
             {
                 let enc = cmd.new_compute_command_encoder();
                 match q8att {
@@ -12053,9 +12767,23 @@ pub fn chunk_run_gpu(
         cmd = prof.cut(c, cmd, "attend");
         {
             let enc = cmd.new_compute_command_encoder();
-            let o_fits = moe_q8::tensor_bytes(l.wo.1, l.wo.2).is_some_and(|n| prep.abs[3] + n <= safe_len);
+            let o_fits =
+                moe_q8::tensor_bytes(l.wo.1, l.wo.2).is_some_and(|n| prep.abs[3] + n <= safe_len);
             if let Some(p) = q8proj.filter(|_| !l.col[3].is_empty() && l.wo.2 % 32 == 0 && o_fits) {
-                moe_q8::enc_mm_rows(p, enc, &fbuf, prep.abs[3], &attn, 0, &ob, 0, b, l.wo.1, l.wo.2, true);
+                moe_q8::enc_mm_rows(
+                    p,
+                    enc,
+                    &fbuf,
+                    prep.abs[3],
+                    &attn,
+                    0,
+                    &ob,
+                    0,
+                    b,
+                    l.wo.1,
+                    l.wo.2,
+                    true,
+                );
             } else {
                 let x = if l.col[3].is_empty() {
                     &attn
@@ -12063,7 +12791,19 @@ pub fn chunk_run_gpu(
                     col_scale(enc, &attn, l.col[3], nh * hd);
                     &xpre
                 };
-                enc_mul_mm(c, enc, &fbuf, prep.abs[3], &prep.rs[3], prep.kind[3], x, &ob, b, l.wo.1, l.wo.2);
+                enc_mul_mm(
+                    c,
+                    enc,
+                    &fbuf,
+                    prep.abs[3],
+                    &prep.rs[3],
+                    prep.kind[3],
+                    x,
+                    &ob,
+                    b,
+                    l.wo.1,
+                    l.wo.2,
+                );
             }
             enc.end_encoding();
         }
@@ -12085,7 +12825,18 @@ pub fn chunk_run_gpu(
         cmd = prof.cut(c, cmd, "axpy+norm");
         if let Some(m) = &l.moe {
             // Routed experts into db (folded by the next add+norm).
-            if !chunk_moe_ffn(c, &fbuf, &mut cmd, m, &prep.moe_abs, &n_b, &db, b, hs, inter) {
+            if !chunk_moe_ffn(
+                c,
+                &fbuf,
+                &mut cmd,
+                m,
+                &prep.moe_abs,
+                &n_b,
+                &db,
+                b,
+                hs,
+                inter,
+            ) {
                 return false;
             }
             cmd = prof.cut(c, cmd, "moe");
@@ -12103,7 +12854,19 @@ pub fn chunk_run_gpu(
                 if prep.q8f[i] {
                     moe_q8::enc_mm_rows(p8, enc, &fbuf, prep.abs[i], x, 0, y, 0, b, t.1, t.2, true);
                 } else {
-                    enc_mul_mm(c, enc, &fbuf, prep.abs[i], &prep.rs[i], prep.kind[i], x, y, b, t.1, t.2);
+                    enc_mul_mm(
+                        c,
+                        enc,
+                        &fbuf,
+                        prep.abs[i],
+                        &prep.rs[i],
+                        prep.kind[i],
+                        x,
+                        y,
+                        b,
+                        t.1,
+                        t.2,
+                    );
                 }
             };
             let enc = cmd.new_compute_command_encoder();
@@ -12123,7 +12886,10 @@ pub fn chunk_run_gpu(
                 let (n_u, hc) = ((b * inter) as u32, 0u32);
                 enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
                 enc.set_bytes(5, 4, &hc as *const u32 as *const std::ffi::c_void);
-                enc.dispatch_threads(MTLSize::new((b * inter) as u64, 1, 1), MTLSize::new(256, 1, 1));
+                enc.dispatch_threads(
+                    MTLSize::new((b * inter) as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
             }
             enc.end_encoding();
             let enc = cmd.new_compute_command_encoder();
@@ -12149,109 +12915,112 @@ pub fn chunk_run_gpu(
             }
             cmd = prof.cut(c, cmd, "mm_down");
         } else {
-        {
-            let enc = cmd.new_compute_command_encoder();
-            enc_mul_mm(
-                c,
-                enc,
-                &fbuf,
-                prep.abs[4],
-                &prep.rs[4],
-                prep.kind[4],
-                &n_b,
-                &gb,
-                b,
-                l.gate.1,
-                l.gate.2,
-            );
-            enc_mul_mm(
-                c,
-                enc,
-                &fbuf,
-                prep.abs[5],
-                &prep.rs[5],
-                prep.kind[5],
-                &n_b,
-                &ub,
-                b,
-                l.up.1,
-                l.up.2,
-            );
-            enc.end_encoding();
-        }
-        cmd = prof.cut(c, cmd, "mm_gateup");
-        if l.act == 1 {
-            // GELU: gelu(g)·u in place over the gate rows, then the plain
-            // down GEMM (the fused-activation GEMMs compute SiLU only).
-            let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&c.gelu);
-            enc.set_buffer(0, Some(&gb), 0);
-            enc.set_buffer(1, Some(&ub), 0);
-            enc.set_buffer(2, Some(&gb), 0); // dummy col (has_col = 0)
-            enc.set_buffer(3, Some(&gb), 0);
-            let (n_u, hc) = ((b * inter) as u32, 0u32);
-            enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(5, 4, &hc as *const u32 as *const std::ffi::c_void);
-            enc.dispatch_threads(MTLSize::new((b * inter) as u64, 1, 1), MTLSize::new(256, 1, 1));
-            enc.end_encoding();
-            let enc = cmd.new_compute_command_encoder();
-            enc_mul_mm(
-                c,
-                enc,
-                &fbuf,
-                prep.abs[6],
-                &prep.rs[6],
-                prep.kind[6],
-                &gb,
-                &db,
-                b,
-                l.down.1,
-                l.down.2,
-            );
-            enc.end_encoding();
-        } else
-        // down GEMM with silu(g)·u fused into the X-tile load — no
-        // standalone activation stage, no act-buffer round trip.
-        {
-            let enc = cmd.new_compute_command_encoder();
-            let (cols_u, rows_u, b_u) = (l.down.2 as u32, l.down.1 as u32, b as u32);
-            // q4t drops the row-scale buffer, so every constant after it
-            // shifts down one slot.
-            let base = if prep.kind[6] != MmKind::Q8 {
-                enc.set_compute_pipeline_state(if prep.kind[6] == MmKind::Q4tp {
-                    &c.q4tpmmsilu
+            {
+                let enc = cmd.new_compute_command_encoder();
+                enc_mul_mm(
+                    c,
+                    enc,
+                    &fbuf,
+                    prep.abs[4],
+                    &prep.rs[4],
+                    prep.kind[4],
+                    &n_b,
+                    &gb,
+                    b,
+                    l.gate.1,
+                    l.gate.2,
+                );
+                enc_mul_mm(
+                    c,
+                    enc,
+                    &fbuf,
+                    prep.abs[5],
+                    &prep.rs[5],
+                    prep.kind[5],
+                    &n_b,
+                    &ub,
+                    b,
+                    l.up.1,
+                    l.up.2,
+                );
+                enc.end_encoding();
+            }
+            cmd = prof.cut(c, cmd, "mm_gateup");
+            if l.act == 1 {
+                // GELU: gelu(g)·u in place over the gate rows, then the plain
+                // down GEMM (the fused-activation GEMMs compute SiLU only).
+                let enc = cmd.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&c.gelu);
+                enc.set_buffer(0, Some(&gb), 0);
+                enc.set_buffer(1, Some(&ub), 0);
+                enc.set_buffer(2, Some(&gb), 0); // dummy col (has_col = 0)
+                enc.set_buffer(3, Some(&gb), 0);
+                let (n_u, hc) = ((b * inter) as u32, 0u32);
+                enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(5, 4, &hc as *const u32 as *const std::ffi::c_void);
+                enc.dispatch_threads(
+                    MTLSize::new((b * inter) as u64, 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
+                enc.end_encoding();
+                let enc = cmd.new_compute_command_encoder();
+                enc_mul_mm(
+                    c,
+                    enc,
+                    &fbuf,
+                    prep.abs[6],
+                    &prep.rs[6],
+                    prep.kind[6],
+                    &gb,
+                    &db,
+                    b,
+                    l.down.1,
+                    l.down.2,
+                );
+                enc.end_encoding();
+            } else
+            // down GEMM with silu(g)·u fused into the X-tile load — no
+            // standalone activation stage, no act-buffer round trip.
+            {
+                let enc = cmd.new_compute_command_encoder();
+                let (cols_u, rows_u, b_u) = (l.down.2 as u32, l.down.1 as u32, b as u32);
+                // q4t drops the row-scale buffer, so every constant after it
+                // shifts down one slot.
+                let base = if prep.kind[6] != MmKind::Q8 {
+                    enc.set_compute_pipeline_state(if prep.kind[6] == MmKind::Q4tp {
+                        &c.q4tpmmsilu
+                    } else {
+                        &c.q4tmmsilu
+                    });
+                    fbuf.bind(enc, 0, prep.abs[6]);
+                    enc.set_buffer(1, Some(&gb), 0);
+                    enc.set_buffer(2, Some(&ub), 0);
+                    enc.set_buffer(3, Some(&db), 0);
+                    4
                 } else {
-                    &c.q4tmmsilu
-                });
-                fbuf.bind(enc, 0, prep.abs[6]);
-                enc.set_buffer(1, Some(&gb), 0);
-                enc.set_buffer(2, Some(&ub), 0);
-                enc.set_buffer(3, Some(&db), 0);
-                4
-            } else {
-                let pso = mm_pipeline(c, l.down.1, l.down.2, 1);
-                enc.set_compute_pipeline_state(&pso);
-                fbuf.bind(enc, 0, prep.abs[6]);
-                enc.set_buffer(1, Some(&gb), 0);
-                enc.set_buffer(2, Some(&ub), 0);
-                enc.set_buffer(3, Some(&prep.rs[6]), 0);
-                enc.set_buffer(4, Some(&db), 0);
-                5
-            };
-            enc.set_bytes(base, 4, &cols_u as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(
-                base + 1,
-                4,
-                &rows_u as *const u32 as *const std::ffi::c_void,
-            );
-            enc.set_bytes(base + 2, 4, &b_u as *const u32 as *const std::ffi::c_void);
-            enc.dispatch_thread_groups(
-                MTLSize::new((b as u64).div_ceil(32), (l.down.1 as u64).div_ceil(64), 1),
-                MTLSize::new(128, 1, 1),
-            );
-            enc.end_encoding();
-        }
-        cmd = prof.cut(c, cmd, "mm_down");
+                    let pso = mm_pipeline(c, l.down.1, l.down.2, 1);
+                    enc.set_compute_pipeline_state(&pso);
+                    fbuf.bind(enc, 0, prep.abs[6]);
+                    enc.set_buffer(1, Some(&gb), 0);
+                    enc.set_buffer(2, Some(&ub), 0);
+                    enc.set_buffer(3, Some(&prep.rs[6]), 0);
+                    enc.set_buffer(4, Some(&db), 0);
+                    5
+                };
+                enc.set_bytes(base, 4, &cols_u as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(
+                    base + 1,
+                    4,
+                    &rows_u as *const u32 as *const std::ffi::c_void,
+                );
+                enc.set_bytes(base + 2, 4, &b_u as *const u32 as *const std::ffi::c_void);
+                enc.dispatch_thread_groups(
+                    MTLSize::new((b as u64).div_ceil(32), (l.down.1 as u64).div_ceil(64), 1),
+                    MTLSize::new(128, 1, 1),
+                );
+                enc.end_encoding();
+            }
+            cmd = prof.cut(c, cmd, "mm_down");
         }
         // Early commit (decode-graph lesson): hand this layer to the
         // GPU now and encode the next one while it runs — the queue
@@ -12981,12 +13750,15 @@ fn q2tp_matvec_mode(
     {
         return false;
     }
-    let Some(abs) = model.entry_abs_offset(entry) else { return false };
-    let Some((fbuf, safe_len)) = file_buffer(c, model) else { return false };
-    let Some(need) = cortiq_core::quant::expected_nbytes(
-        cortiq_core::TensorDtype::Q2TiledP,
-        &[rows, cols],
-    ) else {
+    let Some(abs) = model.entry_abs_offset(entry) else {
+        return false;
+    };
+    let Some((fbuf, safe_len)) = file_buffer(c, model) else {
+        return false;
+    };
+    let Some(need) =
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q2TiledP, &[rows, cols])
+    else {
         return false;
     };
     if abs.checked_add(need).is_none_or(|end| end > safe_len) {
@@ -13017,11 +13789,30 @@ fn q2tp_matvec_mode(
         TERNARY_PROD_ROWS.fetch_add(rows as u64, std::sync::atomic::Ordering::Relaxed);
         let cat = WCAT.load(std::sync::atomic::Ordering::Relaxed) as usize % 6;
         TERNARY_PROD_BY_CAT[cat].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        encode_q2tp_affine_select_matvec(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, cols / GROUP_SIZE);
+        encode_q2tp_affine_select_matvec(
+            c,
+            enc,
+            &fbuf,
+            abs,
+            &xs_buf,
+            &y_buf,
+            rows,
+            cols / GROUP_SIZE,
+        );
     } else {
         // Ordinary midrise Q2 and illegal affine/code3 payloads retain the
         // established centre decoder, including its reserved-code result.
-        encode_q2tp_matvec(c, enc, &fbuf, abs, &xs_buf, &y_buf, rows, cols / GROUP_SIZE, center);
+        encode_q2tp_matvec(
+            c,
+            enc,
+            &fbuf,
+            abs,
+            &xs_buf,
+            &y_buf,
+            rows,
+            cols / GROUP_SIZE,
+            center,
+        );
     }
     enc.end_encoding();
     submit_and_wait(c, cmd, &[&y_buf]);
@@ -13067,8 +13858,7 @@ fn q2tp_matmat_mode(
     affine: bool,
 ) -> bool {
     let Some(c) = ctx() else { return false };
-    if cols % GROUP_SIZE != 0 || rows == 0 || b == 0
-        || pre.len() < b * cols || out.len() < b * rows
+    if cols % GROUP_SIZE != 0 || rows == 0 || b == 0 || pre.len() < b * cols || out.len() < b * rows
     {
         return false;
     }
@@ -13080,12 +13870,15 @@ fn q2tp_matmat_mode(
     {
         return false;
     }
-    let Some(abs) = model.entry_abs_offset(entry) else { return false };
-    let Some((fbuf, safe_len)) = file_buffer(c, model) else { return false };
-    let Some(need) = cortiq_core::quant::expected_nbytes(
-        cortiq_core::TensorDtype::Q2TiledP,
-        &[rows, cols],
-    ) else {
+    let Some(abs) = model.entry_abs_offset(entry) else {
+        return false;
+    };
+    let Some((fbuf, safe_len)) = file_buffer(c, model) else {
+        return false;
+    };
+    let Some(need) =
+        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q2TiledP, &[rows, cols])
+    else {
         return false;
     };
     if abs.checked_add(need).is_none_or(|end| end > safe_len) {
@@ -13112,17 +13905,7 @@ fn q2tp_matmat_mode(
     let cmd = c.queue.new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
     encode_q2tp_matmat(
-        c,
-        enc,
-        &fbuf,
-        abs,
-        &xs_buf,
-        &y_buf,
-        cols,
-        rows,
-        b,
-        wboost,
-        center,
+        c, enc, &fbuf, abs, &xs_buf, &y_buf, cols, rows, b, wboost, center,
     );
     enc.end_encoding();
     submit_and_wait(c, cmd, &[&y_buf]);
@@ -14580,6 +15363,17 @@ enum SparseMoeResult {
 pub static SPARSE_MOE_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static SPARSE_MOE_SPAN_BYTES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Strict Flint selected-view cache receipts.  A benchmark can distinguish a
+/// pager that merely creates transient mappings from one that is reusing its
+/// bounded hot expert-view set.
+pub static FLINT_VIEW_CACHE_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static FLINT_VIEW_CACHE_MISSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static FLINT_VIEW_CACHE_EVICTIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static FLINT_VIEW_CACHE_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// A page-rounded no-copy view over exactly one routed q4tp tensor. `offset`
 /// advances from the page boundary to the tensor payload, so q4tp's required
@@ -14641,6 +15435,98 @@ impl SparseMoeRange {
     }
 }
 
+/// Identity of a page-rounded Flint no-copy view.  `CmfModel::uid` is stable
+/// for a live open and differs across re-opened mappings, so a stale pointer
+/// can never become a cache hit for another model.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct FlintViewCacheKey {
+    model_uid: usize,
+    start: usize,
+    end: usize,
+}
+
+/// One retained no-copy Metal view.  Keep `buffer` before `_model`: a Metal
+/// buffer only borrows the mmap bytes, so it must be released before the Arc
+/// that owns that mapping on eviction/drop.
+struct FlintViewCacheEntry {
+    buffer: Buffer,
+    _model: Arc<CmfModel>,
+    bytes: usize,
+    last_used: u64,
+}
+
+/// Small, explicitly byte-bounded LRU for strict Flint selected views.
+///
+/// It intentionally caches individual page-rounded selected spans rather
+/// than a `WeightArena`: every entry is at most one admitted expert cover and
+/// the accounting sums MTLBuffer lengths, which is conservative on UMA.
+/// Calls wait for checked command-buffer completion before returning, so a
+/// map eviction cannot release a buffer still used by this synchronous path.
+#[derive(Default)]
+struct FlintViewCache {
+    entries: HashMap<FlintViewCacheKey, FlintViewCacheEntry>,
+    used_bytes: usize,
+    tick: u64,
+}
+
+impl FlintViewCache {
+    fn next_tick(&mut self) -> u64 {
+        self.tick = self.tick.saturating_add(1);
+        self.tick
+    }
+
+    fn get(&mut self, key: FlintViewCacheKey) -> Option<Buffer> {
+        let tick = self.next_tick();
+        let entry = self.entries.get_mut(&key)?;
+        entry.last_used = tick;
+        Some(entry.buffer.clone())
+    }
+
+    /// Insert a newly-made view, evicting old entries until the strict cap
+    /// holds. `None` means the individual view is too large for retention;
+    /// its caller still uses it transiently for this one checked submission.
+    fn insert(
+        &mut self,
+        key: FlintViewCacheKey,
+        buffer: Buffer,
+        model: Arc<CmfModel>,
+        bytes: usize,
+        cap_bytes: usize,
+    ) -> Option<u64> {
+        if cap_bytes == 0 || bytes == 0 || bytes > cap_bytes {
+            return None;
+        }
+        // The caller rechecks after creating outside the lock, but make the
+        // bookkeeping fail-closed if a future call uses this directly.
+        if let Some(old) = self.entries.remove(&key) {
+            self.used_bytes = self.used_bytes.saturating_sub(old.bytes);
+        }
+        let mut evicted = 0u64;
+        while self.used_bytes > cap_bytes.saturating_sub(bytes) {
+            let victim = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| *key)?;
+            let old = self.entries.remove(&victim)?;
+            self.used_bytes = self.used_bytes.saturating_sub(old.bytes);
+            evicted += 1;
+        }
+        let last_used = self.next_tick();
+        self.used_bytes = self.used_bytes.checked_add(bytes)?;
+        self.entries.insert(
+            key,
+            FlintViewCacheEntry {
+                buffer,
+                _model: model,
+                bytes,
+                last_used,
+            },
+        );
+        Some(evicted)
+    }
+}
+
 /// Rebase a tensor's payload offset into a coalesced no-copy expert view.
 /// `cover` is admitted only by [`SparseMoeRange::contiguous_triple`], but
 /// retain the bounds checks here so a future caller cannot accidentally bind
@@ -14695,13 +15581,59 @@ mod sparse_moe_range_tests {
         // overlap enough to hide the later 4 KiB gap.  Mapping the cover
         // would then bind an unrelated tensor, so only true continuity is
         // allowed.
-        assert!(SparseMoeRange::contiguous_triple(
-            range(0, 8192),
-            range(0, 8192),
-            range(12_288, 16_384),
-            16_384,
-        )
-        .is_none());
+        assert!(
+            SparseMoeRange::contiguous_triple(
+                range(0, 8192),
+                range(0, 8192),
+                range(12_288, 16_384),
+                16_384,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn flint_view_cache_cap_keeps_large_residency_headroom() {
+        const MIB: usize = 1024 * 1024;
+        // Actual q2 Flint + 24 GB M4 measurements: a one-token selected
+        // set is ~472 MiB, while the policy must still leave 2 GiB plus one
+        // transient selected block outside the retained view cache.
+        let cap = flint_view_cache_safe_cap_bytes(14_684_032_647, 19_069_665_280, 128 * MIB);
+        assert_eq!(cap, 512 * MIB);
+        let no_headroom = flint_view_cache_safe_cap_bytes(
+            14 * 1024 * 1024 * 1024,
+            16 * 1024 * 1024 * 1024,
+            128 * MIB,
+        );
+        assert_eq!(no_headroom, 0);
+    }
+
+    #[test]
+    fn flint_view_cache_cap_never_exceeds_the_bounded_hard_limit() {
+        const MIB: usize = 1024 * 1024;
+        let cap = flint_view_cache_safe_cap_bytes(
+            1 * 1024 * 1024 * 1024,
+            64 * 1024 * 1024 * 1024,
+            128 * MIB,
+        );
+        assert_eq!(cap, 512 * MIB);
+    }
+
+    #[test]
+    fn flint_view_cache_requires_an_explicit_positive_opt_in() {
+        const MIB: usize = 1024 * 1024;
+        let safe = 512 * MIB;
+        assert_eq!(flint_view_cache_requested_cap_bytes(None, safe), 0);
+        assert_eq!(flint_view_cache_requested_cap_bytes(Some("0"), safe), 0);
+        assert_eq!(flint_view_cache_requested_cap_bytes(Some("bad"), safe), 0);
+        assert_eq!(
+            flint_view_cache_requested_cap_bytes(Some("64"), safe),
+            64 * MIB
+        );
+        assert_eq!(
+            flint_view_cache_requested_cap_bytes(Some("1024"), safe),
+            safe
+        );
     }
 }
 
@@ -14718,9 +15650,10 @@ fn metal_env_truthy(name: &str) -> bool {
 /// `CMF_METAL_MOE_PAGER=1` is the bounded graph pager.  It also enables the
 /// already-parity-tested selected q4tp views as its *safe* fallback whenever
 /// a later graph segment cannot fit a page.  `CMF_METAL_SPARSE_MOE=1` keeps
-/// its direct diagnostic meaning.  Neither opt-in may fall through to a
-/// whole-model arena on an oversized UMA model: that turns a page refusal
-/// into the driver OOM/stall this policy exists to avoid.
+/// its direct diagnostic meaning.  Exact oversized Flint models are a narrow
+/// exception: their mixed/ragged expert profile has a dedicated bounded path
+/// and must not create a whole-model arena by default.  Other models retain
+/// the explicit opt-in policy.
 fn metal_moe_pager_requested() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| metal_env_truthy("CMF_METAL_MOE_PAGER"))
@@ -14731,15 +15664,36 @@ fn sparse_moe_enabled() -> bool {
     *ON.get_or_init(|| metal_env_truthy("CMF_METAL_SPARSE_MOE") || metal_moe_pager_requested())
 }
 
-/// Explicit selected-view / graph-pager users asked for bounded residency.
-/// If their model is bigger than Metal's working-set recommendation, never
-/// resurrect `file_buffer()` after the specialised path says it cannot serve
-/// this particular block.  Returning false from `moe_block` is the existing
-/// exact CPU fallback and, unlike a full no-copy arena, has no way to wedge
-/// the driver's eviction path mid-token.
+/// Flint's exact mixed-Q2/Q4 selected-expert pager is safe to choose without
+/// an environment switch when one broad native `WeightArena` would be unsafe:
+/// either the complete mapping exceeds Metal's recommended working set OR it
+/// exceeds `maxBufferLength` and would require overlapping full-file windows.
+/// The latter matters on a 24 GB M4: q2 Flint (about 14 GB) can fit the
+/// reported working-set budget yet crosses its roughly 13.6 GB buffer limit,
+/// so two broad windows recreate the same paging cliff before the MoE block.
+/// Keep the predicate deliberately tight: a look-alike architecture or a
+/// transformed Q2 model retains the existing explicit opt-in/fallback path.
+fn flint_oversized_moe_auto(model: &Arc<CmfModel>, working_set: u64) -> bool {
+    if model.header.arch.arch_name != "flint" || model.header.arch.prism_hadamard.is_some() {
+        return false;
+    }
+    let model_bytes = model.primary_bytes().len() as u64;
+    let working_exceeded = working_set != 0 && model_bytes > working_set;
+    let max_buffer = max_buffer_bytes();
+    let multi_window = max_buffer != 0 && model_bytes > max_buffer;
+    working_exceeded || multi_window
+}
+
+/// Explicit selected-view / graph-pager users and exact oversized Flint need
+/// bounded residency. Once that policy applies, never resurrect `file_buffer()`
+/// after the specialised path says it cannot serve this particular block.
+/// Returning false from `moe_block` is the existing exact CPU fallback and,
+/// unlike a full no-copy arena, has no way to wedge the driver under pressure.
 fn oversized_moe_arena_forbidden(model: &Arc<CmfModel>) -> bool {
     let working_set = working_set_bytes();
-    sparse_moe_enabled() && working_set != 0 && model.primary_bytes().len() as u64 > working_set
+    let model_bytes = model.primary_bytes().len() as u64;
+    let requested_oversize = sparse_moe_enabled() && working_set != 0 && model_bytes > working_set;
+    requested_oversize || flint_oversized_moe_auto(model, working_set)
 }
 
 /// Conservative cap for the page-rounded no-copy *views*, not q4tp payload
@@ -14758,13 +15712,16 @@ fn sparse_moe_span_cap_bytes() -> usize {
         .unwrap_or(DEFAULT)
 }
 
-/// Validate the primary-shard q4tp tensor and form the smallest page-aligned
-/// range `new_buffer_with_bytes_no_copy` accepts for it.
-fn sparse_moe_range(
+/// Validate a primary-shard tiled tensor and form the smallest page-aligned
+/// range `new_buffer_with_bytes_no_copy` accepts for it.  Selected Flint
+/// experts use Q2TP only for gate/up and Q4TP for down, so the no-copy view
+/// machinery must validate the directory dtype rather than assuming Q4TP.
+fn sparse_moe_range_dtype(
     model: &CmfModel,
     idx: usize,
     rows: usize,
     cols: usize,
+    dtype: cortiq_core::TensorDtype,
     page: usize,
     safe_len: usize,
 ) -> Option<SparseMoeRange> {
@@ -14772,16 +15729,10 @@ fn sparse_moe_range(
         return None;
     }
     let entry = model.tensors.get(idx)?;
-    if entry.shard != 0
-        || entry.dtype != cortiq_core::TensorDtype::Q4TiledP
-        || entry.shape.as_slice() != [rows, cols]
-    {
+    if entry.shard != 0 || entry.dtype != dtype || entry.shape.as_slice() != [rows, cols] {
         return None;
     }
-    let qlen = cortiq_core::quant::expected_nbytes(
-        cortiq_core::TensorDtype::Q4TiledP,
-        &[rows, cols],
-    )?;
+    let qlen = cortiq_core::quant::expected_nbytes(dtype, &[rows, cols])?;
     let abs = model.entry_abs_offset(entry)?;
     let payload_end = abs.checked_add(qlen)?;
     if entry.nbytes as usize != qlen || abs % 16 != 0 || payload_end > safe_len {
@@ -14807,14 +15758,30 @@ fn sparse_moe_range(
     })
 }
 
+/// Q4TP wrapper retained for the existing uniform selected-expert pager.
+fn sparse_moe_range(
+    model: &CmfModel,
+    idx: usize,
+    rows: usize,
+    cols: usize,
+    page: usize,
+    safe_len: usize,
+) -> Option<SparseMoeRange> {
+    sparse_moe_range_dtype(
+        model,
+        idx,
+        rows,
+        cols,
+        cortiq_core::TensorDtype::Q4TiledP,
+        page,
+        safe_len,
+    )
+}
+
 /// Build a no-copy MTLBuffer from a previously validated page range. The
 /// caller owns the model Arc and all returned views until checked command
 /// buffer completion, so the mmap cannot be unmapped while Metal reads it.
-fn sparse_moe_view(
-    c: &Ctx,
-    base_ptr: usize,
-    range: SparseMoeRange,
-) -> Option<SparseMoeView> {
+fn sparse_moe_view(c: &Ctx, base_ptr: usize, range: SparseMoeRange) -> Option<SparseMoeView> {
     let span_bytes = range.span_bytes();
     let ptr = base_ptr.checked_add(range.start)?;
     let buffer = unsafe {
@@ -14829,6 +15796,748 @@ fn sparse_moe_view(
         buffer,
         offset: range.offset,
     })
+}
+
+/// The opt-in selected-view cache is deliberately much smaller than a model
+/// and leaves an additional 2 GiB for KV/state/ordinary scratch.  It also
+/// reserves one maximum transient selected block: a miss must be executable
+/// before it can enter the cache.  A 512 MiB hard ceiling is enough to retain
+/// roughly one complete 49-layer q2 Flint route set (~472 MiB on the M4)
+/// without recreating a broad model arena.
+fn flint_view_cache_safe_cap_bytes(
+    model_bytes: u64,
+    working_set: u64,
+    transient_cap: usize,
+) -> usize {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    const HARD_CAP: u64 = 512 * MIB;
+    if working_set == 0 {
+        return 0;
+    }
+    let transient = u64::try_from(transient_cap).unwrap_or(u64::MAX);
+    let remaining = working_set
+        .saturating_sub(model_bytes)
+        .saturating_sub(2 * GIB)
+        .saturating_sub(transient);
+    // Spend at most half of the remaining safety margin on retained views;
+    // the other half absorbs driver accounting, KV growth and unrelated
+    // model buffers rather than turning a speed cache into a residency risk.
+    usize::try_from((remaining / 2).min(HARD_CAP)).unwrap_or(0)
+}
+
+/// Resolve an explicit Flint selected-view cache request against the safety
+/// ceiling.  Retention is deliberately off unless a positive MiB value is
+/// supplied: retained no-copy MTLBuffers regressed steady M4 decode relative
+/// to short-lived views.  Invalid, absent, and zero values all keep the pager
+/// in its bounded transient-view mode.
+fn flint_view_cache_requested_cap_bytes(request: Option<&str>, safe: usize) -> usize {
+    const MIB: usize = 1024 * 1024;
+    match request.and_then(|value| value.parse::<usize>().ok()) {
+        Some(0) | None => 0,
+        // Overflow is still an explicit positive request, so clamp it rather
+        // than allowing it to widen or silently wrap the safety limit.
+        Some(mib) => mib.checked_mul(MIB).map_or(safe, |bytes| bytes.min(safe)),
+    }
+}
+
+/// Capacity for the strict Flint selected-view LRU.  It is disabled by
+/// default; only an explicit positive `CMF_METAL_FLINT_VIEW_CACHE_MB=<n>`
+/// enables it, and the result can never exceed the conservative safety cap.
+fn flint_view_cache_cap_bytes(model_bytes: u64, working_set: u64) -> usize {
+    let safe =
+        flint_view_cache_safe_cap_bytes(model_bytes, working_set, sparse_moe_span_cap_bytes());
+    let requested = std::env::var("CMF_METAL_FLINT_VIEW_CACHE_MB").ok();
+    flint_view_cache_requested_cap_bytes(requested.as_deref(), safe)
+}
+
+/// Return a direct selected Flint view, reusing an exact page-rounded span
+/// when the bounded cache can safely retain it.  The caller owns `model` for
+/// the entire synchronous checked command-buffer submission; cache eviction
+/// therefore cannot invalidate an in-flight mmap pointer.
+fn flint_cached_sparse_moe_view(
+    c: &Ctx,
+    model: &Arc<CmfModel>,
+    base_ptr: usize,
+    range: SparseMoeRange,
+    cap_bytes: usize,
+) -> Option<SparseMoeView> {
+    if cap_bytes == 0 {
+        return sparse_moe_view(c, base_ptr, range);
+    }
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ACTIVE_SAID: AtomicBool = AtomicBool::new(false);
+    static HIT_SAID: AtomicBool = AtomicBool::new(false);
+    if !ACTIVE_SAID.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            cap_mb = cap_bytes / (1024 * 1024),
+            "native Metal Flint selected-view LRU cache enabled"
+        );
+    }
+    let key = FlintViewCacheKey {
+        model_uid: model_key(model),
+        start: range.start,
+        end: range.end,
+    };
+    let (cached, cached_bytes) = {
+        let mut cache = c.flint_view_cache.lock().unwrap();
+        let hit = cache.get(key);
+        let used_bytes = cache.used_bytes;
+        (hit, used_bytes)
+    };
+    if let Some(buffer) = cached {
+        FLINT_VIEW_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+        if !HIT_SAID.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                cap_mb = cap_bytes / (1024 * 1024),
+                cached_mb = cached_bytes / (1024 * 1024),
+                "native Metal Flint selected-view LRU cache hit"
+            );
+        }
+        return Some(SparseMoeView {
+            buffer,
+            offset: range.offset,
+        });
+    }
+
+    FLINT_VIEW_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    // Metal allocation is intentionally outside the cache lock. The model
+    // Arc held by this call owns the mmap throughout; a concurrent creator
+    // may win the insertion race, in which case its cached buffer wins below.
+    let transient = sparse_moe_view(c, base_ptr, range)?;
+    let mut cache = c.flint_view_cache.lock().unwrap();
+    if let Some(buffer) = cache.get(key) {
+        let used_bytes = cache.used_bytes;
+        drop(cache);
+        FLINT_VIEW_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+        if !HIT_SAID.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                cap_mb = cap_bytes / (1024 * 1024),
+                cached_mb = used_bytes / (1024 * 1024),
+                "native Metal Flint selected-view LRU cache hit"
+            );
+        }
+        return Some(SparseMoeView {
+            buffer,
+            offset: range.offset,
+        });
+    }
+    let evicted = cache.insert(
+        key,
+        transient.buffer.clone(),
+        Arc::clone(model),
+        range.span_bytes(),
+        cap_bytes,
+    );
+    let used_bytes = cache.used_bytes;
+    drop(cache);
+    if let Some(evicted) = evicted {
+        FLINT_VIEW_CACHE_EVICTIONS.fetch_add(evicted, Ordering::Relaxed);
+        FLINT_VIEW_CACHE_BYTES.store(used_bytes as u64, Ordering::Relaxed);
+    }
+    Some(transient)
+}
+
+/// The exact host-routed shape used by Recursive Flint: six selected routed
+/// SwiGLU experts and one ungated, always-active shared expert.  The routed
+/// bank may have Q2TP gate/up planes (the q2tp CMF) or Q4TP planes (q4tp
+/// CMF), while every down plane and the wider shared expert remain Q4TP.
+///
+/// This is deliberately a *shape* admission, not a generic ragged-MoE
+/// implementation.  It lets the native Metal backend bind only the seven
+/// experts selected for this token without pretending that 512-wide routed
+/// activations and the 1024-wide shared activation form one uniform bank.
+#[derive(Clone, Copy, Debug)]
+struct FlintSparsePlan {
+    hidden: usize,
+    routed_inter: usize,
+    shared_inter: usize,
+    routed_q2: bool,
+}
+
+fn flint_sparse_plan(jobs: &[MoeJob], out_len: usize) -> Option<FlintSparsePlan> {
+    const ROUTED: usize = 6;
+    if jobs.len() != ROUTED + 1 {
+        return None;
+    }
+    let (routed, shareds) = jobs.split_at(ROUTED);
+    let first = routed.first()?;
+    let shared = shareds.first()?;
+    let hidden = first.gate.2;
+    let routed_inter = first.gate.1;
+    let shared_inter = shared.gate.1;
+    if hidden == 0
+        || routed_inter == 0
+        || shared_inter != routed_inter.checked_mul(2)?
+        || out_len != hidden
+        || hidden % GROUP_SIZE != 0
+        || routed_inter % GROUP_SIZE != 0
+        || shared_inter % GROUP_SIZE != 0
+    {
+        return None;
+    }
+    let routed_q2 = first.gu_q2;
+    let x = &first.xs_gate;
+    let valid = |job: &MoeJob, inter: usize, gu_q2: bool| {
+        !job.q1
+            && !job.q4t
+            && job.q4tp
+            && job.gu_q2 == gu_q2
+            && job.act == 0
+            && job.down_col.is_empty()
+            && job.gate.3.is_empty()
+            && job.up.3.is_empty()
+            && job.down.3.is_empty()
+            && job.gate.1 == inter
+            && job.gate.2 == hidden
+            && job.up.1 == inter
+            && job.up.2 == hidden
+            && job.down.1 == hidden
+            && job.down.2 == inter
+            && job.xs_gate.len() == hidden
+            && job.xs_up.len() == hidden
+            && job.xs_gate.as_slice() == x.as_slice()
+            && job.xs_up.as_slice() == x.as_slice()
+            && job.w.is_finite()
+    };
+    if !routed
+        .iter()
+        .all(|job| valid(job, routed_inter, routed_q2))
+        // Flint's shared expert is an ordinary Q4TP SwiGLU with no sigmoid
+        // gate; admitting a different shared contract here would silently
+        // change routing semantics just to make a pager run.
+        || !valid(shared, shared_inter, false)
+        || shared.w.to_bits() != 1.0f32.to_bits()
+    {
+        return None;
+    }
+    Some(FlintSparsePlan {
+        hidden,
+        routed_inter,
+        shared_inter,
+        routed_q2,
+    })
+}
+
+#[cfg(test)]
+mod flint_sparse_plan_tests {
+    use super::*;
+
+    const HIDDEN: usize = 2_048;
+    static EMPTY: [f32; 0] = [];
+
+    fn job(inter: usize, gu_q2: bool, w: f32) -> MoeJob<'static> {
+        MoeJob {
+            gate: (0, inter, HIDDEN, &EMPTY),
+            up: (1, inter, HIDDEN, &EMPTY),
+            down: (2, HIDDEN, inter, &EMPTY),
+            xs_gate: vec![0.0; HIDDEN],
+            xs_up: vec![0.0; HIDDEN],
+            down_col: &EMPTY,
+            w,
+            q1: false,
+            q4t: false,
+            q4tp: true,
+            gu_q2,
+            swiglu_limit: 0.0,
+            act: 0,
+        }
+    }
+
+    #[test]
+    fn flint_q2_gu_q4_down_and_wide_shared_are_admitted() {
+        let mut jobs = (0..6)
+            .map(|_| job(512, true, 1.0 / 6.0))
+            .collect::<Vec<_>>();
+        jobs.push(job(1_024, false, 1.0));
+        let plan = flint_sparse_plan(&jobs, HIDDEN).expect("valid Flint selected block");
+        assert!(plan.routed_q2, "only gate/up select the q2tp decoder");
+        assert_eq!(plan.routed_inter, 512);
+        assert_eq!(plan.shared_inter, 1_024);
+    }
+
+    #[test]
+    fn flint_q4_routed_and_wide_shared_are_admitted() {
+        let mut jobs = (0..6)
+            .map(|_| job(512, false, 1.0 / 6.0))
+            .collect::<Vec<_>>();
+        jobs.push(job(1_024, false, 1.0));
+        let plan = flint_sparse_plan(&jobs, HIDDEN).expect("valid q4tp Flint selected block");
+        assert!(!plan.routed_q2);
+        assert_eq!((plan.routed_inter, plan.shared_inter), (512, 1_024));
+    }
+
+    #[test]
+    fn flint_sparse_plan_refuses_q2_shared_projection() {
+        let mut jobs = (0..6)
+            .map(|_| job(512, true, 1.0 / 6.0))
+            .collect::<Vec<_>>();
+        jobs.push(job(1_024, true, 1.0));
+        assert!(flint_sparse_plan(&jobs, HIDDEN).is_none());
+    }
+}
+
+/// Opt-in timing for the strict Flint selected-view route.  This is kept
+/// separate from the whole-token graph profiler: the direct route has one
+/// command buffer per MoE layer, so its useful question is whether time is
+/// spent constructing/binding short views, waiting in the driver, or running
+/// the three fused kernels.  GPU timestamps deliberately exclude queueing;
+/// `wait - gpu` therefore exposes residency/queue pressure without claiming
+/// that it is arithmetic.
+fn flint_sparse_profile_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_METAL_FLINT_PROFILE").as_deref() == Ok("1"))
+}
+
+/// The fixed Flint down kernel is the normal strict-shape route after
+/// full-model byte parity on M4.  `=0` is a narrow diagnostic escape hatch
+/// for an Apple GPU/driver regression; every other value (and unset) keeps
+/// the specialized launch.  Its layout assumptions remain deliberately
+/// narrower than `FlintSparsePlan`.
+fn flint_fixed_down_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_METAL_FLINT_FIXED_DOWN").as_deref() != Ok("0"))
+}
+
+fn flint_sparse_profile_sample(
+    prepare: std::time::Duration,
+    wait: std::time::Duration,
+    gpu_ms: f64,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // This released Flint layout has 49 decoder layers but only 47 routed
+    // MoE blocks (two layers are dense).  The direct pager is called only
+    // for the latter, so this cadence is one real decode-token checkpoint.
+    const FLINT_MOE_LAYERS: u64 = 47;
+    static BLOCKS: AtomicU64 = AtomicU64::new(0);
+    static PREP_US: AtomicU64 = AtomicU64::new(0);
+    static WAIT_US: AtomicU64 = AtomicU64::new(0);
+    static GPU_US: AtomicU64 = AtomicU64::new(0);
+
+    PREP_US.fetch_add(prepare.as_micros() as u64, Ordering::Relaxed);
+    WAIT_US.fetch_add(wait.as_micros() as u64, Ordering::Relaxed);
+    // Timestamps may be zero on a driver that does not expose them; retain
+    // that as an honest zero rather than inventing GPU occupancy from wall
+    // time.  Saturation also keeps a malformed timestamp harmless.
+    GPU_US.fetch_add(
+        (gpu_ms.max(0.0) * 1_000.0).min(u64::MAX as f64) as u64,
+        Ordering::Relaxed,
+    );
+    let n = BLOCKS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % FLINT_MOE_LAYERS != 0 {
+        return;
+    }
+    let prep = PREP_US.load(Ordering::Relaxed) as f64 / n as f64 / 1_000.0;
+    let waited = WAIT_US.load(Ordering::Relaxed) as f64 / n as f64 / 1_000.0;
+    let gpu = GPU_US.load(Ordering::Relaxed) as f64 / n as f64 / 1_000.0;
+    eprintln!(
+        "metal Flint direct profile: {n} MoE blocks | prepare {prep:.2} ms/block | \
+         wait {waited:.2} ms/block | GPU {gpu:.2} ms/block | wait-minus-GPU {:.2} ms/block",
+        (waited - gpu).max(0.0),
+    );
+}
+
+/// Selected-view native Metal pager for a single Flint MoE block.
+///
+/// Unlike the uniform q4tp pager below, this keeps the mixed Q2TP/Q4TP
+/// routed planes and Flint's 2x-wider shared expert distinct.  All scratch is
+/// tiny (seven selected experts only); more importantly, every weight buffer
+/// is a short-lived page-aligned no-copy view rather than a 15–21 GiB full
+/// CMF arena on UMA.  The host has already executed Flint's bias-aware
+/// sigmoid top-6 selector, so no router decision is approximated here.
+fn try_moe_block_flint_sparse(
+    c: &Ctx,
+    model: &Arc<CmfModel>,
+    jobs: &[MoeJob],
+    out: &mut [f32],
+) -> SparseMoeResult {
+    let profile = flint_sparse_profile_on();
+    let prof_start = profile.then(std::time::Instant::now);
+    let working_set = working_set_bytes();
+    let model_bytes = model.primary_bytes().len() as u64;
+    let auto = flint_oversized_moe_auto(model, working_set);
+    if !sparse_moe_enabled() && !auto {
+        return SparseMoeResult::NotApplicable;
+    }
+    // An explicit generic pager keeps its historical working-set policy;
+    // auto Flint also protects the one-model-into-two-full-windows case.
+    if !auto && (working_set == 0 || model_bytes <= working_set) {
+        return SparseMoeResult::NotApplicable;
+    }
+    // Q2TP's direct kernel below is the ordinary centre=1.5 decoder.  Do
+    // not borrow this Flint-specific route for a Prism-transformed model.
+    if model.header.arch.arch_name != "flint" || model.header.arch.prism_hadamard.is_some() {
+        return SparseMoeResult::NotApplicable;
+    }
+    let Some(plan) = flint_sparse_plan(jobs, out.len()) else {
+        return SparseMoeResult::Declined;
+    };
+    if plan.hidden != model.header.arch.hidden_size {
+        return SparseMoeResult::Declined;
+    }
+
+    let page = page_size();
+    let bytes = model.primary_bytes();
+    let safe_len = bytes.len() / page * page;
+    if safe_len == 0 || bytes.as_ptr() as usize % page != 0 {
+        return SparseMoeResult::Declined;
+    }
+    let max_buffer_bytes = c._device.max_buffer_length() as usize;
+    let mut ranges = Vec::with_capacity(jobs.len());
+    let mut bound_bytes = 0usize;
+    for job in jobs {
+        let gu_dtype = if job.gu_q2 {
+            cortiq_core::TensorDtype::Q2TiledP
+        } else {
+            cortiq_core::TensorDtype::Q4TiledP
+        };
+        let (Some(gate), Some(up), Some(down)) = (
+            sparse_moe_range_dtype(
+                model, job.gate.0, job.gate.1, job.gate.2, gu_dtype, page, safe_len,
+            ),
+            sparse_moe_range_dtype(
+                model, job.up.0, job.up.1, job.up.2, gu_dtype, page, safe_len,
+            ),
+            sparse_moe_range_dtype(
+                model,
+                job.down.0,
+                job.down.1,
+                job.down.2,
+                cortiq_core::TensorDtype::Q4TiledP,
+                page,
+                safe_len,
+            ),
+        ) else {
+            return SparseMoeResult::Declined;
+        };
+        let packed = SparseMoeRange::contiguous_triple(gate, up, down, max_buffer_bytes);
+        let triple_bytes = match packed {
+            Some(range) => range.span_bytes(),
+            None => gate
+                .span_bytes()
+                .checked_add(up.span_bytes())
+                .and_then(|n| n.checked_add(down.span_bytes()))
+                .unwrap_or(usize::MAX),
+        };
+        let Some(next) = bound_bytes.checked_add(triple_bytes) else {
+            return SparseMoeResult::Declined;
+        };
+        bound_bytes = next;
+        ranges.push((gate, up, down, packed));
+    }
+    if bound_bytes > sparse_moe_span_cap_bytes()
+        || ranges
+            .iter()
+            .flat_map(|(g, u, d, _)| [g, u, d])
+            .any(|range| range.span_bytes() > max_buffer_bytes)
+    {
+        tracing::debug!(
+            bound_bytes,
+            cap = sparse_moe_span_cap_bytes(),
+            "Metal Flint selected MoE views declined by admission cap"
+        );
+        return SparseMoeResult::Declined;
+    }
+
+    let view_buffers = ranges
+        .iter()
+        .map(|(_, _, _, packed)| if packed.is_some() { 1usize } else { 3usize })
+        .sum::<usize>();
+    // Only strict Flint goes through this function. The cache is off by
+    // default; an explicit positive opt-in is bounded by device headroom,
+    // while the zero default retains short-lived views exactly.
+    let view_cache_cap = flint_view_cache_cap_bytes(model_bytes, working_set);
+    let base_ptr = bytes.as_ptr() as usize;
+    let mut views = Vec::with_capacity(ranges.len());
+    for (gate, up, down, packed) in ranges {
+        let view_set = match packed {
+            Some(cover) => {
+                let Some(cover_view) =
+                    flint_cached_sparse_moe_view(c, model, base_ptr, cover, view_cache_cap)
+                else {
+                    return SparseMoeResult::Declined;
+                };
+                let (Some(gate), Some(up), Some(down)) = (
+                    sparse_moe_rebased_view(&cover_view.buffer, cover, gate),
+                    sparse_moe_rebased_view(&cover_view.buffer, cover, up),
+                    sparse_moe_rebased_view(&cover_view.buffer, cover, down),
+                ) else {
+                    return SparseMoeResult::Declined;
+                };
+                SparseMoeViews { gate, up, down }
+            }
+            None => {
+                let (Some(gate), Some(up), Some(down)) = (
+                    flint_cached_sparse_moe_view(c, model, base_ptr, gate, view_cache_cap),
+                    flint_cached_sparse_moe_view(c, model, base_ptr, up, view_cache_cap),
+                    flint_cached_sparse_moe_view(c, model, base_ptr, down, view_cache_cap),
+                ) else {
+                    return SparseMoeResult::Declined;
+                };
+                SparseMoeViews { gate, up, down }
+            }
+        };
+        views.push(view_set);
+    }
+
+    let routed = views.len() - 1;
+    let total_inter = match plan
+        .routed_inter
+        .checked_mul(routed)
+        .and_then(|n| n.checked_add(plan.shared_inter))
+    {
+        Some(n) => n,
+        None => return SparseMoeResult::Declined,
+    };
+    let bytes4 = |n: usize| n.checked_mul(std::mem::size_of::<f32>());
+    let (Some(x_bytes), Some(w_bytes), Some(a_bytes), Some(y_bytes)) = (
+        bytes4(plan.hidden),
+        bytes4(views.len()),
+        bytes4(total_inter),
+        bytes4(plan.hidden),
+    ) else {
+        return SparseMoeResult::Declined;
+    };
+    // Q2 Flint takes the direct fused kernels below, so it has no materialised
+    // gate/up or per-expert-down scratch.  Retain the old scratch only for
+    // q4tp Flint until its analogous routed-GU fusion is measured.
+    let dbuf_bytes = views.len().checked_mul(plan.hidden).and_then(bytes4);
+    if !plan.routed_q2 && dbuf_bytes.is_none() {
+        return SparseMoeResult::Declined;
+    }
+    let get_io = |key: usize, nbytes: usize| -> Buffer {
+        let mut cache = c.io_bufs.lock().unwrap();
+        cache
+            .entry(io_key(key))
+            .or_insert_with(|| {
+                crate::gpu::probe_note_cold();
+                c._device
+                    .new_buffer(nbytes as u64, MTLResourceOptions::StorageModeShared)
+            })
+            .clone()
+    };
+    let wbuf = get_io(19_000_000_109 + views.len(), w_bytes);
+    let xbuf = get_io(19_100_000_117 + plan.hidden, x_bytes);
+    let abuf = get_io(19_200_000_123 + total_inter, a_bytes);
+    let dbuf = (!plan.routed_q2).then(|| {
+        get_io(
+            19_300_000_129 + views.len() * plan.hidden,
+            dbuf_bytes.expect("q4 Flint path admitted down scratch"),
+        )
+    });
+    let ybuf = get_io(19_400_000_133 + plan.hidden, y_bytes);
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            jobs[0].xs_gate.as_ptr(),
+            xbuf.contents() as *mut f32,
+            plan.hidden,
+        );
+        let pw = wbuf.contents() as *mut f32;
+        for (i, job) in jobs.iter().enumerate() {
+            *pw.add(i) = job.w;
+        }
+    }
+
+    let cmd = c.queue.new_command_buffer();
+    // Stage 1: routed q2 gate/up (or q4 fused gate/up) plus the q4 shared
+    // SwiGLU.  All selected projections share the same host input buffer.
+    {
+        let enc = cmd.new_compute_command_encoder();
+        if plan.routed_q2 {
+            // Flint's exact six selected routed experts become one direct
+            // view dispatch: Q2TP gate/up, SiLU and product all stay on the
+            // device.  The strict plan predicate established the fixed count
+            // and raw common input before any view was created.
+            debug_assert_eq!(routed, 6);
+            let gpr_u = (plan.hidden / GROUP_SIZE) as u32;
+            let rows_u = plan.routed_inter as u32;
+            let sgs = 8u64;
+            let tg_per = (plan.routed_inter as u64).div_ceil(sgs * 4);
+            let tg_per_u = tg_per as u32;
+            enc.set_compute_pipeline_state(&c.flint_gu_q2_views6);
+            for (i, view) in views[..routed].iter().enumerate() {
+                enc.set_buffer(i as u64, Some(&view.gate.buffer), view.gate.offset);
+                enc.set_buffer(6 + i as u64, Some(&view.up.buffer), view.up.offset);
+            }
+            enc.set_buffer(12, Some(&xbuf), 0);
+            enc.set_buffer(13, Some(&abuf), 0);
+            enc.set_bytes(14, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(15, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(16, 4, &tg_per_u as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(
+                MTLSize::new(tg_per * routed as u64, 1, 1),
+                MTLSize::new(sgs * 32, 1, 1),
+            );
+        } else {
+            for (i, view) in views[..routed].iter().enumerate() {
+                let act_off = (i * plan.routed_inter * 4) as u64;
+                let (gpr_u, rows_u) = ((plan.hidden / GROUP_SIZE) as u32, plan.routed_inter as u32);
+                let sgs = 4u64;
+                enc.set_compute_pipeline_state(&c.q4tp_mgu);
+                enc.set_buffer(0, Some(&view.gate.buffer), view.gate.offset);
+                enc.set_buffer(1, Some(&xbuf), 0);
+                enc.set_buffer(2, Some(&abuf), act_off);
+                enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+                enc.set_buffer(5, Some(&view.up.buffer), view.up.offset);
+                enc.dispatch_thread_groups(
+                    MTLSize::new((plan.routed_inter as u64).div_ceil(sgs * 4), 1, 1),
+                    MTLSize::new(sgs * 32, 1, 1),
+                );
+            }
+        }
+        let shared = views.last().expect("Flint plan owns shared expert");
+        let shared_off = (routed * plan.routed_inter * 4) as u64;
+        let (gpr_u, rows_u) = ((plan.hidden / GROUP_SIZE) as u32, plan.shared_inter as u32);
+        let sgs = 4u64;
+        enc.set_compute_pipeline_state(&c.q4tp_mgu);
+        enc.set_buffer(0, Some(&shared.gate.buffer), shared.gate.offset);
+        enc.set_buffer(1, Some(&xbuf), 0);
+        enc.set_buffer(2, Some(&abuf), shared_off);
+        enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+        enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+        enc.set_buffer(5, Some(&shared.up.buffer), shared.up.offset);
+        enc.dispatch_thread_groups(
+            MTLSize::new((plan.shared_inter as u64).div_ceil(sgs * 4), 1, 1),
+            MTLSize::new(sgs * 32, 1, 1),
+        );
+        enc.end_encoding();
+    }
+    if plan.routed_q2 {
+        // Stage 2 (q2 profile): the seven q4tp downs and the serial weighted
+        // mix are one ragged direct-view dispatch.  Keep the shared slot last
+        // so the host's selected-route order and its ungated shared weight
+        // stay exact.
+        debug_assert_eq!(routed, 6);
+        let fixed_down = flint_fixed_down_enabled()
+            && plan.hidden == 2_048
+            && plan.routed_inter == 512
+            && plan.shared_inter == 1_024;
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(if fixed_down {
+            &c.flint_dn_fixed7
+        } else {
+            &c.flint_dn_views7
+        });
+        for (i, view) in views.iter().enumerate() {
+            enc.set_buffer(i as u64, Some(&view.down.buffer), view.down.offset);
+        }
+        enc.set_buffer(7, Some(&abuf), 0);
+        enc.set_buffer(8, Some(&ybuf), 0);
+        enc.set_buffer(9, Some(&wbuf), 0);
+        if fixed_down {
+            // `q4tp_moe_down_flint_fixed7`'s ABI has no shape constants:
+            // the strict checked dimensions above cover exactly 128 groups
+            // of four simdgroups/four output rows.
+            enc.dispatch_thread_groups(MTLSize::new(128, 1, 1), MTLSize::new(128, 1, 1));
+        } else {
+            let routed_gpr = (plan.routed_inter / GROUP_SIZE) as u32;
+            let shared_gpr = (plan.shared_inter / GROUP_SIZE) as u32;
+            let rows_u = plan.hidden as u32;
+            enc.set_bytes(10, 4, &routed_gpr as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(11, 4, &shared_gpr as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(12, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+            let sgs = 4u64;
+            enc.dispatch_thread_groups(
+                MTLSize::new((plan.hidden as u64).div_ceil(sgs * 4), 1, 1),
+                MTLSize::new(sgs * 32, 1, 1),
+            );
+        }
+        enc.end_encoding();
+    } else {
+        // q4tp Flint remains on the verified per-expert route for now.  Its
+        // wider shared expert makes the uniform selected-view kernels unsafe;
+        // do not trade semantic correctness for a matching dispatch count.
+        {
+            let enc = cmd.new_compute_command_encoder();
+            let rows_u = plan.hidden as u32;
+            let addy = 0u32;
+            let sgs = 4u64;
+            let dbuf = dbuf.as_ref().expect("q4 Flint path owns down scratch");
+            for (i, (job, view)) in jobs.iter().zip(&views).enumerate() {
+                let inter = if i < routed {
+                    plan.routed_inter
+                } else {
+                    plan.shared_inter
+                };
+                let act_off = if i < routed {
+                    i * plan.routed_inter * 4
+                } else {
+                    routed * plan.routed_inter * 4
+                };
+                let gpr_u = (inter / GROUP_SIZE) as u32;
+                enc.set_compute_pipeline_state(&c.q4tp_m);
+                enc.set_buffer(0, Some(&view.down.buffer), view.down.offset);
+                enc.set_buffer(1, Some(&abuf), act_off as u64);
+                enc.set_buffer(2, Some(dbuf), (i * plan.hidden * 4) as u64);
+                enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(5, 4, &addy as *const u32 as *const std::ffi::c_void);
+                enc.dispatch_thread_groups(
+                    MTLSize::new((plan.hidden as u64).div_ceil(sgs * 4), 1, 1),
+                    MTLSize::new(sgs * 32, 1, 1),
+                );
+                // Keep the tuple's shape/row contract live in this stage too;
+                // range admission above has already checked it, so this is a
+                // zero-cost debug assertion rather than a second policy path.
+                debug_assert_eq!(job.down.2, inter);
+            }
+            enc.end_encoding();
+        }
+        // The established reduction walks expert slots in host route order,
+        // then adds Flint's detached shared output as the final slot.
+        {
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&c.moered);
+            let dbuf = dbuf.as_ref().expect("q4 Flint path owns down scratch");
+            enc.set_buffer(0, Some(dbuf), 0);
+            enc.set_buffer(1, Some(&wbuf), 0);
+            enc.set_buffer(2, Some(&ybuf), 0);
+            let n_u = plan.hidden as u32;
+            let ne_u = views.len() as u32;
+            enc.set_bytes(3, 4, &n_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(4, 4, &ne_u as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_threads(
+                MTLSize::new(plan.hidden as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
+            enc.end_encoding();
+        }
+    }
+    let prof_wait = profile.then(std::time::Instant::now);
+    METAL_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    cmd.commit();
+    if let Err(err) = wait_fast_checked(&cmd) {
+        tracing::warn!("metal Flint selected-view MoE block failed: {err}");
+        return SparseMoeResult::Declined;
+    }
+    if let (Some(start), Some(wait_start)) = (prof_start, prof_wait) {
+        flint_sparse_profile_sample(
+            wait_start.duration_since(start),
+            wait_start.elapsed(),
+            cmd_gpu_ms(&cmd),
+        );
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(ybuf.contents() as *const f32, out.as_mut_ptr(), plan.hidden);
+    }
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SAID: AtomicBool = AtomicBool::new(false);
+    SPARSE_MOE_BLOCKS.fetch_add(1, Ordering::Relaxed);
+    SPARSE_MOE_SPAN_BYTES.fetch_add(bound_bytes as u64, Ordering::Relaxed);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            model_bytes,
+            working_set,
+            view_bytes = bound_bytes,
+            view_buffers,
+            view_cache_cap_mb = view_cache_cap / (1024 * 1024),
+            routed_q2 = plan.routed_q2,
+            "native Metal Flint selected MoE pager active"
+        );
+    }
+    SparseMoeResult::Ran
 }
 
 /// Run a uniform q4tp host-routed MoE block through 27 small, page-aligned
@@ -14912,8 +16621,7 @@ fn try_moe_block_jobs_q4tp_sparse(
                 .and_then(|n| n.checked_add(down.span_bytes()))
                 .unwrap_or(usize::MAX),
         };
-        let Some(next) = bound_bytes.checked_add(triple_bytes)
-        else {
+        let Some(next) = bound_bytes.checked_add(triple_bytes) else {
             return SparseMoeResult::Declined;
         };
         bound_bytes = next;
@@ -15002,11 +16710,7 @@ fn try_moe_block_jobs_q4tp_sparse(
     };
     let ybuf = get_io(18_000_000_099 + hidden, hidden * 4);
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            jobs[0].xs_gate.as_ptr(),
-            xbuf.contents() as *mut f32,
-            gcols,
-        );
+        std::ptr::copy_nonoverlapping(jobs[0].xs_gate.as_ptr(), xbuf.contents() as *mut f32, gcols);
         let pw = wbuf.contents() as *mut f32;
         for (i, job) in jobs.iter().enumerate() {
             *pw.add(i) = job.w;
@@ -15332,6 +17036,14 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
     // short-lived views. `Declined` is an exact CPU fallback: retrying the
     // legacy arena would bind the whole mapping and can turn a refusal into
     // an OOM after some GPU work has already been enqueued.
+    match try_moe_block_flint_sparse(c, model, jobs, out) {
+        SparseMoeResult::Ran => return true,
+        SparseMoeResult::Declined => {
+            moe_block_refused("selected Flint views");
+            return false;
+        }
+        SparseMoeResult::NotApplicable => {}
+    }
     match try_moe_block_jobs_q4tp_sparse(c, model, jobs, out) {
         SparseMoeResult::Ran => return true,
         SparseMoeResult::Declined => {
@@ -15497,9 +17209,18 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
                   rs: Option<&Buffer>,
                   q4t: bool,
                   q4tp: bool,
+                  q2tp: bool,
                   xs: &Buffer,
                   y: &Buffer| {
         match rs {
+            // Flint's q2tp profile keeps only routed gate/up at two bits;
+            // down remains q4tp.  The ragged 512/1024 shared expert cannot
+            // use the uniform jobs kernel, so the per-expert fallback must
+            // select this decoder explicitly rather than treating Q2 bytes
+            // as q4tp payloads (which can poison the next router with NaNs).
+            None if q2tp => {
+                encode_q2tp_matvec(c, enc, &fbuf, abs, xs, y, rows, cols / GROUP_SIZE, 1.5)
+            }
             None if q4tp => encode_q4tp_matvec(c, enc, &fbuf, abs, xs, y, rows, cols / GROUP_SIZE),
             None if q4t => encode_q4t_matvec(c, enc, &fbuf, abs, xs, y, rows, cols / GROUP_SIZE),
             None => encode_q1_matvec(c, enc, &fbuf, abs, xs, y, rows, cols / GROUP_SIZE),
@@ -15548,8 +17269,14 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
         // harmless while xs is the bare x, wrong for q8_2f experts, whose
         // xs is x·col with each expert's own column field (Mellum2.1 q8_2f
         // experts decoded on the per-op path: wiki ppl 7.39 against 7.21).
-        let xsg = get_io(6_000_000_087 + ji * 1_000_003 + j.xs_gate.len(), j.xs_gate.len() * 4);
-        let xsu = get_io(7_000_000_103 + ji * 1_000_003 + j.xs_up.len(), j.xs_up.len() * 4);
+        let xsg = get_io(
+            6_000_000_087 + ji * 1_000_003 + j.xs_gate.len(),
+            j.xs_gate.len() * 4,
+        );
+        let xsu = get_io(
+            7_000_000_103 + ji * 1_000_003 + j.xs_up.len(),
+            j.xs_up.len() * 4,
+        );
         unsafe {
             std::ptr::copy_nonoverlapping(
                 j.xs_gate.as_ptr(),
@@ -15573,6 +17300,7 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
                 rs3[0].as_ref(),
                 j.q4t,
                 j.q4tp,
+                j.gu_q2,
                 &xsg,
                 &g_buf,
             );
@@ -15584,6 +17312,7 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
                 rs3[1].as_ref(),
                 j.q4t,
                 j.q4tp,
+                j.gu_q2,
                 &xsu,
                 &u_buf,
             );
@@ -15613,6 +17342,7 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
                 rs3[2].as_ref(),
                 j.q4t,
                 j.q4tp,
+                false,
                 &a_buf,
                 &d_buf,
             );
@@ -15821,6 +17551,10 @@ pub enum MetalFfn<'a> {
         act: u8,
     },
     Moe(GpuMoe<'a>),
+    /// Flint's mixed-width MoE: six selected Q2TP routed experts plus an
+    /// ungated, wider Q4TP shared expert. It deliberately does not reuse
+    /// `GpuMoe`: the generic jobs layout assumes one common width/dtype.
+    FlintMoe(GpuFlintMoe<'a>),
 }
 
 /// Softmax-router MoE with a gated shared expert — the scope the wgpu
@@ -15847,14 +17581,43 @@ pub struct GpuMoe<'a> {
     /// job applying its own weight's input field.
     pub q8: bool,
     /// Sigmoid scores instead of a softmax (LFM2-MoE / DeepSeek-V3 /
-    /// HunYuan hy_v3); the top-k renorm then floors the sum at 1e-6.
+    /// HunYuan hy_v3); the top-k renorm uses `sigmoid_denom_eps`.
     pub sigmoid: bool,
+    /// Architecture-specific floor for a sigmoid top-k denominator. Most
+    /// existing files use 1e-6; Flint's reference contract uses 1e-20.
+    pub sigmoid_denom_eps: f32,
     /// Per-expert SELECTION bias [n_exp]: added to the score for the
     /// top-k choice only — the mixing weights stay unbiased (noaux_tc).
     pub bias: Option<&'a [f32]>,
     /// The shared expert carries a sigmoid gate (`sgate`). `false`: it
     /// enters with weight 1 and `sgate` is a stand-in the kernel ignores.
     pub shared_gated: bool,
+}
+
+/// Strict native-Metal Flint descriptor. The routed expert bank is
+/// Q2TP/512-wide, while the detached shared SwiGLU is Q4TP/1024-wide and
+/// enters ungated after the routed mix. Keeping the layouts separate makes
+/// it impossible for the uniform `GpuMoe` jobs ladder to address the shared
+/// payload with routed strides.
+pub struct GpuFlintMoe<'a> {
+    /// Router weights `[256, hidden]`, kept f32 on the host mapping.
+    pub router: &'a [f32],
+    /// Selection-only bias `[256]`, if supplied by the source checkpoint.
+    pub bias: Option<&'a [f32]>,
+    /// Routed `(gate, up, down)` directory indices. The preflight requires
+    /// exactly 256 Q2TP/Q2TP/Q4TP tuples with a 512-wide middle.
+    pub experts: Vec<(usize, usize, usize)>,
+    /// Stable logical layer id supplied by the graph planner. It keys this
+    /// layer's mutable base tables; a tensor index alone is not sufficient
+    /// because tied gate weights can still have different up/down tables.
+    pub scratch_key: usize,
+    /// Detached Q4TP `(gate, up, down)` tuple with a 1024-wide middle.
+    pub shared: (usize, usize, usize),
+    pub top_k: usize,
+    pub norm_topk: bool,
+    pub route_scale: f32,
+    pub sigmoid: bool,
+    pub sigmoid_denom_eps: f32,
 }
 
 /// Shared dims of the block (identical across GDN layers of a model).
@@ -16429,12 +18192,7 @@ impl TokenGraph {
         let h_b = io_buf(c, 20_000_000_003 + dims.hidden, dims.hidden * 4);
         let n_b = io_buf(c, 21_000_000_011 + dims.hidden, dims.hidden * 4);
         let d_b = io_buf(c, 32_000_000_207 + dims.hidden, dims.hidden * 4);
-        let max_width = model
-            .header
-            .arch
-            .intermediate_size
-            .max(dims.hidden)
-            .max(1);
+        let max_width = model.header.arch.intermediate_size.max(dims.hidden).max(1);
         let prism_b = io_buf(c, 33_000_000_223 + max_width, max_width * 4);
         unsafe {
             std::ptr::copy_nonoverlapping(h.as_ptr(), h_b.contents() as *mut f32, dims.hidden);
@@ -16472,8 +18230,7 @@ impl TokenGraph {
     /// hybrid/MoE/o1 encoders stay serial. `CMF_METAL_CONC=0` refuses.
     pub fn set_dense_concurrent(&mut self, on: bool) {
         static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let allowed =
-            *ENV.get_or_init(|| std::env::var("CMF_METAL_CONC").as_deref() != Ok("0"));
+        let allowed = *ENV.get_or_init(|| std::env::var("CMF_METAL_CONC").as_deref() != Ok("0"));
         self.conc = on && allowed;
     }
 
@@ -16608,10 +18365,8 @@ impl TokenGraph {
         }
         let entry = &self.model.tensors[idx];
         let abs = self.model.entry_abs_offset(entry)?;
-        let need = cortiq_core::quant::expected_nbytes(
-            cortiq_core::TensorDtype::Q2TiledP,
-            &[rows, cols],
-        )?;
+        let need =
+            cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q2TiledP, &[rows, cols])?;
         if !self.arena_contains(abs, need) || (entry.nbytes as usize) < need {
             return None;
         }
@@ -16845,8 +18600,9 @@ impl TokenGraph {
                         return entry.dtype == cortiq_core::TensorDtype::Q8_2f
                             && entry.shape.as_slice() == [rows, cols]
                             && abs % 4 == 0
-                            && moe_q8::tensor_bytes(rows, cols)
-                                .is_some_and(|n| self.arena_contains(abs, n) && entry.nbytes as usize >= n);
+                            && moe_q8::tensor_bytes(rows, cols).is_some_and(|n| {
+                                self.arena_contains(abs, n) && entry.nbytes as usize >= n
+                            });
                     }
                     let dt = if q2 {
                         cortiq_core::TensorDtype::Q2TiledP
@@ -16858,14 +18614,62 @@ impl TokenGraph {
                         None => false,
                     }
                 };
-                m.experts
-                    .iter()
-                    .chain(m.shared.as_ref())
-                    .all(|&(g, u, d)| {
-                        ok_at(g, m.inter, self.dims.hidden, m.gu_q2)
-                            && ok_at(u, m.inter, self.dims.hidden, m.gu_q2)
-                            && ok_at(d, self.dims.hidden, m.inter, false)
-                    })
+                m.experts.iter().chain(m.shared.as_ref()).all(|&(g, u, d)| {
+                    ok_at(g, m.inter, self.dims.hidden, m.gu_q2)
+                        && ok_at(u, m.inter, self.dims.hidden, m.gu_q2)
+                        && ok_at(d, self.dims.hidden, m.inter, false)
+                })
+            }
+            MetalFfn::FlintMoe(m) => {
+                // This deliberately repeats the narrow builder contract:
+                // a malformed/repacked directory must decline before any
+                // raw dynamic base reaches the jobs shaders.
+                const HIDDEN: usize = 2_048;
+                const ROUTED_INTER: usize = 512;
+                const SHARED_INTER: usize = 1_024;
+                const EXPERTS: usize = 256;
+                const TOP_K: usize = 6;
+                if !self.fbuf.jobs_ok()
+                    || self.dims.hidden != HIDDEN
+                    || m.top_k != TOP_K
+                    || m.experts.len() != EXPERTS
+                    || m.router.len() != EXPERTS * HIDDEN
+                    || m.bias.is_some_and(|b| b.len() != EXPERTS)
+                    || !m.sigmoid
+                    || !m.norm_topk
+                    || m.route_scale.to_bits() != 1.0f32.to_bits()
+                    || m.sigmoid_denom_eps.to_bits() != (1e-20f32).to_bits()
+                {
+                    return false;
+                }
+                let ok_at =
+                    |idx: usize, rows: usize, cols: usize, dtype: cortiq_core::TensorDtype| {
+                        let Some(entry) = self.model.tensors.get(idx) else {
+                            return false;
+                        };
+                        let Some(abs) = self.model.entry_abs_offset(entry) else {
+                            return false;
+                        };
+                        let Some(bytes) = cortiq_core::quant::expected_nbytes(dtype, &[rows, cols])
+                        else {
+                            return false;
+                        };
+                        entry.shard == 0
+                            && entry.dtype == dtype
+                            && entry.shape.as_slice() == [rows, cols]
+                            && entry.nbytes as usize == bytes
+                            && self.arena_contains(abs, bytes)
+                    };
+                m.experts.iter().all(|&(g, u, d)| {
+                    ok_at(g, ROUTED_INTER, HIDDEN, cortiq_core::TensorDtype::Q2TiledP)
+                        && ok_at(u, ROUTED_INTER, HIDDEN, cortiq_core::TensorDtype::Q2TiledP)
+                        && ok_at(d, HIDDEN, ROUTED_INTER, cortiq_core::TensorDtype::Q4TiledP)
+                }) && {
+                    let (g, u, d) = m.shared;
+                    ok_at(g, SHARED_INTER, HIDDEN, cortiq_core::TensorDtype::Q4TiledP)
+                        && ok_at(u, SHARED_INTER, HIDDEN, cortiq_core::TensorDtype::Q4TiledP)
+                        && ok_at(d, HIDDEN, SHARED_INTER, cortiq_core::TensorDtype::Q4TiledP)
+                }
             }
         }
     }
@@ -16896,7 +18700,8 @@ impl TokenGraph {
         let tail = l.attn_out_norm.is_some() || l.ffn_out_norm.is_some() || l.layer_scale.is_some();
         let tanh = matches!(l.ffn, MetalFfn::Dense { act: 2, .. });
         if (tail || tanh)
-            && (matches!(l.ffn, MetalFfn::Moe(_)) || gemma4::pipes(self.c).is_none())
+            && (matches!(l.ffn, MetalFfn::Moe(_) | MetalFfn::FlintMoe(_))
+                || gemma4::pipes(self.c).is_none())
         {
             return false;
         }
@@ -17226,7 +19031,11 @@ impl TokenGraph {
             for (i, w) in words.iter().enumerate() {
                 enc.set_bytes(4 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
             }
-            enc.set_bytes(9, 4, &self.dims.eps as *const f32 as *const std::ffi::c_void);
+            enc.set_bytes(
+                9,
+                4,
+                &self.dims.eps as *const f32 as *const std::ffi::c_void,
+            );
             enc.set_bytes(10, 4, &mult as *const f32 as *const std::ffi::c_void);
             enc.dispatch_threads(MTLSize::new(256, 1, 1), MTLSize::new(256, 1, 1));
         }
@@ -17326,6 +19135,7 @@ impl TokenGraph {
             cpu_gen: p.cpu_gen,
             o1: None,
             window: p.window,
+            softmax_sink: p.softmax_sink,
             head_gate: p.head_gate,
             v_norm: p.v_norm,
         };
@@ -17659,6 +19469,9 @@ impl TokenGraph {
             MetalFfn::Moe(m) => {
                 self.encode_post_moe_ffn(enc, l.post_norm, m, delta);
             }
+            MetalFfn::FlintMoe(m) => {
+                self.encode_post_flint_moe_ffn(enc, l.post_norm, m, delta);
+            }
         }
     }
 
@@ -17678,8 +19491,10 @@ impl TokenGraph {
             && wide_ok
             && (!p.v_norm || gemma4::pipes(self.c).is_some())
             && p.rd <= p.hd
-            && p.rd >= 2
-            && (p.rd / 2) % 32 == 0
+            // Flint has explicit no-RoPE layers (`rd == 0`). The rope
+            // kernel's rotation loops then have zero iterations; retain the
+            // original lane-pair contract for every nonzero rotary width.
+            && (p.rd == 0 || (p.rd >= 2 && (p.rd / 2) % 32 == 0))
             && p.nh % p.nkv == 0
             && l.wq.1 == p.nh * p.hd * (1 + p.output_gate as usize)
             && l.wk.1 == p.nkv * p.hd
@@ -17687,8 +19502,13 @@ impl TokenGraph {
             && l.wo.2 == p.nh * p.hd
             && p.cpu_k.len() == p.nkv
             && p.cpu_v.len() == p.nkv
-            && p.inv_freq.len() >= p.rd / 2
+            && (p.rd == 0 || p.inv_freq.len() >= p.rd / 2)
             && p.window.is_none_or(|w| w >= 1 && p.o1.is_none())
+            && p.softmax_sink.is_none_or(|s| s.len() == p.nh)
+            // The wide Gemma-4 attention family and the O(1) state have
+            // distinct kernels with no value-less sink column. Flint's
+            // ordinary <=256-wide GQA kernel below carries it exactly.
+            && (p.softmax_sink.is_none() || (p.hd <= 256 && p.o1.is_none()))
             && p.head_gate
                 .is_none_or(|g| g.len() == p.nh * self.dims.hidden && !p.output_gate)
     }
@@ -17912,6 +19732,13 @@ impl TokenGraph {
         // and V landing in the mirror directly. Not for the output-gate
         // layout (the chunk kernel has no gate split).
         let rope_app = fuse_on() && !p.output_gate && mirror.is_some();
+        // Even a no-RoPE layer must bind something at the kernel's invf
+        // slot.  `rd == 0` guarantees no shader lane reads it.
+        let inv_freq: &[f32] = if p.rd == 0 {
+            &NO_ROPE_INV_FREQ
+        } else {
+            p.inv_freq
+        };
         if decode_skip('p') {
         } else if rope_app {
             let (k_mb, v_mb, _, cap, stored) = mirror.as_ref().unwrap();
@@ -17919,7 +19746,7 @@ impl TokenGraph {
                 | ((p.k_norm.is_some() as u32) << 2)
                 | ((p.gemma as u32) << 3)
                 | ((p.late_qk_norm as u32) << 5);
-            let invf = const_buf(self.c, p.inv_freq);
+            let invf = const_buf(self.c, inv_freq);
             enc.set_compute_pipeline_state(if wide {
                 &g4.unwrap().cropekv16
             } else {
@@ -17950,7 +19777,11 @@ impl TokenGraph {
             enc.set_bytes(20, 4, &p.eps as *const f32 as *const std::ffi::c_void);
             let nb_u = 1u32;
             enc.set_bytes(21, 4, &nb_u as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(22, 4, &p.rope_scale as *const f32 as *const std::ffi::c_void);
+            enc.set_bytes(
+                22,
+                4,
+                &p.rope_scale as *const f32 as *const std::ffi::c_void,
+            );
             let sgs = 8u64;
             enc.dispatch_thread_groups(
                 MTLSize::new(((p.nh + 2 * p.nkv) as u64).div_ceil(sgs), 1, 1),
@@ -17959,7 +19790,11 @@ impl TokenGraph {
         } else {
             disp(
                 enc,
-                if wide { &g4.unwrap().rqkn16 } else { &self.c.rqkn },
+                if wide {
+                    &g4.unwrap().rqkn16
+                } else {
+                    &self.c.rqkn
+                },
                 &[
                     (&q_b, 0),
                     (&k_b, 0),
@@ -17967,7 +19802,7 @@ impl TokenGraph {
                     (&g_b, 0),
                     (&qn_b, 0),
                     (&kn_b, 0),
-                    (&const_buf(self.c, p.inv_freq), 0),
+                    (&const_buf(self.c, inv_freq), 0),
                 ],
                 &[
                     p.nh as u32,
@@ -18089,55 +19924,100 @@ impl TokenGraph {
             };
             // (`encode_gqa_attend_blk`'s hpk <= 8 for the main kernel; the
             // wide twin runs Gemma-4's 16 heads per KV head.)
+            // `gqa_attend_blk` folds only real KV rows.  A learned sink is
+            // a value-less extra softmax column, so it must use the normal
+            // kernel below, whose denominator includes that column exactly.
             let blk = skip_a
-                || thr > 0
-                && n_pos > thr
-                && (wide || p.nh / p.nkv <= 8)
-                && encode_gqa_attend_blk_with(
-                    self.c,
-                    enc,
-                    if wide { &g4.unwrap().gqablk16 } else { &self.c.gqablk },
-                    &qr_b,
-                    &k_mb,
-                    &v_mb,
-                    kv_off,
-                    &ao_b,
-                    p.nh,
-                    p.nkv,
-                    p.hd,
-                    cap,
-                    stored - first,
-                    1,
-                    p.scale,
-                    self.in_conc.get(),
-                );
-            let att_pso = if wide { &g4.unwrap().gqat16 } else { &self.c.gqat };
+                || (p.softmax_sink.is_none()
+                    && thr > 0
+                    && n_pos > thr
+                    && (wide || p.nh / p.nkv <= 8)
+                    && encode_gqa_attend_blk_with(
+                        self.c,
+                        enc,
+                        if wide {
+                            &g4.unwrap().gqablk16
+                        } else {
+                            &self.c.gqablk
+                        },
+                        &qr_b,
+                        &k_mb,
+                        &v_mb,
+                        kv_off,
+                        &ao_b,
+                        p.nh,
+                        p.nkv,
+                        p.hd,
+                        cap,
+                        stored - first,
+                        1,
+                        p.scale,
+                        self.in_conc.get(),
+                    ));
+            let att_pso = if wide {
+                &g4.unwrap().gqat16
+            } else {
+                &self.c.gqat
+            };
             let cap_sgs = (att_pso.max_total_threads_per_threadgroup() as usize / 32)
                 .clamp(1, gqa_split_max());
             let sgs = n_pos.div_ceil(32).clamp(1, cap_sgs);
             let tg_threads = 32 * sgs;
             if !blk {
-                disp_tg(
-                    enc,
-                    att_pso,
-                    &[
-                        (&qr_b, 0),
-                        (&k_mb, kv_off),
-                        (&v_mb, kv_off),
-                        (&ao_b, 0),
-                        (&imp_mb, imp_off),
-                    ],
-                    &[
-                        p.nh as u32,
-                        (p.nh / p.nkv) as u32,
-                        p.hd as u32,
-                        cap as u32,
-                        n_pos as u32,
-                    ],
-                    &[p.scale],
-                    ((p.nh * tg_threads) as u64, tg_threads as u64),
-                    ((sgs * p.hd + 2 * sgs) * 4) as u64,
-                );
+                // Gemma-4's 16-slot wide kernel has its historical ABI and
+                // cannot carry a learned sink (attn_device_ok rejects that
+                // combination).  The ordinary <=256-wide kernel takes a
+                // dummy binding when no sink is active, keeping its ABI
+                // uniform across all normal GQA models.
+                if wide {
+                    disp_tg(
+                        enc,
+                        att_pso,
+                        &[
+                            (&qr_b, 0),
+                            (&k_mb, kv_off),
+                            (&v_mb, kv_off),
+                            (&ao_b, 0),
+                            (&imp_mb, imp_off),
+                        ],
+                        &[
+                            p.nh as u32,
+                            (p.nh / p.nkv) as u32,
+                            p.hd as u32,
+                            cap as u32,
+                            n_pos as u32,
+                        ],
+                        &[p.scale],
+                        ((p.nh * tg_threads) as u64, tg_threads as u64),
+                        ((sgs * p.hd + 2 * sgs) * 4) as u64,
+                    );
+                } else {
+                    let sink = const_buf(self.c, p.softmax_sink.unwrap_or(&NO_ATTN_SINK));
+                    let has_sink = p.softmax_sink.is_some() as u32;
+                    disp_tg(
+                        enc,
+                        &self.c.gqat,
+                        &[
+                            (&qr_b, 0),
+                            (&k_mb, kv_off),
+                            (&v_mb, kv_off),
+                            (&ao_b, 0),
+                            (&imp_mb, imp_off),
+                            (&sink, 0),
+                        ],
+                        &[
+                            p.nh as u32,
+                            (p.nh / p.nkv) as u32,
+                            p.hd as u32,
+                            cap as u32,
+                            n_pos as u32,
+                            has_sink,
+                        ],
+                        &[p.scale],
+                        ((p.nh * tg_threads) as u64, tg_threads as u64),
+                        ((sgs * p.hd + 2 * sgs) * 4) as u64,
+                    );
+                }
             }
         }
         self.bar(enc);
@@ -18390,7 +20270,14 @@ impl TokenGraph {
             );
         } else {
             if act == 2 {
-                gemma4::enc_gelut(g4.expect("gemma4 kernels (attn_ok)"), enc, &fg_b, &fu_b, &fa_b, inter);
+                gemma4::enc_gelut(
+                    g4.expect("gemma4 kernels (attn_ok)"),
+                    enc,
+                    &fg_b,
+                    &fu_b,
+                    &fa_b,
+                    inter,
+                );
             } else {
                 enc.set_compute_pipeline_state(if gelu { &self.c.gelu } else { &self.c.silu });
                 enc.set_buffer(0, Some(&fg_b), 0);
@@ -18577,6 +20464,11 @@ impl TokenGraph {
             static NO_BIAS: [f32; 1] = [0.0];
             let bias_b = const_buf(c, m.bias.unwrap_or(&NO_BIAS));
             enc.set_buffer(14, Some(&bias_b), 0);
+            enc.set_bytes(
+                15,
+                4,
+                &m.sigmoid_denom_eps as *const f32 as *const std::ffi::c_void,
+            );
             let tpg = if sel_sg { 32 } else { 1 };
             enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(tpg, 1, 1));
         }
@@ -18622,9 +20514,22 @@ impl TokenGraph {
         if let Some(p) = q8p {
             if !decode_skip('g') {
                 if moe_bit(MOE_GU) && moe_q8::gu_fused() {
-                    moe_q8::enc_gu(p, enc, &self.fbuf, &bgu_b, &self.n_b, &a_b, inter, hidden, ne);
+                    moe_q8::enc_gu(
+                        p, enc, &self.fbuf, &bgu_b, &self.n_b, &a_b, inter, hidden, ne,
+                    );
                 } else {
-                    moe_q8::enc_jobs(p, enc, &self.fbuf, &bgu_b, &self.n_b, &gu_b, inter, hidden, ne * 2, 0);
+                    moe_q8::enc_jobs(
+                        p,
+                        enc,
+                        &self.fbuf,
+                        &bgu_b,
+                        &self.n_b,
+                        &gu_b,
+                        inter,
+                        hidden,
+                        ne * 2,
+                        0,
+                    );
                     self.bar(enc);
                     enc.set_compute_pipeline_state(&c.moesilu);
                     enc.set_buffer(0, Some(&gu_b), 0);
@@ -18644,10 +20549,14 @@ impl TokenGraph {
                 return;
             }
             if moe_q8::down_fused() {
-                moe_q8::enc_down_mix(p, enc, &self.fbuf, &bdn_b, &a_b, &self.h_b, &w_b, hidden, inter, ne);
+                moe_q8::enc_down_mix(
+                    p, enc, &self.fbuf, &bdn_b, &a_b, &self.h_b, &w_b, hidden, inter, ne,
+                );
                 return;
             }
-            moe_q8::enc_jobs(p, enc, &self.fbuf, &bdn_b, &a_b, &eo_b, hidden, inter, ne, inter);
+            moe_q8::enc_jobs(
+                p, enc, &self.fbuf, &bdn_b, &a_b, &eo_b, hidden, inter, ne, inter,
+            );
             self.bar(enc);
             enc.set_compute_pipeline_state(&c.moered);
             enc.set_buffer(0, Some(&eo_b), 0);
@@ -18738,6 +20647,263 @@ impl TokenGraph {
             enc.set_bytes(4, 4, &ne_u as *const u32 as *const std::ffi::c_void);
             enc.dispatch_threads(MTLSize::new(hidden as u64, 1, 1), MTLSize::new(256, 1, 1));
         }
+        self.bar(enc);
+        disp_axpy(c, enc, &self.d_b, &self.h_b, 1.0, hidden);
+    }
+
+    /// Flint's page-graph MoE suffix. The router, exact top-6 selection and
+    /// routed Q2TP jobs remain in one command buffer; the 1024-wide ungated
+    /// Q4TP shared expert is intentionally evaluated as a detached branch.
+    ///
+    /// The residual order mirrors `moe_ffn_cpu`: routed slots accumulate in
+    /// route order, then the shared output is added to that *delta*, then the
+    /// completed delta is added to hidden once. In particular, do not add the
+    /// routed output directly to hidden before evaluating the shared branch.
+    fn encode_post_flint_moe_ffn(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        post_norm: &[f32],
+        m: &GpuFlintMoe,
+        delta: Option<&Buffer>,
+    ) {
+        const HIDDEN: usize = 2_048;
+        const ROUTED_INTER: usize = 512;
+        const SHARED_INTER: usize = 1_024;
+        const EXPERTS: usize = 256;
+        const TOP_K: usize = 6;
+
+        WCAT.store(2, std::sync::atomic::Ordering::Relaxed);
+        debug_assert_eq!(self.dims.hidden, HIDDEN);
+        debug_assert_eq!(m.top_k, TOP_K);
+        debug_assert_eq!(m.experts.len(), EXPERTS);
+        let c = self.c;
+        let hidden = self.dims.hidden;
+        // Every logical graph layer owns stable offset-table buffers. Do not
+        // key these by one routed tensor index: tied gates can still have
+        // different up/down tables, and all tables are filled before this
+        // command buffer starts reading them.
+        let salt = m.scratch_key;
+        let gt_b = io_buf(c, 61_000_000_231 + salt, EXPERTS * 8);
+        let ut_b = io_buf(c, 62_000_000_233 + salt, EXPERTS * 8);
+        let dt_b = io_buf(c, 63_000_000_239 + salt, EXPERTS * 8);
+        // The no-shared selector flag makes these two bindings unread, but
+        // Metal still requires every declared resource slot to be bound.
+        let st_b = io_buf(c, 64_000_000_241 + salt, 3 * 8);
+        let sl_b = io_buf(c, 64_100_000_243 + salt, 4);
+        let base_of = |idx: usize| -> u64 {
+            let abs = self
+                .model
+                .entry_abs_offset(&self.model.tensors[idx])
+                .expect("Flint preflight resolved mapped tensor");
+            self.fbuf.jobs_base(abs) as u64
+        };
+        unsafe {
+            let (pg, pu, pd) = (
+                gt_b.contents() as *mut u64,
+                ut_b.contents() as *mut u64,
+                dt_b.contents() as *mut u64,
+            );
+            for (i, &(g, u, d)) in m.experts.iter().enumerate() {
+                *pg.add(i) = base_of(g);
+                *pu.add(i) = base_of(u);
+                *pd.add(i) = base_of(d);
+            }
+        }
+
+        // Device-written scratch. Routed delta uses `d_b` after addnorm has
+        // consumed the attention delta; a distinct shared delta preserves the
+        // source's route-then-shared accumulation before the one h residual.
+        let logits_b = io_buf(c, 64_200_000_247 + EXPERTS, EXPERTS * 4);
+        let weights_b = io_buf(c, 64_300_000_253 + TOP_K, TOP_K * 4);
+        let bgu_b = io_buf(c, 64_400_000_257 + TOP_K, TOP_K * 2 * 8);
+        let bdn_b = io_buf(c, 64_500_000_259 + TOP_K, TOP_K * 8);
+        let routed_a_b = io_buf(
+            c,
+            64_600_000_261 + TOP_K * ROUTED_INTER,
+            TOP_K * ROUTED_INTER * 4,
+        );
+        let shared_a_b = io_buf(c, 64_700_000_263 + SHARED_INTER, SHARED_INTER * 4);
+        let shared_d_b = io_buf(c, 64_800_000_269 + hidden, hidden * 4);
+
+        // 1. h += attention delta; n = RMSNorm(h). Exactly the ordinary MoE
+        // prefix; the old d_b contents are dead after this dispatch.
+        if !decode_skip('n') {
+            let pn_buf = const_buf(c, post_norm);
+            enc.set_compute_pipeline_state(&c.addnorm);
+            enc.set_buffer(0, Some(&self.h_b), 0);
+            enc.set_buffer(1, Some(delta.unwrap_or(&self.h_b)), 0);
+            enc.set_buffer(2, Some(&pn_buf), 0);
+            enc.set_buffer(3, Some(&self.n_b), 0);
+            let n_u = hidden as u32;
+            let g_u = self.dims.gemma as u32;
+            let hd_u = delta.is_some() as u32;
+            enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(5, 4, &g_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(
+                6,
+                4,
+                &self.dims.eps as *const f32 as *const std::ffi::c_void,
+            );
+            enc.set_bytes(7, 4, &hd_u as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
+        }
+        self.bar(enc);
+
+        // 2. Router logits, f32 exactly as the CPU's f32 router rows.
+        if !decode_skip('r') {
+            enc.set_compute_pipeline_state(&c.f16mv);
+            let router_b = const_buf(c, m.router);
+            enc.set_buffer(0, Some(&router_b), 0);
+            enc.set_buffer(1, Some(&self.n_b), 0);
+            enc.set_buffer(2, Some(&logits_b), 0);
+            let cols_u = hidden as u32;
+            let rows_u = EXPERTS as u32;
+            enc.set_bytes(3, 4, &cols_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+            let sgs = 8u64;
+            enc.dispatch_thread_groups(
+                MTLSize::new((EXPERTS as u64).div_ceil(sgs), 1, 1),
+                MTLSize::new(sgs * 32, 1, 1),
+            );
+        }
+        self.bar(enc);
+
+        // 3. GPU selector emits route-ordered six weights plus dynamic base
+        // tables. Flag 32 is essential: shared is detached and its width
+        // must never enter the uniform selected-job arrays.
+        if !decode_skip('s') {
+            let sel_sg = moe_bit(MOE_SEL);
+            enc.set_compute_pipeline_state(if sel_sg { &c.moesel_sg } else { &c.moesel });
+            enc.set_buffer(0, Some(&logits_b), 0);
+            enc.set_buffer(1, Some(&sl_b), 0);
+            enc.set_buffer(2, Some(&gt_b), 0);
+            enc.set_buffer(3, Some(&ut_b), 0);
+            enc.set_buffer(4, Some(&dt_b), 0);
+            enc.set_buffer(5, Some(&st_b), 0);
+            enc.set_buffer(6, Some(&weights_b), 0);
+            enc.set_buffer(7, Some(&bgu_b), 0);
+            enc.set_buffer(8, Some(&bdn_b), 0);
+            let ne_u = EXPERTS as u32;
+            let tk_u = TOP_K as u32;
+            let norm_u = m.norm_topk as u32;
+            enc.set_bytes(9, 4, &ne_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(10, 4, &tk_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(11, 4, &norm_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(
+                12,
+                4,
+                &m.route_scale as *const f32 as *const std::ffi::c_void,
+            );
+            let flags =
+                (u32::from(m.sigmoid) << 1) | (u32::from(m.bias.is_some()) << 2) | (1u32 << 5); // no shared job slot
+            enc.set_bytes(13, 4, &flags as *const u32 as *const std::ffi::c_void);
+            static NO_BIAS: [f32; 1] = [0.0];
+            let bias_b = const_buf(c, m.bias.unwrap_or(&NO_BIAS));
+            enc.set_buffer(14, Some(&bias_b), 0);
+            enc.set_bytes(
+                15,
+                4,
+                &m.sigmoid_denom_eps as *const f32 as *const std::ffi::c_void,
+            );
+            let threads = if sel_sg { 32 } else { 1 };
+            enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(threads, 1, 1));
+        }
+        self.bar(enc);
+
+        // 4. Six dynamically selected Q2TP gate/up SwiGLUs.
+        if !decode_skip('g') {
+            let sgs = 8u64;
+            let tg_per = (ROUTED_INTER as u64).div_ceil(sgs * 4);
+            enc.set_compute_pipeline_state(&c.flint_gu_q2_m);
+            enc.set_buffer(0, Some(self.fbuf.window(0)), 0);
+            self.fbuf.bind_jobs_windows(enc);
+            enc.set_buffer(1, Some(&self.n_b), 0);
+            enc.set_buffer(2, Some(&routed_a_b), 0);
+            let gpr_u = (hidden / GROUP_SIZE) as u32;
+            let rows_u = ROUTED_INTER as u32;
+            let tgp_u = tg_per as u32;
+            let jobs_u = TOP_K as u32;
+            enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+            enc.set_buffer(5, Some(&bgu_b), 0);
+            enc.set_bytes(6, 4, &tgp_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(7, 4, &jobs_u as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(
+                MTLSize::new(tg_per * TOP_K as u64, 1, 1),
+                MTLSize::new(sgs * 32, 1, 1),
+            );
+        }
+        self.bar(enc);
+        if decode_skip('d') {
+            return;
+        }
+
+        // 5. Routed Q4TP down projections and ordered weighted mix into d_b.
+        {
+            let sgs = 4u64;
+            enc.set_compute_pipeline_state(&c.flint_dn_q4_out_m);
+            enc.set_buffer(0, Some(self.fbuf.window(0)), 0);
+            self.fbuf.bind_jobs_windows(enc);
+            enc.set_buffer(1, Some(&routed_a_b), 0);
+            enc.set_buffer(2, Some(&self.d_b), 0);
+            let gpr_u = (ROUTED_INTER / GROUP_SIZE) as u32;
+            let rows_u = hidden as u32;
+            let jobs_u = TOP_K as u32;
+            enc.set_bytes(3, 4, &gpr_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(4, 4, &rows_u as *const u32 as *const std::ffi::c_void);
+            enc.set_buffer(5, Some(&bdn_b), 0);
+            enc.set_buffer(6, Some(&weights_b), 0);
+            enc.set_bytes(7, 4, &jobs_u as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(
+                MTLSize::new((hidden as u64).div_ceil(sgs * 4), 1, 1),
+                MTLSize::new(sgs * 32, 1, 1),
+            );
+        }
+        self.bar(enc);
+
+        // 6. Detached ungated shared SwiGLU and its Q4TP down into a
+        // separate delta. `ffn_ok` validated the Q4TP shape/layout.
+        let (shared_g, shared_u, shared_d) = m.shared;
+        let shared_g_abs = self
+            .model
+            .entry_abs_offset(&self.model.tensors[shared_g])
+            .expect("Flint preflight resolved shared gate");
+        let shared_u_abs = self
+            .model
+            .entry_abs_offset(&self.model.tensors[shared_u])
+            .expect("Flint preflight resolved shared up");
+        encode_q4tp_matvec_m_gu(
+            c,
+            enc,
+            &self.fbuf,
+            shared_g_abs,
+            shared_u_abs,
+            &self.n_b,
+            &shared_a_b,
+            SHARED_INTER,
+            hidden / GROUP_SIZE,
+            false,
+        );
+        self.bar(enc);
+        let (shared_d_abs, shared_d_kind) = self
+            .proj_abs((shared_d, hidden, SHARED_INTER))
+            .expect("Flint preflight resolved shared down");
+        encode_proj(
+            c,
+            enc,
+            &self.fbuf,
+            shared_d_abs,
+            &shared_d_kind,
+            &shared_a_b,
+            &shared_d_b,
+            hidden,
+            SHARED_INTER / GROUP_SIZE,
+        );
+        self.bar(enc);
+
+        // 7. Exact source order: output starts with routed mix, absorbs the
+        // ungated shared output, then one residual add reaches h.
+        disp_axpy(c, enc, &shared_d_b, &self.d_b, 1.0, hidden);
         self.bar(enc);
         disp_axpy(c, enc, &self.d_b, &self.h_b, 1.0, hidden);
     }
@@ -19001,6 +21167,9 @@ impl TokenGraph {
                     MetalFfn::Moe(m) => {
                         self.encode_post_moe_ffn(enc, l.post_norm, m, Some(&d_b));
                     }
+                    MetalFfn::FlintMoe(m) => {
+                        self.encode_post_flint_moe_ffn(enc, l.post_norm, m, Some(&d_b));
+                    }
                 }
             }
         }
@@ -19055,6 +21224,10 @@ pub struct AttnDeviceParams<'a> {
     /// Sliding window: attend the last `w` positions (this one
     /// included), the host's `stored - w` lower bound. None = full context.
     pub window: Option<usize>,
+    /// Learned value-less softmax column, one finite logit per Q head.
+    /// It joins the row max and denominator but never contributes a V row
+    /// (Flint / gpt-oss / MiMo-V2 attention sinks).
+    pub softmax_sink: Option<&'a [f32]>,
     /// Per-head projected output gate `[nh × hidden]` (f32 rows of
     /// `self_attn.g_proj`): head h scales by sigmoid(G[h]·norm(h_in))
     /// after the attend, before O (Spark-X2.5).
@@ -19063,6 +21236,14 @@ pub struct AttnDeviceParams<'a> {
     /// cached (`gemma4::enc_vnorm`, the host's `vnorm_head`).
     pub v_norm: bool,
 }
+
+// `rd=0` does not read the RoPE table, but Metal still requires a valid
+// binding.  Keeping a one-float sentinel lets no-RoPE Flint layers avoid an
+// empty constant buffer / an unnecessary source-table requirement.
+static NO_ROPE_INV_FREQ: [f32; 1] = [0.0];
+// Likewise, the ordinary gqa kernel always has a sink slot in its ABI while
+// the flag keeps it out of the softmax for architectures without sinks.
+static NO_ATTN_SINK: [f32; 1] = [0.0];
 
 /// After the token's final sync: copy the row the graph appended for
 /// (kv_id, layer) out of the mirror (UMA memcpy). `k_out`/`v_out` are
@@ -19434,10 +21615,8 @@ fn q2tp_affine_admitted(c: &Ctx, model: &Arc<CmfModel>, t: (usize, usize, usize)
         if cols == 0 || cols % GROUP_SIZE != 0 || rows == 0 {
             return Some(false);
         }
-        let need = cortiq_core::quant::expected_nbytes(
-            cortiq_core::TensorDtype::Q2TiledP,
-            &[rows, cols],
-        )?;
+        let need =
+            cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q2TiledP, &[rows, cols])?;
         let bytes = model.entry_bytes(entry);
         if (entry.nbytes as usize) < need || need > bytes.len() {
             return Some(false);
@@ -19469,13 +21648,28 @@ mod q2tp_affine_admission_tests {
                 for j in 0..32 {
                     set_symbol(&mut bytes, rows, groups, r, g, j, (j % 3) as u8);
                 }
-                set_rung(&mut bytes, rows, groups, r, g, if (r + g) % 2 == 0 { 3 } else { 31 });
+                set_rung(
+                    &mut bytes,
+                    rows,
+                    groups,
+                    r,
+                    g,
+                    if (r + g) % 2 == 0 { 3 } else { 31 },
+                );
             }
         }
         bytes
     }
 
-    fn set_symbol(bytes: &mut [u8], _rows: usize, groups: usize, r: usize, g: usize, j: usize, code: u8) {
+    fn set_symbol(
+        bytes: &mut [u8],
+        _rows: usize,
+        groups: usize,
+        r: usize,
+        g: usize,
+        j: usize,
+        code: u8,
+    ) {
         let off = (r * groups + g) * 8;
         let mut word = u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
         let shift = 2 * j;
@@ -19574,12 +21768,7 @@ impl VerifyGraph {
             }
         }
         let imp_scratch = Self::vbuf(c, 6, 0, 1 << 20);
-        let max_width = model
-            .header
-            .arch
-            .intermediate_size
-            .max(dims.hidden)
-            .max(1);
+        let max_width = model.header.arch.intermediate_size.max(dims.hidden).max(1);
         let prism_rows = Self::vbuf(c, 29, 0, bc * max_width * 4);
         Some(VerifyGraph {
             tg,
@@ -19675,7 +21864,7 @@ impl VerifyGraph {
                         .iter()
                         .all(|t| self.batch_abs(**t).is_some())
             }
-            MetalFfn::Moe(_) => false,
+            MetalFfn::Moe(_) | MetalFfn::FlintMoe(_) => false,
         }
     }
 
@@ -19697,6 +21886,11 @@ impl VerifyGraph {
             && p.o1.is_none()
             // The batched twins attend full context, ungated.
             && p.window.is_none()
+            // `chunk_attend` has no value-less softmax column.  A b=1
+            // direct gqa call could represent it, but admitting it here
+            // would make b>=2 verification silently compute a different
+            // normalization.
+            && p.softmax_sink.is_none()
             && p.head_gate.is_none()
             // ...and know nothing of Gemma-4.
             && !p.v_norm
@@ -19819,14 +22013,7 @@ impl VerifyGraph {
                 // [batch][cols] and never aliases the one-row TokenGraph
                 // scratch or the original a/b projections.
                 let input = if let Some(spec) = prism {
-                    encode_prism_fwht_rows(
-                        self.tg.c,
-                        enc,
-                        spec,
-                        xs,
-                        &self.prism_rows,
-                        self.b,
-                    );
+                    encode_prism_fwht_rows(self.tg.c, enc, spec, xs, &self.prism_rows, self.b);
                     &self.prism_rows
                 } else {
                     xs
@@ -20192,7 +22379,14 @@ impl VerifyGraph {
             .k_norm
             .map(|w| const_buf(c, w))
             .unwrap_or_else(|| qr_b.clone());
-        let invf_b = const_buf(c, p.inv_freq);
+        // Keep the batched verifier's binding valid for a no-RoPE layer.
+        // `attn_rope_qkn_b` executes zero rotation iterations at rd=0.
+        let inv_freq: &[f32] = if p.rd == 0 {
+            &NO_ROPE_INV_FREQ
+        } else {
+            p.inv_freq
+        };
+        let invf_b = const_buf(c, inv_freq);
         {
             // one 2-D dispatch: x = the (nh+nkv) head simdgroups, y = rows
             enc.set_compute_pipeline_state(&c.rqknb);
@@ -20216,7 +22410,11 @@ impl VerifyGraph {
             enc.set_bytes(13, 4, &p.eps as *const f32 as *const std::ffi::c_void);
             let nb_u = b as u32;
             enc.set_bytes(14, 4, &nb_u as *const u32 as *const std::ffi::c_void);
-            enc.set_bytes(15, 4, &p.rope_scale as *const f32 as *const std::ffi::c_void);
+            enc.set_bytes(
+                15,
+                4,
+                &p.rope_scale as *const f32 as *const std::ffi::c_void,
+            );
             enc.dispatch_threads(
                 MTLSize::new(((p.nh + p.nkv) * 32) as u64, b as u64, 1),
                 MTLSize::new(256, 1, 1),
@@ -20248,8 +22446,8 @@ impl VerifyGraph {
             && stored + b > thr
             && !verify_skip('a')
             && encode_gqa_attend_blk(
-                c, enc, &qr_b, &k_mb, &v_mb, 0, &ao_b, p.nh, p.nkv, p.hd, cap, stored, b,
-                p.scale, false,
+                c, enc, &qr_b, &k_mb, &v_mb, 0, &ao_b, p.nh, p.nkv, p.hd, cap, stored, b, p.scale,
+                false,
             );
         if b >= 2 && !blk {
             // the chunk attend: one simdgroup per (row, head), row e over
@@ -20280,6 +22478,10 @@ impl VerifyGraph {
                 );
             }
         }
+        // `attn_ok` keeps softmax_sink absent here: the batched `cattend`
+        // ABI cannot represent a value-less sink column.  The ordinary
+        // one-token graph uses the sink-aware `gqa_attend` dispatch below.
+        let no_sink = const_buf(c, &NO_ATTN_SINK);
         // attend row e over positions 0..=stored+e
         for e in 0..b {
             if b >= 2 || verify_skip('a') {
@@ -20299,6 +22501,7 @@ impl VerifyGraph {
                     (&v_mb, 0),
                     (&ao_b, (e * nhd * 4) as u64),
                     (&self.imp_scratch, 0),
+                    (&no_sink, 0),
                 ],
                 &[
                     p.nh as u32,
@@ -20306,6 +22509,7 @@ impl VerifyGraph {
                     p.hd as u32,
                     cap as u32,
                     n_pos as u32,
+                    0,
                 ],
                 &[p.scale],
                 ((p.nh * tg_threads) as u64, tg_threads as u64),
@@ -20837,7 +23041,9 @@ mod tests {
     fn lcg_fill(seed: &mut u64, n: usize, lo: f32, hi: f32) -> Vec<f32> {
         (0..n)
             .map(|_| {
-                *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                *seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let u = ((*seed >> 40) as f32) / ((1u64 << 24) as f32);
                 lo + (hi - lo) * u
             })
@@ -20892,12 +23098,27 @@ mod tests {
             for h in 0..nk {
                 let row = &cq[e * c_dim..(e + 1) * c_dim];
                 let nq: f32 = row[h * dk..(h + 1) * dk].iter().map(|v| v * v).sum();
-                let nkn: f32 = row[kd + h * dk..kd + (h + 1) * dk].iter().map(|v| v * v).sum();
+                let nkn: f32 = row[kd + h * dk..kd + (h + 1) * dk]
+                    .iter()
+                    .map(|v| v * v)
+                    .sum();
                 iq[e * nk + h] = 1.0 / ((nq + 1e-6).sqrt() * (dk as f32).sqrt());
                 ik[e * nk + h] = 1.0 / (nkn + 1e-6).sqrt();
             }
         }
-        GdnStateCase { cfg, nb, ring, s0, cq, z, g, beta, iq, ik, gnorm }
+        GdnStateCase {
+            cfg,
+            nb,
+            ring,
+            s0,
+            cq,
+            z,
+            g,
+            beta,
+            iq,
+            ik,
+            gnorm,
+        }
     }
 
     /// f64 reference of the recurrence over the first `n_pos` positions:
@@ -20962,6 +23183,96 @@ mod tests {
         unsafe { std::slice::from_raw_parts(b.contents() as *const f32, n).to_vec() }
     }
 
+    /// The ordinary decode kernel's learned sink is one *value-less*
+    /// softmax column per Q head.  This direct kernel check is deliberately
+    /// tiny (no model / TokenGraph): it catches both the MSL ABI shift and
+    /// the easy-but-wrong implementation that gives a sink a fake V row or
+    /// leaves it out of the attention-importance normalizer.
+    #[test]
+    fn gqa_attend_learned_sink_is_value_less_and_normalizes_importance() {
+        unsafe { std::env::set_var("CMF_GPU", "1") };
+        let Some(c) = ctx() else {
+            eprintln!("gpu test skipped: no Metal device");
+            return;
+        };
+        let (nh, hpk, hd, cap, n) = (2usize, 2usize, 4usize, 4usize, 3usize);
+        let q = vec![
+            1.0, -0.5, 0.25, 0.0, // head 0
+            -0.4, 0.8, 0.5, -0.25, // head 1
+        ];
+        let k = vec![
+            0.2, 0.3, -0.1, 0.4, // row 0
+            -0.6, 0.1, 0.7, -0.2, // row 1
+            0.8, -0.4, 0.2, 0.3, // row 2
+            0.0, 0.0, 0.0, 0.0, // unused capacity
+        ];
+        let v = vec![
+            1.0, -2.0, 0.25, 1.5, // row 0
+            -1.0, 0.5, 2.0, -0.75, // row 1
+            0.7, 1.1, -1.3, 0.0, // row 2
+            0.0, 0.0, 0.0, 0.0, // unused capacity
+        ];
+        let sink = [0.6f32, -0.2];
+        let qb = shared_f32(c, &q);
+        let kb = shared_f32(c, &k);
+        let vb = shared_f32(c, &v);
+        let outb = shared_f32(c, &vec![f32::NAN; nh * hd]);
+        let impb = shared_f32(c, &vec![0.0; n]);
+        let sb = shared_f32(c, &sink);
+        let cmd = c.queue.new_command_buffer().to_owned();
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&c.gqat);
+        for (i, b) in [&qb, &kb, &vb, &outb, &impb, &sb].iter().enumerate() {
+            enc.set_buffer(i as u64, Some(*b), 0);
+        }
+        let words = [nh as u32, hpk as u32, hd as u32, cap as u32, n as u32, 1u32];
+        for (i, w) in words.iter().enumerate() {
+            enc.set_bytes(6 + i as u64, 4, w as *const u32 as *const std::ffi::c_void);
+        }
+        let scale = 1.0f32;
+        enc.set_bytes(12, 4, &scale as *const f32 as *const std::ffi::c_void);
+        enc.set_threadgroup_memory_length(0, ((hd + 2) * 4) as u64);
+        enc.dispatch_threads(MTLSize::new((nh * 32) as u64, 1, 1), MTLSize::new(32, 1, 1));
+        enc.end_encoding();
+        cmd.commit();
+        wait_fast_checked(&cmd).expect("sink gqa dispatch");
+
+        let mut ref_out = vec![0.0f32; nh * hd];
+        let mut ref_imp = vec![0.0f32; n];
+        for h in 0..nh {
+            let score = |p: usize| -> f32 { (0..hd).map(|d| q[h * hd + d] * k[p * hd + d]).sum() };
+            let scores: Vec<f32> = (0..n).map(score).collect();
+            let max = scores.iter().copied().fold(sink[h], f32::max);
+            let denom =
+                scores.iter().map(|&s| (s - max).exp()).sum::<f32>() + (sink[h] - max).exp();
+            for p in 0..n {
+                let w = (scores[p] - max).exp() / denom;
+                ref_imp[p] += w;
+                for d in 0..hd {
+                    ref_out[h * hd + d] += w * v[p * hd + d];
+                }
+            }
+        }
+        let got_out = read_f32(&outb, nh * hd);
+        let got_imp = read_f32(&impb, n);
+        for (i, (&got, &want)) in got_out.iter().zip(&ref_out).enumerate() {
+            assert!(
+                (got - want).abs() < 2e-5,
+                "out[{i}]: got {got}, want {want}"
+            );
+        }
+        for (i, (&got, &want)) in got_imp.iter().zip(&ref_imp).enumerate() {
+            assert!(
+                (got - want).abs() < 2e-5,
+                "imp[{i}]: got {got}, want {want}"
+            );
+        }
+        assert!(
+            got_imp.iter().sum::<f32>() < nh as f32,
+            "the value-less sink must retain some mass outside real KV rows"
+        );
+    }
+
     /// One state pass on the device: `which` = 0 the 4-lane kernel, 1 the
     /// legacy batched kernel, 2 the legacy plain-token kernel (nb = 1,
     /// mode 3 by construction). Returns (whole state buffer, outputs).
@@ -20990,7 +23301,10 @@ mod tests {
             assert_eq!((n_pos, mode), (1, 3));
             enc.set_compute_pipeline_state(&c.stateup);
             enc.set_buffer(0, Some(&s_b), s_off);
-            for (i, b) in [&cq, &z, &g, &beta, &iq, &ik, &gnorm, &of].iter().enumerate() {
+            for (i, b) in [&cq, &z, &g, &beta, &iq, &ik, &gnorm, &of]
+                .iter()
+                .enumerate()
+            {
                 enc.set_buffer(1 + i as u64, Some(*b), 0);
             }
             let w4 = [cfg.nv as u32, cfg.nk as u32, cfg.dk as u32, cfg.dv as u32];
@@ -21004,7 +23318,21 @@ mod tests {
             );
         } else {
             encode_gdn_state_b(
-                c, enc, &s_b, s_off, &cq, &z, &g, &beta, &iq, &ik, &gnorm, &of, cfg, n_pos, mode,
+                c,
+                enc,
+                &s_b,
+                s_off,
+                &cq,
+                &z,
+                &g,
+                &beta,
+                &iq,
+                &ik,
+                &gnorm,
+                &of,
+                cfg,
+                n_pos,
+                mode,
                 which == 1,
             );
         }
@@ -21082,7 +23410,10 @@ mod tests {
             cmd.wait_until_completed();
             t0.elapsed().as_secs_f64() * 1e3
         };
-        for (label, n_pos, mode) in [("verify  nb=8 mode 1", nb, 1u32), ("replay  n=5 mode 2", 5, 2)] {
+        for (label, n_pos, mode) in [
+            ("verify  nb=8 mode 1", nb, 1u32),
+            ("replay  n=5 mode 2", 5, 2),
+        ] {
             for legacy in [true, false] {
                 let mut ts: Vec<f64> = (0..7).map(|_| pass(legacy, n_pos, mode)).collect();
                 ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -21090,7 +23421,11 @@ mod tests {
                 let rd = if mode & 2 == 2 { 2.0 } else { 1.0 };
                 eprintln!(
                     "gdn_state4 bench {label} {}: min {min:.2} ms  median {med:.2} ms  ({:.1} GB/s at median, {} traffic)",
-                    if legacy { "legacy 1-lane" } else { "4-lane       " },
+                    if legacy {
+                        "legacy 1-lane"
+                    } else {
+                        "4-lane       "
+                    },
                     bytes * rd / (med * 1e-3) / 1e9,
                     if rd == 2.0 { "read+write" } else { "read" },
                 );
@@ -21122,7 +23457,11 @@ mod tests {
             // The checks below then pin that fallback to the reference
             // instead of failing on the hardware.
             if state4_pso(c, &t.cfg).is_none() {
-                let pso = if dk == 128 { &c.gdnstb4_128 } else { &c.gdnstb4_64 };
+                let pso = if dk == 128 {
+                    &c.gdnstb4_128
+                } else {
+                    &c.gdnstb4_64
+                };
                 eprintln!(
                     "gdn_state4 dk={dk} nb={nb}: 4-lane kernel declined on this device \
                      (ceiling {} threads, needs {}); checking the legacy fallback",
@@ -21133,7 +23472,11 @@ mod tests {
             let (s_ref, of_ref) = gdn_state_reference(&t, nb);
             let (s_new, of_new) = gdn_state_device(c, &t, 0, nb, 3);
             let (s_old, of_old) = gdn_state_device(c, &t, 1, nb, 3);
-            assert_eq!(&s_new[..t.ring], &t.s0[..t.ring], "dk={dk} nb={nb}: ring prefix touched");
+            assert_eq!(
+                &s_new[..t.ring],
+                &t.s0[..t.ring],
+                "dk={dk} nb={nb}: ring prefix touched"
+            );
             let (rs_new, ro_new) = (rel_max(&s_new, &s_ref), rel_max(&of_new, &of_ref));
             let (rs_old, ro_old) = (rel_max(&s_old, &s_ref), rel_max(&of_old, &of_ref));
             let (rs_x, ro_x) = (rel_max(&s_new, &s_old), rel_max(&of_new, &of_old));
@@ -21141,14 +23484,28 @@ mod tests {
                 "gdn_state4 dk={dk} nb={nb}: new vs ref S {rs_new:.2e} of {ro_new:.2e} | \
                  old vs ref S {rs_old:.2e} of {ro_old:.2e} | new vs old S {rs_x:.2e} of {ro_x:.2e}"
             );
-            assert!(rs_new <= TOL && ro_new <= TOL, "dk={dk} nb={nb}: new kernel vs reference");
-            assert!(rs_old <= TOL && ro_old <= TOL, "dk={dk} nb={nb}: legacy kernel vs reference");
-            assert!(rs_x <= TOL && ro_x <= TOL, "dk={dk} nb={nb}: new vs legacy kernel");
+            assert!(
+                rs_new <= TOL && ro_new <= TOL,
+                "dk={dk} nb={nb}: new kernel vs reference"
+            );
+            assert!(
+                rs_old <= TOL && ro_old <= TOL,
+                "dk={dk} nb={nb}: legacy kernel vs reference"
+            );
+            assert!(
+                rs_x <= TOL && ro_x <= TOL,
+                "dk={dk} nb={nb}: new vs legacy kernel"
+            );
             if nb == 1 {
                 let (s_pl, of_pl) = gdn_state_device(c, &t, 2, 1, 3);
                 let (rs, ro) = (rel_max(&s_new, &s_pl), rel_max(&of_new, &of_pl));
-                eprintln!("gdn_state4 dk={dk} plain: new vs gdn_state_update S {rs:.2e} of {ro:.2e}");
-                assert!(rs <= TOL && ro <= TOL, "dk={dk}: new kernel vs plain gdn_state_update");
+                eprintln!(
+                    "gdn_state4 dk={dk} plain: new vs gdn_state_update S {rs:.2e} of {ro:.2e}"
+                );
+                assert!(
+                    rs <= TOL && ro <= TOL,
+                    "dk={dk}: new kernel vs plain gdn_state_update"
+                );
             } else {
                 // verify: outputs only, S untouched
                 let (s_v, of_v) = gdn_state_device(c, &t, 0, nb, 1);
@@ -21159,7 +23516,10 @@ mod tests {
                 let n_acc = 5;
                 let (s_r, _) = gdn_state_device(c, &t, 0, n_acc, 2);
                 let (s_f, _) = gdn_state_device(c, &t, 0, n_acc, 3);
-                assert_eq!(s_r, s_f, "dk={dk}: replay (mode 2) and fold (mode 3) states differ");
+                assert_eq!(
+                    s_r, s_f,
+                    "dk={dk}: replay (mode 2) and fold (mode 3) states differ"
+                );
                 let (s_ref5, _) = gdn_state_reference(&t, n_acc);
                 let r5 = rel_max(&s_r, &s_ref5);
                 eprintln!("gdn_state4 dk={dk} replay of {n_acc}: vs ref S {r5:.2e}");
@@ -21255,9 +23615,9 @@ mod tests {
             rope_freq_factors: None,
             logit_multiplier: None,
             loop_final_norm: false,
-        prism_hadamard: None,
-        kv_heads_per_layer: None,
-        v_head_dim: None,
+            prism_hadamard: None,
+            kv_heads_per_layer: None,
+            v_head_dim: None,
         };
         let header = CmfHeader {
             format: "cmf".into(),
@@ -21396,9 +23756,9 @@ mod tests {
             rope_freq_factors: None,
             logit_multiplier: None,
             loop_final_norm: false,
-        prism_hadamard: None,
-        kv_heads_per_layer: None,
-        v_head_dim: None,
+            prism_hadamard: None,
+            kv_heads_per_layer: None,
+            v_head_dim: None,
         };
         let header = CmfHeader {
             format: "cmf".into(),
@@ -21480,7 +23840,9 @@ mod tests {
     /// float-summation noise. Skipped without a Metal device.
     #[test]
     fn gpu_q1_matvec_matches_reference() {
-        let _lock = Q1_OVERRIDE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = Q1_OVERRIDE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Two shapes: single-chunk (cols ≤ 4096) and the CHUNKED path
         // (cols 6144 → two threadgroup-memory chunks — the out_proj
         // shape that a small parity test would never touch).
@@ -21572,9 +23934,9 @@ mod tests {
             rope_freq_factors: None,
             logit_multiplier: None,
             loop_final_norm: false,
-        prism_hadamard: None,
-        kv_heads_per_layer: None,
-        v_head_dim: None,
+            prism_hadamard: None,
+            kv_heads_per_layer: None,
+            v_head_dim: None,
         };
         let header = CmfHeader {
             format: "cmf".into(),
@@ -21655,7 +24017,9 @@ mod tests {
     /// covered without cargo by `tools/metal_q1g_parity.swift`.
     #[test]
     fn gpu_q1g_matvec_equals_q1() {
-        let _lock = Q1_OVERRIDE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = Q1_OVERRIDE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe { std::env::set_var("CMF_GPU", "1") };
         if !enabled() {
             eprintln!("gpu test skipped: no Metal device");
@@ -21782,6 +24146,7 @@ mod tests {
         let utbl: Vec<u64> = (0..n_exp as u64).map(|i| 2000 + i * 7).collect();
         let dtbl: Vec<u64> = (0..n_exp as u64).map(|i| 3000 + i * 7).collect();
         let stbl: Vec<u64> = vec![91, 92, 93];
+        let denom_eps = 1e-6f32;
 
         // (norm, scale, sigmoid, bias, ungated shared): the softmax rows are
         // the historical contract; the sigmoid rows are LFM2 / hy_v3.
@@ -21809,7 +24174,7 @@ mod tests {
             order.sort_by(|&a, &b| key[b].partial_cmp(&key[a]).unwrap().then(a.cmp(&b)));
             let idx = &order[..top_k];
             let wsum: f32 = idx.iter().map(|&e| p[e]).sum();
-            let wden = if msig && norm { wsum + 1e-6 } else { wsum };
+            let wden = if msig && norm { wsum + denom_eps } else { wsum };
             let div = if norm { wden / scale } else { 1.0 / scale };
             let want_w: Vec<f32> = idx.iter().map(|&e| p[e] / div).collect();
             let want_shared = if ungated {
@@ -21865,12 +24230,13 @@ mod tests {
             enc.set_bytes(10, 4, &tk_u as *const u32 as *const std::ffi::c_void);
             enc.set_bytes(11, 4, &no_u as *const u32 as *const std::ffi::c_void);
             enc.set_bytes(12, 4, &scale as *const f32 as *const std::ffi::c_void);
-            let fl_u: u32 = (u32::from(msig) << 1) | (u32::from(hasb) << 2) | (u32::from(ungated) << 4);
+            let fl_u: u32 =
+                (u32::from(msig) << 1) | (u32::from(hasb) << 2) | (u32::from(ungated) << 4);
             enc.set_bytes(13, 4, &fl_u as *const u32 as *const std::ffi::c_void);
-            let bias_b = buf(unsafe {
-                std::slice::from_raw_parts(bias_v.as_ptr() as *const u8, n_exp * 4)
-            });
+            let bias_b =
+                buf(unsafe { std::slice::from_raw_parts(bias_v.as_ptr() as *const u8, n_exp * 4) });
             enc.set_buffer(14, Some(&bias_b), 0);
+            enc.set_bytes(15, 4, &denom_eps as *const f32 as *const std::ffi::c_void);
             enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
             enc.end_encoding();
             cmd.commit();
@@ -21899,6 +24265,111 @@ mod tests {
         }
     }
 
+    /// Flint's sigmoid router uses a much smaller denominator floor than the
+    /// historical noaux contract.  Bind it explicitly so a newly added MSL
+    /// argument cannot silently fall back to Metal's undefined argument
+    /// contents (which used to look like the old `1e-6` behavior).
+    #[test]
+    fn moe_topk_select_honors_flint_sigmoid_denom_eps() {
+        unsafe { std::env::set_var("CMF_GPU", "1") };
+        let Some(c) = ctx() else {
+            eprintln!("gpu test skipped: no Metal device");
+            return;
+        };
+        const N_EXP: usize = 256;
+        const TOP_K: usize = 6;
+        // At -50 the selected sigmoid mass is about 1e-21.  `1e-20` has a
+        // visible effect while `1e-6` would collapse every routed weight to
+        // ~1e-16, making this an unambiguous ABI/regression check.
+        let logits = vec![-50.0f32; N_EXP];
+        let gtbl: Vec<u64> = (0..N_EXP as u64).map(|i| 1_000 + i * 7).collect();
+        let utbl: Vec<u64> = (0..N_EXP as u64).map(|i| 2_000 + i * 7).collect();
+        let dtbl: Vec<u64> = (0..N_EXP as u64).map(|i| 3_000 + i * 7).collect();
+        let stbl = [0u64; 3];
+        let slog = [0.0f32];
+        let bias = [0.0f32];
+        let denom_eps = 1e-20f32;
+        let buf = |bytes: &[u8]| {
+            c._device.new_buffer_with_data(
+                bytes.as_ptr() as *const std::ffi::c_void,
+                bytes.len() as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let f32b = |v: &[f32]| {
+            buf(unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) })
+        };
+        let u64b = |v: &[u64]| -> Buffer {
+            buf(&v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())
+        };
+        let run = |pso: &ComputePipelineState, threads: u64| -> (Vec<f32>, Vec<u64>, Vec<u64>) {
+            let (lg, sl) = (f32b(&logits), f32b(&slog));
+            let (gt, ut, dt, st) = (u64b(&gtbl), u64b(&utbl), u64b(&dtbl), u64b(&stbl));
+            let bb = f32b(&bias);
+            let mk = |n: usize| {
+                c._device
+                    .new_buffer(n as u64, MTLResourceOptions::StorageModeShared)
+            };
+            let (w, bgu, bdn) = (mk(TOP_K * 4), mk(TOP_K * 2 * 8), mk(TOP_K * 8));
+            let cmd = c.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(pso);
+            for (slot, b) in [
+                (0, &lg),
+                (1, &sl),
+                (2, &gt),
+                (3, &ut),
+                (4, &dt),
+                (5, &st),
+                (6, &w),
+                (7, &bgu),
+                (8, &bdn),
+                (14, &bb),
+            ] {
+                enc.set_buffer(slot, Some(b), 0);
+            }
+            let (ne_u, tk_u, norm_u) = (N_EXP as u32, TOP_K as u32, 1u32);
+            let scale = 1.0f32;
+            // sigmoid | no-shared: only six routed jobs are emitted.
+            let flags = 2u32 | 32u32;
+            enc.set_bytes(9, 4, &ne_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(10, 4, &tk_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(11, 4, &norm_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(12, 4, &scale as *const f32 as *const std::ffi::c_void);
+            enc.set_bytes(13, 4, &flags as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(15, 4, &denom_eps as *const f32 as *const std::ffi::c_void);
+            enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(threads, 1, 1));
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+            unsafe {
+                (
+                    std::slice::from_raw_parts(w.contents() as *const f32, TOP_K).to_vec(),
+                    std::slice::from_raw_parts(bgu.contents() as *const u64, TOP_K * 2).to_vec(),
+                    std::slice::from_raw_parts(bdn.contents() as *const u64, TOP_K).to_vec(),
+                )
+            }
+        };
+        let p = 1.0f32 / (1.0 + 50.0f32.exp());
+        let expected = p / (TOP_K as f32 * p + denom_eps);
+        for (name, got) in [
+            ("serial", run(&c.moesel, 1)),
+            ("simdgroup", run(&c.moesel_sg, 32)),
+        ] {
+            for (slot, &weight) in got.0.iter().enumerate() {
+                let rel = (weight - expected).abs() / expected;
+                assert!(
+                    rel < 3e-4 && weight > 1e-3,
+                    "{name} Flint weight[{slot}] = {weight}, expected {expected}; selector likely did not bind 1e-20"
+                );
+                // All scores tie, so exact stable top-k order is 0..5.
+                assert_eq!(got.1[slot], gtbl[slot], "{name} gate slot {slot}");
+                assert_eq!(got.1[TOP_K + slot], utbl[slot], "{name} up slot {slot}");
+                assert_eq!(got.2[slot], dtbl[slot], "{name} down slot {slot}");
+            }
+        }
+    }
+
     /// Decode-kernel lab on a real Mellum2.1 file (`MELLUM_CMF=path`,
     /// `cargo test --release -p cortiq-engine --lib mellum_decode_lab --
     /// --ignored --nocapture`): each variant walks all 28 layers per
@@ -21915,14 +24386,33 @@ mod tests {
         let c = ctx().expect("metal");
         let model = Arc::new(CmfModel::open(&path).expect("open"));
         let (fbuf, _safe) = file_buffer(c, &model).expect("arena");
-        let find = |n: &str| model.tensors.iter().position(|t| t.name == n).unwrap_or_else(|| panic!("{n}"));
+        let find = |n: &str| {
+            model
+                .tensors
+                .iter()
+                .position(|t| t.name == n)
+                .unwrap_or_else(|| panic!("{n}"))
+        };
         let absof = |i: usize| model.entry_abs_offset(&model.tensors[i]).unwrap() as u64;
         let (nl, nexp, k, hidden, inter) = (28usize, 64usize, 8usize, 2304usize, 896usize);
-        let ex = |l: usize, e: usize, w: &str| absof(find(&format!("model.layers.{l}.mlp.experts.{e}.{w}_proj.weight")));
-        let gate: Vec<Vec<u64>> = (0..nl).map(|l| (0..nexp).map(|e| ex(l, e, "gate")).collect()).collect();
-        let up: Vec<Vec<u64>> = (0..nl).map(|l| (0..nexp).map(|e| ex(l, e, "up")).collect()).collect();
-        let down: Vec<Vec<u64>> = (0..nl).map(|l| (0..nexp).map(|e| ex(l, e, "down")).collect()).collect();
-        let tokens: usize = std::env::var("LAB_TOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+        let ex = |l: usize, e: usize, w: &str| {
+            absof(find(&format!(
+                "model.layers.{l}.mlp.experts.{e}.{w}_proj.weight"
+            )))
+        };
+        let gate: Vec<Vec<u64>> = (0..nl)
+            .map(|l| (0..nexp).map(|e| ex(l, e, "gate")).collect())
+            .collect();
+        let up: Vec<Vec<u64>> = (0..nl)
+            .map(|l| (0..nexp).map(|e| ex(l, e, "up")).collect())
+            .collect();
+        let down: Vec<Vec<u64>> = (0..nl)
+            .map(|l| (0..nexp).map(|e| ex(l, e, "down")).collect())
+            .collect();
+        let tokens: usize = std::env::var("LAB_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16);
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
         let mut rnd = |n: usize| {
             seed ^= seed << 13;
@@ -21942,26 +24432,45 @@ mod tests {
                         pick.push(e);
                     }
                 }
-                for &e in &pick { bgu.push(gate[l][e]); }
-                for &e in &pick { bgu.push(up[l][e]); }
-                for &e in &pick { bdn.push(down[l][e]); }
+                for &e in &pick {
+                    bgu.push(gate[l][e]);
+                }
+                for &e in &pick {
+                    bgu.push(up[l][e]);
+                }
+                for &e in &pick {
+                    bdn.push(down[l][e]);
+                }
             }
         }
         let mkf = |v: &[f32]| {
-            c._device.new_buffer_with_data(v.as_ptr() as *const std::ffi::c_void, (v.len() * 4) as u64, MTLResourceOptions::StorageModeShared)
+            c._device.new_buffer_with_data(
+                v.as_ptr() as *const std::ffi::c_void,
+                (v.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
         };
         let mku = |v: &[u64]| {
-            c._device.new_buffer_with_data(v.as_ptr() as *const std::ffi::c_void, (v.len() * 8) as u64, MTLResourceOptions::StorageModeShared)
+            c._device.new_buffer_with_data(
+                v.as_ptr() as *const std::ffi::c_void,
+                (v.len() * 8) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
         };
         let bgu_b = mku(&bgu);
         let bdn_b = mku(&bdn);
         let x: Vec<f32> = (0..hidden).map(|i| ((i % 17) as f32 - 8.0) / 8.0).collect();
         let x_b = mkf(&x);
-        let a: Vec<f32> = (0..k * inter).map(|i| ((i % 13) as f32 - 6.0) / 6.0).collect();
+        let a: Vec<f32> = (0..k * inter)
+            .map(|i| ((i % 13) as f32 - 6.0) / 6.0)
+            .collect();
         let a_b = mkf(&a);
         let wv: Vec<f32> = vec![0.125; k];
         let w_b = mkf(&wv);
-        let mk = |n: usize| c._device.new_buffer((n * 4) as u64, MTLResourceOptions::StorageModeShared);
+        let mk = |n: usize| {
+            c._device
+                .new_buffer((n * 4) as u64, MTLResourceOptions::StorageModeShared)
+        };
         let gu_b = mk(2 * k * inter);
         let act_b = mk(k * inter);
         let eo_b = mk(k * hidden);
@@ -21970,23 +24479,44 @@ mod tests {
         let q_gu = (2 * k * inter * (hidden / 32 * 16 + 4 + (hidden / 32 * 5 + 7) / 8)) as f64;
         let q_dn = (k * hidden * (inter / 32 * 16 + 4 + (inter / 32 * 5 + 7) / 8)) as f64;
         // attention q8_2f projections and the head
-        struct Q8 { abs: usize, rows: usize, cols: usize, rs: Buffer, col: Buffer }
+        struct Q8 {
+            abs: usize,
+            rows: usize,
+            cols: usize,
+            rs: Buffer,
+            col: Buffer,
+        }
         let q8 = |name: &str| -> Q8 {
             let t = crate::qtensor::QTensor::from_model(&model, name).expect(name);
             let i = find(name);
             let e = &model.tensors[i];
             let (rs, cf) = match &t {
-                crate::qtensor::QTensor::Mapped { row_scale, col_field, .. } => (row_scale.clone(), col_field.clone()),
+                crate::qtensor::QTensor::Mapped {
+                    row_scale,
+                    col_field,
+                    ..
+                } => (row_scale.clone(), col_field.clone()),
                 _ => panic!("not mapped"),
             };
-            Q8 { abs: absof(i) as usize, rows: e.shape[0], cols: e.shape[1], rs: mkf(&rs), col: mkf(&cf) }
+            Q8 {
+                abs: absof(i) as usize,
+                rows: e.shape[0],
+                cols: e.shape[1],
+                rs: mkf(&rs),
+                col: mkf(&cf),
+            }
         };
         let attn: Vec<[Q8; 4]> = (0..nl)
-            .map(|l| ["q", "k", "v", "o"].map(|p| q8(&format!("model.layers.{l}.self_attn.{p}_proj.weight"))))
+            .map(|l| {
+                ["q", "k", "v", "o"]
+                    .map(|p| q8(&format!("model.layers.{l}.self_attn.{p}_proj.weight")))
+            })
             .collect();
         let head = q8("lm_head.weight");
         let sgs = 8u64;
-        let run = |label: &str, bytes: f64, f: &dyn Fn(&metal::ComputeCommandEncoderRef, usize, usize)| {
+        let run = |label: &str,
+                   bytes: f64,
+                   f: &dyn Fn(&metal::ComputeCommandEncoderRef, usize, usize)| {
             // warm (pipelines, residency)
             let mut ms = 0.0f64;
             for t in 0..tokens {
@@ -22003,9 +24533,20 @@ mod tests {
                 }
             }
             let per = ms / (tokens - 1) as f64;
-            eprintln!("lab {label:<14} {per:7.3} ms/tok  {:6.1} GB/s", bytes / (per * 1e-3) / 1e9);
+            eprintln!(
+                "lab {label:<14} {per:7.3} ms/tok  {:6.1} GB/s",
+                bytes / (per * 1e-3) / 1e9
+            );
         };
-        let jobs = |enc: &metal::ComputeCommandEncoderRef, bases: &Buffer, boff: u64, x: &Buffer, y: &Buffer, rows: usize, cols: usize, njob: usize, xstride: usize| {
+        let jobs = |enc: &metal::ComputeCommandEncoderRef,
+                    bases: &Buffer,
+                    boff: u64,
+                    x: &Buffer,
+                    y: &Buffer,
+                    rows: usize,
+                    cols: usize,
+                    njob: usize,
+                    xstride: usize| {
             let tg_per = (rows as u64).div_ceil(sgs * 4);
             enc.set_compute_pipeline_state(&c.q4tpjobs);
             enc.set_buffer(0, Some(fbuf.window(0)), 0);
@@ -22019,12 +24560,31 @@ mod tests {
             let (tgp, xs) = (tg_per as u32, xstride as u32);
             enc.set_bytes(6, 4, &tgp as *const u32 as *const std::ffi::c_void);
             enc.set_bytes(7, 4, &xs as *const u32 as *const std::ffi::c_void);
-            enc.dispatch_thread_groups(MTLSize::new(tg_per * njob as u64, 1, 1), MTLSize::new(sgs * 32, 1, 1));
+            enc.dispatch_thread_groups(
+                MTLSize::new(tg_per * njob as u64, 1, 1),
+                MTLSize::new(sgs * 32, 1, 1),
+            );
         };
         let gu_off = |t: usize, l: usize| ((t * nl + l) * 2 * k * 8) as u64;
         let dn_off = |t: usize, l: usize| ((t * nl + l) * k * 8) as u64;
-        run("gu_jobs", q_gu, &|enc, t, l| jobs(enc, &bgu_b, gu_off(t, l), &x_b, &gu_b, inter, hidden, 2 * k, 0));
-        let gu_m = |enc: &metal::ComputeCommandEncoderRef, t: usize, l: usize, pso: &ComputePipelineState, sg4: u64| {
+        run("gu_jobs", q_gu, &|enc, t, l| {
+            jobs(
+                enc,
+                &bgu_b,
+                gu_off(t, l),
+                &x_b,
+                &gu_b,
+                inter,
+                hidden,
+                2 * k,
+                0,
+            )
+        });
+        let gu_m = |enc: &metal::ComputeCommandEncoderRef,
+                    t: usize,
+                    l: usize,
+                    pso: &ComputePipelineState,
+                    sg4: u64| {
             {
                 let tg_per = (inter as u64).div_ceil(sg4 * 4);
                 enc.set_compute_pipeline_state(pso);
@@ -22038,13 +24598,32 @@ mod tests {
                 enc.set_buffer(5, Some(&bgu_b), gu_off(t, l));
                 enc.set_bytes(6, 4, &w[2] as *const u32 as *const std::ffi::c_void);
                 enc.set_bytes(7, 4, &w[3] as *const u32 as *const std::ffi::c_void);
-                enc.dispatch_thread_groups(MTLSize::new(tg_per * k as u64, 1, 1), MTLSize::new(sg4 * 32, 1, 1));
+                enc.dispatch_thread_groups(
+                    MTLSize::new(tg_per * k as u64, 1, 1),
+                    MTLSize::new(sg4 * 32, 1, 1),
+                );
             }
         };
         run("gu_m sg4", q_gu, &|e, t, l| gu_m(e, t, l, &c.moe_gu_m, 4));
         run("gu_m sg8", q_gu, &|e, t, l| gu_m(e, t, l, &c.moe_gu_m, 8));
-        run("dn_jobs", q_dn, &|enc, t, l| jobs(enc, &bdn_b, dn_off(t, l), &a_b, &eo_b, hidden, inter, k, inter));
-        let dn_m = |enc: &metal::ComputeCommandEncoderRef, t: usize, l: usize, pso: &ComputePipelineState, sg4: u64| {
+        run("dn_jobs", q_dn, &|enc, t, l| {
+            jobs(
+                enc,
+                &bdn_b,
+                dn_off(t, l),
+                &a_b,
+                &eo_b,
+                hidden,
+                inter,
+                k,
+                inter,
+            )
+        });
+        let dn_m = |enc: &metal::ComputeCommandEncoderRef,
+                    t: usize,
+                    l: usize,
+                    pso: &ComputePipelineState,
+                    sg4: u64| {
             {
                 enc.set_compute_pipeline_state(pso);
                 enc.set_buffer(0, Some(fbuf.window(0)), 0);
@@ -22057,27 +24636,31 @@ mod tests {
                 enc.set_buffer(5, Some(&bdn_b), dn_off(t, l));
                 enc.set_buffer(6, Some(&w_b), 0);
                 enc.set_bytes(7, 4, &w[2] as *const u32 as *const std::ffi::c_void);
-                enc.dispatch_thread_groups(MTLSize::new((hidden as u64).div_ceil(sg4 * 4), 1, 1), MTLSize::new(sg4 * 32, 1, 1));
+                enc.dispatch_thread_groups(
+                    MTLSize::new((hidden as u64).div_ceil(sg4 * 4), 1, 1),
+                    MTLSize::new(sg4 * 32, 1, 1),
+                );
             }
         };
         run("dn_m sg4", q_dn, &|e, t, l| dn_m(e, t, l, &c.moe_dn_m, 4));
         run("dn_m sg8", q_dn, &|e, t, l| dn_m(e, t, l, &c.moe_dn_m, 8));
-        let q8b: f64 = attn[0].iter().map(|p| (p.rows * p.cols + p.rows * 4) as f64).sum();
+        let q8b: f64 = attn[0]
+            .iter()
+            .map(|p| (p.rows * p.cols + p.rows * 4) as f64)
+            .sum();
         let q8run = |enc: &metal::ComputeCommandEncoderRef, _t: usize, l: usize, r4: bool| {
-            {
-                for p in &attn[l] {
-                    enc.set_compute_pipeline_state(if r4 { &c.q8f_r4 } else { &c.q8f });
-                    fbuf.bind(enc, 0, p.abs);
-                    enc.set_buffer(1, Some(&x_b), 0);
-                    enc.set_buffer(2, Some(&p.rs), 0);
-                    enc.set_buffer(3, Some(&h_b), 0);
-                    enc.set_buffer(4, Some(&p.col), 0);
-                    let w = [(p.cols / 4) as u32, p.rows as u32];
-                    enc.set_bytes(5, 4, &w[0] as *const u32 as *const std::ffi::c_void);
-                    enc.set_bytes(6, 4, &w[1] as *const u32 as *const std::ffi::c_void);
-                    let n_tg = (p.rows as u64).div_ceil(8 * if r4 { 4 } else { 1 });
-                    enc.dispatch_thread_groups(MTLSize::new(n_tg, 1, 1), MTLSize::new(256, 1, 1));
-                }
+            for p in &attn[l] {
+                enc.set_compute_pipeline_state(if r4 { &c.q8f_r4 } else { &c.q8f });
+                fbuf.bind(enc, 0, p.abs);
+                enc.set_buffer(1, Some(&x_b), 0);
+                enc.set_buffer(2, Some(&p.rs), 0);
+                enc.set_buffer(3, Some(&h_b), 0);
+                enc.set_buffer(4, Some(&p.col), 0);
+                let w = [(p.cols / 4) as u32, p.rows as u32];
+                enc.set_bytes(5, 4, &w[0] as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(6, 4, &w[1] as *const u32 as *const std::ffi::c_void);
+                let n_tg = (p.rows as u64).div_ceil(8 * if r4 { 4 } else { 1 });
+                enc.dispatch_thread_groups(MTLSize::new(n_tg, 1, 1), MTLSize::new(256, 1, 1));
             }
         };
         let xbig: Vec<f32> = (0..4096).map(|i| ((i % 17) as f32 - 8.0) / 8.0).collect();
@@ -22086,20 +24669,20 @@ mod tests {
         run("attn q8f_r4", q8b, &|e, t, l| q8run(e, t, l, true));
         let hb = (head.rows * head.cols) as f64;
         let headrun = |enc: &metal::ComputeCommandEncoderRef, _t: usize, l: usize, r4: bool| {
-            {
-                if l != 0 { return; }
-                enc.set_compute_pipeline_state(if r4 { &c.q8f_r4 } else { &c.q8f });
-                fbuf.bind(enc, 0, head.abs);
-                enc.set_buffer(1, Some(&x_b), 0);
-                enc.set_buffer(2, Some(&head.rs), 0);
-                enc.set_buffer(3, Some(&h_b), 0);
-                enc.set_buffer(4, Some(&head.col), 0);
-                let w = [(head.cols / 4) as u32, head.rows as u32];
-                enc.set_bytes(5, 4, &w[0] as *const u32 as *const std::ffi::c_void);
-                enc.set_bytes(6, 4, &w[1] as *const u32 as *const std::ffi::c_void);
-                let n_tg = (head.rows as u64).div_ceil(8 * if r4 { 4 } else { 1 });
-                enc.dispatch_thread_groups(MTLSize::new(n_tg, 1, 1), MTLSize::new(256, 1, 1));
+            if l != 0 {
+                return;
             }
+            enc.set_compute_pipeline_state(if r4 { &c.q8f_r4 } else { &c.q8f });
+            fbuf.bind(enc, 0, head.abs);
+            enc.set_buffer(1, Some(&x_b), 0);
+            enc.set_buffer(2, Some(&head.rs), 0);
+            enc.set_buffer(3, Some(&h_b), 0);
+            enc.set_buffer(4, Some(&head.col), 0);
+            let w = [(head.cols / 4) as u32, head.rows as u32];
+            enc.set_bytes(5, 4, &w[0] as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(6, 4, &w[1] as *const u32 as *const std::ffi::c_void);
+            let n_tg = (head.rows as u64).div_ceil(8 * if r4 { 4 } else { 1 });
+            enc.dispatch_thread_groups(MTLSize::new(n_tg, 1, 1), MTLSize::new(256, 1, 1));
         };
         run("head q8f", hb, &|e, t, l| headrun(e, t, l, false));
         run("head q8f_r4", hb, &|e, t, l| headrun(e, t, l, true));
@@ -22123,8 +24706,12 @@ mod tests {
                 MTLResourceOptions::StorageModeShared,
             )
         };
-        let f32b = |v: &[f32]| buf(unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) });
-        let u64b = |v: &[u64]| -> Buffer { buf(&v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()) };
+        let f32b = |v: &[f32]| {
+            buf(unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) })
+        };
+        let u64b = |v: &[u64]| -> Buffer {
+            buf(&v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())
+        };
         let mut seed = 0x2545_f491_4f6c_dd1du64;
         let mut rnd = || {
             seed ^= seed << 13;
@@ -22142,10 +24729,10 @@ mod tests {
                 }
                 let bias: Vec<f32> = (0..n_exp).map(|_| (rnd() - 0.5) * 0.4).collect();
                 let flags: u32 = match case % 4 {
-                    0 => 32,            // no shared expert (Mellum2.1)
-                    1 => 0,             // softmax + gated shared
-                    2 => 2 | 4 | 16,    // sigmoid + bias + ungated shared
-                    _ => 2 | 32,        // sigmoid, no shared
+                    0 => 32,         // no shared expert (Mellum2.1)
+                    1 => 0,          // softmax + gated shared
+                    2 => 2 | 4 | 16, // sigmoid + bias + ungated shared
+                    _ => 2 | 32,     // sigmoid, no shared
                 };
                 let norm = (case % 5 != 4) as u32;
                 let scale = if case % 2 == 0 { 1.0f32 } else { 2.5 };
@@ -22155,16 +24742,32 @@ mod tests {
                 let ut: Vec<u64> = (0..n_exp as u64).map(|i| 2000 + i * 7).collect();
                 let dt: Vec<u64> = (0..n_exp as u64).map(|i| 3000 + i * 7).collect();
                 let st: Vec<u64> = vec![91, 92, 93];
-                let run = |pso: &ComputePipelineState, tpg: u64| -> (Vec<u32>, Vec<u64>, Vec<u64>) {
+                let run = |pso: &ComputePipelineState,
+                           tpg: u64|
+                 -> (Vec<u32>, Vec<u64>, Vec<u64>) {
                     let (lg, sl) = (f32b(&logits), f32b(&[0.37f32]));
                     let (g, u, d, s) = (u64b(&gt), u64b(&ut), u64b(&dt), u64b(&st));
-                    let mk = |n: usize| c._device.new_buffer(n as u64, MTLResourceOptions::StorageModeShared);
+                    let mk = |n: usize| {
+                        c._device
+                            .new_buffer(n as u64, MTLResourceOptions::StorageModeShared)
+                    };
                     let (w, bgu, bdn) = (mk(ne * 4), mk(ne * 16), mk(ne * 8));
                     let bb = f32b(&bias);
                     let cmd = c.queue.new_command_buffer();
                     let enc = cmd.new_compute_command_encoder();
                     enc.set_compute_pipeline_state(pso);
-                    for (slot, b) in [(0, &lg), (1, &sl), (2, &g), (3, &u), (4, &d), (5, &s), (6, &w), (7, &bgu), (8, &bdn), (14, &bb)] {
+                    for (slot, b) in [
+                        (0, &lg),
+                        (1, &sl),
+                        (2, &g),
+                        (3, &u),
+                        (4, &d),
+                        (5, &s),
+                        (6, &w),
+                        (7, &bgu),
+                        (8, &bdn),
+                        (14, &bb),
+                    ] {
                         enc.set_buffer(slot, Some(b), 0);
                     }
                     let words = [n_exp as u32, top_k as u32, norm];
@@ -22173,6 +24776,8 @@ mod tests {
                     }
                     enc.set_bytes(12, 4, &scale as *const f32 as *const std::ffi::c_void);
                     enc.set_bytes(13, 4, &flags as *const u32 as *const std::ffi::c_void);
+                    let denom_eps = 1e-6f32;
+                    enc.set_bytes(15, 4, &denom_eps as *const f32 as *const std::ffi::c_void);
                     enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(tpg, 1, 1));
                     enc.end_encoding();
                     cmd.commit();
@@ -22180,14 +24785,18 @@ mod tests {
                     unsafe {
                         (
                             std::slice::from_raw_parts(w.contents() as *const u32, ne).to_vec(),
-                            std::slice::from_raw_parts(bgu.contents() as *const u64, 2 * ne).to_vec(),
+                            std::slice::from_raw_parts(bgu.contents() as *const u64, 2 * ne)
+                                .to_vec(),
                             std::slice::from_raw_parts(bdn.contents() as *const u64, ne).to_vec(),
                         )
                     }
                 };
                 let a = run(&c.moesel, 1);
                 let b = run(&c.moesel_sg, 32);
-                assert_eq!(a, b, "n_exp {n_exp} top_k {top_k} case {case} flags {flags}");
+                assert_eq!(
+                    a, b,
+                    "n_exp {n_exp} top_k {top_k} case {case} flags {flags}"
+                );
             }
         }
     }
@@ -22200,7 +24809,9 @@ mod tests {
     /// the zero row).
     #[test]
     fn chain_argmax_and_embed_match_cpu() {
-        use cortiq_core::quant::{Q4TP_NIB, dequant_q4tp, f32_to_f16, q4tp_put_code, q4tp_sections};
+        use cortiq_core::quant::{
+            Q4TP_NIB, dequant_q4tp, f32_to_f16, q4tp_put_code, q4tp_sections,
+        };
         unsafe { std::env::set_var("CMF_GPU", "1") };
         let Some(c) = ctx() else {
             eprintln!("gpu test skipped: no Metal device");
@@ -22213,7 +24824,9 @@ mod tests {
                 MTLResourceOptions::StorageModeShared,
             )
         };
-        let f32s = |v: &[f32]| buf(unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) });
+        let f32s = |v: &[f32]| {
+            buf(unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) })
+        };
         let ids_b = c
             ._device
             .new_buffer(16, MTLResourceOptions::StorageModeShared);
@@ -22312,7 +24925,10 @@ mod tests {
             let got = unsafe { std::slice::from_raw_parts(o_b.contents() as *const f32, cols) };
             let id = ids[slot] as usize;
             let row: Vec<f32> = if id < rows {
-                full[id * cols..(id + 1) * cols].iter().map(|v| v * mult).collect()
+                full[id * cols..(id + 1) * cols]
+                    .iter()
+                    .map(|v| v * mult)
+                    .collect()
             } else {
                 vec![0f32; cols]
             };
@@ -22557,7 +25173,10 @@ mod replay_queue_tests {
         assert!(c.replay_event.signaled_value() >= value);
         let out = unsafe { std::slice::from_raw_parts(buf.contents() as *const u8, n as usize) };
         assert!(out.iter().all(|&b| b == 0x5C));
-        assert!(wait_replay(), "a second wait with nothing pending is a no-op");
+        assert!(
+            wait_replay(),
+            "a second wait with nothing pending is a no-op"
+        );
     }
 
     #[test]
@@ -22644,7 +25263,11 @@ mod argmax_rows_tests {
         for r in 0..b {
             let row = &rows[r * stride..r * stride + n];
             let want = crate::sampler::argmax(row);
-            assert_eq!(got[r], want, "row {r}: device argmax {} vs host {want}", got[r]);
+            assert_eq!(
+                got[r], want,
+                "row {r}: device argmax {} vs host {want}",
+                got[r]
+            );
             let want_v = row[want as usize];
             let got_v = f32::from_bits(got[b + r]);
             assert!(
@@ -22652,7 +25275,10 @@ mod argmax_rows_tests {
                 "row {r}: device max {got_v} vs host {want_v}"
             );
         }
-        assert_eq!(got[0], 200_000, "the planted tie must resolve to the higher index");
+        assert_eq!(
+            got[0], 200_000,
+            "the planted tie must resolve to the higher index"
+        );
         assert_eq!(got[1], 0);
         assert_eq!(got[2], (n - 1) as u32);
     }

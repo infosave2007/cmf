@@ -10892,8 +10892,9 @@ fn moe_down_q4tp_f(@builtin(workgroup_id) wid: vec3<u32>,
 
 // ── Multi-step greedy tail: argmax over the logits on the device, then
 // re-embed the winner — k decode steps ride ONE submit and the CPU sees
-// k token ids instead of k megabytes of logits. Ties pick an arbitrary
-// maximal index (same class as the documented GPU float-order ties).
+// k token ids instead of k megabytes of logits.  Match the CPU sampler's
+// documented highest-index tie rule: otherwise a true tie changes greedy
+// text merely because the caller chose the faster transport.
 struct AmP { n: u32, parts: u32, st: u32, _p: u32 };
 @group(0) @binding(0) var<storage, read>       am_x   : array<f32>;
 @group(0) @binding(1) var<storage, read_write> am_pv  : array<f32>;
@@ -10912,7 +10913,7 @@ fn argmax_part(@builtin(workgroup_id) wid: vec3<u32>,
     loop {
         if (i >= am_p.n) { break; }
         let v = am_x[i];
-        if (v > best) { best = v; bi = i; }
+        if (v > best || (v == best && i > bi)) { best = v; bi = i; }
         i = i + stride;
     }
     am_wv[lid] = best;
@@ -10921,7 +10922,8 @@ fn argmax_part(@builtin(workgroup_id) wid: vec3<u32>,
     var s = 128u;
     loop {
         if (s == 0u) { break; }
-        if (lid < s && am_wv[lid + s] > am_wv[lid]) {
+        if (lid < s && (am_wv[lid + s] > am_wv[lid]
+            || (am_wv[lid + s] == am_wv[lid] && am_wi[lid + s] > am_wi[lid]))) {
             am_wv[lid] = am_wv[lid + s];
             am_wi[lid] = am_wi[lid + s];
         }
@@ -10948,7 +10950,9 @@ fn argmax_final(@builtin(local_invocation_index) lid: u32) {
     var i = lid;
     loop {
         if (i >= af_p.parts) { break; }
-        if (af_pv[i] > best) { best = af_pv[i]; bi = af_pi[i]; }
+        if (af_pv[i] > best || (af_pv[i] == best && af_pi[i] > bi)) {
+            best = af_pv[i]; bi = af_pi[i];
+        }
         i = i + 256u;
     }
     af_wv[lid] = best;
@@ -10957,7 +10961,8 @@ fn argmax_final(@builtin(local_invocation_index) lid: u32) {
     var s = 128u;
     loop {
         if (s == 0u) { break; }
-        if (lid < s && af_wv[lid + s] > af_wv[lid]) {
+        if (lid < s && (af_wv[lid + s] > af_wv[lid]
+            || (af_wv[lid + s] == af_wv[lid] && af_wi[lid + s] > af_wi[lid]))) {
             af_wv[lid] = af_wv[lid + s];
             af_wi[lid] = af_wi[lid + s];
         }
@@ -11661,8 +11666,9 @@ fn moe_select(@builtin(local_invocation_index) lid: u32) {
     let denom = ms_red[0];
     workgroupBarrier();
     // norm word: bit0 renorm, bit1 sigmoid scores, bit2 selection bias,
-    // bit3 shared expert present. Softmax models pass 0/1, so every bit
-    // pattern the old contract could send decodes to the old behaviour.
+    // bit3 shared expert present, bit5 means the source sigmoid contract
+    // uses +1e-20 rather than the historical +1e-6 floor. Softmax models
+    // pass 0/1, so every old bit pattern retains its old behaviour.
     let mflags = ms_p.norm;
     let msig = (mflags & 2u) != 0u;
     var msc = 0.0;
@@ -11715,9 +11721,10 @@ fn moe_select(@builtin(local_invocation_index) lid: u32) {
     }
     if (lid == 0u) {
         if ((mflags & 1u) != 0u) {
-            // LFM2 floors the denominator (HF's + 1e-6); softmax probs
-            // already sum near 1 and keep the bare sum, as before.
-            let dn = select(wsum, wsum + 1e-6, msig);
+            // LFM2 floors the denominator at +1e-6; Flint's reference
+            // routing uses +1e-20. Softmax probs keep the bare sum.
+            let eps = select(1e-6, 1e-20, (mflags & 32u) != 0u);
+            let dn = select(wsum, wsum + eps, msig);
             for (var slot = 0u; slot < k; slot = slot + 1u) { ms_w[slot] = ms_w[slot] / dn; }
         }
         // routed_scaling_factor (DeepSeek-V3 lineage, HunYuan hy_v3 2.826):
@@ -20067,6 +20074,10 @@ struct GraphScratch {
     gout: Option<(wgpu::Buffer, u64)>,
     attn: Option<(wgpu::Buffer, u64)>,
     ob: Option<(wgpu::Buffer, u64)>,
+    /// Detached MoE shared-expert output before it is added to `ob`.
+    /// Flint's shared SwiGLU is wider than its routed bank, so it cannot
+    /// reuse the bank's per-slot activation/output layout.
+    moe_shared_out: Option<(wgpu::Buffer, u64)>,
     /// The sandwich-normed token-mixer / FFN output (Gemma), before its add.
     ob2: Option<(wgpu::Buffer, u64)>,
     gbuf: Option<(wgpu::Buffer, u64)>,
@@ -20337,13 +20348,13 @@ pub fn resident_bytes() -> u64 {
 /// Physical live-set ceiling used while an over-size graph is assembled.
 /// On the measured Vulkan path Q8_2F needs about 1.6× its packed payload in
 /// driver allocations (19 Granite-30B layers: 15,384 MiB; 30 layers:
-/// 23,832 MiB). A q4tp-majority MoE stack has the same lifetime hazard: its
+/// 23,832 MiB). A packed-MoE-majority stack has the same lifetime hazard: its
 /// three packed expert planes coexist with upload staging during graph setup.
 /// MiniCPM-V-4.7-35B-A3B q4tp is the reproducer: its 17.5 GiB logical stack
 /// OOMed on a 24 GiB Vulkan card, while the 9/16 ceiling admitted a stable
 /// 27-layer device prefix. Dense q4tp models keep the full budget.
-fn graph_live_budget_from_totals(vram_budget: u64, total: u64, q8: u64, q4tp_moe: u64) -> u64 {
-    if q8 > total / 2 || q4tp_moe > total / 2 {
+fn graph_live_budget_from_totals(vram_budget: u64, total: u64, q8: u64, packed_moe: u64) -> u64 {
+    if q8 > total / 2 || packed_moe > total / 2 {
         // 5/8 matched the packed-to-physical slope but left less than one
         // GiB for the fixed context/pipeline allocations on an A40. 9/16
         // keeps ~3 GiB of measured headroom while retaining the largest safe
@@ -20354,8 +20365,48 @@ fn graph_live_budget_from_totals(vram_budget: u64, total: u64, q8: u64, q4tp_moe
     }
 }
 
+/// Parse the deliberately narrow graph-live *lowering* override.
+///
+/// A graph's logical payload can understate its driver allocation materially:
+/// upload staging and driver-internal copies coexist while it is assembled.
+/// Consequently this knob is intentionally allowed to lower the measured
+/// policy ceiling on a constrained/quirky adapter, never to raise it into an
+/// unverified OOM region.  Zero, malformed, and overflowing values produce no
+/// override, preserving the proven default policy.
+fn graph_live_override_bytes(vram_budget: u64, mb: Option<&str>) -> Option<u64> {
+    const MIB: u64 = 1024 * 1024;
+    let bytes = mb?.parse::<u64>().ok()?.checked_mul(MIB)?.min(vram_budget);
+    (bytes != 0).then_some(bytes)
+}
+
+/// Apply `CMF_GRAPH_LIVE_MB` only as an extra safety ceiling.  Keep this
+/// separate from policy calculation so its fail-closed behavior can be unit
+/// tested without a live GPU context.
+fn graph_live_budget_with_override(
+    vram_budget: u64,
+    total: u64,
+    q8: u64,
+    packed_moe: u64,
+    override_mb: Option<&str>,
+) -> u64 {
+    let proven = graph_live_budget_from_totals(vram_budget, total, q8, packed_moe);
+    graph_live_override_bytes(vram_budget, override_mb)
+        .map(|ceiling| ceiling.min(proven))
+        .unwrap_or(proven)
+}
+
+/// Expert planes that the token graph gathers into a whole-layer packed bank.
+/// Q2TP gate/up and Q4TP down share the same three-plane upload lifetime, so
+/// their bytes need the same admission headroom as a fully Q4TP MoE stack.
+fn is_packed_moe_payload(dtype: cortiq_core::TensorDtype, name: &str) -> bool {
+    matches!(
+        dtype,
+        cortiq_core::TensorDtype::Q4TiledP | cortiq_core::TensorDtype::Q2TiledP
+    ) && (name.contains(".mlp.experts.") || name.contains(".mlp.shared_expert."))
+}
+
 fn graph_live_weight_budget(c: &Ctx, model: &Arc<CmfModel>) -> u64 {
-    let (mut total, mut q8, mut q4tp_moe) = (0u64, 0u64, 0u64);
+    let (mut total, mut q8, mut packed_moe) = (0u64, 0u64, 0u64);
     for e in &model.tensors {
         if !crate::gpu::counts_as_placement_weight(model, &e.name) {
             continue; // a skill lane holds its tensors INSTEAD of the trunk ones
@@ -20364,13 +20415,12 @@ fn graph_live_weight_budget(c: &Ctx, model: &Arc<CmfModel>) -> u64 {
         if e.dtype == cortiq_core::TensorDtype::Q8_2f {
             q8 = q8.saturating_add(e.nbytes);
         }
-        if e.dtype == cortiq_core::TensorDtype::Q4TiledP
-            && (e.name.contains(".mlp.experts.") || e.name.contains(".mlp.shared_expert."))
-        {
-            q4tp_moe = q4tp_moe.saturating_add(e.nbytes);
+        if is_packed_moe_payload(e.dtype, &e.name) {
+            packed_moe = packed_moe.saturating_add(e.nbytes);
         }
     }
-    graph_live_budget_from_totals(c.vram_budget, total, q8, q4tp_moe)
+    let override_mb = std::env::var("CMF_GRAPH_LIVE_MB").ok();
+    graph_live_budget_with_override(c.vram_budget, total, q8, packed_moe, override_mb.as_deref())
 }
 
 /// Automatic prefix for ordinary per-op layer walks (most importantly the
@@ -26263,11 +26313,17 @@ fn graph_layer_payload_bytes(
             shared_gate,
             experts,
             has_shared,
+            detached_shared,
             ..
         } => {
             add(router)?;
             if *has_shared {
                 add(shared_gate)?;
+            }
+            if let Some(shared) = detached_shared {
+                add(&shared.gate)?;
+                add(&shared.up)?;
+                add(&shared.down)?;
             }
             for &(g, u, d) in experts {
                 for idx in [g, u, d] {
@@ -26440,6 +26496,15 @@ pub fn forward_token_graph(
             cdim: usize,
         },
     }
+    /// A shared expert that cannot be packed alongside the routed MoE bank.
+    /// Its output is added to the routed accumulation before the FFN residual
+    /// tail.
+    struct LDetachedShared {
+        gate: GMat,
+        up: GMat,
+        down: GMat,
+        width: usize,
+    }
     enum LFfn {
         Dense {
             gate: GMat,
@@ -26469,8 +26534,10 @@ pub fn forward_token_graph(
             /// q8_2f experts: `moe_q82`'s decode pair.
             q82: bool,
             sigmoid: bool,
+            sigmoid_denom_eps: f32,
             bias: Option<wgpu::Buffer>,
             has_shared: bool,
+            detached_shared: Option<LDetachedShared>,
             shared_gated: bool,
             route_scale: f32,
         },
@@ -26862,8 +26929,10 @@ pub fn forward_token_graph(
                 gu_q2,
                 q82,
                 sigmoid,
+                sigmoid_denom_eps,
                 bias,
                 has_shared,
+                detached_shared,
                 shared_gated,
                 route_scale,
             } => {
@@ -26900,6 +26969,42 @@ pub fn forward_token_graph(
                     sg
                 } else {
                     router.clone()
+                };
+                let detached_shared = match detached_shared {
+                    Some(shared) => {
+                        let (Some(gate), Some(up), Some(down)) = (
+                            resolve(&shared.gate, shared.width, hidden),
+                            resolve(&shared.up, shared.width, hidden),
+                            resolve(&shared.down, hidden, shared.width),
+                        ) else {
+                            graph_decline("detached shared MoE expert resolve");
+                            return token_graph_outcome(o1_started || state_started, false);
+                        };
+                        // This path is intentionally narrow: it is the
+                        // proven Q4TP SwiGLU representation used by Flint.
+                        // Other layouts/gated shared experts stay with their
+                        // established owner rather than taking a near-match.
+                        if gate.kind != 6
+                            || up.kind != 6
+                            || down.kind != 6
+                            || gate.prism != crate::gpu::GraphPrismOp::None
+                            || up.prism != crate::gpu::GraphPrismOp::None
+                            || down.prism != crate::gpu::GraphPrismOp::None
+                            || gate.affine
+                            || up.affine
+                            || down.affine
+                        {
+                            graph_decline("detached shared MoE expert is not plain q4tp");
+                            return token_graph_outcome(o1_started || state_started, false);
+                        }
+                        Some(LDetachedShared {
+                            gate,
+                            up,
+                            down,
+                            width: shared.width,
+                        })
+                    }
+                    None => None,
                 };
                 // The layer-level live-set check above owns the prefix
                 // boundary. Keep this arena check for other resident data
@@ -26957,6 +27062,7 @@ pub fn forward_token_graph(
                     gu_q2: *gu_q2,
                     q82: *q82,
                     sigmoid: *sigmoid,
+                    sigmoid_denom_eps: *sigmoid_denom_eps,
                     bias: bias.map(|b| {
                         c.device
                             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -26967,6 +27073,7 @@ pub fn forward_token_graph(
                     }),
                     has_shared: *has_shared,
                     shared_gated: *shared_gated,
+                    detached_shared,
                     route_scale: *route_scale,
                 }
             }
@@ -27193,6 +27300,13 @@ pub fn forward_token_graph(
     let attn =
         GraphScratch::ensure(&c.device, &mut gs.attn, (nh * max_hd * 4) as u64, st, "g-attn");
     let ob = GraphScratch::ensure(&c.device, &mut gs.ob, (hidden * 4) as u64, st, "g-ob");
+    let moe_shared_out = GraphScratch::ensure(
+        &c.device,
+        &mut gs.moe_shared_out,
+        (hidden * 4) as u64,
+        st,
+        "g-moe-shared-out",
+    );
     // Gemma sandwich norms write the normed mixer/FFN output here before
     // its residual add (allocated only when a layer has them).
     let sandwich = layers
@@ -29983,7 +30097,19 @@ pub fn forward_token_graph(
             // A sandwich-normed or layer-scaled FFN output takes the unfused
             // tail below (its norm and scale sit between the FFN and the add).
             let sandwich_tail = l.ffn_out_norm.is_some() || l.layer_scale.is_some();
-            let simple_tail = fuse_tail && !loop_norm_at.contains(&li) && !sandwich_tail;
+            // A detached shared expert is added after the routed MoE output.
+            // Letting the routed path fuse its residual tail first would
+            // either drop that contribution or apply it to the next layer's
+            // normalized hidden.  Keep the tail below the add instead.
+            let has_detached_shared = matches!(
+                &lw.ffn,
+                LFfn::Moe {
+                    detached_shared: Some(_),
+                    ..
+                }
+            );
+            let simple_tail =
+                fuse_tail && !loop_norm_at.contains(&li) && !sandwich_tail && !has_detached_shared;
             let mut ffn_post: Option<(&wgpu::ComputePipeline, wgpu::BindGroup, u32)> = None;
             let mut tail_done = false;
             if simple_tail {
@@ -30007,6 +30133,9 @@ pub fn forward_token_graph(
             }
             // SiLU FFN: gate+up matvecs + silu fused in ONE compute pass
             // (dispatches within a pass are serialized — silu safely reads gate/up output).
+            // A separately shaped shared MoE expert is encoded immediately
+            // after its routed bank, before the residual tail below.
+            let mut deferred_shared: Option<&LDetachedShared> = None;
             match &lw.ffn {
                 LFfn::Dense {
                     gate,
@@ -30364,12 +30493,15 @@ pub fn forward_token_graph(
                     norm_topk,
                     q82: true,
                     sigmoid,
+                    sigmoid_denom_eps,
                     bias,
                     has_shared,
+                    detached_shared,
                     shared_gated,
                     route_scale,
                     ..
                 } => {
+                    deferred_shared = detached_shared.as_ref();
                     let (mlogit, mslog, msel, mwt, mact) = moe_bufs.as_ref().unwrap();
                     let slots = *top_k + usize::from(*has_shared);
                     let Some(d8) = moe_q82::decode(c, hidden).filter(|_| slots <= 32) else {
@@ -30427,7 +30559,8 @@ pub fn forward_token_graph(
                                     | (u32::from(*sigmoid) << 1)
                                     | (u32::from(bias.is_some()) << 2)
                                     | (u32::from(*has_shared) << 3)
-                                    | (u32::from(*has_shared && !*shared_gated) << 4),
+                                | (u32::from(*has_shared && !*shared_gated) << 4)
+                                | (u32::from(*sigmoid_denom_eps == 1e-20) << 5),
                                 ((hidden as u32) << 8) | (u32::from(sgate.kind == 4) * 4),
                                 route_scale.to_bits(),
                                 0,
@@ -30527,11 +30660,14 @@ pub fn forward_token_graph(
                     gu_q2,
                     q82: false,
                     sigmoid,
+                    sigmoid_denom_eps,
                     bias,
                     has_shared,
+                    detached_shared,
                     shared_gated,
                     route_scale,
                 } => {
+                    deferred_shared = detached_shared.as_ref();
                     // The WHOLE MoE FFN — router + shared-gate matvecs, top-k
                     // select, fused gate+up+SiLU over the selected experts, and
                     // the weighted down accumulation into ob — rides in ONE
@@ -30561,7 +30697,12 @@ pub fn forward_token_graph(
                                 | (u32::from(*sigmoid) << 1)
                                 | (u32::from(bias.is_some()) << 2)
                                 | (u32::from(*has_shared) << 3)
-                                | (u32::from(*has_shared && !*shared_gated) << 4),
+                                | (u32::from(*has_shared && !*shared_gated) << 4)
+                                // Flint's source uses +1e-20 for sigmoid
+                                // renormalization; the established noaux
+                                // contract uses +1e-6. The shader reads this
+                                // only when bit1 says sigmoid.
+                                | (u32::from(*sigmoid_denom_eps == 1e-20) << 5),
                             ((hidden as u32) << 8) | (u32::from(sg_fold) * 4),
                             // routed_scaling_factor on the routed mix (f32 bits).
                             route_scale.to_bits(),
@@ -30835,12 +30976,35 @@ pub fn forward_token_graph(
                         )
                     };
                     let pr = prep(router, &n1, mlogit, *n_exp, hidden);
-                    let ps = prep(sgate, &n1, mslog, 1, hidden);
+                    // `mslog` participates only for a separately gated
+                    // shared slot.  Flint's detached, ungated shared expert
+                    // has `has_shared=false`; computing its router stand-in
+                    // here used to add one pointless 1-row matvec to all 47
+                    // MoE layers every token.
+                    let need_sg = *has_shared && *shared_gated && !sg_fold;
+                    let ps = need_sg
+                        .then(|| prep(sgate, &n1, mslog, 1, hidden))
+                        .flatten();
                     let mut continue_moe_std = true;
                     // Fold-select (q2tp + folded shared gate): router feeds the
                     // gu/down twins DIRECTLY — the select hop and the sgate
                     // matvec disappear from the layer's dependency chain.
-                    let fold = c.foldsel && *gu_q2 && sg_fold && !skip_router;
+                    // The folded q2tp pair encodes its own *gated* shared
+                    // slot and plain softmax selection.  A detached Flint
+                    // shared expert is added by the dense path below, so
+                    // routing it through this shader would turn a routed
+                    // slot into the synthetic `id = n_exp` slot.  Keep the
+                    // fold for its exact original contract only.
+                    let fold = c.foldsel
+                        && *gu_q2
+                        && sg_fold
+                        && *has_shared
+                        && *shared_gated
+                        && !*sigmoid
+                        && bias.is_none()
+                        && *route_scale == 1.0
+                        && detached_shared.is_none()
+                        && !skip_router;
                     if fold {
                         if let Some((prp, bgr, wr)) = prep(router, &n1, mlogit, *n_exp, hidden) {
                             let mgf_u = uniform_u32x4(c, [*n_exp as u32, 0, 0, 0]);
@@ -30914,7 +31078,7 @@ pub fn forward_token_graph(
                         }
                     }
                     if continue_moe_std {
-                        if let (Some((prp, bgr, wr)), Some((psp, bgs, ws))) = (pr, ps) {
+                        if let Some((prp, bgr, wr)) = pr.filter(|_| !need_sg || ps.is_some()) {
                             let mut pass = begin_pass(&mut enc);
                             if let Some((p, b, w)) = &ffn_pre {
                                 pass.set_pipeline(p);
@@ -30929,10 +31093,10 @@ pub fn forward_token_graph(
                                 pass.dispatch_workgroups(wr, 1, 1);
                             }
                             tsp!(pass, fine, 31); // router
-                            if !sg_fold {
+                            if let Some((psp, bgs, ws)) = &ps {
                                 pass.set_pipeline(psp);
-                                pass.set_bind_group(0, &bgs, &[]);
-                                pass.dispatch_workgroups(ws, 1, 1);
+                                pass.set_bind_group(0, bgs, &[]);
+                                pass.dispatch_workgroups(*ws, 1, 1);
                             }
                             // The subgroup select hard-codes the GATED
                             // shared expert; hy_v3's ungated one stays on
@@ -30970,14 +31134,24 @@ pub fn forward_token_graph(
                                 }
                             }
                         } else {
-                            // Un-preppable router dtype: per-op passes (correct, rare).
-                            group_mats(
-                                &mut enc,
-                                &[
-                                    (router, &n1, mlogit, *n_exp, hidden),
-                                    (sgate, &n1, mslog, 1, hidden),
-                                ],
-                            );
+                            // An un-preppable router or required shared gate:
+                            // per-op passes (correct, rare).  An ungated or
+                            // detached shared expert must not manufacture a
+                            // meaningless shared-gate matvec here.
+                            if need_sg {
+                                group_mats(
+                                    &mut enc,
+                                    &[
+                                        (router, &n1, mlogit, *n_exp, hidden),
+                                        (sgate, &n1, mslog, 1, hidden),
+                                    ],
+                                );
+                            } else {
+                                group_mats(
+                                    &mut enc,
+                                    &[(router, &n1, mlogit, *n_exp, hidden)],
+                                );
+                            }
                             go(&mut enc, &c.moe_select, &bg_sel, 1);
                             {
                                 let mut pass = begin_pass(&mut enc);
@@ -30989,6 +31163,114 @@ pub fn forward_token_graph(
                         }
                     } // continue_moe_std
                 }
+            }
+            if let Some(shared) = deferred_shared {
+                // The shared branch receives the same post-attention RMS
+                // input as the routed bank.  It intentionally runs after
+                // routed down-projection: `ob` is the routed sum and the
+                // final axpy implements Flint's ungated shared-expert add.
+                if shared.width == 0 || shared.width > inter {
+                    graph_decline("detached shared MoE width exceeds graph scratch");
+                    return token_graph_outcome(o1_started || state_started, false);
+                }
+                // Flint's direct shared SwiGLU is exactly the q4tp dense
+                // fast-path contract.  Reuse its established fused
+                // gate+up+SiLU projection rather than adding four launches
+                // to every one of the 47 MoE layers.  The generic pair and
+                // scalar fallback retain ownership of every other device.
+                let gu_fused = c.use_mv_gu
+                    && c.use_mv4
+                    && shared.gate.kind == 6
+                    && shared.up.kind == 6
+                    && hidden % 32 == 0
+                    && mv_fuse_gpr_ok(hidden / 32)
+                    && c.q4tp_mv16w_probe.is_none();
+                let pgu = if gu_fused {
+                    c.use_mv_nl
+                        .then(|| {
+                            dense_mv::sg_gu_prep(
+                                c,
+                                &shared.gate.buf,
+                                &shared.up.buf,
+                                &n1,
+                                &abuf,
+                                shared.width,
+                                hidden,
+                                0,
+                            )
+                        })
+                        .flatten()
+                        .or_else(|| {
+                            let (b, w) = mv_gu_bind(
+                                c,
+                                &shared.gate.buf,
+                                &shared.up.buf,
+                                &n1,
+                                &abuf,
+                                shared.width,
+                                hidden,
+                                0,
+                            );
+                            Some((gu_pipe(c), b, w))
+                        })
+                } else {
+                    None
+                };
+                if let Some((p, b, w)) = pgu {
+                    go(&mut enc, p, &b, w);
+                } else {
+                    if let Some((p, b, w)) = prep2(
+                        &shared.gate,
+                        &shared.up,
+                        &n1,
+                        &gbuf,
+                        &ubuf,
+                        shared.width,
+                        shared.width,
+                        hidden,
+                    ) {
+                        go(&mut enc, p, &b, w);
+                    } else {
+                        group_mats(
+                            &mut enc,
+                            &[
+                                (&shared.gate, &n1, &gbuf, shared.width, hidden),
+                                (&shared.up, &n1, &ubuf, shared.width, hidden),
+                            ],
+                        );
+                    }
+                    let shared_silu_u = uniform_u32x4(c, [shared.width as u32, 0, 0, 0]);
+                    go(
+                        &mut enc,
+                        &c.silu,
+                        &bg(
+                            &c.layout_silu,
+                            &[&gbuf, &ubuf, &dummy_hd, &abuf, &shared_silu_u],
+                        ),
+                        (shared.width as u32).div_ceil(256),
+                    );
+                }
+                if let Some((p, b, w)) =
+                    prep(&shared.down, &abuf, &moe_shared_out, hidden, shared.width)
+                {
+                    go(&mut enc, p, &b, w);
+                } else {
+                    emat(
+                        &mut enc,
+                        &shared.down,
+                        &abuf,
+                        &moe_shared_out,
+                        hidden,
+                        shared.width,
+                    );
+                }
+                let shared_add_u = uniform_u32x4(c, [1.0f32.to_bits(), hidden as u32, 0, 0]);
+                go(
+                    &mut enc,
+                    &c.axpy,
+                    &bg(&c.layout_axpy, &[&moe_shared_out, &ob, &shared_add_u]),
+                    (hidden as u32).div_ceil(256),
+                );
             }
             // FFN-residual + next layer's attn-norm fused (plain residual on the last).
             // At loop boundaries (Looped Transformer), insert final_norm between the
@@ -32115,6 +32397,7 @@ pub fn forward_batch_graph_at(
                 has_shared,
                 shared_gated,
                 route_scale,
+                ..
             } => {
                 if *top_k >= 16 || *n_exp > 256 || experts.len() != n_exp + usize::from(*has_shared)
                 {
@@ -47724,7 +48007,7 @@ mod tests {
     }
 
     #[test]
-    fn q4tp_moe_majority_reserves_graph_headroom() {
+    fn packed_moe_majority_reserves_graph_headroom() {
         let budget = 24u64 << 30;
         let guarded = budget * 9 / 16;
         // Q8_2F keeps its existing safety margin.
@@ -47746,6 +48029,70 @@ mod tests {
             graph_live_budget_from_totals(budget, 18 << 30, 1 << 30, 8 << 30),
             budget
         );
+
+        // Mixed q2tp gate/up + q4tp down still uploads three packed expert
+        // planes per layer. It must enter the same conservative bucket rather
+        // than using the full logical VRAM budget.
+        assert!(is_packed_moe_payload(
+            cortiq_core::TensorDtype::Q2TiledP,
+            "model.layers.0.mlp.experts.0.gate_proj.weight"
+        ));
+        assert!(is_packed_moe_payload(
+            cortiq_core::TensorDtype::Q4TiledP,
+            "model.layers.0.mlp.shared_expert.down_proj.weight"
+        ));
+        assert!(!is_packed_moe_payload(
+            cortiq_core::TensorDtype::Q2TiledP,
+            "model.layers.0.self_attn.q_proj.weight"
+        ));
+        assert_eq!(
+            graph_live_budget_from_totals(budget, 48 << 30, 10 << 30, 38 << 30),
+            guarded
+        );
+    }
+
+    #[test]
+    fn graph_live_override_is_explicit_bounded_and_fail_closed() {
+        const MIB: u64 = 1024 * 1024;
+        let budget = 21_500 * MIB;
+        let guarded = budget * 9 / 16;
+
+        // An operator may make graph admission more conservative, but an
+        // environment value can never raise it above the proven ceiling.
+        assert_eq!(
+            graph_live_override_bytes(budget, Some("13438")),
+            Some(13_438 * MIB)
+        );
+        assert_eq!(
+            graph_live_budget_with_override(budget, 18 << 30, 1 << 30, 16 << 30, Some("13438")),
+            guarded
+        );
+        assert_eq!(
+            graph_live_override_bytes(budget, Some("999999")),
+            Some(budget)
+        );
+        assert_eq!(
+            graph_live_budget_with_override(budget, 18 << 30, 1 << 30, 16 << 30, Some("999999")),
+            guarded
+        );
+        assert_eq!(graph_live_override_bytes(0, Some("1")), None);
+
+        // Bad input must retain the existing guarded policy rather than turn
+        // an env typo into a changed graph-admission ceiling.
+        for raw in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("not-a-number"),
+            Some("18446744073709551615"),
+        ] {
+            assert_eq!(graph_live_override_bytes(budget, raw), None, "{raw:?}");
+            assert_eq!(
+                graph_live_budget_with_override(budget, 18 << 30, 1 << 30, 16 << 30, raw),
+                guarded,
+                "{raw:?}"
+            );
+        }
     }
 
     #[test]

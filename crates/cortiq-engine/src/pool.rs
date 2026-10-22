@@ -105,6 +105,10 @@ struct Inner {
     desc_vtable: AtomicUsize,
     desc_n: AtomicUsize,
     desc_dev: AtomicUsize,
+    /// `FLOAT_ACTIVATIONS` is thread-local, while this pool is persistent.
+    /// Snapshot it with the closure descriptor so an exact caller policy is
+    /// retained by the worker-side row kernels as well.
+    desc_float_activations: AtomicBool,
     /// Ticket holders still running the current job (excludes the
     /// caller). Its own line: the caller polls it while workers
     /// decrement.
@@ -193,6 +197,7 @@ impl Pool {
             desc_vtable: AtomicUsize::new(0),
             desc_n: AtomicUsize::new(0),
             desc_dev: AtomicUsize::new(0),
+            desc_float_activations: AtomicBool::new(false),
             remaining: Padded(AtomicUsize::new(0)),
             slots: (0..n_workers)
                 .map(|_| Slot {
@@ -464,6 +469,10 @@ impl Pool {
         inner
             .desc_dev
             .store(crate::gpu::current_device(), Ordering::Relaxed);
+        inner.desc_float_activations.store(
+            crate::qtensor::float_activations_active(),
+            Ordering::Relaxed,
+        );
         inner.remaining.0.store(nw, Ordering::Relaxed);
         let e = inner.epoch.load(Ordering::Relaxed);
         inner.epoch.store(e.wrapping_add(1), Ordering::Relaxed);
@@ -1029,6 +1038,7 @@ fn worker_loop(inner: &Inner, idx: usize) {
         let vtable = inner.desc_vtable.load(Ordering::Relaxed);
         let n = inner.desc_n.load(Ordering::Relaxed);
         let dev = inner.desc_dev.load(Ordering::Relaxed);
+        let float_activations = inner.desc_float_activations.load(Ordering::Relaxed);
         // SAFETY: the two words are the fat pointer `dispatch` split, and
         // the caller of this job is blocked on our decrement below, so the
         // closure it borrows is alive for the whole call.
@@ -1036,6 +1046,8 @@ fn worker_loop(inner: &Inner, idx: usize) {
             unsafe { std::mem::transmute([data, vtable]) };
         let f = unsafe { &*task };
         crate::gpu::set_current_device(dev);
+        let _float_activations =
+            float_activations.then(crate::qtensor::enter_float_activations_scope);
         f(idx, n);
         inner.remaining.0.fetch_sub(1, Ordering::AcqRel);
     }
@@ -1197,6 +1209,37 @@ impl SendMut {
 
 #[cfg(test)]
 mod tests {
+    /// A persistent worker keeps its own TLS between jobs. An exact caller
+    /// scope must therefore ride with the descriptor, and must not leak into
+    /// the next unscoped job.
+    #[test]
+    fn float_activation_scope_follows_dispatch_and_is_restored() {
+        let pool = Pool::with_spin(2, 0);
+        let active = AtomicUsize::new(0);
+        let inactive = AtomicUsize::new(0);
+        crate::qtensor::float_activations_scope(|| {
+            pool.run(&|_w, _n| {
+                if crate::qtensor::float_activations_active() {
+                    active.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    inactive.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        });
+        assert_eq!(active.load(Ordering::Relaxed), 3);
+        assert_eq!(inactive.load(Ordering::Relaxed), 0);
+
+        pool.run(&|_w, _n| {
+            if crate::qtensor::float_activations_active() {
+                active.fetch_add(1, Ordering::Relaxed);
+            } else {
+                inactive.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        assert_eq!(active.load(Ordering::Relaxed), 3);
+        assert_eq!(inactive.load(Ordering::Relaxed), 3);
+    }
+
     /// A worker NOT invited to a limited job is not waited for; if it is
     /// preempted around the moment the job is published, the caller may
     /// already be on the next job. The first protocol then ran that next

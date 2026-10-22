@@ -5,6 +5,52 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.30] — 2026-10-22
+
+### Added
+- `cortiq repair-flint MODEL [--dry-run]` is an atomic, header-only migration
+  for the original standalone Recursive Flint CMFs.  It validates the complete
+  released catalogue (names, shapes and dtypes), preserves the tensor directory
+  and payload bytes, and records the sliding-window/no-RoPE/sink/sigmoid-router
+  execution contract that a compatible runtime needs.
+- `cortiq flint-hybrid Q2_BASE Q4_SOURCE OUTPUT --layers 2,7-10` builds an
+  explicitly selected, layer-aligned Flint q2tp/q4tp experiment without a
+  dequantize/requantize round trip.  It validates both complete source
+  catalogues, streams source payloads into a staged file, verifies it, syncs it,
+  and atomically installs it without overwriting an existing output.  A mixed
+  profile is supported only when every selected routed layer's gate/up pair is
+  complete; it is deliberately not a blanket quality claim.
+
+### Fixed
+- WGPU graph admission now treats the mixed q2tp/q4tp routed-expert layout
+  as a packed-MoE live set.  This keeps its conservative 9/16 VRAM assembly
+  ceiling on 24 GiB Vulkan adapters instead of admitting a full logical graph
+  that can exhaust driver staging memory; it changes placement only, not
+  routing or numerical inference.
+- Flint now follows its source router's selected-sigmoid normalization exactly:
+  its denominator floor is `1e-20` rather than the `1e-6` rule used by other
+  sigmoid-router families.  The same selector reaches the CPU and WGPU token
+  graph paths.
+- Native Metal now has a strict Flint selected-expert route for the released
+  q2tp layout: host-side source-exact routing feeds bounded mmap-backed views
+  for the six q2tp gate/up pairs, q4tp downs, and detached q4tp shared expert.
+  Shape, admission, completion, and readback refusals fall back to CPU rather
+  than changing a result; the learned-sink/no-RoPE attention profile remains
+  active in the hybrid execution.
+- Flint defaults to strict float activations when `CMF_SDOT` is unset, and
+  propagates that scoped policy into persistent row-pool workers. This prevents
+  the ordinary A8W8 fast path from changing a greedy continuation silently.
+  `CMF_SDOT=1` remains an explicit experimental speed override; `=0` selects
+  the same strict policy as the Flint default.
+- The WGPU token/decode graph handles Flint's detached always-active shared
+  SwiGLU expert and its layer-uniform q2tp/q4tp routed gate/up layouts.  A
+  q2tp/q4tp hybrid therefore does not silently skip or CPU-fallback that shared
+  contribution.
+- GPU greedy multistep remains opt-in (`CMF_MULTISTEP`) and now declines when
+  exactness instrumentation or non-greedy state is active, while checking
+  cancellation inside a burst.  It is not enabled by default and is not
+  speculative decoding.
+
 ## [0.8.29] — 2026-10-22
 
 ### Fixed
