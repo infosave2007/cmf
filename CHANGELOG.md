@@ -26,6 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its denominator floor is `1e-20` rather than the `1e-6` rule used by other
   sigmoid-router families.  The same selector reaches the CPU and WGPU token
   graph paths.
+- Native Metal now has a strict Flint selected-expert route for the released
+  q2tp layout: host-side source-exact routing feeds bounded mmap-backed views
+  for the six q2tp gate/up pairs, q4tp downs, and detached q4tp shared expert.
+  Shape, admission, completion, and readback refusals fall back to CPU rather
+  than changing a result; the learned-sink/no-RoPE attention profile remains
+  active in the hybrid execution.
+- Flint defaults to strict float activations when `CMF_SDOT` is unset, and
+  propagates that scoped policy into persistent row-pool workers. This prevents
+  the ordinary A8W8 fast path from changing a greedy continuation silently.
+  `CMF_SDOT=1` remains an explicit experimental speed override; `=0` selects
+  the same strict policy as the Flint default.
 - The WGPU token/decode graph handles Flint's detached always-active shared
   SwiGLU expert and its layer-uniform q2tp/q4tp routed gate/up layouts.  A
   q2tp/q4tp hybrid therefore does not silently skip or CPU-fallback that shared
