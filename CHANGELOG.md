@@ -5,7 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.29] — 2026-10-22
+
+### Fixed
+- **Recursive Flint's attention profile now runs.** Two traits had nowhere to
+  live: the learned per-head attention sink (Flint spells it
+  `self_attn.softmax_offset`; the engine already carried sink logits under
+  two other spellings) and the full-attention layers that carry **no**
+  positional encoding (RoPE applies only to the sliding-window layers). The
+  sink is now loaded under Flint's spelling, and a layer without RoPE gets a
+  zero rotary dim — the same geometry the attention kernel already reads.
 
 ### Added
 - the arch records two Recursive Flint traits the runtime needs: the

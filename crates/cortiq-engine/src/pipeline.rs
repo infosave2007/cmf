@@ -364,6 +364,11 @@ pub struct Pipeline {
     /// Explicit local/global schedule for architectures that cannot be
     /// represented by Gemma's every-Nth-global convention.
     pub sliding_layers: Option<Vec<bool>>,
+    /// Per-layer flag: this layer runs WITHOUT RoPE. Recursive Flint applies
+    /// position encoding only on its sliding-window layers; its 14
+    /// full-attention layers have none. The rotary dim of such a layer is 0,
+    /// which is what the attention kernel reads.
+    pub no_rope_layers: Option<Vec<bool>>,
     /// Natively bounded anchor record (`arch.anchor_core`): the file's
     /// operator, installed once at load. `Some` = the model is
     /// bounded-native — `--o1`/`CMF_O1*` are refused, prefix reuse and
@@ -3525,6 +3530,7 @@ impl Pipeline {
             swa: None,
             swa_trim: None,
             sliding_layers: None,
+            no_rope_layers: None,
             anchor_core: None,
             bounded_rope: None,
             kv_prefix: KvPrefix::default(),
@@ -10744,15 +10750,18 @@ impl Pipeline {
                 return (gkv, ghd, ghd);
             }
         }
-        (
-            self.layer_num_kv_heads(li),
-            self.head_dim,
-            if self.layer_is_local(li) {
-                self.rotary_dim_local.unwrap_or(self.rotary_dim)
-            } else {
-                self.rotary_dim
-            },
-        )
+        let rd = if self.layer_is_local(li) {
+            self.rotary_dim_local.unwrap_or(self.rotary_dim)
+        } else {
+            self.rotary_dim
+        };
+        // A layer without positional encoding rotates nothing.
+        let rd = if self.no_rope_layers.as_ref().and_then(|v| v.get(li)).copied() == Some(true) {
+            0
+        } else {
+            rd
+        };
+        (self.layer_num_kv_heads(li), self.head_dim, rd)
     }
 
     /// KV heads of layer `li` (virtual index): the per-layer count when the

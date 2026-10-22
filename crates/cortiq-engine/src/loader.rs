@@ -2032,6 +2032,10 @@ impl Pipeline {
                 let name = [
                     format!("model.layers.{li}.self_attn.sinks"),
                     format!("model.layers.{li}.self_attn.attention_sink_bias"),
+                    // Recursive Flint spells the same thing `softmax_offset`:
+                    // one learned logit per Q head, added to the attention
+                    // logits before the softmax.
+                    format!("model.layers.{li}.self_attn.softmax_offset"),
                 ]
                 .into_iter()
                 .find(|n| model.tensor(n).is_some());
@@ -2041,6 +2045,14 @@ impl Pipeline {
                         .set_layer_sinks(li, sinks)
                         .map_err(|e| CmfError::Parse(format!("{name}: {e}")))?;
                 }
+            }
+        }
+        // Recursive Flint: RoPE only on the sliding-window layers — its
+        // full-attention layers carry no positional encoding at all. The
+        // schedule is already in `sliding_layers`; the flag follows from it.
+        if arch.arch_name == "flint" {
+            if let Some(sliding) = pipeline.sliding_layers.clone() {
+                pipeline.no_rope_layers = Some(sliding.iter().map(|is_local| !*is_local).collect());
             }
         }
         if pipeline.kv_heads_per_layer.is_some()
