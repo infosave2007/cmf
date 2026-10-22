@@ -5,9 +5,21 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.28] — 2026-10-22
 
-### Added
+### Fixed
+- the NVIDIA Vulkan ICD fails to initialize in a compute-only container without
+  the GLVND dispatch libraries (`libEGL.so.1` / `libGLX.so.0`): wgpu then
+  reports **zero adapters** and the whole model runs on the CPU — measured
+  0.6 tok/s against 8.7 tok/s for the same model and hardware once the
+  dispatch libraries are installed (`apt-get install -y libegl1 libgl1 libglx0
+  libgles2`). The CPU-fallback warning now says so.
+
+### Changed
+- the DSV4.1 expert prefetch quota now follows the link: 8 on a fast upload
+  path (>= 10 GB/s), 1 otherwise. Measured on a 755B DeepSeek-V4.1-Flash on
+  one RTX PRO 6000 (Vulkan): the prefill went 3.2 -> 11.8 tok/s, the decode
+  8.7 -> 9.0.
 - `--blr-plan`: a `keep` rule leaves a layer (or a tensor) exact at the
   model's non-blr codec instead of encoding it. The damage of a stack of
   layers *compounds* — measured on Qwen3-0.6B, quantizing all 28 layers at
