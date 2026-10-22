@@ -6301,6 +6301,8 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
                 || is_mellum_config
                 || is_gemma2
                 || is_gemma3n
+                // Recursive Flint: 35 sliding-window layers, 14 full.
+                || mt == "flint"
                 || tc.get("sliding_window_pattern").is_some()
                 || g4_pattern.is_some()
         }),
