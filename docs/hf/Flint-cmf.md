@@ -148,16 +148,42 @@ and route locality all matter.
 
 ### Apple silicon / Metal status
 
-The WGPU/Metal route-parity test passed 2/2 and compiled the relevant shaders
-on an Apple M4. That is a backend compatibility check only, **not** an
-end-to-end Flint qualification. A full q2tp trial on a 24 GB M4 exposed UMA
-overcommit when WGPU copies the complete routed-expert banks into device
-buffers; it can page heavily. The native-Metal fallback also does not yet
-execute Flint's learned attention-sink path. Consequently, 0.8.30 makes no
-Apple-silicon throughput or full-decode support claim for Flint. Use the
-validated Vulkan configuration for this model today; do not treat the Vulkan
-table as a Metal result or try to force a larger resident graph with memory
-overrides.
+The released q2tp layout has a native-Metal **direct selected-expert** path.
+The host keeps the source-exact route selection, then native Metal executes
+the six selected q2tp gate/up pairs, q4tp down projections, and the detached
+q4tp shared expert through bounded mmap-backed views. This avoids allocating a
+complete routed-expert bank on unified memory. The complete Flint profile
+(including learned attention sinks and the no-RoPE full-attention layers) is
+still executed; this is a hybrid route, not a fully resident token graph.
+
+The direct path checks layout, admission, command completion, and readback;
+any refusal falls back to the CPU path rather than silently changing the
+result. It retains one checked submit/wait boundary for each of the 47 MoE
+layers, so it is not appropriate to infer a general Metal tok/s promise from
+the Vulkan table. `CMF_METAL_FLINT_PAGE_GRAPH=1` remains experimental and
+default-off because it can increase unified-memory pressure. Leave the direct
+path selected by default:
+
+```bash
+# Native Metal on Apple silicon; do not set CMF_SDOT for a quality run.
+CMF_GPU=1 CMF_GPU_PROBE=0 CMF_GPU_BLOCK=0 \
+CMF_METAL_FLINT_VIEW_CACHE_MB=0 \
+  cortiq run flint-q2tp.cmf --prompt "Explain a bounded LRU cache." \
+  --greedy --max-tokens 128
+```
+
+#### Exact activation policy
+
+When `CMF_SDOT` is **unset**, Flint automatically uses float activations for
+its host-side quantized routes, including persistent row-pool workers.
+`CMF_SDOT=0` explicitly requests that same strict contract. `CMF_SDOT=1` is
+an experimental speed override, not a quality or compatibility mode, and must
+not be used for quality claims. On the native-Metal greedy diagnostic (`Hi`,
+24 generated tokens), the default and `CMF_SDOT=0` runs produced identical
+dumped logits at every step (24/24; maximum absolute difference 0); the
+explicit `=1` run diverged after the first generated token. This verifies the
+runtime policy on that diagnostic, not equivalence to an upstream quality
+evaluation.
 
 ## Integrity and legacy files
 
@@ -289,15 +315,41 @@ CMF_GPU=wgpu CMF_GPU_WGPU_GRAPH=1 CMF_MULTISTEP=4 \
 на каждом prompt. Скорость зависит от GPU, драйвера, свободной VRAM, контекста,
 длины вывода и локальности маршрутов.
 
-На Apple M4 WGPU/Metal route-parity test прошёл 2/2 и shaders собраны. Это
-лишь проверка совместимости backend, **не** end-to-end квалификация Flint.
-Полный q2tp-прогон на M4 с 24 GB показал UMA-overcommit: WGPU копирует целые
-банки routed experts в device buffers и может уйти в тяжёлый paging. Native
-Metal fallback пока не исполняет путь Flint с learned attention sinks.
-Поэтому для 0.8.30 не заявляются ни скорость, ни полная поддержка decode для
-Apple silicon. Для этой модели используйте проверенную Vulkan-конфигурацию и
-не пытайтесь форсировать больший resident graph memory-overrides; Vulkan-
-цифры нельзя считать результатом для Mac.
+Для опубликованного q2tp Native Metal использует **прямой путь выбранных
+экспертов**. Host сохраняет source-exact выбор маршрута, а Metal выполняет
+шесть выбранных q2tp gate/up-пар, q4tp down-проекции и отдельный q4tp shared
+expert через ограниченные mmap-backed views. Поэтому на unified memory не
+выделяется полный банк routed-experts. Полный профиль Flint (включая learned
+attention sinks и full-attention слои без RoPE) исполняется, но это гибридный
+путь, а не полностью resident token graph.
+
+Путь проверяет layout, admission, completion command buffer и readback; при
+отказе он возвращается к CPU, а не меняет результат молча. На каждом из 47
+MoE-слоёв остаётся проверяемая граница submit/wait, поэтому из Vulkan-таблицы
+нельзя выводить общую скорость Metal. `CMF_METAL_FLINT_PAGE_GRAPH=1` остаётся
+экспериментальным и выключен по умолчанию: он может повышать давление на
+unified memory. Оставьте direct path по умолчанию:
+
+```bash
+# Native Metal на Apple silicon; для quality-run не задавайте CMF_SDOT.
+CMF_GPU=1 CMF_GPU_PROBE=0 CMF_GPU_BLOCK=0 \
+CMF_METAL_FLINT_VIEW_CACHE_MB=0 \
+  cortiq run flint-q2tp.cmf --prompt "Объясни bounded LRU cache." \
+  --greedy --max-tokens 128
+```
+
+#### Политика точных активаций
+
+Если `CMF_SDOT` **не задана**, Flint автоматически использует float
+activations в host-side quantized routes, включая persistent row-pool workers.
+`CMF_SDOT=0` явно выбирает тот же строгий контракт. `CMF_SDOT=1` —
+экспериментальный speed override, а не режим качества или совместимости; его
+нельзя использовать для заявлений о качестве. В native-Metal greedy
+диагностике (`Hi`, 24 сгенерированных токена) default и `CMF_SDOT=0`
+совпали во всех dumped logits (24/24; максимальная абсолютная разница 0), а
+явный `=1` разошёлся после первого сгенерированного токена. Это проверка
+runtime policy на данном тесте, а не доказательство эквивалентности upstream
+оценке качества.
 
 ### Целостность и старые файлы
 
