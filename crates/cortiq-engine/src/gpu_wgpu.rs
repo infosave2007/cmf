@@ -20348,13 +20348,13 @@ pub fn resident_bytes() -> u64 {
 /// Physical live-set ceiling used while an over-size graph is assembled.
 /// On the measured Vulkan path Q8_2F needs about 1.6× its packed payload in
 /// driver allocations (19 Granite-30B layers: 15,384 MiB; 30 layers:
-/// 23,832 MiB). A q4tp-majority MoE stack has the same lifetime hazard: its
+/// 23,832 MiB). A packed-MoE-majority stack has the same lifetime hazard: its
 /// three packed expert planes coexist with upload staging during graph setup.
 /// MiniCPM-V-4.7-35B-A3B q4tp is the reproducer: its 17.5 GiB logical stack
 /// OOMed on a 24 GiB Vulkan card, while the 9/16 ceiling admitted a stable
 /// 27-layer device prefix. Dense q4tp models keep the full budget.
-fn graph_live_budget_from_totals(vram_budget: u64, total: u64, q8: u64, q4tp_moe: u64) -> u64 {
-    if q8 > total / 2 || q4tp_moe > total / 2 {
+fn graph_live_budget_from_totals(vram_budget: u64, total: u64, q8: u64, packed_moe: u64) -> u64 {
+    if q8 > total / 2 || packed_moe > total / 2 {
         // 5/8 matched the packed-to-physical slope but left less than one
         // GiB for the fixed context/pipeline allocations on an A40. 9/16
         // keeps ~3 GiB of measured headroom while retaining the largest safe
@@ -20386,17 +20386,27 @@ fn graph_live_budget_with_override(
     vram_budget: u64,
     total: u64,
     q8: u64,
-    q4tp_moe: u64,
+    packed_moe: u64,
     override_mb: Option<&str>,
 ) -> u64 {
-    let proven = graph_live_budget_from_totals(vram_budget, total, q8, q4tp_moe);
+    let proven = graph_live_budget_from_totals(vram_budget, total, q8, packed_moe);
     graph_live_override_bytes(vram_budget, override_mb)
         .map(|ceiling| ceiling.min(proven))
         .unwrap_or(proven)
 }
 
+/// Expert planes that the token graph gathers into a whole-layer packed bank.
+/// Q2TP gate/up and Q4TP down share the same three-plane upload lifetime, so
+/// their bytes need the same admission headroom as a fully Q4TP MoE stack.
+fn is_packed_moe_payload(dtype: cortiq_core::TensorDtype, name: &str) -> bool {
+    matches!(
+        dtype,
+        cortiq_core::TensorDtype::Q4TiledP | cortiq_core::TensorDtype::Q2TiledP
+    ) && (name.contains(".mlp.experts.") || name.contains(".mlp.shared_expert."))
+}
+
 fn graph_live_weight_budget(c: &Ctx, model: &Arc<CmfModel>) -> u64 {
-    let (mut total, mut q8, mut q4tp_moe) = (0u64, 0u64, 0u64);
+    let (mut total, mut q8, mut packed_moe) = (0u64, 0u64, 0u64);
     for e in &model.tensors {
         if !crate::gpu::counts_as_placement_weight(model, &e.name) {
             continue; // a skill lane holds its tensors INSTEAD of the trunk ones
@@ -20405,14 +20415,12 @@ fn graph_live_weight_budget(c: &Ctx, model: &Arc<CmfModel>) -> u64 {
         if e.dtype == cortiq_core::TensorDtype::Q8_2f {
             q8 = q8.saturating_add(e.nbytes);
         }
-        if e.dtype == cortiq_core::TensorDtype::Q4TiledP
-            && (e.name.contains(".mlp.experts.") || e.name.contains(".mlp.shared_expert."))
-        {
-            q4tp_moe = q4tp_moe.saturating_add(e.nbytes);
+        if is_packed_moe_payload(e.dtype, &e.name) {
+            packed_moe = packed_moe.saturating_add(e.nbytes);
         }
     }
     let override_mb = std::env::var("CMF_GRAPH_LIVE_MB").ok();
-    graph_live_budget_with_override(c.vram_budget, total, q8, q4tp_moe, override_mb.as_deref())
+    graph_live_budget_with_override(c.vram_budget, total, q8, packed_moe, override_mb.as_deref())
 }
 
 /// Automatic prefix for ordinary per-op layer walks (most importantly the
@@ -47999,7 +48007,7 @@ mod tests {
     }
 
     #[test]
-    fn q4tp_moe_majority_reserves_graph_headroom() {
+    fn packed_moe_majority_reserves_graph_headroom() {
         let budget = 24u64 << 30;
         let guarded = budget * 9 / 16;
         // Q8_2F keeps its existing safety margin.
@@ -48020,6 +48028,26 @@ mod tests {
         assert_eq!(
             graph_live_budget_from_totals(budget, 18 << 30, 1 << 30, 8 << 30),
             budget
+        );
+
+        // Mixed q2tp gate/up + q4tp down still uploads three packed expert
+        // planes per layer. It must enter the same conservative bucket rather
+        // than using the full logical VRAM budget.
+        assert!(is_packed_moe_payload(
+            cortiq_core::TensorDtype::Q2TiledP,
+            "model.layers.0.mlp.experts.0.gate_proj.weight"
+        ));
+        assert!(is_packed_moe_payload(
+            cortiq_core::TensorDtype::Q4TiledP,
+            "model.layers.0.mlp.shared_expert.down_proj.weight"
+        ));
+        assert!(!is_packed_moe_payload(
+            cortiq_core::TensorDtype::Q2TiledP,
+            "model.layers.0.self_attn.q_proj.weight"
+        ));
+        assert_eq!(
+            graph_live_budget_from_totals(budget, 48 << 30, 10 << 30, 38 << 30),
+            guarded
         );
     }
 

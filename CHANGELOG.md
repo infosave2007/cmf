@@ -22,6 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   complete; it is deliberately not a blanket quality claim.
 
 ### Fixed
+- WGPU graph admission now treats the mixed q2tp/q4tp routed-expert layout
+  as a packed-MoE live set.  This keeps its conservative 9/16 VRAM assembly
+  ceiling on 24 GiB Vulkan adapters instead of admitting a full logical graph
+  that can exhaust driver staging memory; it changes placement only, not
+  routing or numerical inference.
 - Flint now follows its source router's selected-sigmoid normalization exactly:
   its denominator floor is `1e-20` rather than the `1e-6` rule used by other
   sigmoid-router families.  The same selector reaches the CPU and WGPU token
