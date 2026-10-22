@@ -17,6 +17,7 @@ hf upload infosave/Hy-MT2-cmf \
 hf upload infosave/EmbeddingGemma-2-cmf \
     docs/hf/EmbeddingGemma-2-cmf.md README.md
 hf upload infosave/flint-cmf docs/hf/Flint-cmf.md README.md
+hf upload infosave/Ornith-1.5-cmf docs/hf/Ornith-1.5-cmf.md README.md
 hf upload infosave/cmf docs/hf/cmf.md README.md
 hf upload infosave/cmf docs/hf/FORMATS.md FORMATS.md
 ```
