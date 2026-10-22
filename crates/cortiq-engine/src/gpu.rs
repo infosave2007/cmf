@@ -1785,6 +1785,20 @@ pub struct GraphLayer<'a> {
     pub layer_scale: Option<f32>,
 }
 
+/// A SwiGLU shared MoE expert whose intermediate width or packed layout does
+/// not match the routed expert bank.  Most MoE checkpoints put the shared
+/// expert in the same packed bank as the routed experts, but Flint keeps its
+/// 1024-wide shared expert beside 512-wide routed experts.  Keeping this
+/// descriptor separate lets the graph run the existing routed-bank kernels
+/// and add the shared expert through the ordinary dense q4tp path, rather
+/// than silently falling all the way back to per-op execution.
+pub struct GraphMoeDetachedShared<'a> {
+    pub gate: GraphW<'a>,
+    pub up: GraphW<'a>,
+    pub down: GraphW<'a>,
+    pub width: usize,
+}
+
 /// The FFN of one graph layer: a dense SwiGLU trio, or a routed MoE —
 /// router + top-k selection + all selected experts run ON DEVICE (the
 /// routing decision depends on the resident hidden state, so a CPU
@@ -1831,9 +1845,10 @@ pub enum GraphFfn<'a> {
         /// expert's input is multiplied by THAT expert's column field.
         q82: bool,
         /// LFM2-MoE / DeepSeek-V3 `noaux_tc` routing: per-expert sigmoid
-        /// scores instead of a softmax, and `norm_topk` renormalises with
-        /// the 1e-6 floor. The softmax arm is bit-identical to before.
+        /// scores instead of a softmax. `sigmoid_denom_eps` carries the
+        /// source architecture's selected-score renormalization floor.
         sigmoid: bool,
+        sigmoid_denom_eps: f32,
         /// Per-expert SELECTION bias: added to the score for the top-k
         /// choice only — the mixing weights stay unbiased (noaux_tc).
         bias: Option<&'a [f32]>,
@@ -1841,6 +1856,10 @@ pub enum GraphFfn<'a> {
         /// LFM2-MoE has none; the select kernel then leaves slot `top_k`
         /// unwritten and the expert loop runs `top_k` slots, not +1.
         has_shared: bool,
+        /// A separately evaluated, ungated shared SwiGLU expert.  It is
+        /// deliberately outside `experts`: those tensors cannot share the
+        /// routed bank's stride when their intermediate width differs.
+        detached_shared: Option<GraphMoeDetachedShared<'a>>,
         /// The shared expert carries a sigmoid gate (Qwen2/3-MoE). `false`
         /// with `has_shared`: the shared expert enters with weight 1
         /// (DeepSeek-V3 / HunYuan hy_v3) and `shared_gate` is a stand-in
