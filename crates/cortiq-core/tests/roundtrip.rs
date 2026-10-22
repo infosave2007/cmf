@@ -58,6 +58,8 @@ fn tiny_arch() -> ModelArch {
         final_logit_softcapping: None,
         attn_logit_softcapping: None,
         mla: None,
+        no_rope_layers: None,
+        attention_sink: false,
         activation_situ_beta: None,
         activation_situ_linear_beta: None,
         attn_v_norm: false,
