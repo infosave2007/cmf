@@ -5820,6 +5820,13 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
                 router_sigmoid: is_lfm2
                     || is_laguna
                     || tc.get("scoring_func").and_then(|v| v.as_str()) == Some("sigmoid")
+                    // Recursive Flint names the same routing law
+                    // `router_score_function`. Its selected top-6 sigmoid
+                    // scores are renormalized, not a softmax over all 256.
+                    || tc
+                        .get("router_score_function")
+                        .and_then(|v| v.as_str())
+                        == Some("sigmoid")
                     || tc
                         .get("moe_router_activation_func")
                         .and_then(|v| v.as_str())
@@ -12962,6 +12969,38 @@ mod hunyuan_tests {
         assert_eq!(moe.shared_expert_intermediate_size, Some(768));
         assert!((moe.routed_scaling_factor.unwrap() - 2.826).abs() < 1e-6);
         assert!(!moe.router_resonance);
+    }
+
+    #[test]
+    fn flint_config_records_its_sigmoid_router_and_attention_profile() {
+        let cfg: serde_json::Value = serde_json::from_str(
+            r#"{"architectures":["FlintForCausalLM"],"model_type":"flint",
+                "hidden_size":2048,"intermediate_size":6144,"num_hidden_layers":49,
+                "num_attention_heads":32,"num_key_value_heads":4,"head_dim":128,
+                "vocab_size":150144,"rms_norm_eps":1e-6,"rope_theta":10000.0,
+                "max_position_embeddings":262144,"tie_word_embeddings":false,
+                "num_experts":256,"num_experts_per_tok":6,"moe_intermediate_size":512,
+                "shared_expert_intermediate_size":1024,"norm_topk_prob":true,
+                "router_score_function":"sigmoid","sliding_window":513,
+                "no_rope_layer_indices":[0,1,5,9,13,17,21,25,29,33,37,41,45,48]}"#,
+        )
+        .unwrap();
+        let arch = build_arch(&cfg).unwrap();
+        let moe = arch.moe.as_ref().unwrap();
+        assert!(moe.router_sigmoid, "Flint uses router_score_function=sigmoid");
+        assert!(moe.norm_topk_prob);
+        assert_eq!(arch.sliding_window, Some(513));
+        assert!(arch.attention_sink);
+        assert_eq!(
+            arch.no_rope_layers
+                .as_ref()
+                .unwrap()
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &v)| v.then_some(i))
+                .collect::<Vec<_>>(),
+            vec![0, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 48]
+        );
     }
 
     #[test]

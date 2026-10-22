@@ -40,6 +40,8 @@ fn arch(kv_heads_per_layer: Option<Vec<usize>>, v_head_dim: Option<usize>) -> Mo
         rope_theta: 10_000_000.0,
         tie_word_embeddings: true,
         partial_rotary_factor: 0.5,
+        no_rope_layers: None,
+        attention_sink: false,
         yarn: None,
         attention_heads_per_layer: None,
         local_partial_rotary_factor: None,

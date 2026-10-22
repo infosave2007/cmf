@@ -625,6 +625,11 @@ pub struct MoeFfn {
     /// Router scores per-expert with a sigmoid (LFM2-MoE / DeepSeek-V3
     /// `noaux_tc`) instead of a softmax over all experts (Qwen).
     pub router_sigmoid: bool,
+    /// Addend in the selected-score denominator of a sigmoid router.
+    /// Most supported checkpoints use the historical `1e-6` floor; Flint's
+    /// reference routing uses `1e-20`.  This is per-MoE rather than a global
+    /// family switch because the same sigmoid routing law has both contracts.
+    pub sigmoid_denom_eps: f32,
     /// Per-expert selection bias `mlp.expert_bias` [num_experts]
     /// (LFM2-MoE): added to the sigmoid scores for the top-k CHOICE only;
     /// the gathered weights use the unbiased scores. None = no bias.
@@ -6084,7 +6089,7 @@ impl Pipeline {
                         }
                     }
                     self.graph_want_logits = fuse_lm;
-                    // Greedy burst (CMF_MULTISTEP, default 8, 1 = off): while
+                    // Greedy burst (CMF_MULTISTEP, off unless explicitly set): while
                     // nothing observes per-token state — pure argmax sampling,
                     // no router/trace/confidence/mask — decode k tokens per
                     // submit and commit them wholesale. The trailing normal
@@ -6092,6 +6097,7 @@ impl Pipeline {
                     let mut t_fwd = t_next;
                     let pure_greedy = self.sampler_config.temperature < 1e-6
                         && self.sampler_config.repetition_penalty == 1.0
+                        && self.sampler_config.presence_penalty == 0.0
                         && self.sampler_config.suppress_tokens.is_empty();
                     // Off by default: at every k the burst measured at or
                     // below the plain path on this graph shape (k=1 loses
@@ -6108,9 +6114,28 @@ impl Pipeline {
                         && router.is_none()
                         && !trace_on
                         && !self.confidence_on
+                        // Diagnostics and teacher forcing observe every
+                        // individual logit row.  A device-only burst returns
+                        // only ids, so decline it rather than silently
+                        // skipping requested evidence or forced ids.
+                        && std::env::var_os("CMF_FORCE_IDS").is_none()
+                        && std::env::var_os("CMF_LOGIT_DUMP").is_none()
+                        && std::env::var_os("CMF_LOGIT_DUMP_ALL").is_none()
                     {
                         let mut stopped = false;
                         loop {
+                            // The outer loop checks cancellation too, but a
+                            // long run can stay in this burst loop for many
+                            // submits.  Bound cancellation latency to one
+                            // exact k-token frame.
+                            if self
+                                .cancel
+                                .swap(false, std::sync::atomic::Ordering::Relaxed)
+                            {
+                                finish_reason = "cancelled".to_string();
+                                stopped = true;
+                                break;
+                            }
                             let room = max_tokens.saturating_sub(generated);
                             if room <= 2 {
                                 break;
@@ -12001,13 +12026,54 @@ impl Pipeline {
                         return None;
                     }
                     let shared = m.shared.as_ref();
-                    let has_shared = shared.is_some();
-                    let shared_gated = matches!(shared, Some((_, Some(_))));
+                    // The resident MoE kernels do not yet carry the
+                    // descriptor-aware transform through router/shared-gate
+                    // selection.  Refuse the complete layer instead of
+                    // scoring with an untransformed Prism plane (the dense
+                    // path has an explicit FWHT boundary below).
+                    let inter = m.experts.first()?.gate_proj.rows();
+                    // Flint's shared expert is a 1024-wide SwiGLU while its
+                    // routed bank is 512-wide.  The resident MoE shader
+                    // indexes a uniform-width packed bank, so keep that
+                    // expert out of the routed slots and add it through the
+                    // dense q4tp path after routed accumulation.  This is
+                    // also the safe route for a mixed q2-routed/q4-shared
+                    // artifact: neither layout nor row stride is faked.
+                    let detached_shared = match shared {
+                        Some((se, None))
+                            if se.gate_proj.rows() != inter || se.up_proj.rows() != inter =>
+                        {
+                            if !matches!(se.act, Act::Silu)
+                                || se.gate_proj.mapped_q4tp().is_none()
+                                || se.up_proj.mapped_q4tp().is_none()
+                                || se.down_proj.mapped_q4tp().is_none()
+                            {
+                                return None;
+                            }
+                            Some(crate::gpu::GraphMoeDetachedShared {
+                                gate: gw(&se.gate_proj)?,
+                                up: gw(&se.up_proj)?,
+                                down: gw(&se.down_proj)?,
+                                width: se.gate_proj.rows(),
+                            })
+                        }
+                        // A separately shaped gated shared expert needs a
+                        // second sigmoid gate path.  Do not turn it into an
+                        // ungated one merely to make the graph run.
+                        Some((se, Some(_)))
+                            if se.gate_proj.rows() != inter || se.up_proj.rows() != inter =>
+                        {
+                            return None;
+                        }
+                        _ => None,
+                    };
+                    let has_shared = shared.is_some() && detached_shared.is_none();
+                    let shared_gated = has_shared && matches!(shared, Some((_, Some(_))));
                     let sgate = match shared {
-                        Some((_, Some(sg))) => gw(sg)?,
-                        // No gate (hy_v3) or no shared expert at all: the
-                        // router weight stands in so the plumbing stays
-                        // total; the select kernels pin weight 1 or skip.
+                        Some((_, Some(sg))) if has_shared => gw(sg)?,
+                        // No gate, no shared expert, or a detached shared
+                        // expert: the router only keeps the binding total;
+                        // the selection shader does not read it.
                         _ => gw(&m.router)?,
                     };
                     let router = gw(&m.router)?;
@@ -12026,7 +12092,6 @@ impl Pipeline {
                         );
                         return None;
                     }
-                    let inter = m.experts.first()?.gate_proj.rows();
                     let mut experts = Vec::with_capacity(m.experts.len() + 1);
                     // q4t or q4tp, but not both in one layer — the kernels
                     // are picked per layer, not per expert.
@@ -12036,7 +12101,12 @@ impl Pipeline {
                     let mut gu_q2: Option<bool> = None;
                     // q8_2f experts (gate, up and down): their own kernels.
                     let mut q82: Option<bool> = None;
-                    for e in m.experts.iter().chain(shared.map(|(se, _)| se)) {
+                    for e in m.experts.iter().chain(
+                        shared
+                            .filter(|_| has_shared)
+                            .map(|(se, _)| se)
+                            .into_iter(),
+                    ) {
                         if !matches!(e.act, Act::Silu)
                             || e.gate_proj.rows() != inter
                             || e.up_proj.rows() != inter
@@ -12153,8 +12223,10 @@ impl Pipeline {
                         gu_q2: gu_q2.unwrap_or(false),
                         q82: q82.unwrap_or(false),
                         sigmoid: m.router_sigmoid,
+                        sigmoid_denom_eps: m.sigmoid_denom_eps,
                         bias: m.expert_bias.as_deref(),
                         has_shared,
+                        detached_shared,
                         shared_gated,
                         route_scale: m.routed_scaling,
                     }
@@ -14095,8 +14167,10 @@ impl Pipeline {
                             gu_q2: gu_q2.unwrap_or(false),
                             q82: q82.unwrap_or(false),
                             sigmoid: m.router_sigmoid,
+                            sigmoid_denom_eps: m.sigmoid_denom_eps,
                             bias: m.expert_bias.as_deref(),
                             has_shared,
+                            detached_shared: None,
                             shared_gated,
                             route_scale: m.routed_scaling,
                         }
@@ -19100,27 +19174,25 @@ impl SendMut {
 /// probabilities, optional renorm — `router_sigmoid=false`, no bias,
 /// scale 1 → bit-identical to the historical path. LFM2-MoE /
 /// DeepSeek-V3 `noaux_tc`: per-expert sigmoid scores, an optional
-/// selection bias (top-k CHOICE only; weights stay unbiased), a 1e-6 renorm
-/// floor and a routed scale. Architectures whose reference uses a different
-/// sigmoid denominator floor (for example GLM-5's `1e-20`) call
-/// [`moe_route_with_eps`] directly; the historical generic path remains
-/// unchanged.
+/// selection bias (top-k CHOICE only; weights stay unbiased), an
+/// architecture-specified renorm floor and a routed scale.  The ordinary
+/// loader contract is `1e-6`; Flint preserves its source's `1e-20`.
 pub(crate) fn moe_route(
     logits: &[f32],
     m: &MoeFfn,
     allowed: Option<&[bool]>,
 ) -> (Vec<usize>, Vec<f32>, f32) {
-    moe_route_with_eps(logits, m, allowed, 1e-6)
+    moe_route_with_eps(logits, m, allowed, m.sigmoid_denom_eps)
 }
 
 /// Router implementation with an explicit sigmoid renormalization floor.
 ///
-/// GLM-5.3's source computes `sum(selected_scores) + 1e-20`; using the
-/// generic 1e-6 floor there is not a harmless tolerance difference when all
-/// logits are very negative: it collapses the routed branch toward zero
-/// instead of normalizing the selected experts. Keeping the epsilon parameter
-/// here avoids changing the established Qwen/LFM2 contract while allowing
-/// each architecture to preserve its own numerical semantics.
+/// Flint's source computes `sum(selected_scores) + 1e-20`; using the generic
+/// 1e-6 floor there is not a harmless tolerance difference when all logits
+/// are very negative: it collapses the routed branch toward zero instead of
+/// normalizing the selected experts. Keeping the epsilon parameter here
+/// avoids changing the established Qwen/LFM2 contract while allowing each
+/// architecture to preserve its own numerical semantics.
 pub(crate) fn moe_route_with_eps(
     logits: &[f32],
     m: &MoeFfn,
@@ -20563,6 +20635,7 @@ mod tests {
             top_k: 1,
             norm_topk_prob: true,
             router_sigmoid: true,
+            sigmoid_denom_eps: 1e-6,
             expert_bias: None,
             routed_scaling: 1.0,
             route_tau: None,
@@ -20625,6 +20698,7 @@ mod tests {
                         top_k: 2,
                         norm_topk_prob: true,
                         router_sigmoid: true,
+                        sigmoid_denom_eps: 1e-6,
                         expert_bias: Some(vec![0.02, -0.03, 0.01, 0.0]),
                         routed_scaling: 1.0,
                         route_tau: None,
@@ -21652,8 +21726,8 @@ mod tests {
 
     #[test]
     fn sigmoid_router_floor_is_explicit_per_architecture() {
-        // GLM-5's noaux_tc reference uses +1e-20 while the generic
-        // LFM2-compatible path uses +1e-6.  At low (but representable)
+        // Flint's reference uses +1e-20 while the generic LFM2-compatible
+        // path uses +1e-6.  At low (but representable)
         // sigmoid scores, silently sharing the latter changes expert weights
         // by orders of magnitude and can make a routed layer look coherent
         // while discarding its expert contribution.
@@ -21671,6 +21745,7 @@ mod tests {
             top_k: 1,
             norm_topk_prob: true,
             router_sigmoid: true,
+            sigmoid_denom_eps: 1e-20,
             expert_bias: None,
             routed_scaling: 2.5,
             route_tau: None,
@@ -21685,11 +21760,11 @@ mod tests {
             grown: Vec::new(),
         };
         let logits = [-20.0f32, -20.0];
-        let (_, p, glm_wsum) = moe_route_with_eps(&logits, &m, None, 1e-20);
-        let (_, _, generic_wsum) = moe_route(&logits, &m, None);
+        let (_, p, flint_wsum) = moe_route(&logits, &m, None);
+        let (_, _, legacy_wsum) = moe_route_with_eps(&logits, &m, None, 1e-6);
         let expected = (p[0] + 1e-20) / m.routed_scaling;
-        assert!((glm_wsum - expected).abs() < 1e-15);
-        assert!(generic_wsum > glm_wsum * 100.0);
+        assert!((flint_wsum - expected).abs() < 1e-15);
+        assert!(legacy_wsum > flint_wsum * 100.0);
     }
 
     #[test]
@@ -21807,6 +21882,7 @@ mod tests {
             top_k: 1,
             norm_topk_prob: true,
             router_sigmoid: sigmoid,
+            sigmoid_denom_eps: 1e-6,
             expert_bias: None,
             routed_scaling: 1.0,
             route_tau: None,
@@ -21873,6 +21949,7 @@ mod tests {
             top_k: 1,
             norm_topk_prob: norm_topk,
             router_sigmoid: false,
+            sigmoid_denom_eps: 1e-6,
             expert_bias: None,
             routed_scaling: 1.0,
             route_tau: None,
