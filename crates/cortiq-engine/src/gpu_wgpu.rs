@@ -20244,6 +20244,18 @@ fn ctx_for(dev: usize) -> Option<&'static Ctx> {
             // Tests install no subscriber, so a tracing-only report makes
             // an init failure look exactly like "no GPU here".
             tracing::warn!("wgpu init failed on device {dev} — CPU fallback: {e}");
+            // On a Linux container the NVIDIA Vulkan ICD needs the GLVND
+            // dispatch libraries (libEGL.so.1 / libGLX.so.0). Without them
+            // the ICD fails to initialize, wgpu reports zero adapters, and
+            // the whole model runs on the CPU — ten times slower, with no
+            // error anywhere else.
+            if cfg!(target_os = "linux") {
+                tracing::warn!(
+                    "if this is a container: the NVIDIA Vulkan ICD needs the GLVND dispatch \
+                     libraries — apt-get install -y libegl1 libgl1 libglx0 libgles2 (then \
+                     `vulkaninfo --summary` must show the GPU)"
+                );
+            }
             if std::env::var("CMF_GPU_DEBUG").is_ok()
                 || std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok()
             {
@@ -66981,12 +66993,18 @@ pub fn dsv4_fetch_defaults() -> (usize, u16) {
     *POLICY.get_or_init(|| {
         let gbs = upload_bandwidth_probe(8 * 1024 * 1024, 4).unwrap_or(0.0);
         let min_seen = if gbs >= 10.0 { 1 } else { 2 };
+        // The quota is how many missing experts a layer may pull in before
+        // the frame runs. On a fast link (>= 10 GB/s) a deeper quota hides
+        // the transfer behind the frame: measured on a 755B DSV4.1-Flash on
+        // one RTX PRO 6000 (Vulkan), the prefill went 3.2 -> 11.8 tok/s at
+        // quota 8, the decode 8.7 -> 9.0. On a slow link the shallow quota
+        // stays: the transfer would then dominate the step.
+        let quota = if gbs >= 10.0 { 8 } else { 1 };
         tracing::info!(
-            "dsv4 refill auto: upload {:.2} GB/s, quota 1, min_seen {}",
-            gbs,
-            min_seen
+            "dsv4 refill auto: upload {:.2} GB/s, quota {quota}, min_seen {min_seen}",
+            gbs
         );
-        (1, min_seen)
+        (quota, min_seen)
     })
 }
 
