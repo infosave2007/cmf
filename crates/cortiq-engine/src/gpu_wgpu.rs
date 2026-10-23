@@ -4111,6 +4111,16 @@ fn cmf_gelu_tanh(x: f32) -> f32 {
     return 0.5 * x * (1.0 + tanh(0.7978846 * (x + 0.044715 * x * x * x)));
 }
 
+// MiniMax M3's SwiGLU-OAI is deliberately a separate activation code rather
+// than a variant of the ordinary swiglu_limit path.  Its gate sigmoid uses
+// alpha 1.702 and its shifted up term means applying the usual clamp first
+// would be observably wrong.
+fn cmf_swiglu_oai_m3(g: f32, u: f32) -> f32 {
+    let gg = min(g, 7.0);
+    let uu = clamp(u, -7.0, 7.0);
+    return (gg / (1.0 + exp(-1.702 * gg))) * (uu + 1.0);
+}
+
 @group(0) @binding(0) var<storage, read>       sg   : array<f32>;
 @group(0) @binding(1) var<storage, read>       su   : array<f32>;
 @group(0) @binding(2) var<storage, read>       scol : array<f32>;
@@ -4121,6 +4131,15 @@ fn silu_mul_pre(@builtin(global_invocation_id) gid: vec3<u32>,
                 @builtin(num_workgroups) nwg: vec3<u32>) {
     let i = gid.x + gid.y * nwg.x * 256u;
     if (i >= snp.n) { return; }
+    // Code 3 is MiniMax M3's SwiGLU-OAI.  Keep it ahead of the historical
+    // limit and GELU arms: its fixed clamp and shifted up value are not the
+    // generic swiglu_limit contract.
+    if (snp._c == 3u) {
+        var v = cmf_swiglu_oai_m3(sg[i], su[i]);
+        if (snp.f == 1u) { v = v * scol[i]; }
+        sact[i] = v;
+        return;
+    }
     var gv = sg[i];
     var uv = su[i];
     // swiglu_limit, and its asymmetry is the reference's: `up` is clamped on
@@ -4132,7 +4151,7 @@ fn silu_mul_pre(@builtin(global_invocation_id) gid: vec3<u32>,
     }
     var v = (gv / (1.0 + exp(-gv))) * uv;
     // `_c` = the dense FFN's activation (`GraphAct::code`): 0 SiLU above,
-    // 1 exact GELU, 2 tanh-GELU.
+    // 1 exact GELU, 2 tanh-GELU. Code 3 returned above.
     if (snp._c == 1u) { v = cmf_gelu_erf(gv) * uv; }
     if (snp._c == 2u) { v = cmf_gelu_tanh(gv) * uv; }
     if (snp.f == 1u) { v = v * scol[i]; }
@@ -4350,8 +4369,12 @@ fn ffn_silu_mul(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.y * (65535u * 256u) + gid.x;
     if (i >= fsp.n) { return; }
     let g = fsg[i];
+    if (fsp._c == 3u) {
+        fsg[i] = cmf_swiglu_oai_m3(g, fsu[i]);
+        return;
+    }
     // `_c` = `GraphAct::code`: 0 SiLU (the historical expression), 1 GELU,
-    // 2 tanh-GELU.
+    // 2 tanh-GELU. Code 3 returned above.
     if (fsp._c == 1u) {
         fsg[i] = cmf_gelu_erf(g) * fsu[i];
     } else if (fsp._c == 2u) {
@@ -10705,13 +10728,17 @@ fn moe_gate_up_q2tp_f(@builtin(workgroup_id) wid: vec3<u32>,
     }
     if (lid == 0u) {
         let g = mg_pg[0];
-        var gg = g;
-        var uu = mg_pu[0];
-        if (mg_p.lim > 0.0) {
-            uu = clamp(uu, -mg_p.lim, mg_p.lim);
-            gg = min(gg, mg_p.lim);
+        if (mg_p.act == 3u) {
+            mg_act[slot * mg_p.inter + row] = cmf_swiglu_oai_m3(g, mg_pu[0]);
+        } else {
+            var gg = g;
+            var uu = mg_pu[0];
+            if (mg_p.lim > 0.0) {
+                uu = clamp(uu, -mg_p.lim, mg_p.lim);
+                gg = min(gg, mg_p.lim);
+            }
+            mg_act[slot * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
         }
-        mg_act[slot * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
     }
 }
 
@@ -11745,12 +11772,14 @@ fn moe_select(@builtin(local_invocation_index) lid: u32) {
 
 // gate+up+SiLU for every selected expert: workgroup (row, slot) does BOTH q4t
 // row dots (they share the activation reads) and writes act = silu(g)·u.
-struct MoeGuP { gpr: u32, inter: u32, slots: u32, mat16: u32 , lim: f32, _p0: u32, _p1: u32, _p2: u32 };
+struct MoeGuP { gpr: u32, inter: u32, slots: u32, mat16: u32 , lim: f32, _p0: u32, _p1: u32, act: u32 };
 // Three scalars, not a vec3: a vec3<u32> aligns to 16 in uniform layout and
 // pushes the struct to 48 bytes, while the buffer handed in is 32.
 // `lim` is DeepSeek-V4's swiglu_limit: the up projection is clamped both
 // ways, the gate only from above. Zero means no clamp, which is every other
 // architecture that reaches these kernels.
+// `act` is `GraphAct::code`.  In particular, code 3 selects MiniMax M3's
+// fixed-clamp, alpha-1.702 SwiGLU-OAI rather than this generic limit.
 @group(0) @binding(0) var<storage, read>       mg_gw  : array<u32>;
 @group(0) @binding(1) var<storage, read>       mg_uw  : array<u32>;
 @group(0) @binding(2) var<storage, read>       mg_x   : array<f32>;
@@ -11824,13 +11853,17 @@ fn moe_gate_up(@builtin(workgroup_id) wid: vec3<u32>,
     }
     if (lid == 0u) {
         let g = mg_pg[0];
-        var gg = g;
-        var uu = mg_pu[0];
-        if (mg_p.lim > 0.0) {
-            uu = clamp(uu, -mg_p.lim, mg_p.lim);
-            gg = min(gg, mg_p.lim);
+        if (mg_p.act == 3u) {
+            mg_act[slot * mg_p.inter + row] = cmf_swiglu_oai_m3(g, mg_pu[0]);
+        } else {
+            var gg = g;
+            var uu = mg_pu[0];
+            if (mg_p.lim > 0.0) {
+                uu = clamp(uu, -mg_p.lim, mg_p.lim);
+                gg = min(gg, mg_p.lim);
+            }
+            mg_act[slot * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
         }
-        mg_act[slot * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
     }
 }
 
@@ -11973,13 +12006,17 @@ fn moe_gate_up_q4tp(@builtin(workgroup_id) wid: vec3<u32>,
     }
     if (lid == 0u) {
         let g = mg_pg[0];
-        var gg = g;
-        var uu = mg_pu[0];
-        if (mg_p.lim > 0.0) {
-            uu = clamp(uu, -mg_p.lim, mg_p.lim);
-            gg = min(gg, mg_p.lim);
+        if (mg_p.act == 3u) {
+            mg_act[slot * mg_p.inter + row] = cmf_swiglu_oai_m3(g, mg_pu[0]);
+        } else {
+            var gg = g;
+            var uu = mg_pu[0];
+            if (mg_p.lim > 0.0) {
+                uu = clamp(uu, -mg_p.lim, mg_p.lim);
+                gg = min(gg, mg_p.lim);
+            }
+            mg_act[slot * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
         }
-        mg_act[slot * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
     }
 }
 
@@ -12092,13 +12129,17 @@ fn moe_gate_up_q2tp(@builtin(workgroup_id) wid: vec3<u32>,
     }
     if (lid == 0u) {
         let g = mg_pg[0];
-        var gg = g;
-        var uu = mg_pu[0];
-        if (mg_p.lim > 0.0) {
-            uu = clamp(uu, -mg_p.lim, mg_p.lim);
-            gg = min(gg, mg_p.lim);
+        if (mg_p.act == 3u) {
+            mg_act[slot * mg_p.inter + row] = cmf_swiglu_oai_m3(g, mg_pu[0]);
+        } else {
+            var gg = g;
+            var uu = mg_pu[0];
+            if (mg_p.lim > 0.0) {
+                uu = clamp(uu, -mg_p.lim, mg_p.lim);
+                gg = min(gg, mg_p.lim);
+            }
+            mg_act[slot * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
         }
-        mg_act[slot * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
     }
 }
 
@@ -12175,13 +12216,17 @@ fn moe_gate_up_q2tp_m(@builtin(workgroup_id) wid: vec3<u32>,
     }
     if (lane == 0u) {
         let g = mgm_pg[sub * 64u];
-        var gg = g;
-        var uu = mgm_pu[sub * 64u];
-        if (mg_p.lim > 0.0) {
-            uu = clamp(uu, -mg_p.lim, mg_p.lim);
-            gg = min(gg, mg_p.lim);
+        if (mg_p.act == 3u) {
+            mg_act[slot * mg_p.inter + row] = cmf_swiglu_oai_m3(g, mgm_pu[sub * 64u]);
+        } else {
+            var gg = g;
+            var uu = mgm_pu[sub * 64u];
+            if (mg_p.lim > 0.0) {
+                uu = clamp(uu, -mg_p.lim, mg_p.lim);
+                gg = min(gg, mg_p.lim);
+            }
+            mg_act[slot * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
         }
-        mg_act[slot * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
     }
 }
 
@@ -12455,12 +12500,13 @@ fn moe_select_b(@builtin(workgroup_id) wid: vec3<u32>,
 }
 
 // gate+up+SiLU with a token axis: workgroup (row, slot, token).
-struct MoeGuBP { gpr: u32, inter: u32, slots: u32, mat16: u32 , lim: f32, _p0: u32, _p1: u32, _p2: u32 };
+struct MoeGuBP { gpr: u32, inter: u32, slots: u32, mat16: u32 , lim: f32, _p0: u32, _p1: u32, act: u32 };
 // Three scalars, not a vec3: a vec3<u32> aligns to 16 in uniform layout and
 // pushes the struct to 48 bytes, while the buffer handed in is 32.
 // `lim` is DeepSeek-V4's swiglu_limit: the up projection is clamped both
 // ways, the gate only from above. Zero means no clamp, which is every other
 // architecture that reaches these kernels.
+// `act` follows `MoeGuP` above; code 3 is MiniMax M3's SwiGLU-OAI.
 @group(0) @binding(0) var<storage, read>       gb_gw  : array<u32>;
 @group(0) @binding(1) var<storage, read>       gb_uw  : array<u32>;
 @group(0) @binding(2) var<storage, read>       gb_x   : array<f32>;
@@ -12544,14 +12590,18 @@ fn moe_gate_up_q4tp_b(@builtin(workgroup_id) wid: vec3<u32>,
     }
     if (lid == 0u) {
         let g = gb_pg[0];
-        var gg = g;
-        var uu = gb_pu[0];
-        if (gb_p.lim > 0.0) {
-            uu = clamp(uu, -gb_p.lim, gb_p.lim);
-            gg = min(gg, gb_p.lim);
+        if (gb_p.act == 3u) {
+            gb_act[(t * gb_p.slots + slot) * gb_p.inter + row] = cmf_swiglu_oai_m3(g, gb_pu[0]);
+        } else {
+            var gg = g;
+            var uu = gb_pu[0];
+            if (gb_p.lim > 0.0) {
+                uu = clamp(uu, -gb_p.lim, gb_p.lim);
+                gg = min(gg, gb_p.lim);
+            }
+            gb_act[(t * gb_p.slots + slot) * gb_p.inter + row] =
+                (gg / (1.0 + exp(-gg))) * uu;
         }
-        gb_act[(t * gb_p.slots + slot) * gb_p.inter + row] =
-            (gg / (1.0 + exp(-gg))) * uu;
     }
 }
 
@@ -12656,14 +12706,19 @@ fn moe_gate_up_q4tp_b_r4(@builtin(workgroup_id) wid: vec3<u32>,
             stride = stride >> 1u;
         }
         if (lid == 0u && row0 + r < rows) {
-            var gg = gb4_pg[0];
-            var uu = gb4_pu[0];
-            if (gb_p.lim > 0.0) {
-                uu = clamp(uu, -gb_p.lim, gb_p.lim);
-                gg = min(gg, gb_p.lim);
+            if (gb_p.act == 3u) {
+                gb_act[(t * gb_p.slots + slot) * gb_p.inter + row0 + r] =
+                    cmf_swiglu_oai_m3(gb4_pg[0], gb4_pu[0]);
+            } else {
+                var gg = gb4_pg[0];
+                var uu = gb4_pu[0];
+                if (gb_p.lim > 0.0) {
+                    uu = clamp(uu, -gb_p.lim, gb_p.lim);
+                    gg = min(gg, gb_p.lim);
+                }
+                gb_act[(t * gb_p.slots + slot) * gb_p.inter + row0 + r] =
+                    (gg / (1.0 + exp(-gg))) * uu;
             }
-            gb_act[(t * gb_p.slots + slot) * gb_p.inter + row0 + r] =
-                (gg / (1.0 + exp(-gg))) * uu;
         }
         workgroupBarrier();
     }
@@ -15547,13 +15602,18 @@ fn bt_moe_gate_up_q2tp(@builtin(workgroup_id) wid: vec3<u32>,
     }
     if (lid == 0u) {
         let g = btg_pg[0];
-        var gg = g;
-        var uu = btg_pu[0];
-        if (mg_p.lim > 0.0) {
-            uu = clamp(uu, -mg_p.lim, mg_p.lim);
-            gg = min(gg, mg_p.lim);
+        if (mg_p.act == 3u) {
+            mg_act[(t * mg_p.slots + slot) * mg_p.inter + row] = cmf_swiglu_oai_m3(g, btg_pu[0]);
+        } else {
+            var gg = g;
+            var uu = btg_pu[0];
+            if (mg_p.lim > 0.0) {
+                uu = clamp(uu, -mg_p.lim, mg_p.lim);
+                gg = min(gg, mg_p.lim);
+            }
+            mg_act[(t * mg_p.slots + slot) * mg_p.inter + row] =
+                (gg / (1.0 + exp(-gg))) * uu;
         }
-        mg_act[(t * mg_p.slots + slot) * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
     }
 }
 
@@ -15636,14 +15696,19 @@ fn bt_moe_gate_up_q2tp_r4(@builtin(workgroup_id) wid: vec3<u32>,
             stride = stride >> 1u;
         }
         if (lid == 0u && row0 + r < rows) {
-            var gg = btg4_pg[0];
-            var uu = btg4_pu[0];
-            if (mg_p.lim > 0.0) {
-                uu = clamp(uu, -mg_p.lim, mg_p.lim);
-                gg = min(gg, mg_p.lim);
+            if (mg_p.act == 3u) {
+                mg_act[(t * mg_p.slots + slot) * mg_p.inter + row0 + r] =
+                    cmf_swiglu_oai_m3(btg4_pg[0], btg4_pu[0]);
+            } else {
+                var gg = btg4_pg[0];
+                var uu = btg4_pu[0];
+                if (mg_p.lim > 0.0) {
+                    uu = clamp(uu, -mg_p.lim, mg_p.lim);
+                    gg = min(gg, mg_p.lim);
+                }
+                mg_act[(t * mg_p.slots + slot) * mg_p.inter + row0 + r] =
+                    (gg / (1.0 + exp(-gg))) * uu;
             }
-            mg_act[(t * mg_p.slots + slot) * mg_p.inter + row0 + r] =
-                (gg / (1.0 + exp(-gg))) * uu;
         }
         workgroupBarrier();
     }
@@ -26504,6 +26569,8 @@ pub fn forward_token_graph(
         up: GMat,
         down: GMat,
         width: usize,
+        /// Routed and detached experts share the layer activation contract.
+        act: u32,
     }
     enum LFfn {
         Dense {
@@ -26528,6 +26595,8 @@ pub fn forward_token_graph(
             n_exp: usize,
             top_k: usize,
             inter: usize,
+            /// `GraphAct::code` for every routed expert.
+            act: u32,
             norm_topk: bool,
             q4tp: bool,
             gu_q2: bool,
@@ -26924,6 +26993,7 @@ pub fn forward_token_graph(
                 n_exp,
                 top_k,
                 inter: mi,
+                act,
                 norm_topk,
                 q4tp,
                 gu_q2,
@@ -26949,9 +27019,13 @@ pub fn forward_token_graph(
                 // q8_2f experts run only on `moe_q82`'s decode pair: refuse
                 // before any upload when it cannot serve this geometry.
                 if *q82
-                    && (!moe_q82::fits(hidden, *mi) || moe_q82::decode(c, hidden).is_none())
+                    && (act.code() == 3
+                        || !moe_q82::fits(hidden, *mi)
+                        || moe_q82::decode(c, hidden).is_none())
                 {
-                    graph_decline("q8_2f MoE experts: no decode kernels for this device/geometry");
+                    graph_decline(
+                        "q8_2f MoE experts: MiniMax M3 activation or decode geometry unsupported",
+                    );
                     return token_graph_outcome(o1_started || state_started, false);
                 }
                 let Some(router) = resolve(router, *n_exp, hidden) else {
@@ -27002,6 +27076,7 @@ pub fn forward_token_graph(
                             up,
                             down,
                             width: shared.width,
+                            act: act.code(),
                         })
                     }
                     None => None,
@@ -27057,6 +27132,7 @@ pub fn forward_token_graph(
                     n_exp: *n_exp,
                     top_k: *top_k,
                     inter: *mi,
+                    act: act.code(),
                     norm_topk: *norm_topk,
                     q4tp: *q4tp,
                     gu_q2: *gu_q2,
@@ -27956,6 +28032,10 @@ pub fn forward_token_graph(
     // The exact-GELU twin (`silu_mul_pre`'s `_c` = 1) for GELU layers.
     let gelu_u = uniform_u32x4(c, [inter as u32, 0, 0, 1]);
     let gelu_tanh_u = uniform_u32x4(c, [inter as u32, 0, 0, 2]);
+    // MiniMax M3's fixed SwiGLU-OAI contract.  Its gate/up fusion is
+    // intentionally left to the ordinary projections plus `silu_mul_pre`:
+    // the older dense fused shaders do not read this activation code.
+    let swiglu_oai_m3_u = uniform_u32x4(c, [inter as u32, 0, 0, 3]);
     let steps = steps.max(1);
     // One uniform PER STEP, with stable identities: write_buffer lands at
     // submit, so a single shared buffer would collapse every step to the
@@ -30150,6 +30230,7 @@ pub fn forward_token_graph(
                     let act_u = match act {
                         0 => &silu_u,
                         2 => &gelu_tanh_u,
+                        3 => &swiglu_oai_m3_u,
                         _ => &gelu_u,
                     };
                     let mut continue_ffn = false;
@@ -30264,6 +30345,12 @@ pub fn forward_token_graph(
                         };
                         let gu_ok = c.use_mv_gu
                             && c.use_mv4
+                            // The dense fused GU shaders only implement
+                            // SiLU/GELU variants. Route M3 through the
+                            // explicit `silu_mul_pre` kernel below so its
+                            // fixed clamp, alpha and shifted up value stay
+                            // exact.
+                            && act != 3
                             && gate.kind == 6
                             && up.kind == 6
                             && gate.prism == crate::gpu::GraphPrismOp::None
@@ -30422,7 +30509,8 @@ pub fn forward_token_graph(
                                 tsp!(pass, fine, 45); // residual + next norm
                                 down_rode_along = true;
                             }
-                        } else if gate.kind == crate::gpu::GRAPH_KIND_BLR
+                        } else if act != 3
+                            && gate.kind == crate::gpu::GRAPH_KIND_BLR
                             && up.kind == crate::gpu::GRAPH_KIND_BLR
                         {
                             // blr gate/up: stage V of both, then stage U
@@ -30490,6 +30578,7 @@ pub fn forward_token_graph(
                     n_exp,
                     top_k,
                     inter: mi,
+                    act,
                     norm_topk,
                     q82: true,
                     sigmoid,
@@ -30501,6 +30590,14 @@ pub fn forward_token_graph(
                     route_scale,
                     ..
                 } => {
+                    // Construction refuses this already, but keep the
+                    // execution arm fail-closed if a future caller builds an
+                    // M3 q8_2f graph directly. moe_q82 has no activation
+                    // uniform and would otherwise run ordinary SiLU.
+                    if *act == 3 {
+                        graph_decline("q8_2f MoE decode lacks MiniMax M3 activation uniform");
+                        return token_graph_outcome(o1_started || state_started, false);
+                    }
                     deferred_shared = detached_shared.as_ref();
                     let (mlogit, mslog, msel, mwt, mact) = moe_bufs.as_ref().unwrap();
                     let slots = *top_k + usize::from(*has_shared);
@@ -30655,6 +30752,7 @@ pub fn forward_token_graph(
                     n_exp,
                     top_k,
                     inter: mi,
+                    act,
                     norm_topk,
                     q4tp,
                     gu_q2,
@@ -30737,8 +30835,8 @@ pub fn forward_token_graph(
                     } else {
                         mat16(*mi, hidden)
                     };
-                    // Eight words now: the fifth is the swiglu limit, zero
-                    // for every architecture but DeepSeek-V4.
+                    // The fifth word is the swiglu limit; the final word is
+                    // `GraphAct::code` for the MoE gate/up kernels.
                     let gu_u = uniform_u32x8(
                         c,
                         [
@@ -30749,7 +30847,7 @@ pub fn forward_token_graph(
                             0,
                             0,
                             0,
-                            0,
+                            *act,
                         ],
                     );
                     let dn_u = uniform_u32x4(
@@ -30808,7 +30906,10 @@ pub fn forward_token_graph(
                     // workgroup, vec4 activations, 16-byte weight words) when
                     // the geometry admits it; `CMF_MOE_R4=0` keeps the
                     // one-row kernels.
-                    let r4 = if *q4tp && !*gu_q2 {
+                    // moe_r4's shaders do not carry the activation code.
+                    // M3 stays on the ordinary q4tp pair below, whose
+                    // uniform explicitly carries code 3.
+                    let r4 = if *q4tp && !*gu_q2 && *act != 3 {
                         moe_r4::decode(c).filter(|_| {
                             moe_r4::fits(hidden, *mi, gu_mat16, mat16(hidden, *mi))
                         })
@@ -31004,6 +31105,7 @@ pub fn forward_token_graph(
                         && bias.is_none()
                         && *route_scale == 1.0
                         && detached_shared.is_none()
+                        && *act != 3
                         && !skip_router;
                     if fold {
                         if let Some((prp, bgr, wr)) = prep(router, &n1, mlogit, *n_exp, hidden) {
@@ -31182,6 +31284,9 @@ pub fn forward_token_graph(
                     && c.use_mv4
                     && shared.gate.kind == 6
                     && shared.up.kind == 6
+                    // dense_mv's fused shader does not carry M3's OAI
+                    // activation contract; use the explicit silu kernel.
+                    && shared.act != 3
                     && hidden % 32 == 0
                     && mv_fuse_gpr_ok(hidden / 32)
                     && c.q4tp_mv16w_probe.is_none();
@@ -31196,7 +31301,7 @@ pub fn forward_token_graph(
                                 &abuf,
                                 shared.width,
                                 hidden,
-                                0,
+                                shared.act,
                             )
                         })
                         .flatten()
@@ -31209,7 +31314,7 @@ pub fn forward_token_graph(
                                 &abuf,
                                 shared.width,
                                 hidden,
-                                0,
+                                shared.act,
                             );
                             Some((gu_pipe(c), b, w))
                         })
@@ -31239,7 +31344,8 @@ pub fn forward_token_graph(
                             ],
                         );
                     }
-                    let shared_silu_u = uniform_u32x4(c, [shared.width as u32, 0, 0, 0]);
+                    let shared_silu_u =
+                        uniform_u32x4(c, [shared.width as u32, 0, 0, shared.act]);
                     go(
                         &mut enc,
                         &c.silu,
@@ -31944,7 +32050,10 @@ pub fn forward_batch_graph_at(
         if let crate::gpu::GraphFfn::Dense { act, .. } = &l.ffn {
             // Gemma-4's tanh-GELU (and exact GELU) ride the act word of
             // the batched act(gate)·up kernel; other models keep SiLU only.
-            if *act != crate::gpu::GraphAct::Silu && !(g4_model && act.code() <= 2) {
+            if *act != crate::gpu::GraphAct::Silu
+                && *act != crate::gpu::GraphAct::SwiGluOaiM3
+                && !(g4_model && act.code() <= 2)
+            {
                 bgraph_refused("non-SiLU dense FFN (no batched arm)");
                 return batch_outcome(o1_started || state_started, false);
             }
@@ -32105,6 +32214,8 @@ pub fn forward_batch_graph_at(
             n_exp: usize,
             top_k: usize,
             inter: usize,
+            /// `GraphAct::code` for every routed expert.
+            act: u32,
             norm_topk: bool,
             q4tp: bool,
             /// Mixed 2-bit profile: q2tp gate/up over a q4tp down. The
@@ -32388,6 +32499,7 @@ pub fn forward_batch_graph_at(
                 n_exp,
                 top_k,
                 inter: mi,
+                act,
                 norm_topk,
                 q4tp,
                 gu_q2,
@@ -32407,12 +32519,15 @@ pub fn forward_batch_graph_at(
                 // q8_2f experts ride only the expert-grouped pair, which
                 // buckets routed experts (no shared slot).
                 if *q82
-                    && (*has_shared
+                    && (act.code() == 3
+                        || *has_shared
                         || !moe_q82::fits(hidden, *mi)
                         || moe_q82::prefill(c).is_none()
                         || moe_r4::prefill(c).is_none())
                 {
-                    bgraph_refused("q8_2f MoE experts: no grouped prefill kernels for this layer");
+                    bgraph_refused(
+                        "q8_2f MoE experts: MiniMax M3 activation or grouped prefill unsupported",
+                    );
                     return batch_outcome(o1_started || state_started, false);
                 }
                 // Without a shared expert the router stands in for the gate
@@ -32450,6 +32565,7 @@ pub fn forward_batch_graph_at(
                     n_exp: *n_exp,
                     top_k: *top_k,
                     inter: *mi,
+                    act: act.code(),
                     norm_topk: *norm_topk,
                     q4tp: *q4tp,
                     gu_q2: *gu_q2,
@@ -34710,6 +34826,7 @@ pub fn forward_batch_graph_at(
                 n_exp,
                 top_k,
                 inter: mi,
+                act,
                 norm_topk,
                 q82: true,
                 sigmoid,
@@ -34719,6 +34836,12 @@ pub fn forward_batch_graph_at(
                 route_scale,
                 ..
             } => {
+                // Keep the q8_2f arm fail-closed even if construction is
+                // bypassed: its grouped shader has no M3 activation field.
+                if *act == 3 {
+                    bgraph_refused("q8_2f MoE prefill lacks MiniMax M3 activation uniform");
+                    return batch_outcome(o1_started || state_started, false);
+                }
                 let (mlogit, _mslog, msel, mwt, mact) = moe_bufs.as_ref().unwrap();
                 let slots = *top_k + usize::from(*has_shared);
                 let (Some(p8), Some(pg)) = (moe_q82::prefill(c), moe_r4::prefill(c)) else {
@@ -34815,6 +34938,7 @@ pub fn forward_batch_graph_at(
                 n_exp,
                 top_k,
                 inter: mi,
+                act,
                 norm_topk,
                 q4tp,
                 gu_q2,
@@ -34892,7 +35016,7 @@ pub fn forward_batch_graph_at(
                         0,
                         0,
                         0,
-                        0,
+                        *act,
                     ],
                 );
                 let dn_u = uniform_u32x4(
@@ -34976,11 +35100,18 @@ pub fn forward_batch_graph_at(
                     // with routed id 255. `bucket_count` hard-limits the
                     // WGSL's 257 counters (256 routed + one shared); any
                     // other layout retains the established batched fallback.
-                    let moeg = moe_r4::prefill(c).and_then(|pg| {
-                        moe_r4::bucket_count(*n_exp, *has_shared).filter(|_| {
-                            moe_r4::fits(hidden, *mi, gu_stride, mat16(hidden, *mi))
-                        }).map(|buckets| (pg, buckets))
-                    });
+                    // The expert-grouped moe_r4 prefill shaders do not read
+                    // the activation code. M3 uses the ordinary batched
+                    // q4tp kernel below, which does.
+                    let moeg = (*act != 3).then(|| {
+                        moe_r4::prefill(c).and_then(|pg| {
+                            moe_r4::bucket_count(*n_exp, *has_shared)
+                                .filter(|_| {
+                                    moe_r4::fits(hidden, *mi, gu_stride, mat16(hidden, *mi))
+                                })
+                                .map(|buckets| (pg, buckets))
+                        })
+                    }).flatten();
                     let mut pass = begin_pass(&mut enc);
                     pass.set_pipeline(&c.moe_select_b);
                     pass.set_bind_group(0, &bg_sel, &[]);
@@ -42618,7 +42749,8 @@ pub static GEMM_MANY_NS: [std::sync::atomic::AtomicU64; 2] =
 /// The LLM prefill's dense FFN with separate gate, up and down weights in
 /// any codec that has a device GEMM (`q8_row`, `q8_2f`, `q4tp`, mixed): the
 /// gate and up panels stay on the card, the activation folds them there
-/// (`ffn_silu_mul`: 0 SiLU, 1 exact GELU), and down reads the folded panel
+/// (`ffn_silu_mul`: 0 SiLU, 1 exact GELU, 2 tanh-GELU, 3 MiniMax M3
+/// SwiGLU-OAI), and down reads the folded panel
 /// from the card. One readback instead of three, and no host pass over the
 /// two b·inter panels — which on a q8_2f prefill cost more than the GEMMs.
 #[allow(clippy::too_many_arguments)]
@@ -42639,7 +42771,7 @@ pub fn ffn_act_keep(
     let _op = c.op_gate.enter();
     let panel = (b * inter * 4) as u64;
     if b == 0
-        || act > 2
+        || act > 3
         || xs.len() < b * hidden
         || out.len() < b * hidden
         || panel > PANEL_BUDGET_BYTES as u64
@@ -43231,7 +43363,8 @@ pub fn q4tp_ffn(
 }
 
 /// `q4t_ffn` / `q4tp_ffn` with the activation of act(gate)·up named
-/// (`GraphAct::code`: 0 SiLU — the plain entry points — 1 exact GELU).
+/// (`GraphAct::code`: 0 SiLU — the plain entry points — 1 exact GELU, 2
+/// tanh-GELU, 3 MiniMax M3 SwiGLU-OAI).
 #[allow(clippy::too_many_arguments)]
 pub fn q4_ffn_act(
     model: &Arc<CmfModel>,
@@ -43265,7 +43398,7 @@ fn ffn_q4(
 ) -> bool {
     let Some(c) = ctx() else { return false };
     let _op = c.op_gate.enter();
-    if hidden % 32 != 0 || inter % 32 != 0 || b == 0 || act > 2 {
+    if hidden % 32 != 0 || inter % 32 != 0 || b == 0 || act > 3 {
         return false;
     }
     let bytes = model.primary_bytes();
@@ -43343,7 +43476,8 @@ fn ffn_q4(
     // one rewritable buffer cannot serve them.
     let p13 = uniform_u32x4(c, [(hidden / 4) as u32, inter as u32, b as u32, 0]);
     let p2 = uniform_u32x4(c, [(inter / 4) as u32, hidden as u32, b as u32, 0]);
-    // `_c` = the activation (`ffn_silu_mul`: 0 SiLU, 1 exact GELU).
+    // `_c` = the activation (`ffn_silu_mul`: 0 SiLU, 1 exact GELU,
+    // 2 tanh-GELU, 3 MiniMax M3 SwiGLU-OAI).
     let psilu = uniform_u32x4(c, [(b * inter) as u32, 0, 0, act]);
     let mm = mm_pipeline(c, q4tp, false);
     let mm_layout = mm.get_bind_group_layout(0);
@@ -53002,6 +53136,240 @@ fn main() {
     fn wgpu_q4tp_matvec16w_gu_gelu_tanh_matches_three_dispatches() {
         gu_matches_three_dispatches(4096, 2);
         gu_matches_three_dispatches(2048, 2);
+    }
+
+    /// MiniMax M3's OAI arm must travel in the q4tp MoE uniform, rather than
+    /// taking the old SiLU/r4 shortcut. Exercise the token and token-axis
+    /// shaders, plus the direct dense `ffn_silu_mul` shader, against the
+    /// standalone `silu_mul_pre` result and fixed clamp/alpha host formula.
+    #[test]
+    fn wgpu_q4tp_moe_oai_matches_standalone_token_and_batch() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping");
+            return;
+        };
+        let _op = c.op_gate.enter();
+        let (inter, hidden, batch) = (32usize, 32usize, 2usize);
+        let mk_w = |seed: usize| -> Vec<u8> {
+            let total = cortiq_core::quant::expected_nbytes(
+                cortiq_core::TensorDtype::Q4TiledP,
+                &[inter, hidden],
+            )
+            .unwrap();
+            let (params_off, _, _) = cortiq_core::quant::q4tp_sections(inter, hidden);
+            let mut bytes: Vec<u8> = (0..total)
+                .map(|i| ((i * 37 + seed * 11) % 251) as u8)
+                .collect();
+            let lo = cortiq_core::quant::f32_to_f16(-4.0);
+            let step = cortiq_core::quant::f32_to_f16(0.25);
+            for row in 0..inter {
+                let off = params_off + row * 4;
+                bytes[off..off + 2].copy_from_slice(&lo.to_le_bytes());
+                bytes[off + 2..off + 4].copy_from_slice(&step.to_le_bytes());
+            }
+            bytes
+        };
+        let (gate_w, up_w) = (mk_w(1), mk_w(2));
+        let xs: Vec<f32> = (0..batch * hidden)
+            .map(|i| ((i * 17 % 19) as f32 - 9.0) * 0.7)
+            .collect();
+        let mk = |bytes: &[u8]| {
+            c.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytes,
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let out = |n: usize| {
+            c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (n * std::mem::size_of::<f32>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let (gate, up) = (mk(&gate_w), mk(&up_w));
+        let x0 = mk(bytemuck::cast_slice(&xs[..hidden]));
+        let x1 = mk(bytemuck::cast_slice(&xs[hidden..]));
+        let xb = mk(bytemuck::cast_slice(&xs));
+        let sel0 = mk(bytemuck::cast_slice(&[0u32]));
+        let selb = mk(bytemuck::cast_slice(&[0u32; 2]));
+        let (g0, u0, g1, u1) = (out(inter), out(inter), out(inter), out(inter));
+        let (standalone0, standalone1) = (out(inter), out(inter));
+        let ffn = out(inter);
+        let (token, batched) = (out(inter), out(batch * inter));
+        let dummy = out(1);
+        let act_u = uniform_u32x4(c, [inter as u32, 0, 0, 3]);
+        let moe_u = uniform_u32x8(
+            c,
+            [
+                (hidden / 32) as u32,
+                inter as u32,
+                1,
+                (gate_w.len() / 2) as u32,
+                0,
+                0,
+                0,
+                3,
+            ],
+        );
+        let silu_bg = |g: &wgpu::Buffer, u: &wgpu::Buffer, y: &wgpu::Buffer| {
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &c.layout_silu,
+                entries: &[
+                    bind_buf(0, g),
+                    bind_buf(1, u),
+                    bind_buf(2, &dummy),
+                    bind_buf(3, y),
+                    bind_buf(4, &act_u),
+                ],
+            })
+        };
+        let ffn_bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.ffn_silu.get_bind_group_layout(0),
+            entries: &[bind_buf(0, &ffn), bind_buf(1, &u0), bind_buf(2, &act_u)],
+        });
+        let token_bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.layout_moe_gu_q4tp,
+            entries: &[
+                bind_buf(0, &gate),
+                bind_buf(1, &up),
+                bind_buf(2, &x0),
+                bind_buf(3, &sel0),
+                bind_buf(4, &token),
+                bind_buf(5, &moe_u),
+            ],
+        });
+        let batch_bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.layout_moe_gu_b,
+            entries: &[
+                bind_buf(0, &gate),
+                bind_buf(1, &up),
+                bind_buf(2, &xb),
+                bind_buf(3, &selb),
+                bind_buf(4, &batched),
+                bind_buf(5, &moe_u),
+            ],
+        });
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        for (x, g, u) in [(&x0, &g0, &u0), (&x1, &g1, &u1)] {
+            encode_q4tp_mv4(c, &mut enc, &gate, x, g, inter, hidden);
+            encode_q4tp_mv4(c, &mut enc, &up, x, u, inter, hidden);
+        }
+        enc.copy_buffer_to_buffer(
+            &g0,
+            0,
+            &ffn,
+            0,
+            (inter * std::mem::size_of::<f32>()) as u64,
+        );
+        {
+            let mut pass = begin_pass(&mut enc);
+            for bg in [silu_bg(&g0, &u0, &standalone0), silu_bg(&g1, &u1, &standalone1)] {
+                pass.set_pipeline(&c.silu);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups((inter as u32).div_ceil(256), 1, 1);
+            }
+            pass.set_pipeline(&c.moe_gate_up_q4tp);
+            pass.set_bind_group(0, &token_bg, &[]);
+            pass.dispatch_workgroups(inter as u32, 1, 1);
+            pass.set_pipeline(&c.moe_gate_up_q4tp_b);
+            pass.set_bind_group(0, &batch_bg, &[]);
+            pass.dispatch_workgroups(inter as u32, 1, batch as u32);
+            pass.set_pipeline(&c.ffn_silu);
+            pass.set_bind_group(0, &ffn_bg, &[]);
+            pass.dispatch_workgroups((inter as u32).div_ceil(256), 1, 1);
+        }
+        let stage_words = 10 * inter;
+        let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (stage_words * std::mem::size_of::<f32>()) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut offset = 0u64;
+        for (src, words) in [
+            (&token, inter),
+            (&batched, batch * inter),
+            (&standalone0, inter),
+            (&standalone1, inter),
+            (&ffn, inter),
+            (&g0, inter),
+            (&u0, inter),
+            (&g1, inter),
+            (&u1, inter),
+        ] {
+            flush_pass(&enc);
+            let bytes = (words * std::mem::size_of::<f32>()) as u64;
+            enc.copy_buffer_to_buffer(src, 0, &stage, offset, bytes);
+            offset += bytes;
+        }
+        submit(c, finish_enc(enc));
+        let slice = stage.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        let data = slice.get_mapped_range().expect("map");
+        let all: &[f32] = bytemuck::cast_slice(&data);
+        let (token_out, rest) = all.split_at(inter);
+        let (batch_out, rest) = rest.split_at(batch * inter);
+        let (standalone0_out, rest) = rest.split_at(inter);
+        let (standalone1_out, rest) = rest.split_at(inter);
+        let (ffn_out, rest) = rest.split_at(inter);
+        let (g0_out, rest) = rest.split_at(inter);
+        let (u0_out, rest) = rest.split_at(inter);
+        let (g1_out, u1_out) = rest.split_at(inter);
+        let oai = |g: f32, u: f32| {
+            let g = g.min(7.0);
+            let u = u.clamp(-7.0, 7.0);
+            (g / (1.0 + (-1.702 * g).exp())) * (u + 1.0)
+        };
+        let close = |got: f32, want: f32| (got - want).abs() <= 5e-5 * (1.0 + want.abs());
+        let mut saturated = false;
+        for ((&got, &standalone), (&g, &u)) in token_out
+            .iter()
+            .zip(standalone0_out)
+            .zip(g0_out.iter().zip(u0_out))
+        {
+            saturated |= g > 7.0 || u.abs() > 7.0;
+            assert!(close(got, standalone), "token MoE differs from standalone: {got} vs {standalone}");
+            assert!(close(standalone, oai(g, u)), "standalone M3 formula mismatch: {standalone} vs {}", oai(g, u));
+        }
+        for (&got, &standalone) in ffn_out.iter().zip(standalone0_out) {
+            assert!(
+                close(got, standalone),
+                "dense ffn activation differs from standalone: {got} vs {standalone}"
+            );
+        }
+        for ((&got, &standalone), (&g, &u)) in batch_out[..inter]
+            .iter()
+            .zip(standalone0_out)
+            .zip(g0_out.iter().zip(u0_out))
+        {
+            assert!(close(got, standalone), "batch token 0 differs from standalone: {got} vs {standalone}");
+            assert!(close(got, oai(g, u)), "batch token 0 M3 formula mismatch: {got} vs {}", oai(g, u));
+        }
+        for ((&got, &standalone), (&g, &u)) in batch_out[inter..]
+            .iter()
+            .zip(standalone1_out)
+            .zip(g1_out.iter().zip(u1_out))
+        {
+            saturated |= g > 7.0 || u.abs() > 7.0;
+            assert!(close(got, standalone), "batch token 1 differs from standalone: {got} vs {standalone}");
+            assert!(close(got, oai(g, u)), "batch token 1 M3 formula mismatch: {got} vs {}", oai(g, u));
+        }
+        assert!(saturated, "test vectors did not exercise the MiniMax OAI clamps");
+        drop(data);
+        stage.unmap();
     }
 
     fn gu_matches_three_dispatches(cols: usize, act_code: u32) {
