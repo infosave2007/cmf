@@ -539,13 +539,12 @@ pub(crate) fn build_ffn_at(
         route_tau,
         norm_topk_prob: cfg.norm_topk_prob,
         router_sigmoid: cfg.router_sigmoid,
-        // Source-specific selected-sigmoid renormalization law.  Recursive
-        // Flint carries `sum + 1e-20`, while MiniMax M3.1 divides by the
-        // selected FP32 sum exactly; the older LFM2/DeepSeek noaux contract
-        // keeps its established `+1e-6` floor.
+        // Source-specific selected-sigmoid renormalization law. Recursive
+        // Flint and MiniMax M3.1 both preserve their reference runtime's
+        // FP32 `sum + 1e-20`; the older LFM2/DeepSeek noaux contract keeps
+        // its established `+1e-6` floor.
         sigmoid_denom_eps: match arch.arch_name.as_str() {
-            "flint" => 1e-20,
-            "minimax_m3_vl" => 0.0,
+            "flint" | "minimax_m3_vl" => 1e-20,
             _ => 1e-6,
         },
         expert_bias,

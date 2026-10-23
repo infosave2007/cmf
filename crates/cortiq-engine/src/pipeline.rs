@@ -660,9 +660,9 @@ pub struct MoeFfn {
     pub router_sigmoid: bool,
     /// Addend in the selected-score denominator of a sigmoid router.
     /// Most supported checkpoints use the historical `1e-6` floor; Flint's
-    /// reference routing uses `1e-20`, while MiniMax M3.1 divides by the
-    /// selected FP32 sum exactly (`0.0`).  This is per-MoE rather than a global
-    /// family switch because the same sigmoid routing law has all contracts.
+    /// reference routing uses `1e-20`; MiniMax M3.1 preserves the same FP32
+    /// `sum + 1e-20` law. This is per-MoE rather than a global family switch
+    /// because the same sigmoid routing law has several contracts.
     pub sigmoid_denom_eps: f32,
     /// Per-expert selection bias `mlp.expert_bias` [num_experts]
     /// (LFM2-MoE): added to the sigmoid scores for the top-k CHOICE only;
@@ -19499,8 +19499,8 @@ impl SendMut {
 /// DeepSeek-V3 `noaux_tc`: per-expert sigmoid scores, an optional
 /// selection bias (top-k CHOICE only; weights stay unbiased), an
 /// architecture-specified renorm floor and a routed scale.  The ordinary
-/// loader contract is `1e-6`; Flint preserves its source's `1e-20`, while
-/// MiniMax M3.1 uses the exact selected-score sum (`0.0`).
+/// loader contract is `1e-6`; Flint and MiniMax M3.1 preserve their
+/// reference runtime's selected-score `sum + 1e-20`.
 pub(crate) fn moe_route(
     logits: &[f32],
     m: &MoeFfn,
@@ -22302,11 +22302,11 @@ mod tests {
 
     #[test]
     fn sigmoid_router_floor_is_explicit_per_architecture() {
-        // Flint's reference uses +1e-20; MiniMax M3.1 divides by exactly the
-        // selected FP32 sum, while the generic LFM2-compatible path uses
-        // +1e-6.  At low (but representable) sigmoid scores, silently sharing
-        // the latter changes expert weights by orders of magnitude and can make
-        // a routed layer look coherent while discarding its expert contribution.
+        // Flint and MiniMax M3.1 reference runtimes use +1e-20, while the
+        // generic LFM2-compatible path uses +1e-6. At low (but representable)
+        // sigmoid scores, silently sharing the latter changes expert weights by
+        // orders of magnitude and can make a routed layer look coherent while
+        // discarding its expert contribution.
         let zero = || DenseFfn {
             gate_proj: QTensor::from_f32(vec![0.0; 4], 2, 2),
             up_proj: QTensor::from_f32(vec![0.0; 4], 2, 2),
@@ -22337,12 +22337,11 @@ mod tests {
         };
         let logits = [-20.0f32, -20.0];
         let (_, p, flint_wsum) = moe_route(&logits, &m, None);
-        let (_, _, minimax_wsum) = moe_route_with_eps(&logits, &m, None, 0.0);
+        let (_, _, minimax_wsum) = moe_route_with_eps(&logits, &m, None, 1e-20);
         let (_, _, legacy_wsum) = moe_route_with_eps(&logits, &m, None, 1e-6);
-        let flint_expected = (p[0] + 1e-20) / m.routed_scaling;
-        let minimax_expected = p[0] / m.routed_scaling;
-        assert!((flint_wsum - flint_expected).abs() < 1e-15);
-        assert_eq!(minimax_wsum.to_bits(), minimax_expected.to_bits());
+        let reference_expected = (p[0] + 1e-20) / m.routed_scaling;
+        assert!((flint_wsum - reference_expected).abs() < 1e-15);
+        assert_eq!(minimax_wsum.to_bits(), reference_expected.to_bits());
         assert!(legacy_wsum > minimax_wsum * 100.0);
     }
 
