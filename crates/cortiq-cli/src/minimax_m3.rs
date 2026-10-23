@@ -7,8 +7,9 @@
 //! separate prevents a future generic decoder path from silently accepting an
 //! incompatible M3 checkpoint.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{ensure, Context, Result};
 use serde_json::Value;
+use std::collections::HashMap;
 
 pub(crate) const MINIMAX_M3_MODEL_TYPE: &str = "minimax_m3_vl";
 const MINIMAX_M3_ARCHITECTURE: &str = "MiniMaxM3SparseForConditionalGeneration";
@@ -37,6 +38,315 @@ pub(crate) struct MiniMaxM3Layout {
     pub sparse_num_index_heads: usize,
     pub sparse_topk_blocks: usize,
     pub sparse_block_size: usize,
+}
+
+/// Header-only view of a source safetensors entry.
+///
+/// This deliberately does not borrow the converter's `TensorMeta` type.  The
+/// contract remains usable with a streamed shard index (and unit tests) while
+/// `convert` can create these cheap views directly from its mmap metadata.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MiniMaxM3TensorRef<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) dtype: &'a str,
+    pub(crate) shape: &'a [usize],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TensorSignature {
+    dtype: &'static str,
+    shape: Vec<usize>,
+}
+
+fn add_expected(
+    expected: &mut HashMap<String, TensorSignature>,
+    name: impl Into<String>,
+    dtype: &'static str,
+    shape: impl Into<Vec<usize>>,
+) {
+    let name = name.into();
+    assert!(
+        expected
+            .insert(
+                name.clone(),
+                TensorSignature {
+                    dtype,
+                    shape: shape.into(),
+                },
+            )
+            .is_none(),
+        "MiniMax-M3.1 built duplicate source contract entry {name}"
+    );
+}
+
+fn add_mxfp8_matrix(
+    expected: &mut HashMap<String, TensorSignature>,
+    name: &str,
+    rows: usize,
+    cols: usize,
+) {
+    // The public M3 checkpoint uses MXFP8 E4M3 with a [1, 32] UE8M0 scale
+    // grid.  Keep this next to the name contract: accepting an ordinary FP8
+    // matrix here would make the converter decode silently incorrect values.
+    assert_eq!(cols % 32, 0, "MXFP8 source columns must be 32-aligned");
+    add_expected(expected, name, "F8_E4M3", [rows, cols]);
+    add_expected(
+        expected,
+        format!("{name}_scale_inv"),
+        "U8",
+        [rows, cols / 32],
+    );
+}
+
+fn add_ct_nvfp4_matrix(
+    expected: &mut HashMap<String, TensorSignature>,
+    name: &str,
+    rows: usize,
+    cols: usize,
+) {
+    // `name` is the source prefix ending in `.w1` / `.w2` / `.w3`.  The
+    // compressed-tensors NVFP4 payload is packed two E2M1 values/byte and
+    // uses one E4M3 scale per 16 logical values.  The global/input scales are
+    // intentionally scalar F32 tensors, not one-element vectors.
+    assert_eq!(cols % 16, 0, "NVFP4 source columns must be 16-aligned");
+    add_expected(
+        expected,
+        format!("{name}.weight_packed"),
+        "U8",
+        [rows, cols / 2],
+    );
+    add_expected(
+        expected,
+        format!("{name}.weight_scale"),
+        "F8_E4M3",
+        [rows, cols / 16],
+    );
+    add_expected(expected, format!("{name}.weight_global_scale"), "F32", []);
+    add_expected(expected, format!("{name}.input_global_scale"), "F32", []);
+}
+
+fn expected_text_tensors(layout: &MiniMaxM3Layout) -> HashMap<String, TensorSignature> {
+    let mut expected = HashMap::with_capacity(89_109);
+    let h = layout.hidden_size;
+    let attn_q = layout.num_attention_heads * layout.head_dim;
+    let attn_kv = layout.num_key_value_heads * layout.head_dim;
+    let index_q = layout.sparse_num_index_heads * layout.sparse_index_dim;
+    // MiniMax's source contains one index-K head, not one per index-Q head.
+    let index_k = layout.sparse_index_dim;
+
+    add_expected(
+        &mut expected,
+        "language_model.lm_head.weight",
+        "BF16",
+        [layout.vocab_size, h],
+    );
+    add_expected(
+        &mut expected,
+        "language_model.model.embed_tokens.weight",
+        "BF16",
+        [layout.vocab_size, h],
+    );
+    add_expected(
+        &mut expected,
+        "language_model.model.norm.weight",
+        "BF16",
+        [h],
+    );
+
+    for layer in 0..layout.num_hidden_layers {
+        let prefix = format!("language_model.model.layers.{layer}");
+        add_expected(
+            &mut expected,
+            format!("{prefix}.input_layernorm.weight"),
+            "BF16",
+            [h],
+        );
+        add_expected(
+            &mut expected,
+            format!("{prefix}.post_attention_layernorm.weight"),
+            "BF16",
+            [h],
+        );
+
+        // Per-head Gemma RMSNorm stores a single head-width vector, rather
+        // than the concatenated Q/K projection width.
+        for norm in ["q_norm", "k_norm", "index_q_norm", "index_k_norm"] {
+            add_expected(
+                &mut expected,
+                format!("{prefix}.self_attn.{norm}.weight"),
+                "BF16",
+                [layout.head_dim],
+            );
+        }
+
+        for (projection, rows) in [
+            ("q_proj", attn_q),
+            ("k_proj", attn_kv),
+            ("v_proj", attn_kv),
+            ("o_proj", h),
+            ("index_q_proj", index_q),
+            ("index_k_proj", index_k),
+        ] {
+            let cols = if projection == "o_proj" { attn_q } else { h };
+            add_mxfp8_matrix(
+                &mut expected,
+                &format!("{prefix}.self_attn.{projection}.weight"),
+                rows,
+                cols,
+            );
+        }
+
+        if layer < 3 {
+            for (projection, rows, cols) in [
+                ("gate_proj", layout.dense_intermediate_size, h),
+                ("up_proj", layout.dense_intermediate_size, h),
+                ("down_proj", h, layout.dense_intermediate_size),
+            ] {
+                add_mxfp8_matrix(
+                    &mut expected,
+                    &format!("{prefix}.mlp.{projection}.weight"),
+                    rows,
+                    cols,
+                );
+            }
+        } else {
+            let moe = format!("{prefix}.block_sparse_moe");
+            add_expected(
+                &mut expected,
+                format!("{moe}.gate.weight"),
+                "F32",
+                [layout.num_local_experts, h],
+            );
+            add_expected(
+                &mut expected,
+                format!("{moe}.e_score_correction_bias"),
+                "F32",
+                [layout.num_local_experts],
+            );
+            for (projection, rows, cols) in [
+                ("gate_proj", layout.shared_intermediate_size, h),
+                ("up_proj", layout.shared_intermediate_size, h),
+                ("down_proj", h, layout.shared_intermediate_size),
+            ] {
+                add_mxfp8_matrix(
+                    &mut expected,
+                    &format!("{moe}.shared_experts.{projection}.weight"),
+                    rows,
+                    cols,
+                );
+            }
+            for expert in 0..layout.num_local_experts {
+                let expert_prefix = format!("{moe}.experts.{expert}");
+                add_ct_nvfp4_matrix(
+                    &mut expected,
+                    &format!("{expert_prefix}.w1"),
+                    layout.intermediate_size,
+                    h,
+                );
+                add_ct_nvfp4_matrix(
+                    &mut expected,
+                    &format!("{expert_prefix}.w2"),
+                    h,
+                    layout.intermediate_size,
+                );
+                add_ct_nvfp4_matrix(
+                    &mut expected,
+                    &format!("{expert_prefix}.w3"),
+                    layout.intermediate_size,
+                    h,
+                );
+            }
+        }
+    }
+
+    debug_assert_eq!(expected.len(), 89_109);
+    expected
+}
+
+/// Validate the full published MiniMax-M3.1 safetensors *header index*.
+///
+/// This is intentionally run before conversion opens/consumes a large source
+/// shard.  It rejects a checkpoint with a changed text tensor name, dtype,
+/// shape, companion, expert, or duplicate.  The non-text roots are counted
+/// too, so a different multimodal checkpoint cannot accidentally masquerade
+/// as this exact source.  The converter may choose not to emit vision tensors
+/// until their runtime is implemented, but it must never silently accept an
+/// unreviewed source layout.
+#[allow(dead_code)] // invoked by `convert` when the dedicated M3 route lands.
+pub(crate) fn validate_minimax_m3_source_index<'a>(
+    layout: &MiniMaxM3Layout,
+    tensors: impl IntoIterator<Item = MiniMaxM3TensorRef<'a>>,
+) -> Result<()> {
+    let mut expected = expected_text_tensors(layout);
+    let mut external_counts = HashMap::<&str, usize>::new();
+    let mut total = 0usize;
+
+    for tensor in tensors {
+        total += 1;
+        if tensor.name.starts_with("language_model.") {
+            let Some(signature) = expected.remove(tensor.name) else {
+                anyhow::bail!(
+                    "MiniMax-M3.1 source contract: unexpected or duplicate text tensor {}",
+                    tensor.name
+                );
+            };
+            ensure!(
+                tensor.dtype == signature.dtype,
+                "MiniMax-M3.1 source contract: {} dtype is {}, expected {}",
+                tensor.name,
+                tensor.dtype,
+                signature.dtype
+            );
+            ensure!(
+                tensor.shape == signature.shape.as_slice(),
+                "MiniMax-M3.1 source contract: {} shape is {:?}, expected {:?}",
+                tensor.name,
+                tensor.shape,
+                signature.shape
+            );
+        } else {
+            let root = if tensor.name.starts_with("vision_tower.") {
+                "vision_tower"
+            } else if tensor.name.starts_with("multi_modal_projector.") {
+                "multi_modal_projector"
+            } else if tensor.name.starts_with("patch_merge_mlp.") {
+                "patch_merge_mlp"
+            } else {
+                anyhow::bail!(
+                    "MiniMax-M3.1 source contract: unexpected non-text tensor {}",
+                    tensor.name
+                );
+            };
+            *external_counts.entry(root).or_default() += 1;
+        }
+    }
+
+    ensure!(
+        expected.is_empty(),
+        "MiniMax-M3.1 source contract: missing {} expected text tensor(s), first: {}",
+        expected.len(),
+        expected.keys().next().expect("non-empty map has first key")
+    );
+    for (root, expected_count) in [
+        ("vision_tower", 515usize),
+        ("multi_modal_projector", 4),
+        ("patch_merge_mlp", 4),
+    ] {
+        let actual = external_counts.remove(root).unwrap_or_default();
+        ensure!(
+            actual == expected_count,
+            "MiniMax-M3.1 source contract: {root} has {actual} tensors, expected {expected_count}"
+        );
+    }
+    ensure!(
+        external_counts.is_empty(),
+        "MiniMax-M3.1 source contract: unexpected source root"
+    );
+    ensure!(
+        total == 89_632,
+        "MiniMax-M3.1 source contract: checkpoint has {total} tensors, expected 89632"
+    );
+    Ok(())
 }
 
 fn object<'a>(value: &'a Value, label: &str) -> Result<&'a serde_json::Map<String, Value>> {
@@ -275,6 +585,23 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[derive(Clone, Debug)]
+    struct OwnedTensor {
+        name: String,
+        dtype: String,
+        shape: Vec<usize>,
+    }
+
+    impl OwnedTensor {
+        fn as_ref(&self) -> MiniMaxM3TensorRef<'_> {
+            MiniMaxM3TensorRef {
+                name: &self.name,
+                dtype: &self.dtype,
+                shape: &self.shape,
+            }
+        }
+    }
+
     fn published_config() -> Value {
         let mut moe_layer_freq = vec![0i64; 3];
         moe_layer_freq.extend(std::iter::repeat_n(1, 57));
@@ -324,6 +651,41 @@ mod tests {
         })
     }
 
+    fn published_source_index() -> Vec<OwnedTensor> {
+        let layout = parse_minimax_m3_layout(&published_config()).unwrap();
+        let mut tensors: Vec<_> = expected_text_tensors(&layout)
+            .into_iter()
+            .map(|(name, signature)| OwnedTensor {
+                name,
+                dtype: signature.dtype.to_owned(),
+                shape: signature.shape,
+            })
+            .collect();
+        // The current public source has 523 multimodal tensors.  Its text
+        // conversion route ignores those payloads, but the source identity is
+        // still pinned by their root/counts.
+        for (root, count) in [
+            ("vision_tower", 515usize),
+            ("multi_modal_projector", 4),
+            ("patch_merge_mlp", 4),
+        ] {
+            for index in 0..count {
+                tensors.push(OwnedTensor {
+                    name: format!("{root}.contract_fixture_{index}"),
+                    dtype: "BF16".to_owned(),
+                    shape: vec![1],
+                });
+            }
+        }
+        assert_eq!(tensors.len(), 89_632);
+        tensors
+    }
+
+    fn validate_owned_source(tensors: &[OwnedTensor]) -> Result<()> {
+        let layout = parse_minimax_m3_layout(&published_config())?;
+        validate_minimax_m3_source_index(&layout, tensors.iter().map(OwnedTensor::as_ref))
+    }
+
     #[test]
     fn accepts_published_text_backbone_contract() {
         let layout = parse_minimax_m3_layout(&published_config()).unwrap();
@@ -355,5 +717,45 @@ mod tests {
         config["text_config"]["hidden_act"] = json!("silu");
         let err = parse_minimax_m3_layout(&config).unwrap_err().to_string();
         assert!(err.contains("hidden_act"), "{err}");
+    }
+
+    #[test]
+    fn accepts_exact_published_source_index_taxonomy() {
+        let tensors = published_source_index();
+        validate_owned_source(&tensors).unwrap();
+    }
+
+    #[test]
+    fn source_index_rejects_wrong_mxfp8_companion_shape() {
+        let mut tensors = published_source_index();
+        let tensor = tensors
+            .iter_mut()
+            .find(|tensor| {
+                tensor.name == "language_model.model.layers.0.self_attn.q_proj.weight_scale_inv"
+            })
+            .unwrap();
+        tensor.shape = vec![8192, 191];
+        let err = validate_owned_source(&tensors).unwrap_err().to_string();
+        assert!(err.contains("q_proj.weight_scale_inv"), "{err}");
+        assert!(err.contains("shape"), "{err}");
+    }
+
+    #[test]
+    fn source_index_rejects_missing_routed_expert_companion() {
+        let mut tensors = published_source_index();
+        tensors.retain(|tensor| {
+            tensor.name
+                != "language_model.model.layers.3.block_sparse_moe.experts.0.w1.weight_global_scale"
+        });
+        let err = validate_owned_source(&tensors).unwrap_err().to_string();
+        assert!(err.contains("missing"), "{err}");
+    }
+
+    #[test]
+    fn source_index_rejects_unknown_text_tensor() {
+        let mut tensors = published_source_index();
+        tensors[0].name = "language_model.model.layers.0.unreviewed.weight".to_owned();
+        let err = validate_owned_source(&tensors).unwrap_err().to_string();
+        assert!(err.contains("unexpected"), "{err}");
     }
 }
