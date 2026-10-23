@@ -8548,6 +8548,53 @@ impl Pipeline {
         }
     }
 
+    /// This is the encoder counterpart to `forward_ids`: it runs a fresh
+    /// sequence through the existing full/GDN hybrid stack and returns the
+    /// final RMS-normalized hidden row for *every* token.  It is used by
+    /// component pipelines whose text tower intentionally has no LM head
+    /// (such as an image-conditioner Qwen3.5 model).  The sequence state is
+    /// always released before returning, so a large text tower can be dropped
+    /// immediately after conditioning a subsequent stage.
+    pub fn encode_hidden_states(&mut self, ids: &[u32]) -> Result<Vec<f32>, String> {
+        #[cfg(target_os = "macos")]
+        crate::gpu_metal::set_io_namespace(self.graph_kv_id);
+        if ids.is_empty() {
+            return Err("empty id sequence".to_string());
+        }
+
+        self.nll_begin()?;
+        let result = (|| {
+            let hidden = self.prefill_input_rows(PrefillIn::Ids(ids), 0, None)?;
+            self.nll_check_graph("encoder prefill", 0)?;
+            let expected = ids.len() * self.hidden_size;
+            if hidden.len() != expected {
+                return Err(format!(
+                    "encoder prefill returned {} values for {} rows of hidden size {}",
+                    hidden.len(),
+                    ids.len(),
+                    self.hidden_size
+                ));
+            }
+
+            let mut out = vec![0.0f32; expected];
+            for (src, dst) in hidden
+                .chunks_exact(self.hidden_size)
+                .zip(out.chunks_exact_mut(self.hidden_size))
+            {
+                inference::rms_norm_into(
+                    src,
+                    &self.weights.final_norm,
+                    self.rms_eps,
+                    self.norm_style,
+                    dst,
+                );
+            }
+            Ok(out)
+        })();
+        self.nll_end();
+        result
+    }
+
     /// Forward a full id sequence from a fresh cache and return the
     /// logits after the last position (golden-parity harness, bench).
     pub fn forward_ids(
@@ -20349,6 +20396,27 @@ fn ffn_forward_pair(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn encoder_hidden_states_are_normalized_and_reusable() {
+        let mut p = super::create_test_pipeline(8, 12, 2, 1, 4, 2, 32);
+        let ids = [1, 7, 11, 19];
+
+        let first = p.encode_hidden_states(&ids).expect("encoder forward");
+        let second = p
+            .encode_hidden_states(&ids)
+            .expect("reusable encoder forward");
+        assert_eq!(first.len(), ids.len() * 8);
+        assert!(first.iter().all(|v| v.is_finite()));
+        assert_eq!(
+            first, second,
+            "encoder forward must start from a fresh state"
+        );
+
+        // An encoder call must not leave stale KV/GDN state behind for the
+        // regular generative API sharing the same Pipeline implementation.
+        assert!(p.forward_ids(&ids, None).is_ok());
+    }
 
     /// The 0.7.6 prefill-chunk rule: a plain dense stack wholly on a
     /// discrete card reads the prompt in wide chunks on x86; every other
