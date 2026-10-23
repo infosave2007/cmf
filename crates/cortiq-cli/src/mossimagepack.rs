@@ -7,15 +7,19 @@
 //! whole 25+ GiB checkpoint in RAM.
 //!
 //! The output layout is stable and purpose-built for the native runtime:
-//! - `model.*`: canonical Qwen3.5 text encoder names (no unused visual tower),
+//! - `model.*`: canonical Qwen3.5 language-tower names for the source Base
+//!   string-prompt text-to-image route,
 //! - `moss.*`: source MOSS transformer suffixes verbatim,
 //! - `vae.*`: Flux2 decoder, post-quant convolution and BN statistics,
 //! - `moss.*_json`: source component/scheduler/tokenizer metadata.
 //!
-//! The image decoder needs no VAE encoder, so the packer deliberately omits
-//! `encoder.*` and `quant_conv.*`.  It also omits the text model's unused
-//! Qwen3.5 vision tower.  These are real residency/file-size savings, not
-//! lossy quantization decisions.
+//! The source Base `MOSSImagePipeline.__call__` samples fresh latents and only
+//! calls `vae.decode`, so its supported string-prompt text-to-image route never
+//! reaches `encoder.*` or `quant_conv.*`.  It likewise supplies no image pixels
+//! to Qwen3.5, so that route cannot invoke Qwen's visual tower.  The packer
+//! deliberately omits those unreachable tensors to reduce residency and file
+//! size; this is not a claim that they are useless to a different multimodal or
+//! future reference-image pipeline.
 
 use crate::{convert, gguf, zimagepack};
 use anyhow::{Context, anyhow, ensure};
@@ -26,7 +30,8 @@ use std::path::{Path, PathBuf};
 
 /// Default codec for the MOSS DiT's projection matrices.  `q8` maps to the
 /// two-field q8_2f representation, which keeps the first release quality
-/// oriented.  Pass `--quant q4tp` for the explicit lower-footprint profile.
+/// oriented.  Pass `--quant q4tp` for the lower-footprint profile and
+/// `--dit-keep layers.N,...` for an explicit, provenance-recorded q8 lift.
 pub(crate) const DEFAULT_DIT_CODEC: &str = "q8";
 /// Default codec for the dense Qwen3.5 text encoder's projections.
 pub(crate) const DEFAULT_TE_CODEC: &str = "q8";
@@ -53,6 +58,10 @@ pub(crate) fn is_moss_image_root(root: &Path) -> bool {
 #[derive(Clone)]
 pub(crate) struct PackOpts {
     pub dit: zimagepack::Codec,
+    /// MOSS DiT matrices intentionally lifted to q8_2f over `dit`.  This is
+    /// a transparent mixed-precision quality profile, not a name for an
+    /// unmeasured q4 refit.
+    pub dit_keep: Vec<String>,
     pub te: zimagepack::Codec,
     /// Optional embedding codec.  Quantized text models default to q8_row;
     /// a 4-bit embedding table is intentionally never selected implicitly.
@@ -121,6 +130,30 @@ fn te_keep_match(name: &str, key: &str) -> bool {
     }
 }
 
+/// Does a source MOSS DiT matrix match a `--dit-keep` selector?  A whole
+/// `layers.N` keeps that block's q/k/v/o and MLP matrices at q8_2f; a bare
+/// `q`, `o`, `ffn_up_gate`, or `ffn_down` selects that projection in every
+/// layer; `layers.N.<projection>` selects one.  All source matrices live
+/// under `layers.N.proj.*`, so matching is intentionally explicit rather than
+/// accepting arbitrary substring selectors.
+fn dit_keep_match(name: &str, key: &str) -> bool {
+    let Some(rest) = name.strip_prefix("layers.") else {
+        return false;
+    };
+    let Some((layer, projection)) = rest.split_once('.') else {
+        return false;
+    };
+    let projection = projection
+        .strip_prefix("proj.")
+        .unwrap_or(projection)
+        .trim_end_matches(".weight");
+    let key = key.strip_prefix("layers.").unwrap_or(key);
+    match key.split_once('.') {
+        None => key == layer || key == projection,
+        Some((want_layer, want_projection)) => want_layer == layer && want_projection == projection,
+    }
+}
+
 fn text_matrix_rule(name: &str, t: &zimagepack::StTensor, o: &PackOpts) -> Rule {
     if name == "model.embed_tokens.weight" {
         return Rule::Fixed(match (o.te_embed, o.te) {
@@ -157,14 +190,18 @@ fn moss_matrix_rule(name: &str, t: &zimagepack::StTensor, o: &PackOpts) -> Rule 
         || name.starts_with("video_head_modulation.");
     if control {
         Rule::Fixed(zimagepack::Codec::Raw)
+    } else if o.dit_keep.iter().any(|key| dit_keep_match(name, key)) {
+        Rule::Fixed(zimagepack::Codec::Q(convert::Quant::Q8_2f))
     } else {
         Rule::Fixed(o.dit)
     }
 }
 
-/// `AutoencoderKLFlux2.decode()` receives the unpatched 32-channel latent
-/// and uses only post_quant_conv + decoder.  MOSS's pipeline normalizes with
-/// the saved BatchNorm running statistics before that call.
+/// The source Base text-to-image `__call__` samples a fresh unpatched
+/// 32-channel latent then invokes `AutoencoderKLFlux2.decode()`, which uses
+/// only post_quant_conv + decoder.  MOSS normalizes with the saved BatchNorm
+/// running statistics before that call.  This predicate is intentionally
+/// limited to that supported decode-only route.
 fn keep_vae_tensor(name: &str) -> bool {
     name.starts_with("decoder.")
         || name.starts_with("post_quant_conv.")
@@ -486,8 +523,9 @@ pub(crate) fn pack(root: &Path, out: &str, o: &PackOpts) -> anyhow::Result<()> {
     }
     let count = items.len() + extras.len();
     eprintln!(
-        "moss-image pack: {n_moss} DiT ({}) + {n_te} Qwen3.5 text ({}) + {n_vae} Flux2 decoder tensors; source vision/encoder omitted",
+        "moss-image pack: {n_moss} DiT ({}; {} q8-kept selector(s)) + {n_te} Qwen3.5 text ({}) + {n_vae} Flux2 decode tensors; visual tower and VAE encode tensors are unreachable in source Base string-prompt text-to-image and omitted",
         zimagepack::codec_name(o.dit),
+        o.dit_keep.len(),
         zimagepack::codec_name(o.te),
     );
 
@@ -584,12 +622,13 @@ pub(crate) fn pack(root: &Path, out: &str, o: &PackOpts) -> anyhow::Result<()> {
                 "pipeline": "moss-image-base",
                 "source_pipeline_class": "MOSSImagePipeline",
                 "components": {
-                    "text_encoder": "Qwen3.5 dense hybrid encoder (visual tower omitted)",
+                    "text_encoder": "Qwen3.5 language tower; visual tower is unreachable in source Base string-prompt text-to-image",
                     "transformer": "MOSSImageTransformer",
-                    "vae": "AutoencoderKLFlux2 decoder + post_quant_conv + BN stats (encoder omitted)"
+                    "vae": "AutoencoderKLFlux2 decode path: decoder + post_quant_conv + BN statistics; encode-only tensors are unreachable in source Base text-to-image"
                 },
                 "packed_from": root.display().to_string(),
                 "moss_codec": zimagepack::codec_name(o.dit),
+                "moss_dit_keep_q8_2f": o.dit_keep,
                 "text_encoder_codec": zimagepack::codec_name(o.te),
                 "text_embed_codec": o.te_embed.map(zimagepack::codec_name),
                 "text_keep": o.te_keep,
@@ -652,6 +691,20 @@ mod tests {
     }
 
     #[test]
+    fn dit_keep_matches_whole_blocks_and_explicit_moss_projections() {
+        let q = "layers.36.proj.q.weight";
+        let up = "layers.36.proj.ffn_up_gate.weight";
+        assert!(dit_keep_match(q, "layers.36"));
+        assert!(!dit_keep_match(q, "layers.35"));
+        assert!(dit_keep_match(q, "q"));
+        assert!(dit_keep_match(q, "layers.36.q"));
+        assert!(!dit_keep_match(q, "layers.36.o"));
+        assert!(dit_keep_match(up, "ffn_up_gate"));
+        assert!(dit_keep_match(up, "layers.36.ffn_up_gate"));
+        assert!(!dit_keep_match("video_embedder.weight", "layers.36"));
+    }
+
+    #[test]
     fn keeps_exact_decode_subset() {
         assert!(keep_vae_tensor("decoder.conv_in.weight"));
         assert!(keep_vae_tensor("post_quant_conv.weight"));
@@ -659,5 +712,172 @@ mod tests {
         assert!(!keep_vae_tensor("bn.num_batches_tracked"));
         assert!(!keep_vae_tensor("encoder.conv_in.weight"));
         assert!(!keep_vae_tensor("quant_conv.weight"));
+    }
+
+    /// The normal-CI policy gate for the deliberately narrow Base package.
+    /// The source-pinned, opt-in integration test below checks the same policy
+    /// against the actual snapshot; this one keeps accidental selection-policy
+    /// drift visible even in a weight-free checkout.
+    #[test]
+    fn base_text_to_image_payload_contract() {
+        // MOSSImagePipeline.encode_prompt passes tokenizer text tensors to
+        // Qwen, while __call__ samples a latent and invokes VAE decode only.
+        assert_eq!(
+            text_name("language_model.layers.3.mlp.down_proj.weight").as_deref(),
+            Some("model.layers.3.mlp.down_proj.weight")
+        );
+        assert_eq!(text_name("visual.blocks.0.attn.qkv.weight"), None);
+        for name in [
+            "decoder.conv_in.weight",
+            "post_quant_conv.weight",
+            "post_quant_conv.bias",
+            "bn.running_mean",
+            "bn.running_var",
+        ] {
+            assert!(keep_vae_tensor(name), "required decode tensor {name}");
+        }
+        for name in [
+            "encoder.conv_in.weight",
+            "quant_conv.weight",
+            "quant_conv.bias",
+            "bn.num_batches_tracked",
+        ] {
+            assert!(!keep_vae_tensor(name), "encode/training-only tensor {name}");
+        }
+    }
+
+    /// Release-source contract for the pinned upstream Base snapshot.  The
+    /// heavyweight source checkout is intentionally optional so standard CI
+    /// remains weight-free; release validation supplies `CMF_MOSS_SOURCE_DIR`.
+    #[test]
+    fn source_base_tti_contract_when_snapshot_supplied() {
+        let Ok(root) = std::env::var("CMF_MOSS_SOURCE_DIR") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let index: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.join("model_index.json")).expect("read MOSS model_index"),
+        )
+        .expect("parse MOSS model_index");
+        assert_eq!(index["_class_name"], "MOSSImagePipeline");
+        let components = index
+            .as_object()
+            .expect("MOSS model_index object")
+            .keys()
+            .filter(|key| !key.starts_with('_'))
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            components,
+            std::collections::BTreeSet::from([
+                "scheduler",
+                "text_encoder",
+                "tokenizer",
+                "transformer",
+                "vae",
+            ])
+        );
+
+        let pipeline = std::fs::read_to_string(root.join("pipeline_moss_image.py"))
+            .expect("read MOSS custom pipeline");
+        for required in [
+            "output = self.text_encoder(**inputs, use_cache=False, return_dict=True)",
+            "if latents is None:",
+            "images = self.vae.decode(z, return_dict=False)[0].clamp(-1, 1)",
+        ] {
+            assert!(
+                pipeline.contains(required),
+                "pinned Base pipeline lost required text-to-image route: {required}"
+            );
+        }
+        assert!(
+            !pipeline.contains("self.vae.encode("),
+            "Base text-to-image pipeline unexpectedly invokes VAE encode"
+        );
+
+        let names = |dir: &str, index: &str, single: &str| {
+            zimagepack::shard_files(&root.join(dir), index, single)
+                .expect("source shard list")
+                .into_iter()
+                .flat_map(|path| {
+                    zimagepack::st_header(&path)
+                        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+                        .0
+                        .into_iter()
+                        .map(|tensor| tensor.name)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let text = names(
+            "text_encoder",
+            "model.safetensors.index.json",
+            "model.safetensors",
+        );
+        assert_eq!(
+            text.iter()
+                .filter(|name| name.starts_with("visual."))
+                .count(),
+            333,
+            "pinned Qwen visual inventory"
+        );
+        assert_eq!(
+            text.iter()
+                .filter(|name| name.starts_with("language_model."))
+                .count(),
+            426,
+            "pinned Qwen language inventory"
+        );
+        assert_eq!(
+            text.iter().filter_map(|name| text_name(name)).count(),
+            426,
+            "all and only language tensors are retained"
+        );
+
+        let vae = names(
+            "vae",
+            "diffusion_pytorch_model.safetensors.index.json",
+            "diffusion_pytorch_model.safetensors",
+        );
+        assert_eq!(
+            vae.iter()
+                .filter(|name| name.starts_with("decoder."))
+                .count(),
+            138,
+            "pinned Flux2 decoder inventory"
+        );
+        assert_eq!(
+            vae.iter()
+                .filter(|name| name.starts_with("post_quant_conv."))
+                .count(),
+            2,
+            "pinned Flux2 post-quant inventory"
+        );
+        assert_eq!(
+            vae.iter().filter(|name| keep_vae_tensor(name)).count(),
+            142,
+            "all and only Base decode tensors are retained"
+        );
+        assert_eq!(
+            vae.iter()
+                .filter(|name| name.starts_with("encoder."))
+                .count(),
+            106,
+            "pinned Flux2 encode inventory"
+        );
+        assert_eq!(
+            vae.iter()
+                .filter(|name| name.starts_with("quant_conv."))
+                .count(),
+            2,
+            "pinned Flux2 quant-conv inventory"
+        );
+        assert_eq!(
+            vae.iter()
+                .filter(|name| name.as_str() == "bn.num_batches_tracked")
+                .count(),
+            1,
+            "pinned Flux2 BatchNorm training counter"
+        );
     }
 }
