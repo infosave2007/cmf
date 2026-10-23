@@ -3171,6 +3171,193 @@ pub(crate) fn unpack_nvfp4(
     Ok(out)
 }
 
+/// MiniMax M3's MXFP8 backbone layout: E4M3FN values and one UE8M0
+/// multiplier per contiguous 32 values of *each row*.
+///
+/// The upstream field is named `weight_scale_inv`, but its byte plane is an
+/// E8M0 multiplier as consumed by the reference loader: `2^(byte - 127)`.
+/// It is therefore deliberately separate from [`unpack_fp8_scale_inv`],
+/// whose scale plane is ordinary f32 and whose geometry may be two-
+/// dimensional.  A source revision with a different layout must not be
+/// accepted by the generic fine-grained FP8 path.
+pub(crate) fn unpack_mxfp8_rowwise(
+    packed: &[u8],
+    scales_e8m0: &[u8],
+    rows: usize,
+    cols: usize,
+) -> anyhow::Result<Vec<f32>> {
+    const GROUP: usize = 32;
+    anyhow::ensure!(
+        cols % GROUP == 0,
+        "mxfp8: cols {cols} is not a multiple of {GROUP}"
+    );
+    let values = rows
+        .checked_mul(cols)
+        .ok_or_else(|| anyhow::anyhow!("mxfp8: {rows}x{cols} overflows usize"))?;
+    let groups_per_row = cols / GROUP;
+    let scale_values = rows
+        .checked_mul(groups_per_row)
+        .ok_or_else(|| anyhow::anyhow!("mxfp8: scale shape overflows usize"))?;
+    anyhow::ensure!(
+        packed.len() == values && scales_e8m0.len() == scale_values,
+        "mxfp8: weight {} (want {values}) / scales {} (want {scale_values}) for {rows}x{cols}",
+        packed.len(),
+        scales_e8m0.len(),
+    );
+    let mut out = vec![0.0f32; values];
+    if rows == 0 || cols == 0 {
+        return Ok(out);
+    }
+    let threads = encode_threads().min(rows).max(1);
+    let rows_per_thread = rows.div_ceil(threads);
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        let mut workers = Vec::with_capacity(threads);
+        for (chunk_index, out_chunk) in out.chunks_mut(rows_per_thread * cols).enumerate() {
+            let first_row = chunk_index * rows_per_thread;
+            workers.push(scope.spawn(move || -> anyhow::Result<()> {
+                for (local_row, out_row) in out_chunk.chunks_mut(cols).enumerate() {
+                    let r = first_row + local_row;
+                    let packed_row = &packed[r * cols..(r + 1) * cols];
+                    let scale_row =
+                        &scales_e8m0[r * groups_per_row..(r + 1) * groups_per_row];
+                    for (g, &scale_byte) in scale_row.iter().enumerate() {
+                        // Reuse the OCP E8M0 decoder rather than `exp2`: it
+                        // has the exact subnormal representation for byte 0
+                        // and maps the reserved 255 encoding to NaN.
+                        let scale = cortiq_core::mxfp4::e8m0_to_f32(scale_byte);
+                        anyhow::ensure!(
+                            scale.is_finite(),
+                            "mxfp8: NaN scale at row {r} group {g}"
+                        );
+                        for c in 0..GROUP {
+                            let col = g * GROUP + c;
+                            let value = fp8_e4m3_to_f32(packed_row[col]);
+                            anyhow::ensure!(
+                                value.is_finite(),
+                                "mxfp8: NaN weight at row {r} column {col}"
+                            );
+                            let decoded = value * scale;
+                            anyhow::ensure!(
+                                decoded.is_finite(),
+                                "mxfp8: non-finite decoded weight at row {r} column {col}"
+                            );
+                            out_row[col] = decoded;
+                        }
+                    }
+                }
+                Ok(())
+            }));
+        }
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("mxfp8 worker panicked"))??;
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// compressed-tensors' `nvfp4-pack-quantized` layout used by MiniMax M3
+/// routed and shared experts.
+///
+/// This is intentionally **not** NVIDIA ModelOpt NVFP4 (`unpack_nvfp4`):
+/// `weight_packed` contains low-nibble-first E2M1 pairs, `weight_scale` is
+/// E4M3 per 16 values, and `weight_global_scale` is a *divisor*.  Its static
+/// weight is therefore `e2m1 * e4m3_scale / weight_global_scale`.
+/// `input_global_scale` belongs to dynamic activation quantization and must
+/// not be folded into this static matrix.
+pub(crate) fn unpack_ct_nvfp4_inverse_global_scale(
+    packed: &[u8],
+    scales_e4m3: &[u8],
+    global_scale_divisor: f32,
+    rows: usize,
+    cols_packed: usize,
+) -> anyhow::Result<Vec<f32>> {
+    const GROUP: usize = 16;
+    let cols = cols_packed
+        .checked_mul(2)
+        .ok_or_else(|| anyhow::anyhow!("compressed-tensors nvfp4: column count overflows usize"))?;
+    anyhow::ensure!(
+        cols % GROUP == 0,
+        "compressed-tensors nvfp4: cols {cols} is not a multiple of {GROUP}"
+    );
+    anyhow::ensure!(
+        global_scale_divisor.is_finite() && global_scale_divisor > 0.0,
+        "compressed-tensors nvfp4: weight_global_scale must be finite and positive, got {global_scale_divisor}"
+    );
+    let inv_global = global_scale_divisor.recip();
+    anyhow::ensure!(
+        inv_global.is_finite(),
+        "compressed-tensors nvfp4: inverse weight_global_scale is not finite"
+    );
+    let groups_per_row = cols / GROUP;
+    let values = rows
+        .checked_mul(cols)
+        .ok_or_else(|| anyhow::anyhow!("compressed-tensors nvfp4: {rows}x{cols} overflows usize"))?;
+    let expected_packed = rows.checked_mul(cols_packed).ok_or_else(|| {
+        anyhow::anyhow!("compressed-tensors nvfp4: packed shape overflows usize")
+    })?;
+    let expected_scales = rows.checked_mul(groups_per_row).ok_or_else(|| {
+        anyhow::anyhow!("compressed-tensors nvfp4: scale shape overflows usize")
+    })?;
+    anyhow::ensure!(
+        packed.len() == expected_packed && scales_e4m3.len() == expected_scales,
+        "compressed-tensors nvfp4: packed {} (want {expected_packed}) / scales {} (want {expected_scales}) for {rows}x{cols}",
+        packed.len(),
+        scales_e4m3.len(),
+    );
+    let mut out = vec![0.0f32; values];
+    if rows == 0 || cols == 0 {
+        return Ok(out);
+    }
+    let lut = &cortiq_core::mxfp4::E2M1_LUT;
+    let threads = encode_threads().min(rows).max(1);
+    let rows_per_thread = rows.div_ceil(threads);
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        let mut workers = Vec::with_capacity(threads);
+        for (chunk_index, out_chunk) in out.chunks_mut(rows_per_thread * cols).enumerate() {
+            let first_row = chunk_index * rows_per_thread;
+            workers.push(scope.spawn(move || -> anyhow::Result<()> {
+                for (local_row, out_row) in out_chunk.chunks_mut(cols).enumerate() {
+                    let r = first_row + local_row;
+                    for g in 0..groups_per_row {
+                        let scale = fp8_e4m3_to_f32(scales_e4m3[r * groups_per_row + g]);
+                        anyhow::ensure!(
+                            scale.is_finite(),
+                            "compressed-tensors nvfp4: NaN scale at row {r} group {g}"
+                        );
+                        let scale = scale * inv_global;
+                        anyhow::ensure!(
+                            scale.is_finite(),
+                            "compressed-tensors nvfp4: non-finite combined scale at row {r} group {g}"
+                        );
+                        for j in 0..GROUP / 2 {
+                            let byte = packed[r * cols_packed + g * (GROUP / 2) + j];
+                            let even = lut[(byte & 0x0F) as usize] * scale;
+                            let odd = lut[(byte >> 4) as usize] * scale;
+                            anyhow::ensure!(
+                                even.is_finite() && odd.is_finite(),
+                                "compressed-tensors nvfp4: non-finite decoded weight at row {r} group {g}"
+                            );
+                            out_row[g * GROUP + 2 * j] = even;
+                            out_row[g * GROUP + 2 * j + 1] = odd;
+                        }
+                    }
+                }
+                Ok(())
+            }));
+        }
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("compressed-tensors nvfp4 worker panicked"))??;
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
 /// The NVFP4 group size when the checkpoint declares ModelOpt NVFP4, either
 /// in `hf_quant_config.json` (`{"quantization": {"quant_algo": "NVFP4",
 /// "group_size": 16}}`) or in `config.json`'s `quantization_config`
@@ -3235,6 +3422,121 @@ fn companion<'a>(files: &'a [SafeTensors], name: &str) -> Option<(&'a SafeTensor
     files
         .iter()
         .find_map(|f| f.tensors.iter().find(|t| t.name == name).map(|t| (f, t)))
+}
+
+/// Decode one MiniMax M3 MXFP8 backbone matrix without accepting another
+/// checkpoint's superficially similar FP8 plane.  Kept private until the
+/// MiniMax conversion route binds the checked M3 source contract to it.
+#[allow(dead_code)]
+fn minimax_m3_mxfp8_decode(
+    m: &TensorMeta,
+    file: &SafeTensors,
+    files: &[SafeTensors],
+) -> anyhow::Result<(Vec<usize>, Vec<f32>)> {
+    let name = &m.name;
+    anyhow::ensure!(
+        m.dtype == "F8_E4M3" && m.shape.len() == 2,
+        "{name}: MiniMax M3 MXFP8 weight must be F8_E4M3 2-D, got {} {:?}",
+        m.dtype,
+        m.shape
+    );
+    let (rows, cols) = (m.shape[0], m.shape[1]);
+    anyhow::ensure!(
+        cols % 32 == 0,
+        "{name}: MiniMax M3 MXFP8 width {cols} is not divisible by 32"
+    );
+    let scale_name = format!("{}_scale_inv", m.name);
+    let (scale_file, scale_meta) = companion(files, &scale_name)
+        .ok_or_else(|| anyhow::anyhow!("{name}: missing MiniMax M3 companion {scale_name}"))?;
+    anyhow::ensure!(
+        scale_meta.dtype == "U8" && scale_meta.shape == vec![rows, cols / 32],
+        "{name}: MiniMax M3 {scale_name} is {} {:?}, expected U8 [{rows}, {}]",
+        scale_meta.dtype,
+        scale_meta.shape,
+        cols / 32
+    );
+    let values = unpack_mxfp8_rowwise(file.bytes(m), scale_file.bytes(scale_meta), rows, cols)?;
+    Ok((vec![rows, cols], values))
+}
+
+/// Decode one MiniMax M3 compressed-tensors NVFP4 expert matrix.
+///
+/// The `input_global_scale` companion is checked to make a malformed source
+/// fail early, but deliberately does not enter the static weight product: it
+/// calibrates runtime activations, not the checkpoint's matrix values.
+#[allow(dead_code)]
+fn minimax_m3_ct_nvfp4_decode(
+    m: &TensorMeta,
+    file: &SafeTensors,
+    files: &[SafeTensors],
+) -> anyhow::Result<(Vec<usize>, Vec<f32>)> {
+    let name = &m.name;
+    anyhow::ensure!(
+        m.dtype == "U8" && m.shape.len() == 2 && name.ends_with(".weight_packed"),
+        "{name}: MiniMax M3 NVFP4 weight must be U8 [rows, cols/2] named .weight_packed, got {} {:?}",
+        m.dtype,
+        m.shape
+    );
+    let (rows, cols_packed) = (m.shape[0], m.shape[1]);
+    let cols = cols_packed.checked_mul(2).ok_or_else(|| {
+        anyhow::anyhow!("{name}: MiniMax M3 NVFP4 logical width overflows usize")
+    })?;
+    anyhow::ensure!(
+        cols % 16 == 0,
+        "{name}: MiniMax M3 NVFP4 logical width {cols} is not divisible by 16"
+    );
+    let stem = name
+        .strip_suffix(".weight_packed")
+        .expect("suffix checked above");
+    let scale_name = format!("{stem}.weight_scale");
+    let (scale_file, scale_meta) = companion(files, &scale_name)
+        .ok_or_else(|| anyhow::anyhow!("{name}: missing MiniMax M3 companion {scale_name}"))?;
+    anyhow::ensure!(
+        scale_meta.dtype == "F8_E4M3" && scale_meta.shape == vec![rows, cols / 16],
+        "{name}: MiniMax M3 {scale_name} is {} {:?}, expected F8_E4M3 [{rows}, {}]",
+        scale_meta.dtype,
+        scale_meta.shape,
+        cols / 16
+    );
+    let global_name = format!("{stem}.weight_global_scale");
+    let (global_file, global_meta) = companion(files, &global_name)
+        .ok_or_else(|| anyhow::anyhow!("{name}: missing MiniMax M3 companion {global_name}"))?;
+    anyhow::ensure!(
+        global_meta.dtype == "F32" && (global_meta.shape.is_empty() || global_meta.shape == [1]),
+        "{name}: MiniMax M3 {global_name} is {} {:?}, expected scalar F32",
+        global_meta.dtype,
+        global_meta.shape
+    );
+    let global_values = to_f32(&global_meta.dtype, global_file.bytes(global_meta))?;
+    anyhow::ensure!(
+        global_values.len() == 1,
+        "{name}: MiniMax M3 {global_name} has {} values, expected one",
+        global_values.len()
+    );
+    let input_name = format!("{stem}.input_global_scale");
+    let (input_file, input_meta) = companion(files, &input_name)
+        .ok_or_else(|| anyhow::anyhow!("{name}: missing MiniMax M3 companion {input_name}"))?;
+    anyhow::ensure!(
+        input_meta.dtype == "F32" && (input_meta.shape.is_empty() || input_meta.shape == [1]),
+        "{name}: MiniMax M3 {input_name} is {} {:?}, expected scalar F32",
+        input_meta.dtype,
+        input_meta.shape
+    );
+    let input_values = to_f32(&input_meta.dtype, input_file.bytes(input_meta))?;
+    anyhow::ensure!(
+        input_values.len() == 1 && input_values[0].is_finite(),
+        "{name}: MiniMax M3 {input_name} must be one finite value"
+    );
+    // Do NOT fold `input_values[0]` into weights.  It is present solely to
+    // certify that this is the published dynamic-activation source layout.
+    let values = unpack_ct_nvfp4_inverse_global_scale(
+        file.bytes(m),
+        scale_file.bytes(scale_meta),
+        global_values[0],
+        rows,
+        cols_packed,
+    )?;
+    Ok((vec![rows, cols], values))
 }
 
 /// Decode one ModelOpt NVFP4 `.weight` (U8) with its `.weight_scale`
@@ -10048,6 +10350,140 @@ pub(crate) mod tests {
         assert!(unpack_fp8_scale_inv(&[0x38; 4], &[1.0], 2, 2, 1).is_err());
         assert!(unpack_fp8_scale_inv(&[0x38; 4], &[f32::NAN; 4], 2, 2, 1).is_err());
         assert!(unpack_fp8_scale_inv(&[0x7F; 4], &[1.0; 4], 2, 2, 1).is_err());
+    }
+
+    #[test]
+    fn minimax_mxfp8_rowwise_uses_32_value_ue8m0_groups() {
+        // E4M3 0x38 is exactly one.  The two scale bytes in each source row
+        // must be indexed by 32-wide ROW groups — treating this as a square
+        // tile grid would make the second row plausibly, but silently, wrong.
+        let (rows, cols) = (2usize, 64usize);
+        let packed = vec![0x38u8; rows * cols];
+        let scales = vec![127u8, 128, 129, 126];
+        let out = unpack_mxfp8_rowwise(&packed, &scales, rows, cols).unwrap();
+        assert_eq!(out[0], 1.0);
+        assert_eq!(out[31], 1.0);
+        assert_eq!(out[32], 2.0);
+        assert_eq!(out[63], 2.0);
+        assert_eq!(out[64], 4.0);
+        assert_eq!(out[64 + 31], 4.0);
+        assert_eq!(out[64 + 32], 0.5);
+        assert_eq!(out[127], 0.5);
+
+        assert!(unpack_mxfp8_rowwise(&packed, &[255, 128, 129, 126], rows, cols).is_err());
+        assert!(unpack_mxfp8_rowwise(&[0x7F; 128], &scales, rows, cols).is_err());
+        assert!(unpack_mxfp8_rowwise(&[0x7E; 128], &[254; 4], rows, cols).is_err());
+        assert!(unpack_mxfp8_rowwise(&packed, &scales, rows, 48).is_err());
+        assert!(unpack_mxfp8_rowwise(&packed[..127], &scales, rows, cols).is_err());
+    }
+
+    #[test]
+    fn minimax_ct_nvfp4_uses_inverse_global_scale() {
+        // One 16-value FP4 group.  0x31 encodes low nibble 1 (=0.5) and
+        // high nibble 3 (=1.5); E4M3 0x40 is 2.0.  With global divisor 4,
+        // the decoded pair is 0.25 / 0.75 — multiplying by the global scale
+        // (the unrelated ModelOpt contract) would yield 4 / 12 instead.
+        let out = unpack_ct_nvfp4_inverse_global_scale(&[0x31; 8], &[0x40], 4.0, 1, 8)
+            .unwrap();
+        for pair in out.chunks_exact(2) {
+            assert_eq!(pair, [0.25, 0.75]);
+        }
+        assert!(unpack_ct_nvfp4_inverse_global_scale(&[0x31; 8], &[0x7F], 4.0, 1, 8).is_err());
+        assert!(unpack_ct_nvfp4_inverse_global_scale(&[0x31; 8], &[0x40], 0.0, 1, 8).is_err());
+        assert!(unpack_ct_nvfp4_inverse_global_scale(&[0x31; 7], &[0x40], 4.0, 1, 8).is_err());
+        assert!(unpack_ct_nvfp4_inverse_global_scale(&[0x31; 8], &[0x40], 4.0, 1, 7).is_err());
+    }
+
+    #[test]
+    fn minimax_source_decoders_validate_companions_and_ignore_input_scale() {
+        fn write_raw(tensors: &[(String, &str, Vec<usize>, Vec<u8>)]) -> Vec<u8> {
+            let mut header = serde_json::Map::new();
+            let mut data = Vec::new();
+            for (name, dtype, shape, bytes) in tensors {
+                let start = data.len();
+                data.extend_from_slice(bytes);
+                header.insert(
+                    name.clone(),
+                    serde_json::json!({
+                        "dtype": dtype,
+                        "shape": shape,
+                        "data_offsets": [start, data.len()]
+                    }),
+                );
+            }
+            let header = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+            let mut out = (header.len() as u64).to_le_bytes().to_vec();
+            out.extend_from_slice(&header);
+            out.extend_from_slice(&data);
+            out
+        }
+        let root = std::env::temp_dir().join(format!(
+            "cortiq-minimax-source-decode-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("model.safetensors");
+        let mxfp8_name = "language_model.model.layers.0.self_attn.q_proj.weight";
+        let nvfp4_name = "language_model.model.layers.3.block_sparse_moe.experts.0.w1.weight_packed";
+        let tensors = vec![
+            (
+                mxfp8_name.into(),
+                "F8_E4M3",
+                vec![1, 32],
+                vec![0x38; 32],
+            ),
+            (
+                format!("{mxfp8_name}_scale_inv"),
+                "U8",
+                vec![1, 1],
+                vec![128],
+            ),
+            (nvfp4_name.into(), "U8", vec![1, 8], vec![0x31; 8]),
+            (
+                nvfp4_name.replace(".weight_packed", ".weight_scale"),
+                "F8_E4M3",
+                vec![1, 1],
+                vec![0x40],
+            ),
+            (
+                nvfp4_name.replace(".weight_packed", ".weight_global_scale"),
+                "F32",
+                vec![],
+                4.0f32.to_le_bytes().to_vec(),
+            ),
+            // Deliberately not one: it verifies this activation-calibration
+            // value is checked but never folded into static weights.
+            (
+                nvfp4_name.replace(".weight_packed", ".input_global_scale"),
+                "F32",
+                vec![],
+                0.25f32.to_le_bytes().to_vec(),
+            ),
+        ];
+        fs::write(&source, write_raw(&tensors)).unwrap();
+        let files = vec![open_safetensors(&source).unwrap()];
+
+        let fp8_meta = files[0]
+            .tensors
+            .iter()
+            .find(|m| m.name == mxfp8_name)
+            .unwrap();
+        let (shape, decoded) = minimax_m3_mxfp8_decode(fp8_meta, &files[0], &files).unwrap();
+        assert_eq!(shape, vec![1, 32]);
+        assert_eq!(decoded, vec![2.0; 32]);
+
+        let fp4_meta = files[0]
+            .tensors
+            .iter()
+            .find(|m| m.name == nvfp4_name)
+            .unwrap();
+        let (shape, decoded) = minimax_m3_ct_nvfp4_decode(fp4_meta, &files[0], &files).unwrap();
+        assert_eq!(shape, vec![1, 16]);
+        for pair in decoded.chunks_exact(2) {
+            assert_eq!(pair, &[0.25, 0.75]);
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// Fine-grained FP8 decode is row-independent just like the output
