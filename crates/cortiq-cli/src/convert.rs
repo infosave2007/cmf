@@ -6133,6 +6133,86 @@ fn parse_convert_only(spec: &str) -> anyhow::Result<Vec<String>> {
 /// capability.
 const MINIMAX_M3_DENSE_SAFE_CONTEXT: usize = 2_048;
 
+/// MiniMax M3 is not ChatML-compatible: its official prompt grammar uses a
+/// namespaced tool envelope and its own reasoning markers.  A text-only CMF
+/// with no usable source template would otherwise load and quietly prompt the
+/// model with the generic fallback, which is a correctness failure rather
+/// than a harmless missing convenience.  Keep this contract next to the
+/// bounded M3 architecture instead of teaching the generic converter a
+/// model-name heuristic.
+const MINIMAX_M3_CHAT_NAMESPACE: &str = "]<]minimax[>[";
+const MINIMAX_M3_THINK_OPEN: &str = "<mm:think>";
+const MINIMAX_M3_THINK_CLOSE: &str = "</mm:think>";
+
+fn validate_minimax_m3_chat_template(template: &str) -> anyhow::Result<()> {
+    let template = template.trim();
+    anyhow::ensure!(
+        !template.is_empty(),
+        "MiniMax-M3.1 contract: chat template is empty"
+    );
+    for (label, marker) in [
+        ("MiniMax namespace", MINIMAX_M3_CHAT_NAMESPACE),
+        ("opening reasoning marker", MINIMAX_M3_THINK_OPEN),
+        ("closing reasoning marker", MINIMAX_M3_THINK_CLOSE),
+        ("tool-call opening tag", "<tool_call>"),
+        ("tool-call closing tag", "</tool_call>"),
+    ] {
+        anyhow::ensure!(
+            template.contains(marker),
+            "MiniMax-M3.1 contract: chat template lacks {label} {marker:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Read the exact prompt grammar carried by an M3 checkpoint before the
+/// expensive 428B source preflight/weight pass.  Sidecar wins, matching the
+/// bundle writer below; a legacy tokenizer_config field is accepted only if
+/// it carries the same verified grammar.
+fn minimax_m3_chat_template(dir: &Path) -> anyhow::Result<String> {
+    let sidecar = dir.join("chat_template.jinja");
+    let template = match fs::read_to_string(&sidecar) {
+        Ok(s) if !s.trim().is_empty() => s,
+        Ok(_) => String::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => anyhow::bail!(
+            "MiniMax-M3.1 contract: read {}: {e}",
+            sidecar.display()
+        ),
+    };
+    let template = if template.is_empty() {
+        let config_path = dir.join("tokenizer_config.json");
+        match fs::read(&config_path) {
+            Ok(bytes) => {
+                let config: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+                    anyhow::anyhow!(
+                        "MiniMax-M3.1 contract: parse {}: {e}",
+                        config_path.display()
+                    )
+                })?;
+                config
+                    .get("chat_template")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+                    .unwrap_or_default()
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => anyhow::bail!(
+                "MiniMax-M3.1 contract: read {}: {e}",
+                config_path.display()
+            ),
+        }
+    } else {
+        template
+    };
+    anyhow::ensure!(
+        !template.trim().is_empty(),
+        "MiniMax-M3.1 contract: missing chat_template.jinja and tokenizer_config.chat_template; refusing generic ChatML fallback"
+    );
+    validate_minimax_m3_chat_template(&template)?;
+    Ok(template)
+}
+
 /// Build the deliberately narrow MiniMax-M3.1 text-backbone descriptor.
 ///
 /// This does not infer a generic Llama shape from a model name.  The public
@@ -8213,6 +8293,15 @@ pub fn run_convert_multi_excluding(
             "MiniMax-M3.1 conversion supports only q4tp (mixed routed-expert profile) or q8_2f; q2tp/fp4 and other profiles are not validated"
         );
     }
+    // The target model's grammar is an executable part of the checkpoint
+    // contract.  Validate and retain it before making any remote header
+    // requests or downloading the first enormous shard, so an artifact can
+    // never finish with a generic ChatML prompt by accident.
+    let minimax_m3_template = if arch.arch_name == minimax_m3::MINIMAX_M3_MODEL_TYPE {
+        Some(minimax_m3_chat_template(dir)?)
+    } else {
+        None
+    };
     // Fail before a streamed 250+ GB weight pass if this is not exactly the
     // public M3.1 tensor inventory.  The HF index names shards but has no
     // dtype/shape data, so remote conversion issues two tiny range requests
@@ -9940,14 +10029,16 @@ pub fn run_convert_multi_excluding(
         .unwrap_or(serde_json::Value::Null);
     // Sidecar `chat_template.jinja` first, then the tokenizer_config field;
     // ignore an empty/blank file so we correctly fall through to the config.
-    let chat_template = fs::read_to_string(dir.join("chat_template.jinja"))
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            tok_cfg
-                .get("chat_template")
-                .and_then(|v| v.as_str().map(String::from))
-        });
+    let chat_template = minimax_m3_template.or_else(|| {
+        fs::read_to_string(dir.join("chat_template.jinja"))
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                tok_cfg
+                    .get("chat_template")
+                    .and_then(|v| v.as_str().map(String::from))
+            })
+    });
     let bundle = TokenizerBundle {
         chat_template,
         eos_token_ids: {
@@ -11055,6 +11146,22 @@ pub(crate) mod tests {
             EmitMode::Auto,
         );
         assert_eq!(batches[0][0].dtype, TensorDtype::F32);
+    }
+
+    #[test]
+    fn minimax_m3_chat_template_requires_its_native_grammar() {
+        let exact = format!(
+            "{MINIMAX_M3_CHAT_NAMESPACE}{MINIMAX_M3_THINK_OPEN}\n\
+             {MINIMAX_M3_THINK_CLOSE}\n\
+             {MINIMAX_M3_CHAT_NAMESPACE}<tool_call>\n\
+             {MINIMAX_M3_CHAT_NAMESPACE}</tool_call>"
+        );
+        validate_minimax_m3_chat_template(&exact).expect("native M3 grammar");
+
+        let err = validate_minimax_m3_chat_template("<think>{{ messages }}</think>")
+            .expect_err("generic ChatML-ish template must not be accepted")
+            .to_string();
+        assert!(err.contains("MiniMax namespace"), "{err}");
     }
 
     #[test]
