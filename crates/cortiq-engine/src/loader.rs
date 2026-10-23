@@ -898,6 +898,25 @@ impl Pipeline {
         Self::from_model_with_skill(model, sampler_config, None)
     }
 
+    /// Build an encoder-only pipeline from an opened CMF model.
+    ///
+    /// Some component models (for example a text tower used by an image
+    /// pipeline) intentionally end at the final normalized hidden states and
+    /// therefore have no language-model head.  Keep that exception explicit:
+    /// regular [`Self::from_model`] continues to reject a non-tied model
+    /// without `lm_head.weight`, so a partially packed generative model can
+    /// never be mistaken for a runnable one.
+    ///
+    /// The returned pipeline is for [`Self::encode_hidden_states`] only.  Its
+    /// placeholder head is deliberately one row wide and must not be exposed
+    /// as a generative model.
+    pub fn from_encoder_model(
+        model: &Arc<CmfModel>,
+        sampler_config: SamplerConfig,
+    ) -> Result<Self, CmfError> {
+        Self::from_model_with_overlay(model, sampler_config, &Overlay::None, true)
+    }
+
     /// Same, with a skill overlaid (spec §9): every layer tensor is
     /// resolved through tensor-source indirection — the skill's
     /// full-shape replacement is read in place of the backbone tensor.
@@ -909,8 +928,10 @@ impl Pipeline {
         skill: Option<&str>,
     ) -> Result<Self, CmfError> {
         match skill {
-            Some(s) => Self::from_model_with_overlay(model, sampler_config, &Overlay::One(s)),
-            None => Self::from_model_with_overlay(model, sampler_config, &Overlay::None),
+            Some(s) => {
+                Self::from_model_with_overlay(model, sampler_config, &Overlay::One(s), false)
+            }
+            None => Self::from_model_with_overlay(model, sampler_config, &Overlay::None, false),
         }
     }
 
@@ -921,7 +942,7 @@ impl Pipeline {
         sampler_config: SamplerConfig,
         blend: &[(String, f32)],
     ) -> Result<Self, CmfError> {
-        Self::from_model_with_overlay(model, sampler_config, &Overlay::Blend(blend))
+        Self::from_model_with_overlay(model, sampler_config, &Overlay::Blend(blend), false)
     }
 
     fn skill_file_guard(model: &CmfModel) -> Result<(), CmfError> {
@@ -947,6 +968,7 @@ impl Pipeline {
         model: &Arc<CmfModel>,
         sampler_config: SamplerConfig,
         ov: &Overlay,
+        encoder_only: bool,
     ) -> Result<Self, CmfError> {
         // Refuse non-runnable files first, before any process-wide state
         // (the device cache directory, the graph verdict) is touched on
@@ -1097,6 +1119,12 @@ impl Pipeline {
         } else if arch.tie_word_embeddings {
             // Tied: reuse the embedding matrix (re-open, cheap for Mapped).
             load_matrix(model, "model.embed_tokens.weight", false, ov)?
+        } else if encoder_only {
+            // `Pipeline` owns an LM-head slot for the generative APIs, but an
+            // encoder component correctly has none.  Keep the inert stand-in
+            // tiny: `encode_hidden_states` never reads it, and the public
+            // generative constructors above still fail before reaching here.
+            QTensor::from_f32(vec![0.0; arch.hidden_size], 1, arch.hidden_size)
         } else {
             return Err(CmfError::MissingTensor(
                 "lm_head.weight (and tie_word_embeddings is false)".into(),
