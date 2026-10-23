@@ -15856,16 +15856,115 @@ fn flint_oversized_moe_auto(model: &Arc<CmfModel>, working_set: u64) -> bool {
     working_exceeded || multi_window
 }
 
-/// Explicit selected-view / graph-pager users and exact oversized Flint need
-/// bounded residency. Once that policy applies, never resurrect `file_buffer()`
-/// after the specialised path says it cannot serve this particular block.
-/// Returning false from `moe_block` is the existing exact CPU fallback and,
-/// unlike a full no-copy arena, has no way to wedge the driver under pressure.
+/// The public MiniMax-M3.1 CMF descriptor that is safe for the automatic
+/// selected-expert path.  This is intentionally *more* specific than the
+/// architecture name: a user-produced M3-like CMF, a future upstream M3
+/// revision, or an altered context/operator profile stays on the established
+/// explicit pager/CPU paths until it receives its own review.
+fn minimax_m3_arch_contract(arch: &cortiq_core::ModelArch) -> bool {
+    let Some(moe) = arch.moe.as_ref() else {
+        return false;
+    };
+    arch.arch_name == "minimax_m3_vl"
+        && arch.hidden_size == 6_144
+        && arch.intermediate_size == 12_288
+        && arch.num_layers == 60
+        && arch.num_attention_heads == 64
+        && arch.num_kv_heads == 4
+        && arch.head_dim == 128
+        && arch.vocab_size == 200_064
+        && arch.max_position_embeddings == 2_048
+        && arch.norm_style == cortiq_core::NormStyle::Gemma
+        && arch.hidden_act == "swigluoai"
+        && arch.rope_theta.to_bits() == 10_000_000.0f64.to_bits()
+        && arch.partial_rotary_factor.to_bits() == 0.5f32.to_bits()
+        && arch.prism_hadamard.is_none()
+        && arch.layer_types.len() == 60
+        && arch
+            .layer_types
+            .iter()
+            .all(|layer| matches!(layer, cortiq_core::LayerType::FullAttention))
+        && moe.num_experts == 128
+        && moe.top_k == 4
+        && moe.moe_intermediate_size == 3_072
+        && moe.shared_expert_intermediate_size == Some(3_072)
+        && moe.norm_topk_prob
+        && moe.router_sigmoid
+        && moe
+            .routed_scaling_factor
+            .is_some_and(|scale| scale.to_bits() == 2.0f32.to_bits())
+}
+
+/// MiniMax M3's q4tp profile has a 6144-wide top-4 routed bank plus one
+/// equally wide shared expert, each with a 3072-wide OAI triple.  Require the
+/// complete geometry *and* frozen device activation before enabling automatic
+/// view binding: the selected route must never turn a look-alike MoE into a
+/// broad full-file Metal arena.
+fn minimax_m3_selected_q4tp_jobs(
+    arch: &cortiq_core::ModelArch,
+    jobs: &[MoeJob],
+    out_len: usize,
+) -> bool {
+    const HIDDEN: usize = 6_144;
+    const INTER: usize = 3_072;
+    const SELECTED: usize = 5; // top-4 routed + always-active shared
+
+    minimax_m3_arch_contract(arch)
+        && out_len == HIDDEN
+        && jobs.len() == SELECTED
+        && q4tp_moe_act(jobs) == Some(Q4tpMoeAct::SwiGluOaiM3)
+        && moe_jobs_batchable(jobs)
+        && jobs.iter().all(|job| {
+            !job.q1
+                && !job.q4t
+                && job.q4tp
+                && !job.gu_q2
+                && job.down_col.is_empty()
+                && job.gate.3.is_empty()
+                && job.up.3.is_empty()
+                && job.down.3.is_empty()
+                && job.gate.1 == INTER
+                && job.gate.2 == HIDDEN
+                && job.up.1 == INTER
+                && job.up.2 == HIDDEN
+                && job.down.1 == HIDDEN
+                && job.down.2 == INTER
+                && job.xs_gate.len() == HIDDEN
+                && job.xs_up.len() == HIDDEN
+                && job.w.is_finite()
+        })
+}
+
+/// Automatic bounded residency for the exact public MiniMax M3 q4tp profile.
+/// Its 428B source-derived mapping cannot safely be bound as a full Metal
+/// arena on ordinary unified-memory Macs, while one top-4+shared expert block
+/// is only about 140.51 MiB before page rounding.  q8_2f deliberately does
+/// not qualify: no q8 selected-view route exists, so it remains an honest CPU
+/// fallback when the whole arena is unsafe.
+fn minimax_m3_oversized_moe_auto(model: &Arc<CmfModel>, working_set: u64) -> bool {
+    if !minimax_m3_arch_contract(&model.header.arch) {
+        return false;
+    }
+    let model_bytes = model.primary_bytes().len() as u64;
+    let working_exceeded = working_set != 0 && model_bytes > working_set;
+    let max_buffer = max_buffer_bytes();
+    let multi_window = max_buffer != 0 && model_bytes > max_buffer;
+    working_exceeded || multi_window
+}
+
+/// Explicit selected-view / graph-pager users and exact oversized Flint/M3
+/// need bounded residency. Once that policy applies, never resurrect
+/// `file_buffer()` after the specialised path says it cannot serve this
+/// particular block. Returning false from `moe_block` is the existing exact
+/// CPU fallback and, unlike a full no-copy arena, has no way to wedge the
+/// driver under pressure.
 fn oversized_moe_arena_forbidden(model: &Arc<CmfModel>) -> bool {
     let working_set = working_set_bytes();
     let model_bytes = model.primary_bytes().len() as u64;
     let requested_oversize = sparse_moe_enabled() && working_set != 0 && model_bytes > working_set;
-    requested_oversize || flint_oversized_moe_auto(model, working_set)
+    requested_oversize
+        || flint_oversized_moe_auto(model, working_set)
+        || minimax_m3_oversized_moe_auto(model, working_set)
 }
 
 /// Conservative cap for the page-rounded no-copy *views*, not q4tp payload
@@ -15873,15 +15972,29 @@ fn oversized_moe_arena_forbidden(model: &Arc<CmfModel>) -> bool {
 /// cap leaves room for page rounding and unusual expert shapes but prevents a
 /// malformed directory from turning the selected-view path into a broad mmap
 /// binding. An experiment may set `CMF_METAL_SPARSE_MOE_MAX_MB`; an invalid
-/// value never widens the default.
-fn sparse_moe_span_cap_bytes() -> usize {
-    const DEFAULT: usize = 128 << 20;
-    std::env::var("CMF_METAL_SPARSE_MOE_MAX_MB")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
+/// value never widens the selected route's default.
+fn sparse_moe_span_cap_bytes_from(raw: Option<&str>, default: usize) -> usize {
+    raw.and_then(|s| s.parse::<usize>().ok())
         .and_then(|mb| mb.checked_mul(1 << 20))
         .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT)
+        .unwrap_or(default)
+}
+
+fn sparse_moe_span_cap_bytes_with_default(default: usize) -> usize {
+    let raw = std::env::var("CMF_METAL_SPARSE_MOE_MAX_MB").ok();
+    sparse_moe_span_cap_bytes_from(raw.as_deref(), default)
+}
+
+fn sparse_moe_span_cap_bytes() -> usize {
+    sparse_moe_span_cap_bytes_with_default(128 << 20)
+}
+
+/// M3 binds exactly five 28.1015625 MiB triples (= 140.5078125 MiB) before
+/// at most 60 KiB of 4 KiB page rounding.  192 MiB keeps a clear hard ceiling
+/// without making the generic 128 MiB selected-view policy wider.  An explicit
+/// `CMF_METAL_SPARSE_MOE_MAX_MB` always wins, including a lower diagnostic cap.
+fn minimax_m3_sparse_moe_span_cap_bytes() -> usize {
+    sparse_moe_span_cap_bytes_with_default(192 << 20)
 }
 
 /// Validate a primary-shard tiled tensor and form the smallest page-aligned
@@ -16272,6 +16385,110 @@ mod flint_sparse_plan_tests {
             q4tp_moe_act(&jobs),
             None,
             "mixed activation banks must decline"
+        );
+    }
+
+    const M3_HIDDEN: usize = 6_144;
+    const M3_INTER: usize = 3_072;
+
+    fn minimax_m3_arch() -> cortiq_core::ModelArch {
+        serde_json::from_value(serde_json::json!({
+            "arch_name": "minimax_m3_vl",
+            "hidden_size": M3_HIDDEN,
+            "intermediate_size": 12_288,
+            "num_layers": 60,
+            "num_attention_heads": 64,
+            "num_kv_heads": 4,
+            "head_dim": 128,
+            "vocab_size": 200_064,
+            "layer_types": vec!["FullAttention"; 60],
+            "rms_norm_eps": 1e-6,
+            "norm_style": "gemma",
+            "rope_theta": 10_000_000.0,
+            "partial_rotary_factor": 0.5,
+            "hidden_act": "swigluoai",
+            "max_position_embeddings": 2_048,
+            "moe": {
+                "num_experts": 128,
+                "top_k": 4,
+                "moe_intermediate_size": M3_INTER,
+                "norm_topk_prob": true,
+                "shared_expert_intermediate_size": M3_INTER,
+                "router_sigmoid": true,
+                "routed_scaling_factor": 2.0
+            }
+        }))
+        .expect("checked MiniMax-M3 architecture fixture")
+    }
+
+    fn minimax_m3_job(w: f32) -> MoeJob<'static> {
+        MoeJob {
+            gate: (0, M3_INTER, M3_HIDDEN, &EMPTY),
+            up: (1, M3_INTER, M3_HIDDEN, &EMPTY),
+            down: (2, M3_HIDDEN, M3_INTER, &EMPTY),
+            xs_gate: vec![0.0; M3_HIDDEN],
+            xs_up: vec![0.0; M3_HIDDEN],
+            down_col: &EMPTY,
+            w,
+            q1: false,
+            q4t: false,
+            q4tp: true,
+            gu_q2: false,
+            swiglu_limit: MOE_SWIGLU_OAI_M3_LIMIT,
+            act: MOE_ACT_SWIGLU_OAI_M3,
+        }
+    }
+
+    #[test]
+    fn minimax_m3_auto_pager_is_exact_q4tp_oai_only() {
+        let arch = minimax_m3_arch();
+        let mut jobs = vec![
+            minimax_m3_job(0.25),
+            minimax_m3_job(0.25),
+            minimax_m3_job(0.25),
+            minimax_m3_job(0.25),
+            minimax_m3_job(1.0),
+        ];
+        assert!(minimax_m3_selected_q4tp_jobs(&arch, &jobs, M3_HIDDEN));
+
+        jobs[4].act = MOE_ACT_SILU;
+        assert!(
+            !minimax_m3_selected_q4tp_jobs(&arch, &jobs, M3_HIDDEN),
+            "mixed OAI/SiLU banks must never auto-admit"
+        );
+        jobs[4].act = MOE_ACT_SWIGLU_OAI_M3;
+        jobs[4].swiglu_limit = 0.0;
+        assert!(
+            !minimax_m3_selected_q4tp_jobs(&arch, &jobs, M3_HIDDEN),
+            "the frozen OAI limit is part of auto-admission"
+        );
+        jobs[4].swiglu_limit = MOE_SWIGLU_OAI_M3_LIMIT;
+        assert!(
+            !minimax_m3_selected_q4tp_jobs(&arch, &jobs, M3_HIDDEN - 1),
+            "wrong output geometry must not borrow M3's view cap"
+        );
+
+        let mut changed = arch.clone();
+        changed.moe.as_mut().expect("fixture has MoE").top_k = 3;
+        assert!(
+            !minimax_m3_arch_contract(&changed),
+            "an altered M3 descriptor stays on the explicit pager/CPU path"
+        );
+    }
+
+    #[test]
+    fn minimax_m3_view_cap_is_bounded_and_user_override_wins() {
+        const MIB: usize = 1 << 20;
+        assert_eq!(sparse_moe_span_cap_bytes_from(None, 192 * MIB), 192 * MIB);
+        assert_eq!(
+            sparse_moe_span_cap_bytes_from(Some("160"), 192 * MIB),
+            160 * MIB,
+            "a user can lower the M3 cap for diagnostics"
+        );
+        assert_eq!(
+            sparse_moe_span_cap_bytes_from(Some("bad"), 192 * MIB),
+            192 * MIB,
+            "invalid input must not widen the cap"
         );
     }
 }
@@ -16758,12 +16975,18 @@ fn try_moe_block_jobs_q4tp_sparse(
     jobs: &[MoeJob],
     out: &mut [f32],
 ) -> SparseMoeResult {
-    if !sparse_moe_enabled() {
-        return SparseMoeResult::NotApplicable;
-    }
     let working_set = working_set_bytes();
     let model_bytes = model.primary_bytes().len() as u64;
-    if working_set == 0 || model_bytes <= working_set {
+    // Unlike the generic selected-view experiment, exact oversized M3 q4tp
+    // auto-admits its small top-4+shared route.  All broader profiles still
+    // require an explicit opt-in, and M3 q8 cannot enter because it has no
+    // q8 selected-view kernel.
+    let minimax_auto = minimax_m3_oversized_moe_auto(model, working_set)
+        && minimax_m3_selected_q4tp_jobs(&model.header.arch, jobs, out.len());
+    if !sparse_moe_enabled() && !minimax_auto {
+        return SparseMoeResult::NotApplicable;
+    }
+    if !minimax_auto && (working_set == 0 || model_bytes <= working_set) {
         return SparseMoeResult::NotApplicable;
     }
 
@@ -16829,7 +17052,12 @@ fn try_moe_block_jobs_q4tp_sparse(
         bound_bytes = next;
         ranges.push((gate, up, down, packed));
     }
-    if bound_bytes > sparse_moe_span_cap_bytes()
+    let view_cap = if minimax_auto {
+        minimax_m3_sparse_moe_span_cap_bytes()
+    } else {
+        sparse_moe_span_cap_bytes()
+    };
+    if bound_bytes > view_cap
         || ranges
             .iter()
             .flat_map(|(g, u, d, _)| [g, u, d])
@@ -16837,7 +17065,8 @@ fn try_moe_block_jobs_q4tp_sparse(
     {
         tracing::debug!(
             bound_bytes,
-            cap = sparse_moe_span_cap_bytes(),
+            cap = view_cap,
+            minimax_auto,
             "Metal selected MoE views declined by admission cap"
         );
         return SparseMoeResult::Declined;
@@ -17053,6 +17282,7 @@ fn try_moe_block_jobs_q4tp_sparse(
             view_buffers,
             jobs = jobs.len(),
             fused_views9 = views9,
+            minimax_auto,
             "native Metal selected MoE views active"
         );
     }
