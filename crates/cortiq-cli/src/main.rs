@@ -2174,13 +2174,17 @@ enum Commands {
         #[arg(long)]
         teacher: Option<String>,
     },
-    /// Text-to-image with Z-Image / Z-Image-Turbo or Lumina CMFs, or edit
-    /// reference images with Qwen Image CMFs.
+    /// Text-to-image with MOSS-Image, Z-Image / Z-Image-Turbo or Lumina
+    /// CMFs, or edit reference images with Qwen Image CMFs.
     ///
     /// Z-Image (one .cmf from `imagine-pack`): every option defaults to the
     /// recipe stored in the file — Turbo: 1024x1024, 8 steps, guidance 0;
     /// Z-Image (base): 1024x1024, 28 steps, guidance 4 with CFG — so
     /// `cortiq imagine z-image-turbo.cmf --prompt "…"` needs no other flag.
+    /// MOSS-Image (one .cmf from `imagine-pack`): the stored official recipe
+    /// is 1024x1024, 50 Flow-Euler steps, CFG 3, shift 5, with its Qwen3.5
+    /// text template and Flux2 decoder embedded.  Its text, DiT and VAE run
+    /// as separate residency stages, so no component path is needed.
     /// Qwen-Image-2.1 (one .cmf from `imagine-pack`): 1024x1024, 40 steps, no
     /// CFG by default; PNG output keeps the alpha channel (ask for transparency
     /// in the prompt); --image adds condition images.
@@ -2192,14 +2196,14 @@ enum Commands {
         /// Text prompt
         #[arg(long)]
         prompt: String,
-        /// Image height in pixels (Z-Image: multiple of 16; default from the file)
+        /// Image height in pixels (MOSS/Z-Image: multiple of 16; default from the file)
         #[arg(long)]
         height: Option<usize>,
-        /// Image width in pixels (Z-Image: multiple of 16; default from the file)
+        /// Image width in pixels (MOSS/Z-Image: multiple of 16; default from the file)
         #[arg(long)]
         width: Option<usize>,
-        /// Denoising steps = DiT forwards per image (Z-Image default from the
-        /// file: Turbo 8, base 28; Lumina 30)
+        /// Denoising steps = DiT forwards per image (MOSS default 50 with
+        /// CFG doing two forwards; Z-Image: Turbo 8/base 28; Lumina 30)
         #[arg(long)]
         steps: Option<usize>,
         /// Classifier-free guidance scale. Z-Image: 0 disables CFG (one DiT
@@ -2218,18 +2222,18 @@ enum Commands {
         /// noise range)
         #[arg(long)]
         cfg_truncation: Option<f32>,
-        /// Z-Image scheduler shift override (default from the file: Turbo 3, base 6)
+        /// MOSS/Z-Image scheduler shift override (default from the file)
         #[arg(long)]
         shift: Option<f32>,
-        /// Z-Image prompt token cap after the chat template (default 512)
+        /// MOSS/Z-Image prompt token cap after the chat template (MOSS default 4096)
         #[arg(long)]
         max_sequence_length: Option<usize>,
-        /// Images to generate (Z-Image); image i uses seed + i and the prompt
+        /// Images to generate (MOSS/Z-Image); image i uses seed + i and the prompt
         /// is encoded once. Files: <out-stem>_<i>.<ext> when more than one.
         #[arg(long, default_value_t = 1)]
         num_images: usize,
-        /// Random seed (Z-Image: SplitMix64 + Box-Muller noise; CMF_INIT_LATENT
-        /// injects a raw f32 [1,16,H/8,W/8] latent instead)
+        /// Random seed (MOSS/Z-Image: SplitMix64 + Box-Muller noise; CMF_INIT_LATENT
+        /// applies only to compatible Z-Image latent geometry)
         #[arg(long, default_value_t = 42)]
         seed: u64,
         /// Condition/reference image (Qwen-Image-2.1, Qwen Image Edit); repeat for multiple images
@@ -2241,8 +2245,9 @@ enum Commands {
         /// Qwen Image VAE CMF (default: vae.cmf beside the transformer)
         #[arg(long)]
         vae: Option<String>,
-        /// Negative prompt. Z-Image: used when guidance > 0 (default "", the
-        /// diffusers default). Qwen Image Edit: default a space, enabling true
+        /// Negative prompt. MOSS: used whenever CFG != 1 (default "", with
+        /// source negative-branch skip at block 22). Z-Image: used when guidance > 0
+        /// (default "", the diffusers default). Qwen Image Edit: default a space, enabling true
         /// CFG. Qwen-Image-2.1: no default; CFG runs only when this is given
         /// and --cfg > 1.
         #[arg(long)]
@@ -4365,6 +4370,7 @@ async fn main() -> anyhow::Result<()> {
                 String::new()
             };
             let zimage = arch == cortiq_engine::zimagegen::ARCH_NAME;
+            let moss_image = arch == cortiq_engine::moss_imagegen::ARCH_NAME;
             if arch == cortiq_engine::qwen_image21::ARCH_NAME {
                 anyhow::ensure!(
                     text_encoder.is_none()
@@ -4393,7 +4399,34 @@ async fn main() -> anyhow::Result<()> {
                     },
                 );
             }
-            if zimage {
+            if moss_image {
+                anyhow::ensure!(
+                    images.is_empty()
+                        && text_encoder.is_none()
+                        && vae.is_none()
+                        && scheduler.is_none()
+                        && cfg_normalization.is_none()
+                        && cfg_truncation.is_none()
+                        && reference_size == 1024,
+                    "--image/--text-encoder/--vae/--scheduler/--cfg-normalization/--cfg-truncation/--reference-size do not apply to MOSS-Image"
+                );
+                cmd_moss_image(
+                    &model_dir,
+                    &prompt,
+                    MossImageCli {
+                        height,
+                        width,
+                        steps,
+                        cfg,
+                        shift,
+                        max_sequence_length,
+                        num_images,
+                        seed,
+                        negative_prompt,
+                        out,
+                    },
+                )
+            } else if zimage {
                 anyhow::ensure!(
                     images.is_empty()
                         && text_encoder.is_none()
@@ -8243,6 +8276,93 @@ fn cmd_qi21(model: &str, prompt: &str, o: Qi21Cli) -> anyhow::Result<()> {
         tm.prefill,
         tm.median_step(),
         tm.vae
+    );
+    Ok(())
+}
+
+/// `cortiq imagine` options that apply to a MOSS-Image container.
+struct MossImageCli {
+    height: Option<usize>,
+    width: Option<usize>,
+    steps: Option<usize>,
+    cfg: Option<f32>,
+    shift: Option<f32>,
+    max_sequence_length: Option<usize>,
+    num_images: usize,
+    seed: u64,
+    negative_prompt: Option<String>,
+    out: Option<String>,
+}
+
+/// MOSS-Image: Qwen3.5 encoder → MOSS DiT → Flux2 decoder. Defaults come
+/// from the CMF recipe and retain the official negative-pass skip at layer 22.
+fn cmd_moss_image(model: &str, prompt: &str, o: MossImageCli) -> anyhow::Result<()> {
+    use cortiq_engine::moss_imagegen::{generate_images, MossDefaults, MossParams};
+    let d = MossDefaults::of(&CmfModel::open(model)?);
+    let mut p = MossParams::from_defaults(&d);
+    p.height = o.height.unwrap_or(d.height);
+    p.width = o.width.unwrap_or(d.width);
+    p.steps = o.steps.unwrap_or(d.steps);
+    p.cfg = o.cfg.unwrap_or(d.cfg);
+    p.shift = o.shift.unwrap_or(d.shift);
+    p.max_tokens = o.max_sequence_length.unwrap_or(d.max_sequence_length);
+    p.num_images = o.num_images;
+    p.seed = o.seed;
+    p.negative_prompt = o.negative_prompt;
+    anyhow::ensure!(
+        p.height > 0 && p.width > 0 && p.height % 16 == 0 && p.width % 16 == 0,
+        "--height/--width must be positive multiples of 16 (got {}x{})",
+        p.width,
+        p.height
+    );
+    anyhow::ensure!(
+        p.steps > 0 && p.cfg.is_finite() && p.cfg >= 0.0,
+        "--steps must be positive and --cfg must be finite and >= 0"
+    );
+    anyhow::ensure!(
+        p.shift.is_finite() && p.shift > 0.0,
+        "--shift must be finite and > 0"
+    );
+    anyhow::ensure!(p.num_images > 0, "--num-images must be at least 1");
+    let out = o.out.unwrap_or_else(|| "out.png".into());
+    let path = std::path::Path::new(&out);
+    let names: Vec<std::path::PathBuf> = if p.num_images == 1 {
+        vec![path.to_path_buf()]
+    } else {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("png");
+        (0..p.num_images)
+            .map(|i| path.with_file_name(format!("{stem}_{i}.{ext}")))
+            .collect()
+    };
+    eprintln!(
+        "moss-image: {}x{}, {} requested steps, CFG {}, shift {}, seed {}, {} image(s)",
+        p.width, p.height, p.steps, p.cfg, p.shift, p.seed, p.num_images
+    );
+    let started = std::time::Instant::now();
+    let (images, timing) = generate_images(std::path::Path::new(model), prompt, &p, |image, step, total| {
+        eprintln!(
+            "image {}/{}: step {step}/{total} ({:.1}s)",
+            image + 1,
+            p.num_images,
+            started.elapsed().as_secs_f64()
+        );
+    })
+    .map_err(anyhow::Error::msg)?;
+    for (image, name) in images.iter().zip(&names) {
+        image.save(name).map_err(anyhow::Error::msg)?;
+        println!("{}: {}x{}, seed {}", name.display(), image.width, image.height, image.seed);
+    }
+    println!(
+        "{} MOSS image(s), {} actual steps in {:.1}s (text {:.1}s, DiT load {:.1}s, text prepare {:.1}s, median step {:.2}s, VAE {:.1}s)",
+        images.len(),
+        timing.steps.len() / images.len().max(1),
+        timing.total,
+        timing.text_encode,
+        timing.dit_load,
+        timing.text_prepare,
+        timing.median_step(),
+        timing.vae
     );
     Ok(())
 }
