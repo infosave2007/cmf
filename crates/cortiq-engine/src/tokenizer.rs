@@ -1761,6 +1761,47 @@ mod tests {
         assert!(!error.is_empty());
     }
 
+    /// MiniMax M3.1 carries an unusually featureful sidecar template: macros,
+    /// `namespace`, Python-style mapping access, custom `tojson` keywords,
+    /// a namespaced XML tool grammar and M3-specific reasoning markers.  Run
+    /// its *actual* upstream template when supplied rather than accepting a
+    /// synthetic toy template that would miss a minijinja compatibility gap.
+    #[test]
+    fn minimax_m3_chat_template_when_available() {
+        let Ok(path) = std::env::var("CMF_MINIMAX_M3_CHAT_TEMPLATE") else {
+            return;
+        };
+        let mut tok = Tokenizer::byte_level();
+        tok.chat_template = Some(std::fs::read_to_string(path).expect("read MiniMax M3 template"));
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "Keep answers concise."}),
+            serde_json::json!({"role": "user", "content": "What is 2 + 2?"}),
+        ];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Return the weather for a city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }
+        })];
+        let rendered = tok
+            .render_chat_json(&messages, Some(&tools), Some(false))
+            .expect("render MiniMax M3 native prompt");
+        assert!(rendered.starts_with("]~!b[]~b]system\n"), "{rendered:?}");
+        assert!(rendered.contains("<effort>low</effort>"), "{rendered:?}");
+        assert!(
+            rendered.contains("]<]minimax[>[<tool_call>"),
+            "{rendered:?}"
+        );
+        assert!(rendered.contains("get_weather"), "{rendered:?}");
+        assert!(rendered.ends_with("]~b]ai\n"), "{rendered:?}");
+    }
+
     /// GLM-5's generation suffix is `<|assistant|><think>`.  The direct-answer
     /// path must close that marker without splitting the `<|assistant|>` token
     /// (a bare `rfind("assistant")` inserts bytes in the middle of the marker).
