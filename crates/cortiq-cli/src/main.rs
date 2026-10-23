@@ -25,6 +25,7 @@ mod lookup;
 mod ltxcmd;
 mod ltxpack;
 mod mimo_towers;
+mod minimax_m3;
 mod moedefrag;
 mod music;
 mod mossimagepack;
