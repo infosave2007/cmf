@@ -26411,6 +26411,15 @@ fn graph_stack_payload_bytes(
     })
 }
 
+/// `GraphMoeDetachedShared` deliberately has no activation field. The pipeline
+/// admits that shape only for a separately-shaped SiLU shared expert, so it
+/// must not inherit the routed bank's activation (for example MiniMax M3's
+/// code-3 OAI contract).
+#[inline]
+fn detached_shared_graph_act_code(_routed_act: u32) -> u32 {
+    crate::gpu::GraphAct::Silu.code()
+}
+
 /// WHOLE-TOKEN decode graph: the entire layer stack (rmsnorm → attention →
 /// residual → rmsnorm → SiLU-FFN → residual, every layer) encoded into ONE
 /// command buffer with the hidden RESIDENT on the GPU — only the final hidden
@@ -26569,7 +26578,8 @@ pub fn forward_token_graph(
         up: GMat,
         down: GMat,
         width: usize,
-        /// Routed and detached experts share the layer activation contract.
+        /// Always SiLU: its public graph descriptor carries no activation
+        /// contract, and construction admits only an explicit SiLU expert.
         act: u32,
     }
     enum LFfn {
@@ -27076,7 +27086,7 @@ pub fn forward_token_graph(
                             up,
                             down,
                             width: shared.width,
-                            act: act.code(),
+                            act: detached_shared_graph_act_code(act.code()),
                         })
                     }
                     None => None,
@@ -53136,6 +53146,21 @@ fn main() {
     fn wgpu_q4tp_matvec16w_gu_gelu_tanh_matches_three_dispatches() {
         gu_matches_three_dispatches(4096, 2);
         gu_matches_three_dispatches(2048, 2);
+    }
+
+    /// A detached shared expert has no activation field in its graph
+    /// descriptor. It remains the separately verified SiLU path even when
+    /// the routed MiniMax M3 bank carries OAI code 3.
+    #[test]
+    fn wgpu_detached_shared_does_not_inherit_routed_oai_act() {
+        let routed_oai = crate::gpu::GraphAct::SwiGluOaiM3.code();
+        assert_eq!(routed_oai, 3, "in-bank MiniMax M3 experts still use OAI");
+        assert_eq!(
+            detached_shared_graph_act_code(routed_oai),
+            crate::gpu::GraphAct::Silu.code(),
+            "a detached shared expert must retain its verified SiLU contract"
+        );
+        assert_ne!(detached_shared_graph_act_code(routed_oai), routed_oai);
     }
 
     /// MiniMax M3's OAI arm must travel in the q4tp MoE uniform, rather than
