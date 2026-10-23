@@ -4471,6 +4471,56 @@ fn validate_minimax_m3_source_headers(
     )
 }
 
+/// Select the immutable M3 source shards that can contribute to a
+/// `CMF_CONVERT_ONLY` probe.  The result is intentionally based on the same
+/// early name gate as `process_file`: a pattern observes the canonical source
+/// name, before a later decoder may rename an executable payload.  That
+/// matters for compressed-tensors experts, whose source name still ends in
+/// `.weight_packed` at this point.
+///
+/// The full header inventory has already been validated when this runs, so a
+/// shard omitted here has no selected executable tensor.  Its quantization
+/// companions are not independently executable and must never force a large
+/// payload download by themselves.
+fn minimax_m3_convert_only_stream_shards(
+    arch: &ModelArch,
+    towers: MimoTowers,
+    shard_names: &[String],
+    headers: &[Vec<TensorMeta>],
+    patterns: &[String],
+) -> anyhow::Result<HashSet<String>> {
+    anyhow::ensure!(
+        arch.arch_name == minimax_m3::MINIMAX_M3_MODEL_TYPE,
+        "MiniMax-M3.1 partial stream selection requires the MiniMax M3 architecture"
+    );
+    anyhow::ensure!(
+        shard_names.len() == headers.len(),
+        "MiniMax-M3.1 partial stream selection has {} shard name(s) but {} header(s)",
+        shard_names.len(),
+        headers.len()
+    );
+    anyhow::ensure!(
+        !patterns.is_empty(),
+        "MiniMax-M3.1 partial stream selection requires at least one pattern"
+    );
+
+    let mut selected = HashSet::new();
+    for (shard, metas) in shard_names.iter().zip(headers) {
+        let selected_here = metas.iter().any(|meta| {
+            if minimax_m3_quant_companion(&meta.name) {
+                return false;
+            }
+            canon_name_for_arch(arch, &meta.name, towers).is_some_and(|name| {
+                patterns.iter().any(|pattern| glob_match(pattern, &name))
+            })
+        });
+        if selected_here {
+            selected.insert(shard.clone());
+        }
+    }
+    Ok(selected)
+}
+
 /// Memory-map a model dir's weights (single file or sharded index).
 pub(crate) fn open_model(dir: &Path) -> anyhow::Result<Vec<SafeTensors>> {
     open_model_filtered(dir, &std::collections::HashSet::new())
@@ -8412,6 +8462,20 @@ pub fn run_convert_multi_excluding(
             "MiniMax-M3.1 conversion supports only q4tp (mixed routed-expert profile) or q8_2f; q2tp/fp4 and other profiles are not validated"
         );
     }
+    // Parse this before M3's immutable header preflight.  Its patterns let
+    // the preflight tell a diagnostic probe exactly which source shards can
+    // contain an executable selected tensor, avoiding a pointless download
+    // of the other 200+ GB while preserving the full header validation.
+    let convert_only = match std::env::var(CONVERT_ONLY_ENV) {
+        Ok(spec) => {
+            let pats = parse_convert_only(&spec)?;
+            eprintln!(
+                "  {CONVERT_ONLY_ENV}={spec}: writing a PARTIAL file (only matching tensors) — a probe, not a model"
+            );
+            Some(pats)
+        }
+        Err(_) => None,
+    };
     // The target model's grammar is an executable part of the checkpoint
     // contract.  Validate and retain it before making any remote header
     // requests or downloading the first enormous shard, so an artifact can
@@ -8431,6 +8495,9 @@ pub fn run_convert_multi_excluding(
     } else {
         None
     };
+    // Set only for an immutable Hub-streamed M3 probe.  Local source walks
+    // retain their established resumable/open-all-shards behavior.
+    let mut minimax_m3_partial_stream_shards: Option<HashSet<String>> = None;
     if let Some(layout) = minimax_m3_layout.as_ref() {
         let headers = if let Some(repo) = stream_repo.as_deref() {
             anyhow::ensure!(
@@ -8457,6 +8524,21 @@ pub fn run_convert_multi_excluding(
                 .collect::<anyhow::Result<Vec<_>>>()?
         };
         validate_minimax_m3_source_headers(layout, &headers)?;
+        if let (Some(patterns), Some(_)) = (convert_only.as_deref(), stream_repo.as_deref()) {
+            let selected = minimax_m3_convert_only_stream_shards(
+                &arch,
+                towers,
+                &stream_shards,
+                &headers,
+                patterns,
+            )?;
+            eprintln!(
+                "  MiniMax-M3.1: partial probe needs payload from {}/{} immutable source shard(s); the remainder will be manifest-marked without download",
+                selected.len(),
+                stream_shards.len()
+            );
+            minimax_m3_partial_stream_shards = Some(selected);
+        }
         eprintln!(
             "  MiniMax-M3.1: exact safetensors source inventory verified ({} tensors)",
             headers.iter().map(Vec::len).sum::<usize>()
@@ -8816,17 +8898,6 @@ pub fn run_convert_multi_excluding(
     } else {
         1.0
     };
-    let convert_only = match std::env::var(CONVERT_ONLY_ENV) {
-        Ok(spec) => {
-            let pats = parse_convert_only(&spec)?;
-            eprintln!(
-                "  {CONVERT_ONLY_ENV}={spec}: writing a PARTIAL file (only matching tensors) — a probe, not a model"
-            );
-            Some(pats)
-        }
-        Err(_) => None,
-    };
-
     let mut process_file = |file: &SafeTensors,
                             files: &[SafeTensors],
                             batches: &mut [Vec<TensorSpec>],
@@ -9991,6 +10062,35 @@ pub fn run_convert_multi_excluding(
                     si + 1,
                     ns
                 );
+                progress((si as f32 + 1.0) / ns as f32);
+                continue;
+            }
+            if minimax_m3_partial_stream_shards
+                .as_ref()
+                .is_some_and(|selected| !selected.contains(sname))
+            {
+                // M3's immutable header preflight proved that this shard
+                // cannot contribute to the requested partial probe.  A mark
+                // is still required for each active writer: on resume it is
+                // the durable proof that an intentionally empty shard needs
+                // neither a re-download nor a second pass.
+                eprintln!(
+                    "  [stream {}/{}] {sname} — MiniMax partial probe: no selected executable tensor, network skip",
+                    si + 1,
+                    ns
+                );
+                for i in 0..outputs.len() {
+                    if !active[i] {
+                        continue;
+                    }
+                    let writer = writers[i].as_mut().ok_or_else(|| {
+                        anyhow::anyhow!("output {} is already finalized", outputs[i].1)
+                    })?;
+                    writer
+                        .mark(sname)
+                        .map_err(|e| anyhow::anyhow!("manifest: {e}"))?;
+                    done_shards[i].insert(sname.clone());
+                }
                 progress((si as f32 + 1.0) / ns as f32);
                 continue;
             }
@@ -11346,6 +11446,81 @@ pub(crate) mod tests {
         assert!(!minimax_m3_quant_companion(
             "language_model.model.layers.3.block_sparse_moe.experts.0.w1.weight_packed"
         ));
+    }
+
+    #[test]
+    fn minimax_m3_partial_probe_selects_only_executable_stream_shards() {
+        let arch = build_arch(&published_minimax_m3_config()).unwrap();
+        let shards = vec![
+            "companions.safetensors".to_string(),
+            "router.safetensors".to_string(),
+            "expert.safetensors".to_string(),
+        ];
+        let meta = |name: &str| TensorMeta {
+            name: name.to_string(),
+            dtype: "F32".to_string(),
+            shape: vec![1],
+            start: 0,
+            end: 4,
+        };
+        let headers = vec![
+            vec![
+                meta("language_model.model.layers.3.block_sparse_moe.experts.7.w1.weight_scale"),
+                meta("vision_tower.blocks.0.attn.q_proj.weight"),
+            ],
+            vec![meta(
+                "language_model.model.layers.3.block_sparse_moe.e_score_correction_bias",
+            )],
+            vec![meta(
+                "language_model.model.layers.3.block_sparse_moe.experts.7.w1.weight_packed",
+            )],
+        ];
+
+        let router = minimax_m3_convert_only_stream_shards(
+            &arch,
+            MimoTowers::TextOnly,
+            &shards,
+            &headers,
+            &["model.layers.3.mlp.expert_bias".to_string()],
+        )
+        .unwrap();
+        assert_eq!(router, HashSet::from(["router.safetensors".to_string()]));
+
+        // A quantization companion must not make a shard eligible by itself,
+        // even when the probe explicitly names its canonical source spelling.
+        let companion = minimax_m3_convert_only_stream_shards(
+            &arch,
+            MimoTowers::TextOnly,
+            &shards,
+            &headers,
+            &["model.layers.3.mlp.experts.7.gate_proj.weight_scale".to_string()],
+        )
+        .unwrap();
+        assert!(companion.is_empty(), "companions must not select a shard");
+
+        // This intentionally uses the early canonical source spelling.  The
+        // current conversion gate runs before `.weight_packed` becomes the
+        // executable `.weight`, so the stream selector must mirror it.
+        let expert = minimax_m3_convert_only_stream_shards(
+            &arch,
+            MimoTowers::TextOnly,
+            &shards,
+            &headers,
+            &["model.layers.3.mlp.experts.7.gate_proj.weight_packed".to_string()],
+        )
+        .unwrap();
+        assert_eq!(expert, HashSet::from(["expert.safetensors".to_string()]));
+
+        let err = minimax_m3_convert_only_stream_shards(
+            &arch,
+            MimoTowers::TextOnly,
+            &shards[..2],
+            &headers,
+            &["model.layers.3.mlp.expert_bias".to_string()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("shard name(s)"), "{err}");
     }
 
     #[test]
