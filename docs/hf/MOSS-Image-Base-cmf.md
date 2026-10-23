@@ -20,9 +20,9 @@ tags:
 
 # MOSS-Image-Base — CMF
 
-> **Publication draft — do not upload this card until the artifact table and
-> sample links below have been filled from the release-validation log.** It is
-> intentionally explicit about what has and has not been measured.
+> Native MOSS-Image support is available in **cortiq v0.8.30**. This is a
+> separate CMF publication for MOSS-Image-Base; it does not replace any other
+> model card or repository.
 
 This repository packages
 [OpenMOSS-Team/MOSS-Image-Base](https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base)
@@ -46,21 +46,37 @@ three explicit residency stages — text encoder, DiT, then VAE — so a compone
 is released before the next one claims GPU memory. This is important on 24 GB
 Vulkan cards and unified-memory Metal systems.
 
-## Release status
+## Release files and validation
 
-The following values are deliberately **pending** until the final q8/q4 packs
-are generated, verified, and rendered on the release hardware. Do not replace
-them with estimates.
-
-| artifact | bytes / SHA-256 | validation | measured Vulkan / Metal speed |
+| artifact | exact bytes | SHA-256 | profile |
 |---|---:|---|---|
-| `moss-image-base-q8_2f.cmf` | pending | pending | pending |
-| `moss-image-base-q4tp.cmf` | pending | pending | pending |
+| [`moss-image-base-q8_2f.cmf`](moss-image-base-q8_2f.cmf) | 13,256,239,565 (12.346 GiB) | `f4dd15a29b58bf6185f5018b40614a65b7ade33e2617339d327f5dc1c6f38e11` | quality-first default |
+| [`moss-image-base-q4tp.cmf`](moss-image-base-q4tp.cmf) | 10,856,278,477 (10.111 GiB) | `c6250b2bab153a0a0b9f6c774ea77fc4a80d472e12b9a48d3d498a825b94f8dd` | lower DiT footprint |
 
-The release must include a `.sha256` file beside every CMF and must report only
-measurements from the exact uploaded files. A successful render is a functional
-smoke test; it is not by itself a claim of numerical parity or broad image
-quality equivalence with the upstream PyTorch pipeline.
+A matching `.sha256` file is published beside each CMF. Both final files passed
+`cortiq verify`, an external SHA-256 check, a Vulkan CFG render, and the
+source-pinned template/Flux2-decoder contract tests. The latter checks the
+stored template token contract and the BatchNorm → 2×2 unpatch →
+post-quant-convolution → decoder path on a fixed source oracle latent.
+
+### Measured Vulkan reference
+
+These are release-hardware measurements, not estimates: NVIDIA GeForce RTX
+3090 (24 GiB), NVIDIA Vulkan driver 595.91.07, `cortiq v0.8.30`, 512×512,
+8 steps, CFG 3, shift 5, seed 42, with the exact commands below. `median step`
+includes the two DiT passes required by CFG; text preparation, model loading
+and VAE decoding are reported separately by the CLI.
+
+| file | total | median DiT step | text / DiT load / VAE |
+|---|---:|---:|---:|
+| q8_2f | 348.8 s | 41.66 s | 2.6 s / 0.3 s / 6.7 s |
+| q4tp | 333.7 s | 39.80 s | 2.7 s / 0.3 s / 7.1 s |
+
+No Metal performance number is claimed here: the release uses the same staged
+GPU-residency design and Metal-capable projection/attention paths, but this
+specific release was not benchmarked on Apple hardware. A successful render is
+a functional smoke test, not a claim of numerical parity or broad image-quality
+equivalence with upstream PyTorch.
 
 ## Quick start
 
@@ -117,56 +133,57 @@ assistant `<think>` suffix. The scheduler is stored with the model and uses the
 source nearest-grid flow schedule; it is not substituted with a generic Euler
 ladder.
 
-## Reproducible examples and samples
+## Reproducible examples and inspected samples
 
-The following commands define the samples that should be uploaded under
-`samples/` together with this card. **The image links are intentionally absent
-until those files have actually been generated and inspected.**
+The two images below were generated and visually inspected on the Vulkan
+reference system using the exact 512×512/8-step commands shown here. They are
+intentionally a fast, reproducible demonstration rather than a claim that
+8 steps replaces the upstream 1024×1024/50-step recipe.
+
+| q8_2f | q4tp |
+|---|---|
+| ![q8_2f fox reading in a library](samples/fox-512-q8.png) | ![q4tp fox reading in a library](samples/fox-512-q4tp.png) |
 
 ```bash
-# samples/fox-1024-q8.png
-cortiq imagine moss-image-base-q8_2f.cmf \
-  --prompt "A small red fox reading a book in a sunlit library, highly detailed." \
-  --width 1024 --height 1024 --steps 50 --cfg 3 --shift 5 --seed 42 \
-  --out samples/fox-1024-q8.png
+PROMPT='A small red fox reading a book in a sunlit library, highly detailed, cinematic composition'
 
-# samples/refrigerator-1024-q8.png
-cortiq imagine moss-image-base-q8_2f.cmf \
-  --prompt "A stainless-steel refrigerator with the Chinese text '新鲜每一天' on its door." \
-  --width 1024 --height 1024 --steps 50 --cfg 3 --shift 5 --seed 7 \
-  --out samples/refrigerator-1024-q8.png
+# samples/fox-512-q8.png
+WGPU_BACKEND=vulkan CMF_GPU=wgpu cortiq imagine moss-image-base-q8_2f.cmf \
+  --prompt "$PROMPT" --width 512 --height 512 --steps 8 --cfg 3 --shift 5 \
+  --seed 42 --out samples/fox-512-q8.png
 
-# samples/fox-1024-q4tp.png — same recipe, lower-precision DiT
-cortiq imagine moss-image-base-q4tp.cmf \
-  --prompt "A small red fox reading a book in a sunlit library, highly detailed." \
-  --width 1024 --height 1024 --steps 50 --cfg 3 --shift 5 --seed 42 \
-  --out samples/fox-1024-q4tp.png
+# samples/fox-512-q4tp.png
+WGPU_BACKEND=vulkan CMF_GPU=wgpu cortiq imagine moss-image-base-q4tp.cmf \
+  --prompt "$PROMPT" --width 512 --height 512 --steps 8 --cfg 3 --shift 5 \
+  --seed 42 --out samples/fox-512-q4tp.png
 ```
 
-The CMF-native random generator is deterministic for a given CMF, command and
-seed, but it is not presented as a bit-identical replacement for PyTorch's
-random-generator sequence. Do not claim that the same integer seed recreates
-the upstream image without a direct parity measurement.
+For the source-quality recipe, use 1024×1024 and 50 steps as described above;
+expect significantly higher runtime. The CMF-native random generator is
+deterministic for a given CMF, command and seed, but it is not presented as a
+bit-identical replacement for PyTorch's random-generator sequence. Do not
+claim that the same integer seed recreates the upstream image without a direct
+parity measurement.
 
-## Validation required before publishing
+## Release validation record
 
-The source contract is pinned to the revision above. Release validation must
-record all of the following against the final artifact, not a temporary smoke
-file:
+The source contract is pinned to the revision above. The following checks were
+run against the final release files (or, where noted, against the pinned source
+oracle):
 
-1. `cortiq verify` and the external SHA-256 check for both profiles;
-2. exact embedded-template token IDs for the source English, Chinese and empty
+1. `cortiq verify` and external SHA-256 checks for q8_2f and q4tp;
+2. exact embedded-template token IDs for the pinned English, Chinese and empty
    prompt fixtures;
 3. the Flux2 BN → 2×2 unpatch → post-quant-convolution → decoder oracle on a
-   fixed latent;
-4. a q8 render with CFG disabled and one with the source CFG/negative-layer-skip
-   path enabled, then the same two functional paths for q4tp;
-5. inspected fixed-seed samples and measured stage timings/peak memory on each
-   hardware/backend that is listed on this card.
+   fixed source latent;
+4. Vulkan renders for q8_2f and q4tp through the CFG / negative-layer-skip
+   path, plus inspected fixed-seed q8_2f and q4tp samples above;
+5. the measured 512×512 timing record above on the named RTX 3090/Vulkan
+   reference system.
 
-Only after those checks may this card replace the `pending` cells in the
-release-status table with artifact sizes, checksums, sample links and measured
-performance.
+The test suite validates critical component contracts. It does **not** replace a
+full end-to-end numerical-parity oracle for the upstream DiT, so the card makes
+no bit-exact PyTorch-equivalence claim.
 
 ## Options
 
