@@ -173,9 +173,29 @@ fn norm_of(c: &Ctx, r: &VaeNormRef) -> VNorm {
     }
 }
 
+/// The GroupNorm shader writes float4s, but its reduction has a scalar-tail
+/// path for compact groups.  Keep admission deliberately narrow: every
+/// channel vector must remain float4 aligned and the fixed scratch planes can
+/// hold at most 64 groups.
+fn norm_supported(r: &VaeNormRef, ch: usize) -> bool {
+    ch % 4 == 0
+        && r.groups != 0
+        && r.groups <= 64
+        && ch % r.groups == 0
+        && r.w.len() == ch
+        && r.b.len() == ch
+}
+
 fn res_of(c: &Ctx, r: &VaeResnetRef) -> Result<VRes, String> {
     let (cin, cout) = (r.conv1.ic, r.conv1.oc);
-    if cin % 32 != 0 || cout % 64 != 0 || cin % (4 * r.norm1.groups) != 0 || cout % (4 * r.norm2.groups) != 0 {
+    // Conv inputs are loaded in 32-wide half lanes.  Outputs may be only
+    // 32-wide (Flux2's final 192→96 stage); `zv_conv` guards their padded
+    // 64-row tile before it stores into the logical NHWC stride.
+    if cin % 32 != 0
+        || cout % 32 != 0
+        || !norm_supported(&r.norm1, cin)
+        || !norm_supported(&r.norm2, cout)
+    {
         return Err(format!("vae resnet {cin}->{cout}"));
     }
     Ok(VRes {
@@ -195,6 +215,12 @@ fn res_of(c: &Ctx, r: &VaeResnetRef) -> Result<VRes, String> {
 fn build(c: &Ctx, a: &VaeChainArgs) -> Result<VaeDev, String> {
     let at = &a.mid_attn;
     let ch = at.c;
+    if !norm_supported(&at.norm, ch) {
+        return Err(format!("vae attention norm {ch}"));
+    }
+    if a.conv_out.ic % 32 != 0 || !norm_supported(&a.norm_out, a.conv_out.ic) {
+        return Err(format!("vae output norm {}", a.conv_out.ic));
+    }
     let scale = 1.0 / (ch as f32).sqrt();
     Ok(VaeDev {
         key: a.key,
@@ -311,7 +337,12 @@ impl VRec<'_> {
         let k = if cv.taps == 0 { k_plain } else { cv.taps * cv.icp };
         let pv = PVc {
             n: n as u32,
-            rows: cv.ocp as u32,
+            // Normal NHWC outputs use `ldy` as their logical channel
+            // stride.  The MMA tile still computes padded rows, and the
+            // shader drops those rows before they can spill into the next
+            // pixel.  EPI=2 is the attention V transpose [channel][token],
+            // whose `ldy` is a token stride rather than a channel count.
+            rows: (if epi == 2 { cv.ocp } else { ldy }) as u32,
             k: k as u32,
             ic: cv.icp as u32,
             h: hw.0 as u32,
@@ -662,4 +693,131 @@ pub(crate) fn decode(a: &VaeChainArgs, z: &[f32], h: usize, w: usize, out: &mut 
 
 fn env_chunk() -> usize {
     std::env::var("CMF_ZI_VAE_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(4096).max(64) / 64 * 64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cpu_group_norm(x: &[f32], w: &[f32], b: &[f32], n: usize, ch: usize, groups: usize) -> Vec<f32> {
+        let cg = ch / groups;
+        let mut out = vec![0.0; x.len()];
+        for g in 0..groups {
+            let c0 = g * cg;
+            let mut sum = 0.0;
+            for px in 0..n {
+                for c in c0..c0 + cg {
+                    sum += x[px * ch + c];
+                }
+            }
+            let mean = sum / (n * cg) as f32;
+            let mut sumsq = 0.0;
+            for px in 0..n {
+                for c in c0..c0 + cg {
+                    let d = x[px * ch + c] - mean;
+                    sumsq += d * d;
+                }
+            }
+            let inv = (sumsq / (n * cg) as f32 + 1e-6).sqrt().recip();
+            for px in 0..n {
+                for c in c0..c0 + cg {
+                    out[px * ch + c] = (x[px * ch + c] - mean) * inv * w[c] + b[c];
+                }
+            }
+        }
+        out
+    }
+
+    /// Flux2's decoder uses 32 groups over 96 and 192 channels.  The
+    /// compact group widths (3 and 6) are exactly the path that must not use
+    /// a whole-float4 statistic.
+    #[test]
+    fn compact_group_norm_matches_cpu_reference() {
+        let Some(c) = super::super::super::ctx() else {
+            eprintln!("Metal unavailable; compact GroupNorm test skipped");
+            return;
+        };
+        let Some(p) = pipes(c) else {
+            eprintln!("Metal Z-Image pipelines unavailable; compact GroupNorm test skipped");
+            return;
+        };
+        for &ch in &[96usize, 192] {
+            let n = 19;
+            let x: Vec<f32> = (0..n * ch)
+                .map(|i| (((i * 17 % 97) as f32) - 48.0) / 17.0)
+                .collect();
+            let w: Vec<f32> = (0..ch).map(|i| 0.55 + (i % 13) as f32 * 0.03).collect();
+            let b: Vec<f32> = (0..ch).map(|i| ((i % 11) as f32 - 5.0) * 0.02).collect();
+            let xb = buf_from(c, &x);
+            let yb = buf_zeroed(c, n * ch * 4);
+            let norm = VNorm { w: buf_from(c, &w), b: buf_from(c, &b), groups: 32 };
+            let mut rec = VRec {
+                c,
+                p,
+                done: Vec::new(),
+                cur: None,
+                part: buf_zeroed(c, 64 * 256 * 4),
+                stat: buf_zeroed(c, 64 * 2 * 4),
+            };
+            rec.gn(&norm, &xb, &yb, n, ch, false, false);
+            assert!(rec.finish(), "Metal GroupNorm command failed for {ch} channels");
+            let got = unsafe { std::slice::from_raw_parts(yb.contents() as *const f32, n * ch) };
+            let want = cpu_group_norm(&x, &w, &b, n, ch, 32);
+            let max_abs = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(max_abs < 3e-4, "{ch}-channel GroupNorm max abs error {max_abs}");
+        }
+    }
+
+    /// The 96-channel final Flux2 stage occupies two 64-row MMA tiles.  The
+    /// second tile's padded rows must not write into the following NHWC
+    /// pixel; compare every logical output against a half-input/half-weight
+    /// CPU reference.
+    #[test]
+    fn conv_96_output_tail_matches_cpu_reference() {
+        let Some(c) = super::super::super::ctx() else {
+            eprintln!("Metal unavailable; 96-channel conv test skipped");
+            return;
+        };
+        let Some(p) = pipes(c) else {
+            eprintln!("Metal Z-Image pipelines unavailable; 96-channel conv test skipped");
+            return;
+        };
+        let (n, ic, oc) = (5usize, 32usize, 96usize);
+        let x: Vec<f32> = (0..n * ic).map(|i| ((i * 11 % 31) as f32 - 15.0) * 0.02).collect();
+        let w: Vec<f32> = (0..oc * ic).map(|i| ((i * 7 % 29) as f32 - 14.0) * 0.01).collect();
+        let b: Vec<f32> = (0..oc).map(|i| ((i % 9) as f32 - 4.0) * 0.015).collect();
+        let cv = conv_of(c, &VaeConvRef { w: &w, b: &b, oc, ic, k: 1 }, 1.0).unwrap();
+        let xb = half_buf(c, &x);
+        let yb = buf_zeroed(c, n * oc * 4);
+        let mut rec = VRec {
+            c,
+            p,
+            done: Vec::new(),
+            cur: None,
+            part: buf_zeroed(c, 64 * 256 * 4),
+            stat: buf_zeroed(c, 64 * 2 * 4),
+        };
+        rec.conv(&cv, (&xb, 0), (&yb, 0), None, n, (1, n), false, 0, oc, 0, 0);
+        assert!(rec.finish(), "Metal 96-channel conv command failed");
+        let got = unsafe { std::slice::from_raw_parts(yb.contents() as *const f32, n * oc) };
+        let h = |v: f32| cortiq_core::quant::f16_to_f32(cortiq_core::quant::f32_to_f16(v));
+        for px in 0..n {
+            for out in 0..oc {
+                let want = b[out]
+                    + (0..ic)
+                        .map(|inp| h(w[out * ic + inp]) * h(x[px * ic + inp]))
+                        .sum::<f32>();
+                let err = (got[px * oc + out] - want).abs();
+                assert!(
+                    err <= 2e-3 + want.abs() * 2e-3,
+                    "pixel {px}, channel {out}: got {}, want {want}, abs error {err}",
+                    got[px * oc + out],
+                );
+            }
+        }
+    }
 }
