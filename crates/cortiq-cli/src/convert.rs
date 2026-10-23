@@ -6110,6 +6110,17 @@ pub(crate) const AUTO_QUANT: &str = "auto";
 /// few layers of a huge checkpoint, never for serving; its provenance says so.
 const CONVERT_ONLY_ENV: &str = "CMF_CONVERT_ONLY";
 
+/// The published M3 checkpoint whose full source contract is frozen in
+/// `minimax_m3`. Recognizing it before any metadata fetch lets conversion
+/// bind the very first config/template/index request to one commit instead of
+/// first sampling a moving `main` branch and trying to repair it later.
+const MINIMAX_M3_PUBLISHED_HF_REPO: &str = "MiniMaxAI/MiniMax-M3.1-Flash";
+
+fn minimax_m3_published_hf_repo(repo: &str) -> bool {
+    repo.trim_matches('/')
+        .eq_ignore_ascii_case(MINIMAX_M3_PUBLISHED_HF_REPO)
+}
+
 fn parse_convert_only(spec: &str) -> anyhow::Result<Vec<String>> {
     let pats: Vec<String> = spec.split(',').map(|p| p.trim().to_string()).collect();
     anyhow::ensure!(
@@ -7390,10 +7401,51 @@ pub(crate) fn hf_fetch_file(
 
 /// Local cache dir for a downloaded HF repo (`~/.cache/cortiq/hf/owner--name`).
 fn hf_cache_dir(repo: &str) -> anyhow::Result<std::path::PathBuf> {
+    hf_cache_dir_at_revision(repo, None)
+}
+
+/// A Hub commit SHA is safe to place both in a cache-path component and in a
+/// `resolve/{revision}` URL. Keep this deliberately stricter than a generic
+/// ref: conversion obtains it from the model API, and accepting branches or
+/// paths here would reintroduce the moving-source problem this helper avoids.
+fn hf_commit_sha(sha: &str) -> Option<&str> {
+    (sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(sha)
+}
+
+/// Resolve a Hub file URL at one immutable revision. `None` preserves the
+/// historical `main` behavior for ordinary conversions; MiniMax M3 supplies a
+/// checked commit SHA so its metadata, header preflight, and every streamed
+/// shard cannot drift apart during a multi-hour pass.
+fn hf_resolve_base(repo: &str, revision: Option<&str>) -> String {
+    let revision = revision.unwrap_or("main");
+    format!("https://huggingface.co/{repo}/resolve/{revision}")
+}
+
+fn hf_cache_leaf(repo: &str, revision: Option<&str>) -> anyhow::Result<String> {
+    let mut leaf = repo.replace('/', "--");
+    if let Some(revision) = revision {
+        let revision = hf_commit_sha(revision).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Hugging Face revision must be a 40-character hexadecimal commit SHA, got {revision:?}"
+            )
+        })?;
+        leaf.push_str("--rev-");
+        leaf.push_str(revision);
+    }
+    Ok(leaf)
+}
+
+/// A revision-specific metadata/shard cache. A completed M3 conversion must
+/// never reuse `config.json` or an index cached from a different moving `main`
+/// revision, even if the file names happen to match.
+fn hf_cache_dir_at_revision(
+    repo: &str,
+    revision: Option<&str>,
+) -> anyhow::Result<std::path::PathBuf> {
     let base = std::env::var_os("HOME")
         .map(|h| std::path::PathBuf::from(h).join(".cache/cortiq/hf"))
         .unwrap_or_else(|| std::path::PathBuf::from(".cortiq-hf"));
-    let dir = base.join(repo.replace('/', "--"));
+    let dir = base.join(hf_cache_leaf(repo, revision)?);
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -7664,6 +7716,36 @@ fn repo_files(agent: &ureq::Agent, repo: &str, token: Option<&str>) -> Vec<Strin
     }
 }
 
+/// Resolve the immutable commit behind a Hub model API response. This is
+/// intentionally separate from `repo_files`: listing sibling names is
+/// best-effort for UX, while MiniMax M3 must fail before writing an artifact
+/// if it cannot bind every request to one verified source commit.
+fn hf_model_commit_sha(
+    agent: &ureq::Agent,
+    repo: &str,
+    token: Option<&str>,
+) -> anyhow::Result<String> {
+    let url = format!("https://huggingface.co/api/models/{repo}");
+    let response = with_retry(4, || {
+        auth(agent.get(&url), token)
+            .call()
+            .map_err(|error| anyhow::anyhow!("Hugging Face model API {url}: {error}"))
+    })?;
+    let value: serde_json::Value = response
+        .into_json()
+        .map_err(|error| anyhow::anyhow!("parse Hugging Face model API {url}: {error}"))?;
+    let sha = value
+        .get("sha")
+        .and_then(serde_json::Value::as_str)
+        .and_then(hf_commit_sha)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Hugging Face model API {url} did not return a 40-character hexadecimal commit SHA"
+            )
+        })?;
+    Ok(sha.to_owned())
+}
+
 /// Fetch a HF repo's convertible files (config, tokenizer, weights) into the
 /// cache, with parallel chunked downloads for the weight shards.
 pub(crate) fn hf_download(repo: &str, token: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
@@ -7678,8 +7760,20 @@ pub(crate) fn hf_download_opts(
     token: Option<&str>,
     weights: bool,
 ) -> anyhow::Result<(std::path::PathBuf, Vec<String>)> {
-    let dir = hf_cache_dir(repo)?;
-    let base = format!("https://huggingface.co/{repo}/resolve/main");
+    hf_download_opts_at_revision(repo, token, weights, None)
+}
+
+/// Revision-aware form of [`hf_download_opts`]. It is currently used by the
+/// fail-closed MiniMax M3 route; ordinary callers retain their historical
+/// moving-`main` cache and behavior through the wrapper above.
+fn hf_download_opts_at_revision(
+    repo: &str,
+    token: Option<&str>,
+    weights: bool,
+    revision: Option<&str>,
+) -> anyhow::Result<(std::path::PathBuf, Vec<String>)> {
+    let dir = hf_cache_dir_at_revision(repo, revision)?;
+    let base = hf_resolve_base(repo, revision);
     let threads = hf_threads();
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(20))
@@ -8249,6 +8343,9 @@ pub fn run_convert_multi_excluding(
     let downloaded;
     let mut stream_shards: Vec<String> = Vec::new();
     let mut stream_repo: Option<String> = None;
+    // Only the M3 route fills this. Other streamed converters deliberately
+    // preserve their established `main` behavior below.
+    let mut stream_revision: Option<String> = None;
     let local_ready_dir = local_ready_dir_from_env();
     let dir: &Path = if Path::new(model).join("config.json").exists() {
         Path::new(model)
@@ -8258,9 +8355,25 @@ pub fn run_convert_multi_excluding(
             "{LOCAL_READY_DIR_ENV} requires a local model directory; unset it for HF hub streaming"
         );
         eprintln!("downloading {model} from Hugging Face (streamed)…");
-        let (d, shards) = hf_download_opts(model, hf_token, false)?;
+        let repo = model.trim_matches('/');
+        let (d, shards) = if minimax_m3_published_hf_repo(repo) {
+            // Do this *before* config/template/index download: a 428B source
+            // must never classify itself through a moving `main` response.
+            let revision = hf_model_commit_sha(&hf_agent(), repo, hf_token).map_err(|error| {
+                anyhow::anyhow!(
+                    "MiniMax-M3.1 conversion requires an immutable Hugging Face commit for {repo}: {error:#}"
+                )
+            })?;
+            eprintln!("  MiniMax-M3.1: pinning Hugging Face source revision {revision}");
+            let downloaded =
+                hf_download_opts_at_revision(repo, hf_token, false, Some(&revision))?;
+            stream_revision = Some(revision);
+            downloaded
+        } else {
+            hf_download_opts(repo, hf_token, false)?
+        };
         stream_shards = shards;
-        stream_repo = Some(model.to_string());
+        stream_repo = Some(repo.to_string());
         downloaded = d;
         downloaded.as_path()
     } else {
@@ -8279,6 +8392,12 @@ pub fn run_convert_multi_excluding(
          `hf download {model} --local-dir DIR`, then `cortiq convert --model DIR`"
     );
     let mut arch = build_arch(&config)?;
+    if arch.arch_name == minimax_m3::MINIMAX_M3_MODEL_TYPE && stream_repo.is_some() {
+        anyhow::ensure!(
+            stream_revision.is_some(),
+            "MiniMax-M3.1 streamed conversion accepts only the reviewed source repo {MINIMAX_M3_PUBLISHED_HF_REPO}; use a local immutable checkpoint directory for another repo"
+        );
+    }
     if arch.arch_name == minimax_m3::MINIMAX_M3_MODEL_TYPE {
         // Reject uncalibrated profiles before the header-only source
         // inventory walk below.  On a streamed 428B source even metadata
@@ -8319,7 +8438,12 @@ pub fn run_convert_multi_excluding(
                 "MiniMax-M3.1 preflight: streamed source has no safetensors shard list"
             );
             let agent = hf_agent();
-            let base = format!("https://huggingface.co/{repo}/resolve/main");
+            let revision = stream_revision.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "MiniMax-M3.1 preflight: streamed source was not pinned to an immutable commit"
+                )
+            })?;
+            let base = hf_resolve_base(repo, Some(revision));
             stream_shards
                 .iter()
                 .map(|name| {
@@ -9848,7 +9972,7 @@ pub fn run_convert_multi_excluding(
     if stream_repo.is_some() || local_ready_dir.is_some() {
         let base = stream_repo
             .as_deref()
-            .map(|repo| format!("https://huggingface.co/{repo}/resolve/main"));
+            .map(|repo| hf_resolve_base(repo, stream_revision.as_deref()));
         let threads = hf_threads();
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(20))
@@ -10138,20 +10262,16 @@ pub fn run_convert_multi_excluding(
         let layout = minimax_m3_layout
             .as_ref()
             .expect("M3 provenance follows M3 source preflight");
-        // The existing hub downloader resolves `main` for both the metadata
-        // and streamed shards.  Do not invent an immutable revision here:
-        // recording that accurately would require pinning config/index and
-        // every later shard fetch together, which this route deliberately
-        // does not change.
-        let source_resolution = if stream_repo.is_some() {
-            "Hugging Face resolve/main at conversion time; no immutable revision recorded"
+        let source_resolution = if let Some(revision) = stream_revision.as_deref() {
+            format!("Hugging Face resolve/{revision} (immutable commit)")
         } else {
-            "local checkpoint directory"
+            "local checkpoint directory".to_string()
         };
         p["minimax_m3"] = serde_json::json!({
             "source_context_tokens": layout.max_position_embeddings,
             "served_context_tokens": MINIMAX_M3_DENSE_SAFE_CONTEXT,
             "source_resolution": source_resolution,
+            "source_revision": stream_revision,
             "attention_runtime": "dense fallback semantically equivalent through 16 sparse blocks (<=2048 tokens); native sparse attention not yet enabled",
             "text_backbone_only": true,
             "vision_video_runtime": "not included",
@@ -10474,6 +10594,37 @@ pub(crate) mod tests {
             parse_hf_threads(Some("999999999999999999999999")),
             HF_DEFAULT_THREADS
         );
+    }
+
+    #[test]
+    fn minimax_m3_pinned_hub_revision_uses_immutable_url_and_cache() {
+        let sha = "54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e";
+        assert!(minimax_m3_published_hf_repo("MiniMaxAI/MiniMax-M3.1-Flash"));
+        assert!(minimax_m3_published_hf_repo(
+            "/minimaxai/minimax-m3.1-flash/"
+        ));
+        assert!(!minimax_m3_published_hf_repo("someone/MiniMax-M3.1-Flash"));
+        assert_eq!(hf_commit_sha(sha), Some(sha));
+        assert!(hf_commit_sha("main").is_none());
+        assert!(hf_commit_sha("54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5").is_none());
+        assert!(hf_commit_sha("z4e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e").is_none());
+        assert_eq!(
+            hf_resolve_base("MiniMaxAI/MiniMax-M3.1-Flash", Some(sha)),
+            format!("https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash/resolve/{sha}")
+        );
+        assert_eq!(
+            hf_resolve_base("MiniMaxAI/MiniMax-M3.1-Flash", None),
+            "https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash/resolve/main"
+        );
+        assert_eq!(
+            hf_cache_leaf("MiniMaxAI/MiniMax-M3.1-Flash", Some(sha)).unwrap(),
+            format!("MiniMaxAI--MiniMax-M3.1-Flash--rev-{sha}")
+        );
+        assert_ne!(
+            hf_cache_leaf("MiniMaxAI/MiniMax-M3.1-Flash", Some(sha)).unwrap(),
+            hf_cache_leaf("MiniMaxAI/MiniMax-M3.1-Flash", None).unwrap()
+        );
+        assert!(hf_cache_leaf("MiniMaxAI/MiniMax-M3.1-Flash", Some("main")).is_err());
     }
 
     #[test]
