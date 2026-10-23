@@ -58,6 +58,8 @@ pub mod mm_ab;
 pub mod mmh3;
 pub mod mmh3ups;
 pub mod music3;
+pub mod moss_image;
+pub mod moss_imagegen;
 pub mod nystrom;
 pub mod pin;
 pub mod pipeline;

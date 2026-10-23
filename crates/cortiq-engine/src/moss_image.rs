@@ -1,0 +1,799 @@
+//! Native MOSS-Image denoiser.
+//!
+//! MOSS-Image is deliberately not routed through Z-Image: its 42 blocks use
+//! joint [image,text] attention, four-axis RoPE, six-way AdaRMS modulation
+//! and SiTU.  This module keeps source tensor suffixes under `moss.` and
+//! uses CMF's mapped quantized projections.  The hot dense products therefore
+//! use the existing q4tp/q8 device path on Metal/Vulkan, while the portable
+//! f32 implementation remains an exact-shape fallback.
+
+use crate::dit::{Proj, cmf_f32};
+use crate::pool::Pool;
+use cortiq_core::CmfModel;
+use std::sync::Arc;
+
+/// Native MOSS transformer geometry, read from the source config stored in
+/// `moss.config_json`.
+#[derive(Clone, Debug)]
+pub struct MossConfig {
+    pub dim: usize,
+    pub ffn_dim: usize,
+    pub freq_dim: usize,
+    pub latent_channels: usize,
+    pub num_heads: usize,
+    pub num_layers: usize,
+    pub text_dim: usize,
+    pub rope_base: f64,
+}
+
+impl MossConfig {
+    pub fn from_json(v: &serde_json::Value) -> Result<Self, String> {
+        let u = |name: &str| -> Result<usize, String> {
+            v[name]
+                .as_u64()
+                .map(|v| v as usize)
+                .ok_or_else(|| format!("MOSS config missing integer {name}"))
+        };
+        let dim = u("dim")?;
+        let num_heads = u("num_heads")?;
+        let freq_dim = u("freq_dim")?;
+        if dim == 0 || num_heads == 0 || dim % num_heads != 0 || (dim / num_heads) % 8 != 0 {
+            return Err(format!(
+                "invalid MOSS dim/head geometry: dim={dim}, num_heads={num_heads}"
+            ));
+        }
+        if freq_dim == 0 || freq_dim % 2 != 0 {
+            return Err(format!(
+                "MOSS freq_dim must be positive and even, got {freq_dim}"
+            ));
+        }
+        Ok(Self {
+            dim,
+            ffn_dim: u("ffn_dim")?,
+            freq_dim,
+            latent_channels: u("latent_channels")?,
+            num_heads,
+            num_layers: u("num_layers")?,
+            text_dim: u("text_dim")?,
+            rope_base: v["rope_base"].as_f64().unwrap_or(10_000.0),
+        })
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.dim / self.num_heads
+    }
+}
+
+struct TextBlock {
+    norm1: Vec<f32>,
+    norm2: Vec<f32>,
+    q_norm: Vec<f32>,
+    k_norm: Vec<f32>,
+    qkv: Proj,
+    qkv_b: Vec<f32>,
+    proj: Proj,
+    proj_b: Vec<f32>,
+    ffn_gate: Proj,
+    ffn_gate_b: Vec<f32>,
+    ffn_up: Proj,
+    ffn_up_b: Vec<f32>,
+    ffn_down: Proj,
+    ffn_down_b: Vec<f32>,
+}
+
+struct Block {
+    norm1: Vec<f32>,
+    norm2: Vec<f32>,
+    q_norm: Vec<f32>,
+    k_norm: Vec<f32>,
+    q: Proj,
+    k: Proj,
+    v: Proj,
+    o: Proj,
+    ffn_up_gate: Proj,
+    ffn_down: Proj,
+}
+
+/// The MOSS DiT loaded directly from one CMF.  Quantized projection tensors
+/// remain mmap-backed, rather than being expanded to f32 at load time.
+pub struct MossDit {
+    pub cfg: MossConfig,
+    video_embedder: Proj,
+    video_embedder_b: Vec<f32>,
+    text_proj: Proj,
+    text_proj_b: Vec<f32>,
+    text_blocks: Vec<TextBlock>,
+    time_0_w: Vec<f32>,
+    time_0_b: Vec<f32>,
+    time_2_w: Vec<f32>,
+    time_2_b: Vec<f32>,
+    shared_mod_w: Vec<f32>,
+    shared_mod_b: Vec<f32>,
+    head_mod_w: Vec<f32>,
+    head_mod_b: Vec<f32>,
+    layers: Vec<Block>,
+    final_norm_video: Vec<f32>,
+    final_linear_video: Proj,
+    pool: Option<Arc<Pool>>,
+}
+
+impl MossDit {
+    /// Load the MOSS DiT from `moss.*` tensors in a packaged model.
+    pub fn from_cmf(model: &Arc<CmfModel>) -> Result<Self, String> {
+        let cfg: serde_json::Value = serde_json::from_slice(
+            model
+                .tensor_bytes("moss.config_json")
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("moss.config_json: {e}"))?;
+        let cfg = MossConfig::from_json(&cfg)?;
+        let f = |suffix: &str| cmf_f32(model, &format!("moss.{suffix}"));
+        let p = |suffix: &str| Proj::from_model(model, &format!("moss.{suffix}"));
+        let text_blocks = (0..2)
+            .map(|i| {
+                let x = format!("text_embedder.blocks.{i}");
+                Ok(TextBlock {
+                    norm1: f(&format!("{x}.norm1.weight"))?,
+                    norm2: f(&format!("{x}.norm2.weight"))?,
+                    q_norm: f(&format!("{x}.q_norm.weight"))?,
+                    k_norm: f(&format!("{x}.k_norm.weight"))?,
+                    qkv: p(&format!("{x}.qkv.weight"))?,
+                    qkv_b: f(&format!("{x}.qkv.bias"))?,
+                    proj: p(&format!("{x}.proj.weight"))?,
+                    proj_b: f(&format!("{x}.proj.bias"))?,
+                    ffn_gate: p(&format!("{x}.ffn_gate.weight"))?,
+                    ffn_gate_b: f(&format!("{x}.ffn_gate.bias"))?,
+                    ffn_up: p(&format!("{x}.ffn_up.weight"))?,
+                    ffn_up_b: f(&format!("{x}.ffn_up.bias"))?,
+                    ffn_down: p(&format!("{x}.ffn_down.weight"))?,
+                    ffn_down_b: f(&format!("{x}.ffn_down.bias"))?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let layers = (0..cfg.num_layers)
+            .map(|i| {
+                let x = format!("layers.{i}");
+                Ok(Block {
+                    norm1: f(&format!("{x}.norm1.weight"))?,
+                    norm2: f(&format!("{x}.norm2.weight"))?,
+                    q_norm: f(&format!("{x}.q_norm.weight"))?,
+                    k_norm: f(&format!("{x}.k_norm.weight"))?,
+                    q: p(&format!("{x}.proj.q.weight"))?,
+                    k: p(&format!("{x}.proj.k.weight"))?,
+                    v: p(&format!("{x}.proj.v.weight"))?,
+                    o: p(&format!("{x}.proj.o.weight"))?,
+                    ffn_up_gate: p(&format!("{x}.proj.ffn_up_gate.weight"))?,
+                    ffn_down: p(&format!("{x}.proj.ffn_down.weight"))?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let dit = Self {
+            video_embedder: p("video_embedder.weight")?,
+            video_embedder_b: f("video_embedder.bias")?,
+            text_proj: p("text_embedder.proj.weight")?,
+            text_proj_b: f("text_embedder.proj.bias")?,
+            time_0_w: f("time_embedding.0.weight")?,
+            time_0_b: f("time_embedding.0.bias")?,
+            time_2_w: f("time_embedding.2.weight")?,
+            time_2_b: f("time_embedding.2.bias")?,
+            shared_mod_w: f("shared_block_modulation.weight")?,
+            shared_mod_b: f("shared_block_modulation.bias")?,
+            head_mod_w: f("video_head_modulation.weight")?,
+            head_mod_b: f("video_head_modulation.bias")?,
+            final_norm_video: f("final_norm_video.weight")?,
+            final_linear_video: p("final_linear_video.weight")?,
+            text_blocks,
+            layers,
+            pool: Pool::from_env(),
+            cfg,
+        };
+        dit.validate()?;
+        Ok(dit)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let d = self.cfg.dim;
+        if self.layers.len() != self.cfg.num_layers || self.text_blocks.len() != 2 {
+            return Err("MOSS block count mismatch".into());
+        }
+        if self.video_embedder.cols() != self.cfg.latent_channels
+            || self.video_embedder.rows() != d
+            || self.text_proj.cols() != self.cfg.text_dim
+            || self.text_proj.rows() != d
+            || self.final_linear_video.cols() != d
+            || self.final_linear_video.rows() != self.cfg.latent_channels
+            || self.final_norm_video.len() != d
+        {
+            return Err("MOSS top-level projection geometry mismatch".into());
+        }
+        if self.shared_mod_w.len() != 6 * d * d || self.shared_mod_b.len() != 6 * d {
+            return Err("MOSS shared modulation geometry mismatch".into());
+        }
+        if self.head_mod_w.len() != 2 * d * d || self.head_mod_b.len() != 2 * d {
+            return Err("MOSS head modulation geometry mismatch".into());
+        }
+        Ok(())
+    }
+
+    fn pool(&self) -> Option<&Pool> {
+        self.pool.as_deref()
+    }
+
+    /// Prepare the encoder's final Qwen3.5 hidden states once per prompt.
+    /// MOSS's text projection/refiner does not depend on the latent or the
+    /// timestep, so retaining this result avoids repeating two blocks on
+    /// every CFG/denoising forward.
+    pub fn prepare_text(&self, text: &[f32], tokens: usize) -> Result<Vec<f32>, String> {
+        if tokens == 0 || text.len() != tokens * self.cfg.text_dim {
+            return Err(format!(
+                "MOSS text conditioning has {} values for {tokens} tokens of width {}",
+                text.len(),
+                self.cfg.text_dim
+            ));
+        }
+        let mut x = linear(
+            &self.text_proj,
+            text,
+            tokens,
+            Some(&self.text_proj_b),
+            self.pool(),
+        );
+        let rope = Rope::new(&self.cfg, 0, 0, tokens);
+        for b in &self.text_blocks {
+            text_block(b, &mut x, tokens, &rope, &self.cfg, self.pool());
+        }
+        Ok(x)
+    }
+
+    /// One MOSS velocity forward.  `latents` is channels-first
+    /// `[latent_channels, h, w]`; `text` is the result of
+    /// [`Self::prepare_text`].  Passing a skip set reproduces MOSS's
+    /// negative-branch layer skip without changing sequence geometry.
+    pub fn forward(
+        &self,
+        latents: &[f32],
+        h: usize,
+        w: usize,
+        timestep: f32,
+        text: &[f32],
+        text_tokens: usize,
+        skip_layers: &[usize],
+    ) -> Result<Vec<f32>, String> {
+        if h == 0 || w == 0 || latents.len() != self.cfg.latent_channels * h * w {
+            return Err("MOSS latent shape is not [C,H,W]".into());
+        }
+        if text_tokens == 0 || text.len() != text_tokens * self.cfg.dim {
+            return Err("MOSS prepared text shape mismatch".into());
+        }
+        if skip_layers.iter().any(|&i| i >= self.layers.len()) {
+            return Err("MOSS skip layer out of range".into());
+        }
+        let image_tokens = h * w;
+        let mut image_in = vec![0f32; image_tokens * self.cfg.latent_channels];
+        for token in 0..image_tokens {
+            for c in 0..self.cfg.latent_channels {
+                image_in[token * self.cfg.latent_channels + c] = latents[c * image_tokens + token];
+            }
+        }
+        let video = linear(
+            &self.video_embedder,
+            &image_in,
+            image_tokens,
+            Some(&self.video_embedder_b),
+            self.pool(),
+        );
+        let mut x = Vec::with_capacity((image_tokens + text_tokens) * self.cfg.dim);
+        x.extend_from_slice(&video);
+        x.extend_from_slice(text);
+        let rope = Rope::new(&self.cfg, h, w, text_tokens);
+        let time = self.time_embedding(timestep);
+        let modulation = linear_small(&time, &self.shared_mod_w, &self.shared_mod_b);
+        let head = linear_small(&time, &self.head_mod_w, &self.head_mod_b);
+        for (i, block) in self.layers.iter().enumerate() {
+            if !skip_layers.contains(&i) {
+                main_block(
+                    block,
+                    &mut x,
+                    image_tokens + text_tokens,
+                    &rope,
+                    &modulation,
+                    &self.cfg,
+                    self.pool(),
+                );
+            }
+        }
+        let d = self.cfg.dim;
+        let mut image = x[..image_tokens * d].to_vec();
+        rms_rows_inplace(
+            &mut image,
+            image_tokens,
+            d,
+            &self.final_norm_video,
+            None,
+            None,
+            self.pool(),
+        );
+        let (shift, scale) = (&head[..d], &head[d..]);
+        for row in image.chunks_exact_mut(d) {
+            for ((v, &s), &a) in row.iter_mut().zip(scale).zip(shift) {
+                *v = *v * (1.0 + s) + a;
+            }
+        }
+        let out = linear(
+            &self.final_linear_video,
+            &image,
+            image_tokens,
+            None,
+            self.pool(),
+        );
+        let mut velocity = vec![0f32; self.cfg.latent_channels * image_tokens];
+        for token in 0..image_tokens {
+            for c in 0..self.cfg.latent_channels {
+                velocity[c * image_tokens + token] = out[token * self.cfg.latent_channels + c];
+            }
+        }
+        Ok(velocity)
+    }
+
+    fn time_embedding(&self, t: f32) -> Vec<f32> {
+        // The source deliberately computes phase in f64, then sends the
+        // concatenated [cos, sin] embedding through f32 Linear modules.
+        let half = self.cfg.freq_dim / 2;
+        let mut input = vec![0f32; self.cfg.freq_dim];
+        for i in 0..half {
+            let freq = self.cfg.rope_base.powf(-(i as f64) / half as f64);
+            let p = t as f64 * freq;
+            input[i] = p.cos() as f32;
+            input[half + i] = p.sin() as f32;
+        }
+        let mut h = linear_small(&input, &self.time_0_w, &self.time_0_b);
+        for v in &mut h {
+            *v = silu(*v);
+        }
+        linear_small(&h, &self.time_2_w, &self.time_2_b)
+    }
+}
+
+/// Four-axis MOSS RoPE, represented as fully expanded sin/cos factors for
+/// source `_rotate`: the first 64 dimensions rotate the first half, and the
+/// same factors repeat for the second half.
+struct Rope {
+    sin: Vec<f32>,
+    cos: Vec<f32>,
+}
+
+impl Rope {
+    fn new(cfg: &MossConfig, h: usize, w: usize, text_len: usize) -> Self {
+        let hd = cfg.head_dim();
+        let bands = hd / 8;
+        let n_img = h * w;
+        let n = n_img + text_len;
+        let mut sin = vec![0f32; n * hd];
+        let mut cos = vec![0f32; n * hd];
+        for token in 0..n {
+            let coords = if token < n_img {
+                let yy = token / w;
+                let xx = token % w;
+                [
+                    0.0,
+                    text_len as f64,
+                    yy as f64 - (h.saturating_sub(1) as f64) / 2.0,
+                    xx as f64 - (w.saturating_sub(1) as f64) / 2.0,
+                ]
+            } else {
+                [0.0, (token - n_img) as f64, 0.0, 0.0]
+            };
+            for axis in 0..4 {
+                for band in 0..bands {
+                    let freq = 1.0 / cfg.rope_base.powf(band as f64 / bands as f64);
+                    let phase = coords[axis] * freq;
+                    let j = axis * bands + band;
+                    sin[token * hd + j] = phase.sin() as f32;
+                    cos[token * hd + j] = phase.cos() as f32;
+                    sin[token * hd + hd / 2 + j] = phase.sin() as f32;
+                    cos[token * hd + hd / 2 + j] = phase.cos() as f32;
+                }
+            }
+        }
+        Self { sin, cos }
+    }
+}
+
+// ── portable f32 kernels ────────────────────────────────────────────────
+
+struct SendRows(*mut f32);
+unsafe impl Send for SendRows {}
+unsafe impl Sync for SendRows {}
+impl SendRows {
+    /// SAFETY: callers divide the buffer into non-overlapping row ranges.
+    unsafe fn row(&self, off: usize, len: usize) -> &mut [f32] {
+        unsafe { std::slice::from_raw_parts_mut(self.0.add(off), len) }
+    }
+}
+
+fn rows(pool: Option<&Pool>, n: usize, f: &(dyn Fn(usize, usize) + Sync)) {
+    match pool {
+        Some(p) => p.run_rows(n, f),
+        None => f(0, n),
+    }
+}
+
+fn silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+fn situ(hidden: f32, gate: f32) -> f32 {
+    (4.0 * (gate / 4.0).tanh() * gate.sigmoid()) * (25.0 * (hidden / 25.0).tanh())
+}
+
+trait Sigmoid {
+    fn sigmoid(self) -> Self;
+}
+impl Sigmoid for f32 {
+    fn sigmoid(self) -> Self {
+        1.0 / (1.0 + (-self).exp())
+    }
+}
+
+fn linear_small(x: &[f32], w: &[f32], bias: &[f32]) -> Vec<f32> {
+    assert_eq!(w.len() % x.len(), 0, "small MOSS linear geometry");
+    let rows = w.len() / x.len();
+    assert_eq!(bias.len(), rows, "small MOSS linear bias geometry");
+    w.chunks_exact(x.len())
+        .zip(bias)
+        .map(|(r, &b)| b + r.iter().zip(x).map(|(&a, &v)| a * v).sum::<f32>())
+        .collect()
+}
+
+fn linear(p: &Proj, x: &[f32], n: usize, bias: Option<&[f32]>, pool: Option<&Pool>) -> Vec<f32> {
+    assert_eq!(x.len(), n * p.cols(), "MOSS projection input geometry");
+    let mut out = vec![0f32; n * p.rows()];
+    p.matmat(x, n, &mut out, pool);
+    if let Some(b) = bias {
+        assert_eq!(b.len(), p.rows(), "MOSS projection bias geometry");
+        for row in out.chunks_exact_mut(p.rows()) {
+            for (v, &b) in row.iter_mut().zip(b) {
+                *v += b;
+            }
+        }
+    }
+    out
+}
+
+/// Plain Diffusers RMSNorm, optionally affine-modulated after normalization.
+fn rms_rows_inplace(
+    x: &mut [f32],
+    n: usize,
+    d: usize,
+    weight: &[f32],
+    scale: Option<&[f32]>,
+    shift: Option<&[f32]>,
+    pool: Option<&Pool>,
+) {
+    assert_eq!(x.len(), n * d);
+    assert_eq!(weight.len(), d);
+    if let Some(s) = scale {
+        assert_eq!(s.len(), d);
+    }
+    if let Some(s) = shift {
+        assert_eq!(s.len(), d);
+    }
+    let ptr = SendRows(x.as_mut_ptr());
+    rows(pool, n, &|lo, hi| {
+        for r in lo..hi {
+            // SAFETY: each worker owns distinct row indices.
+            let row = unsafe { ptr.row(r * d, d) };
+            let mean = row.iter().map(|&v| v * v).sum::<f32>() / d as f32;
+            let inv = 1.0 / (mean + 1e-6).sqrt();
+            for j in 0..d {
+                let mut v = row[j] * inv * weight[j];
+                if let Some(s) = scale {
+                    v *= 1.0 + s[j];
+                }
+                if let Some(a) = shift {
+                    v += a[j];
+                }
+                row[j] = v;
+            }
+        }
+    });
+}
+
+fn qk_norm_rope(
+    q: &mut [f32],
+    n: usize,
+    heads: usize,
+    hd: usize,
+    weight: &[f32],
+    rope: &Rope,
+    pool: Option<&Pool>,
+) {
+    assert_eq!(q.len(), n * heads * hd);
+    assert_eq!(weight.len(), hd);
+    let ptr = SendRows(q.as_mut_ptr());
+    rows(pool, n, &|lo, hi| {
+        for t in lo..hi {
+            for h in 0..heads {
+                // SAFETY: distinct token ranges are disjoint.
+                let row = unsafe { ptr.row((t * heads + h) * hd, hd) };
+                let mean = row.iter().map(|&v| v * v).sum::<f32>() / hd as f32;
+                let inv = 1.0 / (mean + 1e-6).sqrt();
+                for j in 0..hd {
+                    row[j] *= inv * weight[j];
+                }
+                for j in 0..hd / 2 {
+                    let a = row[j];
+                    let b = row[j + hd / 2];
+                    let c = rope.cos[t * hd + j];
+                    let s = rope.sin[t * hd + j];
+                    row[j] = a * c - b * s;
+                    row[j + hd / 2] = b * c + a * s;
+                }
+            }
+        }
+    });
+}
+
+fn softmax(row: &mut [f32]) {
+    let max = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let mut sum = 0.0f32;
+    for v in row.iter_mut() {
+        *v = (*v - max).exp();
+        sum += *v;
+    }
+    if sum > 0.0 {
+        for v in row.iter_mut() {
+            *v /= sum;
+        }
+    }
+}
+
+/// Full bidirectional attention.  The GPU path consumes head-major q/k/v
+/// planes and returns token-major rows; portable fallback holds one score
+/// matrix per head (never one per layer) to bound memory.
+fn attention(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    n: usize,
+    heads: usize,
+    hd: usize,
+    pool: Option<&Pool>,
+) -> Vec<f32> {
+    let hidden = heads * hd;
+    let mut qh = vec![0f32; heads * n * hd];
+    let mut kh = vec![0f32; heads * n * hd];
+    let mut vh = vec![0f32; heads * n * hd];
+    for t in 0..n {
+        for h in 0..heads {
+            let src = &q[(t * heads + h) * hd..(t * heads + h + 1) * hd];
+            qh[(h * n + t) * hd..(h * n + t + 1) * hd].copy_from_slice(src);
+            let src = &k[(t * heads + h) * hd..(t * heads + h + 1) * hd];
+            kh[(h * n + t) * hd..(h * n + t + 1) * hd].copy_from_slice(src);
+            let src = &v[(t * heads + h) * hd..(t * heads + h + 1) * hd];
+            vh[(h * n + t) * hd..(h * n + t + 1) * hd].copy_from_slice(src);
+        }
+    }
+    let mut out = vec![0f32; n * hidden];
+    if n >= 128
+        && crate::gpu::enabled_here()
+        && !crate::gpu::mm_killed()
+        && crate::gpu::dit_attention(
+            &qh,
+            &kh,
+            &vh,
+            heads,
+            heads,
+            n,
+            hd,
+            1.0 / (hd as f32).sqrt(),
+            &mut out,
+        )
+    {
+        return out;
+    }
+    let mut scores = vec![0f32; n * n];
+    let mut vals_t = vec![0f32; hd * n];
+    let mut head_out = vec![0f32; n * hd];
+    for h in 0..heads {
+        let qs = &qh[h * n * hd..(h + 1) * n * hd];
+        let ks = &kh[h * n * hd..(h + 1) * n * hd];
+        let vs = &vh[h * n * hd..(h + 1) * n * hd];
+        // GEMM wants the right operand laid out by output row.  Each score
+        // row is q[t] dot k[j], so transpose logically into k's rows works.
+        crate::fcd_ops::gemm_nt(qs, ks, &mut scores, n, hd, n, pool);
+        let sp = SendRows(scores.as_mut_ptr());
+        rows(pool, n, &|lo, hi| {
+            for r in lo..hi {
+                // SAFETY: row ranges do not overlap.
+                softmax(unsafe { sp.row(r * n, n) });
+            }
+        });
+        for d in 0..hd {
+            for t in 0..n {
+                vals_t[d * n + t] = vs[t * hd + d];
+            }
+        }
+        crate::fcd_ops::gemm_nt(&scores, &vals_t, &mut head_out, n, n, hd, pool);
+        for t in 0..n {
+            out[t * hidden + h * hd..t * hidden + (h + 1) * hd]
+                .copy_from_slice(&head_out[t * hd..(t + 1) * hd]);
+        }
+    }
+    out
+}
+
+fn text_block(
+    b: &TextBlock,
+    x: &mut [f32],
+    n: usize,
+    rope: &Rope,
+    cfg: &MossConfig,
+    pool: Option<&Pool>,
+) {
+    let d = cfg.dim;
+    let mut norm = x.to_vec();
+    rms_rows_inplace(&mut norm, n, d, &b.norm1, None, None, pool);
+    let qkv = linear(&b.qkv, &norm, n, Some(&b.qkv_b), pool);
+    let mut q = qkv[..n * d].to_vec();
+    let mut k = qkv[n * d..2 * n * d].to_vec();
+    let v = qkv[2 * n * d..].to_vec();
+    qk_norm_rope(
+        &mut q,
+        n,
+        cfg.num_heads,
+        cfg.head_dim(),
+        &b.q_norm,
+        rope,
+        pool,
+    );
+    qk_norm_rope(
+        &mut k,
+        n,
+        cfg.num_heads,
+        cfg.head_dim(),
+        &b.k_norm,
+        rope,
+        pool,
+    );
+    let attn = attention(&q, &k, &v, n, cfg.num_heads, cfg.head_dim(), pool);
+    let out = linear(&b.proj, &attn, n, Some(&b.proj_b), pool);
+    for (a, &v) in x.iter_mut().zip(&out) {
+        *a += v;
+    }
+    let mut norm = x.to_vec();
+    rms_rows_inplace(&mut norm, n, d, &b.norm2, None, None, pool);
+    let gate = linear(&b.ffn_gate, &norm, n, Some(&b.ffn_gate_b), pool);
+    let mut up = linear(&b.ffn_up, &norm, n, Some(&b.ffn_up_b), pool);
+    for (a, &g) in up.iter_mut().zip(&gate) {
+        *a = situ(*a, g);
+    }
+    let out = linear(&b.ffn_down, &up, n, Some(&b.ffn_down_b), pool);
+    for (a, &v) in x.iter_mut().zip(&out) {
+        *a += v;
+    }
+}
+
+fn main_block(
+    b: &Block,
+    x: &mut [f32],
+    n: usize,
+    rope: &Rope,
+    modulate: &[f32],
+    cfg: &MossConfig,
+    pool: Option<&Pool>,
+) {
+    let d = cfg.dim;
+    assert_eq!(modulate.len(), 6 * d);
+    let (shift_a, rest) = modulate.split_at(d);
+    let (scale_a, rest) = rest.split_at(d);
+    let (gate_a, rest) = rest.split_at(d);
+    let (shift_f, rest) = rest.split_at(d);
+    let (scale_f, gate_f) = rest.split_at(d);
+    let mut norm = x.to_vec();
+    rms_rows_inplace(
+        &mut norm,
+        n,
+        d,
+        &b.norm1,
+        Some(scale_a),
+        Some(shift_a),
+        pool,
+    );
+    let mut q = linear(&b.q, &norm, n, None, pool);
+    let mut k = linear(&b.k, &norm, n, None, pool);
+    let v = linear(&b.v, &norm, n, None, pool);
+    qk_norm_rope(
+        &mut q,
+        n,
+        cfg.num_heads,
+        cfg.head_dim(),
+        &b.q_norm,
+        rope,
+        pool,
+    );
+    qk_norm_rope(
+        &mut k,
+        n,
+        cfg.num_heads,
+        cfg.head_dim(),
+        &b.k_norm,
+        rope,
+        pool,
+    );
+    let attn = attention(&q, &k, &v, n, cfg.num_heads, cfg.head_dim(), pool);
+    let out = linear(&b.o, &attn, n, None, pool);
+    for row in 0..n {
+        for j in 0..d {
+            x[row * d + j] += out[row * d + j] * gate_a[j];
+        }
+    }
+    let mut norm = x.to_vec();
+    rms_rows_inplace(
+        &mut norm,
+        n,
+        d,
+        &b.norm2,
+        Some(scale_f),
+        Some(shift_f),
+        pool,
+    );
+    let up_gate = linear(&b.ffn_up_gate, &norm, n, None, pool);
+    let inter = cfg.ffn_dim;
+    let mut ffn = vec![0f32; n * inter];
+    for row in 0..n {
+        for i in 0..inter {
+            ffn[row * inter + i] = situ(
+                up_gate[row * 2 * inter + i],
+                up_gate[row * 2 * inter + inter + i],
+            );
+        }
+    }
+    let out = linear(&b.ffn_down, &ffn, n, None, pool);
+    for row in 0..n {
+        for j in 0..d {
+            x[row * d + j] += out[row * d + j] * gate_f[j];
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rope_layout_repeats_quarter_axis_frequencies() {
+        let cfg = MossConfig {
+            dim: 64,
+            ffn_dim: 64,
+            freq_dim: 8,
+            latent_channels: 4,
+            num_heads: 1,
+            num_layers: 1,
+            text_dim: 8,
+            rope_base: 10_000.0,
+        };
+        let r = Rope::new(&cfg, 2, 2, 3);
+        assert_eq!(r.sin.len(), 7 * 64);
+        for t in 0..7 {
+            assert_eq!(
+                &r.sin[t * 64..t * 64 + 32],
+                &r.sin[t * 64 + 32..(t + 1) * 64]
+            );
+            assert_eq!(
+                &r.cos[t * 64..t * 64 + 32],
+                &r.cos[t * 64 + 32..(t + 1) * 64]
+            );
+        }
+    }
+
+    #[test]
+    fn situ_matches_definition() {
+        let h = 2.5f32;
+        let g = -1.25f32;
+        let got = situ(h, g);
+        let want =
+            (4.0 * (g / 4.0).tanh() * (1.0 / (1.0 + (-g).exp()))) * (25.0 * (h / 25.0).tanh());
+        assert!((got - want).abs() < 1e-7);
+    }
+}
