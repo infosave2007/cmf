@@ -1082,9 +1082,11 @@ pub struct MoeJob<'a> {
     /// the difference only shows on saturating activations, which is the
     /// hardest kind of divergence to notice.
     pub swiglu_limit: f32,
-    /// `GraphAct::code` of act(gate)·up: 0 SiLU (every MoE expert), 1 exact
-    /// GELU, 2 tanh-GELU (a Gemma dense FFN riding the single-job block).
-    /// A backend without the activation must refuse the job.
+    /// `GraphAct::code` of act(gate)·up: 0 SiLU, 1 exact GELU, 2 tanh-GELU
+    /// (a Gemma dense FFN riding the single-job block), or 3 MiniMax M3's
+    /// frozen SwiGLU-OAI contract. Code 3 is valid only with its exact 7.0
+    /// `swiglu_limit`; a backend without the complete activation must refuse
+    /// the job rather than reinterpret it as SiLU.
     pub act: u32,
 }
 
@@ -1758,6 +1760,10 @@ pub enum GraphAct {
     /// tanh-approximated GELU (HF `gelu_pytorch_tanh`, the Gemma family):
     /// `inference::gelu_tanh` term for term.
     GeluTanh,
+    /// MiniMax M3's checked SwiGLU-OAI contract. A backend may admit this
+    /// only through an exact matching kernel; generic SiLU must never be used
+    /// as a substitute.
+    SwiGluOaiM3,
 }
 
 impl GraphAct {
@@ -1766,6 +1772,7 @@ impl GraphAct {
             Self::Silu => 0,
             Self::GeluErf => 1,
             Self::GeluTanh => 2,
+            Self::SwiGluOaiM3 => 3,
         }
     }
 }
@@ -1828,6 +1835,11 @@ pub enum GraphFfn<'a> {
         n_exp: usize,
         top_k: usize,
         inter: usize,
+        /// Exact gate/up activation used by every uniformly packed routed
+        /// expert (and its in-bank shared expert, if any). The graph builder
+        /// verifies uniformity before encoding one kernel contract for the
+        /// layer.
+        act: GraphAct,
         norm_topk: bool,
         /// Expert weight layout, uniform across the layer: `false` =
         /// q4_tiled (18 B tiles, inline f16 scale), `true` = q4tp
@@ -2843,7 +2855,10 @@ pub fn q4_ffn_act(
     match act {
         GraphAct::Silu if q4tp => q4tp_ffn(model, w1, w3, w2, xs, b, hidden, inter, out),
         GraphAct::Silu => q4t_ffn(model, w1, w3, w2, xs, b, hidden, inter, out),
-        GraphAct::GeluErf | GraphAct::GeluTanh => match backend() {
+        // The graph FFN's M3 OAI contract is WGPU-only.  Metal reaches its
+        // separate direct-MoE kernel through `moe_block`; falling through to
+        // q4tp_ffn here would silently turn it into ordinary SiLU.
+        GraphAct::GeluErf | GraphAct::GeluTanh | GraphAct::SwiGluOaiM3 => match backend() {
             #[cfg(feature = "gpu")]
             Backend::Wgpu => crate::gpu_wgpu::q4_ffn_act(
                 model,
@@ -4103,10 +4118,10 @@ pub fn gdn_block(
 #[allow(unused_variables)]
 pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> bool {
     match backend() {
-        // The Metal block applies SiLU only: any other activation is an
-        // honest refusal (the caller keeps its host path).
-        #[cfg(target_os = "macos")]
-        Backend::Metal if jobs.iter().any(|j| j.act != 0) => false,
+        // Each backend validates its own complete activation contract.  In
+        // particular Metal admits M3 code 3 only through its dedicated OAI
+        // kernels and rejects every mixed/nearby variant; filtering here
+        // would make that safe path unreachable.
         #[cfg(target_os = "macos")]
         Backend::Metal => crate::gpu_metal::moe_block(model, jobs, out),
         #[cfg(feature = "gpu")]

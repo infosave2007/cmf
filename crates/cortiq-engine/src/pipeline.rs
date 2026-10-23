@@ -583,6 +583,32 @@ impl Act {
             Self::Situ { .. } | Self::SwiGluOai { .. } => None,
         }
     }
+
+    /// The WGPU graph arm.  Keep this deliberately separate from
+    /// `graph_act`: OAI needs its dedicated code rather than a generic SiLU
+    /// fallback.  Only the frozen MiniMax-M3 source constants get a device
+    /// code; a future OAI-like architecture with different constants must add
+    /// and test its own kernel contract.
+    pub(crate) fn wgpu_graph_act(self) -> Option<crate::gpu::GraphAct> {
+        self.moe_job_graph_contract().map(|(act, _)| act)
+    }
+
+    /// The exact device contract for a gate/up/down MoE job.  OAI is not a
+    /// generic "clamped SiLU": code 3 commits a backend to MiniMax M3's
+    /// alpha, asymmetric up transform, and frozen clamp.  Keep the clamp
+    /// alongside the marker so a backend cannot accidentally run code 3 with
+    /// a nearby model's limit.
+    pub(crate) fn moe_job_graph_contract(self) -> Option<(crate::gpu::GraphAct, f32)> {
+        match self {
+            Self::SwiGluOai { alpha, limit }
+                if alpha.to_bits() == 1.702f32.to_bits()
+                    && limit.to_bits() == 7.0f32.to_bits() =>
+            {
+                Some((crate::gpu::GraphAct::SwiGluOaiM3, 7.0))
+            }
+            _ => self.graph_act().map(|act| (act, 0.0)),
+        }
+    }
 }
 
 /// Dense gated triple — the FFN of a dense layer or of one expert.
@@ -12206,7 +12232,7 @@ impl Pipeline {
                     // An activation the graph has no kernel arm for keeps
                     // the CPU/per-op owner, by name — the dense graph FFN
                     // used to compute SiLU for whatever the model asked.
-                    let Some(act) = d.act.graph_act() else {
+                    let Some(act) = d.act.wgpu_graph_act() else {
                         self.note_graph_decline(
                             "wgpu token graph",
                             "dense FFN activation without a graph kernel",
@@ -12307,15 +12333,24 @@ impl Pipeline {
                     let mut gu_q2: Option<bool> = None;
                     // q8_2f experts (gate, up and down): their own kernels.
                     let mut q82: Option<bool> = None;
+                    // One MoE gate/up kernel serves the complete packed bank.
+                    // Bind an activation only when every routed (and in-bank
+                    // shared) expert owns the same exact WGPU contract.
+                    let mut moe_act = None;
                     for e in m
                         .experts
                         .iter()
                         .chain(shared.filter(|_| has_shared).map(|(se, _)| se).into_iter())
                     {
-                        if !matches!(e.act, Act::Silu)
-                            || e.gate_proj.rows() != inter
-                            || e.up_proj.rows() != inter
-                        {
+                        let Some(e_act) = e.act.wgpu_graph_act() else {
+                            return None;
+                        };
+                        match moe_act {
+                            Some(existing) if existing != e_act => return None,
+                            None => moe_act = Some(e_act),
+                            _ => {}
+                        }
+                        if e.gate_proj.rows() != inter || e.up_proj.rows() != inter {
                             return None;
                         }
                         // Expert tensors are packed into one resident buffer
@@ -12423,6 +12458,7 @@ impl Pipeline {
                             .filter(|k| *k > 0 && *k <= m.top_k)
                             .unwrap_or(m.top_k),
                         inter,
+                        act: moe_act?,
                         norm_topk: m.norm_topk_prob,
                         q4tp: q4tp?,
                         gu_q2: gu_q2.unwrap_or(false),
@@ -14220,7 +14256,7 @@ impl Pipeline {
                         return None;
                     }
                     FfnKind::Dense(d) => {
-                        let Some(act) = d.act.graph_act() else {
+                        let Some(act) = d.act.wgpu_graph_act() else {
                             if batch_debug {
                                 eprintln!(
                                     "batch graph: dense FFN activation {:?} without a graph kernel at layer {li}",
@@ -14277,11 +14313,20 @@ impl Pipeline {
                         let mut q4tp: Option<bool> = None;
                         let mut gu_q2: Option<bool> = None;
                         let mut q82: Option<bool> = None;
+                        // The packed MoE graph has one gate/up program per
+                        // layer, so accept only one exact activation contract
+                        // across routed and in-bank shared experts.
+                        let mut moe_act = None;
                         for e in m.experts.iter().chain(shared.map(|(se, _)| se)) {
-                            if !matches!(e.act, Act::Silu)
-                                || e.gate_proj.rows() != inter
-                                || e.up_proj.rows() != inter
-                            {
+                            let Some(e_act) = e.act.wgpu_graph_act() else {
+                                return None;
+                            };
+                            match moe_act {
+                                Some(existing) if existing != e_act => return None,
+                                None => moe_act = Some(e_act),
+                                _ => {}
+                            }
+                            if e.gate_proj.rows() != inter || e.up_proj.rows() != inter {
                                 return None;
                             }
                             // Same ladder as the token graph: q4t → q2tp
@@ -14360,6 +14405,7 @@ impl Pipeline {
                             n_exp: m.experts.len(),
                             top_k: m.top_k,
                             inter,
+                            act: moe_act?,
                             norm_topk: m.norm_topk_prob,
                             q4tp: q4tp?,
                             gu_q2: gu_q2.unwrap_or(false),
@@ -17492,9 +17538,11 @@ fn dense_ffn_batch(
     // the LLM prefill was simply never wired to it. A task mask needs the
     // activations on the host between the halves, so it keeps the CPU
     // arm below.
-    // SiLU and the exact GELU (Spark-X2.5) have device arms; `q4_ffn_act`
-    // hands SiLU to the very entry points this used to call.
-    let fused_act = d.act.graph_act();
+    // SiLU/GELU have device arms everywhere they are admitted.  MiniMax
+    // M3's frozen OAI contract has an additional WGPU-only arm; callers on
+    // native Metal still get an honest decline from `q4_ffn_act` rather than
+    // an accidental SiLU evaluation.
+    let fused_act = d.act.wgpu_graph_act();
     if mask_row.is_none()
         && fused_act.is_some()
         && b >= 32
@@ -18853,9 +18901,9 @@ fn dense_ffn_gpu(d: &DenseFfn, x: &[f32], _pool: Option<&Pool>) -> Option<Vec<f3
     {
         return None;
     }
-    // The GPU block applies SiLU, exact GELU and tanh-GELU (Gemma); other
-    // activations stay on the CPU.
-    d.act.graph_act()?;
+    // The GPU block applies the standard graph activations plus the exact
+    // MiniMax-M3 OAI contract; any other activation stays on the CPU.
+    d.act.moe_job_graph_contract()?;
     // Threshold: tiny FFNs are not worth a submission (q1 excepted —
     // see the caller's gate).
     if d.gate_proj.rows() < crate::gpu::min_rows() && !d.gate_proj.is_q1() {
@@ -19345,9 +19393,12 @@ fn moe_push_job<'a>(
     model_ref: &mut Option<std::sync::Arc<cortiq_core::CmfModel>>,
 ) -> Option<()> {
     use crate::qtensor::prescale;
-    // The block's act(gate)·up pass takes the activation's code (SiLU,
-    // exact GELU, tanh-GELU); anything without a device form stays home.
-    let act = d.act.graph_act()?.code();
+    // The block's act(gate)·up pass takes an exact device contract.  For
+    // ordinary SiLU/GELU this is a zero clamp; MiniMax M3 contributes its
+    // dedicated OAI marker and frozen 7.0 source limit.  Anything without a
+    // device contract stays on the CPU.
+    let (graph_act, swiglu_limit) = d.act.moe_job_graph_contract()?;
+    let act = graph_act.code();
     let (gm, gi, gr, gc, grs, gcf, gq1, gq4, gq2) = moe_parts(&d.gate_proj)?;
     let (_, ui, ur, uc, urs, ucf, uq1, uq4, uq2) = moe_parts(&d.up_proj)?;
     let (_, di, dr, dc, drs, dcf, dq1, dq4, dq2) = moe_parts(&d.down_proj)?;
@@ -19383,7 +19434,7 @@ fn moe_push_job<'a>(
         q4t: gq4 && !gq2 && d.gate_proj.mapped_q4tp().is_none(),
         q4tp: gq4 && (gq2 || d.gate_proj.mapped_q4tp().is_some()),
         gu_q2: gq2,
-        swiglu_limit: 0.0,
+        swiglu_limit,
         act,
     });
     Some(())
@@ -19511,13 +19562,13 @@ pub(crate) fn moe_route(
 
 /// Router implementation with an explicit sigmoid renormalization floor.
 ///
-/// Flint's source computes `sum(selected_scores) + 1e-20`, whereas MiniMax
-/// M3.1 divides by the selected FP32 sum with no additive floor.  Using the
-/// generic 1e-6 floor is not a harmless tolerance difference when all logits
-/// are very negative: it collapses the routed branch toward zero instead of
-/// normalizing the selected experts. Keeping the epsilon parameter here
-/// avoids changing the established Qwen/LFM2 contract while allowing each
-/// architecture to preserve its own numerical semantics.
+/// Flint and MiniMax M3.1 reference runtimes compute
+/// `sum(selected_scores) + 1e-20` in FP32. Using the generic 1e-6 floor is
+/// not a harmless tolerance difference when all logits are very negative: it
+/// collapses the routed branch toward zero instead of normalizing the selected
+/// experts. Keeping the epsilon parameter here avoids changing the established
+/// Qwen/LFM2 contract while allowing each architecture to preserve its own
+/// numerical semantics.
 pub(crate) fn moe_route_with_eps(
     logits: &[f32],
     m: &MoeFfn,
@@ -20692,6 +20743,26 @@ mod tests {
         let expected = crate::inference::swiglu_oai(10.0, -10.0, 1.702, 1.0, Some(7.0));
         assert!((got - expected).abs() < 1e-6);
         assert_eq!(act.graph_act(), None, "no inexact generic graph fallback");
+        assert_eq!(
+            act.wgpu_graph_act(),
+            Some(crate::gpu::GraphAct::SwiGluOaiM3),
+            "the WGPU-only arm accepts only the frozen M3 constants"
+        );
+        assert_eq!(
+            Act::swiglu_oai(1.701, 7.0).wgpu_graph_act(),
+            None,
+            "nearby OAI constants must not borrow MiniMax's kernel"
+        );
+        assert_eq!(
+            act.moe_job_graph_contract(),
+            Some((crate::gpu::GraphAct::SwiGluOaiM3, 7.0)),
+            "the direct MoE path carries the frozen clamp with the marker"
+        );
+        assert_eq!(
+            Act::swiglu_oai(1.702, 6.999).moe_job_graph_contract(),
+            None,
+            "a nearby clamp must not borrow MiniMax's device contract"
+        );
 
         // `apply` is the gate half only; `combine` owns the up clamp and
         // +1 offset. The two must not accidentally collapse to ordinary SiLU.
