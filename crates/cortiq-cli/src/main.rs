@@ -27,6 +27,7 @@ mod ltxpack;
 mod mimo_towers;
 mod moedefrag;
 mod music;
+mod mossimagepack;
 mod npy;
 mod nvg;
 mod nvg_linalg;
@@ -2258,13 +2259,13 @@ enum Commands {
         #[arg(long)]
         out: Option<String>,
     },
-    /// Pack a Diffusers source into CMF. A Qwen-Image-2.1 directory
-    /// (QwenImage21Pipeline) or a Z-Image / Z-Image-Turbo pipeline
-    /// directory (model_index.json = ZImagePipeline) becomes ONE ready-to-run
-    /// file (DiT + Qwen3 text encoder + VAE + tokenizer + the model's default
-    /// recipe) and a <out>.sha256; otherwise the default packs Lumina into one
-    /// file; --component packs a standalone Qwen text encoder or VAE; --bundle
-    /// merges retained Qwen component CMFs into one ready-to-run file.
+    /// Pack a Diffusers source into CMF. Qwen-Image-2.1, Z-Image and
+    /// MOSS-Image-Base pipeline directories become ONE ready-to-run file
+    /// (their DiT + text encoder + decoder + tokenizer + recipe) and a
+    /// <out>.sha256. MOSS retains only its text tower and decoder path, not
+    /// the unused Qwen vision tower or Flux2 VAE encoder. Otherwise the
+    /// default packs Lumina; --component packs a standalone Qwen component;
+    /// --bundle merges retained Qwen component CMFs into one file.
     ImaginePack {
         /// Optional standalone Qwen component: qwen-text-encoder or qwen-vae
         #[arg(long)]
@@ -2275,23 +2276,24 @@ enum Commands {
         bundle: bool,
         /// Diffusers root directory, or a pinned HF resolve base URL for Qwen
         root: String,
-        /// Projection codec (Qwen-Image-2.1 DiT: q4tp (default)/q8/raw; Z-Image DiT: q8 (=q8_2f, default)/q4tp/f16/bf16/raw;
+        /// Projection codec (Qwen-Image-2.1 DiT: q4tp (default)/q8/raw;
+        /// Z-Image/MOSS DiT: q8 (=q8_2f, default)/q4tp/f16/bf16/raw;
         /// Qwen: q4tp/q4t/q8_2f/f16; Lumina: q4t (default)/q8)
         #[arg(long)]
         quant: Option<String>,
-        /// Z-Image / Qwen-Image-2.1 text-encoder projection codec: q8 (=q8_2f,
-        /// default)/q4tp/f16/bf16/raw (embed_tokens stays q8_row unless raw/bf16/f16)
+        /// Z-Image / Qwen-Image-2.1 / MOSS text-encoder projection codec:
+        /// q8 (=q8_2f, default)/q4tp/f16/bf16/raw (embed_tokens stays q8_row
+        /// unless raw/bf16/f16)
         #[arg(long)]
         te_quant: Option<String>,
-        /// Z-Image `te.embed_tokens` codec (default q8_row with a quantized
-        /// --te-quant; raw/bf16/f16/f32 keep it 16/32-bit)
+        /// Z-Image/MOSS `te.embed_tokens` codec (default q8_row with a
+        /// quantized --te-quant; raw/bf16/f16/f32 keep it 16/32-bit)
         #[arg(long)]
         te_embed_quant: Option<String>,
-        /// Z-Image / Qwen-Image-2.1 text-encoder projections kept at the source precision
-        /// (comma list: `layers.N.mlp.down_proj` or a suffix like `down_proj`;
-        /// Z-Image default `layers.6.mlp.down_proj`, the massive-activation writer;
-        /// Qwen-Image-2.1 default none; a whole `layers.N` also works there;
-        /// `none` keeps nothing)
+        /// Z-Image / Qwen-Image-2.1 / MOSS text-encoder projections kept at
+        /// source precision (comma list: `layers.N.mlp.down_proj` or a suffix
+        /// like `down_proj`; Z-Image defaults layer 6; MOSS/Qwen default none;
+        /// a whole `layers.N` also works; `none` keeps nothing)
         #[arg(long, value_delimiter = ',')]
         te_keep: Vec<String>,
         /// Z-Image recipe stored in the file: turbo or base (default: from
@@ -2301,7 +2303,7 @@ enum Commands {
         /// Z-Image dev: pack only the first N main DiT layers (kernel tests)
         #[arg(long)]
         dit_layers: Option<usize>,
-        /// Z-Image / Qwen-Image-2.1: skip hashing the source shards into the provenance
+        /// Z-Image / Qwen-Image-2.1 / MOSS: skip hashing source shards into provenance
         #[arg(long, default_value_t = false)]
         no_source_sha: bool,
         /// Qwen-Image-2.1 vision-tower projection codec (default q8 = q8_2f)
@@ -4463,6 +4465,34 @@ async fn main() -> anyhow::Result<()> {
             bundle,
         } => {
             let zroot = std::path::Path::new(&root);
+            if !bundle && component.is_none() && mossimagepack::is_moss_image_root(zroot) {
+                anyhow::ensure!(
+                    variant.is_none() && dit_layers.is_none(),
+                    "--variant/--dit-layers are Z-Image options"
+                );
+                anyhow::ensure!(
+                    vis_quant.is_none() && vae_quant.is_none() && dit_keep.is_empty() && !no_vision,
+                    "--vis-quant/--vae-quant/--dit-keep/--no-vision are Qwen-Image-2.1 options"
+                );
+                return mossimagepack::pack(
+                    zroot,
+                    &out,
+                    &mossimagepack::PackOpts {
+                        dit: zimagepack::parse_codec(
+                            quant.as_deref().unwrap_or(mossimagepack::DEFAULT_DIT_CODEC),
+                        )?,
+                        te: zimagepack::parse_codec(
+                            te_quant.as_deref().unwrap_or(mossimagepack::DEFAULT_TE_CODEC),
+                        )?,
+                        te_embed: te_embed_quant
+                            .as_deref()
+                            .map(zimagepack::parse_codec)
+                            .transpose()?,
+                        te_keep: te_keep.into_iter().filter(|key| key != "none").collect(),
+                        source_sha: !no_source_sha,
+                    },
+                );
+            }
             if !bundle && component.is_none() && qi21pack::is_qi21_root(zroot) {
                 anyhow::ensure!(
                     te_embed_quant.is_none() && variant.is_none() && dit_layers.is_none(),

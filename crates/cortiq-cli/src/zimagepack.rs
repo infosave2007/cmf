@@ -117,9 +117,17 @@ pub(crate) fn st_header(path: &Path) -> anyhow::Result<(Vec<StTensor>, usize)> {
             o[1].as_u64().context("off")? as usize + base,
         );
         ensure!(e <= size && s <= e, "{name}: range past end of file");
+        // Metadata tensors such as Flux2 BatchNorm's `num_batches_tracked`
+        // are intentionally allowed through header parsing so family packers
+        // can omit them. `encode` still refuses a non-floating payload if a
+        // caller mistakenly tries to serialize it as a weight.
         let item = match dtype.as_str() {
             "F32" => 4,
             "F16" | "BF16" => 2,
+            "I64" | "U64" => 8,
+            "I32" | "U32" => 4,
+            "I16" | "U16" => 2,
+            "I8" | "U8" | "BOOL" => 1,
             d => return Err(anyhow!("{name}: unsupported dtype {d}")),
         };
         ensure!(
@@ -178,7 +186,8 @@ pub(crate) fn encode(t: &StTensor, raw: &[u8], codec: Codec) -> anyhow::Result<(
     let src_dtype = match t.dtype.as_str() {
         "F32" => TensorDtype::F32,
         "F16" => TensorDtype::F16,
-        _ => TensorDtype::Bf16,
+        "BF16" => TensorDtype::Bf16,
+        dtype => return Err(anyhow!("{}: cannot encode non-floating dtype {dtype}", t.name)),
     };
     Ok(match codec {
         Codec::Raw => (src_dtype, raw.to_vec()),
