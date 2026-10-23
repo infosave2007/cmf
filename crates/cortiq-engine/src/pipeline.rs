@@ -478,8 +478,9 @@ pub struct LayerWeights {
     pub attn: AttnKind,
 }
 
-/// FFN gate activation: SiLU (SwiGLU family) or tanh-GELU (Gemma's
-/// GeGLU). A property of the model, carried on every FFN triple.
+/// FFN gate activation: SiLU (SwiGLU family), tanh-GELU (Gemma's GeGLU),
+/// or a source-specific gated contract. A property of the model, carried on
+/// every FFN triple.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub enum Act {
     #[default]
@@ -492,6 +493,14 @@ pub enum Act {
     Situ {
         beta: f32,
         linear_beta: f32,
+    },
+    /// MiniMax M3's SwiGLU-OAI: upper-clamped gate, symmetrically clamped
+    /// up branch, `sigmoid(alpha * gate)`, and a `+1` up-branch offset.
+    /// It deliberately has no generic GPU graph arm until a matching kernel
+    /// exists; CPU uses the exact scalar reference in `inference`.
+    SwiGluOai {
+        alpha: f32,
+        limit: f32,
     },
 }
 
@@ -517,6 +526,15 @@ impl Act {
         }
     }
 
+    /// Construct the MiniMax M3 SwiGLU-OAI activation from a checked model
+    /// contract. This is intentionally explicit rather than recognizing an
+    /// arbitrary `hidden_act` string: callers must validate `alpha` and
+    /// `limit` against their source architecture before enabling it.
+    #[inline]
+    pub fn swiglu_oai(alpha: f32, limit: f32) -> Self {
+        Self::SwiGluOai { alpha, limit }
+    }
+
     #[inline]
     pub fn apply(self, x: f32) -> f32 {
         match self {
@@ -524,6 +542,10 @@ impl Act {
             Self::GeluTanh => inference::gelu_tanh(x),
             Self::Gelu => inference::gelu_erf(x),
             Self::Situ { beta, .. } => beta * (x / beta).tanh() * (1.0 / (1.0 + (-x).exp())),
+            Self::SwiGluOai { alpha, limit } => {
+                let gate = x.min(limit);
+                gate * (1.0 / (1.0 + (-alpha * gate).exp()))
+            }
         }
     }
 
@@ -534,6 +556,9 @@ impl Act {
         match self {
             Self::Situ { linear_beta, .. } if linear_beta > 0.0 => {
                 self.apply(g) * (linear_beta * (u / linear_beta).tanh())
+            }
+            Self::SwiGluOai { alpha, limit } => {
+                inference::swiglu_oai(g, u, alpha, 1.0, Some(limit))
             }
             _ => self.apply(g) * u,
         }
@@ -547,7 +572,7 @@ impl Act {
             Self::Silu => Some(crate::gpu::GraphAct::Silu),
             Self::Gelu => Some(crate::gpu::GraphAct::GeluErf),
             Self::GeluTanh => Some(crate::gpu::GraphAct::GeluTanh),
-            Self::Situ { .. } => None,
+            Self::Situ { .. } | Self::SwiGluOai { .. } => None,
         }
     }
 }
@@ -20605,6 +20630,21 @@ mod tests {
         assert_ne!(r2.finish_reason, "cancelled");
     }
     use super::*;
+
+    #[test]
+    fn minimax_swiglu_oai_act_matches_scalar_contract() {
+        let act = Act::swiglu_oai(1.702, 7.0);
+        let got = act.combine(10.0, -10.0);
+        let expected = crate::inference::swiglu_oai(10.0, -10.0, 1.702, 1.0, Some(7.0));
+        assert!((got - expected).abs() < 1e-6);
+        assert_eq!(act.graph_act(), None, "no inexact generic graph fallback");
+
+        // `apply` is the gate half only; `combine` owns the up clamp and
+        // +1 offset. The two must not accidentally collapse to ordinary SiLU.
+        let gate_only = act.apply(-10.0);
+        let expected_gate = -10.0 / (1.0 + (17.02f32).exp());
+        assert!((gate_only - expected_gate).abs() < 1e-10);
+    }
 
     #[test]
     fn explicit_sliding_schedule_selects_local_rope_profile() {
