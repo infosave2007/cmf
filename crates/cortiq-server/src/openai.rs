@@ -4,7 +4,7 @@
 
 use crate::AppState;
 use crate::streaming::{self, ChatStream};
-use crate::tool_calls::{ToolHoldback, extract_tool_calls};
+use crate::tool_calls::{ToolHoldback, extract_minimax_m3_response, extract_tool_calls};
 use axum::{
     Router,
     extract::State,
@@ -1309,6 +1309,7 @@ async fn chat_completions(
         images: ingress.images,
     });
     let dsv41 = vl_inputs.is_some();
+    let minimax_m3 = state.runtime.model().arch().arch_name == "minimax_m3_vl";
 
     let max_tokens =
         effective_max_tokens(&state, req.max_completion_tokens.or(req.max_tokens)) as usize;
@@ -1671,6 +1672,12 @@ async fn chat_completions(
 
         let (mut plain, mut calls, reasoning_content) = if dsv41 {
             extract_dsv41_result(&result, dsv41_thinking, &state.tokenizer)
+        } else if minimax_m3 {
+            // M3's adaptive reasoning and namespaced XML tool grammar are
+            // distinct from the generic `<think>` / `<tool_call>` families.
+            // Parse them before generic thinking suppression can expose its
+            // internal markers as user-visible content.
+            extract_minimax_m3_response(&result.text, req.effective_tools())
         } else if req.thinking() == Some(false) {
             let content = strip_think_block(&result.text);
             let (plain, calls) = extract_tool_calls(&content, req.effective_tools());
@@ -1683,7 +1690,7 @@ async fn chat_completions(
             let (plain, calls) = extract_tool_calls(&result.text, req.effective_tools());
             (plain, calls, None)
         };
-        if calls.is_empty() {
+        if calls.is_empty() && !minimax_m3 {
             if let Some(names) = req.effective_tools().map(|ts| {
                 ts.iter()
                     .filter_map(|t| t["function"]["name"].as_str().map(String::from))
