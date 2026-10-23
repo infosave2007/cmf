@@ -15913,6 +15913,12 @@ fn minimax_m3_selected_q4tp_jobs(
         && out_len == HIDDEN
         && jobs.len() == SELECTED
         && q4tp_moe_act(jobs) == Some(Q4tpMoeAct::SwiGluOaiM3)
+        // M3's detached shared expert is always active, not router-gated.
+        // Keeping this exact marks the final fifth slot as the real shared
+        // branch rather than merely five coincidentally-shaped routed jobs.
+        && jobs
+            .last()
+            .is_some_and(|shared| shared.w.to_bits() == 1.0f32.to_bits())
         && moe_jobs_batchable(jobs)
         && jobs.iter().all(|job| {
             !job.q1
@@ -15990,7 +15996,8 @@ fn sparse_moe_span_cap_bytes() -> usize {
 }
 
 /// M3 binds exactly five 28.1015625 MiB triples (= 140.5078125 MiB) before
-/// at most 60 KiB of 4 KiB page rounding.  192 MiB keeps a clear hard ceiling
+/// less than 120 KiB of 4 KiB page rounding across the 15 independent ranges.
+/// 192 MiB keeps a clear hard ceiling
 /// without making the generic 128 MiB selected-view policy wider.  An explicit
 /// `CMF_METAL_SPARSE_MOE_MAX_MB` always wins, including a lower diagnostic cap.
 fn minimax_m3_sparse_moe_span_cap_bytes() -> usize {
@@ -16466,6 +16473,11 @@ mod flint_sparse_plan_tests {
         assert!(
             !minimax_m3_selected_q4tp_jobs(&arch, &jobs, M3_HIDDEN - 1),
             "wrong output geometry must not borrow M3's view cap"
+        );
+        jobs[4].w = 0.99;
+        assert!(
+            !minimax_m3_selected_q4tp_jobs(&arch, &jobs, M3_HIDDEN),
+            "the always-active shared expert must retain its exact unit weight"
         );
 
         let mut changed = arch.clone();
