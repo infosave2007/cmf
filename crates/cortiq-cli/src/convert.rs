@@ -3631,6 +3631,28 @@ fn minimax_m3_quant_companion(raw: &str) -> bool {
     .any(|suffix| raw.ends_with(suffix))
 }
 
+/// Match an M3 partial-conversion pattern against both names that an NVFP4
+/// routed-expert matrix has while it crosses the converter.
+///
+/// The source stores its executable plane as `*.weight_packed`; after its
+/// companions have been consumed, the CMF directory deliberately exposes the
+/// ordinary logical `*.weight` name.  `CMF_CONVERT_ONLY` is a user-facing
+/// output probe, so accepting only the early spelling would make a pattern
+/// copied from `cortiq info` silently select no expert.  Keep the raw spelling
+/// accepted too, for compatibility with existing diagnostic scripts.
+///
+/// Callers must reject quantization companions before calling this helper:
+/// stripping `_packed` is valid only for an executable packed weight, never
+/// for a scale/global-scale plane.
+fn minimax_m3_convert_only_matches(patterns: &[String], early_name: &str) -> bool {
+    patterns.iter().any(|pattern| {
+        glob_match(pattern, early_name)
+            || early_name
+                .strip_suffix("_packed")
+                .is_some_and(|emitted_name| glob_match(pattern, emitted_name))
+    })
+}
+
 /// Decode one ModelOpt NVFP4 `.weight` (U8) with its `.weight_scale`
 /// (F8_E4M3 per 16) and `.weight_scale_2` (F32 scalar) companions, folding an
 /// optional AWQ `.pre_quant_scale` (`y = W·(x ⊙ s)`, so column i of W is
@@ -4473,10 +4495,9 @@ fn validate_minimax_m3_source_headers(
 
 /// Select the immutable M3 source shards that can contribute to a
 /// `CMF_CONVERT_ONLY` probe.  The result is intentionally based on the same
-/// early name gate as `process_file`: a pattern observes the canonical source
-/// name, before a later decoder may rename an executable payload.  That
-/// matters for compressed-tensors experts, whose source name still ends in
-/// `.weight_packed` at this point.
+/// name gate as `process_file`: for a packed routed expert, a pattern may use
+/// either the early canonical source name (`*.weight_packed`) or the final
+/// logical CMF name (`*.weight`).
 ///
 /// The full header inventory has already been validated when this runs, so a
 /// shard omitted here has no selected executable tensor.  Its quantization
@@ -4510,9 +4531,8 @@ fn minimax_m3_convert_only_stream_shards(
             if minimax_m3_quant_companion(&meta.name) {
                 return false;
             }
-            canon_name_for_arch(arch, &meta.name, towers).is_some_and(|name| {
-                patterns.iter().any(|pattern| glob_match(pattern, &name))
-            })
+            canon_name_for_arch(arch, &meta.name, towers)
+                .is_some_and(|name| minimax_m3_convert_only_matches(patterns, &name))
         });
         if selected_here {
             selected.insert(shard.clone());
@@ -8956,7 +8976,12 @@ pub fn run_convert_multi_excluding(
                 continue;
             }
             if let Some(pats) = convert_only.as_ref() {
-                if !pats.iter().any(|p| glob_match(p, &name)) {
+                let selected = if is_minimax_m3 {
+                    minimax_m3_convert_only_matches(pats, &name)
+                } else {
+                    pats.iter().any(|p| glob_match(p, &name))
+                };
+                if !selected {
                     continue;
                 }
             }
@@ -11498,10 +11523,10 @@ pub(crate) mod tests {
         .unwrap();
         assert!(companion.is_empty(), "companions must not select a shard");
 
-        // This intentionally uses the early canonical source spelling.  The
-        // current conversion gate runs before `.weight_packed` becomes the
-        // executable `.weight`, so the stream selector must mirror it.
-        let expert = minimax_m3_convert_only_stream_shards(
+        // Both the raw diagnostic spelling and the final CMF directory name
+        // select the same executable packed plane.  The latter is important:
+        // it is what `cortiq info` prints after conversion.
+        let expert_raw = minimax_m3_convert_only_stream_shards(
             &arch,
             MimoTowers::TextOnly,
             &shards,
@@ -11509,7 +11534,20 @@ pub(crate) mod tests {
             &["model.layers.3.mlp.experts.7.gate_proj.weight_packed".to_string()],
         )
         .unwrap();
-        assert_eq!(expert, HashSet::from(["expert.safetensors".to_string()]));
+        assert_eq!(expert_raw, HashSet::from(["expert.safetensors".to_string()]));
+
+        let expert_emitted = minimax_m3_convert_only_stream_shards(
+            &arch,
+            MimoTowers::TextOnly,
+            &shards,
+            &headers,
+            &["model.layers.3.mlp.experts.7.gate_proj.weight".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            expert_emitted,
+            HashSet::from(["expert.safetensors".to_string()])
+        );
 
         let err = minimax_m3_convert_only_stream_shards(
             &arch,
