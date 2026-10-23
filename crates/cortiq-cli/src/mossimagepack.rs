@@ -147,6 +147,10 @@ fn dit_keep_match(name: &str, key: &str) -> bool {
         .strip_prefix("proj.")
         .unwrap_or(projection)
         .trim_end_matches(".weight");
+    // `clap` splits comma-delimited values but deliberately retains a human
+    // readable space after the comma.  Treat selectors as tokens, not as
+    // whitespace-sensitive literals.
+    let key = key.trim();
     let key = key.strip_prefix("layers.").unwrap_or(key);
     match key.split_once('.') {
         None => key == layer || key == projection,
@@ -698,6 +702,7 @@ mod tests {
         assert!(!dit_keep_match(q, "layers.35"));
         assert!(dit_keep_match(q, "q"));
         assert!(dit_keep_match(q, "layers.36.q"));
+        assert!(dit_keep_match(q, " layers.36.q "));
         assert!(!dit_keep_match(q, "layers.36.o"));
         assert!(dit_keep_match(up, "ffn_up_gate"));
         assert!(dit_keep_match(up, "layers.36.ffn_up_gate"));
