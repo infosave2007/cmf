@@ -61,6 +61,237 @@ pub fn extract_minimax_m3_response(
     (content, calls, reasoning)
 }
 
+/// Incremental guard for an M3 server-sent response.
+///
+/// The final tool-call conversion remains deliberately whole-response (so
+/// nested XML can be validated against the supplied schema), but normal final
+/// text can be released as it arrives.  The guard never releases a possible
+/// prefix of the M3 reasoning or namespaced tool protocol; that is important
+/// because generated tokens may split a marker at arbitrary byte boundaries.
+/// Reasoning is kept private in streaming mode because the OpenAI SSE delta
+/// shape used by this server has no `reasoning_content` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MiniMaxM3StreamPhase {
+    Leading,
+    Reasoning,
+    Content,
+    Tool,
+}
+
+pub struct MiniMaxM3Stream {
+    phase: MiniMaxM3StreamPhase,
+    pending: String,
+    emitted: String,
+    /// The strict parser only normalizes namespace-tag whitespace when at
+    /// least one tool was declared, and any later malformed block makes that
+    /// normalization transactional.  Keep public text from the first
+    /// namespace onward until final parsing in that case.
+    has_declared_tools: bool,
+}
+
+impl Default for MiniMaxM3Stream {
+    fn default() -> Self {
+        Self {
+            phase: MiniMaxM3StreamPhase::Leading,
+            pending: String::new(),
+            emitted: String::new(),
+            has_declared_tools: false,
+        }
+    }
+}
+
+impl MiniMaxM3Stream {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Construct a guard for a request with declared tools.  M3's final tool
+    /// parser is transactional: one malformed block restores the original
+    /// wire text, while a fully valid response normalizes namespace-adjacent
+    /// whitespace.  Deferring text from the first namespace preserves an
+    /// exact final prefix under both outcomes.
+    pub fn with_declared_tools() -> Self {
+        Self {
+            has_declared_tools: true,
+            ..Self::default()
+        }
+    }
+
+    /// Consume decoded model text and return only final user-visible content
+    /// that is safe to send now.  M3 thinking and tool markup are never
+    /// returned here.
+    pub fn push(&mut self, token: &str) -> String {
+        if self.phase == MiniMaxM3StreamPhase::Tool {
+            return String::new();
+        }
+        self.pending.push_str(token);
+        let mut out = String::new();
+        loop {
+            match self.phase {
+                MiniMaxM3StreamPhase::Leading => {
+                    // M3's adaptive no-think form begins with a bare close.
+                    // Wait for a full marker before deciding a marker prefix
+                    // is ordinary text, so a split closer never leaks.
+                    let leading = self.pending.trim_start();
+                    if leading.is_empty() {
+                        break;
+                    }
+                    if MINIMAX_M3_THINK_CLOSE.starts_with(leading)
+                        && leading.len() < MINIMAX_M3_THINK_CLOSE.len()
+                    {
+                        break;
+                    }
+                    if let Some(after) = leading.strip_prefix(MINIMAX_M3_THINK_CLOSE) {
+                        self.pending = after.to_string();
+                        self.phase = MiniMaxM3StreamPhase::Content;
+                        continue;
+                    }
+                    // `split_minimax_m3_reasoning` only recognizes an opener
+                    // at byte zero (unlike the adaptive leading closer above),
+                    // so keep that distinction here.  Otherwise a malformed
+                    // ` " <mm:think>...` response would be hidden live and
+                    // duplicated only at the final safety flush.
+                    if MINIMAX_M3_THINK_OPEN.starts_with(&self.pending)
+                        && self.pending.len() < MINIMAX_M3_THINK_OPEN.len()
+                    {
+                        break;
+                    }
+                    if let Some(after) = self.pending.strip_prefix(MINIMAX_M3_THINK_OPEN) {
+                        self.pending = after.to_string();
+                        self.phase = MiniMaxM3StreamPhase::Reasoning;
+                        continue;
+                    }
+                    self.phase = MiniMaxM3StreamPhase::Content;
+                }
+                MiniMaxM3StreamPhase::Reasoning => {
+                    if let Some(end) = self.pending.find(MINIMAX_M3_THINK_CLOSE) {
+                        self.pending =
+                            self.pending[end + MINIMAX_M3_THINK_CLOSE.len()..].to_string();
+                        self.phase = MiniMaxM3StreamPhase::Content;
+                        continue;
+                    }
+                    // Nothing in a still-open reasoning span is public.  Keep
+                    // just a suffix that could become the close marker.
+                    let keep = minimax_m3_marker_suffix(&self.pending, MINIMAX_M3_THINK_CLOSE);
+                    self.pending = self.pending[self.pending.len() - keep..].to_string();
+                    break;
+                }
+                MiniMaxM3StreamPhase::Content => {
+                    // `extract_minimax_m3_tool_calls` first normalizes every
+                    // namespace followed by XML-looking whitespace, but only
+                    // when tools are declared.  If any later tool block is
+                    // malformed it atomically restores the original wire
+                    // text.  Do not release bytes whose final spelling cannot
+                    // yet be known under that transaction.
+                    if self.has_declared_tools {
+                        if let Some(first_namespace) = self.pending.find(MINIMAX_M3_NS) {
+                            if first_namespace > 0 {
+                                out.push_str(&self.pending[..first_namespace]);
+                                self.pending = self.pending[first_namespace..].to_string();
+                                break;
+                            }
+                            if minimax_m3_tool_start(&self.pending) == Some(0) {
+                                self.pending.clear();
+                                self.phase = MiniMaxM3StreamPhase::Tool;
+                            }
+                            // A namespace that is not yet a full tool marker
+                            // might still be normalized or restored by the
+                            // strict final parser, so keep it private for now.
+                            break;
+                        }
+                    }
+                    if let Some(start) = minimax_m3_tool_start(&self.pending) {
+                        out.push_str(&self.pending[..start]);
+                        self.pending.clear();
+                        self.phase = MiniMaxM3StreamPhase::Tool;
+                        break;
+                    }
+                    let flush = minimax_m3_content_flush_len(&self.pending);
+                    if flush == 0 {
+                        break;
+                    }
+                    out.push_str(&self.pending[..flush]);
+                    self.pending = self.pending[flush..].to_string();
+                    break;
+                }
+                MiniMaxM3StreamPhase::Tool => break,
+            }
+        }
+        self.emitted.push_str(&out);
+        out
+    }
+
+    /// Finish with the authoritative whole-response parse result.  Usually it
+    /// is exactly the portion not yet released.  The fallback retains output
+    /// rather than silently dropping it if a future wire variation makes the
+    /// incremental guard disagree with the strict parser.
+    pub fn finish(&mut self, content: &str) -> String {
+        let tail = content
+            .strip_prefix(&self.emitted)
+            .map(str::to_string)
+            .unwrap_or_else(|| content.to_string());
+        self.pending.clear();
+        self.emitted.push_str(&tail);
+        tail
+    }
+}
+
+/// Number of trailing bytes that may be the beginning of `marker`.
+fn minimax_m3_marker_suffix(text: &str, marker: &str) -> usize {
+    for len in (1..text.len().min(marker.len().saturating_sub(1)) + 1).rev() {
+        let start = text.len() - len;
+        if text.is_char_boundary(start) && marker.starts_with(&text[start..]) {
+            return len;
+        }
+    }
+    0
+}
+
+/// Start byte of a complete M3 tool-call marker, accepting the whitespace
+/// spelling the reference detector normalizes after the namespace token.
+fn minimax_m3_tool_start(text: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(relative) = text[from..].find(MINIMAX_M3_NS) {
+        let start = from + relative;
+        let after_ns = &text[start + MINIMAX_M3_NS.len()..];
+        let spaces = after_ns
+            .bytes()
+            .take_while(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+            .count();
+        if after_ns[spaces..].starts_with("<tool_call>") {
+            return Some(start);
+        }
+        from = start + MINIMAX_M3_NS.len();
+    }
+    None
+}
+
+/// Bytes safe to release while in the public-content phase.  The retained
+/// tail is either a partial namespace token or a full namespace followed by
+/// whitespace/a partial `<tool_call>` marker.
+fn minimax_m3_content_flush_len(text: &str) -> usize {
+    let mut keep_from = text.len();
+    let mut from = 0;
+    while let Some(relative) = text[from..].find(MINIMAX_M3_NS) {
+        let start = from + relative;
+        let after_ns = &text[start + MINIMAX_M3_NS.len()..];
+        let spaces = after_ns
+            .bytes()
+            .take_while(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+            .count();
+        let after_space = &after_ns[spaces..];
+        if after_space.is_empty() || "<tool_call>".starts_with(after_space) {
+            keep_from = keep_from.min(start);
+        }
+        from = start + MINIMAX_M3_NS.len();
+    }
+    let partial = minimax_m3_marker_suffix(text, MINIMAX_M3_NS);
+    if partial > 0 {
+        keep_from = keep_from.min(text.len() - partial);
+    }
+    keep_from
+}
+
 /// M3's reasoning detector has one format-specific wrinkle: an adaptive
 /// non-thinking response starts with a closing marker inherited from the
 /// prompt.  Only that *leading* close is stripped.  A truncated reasoning
@@ -1174,6 +1405,18 @@ mod tests {
             .collect()
     }
 
+    fn stream_m3(chunks: &[&str], tools: &[Value]) -> (String, Vec<Value>, Option<String>) {
+        let text = chunks.concat();
+        let mut stream = MiniMaxM3Stream::with_declared_tools();
+        let mut content = String::new();
+        for chunk in chunks {
+            content.push_str(&stream.push(chunk));
+        }
+        let (plain, calls, reasoning) = extract_minimax_m3_response(&text, Some(tools));
+        content.push_str(&stream.finish(&plain));
+        (content, calls, reasoning)
+    }
+
     // ── MiniMax M3 ──
 
     #[test]
@@ -1315,6 +1558,121 @@ mod tests {
         assert_eq!(plain, "answer");
         assert_eq!(calls.len(), 1);
         assert_eq!(args(&calls[0]), serde_json::json!({"city": "Rome"}));
+    }
+
+    #[test]
+    fn minimax_m3_stream_hides_split_reasoning_and_tool_protocol() {
+        let tools = minimax_m3_tools();
+        let chunks = [
+            "<mm:",
+            "think>use the weather tool</mm:th",
+            "ink>Checking.",
+            "]<]min",
+            "imax[>[<tool",
+            "_call> ]<]minimax[>[<invoke name=\"get_weather\">",
+            "]<]minimax[>[<city>Paris",
+            "]<]minimax[>[</city> ]<]minimax[>[</invoke> ]<]minimax[>[</tool_call>",
+        ];
+        let (content, calls, reasoning) = stream_m3(&chunks, &tools);
+        assert_eq!(content, "Checking.");
+        assert!(!content.contains("minimax"));
+        assert!(!content.contains("mm:think"));
+        assert_eq!(reasoning.as_deref(), Some("use the weather tool"));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert_eq!(args(&calls[0]), serde_json::json!({"city": "Paris"}));
+    }
+
+    #[test]
+    fn minimax_m3_stream_is_safe_at_every_marker_boundary() {
+        let tools = minimax_m3_tools();
+        let text = format!(
+            "<mm:think>private</mm:think>public{}",
+            m3_wire(&[
+                "<tool_call>",
+                "<invoke name=\"get_weather\">",
+                "<city>Rome",
+                "</city>",
+                "</invoke>",
+                "</tool_call>",
+            ])
+        );
+        for split in 0..=text.len() {
+            if !text.is_char_boundary(split) {
+                continue;
+            }
+            let (content, calls, reasoning) = stream_m3(&[&text[..split], &text[split..]], &tools);
+            assert_eq!(content, "public", "split at byte {split}");
+            assert!(!content.contains("minimax"), "split at byte {split}");
+            assert!(!content.contains("mm:think"), "split at byte {split}");
+            assert_eq!(reasoning.as_deref(), Some("private"), "split at byte {split}");
+            assert_eq!(calls.len(), 1, "split at byte {split}");
+        }
+    }
+
+    #[test]
+    fn minimax_m3_stream_handles_a_split_adaptive_close() {
+        let tools = minimax_m3_tools();
+        let (content, calls, reasoning) =
+            stream_m3(&[" \n</mm:", "think>direct", " answer"], &tools);
+        assert_eq!(content, "direct answer");
+        assert!(calls.is_empty());
+        assert_eq!(reasoning, None);
+    }
+
+    #[test]
+    fn minimax_m3_stream_retains_malformed_tool_output_at_finish() {
+        let tools = minimax_m3_tools();
+        let chunks = [
+            "Before.",
+            "]<]minimax[>[<tool_call>",
+            "]<]minimax[>[<invoke name=\"get_weather\">",
+            "]<]minimax[>[<city>Paris",
+            "]<]minimax[>[</wrong>] <]minimax[>[</invoke>] <]minimax[>[</tool_call>",
+        ];
+        let (content, calls, reasoning) = stream_m3(&chunks, &tools);
+        assert_eq!(content, chunks.concat());
+        assert!(calls.is_empty());
+        assert_eq!(reasoning, None);
+    }
+
+    #[test]
+    fn minimax_m3_stream_never_leaks_unterminated_reasoning() {
+        let mut stream = MiniMaxM3Stream::new();
+        for chunk in ["<mm:", "think>private ", "chain of thought"] {
+            let emitted = stream.push(chunk);
+            assert!(emitted.is_empty(), "reasoning leaked from {chunk:?}: {emitted:?}");
+        }
+        let text = "<mm:think>private chain of thought";
+        let (plain, calls, reasoning) = extract_minimax_m3_response(text, None);
+        assert!(plain.is_empty());
+        assert!(calls.is_empty());
+        assert_eq!(reasoning.as_deref(), Some("private chain of thought"));
+        assert!(stream.finish(&plain).is_empty());
+    }
+
+    #[test]
+    fn minimax_m3_stream_defers_namespace_text_for_transactional_parser() {
+        let tools = minimax_m3_tools();
+        // The strict parser normalizes whitespace after this namespace only
+        // when all later tool blocks are valid.  A later malformed block must
+        // therefore restore these exact wire bytes without duplicating an
+        // already streamed prefix.
+        let text = format!(
+            "before{MINIMAX_M3_NS}  <ordinary>after{}",
+            m3_wire(&[
+                "<tool_call>",
+                "<invoke name=\"get_weather\">",
+                "<city>Paris",
+                "</wrong>",
+                "</invoke>",
+                "</tool_call>",
+            ])
+        );
+        let (content, calls, reasoning) = stream_m3(&[&text[..7], &text[7..]], &tools);
+        assert_eq!(content, text);
+        assert!(calls.is_empty());
+        assert_eq!(reasoning, None);
     }
 
     // ── Hermes (unchanged behaviour) ──
