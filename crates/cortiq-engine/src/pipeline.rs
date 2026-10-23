@@ -522,6 +522,14 @@ impl Act {
                 beta: arch.activation_situ_beta.unwrap_or(1.0) as f32,
                 linear_beta: arch.activation_situ_linear_beta.unwrap_or(0.0) as f32,
             },
+            // `swigluoai` alone is deliberately not a generic activation
+            // alias.  Its alpha/limit are part of MiniMax M3's checked
+            // source contract, and accepting that string on an unrelated
+            // architecture would silently impose M3 math on its FFN.
+            "swigluoai" if arch.arch_name == "minimax_m3_vl" => Self::SwiGluOai {
+                alpha: 1.702,
+                limit: 7.0,
+            },
             other => Self::from_arch(other),
         }
     }
@@ -20630,6 +20638,49 @@ mod tests {
         assert_ne!(r2.finish_reason, "cancelled");
     }
     use super::*;
+
+    #[test]
+    fn minimax_m3_arch_selects_checked_oai_activation_only() {
+        // Keep this fixture minimal: `Act::from_arch_full` needs only the
+        // architecture id and activation name, while serde supplies stable
+        // defaults for unrelated CMF fields.
+        let arch = |arch_name: &str, hidden_act: &str| {
+            serde_json::from_value::<cortiq_core::ModelArch>(serde_json::json!({
+                "arch_name": arch_name,
+                "hidden_size": 8,
+                "intermediate_size": 16,
+                "num_layers": 1,
+                "num_attention_heads": 1,
+                "num_kv_heads": 1,
+                "head_dim": 8,
+                "vocab_size": 16,
+                "layer_types": ["FullAttention"],
+                "rms_norm_eps": 1e-6,
+                "max_position_embeddings": 16,
+                "hidden_act": hidden_act
+            }))
+            .expect("minimal architecture")
+        };
+        let minimax = arch("minimax_m3_vl", "swigluoai");
+        assert_eq!(
+            Act::from_arch_full(&minimax),
+            Act::SwiGluOai {
+                alpha: 1.702,
+                limit: 7.0,
+            }
+        );
+
+        // The same spelling must not turn into MiniMax math on a generic
+        // model.  Only the source-validated M3 architecture owns it.
+        let unrelated = arch("qwen2", "swigluoai");
+        assert_eq!(Act::from_arch_full(&unrelated), Act::Silu);
+
+        // Conversely, an M3-tagged header with a normal activation keeps the
+        // normal path; this prevents the architecture id from overriding the
+        // explicit serialized contract.
+        let non_oai = arch("minimax_m3_vl", "gelu");
+        assert_eq!(Act::from_arch_full(&non_oai), Act::Gelu);
+    }
 
     #[test]
     fn minimax_swiglu_oai_act_matches_scalar_contract() {
