@@ -7,7 +7,7 @@
 //! separate prevents a future generic decoder path from silently accepting an
 //! incompatible M3 checkpoint.
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -263,28 +263,136 @@ fn expected_text_tensors(layout: &MiniMaxM3Layout) -> HashMap<String, TensorSign
     expected
 }
 
+/// Exact non-text tensor contract for the published M3.1 visual wrapper.
+///
+/// The current conversion route deliberately emits only the text backbone,
+/// but that is not a license to accept an arbitrary collection of tensors
+/// under the three visual roots.  The source identity matters even for a
+/// text-only CMF: a changed patch geometry or projector can indicate a model
+/// revision whose prompt/media contract has changed as well.  Keep this
+/// signature table here (rather than a count-only guard) so full VL support
+/// has a checked source inventory to build on later.
+fn expected_visual_tensors() -> HashMap<String, TensorSignature> {
+    const VISION_HIDDEN: usize = 1280;
+    const VISION_INTERMEDIATE: usize = 5120;
+    const VISION_LAYERS: usize = 32;
+    const TEXT_HIDDEN: usize = 6144;
+    let mut expected = HashMap::with_capacity(523);
+
+    add_expected(
+        &mut expected,
+        "vision_tower.vision_model.embeddings.patch_embedding.weight",
+        "F32",
+        [VISION_HIDDEN, 3, 2, 14, 14],
+    );
+    for param in ["weight", "bias"] {
+        add_expected(
+            &mut expected,
+            format!("vision_tower.vision_model.pre_layrnorm.{param}"),
+            "BF16",
+            [VISION_HIDDEN],
+        );
+    }
+
+    for layer in 0..VISION_LAYERS {
+        let prefix = format!("vision_tower.vision_model.encoder.layers.{layer}");
+        for norm in ["layer_norm1", "layer_norm2"] {
+            for param in ["weight", "bias"] {
+                add_expected(
+                    &mut expected,
+                    format!("{prefix}.{norm}.{param}"),
+                    "BF16",
+                    [VISION_HIDDEN],
+                );
+            }
+        }
+        for (projection, rows, cols) in [
+            ("fc1", VISION_INTERMEDIATE, VISION_HIDDEN),
+            ("fc2", VISION_HIDDEN, VISION_INTERMEDIATE),
+        ] {
+            add_expected(
+                &mut expected,
+                format!("{prefix}.mlp.{projection}.weight"),
+                "BF16",
+                [rows, cols],
+            );
+            add_expected(
+                &mut expected,
+                format!("{prefix}.mlp.{projection}.bias"),
+                "BF16",
+                [rows],
+            );
+        }
+        for projection in ["q_proj", "k_proj", "v_proj", "out_proj"] {
+            add_expected(
+                &mut expected,
+                format!("{prefix}.self_attn.{projection}.weight"),
+                "BF16",
+                [VISION_HIDDEN, VISION_HIDDEN],
+            );
+            add_expected(
+                &mut expected,
+                format!("{prefix}.self_attn.{projection}.bias"),
+                "BF16",
+                [VISION_HIDDEN],
+            );
+        }
+    }
+
+    for (root, input) in [
+        ("multi_modal_projector", VISION_HIDDEN),
+        ("patch_merge_mlp", TEXT_HIDDEN * 4),
+    ] {
+        add_expected(
+            &mut expected,
+            format!("{root}.linear_1.weight"),
+            "BF16",
+            [TEXT_HIDDEN, input],
+        );
+        add_expected(
+            &mut expected,
+            format!("{root}.linear_1.bias"),
+            "BF16",
+            [TEXT_HIDDEN],
+        );
+        add_expected(
+            &mut expected,
+            format!("{root}.linear_2.weight"),
+            "BF16",
+            [TEXT_HIDDEN, TEXT_HIDDEN],
+        );
+        add_expected(
+            &mut expected,
+            format!("{root}.linear_2.bias"),
+            "BF16",
+            [TEXT_HIDDEN],
+        );
+    }
+
+    debug_assert_eq!(expected.len(), 523);
+    expected
+}
+
 /// Validate the full published MiniMax-M3.1 safetensors *header index*.
 ///
 /// This is intentionally run before conversion opens/consumes a large source
-/// shard.  It rejects a checkpoint with a changed text tensor name, dtype,
-/// shape, companion, expert, or duplicate.  The non-text roots are counted
-/// too, so a different multimodal checkpoint cannot accidentally masquerade
-/// as this exact source.  The converter may choose not to emit vision tensors
-/// until their runtime is implemented, but it must never silently accept an
-/// unreviewed source layout.
+/// shard.  It rejects a checkpoint with a changed text or visual tensor name,
+/// dtype, shape, companion, expert, or duplicate.  The converter may choose
+/// not to emit vision tensors until their runtime is implemented, but it must
+/// never silently accept an unreviewed source layout.
 #[allow(dead_code)] // invoked by `convert` when the dedicated M3 route lands.
 pub(crate) fn validate_minimax_m3_source_index<'a>(
     layout: &MiniMaxM3Layout,
     tensors: impl IntoIterator<Item = MiniMaxM3TensorRef<'a>>,
 ) -> Result<()> {
-    let mut expected = expected_text_tensors(layout);
-    let mut external_counts = HashMap::<&str, usize>::new();
+    let mut expected_text = expected_text_tensors(layout);
+    let mut expected_visual = expected_visual_tensors();
     let mut total = 0usize;
 
     for tensor in tensors {
         total += 1;
         if tensor.name.starts_with("language_model.") {
-            let Some(signature) = expected.remove(tensor.name) else {
+            let Some(signature) = expected_text.remove(tensor.name) else {
                 anyhow::bail!(
                     "MiniMax-M3.1 source contract: unexpected or duplicate text tensor {}",
                     tensor.name
@@ -305,42 +413,46 @@ pub(crate) fn validate_minimax_m3_source_index<'a>(
                 signature.shape
             );
         } else {
-            let root = if tensor.name.starts_with("vision_tower.") {
-                "vision_tower"
-            } else if tensor.name.starts_with("multi_modal_projector.") {
-                "multi_modal_projector"
-            } else if tensor.name.starts_with("patch_merge_mlp.") {
-                "patch_merge_mlp"
-            } else {
+            let Some(signature) = expected_visual.remove(tensor.name) else {
                 anyhow::bail!(
-                    "MiniMax-M3.1 source contract: unexpected non-text tensor {}",
+                    "MiniMax-M3.1 source contract: unexpected or duplicate visual tensor {}",
                     tensor.name
                 );
             };
-            *external_counts.entry(root).or_default() += 1;
+            ensure!(
+                tensor.dtype == signature.dtype,
+                "MiniMax-M3.1 source contract: {} dtype is {}, expected {}",
+                tensor.name,
+                tensor.dtype,
+                signature.dtype
+            );
+            ensure!(
+                tensor.shape == signature.shape.as_slice(),
+                "MiniMax-M3.1 source contract: {} shape is {:?}, expected {:?}",
+                tensor.name,
+                tensor.shape,
+                signature.shape
+            );
         }
     }
 
     ensure!(
-        expected.is_empty(),
+        expected_text.is_empty(),
         "MiniMax-M3.1 source contract: missing {} expected text tensor(s), first: {}",
-        expected.len(),
-        expected.keys().next().expect("non-empty map has first key")
+        expected_text.len(),
+        expected_text
+            .keys()
+            .next()
+            .expect("non-empty map has first key")
     );
-    for (root, expected_count) in [
-        ("vision_tower", 515usize),
-        ("multi_modal_projector", 4),
-        ("patch_merge_mlp", 4),
-    ] {
-        let actual = external_counts.remove(root).unwrap_or_default();
-        ensure!(
-            actual == expected_count,
-            "MiniMax-M3.1 source contract: {root} has {actual} tensors, expected {expected_count}"
-        );
-    }
     ensure!(
-        external_counts.is_empty(),
-        "MiniMax-M3.1 source contract: unexpected source root"
+        expected_visual.is_empty(),
+        "MiniMax-M3.1 source contract: missing {} expected visual tensor(s), first: {}",
+        expected_visual.len(),
+        expected_visual
+            .keys()
+            .next()
+            .expect("non-empty map has first key")
     );
     ensure!(
         total == 89_632,
@@ -661,22 +773,15 @@ mod tests {
                 shape: signature.shape,
             })
             .collect();
-        // The current public source has 523 multimodal tensors.  Its text
-        // conversion route ignores those payloads, but the source identity is
-        // still pinned by their root/counts.
-        for (root, count) in [
-            ("vision_tower", 515usize),
-            ("multi_modal_projector", 4),
-            ("patch_merge_mlp", 4),
-        ] {
-            for index in 0..count {
-                tensors.push(OwnedTensor {
-                    name: format!("{root}.contract_fixture_{index}"),
-                    dtype: "BF16".to_owned(),
-                    shape: vec![1],
-                });
-            }
-        }
+        tensors.extend(
+            expected_visual_tensors()
+                .into_iter()
+                .map(|(name, signature)| OwnedTensor {
+                    name,
+                    dtype: signature.dtype.to_owned(),
+                    shape: signature.shape,
+                }),
+        );
         assert_eq!(tensors.len(), 89_632);
         tensors
     }
@@ -738,6 +843,37 @@ mod tests {
         let err = validate_owned_source(&tensors).unwrap_err().to_string();
         assert!(err.contains("q_proj.weight_scale_inv"), "{err}");
         assert!(err.contains("shape"), "{err}");
+    }
+
+    #[test]
+    fn source_index_rejects_changed_visual_signature() {
+        let mut tensors = published_source_index();
+        let tensor = tensors
+            .iter_mut()
+            .find(|tensor| {
+                tensor.name == "vision_tower.vision_model.embeddings.patch_embedding.weight"
+            })
+            .unwrap();
+        tensor.shape = vec![1280, 3, 1, 14, 14];
+        let err = validate_owned_source(&tensors).unwrap_err().to_string();
+        assert!(err.contains("patch_embedding.weight"), "{err}");
+        assert!(err.contains("shape"), "{err}");
+    }
+
+    #[test]
+    fn source_index_rejects_changed_visual_dtype() {
+        let mut tensors = published_source_index();
+        let tensor = tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "multi_modal_projector.linear_1.weight")
+            .unwrap();
+        tensor.dtype = "F32".to_owned();
+        let err = validate_owned_source(&tensors).unwrap_err().to_string();
+        assert!(
+            err.contains("multi_modal_projector.linear_1.weight"),
+            "{err}"
+        );
+        assert!(err.contains("dtype"), "{err}");
     }
 
     #[test]
