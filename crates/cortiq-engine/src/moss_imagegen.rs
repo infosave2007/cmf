@@ -137,6 +137,17 @@ pub struct MossParams {
     /// `None` means the source release default `[22]`; `Some(vec![])`
     /// intentionally disables the negative branch skip.
     pub uncond_skip_layers: Option<Vec<usize>>,
+    /// Optional positive-branch skip-layer guidance (SLG) block indices.
+    /// An empty list disables the third DiT forward.
+    pub slg_layers: Vec<usize>,
+    /// SLG correction strength. It is ignored when `slg_layers` is empty.
+    pub slg_scale: f32,
+    /// Inclusive start of the denoising-fraction interval where both source
+    /// negative-branch skipping and SLG are active.
+    pub slg_start: f32,
+    /// Exclusive end of the denoising-fraction interval where both source
+    /// negative-branch skipping and SLG are active.
+    pub slg_stop: f32,
 }
 
 impl MossParams {
@@ -152,6 +163,10 @@ impl MossParams {
             num_images: 1,
             negative_prompt: None,
             uncond_skip_layers: None,
+            slg_layers: Vec::new(),
+            slg_scale: 0.0,
+            slg_start: 0.0,
+            slg_stop: 1.0,
         }
     }
 }
@@ -306,6 +321,57 @@ fn gauss(n: usize, seed: u64) -> Vec<f32> {
     out
 }
 
+/// The official pipeline measures the active skip/SLG interval over the
+/// scheduler's *actual* denoising step count, with an inclusive start and an
+/// exclusive stop. Keeping this pure makes the boundary contract explicit.
+fn moss_skip_active(step: usize, total_steps: usize, start: f32, stop: f32) -> bool {
+    total_steps > 0
+        && start <= step as f32 / (total_steps as f32)
+        && step as f32 / (total_steps as f32) < stop
+}
+
+/// Apply MOSS's source CFG/SLG formulation in fp32. `prediction` begins as
+/// the positive conditional prediction. If SLG is active, `conditional` is a
+/// retained copy of that original positive forward and `skipped` is the extra
+/// skipped-positive forward. This matches `MOSSImagePipeline.__call__` exactly:
+/// CFG first, then the SLG correction; without CFG SLG starts from `skipped`.
+fn apply_moss_guidance(
+    prediction: &mut [f32],
+    conditional: Option<&[f32]>,
+    uncond: Option<&[f32]>,
+    cfg: f32,
+    skipped: Option<&[f32]>,
+    slg_scale: f32,
+) -> Result<(), String> {
+    if let Some(uncond) = uncond {
+        if uncond.len() != prediction.len() {
+            return Err("MOSS unconditional prediction shape mismatch".into());
+        }
+        for (v, &u) in prediction.iter_mut().zip(uncond) {
+            *v = u + cfg * (*v - u);
+        }
+    }
+    match (conditional, skipped) {
+        (None, None) => Ok(()),
+        (Some(conditional), Some(skipped)) => {
+            if conditional.len() != prediction.len() || skipped.len() != prediction.len() {
+                return Err("MOSS SLG prediction shape mismatch".into());
+            }
+            if uncond.is_some() {
+                for ((v, &c), &s) in prediction.iter_mut().zip(conditional).zip(skipped) {
+                    *v += slg_scale * (c - s);
+                }
+            } else {
+                for ((v, &c), &s) in prediction.iter_mut().zip(conditional).zip(skipped) {
+                    *v = s + slg_scale * (c - s);
+                }
+            }
+            Ok(())
+        }
+        _ => Err("MOSS SLG needs both conditional and skipped predictions".into()),
+    }
+}
+
 fn pixels_to_u8(rgb: &[f32], height: usize, width: usize) -> Result<Vec<u8>, String> {
     let plane = height
         .checked_mul(width)
@@ -353,6 +419,17 @@ pub fn generate_images(
         || p.shift <= 0.0
     {
         return Err("invalid MOSS steps, cfg or shift".into());
+    }
+    if !p.slg_scale.is_finite() || p.slg_scale < 0.0 {
+        return Err("MOSS --slg-scale must be finite and nonnegative".into());
+    }
+    if !p.slg_start.is_finite()
+        || !p.slg_stop.is_finite()
+        || p.slg_start < 0.0
+        || p.slg_start > p.slg_stop
+        || p.slg_stop > 1.0
+    {
+        return Err("MOSS requires 0 <= --slg-start <= --slg-stop <= 1".into());
     }
     let all_started = Instant::now();
     let model = CmfModel::open(model_path).map_err(|e| format!("{}: {e}", model_path.display()))?;
@@ -459,6 +536,9 @@ pub fn generate_images(
                 dit.cfg.num_layers
             ));
         }
+        if p.slg_layers.iter().any(|&i| i >= dit.cfg.num_layers) {
+            return Err(format!("MOSS SLG layer outside 0..{}", dit.cfg.num_layers));
+        }
         let (lh, lw) = (p.height / 16, p.width / 16);
         let mut completed = Vec::with_capacity(p.num_images);
         for image in 0..p.num_images {
@@ -471,14 +551,42 @@ pub fn generate_images(
                 // The source FlowMatch scheduler exposes timestep = sigma ×
                 // its recorded training-grid length.
                 let t = sigmas[step] * scheduler.num_train_timesteps as f32;
+                // The source defines this interval over actual scheduler
+                // timesteps (after its nearest-grid snap), not requested
+                // `--steps`.  It gates both the negative-branch skip and
+                // optional positive-branch SLG.
+                let skip_active = moss_skip_active(step, actual_steps, p.slg_start, p.slg_stop);
                 let mut prediction =
                     dit.forward(&latent, lh, lw, t, &positive, positive_tokens, &[])?;
-                if let Some((negative, neg_len)) = &negative {
-                    let uncond = dit.forward(&latent, lh, lw, t, negative, *neg_len, skips)?;
-                    for (v, &u) in prediction.iter_mut().zip(&uncond) {
-                        *v = u + p.cfg * (*v - u);
-                    }
-                }
+                let use_slg = skip_active && !p.slg_layers.is_empty() && p.slg_scale > 0.0;
+                let conditional = use_slg.then(|| prediction.clone());
+                let uncond = if let Some((negative, neg_len)) = &negative {
+                    let uncond_skips = if skip_active { skips } else { &[] };
+                    Some(dit.forward(&latent, lh, lw, t, negative, *neg_len, uncond_skips)?)
+                } else {
+                    None
+                };
+                let skipped = if conditional.is_some() {
+                    Some(dit.forward(
+                        &latent,
+                        lh,
+                        lw,
+                        t,
+                        &positive,
+                        positive_tokens,
+                        &p.slg_layers,
+                    )?)
+                } else {
+                    None
+                };
+                apply_moss_guidance(
+                    &mut prediction,
+                    conditional.as_deref(),
+                    uncond.as_deref(),
+                    p.cfg,
+                    skipped.as_deref(),
+                    p.slg_scale,
+                )?;
                 let dt = sigmas[step + 1] - sigmas[step];
                 for (x, v) in latent.iter_mut().zip(&prediction) {
                     *x += dt * v;
@@ -579,6 +687,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn skip_guidance_window_matches_source_boundaries() {
+        // The source uses `start <= step_index / num_steps < stop`.
+        assert!(moss_skip_active(0, 10, 0.0, 1.0));
+        assert!(moss_skip_active(9, 10, 0.0, 1.0));
+        assert!(!moss_skip_active(10, 10, 0.0, 1.0));
+        assert!(!moss_skip_active(0, 10, 0.1, 0.9));
+        assert!(moss_skip_active(1, 10, 0.1, 0.9));
+        assert!(!moss_skip_active(9, 10, 0.1, 0.9));
+        assert!(!moss_skip_active(0, 0, 0.0, 1.0));
+    }
+
+    #[test]
+    fn standard_slg_matches_source_cfg_order() {
+        let conditional = [2.0, -1.0];
+        let uncond = [1.0, 3.0];
+        let skipped = [0.0, 1.0];
+
+        // Source: CFG first, then `slg_scale * (cond - cond_skip)`.
+        let mut with_cfg = conditional;
+        apply_moss_guidance(
+            &mut with_cfg,
+            Some(&conditional),
+            Some(&uncond),
+            3.0,
+            Some(&skipped),
+            2.0,
+        )
+        .unwrap();
+        assert_eq!(with_cfg, [8.0, -13.0]);
+
+        // With guidance_scale=1 source replaces the normal conditional output
+        // with `skipped + slg_scale * (cond - skipped)`.
+        let mut without_cfg = conditional;
+        apply_moss_guidance(
+            &mut without_cfg,
+            Some(&conditional),
+            None,
+            1.0,
+            Some(&skipped),
+            2.0,
+        )
+        .unwrap();
+        assert_eq!(without_cfg, [4.0, -3.0]);
     }
 
     #[test]
