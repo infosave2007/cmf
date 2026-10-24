@@ -406,6 +406,12 @@ unsafe impl Send for SendRows {}
 unsafe impl Sync for SendRows {}
 impl SendRows {
     /// SAFETY: callers divide the buffer into non-overlapping row ranges.
+    ///
+    /// The `&self` receiver is deliberate: the wrapper is shared across
+    /// worker closures (`Sync`) while each call carves out a disjoint slice
+    /// of the same backing buffer, so no two live `&mut` ever alias —
+    /// exactly the case `mut_from_ref` cannot see through.
+    #[allow(clippy::mut_from_ref)]
     unsafe fn row(&self, off: usize, len: usize) -> &mut [f32] {
         unsafe { std::slice::from_raw_parts_mut(self.0.add(off), len) }
     }
