@@ -10,7 +10,7 @@
 //! 1/√c), k, vᵀ, then per query chunk S = q·kᵀ (f32), row softmax → half P,
 //! O = P·v, out projection + residual. One latent upload, one RGB readback.
 
-use super::{buf_from, buf_zeroed, pipes, set_p, Pipes};
+use super::{Pipes, buf_from, buf_zeroed, pipes, set_p};
 use crate::vae::{VaeChainArgs, VaeConvRef, VaeNormRef, VaeResnetRef};
 use metal::{Buffer, ComputeCommandEncoderRef, MTLResourceOptions, MTLSize};
 use std::ffi::c_void;
@@ -110,7 +110,10 @@ unsafe impl Send for VState {}
 static VSTATE: Mutex<VState> = Mutex::new(VState(None));
 
 fn half_buf(c: &Ctx, v: &[f32]) -> Buffer {
-    let h: Vec<u16> = v.iter().map(|&x| cortiq_core::quant::f32_to_f16(x)).collect();
+    let h: Vec<u16> = v
+        .iter()
+        .map(|&x| cortiq_core::quant::f32_to_f16(x))
+        .collect();
     c._device.new_buffer_with_data(
         h.as_ptr() as *const c_void,
         (h.len().max(8) * 2) as u64,
@@ -240,7 +243,11 @@ fn build(c: &Ctx, a: &VaeChainArgs) -> Result<VaeDev, String> {
             .iter()
             .map(|u| {
                 Ok(VUp {
-                    res: u.resnets.iter().map(|r| res_of(c, r)).collect::<Result<Vec<_>, String>>()?,
+                    res: u
+                        .resnets
+                        .iter()
+                        .map(|r| res_of(c, r))
+                        .collect::<Result<Vec<_>, String>>()?,
                     up: match &u.upsample {
                         Some(s) => Some(conv_of(c, s, 1.0)?),
                         None => None,
@@ -263,7 +270,9 @@ fn ensure<'s>(st: &'s mut VState, c: &Ctx, a: &VaeChainArgs) -> Result<&'s VaeDe
 }
 
 pub(crate) fn prewarm(a: &VaeChainArgs) -> bool {
-    let Some(c) = super::super::ctx() else { return false };
+    let Some(c) = super::super::ctx() else {
+        return false;
+    };
     if pipes(c).is_none() {
         return false;
     }
@@ -334,7 +343,11 @@ impl VRec<'_> {
         ldx: usize,
         k_plain: usize,
     ) {
-        let k = if cv.taps == 0 { k_plain } else { cv.taps * cv.icp };
+        let k = if cv.taps == 0 {
+            k_plain
+        } else {
+            cv.taps * cv.icp
+        };
         let pv = PVc {
             n: n as u32,
             // Normal NHWC outputs use `ldy` as their logical channel
@@ -376,7 +389,18 @@ impl VRec<'_> {
     /// Plain GEMM with an explicit weight buffer (the attention's k / vᵀ
     /// as "weights"): Y[n][rows] = X[n][K] · W[rows][K]ᵀ, no bias.
     #[allow(clippy::too_many_arguments)]
-    fn gemm(&mut self, w: (&Buffer, u64), rows: usize, k: usize, x: (&Buffer, u64), ldx: usize, y: (&Buffer, u64), ldy: usize, n: usize, epi: u32) {
+    fn gemm(
+        &mut self,
+        w: (&Buffer, u64),
+        rows: usize,
+        k: usize,
+        x: (&Buffer, u64),
+        ldx: usize,
+        y: (&Buffer, u64),
+        ldy: usize,
+        n: usize,
+        epi: u32,
+    ) {
         let pv = PVc {
             n: n as u32,
             rows: rows as u32,
@@ -404,7 +428,16 @@ impl VRec<'_> {
     }
 
     /// GroupNorm (+SiLU) of x [n][ch] f32 → y (half or f32).
-    fn gn(&mut self, nm: &VNorm, x: &Buffer, y: &Buffer, n: usize, ch: usize, silu: bool, half_out: bool) {
+    fn gn(
+        &mut self,
+        nm: &VNorm,
+        x: &Buffer,
+        y: &Buffer,
+        n: usize,
+        ch: usize,
+        silu: bool,
+        half_out: bool,
+    ) {
         let nblk = n.div_ceil(1024).clamp(1, 256);
         let mut pg = PGn {
             n: n as u32,
@@ -426,12 +459,18 @@ impl VRec<'_> {
             enc.set_buffer(1, Some(&part), 0);
             enc.set_buffer(2, Some(&stat), 0);
             set_p(enc, 3, &pg);
-            enc.dispatch_thread_groups(MTLSize::new(nm.groups as u64, nblk as u64, 1), MTLSize::new(256, 1, 1));
+            enc.dispatch_thread_groups(
+                MTLSize::new(nm.groups as u64, nblk as u64, 1),
+                MTLSize::new(256, 1, 1),
+            );
             enc.set_compute_pipeline_state(&p.vgnfin);
             enc.set_buffer(0, Some(&part), 0);
             enc.set_buffer(1, Some(&stat), 0);
             set_p(enc, 2, &pg);
-            enc.dispatch_thread_groups(MTLSize::new(nm.groups as u64, 1, 1), MTLSize::new(32, 1, 1));
+            enc.dispatch_thread_groups(
+                MTLSize::new(nm.groups as u64, 1, 1),
+                MTLSize::new(32, 1, 1),
+            );
         }
         enc.set_compute_pipeline_state(&p.vgnapply);
         enc.set_buffer(0, Some(x), 0);
@@ -441,7 +480,10 @@ impl VRec<'_> {
         enc.set_buffer(4, Some(&nm.b), 0);
         set_p(enc, 5, &pg);
         let n4 = (n * ch / 4) as u64;
-        enc.dispatch_thread_groups(MTLSize::new(n4.div_ceil(256), 1, 1), MTLSize::new(256, 1, 1));
+        enc.dispatch_thread_groups(
+            MTLSize::new(n4.div_ceil(256), 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
     }
 
     fn cvt(&mut self, x: &Buffer, y: &Buffer, count: usize) {
@@ -452,7 +494,10 @@ impl VRec<'_> {
         enc.set_buffer(0, Some(x), 0);
         enc.set_buffer(1, Some(y), 0);
         set_p(enc, 2, &n4);
-        enc.dispatch_thread_groups(MTLSize::new((n4 as u64).div_ceil(256), 1, 1), MTLSize::new(256, 1, 1));
+        enc.dispatch_thread_groups(
+            MTLSize::new((n4 as u64).div_ceil(256), 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
     }
 }
 
@@ -465,13 +510,49 @@ struct Bufs {
 /// One resnet on xa [n][cin] (f32) → xa [n][cout].
 fn resnet(r: &mut VRec, b: &Bufs, rs: &VRes, n: usize, hw: (usize, usize)) {
     r.gn(&rs.n1, &b.xa, &b.hh, n, rs.cin, true, true);
-    r.conv(&rs.c1, (&b.hh, 0), (&b.t, 0), None, n, hw, false, 0, rs.cout, 0, 0);
+    r.conv(
+        &rs.c1,
+        (&b.hh, 0),
+        (&b.t, 0),
+        None,
+        n,
+        hw,
+        false,
+        0,
+        rs.cout,
+        0,
+        0,
+    );
     if let Some(sc) = &rs.sc {
         r.cvt(&b.xa, &b.hh, n * rs.cin);
-        r.conv(sc, (&b.hh, 0), (&b.xa, 0), None, n, hw, false, 0, rs.cout, 0, 0);
+        r.conv(
+            sc,
+            (&b.hh, 0),
+            (&b.xa, 0),
+            None,
+            n,
+            hw,
+            false,
+            0,
+            rs.cout,
+            0,
+            0,
+        );
     }
     r.gn(&rs.n2, &b.t, &b.hh, n, rs.cout, true, true);
-    r.conv(&rs.c2, (&b.hh, 0), (&b.xa, 0), Some((&b.xa, 0)), n, hw, false, 0, rs.cout, 0, 0);
+    r.conv(
+        &rs.c2,
+        (&b.hh, 0),
+        (&b.xa, 0),
+        Some((&b.xa, 0)),
+        n,
+        hw,
+        false,
+        0,
+        rs.cout,
+        0,
+        0,
+    );
 }
 
 /// The f16-plane arm of the codec A/B (plan M5c): the same 64×64×32 tile
@@ -480,10 +561,22 @@ fn resnet(r: &mut VRec, b: &Bufs, rs: &VRes, n: usize, hw: (usize, usize)) {
 pub(crate) fn bench_plane(rows: usize, k: usize, n: usize, reps: usize) -> Option<(f64, f64)> {
     let c = super::super::ctx()?;
     let p = pipes(c)?;
-    let w: Vec<u16> = (0..rows * k).map(|i| cortiq_core::quant::f32_to_f16(((i * 7) % 255) as f32 - 127.0)).collect();
-    let x: Vec<u16> = (0..(n.div_ceil(64) * 64 + 64) * k).map(|i| cortiq_core::quant::f32_to_f16(((i * 5) % 17) as f32 * 0.01)).collect();
-    let wb = c._device.new_buffer_with_data(w.as_ptr() as *const c_void, (w.len() * 2) as u64, MTLResourceOptions::StorageModeShared);
-    let xb = c._device.new_buffer_with_data(x.as_ptr() as *const c_void, (x.len() * 2) as u64, MTLResourceOptions::StorageModeShared);
+    let w: Vec<u16> = (0..rows * k)
+        .map(|i| cortiq_core::quant::f32_to_f16(((i * 7) % 255) as f32 - 127.0))
+        .collect();
+    let x: Vec<u16> = (0..(n.div_ceil(64) * 64 + 64) * k)
+        .map(|i| cortiq_core::quant::f32_to_f16(((i * 5) % 17) as f32 * 0.01))
+        .collect();
+    let wb = c._device.new_buffer_with_data(
+        w.as_ptr() as *const c_void,
+        (w.len() * 2) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let xb = c._device.new_buffer_with_data(
+        x.as_ptr() as *const c_void,
+        (x.len() * 2) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
     let yb = buf_zeroed(c, n * rows * 4);
     let pv = PVc {
         n: n as u32,
@@ -506,7 +599,10 @@ pub(crate) fn bench_plane(rows: usize, k: usize, n: usize, reps: usize) -> Optio
         enc.set_buffer(3, Some(&yb), 0);
         enc.set_buffer(4, Some(&yb), 0);
         set_p(enc, 5, &pv);
-        enc.dispatch_thread_groups(MTLSize::new(n.div_ceil(64) as u64, (rows / 64) as u64, 1), MTLSize::new(128, 1, 1));
+        enc.dispatch_thread_groups(
+            MTLSize::new(n.div_ceil(64) as u64, (rows / 64) as u64, 1),
+            MTLSize::new(128, 1, 1),
+        );
         enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
@@ -523,7 +619,9 @@ pub(crate) fn decode(a: &VaeChainArgs, z: &[f32], h: usize, w: usize, out: &mut 
     if std::env::var("CMF_ZI_VAE").as_deref() == Ok("0") {
         return false;
     }
-    let Some(c) = super::super::ctx() else { return false };
+    let Some(c) = super::super::ctx() else {
+        return false;
+    };
     let Some(p) = pipes(c) else { return false };
     let mut st = VSTATE.lock().unwrap();
     let d = match ensure(&mut st, c, a) {
@@ -602,20 +700,78 @@ pub(crate) fn decode(a: &VaeChainArgs, z: &[f32], h: usize, w: usize, out: &mut 
     let t0 = std::time::Instant::now();
     let b = &bufs;
     // conv_in
-    r.conv(&d.conv_in, (&b.hh, 0), (&b.xa, 0), None, n0, (h, w), false, 0, d.conv_in.ocp, 0, 0);
+    r.conv(
+        &d.conv_in,
+        (&b.hh, 0),
+        (&b.xa, 0),
+        None,
+        n0,
+        (h, w),
+        false,
+        0,
+        d.conv_in.ocp,
+        0,
+        0,
+    );
     resnet(&mut r, b, &d.mid1, n0, (h, w));
     r.cut();
     // mid attention
     {
         let at = &d.attn;
         r.gn(&at.norm, &b.xa, &b.hh, n0, ac, false, true);
-        r.conv(&at.q, (&b.hh, 0), (&qb, 0), None, n0, (0, 0), false, 1, ac, ac, ac);
-        r.conv(&at.k, (&b.hh, 0), (&kb, 0), None, n0, (0, 0), false, 1, ac, ac, ac);
-        r.conv(&at.v, (&b.hh, 0), (&vt, 0), None, n0, (0, 0), false, 2, n0p, ac, ac);
+        r.conv(
+            &at.q,
+            (&b.hh, 0),
+            (&qb, 0),
+            None,
+            n0,
+            (0, 0),
+            false,
+            1,
+            ac,
+            ac,
+            ac,
+        );
+        r.conv(
+            &at.k,
+            (&b.hh, 0),
+            (&kb, 0),
+            None,
+            n0,
+            (0, 0),
+            false,
+            1,
+            ac,
+            ac,
+            ac,
+        );
+        r.conv(
+            &at.v,
+            (&b.hh, 0),
+            (&vt, 0),
+            None,
+            n0,
+            (0, 0),
+            false,
+            2,
+            n0p,
+            ac,
+            ac,
+        );
         let mut q0 = 0;
         while q0 < n0 {
             let m = chunk.min(n0 - q0);
-            r.gemm((&kb, 0), n0p, ac, (&qb, (q0 * ac * 2) as u64), ac, (&sb, 0), n0p, m, 0);
+            r.gemm(
+                (&kb, 0),
+                n0p,
+                ac,
+                (&qb, (q0 * ac * 2) as u64),
+                ac,
+                (&sb, 0),
+                n0p,
+                m,
+                0,
+            );
             {
                 let pp = r.p;
                 let (n0u, ldu) = (n0 as u32, n0p as u32);
@@ -627,10 +783,32 @@ pub(crate) fn decode(a: &VaeChainArgs, z: &[f32], h: usize, w: usize, out: &mut 
                 set_p(enc, 3, &ldu);
                 enc.dispatch_thread_groups(MTLSize::new(m as u64, 1, 1), MTLSize::new(256, 1, 1));
             }
-            r.gemm((&vt, 0), ac, n0p, (&pb, 0), n0p, (&ob, (q0 * ac * 2) as u64), ac, m, 1);
+            r.gemm(
+                (&vt, 0),
+                ac,
+                n0p,
+                (&pb, 0),
+                n0p,
+                (&ob, (q0 * ac * 2) as u64),
+                ac,
+                m,
+                1,
+            );
             q0 += m;
         }
-        r.conv(&at.o, (&ob, 0), (&b.xa, 0), Some((&b.xa, 0)), n0, (0, 0), false, 0, ac, ac, ac);
+        r.conv(
+            &at.o,
+            (&ob, 0),
+            (&b.xa, 0),
+            Some((&b.xa, 0)),
+            n0,
+            (0, 0),
+            false,
+            0,
+            ac,
+            ac,
+            ac,
+        );
     }
     resnet(&mut r, b, &d.mid2, n0, (h, w));
     r.cut();
@@ -640,7 +818,11 @@ pub(crate) fn decode(a: &VaeChainArgs, z: &[f32], h: usize, w: usize, out: &mut 
     let (mut xa, mut tt) = (b.xa.clone(), b.t.clone());
     for u in &d.ups {
         for rs in &u.res {
-            let bb = Bufs { xa: xa.clone(), t: tt.clone(), hh: b.hh.clone() };
+            let bb = Bufs {
+                xa: xa.clone(),
+                t: tt.clone(),
+                hh: b.hh.clone(),
+            };
             resnet(&mut r, &bb, rs, hh * ww, (hh, ww));
             ch = rs.cout;
             r.cut();
@@ -649,7 +831,19 @@ pub(crate) fn decode(a: &VaeChainArgs, z: &[f32], h: usize, w: usize, out: &mut 
             r.cvt(&xa, &b.hh, hh * ww * ch);
             hh *= 2;
             ww *= 2;
-            r.conv(upc, (&b.hh, 0), (&tt, 0), None, hh * ww, (hh, ww), true, 0, upc.ocp, 0, 0);
+            r.conv(
+                upc,
+                (&b.hh, 0),
+                (&tt, 0),
+                None,
+                hh * ww,
+                (hh, ww),
+                true,
+                0,
+                upc.ocp,
+                0,
+                0,
+            );
             std::mem::swap(&mut xa, &mut tt);
             bufs_swapped = !bufs_swapped;
             r.cut();
@@ -657,7 +851,19 @@ pub(crate) fn decode(a: &VaeChainArgs, z: &[f32], h: usize, w: usize, out: &mut 
     }
     let n = hh * ww;
     r.gn(&d.norm_out, &xa, &b.hh, n, ch, true, true);
-    r.conv(&d.conv_out, (&b.hh, 0), (&tt, 0), None, n, (hh, ww), false, 0, 64, 0, 0);
+    r.conv(
+        &d.conv_out,
+        (&b.hh, 0),
+        (&tt, 0),
+        None,
+        n,
+        (hh, ww),
+        false,
+        0,
+        64,
+        0,
+        0,
+    );
     let rgb = buf_zeroed(c, 3 * n * 4);
     {
         let pp = r.p;
@@ -667,7 +873,10 @@ pub(crate) fn decode(a: &VaeChainArgs, z: &[f32], h: usize, w: usize, out: &mut 
         enc.set_buffer(0, Some(&tt), 0);
         enc.set_buffer(1, Some(&rgb), 0);
         set_p(enc, 2, &nu);
-        enc.dispatch_thread_groups(MTLSize::new((n as u64).div_ceil(256), 1, 1), MTLSize::new(256, 1, 1));
+        enc.dispatch_thread_groups(
+            MTLSize::new((n as u64).div_ceil(256), 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
     }
     let _ = bufs_swapped;
     if !r.finish() {
@@ -692,14 +901,27 @@ pub(crate) fn decode(a: &VaeChainArgs, z: &[f32], h: usize, w: usize, out: &mut 
 }
 
 fn env_chunk() -> usize {
-    std::env::var("CMF_ZI_VAE_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(4096).max(64) / 64 * 64
+    std::env::var("CMF_ZI_VAE_CHUNK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4096)
+        .max(64)
+        / 64
+        * 64
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn cpu_group_norm(x: &[f32], w: &[f32], b: &[f32], n: usize, ch: usize, groups: usize) -> Vec<f32> {
+    fn cpu_group_norm(
+        x: &[f32],
+        w: &[f32],
+        b: &[f32],
+        n: usize,
+        ch: usize,
+        groups: usize,
+    ) -> Vec<f32> {
         let cg = ch / groups;
         let mut out = vec![0.0; x.len()];
         for g in 0..groups {
@@ -750,7 +972,11 @@ mod tests {
             let b: Vec<f32> = (0..ch).map(|i| ((i % 11) as f32 - 5.0) * 0.02).collect();
             let xb = buf_from(c, &x);
             let yb = buf_zeroed(c, n * ch * 4);
-            let norm = VNorm { w: buf_from(c, &w), b: buf_from(c, &b), groups: 32 };
+            let norm = VNorm {
+                w: buf_from(c, &w),
+                b: buf_from(c, &b),
+                groups: 32,
+            };
             let mut rec = VRec {
                 c,
                 p,
@@ -760,7 +986,10 @@ mod tests {
                 stat: buf_zeroed(c, 64 * 2 * 4),
             };
             rec.gn(&norm, &xb, &yb, n, ch, false, false);
-            assert!(rec.finish(), "Metal GroupNorm command failed for {ch} channels");
+            assert!(
+                rec.finish(),
+                "Metal GroupNorm command failed for {ch} channels"
+            );
             let got = unsafe { std::slice::from_raw_parts(yb.contents() as *const f32, n * ch) };
             let want = cpu_group_norm(&x, &w, &b, n, ch, 32);
             let max_abs = got
@@ -768,7 +997,10 @@ mod tests {
                 .zip(&want)
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
-            assert!(max_abs < 3e-4, "{ch}-channel GroupNorm max abs error {max_abs}");
+            assert!(
+                max_abs < 3e-4,
+                "{ch}-channel GroupNorm max abs error {max_abs}"
+            );
         }
     }
 
@@ -787,10 +1019,25 @@ mod tests {
             return;
         };
         let (n, ic, oc) = (5usize, 32usize, 96usize);
-        let x: Vec<f32> = (0..n * ic).map(|i| ((i * 11 % 31) as f32 - 15.0) * 0.02).collect();
-        let w: Vec<f32> = (0..oc * ic).map(|i| ((i * 7 % 29) as f32 - 14.0) * 0.01).collect();
+        let x: Vec<f32> = (0..n * ic)
+            .map(|i| ((i * 11 % 31) as f32 - 15.0) * 0.02)
+            .collect();
+        let w: Vec<f32> = (0..oc * ic)
+            .map(|i| ((i * 7 % 29) as f32 - 14.0) * 0.01)
+            .collect();
         let b: Vec<f32> = (0..oc).map(|i| ((i % 9) as f32 - 4.0) * 0.015).collect();
-        let cv = conv_of(c, &VaeConvRef { w: &w, b: &b, oc, ic, k: 1 }, 1.0).unwrap();
+        let cv = conv_of(
+            c,
+            &VaeConvRef {
+                w: &w,
+                b: &b,
+                oc,
+                ic,
+                k: 1,
+            },
+            1.0,
+        )
+        .unwrap();
         let xb = half_buf(c, &x);
         let yb = buf_zeroed(c, n * oc * 4);
         let mut rec = VRec {

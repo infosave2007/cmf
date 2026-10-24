@@ -491,10 +491,12 @@ enum Commands {
         /// skeleton policy), norms and sinks f32.
         #[arg(long, conflicts_with = "mimo_towers")]
         mtp_sidecar: bool,
-        /// MiniCPM-V-4.7-35B-A3B only: convert the official Qwen3 DFlash/
-        /// DSpark checkpoint into the separate `<stem>.dspark.cmf` draft
-        /// sidecar beside an existing base --output CMF.  This is deliberately
-        /// not an MTP sidecar and does not enable a draft runtime by itself.
+        /// Convert an official DSpark draft checkpoint into the separate
+        /// `<stem>.dspark.cmf` draft sidecar beside an existing base --output
+        /// CMF: MiniCPM-V-4.7's Qwen3 DFlash draft or MiniMax-M3.1's
+        /// `DSparkMiniMaxDraftModel` — the base CMF's architecture selects
+        /// the contract.  This is deliberately not an MTP sidecar and does
+        /// not enable a draft runtime by itself.
         #[arg(long, conflicts_with = "mtp_sidecar")]
         dspark_sidecar: bool,
         /// MiMo-V2 towers: `text` (default) drops them; `mm-only` writes the
@@ -3460,7 +3462,7 @@ async fn main() -> anyhow::Result<()> {
                     Some(q) if q.eq_ignore_ascii_case(convert::AUTO_QUANT) => "q8_2f",
                     Some(q) => q,
                 };
-                let path = convert::write_minicpm_dspark_sidecar(
+                let path = convert::write_dspark_sidecar(
                     std::path::Path::new(&model),
                     std::path::Path::new(&output),
                     q,
@@ -10050,6 +10052,46 @@ async fn cmd_bench(
         // Positions the bounded reuse record holds (the host cache's
         // seq_len stays 0 when the resident graph owns the sequence).
         obj["consumed_prefix_len"] = serde_json::json!(pipeline.kv_prefix.len());
+        // Dynamic-tail prepared frame + global pool: what the MoE frame
+        // spends per token (host encode vs GPU wait vs uploads) and how
+        // often the pool admits a new expert. Without these, a frame that
+        // trades CPU MoE for per-layer syncs is invisible in the report.
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let steps = (n_st.saturating_sub(1)).max(1) as f64;
+            let enc = cortiq_engine::gpu_wgpu::MOE_ENC_NS.load(Relaxed) as f64 / 1e6;
+            let wait = cortiq_engine::gpu_wgpu::MOE_WAIT_NS.load(Relaxed) as f64 / 1e6;
+            let up = cortiq_engine::gpu_wgpu::MOE_UP_NS.load(Relaxed) as f64 / 1e6;
+            let fills = cortiq_engine::gpu_wgpu::DSV4_FILLS.load(Relaxed);
+            let fill_mb = cortiq_engine::gpu_wgpu::DSV4_FILL_BYTES.load(Relaxed) as f64 / 1e6;
+            obj["moe_frame_enc_ms_per_tok"] = serde_json::json!(enc / steps);
+            obj["moe_frame_wait_ms_per_tok"] = serde_json::json!(wait / steps);
+            obj["moe_frame_up_ms_per_tok"] = serde_json::json!(up / steps);
+            obj["moe_pool_fills"] = serde_json::json!(fills);
+            obj["moe_pool_fill_mb"] = serde_json::json!(fill_mb);
+            obj["moe_pool_fills_per_tok"] = serde_json::json!(fills as f64 / steps);
+            obj["moe_pooled_calls_per_tok"] = serde_json::json!(
+                cortiq_engine::gpu_wgpu::POOLED_CALLS.load(Relaxed) as f64 / steps
+            );
+            obj["moe_pooled_cold_per_tok"] = serde_json::json!(
+                cortiq_engine::gpu_wgpu::POOLED_COLD_N.load(Relaxed) as f64 / steps
+            );
+            obj["m3_span_ms_per_tok"] = serde_json::json!(
+                cortiq_engine::pipeline::M3_SPAN_NS.load(Relaxed) as f64 / 1e6 / steps
+            );
+            obj["m3_cold_ms_per_tok"] = serde_json::json!(
+                cortiq_engine::pipeline::M3_COLD_NS.load(Relaxed) as f64 / 1e6 / steps
+            );
+            obj["m3_arm_ms_per_tok"] = serde_json::json!(
+                cortiq_engine::pipeline::M3_ARM_NS.load(Relaxed) as f64 / 1e6 / steps
+            );
+            obj["m3_cold_dev_per_tok"] = serde_json::json!(
+                cortiq_engine::pipeline::M3_COLD_DEV_N.load(Relaxed) as f64 / steps
+            );
+            obj["m3_cold_n_per_tok"] = serde_json::json!(
+                cortiq_engine::pipeline::M3_COLD_N.load(Relaxed) as f64 / steps
+            );
+        }
         println!("{}", serde_json::to_string_pretty(&obj)?);
         cortiq_engine::prism::perf_report();
         cortiq_engine::linear_core::perf_report();

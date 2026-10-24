@@ -206,6 +206,13 @@ pub struct Pipeline {
     /// from trunk decode so block batching can be judged without conflating
     /// it with GPU chain variance.
     pub dspark_draft_ns: u128,
+    /// Per-layer winners of the last pooled route — the admission predictor.
+    m3_winners: Vec<Vec<u32>>,
+    /// Route frequency per (layer, expert) — the bank's prewarm profile.
+    m3_counts: Vec<u32>,
+    m3_n_exp: usize,
+    m3_tokens: u64,
+    m3_prewarmed: bool,
     /// LFM2 short-convolution geometry (present when the model has
     /// `ShortConv` mixer layers).
     pub short_conv_cfg: Option<ShortConvCfg>,
@@ -3586,6 +3593,11 @@ impl Pipeline {
             dspark_trunk_picks: Vec::new(),
             dspark_exp: Vec::new(),
             dspark_draft_ns: 0,
+            m3_winners: Vec::new(),
+            m3_counts: Vec::new(),
+            m3_n_exp: 0,
+            m3_tokens: 0,
+            m3_prewarmed: false,
             logit_multiplier: None,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             graph_failed: std::sync::atomic::AtomicBool::new(false),
@@ -5684,14 +5696,35 @@ impl Pipeline {
                 (None, Some(lg)) => lg,
                 (None, None) => {
                     let _prof = crate::cpuprof::time(crate::cpuprof::Slot::Head);
-                    inference::rms_norm_into(
-                        &hidden,
-                        &self.weights.final_norm,
-                        self.rms_eps,
-                        self.norm_style,
-                        &mut self.ws.n1,
-                    );
-                    self.lm_head_forward(&self.ws.n1)
+                    // Pooled-tail mode: the head as one layer-less device
+                    // pass (final-norm + matvec + readback). Any decline —
+                    // no pool, unresolvable weight, backend off — keeps the
+                    // host head exactly as before.
+                    #[cfg(feature = "gpu")]
+                    let logits_out = if let Some(lg) = self.m3_device_logits(&hidden) {
+                        lg
+                    } else {
+                        inference::rms_norm_into(
+                            &hidden,
+                            &self.weights.final_norm,
+                            self.rms_eps,
+                            self.norm_style,
+                            &mut self.ws.n1,
+                        );
+                        self.lm_head_forward(&self.ws.n1)
+                    };
+                    #[cfg(not(feature = "gpu"))]
+                    let logits_out = {
+                        inference::rms_norm_into(
+                            &hidden,
+                            &self.weights.final_norm,
+                            self.rms_eps,
+                            self.norm_style,
+                            &mut self.ws.n1,
+                        );
+                        self.lm_head_forward(&self.ws.n1)
+                    };
+                    logits_out
                 }
             };
             // CMF_LOGIT_DUMP=<path>: the first decode step's hidden + logits
@@ -12023,6 +12056,322 @@ impl Pipeline {
         )
     }
 
+    /// The pooled tail's device lm_head: final-norm + head as one
+    /// layer-less graph pass, so decode stops paying the double-digit
+    /// millisecond host matvec every token. `None` keeps the host head.
+    #[cfg(feature = "gpu")]
+    fn m3_device_logits(&self, hidden: &[f32]) -> Option<Vec<f32>> {
+        if !crate::minicpm_tail::minimax_pool_on()
+            || !crate::gpu::enabled_here()
+            || self.head_clusters.is_some()
+            || self.graph_failed.load(std::sync::atomic::Ordering::Relaxed)
+            || std::env::var("CMF_GPU_LMHEAD").map(|v| v != "0") == Ok(false)
+        {
+            return None;
+        }
+        let (model, i, kind, rs) = self
+            .weights
+            .lm_head
+            .graph_weight()
+            .or_else(|| self.weights.lm_head.graph_weight_descriptor())?;
+        let name = &model.tensors[i].name;
+        let prism = if crate::prism::is_inverse_embedding(&model, name) {
+            crate::gpu::GraphPrismOp::InverseEmbedding
+        } else if crate::prism::is_forward_weight(&model, name) {
+            crate::gpu::GraphPrismOp::Forward
+        } else {
+            crate::gpu::GraphPrismOp::None
+        };
+        let gw = crate::gpu::GraphW {
+            idx: i,
+            kind,
+            row_scale: rs,
+            data: &[],
+            prism,
+            affine: crate::prism::is_affine_target(&model, name),
+        };
+        let rows = self.weights.lm_head.rows();
+        let mut h = hidden.to_vec();
+        let mut lg = Vec::new();
+        let mut layers_run = 0usize;
+        let outcome = crate::gpu::forward_token_graph(
+            &model,
+            self.graph_kv_id,
+            &[],
+            &[],
+            self.o1_epoch,
+            &self.inv_freq,
+            &mut h,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.attn_scale,
+            self.head_dim,
+            self.hidden_size,
+            self.intermediate_size,
+            0,
+            self.kv_cache.max_seq_len,
+            self.norm_style == cortiq_core::NormStyle::Gemma,
+            self.rms_eps as f32,
+            Some((&gw, rows)),
+            &self.weights.final_norm,
+            &mut lg,
+            &[],
+            1,
+            None,
+            None,
+            Some(&mut layers_run),
+            0,
+            false,
+        );
+        if outcome != crate::gpu::TokenGraphOutcome::Completed || lg.is_empty() {
+            return None;
+        }
+        // The same post-steps the host head applies — keep sampling
+        // identical whichever arm produced the logits.
+        lg.resize(self.vocab_size, 0.0);
+        if let Some(m) = self.logit_multiplier {
+            for l in lg.iter_mut() {
+                *l *= m;
+            }
+        }
+        if let Some(c) = self.final_softcap {
+            softcap_in_place(&mut lg, c, self.pool.as_deref());
+        }
+        Some(lg)
+    }
+
+    /// Record one token-layer's winners into the route-frequency profile and
+    /// write it out every 16 tokens when `CMF_M3_PROFILE_SAVE=<path>` is set.
+    fn m3_note_route(&mut self, li: usize, winners: &[u32]) {
+        if winners.is_empty() {
+            return;
+        }
+        if self.m3_n_exp == 0 {
+            self.m3_n_exp = crate::minicpm_tail::minimax_n_experts(&self.weights.layers, self.phys_layer(0)).max(1);
+            self.m3_counts = vec![0; self.num_layers * self.m3_n_exp];
+        }
+        for &e in winners {
+            let e = e as usize;
+            if e < self.m3_n_exp && li < self.num_layers {
+                self.m3_counts[li * self.m3_n_exp + e] = self.m3_counts[li * self.m3_n_exp + e].saturating_add(1);
+            }
+        }
+        if li + 1 == self.num_layers {
+            self.m3_tokens += 1;
+            if self.m3_tokens % 16 == 0 {
+                if let Ok(path) = std::env::var("CMF_M3_PROFILE_SAVE") {
+                    let bytes: Vec<u8> = self.m3_counts.iter().flat_map(|c| c.to_le_bytes()).collect();
+                    let _ = std::fs::write(&path, bytes);
+                }
+            }
+        }
+    }
+
+    /// Admit the most frequent (layer, expert) pairs of a saved profile into
+    /// the bank before the first token: `CMF_M3_PROFILE=<path>` names the
+    /// file, `CMF_M3_PREWARM_N` (default 300) bounds how many experts go in.
+    /// The bank's own eviction stays in charge; prewarm only chooses order.
+    fn m3_prewarm(&mut self) {
+        let Ok(path) = std::env::var("CMF_M3_PROFILE") else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(&path) else {
+            tracing::warn!("m3 prewarm: cannot read profile {path}");
+            return;
+        };
+        let counts: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let n_exp = crate::minicpm_tail::minimax_n_experts(&self.weights.layers, self.phys_layer(0)).max(1);
+        if counts.len() != self.num_layers * n_exp {
+            tracing::warn!("m3 prewarm: profile size {} does not match {}x{}", counts.len(), self.num_layers, n_exp);
+            return;
+        }
+        let limit: usize = std::env::var("CMF_M3_PREWARM_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+        let mut ranked: Vec<(u32, usize, usize)> = counts
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c > 0)
+            .map(|(i, &c)| (c, i / n_exp, i % n_exp))
+            .collect();
+        ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        ranked.truncate(limit);
+        let mut per_layer: Vec<Vec<usize>> = vec![Vec::new(); self.num_layers];
+        for (_, li, e) in ranked {
+            per_layer[li].push(e);
+        }
+        let mut admitted = 0usize;
+        for (li, ids) in per_layer.iter().enumerate() {
+            if ids.is_empty() {
+                continue;
+            }
+            let lw = &self.weights.layers[self.phys_layer(li)];
+            let FfnKind::Moe(m) = &lw.ffn else {
+                continue;
+            };
+            // Arming installs the layer's layout; nothing predicted yet.
+            let _ = crate::minicpm_tail::minimax_pool_arm(m, li, self.num_layers, &[]);
+            if crate::minicpm_tail::minimax_pool_ensure(m, li, self.num_layers, ids) {
+                admitted += ids.len();
+            }
+        }
+        tracing::info!("m3 prewarm: admitted {admitted} experts from {path}");
+    }
+
+    /// One MiniMax tail layer through the pooled token-graph arm: attention,
+    /// the pre-FFN norm, device routing and the descriptor-indexed expert
+    /// bank in ONE submit (one sync instead of host attention + a MoE
+    /// frame), with cold experts finished on the host against the read-back
+    /// FFN input and admitted for the next token.
+    ///
+    /// `Ok(true)` — the layer is done (hidden replaced). `Ok(false)` —
+    /// decline before any device mutation; the ordinary host path owns this
+    /// position. `Err(())` — the device failed after admission; the caller
+    /// must stop the sequence exactly like a failed span run.
+    #[cfg(feature = "gpu")]
+    fn m3_pooled_layer(&mut self, li: usize, position: usize, h: &mut Vec<f32>) -> Result<bool, ()> {
+        if self.o1_active() || self.attn_softcap > 0.0 {
+            return Ok(false);
+        }
+        if !self.m3_prewarmed {
+            self.m3_prewarmed = true;
+            self.m3_prewarm();
+        }
+        let frame = {
+            let lw = &self.weights.layers[self.phys_layer(li)];
+            let FfnKind::Moe(m) = &lw.ffn else {
+                return Ok(false);
+            };
+            if !crate::minicpm_tail::MiniCpmTail::is_requested_target(m) {
+                return Ok(false);
+            }
+            let t_arm = std::time::Instant::now();
+            if self.m3_winners.len() != self.num_layers {
+                self.m3_winners = vec![Vec::new(); self.num_layers];
+            }
+            let pred = std::mem::take(&mut self.m3_winners[li]);
+            let armed = crate::minicpm_tail::minimax_pool_arm(m, li, self.num_layers, &pred);
+            if armed.is_none() {
+                self.m3_winners[li] = pred; // declined before anything ran
+            }
+            M3_ARM_NS.fetch_add(t_arm.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            match armed {
+                Some(frame) => frame,
+                // First-call refusal (geometry/bank): the host layer still
+                // runs; nothing was mutated.
+                None => return Ok(false),
+            }
+        };
+        crate::gpu_wgpu::pooled_frame_enter(frame);
+        // The pooled call must not fold lm_head: its cold experts have to
+        // land before any final norm. The decode loop re-arms this flag for
+        // the next position anyway.
+        let want_logits = self.graph_want_logits;
+        self.graph_want_logits = false;
+        let mut lg = Vec::new();
+        let mut gl = 0usize;
+        let t_span = std::time::Instant::now();
+        let span = crate::gpu::gpu_scope(|| {
+            self.try_token_graph_wgpu_span(h, position, &mut lg, li, li + 1, &mut gl)
+        });
+        self.graph_want_logits = want_logits;
+        M3_SPAN_NS.fetch_add(t_span.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        let hh = match span {
+            Some(Ok(hh)) => hh,
+            Some(Err(())) => return Err(()),
+            None => {
+                // Declined before submission (seed/resolve/refusal): the
+                // device mirror has not moved, so the host path is exact.
+                return Ok(false);
+            }
+        };
+        if gl != 1 {
+            // A single-layer run that reports no layer mutated nothing we
+            // may build on; anything else is a contract break.
+            return if gl == 0 { Ok(false) } else { Err(()) };
+        }
+        *h = hh;
+        let winners = crate::gpu_wgpu::pooled_frame_take_winners();
+        self.m3_note_route(li, &winners);
+        if self.m3_winners.len() != self.num_layers {
+            self.m3_winners = vec![Vec::new(); self.num_layers];
+        }
+        self.m3_winners[li] = winners;
+        let mut cold = crate::gpu_wgpu::pooled_frame_take_cold();
+        // A non-finite parsed weight would poison the residual for the rest
+        // of the sequence — drop such entries loudly instead.
+        cold.retain(|&(_, w)| {
+            if w.is_finite() {
+                true
+            } else {
+                tracing::error!("pooled tail: non-finite cold weight from expert route");
+                false
+            }
+        });
+        if cold.is_empty() {
+            return Ok(true);
+        }
+        let x = crate::gpu_wgpu::pooled_frame_take_input();
+        if x.len() != self.hidden_size {
+            return Err(());
+        }
+        // Cold experts: on the device first (admit, then one prepared frame
+        // over exactly those slots — one submit for the layer). The host
+        // computes them only when the device declines, and then they are
+        // admitted for the next token. `CMF_M3_COLD_CPU=1` forces the host
+        // arm for an A/B measurement.
+        let lw = &self.weights.layers[self.phys_layer(li)];
+        let FfnKind::Moe(m) = &lw.ffn else {
+            return Err(());
+        };
+        let t_cold = std::time::Instant::now();
+        let force_host = std::env::var("CMF_M3_COLD_CPU").as_deref() == Ok("1");
+        let mut out = crate::attention::take_buf(self.hidden_size);
+        let on_device = !force_host
+            && crate::minicpm_tail::minimax_cold_device(m, li, self.num_layers, &cold, &x, &mut out);
+        if !on_device {
+            crate::attention::recycle_buf(&mut out);
+            let jobs: Vec<(&crate::pipeline::DenseFfn, f32)> = cold
+                .iter()
+                .map(|&(e, w)| m.experts.get(e).map(|ex| (ex, w)).ok_or(()))
+                .collect::<Result<_, ()>>()?;
+            out = crate::gpu::cpu_scope(|| {
+                crate::pipeline::moe_cold_experts_cpu(&jobs, &x, self.pool.as_deref())
+            });
+            let ids: Vec<usize> = cold.iter().map(|&(e, _)| e).collect();
+            let _ = crate::minicpm_tail::minimax_pool_ensure(m, li, self.num_layers, &ids);
+        }
+        M3_COLD_NS.fetch_add(t_cold.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        M3_COLD_N.fetch_add(cold.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        if out.len() != h.len() {
+            crate::attention::recycle_buf(&mut out);
+            return Err(());
+        }
+        for (dst, src) in h.iter_mut().zip(out.iter()) {
+            *dst += src;
+        }
+        crate::attention::recycle_buf(&mut out);
+        if on_device {
+            M3_COLD_DEV_N.fetch_add(cold.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(true)
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    fn m3_pooled_layer(
+        &mut self,
+        _li: usize,
+        _position: usize,
+        _h: &mut Vec<f32>,
+    ) -> Result<bool, ()> {
+        Ok(false)
+    }
+
     /// Greedy burst: forward `t_next` and let the device pick + re-embed
     /// the next k−1 tokens — k frames, ONE submit, k ids back. The ZML
     /// trade, on wgpu. None ⇒ caller keeps the per-token path.
@@ -16297,6 +16646,30 @@ impl Pipeline {
                     continue; // dead layer: residual pass-through
                 }
             }
+            // MiniMax's dynamic tail: attention + pooled MoE of this layer as
+            // ONE device frame (single-layer graph call), cold experts on
+            // the host. Any decline falls through to the ordinary host
+            // layer; a post-admission device failure stops the sequence.
+            if host_tail && task_mask.is_none() {
+                match self.m3_pooled_layer(li, position, &mut h) {
+                    Ok(true) => {
+                        crate::gpu::set_layer(-1);
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(()) => {
+                        self.clear_sequence_state();
+                        self.graph_failed
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        self.cancel
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        tracing::error!(
+                            "pooled tail token graph failed after admission; sequence state cleared"
+                        );
+                        return vec![0.0; self.hidden_size];
+                    }
+                }
+            }
             // Whole-block q1 token graph: a run of consecutive q1
             // layers — GDN and full attention — executes with one sync
             // per CPU attend instead of per op (macOS/Metal).
@@ -20096,6 +20469,14 @@ fn moe_ffn_cpu_batched(
 /// Keeping this independent of `MoeFfn` makes the job `Sync`: its routing
 /// statistics live in a `RefCell`, while the immutable expert tensors can be
 /// evaluated safely in parallel with the GPU's resident subset.
+/// Pooled-tail stage timers, reported per token by the bench JSON
+/// (`m3_span_ms_per_tok`, `m3_cold_ms_per_tok`, `m3_arm_ms_per_tok`).
+pub static M3_SPAN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static M3_COLD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static M3_ARM_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static M3_COLD_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static M3_COLD_DEV_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) fn moe_cold_experts_cpu(
     experts: &[(&DenseFfn, f32)],
     x: &[f32],
@@ -20113,7 +20494,18 @@ pub(crate) fn moe_cold_experts_cpu(
     let weights: Vec<_> = experts.iter().map(|(_, w)| *w).collect();
     let inter = experts[0].0.gate_proj.rows();
     let mut activations: Vec<Vec<f32>> = (0..experts.len()).map(|_| vec![0.0; inter]).collect();
-    if QTensor::moe_gate_up_many(&pairs, x, &mut activations, pool)
+    // The batched gate/up kernels implement PLAIN SiLU only (their legacy
+    // helper passes limit 0 and no activation code). MiniMax's SwiGLU-OAI
+    // (alpha 1.702, shifted up) must take the per-expert path that reads
+    // each tensor's own activation — otherwise every cold expert computes
+    // silu and the residual walks away from the reference (measured: the
+    // pooled tail shipped cos 0.047 hidden while the resident path was
+    // bit-close).
+    let silu_only = experts
+        .iter()
+        .all(|(e, _)| matches!(e.act, crate::pipeline::Act::Silu));
+    if silu_only
+        && QTensor::moe_gate_up_many(&pairs, x, &mut activations, pool)
         && QTensor::moe_down_many(&downs, &activations, &weights, &mut out, pool)
     {
         return out;
@@ -22592,6 +22984,220 @@ mod tests {
         assert_eq!(idx, vec![0]);
         assert!(p.iter().all(|&v| v == 0.25));
         assert!(wsum.is_finite() && wsum > 0.0);
+    }
+
+    /// MiniMax-M3.1's DEVICE route (the pooled token-graph arm's exact
+    /// flags: sigmoid scoring via n's high bit, +1e-20 floor,
+    /// routed_scaling 2.0, selection bias on the CHOICE only) must match
+    /// the host reference in experts, ORDER and weights — the check that
+    /// caught the flags/slot collision.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn minimax_device_route_matches_host_sigmoid_contract() {
+        match crate::gpu_wgpu::selected_and_up() {
+            None => {
+                crate::gpu_wgpu::skip_or_fail(module_path!());
+                return;
+            }
+            Some(false) => panic!("wgpu requested but the context did not come up"),
+            Some(true) => {}
+        }
+        let n = 128usize;
+        let top_k = 4usize;
+        let logits: Vec<f32> = (0..n)
+            .map(|i| ((i as f32 * 0.61).sin() * 3.4) + ((i % 23) as f32 * 0.13))
+            .collect();
+        let bias: Vec<f32> = (0..n).map(|i| ((i as f32 * 2.3).cos()) * 0.5).collect();
+        let m = MoeFfn {
+            router: QTensor::from_f32(vec![0.0; 4], 2, 2),
+            experts: Vec::new(),
+            top_k,
+            norm_topk_prob: true,
+            router_sigmoid: true,
+            sigmoid_denom_eps: 1e-20,
+            expert_bias: Some(bias.clone()),
+            routed_scaling: 2.0,
+            route_tau: None,
+            shared: None,
+            stats: std::cell::RefCell::new(Vec::new()),
+            act_sq: std::cell::RefCell::new(Vec::new()),
+            act_rows: std::cell::RefCell::new(Vec::new()),
+            mask: None,
+            per_expert_scale: None,
+            router_input_norm: false,
+            resonance: None,
+            grown: Vec::new(),
+        };
+        let (ci, p, wsum) = moe_route_with_eps(&logits, &m, None, 1e-20);
+        let cw: Vec<f32> = ci.iter().map(|&e| p[e] / wsum).collect();
+
+        for shared in [Some(n as u32), None] {
+            let mut gi = Vec::new();
+            let mut gw = Vec::new();
+            assert!(
+                crate::gpu_wgpu::minimax_moe_route_for_test(
+                    &logits,
+                    Some(&bias),
+                    top_k,
+                    2.0,
+                    shared,
+                    &mut gi,
+                    &mut gw,
+                ),
+                "устройство не поднялось — тест не проверил ничего"
+            );
+            let routed = if shared.is_some() { top_k } else { gi.len() };
+            assert_eq!(
+                &gi[..routed],
+                &ci[..],
+                "разные эксперты или порядок (shared={shared:?})"
+            );
+            let d = cw
+                .iter()
+                .zip(&gw[..routed])
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            println!("minimax route shared={shared:?}: {ci:?} max|Δw|={d:.3e}");
+            assert!(d < 1e-6, "веса разошлись на {d:.3e}");
+            if let Some(s) = shared {
+                assert_eq!(gi[top_k], s as usize, "shared pin slot");
+                assert_eq!(gw[top_k], 1.0, "shared weight");
+            }
+        }
+    }
+
+    /// The pooled arm's COLD hand-back: `(expert, weight)` pairs for the
+    /// picks the bank could not serve must carry the host's EXACT final
+    /// weights — the device ships its resident sum, the host adds this on
+    /// top of the same residual, so a weight drift compounds per layer.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn minimax_device_cold_weights_match_host_contract() {
+        match crate::gpu_wgpu::selected_and_up() {
+            None => {
+                crate::gpu_wgpu::skip_or_fail(module_path!());
+                return;
+            }
+            Some(false) => panic!("wgpu requested but the context did not come up"),
+            Some(true) => {}
+        }
+        let n = 128usize;
+        let top_k = 4usize;
+        let logits: Vec<f32> = (0..n)
+            .map(|i| ((i as f32 * 0.61).sin() * 3.4) + ((i % 23) as f32 * 0.13))
+            .collect();
+        let bias: Vec<f32> = (0..n).map(|i| ((i as f32 * 2.3).cos()) * 0.5).collect();
+        let m = MoeFfn {
+            router: QTensor::from_f32(vec![0.0; 4], 2, 2),
+            experts: Vec::new(),
+            top_k,
+            norm_topk_prob: true,
+            router_sigmoid: true,
+            sigmoid_denom_eps: 1e-20,
+            expert_bias: Some(bias.clone()),
+            routed_scaling: 2.0,
+            route_tau: None,
+            shared: None,
+            stats: std::cell::RefCell::new(Vec::new()),
+            act_sq: std::cell::RefCell::new(Vec::new()),
+            act_rows: std::cell::RefCell::new(Vec::new()),
+            mask: None,
+            per_expert_scale: None,
+            router_input_norm: false,
+            resonance: None,
+            grown: Vec::new(),
+        };
+        let (ci, p, wsum) = moe_route_with_eps(&logits, &m, None, 1e-20);
+        assert_eq!(ci.len(), top_k);
+
+        // Every pick resident → no cold pairs at all.
+        let resident: Vec<u32> = (0..n).map(|e| e as u32).collect();
+        let mut cold = Vec::new();
+        let mut idx = Vec::new();
+        let mut dw = Vec::new();
+        assert!(crate::gpu_wgpu::minimax_moe_route_cold_for_test(
+            &logits,
+            Some(&bias),
+            top_k,
+            2.0,
+            &resident,
+            n as u32,
+            &mut cold,
+            &mut idx,
+            &mut dw,
+        ));
+        assert!(cold.is_empty(), "полностью резидентный банк: {cold:?}");
+        // With subset+pin together: routed slots carry the FLAT remap value
+        // (here identity = the expert id), weights the host contract, and
+        // the pinned shared keeps weight 1 — this exact combination is what
+        // the pooled arm runs with.
+        for (r, &e) in ci.iter().enumerate() {
+            assert_eq!(idx[r] as usize, e, "resident slot mapping r={r}");
+            let host = p[e] / wsum;
+            let d = (dw[r] - host).abs();
+            assert!(
+                d <= 1e-6 * host.abs().max(1.0),
+                "resident weight r={r} expert {e}: device={:.9e} host={host:.9e}",
+                dw[r]
+            );
+        }
+        assert_eq!(idx[top_k] as usize, n, "shared pin slot");
+        assert_eq!(dw[top_k], 1.0, "shared weight");
+
+        // Make exactly two of the CHOSEN picks cold.
+        let mut remap = resident.clone();
+        remap[ci[0]] = u32::MAX;
+        remap[ci[2]] = u32::MAX;
+        let mut cold = Vec::new();
+        let mut idx2 = Vec::new();
+        let mut dw2 = Vec::new();
+        assert!(crate::gpu_wgpu::minimax_moe_route_cold_for_test(
+            &logits,
+            Some(&bias),
+            top_k,
+            2.0,
+            &remap,
+            n as u32,
+            &mut cold,
+            &mut idx2,
+            &mut dw2,
+        ));
+        // The resident picks of the partial bank still carry exact weights.
+        // A COLD rank is a placeholder the device writes as slot 0 / weight
+        // 0.0 — its real (id, weight) pair rides in `cold` — so weight zero
+        // is what marks it, not the slot value: reading the placeholder as
+        // a resident expert compared 0.0 against p[0]/wsum and failed with
+        // Δ=2.552e-1. The test logits keep every sigmoid score strictly
+        // positive, so a resident pick can never weigh exactly zero.
+        let mut resident_weight_checked = 0usize;
+        for (r, &slot) in idx2.iter().enumerate().take(top_k) {
+            if dw2[r] == 0.0 {
+                continue; // cold rank: placeholder, not an expert id
+            }
+            let e = slot as usize;
+            assert!(e < n && remap[e] != u32::MAX, "resident slot {e} escaped the remap");
+            let host = p[e] / wsum;
+            let d = (dw2[r] - host).abs();
+            assert!(
+                d <= 1e-6 * host.abs().max(1.0),
+                "partial-bank resident weight expert {e}: Δ={d:.3e}"
+            );
+            resident_weight_checked += 1;
+        }
+        assert_eq!(resident_weight_checked, 2, "ровно два резидентных пика из четырёх");
+        println!("partial bank: checked {resident_weight_checked} resident weights");
+        assert_eq!(dw2.get(top_k).copied(), Some(1.0), "shared weight under subset");
+        let mut ids: Vec<usize> = cold.iter().map(|&(e, _)| e).collect();
+        ids.sort_unstable();
+        let mut want = vec![ci[0], ci[2]];
+        want.sort_unstable();
+        assert_eq!(ids, want, "холодные эксперты разошлись: {cold:?} против {want:?}");
+        for &(e, w) in &cold {
+            let host = p[e] / wsum;
+            let d = (w - host).abs();
+            println!("cold expert {e}: device={w:.9e} host={host:.9e} Δ={d:.3e}");
+            assert!(d <= 1e-6 * host.abs().max(1.0), "cold вес эксперта {e}: Δ={d:.3e}");
+        }
     }
 
     /// The resonance router (top-1) selects by the raw score as the
