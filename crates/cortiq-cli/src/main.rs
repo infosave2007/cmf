@@ -44,6 +44,7 @@ mod utility;
 mod videopack;
 mod zimagepack;
 mod qi21pack;
+mod sam3pack;
 
 use clap::{Parser, Subcommand};
 use cortiq_core::CmfModel;
@@ -2258,6 +2259,22 @@ enum Commands {
         #[arg(long)]
         out: Option<String>,
     },
+    /// Pack Meta SAM 3 (facebook/sam3) exports into ONE CMF: vision trunk +
+    /// SAM2-style FPN + CLIP text tower + DETR detector (concept/point/box
+    /// prompts, mask head) + the video tracker, with the vendor configs and
+    /// tokenizer embedded.
+    Sam3Pack {
+        /// Export directory: detector.safetensors (+ tracker.safetensors),
+        /// config.json, detector_config.json, processor_config.json,
+        /// tokenizer.json
+        src: String,
+        /// Projection codec for 2-D weights: q8_2f (default) or q4tp
+        #[arg(long, default_value = "q8_2f")]
+        quant: String,
+        /// Output .cmf path
+        #[arg(long)]
+        out: String,
+    },
     /// Pack a Diffusers source into CMF. A Qwen-Image-2.1 directory
     /// (QwenImage21Pipeline) or a Z-Image / Z-Image-Turbo pipeline
     /// directory (model_index.json = ZImagePipeline) becomes ONE ready-to-run
@@ -4445,6 +4462,7 @@ async fn main() -> anyhow::Result<()> {
                 )
             }
         }
+        Commands::Sam3Pack { src, quant, out } => sam3pack::pack(&src, &quant, &out),
         Commands::ImaginePack {
             root,
             quant,
