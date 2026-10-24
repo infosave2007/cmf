@@ -9220,7 +9220,7 @@ impl Pipeline {
                     .ln()
                     + max as f64;
                 let tok_nll = lse - logits[target] as f64;
-                if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 48 {
+                if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 10_000 {
                     let top = logits
                         .iter()
                         .enumerate()
@@ -9264,7 +9264,7 @@ impl Pipeline {
             .ln()
             + max as f64;
         let tok_nll = lse - logits[target] as f64;
-        if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 48 {
+        if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 10_000 {
             let top = logits
                 .iter()
                 .enumerate()
@@ -9655,7 +9655,7 @@ impl Pipeline {
                     .ln()
                     + max as f64;
                 let tok_nll = lse - logits[target] as f64;
-                if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 48 {
+                if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 10_000 {
                     let top = logits
                         .iter()
                         .enumerate()
