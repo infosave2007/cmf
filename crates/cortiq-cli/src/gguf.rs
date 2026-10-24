@@ -1150,9 +1150,16 @@ fn arch_from_md(
             .bytes
             .get(start..end)
             .ok_or_else(|| anyhow::anyhow!("{arch}: rope_freqs.weight data out of range"))?;
+        // Active slots are the finite, non-zero, non-suppressed entries:
+        // llama.cpp's converter writes 1.0 for a rotating frequency and
+        // 1e30 for a frozen one (and other encodings use 0.0) — counting
+        // raw non-zeros would read E4B's 64-of-256 mask as a full 1.0.
         let nz = raw
             .chunks_exact(4)
-            .filter(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) != 0.0)
+            .filter(|c| {
+                let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                v != 0.0 && v.abs() < 1e30
+            })
             .count();
         if ghd == 0 || nz == 0 || nz * 2 > ghd {
             anyhow::bail!("{arch}: implausible rope_freqs mask ({nz} rotating of {ghd} dims)");
