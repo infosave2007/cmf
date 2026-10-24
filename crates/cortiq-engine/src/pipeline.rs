@@ -145,6 +145,9 @@ pub struct Pipeline {
     /// Gemma-3n stack (AltUp/LAuReL/PLE/KV-sharing): its own forward —
     /// weights.layers stays empty, the KV caches are the shared ones.
     pub g3n: Option<Box<(crate::g3n::G3nGlobals, Vec<crate::g3n::G3nLayer>)>>,
+    /// Gemma-4 E-series stack (dual-geometry gemma4 + PLE + shared KV):
+    /// its own per-token forward, same contract as `g3n`.
+    pub g4e: Option<Box<(crate::g4e::G4eGlobals, Vec<crate::g4e::G4eLayer>)>>,
     /// DeepSeek-V4 runs its own stack too: its hidden state is `hc_mult`
     /// copies of a vector, so no loop written for a single residual
     /// stream can carry it.
@@ -1419,9 +1422,16 @@ impl Pipeline {
         )
     }
 
+    /// Architectures that run a dedicated per-token stack (gemma-3n's
+    /// AltUp flow, the gemma-4 E-series PLE/shared-KV body): batched
+    /// prefill and the graphs stay off for them.
+    fn per_token_stack(&self) -> bool {
+        self.g3n.is_some() || self.g4e.is_some()
+    }
+
     fn chunk_stack_facts(&self) -> ChunkStackFacts {
         let plain_dense = !self.weights.layers.is_empty()
-            && self.g3n.is_none()
+            && !self.per_token_stack()
             && self.dsv4.is_none()
             && self.dsv41.is_none()
             && self.qwen4_exp.is_none()
@@ -2037,7 +2047,12 @@ impl Pipeline {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            (self.global_attn.is_some() || self.attn_v_norm)
+            // An EMPTY layer stack (`all()` is vacuously true) plus a
+            // gemma4 geometry flag is exactly the gemma-4 E-series
+            // per-token stack — it has no batch graph rows to ingest.
+            !self.weights.layers.is_empty()
+                && !self.per_token_stack()
+                && (self.global_attn.is_some() || self.attn_v_norm)
                 && crate::gpu::g4_batch_on()
                 && crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Prefill)
                 && crate::gpu::enabled_here()
@@ -3580,6 +3595,7 @@ impl Pipeline {
             gdn_cfg: None,
             kda_cfg: None,
             g3n: None,
+            g4e: None,
             dsv4: None,
             dsv41: None,
             dsv41_vision: None,
@@ -5047,7 +5063,7 @@ impl Pipeline {
             && (crate::gpu::q1_force() || crate::gpu::q2tp_gpu_opt_in())
             && crate::gpu::enabled_here()
             && self.gdn_cfg.is_some()
-            && self.g3n.is_none()
+            && !self.per_token_stack()
             && input_ids.len() > 8
             && std::env::var("CMF_MTP_CHAIN_PROBE").is_err()
             && std::env::var("CMF_METAL_PREFILL").as_deref() != Ok("0")
@@ -5216,7 +5232,7 @@ impl Pipeline {
             && !dyn_prefill
             && !graph_prefill
             && self.can_prefill_batched()
-            && self.g3n.is_none()
+            && !self.per_token_stack()
             && o1_prefill.is_none()
             && input_ids.len() > 2
         {
@@ -8327,7 +8343,7 @@ impl Pipeline {
         // feature-by-feature test says "supported" for a model that has no
         // layers here at all.
         !self.weights.layers.is_empty()
-            && self.g3n.is_none()
+            && !self.per_token_stack()
             && !self
                 .weights
                 .layers
@@ -9344,7 +9360,7 @@ impl Pipeline {
                     .ln()
                     + max as f64;
                 let tok_nll = lse - logits[target] as f64;
-                if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 48 {
+                if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 10_000 {
                     let top = logits
                         .iter()
                         .enumerate()
@@ -9388,7 +9404,7 @@ impl Pipeline {
             .ln()
             + max as f64;
         let tok_nll = lse - logits[target] as f64;
-        if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 48 {
+        if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 10_000 {
             let top = logits
                 .iter()
                 .enumerate()
@@ -9779,7 +9795,7 @@ impl Pipeline {
                     .ln()
                     + max as f64;
                 let tok_nll = lse - logits[target] as f64;
-                if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 48 {
+                if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 10_000 {
                     let top = logits
                         .iter()
                         .enumerate()
@@ -10628,6 +10644,10 @@ impl Pipeline {
         }
         // Gemma-3n: the per-layer-embedding half needs the token ID, so
         // it rides appended to the embedding; the g3n forward splits it.
+        // Gemma-4 E-series PLE: same contract, its own table.
+        if let Some(b) = &self.g4e {
+            return b.0.extend_embedding(id, &out, self.pool.as_deref());
+        }
         if let Some(b) = &self.g3n {
             return b.0.extend_embedding(id, &out, self.pool.as_deref());
         }
@@ -11838,9 +11858,9 @@ impl Pipeline {
                 "network split: Qwen3.8-Flash-Next hyper/QSA stack is not splittable yet".into(),
             );
         }
-        if self.g3n.is_some() {
+        if self.per_token_stack() {
             return Err(
-                "network split: Gemma-3n runs its own AltUp stack (not splittable yet)".into(),
+                "network split: the per-token stack (gemma-3n AltUp / gemma-4 E-series) is not splittable yet".into(),
             );
         }
         Ok(())
@@ -14276,7 +14296,7 @@ impl Pipeline {
             || self.dsv4.is_some()
             || self.dsv41.is_some()
             || self.qwen4_exp.is_some()
-            || self.g3n.is_some()
+            || self.per_token_stack()
         {
             return Err(false);
         }
@@ -15524,7 +15544,7 @@ impl Pipeline {
             || self.logit_multiplier.is_some()
             || self.attn_softcap != 0.0
             || self.mtp.is_some()
-            || self.g3n.is_some()
+            || self.per_token_stack()
             || self.dsv4.is_some()
             || self.dsv41.is_some()
             || self.qwen4_exp.is_some()
@@ -16250,7 +16270,7 @@ impl Pipeline {
                 || (self.dsv4.is_none()
                     && self.dsv41.is_none()
                     && self.qwen4_exp.is_none()
-                    && self.g3n.is_none())
+                    && !self.per_token_stack())
         );
         // Every plain forward — the whole-token Metal graph (`q1_graph_gpu`
         // wraps the GDN owners zero-copy and reallocates them on a size
@@ -16328,6 +16348,22 @@ impl Pipeline {
         }
         // Gemma-3n runs its own stack (4 AltUp replicas don't fit this
         // loop); `hidden` is the extended embedding from embed_single.
+        // Gemma-4 E-series: same hand-off — its dual-geometry attention
+        // with shared-KV tail layers and the PLE injection live in
+        // `g4e_forward`.
+        if let Some(b) = &self.g4e {
+            let _ = (task_mask, upto);
+            return crate::g4e::g4e_forward(
+                &b.0,
+                &b.1,
+                hidden,
+                position,
+                &mut self.kv_cache.layers,
+                self.num_heads,
+                self.num_kv_heads,
+                self.pool.as_deref(),
+            );
+        }
         if let Some(b) = &self.g3n {
             let _ = (task_mask, upto);
             return crate::g3n::g3n_forward(

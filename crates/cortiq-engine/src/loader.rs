@@ -2227,7 +2227,114 @@ impl Pipeline {
             let (globals, layers, cfg, state) = crate::qwen4_exp::load(model, &arch)?;
             pipeline.qwen4_exp = Some(Box::new((globals, layers, cfg, state)));
         }
-        if let Some(gc) = arch.g3n.as_ref() {
+        // Gemma-4 E-series (E4B): the E block rides in `g3n` — altup/
+        // laurel are zeroed for gemma4 — but the layer body is the
+        // gemma4 stack (dual geometry, proportional RoPE, PLE, shared
+        // KV), so it loads into its own runtime stack instead.
+        if arch.g3n.is_some() && arch.arch_name.starts_with("gemma4") {
+            use crate::g4e::{G4eGlobals, G4eLayer};
+            let gc = arch.g3n.as_ref().expect("checked above");
+            let t = |name: &str| load_matrix(model, name, force_f32, ov);
+            let f = |name: &str| load_f32(model, name, ov).map_err(err);
+            let first_shared = arch.num_layers.saturating_sub(gc.num_kv_shared_layers);
+            let sliding_of = |li: usize| {
+                matches!(
+                    arch.layer_types.get(li),
+                    Some(cortiq_core::LayerType::SlidingAttention)
+                )
+            };
+            let hd_g = arch.global_head_dim.unwrap_or(arch.head_dim);
+            let mut g4e_layers = Vec::with_capacity(arch.num_layers);
+            for li in 0..arch.num_layers {
+                let pfx = format!("model.layers.{li}.");
+                let shared = li >= first_shared && first_shared > 0;
+                // Same sharing rule as transformers/llama.cpp/gemma-3n:
+                // a tail layer reuses the KV of the LAST non-shared
+                // layer of its own attention type.
+                let share_src = if shared {
+                    let want = sliding_of(li);
+                    (0..first_shared).rev().find(|&j| sliding_of(j) == want)
+                } else {
+                    None
+                };
+                let sliding = sliding_of(li);
+                let scalar_name = format!("{pfx}layer_scalar");
+                g4e_layers.push(G4eLayer {
+                    input_norm: f(&format!("{pfx}input_layernorm.weight"))?,
+                    attn_out_norm: f(&format!("{pfx}post_attention_layernorm.weight"))?,
+                    pre_ffn_norm: f(&format!("{pfx}pre_feedforward_layernorm.weight"))?,
+                    post_ffw_norm: f(&format!("{pfx}post_feedforward_layernorm.weight"))?,
+                    wq: t(&format!("{pfx}self_attn.q_proj.weight"))?,
+                    wk: if shared {
+                        None
+                    } else {
+                        Some(t(&format!("{pfx}self_attn.k_proj.weight"))?)
+                    },
+                    wv: if shared {
+                        None
+                    } else {
+                        Some(t(&format!("{pfx}self_attn.v_proj.weight"))?)
+                    },
+                    wo: t(&format!("{pfx}self_attn.o_proj.weight"))?,
+                    q_norm: f(&format!("{pfx}self_attn.q_norm.weight"))?,
+                    k_norm: if shared {
+                        None
+                    } else {
+                        Some(f(&format!("{pfx}self_attn.k_norm.weight"))?)
+                    },
+                    kv_share_src: share_src,
+                    sliding,
+                    hd: if sliding { arch.head_dim } else { hd_g },
+                    gate: t(&format!("{pfx}mlp.gate_proj.weight"))?,
+                    up: t(&format!("{pfx}mlp.up_proj.weight"))?,
+                    down: t(&format!("{pfx}mlp.down_proj.weight"))?,
+                    ple_gate: t(&format!("{pfx}per_layer_input_gate.weight"))?,
+                    ple_proj: t(&format!("{pfx}per_layer_projection.weight"))?,
+                    post_ple_norm: f(&format!("{pfx}post_per_layer_input_norm.weight"))?,
+                    layer_scalar: if model.tensor(&scalar_name).is_some() {
+                        f(&scalar_name)?.first().copied()
+                    } else {
+                        None
+                    },
+                });
+            }
+            // Proportional RoPE for the full layers — the same
+            // construction the generic loader installs for dense
+            // gemma4: the first prf·ghd dims rotate (exponent over
+            // ghd), the zero tail is identity under rope_rotate_scaled.
+            let ghd = hd_g;
+            let prf = arch.global_partial_rotary_factor.unwrap_or(1.0);
+            let half = ghd / 2;
+            let ra = (((prf * ghd as f32) as usize) / 2).min(half);
+            let mut inv_freq_global = vec![0.0f32; half];
+            for (i, slot) in inv_freq_global.iter_mut().enumerate().take(ra) {
+                *slot = 1.0 / (arch.rope_theta as f32).powf(2.0 * i as f32 / ghd as f32);
+            }
+            let globals = G4eGlobals {
+                ple_embed: t("model.embed_tokens_per_layer.weight")?,
+                ple_model_proj: t("model.per_layer_model_projection.weight")?,
+                ple_norm: f("model.per_layer_projection_norm.weight")?,
+                ple_vocab: gc.ple_vocab,
+                ple_dim: gc.ple_dim,
+                num_layers: arch.num_layers,
+                hidden: arch.hidden_size,
+                rms_eps: arch.rms_norm_eps,
+                inv_freq_local: crate::attention::rope_inv_freq(
+                    arch.head_dim,
+                    arch.rope_local_base_freq.unwrap_or(10_000.0) as f32,
+                ),
+                inv_freq_global,
+                window: arch.sliding_window.unwrap_or(512),
+                nh: arch.num_attention_heads,
+                nkv: arch.num_kv_heads,
+            };
+            pipeline.g4e = Some(Box::new((globals, g4e_layers)));
+        }
+        if let Some(gc) = arch
+            .g3n
+            .as_ref()
+            .filter(|_| !arch.arch_name.starts_with("gemma4"))
+        {
             use crate::g3n::{G3nAltUp, G3nGlobals, G3nLaurel, G3nLayer};
             anyhow_like(gc.altup_num_inputs == crate::g3n::ALTUP_N).map_err(|_| {
                 CmfError::Parse(format!(
