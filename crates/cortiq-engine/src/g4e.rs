@@ -210,6 +210,28 @@ pub fn g4e_forward(
             attention::rope_rotate_scaled(head, position, inv_freq, 1.0);
         }
         let src = lw.kv_share_src.unwrap_or(li);
+        let attn_dump: Option<String> = std::env::var("CMF_ATTN_DUMP").ok().and_then(|dir| {
+            let want: Vec<usize> = std::env::var("CMF_ATTN_DUMP_LAYERS")
+                .ok()
+                .map(|s| s.split(',').filter_map(|x| x.parse::<usize>().ok()).collect())
+                .unwrap_or_default();
+            (want.contains(&li)).then_some(dir)
+        });
+        let put = |name: &str, v: &[f32]| {
+            if let Some(dir) = &attn_dump {
+                let _ = std::fs::create_dir_all(dir);
+                let mut b = Vec::with_capacity(v.len() * 4);
+                for x in v {
+                    b.extend_from_slice(&x.to_le_bytes());
+                }
+                let _ = std::fs::write(
+                    std::path::Path::new(dir).join(format!("a{position:06}_l{li:02}_{name}.f32")),
+                    b,
+                );
+            }
+        };
+        put("q", &q);
+        put("xn", &xn);
         if lw.kv_share_src.is_none() {
             let wk = lw.wk.as_ref().expect("non-shared layer has k_proj");
             let wv = lw.wv.as_ref().expect("non-shared layer has v_proj");
@@ -225,12 +247,15 @@ pub fn g4e_forward(
             for gi in 0..nkv {
                 rms_plain(&mut v[gi * hd..(gi + 1) * hd], eps);
             }
+            put("k", &k);
+            put("v", &v);
             caches[li].append(&k, &v, &[]);
         }
         let window = if lw.sliding { Some(g.window) } else { None };
         let (mut ao, mut imp) =
             attention::attend_all_heads(&q, &caches[src], nh, hpk, hd, 1.0, window, 0.0);
         attention::recycle_buf(&mut imp);
+        put("ao", &ao);
         let a = matvec(&lw.wo, &ao, pool);
         attention::recycle_buf(&mut ao);
 
