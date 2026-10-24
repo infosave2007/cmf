@@ -5482,6 +5482,30 @@ const MINICPM_DSPARK_SOURCE_ARCH: &str = "Qwen3DSparkModel";
 const MINICPM_DSPARK_BASE_ARCH: &str = "minicpmv4_7";
 const MINICPM_DSPARK_TARGET_IDS: [usize; 5] = [3, 11, 19, 27, 35];
 
+// ── MiniMax-M3.1 DSpark sidecar (same `<stem>.dspark.cmf` contract) ────────
+//
+// The official M3.1 draft is `DSparkMiniMaxDraftModel`: five dense Qwen3
+// shaped blocks over the TARGET's hidden (6144, so the taps need no
+// projection), an MXFP8-quantized body, a vanilla Markov head, and a
+// confidence head — the same executor schema as MiniCPM's draft, with its
+// own geometry and its own source namespace.
+const MINIMAX_DSPARK_ARCH: &str = "minimax_m31_dspark_sidecar";
+const MINIMAX_DSPARK_SOURCE_ARCH: &str = "DSparkMiniMaxDraftModel";
+const MINIMAX_DSPARK_BASE_ARCH: &str = "minimax_m3_vl";
+const MINIMAX_DSPARK_TARGET_IDS: [usize; 5] = [3, 17, 31, 45, 59];
+/// The draft safetensors namespace inside the M3.1 checkpoint.
+const MINIMAX_DSPARK_SRC: &str = "language_model.model.dspark.";
+
+/// Which official draft contract a sidecar follows. The two share the
+/// executor schema (fc taps, Markov + confidence heads, five blocks) but
+/// differ in source namespace, geometry, quantization, and config nesting —
+/// a mismatch must fail closed rather than be reinterpreted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DsparkFlavor {
+    Minicpm,
+    Minimax,
+}
+
 /// Geometry of the one published MiniCPM-V 4.7 35B-A3B DSpark checkpoint.
 /// Keeping this local to the converter is intentional: until a dedicated
 /// executor exists, accepting a merely Qwen-shaped draft as this sidecar
@@ -5502,6 +5526,7 @@ struct DsparkLayout {
     num_target_layers: usize,
     rope_theta: f64,
     rms_norm_eps: f64,
+    flavor: DsparkFlavor,
 }
 
 /// One tensor in the fixed DSpark payload schema.  `source` is deliberately
@@ -5616,6 +5641,7 @@ impl DsparkLayout {
                 .get("rms_norm_eps")
                 .and_then(|v| v.as_f64())
                 .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: rms_norm_eps missing"))?,
+            flavor: DsparkFlavor::Minicpm,
         };
         anyhow::ensure!(
             layout.hidden == 2048
@@ -5648,9 +5674,141 @@ impl DsparkLayout {
         );
         Ok(layout)
     }
+
+    /// Parse and fail closed on the official MiniMax-M3.1 DSpark contract.
+    ///
+    /// The M3.1 draft config nests its whole body under `text_config` (the
+    /// draft is a `minimax_m3_vl` module), carries the DFlash block numbers
+    /// at the root as `dspark_*`, and quantizes its matrices to MXFP8 — none
+    /// of which the MiniCPM reader assumes. Every value here is checked
+    /// against the one published checkpoint, so a future draft revision
+    /// fails closed instead of being reinterpreted.
+    fn minimax(config: &serde_json::Value) -> anyhow::Result<Self> {
+        let architectures = config
+            .get("architectures")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: config has no architectures array"))?;
+        anyhow::ensure!(
+            architectures.iter().any(|v| v.as_str() == Some(MINIMAX_DSPARK_SOURCE_ARCH)),
+            "DSpark sidecar: expected architectures to include {MINIMAX_DSPARK_SOURCE_ARCH}"
+        );
+        anyhow::ensure!(
+            dspark_cfg_str(config, "model_type")? == MINIMAX_DSPARK_BASE_ARCH,
+            "DSpark sidecar: expected model_type {MINIMAX_DSPARK_BASE_ARCH}"
+        );
+        let text = config
+            .get("text_config")
+            .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: config has no text_config"))?;
+        let dflash = text
+            .get("dflash_config")
+            .or_else(|| config.get("dflash_config"))
+            .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: config has no dflash_config"))?;
+        // Root-level DFlash numbers and their text_config twins must agree.
+        let root_targets = config
+            .get("dspark_target_layer_ids")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64().map(|v| v as usize))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        anyhow::ensure!(
+            root_targets == MINIMAX_DSPARK_TARGET_IDS,
+            "DSpark sidecar: dspark_target_layer_ids {root_targets:?} are not the published M3.1 contract {:?}",
+            MINIMAX_DSPARK_TARGET_IDS
+        );
+        let dflash_targets = dflash
+            .get("target_layer_ids")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64().map(|v| v as usize))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        anyhow::ensure!(
+            dflash_targets == root_targets,
+            "DSpark sidecar: dflash_config.target_layer_ids disagrees with dspark_target_layer_ids"
+        );
+        let root_block = dspark_cfg_usize(config, "dspark_block_size")?;
+        let dflash_block = dspark_cfg_usize(dflash, "block_size")?;
+        anyhow::ensure!(
+            root_block == dflash_block,
+            "DSpark sidecar: dspark_block_size {root_block} disagrees with dflash block_size {dflash_block}"
+        );
+        anyhow::ensure!(
+            dspark_cfg_bool(config, "enable_confidence_head")?
+                && dspark_cfg_bool(config, "confidence_head_with_markov")?,
+            "DSpark sidecar: the published confidence head contract is required"
+        );
+        let target_layers: [usize; 5] = root_targets
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("DSpark sidecar: expected exactly five target layers"))?;
+
+        let get_text = |key: &str| -> anyhow::Result<usize> {
+            text.get(key)
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: text_config.{key} missing"))
+        };
+        let layout = Self {
+            hidden: get_text("hidden_size")?,
+            // The draft's MLP is the target's DENSE width (12288), not the
+            // MoE `intermediate_size` its config also carries.
+            intermediate: get_text("dense_intermediate_size")?,
+            layers: get_text("num_hidden_layers")?,
+            heads: get_text("num_attention_heads")?,
+            kv_heads: get_text("num_key_value_heads")?,
+            head_dim: get_text("head_dim")?,
+            vocab: get_text("vocab_size")?,
+            markov_rank: dspark_cfg_usize(config, "markov_rank")?,
+            block_size: root_block,
+            mask_token_id: dspark_cfg_usize(dflash, "mask_token_id")?,
+            target_layers,
+            num_target_layers: dspark_cfg_usize(dflash, "num_target_layers")?,
+            rope_theta: text
+                .get("rope_theta")
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: text_config.rope_theta missing"))?,
+            rms_norm_eps: text
+                .get("rms_norm_eps")
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: text_config.rms_norm_eps missing"))?,
+            flavor: DsparkFlavor::Minimax,
+        };
+        anyhow::ensure!(
+            layout.hidden == 6144
+                && layout.intermediate == 12288
+                && layout.layers == 5
+                && layout.heads == 64
+                && layout.kv_heads == 4
+                && layout.head_dim == 128
+                && layout.vocab == 200_064
+                && layout.markov_rank == 256
+                && layout.block_size == 7
+                && layout.mask_token_id == 200_058
+                && layout.num_target_layers == 60
+                && (layout.rope_theta - 10_000_000.0).abs() < f64::EPSILON
+                && (layout.rms_norm_eps - 1e-6).abs() < f64::EPSILON,
+            "DSpark sidecar: unsupported MiniMax M3.1 DSpark geometry {layout:?}"
+        );
+        // The draft's MLP activation and Q/K norm are part of the executor
+        // contract the sidecar documents; a config that drifts from them
+        // would silently change what a future executor computes.
+        anyhow::ensure!(
+            text.get("hidden_act").and_then(|v| v.as_str()) == Some("swigluoai")
+                && text.get("swiglu_alpha").and_then(|v| v.as_f64()) == Some(1.702)
+                && text.get("swiglu_limit").and_then(|v| v.as_f64()) == Some(7.0)
+                && text.get("use_qk_norm").and_then(|v| v.as_bool()) == Some(true),
+            "DSpark sidecar: draft act/QK-norm contract drifted from swigluoai(1.702, 7.0)+qk-norm"
+        );
+        Ok(layout)
+    }
 }
 
 fn dspark_tensor_specs(layout: &DsparkLayout) -> Vec<DsparkTensorSpec> {
+    let minimax = layout.flavor == DsparkFlavor::Minimax;
     let mut specs = Vec::with_capacity(62);
     let mut add = |source: String, shape: Vec<usize>, matrix: bool| {
         specs.push(DsparkTensorSpec {
@@ -5666,7 +5824,14 @@ fn dspark_tensor_specs(layout: &DsparkLayout) -> Vec<DsparkTensorSpec> {
     );
     add("hidden_norm.weight".into(), vec![layout.hidden], false);
     for li in 0..layout.layers {
-        let p = format!("layers.{li}.");
+        // MiniCPM ships `layers.N.*`; M3.1 nests each block under
+        // `layers.N.decoder_layer.`. The names here carry NO source
+        // namespace — the validator and the decoder add it per flavor.
+        let p = if minimax {
+            format!("layers.{li}.decoder_layer.")
+        } else {
+            format!("layers.{li}.")
+        };
         add(format!("{p}input_layernorm.weight"), vec![layout.hidden], false);
         add(
             format!("{p}self_attn.q_proj.weight"),
@@ -5711,7 +5876,13 @@ fn dspark_tensor_specs(layout: &DsparkLayout) -> Vec<DsparkTensorSpec> {
             true,
         );
     }
-    add("norm.weight".into(), vec![layout.hidden], false);
+    // The two checkpoints name their final block norm differently.
+    let final_norm = if minimax {
+        "final_norm.weight"
+    } else {
+        "norm.weight"
+    };
+    add(final_norm.into(), vec![layout.hidden], false);
     add(
         "markov_head.markov_w1.weight".into(),
         vec![layout.vocab, layout.markov_rank],
@@ -5759,48 +5930,105 @@ fn dspark_matrix_dtype(quant: Quant) -> TensorDtype {
 fn validate_dspark_source(
     source: &SafeTensors,
     specs: &[DsparkTensorSpec],
+    flavor: DsparkFlavor,
 ) -> anyhow::Result<()> {
+    // MiniCPM's source tensors carry their short names; M3.1's live under
+    // the module namespace.
+    let prefix = match flavor {
+        DsparkFlavor::Minicpm => "",
+        DsparkFlavor::Minimax => MINIMAX_DSPARK_SRC,
+    };
+    // Only M3.1's layer matrices are quantized: each adds one scale
+    // companion to the raw file, so the raw tensor count exceeds the
+    // logical schema by exactly those companions.
+    let companions = if flavor == DsparkFlavor::Minimax {
+        specs
+            .iter()
+            .filter(|s| s.matrix && s.source.starts_with("layers."))
+            .count()
+    } else {
+        0
+    };
     anyhow::ensure!(
-        source.tensors.len() == specs.len(),
+        source.tensors.len() == specs.len() + companions,
         "DSpark sidecar: source has {} tensors, expected {} — refusing to drop unknown tensors",
         source.tensors.len(),
-        specs.len()
+        specs.len() + companions
     );
-    let known: HashSet<&str> = specs.iter().map(|s| s.source.as_str()).collect();
-    for tensor in &source.tensors {
-        anyhow::ensure!(
-            known.contains(tensor.name.as_str()),
-            "DSpark sidecar: unexpected source tensor {} — refusing to drop it",
-            tensor.name
-        );
-    }
+    let mut claimed: HashSet<String> = HashSet::new();
     for spec in specs {
+        let name = format!("{prefix}{}", spec.source);
         let tensor = source
             .tensors
             .iter()
-            .find(|t| t.name == spec.source)
-            .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: missing source tensor {}", spec.source))?;
-        anyhow::ensure!(
-            tensor.dtype == "BF16",
-            "DSpark sidecar: {} is {}, expected BF16",
-            spec.source,
-            tensor.dtype
-        );
+            .find(|t| t.name == name)
+            .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: missing source tensor {name}"))?;
+        claimed.insert(name.clone());
         anyhow::ensure!(
             tensor.shape == spec.shape,
-            "DSpark sidecar: {} has shape {:?}, expected {:?}",
-            spec.source,
+            "DSpark sidecar: {name} has shape {:?}, expected {:?}",
             tensor.shape,
             spec.shape
         );
         let elems = spec.shape.iter().product::<usize>();
+        let mxfp8_layer_matrix =
+            flavor == DsparkFlavor::Minimax && spec.matrix && spec.source.starts_with("layers.");
+        if mxfp8_layer_matrix {
+            // The published M3.1 draft stores its layer bodies as MXFP8:
+            // an F8_E4M3 matrix plus a row-block (cols/32) U8 scale plane.
+            anyhow::ensure!(
+                tensor.dtype == "F8_E4M3",
+                "DSpark sidecar: {name} is {}, expected F8_E4M3",
+                tensor.dtype
+            );
+            anyhow::ensure!(
+                tensor.end >= tensor.start && tensor.end - tensor.start == elems,
+                "DSpark sidecar: {name} has invalid F8 byte span [{}, {}) for {:?}",
+                tensor.start,
+                tensor.end,
+                spec.shape
+            );
+            let scale_name = format!("{name}_scale_inv");
+            let scale = source
+                .tensors
+                .iter()
+                .find(|t| t.name == scale_name)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("DSpark sidecar: missing MXFP8 companion {scale_name}")
+                })?;
+            claimed.insert(scale_name.clone());
+            let (rows, cols) = (spec.shape[0], spec.shape[1]);
+            anyhow::ensure!(
+                scale.dtype == "U8" && scale.shape == vec![rows, cols / 32],
+                "DSpark sidecar: {scale_name} is {} {:?}, expected U8 [{rows}, {}]",
+                scale.dtype,
+                scale.shape,
+                cols / 32
+            );
+            anyhow::ensure!(
+                scale.end >= scale.start && scale.end - scale.start == rows * (cols / 32),
+                "DSpark sidecar: {scale_name} has invalid byte span"
+            );
+        } else {
+            anyhow::ensure!(
+                tensor.dtype == "BF16",
+                "DSpark sidecar: {name} is {}, expected BF16",
+                tensor.dtype
+            );
+            anyhow::ensure!(
+                tensor.end >= tensor.start && tensor.end - tensor.start == elems * 2,
+                "DSpark sidecar: {name} has invalid BF16 byte span [{}, {}) for {:?}",
+                tensor.start,
+                tensor.end,
+                spec.shape
+            );
+        }
+    }
+    for tensor in &source.tensors {
         anyhow::ensure!(
-            tensor.end >= tensor.start && tensor.end - tensor.start == elems * 2,
-            "DSpark sidecar: {} has invalid BF16 byte span [{}, {}) for {:?}",
-            spec.source,
-            tensor.start,
-            tensor.end,
-            spec.shape
+            claimed.contains(tensor.name.as_str()),
+            "DSpark sidecar: unexpected source tensor {} — refusing to drop it",
+            tensor.name
         );
     }
     Ok(())
@@ -5828,11 +6056,15 @@ fn validate_dspark_base(base_path: &Path, layout: &DsparkLayout) -> anyhow::Resu
     let base = cortiq_core::CmfModel::open(base_path)
         .map_err(|e| anyhow::anyhow!("DSpark sidecar: open base {}: {e}", base_path.display()))?;
     let arch = base.arch();
+    let want_arch = match layout.flavor {
+        DsparkFlavor::Minicpm => MINICPM_DSPARK_BASE_ARCH,
+        DsparkFlavor::Minimax => MINIMAX_DSPARK_BASE_ARCH,
+    };
     anyhow::ensure!(
-        arch.arch_name == MINICPM_DSPARK_BASE_ARCH,
+        arch.arch_name == want_arch,
         "DSpark sidecar: base arch {} is not {}",
         arch.arch_name,
-        MINICPM_DSPARK_BASE_ARCH
+        want_arch
     );
     anyhow::ensure!(
         arch.num_layers == layout.num_target_layers
@@ -5872,6 +6104,7 @@ fn validate_dspark_base(base_path: &Path, layout: &DsparkLayout) -> anyhow::Resu
 }
 
 fn dspark_sidecar_arch(layout: &DsparkLayout) -> anyhow::Result<ModelArch> {
+    let minimax = layout.flavor == DsparkFlavor::Minimax;
     let config = serde_json::json!({
         "model_type": "qwen3",
         "hidden_size": layout.hidden,
@@ -5884,11 +6117,22 @@ fn dspark_sidecar_arch(layout: &DsparkLayout) -> anyhow::Result<ModelArch> {
         "max_position_embeddings": 262144,
         "rms_norm_eps": layout.rms_norm_eps,
         "rope_theta": layout.rope_theta,
+        // M3.1's draft MLP runs the target's checked SwiGLU-OAI contract;
+        // the sidecar records it for a future executor even though
+        // `build_arch` (whose activation whitelist is trunk-scoped) only
+        // knows the generic names — set it after construction, like the
+        // arch identity below.
         "hidden_act": "silu",
         "tie_word_embeddings": false,
     });
     let mut arch = build_arch(&config)?;
-    arch.arch_name = MINICPM_DSPARK_ARCH.into();
+    arch.arch_name = match layout.flavor {
+        DsparkFlavor::Minicpm => MINICPM_DSPARK_ARCH.into(),
+        DsparkFlavor::Minimax => MINIMAX_DSPARK_ARCH.into(),
+    };
+    if minimax {
+        arch.hidden_act = "swigluoai".into();
+    }
     // The draft has no MTP, MoE, recurrent core, embedding, or lm_head of
     // its own.  Those last two are *bound* in provenance to the target file.
     arch.mtp = None;
@@ -5903,19 +6147,33 @@ fn dspark_header(
     model_dir: &Path,
     quant: Quant,
 ) -> anyhow::Result<CmfHeader> {
+    let (kind, source_arch, source_file, source_dtype) = match layout.flavor {
+        DsparkFlavor::Minicpm => (
+            "minicpm_v47_dspark_sidecar",
+            MINICPM_DSPARK_SOURCE_ARCH,
+            "model.safetensors",
+            "BF16",
+        ),
+        DsparkFlavor::Minimax => (
+            "minimax_m31_dspark_sidecar",
+            MINIMAX_DSPARK_SOURCE_ARCH,
+            "model-dspark-00001.safetensors",
+            "MXFP8 layer bodies (F8_E4M3 + U8 scale), BF16 roots",
+        ),
+    };
     Ok(CmfHeader {
         format: "cmf".into(),
         version: CMF_VERSION,
         arch: dspark_sidecar_arch(layout)?,
         quant_type: dspark_quant_type(quant),
         provenance: Some(serde_json::json!({
-            "kind": "minicpm_v47_dspark_sidecar",
+            "kind": kind,
             "sidecar_format": "cmf-dspark-v1",
             "source": {
                 "directory": model_dir.display().to_string(),
-                "file": "model.safetensors",
-                "architectures": [MINICPM_DSPARK_SOURCE_ARCH],
-                "dtype": "BF16",
+                "file": source_file,
+                "architectures": [source_arch],
+                "dtype": source_dtype,
                 "tensor_count": 62,
             },
             "base_binding": {
@@ -5967,8 +6225,16 @@ fn validate_written_dspark_sidecar(
     binding: &DsparkBaseBinding,
     quant: Quant,
 ) -> anyhow::Result<()> {
+    let want_arch = match layout.flavor {
+        DsparkFlavor::Minicpm => MINICPM_DSPARK_ARCH,
+        DsparkFlavor::Minimax => MINIMAX_DSPARK_ARCH,
+    };
+    let want_kind = match layout.flavor {
+        DsparkFlavor::Minicpm => "minicpm_v47_dspark_sidecar",
+        DsparkFlavor::Minimax => "minimax_m31_dspark_sidecar",
+    };
     anyhow::ensure!(
-        model.arch().arch_name == MINICPM_DSPARK_ARCH,
+        model.arch().arch_name == want_arch,
         "DSpark sidecar: output arch identity was not preserved"
     );
     let provenance = model
@@ -5977,7 +6243,7 @@ fn validate_written_dspark_sidecar(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: output has no provenance"))?;
     anyhow::ensure!(
-        provenance["kind"] == "minicpm_v47_dspark_sidecar"
+        provenance["kind"] == want_kind
             && provenance["sidecar_format"] == "cmf-dspark-v1"
             && provenance["tensor_namespace"] == "dspark.",
         "DSpark sidecar: output identity metadata is malformed"
@@ -6037,18 +6303,37 @@ fn write_dspark_payload(
     quant: Quant,
     output: &Path,
 ) -> anyhow::Result<()> {
+    let minimax = header
+        .provenance
+        .as_ref()
+        .is_some_and(|p| p["kind"] == "minimax_m31_dspark_sidecar");
+    let prefix = if minimax { MINIMAX_DSPARK_SRC } else { "" };
     let mut writer = cortiq_core::format::CmfStreamWriter::new(
         output,
         cortiq_core::format::CmfStreamWriter::head_reserve_for(specs.len(), 64),
     )
     .map_err(|e| anyhow::anyhow!("DSpark sidecar: create {}: {e}", output.display()))?;
     for spec in specs {
+        let source_name = format!("{prefix}{}", spec.source);
         let tensor = source
             .tensors
             .iter()
-            .find(|t| t.name == spec.source)
+            .find(|t| t.name == source_name)
             .expect("source schema was validated");
-        let vals = to_f32(&tensor.dtype, source.bytes(tensor))?;
+        // M3.1's layer bodies are MXFP8: decode through the row scales to
+        // f32 first so the chosen sidecar quant sees the real values.
+        let vals = if minimax && spec.matrix && spec.source.starts_with("layers.") {
+            let scale_name = format!("{source_name}_scale_inv");
+            let scale = source
+                .tensors
+                .iter()
+                .find(|t| t.name == scale_name)
+                .expect("source schema was validated");
+            let (rows, cols) = (spec.shape[0], spec.shape[1]);
+            unpack_mxfp8_rowwise(source.bytes(tensor), source.bytes(scale), rows, cols)?
+        } else {
+            to_f32(&tensor.dtype, source.bytes(tensor))?
+        };
         anyhow::ensure!(
             vals.len() == spec.shape.iter().product::<usize>() && vals.iter().all(|v| v.is_finite()),
             "DSpark sidecar: {} contains an invalid numeric payload",
@@ -6076,7 +6361,11 @@ fn write_dspark_payload(
 /// collision-free sidecar beside an existing CMF target.  This writes every
 /// official draft tensor, validates the result, and binds it to the exact
 /// base directory/trunk hashes.  It intentionally has no runtime effect.
-pub fn write_minicpm_dspark_sidecar(
+/// Convert an official DSpark checkpoint to a collision-free sidecar beside
+/// an existing CMF target. The base's architecture selects the flavor
+/// (MiniCPM-V-4.7's BF16 Qwen3 draft or MiniMax-M3.1's MXFP8 module draft);
+/// both write the same `dspark.` namespace and the same executor schema.
+pub fn write_dspark_sidecar(
     model_dir: &Path,
     base_output: &Path,
     quant: &str,
@@ -6091,7 +6380,21 @@ pub fn write_minicpm_dspark_sidecar(
         &fs::read_to_string(&config_path)
             .map_err(|e| anyhow::anyhow!("DSpark sidecar: {}: {e}", config_path.display()))?,
     )?;
-    let layout = DsparkLayout::official(&config)?;
+    // The base decides which official draft contract this conversion must
+    // satisfy — the layouts are close enough that accepting either config
+    // would be a silent geometry mix.
+    let base_arch = cortiq_core::CmfModel::open(base_output)
+        .map_err(|e| anyhow::anyhow!("DSpark sidecar: open base {}: {e}", base_output.display()))?
+        .arch()
+        .arch_name
+        .clone();
+    let layout = match base_arch.as_str() {
+        MINIMAX_DSPARK_BASE_ARCH => DsparkLayout::minimax(&config)?,
+        MINICPM_DSPARK_BASE_ARCH => DsparkLayout::official(&config)?,
+        other => anyhow::bail!(
+            "DSpark sidecar: base arch {other} has no DSpark contract (expected {MINICPM_DSPARK_BASE_ARCH} or {MINIMAX_DSPARK_BASE_ARCH})"
+        ),
+    };
     let binding = validate_dspark_base(base_output, &layout)?;
     let out = cortiq_core::dspark_sidecar_path(base_output);
     anyhow::ensure!(
@@ -6103,10 +6406,16 @@ pub fn write_minicpm_dspark_sidecar(
         "DSpark sidecar: {} already exists; refusing to overwrite it",
         out.display()
     );
-    let source_path = model_dir.join("model.safetensors");
+    let source_file = match layout.flavor {
+        DsparkFlavor::Minicpm => "model.safetensors",
+        // The M3.1 checkpoint shards its draft; the index resolves to this
+        // single file for the published release.
+        DsparkFlavor::Minimax => "model-dspark-00001.safetensors",
+    };
+    let source_path = model_dir.join(source_file);
     let source = open_safetensors(&source_path)?;
     let specs = dspark_tensor_specs(&layout);
-    validate_dspark_source(&source, &specs)?;
+    validate_dspark_source(&source, &specs, layout.flavor)?;
     let header = dspark_header(&layout, &binding, model_dir, quant)?;
     if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
@@ -6168,7 +6477,10 @@ fn default_quant_for_arch(arch: &ModelArch) -> Quant {
 /// this separate from the user-facing check so an invalid request can fail
 /// before the remote M3 inventory walk issues header ranges for every shard.
 fn minimax_m3_profile_supported(profile: Quant) -> bool {
-    matches!(profile, Quant::Q4TiledP | Quant::Q8_2f)
+    matches!(
+        profile,
+        Quant::Q4TiledP | Quant::Q2TiledP | Quant::Q8_2f
+    )
 }
 
 /// `--quant` value that selects [`default_quant_for_arch`].
@@ -11402,7 +11714,7 @@ pub(crate) mod tests {
         assert_eq!(profile_quant(&arch, Quant::Q8_2f, routed), Quant::Q8_2f);
         assert!(minimax_m3_profile_supported(Quant::Q4TiledP));
         assert!(minimax_m3_profile_supported(Quant::Q8_2f));
-        assert!(!minimax_m3_profile_supported(Quant::Q2TiledP));
+        assert!(minimax_m3_profile_supported(Quant::Q2TiledP));
         assert!(!minimax_m3_profile_supported(Quant::Mxfp4));
 
         let router = "model.layers.3.mlp.gate.weight";
@@ -16175,6 +16487,7 @@ mod dspark_sidecar_tests {
             num_target_layers: 40,
             rope_theta: 10_000_000.0,
             rms_norm_eps: 1e-6,
+            flavor: DsparkFlavor::Minicpm,
         }
     }
 
@@ -16230,6 +16543,80 @@ mod dspark_sidecar_tests {
         open_safetensors(&source).unwrap()
     }
 
+    /// The published MiniMax-M3.1 DSpark config shape (root + `text_config`),
+    /// reproduced from the official checkpoint so the reader's contract is
+    /// testable without the 2.3 GB download.
+    fn minimax_dspark_config() -> serde_json::Value {
+        serde_json::json!({
+            "architectures": [MINIMAX_DSPARK_SOURCE_ARCH],
+            "model_type": "minimax_m3_vl",
+            "dspark_block_size": 7,
+            "dspark_target_layer_ids": MINIMAX_DSPARK_TARGET_IDS,
+            "markov_rank": 256,
+            "enable_confidence_head": true,
+            "confidence_head_with_markov": true,
+            "text_config": {
+                "hidden_size": 6144,
+                "dense_intermediate_size": 12288,
+                "intermediate_size": 3072,
+                "num_hidden_layers": 5,
+                "num_attention_heads": 64,
+                "num_key_value_heads": 4,
+                "head_dim": 128,
+                "vocab_size": 200064,
+                "rope_theta": 10000000.0,
+                "rms_norm_eps": 1e-6,
+                "hidden_act": "swigluoai",
+                "swiglu_alpha": 1.702,
+                "swiglu_limit": 7.0,
+                "use_qk_norm": true,
+                "dflash_config": {
+                    "block_size": 7,
+                    "mask_token_id": 200058,
+                    "target_layer_ids": MINIMAX_DSPARK_TARGET_IDS,
+                    "num_target_layers": 60,
+                    "context_source": "target_layers",
+                },
+            },
+        })
+    }
+
+    #[test]
+    fn minimax_dspark_contract_is_locked_to_the_published_draft() {
+        let layout = DsparkLayout::minimax(&minimax_dspark_config()).unwrap();
+        assert_eq!(layout.flavor, DsparkFlavor::Minimax);
+        assert_eq!(layout.target_layers, MINIMAX_DSPARK_TARGET_IDS);
+        assert_eq!(layout.block_size, 7);
+        assert_eq!(layout.mask_token_id, 200058);
+        assert_eq!(layout.num_target_layers, 60);
+        assert_eq!(layout.hidden, 6144);
+        // The draft's MLP is the target's DENSE width — reading the MoE
+        // `intermediate_size` instead would size every mlp spec wrong.
+        assert_eq!(layout.intermediate, 12288);
+        let specs = dspark_tensor_specs(&layout);
+        assert_eq!(specs.len(), 62);
+        assert!(specs
+            .iter()
+            .any(|s| s.source == "layers.0.decoder_layer.mlp.gate_proj.weight"));
+        assert!(specs.iter().any(|s| s.source == "final_norm.weight"));
+
+        // Drift fails closed: another draft revision's tap ids...
+        let mut bad = minimax_dspark_config();
+        bad["dspark_target_layer_ids"] = serde_json::json!([4, 18, 32, 46, 60]);
+        assert!(DsparkLayout::minimax(&bad).is_err());
+        // ...a missing text_config...
+        let mut bad = minimax_dspark_config();
+        bad.as_object_mut().unwrap().remove("text_config");
+        assert!(DsparkLayout::minimax(&bad).is_err());
+        // ...and a body that stopped being SwiGLU-OAI.
+        let mut bad = minimax_dspark_config();
+        bad["text_config"]["swiglu_alpha"] = serde_json::json!(1.5);
+        assert!(DsparkLayout::minimax(&bad).is_err());
+        // The reader must not accept MiniCPM's flat config or vice versa.
+        assert!(DsparkLayout::minimax(&official_config()).is_err());
+        assert!(DsparkLayout::official(&minimax_dspark_config()).is_err());
+    }
+
     #[test]
     fn dspark_contract_is_explicit_and_sidecar_name_never_aliases_mtp() {
         let layout = DsparkLayout::official(&official_config()).unwrap();
@@ -16261,7 +16648,7 @@ mod dspark_sidecar_tests {
         fs::create_dir_all(&dir).unwrap();
         let layout = tiny_layout();
         let source = write_tiny_source(&dir, &layout, true);
-        let err = validate_dspark_source(&source, &dspark_tensor_specs(&layout)).unwrap_err();
+        let err = validate_dspark_source(&source, &dspark_tensor_specs(&layout), layout.flavor).unwrap_err();
         assert!(err.to_string().contains("expected 62") || err.to_string().contains("unexpected"));
         let _ = fs::remove_dir_all(&dir);
     }
@@ -16274,7 +16661,7 @@ mod dspark_sidecar_tests {
         let layout = tiny_layout();
         let source = write_tiny_source(&dir, &layout, false);
         let specs = dspark_tensor_specs(&layout);
-        validate_dspark_source(&source, &specs).unwrap();
+        validate_dspark_source(&source, &specs, layout.flavor).unwrap();
         let binding = DsparkBaseBinding {
             filename: "minicpm-q4tp.cmf".into(),
             arch_name: MINICPM_DSPARK_BASE_ARCH.into(),

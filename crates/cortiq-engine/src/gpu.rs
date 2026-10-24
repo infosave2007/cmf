@@ -198,6 +198,25 @@ pub fn enter_cpu_scope() -> CpuScopeGuard {
     CpuScopeGuard(previous)
 }
 
+/// Temporarily turn the CPU-only gate back ON inside a held
+/// [`enter_cpu_scope`] (the host tail holds one for its per-op layers).
+/// The pooled tail's own device frames are explicitly device-owned — the
+/// same escape hatch the MiniCPM prepared frame documents — and must not be
+/// declined by the surrounding scope. Restores the previous flag on drop.
+pub fn gpu_scope<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CPU_ONLY.with(|c| c.set(self.0));
+        }
+    }
+    let prev = CPU_ONLY.with(|c| c.replace(false));
+    let restore = Restore(prev);
+    let out = f();
+    drop(restore);
+    out
+}
+
 /// Run `f` with the GPU gates off on this thread (pure-CPU arm).
 pub fn cpu_scope<R>(f: impl FnOnce() -> R) -> R {
     let _restore = enter_cpu_scope();
