@@ -36,6 +36,29 @@ pub fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
+/// MiniMax M3's SwiGLU-OAI gated activation.
+///
+/// The upstream contract is deliberately not ordinary `silu(gate) * up`:
+///
+/// ```text
+/// g = min(gate, limit)                // only an upper clamp
+/// u = clamp(up, -limit, limit)
+/// out = g * sigmoid(alpha * g) * (u + beta)
+/// ```
+///
+/// MiniMax M3.1 uses `alpha = 1.702`, `beta = 1.0`, and `limit = 7.0`.
+/// `None` is useful for source variants which explicitly omit the clamp.
+/// Keeping this scalar reference here lets all execution paths share the
+/// exact asymmetric clamp rule before an accelerator kernel is admitted.
+#[inline]
+pub fn swiglu_oai(gate: f32, up: f32, alpha: f32, beta: f32, limit: Option<f32>) -> f32 {
+    let (gate, up) = match limit {
+        Some(limit) => (gate.min(limit), up.clamp(-limit, limit)),
+        None => (gate, up),
+    };
+    gate * (1.0 / (1.0 + (-alpha * gate).exp())) * (up + beta)
+}
+
 /// RMS normalization with explicit weight semantics.
 ///
 /// - `NormStyle::Qwen`  (Llama family): `x̂ · w`
@@ -312,6 +335,50 @@ mod tests {
         let out = rms_norm(&input, &weight, 1e-6, NormStyle::Gemma);
         let rms = (30.0_f64 / 4.0).sqrt() as f32;
         assert!((out[0] - 1.0 / rms).abs() < 1e-4);
+    }
+
+    #[test]
+    fn minimax_gemma_1p_rms_norm_uses_weight_plus_one() {
+        // MiniMax M3 applies Gemma-1p to its residual, Q/K and index-Q/K
+        // norms. In particular a stored -1 weight must zero that lane; a
+        // usual RMSNorm (`x-hat * weight`) would instead flip its sign.
+        let input = [3.0f32, 4.0];
+        let weight = [-1.0f32, 0.5];
+        let expected_rstd = 1.0 / ((12.5f64 + 1e-6).sqrt() as f32);
+        let expected = [0.0, 4.0 * expected_rstd * 1.5];
+
+        let got = rms_norm(&input, &weight, 1e-6, NormStyle::Gemma);
+        let mut into = [f32::NAN; 2];
+        rms_norm_into(&input, &weight, 1e-6, NormStyle::Gemma, &mut into);
+
+        for ((actual, scratch), want) in got.iter().zip(into).zip(expected) {
+            assert!((actual - want).abs() < 1e-6, "{actual} != {want}");
+            assert!((scratch - want).abs() < 1e-6, "{scratch} != {want}");
+        }
+    }
+
+    #[test]
+    fn minimax_swiglu_oai_has_asymmetric_gate_clamp() {
+        const ALPHA: f32 = 1.702;
+        const BETA: f32 = 1.0;
+        const LIMIT: f32 = 7.0;
+
+        let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
+        let positive = swiglu_oai(10.0, 10.0, ALPHA, BETA, Some(LIMIT));
+        let expected_positive = 7.0 * sigmoid(ALPHA * 7.0) * 8.0;
+        assert!((positive - expected_positive).abs() < 1e-5);
+
+        // The gate is *not* lower-clamped: only up is symmetric. This
+        // catches the tempting but wrong `gate.clamp(-limit, limit)` port.
+        let negative = swiglu_oai(-10.0, -10.0, ALPHA, BETA, Some(LIMIT));
+        let expected_negative = -10.0 * sigmoid(-10.0 * ALPHA) * -6.0;
+        assert!((negative - expected_negative).abs() < 1e-10);
+        let symmetric_gate = -7.0 * sigmoid(-7.0 * ALPHA) * -6.0;
+        assert!((negative - symmetric_gate).abs() > 1e-6);
+
+        let unclamped = swiglu_oai(10.0, -10.0, ALPHA, BETA, None);
+        let expected_unclamped = 10.0 * sigmoid(10.0 * ALPHA) * -9.0;
+        assert!((unclamped - expected_unclamped).abs() < 1e-5);
     }
 
     #[test]

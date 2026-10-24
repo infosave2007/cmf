@@ -79,6 +79,16 @@ inline uint cmf_load_u32_le(device const uchar* p) {
            ((uint)p[2] << 16u) | ((uint)p[3] << 24u);
 }
 
+// Frozen MiniMax-M3.1 SwiGLU-OAI contract.  This is intentionally a
+// separate helper rather than a variant of the ordinary SiLU expression:
+// gate has only an upper clamp, up is symmetrically clamped, and the sigmoid
+// slope plus the post-up offset are source-model constants.
+inline float swiglu_oai_m3(float gate, float up) {
+    float g = min(gate, 7.0f);
+    float u = clamp(up, -7.0f, 7.0f);
+    return g * (1.0f / (1.0f + exp(-1.702f * g))) * (u + 1.0f);
+}
+
 // Shape-specialized pipeline variants (the llama.cpp trick): cols/rows
 // arrive as FUNCTION CONSTANTS so the K-loop trip count and address
 // strides are compile-time — fully unrolled, strength-reduced. Built
@@ -2048,6 +2058,23 @@ kernel void silu_mul_pre(
     float gv = g[i];
     float cv = has_col != 0 ? col[i] : 1.0f;
     act[i] = (gv / (1.0f + exp(-gv))) * u[i] * cv;
+}
+
+// `silu_mul_pre` ABI twin for one admitted MiniMax-M3.1 dense OAI triple.
+// Keeping the down-column multiply here preserves q8_2f's existing input
+// field contract: the field scales the activation after its gate/up function.
+kernel void swiglu_oai_m3_mul_pre(
+    device const float* g   [[buffer(0)]],
+    device const float* u   [[buffer(1)]],
+    device const float* col [[buffer(2)]],
+    device float*       act [[buffer(3)]],
+    constant uint&      n   [[buffer(4)]],
+    constant uint&      has_col [[buffer(5)]],
+    uint i [[thread_position_in_grid]])
+{
+    if (i >= n) return;
+    float cv = has_col != 0 ? col[i] : 1.0f;
+    act[i] = swiglu_oai_m3(g[i], u[i]) * cv;
 }
 
 // erf by Abramowitz–Stegun 7.1.26 (|error| <= 1.5e-7): the host's
@@ -4957,6 +4984,84 @@ kernel void q4tp_matvec_m_gu(
     }
 }
 
+// MiniMax-M3.1's frozen SwiGLU-OAI gate/up pair in one dispatch.  The
+// q4tp walk is identical to `q4tp_matvec_m_gu`; only its epilogue carries
+// the source contract: upper-only gate clamp, symmetric up clamp, alpha
+// 1.702 sigmoid, and the +1 up offset.
+kernel void q4tp_matvec_m_gu_oai(
+    device const uchar* qg   [[buffer(0)]],
+    device const float* x    [[buffer(1)]],
+    device float*       act  [[buffer(2)]],
+    constant uint&      gpr  [[buffer(3)]],
+    constant uint&      rows [[buffer(4)]],
+    device const uchar* qu   [[buffer(5)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint tgpos [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    threadgroup float lad[8u * 8u * 32u];
+    uint r0 = (tgpos * sgs + sg) * 4u;
+    bool active = r0 < rows;
+    uint nr = active ? min(rows - r0, 4u) : 0u;
+    ulong params_off = (ulong)rows * (ulong)gpr * 16ul;
+    ulong codes_off  = params_off + (ulong)rows * 4ul;
+    uint  stride     = (gpr * 5u + 7u) / 8u;
+    for (uint ri = 0u; ri < nr; ++ri) {
+        device const half* pg = (device const half*)(qg + params_off + (ulong)(r0 + ri) * 4ul);
+        device const half* pu = (device const half*)(qu + params_off + (ulong)(r0 + ri) * 4ul);
+        lad[(sg * 8u + ri) * 32u + lane] = exp2((float)pg[0] + (float)lane * (float)pg[1]);
+        lad[(sg * 8u + 4u + ri) * 32u + lane] = exp2((float)pu[0] + (float)lane * (float)pu[1]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!active) return;
+    const float4 sc = float4(1.0f, 1.0f / 16.0f, 1.0f / 256.0f, 1.0f / 4096.0f);
+    float ag0 = 0.0f, ag1 = 0.0f, ag2 = 0.0f, ag3 = 0.0f;
+    float au0 = 0.0f, au1 = 0.0f, au2 = 0.0f, au3 = 0.0f;
+    for (uint g = lane; g < gpr; g += 32u) {
+        device const float4* xv = (device const float4*)(x + g * 32u);
+        float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+        float4 x4 = xv[4], x5 = xv[5], x6 = xv[6], x7 = xv[7];
+        float4 s4 = x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+        float m8 = -8.0f * (s4.x + s4.y + s4.z + s4.w);
+        x0 *= sc; x1 *= sc; x2 *= sc; x3 *= sc; x4 *= sc; x5 *= sc; x6 *= sc; x7 *= sc;
+        uint bit = g * 5u;
+        uint cb  = bit >> 3u;
+        uint shf = bit & 7u;
+        for (uint j = 0u; j < 2u * nr; ++j) {
+            uint ri = j >> 1u;
+            bool up = (j & 1u) != 0u;
+            device const uchar* q = up ? qu : qg;
+            uint r = r0 + ri;
+            uint4 b = *(device const uint4*)(q + ((ulong)r * gpr + (ulong)g) * 16ul);
+            device const uchar* cp = q + codes_off + (ulong)r * (ulong)stride + cb;
+            uint code = (((uint)cp[0] | ((shf > 3u) ? ((uint)cp[1] << 8) : 0u)) >> shf) & 31u;
+            float scale = lad[(sg * 8u + (up ? 4u : 0u) + ri) * 32u + code];
+            float gsum = dot(q4_nib4_scaled(b.x), x0) + dot(q4_nib4_scaled(b.x >> 16), x1)
+                       + dot(q4_nib4_scaled(b.y), x2) + dot(q4_nib4_scaled(b.y >> 16), x3)
+                       + dot(q4_nib4_scaled(b.z), x4) + dot(q4_nib4_scaled(b.z >> 16), x5)
+                       + dot(q4_nib4_scaled(b.w), x6) + dot(q4_nib4_scaled(b.w >> 16), x7);
+            float contrib = scale * (gsum + m8);
+            if (j == 0u) ag0 += contrib;
+            else if (j == 1u) au0 += contrib;
+            else if (j == 2u) ag1 += contrib;
+            else if (j == 3u) au1 += contrib;
+            else if (j == 4u) ag2 += contrib;
+            else if (j == 5u) au2 += contrib;
+            else if (j == 6u) ag3 += contrib;
+            else au3 += contrib;
+        }
+    }
+    ag0 = simd_sum(ag0); ag1 = simd_sum(ag1); ag2 = simd_sum(ag2); ag3 = simd_sum(ag3);
+    au0 = simd_sum(au0); au1 = simd_sum(au1); au2 = simd_sum(au2); au3 = simd_sum(au3);
+    if (lane == 0u) {
+        act[r0] = swiglu_oai_m3(ag0, au0);
+        if (nr > 1u) act[r0 + 1u] = swiglu_oai_m3(ag1, au1);
+        if (nr > 2u) act[r0 + 2u] = swiglu_oai_m3(ag2, au2);
+        if (nr > 3u) act[r0 + 3u] = swiglu_oai_m3(ag3, au3);
+    }
+}
+
 // `q4tp_matvec_m_gu` with the exact GELU in its epilogue (Spark-X2.5):
 // the same two-matrix walk, `gelu_mul_pre`'s expression on the way out.
 kernel void q4tp_matvec_m_gu_gelu(
@@ -5672,6 +5777,25 @@ kernel void moe_silu_jobs(
     float g = gu[(ulong)e * (ulong)n + i];
     float u = gu[(ulong)(ne + e) * (ulong)n + i];
     a[gid] = (g / (1.0f + exp(-g))) * u;
+}
+
+// MiniMax-M3.1's exact SwiGLU-OAI activation for every resident expert in a
+// uniform bank.  The host admits this only for the frozen act=3, limit=7
+// marker, so these constants cannot accidentally reinterpret another OAI-like
+// source contract.
+kernel void moe_swiglu_oai_m3_jobs(
+    device const float* gu [[buffer(0)]],
+    device float*       a  [[buffer(1)]],
+    constant uint&      n  [[buffer(2)]],
+    constant uint&      ne [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n * ne) return;
+    uint e = gid / n;
+    uint i = gid - e * n;
+    float g = gu[(ulong)e * (ulong)n + i];
+    float u = gu[(ulong)(ne + e) * (ulong)n + i];
+    a[gid] = swiglu_oai_m3(g, u);
 }
 
 // Weighted sum of the experts' down projections, accumulated in expert
@@ -8145,6 +8269,8 @@ struct Ctx {
     q4tp_m: ComputePipelineState,
     /// `q4tp_matvec_m_gu`: fused gate|up|SiLU of the dense decode.
     q4tp_mgu: ComputePipelineState,
+    /// `q4tp_matvec_m_gu_oai`: MiniMax-M3.1's exact SwiGLU-OAI twin.
+    q4tp_mgu_oai: ComputePipelineState,
     /// `q4tp_matvec_m_gu_gelu`: the same with the exact GELU.
     q4tp_mgu_gelu: ComputePipelineState,
     /// Standalone q2tp matvec with explicit ordinary/affine centre.
@@ -8198,6 +8324,8 @@ struct Ctx {
     /// only by the exact six-routed-plus-shared selected-view path.
     flint_dn_fixed7: ComputePipelineState,
     moesilu: ComputePipelineState,
+    /// `moe_swiglu_oai_m3_jobs`: resident uniform-bank OAI activation.
+    moe_oai_m3: ComputePipelineState,
     moered: ComputePipelineState,
     q4tmm: ComputePipelineState,
     q4tmmsilu: ComputePipelineState,
@@ -8226,6 +8354,8 @@ struct Ctx {
     qkn: ComputePipelineState,
     stateup: ComputePipelineState,
     silu: ComputePipelineState,
+    /// `swiglu_oai_m3_mul_pre`: one admitted dense/q8 OAI triple.
+    oai_m3: ComputePipelineState,
     /// `gelu_mul_pre`: the exact-GELU twin of `silu` (dense GELU FFNs).
     gelu: ComputePipelineState,
     /// `head_gate_sigmoid`: per-head projected output gate (Spark-X2.5).
@@ -8456,6 +8586,7 @@ fn init() -> Result<Ctx, String> {
     let q4tp = pso("q4tp_matvec")?;
     let q4tp_m = pso("q4tp_matvec_m")?;
     let q4tp_mgu = pso("q4tp_matvec_m_gu")?;
+    let q4tp_mgu_oai = pso("q4tp_matvec_m_gu_oai")?;
     let q4tp_mgu_gelu = pso("q4tp_matvec_m_gu_gelu")?;
     let q2tp = pso("q2tp_matvec")?;
     let q2tp_affine = pso("q2tp_affine_select_matvec")?;
@@ -8483,6 +8614,7 @@ fn init() -> Result<Ctx, String> {
     let flint_dn_views7 = pso("q4tp_moe_down_flint_views7")?;
     let flint_dn_fixed7 = pso("q4tp_moe_down_flint_fixed7")?;
     let moesilu = pso("moe_silu_jobs")?;
+    let moe_oai_m3 = pso("moe_swiglu_oai_m3_jobs")?;
     let moered = pso("moe_reduce_jobs")?;
     let q4tmm = pso("q4t_mul_mm")?;
     let q4tmmsilu = pso("q4t_mul_mm_silu")?;
@@ -8510,6 +8642,7 @@ fn init() -> Result<Ctx, String> {
     let qkn = pso("gdn_qk_norms")?;
     let stateup = pso("gdn_state_update")?;
     let silu = pso("silu_mul_pre")?;
+    let oai_m3 = pso("swiglu_oai_m3_mul_pre")?;
     let gelu = pso("gelu_mul_pre")?;
     let hgate = pso("head_gate_sigmoid")?;
     let csmaxw = pso("causal_softmax_win")?;
@@ -8586,6 +8719,7 @@ fn init() -> Result<Ctx, String> {
         q4tp,
         q4tp_m,
         q4tp_mgu,
+        q4tp_mgu_oai,
         q4tp_mgu_gelu,
         q2tp,
         q2tp_affine,
@@ -8613,6 +8747,7 @@ fn init() -> Result<Ctx, String> {
         flint_dn_views7,
         flint_dn_fixed7,
         moesilu,
+        moe_oai_m3,
         moered,
         q4tmm,
         q4tmmsilu,
@@ -8640,6 +8775,7 @@ fn init() -> Result<Ctx, String> {
         qkn,
         stateup,
         silu,
+        oai_m3,
         gelu,
         hgate,
         csmaxw,
@@ -15312,6 +15448,42 @@ pub fn q1t_matmat(
     true
 }
 
+/// `MoeJob::act` values admitted by the q4tp MoE kernels.  Code 3 is
+/// deliberately coupled to the frozen MiniMax-M3.1 constants below; it is
+/// not a generic OAI activation selector.
+const MOE_ACT_SILU: u32 = 0;
+const MOE_ACT_SWIGLU_OAI_M3: u32 = 3;
+const MOE_SWIGLU_OAI_M3_LIMIT: f32 = 7.0;
+
+/// The activation contract shared by every job in a q4tp MoE bank.
+///
+/// OAI is admitted only when all jobs explicitly carry both the dedicated
+/// marker and its exact source clamp limit.  This protects the fixed Metal
+/// alpha/beta/limit kernel from being used for a merely similar model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Q4tpMoeAct {
+    Silu,
+    SwiGluOaiM3,
+}
+
+fn q4tp_moe_act(jobs: &[MoeJob]) -> Option<Q4tpMoeAct> {
+    let act = jobs.first()?.act;
+    if jobs.iter().any(|job| job.act != act) {
+        return None;
+    }
+    match act {
+        MOE_ACT_SILU => Some(Q4tpMoeAct::Silu),
+        MOE_ACT_SWIGLU_OAI_M3
+            if jobs
+                .iter()
+                .all(|job| job.swiglu_limit.to_bits() == MOE_SWIGLU_OAI_M3_LIMIT.to_bits()) =>
+        {
+            Some(Q4tpMoeAct::SwiGluOaiM3)
+        }
+        _ => None,
+    }
+}
+
 /// Layer MoE-FFN in a single command buffer: for each selected expert
 /// gate/up-matvec → silu·mul·prescale → down-matvec → axpy into y;
 /// intermediate buffers are GPU-resident, one sync per layer. D5 design:
@@ -15684,16 +15856,121 @@ fn flint_oversized_moe_auto(model: &Arc<CmfModel>, working_set: u64) -> bool {
     working_exceeded || multi_window
 }
 
-/// Explicit selected-view / graph-pager users and exact oversized Flint need
-/// bounded residency. Once that policy applies, never resurrect `file_buffer()`
-/// after the specialised path says it cannot serve this particular block.
-/// Returning false from `moe_block` is the existing exact CPU fallback and,
-/// unlike a full no-copy arena, has no way to wedge the driver under pressure.
+/// The public MiniMax-M3.1 CMF descriptor that is safe for the automatic
+/// selected-expert path.  This is intentionally *more* specific than the
+/// architecture name: a user-produced M3-like CMF, a future upstream M3
+/// revision, or an altered context/operator profile stays on the established
+/// explicit pager/CPU paths until it receives its own review.
+fn minimax_m3_arch_contract(arch: &cortiq_core::ModelArch) -> bool {
+    let Some(moe) = arch.moe.as_ref() else {
+        return false;
+    };
+    arch.arch_name == "minimax_m3_vl"
+        && arch.hidden_size == 6_144
+        && arch.intermediate_size == 12_288
+        && arch.num_layers == 60
+        && arch.num_attention_heads == 64
+        && arch.num_kv_heads == 4
+        && arch.head_dim == 128
+        && arch.vocab_size == 200_064
+        && arch.max_position_embeddings == 2_048
+        && arch.norm_style == cortiq_core::NormStyle::Gemma
+        && arch.hidden_act == "swigluoai"
+        && arch.rope_theta.to_bits() == 10_000_000.0f64.to_bits()
+        && arch.partial_rotary_factor.to_bits() == 0.5f32.to_bits()
+        && arch.prism_hadamard.is_none()
+        && arch.layer_types.len() == 60
+        && arch
+            .layer_types
+            .iter()
+            .all(|layer| matches!(layer, cortiq_core::LayerType::FullAttention))
+        && moe.num_experts == 128
+        && moe.top_k == 4
+        && moe.moe_intermediate_size == 3_072
+        && moe.shared_expert_intermediate_size == Some(3_072)
+        && moe.norm_topk_prob
+        && moe.router_sigmoid
+        && moe
+            .routed_scaling_factor
+            .is_some_and(|scale| scale.to_bits() == 2.0f32.to_bits())
+}
+
+/// MiniMax M3's q4tp profile has a 6144-wide top-4 routed bank plus one
+/// equally wide shared expert, each with a 3072-wide OAI triple.  Require the
+/// complete geometry *and* frozen device activation before enabling automatic
+/// view binding: the selected route must never turn a look-alike MoE into a
+/// broad full-file Metal arena.
+fn minimax_m3_selected_q4tp_jobs(
+    arch: &cortiq_core::ModelArch,
+    jobs: &[MoeJob],
+    out_len: usize,
+) -> bool {
+    const HIDDEN: usize = 6_144;
+    const INTER: usize = 3_072;
+    const SELECTED: usize = 5; // top-4 routed + always-active shared
+
+    minimax_m3_arch_contract(arch)
+        && out_len == HIDDEN
+        && jobs.len() == SELECTED
+        && q4tp_moe_act(jobs) == Some(Q4tpMoeAct::SwiGluOaiM3)
+        // M3's detached shared expert is always active, not router-gated.
+        // Keeping this exact marks the final fifth slot as the real shared
+        // branch rather than merely five coincidentally-shaped routed jobs.
+        && jobs
+            .last()
+            .is_some_and(|shared| shared.w.to_bits() == 1.0f32.to_bits())
+        && moe_jobs_batchable(jobs)
+        && jobs.iter().all(|job| {
+            !job.q1
+                && !job.q4t
+                && job.q4tp
+                && !job.gu_q2
+                && job.down_col.is_empty()
+                && job.gate.3.is_empty()
+                && job.up.3.is_empty()
+                && job.down.3.is_empty()
+                && job.gate.1 == INTER
+                && job.gate.2 == HIDDEN
+                && job.up.1 == INTER
+                && job.up.2 == HIDDEN
+                && job.down.1 == HIDDEN
+                && job.down.2 == INTER
+                && job.xs_gate.len() == HIDDEN
+                && job.xs_up.len() == HIDDEN
+                && job.w.is_finite()
+        })
+}
+
+/// Automatic bounded residency for the exact public MiniMax M3 q4tp profile.
+/// Its 428B source-derived mapping cannot safely be bound as a full Metal
+/// arena on ordinary unified-memory Macs, while one top-4+shared expert block
+/// is only about 140.51 MiB before page rounding.  q8_2f deliberately does
+/// not qualify: no q8 selected-view route exists, so it remains an honest CPU
+/// fallback when the whole arena is unsafe.
+fn minimax_m3_oversized_moe_auto(model: &Arc<CmfModel>, working_set: u64) -> bool {
+    if !minimax_m3_arch_contract(&model.header.arch) {
+        return false;
+    }
+    let model_bytes = model.primary_bytes().len() as u64;
+    let working_exceeded = working_set != 0 && model_bytes > working_set;
+    let max_buffer = max_buffer_bytes();
+    let multi_window = max_buffer != 0 && model_bytes > max_buffer;
+    working_exceeded || multi_window
+}
+
+/// Explicit selected-view / graph-pager users and exact oversized Flint/M3
+/// need bounded residency. Once that policy applies, never resurrect
+/// `file_buffer()` after the specialised path says it cannot serve this
+/// particular block. Returning false from `moe_block` is the existing exact
+/// CPU fallback and, unlike a full no-copy arena, has no way to wedge the
+/// driver under pressure.
 fn oversized_moe_arena_forbidden(model: &Arc<CmfModel>) -> bool {
     let working_set = working_set_bytes();
     let model_bytes = model.primary_bytes().len() as u64;
     let requested_oversize = sparse_moe_enabled() && working_set != 0 && model_bytes > working_set;
-    requested_oversize || flint_oversized_moe_auto(model, working_set)
+    requested_oversize
+        || flint_oversized_moe_auto(model, working_set)
+        || minimax_m3_oversized_moe_auto(model, working_set)
 }
 
 /// Conservative cap for the page-rounded no-copy *views*, not q4tp payload
@@ -15701,15 +15978,30 @@ fn oversized_moe_arena_forbidden(model: &Arc<CmfModel>) -> bool {
 /// cap leaves room for page rounding and unusual expert shapes but prevents a
 /// malformed directory from turning the selected-view path into a broad mmap
 /// binding. An experiment may set `CMF_METAL_SPARSE_MOE_MAX_MB`; an invalid
-/// value never widens the default.
-fn sparse_moe_span_cap_bytes() -> usize {
-    const DEFAULT: usize = 128 << 20;
-    std::env::var("CMF_METAL_SPARSE_MOE_MAX_MB")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
+/// value never widens the selected route's default.
+fn sparse_moe_span_cap_bytes_from(raw: Option<&str>, default: usize) -> usize {
+    raw.and_then(|s| s.parse::<usize>().ok())
         .and_then(|mb| mb.checked_mul(1 << 20))
         .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT)
+        .unwrap_or(default)
+}
+
+fn sparse_moe_span_cap_bytes_with_default(default: usize) -> usize {
+    let raw = std::env::var("CMF_METAL_SPARSE_MOE_MAX_MB").ok();
+    sparse_moe_span_cap_bytes_from(raw.as_deref(), default)
+}
+
+fn sparse_moe_span_cap_bytes() -> usize {
+    sparse_moe_span_cap_bytes_with_default(128 << 20)
+}
+
+/// M3 binds exactly five 28.1015625 MiB triples (= 140.5078125 MiB) before
+/// less than 120 KiB of 4 KiB page rounding across the 15 independent ranges.
+/// 192 MiB keeps a clear hard ceiling
+/// without making the generic 128 MiB selected-view policy wider.  An explicit
+/// `CMF_METAL_SPARSE_MOE_MAX_MB` always wins, including a lower diagnostic cap.
+fn minimax_m3_sparse_moe_span_cap_bytes() -> usize {
+    sparse_moe_span_cap_bytes_with_default(192 << 20)
 }
 
 /// Validate a primary-shard tiled tensor and form the smallest page-aligned
@@ -16074,6 +16366,142 @@ mod flint_sparse_plan_tests {
             .collect::<Vec<_>>();
         jobs.push(job(1_024, true, 1.0));
         assert!(flint_sparse_plan(&jobs, HIDDEN).is_none());
+    }
+
+    #[test]
+    fn q4tp_moe_oai_requires_uniform_frozen_marker_and_limit() {
+        let mut jobs = vec![job(512, false, 0.5), job(512, false, 0.5)];
+        assert_eq!(q4tp_moe_act(&jobs), Some(Q4tpMoeAct::Silu));
+
+        for job in &mut jobs {
+            job.act = MOE_ACT_SWIGLU_OAI_M3;
+            job.swiglu_limit = MOE_SWIGLU_OAI_M3_LIMIT;
+        }
+        assert_eq!(q4tp_moe_act(&jobs), Some(Q4tpMoeAct::SwiGluOaiM3));
+
+        jobs[1].swiglu_limit = f32::from_bits(MOE_SWIGLU_OAI_M3_LIMIT.to_bits() + 1);
+        assert_eq!(
+            q4tp_moe_act(&jobs),
+            None,
+            "nearby limits must not borrow M3's kernel"
+        );
+
+        jobs[1].swiglu_limit = MOE_SWIGLU_OAI_M3_LIMIT;
+        jobs[1].act = MOE_ACT_SILU;
+        assert_eq!(
+            q4tp_moe_act(&jobs),
+            None,
+            "mixed activation banks must decline"
+        );
+    }
+
+    const M3_HIDDEN: usize = 6_144;
+    const M3_INTER: usize = 3_072;
+
+    fn minimax_m3_arch() -> cortiq_core::ModelArch {
+        serde_json::from_value(serde_json::json!({
+            "arch_name": "minimax_m3_vl",
+            "hidden_size": M3_HIDDEN,
+            "intermediate_size": 12_288,
+            "num_layers": 60,
+            "num_attention_heads": 64,
+            "num_kv_heads": 4,
+            "head_dim": 128,
+            "vocab_size": 200_064,
+            "layer_types": vec!["FullAttention"; 60],
+            "rms_norm_eps": 1e-6,
+            "norm_style": "gemma",
+            "rope_theta": 10_000_000.0,
+            "partial_rotary_factor": 0.5,
+            "hidden_act": "swigluoai",
+            "max_position_embeddings": 2_048,
+            "moe": {
+                "num_experts": 128,
+                "top_k": 4,
+                "moe_intermediate_size": M3_INTER,
+                "norm_topk_prob": true,
+                "shared_expert_intermediate_size": M3_INTER,
+                "router_sigmoid": true,
+                "routed_scaling_factor": 2.0
+            }
+        }))
+        .expect("checked MiniMax-M3 architecture fixture")
+    }
+
+    fn minimax_m3_job(w: f32) -> MoeJob<'static> {
+        MoeJob {
+            gate: (0, M3_INTER, M3_HIDDEN, &EMPTY),
+            up: (1, M3_INTER, M3_HIDDEN, &EMPTY),
+            down: (2, M3_HIDDEN, M3_INTER, &EMPTY),
+            xs_gate: vec![0.0; M3_HIDDEN],
+            xs_up: vec![0.0; M3_HIDDEN],
+            down_col: &EMPTY,
+            w,
+            q1: false,
+            q4t: false,
+            q4tp: true,
+            gu_q2: false,
+            swiglu_limit: MOE_SWIGLU_OAI_M3_LIMIT,
+            act: MOE_ACT_SWIGLU_OAI_M3,
+        }
+    }
+
+    #[test]
+    fn minimax_m3_auto_pager_is_exact_q4tp_oai_only() {
+        let arch = minimax_m3_arch();
+        let mut jobs = vec![
+            minimax_m3_job(0.25),
+            minimax_m3_job(0.25),
+            minimax_m3_job(0.25),
+            minimax_m3_job(0.25),
+            minimax_m3_job(1.0),
+        ];
+        assert!(minimax_m3_selected_q4tp_jobs(&arch, &jobs, M3_HIDDEN));
+
+        jobs[4].act = MOE_ACT_SILU;
+        assert!(
+            !minimax_m3_selected_q4tp_jobs(&arch, &jobs, M3_HIDDEN),
+            "mixed OAI/SiLU banks must never auto-admit"
+        );
+        jobs[4].act = MOE_ACT_SWIGLU_OAI_M3;
+        jobs[4].swiglu_limit = 0.0;
+        assert!(
+            !minimax_m3_selected_q4tp_jobs(&arch, &jobs, M3_HIDDEN),
+            "the frozen OAI limit is part of auto-admission"
+        );
+        jobs[4].swiglu_limit = MOE_SWIGLU_OAI_M3_LIMIT;
+        assert!(
+            !minimax_m3_selected_q4tp_jobs(&arch, &jobs, M3_HIDDEN - 1),
+            "wrong output geometry must not borrow M3's view cap"
+        );
+        jobs[4].w = 0.99;
+        assert!(
+            !minimax_m3_selected_q4tp_jobs(&arch, &jobs, M3_HIDDEN),
+            "the always-active shared expert must retain its exact unit weight"
+        );
+
+        let mut changed = arch.clone();
+        changed.moe.as_mut().expect("fixture has MoE").top_k = 3;
+        assert!(
+            !minimax_m3_arch_contract(&changed),
+            "an altered M3 descriptor stays on the explicit pager/CPU path"
+        );
+    }
+
+    #[test]
+    fn minimax_m3_view_cap_is_bounded_and_user_override_wins() {
+        const MIB: usize = 1 << 20;
+        assert_eq!(sparse_moe_span_cap_bytes_from(None, 192 * MIB), 192 * MIB);
+        assert_eq!(
+            sparse_moe_span_cap_bytes_from(Some("160"), 192 * MIB),
+            160 * MIB,
+            "a user can lower the M3 cap for diagnostics"
+        );
+        assert_eq!(
+            sparse_moe_span_cap_bytes_from(Some("bad"), 192 * MIB),
+            192 * MIB,
+            "invalid input must not widen the cap"
+        );
     }
 }
 
@@ -16559,20 +16987,29 @@ fn try_moe_block_jobs_q4tp_sparse(
     jobs: &[MoeJob],
     out: &mut [f32],
 ) -> SparseMoeResult {
-    if !sparse_moe_enabled() {
-        return SparseMoeResult::NotApplicable;
-    }
     let working_set = working_set_bytes();
     let model_bytes = model.primary_bytes().len() as u64;
-    if working_set == 0 || model_bytes <= working_set {
+    // Unlike the generic selected-view experiment, exact oversized M3 q4tp
+    // auto-admits its small top-4+shared route.  All broader profiles still
+    // require an explicit opt-in, and M3 q8 cannot enter because it has no
+    // q8 selected-view kernel.
+    let minimax_auto = minimax_m3_oversized_moe_auto(model, working_set)
+        && minimax_m3_selected_q4tp_jobs(&model.header.arch, jobs, out.len());
+    if !sparse_moe_enabled() && !minimax_auto {
+        return SparseMoeResult::NotApplicable;
+    }
+    if !minimax_auto && (working_set == 0 || model_bytes <= working_set) {
         return SparseMoeResult::NotApplicable;
     }
 
-    // This path is specialised for MiniCPM's q4tp SiLU top-8+shared block.
-    // Other dtypes retain their established implementation rather than being
-    // turned into an unexpected CPU-only path merely because their full model
-    // happens to exceed the recommended working set.
-    if jobs.iter().any(|j| j.gu_q2 || !j.q4tp || j.act != 0) {
+    // This path is specialised for uniform q4tp SiLU or frozen MiniMax-M3.1
+    // OAI banks. Other dtypes retain their established implementation rather
+    // than being turned into an unexpected CPU-only path merely because their
+    // full model happens to exceed the recommended working set.
+    let Some(act) = q4tp_moe_act(jobs) else {
+        return SparseMoeResult::NotApplicable;
+    };
+    if jobs.iter().any(|j| j.gu_q2 || !j.q4tp) {
         return SparseMoeResult::NotApplicable;
     }
     if !moe_jobs_batchable(jobs)
@@ -16627,7 +17064,12 @@ fn try_moe_block_jobs_q4tp_sparse(
         bound_bytes = next;
         ranges.push((gate, up, down, packed));
     }
-    if bound_bytes > sparse_moe_span_cap_bytes()
+    let view_cap = if minimax_auto {
+        minimax_m3_sparse_moe_span_cap_bytes()
+    } else {
+        sparse_moe_span_cap_bytes()
+    };
+    if bound_bytes > view_cap
         || ranges
             .iter()
             .flat_map(|(g, u, d, _)| [g, u, d])
@@ -16635,7 +17077,8 @@ fn try_moe_block_jobs_q4tp_sparse(
     {
         tracing::debug!(
             bound_bytes,
-            cap = sparse_moe_span_cap_bytes(),
+            cap = view_cap,
+            minimax_auto,
             "Metal selected MoE views declined by admission cap"
         );
         return SparseMoeResult::Declined;
@@ -16698,11 +17141,11 @@ fn try_moe_block_jobs_q4tp_sparse(
     let wbuf = get_io(13_000_000_051 + ne, ne * 4);
     let xbuf = get_io(14_000_000_059 + gcols, gcols * 4);
     let abuf = get_io(16_000_000_069 + ne * inter, ne * inter * 4);
-    // MiniCPM-V-4.7 is exactly top-8 plus one shared expert.  Its v9
-    // kernels keep the selected views separate yet fuse each MoE stage, so
-    // skip the materialised per-expert down buffer altogether.  Retain the
-    // generic ladder for a diagnostic model with any other routed count.
-    let views9 = ne == 9;
+    // MiniCPM-V-4.7 is exactly top-8 plus one shared SiLU expert.  Its v9
+    // kernels hard-code that activation, so OAI (including any nine-view
+    // future variant) deliberately remains on the generic selected-view
+    // ladder below.
+    let views9 = ne == 9 && act == Q4tpMoeAct::Silu;
     let dbuf = if views9 {
         None
     } else {
@@ -16776,8 +17219,12 @@ fn try_moe_block_jobs_q4tp_sparse(
             let (gpr_u, rows_u) = ((gcols / GROUP_SIZE) as u32, inter as u32);
             let sgs = 4u64;
             let groups = (inter as u64).div_ceil(sgs * 4);
+            let pso = match act {
+                Q4tpMoeAct::Silu => &c.q4tp_mgu,
+                Q4tpMoeAct::SwiGluOaiM3 => &c.q4tp_mgu_oai,
+            };
             for (i, view) in views.iter().enumerate() {
-                enc.set_compute_pipeline_state(&c.q4tp_mgu);
+                enc.set_compute_pipeline_state(pso);
                 enc.set_buffer(0, Some(&view.gate.buffer), view.gate.offset);
                 enc.set_buffer(1, Some(&xbuf), 0);
                 enc.set_buffer(2, Some(&abuf), (i * inter * 4) as u64);
@@ -16847,6 +17294,7 @@ fn try_moe_block_jobs_q4tp_sparse(
             view_buffers,
             jobs = jobs.len(),
             fused_views9 = views9,
+            minimax_auto,
             "native Metal selected MoE views active"
         );
     }
@@ -16854,8 +17302,8 @@ fn try_moe_block_jobs_q4tp_sparse(
 }
 
 /// The whole expert block in four dispatches: gate+up for every expert,
-/// one fused SiLU, every down, one weighted reduce. `None` = a guard
-/// refused and the caller should walk the per-expert chain.
+/// one fused admitted activation, every down, one weighted reduce. `None` =
+/// a guard refused and the caller should walk the per-expert chain.
 #[allow(clippy::too_many_arguments)]
 fn moe_block_jobs_q4tp(
     c: &Ctx,
@@ -16867,6 +17315,7 @@ fn moe_block_jobs_q4tp(
     out: &mut [f32],
     get_io: &dyn Fn(usize, usize) -> Buffer,
 ) -> Option<()> {
+    let act = q4tp_moe_act(jobs)?;
     if !fbuf.jobs_ok() {
         return None; // more windows than the jobs kernels address
     }
@@ -16955,10 +17404,13 @@ fn moe_block_jobs_q4tp(
         );
         enc.end_encoding();
     }
-    // 2. silu(gate)·up, all experts.
+    // 2. The admitted gate/up activation, all experts.
     {
         let enc = cmd.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&c.moesilu);
+        enc.set_compute_pipeline_state(match act {
+            Q4tpMoeAct::Silu => &c.moesilu,
+            Q4tpMoeAct::SwiGluOaiM3 => &c.moe_oai_m3,
+        });
         enc.set_buffer(0, Some(&gubuf), 0);
         enc.set_buffer(1, Some(&abuf), 0);
         let n_u = inter as u32;
@@ -17018,9 +17470,34 @@ fn moe_block_refused(why: &'static str) {
 }
 
 pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> bool {
-    if jobs.iter().any(|j| j.swiglu_limit > 0.0) {
-        // The Metal kernels do not clamp; refusing is honest, dropping the
-        // clamp would diverge from the CPU path only where it matters.
+    let q4tp_act = q4tp_moe_act(jobs);
+    // The generic ladder below owns one exact OAI triple too.  It is needed
+    // for a dense q8/q8_2f M3 FFN, but deliberately does not grow into a
+    // multi-expert q8 route: only a single, geometrically ordinary gated
+    // triple can select its OAI PSO.
+    let oai_single = q4tp_act == Some(Q4tpMoeAct::SwiGluOaiM3)
+        && jobs.len() == 1
+        && jobs[0].gate.1 != 0
+        && jobs[0].gate.1 == jobs[0].up.1
+        && jobs[0].down.2 == jobs[0].gate.1
+        && jobs[0].xs_gate.len() == jobs[0].gate.2
+        && jobs[0].xs_up.len() == jobs[0].up.2;
+    if jobs.iter().any(|j| j.act != MOE_ACT_SILU) && q4tp_act != Some(Q4tpMoeAct::SwiGluOaiM3) {
+        // Never reinterpret an unknown or mixed device activation as SiLU.
+        // In particular, code 3 must also carry the frozen 7.0 clamp marker.
+        moe_block_refused("unknown or mixed MoE activation");
+        return false;
+    }
+    if q4tp_act == Some(Q4tpMoeAct::SwiGluOaiM3) && !moe_jobs_batchable(jobs) && !oai_single {
+        // The only multi-expert OAI encoder below is the uniform q4tp bank.
+        // Do not let a failed admission reach the old per-expert SiLU ladder.
+        moe_block_refused("OAI MoE needs a uniform q4tp bank or one dense triple");
+        return false;
+    }
+    if jobs.iter().any(|j| j.swiglu_limit > 0.0) && q4tp_act != Some(Q4tpMoeAct::SwiGluOaiM3) {
+        // Ordinary Metal MoE kernels do not clamp; refusing is honest,
+        // dropping the clamp would diverge from the CPU path only where it
+        // matters. The exact OAI route above owns its fixed 7.0 clamp.
         return false;
     }
     let Some(c) = ctx() else {
@@ -17155,6 +17632,12 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
     if moe_jobs_batchable(jobs) {
         if let Some(()) = moe_block_jobs_q4tp(c, &fbuf, jobs, &abs3, inter, hidden, out, &get_io) {
             return true;
+        }
+        if q4tp_act == Some(Q4tpMoeAct::SwiGluOaiM3) {
+            // A valid OAI bank has no per-expert fallback: that ladder's
+            // activation remains ordinary SiLU by design.
+            moe_block_refused("uniform OAI q4tp MoE block");
+            return false;
         }
     }
 
@@ -17319,7 +17802,9 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
             enc.end_encoding();
         }
         {
-            // act = silu(g)·u·col_down (col skipped when the job has none)
+            // `col_down` is part of q8_2f's down projection.  The ordinary
+            // path remains SiLU; the frozen OAI marker may use its ABI twin
+            // only for the one dense triple admitted above.
             let enc = cmd.new_compute_command_encoder();
             enc.set_buffer(0, Some(&g_buf), 0);
             enc.set_buffer(1, Some(&u_buf), 0);
@@ -17329,7 +17814,13 @@ pub fn moe_block(model: &Arc<CmfModel>, jobs: &[MoeJob], out: &mut [f32]) -> boo
             let hc_u = has_col as u32;
             enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
             enc.set_bytes(5, 4, &hc_u as *const u32 as *const std::ffi::c_void);
-            disp_elem(enc, &c.silu, inter);
+            let pso = if q4tp_act == Some(Q4tpMoeAct::SwiGluOaiM3) {
+                debug_assert!(oai_single);
+                &c.oai_m3
+            } else {
+                &c.silu
+            };
+            disp_elem(enc, pso, inter);
             enc.end_encoding();
         }
         {
@@ -23181,6 +23672,89 @@ mod tests {
 
     fn read_f32(b: &Buffer, n: usize) -> Vec<f32> {
         unsafe { std::slice::from_raw_parts(b.contents() as *const f32, n).to_vec() }
+    }
+
+    #[test]
+    fn swiglu_oai_m3_single_and_resident_kernels_match_reference() {
+        unsafe { std::env::set_var("CMF_GPU", "1") };
+        let Some(c) = ctx() else {
+            eprintln!("gpu test skipped: no Metal device");
+            return;
+        };
+        let gate = [-10.0f32, -7.0, -1.0, 0.0, 1.0, 7.0, 10.0, 100.0];
+        let up = [-10.0f32, -7.0, -1.0, 0.0, 1.0, 7.0, 10.0, -10.0];
+        let col = [0.5f32, 1.0, -0.25, 2.0, 0.75, -1.5, 0.125, 1.25];
+        let n = gate.len();
+        let gb = shared_f32(c, &gate);
+        let ub = shared_f32(c, &up);
+        let cb = shared_f32(c, &col);
+        let single_out = shared_f32(c, &vec![f32::NAN; n]);
+
+        let cmd = c.queue.new_command_buffer().to_owned();
+        {
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&c.oai_m3);
+            for (slot, buffer) in [&gb, &ub, &cb, &single_out].iter().enumerate() {
+                enc.set_buffer(slot as u64, Some(*buffer), 0);
+            }
+            let n_u = n as u32;
+            let has_col = 1u32;
+            enc.set_bytes(4, 4, &n_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(5, 4, &has_col as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(32, 1, 1));
+            enc.end_encoding();
+        }
+        cmd.commit();
+        wait_fast_checked(&cmd).expect("single OAI activation dispatch");
+        let single = read_f32(&single_out, n);
+        let reference = |g: f32, u: f32| crate::inference::swiglu_oai(g, u, 1.702, 1.0, Some(7.0));
+        for i in 0..n {
+            let got = single[i];
+            let want = reference(gate[i], up[i]) * col[i];
+            assert!(
+                (got - want).abs() <= 3e-5 * want.abs().max(1.0),
+                "single OAI[{i}]: got {got}, want {want}"
+            );
+        }
+
+        let gate1: Vec<f32> = gate.iter().map(|g| g * -0.5).collect();
+        let up1: Vec<f32> = up.iter().map(|u| u + 0.75).collect();
+        let mut gu = Vec::with_capacity(n * 4);
+        gu.extend_from_slice(&gate);
+        gu.extend_from_slice(&gate1);
+        gu.extend_from_slice(&up);
+        gu.extend_from_slice(&up1);
+        let gub = shared_f32(c, &gu);
+        let resident_out = shared_f32(c, &vec![f32::NAN; n * 2]);
+        let cmd = c.queue.new_command_buffer().to_owned();
+        {
+            let enc = cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&c.moe_oai_m3);
+            enc.set_buffer(0, Some(&gub), 0);
+            enc.set_buffer(1, Some(&resident_out), 0);
+            let (n_u, ne_u) = (n as u32, 2u32);
+            enc.set_bytes(2, 4, &n_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(3, 4, &ne_u as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_threads(MTLSize::new((n * 2) as u64, 1, 1), MTLSize::new(32, 1, 1));
+            enc.end_encoding();
+        }
+        cmd.commit();
+        wait_fast_checked(&cmd).expect("resident OAI activation dispatch");
+        let resident = read_f32(&resident_out, n * 2);
+        for (i, (&got, (&g, &u))) in resident[..n].iter().zip(gate.iter().zip(&up)).enumerate() {
+            let want = reference(g, u);
+            assert!(
+                (got - want).abs() <= 3e-5 * want.abs().max(1.0),
+                "resident OAI[0,{i}]: got {got}, want {want}"
+            );
+        }
+        for (i, (&got, (&g, &u))) in resident[n..].iter().zip(gate1.iter().zip(&up1)).enumerate() {
+            let want = reference(g, u);
+            assert!(
+                (got - want).abs() <= 3e-5 * want.abs().max(1.0),
+                "resident OAI[1,{i}]: got {got}, want {want}"
+            );
+        }
     }
 
     /// The ordinary decode kernel's learned sink is one *value-less*
