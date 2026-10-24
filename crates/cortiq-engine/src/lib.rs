@@ -22,6 +22,7 @@ pub mod fcd_ops;
 pub mod nvg_train;
 pub mod f32_backend;
 pub mod g3n;
+pub mod g4e;
 pub mod gptq_capture;
 pub mod gpu;
 #[cfg(target_os = "macos")]
@@ -58,6 +59,8 @@ pub mod mm_ab;
 pub mod mmh3;
 pub mod mmh3ups;
 pub mod music3;
+pub mod moss_image;
+pub mod moss_imagegen;
 pub mod nystrom;
 pub mod pin;
 pub mod pipeline;

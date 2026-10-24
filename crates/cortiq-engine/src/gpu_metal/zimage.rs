@@ -109,7 +109,10 @@
 
 use crate::gpu::{ZBlockRef, ZGeom, ZPrepareArgs, ZStepArgs};
 use cortiq_core::{CmfModel, TensorDtype};
-use metal::{Buffer, CommandBuffer, ComputeCommandEncoderRef, ComputePipelineState, MTLResourceOptions, MTLSize};
+use metal::{
+    Buffer, CommandBuffer, ComputeCommandEncoderRef, ComputePipelineState, MTLResourceOptions,
+    MTLSize,
+};
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -138,7 +141,10 @@ fn decline(reason: &str) -> bool {
 }
 
 fn env_usize(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 // ───────────────────────────── pipelines ─────────────────────────────
@@ -173,7 +179,11 @@ const FLASH_VARIANTS: &[(&str, &str, usize)] = &[
 fn flash_var(p: &Pipes) -> (&ComputePipelineState, usize) {
     static V: OnceLock<String> = OnceLock::new();
     let want = V.get_or_init(|| std::env::var("CMF_ZI_FLASH").unwrap_or_default());
-    let f = p.flashes.iter().find(|f| f.0 == want).unwrap_or(&p.flashes[0]);
+    let f = p
+        .flashes
+        .iter()
+        .find(|f| f.0 == want)
+        .unwrap_or(&p.flashes[0]);
     (&f.1, f.2)
 }
 
@@ -212,7 +222,9 @@ fn build_pipes(c: &Ctx) -> Result<Pipes, String> {
         .new_library_with_source(ZMSL, &opts)
         .map_err(|e| format!("zimage MSL compile: {e}"))?;
     let pso = |name: &str| -> Result<ComputePipelineState, String> {
-        let f = lib.get_function(name, None).map_err(|e| format!("kernel {name}: {e}"))?;
+        let f = lib
+            .get_function(name, None)
+            .map_err(|e| format!("kernel {name}: {e}"))?;
         c._device
             .new_compute_pipeline_state_with_function(&f)
             .map_err(|e| format!("pipeline {name}: {e}"))
@@ -220,7 +232,15 @@ fn build_pipes(c: &Ctx) -> Result<Pipes, String> {
     Ok(Pipes {
         mms: MM_VARIANTS
             .iter()
-            .map(|&(name, k, bt, bo, threads)| Ok(MmVar { name, pso: pso(k)?, bt, bo, threads }))
+            .map(|&(name, k, bt, bo, threads)| {
+                Ok(MmVar {
+                    name,
+                    pso: pso(k)?,
+                    bt,
+                    bo,
+                    threads,
+                })
+            })
             .collect::<Result<Vec<_>, String>>()?,
         flashes: FLASH_VARIANTS
             .iter()
@@ -250,7 +270,9 @@ fn pipes(c: &Ctx) -> Option<&'static Pipes> {
     match PIPES.get_or_init(|| {
         let p = build_pipes(c)?;
         if !frag_layout_ok(c, &p) {
-            return Err("the simdgroup fragment layout differs from the one the kernels assume".into());
+            return Err(
+                "the simdgroup fragment layout differs from the one the kernels assume".into(),
+            );
         }
         Ok(p)
     }) {
@@ -263,7 +285,9 @@ fn pipes(c: &Ctx) -> Option<&'static Pipes> {
 }
 
 fn frag_layout_ok(c: &Ctx, p: &Pipes) -> bool {
-    let out = c._device.new_buffer(128 * 4, MTLResourceOptions::StorageModeShared);
+    let out = c
+        ._device
+        .new_buffer(128 * 4, MTLResourceOptions::StorageModeShared);
     let cmd = c.queue.new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&p.probe);
@@ -292,8 +316,20 @@ pub struct Guards {
 }
 
 impl Guards {
-    pub const TURBO: Guards = Guards { attn: 0, qkv: 1, ao: 0, ffn: 0, hid: 6 };
-    pub const BASE: Guards = Guards { attn: 6, qkv: 8, ao: 6, ffn: 6, hid: 11 };
+    pub const TURBO: Guards = Guards {
+        attn: 0,
+        qkv: 1,
+        ao: 0,
+        ffn: 0,
+        hid: 6,
+    };
+    pub const BASE: Guards = Guards {
+        attn: 6,
+        qkv: 8,
+        ao: 6,
+        ffn: 6,
+        hid: 11,
+    };
 
     fn for_model(model: &CmfModel) -> Guards {
         let variant = model
@@ -301,9 +337,17 @@ impl Guards {
             .ok()
             .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
             .and_then(|v| v["variant"].as_str().map(str::to_string));
-        let g = if variant.as_deref() == Some("base") { Self::BASE } else { Self::TURBO };
+        let g = if variant.as_deref() == Some("base") {
+            Self::BASE
+        } else {
+            Self::TURBO
+        };
         let e = |k: &str, d: i32| {
-            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d).clamp(0, 14)
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+                .clamp(0, 14)
         };
         Guards {
             attn: e("CMF_ZI_ATTN_SHIFT", g.attn),
@@ -353,8 +397,20 @@ fn f16s(b: &[u8]) -> impl Iterator<Item = f32> + '_ {
 fn build_block(c: &Ctx, model: &CmfModel, r: &ZBlockRef, g: &ZGeom) -> Result<ZBlk, String> {
     let idx = [r.wq, r.wk, r.wv, r.wo, r.w1, r.w3, r.w2];
     let (h, inter) = (g.hidden, g.inter);
-    let shapes = [(h, h), (h, h), (h, h), (h, h), (inter, h), (inter, h), (h, inter)];
-    let mut t = [Tens { abs: 0, rows: 0, cols: 0 }; 7];
+    let shapes = [
+        (h, h),
+        (h, h),
+        (h, h),
+        (h, h),
+        (inter, h),
+        (inter, h),
+        (h, inter),
+    ];
+    let mut t = [Tens {
+        abs: 0,
+        rows: 0,
+        cols: 0,
+    }; 7];
     let mut aux: Vec<f32> = Vec::new();
     let mut rs = [0usize; 7];
     let mut col = [0usize; 7];
@@ -363,9 +419,14 @@ fn build_block(c: &Ctx, model: &CmfModel, r: &ZBlockRef, g: &ZGeom) -> Result<ZB
     for (i, (&ti, &(rows, cols))) in idx.iter().zip(&shapes).enumerate() {
         let e = model.tensors.get(ti).ok_or("tensor index out of range")?;
         if e.shape != [rows, cols] {
-            return Err(format!("{}: shape {:?}, expected [{rows}, {cols}]", e.name, e.shape));
+            return Err(format!(
+                "{}: shape {:?}, expected [{rows}, {cols}]",
+                e.name, e.shape
+            ));
         }
-        let abs = model.entry_abs_offset(e).ok_or_else(|| format!("{}: not in the primary shard", e.name))?;
+        let abs = model
+            .entry_abs_offset(e)
+            .ok_or_else(|| format!("{}: not in the primary shard", e.name))?;
         if abs % 16 != 0 {
             return Err(format!("{}: unaligned ({abs})", e.name));
         }
@@ -380,7 +441,12 @@ fn build_block(c: &Ctx, model: &CmfModel, r: &ZBlockRef, g: &ZGeom) -> Result<ZB
                 rs_data.push(f16s(&bytes[q..]).collect());
                 col_data.push(vec![1.0; cols]);
             }
-            d => return Err(format!("{}: codec {d:?} (the Metal chain reads q8_2f / q8_row)", e.name)),
+            d => {
+                return Err(format!(
+                    "{}: codec {d:?} (the Metal chain reads q8_2f / q8_row)",
+                    e.name
+                ));
+            }
         }
         t[i] = Tens { abs, rows, cols };
     }
@@ -393,7 +459,17 @@ fn build_block(c: &Ctx, model: &CmfModel, r: &ZBlockRef, g: &ZGeom) -> Result<ZB
         aux.extend_from_slice(&col_data[i]);
     }
     let mut norm = [0usize; 6];
-    for (k, v) in [r.norm1, r.norm2, r.ffn_norm1, r.ffn_norm2, r.norm_q, r.norm_k].iter().enumerate() {
+    for (k, v) in [
+        r.norm1,
+        r.norm2,
+        r.ffn_norm1,
+        r.ffn_norm2,
+        r.norm_q,
+        r.norm_k,
+    ]
+    .iter()
+    .enumerate()
+    {
         norm[k] = aux.len();
         aux.extend_from_slice(v);
         while aux.len() % 4 != 0 {
@@ -419,12 +495,17 @@ fn buf_from(c: &Ctx, v: &[f32]) -> Buffer {
 
 fn buf_zeroed(c: &Ctx, bytes: usize) -> Buffer {
     // new_buffer returns zero-filled memory for shared storage
-    c._device.new_buffer(bytes.max(16) as u64, MTLResourceOptions::StorageModeShared)
+    c._device
+        .new_buffer(bytes.max(16) as u64, MTLResourceOptions::StorageModeShared)
 }
 
 fn write_f32(b: &Buffer, off_floats: usize, v: &[f32]) {
     unsafe {
-        std::ptr::copy_nonoverlapping(v.as_ptr(), (b.contents() as *mut f32).add(off_floats), v.len());
+        std::ptr::copy_nonoverlapping(
+            v.as_ptr(),
+            (b.contents() as *mut f32).add(off_floats),
+            v.len(),
+        );
     }
 }
 
@@ -505,7 +586,9 @@ const MAX_PROGS: usize = 2;
 
 fn geom_ok(g: &ZGeom) -> Result<(), String> {
     if g.hd != 128 || g.nh * g.hd != g.hidden || g.hidden % 256 != 0 || g.hidden > 4096 {
-        return Err(format!("geometry {g:?} (the kernels need hd 128, hidden % 256 == 0, ≤ 4096)"));
+        return Err(format!(
+            "geometry {g:?} (the kernels need hd 128, hidden % 256 == 0, ≤ 4096)"
+        ));
     }
     if g.inter % 128 != 0 || g.hidden % 128 != 0 || g.patch_dim != 64 {
         return Err(format!("geometry {g:?} (inter % 128, patch 64)"));
@@ -525,11 +608,16 @@ fn ensure_dev<'s>(
     ctx_blocks: Option<&[ZBlockRef]>,
 ) -> Result<&'s mut ZDev, String> {
     geom_ok(geom)?;
-    if st.0.as_ref().is_some_and(|d| d.uid != model.uid() || d.geom != *geom) {
+    if st
+        .0
+        .as_ref()
+        .is_some_and(|d| d.uid != model.uid() || d.geom != *geom)
+    {
         st.0 = None;
     }
     if st.0.is_none() {
-        let (arena, _len) = super::file_buffer(c, model).ok_or("the file mapping cannot be wrapped as a Metal buffer")?;
+        let (arena, _len) = super::file_buffer(c, model)
+            .ok_or("the file mapping cannot be wrapped as a Metal buffer")?;
         st.0 = Some(ZDev {
             uid: model.uid(),
             _model: model.clone(),
@@ -653,7 +741,11 @@ struct PFi {
 }
 
 fn set_p<T>(enc: &ComputeCommandEncoderRef, idx: u64, v: &T) {
-    enc.set_bytes(idx, std::mem::size_of::<T>() as u64, v as *const T as *const c_void);
+    enc.set_bytes(
+        idx,
+        std::mem::size_of::<T>() as u64,
+        v as *const T as *const c_void,
+    );
 }
 
 /// Command-buffer recorder: one encoder per command buffer, a new buffer
@@ -664,7 +756,11 @@ struct Rec<'a> {
     c: &'a Ctx,
     prof: bool,
     done: Vec<(&'static str, CommandBuffer)>,
-    cur: Option<(CommandBuffer, Option<metal::ComputeCommandEncoder>, &'static str)>,
+    cur: Option<(
+        CommandBuffer,
+        Option<metal::ComputeCommandEncoder>,
+        &'static str,
+    )>,
 }
 
 impl<'a> Rec<'a> {
@@ -889,13 +985,21 @@ impl Enc<'_, '_> {
         for s in 0..3 {
             let t = blk.t[ts[s.min(ts.len() - 1)]];
             arena.bind(enc, s as u64, t.abs);
-            enc.set_buffer(3 + s as u64, Some(&blk.aux), (blk.rs[ts[s.min(ts.len() - 1)]] * 4) as u64);
+            enc.set_buffer(
+                3 + s as u64,
+                Some(&blk.aux),
+                (blk.rs[ts[s.min(ts.len() - 1)]] * 4) as u64,
+            );
         }
         enc.set_buffer(6, Some(x), 0);
         enc.set_buffer(7, Some(y), 0);
         set_p(enc, 8, &pm);
         enc.dispatch_thread_groups(
-            MTLSize::new(n.div_ceil(mv.bt) as u64, (rg / mv.bo) as u64, ts.len() as u64),
+            MTLSize::new(
+                n.div_ceil(mv.bt) as u64,
+                (rg / mv.bo) as u64,
+                ts.len() as u64,
+            ),
             MTLSize::new(mv.threads, 1, 1),
         );
         if rg < rows {
@@ -916,8 +1020,18 @@ impl Enc<'_, '_> {
         a: &Acts,
         row0: usize,
         n: usize,
-        post: Option<(&ZBlk, usize /*norm idx*/, Option<(&Buffer, usize)> /*gate*/)>,
-        pre: Option<(&ZBlk, usize /*norm idx*/, Option<(&Buffer, usize)> /*scale*/, &[usize] /*col tensors*/, f32)>,
+        post: Option<(
+            &ZBlk,
+            usize,                    /*norm idx*/
+            Option<(&Buffer, usize)>, /*gate*/
+        )>,
+        pre: Option<(
+            &ZBlk,
+            usize,                    /*norm idx*/
+            Option<(&Buffer, usize)>, /*scale*/
+            &[usize],                 /*col tensors*/
+            f32,
+        )>,
     ) {
         let h = self.d.geom.hidden;
         let eps = self.d.geom.eps;
@@ -1003,7 +1117,20 @@ impl Enc<'_, '_> {
         let md = |k: usize| mods.map(|(b, o)| (b, o + k * h));
         let sl = a.alloc * h;
         // qkv
-        self.gemm(blk, &[TQ, TK, TV], &a.xn, &[0, sl, 2 * sl], h, &a.panel, &[0, h, 2 * h], 3 * h, row0, n, true, p2(gd.attn - gd.qkv));
+        self.gemm(
+            blk,
+            &[TQ, TK, TV],
+            &a.xn,
+            &[0, sl, 2 * sl],
+            h,
+            &a.panel,
+            &[0, h, 2 * h],
+            3 * h,
+            row0,
+            n,
+            true,
+            p2(gd.attn - gd.qkv),
+        );
         self.amax(&a.panel, row0 * 3 * h, n * 3 * h, 1);
         {
             let p = self.p;
@@ -1045,15 +1172,50 @@ impl Enc<'_, '_> {
                 set_p(enc, 3, &pf);
                 let nt = (pf.n_img + pf.n_cap) as u64;
                 let qt = 8 * nsg as u64;
-                enc.dispatch_thread_groups(MTLSize::new(nt.div_ceil(qt), g.nh as u64, 1), MTLSize::new(32 * nsg as u64, 1, 1));
+                enc.dispatch_thread_groups(
+                    MTLSize::new(nt.div_ceil(qt), g.nh as u64, 1),
+                    MTLSize::new(32 * nsg as u64, 1, 1),
+                );
             }
         }
         self.amax(&a.attn, row0 * h, n * h, 2);
-        self.gemm(blk, &[TO], &a.attn, &[0], h, &a.y, &[0], h, row0, n, false, p2(gd.ao));
-        self.rowop(a, row0, n, Some((blk, 1, md(1))), Some((blk, 2, md(2), &[T1, T3], p2(-gd.ffn))));
+        self.gemm(
+            blk,
+            &[TO],
+            &a.attn,
+            &[0],
+            h,
+            &a.y,
+            &[0],
+            h,
+            row0,
+            n,
+            false,
+            p2(gd.ao),
+        );
+        self.rowop(
+            a,
+            row0,
+            n,
+            Some((blk, 1, md(1))),
+            Some((blk, 2, md(2), &[T1, T3], p2(-gd.ffn))),
+        );
         self.amax(&a.xn, row0 * h, n * h, 3);
         let gl = a.alloc * inter;
-        self.gemm(blk, &[T1, T3], &a.xn, &[0, sl], h, &a.gu, &[0, gl], inter, row0, n, false, p2(gd.ffn));
+        self.gemm(
+            blk,
+            &[T1, T3],
+            &a.xn,
+            &[0, sl],
+            h,
+            &a.gu,
+            &[0, gl],
+            inter,
+            row0,
+            n,
+            false,
+            p2(gd.ffn),
+        );
         {
             let p = self.p;
             let ps = PSw {
@@ -1070,13 +1232,35 @@ impl Enc<'_, '_> {
             enc.set_buffer(1, Some(&a.h), 0);
             enc.set_buffer(2, Some(&blk.aux), (blk.col[T2] * 4) as u64);
             set_p(enc, 3, &ps);
-            enc.dispatch_thread_groups(MTLSize::new((ps.n4 as u64).div_ceil(256), 1, 1), MTLSize::new(256, 1, 1));
+            enc.dispatch_thread_groups(
+                MTLSize::new((ps.n4 as u64).div_ceil(256), 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
         }
         self.amax(&a.h, row0 * inter, n * inter, 4);
-        self.gemm(blk, &[T2], &a.h, &[0], inter, &a.y, &[0], h, row0, n, false, p2(gd.hid));
+        self.gemm(
+            blk,
+            &[T2],
+            &a.h,
+            &[0],
+            inter,
+            &a.y,
+            &[0],
+            h,
+            row0,
+            n,
+            false,
+            p2(gd.hid),
+        );
         match next {
             Some((nb, nmods)) => {
-                self.rowop(a, row0, n, Some((blk, 3, md(3))), Some((nb, 0, nmods, &[TQ, TK, TV], p2(-gd.attn))));
+                self.rowop(
+                    a,
+                    row0,
+                    n,
+                    Some((blk, 3, md(3))),
+                    Some((nb, 0, nmods, &[TQ, TK, TV], p2(-gd.attn))),
+                );
                 self.amax(&a.xn, row0 * h, n * h, 0);
             }
             None => self.rowop(a, row0, n, Some((blk, 3, md(3))), None),
@@ -1106,7 +1290,14 @@ pub(crate) fn preload(
 ) -> bool {
     let Some((c, _)) = device() else { return false };
     let mut st = ZSTATE.lock().unwrap();
-    match ensure_dev(&mut st, c, model, geom, Some((noise_refiner, layers)), Some(context_refiner)) {
+    match ensure_dev(
+        &mut st,
+        c,
+        model,
+        geom,
+        Some((noise_refiner, layers)),
+        Some(context_refiner),
+    ) {
         Ok(_) => true,
         Err(e) => decline(&e),
     }
@@ -1137,7 +1328,14 @@ pub(crate) fn prepare(a: &ZPrepareArgs) -> bool {
         }
     }
     let mut st = ZSTATE.lock().unwrap();
-    let d = match ensure_dev(&mut st, c, a.model, &g, Some((a.noise_refiner, a.layers)), None) {
+    let d = match ensure_dev(
+        &mut st,
+        c,
+        a.model,
+        &g,
+        Some((a.noise_refiner, a.layers)),
+        None,
+    ) {
         Ok(d) => d,
         Err(e) => return decline(&e),
     };
@@ -1227,7 +1425,9 @@ pub(crate) fn step(a: &mut ZStepArgs) -> bool {
     let Some((c, p)) = device() else { return false };
     let mut st = ZSTATE.lock().unwrap();
     let Some(d) = st.0.as_mut() else { return false };
-    let Some(pi) = d.progs.iter().position(|p| p.key == a.key) else { return false };
+    let Some(pi) = d.progs.iter().position(|p| p.key == a.key) else {
+        return false;
+    };
     let d: &ZDev = d;
     let pr = &d.progs[pi];
     let g = d.geom;
@@ -1261,7 +1461,12 @@ pub(crate) fn step(a: &mut ZStepArgs) -> bool {
             p,
             d,
             amax: None,
-            cpu: (frac > 0.0).then(|| CpuPlan { frac, ev: zevent(c), ev2: zevent2(c), jobs: Vec::new() }),
+            cpu: (frac > 0.0).then(|| CpuPlan {
+                frac,
+                ev: zevent(c),
+                ev2: zevent2(c),
+                jobs: Vec::new(),
+            }),
         };
         // embed (every item's image rows)
         {
@@ -1310,14 +1515,33 @@ pub(crate) fn step(a: &mut ZStepArgs) -> bool {
                     enc.set_buffer(0, Some(&pr.cap), 0);
                     enc.set_buffer(1, Some(&ac.x), (img_rows * h * 4) as u64);
                     set_p(enc, 2, &n4);
-                    enc.dispatch_thread_groups(MTLSize::new((n4 as u64).div_ceil(256), 1, 1), MTLSize::new(256, 1, 1));
+                    enc.dispatch_thread_groups(
+                        MTLSize::new((n4 as u64).div_ceil(256), 1, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
                 }
                 let n = if bi < nr { img_rows } else { ac.rows };
-                e.rowop(ac, 0, n, None, Some((blk, 0, mo(bi).map(|(b, o)| (b, o)), &[TQ, TK, TV], p2(-d.guards.attn))));
+                e.rowop(
+                    ac,
+                    0,
+                    n,
+                    None,
+                    Some((
+                        blk,
+                        0,
+                        mo(bi).map(|(b, o)| (b, o)),
+                        &[TQ, TK, TV],
+                        p2(-d.guards.attn),
+                    )),
+                );
                 e.amax(&ac.xn, 0, n * h, 0);
             }
             let refiner = bi < nr;
-            let (n, rope) = if refiner { (img_rows, rope_i) } else { (ac.rows, rope_j) };
+            let (n, rope) = if refiner {
+                (img_rows, rope_i)
+            } else {
+                (ac.rows, rope_j)
+            };
             let segs: Vec<PFa> = if refiner {
                 segs_img.clone()
             } else {
@@ -1360,7 +1584,10 @@ pub(crate) fn step(a: &mut ZStepArgs) -> bool {
             enc.set_buffer(3, Some(fin), (64 * h * 4) as u64);
             enc.set_buffer(4, Some(&pr.out), 0);
             set_p(enc, 5, &pf);
-            enc.dispatch_thread_groups(MTLSize::new(pr.n_img as u64, 1, 1), MTLSize::new(256, 1, 1));
+            enc.dispatch_thread_groups(
+                MTLSize::new(pr.n_img as u64, 1, 1),
+                MTLSize::new(256, 1, 1),
+            );
         }
         if let Some(plan) = e.cpu.take() {
             jobs = plan.jobs;
@@ -1401,9 +1628,12 @@ pub(crate) fn step(a: &mut ZStepArgs) -> bool {
         }
         eprintln!("zi amax worst (stored, after guards): {:?}", worst);
     }
-    let out = unsafe { std::slice::from_raw_parts(pr.out.contents() as *const f32, ni * pr.n_img * pd) };
+    let out =
+        unsafe { std::slice::from_raw_parts(pr.out.contents() as *const f32, ni * pr.n_img * pd) };
     if out.iter().any(|v| !v.is_finite()) {
-        return decline("the device output is not finite (an f16 overflow: raise the CMF_ZI_*_SHIFT guards)");
+        return decline(
+            "the device output is not finite (an f16 overflow: raise the CMF_ZI_*_SHIFT guards)",
+        );
     }
     a.out.copy_from_slice(&out[..pr.n_img * pd]);
     if let Some(on) = a.out_neg.as_mut() {
@@ -1461,12 +1691,33 @@ pub(crate) fn refine_caption(
     }];
     let mut rec = Rec::new(c);
     {
-        let mut e = Enc { rec: &mut rec, p, d, amax: None, cpu: None };
+        let mut e = Enc {
+            rec: &mut rec,
+            p,
+            d,
+            amax: None,
+            cpu: None,
+        };
         let nbk = d.ctx_blocks.len();
-        e.rowop(&acts, 0, n, None, Some((&d.ctx_blocks[0], 0, None, &[TQ, TK, TV], p2(-d.guards.attn))));
+        e.rowop(
+            &acts,
+            0,
+            n,
+            None,
+            Some((&d.ctx_blocks[0], 0, None, &[TQ, TK, TV], p2(-d.guards.attn))),
+        );
         for bi in 0..nbk {
             let next = (bi + 1 < nbk).then(|| (&d.ctx_blocks[bi + 1], None));
-            e.block(&acts, &d.ctx_blocks[bi], 0, n, (&rc, &rs), &segs, None, next);
+            e.block(
+                &acts,
+                &d.ctx_blocks[bi],
+                0,
+                n,
+                (&rc, &rs),
+                &segs,
+                None,
+                next,
+            );
         }
     }
     if !rec.finish() {
@@ -1507,8 +1758,20 @@ pub fn bench_mma_peak(ty: &str, reps: usize) -> Option<f64> {
     let opts = metal::CompileOptions::new();
     opts.set_language_version(metal::MTLLanguageVersion::V3_0);
     let lib = c._device.new_library_with_source(ZMSL, &opts).ok()?;
-    let f = lib.get_function(match ty { "f" => "zi_peak_f", "hh" => "zi_peak_hh", _ => "zi_peak_h" }, None).ok()?;
-    let pso = c._device.new_compute_pipeline_state_with_function(&f).ok()?;
+    let f = lib
+        .get_function(
+            match ty {
+                "f" => "zi_peak_f",
+                "hh" => "zi_peak_hh",
+                _ => "zi_peak_h",
+            },
+            None,
+        )
+        .ok()?;
+    let pso = c
+        ._device
+        .new_compute_pipeline_state_with_function(&f)
+        .ok()?;
     let out = buf_zeroed(c, 1 << 20);
     let iters = 4096u32;
     let tgs = 2048u64;
@@ -1535,7 +1798,13 @@ pub fn bench_mma_peak(ty: &str, reps: usize) -> Option<f64> {
 /// median), variant "base" or "wt". Returns (min ms, median ms, rel err vs
 /// an f64 host reference on a sample of outputs).
 #[doc(hidden)]
-pub fn bench_gemm(rows: usize, k: usize, n: usize, reps: usize, variant: &str) -> Option<(f64, f64, f64)> {
+pub fn bench_gemm(
+    rows: usize,
+    k: usize,
+    n: usize,
+    reps: usize,
+    variant: &str,
+) -> Option<(f64, f64, f64)> {
     let c = super::ctx()?;
     let p = pipes(c)?;
     let mv = p.mms.iter().find(|m| m.name == variant)?;
@@ -1551,9 +1820,17 @@ pub fn bench_gemm(rows: usize, k: usize, n: usize, reps: usize, variant: &str) -
     let xh: Vec<u16> = (0..(n.div_ceil(128) * 128 + 128) * k)
         .map(|_| cortiq_core::quant::f32_to_f16(((rnd() % 2001) as f32 - 1000.0) / 1000.0))
         .collect();
-    let wb = c._device.new_buffer_with_data(wq.as_ptr() as *const c_void, wq.len() as u64, MTLResourceOptions::StorageModeShared);
+    let wb = c._device.new_buffer_with_data(
+        wq.as_ptr() as *const c_void,
+        wq.len() as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
     let rb = buf_from(c, &rs);
-    let xb = c._device.new_buffer_with_data(xh.as_ptr() as *const c_void, (xh.len() * 2) as u64, MTLResourceOptions::StorageModeShared);
+    let xb = c._device.new_buffer_with_data(
+        xh.as_ptr() as *const c_void,
+        (xh.len() * 2) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
     let yb = buf_zeroed(c, n * rows * 4);
     let pm = PMm {
         n: n as u32,
@@ -1577,7 +1854,10 @@ pub fn bench_gemm(rows: usize, k: usize, n: usize, reps: usize, variant: &str) -
         enc.set_buffer(6, Some(&xb), 0);
         enc.set_buffer(7, Some(&yb), 0);
         set_p(enc, 8, &pm);
-        enc.dispatch_thread_groups(MTLSize::new(n.div_ceil(mv.bt) as u64, (rows / mv.bo) as u64, 1), MTLSize::new(mv.threads, 1, 1));
+        enc.dispatch_thread_groups(
+            MTLSize::new(n.div_ceil(mv.bt) as u64, (rows / mv.bo) as u64, 1),
+            MTLSize::new(mv.threads, 1, 1),
+        );
         enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
@@ -1634,8 +1914,15 @@ pub fn bench_flash(n: usize, reps: usize, variant: &str) -> Option<(f64, f64, f6
             if col < h { v * qmul } else { v }
         })
         .collect();
-    let panel: Vec<u16> = panel_f.iter().map(|&v| cortiq_core::quant::f32_to_f16(v)).collect();
-    let pb = c._device.new_buffer_with_data(panel.as_ptr() as *const c_void, (panel.len() * 2) as u64, MTLResourceOptions::StorageModeShared);
+    let panel: Vec<u16> = panel_f
+        .iter()
+        .map(|&v| cortiq_core::quant::f32_to_f16(v))
+        .collect();
+    let pb = c._device.new_buffer_with_data(
+        panel.as_ptr() as *const c_void,
+        (panel.len() * 2) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
     let ob = buf_zeroed(c, n * h * 2);
     let colo = buf_from(c, &vec![1.0f32; h]);
     let pf = PFa {
@@ -1657,7 +1944,10 @@ pub fn bench_flash(n: usize, reps: usize, variant: &str) -> Option<(f64, f64, f6
         enc.set_buffer(1, Some(&ob), 0);
         enc.set_buffer(2, Some(&colo), 0);
         set_p(enc, 3, &pf);
-        enc.dispatch_thread_groups(MTLSize::new(n.div_ceil(8 * nsg) as u64, nh as u64, 1), MTLSize::new(32 * nsg as u64, 1, 1));
+        enc.dispatch_thread_groups(
+            MTLSize::new(n.div_ceil(8 * nsg) as u64, nh as u64, 1),
+            MTLSize::new(32 * nsg as u64, 1, 1),
+        );
         enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
@@ -1672,14 +1962,19 @@ pub fn bench_flash(n: usize, reps: usize, variant: &str) -> Option<(f64, f64, f6
         let head = (sidx * 13) % nh;
         let sc: Vec<f64> = (0..n)
             .map(|j| {
-                (0..128).map(|d| hf(row * 3 * h + head * 128 + d) * hf(j * 3 * h + h + head * 128 + d)).sum::<f64>()
+                (0..128)
+                    .map(|d| hf(row * 3 * h + head * 128 + d) * hf(j * 3 * h + h + head * 128 + d))
+                    .sum::<f64>()
             })
             .collect();
         let mx = sc.iter().cloned().fold(f64::MIN, f64::max);
         let w: Vec<f64> = sc.iter().map(|s| (2f64).powf(s - mx)).collect();
         let l: f64 = w.iter().sum();
         for d in 0..128 {
-            let r: f64 = (0..n).map(|j| w[j] * hf(j * 3 * h + 2 * h + head * 128 + d)).sum::<f64>() / l;
+            let r: f64 = (0..n)
+                .map(|j| w[j] * hf(j * 3 * h + 2 * h + head * 128 + d))
+                .sum::<f64>()
+                / l;
             let g = cortiq_core::quant::f16_to_f32(out[row * h + head * 128 + d]) as f64;
             dd += (g - r).powi(2);
             rr += r * r;
