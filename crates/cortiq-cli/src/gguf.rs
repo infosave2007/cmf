@@ -894,16 +894,56 @@ fn dequant_iq4_xs(raw: &[u8], n: usize) -> Vec<f32> {
 }
 
 /// ggml tensor name → HF name (`None` = skip, e.g. rope freqs).
-fn map_name(g: &str) -> Option<String> {
+fn map_name(arch: &str, g: &str) -> Option<String> {
+    // Gemma-4 (llama.cpp arch name == HF model_type) names its globals
+    // differently and uses the four-norm sandwich; the generic mapping
+    // below is the llama-family one.
+    let is_g4 = arch == "gemma4";
     match g {
         "token_embd.weight" => return Some("model.embed_tokens.weight".into()),
         "output_norm.weight" => return Some("model.norm.weight".into()),
         "output.weight" => return Some("lm_head.weight".into()),
+        // Gemma-4 E-series per-layer-input (PLE) globals.
+        "per_layer_token_embd.weight" if is_g4 => {
+            return Some("model.embed_tokens_per_layer.weight".into())
+        }
+        "per_layer_model_proj.weight" if is_g4 => {
+            return Some("model.per_layer_model_projection.weight".into())
+        }
+        "per_layer_proj_norm.weight" if is_g4 => {
+            return Some("model.per_layer_projection_norm.weight".into())
+        }
+        // Deliberately unmapped on every arch: the full layers'
+        // proportional-RoPE freq mask rides in the header
+        // (`global_partial_rotary_factor`), not as a tensor.
+        "rope_freqs.weight" => return None,
         _ => {}
     }
     let rest = g.strip_prefix("blk.")?;
     let (idx, suffix) = rest.split_once('.')?;
-    let mapped = match suffix {
+    let mapped: &str = if is_g4 {
+        // Gemma-4: pre-FFN norm is llama.cpp's `ffn_norm`, the post-FFN
+        // norm is `post_ffw_norm`, and the PLE/output-scale tensors carry
+        // their own spellings (HF `layer_scalar` is a bare buffer).
+        match suffix {
+            "ffn_norm.weight" => "pre_feedforward_layernorm.weight",
+            "post_attention_norm.weight" => "post_attention_layernorm.weight",
+            "post_ffw_norm.weight" => "post_feedforward_layernorm.weight",
+            "inp_gate.weight" => "per_layer_input_gate.weight",
+            "proj.weight" => "per_layer_projection.weight",
+            "post_norm.weight" => "post_per_layer_input_norm.weight",
+            "layer_output_scale.weight" => "layer_scalar",
+            other => map_suffix(other)?,
+        }
+    } else {
+        map_suffix(suffix)?
+    };
+    Some(format!("model.layers.{idx}.{mapped}"))
+}
+
+/// The llama-family (llama/mistral/qwen2-class) blk.* suffix table.
+fn map_suffix(suffix: &str) -> Option<&'static str> {
+    Some(match suffix {
         "attn_norm.weight" => "input_layernorm.weight",
         "ffn_norm.weight" => "post_attention_layernorm.weight",
         "attn_q.weight" => "self_attn.q_proj.weight",
@@ -938,11 +978,14 @@ fn map_name(g: &str) -> Option<String> {
         "ffn_up_shexp.weight" => "mlp.shared_expert.up_proj.weight",
         "ffn_down_shexp.weight" => "mlp.shared_expert.down_proj.weight",
         _ => return None,
-    };
-    Some(format!("model.layers.{idx}.{mapped}"))
+    })
 }
 
-fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::Result<ModelArch> {
+fn arch_from_md(
+    gguf: &Gguf,
+    md: &BTreeMap<String, Val>,
+    tensors: &[GgufTensor],
+) -> anyhow::Result<ModelArch> {
     let arch = md
         .get("general.architecture")
         .and_then(|v| v.as_str())
@@ -968,10 +1011,13 @@ fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::R
         .unwrap_or(0);
     let is_q35 = arch.starts_with("qwen35");
     let is_gemma2 = arch == "gemma2";
+    let is_gemma4 = arch == "gemma4";
     // llama.cpp spells Tencent's dense family `hunyuan-dense`; the engine
     // keys the RoPE-then-norm attention order on the HF model_type.
     let is_hunyuan_dense = arch == "hunyuan-dense";
-    let norm_style = if arch.contains("gemma") || is_q35 {
+    // Gemma-4 went back to plain x̂·w (Gemma3nRMSNorm lineage) — only
+    // gemma-2/3 keep the zero-centered x̂·(1+w) style.
+    let norm_style = if (arch.contains("gemma") && !is_gemma4) || is_q35 {
         // qwen3.5 / qwen3.6 use zero-centered x̂·(1+w) norms.
         NormStyle::Gemma
     } else {
@@ -981,6 +1027,7 @@ fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::R
     // from tensor PRESENCE (full-attention layers carry attn_q, GDN
     // layers carry attn_qkv + ssm_*) — more robust than trusting the
     // full_attention_interval semantics.
+    let mut g4_period: Option<usize> = None;
     let layer_types = if is_q35 {
         (0..n_layers)
             .map(|i| {
@@ -994,10 +1041,55 @@ fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::R
                 }
             })
             .collect()
+    } else if is_gemma4 {
+        // Per-layer sliding schedule from the bool array
+        // `attention.sliding_window_pattern` (true = sliding), folded
+        // into the period the runtime models (full layers at every
+        // p-th position); irregular schedules are refused, not guessed.
+        let Some(Val::IntArr(pat)) = g("attention.sliding_window_pattern") else {
+            anyhow::bail!("{arch}: missing attention.sliding_window_pattern");
+        };
+        if pat.len() != n_layers {
+            anyhow::bail!(
+                "{arch}: attention.sliding_window_pattern has {} entries, expected {n_layers}",
+                pat.len()
+            );
+        }
+        let fulls: Vec<usize> = pat
+            .iter()
+            .enumerate()
+            .filter(|&(_, &s)| s == 0)
+            .map(|(i, _)| i)
+            .collect();
+        let p = fulls.first().map(|f| f + 1).unwrap_or(0);
+        if p == 0
+            || fulls.iter().enumerate().any(|(k, &i)| i != p * (k + 1) - 1)
+            || (n_layers / p) != fulls.len()
+        {
+            anyhow::bail!("{arch}: irregular full/sliding layer schedule not supported");
+        }
+        g4_period = Some(p);
+        pat.iter()
+            .map(|&s| {
+                if s != 0 {
+                    LayerType::SlidingAttention
+                } else {
+                    LayerType::FullAttention
+                }
+            })
+            .collect()
     } else {
         vec![LayerType::FullAttention; n_layers]
     };
-    let head_dim = gu("attention.key_length").unwrap_or(hidden / n_heads.max(1));
+    let head_dim = if is_gemma4 {
+        // Base geometry = the sliding layers; the full layers ride
+        // `attention.key_length` as global_head_dim in the header.
+        gu("attention.key_length_swa")
+            .or(gu("attention.key_length"))
+            .unwrap_or(hidden / n_heads.max(1))
+    } else {
+        gu("attention.key_length").unwrap_or(hidden / n_heads.max(1))
+    };
     let moe = if is_q35 {
         gu("expert_count").filter(|&n| n > 0).map(|ne| MoeConfig {
             num_experts: ne,
@@ -1019,6 +1111,55 @@ fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::R
     let ssm_vheads = match (gu("ssm.inner_size"), ssm_state) {
         (Some(inner), Some(st)) if st > 0 => Some(inner / st),
         _ => None,
+    };
+    // Gemma-4 E-series: PLE + shared-KV ride the `g3n` config block
+    // (altup/laurel zeroed — gemma4 has neither; the loader keys the
+    // dedicated g4e stack on arch_name).
+    let ple_dim = gu("embedding_length_per_layer_input").unwrap_or(0);
+    let kv_shared = gu("attention.shared_kv_layers").unwrap_or(0);
+    if is_gemma4 && (ple_dim > 0) != (kv_shared > 0) {
+        anyhow::bail!(
+            "{arch}: E-series needs both embedding_length_per_layer_input and \
+             attention.shared_kv_layers (got ple_dim={ple_dim}, shared_kv_layers={kv_shared})"
+        );
+    }
+    let g3n_cfg = (is_gemma4 && ple_dim > 0).then(|| cortiq_core::G3nConfig {
+        altup_num_inputs: 0,
+        laurel_rank: 0,
+        ple_dim,
+        ple_vocab: vocab,
+        num_kv_shared_layers: kv_shared,
+        activation_sparsity: Vec::new(),
+    });
+    // Proportional partial rotary of the full layers, read from the
+    // rope_freqs frequency mask: nonzero slots are the rotating
+    // frequencies, so prf = 2·nonzero/ghd (0.25 on E4B = 64 of 256).
+    let g4_global_prf: Option<f32> = if is_gemma4 {
+        let ghd = gu("attention.key_length").unwrap_or(0);
+        let t = tensors
+            .iter()
+            .find(|t| t.name == "rope_freqs.weight")
+            .ok_or_else(|| anyhow::anyhow!("{arch}: missing rope_freqs.weight (proportional RoPE)"))?;
+        let numel: usize = t.dims.iter().map(|&d| d as usize).product();
+        if t.ggml_type != 0 {
+            anyhow::bail!("{arch}: rope_freqs.weight is not F32");
+        }
+        let start = gguf.data_start + usize::try_from(t.offset)?;
+        let end = start + numel * 4;
+        let raw = gguf
+            .bytes
+            .get(start..end)
+            .ok_or_else(|| anyhow::anyhow!("{arch}: rope_freqs.weight data out of range"))?;
+        let nz = raw
+            .chunks_exact(4)
+            .filter(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) != 0.0)
+            .count();
+        if ghd == 0 || nz == 0 || nz * 2 > ghd {
+            anyhow::bail!("{arch}: implausible rope_freqs mask ({nz} rotating of {ghd} dims)");
+        }
+        Some(2.0 * nz as f32 / ghd as f32)
+    } else {
+        None
     };
     Ok(ModelArch {
         arch_name: if is_q35 {
@@ -1045,9 +1186,15 @@ fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::R
             .unwrap_or(10_000.0),
         // No separate output head in the file = tied embeddings.
         tie_word_embeddings: !tensors.iter().any(|t| t.name == "output.weight"),
-        partial_rotary_factor: match gu("rope.dimension_count") {
-            Some(rd) if head_dim > 0 && rd < head_dim => rd as f32 / head_dim as f32,
-            _ => 1.0,
+        partial_rotary_factor: if is_gemma4 {
+            gu("rope.dimension_count_swa")
+                .map(|rd| rd as f32 / head_dim as f32)
+                .unwrap_or(1.0)
+        } else {
+            match gu("rope.dimension_count") {
+                Some(rd) if head_dim > 0 && rd < head_dim => rd as f32 / head_dim as f32,
+                _ => 1.0,
+            }
         },
         yarn: None,
         attention_heads_per_layer: None,
@@ -1074,36 +1221,55 @@ fn arch_from_md(md: &BTreeMap<String, Val>, tensors: &[GgufTensor]) -> anyhow::R
         linear_num_value_heads: ssm_vheads,
         linear_key_head_dim: ssm_state,
         linear_value_head_dim: ssm_state,
-        hidden_act: "silu".into(),
-        embed_multiplier: 1.0,
-        query_pre_attn_scalar: None,
-        sliding_window: if is_gemma2 {
+        hidden_act: if is_gemma4 {
+            // config.hidden_activation = gelu_pytorch_tanh.
+            "gelu_tanh".into()
+        } else {
+            "silu".into()
+        },
+        // Gemma scales embeddings by √hidden (llama.cpp build_inp_embd
+        // and HF Gemma4TextScaledWordEmbedding agree).
+        embed_multiplier: if is_gemma4 { (hidden as f32).sqrt() } else { 1.0 },
+        // Gemma-4 attends with scale 1.0 (q-norm carries it).
+        query_pre_attn_scalar: if is_gemma4 { Some(1.0) } else { None },
+        sliding_window: if is_gemma2 || is_gemma4 {
             gu("attention.sliding_window")
         } else {
             None
         },
-        sliding_window_pattern: if is_gemma2 { Some(2) } else { None },
-        rope_local_base_freq: None,
+        sliding_window_pattern: if is_gemma2 {
+            Some(2)
+        } else if is_gemma4 {
+            g4_period
+        } else {
+            None
+        },
+        rope_local_base_freq: if is_gemma4 { gf("rope.freq_base_swa") } else { None },
         local_partial_rotary_factor: None,
-        global_head_dim: None,
-        num_global_kv_heads: None,
-        global_partial_rotary_factor: None,
-        final_logit_softcapping: gf("attn_logit_softcapping")
-            .is_some()
-            .then(|| gf("final_logit_softcapping"))
-            .flatten()
-            .map(|v| v),
+        global_head_dim: if is_gemma4 {
+            gu("attention.key_length").filter(|&v| v > 0)
+        } else {
+            None
+        },
+        num_global_kv_heads: if is_gemma4 {
+            gu("attention.head_count_kv").or(Some(n_heads))
+        } else {
+            None
+        },
+        global_partial_rotary_factor: g4_global_prf,
+        final_logit_softcapping: gf("final_logit_softcapping"),
         attn_logit_softcapping: gf("attn_logit_softcapping").map(|v| v),
         mla: None,
         activation_situ_beta: None,
         no_rope_layers: None,
         attention_sink: false,
         activation_situ_linear_beta: None,
-        attn_v_norm: false,
+        // Gemma-4's v_norm is scale-less x̂ (with_scale=False).
+        attn_v_norm: is_gemma4,
         qk_norm_after_rope: is_hunyuan_dense,
         num_loops: 1,
         kda_gate_lower_bound: None,
-        g3n: None,
+        g3n: g3n_cfg,
         rope_freq_factors: None,
         logit_multiplier: None,
         loop_final_norm: false,
@@ -1877,7 +2043,7 @@ pub fn run_import_gguf(
         return run_import_qwen_image(&g, &path, gguf, quant, output, progress);
     }
 
-    let arch = arch_from_md(&g.md, &g.tensors)?;
+    let arch = arch_from_md(&g, &g.md, &g.tensors)?;
     let is_llama = arch.arch_name == "llama";
     let is_q35 = arch.arch_name == "qwen3_5_moe";
 
@@ -1946,7 +2112,7 @@ pub fn run_import_gguf(
                 continue;
             }
         }
-        let Some(name) = map_name(&t.name) else {
+        let Some(name) = map_name(&arch.arch_name, &t.name) else {
             continue;
         };
         let numel: usize = t.dims.iter().map(|&d| d as usize).product();
@@ -2033,12 +2199,13 @@ pub fn run_import_gguf(
         // projections, the depthwise conv taps and the MoE routers (a
         // bit-flip there is costly — same policy as the safetensors
         // converter).
-        let keep_f32 = is_q35
+        let keep_f32 = (is_q35
             && (name.ends_with("mlp.gate.weight")
                 || name.contains("linear_attn.in_proj_a")
                 || name.contains("linear_attn.in_proj_b")
                 || name.contains("conv1d")
-                || name.ends_with("shared_expert_gate.weight"));
+                || name.ends_with("shared_expert_gate.weight")))
+            || name.ends_with("layer_scalar");
         // The shared-expert sigmoid gate is a 1-output Linear — the
         // engine loads it as a matrix, so carry it as [1, hidden].
         let shape = if name.ends_with("shared_expert_gate.weight") && shape.len() == 1 {
