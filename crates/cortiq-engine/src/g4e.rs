@@ -181,7 +181,17 @@ pub fn g4e_forward(
     let nkv = g.nkv.min(num_heads);
     let hpk = (nh / nkv).max(1);
     let mut h = e.to_vec();
-
+    // CMF_LAYER_DUMP=dir: per-position hidden after every block (and the
+    // block input as `l_in`), f32 LE rows — the oracle diff hook.
+    let dump_dir = std::env::var_os("CMF_LAYER_DUMP").map(std::path::PathBuf::from);
+    if let Some(dir) = &dump_dir {
+        let _ = std::fs::create_dir_all(dir);
+        let mut b = Vec::with_capacity(h.len() * 4);
+        for v in &h {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        let _ = std::fs::write(dir.join(format!("p{position:06}_l_in.f32")), b);
+    }
     for (li, lw) in layers.iter().enumerate() {
         let hd = lw.hd;
         let inv_freq: &[f32] = if lw.sliding {
@@ -268,6 +278,13 @@ pub fn g4e_forward(
             for hv in h.iter_mut() {
                 *hv *= s;
             }
+        }
+        if let Some(dir) = &dump_dir {
+            let mut b = Vec::with_capacity(h.len() * 4);
+            for v in &h {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            let _ = std::fs::write(dir.join(format!("p{position:06}_l{li:02}.f32")), b);
         }
     }
     h
