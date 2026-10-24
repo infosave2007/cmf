@@ -1980,7 +1980,12 @@ impl Pipeline {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            (self.global_attn.is_some() || self.attn_v_norm)
+            // An EMPTY layer stack (`all()` is vacuously true) plus a
+            // gemma4 geometry flag is exactly the gemma-4 E-series
+            // per-token stack — it has no batch graph rows to ingest.
+            !self.weights.layers.is_empty()
+                && !self.per_token_stack()
+                && (self.global_attn.is_some() || self.attn_v_norm)
                 && crate::gpu::g4_batch_on()
                 && crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Prefill)
                 && crate::gpu::enabled_here()
