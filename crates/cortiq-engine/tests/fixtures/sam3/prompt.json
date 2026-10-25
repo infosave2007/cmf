@@ -1,0 +1,21 @@
+{
+ "prompt": "red square",
+ "image": "synthetic 384x384 (white + red square + blue stripe)",
+ "image_size": [
+  384,
+  384
+ ],
+ "forward_inputs": [
+  "attention_mask",
+  "input_ids",
+  "pixel_values"
+ ],
+ "output_attrs": [
+  "decoder_reference_boxes",
+  "pred_boxes",
+  "pred_logits",
+  "pred_masks",
+  "presence_logits",
+  "semantic_seg"
+ ]
+}
