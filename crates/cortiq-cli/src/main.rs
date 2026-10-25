@@ -46,6 +46,8 @@ mod utility;
 mod videopack;
 mod zimagepack;
 mod qi21pack;
+mod sam3pack;
+mod sam3seg;
 
 use clap::{Parser, Subcommand};
 use cortiq_core::CmfModel;
@@ -2295,6 +2297,58 @@ enum Commands {
         /// default out.png; Lumina: P6 PPM, default out.ppm)
         #[arg(long)]
         out: Option<String>,
+    },
+    /// Pack Meta SAM 3 (facebook/sam3) exports into ONE CMF: vision trunk +
+    /// SAM2-style FPN + CLIP text tower + DETR detector (concept/point/box
+    /// prompts, mask head) + the video tracker, with the vendor configs and
+    /// tokenizer embedded.
+    Sam3Pack {
+        /// Export directory: detector.safetensors (+ tracker.safetensors),
+        /// config.json, detector_config.json, processor_config.json,
+        /// tokenizer.json
+        src: String,
+        /// Projection codec for 2-D weights: q8_2f (default) or q4tp
+        #[arg(long, default_value = "q8_2f")]
+        quant: String,
+        /// Output .cmf path
+        #[arg(long)]
+        out: String,
+    },
+    /// SAM3 inference: an image OR a video + a text prompt → mask overlays
+    /// and JSON. Image input: one mask-overlay PNG and boxes/scores
+    /// (preprocess and prompt framing are the reference ones — resize
+    /// 1008², mean/std 0.5, CLIP frame padded to 32 — so the boxes line up
+    /// with `tools/sam3_ref.py` fixtures).
+    /// Video input — a directory of PNG frames, or an mp4/mkv/webm/… file
+    /// (frames extracted with ffmpeg) — runs the memory-bank tracker
+    /// (`trk.*`): a folder of overlay PNGs (mask + track id) and a JSON of
+    /// tracks with per-frame boxes, scores and id stability.
+    /// `cortiq segment model.cmf img.png --prompt "red square"`
+    /// `cortiq segment model.cmf frames/ --prompt "red square" --out overlays/`
+    Segment {
+        /// Path to the SAM3 .cmf (from `sam3-pack`)
+        model: String,
+        /// Input: an image (PNG, JPEG, …), a directory of PNG frames, or a
+        /// video file (mp4/mkv/webm/mov/avi — needs ffmpeg)
+        input: String,
+        /// Text prompt, e.g. "red square"
+        #[arg(long)]
+        prompt: String,
+        /// Overlay PNG path (default: <image stem>_seg.png beside the input)
+        #[arg(long)]
+        out: Option<String>,
+        /// Write the JSON here instead of stdout
+        #[arg(long)]
+        json: Option<String>,
+        /// Keep at most this many objects, sorted by score
+        #[arg(long, default_value = "10")]
+        topk: usize,
+        /// Score threshold (0.5 = the vendor's `score_threshold_detection`)
+        #[arg(long, default_value = "0.5")]
+        thr: f32,
+        /// Mask binarization threshold on the sigmoid (HF default 0.5)
+        #[arg(long = "mask-thr", default_value = "0.5")]
+        mask_thr: f32,
     },
     /// Pack a Diffusers source into CMF. Qwen-Image-2.1, Z-Image and
     /// MOSS-Image-Base pipeline directories become ONE ready-to-run file
@@ -4549,6 +4603,53 @@ async fn main() -> anyhow::Result<()> {
                     reference_size,
                 )
             }
+        }
+        Commands::Sam3Pack { src, quant, out } => sam3pack::pack(&src, &quant, &out),
+        Commands::Segment {
+            model,
+            input,
+            prompt,
+            out,
+            json,
+            topk,
+            thr,
+            mask_thr,
+        } => {
+            let args = sam3seg::SegArgs {
+                model,
+                input,
+                prompt,
+                out,
+                json,
+                topk,
+                thr,
+                mask_thr,
+            };
+            if sam3seg::is_video_input(&args.input) {
+                let res = sam3seg::run_video(&args)?;
+                sam3seg::print_json_if_stdio(&res.json, args.json.as_deref())?;
+                eprintln!(
+                    "segment: video {} frame(s), {} track(s), {:.0} ms/frame -> {}",
+                    res.frames,
+                    res.tracks.len(),
+                    res.mean_frame_ms,
+                    res.overlay_dir.display()
+                );
+            } else {
+                let res = sam3seg::run(&args)?;
+                sam3seg::print_json_if_stdio(&res.json, args.json.as_deref())?;
+                eprintln!(
+                    "segment: {} object(s) of {}x{}, preprocess {:.0} ms + forward {:.0} ms (total {:.0} ms) -> {}",
+                    res.detections.len(),
+                    res.image_size.0,
+                    res.image_size.1,
+                    res.preprocess_ms,
+                    res.forward_ms,
+                    res.total_ms,
+                    res.overlay_path.display()
+                );
+            }
+            Ok(())
         }
         Commands::ImaginePack {
             root,
