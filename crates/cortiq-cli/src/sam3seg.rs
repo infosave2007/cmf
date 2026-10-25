@@ -59,8 +59,9 @@ const PALETTE: [[u8; 3]; 12] = [
 pub struct SegArgs {
     /// Path to the SAM3 .cmf.
     pub model: String,
-    /// Input image (anything `media::decode_rgb` reads: PNG/JPEG/…).
-    pub image: String,
+    /// Input: an image (anything `media::decode_rgb` reads), a directory of
+    /// PNG frames, or a video file (mp4/mkv/webm/… via ffmpeg).
+    pub input: String,
     /// Text prompt, e.g. `"red square"`.
     pub prompt: String,
     /// Overlay PNG path; `None` = `<image stem>_seg.png` beside the input.
@@ -140,9 +141,9 @@ pub fn run(args: &SegArgs) -> Result<SegOutput> {
     let t_all = Instant::now();
 
     // ── image → [3,1008,1008] f32 ─────────────────────────────────
-    let frame = media::read_rgb(Path::new(&args.image))
+    let frame = media::read_rgb(Path::new(&args.input))
         .map_err(anyhow::Error::msg)
-        .with_context(|| format!("read image {}", args.image))?;
+        .with_context(|| format!("read image {}", args.input))?;
     let t0 = Instant::now();
     let pixels = sam3::preprocess(&frame);
     let preprocess_ms = t0.elapsed().as_secs_f64() * 1e3;
@@ -207,7 +208,7 @@ pub fn run(args: &SegArgs) -> Result<SegOutput> {
     }
 
     // ── overlay PNG ───────────────────────────────────────────────
-    let overlay_path = args.out.as_ref().map(PathBuf::from).unwrap_or_else(|| default_out(&args.image));
+    let overlay_path = args.out.as_ref().map(PathBuf::from).unwrap_or_else(|| default_out(&args.input));
     let overlay = draw_overlay(&frame, &detections);
     media::save_png(&overlay_path, &overlay).map_err(anyhow::Error::msg)?;
 
@@ -229,7 +230,7 @@ pub fn run(args: &SegArgs) -> Result<SegOutput> {
         .collect();
     let value = json!({
         "model": args.model,
-        "image": args.image,
+        "input": args.input,
         "prompt": args.prompt,
         "image_size": [frame.width, frame.height],
         "num_objects": objects.len(),
@@ -297,6 +298,355 @@ pub fn print_json_if_stdio(value: &serde_json::Value, dest: Option<&str>) -> Res
         println!("{}", serde_json::to_string_pretty(value)?);
     }
     Ok(())
+}
+
+// ───────────────────── video mode ─────────────────────
+//
+// `cortiq segment` widens to video input: a directory of PNG frames (no
+// decoder needed) or a video file (frames pulled with ffmpeg). Every frame
+// goes through the detector AND the memory-bank tracker, so objects keep one
+// stable `track_id` across the clip.
+
+use cortiq_engine::sam3::{self as sam3mod};
+use cortiq_engine::sam3vid::{self, FrameOut as VidFrame, Sam3Video, Session};
+
+/// Video file extensions the CLI routes through ffmpeg.
+const VIDEO_EXTS: [&str; 6] = ["mp4", "mkv", "webm", "mov", "avi", "m4v"];
+
+/// `true` for a directory of PNG frames or a video file.
+pub fn is_video_input(input: &str) -> bool {
+    let p = Path::new(input);
+    if p.is_dir() {
+        return true;
+    }
+    match p.extension().and_then(|e| e.to_str()) {
+        Some(e) => VIDEO_EXTS.iter().any(|x| e.eq_ignore_ascii_case(x)),
+        None => false,
+    }
+}
+
+/// PNG frames of a directory, sorted by name.
+fn list_frames(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("read dir {}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().map_or(false, |e| e.eq_ignore_ascii_case("png")))
+        .collect();
+    v.sort();
+    anyhow::ensure!(!v.is_empty(), "no PNG frames in {}", dir.display());
+    Ok(v)
+}
+
+/// ffmpeg: `$FFMPEG`, then `$PATH`, then the bundled tool path.
+fn find_ffmpeg() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("FFMPEG") {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    if let Ok(path) = std::env::var("PATH") {
+        for d in path.split(':') {
+            let c = Path::new(d).join("ffmpeg");
+            if c.exists() {
+                return Some(c);
+            }
+        }
+    }
+    const KNOWN: &str = "/home/hermes/.hermes/tools/ffmpeg-9.0.1-linux-x64/bin/ffmpeg";
+    if Path::new(KNOWN).exists() {
+        Some(PathBuf::from(KNOWN))
+    } else {
+        None
+    }
+}
+
+/// Pull every frame of a video into `dst` as PNGs.
+fn extract_frames(video: &Path, dst: &Path) -> Result<Vec<PathBuf>> {
+    let ff = find_ffmpeg().ok_or_else(|| anyhow::anyhow!("ffmpeg not found — set $FFMPEG"))?;
+    std::fs::create_dir_all(dst).with_context(|| format!("mkdir {}", dst.display()))?;
+    let status = std::process::Command::new(&ff)
+        .arg("-y")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-i")
+        .arg(video)
+        .arg(dst.join("frame_%05d.png"))
+        .status()
+        .with_context(|| format!("spawn {}", ff.display()))?;
+    anyhow::ensure!(status.success(), "ffmpeg exited with {status}");
+    list_frames(dst)
+}
+
+/// One video run: overlays + JSON tracks.
+pub struct VidOutput {
+    pub frames: usize,
+    /// Per-track JSON records (see [`build_tracks`]).
+    pub tracks: Vec<serde_json::Value>,
+    pub overlay_dir: PathBuf,
+    pub mean_frame_ms: f64,
+    pub json: serde_json::Value,
+    pub per_frame: Vec<VidFrame>,
+}
+
+/// Default overlay folder: `frames/` → `frames_seg/`, `clip.mp4` → `clip_seg/`.
+fn default_overlay_dir(input: &str) -> PathBuf {
+    let p = Path::new(input);
+    let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("video");
+    let base = if p.is_dir() { name } else { p.file_stem().and_then(|s| s.to_str()).unwrap_or(name) };
+    p.parent().map(|d| d.join(format!("{base}_seg"))).unwrap_or_else(|| PathBuf::from(format!("{base}_seg")))
+}
+
+/// Group per-frame observations into tracks: per-frame boxes/scores plus the
+/// temporal id-stability stats (one id for the whole track, mask IoU between
+/// consecutive frames).
+fn build_tracks(per_frame: &[VidFrame], prompt: &str) -> Vec<serde_json::Value> {
+    let mut by_id: std::collections::BTreeMap<i64, Vec<(usize, &sam3vid::TrackObs)>> = Default::default();
+    for f in per_frame {
+        for t in &f.tracks {
+            by_id.entry(t.id).or_default().push((f.frame, t));
+        }
+    }
+    by_id
+        .into_iter()
+        .map(|(id, obs)| {
+            let mut ids_seen: std::collections::BTreeSet<i64> = Default::default();
+            let mut iou_sum = 0f32;
+            let mut iou_n = 0usize;
+            let mut switches = 0usize;
+            let mut prev: Option<&sam3vid::TrackObs> = None;
+            for (_, t) in &obs {
+                ids_seen.insert(t.id);
+                if let Some(p) = prev {
+                    if p.id != t.id {
+                        switches += 1;
+                    }
+                    iou_sum += sam3vid::mask_iou(&p.mask, &t.mask);
+                    iou_n += 1;
+                }
+                prev = Some(t);
+            }
+            let frames: Vec<serde_json::Value> = obs
+                .iter()
+                .map(|(fi, t)| {
+                    let [x0, y0, x1, y1] = t.box_px;
+                    json!({
+                        "frame": fi,
+                        "track_id": t.id,
+                        "box": [x0, y0, (x1 - x0 + 1.0).max(0.0), (y1 - y0 + 1.0).max(0.0)],
+                        "box_xyxy": [x0, y0, x1, y1],
+                        "score": t.score,
+                        "source": if t.from_detection { "detection" } else { "tracker" },
+                    })
+                })
+                .collect();
+            let last = obs.last().unwrap().1;
+            json!({
+                "track_id": id,
+                "label": prompt,
+                "score": last.score,
+                "first_frame": obs.first().unwrap().0,
+                "last_frame": obs.last().unwrap().0,
+                "frames_present": obs.len(),
+                "ids": ids_seen.iter().collect::<Vec<_>>(),
+                "id_stable": switches == 0 && ids_seen.len() == 1,
+                "id_switches": switches,
+                "mean_mask_iou_prev": if iou_n > 0 { (iou_sum / iou_n as f32 * 1e4).round() / 1e4 } else { 1.0 },
+                "frames": frames,
+            })
+        })
+        .collect()
+}
+
+/// Run the whole video: detect + track every frame, write overlays and JSON.
+pub fn run_video(args: &SegArgs) -> Result<VidOutput> {
+    let t_all = Instant::now();
+    let input = Path::new(&args.input);
+    anyhow::ensure!(input.exists(), "input {} does not exist", args.input);
+
+    // ── frames: PNG directory or ffmpeg extraction ────────────────
+    let tmp_dir;
+    let frames: Vec<PathBuf> = if input.is_dir() {
+        list_frames(input)?
+    } else {
+        tmp_dir = std::env::temp_dir().join(format!("cortiq_seg_{}", std::process::id()));
+        extract_frames(input, &tmp_dir)?
+    };
+    let n = frames.len();
+
+    // ── overlays + output paths ───────────────────────────────────
+    let overlay_dir = args.out.clone().map(PathBuf::from).unwrap_or_else(|| default_overlay_dir(&args.input));
+    std::fs::create_dir_all(&overlay_dir)
+        .with_context(|| format!("mkdir {}", overlay_dir.display()))?;
+
+    // ── model, prompt, session ────────────────────────────────────
+    let cm = CmfModel::open(&args.model).with_context(|| format!("open {}", args.model))?;
+    let vocab = cm
+        .vocab
+        .clone()
+        .context("the file carries no embedded tokenizer (VOCAB section)")?;
+    let tok = Tokenizer::from_bytes(&vocab).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+    let (ids, attn) = tokenize_prompt(&tok, &args.prompt);
+
+    let mut model = Sam3Video::open(&args.model)?;
+    model.cfg.score_threshold_detection = args.thr;
+    let mut session = Session::new();
+    session.num_frames = n;
+
+    // ── frame loop ────────────────────────────────────────────────
+    let mut per_frame: Vec<VidFrame> = Vec::with_capacity(n);
+    for (i, png) in frames.iter().enumerate() {
+        let frame = media::read_rgb(png).map_err(anyhow::Error::msg).with_context(|| {
+            format!("read frame {}", png.display())
+        })?;
+        let pixels = sam3mod::preprocess(&frame);
+        let out = model.forward(&mut session, i, &pixels, &ids, &attn, (frame.width, frame.height))?;
+
+        let stem = png.file_stem().and_then(|s| s.to_str()).unwrap_or("frame");
+        let overlay_path = overlay_dir.join(format!("{stem}_seg.png"));
+        let overlay = draw_video_overlay(&frame, &out.tracks);
+        media::save_png(&overlay_path, &overlay).map_err(anyhow::Error::msg)?;
+        eprintln!(
+            "frame {i}: {} track(s), {} detection(s), forward {:.0} ms (det {:.0} + trk {:.0}) -> {}",
+            out.tracks.len(),
+            out.detections,
+            out.total_ms,
+            out.det_ms,
+            out.trk_ms,
+            overlay_path.display()
+        );
+        per_frame.push(out);
+    }
+
+    // ── JSON ──────────────────────────────────────────────────────
+    let tracks = build_tracks(&per_frame, &args.prompt);
+    let frames_json: Vec<serde_json::Value> = per_frame
+        .iter()
+        .map(|f| {
+            json!({
+                "frame": f.frame,
+                "detections": f.detections,
+                "track_ids": f.tracks.iter().map(|t| t.id).collect::<Vec<_>>(),
+                "forward_ms": (f.total_ms * 100.0).round() / 100.0,
+            })
+        })
+        .collect();
+    let mean = per_frame.iter().map(|f| f.total_ms).sum::<f64>() / per_frame.len().max(1) as f64;
+    let mean_det = per_frame.iter().map(|f| f.det_ms).sum::<f64>() / per_frame.len().max(1) as f64;
+    let mean_trk = per_frame.iter().map(|f| f.trk_ms).sum::<f64>() / per_frame.len().max(1) as f64;
+    let stable = tracks.iter().all(|t| t["id_stable"].as_bool().unwrap_or(false));
+    let value = json!({
+        "model": args.model,
+        "input": args.input,
+        "prompt": args.prompt,
+        "mode": "video",
+        "num_frames": n,
+        "num_tracks": tracks.len(),
+        "tracks": tracks,
+        "frames": frames_json,
+        "id_stability": {
+            "tracks_with_single_id": tracks.iter().filter(|t| t["ids"].as_array().map_or(false, |a| a.len() == 1)).count(),
+            "total_id_switches": tracks.iter().filter_map(|t| t["id_switches"].as_u64()).sum::<u64>(),
+            "stable": stable,
+        },
+        "params": {
+            "threshold": model.cfg.score_threshold_detection,
+            "assoc_iou": model.cfg.assoc_iou_thresh,
+            "trk_assoc_iou": model.cfg.trk_assoc_iou_thresh,
+            "new_det_thresh": model.cfg.new_det_thresh,
+        },
+        "timing_ms": {
+            "total": (t_all.elapsed().as_secs_f64() * 1e3 * 100.0).round() / 100.0,
+            "mean_frame": (mean * 100.0).round() / 100.0,
+            "mean_detector": (mean_det * 100.0).round() / 100.0,
+            "mean_tracker": (mean_trk * 100.0).round() / 100.0,
+        },
+        "overlays": overlay_dir.display().to_string(),
+    });
+
+    if let Some(path) = &args.json {
+        std::fs::write(path, serde_json::to_vec_pretty(&value)?)
+            .with_context(|| format!("write {path}"))?;
+    }
+
+    Ok(VidOutput {
+        frames: n,
+        tracks,
+        overlay_dir,
+        mean_frame_ms: mean,
+        json: value,
+        per_frame,
+    })
+}
+
+/// 3×5 digit glyphs (rows of 3 bits, MSB left) for the track-id label.
+const DIGITS: [[u8; 5]; 10] = [
+    [0b111, 0b101, 0b101, 0b101, 0b111],
+    [0b010, 0b110, 0b010, 0b010, 0b111],
+    [0b111, 0b001, 0b111, 0b100, 0b111],
+    [0b111, 0b001, 0b111, 0b001, 0b111],
+    [0b101, 0b101, 0b111, 0b001, 0b001],
+    [0b111, 0b100, 0b111, 0b001, 0b111],
+    [0b111, 0b100, 0b111, 0b101, 0b111],
+    [0b111, 0b001, 0b001, 0b001, 0b001],
+    [0b111, 0b101, 0b111, 0b101, 0b111],
+    [0b111, 0b101, 0b111, 0b001, 0b111],
+];
+
+/// Mask (45 %) + 1-px box + the track id, drawn at 3× over the frame.
+fn draw_video_overlay(frame: &RgbFrame, tracks: &[sam3vid::TrackObs]) -> RgbFrame {
+    let (w, h) = (frame.width, frame.height);
+    let mut data = frame.data.clone();
+    let mut put = |x: usize, y: usize, color: [u8; 3], alpha: f32| {
+        if x >= w || y >= h {
+            return;
+        }
+        let o = (y * w + x) * 3;
+        for c in 0..3 {
+            let base = data[o + c] as f32;
+            data[o + c] = (base * (1.0 - alpha) + color[c] as f32 * alpha).round() as u8;
+        }
+    };
+    for t in tracks {
+        let color = PALETTE[(t.id as usize).rem_euclid(PALETTE.len())];
+        for y in 0..h {
+            for x in 0..w {
+                if t.mask[y * w + x] != 0 {
+                    put(x, y, color, 0.45);
+                }
+            }
+        }
+        let [x0, y0, x1, y1] = t.box_px;
+        let (x0, y0) = (x0 as usize, y0 as usize);
+        let (x1, y1) = ((x1 as usize).min(w.saturating_sub(1)), (y1 as usize).min(h.saturating_sub(1)));
+        for x in x0..=x1 {
+            put(x, y0, color, 1.0);
+            put(x, y1, color, 1.0);
+        }
+        for y in y0..=y1 {
+            put(x0, y, color, 1.0);
+            put(x1, y, color, 1.0);
+        }
+        // track id label, top-left of the box, on a dark plate
+        let mut cx = x0 + 2;
+        let cy = y0 + 2;
+        for ch in t.id.max(0).to_string().chars() {
+            let d = ch.to_digit(10).unwrap_or(0) as usize;
+            for (r, bits) in DIGITS[d].iter().enumerate() {
+                for c in 0..3 {
+                    if bits >> (2 - c) & 1 == 0 {
+                        continue;
+                    }
+                    for dy in 0..3 {
+                        for dx in 0..3 {
+                            put(cx + c * 3 + dx, cy + r * 3 + dy, color, 1.0);
+                        }
+                    }
+                }
+            }
+            cx += 12;
+        }
+    }
+    RgbFrame::new(w, h, data).expect("overlay buffer matches its frame")
 }
 
 #[cfg(test)]
@@ -465,7 +815,7 @@ mod tests {
         let out_json = tmp.with_file_name("sam3_seg_e2e_out.json");
         let args = SegArgs {
             model: cmf.display().to_string(),
-            image: tmp.display().to_string(),
+            input: tmp.display().to_string(),
             prompt: "red square".into(),
             out: out_png.display().to_string().into(),
             json: out_json.display().to_string().into(),
@@ -544,5 +894,230 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(&out_png);
         let _ = std::fs::remove_file(&out_json);
+    }
+
+    // ── video mode ────────────────────────────────────────────────
+
+    /// Clip shape: 8 frames of 384², a 128² red square moving 16 px right
+    /// and 8 px down per frame, a static blue stripe — byte-identical to
+    /// `tools/sam3_video_ref.py` (the reference fixtures come from it).
+    const V_FRAMES: usize = 8;
+    const V_SIZE: usize = 384;
+
+    fn v_square(i: usize) -> [usize; 4] {
+        let x0 = 64 + 16 * i;
+        let y0 = 64 + 8 * i;
+        [x0, y0, x0 + 127, y0 + 127] // inclusive, as masks_to_boxes reports
+    }
+
+    fn synthetic_frame(i: usize) -> RgbFrame {
+        let s = V_SIZE;
+        let mut data = vec![255u8; s * s * 3];
+        for y in 300..340 {
+            for x in 0..s {
+                let o = (y * s + x) * 3;
+                data[o..o + 3].copy_from_slice(&[30, 60, 200]);
+            }
+        }
+        let [x0, y0, x1, y1] = v_square(i);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let o = (y * s + x) * 3;
+                data[o..o + 3].copy_from_slice(&[200, 30, 30]);
+            }
+        }
+        RgbFrame::new(s, s, data).unwrap()
+    }
+
+    fn gt_mask(i: usize) -> Vec<u8> {
+        let s = V_SIZE;
+        let mut m = vec![0u8; s * s];
+        let [x0, y0, x1, y1] = v_square(i);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                m[y * s + x] = 1;
+            }
+        }
+        m
+    }
+
+    /// Input routing: directories and video extensions go to the tracker,
+    /// images do not. The ffmpeg leg pulls real frames out of an mp4.
+    #[test]
+    fn segment_video_input_paths() {
+        let tmp = std::env::temp_dir().join(format!("sam3_vid_paths_{}", std::process::id()));
+        let frames = tmp.join("frames");
+        std::fs::create_dir_all(&frames).unwrap();
+        for i in 0..3 {
+            media::save_png(&frames.join(format!("f{i:02}.png")), &synthetic_frame(i)).unwrap();
+        }
+        assert!(is_video_input(frames.to_str().unwrap()), "PNG directory must route to video mode");
+        assert!(is_video_input("clip.MP4"), "video extensions are case-insensitive");
+        assert!(is_video_input("/tmp/missing_dir_xyz") == false || Path::new("/tmp/missing_dir_xyz").is_dir());
+        assert!(!is_video_input("photo.png"), "a PNG file stays image mode");
+        assert!(!is_video_input("photo.jpg"), "a JPEG stays image mode");
+        assert_eq!(list_frames(&frames).unwrap().len(), 3, "all PNG frames are picked up");
+
+        // ffmpeg: PNG dir → mp4 → PNG dir
+        let Some(ff) = find_ffmpeg() else {
+            eprintln!("SKIP ffmpeg leg: ffmpeg not on $PATH/$FFMPEG");
+            let _ = std::fs::remove_dir_all(&tmp);
+            return;
+        };
+        let mp4 = tmp.join("clip.mp4");
+        let status = std::process::Command::new(&ff)
+            .args(["-y", "-loglevel", "error", "-framerate", "1", "-i"])
+            .arg(frames.join("f%02d.png"))
+            .args(["-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv444p"])
+            .arg(&mp4)
+            .status()
+            .unwrap();
+        assert!(status.success(), "ffmpeg encode failed");
+        assert!(is_video_input(mp4.to_str().unwrap()), "mp4 routes to video mode");
+        let back = tmp.join("back");
+        let got = extract_frames(&mp4, &back).expect("ffmpeg extraction");
+        assert_eq!(got.len(), 3, "lossless round trip keeps every frame");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// End-to-end video: the moving red square must be found in EVERY frame
+    /// (box ±10 px of the ground-truth motion), keep ONE stable track id for
+    /// the whole clip, and hold mask IoU ≥ 0.5 against the GT square each
+    /// frame. One command:
+    /// `cargo test --release -p cortiq-cli --bin cortiq sam3_video_e2e -- --nocapture`
+    #[test]
+    fn sam3_video_e2e() {
+        let (_, cmf) = fixture_paths();
+        if !cmf.exists() {
+            eprintln!("SKIP sam3_video_e2e: cmf not found (set SAM3_CMF): {}", cmf.display());
+            return;
+        }
+        let tmp = std::env::temp_dir().join(format!("sam3_video_e2e_{}", std::process::id()));
+        // A shorter clip is useful for local tracker debugging; the default
+        // remains the full eight-frame acceptance run.
+        let n_frames = std::env::var("SAM3_VIDEO_FRAMES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(V_FRAMES)
+            .clamp(1, V_FRAMES);
+        let frames = tmp.join("frames");
+        std::fs::create_dir_all(&frames).unwrap();
+        for i in 0..n_frames {
+            media::save_png(&frames.join(format!("frame_{i:02}.png")), &synthetic_frame(i))
+                .expect("write frame");
+        }
+        let out_dir = tmp.join("seg");
+        let json_path = tmp.join("tracks.json");
+        let args = SegArgs {
+            model: cmf.display().to_string(),
+            input: frames.display().to_string(),
+            prompt: "red square".into(),
+            out: out_dir.display().to_string().into(),
+            json: json_path.display().to_string().into(),
+            topk: 10,
+            thr: 0.5,
+            mask_thr: 0.5,
+        };
+        let res = run_video(&args).expect("video run");
+        assert_eq!(res.frames, n_frames, "every frame was processed");
+        assert!(out_dir.exists() && json_path.exists(), "overlays + JSON written");
+
+        let mut ids: Vec<i64> = Vec::new();
+        for i in 0..n_frames {
+            let f = &res.per_frame[i];
+            assert!(!f.tracks.is_empty(), "frame {i}: the square was not tracked");
+            let gt = gt_mask(i);
+            let best = f
+                .tracks
+                .iter()
+                .max_by(|a, b| {
+                    sam3vid::mask_iou(&a.mask, &gt)
+                        .partial_cmp(&sam3vid::mask_iou(&b.mask, &gt))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap();
+            let iou = sam3vid::mask_iou(&best.mask, &gt);
+            assert!(iou >= 0.5, "frame {i}: mask IoU {iou:.3} < 0.5");
+            let gtb = v_square(i).map(|v| v as f32);
+            for (c, (got, want)) in best.box_px.iter().zip(gtb).enumerate() {
+                assert!(
+                    (got - want).abs() <= 10.0,
+                    "frame {i}: box corner {c} got {got:.1}, want {want:.1} ±10"
+                );
+            }
+            ids.push(best.id);
+            eprintln!(
+                "video frame {i}: id {} box [{:.0},{:.0},{:.0},{:.0}] score {:.4} IoU {:.3} ({:.0} ms)",
+                best.id, best.box_px[0], best.box_px[1], best.box_px[2], best.box_px[3], best.score, iou, f.total_ms
+            );
+        }
+        assert!(
+            ids.iter().all(|x| *x == ids[0]),
+            "track id must not flicker across frames: {ids:?}"
+        );
+        // ── parity with the reference (tools/sam3_video_ref.py) ──────
+        // Same clip, transformers 5.20.2 + facebook/sam3 weights: our
+        // tracker masks for the first three frames must line up with the
+        // checked-in reference `pred_masks`.
+        if let Some(fx) = fixture_paths().0.to_str() {
+            let ref_dir = Path::new(fx).parent().map(|d| d.join("sam3_video"));
+            if let Some(rd) = ref_dir.filter(|d| d.exists()) {
+                for i in 0..3.min(n_frames) {
+                    let mut cand = Vec::new();
+                    for key in ["cond_frame_outputs", "non_cond_frame_outputs"] {
+                        let p = rd.join(format!("f{i}/obj0/{key}/pred_masks.f32"));
+                        if let Ok(bytes) = std::fs::read(p) {
+                            cand = bytes
+                                .chunks_exact(4)
+                                .map(|c| u8::from(f32::from_le_bytes([c[0], c[1], c[2], c[3]]) > 0.0))
+                                .collect();
+                            break;
+                        }
+                    }
+                    if cand.len() != MASK_SIDE * MASK_SIDE {
+                        continue;
+                    }
+                    let gt_ref = gt_mask(i);
+                    // our track mask is at frame resolution; the reference is
+                    // 288² — compare both after resizing to 288²
+                    let mine = &res.per_frame[i]
+                        .tracks
+                        .iter()
+                        .max_by(|a, b| {
+                            sam3vid::mask_iou(&a.mask, &gt_ref)
+                                .partial_cmp(&sam3vid::mask_iou(&b.mask, &gt_ref))
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .unwrap()
+                        .mask;
+                    let mut down = vec![0u8; MASK_SIDE * MASK_SIDE];
+                    for y in 0..MASK_SIDE {
+                        for x in 0..MASK_SIDE {
+                            let sy = (y * V_SIZE / MASK_SIDE).min(V_SIZE - 1);
+                            let sx = (x * V_SIZE / MASK_SIDE).min(V_SIZE - 1);
+                            down[y * MASK_SIDE + x] = mine[sy * V_SIZE + sx];
+                        }
+                    }
+                    let iou = sam3vid::mask_iou(&down, &cand);
+                    eprintln!("frame {i}: mask IoU vs reference transformers = {iou:.4}");
+                    assert!(iou >= 0.8, "frame {i}: reference IoU {iou:.4} < 0.8");
+                }
+            } else {
+                eprintln!("reference fixtures not found — skipping the parity cross-check");
+            }
+        }
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&json_path).expect("read tracks.json")).unwrap();
+        assert_eq!(json["mode"], "video");
+        assert_eq!(json["num_frames"].as_u64().unwrap(), n_frames as u64);
+        assert_eq!(json["id_stability"]["stable"], serde_json::Value::Bool(true), "id stability report");
+        assert!(json["num_tracks"].as_u64().unwrap() >= 1, "at least one track");
+        eprintln!(
+            "video: {} track(s), stable={}, {:.0} ms/frame",
+            json["num_tracks"], json["id_stability"]["stable"], res.mean_frame_ms
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

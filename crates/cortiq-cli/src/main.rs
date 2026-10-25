@@ -2276,17 +2276,23 @@ enum Commands {
         #[arg(long)]
         out: String,
     },
-    /// SAM3 image inference: an image + a text prompt → a mask-overlay
-    /// PNG and JSON with normalized boxes, per-object scores and the CPU
-    /// forward time. Preprocess and prompt framing are the reference
-    /// ones (resize 1008², mean/std 0.5, CLIP frame padded to 32), so
-    /// the boxes/masks line up with `tools/sam3_ref.py` fixtures.
+    /// SAM3 inference: an image OR a video + a text prompt → mask overlays
+    /// and JSON. Image input: one mask-overlay PNG and boxes/scores
+    /// (preprocess and prompt framing are the reference ones — resize
+    /// 1008², mean/std 0.5, CLIP frame padded to 32 — so the boxes line up
+    /// with `tools/sam3_ref.py` fixtures).
+    /// Video input — a directory of PNG frames, or an mp4/mkv/webm/… file
+    /// (frames extracted with ffmpeg) — runs the memory-bank tracker
+    /// (`trk.*`): a folder of overlay PNGs (mask + track id) and a JSON of
+    /// tracks with per-frame boxes, scores and id stability.
     /// `cortiq segment model.cmf img.png --prompt "red square"`
+    /// `cortiq segment model.cmf frames/ --prompt "red square" --out overlays/`
     Segment {
         /// Path to the SAM3 .cmf (from `sam3-pack`)
         model: String,
-        /// Input image (PNG, JPEG, … — anything the media decoder reads)
-        image: String,
+        /// Input: an image (PNG, JPEG, …), a directory of PNG frames, or a
+        /// video file (mp4/mkv/webm/mov/avi — needs ffmpeg)
+        input: String,
         /// Text prompt, e.g. "red square"
         #[arg(long)]
         prompt: String,
@@ -4496,7 +4502,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Sam3Pack { src, quant, out } => sam3pack::pack(&src, &quant, &out),
         Commands::Segment {
             model,
-            image,
+            input,
             prompt,
             out,
             json,
@@ -4506,7 +4512,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let args = sam3seg::SegArgs {
                 model,
-                image,
+                input,
                 prompt,
                 out,
                 json,
@@ -4514,18 +4520,30 @@ async fn main() -> anyhow::Result<()> {
                 thr,
                 mask_thr,
             };
-            let res = sam3seg::run(&args)?;
-            sam3seg::print_json_if_stdio(&res.json, args.json.as_deref())?;
-            eprintln!(
-                "segment: {} object(s) of {}x{}, preprocess {:.0} ms + forward {:.0} ms (total {:.0} ms) -> {}",
-                res.detections.len(),
-                res.image_size.0,
-                res.image_size.1,
-                res.preprocess_ms,
-                res.forward_ms,
-                res.total_ms,
-                res.overlay_path.display()
-            );
+            if sam3seg::is_video_input(&args.input) {
+                let res = sam3seg::run_video(&args)?;
+                sam3seg::print_json_if_stdio(&res.json, args.json.as_deref())?;
+                eprintln!(
+                    "segment: video {} frame(s), {} track(s), {:.0} ms/frame -> {}",
+                    res.frames,
+                    res.tracks.len(),
+                    res.mean_frame_ms,
+                    res.overlay_dir.display()
+                );
+            } else {
+                let res = sam3seg::run(&args)?;
+                sam3seg::print_json_if_stdio(&res.json, args.json.as_deref())?;
+                eprintln!(
+                    "segment: {} object(s) of {}x{}, preprocess {:.0} ms + forward {:.0} ms (total {:.0} ms) -> {}",
+                    res.detections.len(),
+                    res.image_size.0,
+                    res.image_size.1,
+                    res.preprocess_ms,
+                    res.forward_ms,
+                    res.total_ms,
+                    res.overlay_path.display()
+                );
+            }
             Ok(())
         }
         Commands::ImaginePack {

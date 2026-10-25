@@ -79,6 +79,8 @@ pub mod qwen_imagegen;
 pub mod router;
 pub mod runtime;
 pub mod sam3;
+pub mod sam3vid;
+pub(crate) mod sam3vid_net;
 pub mod sampler;
 pub mod skillbake;
 pub mod swarm;
