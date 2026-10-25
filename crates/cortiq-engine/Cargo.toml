@@ -11,6 +11,13 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
+# Test fixtures for the SAM3 parity suites are ~240 MB (a single .f32 dump is
+# 64 MB) while crates.io caps a .crate at 10 MB — the upload 413'd on 0.8.34.
+# They stay in git for CI; consumers of the crate don't run them.
+exclude = [
+    "tests/fixtures/sam3",
+    "tests/fixtures/sam3_video",
+]
 
 [dependencies]
 cortiq-core = { path = "../cortiq-core", version = "0.8.24" }
