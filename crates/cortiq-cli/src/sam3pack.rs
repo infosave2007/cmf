@@ -45,6 +45,14 @@ fn f32_bytes(vals: &[f32]) -> Vec<u8> {
 /// Encode one 2-D projection at `level` (falls back q4t→q8 when the column
 /// constraint is not met).
 fn encode_2d(name: String, vals: &[f32], rows: usize, cols: usize, level: Level) -> TensorSpec {
+    // q8_row stores per-row scales as f16 (max 65504): a row with
+    // |w| > 65504·127 ≈ 8.3e6 would encode an infinite scale and
+    // dequantize to NaN. facebook/sam3's text_projection really carries
+    // ±9.6e18 entries, so such tensors stay exact f32.
+    let amax = vals.iter().fold(0f32, |m, v| m.max(v.abs()));
+    if amax / 127.0 > 65_504.0 {
+        return spec_f32(name, vec![rows, cols], vals);
+    }
     let (dtype, data) = if level == Level::Q4t && cols % 32 == 0 {
         (TensorDtype::Q4Tiled, encode_q4_tiled(vals, rows, cols))
     } else {
