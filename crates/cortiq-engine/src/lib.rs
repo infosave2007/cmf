@@ -78,6 +78,7 @@ pub mod qwen_image_vision;
 pub mod qwen_imagegen;
 pub mod router;
 pub mod runtime;
+pub mod sam3;
 pub mod sampler;
 pub mod skillbake;
 pub mod swarm;
