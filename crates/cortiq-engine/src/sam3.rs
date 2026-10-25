@@ -1209,6 +1209,27 @@ fn apply_rope(buf: &mut [f32], n: usize, stride: usize, width: usize, fc: &[f32]
     }
 }
 
+/// RAII bypass of the f16-staged coop kernel for the calling thread —
+/// the attention arm needs the pure-f32 scalar GEMM to stay inside the
+/// parity gate (the coop kernel rounds operands to f16: measured ~1e-3
+/// per-op, which compounds through a 32-layer trunk to rel 0.36).
+struct CoopBypass;
+
+impl CoopBypass {
+    fn new() -> Self {
+        #[cfg(feature = "gpu")]
+        crate::gpu_wgpu::COOP_BYPASS.with(|b| b.set(true));
+        Self
+    }
+}
+
+impl Drop for CoopBypass {
+    fn drop(&mut self) {
+        #[cfg(feature = "gpu")]
+        crate::gpu_wgpu::COOP_BYPASS.with(|b| b.set(false));
+    }
+}
+
 /// GPU arm for `run_attn`'s core (QKᵀ softmax A·V), owner GPU port.
 ///
 /// Per head: Q/K/V rows are packed contiguous, QKᵀ and A·V run as f32
@@ -1252,12 +1273,18 @@ fn attn_core_gpu(
         let h3 = dim * 3;
         // Q/K packed [.., hd] rows; V packed transposed (rows = hd) so
         // A·V is the same NT GEMM: out[n_q, hd] = A[n_q, n_k]·Vᵀ[hd, n_k].
+        let _byp = CoopBypass::new();
         let mut qpk = vec![0f32; n_q * hd];
         let mut kpk = vec![0f32; n_k * hd];
         let mut vtp = vec![0f32; hd * n_k];
         let mut raw = vec![0f32; n_q * n_k];
         let mut outt = vec![0f32; n_q * hd];
         let mut acc = vec![0f32; n_q * dim];
+        // The pure-f32 scalar arm refuses grids over 2^22 workgroups (a
+        // hang guard) — QKᵀ over a big square (n_q * n_k) is chunked
+        // along query rows; output rows are independent, so chunking
+        // changes nothing but the dispatch.
+        let qk_chunk = ((1usize << 22) / n_k.max(1)).max(1);
         for t in 0..heads {
             let off = t * hd;
             for i in 0..n_q {
@@ -1274,9 +1301,21 @@ fn attn_core_gpu(
                     *rv = v[j * h3 + 2 * dim + off + d];
                 }
             }
-            // QKᵀ: raw[i, j] = qpk[i]·kpk[j]
-            if !crate::gpu_wgpu::gemm_nt_f32_transient(&qpk, &kpk, &mut raw, n_q, hd, n_k) {
-                return false;
+            // QKᵀ: raw[i, j] = qpk[i]·kpk[j]  (chunked over query rows)
+            let mut i0 = 0usize;
+            while i0 < n_q {
+                let i1 = (i0 + qk_chunk).min(n_q);
+                if !crate::gpu_wgpu::gemm_nt_f32_transient(
+                    &qpk[i0 * hd..i1 * hd],
+                    &kpk,
+                    &mut raw[i0 * n_k..i1 * n_k],
+                    i1 - i0,
+                    hd,
+                    n_k,
+                ) {
+                    return false;
+                }
+                i0 = i1;
             }
             // scale + mask + stable softmax — the scalar arm's order.
             let mut rowmax = vec![0f32; n_q];
@@ -1774,48 +1813,75 @@ mod attn_gpu_tests {
             eprintln!("skip attn_gpu_matches_cpu: no wgpu backend");
             return;
         }
-        let (n_q, n_k, dim, heads) = (1024usize, 1024usize, 256usize, 4usize);
-        let h3 = dim * 3;
-        let mut st = 0x9e37_79b9_7f4a_7c15u64;
-        let xs: Vec<f32> = (0..n_k * h3).map(|_| lcg(&mut st) * 2.0).collect();
-        let mut st2 = 0xdead_beefu64.wrapping_mul(0x5bd1_e995);
-        let w_qkv = QTensor::F32 {
-            data: (0..h3 * dim).map(|_| lcg(&mut st2)).collect(),
-            rows: h3,
-            cols: dim,
-        };
-        let w_o = QTensor::F32 {
-            data: (0..dim * dim).map(|_| lcg(&mut st2)).collect(),
-            rows: dim,
-            cols: dim,
-        };
-        let qb = vec![0.01f32; h3];
-        let ob = vec![0.02f32; dim];
-        let mut head_mask = vec![0f32; heads * n_q * n_k];
-        for (i, v) in head_mask.iter_mut().enumerate() {
-            *v = (i % 97) as f32 * 0.001 - 0.048;
-        }
-        let cases: [(Mask<'static>, &str); 2] =
-            [(Mask::None, "none"), (Mask::Head(&head_mask), "head")];
-        for (mask, label) in cases {
-            let mut out_cpu = vec![0f32; n_q * dim];
-            let mut out_gpu = vec![0f32; n_q * dim];
-            crate::gpu::cpu_scope(|| {
+        // Shapes that mirror the real trunk: 1024x1024 (small square),
+        // 576x576x1024/16 (windowed layer) and 5184x5184x1024/16 (global
+        // layer — the only shape that exercises QK query-chunking).
+        let cases: [(usize, usize, usize, usize, bool); 3] = [
+            (1024, 1024, 256, 4, true),
+            (576, 576, 1024, 16, false),
+            (5184, 5184, 1024, 16, false),
+        ];
+        for &(n_q, n_k, dim, heads, with_head) in &cases {
+            let h3 = dim * 3;
+            let mut st = 0x9e37_79b9_7f4a_7c15u64;
+            let xs: Vec<f32> = (0..n_k * h3).map(|_| lcg(&mut st) * 2.0).collect();
+            let mut st2 = 0xdead_beefu64.wrapping_mul(0x5bd1_e995);
+            let w_qkv = QTensor::F32 {
+                data: (0..h3 * dim).map(|_| lcg(&mut st2)).collect(),
+                rows: h3,
+                cols: dim,
+            };
+            let w_o = QTensor::F32 {
+                data: (0..dim * dim).map(|_| lcg(&mut st2)).collect(),
+                rows: dim,
+                cols: dim,
+            };
+            let qb = vec![0.01f32; h3];
+            let ob = vec![0.02f32; dim];
+            let head_mask: Vec<f32>;
+            let mut head_owned: Vec<f32> = Vec::new();
+            if with_head {
+                head_owned = vec![0f32; heads * n_q * n_k];
+                for (i, v) in head_owned.iter_mut().enumerate() {
+                    *v = (i % 97) as f32 * 0.001 - 0.048;
+            }
+            }
+            head_mask = head_owned;
+            let mask_kinds: [(Option<usize>, &str); 2] =
+                [(None, "none"), (with_head.then_some(0usize), "head")];
+            for (kind, label) in mask_kinds {
+                if kind.is_none() && !matches!(label, "none") {
+                    continue;
+                }
+                let mask = match kind {
+                    Some(_) if with_head => Mask::Head(&head_mask),
+                    Some(_) => continue,
+                    None => Mask::None,
+                };
+                if label == "head" && !with_head {
+                    continue;
+                }
+                let mut out_cpu = vec![0f32; n_q * dim];
+                let mut out_gpu = vec![0f32; n_q * dim];
+                crate::gpu::cpu_scope(|| {
+                    run_attn(
+                        &w_qkv, &qb, &w_o, &ob, &xs, &xs, &xs,
+                        n_q, n_k, dim, heads, None, mask, None, &mut out_cpu,
+                    )
+                });
                 run_attn(
                     &w_qkv, &qb, &w_o, &ob, &xs, &xs, &xs,
-                    n_q, n_k, dim, heads, None, mask, None, &mut out_cpu,
-                )
-            });
-            run_attn(
-                &w_qkv, &qb, &w_o, &ob, &xs, &xs, &xs,
-                n_q, n_k, dim, heads, None, mask, None, &mut out_gpu,
-            );
-            let (rel, cos) = rel_cos(&out_gpu, &out_cpu);
-            eprintln!("attn_gpu_vs_cpu[{label}] rel={rel:.3e} cos={cos:.6}");
-            assert!(
-                rel <= 1e-2 && cos >= 0.999,
-                "attn mask={label}: rel={rel:.3e} cos={cos:.6} outside gate"
-            );
+                    n_q, n_k, dim, heads, None, mask, None, &mut out_gpu,
+                );
+                let (rel, cos) = rel_cos(&out_gpu, &out_cpu);
+                eprintln!(
+                    "attn_gpu_vs_cpu[{n_q}x{n_k}x{dim}/{heads} {label}] rel={rel:.3e} cos={cos:.6}"
+                );
+                assert!(
+                    rel <= 1e-2 && cos >= 0.999,
+                    "attn {n_q}x{n_k} mask={label}: rel={rel:.3e} cos={cos:.6} outside gate"
+                );
+            }
         }
     }
 }

@@ -63202,6 +63202,15 @@ thread_local! {
     static TRANSIENT_W: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+thread_local! {
+    /// Bypass the f16-staged coop kernel for the calling thread. The coop
+    /// NT kernel rounds both operands to f16 before the mma (fast, but
+    /// ~1e-3 per-op error) — callers that must match a CPU f32 reference
+    /// within a parity gate (SAM3's GPU attention arm) take the pure-f32
+    /// scalar arm instead.
+    pub static COOP_BYPASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize) -> bool {
     if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") || f32_strict() {
         return false;
@@ -63222,6 +63231,7 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
         .gemm_nt_coop
         .as_ref()
         .filter(|_| !MIMO_F32_GEMM.get())
+        .filter(|_| !COOP_BYPASS.with(|b| b.get()))
         .filter(|_| k % 4 == 0 && m.div_ceil(64) <= 65_535 && n.div_ceil(64) <= 65_535)
         .filter(|_| c.discrete || (m <= 65_000 && n <= 65_000));
     // The scalar arm's dispatch is (m, n) workgroups — huge dims are
