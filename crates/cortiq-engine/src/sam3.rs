@@ -102,7 +102,7 @@ pub struct Sam3Out {
 
 /// Additive attention masks (added to scores before softmax).
 #[derive(Clone, Copy)]
-enum Mask<'a> {
+pub(crate) enum Mask<'a> {
     None,
     /// One value per key, shared by all queries/heads (padding).
     Key(&'a [f32]),
@@ -134,6 +134,13 @@ impl Sam3 {
         let pos_skip_cls = std::env::var("SAM3_POS").as_deref() != Ok("first");
         Ok(Self { model, pool: Pool::from_env(), fpn_prefix, pos_skip_cls })
     }
+
+    /// The shared CMF handle (the video tracker reads its `trk.*` section
+    /// through it).
+    pub(crate) fn cmf(&self) -> &Arc<CmfModel> { &self.model }
+
+    /// The GEMM thread pool the detector was opened with.
+    pub(crate) fn pool_handle(&self) -> Option<&Arc<Pool>> { self.pool.as_ref() }
 
     /// Debug: `"name dtype shape"` lines for every tensor in the CMF
     /// directory (the parity tests filter them by section).
@@ -535,48 +542,7 @@ impl Sam3 {
     /// Four pyramid levels from the trunk map: 288/144/72/36, each
     /// [256, H, W] channels-first.
     fn fpn(&self, trunk: &[f32], pool: Option<&Pool>) -> Result<Vec<Vec<f32>>> {
-        let m = &self.model;
-        let hidden = rows_to_chw(trunk, GRID, GRID); // [1024,72,72]
-        let p = self.fpn_prefix;
-        let scales = [4.0f32, 2.0, 1.0, 0.5];
-        let mut levels = Vec::with_capacity(4);
-        for (i, &s) in scales.iter().enumerate() {
-            let (mut ci, mut ch, mut cw) = (TD, GRID, GRID);
-            let mut cur = hidden.clone();
-            match s {
-                4.0 => {
-                    let w0 = load_vec(m, &format!("{p}.{i}.dconv_2x2_0.weight"))?;
-                    let b0 = load_vec(m, &format!("{p}.{i}.dconv_2x2_0.bias"))?;
-                    cur = convt2x2(&w0, &b0, &cur, ci, ch, cw, pool);
-                    (ch, cw, ci) = (ch * 2, cw * 2, b0.len());
-                    cur.iter_mut().for_each(|v| *v = gelu_erf(*v));
-                    let w1 = load_vec(m, &format!("{p}.{i}.dconv_2x2_1.weight"))?;
-                    let b1 = load_vec(m, &format!("{p}.{i}.dconv_2x2_1.bias"))?;
-                    cur = convt2x2(&w1, &b1, &cur, ci, ch, cw, pool);
-                    (ch, cw, ci) = (ch * 2, cw * 2, b1.len());
-                }
-                2.0 => {
-                    let w0 = load_vec(m, &format!("{p}.{i}.dconv_2x2.weight"))?;
-                    let b0 = load_vec(m, &format!("{p}.{i}.dconv_2x2.bias"))?;
-                    cur = convt2x2(&w0, &b0, &cur, ci, ch, cw, pool);
-                    (ch, cw, ci) = (ch * 2, cw * 2, b0.len());
-                }
-                1.0 => {}
-                _ => {
-                    cur = maxpool2(&cur, ci, ch, cw);
-                    (ch, cw) = (ch / 2, cw / 2);
-                }
-            }
-            let w1 = load_vec(m, &format!("{p}.{i}.conv_1x1.weight"))?;
-            let b1 = load_vec(m, &format!("{p}.{i}.conv_1x1.bias"))?;
-            cur = conv2d(&w1, &b1, &cur, ci, ch, cw, 1, 1, 1, 0, pool);
-            ci = b1.len();
-            let w3 = load_vec(m, &format!("{p}.{i}.conv_3x3.weight"))?;
-            let b3 = load_vec(m, &format!("{p}.{i}.conv_3x3.bias"))?;
-            cur = conv2d(&w3, &b3, &cur, ci, ch, cw, 3, 3, 1, 1, pool);
-            levels.push(cur);
-        }
-        Ok(levels)
+        fpn_levels(&self.model, self.fpn_prefix, trunk, pool, 4)
     }
 
     // ── DETR encoder (pre-norm layers) ──────────────────────────────
@@ -920,6 +886,59 @@ impl Sam3 {
     }
 }
 
+/// `Sam3VisionNeck` (`Sam3FPNLayer` stack) over the trunk map: the first
+/// `n_levels` pyramid levels at 288/144/72/36, each [256, H, W]
+/// channels-first. The DETR path uses all four; the video tracker's neck
+/// (`fpn.sam2_convs`) only consumes the first three.
+pub(crate) fn fpn_levels(
+    m: &Arc<CmfModel>,
+    p: &str,
+    trunk: &[f32],
+    pool: Option<&Pool>,
+    n_levels: usize,
+) -> Result<Vec<Vec<f32>>> {
+    let hidden = rows_to_chw(trunk, GRID, GRID); // [1024,72,72]
+    let scales = [4.0f32, 2.0, 1.0, 0.5];
+    let mut levels = Vec::with_capacity(n_levels);
+    for (i, &s) in scales.iter().enumerate().take(n_levels) {
+        let (mut ci, mut ch, mut cw) = (TD, GRID, GRID);
+        let mut cur = hidden.clone();
+        match s {
+            4.0 => {
+                let w0 = load_vec(m, &format!("{p}.{i}.dconv_2x2_0.weight"))?;
+                let b0 = load_vec(m, &format!("{p}.{i}.dconv_2x2_0.bias"))?;
+                cur = convt2x2(&w0, &b0, &cur, ci, ch, cw, pool);
+                (ch, cw, ci) = (ch * 2, cw * 2, b0.len());
+                cur.iter_mut().for_each(|v| *v = gelu_erf(*v));
+                let w1 = load_vec(m, &format!("{p}.{i}.dconv_2x2_1.weight"))?;
+                let b1 = load_vec(m, &format!("{p}.{i}.dconv_2x2_1.bias"))?;
+                cur = convt2x2(&w1, &b1, &cur, ci, ch, cw, pool);
+                (ch, cw, ci) = (ch * 2, cw * 2, b1.len());
+            }
+            2.0 => {
+                let w0 = load_vec(m, &format!("{p}.{i}.dconv_2x2.weight"))?;
+                let b0 = load_vec(m, &format!("{p}.{i}.dconv_2x2.bias"))?;
+                cur = convt2x2(&w0, &b0, &cur, ci, ch, cw, pool);
+                (ch, cw, ci) = (ch * 2, cw * 2, b0.len());
+            }
+            1.0 => {}
+            _ => {
+                cur = maxpool2(&cur, ci, ch, cw);
+                (ch, cw) = (ch / 2, cw / 2);
+            }
+        }
+        let w1 = load_vec(m, &format!("{p}.{i}.conv_1x1.weight"))?;
+        let b1 = load_vec(m, &format!("{p}.{i}.conv_1x1.bias"))?;
+        cur = conv2d(&w1, &b1, &cur, ci, ch, cw, 1, 1, 1, 0, pool);
+        ci = b1.len();
+        let w3 = load_vec(m, &format!("{p}.{i}.conv_3x3.weight"))?;
+        let b3 = load_vec(m, &format!("{p}.{i}.conv_3x3.bias"))?;
+        cur = conv2d(&w3, &b3, &cur, ci, ch, cw, 3, 3, 1, 1, pool);
+        levels.push(cur);
+    }
+    Ok(levels)
+}
+
 // ───────────────────── model pieces ─────────────────────
 
 /// Sam3DecoderMLP, 2 layers: relu(l1), l2 (with biases).
@@ -988,7 +1007,7 @@ impl DecoderMlp3 {
     }
 }
 
-fn sigm(x: f32) -> f32 {
+pub(crate) fn sigm(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
@@ -1008,12 +1027,12 @@ fn xyxy(boxes: &[[f32; 4]]) -> Vec<f32> {
     out
 }
 
-fn lin(m: &Arc<CmfModel>, name: &str) -> Result<QTensor> {
+pub(crate) fn lin(m: &Arc<CmfModel>, name: &str) -> Result<QTensor> {
     QTensor::from_model(m, name).map_err(|e| anyhow!(e))
 }
 
 /// Dequantize a tensor to flat f32 (norms, biases, tables, convs).
-fn load_vec(m: &Arc<CmfModel>, name: &str) -> Result<Vec<f32>> {
+pub(crate) fn load_vec(m: &Arc<CmfModel>, name: &str) -> Result<Vec<f32>> {
     let e = m.tensor(name).ok_or_else(|| anyhow!("tensor '{name}' not found"))?;
     if matches!(e.dtype, TensorDtype::U8) { return Err(anyhow!("'{name}' is u8")); }
     let bytes = m.entry_bytes(e);
@@ -1023,7 +1042,7 @@ fn load_vec(m: &Arc<CmfModel>, name: &str) -> Result<Vec<f32>> {
 }
 
 /// Row-major [rows, cols] += bias (broadcast over rows).
-fn add_bias(out: &mut [f32], cols: usize, bias: &[f32]) {
+pub(crate) fn add_bias(out: &mut [f32], cols: usize, bias: &[f32]) {
     debug_assert_eq!(bias.len(), cols);
     for r in out.chunks_exact_mut(cols) {
         for (v, b) in r.iter_mut().zip(bias) { *v += *b; }
@@ -1031,7 +1050,7 @@ fn add_bias(out: &mut [f32], cols: usize, bias: &[f32]) {
 }
 
 /// LayerNorm over rows of `x` (row length = w.len()).
-fn layer_norm_rows(x: &mut [f32], w: &[f32], b: &[f32], eps: f32) {
+pub(crate) fn layer_norm_rows(x: &mut [f32], w: &[f32], b: &[f32], eps: f32) {
     let d = w.len();
     for r in x.chunks_exact_mut(d) {
         let mean = r.iter().sum::<f32>() / d as f32;
@@ -1072,7 +1091,7 @@ fn apply_rope(buf: &mut [f32], n: usize, stride: usize, width: usize, fc: &[f32]
 /// optional axial RoPE on q/k, additive mask, softmax, output projection
 /// (`w_o` + `ob`). `out` is [n_q, dim]; scale = head_dim^-0.5.
 #[allow(clippy::too_many_arguments)]
-fn run_attn(
+pub(crate) fn run_attn(
     w_qkv: &QTensor,
     qb: &[f32],
     w_o: &QTensor,
@@ -1167,7 +1186,7 @@ fn run_attn(
 
 // ─────────── convolutions (NCHW f32, explicit shapes) ───────────
 
-fn conv2d(
+pub(crate) fn conv2d(
     w: &[f32],
     b: &[f32],
     x: &[f32],
@@ -1214,7 +1233,7 @@ fn conv2d(
 }
 
 /// ConvTranspose2d(k=2, s=2): w is [ci, co, 2, 2]; x is [ci, h, wid].
-fn convt2x2(w: &[f32], b: &[f32], x: &[f32], ci: usize, h: usize, wid: usize, pool: Option<&Pool>) -> Vec<f32> {
+pub(crate) fn convt2x2(w: &[f32], b: &[f32], x: &[f32], ci: usize, h: usize, wid: usize, pool: Option<&Pool>) -> Vec<f32> {
     let co = b.len();
     debug_assert_eq!(w.len(), ci * co * 4);
     let (oh, ow) = (h * 2, wid * 2);
@@ -1239,7 +1258,7 @@ fn convt2x2(w: &[f32], b: &[f32], x: &[f32], ci: usize, h: usize, wid: usize, po
     out
 }
 
-fn maxpool2(x: &[f32], ci: usize, h: usize, wid: usize) -> Vec<f32> {
+pub(crate) fn maxpool2(x: &[f32], ci: usize, h: usize, wid: usize) -> Vec<f32> {
     let (oh, ow) = (h / 2, wid / 2);
     let mut out = vec![0f32; ci * oh * ow];
     for c in 0..ci {
@@ -1260,7 +1279,7 @@ fn maxpool2(x: &[f32], ci: usize, h: usize, wid: usize) -> Vec<f32> {
 }
 
 /// Nearest-neighbour upsample of [ci, h, wid] to [ci, sh, sw].
-fn upsample_nearest(x: &[f32], ci: usize, h: usize, wid: usize, sh: usize, sw: usize) -> Vec<f32> {
+pub(crate) fn upsample_nearest(x: &[f32], ci: usize, h: usize, wid: usize, sh: usize, sw: usize) -> Vec<f32> {
     let mut out = vec![0f32; ci * sh * sw];
     for c in 0..ci {
         for oy in 0..sh {
@@ -1275,7 +1294,7 @@ fn upsample_nearest(x: &[f32], ci: usize, h: usize, wid: usize, sh: usize, sw: u
 }
 
 /// GroupNorm(eps=1e-5) over channels of [c, h, w].
-fn group_norm(x: &mut [f32], groups: usize, w: &[f32], b: &[f32], eps: f32) {
+pub(crate) fn group_norm(x: &mut [f32], groups: usize, w: &[f32], b: &[f32], eps: f32) {
     let co = w.len();
     let gsz = co / groups;
     let rest = x.len() / co;
@@ -1294,7 +1313,7 @@ fn group_norm(x: &mut [f32], groups: usize, w: &[f32], b: &[f32], eps: f32) {
 
 // ─────────── layout helpers ───────────
 
-fn rows_to_chw(rows: &[f32], h: usize, w: usize) -> Vec<f32> {
+pub(crate) fn rows_to_chw(rows: &[f32], h: usize, w: usize) -> Vec<f32> {
     let n = h * w;
     let c = rows.len() / n;
     let mut out = vec![0f32; c * h * w];
@@ -1306,7 +1325,7 @@ fn rows_to_chw(rows: &[f32], h: usize, w: usize) -> Vec<f32> {
     out
 }
 
-fn chw_to_rows(chw: &[f32], h: usize, w: usize) -> Vec<f32> {
+pub(crate) fn chw_to_rows(chw: &[f32], h: usize, w: usize) -> Vec<f32> {
     let c = chw.len() / (h * w);
     let mut out = vec![0f32; h * w * c];
     for ch in 0..c {
@@ -1319,7 +1338,7 @@ fn chw_to_rows(chw: &[f32], h: usize, w: usize) -> Vec<f32> {
 
 /// Normalized sine position encoding for an FPN level: rows [h*w, 2n]
 /// (pos_y then pos_x), scale 2π, temperature 10000.
-fn sine_pos(h: usize, w: usize, n: usize) -> Vec<f32> {
+pub(crate) fn sine_pos(h: usize, w: usize, n: usize) -> Vec<f32> {
     let scale = std::f32::consts::TAU;
     let mut dim_t = vec![0f32; n];
     for i in 0..n { dim_t[i] = 10000f32.powf((2 * (i / 2)) as f32 / n as f32); }
