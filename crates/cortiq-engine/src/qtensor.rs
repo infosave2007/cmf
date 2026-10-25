@@ -2603,9 +2603,11 @@ impl QTensor {
                     );
                     return;
                 }
+                let _pmp = crate::cpuprof::spans::span("mm.prescale");
                 let pre: Vec<std::borrow::Cow<'_, [f32]>> = (0..b)
                     .map(|bi| prescale(&xs_all[bi * cols..(bi + 1) * cols], col_field, *dtype))
                     .collect();
+                drop(_pmp);
                 // MiMo verification is a 2–4 row decode panel, not a wide
                 // prompt GEMM. Keep q8 projections on the same device as
                 // decode; the generic b>=8 gate otherwise silently moves
@@ -4614,6 +4616,7 @@ fn qmatmat(
 ) {
     let b = pre.len();
     debug_assert_eq!(out.len(), b * rows);
+    let _p = crate::cpuprof::spans::span("mm.qmatmat");
     // Big prefill batches ride the AMX (roadmap PR3): the row×batch
     // SDOT loop below peaks near the CPU's dot throughput, an order
     // below the matrix units. Small tensors and tiny test models stay
@@ -4704,7 +4707,12 @@ fn qmatmat(
     // dot, which is already throughput-bound there.
     #[cfg(target_arch = "x86_64")]
     if avx2_a8w8_enabled() {
-        let acts: Vec<SplitAct> = pre.iter().map(|x| split_act(x)).collect();
+        let acts = {
+            let _psa = crate::cpuprof::spans::span("mm.split_act");
+            let a: Vec<SplitAct> = pre.iter().map(|x| split_act(x)).collect();
+            drop(_psa);
+            a
+        };
         let out_addr = SendMut(out.as_mut_ptr());
         // CMF_X86_BLOCKED=0 forces the per-row path (paired in-process
         // A/B on noisy shared-vCPU hosts).

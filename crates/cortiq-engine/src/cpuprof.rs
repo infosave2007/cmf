@@ -109,6 +109,102 @@ pub fn snapshot() -> Vec<(&'static str, f64, u64)> {
         .collect()
 }
 
+/// Labeled stage spans (`SAM3_PROF=1`) — the generic sibling of [`time`]:
+/// a process-wide map label → (ms, calls), accumulated by RAII spans and
+/// printed (then cleared) by a `dump_on_drop` guard. The accumulator is a
+/// shared Mutex so spans taken ON POOL WORKER THREADS inside run_rows
+/// closures land in the caller's dump too. Inclusive: a child span's ms
+/// are also inside its parent's. Off by default: one cached bool per
+/// `span()` call site.
+pub mod spans {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    type Acc = Mutex<BTreeMap<&'static str, (f64, u64)>>;
+
+    #[inline]
+    fn acc() -> &'static Acc {
+        static ACC: OnceLock<Acc> = OnceLock::new();
+        ACC.get_or_init(|| Mutex::new(BTreeMap::new()))
+    }
+
+    #[inline]
+    pub fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("SAM3_PROF").is_ok_and(|v| v != "0"))
+    }
+
+    /// Records wall time from creation to drop under `label`.
+    pub struct Span(Option<(&'static str, Instant)>);
+
+    impl Drop for Span {
+        #[inline]
+        fn drop(&mut self) {
+            if let Some((label, t0)) = self.0.take() {
+                add(label, t0.elapsed());
+            }
+        }
+    }
+
+    /// Manually accumulate `d` under `label` (worker-thread friendly).
+    #[inline]
+    pub fn add(label: &'static str, d: std::time::Duration) {
+        let mut m = match acc().lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let e = m.entry(label).or_insert((0.0, 0));
+        e.0 += d.as_secs_f64() * 1e3;
+        e.1 += 1;
+    }
+
+    /// Start a span; a no-op when `SAM3_PROF` is off.
+    #[inline]
+    pub fn span(label: &'static str) -> Span {
+        if on() {
+            Span(Some((label, Instant::now())))
+        } else {
+            Span(None)
+        }
+    }
+
+    /// Print the accumulated spans under `prefix`, then clear.
+    pub fn dump(prefix: &str) {
+        if !on() {
+            return;
+        }
+        let mut m = match acc().lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if m.is_empty() {
+            return;
+        }
+        eprintln!("[sam3-prof] {prefix}:");
+        let rows: Vec<(&'static str, f64, u64)> =
+            m.iter().map(|(k, v)| (*k, v.0, v.1)).collect();
+        for (k, ms, n) in rows {
+            eprintln!("[sam3-prof]   {k:<18} {ms:>10.1} ms  ({n} calls)");
+        }
+        m.clear();
+    }
+
+    /// Prints (and clears) the accumulator when dropped — one dump per
+    /// forward even through its early-return paths.
+    pub struct Dump(String);
+
+    impl Drop for Dump {
+        fn drop(&mut self) {
+            dump(&self.0);
+        }
+    }
+
+    pub fn dump_on_drop(prefix: impl Into<String>) -> Dump {
+        Dump(prefix.into())
+    }
+}
+
 /// Print ms/token per slot to stderr.
 pub fn report(label: &str, tokens: usize) {
     if !on() {
