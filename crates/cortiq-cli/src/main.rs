@@ -45,6 +45,7 @@ mod videopack;
 mod zimagepack;
 mod qi21pack;
 mod sam3pack;
+mod sam3seg;
 
 use clap::{Parser, Subcommand};
 use cortiq_core::CmfModel;
@@ -2275,6 +2276,36 @@ enum Commands {
         #[arg(long)]
         out: String,
     },
+    /// SAM3 image inference: an image + a text prompt → a mask-overlay
+    /// PNG and JSON with normalized boxes, per-object scores and the CPU
+    /// forward time. Preprocess and prompt framing are the reference
+    /// ones (resize 1008², mean/std 0.5, CLIP frame padded to 32), so
+    /// the boxes/masks line up with `tools/sam3_ref.py` fixtures.
+    /// `cortiq segment model.cmf img.png --prompt "red square"`
+    Segment {
+        /// Path to the SAM3 .cmf (from `sam3-pack`)
+        model: String,
+        /// Input image (PNG, JPEG, … — anything the media decoder reads)
+        image: String,
+        /// Text prompt, e.g. "red square"
+        #[arg(long)]
+        prompt: String,
+        /// Overlay PNG path (default: <image stem>_seg.png beside the input)
+        #[arg(long)]
+        out: Option<String>,
+        /// Write the JSON here instead of stdout
+        #[arg(long)]
+        json: Option<String>,
+        /// Keep at most this many objects, sorted by score
+        #[arg(long, default_value = "10")]
+        topk: usize,
+        /// Score threshold (0.5 = the vendor's `score_threshold_detection`)
+        #[arg(long, default_value = "0.5")]
+        thr: f32,
+        /// Mask binarization threshold on the sigmoid (HF default 0.5)
+        #[arg(long = "mask-thr", default_value = "0.5")]
+        mask_thr: f32,
+    },
     /// Pack a Diffusers source into CMF. A Qwen-Image-2.1 directory
     /// (QwenImage21Pipeline) or a Z-Image / Z-Image-Turbo pipeline
     /// directory (model_index.json = ZImagePipeline) becomes ONE ready-to-run
@@ -4463,6 +4494,40 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Sam3Pack { src, quant, out } => sam3pack::pack(&src, &quant, &out),
+        Commands::Segment {
+            model,
+            image,
+            prompt,
+            out,
+            json,
+            topk,
+            thr,
+            mask_thr,
+        } => {
+            let args = sam3seg::SegArgs {
+                model,
+                image,
+                prompt,
+                out,
+                json,
+                topk,
+                thr,
+                mask_thr,
+            };
+            let res = sam3seg::run(&args)?;
+            sam3seg::print_json_if_stdio(&res.json, args.json.as_deref())?;
+            eprintln!(
+                "segment: {} object(s) of {}x{}, preprocess {:.0} ms + forward {:.0} ms (total {:.0} ms) -> {}",
+                res.detections.len(),
+                res.image_size.0,
+                res.image_size.1,
+                res.preprocess_ms,
+                res.forward_ms,
+                res.total_ms,
+                res.overlay_path.display()
+            );
+            Ok(())
+        }
         Commands::ImaginePack {
             root,
             quant,

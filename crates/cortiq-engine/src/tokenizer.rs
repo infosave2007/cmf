@@ -61,6 +61,23 @@ pub struct Tokenizer {
     /// synthetic `byte_level()` tokenizer)
     /// Applied in order; each subdivides the previous stage's pieces.
     split_res: Vec<fancy_regex::Regex>,
+    /// Per-stage gap policy, parallel to `split_res`: `true` when the
+    /// stage's Split declares `behavior: Removed, invert: true`, so the
+    /// NON-matching spans (whitespace) are dropped instead of kept as
+    /// pieces. The CLIP family isolates words that way — keeping the
+    /// gaps would hand BPE a stray `Ġ` piece per space.
+    split_drop_gap: Vec<bool>,
+    /// `model.end_of_word_suffix` (CLIP: `</w>`), appended to a piece's
+    /// LAST symbol before the merges run — the merges themselves carry
+    /// the suffix (`["th", "e</w>"]`), so plain words resolve to their
+    /// `…</w>` ids, never to the mid-word spelling.
+    eow_suffix: Option<String>,
+    /// Normalizer `Lowercase` (CLIP): lower-case the segment before the
+    /// pre-tokenizer runs.
+    lowercase: bool,
+    /// Normalizer `Replace(\s+ → " ")` (CLIP): collapse whitespace runs
+    /// to a single space, before lowercasing.
+    collapse_ws: bool,
     /// SentencePiece Prepend("▁") normalizer present (llama family).
     /// Gemma replaces spaces with ▁ but does NOT prepend one.
     sp_prepend: bool,
@@ -149,6 +166,9 @@ struct HfModel {
     merges: Vec<HfMerge>,
     #[serde(default)]
     byte_fallback: bool,
+    /// CLIP's `</w>`: the BPE model appends it to a word's last symbol.
+    #[serde(default)]
+    end_of_word_suffix: Option<String>,
 }
 
 /// Merge rules come in two HF flavours: legacy `"a b"` strings and
@@ -189,6 +209,23 @@ fn collect_split_patterns(pt: &serde_json::Value, out: &mut Vec<String>) {
     if let Some(list) = pt.get("pretokenizers").and_then(|l| l.as_array()) {
         for p in list {
             collect_split_patterns(p, out);
+        }
+    }
+}
+
+/// The gap policy of every Split stage, in the SAME traversal order as
+/// [`collect_split_patterns`]: `true` = `behavior: Removed` with
+/// `invert: true` (non-matching spans dropped — CLIP's word isolation).
+fn collect_split_drop_gaps(pt: &serde_json::Value, out: &mut Vec<bool>) {
+    if pt.get("type").and_then(|t| t.as_str()) == Some("Split") {
+        let behavior = pt.get("behavior").and_then(|b| b.as_str()).unwrap_or("");
+        let invert = pt.get("invert").and_then(|i| i.as_bool()).unwrap_or(false);
+        out.push(behavior == "Removed" && invert);
+        return;
+    }
+    if let Some(list) = pt.get("pretokenizers").and_then(|l| l.as_array()) {
+        for p in list {
+            collect_split_drop_gaps(p, out);
         }
     }
 }
@@ -384,8 +421,8 @@ impl Tokenizer {
                 _ => (false, false),
             }
         };
-        let split_res = if metaspace {
-            Vec::new()
+        let (split_res, split_drop_gap) = if metaspace {
+            (Vec::new(), Vec::new())
         } else {
             let mut pats = Vec::new();
             if let Some(pt) = hf.pre_tokenizer.as_ref() {
@@ -394,13 +431,32 @@ impl Tokenizer {
             if pats.is_empty() {
                 pats.push(DEFAULT_SPLIT.to_string());
             }
-            pats.iter()
-                .map(|p| {
-                    fancy_regex::Regex::new(p)
-                        .map_err(|e| TokenizerError::Parse(format!("pre-tokenizer regex: {e}")))
-                })
-                .collect::<Result<Vec<_>, _>>()?
+            let mut split_drop_gap = Vec::new();
+            if let Some(pt) = hf.pre_tokenizer.as_ref() {
+                collect_split_drop_gaps(pt, &mut split_drop_gap);
+            }
+            while split_drop_gap.len() < pats.len() {
+                split_drop_gap.push(false);
+            }
+            split_drop_gap.truncate(pats.len());
+            (
+                pats.iter()
+                    .map(|p| {
+                        fancy_regex::Regex::new(p)
+                            .map_err(|e| TokenizerError::Parse(format!("pre-tokenizer regex: {e}")))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                split_drop_gap,
+            )
         };
+        // CLIP's normalizer: NFC → Replace(\s+ → " ") → Lowercase.
+        let norm_s = hf
+            .normalizer
+            .as_ref()
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+        let collapse_ws = norm_s.contains("\"Replace\"") && norm_s.contains("\\\\s+");
+        let lowercase = norm_s.contains("\"Lowercase\"");
 
         // Added tokens: longest-first so overlapping contents match right.
         let mut bos_token_id = None;
@@ -423,7 +479,7 @@ impl Tokenizer {
                 "<|endoftext|>" | "</s>" | "[EOS]" => eos_token_id = Some(at.id),
                 "<|im_start|>" => im_start_id = Some(at.id),
                 "<|im_end|>" => im_end_id = Some(at.id),
-                "<s>" | "[BOS]" => bos_token_id = Some(at.id),
+                "<s>" | "[BOS]" | "<|startoftext|>" => bos_token_id = Some(at.id),
                 // Gemma spells BOS as literal "<bos>" — the family
                 // REQUIRES it on every sequence, and newer tokenizers
                 // (gemma-4) no longer say so in a post_processor.
@@ -526,6 +582,10 @@ impl Tokenizer {
             added_ids,
             special_ids,
             split_res,
+            split_drop_gap,
+            eow_suffix: hf.model.end_of_word_suffix,
+            lowercase,
+            collapse_ws,
             metaspace,
             sp_prepend,
             sp_prepend_first,
@@ -562,6 +622,10 @@ impl Tokenizer {
             added_ids: HashSet::new(),
             special_ids: HashSet::new(),
             split_res: Vec::new(),
+            split_drop_gap: Vec::new(),
+            eow_suffix: None,
+            lowercase: false,
+            collapse_ws: false,
             metaspace: false,
             sp_prepend: false,
             sp_prepend_first: false,
@@ -632,18 +696,39 @@ impl Tokenizer {
         ids
     }
 
-    /// Encode one added-token-free segment: NFC → split → byte-map →
-    /// BPE. `head` says whether this section starts at offset 0 of the
+    /// Encode one added-token-free segment: NFC → whitespace collapse →
+    /// lowercase (the CLIP normalizer chain) → split → byte-map → BPE.
+    /// `head` says whether this section starts at offset 0 of the
     /// input — only that one takes a `prepend_scheme: "first"` ▁.
     fn encode_segment_at(&self, segment: &str, head: bool, out: &mut Vec<u32>) {
         if segment.is_empty() {
             return;
         }
-        let norm: String = if self.nfc {
+        let mut norm: String = if self.nfc {
             segment.nfc().collect()
         } else {
             segment.to_string()
         };
+        if self.collapse_ws {
+            // Replace(\s+ → " "): every whitespace RUN becomes one space.
+            let mut collapsed = String::with_capacity(norm.len());
+            let mut in_ws = false;
+            for ch in norm.chars() {
+                if ch.is_whitespace() {
+                    if !in_ws {
+                        collapsed.push(' ');
+                        in_ws = true;
+                    }
+                } else {
+                    collapsed.push(ch);
+                    in_ws = false;
+                }
+            }
+            norm = collapsed;
+        }
+        if self.lowercase {
+            norm = norm.to_lowercase();
+        }
         if self.metaspace {
             // SentencePiece: [Prepend("▁") +] Replace(" "→"▁"), BPE over
             // chars of the whole span (no pre-tokenizer, no byte map).
@@ -669,8 +754,11 @@ impl Tokenizer {
         if !self.split_res.is_empty() {
             // Each stage subdivides the pieces the previous one left, with
             // Isolated behaviour: both the matches and the gaps survive.
+            // A stage declaring `behavior: Removed, invert: true` keeps
+            // only the matches — its gaps (whitespace) are dropped.
             let mut pieces: Vec<(usize, usize)> = vec![(0, norm.len())];
-            for re in &self.split_res {
+            for (stage, re) in self.split_res.iter().enumerate() {
+                let drop = self.split_drop_gap.get(stage).copied().unwrap_or(false);
                 let mut next: Vec<(usize, usize)> = Vec::with_capacity(pieces.len() * 2);
                 for (ps, pe) in pieces {
                     let seg = &norm[ps..pe];
@@ -683,7 +771,7 @@ impl Tokenizer {
                                 break;
                             }
                         };
-                        if m.start() > last {
+                        if m.start() > last && !drop {
                             next.push((ps + last, ps + m.start()));
                         }
                         if m.end() > m.start() {
@@ -691,7 +779,7 @@ impl Tokenizer {
                         }
                         last = m.end();
                     }
-                    if last < seg.len() {
+                    if last < seg.len() && !drop {
                         next.push((ps + last, pe));
                     }
                 }
@@ -806,6 +894,14 @@ impl Tokenizer {
             .map(|b| self.byte_to_char[b as usize].to_string())
             .collect();
         let mut sym = mapped;
+        // CLIP's `end_of_word_suffix`: the last symbol of the word wears
+        // it before any merge runs, so the suffixed merges ("th",
+        // "e</w>") can form and the word resolves to its `…</w>` id.
+        if let Some(sfx) = &self.eow_suffix {
+            if let Some(last) = sym.last_mut() {
+                last.push_str(sfx);
+            }
+        }
 
         // Classic BPE: repeatedly merge the lowest-rank adjacent pair.
         loop {
