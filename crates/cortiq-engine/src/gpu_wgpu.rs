@@ -38471,6 +38471,14 @@ pub fn q82_short_rows(
 /// goes to the matrix units the field is folded into the plane instead, and
 /// nothing touches the activation at all.
 #[allow(clippy::too_many_arguments)]
+/// q8_matmat_2f refusal telemetry (SAM3 GPU-port diagnosis): which
+/// gate turned the device kernel down. Read by the SAM3_STAGES report.
+pub static M2F_NO_CTX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static M2F_SHAPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static M2F_ENTRY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static M2F_BOUNDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static M2F_DISPATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn q8_matmat_2f(
     model: &Arc<CmfModel>,
     idx: usize,
@@ -38484,16 +38492,22 @@ pub fn q8_matmat_2f(
 ) -> bool {
     // MiMo's f32 GEMM contract holds on this entry too (see `q8_matmat`).
     let _precision = MimoF32Gemm::enter(&model.arch().arch_name);
-    let Some(c) = ctx() else { return false };
+    let Some(c) = ctx() else {
+        M2F_NO_CTX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    };
     let _op = c.op_gate.enter();
     if cols % 4 != 0 || rows == 0 || b == 0 || col_field.len() < cols {
+        M2F_SHAPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return false;
     }
     let entry = &model.tensors[idx];
     if entry.shape.first().copied().unwrap_or(0) < rows {
+        M2F_ENTRY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return false;
     }
     let Some(abs) = model.entry_abs_offset(entry) else {
+        M2F_BOUNDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return false;
     };
     let bytes = model.primary_bytes();
@@ -38507,9 +38521,10 @@ pub fn q8_matmat_2f(
         || xs.len() < b * cols
         || out.len() < b * rows
     {
+        M2F_BOUNDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return false;
     }
-    dispatch_matmat_keep(
+    let ok = dispatch_matmat_keep(
         c,
         {
             note_layer((model.uid() as usize, idx), &model.tensors[idx].name);
@@ -38526,7 +38541,11 @@ pub fn q8_matmat_2f(
         None,
         None,
     )
-    .is_some()
+    .is_some();
+    if !ok {
+        M2F_DISPATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    ok
 }
 
 thread_local! {
