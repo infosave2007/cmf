@@ -17977,6 +17977,7 @@ fn dense_ffn_cpu(d: &DenseFfn, x: &[f32], pool: Option<&Pool>) -> Vec<f32> {
             // Multi-matrix job: gate+up under one pool dispatch.
             let _prof = crate::cpuprof::time(crate::cpuprof::Slot::FfnGateUp);
             QTensor::matvec_many([&d.gate_proj, &d.up_proj], x, [g, u], pool);
+            let _c = crate::cpuprof::time(crate::cpuprof::Slot::FfnCombine);
             for i in 0..inter {
                 g[i] = d.act.combine(g[i], u[i]);
             }
