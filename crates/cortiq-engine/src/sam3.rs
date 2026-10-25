@@ -22,6 +22,29 @@ use crate::qtensor::QTensor;
 /// Additive mask for "key is padded": saturates softmax to 0.
 const NEG: f32 = -1e30;
 
+/// The vendor image preprocess, exactly as `cfg.processor` spells it:
+/// resize to 1008×1008 with `resample: 2` (bilinear), rescale 1/255,
+/// normalize with mean/std 0.5 per channel, emit CHW f32. This produces
+/// the parity fixtures' `pixels.f32` from the source image.
+pub fn preprocess(frame: &crate::media::RgbFrame) -> Vec<f32> {
+    use image::imageops::{self, FilterType};
+    let img = image::RgbImage::from_raw(
+        frame.width as u32,
+        frame.height as u32,
+        frame.data.clone(),
+    )
+    .expect("RgbFrame buffer matches its own dimensions");
+    let rs = imageops::resize(&img, PIX as u32, PIX as u32, FilterType::Triangle);
+    let raw = rs.into_raw();
+    let mut out = vec![0f32; 3 * PIX * PIX];
+    for i in 0..PIX * PIX {
+        for c in 0..3 {
+            out[c * PIX * PIX + i] = (raw[i * 3 + c] as f32 / 255.0 - 0.5) / 0.5;
+        }
+    }
+    out
+}
+
 const PIX: usize = 1008;
 const PATCH: usize = 14;
 const GRID: usize = PIX / PATCH; // 72
@@ -66,6 +89,15 @@ pub struct Sam3Out {
     pub pred_boxes: Vec<f32>,
     /// Instance masks, [200 * 288 * 288].
     pub pred_masks: Vec<f32>,
+    /// Per-query classification logits from the dot-product scorer
+    /// (`det.scoring.*`), [200] — the final score of a query is
+    /// `sigmoid(pred_logits) * sigmoid(presence_logit)` (HF's
+    /// `post_process_object_detection`). Empty when `SAM3_ONLY`
+    /// skips the decoder.
+    pub pred_logits: Vec<f32>,
+    /// Presence-token logit of the final decoder layer (clamped ±10).
+    /// 0.0 when the decoder did not run.
+    pub presence_logit: f32,
 }
 
 /// Additive attention masks (added to scores before softmax).
@@ -189,6 +221,8 @@ impl Sam3 {
             dec_hidden: Vec::new(),
             pred_boxes: Vec::new(),
             pred_masks: Vec::new(),
+            pred_logits: Vec::new(),
+            presence_logit: 0.0,
         };
         if !want("trunk") {
             return Ok(blank(text_embeds, text_feats));
@@ -210,7 +244,18 @@ impl Sam3 {
             o.enc_hidden = enc_hidden;
             return Ok(o);
         }
-        let (dec_hidden, final_refs) = self.detr_decoder(&enc_hidden, &pos, &text_feats, attn, pool)?;
+        let (dec_hidden, final_refs, presence_logit) =
+            self.detr_decoder(&enc_hidden, &pos, &text_feats, attn, pool)?;
+        // Dot-product scoring (det.scoring.*): the FINAL layer's DETR
+        // queries against the mean-pooled prompt features. Logits, not
+        // probabilities — the caller multiplies both sigmoids, as HF's
+        // post-processor does (`all_pred_logits[-1]`).
+        let pred_logits = self.score(
+            &text_feats,
+            attn,
+            &dec_hidden[(NL - 1) * NQ * FD..],
+            pool,
+        )?;
         if !want("masks") {
             let mut o = blank(text_embeds, text_feats);
             o.trunk_feats = trunk_feats;
@@ -218,6 +263,8 @@ impl Sam3 {
             o.enc_hidden = enc_hidden;
             o.dec_hidden = dec_hidden.clone();
             o.pred_boxes = xyxy(&final_refs);
+            o.pred_logits = pred_logits;
+            o.presence_logit = presence_logit;
             return Ok(o);
         }
         let pred_boxes = xyxy(&final_refs);
@@ -238,6 +285,8 @@ impl Sam3 {
             dec_hidden,
             pred_boxes,
             pred_masks,
+            pred_logits,
+            presence_logit,
         })
     }
 
@@ -599,7 +648,10 @@ impl Sam3 {
 
     /// Returns (stacked layer outputs [6*200*256], final reference boxes
     /// in cxcywh — the box_head refinement of the last layer, which
-    /// equals Sam3Model's `all_pred_boxes[-1]` pre-xyxy conversion).
+    /// equals Sam3Model's `all_pred_boxes[-1]` pre-xyxy conversion — and
+    /// the FINAL layer's presence logit: the presence row through
+    /// `presence_token_out_norm` + the 3-layer presence head, clamped
+    /// ±10 as HF clamps it).
     fn detr_decoder(
         &self,
         enc: &[f32],
@@ -607,7 +659,7 @@ impl Sam3 {
         text: &[f32],
         am: &[u8],
         pool: Option<&Pool>,
-    ) -> Result<(Vec<f32>, Vec<[f32; 4]>)> {
+    ) -> Result<(Vec<f32>, Vec<[f32; 4]>, f32)> {
         let m = &self.model;
         let n = enc.len() / FD;
         let db = "det.transformer.decoder.";
@@ -633,6 +685,9 @@ impl Sam3 {
         let bbox = DecoderMlp3::load3(m, &format!("{db}bbox_embed."))?;
         let olnw = load_vec(m, &format!("{db}norm.weight"))?;
         let olnb = load_vec(m, &format!("{db}norm.bias"))?;
+        let pres_w = load_vec(m, &format!("{db}presence_token_out_norm.weight"))?;
+        let pres_b = load_vec(m, &format!("{db}presence_token_out_norm.bias"))?;
+        let pres_head = DecoderMlp3::load3(m, &format!("{db}presence_token_head."))?;
         let key = add_rows(enc, pos); // enc + pos, [n, FD]
         let mut inter: Vec<Vec<f32>> = Vec::with_capacity(NL);
         for l in 0..NL {
@@ -708,7 +763,78 @@ impl Sam3 {
             }
         }
         let dec = inter.iter().flat_map(|v| v.iter().copied()).collect();
-        Ok((dec, refs))
+        // Presence logit of the FINAL layer: row 0 (the presence token)
+        // is post-normed by the layer stack like every other row — feed
+        // it through presence_layer_norm + presence_head (relu, relu,
+        // linear — 3 layers), clamp ±10 (HF `clamp_presence_logit_max_val`).
+        let mut ph = hidden[0..FD].to_vec();
+        layer_norm_rows(&mut ph, &pres_w, &pres_b, D_EPS);
+        let pl = pres_head.forward(&ph, 1, pool);
+        let presence_logit = pl[0].clamp(-10.0, 10.0);
+        Ok((dec, refs, presence_logit))
+    }
+
+    /// Dot-product concept scoring — HF `Sam3DotProductScoring` over
+    /// the `det.scoring.*` section: the prompt MLP (2 layers, relu
+    /// between) + residual + out-norm on the resizer features,
+    /// mean-pooled over the unpadded positions, projected by
+    /// `prompt_proj`; the output-normed queries of the FINAL decoder
+    /// layer projected by `hs_proj`; the dot product scaled by
+    /// 1/sqrt(256) and clamped to ±12 (HF `clamp_max_val`). `dec` is
+    /// one layer's `[nq * FD]` queries; returns `nq` logits.
+    fn score(
+        &self,
+        text: &[f32],
+        am: &[u8],
+        dec: &[f32],
+        pool: Option<&Pool>,
+    ) -> Result<Vec<f32>> {
+        let m = &self.model;
+        let mlp = DecoderMlp::load(m, "det.scoring.prompt_mlp.")?;
+        let mut h = mlp.forward(text, SS, pool, FD);
+        for (a, b) in h.iter_mut().zip(text) {
+            *a += *b;
+        }
+        let (ow, ob) = (
+            load_vec(m, "det.scoring.prompt_mlp.out_norm.weight")?,
+            load_vec(m, "det.scoring.prompt_mlp.out_norm.bias")?,
+        );
+        layer_norm_rows(&mut h, &ow, &ob, D_EPS);
+        // Mean pool over attention_mask == 1 (HF `_pool_text_features`).
+        let n_valid = am.iter().filter(|&&v| v == 1).count().max(1) as f32;
+        let mut pooled = vec![0f32; FD];
+        for (i, &v) in am.iter().enumerate().take(SS) {
+            if v == 1 {
+                for d in 0..FD {
+                    pooled[d] += h[i * FD + d];
+                }
+            }
+        }
+        for v in pooled.iter_mut() {
+            *v /= n_valid;
+        }
+        let pt = lin(m, "det.scoring.prompt_proj.weight")?;
+        let pb = load_vec(m, "det.scoring.prompt_proj.bias")?;
+        let mut tp = vec![0f32; FD];
+        pt.matmat(&pooled, 1, &mut tp, pool);
+        add_bias(&mut tp, FD, &pb);
+        let nq = dec.len() / FD;
+        let hs = lin(m, "det.scoring.hs_proj.weight")?;
+        let hb = load_vec(m, "det.scoring.hs_proj.bias")?;
+        let mut q = vec![0f32; nq * FD];
+        hs.matmat(dec, nq, &mut q, pool);
+        add_bias(&mut q, FD, &hb);
+        let scale = 1.0 / (FD as f32).sqrt();
+        Ok(q
+            .chunks(FD)
+            .map(|r| {
+                let mut acc = 0f32;
+                for d in 0..FD {
+                    acc += r[d] * tp[d];
+                }
+                (acc * scale).clamp(-12.0, 12.0)
+            })
+            .collect())
     }
 
     // ── mask decoder ────────────────────────────────────────────────

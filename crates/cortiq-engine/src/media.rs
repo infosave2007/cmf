@@ -114,6 +114,13 @@ pub fn read_rgb(path: &std::path::Path) -> Result<RgbFrame, String> {
     decode_rgb(&bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Write an RGB raster as PNG (lossless, 8-bit).
+pub fn save_png(path: &std::path::Path, frame: &RgbFrame) -> Result<(), String> {
+    let img = image::RgbImage::from_raw(frame.width as u32, frame.height as u32, frame.data.clone())
+        .ok_or_else(|| "RGB buffer does not match its dimensions".to_string())?;
+    img.save(path).map_err(|e| format!("png write failed: {e}"))
+}
+
 /// Binary PPM (`P6`, maxval ≤ 255). `ffmpeg -i x.mp4 frames/%06d.ppm` is the
 /// cheapest way to hand a video to the frame-directory source, and the
 /// `image` crate is built here without its PNM decoder.
