@@ -196,6 +196,7 @@ impl<'a> Net<'a> {
         debug_assert_eq!(out.len(), nq * wo.rows());
 
         let mut q = vec![0f32; nq * int_dim];
+        let _pg = crate::cpuprof::spans::span("vid.attn.gemm");
         wq.matmat(xs_q, nq, &mut q, self.pool);
         sam3::add_bias(&mut q, int_dim, &bq);
         let mut k = vec![0f32; nk * int_dim];
@@ -204,6 +205,7 @@ impl<'a> Net<'a> {
         let mut v = vec![0f32; nk * int_dim];
         wv.matmat(xs_v, nk, &mut v, self.pool);
         sam3::add_bias(&mut v, int_dim, &bv);
+        drop(_pg);
 
         let n_heads = self.n_heads(prefix)?;
         let hd = int_dim / n_heads;
@@ -230,42 +232,70 @@ impl<'a> Net<'a> {
         let scale = 1.0 / (hd as f32).sqrt();
         let mut res = vec![0f32; nq * int_dim];
         let rb = res.as_mut_ptr() as usize;
+        let _pc = crate::cpuprof::spans::span("vid.attn.core");
         let run = |s: usize, e: usize| {
+            if s >= e {
+                return;
+            }
             let res = unsafe { std::slice::from_raw_parts_mut(rb as *mut f32, nq * int_dim) };
-            let mut scores = vec![0f32; nk];
-            for i in s..e {
-                for t in 0..n_heads {
-                    let qr = &q[i * int_dim + t * hd..i * int_dim + (t + 1) * hd];
+            let rows = e - s;
+            let mut scores = vec![0f32; rows * nk];
+            let prof = crate::cpuprof::spans::on();
+            for t in 0..n_heads {
+                let tq = prof.then(std::time::Instant::now);
+                // C[rows, nk] = scale · Q[rows, hd] × Kᵀ (K rows stride int_dim)
+                crate::qtensor::sgemm_public(
+                    rows,
+                    nk,
+                    hd,
+                    scale,
+                    &q[s * int_dim + t * hd..],
+                    int_dim,
+                    &k[t * hd..],
+                    int_dim,
+                    true,
+                    &mut scores,
+                    nk,
+                );
+                let tm = prof.then(std::time::Instant::now);
+                for r in 0..rows {
+                    let sr = &mut scores[r * nk..(r + 1) * nk];
                     let mut mx = f32::NEG_INFINITY;
-                    for j in 0..nk {
-                        let kr = &k[j * int_dim + t * hd..j * int_dim + (t + 1) * hd];
-                        let mut acc = 0f32;
-                        for (a, b) in qr.iter().zip(kr) {
-                            acc += *a * *b;
-                        }
-                        let val = acc * scale;
-                        scores[j] = val;
-                        if val > mx {
-                            mx = val;
+                    for &v in sr.iter() {
+                        if v > mx {
+                            mx = v;
                         }
                     }
                     let mut sum = 0f32;
-                    for j in 0..nk {
-                        scores[j] = (scores[j] - mx).exp();
-                        sum += scores[j];
+                    for v in sr.iter_mut() {
+                        *v = (*v - mx).exp();
+                        sum += *v;
                     }
                     let inv = 1.0 / sum;
-                    let orow = &mut res[i * int_dim + t * hd..i * int_dim + (t + 1) * hd];
-                    for j in 0..nk {
-                        let wgt = scores[j] * inv;
-                        if wgt == 0.0 {
-                            continue;
-                        }
-                        let vr = &v[j * int_dim + t * hd..j * int_dim + (t + 1) * hd];
-                        for (o, vv) in orow.iter_mut().zip(vr) {
-                            *o += wgt * *vv;
-                        }
+                    for v in sr.iter_mut() {
+                        *v *= inv;
                     }
+                }
+                let ta = prof.then(std::time::Instant::now);
+                // C[rows, hd] = S[rows, nk] × V_head (rows stride int_dim)
+                crate::qtensor::sgemm_public(
+                    rows,
+                    hd,
+                    nk,
+                    1.0,
+                    &scores,
+                    nk,
+                    &v[t * hd..],
+                    int_dim,
+                    false,
+                    &mut res[s * int_dim + t * hd..],
+                    int_dim,
+                );
+                if let (Some(t0), Some(t1), Some(t2)) = (tq, tm, ta) {
+                    let t3 = std::time::Instant::now();
+                    crate::cpuprof::spans::add("vid.qk", t1 - t0);
+                    crate::cpuprof::spans::add("vid.sm", t2 - t1);
+                    crate::cpuprof::spans::add("vid.av", t3 - t2);
                 }
             }
         };
@@ -273,6 +303,8 @@ impl<'a> Net<'a> {
             Some(p) => p.run_rows(nq, &run),
             None => run(0, nq),
         }
+        drop(_pc);
+        let _pg = crate::cpuprof::spans::span("vid.attn.gemm");
         wo.matmat(&res, nq, out, self.pool);
         sam3::add_bias(out, wo.rows(), &ob);
         Ok(())
@@ -420,6 +452,7 @@ impl<'a> Net<'a> {
         for (a, b) in img.iter_mut().zip(dense) {
             *a += *b;
         }
+        let _pdec = crate::cpuprof::spans::span("vid.dec.core");
         let img_rows = sam3::chw_to_rows(&img, EMB, EMB);
         let n_img = EMB * EMB;
 
@@ -523,6 +556,7 @@ impl<'a> Net<'a> {
             iou.push(iou_all.get(sel_from + mi).copied().unwrap_or(1.0));
             toks.extend_from_slice(&mask_tok[(sel_from + mi) * HID..(sel_from + mi + 1) * HID]);
         }
+        drop(_pdec);
         Ok((masks, iou, obj_score, toks))
     }
 
