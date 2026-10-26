@@ -1,14 +1,21 @@
 # ТЗ: сжатие модели под задачу по данным учителя
 
-**`cortiq teacher-data` + `cortiq compress`** — нативный конвейер
+**`cortiq teacher-data` + `cortiq compress`** — проектный конвейер
 «данные учителя → засветка нейронов → свёртка NVG → лечение → квантизация»
 внутри движка CMF.
+
+> **Статус для релиза 0.8.37.** В релиз вошёл только text-only E1 v1:
+> `cortiq teacher-data generate` и `teacher-data inspect`. Это ТЗ описывает
+> последующие исследовательские стадии, в том числе ещё не выпущенную команду
+> `cortiq compress`; его нельзя читать как справку по доступным флагам.
+> Практическая инструкция для выпущенного пути:
+> [`TEACHER_DATA.ru.md`](TEACHER_DATA.ru.md).
 
 | | |
 |---|---|
 | Версия | 1.0, черновик к согласованию |
 | Дата | 26.10.2026 |
-| База кода | `infosave2007/cmf`, master `6cfdd807` (v0.8.35) |
+| База кода | `infosave2007/cmf`, релиз `v0.8.37`; исторические измерения ниже сделаны на pre-release срезе |
 | Источник метода | `cortiq-bot/colab_nvg_compress.ipynb` — методический reference; NVG Topological Specialization (Patent 12), Genesis Ť + FCD (Patent 2), quality/episode contract (Patent 4) |
 | Прототипы в репозитории | `tools/nvg_fold_qwen35.py`, `tools/heal_data_teacher.py`, `tools/nvg_heal_kd.py`, `tools/quant/escort.py`, `crates/cortiq-cli/examples/tube_gen.rs` |
 | Язык реализации | Rust, внутри `cortiq`. Python — только как эталон для сверки в тестах, в конвейере его нет |
@@ -50,13 +57,13 @@ cortiq compress Qwen/Qwen3.8-27B coder.tdata cortiq-coder-12b.cmf q4tp --size 12
 
 ### 1.2 Фактический начальный срез (26.10.2026)
 
-Это **не** заявление о готовности всего конвейера: на этой ветке реализованы
+Это **не** заявление о готовности всего конвейера: в релизе реализованы
 `.tdata` v1, `inspect` и минимальный direct-answer `generate`; остальная E2
 (top-k, online stop, import/merge/resplit, resume, shard/parallel) только
 спланирована. `compress` ещё не готов и цифры ниже не являются quality-gate
-сжатой модели. Фактически
-измеренный локальный бинарь этой ветки выводит `cortiq 0.6.8`; указанная выше
-`v0.8.35` — целевая база самого ТЗ, а не утверждение о версии этого среза.
+сжатой модели. Часть чисел и JSON-фрагментов далее зафиксирована во время
+pre-release эксперимента, где бинарь выводил `cortiq 0.6.8`; они сохранены как
+историческая воспроизводимая запись, а не как утверждение о версии релиза.
 
 Для первого настоящего прогона взят существующий набор
 `/Users/oleg/Documents/cortiq-bot/benchmarks/calibration_prompts.jsonl`:
