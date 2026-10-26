@@ -44,6 +44,7 @@ mod sign;
 mod skill;
 mod transcribe;
 mod tube;
+mod mtpcompact;
 mod utility;
 mod videopack;
 mod zimagepack;
@@ -799,6 +800,29 @@ enum Commands {
         /// Output .cmf
         #[arg(long)]
         output: String,
+    },
+    /// Calibrate and physically compact a dense MTP draft FFN without
+    /// rewriting the trunk. Statistics are teacher-forced through the
+    /// actual draft stack; the output is a main CMF or, for a MiMo sidecar,
+    /// a replacement `.mtp.cmf` placed beside its unchanged main file.
+    MtpCompact {
+        /// Source main .cmf (the MTP sidecar is discovered automatically)
+        model: String,
+        /// Finalized .tdata selector, for example calibration.tdata:train
+        #[arg(long)]
+        data: String,
+        /// Output .cmf (a compact main file or compact .mtp.cmf sidecar)
+        #[arg(long)]
+        output: String,
+        /// Fraction of each draft FFN width to retain; rounded down to 32-wide codec groups
+        #[arg(long, default_value_t = 0.90)]
+        keep_ratio: f64,
+        /// Write the auditable v2 MTP plan here (default: <output>.mtp-plan.json)
+        #[arg(long)]
+        plan_out: Option<String>,
+        /// Cap selected calibration records (0 = all selected records)
+        #[arg(long, default_value_t = 0)]
+        max_records: usize,
     },
     /// Store every dense layer's `down_proj` a second time, transposed,
     /// so per-token neuron selection reads a neuron's down weights as a
@@ -3881,6 +3905,21 @@ async fn main() -> anyhow::Result<()> {
             plan,
             output,
         } => tube::cmd_tube_bake(&model, &plan, &output),
+        Commands::MtpCompact {
+            model,
+            data,
+            output,
+            keep_ratio,
+            plan_out,
+            max_records,
+        } => mtpcompact::cmd_mtp_compact(
+            &model,
+            &data,
+            &output,
+            keep_ratio,
+            plan_out.as_deref(),
+            max_records,
+        ),
         Commands::FfnTranspose { model, output } => tube::cmd_ffn_transpose(&model, &output),
         Commands::MoeMask {
             model,
