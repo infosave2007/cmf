@@ -32,7 +32,10 @@
 
 use crate::gpu::{Qi21BlockRef, Qi21Geom, Qi21PrefillArgs};
 use cortiq_core::{CmfModel, TensorDtype};
-use metal::{Buffer, CommandBuffer, ComputeCommandEncoderRef, ComputePipelineState, MTLResourceOptions, MTLSize};
+use metal::{
+    Buffer, CommandBuffer, ComputeCommandEncoderRef, ComputePipelineState, MTLResourceOptions,
+    MTLSize,
+};
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -81,7 +84,9 @@ fn build_pipes(c: &Ctx) -> Result<Pipes, String> {
         .new_library_with_source(QMSL, &opts)
         .map_err(|e| format!("qi21 MSL compile: {e}"))?;
     let pso = |name: &str| -> Result<ComputePipelineState, String> {
-        let f = lib.get_function(name, None).map_err(|e| format!("kernel {name}: {e}"))?;
+        let f = lib
+            .get_function(name, None)
+            .map_err(|e| format!("kernel {name}: {e}"))?;
         c._device
             .new_compute_pipeline_state_with_function(&f)
             .map_err(|e| format!("pipeline {name}: {e}"))
@@ -102,7 +107,9 @@ fn build_pipes(c: &Ctx) -> Result<Pipes, String> {
 }
 
 fn frag_layout_ok(c: &Ctx, p: &Pipes) -> bool {
-    let out = c._device.new_buffer(128 * 4, MTLResourceOptions::StorageModeShared);
+    let out = c
+        ._device
+        .new_buffer(128 * 4, MTLResourceOptions::StorageModeShared);
     let cmd = c.queue.new_command_buffer();
     let enc = cmd.new_compute_command_encoder();
     enc.set_compute_pipeline_state(&p.probe);
@@ -123,7 +130,9 @@ fn device() -> Option<(&'static Ctx, &'static Pipes)> {
     match PIPES.get_or_init(|| {
         let p = build_pipes(c)?;
         if !frag_layout_ok(c, &p) {
-            return Err("the simdgroup fragment layout differs from the one the kernels assume".into());
+            return Err(
+                "the simdgroup fragment layout differs from the one the kernels assume".into(),
+            );
         }
         Ok(p)
     }) {
@@ -149,7 +158,13 @@ struct Guards {
 
 impl Guards {
     fn from_env() -> Guards {
-        let e = |k: &str, d: i32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d).clamp(0, 14);
+        let e = |k: &str, d: i32| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+                .clamp(0, 14)
+        };
         Guards {
             attn: e("CMF_QI21_ATTN_SHIFT", 2),
             qkv: e("CMF_QI21_QKV_SHIFT", 4),
@@ -209,13 +224,24 @@ fn pad4(v: &mut Vec<f32>) {
 
 fn build_block(c: &Ctx, model: &CmfModel, r: &Qi21BlockRef, g: &Qi21Geom) -> Result<Blk, String> {
     let (h, inter) = (g.hidden, g.inter);
-    let shapes = [(h, h), (h, h), (h, h), (h, h), (inter, h), (inter, h), (h, inter)];
+    let shapes = [
+        (h, h),
+        (h, h),
+        (h, h),
+        (h, h),
+        (inter, h),
+        (inter, h),
+        (h, inter),
+    ];
     let mut t = [Tens::default(); 7];
     let mut aux: Vec<f32> = Vec::new();
     for (i, (&ti, &(rows, cols))) in r.w.iter().zip(&shapes).enumerate() {
         let e = model.tensors.get(ti).ok_or("tensor index out of range")?;
         if e.shape != [rows, cols] {
-            return Err(format!("{}: shape {:?}, expected [{rows}, {cols}]", e.name, e.shape));
+            return Err(format!(
+                "{}: shape {:?}, expected [{rows}, {cols}]",
+                e.name, e.shape
+            ));
         }
         let abs = model
             .entry_abs_offset(e)
@@ -260,7 +286,12 @@ fn build_block(c: &Ctx, model: &CmfModel, r: &Qi21BlockRef, g: &Qi21Geom) -> Res
                 aux.extend(std::iter::repeat_n(1.0f32, cols));
                 pad4(&mut aux);
             }
-            d => return Err(format!("{}: codec {d:?} (the Metal chain reads q4tp / q8_2f / q8_row)", e.name)),
+            d => {
+                return Err(format!(
+                    "{}: codec {d:?} (the Metal chain reads q4tp / q8_2f / q8_row)",
+                    e.name
+                ));
+            }
         }
         t[i] = tt;
     }
@@ -295,12 +326,17 @@ fn buf_u32(c: &Ctx, v: &[u32]) -> Buffer {
 }
 
 fn buf_zeroed(c: &Ctx, bytes: usize) -> Buffer {
-    c._device.new_buffer(bytes.max(16) as u64, MTLResourceOptions::StorageModeShared)
+    c._device
+        .new_buffer(bytes.max(16) as u64, MTLResourceOptions::StorageModeShared)
 }
 
 fn write_f32(b: &Buffer, off_floats: usize, v: &[f32]) {
     unsafe {
-        std::ptr::copy_nonoverlapping(v.as_ptr(), (b.contents() as *mut f32).add(off_floats), v.len());
+        std::ptr::copy_nonoverlapping(
+            v.as_ptr(),
+            (b.contents() as *mut f32).add(off_floats),
+            v.len(),
+        );
     }
 }
 
@@ -370,7 +406,9 @@ const MAX_PROGS: usize = 2;
 
 fn geom_ok(g: &Qi21Geom) -> Result<(), String> {
     if g.hd != 128 || g.nh * g.hd != g.hidden || g.hidden % 256 != 0 || g.hidden > 4096 {
-        return Err(format!("geometry {g:?} (the kernels need hd 128, hidden % 256 == 0, ≤ 4096)"));
+        return Err(format!(
+            "geometry {g:?} (the kernels need hd 128, hidden % 256 == 0, ≤ 4096)"
+        ));
     }
     if g.inter % 64 != 0 || g.in_ch != 64 {
         return Err(format!("geometry {g:?} (inter % 64, 64 latent channels)"));
@@ -483,7 +521,11 @@ struct PKv {
 }
 
 fn set_p<T>(enc: &ComputeCommandEncoderRef, idx: u64, v: &T) {
-    enc.set_bytes(idx, std::mem::size_of::<T>() as u64, v as *const T as *const c_void);
+    enc.set_bytes(
+        idx,
+        std::mem::size_of::<T>() as u64,
+        v as *const T as *const c_void,
+    );
 }
 
 fn prof_on() -> bool {
@@ -500,7 +542,11 @@ struct Rec<'a> {
     c: &'a Ctx,
     prof: bool,
     done: Vec<(&'static str, CommandBuffer)>,
-    cur: Option<(CommandBuffer, Option<metal::ComputeCommandEncoder>, &'static str)>,
+    cur: Option<(
+        CommandBuffer,
+        Option<metal::ComputeCommandEncoder>,
+        &'static str,
+    )>,
 }
 
 impl<'a> Rec<'a> {
@@ -560,7 +606,10 @@ impl<'a> Rec<'a> {
             }
             let tot: f64 = by.iter().map(|e| e.1).sum();
             let s: Vec<String> = by.iter().map(|(l, ms)| format!("{l} {ms:.1}")).collect();
-            eprintln!("qi21 metal {what} gpu ms: total {tot:.1} · {}", s.join(" · "));
+            eprintln!(
+                "qi21 metal {what} gpu ms: total {tot:.1} · {}",
+                s.join(" · ")
+            );
         }
         self.done.clear();
         ok
@@ -641,14 +690,24 @@ impl Enc<'_, '_> {
             enc.set_buffer(7, Some(y), 0);
             set_p(enc, 8, &pm);
             enc.dispatch_thread_groups(
-                MTLSize::new(n.div_ceil(64) as u64, (t0.rows / 64) as u64, sel.len() as u64),
+                MTLSize::new(
+                    n.div_ceil(64) as u64,
+                    (t0.rows / 64) as u64,
+                    sel.len() as u64,
+                ),
                 MTLSize::new(128, 1, 1),
             );
         }
     }
 
     /// mode bit 0: x += tanh(g)·y; bit 1: xn = half(LN(x)·(1+s)·oscale).
-    fn rowop(&mut self, a: &Acts, n: usize, gate: Option<(&Buffer, usize)>, scale: Option<(&Buffer, usize, f32)>) {
+    fn rowop(
+        &mut self,
+        a: &Acts,
+        n: usize,
+        gate: Option<(&Buffer, usize)>,
+        scale: Option<(&Buffer, usize, f32)>,
+    ) {
         let g = self.d.geom;
         let mut pr = PRow {
             h: g.hidden as u32,
@@ -704,7 +763,19 @@ impl Enc<'_, '_> {
         for l in 0..nb {
             let blk = &self.d.blocks[l];
             // qkv → panel
-            self.gemm(blk, &[TQ, TK, TV], &a.xn, &[0, 0, 0], h, &a.panel, &[0, h, 2 * h], 3 * h, n, true, p2(gd.attn - gd.qkv));
+            self.gemm(
+                blk,
+                &[TQ, TK, TV],
+                &a.xn,
+                &[0, 0, 0],
+                h,
+                &a.panel,
+                &[0, h, 2 * h],
+                3 * h,
+                n,
+                true,
+                p2(gd.attn - gd.qkv),
+            );
             self.amax(&a.panel, n * 3 * h, 1);
             {
                 let p = self.p;
@@ -745,7 +816,10 @@ impl Enc<'_, '_> {
                 enc.set_buffer(0, Some(&a.panel), 0);
                 enc.set_buffer(1, Some(s.pkv), kv_off);
                 set_p(enc, 2, &pk);
-                enc.dispatch_threads(MTLSize::new((2 * h / 8) as u64, n as u64, 1), MTLSize::new(64, 4, 1));
+                enc.dispatch_threads(
+                    MTLSize::new((2 * h / 8) as u64, n as u64, 1),
+                    MTLSize::new(64, 4, 1),
+                );
             }
             {
                 let p = self.p;
@@ -768,13 +842,40 @@ impl Enc<'_, '_> {
                 enc.set_buffer(2, Some(s.pkv), kv_off);
                 enc.set_buffer(3, Some(s.prefill.unwrap_or(&a.y)), 0);
                 set_p(enc, 4, &pf);
-                enc.dispatch_thread_groups(MTLSize::new(n.div_ceil(64) as u64, g.nh as u64, 1), MTLSize::new(256, 1, 1));
+                enc.dispatch_thread_groups(
+                    MTLSize::new(n.div_ceil(64) as u64, g.nh as u64, 1),
+                    MTLSize::new(256, 1, 1),
+                );
             }
             self.amax(&a.attn, n * h, 2);
-            self.gemm(blk, &[TO], &a.attn, &[0], h, &a.y, &[0], h, n, false, p2(gd.ao));
+            self.gemm(
+                blk,
+                &[TO],
+                &a.attn,
+                &[0],
+                h,
+                &a.y,
+                &[0],
+                h,
+                n,
+                false,
+                p2(gd.ao),
+            );
             self.rowop(a, n, Some((s.mods, h)), Some((s.mods, 2 * h, p2(-gd.ffn))));
             self.amax(&a.xn, n * h, 3);
-            self.gemm(blk, &[TG, TU], &a.xn, &[0, 0], h, &a.gu, &[0, gl], inter, n, false, p2(gd.ffn));
+            self.gemm(
+                blk,
+                &[TG, TU],
+                &a.xn,
+                &[0, 0],
+                h,
+                &a.gu,
+                &[0, gl],
+                inter,
+                n,
+                false,
+                p2(gd.ffn),
+            );
             {
                 let p = self.p;
                 let ps = PSw {
@@ -790,10 +891,25 @@ impl Enc<'_, '_> {
                 enc.set_buffer(0, Some(&a.gu), 0);
                 enc.set_buffer(1, Some(&a.h), 0);
                 set_p(enc, 2, &ps);
-                enc.dispatch_thread_groups(MTLSize::new((ps.n4 as u64).div_ceil(256), 1, 1), MTLSize::new(256, 1, 1));
+                enc.dispatch_thread_groups(
+                    MTLSize::new((ps.n4 as u64).div_ceil(256), 1, 1),
+                    MTLSize::new(256, 1, 1),
+                );
             }
             self.amax(&a.h, n * inter, 4);
-            self.gemm(blk, &[TD], &a.h, &[0], inter, &a.y, &[0], h, n, false, p2(gd.hid));
+            self.gemm(
+                blk,
+                &[TD],
+                &a.h,
+                &[0],
+                inter,
+                &a.y,
+                &[0],
+                h,
+                n,
+                false,
+                p2(gd.hid),
+            );
             if l + 1 < nb {
                 self.rowop(a, n, Some((s.mods, 3 * h)), Some((s.mods, 0, p2(-gd.attn))));
                 self.amax(&a.xn, n * h, 0);
@@ -839,7 +955,11 @@ pub(crate) fn prefill(a: &Qi21PrefillArgs) -> bool {
         return decline("prefill args do not match the lengths");
     }
     let mut st = STATE.lock().unwrap();
-    if st.0.as_ref().is_some_and(|d| d.uid != a.model.uid() || d.geom != g) {
+    if st
+        .0
+        .as_ref()
+        .is_some_and(|d| d.uid != a.model.uid() || d.geom != g)
+    {
         st.0 = None;
     }
     if st.0.is_none() {
@@ -882,7 +1002,8 @@ pub(crate) fn prefill(a: &Qi21PrefillArgs) -> bool {
         .into_iter()
         .max()
         .unwrap_or(0);
-        let total = d.blocks.len() * a.lp * 2 * h * 2 + alloc * (2 * g.inter * 4 + g.inter * 2 + 3 * h * 2 + 2 * h * 4 + 2 * h * 2);
+        let total = d.blocks.len() * a.lp * 2 * h * 2
+            + alloc * (2 * g.inter * 4 + g.inter * 2 + 3 * h * 2 + 2 * h * 4 + 2 * h * 2);
         let max_len = c._device.max_buffer_length() as usize;
         let budget = c._device.recommended_max_working_set_size() as usize;
         if largest > max_len || total > budget {
@@ -955,7 +1076,9 @@ pub(crate) fn step(key: u64, xtok: &[f32], mods: &[f32], fs: &[f32], out: &mut [
     let Some((c, p)) = device() else { return false };
     let mut st = STATE.lock().unwrap();
     let Some(d) = st.0.as_mut() else { return false };
-    let Some(pi) = d.progs.iter().position(|q| q.key == key) else { return false };
+    let Some(pi) = d.progs.iter().position(|q| q.key == key) else {
+        return false;
+    };
     let g = d.geom;
     let h = g.hidden;
     let d_ref: &Dev = d;

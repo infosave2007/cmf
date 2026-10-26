@@ -27,6 +27,10 @@ use std::sync::{Arc, Mutex, Once, OnceLock};
 /// per-pipeline slot map could point at weights another pipeline just
 /// replaced.  [`SharedTailBank`] keeps the physical bank and its host-side LRU
 /// map together instead.
+///
+/// Despite the historical name the bank serves two checked topologies:
+/// MiniCPM-V-4.7's q4tp top-8 tail and MiniMax-M3.1's q2tp-mix (or q4tp)
+/// top-4 tail, each behind its own env opt-in.
 #[derive(Default)]
 pub(crate) struct MiniCpmTailCache;
 
@@ -41,6 +45,13 @@ struct PoolKey {
     inter: usize,
     experts: usize,
     layers: usize,
+    /// Bank codec: gate/up are q2tp against a q4tp down (MiniMax q2tp-mix)
+    /// when true; all-q4tp (MiniCPM, MiniMax q4tp) when false.
+    gu_q2: bool,
+    /// MiniMax-M3.1: the bank is sized from the FREE weight budget (its
+    /// device prefix already claims most of the card) and reaches only its
+    /// own top-4 prepared frame.
+    minimax: bool,
 }
 
 /// The 35B-A3B graph leaves the final 13 of its 40 MoE layers to the host.
@@ -140,14 +151,19 @@ fn create_tail_gpu_pool(
     model: &Arc<cortiq_core::CmfModel>,
     key: PoolKey,
 ) -> Option<crate::qwen4_exp::QwenGpuPool> {
+    let slots = if key.minimax {
+        minimax_tail_slots(&key)?
+    } else {
+        bounded_slots()
+    };
     let mut gpu_pool = crate::qwen4_exp::QwenGpuPool::create_explicit(
         model,
         key.inter,
         key.hidden,
         key.layers,
         key.experts,
-        false,
-        bounded_slots(),
+        key.gu_q2,
+        slots,
         0,
     )?;
     if let Some(active_layers) = active_tail_layers(key.layers) {
@@ -157,6 +173,34 @@ fn create_tail_gpu_pool(
         gpu_pool.configure_minicpm_tail(active_layers);
     }
     Some(gpu_pool)
+}
+
+/// MiniMax's arena comes out of the FREE weight budget, not a percentage of
+/// the card: its device prefix has already claimed most of it (measured:
+/// 80.4 GiB resident of a 91.6 GiB budget on the RTX PRO 6000), and the KV,
+/// staging and driver overhead live out of the remainder.  `CMF_MINIMAX_TAIL_SLOTS`
+/// overrides the estimate; a bank too small to hold one layer's route is
+/// refused rather than allowed to churn on every token.
+#[cfg(feature = "gpu")]
+fn minimax_tail_slots(key: &PoolKey) -> Option<usize> {
+    if let Some(v) = std::env::var("CMF_MINIMAX_TAIL_SLOTS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+    {
+        return (v >= 64).then_some(v.min(4096));
+    }
+    let codec = crate::gpu_wgpu::MoeBankCodec::from_gu_q2(key.gu_q2);
+    let (gu, dn) = codec.lens(key.inter, key.hidden)?;
+    let per = (2usize.checked_mul(gu)? + dn) as u64;
+    let budget = crate::gpu_wgpu::device_vram_budget();
+    let resident = crate::gpu_wgpu::resident_bytes();
+    let free = budget.saturating_sub(resident);
+    // 55 % of the unclaimed budget: enough slots to cover a hot working set
+    // across the tail while KV, the staging ring and the pipeline cache keep
+    // their headroom. Below one layer's route (shared + top-4) the bank has
+    // no protected floor left, so refuse and stay on the exact CPU path.
+    let slots = ((free.saturating_mul(55) / 100) / per.max(1)) as usize;
+    (slots >= 64).then_some(slots.min(4096))
 }
 
 #[cfg(feature = "gpu")]
@@ -265,6 +309,24 @@ fn dynamic_tail_precision_safe() -> bool {
     false
 }
 
+/// MiniMax's opt-in dynamic tail debug: one line per decline reason so a
+/// silent `None` back to the CPU path is attributable without a rebuild.
+#[cfg(feature = "gpu")]
+fn m3_tail_debug(msg: &str) {
+    if std::env::var_os("CMF_M3_TAIL_DEBUG").is_some() {
+        eprintln!("m3-tail decline: {msg}");
+    }
+}
+
+/// MiniMax-M3.1's opt-in dynamic tail.  The prepared frame is f32-exact
+/// between quantized matvecs while the plain host fallback may run the
+/// engine's A8W8 activation approximation, so the switch is explicit — an
+/// operator comparing tok/s across arms must be comparing a stable route.
+#[cfg(feature = "gpu")]
+fn minimax_tail_enabled() -> bool {
+    std::env::var("CMF_MINIMAX_DYNAMIC_TAIL").as_deref() == Ok("1")
+}
+
 /// The prepared frame is the normal dynamic-tail arm: the host has already
 /// formed the exact route, knows which picks are cold, and owns their input.
 /// Keep a one-variable legacy arm for an honest same-binary A/B, and retain
@@ -276,17 +338,32 @@ fn prepared_frame_on() -> bool {
 }
 
 impl MiniCpmTailCache {
-    /// True only for an explicitly requested MiniCPM-V-4.7 pipeline.  Keep
-    /// this inexpensive outer discriminator separate from `forward`: it lets
-    /// the generic MoE match fall through to MiMo/ordinary executors for every
-    /// other architecture rather than taking a MiniCPM arm and refusing late.
+    /// True only for an explicitly requested MiniCPM-V-4.7 or MiniMax-M3.1
+    /// pipeline.  Keep this inexpensive outer discriminator separate from
+    /// `forward`: it lets the generic MoE match fall through to MiMo/ordinary
+    /// executors for every other architecture rather than taking a tail arm
+    /// and refusing late.
     #[cfg(feature = "gpu")]
     pub(crate) fn is_requested_target(m: &MoeFfn) -> bool {
-        m.experts
+        let Some(model) = m
+            .experts
             .first()
             .and_then(|expert| expert.gate_proj.model_arc())
-            .is_some_and(|model| model.arch().arch_name == "minicpmv4_7")
-            && dynamic_tail_precision_safe()
+        else {
+            return false;
+        };
+        match model.arch().arch_name.as_str() {
+            "minicpmv4_7" => dynamic_tail_precision_safe(),
+            "minimax_m3_vl" => {
+                let on = minimax_tail_enabled();
+                m3_tail_debug(&format!("is_requested_target minimax → {on}"));
+                on
+            }
+            other => {
+                m3_tail_debug(&format!("arch not a tail target: {other}"));
+                false
+            }
+        }
     }
 
     #[cfg(not(feature = "gpu"))]
@@ -316,12 +393,6 @@ impl MiniCpmTailCache {
             || !crate::gpu_wgpu::dsv4_global_moe_supported()
             || li >= total_layers
             || x.is_empty()
-            || m.top_k != 8
-            || route.idx.len() != 8
-            || m.router_sigmoid
-            || !m.norm_topk_prob
-            || m.expert_bias.is_some()
-            || (m.routed_scaling - 1.0).abs() > 1e-9
             || m.route_tau.is_some()
             || m.mask.is_some()
             || m.per_expert_scale.is_some()
@@ -329,12 +400,74 @@ impl MiniCpmTailCache {
             || m.resonance.is_some()
             || !m.grown.is_empty()
         {
+            m3_tail_debug(&format!(
+                "outer gate: target={} supported={} li={li}/{total_layers} empty={} tau={} mask={} pscale={} rin={} res={} grown={} top_k={} sigmoid={} normtopk={} scaling={}",
+                Self::is_requested_target(m),
+                crate::gpu_wgpu::dsv4_global_moe_supported(),
+                x.is_empty(),
+                m.route_tau.is_some(),
+                m.mask.is_some(),
+                m.per_expert_scale.is_some(),
+                m.router_input_norm,
+                m.resonance.is_some(),
+                !m.grown.is_empty(),
+                m.top_k,
+                m.router_sigmoid,
+                m.norm_topk_prob,
+                m.routed_scaling,
+            ));
             return None;
         }
 
         let first = m.experts.first()?;
         let model = first.gate_proj.model_arc()?;
-        if model.arch().arch_name != "minicpmv4_7" {
+        // Per-architecture routing contract.  The prepared frame never
+        // re-ranks, so what matters is the shape that formed `route` and the
+        // semantics the host weights already carry.
+        let minimax = match model.arch().arch_name.as_str() {
+            "minicpmv4_7" => {
+                if m.top_k != 8
+                    || route.idx.len() != 8
+                    || m.router_sigmoid
+                    || !m.norm_topk_prob
+                    || (m.routed_scaling - 1.0).abs() > 1e-9
+                    // MiniCPM has no selection bias; keep its exact gate.
+                    || m.expert_bias.is_some()
+                {
+                    return None;
+                }
+                false
+            }
+            "minimax_m3_vl" => {
+                // MiniMax carries `mlp.expert_bias` (added to the top-k
+                // CHOICE; gathered weights stay unbiased) — the host route
+                // above already applied it, and the prepared frame never
+                // re-ranks, so the bias is consumed before this point.
+                if m.top_k != 4
+                    || route.idx.len() != 4
+                    || !m.router_sigmoid
+                    || !m.norm_topk_prob
+                {
+                    return None;
+                }
+                true
+            }
+            _ => return None,
+        };
+        if std::env::var_os("CMF_M3_TAIL_DEBUG").is_some() {
+            eprintln!(
+                "m3-tail: arch={} minimax={minimax} top_k={} idx={} act={:?}",
+                model.arch().arch_name,
+                m.top_k,
+                route.idx.len(),
+                first.gate_proj.model_dtype()
+            );
+        }
+        // MiniMax's frame exists only in the prepared arm: the legacy arm's
+        // device routing re-derives the route through gu uniforms that carry
+        // no activation code for this architecture.  Opting out of the
+        // prepared frame therefore means opting out of the whole tail bank.
+        if minimax && !prepared_frame_on() {
             return None;
         }
         let hidden = x.len();
@@ -346,14 +479,41 @@ impl MiniCpmTailCache {
         // Build directory triples from the actual mapped tensors rather than
         // names.  This preserves overlays/defrag layouts and refuses any
         // synthetic, transformed, or mixed-quantization expert before its raw
-        // bytes could be bound as q4tp.
-        let expert_ids: Vec<_> = m
-            .experts
-            .iter()
-            .map(|expert| q4tp_triple(expert, &model, hidden, inter))
-            .collect::<Option<_>>()?;
-        let (shared, shared_gate) = m.shared.as_ref()?;
-        let shared_ids = q4tp_triple(shared, &model, hidden, inter)?;
+        // bytes could be bound as the bank's codec.  MiniMax's experts are
+        // checked against the OAI activation contract (the gu shader's code 3
+        // hardcodes alpha 1.702; `lim` rides the uniform) and against the
+        // bank codec chosen from the gate/up dtype.
+        let gu_q2 = if minimax {
+            match first.gate_proj.model_dtype() {
+                Some(cortiq_core::TensorDtype::Q2TiledP) => true,
+                Some(cortiq_core::TensorDtype::Q4TiledP) => false,
+                _ => return None,
+            }
+        } else {
+            false
+        };
+        let triple = |expert: &crate::pipeline::DenseFfn| {
+            if minimax {
+                m3_triple(expert, &model, hidden, inter, gu_q2)
+            } else {
+                q4tp_triple(expert, &model, hidden, inter)
+            }
+        };
+        let expert_ids: Vec<_> = match m.experts.iter().map(triple).collect::<Option<Vec<_>>>() {
+            Some(ids) => ids,
+            None => {
+                m3_tail_debug("expert triple refused (act/dtype/geometry)");
+                return None;
+            }
+        };
+        let Some((shared, shared_gate)) = m.shared.as_ref() else {
+            m3_tail_debug("no shared expert");
+            return None;
+        };
+        let Some(shared_ids) = triple(shared) else {
+            m3_tail_debug("shared triple refused");
+            return None;
+        };
         if let Some(gate) = shared_gate
             && (gate.rows() != 1 || gate.cols() != hidden)
         {
@@ -414,6 +574,8 @@ impl MiniCpmTailCache {
             inter,
             experts: candidate.expert_ids.len(),
             layers: total_layers,
+            gu_q2,
+            minimax,
         };
         // The physical DSV4 buffers are global per `(model uid, device)`, so
         // their slot map has to be global on that same key.  Take the shared
@@ -468,10 +630,13 @@ impl MiniCpmTailCache {
         let geom = crate::gpu_wgpu::Dsv4MoeGeom {
             hidden,
             inter,
-            top_k: 8,
+            top_k: if minimax { 4 } else { 8 },
             route_scale: 1.0,
-            swiglu_limit: 0.0,
-            gu_q2: false,
+            // MiniMax's OAI limit rides the uniform (`lim`); the shader's
+            // code 3 branch applies it with alpha 1.702. MiniCPM keeps the
+            // historical zero: no clamp, plain SiLU with act code 0.
+            swiglu_limit: if minimax { 7.0 } else { 0.0 },
+            gu_q2,
             bf16: false,
         };
         let mut out = vec![0.0f32; hidden];
@@ -576,6 +741,9 @@ impl MiniCpmTailCache {
                         &model,
                         global,
                         geom,
+                        // Activation code for the gu shader: 3 = SwiGLU-OAI
+                        // (MiniMax), 0 = the historical SiLU arm.
+                        u32::from(minimax) * 3,
                         x,
                         &resident_slots,
                         &resident_weights,
@@ -707,6 +875,57 @@ fn q4tp_triple(
     ))
 }
 
+/// MiniMax-M3.1's expert triple: gate/up in the bank's codec (q2tp on the
+/// `q2tp-mix` file, q4tp on the 4-bit file), down always q4tp, and the
+/// checked SwiGLU-OAI activation — the prepared gu shader hardcodes alpha
+/// 1.702 and takes the limit from the uniform, so any other contract must
+/// fall back to the exact CPU path instead of borrowing this kernel.
+#[cfg(feature = "gpu")]
+fn m3_triple(
+    expert: &crate::pipeline::DenseFfn,
+    model: &std::sync::Arc<cortiq_core::CmfModel>,
+    hidden: usize,
+    inter: usize,
+    gu_q2: bool,
+) -> Option<(usize, usize, usize)> {
+    use cortiq_core::TensorDtype;
+
+    match expert.act {
+        crate::pipeline::Act::SwiGluOai { alpha, limit }
+            if (alpha - 1.702).abs() < 1e-6 && (limit - 7.0).abs() < 1e-6 => {}
+        _ => return None,
+    }
+    if !expert.segs.is_empty() {
+        return None;
+    }
+    let gu_dt = if gu_q2 {
+        TensorDtype::Q2TiledP
+    } else {
+        TensorDtype::Q4TiledP
+    };
+    let mapped = |t: &crate::qtensor::QTensor, dt: TensorDtype| {
+        t.model_dtype() == Some(dt)
+            && t.model_arc().is_some_and(|owner| owner.uid() == model.uid())
+    };
+    if !mapped(&expert.gate_proj, gu_dt)
+        || !mapped(&expert.up_proj, gu_dt)
+        || !mapped(&expert.down_proj, TensorDtype::Q4TiledP)
+        || expert.gate_proj.rows() != inter
+        || expert.gate_proj.cols() != hidden
+        || expert.up_proj.rows() != inter
+        || expert.up_proj.cols() != hidden
+        || expert.down_proj.rows() != hidden
+        || expert.down_proj.cols() != inter
+    {
+        return None;
+    }
+    Some((
+        expert.gate_proj.model_idx()?,
+        expert.up_proj.model_idx()?,
+        expert.down_proj.model_idx()?,
+    ))
+}
+
 /// `create_explicit` delegates segment rounding and physical-bank admission to
 /// the global allocator.  We deliberately preserve a non-multiple override
 /// here (for example 225): the allocator rounds it safely to S8 geometry,
@@ -734,6 +953,312 @@ fn bounded_slots() -> usize {
         .and_then(|raw| raw.parse::<usize>().ok())
         .unwrap_or_else(|| default_tail_slots(crate::gpu_wgpu::device_vram_budget()))
         .clamp(16, 512)
+}
+
+/// Shared resolution for the pooled token-graph arm: model, bank key, the
+/// layer's routed triples and its shared triple, or `None` for any shape the
+/// device route cannot serve exactly (the caller keeps its host path).
+#[cfg(feature = "gpu")]
+fn minimax_pool_ctx(
+    m: &MoeFfn,
+    li: usize,
+    total_layers: usize,
+) -> Option<(
+    std::sync::Arc<cortiq_core::CmfModel>,
+    PoolKey,
+    Vec<(usize, usize, usize)>,
+    (usize, usize, usize),
+)> {
+    if !minimax_tail_enabled() || !crate::gpu_wgpu::dsv4_global_moe_supported() {
+        return None;
+    }
+    if li >= total_layers
+        || m.top_k != 4
+        || !m.router_sigmoid
+        || !m.norm_topk_prob
+        || m.route_tau.is_some()
+        || m.mask.is_some()
+        || m.per_expert_scale.is_some()
+        || m.router_input_norm
+        || m.resonance.is_some()
+        || !m.grown.is_empty()
+    {
+        return None;
+    }
+    let first = m.experts.first()?;
+    let model = first.gate_proj.model_arc()?;
+    if model.arch().arch_name != "minimax_m3_vl" {
+        return None;
+    }
+    let hidden = m.router.cols();
+    let inter = first.gate_proj.rows();
+    if hidden % 32 != 0 || inter % 32 != 0 || m.router.rows() != m.experts.len() {
+        return None;
+    }
+    let gu_q2 = match first.gate_proj.model_dtype() {
+        Some(cortiq_core::TensorDtype::Q2TiledP) => true,
+        Some(cortiq_core::TensorDtype::Q4TiledP) => false,
+        _ => return None,
+    };
+    let expert_ids: Vec<(usize, usize, usize)> = m
+        .experts
+        .iter()
+        .map(|e| m3_triple(e, &model, hidden, inter, gu_q2))
+        .collect::<Option<_>>()?;
+    // The device route pins the shared expert at weight 1 (rflags bit3); a
+    // GATED shared needs the prepared frame's host-side gate math instead.
+    let (shared, shared_gate) = m.shared.as_ref()?;
+    if shared_gate.is_some() {
+        return None;
+    }
+    let shared_ids = m3_triple(shared, &model, hidden, inter, gu_q2)?;
+    let key = PoolKey {
+        model_uid: model.uid(),
+        hidden,
+        inter,
+        experts: expert_ids.len(),
+        layers: total_layers,
+        gu_q2,
+        minimax: true,
+    };
+    Some((model, key, expert_ids, shared_ids))
+}
+
+/// Arm the pooled token-graph frame for one MiniMax tail layer: resolve the
+/// layout against the shared bank, admit anything the last token left cold
+/// (nothing on the first call), and snapshot the remap + pinned shared slot
+/// for [`crate::gpu_wgpu::pooled_frame_enter`].
+#[cfg(feature = "gpu")]
+pub(crate) fn minimax_pool_arm(
+    m: &MoeFfn,
+    li: usize,
+    total_layers: usize,
+    predicted: &[u32],
+) -> Option<crate::gpu_wgpu::PooledFrame> {
+    let (model, key, expert_ids, shared_ids) = minimax_pool_ctx(m, li, total_layers)?;
+    let shared = acquire_tail_bank(&model, key)?;
+    let mut bank = shared.lock().ok()?;
+    let candidate = LayerLayout {
+        expert_ids: expert_ids.clone().into(),
+        shared_ids,
+    };
+    if !bank.accepts_layout_or_resets(&model, key, li, candidate) {
+        return None;
+    }
+    // Admission PREDICTION: last token's winners for this layer are admitted
+    // (and their LRU clocks refreshed) before this token's route runs, so a
+    // stable greedy route finds them resident and `cold` collapses.
+    let pred: Vec<usize> = predicted
+        .iter()
+        .map(|&e| e as usize)
+        .filter(|&e| e < key.experts)
+        .collect();
+    let pending = bank
+        .gpu_pool
+        .begin_ensure(&model, li, &pred, &expert_ids, Some(shared_ids))?;
+    let Some((remap, shared_slot, _)) = pending.finish_and_flush() else {
+        bank.gpu_pool.flush_uploads();
+        return None;
+    };
+    if remap.len() != expert_ids.len() {
+        return None;
+    }
+    Some(crate::gpu_wgpu::PooledFrame {
+        remap,
+        shared_slot,
+        pool_uid: model.uid(),
+    })
+}
+
+/// Admit a drained cold list so the NEXT token finds those experts
+/// resident. Uses the layout [`minimax_pool_arm`] already validated.
+#[cfg(feature = "gpu")]
+pub(crate) fn minimax_pool_ensure(m: &MoeFfn, li: usize, total_layers: usize, cold: &[usize]) -> bool {
+    if cold.is_empty() {
+        return true;
+    }
+    let (model, key, _, shared_ids) = match minimax_pool_ctx(m, li, total_layers) {
+        Some(v) => v,
+        None => return false,
+    };
+    if cold.iter().any(|&e| e >= key.experts) {
+        return false;
+    }
+    let Some(shared) = acquire_tail_bank(&model, key) else {
+        return false;
+    };
+    let Ok(mut bank) = shared.lock() else {
+        return false;
+    };
+    let (expert_ids, layout_shared) = {
+        let Some(layout) = bank.layouts.get(li).and_then(|l| l.as_ref()) else {
+            return false;
+        };
+        (layout.expert_ids.clone(), layout.shared_ids)
+    };
+    debug_assert_eq!(layout_shared, shared_ids);
+    let Some(pending) =
+        bank.gpu_pool
+            .begin_ensure(&model, li, cold, expert_ids.as_ref(), Some(layout_shared))
+    else {
+        bank.gpu_pool.flush_uploads();
+        return false;
+    };
+    pending.finish_and_flush().is_some()
+}
+
+/// The cold routed experts of one MiniMax layer, computed ON THE DEVICE:
+/// admit them into the bank (their fills queue before the frame's submit),
+/// then run the prepared frame over exactly those slots. The shared expert
+/// rides the frame at weight 0, so `out` holds the cold sum alone — the
+/// resident part and the shared already live in the span's device output.
+///
+/// `false` means nothing was written to `out`; the caller computes the cold
+/// experts on the host instead (the host copies stay authoritative).
+#[cfg(feature = "gpu")]
+pub(crate) fn minimax_cold_device(
+    m: &MoeFfn,
+    li: usize,
+    total_layers: usize,
+    cold: &[(usize, f32)],
+    x: &[f32],
+    out: &mut [f32],
+) -> bool {
+    if cold.is_empty() || cold.len() > 4 || out.len() < x.len() {
+        return false;
+    }
+    let Some((model, key, expert_ids, shared_ids)) = minimax_pool_ctx(m, li, total_layers) else {
+        return false;
+    };
+    let Some(shared) = acquire_tail_bank(&model, key) else {
+        return false;
+    };
+    let Ok(mut bank) = shared.lock() else {
+        return false;
+    };
+    let candidate = LayerLayout {
+        expert_ids: expert_ids.clone().into(),
+        shared_ids,
+    };
+    if !bank.accepts_layout_or_resets(&model, key, li, candidate) {
+        return false;
+    }
+    let ids: Vec<usize> = cold.iter().map(|&(e, _)| e).collect();
+    let Some(pending) = bank
+        .gpu_pool
+        .begin_ensure(&model, li, &ids, &expert_ids, Some(shared_ids))
+    else {
+        bank.gpu_pool.flush_uploads();
+        return false;
+    };
+    let Some((remap, shared_slot, segment_slots)) = pending.finish_and_flush() else {
+        return false;
+    };
+    if remap.len() != expert_ids.len() {
+        return false;
+    }
+    let mut slots: Vec<u32> = Vec::with_capacity(cold.len() + 1);
+    let mut weights: Vec<f32> = Vec::with_capacity(cold.len() + 1);
+    for &(e, w) in cold {
+        let slot = match remap.get(e) {
+            Some(&s) if s != u32::MAX => s,
+            _ => return false,
+        };
+        slots.push(slot);
+        weights.push(w);
+    }
+    slots.push(shared_slot);
+    weights.push(0.0);
+    let hidden = x.len();
+    let Some(inter) = m.experts.first().map(|e| e.gate_proj.rows()) else {
+        return false;
+    };
+    let geom = crate::gpu_wgpu::Dsv4MoeGeom {
+        hidden,
+        inter,
+        top_k: 4,
+        route_scale: 1.0,
+        // MiniMax's checked SwiGLU-OAI contract: alpha 1.702 lives in the
+        // shader's code-3 arm, the limit rides the uniform.
+        swiglu_limit: 7.0,
+        gu_q2: key.gu_q2,
+        bf16: false,
+    };
+    let global = crate::gpu_wgpu::Dsv4GlobalMoe {
+        pool_uid: model.uid(),
+        shared_slot,
+        segment_slots: segment_slots as u32,
+    };
+    drop(bank);
+    out[..hidden].fill(0.0);
+    crate::gpu_wgpu::minicpm_tail_prepared_frame(
+        &model,
+        global,
+        geom,
+        3,
+        x,
+        &slots,
+        &weights,
+        &mut out[..hidden],
+    )
+}
+
+#[cfg(not(feature = "gpu"))]
+pub(crate) fn minimax_cold_device(
+    _m: &MoeFfn,
+    _li: usize,
+    _total_layers: usize,
+    _cold: &[(usize, f32)],
+    _x: &[f32],
+    _out: &mut [f32],
+) -> bool {
+    false
+}
+
+#[cfg(not(feature = "gpu"))]
+pub(crate) fn minimax_pool_arm(
+    _m: &MoeFfn,
+    _li: usize,
+    _total_layers: usize,
+    _predicted: &[u32],
+) -> Option<()> {
+    None
+}
+
+#[cfg(not(feature = "gpu"))]
+pub(crate) fn minimax_pool_ensure(
+    _m: &MoeFfn,
+    _li: usize,
+    _total_layers: usize,
+    _cold: &[usize],
+) -> bool {
+    false
+}
+
+/// Routed-expert count of the first MoE layer at or after `from` (the route
+/// frequency profile is indexed by it).
+pub(crate) fn minimax_n_experts(layers: &[crate::pipeline::LayerWeights], from: usize) -> usize {
+    layers
+        .iter()
+        .skip(from)
+        .find_map(|lw| match &lw.ffn {
+            crate::pipeline::FfnKind::Moe(m) => Some(m.experts.len()),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+/// Public gate for the pooled-tail feature (the pipeline's device head and
+/// driver ask it without touching the module's internals).
+pub(crate) fn minimax_pool_on() -> bool {
+    #[cfg(feature = "gpu")]
+    {
+        minimax_tail_enabled()
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        false
+    }
 }
 
 #[cfg(all(test, feature = "gpu"))]

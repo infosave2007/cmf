@@ -33,6 +33,655 @@ use serde_json::{Map, Value};
 const THINK_OPEN: &str = "<think>";
 const THINK_CLOSE: &str = "</think>";
 
+// MiniMax-M3 deliberately uses a separate, namespaced wire grammar.  Its
+// namespace is ordinary decoded text (rather than a tokenizer special token),
+// so it must be parsed before it reaches an OpenAI-compatible client.
+const MINIMAX_M3_NS: &str = "]<]minimax[>[";
+const MINIMAX_M3_THINK_OPEN: &str = "<mm:think>";
+const MINIMAX_M3_THINK_CLOSE: &str = "</mm:think>";
+const MINIMAX_M3_TOOL_OPEN: &str = "]<]minimax[>[<tool_call>";
+const MINIMAX_M3_TOOL_CLOSE: &str = "]<]minimax[>[</tool_call>";
+const MINIMAX_M3_INVOKE_OPEN: &str = "]<]minimax[>[<invoke name=\"";
+const MINIMAX_M3_INVOKE_CLOSE: &str = "]<]minimax[>[</invoke>";
+
+/// Parse a MiniMax M3 completion into OpenAI response fields.
+///
+/// M3 emits adaptive reasoning as `<mm:think>…</mm:think>` and prefixes all
+/// tool XML tags with `]<]minimax[>[`.  It also prefixes a non-thinking turn
+/// with one bare `</mm:think>` marker.  The source M3/SGLang parser removes
+/// that leading closer; doing the same here keeps it out of user-visible
+/// `content`.  A malformed or undeclared-tool block is deliberately retained
+/// verbatim as content rather than turning partial model output into an action.
+pub fn extract_minimax_m3_response(
+    text: &str,
+    tools: Option<&[Value]>,
+) -> (String, Vec<Value>, Option<String>) {
+    let (content, reasoning) = split_minimax_m3_reasoning(text);
+    let (content, calls) = extract_minimax_m3_tool_calls(&content, tools.unwrap_or(&[]));
+    (content, calls, reasoning)
+}
+
+/// Incremental guard for an M3 server-sent response.
+///
+/// The final tool-call conversion remains deliberately whole-response (so
+/// nested XML can be validated against the supplied schema), but normal final
+/// text can be released as it arrives.  The guard never releases a possible
+/// prefix of the M3 reasoning or namespaced tool protocol; that is important
+/// because generated tokens may split a marker at arbitrary byte boundaries.
+/// Reasoning is kept private in streaming mode because the OpenAI SSE delta
+/// shape used by this server has no `reasoning_content` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MiniMaxM3StreamPhase {
+    Leading,
+    Reasoning,
+    Content,
+    Tool,
+}
+
+pub struct MiniMaxM3Stream {
+    phase: MiniMaxM3StreamPhase,
+    pending: String,
+    emitted: String,
+    /// The strict parser only normalizes namespace-tag whitespace when at
+    /// least one tool was declared, and any later malformed block makes that
+    /// normalization transactional.  Keep public text from the first
+    /// namespace onward until final parsing in that case.
+    has_declared_tools: bool,
+}
+
+impl Default for MiniMaxM3Stream {
+    fn default() -> Self {
+        Self {
+            phase: MiniMaxM3StreamPhase::Leading,
+            pending: String::new(),
+            emitted: String::new(),
+            has_declared_tools: false,
+        }
+    }
+}
+
+impl MiniMaxM3Stream {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Construct a guard for a request with declared tools.  M3's final tool
+    /// parser is transactional: one malformed block restores the original
+    /// wire text, while a fully valid response normalizes namespace-adjacent
+    /// whitespace.  Deferring text from the first namespace preserves an
+    /// exact final prefix under both outcomes.
+    pub fn with_declared_tools() -> Self {
+        Self {
+            has_declared_tools: true,
+            ..Self::default()
+        }
+    }
+
+    /// Consume decoded model text and return only final user-visible content
+    /// that is safe to send now.  M3 thinking and tool markup are never
+    /// returned here.
+    pub fn push(&mut self, token: &str) -> String {
+        if self.phase == MiniMaxM3StreamPhase::Tool {
+            return String::new();
+        }
+        self.pending.push_str(token);
+        let mut out = String::new();
+        loop {
+            match self.phase {
+                MiniMaxM3StreamPhase::Leading => {
+                    // M3's adaptive no-think form begins with a bare close.
+                    // Wait for a full marker before deciding a marker prefix
+                    // is ordinary text, so a split closer never leaks.
+                    let leading = self.pending.trim_start();
+                    if leading.is_empty() {
+                        break;
+                    }
+                    if MINIMAX_M3_THINK_CLOSE.starts_with(leading)
+                        && leading.len() < MINIMAX_M3_THINK_CLOSE.len()
+                    {
+                        break;
+                    }
+                    if let Some(after) = leading.strip_prefix(MINIMAX_M3_THINK_CLOSE) {
+                        self.pending = after.to_string();
+                        self.phase = MiniMaxM3StreamPhase::Content;
+                        continue;
+                    }
+                    // `split_minimax_m3_reasoning` only recognizes an opener
+                    // at byte zero (unlike the adaptive leading closer above),
+                    // so keep that distinction here.  Otherwise a malformed
+                    // ` " <mm:think>...` response would be hidden live and
+                    // duplicated only at the final safety flush.
+                    if MINIMAX_M3_THINK_OPEN.starts_with(&self.pending)
+                        && self.pending.len() < MINIMAX_M3_THINK_OPEN.len()
+                    {
+                        break;
+                    }
+                    if let Some(after) = self.pending.strip_prefix(MINIMAX_M3_THINK_OPEN) {
+                        self.pending = after.to_string();
+                        self.phase = MiniMaxM3StreamPhase::Reasoning;
+                        continue;
+                    }
+                    self.phase = MiniMaxM3StreamPhase::Content;
+                }
+                MiniMaxM3StreamPhase::Reasoning => {
+                    if let Some(end) = self.pending.find(MINIMAX_M3_THINK_CLOSE) {
+                        self.pending =
+                            self.pending[end + MINIMAX_M3_THINK_CLOSE.len()..].to_string();
+                        self.phase = MiniMaxM3StreamPhase::Content;
+                        continue;
+                    }
+                    // Nothing in a still-open reasoning span is public.  Keep
+                    // just a suffix that could become the close marker.
+                    let keep = minimax_m3_marker_suffix(&self.pending, MINIMAX_M3_THINK_CLOSE);
+                    self.pending = self.pending[self.pending.len() - keep..].to_string();
+                    break;
+                }
+                MiniMaxM3StreamPhase::Content => {
+                    // `extract_minimax_m3_tool_calls` first normalizes every
+                    // namespace followed by XML-looking whitespace, but only
+                    // when tools are declared.  If any later tool block is
+                    // malformed it atomically restores the original wire
+                    // text.  Do not release bytes whose final spelling cannot
+                    // yet be known under that transaction.
+                    if self.has_declared_tools {
+                        if let Some(first_namespace) = self.pending.find(MINIMAX_M3_NS) {
+                            if first_namespace > 0 {
+                                out.push_str(&self.pending[..first_namespace]);
+                                self.pending = self.pending[first_namespace..].to_string();
+                                break;
+                            }
+                            if minimax_m3_tool_start(&self.pending) == Some(0) {
+                                self.pending.clear();
+                                self.phase = MiniMaxM3StreamPhase::Tool;
+                            }
+                            // A namespace that is not yet a full tool marker
+                            // might still be normalized or restored by the
+                            // strict final parser, so keep it private for now.
+                            break;
+                        }
+                    }
+                    if let Some(start) = minimax_m3_tool_start(&self.pending) {
+                        out.push_str(&self.pending[..start]);
+                        self.pending.clear();
+                        self.phase = MiniMaxM3StreamPhase::Tool;
+                        break;
+                    }
+                    let flush = minimax_m3_content_flush_len(&self.pending);
+                    if flush == 0 {
+                        break;
+                    }
+                    out.push_str(&self.pending[..flush]);
+                    self.pending = self.pending[flush..].to_string();
+                    break;
+                }
+                MiniMaxM3StreamPhase::Tool => break,
+            }
+        }
+        self.emitted.push_str(&out);
+        out
+    }
+
+    /// Finish with the authoritative whole-response parse result.  Usually it
+    /// is exactly the portion not yet released.  The fallback retains output
+    /// rather than silently dropping it if a future wire variation makes the
+    /// incremental guard disagree with the strict parser.
+    pub fn finish(&mut self, content: &str) -> String {
+        let tail = content
+            .strip_prefix(&self.emitted)
+            .map(str::to_string)
+            .unwrap_or_else(|| content.to_string());
+        self.pending.clear();
+        self.emitted.push_str(&tail);
+        tail
+    }
+}
+
+/// Number of trailing bytes that may be the beginning of `marker`.
+fn minimax_m3_marker_suffix(text: &str, marker: &str) -> usize {
+    for len in (1..text.len().min(marker.len().saturating_sub(1)) + 1).rev() {
+        let start = text.len() - len;
+        if text.is_char_boundary(start) && marker.starts_with(&text[start..]) {
+            return len;
+        }
+    }
+    0
+}
+
+/// Start byte of a complete M3 tool-call marker, accepting the whitespace
+/// spelling the reference detector normalizes after the namespace token.
+fn minimax_m3_tool_start(text: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(relative) = text[from..].find(MINIMAX_M3_NS) {
+        let start = from + relative;
+        let after_ns = &text[start + MINIMAX_M3_NS.len()..];
+        let spaces = after_ns
+            .bytes()
+            .take_while(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+            .count();
+        if after_ns[spaces..].starts_with("<tool_call>") {
+            return Some(start);
+        }
+        from = start + MINIMAX_M3_NS.len();
+    }
+    None
+}
+
+/// Bytes safe to release while in the public-content phase.  The retained
+/// tail is either a partial namespace token or a full namespace followed by
+/// whitespace/a partial `<tool_call>` marker.
+fn minimax_m3_content_flush_len(text: &str) -> usize {
+    let mut keep_from = text.len();
+    let mut from = 0;
+    while let Some(relative) = text[from..].find(MINIMAX_M3_NS) {
+        let start = from + relative;
+        let after_ns = &text[start + MINIMAX_M3_NS.len()..];
+        let spaces = after_ns
+            .bytes()
+            .take_while(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+            .count();
+        let after_space = &after_ns[spaces..];
+        if after_space.is_empty() || "<tool_call>".starts_with(after_space) {
+            keep_from = keep_from.min(start);
+        }
+        from = start + MINIMAX_M3_NS.len();
+    }
+    let partial = minimax_m3_marker_suffix(text, MINIMAX_M3_NS);
+    if partial > 0 {
+        keep_from = keep_from.min(text.len() - partial);
+    }
+    keep_from
+}
+
+/// M3's reasoning detector has one format-specific wrinkle: an adaptive
+/// non-thinking response starts with a closing marker inherited from the
+/// prompt.  Only that *leading* close is stripped.  A truncated reasoning
+/// block remains available as `reasoning_content`, never as user content.
+fn split_minimax_m3_reasoning(text: &str) -> (String, Option<String>) {
+    let leading = text.trim_start();
+    if let Some(content) = leading.strip_prefix(MINIMAX_M3_THINK_CLOSE) {
+        return (content.to_string(), None);
+    }
+
+    let mut rest = text;
+    let mut opened = false;
+    while let Some(after_open) = rest.strip_prefix(MINIMAX_M3_THINK_OPEN) {
+        opened = true;
+        rest = after_open;
+    }
+    if !opened {
+        return (text.to_string(), None);
+    }
+
+    match rest.find(MINIMAX_M3_THINK_CLOSE) {
+        Some(end) => (
+            rest[end + MINIMAX_M3_THINK_CLOSE.len()..].to_string(),
+            Some(rest[..end].to_string()),
+        ),
+        None => (String::new(), Some(rest.to_string())),
+    }
+}
+
+/// The M3 template permits harmless whitespace between its namespace token
+/// and the following XML tag.  SGLang normalizes exactly that spelling before
+/// parsing; do it without touching whitespace anywhere else.
+fn normalize_minimax_m3_tag_spacing(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(MINIMAX_M3_NS) {
+        let after_ns = &rest[at + MINIMAX_M3_NS.len()..];
+        let spaces = after_ns
+            .bytes()
+            .take_while(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+            .count();
+        out.push_str(&rest[..at + MINIMAX_M3_NS.len()]);
+        if spaces > 0 && after_ns[spaces..].starts_with('<') {
+            rest = &after_ns[spaces..];
+        } else {
+            rest = after_ns;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Extract complete M3 tool blocks.  This is intentionally transactional:
+/// if one M3 block cannot be fully and safely decoded, return the original
+/// text and no actions.  Clients can then see the model output, while no
+/// malformed XML can be mistaken for an executable call.
+fn extract_minimax_m3_tool_calls(text: &str, tools: &[Value]) -> (String, Vec<Value>) {
+    if tools.is_empty() {
+        return (text.to_string(), Vec::new());
+    }
+    let normalized = normalize_minimax_m3_tag_spacing(text);
+    let mut plain = String::with_capacity(normalized.len());
+    let mut calls = Vec::new();
+    let mut cursor = 0;
+
+    while let Some(relative_start) = normalized[cursor..].find(MINIMAX_M3_TOOL_OPEN) {
+        let start = cursor + relative_start;
+        let body_start = start + MINIMAX_M3_TOOL_OPEN.len();
+        let Some(relative_end) = normalized[body_start..].find(MINIMAX_M3_TOOL_CLOSE) else {
+            return (text.to_string(), Vec::new());
+        };
+        let end = body_start + relative_end;
+        let block = &normalized[body_start..end];
+        let Some(block_calls) = parse_minimax_m3_tool_block(block, tools) else {
+            return (text.to_string(), Vec::new());
+        };
+        if block_calls.is_empty() {
+            return (text.to_string(), Vec::new());
+        }
+        plain.push_str(&normalized[cursor..start]);
+        calls.extend(block_calls);
+        cursor = end + MINIMAX_M3_TOOL_CLOSE.len();
+    }
+    plain.push_str(&normalized[cursor..]);
+    (plain, calls)
+}
+
+/// Parse every `<invoke>` in one M3 `<tool_call>` block.  Extra non-whitespace
+/// markup is rejected so malformed output remains ordinary content.
+fn parse_minimax_m3_tool_block(block: &str, tools: &[Value]) -> Option<Vec<Value>> {
+    let mut calls = Vec::new();
+    let mut cursor = 0;
+    while cursor < block.len() {
+        let relative_start = block[cursor..].find(MINIMAX_M3_INVOKE_OPEN);
+        let Some(relative_start) = relative_start else {
+            return block[cursor..].trim().is_empty().then_some(calls);
+        };
+        let start = cursor + relative_start;
+        if !block[cursor..start].trim().is_empty() {
+            return None;
+        }
+        let name_start = start + MINIMAX_M3_INVOKE_OPEN.len();
+        let relative_name_end = block[name_start..].find("\">")?;
+        let name_end = name_start + relative_name_end;
+        let name = &block[name_start..name_end];
+        if name.is_empty() {
+            return None;
+        }
+        let function = minimax_m3_function(tools, name)?;
+        let body_start = name_end + 2; // `">`
+        let relative_end = block[body_start..].find(MINIMAX_M3_INVOKE_CLOSE)?;
+        let end = body_start + relative_end;
+        let args =
+            parse_minimax_m3_parameters(&block[body_start..end], function.get("parameters"))?;
+        calls.push(openai_call(name, &args));
+        cursor = end + MINIMAX_M3_INVOKE_CLOSE.len();
+    }
+    Some(calls)
+}
+
+/// Locate an OpenAI tool declaration by name.  Accept the standard wrapper
+/// (`{"type":"function","function":…}`) and the inner function object used
+/// by a few clients' template tests.
+fn minimax_m3_function<'a>(tools: &'a [Value], name: &str) -> Option<&'a Value> {
+    tools.iter().find_map(|tool| {
+        let function = tool.get("function").unwrap_or(tool);
+        (function.get("name").and_then(Value::as_str) == Some(name)).then_some(function)
+    })
+}
+
+struct MiniMaxM3Frame<'a> {
+    tag: String,
+    schema: Option<&'a Value>,
+    value: Value,
+}
+
+/// Decode M3's recursively-expanded XML arguments.  The template prefixes
+/// each tag with the namespace token, so splitting on that token mirrors the
+/// source parser and avoids treating arbitrary text as XML.
+fn parse_minimax_m3_parameters(body: &str, schema: Option<&Value>) -> Option<Value> {
+    let root = if minimax_m3_has_type(schema, &["array"]) && minimax_m3_body_starts_with_item(body)
+    {
+        Value::Array(Vec::new())
+    } else {
+        Value::Object(Map::new())
+    };
+    let mut stack = vec![MiniMaxM3Frame {
+        tag: String::new(),
+        schema,
+        value: root,
+    }];
+
+    for raw_chunk in body.split(MINIMAX_M3_NS) {
+        // This matches SGLang's parser: whitespace separating tags is layout,
+        // while text after an opening tag is the actual leaf value.
+        let chunk = raw_chunk.trim();
+        if chunk.is_empty() {
+            continue;
+        }
+        if let Some(after_close) = chunk.strip_prefix("</") {
+            let close_end = after_close.find('>')?;
+            if !after_close[close_end + 1..].trim().is_empty() {
+                return None;
+            }
+            let tag = after_close[..close_end].trim();
+            if tag.is_empty() || stack.len() <= 1 || stack.last()?.tag != tag {
+                return None;
+            }
+            let frame = stack.pop()?;
+            if !minimax_m3_assign_child(&mut stack.last_mut()?.value, frame.tag, frame.value) {
+                return None;
+            }
+            continue;
+        }
+        let Some(after_open) = chunk.strip_prefix('<') else {
+            return None;
+        };
+        let open_end = after_open.find('>')?;
+        let tag = after_open[..open_end].trim();
+        if tag.is_empty() || tag.contains('/') {
+            return None;
+        }
+        let leaf_text = &after_open[open_end + 1..];
+        let parent = stack.last()?;
+        let child_schema = minimax_m3_child_schema(parent.schema, tag, &parent.value);
+        let value = if !leaf_text.is_empty() || minimax_m3_is_scalar_schema(child_schema) {
+            minimax_m3_leaf_value(leaf_text, child_schema)
+        } else {
+            minimax_m3_new_container(child_schema)
+        };
+        stack.push(MiniMaxM3Frame {
+            tag: tag.to_string(),
+            schema: child_schema,
+            value,
+        });
+    }
+
+    (stack.len() == 1).then(|| stack.pop().expect("root frame").value)
+}
+
+fn minimax_m3_body_starts_with_item(body: &str) -> bool {
+    body.split(MINIMAX_M3_NS)
+        .map(str::trim)
+        .find(|chunk| !chunk.is_empty())
+        .is_some_and(|chunk| chunk.starts_with("<item>"))
+}
+
+fn minimax_m3_schema_types(schema: Option<&Value>) -> Vec<&str> {
+    let Some(schema) = schema else {
+        return Vec::new();
+    };
+    match schema.get("type") {
+        Some(Value::String(kind)) => vec![kind.as_str()],
+        Some(Value::Array(kinds)) => kinds.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn minimax_m3_has_type(schema: Option<&Value>, wanted: &[&str]) -> bool {
+    minimax_m3_schema_types(schema).into_iter().any(|kind| {
+        wanted
+            .iter()
+            .any(|candidate| kind.eq_ignore_ascii_case(candidate))
+    })
+}
+
+fn minimax_m3_is_scalar_schema(schema: Option<&Value>) -> bool {
+    let kinds = minimax_m3_schema_types(schema);
+    let scalar = kinds.iter().any(|kind| {
+        [
+            "string", "str", "integer", "int", "number", "float", "boolean", "bool", "null",
+        ]
+        .iter()
+        .any(|candidate| kind.eq_ignore_ascii_case(candidate))
+    });
+    let container = kinds.iter().any(|kind| {
+        ["object", "array"]
+            .iter()
+            .any(|candidate| kind.eq_ignore_ascii_case(candidate))
+    });
+    scalar && !container
+}
+
+fn minimax_m3_child_schema<'a>(
+    parent_schema: Option<&'a Value>,
+    tag: &str,
+    parent_value: &Value,
+) -> Option<&'a Value> {
+    let schema = parent_schema?;
+    if minimax_m3_has_type(Some(schema), &["array"]) && tag == "item" {
+        return minimax_m3_array_item_schema(schema, parent_value);
+    }
+    if let Some(schema) = minimax_m3_schema_property(schema, tag) {
+        return Some(schema);
+    }
+    schema
+        .get("additionalProperties")
+        .filter(|value| value.is_object())
+}
+
+fn minimax_m3_schema_property<'a>(schema: &'a Value, key: &str) -> Option<&'a Value> {
+    if let Some(value) = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(key))
+    {
+        return Some(value);
+    }
+    for keyword in ["anyOf", "oneOf", "allOf"] {
+        if let Some(value) = schema
+            .get(keyword)
+            .and_then(Value::as_array)
+            .and_then(|branches| {
+                branches
+                    .iter()
+                    .find_map(|branch| minimax_m3_schema_property(branch, key))
+            })
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn minimax_m3_array_item_schema<'a>(schema: &'a Value, value: &Value) -> Option<&'a Value> {
+    let index = value.as_array().map_or(0, Vec::len);
+    if let Some(item) = schema
+        .get("prefixItems")
+        .and_then(Value::as_array)
+        .and_then(|items| items.get(index))
+    {
+        return Some(item);
+    }
+    if let Some(item) = schema
+        .get("additionalItems")
+        .filter(|value| value.is_object())
+    {
+        return Some(item);
+    }
+    if let Some(item) = schema.get("items").filter(|value| value.is_object()) {
+        return Some(item);
+    }
+    schema
+        .get("prefixItems")
+        .and_then(Value::as_array)
+        .and_then(|items| items.last())
+}
+
+fn minimax_m3_new_container(schema: Option<&Value>) -> Value {
+    if minimax_m3_has_type(schema, &["array"]) {
+        Value::Array(Vec::new())
+    } else {
+        Value::Object(Map::new())
+    }
+}
+
+/// M3 scalar coercion follows its reference detector: strings remain literal,
+/// nullable strings turn only exact `null` spellings into JSON null, and typed
+/// numeric/boolean fields are decoded from their XML text.
+fn minimax_m3_leaf_value(raw: &str, schema: Option<&Value>) -> Value {
+    let kinds = minimax_m3_schema_types(schema);
+    let has = |wanted: &[&str]| {
+        kinds.iter().any(|kind| {
+            wanted
+                .iter()
+                .any(|candidate| kind.eq_ignore_ascii_case(candidate))
+        })
+    };
+    let null_permitted = has(&["null"]);
+    if has(&["string", "str"]) && !null_permitted {
+        return Value::String(raw.to_string());
+    }
+    if null_permitted && (matches!(raw, "null" | "Null" | "NULL") || raw.is_empty()) {
+        return Value::Null;
+    }
+
+    let parsed = raw.trim();
+    if has(&["integer", "int"]) {
+        if let Ok(value) = parsed.parse::<i64>() {
+            return Value::Number(value.into());
+        }
+        if let Ok(value) = parsed.parse::<u64>() {
+            return Value::Number(value.into());
+        }
+    }
+    if has(&["number", "float"]) {
+        if let Ok(value) = parsed.parse::<f64>() {
+            if value.is_finite() {
+                if value.fract() == 0.0 && value >= i64::MIN as f64 && value <= i64::MAX as f64 {
+                    return Value::Number((value as i64).into());
+                }
+                if let Some(value) = serde_json::Number::from_f64(value) {
+                    return Value::Number(value);
+                }
+            }
+        }
+    }
+    if has(&["boolean", "bool"]) {
+        match parsed.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => return Value::Bool(true),
+            "false" | "0" | "no" | "off" => return Value::Bool(false),
+            _ => {}
+        }
+    }
+    Value::String(raw.to_string())
+}
+
+fn minimax_m3_assign_child(parent: &mut Value, tag: String, child: Value) -> bool {
+    match parent {
+        Value::Array(values) => {
+            values.push(child);
+            true
+        }
+        Value::Object(values) => {
+            if let Some(existing) = values.get_mut(&tag) {
+                if let Value::Array(items) = existing {
+                    items.push(child);
+                } else {
+                    let old = std::mem::replace(existing, Value::Null);
+                    *existing = Value::Array(vec![old, child]);
+                }
+            } else {
+                values.insert(tag, child);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Extract tool calls. Returns the text outside the calls (trimmed) and
 /// the calls in OpenAI shape. `tools` is the request's declared tool list
 /// (needed for the MiniCPM5 grammar's schema-typed values and name
@@ -718,6 +1367,312 @@ mod tests {
                 "parameters": {"type": "object",
                     "properties": {"code": {"type": "string"}}, "required": ["code"]}}}),
         ]
+    }
+
+    fn minimax_m3_tools() -> Vec<Value> {
+        vec![
+            serde_json::json!({"type": "function", "function": {
+                "name": "get_weather",
+                "parameters": {"type": "object", "properties": {
+                    "city": {"type": "string"}, "count": {"type": "integer"},
+                    "ratio": {"type": "number"}, "verbose": {"type": "boolean"}
+                }, "required": ["city"]}
+            }}),
+            serde_json::json!({"type": "function", "function": {
+                "name": "create_event",
+                "parameters": {"type": "object", "properties": {
+                    "title": {"type": "string"},
+                    "location": {"type": "object", "properties": {
+                        "city": {"type": "string"}, "zip": {"type": "integer"}
+                    }},
+                    "tags": {"type": "array", "items": {"type": "string"}}
+                }}
+            }}),
+            serde_json::json!({"type": "function", "function": {
+                "name": "configure",
+                "parameters": {"type": "object", "properties": {
+                    "mode": {"type": "string"},
+                    "optional": {"type": ["string", "null"]}
+                }}
+            }}),
+        ]
+    }
+
+    fn m3_wire(parts: &[&str]) -> String {
+        parts
+            .iter()
+            .map(|part| format!("{MINIMAX_M3_NS}{part}"))
+            .collect()
+    }
+
+    fn stream_m3(chunks: &[&str], tools: &[Value]) -> (String, Vec<Value>, Option<String>) {
+        let text = chunks.concat();
+        let mut stream = MiniMaxM3Stream::with_declared_tools();
+        let mut content = String::new();
+        for chunk in chunks {
+            content.push_str(&stream.push(chunk));
+        }
+        let (plain, calls, reasoning) = extract_minimax_m3_response(&text, Some(tools));
+        content.push_str(&stream.finish(&plain));
+        (content, calls, reasoning)
+    }
+
+    // ── MiniMax M3 ──
+
+    #[test]
+    fn minimax_m3_splits_adaptive_reasoning_and_parses_namespaced_call() {
+        let tools = minimax_m3_tools();
+        let text = format!(
+            "<mm:think>I should use the weather tool.</mm:think>Checking.{}",
+            m3_wire(&[
+                "<tool_call>",
+                "<invoke name=\"get_weather\">",
+                "<city>Beijing",
+                "</city>",
+                "<count>7",
+                "</count>",
+                "<ratio>0.5",
+                "</ratio>",
+                "<verbose>true",
+                "</verbose>",
+                "</invoke>",
+                "</tool_call>",
+            ])
+        );
+        let (plain, calls, reasoning) = extract_minimax_m3_response(&text, Some(&tools));
+        assert_eq!(reasoning.as_deref(), Some("I should use the weather tool."));
+        assert_eq!(plain, "Checking.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert_eq!(
+            args(&calls[0]),
+            serde_json::json!({"city": "Beijing", "count": 7, "ratio": 0.5, "verbose": true})
+        );
+    }
+
+    #[test]
+    fn minimax_m3_recursively_decodes_object_array_and_nullable_scalars() {
+        let tools = minimax_m3_tools();
+        let event = m3_wire(&[
+            "<tool_call>",
+            "<invoke name=\"create_event\">",
+            "<title>Standup",
+            "</title>",
+            "<location>",
+            "<city>NYC",
+            "</city>",
+            "<zip>10001",
+            "</zip>",
+            "</location>",
+            "<tags>",
+            "<item>red",
+            "</item>",
+            "<item>blue",
+            "</item>",
+            "</tags>",
+            "</invoke>",
+            "</tool_call>",
+        ]);
+        let (plain, calls, reasoning) = extract_minimax_m3_response(&event, Some(&tools));
+        assert_eq!(plain, "");
+        assert_eq!(reasoning, None);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            args(&calls[0]),
+            serde_json::json!({
+                "title": "Standup",
+                "location": {"city": "NYC", "zip": 10001},
+                "tags": ["red", "blue"],
+            })
+        );
+
+        let config = m3_wire(&[
+            "<tool_call>",
+            "<invoke name=\"configure\">",
+            "<mode>null",
+            "</mode>",
+            "<optional>null",
+            "</optional>",
+            "</invoke>",
+            "</tool_call>",
+        ]);
+        let (_, calls, _) = extract_minimax_m3_response(&config, Some(&tools));
+        assert_eq!(
+            args(&calls[0]),
+            serde_json::json!({"mode": "null", "optional": null})
+        );
+    }
+
+    #[test]
+    fn minimax_m3_strips_only_leading_close_and_keeps_malformed_output() {
+        let tools = minimax_m3_tools();
+        let (plain, calls, reasoning) =
+            extract_minimax_m3_response(" \n</mm:think>direct answer", Some(&tools));
+        assert_eq!(plain, "direct answer");
+        assert!(calls.is_empty());
+        assert_eq!(reasoning, None);
+
+        let (plain, calls, reasoning) =
+            extract_minimax_m3_response("<mm:think>truncated", Some(&tools));
+        assert_eq!(plain, "");
+        assert!(calls.is_empty());
+        assert_eq!(reasoning.as_deref(), Some("truncated"));
+
+        let malformed = m3_wire(&[
+            "<tool_call>",
+            "<invoke name=\"get_weather\">",
+            "<city>Beijing",
+            "</wrong>",
+            "</invoke>",
+            "</tool_call>",
+        ]);
+        let (plain, calls, reasoning) = extract_minimax_m3_response(&malformed, Some(&tools));
+        assert_eq!(plain, malformed);
+        assert!(calls.is_empty());
+        assert_eq!(reasoning, None);
+
+        let unknown = m3_wire(&[
+            "<tool_call>",
+            "<invoke name=\"not_declared\">",
+            "</invoke>",
+            "</tool_call>",
+        ]);
+        let (plain, calls, _) = extract_minimax_m3_response(&unknown, Some(&tools));
+        assert_eq!(plain, unknown);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn minimax_m3_accepts_namespace_tag_spacing_without_rewriting_plain_text() {
+        let tools = minimax_m3_tools();
+        let text = format!(
+            "answer{} \n<tool_call>{}\t<invoke name=\"get_weather\">{} <city>Rome{}</city>{}</invoke>{}</tool_call>",
+            MINIMAX_M3_NS,
+            MINIMAX_M3_NS,
+            MINIMAX_M3_NS,
+            MINIMAX_M3_NS,
+            MINIMAX_M3_NS,
+            MINIMAX_M3_NS,
+        );
+        let (plain, calls, _) = extract_minimax_m3_response(&text, Some(&tools));
+        assert_eq!(plain, "answer");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(args(&calls[0]), serde_json::json!({"city": "Rome"}));
+    }
+
+    #[test]
+    fn minimax_m3_stream_hides_split_reasoning_and_tool_protocol() {
+        let tools = minimax_m3_tools();
+        let chunks = [
+            "<mm:",
+            "think>use the weather tool</mm:th",
+            "ink>Checking.",
+            "]<]min",
+            "imax[>[<tool",
+            "_call> ]<]minimax[>[<invoke name=\"get_weather\">",
+            "]<]minimax[>[<city>Paris",
+            "]<]minimax[>[</city> ]<]minimax[>[</invoke> ]<]minimax[>[</tool_call>",
+        ];
+        let (content, calls, reasoning) = stream_m3(&chunks, &tools);
+        assert_eq!(content, "Checking.");
+        assert!(!content.contains("minimax"));
+        assert!(!content.contains("mm:think"));
+        assert_eq!(reasoning.as_deref(), Some("use the weather tool"));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["function"]["name"], "get_weather");
+        assert_eq!(args(&calls[0]), serde_json::json!({"city": "Paris"}));
+    }
+
+    #[test]
+    fn minimax_m3_stream_is_safe_at_every_marker_boundary() {
+        let tools = minimax_m3_tools();
+        let text = format!(
+            "<mm:think>private</mm:think>public{}",
+            m3_wire(&[
+                "<tool_call>",
+                "<invoke name=\"get_weather\">",
+                "<city>Rome",
+                "</city>",
+                "</invoke>",
+                "</tool_call>",
+            ])
+        );
+        for split in 0..=text.len() {
+            if !text.is_char_boundary(split) {
+                continue;
+            }
+            let (content, calls, reasoning) = stream_m3(&[&text[..split], &text[split..]], &tools);
+            assert_eq!(content, "public", "split at byte {split}");
+            assert!(!content.contains("minimax"), "split at byte {split}");
+            assert!(!content.contains("mm:think"), "split at byte {split}");
+            assert_eq!(reasoning.as_deref(), Some("private"), "split at byte {split}");
+            assert_eq!(calls.len(), 1, "split at byte {split}");
+        }
+    }
+
+    #[test]
+    fn minimax_m3_stream_handles_a_split_adaptive_close() {
+        let tools = minimax_m3_tools();
+        let (content, calls, reasoning) =
+            stream_m3(&[" \n</mm:", "think>direct", " answer"], &tools);
+        assert_eq!(content, "direct answer");
+        assert!(calls.is_empty());
+        assert_eq!(reasoning, None);
+    }
+
+    #[test]
+    fn minimax_m3_stream_retains_malformed_tool_output_at_finish() {
+        let tools = minimax_m3_tools();
+        let chunks = [
+            "Before.",
+            "]<]minimax[>[<tool_call>",
+            "]<]minimax[>[<invoke name=\"get_weather\">",
+            "]<]minimax[>[<city>Paris",
+            "]<]minimax[>[</wrong>] <]minimax[>[</invoke>] <]minimax[>[</tool_call>",
+        ];
+        let (content, calls, reasoning) = stream_m3(&chunks, &tools);
+        assert_eq!(content, chunks.concat());
+        assert!(calls.is_empty());
+        assert_eq!(reasoning, None);
+    }
+
+    #[test]
+    fn minimax_m3_stream_never_leaks_unterminated_reasoning() {
+        let mut stream = MiniMaxM3Stream::new();
+        for chunk in ["<mm:", "think>private ", "chain of thought"] {
+            let emitted = stream.push(chunk);
+            assert!(emitted.is_empty(), "reasoning leaked from {chunk:?}: {emitted:?}");
+        }
+        let text = "<mm:think>private chain of thought";
+        let (plain, calls, reasoning) = extract_minimax_m3_response(text, None);
+        assert!(plain.is_empty());
+        assert!(calls.is_empty());
+        assert_eq!(reasoning.as_deref(), Some("private chain of thought"));
+        assert!(stream.finish(&plain).is_empty());
+    }
+
+    #[test]
+    fn minimax_m3_stream_defers_namespace_text_for_transactional_parser() {
+        let tools = minimax_m3_tools();
+        // The strict parser normalizes whitespace after this namespace only
+        // when all later tool blocks are valid.  A later malformed block must
+        // therefore restore these exact wire bytes without duplicating an
+        // already streamed prefix.
+        let text = format!(
+            "before{MINIMAX_M3_NS}  <ordinary>after{}",
+            m3_wire(&[
+                "<tool_call>",
+                "<invoke name=\"get_weather\">",
+                "<city>Paris",
+                "</wrong>",
+                "</invoke>",
+                "</tool_call>",
+            ])
+        );
+        let (content, calls, reasoning) = stream_m3(&[&text[..7], &text[7..]], &tools);
+        assert_eq!(content, text);
+        assert!(calls.is_empty());
+        assert_eq!(reasoning, None);
     }
 
     // ── Hermes (unchanged behaviour) ──

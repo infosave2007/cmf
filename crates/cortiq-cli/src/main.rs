@@ -25,8 +25,10 @@ mod lookup;
 mod ltxcmd;
 mod ltxpack;
 mod mimo_towers;
+mod minimax_m3;
 mod moedefrag;
 mod music;
+mod mossimagepack;
 mod npy;
 mod nvg;
 mod nvg_linalg;
@@ -491,10 +493,12 @@ enum Commands {
         /// skeleton policy), norms and sinks f32.
         #[arg(long, conflicts_with = "mimo_towers")]
         mtp_sidecar: bool,
-        /// MiniCPM-V-4.7-35B-A3B only: convert the official Qwen3 DFlash/
-        /// DSpark checkpoint into the separate `<stem>.dspark.cmf` draft
-        /// sidecar beside an existing base --output CMF.  This is deliberately
-        /// not an MTP sidecar and does not enable a draft runtime by itself.
+        /// Convert an official DSpark draft checkpoint into the separate
+        /// `<stem>.dspark.cmf` draft sidecar beside an existing base --output
+        /// CMF: MiniCPM-V-4.7's Qwen3 DFlash draft or MiniMax-M3.1's
+        /// `DSparkMiniMaxDraftModel` — the base CMF's architecture selects
+        /// the contract.  This is deliberately not an MTP sidecar and does
+        /// not enable a draft runtime by itself.
         #[arg(long, conflicts_with = "mtp_sidecar")]
         dspark_sidecar: bool,
         /// MiMo-V2 towers: `text` (default) drops them; `mm-only` writes the
@@ -2175,13 +2179,17 @@ enum Commands {
         #[arg(long)]
         teacher: Option<String>,
     },
-    /// Text-to-image with Z-Image / Z-Image-Turbo or Lumina CMFs, or edit
-    /// reference images with Qwen Image CMFs.
+    /// Text-to-image with MOSS-Image, Z-Image / Z-Image-Turbo or Lumina
+    /// CMFs, or edit reference images with Qwen Image CMFs.
     ///
     /// Z-Image (one .cmf from `imagine-pack`): every option defaults to the
     /// recipe stored in the file — Turbo: 1024x1024, 8 steps, guidance 0;
     /// Z-Image (base): 1024x1024, 28 steps, guidance 4 with CFG — so
     /// `cortiq imagine z-image-turbo.cmf --prompt "…"` needs no other flag.
+    /// MOSS-Image (one .cmf from `imagine-pack`): the stored official recipe
+    /// is 1024x1024, 50 Flow-Euler steps, CFG 3, shift 5, with its Qwen3.5
+    /// text template and Flux2 decoder embedded.  Its text, DiT and VAE run
+    /// as separate residency stages, so no component path is needed.
     /// Qwen-Image-2.1 (one .cmf from `imagine-pack`): 1024x1024, 40 steps, no
     /// CFG by default; PNG output keeps the alpha channel (ask for transparency
     /// in the prompt); --image adds condition images.
@@ -2190,17 +2198,28 @@ enum Commands {
     Imagine {
         /// Model: a Z-Image/Lumina/Qwen .cmf, or a Lumina/Qwen root directory
         model_dir: String,
-        /// Text prompt
-        #[arg(long)]
-        prompt: String,
-        /// Image height in pixels (Z-Image: multiple of 16; default from the file)
+        /// Text prompt. MOSS also accepts exactly one --layout or --layout-file.
+        #[arg(
+            long,
+            required_unless_present_any = ["layout", "layout_file"],
+            conflicts_with_all = ["layout", "layout_file"]
+        )]
+        prompt: Option<String>,
+        /// A JSON layout prompt for MOSS-Image (exclusive with --prompt).
+        /// The object is passed unchanged through MOSS's official text template.
+        #[arg(long, value_name = "JSON", conflicts_with_all = ["prompt", "layout_file"])]
+        layout: Option<String>,
+        /// Path to a JSON layout prompt for MOSS-Image (exclusive with --prompt).
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["prompt", "layout"])]
+        layout_file: Option<String>,
+        /// Image height in pixels (MOSS/Z-Image: multiple of 16; default from the file)
         #[arg(long)]
         height: Option<usize>,
-        /// Image width in pixels (Z-Image: multiple of 16; default from the file)
+        /// Image width in pixels (MOSS/Z-Image: multiple of 16; default from the file)
         #[arg(long)]
         width: Option<usize>,
-        /// Denoising steps = DiT forwards per image (Z-Image default from the
-        /// file: Turbo 8, base 28; Lumina 30)
+        /// Denoising steps = DiT forwards per image (MOSS default 50 with
+        /// CFG doing two forwards; Z-Image: Turbo 8/base 28; Lumina 30)
         #[arg(long)]
         steps: Option<usize>,
         /// Classifier-free guidance scale. Z-Image: 0 disables CFG (one DiT
@@ -2219,18 +2238,36 @@ enum Commands {
         /// noise range)
         #[arg(long)]
         cfg_truncation: Option<f32>,
-        /// Z-Image scheduler shift override (default from the file: Turbo 3, base 6)
+        /// MOSS/Z-Image scheduler shift override (default from the file)
         #[arg(long)]
         shift: Option<f32>,
-        /// Z-Image prompt token cap after the chat template (default 512)
+        /// MOSS negative-branch blocks to skip during the active interval,
+        /// as comma-separated zero-based indices. Use `none` or a bare flag
+        /// to disable the source default (22).
+        #[arg(long, value_name = "LAYERS", num_args = 0..=1, default_missing_value = "none")]
+        uncond_skip_layers: Option<String>,
+        /// MOSS positive-branch SLG blocks, as comma-separated zero-based indices.
+        /// Together with --slg-scale this adds one DiT forward while active.
+        #[arg(long, value_name = "LAYERS")]
+        slg_layers: Option<String>,
+        /// MOSS standard skip-layer-guidance correction scale (>= 0).
+        #[arg(long)]
+        slg_scale: Option<f32>,
+        /// MOSS denoising-fraction interval start for source skip/SLG (0..=1).
+        #[arg(long)]
+        slg_start: Option<f32>,
+        /// MOSS denoising-fraction interval end for source skip/SLG (0..=1).
+        #[arg(long)]
+        slg_stop: Option<f32>,
+        /// MOSS/Z-Image prompt token cap after the chat template (MOSS default 4096)
         #[arg(long)]
         max_sequence_length: Option<usize>,
-        /// Images to generate (Z-Image); image i uses seed + i and the prompt
+        /// Images to generate (MOSS/Z-Image); image i uses seed + i and the prompt
         /// is encoded once. Files: <out-stem>_<i>.<ext> when more than one.
         #[arg(long, default_value_t = 1)]
         num_images: usize,
-        /// Random seed (Z-Image: SplitMix64 + Box-Muller noise; CMF_INIT_LATENT
-        /// injects a raw f32 [1,16,H/8,W/8] latent instead)
+        /// Random seed (MOSS/Z-Image: SplitMix64 + Box-Muller noise; CMF_INIT_LATENT
+        /// applies only to compatible Z-Image latent geometry)
         #[arg(long, default_value_t = 42)]
         seed: u64,
         /// Condition/reference image (Qwen-Image-2.1, Qwen Image Edit); repeat for multiple images
@@ -2242,8 +2279,9 @@ enum Commands {
         /// Qwen Image VAE CMF (default: vae.cmf beside the transformer)
         #[arg(long)]
         vae: Option<String>,
-        /// Negative prompt. Z-Image: used when guidance > 0 (default "", the
-        /// diffusers default). Qwen Image Edit: default a space, enabling true
+        /// Negative prompt. MOSS: used whenever CFG != 1 (default "", with
+        /// source negative-branch skip at block 22). Z-Image: used when guidance > 0
+        /// (default "", the diffusers default). Qwen Image Edit: default a space, enabling true
         /// CFG. Qwen-Image-2.1: no default; CFG runs only when this is given
         /// and --cfg > 1.
         #[arg(long)]
@@ -2312,13 +2350,14 @@ enum Commands {
         #[arg(long = "mask-thr", default_value = "0.5")]
         mask_thr: f32,
     },
-    /// Pack a Diffusers source into CMF. A Qwen-Image-2.1 directory
-    /// (QwenImage21Pipeline) or a Z-Image / Z-Image-Turbo pipeline
-    /// directory (model_index.json = ZImagePipeline) becomes ONE ready-to-run
-    /// file (DiT + Qwen3 text encoder + VAE + tokenizer + the model's default
-    /// recipe) and a <out>.sha256; otherwise the default packs Lumina into one
-    /// file; --component packs a standalone Qwen text encoder or VAE; --bundle
-    /// merges retained Qwen component CMFs into one ready-to-run file.
+    /// Pack a Diffusers source into CMF. Qwen-Image-2.1, Z-Image and
+    /// MOSS-Image-Base pipeline directories become ONE ready-to-run file
+    /// (their DiT + text encoder + decoder + tokenizer + recipe) and a
+    /// <out>.sha256. For the source Base string-prompt text-to-image route,
+    /// MOSS retains the Qwen language tower and Flux2 decode path; Qwen vision
+    /// and Flux2 encode tensors are not reachable by that route. Otherwise the
+    /// default packs Lumina; --component packs a standalone Qwen component;
+    /// --bundle merges retained Qwen component CMFs into one file.
     ImaginePack {
         /// Optional standalone Qwen component: qwen-text-encoder or qwen-vae
         #[arg(long)]
@@ -2329,23 +2368,24 @@ enum Commands {
         bundle: bool,
         /// Diffusers root directory, or a pinned HF resolve base URL for Qwen
         root: String,
-        /// Projection codec (Qwen-Image-2.1 DiT: q4tp (default)/q8/raw; Z-Image DiT: q8 (=q8_2f, default)/q4tp/f16/bf16/raw;
+        /// Projection codec (Qwen-Image-2.1 DiT: q4tp (default)/q8/raw;
+        /// Z-Image/MOSS DiT: q8 (=q8_2f, default)/q4tp/f16/bf16/raw;
         /// Qwen: q4tp/q4t/q8_2f/f16; Lumina: q4t (default)/q8)
         #[arg(long)]
         quant: Option<String>,
-        /// Z-Image / Qwen-Image-2.1 text-encoder projection codec: q8 (=q8_2f,
-        /// default)/q4tp/f16/bf16/raw (embed_tokens stays q8_row unless raw/bf16/f16)
+        /// Z-Image / Qwen-Image-2.1 / MOSS text-encoder projection codec:
+        /// q8 (=q8_2f, default)/q4tp/f16/bf16/raw (embed_tokens stays q8_row
+        /// unless raw/bf16/f16)
         #[arg(long)]
         te_quant: Option<String>,
-        /// Z-Image `te.embed_tokens` codec (default q8_row with a quantized
-        /// --te-quant; raw/bf16/f16/f32 keep it 16/32-bit)
+        /// Z-Image/MOSS `te.embed_tokens` codec (default q8_row with a
+        /// quantized --te-quant; raw/bf16/f16/f32 keep it 16/32-bit)
         #[arg(long)]
         te_embed_quant: Option<String>,
-        /// Z-Image / Qwen-Image-2.1 text-encoder projections kept at the source precision
-        /// (comma list: `layers.N.mlp.down_proj` or a suffix like `down_proj`;
-        /// Z-Image default `layers.6.mlp.down_proj`, the massive-activation writer;
-        /// Qwen-Image-2.1 default none; a whole `layers.N` also works there;
-        /// `none` keeps nothing)
+        /// Z-Image / Qwen-Image-2.1 / MOSS text-encoder projections kept at
+        /// source precision (comma list: `layers.N.mlp.down_proj` or a suffix
+        /// like `down_proj`; Z-Image defaults layer 6; MOSS/Qwen default none;
+        /// a whole `layers.N` also works; `none` keeps nothing)
         #[arg(long, value_delimiter = ',')]
         te_keep: Vec<String>,
         /// Z-Image recipe stored in the file: turbo or base (default: from
@@ -2355,7 +2395,7 @@ enum Commands {
         /// Z-Image dev: pack only the first N main DiT layers (kernel tests)
         #[arg(long)]
         dit_layers: Option<usize>,
-        /// Z-Image / Qwen-Image-2.1: skip hashing the source shards into the provenance
+        /// Z-Image / Qwen-Image-2.1 / MOSS: skip hashing source shards into provenance
         #[arg(long, default_value_t = false)]
         no_source_sha: bool,
         /// Qwen-Image-2.1 vision-tower projection codec (default q8 = q8_2f)
@@ -2364,9 +2404,10 @@ enum Commands {
         /// Qwen-Image-2.1 VAE weight codec (default f16; f32/bf16/raw)
         #[arg(long)]
         vae_quant: Option<String>,
-        /// Qwen-Image-2.1 DiT projections kept at q8_2f over the --quant
-        /// base (comma list: `blocks.N`, a kind `to_q`/`to_k`/`to_v`/
-        /// `to_out`/`gate_layer`/`proj`/`out`, or `blocks.N.<kind>`)
+        /// Qwen-Image-2.1/MOSS DiT projections kept at q8_2f over the
+        /// --quant base. Qwen: `blocks.N`, a projection kind, or
+        /// `blocks.N.<kind>`; MOSS: `layers.N`, `q`/`k`/`v`/`o`/
+        /// `ffn_up_gate`/`ffn_down`, or `layers.N.<projection>`.
         #[arg(long, value_delimiter = ',')]
         dit_keep: Vec<String>,
         /// Qwen-Image-2.1: leave out the vision tower (text-to-image only)
@@ -3475,7 +3516,7 @@ async fn main() -> anyhow::Result<()> {
                     Some(q) if q.eq_ignore_ascii_case(convert::AUTO_QUANT) => "q8_2f",
                     Some(q) => q,
                 };
-                let path = convert::write_minicpm_dspark_sidecar(
+                let path = convert::write_dspark_sidecar(
                     std::path::Path::new(&model),
                     std::path::Path::new(&output),
                     q,
@@ -4391,6 +4432,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Imagine {
             model_dir,
             prompt,
+            layout,
+            layout_file,
             height,
             width,
             steps,
@@ -4398,6 +4441,11 @@ async fn main() -> anyhow::Result<()> {
             cfg_normalization,
             cfg_truncation,
             shift,
+            uncond_skip_layers,
+            slg_layers,
+            slg_scale,
+            slg_start,
+            slg_stop,
             max_sequence_length,
             num_images,
             seed,
@@ -4417,6 +4465,16 @@ async fn main() -> anyhow::Result<()> {
                 String::new()
             };
             let zimage = arch == cortiq_engine::zimagegen::ARCH_NAME;
+            let moss_image = arch == cortiq_engine::moss_imagegen::ARCH_NAME;
+            let prompt = if moss_image {
+                resolve_moss_prompt(prompt, layout, layout_file)?
+            } else {
+                anyhow::ensure!(
+                    layout.is_none() && layout_file.is_none(),
+                    "--layout/--layout-file apply only to MOSS-Image"
+                );
+                prompt.ok_or_else(|| anyhow::anyhow!("--prompt is required for this image model"))?
+            };
             if arch == cortiq_engine::qwen_image21::ARCH_NAME {
                 anyhow::ensure!(
                     text_encoder.is_none()
@@ -4425,8 +4483,13 @@ async fn main() -> anyhow::Result<()> {
                         && cfg_normalization.is_none()
                         && cfg_truncation.is_none()
                         && shift.is_none()
+                        && uncond_skip_layers.is_none()
+                        && slg_layers.is_none()
+                        && slg_scale.is_none()
+                        && slg_start.is_none()
+                        && slg_stop.is_none()
                         && max_sequence_length.is_none(),
-                    "--text-encoder/--vae/--scheduler/--cfg-normalization/--cfg-truncation/--shift/--max-sequence-length do not apply to Qwen-Image-2.1"
+                    "--text-encoder/--vae/--scheduler/--cfg-normalization/--cfg-truncation/--shift/--uncond-skip-layers/--slg-*/--max-sequence-length do not apply to Qwen-Image-2.1"
                 );
                 return cmd_qi21(
                     &model_dir,
@@ -4445,14 +4508,51 @@ async fn main() -> anyhow::Result<()> {
                     },
                 );
             }
-            if zimage {
+            if moss_image {
                 anyhow::ensure!(
                     images.is_empty()
                         && text_encoder.is_none()
                         && vae.is_none()
                         && scheduler.is_none()
+                        && cfg_normalization.is_none()
+                        && cfg_truncation.is_none()
                         && reference_size == 1024,
-                    "--image/--text-encoder/--vae/--scheduler/--reference-size are Qwen Image options"
+                    "--image/--text-encoder/--vae/--scheduler/--cfg-normalization/--cfg-truncation/--reference-size do not apply to MOSS-Image"
+                );
+                cmd_moss_image(
+                    &model_dir,
+                    &prompt,
+                    MossImageCli {
+                        height,
+                        width,
+                        steps,
+                        cfg,
+                        shift,
+                        uncond_skip_layers,
+                        slg_layers,
+                        slg_scale,
+                        slg_start,
+                        slg_stop,
+                        max_sequence_length,
+                        num_images,
+                        seed,
+                        negative_prompt,
+                        out,
+                    },
+                )
+            } else if zimage {
+                anyhow::ensure!(
+                    images.is_empty()
+                        && text_encoder.is_none()
+                        && vae.is_none()
+                        && scheduler.is_none()
+                        && uncond_skip_layers.is_none()
+                        && slg_layers.is_none()
+                        && slg_scale.is_none()
+                        && slg_start.is_none()
+                        && slg_stop.is_none()
+                        && reference_size == 1024,
+                    "--image/--text-encoder/--vae/--scheduler/--reference-size are Qwen Image options; --uncond-skip-layers/--slg-* are MOSS-Image options"
                 );
                 cmd_zimage(
                     &model_dir,
@@ -4477,9 +4577,14 @@ async fn main() -> anyhow::Result<()> {
                     cfg_normalization.is_none()
                         && cfg_truncation.is_none()
                         && shift.is_none()
+                        && uncond_skip_layers.is_none()
+                        && slg_layers.is_none()
+                        && slg_scale.is_none()
+                        && slg_start.is_none()
+                        && slg_stop.is_none()
                         && max_sequence_length.is_none()
                         && num_images == 1,
-                    "--cfg-normalization/--cfg-truncation/--shift/--max-sequence-length/--num-images are Z-Image options"
+                    "--cfg-normalization/--cfg-truncation/--shift/--max-sequence-length/--num-images are Z-Image options; --uncond-skip-layers/--slg-* are MOSS-Image options"
                 );
                 cmd_imagine(
                     &model_dir,
@@ -4564,6 +4669,38 @@ async fn main() -> anyhow::Result<()> {
             bundle,
         } => {
             let zroot = std::path::Path::new(&root);
+            if !bundle && component.is_none() && mossimagepack::is_moss_image_root(zroot) {
+                anyhow::ensure!(
+                    variant.is_none() && dit_layers.is_none(),
+                    "--variant/--dit-layers are Z-Image options"
+                );
+                anyhow::ensure!(
+                    vis_quant.is_none() && vae_quant.is_none() && !no_vision,
+                    "--vis-quant/--vae-quant/--no-vision are Qwen-Image-2.1 options"
+                );
+                return mossimagepack::pack(
+                    zroot,
+                    &out,
+                    &mossimagepack::PackOpts {
+                        dit: zimagepack::parse_codec(
+                            quant.as_deref().unwrap_or(mossimagepack::DEFAULT_DIT_CODEC),
+                        )?,
+                        dit_keep: dit_keep
+                            .into_iter()
+                            .filter(|key| key != "none")
+                            .collect(),
+                        te: zimagepack::parse_codec(
+                            te_quant.as_deref().unwrap_or(mossimagepack::DEFAULT_TE_CODEC),
+                        )?,
+                        te_embed: te_embed_quant
+                            .as_deref()
+                            .map(zimagepack::parse_codec)
+                            .transpose()?,
+                        te_keep: te_keep.into_iter().filter(|key| key != "none").collect(),
+                        source_sha: !no_source_sha,
+                    },
+                );
+            }
             if !bundle && component.is_none() && qi21pack::is_qi21_root(zroot) {
                 anyhow::ensure!(
                     te_embed_quant.is_none() && variant.is_none() && dit_layers.is_none(),
@@ -8318,6 +8455,175 @@ fn cmd_qi21(model: &str, prompt: &str, o: Qi21Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Parse zero-based MOSS transformer block indices without changing the
+/// source's set-like semantics. `none`, `off` and an empty value deliberately
+/// mean no skips, so a bare `--uncond-skip-layers` can disable the packaged
+/// source default.
+fn parse_moss_layer_list(raw: &str, flag: &str) -> anyhow::Result<Vec<usize>> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("none") || raw.eq_ignore_ascii_case("off") {
+        return Ok(Vec::new());
+    }
+    let mut layers = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        anyhow::ensure!(!part.is_empty(), "{flag} needs comma-separated nonnegative block indices");
+        let index = part.parse::<usize>().map_err(|_| {
+            anyhow::anyhow!("{flag} has invalid block index {part:?}; expected comma-separated nonnegative integers")
+        })?;
+        // The official Python path turns the list into a frozenset. Removing
+        // duplicates here has the same result and avoids needless contains
+        // checks in the hot forward loop.
+        if !layers.contains(&index) {
+            layers.push(index);
+        }
+    }
+    Ok(layers)
+}
+
+/// Keep a MOSS layout prompt byte-for-byte as supplied. The official pipeline
+/// treats it as a normal string prompt, so validation catches only malformed
+/// JSON / the wrong root value and never serializes it into a different form.
+fn validate_moss_layout(raw: &str, source: &str) -> anyhow::Result<String> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|e| anyhow::anyhow!("{source} is not valid JSON: {e}"))?;
+    anyhow::ensure!(value.is_object(), "{source} must contain a JSON object");
+    Ok(raw.to_owned())
+}
+
+/// Select MOSS's single source prompt. `--layout` and `--layout-file` are a
+/// convenience for the upstream JSON layout prompting mode; their content is
+/// passed unchanged through the stored source chat template.
+fn resolve_moss_prompt(
+    prompt: Option<String>,
+    layout: Option<String>,
+    layout_file: Option<String>,
+) -> anyhow::Result<String> {
+    match (prompt, layout, layout_file) {
+        (Some(prompt), None, None) => Ok(prompt),
+        (None, Some(layout), None) => validate_moss_layout(&layout, "--layout"),
+        (None, None, Some(path)) => {
+            let layout = std::fs::read_to_string(&path)
+                .map_err(|e| anyhow::anyhow!("cannot read --layout-file {path:?}: {e}"))?;
+            validate_moss_layout(&layout, "--layout-file")
+        }
+        _ => anyhow::bail!("provide exactly one of --prompt, --layout or --layout-file for MOSS-Image"),
+    }
+}
+
+/// `cortiq imagine` options that apply to a MOSS-Image container.
+struct MossImageCli {
+    height: Option<usize>,
+    width: Option<usize>,
+    steps: Option<usize>,
+    cfg: Option<f32>,
+    shift: Option<f32>,
+    uncond_skip_layers: Option<String>,
+    slg_layers: Option<String>,
+    slg_scale: Option<f32>,
+    slg_start: Option<f32>,
+    slg_stop: Option<f32>,
+    max_sequence_length: Option<usize>,
+    num_images: usize,
+    seed: u64,
+    negative_prompt: Option<String>,
+    out: Option<String>,
+}
+
+/// MOSS-Image: Qwen3.5 encoder → MOSS DiT → Flux2 decoder. Defaults come
+/// from the CMF recipe and retain the official negative-pass skip at layer 22.
+fn cmd_moss_image(model: &str, prompt: &str, o: MossImageCli) -> anyhow::Result<()> {
+    use cortiq_engine::moss_imagegen::{generate_images, MossDefaults, MossParams};
+    let d = MossDefaults::of(&CmfModel::open(model)?);
+    let mut p = MossParams::from_defaults(&d);
+    p.height = o.height.unwrap_or(d.height);
+    p.width = o.width.unwrap_or(d.width);
+    p.steps = o.steps.unwrap_or(d.steps);
+    p.cfg = o.cfg.unwrap_or(d.cfg);
+    p.shift = o.shift.unwrap_or(d.shift);
+    p.max_tokens = o.max_sequence_length.unwrap_or(d.max_sequence_length);
+    p.num_images = o.num_images;
+    p.seed = o.seed;
+    p.negative_prompt = o.negative_prompt;
+    if let Some(layers) = o.uncond_skip_layers.as_deref() {
+        p.uncond_skip_layers = Some(parse_moss_layer_list(layers, "--uncond-skip-layers")?);
+    }
+    if let Some(layers) = o.slg_layers.as_deref() {
+        p.slg_layers = parse_moss_layer_list(layers, "--slg-layers")?;
+    }
+    p.slg_scale = o.slg_scale.unwrap_or(p.slg_scale);
+    p.slg_start = o.slg_start.unwrap_or(p.slg_start);
+    p.slg_stop = o.slg_stop.unwrap_or(p.slg_stop);
+    anyhow::ensure!(
+        p.height > 0 && p.width > 0 && p.height % 16 == 0 && p.width % 16 == 0,
+        "--height/--width must be positive multiples of 16 (got {}x{})",
+        p.width,
+        p.height
+    );
+    anyhow::ensure!(
+        p.steps > 0 && p.cfg.is_finite() && p.cfg >= 0.0,
+        "--steps must be positive and --cfg must be finite and >= 0"
+    );
+    anyhow::ensure!(
+        p.shift.is_finite() && p.shift > 0.0,
+        "--shift must be finite and > 0"
+    );
+    anyhow::ensure!(
+        p.slg_scale.is_finite() && p.slg_scale >= 0.0,
+        "--slg-scale must be finite and >= 0"
+    );
+    anyhow::ensure!(
+        p.slg_start.is_finite()
+            && p.slg_stop.is_finite()
+            && p.slg_start >= 0.0
+            && p.slg_start <= p.slg_stop
+            && p.slg_stop <= 1.0,
+        "require 0 <= --slg-start <= --slg-stop <= 1"
+    );
+    anyhow::ensure!(p.num_images > 0, "--num-images must be at least 1");
+    let out = o.out.unwrap_or_else(|| "out.png".into());
+    let path = std::path::Path::new(&out);
+    let names: Vec<std::path::PathBuf> = if p.num_images == 1 {
+        vec![path.to_path_buf()]
+    } else {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("png");
+        (0..p.num_images)
+            .map(|i| path.with_file_name(format!("{stem}_{i}.{ext}")))
+            .collect()
+    };
+    eprintln!(
+        "moss-image: {}x{}, {} requested steps, CFG {}, shift {}, seed {}, {} image(s)",
+        p.width, p.height, p.steps, p.cfg, p.shift, p.seed, p.num_images
+    );
+    let started = std::time::Instant::now();
+    let (images, timing) = generate_images(std::path::Path::new(model), prompt, &p, |image, step, total| {
+        eprintln!(
+            "image {}/{}: step {step}/{total} ({:.1}s)",
+            image + 1,
+            p.num_images,
+            started.elapsed().as_secs_f64()
+        );
+    })
+    .map_err(anyhow::Error::msg)?;
+    for (image, name) in images.iter().zip(&names) {
+        image.save(name).map_err(anyhow::Error::msg)?;
+        println!("{}: {}x{}, seed {}", name.display(), image.width, image.height, image.seed);
+    }
+    println!(
+        "{} MOSS image(s), {} actual steps in {:.1}s (text {:.1}s, DiT load {:.1}s, text prepare {:.1}s, median step {:.2}s, VAE {:.1}s)",
+        images.len(),
+        timing.steps.len() / images.len().max(1),
+        timing.total,
+        timing.text_encode,
+        timing.dit_load,
+        timing.text_prepare,
+        timing.median_step(),
+        timing.vae
+    );
+    Ok(())
+}
+
 /// `cortiq imagine` options that apply to a Z-Image container.
 struct ZimageCli {
     height: Option<usize>,
@@ -9847,6 +10153,46 @@ async fn cmd_bench(
         // Positions the bounded reuse record holds (the host cache's
         // seq_len stays 0 when the resident graph owns the sequence).
         obj["consumed_prefix_len"] = serde_json::json!(pipeline.kv_prefix.len());
+        // Dynamic-tail prepared frame + global pool: what the MoE frame
+        // spends per token (host encode vs GPU wait vs uploads) and how
+        // often the pool admits a new expert. Without these, a frame that
+        // trades CPU MoE for per-layer syncs is invisible in the report.
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let steps = (n_st.saturating_sub(1)).max(1) as f64;
+            let enc = cortiq_engine::gpu_wgpu::MOE_ENC_NS.load(Relaxed) as f64 / 1e6;
+            let wait = cortiq_engine::gpu_wgpu::MOE_WAIT_NS.load(Relaxed) as f64 / 1e6;
+            let up = cortiq_engine::gpu_wgpu::MOE_UP_NS.load(Relaxed) as f64 / 1e6;
+            let fills = cortiq_engine::gpu_wgpu::DSV4_FILLS.load(Relaxed);
+            let fill_mb = cortiq_engine::gpu_wgpu::DSV4_FILL_BYTES.load(Relaxed) as f64 / 1e6;
+            obj["moe_frame_enc_ms_per_tok"] = serde_json::json!(enc / steps);
+            obj["moe_frame_wait_ms_per_tok"] = serde_json::json!(wait / steps);
+            obj["moe_frame_up_ms_per_tok"] = serde_json::json!(up / steps);
+            obj["moe_pool_fills"] = serde_json::json!(fills);
+            obj["moe_pool_fill_mb"] = serde_json::json!(fill_mb);
+            obj["moe_pool_fills_per_tok"] = serde_json::json!(fills as f64 / steps);
+            obj["moe_pooled_calls_per_tok"] = serde_json::json!(
+                cortiq_engine::gpu_wgpu::POOLED_CALLS.load(Relaxed) as f64 / steps
+            );
+            obj["moe_pooled_cold_per_tok"] = serde_json::json!(
+                cortiq_engine::gpu_wgpu::POOLED_COLD_N.load(Relaxed) as f64 / steps
+            );
+            obj["m3_span_ms_per_tok"] = serde_json::json!(
+                cortiq_engine::pipeline::M3_SPAN_NS.load(Relaxed) as f64 / 1e6 / steps
+            );
+            obj["m3_cold_ms_per_tok"] = serde_json::json!(
+                cortiq_engine::pipeline::M3_COLD_NS.load(Relaxed) as f64 / 1e6 / steps
+            );
+            obj["m3_arm_ms_per_tok"] = serde_json::json!(
+                cortiq_engine::pipeline::M3_ARM_NS.load(Relaxed) as f64 / 1e6 / steps
+            );
+            obj["m3_cold_dev_per_tok"] = serde_json::json!(
+                cortiq_engine::pipeline::M3_COLD_DEV_N.load(Relaxed) as f64 / steps
+            );
+            obj["m3_cold_n_per_tok"] = serde_json::json!(
+                cortiq_engine::pipeline::M3_COLD_N.load(Relaxed) as f64 / steps
+            );
+        }
         println!("{}", serde_json::to_string_pretty(&obj)?);
         cortiq_engine::prism::perf_report();
         cortiq_engine::linear_core::perf_report();
@@ -9938,6 +10284,69 @@ async fn cmd_bench(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moss_layout_prompt_is_validated_but_not_reformatted() {
+        let raw = "{\n  \"summary\": \"two foxes\", \"items\": []\n}";
+        assert_eq!(
+            resolve_moss_prompt(None, Some(raw.to_owned()), None).unwrap(),
+            raw
+        );
+        assert!(resolve_moss_prompt(None, Some("[]".to_owned()), None).is_err());
+        assert!(resolve_moss_prompt(None, Some("not json".to_owned()), None).is_err());
+        assert!(resolve_moss_prompt(Some("text".to_owned()), Some("{}".to_owned()), None).is_err());
+    }
+
+    #[test]
+    fn moss_skip_lists_match_source_set_behavior() {
+        assert_eq!(parse_moss_layer_list("22, 24,22", "--slg-layers").unwrap(), [22, 24]);
+        assert_eq!(parse_moss_layer_list("none", "--uncond-skip-layers").unwrap(), Vec::<usize>::new());
+        assert_eq!(parse_moss_layer_list("", "--uncond-skip-layers").unwrap(), Vec::<usize>::new());
+        assert!(parse_moss_layer_list("22,,24", "--slg-layers").is_err());
+        assert!(parse_moss_layer_list("nope", "--slg-layers").is_err());
+    }
+
+    #[test]
+    fn moss_imagine_parser_accepts_layout_and_source_controls() {
+        // The full command tree needs the main CLI's larger stack in debug.
+        let cli = std::thread::Builder::new()
+            .name("moss-imagine-parser".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                Cli::try_parse_from([
+                    "cortiq", "imagine", "moss.cmf", "--layout", "{\"summary\":\"cat\"}",
+                    "--uncond-skip-layers", "none", "--slg-layers", "24,26", "--slg-scale", "3",
+                    "--slg-start", "0.01", "--slg-stop", "1",
+                ])
+                .unwrap()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        match cli.command {
+            Commands::Imagine {
+                prompt,
+                layout,
+                layout_file,
+                uncond_skip_layers,
+                slg_layers,
+                slg_scale,
+                slg_start,
+                slg_stop,
+                ..
+            } => {
+                assert!(prompt.is_none());
+                assert_eq!(layout.as_deref(), Some("{\"summary\":\"cat\"}"));
+                assert!(layout_file.is_none());
+                assert_eq!(uncond_skip_layers.as_deref(), Some("none"));
+                assert_eq!(slg_layers.as_deref(), Some("24,26"));
+                assert_eq!(slg_scale, Some(3.0));
+                assert_eq!(slg_start, Some(0.01));
+                assert_eq!(slg_stop, Some(1.0));
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
 
     #[test]
     fn mimo_run_media_flags_parse() {
