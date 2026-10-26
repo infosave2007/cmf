@@ -5837,24 +5837,54 @@ impl<'a> Q4tpView<'a> {
     /// q4tp row; a decode profile put this function above the dot
     /// products it feeds. Same bitstream, same codes — just no branch
     /// and eight independent extractions.
+    /// `avx2_enabled()` and `ladder_4` are compiled only for x86-64, so a
+    /// plain `cfg!(target_arch = ...)` guard is NOT enough: `cfg!` is a
+    /// runtime `false` on other targets, yet both arms still get compiled
+    /// and the x86-only symbols do not exist there at all (aarch64 build:
+    /// E0425). This associated fn IS a compile-time `cfg` — the whole
+    /// branch, symbol references included, is dropped on non-x86 targets,
+    /// and the non-x86 arm falls straight through to the scalar ladder.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    fn ladder_via_avx2(&self) -> bool {
+        avx2_enabled()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    #[inline]
+    fn ladder_via_avx2(&self) -> bool {
+        false
+    }
+
     #[inline]
     fn scales_into(&self, r: usize, gpr: usize, out: &mut [f32]) {
         let tab = if self.zero_rung {
             q2tp_ladder(self.params, r)
-        } else if avx2_enabled() {
+        } else if self.ladder_via_avx2() {
             // One lane of the 4-wide vector ladder (the other three are
             // duplicates) — every q4tp scale in the process then comes
             // from the SAME ladder bits, whichever call site decoded it.
-            let p = &self.params[r * 4..r * 4 + 4];
-            let lo = f16_to_f32(u16::from_le_bytes([p[0], p[1]]));
-            let st = f16_to_f32(u16::from_le_bytes([p[2], p[3]]));
-            let mut tabc = [0f32; 128];
-            unsafe { ladder_4(&[lo; 4], &[st; 4], &mut tabc) };
-            let mut t = [0f32; 32];
-            for (g, o) in t.iter_mut().enumerate() {
-                *o = tabc[g * 4];
-            }
-            t
+            // `ladder_via_avx2()` is cfg-gated, so on non-x86 targets
+            // this arm is never taken and never even compiled with the
+            // x86-only symbols in scope.
+            #[cfg(target_arch = "x86_64")]
+            let tab = {
+                let p = &self.params[r * 4..r * 4 + 4];
+                let lo = f16_to_f32(u16::from_le_bytes([p[0], p[1]]));
+                let st = f16_to_f32(u16::from_le_bytes([p[2], p[3]]));
+                let mut tabc = [0f32; 128];
+                unsafe { ladder_4(&[lo; 4], &[st; 4], &mut tabc) };
+                let mut t = [0f32; 32];
+                for (g, o) in t.iter_mut().enumerate() {
+                    *o = tabc[g * 4];
+                }
+                t
+            };
+            // On a non-x86 target the arm is unreachable (the `cfg!`
+            // above is false), so it decodes through the scalar ladder —
+            // the very path this branch would have fallen back to.
+            #[cfg(not(target_arch = "x86_64"))]
+            let tab = q4tp_ladder(self.params, r);
+            tab
         } else {
             q4tp_ladder(self.params, r)
         };
@@ -6034,6 +6064,13 @@ unsafe fn exp2_128(x: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 
         let r = _mm_sub_ps(x, _mm_cvtepi32_ps(n)); // x - floor(x) ∈ [0,1)
         // 2^r = exp(r·ln2) ≈ Σ aₖrᵏ, aₖ = ln2ᵏ/k!, k = 1..9 (Horner).
         // At r ∈ [0,1) the a₁₀ term is 7.1e-9 — below f32's own ulp.
+        // The coefficients are carried at full decimal precision on
+        // purpose: truncating them to an f32 spelling (what
+        // `excessive_precision` suggests) would round the constants before
+        // they reach the AVX registers. `approx_constant` fires on a₁ =
+        // LN_2, but the table must stay internally consistent, so both
+        // lints are allowed for this table only.
+        #[allow(clippy::excessive_precision, clippy::approx_constant)]
         let a = [
             6.931_471_805_599_453e-1,
             2.402_265_069_591_007e-1,
