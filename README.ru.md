@@ -126,6 +126,47 @@ Metal/wgpu; `CMF_GPU=0` принудительно включает CPU. По у
 полный контекст 30 секунд; экспериментальный `CMF_WHISPER_TRIM_ENCODER=1`
 может повлиять на качество распознавания.
 
+### Многоязычный TTS Phonon 40M (0.8.36)
+
+Команды `phonon-pack` и `tts` добавляются в **cortiq-cli 0.8.36**. В уже
+опубликованных 0.8.35 и более ранних крейтах этих команд нет. До появления
+тега `v0.8.36` и публикации крейта 0.8.36 нельзя считать, что обычный
+`cargo install cortiq-cli` их установит. После публикации релиза:
+
+```sh
+# Обычная установка включает GPU и мост Phonon.
+cargo install cortiq-cli --version 0.8.36 --locked
+
+# Либо переносимая CPU-сборка с сохранением поддержки Phonon.
+cargo install cortiq-cli --version 0.8.36 --locked \
+  --no-default-features --features phonon
+```
+
+После принятия условий исходной модели можно упаковать её локальную копию;
+готовый CMF также скачивается через API-команду Hugging Face:
+
+```sh
+hf download gradium/phonon-40m-multilingual --local-dir phonon-source
+cortiq phonon-pack phonon-source --output phonon-40m-multilingual-q8.cmf
+
+hf download infosave/phonon-40m-multilingual-cmf \
+  phonon-40m-multilingual-q8.cmf --local-dir .
+cortiq verify phonon-40m-multilingual-q8.cmf
+cortiq tts phonon-40m-multilingual-q8.cmf "Bonjour, monde." \
+  --lang fr --temperature 0.3 --seed 4242424242424242 --out bonjour.wav
+```
+
+CMF побайтно хранит исходные Q8 GGUF, конфигурацию, токенизатор и latent
+стандартного голоса; после проверки Cortiq материализует эти записи и вызывает
+поддерживаемый Gradium рантайм `ptts`. Это мост, а не заявление о нативной
+реализации Phonon. Модель принимает **только** `en`, `fr`, `de`, `es`, `pt`:
+русский язык и автоопределение языка не поддерживаются; `--voice-file`
+принимает только заранее вычисленный совместимый latent, а не запись голоса.
+Исходные веса распространяются на условиях CC-BY-NC-4.0. Подробности и
+происхождение — в [исходнике карточки](docs/hf/Phonon-40M-Multilingual-cmf.md);
+работающий публичный тест доступен в
+[Space](https://huggingface.co/spaces/infosave/phonon-40m-multilingual-cmf-demo).
+
 ## Что хранит файл CMF
 
 - Фиксированный 128-байтовый конверт, адресующий все секции.

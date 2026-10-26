@@ -39,6 +39,10 @@ matrixmultiply = "0.3.9"
 # DeepSeek-V4.1 image decode/resize and remote image ingress.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 ureq = { version = "2", features = ["tls"] }
+# Gradium's maintained Phonon runtime. CMF stores the upstream Q8 GGUF
+# payload; this optional dependency supplies the model-specific flow/Mimi
+# execution path.
+ptts = { version = "0.4.2", default-features = false, features = ["hf"], optional = true }
 
 # Cross-platform GPU backend (C1): wgpu -> Vulkan/DX12/Metal (NVIDIA,
 # Radeon, Intel, Apple). Optional: a plain CPU build does not pull it in.
@@ -49,6 +53,8 @@ bytemuck = { version = "1", optional = true, features = ["derive"] }
 [features]
 # `--features gpu` enables the wgpu path; test on a discrete card.
 gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck", "dep:ash"]
+# Self-contained CMF packaging and execution for Gradium Phonon TTS.
+phonon = ["dep:ptts"]
 
 # Imports `cortiq_engine::gpu_wgpu`, which exists only with `gpu`: without
 # this, `cargo test -p cortiq-engine` (no features) failed to build it.
