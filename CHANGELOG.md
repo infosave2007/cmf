@@ -5,6 +5,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.37] — 2026-10-26
+
+### Added
+- `cortiq teacher-data generate TEACHER.cmf PROMPTS.jsonl OUTPUT.tdata`
+  creates a finalized, streaming v1 teacher-data set. It records prompt and
+  answer-token boundaries, deterministic split/provenance metadata, a token
+  index, and hashes for every finalized payload instead of holding the whole
+  dataset in memory.
+- `cortiq teacher-data inspect DATA.tdata [--verify] [--json]` reports and
+  streams through the finalized records. `--verify` adds an explicit integrity
+  pass after the inspection scan.
+- `teacher-data generate --disable-mtp` provides an explicit plain-greedy
+  control for calibration runs. It disables only speculative/MTP drafting;
+  the selected model backend (including Metal) remains active, and the chosen
+  mode is recorded in the dataset manifest.
+- Added the Russian usage guide
+  [`docs/TEACHER_DATA.ru.md`](docs/TEACHER_DATA.ru.md).
+
+### Limits
+- This is the text-only direct-answer v1 producer. It deliberately requires
+  `--no-think`, refuses `--raw`, and does not yet provide top-k logits,
+  resume/sharding, or model compression. No generation-speed claim is made.
+
 ## [0.8.36] — 2026-10-26
 
 ### Added
