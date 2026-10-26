@@ -965,6 +965,24 @@ pub struct MtpModule {
     pub kv: crate::kv_cache::LayerKvCache,
 }
 
+/// Teacher-forced activation statistics for one MTP draft FFN.
+///
+/// `mass[i]` is `Σ_rows |activation_i|`; `squared_mass[i]` is
+/// `Σ_rows activation_i²`, where `activation = act(gate) · up` immediately
+/// before the draft layer's down projection. `observed_positions` is the
+/// number of teacher-forced rows that contributed to both arrays.
+///
+/// [`Pipeline::probe_mtp_ffn`] returns one of these for each actual draft
+/// layer.  It intentionally has a separate type/API from
+/// [`Pipeline::probe_ffn_mass`] so a compactor cannot accidentally substitute
+/// trunk statistics for an MTP sidecar whose FFN has a different width.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MtpFfnProbe {
+    pub mass: Vec<f64>,
+    pub squared_mass: Vec<f64>,
+    pub observed_positions: usize,
+}
+
 /// A Metal verify graph after its sync: what the commit needs — the
 /// graph (per-layer replay scratch), the GDN layers in encode order (their
 /// CPU states receive the replay), and the attention layers with the CPU
@@ -6994,7 +7012,10 @@ impl Pipeline {
             self.attn_scale,
             rd,
             self.hidden_size,
-            self.intermediate_size,
+            // An MTP draft can have an independently compacted FFN. The
+            // graph must use the checked local tensor width, not the trunk
+            // arch-wide intermediate size.
+            d.gate_proj.rows(),
             position,
             self.kv_cache.max_seq_len,
             gemma,
@@ -7161,7 +7182,9 @@ impl Pipeline {
             hd,
             rd,
             hs,
-            self.intermediate_size,
+            // See `mtp_step_graph`: draft FFN geometry is local to this
+            // block after independent MTP compaction.
+            d.gate_proj.rows(),
             &positions,
             self.kv_cache.max_seq_len,
             gemma,
@@ -9027,6 +9050,224 @@ impl Pipeline {
     ) -> Option<(Vec<(usize, usize, usize)>, Option<(usize, usize, usize)>)> {
         let b = self.qwen4_exp.as_ref()?;
         crate::qwen4_exp::expert_dirs(&b.1, li)
+    }
+
+    /// Teacher-force the installed MTP draft stack and collect each draft
+    /// FFN's own pre-down activation statistics.
+    ///
+    /// This is deliberately separate from [`Self::probe_ffn_mass`]: canonical
+    /// MTP and MiMo sidecars can have independently compacted FFNs, and MiMo
+    /// draft layers can differ in width from one another and from the trunk.
+    /// The returned vector follows the actual draft stack (one entry for a
+    /// canonical MTP head; one per MiMo draft layer). MiMo layer `k` replays
+    /// the teacher-forced pairs `(hidden[j], ids[j + k + 1])`.
+    ///
+    /// Calibration starts from a fresh sequence and leaves the trunk, draft
+    /// KVs, history, and device mirrors fresh on both success and error. It
+    /// is therefore unsuitable for the middle of a conversation whose KV
+    /// cache must be retained.
+    pub fn probe_mtp_ffn(&mut self, ids: &[u32]) -> Result<Vec<MtpFfnProbe>, String> {
+        self.reset_mtp_probe_state();
+        let result = if ids.len() < 2 {
+            Err("MTP FFN probe needs at least two token ids".into())
+        } else if ids
+            .iter()
+            .any(|&id| id as usize >= self.weights.embed_tokens.rows())
+        {
+            Err("MTP FFN probe received a token id outside the embedding table".into())
+        } else if self.mtp.is_some() && self.mimo_mtp.is_some() {
+            // A synthetic pipeline can carry both mechanisms, but merging
+            // unlike draft semantics into one compaction plan is unsafe.
+            Err("MTP FFN probe found both canonical and MiMo draft stacks".into())
+        } else if self.mimo_mtp.is_some() {
+            let mut st = self
+                .mimo_mtp
+                .take()
+                .expect("checked MiMo MTP before detaching it");
+            let result = crate::gpu::cpu_scope(|| {
+                let hiddens = self.mtp_probe_trunk_hiddens(ids)?;
+                self.mimo_mtp_ffn_probe_teacher_forced(&mut st, ids, &hiddens)
+            });
+            // The owner is detached during the replay, so the common trunk
+            // reset cannot clear its KVs. Restore it even on an error.
+            st.reset();
+            self.mimo_mtp = Some(st);
+            result
+        } else if self.mtp.is_some() {
+            let mut mtp = self
+                .mtp
+                .take()
+                .expect("checked canonical MTP before detaching it");
+            let result = crate::gpu::cpu_scope(|| {
+                let hiddens = self.mtp_probe_trunk_hiddens(ids)?;
+                self.mtp_ffn_probe_teacher_forced(&mut mtp, ids, &hiddens)
+            });
+            mtp.kv.clear();
+            self.mtp = Some(mtp);
+            result
+        } else {
+            Err("MTP FFN probe: this pipeline has no draft stack".into())
+        };
+        // Cover every early/error arm above: no failed calibration can leak
+        // a partially populated trunk or draft cache into the next request.
+        self.reset_mtp_probe_state();
+        result
+    }
+
+    /// Reset every state owner touched by [`Self::probe_mtp_ffn`].
+    fn reset_mtp_probe_state(&mut self) {
+        self.clear_sequence_state();
+        if let Some(mtp) = self.mtp.as_mut() {
+            mtp.kv.clear();
+        }
+        if let Some(mimo) = self.mimo_mtp.as_mut() {
+            mimo.reset();
+        }
+        self.mtp_graph_mode = None;
+    }
+
+    /// Sequential CPU-only trunk replay for MTP calibration. Unlike the
+    /// trunk mass probe this returns the exact boundary hiddens consumed by
+    /// the draft stack; it never records into the trunk's TLS accumulator.
+    fn mtp_probe_trunk_hiddens(&mut self, ids: &[u32]) -> Result<Vec<f32>, String> {
+        let mut hiddens = Vec::with_capacity(ids.len() * self.hidden_size);
+        for (position, &id) in ids.iter().enumerate() {
+            let hidden = self.forward_layers(&self.embed_single(id), position, None);
+            if hidden.len() != self.hidden_size {
+                return Err(format!(
+                    "MTP FFN probe: trunk hidden width {} != {}",
+                    hidden.len(),
+                    self.hidden_size
+                ));
+            }
+            hiddens.extend_from_slice(&hidden);
+        }
+        Ok(hiddens)
+    }
+
+    /// Canonical one-layer MTP teacher-forced replay. Its cache advances for
+    /// every row so later attention inputs match a real draft warm-up rather
+    /// than a collection of independent one-token measurements.
+    fn mtp_ffn_probe_teacher_forced(
+        &mut self,
+        mtp: &mut MtpModule,
+        ids: &[u32],
+        hiddens: &[f32],
+    ) -> Result<Vec<MtpFfnProbe>, String> {
+        if hiddens.len() != ids.len() * self.hidden_size {
+            return Err("MTP FFN probe: malformed trunk hidden replay".into());
+        }
+        let FfnKind::Dense(dense) = &mtp.layer.ffn else {
+            return Err("MTP FFN probe: canonical draft FFN is not dense".into());
+        };
+        let mut mass = vec![0.0f64; dense.gate_proj.rows()];
+        let mut squared_mass = vec![0.0f64; dense.gate_proj.rows()];
+        for position in 0..ids.len() - 1 {
+            self.mtp_probe_step_ffn(
+                mtp,
+                &hiddens[position * self.hidden_size..(position + 1) * self.hidden_size],
+                ids[position + 1],
+                position,
+                &mut mass,
+                &mut squared_mass,
+            )?;
+        }
+        Ok(vec![MtpFfnProbe {
+            mass,
+            squared_mass,
+            observed_positions: ids.len() - 1,
+        }])
+    }
+
+    /// CPU-only MTP block replay with a measurement between post-attention
+    /// norm and down projection. The ordinary `mtp_step_hl` device path
+    /// keeps these values resident and therefore cannot truthfully provide a
+    /// per-neuron calibration statistic.
+    fn mtp_probe_step_ffn(
+        &mut self,
+        mtp: &mut MtpModule,
+        hidden: &[f32],
+        next_token: u32,
+        position: usize,
+        mass: &mut [f64],
+        squared_mass: &mut [f64],
+    ) -> Result<(), String> {
+        let e = self.embed_single(next_token);
+        let mut cat = vec![0.0f32; 2 * self.hidden_size];
+        let (cat_e, cat_h) = cat.split_at_mut(self.hidden_size);
+        inference::rms_norm_into(&e, &mtp.enorm, self.rms_eps, self.norm_style, cat_e);
+        inference::rms_norm_into(
+            hidden,
+            &mtp.hnorm,
+            self.rms_eps,
+            self.norm_style,
+            cat_h,
+        );
+        let mut x = vec![0.0f32; self.hidden_size];
+        mtp.eh_proj.matvec(&cat, &mut x, self.pool.as_deref());
+
+        let lw = &mtp.layer;
+        inference::rms_norm_into(
+            &x,
+            &lw.input_norm,
+            self.rms_eps,
+            self.norm_style,
+            &mut self.ws.n1,
+        );
+        let attn = match &lw.attn {
+            AttnKind::Full {
+                wq,
+                wk,
+                wv,
+                wo,
+                q_norm,
+                k_norm,
+                output_gate,
+                softplus_gate,
+                bias,
+            } => {
+                let mut cfg = self.attn_cfg(position);
+                cfg.q_norm = q_norm.as_deref();
+                cfg.k_norm = k_norm.as_deref();
+                cfg.output_gate = *output_gate;
+                cfg.softplus_gate = softplus_gate
+                    .as_ref()
+                    .map(|(gate, per_head)| (gate, *per_head));
+                cfg.bias = bias
+                    .as_ref()
+                    .map(|(q, k, v)| (q.as_slice(), k.as_slice(), v.as_slice()));
+                attention::qwen_attention(&self.ws.n1, wq, wk, wv, wo, &mut mtp.kv, &cfg)
+            }
+            _ => return Err("MTP FFN probe: draft attention is not full attention".into()),
+        };
+        for (dst, src) in x.iter_mut().zip(attn) {
+            *dst += src;
+        }
+        inference::rms_norm_into(
+            &x,
+            &lw.post_norm,
+            self.rms_eps,
+            self.norm_style,
+            &mut self.ws.p1,
+        );
+        let FfnKind::Dense(dense) = &lw.ffn else {
+            return Err("MTP FFN probe: draft FFN is not dense".into());
+        };
+        accumulate_dense_ffn_activation_mass(
+            dense,
+            &self.ws.p1,
+            1,
+            self.pool.as_deref(),
+            mass,
+            squared_mass,
+        )?;
+        // Execute the same residual FFN arm as normal draft replay; the
+        // final logits are not needed for teacher-forced statistics.
+        let ffn = ffn_forward(&lw.ffn, &self.ws.p1, self.pool.as_deref(), None);
+        for (dst, src) in x.iter_mut().zip(ffn) {
+            *dst += src;
+        }
+        Ok(())
     }
 
     /// DTG-MA calibration pass (Patent 2): run `ids` through the model
@@ -17931,6 +18172,65 @@ fn prefill_prof_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("CMF_PREFILL_PROF").is_some())
 }
 
+/// Accumulate the dense FFN activations which feed the down projection.
+///
+/// MTP calibration intentionally calls this independently of the trunk's
+/// `FFN_PROBE` TLS recorder: an MTP sidecar can use a different FFN width,
+/// and borrowing the trunk's layer-numbered accumulator would silently turn
+/// draft statistics into trunk proxies.  The caller owns the execution scope
+/// (the public MTP probe uses `gpu::cpu_scope`) and supplies one accumulator
+/// per actual MTP FFN channel.
+pub(crate) fn accumulate_dense_ffn_activation_mass(
+    d: &DenseFfn,
+    xs: &[f32],
+    b: usize,
+    pool: Option<&Pool>,
+    mass: &mut [f64],
+    squared_mass: &mut [f64],
+) -> Result<(), String> {
+    let inter = d.gate_proj.rows();
+    let hidden = d.gate_proj.cols();
+    if mass.len() != inter || squared_mass.len() != inter {
+        return Err(format!(
+            "MTP FFN probe: accumulator widths ({}, {}) != gate width {inter}",
+            mass.len(),
+            squared_mass.len()
+        ));
+    }
+    if d.up_proj.rows() != inter
+        || d.up_proj.cols() != hidden
+        || d.down_proj.cols() != inter
+        || d.down_proj.rows() != hidden
+    {
+        return Err("MTP FFN probe: inconsistent dense FFN shapes".into());
+    }
+    if !d.segs.is_empty() {
+        return Err("MTP FFN probe: tube-segmented draft FFNs are not supported".into());
+    }
+    if xs.len() != b.saturating_mul(hidden) {
+        return Err(format!(
+            "MTP FFN probe: {} input values for {b} × {hidden} rows",
+            xs.len()
+        ));
+    }
+    if b == 0 {
+        return Ok(());
+    }
+    let mut gate = vec![0.0f32; b * inter];
+    let mut up = vec![0.0f32; b * inter];
+    d.gate_proj.matmat(xs, b, &mut gate, pool);
+    d.up_proj.matmat(xs, b, &mut up, pool);
+    for row in 0..b {
+        for i in 0..inter {
+            let a = d.act.combine(gate[row * inter + i], up[row * inter + i]);
+            let a = a as f64;
+            mass[i] += a.abs();
+            squared_mass[i] += a * a;
+        }
+    }
+    Ok(())
+}
+
 fn dense_ffn_batch(
     d: &DenseFfn,
     xs: &[f32],
@@ -21394,11 +21694,12 @@ mod tests {
         assert!(max_d < 1e-5, "sparse != dense-zeroed: max|Δ| = {max_d}");
     }
 
-    /// Attach a synthetic MTP head (same structure as a main layer).
-    fn attach_test_mtp(p: &mut Pipeline) {
+    /// Attach a synthetic MTP head. `inter` deliberately stays independent
+    /// from the trunk width so calibration tests can catch a trunk-proxy bug.
+    fn attach_test_mtp_width(p: &mut Pipeline, inter: usize) {
         let (h, inter, heads, kv, hd) = (
             p.hidden_size,
-            p.intermediate_size,
+            inter,
             p.num_heads,
             p.num_kv_heads,
             p.head_dim,
@@ -21446,6 +21747,57 @@ mod tests {
         });
     }
 
+    /// Attach a synthetic MTP head with the trunk's conventional width.
+    fn attach_test_mtp(p: &mut Pipeline) {
+        attach_test_mtp_width(p, p.intermediate_size);
+    }
+
+    #[test]
+    fn canonical_mtp_ffn_probe_uses_draft_width_and_cleans_state() {
+        let mut p = create_test_pipeline(8, 16, 2, 1, 4, 2, 64);
+        // This differs from the trunk FFN width (16). A result shaped like
+        // the trunk probe would be a silent, dangerous compaction bug.
+        attach_test_mtp_width(&mut p, 11);
+        let ids = [3, 9, 4, 12, 7, 2];
+        let trunk = p.probe_ffn_mass(&ids);
+        assert_eq!(trunk[0].len(), p.intermediate_size);
+
+        let got = p.probe_mtp_ffn(&ids).expect("canonical MTP probe");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].mass.len(), 11);
+        assert_eq!(got[0].squared_mass.len(), 11);
+        assert_eq!(got[0].observed_positions, ids.len() - 1);
+        assert!(got[0].mass.iter().any(|&v| v > 0.0));
+        assert!(got[0]
+            .mass
+            .iter()
+            .zip(&got[0].squared_mass)
+            .all(|(&m, &s)| m.is_finite() && s.is_finite() && m >= 0.0 && s >= 0.0));
+        assert_eq!(p.kv_cache.seq_len(), 0, "probe must leave a fresh trunk");
+        assert_eq!(p.mtp.as_ref().unwrap().kv.seq_len, 0, "and fresh MTP KV");
+
+        // Force an error *after* the MTP attention has appended a draft KV
+        // row. This proves the error path clears detached draft state, not
+        // merely the easy invalid-token preflight branch.
+        let h = p.hidden_size;
+        let FfnKind::Dense(dense) = &mut p.mtp.as_mut().unwrap().layer.ffn else {
+            panic!("synthetic MTP must be dense")
+        };
+        dense.segs.push(FfnSeg {
+            gate: QTensor::from_f32(vec![0.0; h], 1, h),
+            up: QTensor::from_f32(vec![0.0; h], 1, h),
+            down: QTensor::from_f32(vec![0.0; h], h, 1),
+            start: dense.gate_proj.rows(),
+            width: 1,
+        });
+        let err = p.probe_mtp_ffn(&ids);
+        assert!(err
+            .unwrap_err()
+            .contains("tube-segmented draft FFNs are not supported"));
+        assert_eq!(p.kv_cache.seq_len(), 0);
+        assert_eq!(p.mtp.as_ref().unwrap().kv.seq_len, 0);
+    }
+
     #[test]
     fn speculative_equals_vanilla_greedy() {
         // Speculative decode and the wgpu token graph are mutually
@@ -21464,6 +21816,7 @@ mod tests {
         let (spec, d1, a1) = run(true);
         assert_eq!(d0, 0, "vanilla path must not draft");
         assert!(d1 > 0, "speculative path must draft");
+        assert!(a1 <= d1, "accepted drafts cannot exceed proposals");
         assert_eq!(
             vanilla, spec,
             "speculative must reproduce the exact greedy sequence (accepted {a1}/{d1})"
@@ -22084,10 +22437,12 @@ mod tests {
         assert!(c.kv_cache.layers[0].seq_len <= 12, "the receiver trims on");
     }
 
-    /// A synthetic MiMo draft stack of `n` layers for `mimo_test_pipeline`
-    /// (the SWA geometry of its sliding layers: 2 KV heads, head 8 / V 4).
-    fn mimo_test_mtp(n: usize, gain: f32) -> mimo_mtp::MimoMtp {
-        let (hs, inter, nh, hd, vd, nkv) = (16usize, 24usize, 4usize, 8usize, 4usize, 2usize);
+    /// A synthetic MiMo draft stack for `mimo_test_pipeline` (the SWA
+    /// geometry of its sliding layers: 2 KV heads, head 8 / V 4).  Widths
+    /// are per-draft-layer so the MTP collector cannot accidentally borrow
+    /// the trunk's `intermediate_size`.
+    fn mimo_test_mtp_widths(widths: &[usize], gain: f32) -> mimo_mtp::MimoMtp {
+        let (hs, nh, hd, vd, nkv) = (16usize, 4usize, 8usize, 4usize, 2usize);
         let synth = |len: usize, salt: usize| -> Vec<f32> {
             (0..len)
                 .map(|i| (((i * 37 + salt * 13 + 3) % 89) as f32 / 89.0 - 0.5) * 0.6 * gain)
@@ -22096,8 +22451,11 @@ mod tests {
         let qt = |rows: usize, cols: usize, salt: usize| {
             QTensor::from_f32(synth(rows * cols, salt), rows, cols)
         };
-        let layers = (0..n)
-            .map(|k| {
+        let layers = widths
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(k, inter)| {
                 let s = 500 + k * 40;
                 let mut kv = crate::kv_cache::LayerKvCache::new(nkv, hd);
                 kv.sinks = Some(vec![0.3, -0.7, 1.1, 0.0]);
@@ -22139,12 +22497,72 @@ mod tests {
         mimo_mtp::MimoMtp::from_layers(layers)
     }
 
+    fn mimo_test_mtp(n: usize, gain: f32) -> mimo_mtp::MimoMtp {
+        mimo_test_mtp_widths(&vec![24; n], gain)
+    }
+
     fn mimo_greedy(p: &mut Pipeline, ids: &[u32], n: usize, spec: bool) -> GenerateResult {
         p.clear_sequence_state();
         p.speculative = spec;
         p.ignore_eos = true;
         p.sampler_config.temperature = 0.0;
         p.generate_from_ids(ids, n, None, None).unwrap()
+    }
+
+    #[test]
+    fn mimo_mtp_ffn_probe_tracks_each_independent_draft_width() {
+        let mut p = mimo_test_pipeline();
+        let widths = [7usize, 13, 29];
+        assert_ne!(widths[0], p.intermediate_size);
+        assert_ne!(widths[1], p.intermediate_size);
+        assert_ne!(widths[2], p.intermediate_size);
+        p.mimo_mtp = Some(mimo_test_mtp_widths(&widths, 1.0));
+        let ids: Vec<u32> = (0..11).map(|i| (i * 9 + 5) % 64).collect();
+
+        let trunk = p.probe_ffn_mass(&ids);
+        assert!(trunk.iter().all(|v| v.len() == p.intermediate_size));
+        let got = p.probe_mtp_ffn(&ids).expect("MiMo MTP probe");
+        assert_eq!(got.len(), widths.len());
+        for (k, (stat, &width)) in got.iter().zip(&widths).enumerate() {
+            assert_eq!(stat.mass.len(), width, "draft layer {k}");
+            assert_eq!(stat.squared_mass.len(), width, "draft layer {k}");
+            assert_eq!(stat.observed_positions, ids.len() - k - 1);
+            assert!(stat.mass.iter().any(|&v| v > 0.0), "draft layer {k}");
+            assert!(stat
+                .mass
+                .iter()
+                .zip(&stat.squared_mass)
+                .all(|(&m, &s)| m.is_finite() && s.is_finite() && m >= 0.0 && s >= 0.0));
+        }
+        assert_eq!(p.kv_cache.seq_len(), 0, "probe leaves a fresh trunk");
+        let st = p.mimo_mtp.as_ref().unwrap();
+        assert!(st.layers.iter().all(|m| m.kv.seq_len == 0));
+
+        // As above, reject only after a MiMo draft KV has been appended.
+        // The detached multi-layer owner must still be reset on that error.
+        let h = p.hidden_size;
+        let FfnKind::Dense(dense) = &mut p.mimo_mtp.as_mut().unwrap().layers[0].layer.ffn else {
+            panic!("synthetic MiMo MTP must be dense")
+        };
+        dense.segs.push(FfnSeg {
+            gate: QTensor::from_f32(vec![0.0; h], 1, h),
+            up: QTensor::from_f32(vec![0.0; h], 1, h),
+            down: QTensor::from_f32(vec![0.0; h], h, 1),
+            start: dense.gate_proj.rows(),
+            width: 1,
+        });
+        assert!(p
+            .probe_mtp_ffn(&ids)
+            .unwrap_err()
+            .contains("tube-segmented draft FFNs are not supported"));
+        assert_eq!(p.kv_cache.seq_len(), 0);
+        assert!(p
+            .mimo_mtp
+            .as_ref()
+            .unwrap()
+            .layers
+            .iter()
+            .all(|m| m.kv.seq_len == 0));
     }
 
     /// The draft stack's incremental rounds (a few rows per layer, last
