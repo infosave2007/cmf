@@ -578,6 +578,55 @@ pub(crate) fn build_ffn_at(
     Ok(FfnKind::Moe(moe))
 }
 
+/// Check the optional, tensor-derived MTP width declaration against the
+/// dense block actually loaded from the directory.  An MTP draft is allowed
+/// to have an independently compacted FFN, so the trunk-wide
+/// `arch.intermediate_size` is intentionally not part of this comparison.
+///
+/// `ffn_intermediate_sizes` has no unambiguous meaning for a routed or
+/// segmented FFN.  Refuse such a combination rather than interpreting a
+/// dense-width declaration as an expert width (or a core-vs-tube width).
+fn validate_generic_mtp_ffn_width(
+    cfg: &cortiq_core::MtpConfig,
+    ffn: &FfnKind,
+) -> Result<(), CmfError> {
+    let Some(widths) = cfg.ffn_intermediate_sizes.as_deref() else {
+        return Ok(());
+    };
+    if widths.len() != cfg.num_layers {
+        return Err(CmfError::Parse(format!(
+            "MTP ffn_intermediate_sizes has {} entries, expected {} (one per draft layer)",
+            widths.len(),
+            cfg.num_layers
+        )));
+    }
+    if widths.iter().any(|&width| width == 0) {
+        return Err(CmfError::Parse(
+            "MTP ffn_intermediate_sizes must contain only positive widths".into(),
+        ));
+    }
+    let FfnKind::Dense(dense) = ffn else {
+        return Err(CmfError::Parse(
+            "MTP ffn_intermediate_sizes is valid only for a dense MTP FFN; omit it for routed MTP"
+                .into(),
+        ));
+    };
+    if !dense.segs.is_empty() {
+        return Err(CmfError::Parse(
+            "MTP ffn_intermediate_sizes requires an unsplit dense MTP FFN; omit it for tube-segmented MTP"
+                .into(),
+        ));
+    }
+    let actual = dense.gate_proj.rows();
+    let declared = widths[0];
+    if declared != actual {
+        return Err(CmfError::Parse(format!(
+            "MTP ffn_intermediate_sizes[0]={declared}, but model.mtp.layers.0.mlp.gate_proj.weight has {actual} rows"
+        )));
+    }
+    Ok(())
+}
+
 // ───────────────────────── growth records ─────────────────────────
 
 /// Which `expert_append` records the loader mounts (`CMF_GROWTH`).
@@ -1923,6 +1972,12 @@ impl Pipeline {
             }
             let p = "model.mtp.";
             let attn = load_full_attn("model.mtp.layers.0.", None)?;
+            // The MTP MLP may be physically narrower than the trunk after
+            // draft-only compaction. `build_ffn_at` establishes the local
+            // tensor triple geometry; the optional header declaration is a
+            // checked assertion, never a replacement for those dimensions.
+            let ffn = build_ffn_at(model, &arch, &format!("{p}layers.0."), false, ov)?;
+            validate_generic_mtp_ffn_width(cfg, &ffn)?;
             Some(MtpModule {
                 enorm: load_f32(model, &format!("{p}enorm.weight"), ov).map_err(err)?,
                 hnorm: load_f32(model, &format!("{p}hnorm.weight"), ov).map_err(err)?,
@@ -1942,7 +1997,7 @@ impl Pipeline {
                     // Whatever the block actually carries: DeepSeek's MTP
                     // layer is dense, Qwen3.6's is a full MoE (router + 256
                     // experts + shared). Same builder as a backbone layer.
-                    ffn: build_ffn_at(model, &arch, &format!("{p}layers.0."), false, ov)?,
+                    ffn,
                     attn,
                 },
                 final_norm: load_f32(model, &format!("{p}norm.weight"), ov).map_err(err)?,
@@ -2947,4 +3002,47 @@ pub fn per_sequence_state_bytes(model: &CmfModel) -> Result<PerSequenceState, St
         }
     }
     Ok(st)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dense_mtp_ffn(width: usize) -> FfnKind {
+        const HIDDEN: usize = 4;
+        let matrix = |rows, cols| QTensor::from_f32(vec![0.0; rows * cols], rows, cols);
+        FfnKind::Dense(DenseFfn {
+            gate_proj: matrix(width, HIDDEN),
+            up_proj: matrix(width, HIDDEN),
+            down_proj: matrix(HIDDEN, width),
+            act: crate::pipeline::Act::Silu,
+            down_t: None,
+            segs: Vec::new(),
+        })
+    }
+
+    fn mtp_config(widths: Vec<usize>) -> cortiq_core::MtpConfig {
+        cortiq_core::MtpConfig {
+            num_layers: 1,
+            ffn_intermediate_sizes: Some(widths),
+            share_lm_head: true,
+            share_embed: true,
+        }
+    }
+
+    #[test]
+    fn generic_mtp_declared_width_is_checked_against_its_local_ffn() {
+        assert!(validate_generic_mtp_ffn_width(&mtp_config(vec![6]), &dense_mtp_ffn(6)).is_ok());
+
+        let err = validate_generic_mtp_ffn_width(&mtp_config(vec![5]), &dense_mtp_ffn(6))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ffn_intermediate_sizes[0]=5"), "{err}");
+        assert!(err.contains("has 6 rows"), "{err}");
+
+        let err = validate_generic_mtp_ffn_width(&mtp_config(vec![6, 6]), &dense_mtp_ffn(6))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has 2 entries, expected 1"), "{err}");
+    }
 }

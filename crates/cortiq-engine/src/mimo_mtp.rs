@@ -196,9 +196,13 @@ impl MimoMtp {
 
     /// Load `n` draft layers `model.mtp.layers.{0..n}` from `model` (the
     /// sidecar, or a main file that carries them) with the backbone's SWA
-    /// geometry: `nh` query heads, `nkv` KV heads, `hd` Q/K head width,
-    /// `vd` V head width, `inter` MLP width. Shapes are checked here so a
-    /// mismatched sidecar fails at load, not as garbage drafts.
+    /// geometry: `nh` query heads, `nkv` KV heads, `hd` Q/K head width, and
+    /// `vd` V head width. Each draft MLP width is derived from its own gate
+    /// tensor, rather than from the backbone's `intermediate_size`: a draft
+    /// may have been physically compacted independently. If the optional
+    /// header records per-layer widths, it is checked against those tensors.
+    /// Shapes are checked here so a mismatched sidecar fails at load, not as
+    /// garbage drafts.
     #[allow(clippy::too_many_arguments)]
     pub fn load(
         model: &Arc<CmfModel>,
@@ -208,10 +212,27 @@ impl MimoMtp {
         nkv: usize,
         hd: usize,
         vd: usize,
-        inter: usize,
     ) -> Result<Self, CmfError> {
         let err = |e: String| CmfError::Parse(format!("MiMo MTP: {e}"));
         let ov = crate::loader::Overlay::None;
+        let declared_widths = model
+            .arch()
+            .mtp
+            .as_ref()
+            .and_then(|cfg| cfg.ffn_intermediate_sizes.as_deref());
+        if let Some(widths) = declared_widths {
+            if widths.len() != n {
+                return Err(err(format!(
+                    "ffn_intermediate_sizes has {} entries, expected {n} (one per draft layer)",
+                    widths.len()
+                )));
+            }
+            if widths.iter().any(|&width| width == 0) {
+                return Err(err(
+                    "ffn_intermediate_sizes must contain only positive widths".into(),
+                ));
+            }
+        }
         let mut layers = Vec::with_capacity(n);
         for k in 0..n {
             let p = format!("model.mtp.layers.{k}.");
@@ -240,6 +261,24 @@ impl MimoMtp {
             if let Some(bad) = sinks.iter().find(|s| !s.is_finite()) {
                 return Err(err(format!("{p}self_attn.sinks: non-finite {bad}")));
             }
+            let gate_name = format!("{p}mlp.gate_proj.weight");
+            let gate = QTensor::from_model(model, &gate_name).map_err(err)?;
+            let inter = gate.rows();
+            if inter == 0 || gate.cols() != h {
+                return Err(err(format!(
+                    "{gate_name}: [{}, {}], expected [positive, {h}]",
+                    gate.rows(),
+                    gate.cols()
+                )));
+            }
+            if let Some(widths) = declared_widths
+                && widths[k] != inter
+            {
+                return Err(err(format!(
+                    "ffn_intermediate_sizes[{k}]={}, but {gate_name} has {inter} rows",
+                    widths[k]
+                )));
+            }
             let mut kv = LayerKvCache::new(nkv, hd);
             kv.sinks = Some(sinks);
             layers.push(MtpModule {
@@ -264,7 +303,7 @@ impl MimoMtp {
                         bias: None,
                     },
                     ffn: FfnKind::Dense(DenseFfn {
-                        gate_proj: mat("mlp.gate_proj.weight", inter, h)?,
+                        gate_proj: gate,
                         up_proj: mat("mlp.up_proj.weight", inter, h)?,
                         down_proj: mat("mlp.down_proj.weight", h, inter)?,
                         act: super::Act::Silu,
@@ -381,7 +420,6 @@ pub fn load_for(
         nkv,
         hd,
         arch.v_head_dim.unwrap_or(hd),
-        arch.intermediate_size,
     )?;
     tracing::info!(
         "MiMo MTP: {n} draft layers from {from} (draft depth {})",
