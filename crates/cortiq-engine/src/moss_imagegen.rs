@@ -372,6 +372,28 @@ fn apply_moss_guidance(
     }
 }
 
+/// Cosine similarity and max absolute delta between two same-shaped
+/// prediction vectors — the stage-level GPU-vs-CPU gate.
+fn cos_max_abs(a: &[f32], b: &[f32]) -> (f32, f32) {
+    assert_eq!(a.len(), b.len());
+    let mut dot = 0.0f64;
+    let mut na = 0.0f64;
+    let mut nb = 0.0f64;
+    let mut max_abs = 0.0f32;
+    for (&x, &y) in a.iter().zip(b) {
+        dot += x as f64 * y as f64;
+        na += x as f64 * x as f64;
+        nb += y as f64 * y as f64;
+        max_abs = max_abs.max((x - y).abs());
+    }
+    let cos = if na > 0.0 && nb > 0.0 {
+        (dot / (na.sqrt() * nb.sqrt())) as f32
+    } else {
+        0.0
+    };
+    (cos, max_abs)
+}
+
 fn pixels_to_u8(rgb: &[f32], height: usize, width: usize) -> Result<Vec<u8>, String> {
     let plane = height
         .checked_mul(width)
@@ -431,6 +453,17 @@ pub fn generate_images(
     {
         return Err("MOSS requires 0 <= --slg-start <= --slg-stop <= 1".into());
     }
+    // `CMF_MOSS_GPU=0`: hard kill switch for every GPU arm on this path
+    // (DiT GEMMs, attention, VAE).  Held for the whole run — nested with
+    // the text-encoder pause below, which the pause gate supports.
+    let _moss_gpu_off =
+        (std::env::var("CMF_MOSS_GPU").as_deref() == Ok("0")).then(crate::gpu::pause_gpu);
+    // `CMF_MOSS_CHECK=1`: recompute the conditional forward on the CPU
+    // next to the (possibly GPU) one and report cos/max|Δ| per step, so a
+    // GPU port can be validated stage-by-stage against the host path.
+    let check = std::env::var("CMF_MOSS_CHECK").is_ok_and(|v| v != "0");
+    let mut check_min_cos = f32::INFINITY;
+    let mut check_max_abs = 0.0f32;
     let all_started = Instant::now();
     let model = CmfModel::open(model_path).map_err(|e| format!("{}: {e}", model_path.display()))?;
     if model.header.arch.arch_name != ARCH_NAME {
@@ -558,6 +591,19 @@ pub fn generate_images(
                 let skip_active = moss_skip_active(step, actual_steps, p.slg_start, p.slg_stop);
                 let mut prediction =
                     dit.forward(&latent, lh, lw, t, &positive, positive_tokens, &[])?;
+                if check {
+                    let cpu = crate::gpu::cpu_scope(|| {
+                        dit.forward(&latent, lh, lw, t, &positive, positive_tokens, &[])
+                    })?;
+                    let (cos, mabs) = cos_max_abs(&prediction, &cpu);
+                    if step < 2 {
+                        eprintln!(
+                            "MOSS check: image {image} step {step} cond forward cpu-vs-run cos={cos:.6} max|d|={mabs:.3e}"
+                        );
+                    }
+                    check_min_cos = check_min_cos.min(cos);
+                    check_max_abs = check_max_abs.max(mabs);
+                }
                 let use_slg = skip_active && !p.slg_layers.is_empty() && p.slg_scale > 0.0;
                 let conditional = use_slg.then(|| prediction.clone());
                 let uncond = if let Some((negative, neg_len)) = &negative {
@@ -579,23 +625,26 @@ pub fn generate_images(
                 } else {
                     None
                 };
-                apply_moss_guidance(
-                    &mut prediction,
-                    conditional.as_deref(),
-                    uncond.as_deref(),
-                    p.cfg,
-                    skipped.as_deref(),
-                    p.slg_scale,
-                )?;
-                let dt = sigmas[step + 1] - sigmas[step];
-                for (x, v) in latent.iter_mut().zip(&prediction) {
-                    *x += dt * v;
-                }
-                if latent.iter().any(|v| !v.is_finite()) {
-                    return Err(format!(
-                        "MOSS image {image}: non-finite latent at step {}",
-                        step + 1
-                    ));
+                {
+                    let _t = crate::moss_image::prof::time(crate::moss_image::prof::ELEM);
+                    apply_moss_guidance(
+                        &mut prediction,
+                        conditional.as_deref(),
+                        uncond.as_deref(),
+                        p.cfg,
+                        skipped.as_deref(),
+                        p.slg_scale,
+                    )?;
+                    let dt = sigmas[step + 1] - sigmas[step];
+                    for (x, v) in latent.iter_mut().zip(&prediction) {
+                        *x += dt * v;
+                    }
+                    if latent.iter().any(|v| !v.is_finite()) {
+                        return Err(format!(
+                            "MOSS image {image}: non-finite latent at step {}",
+                            step + 1
+                        ));
+                    }
                 }
                 timing.steps.push(clock.elapsed().as_secs_f64());
                 progress(image, step + 1, actual_steps);
@@ -632,6 +681,31 @@ pub fn generate_images(
     };
     timing.vae = vae_started.elapsed().as_secs_f64();
     timing.total = all_started.elapsed().as_secs_f64();
+    if crate::moss_image::prof::on() {
+        let steps_sum: f64 = timing.steps.iter().sum();
+        eprintln!(
+            "MOSS profile (CMF_MOSS_PROF=1) stages: text {:.3}s, dit_load {:.3}s, text_prepare {:.3}s, steps {:.3}s (n={}, median {:.3}s), vae {:.3}s, total {:.3}s",
+            timing.text_encode,
+            timing.dit_load,
+            timing.text_prepare,
+            steps_sum,
+            timing.steps.len(),
+            timing.median_step(),
+            timing.vae,
+            timing.total
+        );
+        eprint!("{}", crate::moss_image::prof::report(steps_sum));
+        eprintln!(
+            "    gpu attention hits: {}",
+            crate::moss_image::prof::hit(crate::moss_image::prof::ATTN_GPU)
+        );
+    }
+    if check {
+        eprintln!(
+            "MOSS check summary: min cos(cpu, run) over conditional forwards = {:.6}, max |Δ| = {:.3e} (1.0 / 0.0 means the run already was the CPU path)",
+            check_min_cos, check_max_abs
+        );
+    }
     Ok((images, timing))
 }
 

@@ -12,6 +12,126 @@ use crate::pool::Pool;
 use cortiq_core::CmfModel;
 use std::sync::Arc;
 
+/// `CMF_MOSS_PROF=1`: wall-time totals per MOSS DiT op class,
+/// accumulated across every block of every forward of every step and
+/// printed when generation ends (see `moss_imagegen`).  Same contract
+/// as `cpuprof`/`dit::prof`: off by default, one cached bool per
+/// instrumented site, zero nanoseconds recorded when disabled.
+pub mod prof {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub const VEMB: usize = 0;
+    pub const TIME: usize = 1;
+    pub const ROPE: usize = 2;
+    pub const NORMS: usize = 3;
+    pub const QKNORM: usize = 4;
+    pub const ATTN: usize = 5;
+    pub const ATTN_GPU: usize = 6;
+    pub const MATMAT: usize = 7;
+    pub const ELEM: usize = 8;
+    pub const HEAD: usize = 9;
+    const N: usize = 10;
+    const NAMES: [&str; N] = [
+        "latent+text layout",
+        "time+modulation",
+        "rope build",
+        "rmsnorms",
+        "qknorm+rope",
+        "attention(total)",
+        "  of which gpu",
+        "linears(matmat)",
+        "elementwise",
+        "head+tail",
+    ];
+
+    static NS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    static CALLS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+
+    static ON: OnceLock<bool> = OnceLock::new();
+    #[inline]
+    pub fn on() -> bool {
+        *ON.get_or_init(|| std::env::var("CMF_MOSS_PROF").is_ok_and(|v| v != "0"))
+    }
+
+    /// Scope timer; records on drop. `None` when profiling is off.
+    pub struct Timer(Option<(usize, std::time::Instant)>);
+
+    impl Drop for Timer {
+        #[inline]
+        fn drop(&mut self) {
+            if let Some((s, t0)) = self.0.take() {
+                NS[s].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                CALLS[s as usize].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn time(s: usize) -> Timer {
+        if on() {
+            Timer(Some((s, std::time::Instant::now())))
+        } else {
+            Timer(None)
+        }
+    }
+
+    /// Record an externally measured span (e.g. a GPU arm measured by
+    /// its own clock) without nesting a second timer.
+    pub fn add(s: usize, ns: u64) {
+        NS[s].fetch_add(ns, Ordering::Relaxed);
+        CALLS[s].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn hit(s: usize) -> u64 {
+        CALLS[s].load(Ordering::Relaxed)
+    }
+
+    pub fn reset() {
+        for i in 0..N {
+            NS[i].store(0, Ordering::Relaxed);
+            CALLS[i].store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// One block of `name: ms (share%)` lines; `base` is the wall-clock
+    /// budget the shares are taken against (the summed step time).
+    pub fn report(base_secs: f64) -> String {
+        let mut out = String::new();
+        let accounted: f64 = (0..N)
+            .filter(|&s| s != ATTN_GPU)
+            .map(|s| NS[s].load(Ordering::Relaxed) as f64)
+            .sum();
+        for s in 0..N {
+            let ns = NS[s].load(Ordering::Relaxed);
+            if ns == 0 {
+                continue;
+            }
+            let calls = CALLS[s].load(Ordering::Relaxed);
+            let ms = ns as f64 / 1e6;
+            if s == ATTN_GPU {
+                out.push_str(&format!("    {name:<22} {ms:>10.1} ms ({calls} hits)\n", name = NAMES[s]));
+            } else {
+                let share = if base_secs > 0.0 {
+                    ns as f64 / 1e9 / base_secs * 100.0
+                } else {
+                    0.0
+                };
+                out.push_str(&format!(
+                    "    {name:<22} {ms:>10.1} ms ({share:>5.1}% of steps, {calls} calls)\n",
+                    name = NAMES[s]
+                ));
+            }
+        }
+        let acc = accounted / 1e9;
+        out.push_str(&format!(
+            "    {:<22} {acc:>10.3} s of {base_secs:.3} s step budget\n",
+            "accounted"
+        ));
+        out
+    }
+}
+
 /// Native MOSS transformer geometry, read from the source config stored in
 /// `moss.config_json`.
 #[derive(Clone, Debug)]
@@ -269,12 +389,14 @@ impl MossDit {
             return Err("MOSS skip layer out of range".into());
         }
         let image_tokens = h * w;
+        let _t_vemb = prof::time(prof::VEMB);
         let mut image_in = vec![0f32; image_tokens * self.cfg.latent_channels];
         for token in 0..image_tokens {
             for c in 0..self.cfg.latent_channels {
                 image_in[token * self.cfg.latent_channels + c] = latents[c * image_tokens + token];
             }
         }
+        drop(_t_vemb);
         let video = linear(
             &self.video_embedder,
             &image_in,
@@ -285,10 +407,14 @@ impl MossDit {
         let mut x = Vec::with_capacity((image_tokens + text_tokens) * self.cfg.dim);
         x.extend_from_slice(&video);
         x.extend_from_slice(text);
+        let _t_rope = prof::time(prof::ROPE);
         let rope = Rope::new(&self.cfg, h, w, text_tokens);
+        drop(_t_rope);
+        let _t_time = prof::time(prof::TIME);
         let time = self.time_embedding(timestep);
         let modulation = linear_small(&time, &self.shared_mod_w, &self.shared_mod_b);
         let head = linear_small(&time, &self.head_mod_w, &self.head_mod_b);
+        drop(_t_time);
         for (i, block) in self.layers.iter().enumerate() {
             if !skip_layers.contains(&i) {
                 main_block(
@@ -314,9 +440,12 @@ impl MossDit {
             self.pool(),
         );
         let (shift, scale) = (&head[..d], &head[d..]);
-        for row in image.chunks_exact_mut(d) {
-            for ((v, &s), &a) in row.iter_mut().zip(scale).zip(shift) {
-                *v = *v * (1.0 + s) + a;
+        {
+            let _t_head = prof::time(prof::HEAD);
+            for row in image.chunks_exact_mut(d) {
+                for ((v, &s), &a) in row.iter_mut().zip(scale).zip(shift) {
+                    *v = *v * (1.0 + s) + a;
+                }
             }
         }
         let out = linear(
@@ -327,9 +456,12 @@ impl MossDit {
             self.pool(),
         );
         let mut velocity = vec![0f32; self.cfg.latent_channels * image_tokens];
-        for token in 0..image_tokens {
-            for c in 0..self.cfg.latent_channels {
-                velocity[c * image_tokens + token] = out[token * self.cfg.latent_channels + c];
+        {
+            let _t_head = prof::time(prof::HEAD);
+            for token in 0..image_tokens {
+                for c in 0..self.cfg.latent_channels {
+                    velocity[c * image_tokens + token] = out[token * self.cfg.latent_channels + c];
+                }
             }
         }
         Ok(velocity)
@@ -452,6 +584,7 @@ fn linear_small(x: &[f32], w: &[f32], bias: &[f32]) -> Vec<f32> {
 }
 
 fn linear(p: &Proj, x: &[f32], n: usize, bias: Option<&[f32]>, pool: Option<&Pool>) -> Vec<f32> {
+    let _t = prof::time(prof::MATMAT);
     assert_eq!(x.len(), n * p.cols(), "MOSS projection input geometry");
     let mut out = vec![0f32; n * p.rows()];
     p.matmat(x, n, &mut out, pool);
@@ -476,6 +609,7 @@ fn rms_rows_inplace(
     shift: Option<&[f32]>,
     pool: Option<&Pool>,
 ) {
+    let _t = prof::time(prof::NORMS);
     assert_eq!(x.len(), n * d);
     assert_eq!(weight.len(), d);
     if let Some(s) = scale {
@@ -514,6 +648,7 @@ fn qk_norm_rope(
     rope: &Rope,
     pool: Option<&Pool>,
 ) {
+    let _t = prof::time(prof::QKNORM);
     assert_eq!(q.len(), n * heads * hd);
     assert_eq!(weight.len(), hd);
     let ptr = SendRows(q.as_mut_ptr());
@@ -566,6 +701,7 @@ fn attention(
     hd: usize,
     pool: Option<&Pool>,
 ) -> Vec<f32> {
+    let _t = prof::time(prof::ATTN);
     let hidden = heads * hd;
     let mut qh = vec![0f32; heads * n * hd];
     let mut kh = vec![0f32; heads * n * hd];
@@ -581,7 +717,23 @@ fn attention(
         }
     }
     let mut out = vec![0f32; n * hidden];
-    if n >= 128
+    if prof::on() && n >= 128 && crate::gpu::enabled_here() && !crate::gpu::mm_killed() {
+        let g = std::time::Instant::now();
+        if crate::gpu::dit_attention(
+            &qh,
+            &kh,
+            &vh,
+            heads,
+            heads,
+            n,
+            hd,
+            1.0 / (hd as f32).sqrt(),
+            &mut out,
+        ) {
+            prof::add(prof::ATTN_GPU, g.elapsed().as_nanos() as u64);
+            return out;
+        }
+    } else if n >= 128
         && crate::gpu::enabled_here()
         && !crate::gpu::mm_killed()
         && crate::gpu::dit_attention(
@@ -729,9 +881,12 @@ fn main_block(
     );
     let attn = attention(&q, &k, &v, n, cfg.num_heads, cfg.head_dim(), pool);
     let out = linear(&b.o, &attn, n, None, pool);
-    for row in 0..n {
-        for j in 0..d {
-            x[row * d + j] += out[row * d + j] * gate_a[j];
+    {
+        let _t = prof::time(prof::ELEM);
+        for row in 0..n {
+            for j in 0..d {
+                x[row * d + j] += out[row * d + j] * gate_a[j];
+            }
         }
     }
     let mut norm = x.to_vec();
@@ -747,18 +902,24 @@ fn main_block(
     let up_gate = linear(&b.ffn_up_gate, &norm, n, None, pool);
     let inter = cfg.ffn_dim;
     let mut ffn = vec![0f32; n * inter];
-    for row in 0..n {
-        for i in 0..inter {
-            ffn[row * inter + i] = situ(
-                up_gate[row * 2 * inter + i],
-                up_gate[row * 2 * inter + inter + i],
-            );
+    {
+        let _t = prof::time(prof::ELEM);
+        for row in 0..n {
+            for i in 0..inter {
+                ffn[row * inter + i] = situ(
+                    up_gate[row * 2 * inter + i],
+                    up_gate[row * 2 * inter + inter + i],
+                );
+            }
         }
     }
     let out = linear(&b.ffn_down, &ffn, n, None, pool);
-    for row in 0..n {
-        for j in 0..d {
-            x[row * d + j] += out[row * d + j] * gate_f[j];
+    {
+        let _t = prof::time(prof::ELEM);
+        for row in 0..n {
+            for j in 0..d {
+                x[row * d + j] += out[row * d + j] * gate_f[j];
+            }
         }
     }
 }
