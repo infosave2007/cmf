@@ -2603,9 +2603,14 @@ impl QTensor {
                     );
                     return;
                 }
-                let pre: Vec<std::borrow::Cow<'_, [f32]>> = (0..b)
-                    .map(|bi| prescale(&xs_all[bi * cols..(bi + 1) * cols], col_field, *dtype))
-                    .collect();
+                // Host-side activation prescale — only the CPU kernels
+                // need it; the device applies the column field on the
+                // weight side, so GPU arms skip this allocation entirely.
+                let precompute = || -> Vec<std::borrow::Cow<'_, [f32]>> {
+                    (0..b)
+                        .map(|bi| prescale(&xs_all[bi * cols..(bi + 1) * cols], col_field, *dtype))
+                        .collect()
+                };
                 // MiMo verification is a 2–4 row decode panel, not a wide
                 // prompt GEMM. Keep q8 projections on the same device as
                 // decode; the generic b>=8 gate otherwise silently moves
@@ -2617,6 +2622,7 @@ impl QTensor {
                     && crate::gpu::enabled_here()
                     && crate::gpu::wgpu_active()
                 {
+                    let pre = precompute();
                     let flat: Vec<f32> = pre.iter().flat_map(|v| v.iter().copied()).collect();
                     if crate::gpu::q8_matmat(model, *idx, row_scale, &flat, b, rows, cols, out) {
                         return;
@@ -2645,33 +2651,35 @@ impl QTensor {
                 if b >= 8 && b * rows * cols >= 128_000_000 && crate::gpu::enabled_here() {
                     if let Self::Mapped { model, idx, .. } = self {
                         let t0 = std::time::Instant::now();
-                        match crate::gpu::probe_arm(crate::gpu::OpClass::Matmat) {
-                            crate::gpu::ProbeArm::Gpu
-                                if crate::gpu::probe_deciding(crate::gpu::OpClass::Matmat)
-                                    && !crate::gpu::q8_resident_or_upload(model, *idx) =>
-                            {
-                                // Cold weights during probing: the upload
-                                // has started, the count runs on the CPU —
-                                // the GPU arm samples on the next touch.
-                                {
-                                    static N: std::sync::atomic::AtomicU32 =
-                                        std::sync::atomic::AtomicU32::new(0);
-                                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
-                                        eprintln!("D5dbg arm=cold-weights(idx={idx}) -> cpu");
-                                    }
-                                }
-                                let q = self.quant_bytes();
-                                qmatmat(q, row_scale, &pre, rows, cols, out, pool);
-                                return;
-                            }
+                        // Wide batches (the diffusion denoise loop) arbitrate
+                        // as `MatmatWide` so a caller that holds
+                        // `gpu::trust_gpu()` — the MOSS denoise loop — skips
+                        // the probe entirely; narrow batches keep probing.
+                        let class = if b >= 128 {
+                            crate::gpu::OpClass::MatmatWide
+                        } else {
+                            crate::gpu::OpClass::Matmat
+                        };
+                        // A COLD weight takes the device arm: the dispatch
+                        // uploads and keeps it (budget-bounded by the
+                        // residency cache, uncapped), and `probe_record`
+                        // discards the sample as cold. The previous design
+                        // routed cold weights to the host behind
+                        // `q8_resident_or_upload`, whose probe-upload budget
+                        // allows FOUR tensors total — against a 460-tensor
+                        // DiT that meant the probe never saw a warm GPU
+                        // sample, never decided, and every render silently
+                        // ran its linears on the host (measured: 90.9 s/step
+                        // at 512² vs 44.1 with the device forced).
+                        let resident = crate::gpu::weight_is_resident(model, *idx);
+                        match crate::gpu::probe_arm_cold_prefers_gpu(class, resident) {
                             crate::gpu::ProbeArm::Gpu => {
                                 // The two-field codec's own entry first, as
                                 // `device_matmat` takes it: the column field
                                 // folds into the weight plane and the GEMM
                                 // runs on the matrix units. The plain int8
-                                // entry below is the scalar f32 GEMM — on a
-                                // Spark-X2.5 4B prefill it ran q|k|v|o at
-                                // host speed.
+                                // entry below is the scalar f32 GEMM — kept
+                                // as the bool fallback.
                                 if *dtype == TensorDtype::Q8_2f
                                     && std::env::var("CMF_Q8_2F_DEV").as_deref() != Ok("0")
                                     && crate::gpu::q8_matmat_2f(
@@ -2679,25 +2687,21 @@ impl QTensor {
                                         cols, out,
                                     )
                                 {
-                                    crate::gpu::probe_record(
-                                        crate::gpu::OpClass::Matmat,
-                                        true,
-                                        t0.elapsed(),
-                                    );
+                                    crate::gpu::probe_record(class, true, t0.elapsed());
                                     return;
                                 }
+                                let pre = precompute();
                                 let flat: Vec<f32> =
                                     pre.iter().flat_map(|v| v.iter().copied()).collect();
                                 if crate::gpu::q8_matmat(
                                     model, *idx, row_scale, &flat, b, rows, cols, out,
                                 ) {
-                                    crate::gpu::probe_record(
-                                        crate::gpu::OpClass::Matmat,
-                                        true,
-                                        t0.elapsed(),
-                                    );
+                                    crate::gpu::probe_record(class, true, t0.elapsed());
                                     return;
                                 }
+                                // Both device entries declined the work —
+                                // say so, or the class can never settle.
+                                crate::gpu::probe_note_decline(class);
                             }
                             crate::gpu::ProbeArm::CpuTimed => {
                                 {
@@ -2707,13 +2711,10 @@ impl QTensor {
                                         eprintln!("D5dbg arm=cpu-timed -> cpu");
                                     }
                                 }
+                                let pre = precompute();
                                 let q = self.quant_bytes();
                                 qmatmat(q, row_scale, &pre, rows, cols, out, pool);
-                                crate::gpu::probe_record(
-                                    crate::gpu::OpClass::Matmat,
-                                    false,
-                                    t0.elapsed(),
-                                );
+                                crate::gpu::probe_record(class, false, t0.elapsed());
                                 return;
                             }
                             crate::gpu::ProbeArm::Cpu => {
@@ -2732,6 +2733,7 @@ impl QTensor {
                         eprintln!("D5dbg gate-not-taken-or-nonmapped -> cpu");
                     }
                 }
+                let pre = precompute();
                 let q = self.quant_bytes();
                 qmatmat(q, row_scale, &pre, rows, cols, out, pool);
             }

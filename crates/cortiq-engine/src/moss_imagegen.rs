@@ -543,6 +543,15 @@ pub fn generate_images(
             CmfModel::open(model_path).map_err(|e| format!("{}: {e}", model_path.display()))?,
         );
         stage.track_model(stage_model.uid());
+        // The denoise loop is long, uniform and warm — exactly the case
+        // `gpu::trust_gpu()` documents: without it the per-op probe
+        // alternates arms inside a sustained diffusion step (and behind
+        // its cold-upload budget it could never decide at all for this
+        // 460-tensor DiT, silently pinning every linear to the host).
+        // Held for the whole DiT stage; each device op still carries its
+        // bool CPU fallback, and CMF_MOSS_GPU=0 / CMF_GPU=0 keep the hard
+        // escape hatches.
+        let _trust_gpu = crate::gpu::trust_gpu();
         let started = Instant::now();
         let dit = MossDit::from_cmf(&stage_model)?;
         timing.dit_load = started.elapsed().as_secs_f64();
