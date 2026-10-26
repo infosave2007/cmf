@@ -306,6 +306,15 @@ pub enum LayerType {
 pub struct MtpConfig {
     /// Number of MTP transformer blocks (`model.mtp.layers.{i}.*`).
     pub num_layers: usize,
+    /// Tensor-derived dense FFN intermediate width for each MTP block.
+    ///
+    /// The draft is allowed to be narrower than the trunk after physical
+    /// compaction, so this deliberately is not inferred from
+    /// [`ModelArch::intermediate_size`]. `None` preserves legacy files whose
+    /// header did not record the per-draft width; loaders then obtain it from
+    /// the checked tensor triple.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ffn_intermediate_sizes: Option<Vec<usize>>,
     #[serde(default = "default_true")]
     pub share_lm_head: bool,
     #[serde(default = "default_true")]
@@ -1307,5 +1316,37 @@ mod tests {
         assert_eq!(back.kv_heads_per_layer, Some(vec![2, 4, 4]));
         assert_eq!(back.v_head_dim, Some(8));
         assert_eq!(serde_json::to_value(&back).unwrap(), value);
+    }
+
+    #[test]
+    fn mtp_ffn_widths_are_optional_and_round_trip_when_present() {
+        let mut legacy = legacy_arch_json();
+        legacy["mtp"] = serde_json::json!({
+            "num_layers": 1,
+            "share_lm_head": true,
+            "share_embed": true
+        });
+        let mut arch: ModelArch = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            arch.mtp
+                .as_ref()
+                .and_then(|mtp| mtp.ffn_intermediate_sizes.as_deref()),
+            None
+        );
+        assert!(
+            !serde_json::to_value(&arch).unwrap()["mtp"]
+                .as_object()
+                .unwrap()
+                .contains_key("ffn_intermediate_sizes")
+        );
+
+        arch.mtp.as_mut().unwrap().ffn_intermediate_sizes = Some(vec![96]);
+        let back: ModelArch = serde_json::from_value(serde_json::to_value(&arch).unwrap()).unwrap();
+        assert_eq!(
+            back.mtp
+                .as_ref()
+                .and_then(|mtp| mtp.ffn_intermediate_sizes.as_deref()),
+            Some(&[96][..])
+        );
     }
 }
