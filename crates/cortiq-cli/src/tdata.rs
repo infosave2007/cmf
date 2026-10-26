@@ -11,12 +11,12 @@
 //! directory layout while streaming, so opening a multi-million-token set is
 //! O(1) memory and records are checked only as they are consumed.
 
-use anyhow::{Context, Result, ensure};
-use serde_json::{Map, Value};
+use anyhow::{ensure, Context, Result};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::fmt;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// The manifest identity required by the v1 on-disk format.
@@ -794,7 +794,7 @@ impl TdataReader {
         for item in self.stream(selector)? {
             item?;
         }
-        Ok(())
+        verify_manifest_file_hashes(&self.root, &self.manifest.raw)
     }
 
     /// Scan every row (including rejected records) and return counts useful
@@ -813,6 +813,977 @@ impl TdataReader {
             summary.add(&sample.record, sample.index);
         }
         Ok(summary)
+    }
+}
+
+/// Result of one committed [`TdataWriter::append_record`] call.
+///
+/// `record.tok.index` and `record.tok.offset` are assigned by the writer,
+/// rather than trusted from the caller.  The returned values are exactly the
+/// JSON row and 40-byte index entry that became visible as one committed
+/// `.tdata` record.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TdataWrittenRecord {
+    pub record: TdataRecord,
+    pub index: TdataTokenIndex,
+}
+
+/// Counters maintained by the append-only v1 writer.
+///
+/// They are rebuilt from committed JSONL rows on [`TdataWriter::resume`], so
+/// they never depend on a stale partially-written manifest.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TdataWriterStats {
+    pub prompts: u64,
+    pub records: u64,
+    pub usable: u64,
+    pub rejected: u64,
+    pub total_tokens: u64,
+    pub prompt_tokens: u64,
+    pub think_tokens: u64,
+    pub answer_tokens: u64,
+    pub rejected_loop: u64,
+    pub rejected_length: u64,
+    pub rejected_empty: u64,
+    pub rejected_check: u64,
+    pub rejected_error: u64,
+    pub train: TdataSplitSummary,
+    pub val: TdataSplitSummary,
+    pub test: TdataSplitSummary,
+}
+
+impl TdataWriterStats {
+    fn add_prompt(&mut self) -> Result<()> {
+        self.prompts = self
+            .prompts
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!(".tdata prompt count overflows u64"))?;
+        Ok(())
+    }
+
+    fn add_record(&mut self, record: &TdataRecord, index: TdataTokenIndex) -> Result<()> {
+        self.records = checked_add_counter(self.records, 1, "record count")?;
+        self.total_tokens =
+            checked_add_counter(self.total_tokens, index.total as u64, "token count")?;
+        self.prompt_tokens = checked_add_counter(
+            self.prompt_tokens,
+            index.prompt as u64,
+            "prompt token count",
+        )?;
+        self.think_tokens =
+            checked_add_counter(self.think_tokens, index.think as u64, "think token count")?;
+        self.answer_tokens = checked_add_counter(
+            self.answer_tokens,
+            index.answer as u64,
+            "answer token count",
+        )?;
+
+        let split = match record.split {
+            TdataSplit::Train => &mut self.train,
+            TdataSplit::Val => &mut self.val,
+            TdataSplit::Test => &mut self.test,
+        };
+        split.records = checked_add_counter(split.records, 1, "split record count")?;
+        split.tokens = checked_add_counter(split.tokens, index.total as u64, "split token count")?;
+        if record.usable {
+            self.usable = checked_add_counter(self.usable, 1, "usable record count")?;
+            split.usable = checked_add_counter(split.usable, 1, "split usable record count")?;
+        } else {
+            self.rejected = checked_add_counter(self.rejected, 1, "rejected record count")?;
+            split.rejected = checked_add_counter(split.rejected, 1, "split rejected record count")?;
+            if index.flags.check_failed() {
+                self.rejected_check =
+                    checked_add_counter(self.rejected_check, 1, "check-rejected count")?;
+            } else {
+                match record.finish.as_deref() {
+                    Some("loop") => {
+                        self.rejected_loop =
+                            checked_add_counter(self.rejected_loop, 1, "loop-rejected count")?;
+                    }
+                    Some("length") => {
+                        self.rejected_length =
+                            checked_add_counter(self.rejected_length, 1, "length-rejected count")?;
+                    }
+                    Some("empty") => {
+                        self.rejected_empty =
+                            checked_add_counter(self.rejected_empty, 1, "empty-rejected count")?;
+                    }
+                    _ => {
+                        self.rejected_error =
+                            checked_add_counter(self.rejected_error, 1, "error-rejected count")?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Append-only producer for a minimal v1 `.tdata` directory.
+///
+/// The writer deliberately supports token sequences and structured records,
+/// but not `topk.bin` yet.  `records.jsonl` is its commit marker: token bytes
+/// and the matching 40-byte index entry are synced before the JSONL newline is
+/// appended.  On an explicit [`Self::resume`], uncommitted binary tails and a
+/// non-newline JSONL tail are discarded, while a committed JSONL row without
+/// its binary payload is rejected as corruption rather than silently lost.
+#[derive(Debug)]
+pub struct TdataWriter {
+    root: PathBuf,
+    manifest: Value,
+    prompts: File,
+    records: File,
+    index: File,
+    tokens: File,
+    stats: TdataWriterStats,
+    finalized: bool,
+}
+
+impl TdataWriter {
+    /// Create a new empty `.tdata` directory and publish an incomplete
+    /// manifest.  Existing non-empty paths are never modified; use
+    /// [`Self::resume`] only when explicitly continuing an incomplete output.
+    pub fn create(root: impl AsRef<Path>, manifest: Value) -> Result<Self> {
+        let root = root.as_ref().to_path_buf();
+        if root.exists() {
+            ensure!(
+                root.is_dir(),
+                "{}: .tdata output path exists but is not a directory",
+                root.display()
+            );
+            ensure!(
+                fs::read_dir(&root)
+                    .with_context(|| format!("reading {}", root.display()))?
+                    .next()
+                    .transpose()
+                    .with_context(|| format!("reading {}", root.display()))?
+                    .is_none(),
+                "{}: refuse to create over a non-empty .tdata directory; use explicit resume or a new output path",
+                root.display()
+            );
+        } else {
+            fs::create_dir_all(&root)
+                .with_context(|| format!("creating .tdata directory {}", root.display()))?;
+        }
+
+        let manifest = normalize_new_writer_manifest(manifest)?;
+        for name in ["prompts.jsonl", "records.jsonl", "tokens.idx", "tokens.bin"] {
+            let path = root.join(name);
+            let file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .with_context(|| format!("creating {}", path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("syncing newly created {}", path.display()))?;
+        }
+        sync_directory(&root)?;
+        write_manifest_atomic(&root, &manifest)?;
+
+        Ok(Self {
+            prompts: open_append_file(&root.join("prompts.jsonl"))?,
+            records: open_append_file(&root.join("records.jsonl"))?,
+            index: open_append_file(&root.join("tokens.idx"))?,
+            tokens: open_append_file(&root.join("tokens.bin"))?,
+            root,
+            manifest,
+            stats: TdataWriterStats::default(),
+            finalized: false,
+        })
+    }
+
+    /// Continue an incomplete directory created by this writer.
+    ///
+    /// This performs the recovery protocol before opening append handles.  It
+    /// is intentionally the only API that can truncate anything, and it only
+    /// truncates bytes that have no committed `records.jsonl` row.
+    pub fn resume(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref().to_path_buf();
+        ensure!(
+            root.is_dir(),
+            "{}: expected an incomplete .tdata directory to resume",
+            root.display()
+        );
+        let manifest_path = root.join("manifest.json");
+        let manifest_text = fs::read_to_string(&manifest_path)
+            .with_context(|| format!("reading {}", manifest_path.display()))?;
+        let manifest: Value = serde_json::from_str(&manifest_text)
+            .with_context(|| format!("parsing {}", manifest_path.display()))?;
+        validate_incomplete_writer_manifest(&manifest)?;
+        let stats = recover_incomplete_writer_layout(&root)?;
+
+        Ok(Self {
+            prompts: open_append_file(&root.join("prompts.jsonl"))?,
+            records: open_append_file(&root.join("records.jsonl"))?,
+            index: open_append_file(&root.join("tokens.idx"))?,
+            tokens: open_append_file(&root.join("tokens.bin"))?,
+            root,
+            manifest,
+            stats,
+            finalized: false,
+        })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The incomplete manifest base supplied at creation time.  It becomes a
+    /// finalized copy only after [`Self::finalize`] succeeds.
+    pub fn manifest(&self) -> &Value {
+        &self.manifest
+    }
+
+    pub const fn stats(&self) -> TdataWriterStats {
+        self.stats
+    }
+
+    /// Append one normalized prompt JSON object to `prompts.jsonl`.
+    ///
+    /// Prompt rows are independently committed by their newline.  The writer
+    /// leaves validation of prompt-specific fields (`id`, messages, category)
+    /// to the generate/import command, but rejects any non-object row here so
+    /// an interrupted output remains unambiguous JSONL.
+    pub fn append_prompt(&mut self, prompt: &Value) -> Result<()> {
+        self.ensure_active()?;
+        ensure!(
+            prompt.is_object(),
+            "prompts.jsonl row must be a JSON object, not {}",
+            json_type_name(prompt)
+        );
+        let bytes = serde_json::to_vec(prompt).context("serializing prompts.jsonl row")?;
+        self.prompts
+            .write_all(&bytes)
+            .context("writing prompts.jsonl row")?;
+        self.prompts
+            .write_all(b"\n")
+            .context("committing prompts.jsonl row")?;
+        self.prompts
+            .sync_data()
+            .context("syncing prompts.jsonl row")?;
+        self.stats.add_prompt()
+    }
+
+    /// Append one record and its complete rendered token sequence.
+    ///
+    /// The caller supplies `prompt`, `think`, `answer`, and `total` counts in
+    /// `record.tok`; this method validates them against `tokens`, assigns the
+    /// append-only index/offset, then writes `tokens.bin`, `tokens.idx`, and
+    /// finally the JSONL commit marker.  v1 top-k payloads are deliberately
+    /// rejected by this minimal writer until `topk.bin` has a full producer.
+    pub fn append_record(
+        &mut self,
+        mut record: TdataRecord,
+        tokens: &[u32],
+    ) -> Result<TdataWrittenRecord> {
+        self.ensure_active()?;
+        ensure!(
+            record.topk.is_none(),
+            "TdataWriter v1 minimal mode cannot append top-k data yet"
+        );
+        record.tok.validate("TdataWriter record.tok")?;
+        ensure!(
+            record.tok.total as usize == tokens.len(),
+            "TdataWriter record.tok.total={} but {} token ids were supplied",
+            record.tok.total,
+            tokens.len()
+        );
+        let line_no = self
+            .stats
+            .records
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!(".tdata record index overflows u64"))?;
+        record.tok.index = self.stats.records;
+        record.tok.offset = self.stats.total_tokens;
+
+        // Round-trip the exact outgoing row through the reader parser before
+        // changing any binary file.  This keeps writer and reader schemas
+        // coupled without relying on a separate serialization implementation.
+        let json_row = tdata_record_to_value(&record);
+        let json_bytes = serde_json::to_vec(&json_row).context("serializing records.jsonl row")?;
+        let line_no_usize = usize::try_from(line_no)
+            .map_err(|_| anyhow::anyhow!("records.jsonl line number {line_no} exceeds usize"))?;
+        let record = TdataRecord::from_json_line(
+            std::str::from_utf8(&json_bytes).expect("serde_json output is UTF-8"),
+            line_no_usize,
+        )?;
+        let flags = flags_for_writer_record(&record)?;
+        let index = TdataTokenIndex {
+            tok_offset: record.tok.offset,
+            total: record.tok.total,
+            prompt: record.tok.prompt,
+            think: record.tok.think,
+            answer: record.tok.answer,
+            topk_offset: TdataTokenIndex::NO_TOPK,
+            flags,
+            split: record.split,
+        };
+        validate_record_index_pair(&record, index, line_no, self.stats.total_tokens, None)?;
+        let mut next_stats = self.stats;
+        next_stats.add_record(&record, index)?;
+
+        let mut token_bytes = Vec::with_capacity(
+            tokens
+                .len()
+                .checked_mul(4)
+                .ok_or_else(|| anyhow::anyhow!("token payload byte length overflows usize"))?,
+        );
+        for &token in tokens {
+            token_bytes.extend_from_slice(&token.to_le_bytes());
+        }
+        let index_bytes = index.to_le_bytes()?;
+
+        // Write and sync the binary payload before the JSONL marker.  If a
+        // process dies during any of these writes, `resume` trims only this
+        // uncommitted tail.  A visible newline therefore never points at data
+        // that this writer did not first make durable.
+        self.tokens
+            .write_all(&token_bytes)
+            .with_context(|| format!("writing tokens.bin for record {line_no}"))?;
+        self.tokens
+            .sync_data()
+            .with_context(|| format!("syncing tokens.bin for record {line_no}"))?;
+        self.index
+            .write_all(&index_bytes)
+            .with_context(|| format!("writing tokens.idx for record {line_no}"))?;
+        self.index
+            .sync_data()
+            .with_context(|| format!("syncing tokens.idx for record {line_no}"))?;
+        self.records
+            .write_all(&json_bytes)
+            .with_context(|| format!("writing records.jsonl record {line_no}"))?;
+        self.records
+            .write_all(b"\n")
+            .with_context(|| format!("committing records.jsonl record {line_no}"))?;
+        self.records
+            .sync_data()
+            .with_context(|| format!("syncing records.jsonl record {line_no}"))?;
+
+        self.stats = next_stats;
+        Ok(TdataWrittenRecord { record, index })
+    }
+
+    /// Sync all append-only payloads without finalizing the manifest.
+    pub fn sync(&mut self) -> Result<()> {
+        self.ensure_active()?;
+        self.prompts.sync_data().context("syncing prompts.jsonl")?;
+        self.records.sync_data().context("syncing records.jsonl")?;
+        self.index.sync_data().context("syncing tokens.idx")?;
+        self.tokens.sync_data().context("syncing tokens.bin")?;
+        sync_directory(&self.root)
+    }
+
+    /// Atomically publish the final manifest and return its reader-validated
+    /// representation.  After this point [`TdataReader::open`] can consume
+    /// the directory and [`Self::resume`] intentionally refuses it.
+    pub fn finalize(mut self) -> Result<TdataManifest> {
+        self.ensure_active()?;
+        self.sync()?;
+        let manifest = finalized_writer_manifest(&self.root, &self.manifest, self.stats)?;
+        write_manifest_atomic(&self.root, &manifest)?;
+        self.manifest = manifest.clone();
+        self.finalized = true;
+        TdataManifest::from_json(manifest)
+    }
+
+    fn ensure_active(&self) -> Result<()> {
+        ensure!(
+            !self.finalized,
+            "cannot append to a finalized .tdata writer; create a new output instead"
+        );
+        Ok(())
+    }
+}
+
+fn checked_add_counter(value: u64, amount: u64, label: &str) -> Result<u64> {
+    value
+        .checked_add(amount)
+        .ok_or_else(|| anyhow::anyhow!(".tdata {label} overflows u64"))
+}
+
+fn normalize_new_writer_manifest(mut manifest: Value) -> Result<Value> {
+    {
+        let obj = manifest
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("TdataWriter manifest must be a JSON object"))?;
+        if let Some(format) = obj.get("format") {
+            ensure!(
+                format.as_str() == Some(TDATA_FORMAT),
+                "TdataWriter manifest format must be {TDATA_FORMAT:?}"
+            );
+        }
+        if let Some(version) = obj.get("version") {
+            ensure!(
+                json_u64(version, "TdataWriter manifest.version")? == TDATA_VERSION as u64,
+                "TdataWriter supports only v{TDATA_VERSION}"
+            );
+        }
+        if let Some(complete) = obj.get("complete") {
+            ensure!(
+                complete.as_bool() != Some(true),
+                "cannot create a new .tdata writer from a complete manifest"
+            );
+            ensure!(
+                complete.is_boolean(),
+                "TdataWriter manifest.complete must be a bool when supplied"
+            );
+        }
+        obj.insert("format".to_owned(), Value::String(TDATA_FORMAT.to_owned()));
+        obj.insert("version".to_owned(), Value::from(TDATA_VERSION));
+        obj.insert("complete".to_owned(), Value::Bool(false));
+    }
+    ensure!(
+        !manifest_requests_topk(&manifest)?,
+        "TdataWriter v1 minimal mode does not support topk.bin; set topk.k to 0 or omit topk"
+    );
+    Ok(manifest)
+}
+
+fn validate_incomplete_writer_manifest(manifest: &Value) -> Result<()> {
+    let obj = manifest
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("manifest.json: expected a JSON object"))?;
+    let format = required_string(obj, "format", "manifest.json")?;
+    ensure!(
+        format == TDATA_FORMAT,
+        "manifest.json: format {format:?}; expected {TDATA_FORMAT:?}"
+    );
+    let version = required_u32(obj, "version", "manifest.json")?;
+    ensure!(
+        version == TDATA_VERSION,
+        "manifest.json: version {version}; this writer supports only v{TDATA_VERSION}"
+    );
+    ensure!(
+        !required_bool(obj, "complete", "manifest.json")?,
+        "manifest.json is already complete; refusing to resume immutable .tdata output"
+    );
+    ensure!(
+        !manifest_requests_topk(manifest)?,
+        "TdataWriter v1 minimal mode cannot safely resume a top-k .tdata directory"
+    );
+    Ok(())
+}
+
+fn manifest_requests_topk(manifest: &Value) -> Result<bool> {
+    let obj = manifest
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("manifest.json: expected a JSON object"))?;
+    let Some(topk) = obj.get("topk") else {
+        return Ok(false);
+    };
+    if topk.is_null() {
+        return Ok(false);
+    }
+    let topk = topk
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("manifest.json.topk must be an object or null"))?;
+    let k = topk
+        .get("k")
+        .ok_or_else(|| anyhow::anyhow!("manifest.json.topk.k is required when topk is present"))?;
+    Ok(json_u64(k, "manifest.json.topk.k")? != 0)
+}
+
+fn open_append_file(path: &Path) -> Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("opening {} for append", path.display()))
+}
+
+fn recover_incomplete_writer_layout(root: &Path) -> Result<TdataWriterStats> {
+    let prompts_path = root.join("prompts.jsonl");
+    let records_path = root.join("records.jsonl");
+    let index_path = root.join("tokens.idx");
+    let tokens_path = root.join("tokens.bin");
+
+    truncate_unterminated_jsonl_tail(&prompts_path)?;
+    let mut stats = TdataWriterStats {
+        prompts: count_jsonl_objects(&prompts_path, "prompts.jsonl")?,
+        ..TdataWriterStats::default()
+    };
+
+    truncate_unterminated_jsonl_tail(&records_path)?;
+    let mut records = BufReader::new(
+        File::open(&records_path).with_context(|| format!("opening {}", records_path.display()))?,
+    );
+    let mut index =
+        File::open(&index_path).with_context(|| format!("opening {}", index_path.display()))?;
+    let mut ordinal = 0_u64;
+    let mut expected_tok_offset = 0_u64;
+    while let Some(line) = read_jsonl_line(&mut records)? {
+        let line_no = ordinal
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("records.jsonl line number overflows u64"))?;
+        let line_no_usize = usize::try_from(line_no)
+            .map_err(|_| anyhow::anyhow!("records.jsonl line number {line_no} exceeds usize"))?;
+        let record = TdataRecord::from_json_line(&line, line_no_usize)?;
+        ensure!(
+            record.topk.is_none(),
+            "records.jsonl line {line_no}: TdataWriter minimal resume cannot preserve top-k records"
+        );
+        let entry = read_index_entry(&mut index, ordinal)?;
+        validate_record_index_pair(&record, entry, line_no, expected_tok_offset, None)?;
+        stats.add_record(&record, entry)?;
+        expected_tok_offset = expected_tok_offset
+            .checked_add(entry.total as u64)
+            .ok_or_else(|| anyhow::anyhow!("tokens.idx record {line_no}: token offset overflow"))?;
+        ordinal = line_no;
+    }
+
+    let required_index_bytes = ordinal
+        .checked_mul(TDATA_INDEX_BYTES as u64)
+        .ok_or_else(|| anyhow::anyhow!("committed tokens.idx byte length overflows u64"))?;
+    truncate_uncommitted_tail(&index_path, required_index_bytes, "tokens.idx")?;
+    let required_token_bytes = expected_tok_offset
+        .checked_mul(4)
+        .ok_or_else(|| anyhow::anyhow!("committed tokens.bin byte length overflows u64"))?;
+    truncate_uncommitted_tail(&tokens_path, required_token_bytes, "tokens.bin")?;
+    sync_directory(root)?;
+    Ok(stats)
+}
+
+/// Remove a partial JSONL row only when it lacks the newline that our writer
+/// uses as its commit marker.  Fully terminated malformed rows are corruption
+/// and are left for the parser to reject rather than being silently erased.
+fn truncate_unterminated_jsonl_tail(path: &Path) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("opening {} for recovery", path.display()))?;
+    let len = file
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    if len == 0 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::End(-1))
+        .with_context(|| format!("seeking {} during recovery", path.display()))?;
+    let mut last = [0_u8; 1];
+    file.read_exact(&mut last)
+        .with_context(|| format!("reading {} during recovery", path.display()))?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+    let committed_len = last_newline_end(&mut file, len)?;
+    file.set_len(committed_len)
+        .with_context(|| format!("truncating uncommitted JSONL tail in {}", path.display()))?;
+    file.sync_data()
+        .with_context(|| format!("syncing recovered {}", path.display()))?;
+    Ok(())
+}
+
+fn last_newline_end(file: &mut File, len: u64) -> Result<u64> {
+    const CHUNK: usize = 64 * 1024;
+    let mut end = len;
+    let mut bytes = [0_u8; CHUNK];
+    while end != 0 {
+        let take = usize::try_from(end.min(CHUNK as u64)).expect("bounded chunk length");
+        let start = end - take as u64;
+        file.seek(SeekFrom::Start(start))
+            .context("seeking JSONL tail during recovery")?;
+        file.read_exact(&mut bytes[..take])
+            .context("reading JSONL tail during recovery")?;
+        if let Some(position) = bytes[..take].iter().rposition(|byte| *byte == b'\n') {
+            return Ok(start + position as u64 + 1);
+        }
+        end = start;
+    }
+    Ok(0)
+}
+
+fn count_jsonl_objects(path: &Path, label: &str) -> Result<u64> {
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut count = 0_u64;
+    let mut line_no = 0_u64;
+    while let Some(line) = read_jsonl_line(&mut reader)? {
+        line_no = line_no
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("{label}: line count overflows u64"))?;
+        let value: Value = serde_json::from_str(&line)
+            .with_context(|| format!("{label} line {line_no}: invalid JSON"))?;
+        ensure!(
+            value.is_object(),
+            "{label} line {line_no}: expected a JSON object"
+        );
+        count = checked_add_counter(count, 1, &format!("{label} row count"))?;
+    }
+    Ok(count)
+}
+
+/// Trim only a binary suffix that has no committed record row.  If a JSONL
+/// row requires bytes which are missing, fail rather than treating it as an
+/// uncommitted row: that would violate the JSONL commit-marker contract.
+fn truncate_uncommitted_tail(path: &Path, committed_len: u64, label: &str) -> Result<()> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("opening {} for recovery", path.display()))?;
+    let actual_len = file
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    ensure!(
+        actual_len >= committed_len,
+        "{label}: {actual_len} bytes exist but committed records require {committed_len}; refusing to lose a committed JSONL row"
+    );
+    if actual_len > committed_len {
+        file.set_len(committed_len).with_context(|| {
+            format!("truncating uncommitted {label} tail in {}", path.display())
+        })?;
+        file.sync_data()
+            .with_context(|| format!("syncing recovered {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn flags_for_writer_record(record: &TdataRecord) -> Result<TdataIndexFlags> {
+    let mut flags = if record.usable {
+        TdataIndexFlags::USABLE
+    } else {
+        0
+    };
+    if let Some(quality) = &record.quality {
+        if quality.truncated == Some(true) {
+            flags |= TdataIndexFlags::TRUNCATED;
+        }
+        if quality.loop_suspect == Some(true) {
+            flags |= TdataIndexFlags::LOOP;
+        }
+        if quality_check_failed(quality) {
+            flags |= TdataIndexFlags::CHECK_FAILED;
+        }
+    }
+    let flags = TdataIndexFlags(flags);
+    ensure!(
+        !flags.check_failed() || !record.usable,
+        "records.jsonl {}: quality.check failed but usable=true",
+        record.rid
+    );
+    flags.validate("TdataWriter flags")?;
+    Ok(flags)
+}
+
+fn quality_check_failed(quality: &TdataQuality) -> bool {
+    match quality.raw_check.as_ref() {
+        Some(Value::Bool(false)) => true,
+        Some(Value::Object(object)) => object.get("pass").and_then(Value::as_bool) == Some(false),
+        _ => false,
+    }
+}
+
+fn tdata_record_to_value(record: &TdataRecord) -> Value {
+    let messages = record
+        .messages
+        .iter()
+        .map(|message| {
+            let mut value = Map::new();
+            value.insert("role".to_owned(), Value::String(message.role.clone()));
+            value.insert("content".to_owned(), message.content.clone());
+            Value::Object(value)
+        })
+        .collect();
+    let mut response = Map::new();
+    response.insert(
+        "think".to_owned(),
+        record
+            .response
+            .think
+            .as_ref()
+            .map(|value| Value::String(value.clone()))
+            .unwrap_or(Value::Null),
+    );
+    response.insert(
+        "content".to_owned(),
+        Value::String(record.response.content.clone()),
+    );
+    let quality = record.quality.as_ref().map_or(Value::Null, |quality| {
+        let mut value = Map::new();
+        value.insert(
+            "truncated".to_owned(),
+            quality.truncated.map(Value::Bool).unwrap_or(Value::Null),
+        );
+        value.insert(
+            "loop_suspect".to_owned(),
+            quality.loop_suspect.map(Value::Bool).unwrap_or(Value::Null),
+        );
+        value.insert(
+            "check".to_owned(),
+            quality.raw_check.clone().unwrap_or(Value::Null),
+        );
+        Value::Object(value)
+    });
+    let mut tok = Map::new();
+    tok.insert("index".to_owned(), Value::from(record.tok.index));
+    tok.insert("offset".to_owned(), Value::from(record.tok.offset));
+    tok.insert("prompt".to_owned(), Value::from(record.tok.prompt));
+    tok.insert("think".to_owned(), Value::from(record.tok.think));
+    tok.insert("answer".to_owned(), Value::from(record.tok.answer));
+    tok.insert("total".to_owned(), Value::from(record.tok.total));
+
+    let mut value = Map::new();
+    value.insert("rid".to_owned(), Value::String(record.rid.clone()));
+    value.insert("pid".to_owned(), Value::String(record.pid.clone()));
+    value.insert("sample".to_owned(), Value::from(record.sample));
+    value.insert(
+        "category".to_owned(),
+        record
+            .category
+            .as_ref()
+            .map(|value| Value::String(value.clone()))
+            .unwrap_or(Value::Null),
+    );
+    value.insert(
+        "split".to_owned(),
+        Value::String(record.split.as_str().to_owned()),
+    );
+    value.insert("usable".to_owned(), Value::Bool(record.usable));
+    value.insert("messages".to_owned(), Value::Array(messages));
+    value.insert("response".to_owned(), Value::Object(response));
+    value.insert(
+        "finish".to_owned(),
+        record
+            .finish
+            .as_ref()
+            .map(|value| Value::String(value.clone()))
+            .unwrap_or(Value::Null),
+    );
+    value.insert("tok".to_owned(), Value::Object(tok));
+    value.insert("topk".to_owned(), Value::Null);
+    value.insert("quality".to_owned(), quality);
+    value.insert("gen".to_owned(), record.generation.clone());
+    value.insert("meta".to_owned(), record.meta.clone());
+    Value::Object(value)
+}
+
+fn finalized_writer_manifest(root: &Path, base: &Value, stats: TdataWriterStats) -> Result<Value> {
+    let mut manifest = base.clone();
+    let obj = manifest
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("writer manifest unexpectedly ceased to be an object"))?;
+    obj.insert("format".to_owned(), Value::String(TDATA_FORMAT.to_owned()));
+    obj.insert("version".to_owned(), Value::from(TDATA_VERSION));
+    obj.insert("complete".to_owned(), Value::Bool(true));
+
+    let mut stats_value = take_object_field(obj, "stats", "manifest.stats")?;
+    stats_value.insert("records".to_owned(), Value::from(stats.records));
+    stats_value.insert("usable".to_owned(), Value::from(stats.usable));
+    let mut rejected = take_object_field(&mut stats_value, "rejected", "manifest.stats.rejected")?;
+    rejected.insert("loop".to_owned(), Value::from(stats.rejected_loop));
+    rejected.insert("length".to_owned(), Value::from(stats.rejected_length));
+    rejected.insert("empty".to_owned(), Value::from(stats.rejected_empty));
+    rejected.insert("check".to_owned(), Value::from(stats.rejected_check));
+    rejected.insert("error".to_owned(), Value::from(stats.rejected_error));
+    stats_value.insert("rejected".to_owned(), Value::Object(rejected));
+    let mut tokens = take_object_field(&mut stats_value, "tokens", "manifest.stats.tokens")?;
+    tokens.insert("prompt".to_owned(), Value::from(stats.prompt_tokens));
+    tokens.insert("think".to_owned(), Value::from(stats.think_tokens));
+    tokens.insert("answer".to_owned(), Value::from(stats.answer_tokens));
+    tokens.insert("total".to_owned(), Value::from(stats.total_tokens));
+    stats_value.insert("tokens".to_owned(), Value::Object(tokens));
+    let mut by_split = take_object_field(&mut stats_value, "by_split", "manifest.stats.by_split")?;
+    by_split.insert("train".to_owned(), split_summary_value(stats.train));
+    by_split.insert("val".to_owned(), split_summary_value(stats.val));
+    by_split.insert("test".to_owned(), split_summary_value(stats.test));
+    stats_value.insert("by_split".to_owned(), Value::Object(by_split));
+    obj.insert("stats".to_owned(), Value::Object(stats_value));
+
+    let mut prompts = take_object_field(obj, "prompts", "manifest.prompts")?;
+    prompts.insert("count".to_owned(), Value::from(stats.prompts));
+    obj.insert("prompts".to_owned(), Value::Object(prompts));
+
+    let mut files = take_object_field(obj, "files", "manifest.files")?;
+    for name in ["prompts.jsonl", "records.jsonl", "tokens.bin", "tokens.idx"] {
+        files.insert(name.to_owned(), file_info(&root.join(name))?);
+    }
+    obj.insert("files".to_owned(), Value::Object(files));
+    Ok(manifest)
+}
+
+fn take_object_field(
+    parent: &mut Map<String, Value>,
+    field: &str,
+    context: &str,
+) -> Result<Map<String, Value>> {
+    match parent.remove(field) {
+        None | Some(Value::Null) => Ok(Map::new()),
+        Some(Value::Object(value)) => Ok(value),
+        Some(_) => anyhow::bail!("{context} must be a JSON object or null"),
+    }
+}
+
+fn split_summary_value(summary: TdataSplitSummary) -> Value {
+    json!({
+        "records": summary.records,
+        "usable": summary.usable,
+        "rejected": summary.rejected,
+        "tokens": summary.tokens,
+    })
+}
+
+fn file_info(path: &Path) -> Result<Value> {
+    let (bytes, sha256) = file_len_and_sha256(path)?;
+    Ok(json!({"bytes": bytes, "sha256": sha256}))
+}
+
+fn file_len_and_sha256(path: &Path) -> Result<(u64, String)> {
+    let mut file =
+        File::open(path).with_context(|| format!("opening {} for hash", path.display()))?;
+    let bytes = file
+        .metadata()
+        .with_context(|| format!("stat {} for hash", path.display()))?
+        .len();
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("reading {} for hash", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok((bytes, format!("{:x}", hasher.finalize())))
+}
+
+/// Verify size and SHA-256 entries emitted by the writer's finalized manifest.
+/// Empty file descriptors remain legal for compatibility with early v1 output;
+/// a descriptor becomes a verification promise only when it contains `bytes`
+/// or `sha256`.  Only standard root-level payloads are opened here, so an
+/// untrusted manifest cannot turn `verify` into an arbitrary-file reader.
+fn verify_manifest_file_hashes(root: &Path, manifest: &Value) -> Result<()> {
+    const V1_FILES: &[&str] = &[
+        "prompts.jsonl",
+        "records.jsonl",
+        "tokens.bin",
+        "tokens.idx",
+        "topk.bin",
+    ];
+    let Some(files) = manifest.as_object().and_then(|object| object.get("files")) else {
+        return Ok(());
+    };
+    let files = files
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("manifest.json.files must be a JSON object"))?;
+    for (name, descriptor) in files {
+        // Forward-compatible manifests may list future files.  This reader
+        // does not claim to validate those, and never follows their paths.
+        if !V1_FILES.contains(&name.as_str()) {
+            continue;
+        }
+        let descriptor = descriptor
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("manifest.json.files.{name:?} must be a JSON object"))?;
+        let expected_bytes = descriptor
+            .get("bytes")
+            .map(|value| json_u64(value, &format!("manifest.json.files.{name}.bytes")))
+            .transpose()?;
+        let expected_sha = match descriptor.get("sha256") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "manifest.json.files.{name}.sha256 must be a string or null"
+                        )
+                    })?
+                    .to_owned(),
+            ),
+        };
+        if expected_bytes.is_none() && expected_sha.is_none() {
+            continue;
+        }
+        let (actual_bytes, actual_sha) = file_len_and_sha256(&root.join(name))?;
+        if let Some(expected_bytes) = expected_bytes {
+            ensure!(
+                expected_bytes == actual_bytes,
+                "manifest.json.files.{name}.bytes={expected_bytes}, but {name} has {actual_bytes} bytes"
+            );
+        }
+        if let Some(expected_sha) = expected_sha {
+            ensure!(
+                expected_sha.eq_ignore_ascii_case(&actual_sha),
+                "manifest.json.files.{name}.sha256 does not match {name}"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn write_manifest_atomic(root: &Path, manifest: &Value) -> Result<()> {
+    let manifest_path = root.join("manifest.json");
+    let bytes = serde_json::to_vec_pretty(manifest).context("serializing manifest.json")?;
+    let temp_path = unique_manifest_temp_path(root)?;
+    let mut temp = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .with_context(|| format!("creating {}", temp_path.display()))?;
+    temp.write_all(&bytes)
+        .with_context(|| format!("writing {}", temp_path.display()))?;
+    temp.write_all(b"\n")
+        .with_context(|| format!("writing {}", temp_path.display()))?;
+    temp.sync_all()
+        .with_context(|| format!("syncing {}", temp_path.display()))?;
+    fs::rename(&temp_path, &manifest_path).with_context(|| {
+        format!(
+            "atomically replacing {} with {}",
+            manifest_path.display(),
+            temp_path.display()
+        )
+    })?;
+    sync_directory(root)
+}
+
+fn unique_manifest_temp_path(root: &Path) -> Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..128 {
+        let serial = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let path = root.join(format!(
+            ".manifest.json.{}.{}.tmp",
+            std::process::id(),
+            serial
+        ));
+        if !path.exists() {
+            return Ok(path);
+        }
+    }
+    anyhow::bail!(
+        "{}: cannot allocate a unique temporary manifest name",
+        root.display()
+    )
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(path)
+            .with_context(|| format!("opening directory {} for sync", path.display()))?
+            .sync_all()
+            .with_context(|| format!("syncing directory {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -962,6 +1933,16 @@ impl TdataStream {
                 );
             }
         }
+        let check_failed = record.quality.as_ref().is_some_and(quality_check_failed);
+        ensure!(
+            check_failed == index.flags.check_failed(),
+            "{context}: quality.check failure={check_failed} differs from index flag={}",
+            index.flags.check_failed()
+        );
+        ensure!(
+            !index.flags.check_failed() || !record.usable,
+            "{context}: index CHECK_FAILED is incompatible with usable=true"
+        );
         match record.topk {
             Some(topk) => {
                 ensure!(
@@ -1019,6 +2000,123 @@ impl TdataStream {
             .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("4-byte chunk")))
             .collect())
     }
+}
+
+/// Validate the JSON/index invariants shared by the streaming reader and the
+/// writer's resume scan.  `token_count=None` is used before resume has trimmed
+/// an uncommitted `tokens.bin` tail; all structural and append-only invariants
+/// are still checked in that pass.
+fn validate_record_index_pair(
+    record: &TdataRecord,
+    index: TdataTokenIndex,
+    line_no: u64,
+    expected_tok_offset: u64,
+    token_count: Option<u64>,
+) -> Result<()> {
+    let context = format!(
+        "records.jsonl line {line_no} / tokens.idx entry {}",
+        line_no - 1
+    );
+    ensure!(
+        record.tok.index == line_no - 1,
+        "{context}: tok.index={} but expected {}",
+        record.tok.index,
+        line_no - 1
+    );
+    ensure!(
+        record.tok.offset == index.tok_offset,
+        "{context}: JSON tok.offset={} differs from index {}",
+        record.tok.offset,
+        index.tok_offset
+    );
+    ensure!(
+        index.tok_offset == expected_tok_offset,
+        "{context}: tok_offset={} but append-only sequence expects {}",
+        index.tok_offset,
+        expected_tok_offset
+    );
+    ensure!(
+        record.tok.total == index.total
+            && record.tok.prompt == index.prompt
+            && record.tok.think == index.think
+            && record.tok.answer == index.answer,
+        "{context}: JSON tok counts differ from tokens.idx"
+    );
+    ensure!(
+        record.split == index.split,
+        "{context}: JSON split={} differs from index split={}",
+        record.split,
+        index.split
+    );
+    ensure!(
+        record.usable == index.flags.usable(),
+        "{context}: JSON usable={} differs from index usable={}",
+        record.usable,
+        index.flags.usable()
+    );
+    if let Some(quality) = &record.quality {
+        if let Some(truncated) = quality.truncated {
+            ensure!(
+                truncated == index.flags.truncated(),
+                "{context}: quality.truncated={truncated} differs from index flag={} ",
+                index.flags.truncated()
+            );
+        }
+        if let Some(loop_suspect) = quality.loop_suspect {
+            ensure!(
+                loop_suspect == index.flags.loop_suspect(),
+                "{context}: quality.loop_suspect={loop_suspect} differs from index flag={}",
+                index.flags.loop_suspect()
+            );
+        }
+    }
+    let check_failed = record.quality.as_ref().is_some_and(quality_check_failed);
+    ensure!(
+        check_failed == index.flags.check_failed(),
+        "{context}: quality.check failure={check_failed} differs from index flag={}",
+        index.flags.check_failed()
+    );
+    ensure!(
+        !index.flags.check_failed() || !record.usable,
+        "{context}: index CHECK_FAILED is incompatible with usable=true"
+    );
+    match record.topk {
+        Some(topk) => {
+            ensure!(
+                index.topk_offset != TdataTokenIndex::NO_TOPK,
+                "{context}: JSON topk exists but index has NO_TOPK"
+            );
+            ensure!(
+                topk.offset == index.topk_offset,
+                "{context}: JSON topk.offset={} differs from index {}",
+                topk.offset,
+                index.topk_offset
+            );
+            ensure!(
+                topk.positions as u64 == index.think as u64 + index.answer as u64,
+                "{context}: topk.positions={} but generated think + answer={}",
+                topk.positions,
+                index.think as u64 + index.answer as u64
+            );
+        }
+        None => ensure!(
+            index.topk_offset == TdataTokenIndex::NO_TOPK,
+            "{context}: index has topk_offset={} but JSON has no topk",
+            index.topk_offset
+        ),
+    }
+    if let Some(token_count) = token_count {
+        let end = index
+            .tok_offset
+            .checked_add(index.total as u64)
+            .ok_or_else(|| anyhow::anyhow!("{context}: token range overflows u64"))?;
+        ensure!(
+            end <= token_count,
+            "{context}: token range {}..{end} exceeds tokens.bin length {token_count}",
+            index.tok_offset
+        );
+    }
+    Ok(())
 }
 
 impl Iterator for TdataStream {
@@ -1235,7 +2333,7 @@ fn parse_quality(value: Option<&Value>, context: &str) -> Result<Option<TdataQua
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::io::Write;
+    use std::io::{Seek, Write};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -1472,13 +2570,180 @@ mod tests {
         .unwrap();
         fs::write(malformed.root.join("tokens.bin"), 1_u32.to_le_bytes()).unwrap();
         let reader = TdataReader::open(&malformed.root).unwrap();
+        assert!(reader
+            .stream(TdataSelector::parse(&malformed.root.display().to_string()).unwrap())
+            .unwrap()
+            .next()
+            .unwrap()
+            .is_err());
+    }
+
+    fn writer_record(rid: &str, split: &str, usable: bool, ids: &[u32]) -> TdataRecord {
+        let value = row(rid, split, usable, 91, 777, ids);
+        TdataRecord::from_json_line(&serde_json::to_string(&value).unwrap(), 1).unwrap()
+    }
+
+    #[test]
+    fn writer_round_trip_finalizes_reader_compatible_layout_and_hashes() {
+        let data = TempTdata::new("writer-roundtrip");
+        let mut writer = TdataWriter::create(
+            &data.root,
+            json!({"teacher": {"kind": "test"}, "created": "test"}),
+        )
+        .unwrap();
+        assert_eq!(writer.manifest()["complete"], Value::Bool(false));
+        writer
+            .append_prompt(&json!({"id": "first", "prompt": "hello"}))
+            .unwrap();
+        writer
+            .append_prompt(&json!({"id": "second", "prompt": "world"}))
+            .unwrap();
+        let first = writer
+            .append_record(
+                writer_record("first#0", "train", true, &[11, 12, 13]),
+                &[11, 12, 13],
+            )
+            .unwrap();
+        let mut rejected = writer_record("second#0", "val", false, &[21, 22]);
+        rejected.quality.as_mut().unwrap().raw_check = Some(json!({"pass": false}));
+        let second = writer.append_record(rejected, &[21, 22]).unwrap();
+        assert_eq!(first.record.tok.index, 0);
+        assert_eq!(first.record.tok.offset, 0);
+        assert_eq!(second.record.tok.index, 1);
+        assert_eq!(second.record.tok.offset, 3);
+        assert_eq!(first.index.tok_offset, 0);
+        assert_eq!(second.index.tok_offset, 3);
+        assert_eq!(writer.stats().records, 2);
+        assert_eq!(writer.stats().prompts, 2);
+        assert_eq!(writer.stats().rejected, 1);
+        assert!(second.index.flags.check_failed());
+        assert_eq!(writer.stats().rejected_check, 1);
+        let manifest = writer.finalize().unwrap();
+        assert!(manifest.complete);
+        assert_eq!(manifest.expected_records, Some(2));
+        assert_eq!(
+            fs::metadata(data.root.join("tokens.idx")).unwrap().len(),
+            2 * TDATA_INDEX_BYTES as u64
+        );
+
+        let reader = TdataReader::open(&data.root).unwrap();
+        reader.verify().unwrap();
+        let samples = reader
+            .stream(
+                TdataSelector::parse(&format!("{}:all", data.root.display()))
+                    .unwrap()
+                    .include_rejected(),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].tokens, vec![11, 12, 13]);
+        assert_eq!(samples[1].tokens, vec![21, 22]);
+        assert_eq!(reader.manifest.raw["files"]["tokens.bin"]["bytes"], 20);
+        assert!(reader.manifest.raw["files"]["tokens.bin"]["sha256"]
+            .as_str()
+            .is_some());
+
+        // Payload remains structurally readable after a one-byte token change,
+        // so this specifically proves that `verify` checks the finalized hash.
+        let mut tokens = OpenOptions::new()
+            .write(true)
+            .open(data.root.join("tokens.bin"))
+            .unwrap();
+        tokens.seek(SeekFrom::Start(0)).unwrap();
+        tokens.write_all(&[0xff]).unwrap();
+        tokens.sync_all().unwrap();
+        assert!(reader.verify().is_err());
+    }
+
+    #[test]
+    fn writer_resume_trims_only_uncommitted_tails_then_appends() {
+        let data = TempTdata::new("writer-resume");
+        let mut writer = TdataWriter::create(&data.root, json!({"seed": 7})).unwrap();
+        writer
+            .append_prompt(&json!({"id": "first", "prompt": "hello"}))
+            .unwrap();
+        writer
+            .append_record(writer_record("first#0", "train", true, &[1, 2]), &[1, 2])
+            .unwrap();
+        drop(writer);
+
+        // Simulate a process dying after it has appended binary payloads and
+        // started its JSONL commit marker.  `resume` must retain only first#0.
+        let mut prompts = OpenOptions::new()
+            .append(true)
+            .open(data.root.join("prompts.jsonl"))
+            .unwrap();
+        prompts.write_all(br#"{"id":"partial""#).unwrap();
+        prompts.sync_all().unwrap();
+        let mut tokens = OpenOptions::new()
+            .append(true)
+            .open(data.root.join("tokens.bin"))
+            .unwrap();
+        tokens.write_all(&99_u32.to_le_bytes()).unwrap();
+        tokens.sync_all().unwrap();
+        let mut index_file = OpenOptions::new()
+            .append(true)
+            .open(data.root.join("tokens.idx"))
+            .unwrap();
+        index_file
+            .write_all(&index(2, 1, TdataSplit::Train, true).to_le_bytes().unwrap())
+            .unwrap();
+        index_file.sync_all().unwrap();
+        let mut records = OpenOptions::new()
+            .append(true)
+            .open(data.root.join("records.jsonl"))
+            .unwrap();
+        records.write_all(br#"{"rid":"partial""#).unwrap();
+        records.sync_all().unwrap();
+
+        let mut writer = TdataWriter::resume(&data.root).unwrap();
+        assert_eq!(writer.stats().prompts, 1);
+        assert_eq!(writer.stats().records, 1);
+        assert_eq!(writer.stats().total_tokens, 2);
+        assert_eq!(fs::metadata(data.root.join("tokens.bin")).unwrap().len(), 8);
+        assert_eq!(
+            fs::metadata(data.root.join("tokens.idx")).unwrap().len(),
+            TDATA_INDEX_BYTES as u64
+        );
+        let recovered_records = fs::read_to_string(data.root.join("records.jsonl")).unwrap();
+        assert!(recovered_records.ends_with('\n'));
+        assert!(!recovered_records.contains("partial"));
+        let recovered_prompts = fs::read_to_string(data.root.join("prompts.jsonl")).unwrap();
+        assert!(recovered_prompts.ends_with('\n'));
+        assert!(!recovered_prompts.contains("partial"));
+        writer
+            .append_prompt(&json!({"id": "second", "prompt": "world"}))
+            .unwrap();
+        writer
+            .append_record(
+                writer_record("second#0", "test", true, &[3, 4, 5]),
+                &[3, 4, 5],
+            )
+            .unwrap();
+        writer.finalize().unwrap();
+
+        let reader = TdataReader::open(&data.root).unwrap();
+        reader.verify().unwrap();
+        assert_eq!(reader.inspect().unwrap().records, 2);
+    }
+
+    #[test]
+    fn writer_resume_rejects_a_committed_row_without_its_binary_payload() {
+        let data = TempTdata::new("writer-committed-corruption");
+        let writer = TdataWriter::create(&data.root, json!({})).unwrap();
+        drop(writer);
+        let row = row("lost#0", "train", true, 0, 0, &[1, 2]);
+        fs::write(
+            data.root.join("records.jsonl"),
+            format!("{}\n", serde_json::to_string(&row).unwrap()),
+        )
+        .unwrap();
+        let error = TdataWriter::resume(&data.root).expect_err("must reject committed corruption");
         assert!(
-            reader
-                .stream(TdataSelector::parse(&malformed.root.display().to_string()).unwrap())
-                .unwrap()
-                .next()
-                .unwrap()
-                .is_err()
+            error.to_string().contains("tokens.idx")
+                || error.to_string().contains("committed records")
         );
     }
 
