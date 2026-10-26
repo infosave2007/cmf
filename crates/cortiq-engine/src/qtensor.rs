@@ -2627,6 +2627,21 @@ impl QTensor {
                 // Runtime probe: the naive GEMM shader + sync readback
                 // lose to the CPU GEMM on slow driver stacks — alternate
                 // both arms and keep the winner.
+                {
+                    static DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if *DBG.get_or_init(|| std::env::var_os("CMF_GPUDBG").is_some())
+                        && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6
+                    {
+                        eprintln!(
+                            "D5dbg dtype={dtype:?} b={b} rows={rows} cols={cols} vol={} gate={} enabled={} mapped={}",
+                            b as u128 * rows as u128 * cols as u128,
+                            b >= 8 && b * rows * cols >= 128_000_000,
+                            crate::gpu::enabled_here(),
+                            matches!(self, Self::Mapped { .. }),
+                        );
+                    }
+                }
                 if b >= 8 && b * rows * cols >= 128_000_000 && crate::gpu::enabled_here() {
                     if let Self::Mapped { model, idx, .. } = self {
                         let t0 = std::time::Instant::now();
@@ -2638,6 +2653,13 @@ impl QTensor {
                                 // Cold weights during probing: the upload
                                 // has started, the count runs on the CPU —
                                 // the GPU arm samples on the next touch.
+                                {
+                                    static N: std::sync::atomic::AtomicU32 =
+                                        std::sync::atomic::AtomicU32::new(0);
+                                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                                        eprintln!("D5dbg arm=cold-weights(idx={idx}) -> cpu");
+                                    }
+                                }
                                 let q = self.quant_bytes();
                                 qmatmat(q, row_scale, &pre, rows, cols, out, pool);
                                 return;
@@ -2678,6 +2700,13 @@ impl QTensor {
                                 }
                             }
                             crate::gpu::ProbeArm::CpuTimed => {
+                                {
+                                    static N: std::sync::atomic::AtomicU32 =
+                                        std::sync::atomic::AtomicU32::new(0);
+                                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                                        eprintln!("D5dbg arm=cpu-timed -> cpu");
+                                    }
+                                }
                                 let q = self.quant_bytes();
                                 qmatmat(q, row_scale, &pre, rows, cols, out, pool);
                                 crate::gpu::probe_record(
@@ -2687,8 +2716,20 @@ impl QTensor {
                                 );
                                 return;
                             }
-                            crate::gpu::ProbeArm::Cpu => {}
+                            crate::gpu::ProbeArm::Cpu => {
+                                static N: std::sync::atomic::AtomicU32 =
+                                    std::sync::atomic::AtomicU32::new(0);
+                                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                                    eprintln!("D5dbg arm=cpu-decided -> cpu");
+                                }
+                            }
                         }
+                    }
+                }
+                {
+                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                        eprintln!("D5dbg gate-not-taken-or-nonmapped -> cpu");
                     }
                 }
                 let q = self.quant_bytes();
