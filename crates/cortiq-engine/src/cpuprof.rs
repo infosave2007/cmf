@@ -38,9 +38,25 @@ pub enum Slot {
     PrefillAttend,
     /// Activation quantization (split_act) inside the kernels.
     SplitAct,
+    /// One pool dispatch, entry to exit (caller thread).
+    DispTotal,
+    /// Pool dispatch bookkeeping: descriptor, tickets, unparks.
+    DispSetup,
+    /// The caller participant's share of the dispatched closure.
+    DispWork,
+    /// Barrier drain: waiting for the other participants.
+    DispWait,
+    /// Lane driver (gate+up): per-batch scale/ladder decode.
+    GuScales,
+    /// Lane driver (gate+up): the interleaved group-dot loop.
+    GuDots,
+    /// Lane driver (gate+up): outliers + silu + store.
+    GuPost,
+    /// The dense-FFN activation pass (Spark's exact-erf GELU combine).
+    FfnCombine,
 }
 
-const N: usize = 12;
+const N: usize = 20;
 const NAMES: [&str; N] = [
     "qkv",
     "attn_core",
@@ -54,10 +70,42 @@ const NAMES: [&str; N] = [
     "matmat(prefill)",
     "attend(prefill)",
     "split_act",
+    "disp(total)",
+    "disp(setup)",
+    "disp(work)",
+    "disp(wait)",
+    "ln.scales",
+    "ln.dots",
+    "ln.post",
+    "ffn_combine",
 ];
 
 static NS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 static CALLS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+
+/// Total elements marked as activation outliers by `split_act` (diagnostic
+/// for the per-row outlier-correction cost). Reset by [`reset`], printed by
+/// [`report`].
+static OUTLIERS: AtomicU64 = AtomicU64::new(0);
+/// Rows routed through a lane driver (diagnostic: is the lane path live?).
+static LANE_ROWS: AtomicU64 = AtomicU64::new(0);
+/// Rows routed through the plain per-row path (diagnostic).
+static PLAIN_ROWS: AtomicU64 = AtomicU64::new(0);
+
+/// Record `n` outliers found in one activation split.
+pub fn count_outliers(n: u64) {
+    OUTLIERS.fetch_add(n, Ordering::Relaxed);
+}
+
+/// Record `n` rows about to run through a lane-interleaved driver.
+pub fn count_lane_rows(n: u64) {
+    LANE_ROWS.fetch_add(n, Ordering::Relaxed);
+}
+
+/// Record `n` rows about to run through the plain per-row path.
+pub fn count_plain_rows(n: u64) {
+    PLAIN_ROWS.fetch_add(n, Ordering::Relaxed);
+}
 
 #[inline]
 pub fn on() -> bool {
@@ -93,6 +141,9 @@ pub fn reset() {
         NS[i].store(0, Ordering::Relaxed);
         CALLS[i].store(0, Ordering::Relaxed);
     }
+    OUTLIERS.store(0, Ordering::Relaxed);
+    LANE_ROWS.store(0, Ordering::Relaxed);
+    PLAIN_ROWS.store(0, Ordering::Relaxed);
 }
 
 /// Snapshot of (name, total ms, calls) for every slot that ran.
@@ -217,6 +268,23 @@ pub fn report(label: &str, tokens: usize) {
             "  {name:<16} {:>8.3} ms/tok  ({calls} calls, {:.1} us/call)",
             ms / t,
             ms * 1e3 / calls.max(1) as f64
+        );
+    }
+    let ol = OUTLIERS.load(Ordering::Relaxed);
+    if ol > 0 {
+        eprintln!(
+            "  outliers         {:>8.1} /split  ({} total)",
+            ol as f64 / t,
+            ol
+        );
+    }
+    let lr = LANE_ROWS.load(Ordering::Relaxed);
+    let pr = PLAIN_ROWS.load(Ordering::Relaxed);
+    if lr > 0 || pr > 0 {
+        eprintln!(
+            "  lane_rows        {:>8.1} /tok   plain_rows {:>8.1} /tok",
+            lr as f64 / t,
+            pr as f64 / t
         );
     }
 }
