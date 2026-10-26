@@ -50,6 +50,8 @@ mod zimagepack;
 mod qi21pack;
 mod sam3pack;
 mod sam3seg;
+mod tdata;
+mod teacher_data;
 
 use clap::{Parser, Subcommand};
 use cortiq_core::CmfModel;
@@ -2128,6 +2130,11 @@ enum Commands {
         #[command(subcommand)]
         cmd: SkillCmd,
     },
+    /// Work with finalized teacher-data (`.tdata`) directories
+    TeacherData {
+        #[command(subcommand)]
+        cmd: TeacherDataCmd,
+    },
     /// What the GPU backend can see: adapters, the one that would be
     /// chosen, and its limits. Answers "is the card visible at all?"
     /// without inferring it from a missing log line.
@@ -2997,6 +3004,76 @@ fn progress_reporter(what: &'static str) -> impl FnMut(f32) {
             println!();
         }
     }
+}
+
+#[derive(Subcommand)]
+enum TeacherDataCmd {
+    /// Generate a finalized v1 `.tdata` directory from JSONL prompts.
+    ///
+    /// This first text-only slice deliberately runs greedy direct-answer
+    /// generation (`--no-think` is required) and writes no top-k logits yet.
+    /// It keeps one model pipeline hot between records. `--disable-mtp` is
+    /// available for a reproducible plain-greedy control when a draft path is
+    /// slower or unsuitable for a long calibration job.
+    Generate {
+        /// Local CMF teacher model
+        teacher: String,
+        /// JSONL prompts (`prompt` or `messages`; `id`/`category` optional)
+        prompts: String,
+        /// New output directory, which must end in `.tdata`
+        output: String,
+        /// Maximum generated tokens per record (unless a prompt row overrides it)
+        #[arg(long, default_value_t = 8192)]
+        max_tokens: usize,
+        /// Responses per prompt (unless a prompt row overrides it)
+        #[arg(long, default_value_t = 1)]
+        samples: u32,
+        /// Base seed; each record derives a deterministic independent seed
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Optional seed for the category-stratified prompt split (defaults to --seed)
+        #[arg(long)]
+        split_seed: Option<u64>,
+        /// Train/validation/test ratio, e.g. 90/5/5
+        #[arg(long, default_value = "90/5/5")]
+        split: String,
+        /// Teacher distribution width. Only 0 is valid until raw generated logits are observable.
+        #[arg(long, default_value_t = 0)]
+        topk: u32,
+        /// Reserved for a future base-completion producer; the direct-answer
+        /// v1 path rejects it rather than guessing reasoning-token boundaries.
+        #[arg(long)]
+        raw: bool,
+        /// Required in this initial slice: preserves a single exact answer-token span
+        #[arg(long)]
+        no_think: bool,
+        /// Keep records that reached --max-tokens (they remain marked truncated)
+        #[arg(long)]
+        keep_truncated: bool,
+        /// Disable MTP/speculative draft decoding for this job. The trunk
+        /// remains on the selected GPU; this is a stable plain-greedy control,
+        /// not a CPU fallback.
+        #[arg(long)]
+        disable_mtp: bool,
+        /// Keep only the first N accepted, de-duplicated source prompts
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Inspect a finalized `.tdata` data set without loading its token payload
+    /// all at once.  The scan validates every record/index/token range.
+    Inspect {
+        /// Finalized `.tdata` directory
+        tdata: String,
+        /// Make an additional full integrity pass after computing the report.
+        /// The ordinary inspection scan already validates every row while it
+        /// counts it; this is useful when an explicit verify pass is required
+        /// by an automation policy.
+        #[arg(long)]
+        verify: bool,
+        /// Emit one stable JSON object to stdout.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -5346,6 +5423,46 @@ async fn main() -> anyhow::Result<()> {
                 skip_runtime_gate,
             ),
         },
+        Commands::TeacherData { cmd } => match cmd {
+            TeacherDataCmd::Generate {
+                teacher,
+                prompts,
+                output,
+                max_tokens,
+                samples,
+                seed,
+                split_seed,
+                split,
+                topk,
+                raw,
+                no_think,
+                keep_truncated,
+                disable_mtp,
+                limit,
+            } => cmd_teacher_data_generate(
+                &teacher,
+                &prompts,
+                &output,
+                TeacherDataGenerateOptions {
+                    max_tokens,
+                    samples,
+                    seed,
+                    split_seed: split_seed.unwrap_or(seed),
+                    split,
+                    topk,
+                    raw,
+                    no_think,
+                    keep_truncated,
+                    disable_mtp,
+                    limit,
+                },
+            ),
+            TeacherDataCmd::Inspect {
+                tdata,
+                verify,
+                json,
+            } => cmd_teacher_data_inspect(&tdata, verify, json),
+        },
         Commands::Gpu => {
             // `gpu_wgpu` is behind the `gpu` feature, and this arm called
             // into it unconditionally — so the CPU-only build the manifest
@@ -5435,6 +5552,519 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "gpu")]
     cortiq_engine::gpu_wgpu::shutdown();
     result
+}
+
+/// Inspect a finalized teacher-data directory through the bounded streaming
+/// reader.  The JSON shape deliberately contains only v1 fields owned by the
+/// reader rather than the producer's open-ended manifest metadata, so scripts
+/// have a stable contract even as producer provenance grows.
+fn cmd_teacher_data_inspect(tdata_path: &str, verify: bool, json: bool) -> anyhow::Result<()> {
+    let dataset = tdata::Dataset::open(tdata_path)?;
+    // `inspect` streams every record, its fixed-width index row and its own
+    // token payload in lockstep.  It is already an integrity check, while
+    // `--verify` intentionally provides a distinct, explicit second pass.
+    let summary = dataset.inspect()?;
+    if verify {
+        dataset.verify()?;
+    }
+
+    let split_json = |split: tdata::TdataSplitSummary| {
+        serde_json::json!({
+            "records": split.records,
+            "usable": split.usable,
+            "rejected": split.rejected,
+            "tokens": split.tokens,
+        })
+    };
+    let path = dataset.root().to_string_lossy().into_owned();
+    let report = serde_json::json!({
+        "schema": "cmf-tdata-inspect/v1",
+        "path": path,
+        "manifest": {
+            "format": dataset.manifest.format.as_str(),
+            "version": dataset.manifest.version,
+            "complete": dataset.manifest.complete,
+        },
+        "integrity": {
+            "stream_validated": true,
+            "extra_verify_pass": verify,
+        },
+        "records": {
+            "total": summary.records,
+            "usable": summary.usable,
+            "rejected": summary.rejected,
+        },
+        "tokens": summary.tokens,
+        "splits": {
+            "train": split_json(summary.train),
+            "val": split_json(summary.val),
+            "test": split_json(summary.test),
+        },
+    });
+
+    if json {
+        // One compact object makes the command safe in JSONL-style automation.
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        println!("schema: cmf-tdata-inspect/v1");
+        println!("path: {tdata_path}");
+        println!(
+            "manifest: {} v{} ({})",
+            dataset.manifest.format,
+            dataset.manifest.version,
+            if dataset.manifest.complete {
+                "complete"
+            } else {
+                "incomplete"
+            }
+        );
+        println!(
+            "records: total={} usable={} rejected={}",
+            summary.records, summary.usable, summary.rejected
+        );
+        println!("tokens: {}", summary.tokens);
+        for (name, split) in [
+            ("train", summary.train),
+            ("val", summary.val),
+            ("test", summary.test),
+        ] {
+            println!(
+                "split.{name}: records={} usable={} rejected={} tokens={}",
+                split.records, split.usable, split.rejected, split.tokens
+            );
+        }
+        println!(
+            "integrity: stream-validated{}",
+            if verify {
+                "; explicit verify pass complete"
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(())
+}
+
+/// Options kept together so the command dispatch remains readable and the
+/// generation implementation cannot accidentally pick up a CLI default that
+/// differs from the recorded manifest.
+#[derive(Debug)]
+struct TeacherDataGenerateOptions {
+    max_tokens: usize,
+    samples: u32,
+    seed: u64,
+    split_seed: u64,
+    split: String,
+    topk: u32,
+    raw: bool,
+    no_think: bool,
+    keep_truncated: bool,
+    disable_mtp: bool,
+    limit: Option<usize>,
+}
+
+/// Parse an integer train/validation/test ratio without a floating-point
+/// threshold.  The deterministic splitter owns rounding after this point.
+fn parse_teacher_data_split(value: &str) -> anyhow::Result<teacher_data::SplitRatios> {
+    let parts: Vec<&str> = value.split('/').collect();
+    if parts.len() != 3 || parts.iter().any(|part| part.is_empty()) {
+        anyhow::bail!(
+            "teacher-data generate: --split {value:?} must be train/val/test, for example 90/5/5"
+        );
+    }
+    let parse = |part: &str, name: &str| -> anyhow::Result<u32> {
+        part.parse::<u32>().map_err(|_| {
+            anyhow::anyhow!(
+                "teacher-data generate: --split {value:?}: {name} part {part:?} is not a non-negative integer"
+            )
+        })
+    };
+    teacher_data::SplitRatios::new(
+        parse(parts[0], "train")?,
+        parse(parts[1], "validation")?,
+        parse(parts[2], "test")?,
+    )
+}
+
+/// A `Read` adapter that records exactly the source bytes the JSONL parser
+/// consumes.  Keeping the digest outside the adapter lets the parser own and
+/// exhaust its buffered reader without a second source pass or a pathname
+/// race between a pre-hash and parse.
+struct HashingReader<'a, R> {
+    inner: R,
+    hasher: &'a mut sha2::Sha256,
+}
+
+impl<R: std::io::Read> std::io::Read for HashingReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        use sha2::Digest as _;
+
+        let count = self.inner.read(buffer)?;
+        self.hasher.update(&buffer[..count]);
+        Ok(count)
+    }
+}
+
+/// Parse and hash the prompt source in one forward pass without retaining a
+/// second complete copy in RAM.  The manifest digest therefore describes the
+/// actual byte stream given to the parser, even if a writer mutates the file
+/// in place while the command is running.
+fn parse_hashed_teacher_data_prompts(
+    path: &str,
+) -> anyhow::Result<(teacher_data::PromptLoad, String)> {
+    use sha2::{Digest, Sha256};
+
+    let file = std::fs::File::open(path)
+        .map_err(|err| anyhow::anyhow!("opening prompts {path:?}: {err}"))?;
+    let mut hasher = Sha256::new();
+    let loaded = teacher_data::parse_jsonl_prompts(
+        std::io::BufReader::new(HashingReader {
+            inner: file,
+            hasher: &mut hasher,
+        }),
+        teacher_data::PromptParseOptions::default(),
+    )
+    .map_err(|err| anyhow::anyhow!("parsing prompts {path:?}: {err}"))?;
+    Ok((loaded, format!("{:x}", hasher.finalize())))
+}
+
+/// Sampling configuration for the first teacher-data slice.  Greedy decode
+/// avoids a probability reconstruction pass and preserves the engine's MTP
+/// fast path when the selected CMF has it.
+fn teacher_data_greedy_sampler(seed: u64) -> SamplerConfig {
+    SamplerConfig {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+        repetition_penalty: 1.0,
+        min_p: 0.0,
+        presence_penalty: 0.0,
+        seed: Some(seed),
+        ..Default::default()
+    }
+}
+
+/// Generate a minimal but auditable `.tdata` v1 data set from JSONL prompts.
+///
+/// Deliberately absent in this first vertical slice: top-k logits, exact
+/// hidden-reasoning spans, and public resume orchestration.  Each absence is
+/// fail-closed rather than written as estimated data.  The hot `Pipeline`
+/// remains alive for the whole job; only the request state and deterministic
+/// sampler stream are reset between records.
+fn cmd_teacher_data_generate(
+    teacher_path: &str,
+    prompts_path: &str,
+    output_path: &str,
+    options: TeacherDataGenerateOptions,
+) -> anyhow::Result<()> {
+    teacher_data::require_topk_disabled(options.topk)?;
+    teacher_data::require_direct_response_mode(options.no_think)?;
+    if options.raw {
+        anyhow::bail!(
+            "teacher-data generate: --raw is not available in the direct-answer v1 path; \
+             it cannot prove an exact non-thinking response boundary without a carried chat template"
+        );
+    }
+    if options.max_tokens == 0 {
+        anyhow::bail!("teacher-data generate: --max-tokens must be positive");
+    }
+    if options.samples == 0 {
+        anyhow::bail!("teacher-data generate: --samples must be positive");
+    }
+    if !output_path.ends_with(".tdata") {
+        anyhow::bail!(
+            "teacher-data generate: output {output_path:?} must end in .tdata to make the immutable dataset boundary explicit"
+        );
+    }
+    if std::path::Path::new(output_path).exists() {
+        anyhow::bail!(
+            "teacher-data generate: output {output_path:?} already exists; this initial command intentionally has no --resume, so choose a new .tdata directory"
+        );
+    }
+    let ratios = parse_teacher_data_split(&options.split)?;
+
+    // Hash while parsing through one descriptor.  This is bounded by a JSONL
+    // row, not a duplicate source-byte buffer, and the manifest digest names
+    // the exact stream that supplied the accepted prompts.
+    let (mut loaded, prompt_sha256) = parse_hashed_teacher_data_prompts(prompts_path)?;
+    let accepted_before_limit = loaded.accepted();
+    if let Some(limit) = options.limit {
+        loaded.prompts.truncate(limit);
+    }
+    if loaded.prompts.is_empty() {
+        anyhow::bail!(
+            "teacher-data generate: no accepted prompts remain after validation{}",
+            options
+                .limit
+                .map(|limit| format!(" and --limit {limit}"))
+                .unwrap_or_default()
+        );
+    }
+    let splits =
+        teacher_data::assign_stratified_splits(&loaded.prompts, ratios, options.split_seed)?;
+    debug_assert_eq!(splits.len(), loaded.prompts.len());
+
+    // The append-only writer cannot safely recover a prompt ledger row that
+    // exceeds its bounded JSONL reader.  Validate every row before opening a
+    // model or creating an incomplete output directory.
+    for (prompt, &split) in loaded.prompts.iter().zip(&splits) {
+        let ledger = teacher_data::canonical_prompt_json(prompt, split);
+        tdata::serialize_prompt_jsonl_row(&ledger)?;
+    }
+
+    let planned_records = loaded.prompts.iter().try_fold(0_u64, |total, prompt| {
+        total
+            .checked_add(u64::from(prompt.samples.unwrap_or(options.samples)))
+            .ok_or_else(|| {
+                anyhow::anyhow!("teacher-data generate: planned record count overflows u64")
+            })
+    })?;
+
+    // Do every failure-prone configuration step before creating an incomplete
+    // output directory.  It is important that the one pipeline owns all
+    // records: recreating it would repeatedly compile Metal graphs/upload
+    // state and make the benchmark unnecessarily slow.
+    let model = Arc::new(CmfModel::open_sharded(teacher_path)?);
+    // `open_sharded` joins sibling tensor directories, but opening alone does
+    // not rehash every payload.  A teacher-data manifest must not claim that
+    // an unchecked sharded (or partially modified) teacher produced its
+    // answers: validate all CMF tensor bytes once before any output exists.
+    let integrity_problems = model.verify();
+    if !integrity_problems.is_empty() {
+        let preview = integrity_problems
+            .iter()
+            .take(3)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!(
+            "teacher-data generate: CMF integrity verification failed for {teacher_path:?} ({} problem(s)): {preview}",
+            integrity_problems.len()
+        );
+    }
+    // This fingerprint is calculated from the merged directory (including
+    // sibling shards) after the all-tensor verification above.  `dir_hash`
+    // remains useful for legacy/base identity, but is only the primary shard.
+    let teacher_trunk_hash = model.trunk_hash();
+    let mut pipeline = Pipeline::from_model(&model, teacher_data_greedy_sampler(options.seed))?;
+    if options.disable_mtp {
+        // MTP is an optional speculative accelerator, not part of the
+        // generated-token contract. This keeps the trunk on the selected GPU
+        // while making a long calibration job plain greedy by request.
+        pipeline.speculative = false;
+    }
+    let speculative_mtp = pipeline.speculative;
+    pipeline.set_confidence(false);
+
+    // A carried template is the only current mechanism for requesting
+    // `enable_thinking=false`.  Base completion text could contain a model's
+    // invisible reasoning convention, and treating every generated id as an
+    // answer would silently corrupt answer-only losses.
+    let template = pipeline.tokenizer.chat_template.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "teacher-data generate: teacher has no carried chat template; the direct-answer v1 path refuses raw/base completion until it can record exact reasoning boundaries"
+        )
+    })?;
+    let rendered_prompts = loaded
+        .prompts
+        .iter()
+        .map(|prompt| teacher_data::render_prompt(&pipeline.tokenizer, prompt, false, true))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let tokenizer_vocab = model.vocab.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "teacher-data generate: teacher has no embedded tokenizer bytes; refusing to write a token dataset without a reproducible tokenizer contract"
+        )
+    })?;
+    let tokenizer_config_bytes = serde_json::to_vec(&model.header.tokenizer_config)
+        .map_err(|err| anyhow::anyhow!("serializing teacher tokenizer configuration: {err}"))?;
+
+    let source_name = std::path::Path::new(prompts_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("prompts.jsonl")
+        .to_owned();
+    let teacher_name = std::path::Path::new(teacher_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("teacher.cmf")
+        .to_owned();
+    let template_sha256 = knowledge::sha256_hex(template.as_bytes());
+    let manifest = serde_json::json!({
+        "format": "cmf-tdata",
+        "version": 1,
+        "complete": false,
+        "cortiq": {"version": env!("CARGO_PKG_VERSION")},
+        "teacher": {
+            "kind": "cmf",
+            "file": teacher_name,
+            "directory_hash": format!("{:016x}", model.dir_hash()),
+            "trunk_hash": format!("{:016x}", teacher_trunk_hash),
+            "integrity": "verified-all-cmf-tensors-v1",
+            "architecture": model.arch().arch_name.clone(),
+            "quantization": format!("{:?}", model.header.quant_type),
+        },
+        "tokenizer": {
+            "vocab_size": pipeline.tokenizer.vocab_size(),
+            "eos_id": pipeline.tokenizer.eos_token_id,
+            "vocab_sha256": knowledge::sha256_hex(tokenizer_vocab),
+            "config_sha256": knowledge::sha256_hex(&tokenizer_config_bytes),
+            "template_sha256": template_sha256,
+        },
+        "template": {
+            "mode": "carried",
+            "thinking": "off",
+        },
+        "sampling": {
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": 0,
+            "min_p": 0.0,
+            "repetition_penalty": 1.0,
+            "presence_penalty": 0.0,
+        },
+        "seed": options.seed,
+        "max_tokens": options.max_tokens,
+        "topk": {"k": 0, "positions": "none"},
+        "prompts": {
+            "source": source_name,
+            "sha256": prompt_sha256,
+            "source_lines": loaded.source_lines,
+            "duplicates": loaded.duplicates,
+            "skipped_short": loaded.skipped_short,
+            "accepted_before_limit": accepted_before_limit,
+            "count": loaded.accepted(),
+        },
+        "split": {
+            "rule": "stratified-hash",
+            "rule_version": 1,
+            "seed": options.split_seed,
+            "ratios": [ratios.train, ratios.val, ratios.test],
+        },
+        "generation": {
+            "mode": "direct-answer",
+            "samples": options.samples,
+            "keep_truncated": options.keep_truncated,
+            "speculative_mtp": if speculative_mtp { "enabled" } else { "disabled" },
+            "mtp_control": if options.disable_mtp { "disabled-by-cli" } else { "engine-default" },
+            "topk": "disabled-until-raw-logit-capture",
+            "resume": "not-exposed-in-v1-generator",
+        },
+        "input": {
+            "format": "jsonl-v1",
+            "minimum_visible_prompt_chars": teacher_data::DEFAULT_MIN_PROMPT_CHARS,
+            "limit": options.limit,
+        },
+    });
+    let mut writer = tdata::TdataWriter::create(output_path, manifest)?;
+    for (prompt, &split) in loaded.prompts.iter().zip(&splits) {
+        writer.append_prompt(&teacher_data::canonical_prompt_json(prompt, split))?;
+    }
+
+    eprintln!(
+        "teacher-data: {} accepted prompts → {planned_records} record(s); teacher={} ({}, {:?}); one hot pipeline; MTP={}",
+        loaded.accepted(),
+        teacher_name,
+        model.arch().arch_name,
+        model.header.quant_type,
+        if speculative_mtp { "on" } else { "off" },
+    );
+    let job_started = std::time::Instant::now();
+    let mut generated_tokens = 0_u64;
+    let mut record_number = 0_u64;
+    for ((prompt, &split), rendered) in loaded.prompts.iter().zip(&splits).zip(&rendered_prompts) {
+        // Rendering was preflighted before creating output.  It neither
+        // depends on the seed nor mutates KV, and the immutable ids are
+        // reused for each sample exactly as they will be written to tokens.bin.
+        let per_samples = prompt.samples.unwrap_or(options.samples);
+        let per_max_tokens = prompt.max_tokens.unwrap_or(options.max_tokens);
+        for sample in 0..per_samples {
+            let record_seed = teacher_data::record_seed(options.seed, &prompt.id, sample);
+            pipeline.reset_session();
+            pipeline.set_sampler_config(teacher_data_greedy_sampler(record_seed));
+            let started = std::time::Instant::now();
+            let result = pipeline
+                .generate_from_ids(&rendered.token_ids, per_max_tokens, None, None)
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "teacher-data generate: prompt {} (source line {}, sample {}): {err}",
+                        prompt.id,
+                        prompt.source_line,
+                        sample,
+                    )
+                })?;
+            if result.tokens_generated != result.token_ids.len() {
+                anyhow::bail!(
+                    "teacher-data generate: prompt {} sample {}: engine returned tokens_generated={} but {} token ids; refusing non-exact calibration payload",
+                    prompt.id,
+                    sample,
+                    result.tokens_generated,
+                    result.token_ids.len(),
+                );
+            }
+            let (finish, quality) = teacher_data::final_record_quality(
+                &result.finish_reason,
+                &result.text,
+                &result.token_ids,
+                options.keep_truncated,
+            );
+            let response =
+                teacher_data::ResponseParts::direct(result.text, result.token_ids.len())?;
+            let prepared =
+                teacher_data::build_canonical_record(teacher_data::CanonicalRecordInput {
+                    prompt,
+                    split,
+                    sample,
+                    seed: record_seed,
+                    rendered,
+                    generated_token_ids: &result.token_ids,
+                    response,
+                    finish: &finish,
+                    quality,
+                })?;
+            let usable = prepared.record.usable;
+            let elapsed = started.elapsed().as_secs_f64();
+            let answer_tokens = result.token_ids.len() as u64;
+            let mtp_drafted = result.mtp_drafted;
+            let mtp_accepted = result.mtp_accepted;
+            writer.append_record(prepared.record, &prepared.tokens)?;
+            record_number += 1;
+            generated_tokens = generated_tokens.checked_add(answer_tokens).ok_or_else(|| {
+                anyhow::anyhow!("teacher-data generate: generated token counter overflows u64")
+            })?;
+            eprintln!(
+                "teacher-data: [{record_number}/{planned_records}] {}#{} split={} finish={} usable={} answer={} tok {:.2} tok/s{}",
+                prompt.id,
+                sample,
+                split.as_str(),
+                finish,
+                usable,
+                answer_tokens,
+                answer_tokens as f64 / elapsed.max(f64::MIN_POSITIVE),
+                if mtp_drafted > 0 {
+                    format!(" · MTP {mtp_accepted}/{mtp_drafted}")
+                } else {
+                    String::new()
+                },
+            );
+        }
+    }
+    let stats = writer.stats();
+    let manifest = writer.finalize()?;
+    let elapsed = job_started.elapsed().as_secs_f64();
+    println!(
+        "teacher-data: finalized {}: records={} usable={} rejected={} answer_tokens={} overall={:.2} tok/s",
+        output_path,
+        stats.records,
+        stats.usable,
+        stats.rejected,
+        generated_tokens,
+        generated_tokens as f64 / elapsed.max(f64::MIN_POSITIVE),
+    );
+    println!(
+        "teacher-data: manifest {} v{} complete={}",
+        manifest.format, manifest.version, manifest.complete
+    );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10843,5 +11473,83 @@ mod tests {
             bench_generation_prefill_path(false, true, 2048, None, Some(128), true),
             None
         );
+    }
+
+    #[test]
+    fn teacher_data_cli_split_and_greedy_contract_are_strict() {
+        assert_eq!(
+            parse_teacher_data_split("90/5/5").unwrap(),
+            teacher_data::SplitRatios::new(90, 5, 5).unwrap()
+        );
+        assert_eq!(
+            parse_teacher_data_split("0/50/50").unwrap(),
+            teacher_data::SplitRatios::new(0, 50, 50).unwrap()
+        );
+        for invalid in ["90/10", "90//10", "x/5/5", "0/0/0", "90/5/5/0"] {
+            assert!(
+                parse_teacher_data_split(invalid).is_err(),
+                "invalid split {invalid:?} must be rejected"
+            );
+        }
+
+        let config = teacher_data_greedy_sampler(0xCAFE_BABE);
+        assert_eq!(config.temperature, 0.0);
+        assert_eq!(config.top_p, 1.0);
+        assert_eq!(config.top_k, 0);
+        assert_eq!(config.min_p, 0.0);
+        assert_eq!(config.repetition_penalty, 1.0);
+        assert_eq!(config.presence_penalty, 0.0);
+        assert_eq!(config.seed, Some(0xCAFE_BABE));
+    }
+
+    #[test]
+    fn teacher_data_disable_mtp_is_an_explicit_cli_opt_in() {
+        // The complete CLI tree needs the main thread's larger stack in a
+        // debug test binary; parse the actual public spelling rather than
+        // duplicating its default in a helper.
+        let cli = std::thread::Builder::new()
+            .name("teacher-data-disable-mtp-parser".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                Cli::try_parse_from([
+                    "cortiq",
+                    "teacher-data",
+                    "generate",
+                    "teacher.cmf",
+                    "prompts.jsonl",
+                    "out.tdata",
+                    "--no-think",
+                    "--disable-mtp",
+                ])
+                .unwrap()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        match cli.command {
+            Commands::TeacherData {
+                cmd: TeacherDataCmd::Generate { disable_mtp, .. },
+            } => assert!(disable_mtp),
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn teacher_data_prompt_hashing_tracks_the_stream_given_to_the_parser() {
+        let path = std::env::temp_dir().join(format!(
+            "cmf-teacher-data-prompts-{}-{}.jsonl",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let bytes = b"{\"prompt\":\"first prompt\"}\n{\"prompt\":\"second prompt\"}\n";
+        std::fs::write(&path, bytes).unwrap();
+
+        let (loaded, digest) = parse_hashed_teacher_data_prompts(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(digest, knowledge::sha256_hex(bytes));
+        assert_eq!(loaded.accepted(), 2);
+        assert_eq!(loaded.prompts[0].id, teacher_data::derived_prompt_id("first prompt"));
+        assert_eq!(loaded.prompts[1].id, teacher_data::derived_prompt_id("second prompt"));
     }
 }
