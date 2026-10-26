@@ -17,31 +17,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::tdata::{TdataReader, TdataSplitSelector};
+use crate::tube::paths_collide;
 
 /// The physical codecs used by CMF dense FFNs have 32-wide groups.  Keeping
 /// the draft plan on that boundary prevents a supposedly compact q4tp/q8_2f
 /// MTP matrix from falling back to a less suitable layout in the writer.
 const MTP_COMPACT_ALIGNMENT: usize = 32;
-
-/// A collision key for an existing source or a not-yet-created output.  A
-/// lexical comparison is insufficient here: `model.cmf` and
-/// `./model.cmf` would otherwise let an operator overwrite the source during
-/// a physical rewrite.  The parent is canonicalized when the leaf does not
-/// exist yet, which covers the normal output case without creating anything.
-fn collision_key(path: &Path) -> PathBuf {
-    if let Ok(full) = std::fs::canonicalize(path) {
-        return full;
-    }
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    match (std::fs::canonicalize(parent), path.file_name()) {
-        (Ok(parent), Some(name)) => parent.join(name),
-        _ => path.to_path_buf(),
-    }
-}
-
-fn same_path(a: &Path, b: &Path) -> bool {
-    collision_key(a) == collision_key(b)
-}
 
 /// Keep the backbone and independently stored draft provenance separate.
 /// MiMo puts its draft in a sidecar, so recording only the main directory
@@ -304,7 +285,7 @@ pub fn cmd_mtp_compact(
     max_records: usize,
 ) -> Result<()> {
     ensure!(
-        !same_path(Path::new(output), Path::new(model_path)),
+        !paths_collide(Path::new(output), Path::new(model_path)),
         "MTP compact: --output must differ from the source model"
     );
     let main = Arc::new(
@@ -324,11 +305,11 @@ pub fn cmd_mtp_compact(
     );
     let (draft_path, draft) = draft_source(&main, model_path)?;
     ensure!(
-        !same_path(Path::new(output), &draft_path),
+        !paths_collide(Path::new(output), &draft_path),
         "MTP compact: --output must differ from the source draft {}",
         draft_path.display()
     );
-    if !same_path(Path::new(model_path), &draft_path) {
+    if !paths_collide(Path::new(model_path), &draft_path) {
         let integrity = draft.verify();
         ensure!(
             integrity.is_empty(),
@@ -353,7 +334,7 @@ pub fn cmd_mtp_compact(
 
     let mut pipeline = Pipeline::from_model(&main, SamplerConfig::default())
         .map_err(|error| anyhow::anyhow!("MTP compact: loading pipeline: {error}"))?;
-    if !same_path(Path::new(model_path), &draft_path) {
+    if !paths_collide(Path::new(model_path), &draft_path) {
         ensure!(
             pipeline.mimo_mtp.is_some(),
             "MTP compact: an external .mtp.cmf sidecar is supported only for the MiMo draft executor; the main model did not load it (check CMF_MIMO_MTP)"
@@ -433,7 +414,8 @@ pub fn cmd_mtp_compact(
 
     let mut selection = json!({
         "kind": "draft-activation-weighted-down-column-energy-v1",
-        "formula": "sum_teacher_forced((silu(gate)*up)^2) * down_proj_column_l2_squared",
+        "formula": "sum_teacher_forced((activation(gate, up))^2) * down_proj_column_l2_squared",
+        "activation_contract": draft.arch().hidden_act,
         "keep_ratio": keep_ratio,
         "alignment": MTP_COMPACT_ALIGNMENT,
         "calibration_records": records,
@@ -457,9 +439,9 @@ pub fn cmd_mtp_compact(
     let default_plan = format!("{output}.mtp-plan.json");
     let plan_path = plan_out.unwrap_or(&default_plan);
     ensure!(
-        !same_path(Path::new(plan_path), Path::new(model_path))
-            && !same_path(Path::new(plan_path), &draft_path)
-            && !same_path(Path::new(plan_path), Path::new(output)),
+        !paths_collide(Path::new(plan_path), Path::new(model_path))
+            && !paths_collide(Path::new(plan_path), &draft_path)
+            && !paths_collide(Path::new(plan_path), Path::new(output)),
         "MTP compact: --plan-out must differ from source and output CMFs"
     );
     std::fs::write(plan_path, serde_json::to_vec_pretty(&plan)?)
@@ -486,7 +468,7 @@ pub fn cmd_mtp_compact(
 #[cfg(test)]
 mod tests {
     use super::{
-        accumulate_probe, aligned_keep, rank_channel_scores, same_path, source_hash_fields,
+        accumulate_probe, aligned_keep, paths_collide, rank_channel_scores, source_hash_fields,
         validate_probe,
     };
     use cortiq_engine::MtpFfnProbe;
@@ -568,7 +550,7 @@ mod tests {
         let source = temp.path().join("draft.cmf");
         fs::write(&source, b"cmf").unwrap();
         let alias = temp.path().join(".").join("draft.cmf");
-        assert!(same_path(&source, &alias));
-        assert!(!same_path(&source, &temp.path().join("new-output.cmf")));
+        assert!(paths_collide(&source, &alias));
+        assert!(!paths_collide(&source, &temp.path().join("new-output.cmf")));
     }
 }
