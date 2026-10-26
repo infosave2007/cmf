@@ -18,36 +18,46 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # Package before publishing: this catches a non-registry dependency or
-      # an omitted manifest file before a partial crates.io release.  The
-      # Phonon bridge is intentionally included because cortiq-cli enables it
-      # by default in this release.
-      - name: Package release crates (including Phonon bridge)
-        run: |
-          cargo package --locked --no-verify -p cortiq-engine
-          cargo package --locked --no-verify -p cortiq-cli
-      # ORDER IS THE DEPENDENCY ORDER, and `cortiq-net` was missing from
-      # it. It sits between the engine and the server — both the server
-      # and the cli depend on it — so every run since it was introduced
-      # died at `cortiq-server` with "no matching package named
-      # cortiq-net", and the registry sat at 0.5.65 through three
-      # releases while the tags kept moving. Nothing said so: the loop
-      # exits non-zero, but a manual workflow nobody re-reads is a
-      # silent failure.
-      # `cortiq-decision` (0.7.8) depends on core and engine, and the
-      # server and cli depend on it, so it goes right after the engine —
-      # otherwise `cargo install cortiq-cli` has nothing to resolve.
+      # Publish each crate in dependency order. `cargo publish` packages the
+      # crate before upload, so a separate workspace-wide `cargo package`
+      # preflight is invalid for a new version: dependent crates would be
+      # resolved against crates.io before their newly-versioned dependencies
+      # have been published. The bounded retry is only for that registry-index
+      # propagation window; all other errors stop the workflow immediately.
       - name: Publish (core → engine → decision → net → server → cli → ffi)
+        shell: bash
         run: |
-          set -e
-          for c in cortiq-core cortiq-engine cortiq-decision cortiq-net cortiq-server cortiq-cli cortiq-ffi; do
-            echo "── publishing $c ──"
-            if cargo publish --locked -p "$c" 2>err.log; then
-              echo "$c published"
-            elif grep -qiE "already (exists|uploaded)|crate version .* is already" err.log; then
-              echo "$c: version already on crates.io — skipping"
-            else
-              cat err.log
-              exit 1
-            fi
+          set -euo pipefail
+          crates=(cortiq-core cortiq-engine cortiq-decision cortiq-net cortiq-server cortiq-cli cortiq-ffi)
+
+          publish_crate() {
+            local crate="$1"
+            local attempt err_log
+            err_log="$(mktemp)"
+            for attempt in $(seq 1 20); do
+              echo "── publishing $crate (attempt $attempt/20) ──"
+              if cargo publish --locked -p "$crate" 2>"$err_log"; then
+                rm -f "$err_log"
+                echo "$crate published"
+                return 0
+              elif grep -qiE "already (exists|uploaded)|crate version .* is already" "$err_log"; then
+                rm -f "$err_log"
+                echo "$crate: version already on crates.io — skipping"
+                return 0
+              elif grep -qiE "no matching package named|failed to select a version for requirement" "$err_log" && [[ "$attempt" -lt 20 ]]; then
+                cat "$err_log"
+                echo "Waiting for preceding crate metadata to reach crates.io…"
+                sleep 15
+              else
+                cat "$err_log"
+                rm -f "$err_log"
+                return 1
+              fi
+            done
+            rm -f "$err_log"
+            return 1
+          }
+
+          for crate in "${crates[@]}"; do
+            publish_crate "$crate"
           done
