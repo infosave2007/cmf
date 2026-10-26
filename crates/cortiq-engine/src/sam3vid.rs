@@ -342,13 +342,16 @@ impl Sam3Video {
         attn: &[u8],
         frame_size: (usize, usize),
     ) -> Result<FrameOut> {
+        let _prof = crate::cpuprof::spans::dump_on_drop(format!("video frame {frame_idx}"));
         let t0 = Instant::now();
         // ── 1. detector ────────────────────────────────────────────
         let t_fwd = Instant::now();
         let out = self.sam.forward(pixels, ids, attn)?;
         let mut det_ms = t_fwd.elapsed().as_secs_f64() * 1e3;
         let t_det = Instant::now();
+        let _pd = crate::cpuprof::spans::span("vid.detect");
         let dets = self.detect(&out)?;
+        drop(_pd);
         det_ms += t_det.elapsed().as_secs_f64() * 1e3;
         let presence = sigm(out.presence_logit);
 
@@ -356,19 +359,24 @@ impl Sam3Video {
         let t_trk = Instant::now();
 
         // ── 2. tracker features for this frame ─────────────────────
-        let feats = net.feats(&out.trunk_feats)?;
+        let feats = {
+            let _p = crate::cpuprof::spans::span("vid.feats");
+            net.feats(&out.trunk_feats)?
+        };
 
         // ── 3. propagate the existing objects ──────────────────────
         let pre_ids = s.obj_ids.clone();
         let mut trk_masks: Vec<Vec<f32>> = Vec::new();
         let mut trk_scores: Vec<f32> = Vec::new();
         if !pre_ids.is_empty() {
+            let _pp = crate::cpuprof::spans::span("vid.propagate");
             for &id in &pre_ids {
                 let (o, _high) = self.propagate(&net, s, id, frame_idx, &feats)?;
                 trk_scores.push(o.obj_score);
                 trk_masks.push(o.pred_masks.clone());
                 self.store(s, id, frame_idx, false, o);
             }
+            drop(_pp);
             // Propagation deliberately does NOT encode memory here. The HF
             // pipeline defers it until planning has applied its constraints;
             // `plan` below owns that encode (and execution may replace it when
@@ -381,10 +389,14 @@ impl Sam3Video {
         }
 
         // ── 4. planning phase ─────────────────────────────────────
-        let plan = self.plan(&net, s, frame_idx, &dets, &trk_masks, &feats)?;
+        let plan = {
+            let _p = crate::cpuprof::spans::span("vid.plan");
+            self.plan(&net, s, frame_idx, &dets, &trk_masks, &feats)?
+        };
 
         // ── 5. execution phase: new objects become conditioning ───
         if !plan.new_inds.is_empty() {
+            let _pe = crate::cpuprof::spans::span("vid.execute");
             let mut pending: Vec<(i64, ObjOut, Vec<f32>)> = Vec::new();
             for (k, &di) in plan.new_inds.iter().enumerate() {
                 let id = plan.new_ids[k];
@@ -412,10 +424,14 @@ impl Sam3Video {
             }
             let any_mask_input = !pending.is_empty();
             self.encode_into(&net, s, frame_idx, pending, &feats.l2, IMG, IMG, any_mask_input)?;
+            drop(_pe);
         }
 
         // ── 6. outputs ────────────────────────────────────────────
-        let tracks = self.build_outputs(s, frame_idx, &pre_ids, &dets, &plan, frame_size)?;
+        let tracks = {
+            let _p = crate::cpuprof::spans::span("vid.outputs");
+            self.build_outputs(s, frame_idx, &pre_ids, &dets, &plan, frame_size)?
+        };
         let trk_ms = t_trk.elapsed().as_secs_f64() * 1e3;
 
         for id in &plan.removed {
@@ -527,7 +543,10 @@ impl Sam3Video {
         // memory attention reads the neck's sine PE, the mask decoder the
         // prompt encoder's Gaussian PE
         let neck_pos = Net::neck_pos();
-        let pix = self.memory_cond(net, &pix, &neck_pos, &memories, &pointers, max_ptr)?;
+        let pix = {
+            let _p = crate::cpuprof::spans::span("vid.mem_cond");
+            self.memory_cond(net, &pix, &neck_pos, &memories, &pointers, max_ptr)?
+        };
         let pos = net.image_pos()?;
 
         let dense_p = net.no_mask_prompt()?;
@@ -546,14 +565,17 @@ impl Sam3Video {
                 mx
             );
         }
-        let (masks, iou, obj_score, tokens) = net.mask_decoder(
-            &sam3::rows_to_chw(&pix, EMB, EMB),
-            &pos,
-            &dense_p,
-            &sparse,
-            (&feats.l0, &feats.l1),
-            self.cfg.multimask,
-        )?;
+        let (masks, iou, obj_score, tokens) = {
+            let _p = crate::cpuprof::spans::span("vid.dec");
+            net.mask_decoder(
+                &sam3::rows_to_chw(&pix, EMB, EMB),
+                &pos,
+                &dense_p,
+                &sparse,
+                (&feats.l0, &feats.l1),
+                self.cfg.multimask,
+            )?
+        };
         let n_masks = masks.len() / (MASK_SIDE * MASK_SIDE);
         let best = argmax(&iou).min(n_masks.saturating_sub(1));
         if dbg {
@@ -585,7 +607,10 @@ impl Sam3Video {
             let pos = low.iter().filter(|&&v| v > 0.0).count();
             eprintln!("[vid] f{frame_idx} obj{id}: propagate mask pos={pos}/{}", low.len());
         }
-        let high = resize2d(&low, MASK_SIDE, MASK_SIDE, IMG, IMG);
+        let high = {
+            let _p = crate::cpuprof::spans::span("vid.resize");
+            resize2d(&low, MASK_SIDE, MASK_SIDE, IMG, IMG)
+        };
         let pointer = self.object_pointer(net, tok, appearing)?;
         Ok((
             ObjOut { pred_masks: low, obj_score, pointer, mem_feat: None, mem_pos: None },
@@ -1094,6 +1119,7 @@ impl Sam3Video {
         if pending.is_empty() {
             return Ok(());
         }
+        let _p = crate::cpuprof::spans::span("vid.encode");
         for (id, o, high) in pending {
             let (mf, mp) = self.encode_memory(net, pix, &high, h, w, o.obj_score, from_pts)?;
             let st = s.objs.entry(id).or_default();
