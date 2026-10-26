@@ -50,6 +50,7 @@ mod zimagepack;
 mod qi21pack;
 mod sam3pack;
 mod sam3seg;
+mod tdata;
 
 use clap::{Parser, Subcommand};
 use cortiq_core::CmfModel;
@@ -2128,6 +2129,11 @@ enum Commands {
         #[command(subcommand)]
         cmd: SkillCmd,
     },
+    /// Work with finalized teacher-data (`.tdata`) directories
+    TeacherData {
+        #[command(subcommand)]
+        cmd: TeacherDataCmd,
+    },
     /// What the GPU backend can see: adapters, the one that would be
     /// chosen, and its limits. Answers "is the card visible at all?"
     /// without inferring it from a missing log line.
@@ -2997,6 +3003,25 @@ fn progress_reporter(what: &'static str) -> impl FnMut(f32) {
             println!();
         }
     }
+}
+
+#[derive(Subcommand)]
+enum TeacherDataCmd {
+    /// Inspect a finalized `.tdata` data set without loading its token payload
+    /// all at once.  The scan validates every record/index/token range.
+    Inspect {
+        /// Finalized `.tdata` directory
+        tdata: String,
+        /// Make an additional full integrity pass after computing the report.
+        /// The ordinary inspection scan already validates every row while it
+        /// counts it; this is useful when an explicit verify pass is required
+        /// by an automation policy.
+        #[arg(long)]
+        verify: bool,
+        /// Emit one stable JSON object to stdout.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -5346,6 +5371,13 @@ async fn main() -> anyhow::Result<()> {
                 skip_runtime_gate,
             ),
         },
+        Commands::TeacherData { cmd } => match cmd {
+            TeacherDataCmd::Inspect {
+                tdata,
+                verify,
+                json,
+            } => cmd_teacher_data_inspect(&tdata, verify, json),
+        },
         Commands::Gpu => {
             // `gpu_wgpu` is behind the `gpu` feature, and this arm called
             // into it unconditionally — so the CPU-only build the manifest
@@ -5435,6 +5467,97 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "gpu")]
     cortiq_engine::gpu_wgpu::shutdown();
     result
+}
+
+/// Inspect a finalized teacher-data directory through the bounded streaming
+/// reader.  The JSON shape deliberately contains only v1 fields owned by the
+/// reader rather than the producer's open-ended manifest metadata, so scripts
+/// have a stable contract even as producer provenance grows.
+fn cmd_teacher_data_inspect(tdata_path: &str, verify: bool, json: bool) -> anyhow::Result<()> {
+    let dataset = tdata::Dataset::open(tdata_path)?;
+    // `inspect` streams every record, its fixed-width index row and its own
+    // token payload in lockstep.  It is already an integrity check, while
+    // `--verify` intentionally provides a distinct, explicit second pass.
+    let summary = dataset.inspect()?;
+    if verify {
+        dataset.verify()?;
+    }
+
+    let split_json = |split: tdata::TdataSplitSummary| {
+        serde_json::json!({
+            "records": split.records,
+            "usable": split.usable,
+            "rejected": split.rejected,
+            "tokens": split.tokens,
+        })
+    };
+    let path = dataset.root().to_string_lossy().into_owned();
+    let report = serde_json::json!({
+        "schema": "cmf-tdata-inspect/v1",
+        "path": path,
+        "manifest": {
+            "format": dataset.manifest.format.as_str(),
+            "version": dataset.manifest.version,
+            "complete": dataset.manifest.complete,
+        },
+        "integrity": {
+            "stream_validated": true,
+            "extra_verify_pass": verify,
+        },
+        "records": {
+            "total": summary.records,
+            "usable": summary.usable,
+            "rejected": summary.rejected,
+        },
+        "tokens": summary.tokens,
+        "splits": {
+            "train": split_json(summary.train),
+            "val": split_json(summary.val),
+            "test": split_json(summary.test),
+        },
+    });
+
+    if json {
+        // One compact object makes the command safe in JSONL-style automation.
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        println!("schema: cmf-tdata-inspect/v1");
+        println!("path: {tdata_path}");
+        println!(
+            "manifest: {} v{} ({})",
+            dataset.manifest.format,
+            dataset.manifest.version,
+            if dataset.manifest.complete {
+                "complete"
+            } else {
+                "incomplete"
+            }
+        );
+        println!(
+            "records: total={} usable={} rejected={}",
+            summary.records, summary.usable, summary.rejected
+        );
+        println!("tokens: {}", summary.tokens);
+        for (name, split) in [
+            ("train", summary.train),
+            ("val", summary.val),
+            ("test", summary.test),
+        ] {
+            println!(
+                "split.{name}: records={} usable={} rejected={} tokens={}",
+                split.records, split.usable, split.rejected, split.tokens
+            );
+        }
+        println!(
+            "integrity: stream-validated{}",
+            if verify {
+                "; explicit verify pass complete"
+            } else {
+                ""
+            }
+        );
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
