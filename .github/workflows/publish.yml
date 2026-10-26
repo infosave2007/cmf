@@ -18,6 +18,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Package before publishing: this catches a non-registry dependency or
+      # an omitted manifest file before a partial crates.io release.  The
+      # Phonon bridge is intentionally included because cortiq-cli enables it
+      # by default in this release.
+      - name: Package release crates (including Phonon bridge)
+        run: |
+          cargo package --locked --no-verify -p cortiq-engine
+          cargo package --locked --no-verify -p cortiq-cli
       # ORDER IS THE DEPENDENCY ORDER, and `cortiq-net` was missing from
       # it. It sits between the engine and the server — both the server
       # and the cli depend on it — so every run since it was introduced
