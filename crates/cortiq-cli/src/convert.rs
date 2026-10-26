@@ -5423,6 +5423,11 @@ pub fn write_mimo_mtp_sidecar(
     let mut header_arch = arch.clone();
     header_arch.mtp = Some(cortiq_core::MtpConfig {
         num_layers: n_mtp,
+        // This sidecar writer has verified every dense draft triple at this
+        // local width. Preserve that fact independently of the backbone so a
+        // later physical trunk compaction cannot make the MTP geometry look
+        // like `arch.intermediate_size`.
+        ffn_intermediate_sizes: Some(vec![inter; n_mtp]),
         share_lm_head: true,
         share_embed: true,
     });
@@ -7460,6 +7465,13 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
                 .filter(|n| *n > 0)
                 .map(|n| cortiq_core::MtpConfig {
                     num_layers: n,
+                    // Source configs describe the trunk's MLP width, but do
+                    // not universally describe a legacy MTP block's local
+                    // dense/MoE layout. Do not guess from the trunk: the
+                    // loader derives a missing value from the checked tensor
+                    // triple, and a writer that physically compacts MTP
+                    // records the exact per-layer widths.
+                    ffn_intermediate_sizes: None,
                     share_lm_head: true,
                     share_embed: true,
                 })
@@ -16359,6 +16371,12 @@ mod mimo_v2_tests {
             let a = m.arch();
             assert_eq!(a.arch_name, "mimo_v2");
             assert_eq!(a.mtp.as_ref().map(|c| c.num_layers), Some(2));
+            assert_eq!(
+                a.mtp
+                    .as_ref()
+                    .and_then(|c| c.ffn_intermediate_sizes.as_deref()),
+                Some(&[INTER, INTER][..])
+            );
             assert_eq!(a.kv_heads_per_layer, Some(vec![2, 4, 4]));
             assert_eq!(
                 m.header.provenance.as_ref().unwrap()["kind"],
