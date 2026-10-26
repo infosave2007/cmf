@@ -14,6 +14,7 @@
 use anyhow::{ensure, Context, Result};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -29,7 +30,11 @@ pub const TDATA_INDEX_BYTES: usize = 40;
 /// unbounded memory.  Normal teacher records are limited by `--max-tokens`
 /// (8192 by default), so 16 Mi tokens is intentionally generous.
 pub const MAX_TOKENS_PER_RECORD: u32 = 16 * 1024 * 1024;
-const MAX_RECORD_JSONL_BYTES: usize = 16 * 1024 * 1024;
+/// Every v1 JSONL row has one shared bounded-reader limit.  The writer uses
+/// the same limit for prompts and records so recovery never creates a
+/// finalized-looking directory that its own bounded reader cannot resume.
+pub(crate) const MAX_JSONL_ROW_BYTES: usize = 16 * 1024 * 1024;
+const MAX_RECORD_JSONL_BYTES: usize = MAX_JSONL_ROW_BYTES;
 
 /// Train/validation/test split stored in both a JSONL record and its index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -704,11 +709,14 @@ impl TdataReader {
             .with_context(|| format!("parsing {}", manifest_path.display()))?;
         let manifest = TdataManifest::from_json(manifest_value)?;
 
+        let prompts_path = root.join("prompts.jsonl");
         let records_path = root.join("records.jsonl");
         let index_path = root.join("tokens.idx");
         let tokens_path = root.join("tokens.bin");
         // Open every required file now.  This produces an actionable failure
         // before a costly conversion pipeline starts.
+        let _ = File::open(&prompts_path)
+            .with_context(|| format!("opening {}", prompts_path.display()))?;
         let _ = File::open(&records_path)
             .with_context(|| format!("opening {}", records_path.display()))?;
         let index_len = fs::metadata(&index_path)
@@ -785,6 +793,13 @@ impl TdataReader {
     /// pass: regular consumers stay streaming and only pay for selected
     /// token vectors.
     pub fn verify(&self) -> Result<()> {
+        // The generic v1 writer can be used by future importers that do not
+        // have the JSONL teacher-prompt contract.  The native E1 generator
+        // explicitly declares `input.format=jsonl-v1`; for that contract,
+        // make `--verify` prove that the ledger is parseable and that every
+        // generated pid/split refers to exactly one ledger prompt.
+        let prompt_ledger = self.read_teacher_prompt_ledger()?;
+        let mut seen_prompt_ids = BTreeSet::new();
         let selector = TdataSelector {
             root: self.root.clone(),
             split: TdataSplitSelector::All,
@@ -792,9 +807,102 @@ impl TdataReader {
             usable_only: false,
         };
         for item in self.stream(selector)? {
-            item?;
+            let sample = item?;
+            if let Some(ledger) = &prompt_ledger {
+                let expected_split = ledger.get(&sample.record.pid).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "records.jsonl rid {:?} refers to pid {:?}, which is absent from prompts.jsonl",
+                        sample.record.rid,
+                        sample.record.pid
+                    )
+                })?;
+                ensure!(
+                    *expected_split == sample.record.split,
+                    "records.jsonl rid {:?} has split {}, but prompts.jsonl pid {:?} declares {}",
+                    sample.record.rid,
+                    sample.record.split,
+                    sample.record.pid,
+                    expected_split
+                );
+                seen_prompt_ids.insert(sample.record.pid);
+            }
+        }
+        if let Some(ledger) = &prompt_ledger {
+            ensure!(
+                seen_prompt_ids.len() == ledger.len(),
+                "prompts.jsonl contains {} prompt(s), but records.jsonl refers to {} distinct pid(s); prompt {:?} has no committed record",
+                ledger.len(),
+                seen_prompt_ids.len(),
+                ledger
+                    .keys()
+                    .find(|id| !seen_prompt_ids.contains(*id))
+                    .expect("length mismatch implies a missing id")
+            );
         }
         verify_manifest_file_hashes(&self.root, &self.manifest.raw)
+    }
+
+    /// Read the strict prompt ledger emitted by the native JSONL generator.
+    /// This runs only for manifests that opt into that schema, preserving the
+    /// minimal generic writer API for future importers.  `verify()` is
+    /// explicitly allowed to retain this id/split map: ordinary `stream()`
+    /// consumers remain O(1) additional memory.
+    fn read_teacher_prompt_ledger(&self) -> Result<Option<BTreeMap<String, TdataSplit>>> {
+        let input_format = self
+            .manifest
+            .raw
+            .as_object()
+            .and_then(|manifest| manifest.get("input"))
+            .and_then(Value::as_object)
+            .and_then(|input| input.get("format"))
+            .and_then(Value::as_str);
+        if input_format != Some("jsonl-v1") {
+            return Ok(None);
+        }
+
+        let expected_count = self
+            .manifest
+            .raw
+            .as_object()
+            .and_then(|manifest| manifest.get("prompts"))
+            .and_then(Value::as_object)
+            .and_then(|prompts| prompts.get("count"))
+            .ok_or_else(|| anyhow::anyhow!("manifest.json.prompts.count is required for input.format=jsonl-v1"))
+            .and_then(|value| json_u64(value, "manifest.json.prompts.count"))?;
+        let prompts_path = self.root.join("prompts.jsonl");
+        let mut reader = BufReader::new(
+            File::open(&prompts_path)
+                .with_context(|| format!("opening {}", prompts_path.display()))?,
+        );
+        let mut ledger = BTreeMap::new();
+        let mut line_no = 0_u64;
+        while let Some(line) = read_jsonl_line(&mut reader)? {
+            line_no = checked_add_counter(line_no, 1, "prompts.jsonl line count")?;
+            let context = format!("prompts.jsonl line {line_no}");
+            let value: Value = serde_json::from_str(&line)
+                .with_context(|| format!("{context}: invalid JSON"))?;
+            let object = value
+                .as_object()
+                .ok_or_else(|| anyhow::anyhow!("{context}: expected a JSON object"))?;
+            let id = required_string(object, "id", &context)?;
+            ensure!(!id.is_empty(), "{context}: id must not be empty");
+            let split = TdataSplit::parse(required_string(object, "split", &context)?)
+                .with_context(|| context.clone())?;
+            let messages = required_value(object, "messages", &context)?
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("{context}: messages must be an array"))?;
+            ensure!(!messages.is_empty(), "{context}: messages must not be empty");
+            ensure!(
+                ledger.insert(id.to_owned(), split).is_none(),
+                "{context}: duplicate prompt id {id:?}"
+            );
+        }
+        ensure!(
+            ledger.len() as u64 == expected_count,
+            "manifest.json.prompts.count={expected_count}, but prompts.jsonl has {} rows",
+            ledger.len()
+        );
+        Ok(Some(ledger))
     }
 
     /// Scan every row (including rejected records) and return counts useful
@@ -894,6 +1002,13 @@ impl TdataWriterStats {
             if index.flags.check_failed() {
                 self.rejected_check =
                     checked_add_counter(self.rejected_check, 1, "check-rejected count")?;
+            } else if index.flags.loop_suspect() {
+                // The first generator's final 5-gram diagnostic can mark a
+                // normal `stop` (or `length`) as suspect without inventing a
+                // false engine finish="loop".  The index flag is the
+                // authoritative reason for the aggregate in that case.
+                self.rejected_loop =
+                    checked_add_counter(self.rejected_loop, 1, "loop-rejected count")?;
             } else {
                 match record.finish.as_deref() {
                     Some("loop") => {
@@ -1046,12 +1161,7 @@ impl TdataWriter {
     /// an interrupted output remains unambiguous JSONL.
     pub fn append_prompt(&mut self, prompt: &Value) -> Result<()> {
         self.ensure_active()?;
-        ensure!(
-            prompt.is_object(),
-            "prompts.jsonl row must be a JSON object, not {}",
-            json_type_name(prompt)
-        );
-        let bytes = serde_json::to_vec(prompt).context("serializing prompts.jsonl row")?;
+        let bytes = serialize_prompt_jsonl_row(prompt)?;
         self.prompts
             .write_all(&bytes)
             .context("writing prompts.jsonl row")?;
@@ -1101,6 +1211,11 @@ impl TdataWriter {
         // coupled without relying on a separate serialization implementation.
         let json_row = tdata_record_to_value(&record);
         let json_bytes = serde_json::to_vec(&json_row).context("serializing records.jsonl row")?;
+        ensure!(
+            json_bytes.len().saturating_add(1) <= MAX_RECORD_JSONL_BYTES,
+            "records.jsonl record {line_no} is {} bytes; v1 rows are capped at {MAX_RECORD_JSONL_BYTES} bytes so a writer never emits a dataset its own bounded reader rejects",
+            json_bytes.len().saturating_add(1),
+        );
         let line_no_usize = usize::try_from(line_no)
             .map_err(|_| anyhow::anyhow!("records.jsonl line number {line_no} exceeds usize"))?;
         let record = TdataRecord::from_json_line(
@@ -1199,6 +1314,24 @@ fn checked_add_counter(value: u64, amount: u64, label: &str) -> Result<u64> {
     value
         .checked_add(amount)
         .ok_or_else(|| anyhow::anyhow!(".tdata {label} overflows u64"))
+}
+
+/// Serialize one prompt-ledger row under the same byte cap used by the
+/// bounded JSONL reader.  Kept crate-visible so a producer can preflight all
+/// rows before it creates an otherwise non-resumable output directory.
+pub(crate) fn serialize_prompt_jsonl_row(prompt: &Value) -> Result<Vec<u8>> {
+    ensure!(
+        prompt.is_object(),
+        "prompts.jsonl row must be a JSON object, not {}",
+        json_type_name(prompt)
+    );
+    let bytes = serde_json::to_vec(prompt).context("serializing prompts.jsonl row")?;
+    ensure!(
+        bytes.len().saturating_add(1) <= MAX_JSONL_ROW_BYTES,
+        "prompts.jsonl row is {} bytes; v1 rows are capped at {MAX_JSONL_ROW_BYTES} bytes so a writer never emits a dataset its own bounded reader cannot recover",
+        bytes.len().saturating_add(1),
+    );
+    Ok(bytes)
 }
 
 fn normalize_new_writer_manifest(mut manifest: Value) -> Result<Value> {
@@ -2369,6 +2502,9 @@ mod tests {
                 serde_json::to_vec_pretty(&manifest).unwrap(),
             )
             .unwrap();
+            // Every v1 directory has a prompt ledger, even when this low
+            // level fixture is testing only record/index/token semantics.
+            fs::write(self.root.join("prompts.jsonl"), b"").unwrap();
             let mut records = File::create(self.root.join("records.jsonl")).unwrap();
             let mut index = File::create(self.root.join("tokens.idx")).unwrap();
             let mut tokens = File::create(self.root.join("tokens.bin")).unwrap();
@@ -2531,6 +2667,7 @@ mod tests {
             r#"{"format":"cmf-tdata","version":1,"complete":true}"#,
         )
         .unwrap();
+        fs::write(bad_index.root.join("prompts.jsonl"), b"").unwrap();
         fs::write(bad_index.root.join("records.jsonl"), b"").unwrap();
         fs::write(bad_index.root.join("tokens.idx"), vec![0_u8; 39]).unwrap();
         fs::write(bad_index.root.join("tokens.bin"), b"").unwrap();
@@ -2562,6 +2699,7 @@ mod tests {
             r#"{"format":"cmf-tdata","version":1,"complete":true,"stats":{"records":1}}"#,
         )
         .unwrap();
+        fs::write(malformed.root.join("prompts.jsonl"), b"").unwrap();
         fs::write(malformed.root.join("records.jsonl"), b"not json\n").unwrap();
         fs::write(
             malformed.root.join("tokens.idx"),
@@ -2581,6 +2719,62 @@ mod tests {
     fn writer_record(rid: &str, split: &str, usable: bool, ids: &[u32]) -> TdataRecord {
         let value = row(rid, split, usable, 91, 777, ids);
         TdataRecord::from_json_line(&serde_json::to_string(&value).unwrap(), 1).unwrap()
+    }
+
+    #[test]
+    fn writer_rejects_an_oversized_record_before_any_payload_write() {
+        let data = TempTdata::new("writer-row-limit");
+        let mut writer = TdataWriter::create(&data.root, json!({"teacher": "test"})).unwrap();
+        let mut record = writer_record("oversized#0", "train", true, &[11, 12]);
+        // Leave room for the surrounding JSON so the serialized JSONL line is
+        // definitely larger than the reader's bounded-row contract.
+        record.response.content = "x".repeat(MAX_RECORD_JSONL_BYTES);
+
+        let error = writer
+            .append_record(record, &[11, 12])
+            .expect_err("writer must not emit a row its own reader rejects");
+        assert!(error.to_string().contains("rows are capped"), "{error:#}");
+        assert_eq!(writer.stats().records, 0);
+        assert_eq!(writer.stats().total_tokens, 0);
+        for name in ["tokens.bin", "tokens.idx", "records.jsonl"] {
+            assert_eq!(
+                fs::metadata(data.root.join(name)).unwrap().len(),
+                0,
+                "{name} must remain untouched after a pre-write refusal"
+            );
+        }
+    }
+
+    #[test]
+    fn writer_rejects_an_oversized_prompt_before_committing_the_ledger() {
+        let data = TempTdata::new("writer-prompt-row-limit");
+        let mut writer = TdataWriter::create(&data.root, json!({})).unwrap();
+        let prompt = json!({"id": "oversized", "prompt": "x".repeat(MAX_JSONL_ROW_BYTES)});
+
+        let error = writer
+            .append_prompt(&prompt)
+            .expect_err("writer must not emit a prompt its recovery reader rejects");
+        assert!(error.to_string().contains("rows are capped"), "{error:#}");
+        assert_eq!(writer.stats().prompts, 0);
+        assert_eq!(
+            fs::metadata(data.root.join("prompts.jsonl")).unwrap().len(),
+            0
+        );
+    }
+
+    #[test]
+    fn writer_counts_a_post_generation_loop_flag_as_a_loop_rejection() {
+        let data = TempTdata::new("writer-tail-loop");
+        let mut writer = TdataWriter::create(&data.root, json!({})).unwrap();
+        let mut record = writer_record("tail-loop#0", "train", false, &[11, 12, 13]);
+        record.finish = Some("stop".to_owned());
+        record.quality.as_mut().unwrap().loop_suspect = Some(true);
+
+        writer.append_record(record, &[11, 12, 13]).unwrap();
+        let stats = writer.stats();
+        assert_eq!(stats.rejected, 1);
+        assert_eq!(stats.rejected_loop, 1);
+        assert_eq!(stats.rejected_error, 0);
     }
 
     #[test]
@@ -2655,6 +2849,45 @@ mod tests {
         tokens.write_all(&[0xff]).unwrap();
         tokens.sync_all().unwrap();
         assert!(reader.verify().is_err());
+    }
+
+    #[test]
+    fn verify_cross_checks_the_native_prompt_ledger_against_records() {
+        let data = TempTdata::new("teacher-prompt-ledger");
+        let mut writer = TdataWriter::create(
+            &data.root,
+            json!({"input": {"format": "jsonl-v1"}}),
+        )
+        .unwrap();
+        writer
+            .append_prompt(&json!({
+                "id": "known",
+                "split": "train",
+                "messages": [{"role": "user", "content": "hello"}],
+                "meta": {}
+            }))
+            .unwrap();
+        writer
+            .append_record(
+                writer_record("known#0", "train", true, &[1, 2]),
+                &[1, 2],
+            )
+            .unwrap();
+        writer.finalize().unwrap();
+
+        let reader = TdataReader::open(&data.root).unwrap();
+        reader.verify().unwrap();
+
+        // The payload hashes have deliberately not been regenerated.  The
+        // ledger/record link must fail before the later hash comparison so a
+        // syntactically valid but unrelated ledger cannot be blessed.
+        fs::write(
+            data.root.join("prompts.jsonl"),
+            r#"{"id":"other","split":"train","messages":[{"role":"user","content":"hello"}],"meta":{}}"#,
+        )
+        .unwrap();
+        let error = reader.verify().expect_err("ledger pid mismatch must fail");
+        assert!(error.to_string().contains("absent from prompts.jsonl"), "{error:#}");
     }
 
     #[test]
