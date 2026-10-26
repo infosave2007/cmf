@@ -260,6 +260,8 @@ fails.
 - [GPU kernel recipes](docs/GPU_KERNEL_RECIPES.md) — backend measurements.
 - [Multi-GPU execution](docs/MULTI_GPU.md) and [mobile split](docs/MOBILE_SPLIT.ru.md).
 - [FCD restoration](docs/RUST_FCD.md) and [low-bit PTQ](docs/Q1T_PTQ.md).
+- [MTP FFN compaction](docs/MTP_COMPACTION.ru.md) — независимая калибровка и
+  физическое уменьшение MTP-draft FFN.
 - [Qwen Image Edit](docs/QWEN_IMAGE.md) — one-file native image editing and
   standalone component staging.
 - [Model cards and conversion notes](docs/hf/README.md).
