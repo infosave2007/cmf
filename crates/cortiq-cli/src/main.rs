@@ -3012,8 +3012,9 @@ enum TeacherDataCmd {
     ///
     /// This first text-only slice deliberately runs greedy direct-answer
     /// generation (`--no-think` is required) and writes no top-k logits yet.
-    /// It keeps one model pipeline hot, so normal Metal/MTP decode stays on
-    /// the production fast path between records.
+    /// It keeps one model pipeline hot between records. `--disable-mtp` is
+    /// available for a reproducible plain-greedy control when a draft path is
+    /// slower or unsuitable for a long calibration job.
     Generate {
         /// Local CMF teacher model
         teacher: String,
@@ -3049,6 +3050,11 @@ enum TeacherDataCmd {
         /// Keep records that reached --max-tokens (they remain marked truncated)
         #[arg(long)]
         keep_truncated: bool,
+        /// Disable MTP/speculative draft decoding for this job. The trunk
+        /// remains on the selected GPU; this is a stable plain-greedy control,
+        /// not a CPU fallback.
+        #[arg(long)]
+        disable_mtp: bool,
         /// Keep only the first N accepted, de-duplicated source prompts
         #[arg(long)]
         limit: Option<usize>,
@@ -5431,6 +5437,7 @@ async fn main() -> anyhow::Result<()> {
                 raw,
                 no_think,
                 keep_truncated,
+                disable_mtp,
                 limit,
             } => cmd_teacher_data_generate(
                 &teacher,
@@ -5446,6 +5453,7 @@ async fn main() -> anyhow::Result<()> {
                     raw,
                     no_think,
                     keep_truncated,
+                    disable_mtp,
                     limit,
                 },
             ),
@@ -5651,6 +5659,7 @@ struct TeacherDataGenerateOptions {
     raw: bool,
     no_think: bool,
     keep_truncated: bool,
+    disable_mtp: bool,
     limit: Option<usize>,
 }
 
@@ -5838,6 +5847,13 @@ fn cmd_teacher_data_generate(
     // remains useful for legacy/base identity, but is only the primary shard.
     let teacher_trunk_hash = model.trunk_hash();
     let mut pipeline = Pipeline::from_model(&model, teacher_data_greedy_sampler(options.seed))?;
+    if options.disable_mtp {
+        // MTP is an optional speculative accelerator, not part of the
+        // generated-token contract. This keeps the trunk on the selected GPU
+        // while making a long calibration job plain greedy by request.
+        pipeline.speculative = false;
+    }
+    let speculative_mtp = pipeline.speculative;
     pipeline.set_confidence(false);
 
     // A carried template is the only current mechanism for requesting
@@ -5928,6 +5944,8 @@ fn cmd_teacher_data_generate(
             "mode": "direct-answer",
             "samples": options.samples,
             "keep_truncated": options.keep_truncated,
+            "speculative_mtp": if speculative_mtp { "enabled" } else { "disabled" },
+            "mtp_control": if options.disable_mtp { "disabled-by-cli" } else { "engine-default" },
             "topk": "disabled-until-raw-logit-capture",
             "resume": "not-exposed-in-v1-generator",
         },
@@ -5943,11 +5961,12 @@ fn cmd_teacher_data_generate(
     }
 
     eprintln!(
-        "teacher-data: {} accepted prompts → {planned_records} record(s); teacher={} ({}, {:?}); one hot pipeline",
+        "teacher-data: {} accepted prompts → {planned_records} record(s); teacher={} ({}, {:?}); one hot pipeline; MTP={}",
         loaded.accepted(),
         teacher_name,
         model.arch().arch_name,
         model.header.quant_type,
+        if speculative_mtp { "on" } else { "off" },
     );
     let job_started = std::time::Instant::now();
     let mut generated_tokens = 0_u64;
@@ -11454,6 +11473,8 @@ mod tests {
             bench_generation_prefill_path(false, true, 2048, None, Some(128), true),
             None
         );
+    }
+
     #[test]
     fn teacher_data_cli_split_and_greedy_contract_are_strict() {
         assert_eq!(
@@ -11479,6 +11500,38 @@ mod tests {
         assert_eq!(config.repetition_penalty, 1.0);
         assert_eq!(config.presence_penalty, 0.0);
         assert_eq!(config.seed, Some(0xCAFE_BABE));
+    }
+
+    #[test]
+    fn teacher_data_disable_mtp_is_an_explicit_cli_opt_in() {
+        // The complete CLI tree needs the main thread's larger stack in a
+        // debug test binary; parse the actual public spelling rather than
+        // duplicating its default in a helper.
+        let cli = std::thread::Builder::new()
+            .name("teacher-data-disable-mtp-parser".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                Cli::try_parse_from([
+                    "cortiq",
+                    "teacher-data",
+                    "generate",
+                    "teacher.cmf",
+                    "prompts.jsonl",
+                    "out.tdata",
+                    "--no-think",
+                    "--disable-mtp",
+                ])
+                .unwrap()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        match cli.command {
+            Commands::TeacherData {
+                cmd: TeacherDataCmd::Generate { disable_mtp, .. },
+            } => assert!(disable_mtp),
+            _ => panic!("wrong subcommand"),
+        }
     }
 
     #[test]
