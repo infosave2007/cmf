@@ -4,7 +4,9 @@
 
 use crate::AppState;
 use crate::streaming::{self, ChatStream};
-use crate::tool_calls::{ToolHoldback, extract_tool_calls};
+use crate::tool_calls::{
+    MiniMaxM3Stream, ToolHoldback, extract_minimax_m3_response, extract_tool_calls,
+};
 use axum::{
     Router,
     extract::State,
@@ -961,6 +963,60 @@ fn request_messages_json(
         .collect()
 }
 
+const MINIMAX_M3_TEMPLATE_REQUIRED: &str =
+    "MiniMax M3 CMF requires its native chat template; refusing generic ChatML fallback";
+
+fn require_minimax_m3_native_template(
+    tokenizer: &cortiq_engine::tokenizer::Tokenizer,
+) -> Result<(), &'static str> {
+    tokenizer
+        .chat_template
+        .as_deref()
+        .filter(|template| !template.trim().is_empty())
+        .map(|_| ())
+        .ok_or(MINIMAX_M3_TEMPLATE_REQUIRED)
+}
+
+/// M3's upstream template knows image/video sentinel tokens, but this CMF
+/// package contains only its text backbone. Reject media at the HTTP edge
+/// instead of flattening a request into unrelated text and pretending it ran.
+/// Use the shared JSON conversion afterward so assistant `reasoning_content`
+/// and tool-call history reach the template intact.
+fn minimax_m3_messages(messages: &[ChatMessage]) -> Result<Vec<serde_json::Value>, String> {
+    for (message_index, message) in messages.iter().enumerate() {
+        let Some(MessageContent::Blocks(blocks)) = &message.content else {
+            continue;
+        };
+        for (block_index, block) in blocks.iter().enumerate() {
+            if block.kind.as_deref() != Some("text") {
+                let kind = block.kind.as_deref().unwrap_or("untyped");
+                return Err(format!(
+                    "MiniMax M3 CMF is text-only; messages[{message_index}].content[{block_index}] has unsupported {kind:?} content"
+                ));
+            }
+        }
+    }
+    request_messages_json(messages, false)
+}
+
+/// The M3 template serializes this value in its native `<effort>` field. It
+/// does not define a closed enum, so keep a caller-supplied non-empty string
+/// verbatim rather than guessing a vendor-specific set of levels.
+fn minimax_m3_reasoning_effort(
+    effort: Option<&serde_json::Value>,
+) -> Result<Option<String>, String> {
+    match effort {
+        None => Ok(None),
+        Some(serde_json::Value::String(value)) if !value.trim().is_empty() => {
+            Ok(Some(value.clone()))
+        }
+        Some(serde_json::Value::String(_)) => {
+            Err("MiniMax M3 reasoning_effort must be a non-empty string".to_string())
+        }
+        Some(_) => Err("MiniMax M3 reasoning_effort must be a string".to_string()),
+    }
+}
+
 /// Encode OpenAI messages with the pinned V4.1 harmony formatter and image
 /// processor. This is public so the CLI/server protocol layers share the same
 /// image-span normalization without duplicating it in the runtime.
@@ -1051,6 +1107,28 @@ async fn chat_completions(
         return error_response(StatusCode::BAD_REQUEST, "messages must not be empty");
     }
 
+    let minimax_m3 = state.runtime.model().arch().arch_name == "minimax_m3_vl";
+    let minimax_m3_effort = if minimax_m3 {
+        // Unlike an ordinary text model, M3's wire grammar and adaptive
+        // thinking are defined by its bundled Jinja template.  Running its
+        // text backbone in generic ChatML is a different protocol, not a
+        // recoverable approximation.
+        if let Err(error) = require_minimax_m3_native_template(&state.tokenizer) {
+            return error_response(StatusCode::BAD_REQUEST, error);
+        }
+        // Do this before routing/lookup: an image or malformed effort must
+        // never receive an unrelated table answer from a text-only package.
+        if let Err(error) = minimax_m3_messages(&req.messages) {
+            return error_response(StatusCode::BAD_REQUEST, error);
+        }
+        match minimax_m3_reasoning_effort(req.reasoning_effort.as_ref()) {
+            Ok(effort) => effort,
+            Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
+        }
+    } else {
+        None
+    };
+
     // Resolve task selection into request-local state. Mutating the runtime's
     // global active task here made concurrent requests use each other's mask.
     let (task_used, request_mask) =
@@ -1080,7 +1158,7 @@ async fn chat_completions(
         Ok(config) => config,
         Err(response) => return response,
     };
-    if req.thinking() == Some(false) {
+    if !minimax_m3 && req.thinking() == Some(false) {
         let think_tokens = state.tokenizer.encode("<think>");
         sampler_config.suppress_tokens.extend(think_tokens);
     }
@@ -1140,6 +1218,11 @@ async fn chat_completions(
     }
 
     let mut mimo_rows = None;
+    // MiniMax's native template deliberately has adaptive thinking and only
+    // consumes the explicit `reasoning_effort` variable.  Do not smuggle the
+    // server's generic `thinking=false` -> `reasoning_effort=low` convention
+    // into that template.
+    let template_thinking = if minimax_m3 { None } else { req.thinking() };
     // Chat template → prompt ids (uses real special tokens).
     let (prompt_ids, prompt_ingress) = if let Some(source) =
         state.runtime.model().arch().deepseek_v41.as_ref()
@@ -1205,10 +1288,13 @@ async fn chat_completions(
         (ids, None)
     } else {
         let prompt_ids = {
-            let mut msgs: Vec<serde_json::Value> = req
-                .messages
-                .iter()
-                .map(|m| {
+            let mut msgs: Vec<serde_json::Value> = if minimax_m3 {
+                match minimax_m3_messages(&req.messages) {
+                    Ok(messages) => messages,
+                    Err(error) => return error_response(StatusCode::BAD_REQUEST, error),
+                }
+            } else {
+                req.messages.iter().map(|m| {
                     let mut o = serde_json::json!({
                         "role": m.role,
                         "content": m.content.as_ref().map(|c| c.text()).unwrap_or_default(),
@@ -1247,8 +1333,8 @@ async fn chat_completions(
                         o["name"] = serde_json::json!(n);
                     }
                     o
-                })
-                .collect();
+                }).collect()
+            };
             // Hard thinking suppression: when enable_thinking=false, inject a
             // system-level directive so even models that ignore the empty
             //  block still produce direct answers.
@@ -1257,7 +1343,7 @@ async fn chat_completions(
             // with invented results under it, and called the tool in all
             // 6 without it).
             eprintln!("[serve] thinking={:?}", req.thinking());
-            if req.thinking() == Some(false) && req.effective_tools().is_none() {
+            if !minimax_m3 && req.thinking() == Some(false) && req.effective_tools().is_none() {
                 let has_system = msgs.iter().any(|m| m["role"] == "system");
                 let directive = "Answer directly and concisely. Do NOT reason, think step-by-step, or explain your process. Output ONLY the final answer.";
                 if has_system {
@@ -1277,11 +1363,15 @@ async fn chat_completions(
                 // With tools a failed render is an ERROR: the ChatML
                 // fallback has no place for them, and the model would
                 // answer as if no functions were offered — silently.
-                Some(tools) => match state.tokenizer.try_apply_chat_template_json(
-                    &msgs,
-                    Some(tools),
-                    req.thinking(),
-                ) {
+                Some(tools) => match state
+                    .tokenizer
+                    .try_apply_chat_template_json_with_reasoning_effort(
+                        &msgs,
+                        Some(tools),
+                        template_thinking,
+                        minimax_m3_effort.as_deref(),
+                    )
+                {
                     Ok(ids) => ids,
                     Err(e) => {
                         tracing::error!("chat template render failed with tools: {e}");
@@ -1294,9 +1384,38 @@ async fn chat_completions(
                         );
                     }
                 },
+                // M3's template is mandatory and its history syntax is
+                // protocol-bearing (`reasoning_content`, namespaced calls).
+                // A Jinja failure must not quietly fall back to ChatML.
+                None if minimax_m3 => match state
+                    .tokenizer
+                    .try_apply_chat_template_json_with_reasoning_effort(
+                        &msgs,
+                        None,
+                        template_thinking,
+                        minimax_m3_effort.as_deref(),
+                    )
+                {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        tracing::error!("MiniMax M3 chat template render failed: {e}");
+                        return error_response(
+                            StatusCode::BAD_REQUEST,
+                            format!(
+                                "the MiniMax M3 chat template failed to render this request ({e}); \
+                                 refusing generic ChatML fallback"
+                            ),
+                        );
+                    }
+                },
                 None => state
                     .tokenizer
-                    .apply_chat_template_json(&msgs, None, req.thinking()),
+                    .apply_chat_template_json_with_reasoning_effort(
+                        &msgs,
+                        None,
+                        template_thinking,
+                        minimax_m3_effort.as_deref(),
+                    ),
             }
         };
         (prompt_ids, None)
@@ -1457,6 +1576,19 @@ async fn chat_completions(
             let tx_tokens = tx.clone();
             let id2 = id.clone();
             let model2 = model.clone();
+            // M3 emits its own namespaced protocol instead of the generic
+            // `<think>` / `<tool_call>` dialect. Keep a small state machine
+            // next to the token callback so a marker split across decoded
+            // tokens can never leak into an SSE content delta.
+            let minimax_m3_stream = minimax_m3.then(|| {
+                let parser = if tools_owned.as_ref().is_some_and(|tools| !tools.is_empty()) {
+                    MiniMaxM3Stream::with_declared_tools()
+                } else {
+                    MiniMaxM3Stream::new()
+                };
+                std::sync::Arc::new(std::sync::Mutex::new(parser))
+            });
+            let minimax_m3_stream_cb = minimax_m3_stream.clone();
             // Shared with the post-generation flush: a short reply that
             // never opens a <think> block (the template prefilled an
             // empty one) used to be swallowed whole — the filter waited
@@ -1475,6 +1607,14 @@ async fn chat_completions(
             let mut opener = think_opened.then(|| "<think>".to_string());
 
             let callback: cortiq_engine::TokenCallback = Box::new(move |token: &str| {
+                if let Some(stream) = &minimax_m3_stream_cb {
+                    let out = stream.lock().expect("MiniMax M3 stream").push(token);
+                    if out.is_empty() {
+                        return !tx_tokens.is_closed();
+                    }
+                    let chunk = streaming::token_chunk(&id2, &model2, &out, created);
+                    return tx_tokens.blocking_send(chunk).is_ok();
+                }
                 let opened;
                 let token = match opener.take() {
                     Some(o) => {
@@ -1536,6 +1676,65 @@ async fn chat_completions(
 
             match outcome {
                 Ok((result, elapsed_ms, decision)) => {
+                    if minimax_m3 {
+                        state2
+                            .runtime
+                            .record_generation(result.tokens_generated, elapsed_ms, elapsed_ms)
+                            .await;
+                        // The strict whole-response parser remains the
+                        // authority for recursive arguments and malformed
+                        // XML. The incremental parser has only released a
+                        // verified prefix of its public content.
+                        let (plain, calls, _) =
+                            extract_minimax_m3_response(&result.text, tools_owned.as_deref());
+                        let tail = minimax_m3_stream
+                            .as_ref()
+                            .expect("MiniMax M3 parser")
+                            .lock()
+                            .expect("MiniMax M3 stream")
+                            .finish(&plain);
+                        if !tail.is_empty() {
+                            let _ = tx
+                                .send(streaming::token_chunk(&id, &model, &tail, created))
+                                .await;
+                        }
+                        let finish = if calls.is_empty() {
+                            result.finish_reason.clone()
+                        } else {
+                            let _ = tx
+                                .send(streaming::tool_calls_chunk(
+                                    &id,
+                                    &model,
+                                    serde_json::Value::Array(
+                                        calls
+                                            .into_iter()
+                                            .enumerate()
+                                            .map(|(index, mut call)| {
+                                                call["index"] = serde_json::json!(index);
+                                                call
+                                            })
+                                            .collect(),
+                                    ),
+                                    created,
+                                ))
+                                .await;
+                            "tool_calls".to_string()
+                        };
+                        let mut usage = streaming::usage_chunk(
+                            &id,
+                            &model,
+                            created,
+                            result.prompt_tokens as u32,
+                            result.tokens_generated as u32,
+                        );
+                        usage.x_cortiq_route =
+                            route_json(decision.as_ref(), lookup_outcome.as_ref(), lookup_mode);
+                        let _ = tx.send(usage).await;
+                        let _ = tx
+                            .send(streaming::finish_chunk(&id, &model, &finish, created))
+                            .await;
+                        return;
+                    }
                     // End-of-generation flush of the think filter, by the
                     // filter's own rules: a buffer that never opened a
                     // <think> block IS the answer; a closed block ships
@@ -1671,6 +1870,12 @@ async fn chat_completions(
 
         let (mut plain, mut calls, reasoning_content) = if dsv41 {
             extract_dsv41_result(&result, dsv41_thinking, &state.tokenizer)
+        } else if minimax_m3 {
+            // M3's adaptive reasoning and namespaced XML tool grammar are
+            // distinct from the generic `<think>` / `<tool_call>` families.
+            // Parse them before generic thinking suppression can expose its
+            // internal markers as user-visible content.
+            extract_minimax_m3_response(&result.text, req.effective_tools())
         } else if req.thinking() == Some(false) {
             let content = strip_think_block(&result.text);
             let (plain, calls) = extract_tool_calls(&content, req.effective_tools());
@@ -1683,7 +1888,7 @@ async fn chat_completions(
             let (plain, calls) = extract_tool_calls(&result.text, req.effective_tools());
             (plain, calls, None)
         };
-        if calls.is_empty() {
+        if calls.is_empty() && !minimax_m3 {
             if let Some(names) = req.effective_tools().map(|ts| {
                 ts.iter()
                     .filter_map(|t| t["function"]["name"].as_str().map(String::from))
@@ -2051,6 +2256,82 @@ fn effective_max_tokens(state: &AppState, requested: Option<u32>) -> u32 {
 mod tests {
 
     use super::*;
+
+    #[test]
+    fn minimax_m3_requires_a_native_template() {
+        let tok = cortiq_engine::tokenizer::Tokenizer::byte_level();
+        assert_eq!(
+            require_minimax_m3_native_template(&tok).unwrap_err(),
+            MINIMAX_M3_TEMPLATE_REQUIRED
+        );
+        let mut blank = cortiq_engine::tokenizer::Tokenizer::byte_level();
+        blank.chat_template = Some(" \n\t ".to_string());
+        assert_eq!(
+            require_minimax_m3_native_template(&blank).unwrap_err(),
+            MINIMAX_M3_TEMPLATE_REQUIRED
+        );
+    }
+
+    #[test]
+    fn minimax_m3_text_only_ingress_rejects_media_and_keeps_history_reasoning() {
+        let image: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe this"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}
+            ]
+        }))
+        .unwrap();
+        let error = minimax_m3_messages(&[image]).unwrap_err();
+        assert!(error.contains("text-only"), "{error}");
+        assert!(error.contains("image_url"), "{error}");
+        for kind in ["input_audio", "video"] {
+            let message: ChatMessage = serde_json::from_value(serde_json::json!({
+                "role": "user",
+                "content": [{"type": kind, "data": "AA=="}]
+            }))
+            .unwrap();
+            let error = minimax_m3_messages(&[message]).unwrap_err();
+            assert!(error.contains("text-only"), "{error}");
+            assert!(error.contains(kind), "{error}");
+        }
+
+        let messages: Vec<ChatMessage> = serde_json::from_value(serde_json::json!([
+            {
+                "role": "assistant",
+                "content": "I'll look it up.",
+                "reasoning_content": "Need the weather tool.",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
+                }]
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": [{"type": "text", "text": "sunny"}]
+            }
+        ]))
+        .unwrap();
+        let rendered = minimax_m3_messages(&messages).unwrap();
+        assert_eq!(rendered[0]["reasoning_content"], "Need the weather tool.");
+        assert_eq!(rendered[0]["tool_calls"][0]["function"]["arguments"], serde_json::json!({"city": "Paris"}));
+        assert_eq!(rendered[1]["content"], "sunny");
+    }
+
+    #[test]
+    fn minimax_m3_reasoning_effort_is_a_template_string() {
+        let high = serde_json::json!("high");
+        assert_eq!(
+            minimax_m3_reasoning_effort(Some(&high)).unwrap().as_deref(),
+            Some("high")
+        );
+        let numeric = serde_json::json!(32);
+        assert!(minimax_m3_reasoning_effort(Some(&numeric)).is_err());
+        let blank = serde_json::json!("  ");
+        assert!(minimax_m3_reasoning_effort(Some(&blank)).is_err());
+    }
 
     #[test]
     fn mimo_content_blocks_reach_shared_ingress_without_flattening() {

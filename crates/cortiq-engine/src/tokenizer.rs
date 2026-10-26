@@ -1122,7 +1122,24 @@ impl Tokenizer {
         tools: Option<&[serde_json::Value]>,
         enable_thinking: Option<bool>,
     ) -> Vec<u32> {
-        match self.try_apply_chat_template_json(messages, tools, enable_thinking) {
+        self.apply_chat_template_json_with_reasoning_effort(messages, tools, enable_thinking, None)
+    }
+
+    /// JSON chat template rendering with an optional template-native reasoning
+    /// effort. An explicit value is passed through to Jinja unchanged.
+    pub fn apply_chat_template_json_with_reasoning_effort(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&[serde_json::Value]>,
+        enable_thinking: Option<bool>,
+        reasoning_effort: Option<&str>,
+    ) -> Vec<u32> {
+        match self.try_apply_chat_template_json_with_reasoning_effort(
+            messages,
+            tools,
+            enable_thinking,
+            reasoning_effort,
+        ) {
             Ok(ids) => ids,
             Err(e) => {
                 tracing::error!("chat template render failed ({e}); ChatML fallback");
@@ -1147,9 +1164,27 @@ impl Tokenizer {
         tools: Option<&[serde_json::Value]>,
         enable_thinking: Option<bool>,
     ) -> Result<Vec<u32>, String> {
+        self.try_apply_chat_template_json_with_reasoning_effort(
+            messages,
+            tools,
+            enable_thinking,
+            None,
+        )
+    }
+
+    /// Fallible JSON template rendering with a native reasoning-effort
+    /// variable. MiniMax M3's upstream template is adaptive and consumes
+    /// `<effort>` from this variable instead of a generic `<think>` injection.
+    pub fn try_apply_chat_template_json_with_reasoning_effort(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&[serde_json::Value]>,
+        enable_thinking: Option<bool>,
+        reasoning_effort: Option<&str>,
+    ) -> Result<Vec<u32>, String> {
         if let Some(tpl) = &self.chat_template {
             return self
-                .render_template_json(tpl, messages, tools, enable_thinking)
+                .render_template_json(tpl, messages, tools, enable_thinking, reasoning_effort)
                 .map(|text| self.with_bos(self.encode(&text)))
                 .map_err(|e| format!("{e:#}"));
         }
@@ -1186,8 +1221,20 @@ impl Tokenizer {
         tools: Option<&[serde_json::Value]>,
         enable_thinking: Option<bool>,
     ) -> Option<String> {
+        self.render_chat_json_with_reasoning_effort(messages, tools, enable_thinking, None)
+    }
+
+    /// Render a JSON chat template with an optional native reasoning effort.
+    /// Kept public for exact-template parity tests and protocol adapters.
+    pub fn render_chat_json_with_reasoning_effort(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<&[serde_json::Value]>,
+        enable_thinking: Option<bool>,
+        reasoning_effort: Option<&str>,
+    ) -> Option<String> {
         let tpl = self.chat_template.as_ref()?;
-        match self.render_template_json(tpl, messages, tools, enable_thinking) {
+        match self.render_template_json(tpl, messages, tools, enable_thinking, reasoning_effort) {
             Ok(t) => Some(t),
             Err(e) => {
                 tracing::error!("chat template render (json): {e:#}");
@@ -1203,6 +1250,7 @@ impl Tokenizer {
         messages: &[serde_json::Value],
         tools: Option<&[serde_json::Value]>,
         enable_thinking: Option<bool>,
+        reasoning_effort: Option<&str>,
     ) -> Result<String, minijinja::Error> {
         let mut env = crate::chat_template::environment();
         let tpl_src = strip_generation_tags(tpl);
@@ -1220,8 +1268,13 @@ impl Tokenizer {
         // (Nanbeige): undefined falls into their XML branch. The JSON
         // grammar is the one every parser downstream speaks, so choose
         // it explicitly; templates without the knob never read it.
-        let rendered = match (tools_v, enable_thinking) {
-            (Some(ts), Some(v)) => tpl.render(minijinja::context! {
+        let rendered = match (tools_v, enable_thinking, reasoning_effort) {
+            (Some(ts), Some(v), Some(effort)) => tpl.render(minijinja::context! {
+                messages => msgs, tools => ts, add_generation_prompt => true, enable_thinking => v,
+                reasoning_effort => effort,
+                tool_call_format => "json",
+            })?,
+            (Some(ts), Some(v), None) => tpl.render(minijinja::context! {
                 messages => msgs, tools => ts, add_generation_prompt => true, enable_thinking => v,
                 // GLM-5's template controls its reasoning budget with
                 // `reasoning_effort` rather than `enable_thinking`.  A direct
@@ -1230,17 +1283,32 @@ impl Tokenizer {
                 reasoning_effort => if !v { Some("low") } else { None::<&str> },
                 tool_call_format => "json",
             })?,
-            (Some(ts), None) => tpl.render(minijinja::context! {
+            (Some(ts), None, Some(effort)) => tpl.render(minijinja::context! {
+                messages => msgs, tools => ts, add_generation_prompt => true,
+                reasoning_effort => effort,
+                tool_call_format => "json",
+            })?,
+            (Some(ts), None, None) => tpl.render(minijinja::context! {
                 messages => msgs, tools => ts, add_generation_prompt => true,
                 tool_call_format => "json",
             })?,
-            (None, Some(v)) => tpl.render(minijinja::context! {
+            (None, Some(v), Some(effort)) => tpl.render(minijinja::context! {
+                messages => msgs, add_generation_prompt => true, enable_thinking => v,
+                reasoning_effort => effort,
+                tool_call_format => "json",
+            })?,
+            (None, Some(v), None) => tpl.render(minijinja::context! {
                 messages => msgs, add_generation_prompt => true, enable_thinking => v,
                 // See the tool-bearing branch above.
                 reasoning_effort => if !v { Some("low") } else { None::<&str> },
                 tool_call_format => "json",
             })?,
-            (None, None) => tpl.render(minijinja::context! {
+            (None, None, Some(effort)) => tpl.render(minijinja::context! {
+                messages => msgs, add_generation_prompt => true,
+                reasoning_effort => effort,
+                tool_call_format => "json",
+            })?,
+            (None, None, None) => tpl.render(minijinja::context! {
                 messages => msgs, add_generation_prompt => true,
                 tool_call_format => "json",
             })?,
@@ -1748,6 +1816,86 @@ mod tests {
             direct,
             "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think></think>"
         );
+    }
+
+    #[test]
+    fn json_template_passes_explicit_reasoning_effort_without_overriding_it() {
+        let mut tok = Tokenizer::byte_level();
+        tok.chat_template = Some(
+            "{% if reasoning_effort is defined %}<effort>{{ reasoning_effort }}</effort>{% else %}<default-effort>{% endif %}|{{ enable_thinking }}|{{ messages[0].reasoning_content }}"
+                .to_string(),
+        );
+        let messages = vec![serde_json::json!({
+            "role": "assistant",
+            "content": "answer",
+            "reasoning_content": "prior chain"
+        })];
+        let explicit = tok
+            .render_chat_json_with_reasoning_effort(&messages, None, Some(false), Some("high"))
+            .expect("render explicit effort");
+        assert_eq!(explicit, "<effort>high</effort>|False|prior chain");
+
+        let native_default = tok
+            .render_chat_json_with_reasoning_effort(&messages, None, None, None)
+            .expect("render native default");
+        assert_eq!(native_default, "<default-effort>||prior chain");
+    }
+
+    #[test]
+    fn fallible_json_template_render_does_not_use_chatml_on_jinja_error() {
+        let mut tok = Tokenizer::byte_level();
+        tok.chat_template = Some("{% for message in messages %}".to_string());
+        let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
+        let error = tok
+            .try_apply_chat_template_json_with_reasoning_effort(
+                &messages,
+                None,
+                None,
+                Some("high"),
+            )
+            .expect_err("unclosed Jinja must fail instead of producing ChatML");
+        assert!(!error.is_empty());
+    }
+
+    /// MiniMax M3.1 carries an unusually featureful sidecar template: macros,
+    /// `namespace`, Python-style mapping access, custom `tojson` keywords,
+    /// a namespaced XML tool grammar and M3-specific reasoning markers.  Run
+    /// its *actual* upstream template when supplied rather than accepting a
+    /// synthetic toy template that would miss a minijinja compatibility gap.
+    #[test]
+    fn minimax_m3_chat_template_when_available() {
+        let Ok(path) = std::env::var("CMF_MINIMAX_M3_CHAT_TEMPLATE") else {
+            return;
+        };
+        let mut tok = Tokenizer::byte_level();
+        tok.chat_template = Some(std::fs::read_to_string(path).expect("read MiniMax M3 template"));
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "Keep answers concise."}),
+            serde_json::json!({"role": "user", "content": "What is 2 + 2?"}),
+        ];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Return the weather for a city.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"]
+                }
+            }
+        })];
+        let rendered = tok
+            .render_chat_json(&messages, Some(&tools), Some(false))
+            .expect("render MiniMax M3 native prompt");
+        assert!(rendered.starts_with("]~!b[]~b]system\n"), "{rendered:?}");
+        assert!(rendered.contains("<effort>low</effort>"), "{rendered:?}");
+        assert!(
+            rendered.contains("]<]minimax[>[<tool_call>"),
+            "{rendered:?}"
+        );
+        assert!(rendered.contains("get_weather"), "{rendered:?}");
+        assert!(rendered.ends_with("]~b]ai\n"), "{rendered:?}");
     }
 
     /// GLM-5's generation suffix is `<|assistant|><think>`.  The direct-answer

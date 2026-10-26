@@ -5,6 +5,31 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.31] — 2026-10-23
+
+### Added
+- Native, single-file **MOSS-Image-Base** CMF support: `imagine-pack` stores
+  the source Qwen3.5 language path, MOSS DiT, Flux2 decode path, tokenizer,
+  template, scheduler, and recipe in one verified artifact.  The runtime runs
+  text, DiT, and VAE as separate residency stages rather than requiring an
+  unpacked Diffusers directory.
+- `cortiq imagine` now exposes the Base pipeline's documented source controls:
+  raw JSON layouts via `--layout` / `--layout-file`, negative-branch
+  `--uncond-skip-layers`, and standard SLG via `--slg-layers`, `--slg-scale`,
+  `--slg-start`, and `--slg-stop`.  The layout text is validated as an object
+  but is not reserialized before the stored MOSS template receives it.
+- MOSS `imagine-pack --dit-keep` permits an explicit provenance-recorded
+  q8_2f lift of selected `layers.N` blocks or DiT projections over a q4tp
+  base.  It is a transparent mixed-precision option, not an unmeasured
+  q4tp-v2 refit label.
+
+### Fixed
+- Native Metal Flux2 VAE admission now handles MOSS's compact 32-group
+  192- and 96-channel GroupNorm tails and protects the padded 96-channel
+  convolution tile.  The normal float4 path remains intact; new native-Metal
+  parity tests cover both tails.  A q4tp MOSS 256×256 one-step smoke on Apple
+  M4 now completes through native Metal DiT **and** VAE.
+
 ## [0.8.30] — 2026-10-22
 
 ### Added

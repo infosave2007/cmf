@@ -15,7 +15,7 @@
 //! Not in scope: per-skill delta tensors and task masks — this writes backbones.
 //! Those come from the DTG-MA path in `converter/`.
 
-use crate::npy;
+use crate::{minimax_m3, npy};
 use cortiq_core::format::{CMF_VERSION, CmfHeader, TensorSpec, TokenizerBundle};
 use cortiq_core::quant::{
     Q2TP_CHUNK, Q2TP_LMAX, Q4TP_LMAX, Q4TP_NIB, bf16_to_f32, f16_to_f32, f32_to_f16,
@@ -643,12 +643,60 @@ pub(crate) fn canon_name(raw: &str) -> Option<String> {
     Some(lfm2_canon(raw))
 }
 
+/// MiniMax-M3.1-Flash places its text backbone under `language_model`, but
+/// unlike the usual multimodal wrappers its LM head is a sibling of `model`
+/// rather than a member of it.  Routing that head through the generic wrapper
+/// rule would create `model.lm_head.weight`, which no loader reads.  Keep the
+/// index-attention tensors too: the current bounded dense fallback does not
+/// consume them, but dropping their trained projections would make a later
+/// sparse-attention implementation impossible without reconverting 428B of
+/// source weights.
+///
+/// The vision tower/projectors are intentionally not packaged here.  This is
+/// a text-backbone route; a CMF must not imply that image/video preprocessing
+/// or fusion works just because the source checkpoint is multimodal.
+fn minimax_m3_canon(raw: &str) -> Option<String> {
+    match raw {
+        "language_model.lm_head.weight" => Some("lm_head.weight".into()),
+        "language_model.lm_head.bias" => Some("lm_head.bias".into()),
+        _ => {
+            if let Some(rest) = raw.strip_prefix("language_model.model.") {
+                // Reuse the ordinary MLP/MoE normalization rules after
+                // removing only the MiniMax wrapper.  In particular this
+                // maps `block_sparse_moe`.  M3 puts its noaux routing bias
+                // directly under that block, while the older Kimi spelling
+                // puts it under `gate`; normalize both source spellings to
+                // the one loader name without changing other architectures.
+                let canonical = canon_name(&format!("model.{rest}"))?;
+                return Some(canonical.replace(
+                    ".mlp.e_score_correction_bias",
+                    ".mlp.expert_bias",
+                ));
+            }
+            if raw.starts_with("vision_tower.")
+                || raw.starts_with("multi_modal_projector.")
+                || raw.starts_with("patch_merge_mlp.")
+            {
+                return None;
+            }
+            // Do not let a changed source namespace masquerade as an
+            // ordinary tensor.  The M3 inventory validator diagnoses it
+            // before conversion; returning None here also keeps non-text
+            // extras out of the text-only artifact.
+            None
+        }
+    }
+}
+
 /// Prism/Bonsai uses the same text canonical layout as the ordinary Qwen
 /// reader, but its checkpoint wraps the language model one level deeper and
 /// carries a real vision tower.  Keep the generic `canon_name` multimodal
 /// policy unchanged (older readers intentionally drop vision); only this
 /// explicit architecture path maps the retained tower into `vis.*`.
 fn canon_name_for_arch(arch: &ModelArch, raw: &str, towers: MimoTowers) -> Option<String> {
+    if arch.arch_name == minimax_m3::MINIMAX_M3_MODEL_TYPE {
+        return minimax_m3_canon(raw);
+    }
     // MiMo-V2's rules (router bias, sinks, tower/MTP drops) are gated on the
     // arch so the generic canon policy of every other family is untouched.
     if arch.arch_name == MIMO_V2 {
@@ -780,6 +828,17 @@ fn force_dsv41_vision_f16(arch: &ModelArch, name: &str, shape: &[usize]) -> bool
         && (name.starts_with("vision.") || name.starts_with("aligner."))
 }
 
+/// M3's router starts as an F32 source plane and its top-4 choice is
+/// discontinuous.  An f16 rounding can select a different expert even when
+/// the output weight error looks negligible, so retain the tiny router matrix
+/// exactly.  This is architecture-gated: most other MoE families deliberately
+/// use the established f16 router policy for their own source/runtime paths.
+fn force_arch_f32(arch: &ModelArch, name: &str) -> bool {
+    force_f32(name)
+        || (arch.arch_name == minimax_m3::MINIMAX_M3_MODEL_TYPE
+            && name.ends_with(".mlp.gate.weight"))
+}
+
 /// Name-level "never quantize this matrix" rule, for tools that re-encode a
 /// float container outside the streaming emitter (GPTQ). The arch-gated
 /// vision rule is not included — it needs shapes and the arch.
@@ -867,6 +926,24 @@ fn quant_for_tensor(arch: &ModelArch, name: &str, base: Quant) -> Quant {
     // before this policy is consulted.
     if arch.arch_name == MIMO_V2 || arch.arch_name.eq_ignore_ascii_case("mellum") {
         return if name.contains(".mlp.experts.") {
+            base
+        } else {
+            Quant::Q8_2f
+        };
+    }
+    // MiniMax M3.1 has a 428B total parameter bank but only four routed
+    // experts are active per token.  Its attention, vocabulary edges, first
+    // three dense FFNs, shared expert and sparse-index projections run on
+    // every token, so a uniform four-bit conversion makes the small active
+    // skeleton carry most of the quality loss while saving little.  Keep
+    // only the routed + always-on shared expert matrices at q4tp; the source
+    // router itself is held F32 by `force_arch_f32` before this policy is
+    // consulted.  Keeping the entire expert triple on one codec is also the
+    // admission rule used by the selected-expert Metal/Vulkan paths; making
+    // the small shared expert q8 would force a later exact OAI graph back to
+    // CPU even after its activation kernel is available.
+    if arch.arch_name == minimax_m3::MINIMAX_M3_MODEL_TYPE {
+        return if name.contains(".mlp.experts.") || name.contains(".mlp.shared_expert.") {
             base
         } else {
             Quant::Q8_2f
@@ -1581,7 +1658,7 @@ fn emit_profiled_tensor(
             ),
             EmitMode::F16 => (TensorDtype::F16, encode_f16(vals)),
             EmitMode::Auto => {
-                if force_f32(name) {
+                if force_arch_f32(arch, name) {
                     (
                         TensorDtype::F32,
                         vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
@@ -3171,6 +3248,193 @@ pub(crate) fn unpack_nvfp4(
     Ok(out)
 }
 
+/// MiniMax M3's MXFP8 backbone layout: E4M3FN values and one UE8M0
+/// multiplier per contiguous 32 values of *each row*.
+///
+/// The upstream field is named `weight_scale_inv`, but its byte plane is an
+/// E8M0 multiplier as consumed by the reference loader: `2^(byte - 127)`.
+/// It is therefore deliberately separate from [`unpack_fp8_scale_inv`],
+/// whose scale plane is ordinary f32 and whose geometry may be two-
+/// dimensional.  A source revision with a different layout must not be
+/// accepted by the generic fine-grained FP8 path.
+pub(crate) fn unpack_mxfp8_rowwise(
+    packed: &[u8],
+    scales_e8m0: &[u8],
+    rows: usize,
+    cols: usize,
+) -> anyhow::Result<Vec<f32>> {
+    const GROUP: usize = 32;
+    anyhow::ensure!(
+        cols % GROUP == 0,
+        "mxfp8: cols {cols} is not a multiple of {GROUP}"
+    );
+    let values = rows
+        .checked_mul(cols)
+        .ok_or_else(|| anyhow::anyhow!("mxfp8: {rows}x{cols} overflows usize"))?;
+    let groups_per_row = cols / GROUP;
+    let scale_values = rows
+        .checked_mul(groups_per_row)
+        .ok_or_else(|| anyhow::anyhow!("mxfp8: scale shape overflows usize"))?;
+    anyhow::ensure!(
+        packed.len() == values && scales_e8m0.len() == scale_values,
+        "mxfp8: weight {} (want {values}) / scales {} (want {scale_values}) for {rows}x{cols}",
+        packed.len(),
+        scales_e8m0.len(),
+    );
+    let mut out = vec![0.0f32; values];
+    if rows == 0 || cols == 0 {
+        return Ok(out);
+    }
+    let threads = encode_threads().min(rows).max(1);
+    let rows_per_thread = rows.div_ceil(threads);
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        let mut workers = Vec::with_capacity(threads);
+        for (chunk_index, out_chunk) in out.chunks_mut(rows_per_thread * cols).enumerate() {
+            let first_row = chunk_index * rows_per_thread;
+            workers.push(scope.spawn(move || -> anyhow::Result<()> {
+                for (local_row, out_row) in out_chunk.chunks_mut(cols).enumerate() {
+                    let r = first_row + local_row;
+                    let packed_row = &packed[r * cols..(r + 1) * cols];
+                    let scale_row =
+                        &scales_e8m0[r * groups_per_row..(r + 1) * groups_per_row];
+                    for (g, &scale_byte) in scale_row.iter().enumerate() {
+                        // Reuse the OCP E8M0 decoder rather than `exp2`: it
+                        // has the exact subnormal representation for byte 0
+                        // and maps the reserved 255 encoding to NaN.
+                        let scale = cortiq_core::mxfp4::e8m0_to_f32(scale_byte);
+                        anyhow::ensure!(
+                            scale.is_finite(),
+                            "mxfp8: NaN scale at row {r} group {g}"
+                        );
+                        for c in 0..GROUP {
+                            let col = g * GROUP + c;
+                            let value = fp8_e4m3_to_f32(packed_row[col]);
+                            anyhow::ensure!(
+                                value.is_finite(),
+                                "mxfp8: NaN weight at row {r} column {col}"
+                            );
+                            let decoded = value * scale;
+                            anyhow::ensure!(
+                                decoded.is_finite(),
+                                "mxfp8: non-finite decoded weight at row {r} column {col}"
+                            );
+                            out_row[col] = decoded;
+                        }
+                    }
+                }
+                Ok(())
+            }));
+        }
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("mxfp8 worker panicked"))??;
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// compressed-tensors' `nvfp4-pack-quantized` layout used by MiniMax M3
+/// routed and shared experts.
+///
+/// This is intentionally **not** NVIDIA ModelOpt NVFP4 (`unpack_nvfp4`):
+/// `weight_packed` contains low-nibble-first E2M1 pairs, `weight_scale` is
+/// E4M3 per 16 values, and `weight_global_scale` is a *divisor*.  Its static
+/// weight is therefore `e2m1 * e4m3_scale / weight_global_scale`.
+/// `input_global_scale` belongs to dynamic activation quantization and must
+/// not be folded into this static matrix.
+pub(crate) fn unpack_ct_nvfp4_inverse_global_scale(
+    packed: &[u8],
+    scales_e4m3: &[u8],
+    global_scale_divisor: f32,
+    rows: usize,
+    cols_packed: usize,
+) -> anyhow::Result<Vec<f32>> {
+    const GROUP: usize = 16;
+    let cols = cols_packed
+        .checked_mul(2)
+        .ok_or_else(|| anyhow::anyhow!("compressed-tensors nvfp4: column count overflows usize"))?;
+    anyhow::ensure!(
+        cols % GROUP == 0,
+        "compressed-tensors nvfp4: cols {cols} is not a multiple of {GROUP}"
+    );
+    anyhow::ensure!(
+        global_scale_divisor.is_finite() && global_scale_divisor > 0.0,
+        "compressed-tensors nvfp4: weight_global_scale must be finite and positive, got {global_scale_divisor}"
+    );
+    let inv_global = global_scale_divisor.recip();
+    anyhow::ensure!(
+        inv_global.is_finite(),
+        "compressed-tensors nvfp4: inverse weight_global_scale is not finite"
+    );
+    let groups_per_row = cols / GROUP;
+    let values = rows
+        .checked_mul(cols)
+        .ok_or_else(|| anyhow::anyhow!("compressed-tensors nvfp4: {rows}x{cols} overflows usize"))?;
+    let expected_packed = rows.checked_mul(cols_packed).ok_or_else(|| {
+        anyhow::anyhow!("compressed-tensors nvfp4: packed shape overflows usize")
+    })?;
+    let expected_scales = rows.checked_mul(groups_per_row).ok_or_else(|| {
+        anyhow::anyhow!("compressed-tensors nvfp4: scale shape overflows usize")
+    })?;
+    anyhow::ensure!(
+        packed.len() == expected_packed && scales_e4m3.len() == expected_scales,
+        "compressed-tensors nvfp4: packed {} (want {expected_packed}) / scales {} (want {expected_scales}) for {rows}x{cols}",
+        packed.len(),
+        scales_e4m3.len(),
+    );
+    let mut out = vec![0.0f32; values];
+    if rows == 0 || cols == 0 {
+        return Ok(out);
+    }
+    let lut = &cortiq_core::mxfp4::E2M1_LUT;
+    let threads = encode_threads().min(rows).max(1);
+    let rows_per_thread = rows.div_ceil(threads);
+    std::thread::scope(|scope| -> anyhow::Result<()> {
+        let mut workers = Vec::with_capacity(threads);
+        for (chunk_index, out_chunk) in out.chunks_mut(rows_per_thread * cols).enumerate() {
+            let first_row = chunk_index * rows_per_thread;
+            workers.push(scope.spawn(move || -> anyhow::Result<()> {
+                for (local_row, out_row) in out_chunk.chunks_mut(cols).enumerate() {
+                    let r = first_row + local_row;
+                    for g in 0..groups_per_row {
+                        let scale = fp8_e4m3_to_f32(scales_e4m3[r * groups_per_row + g]);
+                        anyhow::ensure!(
+                            scale.is_finite(),
+                            "compressed-tensors nvfp4: NaN scale at row {r} group {g}"
+                        );
+                        let scale = scale * inv_global;
+                        anyhow::ensure!(
+                            scale.is_finite(),
+                            "compressed-tensors nvfp4: non-finite combined scale at row {r} group {g}"
+                        );
+                        for j in 0..GROUP / 2 {
+                            let byte = packed[r * cols_packed + g * (GROUP / 2) + j];
+                            let even = lut[(byte & 0x0F) as usize] * scale;
+                            let odd = lut[(byte >> 4) as usize] * scale;
+                            anyhow::ensure!(
+                                even.is_finite() && odd.is_finite(),
+                                "compressed-tensors nvfp4: non-finite decoded weight at row {r} group {g}"
+                            );
+                            out_row[g * GROUP + 2 * j] = even;
+                            out_row[g * GROUP + 2 * j + 1] = odd;
+                        }
+                    }
+                }
+                Ok(())
+            }));
+        }
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("compressed-tensors nvfp4 worker panicked"))??;
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
 /// The NVFP4 group size when the checkpoint declares ModelOpt NVFP4, either
 /// in `hf_quant_config.json` (`{"quantization": {"quant_algo": "NVFP4",
 /// "group_size": 16}}`) or in `config.json`'s `quantization_config`
@@ -3235,6 +3499,158 @@ fn companion<'a>(files: &'a [SafeTensors], name: &str) -> Option<(&'a SafeTensor
     files
         .iter()
         .find_map(|f| f.tensors.iter().find(|t| t.name == name).map(|t| (f, t)))
+}
+
+/// Decode one MiniMax M3 MXFP8 backbone matrix without accepting another
+/// checkpoint's superficially similar FP8 plane.  Kept private until the
+/// MiniMax conversion route binds the checked M3 source contract to it.
+#[allow(dead_code)]
+fn minimax_m3_mxfp8_decode(
+    m: &TensorMeta,
+    file: &SafeTensors,
+    files: &[SafeTensors],
+) -> anyhow::Result<(Vec<usize>, Vec<f32>)> {
+    let name = &m.name;
+    anyhow::ensure!(
+        m.dtype == "F8_E4M3" && m.shape.len() == 2,
+        "{name}: MiniMax M3 MXFP8 weight must be F8_E4M3 2-D, got {} {:?}",
+        m.dtype,
+        m.shape
+    );
+    let (rows, cols) = (m.shape[0], m.shape[1]);
+    anyhow::ensure!(
+        cols % 32 == 0,
+        "{name}: MiniMax M3 MXFP8 width {cols} is not divisible by 32"
+    );
+    let scale_name = format!("{}_scale_inv", m.name);
+    let (scale_file, scale_meta) = companion(files, &scale_name)
+        .ok_or_else(|| anyhow::anyhow!("{name}: missing MiniMax M3 companion {scale_name}"))?;
+    anyhow::ensure!(
+        scale_meta.dtype == "U8" && scale_meta.shape == vec![rows, cols / 32],
+        "{name}: MiniMax M3 {scale_name} is {} {:?}, expected U8 [{rows}, {}]",
+        scale_meta.dtype,
+        scale_meta.shape,
+        cols / 32
+    );
+    let values = unpack_mxfp8_rowwise(file.bytes(m), scale_file.bytes(scale_meta), rows, cols)?;
+    Ok((vec![rows, cols], values))
+}
+
+/// Decode one MiniMax M3 compressed-tensors NVFP4 expert matrix.
+///
+/// The `input_global_scale` companion is checked to make a malformed source
+/// fail early, but deliberately does not enter the static weight product: it
+/// calibrates runtime activations, not the checkpoint's matrix values.
+#[allow(dead_code)]
+fn minimax_m3_ct_nvfp4_decode(
+    m: &TensorMeta,
+    file: &SafeTensors,
+    files: &[SafeTensors],
+) -> anyhow::Result<(Vec<usize>, Vec<f32>)> {
+    let name = &m.name;
+    anyhow::ensure!(
+        m.dtype == "U8" && m.shape.len() == 2 && name.ends_with(".weight_packed"),
+        "{name}: MiniMax M3 NVFP4 weight must be U8 [rows, cols/2] named .weight_packed, got {} {:?}",
+        m.dtype,
+        m.shape
+    );
+    let (rows, cols_packed) = (m.shape[0], m.shape[1]);
+    let cols = cols_packed.checked_mul(2).ok_or_else(|| {
+        anyhow::anyhow!("{name}: MiniMax M3 NVFP4 logical width overflows usize")
+    })?;
+    anyhow::ensure!(
+        cols % 16 == 0,
+        "{name}: MiniMax M3 NVFP4 logical width {cols} is not divisible by 16"
+    );
+    let stem = name
+        .strip_suffix(".weight_packed")
+        .expect("suffix checked above");
+    let scale_name = format!("{stem}.weight_scale");
+    let (scale_file, scale_meta) = companion(files, &scale_name)
+        .ok_or_else(|| anyhow::anyhow!("{name}: missing MiniMax M3 companion {scale_name}"))?;
+    anyhow::ensure!(
+        scale_meta.dtype == "F8_E4M3" && scale_meta.shape == vec![rows, cols / 16],
+        "{name}: MiniMax M3 {scale_name} is {} {:?}, expected F8_E4M3 [{rows}, {}]",
+        scale_meta.dtype,
+        scale_meta.shape,
+        cols / 16
+    );
+    let global_name = format!("{stem}.weight_global_scale");
+    let (global_file, global_meta) = companion(files, &global_name)
+        .ok_or_else(|| anyhow::anyhow!("{name}: missing MiniMax M3 companion {global_name}"))?;
+    anyhow::ensure!(
+        global_meta.dtype == "F32" && (global_meta.shape.is_empty() || global_meta.shape == [1]),
+        "{name}: MiniMax M3 {global_name} is {} {:?}, expected scalar F32",
+        global_meta.dtype,
+        global_meta.shape
+    );
+    let global_values = to_f32(&global_meta.dtype, global_file.bytes(global_meta))?;
+    anyhow::ensure!(
+        global_values.len() == 1,
+        "{name}: MiniMax M3 {global_name} has {} values, expected one",
+        global_values.len()
+    );
+    let input_name = format!("{stem}.input_global_scale");
+    let (input_file, input_meta) = companion(files, &input_name)
+        .ok_or_else(|| anyhow::anyhow!("{name}: missing MiniMax M3 companion {input_name}"))?;
+    anyhow::ensure!(
+        input_meta.dtype == "F32" && (input_meta.shape.is_empty() || input_meta.shape == [1]),
+        "{name}: MiniMax M3 {input_name} is {} {:?}, expected scalar F32",
+        input_meta.dtype,
+        input_meta.shape
+    );
+    let input_values = to_f32(&input_meta.dtype, input_file.bytes(input_meta))?;
+    anyhow::ensure!(
+        input_values.len() == 1 && input_values[0].is_finite(),
+        "{name}: MiniMax M3 {input_name} must be one finite value"
+    );
+    // Do NOT fold `input_values[0]` into weights.  It is present solely to
+    // certify that this is the published dynamic-activation source layout.
+    let values = unpack_ct_nvfp4_inverse_global_scale(
+        file.bytes(m),
+        scale_file.bytes(scale_meta),
+        global_values[0],
+        rows,
+        cols_packed,
+    )?;
+    Ok((vec![rows, cols], values))
+}
+
+/// MiniMax M3 quantization companion planes are consumed together with their
+/// owning matrix.  This checks the **raw source name** rather than a canonical
+/// name: a future canonical spelling must not accidentally serialize a scale
+/// plane as an executable tensor.
+fn minimax_m3_quant_companion(raw: &str) -> bool {
+    [
+        ".weight_scale_inv",
+        ".weight_scale",
+        ".weight_global_scale",
+        ".input_global_scale",
+    ]
+    .iter()
+    .any(|suffix| raw.ends_with(suffix))
+}
+
+/// Match an M3 partial-conversion pattern against both names that an NVFP4
+/// routed-expert matrix has while it crosses the converter.
+///
+/// The source stores its executable plane as `*.weight_packed`; after its
+/// companions have been consumed, the CMF directory deliberately exposes the
+/// ordinary logical `*.weight` name.  `CMF_CONVERT_ONLY` is a user-facing
+/// output probe, so accepting only the early spelling would make a pattern
+/// copied from `cortiq info` silently select no expert.  Keep the raw spelling
+/// accepted too, for compatibility with existing diagnostic scripts.
+///
+/// Callers must reject quantization companions before calling this helper:
+/// stripping `_packed` is valid only for an executable packed weight, never
+/// for a scale/global-scale plane.
+fn minimax_m3_convert_only_matches(patterns: &[String], early_name: &str) -> bool {
+    patterns.iter().any(|pattern| {
+        glob_match(pattern, early_name)
+            || early_name
+                .strip_suffix("_packed")
+                .is_some_and(|emitted_name| glob_match(pattern, emitted_name))
+    })
 }
 
 /// Decode one ModelOpt NVFP4 `.weight` (U8) with its `.weight_scale`
@@ -3869,6 +4285,260 @@ pub(crate) fn open_safetensors(path: &Path) -> anyhow::Result<SafeTensors> {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default(),
     })
+}
+
+/// A bounded safetensors header parser for MiniMax M3's preflight.  Unlike
+/// `open_safetensors`, this reads no payload bytes: the M3 route validates all
+/// 89,632 source entries before it starts a 250+ GB streamed conversion.
+const MINIMAX_M3_MAX_HEADER_BYTES: usize = 64 * 1024 * 1024;
+
+fn minimax_m3_header_metas(label: &str, bytes: &[u8]) -> anyhow::Result<Vec<TensorMeta>> {
+    anyhow::ensure!(
+        bytes.len() >= 8,
+        "MiniMax-M3.1 preflight: {label} is shorter than a safetensors header prefix"
+    );
+    let header_len_u64 = u64::from_le_bytes(bytes[..8].try_into().expect("prefix length checked"));
+    let header_len = usize::try_from(header_len_u64).map_err(|_| {
+        anyhow::anyhow!(
+            "MiniMax-M3.1 preflight: {label} safetensors header length {header_len_u64} does not fit usize"
+        )
+    })?;
+    anyhow::ensure!(
+        header_len <= MINIMAX_M3_MAX_HEADER_BYTES,
+        "MiniMax-M3.1 preflight: {label} safetensors header is {header_len} bytes (limit {MINIMAX_M3_MAX_HEADER_BYTES})"
+    );
+    let end = 8usize.checked_add(header_len).ok_or_else(|| {
+        anyhow::anyhow!("MiniMax-M3.1 preflight: {label} safetensors header length overflows")
+    })?;
+    anyhow::ensure!(
+        bytes.len() >= end,
+        "MiniMax-M3.1 preflight: {label} supplied {} header bytes, need {end}",
+        bytes.len()
+    );
+    let header: serde_json::Value = serde_json::from_slice(&bytes[8..end]).map_err(|err| {
+        anyhow::anyhow!("MiniMax-M3.1 preflight: parse {label} safetensors header: {err}")
+    })?;
+    let object = header.as_object().ok_or_else(|| {
+        anyhow::anyhow!("MiniMax-M3.1 preflight: {label} safetensors header is not an object")
+    })?;
+    let mut tensors = Vec::with_capacity(object.len());
+    for (name, value) in object {
+        if name == "__metadata__" {
+            continue;
+        }
+        let dtype = value.get("dtype").and_then(|value| value.as_str()).ok_or_else(|| {
+            anyhow::anyhow!("MiniMax-M3.1 preflight: {label}:{name} has no string dtype")
+        })?;
+        let shape = value
+            .get("shape")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| anyhow::anyhow!("MiniMax-M3.1 preflight: {label}:{name} has no shape"))?
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let dim = value.as_u64().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "MiniMax-M3.1 preflight: {label}:{name} shape[{index}] is not an unsigned integer"
+                    )
+                })?;
+                usize::try_from(dim).map_err(|_| {
+                    anyhow::anyhow!(
+                        "MiniMax-M3.1 preflight: {label}:{name} shape[{index}] does not fit usize"
+                    )
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let offsets = value
+            .get("data_offsets")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| anyhow::anyhow!("MiniMax-M3.1 preflight: {label}:{name} has no data_offsets"))?;
+        anyhow::ensure!(
+            offsets.len() == 2,
+            "MiniMax-M3.1 preflight: {label}:{name} data_offsets must have two entries"
+        );
+        let start_u64 = offsets[0].as_u64().ok_or_else(|| {
+            anyhow::anyhow!("MiniMax-M3.1 preflight: {label}:{name} offset start is not an unsigned integer")
+        })?;
+        let end_u64 = offsets[1].as_u64().ok_or_else(|| {
+            anyhow::anyhow!("MiniMax-M3.1 preflight: {label}:{name} offset end is not an unsigned integer")
+        })?;
+        anyhow::ensure!(
+            start_u64 <= end_u64,
+            "MiniMax-M3.1 preflight: {label}:{name} data offsets are reversed"
+        );
+        let start = usize::try_from(start_u64).map_err(|_| {
+            anyhow::anyhow!("MiniMax-M3.1 preflight: {label}:{name} offset start does not fit usize")
+        })?;
+        let end = usize::try_from(end_u64).map_err(|_| {
+            anyhow::anyhow!("MiniMax-M3.1 preflight: {label}:{name} offset end does not fit usize")
+        })?;
+        tensors.push(TensorMeta {
+            name: name.clone(),
+            dtype: dtype.to_owned(),
+            shape,
+            start,
+            end,
+        });
+    }
+    Ok(tensors)
+}
+
+fn minimax_m3_read_local_header(path: &Path) -> anyhow::Result<Vec<TensorMeta>> {
+    let mut file = fs::File::open(path)
+        .map_err(|err| anyhow::anyhow!("MiniMax-M3.1 preflight: open {}: {err}", path.display()))?;
+    let mut prefix = [0u8; 8];
+    file.read_exact(&mut prefix)
+        .map_err(|err| anyhow::anyhow!("MiniMax-M3.1 preflight: read {} prefix: {err}", path.display()))?;
+    let header_len = u64::from_le_bytes(prefix);
+    let header_len_usize = usize::try_from(header_len).map_err(|_| {
+        anyhow::anyhow!(
+            "MiniMax-M3.1 preflight: {} header length {header_len} does not fit usize",
+            path.display()
+        )
+    })?;
+    anyhow::ensure!(
+        header_len_usize <= MINIMAX_M3_MAX_HEADER_BYTES,
+        "MiniMax-M3.1 preflight: {} header is {header_len_usize} bytes (limit {MINIMAX_M3_MAX_HEADER_BYTES})",
+        path.display()
+    );
+    let mut bytes = Vec::with_capacity(8 + header_len_usize);
+    bytes.extend_from_slice(&prefix);
+    bytes.resize(8 + header_len_usize, 0);
+    file.read_exact(&mut bytes[8..]).map_err(|err| {
+        anyhow::anyhow!("MiniMax-M3.1 preflight: read {} header: {err}", path.display())
+    })?;
+    minimax_m3_header_metas(&path.display().to_string(), &bytes)
+}
+
+fn minimax_m3_fetch_remote_header(
+    agent: &ureq::Agent,
+    url: &str,
+    token: Option<&str>,
+) -> anyhow::Result<Vec<TensorMeta>> {
+    let prefix = with_retry(4, || get_range(agent, url, token, 0, 8))?;
+    anyhow::ensure!(
+        prefix.len() == 8,
+        "MiniMax-M3.1 preflight: {url} returned {} bytes for its 8-byte header prefix",
+        prefix.len()
+    );
+    let header_len = u64::from_le_bytes(prefix[..8].try_into().expect("prefix length checked"));
+    let header_len_usize = usize::try_from(header_len).map_err(|_| {
+        anyhow::anyhow!("MiniMax-M3.1 preflight: {url} header length {header_len} does not fit usize")
+    })?;
+    anyhow::ensure!(
+        header_len_usize <= MINIMAX_M3_MAX_HEADER_BYTES,
+        "MiniMax-M3.1 preflight: {url} header is {header_len_usize} bytes (limit {MINIMAX_M3_MAX_HEADER_BYTES})"
+    );
+    let end = 8u64.checked_add(header_len).ok_or_else(|| {
+        anyhow::anyhow!("MiniMax-M3.1 preflight: {url} header range overflows u64")
+    })?;
+    let header = with_retry(4, || get_range(agent, url, token, 8, end))?;
+    anyhow::ensure!(
+        header.len() == header_len_usize,
+        "MiniMax-M3.1 preflight: {url} returned {} bytes for a {header_len_usize}-byte header",
+        header.len()
+    );
+    let mut bytes = prefix;
+    bytes.extend_from_slice(&header);
+    minimax_m3_header_metas(url, &bytes)
+}
+
+fn minimax_m3_shard_names(dir: &Path) -> anyhow::Result<Vec<String>> {
+    let index = dir.join("model.safetensors.index.json");
+    if index.exists() {
+        let source: serde_json::Value = serde_json::from_slice(&fs::read(&index).map_err(|err| {
+            anyhow::anyhow!("MiniMax-M3.1 preflight: read {}: {err}", index.display())
+        })?)?;
+        let map = source.get("weight_map").and_then(|value| value.as_object()).ok_or_else(|| {
+            anyhow::anyhow!("MiniMax-M3.1 preflight: {} has no object weight_map", index.display())
+        })?;
+        let mut names: Vec<String> = map
+            .values()
+            .map(|value| {
+                value.as_str().map(str::to_owned).ok_or_else(|| {
+                    anyhow::anyhow!("MiniMax-M3.1 preflight: {} weight_map has a non-string shard", index.display())
+                })
+            })
+            .collect::<anyhow::Result<_>>()?;
+        names.sort();
+        names.dedup();
+        anyhow::ensure!(
+            !names.is_empty(),
+            "MiniMax-M3.1 preflight: {} weight_map is empty",
+            index.display()
+        );
+        return Ok(names);
+    }
+    let single = dir.join("model.safetensors");
+    anyhow::ensure!(
+        single.exists(),
+        "MiniMax-M3.1 preflight: neither {} nor {} exists",
+        index.display(),
+        single.display()
+    );
+    Ok(vec!["model.safetensors".into()])
+}
+
+fn validate_minimax_m3_source_headers(
+    layout: &minimax_m3::MiniMaxM3Layout,
+    headers: &[Vec<TensorMeta>],
+) -> anyhow::Result<()> {
+    minimax_m3::validate_minimax_m3_source_index(
+        layout,
+        headers.iter().flatten().map(|tensor| minimax_m3::MiniMaxM3TensorRef {
+            name: &tensor.name,
+            dtype: &tensor.dtype,
+            shape: &tensor.shape,
+        }),
+    )
+}
+
+/// Select the immutable M3 source shards that can contribute to a
+/// `CMF_CONVERT_ONLY` probe.  The result is intentionally based on the same
+/// name gate as `process_file`: for a packed routed expert, a pattern may use
+/// either the early canonical source name (`*.weight_packed`) or the final
+/// logical CMF name (`*.weight`).
+///
+/// The full header inventory has already been validated when this runs, so a
+/// shard omitted here has no selected executable tensor.  Its quantization
+/// companions are not independently executable and must never force a large
+/// payload download by themselves.
+fn minimax_m3_convert_only_stream_shards(
+    arch: &ModelArch,
+    towers: MimoTowers,
+    shard_names: &[String],
+    headers: &[Vec<TensorMeta>],
+    patterns: &[String],
+) -> anyhow::Result<HashSet<String>> {
+    anyhow::ensure!(
+        arch.arch_name == minimax_m3::MINIMAX_M3_MODEL_TYPE,
+        "MiniMax-M3.1 partial stream selection requires the MiniMax M3 architecture"
+    );
+    anyhow::ensure!(
+        shard_names.len() == headers.len(),
+        "MiniMax-M3.1 partial stream selection has {} shard name(s) but {} header(s)",
+        shard_names.len(),
+        headers.len()
+    );
+    anyhow::ensure!(
+        !patterns.is_empty(),
+        "MiniMax-M3.1 partial stream selection requires at least one pattern"
+    );
+
+    let mut selected = HashSet::new();
+    for (shard, metas) in shard_names.iter().zip(headers) {
+        let selected_here = metas.iter().any(|meta| {
+            if minimax_m3_quant_companion(&meta.name) {
+                return false;
+            }
+            canon_name_for_arch(arch, &meta.name, towers)
+                .is_some_and(|name| minimax_m3_convert_only_matches(patterns, &name))
+        });
+        if selected_here {
+            selected.insert(shard.clone());
+        }
+    }
+    Ok(selected)
 }
 
 /// Memory-map a model dir's weights (single file or sharded index).
@@ -4812,6 +5482,30 @@ const MINICPM_DSPARK_SOURCE_ARCH: &str = "Qwen3DSparkModel";
 const MINICPM_DSPARK_BASE_ARCH: &str = "minicpmv4_7";
 const MINICPM_DSPARK_TARGET_IDS: [usize; 5] = [3, 11, 19, 27, 35];
 
+// ── MiniMax-M3.1 DSpark sidecar (same `<stem>.dspark.cmf` contract) ────────
+//
+// The official M3.1 draft is `DSparkMiniMaxDraftModel`: five dense Qwen3
+// shaped blocks over the TARGET's hidden (6144, so the taps need no
+// projection), an MXFP8-quantized body, a vanilla Markov head, and a
+// confidence head — the same executor schema as MiniCPM's draft, with its
+// own geometry and its own source namespace.
+const MINIMAX_DSPARK_ARCH: &str = "minimax_m31_dspark_sidecar";
+const MINIMAX_DSPARK_SOURCE_ARCH: &str = "DSparkMiniMaxDraftModel";
+const MINIMAX_DSPARK_BASE_ARCH: &str = "minimax_m3_vl";
+const MINIMAX_DSPARK_TARGET_IDS: [usize; 5] = [3, 17, 31, 45, 59];
+/// The draft safetensors namespace inside the M3.1 checkpoint.
+const MINIMAX_DSPARK_SRC: &str = "language_model.model.dspark.";
+
+/// Which official draft contract a sidecar follows. The two share the
+/// executor schema (fc taps, Markov + confidence heads, five blocks) but
+/// differ in source namespace, geometry, quantization, and config nesting —
+/// a mismatch must fail closed rather than be reinterpreted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DsparkFlavor {
+    Minicpm,
+    Minimax,
+}
+
 /// Geometry of the one published MiniCPM-V 4.7 35B-A3B DSpark checkpoint.
 /// Keeping this local to the converter is intentional: until a dedicated
 /// executor exists, accepting a merely Qwen-shaped draft as this sidecar
@@ -4832,6 +5526,7 @@ struct DsparkLayout {
     num_target_layers: usize,
     rope_theta: f64,
     rms_norm_eps: f64,
+    flavor: DsparkFlavor,
 }
 
 /// One tensor in the fixed DSpark payload schema.  `source` is deliberately
@@ -4946,6 +5641,7 @@ impl DsparkLayout {
                 .get("rms_norm_eps")
                 .and_then(|v| v.as_f64())
                 .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: rms_norm_eps missing"))?,
+            flavor: DsparkFlavor::Minicpm,
         };
         anyhow::ensure!(
             layout.hidden == 2048
@@ -4978,9 +5674,141 @@ impl DsparkLayout {
         );
         Ok(layout)
     }
+
+    /// Parse and fail closed on the official MiniMax-M3.1 DSpark contract.
+    ///
+    /// The M3.1 draft config nests its whole body under `text_config` (the
+    /// draft is a `minimax_m3_vl` module), carries the DFlash block numbers
+    /// at the root as `dspark_*`, and quantizes its matrices to MXFP8 — none
+    /// of which the MiniCPM reader assumes. Every value here is checked
+    /// against the one published checkpoint, so a future draft revision
+    /// fails closed instead of being reinterpreted.
+    fn minimax(config: &serde_json::Value) -> anyhow::Result<Self> {
+        let architectures = config
+            .get("architectures")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: config has no architectures array"))?;
+        anyhow::ensure!(
+            architectures.iter().any(|v| v.as_str() == Some(MINIMAX_DSPARK_SOURCE_ARCH)),
+            "DSpark sidecar: expected architectures to include {MINIMAX_DSPARK_SOURCE_ARCH}"
+        );
+        anyhow::ensure!(
+            dspark_cfg_str(config, "model_type")? == MINIMAX_DSPARK_BASE_ARCH,
+            "DSpark sidecar: expected model_type {MINIMAX_DSPARK_BASE_ARCH}"
+        );
+        let text = config
+            .get("text_config")
+            .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: config has no text_config"))?;
+        let dflash = text
+            .get("dflash_config")
+            .or_else(|| config.get("dflash_config"))
+            .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: config has no dflash_config"))?;
+        // Root-level DFlash numbers and their text_config twins must agree.
+        let root_targets = config
+            .get("dspark_target_layer_ids")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64().map(|v| v as usize))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        anyhow::ensure!(
+            root_targets == MINIMAX_DSPARK_TARGET_IDS,
+            "DSpark sidecar: dspark_target_layer_ids {root_targets:?} are not the published M3.1 contract {:?}",
+            MINIMAX_DSPARK_TARGET_IDS
+        );
+        let dflash_targets = dflash
+            .get("target_layer_ids")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64().map(|v| v as usize))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        anyhow::ensure!(
+            dflash_targets == root_targets,
+            "DSpark sidecar: dflash_config.target_layer_ids disagrees with dspark_target_layer_ids"
+        );
+        let root_block = dspark_cfg_usize(config, "dspark_block_size")?;
+        let dflash_block = dspark_cfg_usize(dflash, "block_size")?;
+        anyhow::ensure!(
+            root_block == dflash_block,
+            "DSpark sidecar: dspark_block_size {root_block} disagrees with dflash block_size {dflash_block}"
+        );
+        anyhow::ensure!(
+            dspark_cfg_bool(config, "enable_confidence_head")?
+                && dspark_cfg_bool(config, "confidence_head_with_markov")?,
+            "DSpark sidecar: the published confidence head contract is required"
+        );
+        let target_layers: [usize; 5] = root_targets
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("DSpark sidecar: expected exactly five target layers"))?;
+
+        let get_text = |key: &str| -> anyhow::Result<usize> {
+            text.get(key)
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: text_config.{key} missing"))
+        };
+        let layout = Self {
+            hidden: get_text("hidden_size")?,
+            // The draft's MLP is the target's DENSE width (12288), not the
+            // MoE `intermediate_size` its config also carries.
+            intermediate: get_text("dense_intermediate_size")?,
+            layers: get_text("num_hidden_layers")?,
+            heads: get_text("num_attention_heads")?,
+            kv_heads: get_text("num_key_value_heads")?,
+            head_dim: get_text("head_dim")?,
+            vocab: get_text("vocab_size")?,
+            markov_rank: dspark_cfg_usize(config, "markov_rank")?,
+            block_size: root_block,
+            mask_token_id: dspark_cfg_usize(dflash, "mask_token_id")?,
+            target_layers,
+            num_target_layers: dspark_cfg_usize(dflash, "num_target_layers")?,
+            rope_theta: text
+                .get("rope_theta")
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: text_config.rope_theta missing"))?,
+            rms_norm_eps: text
+                .get("rms_norm_eps")
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: text_config.rms_norm_eps missing"))?,
+            flavor: DsparkFlavor::Minimax,
+        };
+        anyhow::ensure!(
+            layout.hidden == 6144
+                && layout.intermediate == 12288
+                && layout.layers == 5
+                && layout.heads == 64
+                && layout.kv_heads == 4
+                && layout.head_dim == 128
+                && layout.vocab == 200_064
+                && layout.markov_rank == 256
+                && layout.block_size == 7
+                && layout.mask_token_id == 200_058
+                && layout.num_target_layers == 60
+                && (layout.rope_theta - 10_000_000.0).abs() < f64::EPSILON
+                && (layout.rms_norm_eps - 1e-6).abs() < f64::EPSILON,
+            "DSpark sidecar: unsupported MiniMax M3.1 DSpark geometry {layout:?}"
+        );
+        // The draft's MLP activation and Q/K norm are part of the executor
+        // contract the sidecar documents; a config that drifts from them
+        // would silently change what a future executor computes.
+        anyhow::ensure!(
+            text.get("hidden_act").and_then(|v| v.as_str()) == Some("swigluoai")
+                && text.get("swiglu_alpha").and_then(|v| v.as_f64()) == Some(1.702)
+                && text.get("swiglu_limit").and_then(|v| v.as_f64()) == Some(7.0)
+                && text.get("use_qk_norm").and_then(|v| v.as_bool()) == Some(true),
+            "DSpark sidecar: draft act/QK-norm contract drifted from swigluoai(1.702, 7.0)+qk-norm"
+        );
+        Ok(layout)
+    }
 }
 
 fn dspark_tensor_specs(layout: &DsparkLayout) -> Vec<DsparkTensorSpec> {
+    let minimax = layout.flavor == DsparkFlavor::Minimax;
     let mut specs = Vec::with_capacity(62);
     let mut add = |source: String, shape: Vec<usize>, matrix: bool| {
         specs.push(DsparkTensorSpec {
@@ -4996,7 +5824,14 @@ fn dspark_tensor_specs(layout: &DsparkLayout) -> Vec<DsparkTensorSpec> {
     );
     add("hidden_norm.weight".into(), vec![layout.hidden], false);
     for li in 0..layout.layers {
-        let p = format!("layers.{li}.");
+        // MiniCPM ships `layers.N.*`; M3.1 nests each block under
+        // `layers.N.decoder_layer.`. The names here carry NO source
+        // namespace — the validator and the decoder add it per flavor.
+        let p = if minimax {
+            format!("layers.{li}.decoder_layer.")
+        } else {
+            format!("layers.{li}.")
+        };
         add(format!("{p}input_layernorm.weight"), vec![layout.hidden], false);
         add(
             format!("{p}self_attn.q_proj.weight"),
@@ -5041,7 +5876,13 @@ fn dspark_tensor_specs(layout: &DsparkLayout) -> Vec<DsparkTensorSpec> {
             true,
         );
     }
-    add("norm.weight".into(), vec![layout.hidden], false);
+    // The two checkpoints name their final block norm differently.
+    let final_norm = if minimax {
+        "final_norm.weight"
+    } else {
+        "norm.weight"
+    };
+    add(final_norm.into(), vec![layout.hidden], false);
     add(
         "markov_head.markov_w1.weight".into(),
         vec![layout.vocab, layout.markov_rank],
@@ -5089,48 +5930,105 @@ fn dspark_matrix_dtype(quant: Quant) -> TensorDtype {
 fn validate_dspark_source(
     source: &SafeTensors,
     specs: &[DsparkTensorSpec],
+    flavor: DsparkFlavor,
 ) -> anyhow::Result<()> {
+    // MiniCPM's source tensors carry their short names; M3.1's live under
+    // the module namespace.
+    let prefix = match flavor {
+        DsparkFlavor::Minicpm => "",
+        DsparkFlavor::Minimax => MINIMAX_DSPARK_SRC,
+    };
+    // Only M3.1's layer matrices are quantized: each adds one scale
+    // companion to the raw file, so the raw tensor count exceeds the
+    // logical schema by exactly those companions.
+    let companions = if flavor == DsparkFlavor::Minimax {
+        specs
+            .iter()
+            .filter(|s| s.matrix && s.source.starts_with("layers."))
+            .count()
+    } else {
+        0
+    };
     anyhow::ensure!(
-        source.tensors.len() == specs.len(),
+        source.tensors.len() == specs.len() + companions,
         "DSpark sidecar: source has {} tensors, expected {} — refusing to drop unknown tensors",
         source.tensors.len(),
-        specs.len()
+        specs.len() + companions
     );
-    let known: HashSet<&str> = specs.iter().map(|s| s.source.as_str()).collect();
-    for tensor in &source.tensors {
-        anyhow::ensure!(
-            known.contains(tensor.name.as_str()),
-            "DSpark sidecar: unexpected source tensor {} — refusing to drop it",
-            tensor.name
-        );
-    }
+    let mut claimed: HashSet<String> = HashSet::new();
     for spec in specs {
+        let name = format!("{prefix}{}", spec.source);
         let tensor = source
             .tensors
             .iter()
-            .find(|t| t.name == spec.source)
-            .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: missing source tensor {}", spec.source))?;
-        anyhow::ensure!(
-            tensor.dtype == "BF16",
-            "DSpark sidecar: {} is {}, expected BF16",
-            spec.source,
-            tensor.dtype
-        );
+            .find(|t| t.name == name)
+            .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: missing source tensor {name}"))?;
+        claimed.insert(name.clone());
         anyhow::ensure!(
             tensor.shape == spec.shape,
-            "DSpark sidecar: {} has shape {:?}, expected {:?}",
-            spec.source,
+            "DSpark sidecar: {name} has shape {:?}, expected {:?}",
             tensor.shape,
             spec.shape
         );
         let elems = spec.shape.iter().product::<usize>();
+        let mxfp8_layer_matrix =
+            flavor == DsparkFlavor::Minimax && spec.matrix && spec.source.starts_with("layers.");
+        if mxfp8_layer_matrix {
+            // The published M3.1 draft stores its layer bodies as MXFP8:
+            // an F8_E4M3 matrix plus a row-block (cols/32) U8 scale plane.
+            anyhow::ensure!(
+                tensor.dtype == "F8_E4M3",
+                "DSpark sidecar: {name} is {}, expected F8_E4M3",
+                tensor.dtype
+            );
+            anyhow::ensure!(
+                tensor.end >= tensor.start && tensor.end - tensor.start == elems,
+                "DSpark sidecar: {name} has invalid F8 byte span [{}, {}) for {:?}",
+                tensor.start,
+                tensor.end,
+                spec.shape
+            );
+            let scale_name = format!("{name}_scale_inv");
+            let scale = source
+                .tensors
+                .iter()
+                .find(|t| t.name == scale_name)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("DSpark sidecar: missing MXFP8 companion {scale_name}")
+                })?;
+            claimed.insert(scale_name.clone());
+            let (rows, cols) = (spec.shape[0], spec.shape[1]);
+            anyhow::ensure!(
+                scale.dtype == "U8" && scale.shape == vec![rows, cols / 32],
+                "DSpark sidecar: {scale_name} is {} {:?}, expected U8 [{rows}, {}]",
+                scale.dtype,
+                scale.shape,
+                cols / 32
+            );
+            anyhow::ensure!(
+                scale.end >= scale.start && scale.end - scale.start == rows * (cols / 32),
+                "DSpark sidecar: {scale_name} has invalid byte span"
+            );
+        } else {
+            anyhow::ensure!(
+                tensor.dtype == "BF16",
+                "DSpark sidecar: {name} is {}, expected BF16",
+                tensor.dtype
+            );
+            anyhow::ensure!(
+                tensor.end >= tensor.start && tensor.end - tensor.start == elems * 2,
+                "DSpark sidecar: {name} has invalid BF16 byte span [{}, {}) for {:?}",
+                tensor.start,
+                tensor.end,
+                spec.shape
+            );
+        }
+    }
+    for tensor in &source.tensors {
         anyhow::ensure!(
-            tensor.end >= tensor.start && tensor.end - tensor.start == elems * 2,
-            "DSpark sidecar: {} has invalid BF16 byte span [{}, {}) for {:?}",
-            spec.source,
-            tensor.start,
-            tensor.end,
-            spec.shape
+            claimed.contains(tensor.name.as_str()),
+            "DSpark sidecar: unexpected source tensor {} — refusing to drop it",
+            tensor.name
         );
     }
     Ok(())
@@ -5158,11 +6056,15 @@ fn validate_dspark_base(base_path: &Path, layout: &DsparkLayout) -> anyhow::Resu
     let base = cortiq_core::CmfModel::open(base_path)
         .map_err(|e| anyhow::anyhow!("DSpark sidecar: open base {}: {e}", base_path.display()))?;
     let arch = base.arch();
+    let want_arch = match layout.flavor {
+        DsparkFlavor::Minicpm => MINICPM_DSPARK_BASE_ARCH,
+        DsparkFlavor::Minimax => MINIMAX_DSPARK_BASE_ARCH,
+    };
     anyhow::ensure!(
-        arch.arch_name == MINICPM_DSPARK_BASE_ARCH,
+        arch.arch_name == want_arch,
         "DSpark sidecar: base arch {} is not {}",
         arch.arch_name,
-        MINICPM_DSPARK_BASE_ARCH
+        want_arch
     );
     anyhow::ensure!(
         arch.num_layers == layout.num_target_layers
@@ -5202,6 +6104,7 @@ fn validate_dspark_base(base_path: &Path, layout: &DsparkLayout) -> anyhow::Resu
 }
 
 fn dspark_sidecar_arch(layout: &DsparkLayout) -> anyhow::Result<ModelArch> {
+    let minimax = layout.flavor == DsparkFlavor::Minimax;
     let config = serde_json::json!({
         "model_type": "qwen3",
         "hidden_size": layout.hidden,
@@ -5214,11 +6117,22 @@ fn dspark_sidecar_arch(layout: &DsparkLayout) -> anyhow::Result<ModelArch> {
         "max_position_embeddings": 262144,
         "rms_norm_eps": layout.rms_norm_eps,
         "rope_theta": layout.rope_theta,
+        // M3.1's draft MLP runs the target's checked SwiGLU-OAI contract;
+        // the sidecar records it for a future executor even though
+        // `build_arch` (whose activation whitelist is trunk-scoped) only
+        // knows the generic names — set it after construction, like the
+        // arch identity below.
         "hidden_act": "silu",
         "tie_word_embeddings": false,
     });
     let mut arch = build_arch(&config)?;
-    arch.arch_name = MINICPM_DSPARK_ARCH.into();
+    arch.arch_name = match layout.flavor {
+        DsparkFlavor::Minicpm => MINICPM_DSPARK_ARCH.into(),
+        DsparkFlavor::Minimax => MINIMAX_DSPARK_ARCH.into(),
+    };
+    if minimax {
+        arch.hidden_act = "swigluoai".into();
+    }
     // The draft has no MTP, MoE, recurrent core, embedding, or lm_head of
     // its own.  Those last two are *bound* in provenance to the target file.
     arch.mtp = None;
@@ -5233,19 +6147,33 @@ fn dspark_header(
     model_dir: &Path,
     quant: Quant,
 ) -> anyhow::Result<CmfHeader> {
+    let (kind, source_arch, source_file, source_dtype) = match layout.flavor {
+        DsparkFlavor::Minicpm => (
+            "minicpm_v47_dspark_sidecar",
+            MINICPM_DSPARK_SOURCE_ARCH,
+            "model.safetensors",
+            "BF16",
+        ),
+        DsparkFlavor::Minimax => (
+            "minimax_m31_dspark_sidecar",
+            MINIMAX_DSPARK_SOURCE_ARCH,
+            "model-dspark-00001.safetensors",
+            "MXFP8 layer bodies (F8_E4M3 + U8 scale), BF16 roots",
+        ),
+    };
     Ok(CmfHeader {
         format: "cmf".into(),
         version: CMF_VERSION,
         arch: dspark_sidecar_arch(layout)?,
         quant_type: dspark_quant_type(quant),
         provenance: Some(serde_json::json!({
-            "kind": "minicpm_v47_dspark_sidecar",
+            "kind": kind,
             "sidecar_format": "cmf-dspark-v1",
             "source": {
                 "directory": model_dir.display().to_string(),
-                "file": "model.safetensors",
-                "architectures": [MINICPM_DSPARK_SOURCE_ARCH],
-                "dtype": "BF16",
+                "file": source_file,
+                "architectures": [source_arch],
+                "dtype": source_dtype,
                 "tensor_count": 62,
             },
             "base_binding": {
@@ -5297,8 +6225,16 @@ fn validate_written_dspark_sidecar(
     binding: &DsparkBaseBinding,
     quant: Quant,
 ) -> anyhow::Result<()> {
+    let want_arch = match layout.flavor {
+        DsparkFlavor::Minicpm => MINICPM_DSPARK_ARCH,
+        DsparkFlavor::Minimax => MINIMAX_DSPARK_ARCH,
+    };
+    let want_kind = match layout.flavor {
+        DsparkFlavor::Minicpm => "minicpm_v47_dspark_sidecar",
+        DsparkFlavor::Minimax => "minimax_m31_dspark_sidecar",
+    };
     anyhow::ensure!(
-        model.arch().arch_name == MINICPM_DSPARK_ARCH,
+        model.arch().arch_name == want_arch,
         "DSpark sidecar: output arch identity was not preserved"
     );
     let provenance = model
@@ -5307,7 +6243,7 @@ fn validate_written_dspark_sidecar(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("DSpark sidecar: output has no provenance"))?;
     anyhow::ensure!(
-        provenance["kind"] == "minicpm_v47_dspark_sidecar"
+        provenance["kind"] == want_kind
             && provenance["sidecar_format"] == "cmf-dspark-v1"
             && provenance["tensor_namespace"] == "dspark.",
         "DSpark sidecar: output identity metadata is malformed"
@@ -5367,18 +6303,37 @@ fn write_dspark_payload(
     quant: Quant,
     output: &Path,
 ) -> anyhow::Result<()> {
+    let minimax = header
+        .provenance
+        .as_ref()
+        .is_some_and(|p| p["kind"] == "minimax_m31_dspark_sidecar");
+    let prefix = if minimax { MINIMAX_DSPARK_SRC } else { "" };
     let mut writer = cortiq_core::format::CmfStreamWriter::new(
         output,
         cortiq_core::format::CmfStreamWriter::head_reserve_for(specs.len(), 64),
     )
     .map_err(|e| anyhow::anyhow!("DSpark sidecar: create {}: {e}", output.display()))?;
     for spec in specs {
+        let source_name = format!("{prefix}{}", spec.source);
         let tensor = source
             .tensors
             .iter()
-            .find(|t| t.name == spec.source)
+            .find(|t| t.name == source_name)
             .expect("source schema was validated");
-        let vals = to_f32(&tensor.dtype, source.bytes(tensor))?;
+        // M3.1's layer bodies are MXFP8: decode through the row scales to
+        // f32 first so the chosen sidecar quant sees the real values.
+        let vals = if minimax && spec.matrix && spec.source.starts_with("layers.") {
+            let scale_name = format!("{source_name}_scale_inv");
+            let scale = source
+                .tensors
+                .iter()
+                .find(|t| t.name == scale_name)
+                .expect("source schema was validated");
+            let (rows, cols) = (spec.shape[0], spec.shape[1]);
+            unpack_mxfp8_rowwise(source.bytes(tensor), source.bytes(scale), rows, cols)?
+        } else {
+            to_f32(&tensor.dtype, source.bytes(tensor))?
+        };
         anyhow::ensure!(
             vals.len() == spec.shape.iter().product::<usize>() && vals.iter().all(|v| v.is_finite()),
             "DSpark sidecar: {} contains an invalid numeric payload",
@@ -5406,7 +6361,11 @@ fn write_dspark_payload(
 /// collision-free sidecar beside an existing CMF target.  This writes every
 /// official draft tensor, validates the result, and binds it to the exact
 /// base directory/trunk hashes.  It intentionally has no runtime effect.
-pub fn write_minicpm_dspark_sidecar(
+/// Convert an official DSpark checkpoint to a collision-free sidecar beside
+/// an existing CMF target. The base's architecture selects the flavor
+/// (MiniCPM-V-4.7's BF16 Qwen3 draft or MiniMax-M3.1's MXFP8 module draft);
+/// both write the same `dspark.` namespace and the same executor schema.
+pub fn write_dspark_sidecar(
     model_dir: &Path,
     base_output: &Path,
     quant: &str,
@@ -5421,7 +6380,21 @@ pub fn write_minicpm_dspark_sidecar(
         &fs::read_to_string(&config_path)
             .map_err(|e| anyhow::anyhow!("DSpark sidecar: {}: {e}", config_path.display()))?,
     )?;
-    let layout = DsparkLayout::official(&config)?;
+    // The base decides which official draft contract this conversion must
+    // satisfy — the layouts are close enough that accepting either config
+    // would be a silent geometry mix.
+    let base_arch = cortiq_core::CmfModel::open(base_output)
+        .map_err(|e| anyhow::anyhow!("DSpark sidecar: open base {}: {e}", base_output.display()))?
+        .arch()
+        .arch_name
+        .clone();
+    let layout = match base_arch.as_str() {
+        MINIMAX_DSPARK_BASE_ARCH => DsparkLayout::minimax(&config)?,
+        MINICPM_DSPARK_BASE_ARCH => DsparkLayout::official(&config)?,
+        other => anyhow::bail!(
+            "DSpark sidecar: base arch {other} has no DSpark contract (expected {MINICPM_DSPARK_BASE_ARCH} or {MINIMAX_DSPARK_BASE_ARCH})"
+        ),
+    };
     let binding = validate_dspark_base(base_output, &layout)?;
     let out = cortiq_core::dspark_sidecar_path(base_output);
     anyhow::ensure!(
@@ -5433,10 +6406,16 @@ pub fn write_minicpm_dspark_sidecar(
         "DSpark sidecar: {} already exists; refusing to overwrite it",
         out.display()
     );
-    let source_path = model_dir.join("model.safetensors");
+    let source_file = match layout.flavor {
+        DsparkFlavor::Minicpm => "model.safetensors",
+        // The M3.1 checkpoint shards its draft; the index resolves to this
+        // single file for the published release.
+        DsparkFlavor::Minimax => "model-dspark-00001.safetensors",
+    };
+    let source_path = model_dir.join(source_file);
     let source = open_safetensors(&source_path)?;
     let specs = dspark_tensor_specs(&layout);
-    validate_dspark_source(&source, &specs)?;
+    validate_dspark_source(&source, &specs, layout.flavor)?;
     let header = dspark_header(&layout, &binding, model_dir, quant)?;
     if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
@@ -5484,11 +6463,24 @@ fn layer_index_of(name: &str) -> Option<usize> {
 /// Mellum profiles.  Those default to q4tp for the expert bank, while
 /// `quant_for_tensor` keeps the always-active skeleton at q8_2f.
 fn default_quant_for_arch(arch: &ModelArch) -> Quant {
-    if arch.arch_name == MIMO_V2 || arch.arch_name.eq_ignore_ascii_case("mellum") {
+    if arch.arch_name == MIMO_V2
+        || arch.arch_name.eq_ignore_ascii_case("mellum")
+        || arch.arch_name == minimax_m3::MINIMAX_M3_MODEL_TYPE
+    {
         Quant::Q4TiledP
     } else {
         Quant::Q8Row
     }
+}
+
+/// Profiles whose M3 quality/codec contract is intentionally defined.  Keep
+/// this separate from the user-facing check so an invalid request can fail
+/// before the remote M3 inventory walk issues header ranges for every shard.
+fn minimax_m3_profile_supported(profile: Quant) -> bool {
+    matches!(
+        profile,
+        Quant::Q4TiledP | Quant::Q2TiledP | Quant::Q8_2f
+    )
 }
 
 /// `--quant` value that selects [`default_quant_for_arch`].
@@ -5500,6 +6492,17 @@ pub(crate) const AUTO_QUANT: &str = "auto";
 /// few layers of a huge checkpoint, never for serving; its provenance says so.
 const CONVERT_ONLY_ENV: &str = "CMF_CONVERT_ONLY";
 
+/// The published M3 checkpoint whose full source contract is frozen in
+/// `minimax_m3`. Recognizing it before any metadata fetch lets conversion
+/// bind the very first config/template/index request to one commit instead of
+/// first sampling a moving `main` branch and trying to repair it later.
+const MINIMAX_M3_PUBLISHED_HF_REPO: &str = "MiniMaxAI/MiniMax-M3.1-Flash";
+
+fn minimax_m3_published_hf_repo(repo: &str) -> bool {
+    repo.trim_matches('/')
+        .eq_ignore_ascii_case(MINIMAX_M3_PUBLISHED_HF_REPO)
+}
+
 fn parse_convert_only(spec: &str) -> anyhow::Result<Vec<String>> {
     let pats: Vec<String> = spec.split(',').map(|p| p.trim().to_string()).collect();
     anyhow::ensure!(
@@ -5510,6 +6513,227 @@ fn parse_convert_only(spec: &str) -> anyhow::Result<Vec<String>> {
 }
 
 /// Build ModelArch from a HF config.json (dense transformer families).
+/// The current generic attention executor is dense.  MiniMax M3's native
+/// operator is block-sparse, so emitting the source's 1M-token limit here
+/// would silently promise an execution contract the file cannot meet.  The
+/// published M3 selector has 128-token blocks and top-k=16: through 16
+/// causal blocks (2,048 tokens) every available block fits in the selector,
+/// including its mandatory local/current block.  Thus the selected causal
+/// key set is complete and the ordinary dense path is semantically equivalent
+/// in that bounded range (but not promised bit-identical across different
+/// floating-point reduction orders).  At block 17 it need not be, so a
+/// later sparse executor may raise this only together with an explicit header
+/// capability.
+const MINIMAX_M3_DENSE_SAFE_CONTEXT: usize = 2_048;
+
+/// MiniMax M3 is not ChatML-compatible: its official prompt grammar uses a
+/// namespaced tool envelope and its own reasoning markers.  A text-only CMF
+/// with no usable source template would otherwise load and quietly prompt the
+/// model with the generic fallback, which is a correctness failure rather
+/// than a harmless missing convenience.  Keep this contract next to the
+/// bounded M3 architecture instead of teaching the generic converter a
+/// model-name heuristic.
+const MINIMAX_M3_CHAT_NAMESPACE: &str = "]<]minimax[>[";
+const MINIMAX_M3_THINK_OPEN: &str = "<mm:think>";
+const MINIMAX_M3_THINK_CLOSE: &str = "</mm:think>";
+
+fn validate_minimax_m3_chat_template(template: &str) -> anyhow::Result<()> {
+    let template = template.trim();
+    anyhow::ensure!(
+        !template.is_empty(),
+        "MiniMax-M3.1 contract: chat template is empty"
+    );
+    for (label, marker) in [
+        ("MiniMax namespace", MINIMAX_M3_CHAT_NAMESPACE),
+        ("opening reasoning marker", MINIMAX_M3_THINK_OPEN),
+        ("closing reasoning marker", MINIMAX_M3_THINK_CLOSE),
+        ("tool-call opening tag", "<tool_call>"),
+        ("tool-call closing tag", "</tool_call>"),
+    ] {
+        anyhow::ensure!(
+            template.contains(marker),
+            "MiniMax-M3.1 contract: chat template lacks {label} {marker:?}"
+        );
+    }
+    Ok(())
+}
+
+/// Read the exact prompt grammar carried by an M3 checkpoint before the
+/// expensive 428B source preflight/weight pass.  Sidecar wins, matching the
+/// bundle writer below; a legacy tokenizer_config field is accepted only if
+/// it carries the same verified grammar.
+fn minimax_m3_chat_template(dir: &Path) -> anyhow::Result<String> {
+    let sidecar = dir.join("chat_template.jinja");
+    let template = match fs::read_to_string(&sidecar) {
+        Ok(s) if !s.trim().is_empty() => s,
+        Ok(_) => String::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => anyhow::bail!(
+            "MiniMax-M3.1 contract: read {}: {e}",
+            sidecar.display()
+        ),
+    };
+    let template = if template.is_empty() {
+        let config_path = dir.join("tokenizer_config.json");
+        match fs::read(&config_path) {
+            Ok(bytes) => {
+                let config: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+                    anyhow::anyhow!(
+                        "MiniMax-M3.1 contract: parse {}: {e}",
+                        config_path.display()
+                    )
+                })?;
+                config
+                    .get("chat_template")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+                    .unwrap_or_default()
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => anyhow::bail!(
+                "MiniMax-M3.1 contract: read {}: {e}",
+                config_path.display()
+            ),
+        }
+    } else {
+        template
+    };
+    anyhow::ensure!(
+        !template.trim().is_empty(),
+        "MiniMax-M3.1 contract: missing chat_template.jinja and tokenizer_config.chat_template; refusing generic ChatML fallback"
+    );
+    validate_minimax_m3_chat_template(&template)?;
+    Ok(template)
+}
+
+/// Build the deliberately narrow MiniMax-M3.1 text-backbone descriptor.
+///
+/// This does not infer a generic Llama shape from a model name.  The public
+/// source contract is frozen in `minimax_m3`; this adapter merely expresses
+/// the portions already represented by `ModelArch` and caps the context to
+/// the 16-block dense-equivalent path.  Index projections stay as regular
+/// directory entries (the generic loader ignores unknown extras) for the
+/// future sparse runtime.
+fn build_minimax_m3_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
+    let layout = minimax_m3::parse_minimax_m3_layout(config)?;
+    let text = config
+        .get("text_config")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| anyhow::anyhow!("MiniMax-M3.1 contract: root.text_config must be an object"))?;
+    let rope_theta = text
+        .get("rope_theta")
+        .and_then(|value| value.as_f64())
+        .ok_or_else(|| anyhow::anyhow!("MiniMax-M3.1 contract: text_config.rope_theta is missing"))?;
+    anyhow::ensure!(
+        (rope_theta - 10_000_000.0).abs() <= f64::EPSILON,
+        "MiniMax-M3.1 contract: text_config.rope_theta is {rope_theta}, expected 10000000"
+    );
+    let rotary_dim = text
+        .get("rotary_dim")
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| anyhow::anyhow!("MiniMax-M3.1 contract: text_config.rotary_dim is missing"))?;
+    anyhow::ensure!(
+        rotary_dim == 64,
+        "MiniMax-M3.1 contract: text_config.rotary_dim is {rotary_dim}, expected 64"
+    );
+    let partial_rotary_factor = text
+        .get("partial_rotary_factor")
+        .and_then(|value| value.as_f64())
+        .ok_or_else(|| {
+            anyhow::anyhow!("MiniMax-M3.1 contract: text_config.partial_rotary_factor is missing")
+        })?;
+    anyhow::ensure!(
+        (partial_rotary_factor - 0.5).abs() <= f64::EPSILON,
+        "MiniMax-M3.1 contract: text_config.partial_rotary_factor is {partial_rotary_factor}, expected 0.5"
+    );
+    anyhow::ensure!(
+        text.get("attention_output_gate")
+            .and_then(|value| value.as_bool())
+            == Some(false),
+        "MiniMax-M3.1 contract: attention_output_gate must be false"
+    );
+    let runtime_partial_rotary_factor = rotary_dim as f32 / layout.head_dim as f32;
+    anyhow::ensure!(
+        (layout.head_dim as f32 * runtime_partial_rotary_factor) as usize == rotary_dim as usize,
+        "MiniMax-M3.1 contract: partial rotary factor does not reproduce rotary_dim"
+    );
+
+    Ok(ModelArch {
+        arch_name: minimax_m3::MINIMAX_M3_MODEL_TYPE.into(),
+        hidden_size: layout.hidden_size,
+        // Dense layers 0..=2 are wider than routed experts.  The generic
+        // pipeline uses this as its dense scratch upper bound; MoE layers
+        // take their own width from `moe` below.
+        intermediate_size: layout.dense_intermediate_size,
+        num_layers: layout.num_hidden_layers,
+        num_attention_heads: layout.num_attention_heads,
+        num_kv_heads: layout.num_key_value_heads,
+        head_dim: layout.head_dim,
+        vocab_size: layout.vocab_size,
+        layer_types: vec![LayerType::FullAttention; layout.num_hidden_layers],
+        rms_norm_eps: 1e-6,
+        norm_style: NormStyle::Gemma,
+        rope_theta,
+        tie_word_embeddings: false,
+        partial_rotary_factor: runtime_partial_rotary_factor,
+        yarn: None,
+        attention_heads_per_layer: None,
+        kv_heads_per_layer: None,
+        v_head_dim: None,
+        hidden_act: "swigluoai".into(),
+        embed_multiplier: 1.0,
+        query_pre_attn_scalar: None,
+        sliding_window: None,
+        sliding_window_pattern: None,
+        rope_local_base_freq: None,
+        local_partial_rotary_factor: None,
+        global_head_dim: None,
+        num_global_kv_heads: None,
+        global_partial_rotary_factor: None,
+        final_logit_softcapping: None,
+        mla: None,
+        no_rope_layers: None,
+        attention_sink: false,
+        activation_situ_beta: None,
+        activation_situ_linear_beta: None,
+        attn_logit_softcapping: None,
+        attn_v_norm: false,
+        // The reference does Gemma-1p per-head Q/K norm before RoPE.
+        qk_norm_after_rope: false,
+        mtp: None,
+        moe: Some(MoeConfig {
+            num_experts: layout.num_local_experts,
+            top_k: layout.num_experts_per_tok,
+            moe_intermediate_size: layout.intermediate_size,
+            norm_topk_prob: true,
+            shared_expert_intermediate_size: Some(layout.shared_intermediate_size),
+            router_sigmoid: true,
+            routed_scaling_factor: Some(2.0),
+            router_resonance: false,
+        }),
+        qwen4_exp: None,
+        deepseek_v41: None,
+        linear_core: None,
+        anchor_core: None,
+        head_clusters: None,
+        // Deliberately not layout.max_position_embeddings (1,048,576); see
+        // MINIMAX_M3_DENSE_SAFE_CONTEXT above.
+        max_position_embeddings: MINIMAX_M3_DENSE_SAFE_CONTEXT,
+        linear_conv_kernel_dim: None,
+        linear_num_key_heads: None,
+        linear_num_value_heads: None,
+        linear_key_head_dim: None,
+        linear_value_head_dim: None,
+        rope_freq_factors: None,
+        logit_multiplier: None,
+        g3n: None,
+        kda_gate_lower_bound: None,
+        num_loops: 1,
+        loop_final_norm: false,
+        prism_hadamard: None,
+    })
+}
+
 fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     // Whisper is encoder/decoder, so use its encoder dimensions for the
     // generic inspection fields and retain the full original config below.
@@ -5543,6 +6767,11 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         arch.max_position_embeddings = get("max_source_positions")?;
         arch.hidden_act = "gelu".into();
         return Ok(arch);
+    }
+    if config.get("model_type").and_then(|v| v.as_str())
+        == Some(minimax_m3::MINIMAX_M3_MODEL_TYPE)
+    {
+        return build_minimax_m3_arch(config);
     }
     // Vision/multimodal configs nest the text model under "text_config".
     let tc = config.get("text_config").unwrap_or(config);
@@ -6554,10 +7783,51 @@ pub(crate) fn hf_fetch_file(
 
 /// Local cache dir for a downloaded HF repo (`~/.cache/cortiq/hf/owner--name`).
 fn hf_cache_dir(repo: &str) -> anyhow::Result<std::path::PathBuf> {
+    hf_cache_dir_at_revision(repo, None)
+}
+
+/// A Hub commit SHA is safe to place both in a cache-path component and in a
+/// `resolve/{revision}` URL. Keep this deliberately stricter than a generic
+/// ref: conversion obtains it from the model API, and accepting branches or
+/// paths here would reintroduce the moving-source problem this helper avoids.
+fn hf_commit_sha(sha: &str) -> Option<&str> {
+    (sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(sha)
+}
+
+/// Resolve a Hub file URL at one immutable revision. `None` preserves the
+/// historical `main` behavior for ordinary conversions; MiniMax M3 supplies a
+/// checked commit SHA so its metadata, header preflight, and every streamed
+/// shard cannot drift apart during a multi-hour pass.
+fn hf_resolve_base(repo: &str, revision: Option<&str>) -> String {
+    let revision = revision.unwrap_or("main");
+    format!("https://huggingface.co/{repo}/resolve/{revision}")
+}
+
+fn hf_cache_leaf(repo: &str, revision: Option<&str>) -> anyhow::Result<String> {
+    let mut leaf = repo.replace('/', "--");
+    if let Some(revision) = revision {
+        let revision = hf_commit_sha(revision).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Hugging Face revision must be a 40-character hexadecimal commit SHA, got {revision:?}"
+            )
+        })?;
+        leaf.push_str("--rev-");
+        leaf.push_str(revision);
+    }
+    Ok(leaf)
+}
+
+/// A revision-specific metadata/shard cache. A completed M3 conversion must
+/// never reuse `config.json` or an index cached from a different moving `main`
+/// revision, even if the file names happen to match.
+fn hf_cache_dir_at_revision(
+    repo: &str,
+    revision: Option<&str>,
+) -> anyhow::Result<std::path::PathBuf> {
     let base = std::env::var_os("HOME")
         .map(|h| std::path::PathBuf::from(h).join(".cache/cortiq/hf"))
         .unwrap_or_else(|| std::path::PathBuf::from(".cortiq-hf"));
-    let dir = base.join(repo.replace('/', "--"));
+    let dir = base.join(hf_cache_leaf(repo, revision)?);
     fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -6828,6 +8098,36 @@ fn repo_files(agent: &ureq::Agent, repo: &str, token: Option<&str>) -> Vec<Strin
     }
 }
 
+/// Resolve the immutable commit behind a Hub model API response. This is
+/// intentionally separate from `repo_files`: listing sibling names is
+/// best-effort for UX, while MiniMax M3 must fail before writing an artifact
+/// if it cannot bind every request to one verified source commit.
+fn hf_model_commit_sha(
+    agent: &ureq::Agent,
+    repo: &str,
+    token: Option<&str>,
+) -> anyhow::Result<String> {
+    let url = format!("https://huggingface.co/api/models/{repo}");
+    let response = with_retry(4, || {
+        auth(agent.get(&url), token)
+            .call()
+            .map_err(|error| anyhow::anyhow!("Hugging Face model API {url}: {error}"))
+    })?;
+    let value: serde_json::Value = response
+        .into_json()
+        .map_err(|error| anyhow::anyhow!("parse Hugging Face model API {url}: {error}"))?;
+    let sha = value
+        .get("sha")
+        .and_then(serde_json::Value::as_str)
+        .and_then(hf_commit_sha)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Hugging Face model API {url} did not return a 40-character hexadecimal commit SHA"
+            )
+        })?;
+    Ok(sha.to_owned())
+}
+
 /// Fetch a HF repo's convertible files (config, tokenizer, weights) into the
 /// cache, with parallel chunked downloads for the weight shards.
 pub(crate) fn hf_download(repo: &str, token: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
@@ -6842,8 +8142,20 @@ pub(crate) fn hf_download_opts(
     token: Option<&str>,
     weights: bool,
 ) -> anyhow::Result<(std::path::PathBuf, Vec<String>)> {
-    let dir = hf_cache_dir(repo)?;
-    let base = format!("https://huggingface.co/{repo}/resolve/main");
+    hf_download_opts_at_revision(repo, token, weights, None)
+}
+
+/// Revision-aware form of [`hf_download_opts`]. It is currently used by the
+/// fail-closed MiniMax M3 route; ordinary callers retain their historical
+/// moving-`main` cache and behavior through the wrapper above.
+fn hf_download_opts_at_revision(
+    repo: &str,
+    token: Option<&str>,
+    weights: bool,
+    revision: Option<&str>,
+) -> anyhow::Result<(std::path::PathBuf, Vec<String>)> {
+    let dir = hf_cache_dir_at_revision(repo, revision)?;
+    let base = hf_resolve_base(repo, revision);
     let threads = hf_threads();
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(20))
@@ -7413,6 +8725,9 @@ pub fn run_convert_multi_excluding(
     let downloaded;
     let mut stream_shards: Vec<String> = Vec::new();
     let mut stream_repo: Option<String> = None;
+    // Only the M3 route fills this. Other streamed converters deliberately
+    // preserve their established `main` behavior below.
+    let mut stream_revision: Option<String> = None;
     let local_ready_dir = local_ready_dir_from_env();
     let dir: &Path = if Path::new(model).join("config.json").exists() {
         Path::new(model)
@@ -7422,9 +8737,25 @@ pub fn run_convert_multi_excluding(
             "{LOCAL_READY_DIR_ENV} requires a local model directory; unset it for HF hub streaming"
         );
         eprintln!("downloading {model} from Hugging Face (streamed)…");
-        let (d, shards) = hf_download_opts(model, hf_token, false)?;
+        let repo = model.trim_matches('/');
+        let (d, shards) = if minimax_m3_published_hf_repo(repo) {
+            // Do this *before* config/template/index download: a 428B source
+            // must never classify itself through a moving `main` response.
+            let revision = hf_model_commit_sha(&hf_agent(), repo, hf_token).map_err(|error| {
+                anyhow::anyhow!(
+                    "MiniMax-M3.1 conversion requires an immutable Hugging Face commit for {repo}: {error:#}"
+                )
+            })?;
+            eprintln!("  MiniMax-M3.1: pinning Hugging Face source revision {revision}");
+            let downloaded =
+                hf_download_opts_at_revision(repo, hf_token, false, Some(&revision))?;
+            stream_revision = Some(revision);
+            downloaded
+        } else {
+            hf_download_opts(repo, hf_token, false)?
+        };
         stream_shards = shards;
-        stream_repo = Some(model.to_string());
+        stream_repo = Some(repo.to_string());
         downloaded = d;
         downloaded.as_path()
     } else {
@@ -7443,6 +8774,108 @@ pub fn run_convert_multi_excluding(
          `hf download {model} --local-dir DIR`, then `cortiq convert --model DIR`"
     );
     let mut arch = build_arch(&config)?;
+    if arch.arch_name == minimax_m3::MINIMAX_M3_MODEL_TYPE && stream_repo.is_some() {
+        anyhow::ensure!(
+            stream_revision.is_some(),
+            "MiniMax-M3.1 streamed conversion accepts only the reviewed source repo {MINIMAX_M3_PUBLISHED_HF_REPO}; use a local immutable checkpoint directory for another repo"
+        );
+    }
+    if arch.arch_name == minimax_m3::MINIMAX_M3_MODEL_TYPE {
+        // Reject uncalibrated profiles before the header-only source
+        // inventory walk below.  On a streamed 428B source even metadata
+        // preflight is meaningful remote work, and q2tp/fp4 must never be
+        // allowed to look like a supported M3 output.
+        anyhow::ensure!(
+            requested_profiles.iter().all(|requested| {
+                minimax_m3_profile_supported(
+                    requested.unwrap_or_else(|| default_quant_for_arch(&arch)),
+                )
+            }),
+            "MiniMax-M3.1 conversion supports only q4tp (mixed routed-expert profile) or q8_2f; q2tp/fp4 and other profiles are not validated"
+        );
+    }
+    // Parse this before M3's immutable header preflight.  Its patterns let
+    // the preflight tell a diagnostic probe exactly which source shards can
+    // contain an executable selected tensor, avoiding a pointless download
+    // of the other 200+ GB while preserving the full header validation.
+    let convert_only = match std::env::var(CONVERT_ONLY_ENV) {
+        Ok(spec) => {
+            let pats = parse_convert_only(&spec)?;
+            eprintln!(
+                "  {CONVERT_ONLY_ENV}={spec}: writing a PARTIAL file (only matching tensors) — a probe, not a model"
+            );
+            Some(pats)
+        }
+        Err(_) => None,
+    };
+    // The target model's grammar is an executable part of the checkpoint
+    // contract.  Validate and retain it before making any remote header
+    // requests or downloading the first enormous shard, so an artifact can
+    // never finish with a generic ChatML prompt by accident.
+    let minimax_m3_template = if arch.arch_name == minimax_m3::MINIMAX_M3_MODEL_TYPE {
+        Some(minimax_m3_chat_template(dir)?)
+    } else {
+        None
+    };
+    // Fail before a streamed 250+ GB weight pass if this is not exactly the
+    // public M3.1 tensor inventory.  The HF index names shards but has no
+    // dtype/shape data, so remote conversion issues two tiny range requests
+    // per shard for safetensors headers; local conversion reads just those
+    // headers.  No tensor payload is downloaded or mapped by this preflight.
+    let minimax_m3_layout = if arch.arch_name == minimax_m3::MINIMAX_M3_MODEL_TYPE {
+        Some(minimax_m3::parse_minimax_m3_layout(&config)?)
+    } else {
+        None
+    };
+    // Set only for an immutable Hub-streamed M3 probe.  Local source walks
+    // retain their established resumable/open-all-shards behavior.
+    let mut minimax_m3_partial_stream_shards: Option<HashSet<String>> = None;
+    if let Some(layout) = minimax_m3_layout.as_ref() {
+        let headers = if let Some(repo) = stream_repo.as_deref() {
+            anyhow::ensure!(
+                !stream_shards.is_empty(),
+                "MiniMax-M3.1 preflight: streamed source has no safetensors shard list"
+            );
+            let agent = hf_agent();
+            let revision = stream_revision.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "MiniMax-M3.1 preflight: streamed source was not pinned to an immutable commit"
+                )
+            })?;
+            let base = hf_resolve_base(repo, Some(revision));
+            stream_shards
+                .iter()
+                .map(|name| {
+                    minimax_m3_fetch_remote_header(&agent, &format!("{base}/{name}"), hf_token)
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?
+        } else {
+            minimax_m3_shard_names(dir)?
+                .iter()
+                .map(|name| minimax_m3_read_local_header(&dir.join(name)))
+                .collect::<anyhow::Result<Vec<_>>>()?
+        };
+        validate_minimax_m3_source_headers(layout, &headers)?;
+        if let (Some(patterns), Some(_)) = (convert_only.as_deref(), stream_repo.as_deref()) {
+            let selected = minimax_m3_convert_only_stream_shards(
+                &arch,
+                towers,
+                &stream_shards,
+                &headers,
+                patterns,
+            )?;
+            eprintln!(
+                "  MiniMax-M3.1: partial probe needs payload from {}/{} immutable source shard(s); the remainder will be manifest-marked without download",
+                selected.len(),
+                stream_shards.len()
+            );
+            minimax_m3_partial_stream_shards = Some(selected);
+        }
+        eprintln!(
+            "  MiniMax-M3.1: exact safetensors source inventory verified ({} tensors)",
+            headers.iter().map(Vec::len).sum::<usize>()
+        );
+    }
     // The multimodal towers (checked before any shard is touched: a missing
     // audio tokenizer must not surface after a multi-hour text pass).
     let tower_source = match towers {
@@ -7476,6 +8909,22 @@ pub fn run_convert_multi_excluding(
             })
         })
         .collect();
+    if arch.arch_name == minimax_m3::MINIMAX_M3_MODEL_TYPE {
+        eprintln!(
+            "  MiniMax-M3.1: text-only dense fallback capped at {MINIMAX_M3_DENSE_SAFE_CONTEXT} tokens; sparse index tensors retained for a future native sparse runtime"
+        );
+        if profiles
+            .iter()
+            .any(|profile| matches!(profile, Quant::Q4TiledP))
+            && profiles
+                .iter()
+                .any(|profile| matches!(profile, Quant::Q8_2f))
+        {
+            eprintln!(
+                "  warning: MiniMax-M3.1 q4tp + q8_2f writes two independently finalized large artifacts; provision space for both outputs plus a source shard, or convert/upload/delete sequentially"
+            );
+        }
+    }
     let quant = profiles[0];
     // Some codecs intentionally share a physical dtype (q1/q1p both use
     // Q1).  Preserve the requested encoder so later skill grafts can encode
@@ -7498,6 +8947,7 @@ pub fn run_convert_multi_excluding(
         );
     }
     let source_fp8_block = source_fp8_block(&config);
+    let is_minimax_m3 = minimax_m3_layout.is_some();
     // NVIDIA ModelOpt NVFP4 checkpoints decode to f32 first (then any
     // profile, mxfp4 included, re-encodes them).
     let nvfp4_src = nvfp4_source(dir, &config)?;
@@ -7780,17 +9230,6 @@ pub fn run_convert_multi_excluding(
     } else {
         1.0
     };
-    let convert_only = match std::env::var(CONVERT_ONLY_ENV) {
-        Ok(spec) => {
-            let pats = parse_convert_only(&spec)?;
-            eprintln!(
-                "  {CONVERT_ONLY_ENV}={spec}: writing a PARTIAL file (only matching tensors) — a probe, not a model"
-            );
-            Some(pats)
-        }
-        Err(_) => None,
-    };
-
     let mut process_file = |file: &SafeTensors,
                             files: &[SafeTensors],
                             batches: &mut [Vec<TensorSpec>],
@@ -7841,8 +9280,20 @@ pub fn run_convert_multi_excluding(
             let Some(name) = canon_name_for_arch(&arch, &m.name, towers) else {
                 continue;
             };
+            // M3's source stores all its backbone/expert quantization
+            // metadata as ordinary safetensors.  They must never enter the
+            // CMF directory alone: the exact decoders below consume and
+            // validate each companion with its owning weight.
+            if is_minimax_m3 && minimax_m3_quant_companion(&m.name) {
+                continue;
+            }
             if let Some(pats) = convert_only.as_ref() {
-                if !pats.iter().any(|p| glob_match(p, &name)) {
+                let selected = if is_minimax_m3 {
+                    minimax_m3_convert_only_matches(pats, &name)
+                } else {
+                    pats.iter().any(|p| glob_match(p, &name))
+                };
+                if !selected {
                     continue;
                 }
             }
@@ -8101,7 +9552,21 @@ pub fn run_convert_multi_excluding(
                 }
                 continue;
             }
-            let fp8_scale_inv = if m.dtype == "F8_E4M3" && m.shape.len() == 2 {
+            // MiniMax M3 uses two source codecs which look deceptively like
+            // paths supported by other families, but are not wire-compatible:
+            // MXFP8 has U8 E8M0 rowwise 1x32 scales (not f32 tile scales),
+            // and compressed-tensors NVFP4 uses an inverse global scale (not
+            // OCP MXFP4).  Decode them before every generic FP8/FP4 branch.
+            let minimax_m3_packed =
+                is_minimax_m3 && m.dtype == "U8" && m.name.ends_with(".weight_packed");
+            let minimax_m3_decoded = if is_minimax_m3 && m.name.ends_with(".weight_packed") {
+                Some(minimax_m3_ct_nvfp4_decode(m, file, files)?)
+            } else if is_minimax_m3 && m.dtype == "F8_E4M3" && m.name.ends_with(".weight") {
+                Some(minimax_m3_mxfp8_decode(m, file, files)?)
+            } else {
+                None
+            };
+            let fp8_scale_inv = if !is_minimax_m3 && m.dtype == "F8_E4M3" && m.shape.len() == 2 {
                 let scale_name = m.name.replace(".weight", ".weight_scale_inv");
                 let mut scale = None;
                 for source in files {
@@ -8204,7 +9669,7 @@ pub fn run_convert_multi_excluding(
                 None
             };
 
-            let mxfp4_packed = m.dtype == "U8" && m.name.ends_with(".weight_packed");
+            let mxfp4_packed = !is_minimax_m3 && m.dtype == "U8" && m.name.ends_with(".weight_packed");
             let mxfp4 = if mxfp4_packed {
                 // MXFP4 (Kimi-K3 experts): decode to f32 and continue the
                 // normal path under the plain `.weight` name.
@@ -8264,7 +9729,7 @@ pub fn run_convert_multi_excluding(
             } else {
                 None
             };
-            let name = if mxfp4_packed {
+            let name = if mxfp4_packed || minimax_m3_packed {
                 name.strip_suffix("_packed")
                     .expect("suffix checked")
                     .to_string()
@@ -8391,7 +9856,7 @@ pub fn run_convert_multi_excluding(
                 }
                 continue;
             }
-            let mxfp4 = fp8_scale_inv.or(mxfp4).or(dsv4);
+            let mxfp4 = minimax_m3_decoded.or(fp8_scale_inv).or(mxfp4).or(dsv4);
             // MLX Conv3d stores Qwen's patch kernel as [out, temporal, height,
             // width, channels], while the CMF vision tower consumes flattened
             // per-patch rows in the source processor's [channels, temporal,
@@ -8915,7 +10380,7 @@ pub fn run_convert_multi_excluding(
     if stream_repo.is_some() || local_ready_dir.is_some() {
         let base = stream_repo
             .as_deref()
-            .map(|repo| format!("https://huggingface.co/{repo}/resolve/main"));
+            .map(|repo| hf_resolve_base(repo, stream_revision.as_deref()));
         let threads = hf_threads();
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(20))
@@ -8934,6 +10399,35 @@ pub fn run_convert_multi_excluding(
                     si + 1,
                     ns
                 );
+                progress((si as f32 + 1.0) / ns as f32);
+                continue;
+            }
+            if minimax_m3_partial_stream_shards
+                .as_ref()
+                .is_some_and(|selected| !selected.contains(sname))
+            {
+                // M3's immutable header preflight proved that this shard
+                // cannot contribute to the requested partial probe.  A mark
+                // is still required for each active writer: on resume it is
+                // the durable proof that an intentionally empty shard needs
+                // neither a re-download nor a second pass.
+                eprintln!(
+                    "  [stream {}/{}] {sname} — MiniMax partial probe: no selected executable tensor, network skip",
+                    si + 1,
+                    ns
+                );
+                for i in 0..outputs.len() {
+                    if !active[i] {
+                        continue;
+                    }
+                    let writer = writers[i].as_mut().ok_or_else(|| {
+                        anyhow::anyhow!("output {} is already finalized", outputs[i].1)
+                    })?;
+                    writer
+                        .mark(sname)
+                        .map_err(|e| anyhow::anyhow!("manifest: {e}"))?;
+                    done_shards[i].insert(sname.clone());
+                }
                 progress((si as f32 + 1.0) / ns as f32);
                 continue;
             }
@@ -9096,14 +10590,16 @@ pub fn run_convert_multi_excluding(
         .unwrap_or(serde_json::Value::Null);
     // Sidecar `chat_template.jinja` first, then the tokenizer_config field;
     // ignore an empty/blank file so we correctly fall through to the config.
-    let chat_template = fs::read_to_string(dir.join("chat_template.jinja"))
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            tok_cfg
-                .get("chat_template")
-                .and_then(|v| v.as_str().map(String::from))
-        });
+    let chat_template = minimax_m3_template.or_else(|| {
+        fs::read_to_string(dir.join("chat_template.jinja"))
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                tok_cfg
+                    .get("chat_template")
+                    .and_then(|v| v.as_str().map(String::from))
+            })
+    });
     let bundle = TokenizerBundle {
         chat_template,
         eos_token_ids: {
@@ -9194,6 +10690,35 @@ pub fn run_convert_multi_excluding(
         {
             p["source_model"] = serde_json::json!(repo);
         }
+        p
+    } else {
+        provenance
+    };
+    let provenance = if is_minimax_m3 {
+        let mut p = provenance;
+        let layout = minimax_m3_layout
+            .as_ref()
+            .expect("M3 provenance follows M3 source preflight");
+        let source_resolution = if let Some(revision) = stream_revision.as_deref() {
+            format!("Hugging Face resolve/{revision} (immutable commit)")
+        } else {
+            "local checkpoint directory".to_string()
+        };
+        p["minimax_m3"] = serde_json::json!({
+            "source_context_tokens": layout.max_position_embeddings,
+            "served_context_tokens": MINIMAX_M3_DENSE_SAFE_CONTEXT,
+            "source_resolution": source_resolution,
+            "source_revision": stream_revision,
+            "attention_runtime": "dense fallback semantically equivalent through 16 sparse blocks (<=2048 tokens); native sparse attention not yet enabled",
+            "text_backbone_only": true,
+            "vision_video_runtime": "not included",
+            "sparse_index_tensors": "preserved for future native sparse runtime",
+            "dspark_sidecar": "not included",
+            "source_weight_codecs": {
+                "backbone": "mxfp8_e4m3_ue8m0_rowwise_1x32",
+                "routed_experts": "compressed_tensors_nvfp4_inverse_global_scale"
+            }
+        });
         p
     } else {
         provenance
@@ -9506,6 +11031,37 @@ pub(crate) mod tests {
             parse_hf_threads(Some("999999999999999999999999")),
             HF_DEFAULT_THREADS
         );
+    }
+
+    #[test]
+    fn minimax_m3_pinned_hub_revision_uses_immutable_url_and_cache() {
+        let sha = "54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e";
+        assert!(minimax_m3_published_hf_repo("MiniMaxAI/MiniMax-M3.1-Flash"));
+        assert!(minimax_m3_published_hf_repo(
+            "/minimaxai/minimax-m3.1-flash/"
+        ));
+        assert!(!minimax_m3_published_hf_repo("someone/MiniMax-M3.1-Flash"));
+        assert_eq!(hf_commit_sha(sha), Some(sha));
+        assert!(hf_commit_sha("main").is_none());
+        assert!(hf_commit_sha("54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5").is_none());
+        assert!(hf_commit_sha("z4e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e").is_none());
+        assert_eq!(
+            hf_resolve_base("MiniMaxAI/MiniMax-M3.1-Flash", Some(sha)),
+            format!("https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash/resolve/{sha}")
+        );
+        assert_eq!(
+            hf_resolve_base("MiniMaxAI/MiniMax-M3.1-Flash", None),
+            "https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash/resolve/main"
+        );
+        assert_eq!(
+            hf_cache_leaf("MiniMaxAI/MiniMax-M3.1-Flash", Some(sha)).unwrap(),
+            format!("MiniMaxAI--MiniMax-M3.1-Flash--rev-{sha}")
+        );
+        assert_ne!(
+            hf_cache_leaf("MiniMaxAI/MiniMax-M3.1-Flash", Some(sha)).unwrap(),
+            hf_cache_leaf("MiniMaxAI/MiniMax-M3.1-Flash", None).unwrap()
+        );
+        assert!(hf_cache_leaf("MiniMaxAI/MiniMax-M3.1-Flash", Some("main")).is_err());
     }
 
     #[test]
@@ -10048,6 +11604,407 @@ pub(crate) mod tests {
         assert!(unpack_fp8_scale_inv(&[0x38; 4], &[1.0], 2, 2, 1).is_err());
         assert!(unpack_fp8_scale_inv(&[0x38; 4], &[f32::NAN; 4], 2, 2, 1).is_err());
         assert!(unpack_fp8_scale_inv(&[0x7F; 4], &[1.0; 4], 2, 2, 1).is_err());
+    }
+
+    fn published_minimax_m3_config() -> serde_json::Value {
+        let mut moe_layer_freq = vec![0i64; 3];
+        moe_layer_freq.extend(std::iter::repeat_n(1i64, 57));
+        serde_json::json!({
+            "architectures": ["MiniMaxM3SparseForConditionalGeneration"],
+            "model_type": "minimax_m3_vl",
+            "text_config": {
+                "hidden_size": 6144,
+                "intermediate_size": 3072,
+                "dense_intermediate_size": 12288,
+                "shared_intermediate_size": 3072,
+                "num_hidden_layers": 60,
+                "num_attention_heads": 64,
+                "num_key_value_heads": 4,
+                "head_dim": 128,
+                "vocab_size": 200064,
+                "max_position_embeddings": 1048576,
+                "rms_norm_eps": 0.000001,
+                "use_gemma_norm": true,
+                "use_qk_norm": true,
+                "qk_norm_type": "per_head",
+                "hidden_act": "swigluoai",
+                "swiglu_alpha": 1.702,
+                "swiglu_limit": 7.0,
+                "tie_word_embeddings": false,
+                "rope_theta": 10000000.0,
+                "rotary_dim": 64,
+                "partial_rotary_factor": 0.5,
+                "attention_output_gate": false,
+                "num_local_experts": 128,
+                "num_experts_per_tok": 4,
+                "n_shared_experts": 1,
+                "scoring_func": "sigmoid",
+                "use_routing_bias": true,
+                "routed_scaling_factor": 2.0,
+                "moe_layer_freq": moe_layer_freq,
+                "sparse_attention_config": {
+                    "use_sparse_attention": true,
+                    "sparse_index_dim": 128,
+                    "sparse_num_index_heads": 4,
+                    "sparse_topk_blocks": 16,
+                    "sparse_block_size": 128,
+                    "sparse_score_type": "max",
+                    "sparse_init_block": 0,
+                    "sparse_local_block": 1,
+                    "sparse_attention_freq": vec![1i64; 60],
+                    "sparse_disable_index_value": vec![1i64; 60]
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn minimax_m3_arch_names_profile_and_router_precision_are_explicit() {
+        let arch = build_arch(&published_minimax_m3_config()).unwrap();
+        assert_eq!(arch.arch_name, minimax_m3::MINIMAX_M3_MODEL_TYPE);
+        assert_eq!(arch.max_position_embeddings, MINIMAX_M3_DENSE_SAFE_CONTEXT);
+        assert_eq!(arch.max_position_embeddings, 2_048);
+        assert_eq!(arch.norm_style, NormStyle::Gemma);
+        assert_eq!(arch.hidden_act, "swigluoai");
+        assert_eq!(arch.partial_rotary_factor, 0.5);
+        assert_eq!(arch.moe.as_ref().map(|m| (m.num_experts, m.top_k)), Some((128, 4)));
+
+        let canon = |name| canon_name_for_arch(&arch, name, MimoTowers::TextOnly);
+        assert_eq!(canon("language_model.lm_head.weight").as_deref(), Some("lm_head.weight"));
+        assert_eq!(
+            canon("language_model.model.layers.3.self_attn.q_norm.weight").as_deref(),
+            Some("model.layers.3.self_attn.q_norm.weight")
+        );
+        assert_eq!(
+            canon("language_model.model.layers.3.self_attn.k_norm.weight").as_deref(),
+            Some("model.layers.3.self_attn.k_norm.weight")
+        );
+        assert_eq!(
+            canon("language_model.model.layers.3.self_attn.index_q_proj.weight").as_deref(),
+            Some("model.layers.3.self_attn.index_q_proj.weight")
+        );
+        assert_eq!(
+            canon("language_model.model.layers.3.self_attn.index_k_proj.weight").as_deref(),
+            Some("model.layers.3.self_attn.index_k_proj.weight")
+        );
+        assert_eq!(
+            canon("language_model.model.layers.3.block_sparse_moe.e_score_correction_bias")
+                .as_deref(),
+            Some("model.layers.3.mlp.expert_bias")
+        );
+        assert_eq!(
+            canon("language_model.model.layers.3.block_sparse_moe.shared_experts.gate_proj.weight")
+                .as_deref(),
+            Some("model.layers.3.mlp.shared_expert.gate_proj.weight")
+        );
+        assert_eq!(
+            canon("language_model.model.layers.3.block_sparse_moe.experts.7.w1.weight_packed")
+                .as_deref(),
+            Some("model.layers.3.mlp.experts.7.gate_proj.weight_packed")
+        );
+        assert_eq!(canon("vision_tower.blocks.0.weight"), None);
+
+        let routed = "model.layers.3.mlp.experts.7.gate_proj.weight";
+        let shared = "model.layers.3.mlp.shared_expert.down_proj.weight";
+        let core = "model.layers.3.self_attn.q_proj.weight";
+        assert_eq!(default_quant_for_arch(&arch), Quant::Q4TiledP);
+        assert_eq!(profile_quant(&arch, Quant::Q4TiledP, routed), Quant::Q4TiledP);
+        assert_eq!(profile_quant(&arch, Quant::Q4TiledP, shared), Quant::Q4TiledP);
+        assert_eq!(profile_quant(&arch, Quant::Q4TiledP, core), Quant::Q8_2f);
+        assert_eq!(profile_quant(&arch, Quant::Q8_2f, routed), Quant::Q8_2f);
+        assert!(minimax_m3_profile_supported(Quant::Q4TiledP));
+        assert!(minimax_m3_profile_supported(Quant::Q8_2f));
+        assert!(minimax_m3_profile_supported(Quant::Q2TiledP));
+        assert!(!minimax_m3_profile_supported(Quant::Mxfp4));
+
+        let router = "model.layers.3.mlp.gate.weight";
+        assert!(force_f16(router), "legacy policy would otherwise downcast router");
+        assert!(force_arch_f32(&arch, router));
+        assert!(force_f32("model.layers.3.mlp.expert_bias"));
+        let values = vec![0.25f32; 128 * 32];
+        let mut batches = vec![Vec::new()];
+        emit_profiled_tensor(
+            &mut batches,
+            &[Quant::Q4TiledP],
+            &[true],
+            &arch,
+            router,
+            &[128, 32],
+            &values,
+            EmitMode::Auto,
+        );
+        assert_eq!(batches[0][0].dtype, TensorDtype::F32);
+    }
+
+    #[test]
+    fn minimax_m3_chat_template_requires_its_native_grammar() {
+        let exact = format!(
+            "{MINIMAX_M3_CHAT_NAMESPACE}{MINIMAX_M3_THINK_OPEN}\n\
+             {MINIMAX_M3_THINK_CLOSE}\n\
+             {MINIMAX_M3_CHAT_NAMESPACE}<tool_call>\n\
+             {MINIMAX_M3_CHAT_NAMESPACE}</tool_call>"
+        );
+        validate_minimax_m3_chat_template(&exact).expect("native M3 grammar");
+
+        let err = validate_minimax_m3_chat_template("<think>{{ messages }}</think>")
+            .expect_err("generic ChatML-ish template must not be accepted")
+            .to_string();
+        assert!(err.contains("MiniMax namespace"), "{err}");
+    }
+
+    #[test]
+    fn minimax_m3_arch_rejects_changed_rope_contract() {
+        let mut config = published_minimax_m3_config();
+        config["text_config"]["partial_rotary_factor"] = serde_json::json!(1.0);
+        let err = build_arch(&config).unwrap_err().to_string();
+        assert!(err.contains("partial_rotary_factor"), "{err}");
+    }
+
+    #[test]
+    fn minimax_m3_header_preflight_is_header_only_and_strict() {
+        let header = serde_json::json!({
+            "__metadata__": {"format": "pt"},
+            "language_model.model.embed_tokens.weight": {
+                "dtype": "BF16", "shape": [2, 3], "data_offsets": [0, 12]
+            }
+        });
+        let header = serde_json::to_vec(&header).unwrap();
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&header);
+        let metas = minimax_m3_header_metas("fixture", &bytes).unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].name, "language_model.model.embed_tokens.weight");
+        assert_eq!(metas[0].dtype, "BF16");
+        assert_eq!(metas[0].shape, vec![2, 3]);
+        assert!(minimax_m3_header_metas("truncated", &bytes[..8]).is_err());
+        assert!(minimax_m3_quant_companion(
+            "language_model.model.layers.3.block_sparse_moe.experts.0.w1.weight_scale"
+        ));
+        assert!(!minimax_m3_quant_companion(
+            "language_model.model.layers.3.block_sparse_moe.experts.0.w1.weight_packed"
+        ));
+    }
+
+    #[test]
+    fn minimax_m3_partial_probe_selects_only_executable_stream_shards() {
+        let arch = build_arch(&published_minimax_m3_config()).unwrap();
+        let shards = vec![
+            "companions.safetensors".to_string(),
+            "router.safetensors".to_string(),
+            "expert.safetensors".to_string(),
+        ];
+        let meta = |name: &str| TensorMeta {
+            name: name.to_string(),
+            dtype: "F32".to_string(),
+            shape: vec![1],
+            start: 0,
+            end: 4,
+        };
+        let headers = vec![
+            vec![
+                meta("language_model.model.layers.3.block_sparse_moe.experts.7.w1.weight_scale"),
+                meta("vision_tower.blocks.0.attn.q_proj.weight"),
+            ],
+            vec![meta(
+                "language_model.model.layers.3.block_sparse_moe.e_score_correction_bias",
+            )],
+            vec![meta(
+                "language_model.model.layers.3.block_sparse_moe.experts.7.w1.weight_packed",
+            )],
+        ];
+
+        let router = minimax_m3_convert_only_stream_shards(
+            &arch,
+            MimoTowers::TextOnly,
+            &shards,
+            &headers,
+            &["model.layers.3.mlp.expert_bias".to_string()],
+        )
+        .unwrap();
+        assert_eq!(router, HashSet::from(["router.safetensors".to_string()]));
+
+        // A quantization companion must not make a shard eligible by itself,
+        // even when the probe explicitly names its canonical source spelling.
+        let companion = minimax_m3_convert_only_stream_shards(
+            &arch,
+            MimoTowers::TextOnly,
+            &shards,
+            &headers,
+            &["model.layers.3.mlp.experts.7.gate_proj.weight_scale".to_string()],
+        )
+        .unwrap();
+        assert!(companion.is_empty(), "companions must not select a shard");
+
+        // Both the raw diagnostic spelling and the final CMF directory name
+        // select the same executable packed plane.  The latter is important:
+        // it is what `cortiq info` prints after conversion.
+        let expert_raw = minimax_m3_convert_only_stream_shards(
+            &arch,
+            MimoTowers::TextOnly,
+            &shards,
+            &headers,
+            &["model.layers.3.mlp.experts.7.gate_proj.weight_packed".to_string()],
+        )
+        .unwrap();
+        assert_eq!(expert_raw, HashSet::from(["expert.safetensors".to_string()]));
+
+        let expert_emitted = minimax_m3_convert_only_stream_shards(
+            &arch,
+            MimoTowers::TextOnly,
+            &shards,
+            &headers,
+            &["model.layers.3.mlp.experts.7.gate_proj.weight".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            expert_emitted,
+            HashSet::from(["expert.safetensors".to_string()])
+        );
+
+        let err = minimax_m3_convert_only_stream_shards(
+            &arch,
+            MimoTowers::TextOnly,
+            &shards[..2],
+            &headers,
+            &["model.layers.3.mlp.expert_bias".to_string()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("shard name(s)"), "{err}");
+    }
+
+    #[test]
+    fn minimax_mxfp8_rowwise_uses_32_value_ue8m0_groups() {
+        // E4M3 0x38 is exactly one.  The two scale bytes in each source row
+        // must be indexed by 32-wide ROW groups — treating this as a square
+        // tile grid would make the second row plausibly, but silently, wrong.
+        let (rows, cols) = (2usize, 64usize);
+        let packed = vec![0x38u8; rows * cols];
+        let scales = vec![127u8, 128, 129, 126];
+        let out = unpack_mxfp8_rowwise(&packed, &scales, rows, cols).unwrap();
+        assert_eq!(out[0], 1.0);
+        assert_eq!(out[31], 1.0);
+        assert_eq!(out[32], 2.0);
+        assert_eq!(out[63], 2.0);
+        assert_eq!(out[64], 4.0);
+        assert_eq!(out[64 + 31], 4.0);
+        assert_eq!(out[64 + 32], 0.5);
+        assert_eq!(out[127], 0.5);
+
+        assert!(unpack_mxfp8_rowwise(&packed, &[255, 128, 129, 126], rows, cols).is_err());
+        assert!(unpack_mxfp8_rowwise(&[0x7F; 128], &scales, rows, cols).is_err());
+        assert!(unpack_mxfp8_rowwise(&[0x7E; 128], &[254; 4], rows, cols).is_err());
+        assert!(unpack_mxfp8_rowwise(&packed, &scales, rows, 48).is_err());
+        assert!(unpack_mxfp8_rowwise(&packed[..127], &scales, rows, cols).is_err());
+    }
+
+    #[test]
+    fn minimax_ct_nvfp4_uses_inverse_global_scale() {
+        // One 16-value FP4 group.  0x31 encodes low nibble 1 (=0.5) and
+        // high nibble 3 (=1.5); E4M3 0x40 is 2.0.  With global divisor 4,
+        // the decoded pair is 0.25 / 0.75 — multiplying by the global scale
+        // (the unrelated ModelOpt contract) would yield 4 / 12 instead.
+        let out = unpack_ct_nvfp4_inverse_global_scale(&[0x31; 8], &[0x40], 4.0, 1, 8)
+            .unwrap();
+        for pair in out.chunks_exact(2) {
+            assert_eq!(pair, [0.25, 0.75]);
+        }
+        assert!(unpack_ct_nvfp4_inverse_global_scale(&[0x31; 8], &[0x7F], 4.0, 1, 8).is_err());
+        assert!(unpack_ct_nvfp4_inverse_global_scale(&[0x31; 8], &[0x40], 0.0, 1, 8).is_err());
+        assert!(unpack_ct_nvfp4_inverse_global_scale(&[0x31; 7], &[0x40], 4.0, 1, 8).is_err());
+        assert!(unpack_ct_nvfp4_inverse_global_scale(&[0x31; 8], &[0x40], 4.0, 1, 7).is_err());
+    }
+
+    #[test]
+    fn minimax_source_decoders_validate_companions_and_ignore_input_scale() {
+        fn write_raw(tensors: &[(String, &str, Vec<usize>, Vec<u8>)]) -> Vec<u8> {
+            let mut header = serde_json::Map::new();
+            let mut data = Vec::new();
+            for (name, dtype, shape, bytes) in tensors {
+                let start = data.len();
+                data.extend_from_slice(bytes);
+                header.insert(
+                    name.clone(),
+                    serde_json::json!({
+                        "dtype": dtype,
+                        "shape": shape,
+                        "data_offsets": [start, data.len()]
+                    }),
+                );
+            }
+            let header = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+            let mut out = (header.len() as u64).to_le_bytes().to_vec();
+            out.extend_from_slice(&header);
+            out.extend_from_slice(&data);
+            out
+        }
+        let root = std::env::temp_dir().join(format!(
+            "cortiq-minimax-source-decode-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("model.safetensors");
+        let mxfp8_name = "language_model.model.layers.0.self_attn.q_proj.weight";
+        let nvfp4_name = "language_model.model.layers.3.block_sparse_moe.experts.0.w1.weight_packed";
+        let tensors = vec![
+            (
+                mxfp8_name.into(),
+                "F8_E4M3",
+                vec![1, 32],
+                vec![0x38; 32],
+            ),
+            (
+                format!("{mxfp8_name}_scale_inv"),
+                "U8",
+                vec![1, 1],
+                vec![128],
+            ),
+            (nvfp4_name.into(), "U8", vec![1, 8], vec![0x31; 8]),
+            (
+                nvfp4_name.replace(".weight_packed", ".weight_scale"),
+                "F8_E4M3",
+                vec![1, 1],
+                vec![0x40],
+            ),
+            (
+                nvfp4_name.replace(".weight_packed", ".weight_global_scale"),
+                "F32",
+                vec![],
+                4.0f32.to_le_bytes().to_vec(),
+            ),
+            // Deliberately not one: it verifies this activation-calibration
+            // value is checked but never folded into static weights.
+            (
+                nvfp4_name.replace(".weight_packed", ".input_global_scale"),
+                "F32",
+                vec![],
+                0.25f32.to_le_bytes().to_vec(),
+            ),
+        ];
+        fs::write(&source, write_raw(&tensors)).unwrap();
+        let files = vec![open_safetensors(&source).unwrap()];
+
+        let fp8_meta = files[0]
+            .tensors
+            .iter()
+            .find(|m| m.name == mxfp8_name)
+            .unwrap();
+        let (shape, decoded) = minimax_m3_mxfp8_decode(fp8_meta, &files[0], &files).unwrap();
+        assert_eq!(shape, vec![1, 32]);
+        assert_eq!(decoded, vec![2.0; 32]);
+
+        let fp4_meta = files[0]
+            .tensors
+            .iter()
+            .find(|m| m.name == nvfp4_name)
+            .unwrap();
+        let (shape, decoded) = minimax_m3_ct_nvfp4_decode(fp4_meta, &files[0], &files).unwrap();
+        assert_eq!(shape, vec![1, 16]);
+        for pair in decoded.chunks_exact(2) {
+            assert_eq!(pair, &[0.25, 0.75]);
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// Fine-grained FP8 decode is row-independent just like the output
@@ -14530,6 +16487,7 @@ mod dspark_sidecar_tests {
             num_target_layers: 40,
             rope_theta: 10_000_000.0,
             rms_norm_eps: 1e-6,
+            flavor: DsparkFlavor::Minicpm,
         }
     }
 
@@ -14585,6 +16543,80 @@ mod dspark_sidecar_tests {
         open_safetensors(&source).unwrap()
     }
 
+    /// The published MiniMax-M3.1 DSpark config shape (root + `text_config`),
+    /// reproduced from the official checkpoint so the reader's contract is
+    /// testable without the 2.3 GB download.
+    fn minimax_dspark_config() -> serde_json::Value {
+        serde_json::json!({
+            "architectures": [MINIMAX_DSPARK_SOURCE_ARCH],
+            "model_type": "minimax_m3_vl",
+            "dspark_block_size": 7,
+            "dspark_target_layer_ids": MINIMAX_DSPARK_TARGET_IDS,
+            "markov_rank": 256,
+            "enable_confidence_head": true,
+            "confidence_head_with_markov": true,
+            "text_config": {
+                "hidden_size": 6144,
+                "dense_intermediate_size": 12288,
+                "intermediate_size": 3072,
+                "num_hidden_layers": 5,
+                "num_attention_heads": 64,
+                "num_key_value_heads": 4,
+                "head_dim": 128,
+                "vocab_size": 200064,
+                "rope_theta": 10000000.0,
+                "rms_norm_eps": 1e-6,
+                "hidden_act": "swigluoai",
+                "swiglu_alpha": 1.702,
+                "swiglu_limit": 7.0,
+                "use_qk_norm": true,
+                "dflash_config": {
+                    "block_size": 7,
+                    "mask_token_id": 200058,
+                    "target_layer_ids": MINIMAX_DSPARK_TARGET_IDS,
+                    "num_target_layers": 60,
+                    "context_source": "target_layers",
+                },
+            },
+        })
+    }
+
+    #[test]
+    fn minimax_dspark_contract_is_locked_to_the_published_draft() {
+        let layout = DsparkLayout::minimax(&minimax_dspark_config()).unwrap();
+        assert_eq!(layout.flavor, DsparkFlavor::Minimax);
+        assert_eq!(layout.target_layers, MINIMAX_DSPARK_TARGET_IDS);
+        assert_eq!(layout.block_size, 7);
+        assert_eq!(layout.mask_token_id, 200058);
+        assert_eq!(layout.num_target_layers, 60);
+        assert_eq!(layout.hidden, 6144);
+        // The draft's MLP is the target's DENSE width — reading the MoE
+        // `intermediate_size` instead would size every mlp spec wrong.
+        assert_eq!(layout.intermediate, 12288);
+        let specs = dspark_tensor_specs(&layout);
+        assert_eq!(specs.len(), 62);
+        assert!(specs
+            .iter()
+            .any(|s| s.source == "layers.0.decoder_layer.mlp.gate_proj.weight"));
+        assert!(specs.iter().any(|s| s.source == "final_norm.weight"));
+
+        // Drift fails closed: another draft revision's tap ids...
+        let mut bad = minimax_dspark_config();
+        bad["dspark_target_layer_ids"] = serde_json::json!([4, 18, 32, 46, 60]);
+        assert!(DsparkLayout::minimax(&bad).is_err());
+        // ...a missing text_config...
+        let mut bad = minimax_dspark_config();
+        bad.as_object_mut().unwrap().remove("text_config");
+        assert!(DsparkLayout::minimax(&bad).is_err());
+        // ...and a body that stopped being SwiGLU-OAI.
+        let mut bad = minimax_dspark_config();
+        bad["text_config"]["swiglu_alpha"] = serde_json::json!(1.5);
+        assert!(DsparkLayout::minimax(&bad).is_err());
+        // The reader must not accept MiniCPM's flat config or vice versa.
+        assert!(DsparkLayout::minimax(&official_config()).is_err());
+        assert!(DsparkLayout::official(&minimax_dspark_config()).is_err());
+    }
+
     #[test]
     fn dspark_contract_is_explicit_and_sidecar_name_never_aliases_mtp() {
         let layout = DsparkLayout::official(&official_config()).unwrap();
@@ -14616,7 +16648,7 @@ mod dspark_sidecar_tests {
         fs::create_dir_all(&dir).unwrap();
         let layout = tiny_layout();
         let source = write_tiny_source(&dir, &layout, true);
-        let err = validate_dspark_source(&source, &dspark_tensor_specs(&layout)).unwrap_err();
+        let err = validate_dspark_source(&source, &dspark_tensor_specs(&layout), layout.flavor).unwrap_err();
         assert!(err.to_string().contains("expected 62") || err.to_string().contains("unexpected"));
         let _ = fs::remove_dir_all(&dir);
     }
@@ -14629,7 +16661,7 @@ mod dspark_sidecar_tests {
         let layout = tiny_layout();
         let source = write_tiny_source(&dir, &layout, false);
         let specs = dspark_tensor_specs(&layout);
-        validate_dspark_source(&source, &specs).unwrap();
+        validate_dspark_source(&source, &specs, layout.flavor).unwrap();
         let binding = DsparkBaseBinding {
             filename: "minicpm-q4tp.cmf".into(),
             arch_name: MINICPM_DSPARK_BASE_ARCH.into(),

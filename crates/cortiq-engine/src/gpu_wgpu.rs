@@ -3014,6 +3014,14 @@ fn dsv4_global_gate_up_q4tp(@builtin(workgroup_id) wid: vec3<u32>,
             gate = min(gate, gg_p.lim);
         }
         var act = (gate / (1.0 + exp(-gate))) * up;
+        // `_p1 == 3` is MiniMax M3's SwiGLU-OAI: the clamps above are the
+        // reference's (gate min'd with `lim`, up clamped to ±`lim`), but the
+        // gate sigmoid uses alpha 1.702 and the up branch carries its +1
+        // offset.  `lim` is the OAI limit (7.0); `_p0` (the bf16 fold) is
+        // orthogonal and still applies after this branch.
+        if (gg_p._p1 == 3u) {
+            act = (gate / (1.0 + exp(-1.702 * gate))) * (up + 1.0);
+        }
         if (gg_p._p0 != 0u) {
             // The reference multiplies by the selected route weight before
             // converting the down input back to the model BF16 dtype.  The
@@ -3097,6 +3105,14 @@ fn dsv4_global_gate_up_q2tp(@builtin(workgroup_id) wid: vec3<u32>,
             gate = min(gate, gg_p.lim);
         }
         var act = (gate / (1.0 + exp(-gate))) * up;
+        // `_p1 == 3` is MiniMax M3's SwiGLU-OAI: the clamps above are the
+        // reference's (gate min'd with `lim`, up clamped to ±`lim`), but the
+        // gate sigmoid uses alpha 1.702 and the up branch carries its +1
+        // offset.  `lim` is the OAI limit (7.0); `_p0` (the bf16 fold) is
+        // orthogonal and still applies after this branch.
+        if (gg_p._p1 == 3u) {
+            act = (gate / (1.0 + exp(-1.702 * gate))) * (up + 1.0);
+        }
         if (gg_p._p0 != 0u) {
             act = gg_bf16(gg_wt[bslot] * act);
         }
@@ -3261,6 +3277,86 @@ mod global_moe_shader_tests {
         assert!(!src.contains("binding_array<WordBank, 8>"));
         validate(&src);
     }
+
+    /// The main ctx shader (moe_route, select, the graph kernels) is only
+    /// otherwise checked at pipeline creation — on a device, at startup,
+    /// for every model. A typo there is a whole-runtime failure, so parse
+    /// and validate it in tests too.
+    #[test]
+    fn main_wgsl_source_validates() {
+        validate(super::WGSL);
+    }
+}
+
+/// Per-call context for the pooled tail arm of the token graph.
+///
+/// The pipeline driver admits picks and snapshots the remap BEFORE a
+/// single-layer graph call and drains the cold list AFTER it; carrying that
+/// across the call as a thread-local avoids widening `forward_token_graph`'s
+/// already-enormous signature at its four callers. Decode is sequential on
+/// this thread, and `pooled_frame_enter` overwrites any stale frame.
+pub struct PooledFrame {
+    /// logical expert -> flat bank slot, `u32::MAX` where the expert is cold.
+    pub remap: Vec<u32>,
+    /// The layer's pinned shared-expert slot.
+    pub shared_slot: u32,
+    /// Bank identity the encode must match against `LFfn::MoePooled`.
+    pub pool_uid: u64,
+}
+
+thread_local! {
+    static POOLED: std::cell::RefCell<Option<PooledFrame>> = const { std::cell::RefCell::new(None) };
+    static POOLED_COLD: std::cell::RefCell<Vec<(usize, f32)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static POOLED_INPUT: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static POOLED_WINNERS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Arm the pooled context for the next token-graph call on this thread.
+pub fn pooled_frame_enter(frame: PooledFrame) {
+    POOLED_COLD.with(|c| c.borrow_mut().clear());
+    POOLED_INPUT.with(|c| c.borrow_mut().clear());
+    POOLED_WINNERS.with(|w| w.borrow_mut().clear());
+    POOLED.with(|p| *p.borrow_mut() = Some(frame));
+}
+
+/// The arm's `(remap, shared_slot)` when the armed frame belongs to this
+/// bank; `None` makes the encode decline instead of guessing a mapping.
+fn pooled_frame_ctx(pool_uid: u64) -> Option<(Vec<u32>, u32)> {
+    POOLED.with(|p| {
+        let f = p.borrow();
+        let f = f.as_ref()?;
+        (f.pool_uid == pool_uid).then_some((f.remap.clone(), f.shared_slot))
+    })
+}
+
+/// Cold picks of the just-finished pooled call: `(global expert, weight)`.
+/// Empty when every pick was resident.
+pub fn pooled_frame_take_cold() -> Vec<(usize, f32)> {
+    let v = POOLED_COLD.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    if !v.is_empty() {
+        POOLED_COLD_N.fetch_add(v.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    POOLED_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    v
+}
+
+/// Total cold experts and pooled layer-calls of this process (bench JSON).
+pub static POOLED_COLD_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static POOLED_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The device route's winners for the just-finished pooled call (global
+/// expert ids, resident or cold). The driver keeps them per layer and
+/// re-admits them BEFORE the next call — prediction, so the next token's
+/// route finds its picks resident and `cold` collapses toward zero.
+pub fn pooled_frame_take_winners() -> Vec<u32> {
+    POOLED_WINNERS.with(|w| std::mem::take(&mut *w.borrow_mut()))
+}
+
+/// The pooled layer's FFN input (`norm(h + attn)`), read back with the
+/// hidden so the host can finish cold experts against the exact vector the
+/// device routed on. Empty when the last call was not pooled.
+pub fn pooled_frame_take_input() -> Vec<f32> {
+    POOLED_INPUT.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
 
 const WGSL: &str = r#"
@@ -4111,6 +4207,16 @@ fn cmf_gelu_tanh(x: f32) -> f32 {
     return 0.5 * x * (1.0 + tanh(0.7978846 * (x + 0.044715 * x * x * x)));
 }
 
+// MiniMax M3's SwiGLU-OAI is deliberately a separate activation code rather
+// than a variant of the ordinary swiglu_limit path.  Its gate sigmoid uses
+// alpha 1.702 and its shifted up term means applying the usual clamp first
+// would be observably wrong.
+fn cmf_swiglu_oai_m3(g: f32, u: f32) -> f32 {
+    let gg = min(g, 7.0);
+    let uu = clamp(u, -7.0, 7.0);
+    return (gg / (1.0 + exp(-1.702 * gg))) * (uu + 1.0);
+}
+
 @group(0) @binding(0) var<storage, read>       sg   : array<f32>;
 @group(0) @binding(1) var<storage, read>       su   : array<f32>;
 @group(0) @binding(2) var<storage, read>       scol : array<f32>;
@@ -4121,6 +4227,15 @@ fn silu_mul_pre(@builtin(global_invocation_id) gid: vec3<u32>,
                 @builtin(num_workgroups) nwg: vec3<u32>) {
     let i = gid.x + gid.y * nwg.x * 256u;
     if (i >= snp.n) { return; }
+    // Code 3 is MiniMax M3's SwiGLU-OAI.  Keep it ahead of the historical
+    // limit and GELU arms: its fixed clamp and shifted up value are not the
+    // generic swiglu_limit contract.
+    if (snp._c == 3u) {
+        var v = cmf_swiglu_oai_m3(sg[i], su[i]);
+        if (snp.f == 1u) { v = v * scol[i]; }
+        sact[i] = v;
+        return;
+    }
     var gv = sg[i];
     var uv = su[i];
     // swiglu_limit, and its asymmetry is the reference's: `up` is clamped on
@@ -4132,7 +4247,7 @@ fn silu_mul_pre(@builtin(global_invocation_id) gid: vec3<u32>,
     }
     var v = (gv / (1.0 + exp(-gv))) * uv;
     // `_c` = the dense FFN's activation (`GraphAct::code`): 0 SiLU above,
-    // 1 exact GELU, 2 tanh-GELU.
+    // 1 exact GELU, 2 tanh-GELU. Code 3 returned above.
     if (snp._c == 1u) { v = cmf_gelu_erf(gv) * uv; }
     if (snp._c == 2u) { v = cmf_gelu_tanh(gv) * uv; }
     if (snp.f == 1u) { v = v * scol[i]; }
@@ -4350,8 +4465,12 @@ fn ffn_silu_mul(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.y * (65535u * 256u) + gid.x;
     if (i >= fsp.n) { return; }
     let g = fsg[i];
+    if (fsp._c == 3u) {
+        fsg[i] = cmf_swiglu_oai_m3(g, fsu[i]);
+        return;
+    }
     // `_c` = `GraphAct::code`: 0 SiLU (the historical expression), 1 GELU,
-    // 2 tanh-GELU.
+    // 2 tanh-GELU. Code 3 returned above.
     if (fsp._c == 1u) {
         fsg[i] = cmf_gelu_erf(g) * fsu[i];
     } else if (fsp._c == 2u) {
@@ -10705,13 +10824,17 @@ fn moe_gate_up_q2tp_f(@builtin(workgroup_id) wid: vec3<u32>,
     }
     if (lid == 0u) {
         let g = mg_pg[0];
-        var gg = g;
-        var uu = mg_pu[0];
-        if (mg_p.lim > 0.0) {
-            uu = clamp(uu, -mg_p.lim, mg_p.lim);
-            gg = min(gg, mg_p.lim);
+        if (mg_p.act == 3u) {
+            mg_act[slot * mg_p.inter + row] = cmf_swiglu_oai_m3(g, mg_pu[0]);
+        } else {
+            var gg = g;
+            var uu = mg_pu[0];
+            if (mg_p.lim > 0.0) {
+                uu = clamp(uu, -mg_p.lim, mg_p.lim);
+                gg = min(gg, mg_p.lim);
+            }
+            mg_act[slot * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
         }
-        mg_act[slot * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
     }
 }
 
@@ -11745,12 +11868,14 @@ fn moe_select(@builtin(local_invocation_index) lid: u32) {
 
 // gate+up+SiLU for every selected expert: workgroup (row, slot) does BOTH q4t
 // row dots (they share the activation reads) and writes act = silu(g)·u.
-struct MoeGuP { gpr: u32, inter: u32, slots: u32, mat16: u32 , lim: f32, _p0: u32, _p1: u32, _p2: u32 };
+struct MoeGuP { gpr: u32, inter: u32, slots: u32, mat16: u32 , lim: f32, _p0: u32, _p1: u32, act: u32 };
 // Three scalars, not a vec3: a vec3<u32> aligns to 16 in uniform layout and
 // pushes the struct to 48 bytes, while the buffer handed in is 32.
 // `lim` is DeepSeek-V4's swiglu_limit: the up projection is clamped both
 // ways, the gate only from above. Zero means no clamp, which is every other
 // architecture that reaches these kernels.
+// `act` is `GraphAct::code`.  In particular, code 3 selects MiniMax M3's
+// fixed-clamp, alpha-1.702 SwiGLU-OAI rather than this generic limit.
 @group(0) @binding(0) var<storage, read>       mg_gw  : array<u32>;
 @group(0) @binding(1) var<storage, read>       mg_uw  : array<u32>;
 @group(0) @binding(2) var<storage, read>       mg_x   : array<f32>;
@@ -11824,13 +11949,17 @@ fn moe_gate_up(@builtin(workgroup_id) wid: vec3<u32>,
     }
     if (lid == 0u) {
         let g = mg_pg[0];
-        var gg = g;
-        var uu = mg_pu[0];
-        if (mg_p.lim > 0.0) {
-            uu = clamp(uu, -mg_p.lim, mg_p.lim);
-            gg = min(gg, mg_p.lim);
+        if (mg_p.act == 3u) {
+            mg_act[slot * mg_p.inter + row] = cmf_swiglu_oai_m3(g, mg_pu[0]);
+        } else {
+            var gg = g;
+            var uu = mg_pu[0];
+            if (mg_p.lim > 0.0) {
+                uu = clamp(uu, -mg_p.lim, mg_p.lim);
+                gg = min(gg, mg_p.lim);
+            }
+            mg_act[slot * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
         }
-        mg_act[slot * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
     }
 }
 
@@ -11973,13 +12102,17 @@ fn moe_gate_up_q4tp(@builtin(workgroup_id) wid: vec3<u32>,
     }
     if (lid == 0u) {
         let g = mg_pg[0];
-        var gg = g;
-        var uu = mg_pu[0];
-        if (mg_p.lim > 0.0) {
-            uu = clamp(uu, -mg_p.lim, mg_p.lim);
-            gg = min(gg, mg_p.lim);
+        if (mg_p.act == 3u) {
+            mg_act[slot * mg_p.inter + row] = cmf_swiglu_oai_m3(g, mg_pu[0]);
+        } else {
+            var gg = g;
+            var uu = mg_pu[0];
+            if (mg_p.lim > 0.0) {
+                uu = clamp(uu, -mg_p.lim, mg_p.lim);
+                gg = min(gg, mg_p.lim);
+            }
+            mg_act[slot * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
         }
-        mg_act[slot * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
     }
 }
 
@@ -12092,13 +12225,17 @@ fn moe_gate_up_q2tp(@builtin(workgroup_id) wid: vec3<u32>,
     }
     if (lid == 0u) {
         let g = mg_pg[0];
-        var gg = g;
-        var uu = mg_pu[0];
-        if (mg_p.lim > 0.0) {
-            uu = clamp(uu, -mg_p.lim, mg_p.lim);
-            gg = min(gg, mg_p.lim);
+        if (mg_p.act == 3u) {
+            mg_act[slot * mg_p.inter + row] = cmf_swiglu_oai_m3(g, mg_pu[0]);
+        } else {
+            var gg = g;
+            var uu = mg_pu[0];
+            if (mg_p.lim > 0.0) {
+                uu = clamp(uu, -mg_p.lim, mg_p.lim);
+                gg = min(gg, mg_p.lim);
+            }
+            mg_act[slot * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
         }
-        mg_act[slot * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
     }
 }
 
@@ -12175,13 +12312,17 @@ fn moe_gate_up_q2tp_m(@builtin(workgroup_id) wid: vec3<u32>,
     }
     if (lane == 0u) {
         let g = mgm_pg[sub * 64u];
-        var gg = g;
-        var uu = mgm_pu[sub * 64u];
-        if (mg_p.lim > 0.0) {
-            uu = clamp(uu, -mg_p.lim, mg_p.lim);
-            gg = min(gg, mg_p.lim);
+        if (mg_p.act == 3u) {
+            mg_act[slot * mg_p.inter + row] = cmf_swiglu_oai_m3(g, mgm_pu[sub * 64u]);
+        } else {
+            var gg = g;
+            var uu = mgm_pu[sub * 64u];
+            if (mg_p.lim > 0.0) {
+                uu = clamp(uu, -mg_p.lim, mg_p.lim);
+                gg = min(gg, mg_p.lim);
+            }
+            mg_act[slot * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
         }
-        mg_act[slot * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
     }
 }
 
@@ -12455,12 +12596,13 @@ fn moe_select_b(@builtin(workgroup_id) wid: vec3<u32>,
 }
 
 // gate+up+SiLU with a token axis: workgroup (row, slot, token).
-struct MoeGuBP { gpr: u32, inter: u32, slots: u32, mat16: u32 , lim: f32, _p0: u32, _p1: u32, _p2: u32 };
+struct MoeGuBP { gpr: u32, inter: u32, slots: u32, mat16: u32 , lim: f32, _p0: u32, _p1: u32, act: u32 };
 // Three scalars, not a vec3: a vec3<u32> aligns to 16 in uniform layout and
 // pushes the struct to 48 bytes, while the buffer handed in is 32.
 // `lim` is DeepSeek-V4's swiglu_limit: the up projection is clamped both
 // ways, the gate only from above. Zero means no clamp, which is every other
 // architecture that reaches these kernels.
+// `act` follows `MoeGuP` above; code 3 is MiniMax M3's SwiGLU-OAI.
 @group(0) @binding(0) var<storage, read>       gb_gw  : array<u32>;
 @group(0) @binding(1) var<storage, read>       gb_uw  : array<u32>;
 @group(0) @binding(2) var<storage, read>       gb_x   : array<f32>;
@@ -12544,14 +12686,18 @@ fn moe_gate_up_q4tp_b(@builtin(workgroup_id) wid: vec3<u32>,
     }
     if (lid == 0u) {
         let g = gb_pg[0];
-        var gg = g;
-        var uu = gb_pu[0];
-        if (gb_p.lim > 0.0) {
-            uu = clamp(uu, -gb_p.lim, gb_p.lim);
-            gg = min(gg, gb_p.lim);
+        if (gb_p.act == 3u) {
+            gb_act[(t * gb_p.slots + slot) * gb_p.inter + row] = cmf_swiglu_oai_m3(g, gb_pu[0]);
+        } else {
+            var gg = g;
+            var uu = gb_pu[0];
+            if (gb_p.lim > 0.0) {
+                uu = clamp(uu, -gb_p.lim, gb_p.lim);
+                gg = min(gg, gb_p.lim);
+            }
+            gb_act[(t * gb_p.slots + slot) * gb_p.inter + row] =
+                (gg / (1.0 + exp(-gg))) * uu;
         }
-        gb_act[(t * gb_p.slots + slot) * gb_p.inter + row] =
-            (gg / (1.0 + exp(-gg))) * uu;
     }
 }
 
@@ -12656,14 +12802,19 @@ fn moe_gate_up_q4tp_b_r4(@builtin(workgroup_id) wid: vec3<u32>,
             stride = stride >> 1u;
         }
         if (lid == 0u && row0 + r < rows) {
-            var gg = gb4_pg[0];
-            var uu = gb4_pu[0];
-            if (gb_p.lim > 0.0) {
-                uu = clamp(uu, -gb_p.lim, gb_p.lim);
-                gg = min(gg, gb_p.lim);
+            if (gb_p.act == 3u) {
+                gb_act[(t * gb_p.slots + slot) * gb_p.inter + row0 + r] =
+                    cmf_swiglu_oai_m3(gb4_pg[0], gb4_pu[0]);
+            } else {
+                var gg = gb4_pg[0];
+                var uu = gb4_pu[0];
+                if (gb_p.lim > 0.0) {
+                    uu = clamp(uu, -gb_p.lim, gb_p.lim);
+                    gg = min(gg, gb_p.lim);
+                }
+                gb_act[(t * gb_p.slots + slot) * gb_p.inter + row0 + r] =
+                    (gg / (1.0 + exp(-gg))) * uu;
             }
-            gb_act[(t * gb_p.slots + slot) * gb_p.inter + row0 + r] =
-                (gg / (1.0 + exp(-gg))) * uu;
         }
         workgroupBarrier();
     }
@@ -14369,7 +14520,6 @@ var<workgroup> rt_used: array<u32, 64>;
 // untouched by how many threads do the counting.
 @compute @workgroup_size(1024)
 fn moe_route(@builtin(local_invocation_index) lid: u32) {
-    let n = rt_p.n;
     let k = rt_p.top_k;
     let has_bias = (rt_p.flags & 1u) != 0u;
     let has_mask = (rt_p.flags & 2u) != 0u;
@@ -14383,6 +14533,17 @@ fn moe_route(@builtin(local_invocation_index) lid: u32) {
     let qwen = (rt_p.flags & 32u) != 0u;
     let shared_gated = (rt_p.flags & 64u) != 0u;
     let preweighted = (rt_p.flags & 128u) != 0u;
+    // MiniMax-M3.1 (and Flint): sigmoid scores instead of sqrt-softplus,
+    // renormalized over the selected top-k with the reference's +1e-20
+    // floor. The bias still shifts only the CHOICE; weights ride the
+    // unbiased sigmoid, exactly like the host `moe_route_with_eps`.
+    //
+    // The selector lives in `n`'s HIGH bit, not in `flags`: flags bits 8+
+    // ARE the shared-slot field (`flags >> 8`), so a flag there corrupts
+    // the pinned slot (that collision shipped once as an off-by-one shared
+    // expert) and its own LSB toggled with the slot's parity.
+    let sigmoid_sc = (rt_p.n & 0x80000000u) != 0u;
+    let n = rt_p.n & 0x7FFFFFFFu;
     if (lid < k) {
         rt_used[lid] = 0u;
         rt_idx[lid] = 0u;
@@ -14420,7 +14581,9 @@ fn moe_route(@builtin(local_invocation_index) lid: u32) {
         // 512 experts followed by division by the selected mass, without an
         // overflow-prone full softmax in workgroup memory.
         var sc = v;
-        if (!qwen) {
+        if (sigmoid_sc) {
+            sc = 1.0 / (1.0 + exp(-v));
+        } else if (!qwen) {
             var sp = v;
             if (v <= 20.0) { sp = log(1.0 + exp(v)); }
             sc = sqrt(sp);
@@ -14553,7 +14716,12 @@ fn moe_route(@builtin(local_invocation_index) lid: u32) {
             }
         }
         if (sum > 0.0 && !preweighted) {
-            let inv = rt_p.scale / sum;
+            // The reference's sigmoid denominator is `(selected + 1e-20) /
+            // scaling`; the floor only separates from the plain division when
+            // every score underflows, which is exactly when it decides the
+            // route. Mirror it bit for bit for the sigmoid arm.
+            let denom = select(sum, sum + 1e-20, sigmoid_sc);
+            let inv = rt_p.scale / denom;
             for (var j = 0u; j < cnt; j = j + 1u) {
                 rt_w[j] = rt_w[j] * inv;
                 if (rt_cold[2u * j] != 0xFFFFFFFFu) {
@@ -15547,13 +15715,18 @@ fn bt_moe_gate_up_q2tp(@builtin(workgroup_id) wid: vec3<u32>,
     }
     if (lid == 0u) {
         let g = btg_pg[0];
-        var gg = g;
-        var uu = btg_pu[0];
-        if (mg_p.lim > 0.0) {
-            uu = clamp(uu, -mg_p.lim, mg_p.lim);
-            gg = min(gg, mg_p.lim);
+        if (mg_p.act == 3u) {
+            mg_act[(t * mg_p.slots + slot) * mg_p.inter + row] = cmf_swiglu_oai_m3(g, btg_pu[0]);
+        } else {
+            var gg = g;
+            var uu = btg_pu[0];
+            if (mg_p.lim > 0.0) {
+                uu = clamp(uu, -mg_p.lim, mg_p.lim);
+                gg = min(gg, mg_p.lim);
+            }
+            mg_act[(t * mg_p.slots + slot) * mg_p.inter + row] =
+                (gg / (1.0 + exp(-gg))) * uu;
         }
-        mg_act[(t * mg_p.slots + slot) * mg_p.inter + row] = (gg / (1.0 + exp(-gg))) * uu;
     }
 }
 
@@ -15636,14 +15809,19 @@ fn bt_moe_gate_up_q2tp_r4(@builtin(workgroup_id) wid: vec3<u32>,
             stride = stride >> 1u;
         }
         if (lid == 0u && row0 + r < rows) {
-            var gg = btg4_pg[0];
-            var uu = btg4_pu[0];
-            if (mg_p.lim > 0.0) {
-                uu = clamp(uu, -mg_p.lim, mg_p.lim);
-                gg = min(gg, mg_p.lim);
+            if (mg_p.act == 3u) {
+                mg_act[(t * mg_p.slots + slot) * mg_p.inter + row0 + r] =
+                    cmf_swiglu_oai_m3(btg4_pg[0], btg4_pu[0]);
+            } else {
+                var gg = btg4_pg[0];
+                var uu = btg4_pu[0];
+                if (mg_p.lim > 0.0) {
+                    uu = clamp(uu, -mg_p.lim, mg_p.lim);
+                    gg = min(gg, mg_p.lim);
+                }
+                mg_act[(t * mg_p.slots + slot) * mg_p.inter + row0 + r] =
+                    (gg / (1.0 + exp(-gg))) * uu;
             }
-            mg_act[(t * mg_p.slots + slot) * mg_p.inter + row0 + r] =
-                (gg / (1.0 + exp(-gg))) * uu;
         }
         workgroupBarrier();
     }
@@ -20353,8 +20531,25 @@ pub fn resident_bytes() -> u64 {
 /// MiniCPM-V-4.7-35B-A3B q4tp is the reproducer: its 17.5 GiB logical stack
 /// OOMed on a 24 GiB Vulkan card, while the 9/16 ceiling admitted a stable
 /// 27-layer device prefix. Dense q4tp models keep the full budget.
+///
+/// A proportional ceiling is the wrong shape on a large adapter: it was
+/// derived on 24-48 GiB cards, where the fixed context/pipeline allocations
+/// are a large fraction of the total, and on a 96 GiB card it reserves tens
+/// of GiB that nothing uses while forcing a needlessly long host tail. The
+/// measured amplification is what matters and it is small here: RTX PRO 6000
+/// (93,791 MiB budget) + MiniMax-M3.1 426B q4tp held a 23-layer prefix at
+/// 51,004 MiB logical against a 51,722 MiB physical peak (x1.014). So cards
+/// of at least 64 GiB take a flat reserve instead — 12 GiB covers the KV and
+/// upload-staging allocations the payload sum deliberately omits, and is
+/// still several times the measured slack.
 fn graph_live_budget_from_totals(vram_budget: u64, total: u64, q8: u64, packed_moe: u64) -> u64 {
+    const GIB: u64 = 1 << 30;
+    // Fixed KV/context/staging allocations that `total` does not model.
+    const LARGE_CARD_RESERVE: u64 = 12 * GIB;
     if q8 > total / 2 || packed_moe > total / 2 {
+        if vram_budget >= 64 * GIB {
+            return vram_budget.saturating_sub(LARGE_CARD_RESERVE);
+        }
         // 5/8 matched the packed-to-physical slope but left less than one
         // GiB for the fixed context/pipeline allocations on an A40. 9/16
         // keeps ~3 GiB of measured headroom while retaining the largest safe
@@ -25153,18 +25348,23 @@ pub fn q8_matvec_range(
     cols: usize,
     out: &mut [f32],
 ) -> bool {
-    let Some(c) = ctx() else { return false };
+    let dbg = std::env::var_os("CMF_HEAD_DEBUG").is_some();
+    let no = |why: &str| -> bool {
+        if dbg { eprintln!("q8_matvec_range[{idx}] declined: {why}"); }
+        false
+    };
+    let Some(c) = ctx() else { return no("no ctx") };
     let _op = c.op_gate.enter();
     if cols % 4 != 0 || rows == 0 {
-        return false;
+        return no("cols/rows");
     }
     let entry = &model.tensors[idx];
     let rows_total = entry.shape.first().copied().unwrap_or(0);
     if rows_total < row0 + rows {
-        return false;
+        return no("rows_total");
     }
     let Some(abs) = model.entry_abs_offset(entry) else {
-        return false; // neighboring shard — different mapping; CPU
+        return no("entry_abs_offset (shard)");
     };
     let bytes = model.primary_bytes();
     let payload_len = if entry.dtype == cortiq_core::TensorDtype::Q8_2f {
@@ -25173,7 +25373,7 @@ pub fn q8_matvec_range(
         rows_total * cols
     };
     if abs + payload_len > bytes.len() {
-        return false;
+        return no("payload beyond primary_bytes");
     }
     let full_quant = &bytes[abs..abs + payload_len];
     let key = (model.uid() as usize, idx);
@@ -25210,7 +25410,12 @@ fn dispatch_matvec(
     let q_buf = match weight_key {
         Some(k) => match weight_buffer(c, k, full_quant) {
             Some(b) => b,
-            None => return false, // over VRAM budget — honest CPU path
+            None => {
+                if std::env::var_os("CMF_HEAD_DEBUG").is_some() {
+                    eprintln!("dispatch_matvec weight_buffer refused key={k:?} len={}", full_quant.len());
+                }
+                return false; // over VRAM budget — honest CPU path
+            }
         },
         None => c
             .device
@@ -26346,6 +26551,15 @@ fn graph_stack_payload_bytes(
     })
 }
 
+/// `GraphMoeDetachedShared` deliberately has no activation field. The pipeline
+/// admits that shape only for a separately-shaped SiLU shared expert, so it
+/// must not inherit the routed bank's activation (for example MiniMax M3's
+/// code-3 OAI contract).
+#[inline]
+fn detached_shared_graph_act_code(_routed_act: u32) -> u32 {
+    crate::gpu::GraphAct::Silu.code()
+}
+
 /// WHOLE-TOKEN decode graph: the entire layer stack (rmsnorm → attention →
 /// residual → rmsnorm → SiLU-FFN → residual, every layer) encoded into ONE
 /// command buffer with the hidden RESIDENT on the GPU — only the final hidden
@@ -26504,6 +26718,9 @@ pub fn forward_token_graph(
         up: GMat,
         down: GMat,
         width: usize,
+        /// Always SiLU: its public graph descriptor carries no activation
+        /// contract, and construction admits only an explicit SiLU expert.
+        act: u32,
     }
     enum LFfn {
         Dense {
@@ -26528,6 +26745,8 @@ pub fn forward_token_graph(
             n_exp: usize,
             top_k: usize,
             inter: usize,
+            /// `GraphAct::code` for every routed expert.
+            act: u32,
             norm_topk: bool,
             q4tp: bool,
             gu_q2: bool,
@@ -26540,6 +26759,29 @@ pub fn forward_token_graph(
             detached_shared: Option<LDetachedShared>,
             shared_gated: bool,
             route_scale: f32,
+        },
+        /// MiniMax's dynamic tail: routing through the segmented global bank
+        /// (descriptor-indexed gate/up/down), experts admitted between
+        /// single-layer calls. The remap and pinned shared slot ride the
+        /// per-call [`PooledFrame`] context; cold picks come back through
+        /// [`pooled_frame_take_cold`] for the host to finish.
+        MoePooled {
+            router: GMat,
+            sgate: GMat,
+            n_exp: usize,
+            top_k: usize,
+            inter: usize,
+            act: u32,
+            norm_topk: bool,
+            gu_q2: bool,
+            sigmoid: bool,
+            sigmoid_denom_eps: f32,
+            bias: Option<wgpu::Buffer>,
+            has_shared: bool,
+            shared_gated: bool,
+            route_scale: f32,
+            pool_uid: u64,
+            segment_slots: u32,
         },
     }
     struct LW {
@@ -26757,6 +26999,14 @@ pub fn forward_token_graph(
                                                                                  // boundary, not per layer.
     let mut prefix = false;
     let mut graph_bytes = 0u64;
+    // MiniMax's dynamic tail: a SINGLE-layer call with the expert bank armed
+    // converts its MoE to the pooled arm instead of baking ~2.5 GB of
+    // experts for one layer. Multi-layer runs stay baked-only — a bank slot
+    // cannot be refilled inside one submit (cold picks need the host).
+    let pooled_run = layers.len() == 1
+        && std::env::var("CMF_MINIMAX_DYNAMIC_TAIL").as_deref() == Ok("1")
+        && dsv4_global_moe_supported()
+        && dsv4_global_moe_ready(model);
     for l in layers {
         let Some(layer_bytes) = graph_layer_payload_bytes(model, l) else {
             graph_decline("cannot size layer payload");
@@ -26924,6 +27174,7 @@ pub fn forward_token_graph(
                 n_exp,
                 top_k,
                 inter: mi,
+                act,
                 norm_topk,
                 q4tp,
                 gu_q2,
@@ -26949,9 +27200,13 @@ pub fn forward_token_graph(
                 // q8_2f experts run only on `moe_q82`'s decode pair: refuse
                 // before any upload when it cannot serve this geometry.
                 if *q82
-                    && (!moe_q82::fits(hidden, *mi) || moe_q82::decode(c, hidden).is_none())
+                    && (act.code() == 3
+                        || !moe_q82::fits(hidden, *mi)
+                        || moe_q82::decode(c, hidden).is_none())
                 {
-                    graph_decline("q8_2f MoE experts: no decode kernels for this device/geometry");
+                    graph_decline(
+                        "q8_2f MoE experts: MiniMax M3 activation or decode geometry unsupported",
+                    );
                     return token_graph_outcome(o1_started || state_started, false);
                 }
                 let Some(router) = resolve(router, *n_exp, hidden) else {
@@ -27002,10 +27257,51 @@ pub fn forward_token_graph(
                             up,
                             down,
                             width: shared.width,
+                            act: detached_shared_graph_act_code(act.code()),
                         })
                     }
                     None => None,
                 };
+                if pooled_run {
+                    let gb = c
+                        .dsv4_global_moe
+                        .lock()
+                        .unwrap()
+                        .get(&model.uid())
+                        .cloned();
+                    let Some(gb) = gb else {
+                        graph_decline("pooled MoE: bank disappeared");
+                        return token_graph_outcome(o1_started || state_started, false);
+                    };
+                    if gb.gu_q2 != *gu_q2 || gb.fp4 {
+                        graph_decline("pooled MoE: bank codec does not match the layer");
+                        return token_graph_outcome(o1_started || state_started, false);
+                    }
+                    LFfn::MoePooled {
+                        router,
+                        sgate,
+                        n_exp: *n_exp,
+                        top_k: *top_k,
+                        inter: *mi,
+                        act: act.code(),
+                        norm_topk: *norm_topk,
+                        gu_q2: *gu_q2,
+                        sigmoid: *sigmoid,
+                        sigmoid_denom_eps: *sigmoid_denom_eps,
+                        bias: bias.map(|b| {
+                            c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                label: Some("moe-sel-bias"),
+                                contents: bytemuck::cast_slice(b),
+                                usage: wgpu::BufferUsages::STORAGE,
+                            })
+                        }),
+                        has_shared: *has_shared,
+                        shared_gated: *shared_gated,
+                        route_scale: *route_scale,
+                        pool_uid: model.uid(),
+                        segment_slots: gb.segment_slots as u32,
+                    }
+                } else {
                 // The layer-level live-set check above owns the prefix
                 // boundary. Keep this arena check for other resident data
                 // that may already occupy the explicit weight budget.
@@ -27057,6 +27353,7 @@ pub fn forward_token_graph(
                     n_exp: *n_exp,
                     top_k: *top_k,
                     inter: *mi,
+                    act: act.code(),
                     norm_topk: *norm_topk,
                     q4tp: *q4tp,
                     gu_q2: *gu_q2,
@@ -27075,6 +27372,7 @@ pub fn forward_token_graph(
                     shared_gated: *shared_gated,
                     detached_shared,
                     route_scale: *route_scale,
+                }
                 }
             }
         };
@@ -27366,6 +27664,12 @@ pub fn forward_token_graph(
                 top_k,
                 inter,
                 ..
+            }
+            | LFfn::MoePooled {
+                n_exp,
+                top_k,
+                inter,
+                ..
             } => Some((*n_exp, *top_k + 1, *inter)),
             _ => None,
         })
@@ -27379,6 +27683,10 @@ pub fn forward_token_graph(
             GraphScratch::ensure(&c.device, &mut gs.m_act, (ms * mi * 4) as u64, st, "g-mact"),
         )
     });
+    // The pooled arm's cold list: copied into the final readback stage and
+    // drained into the per-thread frame once the call completes. At most one
+    // pooled layer exists per call (single-layer by construction).
+    let mut pooled_cold: Option<(wgpu::Buffer, usize)> = None;
     let invf_b = stor(bytemuck::cast_slice(invf));
     let dummy_hd = zeros(hd);
     // GDN intermediates (sized to the model's GDN geometry; 1 if no GDN layer).
@@ -27956,6 +28264,10 @@ pub fn forward_token_graph(
     // The exact-GELU twin (`silu_mul_pre`'s `_c` = 1) for GELU layers.
     let gelu_u = uniform_u32x4(c, [inter as u32, 0, 0, 1]);
     let gelu_tanh_u = uniform_u32x4(c, [inter as u32, 0, 0, 2]);
+    // MiniMax M3's fixed SwiGLU-OAI contract.  Its gate/up fusion is
+    // intentionally left to the ordinary projections plus `silu_mul_pre`:
+    // the older dense fused shaders do not read this activation code.
+    let swiglu_oai_m3_u = uniform_u32x4(c, [inter as u32, 0, 0, 3]);
     let steps = steps.max(1);
     // One uniform PER STEP, with stable identities: write_buffer lands at
     // submit, so a single shared buffer would collapse every step to the
@@ -28691,13 +29003,89 @@ pub fn forward_token_graph(
     } else {
         (None, None, None, None, None)
     };
+    // Head-only pass: the pooled tail's device lm_head. No layers and no KV
+    // — final-norm + lm_head over the uploaded hidden, read back on the same
+    // fence. This exists because a pooled single-layer call must NOT fold the
+    // head (its cold experts land after the call), yet the host head costs
+    // double-digit milliseconds a token. Everything it uses (h_buf upload,
+    // n1, rms_u, emat, the merge-guarded encoder) is armed above.
+    if layers.is_empty()
+        && steps == 1
+        && embed.is_none()
+        && ids_out.is_none()
+        && o1.is_empty()
+        && loop_norm_at.is_empty()
+    {
+        let resolved = lm_head.and_then(|(gw, rows)| {
+            let total = model
+                .tensors
+                .get(gw.idx)
+                .and_then(|e| e.shape.first().copied())
+                .unwrap_or(rows)
+                .max(rows);
+            resolve(gw, total, hidden).map(|m| (m, rows, total))
+        });
+        let Some((lm, lrows, ltotal)) = resolved else {
+            graph_decline("head-only: lm_head resolve");
+            return token_graph_outcome(o1_started || state_started, false);
+        };
+        let fnw = stor(bytemuck::cast_slice(final_norm));
+        go(
+            &mut enc,
+            &c.rmsnorm,
+            &bgc(0, 0, &c.layout_rmsnorm, &[&h_buf, &fnw, &n1, &rms_u]),
+            1,
+        );
+        let lsize = (lrows * 4) as u64;
+        let lbuf = GraphScratch::ensure(
+            &c.device,
+            &mut gs.logits,
+            lsize,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            "g-logits",
+        );
+        let Some(lm_in) = prism_input(&mut enc, &[&lm], &n1, hidden) else {
+            graph_decline("head-only: Prism lm_head transform unavailable");
+            return token_graph_outcome(o1_started || state_started, false);
+        };
+        if lrows < ltotal && lm.kind == 6 && hidden % 32 == 0 && hidden / 32 > 64 {
+            encode_q4tp_mv16w_shortlist(c, &mut enc, &lm.buf, &lm_in, &lbuf, lrows, hidden, ltotal);
+        } else if lm.kind == 10 {
+            encode_matvec_q1g_rows(c, &mut enc, &lm.buf, &lm_in, &lbuf, lrows, ltotal, hidden);
+        } else {
+            emat(&mut enc, &lm, &lm_in, &lbuf, lrows, hidden);
+        }
+        logits.resize(lrows, 0.0);
+        write_span_endpoint(&mut enc);
+        resolve_timestamps(&mut enc);
+        let stage = GraphScratch::ensure(
+            &c.device,
+            &mut gs.stage,
+            lsize,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            "g-stage",
+        );
+        crate::gpu::hostprof_encode_done(_hp_t0);
+        let ok = readback(c, enc, &lbuf, &stage, lsize, &mut logits[..lrows]);
+        crate::gpu::hostprof_total(_hp_t0);
+        drop(gs);
+        return token_graph_outcome(o1_started || state_started, ok);
+    }
     for stp in 0..steps {
         let kv_u = kv_us[stp].clone();
         let at_u = at_us[stp].clone();
         let position = position + stp;
         // Bootstrap the first layer's attention norm; thereafter each residual is
         // fused with the following norm (add_rmsnorm), saving two dispatches/layer.
-        let inw0 = stor(bytemuck::cast_slice(layers[0].input_norm));
+        // Cached per (kv, layer): a fresh create_buffer_init per span
+        // call was one of the larger per-layer costs of the pooled tail.
+        let inw0 = store_slot(
+            c,
+            19,
+            kv_id,
+            layer_base,
+            bytemuck::cast_slice(layers[0].input_norm),
+        );
         ts!(enc, 0, 0);
         go(
             &mut enc,
@@ -30137,6 +30525,231 @@ pub fn forward_token_graph(
             // after its routed bank, before the residual tail below.
             let mut deferred_shared: Option<&LDetachedShared> = None;
             match &lw.ffn {
+                LFfn::MoePooled {
+                    router,
+                    sgate: _,
+                    n_exp,
+                    top_k,
+                    inter: mi,
+                    act,
+                    norm_topk,
+                    gu_q2,
+                    sigmoid,
+                    sigmoid_denom_eps,
+                    bias,
+                    has_shared,
+                    shared_gated,
+                    route_scale,
+                    pool_uid,
+                    segment_slots,
+                } => {
+                    // MiniMax's dynamic tail, ONE layer a call: the router
+                    // runs here, then the chain's route kernel (remap-aware,
+                    // cold hand-back) and the descriptor-indexed gate/up and
+                    // down stay inside THIS compute pass — the same shape
+                    // `encode_moe_chain_p` proved for DSV4. The driver arms
+                    // the remap before the call and drains cold after it.
+                    let Some((remap, shared_slot)) = pooled_frame_ctx(*pool_uid) else {
+                        graph_decline("pooled MoE: no armed pool frame for this bank");
+                        return token_graph_outcome(o1_started || state_started, false);
+                    };
+                    let gb = c
+                        .dsv4_global_moe
+                        .lock()
+                        .unwrap()
+                        .get(pool_uid)
+                        .cloned();
+                    let Some(gb) = gb else {
+                        graph_decline("pooled MoE: bank vanished mid-run");
+                        return token_graph_outcome(o1_started || state_started, false);
+                    };
+                    if gb.gu_q2 != *gu_q2 || gb.fp4 || remap.len() < *n_exp {
+                        graph_decline("pooled MoE: bank codec/geometry mismatch");
+                        return token_graph_outcome(o1_started || state_started, false);
+                    }
+                    let Some((p_gu, p_dn)) = dsv4_global_moe_pipelines(c, *gu_q2, gb.segments)
+                    else {
+                        graph_decline("pooled MoE: descriptor pipelines unavailable");
+                        return token_graph_outcome(o1_started || state_started, false);
+                    };
+                    // The pre-FFN prologue (`h += attn`, `n1 = rms(h,
+                    // post_norm)`) is deferred into the FFN pass by
+                    // pass-fusing — EVERY baked arm runs it before touching
+                    // n1, and skipping it here fed the router and experts
+                    // the pre-attention vector and dropped attention from
+                    // the residual tail (26 layers of that compounds into
+                    // noise).
+                    if let Some((p, b, w)) = ffn_pre.take() {
+                        go(&mut enc, p, &b, w);
+                    }
+                    let (mlogit, _mslog, msel, mwt, mact) = moe_bufs.as_ref().expect("pooled MoE participates in moe_geom");
+                    emat(&mut enc, router, &n1, mlogit, *n_exp, hidden);
+                    let slots = *top_k + usize::from(*has_shared);
+                    let bias_buf = match bias {
+                        Some(b) => b.clone(),
+                        None => mlogit.clone(),
+                    };
+                    let mk = frame_buf(c, 17, (*n_exp).max(1) * 4, true);
+                    let fc = frame_buf(c, 18, (*top_k).max(1) * 4, true);
+                    let rm = store_slot(
+                        c,
+                        26,
+                        kv_id,
+                        layer_base + li,
+                        bytemuck::cast_slice(&remap[..*n_exp]),
+                    );
+                    let mcnt = rw_f32(c, 1, true);
+                    let coldb = rw_f32(c, 4 * *top_k, true);
+                    // bit0 selection bias, bit3 pin the shared expert at
+                    // `shared_slot` (weight 1 — MiniMax's shared is ungated),
+                    // bit4 subset (remap may hand a pick back as cold);
+                    // sigmoid scoring rides n's high bit (see the shader).
+                    let rflags = u32::from(bias.is_some())
+                        | 8
+                        | 16
+                        | (shared_slot << 8);
+                    // High bit of `n` selects sigmoid scoring — `flags` has
+                    // no free bit below the shared-slot field.
+                    let rp = uniform_mixed(
+                        c,
+                        [(*n_exp as u32) | 0x8000_0000, *top_k as u32, rflags],
+                        *route_scale,
+                    );
+                    let stride16 = |rows: usize, cols: usize, q2: bool| -> u32 {
+                        let dt = if q2 {
+                            cortiq_core::TensorDtype::Q2TiledP
+                        } else {
+                            cortiq_core::TensorDtype::Q4TiledP
+                        };
+                        (cortiq_core::quant::expected_nbytes(dt, &[rows, cols]).unwrap_or(0) / 2)
+                            as u32
+                    };
+                    // The OAI limit rides the uniform; the shader's code 3
+                    // branch clamps against it (the generic arm passes 0 =
+                    // no clamp, as the baked MoE kernels do).
+                    let lim = if *act == 3 { 7.0f32 } else { 0.0 };
+                    let gu_u = uniform_u32x8(
+                        c,
+                        [
+                            (hidden / 32) as u32,
+                            *mi as u32,
+                            slots as u32,
+                            stride16(*mi, hidden, *gu_q2),
+                            lim.to_bits(),
+                            *segment_slots,
+                            0,
+                            *act,
+                        ],
+                    );
+                    let dn_u = uniform_u32x8(
+                        c,
+                        [
+                            (*mi / 32) as u32,
+                            hidden as u32,
+                            slots as u32,
+                            stride16(hidden, *mi, false),
+                            *segment_slots,
+                            0,
+                            0,
+                            0,
+                        ],
+                    );
+                    let gate_b: Vec<_> = gb
+                        .gate
+                        .iter()
+                        .map(wgpu::Buffer::as_entire_buffer_binding)
+                        .collect();
+                    let up_b: Vec<_> = gb
+                        .up
+                        .iter()
+                        .map(wgpu::Buffer::as_entire_buffer_binding)
+                        .collect();
+                    let down_b: Vec<_> = gb
+                        .down
+                        .iter()
+                        .map(wgpu::Buffer::as_entire_buffer_binding)
+                        .collect();
+                    let mut pass = begin_pass(&mut enc);
+                    {
+                        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("pooled-route"),
+                            layout: &c.moe_route.get_bind_group_layout(0),
+                            entries: &[
+                                bind_buf(0, mlogit),
+                                bind_buf(1, &bias_buf),
+                                bind_buf(2, &mk),
+                                bind_buf(3, &fc),
+                                bind_buf(4, msel),
+                                bind_buf(5, mwt),
+                                bind_buf(6, &mcnt),
+                                bind_buf(7, &rp),
+                                bind_buf(8, &rm),
+                                bind_buf(9, &coldb),
+                            ],
+                        });
+                        pass.set_pipeline(&c.moe_route);
+                        pass.set_bind_group(0, &bind, &[]);
+                        pass.dispatch_workgroups(1, 1, 1);
+                    }
+                    {
+                        let bg_gu = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("pooled-gu"),
+                            layout: &p_gu.get_bind_group_layout(0),
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::BufferArray(&gate_b),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::BufferArray(&up_b),
+                                },
+                                bind_buf(2, &n1),
+                                bind_buf(3, msel),
+                                bind_buf(4, mact),
+                                bind_buf(5, mwt),
+                            ],
+                        });
+                        let bg_gu_p = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("pooled-gu-p"),
+                            layout: &p_gu.get_bind_group_layout(1),
+                            entries: &[bind_buf(0, &gu_u)],
+                        });
+                        pass.set_pipeline(p_gu);
+                        pass.set_bind_group(0, &bg_gu, &[]);
+                        pass.set_bind_group(1, &bg_gu_p, &[]);
+                        pass.dispatch_workgroups(*mi as u32, slots as u32, 1);
+                    }
+                    {
+                        let bg_dn = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("pooled-dn"),
+                            layout: &p_dn.get_bind_group_layout(0),
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::BufferArray(&down_b),
+                                },
+                                bind_buf(1, mact),
+                                bind_buf(2, msel),
+                                bind_buf(3, mwt),
+                                bind_buf(4, &ob),
+                            ],
+                        });
+                        let bg_dn_p = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("pooled-dn-p"),
+                            layout: &p_dn.get_bind_group_layout(1),
+                            entries: &[bind_buf(0, &dn_u)],
+                        });
+                        pass.set_pipeline(p_dn);
+                        pass.set_bind_group(0, &bg_dn, &[]);
+                        pass.set_bind_group(1, &bg_dn_p, &[]);
+                        pass.dispatch_workgroups(hidden as u32, 1, 1);
+                    }
+                    drop(pass);
+                    // The cold list rides the final readback of THIS call;
+                    // a pooled run is one layer, so at most one list exists.
+                    pooled_cold = Some((coldb, *top_k));
+                }
                 LFfn::Dense {
                     gate,
                     up,
@@ -30150,6 +30763,7 @@ pub fn forward_token_graph(
                     let act_u = match act {
                         0 => &silu_u,
                         2 => &gelu_tanh_u,
+                        3 => &swiglu_oai_m3_u,
                         _ => &gelu_u,
                     };
                     let mut continue_ffn = false;
@@ -30264,6 +30878,12 @@ pub fn forward_token_graph(
                         };
                         let gu_ok = c.use_mv_gu
                             && c.use_mv4
+                            // The dense fused GU shaders only implement
+                            // SiLU/GELU variants. Route M3 through the
+                            // explicit `silu_mul_pre` kernel below so its
+                            // fixed clamp, alpha and shifted up value stay
+                            // exact.
+                            && act != 3
                             && gate.kind == 6
                             && up.kind == 6
                             && gate.prism == crate::gpu::GraphPrismOp::None
@@ -30422,7 +31042,8 @@ pub fn forward_token_graph(
                                 tsp!(pass, fine, 45); // residual + next norm
                                 down_rode_along = true;
                             }
-                        } else if gate.kind == crate::gpu::GRAPH_KIND_BLR
+                        } else if act != 3
+                            && gate.kind == crate::gpu::GRAPH_KIND_BLR
                             && up.kind == crate::gpu::GRAPH_KIND_BLR
                         {
                             // blr gate/up: stage V of both, then stage U
@@ -30490,6 +31111,7 @@ pub fn forward_token_graph(
                     n_exp,
                     top_k,
                     inter: mi,
+                    act,
                     norm_topk,
                     q82: true,
                     sigmoid,
@@ -30501,6 +31123,14 @@ pub fn forward_token_graph(
                     route_scale,
                     ..
                 } => {
+                    // Construction refuses this already, but keep the
+                    // execution arm fail-closed if a future caller builds an
+                    // M3 q8_2f graph directly. moe_q82 has no activation
+                    // uniform and would otherwise run ordinary SiLU.
+                    if *act == 3 {
+                        graph_decline("q8_2f MoE decode lacks MiniMax M3 activation uniform");
+                        return token_graph_outcome(o1_started || state_started, false);
+                    }
                     deferred_shared = detached_shared.as_ref();
                     let (mlogit, mslog, msel, mwt, mact) = moe_bufs.as_ref().unwrap();
                     let slots = *top_k + usize::from(*has_shared);
@@ -30655,6 +31285,7 @@ pub fn forward_token_graph(
                     n_exp,
                     top_k,
                     inter: mi,
+                    act,
                     norm_topk,
                     q4tp,
                     gu_q2,
@@ -30737,8 +31368,8 @@ pub fn forward_token_graph(
                     } else {
                         mat16(*mi, hidden)
                     };
-                    // Eight words now: the fifth is the swiglu limit, zero
-                    // for every architecture but DeepSeek-V4.
+                    // The fifth word is the swiglu limit; the final word is
+                    // `GraphAct::code` for the MoE gate/up kernels.
                     let gu_u = uniform_u32x8(
                         c,
                         [
@@ -30749,7 +31380,7 @@ pub fn forward_token_graph(
                             0,
                             0,
                             0,
-                            0,
+                            *act,
                         ],
                     );
                     let dn_u = uniform_u32x4(
@@ -30808,7 +31439,10 @@ pub fn forward_token_graph(
                     // workgroup, vec4 activations, 16-byte weight words) when
                     // the geometry admits it; `CMF_MOE_R4=0` keeps the
                     // one-row kernels.
-                    let r4 = if *q4tp && !*gu_q2 {
+                    // moe_r4's shaders do not carry the activation code.
+                    // M3 stays on the ordinary q4tp pair below, whose
+                    // uniform explicitly carries code 3.
+                    let r4 = if *q4tp && !*gu_q2 && *act != 3 {
                         moe_r4::decode(c).filter(|_| {
                             moe_r4::fits(hidden, *mi, gu_mat16, mat16(hidden, *mi))
                         })
@@ -31004,6 +31638,7 @@ pub fn forward_token_graph(
                         && bias.is_none()
                         && *route_scale == 1.0
                         && detached_shared.is_none()
+                        && *act != 3
                         && !skip_router;
                     if fold {
                         if let Some((prp, bgr, wr)) = prep(router, &n1, mlogit, *n_exp, hidden) {
@@ -31182,6 +31817,9 @@ pub fn forward_token_graph(
                     && c.use_mv4
                     && shared.gate.kind == 6
                     && shared.up.kind == 6
+                    // dense_mv's fused shader does not carry M3's OAI
+                    // activation contract; use the explicit silu kernel.
+                    && shared.act != 3
                     && hidden % 32 == 0
                     && mv_fuse_gpr_ok(hidden / 32)
                     && c.q4tp_mv16w_probe.is_none();
@@ -31196,7 +31834,7 @@ pub fn forward_token_graph(
                                 &abuf,
                                 shared.width,
                                 hidden,
-                                0,
+                                shared.act,
                             )
                         })
                         .flatten()
@@ -31209,7 +31847,7 @@ pub fn forward_token_graph(
                                 &abuf,
                                 shared.width,
                                 hidden,
-                                0,
+                                shared.act,
                             );
                             Some((gu_pipe(c), b, w))
                         })
@@ -31239,7 +31877,8 @@ pub fn forward_token_graph(
                             ],
                         );
                     }
-                    let shared_silu_u = uniform_u32x4(c, [shared.width as u32, 0, 0, 0]);
+                    let shared_silu_u =
+                        uniform_u32x4(c, [shared.width as u32, 0, 0, shared.act]);
                     go(
                         &mut enc,
                         &c.silu,
@@ -31644,16 +32283,95 @@ pub fn forward_token_graph(
         r
     } else {
         let size = (hidden * 4) as u64;
+        let cold_bytes = pooled_cold.as_ref().map_or(0, |(_, k)| (4 * *k * 4) as u64);
+        // A pooled call also hands back the FFN input (n1) so the host can
+        // finish cold experts against the exact routed vector. n1 survives
+        // untouched: the single-layer tail is a raw axpy into h_buf.
+        let n1_bytes = if pooled_cold.is_some() {
+            (hidden * 4) as u64
+        } else {
+            0
+        };
+        debug_assert!(
+            !(lm_resolved.is_some() && cold_bytes > 0),
+            "a pooled call must not also fold lm_head: the host has to add \
+             its cold experts before the final norm"
+        );
         let stage = GraphScratch::ensure(
             &c.device,
             &mut gs.stage,
-            size,
+            size + cold_bytes + n1_bytes,
             wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             "g-stage",
         );
         write_span_endpoint(&mut enc);
         resolve_timestamps(&mut enc);
-        let r = readback(c, enc, &h_buf, &stage, size, &mut h[..hidden]);
+        // Pooled: hidden + cold + n1 ride ONE submit and ONE map — the
+        // previous two-map shape cost a second map_async/poll pair per
+        // layer, more than any kernel here.
+        let r = if cold_bytes > 0 {
+            flush_pass(&enc);
+            enc.copy_buffer_to_buffer(&h_buf, 0, &stage, 0, size);
+            if let Some((cold_src, _)) = &pooled_cold {
+                enc.copy_buffer_to_buffer(cold_src, 0, &stage, size, cold_bytes);
+                enc.copy_buffer_to_buffer(&n1, 0, &stage, size + cold_bytes, n1_bytes);
+            }
+            submit(c, finish_enc(enc));
+            let slice = stage.slice(..size + cold_bytes + n1_bytes);
+            slice.map_async(wgpu::MapMode::Read, |_| {});
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+            let mut ok = false;
+            if let Ok(data) = slice.get_mapped_range() {
+                h[..hidden].copy_from_slice(bytemuck::cast_slice::<u8, f32>(
+                    &data[..size as usize],
+                ));
+                let words: &[u32] =
+                    bytemuck::cast_slice(&data[size as usize..][..cold_bytes as usize]);
+                POOLED_COLD.with(|cc| {
+                    let mut cc = cc.borrow_mut();
+                    // The buffer is TWO halves: [0..2k) the cold picks the
+                    // device handed back, [2k..4k) route statistics (global
+                    // winners — mostly RESIDENT ids). Parsing past the first
+                    // half made the host recompute resident experts too.
+                    for t in 0..(cold_bytes as usize / 16) {
+                        let id = words[2 * t];
+                        if id != u32::MAX {
+                            cc.push((id as usize, f32::from_bits(words[2 * t + 1])));
+                        }
+                    }
+                });
+                // Second half of the cold buffer: the route's WINNERS
+                // (global ids, resident or cold) — the admission predictor.
+                POOLED_WINNERS.with(|ww| {
+                    let mut ww = ww.borrow_mut();
+                    ww.clear();
+                    for t in (cold_bytes as usize / 16)..(cold_bytes as usize / 8) {
+                        let id = words[2 * t];
+                        if id != u32::MAX {
+                            ww.push(id);
+                        }
+                    }
+                });
+                // Absolute offset inside the FULL stage slice: hidden first,
+                // then cold, then n1 (the two-map predecessor's slice began
+                // at `size`, which is what made the relative offset look
+                // right).
+                let n1_off = size as usize + cold_bytes as usize;
+                POOLED_INPUT.with(|ci| {
+                    let mut ci = ci.borrow_mut();
+                    ci.clear();
+                    ci.extend_from_slice(bytemuck::cast_slice::<u8, f32>(
+                        &data[n1_off..n1_off + hidden * 4],
+                    ));
+                });
+                ok = true;
+                drop(data);
+            }
+            stage.unmap();
+            ok
+        } else {
+            readback(c, enc, &h_buf, &stage, size, &mut h[..hidden])
+        };
         drop(gs);
         r
     };
@@ -31944,7 +32662,10 @@ pub fn forward_batch_graph_at(
         if let crate::gpu::GraphFfn::Dense { act, .. } = &l.ffn {
             // Gemma-4's tanh-GELU (and exact GELU) ride the act word of
             // the batched act(gate)·up kernel; other models keep SiLU only.
-            if *act != crate::gpu::GraphAct::Silu && !(g4_model && act.code() <= 2) {
+            if *act != crate::gpu::GraphAct::Silu
+                && *act != crate::gpu::GraphAct::SwiGluOaiM3
+                && !(g4_model && act.code() <= 2)
+            {
                 bgraph_refused("non-SiLU dense FFN (no batched arm)");
                 return batch_outcome(o1_started || state_started, false);
             }
@@ -32105,6 +32826,8 @@ pub fn forward_batch_graph_at(
             n_exp: usize,
             top_k: usize,
             inter: usize,
+            /// `GraphAct::code` for every routed expert.
+            act: u32,
             norm_topk: bool,
             q4tp: bool,
             /// Mixed 2-bit profile: q2tp gate/up over a q4tp down. The
@@ -32388,6 +33111,7 @@ pub fn forward_batch_graph_at(
                 n_exp,
                 top_k,
                 inter: mi,
+                act,
                 norm_topk,
                 q4tp,
                 gu_q2,
@@ -32407,12 +33131,15 @@ pub fn forward_batch_graph_at(
                 // q8_2f experts ride only the expert-grouped pair, which
                 // buckets routed experts (no shared slot).
                 if *q82
-                    && (*has_shared
+                    && (act.code() == 3
+                        || *has_shared
                         || !moe_q82::fits(hidden, *mi)
                         || moe_q82::prefill(c).is_none()
                         || moe_r4::prefill(c).is_none())
                 {
-                    bgraph_refused("q8_2f MoE experts: no grouped prefill kernels for this layer");
+                    bgraph_refused(
+                        "q8_2f MoE experts: MiniMax M3 activation or grouped prefill unsupported",
+                    );
                     return batch_outcome(o1_started || state_started, false);
                 }
                 // Without a shared expert the router stands in for the gate
@@ -32450,6 +33177,7 @@ pub fn forward_batch_graph_at(
                     n_exp: *n_exp,
                     top_k: *top_k,
                     inter: *mi,
+                    act: act.code(),
                     norm_topk: *norm_topk,
                     q4tp: *q4tp,
                     gu_q2: *gu_q2,
@@ -34710,6 +35438,7 @@ pub fn forward_batch_graph_at(
                 n_exp,
                 top_k,
                 inter: mi,
+                act,
                 norm_topk,
                 q82: true,
                 sigmoid,
@@ -34719,6 +35448,12 @@ pub fn forward_batch_graph_at(
                 route_scale,
                 ..
             } => {
+                // Keep the q8_2f arm fail-closed even if construction is
+                // bypassed: its grouped shader has no M3 activation field.
+                if *act == 3 {
+                    bgraph_refused("q8_2f MoE prefill lacks MiniMax M3 activation uniform");
+                    return batch_outcome(o1_started || state_started, false);
+                }
                 let (mlogit, _mslog, msel, mwt, mact) = moe_bufs.as_ref().unwrap();
                 let slots = *top_k + usize::from(*has_shared);
                 let (Some(p8), Some(pg)) = (moe_q82::prefill(c), moe_r4::prefill(c)) else {
@@ -34815,6 +35550,7 @@ pub fn forward_batch_graph_at(
                 n_exp,
                 top_k,
                 inter: mi,
+                act,
                 norm_topk,
                 q4tp,
                 gu_q2,
@@ -34892,7 +35628,7 @@ pub fn forward_batch_graph_at(
                         0,
                         0,
                         0,
-                        0,
+                        *act,
                     ],
                 );
                 let dn_u = uniform_u32x4(
@@ -34976,11 +35712,18 @@ pub fn forward_batch_graph_at(
                     // with routed id 255. `bucket_count` hard-limits the
                     // WGSL's 257 counters (256 routed + one shared); any
                     // other layout retains the established batched fallback.
-                    let moeg = moe_r4::prefill(c).and_then(|pg| {
-                        moe_r4::bucket_count(*n_exp, *has_shared).filter(|_| {
-                            moe_r4::fits(hidden, *mi, gu_stride, mat16(hidden, *mi))
-                        }).map(|buckets| (pg, buckets))
-                    });
+                    // The expert-grouped moe_r4 prefill shaders do not read
+                    // the activation code. M3 uses the ordinary batched
+                    // q4tp kernel below, which does.
+                    let moeg = (*act != 3).then(|| {
+                        moe_r4::prefill(c).and_then(|pg| {
+                            moe_r4::bucket_count(*n_exp, *has_shared)
+                                .filter(|_| {
+                                    moe_r4::fits(hidden, *mi, gu_stride, mat16(hidden, *mi))
+                                })
+                                .map(|buckets| (pg, buckets))
+                        })
+                    }).flatten();
                     let mut pass = begin_pass(&mut enc);
                     pass.set_pipeline(&c.moe_select_b);
                     pass.set_bind_group(0, &bg_sel, &[]);
@@ -37728,6 +38471,14 @@ pub fn q82_short_rows(
 /// goes to the matrix units the field is folded into the plane instead, and
 /// nothing touches the activation at all.
 #[allow(clippy::too_many_arguments)]
+/// q8_matmat_2f refusal telemetry (SAM3 GPU-port diagnosis): which
+/// gate turned the device kernel down. Read by the SAM3_STAGES report.
+pub static M2F_NO_CTX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static M2F_SHAPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static M2F_ENTRY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static M2F_BOUNDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static M2F_DISPATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn q8_matmat_2f(
     model: &Arc<CmfModel>,
     idx: usize,
@@ -37741,16 +38492,22 @@ pub fn q8_matmat_2f(
 ) -> bool {
     // MiMo's f32 GEMM contract holds on this entry too (see `q8_matmat`).
     let _precision = MimoF32Gemm::enter(&model.arch().arch_name);
-    let Some(c) = ctx() else { return false };
+    let Some(c) = ctx() else {
+        M2F_NO_CTX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    };
     let _op = c.op_gate.enter();
     if cols % 4 != 0 || rows == 0 || b == 0 || col_field.len() < cols {
+        M2F_SHAPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return false;
     }
     let entry = &model.tensors[idx];
     if entry.shape.first().copied().unwrap_or(0) < rows {
+        M2F_ENTRY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return false;
     }
     let Some(abs) = model.entry_abs_offset(entry) else {
+        M2F_BOUNDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return false;
     };
     let bytes = model.primary_bytes();
@@ -37764,9 +38521,10 @@ pub fn q8_matmat_2f(
         || xs.len() < b * cols
         || out.len() < b * rows
     {
+        M2F_BOUNDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return false;
     }
-    dispatch_matmat_keep(
+    let ok = dispatch_matmat_keep(
         c,
         {
             note_layer((model.uid() as usize, idx), &model.tensors[idx].name);
@@ -37783,7 +38541,11 @@ pub fn q8_matmat_2f(
         None,
         None,
     )
-    .is_some()
+    .is_some();
+    if !ok {
+        M2F_DISPATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    ok
 }
 
 thread_local! {
@@ -42618,7 +43380,8 @@ pub static GEMM_MANY_NS: [std::sync::atomic::AtomicU64; 2] =
 /// The LLM prefill's dense FFN with separate gate, up and down weights in
 /// any codec that has a device GEMM (`q8_row`, `q8_2f`, `q4tp`, mixed): the
 /// gate and up panels stay on the card, the activation folds them there
-/// (`ffn_silu_mul`: 0 SiLU, 1 exact GELU), and down reads the folded panel
+/// (`ffn_silu_mul`: 0 SiLU, 1 exact GELU, 2 tanh-GELU, 3 MiniMax M3
+/// SwiGLU-OAI), and down reads the folded panel
 /// from the card. One readback instead of three, and no host pass over the
 /// two b·inter panels — which on a q8_2f prefill cost more than the GEMMs.
 #[allow(clippy::too_many_arguments)]
@@ -42639,7 +43402,7 @@ pub fn ffn_act_keep(
     let _op = c.op_gate.enter();
     let panel = (b * inter * 4) as u64;
     if b == 0
-        || act > 2
+        || act > 3
         || xs.len() < b * hidden
         || out.len() < b * hidden
         || panel > PANEL_BUDGET_BYTES as u64
@@ -43231,7 +43994,8 @@ pub fn q4tp_ffn(
 }
 
 /// `q4t_ffn` / `q4tp_ffn` with the activation of act(gate)·up named
-/// (`GraphAct::code`: 0 SiLU — the plain entry points — 1 exact GELU).
+/// (`GraphAct::code`: 0 SiLU — the plain entry points — 1 exact GELU, 2
+/// tanh-GELU, 3 MiniMax M3 SwiGLU-OAI).
 #[allow(clippy::too_many_arguments)]
 pub fn q4_ffn_act(
     model: &Arc<CmfModel>,
@@ -43265,7 +44029,7 @@ fn ffn_q4(
 ) -> bool {
     let Some(c) = ctx() else { return false };
     let _op = c.op_gate.enter();
-    if hidden % 32 != 0 || inter % 32 != 0 || b == 0 || act > 2 {
+    if hidden % 32 != 0 || inter % 32 != 0 || b == 0 || act > 3 {
         return false;
     }
     let bytes = model.primary_bytes();
@@ -43343,7 +44107,8 @@ fn ffn_q4(
     // one rewritable buffer cannot serve them.
     let p13 = uniform_u32x4(c, [(hidden / 4) as u32, inter as u32, b as u32, 0]);
     let p2 = uniform_u32x4(c, [(inter / 4) as u32, hidden as u32, b as u32, 0]);
-    // `_c` = the activation (`ffn_silu_mul`: 0 SiLU, 1 exact GELU).
+    // `_c` = the activation (`ffn_silu_mul`: 0 SiLU, 1 exact GELU,
+    // 2 tanh-GELU, 3 MiniMax M3 SwiGLU-OAI).
     let psilu = uniform_u32x4(c, [(b * inter) as u32, 0, 0, act]);
     let mm = mm_pipeline(c, q4tp, false);
     let mm_layout = mm.get_bind_group_layout(0);
@@ -48048,6 +48813,27 @@ mod tests {
         assert_eq!(
             graph_live_budget_from_totals(budget, 48 << 30, 10 << 30, 38 << 30),
             guarded
+        );
+
+        // A large adapter swaps the proportional ceiling for a flat reserve:
+        // 9/16 of 96 GiB would strand 42 GiB. Dense stacks are unaffected.
+        let big = 96u64 << 30;
+        assert_eq!(
+            graph_live_budget_from_totals(big, 200 << 30, 1 << 30, 160 << 30),
+            big - (12 << 30)
+        );
+        assert_eq!(
+            graph_live_budget_from_totals(big, 200 << 30, 150 << 30, 0),
+            big - (12 << 30)
+        );
+        assert_eq!(
+            graph_live_budget_from_totals(big, 200 << 30, 1 << 30, 0),
+            big
+        );
+        // The flat reserve never underflows a budget just above the cutoff.
+        assert_eq!(
+            graph_live_budget_from_totals(64 << 30, 200 << 30, 1 << 30, 160 << 30),
+            52 << 30
         );
     }
 
@@ -53002,6 +53788,255 @@ fn main() {
     fn wgpu_q4tp_matvec16w_gu_gelu_tanh_matches_three_dispatches() {
         gu_matches_three_dispatches(4096, 2);
         gu_matches_three_dispatches(2048, 2);
+    }
+
+    /// A detached shared expert has no activation field in its graph
+    /// descriptor. It remains the separately verified SiLU path even when
+    /// the routed MiniMax M3 bank carries OAI code 3.
+    #[test]
+    fn wgpu_detached_shared_does_not_inherit_routed_oai_act() {
+        let routed_oai = crate::gpu::GraphAct::SwiGluOaiM3.code();
+        assert_eq!(routed_oai, 3, "in-bank MiniMax M3 experts still use OAI");
+        assert_eq!(
+            detached_shared_graph_act_code(routed_oai),
+            crate::gpu::GraphAct::Silu.code(),
+            "a detached shared expert must retain its verified SiLU contract"
+        );
+        assert_ne!(detached_shared_graph_act_code(routed_oai), routed_oai);
+    }
+
+    /// MiniMax M3's OAI arm must travel in the q4tp MoE uniform, rather than
+    /// taking the old SiLU/r4 shortcut. Exercise the token and token-axis
+    /// shaders, plus the direct dense `ffn_silu_mul` shader, against the
+    /// standalone `silu_mul_pre` result and fixed clamp/alpha host formula.
+    #[test]
+    fn wgpu_q4tp_moe_oai_matches_standalone_token_and_batch() {
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping");
+            return;
+        };
+        let _op = c.op_gate.enter();
+        let (inter, hidden, batch) = (32usize, 32usize, 2usize);
+        let mk_w = |seed: usize| -> Vec<u8> {
+            let total = cortiq_core::quant::expected_nbytes(
+                cortiq_core::TensorDtype::Q4TiledP,
+                &[inter, hidden],
+            )
+            .unwrap();
+            let (params_off, _, _) = cortiq_core::quant::q4tp_sections(inter, hidden);
+            let mut bytes: Vec<u8> = (0..total)
+                .map(|i| ((i * 37 + seed * 11) % 251) as u8)
+                .collect();
+            let lo = cortiq_core::quant::f32_to_f16(-4.0);
+            let step = cortiq_core::quant::f32_to_f16(0.25);
+            for row in 0..inter {
+                let off = params_off + row * 4;
+                bytes[off..off + 2].copy_from_slice(&lo.to_le_bytes());
+                bytes[off + 2..off + 4].copy_from_slice(&step.to_le_bytes());
+            }
+            bytes
+        };
+        let (gate_w, up_w) = (mk_w(1), mk_w(2));
+        let xs: Vec<f32> = (0..batch * hidden)
+            .map(|i| ((i * 17 % 19) as f32 - 9.0) * 0.7)
+            .collect();
+        let mk = |bytes: &[u8]| {
+            c.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None,
+                    contents: bytes,
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
+        };
+        let out = |n: usize| {
+            c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (n * std::mem::size_of::<f32>()) as u64,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let (gate, up) = (mk(&gate_w), mk(&up_w));
+        let x0 = mk(bytemuck::cast_slice(&xs[..hidden]));
+        let x1 = mk(bytemuck::cast_slice(&xs[hidden..]));
+        let xb = mk(bytemuck::cast_slice(&xs));
+        let sel0 = mk(bytemuck::cast_slice(&[0u32]));
+        let selb = mk(bytemuck::cast_slice(&[0u32; 2]));
+        let (g0, u0, g1, u1) = (out(inter), out(inter), out(inter), out(inter));
+        let (standalone0, standalone1) = (out(inter), out(inter));
+        let ffn = out(inter);
+        let (token, batched) = (out(inter), out(batch * inter));
+        let dummy = out(1);
+        let act_u = uniform_u32x4(c, [inter as u32, 0, 0, 3]);
+        let moe_u = uniform_u32x8(
+            c,
+            [
+                (hidden / 32) as u32,
+                inter as u32,
+                1,
+                (gate_w.len() / 2) as u32,
+                0,
+                0,
+                0,
+                3,
+            ],
+        );
+        let silu_bg = |g: &wgpu::Buffer, u: &wgpu::Buffer, y: &wgpu::Buffer| {
+            c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &c.layout_silu,
+                entries: &[
+                    bind_buf(0, g),
+                    bind_buf(1, u),
+                    bind_buf(2, &dummy),
+                    bind_buf(3, y),
+                    bind_buf(4, &act_u),
+                ],
+            })
+        };
+        let ffn_bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.ffn_silu.get_bind_group_layout(0),
+            entries: &[bind_buf(0, &ffn), bind_buf(1, &u0), bind_buf(2, &act_u)],
+        });
+        let token_bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.layout_moe_gu_q4tp,
+            entries: &[
+                bind_buf(0, &gate),
+                bind_buf(1, &up),
+                bind_buf(2, &x0),
+                bind_buf(3, &sel0),
+                bind_buf(4, &token),
+                bind_buf(5, &moe_u),
+            ],
+        });
+        let batch_bg = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.layout_moe_gu_b,
+            entries: &[
+                bind_buf(0, &gate),
+                bind_buf(1, &up),
+                bind_buf(2, &xb),
+                bind_buf(3, &selb),
+                bind_buf(4, &batched),
+                bind_buf(5, &moe_u),
+            ],
+        });
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        for (x, g, u) in [(&x0, &g0, &u0), (&x1, &g1, &u1)] {
+            encode_q4tp_mv4(c, &mut enc, &gate, x, g, inter, hidden);
+            encode_q4tp_mv4(c, &mut enc, &up, x, u, inter, hidden);
+        }
+        enc.copy_buffer_to_buffer(
+            &g0,
+            0,
+            &ffn,
+            0,
+            (inter * std::mem::size_of::<f32>()) as u64,
+        );
+        {
+            let mut pass = begin_pass(&mut enc);
+            for bg in [silu_bg(&g0, &u0, &standalone0), silu_bg(&g1, &u1, &standalone1)] {
+                pass.set_pipeline(&c.silu);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups((inter as u32).div_ceil(256), 1, 1);
+            }
+            pass.set_pipeline(&c.moe_gate_up_q4tp);
+            pass.set_bind_group(0, &token_bg, &[]);
+            pass.dispatch_workgroups(inter as u32, 1, 1);
+            pass.set_pipeline(&c.moe_gate_up_q4tp_b);
+            pass.set_bind_group(0, &batch_bg, &[]);
+            pass.dispatch_workgroups(inter as u32, 1, batch as u32);
+            pass.set_pipeline(&c.ffn_silu);
+            pass.set_bind_group(0, &ffn_bg, &[]);
+            pass.dispatch_workgroups((inter as u32).div_ceil(256), 1, 1);
+        }
+        let stage_words = 10 * inter;
+        let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (stage_words * std::mem::size_of::<f32>()) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut offset = 0u64;
+        for (src, words) in [
+            (&token, inter),
+            (&batched, batch * inter),
+            (&standalone0, inter),
+            (&standalone1, inter),
+            (&ffn, inter),
+            (&g0, inter),
+            (&u0, inter),
+            (&g1, inter),
+            (&u1, inter),
+        ] {
+            flush_pass(&enc);
+            let bytes = (words * std::mem::size_of::<f32>()) as u64;
+            enc.copy_buffer_to_buffer(src, 0, &stage, offset, bytes);
+            offset += bytes;
+        }
+        submit(c, finish_enc(enc));
+        let slice = stage.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        let data = slice.get_mapped_range().expect("map");
+        let all: &[f32] = bytemuck::cast_slice(&data);
+        let (token_out, rest) = all.split_at(inter);
+        let (batch_out, rest) = rest.split_at(batch * inter);
+        let (standalone0_out, rest) = rest.split_at(inter);
+        let (standalone1_out, rest) = rest.split_at(inter);
+        let (ffn_out, rest) = rest.split_at(inter);
+        let (g0_out, rest) = rest.split_at(inter);
+        let (u0_out, rest) = rest.split_at(inter);
+        let (g1_out, u1_out) = rest.split_at(inter);
+        let oai = |g: f32, u: f32| {
+            let g = g.min(7.0);
+            let u = u.clamp(-7.0, 7.0);
+            (g / (1.0 + (-1.702 * g).exp())) * (u + 1.0)
+        };
+        let close = |got: f32, want: f32| (got - want).abs() <= 5e-5 * (1.0 + want.abs());
+        let mut saturated = false;
+        for ((&got, &standalone), (&g, &u)) in token_out
+            .iter()
+            .zip(standalone0_out)
+            .zip(g0_out.iter().zip(u0_out))
+        {
+            saturated |= g > 7.0 || u.abs() > 7.0;
+            assert!(close(got, standalone), "token MoE differs from standalone: {got} vs {standalone}");
+            assert!(close(standalone, oai(g, u)), "standalone M3 formula mismatch: {standalone} vs {}", oai(g, u));
+        }
+        for (&got, &standalone) in ffn_out.iter().zip(standalone0_out) {
+            assert!(
+                close(got, standalone),
+                "dense ffn activation differs from standalone: {got} vs {standalone}"
+            );
+        }
+        for ((&got, &standalone), (&g, &u)) in batch_out[..inter]
+            .iter()
+            .zip(standalone0_out)
+            .zip(g0_out.iter().zip(u0_out))
+        {
+            assert!(close(got, standalone), "batch token 0 differs from standalone: {got} vs {standalone}");
+            assert!(close(got, oai(g, u)), "batch token 0 M3 formula mismatch: {got} vs {}", oai(g, u));
+        }
+        for ((&got, &standalone), (&g, &u)) in batch_out[inter..]
+            .iter()
+            .zip(standalone1_out)
+            .zip(g1_out.iter().zip(u1_out))
+        {
+            saturated |= g > 7.0 || u.abs() > 7.0;
+            assert!(close(got, standalone), "batch token 1 differs from standalone: {got} vs {standalone}");
+            assert!(close(got, oai(g, u)), "batch token 1 M3 formula mismatch: {got} vs {}", oai(g, u));
+        }
+        assert!(saturated, "test vectors did not exercise the MiniMax OAI clamps");
+        drop(data);
+        stage.unmap();
     }
 
     fn gu_matches_three_dispatches(cols: usize, act_code: u32) {
@@ -62167,6 +63202,15 @@ thread_local! {
     static TRANSIENT_W: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+thread_local! {
+    /// Bypass the f16-staged coop kernel for the calling thread. The coop
+    /// NT kernel rounds both operands to f16 before the mma (fast, but
+    /// ~1e-3 per-op error) — callers that must match a CPU f32 reference
+    /// within a parity gate (SAM3's GPU attention arm) take the pure-f32
+    /// scalar arm instead.
+    pub static COOP_BYPASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize) -> bool {
     if std::env::var("CMF_BAKE_GPU").as_deref() == Ok("0") || f32_strict() {
         return false;
@@ -62187,6 +63231,7 @@ pub fn gemm_nt_f32(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: u
         .gemm_nt_coop
         .as_ref()
         .filter(|_| !MIMO_F32_GEMM.get())
+        .filter(|_| !COOP_BYPASS.with(|b| b.get()))
         .filter(|_| k % 4 == 0 && m.div_ceil(64) <= 65_535 && n.div_ceil(64) <= 65_535)
         .filter(|_| c.discrete || (m <= 65_000 && n <= 65_000));
     // The scalar arm's dispatch is (m, n) workgroups — huge dims are
@@ -67628,6 +68673,219 @@ pub fn bt_moe_route_for_test(
     true
 }
 
+/// MiniMax-M3.1's route contract on the device, with the EXACT flag
+/// construction the pooled token-graph arm uses: sigmoid scoring (n's high
+/// bit), pin-shared (bit3), selection bias (bit0), and `route_scale`
+/// folded into the +1e-20 renormalization floor. Without a subset the
+/// device returns global expert ids — directly comparable with the host's
+/// `moe_route_with_eps`. `shared_slot` pins the shared expert in the last
+/// slot at weight 1 (pass `n` for the unpinned-parity shape).
+pub fn minimax_moe_route_for_test(
+    scores: &[f32],
+    bias: Option<&[f32]>,
+    top_k: usize,
+    route_scale: f32,
+    shared_slot: Option<u32>,
+    idx_out: &mut Vec<usize>,
+    w_out: &mut Vec<f32>,
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
+    let n = scores.len();
+    if n == 0 || n > 1024 || top_k == 0 || top_k > 64 {
+        return false;
+    }
+    let sb = storage_bytes(c, bytemuck::cast_slice(scores));
+    let bb = match bias {
+        Some(b) if b.len() >= n => storage_bytes(c, bytemuck::cast_slice(&b[..n])),
+        _ => sb.clone(),
+    };
+    let mb = storage_bytes(c, bytemuck::cast_slice(&vec![1u32; n]));
+    let fb = storage_bytes(c, bytemuck::cast_slice(&vec![0u32; top_k]));
+    let slots = top_k + shared_slot.is_some() as usize;
+    let ib = rw_f32(c, slots, true);
+    let wb = rw_f32(c, slots, true);
+    let cb = rw_f32(c, 1, true);
+    let rmb = storage_bytes(c, bytemuck::cast_slice(&vec![0u32; n]));
+    let coldb = rw_f32(c, 4 * top_k, true);
+    let rflags = u32::from(bias.is_some() && bias.map_or(false, |b| b.len() >= n))
+        | 8 * (shared_slot.is_some() as u32)
+        | (shared_slot.unwrap_or(0) << 8);
+    let rp = uniform_mixed(
+        c,
+        [(n as u32) | 0x80000000, top_k as u32, rflags],
+        route_scale,
+    );
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("m3-route-test"),
+        });
+    {
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.moe_route.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &sb),
+                bind_buf(1, &bb),
+                bind_buf(2, &mb),
+                bind_buf(3, &fb),
+                bind_buf(4, &ib),
+                bind_buf(5, &wb),
+                bind_buf(6, &cb),
+                bind_buf(7, &rp),
+                bind_buf(8, &rmb),
+                bind_buf(9, &coldb),
+            ],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(&c.moe_route);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    let isz = (slots * 4) as u64;
+    let wsz = isz;
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        isz + wsz,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "m3-route-test-stage",
+    );
+    enc.copy_buffer_to_buffer(&ib, 0, &stage, 0, isz);
+    enc.copy_buffer_to_buffer(&wb, 0, &stage, isz, wsz);
+    submit(c, finish_enc(enc));
+    let slice = stage.slice(..isz + wsz);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+    let mut ok = false;
+    if let Ok(data) = slice.get_mapped_range() {
+        let ids: &[u32] = bytemuck::cast_slice(&data[..isz as usize]);
+        let ws: &[f32] = bytemuck::cast_slice(&data[isz as usize..]);
+        idx_out.clear();
+        w_out.clear();
+        idx_out.extend(ids.iter().map(|&x| x as usize));
+        w_out.extend_from_slice(ws);
+        ok = true;
+        drop(data);
+    }
+    stage.unmap();
+    drop(sc);
+    ok
+}
+
+/// The pooled arm's COLD contract: with a subset remap the device hands
+/// back `(global expert, final weight)` pairs for the picks it could not
+/// serve — those weights must equal the host's `p[e]/wsum` exactly, since
+/// the host adds its cold sum to the residual the device already shipped.
+pub fn minimax_moe_route_cold_for_test(
+    scores: &[f32],
+    bias: Option<&[f32]>,
+    top_k: usize,
+    route_scale: f32,
+    remap: &[u32],
+    shared_slot: u32,
+    cold_out: &mut Vec<(usize, f32)>,
+    idx_out: &mut Vec<u32>,
+    w_out: &mut Vec<f32>,
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    let _op = c.op_gate.enter();
+    let n = scores.len();
+    if n == 0 || n > 1024 || top_k == 0 || top_k > 64 || remap.len() != n {
+        return false;
+    }
+    let sb = storage_bytes(c, bytemuck::cast_slice(scores));
+    let bb = match bias {
+        Some(b) if b.len() >= n => storage_bytes(c, bytemuck::cast_slice(&b[..n])),
+        _ => sb.clone(),
+    };
+    let mb = storage_bytes(c, bytemuck::cast_slice(&vec![1u32; n]));
+    let fb = storage_bytes(c, bytemuck::cast_slice(&vec![0u32; top_k]));
+    let slots = top_k + 1;
+    let ib = rw_f32(c, slots, true);
+    let wb = rw_f32(c, slots, true);
+    let cb = rw_f32(c, 1, true);
+    let rmb = storage_bytes(c, bytemuck::cast_slice(remap));
+    let coldb = rw_f32(c, 4 * top_k, true);
+    let rflags = u32::from(bias.is_some() && bias.map_or(false, |b| b.len() >= n))
+        | 8
+        | 16
+        | (shared_slot << 8);
+    let rp = uniform_mixed(
+        c,
+        [(n as u32) | 0x80000000, top_k as u32, rflags],
+        route_scale,
+    );
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("m3-cold-test"),
+        });
+    {
+        let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &c.moe_route.get_bind_group_layout(0),
+            entries: &[
+                bind_buf(0, &sb),
+                bind_buf(1, &bb),
+                bind_buf(2, &mb),
+                bind_buf(3, &fb),
+                bind_buf(4, &ib),
+                bind_buf(5, &wb),
+                bind_buf(6, &cb),
+                bind_buf(7, &rp),
+                bind_buf(8, &rmb),
+                bind_buf(9, &coldb),
+            ],
+        });
+        let mut pass = begin_pass(&mut enc);
+        pass.set_pipeline(&c.moe_route);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    let csz = (4 * top_k * 4) as u64;
+    let isz = (slots * 4) as u64;
+    let mut sc = c.scratch.lock().unwrap();
+    let stage = Scratch::ensure(
+        &c.device,
+        &mut sc.stage,
+        csz + 2 * isz,
+        wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        "m3-cold-test-stage",
+    );
+    enc.copy_buffer_to_buffer(&coldb, 0, &stage, 0, csz);
+    enc.copy_buffer_to_buffer(&ib, 0, &stage, csz, isz);
+    enc.copy_buffer_to_buffer(&wb, 0, &stage, csz + isz, isz);
+    submit(c, finish_enc(enc));
+    let slice = stage.slice(..csz + 2 * isz);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+    let mut ok = false;
+    if let Ok(data) = slice.get_mapped_range() {
+        let words: &[u32] = bytemuck::cast_slice(&data[..csz as usize]);
+        cold_out.clear();
+        for t in 0..top_k {
+            let id = words[2 * t];
+            if id != u32::MAX {
+                cold_out.push((id as usize, f32::from_bits(words[2 * t + 1])));
+            }
+        }
+        let ids: &[u32] = bytemuck::cast_slice(&data[csz as usize..][..isz as usize]);
+        let ws: &[f32] = bytemuck::cast_slice(&data[(csz + isz) as usize..]);
+        idx_out.clear();
+        w_out.clear();
+        idx_out.extend_from_slice(ids);
+        w_out.extend_from_slice(ws);
+        ok = true;
+        drop(data);
+    }
+    stage.unmap();
+    drop(sc);
+    ok
+}
+
 pub fn moe_route_for_test(
     scores: &[f32],
     bias: Option<&[f32]>,
@@ -70452,6 +71710,7 @@ pub fn minicpm_tail_prepared_frame(
     model: &Arc<CmfModel>,
     global: Dsv4GlobalMoe,
     g: Dsv4MoeGeom,
+    act: u32,
     x: &[f32],
     selected_slots: &[u32],
     selected_weights: &[f32],
@@ -70478,8 +71737,10 @@ pub fn minicpm_tail_prepared_frame(
         || slots != selected_weights.len()
         || slots > g.top_k.saturating_add(1)
         || slots > 64
-        || g.top_k != 8
-        || g.gu_q2
+        // Two checked topologies ride this frame: MiniCPM-V-4.7's top-8
+        // (SiLU, q4tp) and MiniMax-M3.1's top-4 (SwiGLU-OAI, q2tp gate/up
+        // against a q4tp down).  Anything else keeps its exact CPU path.
+        || (g.top_k != 4 && g.top_k != 8)
         || g.bf16
         || g.hidden == 0
         || g.inter == 0
@@ -70514,13 +71775,17 @@ pub fn minicpm_tail_prepared_frame(
     else {
         no!("глобальный пул модели не найден")
     };
-    if global_bufs.gu_q2
+    // The bank's codec has to be exactly the geometry's: a q4tp frame must
+    // not address a q2tp bank (or the mxfp4 one, whose gu_q2 is also false
+    // but whose pipelines and strides differ).
+    if global_bufs.gu_q2 != g.gu_q2
+        || global_bufs.fp4
         || global.segment_slots != global_bufs.segment_slots as u32
         || selected_slots
             .iter()
             .any(|&slot| slot as usize >= global_bufs.capacity)
     {
-        no!("глобальный пул не соответствует prepared q4tp кадру")
+        no!("глобальный пул не соответствует prepared кадру (gu_q2 mismatch)")
     }
 
     let Some(mact_bytes) = slots
@@ -70529,16 +71794,25 @@ pub fn minicpm_tail_prepared_frame(
     else {
         no!("переполнение prepared activation buffer")
     };
-    let Some((p_gu, p_dn)) = dsv4_global_moe_pipelines(c, false, global_bufs.segments) else {
-        no!("глобальный q4tp pipeline недоступен")
+    let Some((p_gu, p_dn)) = dsv4_global_moe_pipelines(c, g.gu_q2, global_bufs.segments) else {
+        no!("глобальный pipeline недоступен")
     };
-    let stride16 = |rows: usize, cols: usize| {
-        cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])
+    // Gate/up stride follows the bank codec (q2tp lanes pack differently
+    // from q4tp tiles); down is q4tp in both checked profiles.
+    let stride16 = |rows: usize, cols: usize, q2: bool| {
+        let dt = if q2 {
+            cortiq_core::TensorDtype::Q2TiledP
+        } else {
+            cortiq_core::TensorDtype::Q4TiledP
+        };
+        cortiq_core::quant::expected_nbytes(dt, &[rows, cols])
             .and_then(|bytes| u32::try_from(bytes / 2).ok())
     };
-    let (Some(gu_stride), Some(dn_stride)) = (stride16(g.inter, g.hidden), stride16(g.hidden, g.inter))
-    else {
-        no!("prepared q4tp stride не вычислен")
+    let (Some(gu_stride), Some(dn_stride)) = (
+        stride16(g.inter, g.hidden, g.gu_q2),
+        stride16(g.hidden, g.inter, false),
+    ) else {
+        no!("prepared stride не вычислен")
     };
 
     // These tags are dedicated to the synchronous MiniCPM tail.  Frame
@@ -70568,7 +71842,9 @@ pub fn minicpm_tail_prepared_frame(
             g.swiglu_limit.to_bits(),
             global.segment_slots,
             0,
-            0,
+            // `_p1`: the activation code the gu shader branches on
+            // (0 = the historical SiLU+limit arm, 3 = SwiGLU-OAI).
+            act,
         ],
     );
     let dn_u = uniform_u32x8(

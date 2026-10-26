@@ -19,9 +19,15 @@ use cortiq_core::quant::{
 use cortiq_core::{CmfModel, TensorDtype};
 use std::cell::UnsafeCell;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// `mxfp4` (OCP MX FP4) CPU kernels.
 mod mxfp4;
+
+/// D5 GPU-matmat gate telemetry: large-GEMM calls that reached the gate
+/// vs those the q8_2f device kernel actually consumed (SAM3 profiling).
+pub static MATMAT_GATE: AtomicU64 = AtomicU64::new(0);
+pub static MATMAT_GPU_HIT: AtomicU64 = AtomicU64::new(0);
 
 pub enum QTensor {
     F32 {
@@ -2629,8 +2635,19 @@ impl QTensor {
                 // Runtime probe: the naive GEMM shader + sync readback
                 // lose to the CPU GEMM on slow driver stacks — alternate
                 // both arms and keep the winner.
-                if b >= 8 && b * rows * cols >= 128_000_000 && crate::gpu::enabled_here() {
+                // CMF_MATMAT_GPU=0: diagnostic off-switch for this D5
+                // device arm only (default unchanged). The GPU int8 kernel
+                // and the CPU int8 kernel are not bit-comparable and differ
+                // ~1e-2/layer (measured on SAM3), which compounds through
+                // deep stacks — validation harnesses that need a single
+                // changed block per run turn the others off with this.
+                if b >= 8
+                    && b * rows * cols >= 128_000_000
+                    && crate::gpu::enabled_here()
+                    && std::env::var("CMF_MATMAT_GPU").as_deref() != Ok("0")
+                {
                     if let Self::Mapped { model, idx, .. } = self {
+                        MATMAT_GATE.fetch_add(1, Ordering::Relaxed);
                         let t0 = std::time::Instant::now();
                         match crate::gpu::probe_arm(crate::gpu::OpClass::Matmat) {
                             crate::gpu::ProbeArm::Gpu
@@ -2659,6 +2676,7 @@ impl QTensor {
                                         cols, out,
                                     )
                                 {
+                                    MATMAT_GPU_HIT.fetch_add(1, Ordering::Relaxed);
                                     crate::gpu::probe_record(
                                         crate::gpu::OpClass::Matmat,
                                         true,

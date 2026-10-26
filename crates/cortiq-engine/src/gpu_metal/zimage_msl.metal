@@ -751,6 +751,11 @@ kernel void zv_conv(
     const short2 fc = zi_fc(lane);
     for (ushort j = 0; j < 4; ++j) {
         const uint o = o0 + 32u * sgo + 8u * j + (uint)fc.y;
+        // Weight rows are padded to the 64-row MMA tile.  Ordinary NHWC
+        // outputs may have a smaller logical stride (Flux2 has 96), so do
+        // not let the padded pair spill into the next pixel.  Transposed V
+        // is addressed by [channel][token] and retains its padded rows.
+        if (p.epi != 2u && o + 1u >= p.rows) continue;
         const float b0 = p.has_bias != 0u ? bias[o] : 0.0f;
         const float b1 = p.has_bias != 0u ? bias[o + 1] : 0.0f;
         for (ushort i = 0; i < 4; ++i) {
@@ -807,12 +812,30 @@ kernel void zv_gn_part(
     const uint p0 = b * per, p1 = min(p.n, p0 + per);
     const float mean = p.pass == 1u ? stat[2u * g] : 0.0f;
     float acc = 0.0f;
-    for (uint px = p0 + tid; px < p1; px += 256u) {
-        device const float4* v4 = (device const float4*)(x + (ulong)px * p.C + g * cg);
-        for (uint c = 0; c < cg / 4u; ++c) {
-            float4 v = v4[c];
-            if (p.pass == 1u) { v -= mean; acc += dot(v, v); }
-            else acc += v.x + v.y + v.z + v.w;
+    // The common decoder layout has four-or-more channels per GroupNorm
+    // group, aligned to a float4. Flux2 also has 32 groups over 192 and
+    // 96 channels (six and three channels per group respectively): a
+    // float4 then crosses a group boundary, and the old `cg / 4` loop
+    // silently dropped its tail. Keep the vector path for the established
+    // layout, but use scalar loads for those compact tails.
+    if ((cg & 3u) == 0u) {
+        for (uint px = p0 + tid; px < p1; px += 256u) {
+            device const float4* v4 =
+                (device const float4*)(x + (ulong)px * p.C + g * cg);
+            for (uint c = 0; c < cg / 4u; ++c) {
+                float4 v = v4[c];
+                if (p.pass == 1u) { v -= mean; acc += dot(v, v); }
+                else acc += v.x + v.y + v.z + v.w;
+            }
+        }
+    } else {
+        for (uint px = p0 + tid; px < p1; px += 256u) {
+            device const float* v = x + (ulong)px * p.C + g * cg;
+            for (uint c = 0; c < cg; ++c) {
+                const float q = v[c];
+                if (p.pass == 1u) { const float d = q - mean; acc += d * d; }
+                else acc += q;
+            }
         }
     }
     acc = zi_block_sum(acc, red, sg, lane);
@@ -850,8 +873,22 @@ kernel void zv_gn_apply(
     const uint n4 = p.n * p.C / 4u;
     if (i >= n4) return;
     const uint c = (4u * i) % p.C;
-    const uint g = c / (p.C / p.groups);
-    const float mean = stat[2u * g], inv = stat[2u * g + 1u];
+    const uint cg = p.C / p.groups;
+    float4 mean, inv;
+    if ((cg & 3u) == 0u) {
+        const uint g = c / cg;
+        mean = float4(stat[2u * g]);
+        inv = float4(stat[2u * g + 1u]);
+    } else {
+        // A float4 can straddle a compact group (for example 32 groups
+        // across 96 or 192 channels), so select its statistics per lane.
+        const uint g0 = c / cg, g1 = (c + 1u) / cg;
+        const uint g2 = (c + 2u) / cg, g3 = (c + 3u) / cg;
+        mean = float4(stat[2u * g0], stat[2u * g1],
+                      stat[2u * g2], stat[2u * g3]);
+        inv = float4(stat[2u * g0 + 1u], stat[2u * g1 + 1u],
+                     stat[2u * g2 + 1u], stat[2u * g3 + 1u]);
+    }
     float4 v = (((device const float4*)x)[i] - mean) * inv * *(device const float4*)(w + c)
              + *(device const float4*)(bb + c);
     if (p.silu != 0u) v = v / (1.0f + exp(-v));

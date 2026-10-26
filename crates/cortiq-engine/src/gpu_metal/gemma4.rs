@@ -88,7 +88,9 @@ pub(super) fn pipes(c: &Ctx) -> Option<&'static Pipes> {
         Err(e) => {
             static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                tracing::warn!("Gemma-4 Metal kernels unavailable ({e}) — the model stays off the graphs");
+                tracing::warn!(
+                    "Gemma-4 Metal kernels unavailable ({e}) — the model stays off the graphs"
+                );
             }
             None
         }
