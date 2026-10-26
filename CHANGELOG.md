@@ -5,6 +5,32 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.36] — 2026-10-26
+
+### Added
+- `cortiq phonon-pack SOURCE --output MODEL.cmf` packages the official local
+  `gradium/phonon-40m-multilingual` Q8 checkpoint as one integrity-checked
+  CMF. It preserves the upstream Q8 GGUF payload, configuration, tokenizer,
+  and default voice latent rather than claiming a new quantization.
+- `cortiq tts MODEL.cmf TEXT --lang LANG --out FILE.wav` renders Phonon speech
+  through Gradium's maintained `ptts` runtime. It exposes deterministic seed,
+  flow temperature, CFG, duration conditioning, EOS threshold, and sentence
+  chunk controls.
+
+### Changed
+- `cortiq-cli` now selects the matching `cortiq-engine` 0.8.36 exactly, so a
+  crates.io install cannot resolve an older engine that lacks the `phonon`
+  feature. Release binaries build that feature explicitly.
+
+### Limits and licensing
+- Phonon 40M Multilingual accepts only `en`, `fr`, `de`, `es`, and `pt`.
+  Russian and automatic language detection are not supported by this model.
+  `--voice-file` accepts a precomputed compatible voice latent; converting a
+  recording into a voice is not provided.
+- The Phonon model payload remains subject to the upstream CC-BY-NC-4.0 terms.
+  The CMF bridge validates and materializes its raw assets for `ptts`; it is
+  not a claim of a native reimplementation of the Phonon architecture.
+
 ## [0.8.31] — 2026-10-23
 
 ### Added
