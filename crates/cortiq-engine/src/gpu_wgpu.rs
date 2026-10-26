@@ -25288,15 +25288,22 @@ pub fn enabled() -> bool {
 /// budget, without a dispatch, so the next touch is warm) or the tensor
 /// can't be resolved.
 pub fn q8_resident_or_upload(model: &Arc<CmfModel>, idx: usize, may_upload: bool) -> bool {
-    let Some(c) = ctx() else { return false };
+    static DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let dbg = *DBG.get_or_init(|| std::env::var_os("CMF_GPUDBG").is_some());
+    let Some(c) = ctx() else {
+        if dbg { eprintln!("resdbg[{idx}]: no ctx"); }
+        return false;
+    };
     let _op = c.op_gate.enter();
     let entry = &model.tensors[idx];
     let rows_total = entry.shape.first().copied().unwrap_or(0);
     let cols = entry.shape.get(1).copied().unwrap_or(0);
     if rows_total == 0 || cols == 0 {
+        if dbg { eprintln!("resdbg[{idx}]: bad shape {}x{}", rows_total, cols); }
         return false;
     }
     let Some(abs) = model.entry_abs_offset(entry) else {
+        if dbg { eprintln!("resdbg[{idx}]: no abs offset"); }
         return false;
     };
     let bytes = model.primary_bytes();
@@ -25313,6 +25320,7 @@ pub fn q8_resident_or_upload(model: &Arc<CmfModel>, idx: usize, may_upload: bool
         rows_total * cols
     };
     if abs + payload_len > bytes.len() {
+        if dbg { eprintln!("resdbg[{idx}]: payload {} + abs {} beyond bytes {}", payload_len, abs, bytes.len()); }
         return false;
     }
     let key = (model.uid() as usize, idx);
@@ -25322,15 +25330,27 @@ pub fn q8_resident_or_upload(model: &Arc<CmfModel>, idx: usize, may_upload: bool
         .get(&key)
         .is_some_and(|e| e.bytes >= payload_len as u64)
     {
+        if dbg { eprintln!("resdbg[{idx}]: resident hit"); }
         return true;
     }
     if may_upload {
-        let _ = weight_buffer_l(
+        let put = weight_buffer_l(
             c,
             key,
             &bytes[abs..abs + payload_len],
             layer_of_name(&model.tensors[idx].name),
         );
+        if dbg {
+            eprintln!(
+                "resdbg[{idx}]: upload may_upload=true -> {} (resident={} budget={} len={})",
+                if put.is_some() { "buffered" } else { "REFUSED" },
+                c.resident.load(std::sync::atomic::Ordering::Relaxed),
+                c.vram_budget,
+                payload_len
+            );
+        }
+    } else if dbg {
+        eprintln!("resdbg[{idx}]: upload skipped (probe upload cap), resident check false");
     }
     false
 }
@@ -38518,7 +38538,7 @@ pub fn q8_matmat_2f(
         &bytes[abs..abs + payload_len],
         row_scale,
         Some(&col_field[..cols]),
-        xs,
+        &xs,
         b,
         rows,
         cols,
@@ -38526,7 +38546,18 @@ pub fn q8_matmat_2f(
         None,
         None,
     )
-    .is_some()
+    .map_or_else(
+        || {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if std::env::var_os("CMF_GPUDBG").is_some()
+                && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8
+            {
+                eprintln!("q8_2f_dispatch[{idx}]: DECLINED b={b} rows={rows} cols={cols}");
+            }
+            false
+        },
+        |_| true,
+    )
 }
 
 thread_local! {
