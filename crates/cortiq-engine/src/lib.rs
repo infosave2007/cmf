@@ -106,7 +106,7 @@ pub mod zimagegen;
     any(target_os = "linux", target_os = "windows", target_os = "android")
 ))]
 pub use nystrom::NystromState;
-pub use pipeline::{GenerateResult, Pipeline, TokenCallback, TokenTrace};
+pub use pipeline::{GenerateResult, MtpFfnProbe, Pipeline, TokenCallback, TokenTrace};
 pub use runtime::CortiqRuntime;
 
 /// Test-only: N empty Metal command-buffer round trips, total seconds.

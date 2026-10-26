@@ -16,6 +16,16 @@
 //! time from the first streamed token to the last (prefill excluded); the
 //! first token's latency is reported separately. `--ids-out` writes
 //! {"prompt": ids, "continuation": ids} (the plain arm's) for the oracle.
+//!
+//! ## Native Metal diagnostic
+//!
+//! On Apple Silicon, run the exact same prompt through the paired arms, for
+//! example `CMF_GPU=1 cargo run --release -p cortiq-cli --example
+//! mimo_mtp_bench -- model.cmf prompt.txt --modes plain,spec --k 3`.  Compare
+//! the emitted `decode_tok_s`, `mtp_drafted`/`mtp_accepted`, graph counters,
+//! and `identical_to_first`; repeat after warm-up before drawing a conclusion.
+//! This example deliberately makes **no fixed speed claim**: Metal throughput
+//! depends on model codec, context, device, and draft acceptance/rejection.
 use cortiq_core::CmfModel;
 use cortiq_engine::{Pipeline, SamplerConfig};
 use std::sync::{Arc, Mutex};

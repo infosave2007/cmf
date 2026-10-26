@@ -62,7 +62,10 @@ use std::sync::Arc;
 
 use cortiq_core::{CmfError, CmfModel};
 
-use super::{AttnKind, DenseFfn, FfnKind, LayerWeights, MtpModule, Pipeline};
+use super::{
+    accumulate_dense_ffn_activation_mass, AttnKind, DenseFfn, FfnKind, LayerWeights,
+    MtpFfnProbe, MtpModule, Pipeline,
+};
 use crate::attention::{self, QwenAttnCfg};
 use crate::inference;
 use crate::kv_cache::LayerKvCache;
@@ -490,6 +493,22 @@ impl Pipeline {
         n: usize,
         first_pos: usize,
     ) {
+        self.mimo_mtp_block_with_probe(m, x, n, first_pos, None)
+            .expect("MiMo MTP block has validated full-attention dense geometry");
+    }
+
+    /// Same draft block as [`Self::mimo_mtp_block`], with an optional
+    /// independent activation recorder.  The normal decode path passes
+    /// `None`; calibration asks for the pre-down gated activations without
+    /// borrowing the trunk's global FFN recorder.
+    fn mimo_mtp_block_with_probe(
+        &self,
+        m: &mut MtpModule,
+        x: &mut [f32],
+        n: usize,
+        first_pos: usize,
+        probe: Option<(&mut [f64], &mut [f64])>,
+    ) -> Result<(), String> {
         let hs = self.hidden_size;
         let li = self.mimo_mtp_geom_layer();
         let MtpModule { layer, kv, .. } = m;
@@ -504,7 +523,7 @@ impl Pipeline {
             );
         }
         let AttnKind::Full { wq, wk, wv, wo, .. } = &layer.attn else {
-            unreachable!("MiMo MTP blocks are softmax attention")
+            return Err("MiMo MTP FFN probe: draft attention is not full attention".into());
         };
         let inv_freq_l = self.layer_inv_freq(li);
         let (nkv_l, hd_l, rd_l) = self.layer_geom(li);
@@ -547,12 +566,96 @@ impl Pipeline {
             );
         }
         let FfnKind::Dense(d) = &layer.ffn else {
-            unreachable!("MiMo MTP blocks have a dense MLP")
+            return Err("MiMo MTP FFN probe: draft FFN is not dense".into());
         };
+        if let Some((mass, squared_mass)) = probe {
+            accumulate_dense_ffn_activation_mass(
+                d,
+                &normed,
+                n,
+                self.pool.as_deref(),
+                mass,
+                squared_mass,
+            )?;
+        }
         let f = super::dense_ffn_batch(d, &normed, n, self.pool.as_deref(), None);
         for (a, b) in x.iter_mut().zip(&f) {
             *a += b;
         }
+        Ok(())
+    }
+
+    /// One causal, teacher-forced pass through every MiMo draft layer for
+    /// independent FFN calibration. Layer `k` consumes
+    /// `(hidden[j], ids[j + k + 1])`, exactly the convention used by
+    /// `mimo_mtp_draft`; it does not read or aggregate the trunk FFN probe.
+    pub(crate) fn mimo_mtp_ffn_probe_teacher_forced(
+        &mut self,
+        st: &mut MimoMtp,
+        ids: &[u32],
+        hiddens: &[f32],
+    ) -> Result<Vec<MtpFfnProbe>, String> {
+        let hs = self.hidden_size;
+        if hiddens.len() != ids.len() * hs {
+            return Err("MiMo MTP FFN probe: malformed trunk hidden replay".into());
+        }
+        let post_norm_hidden = st.post_norm_hidden;
+        let mut out = Vec::with_capacity(st.layers.len());
+        for (layer_index, m) in st.layers.iter_mut().enumerate() {
+            let FfnKind::Dense(dense) = &m.layer.ffn else {
+                return Err(format!(
+                    "MiMo MTP FFN probe: draft layer {layer_index} is not dense"
+                ));
+            };
+            let inter = dense.gate_proj.rows();
+            let n = ids.len().saturating_sub(layer_index + 1);
+            let mut mass = vec![0.0f64; inter];
+            let mut squared_mass = vec![0.0f64; inter];
+            if n != 0 {
+                m.kv.clear();
+                let mut cats = vec![0.0f32; n * 2 * hs];
+                let mut draft_hidden = vec![0.0f32; hs];
+                for j in 0..n {
+                    let e = self.embed_single(ids[j + layer_index + 1]);
+                    let raw_hidden = &hiddens[j * hs..(j + 1) * hs];
+                    let (ce, ch) = cats[j * 2 * hs..(j + 1) * 2 * hs].split_at_mut(hs);
+                    inference::rms_norm_into(&e, &m.enorm, self.rms_eps, self.norm_style, ce);
+                    if post_norm_hidden {
+                        inference::rms_norm_into(
+                            raw_hidden,
+                            &self.weights.final_norm,
+                            self.rms_eps,
+                            self.norm_style,
+                            &mut draft_hidden,
+                        );
+                    } else {
+                        draft_hidden.copy_from_slice(raw_hidden);
+                    }
+                    inference::rms_norm_into(
+                        &draft_hidden,
+                        &m.hnorm,
+                        self.rms_eps,
+                        self.norm_style,
+                        ch,
+                    );
+                }
+                let mut x = vec![0.0f32; n * hs];
+                m.eh_proj.matmat(&cats, n, &mut x, self.pool.as_deref());
+                self.mimo_mtp_block_with_probe(
+                    m,
+                    &mut x,
+                    n,
+                    0,
+                    Some((&mut mass, &mut squared_mass)),
+                )?;
+            }
+            out.push(MtpFfnProbe {
+                mass,
+                squared_mass,
+                observed_positions: n,
+            });
+        }
+        Ok(out)
     }
 
     /// Draft up to `k` tokens for the round that starts after the backbone
