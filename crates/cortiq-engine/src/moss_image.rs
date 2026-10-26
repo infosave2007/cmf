@@ -241,6 +241,65 @@ pub struct MossDit {
     final_norm_video: Vec<f32>,
     final_linear_video: Proj,
     pool: Option<Arc<Pool>>,
+    /// Reusable per-run scratch. Every block/step resizes into it instead
+    /// of allocating MB-scale Vecs (the layer loop used to churn ~GB per
+    /// forward through malloc/mmap). Borrowed with `RefCell` — the forward
+    /// is strictly sequential on one thread.
+    work: std::cell::RefCell<Work>,
+}
+
+/// Attention scratch: transposed head planes, one score matrix, and the
+/// output row buffer — all n-dependent, all reused across every call.
+#[derive(Default)]
+struct AttnW {
+    qh: Vec<f32>,
+    kh: Vec<f32>,
+    vh: Vec<f32>,
+    scores: Vec<f32>,
+    vals_t: Vec<f32>,
+    head_out: Vec<f32>,
+    out: Vec<f32>,
+}
+
+/// Per-block scratch (norms, projections, FFN), sized by the largest
+/// sequence seen — the image+text forward at 512².
+#[derive(Default)]
+struct Blk {
+    norm: Vec<f32>,
+    qkv: Vec<f32>,
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    attn: Vec<f32>,
+    aw: AttnW,
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    ffn: Vec<f32>,
+    out: Vec<f32>,
+}
+
+/// Forward-level scratch (latent layout, embeddings, head image).
+#[derive(Default)]
+struct Fwd {
+    image_in: Vec<f32>,
+    video: Vec<f32>,
+    x: Vec<f32>,
+    image: Vec<f32>,
+}
+
+#[derive(Default)]
+struct Work {
+    f: Fwd,
+    b: Blk,
+}
+
+/// Length-exact view of a scratch buffer (first call sizes it, later
+/// calls with the same length are a no-op borrow).
+fn fit(buf: &mut Vec<f32>, len: usize) -> &mut [f32] {
+    if buf.len() != len {
+        buf.resize(len, 0f32);
+    }
+    buf
 }
 
 impl MossDit {
@@ -311,6 +370,7 @@ impl MossDit {
             text_blocks,
             layers,
             pool: Pool::from_env(),
+            work: std::cell::RefCell::new(Work::default()),
             cfg,
         };
         dit.validate()?;
@@ -357,16 +417,20 @@ impl MossDit {
                 self.cfg.text_dim
             ));
         }
-        let mut x = linear(
+        let mut work = self.work.borrow_mut();
+        let Work { b: blk, .. } = &mut *work;
+        let mut x: Vec<f32> = Vec::new();
+        linear_into(
             &self.text_proj,
             text,
             tokens,
             Some(&self.text_proj_b),
             self.pool(),
+            &mut x,
         );
         let rope = Rope::new(&self.cfg, 0, 0, tokens);
         for b in &self.text_blocks {
-            text_block(b, &mut x, tokens, &rope, &self.cfg, self.pool());
+            text_block(b, &mut x, tokens, &rope, &self.cfg, self.pool(), blk);
         }
         Ok(x)
     }
@@ -395,24 +459,31 @@ impl MossDit {
             return Err("MOSS skip layer out of range".into());
         }
         let image_tokens = h * w;
+        let pool = self.pool();
+        let mut work = self.work.borrow_mut();
+        let Work { f, b } = &mut *work;
         let _t_vemb = prof::time(prof::VEMB);
-        let mut image_in = vec![0f32; image_tokens * self.cfg.latent_channels];
+        fit(&mut f.image_in, image_tokens * self.cfg.latent_channels);
         for token in 0..image_tokens {
             for c in 0..self.cfg.latent_channels {
-                image_in[token * self.cfg.latent_channels + c] = latents[c * image_tokens + token];
+                f.image_in[token * self.cfg.latent_channels + c] =
+                    latents[c * image_tokens + token];
             }
         }
         drop(_t_vemb);
-        let video = linear(
+        linear_into(
             &self.video_embedder,
-            &image_in,
+            &f.image_in,
             image_tokens,
             Some(&self.video_embedder_b),
-            self.pool(),
+            pool,
+            &mut f.video,
         );
-        let mut x = Vec::with_capacity((image_tokens + text_tokens) * self.cfg.dim);
-        x.extend_from_slice(&video);
-        x.extend_from_slice(text);
+        let n = image_tokens + text_tokens;
+        f.x.clear();
+        f.x.extend_from_slice(&f.video);
+        f.x.extend_from_slice(text);
+        debug_assert_eq!(f.x.len(), n * self.cfg.dim);
         let _t_rope = prof::time(prof::ROPE);
         let rope = Rope::new(&self.cfg, h, w, text_tokens);
         drop(_t_rope);
@@ -423,47 +494,42 @@ impl MossDit {
         drop(_t_time);
         for (i, block) in self.layers.iter().enumerate() {
             if !skip_layers.contains(&i) {
-                main_block(
-                    block,
-                    &mut x,
-                    image_tokens + text_tokens,
-                    &rope,
-                    &modulation,
-                    &self.cfg,
-                    self.pool(),
-                );
+                main_block(block, &mut f.x, n, &rope, &modulation, &self.cfg, pool, b);
             }
         }
         let d = self.cfg.dim;
-        let mut image = x[..image_tokens * d].to_vec();
+        fit(&mut f.image, image_tokens * d);
+        f.image.copy_from_slice(&f.x[..image_tokens * d]);
         rms_rows_inplace(
-            &mut image,
+            &mut f.image,
             image_tokens,
             d,
             &self.final_norm_video,
             None,
             None,
-            self.pool(),
+            pool,
         );
         let (shift, scale) = (&head[..d], &head[d..]);
         {
             let _t_head = prof::time(prof::HEAD);
-            for row in image.chunks_exact_mut(d) {
+            for row in f.image.chunks_exact_mut(d) {
                 for ((v, &s), &a) in row.iter_mut().zip(scale).zip(shift) {
                     *v = *v * (1.0 + s) + a;
                 }
             }
         }
-        let out = linear(
+        linear_into(
             &self.final_linear_video,
-            &image,
+            &f.image,
             image_tokens,
             None,
-            self.pool(),
+            pool,
+            &mut b.out,
         );
         let mut velocity = vec![0f32; self.cfg.latent_channels * image_tokens];
         {
             let _t_head = prof::time(prof::HEAD);
+            let out = &b.out;
             for token in 0..image_tokens {
                 for c in 0..self.cfg.latent_channels {
                     velocity[c * image_tokens + token] = out[token * self.cfg.latent_channels + c];
@@ -508,6 +574,11 @@ impl Rope {
         let n = n_img + text_len;
         let mut sin = vec![0f32; n * hd];
         let mut cos = vec![0f32; n * hd];
+        // The band frequency depends only on the band — hoist the powf out
+        // of the per-token loop (same f64 expression, so bit-identical).
+        let freqs: Vec<f64> = (0..bands)
+            .map(|band| 1.0 / cfg.rope_base.powf(band as f64 / bands as f64))
+            .collect();
         for token in 0..n {
             let coords = if token < n_img {
                 let yy = token / w;
@@ -523,13 +594,14 @@ impl Rope {
             };
             for axis in 0..4 {
                 for band in 0..bands {
-                    let freq = 1.0 / cfg.rope_base.powf(band as f64 / bands as f64);
-                    let phase = coords[axis] * freq;
+                    let phase = coords[axis] * freqs[band];
                     let j = axis * bands + band;
-                    sin[token * hd + j] = phase.sin() as f32;
-                    cos[token * hd + j] = phase.cos() as f32;
-                    sin[token * hd + hd / 2 + j] = phase.sin() as f32;
-                    cos[token * hd + hd / 2 + j] = phase.cos() as f32;
+                    let s = phase.sin() as f32;
+                    let c = phase.cos() as f32;
+                    sin[token * hd + j] = s;
+                    cos[token * hd + j] = c;
+                    sin[token * hd + hd / 2 + j] = s;
+                    cos[token * hd + hd / 2 + j] = c;
                 }
             }
         }
@@ -552,6 +624,12 @@ impl SendRows {
     #[allow(clippy::mut_from_ref)]
     unsafe fn row(&self, off: usize, len: usize) -> &mut [f32] {
         unsafe { std::slice::from_raw_parts_mut(self.0.add(off), len) }
+    }
+
+    /// SAFETY: read-only view of a source range the caller only reads;
+    /// used where the wrapper holds a const buffer cast for convenience.
+    unsafe fn rrow(&self, off: usize, len: usize) -> &[f32] {
+        unsafe { std::slice::from_raw_parts(self.0.add(off), len) }
     }
 }
 
@@ -589,14 +667,24 @@ fn linear_small(x: &[f32], w: &[f32], bias: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-fn linear(p: &Proj, x: &[f32], n: usize, bias: Option<&[f32]>, pool: Option<&Pool>) -> Vec<f32> {
+/// `y[n, rows] = x[n, cols] · Wᵀ (+ bias)`, writing into the reusable
+/// `buf` instead of allocating per call. Returns the filled region.
+fn linear_into<'a>(
+    p: &Proj,
+    x: &[f32],
+    n: usize,
+    bias: Option<&[f32]>,
+    pool: Option<&Pool>,
+    buf: &'a mut Vec<f32>,
+) -> &'a mut [f32] {
     let _t = prof::time(prof::MATMAT);
     assert_eq!(x.len(), n * p.cols(), "MOSS projection input geometry");
-    let mut out = vec![0f32; n * p.rows()];
-    p.matmat(x, n, &mut out, pool);
+    let rows = p.rows();
+    let out = fit(buf, n * rows);
+    p.matmat(x, n, out, pool);
     if let Some(b) = bias {
-        assert_eq!(b.len(), p.rows(), "MOSS projection bias geometry");
-        for row in out.chunks_exact_mut(p.rows()) {
+        assert_eq!(b.len(), rows, "MOSS projection bias geometry");
+        for row in out.chunks_exact_mut(rows) {
             for (v, &b) in row.iter_mut().zip(b) {
                 *v += b;
             }
@@ -696,9 +784,12 @@ fn softmax(row: &mut [f32]) {
 }
 
 /// Full bidirectional attention.  The GPU path consumes head-major q/k/v
-/// planes and returns token-major rows; portable fallback holds one score
-/// matrix per head (never one per layer) to bound memory.
-fn attention(
+/// planes and writes token-major rows; portable fallback holds one score
+/// matrix per head (never one per layer) to bound memory.  All scratch
+/// comes from `w` (reused across every call of the run), and the
+/// token→head transposes run over the pooled workers — disjoint token
+/// ranges keep the result bit-identical to the serial order.
+fn attention<'a>(
     q: &[f32],
     k: &[f32],
     v: &[f32],
@@ -706,66 +797,84 @@ fn attention(
     heads: usize,
     hd: usize,
     pool: Option<&Pool>,
-) -> Vec<f32> {
+    w: &'a mut AttnW,
+) -> &'a mut [f32] {
     let _t = prof::time(prof::ATTN);
     let hidden = heads * hd;
-    let mut qh = vec![0f32; heads * n * hd];
-    let mut kh = vec![0f32; heads * n * hd];
-    let mut vh = vec![0f32; heads * n * hd];
-    for t in 0..n {
-        for h in 0..heads {
-            let src = &q[(t * heads + h) * hd..(t * heads + h + 1) * hd];
-            qh[(h * n + t) * hd..(h * n + t + 1) * hd].copy_from_slice(src);
-            let src = &k[(t * heads + h) * hd..(t * heads + h + 1) * hd];
-            kh[(h * n + t) * hd..(h * n + t + 1) * hd].copy_from_slice(src);
-            let src = &v[(t * heads + h) * hd..(t * heads + h + 1) * hd];
-            vh[(h * n + t) * hd..(h * n + t + 1) * hd].copy_from_slice(src);
-        }
-    }
-    let mut out = vec![0f32; n * hidden];
-    if prof::on() && n >= 128 && crate::gpu::enabled_here() && !crate::gpu::mm_killed() {
-        let g = std::time::Instant::now();
-        if crate::gpu::dit_attention(
-            &qh,
-            &kh,
-            &vh,
-            heads,
-            heads,
-            n,
-            hd,
-            1.0 / (hd as f32).sqrt(),
-            &mut out,
-        ) {
-            prof::add(prof::ATTN_GPU, g.elapsed().as_nanos() as u64);
-            return out;
-        }
-    } else if n >= 128
-        && crate::gpu::enabled_here()
-        && !crate::gpu::mm_killed()
-        && crate::gpu::dit_attention(
-            &qh,
-            &kh,
-            &vh,
-            heads,
-            heads,
-            n,
-            hd,
-            1.0 / (hd as f32).sqrt(),
-            &mut out,
-        )
+    fit(&mut w.qh, heads * n * hd);
+    fit(&mut w.kh, heads * n * hd);
+    fit(&mut w.vh, heads * n * hd);
+    fit(&mut w.out, n * hidden);
     {
-        return out;
+        // Parallel transpose: token t owns rows [t*heads, (t+1)*heads) of
+        // every plane, so workers take disjoint token spans.
+        let qp = SendRows(q.as_ptr() as *mut f32);
+        let kp = SendRows(k.as_ptr() as *mut f32);
+        let vp = SendRows(v.as_ptr() as *mut f32);
+        let qhp = SendRows(w.qh.as_mut_ptr());
+        let khp = SendRows(w.kh.as_mut_ptr());
+        let vhp = SendRows(w.vh.as_mut_ptr());
+        rows(pool, n, &|lo, hi| {
+            for t in lo..hi {
+                for h in 0..heads {
+                    // SAFETY: each (t, h) cell is written by exactly one
+                    // worker (token ranges are disjoint) and read from
+                    // distinct q/k/v source cells.
+                    let src = t * heads + h;
+                    let dst = (h * n + t) * hd;
+                    unsafe {
+                        qhp
+                            .row(dst, hd)
+                            .copy_from_slice(qp.rrow(src * hd, hd));
+                        khp
+                            .row(dst, hd)
+                            .copy_from_slice(kp.rrow(src * hd, hd));
+                        vhp
+                            .row(dst, hd)
+                            .copy_from_slice(vp.rrow(src * hd, hd));
+                    }
+                }
+            }
+        });
     }
-    let mut scores = vec![0f32; n * n];
-    let mut vals_t = vec![0f32; hd * n];
-    let mut head_out = vec![0f32; n * hd];
+    if n >= 128 && crate::gpu::enabled_here() && !crate::gpu::mm_killed() {
+        let g = if prof::on() { Some(std::time::Instant::now()) } else { None };
+        if crate::gpu::dit_attention(
+            &w.qh,
+            &w.kh,
+            &w.vh,
+            heads,
+            heads,
+            n,
+            hd,
+            1.0 / (hd as f32).sqrt(),
+            &mut w.out,
+        ) {
+            if let Some(g) = g {
+                prof::add(prof::ATTN_GPU, g.elapsed().as_nanos() as u64);
+            }
+            return &mut w.out;
+        }
+    }
+    fit(&mut w.scores, n * n);
+    fit(&mut w.vals_t, hd * n);
+    fit(&mut w.head_out, n * hd);
+    let AttnW {
+        qh,
+        kh,
+        vh,
+        scores,
+        vals_t,
+        head_out,
+        out,
+    } = w;
     for h in 0..heads {
         let qs = &qh[h * n * hd..(h + 1) * n * hd];
         let ks = &kh[h * n * hd..(h + 1) * n * hd];
         let vs = &vh[h * n * hd..(h + 1) * n * hd];
         // GEMM wants the right operand laid out by output row.  Each score
         // row is q[t] dot k[j], so transpose logically into k's rows works.
-        crate::fcd_ops::gemm_nt(qs, ks, &mut scores, n, hd, n, pool);
+        crate::fcd_ops::gemm_nt(qs, ks, scores, n, hd, n, pool);
         let sp = SendRows(scores.as_mut_ptr());
         rows(pool, n, &|lo, hi| {
             for r in lo..hi {
@@ -778,7 +887,7 @@ fn attention(
                 vals_t[d * n + t] = vs[t * hd + d];
             }
         }
-        crate::fcd_ops::gemm_nt(&scores, &vals_t, &mut head_out, n, n, hd, pool);
+        crate::fcd_ops::gemm_nt(scores, vals_t, head_out, n, n, hd, pool);
         for t in 0..n {
             out[t * hidden + h * hd..t * hidden + (h + 1) * hd]
                 .copy_from_slice(&head_out[t * hd..(t + 1) * hd]);
@@ -794,16 +903,29 @@ fn text_block(
     rope: &Rope,
     cfg: &MossConfig,
     pool: Option<&Pool>,
+    w: &mut Blk,
 ) {
     let d = cfg.dim;
-    let mut norm = x.to_vec();
-    rms_rows_inplace(&mut norm, n, d, &b.norm1, None, None, pool);
-    let qkv = linear(&b.qkv, &norm, n, Some(&b.qkv_b), pool);
-    let mut q = qkv[..n * d].to_vec();
-    let mut k = qkv[n * d..2 * n * d].to_vec();
-    let v = qkv[2 * n * d..].to_vec();
+    let Blk {
+        norm,
+        qkv,
+        q,
+        k,
+        v,
+        aw,
+        gate,
+        up,
+        out,
+        ..
+    } = w;
+    fit(norm, n * d).copy_from_slice(&x[..n * d]);
+    rms_rows_inplace(norm, n, d, &b.norm1, None, None, pool);
+    linear_into(&b.qkv, norm, n, Some(&b.qkv_b), pool, qkv);
+    fit(q, n * d).copy_from_slice(&qkv[..n * d]);
+    fit(k, n * d).copy_from_slice(&qkv[n * d..2 * n * d]);
+    fit(v, n * d).copy_from_slice(&qkv[2 * n * d..3 * n * d]);
     qk_norm_rope(
-        &mut q,
+        &mut q[..],
         n,
         cfg.num_heads,
         cfg.head_dim(),
@@ -812,7 +934,7 @@ fn text_block(
         pool,
     );
     qk_norm_rope(
-        &mut k,
+        &mut k[..],
         n,
         cfg.num_heads,
         cfg.head_dim(),
@@ -820,21 +942,22 @@ fn text_block(
         rope,
         pool,
     );
-    let attn = attention(&q, &k, &v, n, cfg.num_heads, cfg.head_dim(), pool);
-    let out = linear(&b.proj, &attn, n, Some(&b.proj_b), pool);
-    for (a, &v) in x.iter_mut().zip(&out) {
-        *a += v;
+    let attn_out = attention(&q[..], &k[..], &v[..], n, cfg.num_heads, cfg.head_dim(), pool, aw);
+    linear_into(&b.proj, attn_out, n, Some(&b.proj_b), pool, out);
+    for (a, &val) in x.iter_mut().zip(out[..n * d].iter()) {
+        *a += val;
     }
-    let mut norm = x.to_vec();
-    rms_rows_inplace(&mut norm, n, d, &b.norm2, None, None, pool);
-    let gate = linear(&b.ffn_gate, &norm, n, Some(&b.ffn_gate_b), pool);
-    let mut up = linear(&b.ffn_up, &norm, n, Some(&b.ffn_up_b), pool);
-    for (a, &g) in up.iter_mut().zip(&gate) {
+    fit(norm, n * d).copy_from_slice(&x[..n * d]);
+    rms_rows_inplace(norm, n, d, &b.norm2, None, None, pool);
+    linear_into(&b.ffn_gate, norm, n, Some(&b.ffn_gate_b), pool, gate);
+    linear_into(&b.ffn_up, norm, n, Some(&b.ffn_up_b), pool, up);
+    let inter = cfg.ffn_dim;
+    for (a, &g) in up[..n * inter].iter_mut().zip(gate[..n * inter].iter()) {
         *a = situ(*a, g);
     }
-    let out = linear(&b.ffn_down, &up, n, Some(&b.ffn_down_b), pool);
-    for (a, &v) in x.iter_mut().zip(&out) {
-        *a += v;
+    linear_into(&b.ffn_down, &up[..n * inter], n, Some(&b.ffn_down_b), pool, out);
+    for (a, &val) in x.iter_mut().zip(out[..n * d].iter()) {
+        *a += val;
     }
 }
 
@@ -846,6 +969,7 @@ fn main_block(
     modulate: &[f32],
     cfg: &MossConfig,
     pool: Option<&Pool>,
+    w: &mut Blk,
 ) {
     let d = cfg.dim;
     assert_eq!(modulate.len(), 6 * d);
@@ -854,9 +978,20 @@ fn main_block(
     let (gate_a, rest) = rest.split_at(d);
     let (shift_f, rest) = rest.split_at(d);
     let (scale_f, gate_f) = rest.split_at(d);
-    let mut norm = x.to_vec();
+    let Blk {
+        norm,
+        q,
+        k,
+        v,
+        aw,
+        up,
+        ffn,
+        out,
+        ..
+    } = w;
+    fit(norm, n * d).copy_from_slice(&x[..n * d]);
     rms_rows_inplace(
-        &mut norm,
+        norm,
         n,
         d,
         &b.norm1,
@@ -864,11 +999,11 @@ fn main_block(
         Some(shift_a),
         pool,
     );
-    let mut q = linear(&b.q, &norm, n, None, pool);
-    let mut k = linear(&b.k, &norm, n, None, pool);
-    let v = linear(&b.v, &norm, n, None, pool);
+    linear_into(&b.q, norm, n, None, pool, q);
+    linear_into(&b.k, norm, n, None, pool, k);
+    linear_into(&b.v, norm, n, None, pool, v);
     qk_norm_rope(
-        &mut q,
+        &mut q[..],
         n,
         cfg.num_heads,
         cfg.head_dim(),
@@ -877,7 +1012,7 @@ fn main_block(
         pool,
     );
     qk_norm_rope(
-        &mut k,
+        &mut k[..],
         n,
         cfg.num_heads,
         cfg.head_dim(),
@@ -885,19 +1020,28 @@ fn main_block(
         rope,
         pool,
     );
-    let attn = attention(&q, &k, &v, n, cfg.num_heads, cfg.head_dim(), pool);
-    let out = linear(&b.o, &attn, n, None, pool);
+    let attn_out = attention(&q[..], &k[..], &v[..], n, cfg.num_heads, cfg.head_dim(), pool, aw);
+    linear_into(&b.o, attn_out, n, None, pool, out);
+    // Residual gate: rows are disjoint across workers, so each output
+    // cell keeps its serial value — bit-identical, just parallel.
     {
         let _t = prof::time(prof::ELEM);
-        for row in 0..n {
-            for j in 0..d {
-                x[row * d + j] += out[row * d + j] * gate_a[j];
+        let xp = SendRows(x.as_mut_ptr());
+        let op = SendRows(out.as_mut_ptr());
+        rows(pool, n, &|lo, hi| {
+            for row in lo..hi {
+                // SAFETY: workers own disjoint row ranges of x and out.
+                let xs = unsafe { xp.row(row * d, d) };
+                let os = unsafe { op.row(row * d, d) };
+                for j in 0..d {
+                    xs[j] += os[j] * gate_a[j];
+                }
             }
-        }
+        });
     }
-    let mut norm = x.to_vec();
+    fit(norm, n * d).copy_from_slice(&x[..n * d]);
     rms_rows_inplace(
-        &mut norm,
+        norm,
         n,
         d,
         &b.norm2,
@@ -905,28 +1049,40 @@ fn main_block(
         Some(shift_f),
         pool,
     );
-    let up_gate = linear(&b.ffn_up_gate, &norm, n, None, pool);
     let inter = cfg.ffn_dim;
-    let mut ffn = vec![0f32; n * inter];
+    linear_into(&b.ffn_up_gate, norm, n, None, pool, up);
+    fit(ffn, n * inter);
     {
         let _t = prof::time(prof::ELEM);
-        for row in 0..n {
-            for i in 0..inter {
-                ffn[row * inter + i] = situ(
-                    up_gate[row * 2 * inter + i],
-                    up_gate[row * 2 * inter + inter + i],
-                );
+        let fp = SendRows(ffn.as_mut_ptr());
+        let upp = SendRows(up.as_mut_ptr());
+        rows(pool, n, &|lo, hi| {
+            for row in lo..hi {
+                // SAFETY: disjoint output rows; the up_gate source is
+                // read-only (rrow) and indexed within this row's span.
+                let f = unsafe { fp.row(row * inter, inter) };
+                let u = unsafe { upp.rrow(row * 2 * inter, 2 * inter) };
+                for i in 0..inter {
+                    f[i] = situ(u[i], u[inter + i]);
+                }
             }
-        }
+        });
     }
-    let out = linear(&b.ffn_down, &ffn, n, None, pool);
+    linear_into(&b.ffn_down, &ffn[..n * inter], n, None, pool, out);
     {
         let _t = prof::time(prof::ELEM);
-        for row in 0..n {
-            for j in 0..d {
-                x[row * d + j] += out[row * d + j] * gate_f[j];
+        let xp = SendRows(x.as_mut_ptr());
+        let op = SendRows(out.as_mut_ptr());
+        rows(pool, n, &|lo, hi| {
+            for row in lo..hi {
+                // SAFETY: workers own disjoint row ranges of x and out.
+                let xs = unsafe { xp.row(row * d, d) };
+                let os = unsafe { op.row(row * d, d) };
+                for j in 0..d {
+                    xs[j] += os[j] * gate_f[j];
+                }
             }
-        }
+        });
     }
 }
 
