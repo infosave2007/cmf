@@ -30,6 +30,8 @@ mod moedefrag;
 mod music;
 mod mossimagepack;
 mod npy;
+#[cfg(feature = "phonon")]
+mod phononpack;
 mod nvg;
 mod nvg_linalg;
 mod nvgbench;
@@ -666,6 +668,55 @@ enum Commands {
         /// Maximum generated text tokens per 30-second segment
         #[arg(long, default_value_t = 440)]
         max_new_tokens: usize,
+    },
+    /// Package a Gradium Phonon Q8 checkpoint as a self-contained CMF file.
+    #[cfg(feature = "phonon")]
+    PhononPack {
+        /// Downloaded gradium/phonon-40m-multilingual directory containing
+        /// config.json, model.q8.gguf, tokenizer.json and default-voice.safetensors.
+        source: String,
+        /// Destination .cmf file.
+        #[arg(long)]
+        output: String,
+    },
+    /// Synthesize multilingual Phonon speech from a Phonon CMF checkpoint.
+    #[cfg(feature = "phonon")]
+    Tts {
+        /// Path to a Gradium Phonon `.cmf` model.
+        model: String,
+        /// Text to synthesize. Long input is split on sentence boundaries.
+        text: String,
+        /// Language used for text normalization: en, fr, de, es, or pt.
+        #[arg(long, visible_alias = "language", default_value = "en")]
+        lang: String,
+        /// Output mono 24 kHz WAV path.
+        #[arg(long, default_value = "speech.wav")]
+        out: String,
+        /// Optional precomputed Phonon voice-latent `.safetensors` file.
+        /// Audio recordings are not supported because the speaker codec is not released.
+        #[arg(long)]
+        voice_file: Option<String>,
+        /// Name assigned to --voice-file; without it only `default` is embedded.
+        #[arg(long, default_value = "default")]
+        voice: String,
+        /// Flow-noise temperature; 0 is deterministic and 0.3 is the upstream default.
+        #[arg(long, default_value_t = 0.3)]
+        temperature: f32,
+        /// Flow-noise seed for reproducible output.
+        #[arg(long, default_value_t = 4_242_424_242_424_242u64)]
+        seed: u64,
+        /// Optional classifier-free guidance coefficient; 1 disables guidance.
+        #[arg(long)]
+        guidance: Option<f32>,
+        /// Native speech-rate conditioning: negative is faster, positive is slower.
+        #[arg(long, default_value_t = 0.0)]
+        duration_delta: f32,
+        /// Override the model's end-of-speech threshold.
+        #[arg(long)]
+        eos_threshold: Option<f32>,
+        /// Text-token limit for each sentence chunk.
+        #[arg(long)]
+        max_tokens_per_chunk: Option<usize>,
     },
     /// Rewrite a container tightly: reclaim dead directory/header tails
     /// left by append-only skill growth (spec §9). Streams from mmap.
@@ -3672,6 +3723,46 @@ async fn main() -> anyhow::Result<()> {
             let model = Arc::new(CmfModel::open(&model)?);
             let text = transcribe::run(&model, &audio, &language, &task, max_new_tokens)?;
             println!("{text}");
+            Ok(())
+        }
+        #[cfg(feature = "phonon")]
+        Commands::PhononPack { source, output } => phononpack::cmd_phonon_pack(&source, &output),
+        #[cfg(feature = "phonon")]
+        Commands::Tts {
+            model,
+            text,
+            lang,
+            out,
+            voice_file,
+            voice,
+            temperature,
+            seed,
+            guidance,
+            duration_delta,
+            eos_threshold,
+            max_tokens_per_chunk,
+        } => {
+            let options = cortiq_engine::phonon::SynthesisOptions {
+                language: &lang,
+                voice_file: voice_file.as_deref().map(std::path::Path::new),
+                voice_name: &voice,
+                temperature,
+                seed,
+                guidance,
+                duration_delta,
+                eos_threshold,
+                max_tokens_per_chunk,
+            };
+            let result = cortiq_engine::phonon::synthesize_to_wav(
+                std::path::Path::new(&model),
+                &text,
+                std::path::Path::new(&out),
+                &options,
+            )?;
+            println!(
+                "✓ wrote {} ({:.2}s, {} Hz, {} samples)",
+                out, result.seconds, result.sample_rate, result.samples
+            );
             Ok(())
         }
         Commands::Compact {
@@ -10157,6 +10248,9 @@ async fn cmd_bench(
         // spends per token (host encode vs GPU wait vs uploads) and how
         // often the pool admits a new expert. Without these, a frame that
         // trades CPU MoE for per-layer syncs is invisible in the report.
+        // `gpu_wgpu` exists only when the optional GPU backend is enabled;
+        // CPU-only builds deliberately omit these GPU-only metrics.
+        #[cfg(feature = "gpu")]
         {
             use std::sync::atomic::Ordering::Relaxed;
             let steps = (n_st.saturating_sub(1)).max(1) as f64;

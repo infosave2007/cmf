@@ -20,6 +20,8 @@ hf upload infosave/flint-cmf docs/hf/Flint-cmf.md README.md
 hf upload infosave/Ornith-1.5-cmf docs/hf/Ornith-1.5-cmf.md README.md
 hf upload infosave/Ornith-1.5-122B-cmf docs/hf/Ornith-1.5-122B-cmf.md README.md
 hf upload infosave/cmf docs/hf/cmf.md README.md
+hf upload infosave/phonon-40m-multilingual-cmf \
+    docs/hf/Phonon-40M-Multilingual-cmf.md README.md
 hf upload infosave/cmf docs/hf/FORMATS.md FORMATS.md
 ```
 
