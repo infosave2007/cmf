@@ -837,7 +837,14 @@ fn attention<'a>(
             }
         });
     }
-    if n >= 128 && crate::gpu::enabled_here() && !crate::gpu::mm_killed() {
+    // `CMF_MOSS_ATTN_GPU=0`: keep attention on the host while the linears
+    // stay on the device — the isolation switch behind the MOSS_CHECK
+    // GPU-vs-CPU validation.
+    if n >= 128
+        && crate::gpu::enabled_here()
+        && !crate::gpu::mm_killed()
+        && std::env::var("CMF_MOSS_ATTN_GPU").as_deref() != Ok("0")
+    {
         let g = if prof::on() { Some(std::time::Instant::now()) } else { None };
         if crate::gpu::dit_attention(
             &w.qh,

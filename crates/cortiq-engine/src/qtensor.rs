@@ -2648,7 +2648,11 @@ impl QTensor {
                         );
                     }
                 }
-                if b >= 8 && b * rows * cols >= 128_000_000 && crate::gpu::enabled_here() {
+                if b >= 8
+                    && b * rows * cols >= 128_000_000
+                    && crate::gpu::enabled_here()
+                    && std::env::var("CMF_Q8_WIDE_GPU").as_deref() != Ok("0")
+                {
                     if let Self::Mapped { model, idx, .. } = self {
                         let t0 = std::time::Instant::now();
                         // Wide batches (the diffusion denoise loop) arbitrate
