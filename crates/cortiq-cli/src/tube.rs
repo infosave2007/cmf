@@ -22,8 +22,9 @@
 
 use anyhow::{Context, bail};
 use cortiq_core::mask::{MaskCatalog, MaskPriority, TaskMask};
-use cortiq_core::{CmfModel, TensorDtype, TensorSpec};
-use serde_json::Value;
+use cortiq_core::{CmfModel, ModelArch, TensorDtype, TensorEntry, TensorSpec};
+use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::convert::{Quant, quantize_2d};
@@ -44,9 +45,582 @@ fn quant_of(d: TensorDtype) -> Option<Quant> {
 
 /// One layer's plan: the new order of the neurons that survive, and the
 /// widths of the segments that order is cut into.
+#[derive(Clone, Debug)]
 struct LayerPlan {
     order: Vec<usize>,
     widths: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MtpMode {
+    Preserve,
+    Compact,
+    Drop,
+}
+
+impl MtpMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Preserve => "preserve",
+            Self::Compact => "compact",
+            Self::Drop => "drop",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MtpPlan {
+    mode: MtpMode,
+    layers: Vec<LayerPlan>,
+}
+
+#[derive(Clone, Debug)]
+struct CanonicalMtp {
+    widths: Vec<usize>,
+    has_down_t: Vec<bool>,
+}
+
+fn parse_layer_plan(value: &Value, what: &str) -> anyhow::Result<LayerPlan> {
+    let parse_numbers = |key: &str| -> anyhow::Result<Vec<usize>> {
+        value
+            .get(key)
+            .and_then(Value::as_array)
+            .with_context(|| format!("{what}.{key} must be an array"))?
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                item.as_u64().map(|n| n as usize).with_context(|| {
+                    format!("{what}.{key}[{index}] must be a non-negative integer")
+                })
+            })
+            .collect()
+    };
+    Ok(LayerPlan {
+        order: parse_numbers("order")?,
+        widths: parse_numbers("widths")?,
+    })
+}
+
+fn parse_layer_plans(value: &Value, what: &str) -> anyhow::Result<Vec<LayerPlan>> {
+    value
+        .as_array()
+        .with_context(|| format!("{what} must be an array"))?
+        .iter()
+        .enumerate()
+        .map(|(index, item)| parse_layer_plan(item, &format!("{what}[{index}]")))
+        .collect()
+}
+
+fn validate_layer_plan(plan: &LayerPlan, source_width: usize, what: &str) -> anyhow::Result<()> {
+    let sum: usize = plan.widths.iter().sum();
+    if sum != plan.order.len() {
+        bail!("{what}: widths sum {sum} != order len {}", plan.order.len());
+    }
+    if plan.widths.is_empty() || plan.widths[0] == 0 {
+        bail!("{what}: the core segment must be non-empty");
+    }
+    let mut seen = HashSet::with_capacity(plan.order.len());
+    for &channel in &plan.order {
+        if channel >= source_width {
+            bail!("{what}: channel {channel} is out of range (width {source_width})");
+        }
+        if !seen.insert(channel) {
+            bail!("{what}: channel {channel} occurs more than once");
+        }
+    }
+    Ok(())
+}
+
+// Plan-v2 MTP behavior is explicit.  In particular, old plans which used
+// drop_mtp cannot silently remove a speculative draft.
+fn parse_mtp_plan(plan: &Value) -> anyhow::Result<MtpPlan> {
+    if plan.get("drop_mtp").and_then(Value::as_bool) == Some(true) {
+        bail!("legacy drop_mtp is unsupported; use the explicit mtp.mode=drop plan-v2 field");
+    }
+    let Some(raw) = plan.get("mtp") else {
+        return Ok(MtpPlan {
+            mode: MtpMode::Preserve,
+            layers: Vec::new(),
+        });
+    };
+    let object = raw.as_object().context("plan.mtp must be an object")?;
+    let mode = match object
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("preserve")
+    {
+        "preserve" => MtpMode::Preserve,
+        "compact" => MtpMode::Compact,
+        "drop" => MtpMode::Drop,
+        other => bail!("plan.mtp.mode must be preserve, compact, or drop (got {other:?})"),
+    };
+    let layers = match mode {
+        MtpMode::Compact => parse_layer_plans(
+            object
+                .get("layers")
+                .context("plan.mtp.layers is required for mtp.mode=compact")?,
+            "plan.mtp.layers",
+        )?,
+        MtpMode::Preserve | MtpMode::Drop => {
+            if object.contains_key("layers") {
+                bail!("plan.mtp.layers is valid only for mtp.mode=compact");
+            }
+            Vec::new()
+        }
+    };
+    Ok(MtpPlan { mode, layers })
+}
+
+// A compact/drop MTP plan with no legacy top-level trunk fields is an MTP-only
+// operation.  This is also spelled explicitly by trunk.mode=preserve.
+fn trunk_is_preserved(plan: &Value, mtp: &MtpPlan) -> anyhow::Result<bool> {
+    let has_trunk_fields = ["tasks", "layers", "active"]
+        .iter()
+        .any(|key| plan.get(*key).is_some());
+    if let Some(raw) = plan.get("trunk") {
+        let object = raw.as_object().context("plan.trunk must be an object")?;
+        match object
+            .get("mode")
+            .and_then(Value::as_str)
+            .context("plan.trunk.mode is required")?
+        {
+            "preserve" => {
+                if has_trunk_fields {
+                    bail!(
+                        "plan.trunk.mode=preserve cannot be combined with top-level tasks/layers/active"
+                    );
+                }
+                Ok(true)
+            }
+            "bake" | "compact" => Ok(false),
+            other => bail!("unknown plan.trunk.mode {other:?}"),
+        }
+    } else {
+        Ok(!has_trunk_fields && mtp.mode != MtpMode::Preserve)
+    }
+}
+
+fn parse_active(
+    value: &Value,
+    task_count: usize,
+    layer_count: usize,
+) -> anyhow::Result<Vec<Vec<Vec<bool>>>> {
+    let rows = value.as_array().context("plan.active must be an array")?;
+    if rows.len() != task_count {
+        bail!("plan.active has {} rows, {task_count} tasks", rows.len());
+    }
+    let per_layer = rows
+        .first()
+        .and_then(Value::as_array)
+        .and_then(|task| task.first())
+        .is_some_and(Value::is_array);
+    rows.iter()
+        .enumerate()
+        .map(|(task_index, task)| -> anyhow::Result<Vec<Vec<bool>>> {
+            let task = task
+                .as_array()
+                .with_context(|| format!("plan.active[{task_index}] must be an array"))?;
+            let parsed = if per_layer {
+                task.iter()
+                    .enumerate()
+                    .map(|(layer_index, layer)| -> anyhow::Result<Vec<bool>> {
+                        layer
+                            .as_array()
+                            .with_context(|| {
+                                format!(
+                                    "plan.active[{task_index}][{layer_index}] must be an array"
+                                )
+                            })?
+                            .iter()
+                            .enumerate()
+                            .map(|(segment, bit)| {
+                                bit.as_bool().with_context(|| {
+                                    format!(
+                                        "plan.active[{task_index}][{layer_index}][{segment}] must be a bool"
+                                    )
+                                })
+                            })
+                            .collect()
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?
+            } else {
+                let one = task
+                    .iter()
+                    .enumerate()
+                    .map(|(segment, bit)| {
+                        bit.as_bool().with_context(|| {
+                            format!("plan.active[{task_index}][{segment}] must be a bool")
+                        })
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                vec![one; layer_count]
+            };
+            if parsed.len() != layer_count {
+                bail!(
+                    "plan.active[{task_index}] has {} layer rows, model has {layer_count}",
+                    parsed.len()
+                );
+            }
+            Ok(parsed)
+        })
+        .collect()
+}
+
+fn tensor<'a>(model: &'a CmfModel, name: &str) -> anyhow::Result<&'a TensorEntry> {
+    model
+        .tensors
+        .iter()
+        .find(|entry| entry.name == name)
+        .with_context(|| format!("missing tensor {name}"))
+}
+
+fn dequant(model: &CmfModel, name: &str) -> anyhow::Result<Vec<f32>> {
+    let entry = tensor(model, name)?;
+    let mut out = vec![0.0; entry.shape.iter().product()];
+    cortiq_core::quant::dequant_tensor(entry, model.tensor_bytes(name)?, &mut out)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    Ok(out)
+}
+
+fn expect_shape(model: &CmfModel, name: &str, expected: &[usize]) -> anyhow::Result<()> {
+    let actual = &tensor(model, name)?.shape;
+    if actual.as_slice() != expected {
+        bail!("{name}: expected {expected:?}, got {actual:?}");
+    }
+    Ok(())
+}
+
+fn mtp_mlp_names(layer: usize) -> [String; 4] {
+    let prefix = format!("model.mtp.layers.{layer}.mlp.");
+    [
+        format!("{prefix}gate_proj.weight"),
+        format!("{prefix}up_proj.weight"),
+        format!("{prefix}down_proj.weight"),
+        format!("{prefix}down_proj.t.weight"),
+    ]
+}
+
+fn mtp_payload_present(model: &CmfModel) -> bool {
+    model
+        .tensors
+        .iter()
+        .any(|entry| entry.name.starts_with("model.mtp."))
+}
+
+// The compactor only transforms canonical dense local MLPs.  This works for
+// the generic one-block MTP and for multi-block MiMo sidecars because their
+// differing surrounding tensors are copied byte-for-byte.  Routed experts,
+// old MTP tubes, DSV4's different namespace, and header/tensor disagreement
+// are rejected rather than guessed at.
+fn validate_canonical_dense_mtp(
+    model: &CmfModel,
+    arch: &ModelArch,
+) -> anyhow::Result<CanonicalMtp> {
+    let config = arch
+        .mtp
+        .as_ref()
+        .context("MTP tensors are present but header.arch.mtp is absent")?;
+    if config.num_layers == 0 {
+        bail!("header.arch.mtp.num_layers must be positive for MTP compact");
+    }
+    if model
+        .tensors
+        .iter()
+        .any(|entry| entry.name.starts_with("model.mtp.0."))
+    {
+        bail!("MTP compact does not support DeepSeek-V4 model.mtp.N layouts");
+    }
+
+    let mut widths = Vec::with_capacity(config.num_layers);
+    let mut has_down_t = Vec::with_capacity(config.num_layers);
+    for layer in 0..config.num_layers {
+        let [gate_name, up_name, down_name, down_t_name] = mtp_mlp_names(layer);
+        let hidden = arch.hidden_size;
+        let gate_shape = &tensor(model, &gate_name)?.shape;
+        if gate_shape.len() != 2 || gate_shape[0] == 0 || gate_shape[1] != hidden {
+            bail!("{gate_name}: expected non-empty [intermediate, {hidden}], got {gate_shape:?}");
+        }
+        let width = gate_shape[0];
+        expect_shape(model, &up_name, &[width, hidden])?;
+        expect_shape(model, &down_name, &[hidden, width])?;
+        let down_t = model.tensors.iter().any(|entry| entry.name == down_t_name);
+        if down_t {
+            expect_shape(model, &down_t_name, &[width, hidden])?;
+        }
+        let prefix = format!("model.mtp.layers.{layer}.mlp.");
+        for entry in model
+            .tensors
+            .iter()
+            .filter(|entry| entry.name.starts_with(&prefix))
+        {
+            if entry.name != gate_name
+                && entry.name != up_name
+                && entry.name != down_name
+                && entry.name != down_t_name
+            {
+                bail!(
+                    "MTP compact only supports an unsplit dense MLP triple; unsupported tensor {}",
+                    entry.name
+                );
+            }
+        }
+        widths.push(width);
+        has_down_t.push(down_t);
+    }
+    for entry in &model.tensors {
+        if let Some(rest) = entry.name.strip_prefix("model.mtp.layers.") {
+            let layer = rest.split('.').next().unwrap_or_default();
+            let index = layer.parse::<usize>().with_context(|| {
+                format!("MTP compact found malformed layer namespace {}", entry.name)
+            })?;
+            if index >= config.num_layers {
+                bail!(
+                    "MTP compact header declares {} layers but found tensor {}",
+                    config.num_layers,
+                    entry.name
+                );
+            }
+        }
+    }
+    if let Some(declared) = config.ffn_intermediate_sizes.as_deref() {
+        if declared != widths.as_slice() {
+            bail!(
+                "header.arch.mtp.ffn_intermediate_sizes={declared:?} disagrees with MTP widths {widths:?}"
+            );
+        }
+    }
+    Ok(CanonicalMtp { widths, has_down_t })
+}
+
+fn is_mtp_compacted_tensor(name: &str, layer_count: usize) -> bool {
+    (0..layer_count).any(|layer| {
+        mtp_mlp_names(layer)
+            .iter()
+            .any(|candidate| candidate == name)
+    })
+}
+
+fn compact_rows(values: &[f32], selected: &[usize], source_rows: usize, cols: usize) -> Vec<f32> {
+    debug_assert_eq!(values.len(), source_rows * cols);
+    let mut output = Vec::with_capacity(selected.len() * cols);
+    for &row in selected {
+        output.extend_from_slice(&values[row * cols..(row + 1) * cols]);
+    }
+    output
+}
+
+fn compact_down_columns(
+    values: &[f32],
+    rows: usize,
+    source_cols: usize,
+    selected: &[usize],
+) -> Vec<f32> {
+    debug_assert_eq!(values.len(), rows * source_cols);
+    let mut output = Vec::with_capacity(rows * selected.len());
+    for row in 0..rows {
+        for &column in selected {
+            output.push(values[row * source_cols + column]);
+        }
+    }
+    output
+}
+
+fn transpose(values: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    debug_assert_eq!(values.len(), rows * cols);
+    let mut output = Vec::with_capacity(values.len());
+    for column in 0..cols {
+        for row in 0..rows {
+            output.push(values[row * cols + column]);
+        }
+    }
+    output
+}
+
+// MTP stays one physical dense triple per layer.  A draft has no task mask,
+// and tube tensors would both slow it down and disqualify the fast speculative
+// GPU graph.  The plan's widths remain in provenance for reproducibility.
+fn append_compacted_mtp_layer(
+    model: &CmfModel,
+    layer: usize,
+    plan: &LayerPlan,
+    source_width: usize,
+    has_down_t: bool,
+    hidden: usize,
+    tensors: &mut Vec<TensorSpec>,
+) -> anyhow::Result<()> {
+    let [gate_name, up_name, down_name, down_t_name] = mtp_mlp_names(layer);
+    let gate = dequant(model, &gate_name)?;
+    let up = dequant(model, &up_name)?;
+    let down = dequant(model, &down_name)?;
+    let gate_q =
+        quant_of(tensor(model, &gate_name)?.dtype).context("unsupported MTP gate dtype")?;
+    let up_q = quant_of(tensor(model, &up_name)?.dtype).context("unsupported MTP up dtype")?;
+    let down_q =
+        quant_of(tensor(model, &down_name)?.dtype).context("unsupported MTP down dtype")?;
+    let width = plan.order.len();
+    let gate = compact_rows(&gate, &plan.order, source_width, hidden);
+    let up = compact_rows(&up, &plan.order, source_width, hidden);
+    let down = compact_down_columns(&down, hidden, source_width, &plan.order);
+    let down_q = if width % 32 == 0 {
+        down_q
+    } else {
+        Quant::Q8_2f
+    };
+    for (name, values, rows, cols, quant) in [
+        (&gate_name, &gate, width, hidden, gate_q),
+        (&up_name, &up, width, hidden, up_q),
+        (&down_name, &down, hidden, width, down_q),
+    ] {
+        let (dtype, data) = quantize_2d(quant, values, rows, cols);
+        tensors.push(TensorSpec {
+            name: name.to_string(),
+            dtype,
+            shape: vec![rows, cols],
+            data,
+        });
+    }
+    if has_down_t {
+        // Rebuild instead of slicing the old cached transpose.  This keeps it
+        // mathematically coherent with a permutation as well as a subset.
+        let t_q = quant_of(tensor(model, &down_t_name)?.dtype)
+            .context("unsupported MTP down_proj.t dtype")?;
+        let down_t = transpose(&down, hidden, width);
+        let (dtype, data) = quantize_2d(t_q, &down_t, width, hidden);
+        tensors.push(TensorSpec {
+            name: down_t_name,
+            dtype,
+            shape: vec![width, hidden],
+            data,
+        });
+    }
+    Ok(())
+}
+
+fn cmd_mtp_only_bake(
+    model: &Arc<CmfModel>,
+    plan_document: &Value,
+    mtp: &MtpPlan,
+    output: &str,
+) -> anyhow::Result<()> {
+    let arch = model.arch().clone();
+    let canonical = if mtp.mode == MtpMode::Compact {
+        if !mtp_payload_present(model) {
+            bail!("plan requests MTP compact, but source carries no model.mtp tensors");
+        }
+        let canonical = validate_canonical_dense_mtp(model, &arch)?;
+        if mtp.layers.len() != canonical.widths.len() {
+            bail!(
+                "MTP compact plan has {} layers, source header declares {}",
+                mtp.layers.len(),
+                canonical.widths.len()
+            );
+        }
+        for (layer, (plan, &width)) in mtp.layers.iter().zip(&canonical.widths).enumerate() {
+            validate_layer_plan(plan, width, &format!("plan.mtp.layers[{layer}]"))?;
+        }
+        Some(canonical)
+    } else {
+        None
+    };
+
+    let layer_count = canonical.as_ref().map_or(0, |item| item.widths.len());
+    let mut tensors = Vec::with_capacity(model.tensors.len() + layer_count * 4);
+    for entry in &model.tensors {
+        let omit = match mtp.mode {
+            MtpMode::Preserve => false,
+            MtpMode::Drop => entry.name.starts_with("model.mtp."),
+            MtpMode::Compact => is_mtp_compacted_tensor(&entry.name, layer_count),
+        };
+        if !omit {
+            tensors.push(TensorSpec {
+                name: entry.name.clone(),
+                dtype: entry.dtype,
+                shape: entry.shape.clone(),
+                data: model.tensor_bytes(&entry.name)?.to_vec(),
+            });
+        }
+    }
+    if let Some(canonical) = &canonical {
+        for (layer, plan) in mtp.layers.iter().enumerate() {
+            append_compacted_mtp_layer(
+                model,
+                layer,
+                plan,
+                canonical.widths[layer],
+                canonical.has_down_t[layer],
+                arch.hidden_size,
+                &mut tensors,
+            )?;
+        }
+    }
+
+    let mut header = model.header.clone();
+    match mtp.mode {
+        MtpMode::Preserve => {}
+        MtpMode::Drop => header.arch.mtp = None,
+        MtpMode::Compact => {
+            let config = header
+                .arch
+                .mtp
+                .as_mut()
+                .context("validated MTP source lost header.arch.mtp")?;
+            config.ffn_intermediate_sizes =
+                Some(mtp.layers.iter().map(|plan| plan.order.len()).collect());
+        }
+    }
+    let mut provenance = header.provenance.take().unwrap_or_else(|| json!({}));
+    let mut tubes = provenance
+        .get("tubes")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if !tubes.is_object() {
+        tubes = json!({});
+    }
+    tubes["mtp"] = match mtp.mode {
+        MtpMode::Preserve => json!({"mode": mtp.mode.as_str(), "rewritten": false}),
+        MtpMode::Drop => json!({"plan_version": 2, "mode": mtp.mode.as_str(), "rewritten": true}),
+        MtpMode::Compact => {
+            let source = canonical.as_ref().context("missing validated MTP")?;
+            json!({
+                "plan_version": 2,
+                "mode": mtp.mode.as_str(),
+                "layout": "canonical-dense-mtp-ffn-v1",
+                "source_widths": source.widths,
+                "post_widths": mtp.layers.iter().map(|plan| plan.order.len()).collect::<Vec<_>>(),
+                "logical_segments": mtp.layers.iter().map(|plan| plan.widths.clone()).collect::<Vec<_>>(),
+                "physical_segments_per_layer": 1,
+                "down_proj_t_rebuilt": source.has_down_t,
+                "non_ffn_tensors": "copied-bytewise",
+            })
+        }
+    };
+    if let Some(selection) = plan_document.get("selection") {
+        tubes["mtp"]["selection"] = selection.clone();
+    }
+    provenance["tubes"] = tubes;
+    header.provenance = Some(provenance);
+    CmfModel::write(
+        output,
+        &header,
+        &tensors,
+        (!model.masks.masks.is_empty()).then_some(&model.masks),
+        model.vocab.as_deref(),
+    )?;
+    match mtp.mode {
+        MtpMode::Preserve => println!("MTP: copied bytewise"),
+        MtpMode::Drop => {
+            println!("MTP: explicitly dropped model.mtp tensors and header declaration")
+        }
+        MtpMode::Compact => println!(
+            "MTP: compacted dense draft widths {:?} -> {:?}; kept unsplit for speculative GPU graphs",
+            canonical.as_ref().expect("validated MTP").widths,
+            mtp.layers
+                .iter()
+                .map(|plan| plan.order.len())
+                .collect::<Vec<_>>()
+        ),
+    }
+    Ok(())
 }
 
 pub fn cmd_tube_bake(model_path: &str, plan_path: &str, output: &str) -> anyhow::Result<()> {
@@ -57,84 +631,48 @@ pub fn cmd_tube_bake(model_path: &str, plan_path: &str, output: &str) -> anyhow:
     let plan: Value = serde_json::from_str(
         &std::fs::read_to_string(plan_path).with_context(|| format!("reading {plan_path}"))?,
     )?;
+    let mtp = parse_mtp_plan(&plan)?;
+    if trunk_is_preserved(&plan, &mtp)? {
+        return cmd_mtp_only_bake(&model, &plan, &mtp, output);
+    }
+    let canonical_mtp = if mtp.mode == MtpMode::Compact {
+        if !mtp_payload_present(&model) {
+            bail!("plan requests MTP compact, but source carries no model.mtp tensors");
+        }
+        let canonical = validate_canonical_dense_mtp(&model, &arch)?;
+        if mtp.layers.len() != canonical.widths.len() {
+            bail!(
+                "MTP compact plan has {} layers, source header declares {}",
+                mtp.layers.len(),
+                canonical.widths.len()
+            );
+        }
+        for (layer, (item, &width)) in mtp.layers.iter().zip(&canonical.widths).enumerate() {
+            validate_layer_plan(item, width, &format!("plan.mtp.layers[{layer}]"))?;
+        }
+        Some(canonical)
+    } else {
+        None
+    };
     let tasks: Vec<String> = plan["tasks"]
         .as_array()
         .context("plan.tasks")?
         .iter()
-        .map(|v| v.as_str().unwrap_or_default().to_string())
-        .collect();
-    let layers: Vec<LayerPlan> = plan["layers"]
-        .as_array()
-        .context("plan.layers")?
-        .iter()
-        .map(|l| LayerPlan {
-            order: l["order"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_u64().unwrap() as usize)
-                .collect(),
-            widths: l["widths"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_u64().unwrap() as usize)
-                .collect(),
+        .enumerate()
+        .map(|(index, value)| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .with_context(|| format!("plan.tasks[{index}] must be a string"))
         })
-        .collect();
+        .collect::<anyhow::Result<_>>()?;
+    let layers = parse_layer_plans(&plan["layers"], "plan.layers")?;
     if layers.len() != nl {
         bail!("plan has {} layers, model has {nl}", layers.len());
     }
-    // `active` is either [task][segment] — one segment table for the
-    // whole stack — or [task][layer][segment], which lets a tube open in
-    // the layers where the task needs it and stay shut elsewhere.
-    let raw_active = plan["active"].as_array().context("plan.active")?;
-    if raw_active.len() != tasks.len() {
-        bail!(
-            "plan.active has {} rows, {} tasks",
-            raw_active.len(),
-            tasks.len()
-        );
-    }
-    let per_layer_active = raw_active
-        .first()
-        .and_then(|r| r.as_array())
-        .and_then(|r| r.first())
-        .is_some_and(|v| v.is_array());
-    let active: Vec<Vec<Vec<bool>>> = raw_active
-        .iter()
-        .map(|t| {
-            let rows = t.as_array().unwrap();
-            if per_layer_active {
-                rows.iter()
-                    .map(|l| {
-                        l.as_array()
-                            .unwrap()
-                            .iter()
-                            .map(|v| v.as_bool().unwrap_or(false))
-                            .collect()
-                    })
-                    .collect()
-            } else {
-                let one: Vec<bool> = rows.iter().map(|v| v.as_bool().unwrap_or(false)).collect();
-                vec![one; nl]
-            }
-        })
-        .collect();
+    let active = parse_active(&plan["active"], tasks.len(), nl)?;
     for (li, l) in layers.iter().enumerate() {
-        let sum: usize = l.widths.iter().sum();
-        if sum != l.order.len() {
-            bail!(
-                "layer {li}: widths sum {sum} != order len {}",
-                l.order.len()
-            );
-        }
-        if l.widths.is_empty() || l.widths[0] == 0 {
-            bail!("layer {li}: the core segment must be non-empty");
-        }
-        if l.order.iter().any(|&n| n >= inter) {
-            bail!("layer {li}: neuron index out of range (inter {inter})");
-        }
+        validate_layer_plan(l, inter, &format!("plan.layers[{li}]"))?;
     }
     let nseg = layers.iter().map(|l| l.widths.len()).max().unwrap_or(1);
 
@@ -150,8 +688,8 @@ pub fn cmd_tube_bake(model_path: &str, plan_path: &str, output: &str) -> anyhow:
         Ok(out)
     };
 
-    // Only the stack's own FFN is rebuilt — an MTP block carries its
-    // own `model.mtp.layers.*.mlp.*` triple and must copy through.
+    // The stack FFNs are rebuilt below.  MTP is copied bytewise unless an
+    // explicit v2 compact/drop mode says otherwise.
     let is_stack_ffn = |name: &str| -> bool {
         name.strip_prefix("model.layers.")
             .and_then(|r| r.split_once('.'))
@@ -162,9 +700,15 @@ pub fn cmd_tube_bake(model_path: &str, plan_path: &str, output: &str) -> anyhow:
                         || rest.starts_with("mlp.down_proj."))
             })
     };
+    let compact_mtp_layers = canonical_mtp.as_ref().map_or(0, |item| item.widths.len());
     let mut tensors: Vec<TensorSpec> = Vec::new();
     for t in &model.tensors {
-        if is_stack_ffn(&t.name) {
+        let omit_mtp = match mtp.mode {
+            MtpMode::Preserve => false,
+            MtpMode::Drop => t.name.starts_with("model.mtp."),
+            MtpMode::Compact => is_mtp_compacted_tensor(&t.name, compact_mtp_layers),
+        };
+        if is_stack_ffn(&t.name) || omit_mtp {
             continue;
         }
         tensors.push(TensorSpec {
@@ -257,8 +801,35 @@ pub fn cmd_tube_bake(model_path: &str, plan_path: &str, output: &str) -> anyhow:
         }
     }
 
+    if let Some(canonical) = &canonical_mtp {
+        for (layer, plan) in mtp.layers.iter().enumerate() {
+            append_compacted_mtp_layer(
+                &model,
+                layer,
+                plan,
+                canonical.widths[layer],
+                canonical.has_down_t[layer],
+                hidden,
+                &mut tensors,
+            )?;
+        }
+    }
+
     let mut header = model.header.clone();
     header.arch.intermediate_size = max_width;
+    match mtp.mode {
+        MtpMode::Preserve => {}
+        MtpMode::Drop => header.arch.mtp = None,
+        MtpMode::Compact => {
+            let config = header
+                .arch
+                .mtp
+                .as_mut()
+                .context("validated MTP source lost header.arch.mtp")?;
+            config.ffn_intermediate_sizes =
+                Some(mtp.layers.iter().map(|plan| plan.order.len()).collect());
+        }
+    }
     // Task masks over the NEW index space: the core plus this task's
     // tubes, every neuron of an active segment set.
     let mut catalog = MaskCatalog::empty();
@@ -312,7 +883,7 @@ pub fn cmd_tube_bake(model_path: &str, plan_path: &str, output: &str) -> anyhow:
         .provenance
         .take()
         .unwrap_or_else(|| serde_json::json!({}));
-    prov["tubes"] = serde_json::json!({
+    let mut tube_provenance = serde_json::json!({
         "recipe": "task-tube defrag (permutation + segment cut)",
         "pre_intermediate": inter,
         "post_intermediate_max": max_width,
@@ -321,6 +892,28 @@ pub fn cmd_tube_bake(model_path: &str, plan_path: &str, output: &str) -> anyhow:
         "tasks": tasks,
         "active": active,
     });
+    tube_provenance["mtp"] = match mtp.mode {
+        MtpMode::Preserve => json!({"mode": mtp.mode.as_str(), "rewritten": false}),
+        MtpMode::Drop => json!({"plan_version": 2, "mode": mtp.mode.as_str(), "rewritten": true}),
+        MtpMode::Compact => {
+            let source = canonical_mtp.as_ref().context("missing validated MTP")?;
+            json!({
+                "plan_version": 2,
+                "mode": mtp.mode.as_str(),
+                "layout": "canonical-dense-mtp-ffn-v1",
+                "source_widths": source.widths,
+                "post_widths": mtp.layers.iter().map(|item| item.order.len()).collect::<Vec<_>>(),
+                "logical_segments": mtp.layers.iter().map(|item| item.widths.clone()).collect::<Vec<_>>(),
+                "physical_segments_per_layer": 1,
+                "down_proj_t_rebuilt": source.has_down_t,
+                "non_ffn_tensors": "copied-bytewise",
+            })
+        }
+    };
+    if let Some(selection) = plan.get("selection") {
+        tube_provenance["mtp"]["selection"] = selection.clone();
+    }
+    prov["tubes"] = tube_provenance;
     header.provenance = Some(prov);
     CmfModel::write(
         output,
@@ -357,7 +950,72 @@ pub fn cmd_tube_bake(model_path: &str, plan_path: &str, output: &str) -> anyhow:
             w as f64 / (nl * inter) as f64 * 100.0
         );
     }
+    match mtp.mode {
+        MtpMode::Preserve => {}
+        MtpMode::Drop => {
+            println!("MTP: explicitly dropped model.mtp tensors and header declaration")
+        }
+        MtpMode::Compact => println!(
+            "MTP: compacted dense draft widths {:?} -> {:?}; kept unsplit for speculative GPU graphs",
+            canonical_mtp.as_ref().expect("validated MTP").widths,
+            mtp.layers
+                .iter()
+                .map(|item| item.order.len())
+                .collect::<Vec<_>>()
+        ),
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod mtp_plan_tests {
+    use super::*;
+
+    #[test]
+    fn mtp_defaults_to_preserve() {
+        let plan = serde_json::json!({"tasks": [], "layers": [], "active": []});
+        let mtp = parse_mtp_plan(&plan).unwrap();
+        assert_eq!(mtp.mode, MtpMode::Preserve);
+        assert!(mtp.layers.is_empty());
+    }
+
+    #[test]
+    fn mtp_compact_requires_independent_layer_plan() {
+        let error = parse_mtp_plan(&serde_json::json!({"mtp": {"mode": "compact"}}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("plan.mtp.layers"));
+    }
+
+    #[test]
+    fn mtp_only_compaction_preserves_trunk() {
+        let document = serde_json::json!({
+            "mtp": {
+                "mode": "compact",
+                "layers": [{"order": [0, 1], "widths": [2]}]
+            }
+        });
+        let mtp = parse_mtp_plan(&document).unwrap();
+        assert!(trunk_is_preserved(&document, &mtp).unwrap());
+    }
+
+    #[test]
+    fn plan_rejects_duplicate_channels() {
+        let plan = LayerPlan {
+            order: vec![0, 2, 2],
+            widths: vec![3],
+        };
+        assert!(validate_layer_plan(&plan, 4, "mtp").is_err());
+    }
+
+    #[test]
+    fn selected_down_and_transpose_are_coherent() {
+        // Original down is [[0, 1, 2], [3, 4, 5]]; selected order is [2, 0].
+        let original = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let compact = compact_down_columns(&original, 2, 3, &[2, 0]);
+        assert_eq!(compact, vec![2.0, 0.0, 5.0, 3.0]);
+        assert_eq!(transpose(&compact, 2, 2), vec![2.0, 5.0, 0.0, 3.0]);
+    }
 }
 
 /// Store each dense layer's `down_proj` a second time, transposed.
