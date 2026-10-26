@@ -457,6 +457,8 @@ impl Pool {
     /// is the single writer of the descriptor, `remaining` and every
     /// `ticket`; workers without a ticket never touch any of them.
     fn dispatch(&self, f: &(dyn Fn(usize, usize) + Sync), nw: usize) {
+        let _tot = crate::cpuprof::time(crate::cpuprof::Slot::DispTotal);
+        let mut _setup = crate::cpuprof::time(crate::cpuprof::Slot::DispSetup);
         let inner = &*self.inner;
         let n = nw + 1;
         let ptr: *const (dyn Fn(usize, usize) + Sync) = f;
@@ -493,14 +495,18 @@ impl Pool {
                 t.unpark();
             }
         }
+        drop(_setup);
 
         // The caller's share — the barrier costs nothing while there is
         // real work to do.
+        let _work = crate::cpuprof::time(crate::cpuprof::Slot::DispWork);
         f(nw, n);
+        drop(_work);
 
-        // Wait for the stragglers (bounded by one worker's chunk). When
-        // the pool has more threads than CPUs, a ticket holder may be
+        // Wait for the stragglers (bounded by one worker's chunk). When the
+        // pool has more threads than CPUs, a ticket holder may be
         // waiting for THIS core: yield it early instead of spinning.
+        let _wait = crate::cpuprof::time(crate::cpuprof::Slot::DispWait);
         let spin_limit = if inner.oversubscribed { 64 } else { 10_000 };
         let mut spins = 0usize;
         while inner.remaining.0.load(Ordering::Acquire) != 0 {
@@ -511,6 +517,8 @@ impl Pool {
                 std::thread::yield_now();
             }
         }
+        drop(_wait);
+        drop(_tot);
     }
 
     /// Run `f(row_start, row_end)` over `0..rows`, self-balancing.

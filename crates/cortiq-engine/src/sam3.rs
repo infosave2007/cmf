@@ -9,6 +9,7 @@
 //! prompts are not part of the image path. Batch size 1; `pixels` is a
 //! preprocessed [3,1008,1008] tensor.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -112,6 +113,101 @@ pub(crate) enum Mask<'a> {
     Head(&'a [f32]),
 }
 
+/// Attention sub-timers (ns), accumulated inside `run_attn` (qkv/proj
+/// GEMMs vs the softmax core) and printed by the session timer's Drop.
+static ATT_PROJ_NS: AtomicU64 = AtomicU64::new(0);
+static ATT_CORE_NS: AtomicU64 = AtomicU64::new(0);
+
+/// `SAM3_STAGES=1` — in-code wall-clock counters: `lap(name)` closes the
+/// current segment under `name` (laps with the same name merge), `add`
+/// accumulates inside loops. On drop the merged totals print as one
+/// `[sam3-prof]` block on stderr. Off by default (one env read per run).
+struct StageTimer {
+    on: bool,
+    main: bool,
+    t0: std::time::Instant,
+    acc: Vec<(&'static str, f64)>,
+}
+
+impl StageTimer {
+    fn new() -> Self {
+        Self {
+            on: std::env::var("SAM3_STAGES").is_ok_and(|v| v != "0"),
+            main: false,
+            t0: std::time::Instant::now(),
+            acc: Vec::new(),
+        }
+    }
+
+    /// The forward-level timer: resets the per-run attention statics so
+    /// multi-frame (video) runs report per-frame numbers.
+    fn new_session() -> Self {
+        ATT_PROJ_NS.store(0, Ordering::Relaxed);
+        ATT_CORE_NS.store(0, Ordering::Relaxed);
+        Self {
+            on: std::env::var("SAM3_STAGES").is_ok_and(|v| v != "0"),
+            main: true,
+            t0: std::time::Instant::now(),
+            acc: Vec::new(),
+        }
+    }
+
+    fn lap(&mut self, name: &'static str) {
+        if self.on {
+            self.acc.push((name, self.t0.elapsed().as_secs_f64() * 1e3));
+        }
+        self.t0 = std::time::Instant::now();
+    }
+}
+
+impl Drop for StageTimer {
+    fn drop(&mut self) {
+        if !self.on || self.acc.is_empty() {
+            return;
+        }
+        let mut merged: Vec<(&'static str, f64)> = Vec::new();
+        for (n, ms) in &self.acc {
+            match merged.iter_mut().find(|(m, _)| m == n) {
+                Some((_, t)) => *t += *ms,
+                None => merged.push((*n, *ms)),
+            }
+        }
+        let total: f64 = merged.iter().map(|(_, t)| t).sum();
+        for (n, ms) in &merged {
+            eprintln!("[sam3-prof] {n:>14} {ms:>10.1} ms  ({:.1}%)", ms / total * 100.0);
+        }
+        eprintln!("[sam3-prof] {:>14} {total:>10.1} ms", "TOTAL");
+        if self.main {
+            eprintln!(
+                "[sam3-prof] {:>14} {:>10.1} ms",
+                "attn_proj",
+                ATT_PROJ_NS.load(Ordering::Relaxed) as f64 / 1e6
+            );
+            eprintln!(
+                "[sam3-prof] {:>14} {:>10.1} ms",
+                "attn_core",
+                ATT_CORE_NS.load(Ordering::Relaxed) as f64 / 1e6
+            );
+            eprintln!(
+                "[sam3-prof] {:>14} hit/gate={}/{}",
+                "matmat_gpu",
+                crate::qtensor::MATMAT_GPU_HIT.load(Ordering::Relaxed),
+                crate::qtensor::MATMAT_GATE.load(Ordering::Relaxed)
+            );
+            #[cfg(feature = "gpu")]
+            eprintln!(
+                "[sam3-prof] {:>14} noctx/shape/entry/bounds/disp={}/{}/{}/{}/{}",
+                "m2f_refuse",
+                crate::gpu_wgpu::M2F_NO_CTX.load(Ordering::Relaxed),
+                crate::gpu_wgpu::M2F_SHAPE.load(Ordering::Relaxed),
+                crate::gpu_wgpu::M2F_ENTRY.load(Ordering::Relaxed),
+                crate::gpu_wgpu::M2F_BOUNDS.load(Ordering::Relaxed),
+                crate::gpu_wgpu::M2F_DISPATCH.load(Ordering::Relaxed),
+            );
+        }
+    }
+}
+
 pub struct Sam3 {
     model: Arc<CmfModel>,
     pool: Option<Arc<Pool>>,
@@ -205,6 +301,7 @@ impl Sam3 {
     /// `trunk_b{l}.f32`) for reference bisection; `SAM3_TEXT_DEBUG=1`
     /// prints per-stage finiteness stats of the text tower.
     pub fn forward(&mut self, pixels: &[f32], ids: &[u32], attn: &[u8]) -> Result<Sam3Out> {
+        let _prof = crate::cpuprof::spans::dump_on_drop("image forward");
         if pixels.len() != 3 * PIX * PIX {
             return Err(anyhow!("pixels {} != 3*{}*{}", pixels.len(), PIX, PIX));
         }
@@ -218,7 +315,11 @@ impl Sam3 {
                 .map_or(true, |o| o.split(',').any(|s| s.trim() == k))
         };
         let pool = self.pool.as_deref();
+        let mut stg = StageTimer::new_session();
+        let _p = crate::cpuprof::spans::span("text");
         let (text_embeds, text_feats) = self.text(ids, attn, pool)?;
+        drop(_p);
+        stg.lap("text");
         let blank = |te: Vec<f32>, tf: Vec<f32>| Sam3Out {
             text_embeds: te,
             text_feats: tf,
@@ -234,16 +335,25 @@ impl Sam3 {
         if !want("trunk") {
             return Ok(blank(text_embeds, text_feats));
         }
-        let trunk_feats = self.trunk(pixels, pool)?;
+        let trunk_feats = {
+            let _p = crate::cpuprof::spans::span("trunk");
+            self.trunk(pixels, pool)?
+        };
+        stg.lap("trunk");
         if !want("fpn") {
             let mut o = blank(text_embeds, text_feats);
             o.trunk_feats = trunk_feats;
             return Ok(o);
         }
         let fpn = self.fpn(&trunk_feats, pool)?;
+        stg.lap("fpn");
         let pos = sine_pos(GRID, GRID, FD / 2); // level-2 (72) encoding, rows
         let vision = chw_to_rows(&fpn[2], GRID, GRID);
-        let enc_hidden = self.detr_encoder(&vision, &pos, &text_feats, attn, pool)?;
+        let enc_hidden = {
+            let _p = crate::cpuprof::spans::span("detr_enc");
+            self.detr_encoder(&vision, &pos, &text_feats, attn, pool)?
+        };
+        stg.lap("enc");
         if !want("dec") {
             let mut o = blank(text_embeds, text_feats);
             o.trunk_feats = trunk_feats;
@@ -251,18 +361,25 @@ impl Sam3 {
             o.enc_hidden = enc_hidden;
             return Ok(o);
         }
-        let (dec_hidden, final_refs, presence_logit) =
-            self.detr_decoder(&enc_hidden, &pos, &text_feats, attn, pool)?;
+        let (dec_hidden, final_refs, presence_logit) = {
+            let _p = crate::cpuprof::spans::span("detr_dec");
+            self.detr_decoder(&enc_hidden, &pos, &text_feats, attn, pool)?
+        };
+        stg.lap("dec");
         // Dot-product scoring (det.scoring.*): the FINAL layer's DETR
         // queries against the mean-pooled prompt features. Logits, not
         // probabilities — the caller multiplies both sigmoids, as HF's
         // post-processor does (`all_pred_logits[-1]`).
-        let pred_logits = self.score(
-            &text_feats,
-            attn,
-            &dec_hidden[(NL - 1) * NQ * FD..],
-            pool,
-        )?;
+        let pred_logits = {
+            let _p = crate::cpuprof::spans::span("score");
+            self.score(
+                &text_feats,
+                attn,
+                &dec_hidden[(NL - 1) * NQ * FD..],
+                pool,
+            )?
+        };
+        stg.lap("score");
         if !want("masks") {
             let mut o = blank(text_embeds, text_feats);
             o.trunk_feats = trunk_feats;
@@ -275,14 +392,18 @@ impl Sam3 {
             return Ok(o);
         }
         let pred_boxes = xyxy(&final_refs);
-        let pred_masks = self.mask_decoder(
-            &dec_hidden[(NL - 1) * NQ * FD..],
-            &enc_hidden,
-            &fpn,
-            &text_feats,
-            attn,
-            pool,
-        )?;
+        let pred_masks = {
+            let _p = crate::cpuprof::spans::span("mask_dec");
+            self.mask_decoder(
+                &dec_hidden[(NL - 1) * NQ * FD..],
+                &enc_hidden,
+                &fpn,
+                &text_feats,
+                attn,
+                pool,
+            )?
+        };
+        stg.lap("masks");
         Ok(Sam3Out {
             text_embeds,
             text_feats,
@@ -392,6 +513,7 @@ impl Sam3 {
     // ── trunk (ViT, pre-norm layers, windowed/global axial RoPE) ────
 
     fn trunk(&self, pixels: &[f32], pool: Option<&Pool>) -> Result<Vec<f32>> {
+        let _patch = crate::cpuprof::spans::span("trunk.patch");
         let m = &self.model;
         let np = GRID * GRID;
         let kc = 3 * PATCH * PATCH;
@@ -435,6 +557,7 @@ impl Sam3 {
             }
         };
         match pool { Some(p) => p.run_rows(TD, &gemm), None => gemm(0, TD) };
+        drop(_patch);
         if let Some(d) = &dump { dump_f32(d, "trunk_patch", &x); }
         // position embeddings [1,577,1024]: drop Meta's cls row, tile 24x24 -> 72x72
         let pos = load_vec(m, "trunk.pos_embed")?;
@@ -449,27 +572,37 @@ impl Sam3 {
         layer_norm_rows(&mut x, &lw, &lb, T_EPS);
         if let Some(d) = &dump { dump_f32(d, "trunk_pre", &x); }
 
+        let mut tst = StageTimer::new();
         for l in 0..TL {
             let b = format!("trunk.blocks.{l}.");
+            let _attn = crate::cpuprof::spans::span("trunk.attn");
             let (nw, nb) = (load_vec(m, &format!("{b}norm1.weight"))?, load_vec(m, &format!("{b}norm1.bias"))?);
             let mut h = x.clone();
             layer_norm_rows(&mut h, &nw, &nb, T_EPS);
             let dbg0 = dump.is_some() && l == 0;
             if let (Some(d), true) = (&dump, dbg0) { dump_f32(d, "b0_ln1", &h); }
+            drop(_attn);
             let qkv = lin(m, &format!("{b}attn.qkv.weight"))?;
             let qb = load_vec(m, &format!("{b}attn.qkv.bias"))?;
             let proj = lin(m, &format!("{b}attn.proj.weight"))?;
             let pb = load_vec(m, &format!("{b}attn.proj.bias"))?;
             let fc = load_vec(m, &format!("{b}attn.freqs_cis"))?;
+            tst.lap("trk_attn_ln");
             let attn_out = if GLOBAL.contains(&l) {
                 let mut o = vec![0f32; np * TD];
+                let _pa = crate::cpuprof::spans::span("trunk.attn.run");
                 run_attn(&qkv, &qb, &proj, &pb, &h, &h, &h, np, np, TD, TH, Some(&fc), Mask::None, pool, &mut o);
+                drop(_pa);
                 o
             } else {
-                self.vit_windows(&h, &qkv, &qb, &proj, &pb, &fc, pool)?
+                let _pa = crate::cpuprof::spans::span("trunk.attn.run");
+                let o = self.vit_windows(&h, &qkv, &qb, &proj, &pb, &fc, pool)?;
+                drop(_pa);
+                o
             };
             if let (Some(d), true) = (&dump, dbg0) { dump_f32(d, "b0_attn", &attn_out); }
             for (a, c) in x.iter_mut().zip(&attn_out) { *a += *c; }
+            tst.lap("trk_attn_run");
             if let (Some(d), true) = (&dump, dbg0) { dump_f32(d, "b0_x2", &x); }
             // pre-norm MLP branch: norm a CLONE — x keeps the residual
             // (norming x in place made the block add mlp(ln2(x)) instead
@@ -485,12 +618,13 @@ impl Sam3 {
             let mut ff = vec![0f32; np * TI];
             f1.matmat(&h, np, &mut ff, pool);
             add_bias(&mut ff, TI, &f1b);
-            ff.iter_mut().for_each(|v| *v = gelu_erf(*v));
+            gelu_slice(&mut ff);
             let mut fo = vec![0f32; np * TD];
             f2.matmat(&ff, np, &mut fo, pool);
             add_bias(&mut fo, TD, &f2b);
             if let (Some(d), true) = (&dump, dbg0) { dump_f32(d, "b0_mlp", &fo); }
             for (a, c) in x.iter_mut().zip(&fo) { *a += *c; }
+            tst.lap("trk_mlp");
             if let (Some(d), true) = (&dump, dlayers.as_ref().map_or(true, |ls| ls.contains(&l))) {
                 dump_f32(d, &format!("trunk_b{l}"), &x);
             }
@@ -561,6 +695,7 @@ impl Sam3 {
         let mut xs = vision.to_vec();
         let mut km = vec![0f32; SS];
         for (k, &v) in am.iter().enumerate() { km[k] = if v == 0 { NEG } else { 0.0 }; }
+        let mut tse = StageTimer::new();
         for l in 0..NL {
             let b = format!("det.transformer.encoder.layers.{l}.");
             // pre-norm self attention: q=k=normed+pos, v=normed
@@ -579,6 +714,7 @@ impl Sam3 {
             let mut ao = vec![0f32; n * FD];
             run_attn(&qkv, &ib, &op, &ob, &hp, &hp, &h, n, n, FD, FH, None, Mask::None, pool, &mut ao);
             for (a, c) in xs.iter_mut().zip(&ao) { *a += *c; }
+            tse.lap("enc_self_attn");
             // cross attention to the text features (query has no pos add)
             let (nw, nb) = (load_vec(m, &format!("{b}norm2.weight"))?, load_vec(m, &format!("{b}norm2.bias"))?);
             let mut h = xs.clone();
@@ -590,6 +726,7 @@ impl Sam3 {
             let mut ao = vec![0f32; n * FD];
             run_attn(&qkv, &ib, &op, &ob, &h, text, text, n, SS, FD, FH, None, Mask::Key(&km), pool, &mut ao);
             for (a, c) in xs.iter_mut().zip(&ao) { *a += *c; }
+            tse.lap("enc_cross_text");
             // relu MLP
             let (nw, nb) = (load_vec(m, &format!("{b}norm3.weight"))?, load_vec(m, &format!("{b}norm3.bias"))?);
             let mut h = xs.clone();
@@ -606,6 +743,7 @@ impl Sam3 {
             l2.matmat(&mid, n, &mut fo, pool);
             add_bias(&mut fo, FD, &l2b);
             for (a, c) in xs.iter_mut().zip(&fo) { *a += *c; }
+            tse.lap("enc_ffn");
         }
         Ok(xs)
     }
@@ -641,6 +779,7 @@ impl Sam3 {
             .collect();
         let mut km = vec![0f32; SS];
         for (k, &v) in am.iter().enumerate() { km[k] = if v == 0 { NEG } else { 0.0 }; }
+        let mut tsd = StageTimer::new();
         // heads (all loaded once, biases included)
         let rh0 = lin(m, &format!("{db}ref_point_head.layers.0.weight"))?;
         let rh0b = load_vec(m, &format!("{db}ref_point_head.layers.0.bias"))?;
@@ -680,6 +819,7 @@ impl Sam3 {
             let mut ao = vec![0f32; (NQ + 1) * FD];
             run_attn(&qkv, &ib, &op, &ob, &hqp, &hqp, &hidden, NQ + 1, NQ + 1, FD, FH, None, Mask::None, pool, &mut ao);
             for (a, c) in hidden.iter_mut().zip(&ao) { *a += *c; }
+            tsd.lap("dec_self_attn");
             let (nw, nb) = (load_vec(m, &format!("{b}norm1.weight"))?, load_vec(m, &format!("{b}norm1.bias"))?);
             layer_norm_rows(&mut hidden, &nw, &nb, D_EPS);
             // text cross attention
@@ -691,6 +831,7 @@ impl Sam3 {
             let mut ao = vec![0f32; (NQ + 1) * FD];
             run_attn(&qkv, &ib, &op, &ob, &hqp, text, text, NQ + 1, SS, FD, FH, None, Mask::Key(&km), pool, &mut ao);
             for (a, c) in hidden.iter_mut().zip(&ao) { *a += *c; }
+            tsd.lap("dec_cross_text");
             let (nw, nb) = (load_vec(m, &format!("{b}catext_norm.weight"))?, load_vec(m, &format!("{b}catext_norm.bias"))?);
             layer_norm_rows(&mut hidden, &nw, &nb, D_EPS);
             // vision cross attention (keys = enc + pos, values = enc, RPB bias)
@@ -702,6 +843,7 @@ impl Sam3 {
             let mut ao = vec![0f32; (NQ + 1) * FD];
             run_attn(&qkv, &ib, &op, &ob, &hqp, &key, enc, NQ + 1, n, FD, FH, None, Mask::Head(&rpb), pool, &mut ao);
             for (a, c) in hidden.iter_mut().zip(&ao) { *a += *c; }
+            tsd.lap("dec_cross_enc");
             let (nw, nb) = (load_vec(m, &format!("{b}norm2.weight"))?, load_vec(m, &format!("{b}norm2.bias"))?);
             layer_norm_rows(&mut hidden, &nw, &nb, D_EPS);
             // relu MLP (Sam3MLP)
@@ -717,6 +859,7 @@ impl Sam3 {
             l2.matmat(&mid, NQ + 1, &mut fo, pool);
             add_bias(&mut fo, FD, &l2b);
             for (a, c) in hidden.iter_mut().zip(&fo) { *a += *c; }
+            tsd.lap("dec_ffn");
             let (nw, nb) = (load_vec(m, &format!("{b}norm3.weight"))?, load_vec(m, &format!("{b}norm3.bias"))?);
             layer_norm_rows(&mut hidden, &nw, &nb, D_EPS);
             // box refine + intermediate (query rows only, output_layer_norm)
@@ -727,6 +870,7 @@ impl Sam3 {
             for (r, dd) in refs.iter_mut().zip(d.chunks_exact(4)) {
                 for k in 0..4 { r[k] = sigm(inv_sigmoid(r[k]) + dd[k]); }
             }
+            tsd.lap("dec_box_ref");
         }
         let dec = inter.iter().flat_map(|v| v.iter().copied()).collect();
         // Presence logit of the FINAL layer: row 0 (the presence token)
@@ -831,15 +975,18 @@ impl Sam3 {
         let ib = load_vec(m, &format!("{db}cross_attend_prompt.in_proj_bias"))?;
         let op = lin(m, &format!("{db}cross_attend_prompt.out_proj.weight"))?;
         let ob = load_vec(m, &format!("{db}cross_attend_prompt.out_proj.bias"))?;
+        let mut tsm = StageTimer::new();
         let mut e = enc.to_vec();
         let mut ao = vec![0f32; n * FD];
         run_attn(&qkv, &ib, &op, &ob, &h, text, text, n, SS, FD, FH, None, Mask::Key(&km), pool, &mut ao);
         for (a, c) in e.iter_mut().zip(&ao) { *a += *c; }
+        tsm.lap("msk_cross_attn");
         // pixel decoder: encoder states replace level 2 (72), then upsample
         let l72 = rows_to_chw(&e, GRID, GRID);
         let sizes = [(144usize, 144usize), (288, 288)];
         let mut prev = l72;
         for (li, &(sh, sw)) in sizes.iter().enumerate() {
+            let _pp = crate::cpuprof::spans::span("mask.pixdec");
             prev = upsample_nearest(&prev, FD, sh / 2, sh / 2, sh, sw);
             let fw = &fpn[1 - li]; // reversed(fpn[:-1]): 144 then 288
             for (a, b) in prev.iter_mut().zip(fw.iter()) { *a += *b; }
@@ -850,7 +997,9 @@ impl Sam3 {
             let gb = load_vec(m, &format!("{db}pixel_decoder.norms.{li}.bias"))?;
             group_norm(&mut prev, 8, &gw, &gb, 1e-5);
             prev.iter_mut().for_each(|v| *v = v.max(0.0));
+            drop(_pp);
         }
+        tsm.lap("msk_pixel_dec");
         let iw = load_vec(m, &format!("{db}instance_seg_head.weight"))?;
         let ib2 = load_vec(m, &format!("{db}instance_seg_head.bias"))?;
         let inst = conv2d(&iw, &ib2, &prev, FD, MH, MH, 1, 1, 1, 0, pool);
@@ -865,9 +1014,11 @@ impl Sam3 {
             if i < 2 { o.iter_mut().for_each(|v| *v = v.max(0.0)); }
             q = o;
         }
+        tsm.lap("msk_inst_head");
         let hw = MH * MH;
         let mut out = vec![0f32; NQ * hw];
         let ob2 = out.as_mut_ptr() as usize;
+        let _pe = crate::cpuprof::spans::span("mask.einsum");
         let run = |s: usize, e: usize| {
             let o = unsafe { std::slice::from_raw_parts_mut(ob2 as *mut f32, NQ * hw) };
             for qi in s..e {
@@ -882,6 +1033,8 @@ impl Sam3 {
             }
         };
         match pool { Some(p) => p.run_rows(NQ, &run), None => run(0, NQ) }
+        drop(_pe);
+        tsm.lap("msk_einsum");
         Ok(out)
     }
 }
@@ -900,6 +1053,7 @@ pub(crate) fn fpn_levels(
     let hidden = rows_to_chw(trunk, GRID, GRID); // [1024,72,72]
     let scales = [4.0f32, 2.0, 1.0, 0.5];
     let mut levels = Vec::with_capacity(n_levels);
+    let _p = crate::cpuprof::spans::span("fpn.levels");
     for (i, &s) in scales.iter().enumerate().take(n_levels) {
         let (mut ci, mut ch, mut cw) = (TD, GRID, GRID);
         let mut cur = hidden.clone();
@@ -909,7 +1063,7 @@ pub(crate) fn fpn_levels(
                 let b0 = load_vec(m, &format!("{p}.{i}.dconv_2x2_0.bias"))?;
                 cur = convt2x2(&w0, &b0, &cur, ci, ch, cw, pool);
                 (ch, cw, ci) = (ch * 2, cw * 2, b0.len());
-                cur.iter_mut().for_each(|v| *v = gelu_erf(*v));
+                gelu_slice(&mut cur);
                 let w1 = load_vec(m, &format!("{p}.{i}.dconv_2x2_1.weight"))?;
                 let b1 = load_vec(m, &format!("{p}.{i}.dconv_2x2_1.bias"))?;
                 cur = convt2x2(&w1, &b1, &cur, ci, ch, cw, pool);
@@ -1028,17 +1182,25 @@ fn xyxy(boxes: &[[f32; 4]]) -> Vec<f32> {
 }
 
 pub(crate) fn lin(m: &Arc<CmfModel>, name: &str) -> Result<QTensor> {
+    let _p = crate::cpuprof::spans::span("qtensor.wrap");
     QTensor::from_model(m, name).map_err(|e| anyhow!(e))
 }
 
 /// Dequantize a tensor to flat f32 (norms, biases, tables, convs).
 pub(crate) fn load_vec(m: &Arc<CmfModel>, name: &str) -> Result<Vec<f32>> {
+    let _p = crate::cpuprof::spans::span("load.decode");
     let e = m.tensor(name).ok_or_else(|| anyhow!("tensor '{name}' not found"))?;
     if matches!(e.dtype, TensorDtype::U8) { return Err(anyhow!("'{name}' is u8")); }
     let bytes = m.entry_bytes(e);
     let mut dst = vec![0f32; e.n_elems()];
     dequant_tensor(e, bytes, &mut dst).map_err(|er| anyhow!("{name}: {er}"))?;
     Ok(dst)
+}
+
+/// `gelu_erf` over a whole buffer, one `SAM3_PROF` span for the loop.
+pub(crate) fn gelu_slice(v: &mut [f32]) {
+    let _p = crate::cpuprof::spans::span("op.gelu");
+    v.iter_mut().for_each(|x| *x = gelu_erf(*x));
 }
 
 /// Row-major [rows, cols] += bias (broadcast over rows).
@@ -1051,6 +1213,7 @@ pub(crate) fn add_bias(out: &mut [f32], cols: usize, bias: &[f32]) {
 
 /// LayerNorm over rows of `x` (row length = w.len()).
 pub(crate) fn layer_norm_rows(x: &mut [f32], w: &[f32], b: &[f32], eps: f32) {
+    let _p = crate::cpuprof::spans::span("op.layernorm");
     let d = w.len();
     for r in x.chunks_exact_mut(d) {
         let mean = r.iter().sum::<f32>() / d as f32;
@@ -1086,6 +1249,163 @@ fn apply_rope(buf: &mut [f32], n: usize, stride: usize, width: usize, fc: &[f32]
     }
 }
 
+/// RAII bypass of the f16-staged coop kernel for the calling thread —
+/// the attention arm needs the pure-f32 scalar GEMM to stay inside the
+/// parity gate (the coop kernel rounds operands to f16: measured ~1e-3
+/// per-op, which compounds through a 32-layer trunk to rel 0.36).
+struct CoopBypass;
+
+impl CoopBypass {
+    fn new() -> Self {
+        #[cfg(feature = "gpu")]
+        crate::gpu_wgpu::COOP_BYPASS.with(|b| b.set(true));
+        Self
+    }
+}
+
+impl Drop for CoopBypass {
+    fn drop(&mut self) {
+        #[cfg(feature = "gpu")]
+        crate::gpu_wgpu::COOP_BYPASS.with(|b| b.set(false));
+    }
+}
+
+/// GPU arm for `run_attn`'s core (QKᵀ softmax A·V), owner GPU port.
+///
+/// Per head: Q/K/V rows are packed contiguous, QKᵀ and A·V run as f32
+/// `gemm_nt_f32` GEMMs (transient both operands are activations), the
+/// scale/mask/softmax step stays on the CPU in exactly the scalar arm's
+/// order — only the f32 dot-product summation order differs (allowed:
+/// cos >= 0.999 vs the CPU arm). Returns false on ANY refusal — backend
+/// down, `CMF_GPU=0`, inside `cpu_scope`, job under the GEMM floor, a
+/// device decline mid-loop — and leaves `out` untouched, so the caller
+/// falls back to the scalar arm. `CMF_SAM3_GPU=0` disables the arm.
+#[allow(clippy::too_many_arguments)]
+fn attn_core_gpu(
+    qkv_q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    n_q: usize,
+    n_k: usize,
+    dim: usize,
+    heads: usize,
+    mask: Mask<'_>,
+    scale: f32,
+    out: &mut [f32],
+) -> bool {
+    #[cfg(feature = "gpu")]
+    {
+        if std::env::var("CMF_SAM3_GPU").as_deref() == Ok("0") {
+            return false;
+        }
+        if !crate::gpu::enabled_here() {
+            return false;
+        }
+        let hd = dim / heads;
+        if hd == 0 || out.len() < n_q * dim {
+            return false;
+        }
+        // Same floor gemm_nt enforces, checked before any packing: both
+        // GEMMs carry the identical n_q * n_k * hd MAC product.
+        if n_q.saturating_mul(n_k).saturating_mul(hd) < (1 << 22) {
+            return false;
+        }
+        let h3 = dim * 3;
+        // Q/K packed [.., hd] rows; V packed transposed (rows = hd) so
+        // A·V is the same NT GEMM: out[n_q, hd] = A[n_q, n_k]·Vᵀ[hd, n_k].
+        let _byp = CoopBypass::new();
+        let mut qpk = vec![0f32; n_q * hd];
+        let mut kpk = vec![0f32; n_k * hd];
+        let mut vtp = vec![0f32; hd * n_k];
+        let mut raw = vec![0f32; n_q * n_k];
+        let mut outt = vec![0f32; n_q * hd];
+        let mut acc = vec![0f32; n_q * dim];
+        // The pure-f32 scalar arm refuses grids over 2^22 workgroups (a
+        // hang guard) — QKᵀ over a big square (n_q * n_k) is chunked
+        // along query rows; output rows are independent, so chunking
+        // changes nothing but the dispatch.
+        let qk_chunk = ((1usize << 22) / n_k.max(1)).max(1);
+        for t in 0..heads {
+            let off = t * hd;
+            for i in 0..n_q {
+                qpk[i * hd..(i + 1) * hd]
+                    .copy_from_slice(&qkv_q[i * h3 + off..i * h3 + off + hd]);
+            }
+            for j in 0..n_k {
+                kpk[j * hd..(j + 1) * hd]
+                    .copy_from_slice(&k[j * h3 + dim + off..j * h3 + dim + off + hd]);
+            }
+            for d in 0..hd {
+                let rowd = &mut vtp[d * n_k..(d + 1) * n_k];
+                for (j, rv) in rowd.iter_mut().enumerate() {
+                    *rv = v[j * h3 + 2 * dim + off + d];
+                }
+            }
+            // QKᵀ: raw[i, j] = qpk[i]·kpk[j]  (chunked over query rows)
+            let mut i0 = 0usize;
+            while i0 < n_q {
+                let i1 = (i0 + qk_chunk).min(n_q);
+                if !crate::gpu_wgpu::gemm_nt_f32_transient(
+                    &qpk[i0 * hd..i1 * hd],
+                    &kpk,
+                    &mut raw[i0 * n_k..i1 * n_k],
+                    i1 - i0,
+                    hd,
+                    n_k,
+                ) {
+                    return false;
+                }
+                i0 = i1;
+            }
+            // scale + mask + stable softmax — the scalar arm's order.
+            let mut rowmax = vec![0f32; n_q];
+            for i in 0..n_q {
+                let base = i * n_k;
+                let mut mx = f32::NEG_INFINITY;
+                for j in 0..n_k {
+                    let mut val = raw[base + j] * scale;
+                    val += match mask {
+                        Mask::None => 0.0,
+                        Mask::Key(km) => km[j],
+                        Mask::Add(am) => am[i * n_k + j],
+                        Mask::Head(hm) => hm[(t * n_q + i) * n_k + j],
+                    };
+                    raw[base + j] = val;
+                    if val > mx {
+                        mx = val;
+                    }
+                }
+                rowmax[i] = mx;
+                let mut sum = 0.0f32;
+                for j in 0..n_k {
+                    let e = (raw[base + j] - mx).exp();
+                    raw[base + j] = e;
+                    sum += e;
+                }
+                let inv = 1.0 / sum;
+                for j in 0..n_k {
+                    raw[base + j] *= inv;
+                }
+            }
+            // A·V: outt[i, d] = raw[i]·vtp[d]
+            if !crate::gpu_wgpu::gemm_nt_f32_transient(&raw, &vtp, &mut outt, n_q, n_k, hd) {
+                return false;
+            }
+            for i in 0..n_q {
+                acc[i * dim + off..i * dim + off + hd]
+                    .copy_from_slice(&outt[i * hd..(i + 1) * hd]);
+            }
+        }
+        out.copy_from_slice(&acc);
+        true
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        let _ = (qkv_q, k, v, n_q, n_k, dim, heads, mask, scale, out);
+        false
+    }
+}
+
 /// Multi-head attention for one sequence: fused QKV projection
 /// (`w_qkv` rows = 3*dim laid out [q | k | v] per row, `qb` its bias),
 /// optional axial RoPE on q/k, additive mask, softmax, output projection
@@ -1111,7 +1431,9 @@ pub(crate) fn run_attn(
     let h3 = dim * 3;
     let hd = dim / heads;
     let scale = 1.0 / (hd as f32).sqrt();
+    let _tp = std::time::Instant::now();
     let mut qkv_q = vec![0f32; n_q * h3];
+    let _pg = crate::cpuprof::spans::span("attn.gemm");
     w_qkv.matmat(xs_q, n_q, &mut qkv_q, pool);
     add_bias(&mut qkv_q, h3, qb);
     let same_k = xs_k.as_ptr() == xs_q.as_ptr();
@@ -1128,6 +1450,7 @@ pub(crate) fn run_attn(
         w_qkv.matmat(xs_v, n_k, &mut vbuf, pool);
         add_bias(&mut vbuf, h3, qb);
     }
+    drop(_pg);
     if let Some(fc) = rope {
         // rotate q (and k when they share the buffer) over the first 2*dim dims
         apply_rope(&mut qkv_q, n_q, h3, dim * 2, fc);
@@ -1135,53 +1458,134 @@ pub(crate) fn run_attn(
             apply_rope(&mut kbuf, n_k, h3, dim * 2, fc);
         }
     }
+    ATT_PROJ_NS.fetch_add(_tp.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let _tc = std::time::Instant::now();
     let qkv_k: &[f32] = if same_k { &qkv_q } else { &kbuf };
     let qkv_v: &[f32] = if same_v { &qkv_q } else { &vbuf };
     let mut attn = vec![0f32; n_q * dim];
+    if attn_core_gpu(&qkv_q, qkv_k, qkv_v, n_q, n_k, dim, heads, mask, scale, &mut attn) {
+        ATT_CORE_NS.fetch_add(_tc.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let _tw = std::time::Instant::now();
+        w_o.matmat(&attn, n_q, out, pool);
+        add_bias(out, dim, ob);
+        ATT_PROJ_NS.fetch_add(_tw.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        return;
+    }
     let ab = attn.as_mut_ptr() as usize;
+    let _pc = crate::cpuprof::spans::span("attn.core");
+    // Attention core as two packed GEMMs per head over each row chunk —
+    // QKᵀ then softmax then AV — instead of the per-(row, head) scalar
+    // loops with a dot()/axpy() call per key. matrixmultiply packs K/V
+    // once per call (the old code rebuilt a hd-wide dot and re-sliced a
+    // strided V row n_q×heads×n_k times: 1.0G+ tiny calls/frame at
+    // ~115 µs per (row, head) group). Per-element mask/softmax values are
+    // unchanged; only the reduction ORDER differs (gates are numeric).
     let run = |s: usize, e: usize| {
+        if s >= e {
+            return;
+        }
         let a = unsafe { std::slice::from_raw_parts_mut(ab as *mut f32, n_q * dim) };
-        let mut scores = vec![0f32; n_k];
-        for i in s..e {
-            let qrow = &qkv_q[i * h3..i * h3 + dim];
-            for t in 0..heads {
-                let qs = &qrow[t * hd..(t + 1) * hd];
-                let mut mx = f32::NEG_INFINITY;
-                for j in 0..n_k {
-                    let kr = &qkv_k[j * h3 + dim + t * hd..j * h3 + dim + (t + 1) * hd];
-                    let mut v = qs.iter().zip(kr).fold(0.0f32, |c, (a, b)| c + a * b) * scale;
-                    v += match mask {
-                        Mask::None => 0.0,
-                        Mask::Key(km) => km[j],
-                        Mask::Add(am) => am[i * n_k + j],
-                        Mask::Head(hm) => hm[(t * n_q + i) * n_k + j],
-                    };
-                    scores[j] = v;
-                    if v > mx { mx = v; }
+        let rows = e - s;
+        let mut scores = vec![0f32; rows * n_k];
+        let prof = crate::cpuprof::spans::on();
+        for t in 0..heads {
+            let tq = prof.then(std::time::Instant::now);
+            // C[rows, n_k] = scale · Q[rows, hd] × Kᵀ (K head rows, stride h3)
+            crate::qtensor::sgemm_public(
+                rows,
+                n_k,
+                hd,
+                scale,
+                &qkv_q[s * h3 + t * hd..],
+                h3,
+                &qkv_k[dim + t * hd..],
+                h3,
+                true,
+                &mut scores,
+                n_k,
+            );
+            match mask {
+                Mask::None => {}
+                Mask::Key(km) => {
+                    for r in 0..rows {
+                        let sr = &mut scores[r * n_k..(r + 1) * n_k];
+                        for (v, &m) in sr.iter_mut().zip(km) {
+                            *v += m;
+                        }
+                    }
                 }
-                // Stable softmax: the trunk's ViT scores reach ~155, so a
-                // raw exp() overflows to inf for the row-max and the sum
-                // turns inf → inv = 0 → the whole attention row silently
-                // collapses to zeros. Subtract the row max (`mx`).
+                Mask::Add(am) => {
+                    for (r, i) in (s..e).enumerate() {
+                        let sr = &mut scores[r * n_k..(r + 1) * n_k];
+                        for (v, &m) in sr.iter_mut().zip(&am[i * n_k..(i + 1) * n_k]) {
+                            *v += m;
+                        }
+                    }
+                }
+                Mask::Head(hm) => {
+                    for (r, i) in (s..e).enumerate() {
+                        let base = (t * n_q + i) * n_k;
+                        let sr = &mut scores[r * n_k..(r + 1) * n_k];
+                        for (v, &m) in sr.iter_mut().zip(&hm[base..base + n_k]) {
+                            *v += m;
+                        }
+                    }
+                }
+            }
+            let tm = prof.then(std::time::Instant::now);
+            // Stable softmax: the trunk's ViT scores reach ~155, so a
+            // raw exp() overflows to inf for the row-max and the sum
+            // turns inf → inv = 0 → the whole attention row silently
+            // collapses to zeros. Subtract the row max (`mx`).
+            for r in 0..rows {
+                let sr = &mut scores[r * n_k..(r + 1) * n_k];
+                let mut mx = f32::NEG_INFINITY;
+                for &v in sr.iter() {
+                    if v > mx {
+                        mx = v;
+                    }
+                }
                 let mut sum = 0.0f32;
-                for sv in scores.iter_mut().take(n_k) {
-                    *sv = (*sv - mx).exp();
-                    sum += *sv;
+                for v in sr.iter_mut() {
+                    *v = (*v - mx).exp();
+                    sum += *v;
                 }
                 let inv = 1.0 / sum;
-                let orow = &mut a[i * dim + t * hd..i * dim + (t + 1) * hd];
-                for j in 0..n_k {
-                    let wgt = scores[j] * inv;
-                    if wgt == 0.0 { continue; }
-                    let vr = &qkv_v[j * h3 + 2 * dim + t * hd..j * h3 + 2 * dim + (t + 1) * hd];
-                    for (o, vv) in orow.iter_mut().zip(vr) { *o += wgt * vv; }
+                for v in sr.iter_mut() {
+                    *v *= inv;
                 }
+            }
+            let ta = prof.then(std::time::Instant::now);
+            // C[rows, hd] = S[rows, n_k] × V_head (rows stride h3) → out
+            crate::qtensor::sgemm_public(
+                rows,
+                hd,
+                n_k,
+                1.0,
+                &scores,
+                n_k,
+                &qkv_v[2 * dim + t * hd..],
+                h3,
+                false,
+                &mut a[s * dim + t * hd..],
+                dim,
+            );
+            if let (Some(t0), Some(t1), Some(t2)) = (tq, tm, ta) {
+                let t3 = std::time::Instant::now();
+                crate::cpuprof::spans::add("attn.qk", t1 - t0);
+                crate::cpuprof::spans::add("attn.sm", t2 - t1);
+                crate::cpuprof::spans::add("attn.av", t3 - t2);
             }
         }
     };
     match pool { Some(p) => p.run_rows(n_q, &run), None => run(0, n_q) }
+    drop(_pc);
+    let _pg = crate::cpuprof::spans::span("attn.gemm");
+    ATT_CORE_NS.fetch_add(_tc.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let _tw = std::time::Instant::now();
     w_o.matmat(&attn, n_q, out, pool);
     add_bias(out, dim, ob);
+    ATT_PROJ_NS.fetch_add(_tw.elapsed().as_nanos() as u64, Ordering::Relaxed);
 }
 
 // ─────────── convolutions (NCHW f32, explicit shapes) ───────────
@@ -1204,31 +1608,57 @@ pub(crate) fn conv2d(
     debug_assert_eq!(x.len(), ci * h * wid);
     let oh = (h + 2 * pad - kh) / stride + 1;
     let ow = (wid + 2 * pad - kw) / stride + 1;
+    let _p = crate::cpuprof::spans::span("op.conv2d");
     let mut out = vec![0f32; co * oh * ow];
     let ob = out.as_mut_ptr() as usize;
+    // One output ROW per unit instead of one pixel: the (c, dy, dx)
+    // accumulation order per element is unchanged (results stay bit-exact),
+    // but the innermost loop becomes a contiguous `orow[lo..hi] += w *
+    // xrow[..]` slice that auto-vectorizes — the pixel loop fed LLVM a
+    // strided load, a div/mod for (oy, ox) and two bounds checks per tap,
+    // and ran ~50% of the SAM3 image forward scalar.
     let run = |s: usize, e: usize| {
         let o = unsafe { std::slice::from_raw_parts_mut(ob as *mut f32, co * oh * ow) };
-        for idx in s..e {
-            let c_o = idx / (oh * ow);
-            let rem = idx % (oh * ow);
-            let (oy, ox) = (rem / ow, rem % ow);
-            let mut acc = b[c_o];
+        for r in s..e {
+            let c_o = r / oh;
+            let oy = r % oh;
+            let obase = c_o * oh * ow + oy * ow;
+            let orow = &mut o[obase..obase + ow];
+            orow.fill(b[c_o]);
             for c in 0..ci {
                 for dy in 0..kh {
                     let iy = oy * stride + dy;
                     if iy < pad || iy - pad >= h { continue; }
+                    let xrow = &x[(c * h + iy - pad) * wid..][..wid];
                     for dx in 0..kw {
-                        let ix = ox * stride + dx;
-                        if ix < pad || ix - pad >= wid { continue; }
-                        acc += w[((c_o * ci + c) * kh + dy) * kw + dx]
-                            * x[(c * h + iy - pad) * wid + (ix - pad)];
+                        let wv = w[((c_o * ci + c) * kh + dy) * kw + dx];
+                        // ox with 0 <= ox*stride + dx - pad < wid, 0 <= ox < ow
+                        let lo = if pad > dx {
+                            (pad - dx).div_ceil(stride)
+                        } else {
+                            0
+                        };
+                        if lo >= ow { continue; }
+                        let hi_excl = (pad + wid - dx).div_ceil(stride).min(ow);
+                        if lo >= hi_excl { continue; }
+                        if stride == 1 {
+                            // vectorizable: both slices are contiguous
+                            let xo = lo + dx - pad;
+                            let hi = hi_excl;
+                            for (a, b) in orow[lo..hi].iter_mut().zip(&xrow[xo..xo + (hi - lo)]) {
+                                *a += wv * *b;
+                            }
+                        } else {
+                            for ox in lo..hi_excl {
+                                orow[ox] += wv * xrow[ox * stride + dx - pad];
+                            }
+                        }
                     }
                 }
             }
-            o[idx] = acc;
         }
     };
-    match pool { Some(p) => p.run_rows(co * oh * ow, &run), None => run(0, co * oh * ow) }
+    match pool { Some(p) => p.run_rows(co * oh, &run), None => run(0, co * oh) }
     out
 }
 
@@ -1237,24 +1667,42 @@ pub(crate) fn convt2x2(w: &[f32], b: &[f32], x: &[f32], ci: usize, h: usize, wid
     let co = b.len();
     debug_assert_eq!(w.len(), ci * co * 4);
     let (oh, ow) = (h * 2, wid * 2);
+    let _p = crate::cpuprof::spans::span("op.convt");
     let mut out = vec![0f32; co * oh * ow];
     let ob = out.as_mut_ptr() as usize;
+    // Per output row: (kh, kx) = (oy & 1, ox & 1), so even columns take
+    // w[.., 0] and odd columns w[.., 1] — accumulate into two contiguous
+    // scratch rows (vectorizable axpy over x, per-channel order kept →
+    // bit-exact) and interleave once at the end.
     let run = |s: usize, e: usize| {
         let o = unsafe { std::slice::from_raw_parts_mut(ob as *mut f32, co * oh * ow) };
-        for idx in s..e {
-            let c_o = idx / (oh * ow);
-            let rem = idx % (oh * ow);
-            let (oy, ox) = (rem / ow, rem % ow);
-            let (kh, kx) = (oy & 1, ox & 1);
-            let (iy, ix) = (oy >> 1, ox >> 1);
-            let mut acc = b[c_o];
+        let mut t0 = vec![0f32; wid];
+        let mut t1 = vec![0f32; wid];
+        for r in s..e {
+            let c_o = r / oh;
+            let oy = r % oh;
+            let (slot, iy) = (oy & 1, oy >> 1);
+            t0.fill(b[c_o]);
+            t1.fill(b[c_o]);
             for c in 0..ci {
-                acc += w[((c * co + c_o) * 2 + kh) * 2 + kx] * x[(c * h + iy) * wid + ix];
+                let xrow = &x[(c * h + iy) * wid..][..wid];
+                let wb = &w[(c * co + c_o) * 4 + slot * 2..][..2];
+                let (w0, w1) = (wb[0], wb[1]);
+                for (t, &xv) in t0.iter_mut().zip(xrow) {
+                    *t += w0 * xv;
+                }
+                for (t, &xv) in t1.iter_mut().zip(xrow) {
+                    *t += w1 * xv;
+                }
             }
-            o[idx] = acc;
+            let obase = c_o * oh * ow + oy * ow;
+            for j in 0..wid {
+                o[obase + 2 * j] = t0[j];
+                o[obase + 2 * j + 1] = t1[j];
+            }
         }
     };
-    match pool { Some(p) => p.run_rows(co * oh * ow, &run), None => run(0, co * oh * ow) }
+    match pool { Some(p) => p.run_rows(co * oh, &run), None => run(0, co * oh) }
     out
 }
 
@@ -1314,6 +1762,7 @@ pub(crate) fn group_norm(x: &mut [f32], groups: usize, w: &[f32], b: &[f32], eps
 // ─────────── layout helpers ───────────
 
 pub(crate) fn rows_to_chw(rows: &[f32], h: usize, w: usize) -> Vec<f32> {
+    let _p = crate::cpuprof::spans::span("op.layout");
     let n = h * w;
     let c = rows.len() / n;
     let mut out = vec![0f32; c * h * w];
@@ -1326,6 +1775,7 @@ pub(crate) fn rows_to_chw(rows: &[f32], h: usize, w: usize) -> Vec<f32> {
 }
 
 pub(crate) fn chw_to_rows(chw: &[f32], h: usize, w: usize) -> Vec<f32> {
+    let _p = crate::cpuprof::spans::span("op.layout");
     let c = chw.len() / (h * w);
     let mut out = vec![0f32; h * w * c];
     for ch in 0..c {
@@ -1339,6 +1789,7 @@ pub(crate) fn chw_to_rows(chw: &[f32], h: usize, w: usize) -> Vec<f32> {
 /// Normalized sine position encoding for an FPN level: rows [h*w, 2n]
 /// (pos_y then pos_x), scale 2π, temperature 10000.
 pub(crate) fn sine_pos(h: usize, w: usize, n: usize) -> Vec<f32> {
+    let _p = crate::cpuprof::spans::span("op.sine_pos");
     let scale = std::f32::consts::TAU;
     let mut dim_t = vec![0f32; n];
     for i in 0..n { dim_t[i] = 10000f32.powf((2 * (i / 2)) as f32 / n as f32); }
@@ -1468,5 +1919,126 @@ fn dump_f32(dir: &str, name: &str, v: &[f32]) {
     match std::fs::File::create(&p).and_then(|mut f| f.write_all(&b)) {
         Ok(()) => eprintln!("[sam3] dumped {} ({} elems)", p.display(), v.len()),
         Err(e) => eprintln!("[sam3] dump {} failed: {e}", p.display()),
+    }
+}
+
+// ───────────────────────── tests (gpu feature) ─────────────────────
+
+/// Isolated GPU-vs-CPU check of `run_attn` itself on deterministic
+/// pseudo-random inputs — no model, no fixtures: if the owner gate
+/// (rel/cos) fails at the Sam3Out level, this says whether the
+/// attention GPU arm or another block is the diverger.
+#[cfg(all(test, feature = "gpu"))]
+mod attn_gpu_tests {
+    use super::*;
+
+    fn lcg(state: &mut u64) -> f32 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((*state >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+    }
+
+    fn rel_cos(g: &[f32], w: &[f32]) -> (f32, f32) {
+        let mut md = 0f32;
+        let mut mx = 0f32;
+        let (mut dot, mut ng, mut nw) = (0f64, 0f64, 0f64);
+        for (&g, &w) in g.iter().zip(w) {
+            let d = (g - w).abs();
+            if d > md { md = d; }
+            if g.abs() > mx { mx = g.abs(); }
+            dot += g as f64 * w as f64;
+            ng += g as f64 * g as f64;
+            nw += w as f64 * w as f64;
+        }
+        let rel = if mx > 0.0 { md / mx } else { md };
+        let cos = if ng > 0.0 && nw > 0.0 {
+            (dot / (ng.sqrt() * nw.sqrt())) as f32
+        } else {
+            1.0
+        };
+        (rel, cos)
+    }
+
+    #[test]
+    fn attn_gpu_matches_cpu() {
+        if std::env::var("CMF_GPU").as_deref() != Ok("1") {
+            eprintln!("skip attn_gpu_matches_cpu: CMF_GPU != 1");
+            return;
+        }
+        if !crate::gpu::backend_available() {
+            eprintln!("skip attn_gpu_matches_cpu: no wgpu backend");
+            return;
+        }
+        // Shapes that mirror the real trunk: 1024x1024 (small square),
+        // 576x576x1024/16 (windowed layer) and 5184x5184x1024/16 (global
+        // layer — the only shape that exercises QK query-chunking).
+        let cases: [(usize, usize, usize, usize, bool); 3] = [
+            (1024, 1024, 256, 4, true),
+            (576, 576, 1024, 16, false),
+            (5184, 5184, 1024, 16, false),
+        ];
+        for &(n_q, n_k, dim, heads, with_head) in &cases {
+            let h3 = dim * 3;
+            let mut st = 0x9e37_79b9_7f4a_7c15u64;
+            let xs: Vec<f32> = (0..n_k * h3).map(|_| lcg(&mut st) * 2.0).collect();
+            let mut st2 = 0xdead_beefu64.wrapping_mul(0x5bd1_e995);
+            let w_qkv = QTensor::F32 {
+                data: (0..h3 * dim).map(|_| lcg(&mut st2)).collect(),
+                rows: h3,
+                cols: dim,
+            };
+            let w_o = QTensor::F32 {
+                data: (0..dim * dim).map(|_| lcg(&mut st2)).collect(),
+                rows: dim,
+                cols: dim,
+            };
+            let qb = vec![0.01f32; h3];
+            let ob = vec![0.02f32; dim];
+            let head_mask: Vec<f32>;
+            let mut head_owned: Vec<f32> = Vec::new();
+            if with_head {
+                head_owned = vec![0f32; heads * n_q * n_k];
+                for (i, v) in head_owned.iter_mut().enumerate() {
+                    *v = (i % 97) as f32 * 0.001 - 0.048;
+            }
+            }
+            head_mask = head_owned;
+            let mask_kinds: [(Option<usize>, &str); 2] =
+                [(None, "none"), (with_head.then_some(0usize), "head")];
+            for (kind, label) in mask_kinds {
+                if kind.is_none() && !matches!(label, "none") {
+                    continue;
+                }
+                let mask = match kind {
+                    Some(_) if with_head => Mask::Head(&head_mask),
+                    Some(_) => continue,
+                    None => Mask::None,
+                };
+                if label == "head" && !with_head {
+                    continue;
+                }
+                let mut out_cpu = vec![0f32; n_q * dim];
+                let mut out_gpu = vec![0f32; n_q * dim];
+                crate::gpu::cpu_scope(|| {
+                    run_attn(
+                        &w_qkv, &qb, &w_o, &ob, &xs, &xs, &xs,
+                        n_q, n_k, dim, heads, None, mask, None, &mut out_cpu,
+                    )
+                });
+                run_attn(
+                    &w_qkv, &qb, &w_o, &ob, &xs, &xs, &xs,
+                    n_q, n_k, dim, heads, None, mask, None, &mut out_gpu,
+                );
+                let (rel, cos) = rel_cos(&out_gpu, &out_cpu);
+                eprintln!(
+                    "attn_gpu_vs_cpu[{n_q}x{n_k}x{dim}/{heads} {label}] rel={rel:.3e} cos={cos:.6}"
+                );
+                assert!(
+                    rel <= 1e-2 && cos >= 0.999,
+                    "attn {n_q}x{n_k} mask={label}: rel={rel:.3e} cos={cos:.6} outside gate"
+                );
+            }
+        }
     }
 }
