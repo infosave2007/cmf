@@ -10,7 +10,7 @@
 //! 1/√c), k, vᵀ, then per query chunk S = q·kᵀ (f32), row softmax → half P,
 //! O = P·v, out projection + residual. One latent upload, one RGB readback.
 
-use super::{buf_from, buf_zeroed, pipes, set_p, Pipes};
+use super::{Pipes, buf_from, buf_zeroed, pipes, set_p};
 use crate::vae::{VaeChainArgs, VaeConvRef, VaeNormRef, VaeResnetRef};
 use metal::{Buffer, ComputeCommandEncoderRef, MTLResourceOptions, MTLSize};
 use std::ffi::c_void;
@@ -110,7 +110,10 @@ unsafe impl Send for VState {}
 static VSTATE: Mutex<VState> = Mutex::new(VState(None));
 
 fn half_buf(c: &Ctx, v: &[f32]) -> Buffer {
-    let h: Vec<u16> = v.iter().map(|&x| cortiq_core::quant::f32_to_f16(x)).collect();
+    let h: Vec<u16> = v
+        .iter()
+        .map(|&x| cortiq_core::quant::f32_to_f16(x))
+        .collect();
     c._device.new_buffer_with_data(
         h.as_ptr() as *const c_void,
         (h.len().max(8) * 2) as u64,
@@ -173,9 +176,29 @@ fn norm_of(c: &Ctx, r: &VaeNormRef) -> VNorm {
     }
 }
 
+/// The GroupNorm shader writes float4s, but its reduction has a scalar-tail
+/// path for compact groups.  Keep admission deliberately narrow: every
+/// channel vector must remain float4 aligned and the fixed scratch planes can
+/// hold at most 64 groups.
+fn norm_supported(r: &VaeNormRef, ch: usize) -> bool {
+    ch % 4 == 0
+        && r.groups != 0
+        && r.groups <= 64
+        && ch % r.groups == 0
+        && r.w.len() == ch
+        && r.b.len() == ch
+}
+
 fn res_of(c: &Ctx, r: &VaeResnetRef) -> Result<VRes, String> {
     let (cin, cout) = (r.conv1.ic, r.conv1.oc);
-    if cin % 32 != 0 || cout % 64 != 0 || cin % (4 * r.norm1.groups) != 0 || cout % (4 * r.norm2.groups) != 0 {
+    // Conv inputs are loaded in 32-wide half lanes.  Outputs may be only
+    // 32-wide (Flux2's final 192→96 stage); `zv_conv` guards their padded
+    // 64-row tile before it stores into the logical NHWC stride.
+    if cin % 32 != 0
+        || cout % 32 != 0
+        || !norm_supported(&r.norm1, cin)
+        || !norm_supported(&r.norm2, cout)
+    {
         return Err(format!("vae resnet {cin}->{cout}"));
     }
     Ok(VRes {
@@ -195,6 +218,12 @@ fn res_of(c: &Ctx, r: &VaeResnetRef) -> Result<VRes, String> {
 fn build(c: &Ctx, a: &VaeChainArgs) -> Result<VaeDev, String> {
     let at = &a.mid_attn;
     let ch = at.c;
+    if !norm_supported(&at.norm, ch) {
+        return Err(format!("vae attention norm {ch}"));
+    }
+    if a.conv_out.ic % 32 != 0 || !norm_supported(&a.norm_out, a.conv_out.ic) {
+        return Err(format!("vae output norm {}", a.conv_out.ic));
+    }
     let scale = 1.0 / (ch as f32).sqrt();
     Ok(VaeDev {
         key: a.key,
@@ -214,7 +243,11 @@ fn build(c: &Ctx, a: &VaeChainArgs) -> Result<VaeDev, String> {
             .iter()
             .map(|u| {
                 Ok(VUp {
-                    res: u.resnets.iter().map(|r| res_of(c, r)).collect::<Result<Vec<_>, String>>()?,
+                    res: u
+                        .resnets
+                        .iter()
+                        .map(|r| res_of(c, r))
+                        .collect::<Result<Vec<_>, String>>()?,
                     up: match &u.upsample {
                         Some(s) => Some(conv_of(c, s, 1.0)?),
                         None => None,
@@ -237,7 +270,9 @@ fn ensure<'s>(st: &'s mut VState, c: &Ctx, a: &VaeChainArgs) -> Result<&'s VaeDe
 }
 
 pub(crate) fn prewarm(a: &VaeChainArgs) -> bool {
-    let Some(c) = super::super::ctx() else { return false };
+    let Some(c) = super::super::ctx() else {
+        return false;
+    };
     if pipes(c).is_none() {
         return false;
     }
@@ -308,10 +343,19 @@ impl VRec<'_> {
         ldx: usize,
         k_plain: usize,
     ) {
-        let k = if cv.taps == 0 { k_plain } else { cv.taps * cv.icp };
+        let k = if cv.taps == 0 {
+            k_plain
+        } else {
+            cv.taps * cv.icp
+        };
         let pv = PVc {
             n: n as u32,
-            rows: cv.ocp as u32,
+            // Normal NHWC outputs use `ldy` as their logical channel
+            // stride.  The MMA tile still computes padded rows, and the
+            // shader drops those rows before they can spill into the next
+            // pixel.  EPI=2 is the attention V transpose [channel][token],
+            // whose `ldy` is a token stride rather than a channel count.
+            rows: (if epi == 2 { cv.ocp } else { ldy }) as u32,
             k: k as u32,
             ic: cv.icp as u32,
             h: hw.0 as u32,
@@ -345,7 +389,18 @@ impl VRec<'_> {
     /// Plain GEMM with an explicit weight buffer (the attention's k / vᵀ
     /// as "weights"): Y[n][rows] = X[n][K] · W[rows][K]ᵀ, no bias.
     #[allow(clippy::too_many_arguments)]
-    fn gemm(&mut self, w: (&Buffer, u64), rows: usize, k: usize, x: (&Buffer, u64), ldx: usize, y: (&Buffer, u64), ldy: usize, n: usize, epi: u32) {
+    fn gemm(
+        &mut self,
+        w: (&Buffer, u64),
+        rows: usize,
+        k: usize,
+        x: (&Buffer, u64),
+        ldx: usize,
+        y: (&Buffer, u64),
+        ldy: usize,
+        n: usize,
+        epi: u32,
+    ) {
         let pv = PVc {
             n: n as u32,
             rows: rows as u32,
@@ -373,7 +428,16 @@ impl VRec<'_> {
     }
 
     /// GroupNorm (+SiLU) of x [n][ch] f32 → y (half or f32).
-    fn gn(&mut self, nm: &VNorm, x: &Buffer, y: &Buffer, n: usize, ch: usize, silu: bool, half_out: bool) {
+    fn gn(
+        &mut self,
+        nm: &VNorm,
+        x: &Buffer,
+        y: &Buffer,
+        n: usize,
+        ch: usize,
+        silu: bool,
+        half_out: bool,
+    ) {
         let nblk = n.div_ceil(1024).clamp(1, 256);
         let mut pg = PGn {
             n: n as u32,
@@ -395,12 +459,18 @@ impl VRec<'_> {
             enc.set_buffer(1, Some(&part), 0);
             enc.set_buffer(2, Some(&stat), 0);
             set_p(enc, 3, &pg);
-            enc.dispatch_thread_groups(MTLSize::new(nm.groups as u64, nblk as u64, 1), MTLSize::new(256, 1, 1));
+            enc.dispatch_thread_groups(
+                MTLSize::new(nm.groups as u64, nblk as u64, 1),
+                MTLSize::new(256, 1, 1),
+            );
             enc.set_compute_pipeline_state(&p.vgnfin);
             enc.set_buffer(0, Some(&part), 0);
             enc.set_buffer(1, Some(&stat), 0);
             set_p(enc, 2, &pg);
-            enc.dispatch_thread_groups(MTLSize::new(nm.groups as u64, 1, 1), MTLSize::new(32, 1, 1));
+            enc.dispatch_thread_groups(
+                MTLSize::new(nm.groups as u64, 1, 1),
+                MTLSize::new(32, 1, 1),
+            );
         }
         enc.set_compute_pipeline_state(&p.vgnapply);
         enc.set_buffer(0, Some(x), 0);
@@ -410,7 +480,10 @@ impl VRec<'_> {
         enc.set_buffer(4, Some(&nm.b), 0);
         set_p(enc, 5, &pg);
         let n4 = (n * ch / 4) as u64;
-        enc.dispatch_thread_groups(MTLSize::new(n4.div_ceil(256), 1, 1), MTLSize::new(256, 1, 1));
+        enc.dispatch_thread_groups(
+            MTLSize::new(n4.div_ceil(256), 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
     }
 
     fn cvt(&mut self, x: &Buffer, y: &Buffer, count: usize) {
@@ -421,7 +494,10 @@ impl VRec<'_> {
         enc.set_buffer(0, Some(x), 0);
         enc.set_buffer(1, Some(y), 0);
         set_p(enc, 2, &n4);
-        enc.dispatch_thread_groups(MTLSize::new((n4 as u64).div_ceil(256), 1, 1), MTLSize::new(256, 1, 1));
+        enc.dispatch_thread_groups(
+            MTLSize::new((n4 as u64).div_ceil(256), 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
     }
 }
 
@@ -434,13 +510,49 @@ struct Bufs {
 /// One resnet on xa [n][cin] (f32) → xa [n][cout].
 fn resnet(r: &mut VRec, b: &Bufs, rs: &VRes, n: usize, hw: (usize, usize)) {
     r.gn(&rs.n1, &b.xa, &b.hh, n, rs.cin, true, true);
-    r.conv(&rs.c1, (&b.hh, 0), (&b.t, 0), None, n, hw, false, 0, rs.cout, 0, 0);
+    r.conv(
+        &rs.c1,
+        (&b.hh, 0),
+        (&b.t, 0),
+        None,
+        n,
+        hw,
+        false,
+        0,
+        rs.cout,
+        0,
+        0,
+    );
     if let Some(sc) = &rs.sc {
         r.cvt(&b.xa, &b.hh, n * rs.cin);
-        r.conv(sc, (&b.hh, 0), (&b.xa, 0), None, n, hw, false, 0, rs.cout, 0, 0);
+        r.conv(
+            sc,
+            (&b.hh, 0),
+            (&b.xa, 0),
+            None,
+            n,
+            hw,
+            false,
+            0,
+            rs.cout,
+            0,
+            0,
+        );
     }
     r.gn(&rs.n2, &b.t, &b.hh, n, rs.cout, true, true);
-    r.conv(&rs.c2, (&b.hh, 0), (&b.xa, 0), Some((&b.xa, 0)), n, hw, false, 0, rs.cout, 0, 0);
+    r.conv(
+        &rs.c2,
+        (&b.hh, 0),
+        (&b.xa, 0),
+        Some((&b.xa, 0)),
+        n,
+        hw,
+        false,
+        0,
+        rs.cout,
+        0,
+        0,
+    );
 }
 
 /// The f16-plane arm of the codec A/B (plan M5c): the same 64×64×32 tile
@@ -449,10 +561,22 @@ fn resnet(r: &mut VRec, b: &Bufs, rs: &VRes, n: usize, hw: (usize, usize)) {
 pub(crate) fn bench_plane(rows: usize, k: usize, n: usize, reps: usize) -> Option<(f64, f64)> {
     let c = super::super::ctx()?;
     let p = pipes(c)?;
-    let w: Vec<u16> = (0..rows * k).map(|i| cortiq_core::quant::f32_to_f16(((i * 7) % 255) as f32 - 127.0)).collect();
-    let x: Vec<u16> = (0..(n.div_ceil(64) * 64 + 64) * k).map(|i| cortiq_core::quant::f32_to_f16(((i * 5) % 17) as f32 * 0.01)).collect();
-    let wb = c._device.new_buffer_with_data(w.as_ptr() as *const c_void, (w.len() * 2) as u64, MTLResourceOptions::StorageModeShared);
-    let xb = c._device.new_buffer_with_data(x.as_ptr() as *const c_void, (x.len() * 2) as u64, MTLResourceOptions::StorageModeShared);
+    let w: Vec<u16> = (0..rows * k)
+        .map(|i| cortiq_core::quant::f32_to_f16(((i * 7) % 255) as f32 - 127.0))
+        .collect();
+    let x: Vec<u16> = (0..(n.div_ceil(64) * 64 + 64) * k)
+        .map(|i| cortiq_core::quant::f32_to_f16(((i * 5) % 17) as f32 * 0.01))
+        .collect();
+    let wb = c._device.new_buffer_with_data(
+        w.as_ptr() as *const c_void,
+        (w.len() * 2) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let xb = c._device.new_buffer_with_data(
+        x.as_ptr() as *const c_void,
+        (x.len() * 2) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
     let yb = buf_zeroed(c, n * rows * 4);
     let pv = PVc {
         n: n as u32,
@@ -475,7 +599,10 @@ pub(crate) fn bench_plane(rows: usize, k: usize, n: usize, reps: usize) -> Optio
         enc.set_buffer(3, Some(&yb), 0);
         enc.set_buffer(4, Some(&yb), 0);
         set_p(enc, 5, &pv);
-        enc.dispatch_thread_groups(MTLSize::new(n.div_ceil(64) as u64, (rows / 64) as u64, 1), MTLSize::new(128, 1, 1));
+        enc.dispatch_thread_groups(
+            MTLSize::new(n.div_ceil(64) as u64, (rows / 64) as u64, 1),
+            MTLSize::new(128, 1, 1),
+        );
         enc.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
@@ -492,7 +619,9 @@ pub(crate) fn decode(a: &VaeChainArgs, z: &[f32], h: usize, w: usize, out: &mut 
     if std::env::var("CMF_ZI_VAE").as_deref() == Ok("0") {
         return false;
     }
-    let Some(c) = super::super::ctx() else { return false };
+    let Some(c) = super::super::ctx() else {
+        return false;
+    };
     let Some(p) = pipes(c) else { return false };
     let mut st = VSTATE.lock().unwrap();
     let d = match ensure(&mut st, c, a) {
@@ -571,20 +700,78 @@ pub(crate) fn decode(a: &VaeChainArgs, z: &[f32], h: usize, w: usize, out: &mut 
     let t0 = std::time::Instant::now();
     let b = &bufs;
     // conv_in
-    r.conv(&d.conv_in, (&b.hh, 0), (&b.xa, 0), None, n0, (h, w), false, 0, d.conv_in.ocp, 0, 0);
+    r.conv(
+        &d.conv_in,
+        (&b.hh, 0),
+        (&b.xa, 0),
+        None,
+        n0,
+        (h, w),
+        false,
+        0,
+        d.conv_in.ocp,
+        0,
+        0,
+    );
     resnet(&mut r, b, &d.mid1, n0, (h, w));
     r.cut();
     // mid attention
     {
         let at = &d.attn;
         r.gn(&at.norm, &b.xa, &b.hh, n0, ac, false, true);
-        r.conv(&at.q, (&b.hh, 0), (&qb, 0), None, n0, (0, 0), false, 1, ac, ac, ac);
-        r.conv(&at.k, (&b.hh, 0), (&kb, 0), None, n0, (0, 0), false, 1, ac, ac, ac);
-        r.conv(&at.v, (&b.hh, 0), (&vt, 0), None, n0, (0, 0), false, 2, n0p, ac, ac);
+        r.conv(
+            &at.q,
+            (&b.hh, 0),
+            (&qb, 0),
+            None,
+            n0,
+            (0, 0),
+            false,
+            1,
+            ac,
+            ac,
+            ac,
+        );
+        r.conv(
+            &at.k,
+            (&b.hh, 0),
+            (&kb, 0),
+            None,
+            n0,
+            (0, 0),
+            false,
+            1,
+            ac,
+            ac,
+            ac,
+        );
+        r.conv(
+            &at.v,
+            (&b.hh, 0),
+            (&vt, 0),
+            None,
+            n0,
+            (0, 0),
+            false,
+            2,
+            n0p,
+            ac,
+            ac,
+        );
         let mut q0 = 0;
         while q0 < n0 {
             let m = chunk.min(n0 - q0);
-            r.gemm((&kb, 0), n0p, ac, (&qb, (q0 * ac * 2) as u64), ac, (&sb, 0), n0p, m, 0);
+            r.gemm(
+                (&kb, 0),
+                n0p,
+                ac,
+                (&qb, (q0 * ac * 2) as u64),
+                ac,
+                (&sb, 0),
+                n0p,
+                m,
+                0,
+            );
             {
                 let pp = r.p;
                 let (n0u, ldu) = (n0 as u32, n0p as u32);
@@ -596,10 +783,32 @@ pub(crate) fn decode(a: &VaeChainArgs, z: &[f32], h: usize, w: usize, out: &mut 
                 set_p(enc, 3, &ldu);
                 enc.dispatch_thread_groups(MTLSize::new(m as u64, 1, 1), MTLSize::new(256, 1, 1));
             }
-            r.gemm((&vt, 0), ac, n0p, (&pb, 0), n0p, (&ob, (q0 * ac * 2) as u64), ac, m, 1);
+            r.gemm(
+                (&vt, 0),
+                ac,
+                n0p,
+                (&pb, 0),
+                n0p,
+                (&ob, (q0 * ac * 2) as u64),
+                ac,
+                m,
+                1,
+            );
             q0 += m;
         }
-        r.conv(&at.o, (&ob, 0), (&b.xa, 0), Some((&b.xa, 0)), n0, (0, 0), false, 0, ac, ac, ac);
+        r.conv(
+            &at.o,
+            (&ob, 0),
+            (&b.xa, 0),
+            Some((&b.xa, 0)),
+            n0,
+            (0, 0),
+            false,
+            0,
+            ac,
+            ac,
+            ac,
+        );
     }
     resnet(&mut r, b, &d.mid2, n0, (h, w));
     r.cut();
@@ -609,7 +818,11 @@ pub(crate) fn decode(a: &VaeChainArgs, z: &[f32], h: usize, w: usize, out: &mut 
     let (mut xa, mut tt) = (b.xa.clone(), b.t.clone());
     for u in &d.ups {
         for rs in &u.res {
-            let bb = Bufs { xa: xa.clone(), t: tt.clone(), hh: b.hh.clone() };
+            let bb = Bufs {
+                xa: xa.clone(),
+                t: tt.clone(),
+                hh: b.hh.clone(),
+            };
             resnet(&mut r, &bb, rs, hh * ww, (hh, ww));
             ch = rs.cout;
             r.cut();
@@ -618,7 +831,19 @@ pub(crate) fn decode(a: &VaeChainArgs, z: &[f32], h: usize, w: usize, out: &mut 
             r.cvt(&xa, &b.hh, hh * ww * ch);
             hh *= 2;
             ww *= 2;
-            r.conv(upc, (&b.hh, 0), (&tt, 0), None, hh * ww, (hh, ww), true, 0, upc.ocp, 0, 0);
+            r.conv(
+                upc,
+                (&b.hh, 0),
+                (&tt, 0),
+                None,
+                hh * ww,
+                (hh, ww),
+                true,
+                0,
+                upc.ocp,
+                0,
+                0,
+            );
             std::mem::swap(&mut xa, &mut tt);
             bufs_swapped = !bufs_swapped;
             r.cut();
@@ -626,7 +851,19 @@ pub(crate) fn decode(a: &VaeChainArgs, z: &[f32], h: usize, w: usize, out: &mut 
     }
     let n = hh * ww;
     r.gn(&d.norm_out, &xa, &b.hh, n, ch, true, true);
-    r.conv(&d.conv_out, (&b.hh, 0), (&tt, 0), None, n, (hh, ww), false, 0, 64, 0, 0);
+    r.conv(
+        &d.conv_out,
+        (&b.hh, 0),
+        (&tt, 0),
+        None,
+        n,
+        (hh, ww),
+        false,
+        0,
+        64,
+        0,
+        0,
+    );
     let rgb = buf_zeroed(c, 3 * n * 4);
     {
         let pp = r.p;
@@ -636,7 +873,10 @@ pub(crate) fn decode(a: &VaeChainArgs, z: &[f32], h: usize, w: usize, out: &mut 
         enc.set_buffer(0, Some(&tt), 0);
         enc.set_buffer(1, Some(&rgb), 0);
         set_p(enc, 2, &nu);
-        enc.dispatch_thread_groups(MTLSize::new((n as u64).div_ceil(256), 1, 1), MTLSize::new(256, 1, 1));
+        enc.dispatch_thread_groups(
+            MTLSize::new((n as u64).div_ceil(256), 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
     }
     let _ = bufs_swapped;
     if !r.finish() {
@@ -661,5 +901,170 @@ pub(crate) fn decode(a: &VaeChainArgs, z: &[f32], h: usize, w: usize, out: &mut 
 }
 
 fn env_chunk() -> usize {
-    std::env::var("CMF_ZI_VAE_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(4096).max(64) / 64 * 64
+    std::env::var("CMF_ZI_VAE_CHUNK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4096)
+        .max(64)
+        / 64
+        * 64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cpu_group_norm(
+        x: &[f32],
+        w: &[f32],
+        b: &[f32],
+        n: usize,
+        ch: usize,
+        groups: usize,
+    ) -> Vec<f32> {
+        let cg = ch / groups;
+        let mut out = vec![0.0; x.len()];
+        for g in 0..groups {
+            let c0 = g * cg;
+            let mut sum = 0.0;
+            for px in 0..n {
+                for c in c0..c0 + cg {
+                    sum += x[px * ch + c];
+                }
+            }
+            let mean = sum / (n * cg) as f32;
+            let mut sumsq = 0.0;
+            for px in 0..n {
+                for c in c0..c0 + cg {
+                    let d = x[px * ch + c] - mean;
+                    sumsq += d * d;
+                }
+            }
+            let inv = (sumsq / (n * cg) as f32 + 1e-6).sqrt().recip();
+            for px in 0..n {
+                for c in c0..c0 + cg {
+                    out[px * ch + c] = (x[px * ch + c] - mean) * inv * w[c] + b[c];
+                }
+            }
+        }
+        out
+    }
+
+    /// Flux2's decoder uses 32 groups over 96 and 192 channels.  The
+    /// compact group widths (3 and 6) are exactly the path that must not use
+    /// a whole-float4 statistic.
+    #[test]
+    fn compact_group_norm_matches_cpu_reference() {
+        let Some(c) = super::super::super::ctx() else {
+            eprintln!("Metal unavailable; compact GroupNorm test skipped");
+            return;
+        };
+        let Some(p) = pipes(c) else {
+            eprintln!("Metal Z-Image pipelines unavailable; compact GroupNorm test skipped");
+            return;
+        };
+        for &ch in &[96usize, 192] {
+            let n = 19;
+            let x: Vec<f32> = (0..n * ch)
+                .map(|i| (((i * 17 % 97) as f32) - 48.0) / 17.0)
+                .collect();
+            let w: Vec<f32> = (0..ch).map(|i| 0.55 + (i % 13) as f32 * 0.03).collect();
+            let b: Vec<f32> = (0..ch).map(|i| ((i % 11) as f32 - 5.0) * 0.02).collect();
+            let xb = buf_from(c, &x);
+            let yb = buf_zeroed(c, n * ch * 4);
+            let norm = VNorm {
+                w: buf_from(c, &w),
+                b: buf_from(c, &b),
+                groups: 32,
+            };
+            let mut rec = VRec {
+                c,
+                p,
+                done: Vec::new(),
+                cur: None,
+                part: buf_zeroed(c, 64 * 256 * 4),
+                stat: buf_zeroed(c, 64 * 2 * 4),
+            };
+            rec.gn(&norm, &xb, &yb, n, ch, false, false);
+            assert!(
+                rec.finish(),
+                "Metal GroupNorm command failed for {ch} channels"
+            );
+            let got = unsafe { std::slice::from_raw_parts(yb.contents() as *const f32, n * ch) };
+            let want = cpu_group_norm(&x, &w, &b, n, ch, 32);
+            let max_abs = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs < 3e-4,
+                "{ch}-channel GroupNorm max abs error {max_abs}"
+            );
+        }
+    }
+
+    /// The 96-channel final Flux2 stage occupies two 64-row MMA tiles.  The
+    /// second tile's padded rows must not write into the following NHWC
+    /// pixel; compare every logical output against a half-input/half-weight
+    /// CPU reference.
+    #[test]
+    fn conv_96_output_tail_matches_cpu_reference() {
+        let Some(c) = super::super::super::ctx() else {
+            eprintln!("Metal unavailable; 96-channel conv test skipped");
+            return;
+        };
+        let Some(p) = pipes(c) else {
+            eprintln!("Metal Z-Image pipelines unavailable; 96-channel conv test skipped");
+            return;
+        };
+        let (n, ic, oc) = (5usize, 32usize, 96usize);
+        let x: Vec<f32> = (0..n * ic)
+            .map(|i| ((i * 11 % 31) as f32 - 15.0) * 0.02)
+            .collect();
+        let w: Vec<f32> = (0..oc * ic)
+            .map(|i| ((i * 7 % 29) as f32 - 14.0) * 0.01)
+            .collect();
+        let b: Vec<f32> = (0..oc).map(|i| ((i % 9) as f32 - 4.0) * 0.015).collect();
+        let cv = conv_of(
+            c,
+            &VaeConvRef {
+                w: &w,
+                b: &b,
+                oc,
+                ic,
+                k: 1,
+            },
+            1.0,
+        )
+        .unwrap();
+        let xb = half_buf(c, &x);
+        let yb = buf_zeroed(c, n * oc * 4);
+        let mut rec = VRec {
+            c,
+            p,
+            done: Vec::new(),
+            cur: None,
+            part: buf_zeroed(c, 64 * 256 * 4),
+            stat: buf_zeroed(c, 64 * 2 * 4),
+        };
+        rec.conv(&cv, (&xb, 0), (&yb, 0), None, n, (1, n), false, 0, oc, 0, 0);
+        assert!(rec.finish(), "Metal 96-channel conv command failed");
+        let got = unsafe { std::slice::from_raw_parts(yb.contents() as *const f32, n * oc) };
+        let h = |v: f32| cortiq_core::quant::f16_to_f32(cortiq_core::quant::f32_to_f16(v));
+        for px in 0..n {
+            for out in 0..oc {
+                let want = b[out]
+                    + (0..ic)
+                        .map(|inp| h(w[out * ic + inp]) * h(x[px * ic + inp]))
+                        .sum::<f32>();
+                let err = (got[px * oc + out] - want).abs();
+                assert!(
+                    err <= 2e-3 + want.abs() * 2e-3,
+                    "pixel {px}, channel {out}: got {}, want {want}, abs error {err}",
+                    got[px * oc + out],
+                );
+            }
+        }
+    }
 }

@@ -854,6 +854,122 @@ impl VaeDecoder {
     }
 }
 
+/// Decoder wrapper for Diffusers `AutoencoderKLFlux2` as used by
+/// MOSS-Image.  Its denoiser emits 128 channels at a 16×-smaller grid;
+/// Flux2 first restores the BatchNorm statistics, unpatches each four
+/// channel group into a 2×2 spatial tile, optionally applies
+/// `post_quant_conv`, and only then enters the ordinary decoder.
+///
+/// Keeping this wrapper beside [`VaeDecoder`] is intentional: `Conv2d` is
+/// private implementation detail, while the staged image pipelines need the
+/// exact Flux2 pre-decode contract without duplicating the decoder.
+pub struct Flux2VaeDecoder {
+    decoder: VaeDecoder,
+    post_quant_conv: Option<Conv2d>,
+    bn_mean: Vec<f32>,
+    bn_var: Vec<f32>,
+    bn_eps: f32,
+    packed_channels: usize,
+}
+
+impl Flux2VaeDecoder {
+    /// Load a Flux2 VAE packaged below `vae.` in a CMF file.
+    pub fn from_cmf(model: &cortiq_core::CmfModel) -> Result<Self, String> {
+        let cfg: serde_json::Value = serde_json::from_slice(
+            model
+                .tensor_bytes("vae.config_json")
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("vae.config_json: {e}"))?;
+        let decoder = VaeDecoder::from_cmf(model)?;
+        let f = |name: &str| crate::dit::cmf_f32(model, name);
+        let mean = f("vae.bn.running_mean")?;
+        let var = f("vae.bn.running_var")?;
+        if mean.is_empty() || mean.len() != var.len() || mean.len() % 4 != 0 {
+            return Err(format!(
+                "Flux2 VAE BN must have a nonempty channel count divisible by 4 (mean {}, var {})",
+                mean.len(),
+                var.len()
+            ));
+        }
+        let post_quant_conv = if model.tensor("vae.post_quant_conv.weight").is_some() {
+            let w = f("vae.post_quant_conv.weight")?;
+            let b = f("vae.post_quant_conv.bias")?;
+            let e = model
+                .tensor("vae.post_quant_conv.weight")
+                .ok_or("missing vae.post_quant_conv.weight")?;
+            if e.shape.len() != 4 || e.shape[2] != e.shape[3] {
+                return Err("Flux2 post_quant_conv must be square 2-D convolution".into());
+            }
+            let (oc, ic, k) = (e.shape[0], e.shape[1], e.shape[2]);
+            if w.len() != oc * ic * k * k || b.len() != oc {
+                return Err("Flux2 post_quant_conv shape/bias mismatch".into());
+            }
+            Some(Conv2d { w, b, oc, ic, k })
+        } else {
+            None
+        };
+        Ok(Self {
+            decoder,
+            post_quant_conv,
+            bn_mean: mean,
+            bn_var: var,
+            bn_eps: cfg["batch_norm_eps"].as_f64().unwrap_or(1e-4) as f32,
+            packed_channels: cfg["latent_channels"].as_u64().unwrap_or(32) as usize,
+        })
+    }
+
+    /// Compile/upload the reusable decoder chain while another image stage runs.
+    /// The small Flux2 `post_quant_conv` stays on the host before the chain.
+    pub fn prewarm(&self) -> bool {
+        crate::gpu::vae_prewarm(&self.decoder.chain_args())
+    }
+
+    /// Decode a channels-first Flux2 packed latent `[4*C, h, w]` into RGB.
+    /// `h`/`w` are the denoiser grid; RGB is `16h × 16w`.
+    pub fn decode_fast(&self, packed: &[f32], h: usize, w: usize) -> Result<Vec<f32>, String> {
+        let channels = self.bn_mean.len();
+        let hw = h.checked_mul(w).ok_or("Flux2 latent dimensions overflow")?;
+        if packed.len() != channels * hw || channels != self.packed_channels * 4 {
+            return Err(format!(
+                "Flux2 packed latent has {} values; expected {} channels × {}×{}",
+                packed.len(),
+                channels,
+                h,
+                w
+            ));
+        }
+        // Exact source ordering:
+        // [B, 4C, h, w] -> [B,C,2,2,h,w] -> permute(C,h,2,w,2).
+        let mut z = vec![0f32; self.packed_channels * 4 * hw];
+        for c4 in 0..channels {
+            let scale = (self.bn_var[c4] + self.bn_eps).sqrt();
+            let src = &packed[c4 * hw..(c4 + 1) * hw];
+            let c = c4 / 4;
+            let rem = c4 % 4;
+            let dy = rem / 2;
+            let dx = rem % 2;
+            for yy in 0..h {
+                for xx in 0..w {
+                    z[c * (4 * hw) + (2 * yy + dy) * (2 * w) + 2 * xx + dx] =
+                        src[yy * w + xx] * scale + self.bn_mean[c4];
+                }
+            }
+        }
+        let (h2, w2) = (h * 2, w * 2);
+        if let Some(conv) = &self.post_quant_conv {
+            if conv.ic != self.packed_channels {
+                return Err(format!(
+                    "Flux2 post_quant_conv expects {} channels, unpatch produced {}",
+                    conv.ic, self.packed_channels
+                ));
+            }
+            z = conv.apply(&z, h2, w2);
+        }
+        Ok(self.decoder.decode_fast(&z, h2, w2))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

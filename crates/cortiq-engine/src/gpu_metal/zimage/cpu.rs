@@ -150,7 +150,11 @@ fn pool() -> &'static Pool {
 }
 
 fn env_threads() -> usize {
-    std::env::var("CMF_ZI_CPU_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4).max(1)
+    std::env::var("CMF_ZI_CPU_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4)
+        .max(1)
 }
 
 fn f16_lut() -> &'static [f32] {
@@ -179,7 +183,10 @@ fn wait(ev: &SharedEventRef, v: u64, cmds: &[CommandBuffer]) -> bool {
         }
         std::thread::sleep(std::time::Duration::from_micros(50));
         if spins % 2000 == 0 {
-            if cmds.iter().any(|c| c.status() == metal::MTLCommandBufferStatus::Error) {
+            if cmds
+                .iter()
+                .any(|c| c.status() == metal::MTLCommandBufferStatus::Error)
+            {
                 return false;
             }
             if t0.elapsed().as_secs() > 600 {
@@ -226,7 +233,11 @@ fn run(j: &CpuJob, s: &mut Scratch) {
         // int8 rows r0..r1 → f32 · row scale
         {
             let ws = SendPtr(s.w.as_mut_ptr());
-            let (wb, rsb, r0) = (SendPtr(j.w[z] as *mut i8), SendPtr(j.rs[z] as *mut f32), j.r0);
+            let (wb, rsb, r0) = (
+                SendPtr(j.w[z] as *mut i8),
+                SendPtr(j.rs[z] as *mut f32),
+                j.r0,
+            );
             p.run_rows(rc, &|lo, hi| {
                 let (ws, wb, rsb) = (&ws, &wb, &rsb);
                 for r in lo..hi {
@@ -331,7 +342,8 @@ pub(super) fn execute(
     if std::env::var("CMF_ZI_CPU_PROF").as_deref() == Ok("1") {
         eprintln!(
             "zimage cpu share {:.2}: {} jobs, cpu late {late} / early {early} · wait {:.3}s · x->f32 {:.3}s · w dequant {:.3}s · sgemm {:.3}s · y->f16 {:.3}s",
-            jobs.first().map_or(0.0, |j| (j.r1 - j.r0) as f64 / j.r1 as f64),
+            jobs.first()
+                .map_or(0.0, |j| (j.r1 - j.r0) as f64 / j.r1 as f64),
             jobs.len(),
             s.t[0],
             s.t[1],

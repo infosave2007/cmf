@@ -145,6 +145,9 @@ pub struct Pipeline {
     /// Gemma-3n stack (AltUp/LAuReL/PLE/KV-sharing): its own forward —
     /// weights.layers stays empty, the KV caches are the shared ones.
     pub g3n: Option<Box<(crate::g3n::G3nGlobals, Vec<crate::g3n::G3nLayer>)>>,
+    /// Gemma-4 E-series stack (dual-geometry gemma4 + PLE + shared KV):
+    /// its own per-token forward, same contract as `g3n`.
+    pub g4e: Option<Box<(crate::g4e::G4eGlobals, Vec<crate::g4e::G4eLayer>)>>,
     /// DeepSeek-V4 runs its own stack too: its hidden state is `hc_mult`
     /// copies of a vector, so no loop written for a single residual
     /// stream can carry it.
@@ -206,6 +209,13 @@ pub struct Pipeline {
     /// from trunk decode so block batching can be judged without conflating
     /// it with GPU chain variance.
     pub dspark_draft_ns: u128,
+    /// Per-layer winners of the last pooled route — the admission predictor.
+    m3_winners: Vec<Vec<u32>>,
+    /// Route frequency per (layer, expert) — the bank's prewarm profile.
+    m3_counts: Vec<u32>,
+    m3_n_exp: usize,
+    m3_tokens: u64,
+    m3_prewarmed: bool,
     /// LFM2 short-convolution geometry (present when the model has
     /// `ShortConv` mixer layers).
     pub short_conv_cfg: Option<ShortConvCfg>,
@@ -478,8 +488,9 @@ pub struct LayerWeights {
     pub attn: AttnKind,
 }
 
-/// FFN gate activation: SiLU (SwiGLU family) or tanh-GELU (Gemma's
-/// GeGLU). A property of the model, carried on every FFN triple.
+/// FFN gate activation: SiLU (SwiGLU family), tanh-GELU (Gemma's GeGLU),
+/// or a source-specific gated contract. A property of the model, carried on
+/// every FFN triple.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub enum Act {
     #[default]
@@ -492,6 +503,14 @@ pub enum Act {
     Situ {
         beta: f32,
         linear_beta: f32,
+    },
+    /// MiniMax M3's SwiGLU-OAI: upper-clamped gate, symmetrically clamped
+    /// up branch, `sigmoid(alpha * gate)`, and a `+1` up-branch offset.
+    /// It deliberately has no generic GPU graph arm until a matching kernel
+    /// exists; CPU uses the exact scalar reference in `inference`.
+    SwiGluOai {
+        alpha: f32,
+        limit: f32,
     },
 }
 
@@ -513,8 +532,25 @@ impl Act {
                 beta: arch.activation_situ_beta.unwrap_or(1.0) as f32,
                 linear_beta: arch.activation_situ_linear_beta.unwrap_or(0.0) as f32,
             },
+            // `swigluoai` alone is deliberately not a generic activation
+            // alias.  Its alpha/limit are part of MiniMax M3's checked
+            // source contract, and accepting that string on an unrelated
+            // architecture would silently impose M3 math on its FFN.
+            "swigluoai" if arch.arch_name == "minimax_m3_vl" => Self::SwiGluOai {
+                alpha: 1.702,
+                limit: 7.0,
+            },
             other => Self::from_arch(other),
         }
+    }
+
+    /// Construct the MiniMax M3 SwiGLU-OAI activation from a checked model
+    /// contract. This is intentionally explicit rather than recognizing an
+    /// arbitrary `hidden_act` string: callers must validate `alpha` and
+    /// `limit` against their source architecture before enabling it.
+    #[inline]
+    pub fn swiglu_oai(alpha: f32, limit: f32) -> Self {
+        Self::SwiGluOai { alpha, limit }
     }
 
     #[inline]
@@ -524,6 +560,10 @@ impl Act {
             Self::GeluTanh => inference::gelu_tanh(x),
             Self::Gelu => inference::gelu_erf(x),
             Self::Situ { beta, .. } => beta * (x / beta).tanh() * (1.0 / (1.0 + (-x).exp())),
+            Self::SwiGluOai { alpha, limit } => {
+                let gate = x.min(limit);
+                gate * (1.0 / (1.0 + (-alpha * gate).exp()))
+            }
         }
     }
 
@@ -534,6 +574,9 @@ impl Act {
         match self {
             Self::Situ { linear_beta, .. } if linear_beta > 0.0 => {
                 self.apply(g) * (linear_beta * (u / linear_beta).tanh())
+            }
+            Self::SwiGluOai { alpha, limit } => {
+                inference::swiglu_oai(g, u, alpha, 1.0, Some(limit))
             }
             _ => self.apply(g) * u,
         }
@@ -547,7 +590,33 @@ impl Act {
             Self::Silu => Some(crate::gpu::GraphAct::Silu),
             Self::Gelu => Some(crate::gpu::GraphAct::GeluErf),
             Self::GeluTanh => Some(crate::gpu::GraphAct::GeluTanh),
-            Self::Situ { .. } => None,
+            Self::Situ { .. } | Self::SwiGluOai { .. } => None,
+        }
+    }
+
+    /// The WGPU graph arm.  Keep this deliberately separate from
+    /// `graph_act`: OAI needs its dedicated code rather than a generic SiLU
+    /// fallback.  Only the frozen MiniMax-M3 source constants get a device
+    /// code; a future OAI-like architecture with different constants must add
+    /// and test its own kernel contract.
+    pub(crate) fn wgpu_graph_act(self) -> Option<crate::gpu::GraphAct> {
+        self.moe_job_graph_contract().map(|(act, _)| act)
+    }
+
+    /// The exact device contract for a gate/up/down MoE job.  OAI is not a
+    /// generic "clamped SiLU": code 3 commits a backend to MiniMax M3's
+    /// alpha, asymmetric up transform, and frozen clamp.  Keep the clamp
+    /// alongside the marker so a backend cannot accidentally run code 3 with
+    /// a nearby model's limit.
+    pub(crate) fn moe_job_graph_contract(self) -> Option<(crate::gpu::GraphAct, f32)> {
+        match self {
+            Self::SwiGluOai { alpha, limit }
+                if alpha.to_bits() == 1.702f32.to_bits()
+                    && limit.to_bits() == 7.0f32.to_bits() =>
+            {
+                Some((crate::gpu::GraphAct::SwiGluOaiM3, 7.0))
+            }
+            _ => self.graph_act().map(|act| (act, 0.0)),
         }
     }
 }
@@ -627,8 +696,9 @@ pub struct MoeFfn {
     pub router_sigmoid: bool,
     /// Addend in the selected-score denominator of a sigmoid router.
     /// Most supported checkpoints use the historical `1e-6` floor; Flint's
-    /// reference routing uses `1e-20`.  This is per-MoE rather than a global
-    /// family switch because the same sigmoid routing law has both contracts.
+    /// reference routing uses `1e-20`; MiniMax M3.1 preserves the same FP32
+    /// `sum + 1e-20` law. This is per-MoE rather than a global family switch
+    /// because the same sigmoid routing law has several contracts.
     pub sigmoid_denom_eps: f32,
     /// Per-expert selection bias `mlp.expert_bias` [num_experts]
     /// (LFM2-MoE): added to the sigmoid scores for the top-k CHOICE only;
@@ -1352,9 +1422,16 @@ impl Pipeline {
         )
     }
 
+    /// Architectures that run a dedicated per-token stack (gemma-3n's
+    /// AltUp flow, the gemma-4 E-series PLE/shared-KV body): batched
+    /// prefill and the graphs stay off for them.
+    fn per_token_stack(&self) -> bool {
+        self.g3n.is_some() || self.g4e.is_some()
+    }
+
     fn chunk_stack_facts(&self) -> ChunkStackFacts {
         let plain_dense = !self.weights.layers.is_empty()
-            && self.g3n.is_none()
+            && !self.per_token_stack()
             && self.dsv4.is_none()
             && self.dsv41.is_none()
             && self.qwen4_exp.is_none()
@@ -1970,7 +2047,12 @@ impl Pipeline {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            (self.global_attn.is_some() || self.attn_v_norm)
+            // An EMPTY layer stack (`all()` is vacuously true) plus a
+            // gemma4 geometry flag is exactly the gemma-4 E-series
+            // per-token stack — it has no batch graph rows to ingest.
+            !self.weights.layers.is_empty()
+                && !self.per_token_stack()
+                && (self.global_attn.is_some() || self.attn_v_norm)
                 && crate::gpu::g4_batch_on()
                 && crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Prefill)
                 && crate::gpu::enabled_here()
@@ -3513,6 +3595,7 @@ impl Pipeline {
             gdn_cfg: None,
             kda_cfg: None,
             g3n: None,
+            g4e: None,
             dsv4: None,
             dsv41: None,
             dsv41_vision: None,
@@ -3526,6 +3609,11 @@ impl Pipeline {
             dspark_trunk_picks: Vec::new(),
             dspark_exp: Vec::new(),
             dspark_draft_ns: 0,
+            m3_winners: Vec::new(),
+            m3_counts: Vec::new(),
+            m3_n_exp: 0,
+            m3_tokens: 0,
+            m3_prewarmed: false,
             logit_multiplier: None,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             graph_failed: std::sync::atomic::AtomicBool::new(false),
@@ -4975,7 +5063,7 @@ impl Pipeline {
             && (crate::gpu::q1_force() || crate::gpu::q2tp_gpu_opt_in())
             && crate::gpu::enabled_here()
             && self.gdn_cfg.is_some()
-            && self.g3n.is_none()
+            && !self.per_token_stack()
             && input_ids.len() > 8
             && std::env::var("CMF_MTP_CHAIN_PROBE").is_err()
             && std::env::var("CMF_METAL_PREFILL").as_deref() != Ok("0")
@@ -5144,7 +5232,7 @@ impl Pipeline {
             && !dyn_prefill
             && !graph_prefill
             && self.can_prefill_batched()
-            && self.g3n.is_none()
+            && !self.per_token_stack()
             && o1_prefill.is_none()
             && input_ids.len() > 2
         {
@@ -5624,14 +5712,35 @@ impl Pipeline {
                 (None, Some(lg)) => lg,
                 (None, None) => {
                     let _prof = crate::cpuprof::time(crate::cpuprof::Slot::Head);
-                    inference::rms_norm_into(
-                        &hidden,
-                        &self.weights.final_norm,
-                        self.rms_eps,
-                        self.norm_style,
-                        &mut self.ws.n1,
-                    );
-                    self.lm_head_forward(&self.ws.n1)
+                    // Pooled-tail mode: the head as one layer-less device
+                    // pass (final-norm + matvec + readback). Any decline —
+                    // no pool, unresolvable weight, backend off — keeps the
+                    // host head exactly as before.
+                    #[cfg(feature = "gpu")]
+                    let logits_out = if let Some(lg) = self.m3_device_logits(&hidden) {
+                        lg
+                    } else {
+                        inference::rms_norm_into(
+                            &hidden,
+                            &self.weights.final_norm,
+                            self.rms_eps,
+                            self.norm_style,
+                            &mut self.ws.n1,
+                        );
+                        self.lm_head_forward(&self.ws.n1)
+                    };
+                    #[cfg(not(feature = "gpu"))]
+                    let logits_out = {
+                        inference::rms_norm_into(
+                            &hidden,
+                            &self.weights.final_norm,
+                            self.rms_eps,
+                            self.norm_style,
+                            &mut self.ws.n1,
+                        );
+                        self.lm_head_forward(&self.ws.n1)
+                    };
+                    logits_out
                 }
             };
             // CMF_LOGIT_DUMP=<path>: the first decode step's hidden + logits
@@ -8234,7 +8343,7 @@ impl Pipeline {
         // feature-by-feature test says "supported" for a model that has no
         // layers here at all.
         !self.weights.layers.is_empty()
-            && self.g3n.is_none()
+            && !self.per_token_stack()
             && !self
                 .weights
                 .layers
@@ -8546,6 +8655,53 @@ impl Pipeline {
                 layer.linear_scratch.clear();
             }
         }
+    }
+
+    /// This is the encoder counterpart to `forward_ids`: it runs a fresh
+    /// sequence through the existing full/GDN hybrid stack and returns the
+    /// final RMS-normalized hidden row for *every* token.  It is used by
+    /// component pipelines whose text tower intentionally has no LM head
+    /// (such as an image-conditioner Qwen3.5 model).  The sequence state is
+    /// always released before returning, so a large text tower can be dropped
+    /// immediately after conditioning a subsequent stage.
+    pub fn encode_hidden_states(&mut self, ids: &[u32]) -> Result<Vec<f32>, String> {
+        #[cfg(target_os = "macos")]
+        crate::gpu_metal::set_io_namespace(self.graph_kv_id);
+        if ids.is_empty() {
+            return Err("empty id sequence".to_string());
+        }
+
+        self.nll_begin()?;
+        let result = (|| {
+            let hidden = self.prefill_input_rows(PrefillIn::Ids(ids), 0, None)?;
+            self.nll_check_graph("encoder prefill", 0)?;
+            let expected = ids.len() * self.hidden_size;
+            if hidden.len() != expected {
+                return Err(format!(
+                    "encoder prefill returned {} values for {} rows of hidden size {}",
+                    hidden.len(),
+                    ids.len(),
+                    self.hidden_size
+                ));
+            }
+
+            let mut out = vec![0.0f32; expected];
+            for (src, dst) in hidden
+                .chunks_exact(self.hidden_size)
+                .zip(out.chunks_exact_mut(self.hidden_size))
+            {
+                inference::rms_norm_into(
+                    src,
+                    &self.weights.final_norm,
+                    self.rms_eps,
+                    self.norm_style,
+                    dst,
+                );
+            }
+            Ok(out)
+        })();
+        self.nll_end();
+        result
     }
 
     /// Forward a full id sequence from a fresh cache and return the
@@ -9204,7 +9360,7 @@ impl Pipeline {
                     .ln()
                     + max as f64;
                 let tok_nll = lse - logits[target] as f64;
-                if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 48 {
+                if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 10_000 {
                     let top = logits
                         .iter()
                         .enumerate()
@@ -9248,7 +9404,7 @@ impl Pipeline {
             .ln()
             + max as f64;
         let tok_nll = lse - logits[target] as f64;
-        if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 48 {
+        if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 10_000 {
             let top = logits
                 .iter()
                 .enumerate()
@@ -9639,7 +9795,7 @@ impl Pipeline {
                     .ln()
                     + max as f64;
                 let tok_nll = lse - logits[target] as f64;
-                if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 48 {
+                if std::env::var("CMF_PPL_TRACE").is_ok() && pos < 10_000 {
                     let top = logits
                         .iter()
                         .enumerate()
@@ -10488,6 +10644,10 @@ impl Pipeline {
         }
         // Gemma-3n: the per-layer-embedding half needs the token ID, so
         // it rides appended to the embedding; the g3n forward splits it.
+        // Gemma-4 E-series PLE: same contract, its own table.
+        if let Some(b) = &self.g4e {
+            return b.0.extend_embedding(id, &out, self.pool.as_deref());
+        }
         if let Some(b) = &self.g3n {
             return b.0.extend_embedding(id, &out, self.pool.as_deref());
         }
@@ -11698,9 +11858,9 @@ impl Pipeline {
                 "network split: Qwen3.8-Flash-Next hyper/QSA stack is not splittable yet".into(),
             );
         }
-        if self.g3n.is_some() {
+        if self.per_token_stack() {
             return Err(
-                "network split: Gemma-3n runs its own AltUp stack (not splittable yet)".into(),
+                "network split: the per-token stack (gemma-3n AltUp / gemma-4 E-series) is not splittable yet".into(),
             );
         }
         Ok(())
@@ -11916,6 +12076,322 @@ impl Pipeline {
         )
     }
 
+    /// The pooled tail's device lm_head: final-norm + head as one
+    /// layer-less graph pass, so decode stops paying the double-digit
+    /// millisecond host matvec every token. `None` keeps the host head.
+    #[cfg(feature = "gpu")]
+    fn m3_device_logits(&self, hidden: &[f32]) -> Option<Vec<f32>> {
+        if !crate::minicpm_tail::minimax_pool_on()
+            || !crate::gpu::enabled_here()
+            || self.head_clusters.is_some()
+            || self.graph_failed.load(std::sync::atomic::Ordering::Relaxed)
+            || std::env::var("CMF_GPU_LMHEAD").map(|v| v != "0") == Ok(false)
+        {
+            return None;
+        }
+        let (model, i, kind, rs) = self
+            .weights
+            .lm_head
+            .graph_weight()
+            .or_else(|| self.weights.lm_head.graph_weight_descriptor())?;
+        let name = &model.tensors[i].name;
+        let prism = if crate::prism::is_inverse_embedding(&model, name) {
+            crate::gpu::GraphPrismOp::InverseEmbedding
+        } else if crate::prism::is_forward_weight(&model, name) {
+            crate::gpu::GraphPrismOp::Forward
+        } else {
+            crate::gpu::GraphPrismOp::None
+        };
+        let gw = crate::gpu::GraphW {
+            idx: i,
+            kind,
+            row_scale: rs,
+            data: &[],
+            prism,
+            affine: crate::prism::is_affine_target(&model, name),
+        };
+        let rows = self.weights.lm_head.rows();
+        let mut h = hidden.to_vec();
+        let mut lg = Vec::new();
+        let mut layers_run = 0usize;
+        let outcome = crate::gpu::forward_token_graph(
+            &model,
+            self.graph_kv_id,
+            &[],
+            &[],
+            self.o1_epoch,
+            &self.inv_freq,
+            &mut h,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.attn_scale,
+            self.head_dim,
+            self.hidden_size,
+            self.intermediate_size,
+            0,
+            self.kv_cache.max_seq_len,
+            self.norm_style == cortiq_core::NormStyle::Gemma,
+            self.rms_eps as f32,
+            Some((&gw, rows)),
+            &self.weights.final_norm,
+            &mut lg,
+            &[],
+            1,
+            None,
+            None,
+            Some(&mut layers_run),
+            0,
+            false,
+        );
+        if outcome != crate::gpu::TokenGraphOutcome::Completed || lg.is_empty() {
+            return None;
+        }
+        // The same post-steps the host head applies — keep sampling
+        // identical whichever arm produced the logits.
+        lg.resize(self.vocab_size, 0.0);
+        if let Some(m) = self.logit_multiplier {
+            for l in lg.iter_mut() {
+                *l *= m;
+            }
+        }
+        if let Some(c) = self.final_softcap {
+            softcap_in_place(&mut lg, c, self.pool.as_deref());
+        }
+        Some(lg)
+    }
+
+    /// Record one token-layer's winners into the route-frequency profile and
+    /// write it out every 16 tokens when `CMF_M3_PROFILE_SAVE=<path>` is set.
+    fn m3_note_route(&mut self, li: usize, winners: &[u32]) {
+        if winners.is_empty() {
+            return;
+        }
+        if self.m3_n_exp == 0 {
+            self.m3_n_exp = crate::minicpm_tail::minimax_n_experts(&self.weights.layers, self.phys_layer(0)).max(1);
+            self.m3_counts = vec![0; self.num_layers * self.m3_n_exp];
+        }
+        for &e in winners {
+            let e = e as usize;
+            if e < self.m3_n_exp && li < self.num_layers {
+                self.m3_counts[li * self.m3_n_exp + e] = self.m3_counts[li * self.m3_n_exp + e].saturating_add(1);
+            }
+        }
+        if li + 1 == self.num_layers {
+            self.m3_tokens += 1;
+            if self.m3_tokens % 16 == 0 {
+                if let Ok(path) = std::env::var("CMF_M3_PROFILE_SAVE") {
+                    let bytes: Vec<u8> = self.m3_counts.iter().flat_map(|c| c.to_le_bytes()).collect();
+                    let _ = std::fs::write(&path, bytes);
+                }
+            }
+        }
+    }
+
+    /// Admit the most frequent (layer, expert) pairs of a saved profile into
+    /// the bank before the first token: `CMF_M3_PROFILE=<path>` names the
+    /// file, `CMF_M3_PREWARM_N` (default 300) bounds how many experts go in.
+    /// The bank's own eviction stays in charge; prewarm only chooses order.
+    fn m3_prewarm(&mut self) {
+        let Ok(path) = std::env::var("CMF_M3_PROFILE") else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(&path) else {
+            tracing::warn!("m3 prewarm: cannot read profile {path}");
+            return;
+        };
+        let counts: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let n_exp = crate::minicpm_tail::minimax_n_experts(&self.weights.layers, self.phys_layer(0)).max(1);
+        if counts.len() != self.num_layers * n_exp {
+            tracing::warn!("m3 prewarm: profile size {} does not match {}x{}", counts.len(), self.num_layers, n_exp);
+            return;
+        }
+        let limit: usize = std::env::var("CMF_M3_PREWARM_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+        let mut ranked: Vec<(u32, usize, usize)> = counts
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c > 0)
+            .map(|(i, &c)| (c, i / n_exp, i % n_exp))
+            .collect();
+        ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        ranked.truncate(limit);
+        let mut per_layer: Vec<Vec<usize>> = vec![Vec::new(); self.num_layers];
+        for (_, li, e) in ranked {
+            per_layer[li].push(e);
+        }
+        let mut admitted = 0usize;
+        for (li, ids) in per_layer.iter().enumerate() {
+            if ids.is_empty() {
+                continue;
+            }
+            let lw = &self.weights.layers[self.phys_layer(li)];
+            let FfnKind::Moe(m) = &lw.ffn else {
+                continue;
+            };
+            // Arming installs the layer's layout; nothing predicted yet.
+            let _ = crate::minicpm_tail::minimax_pool_arm(m, li, self.num_layers, &[]);
+            if crate::minicpm_tail::minimax_pool_ensure(m, li, self.num_layers, ids) {
+                admitted += ids.len();
+            }
+        }
+        tracing::info!("m3 prewarm: admitted {admitted} experts from {path}");
+    }
+
+    /// One MiniMax tail layer through the pooled token-graph arm: attention,
+    /// the pre-FFN norm, device routing and the descriptor-indexed expert
+    /// bank in ONE submit (one sync instead of host attention + a MoE
+    /// frame), with cold experts finished on the host against the read-back
+    /// FFN input and admitted for the next token.
+    ///
+    /// `Ok(true)` — the layer is done (hidden replaced). `Ok(false)` —
+    /// decline before any device mutation; the ordinary host path owns this
+    /// position. `Err(())` — the device failed after admission; the caller
+    /// must stop the sequence exactly like a failed span run.
+    #[cfg(feature = "gpu")]
+    fn m3_pooled_layer(&mut self, li: usize, position: usize, h: &mut Vec<f32>) -> Result<bool, ()> {
+        if self.o1_active() || self.attn_softcap > 0.0 {
+            return Ok(false);
+        }
+        if !self.m3_prewarmed {
+            self.m3_prewarmed = true;
+            self.m3_prewarm();
+        }
+        let frame = {
+            let lw = &self.weights.layers[self.phys_layer(li)];
+            let FfnKind::Moe(m) = &lw.ffn else {
+                return Ok(false);
+            };
+            if !crate::minicpm_tail::MiniCpmTail::is_requested_target(m) {
+                return Ok(false);
+            }
+            let t_arm = std::time::Instant::now();
+            if self.m3_winners.len() != self.num_layers {
+                self.m3_winners = vec![Vec::new(); self.num_layers];
+            }
+            let pred = std::mem::take(&mut self.m3_winners[li]);
+            let armed = crate::minicpm_tail::minimax_pool_arm(m, li, self.num_layers, &pred);
+            if armed.is_none() {
+                self.m3_winners[li] = pred; // declined before anything ran
+            }
+            M3_ARM_NS.fetch_add(t_arm.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            match armed {
+                Some(frame) => frame,
+                // First-call refusal (geometry/bank): the host layer still
+                // runs; nothing was mutated.
+                None => return Ok(false),
+            }
+        };
+        crate::gpu_wgpu::pooled_frame_enter(frame);
+        // The pooled call must not fold lm_head: its cold experts have to
+        // land before any final norm. The decode loop re-arms this flag for
+        // the next position anyway.
+        let want_logits = self.graph_want_logits;
+        self.graph_want_logits = false;
+        let mut lg = Vec::new();
+        let mut gl = 0usize;
+        let t_span = std::time::Instant::now();
+        let span = crate::gpu::gpu_scope(|| {
+            self.try_token_graph_wgpu_span(h, position, &mut lg, li, li + 1, &mut gl)
+        });
+        self.graph_want_logits = want_logits;
+        M3_SPAN_NS.fetch_add(t_span.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        let hh = match span {
+            Some(Ok(hh)) => hh,
+            Some(Err(())) => return Err(()),
+            None => {
+                // Declined before submission (seed/resolve/refusal): the
+                // device mirror has not moved, so the host path is exact.
+                return Ok(false);
+            }
+        };
+        if gl != 1 {
+            // A single-layer run that reports no layer mutated nothing we
+            // may build on; anything else is a contract break.
+            return if gl == 0 { Ok(false) } else { Err(()) };
+        }
+        *h = hh;
+        let winners = crate::gpu_wgpu::pooled_frame_take_winners();
+        self.m3_note_route(li, &winners);
+        if self.m3_winners.len() != self.num_layers {
+            self.m3_winners = vec![Vec::new(); self.num_layers];
+        }
+        self.m3_winners[li] = winners;
+        let mut cold = crate::gpu_wgpu::pooled_frame_take_cold();
+        // A non-finite parsed weight would poison the residual for the rest
+        // of the sequence — drop such entries loudly instead.
+        cold.retain(|&(_, w)| {
+            if w.is_finite() {
+                true
+            } else {
+                tracing::error!("pooled tail: non-finite cold weight from expert route");
+                false
+            }
+        });
+        if cold.is_empty() {
+            return Ok(true);
+        }
+        let x = crate::gpu_wgpu::pooled_frame_take_input();
+        if x.len() != self.hidden_size {
+            return Err(());
+        }
+        // Cold experts: on the device first (admit, then one prepared frame
+        // over exactly those slots — one submit for the layer). The host
+        // computes them only when the device declines, and then they are
+        // admitted for the next token. `CMF_M3_COLD_CPU=1` forces the host
+        // arm for an A/B measurement.
+        let lw = &self.weights.layers[self.phys_layer(li)];
+        let FfnKind::Moe(m) = &lw.ffn else {
+            return Err(());
+        };
+        let t_cold = std::time::Instant::now();
+        let force_host = std::env::var("CMF_M3_COLD_CPU").as_deref() == Ok("1");
+        let mut out = crate::attention::take_buf(self.hidden_size);
+        let on_device = !force_host
+            && crate::minicpm_tail::minimax_cold_device(m, li, self.num_layers, &cold, &x, &mut out);
+        if !on_device {
+            crate::attention::recycle_buf(&mut out);
+            let jobs: Vec<(&crate::pipeline::DenseFfn, f32)> = cold
+                .iter()
+                .map(|&(e, w)| m.experts.get(e).map(|ex| (ex, w)).ok_or(()))
+                .collect::<Result<_, ()>>()?;
+            out = crate::gpu::cpu_scope(|| {
+                crate::pipeline::moe_cold_experts_cpu(&jobs, &x, self.pool.as_deref())
+            });
+            let ids: Vec<usize> = cold.iter().map(|&(e, _)| e).collect();
+            let _ = crate::minicpm_tail::minimax_pool_ensure(m, li, self.num_layers, &ids);
+        }
+        M3_COLD_NS.fetch_add(t_cold.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        M3_COLD_N.fetch_add(cold.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        if out.len() != h.len() {
+            crate::attention::recycle_buf(&mut out);
+            return Err(());
+        }
+        for (dst, src) in h.iter_mut().zip(out.iter()) {
+            *dst += src;
+        }
+        crate::attention::recycle_buf(&mut out);
+        if on_device {
+            M3_COLD_DEV_N.fetch_add(cold.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(true)
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    fn m3_pooled_layer(
+        &mut self,
+        _li: usize,
+        _position: usize,
+        _h: &mut Vec<f32>,
+    ) -> Result<bool, ()> {
+        Ok(false)
+    }
+
     /// Greedy burst: forward `t_next` and let the device pick + re-embed
     /// the next k−1 tokens — k frames, ONE submit, k ids back. The ZML
     /// trade, on wgpu. None ⇒ caller keeps the per-token path.
@@ -12125,7 +12601,7 @@ impl Pipeline {
                     // An activation the graph has no kernel arm for keeps
                     // the CPU/per-op owner, by name — the dense graph FFN
                     // used to compute SiLU for whatever the model asked.
-                    let Some(act) = d.act.graph_act() else {
+                    let Some(act) = d.act.wgpu_graph_act() else {
                         self.note_graph_decline(
                             "wgpu token graph",
                             "dense FFN activation without a graph kernel",
@@ -12226,15 +12702,24 @@ impl Pipeline {
                     let mut gu_q2: Option<bool> = None;
                     // q8_2f experts (gate, up and down): their own kernels.
                     let mut q82: Option<bool> = None;
+                    // One MoE gate/up kernel serves the complete packed bank.
+                    // Bind an activation only when every routed (and in-bank
+                    // shared) expert owns the same exact WGPU contract.
+                    let mut moe_act = None;
                     for e in m
                         .experts
                         .iter()
                         .chain(shared.filter(|_| has_shared).map(|(se, _)| se).into_iter())
                     {
-                        if !matches!(e.act, Act::Silu)
-                            || e.gate_proj.rows() != inter
-                            || e.up_proj.rows() != inter
-                        {
+                        let Some(e_act) = e.act.wgpu_graph_act() else {
+                            return None;
+                        };
+                        match moe_act {
+                            Some(existing) if existing != e_act => return None,
+                            None => moe_act = Some(e_act),
+                            _ => {}
+                        }
+                        if e.gate_proj.rows() != inter || e.up_proj.rows() != inter {
                             return None;
                         }
                         // Expert tensors are packed into one resident buffer
@@ -12342,6 +12827,7 @@ impl Pipeline {
                             .filter(|k| *k > 0 && *k <= m.top_k)
                             .unwrap_or(m.top_k),
                         inter,
+                        act: moe_act?,
                         norm_topk: m.norm_topk_prob,
                         q4tp: q4tp?,
                         gu_q2: gu_q2.unwrap_or(false),
@@ -13810,7 +14296,7 @@ impl Pipeline {
             || self.dsv4.is_some()
             || self.dsv41.is_some()
             || self.qwen4_exp.is_some()
-            || self.g3n.is_some()
+            || self.per_token_stack()
         {
             return Err(false);
         }
@@ -14139,7 +14625,7 @@ impl Pipeline {
                         return None;
                     }
                     FfnKind::Dense(d) => {
-                        let Some(act) = d.act.graph_act() else {
+                        let Some(act) = d.act.wgpu_graph_act() else {
                             if batch_debug {
                                 eprintln!(
                                     "batch graph: dense FFN activation {:?} without a graph kernel at layer {li}",
@@ -14196,11 +14682,20 @@ impl Pipeline {
                         let mut q4tp: Option<bool> = None;
                         let mut gu_q2: Option<bool> = None;
                         let mut q82: Option<bool> = None;
+                        // The packed MoE graph has one gate/up program per
+                        // layer, so accept only one exact activation contract
+                        // across routed and in-bank shared experts.
+                        let mut moe_act = None;
                         for e in m.experts.iter().chain(shared.map(|(se, _)| se)) {
-                            if !matches!(e.act, Act::Silu)
-                                || e.gate_proj.rows() != inter
-                                || e.up_proj.rows() != inter
-                            {
+                            let Some(e_act) = e.act.wgpu_graph_act() else {
+                                return None;
+                            };
+                            match moe_act {
+                                Some(existing) if existing != e_act => return None,
+                                None => moe_act = Some(e_act),
+                                _ => {}
+                            }
+                            if e.gate_proj.rows() != inter || e.up_proj.rows() != inter {
                                 return None;
                             }
                             // Same ladder as the token graph: q4t → q2tp
@@ -14279,6 +14774,7 @@ impl Pipeline {
                             n_exp: m.experts.len(),
                             top_k: m.top_k,
                             inter,
+                            act: moe_act?,
                             norm_topk: m.norm_topk_prob,
                             q4tp: q4tp?,
                             gu_q2: gu_q2.unwrap_or(false),
@@ -15048,7 +15544,7 @@ impl Pipeline {
             || self.logit_multiplier.is_some()
             || self.attn_softcap != 0.0
             || self.mtp.is_some()
-            || self.g3n.is_some()
+            || self.per_token_stack()
             || self.dsv4.is_some()
             || self.dsv41.is_some()
             || self.qwen4_exp.is_some()
@@ -15774,7 +16270,7 @@ impl Pipeline {
                 || (self.dsv4.is_none()
                     && self.dsv41.is_none()
                     && self.qwen4_exp.is_none()
-                    && self.g3n.is_none())
+                    && !self.per_token_stack())
         );
         // Every plain forward — the whole-token Metal graph (`q1_graph_gpu`
         // wraps the GDN owners zero-copy and reallocates them on a size
@@ -15852,6 +16348,22 @@ impl Pipeline {
         }
         // Gemma-3n runs its own stack (4 AltUp replicas don't fit this
         // loop); `hidden` is the extended embedding from embed_single.
+        // Gemma-4 E-series: same hand-off — its dual-geometry attention
+        // with shared-KV tail layers and the PLE injection live in
+        // `g4e_forward`.
+        if let Some(b) = &self.g4e {
+            let _ = (task_mask, upto);
+            return crate::g4e::g4e_forward(
+                &b.0,
+                &b.1,
+                hidden,
+                position,
+                &mut self.kv_cache.layers,
+                self.num_heads,
+                self.num_kv_heads,
+                self.pool.as_deref(),
+            );
+        }
         if let Some(b) = &self.g3n {
             let _ = (task_mask, upto);
             return crate::g3n::g3n_forward(
@@ -16168,6 +16680,30 @@ impl Pipeline {
             if let Some(mask) = task_mask {
                 if !mask.layer_alive(li) {
                     continue; // dead layer: residual pass-through
+                }
+            }
+            // MiniMax's dynamic tail: attention + pooled MoE of this layer as
+            // ONE device frame (single-layer graph call), cold experts on
+            // the host. Any decline falls through to the ordinary host
+            // layer; a post-admission device failure stops the sequence.
+            if host_tail && task_mask.is_none() {
+                match self.m3_pooled_layer(li, position, &mut h) {
+                    Ok(true) => {
+                        crate::gpu::set_layer(-1);
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(()) => {
+                        self.clear_sequence_state();
+                        self.graph_failed
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        self.cancel
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        tracing::error!(
+                            "pooled tail token graph failed after admission; sequence state cleared"
+                        );
+                        return vec![0.0; self.hidden_size];
+                    }
                 }
             }
             // Whole-block q1 token graph: a run of consecutive q1
@@ -17411,9 +17947,11 @@ fn dense_ffn_batch(
     // the LLM prefill was simply never wired to it. A task mask needs the
     // activations on the host between the halves, so it keeps the CPU
     // arm below.
-    // SiLU and the exact GELU (Spark-X2.5) have device arms; `q4_ffn_act`
-    // hands SiLU to the very entry points this used to call.
-    let fused_act = d.act.graph_act();
+    // SiLU/GELU have device arms everywhere they are admitted.  MiniMax
+    // M3's frozen OAI contract has an additional WGPU-only arm; callers on
+    // native Metal still get an honest decline from `q4_ffn_act` rather than
+    // an accidental SiLU evaluation.
+    let fused_act = d.act.wgpu_graph_act();
     if mask_row.is_none()
         && fused_act.is_some()
         && b >= 32
@@ -18772,9 +19310,9 @@ fn dense_ffn_gpu(d: &DenseFfn, x: &[f32], _pool: Option<&Pool>) -> Option<Vec<f3
     {
         return None;
     }
-    // The GPU block applies SiLU, exact GELU and tanh-GELU (Gemma); other
-    // activations stay on the CPU.
-    d.act.graph_act()?;
+    // The GPU block applies the standard graph activations plus the exact
+    // MiniMax-M3 OAI contract; any other activation stays on the CPU.
+    d.act.moe_job_graph_contract()?;
     // Threshold: tiny FFNs are not worth a submission (q1 excepted —
     // see the caller's gate).
     if d.gate_proj.rows() < crate::gpu::min_rows() && !d.gate_proj.is_q1() {
@@ -19264,9 +19802,12 @@ fn moe_push_job<'a>(
     model_ref: &mut Option<std::sync::Arc<cortiq_core::CmfModel>>,
 ) -> Option<()> {
     use crate::qtensor::prescale;
-    // The block's act(gate)·up pass takes the activation's code (SiLU,
-    // exact GELU, tanh-GELU); anything without a device form stays home.
-    let act = d.act.graph_act()?.code();
+    // The block's act(gate)·up pass takes an exact device contract.  For
+    // ordinary SiLU/GELU this is a zero clamp; MiniMax M3 contributes its
+    // dedicated OAI marker and frozen 7.0 source limit.  Anything without a
+    // device contract stays on the CPU.
+    let (graph_act, swiglu_limit) = d.act.moe_job_graph_contract()?;
+    let act = graph_act.code();
     let (gm, gi, gr, gc, grs, gcf, gq1, gq4, gq2) = moe_parts(&d.gate_proj)?;
     let (_, ui, ur, uc, urs, ucf, uq1, uq4, uq2) = moe_parts(&d.up_proj)?;
     let (_, di, dr, dc, drs, dcf, dq1, dq4, dq2) = moe_parts(&d.down_proj)?;
@@ -19302,7 +19843,7 @@ fn moe_push_job<'a>(
         q4t: gq4 && !gq2 && d.gate_proj.mapped_q4tp().is_none(),
         q4tp: gq4 && (gq2 || d.gate_proj.mapped_q4tp().is_some()),
         gu_q2: gq2,
-        swiglu_limit: 0.0,
+        swiglu_limit,
         act,
     });
     Some(())
@@ -19418,7 +19959,8 @@ impl SendMut {
 /// DeepSeek-V3 `noaux_tc`: per-expert sigmoid scores, an optional
 /// selection bias (top-k CHOICE only; weights stay unbiased), an
 /// architecture-specified renorm floor and a routed scale.  The ordinary
-/// loader contract is `1e-6`; Flint preserves its source's `1e-20`.
+/// loader contract is `1e-6`; Flint and MiniMax M3.1 preserve their
+/// reference runtime's selected-score `sum + 1e-20`.
 pub(crate) fn moe_route(
     logits: &[f32],
     m: &MoeFfn,
@@ -19429,12 +19971,13 @@ pub(crate) fn moe_route(
 
 /// Router implementation with an explicit sigmoid renormalization floor.
 ///
-/// Flint's source computes `sum(selected_scores) + 1e-20`; using the generic
-/// 1e-6 floor there is not a harmless tolerance difference when all logits
-/// are very negative: it collapses the routed branch toward zero instead of
-/// normalizing the selected experts. Keeping the epsilon parameter here
-/// avoids changing the established Qwen/LFM2 contract while allowing each
-/// architecture to preserve its own numerical semantics.
+/// Flint and MiniMax M3.1 reference runtimes compute
+/// `sum(selected_scores) + 1e-20` in FP32. Using the generic 1e-6 floor is
+/// not a harmless tolerance difference when all logits are very negative: it
+/// collapses the routed branch toward zero instead of normalizing the selected
+/// experts. Keeping the epsilon parameter here avoids changing the established
+/// Qwen/LFM2 contract while allowing each architecture to preserve its own
+/// numerical semantics.
 pub(crate) fn moe_route_with_eps(
     logits: &[f32],
     m: &MoeFfn,
@@ -19962,6 +20505,14 @@ fn moe_ffn_cpu_batched(
 /// Keeping this independent of `MoeFfn` makes the job `Sync`: its routing
 /// statistics live in a `RefCell`, while the immutable expert tensors can be
 /// evaluated safely in parallel with the GPU's resident subset.
+/// Pooled-tail stage timers, reported per token by the bench JSON
+/// (`m3_span_ms_per_tok`, `m3_cold_ms_per_tok`, `m3_arm_ms_per_tok`).
+pub static M3_SPAN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static M3_COLD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static M3_ARM_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static M3_COLD_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static M3_COLD_DEV_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) fn moe_cold_experts_cpu(
     experts: &[(&DenseFfn, f32)],
     x: &[f32],
@@ -19979,7 +20530,18 @@ pub(crate) fn moe_cold_experts_cpu(
     let weights: Vec<_> = experts.iter().map(|(_, w)| *w).collect();
     let inter = experts[0].0.gate_proj.rows();
     let mut activations: Vec<Vec<f32>> = (0..experts.len()).map(|_| vec![0.0; inter]).collect();
-    if QTensor::moe_gate_up_many(&pairs, x, &mut activations, pool)
+    // The batched gate/up kernels implement PLAIN SiLU only (their legacy
+    // helper passes limit 0 and no activation code). MiniMax's SwiGLU-OAI
+    // (alpha 1.702, shifted up) must take the per-expert path that reads
+    // each tensor's own activation — otherwise every cold expert computes
+    // silu and the residual walks away from the reference (measured: the
+    // pooled tail shipped cos 0.047 hidden while the resident path was
+    // bit-close).
+    let silu_only = experts
+        .iter()
+        .all(|(e, _)| matches!(e.act, crate::pipeline::Act::Silu));
+    if silu_only
+        && QTensor::moe_gate_up_many(&pairs, x, &mut activations, pool)
         && QTensor::moe_down_many(&downs, &activations, &weights, &mut out, pool)
     {
         return out;
@@ -20350,6 +20912,27 @@ fn ffn_forward_pair(
 #[cfg(test)]
 mod tests {
 
+    #[test]
+    fn encoder_hidden_states_are_normalized_and_reusable() {
+        let mut p = super::create_test_pipeline(8, 12, 2, 1, 4, 2, 32);
+        let ids = [1, 7, 11, 19];
+
+        let first = p.encode_hidden_states(&ids).expect("encoder forward");
+        let second = p
+            .encode_hidden_states(&ids)
+            .expect("reusable encoder forward");
+        assert_eq!(first.len(), ids.len() * 8);
+        assert!(first.iter().all(|v| v.is_finite()));
+        assert_eq!(
+            first, second,
+            "encoder forward must start from a fresh state"
+        );
+
+        // An encoder call must not leave stale KV/GDN state behind for the
+        // regular generative API sharing the same Pipeline implementation.
+        assert!(p.forward_ids(&ids, None).is_ok());
+    }
+
     /// The 0.7.6 prefill-chunk rule: a plain dense stack wholly on a
     /// discrete card reads the prompt in wide chunks on x86; every other
     /// case keeps the width it had (the GDN-hybrid, MoE and DeepSeek paths
@@ -20537,6 +21120,84 @@ mod tests {
         assert_ne!(r2.finish_reason, "cancelled");
     }
     use super::*;
+
+    #[test]
+    fn minimax_m3_arch_selects_checked_oai_activation_only() {
+        // Keep this fixture minimal: `Act::from_arch_full` needs only the
+        // architecture id and activation name, while serde supplies stable
+        // defaults for unrelated CMF fields.
+        let arch = |arch_name: &str, hidden_act: &str| {
+            serde_json::from_value::<cortiq_core::ModelArch>(serde_json::json!({
+                "arch_name": arch_name,
+                "hidden_size": 8,
+                "intermediate_size": 16,
+                "num_layers": 1,
+                "num_attention_heads": 1,
+                "num_kv_heads": 1,
+                "head_dim": 8,
+                "vocab_size": 16,
+                "layer_types": ["FullAttention"],
+                "rms_norm_eps": 1e-6,
+                "max_position_embeddings": 16,
+                "hidden_act": hidden_act
+            }))
+            .expect("minimal architecture")
+        };
+        let minimax = arch("minimax_m3_vl", "swigluoai");
+        assert_eq!(
+            Act::from_arch_full(&minimax),
+            Act::SwiGluOai {
+                alpha: 1.702,
+                limit: 7.0,
+            }
+        );
+
+        // The same spelling must not turn into MiniMax math on a generic
+        // model.  Only the source-validated M3 architecture owns it.
+        let unrelated = arch("qwen2", "swigluoai");
+        assert_eq!(Act::from_arch_full(&unrelated), Act::Silu);
+
+        // Conversely, an M3-tagged header with a normal activation keeps the
+        // normal path; this prevents the architecture id from overriding the
+        // explicit serialized contract.
+        let non_oai = arch("minimax_m3_vl", "gelu");
+        assert_eq!(Act::from_arch_full(&non_oai), Act::Gelu);
+    }
+
+    #[test]
+    fn minimax_swiglu_oai_act_matches_scalar_contract() {
+        let act = Act::swiglu_oai(1.702, 7.0);
+        let got = act.combine(10.0, -10.0);
+        let expected = crate::inference::swiglu_oai(10.0, -10.0, 1.702, 1.0, Some(7.0));
+        assert!((got - expected).abs() < 1e-6);
+        assert_eq!(act.graph_act(), None, "no inexact generic graph fallback");
+        assert_eq!(
+            act.wgpu_graph_act(),
+            Some(crate::gpu::GraphAct::SwiGluOaiM3),
+            "the WGPU-only arm accepts only the frozen M3 constants"
+        );
+        assert_eq!(
+            Act::swiglu_oai(1.701, 7.0).wgpu_graph_act(),
+            None,
+            "nearby OAI constants must not borrow MiniMax's kernel"
+        );
+        assert_eq!(
+            act.moe_job_graph_contract(),
+            Some((crate::gpu::GraphAct::SwiGluOaiM3, 7.0)),
+            "the direct MoE path carries the frozen clamp with the marker"
+        );
+        assert_eq!(
+            Act::swiglu_oai(1.702, 6.999).moe_job_graph_contract(),
+            None,
+            "a nearby clamp must not borrow MiniMax's device contract"
+        );
+
+        // `apply` is the gate half only; `combine` owns the up clamp and
+        // +1 offset. The two must not accidentally collapse to ordinary SiLU.
+        let gate_only = act.apply(-10.0);
+        let expected_gate = -10.0 / (1.0 + (17.02f32).exp());
+        assert!((gate_only - expected_gate).abs() < 1e-10);
+    }
 
     #[test]
     fn explicit_sliding_schedule_selects_local_rope_profile() {
@@ -22140,11 +22801,11 @@ mod tests {
 
     #[test]
     fn sigmoid_router_floor_is_explicit_per_architecture() {
-        // Flint's reference uses +1e-20 while the generic LFM2-compatible
-        // path uses +1e-6.  At low (but representable)
-        // sigmoid scores, silently sharing the latter changes expert weights
-        // by orders of magnitude and can make a routed layer look coherent
-        // while discarding its expert contribution.
+        // Flint and MiniMax M3.1 reference runtimes use +1e-20, while the
+        // generic LFM2-compatible path uses +1e-6. At low (but representable)
+        // sigmoid scores, silently sharing the latter changes expert weights by
+        // orders of magnitude and can make a routed layer look coherent while
+        // discarding its expert contribution.
         let zero = || DenseFfn {
             gate_proj: QTensor::from_f32(vec![0.0; 4], 2, 2),
             up_proj: QTensor::from_f32(vec![0.0; 4], 2, 2),
@@ -22175,10 +22836,12 @@ mod tests {
         };
         let logits = [-20.0f32, -20.0];
         let (_, p, flint_wsum) = moe_route(&logits, &m, None);
+        let (_, _, minimax_wsum) = moe_route_with_eps(&logits, &m, None, 1e-20);
         let (_, _, legacy_wsum) = moe_route_with_eps(&logits, &m, None, 1e-6);
-        let expected = (p[0] + 1e-20) / m.routed_scaling;
-        assert!((flint_wsum - expected).abs() < 1e-15);
-        assert!(legacy_wsum > flint_wsum * 100.0);
+        let reference_expected = (p[0] + 1e-20) / m.routed_scaling;
+        assert!((flint_wsum - reference_expected).abs() < 1e-15);
+        assert_eq!(minimax_wsum.to_bits(), reference_expected.to_bits());
+        assert!(legacy_wsum > minimax_wsum * 100.0);
     }
 
     #[test]
@@ -22357,6 +23020,246 @@ mod tests {
         assert_eq!(idx, vec![0]);
         assert!(p.iter().all(|&v| v == 0.25));
         assert!(wsum.is_finite() && wsum > 0.0);
+    }
+
+    /// MiniMax-M3.1's DEVICE route (the pooled token-graph arm's exact
+    /// flags: sigmoid scoring via n's high bit, +1e-20 floor,
+    /// routed_scaling 2.0, selection bias on the CHOICE only) must match
+    /// the host reference in experts, ORDER and weights — the check that
+    /// caught the flags/slot collision.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn minimax_device_route_matches_host_sigmoid_contract() {
+        match crate::gpu_wgpu::selected_and_up() {
+            None => {
+                crate::gpu_wgpu::skip_or_fail(module_path!());
+                return;
+            }
+            // Sibling unit tests in THIS process select wgpu by writing
+            // `CMF_GPU` (the gpu_wgpu test module does it ~70 times), so on a
+            // headless runner the variable is already set by the time this
+            // test reads it — "requested" here is test pollution, not an
+            // operator's ask, and the adapter genuinely does not exist in
+            // this process. Same treatment as the gpu_wgpu tests themselves:
+            // a visible skip, never a silent pass.
+            Some(false) => {
+                eprintln!(
+                    "SKIPPED ({}): CMF_GPU names wgpu but no adapter came up in this process",
+                    module_path!()
+                );
+                return;
+            }
+            Some(true) => {}
+        }
+        let n = 128usize;
+        let top_k = 4usize;
+        let logits: Vec<f32> = (0..n)
+            .map(|i| ((i as f32 * 0.61).sin() * 3.4) + ((i % 23) as f32 * 0.13))
+            .collect();
+        let bias: Vec<f32> = (0..n).map(|i| ((i as f32 * 2.3).cos()) * 0.5).collect();
+        let m = MoeFfn {
+            router: QTensor::from_f32(vec![0.0; 4], 2, 2),
+            experts: Vec::new(),
+            top_k,
+            norm_topk_prob: true,
+            router_sigmoid: true,
+            sigmoid_denom_eps: 1e-20,
+            expert_bias: Some(bias.clone()),
+            routed_scaling: 2.0,
+            route_tau: None,
+            shared: None,
+            stats: std::cell::RefCell::new(Vec::new()),
+            act_sq: std::cell::RefCell::new(Vec::new()),
+            act_rows: std::cell::RefCell::new(Vec::new()),
+            mask: None,
+            per_expert_scale: None,
+            router_input_norm: false,
+            resonance: None,
+            grown: Vec::new(),
+        };
+        let (ci, p, wsum) = moe_route_with_eps(&logits, &m, None, 1e-20);
+        let cw: Vec<f32> = ci.iter().map(|&e| p[e] / wsum).collect();
+
+        for shared in [Some(n as u32), None] {
+            let mut gi = Vec::new();
+            let mut gw = Vec::new();
+            assert!(
+                crate::gpu_wgpu::minimax_moe_route_for_test(
+                    &logits,
+                    Some(&bias),
+                    top_k,
+                    2.0,
+                    shared,
+                    &mut gi,
+                    &mut gw,
+                ),
+                "устройство не поднялось — тест не проверил ничего"
+            );
+            let routed = if shared.is_some() { top_k } else { gi.len() };
+            assert_eq!(
+                &gi[..routed],
+                &ci[..],
+                "разные эксперты или порядок (shared={shared:?})"
+            );
+            let d = cw
+                .iter()
+                .zip(&gw[..routed])
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            println!("minimax route shared={shared:?}: {ci:?} max|Δw|={d:.3e}");
+            assert!(d < 1e-6, "веса разошлись на {d:.3e}");
+            if let Some(s) = shared {
+                assert_eq!(gi[top_k], s as usize, "shared pin slot");
+                assert_eq!(gw[top_k], 1.0, "shared weight");
+            }
+        }
+    }
+
+    /// The pooled arm's COLD hand-back: `(expert, weight)` pairs for the
+    /// picks the bank could not serve must carry the host's EXACT final
+    /// weights — the device ships its resident sum, the host adds this on
+    /// top of the same residual, so a weight drift compounds per layer.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn minimax_device_cold_weights_match_host_contract() {
+        match crate::gpu_wgpu::selected_and_up() {
+            None => {
+                crate::gpu_wgpu::skip_or_fail(module_path!());
+                return;
+            }
+            // Sibling unit tests in THIS process select wgpu by writing
+            // `CMF_GPU` (the gpu_wgpu test module does it ~70 times), so on a
+            // headless runner the variable is already set by the time this
+            // test reads it — "requested" here is test pollution, not an
+            // operator's ask, and the adapter genuinely does not exist in
+            // this process. Same treatment as the gpu_wgpu tests themselves:
+            // a visible skip, never a silent pass.
+            Some(false) => {
+                eprintln!(
+                    "SKIPPED ({}): CMF_GPU names wgpu but no adapter came up in this process",
+                    module_path!()
+                );
+                return;
+            }
+            Some(true) => {}
+        }
+        let n = 128usize;
+        let top_k = 4usize;
+        let logits: Vec<f32> = (0..n)
+            .map(|i| ((i as f32 * 0.61).sin() * 3.4) + ((i % 23) as f32 * 0.13))
+            .collect();
+        let bias: Vec<f32> = (0..n).map(|i| ((i as f32 * 2.3).cos()) * 0.5).collect();
+        let m = MoeFfn {
+            router: QTensor::from_f32(vec![0.0; 4], 2, 2),
+            experts: Vec::new(),
+            top_k,
+            norm_topk_prob: true,
+            router_sigmoid: true,
+            sigmoid_denom_eps: 1e-20,
+            expert_bias: Some(bias.clone()),
+            routed_scaling: 2.0,
+            route_tau: None,
+            shared: None,
+            stats: std::cell::RefCell::new(Vec::new()),
+            act_sq: std::cell::RefCell::new(Vec::new()),
+            act_rows: std::cell::RefCell::new(Vec::new()),
+            mask: None,
+            per_expert_scale: None,
+            router_input_norm: false,
+            resonance: None,
+            grown: Vec::new(),
+        };
+        let (ci, p, wsum) = moe_route_with_eps(&logits, &m, None, 1e-20);
+        assert_eq!(ci.len(), top_k);
+
+        // Every pick resident → no cold pairs at all.
+        let resident: Vec<u32> = (0..n).map(|e| e as u32).collect();
+        let mut cold = Vec::new();
+        let mut idx = Vec::new();
+        let mut dw = Vec::new();
+        assert!(crate::gpu_wgpu::minimax_moe_route_cold_for_test(
+            &logits,
+            Some(&bias),
+            top_k,
+            2.0,
+            &resident,
+            n as u32,
+            &mut cold,
+            &mut idx,
+            &mut dw,
+        ));
+        assert!(cold.is_empty(), "полностью резидентный банк: {cold:?}");
+        // With subset+pin together: routed slots carry the FLAT remap value
+        // (here identity = the expert id), weights the host contract, and
+        // the pinned shared keeps weight 1 — this exact combination is what
+        // the pooled arm runs with.
+        for (r, &e) in ci.iter().enumerate() {
+            assert_eq!(idx[r] as usize, e, "resident slot mapping r={r}");
+            let host = p[e] / wsum;
+            let d = (dw[r] - host).abs();
+            assert!(
+                d <= 1e-6 * host.abs().max(1.0),
+                "resident weight r={r} expert {e}: device={:.9e} host={host:.9e}",
+                dw[r]
+            );
+        }
+        assert_eq!(idx[top_k] as usize, n, "shared pin slot");
+        assert_eq!(dw[top_k], 1.0, "shared weight");
+
+        // Make exactly two of the CHOSEN picks cold.
+        let mut remap = resident.clone();
+        remap[ci[0]] = u32::MAX;
+        remap[ci[2]] = u32::MAX;
+        let mut cold = Vec::new();
+        let mut idx2 = Vec::new();
+        let mut dw2 = Vec::new();
+        assert!(crate::gpu_wgpu::minimax_moe_route_cold_for_test(
+            &logits,
+            Some(&bias),
+            top_k,
+            2.0,
+            &remap,
+            n as u32,
+            &mut cold,
+            &mut idx2,
+            &mut dw2,
+        ));
+        // The resident picks of the partial bank still carry exact weights.
+        // A COLD rank is a placeholder the device writes as slot 0 / weight
+        // 0.0 — its real (id, weight) pair rides in `cold` — so weight zero
+        // is what marks it, not the slot value: reading the placeholder as
+        // a resident expert compared 0.0 against p[0]/wsum and failed with
+        // Δ=2.552e-1. The test logits keep every sigmoid score strictly
+        // positive, so a resident pick can never weigh exactly zero.
+        let mut resident_weight_checked = 0usize;
+        for (r, &slot) in idx2.iter().enumerate().take(top_k) {
+            if dw2[r] == 0.0 {
+                continue; // cold rank: placeholder, not an expert id
+            }
+            let e = slot as usize;
+            assert!(e < n && remap[e] != u32::MAX, "resident slot {e} escaped the remap");
+            let host = p[e] / wsum;
+            let d = (dw2[r] - host).abs();
+            assert!(
+                d <= 1e-6 * host.abs().max(1.0),
+                "partial-bank resident weight expert {e}: Δ={d:.3e}"
+            );
+            resident_weight_checked += 1;
+        }
+        assert_eq!(resident_weight_checked, 2, "ровно два резидентных пика из четырёх");
+        println!("partial bank: checked {resident_weight_checked} resident weights");
+        assert_eq!(dw2.get(top_k).copied(), Some(1.0), "shared weight under subset");
+        let mut ids: Vec<usize> = cold.iter().map(|&(e, _)| e).collect();
+        ids.sort_unstable();
+        let mut want = vec![ci[0], ci[2]];
+        want.sort_unstable();
+        assert_eq!(ids, want, "холодные эксперты разошлись: {cold:?} против {want:?}");
+        for &(e, w) in &cold {
+            let host = p[e] / wsum;
+            let d = (w - host).abs();
+            println!("cold expert {e}: device={w:.9e} host={host:.9e} Δ={d:.3e}");
+            assert!(d <= 1e-6 * host.abs().max(1.0), "cold вес эксперта {e}: Δ={d:.3e}");
+        }
     }
 
     /// The resonance router (top-1) selects by the raw score as the
