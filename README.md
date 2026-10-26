@@ -140,6 +140,47 @@ mono 16 kHz. Metal/wgpu are used when available; `CMF_GPU=0` forces CPU. Full
 30-second context is the default; `CMF_WHISPER_TRIM_ENCODER=1` is experimental
 and may affect recognition quality.
 
+### Phonon 40M multilingual text-to-speech (0.8.36)
+
+`phonon-pack` and `tts` are introduced in **cortiq-cli 0.8.36**. The currently
+published 0.8.35 crate and older releases do not expose either command. Do not
+expect a bare `cargo install cortiq-cli` to provide them until the `v0.8.36` tag
+and the 0.8.36 crates.io publication exist. After that release is published:
+
+```sh
+# Default installation includes GPU support and the Phonon bridge.
+cargo install cortiq-cli --version 0.8.36 --locked
+
+# Or build the portable CPU-only CLI while retaining Phonon support.
+cargo install cortiq-cli --version 0.8.36 --locked \
+  --no-default-features --features phonon
+```
+
+Package an upstream checkout only after accepting its terms, or download the
+ready CMF through the Hugging Face API CLI:
+
+```sh
+hf download gradium/phonon-40m-multilingual --local-dir phonon-source
+cortiq phonon-pack phonon-source --output phonon-40m-multilingual-q8.cmf
+
+hf download infosave/phonon-40m-multilingual-cmf \
+  phonon-40m-multilingual-q8.cmf --local-dir .
+cortiq verify phonon-40m-multilingual-q8.cmf
+cortiq tts phonon-40m-multilingual-q8.cmf "Bonjour, monde." \
+  --lang fr --temperature 0.3 --seed 4242424242424242 --out bonjour.wav
+```
+
+The CMF stores the upstream Q8 GGUF, configuration, tokenizer, and default
+voice latent byte-for-byte; synthesis uses Gradium's maintained `ptts` runtime
+after Cortiq validates and materializes those entries. This is a bridge, not a
+claim of a native Phonon reimplementation. The model accepts **only** `en`,
+`fr`, `de`, `es`, and `pt`: it does not support Russian or automatic language
+detection, and `--voice-file` takes a precomputed compatible latent rather than
+recorded-audio voice cloning. The upstream payload is CC-BY-NC-4.0. See the
+[model-card source](docs/hf/Phonon-40M-Multilingual-cmf.md) for provenance and
+the [public test Space](https://huggingface.co/spaces/infosave/phonon-40m-multilingual-cmf-demo)
+for the currently deployed demo.
+
 ## What a CMF file contains
 
 - A fixed 128-byte envelope addressing every section.

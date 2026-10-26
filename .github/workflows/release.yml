@@ -85,12 +85,14 @@ jobs:
           # every android artifact links with 16 KB max-page-size.
           echo "RUSTFLAGS=-C link-arg=-Wl,-z,max-page-size=16384" >> "$GITHUB_ENV"
       - name: Build
-        # --features gpu: the wgpu (Vulkan/DX12) path ships in every
-        # artifact — field case: a 35B CMF on an RTX 4090 ran CPU-only at
-        # 1.9 tok/s because Linux/Windows builds carried no GPU backend
-        # at all. macOS keeps native Metal as the default; wgpu there
-        # remains opt-in via CMF_GPU=wgpu.
-        run: cargo build --locked --release -p cortiq-cli --features gpu --target ${{ matrix.target }}
+        # --features gpu,phonon: the wgpu (Vulkan/DX12) path and the optional
+        # Gradium Phonon TTS bridge ship in every CLI artifact.  Keeping
+        # `phonon` explicit makes this release contract testable even if the
+        # default feature set changes later.  A 35B CMF on an RTX 4090 once
+        # ran CPU-only at 1.9 tok/s because Linux/Windows builds carried no
+        # GPU backend at all. macOS keeps native Metal as the default; wgpu
+        # there remains opt-in via CMF_GPU=wgpu.
+        run: cargo build --locked --release -p cortiq-cli --features gpu,phonon --target ${{ matrix.target }}
       - name: Build FFI library (android)
         if: matrix.target == 'aarch64-linux-android'
         # libcortiq_ffi.so for APK embedding (see crates/cortiq-ffi).
