@@ -64,6 +64,9 @@ pub mod moss_imagegen;
 pub mod nystrom;
 pub mod pin;
 pub mod pipeline;
+/// Gradium Phonon text-to-speech execution for self-contained CMF packages.
+#[cfg(feature = "phonon")]
+pub mod phonon;
 pub mod pool;
 pub mod prism;
 pub mod qtensor;
