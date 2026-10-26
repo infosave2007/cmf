@@ -1496,6 +1496,47 @@ pub(crate) fn q82_short_rows(
     false
 }
 
+// ── device-op profiling (`CMF_GPU_OP_PROF=1`) ──────────────────────────
+// Counts successful device GEMM/attention submissions and their wall
+// time — the only way to see, from the MOSS profile, whether the linears
+// actually left the host. Off by default: one cached bool.
+static OP_OK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static OP_TRY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn op_prof_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_GPU_OP_PROF").is_ok_and(|v| v != "0"))
+}
+
+#[inline]
+fn op_prof_start() -> Option<std::time::Instant> {
+    OP_TRY.fetch_add(1, Ordering::Relaxed);
+    op_prof_on().then(std::time::Instant::now)
+}
+
+#[inline]
+fn op_prof_end(t: Option<std::time::Instant>, ok: bool) {
+    if let Some(t0) = t {
+        if ok {
+            OP_OK.fetch_add(1, Ordering::Relaxed);
+            OP_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+/// `(submissions, wall seconds)` of device ops since process start.
+pub fn op_stats() -> (u64, f64) {
+    (
+        OP_OK.load(Ordering::Relaxed),
+        OP_NS.load(Ordering::Relaxed) as f64 / 1e9,
+    )
+}
+
+pub fn op_tries() -> u64 {
+    OP_TRY.load(Ordering::Relaxed)
+}
+
 /// GEMM of a prefill batch: `pre` — prescaled inputs row-major [b, cols],
 /// out — row-major [b, rows].
 #[allow(clippy::too_many_arguments, unused_variables)]
@@ -1514,14 +1555,17 @@ pub fn q8_matmat_2f(
     cols: usize,
     out: &mut [f32],
 ) -> bool {
+    let _t = op_prof_start();
     #[allow(unreachable_patterns)]
-    match backend() {
+    let ok = match backend() {
         #[cfg(feature = "gpu")]
         Backend::Wgpu => {
             crate::gpu_wgpu::q8_matmat_2f(model, idx, row_scale, col_field, xs, b, rows, cols, out)
         }
         _ => false,
-    }
+    };
+    op_prof_end(_t, ok);
+    ok
 }
 
 pub fn q8_matmat(
@@ -1534,7 +1578,8 @@ pub fn q8_matmat(
     cols: usize,
     out: &mut [f32],
 ) -> bool {
-    match backend() {
+    let _t = op_prof_start();
+    let ok = match backend() {
         #[cfg(target_os = "macos")]
         Backend::Metal => {
             crate::gpu_metal::q8_matmat(model, idx, row_scale, pre, b, rows, cols, out)
@@ -1542,7 +1587,9 @@ pub fn q8_matmat(
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::q8_matmat(model, idx, row_scale, pre, b, rows, cols, out),
         Backend::None => false,
-    }
+    };
+    op_prof_end(_t, ok);
+    ok
 }
 
 /// q1 matvec: raw f32 activations, tile-embedded scales. Metal only
@@ -3743,14 +3790,17 @@ pub fn dit_attention(
     scale: f32,
     out: &mut [f32],
 ) -> bool {
-    match backend() {
+    let _t = op_prof_start();
+    let ok = match backend() {
         #[cfg(target_os = "macos")]
         Backend::Metal => crate::gpu_metal::dit_attention(qh, kh, vh, nh, nkv, n, hd, scale, out),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::dit_attention(qh, kh, vh, nh, nkv, n, hd, scale, out),
         #[allow(unreachable_patterns)]
         _ => false,
-    }
+    };
+    op_prof_end(_t, ok);
+    ok
 }
 
 /// GPTQ calibration: a zeroed `cols × cols` Hessian accumulator on the
@@ -3905,14 +3955,17 @@ pub fn q4tp_matmat(
     cols: usize,
     out: &mut [f32],
 ) -> bool {
-    match backend() {
+    let _t = op_prof_start();
+    let ok = match backend() {
         #[cfg(target_os = "macos")]
         Backend::Metal => crate::gpu_metal::q4tp_matmat(model, idx, xs, b, rows, cols, out),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::q4tp_matmat(model, idx, xs, b, rows, cols, out),
         #[allow(unreachable_patterns)]
         _ => false,
-    }
+    };
+    op_prof_end(_t, ok);
+    ok
 }
 
 /// The same over a two-bit weight plane. Native Metal uses the dedicated

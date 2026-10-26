@@ -128,6 +128,12 @@ pub mod prof {
             "    {:<22} {acc:>10.3} s of {base_secs:.3} s step budget\n",
             "accounted"
         ));
+        let (ok, secs) = crate::gpu::op_stats();
+        out.push_str(&format!(
+            "    {:<22} {ok} submissions, {secs:.3} s wall ({} gpu-branch tries)\n",
+            "device ops",
+            crate::gpu::op_tries()
+        ));
         out
     }
 }
