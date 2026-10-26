@@ -1267,6 +1267,26 @@ mod tests {
     }
 
     #[test]
+    fn raw_rendering_never_flattens_a_structured_conversation() {
+        let tokenizer = Tokenizer::byte_level();
+        let simple = parse(r#"{"prompt":"A simple prompt with enough text."}"#)
+            .prompts
+            .remove(0);
+        let rendered = render_prompt(&tokenizer, &simple, true, true).unwrap();
+        assert!(!rendered.template_applied);
+        assert_eq!(rendered.thinking, None);
+
+        let structured =
+            parse(r#"{"system":"System text","prompt":"A structured prompt with enough text."}"#)
+                .prompts
+                .remove(0);
+        let error = render_prompt(&tokenizer, &structured, true, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("raw/base-model completion"), "{error}");
+    }
+
+    #[test]
     fn finish_and_final_tail_quality_are_conservative() {
         assert_eq!(normalize_finish_reason("max_tokens", "answer"), "length");
         assert_eq!(normalize_finish_reason("stop", "   "), "empty");
