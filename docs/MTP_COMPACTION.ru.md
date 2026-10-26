@@ -37,21 +37,25 @@ candidate/model.mtp.cmf     # новый compact draft
 
 Подайте финализированный и проверяемый `.tdata`-selector. Для выбора каналов
 используйте только train/calibration split; validation/test оставьте для
-последующей оценки. Команда сама проверяет main CMF и `.tdata`; sidecar перед
-запуском проверьте отдельно через `cortiq verify`.
+последующей оценки. Команда сама проверяет main CMF, обнаруженный MTP-sidecar
+и `.tdata`.
 
 На реальном teacher-forced MTP-пути она собирает для каждого канала
 
 ```text
-sum_teacher_forced((silu(gate) * up)^2) * down_proj_column_l2_squared
+sum_teacher_forced((activation(gate, up))^2) * down_proj_column_l2_squared
 ```
 
 и сохраняет каналы с наибольшим score. Это не trunk-статистика и не
-предположение по `intermediate_size` backbone. `--keep-ratio` применяется к
+предположение по `intermediate_size` backbone. `activation(gate, up)` — это
+ровно функция MLP данного draft из runtime (например, `silu(gate) * up`), а
+не всегда SiLU; её контракт также записывается в plan. `--keep-ratio` применяется к
 каждому draft-слою, после чего ширина округляется вниз до группы из 32 каналов;
 минимум — одна 32-канальная группа. Итоговый JSON-plan фиксирует selector,
-число записей/токенов, исходный directory hash, order каналов и долю сохранённой
-энергии — храните его рядом с артефактом.
+число записей/токенов, отдельные directory hash main и draft, order каналов и
+долю сохранённой энергии — храните его рядом с артефактом. При `mtp.mode=compact`
+`tube bake` сверяет `source_draft_directory_hash` с входным draft, поэтому
+калиброванный план нельзя случайно применить к другому same-shape sidecar.
 
 Пример sidecar-варианта:
 
@@ -83,9 +87,17 @@ ln base/model.cmf candidate/model.cmf
 реальными tensor shapes. MiMo аналогично выводит ширину каждого draft-слоя из
 его tensor-ов, а не из geometry trunk.
 
-Следствие: нельзя вручную подменять width в JSON или применять план от другой
-модели. Несовпадение заголовка, числа слоёв или shapes — причина отказа, а не
-причина «попробовать запустить».
+`eh_proj`, `enorm`, `hnorm`, attention и layer/final norms работают по hidden
+width, а не по FFN-axis: при этой операции они побайтно сохраняются; меняются
+только согласованные оси `gate/up/down` (и `down_proj.t`, если он был) и
+`arch.mtp.ffn_intermediate_sizes`. Поэтому compactor не пытается «уменьшить»
+projection/norm по неверной оси.
+
+Следствие: не изменяйте fingerprint или width в JSON и не применяйте план от
+другой модели. Отсутствующий/несовпадающий fingerprint, а также несовпадение
+заголовка, числа слоёв или shapes — причина отказа, а не причина «попробовать
+запустить». Несколько draft-слоёв допускаются только для `mimo_v2`, поскольку
+именно для него в runtime есть многослойный executor.
 
 ## Обязательная проверка корректности
 
@@ -178,6 +190,15 @@ CMF_GPU=1 CMF_MTP=1 CMF_MIMO_MTP=1 \
 может снизить acceptance настолько, что кандидат станет медленнее — это
 измеряемый результат, а не повод скрывать счётчики.
 
+Для компактного MTP с `q4tp` fast-path Metal/WGPU использует локальную ширину
+`gate_proj`, а не `intermediate_size` backbone; поэтому 32-кратно сжатый draft
+не получает устаревшую geometry trunk. У `q2tp`/Prism MTP native-Metal graph
+сейчас безопасно отклоняется до выполнения и идёт через обычный fallback; у
+`q8_2f` одношаговый путь корректен, но batched warm-up также может перейти в
+fallback. Это не ошибка точности, но не основание обещать скорость для этих
+codec без отдельного замера. Для выпуска с целью Metal-speed выбирайте `q4tp`
+и всё равно подтверждайте его приведённым benchmark.
+
 ## Границы и отказы
 
 Команда намеренно fail-closed. Она рассчитана на полную каноническую dense
@@ -190,7 +211,8 @@ CMF_GPU=1 CMF_MTP=1 CMF_MIMO_MTP=1 \
   пустая teacher-forced калибровка;
 * специальные MTP-форматы, не представленные такой dense-тройкой, и внешние
   DSpark/draft sidecar, не являющиеся MTP FFN;
-* ручное редактирование v2 plan для обхода проверок.
+* plan без `selection.source_draft_directory_hash` или с fingerprint не того
+  draft; изменение plan не отменяет проверок source tensor/config.
 
 Сохраните исходные main, sidecar и plan до завершения всех проверок. Компактный
 draft можно принять только после целостности файлов, точного greedy-сравнения
