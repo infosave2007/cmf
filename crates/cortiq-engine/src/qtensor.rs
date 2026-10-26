@@ -19,9 +19,15 @@ use cortiq_core::quant::{
 use cortiq_core::{CmfModel, TensorDtype};
 use std::cell::UnsafeCell;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// `mxfp4` (OCP MX FP4) CPU kernels.
 mod mxfp4;
+
+/// D5 GPU-matmat gate telemetry: large-GEMM calls that reached the gate
+/// vs those the q8_2f device kernel actually consumed (SAM3 profiling).
+pub static MATMAT_GATE: AtomicU64 = AtomicU64::new(0);
+pub static MATMAT_GPU_HIT: AtomicU64 = AtomicU64::new(0);
 
 pub enum QTensor {
     F32 {
@@ -2603,9 +2609,11 @@ impl QTensor {
                     );
                     return;
                 }
+                let _pmp = crate::cpuprof::spans::span("mm.prescale");
                 let pre: Vec<std::borrow::Cow<'_, [f32]>> = (0..b)
                     .map(|bi| prescale(&xs_all[bi * cols..(bi + 1) * cols], col_field, *dtype))
                     .collect();
+                drop(_pmp);
                 // MiMo verification is a 2–4 row decode panel, not a wide
                 // prompt GEMM. Keep q8 projections on the same device as
                 // decode; the generic b>=8 gate otherwise silently moves
@@ -2627,8 +2635,19 @@ impl QTensor {
                 // Runtime probe: the naive GEMM shader + sync readback
                 // lose to the CPU GEMM on slow driver stacks — alternate
                 // both arms and keep the winner.
-                if b >= 8 && b * rows * cols >= 128_000_000 && crate::gpu::enabled_here() {
+                // CMF_MATMAT_GPU=0: diagnostic off-switch for this D5
+                // device arm only (default unchanged). The GPU int8 kernel
+                // and the CPU int8 kernel are not bit-comparable and differ
+                // ~1e-2/layer (measured on SAM3), which compounds through
+                // deep stacks — validation harnesses that need a single
+                // changed block per run turn the others off with this.
+                if b >= 8
+                    && b * rows * cols >= 128_000_000
+                    && crate::gpu::enabled_here()
+                    && std::env::var("CMF_MATMAT_GPU").as_deref() != Ok("0")
+                {
                     if let Self::Mapped { model, idx, .. } = self {
+                        MATMAT_GATE.fetch_add(1, Ordering::Relaxed);
                         let t0 = std::time::Instant::now();
                         match crate::gpu::probe_arm(crate::gpu::OpClass::Matmat) {
                             crate::gpu::ProbeArm::Gpu
@@ -2657,6 +2676,7 @@ impl QTensor {
                                         cols, out,
                                     )
                                 {
+                                    MATMAT_GPU_HIT.fetch_add(1, Ordering::Relaxed);
                                     crate::gpu::probe_record(
                                         crate::gpu::OpClass::Matmat,
                                         true,
@@ -2955,7 +2975,63 @@ impl QTensor {
             if a8w8_enabled() {
                 let act = split_act(x);
                 let act = &act;
+                #[cfg(target_arch = "x86_64")]
+                let lanes = q4tp_lanes();
                 let run = |start: usize, end: usize| {
+                    #[cfg(target_arch = "x86_64")]
+                    if lanes > 1 && act.xg8.len() == gpr {
+                        // L independent accumulator chains per worker —
+                        // the plain body's math, lane-interleaved.
+                        with_krow(gpr * lanes, |sc| {
+                            // SAFETY: a8w8 implies AVX2; each (tensor, row)
+                            // pair still belongs to exactly one worker.
+                            unsafe {
+                                match lanes {
+                                    2 => q4tp_many_lanes::<2>(
+                                        &views[..],
+                                        &locate,
+                                        start,
+                                        end,
+                                        gpr,
+                                        &act.xq,
+                                        &act.xg8,
+                                        act.sx,
+                                        &act.outliers,
+                                        sc,
+                                        &outs_addr[..],
+                                    ),
+                                    8 => q4tp_many_lanes::<8>(
+                                        &views[..],
+                                        &locate,
+                                        start,
+                                        end,
+                                        gpr,
+                                        &act.xq,
+                                        &act.xg8,
+                                        act.sx,
+                                        &act.outliers,
+                                        sc,
+                                        &outs_addr[..],
+                                    ),
+                                    _ => q4tp_many_lanes::<4>(
+                                        &views[..],
+                                        &locate,
+                                        start,
+                                        end,
+                                        gpr,
+                                        &act.xq,
+                                        &act.xg8,
+                                        act.sx,
+                                        &act.outliers,
+                                        sc,
+                                        &outs_addr[..],
+                                    ),
+                                }
+                            }
+                        });
+                        return;
+                    }
+                    crate::cpuprof::count_plain_rows((end - start) as u64);
                     with_krow(gpr, |sc| {
                         for flat in start..end {
                             let (t, r) = locate(flat);
@@ -3646,7 +3722,38 @@ impl QTensor {
                 let gpr = cols / GROUP_SIZE;
                 let gv_view = Q4tpView::new(gate.quant_bytes(), inter, cols);
                 let uv_view = Q4tpView::new(up.quant_bytes(), inter, cols);
+                #[cfg(target_arch = "x86_64")]
+                let lanes = q4tp_lanes();
                 let run = |start: usize, end: usize| {
+                    #[cfg(target_arch = "x86_64")]
+                    if lanes > 1 && act.xg8.len() == gpr {
+                        // L independent accumulator chains per worker —
+                        // the plain arm's math, lane-interleaved.
+                        with_krows(gpr * lanes, |gsc, usc| {
+                            // SAFETY: a8w8 implies AVX2; disjoint row ranges.
+                            unsafe {
+                                match lanes {
+                                    2 => q4tp_gateup_lanes::<2>(
+                                        &gv_view, &uv_view, start, end, gpr, &act.xq,
+                                        &act.xg8, act.sx, limit, &act.outliers, gsc, usc,
+                                        out_addr,
+                                    ),
+                                    8 => q4tp_gateup_lanes::<8>(
+                                        &gv_view, &uv_view, start, end, gpr, &act.xq,
+                                        &act.xg8, act.sx, limit, &act.outliers, gsc, usc,
+                                        out_addr,
+                                    ),
+                                    _ => q4tp_gateup_lanes::<4>(
+                                        &gv_view, &uv_view, start, end, gpr, &act.xq,
+                                        &act.xg8, act.sx, limit, &act.outliers, gsc, usc,
+                                        out_addr,
+                                    ),
+                                }
+                            }
+                        });
+                        return;
+                    }
+                    crate::cpuprof::count_plain_rows((end - start) as u64);
                     with_krows(gpr, |gsc, usc| {
                         for r in start..end {
                             gv_view.scales_into(r, gpr, gsc);
@@ -4614,6 +4721,7 @@ fn qmatmat(
 ) {
     let b = pre.len();
     debug_assert_eq!(out.len(), b * rows);
+    let _p = crate::cpuprof::spans::span("mm.qmatmat");
     // Big prefill batches ride the AMX (roadmap PR3): the row×batch
     // SDOT loop below peaks near the CPU's dot throughput, an order
     // below the matrix units. Small tensors and tiny test models stay
@@ -4704,7 +4812,12 @@ fn qmatmat(
     // dot, which is already throughput-bound there.
     #[cfg(target_arch = "x86_64")]
     if avx2_a8w8_enabled() {
-        let acts: Vec<SplitAct> = pre.iter().map(|x| split_act(x)).collect();
+        let acts = {
+            let _psa = crate::cpuprof::spans::span("mm.split_act");
+            let a: Vec<SplitAct> = pre.iter().map(|x| split_act(x)).collect();
+            drop(_psa);
+            a
+        };
         let out_addr = SendMut(out.as_mut_ptr());
         // CMF_X86_BLOCKED=0 forces the per-row path (paired in-process
         // A/B on noisy shared-vCPU hosts).
@@ -5724,10 +5837,54 @@ impl<'a> Q4tpView<'a> {
     /// q4tp row; a decode profile put this function above the dot
     /// products it feeds. Same bitstream, same codes — just no branch
     /// and eight independent extractions.
+    /// `avx2_enabled()` and `ladder_4` are compiled only for x86-64, so a
+    /// plain `cfg!(target_arch = ...)` guard is NOT enough: `cfg!` is a
+    /// runtime `false` on other targets, yet both arms still get compiled
+    /// and the x86-only symbols do not exist there at all (aarch64 build:
+    /// E0425). This associated fn IS a compile-time `cfg` — the whole
+    /// branch, symbol references included, is dropped on non-x86 targets,
+    /// and the non-x86 arm falls straight through to the scalar ladder.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    fn ladder_via_avx2(&self) -> bool {
+        avx2_enabled()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    #[inline]
+    fn ladder_via_avx2(&self) -> bool {
+        false
+    }
+
     #[inline]
     fn scales_into(&self, r: usize, gpr: usize, out: &mut [f32]) {
         let tab = if self.zero_rung {
             q2tp_ladder(self.params, r)
+        } else if self.ladder_via_avx2() {
+            // One lane of the 4-wide vector ladder (the other three are
+            // duplicates) — every q4tp scale in the process then comes
+            // from the SAME ladder bits, whichever call site decoded it.
+            // `ladder_via_avx2()` is cfg-gated, so on non-x86 targets
+            // this arm is never taken and never even compiled with the
+            // x86-only symbols in scope.
+            #[cfg(target_arch = "x86_64")]
+            let tab = {
+                let p = &self.params[r * 4..r * 4 + 4];
+                let lo = f16_to_f32(u16::from_le_bytes([p[0], p[1]]));
+                let st = f16_to_f32(u16::from_le_bytes([p[2], p[3]]));
+                let mut tabc = [0f32; 128];
+                unsafe { ladder_4(&[lo; 4], &[st; 4], &mut tabc) };
+                let mut t = [0f32; 32];
+                for (g, o) in t.iter_mut().enumerate() {
+                    *o = tabc[g * 4];
+                }
+                t
+            };
+            // On a non-x86 target the arm is unreachable (the `cfg!`
+            // above is false), so it decodes through the scalar ladder —
+            // the very path this branch would have fallen back to.
+            #[cfg(not(target_arch = "x86_64"))]
+            let tab = q4tp_ladder(self.params, r);
+            tab
         } else {
             q4tp_ladder(self.params, r)
         };
@@ -5883,6 +6040,686 @@ unsafe fn dot_q4tp_row_vnni(nib: &[u8], r: usize, gpr: usize, xq: &[i8], scales:
     }
 }
 
+/// `2^x` for a 4-lane vector (range-reduced degree-6 polynomial).
+/// ≤1 ulp vs libm `exp2f` — f32's own precision rounds the polynomial
+/// home. Used only by [`q4tp_scales_lanes`]; see the ladder note there.
+///
+/// # Safety
+/// AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn exp2_128(x: core::arch::x86_64::__m128) -> core::arch::x86_64::__m128 {
+    unsafe {
+        use core::arch::x86_64::*;
+        // floor via trunc with a below-integer correction.
+        let tr = _mm_cvttps_epi32(x);
+        // Compare against cvt(tr), NOT a bit-cast: the bit pattern of a
+        // negative i32 is a NaN and cmplt against it is always false.
+        let below = _mm_and_si128(
+            _mm_castps_si128(_mm_cmplt_ps(x, _mm_cvtepi32_ps(tr))),
+            _mm_set1_epi32(1),
+        );
+        let n = _mm_sub_epi32(tr, below); // floor(x)
+        let r = _mm_sub_ps(x, _mm_cvtepi32_ps(n)); // x - floor(x) ∈ [0,1)
+        // 2^r = exp(r·ln2) ≈ Σ aₖrᵏ, aₖ = ln2ᵏ/k!, k = 1..9 (Horner).
+        // At r ∈ [0,1) the a₁₀ term is 7.1e-9 — below f32's own ulp.
+        // The coefficients are carried at full decimal precision on
+        // purpose: truncating them to an f32 spelling (what
+        // `excessive_precision` suggests) would round the constants before
+        // they reach the AVX registers. `approx_constant` fires on a₁ =
+        // LN_2, but the table must stay internally consistent, so both
+        // lints are allowed for this table only.
+        #[allow(clippy::excessive_precision, clippy::approx_constant)]
+        let a = [
+            6.931_471_805_599_453e-1,
+            2.402_265_069_591_007e-1,
+            5.550_410_866_482_158e-2,
+            9.618_129_107_628_477e-3,
+            1.333_355_814_642_844e-3,
+            1.540_353_039_338_161e-4,
+            1.525_273_380_405_984e-5,
+            1.321_548_679_014_431e-6,
+            1.017_808_600_923_969_6e-7,
+        ];
+        let mut p = _mm_set1_ps(a[8]);
+        for &c in a[..8].iter().rev() {
+            p = _mm_add_ps(_mm_mul_ps(p, r), _mm_set1_ps(c));
+        }
+        p = _mm_add_ps(_mm_mul_ps(p, r), _mm_set1_ps(1.0));
+        // Combine: p ∈ [1,2) carries the mantissa; n the exponent.
+        // Underflow (n < −126) → 0; our args are f16-derived, so this
+        // only matters for pathological rows.
+        // bits(p) already carries exponent 127; adding n<<23 (mod 2^32,
+        // correct for negative n too) retargets it to 127+n.
+        let ncl = _mm_min_epi32(
+            _mm_max_epi32(n, _mm_set1_epi32(-126)),
+            _mm_set1_epi32(127),
+        );
+        let mut bits = _mm_add_epi32(_mm_castps_si128(p), _mm_slli_epi32(ncl, 23));
+        let over = _mm_cmpgt_epi32(n, _mm_set1_epi32(127));
+        bits = _mm_or_si128(
+            _mm_andnot_si128(over, bits),
+            _mm_and_si128(over, _mm_set1_epi32(0x007F_8000)),
+        );
+        let zero = _mm_cmplt_ps(x, _mm_set1_ps(-149.0));
+        _mm_andnot_ps(zero, _mm_castsi128_ps(bits))
+    }
+}
+
+/// Horizontal helper: the four lanes of `v` as `[f32; 4]`.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn lanes4(v: core::arch::x86_64::__m128) -> [f32; 4] {
+    use core::arch::x86_64::*;
+    unsafe {
+        [
+            _mm_cvtss_f32(v),
+            _mm_cvtss_f32(_mm_shuffle_ps(v, v, 0x55)),
+            _mm_cvtss_f32(_mm_shuffle_ps(v, v, 0xAA)),
+            _mm_cvtss_f32(_mm_shuffle_ps(v, v, 0xFF)),
+        ]
+    }
+}
+
+/// FOUR rows' 32-run q4tp ladders at once into `[group * 4 + lane]`.
+/// The chain is `t = exp2(lo); t *= exp2(st)` — per lane this is the
+/// scalar `q4tp_ladder` recurrence run as `vmulps`, bit-identical; only
+/// `exp2` is replaced (≤1 ulp, see [`exp2_128`]).
+///
+/// # Safety
+/// AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn ladder_4(lo4: &[f32; 4], st4: &[f32; 4], tabc: &mut [f32; 128]) {
+    unsafe {
+        use core::arch::x86_64::*;
+        let ratio = exp2_128(_mm_loadu_ps(st4.as_ptr()));
+        let mut t = exp2_128(_mm_loadu_ps(lo4.as_ptr()));
+        tabc[0..4].copy_from_slice(&lanes4(t));
+        for c in 1..32 {
+            t = _mm_mul_ps(t, ratio);
+            tabc[c * 4..c * 4 + 4].copy_from_slice(&lanes4(t));
+        }
+    }
+}
+
+/// Decode FOUR rows' q4tp group scales at once. The scalar
+/// [`Q4tpView::scales_into`] costs ~364 cycles a row — two libm `exp2`
+/// calls plus the 31-step serial `t *= ratio` ladder chain — and the
+/// ladder is 17 % of every decode token. Here the chains run as one
+/// 4-lane vector: `t[c] = t[c-1] * ratio` is `vmulps`, bit-identical to
+/// the scalar f32 chain (and to `q4tp_ladder`'s definition), so the only
+/// bit change is `exp2` (≤1 ulp, see [`exp2_128`]); the dequant reference
+/// shares this function. Output layout is `[row][group]`.
+///
+/// Only for `Q4TiledP` views (`!zero_rung`); rows need not be
+/// contiguous. Falls back per incomplete tail chunk.
+///
+/// # Safety
+/// AVX2; `out` must hold `rows.len() * gpr` floats.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q4tp_scales_lanes(
+    vs: &[&Q4tpView<'_>],
+    rows: &[usize],
+    gpr: usize,
+    out: &mut [f32],
+) {
+    use core::arch::x86_64::*;
+    debug_assert_eq!(vs.len(), rows.len());
+    debug_assert!(out.len() >= rows.len() * gpr);
+    let mut done = 0usize;
+    for (ci, chunk) in rows.chunks(4).enumerate() {
+        let vchunk = &vs[ci * 4..ci * 4 + chunk.len()];
+        if chunk.len() < 4 || vchunk.iter().any(|v| v.zero_rung) {
+            for (l, &r) in chunk.iter().enumerate() {
+                vchunk[l].scales_into(r, gpr, &mut out[(done + l) * gpr..(done + l + 1) * gpr]);
+            }
+            done += chunk.len();
+            continue;
+        }
+        let (r0, r1, r2, r3) = (chunk[0], chunk[1], chunk[2], chunk[3]);
+        let v0 = vchunk[0];
+        let v1 = vchunk[1];
+        let v2 = vchunk[2];
+        let v3 = vchunk[3];
+        // Gather the four (lo, st) f16 pairs — 4 B per row.
+        let mut lo = [0f32; 4];
+        let mut st = [0f32; 4];
+        for (l, r) in [r0, r1, r2, r3].iter().enumerate() {
+            let o = *r * 4;
+            let vv = vchunk[l];
+            lo[l] = cortiq_core::quant::f16_to_f32(u16::from_le_bytes([
+                vv.params[o],
+                vv.params[o + 1],
+            ]));
+            st[l] = cortiq_core::quant::f16_to_f32(u16::from_le_bytes([
+                vv.params[o + 2],
+                vv.params[o + 3],
+            ]));
+        }
+        let lo_v = _mm_loadu_ps(lo.as_ptr());
+        let st_v = _mm_loadu_ps(st.as_ptr());
+        let ratio = exp2_128(st_v);
+        let mut t = exp2_128(lo_v);
+        // tab layout [group * 4 + lane] — contiguous stores per step.
+        let mut tabc = [0f32; 32 * 4];
+        tabc[0..4].copy_from_slice(&[
+            _mm_cvtss_f32(t),
+            _mm_cvtss_f32(_mm_shuffle_ps(t, t, 0x55)),
+            _mm_cvtss_f32(_mm_shuffle_ps(t, t, 0xAA)),
+            _mm_cvtss_f32(_mm_shuffle_ps(t, t, 0xFF)),
+        ]);
+        for c in 1..32 {
+            t = _mm_mul_ps(t, ratio);
+            tabc[c * 4..c * 4 + 4].copy_from_slice(&[
+                _mm_cvtss_f32(t),
+                _mm_cvtss_f32(_mm_shuffle_ps(t, t, 0x55)),
+                _mm_cvtss_f32(_mm_shuffle_ps(t, t, 0xAA)),
+                _mm_cvtss_f32(_mm_shuffle_ps(t, t, 0xFF)),
+            ]);
+        }
+        // Scalar code walks (per row), reading tabc[group * 4 + lane].
+        let vs4 = [v0, v1, v2, v3];
+        for (l, &r) in [r0, r1, r2, r3].iter().enumerate() {
+            let v = vs4[l];
+            let codes = &v.codes[r * v.stride..(r + 1) * v.stride];
+            let dst = &mut out[(done + l) * gpr..(done + l + 1) * gpr];
+            let mut chunks = dst.chunks_exact_mut(8);
+            let mut ci = 0usize;
+            for c in &mut chunks {
+                let w = u64::from(codes[ci])
+                    | u64::from(codes[ci + 1]) << 8
+                    | u64::from(codes[ci + 2]) << 16
+                    | u64::from(codes[ci + 3]) << 24
+                    | u64::from(codes[ci + 4]) << 32;
+                for (k, o) in c.iter_mut().enumerate() {
+                    *o = tabc[(((w >> (5 * k)) & 31) as usize) * 4 + l];
+                }
+                ci += 5;
+            }
+            let tail = &codes[ci..];
+            for (k, o) in chunks.into_remainder().iter_mut().enumerate() {
+                *o = tabc[q4tp_code(tail, k) * 4 + l];
+            }
+        }
+        done += 4;
+    }
+}
+
+/// Decode-lane count for the q4tp row loops: how many rows one worker
+/// steps through with independent `acc += d * scale` chains in ONE body.
+/// The per-group AVX2 dot is a ~17-cycle dependent chain per 32 weights;
+/// a single row serializes on it, overlapping rows reaches the uop-issue
+/// bound instead. Each row keeps its own group order, so every output is
+/// bit-identical to the plain row loop. `CMF_Q4TP_LANES=1` restores it;
+/// 2/4/8 are the supported lane counts (default 4).
+fn q4tp_lanes() -> usize {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        1
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        static ON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            let n: usize = std::env::var("CMF_Q4TP_LANES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4);
+            match n {
+                1 => 1,
+                2 => 2,
+                8 => 8,
+                _ => 4,
+            }
+        })
+    }
+}
+
+/// One q4tp group tile unpacked to interleaved weights in 0..=16 — the
+/// raw nibbles, WITHOUT the −8 shift. The correction travels in
+/// `SplitAct::xg8` instead (each vertical lane subtracts `Σx`, and the
+/// 8-lane reduction makes that `8·Σx` overall), which lets `vpmaddubsw`
+/// consume the unsigned codes directly and deletes the per-byte `vpaddb`
+/// + `vpabsb`/`vpsignb` — two of them port-5 ops in the old row
+/// kernel's innermost loop.
+///
+/// # Safety
+/// AVX2; `tile` must point at 16 valid weight bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn q4tp_unpack_w(tile: *const u8) -> core::arch::x86_64::__m256i {
+    unsafe {
+        use core::arch::x86_64::*;
+        let lomask = _mm_set1_epi8(0x0F);
+        let b = _mm_loadu_si128(tile as *const __m128i);
+        let lo = _mm_and_si128(b, lomask);
+        let hi = _mm_and_si128(_mm_srli_epi16::<4>(b), lomask);
+        _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi), _mm_unpacklo_epi8(lo, hi))
+    }
+}
+
+/// Σ over 32 columns of `w·x` as i32x8 lane partials: `vpmaddubsw`
+/// (|w| ≤ 15, |x| ≤ 127 — pair sums ≤ 3810, no saturation) then `vpmaddwd`.
+/// Exact in any association.
+///
+/// # Safety
+/// AVX2; `xp` must point at 32 valid i8 activation bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn q4tp_madd_wx(
+    w: core::arch::x86_64::__m256i,
+    xp: *const i8,
+) -> core::arch::x86_64::__m256i {
+    unsafe {
+        use core::arch::x86_64::*;
+        let ones = _mm256_set1_epi16(1);
+        let x = _mm256_loadu_si256(xp as *const __m256i);
+        _mm256_madd_epi16(_mm256_maddubs_epi16(w, x), ones)
+    }
+}
+
+/// THE shared end-of-row reduction of the vertical f32 accumulator.
+/// Every a8w8 q4tp path — the decode lane drivers and the row-exact
+/// matmat cells — must reduce through this one function, or the
+/// matvec↔matmat bitwise parity test breaks.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn q4tp_hsum256(acc: core::arch::x86_64::__m256) -> f32 {
+    unsafe {
+        use core::arch::x86_64::*;
+        let a = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps::<1>(acc));
+        let b = _mm_add_ps(a, _mm_movehl_ps(a, a));
+        let c = _mm_add_ss(b, _mm_shuffle_ps(b, b, 0x55));
+        _mm_cvtss_f32(c)
+    }
+}
+
+/// One (row, activation) cell computed the vertical way: per group,
+/// `(Σ(w+8)·x − 8·Σx) as f32 · scale` accumulated lane-wise in f32x8,
+/// one horizontal reduction at the end. Used by the lane drivers' tails
+/// and by the row-exact matmat column loop so both land on identical bits.
+///
+/// # Safety
+/// AVX2; `gpr` groups must be covered by `xq`/`sc`/`xg8`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn q4tp_cell_dot_v(
+    nib: *const u8,
+    r: usize,
+    gpr: usize,
+    xp: *const i8,
+    sc: *const f32,
+    xg8: *const f32,
+) -> f32 {
+    unsafe {
+        use core::arch::x86_64::*;
+        let mut acc = _mm256_setzero_ps();
+        for gi in 0..gpr {
+            let w = q4tp_unpack_w(nib.add((r * gpr + gi) * Q4TP_NIB));
+            let d = q4tp_madd_wx(w, xp.add(gi * GROUP_SIZE));
+            let t = _mm256_sub_ps(_mm256_cvtepi32_ps(d), _mm256_set1_ps(*xg8.add(gi)));
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(t, _mm256_set1_ps(*sc.add(gi))));
+        }
+        q4tp_hsum256(acc)
+    }
+}
+
+/// Row `r` of a row-exact q4tp matmat against one activation panel (up to
+/// four columns at a time): each weight group is unpacked ONCE and fed to
+/// four independent column accumulators — the cell math of
+/// [`q4tp_cell_dot_v`], gi-ascending, so every cell equals the decode
+/// matvec's bits while the columns overlap their latency chains and the
+/// unpack is shared. This is the AVX2 twin of the avx512-only blocked
+/// kernel: without it, Broadwell prefill re-decodes every row once per
+/// column (7 tok/s measured against q8_2f's 24).
+///
+/// # Safety
+/// AVX2 (caller gates on `a8w8_enabled()` + `xg8.len() == gpr`);
+/// `out` cells for this row are this worker's alone.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q4tp_matmat_row_cols_v(
+    v: &Q4tpView<'_>,
+    r: usize,
+    gpr: usize,
+    acts: &[SplitAct],
+    sc: &[f32],
+    abase: usize,
+    rows: usize,
+    out: SendMut,
+) {
+    use core::arch::x86_64::*;
+    debug_assert_eq!(sc.len(), gpr);
+    let n = acts.len();
+    let mut bi = 0usize;
+    while bi + 4 <= n {
+        let a: [&SplitAct; 4] = [&acts[bi], &acts[bi + 1], &acts[bi + 2], &acts[bi + 3]];
+        let mut accs = [_mm256_setzero_ps(); 4];
+        for gi in 0..gpr {
+            let w = q4tp_unpack_w(v.nib.as_ptr().add((r * gpr + gi) * Q4TP_NIB));
+            let sb = _mm256_set1_ps(*sc.get_unchecked(gi));
+            for (k, act) in a.iter().enumerate() {
+                let xp = act.xq.as_ptr().add(gi * GROUP_SIZE);
+                let d = q4tp_madd_wx(w, xp);
+                let xgb = _mm256_set1_ps(*act.xg8.get_unchecked(gi));
+                let t = _mm256_sub_ps(_mm256_cvtepi32_ps(d), xgb);
+                accs[k] = _mm256_add_ps(accs[k], _mm256_mul_ps(t, sb));
+            }
+        }
+        for k in 0..4 {
+            let act = a[k];
+            let mut acc = q4tp_hsum256(accs[k]) * act.sx;
+            for &(j, xv) in &act.outliers {
+                let (w, s) = q4tp_outlier(v.nib, r, gpr, j, sc);
+                acc += w * s * xv;
+            }
+            // SAFETY: disjoint (bi, r) cells per worker.
+            unsafe { *out.at((abase + bi + k) * rows + r) = acc };
+        }
+        bi += 4;
+    }
+    // Remainder columns (1..=3): one vertical cell each.
+    while bi < n {
+        let act = &acts[bi];
+        let mut acc = q4tp_cell_dot_v(
+            v.nib.as_ptr(),
+            r,
+            gpr,
+            act.xq.as_ptr(),
+            sc.as_ptr(),
+            act.xg8.as_ptr(),
+        ) * act.sx;
+        for &(j, xv) in &act.outliers {
+            let (w, s) = q4tp_outlier(v.nib, r, gpr, j, sc);
+            acc += w * s * xv;
+        }
+        // SAFETY: disjoint (bi, r) cells per worker.
+        unsafe { *out.at((abase + bi) * rows + r) = acc };
+        bi += 1;
+    }
+}
+
+/// Rows `start..end` of a single-output q4tp a8w8 matvec, `L` independent
+/// accumulator chains wide. Per row: scales decoded once, groups stepped
+/// in ascending `gi` with `acc += d as f32 * scale` (the exact plain-row
+/// order), then the `* sx` scale and the outlier corrections in list
+/// order — the plain row loop's arithmetic, line for line.
+///
+/// # Safety
+/// AVX2 (callers gate on `a8w8_enabled()`); `out` disjoint per row.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q4tp_matvec_lanes<const L: usize>(
+    v: &Q4tpView<'_>,
+    start: usize,
+    end: usize,
+    gpr: usize,
+    xq: &[i8],
+    xg8: &[f32],
+    sx: f32,
+    outliers: &[(usize, f32)],
+    sc: &mut [f32],
+    out: SendMut,
+) {
+    use core::arch::x86_64::*;
+    debug_assert!(L >= 2 && sc.len() >= L * gpr && xg8.len() == gpr);
+    crate::cpuprof::count_lane_rows((end - start) as u64);
+    let mut base = start;
+    while base + L <= end {
+        let _t0 = crate::cpuprof::time(crate::cpuprof::Slot::GuScales);
+        let mut rows = [0usize; L];
+        for l in 0..L {
+            rows[l] = base + l;
+        }
+        let v4: [&Q4tpView; L] = [v; L];
+        q4tp_scales_lanes(&v4, &rows, gpr, sc);
+        drop(_t0);
+        let _t1 = crate::cpuprof::time(crate::cpuprof::Slot::GuDots);
+        let mut accs = [_mm256_setzero_ps(); L];
+        for gi in 0..gpr {
+            let xp = xq.as_ptr().add(gi * GROUP_SIZE);
+            let xgb = _mm256_set1_ps(*xg8.get_unchecked(gi));
+            for l in 0..L {
+                let w = q4tp_unpack_w(v.nib.as_ptr().add((rows[l] * gpr + gi) * Q4TP_NIB));
+                let d = q4tp_madd_wx(w, xp);
+                let t = _mm256_sub_ps(_mm256_cvtepi32_ps(d), xgb);
+                let sb = _mm256_set1_ps(*sc.get_unchecked(l * gpr + gi));
+                accs[l] = _mm256_add_ps(accs[l], _mm256_mul_ps(t, sb));
+            }
+        }
+        drop(_t1);
+        let _t2 = crate::cpuprof::time(crate::cpuprof::Slot::GuPost);
+        for l in 0..L {
+            let r = rows[l];
+            let scl = &sc[l * gpr..(l + 1) * gpr];
+            let mut acc = q4tp_hsum256(accs[l]) * sx;
+            for &(j, xv) in outliers {
+                let (w, s) = q4tp_outlier(v.nib, r, gpr, j, scl);
+                acc += w * s * xv;
+            }
+            // SAFETY: one lane owns each row.
+            unsafe { *out.at(r) = acc };
+        }
+        drop(_t2);
+        base += L;
+    }
+    // Partial lane batch (and any tail): one vertical cell per row —
+    // the same reduction shape as the lanes above and as the row-exact
+    // matmat, so bits agree across every path.
+    for r in base..end {
+        let scl = &mut sc[..gpr];
+        v.scales_into(r, gpr, scl);
+        let scl: &[f32] = scl;
+        let mut acc = q4tp_cell_dot_v(v.nib.as_ptr(), r, gpr, xq.as_ptr(), scl.as_ptr(), xg8.as_ptr())
+            * sx;
+        for &(j, xv) in outliers {
+            let (w, s) = q4tp_outlier(v.nib, r, gpr, j, scl);
+            acc += w * s * xv;
+        }
+        // SAFETY: disjoint row ranges per worker.
+        unsafe { *out.at(r) = acc };
+    }
+}
+
+/// Rows `start..end` of the fused SwiGLU gate+up q4tp arm, `L` chains
+/// wide: both projections' scales decoded per lane, both group loops
+/// stepped in the plain arm's per-row order, then `silu_mul_limited`
+/// over the outlier-corrected pair — bit-identical to the plain arm.
+///
+/// # Safety
+/// AVX2 (callers gate on `a8w8_enabled()`); `out` disjoint per row.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q4tp_gateup_lanes<const L: usize>(
+    gv: &Q4tpView<'_>,
+    uv: &Q4tpView<'_>,
+    start: usize,
+    end: usize,
+    gpr: usize,
+    xq: &[i8],
+    xg8: &[f32],
+    sx: f32,
+    limit: f32,
+    outliers: &[(usize, f32)],
+    gsc: &mut [f32],
+    usc: &mut [f32],
+    out: SendMut,
+) {
+    use core::arch::x86_64::*;
+    debug_assert!(
+        L >= 2 && gsc.len() >= L * gpr && usc.len() >= L * gpr && xg8.len() == gpr
+    );
+    crate::cpuprof::count_lane_rows((end - start) as u64);
+    let mut base = start;
+    while base + L <= end {
+        let _t0 = crate::cpuprof::time(crate::cpuprof::Slot::GuScales);
+        let mut rows = [0usize; L];
+        for l in 0..L {
+            rows[l] = base + l;
+        }
+        let gv4: [&Q4tpView; L] = [gv; L];
+        let uv4: [&Q4tpView; L] = [uv; L];
+        q4tp_scales_lanes(&gv4, &rows, gpr, gsc);
+        q4tp_scales_lanes(&uv4, &rows, gpr, usc);
+        drop(_t0);
+        let _t1 = crate::cpuprof::time(crate::cpuprof::Slot::GuDots);
+        let mut ag = [_mm256_setzero_ps(); L];
+        let mut au = [_mm256_setzero_ps(); L];
+        for gi in 0..gpr {
+            let xp = xq.as_ptr().add(gi * GROUP_SIZE);
+            let xgb = _mm256_set1_ps(*xg8.get_unchecked(gi));
+            for l in 0..L {
+                let w = q4tp_unpack_w(gv.nib.as_ptr().add((rows[l] * gpr + gi) * Q4TP_NIB));
+                let d = q4tp_madd_wx(w, xp);
+                let t = _mm256_sub_ps(_mm256_cvtepi32_ps(d), xgb);
+                let sb = _mm256_set1_ps(*gsc.get_unchecked(l * gpr + gi));
+                ag[l] = _mm256_add_ps(ag[l], _mm256_mul_ps(t, sb));
+            }
+            for l in 0..L {
+                let w = q4tp_unpack_w(uv.nib.as_ptr().add((rows[l] * gpr + gi) * Q4TP_NIB));
+                let d = q4tp_madd_wx(w, xp);
+                let t = _mm256_sub_ps(_mm256_cvtepi32_ps(d), xgb);
+                let sb = _mm256_set1_ps(*usc.get_unchecked(l * gpr + gi));
+                au[l] = _mm256_add_ps(au[l], _mm256_mul_ps(t, sb));
+            }
+        }
+        drop(_t1);
+        let _t2 = crate::cpuprof::time(crate::cpuprof::Slot::GuPost);
+        for l in 0..L {
+            let r = rows[l];
+            let gs = &gsc[l * gpr..(l + 1) * gpr];
+            let us = &usc[l * gpr..(l + 1) * gpr];
+            let mut g = q4tp_hsum256(ag[l]) * sx;
+            let mut u = q4tp_hsum256(au[l]) * sx;
+            for &(j, xv) in outliers {
+                let (w, s) = q4tp_outlier(gv.nib, r, gpr, j, gs);
+                g += w * s * xv;
+                let (w, s) = q4tp_outlier(uv.nib, r, gpr, j, us);
+                u += w * s * xv;
+            }
+            // SAFETY: one lane owns each row.
+            unsafe { *out.at(r) = silu_mul_limited(g, u, limit) };
+        }
+        drop(_t2);
+        base += L;
+    }
+    // Partial lane batch (and any tail): one vertical cell per stream.
+    for r in base..end {
+        let g = &mut gsc[..gpr];
+        let u = &mut usc[..gpr];
+        gv.scales_into(r, gpr, g);
+        uv.scales_into(r, gpr, u);
+        let (g, u): (&[f32], &[f32]) = (g, u);
+        let mut gv_ =
+            q4tp_cell_dot_v(gv.nib.as_ptr(), r, gpr, xq.as_ptr(), g.as_ptr(), xg8.as_ptr()) * sx;
+        let mut uv_ =
+            q4tp_cell_dot_v(uv.nib.as_ptr(), r, gpr, xq.as_ptr(), u.as_ptr(), xg8.as_ptr()) * sx;
+        for &(j, xv) in outliers {
+            let (w, s) = q4tp_outlier(gv.nib, r, gpr, j, g);
+            gv_ += w * s * xv;
+            let (w, s) = q4tp_outlier(uv.nib, r, gpr, j, u);
+            uv_ += w * s * xv;
+        }
+        // SAFETY: disjoint row ranges per worker.
+        unsafe { *out.at(r) = silu_mul_limited(gv_, uv_, limit) };
+    }
+}
+
+/// Flat-space sibling of [`q4tp_matvec_lanes`] for `matvec_many`: the
+/// virtual row space spans several tensors, so each lane resolves its
+/// (tensor, row) pair through the caller's `locate`, then runs the plain
+/// per-row math of the fused q4tp arm.
+///
+/// # Safety
+/// AVX2 (callers gate on `a8w8_enabled()`); `outs` disjoint per row.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q4tp_many_lanes<const L: usize>(
+    views: &[Q4tpView<'_>],
+    locate: &(dyn Fn(usize) -> (usize, usize)),
+    start: usize,
+    end: usize,
+    gpr: usize,
+    xq: &[i8],
+    xg8: &[f32],
+    sx: f32,
+    outliers: &[(usize, f32)],
+    sc: &mut [f32],
+    outs: &[SendMut],
+) {
+    use core::arch::x86_64::*;
+    debug_assert!(L >= 2 && sc.len() >= L * gpr && xg8.len() == gpr);
+    crate::cpuprof::count_lane_rows((end - start) as u64);
+    let mut base = start;
+    while base + L <= end {
+        let _t0 = crate::cpuprof::time(crate::cpuprof::Slot::GuScales);
+        let mut tk = [0usize; L];
+        let mut rows = [0usize; L];
+        for l in 0..L {
+            let (t, r) = locate(base + l);
+            tk[l] = t;
+            rows[l] = r;
+        }
+        let v4: [&Q4tpView; L] = std::array::from_fn(|l| &views[tk[l]]);
+        q4tp_scales_lanes(&v4, &rows, gpr, sc);
+        drop(_t0);
+        let _t1 = crate::cpuprof::time(crate::cpuprof::Slot::GuDots);
+        let mut accs = [_mm256_setzero_ps(); L];
+        for gi in 0..gpr {
+            let xp = xq.as_ptr().add(gi * GROUP_SIZE);
+            let xgb = _mm256_set1_ps(*xg8.get_unchecked(gi));
+            for l in 0..L {
+                let w = q4tp_unpack_w(
+                    views[tk[l]].nib.as_ptr().add((rows[l] * gpr + gi) * Q4TP_NIB),
+                );
+                let d = q4tp_madd_wx(w, xp);
+                let t = _mm256_sub_ps(_mm256_cvtepi32_ps(d), xgb);
+                let sb = _mm256_set1_ps(*sc.get_unchecked(l * gpr + gi));
+                accs[l] = _mm256_add_ps(accs[l], _mm256_mul_ps(t, sb));
+            }
+        }
+        drop(_t1);
+        let _t2 = crate::cpuprof::time(crate::cpuprof::Slot::GuPost);
+        for l in 0..L {
+            let (t, r) = (tk[l], rows[l]);
+            let scl = &sc[l * gpr..(l + 1) * gpr];
+            let mut acc = q4tp_hsum256(accs[l]) * sx;
+            for &(j, xv) in outliers {
+                let (w, s) = q4tp_outlier(views[t].nib, r, gpr, j, scl);
+                acc += w * s * xv;
+            }
+            // SAFETY: one lane owns each (tensor, row) pair.
+            unsafe { *outs[t].at(r) = acc };
+        }
+        drop(_t2);
+        base += L;
+    }
+    // Partial lane batch (and any tail): one vertical cell per row.
+    for flat in base..end {
+        let (t, r) = locate(flat);
+        let v = &views[t];
+        let scl = &mut sc[..gpr];
+        v.scales_into(r, gpr, scl);
+        let scl: &[f32] = scl;
+        let mut acc =
+            q4tp_cell_dot_v(v.nib.as_ptr(), r, gpr, xq.as_ptr(), scl.as_ptr(), xg8.as_ptr()) * sx;
+        for &(j, xv) in outliers {
+            let (w, s) = q4tp_outlier(v.nib, r, gpr, j, scl);
+            acc += w * s * xv;
+        }
+        // SAFETY: one worker owns each (tensor, row) pair.
+        unsafe { *outs[t].at(r) = acc };
+    }
+}
+
 /// Exact scalar q4tp row — the `CMF_SDOT=0` contract, same pairwise
 /// accumulation shape as `q4t_row_exact`.
 #[inline]
@@ -5993,7 +6830,35 @@ fn q4tp_matvec(
     let out_addr = SendMut(out.as_mut_ptr());
     if a8w8_enabled() {
         let act = split_act(x);
+        #[cfg(target_arch = "x86_64")]
+        let lanes = q4tp_lanes();
         let run = |start: usize, end: usize| {
+            #[cfg(target_arch = "x86_64")]
+            if lanes > 1 && act.xg8.len() == gpr {
+                // L independent accumulator chains per worker — the plain
+                // row body's math, lane-interleaved.
+                with_krow(gpr * lanes, |sc| {
+                    // SAFETY: a8w8 implies AVX2; disjoint row ranges.
+                    unsafe {
+                        match lanes {
+                            2 => q4tp_matvec_lanes::<2>(
+                                &v, start, end, gpr, &act.xq, &act.xg8, act.sx,
+                                &act.outliers, sc, out_addr,
+                            ),
+                            8 => q4tp_matvec_lanes::<8>(
+                                &v, start, end, gpr, &act.xq, &act.xg8, act.sx,
+                                &act.outliers, sc, out_addr,
+                            ),
+                            _ => q4tp_matvec_lanes::<4>(
+                                &v, start, end, gpr, &act.xq, &act.xg8, act.sx,
+                                &act.outliers, sc, out_addr,
+                            ),
+                        }
+                    }
+                });
+                return;
+            }
+            crate::cpuprof::count_plain_rows((end - start) as u64);
             // One scratch row of scales per worker — borrowed, not minted.
             with_krow(gpr, |sc| {
                 for r in start..end {
@@ -6004,7 +6869,7 @@ fn q4tp_matvec(
                         acc += w * s * xv;
                     }
                     // SAFETY: disjoint row ranges per worker.
-                    unsafe { *out_addr.at(r) = acc };
+                    unsafe { *out_addr.at(r) = acc }
                 }
             })
         };
@@ -7197,6 +8062,32 @@ fn q4tp_matmat_with(
                         }
                     }
                     let _ = blocked_ok;
+                    // AVX2: the vertical column panel shares each group's
+                    // unpack across four columns and keeps the row-exact
+                    // cell bits (see `q4tp_matmat_row_cols_v`). Falls
+                    // through to the single-column loop only when a column
+                    // lacks its per-group correction.
+                    #[cfg(target_arch = "x86_64")]
+                    if acts[abase..abase + alen]
+                        .iter()
+                        .all(|a| a.xg8.len() == gpr)
+                    {
+                        // SAFETY: a8w8 implies AVX2; cells stay disjoint
+                        // per (worker, bi, r).
+                        unsafe {
+                            q4tp_matmat_row_cols_v(
+                                &v,
+                                r,
+                                gpr,
+                                &acts[abase + bi..abase + alen],
+                                &sc,
+                                abase + bi,
+                                rows,
+                                out_addr,
+                            )
+                        };
+                        bi = alen;
+                    }
                     while bi < alen {
                         let act = &acts[abase + bi];
                         let mut acc = dot_q4tp_row_i8(v.nib, r, gpr, &act.xq, &sc) * act.sx;
@@ -11620,6 +12511,17 @@ struct SplitAct {
     /// `−128·Σx`); one i32 per split, computed once per matvec.
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     xsum: i32,
+    /// `Σ xq` per 32-element group, already f32 — the q4tp `(w+8)·x − 8·Σx`
+    /// correction for the VERTICAL accumulator: the f32x8 partials reduce
+    /// through an 8-lane horizontal sum, and each lane subtracts this once,
+    /// so the row total carries exactly `8·Σx`. Precomputing it lets the
+    /// AVX2 kernels drop the per-byte `vpaddb`/`vpabsb`/`vpsignb` (two of
+    /// the three sat on port 5) and feed the raw unsigned nibbles straight
+    /// to `vpmaddubsw`. Every value is an integer ≤ 32·127, so both the
+    /// f32 conversion and each lane's subtraction are exact and the cell
+    /// equals the old `(nib − 8)` dot bit for bit.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    xg8: Vec<f32>,
 }
 
 thread_local! {
@@ -11627,6 +12529,16 @@ thread_local! {
     /// and its hidden-size allocation was steady-state heap churn.
     static XQ_FREE: std::cell::RefCell<Vec<Vec<i8>>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Recycled per-group correction buffers (see `SplitAct::xg8`).
+    static XG8_FREE: std::cell::RefCell<Vec<Vec<f32>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Pop a recycled `xg8` buffer, or mint one; filled by [`xg8_of`].
+fn xg8_take() -> Vec<f32> {
+    let mut v = XG8_FREE.with(|f| f.borrow_mut().pop()).unwrap_or_default();
+    v.clear();
+    v
 }
 
 impl Drop for SplitAct {
@@ -11640,7 +12552,30 @@ impl Drop for SplitAct {
                 }
             });
         }
+        let buf = std::mem::take(&mut self.xg8);
+        if buf.capacity() > 0 {
+            XG8_FREE.with(|f| {
+                let mut f = f.borrow_mut();
+                if f.len() < 16 {
+                    f.push(buf);
+                }
+            });
+        }
     }
+}
+
+/// Fill `out` with `Σ xq` per group — see [`SplitAct::xg8`]. A tail
+/// shorter than one group is dropped (`chunks_exact`); kernels guard on
+/// `xg8.len() == gpr`.
+fn xg8_fill(xq: &[i8], out: &mut Vec<f32>) {
+    out.clear();
+    out.extend(xq.chunks_exact(GROUP_SIZE).map(|c| {
+        let mut s = 0i32;
+        for &v in c {
+            s += v as i32;
+        }
+        s as f32
+    }));
 }
 
 thread_local! {
@@ -11744,6 +12679,7 @@ fn split_act(x: &[f32]) -> SplitAct {
     }
     let sx = if amax > 0.0 { amax / 127.0 } else { 1.0 };
     let inv = 1.0 / sx;
+    crate::cpuprof::count_outliers(outliers.len() as u64);
     let mut xq = XQ_FREE.with(|f| f.borrow_mut().pop()).unwrap_or_default();
     xq.clear();
     xq.reserve(n);
@@ -11763,11 +12699,14 @@ fn split_act(x: &[f32]) -> SplitAct {
         }));
     }
     let xsum = xq.iter().map(|&v| v as i32).sum();
+    let mut xg8 = xg8_take();
+    xg8_fill(&xq, &mut xg8);
     SplitAct {
         xq,
         sx,
         outliers,
         xsum,
+        xg8,
     }
 }
 
@@ -11820,11 +12759,14 @@ fn split_act_q8_2f(x: &[f32], col: &[f32]) -> SplitAct {
         }));
     }
     let xsum = xq.iter().map(|&v| v as i32).sum();
+    let mut xg8 = xg8_take();
+    xg8_fill(&xq, &mut xg8);
     SplitAct {
         xq,
         sx,
         outliers,
         xsum,
+        xg8,
     }
 }
 
@@ -12637,6 +13579,7 @@ impl SendMut {
 
 #[cfg(test)]
 mod tests {
+
     /// `q8_round` must be `round().clamp(±127) as i8` bit for bit: every
     /// half-integer, their neighbours one ulp either side, the clamp
     /// boundary, huge values, infinities and NaN, plus a dense sweep.
