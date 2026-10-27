@@ -11,8 +11,8 @@
 //! directory layout while streaming, so opening a multi-million-token set is
 //! O(1) memory and records are checked only as they are consumed.
 
-use anyhow::{ensure, Context, Result};
-use serde_json::{json, Map, Value};
+use anyhow::{Context, Result, ensure};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -808,38 +808,108 @@ impl TdataReader {
         };
         for item in self.stream(selector)? {
             let sample = item?;
-            if let Some(ledger) = &prompt_ledger {
-                let expected_split = ledger.get(&sample.record.pid).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "records.jsonl rid {:?} refers to pid {:?}, which is absent from prompts.jsonl",
-                        sample.record.rid,
-                        sample.record.pid
-                    )
-                })?;
-                ensure!(
-                    *expected_split == sample.record.split,
-                    "records.jsonl rid {:?} has split {}, but prompts.jsonl pid {:?} declares {}",
-                    sample.record.rid,
-                    sample.record.split,
-                    sample.record.pid,
-                    expected_split
-                );
-                seen_prompt_ids.insert(sample.record.pid);
-            }
+            verify_prompt_ledger_record(&prompt_ledger, &mut seen_prompt_ids, &sample.record)?;
         }
-        if let Some(ledger) = &prompt_ledger {
+        verify_prompt_ledger_complete(&prompt_ledger, &seen_prompt_ids)?;
+        verify_manifest_file_hashes(&self.root, &self.manifest.raw)
+    }
+
+    /// Verify the immutable data-set contract before a selected calibration
+    /// pass without allocating one `Vec<u32>` per record merely for the
+    /// preflight.
+    ///
+    /// This still parses and structurally validates *every* JSONL/index row:
+    /// a malformed validation/test row cannot be hidden by a `:train`
+    /// selector. A finalized writer's manifest contains sizes and SHA-256
+    /// digests, so [`verify_manifest_file_hashes`] reads and authenticates all
+    /// payload bytes, including unselected token records, in one sequential
+    /// pass. Older descriptor-less v1 data falls back to a bounded sequential
+    /// readability scan of `tokens.bin`; that retains the old full-read
+    /// failure detection without materializing a record-sized token vector.
+    ///
+    /// The caller must subsequently consume selected records through
+    /// [`Self::stream`]. Keeping data validation and model calibration as
+    /// independent passes makes a large CPU calibration fail before loading
+    /// the model while retaining O(1) token-payload memory in this preflight.
+    pub fn verify_for_calibration(&self, selector: &TdataSelector) -> Result<()> {
+        ensure!(
+            selector.root == self.root,
+            "calibration selector root {} differs from opened .tdata directory {}",
+            selector.root.display(),
+            self.root.display()
+        );
+
+        // Preserve the strict native prompt-ledger guarantees of `verify()`.
+        // This preflight intentionally ignores `selector` after checking its
+        // root: all rows must be validated regardless of which split is later
+        // consumed by calibration.
+        let prompt_ledger = self.read_teacher_prompt_ledger()?;
+        let mut seen_prompt_ids = BTreeSet::new();
+        let records_path = self.root.join("records.jsonl");
+        let index_path = self.root.join("tokens.idx");
+        let mut records = BufReader::new(
+            File::open(&records_path)
+                .with_context(|| format!("opening {}", records_path.display()))?,
+        );
+        let mut index =
+            File::open(&index_path).with_context(|| format!("opening {}", index_path.display()))?;
+        let mut ordinal = 0_u64;
+        let mut expected_tok_offset = 0_u64;
+        while let Some(line) = read_jsonl_line(&mut records)? {
             ensure!(
-                seen_prompt_ids.len() == ledger.len(),
-                "prompts.jsonl contains {} prompt(s), but records.jsonl refers to {} distinct pid(s); prompt {:?} has no committed record",
-                ledger.len(),
-                seen_prompt_ids.len(),
-                ledger
-                    .keys()
-                    .find(|id| !seen_prompt_ids.contains(*id))
-                    .expect("length mismatch implies a missing id")
+                ordinal < self.index_entries,
+                "records.jsonl has more rows than tokens.idx entries (first extra row {})",
+                ordinal + 1
+            );
+            let line_no = ordinal
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("records.jsonl line number overflows u64"))?;
+            let line_no_usize = usize::try_from(line_no).map_err(|_| {
+                anyhow::anyhow!("records.jsonl line number {line_no} exceeds usize")
+            })?;
+            let record = TdataRecord::from_json_line(&line, line_no_usize)?;
+            let entry = read_index_entry(&mut index, ordinal)?;
+            validate_record_index_pair(
+                &record,
+                entry,
+                line_no,
+                expected_tok_offset,
+                Some(self.token_count),
+            )?;
+            verify_prompt_ledger_record(&prompt_ledger, &mut seen_prompt_ids, &record)?;
+            expected_tok_offset = expected_tok_offset
+                .checked_add(entry.total as u64)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("tokens.idx record {line_no}: token offset overflow")
+                })?;
+            ordinal = line_no;
+        }
+        ensure!(
+            ordinal == self.index_entries,
+            "records.jsonl ended after {ordinal} rows but tokens.idx contains {} entries",
+            self.index_entries
+        );
+        ensure!(
+            expected_tok_offset == self.token_count,
+            "tokens.bin has {} tokens but records/index account for {expected_tok_offset}",
+            self.token_count
+        );
+        if let Some(expected) = self.manifest.expected_records {
+            ensure!(
+                expected == ordinal,
+                "manifest.json stats.records={expected}, but records.jsonl has {ordinal} rows"
             );
         }
-        verify_manifest_file_hashes(&self.root, &self.manifest.raw)
+        verify_prompt_ledger_complete(&prompt_ledger, &seen_prompt_ids)?;
+
+        // Finalized native data always has this promise. Legacy v1 input can
+        // omit it; scanning with a fixed buffer preserves `verify()`'s former
+        // all-payload read without paying a record-sized allocation.
+        verify_manifest_file_hashes(&self.root, &self.manifest.raw)?;
+        if !manifest_file_has_integrity_promise(&self.manifest.raw, "tokens.bin") {
+            scan_file_readable(&self.root.join("tokens.bin"), "tokens.bin")?;
+        }
+        Ok(())
     }
 
     /// Read the strict prompt ledger emitted by the native JSONL generator.
@@ -867,7 +937,9 @@ impl TdataReader {
             .and_then(|manifest| manifest.get("prompts"))
             .and_then(Value::as_object)
             .and_then(|prompts| prompts.get("count"))
-            .ok_or_else(|| anyhow::anyhow!("manifest.json.prompts.count is required for input.format=jsonl-v1"))
+            .ok_or_else(|| {
+                anyhow::anyhow!("manifest.json.prompts.count is required for input.format=jsonl-v1")
+            })
             .and_then(|value| json_u64(value, "manifest.json.prompts.count"))?;
         let prompts_path = self.root.join("prompts.jsonl");
         let mut reader = BufReader::new(
@@ -879,8 +951,8 @@ impl TdataReader {
         while let Some(line) = read_jsonl_line(&mut reader)? {
             line_no = checked_add_counter(line_no, 1, "prompts.jsonl line count")?;
             let context = format!("prompts.jsonl line {line_no}");
-            let value: Value = serde_json::from_str(&line)
-                .with_context(|| format!("{context}: invalid JSON"))?;
+            let value: Value =
+                serde_json::from_str(&line).with_context(|| format!("{context}: invalid JSON"))?;
             let object = value
                 .as_object()
                 .ok_or_else(|| anyhow::anyhow!("{context}: expected a JSON object"))?;
@@ -891,7 +963,10 @@ impl TdataReader {
             let messages = required_value(object, "messages", &context)?
                 .as_array()
                 .ok_or_else(|| anyhow::anyhow!("{context}: messages must be an array"))?;
-            ensure!(!messages.is_empty(), "{context}: messages must not be empty");
+            ensure!(
+                !messages.is_empty(),
+                "{context}: messages must not be empty"
+            );
             ensure!(
                 ledger.insert(id.to_owned(), split).is_none(),
                 "{context}: duplicate prompt id {id:?}"
@@ -921,6 +996,95 @@ impl TdataReader {
             summary.add(&sample.record, sample.index);
         }
         Ok(summary)
+    }
+}
+
+/// Validate one record against the optional strict native prompt ledger.
+/// Keeping this outside the reader lets the calibration preflight use exactly
+/// the same native integrity rule as the public full verifier.
+fn verify_prompt_ledger_record(
+    prompt_ledger: &Option<BTreeMap<String, TdataSplit>>,
+    seen_prompt_ids: &mut BTreeSet<String>,
+    record: &TdataRecord,
+) -> Result<()> {
+    let Some(ledger) = prompt_ledger else {
+        return Ok(());
+    };
+    let expected_split = ledger.get(&record.pid).ok_or_else(|| {
+        anyhow::anyhow!(
+            "records.jsonl rid {:?} refers to pid {:?}, which is absent from prompts.jsonl",
+            record.rid,
+            record.pid
+        )
+    })?;
+    ensure!(
+        *expected_split == record.split,
+        "records.jsonl rid {:?} has split {}, but prompts.jsonl pid {:?} declares {}",
+        record.rid,
+        record.split,
+        record.pid,
+        expected_split
+    );
+    seen_prompt_ids.insert(record.pid.clone());
+    Ok(())
+}
+
+/// Finish the optional strict native prompt-ledger validation.
+fn verify_prompt_ledger_complete(
+    prompt_ledger: &Option<BTreeMap<String, TdataSplit>>,
+    seen_prompt_ids: &BTreeSet<String>,
+) -> Result<()> {
+    let Some(ledger) = prompt_ledger else {
+        return Ok(());
+    };
+    ensure!(
+        seen_prompt_ids.len() == ledger.len(),
+        "prompts.jsonl contains {} prompt(s), but records.jsonl refers to {} distinct pid(s); prompt {:?} has no committed record",
+        ledger.len(),
+        seen_prompt_ids.len(),
+        ledger
+            .keys()
+            .find(|id| !seen_prompt_ids.contains(*id))
+            .expect("length mismatch implies a missing id")
+    );
+    Ok(())
+}
+
+/// Whether `verify_manifest_file_hashes` performs a complete read of this
+/// payload. It intentionally mirrors the verifier's "bytes or sha256"
+/// contract; malformed descriptors are rejected by that verifier before this
+/// answer matters.
+fn manifest_file_has_integrity_promise(manifest: &Value, name: &str) -> bool {
+    manifest
+        .as_object()
+        .and_then(|manifest| manifest.get("files"))
+        .and_then(Value::as_object)
+        .and_then(|files| files.get(name))
+        .and_then(Value::as_object)
+        .is_some_and(|descriptor| {
+            descriptor
+                .get("bytes")
+                .is_some_and(|value| !value.is_null())
+                || descriptor
+                    .get("sha256")
+                    .is_some_and(|value| !value.is_null())
+        })
+}
+
+/// Read a payload in a fixed-size buffer when legacy v1 data provides no
+/// manifest digest/size promise. This preserves a full-read I/O error fence
+/// without allocating according to a record's token count.
+fn scan_file_readable(path: &Path, label: &str) -> Result<()> {
+    let mut file =
+        File::open(path).with_context(|| format!("opening {label} {}", path.display()))?;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("reading {label} {}", path.display()))?;
+        if read == 0 {
+            return Ok(());
+        }
     }
 }
 
@@ -2708,12 +2872,14 @@ mod tests {
         .unwrap();
         fs::write(malformed.root.join("tokens.bin"), 1_u32.to_le_bytes()).unwrap();
         let reader = TdataReader::open(&malformed.root).unwrap();
-        assert!(reader
-            .stream(TdataSelector::parse(&malformed.root.display().to_string()).unwrap())
-            .unwrap()
-            .next()
-            .unwrap()
-            .is_err());
+        assert!(
+            reader
+                .stream(TdataSelector::parse(&malformed.root.display().to_string()).unwrap())
+                .unwrap()
+                .next()
+                .unwrap()
+                .is_err()
+        );
     }
 
     fn writer_record(rid: &str, split: &str, usable: bool, ids: &[u32]) -> TdataRecord {
@@ -2835,9 +3001,11 @@ mod tests {
         assert_eq!(samples[0].tokens, vec![11, 12, 13]);
         assert_eq!(samples[1].tokens, vec![21, 22]);
         assert_eq!(reader.manifest.raw["files"]["tokens.bin"]["bytes"], 20);
-        assert!(reader.manifest.raw["files"]["tokens.bin"]["sha256"]
-            .as_str()
-            .is_some());
+        assert!(
+            reader.manifest.raw["files"]["tokens.bin"]["sha256"]
+                .as_str()
+                .is_some()
+        );
 
         // Payload remains structurally readable after a one-byte token change,
         // so this specifically proves that `verify` checks the finalized hash.
@@ -2852,13 +3020,82 @@ mod tests {
     }
 
     #[test]
+    fn calibration_preflight_checks_an_unselected_row_structurally() {
+        let data = TempTdata::new("calibration-preflight-structure");
+        data.write(
+            &[
+                (
+                    row("train#0", "train", true, 0, 0, &[11, 12]),
+                    index(0, 2, TdataSplit::Train, true),
+                    vec![11, 12],
+                ),
+                (
+                    row("val#0", "val", true, 1, 2, &[21, 22]),
+                    index(2, 2, TdataSplit::Val, true),
+                    vec![21, 22],
+                ),
+            ],
+            None,
+        );
+        let reader = TdataReader::open(&data.root).unwrap();
+        let train = TdataSelector::parse(&format!("{}:train", data.root.display())).unwrap();
+        reader.verify_for_calibration(&train).unwrap();
+
+        // The selected calibration split is train, but a malformed skipped
+        // validation index is still a data-set integrity failure.
+        let index_path = data.root.join("tokens.idx");
+        let mut bytes = fs::read(&index_path).unwrap();
+        bytes[TDATA_INDEX_BYTES + 36] = 9; // invalid v1 split byte
+        fs::write(index_path, bytes).unwrap();
+        let error = reader
+            .verify_for_calibration(&train)
+            .expect_err("unselected malformed row must not be skipped");
+        assert!(
+            format!("{error:#}").contains("invalid split byte"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn calibration_preflight_authenticates_unselected_token_bytes() {
+        let data = TempTdata::new("calibration-preflight-hash");
+        let mut writer = TdataWriter::create(&data.root, json!({})).unwrap();
+        writer
+            .append_record(
+                writer_record("train#0", "train", true, &[11, 12]),
+                &[11, 12],
+            )
+            .unwrap();
+        writer
+            .append_record(writer_record("val#0", "val", true, &[21, 22]), &[21, 22])
+            .unwrap();
+        writer.finalize().unwrap();
+
+        let reader = TdataReader::open(&data.root).unwrap();
+        let train = TdataSelector::parse(&format!("{}:train", data.root.display())).unwrap();
+        reader.verify_for_calibration(&train).unwrap();
+
+        // Byte 8 belongs to the unselected validation record. Its raw u32
+        // representation is structurally valid, so this specifically proves
+        // the manifest SHA remains an all-payload integrity fence.
+        let mut tokens = OpenOptions::new()
+            .write(true)
+            .open(data.root.join("tokens.bin"))
+            .unwrap();
+        tokens.seek(SeekFrom::Start(8)).unwrap();
+        tokens.write_all(&[0xff]).unwrap();
+        tokens.sync_all().unwrap();
+        let error = reader
+            .verify_for_calibration(&train)
+            .expect_err("unselected token corruption must fail the SHA fence");
+        assert!(error.to_string().contains("tokens.bin.sha256"), "{error:#}");
+    }
+
+    #[test]
     fn verify_cross_checks_the_native_prompt_ledger_against_records() {
         let data = TempTdata::new("teacher-prompt-ledger");
-        let mut writer = TdataWriter::create(
-            &data.root,
-            json!({"input": {"format": "jsonl-v1"}}),
-        )
-        .unwrap();
+        let mut writer =
+            TdataWriter::create(&data.root, json!({"input": {"format": "jsonl-v1"}})).unwrap();
         writer
             .append_prompt(&json!({
                 "id": "known",
@@ -2868,10 +3105,7 @@ mod tests {
             }))
             .unwrap();
         writer
-            .append_record(
-                writer_record("known#0", "train", true, &[1, 2]),
-                &[1, 2],
-            )
+            .append_record(writer_record("known#0", "train", true, &[1, 2]), &[1, 2])
             .unwrap();
         writer.finalize().unwrap();
 
@@ -2887,7 +3121,10 @@ mod tests {
         )
         .unwrap();
         let error = reader.verify().expect_err("ledger pid mismatch must fail");
-        assert!(error.to_string().contains("absent from prompts.jsonl"), "{error:#}");
+        assert!(
+            error.to_string().contains("absent from prompts.jsonl"),
+            "{error:#}"
+        );
     }
 
     #[test]

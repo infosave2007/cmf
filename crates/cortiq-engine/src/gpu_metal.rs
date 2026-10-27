@@ -57,6 +57,12 @@ fn io_key(key: usize) -> (u64, usize) {
     (IO_NAMESPACE.with(Cell::get), key)
 }
 
+// Metal does not guarantee that `newBufferWithLength:0` returns an object;
+// on Apple M4 it returns nil and metal-rs correctly refuses to wrap it. KV
+// mirrors replace these placeholders before any kernel can read them, but a
+// real nonzero buffer is still required to construct the Rust `Buffer`.
+const METAL_PLACEHOLDER_BYTES: u64 = std::mem::size_of::<f32>() as u64;
+
 /// Select the scratch-buffer namespace for the current generation thread.
 /// Pipeline graph ids are process-unique, so no allocation or global lock is
 /// needed.  A zero id is retained for direct low-level callers/tests.
@@ -11567,32 +11573,17 @@ pub fn q4_matvec_sweep(
 /// out — row-major [b, rows]. false = CPU path.
 #[allow(clippy::too_many_arguments)]
 /// f32 → f16 bulk convert into a raw destination (the mul_mm X upload).
-/// NEON vcvt on aarch64; scalar bit-twiddle elsewhere.
+///
+/// Keep this on the stable scalar converter: Rust 1.88 (the project's MSRV)
+/// does not yet expose the aarch64 NEON `vcvt_f16_f32` intrinsic on stable.
+/// The helper is deliberately small and lets LLVM vectorize the ordinary loop
+/// where that is legal, rather than making the release fail to compile.
 fn f32_to_f16_into(src: &[f32], dst: *mut u16) {
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use core::arch::aarch64::*;
-        let n = src.len();
-        let sp = src.as_ptr();
-        let mut i = 0usize;
-        while i + 4 <= n {
-            let v = vld1q_f32(sp.add(i));
-            let h = vcvt_f16_f32(v);
-            core::ptr::write_unaligned(
-                dst.add(i) as *mut u64,
-                core::mem::transmute::<float16x4_t, u64>(h),
-            );
-            i += 4;
-        }
-        while i < n {
-            *dst.add(i) = cortiq_core::quant::f32_to_f16(*sp.add(i));
-            i += 1;
-        }
-        return;
-    }
-    #[allow(unreachable_code)]
-    for (i, &v) in src.iter().enumerate() {
-        unsafe { *dst.add(i) = cortiq_core::quant::f32_to_f16(v) };
+    // SAFETY: callers provide an initialized writable destination with one
+    // u16 slot per source f32 (the Metal upload buffer allocation does this).
+    let dst = unsafe { std::slice::from_raw_parts_mut(dst, src.len()) };
+    for (out, &value) in dst.iter_mut().zip(src) {
+        *out = cortiq_core::quant::f32_to_f16(value);
     }
 }
 
@@ -12427,12 +12418,12 @@ pub fn chunk_run_gpu(
             let need = lio.cpu_stored + b;
             let entry = reg.entry((l.kv_id, l.layer)).or_insert_with(|| KvMirror {
                 k: c._device
-                    .new_buffer(0, MTLResourceOptions::StorageModeShared),
+                    .new_buffer(METAL_PLACEHOLDER_BYTES, MTLResourceOptions::StorageModeShared),
                 v: c._device
-                    .new_buffer(0, MTLResourceOptions::StorageModeShared),
+                    .new_buffer(METAL_PLACEHOLDER_BYTES, MTLResourceOptions::StorageModeShared),
                 imp: c
                     ._device
-                    .new_buffer(0, MTLResourceOptions::StorageModeShared),
+                    .new_buffer(METAL_PLACEHOLDER_BYTES, MTLResourceOptions::StorageModeShared),
                 cap: 0,
                 stored: usize::MAX,
                 generation: 0,
@@ -20030,15 +20021,15 @@ impl TokenGraph {
                     k: self
                         .c
                         ._device
-                        .new_buffer(0, MTLResourceOptions::StorageModeShared),
+                        .new_buffer(METAL_PLACEHOLDER_BYTES, MTLResourceOptions::StorageModeShared),
                     v: self
                         .c
                         ._device
-                        .new_buffer(0, MTLResourceOptions::StorageModeShared),
+                        .new_buffer(METAL_PLACEHOLDER_BYTES, MTLResourceOptions::StorageModeShared),
                     imp: self
                         .c
                         ._device
-                        .new_buffer(0, MTLResourceOptions::StorageModeShared),
+                        .new_buffer(METAL_PLACEHOLDER_BYTES, MTLResourceOptions::StorageModeShared),
                     cap: 0,
                     stored: usize::MAX, // force first-touch upload
                     generation: 0,
@@ -22793,12 +22784,12 @@ impl VerifyGraph {
             let need = p.cpu_stored + b;
             let entry = reg.entry((p.kv_id, p.layer)).or_insert_with(|| KvMirror {
                 k: c._device
-                    .new_buffer(0, MTLResourceOptions::StorageModeShared),
+                    .new_buffer(METAL_PLACEHOLDER_BYTES, MTLResourceOptions::StorageModeShared),
                 v: c._device
-                    .new_buffer(0, MTLResourceOptions::StorageModeShared),
+                    .new_buffer(METAL_PLACEHOLDER_BYTES, MTLResourceOptions::StorageModeShared),
                 imp: c
                     ._device
-                    .new_buffer(0, MTLResourceOptions::StorageModeShared),
+                    .new_buffer(METAL_PLACEHOLDER_BYTES, MTLResourceOptions::StorageModeShared),
                 cap: 0,
                 stored: usize::MAX,
                 generation: 0,

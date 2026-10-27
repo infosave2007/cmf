@@ -5,6 +5,47 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.38] — 2026-10-27
+
+### Added
+- `cortiq compact SOURCE.cmf PROMPTS.jsonl OUTPUT.cmf` is the short,
+  reproducible MTP-draft compaction workflow. It uses `SOURCE.cmf` as its own
+  teacher, creates or reuses the visible `OUTPUT.tdata` cache, physically
+  compacts the supported dense MTP FFN, records a plan, and publishes only a
+  verified runnable candidate.
+- `cortiq mtp-compact` can materialize a missing finalized `.tdata` directory
+  from `--teacher` and `--prompts` before compaction. Its tokenizer contract is
+  checked before a long generation run, and an existing finalized dataset is
+  reused rather than overwritten.
+- The MTP compaction path records bounded-chunk calibration provenance and
+  verifies source, draft, and staged output before no-clobber publication.
+  The Russian guide [`docs/MTP_COMPACTION.ru.md`](docs/MTP_COMPACTION.ru.md)
+  documents the short and audit-oriented forms, JSONL input, limits, and
+  Metal/Vulkan validation procedure.
+
+### Fixed
+- Prompt-calibrated compaction now rejects a non-`.cmf` output or sidecar used
+  as `MODEL` before it can start self-teacher data generation; the short form
+  also rejects a sidecar output before spending rented-GPU time.
+- Restored the declared Rust 1.88 build contract on Apple Silicon by avoiding
+  an unstable NEON half-conversion intrinsic in the Metal upload helper.
+- Restored the legacy external-MiMo `mtp-compact --output candidate.mtp.cmf`
+  sidecar-only form. It intentionally publishes only the compact draft and
+  plan; the preferred main-CMF output continues to publish a runnable paired
+  candidate without changing the source model.
+- WGPU MTP shortlist padding now marks unevaluated vocabulary rows as
+  negative infinity rather than allowing them to win a draft shortlist.
+  Fresh requests also reset draft-head escalation state.
+- Speculation exits its timing trial after two consecutive rounds without an
+  accepted draft, avoiding repeated losing MTP work while preserving the
+  verifier-authoritative emitted token contract.
+
+### Limits
+- This release compacts only an existing supported dense MTP draft FFN. It
+  does not fine-tune the trunk, MoE, or DSpark, and it makes no universal
+  speed claim; validate exact token IDs and acceptance/throughput on the
+  target Metal or Vulkan backend before deployment.
+
 ## [0.8.37] — 2026-10-26
 
 ### Added
