@@ -29,6 +29,43 @@ use cortiq_core::types::NormStyle;
 pub static GLOBAL_USE_GPU: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+// MTP compaction statistics must describe the dense draft that will be
+// serialized, not an ambient serving experiment such as gate/oracle top-k.
+// A thread-local nesting counter keeps the guard local to calibration and
+// avoids mutating process-global environment variables mid-command.
+thread_local! {
+    static EXACT_MTP_CALIBRATION: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+struct ExactMtpCalibrationGuard;
+
+impl ExactMtpCalibrationGuard {
+    fn enter() -> Self {
+        EXACT_MTP_CALIBRATION.with(|depth| depth.set(depth.get().saturating_add(1)));
+        Self
+    }
+}
+
+impl Drop for ExactMtpCalibrationGuard {
+    fn drop(&mut self) {
+        EXACT_MTP_CALIBRATION.with(|depth| {
+            debug_assert!(depth.get() > 0, "unbalanced MTP calibration guard");
+            depth.set(depth.get().saturating_sub(1));
+        });
+    }
+}
+
+fn exact_mtp_calibration_active() -> bool {
+    EXACT_MTP_CALIBRATION.with(|depth| depth.get() != 0)
+}
+
+/// Extend an MTP draft-head shortlist to the model vocabulary.  Rows outside
+/// the shortlist were deliberately not evaluated, so they must be impossible
+/// draft candidates rather than neutral zero logits.
+fn pad_mtp_draft_logits(logits: &mut Vec<f32>, vocab_size: usize) {
+    logits.resize(vocab_size, f32::NEG_INFINITY);
+}
+
 /// Reusable per-pipeline forward scratch: the four norm outputs the
 /// decode paths recompute every layer (single: n1/p1; pair: all four).
 /// Plain buffers, resized once — steady-state decode reuses them.
@@ -1045,9 +1082,11 @@ enum MetalBatchNllOutcome {
     Completed(f64, usize),
 }
 
-/// The speculation trial's phases (see the decode loop): four timed
-/// speculative rounds, eight timed plain tokens, then the faster arm
-/// until a re-check.
+/// The speculation trial's phases (see the decode loop): up to five timed
+/// speculative rounds, eight timed plain tokens, then the faster arm until a
+/// re-check. Two consecutive rounds with no accepted draft skip directly to
+/// the plain measurement: another speculative round cannot pay when it emits
+/// exactly the one token the plain loop would have produced.
 #[derive(Clone, Copy)]
 enum SpecTrial {
     Spec {
@@ -1074,6 +1113,34 @@ pub(crate) fn spec_time_level() -> u8 {
         Ok(v) => v.trim().parse::<u8>().map(|n| n.max(1)).unwrap_or(1),
         Err(_) => 0,
     })
+}
+
+/// Decide whether the batched speculative verifier is admitted by the
+/// user/backend policy, before capability checks.  Native Metal's row-batch
+/// verifier is deliberately fail-closed by default: it has produced a
+/// different *emitted* greedy token than the serial path on a real model.
+/// It remains available only through the documented explicit experiment
+/// spelling, `CMF_GRAPH_SPEC=1`; other backends retain their historical
+/// nonzero override behaviour.
+fn graph_spec_wanted_by_policy(
+    spec_env: Option<&str>,
+    spec_default_ok: bool,
+    penalized: bool,
+    metal_wgpu: bool,
+    native_metal: bool,
+) -> bool {
+    match spec_env {
+        Some("0") => false,
+        // Keep the native path genuinely explicit.  In particular, a
+        // typo/nonzero value must not silently re-enable an unqualified
+        // verifier just because historical non-Metal parsing treated it as
+        // force-on.
+        Some("1") => true,
+        Some(_) => !native_metal,
+        // The discrete/wgpu default stays as it was; only native Metal has
+        // a quality gate here.
+        None => spec_default_ok && !penalized && !metal_wgpu && !native_metal,
+    }
 }
 
 /// The round's host stamps: `spec_stamp(name)` records the time since
@@ -1175,6 +1242,11 @@ struct SpecMon {
     plain_ms: f64,
     n: u32,
     fails: u32,
+    /// Consecutive rounds that produced only their verifier-tip token (zero
+    /// accepted MTP drafts). This is deliberately counted before the warm-up
+    /// round is excluded from timing: two real zero-acceptance rounds are
+    /// enough to stop charging an obviously losing speculative arm.
+    zero_accept_rounds: u8,
     metal: bool,
 }
 
@@ -1187,6 +1259,11 @@ const SPEC_PLAIN_MIN_MS: f64 = 200.0;
 
 impl SpecMon {
     fn round(&mut self, dt_ms: f64, produced: usize) {
+        if produced <= 1 {
+            self.zero_accept_rounds = self.zero_accept_rounds.saturating_add(1);
+        } else {
+            self.zero_accept_rounds = 0;
+        }
         self.n += 1;
         if self.n == 1 {
             return; // round 1 pays the batch scratch and the draft mirror
@@ -1201,6 +1278,9 @@ impl SpecMon {
         } else {
             self.metal && self.tokens >= SPEC_PROXY_TOKENS
         }
+    }
+    fn repeated_zero_acceptance(&self) -> bool {
+        self.zero_accept_rounds >= 2
     }
     /// Has the plain phase timed enough tokens to decide?
     fn plain_done(&self, t0: std::time::Instant, gen0: usize, generated: usize) -> bool {
@@ -1650,6 +1730,12 @@ pub(crate) fn kv_reuse_plan(reuse_from: usize, layers: &[ReuseLayer]) -> ReusePl
 }
 
 impl Pipeline {
+    /// Reset state whose meaning is local to a single MTP draft sequence.
+    /// Unlike ordinary KV reuse, MTP is always rebuilt from the prompt.
+    fn reset_fresh_mtp_draft_state(&mut self) {
+        self.draft_full_streak = 0;
+    }
+
     /// Clear all per-sequence state, including backend device mirrors.
     ///
     /// The host KV/history buffers are only half of the request lifecycle on
@@ -4534,6 +4620,10 @@ impl Pipeline {
         let bounded_native = self.bounded_native();
         if reuse_from == 0 {
             // Fresh sequence — the cache holds absolute positions.
+            // MTP never participates in cross-turn KV reuse, so a
+            // high-vocabulary token from the previous request must not keep
+            // this request on its expensive full draft head.
+            self.reset_fresh_mtp_draft_state();
             self.clear_sequence_state();
         } else if std::env::var("CMF_PREFILL_PROF").is_ok() {
             eprintln!(
@@ -4590,26 +4680,34 @@ impl Pipeline {
         // distributions a round plus a lower acceptance than greedy's,
         // against a verify that costs 2.7 single tokens. The greedy arms
         // pay +10%; the sampling arm needs a cheaper verify first.
-        // Native Metal HAS that verify: its eight-row tile is flat in b,
-        // so a round costs ~1.9 plain tokens and the sampling arm pays at
-        // 2.3 accepted per round — measured on Qwen3.8-27B q4tp / M4 at
-        // the CLI defaults (0.7 / rep 1.1 / top-k 40, seed 42), a code
-        // prompt: 9.0 tok/s against a plain 5.4 in the same window, and
-        // the per-round watchdog turns it off where prose loses. So on
-        // Metal the sampling arm is ON (`CMF_GRAPH_SPEC_SAMPLE=0` opts out)
-        // — but only for a config the SPARSE chain serves (a top-k within
-        // `sparse_ok`): without it a round builds nine 248k-float
-        // distributions on the host, which is the 5090's measured loss and
-        // not a cost the round-token proxy below can see. A top-k-less
-        // sampling config keeps the plain path unless asked for by name.
+        // Native Metal has a fast row-batch verify, but it is NOT admitted
+        // by default: a real-model exactness check found an emitted greedy
+        // divergence from the serial path.  Every native-Metal speculative
+        // arm therefore requires the explicit `CMF_GRAPH_SPEC=1` experiment
+        // gate until the batch kernels are numerically qualified.  If it is
+        // explicitly enabled, its sampling arm is useful only for a config
+        // the SPARSE chain serves (a top-k within `sparse_ok`): without it a
+        // round builds nine 248k-float distributions on the host, which is
+        // the 5090's measured loss and not a cost the round-token proxy
+        // below can see. A top-k-less sampling config keeps the plain path
+        // unless asked for by name.
         #[cfg(target_os = "macos")]
         let metal_graph = crate::gpu::q1_force()
             && crate::gpu::enabled_here()
             && std::env::var("CMF_GPU_BLOCK")
                 .map(|v| v != "0")
                 .unwrap_or(true);
+        // `CMF_GPU_BLOCK=0` declines the ordinary native block route but
+        // does not change the backend identity: a separately requested wgpu
+        // graph can still reach `graph_spec_step`, whose native branch uses
+        // VerifyGraph. Keep the quality policy tied to that identity, not to
+        // the particular block-route admission above.
+        #[cfg(target_os = "macos")]
+        let native_metal_backend = crate::gpu::q1_force();
         #[cfg(not(target_os = "macos"))]
         let metal_graph = false;
+        #[cfg(not(target_os = "macos"))]
+        let native_metal_backend = false;
         let spec_sample_env = std::env::var("CMF_GRAPH_SPEC_SAMPLE").ok();
         // A round whose cost is the MEASURED one: greedy (argmax rows), or
         // sampling through the sparse chain. Anything else pays the dense
@@ -4627,7 +4725,7 @@ impl Pipeline {
         // against a plain 48.1 on Qwen3.8-27B q4tp / RTX 5090 (k=4) and
         // 51.1 against 49.4 on Qwen3.6-27B, and a round that stops
         // paying turns itself off below (acceptance watchdog).
-        // `CMF_GRAPH_SPEC=0` disables; `=1` was the old opt-in spelling.
+        // `CMF_GRAPH_SPEC=0` disables; `=1` is the explicit opt-in spelling.
         // …but only where the batched verify has its register-blocked
         // kernel: q4tp dense FFNs (graph kind 6). q4t and q8_2f verify
         // through tile GEMMs today and measured a LOSS (q8_2f 22 against
@@ -4674,19 +4772,19 @@ impl Pipeline {
         #[cfg(not(feature = "gpu"))]
         let metal_wgpu = false;
         let spec_env = std::env::var("CMF_GRAPH_SPEC").ok();
-        let spec_wanted = match spec_env.as_deref() {
-            Some("0") => false,
-            Some(_) => {
-                if metal_wgpu {
-                    tracing::warn!(
-                        "CMF_GRAPH_SPEC forced on wgpu/Metal: the batched verify graph is not \
-                         verified on this backend (garbage measured on Qwen3.5-0.8B)"
-                    );
-                }
-                true
-            }
-            None => spec_default_ok && !penalized && !metal_wgpu,
-        };
+        let spec_wanted = graph_spec_wanted_by_policy(
+            spec_env.as_deref(),
+            spec_default_ok,
+            penalized,
+            metal_wgpu,
+            native_metal_backend,
+        );
+        if spec_wanted && metal_wgpu {
+            tracing::warn!(
+                "CMF_GRAPH_SPEC forced on wgpu/Metal: the batched verify graph is not \
+                 verified on this backend (garbage measured on Qwen3.5-0.8B)"
+            );
+        }
         // Native Metal: the b-row verify graph (`try_batch_graph_metal`)
         // stands where the wgpu batch graph stands on discrete cards
         // (`metal_graph`, above).
@@ -4697,9 +4795,24 @@ impl Pipeline {
             && !self.o1_active()
             && spec_sampling_ok
             && spec_wanted;
-        // Native Metal: say the route ONCE (RUST_LOG=info), so a user can
-        // confirm the fast path without setting a single flag — every
-        // knob below defaults to the measured-best value on the M4.
+        // The host fused pair is an optimization, not a verifier. On real
+        // q4tp Qwen3.5 a near-tied row produced a different greedy argmax
+        // from two serial target forwards. That makes a seemingly accepted
+        // draft change text, which is worse than losing speculative speed.
+        // Keep it explicitly experimental until a model/backend has passed
+        // a long exact-ID gate; the native Metal batch verifier has its own
+        // separate graph admission and is not controlled by this switch.
+        //
+        // GDN hybrids are also excluded by default: their recurrence is
+        // sequential, so the pair lane cannot parallelize and measured 2x
+        // slower on the 35B. `CMF_MTP_PAIR=1` is deliberately the only
+        // opt-in for the host fused-pair experiment (not `CMF_MTP=1`).
+        let host_pair_opt_in = std::env::var("CMF_MTP_PAIR").as_deref() == Ok("1");
+        let pair_pays = host_pair_opt_in
+            && (self.gdn_cfg.is_none() || std::env::var("CMF_MTP").as_deref() == Ok("1"));
+        // Native Metal: say the route ONCE (RUST_LOG=info), including the
+        // deliberate quality gate that keeps the unqualified batch verifier
+        // off unless the user explicitly requested the experiment.
         #[cfg(target_os = "macos")]
         if metal_graph {
             static SAID: std::sync::Once = std::sync::Once::new();
@@ -4732,9 +4845,16 @@ impl Pipeline {
                             .to_string()
                     }
                 } else if !spec_wanted {
-                    "spec off (CMF_GRAPH_SPEC=0 or non-q4tp FFNs)".to_string()
+                    if spec_env.is_none() {
+                        "spec off (native Metal batch verifier requires CMF_GRAPH_SPEC=1 after exact-ID validation)".to_string()
+                    } else {
+                        "spec off (native Metal accepts only exact CMF_GRAPH_SPEC=1)".to_string()
+                    }
                 } else if task_mask.is_some() {
                     "spec off (task mask)".to_string()
+                } else if !graph_spec && !pair_pays {
+                    "spec off (host fused pair requires CMF_MTP_PAIR=1 after exact-ID validation)"
+                        .to_string()
                 } else {
                     "spec off (O(1) attention)".to_string()
                 };
@@ -4769,13 +4889,6 @@ impl Pipeline {
                 );
             });
         }
-        // GDN hybrids sit the fused-pair speculation out by default: the
-        // recurrence is sequential, so the pair lane cannot parallelize
-        // (the bench's own Pair line reads fused 1.28x TWO singles on the
-        // 35B) and the draft's full-vocab head rides on top — measured 2x
-        // SLOWER end to end (16.1 vs 32.4 tok/s on the 48-core stand).
-        // CMF_MTP=1 forces it back for study.
-        let pair_pays = self.gdn_cfg.is_none() || std::env::var("CMF_MTP").as_deref() == Ok("1");
         let spec_active = self.speculative
             && self.mtp.is_some()
             && task_mask.is_none()
@@ -5890,6 +6003,7 @@ impl Pipeline {
                     }
                     SpecTrial::Decided { recheck_at, .. } if generated >= recheck_at => {
                         spec_mon.n = 0;
+                        spec_mon.zero_accept_rounds = 0;
                         spec_trial = SpecTrial::Spec {
                             t0: std::time::Instant::now(),
                             gen0: generated,
@@ -6704,6 +6818,22 @@ impl Pipeline {
         match trial {
             SpecTrial::Spec { t0, gen0, rounds } => {
                 let rounds = rounds + 1;
+                // A round that accepts no draft still has to run the MTP
+                // chain and a K+1 verifier, but emits only its verifier tip.
+                // After two such real rounds the speculative arm cannot win
+                // on any backend; time plain immediately rather than spend
+                // the remaining exploratory rounds on the same one-token
+                // result. A later 128-token re-check still gives changing
+                // context a chance to re-admit it.
+                if mon.repeated_zero_acceptance() {
+                    tracing::info!(
+                        "speculation trial: no accepted drafts in two rounds — timing plain"
+                    );
+                    return SpecTrial::Plain {
+                        t0: std::time::Instant::now(),
+                        gen0: generated,
+                    };
+                }
                 if rounds >= 5 {
                     if mon.plain_ms > 0.0 {
                         let keep = mon.pays();
@@ -7068,7 +7198,10 @@ impl Pipeline {
                 return None;
             }
         }
-        logits.resize(self.vocab_size, 0.0);
+        // The graph may deliberately evaluate only a prefix of the draft
+        // head.  Do not turn every omitted token into a zero-logit candidate:
+        // that can win an all-negative shortlist and collapses acceptance.
+        pad_mtp_draft_logits(&mut logits, self.vocab_size);
         Some((logits, x))
     }
 
@@ -9090,6 +9223,10 @@ impl Pipeline {
     /// cache must be retained.
     pub fn probe_mtp_ffn(&mut self, ids: &[u32]) -> Result<Vec<MtpFfnProbe>, String> {
         self.reset_mtp_probe_state();
+        // CPU scope avoids backend-dependent device math; this guard also
+        // suppresses gate/oracle sparsity experiments for the duration so the
+        // statistics and admission replay always execute the full dense FFN.
+        let _exact_calibration = ExactMtpCalibrationGuard::enter();
         let result = if ids.len() < 2 {
             Err("MTP FFN probe needs at least two token ids".into())
         } else if ids
@@ -9107,8 +9244,7 @@ impl Pipeline {
                 .take()
                 .expect("checked MiMo MTP before detaching it");
             let result = crate::gpu::cpu_scope(|| {
-                let hiddens = self.mtp_probe_trunk_hiddens(ids)?;
-                self.mimo_mtp_ffn_probe_teacher_forced(&mut st, ids, &hiddens)
+                self.mimo_mtp_ffn_probe_teacher_forced(&mut st, ids)
             });
             // The owner is detached during the replay, so the common trunk
             // reset cannot clear its KVs. Restore it even on an error.
@@ -9120,10 +9256,7 @@ impl Pipeline {
                 .mtp
                 .take()
                 .expect("checked canonical MTP before detaching it");
-            let result = crate::gpu::cpu_scope(|| {
-                let hiddens = self.mtp_probe_trunk_hiddens(ids)?;
-                self.mtp_ffn_probe_teacher_forced(&mut mtp, ids, &hiddens)
-            });
+            let result = crate::gpu::cpu_scope(|| self.mtp_ffn_probe_teacher_forced(&mut mtp, ids));
             mtp.kv.clear();
             self.mtp = Some(mtp);
             result
@@ -9148,13 +9281,23 @@ impl Pipeline {
         self.mtp_graph_mode = None;
     }
 
-    /// Sequential CPU-only trunk replay for MTP calibration. Unlike the
-    /// trunk mass probe this returns the exact boundary hiddens consumed by
-    /// the draft stack; it never records into the trunk's TLS accumulator.
-    fn mtp_probe_trunk_hiddens(&mut self, ids: &[u32]) -> Result<Vec<f32>, String> {
-        let mut hiddens = Vec::with_capacity(ids.len() * self.hidden_size);
-        for (position, &id) in ids.iter().enumerate() {
-            let hidden = self.forward_layers(&self.embed_single(id), position, None);
+    /// Canonical one-layer MTP teacher-forced replay. Its cache advances for
+    /// every row so later attention inputs match a real draft warm-up rather
+    /// than a collection of independent one-token measurements. The trunk is
+    /// advanced row-by-row here instead of first materializing every hidden
+    /// state, so canonical calibration remains O(hidden) transient RAM.
+    fn mtp_ffn_probe_teacher_forced(
+        &mut self,
+        mtp: &mut MtpModule,
+        ids: &[u32],
+    ) -> Result<Vec<MtpFfnProbe>, String> {
+        let FfnKind::Dense(dense) = &mtp.layer.ffn else {
+            return Err("MTP FFN probe: canonical draft FFN is not dense".into());
+        };
+        let mut mass = vec![0.0f64; dense.gate_proj.rows()];
+        let mut squared_mass = vec![0.0f64; dense.gate_proj.rows()];
+        for position in 0..ids.len() - 1 {
+            let hidden = self.forward_layers(&self.embed_single(ids[position]), position, None);
             if hidden.len() != self.hidden_size {
                 return Err(format!(
                     "MTP FFN probe: trunk hidden width {} != {}",
@@ -9162,32 +9305,9 @@ impl Pipeline {
                     self.hidden_size
                 ));
             }
-            hiddens.extend_from_slice(&hidden);
-        }
-        Ok(hiddens)
-    }
-
-    /// Canonical one-layer MTP teacher-forced replay. Its cache advances for
-    /// every row so later attention inputs match a real draft warm-up rather
-    /// than a collection of independent one-token measurements.
-    fn mtp_ffn_probe_teacher_forced(
-        &mut self,
-        mtp: &mut MtpModule,
-        ids: &[u32],
-        hiddens: &[f32],
-    ) -> Result<Vec<MtpFfnProbe>, String> {
-        if hiddens.len() != ids.len() * self.hidden_size {
-            return Err("MTP FFN probe: malformed trunk hidden replay".into());
-        }
-        let FfnKind::Dense(dense) = &mtp.layer.ffn else {
-            return Err("MTP FFN probe: canonical draft FFN is not dense".into());
-        };
-        let mut mass = vec![0.0f64; dense.gate_proj.rows()];
-        let mut squared_mass = vec![0.0f64; dense.gate_proj.rows()];
-        for position in 0..ids.len() - 1 {
             self.mtp_probe_step_ffn(
                 mtp,
-                &hiddens[position * self.hidden_size..(position + 1) * self.hidden_size],
+                &hidden,
                 ids[position + 1],
                 position,
                 &mut mass,
@@ -14495,7 +14615,7 @@ impl Pipeline {
             logits = attention::take_buf(n_read);
             graph.read_logits(&mut logits);
             // ids past the shortlist: never drafted (−∞ in every chain)
-            logits.resize(self.vocab_size, f32::NEG_INFINITY);
+            pad_mtp_draft_logits(&mut logits, self.vocab_size);
         }
         graph.finish(&mut x);
         let mut krow = attention::take_buf(nkv * hd);
@@ -19320,6 +19440,9 @@ fn adump_row(li: usize, g: &[f32]) {
 /// measured by cheating, since the selection reads the very activations
 /// it would have to predict.
 fn oracle_topk() -> usize {
+    if exact_mtp_calibration_active() {
+        return 0;
+    }
     static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *K.get_or_init(|| {
         std::env::var("CMF_FFN_ORACLE_TOPK")
@@ -19335,6 +19458,9 @@ fn oracle_topk() -> usize {
 /// dropped neuron's `up` row and `down` column stay unread, so this is
 /// the sparsity a serving path can actually take without a router.
 fn gate_topk() -> usize {
+    if exact_mtp_calibration_active() {
+        return 0;
+    }
     static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *K.get_or_init(|| {
         std::env::var("CMF_FFN_GATE_TOPK")
@@ -21249,6 +21375,170 @@ fn ffn_forward_pair(
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    // Environment switches are process-global. Keep the speculative-path
+    // tests serialized and restore every prior value even during unwinding.
+    static MTP_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct ScopedTestEnv {
+        previous: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl ScopedTestEnv {
+        fn set(vars: &[(&'static str, Option<&'static str>)]) -> Self {
+            let previous = vars
+                .iter()
+                .map(|(name, _)| (*name, std::env::var_os(name)))
+                .collect();
+            for &(name, value) in vars {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for ScopedTestEnv {
+        fn drop(&mut self) {
+            for (name, value) in self.previous.drain(..).rev() {
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mtp_draft_shortlist_masks_unevaluated_vocab_rows() {
+        use super::pad_mtp_draft_logits;
+
+        let mut logits = vec![-3.0, -1.0, -2.0];
+        pad_mtp_draft_logits(&mut logits, 6);
+        assert_eq!(&logits[..3], &[-3.0, -1.0, -2.0]);
+        assert!(logits[3..].iter().all(|&x| x == f32::NEG_INFINITY));
+        assert_eq!(
+            logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                .map(|(i, _)| i),
+            Some(1),
+            "an unevaluated row cannot win an all-negative shortlist"
+        );
+    }
+
+    #[test]
+    fn speculative_trial_fast_exits_after_two_zero_acceptance_rounds() {
+        use super::{Pipeline, SpecMon, SpecTrial};
+
+        let mut mon = SpecMon::default();
+        let start = std::time::Instant::now();
+        mon.round(1.0, 1);
+        let first = Pipeline::spec_trial_round(
+            SpecTrial::Spec {
+                t0: start,
+                gen0: 0,
+                rounds: 0,
+            },
+            &mut mon,
+            1,
+        );
+        assert!(matches!(first, SpecTrial::Spec { rounds: 1, .. }));
+
+        mon.round(1.0, 1);
+        let second = Pipeline::spec_trial_round(first, &mut mon, 2);
+        assert!(
+            matches!(second, SpecTrial::Plain { gen0: 2, .. }),
+            "two verifier-tip-only rounds must stop the losing MTP trial"
+        );
+
+        // One successful draft resets the streak, so a viable head retains
+        // the normal five-round measurement budget.
+        let mut viable = SpecMon::default();
+        viable.round(1.0, 1);
+        viable.round(1.0, 2);
+        let continued = Pipeline::spec_trial_round(
+            SpecTrial::Spec {
+                t0: start,
+                gen0: 0,
+                rounds: 1,
+            },
+            &mut viable,
+            3,
+        );
+        assert!(matches!(continued, SpecTrial::Spec { rounds: 2, .. }));
+    }
+
+    #[test]
+    fn fresh_mtp_request_does_not_inherit_full_head_streak() {
+        let mut p = spark_test_pipeline(None);
+        let head_rows = 248_070;
+        p.draft_full_streak = 7;
+        assert_eq!(p.draft_head_rows(head_rows), head_rows);
+
+        p.reset_fresh_mtp_draft_state();
+        assert_eq!(
+            p.draft_head_rows(head_rows),
+            super::Pipeline::draft_vocab_rows(head_rows),
+            "a fresh request returns to its configured shortlist"
+        );
+
+        // A high-id first token of the NEW request still restores the
+        // full-head protection immediately.
+        p.note_draft_id(u32::MAX);
+        assert_eq!(p.draft_head_rows(head_rows), head_rows);
+    }
+
+    #[test]
+    fn native_metal_batch_spec_requires_exact_explicit_opt_in() {
+        use super::graph_spec_wanted_by_policy;
+
+        // A capable, otherwise-default-eligible native Metal model stays on
+        // the serial path until the user deliberately asks for the
+        // experimental verifier.
+        assert!(!graph_spec_wanted_by_policy(None, true, false, false, true));
+        assert!(!graph_spec_wanted_by_policy(
+            Some("anything-but-1"),
+            true,
+            false,
+            false,
+            true,
+        ));
+        assert!(graph_spec_wanted_by_policy(
+            Some("1"),
+            false,
+            true,
+            false,
+            true,
+        ));
+        assert!(!graph_spec_wanted_by_policy(
+            Some("0"),
+            true,
+            false,
+            false,
+            true,
+        ));
+
+        // Do not regress the established discrete/wgpu policy while closing
+        // the native-Metal quality gate.
+        assert!(graph_spec_wanted_by_policy(None, true, false, false, false));
+        assert!(graph_spec_wanted_by_policy(
+            Some("legacy-force"),
+            false,
+            true,
+            true,
+            false,
+        ));
+    }
 
     #[test]
     fn encoder_hidden_states_are_normalized_and_reusable() {
@@ -21837,10 +22127,14 @@ mod tests {
 
     #[test]
     fn speculative_equals_vanilla_greedy() {
-        // Speculative decode and the wgpu token graph are mutually
-        // exclusive; a leaked CMF_GPU=wgpu from a parallel gpu test
-        // would silently disable drafting. Pin the graph off.
-        unsafe { std::env::set_var("CMF_GPU_WGPU_GRAPH", "0") };
+        let _env_lock = MTP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Exercise the experimental host pair deterministically; the native
+        // and wgpu batch graphs have independent coverage.
+        let _env = ScopedTestEnv::set(&[
+            ("CMF_GPU", Some("0")),
+            ("CMF_GPU_WGPU_GRAPH", Some("0")),
+            ("CMF_MTP_PAIR", Some("1")),
+        ]);
         let run = |spec: bool| {
             let mut p = create_test_pipeline(8, 16, 2, 1, 4, 2, 260);
             p.sampler_config.temperature = 0.0;
@@ -21862,8 +22156,12 @@ mod tests {
 
     #[test]
     fn speculative_accepts_constant_oracle() {
-        // See speculative_equals_vanilla_greedy: pin the wgpu graph off.
-        unsafe { std::env::set_var("CMF_GPU_WGPU_GRAPH", "0") };
+        let _env_lock = MTP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = ScopedTestEnv::set(&[
+            ("CMF_GPU", Some("0")),
+            ("CMF_GPU_WGPU_GRAPH", Some("0")),
+            ("CMF_MTP_PAIR", Some("1")),
+        ]);
         let mut p = create_test_pipeline(8, 16, 2, 1, 4, 1, 64);
         p.sampler_config.temperature = 0.0;
         p.sampler_config.repetition_penalty = 1.0;
@@ -21881,6 +22179,30 @@ mod tests {
         // Ties resolve to the same token in both the main and draft
         // heads — the sequence is one repeated token.
         assert!(r.token_ids.windows(2).all(|w| w[0] == w[1]));
+    }
+
+    #[test]
+    fn host_fused_mtp_pair_is_opt_in() {
+        let _env_lock = MTP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = ScopedTestEnv::set(&[
+            ("CMF_GPU", Some("0")),
+            ("CMF_GPU_WGPU_GRAPH", Some("0")),
+            ("CMF_MTP_PAIR", None),
+        ]);
+        let run = |spec: bool| {
+            let mut p = create_test_pipeline(8, 16, 2, 1, 4, 2, 260);
+            p.sampler_config.temperature = 0.0;
+            attach_test_mtp(&mut p);
+            p.speculative = spec;
+            let r = p.generate("abcdef", 12, None, None).unwrap();
+            (r.token_ids, r.mtp_drafted, r.mtp_accepted)
+        };
+        let (plain, d0, _) = run(false);
+        let (guarded, d1, a1) = run(true);
+        assert_eq!(d0, 0);
+        assert_eq!(d1, 0, "host MTP pair must remain opt-in");
+        assert_eq!(a1, 0);
+        assert_eq!(guarded, plain, "the safe default is ordinary greedy decode");
     }
 
     #[test]
@@ -22602,6 +22924,64 @@ mod tests {
             .all(|m| m.kv.seq_len == 0));
     }
 
+    #[test]
+    fn mimo_mtp_ffn_probe_chunking_preserves_teacher_forced_statistics() {
+        fn collect(p: &mut Pipeline, ids: &[u32], rows: usize) -> Vec<MtpFfnProbe> {
+            p.clear_sequence_state();
+            let mut st = p.mimo_mtp.take().expect("synthetic MiMo draft");
+            let _exact = ExactMtpCalibrationGuard::enter();
+            let got = crate::gpu::cpu_scope(|| {
+                p.mimo_mtp_ffn_probe_teacher_forced_with_chunk_rows(&mut st, ids, rows)
+            })
+            .expect("teacher-forced MiMo probe");
+            st.reset();
+            p.mimo_mtp = Some(st);
+            p.reset_mtp_probe_state();
+            got
+        }
+
+        for post_norm_hidden in [false, true] {
+            let ids: Vec<u32> = (0..263u32).map(|i| (i * 17 + 5) % 64).collect();
+            let make = || {
+                let mut p = mimo_test_pipeline();
+                let mut st = mimo_test_mtp_widths(&[7, 13, 29], 1.0);
+                st.post_norm_hidden = post_norm_hidden;
+                p.mimo_mtp = Some(st);
+                p
+            };
+            let mut full = make();
+            let expected = collect(&mut full, &ids, usize::MAX);
+            for rows in [1usize, 7, 128] {
+                let mut chunked = make();
+                let got = collect(&mut chunked, &ids, rows);
+                assert_eq!(got.len(), expected.len(), "post={post_norm_hidden}, rows={rows}");
+                for (layer, (got, expected)) in got.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        got.observed_positions, expected.observed_positions,
+                        "post={post_norm_hidden}, rows={rows}, layer={layer}"
+                    );
+                    assert_eq!(
+                        got.mass.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        expected.mass.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "post={post_norm_hidden}, rows={rows}, layer={layer} mass"
+                    );
+                    assert_eq!(
+                        got.squared_mass
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .collect::<Vec<_>>(),
+                        expected
+                            .squared_mass
+                            .iter()
+                            .map(|v| v.to_bits())
+                            .collect::<Vec<_>>(),
+                        "post={post_norm_hidden}, rows={rows}, layer={layer} squared mass"
+                    );
+                }
+            }
+        }
+    }
+
     /// The draft stack's incremental rounds (a few rows per layer, last
     /// round's provisional rows dropped) give exactly the teacher-forced
     /// table of one causal pass per layer over the whole sequence — the
@@ -22683,7 +23063,11 @@ mod tests {
     /// penalty.
     #[test]
     fn mimo_speculative_greedy_equals_plain_greedy() {
-        unsafe { std::env::set_var("CMF_GPU_WGPU_GRAPH", "0") };
+        let _env_lock = MTP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = ScopedTestEnv::set(&[
+            ("CMF_GPU", Some("0")),
+            ("CMF_GPU_WGPU_GRAPH", Some("0")),
+        ]);
         let ids: Vec<u32> = (0..9u32).map(|i| (i * 7 + 3) % 64).collect();
         let n = 24;
         let mut p = mimo_test_pipeline();

@@ -952,6 +952,57 @@ fn tempdir() -> std::path::PathBuf {
     dir
 }
 
+#[test]
+fn stream_writer_no_clobber_preserves_existing_file() {
+    let dir = tempdir();
+    let path = dir.join("already-there.cmf");
+    std::fs::write(&path, b"do not truncate").unwrap();
+    assert!(CmfStreamWriter::new_no_clobber(&path, 4096).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"do not truncate");
+}
+
+#[test]
+fn stream_writer_prehashed_copy_requires_final_verification() {
+    let dir = tempdir();
+    let good = dir.join("prehashed-good.cmf");
+    let bad = dir.join("prehashed-bad.cmf");
+    let data = vec![0x5au8; 64];
+
+    let mut writer = CmfStreamWriter::new(&good, CmfStreamWriter::head_reserve_for(1, 24)).unwrap();
+    writer
+        .push_bounded_prehashed(
+            "copied.weight",
+            TensorDtype::F32,
+            &[16],
+            &data,
+            hash64(&data),
+            7,
+        )
+        .unwrap();
+    writer.finish(&tiny_header(), None, None).unwrap();
+    assert!(CmfModel::open(&good).unwrap().verify().is_empty());
+
+    // A prehashed streaming copy intentionally skips a second source scan;
+    // this locks in the contract that final output verification is what
+    // rejects a source modified during the write.
+    let mut writer = CmfStreamWriter::new(&bad, CmfStreamWriter::head_reserve_for(1, 24)).unwrap();
+    writer
+        .push_bounded_prehashed(
+            "copied.weight",
+            TensorDtype::F32,
+            &[16],
+            &data,
+            hash64(b"a different immutable source"),
+            7,
+        )
+        .unwrap();
+    writer.finish(&tiny_header(), None, None).unwrap();
+    assert!(
+        !CmfModel::open(&bad).unwrap().verify().is_empty(),
+        "a stale copied hash must be rejected by the final integrity scan"
+    );
+}
+
 // ─────────────── one-pass streaming writer ───────────────
 
 /// The streaming writer exists so a 300B-class conversion never holds its
