@@ -111,6 +111,13 @@ projection/norm по неверной оси.
 `--trace-json` пишет JSONL в stderr; сравнивать следует **token id**, а не
 отрендеренный текст.
 
+Trace — также часть контракта проверки: в нём должна быть ровно одна JSON-строка
+на каждый выданный token, в том числе на дополнительные draft-token'ы, принятые
+одним batched graph-speculative round. Для таких принятых строк runtime не
+делает отдельный полный softmax только ради telemetry, поэтому `confidence`
+честно равен `0.0`; это не означает нулевую вероятность и не должно
+использоваться как quality-метрика.
+
 ```sh
 BIN=target/release/cortiq
 PROMPT='Explain in one paragraph why deterministic decoding is useful.'
@@ -191,13 +198,21 @@ CMF_GPU=1 CMF_MTP=1 CMF_MIMO_MTP=1 \
 измеряемый результат, а не повод скрывать счётчики.
 
 Для компактного MTP с `q4tp` fast-path Metal/WGPU использует локальную ширину
-`gate_proj`, а не `intermediate_size` backbone; поэтому 32-кратно сжатый draft
-не получает устаревшую geometry trunk. У `q2tp`/Prism MTP native-Metal graph
+`gate_proj`, а не `intermediate_size` backbone; поэтому draft, сжатый по
+32-канальным группам, не получает устаревшую geometry trunk. У `q2tp`/Prism
+MTP native-Metal graph
 сейчас безопасно отклоняется до выполнения и идёт через обычный fallback; у
 `q8_2f` одношаговый путь корректен, но batched warm-up также может перейти в
 fallback. Это не ошибка точности, но не основание обещать скорость для этих
 codec без отдельного замера. Для выпуска с целью Metal-speed выбирайте `q4tp`
 и всё равно подтверждайте его приведённым benchmark.
+
+Для eligible `q4tp` MTP draft native Metal включает только masked-nibble
+matvec fast-path; fusion residual-epilogue намеренно не включается без
+отдельной доказанной пользы. Для сравнительного rollback есть
+`CMF_METAL_MVFAST=0`. Сравнивайте этот переключатель только чередующимися
+прогонами: на коротких MTP-бенчмарках тепловой и планировочный разброс может
+быть больше эффекта одной draft-операции.
 
 ## Границы и отказы
 

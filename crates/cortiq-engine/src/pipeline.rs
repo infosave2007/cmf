@@ -6089,6 +6089,28 @@ impl Pipeline {
                             if self.confidence_on {
                                 confidence.push(0.0);
                             }
+                            // `graph_spec_step` commits the accepted MTP
+                            // drafts as a batch.  They do not pass through
+                            // the ordinary loop-top sampling block below,
+                            // which is normally where the telemetry row is
+                            // created.  Keep the public trace contract
+                            // (one row per emitted token) here as well.
+                            //
+                            // The graph-spec path does not surface a
+                            // per-row probability for accepted extras.  It
+                            // deliberately matches the zero placed in the
+                            // confidence channel above instead of inventing
+                            // one or adding a separate probability pass.
+                            if trace_on {
+                                traces.push(TokenTrace {
+                                    t: generated,
+                                    token_id: id,
+                                    confidence: confidence.last().copied().unwrap_or(0.0),
+                                    active_skill: None,
+                                    recon: None,
+                                    switched: false,
+                                });
+                            }
                             if !commit!(id) {
                                 stopped = true;
                                 break;
@@ -14356,6 +14378,15 @@ impl Pipeline {
         // graph (one submit a step); the host per-op matvec if it cannot.
         let hs = self.hidden_size;
         let mut x = vec![0f32; hs];
+        // Let an eligible q4tp MTP draft use the measured masked-nibble
+        // matvec.  Unlike fused epilogues, this reduces the draft's
+        // projection work without changing its residual-update schedule;
+        // the target verifier remains the authority over emitted tokens.
+        // The guard keeps `CMF_METAL_MVFAST=0` as an immediate rollback
+        // switch and restores the caller's setting on every early return.
+        let _mtp_fast = crate::gpu_metal::MvFastGuard::set_bits(
+            crate::gpu_metal::DENSE_MV,
+        );
         let mut graph = TokenGraph::new(&model, dims, &x)?;
         let mut folded = false;
         if let Some(eh) = m.eh_proj.q1_parts() {
@@ -14609,6 +14640,12 @@ impl Pipeline {
             eps: self.rms_eps as f32,
             gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
         };
+        // Keep the chained MTP draft on the masked-nibble Metal matvec
+        // path.  This scope covers every encode in the chain; the guard
+        // restores its predecessor when this round returns or declines.
+        let _mtp_fast = crate::gpu_metal::MvFastGuard::set_bits(
+            crate::gpu_metal::DENSE_MV,
+        );
         let Some(mut graph) = TokenGraph::new(&model, dims, hidden) else {
             return Err(false);
         };
