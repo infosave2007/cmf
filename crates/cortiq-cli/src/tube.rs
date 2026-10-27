@@ -20,8 +20,14 @@
 //! `mlp.*_proj.tube{k}.weight` triple. A task is a first-class task mask
 //! whose bits are on for the core and for its own tubes.
 
-use anyhow::{Context, bail};
+use anyhow::{Context, bail, ensure};
+use cortiq_core::format::CmfStreamWriter;
 use cortiq_core::mask::{MaskCatalog, MaskPriority, TaskMask};
+use cortiq_core::quant::{
+    Q2TP_CHUNK, Q4TP_NIB, bf16_to_f32, dequant_q8_2f, dequant_q8_row, expected_nbytes,
+    f16_to_f32,
+    q2tp_ladder, q2tp_sections, q4tp_code, q4tp_ladder, q4tp_sections,
+};
 use cortiq_core::{CmfModel, ModelArch, TensorDtype, TensorEntry, TensorSpec};
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -463,6 +469,39 @@ fn validate_canonical_dense_mtp(
     Ok(CanonicalMtp { widths, has_down_t })
 }
 
+/// Validate every property of a dense MTP source that the physical compact
+/// writer needs, without allocating a plan or touching an output.  The
+/// calibration command calls this immediately after opening its verified
+/// draft, so an unsupported MTP layout or codec cannot consume a large
+/// `.tdata` scan and hours of activation collection before failing in the
+/// writer.
+pub(crate) fn preflight_mtp_compact_source(model: &CmfModel) -> anyhow::Result<Vec<usize>> {
+    if !mtp_payload_present(model) {
+        bail!("MTP compact source carries no model.mtp tensors");
+    }
+    let canonical = validate_canonical_dense_mtp(model, model.arch())?;
+    for layer in 0..canonical.widths.len() {
+        let [gate_name, up_name, down_name, down_t_name] = mtp_mlp_names(layer);
+        for name in [&gate_name, &up_name, &down_name] {
+            let dtype = tensor(model, name)?.dtype;
+            ensure!(
+                is_mtp_materializable_dtype(dtype),
+                "MTP compact: {name} uses {}, which the physical compact writer cannot materialize",
+                dtype.name()
+            );
+        }
+        if canonical.has_down_t[layer] {
+            let dtype = tensor(model, &down_t_name)?.dtype;
+            ensure!(
+                is_mtp_materializable_dtype(dtype),
+                "MTP compact: {down_t_name} uses {}, which the physical compact writer cannot rebuild",
+                dtype.name()
+            );
+        }
+    }
+    Ok(canonical.widths)
+}
+
 /// A calibration-generated MTP plan is tied to the exact draft directory it
 /// measured.  Unlike the main-file hash (which is only audit metadata for a
 /// sidecar), this hash can be checked by `tube bake` because its input is the
@@ -488,6 +527,25 @@ fn validate_mtp_compact_source(plan: &Value, model: &CmfModel) -> anyhow::Result
             actual
         );
     }
+    // New plans additionally bind the merged tensor directory. `dir_hash()`
+    // is necessarily the first physical shard's directory, whereas this
+    // identity covers all shard entries and their payload hashes. Keep this
+    // optional so historical unsharded plans remain readable.
+    if let Some(recorded) = selection
+        .get("source_draft_trunk_hash")
+        .and_then(Value::as_str)
+    {
+        let parsed = u64::from_str_radix(recorded, 16).with_context(
+            || "MTP compact plan.selection.source_draft_trunk_hash must be a hexadecimal u64",
+        )?;
+        let actual = model.trunk_hash();
+        if parsed != actual {
+            bail!(
+                "MTP compact plan targets draft trunk hash {recorded}, but input is {:016x}",
+                actual
+            );
+        }
+    }
     Ok(())
 }
 
@@ -506,6 +564,646 @@ fn compact_rows(values: &[f32], selected: &[usize], source_rows: usize, cols: us
         output.extend_from_slice(&values[row * cols..(row + 1) * cols]);
     }
     output
+}
+
+/// Byte width of a raw, row-major scalar encoding whose axes can be selected
+/// without changing any quantization parameters.
+fn raw_scalar_width(dtype: TensorDtype) -> Option<usize> {
+    match dtype {
+        TensorDtype::F32 => Some(4),
+        TensorDtype::F16 | TensorDtype::Bf16 => Some(2),
+        _ => None,
+    }
+}
+
+fn is_mtp_materializable_dtype(dtype: TensorDtype) -> bool {
+    raw_scalar_width(dtype).is_some() || quant_of(dtype).is_some()
+}
+
+/// Round an f32 to bfloat16, using round-to-nearest-even. Values that
+/// originated from a bfloat16 payload have zero low bits and therefore retain
+/// their exact source representation on a transpose rebuild.
+fn f32_to_bf16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let round_bias = 0x7fff + ((bits >> 16) & 1);
+    bits.wrapping_add(round_bias).wrapping_shr(16) as u16
+}
+
+/// Retain selected complete rows of the simple, row-addressable dense codecs
+/// without first expanding their entire source panel.  Unlike the tiled
+/// formats below, these layouts have raw f32/bf16/f16 values or an independent
+/// row scale, so selecting a neuron keeps exactly the same encoded values.
+/// `q8_2f` additionally has one unchanged column-scale plane because the
+/// input axis of gate/up is unchanged.
+fn compact_encoded_basic_rows(
+    dtype: TensorDtype,
+    source: &[u8],
+    source_rows: usize,
+    cols: usize,
+    selected: &[usize],
+) -> anyhow::Result<Option<Vec<u8>>> {
+    if !matches!(
+        dtype,
+        TensorDtype::F32
+            | TensorDtype::F16
+            | TensorDtype::Bf16
+            | TensorDtype::Q8Row
+            | TensorDtype::Q8_2f
+    ) {
+        return Ok(None);
+    }
+    let source_shape = [source_rows, cols];
+    let expected_source = expected_nbytes(dtype, &source_shape)
+        .context("MTP compact: encoded basic row-selection source shape overflows")?;
+    ensure!(
+        source.len() == expected_source,
+        "MTP compact: encoded basic row-selection source payload has {} bytes, expected {expected_source}",
+        source.len()
+    );
+    for &row in selected {
+        ensure!(
+            row < source_rows,
+            "MTP compact: encoded basic row-selection index {row} is out of range for {source_rows} rows"
+        );
+    }
+    let destination_shape = [selected.len(), cols];
+    let expected_destination = expected_nbytes(dtype, &destination_shape)
+        .context("MTP compact: encoded basic row-selection destination shape overflows")?;
+    let source_values = source_rows
+        .checked_mul(cols)
+        .context("MTP compact: encoded basic row-selection source element count overflows")?;
+    let destination_values = selected
+        .len()
+        .checked_mul(cols)
+        .context("MTP compact: encoded basic row-selection destination element count overflows")?;
+    let mut destination = vec![0u8; expected_destination];
+    match dtype {
+        TensorDtype::F32 | TensorDtype::F16 | TensorDtype::Bf16 => {
+            let scalar_width = raw_scalar_width(dtype)
+                .expect("raw scalar dtype was accepted by basic row selection");
+            for (destination_row, &source_row) in selected.iter().enumerate() {
+                let source_start = source_row
+                    .checked_mul(cols)
+                    .and_then(|offset| offset.checked_mul(scalar_width))
+                    .context("MTP compact: encoded raw row source offset overflows")?;
+                let destination_start = destination_row
+                    .checked_mul(cols)
+                    .and_then(|offset| offset.checked_mul(scalar_width))
+                    .context("MTP compact: encoded raw row destination offset overflows")?;
+                let row_bytes = cols
+                    .checked_mul(scalar_width)
+                    .context("MTP compact: encoded raw row byte width overflows")?;
+                destination[destination_start..destination_start + row_bytes]
+                    .copy_from_slice(&source[source_start..source_start + row_bytes]);
+            }
+        }
+        TensorDtype::Q8Row => {
+            let source_scales = &source[source_values..];
+            let destination_scales = destination_values;
+            for (destination_row, &source_row) in selected.iter().enumerate() {
+                let source_start = source_row
+                    .checked_mul(cols)
+                    .context("MTP compact: encoded q8 row source offset overflows")?;
+                let destination_start = destination_row
+                    .checked_mul(cols)
+                    .context("MTP compact: encoded q8 row destination offset overflows")?;
+                destination[destination_start..destination_start + cols]
+                    .copy_from_slice(&source[source_start..source_start + cols]);
+                destination[destination_scales + destination_row * 2
+                    ..destination_scales + destination_row * 2 + 2]
+                    .copy_from_slice(&source_scales[source_row * 2..source_row * 2 + 2]);
+            }
+        }
+        TensorDtype::Q8_2f => {
+            let source_row_scales_end = source_values
+                .checked_add(
+                    source_rows
+                        .checked_mul(2)
+                        .context("MTP compact: encoded q8_2f source row-scale width overflows")?,
+                )
+                .context("MTP compact: encoded q8_2f source scale offset overflows")?;
+            let (source_quant, source_tail) = source.split_at(source_values);
+            let (source_row_scales, source_column_scales) =
+                source_tail.split_at(source_row_scales_end - source_values);
+            let destination_row_scales = destination_values;
+            let destination_column_scales = destination_row_scales
+                .checked_add(
+                    selected
+                        .len()
+                        .checked_mul(2)
+                        .context("MTP compact: encoded q8_2f destination row-scale width overflows")?,
+                )
+                .context("MTP compact: encoded q8_2f destination scale offset overflows")?;
+            for (destination_row, &source_row) in selected.iter().enumerate() {
+                let source_start = source_row
+                    .checked_mul(cols)
+                    .context("MTP compact: encoded q8_2f row source offset overflows")?;
+                let destination_start = destination_row
+                    .checked_mul(cols)
+                    .context("MTP compact: encoded q8_2f row destination offset overflows")?;
+                destination[destination_start..destination_start + cols]
+                    .copy_from_slice(&source_quant[source_start..source_start + cols]);
+                destination[destination_row_scales + destination_row * 2
+                    ..destination_row_scales + destination_row * 2 + 2]
+                    .copy_from_slice(&source_row_scales[source_row * 2..source_row * 2 + 2]);
+            }
+            destination[destination_column_scales..]
+                .copy_from_slice(source_column_scales);
+        }
+        _ => unreachable!("non-basic dtype returned above"),
+    }
+    Ok(Some(destination))
+}
+
+/// Select the input axis of a dense MTP `down_proj` from simple encodings
+/// exactly. The output needs no requantization: raw f32/bf16/f16 values remain
+/// raw, q8 rows keep their per-row scale, and q8_2f keeps both the row scale and
+/// the matching (possibly re-ordered) column scale.  This is especially
+/// important for a quality-focused q8_2f draft: re-fitting scales after a
+/// column subset would introduce avoidable error.
+fn compact_encoded_basic_columns(
+    dtype: TensorDtype,
+    source: &[u8],
+    rows: usize,
+    source_cols: usize,
+    selected: &[usize],
+) -> anyhow::Result<Option<Vec<u8>>> {
+    if !matches!(
+        dtype,
+        TensorDtype::F32
+            | TensorDtype::F16
+            | TensorDtype::Bf16
+            | TensorDtype::Q8Row
+            | TensorDtype::Q8_2f
+    ) {
+        return Ok(None);
+    }
+    let source_shape = [rows, source_cols];
+    let expected_source = expected_nbytes(dtype, &source_shape)
+        .context("MTP compact: encoded basic column-selection source shape overflows")?;
+    ensure!(
+        source.len() == expected_source,
+        "MTP compact: encoded basic column-selection source payload has {} bytes, expected {expected_source}",
+        source.len()
+    );
+    for &column in selected {
+        ensure!(
+            column < source_cols,
+            "MTP compact: encoded basic column-selection index {column} is out of range for {source_cols} columns"
+        );
+    }
+    let destination_cols = selected.len();
+    let destination_shape = [rows, destination_cols];
+    let expected_destination = expected_nbytes(dtype, &destination_shape)
+        .context("MTP compact: encoded basic column-selection destination shape overflows")?;
+    let source_values = rows
+        .checked_mul(source_cols)
+        .context("MTP compact: encoded basic column-selection source element count overflows")?;
+    let destination_values = rows
+        .checked_mul(destination_cols)
+        .context("MTP compact: encoded basic column-selection destination element count overflows")?;
+    let mut destination = vec![0u8; expected_destination];
+    match dtype {
+        TensorDtype::F32 | TensorDtype::F16 | TensorDtype::Bf16 => {
+            let scalar_width = raw_scalar_width(dtype)
+                .expect("raw scalar dtype was accepted by basic column selection");
+            for row in 0..rows {
+                for (destination_column, &source_column) in selected.iter().enumerate() {
+                    let source_start = row
+                        .checked_mul(source_cols)
+                        .and_then(|offset| offset.checked_add(source_column))
+                        .and_then(|offset| offset.checked_mul(scalar_width))
+                        .context("MTP compact: encoded raw column source offset overflows")?;
+                    let destination_start = row
+                        .checked_mul(destination_cols)
+                        .and_then(|offset| offset.checked_add(destination_column))
+                        .and_then(|offset| offset.checked_mul(scalar_width))
+                        .context("MTP compact: encoded raw column destination offset overflows")?;
+                    destination[destination_start..destination_start + scalar_width]
+                        .copy_from_slice(&source[source_start..source_start + scalar_width]);
+                }
+            }
+        }
+        TensorDtype::Q8Row => {
+            let source_scales = &source[source_values..];
+            let destination_scales = destination_values;
+            for row in 0..rows {
+                let source_row = row
+                    .checked_mul(source_cols)
+                    .context("MTP compact: encoded q8 column source row offset overflows")?;
+                let destination_row = row
+                    .checked_mul(destination_cols)
+                    .context("MTP compact: encoded q8 column destination row offset overflows")?;
+                for (destination_column, &source_column) in selected.iter().enumerate() {
+                    destination[destination_row + destination_column] =
+                        source[source_row + source_column];
+                }
+                destination[destination_scales + row * 2..destination_scales + row * 2 + 2]
+                    .copy_from_slice(&source_scales[row * 2..row * 2 + 2]);
+            }
+        }
+        TensorDtype::Q8_2f => {
+            let source_row_scales_end = source_values
+                .checked_add(
+                    rows.checked_mul(2)
+                        .context("MTP compact: encoded q8_2f source row-scale width overflows")?,
+                )
+                .context("MTP compact: encoded q8_2f source scale offset overflows")?;
+            let (source_quant, source_tail) = source.split_at(source_values);
+            let (source_row_scales, source_column_scales) =
+                source_tail.split_at(source_row_scales_end - source_values);
+            let destination_row_scales = destination_values;
+            let destination_column_scales = destination_row_scales
+                .checked_add(
+                    rows.checked_mul(2)
+                        .context("MTP compact: encoded q8_2f destination row-scale width overflows")?,
+                )
+                .context("MTP compact: encoded q8_2f destination scale offset overflows")?;
+            for row in 0..rows {
+                let source_row = row
+                    .checked_mul(source_cols)
+                    .context("MTP compact: encoded q8_2f column source row offset overflows")?;
+                let destination_row = row
+                    .checked_mul(destination_cols)
+                    .context("MTP compact: encoded q8_2f column destination row offset overflows")?;
+                for (destination_column, &source_column) in selected.iter().enumerate() {
+                    destination[destination_row + destination_column] =
+                        source_quant[source_row + source_column];
+                }
+                destination[destination_row_scales + row * 2
+                    ..destination_row_scales + row * 2 + 2]
+                    .copy_from_slice(&source_row_scales[row * 2..row * 2 + 2]);
+            }
+            for (destination_column, &source_column) in selected.iter().enumerate() {
+                destination[destination_column_scales + destination_column * 2
+                    ..destination_column_scales + destination_column * 2 + 2]
+                    .copy_from_slice(
+                        &source_column_scales[source_column * 2..source_column * 2 + 2],
+                    );
+            }
+        }
+        _ => unreachable!("non-basic dtype returned above"),
+    }
+    Ok(Some(destination))
+}
+
+/// Decode the compact basic payload only when rebuilding an optional
+/// `down_proj.t` cache.  The source panel is never expanded: this consumes
+/// the already-small selected matrix and exactly matches the core codecs.
+fn dequant_compact_basic_matrix(
+    dtype: TensorDtype,
+    bytes: &[u8],
+    rows: usize,
+    cols: usize,
+) -> anyhow::Result<Vec<f32>> {
+    let expected = expected_nbytes(dtype, &[rows, cols])
+        .context("MTP compact: compact basic matrix shape overflows")?;
+    ensure!(
+        bytes.len() == expected,
+        "MTP compact: compact basic matrix has {} bytes, expected {expected}",
+        bytes.len()
+    );
+    let values = rows
+        .checked_mul(cols)
+        .context("MTP compact: compact basic matrix element count overflows")?;
+    let mut output = vec![0.0f32; values];
+    match dtype {
+        TensorDtype::F32 => {
+            for (slot, packed) in output.iter_mut().zip(bytes.chunks_exact(4)) {
+                *slot = f32::from_le_bytes([packed[0], packed[1], packed[2], packed[3]]);
+            }
+        }
+        TensorDtype::F16 => {
+            for (slot, packed) in output.iter_mut().zip(bytes.chunks_exact(2)) {
+                *slot = f16_to_f32(u16::from_le_bytes([packed[0], packed[1]]));
+            }
+        }
+        TensorDtype::Bf16 => {
+            for (slot, packed) in output.iter_mut().zip(bytes.chunks_exact(2)) {
+                *slot = bf16_to_f32(u16::from_le_bytes([packed[0], packed[1]]));
+            }
+        }
+        TensorDtype::Q8Row => dequant_q8_row(bytes, rows, cols, &mut output),
+        TensorDtype::Q8_2f => dequant_q8_2f(bytes, rows, cols, &mut output),
+        _ => bail!("MTP compact: {dtype:?} is not a basic exact matrix codec"),
+    }
+    Ok(output)
+}
+
+/// Encode a rebuilt compact matrix using the source tensor's physical dtype.
+/// Raw f32/bf16 source tensors have no `Quant` equivalent, but preserving the
+/// dtype matters for a `down_proj.t` cache: silently falling back to f16 can
+/// overflow bf16 values or add a needless quality change.
+fn encode_compact_mtp_matrix(
+    dtype: TensorDtype,
+    values: &[f32],
+    rows: usize,
+    cols: usize,
+) -> anyhow::Result<(TensorDtype, Vec<u8>)> {
+    let expected_values = rows
+        .checked_mul(cols)
+        .context("MTP compact: rebuilt matrix element count overflows")?;
+    ensure!(
+        values.len() == expected_values,
+        "MTP compact: rebuilt matrix has {} values, expected {expected_values}",
+        values.len()
+    );
+    match dtype {
+        TensorDtype::F32 => {
+            let byte_len = expected_values
+                .checked_mul(4)
+                .context("MTP compact: rebuilt f32 matrix byte count overflows")?;
+            let mut data = Vec::new();
+            data.try_reserve_exact(byte_len).map_err(|error| {
+                anyhow::anyhow!("MTP compact: reserving rebuilt f32 matrix: {error}")
+            })?;
+            for &value in values {
+                data.extend_from_slice(&value.to_le_bytes());
+            }
+            Ok((dtype, data))
+        }
+        TensorDtype::Bf16 => {
+            let byte_len = expected_values
+                .checked_mul(2)
+                .context("MTP compact: rebuilt bf16 matrix byte count overflows")?;
+            let mut data = Vec::new();
+            data.try_reserve_exact(byte_len).map_err(|error| {
+                anyhow::anyhow!("MTP compact: reserving rebuilt bf16 matrix: {error}")
+            })?;
+            for &value in values {
+                data.extend_from_slice(&f32_to_bf16(value).to_le_bytes());
+            }
+            Ok((dtype, data))
+        }
+        _ => {
+            let quant = quant_of(dtype)
+                .with_context(|| format!("unsupported MTP matrix dtype {}", dtype.name()))?;
+            Ok(quantize_2d(quant, values, rows, cols))
+        }
+    }
+}
+
+enum CompactMtpColumns {
+    /// Exact selected bytes for an encoding whose axes remain independently
+    /// addressable after compaction.
+    Exact {
+        dtype: TensorDtype,
+        data: Vec<u8>,
+    },
+    /// q4tp/q2tp need a new group layout after their input columns change,
+    /// so they are decoded only for the selected columns and re-encoded.
+    Decoded(Vec<f32>),
+}
+
+/// Losslessly retain selected *rows* of the row-addressable q4tp/q2tp
+/// payloads. Gate/up MTP matrices keep their input axis unchanged, so a
+/// selected neuron is a complete encoded row: copying its weight, ladder and
+/// code planes is both exact relative to the source CMF and much cheaper than
+/// dequantizing/re-quantizing it. `down_proj` is deliberately excluded: its
+/// selected axis is columns, which changes groups and requires requantization.
+fn compact_encoded_tiled_rows(
+    dtype: TensorDtype,
+    source: &[u8],
+    source_rows: usize,
+    cols: usize,
+    selected: &[usize],
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let tile_bytes = match dtype {
+        TensorDtype::Q4TiledP => Q4TP_NIB,
+        TensorDtype::Q2TiledP => Q2TP_CHUNK,
+        _ => return Ok(None),
+    };
+    ensure!(
+        cols != 0 && cols % 32 == 0,
+        "MTP compact: {:?} row selection needs a positive 32-aligned input width, got {cols}",
+        dtype
+    );
+    let source_shape = [source_rows, cols];
+    let expected_source = expected_nbytes(dtype, &source_shape)
+        .context("MTP compact: encoded row-selection source shape overflows")?;
+    ensure!(
+        source.len() == expected_source,
+        "MTP compact: encoded row-selection source payload has {} bytes, expected {expected_source}",
+        source.len()
+    );
+    let destination_shape = [selected.len(), cols];
+    let expected_destination = expected_nbytes(dtype, &destination_shape)
+        .context("MTP compact: encoded row-selection destination shape overflows")?;
+    let groups_per_row = cols / 32;
+    let row_weight_bytes = groups_per_row
+        .checked_mul(tile_bytes)
+        .context("MTP compact: encoded row-selection row width overflows")?;
+    let (source_params, source_codes, source_code_stride) = match dtype {
+        TensorDtype::Q4TiledP => q4tp_sections(source_rows, cols),
+        TensorDtype::Q2TiledP => q2tp_sections(source_rows, cols),
+        _ => unreachable!("non-tiled dtype returned above"),
+    };
+    let (destination_params, destination_codes, destination_code_stride) = match dtype {
+        TensorDtype::Q4TiledP => q4tp_sections(selected.len(), cols),
+        TensorDtype::Q2TiledP => q2tp_sections(selected.len(), cols),
+        _ => unreachable!("non-tiled dtype returned above"),
+    };
+    ensure!(
+        source_code_stride == destination_code_stride,
+        "MTP compact: encoded row-selection changed code stride unexpectedly"
+    );
+    ensure!(
+        source_params == source_rows.checked_mul(row_weight_bytes).context("MTP compact: encoded source plane offset overflows")?
+            && destination_params == selected.len().checked_mul(row_weight_bytes).context("MTP compact: encoded destination plane offset overflows")?,
+        "MTP compact: encoded row-selection plane layout is inconsistent"
+    );
+
+    let mut destination = vec![0u8; expected_destination];
+    for (destination_row, &source_row) in selected.iter().enumerate() {
+        ensure!(
+            source_row < source_rows,
+            "MTP compact: encoded row-selection index {source_row} is out of range for {source_rows} rows"
+        );
+        let source_weight = source_row * row_weight_bytes;
+        let destination_weight = destination_row * row_weight_bytes;
+        destination[destination_weight..destination_weight + row_weight_bytes]
+            .copy_from_slice(&source[source_weight..source_weight + row_weight_bytes]);
+        let source_param = source_params + source_row * 4;
+        let destination_param = destination_params + destination_row * 4;
+        destination[destination_param..destination_param + 4]
+            .copy_from_slice(&source[source_param..source_param + 4]);
+        let source_code = source_codes + source_row * source_code_stride;
+        let destination_code = destination_codes + destination_row * destination_code_stride;
+        destination[destination_code..destination_code + destination_code_stride]
+            .copy_from_slice(&source[source_code..source_code + source_code_stride]);
+    }
+    Ok(Some(destination))
+}
+
+fn compact_encoded_mtp_rows(
+    model: &CmfModel,
+    name: &str,
+    source_rows: usize,
+    cols: usize,
+    selected: &[usize],
+) -> anyhow::Result<Option<(TensorDtype, Vec<u8>)>> {
+    let entry = tensor(model, name)?;
+    ensure!(
+        entry.shape.as_slice() == [source_rows, cols],
+        "MTP compact: {name} has shape {:?}, expected [{source_rows}, {cols}]",
+        entry.shape
+    );
+    let source = model.tensor_bytes(name)?;
+    let data = if let Some(data) =
+        compact_encoded_basic_rows(entry.dtype, source, source_rows, cols, selected)?
+    {
+        Some(data)
+    } else {
+        compact_encoded_tiled_rows(entry.dtype, source, source_rows, cols, selected)?
+    };
+    Ok(data.map(|data| (entry.dtype, data)))
+}
+
+/// Decode only the selected columns of a q4tp/q2tp matrix.  Unlike gate/up,
+/// `down_proj` cannot keep its encoded source rows because compaction changes
+/// its input axis and therefore its group boundaries.  It still need not
+/// expand the entire source matrix first: both predicted-scale codecs are
+/// independently addressable by source row and 32-wide group.  The returned
+/// f32 values use precisely the same scalar operations as `dequant_q4tp` and
+/// `dequant_q2tp`, then the ordinary writer re-encodes the compact matrix.
+fn compact_encoded_tiled_columns(
+    dtype: TensorDtype,
+    source: &[u8],
+    rows: usize,
+    source_cols: usize,
+    selected: &[usize],
+) -> anyhow::Result<Option<Vec<f32>>> {
+    let tile_bytes = match dtype {
+        TensorDtype::Q4TiledP => Q4TP_NIB,
+        TensorDtype::Q2TiledP => Q2TP_CHUNK,
+        _ => return Ok(None),
+    };
+    ensure!(
+        source_cols != 0 && source_cols % 32 == 0,
+        "MTP compact: {:?} column selection needs a positive 32-aligned input width, got {source_cols}",
+        dtype
+    );
+    let source_shape = [rows, source_cols];
+    let expected_source = expected_nbytes(dtype, &source_shape)
+        .context("MTP compact: encoded column-selection source shape overflows")?;
+    ensure!(
+        source.len() == expected_source,
+        "MTP compact: encoded column-selection source payload has {} bytes, expected {expected_source}",
+        source.len()
+    );
+    // Channel ranking produces a non-monotonic order.  Group the requested
+    // columns once so each source 32-wide tile obtains its predicted scale
+    // code only once per row, while `destination_column` preserves that
+    // ranking order in the compact output.
+    let groups_per_row = source_cols / 32;
+    let mut selected_by_group = vec![Vec::<(usize, usize)>::new(); groups_per_row];
+    for (destination_column, &column) in selected.iter().enumerate() {
+        ensure!(
+            column < source_cols,
+            "MTP compact: encoded column-selection index {column} is out of range for {source_cols} columns"
+        );
+        selected_by_group[column / 32].push((destination_column, column % 32));
+    }
+    let (params_offset, codes_offset, code_stride) = match dtype {
+        TensorDtype::Q4TiledP => q4tp_sections(rows, source_cols),
+        TensorDtype::Q2TiledP => q2tp_sections(rows, source_cols),
+        _ => unreachable!("non-tiled dtype returned above"),
+    };
+    let row_weight_bytes = groups_per_row
+        .checked_mul(tile_bytes)
+        .context("MTP compact: encoded column-selection row width overflows")?;
+    ensure!(
+        params_offset
+            == rows
+                .checked_mul(row_weight_bytes)
+                .context("MTP compact: encoded column-selection plane offset overflows")?,
+        "MTP compact: encoded column-selection plane layout is inconsistent"
+    );
+    let capacity = rows
+        .checked_mul(selected.len())
+        .context("MTP compact: encoded column-selection output shape overflows")?;
+    let params_end = params_offset
+        .checked_add(rows.checked_mul(4).context("MTP compact: encoded column-selection parameter plane overflows")?)
+        .context("MTP compact: encoded column-selection parameter plane end overflows")?;
+    ensure!(
+        params_end <= source.len()
+            && codes_offset
+                .checked_add(rows.checked_mul(code_stride).context("MTP compact: encoded column-selection code plane overflows")?)
+                .is_some_and(|end| end == source.len()),
+        "MTP compact: encoded column-selection plane bounds are inconsistent"
+    );
+    let params = &source[params_offset..params_end];
+    let mut output = vec![0.0f32; capacity];
+    for row in 0..rows {
+        let codes = &source[codes_offset + row * code_stride..codes_offset + (row + 1) * code_stride];
+        let destination = &mut output[row * selected.len()..(row + 1) * selected.len()];
+        match dtype {
+            TensorDtype::Q4TiledP => {
+                let ladder = q4tp_ladder(params, row);
+                for (group, requested) in selected_by_group.iter().enumerate() {
+                    if requested.is_empty() {
+                        continue;
+                    }
+                    let scale = ladder[q4tp_code(codes, group)];
+                    let tile_offset = row * row_weight_bytes + group * Q4TP_NIB;
+                    for &(destination_column, within_group) in requested {
+                        let byte = source[tile_offset + within_group / 2];
+                        let quant = if within_group % 2 == 0 {
+                            byte & 0x0f
+                        } else {
+                            byte >> 4
+                        };
+                        destination[destination_column] = (quant as f32 - 8.0) * scale;
+                    }
+                }
+            }
+            TensorDtype::Q2TiledP => {
+                let ladder = q2tp_ladder(params, row);
+                for (group, requested) in selected_by_group.iter().enumerate() {
+                    if requested.is_empty() {
+                        continue;
+                    }
+                    let scale = ladder[q4tp_code(codes, group)];
+                    for &(destination_column, within_group) in requested {
+                        let byte = source[row * row_weight_bytes
+                            + group * Q2TP_CHUNK
+                            + within_group / 4];
+                        let quant = (byte >> (2 * (within_group % 4))) & 0x03;
+                        destination[destination_column] = (quant as f32 - 1.5) * scale;
+                    }
+                }
+            }
+            _ => unreachable!("non-tiled dtype returned above"),
+        }
+    }
+    debug_assert_eq!(output.len(), capacity);
+    Ok(Some(output))
+}
+
+fn compact_encoded_mtp_columns(
+    model: &CmfModel,
+    name: &str,
+    rows: usize,
+    source_cols: usize,
+    selected: &[usize],
+) -> anyhow::Result<Option<CompactMtpColumns>> {
+    let entry = tensor(model, name)?;
+    ensure!(
+        entry.shape.as_slice() == [rows, source_cols],
+        "MTP compact: {name} has shape {:?}, expected [{rows}, {source_cols}]",
+        entry.shape
+    );
+    let source = model.tensor_bytes(name)?;
+    if let Some(data) =
+        compact_encoded_basic_columns(entry.dtype, source, rows, source_cols, selected)?
+    {
+        return Ok(Some(CompactMtpColumns::Exact {
+            dtype: entry.dtype,
+            data,
+        }));
+    }
+    Ok(compact_encoded_tiled_columns(entry.dtype, source, rows, source_cols, selected)?
+        .map(CompactMtpColumns::Decoded))
 }
 
 fn compact_down_columns(
@@ -535,6 +1233,101 @@ fn transpose(values: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     output
 }
 
+// Copy large mmap payloads in bounded chunks. The only allocated dense f32
+// buffers in an MTP-only rewrite are one compacted draft layer at a time.
+const STREAM_COPY_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+
+fn stream_writer_for(
+    model: &CmfModel,
+    output: &Path,
+    additional_tensors: usize,
+    no_clobber: bool,
+) -> anyhow::Result<CmfStreamWriter> {
+    let average_name = model
+        .tensors
+        .iter()
+        .map(|entry| entry.name.len())
+        .sum::<usize>()
+        / model.tensors.len().max(1);
+    let tensor_count = model
+        .tensors
+        .len()
+        .checked_add(additional_tensors)
+        .context("MTP compact: output tensor count overflow")?;
+    let head = CmfStreamWriter::head_reserve_for(tensor_count, average_name);
+    let writer = if no_clobber {
+        CmfStreamWriter::new_no_clobber(output, head)
+    } else {
+        CmfStreamWriter::new(output, head)
+    };
+    Ok(writer?)
+}
+
+/// Copy a merged source model to one valid, unsharded CMF without making a
+/// `Vec<u8>` for every payload. MiMo pair publishing uses this for a sharded
+/// backbone; MTP-only baking below uses the same streaming contract while
+/// replacing the draft FFN tensors.
+fn stream_copy_as_unsharded_impl(
+    model: &CmfModel,
+    output: &Path,
+    no_clobber: bool,
+) -> anyhow::Result<()> {
+    let mut writer = stream_writer_for(model, output, 0, no_clobber)?;
+    for entry in &model.tensors {
+        if no_clobber {
+            // This private-stage route is reached only from `mtp-compact`,
+            // which verifies both source and final candidate. Reuse the
+            // source entry hash to avoid an otherwise redundant mmap pass.
+            writer.push_bounded_prehashed(
+                &entry.name,
+                entry.dtype,
+                &entry.shape,
+                model.entry_bytes(entry),
+                entry.hash,
+                STREAM_COPY_CHUNK_BYTES,
+            )?;
+        } else {
+            // The public helper retains its historic standalone semantics:
+            // callers are not required to have verified the source or to
+            // perform a final candidate scan.
+            writer.push_bounded(
+                &entry.name,
+                entry.dtype,
+                &entry.shape,
+                model.entry_bytes(entry),
+                STREAM_COPY_CHUNK_BYTES,
+            )?;
+        }
+    }
+    let mut header = model.header.clone();
+    let source_shards_coalesced = header.shard.take().is_some();
+    if source_shards_coalesced {
+        let mut provenance = header
+            .provenance
+            .take()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        provenance["stream_copy"] = json!({"source_shards_coalesced": true});
+        header.provenance = Some(provenance);
+    }
+    writer.finish(
+        &header,
+        (!model.masks.masks.is_empty()).then_some(&model.masks),
+        model.vocab.as_deref(),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn stream_copy_as_unsharded(model: &CmfModel, output: &Path) -> anyhow::Result<()> {
+    stream_copy_as_unsharded_impl(model, output, false)
+}
+
+/// Same streaming coalescer, but safe for a private stage: an unexpected
+/// existing file is an error rather than a truncation target.
+pub(crate) fn stream_copy_as_unsharded_new(model: &CmfModel, output: &Path) -> anyhow::Result<()> {
+    stream_copy_as_unsharded_impl(model, output, true)
+}
+
 // MTP stays one physical dense triple per layer.  A draft has no task mask,
 // and tube tensors would both slow it down and disqualify the fast speculative
 // GPU graph.  The plan's widths remain in provenance for reproducibility.
@@ -548,47 +1341,114 @@ fn append_compacted_mtp_layer(
     tensors: &mut Vec<TensorSpec>,
 ) -> anyhow::Result<()> {
     let [gate_name, up_name, down_name, down_t_name] = mtp_mlp_names(layer);
-    let gate = dequant(model, &gate_name)?;
-    let up = dequant(model, &up_name)?;
-    let down = dequant(model, &down_name)?;
-    let gate_q =
-        quant_of(tensor(model, &gate_name)?.dtype).context("unsupported MTP gate dtype")?;
-    let up_q = quant_of(tensor(model, &up_name)?.dtype).context("unsupported MTP up dtype")?;
-    let down_q =
-        quant_of(tensor(model, &down_name)?.dtype).context("unsupported MTP down dtype")?;
+    let gate_q = quant_of(tensor(model, &gate_name)?.dtype);
+    let up_q = quant_of(tensor(model, &up_name)?.dtype);
+    let source_down_q = quant_of(tensor(model, &down_name)?.dtype);
     let width = plan.order.len();
-    let gate = compact_rows(&gate, &plan.order, source_width, hidden);
-    let up = compact_rows(&up, &plan.order, source_width, hidden);
-    let down = compact_down_columns(&down, hidden, source_width, &plan.order);
+    let gate_encoded = compact_encoded_mtp_rows(
+        model,
+        &gate_name,
+        source_width,
+        hidden,
+        &plan.order,
+    )?;
+    let up_encoded = compact_encoded_mtp_rows(
+        model,
+        &up_name,
+        source_width,
+        hidden,
+        &plan.order,
+    )?;
     // Tiled low-bit codecs group the input axis, so a hand-written plan
-    // with an unaligned compact width must fall back.  Plain f16/q8 rows do
+    // with an unaligned compact width must fall back. Plain raw/f16/q8 rows do
     // not have that restriction and must not lose precision merely because
     // their selected draft width is not a codec-group multiple.
-    let down_q = if matches!(down_q, Quant::F16 | Quant::Q8Row | Quant::Q8_2f) || width % 32 == 0 {
-        down_q
-    } else {
-        Quant::Q8_2f
-    };
-    for (name, values, rows, cols, quant) in [
-        (&gate_name, &gate, width, hidden, gate_q),
-        (&up_name, &up, width, hidden, up_q),
-        (&down_name, &down, hidden, width, down_q),
+    let down_q = source_down_q.map(|quant| {
+        if matches!(quant, Quant::F16 | Quant::Q8Row | Quant::Q8_2f) || width % 32 == 0 {
+            quant
+        } else {
+            Quant::Q8_2f
+        }
+    });
+    for (name, encoded, quant) in [
+        (&gate_name, gate_encoded, gate_q),
+        (&up_name, up_encoded, up_q),
     ] {
-        let (dtype, data) = quantize_2d(quant, values, rows, cols);
-        tensors.push(TensorSpec {
-            name: name.to_string(),
-            dtype,
-            shape: vec![rows, cols],
-            data,
-        });
+        if let Some((dtype, data)) = encoded {
+            tensors.push(TensorSpec {
+                name: name.to_string(),
+                dtype,
+                shape: vec![width, hidden],
+                data,
+            });
+        } else {
+            let quant = quant.with_context(|| format!("unsupported MTP dtype for {name}"))?;
+            let original = dequant(model, name)?;
+            let compacted = compact_rows(&original, &plan.order, source_width, hidden);
+            let (dtype, data) = quantize_2d(quant, &compacted, width, hidden);
+            tensors.push(TensorSpec {
+                name: name.to_string(),
+                dtype,
+                shape: vec![width, hidden],
+                data,
+            });
+        }
     }
+    let down_for_transpose = match compact_encoded_mtp_columns(
+        model,
+        &down_name,
+        hidden,
+        source_width,
+        &plan.order,
+    )? {
+        Some(CompactMtpColumns::Exact { dtype, data }) => {
+            // Raw/f16/q8/q8_2f retain exactly the selected source values and
+            // scales, so do not introduce a second quantization merely
+            // because the MTP intermediate axis became narrower.
+            let compacted = has_down_t
+                .then(|| dequant_compact_basic_matrix(dtype, &data, hidden, width))
+                .transpose()?;
+            tensors.push(TensorSpec {
+                name: down_name.to_string(),
+                dtype,
+                shape: vec![hidden, width],
+                data,
+            });
+            compacted
+        }
+        Some(CompactMtpColumns::Decoded(down)) => {
+            let down_q = down_q.context("unsupported MTP down dtype")?;
+            let (dtype, data) = quantize_2d(down_q, &down, hidden, width);
+            tensors.push(TensorSpec {
+                name: down_name.to_string(),
+                dtype,
+                shape: vec![hidden, width],
+                data,
+            });
+            has_down_t.then_some(down)
+        }
+        None => {
+            let down_q = down_q.context("unsupported MTP down dtype")?;
+            let original = dequant(model, &down_name)?;
+            let down = compact_down_columns(&original, hidden, source_width, &plan.order);
+            drop(original);
+            let (dtype, data) = quantize_2d(down_q, &down, hidden, width);
+            tensors.push(TensorSpec {
+                name: down_name.to_string(),
+                dtype,
+                shape: vec![hidden, width],
+                data,
+            });
+            has_down_t.then_some(down)
+        }
+    };
     if has_down_t {
         // Rebuild instead of slicing the old cached transpose.  This keeps it
         // mathematically coherent with a permutation as well as a subset.
-        let t_q = quant_of(tensor(model, &down_t_name)?.dtype)
-            .context("unsupported MTP down_proj.t dtype")?;
+        let down_t_dtype = tensor(model, &down_t_name)?.dtype;
+        let down = down_for_transpose.expect("down projection retained for transpose");
         let down_t = transpose(&down, hidden, width);
-        let (dtype, data) = quantize_2d(t_q, &down_t, width, hidden);
+        let (dtype, data) = encode_compact_mtp_matrix(down_t_dtype, &down_t, width, hidden)?;
         tensors.push(TensorSpec {
             name: down_t_name,
             dtype,
@@ -599,11 +1459,151 @@ fn append_compacted_mtp_layer(
     Ok(())
 }
 
+/// Rewrite one compacted MTP layer directly into the stream writer.  This is
+/// intentionally projection-at-a-time: keeping the original and compacted
+/// gate, up and down matrices together would make a large draft rewrite need
+/// several extra GiB of transient f32 RAM.  `down_proj.t`, when present, is
+/// reconstructed only after the compacted `down_proj` was emitted.
+fn stream_compacted_mtp_layer(
+    model: &CmfModel,
+    layer: usize,
+    plan: &LayerPlan,
+    source_width: usize,
+    has_down_t: bool,
+    hidden: usize,
+    writer: &mut CmfStreamWriter,
+) -> anyhow::Result<()> {
+    let [gate_name, up_name, down_name, down_t_name] = mtp_mlp_names(layer);
+    let width = plan.order.len();
+
+    for name in [&gate_name, &up_name] {
+        if let Some((dtype, data)) =
+            compact_encoded_mtp_rows(model, name, source_width, hidden, &plan.order)?
+        {
+            // q4tp/q2tp gate/up rows are copied byte-for-byte. This avoids
+            // a second PTQ pass and keeps the selected source rows exactly
+            // intact, including their per-row predicted-scale ladder.
+            writer.push_bounded(
+                name,
+                dtype,
+                &[width, hidden],
+                &data,
+                STREAM_COPY_CHUNK_BYTES,
+            )?;
+            continue;
+        }
+        let quant = quant_of(tensor(model, name)?.dtype)
+            .with_context(|| format!("unsupported MTP dtype for {name}"))?;
+        let original = dequant(model, name)?;
+        let compacted = compact_rows(&original, &plan.order, source_width, hidden);
+        drop(original);
+        let (dtype, data) = quantize_2d(quant, &compacted, width, hidden);
+        // `data` no longer borrows the f32 panel after quantization.  Do not
+        // keep both representations resident while a large streamed write is
+        // in progress: a multi-layer MTP draft can otherwise retain another
+        // wide projection per layer longer than necessary.
+        drop(compacted);
+        writer.push_bounded(
+            name,
+            dtype,
+            &[width, hidden],
+            &data,
+            STREAM_COPY_CHUNK_BYTES,
+        )?;
+    }
+
+    let source_down_quant = quant_of(tensor(model, &down_name)?.dtype);
+    // Tiled low-bit codecs group the input axis.  A hand-written unaligned
+    // plan must fall back rather than serialize an invalid encoded tensor.
+    let down_quant = source_down_quant.map(|quant| {
+        if matches!(quant, Quant::F16 | Quant::Q8Row | Quant::Q8_2f) || width % 32 == 0 {
+            quant
+        } else {
+            Quant::Q8_2f
+        }
+    });
+    let compacted_down_for_transpose = match compact_encoded_mtp_columns(
+        model,
+        &down_name,
+        hidden,
+        source_width,
+        &plan.order,
+    )? {
+        Some(CompactMtpColumns::Exact { dtype, data }) => {
+            // Preserve the selected raw/f16/q8/q8_2f values and scales exactly.
+            // `down_proj.t`, when present, is derived only from this compact
+            // payload below; no full source down projection is materialized.
+            let compacted = has_down_t
+                .then(|| dequant_compact_basic_matrix(dtype, &data, hidden, width))
+                .transpose()?;
+            writer.push_bounded(
+                &down_name,
+                dtype,
+                &[hidden, width],
+                &data,
+                STREAM_COPY_CHUNK_BYTES,
+            )?;
+            compacted
+        }
+        Some(CompactMtpColumns::Decoded(compacted)) => {
+            let down_quant = down_quant.context("unsupported MTP down dtype")?;
+            let (dtype, data) = quantize_2d(down_quant, &compacted, hidden, width);
+            writer.push_bounded(
+                &down_name,
+                dtype,
+                &[hidden, width],
+                &data,
+                STREAM_COPY_CHUNK_BYTES,
+            )?;
+            has_down_t.then_some(compacted)
+        }
+        None => {
+            let down_quant = down_quant.context("unsupported MTP down dtype")?;
+            let original = dequant(model, &down_name)?;
+            let compacted = compact_down_columns(&original, hidden, source_width, &plan.order);
+            drop(original);
+            let (dtype, data) = quantize_2d(down_quant, &compacted, hidden, width);
+            writer.push_bounded(
+                &down_name,
+                dtype,
+                &[hidden, width],
+                &data,
+                STREAM_COPY_CHUNK_BYTES,
+            )?;
+            has_down_t.then_some(compacted)
+        }
+    };
+
+    if has_down_t {
+        let down_t_dtype = tensor(model, &down_t_name)?.dtype;
+        let compacted_down = compacted_down_for_transpose
+            .expect("down projection retained for transpose");
+        let compacted_down_t = transpose(&compacted_down, hidden, width);
+        // The transpose owns every value required by the cached layout. Free
+        // the original compacted orientation before re-encoding it so this
+        // optional cache does not make peak f32 RAM grow to two panels plus
+        // an encoded payload.
+        drop(compacted_down);
+        let (dtype, data) =
+            encode_compact_mtp_matrix(down_t_dtype, &compacted_down_t, width, hidden)?;
+        drop(compacted_down_t);
+        writer.push_bounded(
+            &down_t_name,
+            dtype,
+            &[width, hidden],
+            &data,
+            STREAM_COPY_CHUNK_BYTES,
+        )?;
+    }
+    Ok(())
+}
+
 fn cmd_mtp_only_bake(
     model: &Arc<CmfModel>,
     plan_document: &Value,
     mtp: &MtpPlan,
     output: &str,
+    no_clobber: bool,
 ) -> anyhow::Result<()> {
     let arch = model.arch().clone();
     let canonical = if mtp.mode == MtpMode::Compact {
@@ -628,7 +1628,19 @@ fn cmd_mtp_only_bake(
     };
 
     let layer_count = canonical.as_ref().map_or(0, |item| item.widths.len());
-    let mut tensors = Vec::with_capacity(model.tensors.len() + layer_count * 4);
+    // MTP-only baking must work for a main model far larger than RAM. Stream
+    // all preserved mmap payloads directly to the candidate; only one small
+    // MTP layer is dequantized/requantized at a time below. This also turns a
+    // valid sharded input into one independently runnable unsharded CMF.
+    let replacement_tensor_capacity = layer_count
+        .checked_mul(4)
+        .context("MTP compact: replacement tensor count overflow")?;
+    let mut writer = stream_writer_for(
+        model,
+        Path::new(output),
+        replacement_tensor_capacity,
+        no_clobber,
+    )?;
     for entry in &model.tensors {
         let omit = match mtp.mode {
             MtpMode::Preserve => false,
@@ -636,29 +1648,48 @@ fn cmd_mtp_only_bake(
             MtpMode::Compact => is_mtp_compacted_tensor(&entry.name, layer_count),
         };
         if !omit {
-            tensors.push(TensorSpec {
-                name: entry.name.clone(),
-                dtype: entry.dtype,
-                shape: entry.shape.clone(),
-                data: model.tensor_bytes(&entry.name)?.to_vec(),
-            });
+            if no_clobber {
+                // The private `mtp-compact` route verified this source and
+                // will verify the final candidate. Preserve the known hash to
+                // avoid an extra full read of every untouched payload.
+                writer.push_bounded_prehashed(
+                    &entry.name,
+                    entry.dtype,
+                    &entry.shape,
+                    model.entry_bytes(entry),
+                    entry.hash,
+                    STREAM_COPY_CHUNK_BYTES,
+                )?;
+            } else {
+                // A public `tube bake` is intentionally usable standalone;
+                // it must compute fresh hashes rather than rely on an
+                // unverified input directory.
+                writer.push_bounded(
+                    &entry.name,
+                    entry.dtype,
+                    &entry.shape,
+                    model.entry_bytes(entry),
+                    STREAM_COPY_CHUNK_BYTES,
+                )?;
+            }
         }
     }
     if let Some(canonical) = &canonical {
         for (layer, plan) in mtp.layers.iter().enumerate() {
-            append_compacted_mtp_layer(
+            stream_compacted_mtp_layer(
                 model,
                 layer,
                 plan,
                 canonical.widths[layer],
                 canonical.has_down_t[layer],
                 arch.hidden_size,
-                &mut tensors,
+                &mut writer,
             )?;
         }
     }
 
     let mut header = model.header.clone();
+    let source_shards_coalesced = header.shard.take().is_some();
     match mtp.mode {
         MtpMode::Preserve => {}
         MtpMode::Drop => header.arch.mtp = None,
@@ -672,7 +1703,11 @@ fn cmd_mtp_only_bake(
                 Some(mtp.layers.iter().map(|plan| plan.order.len()).collect());
         }
     }
-    let mut provenance = header.provenance.take().unwrap_or_else(|| json!({}));
+    let mut provenance = header
+        .provenance
+        .take()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
     let mut tubes = provenance
         .get("tubes")
         .cloned()
@@ -693,6 +1728,9 @@ fn cmd_mtp_only_bake(
                 "post_widths": mtp.layers.iter().map(|plan| plan.order.len()).collect::<Vec<_>>(),
                 "logical_segments": mtp.layers.iter().map(|plan| plan.widths.clone()).collect::<Vec<_>>(),
                 "physical_segments_per_layer": 1,
+                "gate_up_q4tp_q2tp": "selected encoded rows copied bytewise; other projections are re-encoded as needed",
+                "down_q4tp_q2tp": "only selected source columns are decoded before compact output re-encoding",
+                "raw_f32_bf16_f16_q8_q8_2f": "gate/up selected rows and down selected columns retain source encoded values/scales exactly; compact down is decoded only when rebuilding down_proj.t",
                 "down_proj_t_rebuilt": source.has_down_t,
                 "non_ffn_tensors": "copied-bytewise",
             })
@@ -701,12 +1739,13 @@ fn cmd_mtp_only_bake(
     if let Some(selection) = plan_document.get("selection") {
         tubes["mtp"]["selection"] = selection.clone();
     }
+    if source_shards_coalesced {
+        tubes["mtp"]["source_shards_coalesced"] = json!(true);
+    }
     provenance["tubes"] = tubes;
     header.provenance = Some(provenance);
-    CmfModel::write(
-        output,
+    writer.finish(
         &header,
-        &tensors,
         (!model.masks.masks.is_empty()).then_some(&model.masks),
         model.vocab.as_deref(),
     )?;
@@ -727,7 +1766,12 @@ fn cmd_mtp_only_bake(
     Ok(())
 }
 
-pub fn cmd_tube_bake(model_path: &str, plan_path: &str, output: &str) -> anyhow::Result<()> {
+fn cmd_tube_bake_impl(
+    model_path: &str,
+    plan_path: &str,
+    output: &str,
+    no_clobber: bool,
+) -> anyhow::Result<()> {
     ensure_distinct_bake_paths(model_path, plan_path, output)?;
     let model = Arc::new(CmfModel::open_sharded(model_path)?);
     crate::knowledge::refuse_genome_rewrite(&model, "tube-bake")?;
@@ -738,8 +1782,12 @@ pub fn cmd_tube_bake(model_path: &str, plan_path: &str, output: &str) -> anyhow:
     )?;
     let mtp = parse_mtp_plan(&plan)?;
     if trunk_is_preserved(&plan, &mtp)? {
-        return cmd_mtp_only_bake(&model, &plan, &mtp, output);
+        return cmd_mtp_only_bake(&model, &plan, &mtp, output, no_clobber);
     }
+    ensure!(
+        !no_clobber,
+        "MTP compact: private no-clobber bake only supports trunk.mode=preserve"
+    );
     let canonical_mtp = if mtp.mode == MtpMode::Compact {
         validate_mtp_compact_source(&plan, &model)?;
         if !mtp_payload_present(&model) {
@@ -1011,6 +2059,7 @@ pub fn cmd_tube_bake(model_path: &str, plan_path: &str, output: &str) -> anyhow:
                 "post_widths": mtp.layers.iter().map(|item| item.order.len()).collect::<Vec<_>>(),
                 "logical_segments": mtp.layers.iter().map(|item| item.widths.clone()).collect::<Vec<_>>(),
                 "physical_segments_per_layer": 1,
+                "raw_f32_bf16_f16_q8_q8_2f": "gate/up selected rows and down selected columns retain source encoded values/scales exactly; compact down is decoded only when rebuilding down_proj.t",
                 "down_proj_t_rebuilt": source.has_down_t,
                 "non_ffn_tensors": "copied-bytewise",
             })
@@ -1071,6 +2120,23 @@ pub fn cmd_tube_bake(model_path: &str, plan_path: &str, output: &str) -> anyhow:
         ),
     }
     Ok(())
+}
+
+/// Rewrite a model according to a tube/MTP plan. This legacy public command
+/// keeps its established overwrite semantics; production `mtp-compact` uses
+/// the private no-clobber variant below for nonce stages.
+pub fn cmd_tube_bake(model_path: &str, plan_path: &str, output: &str) -> anyhow::Result<()> {
+    cmd_tube_bake_impl(model_path, plan_path, output, false)
+}
+
+/// Safe private-stage entry point used by `mtp-compact`. It only accepts the
+/// MTP-only path, whose writer opens the destination with `create_new`.
+pub(crate) fn cmd_tube_bake_new(
+    model_path: &str,
+    plan_path: &str,
+    output: &str,
+) -> anyhow::Result<()> {
+    cmd_tube_bake_impl(model_path, plan_path, output, true)
 }
 
 #[cfg(test)]
@@ -1355,6 +2421,625 @@ mod mtp_plan_tests {
     }
 
     #[test]
+    fn q4tp_and_q2tp_gate_up_row_selection_is_lossless() {
+        let (rows, cols) = (7usize, 64usize);
+        let values = (0..rows * cols)
+            .map(|index| {
+                let row = index / cols;
+                let col = index % cols;
+                ((row * 31 + col * 17 + 5) % 71) as f32 / 29.0 - 1.2
+            })
+            .collect::<Vec<_>>();
+        // Non-monotonic order proves that every plane is copied with the same
+        // row permutation rather than merely truncating its prefix.
+        let selected = [6usize, 1, 4, 0];
+        for quant in [Quant::Q4TiledP, Quant::Q2TiledP] {
+            let (dtype, source) = quantize_2d(quant, &values, rows, cols);
+            let compact = compact_encoded_tiled_rows(dtype, &source, rows, cols, &selected)
+                .unwrap()
+                .expect("tiled codec must use encoded row copy");
+            assert!(
+                cortiq_core::quant::validate_payload(dtype, &[selected.len(), cols], &compact)
+                    .is_ok(),
+                "selected {dtype:?} payload is invalid"
+            );
+            let mut decoded_source = vec![0.0f32; rows * cols];
+            let mut decoded_compact = vec![0.0f32; selected.len() * cols];
+            match dtype {
+                TensorDtype::Q4TiledP => {
+                    cortiq_core::quant::dequant_q4tp(&source, rows, cols, &mut decoded_source);
+                    cortiq_core::quant::dequant_q4tp(
+                        &compact,
+                        selected.len(),
+                        cols,
+                        &mut decoded_compact,
+                    );
+                }
+                TensorDtype::Q2TiledP => {
+                    cortiq_core::quant::dequant_q2tp(&source, rows, cols, &mut decoded_source);
+                    cortiq_core::quant::dequant_q2tp(
+                        &compact,
+                        selected.len(),
+                        cols,
+                        &mut decoded_compact,
+                    );
+                }
+                _ => panic!("q4tp/q2tp encoder returned {dtype:?}"),
+            }
+            for (destination_row, &source_row) in selected.iter().enumerate() {
+                assert_eq!(
+                    &decoded_compact[destination_row * cols..(destination_row + 1) * cols],
+                    &decoded_source[source_row * cols..(source_row + 1) * cols],
+                    "{dtype:?} selected row {source_row} changed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn q4tp_and_q2tp_down_column_selection_matches_full_dequant() {
+        let (rows, cols) = (5usize, 64usize);
+        let values = (0..rows * cols)
+            .map(|index| ((index * 29 % 113) as f32 - 56.0) / 37.0)
+            .collect::<Vec<_>>();
+        // A non-monotonic order is the actual compaction case: channel score
+        // rank, rather than source position, determines output columns.
+        let selected = [63usize, 2, 32, 31, 1, 47];
+        for quant in [Quant::Q4TiledP, Quant::Q2TiledP] {
+            let (dtype, source) = quantize_2d(quant, &values, rows, cols);
+            let direct = compact_encoded_tiled_columns(dtype, &source, rows, cols, &selected)
+                .unwrap()
+                .expect("tiled codec must decode selected columns directly");
+            let mut full = vec![0.0f32; rows * cols];
+            match dtype {
+                TensorDtype::Q4TiledP => {
+                    cortiq_core::quant::dequant_q4tp(&source, rows, cols, &mut full)
+                }
+                TensorDtype::Q2TiledP => {
+                    cortiq_core::quant::dequant_q2tp(&source, rows, cols, &mut full)
+                }
+                _ => panic!("q4tp/q2tp encoder returned {dtype:?}"),
+            }
+            assert_eq!(
+                direct,
+                compact_down_columns(&full, rows, cols, &selected),
+                "{dtype:?} direct selected-column decode changed a down_proj value"
+            );
+        }
+    }
+
+    #[test]
+    fn f16_and_q8_mtp_selection_preserves_encoded_values_exactly() {
+        // Unlike tiled low-bit payloads, these codecs retain independent
+        // scalar/scale fields after an arbitrary input-column reorder.  The
+        // direct path must therefore preserve the original decoded values,
+        // not merely produce a close re-quantization.
+        let (rows, cols) = (5usize, 37usize);
+        let values = (0..rows * cols)
+            .map(|index| ((index * 43 % 173) as f32 - 86.0) / 53.0)
+            .collect::<Vec<_>>();
+        let selected_rows = [4usize, 1, 3];
+        let selected_columns = [36usize, 2, 0, 19, 7];
+        for quant in [Quant::F16, Quant::Q8Row, Quant::Q8_2f] {
+            let (dtype, source) = quantize_2d(quant, &values, rows, cols);
+            let selected_row_bytes =
+                compact_encoded_basic_rows(dtype, &source, rows, cols, &selected_rows)
+                    .unwrap()
+                    .expect("basic codec must use direct row selection");
+            let selected_column_bytes =
+                compact_encoded_basic_columns(dtype, &source, rows, cols, &selected_columns)
+                    .unwrap()
+                    .expect("basic codec must use direct column selection");
+            assert!(
+                cortiq_core::quant::validate_payload(
+                    dtype,
+                    &[selected_rows.len(), cols],
+                    &selected_row_bytes,
+                )
+                .is_ok(),
+                "{dtype:?} selected rows are not a valid payload"
+            );
+            assert!(
+                cortiq_core::quant::validate_payload(
+                    dtype,
+                    &[rows, selected_columns.len()],
+                    &selected_column_bytes,
+                )
+                .is_ok(),
+                "{dtype:?} selected columns are not a valid payload"
+            );
+            let decoded_source = dequant_compact_basic_matrix(dtype, &source, rows, cols).unwrap();
+            let decoded_rows = dequant_compact_basic_matrix(
+                dtype,
+                &selected_row_bytes,
+                selected_rows.len(),
+                cols,
+            )
+            .unwrap();
+            let decoded_columns = dequant_compact_basic_matrix(
+                dtype,
+                &selected_column_bytes,
+                rows,
+                selected_columns.len(),
+            )
+            .unwrap();
+            assert_eq!(
+                decoded_rows,
+                compact_rows(&decoded_source, &selected_rows, rows, cols),
+                "{dtype:?} direct selected rows changed decoded values"
+            );
+            assert_eq!(
+                decoded_columns,
+                compact_down_columns(&decoded_source, rows, cols, &selected_columns),
+                "{dtype:?} direct selected columns changed decoded values"
+            );
+        }
+    }
+
+    #[test]
+    fn mtp_only_bake_uses_lossless_tiled_gate_up_and_selected_down_decode() {
+        // Exercise the actual MTP-only stream writer, not only the helper:
+        // q4tp/q2tp gate/up must retain selected source rows byte-for-byte,
+        // and down must be equivalent to selecting those source columns
+        // before its one necessary output re-quantization.
+        let dir = tempfile::tempdir().unwrap();
+        let (hidden, source_width) = (32usize, 64usize);
+        let order = vec![
+            63usize, 2, 32, 31, 1, 47, 8, 59, 17, 40, 4, 55, 23, 36, 9, 60, 14, 42, 6, 52,
+            27, 34, 12, 57, 19, 45, 3, 62, 24, 38, 11, 50,
+        ];
+        let values = |salt: usize, rows: usize, cols: usize| {
+            (0..rows * cols)
+                .map(|index| ((index * 31 + salt * 19) % 127) as f32 / 41.0 - 1.5)
+                .collect::<Vec<_>>()
+        };
+        for (suffix, quant) in [("q4tp", Quant::Q4TiledP), ("q2tp", Quant::Q2TiledP)] {
+            let source_path = dir.path().join(format!("source-{suffix}.cmf"));
+            let plan_path = dir.path().join(format!("plan-{suffix}.json"));
+            let output_path = dir.path().join(format!("output-{suffix}.cmf"));
+            let gate = values(1, source_width, hidden);
+            let up = values(2, source_width, hidden);
+            let down = values(3, hidden, source_width);
+            let (gate_dtype, gate_data) = quantize_2d(quant, &gate, source_width, hidden);
+            let (up_dtype, up_data) = quantize_2d(quant, &up, source_width, hidden);
+            let (down_dtype, down_data) = quantize_2d(quant, &down, hidden, source_width);
+            let mut header = sidecar_header();
+            header.arch.hidden_size = hidden;
+            header.arch.intermediate_size = hidden;
+            header.arch.num_attention_heads = 1;
+            header.arch.num_kv_heads = 1;
+            header.arch.head_dim = hidden;
+            header.arch.v_head_dim = Some(hidden);
+            header
+                .arch
+                .mtp
+                .as_mut()
+                .expect("sidecar header has MTP")
+                .ffn_intermediate_sizes = Some(vec![source_width]);
+            let prefix = "model.mtp.layers.0.mlp.";
+            CmfModel::write(
+                &source_path,
+                &header,
+                &[
+                    TensorSpec {
+                        name: format!("{prefix}gate_proj.weight"),
+                        dtype: gate_dtype,
+                        shape: vec![source_width, hidden],
+                        data: gate_data,
+                    },
+                    TensorSpec {
+                        name: format!("{prefix}up_proj.weight"),
+                        dtype: up_dtype,
+                        shape: vec![source_width, hidden],
+                        data: up_data,
+                    },
+                    TensorSpec {
+                        name: format!("{prefix}down_proj.weight"),
+                        dtype: down_dtype,
+                        shape: vec![hidden, source_width],
+                        data: down_data,
+                    },
+                ],
+                None,
+                None,
+            )
+            .unwrap();
+            let source = CmfModel::open(&source_path).unwrap();
+            assert!(
+                preflight_mtp_compact_source(&source).is_ok(),
+                "{suffix} must be accepted before expensive calibration"
+            );
+            std::fs::write(
+                &plan_path,
+                serde_json::to_vec(&json!({
+                    "format": "cmf-mtp-ffn-plan",
+                    "version": 2,
+                    "trunk": {"mode": "preserve"},
+                    "mtp": {"mode": "compact", "layers": [{"order": order, "widths": [32]}]},
+                    "selection": {
+                        "source_draft_directory_hash": format!("{:016x}", source.dir_hash())
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let expected_gate = compact_encoded_tiled_rows(
+                gate_dtype,
+                source
+                    .tensor_bytes(&format!("{prefix}gate_proj.weight"))
+                    .unwrap(),
+                source_width,
+                hidden,
+                &order,
+            )
+            .unwrap()
+            .unwrap();
+            let expected_up = compact_encoded_tiled_rows(
+                up_dtype,
+                source
+                    .tensor_bytes(&format!("{prefix}up_proj.weight"))
+                    .unwrap(),
+                source_width,
+                hidden,
+                &order,
+            )
+            .unwrap()
+            .unwrap();
+            let expected_down = compact_encoded_tiled_columns(
+                down_dtype,
+                source
+                    .tensor_bytes(&format!("{prefix}down_proj.weight"))
+                    .unwrap(),
+                hidden,
+                source_width,
+                &order,
+            )
+            .unwrap()
+            .unwrap();
+            let (expected_down_dtype, expected_down_data) =
+                quantize_2d(quant, &expected_down, hidden, order.len());
+
+            cmd_tube_bake(
+                source_path.to_str().unwrap(),
+                plan_path.to_str().unwrap(),
+                output_path.to_str().unwrap(),
+            )
+            .unwrap();
+            let output = CmfModel::open(&output_path).unwrap();
+            assert!(output.verify().is_empty(), "{suffix}: {:?}", output.verify());
+            assert_eq!(
+                output
+                    .tensor_bytes(&format!("{prefix}gate_proj.weight"))
+                    .unwrap(),
+                expected_gate,
+                "{suffix} gate lost encoded source rows"
+            );
+            assert_eq!(
+                output
+                    .tensor_bytes(&format!("{prefix}up_proj.weight"))
+                    .unwrap(),
+                expected_up,
+                "{suffix} up lost encoded source rows"
+            );
+            assert_eq!(
+                output
+                    .tensor(&format!("{prefix}down_proj.weight"))
+                    .unwrap()
+                    .dtype,
+                expected_down_dtype
+            );
+            assert_eq!(
+                output
+                    .tensor_bytes(&format!("{prefix}down_proj.weight"))
+                    .unwrap(),
+                expected_down_data,
+                "{suffix} down did not encode direct selected-column values"
+            );
+        }
+    }
+
+    #[test]
+    fn f32_and_bf16_mtp_selection_preserves_encoded_values_exactly() {
+        // Raw scalar codecs have no scale plane at all. Their selected
+        // payload must therefore be literal byte-for-byte gathers, while the
+        // bfloat decode check also catches an accidental f16 fallback.
+        let (rows, cols) = (5usize, 37usize);
+        let values = (0..rows * cols)
+            .map(|index| ((index * 43 % 173) as f32 - 86.0) / 53.0)
+            .collect::<Vec<_>>();
+        let selected_rows = [4usize, 1, 3];
+        let selected_columns = [36usize, 2, 0, 19, 7];
+        for dtype in [TensorDtype::F32, TensorDtype::Bf16] {
+            let (_, source) = encode_compact_mtp_matrix(dtype, &values, rows, cols).unwrap();
+            let selected_row_bytes =
+                compact_encoded_basic_rows(dtype, &source, rows, cols, &selected_rows)
+                    .unwrap()
+                    .expect("raw codec must use direct row selection");
+            let selected_column_bytes =
+                compact_encoded_basic_columns(dtype, &source, rows, cols, &selected_columns)
+                    .unwrap()
+                    .expect("raw codec must use direct column selection");
+            assert!(
+                cortiq_core::quant::validate_payload(
+                    dtype,
+                    &[selected_rows.len(), cols],
+                    &selected_row_bytes,
+                )
+                .is_ok(),
+                "{dtype:?} selected rows are not a valid payload"
+            );
+            assert!(
+                cortiq_core::quant::validate_payload(
+                    dtype,
+                    &[rows, selected_columns.len()],
+                    &selected_column_bytes,
+                )
+                .is_ok(),
+                "{dtype:?} selected columns are not a valid payload"
+            );
+            let decoded_source = dequant_compact_basic_matrix(dtype, &source, rows, cols).unwrap();
+            let decoded_rows = dequant_compact_basic_matrix(
+                dtype,
+                &selected_row_bytes,
+                selected_rows.len(),
+                cols,
+            )
+            .unwrap();
+            let decoded_columns = dequant_compact_basic_matrix(
+                dtype,
+                &selected_column_bytes,
+                rows,
+                selected_columns.len(),
+            )
+            .unwrap();
+            assert_eq!(
+                decoded_rows,
+                compact_rows(&decoded_source, &selected_rows, rows, cols),
+                "{dtype:?} selected rows changed values"
+            );
+            assert_eq!(
+                decoded_columns,
+                compact_down_columns(&decoded_source, rows, cols, &selected_columns),
+                "{dtype:?} selected columns changed values"
+            );
+        }
+    }
+
+    #[test]
+    fn rebuilt_bf16_transpose_uses_nearest_even_rounding() {
+        // Exact halfway cases cover the only nontrivial part of rebuilding a
+        // bf16 `down_proj.t`: the lower retained bit decides which neighbor
+        // wins. This also prevents an accidental f16 encoder fallback.
+        assert_eq!(f32_to_bf16(f32::from_bits(0x3f80_8000)), 0x3f80);
+        assert_eq!(f32_to_bf16(f32::from_bits(0x3f81_8000)), 0x3f82);
+        let (dtype, bytes) = encode_compact_mtp_matrix(
+            TensorDtype::Bf16,
+            &[f32::from_bits(0x3f80_8000), f32::from_bits(0x3f81_8000)],
+            1,
+            2,
+        )
+        .unwrap();
+        assert_eq!(dtype, TensorDtype::Bf16);
+        assert_eq!(bytes, vec![0x80, 0x3f, 0x82, 0x3f]);
+    }
+
+    #[test]
+    fn mtp_only_bake_keeps_raw_f16_and_q8_selected_values_exact() {
+        // Exercise the streaming writer's exact-code branch, including the
+        // optional transpose cache. The output down matrix must retain the
+        // selected source raw/f16/q8 values exactly; only down_proj.t is
+        // rebuilt from that compact matrix.
+        let dir = tempfile::tempdir().unwrap();
+        let (hidden, source_width) = (32usize, 64usize);
+        let order = vec![
+            63usize, 2, 32, 31, 1, 47, 8, 59, 17, 40, 4, 55, 23, 36, 9, 60, 14, 42, 6, 52,
+            27, 34, 12, 57, 19, 45, 3, 62, 24, 38, 11, 50,
+        ];
+        let values = |salt: usize, rows: usize, cols: usize| {
+            (0..rows * cols)
+                .map(|index| ((index * 31 + salt * 19) % 127) as f32 / 41.0 - 1.5)
+                .collect::<Vec<_>>()
+        };
+        for (suffix, dtype) in [
+            ("f32", TensorDtype::F32),
+            ("bf16", TensorDtype::Bf16),
+            ("f16", TensorDtype::F16),
+            ("q8", TensorDtype::Q8Row),
+            ("q8_2f", TensorDtype::Q8_2f),
+        ] {
+            let source_path = dir.path().join(format!("basic-source-{suffix}.cmf"));
+            let plan_path = dir.path().join(format!("basic-plan-{suffix}.json"));
+            let output_path = dir.path().join(format!("basic-output-{suffix}.cmf"));
+            let gate = values(1, source_width, hidden);
+            let up = values(2, source_width, hidden);
+            let down = values(3, hidden, source_width);
+            let down_t = transpose(&down, hidden, source_width);
+            let (gate_dtype, gate_data) =
+                encode_compact_mtp_matrix(dtype, &gate, source_width, hidden).unwrap();
+            let (up_dtype, up_data) =
+                encode_compact_mtp_matrix(dtype, &up, source_width, hidden).unwrap();
+            let (down_dtype, down_data) =
+                encode_compact_mtp_matrix(dtype, &down, hidden, source_width).unwrap();
+            let (down_t_dtype, down_t_data) =
+                encode_compact_mtp_matrix(dtype, &down_t, source_width, hidden).unwrap();
+            let mut header = sidecar_header();
+            header.arch.hidden_size = hidden;
+            header.arch.intermediate_size = hidden;
+            header.arch.num_attention_heads = 1;
+            header.arch.num_kv_heads = 1;
+            header.arch.head_dim = hidden;
+            header.arch.v_head_dim = Some(hidden);
+            header
+                .arch
+                .mtp
+                .as_mut()
+                .expect("sidecar header has MTP")
+                .ffn_intermediate_sizes = Some(vec![source_width]);
+            let prefix = "model.mtp.layers.0.mlp.";
+            CmfModel::write(
+                &source_path,
+                &header,
+                &[
+                    TensorSpec {
+                        name: format!("{prefix}gate_proj.weight"),
+                        dtype: gate_dtype,
+                        shape: vec![source_width, hidden],
+                        data: gate_data,
+                    },
+                    TensorSpec {
+                        name: format!("{prefix}up_proj.weight"),
+                        dtype: up_dtype,
+                        shape: vec![source_width, hidden],
+                        data: up_data,
+                    },
+                    TensorSpec {
+                        name: format!("{prefix}down_proj.weight"),
+                        dtype: down_dtype,
+                        shape: vec![hidden, source_width],
+                        data: down_data,
+                    },
+                    TensorSpec {
+                        name: format!("{prefix}down_proj.t.weight"),
+                        dtype: down_t_dtype,
+                        shape: vec![source_width, hidden],
+                        data: down_t_data,
+                    },
+                ],
+                None,
+                None,
+            )
+            .unwrap();
+            let source = CmfModel::open(&source_path).unwrap();
+            std::fs::write(
+                &plan_path,
+                serde_json::to_vec(&json!({
+                    "format": "cmf-mtp-ffn-plan",
+                    "version": 2,
+                    "trunk": {"mode": "preserve"},
+                    "mtp": {"mode": "compact", "layers": [{"order": order, "widths": [32]}]},
+                    "selection": {
+                        "source_draft_directory_hash": format!("{:016x}", source.dir_hash())
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let expected_gate = compact_encoded_basic_rows(
+                gate_dtype,
+                source
+                    .tensor_bytes(&format!("{prefix}gate_proj.weight"))
+                    .unwrap(),
+                source_width,
+                hidden,
+                &order,
+            )
+            .unwrap()
+            .unwrap();
+            let expected_up = compact_encoded_basic_rows(
+                up_dtype,
+                source
+                    .tensor_bytes(&format!("{prefix}up_proj.weight"))
+                    .unwrap(),
+                source_width,
+                hidden,
+                &order,
+            )
+            .unwrap()
+            .unwrap();
+            let expected_down = compact_encoded_basic_columns(
+                down_dtype,
+                source
+                    .tensor_bytes(&format!("{prefix}down_proj.weight"))
+                    .unwrap(),
+                hidden,
+                source_width,
+                &order,
+            )
+            .unwrap()
+            .unwrap();
+            let expected_down_values =
+                dequant_compact_basic_matrix(down_dtype, &expected_down, hidden, order.len())
+                    .unwrap();
+            let (expected_down_t_dtype, expected_down_t) = encode_compact_mtp_matrix(
+                down_t_dtype,
+                &transpose(&expected_down_values, hidden, order.len()),
+                order.len(),
+                hidden,
+            )
+            .unwrap();
+
+            // The ordinary tube-bake route uses the older collecting writer
+            // rather than the private streaming route. Exercise its shared
+            // exact raw path too, so F32/BF16 cannot regress behind the
+            // MTP-only fast path.
+            let mut collected = Vec::new();
+            append_compacted_mtp_layer(
+                &source,
+                0,
+                &LayerPlan {
+                    order: order.clone(),
+                    widths: vec![order.len()],
+                },
+                source_width,
+                true,
+                hidden,
+                &mut collected,
+            )
+            .unwrap();
+            for (name, expected_dtype, expected) in [
+                (format!("{prefix}gate_proj.weight"), gate_dtype, &expected_gate),
+                (format!("{prefix}up_proj.weight"), up_dtype, &expected_up),
+                (format!("{prefix}down_proj.weight"), down_dtype, &expected_down),
+                (
+                    format!("{prefix}down_proj.t.weight"),
+                    expected_down_t_dtype,
+                    &expected_down_t,
+                ),
+            ] {
+                let actual = collected
+                    .iter()
+                    .find(|tensor| tensor.name == name)
+                    .expect("collecting MTP bake emitted every projection");
+                assert_eq!(actual.dtype, expected_dtype, "{suffix} {name} dtype");
+                assert_eq!(&actual.data, expected, "{suffix} {name} collecting bake");
+            }
+
+            cmd_tube_bake(
+                source_path.to_str().unwrap(),
+                plan_path.to_str().unwrap(),
+                output_path.to_str().unwrap(),
+            )
+            .unwrap();
+            let output = CmfModel::open(&output_path).unwrap();
+            assert!(output.verify().is_empty(), "{suffix}: {:?}", output.verify());
+            for (name, expected) in [
+                (format!("{prefix}gate_proj.weight"), expected_gate),
+                (format!("{prefix}up_proj.weight"), expected_up),
+                (format!("{prefix}down_proj.weight"), expected_down),
+            ] {
+                assert_eq!(
+                    output.tensor_bytes(&name).unwrap(),
+                    expected,
+                    "{suffix} {name} did not retain exact selected encoded values"
+                );
+            }
+            let down_t_entry = output
+                .tensor(&format!("{prefix}down_proj.t.weight"))
+                .unwrap();
+            assert_eq!(down_t_entry.dtype, expected_down_t_dtype, "{suffix} down_t dtype");
+            assert_eq!(
+                output
+                    .tensor_bytes(&format!("{prefix}down_proj.t.weight"))
+                    .unwrap(),
+                expected_down_t,
+                "{suffix} down_t was not rebuilt from exact compact down"
+            );
+        }
+    }
+
+    #[test]
     fn mtp_only_bake_rewrites_dense_ffn_and_preserves_draft_projection_and_norm() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source.mtp.cmf");
@@ -1394,6 +3079,18 @@ mod mtp_plan_tests {
             )
             .is_err()
         );
+        let bad_trunk = validate_mtp_compact_source(
+            &serde_json::json!({
+                "selection": {
+                    "source_draft_directory_hash": format!("{:016x}", source_model.dir_hash()),
+                    "source_draft_trunk_hash": "0000000000000000"
+                }
+            }),
+            &source_model,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(bad_trunk.contains("trunk hash"), "{bad_trunk}");
         std::fs::write(
             &plan,
             serde_json::to_vec(&serde_json::json!({
@@ -1553,9 +3250,84 @@ mod mtp_plan_tests {
         let speculative = speculative
             .generate_from_ids(&[1, 2, 3, 4], 8, None, None)
             .unwrap();
-        assert!(speculative.mtp_drafted > 0, "MTP draft did not run");
         assert!(speculative.mtp_accepted <= speculative.mtp_drafted);
         assert_eq!(plain.token_ids, speculative.token_ids);
+    }
+
+    #[test]
+    fn sharded_mtp_bake_coalesces_a_runnable_unsharded_candidate() {
+        use cortiq_core::format::ShardInfo;
+
+        let dir = tempfile::tempdir().unwrap();
+        let shard1 = dir.path().join("source-00001-of-00002.cmf");
+        let shard2 = dir.path().join("source-00002-of-00002.cmf");
+        let plan = dir.path().join("plan.json");
+        let copied = dir.path().join("copied.cmf");
+        let output = dir.path().join("compact.cmf");
+        let tensors = canonical_mtp_tensors();
+        let split = tensors.len() / 2;
+        let mut header1 = canonical_mtp_header();
+        header1.shard = Some(ShardInfo { no: 1, count: 2 });
+        let mut header2 = canonical_mtp_header();
+        header2.shard = Some(ShardInfo { no: 2, count: 2 });
+        CmfModel::write(&shard1, &header1, &tensors[..split], None, None).unwrap();
+        CmfModel::write(&shard2, &header2, &tensors[split..], None, None).unwrap();
+
+        let source = CmfModel::open_sharded(&shard1).unwrap();
+        assert!(source.verify().is_empty(), "{:?}", source.verify());
+        // This is the path used by a sharded MiMo backbone before its
+        // separately compacted sidecar is admitted and published.
+        stream_copy_as_unsharded(&source, &copied).unwrap();
+        let copied_model = CmfModel::open(&copied).unwrap();
+        assert!(copied_model.header.shard.is_none());
+        assert!(copied_model.verify().is_empty(), "{:?}", copied_model.verify());
+        assert_eq!(
+            copied_model
+                .tensor_bytes("model.layers.0.mlp.gate_proj.weight")
+                .unwrap(),
+            source
+                .tensor_bytes("model.layers.0.mlp.gate_proj.weight")
+                .unwrap()
+        );
+        std::fs::write(
+            &plan,
+            serde_json::to_vec(&serde_json::json!({
+                "format": "cmf-mtp-ffn-plan",
+                "version": 2,
+                "trunk": {"mode": "preserve"},
+                "mtp": {
+                    "mode": "compact",
+                    "layers": [{"order": [3, 1], "widths": [2]}]
+                },
+                "selection": {
+                    "source_draft_directory_hash": format!("{:016x}", source.dir_hash()),
+                    "source_draft_trunk_hash": format!("{:016x}", source.trunk_hash())
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        cmd_tube_bake(
+            shard1.to_str().unwrap(),
+            plan.to_str().unwrap(),
+            output.to_str().unwrap(),
+        )
+        .unwrap();
+
+        let candidate = Arc::new(CmfModel::open(&output).unwrap());
+        assert!(candidate.header.shard.is_none());
+        assert!(candidate.verify().is_empty(), "{:?}", candidate.verify());
+        assert_eq!(
+            candidate
+                .arch()
+                .mtp
+                .as_ref()
+                .and_then(|config| config.ffn_intermediate_sizes.as_deref()),
+            Some(&[2][..])
+        );
+        let mut pipeline = Pipeline::from_model(&candidate, SamplerConfig::default()).unwrap();
+        assert_eq!(pipeline.probe_mtp_ffn(&[1, 2, 3, 4]).unwrap()[0].mass.len(), 2);
     }
 }
 

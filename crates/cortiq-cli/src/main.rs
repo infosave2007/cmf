@@ -721,19 +721,74 @@ enum Commands {
         #[arg(long)]
         max_tokens_per_chunk: Option<usize>,
     },
-    /// Rewrite a container tightly: reclaim dead directory/header tails
-    /// left by append-only skill growth (spec §9). Streams from mmap.
+    /// Rewrite a container tightly, or calibrate/compact an existing MTP
+    /// draft from a prompt set:
+    ///
+    /// `cortiq compact SOURCE.cmf PROMPTS.jsonl OUTPUT.cmf`
+    ///
+    /// The three-argument form uses SOURCE as its own teacher, creates or
+    /// reuses the adjacent `OUTPUT.tdata` calibration cache, compacts only
+    /// the MTP draft, and verifies the new runnable CMF. The trunk weights
+    /// stay identical; the speculative verifier remains authoritative for
+    /// emitted tokens. This is calibration/physical draft compaction, not
+    /// generic task fine-tuning. The legacy
+    /// `cortiq compact SOURCE.cmf --output OUTPUT.cmf` form only rewrites
+    /// container layout (it does not train or compact a draft).
     Compact {
         /// Source .cmf model
         model: String,
-        /// Output .cmf path
+        /// JSONL prompt set for the simple MTP-draft calibration form
+        #[arg(value_name = "PROMPTS.jsonl")]
+        prompts: Option<String>,
+        /// New runnable .cmf with a compacted MTP draft in the simple form
+        #[arg(value_name = "OUTPUT.cmf")]
+        task_output: Option<String>,
+        /// Output .cmf path for the legacy container-only rewrite form
         #[arg(long)]
-        output: String,
+        output: Option<String>,
         /// Lay out payloads in decode traversal order (including contiguous
-        /// gate/up/down weights per MoE expert). The default preserves the
+        /// gate/up/down weights per MoE expert). This applies only to the
+        /// legacy `--output` container rewrite; the default preserves the
         /// source directory order.
         #[arg(long)]
         execution_order: bool,
+        /// Simple MTP form: fraction of each draft FFN width to retain
+        /// (default: 0.90; groups are aligned to 32 channels)
+        #[arg(long)]
+        keep_ratio: Option<f64>,
+        /// Simple MTP form: maximum direct-answer tokens the source teacher
+        /// generates per prompt (default: 8192)
+        #[arg(long)]
+        max_tokens: Option<usize>,
+        /// Simple MTP form: deterministic teacher responses per prompt
+        /// (default: 1)
+        #[arg(long)]
+        samples: Option<u32>,
+        /// Simple MTP form: seed for teacher generation and prompt split
+        /// (default: 42)
+        #[arg(long)]
+        seed: Option<u64>,
+        /// Simple MTP form: train/validation/test split (default: 90/5/5)
+        #[arg(long)]
+        split: Option<String>,
+        /// Simple MTP form: use only the first N accepted prompt rows
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Simple MTP form: cap train records consumed by MTP compaction
+        /// after the data integrity scan (0 = all)
+        #[arg(long)]
+        max_records: Option<usize>,
+        /// Simple MTP form: cap one fresh-causal MTP calibration chunk
+        /// (default: 4096 tokens)
+        #[arg(long)]
+        max_record_tokens: Option<usize>,
+        /// Simple MTP form: retain teacher records that reach --max-tokens
+        #[arg(long)]
+        keep_truncated: bool,
+        /// Simple MTP form: use a plain-greedy source teacher instead of its
+        /// MTP/speculative path while making the reusable data cache
+        #[arg(long)]
+        disable_mtp: bool,
     },
     /// Recode an existing .cmf into a denser layout without the original
     /// checkpoint. `--quant q4tp` re-expresses q4_tiled/q4_block per-tile
@@ -803,15 +858,27 @@ enum Commands {
     },
     /// Calibrate and physically compact a dense MTP draft FFN without
     /// rewriting the trunk. Statistics are teacher-forced through the
-    /// actual draft stack; the output is a main CMF or, for a MiMo sidecar,
-    /// a replacement `.mtp.cmf` placed beside its unchanged main file.
+    /// actual draft stack; `--output` is always a new runnable main CMF.
+    /// For a MiMo sidecar the matching `.mtp.cmf` is created beside it.
     MtpCompact {
         /// Source main .cmf (the MTP sidecar is discovered automatically)
         model: String,
-        /// Finalized .tdata selector, for example calibration.tdata:train
+        /// Calibration .tdata selector, for example calibration.tdata:train=0.5.
+        /// If its directory does not exist, --teacher and --prompts generate
+        /// it once before physical compaction starts.
         #[arg(long)]
         data: String,
-        /// Output .cmf (a compact main file or compact .mtp.cmf sidecar)
+        /// CMF teacher used only to create a missing --data directory. It may
+        /// be the same file as MODEL, but must use compatible token ids.
+        #[arg(long, requires = "prompts")]
+        teacher: Option<String>,
+        /// JSONL prompt source used only to create a missing --data directory.
+        #[arg(long, requires = "teacher")]
+        prompts: Option<String>,
+        /// Preferred: new runnable main .cmf candidate; a MiMo `.mtp.cmf`
+        /// sidecar is created next to it and the source backbone is
+        /// hard-linked when possible. Compatibility: an explicit `.mtp.cmf`
+        /// path writes only an external MiMo sidecar, not a runnable main.
         #[arg(long)]
         output: String,
         /// Fraction of each draft FFN width to retain; rounded down to 32-wide codec groups
@@ -820,9 +887,46 @@ enum Commands {
         /// Write the auditable v2 MTP plan here (default: <output>.mtp-plan.json)
         #[arg(long)]
         plan_out: Option<String>,
-        /// Cap selected calibration records (0 = all selected records)
+        /// Cap selected calibration records after the full `.tdata` integrity
+        /// preflight (0 = all selected records)
         #[arg(long, default_value_t = 0)]
         max_records: usize,
+        /// Maximum teacher-forced tokens per calibration sequence. Longer
+        /// records are split into contiguous fresh-causal chunks so draft KV
+        /// memory stays bounded (default: 4096).
+        #[arg(long, default_value_t = 4096)]
+        max_record_tokens: usize,
+        /// Maximum direct-answer tokens generated by --teacher for each
+        /// missing-data prompt (the generator records no thinking span).
+        #[arg(long, default_value_t = 8192)]
+        teacher_max_tokens: usize,
+        /// Deterministic direct-answer samples generated per prompt when
+        /// --data is missing.
+        #[arg(long, default_value_t = 1)]
+        teacher_samples: u32,
+        /// Base seed for missing-data teacher generation.
+        #[arg(long, default_value_t = 42)]
+        teacher_seed: u64,
+        /// Optional category-stratified split seed for missing-data generation
+        /// (defaults to --teacher-seed).
+        #[arg(long)]
+        teacher_split_seed: Option<u64>,
+        /// Train/validation/test split for missing-data generation, e.g.
+        /// 90/5/5. Compaction consumes only the train split.
+        #[arg(long, default_value = "90/5/5")]
+        teacher_split: String,
+        /// Retain missing-data records that hit --teacher-max-tokens; they
+        /// remain marked truncated in the reusable dataset.
+        #[arg(long)]
+        teacher_keep_truncated: bool,
+        /// Disable MTP/speculative decode while producing a missing-data
+        /// teacher set; this is a reproducible plain-greedy control.
+        #[arg(long)]
+        teacher_disable_mtp: bool,
+        /// Keep only the first N accepted prompt rows while generating a
+        /// missing-data set.
+        #[arg(long)]
+        teacher_limit: Option<usize>,
     },
     /// Store every dense layer's `down_proj` a second time, transposed,
     /// so per-token neuron selection reads a neuron's down weights as a
@@ -3868,9 +3972,89 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Compact {
             model,
+            prompts,
+            task_output,
             output,
             execution_order,
-        } => moedefrag::cmd_compact(&model, &output, execution_order),
+            keep_ratio,
+            max_tokens,
+            samples,
+            seed,
+            split,
+            limit,
+            max_records,
+            max_record_tokens,
+            keep_truncated,
+            disable_mtp,
+        } => match (prompts, task_output) {
+            (Some(prompts), Some(task_output)) => {
+                if output.is_some() || execution_order {
+                    anyhow::bail!(
+                        "compact: the task form is `compact SOURCE.cmf PROMPTS.jsonl OUTPUT.cmf`; \
+                         --output/--execution-order belong to the legacy container-only form"
+                    );
+                }
+                preflight_mtp_compact_model_input(&model)?;
+                preflight_simple_mtp_compact_output(&task_output)?;
+                let data = simple_mtp_compact_data_path(&task_output);
+                eprintln!(
+                    "compact: prompt-calibrated MTP draft compaction; source is its own teacher, calibration cache: {data}"
+                );
+                cmd_mtp_compact_with_data(
+                    &model,
+                    &data,
+                    Some(&model),
+                    Some(&prompts),
+                    &task_output,
+                    keep_ratio.unwrap_or(0.90),
+                    None,
+                    max_records.unwrap_or(0),
+                    max_record_tokens.unwrap_or(4096),
+                    TeacherDataGenerateOptions {
+                        max_tokens: max_tokens.unwrap_or(8192),
+                        samples: samples.unwrap_or(1),
+                        seed: seed.unwrap_or(42),
+                        split_seed: seed.unwrap_or(42),
+                        split: split.unwrap_or_else(|| "90/5/5".to_string()),
+                        topk: 0,
+                        raw: false,
+                        no_think: true,
+                        keep_truncated,
+                        disable_mtp,
+                        limit,
+                    },
+                )
+            }
+            (None, None) => {
+                if keep_ratio.is_some()
+                    || max_tokens.is_some()
+                    || samples.is_some()
+                    || seed.is_some()
+                    || split.is_some()
+                    || limit.is_some()
+                    || max_records.is_some()
+                    || max_record_tokens.is_some()
+                    || keep_truncated
+                    || disable_mtp
+                {
+                    anyhow::bail!(
+                        "compact: MTP calibration options need `compact SOURCE.cmf PROMPTS.jsonl OUTPUT.cmf`; \
+                         the legacy container-only form accepts only --output/--execution-order"
+                    );
+                }
+                let output = output.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "compact: use either `compact SOURCE.cmf --output OUTPUT.cmf` to rewrite a container, \
+                         or `compact SOURCE.cmf PROMPTS.jsonl OUTPUT.cmf` to make a prompt-calibrated MTP candidate"
+                    )
+                })?;
+                moedefrag::cmd_compact(&model, &output, execution_order)
+            }
+            _ => anyhow::bail!(
+                "compact: the prompt-calibrated form needs both PROMPTS.jsonl and OUTPUT.cmf: \
+                 `compact SOURCE.cmf PROMPTS.jsonl OUTPUT.cmf`"
+            ),
+        },
         Commands::Awnp {
             model,
             acts,
@@ -3908,17 +4092,44 @@ async fn main() -> anyhow::Result<()> {
         Commands::MtpCompact {
             model,
             data,
+            teacher,
+            prompts,
             output,
             keep_ratio,
             plan_out,
             max_records,
-        } => mtpcompact::cmd_mtp_compact(
+            max_record_tokens,
+            teacher_max_tokens,
+            teacher_samples,
+            teacher_seed,
+            teacher_split_seed,
+            teacher_split,
+            teacher_keep_truncated,
+            teacher_disable_mtp,
+            teacher_limit,
+        } => cmd_mtp_compact_with_data(
             &model,
             &data,
+            teacher.as_deref(),
+            prompts.as_deref(),
             &output,
             keep_ratio,
             plan_out.as_deref(),
             max_records,
+            max_record_tokens,
+            TeacherDataGenerateOptions {
+                max_tokens: teacher_max_tokens,
+                samples: teacher_samples,
+                seed: teacher_seed,
+                split_seed: teacher_split_seed.unwrap_or(teacher_seed),
+                split: teacher_split,
+                topk: 0,
+                raw: false,
+                no_think: true,
+                keep_truncated: teacher_keep_truncated,
+                disable_mtp: teacher_disable_mtp,
+                limit: teacher_limit,
+            },
         ),
         Commands::FfnTranspose { model, output } => tube::cmd_ffn_transpose(&model, &output),
         Commands::MoeMask {
@@ -5700,6 +5911,242 @@ struct TeacherDataGenerateOptions {
     keep_truncated: bool,
     disable_mtp: bool,
     limit: Option<usize>,
+}
+
+/// Resolve the two inputs needed to materialize a calibration set.  This is
+/// deliberately a small pure gate: callers decide whether the `.tdata` root
+/// already exists before opening a model or creating any output.
+fn mtp_compact_generation_inputs<'a>(
+    data: &str,
+    teacher: Option<&'a str>,
+    prompts: Option<&'a str>,
+) -> anyhow::Result<(&'a str, &'a str)> {
+    let teacher = teacher.ok_or_else(|| {
+        anyhow::anyhow!(
+            "mtp-compact: calibration data {data:?} does not exist; supply both --teacher and --prompts to generate it"
+        )
+    })?;
+    let prompts = prompts.ok_or_else(|| {
+        anyhow::anyhow!(
+            "mtp-compact: calibration data {data:?} does not exist; supply both --teacher and --prompts to generate it"
+        )
+    })?;
+    Ok((teacher, prompts))
+}
+
+/// The simple `compact SOURCE PROMPTS OUTPUT` form owns a visible reusable
+/// cache beside its candidate. Replacing the final extension avoids an
+/// ambiguous hidden directory while keeping multiple task outputs isolated.
+fn simple_mtp_compact_data_path(output: &str) -> String {
+    std::path::Path::new(output)
+        .with_extension("tdata")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Refuse a malformed final candidate name before an auto-generated teacher
+/// data run can consume hours on a rented GPU.  The physical compactor repeats
+/// its stronger collision/topology preflight after MTP discovery; this cheap
+/// syntax fence applies equally to reused and missing `.tdata` inputs.
+fn preflight_mtp_compact_output_suffix(output: &str) -> anyhow::Result<()> {
+    let path = std::path::Path::new(output);
+    anyhow::ensure!(
+        path.extension().and_then(|extension| extension.to_str()) == Some("cmf"),
+        "mtp-compact: --output must name a new .cmf candidate"
+    );
+    Ok(())
+}
+
+/// The model argument is always the runnable main CMF. Rejecting an MTP
+/// sidecar here avoids generating a self-teacher dataset for an input the
+/// physical compactor must later refuse for lacking its backbone.
+fn preflight_mtp_compact_model_input(model: &str) -> anyhow::Result<()> {
+    let path = std::path::Path::new(model);
+    anyhow::ensure!(
+        cortiq_core::mtp_sidecar_path(path) != path,
+        "mtp-compact: MODEL must name the main .cmf, not an .mtp.cmf sidecar; pass its companion main CMF"
+    );
+    Ok(())
+}
+
+/// The short task form must always publish a runnable main CMF.  The extended
+/// `mtp-compact` command retains the external-MiMo `.mtp.cmf` sidecar-only
+/// compatibility spelling, which is why this is deliberately a separate
+/// policy gate from the shared suffix check.
+fn preflight_simple_mtp_compact_output(output: &str) -> anyhow::Result<()> {
+    preflight_mtp_compact_output_suffix(output)?;
+    let path = std::path::Path::new(output);
+    if cortiq_core::mtp_sidecar_path(path) == path {
+        anyhow::bail!(
+            "compact: OUTPUT.cmf must name a runnable main CMF, not an .mtp.cmf sidecar; \
+             use `mtp-compact` explicitly only when preserving a legacy MiMo sidecar-only workflow"
+        );
+    }
+    Ok(())
+}
+
+/// A generated `.tdata` carries exact tokenizer byte/configuration hashes.
+/// Check those inexpensive metadata contracts before spending a potentially
+/// long teacher-generation run only to have MTP compaction reject its output.
+fn ensure_mtp_compact_tokenizer_contracts_match(
+    source_vocab: Option<&[u8]>,
+    source_config: &[u8],
+    teacher_vocab: Option<&[u8]>,
+    teacher_config: &[u8],
+) -> anyhow::Result<()> {
+    let source_vocab = source_vocab.ok_or_else(|| {
+        anyhow::anyhow!(
+            "mtp-compact: source model has no embedded tokenizer bytes; a generated .tdata cannot be bound to it safely"
+        )
+    })?;
+    let teacher_vocab = teacher_vocab.ok_or_else(|| {
+        anyhow::anyhow!(
+            "mtp-compact: teacher model has no embedded tokenizer bytes; cannot generate a reproducible .tdata tokenizer contract"
+        )
+    })?;
+    anyhow::ensure!(
+        knowledge::sha256_hex(source_vocab) == knowledge::sha256_hex(teacher_vocab),
+        "mtp-compact: source and --teacher tokenizer vocabularies differ; refusing to generate calibration token ids that source cannot safely consume"
+    );
+    anyhow::ensure!(
+        knowledge::sha256_hex(source_config) == knowledge::sha256_hex(teacher_config),
+        "mtp-compact: source and --teacher tokenizer configurations differ; refusing to generate calibration token ids that source cannot safely consume"
+    );
+    Ok(())
+}
+
+/// Open only CMF metadata (not an all-tensor integrity scan) to reject an
+/// incompatible teacher/source pair before a long missing-data generation.
+/// The generator and physical compactor retain their full independent
+/// integrity checks afterwards.
+fn preflight_mtp_compact_generation_tokenizers(
+    source_path: &str,
+    teacher_path: &str,
+) -> anyhow::Result<()> {
+    let source = CmfModel::open_sharded(source_path).map_err(|error| {
+        anyhow::anyhow!(
+            "mtp-compact: opening source model {source_path:?} for teacher-data tokenizer preflight: {error}"
+        )
+    })?;
+    let teacher = CmfModel::open_sharded(teacher_path).map_err(|error| {
+        anyhow::anyhow!(
+            "mtp-compact: opening teacher model {teacher_path:?} for tokenizer preflight: {error}"
+        )
+    })?;
+    let source_config = serde_json::to_vec(&source.header.tokenizer_config).map_err(|error| {
+        anyhow::anyhow!(
+            "mtp-compact: serializing source tokenizer metadata for teacher-data preflight: {error}"
+        )
+    })?;
+    let teacher_config = serde_json::to_vec(&teacher.header.tokenizer_config).map_err(|error| {
+        anyhow::anyhow!(
+            "mtp-compact: serializing teacher tokenizer metadata for preflight: {error}"
+        )
+    })?;
+    ensure_mtp_compact_tokenizer_contracts_match(
+        source.vocab.as_deref(),
+        &source_config,
+        teacher.vocab.as_deref(),
+        &teacher_config,
+    )
+}
+
+/// Reuse an immutable finalized `.tdata` set when it is already present, or
+/// materialize it from the requested teacher exactly once before invoking the
+/// physical MTP compactor.  The old `mtp-compact --data` path keeps its
+/// semantics: the only new behavior is the missing-directory branch.
+#[allow(clippy::too_many_arguments)]
+fn cmd_mtp_compact_with_data(
+    model: &str,
+    data: &str,
+    teacher: Option<&str>,
+    prompts: Option<&str>,
+    output: &str,
+    keep_ratio: f64,
+    plan_out: Option<&str>,
+    max_records: usize,
+    max_record_tokens: usize,
+    generation: TeacherDataGenerateOptions,
+) -> anyhow::Result<()> {
+    // Validate the final artifact spelling before any optional teacher-data
+    // generation. A missing `.cmf` suffix must fail in milliseconds rather
+    // than after a costly self-teacher run. The extended command may still
+    // use the `.mtp.cmf` legacy MiMo sidecar-only form; MTP discovery below
+    // decides whether that form is valid for this source.
+    preflight_mtp_compact_model_input(model)?;
+    preflight_mtp_compact_output_suffix(output)?;
+    // Parse selectors even before a directory exists: `calibration.tdata` and
+    // `calibration.tdata:train` identify the same root, while generation must
+    // write the root directory rather than accidentally create a colon-suffix
+    // sibling. The compactor retains ownership of split/share validation.
+    let selector = tdata::TdataSelector::parse(data).map_err(|error| {
+        anyhow::anyhow!("mtp-compact: parsing --data selector {data:?}: {error}")
+    })?;
+    if selector.split != tdata::TdataSplitSelector::Train {
+        anyhow::bail!(
+            "mtp-compact: --data must select the train split; use PATH.tdata[:train][=SHARE]"
+        );
+    }
+    let data_root = selector.root;
+    if data_root.exists() {
+        // Open-only is intentionally cheap. `cmd_mtp_compact` immediately
+        // follows with the full stream/integrity preflight; opening here makes
+        // an incomplete or malformed old job fail before any source-model
+        // scan, and, critically, never overwrites it.
+        tdata::TdataReader::open(&data_root).map_err(|error| {
+            anyhow::anyhow!(
+                "mtp-compact: existing calibration data {} must be finalized and readable: {error}",
+                data_root.display()
+            )
+        })?;
+        if teacher.is_some() || prompts.is_some() {
+            eprintln!(
+                "mtp compact: reusing existing calibration data {}; --teacher/--prompts and teacher-generation options are ignored",
+                data_root.display()
+            );
+        } else {
+            eprintln!(
+                "mtp compact: reusing existing finalized calibration data {}",
+                data_root.display()
+            );
+        }
+    } else {
+        let (teacher, prompts) = mtp_compact_generation_inputs(data, teacher, prompts)?;
+        preflight_mtp_compact_generation_tokenizers(model, teacher)?;
+        let data_root_utf8 = data_root.to_str().ok_or_else(|| {
+            anyhow::anyhow!(
+                "mtp-compact: generated calibration directory {} is not valid UTF-8",
+                data_root.display()
+            )
+        })?;
+        eprintln!(
+            "mtp compact: calibration data {} is absent; generating it once from teacher {} and prompts {}",
+            data_root.display(),
+            teacher,
+            prompts
+        );
+        cmd_teacher_data_generate(teacher, prompts, data_root_utf8, generation)
+            .map_err(|error| anyhow::anyhow!("mtp-compact: generating missing calibration data: {error}"))?;
+        // The writer's `finalize` is the commit point. Reopening prevents a
+        // future generator change from silently flowing a partial directory
+        // into the destructive/expensive compaction phase.
+        tdata::TdataReader::open(&data_root).map_err(|error| {
+            anyhow::anyhow!(
+                "mtp-compact: generated calibration data {} was not finalized/readable: {error}",
+                data_root.display()
+            )
+        })?;
+    }
+
+    mtpcompact::cmd_mtp_compact(
+        model,
+        data,
+        output,
+        keep_ratio,
+        plan_out,
+        max_records,
+        max_record_tokens,
+    )
 }
 
 /// Parse an integer train/validation/test ratio without a floating-point
@@ -11569,6 +12016,270 @@ mod tests {
             Commands::TeacherData {
                 cmd: TeacherDataCmd::Generate { disable_mtp, .. },
             } => assert!(disable_mtp),
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn mtp_compact_missing_data_requires_a_complete_teacher_pair() {
+        assert_eq!(
+            mtp_compact_generation_inputs(
+                "calibration.tdata",
+                Some("teacher.cmf"),
+                Some("prompts.jsonl"),
+            )
+            .unwrap(),
+            ("teacher.cmf", "prompts.jsonl")
+        );
+        for (teacher, prompts) in [
+            (None, None),
+            (Some("teacher.cmf"), None),
+            (None, Some("prompts.jsonl")),
+        ] {
+            let error = mtp_compact_generation_inputs("calibration.tdata", teacher, prompts)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("--teacher") && error.contains("--prompts"), "{error}");
+        }
+    }
+
+    #[test]
+    fn compact_three_argument_form_is_the_simple_mtp_recipe() {
+        let cli = std::thread::Builder::new()
+            .name("compact-simple-mtp-parser".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                Cli::try_parse_from([
+                    "cortiq",
+                    "compact",
+                    "source.cmf",
+                    "prompts.jsonl",
+                    "task-model.cmf",
+                    "--keep-ratio",
+                    "0.75",
+                    "--max-tokens",
+                    "512",
+                    "--samples",
+                    "2",
+                    "--seed",
+                    "99",
+                    "--split",
+                    "100/0/0",
+                    "--limit",
+                    "24",
+                    "--max-records",
+                    "20",
+                    "--max-record-tokens",
+                    "256",
+                    "--keep-truncated",
+                    "--disable-mtp",
+                ])
+                .unwrap()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        match cli.command {
+            Commands::Compact {
+                model,
+                prompts,
+                task_output,
+                output,
+                execution_order,
+                keep_ratio,
+                max_tokens,
+                samples,
+                seed,
+                split,
+                limit,
+                max_records,
+                max_record_tokens,
+                keep_truncated,
+                disable_mtp,
+                ..
+            } => {
+                assert_eq!(model, "source.cmf");
+                assert_eq!(prompts.as_deref(), Some("prompts.jsonl"));
+                assert_eq!(task_output.as_deref(), Some("task-model.cmf"));
+                assert!(output.is_none());
+                assert!(!execution_order);
+                assert_eq!(keep_ratio, Some(0.75));
+                assert_eq!(max_tokens, Some(512));
+                assert_eq!(samples, Some(2));
+                assert_eq!(seed, Some(99));
+                assert_eq!(split.as_deref(), Some("100/0/0"));
+                assert_eq!(limit, Some(24));
+                assert_eq!(max_records, Some(20));
+                assert_eq!(max_record_tokens, Some(256));
+                assert!(keep_truncated);
+                assert!(disable_mtp);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+        assert_eq!(
+            simple_mtp_compact_data_path("task-model.cmf"),
+            "task-model.tdata"
+        );
+        assert_eq!(
+            simple_mtp_compact_data_path("models/task.model.cmf"),
+            "models/task.model.tdata"
+        );
+    }
+
+    #[test]
+    fn prompt_calibrated_mtp_preflight_rejects_bad_paths_before_generation() {
+        preflight_mtp_compact_model_input("source.cmf").unwrap();
+        let sidecar_model = preflight_mtp_compact_model_input("source.mtp.cmf")
+            .unwrap_err()
+            .to_string();
+        assert!(sidecar_model.contains("main .cmf"), "{sidecar_model}");
+
+        preflight_mtp_compact_output_suffix("candidate.cmf").unwrap();
+        // The extended command preserves this external-MiMo compatibility
+        // spelling; source discovery decides its topology later.
+        preflight_mtp_compact_output_suffix("candidate.mtp.cmf").unwrap();
+        let bad_suffix = preflight_mtp_compact_output_suffix("candidate")
+            .unwrap_err()
+            .to_string();
+        assert!(bad_suffix.contains("new .cmf candidate"), "{bad_suffix}");
+
+        preflight_simple_mtp_compact_output("candidate.cmf").unwrap();
+        let simple_sidecar = preflight_simple_mtp_compact_output("candidate.mtp.cmf")
+            .unwrap_err()
+            .to_string();
+        assert!(simple_sidecar.contains("runnable main CMF"), "{simple_sidecar}");
+    }
+
+    #[test]
+    fn compact_legacy_rewrite_form_stays_available() {
+        let cli = std::thread::Builder::new()
+            .name("compact-legacy-parser".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                Cli::try_parse_from([
+                    "cortiq",
+                    "compact",
+                    "source.cmf",
+                    "--output",
+                    "rewritten.cmf",
+                    "--execution-order",
+                ])
+                .unwrap()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        match cli.command {
+            Commands::Compact {
+                prompts,
+                task_output,
+                output,
+                execution_order,
+                ..
+            } => {
+                assert!(prompts.is_none());
+                assert!(task_output.is_none());
+                assert_eq!(output.as_deref(), Some("rewritten.cmf"));
+                assert!(execution_order);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn mtp_compact_missing_data_preflights_exact_tokenizer_contract() {
+        use super::ensure_mtp_compact_tokenizer_contracts_match;
+
+        ensure_mtp_compact_tokenizer_contracts_match(
+            Some(b"shared-tokenizer"),
+            b"shared-config",
+            Some(b"shared-tokenizer"),
+            b"shared-config",
+        )
+        .unwrap();
+        let vocab_error = ensure_mtp_compact_tokenizer_contracts_match(
+            Some(b"source-tokenizer"),
+            b"shared-config",
+            Some(b"teacher-tokenizer"),
+            b"shared-config",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(vocab_error.contains("vocabularies differ"), "{vocab_error}");
+        let config_error = ensure_mtp_compact_tokenizer_contracts_match(
+            Some(b"shared-tokenizer"),
+            b"source-config",
+            Some(b"shared-tokenizer"),
+            b"teacher-config",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            config_error.contains("configurations differ"),
+            "{config_error}"
+        );
+        let missing_error = ensure_mtp_compact_tokenizer_contracts_match(
+            None,
+            b"shared-config",
+            Some(b"shared-tokenizer"),
+            b"shared-config",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(missing_error.contains("source model has no embedded"));
+    }
+
+    #[test]
+    fn mtp_compact_parser_accepts_reusable_teacher_data_recipe() {
+        let cli = std::thread::Builder::new()
+            .name("mtp-compact-auto-parser".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                Cli::try_parse_from([
+                    "cortiq",
+                    "mtp-compact",
+                    "student.cmf",
+                    "--data",
+                    "calibration.tdata",
+                    "--teacher",
+                    "teacher.cmf",
+                    "--prompts",
+                    "prompts.jsonl",
+                    "--output",
+                    "candidate.cmf",
+                    "--teacher-max-tokens",
+                    "384",
+                    "--teacher-samples",
+                    "2",
+                    "--teacher-limit",
+                    "7",
+                ])
+                .unwrap()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        match cli.command {
+            Commands::MtpCompact {
+                model,
+                data,
+                teacher,
+                prompts,
+                output,
+                teacher_max_tokens,
+                teacher_samples,
+                teacher_limit,
+                ..
+            } => {
+                assert_eq!(model, "student.cmf");
+                assert_eq!(data, "calibration.tdata");
+                assert_eq!(teacher.as_deref(), Some("teacher.cmf"));
+                assert_eq!(prompts.as_deref(), Some("prompts.jsonl"));
+                assert_eq!(output, "candidate.cmf");
+                assert_eq!(teacher_max_tokens, 384);
+                assert_eq!(teacher_samples, 2);
+                assert_eq!(teacher_limit, Some(7));
+            }
             _ => panic!("wrong subcommand"),
         }
     }

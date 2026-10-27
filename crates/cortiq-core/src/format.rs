@@ -2004,18 +2004,19 @@ impl CmfStreamWriter {
         align_to(3 * head as u64, DATA_ALIGNMENT).max(1 << 20)
     }
 
-    /// `gap` bytes are reserved for envelope + header + directory.
-    pub fn new(path: impl AsRef<Path>, gap: u64) -> Result<Self, CmfError> {
+    fn create(path: impl AsRef<Path>, gap: u64, no_clobber: bool) -> Result<Self, CmfError> {
         let path = path.as_ref().to_path_buf();
         let data_off = align_to(gap.max(ENVELOPE_LEN as u64 + 1), DATA_ALIGNMENT);
         // Read + write: `finish` reads a few descriptor values back from
         // the payloads already on disk (expert_append records).
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true);
+        if no_clobber {
+            options.create_new(true);
+        } else {
+            options.create(true).truncate(true);
+        }
+        let file = options.open(&path)?;
         let mut file = BufWriter::new(file);
         file.write_all(&zeros(data_off as usize))?;
         Ok(Self {
@@ -2026,6 +2027,21 @@ impl CmfStreamWriter {
             entries: Vec::new(),
             manifest: None,
         })
+    }
+
+    /// `gap` bytes are reserved for envelope + header + directory. Existing
+    /// files are truncated; callers that publish a new artifact must instead
+    /// use [`Self::new_no_clobber`].
+    pub fn new(path: impl AsRef<Path>, gap: u64) -> Result<Self, CmfError> {
+        Self::create(path, gap, false)
+    }
+
+    /// Create a new stream output without ever truncating an existing path.
+    /// This is the safe primitive for private staging names: `create_new`
+    /// closes the reserve/reopen race that exists when a writer only receives
+    /// a path rather than an already-open file descriptor.
+    pub fn new_no_clobber(path: impl AsRef<Path>, gap: u64) -> Result<Self, CmfError> {
+        Self::create(path, gap, true)
     }
 
     /// Append one tensor. The payload is consumed here, so the caller can drop
@@ -2055,6 +2071,38 @@ impl CmfStreamWriter {
         shape: &[usize],
         data: &[u8],
         chunk_bytes: usize,
+    ) -> Result<(), CmfError> {
+        self.push_bounded_impl(name, dtype, shape, data, chunk_bytes, None)
+    }
+
+    /// Append a payload whose hash was already established by an integrity
+    /// check of the immutable source. This avoids re-reading every preserved
+    /// mmap payload solely to compute the same directory hash during a large
+    /// streaming rewrite. Callers must perform a final [`CmfModel::verify`]
+    /// of the completed output before treating it as valid: that validation
+    /// is what detects a source mutated while it was being copied.
+    ///
+    /// New or transformed payloads must use [`Self::push_bounded`] instead.
+    pub fn push_bounded_prehashed(
+        &mut self,
+        name: &str,
+        dtype: TensorDtype,
+        shape: &[usize],
+        data: &[u8],
+        hash: u64,
+        chunk_bytes: usize,
+    ) -> Result<(), CmfError> {
+        self.push_bounded_impl(name, dtype, shape, data, chunk_bytes, Some(hash))
+    }
+
+    fn push_bounded_impl(
+        &mut self,
+        name: &str,
+        dtype: TensorDtype,
+        shape: &[usize],
+        data: &[u8],
+        chunk_bytes: usize,
+        known_hash: Option<u64>,
     ) -> Result<(), CmfError> {
         if shape.len() > DIR_MAX_NDIM {
             return Err(CmfError::Parse(format!(
@@ -2093,7 +2141,7 @@ impl CmfStreamWriter {
             off,
             nbytes: data.len() as u64,
             shard: 0,
-            hash: hash64(data),
+            hash: known_hash.unwrap_or_else(|| hash64(data)),
         });
         self.cursor = off + data.len() as u64;
         if let Some(m) = self.manifest.as_mut() {

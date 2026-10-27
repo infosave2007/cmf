@@ -79,6 +79,12 @@ use crate::sampler;
 /// the window makes the first rounds' drafts exact too.
 pub(crate) const HIST_CAP: usize = 320;
 
+/// Rows of teacher-forced MiMo calibration retained at once. The MTP draft
+/// keeps its causal K/V across chunks, while the temporary trunk hidden,
+/// `(embed, hidden)` and FFN panels stay bounded instead of scaling with one
+/// long `.tdata` record.
+const MTP_FFN_PROBE_CHUNK_ROWS: usize = 128;
+
 /// Speculation counters of one generation.
 #[derive(Clone, Debug, Default)]
 pub struct MtpStats {
@@ -593,11 +599,32 @@ impl Pipeline {
         &mut self,
         st: &mut MimoMtp,
         ids: &[u32],
-        hiddens: &[f32],
+    ) -> Result<Vec<MtpFfnProbe>, String> {
+        self.mimo_mtp_ffn_probe_teacher_forced_chunked(st, ids, MTP_FFN_PROBE_CHUNK_ROWS)
+    }
+
+    /// Test-visible chunk-width variant. Production uses the fixed bounded
+    /// value above; a whole-record width serves as the numerical reference in
+    /// the regression test for causal K/V continuation across chunks.
+    #[cfg(test)]
+    pub(crate) fn mimo_mtp_ffn_probe_teacher_forced_with_chunk_rows(
+        &mut self,
+        st: &mut MimoMtp,
+        ids: &[u32],
+        chunk_rows: usize,
+    ) -> Result<Vec<MtpFfnProbe>, String> {
+        self.mimo_mtp_ffn_probe_teacher_forced_chunked(st, ids, chunk_rows)
+    }
+
+    fn mimo_mtp_ffn_probe_teacher_forced_chunked(
+        &mut self,
+        st: &mut MimoMtp,
+        ids: &[u32],
+        chunk_rows: usize,
     ) -> Result<Vec<MtpFfnProbe>, String> {
         let hs = self.hidden_size;
-        if hiddens.len() != ids.len() * hs {
-            return Err("MiMo MTP FFN probe: malformed trunk hidden replay".into());
+        if chunk_rows == 0 {
+            return Err("MiMo MTP FFN probe: chunk width must be positive".into());
         }
         let post_norm_hidden = st.post_norm_hidden;
         let mut out = Vec::with_capacity(st.layers.len());
@@ -609,16 +636,53 @@ impl Pipeline {
             };
             let inter = dense.gate_proj.rows();
             let n = ids.len().saturating_sub(layer_index + 1);
-            let mut mass = vec![0.0f64; inter];
-            let mut squared_mass = vec![0.0f64; inter];
-            if n != 0 {
-                m.kv.clear();
-                let mut cats = vec![0.0f32; n * 2 * hs];
+            out.push(MtpFfnProbe {
+                mass: vec![0.0f64; inter],
+                squared_mass: vec![0.0f64; inter],
+                observed_positions: n,
+            });
+            m.kv.clear();
+        }
+
+        // Layer zero needs trunk rows 0..ids.len()-1; deeper drafts need a
+        // prefix only. Advance the trunk exactly once in causal order, then
+        // feed each independent draft layer the usable part of that chunk.
+        let trunk_rows = ids.len().saturating_sub(1);
+        for chunk_start in (0..trunk_rows).step_by(chunk_rows) {
+            let chunk_end = (chunk_start + chunk_rows).min(trunk_rows);
+            let rows = chunk_end - chunk_start;
+            let hidden_len = rows
+                .checked_mul(hs)
+                .ok_or_else(|| "MiMo MTP FFN probe: hidden chunk size overflows usize".to_string())?;
+            let mut hiddens = Vec::with_capacity(hidden_len);
+            for position in chunk_start..chunk_end {
+                let hidden = self.forward_layers(&self.embed_single(ids[position]), position, None);
+                if hidden.len() != hs {
+                    return Err(format!(
+                        "MiMo MTP FFN probe: trunk hidden width {} != {hs}",
+                        hidden.len()
+                    ));
+                }
+                hiddens.extend_from_slice(&hidden);
+            }
+
+            for (layer_index, (m, probe)) in st.layers.iter_mut().zip(out.iter_mut()).enumerate() {
+                let layer_end = chunk_end.min(ids.len().saturating_sub(layer_index + 1));
+                if chunk_start >= layer_end {
+                    continue;
+                }
+                let n = layer_end - chunk_start;
+                let cats_len = n
+                    .checked_mul(2)
+                    .and_then(|n| n.checked_mul(hs))
+                    .ok_or_else(|| "MiMo MTP FFN probe: input chunk size overflows usize".to_string())?;
+                let mut cats = vec![0.0f32; cats_len];
                 let mut draft_hidden = vec![0.0f32; hs];
-                for j in 0..n {
+                for local in 0..n {
+                    let j = chunk_start + local;
                     let e = self.embed_single(ids[j + layer_index + 1]);
-                    let raw_hidden = &hiddens[j * hs..(j + 1) * hs];
-                    let (ce, ch) = cats[j * 2 * hs..(j + 1) * 2 * hs].split_at_mut(hs);
+                    let raw_hidden = &hiddens[local * hs..(local + 1) * hs];
+                    let (ce, ch) = cats[local * 2 * hs..(local + 1) * 2 * hs].split_at_mut(hs);
                     inference::rms_norm_into(&e, &m.enorm, self.rms_eps, self.norm_style, ce);
                     if post_norm_hidden {
                         inference::rms_norm_into(
@@ -639,21 +703,19 @@ impl Pipeline {
                         ch,
                     );
                 }
-                let mut x = vec![0.0f32; n * hs];
+                let x_len = n
+                    .checked_mul(hs)
+                    .ok_or_else(|| "MiMo MTP FFN probe: projection chunk size overflows usize".to_string())?;
+                let mut x = vec![0.0f32; x_len];
                 m.eh_proj.matmat(&cats, n, &mut x, self.pool.as_deref());
                 self.mimo_mtp_block_with_probe(
                     m,
                     &mut x,
                     n,
-                    0,
-                    Some((&mut mass, &mut squared_mass)),
+                    chunk_start,
+                    Some((&mut probe.mass, &mut probe.squared_mass)),
                 )?;
             }
-            out.push(MtpFfnProbe {
-                mass,
-                squared_mass,
-                observed_positions: n,
-            });
         }
         Ok(out)
     }

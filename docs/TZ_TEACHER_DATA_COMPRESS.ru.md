@@ -4,10 +4,13 @@
 «данные учителя → засветка нейронов → свёртка NVG → лечение → квантизация»
 внутри движка CMF.
 
-> **Статус для релиза 0.8.37.** В релиз вошёл только text-only E1 v1:
-> `cortiq teacher-data generate` и `teacher-data inspect`. Это ТЗ описывает
-> последующие исследовательские стадии, в том числе ещё не выпущенную команду
-> `cortiq compress`; его нельзя читать как справку по доступным флагам.
+> **Статус для релиза 0.8.38.** В релиз вошли text-only E1 v1
+> (`cortiq teacher-data generate` и `teacher-data inspect`) и безопасная
+> compaction существующего dense MTP-draft через `cortiq mtp-compact` /
+> короткую форму `cortiq compact SOURCE.cmf PROMPTS.jsonl OUTPUT.cmf`. Это ТЗ
+> всё ещё описывает последующие исследовательские стадии, в том числе ещё не
+> выпущенную общую команду `cortiq compress`; его нельзя читать как справку по
+> доступным флагам.
 > Практическая инструкция для выпущенного пути:
 > [`TEACHER_DATA.ru.md`](TEACHER_DATA.ru.md).
 
@@ -15,7 +18,7 @@
 |---|---|
 | Версия | 1.0, черновик к согласованию |
 | Дата | 26.10.2026 |
-| База кода | `infosave2007/cmf`, релиз `v0.8.37`; исторические измерения ниже сделаны на pre-release срезе |
+| База кода | `infosave2007/cmf`, релиз `v0.8.38`; исторические измерения ниже сделаны на pre-release срезе |
 | Источник метода | `cortiq-bot/colab_nvg_compress.ipynb` — методический reference; NVG Topological Specialization (Patent 12), Genesis Ť + FCD (Patent 2), quality/episode contract (Patent 4) |
 | Прототипы в репозитории | `tools/nvg_fold_qwen35.py`, `tools/heal_data_teacher.py`, `tools/nvg_heal_kd.py`, `tools/quant/escort.py`, `crates/cortiq-cli/examples/tube_gen.rs` |
 | Язык реализации | Rust, внутри `cortiq`. Python — только как эталон для сверки в тестах, в конвейере его нет |

@@ -51,6 +51,22 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Компактация MTP draft по своим промптам (0.8.38)
+
+Для CMF с уже поддерживаемым dense MTP draft одна команда создаёт более узкий
+draft, откалиброванный по типичным запросам задачи:
+
+```sh
+cortiq compact source.cmf prompts.jsonl task-model.cmf
+```
+
+Source используется как teacher; команда создаёт или переиспользует
+`task-model.tdata`, сохраняет проверяемый plan и публикует только runnable
+CMF. Это физическая compaction MTP-draft, а не general fine-tuning: trunk
+остается исходным, а greedy output контролируется verifier-ом. JSONL, safety
+gates и проверка на Metal/Vulkan описаны в
+[руководстве MTP](docs/MTP_COMPACTION.ru.md).
+
 GGUF трансформера Qwen Image можно импортировать как отдельный CMF;
 подробности упаковки приведены в руководстве Qwen Image. Для нативного
 редактирования используйте готовый однофайловый bundle или сохраните
@@ -234,6 +250,8 @@ Kimi Linear, MiniCPM и несколько MoE/video-семейств. Огра�
 - [GPU-рецепты](docs/GPU_KERNEL_RECIPES.md) — измерения бэкендов.
 - [Несколько GPU](docs/MULTI_GPU.md) и [разделение на мобильном](docs/MOBILE_SPLIT.ru.md).
 - [FCD-восстановление](docs/RUST_FCD.md) и [низкоразрядный PTQ](docs/Q1T_PTQ.md).
+- [Компактация MTP FFN](docs/MTP_COMPACTION.ru.md) — независимая калибровка и
+  физическое уменьшение FFN у MTP-draft.
 - [Qwen Image Edit](docs/QWEN_IMAGE.md) — однофайловое редактирование и
   отдельная раскладка компонентов.
 - [Карточки моделей и конвертация](docs/hf/README.md).

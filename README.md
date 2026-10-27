@@ -51,6 +51,21 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Prompt-calibrated MTP draft compaction (0.8.38)
+
+For a CMF that already carries a supported dense MTP draft, create a smaller
+draft calibrated to representative task prompts with one command:
+
+```sh
+cortiq compact source.cmf prompts.jsonl task-model.cmf
+```
+
+The source is used as the teacher and the command creates or reuses
+`task-model.tdata`, writes an auditable plan, and verifies the runnable output.
+It is physical MTP-draft compaction, not general fine-tuning: trunk weights and
+greedy output remain verifier-controlled. See the [MTP compaction guide](docs/MTP_COMPACTION.ru.md)
+for JSONL input, safety gates, and Metal/Vulkan validation.
+
 ## Tencent Hy-MT2 (HunYuan)
 
 Version 0.7.0 adds the HunYuan architectures — the dense `hunyuan_v1_dense`

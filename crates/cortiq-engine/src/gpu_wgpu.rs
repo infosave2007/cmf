@@ -19008,6 +19008,26 @@ struct Q2LadderCache {
     row_ids: wgpu::Buffer,
 }
 
+/// Identity of a bind group retained by the whole-token graph.
+///
+/// `layer` is absolute rather than span-local: a network split invokes the
+/// graph separately for (say) layers 0..32 and 32..64 using the same
+/// sequence id.  `step` keeps the identity explicit for the device-greedy
+/// multi-step path, whose per-step uniforms intentionally have different
+/// buffer handles.
+type GraphBgKey = (u32, usize, u64, usize);
+
+#[inline]
+fn graph_bg_key(
+    site: u32,
+    layer_base: usize,
+    local_layer: usize,
+    kv_id: u64,
+    step: usize,
+) -> GraphBgKey {
+    (site, layer_base + local_layer, kv_id, step)
+}
+
 pub struct Ctx {
     /// The instance and adapter the device came from, kept for exactly as
     /// long as the device — which Vulkan requires and we were not doing.
@@ -19115,12 +19135,12 @@ pub struct Ctx {
     q4tp_mv4_dual: wgpu::ComputePipeline,
     use_mv_dual: bool,
     q4tp_mv4_dsilu: wgpu::ComputePipeline,
-    /// Bind groups reused across tokens: (site, layer, kv_id) → (epoch,
-    /// group). Valid while no buffer under it was reallocated — the
-    /// epoch bumps on every scratch grow and weight eviction. Behind
-    /// CMF_GRAPH_BGCACHE=1 until the parity suite blesses it: the host
-    /// spends 13.7 of a 23.5 ms token CREATING these objects.
-    graph_bgs: Mutex<HashMap<(u32, usize, u64), (u64, wgpu::BindGroup)>>,
+    /// Bind groups reused across tokens: (site, absolute-layer, kv_id,
+    /// step) → (epoch, group). Valid while no buffer under it was
+    /// reallocated — the epoch bumps on every graph scratch/KV grow and
+    /// weight eviction.  The Vulkan default removes a large host-side
+    /// encode cost; `CMF_GRAPH_BGCACHE=0` is the parity escape hatch.
+    graph_bgs: Mutex<HashMap<GraphBgKey, (u64, wgpu::BindGroup)>>,
     use_bgcache: bool,
     /// The same eight rows, but blocked over a SMALL BATCH in registers:
     /// the weight is read from DRAM once for the whole batch instead of
@@ -19872,6 +19892,10 @@ fn kv_mirror_ensure<'a>(
     }
     let grow = mirrors.get(&key).is_none_or(|m| m.cap < want_cap);
     if grow {
+        // Cached token-graph bind groups can name this mirror.  A growth
+        // replaces both buffers, so make every cached group miss before the
+        // next frame rather than silently appending to the old stride.
+        crate::gpu::probe_note_cold();
         let old = mirrors.remove(&key);
         let sz = (nkv * want_cap * hd * 4) as u64;
         let mk = || {
@@ -19946,6 +19970,10 @@ fn kv_mirror_ensure_x<'a>(
     };
     let grow = mirrors.get(&key).is_none_or(|m| m.cap < want_cap);
     if grow {
+        // See `kv_mirror_ensure`: the per-layer-geometry mirror is also
+        // directly bound by the token graph and must invalidate its groups
+        // whenever its backing buffers change.
+        crate::gpu::probe_note_cold();
         let old = mirrors.remove(&key);
         let mk = |width: usize| {
             c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -20325,6 +20353,11 @@ impl GraphScratch {
         match slot {
             Some((b, cap)) if *cap >= need => b.clone(),
             _ => {
+                // A cached graph bind group retains a buffer handle.  Unlike
+                // the generic scratch pool, these slots are bound by the
+                // whole-token graph, so a grow must advance its invalidation
+                // epoch before a later token can reuse the old group.
+                crate::gpu::probe_note_cold();
                 let cap = need.next_power_of_two().max(256);
                 let b = dev.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(label),
@@ -20356,6 +20389,33 @@ impl GraphScratch {
                 b
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod graph_bg_cache_key_tests {
+    use super::graph_bg_key;
+
+    #[test]
+    fn absolute_layer_key_reuses_only_the_same_model_layer() {
+        // A whole-stack run and a span run of the same physical layer may
+        // share a group; two local layer zeroes from different spans may not.
+        assert_eq!(
+            graph_bg_key(17, 0, 32, 41, 0),
+            graph_bg_key(17, 32, 0, 41, 0)
+        );
+        assert_ne!(
+            graph_bg_key(17, 0, 0, 41, 0),
+            graph_bg_key(17, 32, 0, 41, 0)
+        );
+    }
+
+    #[test]
+    fn step_uniforms_never_alias_a_cached_group() {
+        assert_ne!(
+            graph_bg_key(34, 0, 7, 41, 0),
+            graph_bg_key(34, 0, 7, 41, 1)
+        );
     }
 }
 
@@ -22010,6 +22070,15 @@ fn init(dev: usize) -> Result<Ctx, String> {
     // every process after this one.
     pipeline_cache_store(pcache.as_ref(), &info);
 
+    // Bind-group construction is a sizeable part of a Vulkan decode frame.
+    // The cache is intentionally conservative in `forward_token_graph`
+    // (single-step only, absolute layer key, invalidated on every backing
+    // buffer grow).  Keep it opt-out for a parity bisect and leave other
+    // wgpu backends unchanged until they have their own measurement.
+    let use_bgcache = std::env::var("CMF_GRAPH_BGCACHE")
+        .map(|v| v != "0")
+        .unwrap_or(info.backend == wgpu::Backend::Vulkan);
+
     Ok(Ctx {
         _instance: instance,
         _adapter: adapter,
@@ -22091,7 +22160,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         use_mv_dual,
         q4tp_mv4_dsilu,
         graph_bgs: Mutex::new(HashMap::new()),
-        use_bgcache: std::env::var("CMF_GRAPH_BGCACHE").as_deref() == Ok("1"),
+        use_bgcache,
         q4tp_mv4_bk,
         q4tp_mv4_bku,
         use_mv_bk,
@@ -27501,18 +27570,20 @@ pub fn forward_token_graph(
         })
     };
     // The host spends 13.7 of a 23.5 ms token creating these objects
-    // (CMF_GRAPH_HOSTPROF). Cache per (site, layer, kv): buffers under a
-    // cached group are stable until ANY cold event — a scratch grow or a
-    // weight upload — which invalidates everything via the global cold
-    // epoch. Positions ride in content-cached uniforms, so a给 (site,
-    // layer) the uniform BUFFER changes when position changes — those
-    // sites pass site=0, which bypasses the cache.
+    // (CMF_GRAPH_HOSTPROF). Cache only ordinary one-step decode: a greedy
+    // burst deliberately has one distinct position uniform per step and
+    // belongs to a separate correctness/performance experiment.  Every
+    // cached group has an absolute layer and a step in its key; its backing
+    // buffers stay stable until a cold event (weight upload, graph scratch
+    // or KV growth) advances the epoch.
+    let cache_bgs = c.use_bgcache && steps <= 1;
+    let bg_cache_step = std::cell::Cell::new(0usize);
     let bgc = |site: u32, li: usize, layout: &wgpu::BindGroupLayout, bufs: &[&wgpu::Buffer]| {
-        if site == 0 || !c.use_bgcache {
+        if site == 0 || !cache_bgs {
             return mk_bg(layout, bufs);
         }
         let ep = crate::gpu::cold_epoch();
-        let key = (site, li, kv_id);
+        let key = graph_bg_key(site, layer_base, li, kv_id, bg_cache_step.get());
         let mut m = c.graph_bgs.lock().unwrap();
         if let Some((e, g)) = m.get(&key) {
             if *e == ep {
@@ -27647,14 +27718,15 @@ pub fn forward_token_graph(
         .max()
         .unwrap_or(0);
     let blr_graph = if blr_lat > 0 { blr::graph_pipes(c) } else { None };
-    let blr_t = {
-        let need = (blr_lat.max(1) * 4) as u64;
-        if gs.blr_t.as_ref().is_some_and(|(_, cap)| *cap < need) {
-            // Cached bind groups hold the old buffer: a grow is a cold event.
-            crate::gpu::probe_note_cold();
-        }
-        GraphScratch::ensure(&c.device, &mut gs.blr_t, need, st, "g-blr-t")
-    };
+    // `GraphScratch::ensure` invalidates cached bind groups if this slot
+    // grows, exactly like every other graph-owned intermediate.
+    let blr_t = GraphScratch::ensure(
+        &c.device,
+        &mut gs.blr_t,
+        (blr_lat.max(1) * 4) as u64,
+        st,
+        "g-blr-t",
+    );
     // MoE routing scratch, sized to the largest MoE layer (absent → skipped).
     let moe_geom = lws
         .iter()
@@ -29072,6 +29144,7 @@ pub fn forward_token_graph(
         return token_graph_outcome(o1_started || state_started, ok);
     }
     for stp in 0..steps {
+        bg_cache_step.set(stp);
         let kv_u = kv_us[stp].clone();
         let at_u = at_us[stp].clone();
         let position = position + stp;
@@ -29892,7 +29965,7 @@ pub fn forward_token_graph(
                                 &c.gqa_attend_dec_rkv,
                                 &bgc(
                                     35,
-                                    stp * layers.len() + li,
+                                    li,
                                     &rkv_l,
                                     &[&qraw, kbuf, vbuf, &attn, &at_u, &kb, &vb, &invf_b],
                                 ),
@@ -29997,11 +30070,12 @@ pub fn forward_token_graph(
                                     go(
                                         &mut enc,
                                         &c.gqa_attend_dec,
-                                        // Keyed per step: `at_u` is the step's
-                                        // own uniform in a greedy burst.
+                                        // The cache key carries the step: `at_u`
+                                        // is the step's own uniform in a greedy
+                                        // burst.
                                         &bgc(
                                             34,
-                                            stp * layers.len() + li,
+                                            li,
                                             &dec_l,
                                             &[&qout, kbuf, vbuf, &attn, &at_u],
                                         ),
@@ -37562,7 +37636,7 @@ pub fn kv_mirror_reset(kv_id: u64) {
         c.graph_bgs
             .lock()
             .unwrap()
-            .retain(|(_, _, id), _| *id != kv_id);
+            .retain(|(_, _, id, _), _| *id != kv_id);
     }
 }
 
