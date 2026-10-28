@@ -195,6 +195,18 @@ pub struct Layer {
     pub gate: Lin,
     pub up: Lin,
     pub down: Lin,
+    /// DTG-MA: a gate on the MLP's intermediate ([`Net::enable_masks`]).
+    pub mask: Option<MaskGate>,
+}
+
+/// A gate per MLP neuron between the SwiGLU and `down_proj`: `h·s` with
+/// `s` set by the caller (σ(m) of the mask logits while training, 0/1 for
+/// the hard mask), and `Σ_tokens dL/d(h·s)·h` — the gradient with respect
+/// to `s` — accumulated on the card.
+pub struct MaskGate {
+    pub s: wgpu::Buffer,
+    pub g: wgpu::Buffer,
+    pub w: usize,
 }
 
 /// Every parameter laid end to end, for the optimizer: one dispatch for all
@@ -465,6 +477,7 @@ impl Net {
                 gate: lin("mlp.gate_proj.weight", "mlp.gate")?,
                 up: lin("mlp.up_proj.weight", "mlp.up")?,
                 down: lin("mlp.down_proj.weight", "mlp.down")?,
+                mask: None,
             });
             // Every upload is a queue write staged until the next submission;
             // a 27B teacher's ~49 GB of f16 planes would otherwise sit in
@@ -566,6 +579,39 @@ impl Net {
             push_lin(&l.down, &mut v);
         }
         v
+    }
+
+    /// DTG-MA: put a gate (all open) on every on-device layer's MLP
+    /// intermediate. The backward must reach the layers (a net loaded with
+    /// `bwd`); the weights stay as they are.
+    pub fn enable_masks(&mut self, c: Ctx) {
+        for ly in &mut self.layers[self.first..self.end] {
+            let w = ly.gate.m();
+            ly.mask = Some(MaskGate { s: to::upload(c, &vec![1.0; w]), g: to::zeros(c, w), w });
+        }
+    }
+
+    /// Set every gate (`s[l]` for layer `first + l`, its MLP width long).
+    pub fn set_masks(&self, c: Ctx, s: &[Vec<f32>]) -> Option<()> {
+        for (ly, v) in self.layers[self.first..self.end].iter().zip(s) {
+            let mg = ly.mask.as_ref()?;
+            if v.len() != mg.w {
+                return None;
+            }
+            c.queue.write_buffer(&mg.s, 0, bytemuck::cast_slice(v));
+        }
+        Some(())
+    }
+
+    /// The gates' accumulated gradients `dL/ds`, read and cleared.
+    pub fn mask_grads(&self, c: Ctx) -> Option<Vec<Vec<f32>>> {
+        let mut out = Vec::new();
+        for ly in &self.layers[self.first..self.end] {
+            let mg = ly.mask.as_ref()?;
+            out.push(to::download(c, &mg.g, mg.w)?);
+            zero(c, &mg.g, mg.w);
+        }
+        Some(out)
     }
 
     /// Every linear trained in full ([`Lin::Train`]) with its tensor name.
@@ -1010,7 +1056,11 @@ fn layer_fwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, y: &wgpu::
         to::rms_fwd(c, w.get("x2"), &ly.ln2.w, w.get("n2"), w.get("inv2"), n, g.hs, g.eps, g.gemma)?,
     ]);
     lin_fwd_shared(c, w, &[(&ly.gate, w.get("gg")), (&ly.up, w.get("uu"))], w.get("n2"))?;
-    to::run(c, &[to::elt(c, "swiglu_fwd", n * ly.gate.m(), w.get("gg"), w.get("uu"), Some(w.get("hh")), None, None, None)?]);
+    let act = match &ly.mask {
+        Some(mg) => to::swiglu_cols(c, n * mg.w, w.get("gg"), w.get("uu"), w.get("hh"), &mg.s, mg.w)?,
+        None => to::elt(c, "swiglu_fwd", n * ly.gate.m(), w.get("gg"), w.get("uu"), Some(w.get("hh")), None, None, None)?,
+    };
+    to::run(c, &[act]);
     lin_fwd_shared(c, w, &[(&ly.down, w.get("mix"))], w.get("hh"))?;
     to::run(c, &[to::elt(c, "add", n * g.hs, w.get("x2"), w.get("mix"), Some(y), None, None, None)?]);
     Some(())
@@ -1025,7 +1075,20 @@ fn layer_bwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, dy: &wgpu:
     let n = w.ntok;
     // MLP: y = x2 + down(swiglu(gate(n2), up(n2)))
     lin_bwd(c, w, &ly.down, w.get("hh"), dy, w.get("dhh"), false, gs, sg)?;
-    to::run(c, &[to::elt(c, "swiglu_bwd", n * ly.gate.m(), w.get("gg"), w.get("uu"), None, Some(w.get("dhh")), Some(w.get("dgg")), Some(w.get("duu")))?]);
+    match &ly.mask {
+        Some(mg) => {
+            // the gate's gradient Σ_tokens dhh·h, h the ungated SwiGLU
+            // (recomputed into dgg, which the SwiGLU backward then overwrites)
+            let [p1, p2] = tm::colsum(c, w.get("dhh"), tm::ColTerm::Prod(w.get("dgg")), &mg.g, n, mg.w, true)?;
+            to::run(c, &[
+                to::elt(c, "swiglu_fwd", n * mg.w, w.get("gg"), w.get("uu"), Some(w.get("dgg")), None, None, None)?,
+                p1,
+                p2,
+                to::swiglu_cols_bwd(c, n * mg.w, w.get("gg"), w.get("uu"), &mg.s, w.get("dhh"), w.get("dgg"), w.get("duu"), mg.w)?,
+            ]);
+        }
+        None => to::run(c, &[to::elt(c, "swiglu_bwd", n * ly.gate.m(), w.get("gg"), w.get("uu"), None, Some(w.get("dhh")), Some(w.get("dgg")), Some(w.get("duu")))?]),
+    }
     lin_bwd(c, w, &ly.gate, w.get("n2"), w.get("dgg"), w.get("dn2"), false, gs, sg)?;
     lin_bwd(c, w, &ly.up, w.get("n2"), w.get("duu"), w.get("dn2"), true, gs, sg)?;
     let [dw1, dw2] = to::rms_dw(c, w.get("x2"), w.get("inv2"), w.get("dn2"), &ly.ln2.g, n, g.hs)?;
@@ -1973,6 +2036,110 @@ mod tests {
         }
         set(0.0);
         assert!(ok, "directional derivative does not match the gradient norm");
+    }
+
+    /// DTG-MA gates: with every gate open the net is the plain one (same
+    /// loss to the bit); the analytic gradient of a gate value against a
+    /// central difference of the loss, for the largest-gradient gates of the
+    /// first and the last layer, the gates set to a spread of values
+    /// (`CMF_TRAIN_TEST_MODEL`).
+    #[test]
+    #[ignore]
+    fn mask_gradient_check() {
+        let Ok(path) = std::env::var("CMF_TRAIN_TEST_MODEL") else { return };
+        let Some(c) = to::dev() else { return };
+        let model = CmfModel::open_sharded(&path).expect("model");
+        let teacher = Net::load(c, &model, true, false, None).expect("teacher");
+        let (nb, t, k) = (2usize, 64usize, 32usize);
+        let tw = Work::new(c, &teacher, nb, t);
+        let vocab = teacher.geom.vocab as u64;
+        let ids: Vec<u32> = (0..(nb * t) as u64).map(|i| ((i * 7919 + 13) % vocab.min(30000)) as u32).collect();
+        let (tid, tp) = teacher_topk(c, &teacher, &tw, &ids, k).expect("topk");
+        let plain = loss_only(c, &teacher, &tw, &ids, &tid, &tp, k).unwrap();
+        drop((tw, teacher));
+        let mut student = Net::load(c, &model, true, true, None).expect("student");
+        student.enable_masks(c);
+        let w = Work::new(c, &student, nb, t);
+        let open = loss_only(c, &student, &w, &ids, &tid, &tp, k).unwrap();
+        eprintln!("loss: plain {plain:.8}, every gate open {open:.8}");
+        assert_eq!(plain, open, "open gates must leave the net unchanged");
+        let nl = student.geom.nl;
+        let mut s: Vec<Vec<f32>> = student.layers.iter().enumerate().map(|(l, ly)| (0..ly.gate.m()).map(|j| 0.4 + 0.6 * (((j * 37 + l * 11) % 101) as f32 / 100.0)).collect()).collect();
+        student.set_masks(c, &s).unwrap();
+        zero_grads(c, &student);
+        let st = step(c, &student, &w, &ids, &tid, &tp, k, 1024.0, None).expect("step");
+        let g = student.mask_grads(c).unwrap();
+        eprintln!("loss with gates {:.6}", st.loss);
+        let mut worst = 0f64;
+        for l in [0, nl - 1] {
+            let mut order: Vec<usize> = (0..g[l].len()).collect();
+            order.sort_by(|&a, &b| g[l][b].abs().partial_cmp(&g[l][a].abs()).unwrap());
+            for &j in order.iter().take(4) {
+                // two step sizes: through all the layers above, the f16
+                // forward's rounding swamps a small one (the layer-0 norm
+                // gains of `net_gradient_check` behave alike)
+                let base = s[l][j];
+                let mut fds = Vec::new();
+                for eps in [0.02f32, 0.08] {
+                    s[l][j] = base + eps;
+                    student.set_masks(c, &s).unwrap();
+                    let lp = loss_only(c, &student, &w, &ids, &tid, &tp, k).unwrap();
+                    s[l][j] = base - eps;
+                    student.set_masks(c, &s).unwrap();
+                    let lm = loss_only(c, &student, &w, &ids, &tid, &tp, k).unwrap();
+                    fds.push((lp - lm) / (2.0 * eps as f64));
+                }
+                s[l][j] = base;
+                let r = fds.iter().map(|fd| (fd / g[l][j] as f64 - 1.0).abs()).fold(f64::MAX, f64::min);
+                // the last layer's difference is clean (≤ 2 %); through all
+                // the layers above the first one it scatters around the
+                // gradient by the f16 forward's rounding: the two step sizes
+                // must bracket it (15 % slack)
+                let (lo, hi) = (fds[0].min(fds[1]), fds[0].max(fds[1]));
+                let a = g[l][j] as f64;
+                let ok = if l + 1 == nl { r < 0.02 } else { r < 0.15 || (a >= lo - 0.15 * a.abs() && a <= hi + 0.15 * a.abs()) };
+                worst = worst.max(if ok { 0.0 } else { r });
+                eprintln!("L{l} gate {j}: analytic {:.5e}  fd(0.02) {:.5e}  fd(0.08) {:.5e}  (rel {r:.3}){}", g[l][j], fds[0], fds[1], if ok { "" } else { "  ✗" });
+            }
+        }
+        student.set_masks(c, &s).unwrap();
+        assert!(worst == 0.0, "gate gradient off by {worst:.3}");
+    }
+
+    /// Where a healing step's time goes on this device: the teacher pass
+    /// and six steps of a full-depth MLP heal of `CMF_TRAIN_TEST_MODEL` at
+    /// the compress shape (2 windows × 2048 tokens), host-timed, then the
+    /// profiler's table (run with `CMF_NVG_PROF=2` or `1`).
+    #[test]
+    #[ignore]
+    fn heal_step_profile() {
+        let Ok(path) = std::env::var("CMF_TRAIN_TEST_MODEL") else { return };
+        let Some(c) = to::dev() else { return };
+        let model = CmfModel::open_sharded(&path).expect("model");
+        let (nb, t, k) = (2usize, 2048usize, 65usize);
+        let vocab = model.arch().vocab_size as u64;
+        let ids: Vec<u32> = (0..(nb * t) as u64).map(|i| ((i * 7919 + 13) % vocab.min(30000)) as u32).collect();
+        let (tid, tp) = {
+            let teacher = Net::load(c, &model, true, false, None).expect("teacher");
+            let tw = Work::new(c, &teacher, nb, t);
+            let _ = teacher_topk(c, &teacher, &tw, &ids, k).expect("warm");
+            let t0 = std::time::Instant::now();
+            let r = teacher_topk(c, &teacher, &tw, &ids, k).expect("topk");
+            eprintln!("teacher pass: {:.2} s for {} tokens ({:.0} tok/s)", t0.elapsed().as_secs_f64(), nb * t, (nb * t) as f64 / t0.elapsed().as_secs_f64());
+            r
+        };
+        let student = Net::load_heal(c, &model, HealCfg { train_from: 0, ffn_only: true, prefix_cached: false }).expect("student");
+        let w = Work::new(c, &student, nb, t);
+        for i in 0..6 {
+            let t0 = std::time::Instant::now();
+            let st = step_w(c, &student, &w, &ids, &tid, &tp, k, 1024.0, None, None).expect("step");
+            prof::step_end();
+            let ts = t0.elapsed().as_secs_f64();
+            adam(c, &student, 1e-6, i + 1, 0.9, 0.999, 1e-8, 1.0).expect("adam");
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+            eprintln!("step {i}: loss {:.4}, fwd+bwd {:.2} s, with adam {:.2} s", st.loss, ts, t0.elapsed().as_secs_f64());
+        }
+        prof::report();
     }
 
     /// Teacher top-k on one small batch of the 0.8B check models

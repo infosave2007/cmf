@@ -78,6 +78,8 @@ pub struct NvgTrainOpts<'a> {
     pub budget_sel_tokens: usize,
     /// The device jobs of the re-encode.
     pub budget_jobs: usize,
+    /// DTG-MA before the metric: the fraction of MLP neurons kept.
+    pub mask_keep: Option<f64>,
 }
 
 const TOPK_MAGIC: &[u8; 8] = b"NVGTOPK1";
@@ -332,6 +334,85 @@ fn load_gram_bytes(raw: &[u8]) -> anyhow::Result<crate::nvg_linalg::Mat> {
     Ok(crate::nvg_linalg::Mat::from_vec(n, n, d))
 }
 
+/// Train DTG-MA gates on `smodel` against the teacher's top-k (`t_ids`,
+/// `t_p`), keep the `keep` fraction of the MLP neurons they rank highest and
+/// write the cut model next to the output (`<output>.masked.cmf`).
+#[allow(clippy::too_many_arguments)]
+fn mask_and_cut(
+    c: cortiq_engine::gpu_wgpu::CtxRef,
+    smodel: CmfModel,
+    keep: f64,
+    o: &NvgTrainOpts,
+    n_train_b: usize,
+    n_eval_b: usize,
+    batch_ids: &dyn Fn(usize) -> Vec<u32>,
+    t_ids: &[Vec<u32>],
+    t_p: &[Vec<f32>],
+) -> anyhow::Result<CmfModel> {
+    use crate::compress::{cmfio, dtgma, heal_gpu};
+    anyhow::ensure!(keep > 0.0 && keep < 1.0, "--mask-keep {keep}: a fraction in (0, 1)");
+    let k = o.topk;
+    let mut mnet = nt::Net::load(c, &smodel, true, true, None).map_err(|e| anyhow::anyhow!(e))?;
+    mnet.enable_masks(c);
+    let mw = nt::Work::new(c, &mnet, o.batch, o.window);
+    let step = |b: usize, gs: f32| nt::step(c, &mnet, &mw, &batch_ids(b), &t_ids[b], &t_p[b], k, gs, None);
+    let val = || -> anyhow::Result<f64> {
+        let mut s = 0.0;
+        for e in 0..n_eval_b {
+            let b = n_train_b + e;
+            s += nt::loss_only(c, &mnet, &mw, &batch_ids(b), &t_ids[b], &t_p[b], k).ok_or_else(|| anyhow::anyhow!("eval failed"))?;
+        }
+        Ok(s / n_eval_b.max(1) as f64)
+    };
+    let knob = |n: &str, d: f64| std::env::var(format!("CMF_DTGMA_{n}")).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let cfg = heal_gpu::MaskCfg {
+        window: o.window,
+        batch: o.batch,
+        keep_frac: keep,
+        lr: knob("LR", 0.1),
+        l1_init: knob("L1", 0.01),
+        l1_step: knob("L1_STEP", 0.005),
+        l1_grow: knob("L1_GROW", 1.5),
+        eval_every: knob("EVAL", 25.0) as usize,
+        max_steps: knob("MAX_STEPS", 3000.0) as usize,
+        mask_init: knob("INIT", 2.0) as f32,
+        tau: 0.5,
+        settle: knob("SETTLE", 0.0) as usize,
+    };
+    let intro = format!("{n_train_b} train + {n_eval_b} held-out batches of {}×{} tokens, KL to the teacher's top-{k}", o.batch, o.window);
+    let rep = heal_gpu::train_masks(c, &mnet, n_train_b, &step, &val, &cfg, &|l| eprintln!("{l}"), "nvg-train", &intro)?;
+    drop((mw, mnet));
+    let widths: Vec<usize> = rep.logits.iter().map(Vec::len).collect();
+    let total = (widths.iter().sum::<usize>() as f64 * keep).round() as usize;
+    let floor: Vec<usize> = widths.iter().map(|&w| ((w as f64 * 0.25) as usize).div_ceil(128) * 128).collect();
+    let keeps = dtgma::keeps_from(&rep.logits, &widths, total, 128, &floor);
+    let keep_idx: Vec<Vec<usize>> = dtgma::orders_from(&rep.logits)
+        .into_iter()
+        .zip(&keeps)
+        .map(|(ord, &n)| {
+            let mut v = ord[..n].to_vec();
+            v.sort_unstable();
+            v
+        })
+        .collect();
+    let cut = std::path::PathBuf::from(format!("{}.masked.cmf", o.output));
+    let prov = serde_json::json!({
+        "keep": keep, "widths": keeps, "hard_loss": rep.nll_hard, "open_loss": rep.nll_open,
+        "pruned_at_selection": rep.pruned, "step": rep.step, "steps": rep.steps, "sec_per_step": rep.sec_per_step,
+    });
+    let bytes = cmfio::subset_ffn(&smodel, &cut, &keep_idx, &|h| cmfio::provenance_set(h, "dtgma", prov.clone()))?;
+    eprintln!(
+        "nvg-train: {} of {} MLP neurons kept ({:.1} %) → {} ({:.3} GB); widths {}",
+        keeps.iter().sum::<usize>(),
+        widths.iter().sum::<usize>(),
+        100.0 * keeps.iter().sum::<usize>() as f64 / widths.iter().sum::<usize>() as f64,
+        cut.display(),
+        bytes as f64 / 1e9,
+        keeps.iter().map(usize::to_string).collect::<Vec<_>>().join(" ")
+    );
+    Ok(CmfModel::open_sharded(&cut)?)
+}
+
 pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
     let t0 = Instant::now();
     // The plan is parsed first: a malformed rule is a cheap error, and it
@@ -433,6 +514,13 @@ pub fn run(o: &NvgTrainOpts) -> anyhow::Result<()> {
     let batch_ids = |b: usize| -> Vec<u32> {
         let src = if b < n_train_b { &train[b * o.batch..(b + 1) * o.batch] } else { &eval[(b - n_train_b) * o.batch..(b - n_train_b + 1) * o.batch] };
         src.iter().flat_map(|w| w.iter().copied()).collect()
+    };
+
+    // ── DTG-MA before the metric (NVG → DTG-MA): a gate on every MLP neuron
+    // trained with the same KL, the closed neurons cut out of the tensors ──
+    let smodel = match o.mask_keep {
+        Some(keep) => mask_and_cut(c, smodel, keep, o, n_train_b, eval_n / o.batch, &batch_ids, &t_ids, &t_p)?,
+        None => smodel,
     };
 
     // ── student ──

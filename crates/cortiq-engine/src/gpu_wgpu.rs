@@ -20472,10 +20472,30 @@ fn ctx() -> Option<&'static Ctx> {
     ctx_for(crate::gpu::current_device())
 }
 
+/// The trainer's context (`train_ops::dev`): the runtime's when wgpu is
+/// selected; on macOS, where the runtime runs on native Metal, a wgpu
+/// Metal context of the trainer's own (the nvg-train / compress device
+/// kernels, Apple's 8×8 simdgroup matrices) — `CMF_TRAIN_GPU=0` keeps the
+/// trainer off it. The runtime never sees this context: `ctx()` still
+/// answers None while wgpu is not selected.
+pub fn trainer_ctx() -> Option<&'static Ctx> {
+    if selected() {
+        return ctx();
+    }
+    if !cfg!(target_os = "macos") || matches!(std::env::var("CMF_TRAIN_GPU").as_deref(), Ok("0") | Ok("off")) {
+        return None;
+    }
+    ctx_built(crate::gpu::current_device())
+}
+
 fn ctx_for(dev: usize) -> Option<&'static Ctx> {
     if !selected() {
         return None;
     }
+    ctx_built(dev)
+}
+
+fn ctx_built(dev: usize) -> Option<&'static Ctx> {
     let map = CTXS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut g = map.lock().unwrap();
     if let Some(slot) = g.get(&dev) {
@@ -20572,6 +20592,13 @@ fn existing_ctx() -> Option<&'static Ctx> {
 /// and a layer split.
 pub fn device_vram_budget() -> u64 {
     ctx().map(|c| c.vram_budget).unwrap_or(0)
+}
+
+/// The trainer device's memory budget ([`trainer_ctx`]): bytes, or
+/// `u64::MAX` on unified memory (Apple Silicon — the host's memory is the
+/// device's); None without a trainer device.
+pub fn trainer_vram_budget() -> Option<u64> {
+    trainer_ctx().map(|c| c.vram_budget)
 }
 
 /// Logical bytes currently held by the weight-residency arena on the active
@@ -21029,6 +21056,21 @@ fn init(dev: usize) -> Result<Ctx, String> {
         | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING;
     let want_bind_arrays = adapter.features().contains(bind_array_features);
     COOP_OK.store(want_coop, std::sync::atomic::Ordering::Relaxed);
+    // Apple GPUs (Metal) expose 8×8×8 simdgroup matrices instead: the
+    // trainer's GEMM has an 8-wide variant; every 16×16 kernel stays off.
+    let want_coop8 = !want_coop
+        && adapter_info.backend == wgpu::Backend::Metal
+        && adapter.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+        && adapter.features().contains(wgpu::Features::SHADER_F16)
+        && coop_env.as_deref() != Some("0")
+        && adapter.cooperative_matrix_properties().iter().any(|c| {
+            c.m_size == 8
+                && c.n_size == 8
+                && c.k_size == 8
+                && c.ab_type == wgpu::CooperativeScalarType::F16
+                && c.cr_type == wgpu::CooperativeScalarType::F32
+        });
+    COOP8_OK.store(want_coop8, std::sync::atomic::Ordering::Relaxed);
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("cortiq-wgpu"),
         required_limits: limits.clone(),
@@ -21040,7 +21082,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
             wgpu::Features::SUBGROUP
         } else {
             wgpu::Features::empty()
-        } | if want_coop {
+        } | if want_coop || want_coop8 {
             wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX
         } else {
             wgpu::Features::empty()
@@ -21061,7 +21103,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         // without it `request_device` fails outright rather than dropping
         // the feature — which is how asking for cooperative matrices took
         // the whole device down and every op with it.
-        experimental_features: if want_coop {
+        experimental_features: if want_coop || want_coop8 {
             unsafe { wgpu::ExperimentalFeatures::enabled() }
         } else {
             wgpu::ExperimentalFeatures::disabled()
@@ -46199,9 +46241,16 @@ fn gemm_nn_coop(@builtin(workgroup_id) wid: vec3<u32>,
 /// pick its pipeline, and by the shader-module builder to decide whether
 /// the tensor-core source can be compiled at all.
 static COOP_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Apple's 8×8×8 f16→f32 cooperative matrices (Metal), where 16×16 is absent.
+static COOP8_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn coop_matrix_active() -> bool {
     COOP_OK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 8×8 cooperative matrices only (the trainer's Metal GEMM, `zimage::tctx`).
+pub fn coop8_active() -> bool {
+    COOP8_OK.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[inline]

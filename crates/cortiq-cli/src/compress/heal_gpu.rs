@@ -379,6 +379,234 @@ pub fn heal(data: &Data, on: LossOn, student_path: &Path, teacher_path: &Path, o
     Ok(Report { kl_start: e0, kl_best: best.0, best_step: best.2, steps: done, sec_per_step: step_secs / done.max(1) as f64, teacher_secs, trained })
 }
 
+/// DTG-MA mask training on the device (Patent 2, `skillbake` Phase A's
+/// recipe): a gate σ(m) on every MLP neuron, trained with the task's LM loss
+/// on the train windows under an L1 pressure that grows at every evaluation;
+/// every evaluation scores the hard mask (σ > τ) on the val windows, and
+/// the checkpoint kept is the best one that prunes at least the target.
+pub struct MaskCfg {
+    pub window: usize,
+    pub batch: usize,
+    /// The fraction of FFN neurons the plan keeps (the target prunes the rest).
+    pub keep_frac: f64,
+    pub lr: f64,
+    pub l1_init: f64,
+    pub l1_step: f64,
+    /// The pressure's growth per evaluation below the target: `l1 ← l1·grow
+    /// + step`. A linear rise (grow 1) stalls: on Qwen3.5-0.8B it held at
+    /// 15 % pruned from step 700 on, the task's gradient on the remaining
+    /// gates outgrowing it; ×1.5 reaches 25 % in 325 steps (healed test NLL
+    /// 0.282, ×1.2: 0.290 in 525). At the target the pressure stops rising.
+    pub l1_grow: f64,
+    pub eval_every: usize,
+    pub max_steps: usize,
+    /// Initial logit of every gate (σ(2) = 0.88, the native recipe).
+    pub mask_init: f32,
+    pub tau: f32,
+    /// Evaluations past the first one at the target before stopping (the
+    /// first was the best one in every run: the held-out loss grows with the
+    /// pruning).
+    pub settle: usize,
+}
+
+pub struct MaskReport {
+    pub logits: Vec<Vec<f32>>,
+    /// Val NLL of the open model and of the selected hard mask.
+    pub nll_open: f64,
+    pub nll_hard: f64,
+    pub pruned: f64,
+    pub step: usize,
+    pub steps: usize,
+    pub sec_per_step: f64,
+}
+
+pub fn learn_masks(data: &Data, on: LossOn, model_path: &Path, cfg: &MaskCfg, log: &dyn Fn(&str)) -> Result<MaskReport> {
+    let c = cortiq_engine::gpu_wgpu::train_ops::dev().context("no wgpu GPU")?;
+    let model = CmfModel::open_sharded(model_path)?;
+    let pad_id = model.header.tokenizer_config.as_ref().and_then(|t| t.eos_token_ids.first().copied()).unwrap_or(0);
+    let mut tr: Vec<_> = data.split(TdataSplit::Train).collect();
+    tr.sort_by_key(|r| fnv(&r.rid));
+    let trw = windows(&Stream::build(tr.into_iter(), on, pad_id, 0), cfg.window, pad_id);
+    let vaw = windows(&Stream::build(data.split(TdataSplit::Val), on, pad_id, 0), cfg.window, pad_id);
+    let nb = cfg.batch;
+    let n_train_b = trw.ids.len() / nb;
+    let n_val_b = (vaw.ids.len() / nb).max(usize::from(!vaw.ids.is_empty()));
+    anyhow::ensure!(n_train_b > 0 && n_val_b > 0, "DTG-MA: {} train / {} val windows of {} tokens", trw.ids.len(), vaw.ids.len(), cfg.window);
+    // a batch: ids and one-hot targets weighted by the row's score (the
+    // task's LM loss — the cross-entropy of the teacher's own text)
+    let batch = |w: &Windows, b: usize| -> (Vec<u32>, Vec<u32>, Vec<f32>, f64) {
+        let (mut ids, mut nx, mut wt) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..nb {
+            let j = (b * nb + i) % w.ids.len();
+            ids.extend_from_slice(&w.ids[j]);
+            nx.extend_from_slice(&w.next[j]);
+            wt.extend_from_slice(&w.rows[j]);
+        }
+        let tot = wt.iter().map(|&x| x as f64).sum();
+        (ids, nx, wt, tot)
+    };
+    let mut net = nt::Net::load(c, &model, true, true, None).map_err(|e| anyhow::anyhow!("DTG-MA: {e}"))?;
+    net.enable_masks(c);
+    let work = nt::Work::new(c, &net, nb, cfg.window);
+    let val = |net: &nt::Net| -> Result<f64> {
+        let (mut s, mut t) = (0.0, 0.0);
+        for e in 0..n_val_b {
+            let (ids, nx, wt, tot) = batch(&vaw, e);
+            s += nt::loss_sum(c, net, &work, &ids, &nx, &wt, 1, true).context("DTG-MA eval failed")?;
+            t += tot;
+        }
+        Ok(s / t.max(1e-9))
+    };
+    let intro = format!("{} train + {} val windows of {} tokens, batch {nb}", trw.ids.len(), vaw.ids.len(), cfg.window);
+    let step = |b: usize, gs: f32| {
+        let (ids, nx, wt, tot) = batch(&trw, b);
+        nt::step_w(c, &net, &work, &ids, &nx, &wt, 1, gs, None, Some(tot))
+    };
+    train_masks(c, &net, n_train_b, &step, &|| val(&net), cfg, log, "S2 (device)", &intro)
+}
+
+/// The mask loop of [`learn_masks`] on a net with gates on
+/// ([`nt::Net::enable_masks`]): `step(b, gscale)` runs batch `b` (the loss
+/// is the caller's — the task's LM loss, or a KL to a teacher), `val` the
+/// held-out loss.
+#[allow(clippy::too_many_arguments)]
+pub fn train_masks(
+    c: cortiq_engine::gpu_wgpu::CtxRef,
+    net: &nt::Net,
+    n_train_b: usize,
+    step: &dyn Fn(usize, f32) -> Option<nt::StepStats>,
+    val: &dyn Fn() -> Result<f64>,
+    cfg: &MaskCfg,
+    log: &dyn Fn(&str),
+    what: &str,
+    intro: &str,
+) -> Result<MaskReport> {
+    let widths: Vec<usize> = net.layers.iter().map(|l| l.gate.m()).collect();
+    let n_all: usize = widths.iter().sum();
+    let target = (1.0 - cfg.keep_frac).clamp(0.0, 0.95);
+    let sig = |x: f32| 1.0 / (1.0 + (-x).exp());
+    let hard = |lg: &[Vec<f32>]| -> (Vec<Vec<f32>>, usize) {
+        let mut alive = 0;
+        let s = lg
+            .iter()
+            .map(|l| {
+                l.iter()
+                    .map(|&x| {
+                        let on = sig(x) > cfg.tau;
+                        alive += usize::from(on);
+                        if on { 1.0 } else { 0.0 }
+                    })
+                    .collect()
+            })
+            .collect();
+        (s, alive)
+    };
+    net.set_masks(c, &widths.iter().map(|&w| vec![1.0; w]).collect::<Vec<_>>()).context("masks")?;
+    let nll_open = val()?;
+    let mut logits: Vec<Vec<f32>> = widths.iter().map(|&w| vec![cfg.mask_init; w]).collect();
+    let (mut m1, mut m2): (Vec<Vec<f64>>, Vec<Vec<f64>>) = (widths.iter().map(|&w| vec![0.0; w]).collect(), widths.iter().map(|&w| vec![0.0; w]).collect());
+    log(&format!(
+        "{what}: DTG-MA mask over {n_all} FFN neurons — {intro}, target {:.0} % pruned, held-out loss of the open model {nll_open:.4}",
+        target * 100.0
+    ));
+    let mut l1 = cfg.l1_init;
+    // (hard NLL, logits, pruned, step) of the best checkpoint at the target,
+    // and of the most pruned one (the fallback)
+    let mut best: Option<(f64, Vec<Vec<f32>>, f64, usize)> = None;
+    let mut most: (f64, Vec<Vec<f32>>, f64, usize) = (nll_open, logits.clone(), 0.0, 0);
+    let mut since_target = None::<usize>;
+    let (mut done, mut skipped, mut secs) = (0usize, 0usize, 0f64);
+    let mut gscale = 4096f32;
+    let mut rng = 0x2545_f491_4f6c_dd1du64;
+    let mut order: Vec<usize> = (0..n_train_b).collect();
+    let t0 = Instant::now();
+    'outer: loop {
+        for i in (1..order.len()).rev() {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            order.swap(i, (rng % (i as u64 + 1)) as usize);
+        }
+        for &b in &order {
+            if done >= cfg.max_steps {
+                break 'outer;
+            }
+            let ts = Instant::now();
+            let s: Vec<Vec<f32>> = logits.iter().map(|l| l.iter().map(|&x| sig(x)).collect()).collect();
+            net.set_masks(c, &s).context("masks")?;
+            let st = step(b, gscale).context("DTG-MA step failed")?;
+            let g = net.mask_grads(c).context("mask gradients")?;
+            if !st.finite || g.iter().flatten().any(|x| !x.is_finite()) {
+                gscale = (gscale / 2.0).max(1.0);
+                skipped += 1;
+                anyhow::ensure!(skipped < 20, "DTG-MA: 20 non-finite steps");
+                continue;
+            }
+            done += 1;
+            // dL/dm = dL/ds·σ' plus the L1 pull on σ (per neuron), Adam
+            let l1_per = l1 / n_all as f64;
+            let (b1, b2, eps) = (0.9f64, 0.999f64, 1e-8f64);
+            let (c1, c2) = (1.0 - b1.powi(done as i32), 1.0 - b2.powi(done as i32));
+            for l in 0..logits.len() {
+                for j in 0..logits[l].len() {
+                    let sv = s[l][j] as f64;
+                    let d = sv * (1.0 - sv);
+                    let gr = g[l][j] as f64 * d + l1_per * d;
+                    m1[l][j] = b1 * m1[l][j] + (1.0 - b1) * gr;
+                    m2[l][j] = b2 * m2[l][j] + (1.0 - b2) * gr * gr;
+                    logits[l][j] -= (cfg.lr * (m1[l][j] / c1) / ((m2[l][j] / c2).sqrt() + eps)) as f32;
+                }
+            }
+            secs += ts.elapsed().as_secs_f64();
+            eprint!("\r  mask step {done} · loss {:.4} · L1 {l1:.3} · {:.2} s/step   ", st.loss, secs / done as f64);
+            if done % cfg.eval_every == 0 {
+                let (hs, alive) = hard(&logits);
+                net.set_masks(c, &hs).context("masks")?;
+                let e = val()?;
+                let pruned = 1.0 - alive as f64 / n_all as f64;
+                if pruned < target {
+                    l1 = l1 * cfg.l1_grow + cfg.l1_step;
+                }
+                if pruned > most.2 {
+                    most = (e, logits.clone(), pruned, done);
+                }
+                if pruned >= target {
+                    since_target.get_or_insert(done);
+                    if best.as_ref().is_none_or(|b| e < b.0) {
+                        best = Some((e, logits.clone(), pruned, done));
+                    }
+                }
+                eprintln!();
+                log(&format!(
+                    "  [A] step {done}: L1={l1:.3} pruned={:.2}% (target {:.0}%) hard {e:.4} (open {nll_open:.4}){} · {:.2} s/step · {} since the start",
+                    pruned * 100.0,
+                    target * 100.0,
+                    best.as_ref().map_or(String::new(), |b| format!(" · best at the target {:.4} (step {})", b.0, b.3)),
+                    secs / done as f64,
+                    crate::fmt_eta(t0.elapsed().as_secs_f64())
+                ));
+                if since_target.is_some_and(|f| done >= f + cfg.settle * cfg.eval_every) {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    eprintln!();
+    let (nll_hard, logits, pruned, step) = match best {
+        Some(b) => b,
+        None => {
+            log(&format!("{what}: the mask reached {:.1} % of the {:.0} % target in {done} steps — its most pruned checkpoint ranks the neurons", most.2 * 100.0, target * 100.0));
+            most
+        }
+    };
+    log(&format!(
+        "{what}: DTG-MA mask — hard {nll_hard:.4} (open {nll_open:.4}), {:.1} % pruned at step {step} of {done}, {:.2} s/step, {skipped} non-finite steps skipped",
+        pruned * 100.0,
+        secs / done.max(1) as f64
+    ));
+    Ok(MaskReport { logits, nll_open, nll_hard, pruned, step, steps: done, sec_per_step: secs / done.max(1) as f64 })
+}
+
 /// Teacher-forced NLL of the scored tokens of `recs` on the device: the
 /// trainer's forward (weights dequantized to f16 planes), each record its
 /// own window from position 0 (padding rows unscored), the loss a KL
@@ -440,7 +668,12 @@ impl DevCapture {
         let xt = cortiq_engine::gpu_wgpu::train_mm::f16_buf(c, cortiq_engine::gpu_wgpu::train_mm::pad_rows(wmax) * kp);
         let tmp = to(c, wmax * wmax);
         // accumulators within half the free weight budget; more layers take more passes
-        let room = cortiq_engine::gpu_wgpu::dsv4_vram_budget().unwrap_or(8 << 30) as usize / 2;
+        let room = match cortiq_engine::gpu_wgpu::trainer_vram_budget() {
+            Some(b) if b != u64::MAX => b as usize / 2,
+            // unified memory: the host's budget is the device's
+            Some(_) => (super::stages::mem_budget() as f64 * 0.3) as usize,
+            None => 4 << 30,
+        };
         let mut parts: Vec<Vec<usize>> = vec![Vec::new()];
         let mut used = 0usize;
         for &l in layers {
@@ -483,5 +716,42 @@ impl DevCapture {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The runtime's decode speed before and after the trainer's device has
+    /// worked in the same process (`CMF_TRAIN_TEST_MODEL`, a .cmf; on macOS
+    /// the trainer runs a wgpu Metal context beside the runtime's native
+    /// Metal): S6 scores on the trainer, then generates on the runtime.
+    #[test]
+    #[ignore]
+    fn runtime_decode_beside_the_trainer() {
+        let Ok(path) = std::env::var("CMF_TRAIN_TEST_MODEL") else { return };
+        let model = std::sync::Arc::new(CmfModel::open_sharded(&path).expect("model"));
+        let decode = |label: &str| {
+            let mut pipe = cortiq_engine::Pipeline::from_model(&model, cortiq_engine::SamplerConfig { temperature: 0.0, ..Default::default() }).expect("pipeline");
+            pipe.set_confidence(false);
+            let ids: Vec<u32> = (0..64u32).map(|i| 1000 + i * 7).collect();
+            let _ = pipe.generate_from_ids(&ids, 16, None, None).expect("warm");
+            let t0 = Instant::now();
+            let g = pipe.generate_from_ids(&ids, 192, None, None).expect("gen");
+            eprintln!("{label}: {} tokens in {:.2} s = {:.1} tok/s", g.tokens_generated, t0.elapsed().as_secs_f64(), g.tokens_generated as f64 / t0.elapsed().as_secs_f64());
+        };
+        decode("runtime alone");
+        let c = cortiq_engine::gpu_wgpu::train_ops::dev().expect("trainer device");
+        {
+            let net = nt::Net::load(c, &model, true, false, None).expect("net");
+            let w = nt::Work::new(c, &net, 1, 2048);
+            let ids: Vec<u32> = (0..2048u32).map(|i| 1000 + i % 5000).collect();
+            let tid: Vec<u32> = ids.iter().map(|&x| x + 1).collect();
+            let tp = vec![1f32; 2048];
+            let l = nt::loss_sum(c, &net, &w, &ids, &tid, &tp, 1, true).expect("nll");
+            eprintln!("trainer NLL pass done ({l:.1})");
+        }
+        decode("runtime after the trainer");
     }
 }
