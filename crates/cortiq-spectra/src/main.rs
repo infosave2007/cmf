@@ -13,7 +13,7 @@ use std::time::Instant;
 #[derive(Debug, Parser)]
 #[command(
     name = "cortiq-spectra",
-    about = "Поточная колоризация двухэнергетического рентгена"
+    about = "Streaming colorization of dual-energy X-ray images"
 )]
 struct Args {
     /// Папка с data_*.tif, gain_*.tif, offset_*.tif и reference/

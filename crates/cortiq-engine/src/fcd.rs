@@ -75,6 +75,92 @@ impl Default for FcdHyper {
     }
 }
 
+/// A training or validation token stream for the polish.
+///
+/// `weight[i]` scales the loss of predicting `ids[i]` (0 = context only),
+/// so an answer-only loss is a stream whose prompt tokens weigh 0.
+/// `starts` marks record boundaries (ascending, `starts[0] == 0`): a window
+/// then begins inside one record and nothing past that record's end is
+/// scored, so one prompt's answer is never trained on another's context.
+/// Without either, the stream is plain text and every position counts —
+/// exactly the original corpus behaviour.
+#[derive(Clone, Copy, Debug)]
+pub struct FcdStream<'a> {
+    pub ids: &'a [u32],
+    pub weight: Option<&'a [f32]>,
+    pub starts: Option<&'a [usize]>,
+}
+
+impl<'a> FcdStream<'a> {
+    pub fn plain(ids: &'a [u32]) -> Self {
+        Self { ids, weight: None, starts: None }
+    }
+
+    fn is_plain(&self) -> bool {
+        self.weight.is_none() && self.starts.is_none()
+    }
+
+    fn w(&self, i: usize) -> f32 {
+        self.weight.map_or(1.0, |w| w[i])
+    }
+
+    /// Records that carry any loss: `(start, end, first scored target,
+    /// last scored target + 1)`. A plain stream is one record.
+    fn scored_records(&self) -> Vec<(usize, usize, usize, usize)> {
+        let n = self.ids.len();
+        let whole = [0usize];
+        let starts = self.starts.unwrap_or(&whole);
+        let mut out = Vec::new();
+        for (r, &st) in starts.iter().enumerate() {
+            let en = starts.get(r + 1).copied().unwrap_or(n).min(n);
+            let mut first = None;
+            let mut last = 0;
+            for i in st + 1..en {
+                if self.w(i) > 0.0 {
+                    first.get_or_insert(i);
+                    last = i + 1;
+                }
+            }
+            if let Some(f) = first {
+                out.push((st, en, f, last));
+            }
+        }
+        out
+    }
+
+    /// Window start for record `rec` that keeps target `p` in view:
+    /// a record that fits starts at its own first token (the whole prompt
+    /// is context), a longer one at a uniform offset around `p`.
+    fn window_start(&self, rec: (usize, usize, usize, usize), p: usize, seq: usize, jitter: u64) -> usize {
+        let (st, en, _, _) = rec;
+        let max_off = self.ids.len() - seq - 1;
+        if en - st <= seq + 1 {
+            return st.min(max_off);
+        }
+        let lo = st.max(p.saturating_sub(seq));
+        let hi = (p - 1).min(max_off).max(lo);
+        (lo + (jitter as usize) % (hi - lo + 1)).min(max_off)
+    }
+
+    /// Loss weights of the `seq` targets of the window at `off` (targets
+    /// outside the window's own record weigh 0).
+    fn target_weights(&self, off: usize, seq: usize, rec: (usize, usize, usize, usize)) -> Vec<f32> {
+        let (st, en, _, _) = rec;
+        (0..seq)
+            .map(|t| {
+                let i = off + 1 + t;
+                if i > st && i < en { self.w(i) } else { 0.0 }
+            })
+            .collect()
+    }
+}
+
+/// Input of [`FcdModel::forward_span`].
+enum SpanIn<'a> {
+    Ids(&'a [u32]),
+    Hidden(Vec<f32>),
+}
+
 /// What the polish measured — written into `provenance.fcd` and
 /// reported by the CLI.
 #[derive(Clone, Debug)]
@@ -2539,15 +2625,38 @@ impl FcdModel {
         t: usize,
         ts: Option<&TrainState>,
         student: bool,
+        keep: Option<&mut Vec<Vec<f32>>>,
+    ) -> Vec<f32> {
+        self.forward_span(SpanIn::Ids(ids), 0, self.nl, b, t, ts, student, keep)
+    }
+
+    /// Layers `from..to` on the token embeddings of `ids` or on a hidden
+    /// state entering layer `from`; `keep` collects each layer's input.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_span(
+        &self,
+        input: SpanIn,
+        from: usize,
+        to: usize,
+        b: usize,
+        t: usize,
+        ts: Option<&TrainState>,
+        student: bool,
         mut keep: Option<&mut Vec<Vec<f32>>>,
     ) -> Vec<f32> {
         let hsz = self.hidden;
-        let mut h = vec![0f32; b * t * hsz];
-        for (r, &id) in ids.iter().enumerate() {
-            let src = (id as usize).min(self.embed.len() / hsz - 1) * hsz;
-            h[r * hsz..(r + 1) * hsz].copy_from_slice(&self.embed[src..src + hsz]);
-        }
-        for li in 0..self.nl {
+        let mut h = match input {
+            SpanIn::Hidden(h) => h,
+            SpanIn::Ids(ids) => {
+                let mut h = vec![0f32; b * t * hsz];
+                for (r, &id) in ids.iter().enumerate() {
+                    let src = (id as usize).min(self.embed.len() / hsz - 1) * hsz;
+                    h[r * hsz..(r + 1) * hsz].copy_from_slice(&self.embed[src..src + hsz]);
+                }
+                h
+            }
+        };
+        for li in from..to {
             if let Some(k) = keep.as_deref_mut() {
                 k.push(h.clone());
             }
@@ -2559,20 +2668,128 @@ impl FcdModel {
         h
     }
 
+    /// The vocabulary head of [`Self::loss_and_dhidden`] over normed rows:
+    /// (Σ w·ce, Σ w·kl, dNormed). `inv_w` is 1/Σw of the whole batch.
+    #[allow(clippy::too_many_arguments)]
+    fn head_core(
+        &self,
+        ns: &[f32],
+        nt: &[f32],
+        targets: &[u32],
+        kl_w: f64,
+        weights: Option<&[f32]>,
+        inv_w: f64,
+    ) -> (f64, f64, Vec<f32>) {
+        let hsz = self.hidden;
+        let n = targets.len();
+        let pos_w = |i: usize| weights.map_or(1.0, |w| w[i] as f64);
+        let pool = self.pool.as_deref();
+        let wh = self.head_weight();
+        let vs = self.vocab;
+        let mut ce_sum = 0f64;
+        let mut kl_sum = 0f64;
+        let mut dns = vec![0f32; n * hsz];
+        let mut ls = vec![0f32; LM_CHUNK * vs];
+        let mut lt = vec![0f32; LM_CHUNK * vs];
+        let mut dlg = vec![0f32; LM_CHUNK * vs];
+        let mut r0 = 0usize;
+        let nth = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        while r0 < n {
+            let r1 = (r0 + LM_CHUNK).min(n);
+            let c = r1 - r0;
+            // a chunk with nothing scored adds no loss and no gradient
+            if weights.is_some_and(|w| w[r0..r1].iter().all(|&x| x == 0.0)) {
+                r0 = r1;
+                continue;
+            }
+            ops::gemm_nt(
+                &ns[r0 * hsz..r1 * hsz],
+                wh,
+                &mut ls[..c * vs],
+                c,
+                hsz,
+                vs,
+                pool,
+            );
+            ops::gemm_nt(
+                &nt[r0 * hsz..r1 * hsz],
+                wh,
+                &mut lt[..c * vs],
+                c,
+                hsz,
+                vs,
+                pool,
+            );
+            // Rows are independent (each writes only its own gradient row):
+            // the vocabulary-wide softmaxes run on all cores.
+            let per = c.div_ceil(nth.min(c)).max(1);
+            let parts: Vec<(f64, f64)> = std::thread::scope(|sc| {
+                let (ls, lt, pos_w) = (&ls, &lt, &pos_w);
+                let hs: Vec<_> = dlg[..c * vs]
+                    .chunks_mut(per * vs)
+                    .enumerate()
+                    .map(|(ti, dchunk)| {
+                        sc.spawn(move || {
+                            let mut acc = (0f64, 0f64);
+                            for (k, drow) in dchunk.chunks_mut(vs).enumerate() {
+                                let r = ti * per + k;
+                                let w = pos_w(r0 + r);
+                                if w == 0.0 {
+                                    drow.fill(0.0);
+                                    continue;
+                                }
+                                let (ce, kl) = ops::ce_kl_position(
+                                    &ls[r * vs..(r + 1) * vs],
+                                    &lt[r * vs..(r + 1) * vs],
+                                    targets[r0 + r] as usize,
+                                    kl_w,
+                                    w * inv_w,
+                                    drow,
+                                );
+                                acc.0 += w * ce;
+                                acc.1 += w * kl;
+                            }
+                            acc
+                        })
+                    })
+                    .collect();
+                hs.into_iter().map(|h| h.join().expect("ce/kl worker")).collect()
+            });
+            for (ce, kl) in parts {
+                ce_sum += ce;
+                kl_sum += kl;
+            }
+            ops::gemm_dx(
+                &dlg[..c * vs],
+                wh,
+                &mut dns[r0 * hsz..r1 * hsz],
+                c,
+                hsz,
+                vs,
+                pool,
+            );
+            r0 = r1;
+        }
+
+        (ce_sum, kl_sum, dns)
+    }
+
     /// Loss head: chunked tied-lm_head CE+KL against the teacher hidden,
-    /// returning (ce_mean, kl_mean, dHidden_student).
+    /// returning (ce_mean, kl_mean, dHidden_student). `weights` scales each
+    /// position (the means are then weighted means; a 0 position adds
+    /// nothing and gets no gradient).
     fn loss_and_dhidden(
         &self,
         hs: &[f32],
         ht: &[f32],
         targets: &[u32],
         kl_w: f64,
+        weights: Option<&[f32]>,
     ) -> (f64, f64, Vec<f32>) {
         let hsz = self.hidden;
         let n = targets.len();
-        let pool = self.pool.as_deref();
-        let wh = self.head_weight();
-        let vs = self.vocab;
+        let wsum: f64 = weights.map_or(n as f64, |w| w.iter().map(|&v| v as f64).sum());
+        let inv_w = if wsum > 0.0 { 1.0 / wsum } else { 0.0 };
 
         let mut ns = vec![0f32; n * hsz];
         let mut invs = vec![0f32; n];
@@ -2595,59 +2812,27 @@ impl FcdModel {
             &mut invt,
         );
 
-        let inv_n = 1.0 / n as f64;
-        let mut ce_sum = 0f64;
-        let mut kl_sum = 0f64;
-        let mut dns = vec![0f32; n * hsz];
-        let mut ls = vec![0f32; LM_CHUNK * vs];
-        let mut lt = vec![0f32; LM_CHUNK * vs];
-        let mut dlg = vec![0f32; LM_CHUNK * vs];
-        let mut r0 = 0usize;
-        while r0 < n {
-            let r1 = (r0 + LM_CHUNK).min(n);
-            let c = r1 - r0;
-            ops::gemm_nt(
-                &ns[r0 * hsz..r1 * hsz],
-                wh,
-                &mut ls[..c * vs],
-                c,
-                hsz,
-                vs,
-                pool,
-            );
-            ops::gemm_nt(
-                &nt[r0 * hsz..r1 * hsz],
-                wh,
-                &mut lt[..c * vs],
-                c,
-                hsz,
-                vs,
-                pool,
-            );
-            for r in 0..c {
-                let (ce, kl) = ops::ce_kl_position(
-                    &ls[r * vs..(r + 1) * vs],
-                    &lt[r * vs..(r + 1) * vs],
-                    targets[r0 + r] as usize,
-                    kl_w,
-                    inv_n,
-                    &mut dlg[r * vs..(r + 1) * vs],
-                );
-                ce_sum += ce;
-                kl_sum += kl;
+        // Only scored rows reach the head (vocabulary GEMMs + softmaxes, the
+        // dearest part of a step): an answer-only loss scores about half of
+        // a window's positions.
+        let (ce_sum, kl_sum, dns) = match weights {
+            Some(w) if w.iter().any(|&x| x == 0.0) => {
+                let rows: Vec<usize> = (0..n).filter(|&i| w[i] > 0.0).collect();
+                let gather = |src: &[f32]| -> Vec<f32> {
+                    rows.iter().flat_map(|&r| src[r * hsz..(r + 1) * hsz].iter().copied()).collect()
+                };
+                let (nsc, ntc) = (gather(&ns), gather(&nt));
+                let tgc: Vec<u32> = rows.iter().map(|&r| targets[r]).collect();
+                let wc: Vec<f32> = rows.iter().map(|&r| w[r]).collect();
+                let (ce, kl, dnc) = self.head_core(&nsc, &ntc, &tgc, kl_w, Some(&wc), inv_w);
+                let mut dns = vec![0f32; n * hsz];
+                for (k, &r) in rows.iter().enumerate() {
+                    dns[r * hsz..(r + 1) * hsz].copy_from_slice(&dnc[k * hsz..(k + 1) * hsz]);
+                }
+                (ce, kl, dns)
             }
-            ops::gemm_dx(
-                &dlg[..c * vs],
-                wh,
-                &mut dns[r0 * hsz..r1 * hsz],
-                c,
-                hsz,
-                vs,
-                pool,
-            );
-            r0 = r1;
-        }
-
+            _ => self.head_core(&ns, &nt, targets, kl_w, weights, inv_w),
+        };
         let mut dhs = vec![0f32; n * hsz];
         ops::rmsnorm_bwd(
             hs,
@@ -2658,7 +2843,7 @@ impl FcdModel {
             &mut dhs,
             None,
         );
-        (ce_sum * inv_n, kl_sum * inv_n, dhs)
+        (ce_sum * inv_w, kl_sum * inv_w, dhs)
     }
 
     /// Checkpointed backward: per layer, recompute the intra-layer
@@ -2671,14 +2856,29 @@ impl FcdModel {
         dh_last: Vec<f32>,
         ts: &mut TrainState,
     ) {
+        self.backward_from(0, b, t, keep, dh_last, ts)
+    }
+
+    /// [`Self::backward`] down to layer `from` only (`keep[i]` is the input
+    /// of layer `from + i`): below the lowest trainable layer there is
+    /// nothing to differentiate.
+    fn backward_from(
+        &self,
+        from: usize,
+        b: usize,
+        t: usize,
+        keep: &[Vec<f32>],
+        dh_last: Vec<f32>,
+        ts: &mut TrainState,
+    ) {
         // Split-borrow: the weight view reads `data`, the grads write
         // `grad` — disjoint fields of TrainState.
         let TrainState {
             layers, data, grad, ..
         } = ts;
         let mut dh = dh_last;
-        for li in (0..self.nl).rev() {
-            let h_in = &keep[li];
+        for li in (from..self.nl).rev() {
+            let h_in = &keep[li - from];
             let nys = self.o1_flags[li];
             let slot = layers.iter().position(|&x| x == li);
             let mats_hold = self.mats(li).expect("layer mats");
@@ -2738,7 +2938,7 @@ impl FcdModel {
         let ht = self.forward_hidden(ids, b, t, None, false, None);
         let mut keep = Vec::with_capacity(self.nl);
         let hs = self.forward_hidden(ids, b, t, Some(ts), true, Some(&mut keep));
-        let (ce, kl, dhs) = self.loss_and_dhidden(&hs, &ht, tgt, kl_w);
+        let (ce, kl, dhs) = self.loss_and_dhidden(&hs, &ht, tgt, kl_w, None);
         ts.zero_grad();
         self.backward(b, t, &keep, dhs, ts);
         (1.0 - kl_w) * ce + kl_w * kl
@@ -2820,6 +3020,172 @@ impl FcdModel {
         }
         (nll / cnt.max(1) as f64).exp()
     }
+
+    /// [`Self::val_ppl`] over an [`FcdStream`]: a plain stream takes the
+    /// original evenly-spaced windows; a record stream scores up to
+    /// `4·nrounds·bs` records, evenly spaced, each window at its record's
+    /// start (or centred on its first scored token when the prompt is
+    /// longer than half a window), weighted by the stream's loss weights.
+    pub fn val_ppl_stream(
+        &self,
+        va: &FcdStream,
+        ts: Option<&TrainState>,
+        student: bool,
+        bs: usize,
+        nrounds: usize,
+        seq: usize,
+    ) -> f64 {
+        if va.is_plain() {
+            return self.val_ppl(va.ids, ts, student, bs, nrounds, seq);
+        }
+        if va.ids.len() < seq + 2 || bs == 0 {
+            return f64::NAN;
+        }
+        let recs = va.scored_records();
+        let want = (4 * nrounds * bs).min(recs.len());
+        if want == 0 {
+            return f64::NAN;
+        }
+        let picks: Vec<(usize, Vec<f32>)> = (0..want)
+            .map(|j| {
+                let rec = recs[j * recs.len() / want];
+                let (st, _, f, _) = rec;
+                let max_off = va.ids.len() - seq - 1;
+                let off = if f - st < seq / 2 { st } else { f - seq / 2 }.min(max_off);
+                (off, va.target_weights(off, seq, rec))
+            })
+            .collect();
+        let hsz = self.hidden;
+        let wh = self.head_weight();
+        let vs = self.vocab;
+        let pool = self.pool.as_deref();
+        let (mut nll, mut wsum) = (0f64, 0f64);
+        for group in picks.chunks(bs) {
+            let b = group.len();
+            let mut ids = Vec::with_capacity(b * seq);
+            let mut tgt = Vec::with_capacity(b * seq);
+            let mut tw = Vec::with_capacity(b * seq);
+            for (off, w) in group {
+                ids.extend_from_slice(&va.ids[*off..*off + seq]);
+                tgt.extend_from_slice(&va.ids[*off + 1..*off + seq + 1]);
+                tw.extend_from_slice(w);
+            }
+            let h = self.forward_hidden(&ids, b, seq, ts, student, None);
+            let n = b * seq;
+            let mut ns = vec![0f32; n * hsz];
+            let mut inv = vec![0f32; n];
+            ops::rmsnorm_fwd(&h, &self.final_norm, self.eps, self.gemma, &mut ns, &mut inv);
+            let mut lg = vec![0f32; LM_CHUNK * vs];
+            let mut r0 = 0usize;
+            while r0 < n {
+                let r1 = (r0 + LM_CHUNK).min(n);
+                let c = r1 - r0;
+                ops::gemm_nt(&ns[r0 * hsz..r1 * hsz], wh, &mut lg[..c * vs], c, hsz, vs, pool);
+                for r in 0..c {
+                    let w = tw[r0 + r] as f64;
+                    if w == 0.0 {
+                        continue;
+                    }
+                    let row = &lg[r * vs..(r + 1) * vs];
+                    let target = tgt[r0 + r] as usize;
+                    let mx = row.iter().fold(f64::NEG_INFINITY, |m, &v| m.max(v as f64));
+                    let s: f64 = row.iter().map(|&v| (v as f64 - mx).exp()).sum();
+                    nll += w * (mx + s.ln() - row[target.min(vs - 1)] as f64);
+                    wsum += w;
+                }
+                r0 = r1;
+            }
+        }
+        if wsum == 0.0 { f64::NAN } else { (nll / wsum).exp() }
+    }
+
+    /// Weighted NLL of `tgt` under final hidden `h` (rows of `tgt.len()`):
+    /// (Σ w·nll, Σ w).
+    fn nll_on(&self, h: &[f32], tgt: &[u32], w: &[f32]) -> (f64, f64) {
+        let hsz = self.hidden;
+        let wh = self.head_weight();
+        let vs = self.vocab;
+        let pool = self.pool.as_deref();
+        let n = tgt.len();
+        let mut ns = vec![0f32; n * hsz];
+        let mut inv = vec![0f32; n];
+        ops::rmsnorm_fwd(h, &self.final_norm, self.eps, self.gemma, &mut ns, &mut inv);
+        let mut lg = vec![0f32; LM_CHUNK * vs];
+        let (mut nll, mut wsum) = (0f64, 0f64);
+        let mut r0 = 0usize;
+        while r0 < n {
+            let r1 = (r0 + LM_CHUNK).min(n);
+            let c = r1 - r0;
+            if w[r0..r1].iter().any(|&x| x > 0.0) {
+                ops::gemm_nt(&ns[r0 * hsz..r1 * hsz], wh, &mut lg[..c * vs], c, hsz, vs, pool);
+                let lg = &lg;
+                let parts: Vec<(f64, f64)> = std::thread::scope(|sc| {
+                    let hs: Vec<_> = (0..c)
+                        .map(|r| {
+                            sc.spawn(move || {
+                                let wr = w[r0 + r] as f64;
+                                if wr == 0.0 {
+                                    return (0.0, 0.0);
+                                }
+                                let row = &lg[r * vs..(r + 1) * vs];
+                                let mx = row.iter().fold(f64::NEG_INFINITY, |m, &v| m.max(v as f64));
+                                let se: f64 = row.iter().map(|&v| (v as f64 - mx).exp()).sum();
+                                (wr * (mx + se.ln() - row[(tgt[r0 + r] as usize).min(vs - 1)] as f64), wr)
+                            })
+                        })
+                        .collect();
+                    hs.into_iter().map(|h| h.join().expect("nll worker")).collect()
+                });
+                for (a, b) in parts {
+                    nll += a;
+                    wsum += b;
+                }
+            }
+            r0 = r1;
+        }
+        (nll, wsum)
+    }
+}
+
+/// One fixed training/validation window of a record stream.
+struct Slot {
+    off: usize,
+    w: Vec<f32>,
+    wsum: f64,
+}
+
+/// Fixed windows over a record stream: a record that fits is one window
+/// at its start; a longer one is covered by windows at half-window steps
+/// (the last flush with its end). Windows without scored targets are left
+/// out. Fixed windows are what lets the teacher and the frozen prefix be
+/// computed once.
+fn record_slots(s: &FcdStream, seq: usize, val: bool) -> Vec<Slot> {
+    let max_off = s.ids.len() - seq - 1;
+    let mut out = Vec::new();
+    for rec in s.scored_records() {
+        let (st, en, f, _) = rec;
+        let offs: Vec<usize> = if en - st <= seq + 1 {
+            vec![st.min(max_off)]
+        } else if val {
+            // one window per record, centred on the start of the answer
+            vec![if f - st < seq / 2 { st } else { f - seq / 2 }.min(en - seq - 1).min(max_off)]
+        } else {
+            let last = (en - seq - 1).min(max_off);
+            let mut v: Vec<usize> = (st..=last).step_by((seq / 2).max(1)).collect();
+            if v.last() != Some(&last) {
+                v.push(last);
+            }
+            v
+        };
+        for off in offs {
+            let w = s.target_weights(off, seq, rec);
+            let wsum: f64 = w.iter().map(|&x| x as f64).sum();
+            if wsum > 0.0 {
+                out.push(Slot { off, w, wsum });
+            }
+        }
+    }
+    out
 }
 
 // ─────────────────────────── training loop ───────────────────────────
@@ -2853,16 +3219,76 @@ pub fn run_polish_distilled(
     out: &std::path::Path,
     gate: Option<&GenGateCfg>,
 ) -> Result<FcdReport, String> {
-    if tr.len() < hp.seq + 2 {
+    run_polish_stream(
+        model,
+        teacher,
+        o1,
+        hp,
+        FcdStream::plain(tr),
+        FcdStream::plain(va),
+        out,
+        gate,
+        None,
+    )
+}
+
+/// Files the record path runs through the runtime to build its window
+/// cache, when they differ from the training files: e.g. q8_2f copies of
+/// the teacher and the student, which the device executes, where an f16
+/// file is expanded to f32 and runs on the host.
+#[derive(Clone, Copy)]
+pub struct CacheModels<'a> {
+    pub teacher: &'a Arc<CmfModel>,
+    pub student: &'a Arc<CmfModel>,
+}
+
+/// [`run_polish_distilled`] over [`FcdStream`]s: per-token loss weights
+/// (answer-only distillation) and record-bounded windows. Plain streams
+/// reproduce the corpus behaviour exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn run_polish_stream(
+    model: &Arc<CmfModel>,
+    teacher: Option<&Arc<CmfModel>>,
+    o1: &O1Cfg,
+    hp: &FcdHyper,
+    tr: FcdStream,
+    va: FcdStream,
+    out: &std::path::Path,
+    gate: Option<&GenGateCfg>,
+    cache_models: Option<CacheModels>,
+) -> Result<FcdReport, String> {
+    if tr.ids.len() < hp.seq + 2 {
         return Err(format!(
             "train corpus too small: {} tokens < seq+2 = {}",
-            tr.len(),
+            tr.ids.len(),
             hp.seq + 2
         ));
     }
+    let tr_recs = tr.scored_records();
+    if tr_recs.is_empty() {
+        return Err("train stream has no scored positions".into());
+    }
+    // Records drawn in proportion to their scored targets, so every scored
+    // token is equally likely to be trained on.
+    let tr_cum: Vec<f64> = tr_recs
+        .iter()
+        .scan(0f64, |acc, &(_, _, f, l)| {
+            *acc += (l - f) as f64;
+            Some(*acc)
+        })
+        .collect();
     let mut fm = FcdModel::from_cmf(model, o1, hp.polish_only)?;
     fm.polish_only = hp.polish_only;
     let fm = fm;
+    if !tr.is_plain() {
+        // the record path never builds an f32 teacher replica: the runtime
+        // computes the teacher's hidden states once per window
+        let converted = fm.converted();
+        if converted.is_empty() {
+            return Err("no converted layers under this --o1 spec (nothing to polish)".into());
+        }
+        return polish_records(model, fm, teacher, converted, o1, hp, tr, va, out, gate, cache_models);
+    }
     let tfm: Option<FcdModel> = match teacher {
         Some(t) => {
             let off = O1Cfg {
@@ -2897,16 +3323,16 @@ pub fn run_polish_distilled(
         fm.nys.m,
         fm.nys.w,
         fm.nys.sink,
-        tr.len(),
-        va.len()
+        tr.ids.len(),
+        va.ids.len()
     );
 
     let mut ts = TrainState::new(&fm);
     let teacher_ppl = match &tfm {
-        Some(t) => t.val_ppl(va, None, false, hp.bs, 2, hp.seq),
-        None => fm.val_ppl(va, None, false, hp.bs, 2, hp.seq),
+        Some(t) => t.val_ppl_stream(&va, None, false, hp.bs, 2, hp.seq),
+        None => fm.val_ppl_stream(&va, None, false, hp.bs, 2, hp.seq),
     };
-    let ppl_start = fm.val_ppl(va, Some(&ts), true, hp.bs, 2, hp.seq);
+    let ppl_start = fm.val_ppl_stream(&va, Some(&ts), true, hp.bs, 2, hp.seq);
     tracing::info!(
         "fcd: quick-val teacher ppl {teacher_ppl:.2} | zero-shot o1 student ppl {ppl_start:.2}"
     );
@@ -2955,10 +3381,22 @@ pub fn run_polish_distilled(
         // match the torch RNG — the distribution does).
         let mut ids = Vec::with_capacity(n_per_step);
         let mut tgt = Vec::with_capacity(n_per_step);
+        let mut tw: Vec<f32> = Vec::with_capacity(n_per_step);
         for _ in 0..hp.bs {
-            let off = (rng.next_u64() as usize) % (tr.len() - hp.seq - 1);
-            ids.extend_from_slice(&tr[off..off + hp.seq]);
-            tgt.extend_from_slice(&tr[off + 1..off + hp.seq + 1]);
+            let off = if tr.is_plain() {
+                (rng.next_u64() as usize) % (tr.ids.len() - hp.seq - 1)
+            } else {
+                let total = *tr_cum.last().unwrap();
+                let u = (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64 * total;
+                let r = tr_cum.partition_point(|&c| c <= u).min(tr_recs.len() - 1);
+                let rec = tr_recs[r];
+                let p = rec.2 + (rng.next_u64() as usize) % (rec.3 - rec.2);
+                let off = tr.window_start(rec, p, hp.seq, rng.next_u64());
+                tw.extend(tr.target_weights(off, hp.seq, rec));
+                off
+            };
+            ids.extend_from_slice(&tr.ids[off..off + hp.seq]);
+            tgt.extend_from_slice(&tr.ids[off + 1..off + hp.seq + 1]);
         }
 
         let ht = match &tfm {
@@ -2967,7 +3405,8 @@ pub fn run_polish_distilled(
         };
         let mut keep: Vec<Vec<f32>> = Vec::with_capacity(fm.nl);
         let hs = fm.forward_hidden(&ids, hp.bs, hp.seq, Some(&ts), true, Some(&mut keep));
-        let (ce, kl, dhs) = fm.loss_and_dhidden(&hs, &ht, &tgt, hp.kl_w);
+        let (ce, kl, dhs) =
+            fm.loss_and_dhidden(&hs, &ht, &tgt, hp.kl_w, (!tr.is_plain()).then_some(&tw[..]));
         ts.zero_grad();
         fm.backward(hp.bs, hp.seq, &keep, dhs, &mut ts);
         let gn = ts.clip_and_step(hp.lr);
@@ -2980,7 +3419,7 @@ pub fn run_polish_distilled(
             el / st as f64
         );
         if hp.eval_every > 0 && st % hp.eval_every == 0 {
-            let p = fm.val_ppl(va, Some(&ts), true, hp.bs, 2, hp.seq);
+            let p = fm.val_ppl_stream(&va, Some(&ts), true, hp.bs, 2, hp.seq);
             match (&mut gate_state, gate) {
                 (Some((pipe, base)), Some(g)) => {
                     apply_trainables(pipe, &fm, &ts);
@@ -3029,7 +3468,7 @@ pub fn run_polish_distilled(
             "fcd: polish rejected by generation gate — identity artifact              (zero-shot state written; claim 13 floor)"
         );
     }
-    let ppl_final = fm.val_ppl(va, Some(&ts), true, hp.bs, 6, hp.seq);
+    let ppl_final = fm.val_ppl_stream(&va, Some(&ts), true, hp.bs, 6, hp.seq);
     let report = FcdReport {
         converted: converted.clone(),
         teacher_ppl,
@@ -3045,6 +3484,296 @@ pub fn run_polish_distilled(
             evals: gate_evals,
             chosen: gate_chosen,
         }),
+    };
+    save_polished(model, out, &fm, &ts, o1, hp, &report)?;
+    Ok(report)
+}
+
+/// The polish over a record stream (`FcdStream` with record starts): fixed
+/// windows, so the teacher's final hidden state and the student's hidden
+/// state entering its lowest trainable layer are computed once per window
+/// (the frozen prefix and the teacher never change) — the teacher is freed
+/// before training — and every step runs and differentiates only the
+/// trainable tail.
+#[allow(clippy::too_many_arguments)]
+fn polish_records(
+    model: &Arc<CmfModel>,
+    fm: FcdModel,
+    teacher: Option<&Arc<CmfModel>>,
+    converted: Vec<usize>,
+    o1: &O1Cfg,
+    hp: &FcdHyper,
+    tr: FcdStream,
+    va: FcdStream,
+    out: &std::path::Path,
+    gate: Option<&GenGateCfg>,
+    cache_models: Option<CacheModels>,
+) -> Result<FcdReport, String> {
+    let (t, hsz) = (hp.seq, fm.hidden);
+    let mut ts = TrainState::new(&fm);
+    let from = *ts.layers.iter().min().ok_or("no trainable layers")?;
+    let tr_slots = record_slots(&tr, t, false);
+    let mut va_slots = record_slots(&va, t, true);
+    if va_slots.len() > 64 {
+        // 64 val windows, evenly spaced over the records
+        let k = va_slots.len();
+        let keep: std::collections::HashSet<usize> = (0..64).map(|j| j * k / 64).collect();
+        va_slots = va_slots.into_iter().enumerate().filter(|(i, _)| keep.contains(i)).map(|(_, s)| s).collect();
+    }
+    if tr_slots.is_empty() || va_slots.is_empty() {
+        return Err("record streams have no scored windows".into());
+    }
+    let n_slots = tr_slots.len() + va_slots.len();
+    let cache_bytes = n_slots as f64 * t as f64 * hsz as f64 * 4.0 * if from > 0 { 2.0 } else { 1.0 };
+    tracing::info!(
+        "fcd: {} train + {} val windows of {t}; trainable layers {}..{} — caching the teacher and the frozen prefix ({:.2} GB)",
+        tr_slots.len(),
+        va_slots.len(),
+        from,
+        fm.nl - 1,
+        cache_bytes / 1e9
+    );
+    // ── the fixed parts of every window, computed once ──
+    let t_cache = std::time::Instant::now();
+    // The fixed parts come from the runtime's batched prefill (one window at
+    // a time, the device where there is one): the teacher's final hidden
+    // state and the student's state entering layer `from`. The training
+    // replica's own forward is the fallback for an architecture without a
+    // batched prefill.
+    let runtime = |m: &Arc<CmfModel>| -> Option<Pipeline> {
+        let mut p = Pipeline::from_model(m, SamplerConfig::default()).ok()?;
+        p.set_confidence(false);
+        p.can_prefill_batched().then_some(p)
+    };
+    let (t_file, s_file) = match cache_models {
+        Some(c) => (c.teacher, c.student),
+        None => (teacher.unwrap_or(model), model),
+    };
+    let mut t_rt = runtime(t_file);
+    let mut s_rt = if from > 0 { runtime(s_file) } else { None };
+    let fill = |s: &FcdStream, slots: &[Slot], label: &str, t_rt: &mut Option<Pipeline>, s_rt: &mut Option<Pipeline>| -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>), String> {
+        let (mut pre, mut th) = (Vec::with_capacity(slots.len()), Vec::with_capacity(slots.len()));
+        let tc = std::time::Instant::now();
+        for (k, sl) in slots.iter().enumerate() {
+            let ids = &s.ids[sl.off..sl.off + t];
+            let h = match t_rt.as_mut() {
+                Some(p) => p.final_hidden_rows(ids)?,
+                None => fm.forward_hidden(ids, 1, t, None, false, None),
+            };
+            let p = if from == 0 {
+                Vec::new()
+            } else {
+                match s_rt.as_mut() {
+                    Some(p) => p.calib_window_span(ids, None, 0, from, from)?,
+                    None => fm.forward_span(SpanIn::Ids(ids), 0, from, 1, t, None, true, None),
+                }
+            };
+            if h.len() != t * hsz || (from > 0 && p.len() != t * hsz) {
+                return Err(format!("window cache: hidden of {} / {} values, expected {}", h.len(), p.len(), t * hsz));
+            }
+            pre.push(p);
+            th.push(h);
+            if k % 64 == 63 {
+                tracing::info!("fcd: {label} cache {}/{} windows ({:.0}s)", k + 1, slots.len(), tc.elapsed().as_secs_f64());
+            }
+        }
+        Ok((pre, th))
+    };
+    // the whole-stack prefill must reproduce the span walk it replaces
+    if let (Some(p), Some(sl)) = (t_rt.as_mut(), tr_slots.first()) {
+        let ids = &tr.ids[sl.off..sl.off + t];
+        let a = p.final_hidden_rows(ids)?;
+        let b = p.calib_window_span(ids, None, 0, fm.nl, fm.nl)?;
+        let num: f64 = a.iter().zip(&b).map(|(x, y)| ((x - y) as f64).powi(2)).sum();
+        let den: f64 = b.iter().map(|y| (*y as f64).powi(2)).sum();
+        tracing::info!("fcd: teacher prefill vs span walk, relative difference {:.2e}", (num / den.max(1e-30)).sqrt());
+    }
+    // Val windows are scored at every evaluation: all of them up front.
+    // Train windows are drawn at random, steps×bs of them with repeats: each
+    // is computed when first drawn and kept, so the cache holds only what
+    // the run uses (a fraction of a long-record data set).
+    let (va_pre, va_th) = fill(&va, &va_slots, "val", &mut t_rt, &mut s_rt)?;
+    let mut tr_pre: Vec<Option<Vec<f32>>> = vec![None; tr_slots.len()];
+    let mut tr_th: Vec<Option<Vec<f32>>> = vec![None; tr_slots.len()];
+    tracing::info!("fcd: val window cache built in {:.0}s; train windows are cached as they are drawn", t_cache.elapsed().as_secs_f64());
+
+    let gather = |s: &FcdStream, slots: &[Slot], pre: &[Vec<f32>], th: &[Vec<f32>], pick: &[usize]| {
+        let mut ids = Vec::with_capacity(pick.len() * t);
+        let mut tgt = Vec::with_capacity(pick.len() * t);
+        let mut w = Vec::with_capacity(pick.len() * t);
+        let mut h0 = Vec::with_capacity(if from > 0 { pick.len() * t * hsz } else { 0 });
+        let mut ht = Vec::with_capacity(pick.len() * t * hsz);
+        for &i in pick {
+            let sl = &slots[i];
+            ids.extend_from_slice(&s.ids[sl.off..sl.off + t]);
+            tgt.extend_from_slice(&s.ids[sl.off + 1..sl.off + t + 1]);
+            w.extend_from_slice(&sl.w);
+            h0.extend_from_slice(&pre[i]);
+            ht.extend_from_slice(&th[i]);
+        }
+        (ids, tgt, w, h0, ht)
+    };
+    let student_hidden = |ids: &[u32], h0: Vec<f32>, b: usize, ts: &TrainState, keep: Option<&mut Vec<Vec<f32>>>| {
+        if from > 0 {
+            fm.forward_span(SpanIn::Hidden(h0), from, fm.nl, b, t, Some(ts), true, keep)
+        } else {
+            fm.forward_span(SpanIn::Ids(ids), 0, fm.nl, b, t, Some(ts), true, keep)
+        }
+    };
+    // weighted val ppl over every val window (teacher: cached hiddens)
+    let val_ppl = |ts: Option<&TrainState>| -> f64 {
+        let (mut nll, mut ws) = (0f64, 0f64);
+        let idx: Vec<usize> = (0..va_slots.len()).collect();
+        for chunk in idx.chunks(hp.bs.max(1)) {
+            let (ids, tgt, w, h0, ht) = gather(&va, &va_slots, &va_pre, &va_th, chunk);
+            let h = match ts {
+                Some(ts) => student_hidden(&ids, h0, chunk.len(), ts, None),
+                None => ht,
+            };
+            let (a, b) = fm.nll_on(&h, &tgt, &w);
+            nll += a;
+            ws += b;
+        }
+        if ws == 0.0 { f64::NAN } else { (nll / ws).exp() }
+    };
+    let teacher_ppl = val_ppl(None);
+    let ppl_start = val_ppl(Some(&ts));
+    tracing::info!("fcd: val ppl (scored tokens) teacher {teacher_ppl:.3} | student before training {ppl_start:.3}");
+
+    let mut gate_state: Option<(Pipeline, Vec<f64>)> = match gate {
+        Some(g) if !g.prompts.is_empty() => {
+            let greedy = SamplerConfig {
+                temperature: 0.0,
+                top_p: 1.0,
+                presence_penalty: 0.0,
+                top_k: 0,
+                repetition_penalty: 1.0,
+                min_p: 0.0,
+                seed: Some(0),
+                suppress_tokens: Vec::new(),
+                penalty_window: 0,
+            };
+            let mut pipe = Pipeline::from_model(model, greedy).map_err(|e| format!("gen-gate pipeline: {e}"))?;
+            if !hp.polish_only {
+                pipe.set_o1(Some(o1.clone()));
+            }
+            apply_trainables(&mut pipe, &fm, &ts);
+            let base = gate_gen_scores(&mut pipe, g)?;
+            tracing::info!("fcd gen-gate baseline loop-scores: {base:?}");
+            Some((pipe, base))
+        }
+        _ => None,
+    };
+    let init_snapshot: Vec<Vec<f32>> = ts.data.clone();
+    let mut gate_evals: Vec<(usize, f64, Vec<f64>, bool)> = Vec::new();
+    // the zero-shot state is a candidate: training never makes val worse
+    let mut best: (f64, Option<Vec<Vec<f32>>>, usize) = (ppl_start, None, 0);
+    let cum: Vec<f64> = tr_slots
+        .iter()
+        .scan(0f64, |a, s| {
+            *a += s.wsum;
+            Some(*a)
+        })
+        .collect();
+    let total = *cum.last().unwrap();
+    let mut rng = SplitMix64::new(hp.seed);
+    let mut losses: Vec<(f64, f64)> = Vec::with_capacity(hp.steps);
+    let t0 = std::time::Instant::now();
+    for st in 1..=hp.steps {
+        let pick: Vec<usize> = (0..hp.bs)
+            .map(|_| {
+                let u = (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64 * total;
+                cum.partition_point(|&c| c <= u).min(tr_slots.len() - 1)
+            })
+            .collect();
+        for &i in &pick {
+            if tr_th[i].is_none() {
+                let (mut p, mut h) = fill(&tr, &tr_slots[i..i + 1], "train", &mut t_rt, &mut s_rt)?;
+                tr_pre[i] = p.pop();
+                tr_th[i] = h.pop();
+            }
+        }
+        let pre_v: Vec<Vec<f32>> = pick.iter().map(|&i| tr_pre[i].clone().unwrap_or_default()).collect();
+        let th_v: Vec<Vec<f32>> = pick.iter().map(|&i| tr_th[i].clone().unwrap_or_default()).collect();
+        let local: Vec<usize> = (0..pick.len()).collect();
+        let picked: Vec<Slot> = pick.iter().map(|&i| Slot { off: tr_slots[i].off, w: tr_slots[i].w.clone(), wsum: tr_slots[i].wsum }).collect();
+        let (ids, tgt, w, h0, ht) = gather(&tr, &picked, &pre_v, &th_v, &local);
+        let mut keep: Vec<Vec<f32>> = Vec::with_capacity(fm.nl - from);
+        let t_step = std::time::Instant::now();
+        let hs = student_hidden(&ids, h0, hp.bs, &ts, Some(&mut keep));
+        let t_fwd = t_step.elapsed().as_secs_f64();
+        let (ce, kl, dhs) = fm.loss_and_dhidden(&hs, &ht, &tgt, hp.kl_w, Some(&w));
+        let t_loss = t_step.elapsed().as_secs_f64() - t_fwd;
+        ts.zero_grad();
+        fm.backward_from(from, hp.bs, t, &keep, dhs, &mut ts);
+        let t_bwd = t_step.elapsed().as_secs_f64() - t_fwd - t_loss;
+        let gn = ts.clip_and_step(hp.lr);
+        if std::env::var("CMF_BAKE_PROF").is_ok() && st % 10 == 0 {
+            tracing::info!(
+                "fcd prof step {st}: forward {t_fwd:.2}s (attn {:.2} ffn {:.2}) · loss head {t_loss:.2}s · backward {t_bwd:.2}s · adam {:.2}s",
+                prof::take(&prof::ATTN_FWD),
+                prof::take(&prof::FFN_FWD),
+                t_step.elapsed().as_secs_f64() - t_fwd - t_loss - t_bwd
+            );
+            let _ = prof::take(&prof::BWD);
+        }
+        losses.push((ce, kl));
+        tracing::info!(
+            "fcd step {st}/{}: ce {ce:.3} kl {kl:.3} |g| {gn:.3} ({:.1}s/step)",
+            hp.steps,
+            t0.elapsed().as_secs_f64() / st as f64
+        );
+        if hp.eval_every > 0 && (st % hp.eval_every == 0 || st == hp.steps) {
+            let p = val_ppl(Some(&ts));
+            let pass = match (&mut gate_state, gate) {
+                (Some((pipe, base)), Some(g)) => {
+                    apply_trainables(pipe, &fm, &ts);
+                    let scores = gate_gen_scores(pipe, g)?;
+                    let pass = gate_pass(&scores, base, g.threshold, g.baseline_slack);
+                    gate_evals.push((st, p, scores, pass));
+                    pass
+                }
+                _ => true,
+            };
+            let tag = if pass && p < best.0 {
+                best = (p, Some(ts.data.clone()), st);
+                " *best*"
+            } else {
+                ""
+            };
+            tracing::info!("fcd eval step {st}: val ppl {p:.3}{}{tag}", if pass { "" } else { " (gen-gate FAIL)" });
+        }
+    }
+    drop((t_rt, s_rt));
+    tracing::info!(
+        "fcd: {} of {} train windows were drawn and cached",
+        tr_th.iter().filter(|x| x.is_some()).count(),
+        tr_slots.len()
+    );
+    let chosen = match best.1.take() {
+        Some(snap) => {
+            ts.data = snap;
+            tracing::info!("fcd: restored best checkpoint from step {} (val ppl {:.3})", best.2, best.0);
+            Some(best.2)
+        }
+        None => {
+            ts.data = init_snapshot;
+            tracing::info!("fcd: no checkpoint beat the untrained state on val — identity written");
+            None
+        }
+    };
+    let ppl_final = val_ppl(Some(&ts));
+    let report = FcdReport {
+        converted: converted.clone(),
+        teacher_ppl,
+        ppl_start,
+        ppl_best: best.0.min(ppl_final),
+        best_step: best.2,
+        ppl_final,
+        steps_run: hp.steps,
+        sec_per_step: t0.elapsed().as_secs_f64() / hp.steps.max(1) as f64,
+        losses,
+        gate: gate_state.map(|(_, base)| GateReport { baseline: base, evals: gate_evals, chosen }),
     };
     save_polished(model, out, &fm, &ts, o1, hp, &report)?;
     Ok(report)
@@ -3145,12 +3874,17 @@ fn save_polished(
         O1Layers::Deep(n) => serde_json::json!(format!("deep{n}")),
         O1Layers::List(v) => serde_json::json!(v),
     };
-    prov.insert(
-        "o1_attn".into(),
-        serde_json::json!({
-            "layers": layers_json, "m": o1.m, "w": o1.w, "sink": o1.sink
-        }),
-    );
+    // A polish-only run names TRAINABLE layers with the o1 spec; its
+    // attention stayed exact. Writing that spec as the runtime's O(1) hint
+    // would switch those layers to Nyström attention at every later load.
+    if !hp.polish_only {
+        prov.insert(
+            "o1_attn".into(),
+            serde_json::json!({
+                "layers": layers_json, "m": o1.m, "w": o1.w, "sink": o1.sink
+            }),
+        );
+    }
     prov.insert(
         "fcd".into(),
         serde_json::json!({
@@ -3161,6 +3895,7 @@ fn save_polished(
             "ppl_final": report.ppl_final,
             "best_step": report.best_step,
             "converted_layers": report.converted,
+            "polish_only": hp.polish_only,
         }),
     );
     header.provenance = Some(serde_json::Value::Object(prov));

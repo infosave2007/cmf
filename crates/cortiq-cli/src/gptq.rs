@@ -160,6 +160,38 @@ fn read_calib_text_budget(path: &str, budget: usize) -> anyhow::Result<(String, 
     Ok((String::from_utf8_lossy(&buf).into_owned(), exhausted))
 }
 
+/// Whether a calibration source names a teacher-data directory
+/// (`PATH.tdata[:split]`), whose records are already token ids.
+pub(crate) fn is_tdata_spec(path: &str) -> bool {
+    path.contains(".tdata")
+}
+
+/// Calibration windows from teacher data: the usable records of the
+/// selected split (train by default) in file order, each cut into windows
+/// of at most `window` tokens that never cross into another record, until
+/// `want` tokens. Returns the windows and their token count.
+pub(crate) fn tdata_calib_windows(spec: &str, want: usize, window: usize) -> anyhow::Result<(Vec<Vec<u32>>, usize)> {
+    let (reader, sel) = crate::tdata::Dataset::open_selector(spec)?;
+    let window = window.max(2);
+    let (mut out, mut n) = (Vec::new(), 0usize);
+    'records: for sample in reader.stream(sel)? {
+        let s = sample?;
+        for w in s.tokens.chunks(window) {
+            if w.len() < 2 {
+                continue;
+            }
+            if n >= want {
+                break 'records;
+            }
+            let take = w.len().min(want - n).max(2);
+            out.push(w[..take].to_vec());
+            n += take;
+        }
+    }
+    anyhow::ensure!(!out.is_empty(), "{spec}: no usable records for calibration");
+    Ok((out, n))
+}
+
 /// The first `want` tokens of one calibration source, reading only as much
 /// text as that takes (≈8 bytes a token, doubled until it suffices). A cut
 /// can only disturb the last few tokens, so a margin past `want` is required
@@ -171,6 +203,11 @@ pub(crate) fn calib_source_tokens(
 ) -> anyhow::Result<Vec<u32>> {
     if want == 0 {
         return Ok(Vec::new());
+    }
+    if is_tdata_spec(path) {
+        // teacher data is already token ids: whole records, in file order
+        let (wins, _) = tdata_calib_windows(path, want, usize::MAX)?;
+        return Ok(wins.into_iter().flatten().collect());
     }
     let mut budget = want.saturating_mul(8).max(4096);
     loop {
@@ -958,6 +995,16 @@ impl CalibRun {
         let budgets = split_calib_budget(&o.calib, o.tokens.max(2));
         let (mut windows, mut used) = (Vec::new(), Vec::new());
         for (src, &want) in o.calib.iter().zip(&budgets) {
+            if is_tdata_spec(&src.path) {
+                // Teacher data: whole records, each window inside one record.
+                let (wins, n) = tdata_calib_windows(&src.path, want, window)?;
+                if n < want {
+                    eprintln!("  note: {} holds only {n} of its {want} tokens", src.path);
+                }
+                used.push((src.path.clone(), src.share, n));
+                windows.extend(wins);
+                continue;
+            }
             let ids = calib_source_tokens(&src.path, want, &|t| pipe.tokenizer.encode(t))?;
             if ids.len() < want {
                 eprintln!("  note: {} holds only {} of its {want} tokens", src.path, ids.len());
@@ -1857,7 +1904,7 @@ const FOLD_BLOCK: usize = 32;
 /// slices, divided by the same pivot, as in the serial version, so the
 /// factor is bit-identical whatever the thread count (the upper triangle is
 /// zeroed at the end instead of row by row).
-fn cholesky_lower_par(a: &mut [f64], n: usize, threads: usize) -> bool {
+pub(crate) fn cholesky_lower_par(a: &mut [f64], n: usize, threads: usize) -> bool {
     let t = threads.clamp(1, n.max(1));
     let failed = std::sync::atomic::AtomicBool::new(false);
     let barrier = std::sync::Barrier::new(t);

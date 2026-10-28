@@ -41,7 +41,7 @@ fn the_fused_attention_block_matches_the_cpu() {
         find(&format!("{p}.wo_b.weight")),
         find(&format!("{p}.wkv.weight")),
     ) else {
-        eprintln!("{path} — не игрушка DeepSeek-V4, пропуск");
+        eprintln!("{path} is not a DeepSeek-V4 toy, skipped");
         return;
     };
     let sh = |i: usize| (model.tensors[i].shape[0], model.tensors[i].shape[1]);
@@ -55,7 +55,7 @@ fn the_fused_attention_block_matches_the_cpu() {
     let rd = if hd >= 16 { 16 } else { hd & !1 };
     let eps = 1e-6f32;
     let scale = (hd as f32).powf(-0.5);
-    println!("dim={dim} q_lora={q_lora} nh={nh} hd={hd} групп={o_groups} o_lora={o_lora}");
+    println!("dim={dim} q_lora={q_lora} nh={nh} hd={hd} groups={o_groups} o_lora={o_lora}");
 
     let hidden: Vec<f32> = (0..dim).map(|i| ((i * 13) as f32 * 0.017).sin()).collect();
     let q_norm: Vec<f32> = (0..q_lora).map(|i| 1.0 + (i as f32) * 0.01).collect();
@@ -129,7 +129,7 @@ fn the_fused_attention_block_matches_the_cpu() {
     // ── the device's one submission ──
     assert!(
         gpu_wgpu::dsv4_cache_write(7, 0, 0, &cache, npos * hd),
-        "кеш не сел на карту"
+        "the cache did not settle on the card"
     );
     let w = gpu_wgpu::Dsv4AttnW {
         wq_a: i_qa,
@@ -178,20 +178,20 @@ fn the_fused_attention_block_matches_the_cpu() {
         if !gpu_wgpu::dsv4_attn_frame(
             &model, &w, g, &hidden, None, None, 7, 0, &idxs, &inv_freq, pos, None, &mut got,
         ) {
-            eprintln!("кадр отклонён устройством — пропуск");
+            eprintln!("the frame was declined by the device — skipped");
             return;
         }
         let got = &got[..cpu.len()];
         let num: f32 = cpu.iter().zip(got).map(|(a, b)| (a - b) * (a - b)).sum();
         let den: f32 = cpu.iter().map(|a| a * a).sum::<f32>().max(1e-20);
         let rel = (num / den).sqrt();
-        let name = if tap.is_empty() { "выход" } else { tap };
+        let name = if tap.is_empty() { "output" } else { tap };
         println!("  {name:>5}: {rel:.3e}");
         worst = worst.max(rel);
         // 1e-4, not 5e-3: on the exact contract the stages land at 1e-6, and
         // a threshold loose enough to pass an actual wiring fault is decoration.
-        assert!(rel < 1e-4, "ступень {name} разошлась на {rel:.3e}");
+        assert!(rel < 1e-4, "stage {name} diverged by {rel:.3e}");
     }
-    println!("сшитый блок внимания: худшая ступень {worst:.3e}");
+    println!("stitched attention block: worst stage {worst:.3e}");
     gpu_wgpu::dsv4_cache_clear(7);
 }

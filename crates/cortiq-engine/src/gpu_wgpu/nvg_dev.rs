@@ -19,7 +19,7 @@
 //! shape). Each call records its dispatches and submits; readbacks wait.
 
 use super::train_ops::{self, Disp, Mod, elt_fold};
-use super::{Ctx, ctx, submit};
+use super::{Ctx, submit, trainer_ctx as ctx};
 
 /// A row-major f32 matrix on the device.
 pub struct DMat {

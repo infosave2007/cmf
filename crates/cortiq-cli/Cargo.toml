@@ -36,7 +36,7 @@ cortiq-core = { path = "../cortiq-core", version = "0.8.24" }
 # `phonon` is first introduced by this release.  Pin the published CLI to the
 # matching engine so `cargo install cortiq-cli` cannot resolve an older engine
 # which lacks that feature.
-cortiq-engine = { path = "../cortiq-engine", version = "=0.8.38" }
+cortiq-engine = { path = "../cortiq-engine", version = "=0.8.39" }
 cortiq-net = { path = "../cortiq-net", version = "0.8.24" }
 cortiq-server = { path = "../cortiq-server", version = "0.8.24" }
 # `cortiq decide` / `cortiq decision …` and the decision branch of serve.
@@ -47,6 +47,7 @@ axum = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 memmap2 = { workspace = true }
 # Minimal blocking HTTP client (rustls) so `cortiq convert` can pull a model

@@ -362,7 +362,7 @@ pub fn sparse_attend(
     }
     if std::env::var("CMF_ATTN_DEBUG").is_ok() {
         eprintln!(
-            "    [порт] позиций={} score={:?} sink={sink:.4} denom={denom:.4} |q|={:.3}",
+            "    [port] positions={} score={:?} sink={sink:.4} denom={denom:.4} |q|={:.3}",
             idxs.iter().filter(|&&p| p != usize::MAX).count(),
             scores
                 .iter()
@@ -1145,7 +1145,7 @@ pub(crate) mod prof {
         let prep = PREP_NS.load(Ordering::Relaxed) as f64 / 1e6;
         let cw = CACHEW_NS.load(Ordering::Relaxed) as f64 / 1e6;
         eprintln!(
-            "[dsv4-профиль] ХОСТ-ПРЕП слоя: {:.0} мс/токен, KV-заливки: {:.0} мс/токен",
+            "[dsv4-profile] layer HOST PREP: {:.0} ms/token, KV uploads: {:.0} ms/token",
             prep / toks as f64,
             cw / toks as f64
         );
@@ -1154,15 +1154,15 @@ pub(crate) mod prof {
             let f = crate::gpu_wgpu::DSV4_FILLS.load(Ordering::Relaxed);
             let fb = crate::gpu_wgpu::DSV4_FILL_BYTES.load(Ordering::Relaxed);
             eprintln!(
-                "[dsv4-профиль] ЗАЛИВКИ СЛОТОВ: {:.1} эксп/токен, {:.0} МБ/токен",
+                "[dsv4-profile] SLOT UPLOADS: {:.1} experts/token, {:.0} MB/token",
                 f as f64 / toks as f64,
                 fb as f64 / 1e6 / toks as f64
             );
         }
         eprintln!(
-            "[dsv4-профиль] {calls} вызовов слоя за {toks} токенов | \
-             на токен: внимание {:.0} мс, MoE {:.0} мс, гипер-связи+нормы {:.0} мс, \
-             голова {:.0} мс | на вызов: внимание {:.2}, MoE {:.2}, связи {:.2}",
+            "[dsv4-profile] {calls} layer calls over {toks} tokens | \
+             per token: attention {:.0} ms, MoE {:.0} ms, hyper-connections+norms {:.0} ms, \
+             head {:.0} ms | per call: attention {:.2}, MoE {:.2}, connections {:.2}",
             a / toks as f64,
             m / toks as f64,
             hc / toks as f64,
@@ -1172,7 +1172,7 @@ pub(crate) mod prof {
             hc / calls as f64,
         );
         eprintln!(
-            "[dsv4-профиль] весь проход {:.0} мс на токен; вне счётчиков {:.0} мс",
+            "[dsv4-profile] whole pass {:.0} ms per token; outside the counters {:.0} ms",
             all / toks as f64,
             (all - a - m - hd) / toks as f64,
         );
@@ -1182,8 +1182,8 @@ pub(crate) mod prof {
             let aw = crate::gpu_wgpu::ATT_WAIT_NS.load(Ordering::Relaxed) as f64 / 1e6;
             if ae + aw > 0.0 {
                 eprintln!(
-                    "[dsv4-профиль] кадр внимания на вызов: кодирование {:.2} мс, \
-                     отправка и ожидание {:.2} мс",
+                    "[dsv4-profile] attention frame per call: encoding {:.2} ms, \
+                     submit and wait {:.2} ms",
                     ae / calls as f64,
                     aw / calls as f64,
                 );
@@ -1196,7 +1196,7 @@ pub(crate) mod prof {
             let un = crate::gpu_wgpu::UPLOAD_NS.load(Ordering::Relaxed);
             if ub > 0 && un > 0 {
                 eprintln!(
-                    "[dsv4-профиль] ЗАЛИВКА весов: {:.1} ГБ за {:.1} с ({:.0} МБ/с)",
+                    "[dsv4-profile] weight UPLOAD: {:.1} GB in {:.1} s ({:.0} MB/s)",
                     ub as f64 / 1e9,
                     un as f64 / 1e9,
                     ub as f64 / (un as f64 / 1e9) / 1e6,
@@ -1205,8 +1205,8 @@ pub(crate) mod prof {
             let sub = crate::gpu_wgpu::SUBMITS.load(Ordering::Relaxed);
             if sub > 0 {
                 eprintln!(
-                    "[dsv4-профиль] ОТПРАВОК на карту: {:.1} на токен, ПРОХОДОВ {:.0} \
-                     ({:.1} на слой)",
+                    "[dsv4-profile] SUBMITS to the card: {:.1} per token, PASSES {:.0} \
+                     ({:.1} per layer)",
                     sub as f64 / toks as f64,
                     crate::gpu_wgpu::PASSES.load(Ordering::Relaxed) as f64 / toks as f64,
                     crate::gpu_wgpu::PASSES.load(Ordering::Relaxed) as f64 / calls as f64,
@@ -1216,8 +1216,8 @@ pub(crate) mod prof {
             if cl > 0 {
                 let toks2 = toks.max(1) as f64;
                 eprintln!(
-                    "[dsv4-профиль] ЦЕПОЧКА на токен: кодирование {:.2} мс, \
-                     ожидание {:.2} мс ({} слоёв, {} отправок)",
+                    "[dsv4-profile] CHAIN per token: encoding {:.2} ms, \
+                     wait {:.2} ms ({} layers, {} submits)",
                     crate::gpu_wgpu::CHAIN_ENC_NS.load(Ordering::Relaxed) as f64 / 1e6 / toks2,
                     crate::gpu_wgpu::CHAIN_WAIT_NS.load(Ordering::Relaxed) as f64 / 1e6 / toks2,
                     cl / toks.max(1),
@@ -1231,8 +1231,8 @@ pub(crate) mod prof {
                     a.load(Ordering::Relaxed) as f64 / 1e6 / calls as f64
                 };
                 eprintln!(
-                    "[dsv4-профиль] кадр MoE на вызов: кодирование {:.2} мс, \
-                     отправка и ожидание {:.2} мс",
+                    "[dsv4-profile] MoE frame per call: encoding {:.2} ms, \
+                     submit and wait {:.2} ms",
                     e / calls as f64,
                     wt / calls as f64,
                 );
@@ -1244,8 +1244,8 @@ pub(crate) mod prof {
                             / an as f64
                     };
                     eprintln!(
-                        "[dsv4-профиль]   ВНИМАНИЕ НА КАРТЕ на вызов: одиночное {:.3} мс, \
-                         оценки {:.3} мс, применение {:.3} мс",
+                        "[dsv4-profile]   ATTENTION ON THE CARD per call: single {:.3} ms, \
+                         scores {:.3} ms, apply {:.3} ms",
                         g(0),
                         g(1),
                         g(2),
@@ -1255,7 +1255,7 @@ pub(crate) mod prof {
                 let gns = crate::gpu_wgpu::MOE_GPU_NS[0].load(Ordering::Relaxed);
                 if gn > 0 && gns > 0 {
                     eprintln!(
-                        "[dsv4-профиль]   MoE НА КАРТЕ: {:.3} мс на вызов ({gn} замеров)",
+                        "[dsv4-profile]   MoE ON THE CARD: {:.3} ms per call ({gn} samples)",
                         gns as f64 / 1e6 / gn as f64,
                     );
                 } else if gn > 0 {
@@ -1263,13 +1263,13 @@ pub(crate) mod prof {
                     // an instant kernel, and printing it as a time is how a
                     // profile starts lying.
                     eprintln!(
-                        "[dsv4-профиль]   MoE НА КАРТЕ: метки вернули НОЛЬ на {gn} замерах — \
-                         запрос времени не сработал, число не использовать"
+                        "[dsv4-profile]   MoE ON THE CARD: the timestamps returned ZERO on {gn} samples — \
+                         the time query did not work, do not use the number"
                     );
                 }
                 eprintln!(
-                    "[dsv4-профиль]   из кодирования: буферы экспертов {:.2} мс, \
-                     загрузки {:.2} мс, проходы {:.2} мс",
+                    "[dsv4-profile]   of the encoding: expert buffers {:.2} ms, \
+                     uploads {:.2} ms, passes {:.2} ms",
                     ns(&crate::gpu_wgpu::MOE_BUFS_NS),
                     ns(&crate::gpu_wgpu::MOE_UP_NS),
                     ns(&crate::gpu_wgpu::MOE_PASS_NS),
@@ -1300,11 +1300,11 @@ fn gpu_attn_enabled() -> bool {
             let have = want && crate::gpu::backend_available();
             if want && !have && std::env::var("CMF_DSV4_GPU_ATTN").is_ok() {
                 tracing::warn!(
-                    "CMF_DSV4_GPU_ATTN задан, но устройства нет — блок внимания                      остаётся на CPU. Проверьте CMF_GPU=wgpu и Vulkan-ICD."
+                    "CMF_DSV4_GPU_ATTN is set but there is no device — the attention block                      stays on the CPU. Check CMF_GPU=wgpu and the Vulkan ICD."
                 );
             }
             if std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok() {
-                eprintln!("кадр dsv4: запрошен={want} доступен={have}");
+                eprintln!("dsv4 frame: requested={want} available={have}");
             }
             have
         })
@@ -1464,7 +1464,7 @@ pub fn attention_step(
     let pos = st.pos;
     if std::env::var("CMF_FREQ_DEBUG").is_ok() && li == 0 && pos == 0 {
         eprintln!(
-            "    [порт] rd={rd} частот={} inv_freq[0..4]={:?}",
+            "    [port] rd={rd} frequencies={} inv_freq[0..4]={:?}",
             inv_freq.len(),
             &inv_freq[..4.min(inv_freq.len())]
         );
@@ -1851,7 +1851,7 @@ fn dsv4_layer_loop(
         if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
             if let (Some(idx), Some(model)) = (g.head.model_idx(), g.head.model_arc()) {
                 let ok = crate::gpu_wgpu::dsv4_weight_ready(&model, idx);
-                tracing::info!("dsv4: голова на карте: {}", if ok { "да" } else { "нет" });
+                tracing::info!("dsv4: head on the card: {}", if ok { "yes" } else { "no" });
             }
         }
     }
@@ -1985,10 +1985,10 @@ fn dsv4_layer_loop(
                 .filter_map(|(li, _)| pack_for(&layers[li], cfg, li).map(|p| (li, p.globals.len())))
                 .collect();
             if host.is_empty() && partial.is_empty() {
-                tracing::info!("dsv4: все {} слоёв на карте", on_dev.len());
+                tracing::info!("dsv4: all {} layers on the card", on_dev.len());
             } else {
                 tracing::info!(
-                    "dsv4: {} из {} слоёв используют карту; частичные {:?}; на хосте {:?}",
+                    "dsv4: {} of {} layers use the card; partial {:?}; on the host {:?}",
                     active_dev.len() - host.len(),
                     on_dev.len(),
                     partial,
@@ -2027,7 +2027,7 @@ fn dsv4_layer_loop(
             .filter(|&i| st.dev_set[i] && !active_dev[i])
             .collect();
         if !left.is_empty() {
-            tracing::warn!("слои {left:?} ушли с карты — кеши на разных сторонах");
+            tracing::warn!("layers {left:?} left the card — caches on different sides");
             return false;
         }
         // A layer that was active remains device-owned. Its full/partial mode
@@ -2543,7 +2543,7 @@ fn dsv4_layer_loop(
                 }
                 let packed = pack_for(l, cfg, li).map_or(0, |p| p.globals.len());
                 tracing::info!(
-                    "слой {li} на хосте: упаковано {packed} экспертов из {}",
+                    "layer {li} on the host: packed {packed} experts of {}",
                     cfg.n_routed_experts
                 );
             }
@@ -2552,7 +2552,7 @@ fn dsv4_layer_loop(
                 .find_map(|l| l.experts.first().and_then(|e| e.w1.model_arc()))
                 .map_or(0, |m| crate::gpu_wgpu::pin_weights(&m, &idxs));
             tracing::info!(
-                "закреплено на карте: {pinned} тензоров {} слоёв",
+                "pinned on the card: {pinned} tensors of {} layers",
                 on_dev.iter().filter(|&&x| x).count()
             );
         }
@@ -4184,7 +4184,7 @@ fn pack_freq_order(li: usize, n: usize) -> Option<Vec<usize>> {
             let text = match std::fs::read_to_string(&path) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("CMF_DSV4_PACK_FREQ={path} не читается ({e}) — порядок по id");
+                    eprintln!("CMF_DSV4_PACK_FREQ={path} is unreadable ({e}) — ordering by id");
                     return None;
                 }
             };
@@ -4524,7 +4524,7 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
                 Some(t) => tensors.push(t),
                 None => {
                     if std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok() {
-                        eprintln!("слой {li}: эксперт {gi} без индексов в каталоге");
+                        eprintln!("layer {li}: expert {gi} has no indices in the catalog");
                     }
                     return None;
                 }
@@ -4541,12 +4541,12 @@ fn pack_for(l: &Dsv4Layer, cfg: &Dsv4Cfg, li: usize) -> Option<std::sync::Arc<Pa
                     std::sync::atomic::AtomicBool::new(false);
                 if !SAID_ZERO.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     tracing::warn!(
-                        "начиная со слоя {li}, в бюджете VRAM не осталось места даже под одного \
-                         эксперта — остальные веса остаются mmap-backed и читаются по требованию"
+                        "from layer {li} on, the VRAM budget has no room for even one \
+                         expert — the remaining weights stay mmap-backed and are read on demand"
                     );
                 }
             } else {
-                tracing::warn!("слой {li}: маска не оставила ни одного эксперта");
+                tracing::warn!("layer {li}: the mask left no expert");
             }
             return None;
         }
@@ -4615,18 +4615,18 @@ fn moe_frame(
     macro_rules! no {
         ($($t:tt)*) => {{
             if std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok() {
-                eprintln!("кадр MoE отклонён: {}", format_args!($($t)*));
+                eprintln!("MoE frame declined: {}", format_args!($($t)*));
             }
             return None;
         }};
     }
     let Some(pk) = pack_for(l, cfg, li) else {
-        no!("слой {li}: упаковка экспертов не построена");
+        no!("layer {li}: the expert packing was not built");
     };
     // The router is a small f32 tensor and is usually NOT mapped; the handle
     // has to come from something that is.
     let Some(model) = l.experts.first().and_then(|e| e.w1.model_arc()) else {
-        no!("слой {li}: эксперты не отображены из файла");
+        no!("layer {li}: the experts are not mapped from the file");
     };
     let subset = !pk.route_complete();
     let needs_remap = pk.needs_remap();
@@ -4772,7 +4772,7 @@ fn moe_frame(
         Some(f) => {
             let v: Vec<usize> = f.iter().map(|&g| pk.to_slot[g]).collect();
             if v.contains(&usize::MAX) {
-                no!("слой {li}: хеш-слой называет эксперта вне упаковки");
+                no!("layer {li}: the hash layer names an expert outside the packing");
             }
             Some(v)
         }
@@ -4877,7 +4877,7 @@ fn moe_frame(
     if std::env::var("CMF_DSV4_MOE_CHECK").is_ok() {
         let csum: f32 = cold.iter().map(|c| c.1).sum();
         eprintln!(
-            "[холодные] слой {li}: вернулось {} из {} | сумма холодных {csum:.4} | \
+            "[cold] layer {li}: {} of {} returned | cold sum {csum:.4} | \
              route_scale {:.4} | {:?}",
             cold.len(),
             cfg.top_k,
@@ -5134,8 +5134,8 @@ pub fn moe_step(
                 if rel > 1e-3 {
                     let packed = pack_for(l, cfg, li).map_or(0, |p| p.globals.len());
                     eprintln!(
-                        "[кадр MoE] слой {li}: расхождение {rel:.3e} | выбрано {} | \
-                         упаковано {packed} из {} | хеш={} | смещение={}",
+                        "[MoE frame] layer {li}: divergence {rel:.3e} | selected {} | \
+                         packed {packed} of {} | hash={} | offset={}",
                         idx.len(),
                         cfg.n_routed_experts,
                         l.tid2eid.is_some(),
@@ -5255,7 +5255,7 @@ pub fn moe_step(
                             .sum();
                         let den: f32 = want.iter().map(|a| a * a).sum::<f32>().max(1e-20);
                         eprintln!(
-                            "[dsv4-gpu] слой {li}: расхождение {:.3e} | |CPU|={:.5} |GPU|={:.5} | экспертов {}",
+                            "[dsv4-gpu] layer {li}: divergence {:.3e} | |CPU|={:.5} |GPU|={:.5} | experts {}",
                             (num / den).sqrt(),
                             den.sqrt(),
                             out.iter().map(|x| x * x).sum::<f32>().sqrt(),
@@ -6084,19 +6084,19 @@ fn forward_chunk_batched(
             })
             .unwrap_or(st.dev_set.len());
         let why = if b < 2 {
-            "токенов меньше двух"
+            "fewer than two tokens"
         } else if !chain_enabled() {
-            "цепочка выключена"
+            "the chain is off"
         } else if !st.dev_owned {
-            "карта ещё не владеет состоянием"
+            "the card does not own the state yet"
         } else if st.dev_set.len() != layers.len() {
-            "набор слоёв ещё не зафиксирован"
+            "the layer set is not fixed yet"
         } else if st.dev_set[gpu_end.min(st.dev_set.len())..]
             .iter()
             .enumerate()
             .any(|(i, &on)| on && !st.partial_set.get(gpu_end + i).copied().unwrap_or(false))
         {
-            "слои на карте не образуют префикс"
+            "the layers on the card do not form a prefix"
         } else {
             ""
         };
@@ -6106,9 +6106,9 @@ fn forward_chunk_batched(
             // to batch.  The caller immediately takes the exact walk, so a
             // warning here looked like a generation failure when nothing had
             // failed. Keep the reason available only to the diagnostic gate.
-            tracing::debug!("dsv4: пакет preflight — {why}");
+            tracing::debug!("dsv4: batch preflight — {why}");
             if std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok() {
-                eprintln!("dsv4: пакет preflight — {why}");
+                eprintln!("dsv4: batch preflight — {why}");
             }
             return false;
         }
@@ -6191,7 +6191,7 @@ fn forward_chunk_batched(
         // two apart.
         {
             static SAID: std::sync::Once = std::sync::Once::new();
-            SAID.call_once(|| tracing::warn!("dsv4: префилл пакетами по {b}"));
+            SAID.call_once(|| tracing::warn!("dsv4: prefill in batches of {b}"));
         }
         // Only the last token's logits are read; the rest of the chunk exists
         // to fill the caches. The head consumes the hyper-connection state,
@@ -6515,7 +6515,7 @@ fn host_tail_walk_batch(
         }
         if spec_time {
             eprintln!(
-                "хвост слоя {li}: attn {:.1} мс, клей {:.1}, moe {:.1}, expand {:.1}",
+                "layer {li} tail: attn {:.1} ms, glue {:.1}, moe {:.1}, expand {:.1}",
                 (t_glue - t_attn).as_secs_f64() * 1e3,
                 (t_moe - t_glue).as_secs_f64() * 1e3,
                 (t_exp - t_moe).as_secs_f64() * 1e3,
@@ -7181,7 +7181,7 @@ pub fn dsv4_verify_chunk(
     st.pos = pos0 + b;
     if spec_time {
         eprintln!(
-            "verify: тень+сид+цепочка {:.1} мс, хвост+голова {:.1} мс",
+            "verify: shadow+seed+chain {:.1} ms, tail+head {:.1} ms",
             t_chain.as_secs_f64() * 1e3,
             (t0.elapsed() - t_chain).as_secs_f64() * 1e3,
         );
@@ -7225,7 +7225,7 @@ pub fn dsv4_spec_finish(
         .map(|li| (li, txn.dev_filled[li], cfg.window, hd))
         .collect();
     if !crate::gpu_wgpu::dsv4_spec_commit_windows(st.kv_id, &win_metas, b, k) {
-        sfail!("коммит окон");
+        sfail!("window commit");
     }
     if k == b {
         // Every stream mutation was the walk's own kernels in walk order —
@@ -7234,26 +7234,26 @@ pub fn dsv4_spec_finish(
     }
     // ── device: restore to the snapshot, then replay the accepted tokens ──
     let Some(sh) = txn.shadow.take() else {
-        sfail!("нет тени")
+        sfail!("no shadow")
     };
     if !crate::gpu_wgpu::dsv4_spec_restore(&sh) {
         sfail!("restore");
     }
     let Some(model) = layers[0].experts.first().and_then(|e| e.w1.model_arc()) else {
-        sfail!("нет модели");
+        sfail!("no model");
     };
     let mut plan: Vec<(usize, crate::gpu_wgpu::Dsv4Prep)> = Vec::new();
     let mut freqs_own: Vec<&[f32]> = Vec::new();
     for li in 0..txn.gpu_end {
         let l = &layers[li];
         let Some(wkv) = l.wkv.model_idx() else {
-            sfail!("wkv слоя {li}")
+            sfail!("wkv of layer {li}")
         };
         let comp = match &l.compressor {
             None => None,
             Some(cp) => {
                 let (Some(a), Some(bx)) = (cp.wkv.model_idx(), cp.wgate.model_idx()) else {
-                    sfail!("компрессор слоя {li}");
+                    sfail!("compressor of layer {li}");
                 };
                 Some((
                     crate::gpu_wgpu::Dsv4CompW {
@@ -7283,7 +7283,7 @@ pub fn dsv4_spec_finish(
                     ixr.wq_b.model_idx(),
                     ixr.weights_proj.model_idx(),
                 ) else {
-                    sfail!("индексер слоя {li}");
+                    sfail!("indexer of layer {li}");
                 };
                 let ih = ixr.weights_proj.rows();
                 Some((
@@ -7674,7 +7674,7 @@ fn forward_token_inner(
             }
             if trace_on() && (st.pos % 64 == 0 || st.pos == 199) {
                 eprintln!(
-                    "[dsv4]  кеши слоя {li}: окно={} сжатых={} индекс={} (ratio={:?})",
+                    "[dsv4]  caches of layer {li}: window={} compressed={} index={} (ratio={:?})",
                     st.window[li].len() / cfg.head_dim.max(1),
                     st.compressed[li].len() / cfg.head_dim.max(1),
                     st.index_kv[li].len().max(1) / 128,
@@ -8117,7 +8117,7 @@ pub fn load_mtp(
         let layer = match load_layer(model, cfg, &p, Scheme::Mtp) {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("MTP {d}: пропущен, {e}");
+                eprintln!("MTP {d}: skipped, {e}");
                 break;
             }
         };
@@ -8153,21 +8153,21 @@ pub fn load_mtp(
             .iter()
             .find_map(|m| m.main_proj.as_ref())
             .map(|t| format!("[{}, {}]", t.rows(), t.cols()))
-            .unwrap_or_else(|| "нет".into());
+            .unwrap_or_else(|| "no".into());
         eprintln!(
-            "MTP: {} стади(я/и/й), main_proj {mp}, экспертов {}, \
-             голова уверенности {}, марков {}",
+            "MTP: {} stage(s), main_proj {mp}, experts {}, \
+             confidence head {}, markov {}",
             out.len(),
             out[0].layer.experts.len(),
             if out.iter().any(|m| m.confidence.is_some()) {
-                "есть"
+                "yes"
             } else {
-                "нет"
+                "no"
             },
             if out.iter().any(|m| m.markov_w1.is_some()) {
-                "есть"
+                "yes"
             } else {
-                "нет"
+                "no"
             },
         );
     }
@@ -9328,7 +9328,7 @@ fn dspark_apply_mask(out: &mut [Dsv4Mtp]) {
         return;
     };
     let Ok(text) = std::fs::read_to_string(&path) else {
-        eprintln!("DSpark: CMF_DSPARK_MASK={path} не читается — маска не применена");
+        eprintln!("DSpark: CMF_DSPARK_MASK={path} is unreadable — no mask applied");
         return;
     };
     for (d, line) in text.lines().enumerate() {
@@ -9347,7 +9347,7 @@ fn dspark_apply_mask(out: &mut [Dsv4Mtp]) {
         if kept == 0 {
             continue;
         }
-        eprintln!("DSpark: стадия {d} ограничена {kept}/{n} экспертами");
+        eprintln!("DSpark: stage {d} limited to {kept}/{n} experts");
         m.layer.mask = Some(mask);
     }
 }
@@ -9733,7 +9733,7 @@ pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
     }
     for &idx in &skeleton {
         if !crate::gpu_wgpu::dsv4_weight_ready(&model, idx) {
-            eprintln!("DSpark: скелет драфта не влез в VRAM — GPU-черновик выключен");
+            eprintln!("DSpark: the draft skeleton does not fit in VRAM — the GPU draft is off");
             return None;
         }
     }
@@ -9771,7 +9771,7 @@ pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
         };
         if !ok {
             eprintln!(
-                "DSpark: эксперты стадии {si} ({} + shared) не влезли в VRAM — GPU-черновик выключен",
+                "DSpark: the experts of stage {si} ({} + shared) do not fit in VRAM — the GPU draft is off",
                 sp.n_resident
             );
             return None;
@@ -9779,11 +9779,11 @@ pub fn dspark_pack_build(mtp: &[Dsv4Mtp], cfg: &Dsv4Cfg) -> Option<DsparkPack> {
     }
     let _ = crate::gpu_wgpu::pin_weights(&model, &skeleton);
     eprintln!(
-        "DSpark: {} — {} стадии по {} экспертов + shared",
+        "DSpark: {} — {} stages of {} experts + shared",
         if global_share {
-            "защищённая доля единого пула"
+            "a reserved share of the unified pool"
         } else {
-            "отдельный пак драфта на карте"
+            "a separate draft pack on the card"
         },
         stages.len(),
         stages
@@ -10062,7 +10062,7 @@ pub fn dspark_draft_gpu(
     }
     if dspark_time {
         eprintln!(
-            "DSpark GPU: граф {:.1} мс, фолды {:.1}, голова {:.1}, марков+argmax {:.1}",
+            "DSpark GPU: graph {:.1} ms, folds {:.1}, head {:.1}, markov+argmax {:.1}",
             t_graph.as_secs_f64() * 1e3,
             (t_fold - t_graph).as_secs_f64() * 1e3,
             (t_head - t_fold).as_secs_f64() * 1e3,

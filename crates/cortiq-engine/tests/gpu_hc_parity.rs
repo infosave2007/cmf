@@ -20,7 +20,7 @@ fn device_hc_join_matches_the_cpu_needs_cmf_gpu() {
             cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());
             return;
         }
-        Some(false) => panic!("wgpu запрошен, но контекст не поднялся"),
+        Some(false) => panic!("wgpu was requested but the context did not come up"),
         Some(true) => {}
     }
     use cortiq_engine::dsv4;
@@ -76,7 +76,7 @@ fn device_hc_join_matches_the_cpu_needs_cmf_gpu() {
         &mut got_exp,
     );
     if !ok {
-        panic!("устройство не поднялось — тест не проверил ничего");
+        panic!("the device did not come up — the test checked nothing");
     }
     let rel = |a: &[f32], b: &[f32]| {
         let num: f32 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
@@ -85,7 +85,7 @@ fn device_hc_join_matches_the_cpu_needs_cmf_gpu() {
     };
     let df = rel(&got_fold, &want_fold);
     let de = rel(&got_exp, &want_exp);
-    println!("свёртка: {df:.3e}   развёртка: {de:.3e}");
-    assert!(df < 1e-5, "свёртка разошлась: {df:.3e}");
-    assert!(de < 1e-5, "развёртка разошлась: {de:.3e}");
+    println!("fold: {df:.3e}   unfold: {de:.3e}");
+    assert!(df < 1e-5, "the fold diverged: {df:.3e}");
+    assert!(de < 1e-5, "the unfold diverged: {de:.3e}");
 }

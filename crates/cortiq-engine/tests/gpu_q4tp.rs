@@ -639,7 +639,7 @@ fn wgpu_q4tp_matmat_matches_dequant_reference() {
 fn wgpu_q4tp_batch_cost() {
     let _gpu = gpu_serial();
     unsafe { std::env::set_var("CMF_GPU", "wgpu") };
-    assert!(cortiq_engine::gpu_wgpu::enabled(), "нет адаптера wgpu");
+    assert!(cortiq_engine::gpu_wgpu::enabled(), "no wgpu adapter");
     // Two shapes off the release: a layer projection, and the head.
     // Shape decides everything here. 4096 rows is 256 workgroups, which
     // already saturates the card at B=1 — extra batch elements there must
@@ -703,8 +703,8 @@ fn wgpu_q4tp_batch_cost() {
             // is the wall.
             let wbytes = (rows * cols) as f64 * 0.5;
             eprintln!(
-                "СТОИМОСТЬ {rows}x{cols} B={b}: {ms:.3} мс, {:.2}x от B=1, \
-                 на токен {:.3} мс, вес-один-раз {:.0} ГБ/с",
+                "COST {rows}x{cols} B={b}: {ms:.3} ms, {:.2}x of B=1, \
+                 per token {:.3} ms, weight-once {:.0} GB/s",
                 ms / base,
                 ms / b as f64,
                 wbytes / (ms / 1000.0) / 1e9

@@ -13,7 +13,7 @@ fn batched_q4tp_matvec_matches_single_bitwise_needs_cmf_gpu() {
             cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());
             return;
         }
-        Some(false) => panic!("wgpu запрошен, но контекст не поднялся"),
+        Some(false) => panic!("wgpu was requested but the context did not come up"),
         Some(true) => {}
     }
     let dir = std::env::var("CMF_TOY_DIR").unwrap_or_else(|_| {
@@ -21,7 +21,7 @@ fn batched_q4tp_matvec_matches_single_bitwise_needs_cmf_gpu() {
     });
     let path = std::path::Path::new(&dir).join("q4.cmf");
     if !path.exists() {
-        eprintln!("стендов нет — пропуск");
+        eprintln!("no stands — skipped");
         return;
     }
     let model = Arc::new(cortiq_core::CmfModel::open_sharded(path.to_str().unwrap()).unwrap());
@@ -34,7 +34,7 @@ fn batched_q4tp_matvec_matches_single_bitwise_needs_cmf_gpu() {
             .tensors
             .iter()
             .position(|t| t.name == name)
-            .unwrap_or_else(|| panic!("нет {name}"));
+            .unwrap_or_else(|| panic!("no {name}"));
         let (rows, cols) = {
             let t = &model.tensors[e];
             (t.shape[0], t.shape[1])
@@ -78,9 +78,9 @@ fn batched_q4tp_matvec_matches_single_bitwise_needs_cmf_gpu() {
             .fold(0.0f32, f32::max);
         assert!(
             n_diff == 0,
-            "{name}: {n_diff}/{} бит-различий, max {mx:e}",
+            "{name}: {n_diff}/{} bit differences, max {mx:e}",
             single.len()
         );
-        println!("{name}: bit-exact на B={b}");
+        println!("{name}: bit-exact at B={b}");
     }
 }
