@@ -14,7 +14,7 @@ fn device_rope_heads_matches_the_cpu_needs_cmf_gpu() {
             cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());
             return;
         }
-        Some(false) => panic!("wgpu запрошен, но контекст не поднялся"),
+        Some(false) => panic!("wgpu was requested but the context did not come up"),
         Some(true) => {}
     }
     use cortiq_engine::dsv4;
@@ -43,15 +43,15 @@ fn device_rope_heads_matches_the_cpu_needs_cmf_gpu() {
             if !cortiq_engine::gpu_wgpu::rope_heads_for_test(
                 &mut got, &freq, nh, hd, rd, pos, eps, rms, inverse,
             ) {
-                panic!("устройство не поднялось — тест не проверил ничего");
+                panic!("the device did not come up — the test checked nothing");
             }
             let num: f32 = got.iter().zip(&want).map(|(a, b)| (a - b) * (a - b)).sum();
             let den: f32 = want.iter().map(|a| a * a).sum::<f32>().max(1e-20);
             let rel = (num / den).sqrt();
-            println!("rms={rms} inverse={inverse} поз={pos}: {rel:.3e}");
+            println!("rms={rms} inverse={inverse} pos={pos}: {rel:.3e}");
             assert!(
                 rel < 1e-5,
-                "rms={rms} inverse={inverse} поз={pos}: {rel:.3e}"
+                "rms={rms} inverse={inverse} pos={pos}: {rel:.3e}"
             );
         }
     }

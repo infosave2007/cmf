@@ -30,7 +30,7 @@ mod imp {
     pub fn lock_slice(_b: &[u8]) -> std::io::Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "закрепление памяти поддержано только на Linux",
+            "memory pinning is supported on Linux only",
         ))
     }
     pub fn phys_mem() -> Option<(u64, u64)> {
@@ -166,9 +166,9 @@ pub fn pin_tensors(model: &cortiq_core::CmfModel, names: &[String]) -> Pinned {
     if let Some((total, avail)) = phys_mem() {
         if want > avail {
             tracing::warn!(
-                "закрепление {:.1} ГБ при доступных {:.1} ГБ из {:.1} — \
-                 закрепляю столько, сколько поместится, остальное останется \
-                 подкачиваемым",
+                "pinning {:.1} GB with {:.1} GB available of {:.1} — \
+                 pinning as much as fits, the rest stays \
+                 pageable",
                 want as f64 / 1e9,
                 avail as f64 / 1e9,
                 total as f64 / 1e9
@@ -199,15 +199,15 @@ pub fn pin_tensors(model: &cortiq_core::CmfModel, names: &[String]) -> Pinned {
                 out.skipped += 1;
                 fails += 1;
                 if fails == 1 {
-                    tracing::warn!("первое закрепление не удалось ({n}): {e}");
+                    tracing::warn!("the first pin failed ({n}): {e}");
                 }
                 if fails >= 64 && out.bytes < 1 << 30 {
                     tracing::warn!(
-                        "закрепление упирается в RLIMIT_MEMLOCK = {:.0} МБ и поднять \
-                         его не дали (контейнеры обычно снимают CAP_SYS_RESOURCE). \
-                         Лечится вне процесса: `--ulimit memlock=-1` у докера, \
-                         LimitMEMLOCK=infinity в systemd, или запуск с этой \
-                         привилегией. Пропущено {} тензоров.",
+                        "pinning hits RLIMIT_MEMLOCK = {:.0} MB and raising \
+                         it was refused (containers usually drop CAP_SYS_RESOURCE). \
+                         The fix is outside the process: `--ulimit memlock=-1` for docker, \
+                         LimitMEMLOCK=infinity in systemd, or running with that \
+                         privilege. {} tensors skipped.",
                         limit.unwrap_or(0) as f64 / 1e6,
                         names.len() - out.skipped
                     );

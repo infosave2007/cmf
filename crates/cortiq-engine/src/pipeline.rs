@@ -1490,7 +1490,7 @@ enum PrefillIn<'a> {
 /// fallback. Every call site goes through here so the next such
 /// architecture is one line, not four.
 impl Pipeline {
-    fn can_prefill_batched(&self) -> bool {
+    pub(crate) fn can_prefill_batched(&self) -> bool {
         #[cfg(test)]
         let force_serial = self.nll_test_force_serial;
         #[cfg(not(test))]
@@ -3572,7 +3572,7 @@ impl Pipeline {
             let n = N.fetch_add(1, Ordering::Relaxed) + 1;
             if n % 100 == 0 {
                 eprintln!(
-                    "postprof: sync-wait {:.1} ms/ток | read_states {:.1} ms/ток ({n})",
+                    "postprof: sync-wait {:.1} ms/tok | read_states {:.1} ms/tok ({n})",
                     SY.load(Ordering::Relaxed) as f64 / n as f64 / 1e6,
                     RS.load(Ordering::Relaxed) as f64 / n as f64 / 1e6
                 );
@@ -6352,7 +6352,7 @@ impl Pipeline {
                         static SAID: std::sync::Once = std::sync::Once::new();
                         SAID.call_once(|| {
                             eprintln!(
-                                "dsv4-spec гейт: mtp={} mask={} router={} trace={} temp={} rep={} ",
+                                "dsv4-spec gate: mtp={} mask={} router={} trace={} temp={} rep={} ",
                                 !self.dsv4_mtp.is_empty(),
                                 task_mask.is_none(),
                                 router.is_none(),
@@ -6395,7 +6395,7 @@ impl Pipeline {
                                     dsv4_spec_bad = 0;
                                     dsv4_spec_retry_at = generated.saturating_add(32);
                                     tracing::info!(
-                                        "dsv4: draft не окупился дважды — точный walk на 32 токена"
+                                        "dsv4: the draft did not pay off twice — exact walk for 32 tokens"
                                     );
                                 }
                             }
@@ -8877,6 +8877,29 @@ impl Pipeline {
                 );
             }
             Ok(out)
+        })();
+        self.nll_end();
+        result
+    }
+
+    /// The last layer's hidden row (before the final norm) for every token
+    /// of `ids`, from a fresh sequence, through the whole-stack prefill (the
+    /// device chunk graph where there is one) — what a distillation cache of
+    /// teacher outputs needs, at prefill speed.
+    pub fn final_hidden_rows(&mut self, ids: &[u32]) -> Result<Vec<f32>, String> {
+        #[cfg(target_os = "macos")]
+        crate::gpu_metal::set_io_namespace(self.graph_kv_id);
+        if ids.is_empty() {
+            return Err("empty id sequence".to_string());
+        }
+        self.nll_begin()?;
+        let result = (|| {
+            let hidden = self.prefill_input_rows(PrefillIn::Ids(ids), 0, None)?;
+            self.nll_check_graph("hidden prefill", 0)?;
+            if hidden.len() != ids.len() * self.hidden_size {
+                return Err(format!("hidden prefill returned {} values for {} rows", hidden.len(), ids.len()));
+            }
+            Ok(hidden)
         })();
         self.nll_end();
         result
@@ -15393,7 +15416,7 @@ impl Pipeline {
             LAST.with(|l| {
                 if let Some(prev) = l.get() {
                     eprintln!(
-                        "между раундами {:.1} мс",
+                        "between rounds {:.1} ms",
                         prev.elapsed().as_secs_f64() * 1e3
                     );
                 }
@@ -15401,7 +15424,7 @@ impl Pipeline {
             });
         }
         if std::env::var("CMF_DSV4_SPEC_DEBUG").is_ok() {
-            eprintln!("spec_step: вход pos={next_pos}");
+            eprintln!("spec_step: enter pos={next_pos}");
         }
         let n_layers = self.dsv4.as_ref().map(|b| b.1.len())?;
         let cfg = self.dsv4.as_ref().map(|b| b.2)?;
@@ -15421,7 +15444,7 @@ impl Pipeline {
         let targets = crate::dsv4::dspark_targets(&self.dsv4_mtp, &cfg, n_layers);
         let pack = crate::dsv4::dspark_pack_get(&self.dsv4_mtp, &cfg);
         if pack.is_none() && std::env::var("CMF_DSV4_SPEC_DEBUG").is_ok() {
-            eprintln!("spec_step: пак не построился (targets {targets:?})");
+            eprintln!("spec_step: the pack was not built (targets {targets:?})");
         }
         let pack = pack?;
         let block = crate::dsv4::dspark_block();
@@ -15433,7 +15456,7 @@ impl Pipeline {
         let dbg = std::env::var("CMF_DSV4_SPEC_DEBUG").is_ok();
         if !crate::dsv4::dspark_take(&mut ds.main_hidden) && !ds.have_hidden {
             if dbg {
-                eprintln!("spec_step: нет захвата");
+                eprintln!("spec_step: no capture");
             }
             return None;
         }
@@ -15458,11 +15481,11 @@ impl Pipeline {
         if props.is_empty() || props[0] != t_next {
             if dbg {
                 eprintln!(
-                    "spec_step: черновик {} (props0={:?} t_next={t_next})",
+                    "spec_step: draft {} (props0={:?} t_next={t_next})",
                     if props.is_empty() {
-                        "пуст"
+                        "empty"
                     } else {
-                        "мимо"
+                        "miss"
                     },
                     props.first()
                 );
@@ -15523,7 +15546,7 @@ impl Pipeline {
             &mut walked,
         );
         if txn.is_none() && dbg {
-            eprintln!("spec_step: verify отказал");
+            eprintln!("spec_step: verify declined");
         }
         let txn = txn?;
         let spec_gpu_end = txn.gpu_end;
@@ -15554,12 +15577,12 @@ impl Pipeline {
             &self.inv_freq,
             self.pool.as_deref(),
         ) {
-            tracing::warn!("dsv4: спекулятивный откат не удался — состояние подозрительно");
+            tracing::warn!("dsv4: the speculative rollback failed — the state is suspect");
             return None;
         }
         if std::env::var("CMF_DSV4_SPEC_TIME").is_ok() {
             eprintln!(
-                "finish(k={accepted}): {:.1} мс",
+                "finish(k={accepted}): {:.1} ms",
                 t_fin.elapsed().as_secs_f64() * 1e3
             );
         }
@@ -15636,7 +15659,7 @@ impl Pipeline {
         }
         if std::env::var("CMF_DSV4_SPEC_TIME").is_ok() {
             eprintln!(
-                "spec_step total {:.1} мс (k={accepted})",
+                "spec_step total {:.1} ms (k={accepted})",
                 t_all.elapsed().as_secs_f64() * 1e3
             );
         }
@@ -15687,7 +15710,7 @@ impl Pipeline {
                 return;
             }
             eprintln!(
-                "DSpark: захват со слоёв {t:?}, блок {}",
+                "DSpark: capture from layers {t:?}, block {}",
                 crate::dsv4::dspark_block()
             );
             crate::dsv4::dspark_arm(&t, cfg.dim);
@@ -15807,16 +15830,16 @@ impl Pipeline {
             });
             let m = self.dspark_exp.len().max(1);
             eprintln!(
-                "DSpark: черновиков {}, принято в среднем {mean:.2} из {block} \
-                 (токенов за проход {:.2}), распределение {at:?}, выживание [{}]",
+                "DSpark: {} drafts, {mean:.2} of {block} accepted on average \
+                 (tokens per pass {:.2}), distribution {at:?}, survival [{}]",
                 self.dspark_hist.len(),
                 mean + 1.0,
                 surv.join(" ")
             );
             eprintln!(
-                "DSpark: разных токенов {distinct} из {} (вырожденность), \
-                 эксперты ствол {}/{} на слой за {block} токенов, \
-                 черновик {}/{} за блок, draft {:.2} мс/блок",
+                "DSpark: {distinct} distinct tokens of {} (degeneracy), \
+                 trunk experts {}/{} per layer over {block} tokens, \
+                 draft {}/{} per block, draft {:.2} ms/block",
                 self.dspark_real.len(),
                 tu / m,
                 tt / m,
@@ -23933,13 +23956,13 @@ mod tests {
                     &mut gi,
                     &mut gw,
                 ),
-                "устройство не поднялось — тест не проверил ничего"
+                "the device did not come up — the test checked nothing"
             );
             let routed = if shared.is_some() { top_k } else { gi.len() };
             assert_eq!(
                 &gi[..routed],
                 &ci[..],
-                "разные эксперты или порядок (shared={shared:?})"
+                "different experts or order (shared={shared:?})"
             );
             let d = cw
                 .iter()
@@ -23947,7 +23970,7 @@ mod tests {
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
             println!("minimax route shared={shared:?}: {ci:?} max|Δw|={d:.3e}");
-            assert!(d < 1e-6, "веса разошлись на {d:.3e}");
+            assert!(d < 1e-6, "the weights diverged by {d:.3e}");
             if let Some(s) = shared {
                 assert_eq!(gi[top_k], s as usize, "shared pin slot");
                 assert_eq!(gw[top_k], 1.0, "shared weight");
@@ -24028,7 +24051,7 @@ mod tests {
             &mut idx,
             &mut dw,
         ));
-        assert!(cold.is_empty(), "полностью резидентный банк: {cold:?}");
+        assert!(cold.is_empty(), "fully resident bank: {cold:?}");
         // With subset+pin together: routed slots carry the FLAT remap value
         // (here identity = the expert id), weights the host contract, and
         // the pinned shared keeps weight 1 — this exact combination is what
@@ -24086,19 +24109,19 @@ mod tests {
             );
             resident_weight_checked += 1;
         }
-        assert_eq!(resident_weight_checked, 2, "ровно два резидентных пика из четырёх");
+        assert_eq!(resident_weight_checked, 2, "exactly two resident peaks out of four");
         println!("partial bank: checked {resident_weight_checked} resident weights");
         assert_eq!(dw2.get(top_k).copied(), Some(1.0), "shared weight under subset");
         let mut ids: Vec<usize> = cold.iter().map(|&(e, _)| e).collect();
         ids.sort_unstable();
         let mut want = vec![ci[0], ci[2]];
         want.sort_unstable();
-        assert_eq!(ids, want, "холодные эксперты разошлись: {cold:?} против {want:?}");
+        assert_eq!(ids, want, "the cold experts diverged: {cold:?} versus {want:?}");
         for &(e, w) in &cold {
             let host = p[e] / wsum;
             let d = (w - host).abs();
             println!("cold expert {e}: device={w:.9e} host={host:.9e} Δ={d:.3e}");
-            assert!(d <= 1e-6 * host.abs().max(1.0), "cold вес эксперта {e}: Δ={d:.3e}");
+            assert!(d <= 1e-6 * host.abs().max(1.0), "cold weight of expert {e}: Δ={d:.3e}");
         }
     }
 

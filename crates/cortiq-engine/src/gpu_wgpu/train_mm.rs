@@ -1104,6 +1104,12 @@ pub fn sumsq(c: &Ctx, a: &wgpu::Buffer, n: usize) -> Option<f64> {
     Some(train_ops::download(c, &out, 64)?.iter().map(|&x| x as f64).sum())
 }
 
+/// Partial sums of squares of `a[..n]` into `out[0..64]` (one per workgroup).
+pub fn sumsq_part<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, n: usize, out: &'a wgpu::Buffer) -> Option<Disp<'a>> {
+    let md = module(c)?;
+    Some(Disp { pipe: &md.p["sumsq"], uni: vec![64, n as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], bufs: vec![(7, a), (9, out)], grid: (64, 1, 1) })
+}
+
 /// `out[m][n] = act[m][k] · plane[n][k]ᵀ · oscale` on the matrix units.
 #[allow(clippy::too_many_arguments)]
 pub fn mm(c: &Ctx, plane: &wgpu::Buffer, act: &wgpu::Buffer, out: &wgpu::Buffer, m: usize, n: usize, k: usize, oscale: f32) -> Option<zi::MmCall> {
@@ -1147,6 +1153,36 @@ pub fn mm_cols(c: &Ctx, plane: &wgpu::Buffer, act: &wgpu::Buffer, out: &wgpu::Bu
 #[allow(clippy::too_many_arguments)]
 pub fn plane_linear(c: &Ctx, plane: &wgpu::Buffer, x: &wgpu::Buffer, act16: &wgpu::Buffer, y: &wgpu::Buffer, ntok: usize, n: usize, k: usize, scale: f32) -> Option<()> {
     let ops = vec![Op::D(cvt(c, x, None, act16, ntok, k, scale)?), Op::M(mm(c, plane, act16, y, ntok, n, k, 1.0 / scale)?)];
+    run(c, &ops);
+    Some(())
+}
+
+/// `dw[m][k] = dy[ntok][m]ᵀ · x[ntok][k]` (overwritten): both operands
+/// staged transposed in f16 (`xt`, `dyt`: `[rows][ceil32(ntok)]`; dy at the
+/// gradient scale), the token axis as the GEMM's K. `k` a multiple of 128.
+#[allow(clippy::too_many_arguments)]
+pub fn weight_grad(c: &Ctx, x: &wgpu::Buffer, dy: &wgpu::Buffer, xt: &wgpu::Buffer, dyt: &wgpu::Buffer, dw: &wgpu::Buffer, ntok: usize, m: usize, k: usize, gscale: f32) -> Option<()> {
+    let kp = ntok.div_ceil(32) * 32;
+    let ops = vec![
+        Op::D(cvt_t(c, x, None, xt, ntok, k, 1.0)?),
+        Op::D(cvt_t(c, dy, None, dyt, ntok, m, gscale)?),
+        Op::M(mm(c, xt, dyt, dw, m, k, kp, 1.0 / gscale)?),
+    ];
+    run(c, &ops);
+    Some(())
+}
+
+/// `acc[k][k] += x[..ntok][k]ᵀ · x` (the input Gram of a linear): `x`
+/// staged transposed in f16 (`xt`, rows past `ntok` zero), the product into
+/// `tmp`, then added. `k` a multiple of 128.
+#[allow(clippy::too_many_arguments)]
+pub fn gram_acc(c: &Ctx, x: &wgpu::Buffer, xt: &wgpu::Buffer, acc: &wgpu::Buffer, tmp: &wgpu::Buffer, ntok: usize, k: usize) -> Option<()> {
+    let kp = ntok.div_ceil(32) * 32;
+    let ops = vec![
+        Op::D(cvt_t(c, x, None, xt, ntok, k, 1.0)?),
+        Op::M(mm(c, xt, xt, tmp, k, k, kp, 1.0)?),
+        Op::D(train_ops::elt(c, "add", k * k, acc, tmp, Some(acc), None, None, None)?),
+    ];
     run(c, &ops);
     Some(())
 }
