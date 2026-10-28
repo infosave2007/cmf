@@ -24,7 +24,7 @@ fn near(got: &[f32], want: &[f32], what: &str) {
 fn device_axpy_matches_the_cpu() {
     unsafe { std::env::set_var("CMF_GPU", "wgpu") };
     if !gpu_wgpu::enabled() {
-        eprintln!("пропуск: нет адаптера wgpu");
+        eprintln!("skipped: no wgpu adapter");
         return;
     }
     // Not a round count: the kernel is 256 wide and the tail is where a
@@ -40,7 +40,7 @@ fn device_axpy_matches_the_cpu() {
     let mut got = y0.clone();
     assert!(
         gpu_wgpu::axpy_for_test(&x, &mut got, w, false, 0),
-        "устройство отказало"
+        "the device declined"
     );
     let want: Vec<f32> = y0.iter().zip(&x).map(|(y, xv)| y + w * xv).collect();
     near(&got, &want, "y += w·x");

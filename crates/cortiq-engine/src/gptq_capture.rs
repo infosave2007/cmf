@@ -368,11 +368,43 @@ fn gram_upper_add(h: &mut [f64], xs: &[f32], b: usize, cols: usize) {
             xt[i * b + t] = v;
         }
     }
-    let nth = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(cols.div_ceil(16))
-        .max(1);
+    // Wide inputs: the batch product as GEMMs by row blocks of the upper
+    // triangle (the same f32-per-batch, f64-across-batches precision as the
+    // register kernel below). Accelerate threads itself; elsewhere the
+    // blocks go round-robin to the pool's thread budget. On an M4 the
+    // register kernel ran ~30× slower than the matrix units; on a container
+    // it spawned one thread per HOST core (128 against a 13-core quota).
+    let nth = crate::pool::Pool::effective_threads().max(1).min(cols.div_ceil(16)).max(1);
+    if cols >= 256 && std::env::var("CMF_GRAM_KERNEL").as_deref() != Ok("1") {
+        const BLK: usize = 256;
+        let blocks: Vec<usize> = (0..cols).step_by(BLK).collect();
+        let workers = if cfg!(any(target_os = "macos", target_arch = "aarch64")) { 1 } else { nth.min(blocks.len()) };
+        struct SendPtr(*mut f64);
+        unsafe impl Sync for SendPtr {}
+        unsafe impl Send for SendPtr {}
+        let hp = SendPtr(h.as_mut_ptr());
+        let (hp, xt, blocks) = (&hp, &xt, &blocks);
+        std::thread::scope(|s| {
+            for wk in 0..workers {
+                s.spawn(move || {
+                    let mut c = vec![0f32; BLK * cols];
+                    for &i0 in blocks.iter().skip(wk).step_by(workers) {
+                        let m = BLK.min(cols - i0);
+                        let n = cols - i0;
+                        crate::qtensor::sgemm_public(m, n, b, 1.0, &xt[i0 * b..], b, &xs[i0..], cols, false, &mut c[..m * n], n);
+                        for r in 0..m {
+                            // SAFETY: rows i0..i0+m of H belong to this block only.
+                            let hrow = unsafe { std::slice::from_raw_parts_mut(hp.0.add((i0 + r) * cols + i0 + r), n - r) };
+                            for (dst, &v) in hrow.iter_mut().zip(&c[r * n + r..(r + 1) * n]) {
+                                *dst += v as f64;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        return;
+    }
     struct SendPtr(*mut f64);
     unsafe impl Sync for SendPtr {}
     unsafe impl Send for SendPtr {}

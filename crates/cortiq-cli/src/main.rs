@@ -52,7 +52,9 @@ mod qi21pack;
 mod sam3pack;
 mod sam3seg;
 mod tdata;
+mod teacher_api;
 mod teacher_data;
+mod compress;
 
 use clap::{Parser, Subcommand};
 use cortiq_core::CmfModel;
@@ -1279,6 +1281,13 @@ enum Commands {
         /// The device jobs of the re-encode.
         #[arg(long, default_value = "3")]
         budget_jobs: usize,
+        /// DTG-MA before the metric: train a gate on every MLP neuron with
+        /// the same distillation loss, keep this fraction of the neurons (the
+        /// ones the gates rank highest, 128-aligned per layer, ≥ 25 % of each
+        /// layer), cut the rest out of the binary low-rank tensors, then
+        /// train the metric of what is left (NVG → DTG-MA)
+        #[arg(long, value_name = "F")]
+        mask_keep: Option<f64>,
     },
     /// One tensor through the NVG `blr` encoder with a per-stage profile, on
     /// the CPU reference path and/or the device path, from Grams captured
@@ -2258,6 +2267,14 @@ enum Commands {
         #[command(subcommand)]
         cmd: SkillCmd,
     },
+    /// Compress a model for one task: `cortiq compress SOURCE.cmf
+    /// PROMPTS.jsonl OUTPUT.cmf --ratio 0.8`. The teacher (the source, or
+    /// `--teacher` — another .cmf or any OpenAI-compatible API) answers the
+    /// prompts; the parts the task does not use leave the model (FFN width
+    /// by illumination or DTG-MA masks, unused MoE experts), the rest is
+    /// refit and healed on the answers, and held-out answers score it. The
+    /// output keeps the source's codec — quantize it afterwards if you want.
+    Compress(compress::CompressArgs),
     /// Work with finalized teacher-data (`.tdata`) directories
     TeacherData {
         #[command(subcommand)]
@@ -3138,13 +3155,16 @@ fn progress_reporter(what: &'static str) -> impl FnMut(f32) {
 enum TeacherDataCmd {
     /// Generate a finalized v1 `.tdata` directory from JSONL prompts.
     ///
-    /// This first text-only slice deliberately runs greedy direct-answer
-    /// generation (`--no-think` is required) and writes no top-k logits yet.
-    /// It keeps one model pipeline hot between records. `--disable-mtp` is
-    /// available for a reproducible plain-greedy control when a draft path is
-    /// slower or unsuitable for a long calibration job.
+    /// Greedy teacher answers, one hot pipeline for every record. A reasoning
+    /// model thinks unless `--no-think`; its `</think>` token splits each
+    /// record into exact reasoning and answer spans. An interrupted run is
+    /// continued by the same command (the directory keeps every committed
+    /// record). A generation that collapses into repetition is stopped early
+    /// and recorded as unusable. `--disable-mtp` gives a plain-greedy control.
     Generate {
-        /// Local CMF teacher model
+        /// Teacher: a local .cmf, or a model behind an API —
+        /// `openrouter:qwen/qwen3.8-27b` (key in OPENROUTER_API_KEY; needs
+        /// --tokenizer) or `api:MODEL` with CORTIQ_API_BASE
         teacher: String,
         /// JSONL prompts (`prompt` or `messages`; `id`/`category` optional)
         prompts: String,
@@ -3172,7 +3192,9 @@ enum TeacherDataCmd {
         /// v1 path rejects it rather than guessing reasoning-token boundaries.
         #[arg(long)]
         raw: bool,
-        /// Required in this initial slice: preserves a single exact answer-token span
+        /// Render the chat template with enable_thinking=false (direct answers).
+        /// Without it a reasoning model thinks first; the `</think>` token
+        /// marks the exact reasoning / answer boundary of every record
         #[arg(long)]
         no_think: bool,
         /// Keep records that reached --max-tokens (they remain marked truncated)
@@ -3186,6 +3208,55 @@ enum TeacherDataCmd {
         /// Keep only the first N accepted, de-duplicated source prompts
         #[arg(long)]
         limit: Option<usize>,
+        /// Generate only this share of the prompts, I/N (by prompt id hash;
+        /// the split is computed over all prompts first, so shards merged
+        /// with `teacher-data merge` equal one whole run)
+        #[arg(long, value_name = "I/N")]
+        shard: Option<String>,
+        /// Decoding: `greedy` (default), `file` (the teacher's recommended
+        /// sampling from `convert --sampling`), or
+        /// `temperature=0.6,top_p=0.95,top_k=20,…`. Sampled records stay
+        /// reproducible: each draws from its own seed. Greedy decoding of a
+        /// reasoning model loops; use its recommended sampling there
+        #[arg(long, default_value = "greedy")]
+        sampling: String,
+        /// API teacher: the model whose tokenizer and chat template turn the
+        /// answers into token ids (the model the data will compress)
+        #[arg(long)]
+        tokenizer: Option<String>,
+        #[command(flatten)]
+        api: teacher_api::ApiArgs,
+    },
+    /// Join shards of one generation job (`generate --shard I/N`) into one
+    /// finalized `.tdata`. Teacher, tokenizer, seed, split and generation
+    /// settings must match; a record id may appear only once.
+    Merge {
+        /// Finalized shard directories
+        #[arg(required = true)]
+        parts: Vec<String>,
+        /// New output directory ending in `.tdata`
+        #[arg(short, long)]
+        output: String,
+    },
+    /// Turn an existing answer cache into a finalized `.tdata`: a `.json`
+    /// array of `[prompt, rendered ChatML]` pairs (the DTG-MA notebooks'
+    /// cache) or JSONL rows with `prompt`/`messages` and `response`. Token ids
+    /// come from the tokenizer of `--tokenizer`; repeated prompts become
+    /// samples of one prompt; `</think>` splits reasoning from the answer.
+    Import {
+        /// The cache (.json pairs or .jsonl rows)
+        source: String,
+        /// New output directory ending in `.tdata`
+        output: String,
+        /// The .cmf whose tokenizer (and chat template) the ids are for —
+        /// the model the data will compress
+        #[arg(long)]
+        tokenizer: String,
+        /// Train/validation/test ratio
+        #[arg(long, default_value = "90/5/5")]
+        split: String,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
     },
     /// Inspect a finalized `.tdata` data set without loading its token payload
     /// all at once.  The scan validates every record/index/token range.
@@ -4022,6 +4093,10 @@ async fn main() -> anyhow::Result<()> {
                         keep_truncated,
                         disable_mtp,
                         limit,
+                        shard: None,
+                        sampling: "greedy".into(),
+                        tokenizer: None,
+                        api: Default::default(),
                     },
                 )
             }
@@ -4129,6 +4204,10 @@ async fn main() -> anyhow::Result<()> {
                 keep_truncated: teacher_keep_truncated,
                 disable_mtp: teacher_disable_mtp,
                 limit: teacher_limit,
+                shard: None,
+                sampling: "greedy".into(),
+                tokenizer: None,
+                api: Default::default(),
             },
         ),
         Commands::FfnTranspose { model, output } => tube::cmd_ffn_transpose(&model, &output),
@@ -4224,6 +4303,7 @@ async fn main() -> anyhow::Result<()> {
             budget_fit_tokens,
             budget_sel_tokens,
             budget_jobs,
+            mask_keep,
         } => {
             let signs = if train_signs {
                 let opt = cortiq_engine::gpu_wgpu::train_sign::SignOpt::parse(&sign_opt).ok_or_else(|| anyhow::anyhow!("--sign-opt: fact | fact-mom | ref"))?;
@@ -4272,6 +4352,7 @@ async fn main() -> anyhow::Result<()> {
                 budget_fit_tokens,
                 budget_sel_tokens,
                 budget_jobs,
+                mask_keep,
             })
         }
         #[cfg(not(feature = "gpu"))]
@@ -5673,6 +5754,7 @@ async fn main() -> anyhow::Result<()> {
                 skip_runtime_gate,
             ),
         },
+        Commands::Compress(args) => compress::run(args),
         Commands::TeacherData { cmd } => match cmd {
             TeacherDataCmd::Generate {
                 teacher,
@@ -5689,6 +5771,10 @@ async fn main() -> anyhow::Result<()> {
                 keep_truncated,
                 disable_mtp,
                 limit,
+                shard,
+                sampling,
+                tokenizer,
+                api,
             } => cmd_teacher_data_generate(
                 &teacher,
                 &prompts,
@@ -5705,13 +5791,25 @@ async fn main() -> anyhow::Result<()> {
                     keep_truncated,
                     disable_mtp,
                     limit,
+                    shard: shard.as_deref().map(parse_shard).transpose()?,
+                    sampling,
+                    tokenizer,
+                    api,
                 },
             ),
+            TeacherDataCmd::Merge { parts, output } => cmd_teacher_data_merge(&parts, &output),
             TeacherDataCmd::Inspect {
                 tdata,
                 verify,
                 json,
             } => cmd_teacher_data_inspect(&tdata, verify, json),
+            TeacherDataCmd::Import {
+                source,
+                output,
+                tokenizer,
+                split,
+                seed,
+            } => cmd_teacher_data_import(&source, &output, &tokenizer, &split, seed),
         },
         Commands::Gpu => {
             // `gpu_wgpu` is behind the `gpu` feature, and this arm called
@@ -5729,7 +5827,7 @@ async fn main() -> anyhow::Result<()> {
                 // cannot help.
                 if let Some((empty, one)) = cortiq_engine::gpu_wgpu::roundtrip_bench(30) {
                     println!(
-                        "  круг до устройства: пустой сабмит {empty:.2} мс · сабмит+диспатч+readback {one:.2} мс"
+                        "  round trip to the device: empty submit {empty:.2} ms · submit+dispatch+readback {one:.2} ms"
                     );
                 }
                 // CMF_GPU_DISPATCH_BENCH=1: what a dispatch costs, and whether
@@ -5895,22 +5993,326 @@ fn cmd_teacher_data_inspect(tdata_path: &str, verify: bool, json: bool) -> anyho
     Ok(())
 }
 
+/// `cortiq teacher-data import`: a foreign answer cache as `.tdata`, its
+/// text tokenized by the tokenizer of the model the data will compress.
+/// `teacher-data generate openrouter:MODEL …`: the API answers the prompts
+/// into `<output>.answers.jsonl` (resumable), then the answers become teacher
+/// data through `--tokenizer`'s tokenizer and chat template.
+fn teacher_data_generate_api(
+    api: &teacher_api::ApiTeacher,
+    spec: &str,
+    prompts_path: &str,
+    output_path: &str,
+    options: &TeacherDataGenerateOptions,
+) -> anyhow::Result<()> {
+    let tokenizer = options
+        .tokenizer
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("teacher-data generate {spec}: an API teacher needs --tokenizer MODEL.cmf (the model the data is for)"))?;
+    anyhow::ensure!(output_path.ends_with(".tdata"), "teacher-data generate: output must end in .tdata");
+    anyhow::ensure!(!std::path::Path::new(output_path).exists(), "teacher-data generate: {output_path} already exists");
+    let (mut loaded, _) = parse_hashed_teacher_data_prompts(prompts_path)?;
+    if let Some(limit) = options.limit {
+        loaded.prompts.truncate(limit);
+    }
+    anyhow::ensure!(!loaded.prompts.is_empty(), "teacher-data generate: no prompts");
+    let sampling = teacher_api::ApiSampling::parse(&options.sampling)?;
+    let cache = std::path::PathBuf::from(format!("{output_path}.answers.jsonl"));
+    teacher_api::answer_all(
+        api,
+        &loaded.prompts,
+        options.samples,
+        options.max_tokens,
+        &sampling,
+        !options.no_think,
+        options.seed,
+        options.api.api_concurrency,
+        &cache,
+    )?;
+    cmd_teacher_data_import_as(
+        cache.to_str().unwrap_or_default(),
+        output_path,
+        tokenizer,
+        &options.split,
+        options.split_seed,
+        Some(serde_json::json!({
+            "kind": "api",
+            "model": api.model,
+            "base": api.base,
+            "extra": options.api.api_extra,
+            "directory_hash": format!("api:{}", api.model),
+            "sampling": options.sampling,
+            "max_tokens": options.max_tokens,
+            "thinking": !options.no_think,
+            "note": "answers of the API model, tokenized with the student's tokenizer: text targets",
+        })),
+    )
+}
+
+fn cmd_teacher_data_import(
+    source: &str,
+    output: &str,
+    tokenizer_model: &str,
+    split: &str,
+    seed: u64,
+) -> anyhow::Result<()> {
+    cmd_teacher_data_import_as(source, output, tokenizer_model, split, seed, None)
+}
+
+/// [`cmd_teacher_data_import`] with the manifest's teacher described by the caller.
+fn cmd_teacher_data_import_as(
+    source: &str,
+    output: &str,
+    tokenizer_model: &str,
+    split: &str,
+    seed: u64,
+    teacher: Option<serde_json::Value>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(output.ends_with(".tdata"), "teacher-data import: output must end in .tdata");
+    anyhow::ensure!(!std::path::Path::new(output).exists(), "teacher-data import: {output} already exists");
+    // Only the tokenizer and template are needed: keep the device out.
+    unsafe { std::env::set_var("CMF_GPU", "0") };
+    let ratios = parse_teacher_data_split(split)?;
+    let rows = teacher_data::parse_import_source(std::path::Path::new(source))?;
+    anyhow::ensure!(!rows.is_empty(), "teacher-data import: {source} has no rows");
+    let model = Arc::new(CmfModel::open_sharded(tokenizer_model)?);
+    let pipeline = Pipeline::from_model(&model, teacher_data_greedy_sampler(seed))?;
+    let tok = &pipeline.tokenizer;
+    let eos = tok.eos_token_id.ok_or_else(|| anyhow::anyhow!("teacher-data import: the tokenizer has no EOS id"))?;
+    // A chat answer ends with the turn terminator the model emits, which for
+    // ChatML is `<|im_end|>`, not the document EOS.
+    let im_end = {
+        let ids = tok.encode("<|im_end|>");
+        (ids.len() == 1).then(|| ids[0])
+    };
+    let chatml = tok.chat_template.as_deref().is_some_and(|t| t.contains("<|im_end|>"));
+    let think_end = teacher_data::think_end_id(tok);
+    // Repeated prompts are samples of one prompt (one split for all of them).
+    let mut first: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut unique: Vec<teacher_data::TeacherPrompt> = Vec::new();
+    let mut sample_of = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let k = first.entry(r.prompt.id.clone()).or_insert_with(|| {
+            unique.push(r.prompt.clone());
+            unique.len() - 1
+        });
+        let n = sample_of.iter().filter(|(u, _)| u == k).count() as u32;
+        sample_of.push((*k, n));
+    }
+    let splits = teacher_data::assign_stratified_splits(&unique, ratios, seed)?;
+    let vocab = model.vocab.as_deref().ok_or_else(|| anyhow::anyhow!("teacher-data import: {tokenizer_model} has no embedded tokenizer"))?;
+    let tokenizer_config_bytes = serde_json::to_vec(&model.header.tokenizer_config)?;
+    let template_sha256 = tok.chat_template.as_deref().map(|t| knowledge::sha256_hex(t.as_bytes()));
+    let source_sha = knowledge::sha256_hex(&std::fs::read(source)?);
+    let manifest = serde_json::json!({
+        "format": "cmf-tdata",
+        "version": 1,
+        "complete": false,
+        "cortiq": {"version": env!("CARGO_PKG_VERSION")},
+        "teacher": teacher.clone().unwrap_or_else(|| serde_json::json!({
+            "kind": "imported",
+            "file": std::path::Path::new(source).file_name().and_then(|n| n.to_str()),
+            "directory_hash": format!("import:{}", &source_sha[..16]),
+            "source_sha256": source_sha,
+            "note": "answers written by another model; usable as text targets, not as this model's distribution",
+        })),
+        "tokenizer": {
+            "vocab_size": tok.vocab_size(),
+            "eos_id": eos,
+            "vocab_sha256": knowledge::sha256_hex(vocab),
+            "config_sha256": knowledge::sha256_hex(&tokenizer_config_bytes),
+            "template_sha256": template_sha256,
+            "from": std::path::Path::new(tokenizer_model).file_name().and_then(|n| n.to_str()),
+        },
+        "template": {"mode": "imported-text"},
+        "seed": seed,
+        "max_tokens": null,
+        "topk": {"k": 0, "positions": "none"},
+        "prompts": {"source": source, "sha256": source_sha, "count": unique.len(), "rows": rows.len()},
+        "split": {"rule": "stratified-hash", "rule_version": 1, "seed": seed, "ratios": [ratios.train, ratios.val, ratios.test]},
+        "generation": {"mode": "imported", "samples": "per-row"},
+    });
+    let mut writer = tdata::TdataWriter::create(output, manifest)?;
+    for (p, &s) in unique.iter().zip(&splits) {
+        writer.append_prompt(&teacher_data::canonical_prompt_json(p, s))?;
+    }
+    for (r, &(u, sample)) in rows.iter().zip(&sample_of) {
+        // an answer cut off inside its reasoning has no `</think>` yet: the
+        // API path marks it so the prompt still opens the reasoning
+        let open_think = r.prompt.meta.get("open_think").and_then(|v| v.as_bool()) == Some(true);
+        let has_think = open_think || r.response_text.contains("</think>");
+        let prompt_ids = match &r.prefix_text {
+            Some(prefix) => tok.encode(prefix),
+            None => teacher_data::render_prompt(tok, &r.prompt, false, !has_think)?.token_ids,
+        };
+        let rendered = teacher_data::RenderedPrompt { token_ids: prompt_ids, template_applied: true, thinking: Some(has_think) };
+        let mut generated = tok.encode(&r.response_text);
+        let is_chatml = chatml || r.prefix_text.as_deref().is_some_and(|p| p.contains("<|im_start|>"));
+        // an API answer cut by max_tokens is a truncated record (kept); it
+        // gets no end token — the text did not end there
+        let cut = r.prompt.meta.get("finish").and_then(|f| f.as_str()) == Some("length");
+        if !cut {
+            generated.push(if is_chatml { im_end.unwrap_or(eos) } else { eos });
+        }
+        let (think_n, answer_n) = match think_end {
+            Some(end) if has_think => teacher_data::split_think_ids(&generated, end),
+            _ => (0, generated.len()),
+        };
+        let think_text = (think_n > 0).then(|| tok.decode(&generated[..think_n]));
+        let content = tok.decode(&generated[think_n..]);
+        let response = teacher_data::ResponseParts::segmented(think_text, content.clone(), think_n as u32, answer_n as u32);
+        let engine_finish = if cut { "max_tokens" } else { "stop" };
+        let (finish, quality) = teacher_data::final_record_quality(engine_finish, &content, &generated, true);
+        let prepared = teacher_data::build_canonical_record(teacher_data::CanonicalRecordInput {
+            prompt: &unique[u],
+            split: splits[u],
+            sample,
+            seed,
+            rendered: &rendered,
+            generated_token_ids: &generated,
+            response,
+            finish: &finish,
+            quality,
+        })?;
+        writer.append_record(prepared.record, &prepared.tokens)?;
+    }
+    let stats = writer.stats();
+    writer.finalize()?;
+    println!(
+        "teacher-data import: {output}: {} records ({} usable) for {} prompts from {source}",
+        stats.records, stats.usable, unique.len()
+    );
+    Ok(())
+}
+
 /// Options kept together so the command dispatch remains readable and the
 /// generation implementation cannot accidentally pick up a CLI default that
 /// differs from the recorded manifest.
 #[derive(Debug)]
-struct TeacherDataGenerateOptions {
-    max_tokens: usize,
-    samples: u32,
-    seed: u64,
-    split_seed: u64,
-    split: String,
-    topk: u32,
-    raw: bool,
-    no_think: bool,
-    keep_truncated: bool,
-    disable_mtp: bool,
-    limit: Option<usize>,
+pub(crate) struct TeacherDataGenerateOptions {
+    pub(crate) max_tokens: usize,
+    pub(crate) samples: u32,
+    pub(crate) seed: u64,
+    pub(crate) split_seed: u64,
+    pub(crate) split: String,
+    pub(crate) topk: u32,
+    pub(crate) raw: bool,
+    pub(crate) no_think: bool,
+    pub(crate) keep_truncated: bool,
+    pub(crate) disable_mtp: bool,
+    pub(crate) limit: Option<usize>,
+    /// `--shard I/N`: (I, N)
+    pub(crate) shard: Option<(u32, u32)>,
+    /// `--sampling`: greedy | file | K=V,…
+    pub(crate) sampling: String,
+    /// An API teacher's token ids come from this model's tokenizer.
+    pub(crate) tokenizer: Option<String>,
+    /// An API teacher's server, extra fields and concurrency.
+    pub(crate) api: teacher_api::ApiArgs,
+}
+
+/// The decoding settings of `teacher-data generate --sampling`, as the
+/// manifest records them (seed excluded — it is per record).
+fn teacher_data_sampling(spec: &str, model: &CmfModel) -> anyhow::Result<serde_json::Value> {
+    let greedy = serde_json::json!({
+        "temperature": 0.0, "top_p": 1.0, "top_k": 0, "min_p": 0.0,
+        "repetition_penalty": 1.0, "presence_penalty": 0.0,
+    });
+    let mut v = greedy.clone();
+    let pairs: Vec<(String, f64)> = match spec {
+        "greedy" => return Ok(greedy),
+        "file" => {
+            let f = model.header.provenance.as_ref().and_then(|p| p.get("sampling")).ok_or_else(|| {
+                anyhow::anyhow!("--sampling file: the teacher carries no recommended sampling; give it as temperature=…,top_p=…")
+            })?;
+            f.as_object()
+                .into_iter()
+                .flatten()
+                .filter_map(|(k, x)| x.as_f64().map(|x| (k.clone(), x)))
+                .collect()
+        }
+        list => list
+            .split(',')
+            .map(|kv| {
+                let (k, x) = kv.split_once('=').ok_or_else(|| anyhow::anyhow!("--sampling {list:?}: expected KEY=VALUE pairs"))?;
+                Ok((k.trim().to_string(), x.trim().parse::<f64>()?))
+            })
+            .collect::<anyhow::Result<_>>()?,
+    };
+    for (k, x) in pairs {
+        anyhow::ensure!(v.get(&k).is_some(), "--sampling: unknown key {k:?}");
+        v[k] = serde_json::json!(x);
+    }
+    Ok(v)
+}
+
+fn sampler_from(v: &serde_json::Value, seed: u64) -> SamplerConfig {
+    let f = |k: &str| v[k].as_f64().unwrap_or(0.0) as f32;
+    SamplerConfig {
+        temperature: f("temperature"),
+        top_p: f("top_p"),
+        top_k: v["top_k"].as_f64().unwrap_or(0.0) as u32,
+        min_p: f("min_p"),
+        repetition_penalty: f("repetition_penalty"),
+        presence_penalty: f("presence_penalty"),
+        seed: Some(seed),
+        ..Default::default()
+    }
+}
+
+fn parse_shard(s: &str) -> anyhow::Result<(u32, u32)> {
+    let (i, n) = s.split_once('/').ok_or_else(|| anyhow::anyhow!("--shard {s:?}: expected I/N"))?;
+    let (i, n): (u32, u32) = (i.trim().parse()?, n.trim().parse()?);
+    anyhow::ensure!(n > 0 && i < n, "--shard {s:?}: need 0 <= I < N");
+    Ok((i, n))
+}
+
+/// Shard of a prompt id: the first bytes of its SHA-256.
+fn shard_of(id: &str, n: u32) -> u32 {
+    let h = knowledge::sha256_hex(id.as_bytes());
+    (u64::from_str_radix(&h[..12], 16).unwrap_or(0) % n as u64) as u32
+}
+
+/// `cortiq teacher-data merge`: shards of one job as one `.tdata`.
+fn cmd_teacher_data_merge(parts: &[String], output: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(output.ends_with(".tdata"), "teacher-data merge: output must end in .tdata");
+    anyhow::ensure!(!std::path::Path::new(output).exists(), "teacher-data merge: {output} already exists");
+    let readers: Vec<tdata::Dataset> = parts.iter().map(tdata::Dataset::open).collect::<anyhow::Result<_>>()?;
+    let first = &readers[0].manifest.raw;
+    for (r, p) in readers.iter().zip(parts).skip(1) {
+        for ptr in ["/teacher/directory_hash", "/tokenizer/vocab_sha256", "/template/thinking", "/seed", "/max_tokens", "/prompts/sha256", "/split", "/sampling", "/generation/samples", "/generation/keep_truncated"] {
+            anyhow::ensure!(
+                r.manifest.raw.pointer(ptr) == first.pointer(ptr),
+                "teacher-data merge: {p} differs from {} in {ptr} — not a shard of the same job",
+                parts[0]
+            );
+        }
+    }
+    let mut manifest = first.clone();
+    manifest["complete"] = serde_json::json!(false);
+    manifest["shard"] = serde_json::Value::Null;
+    manifest["merged_from"] = serde_json::json!(parts);
+    if let Some(stats) = manifest.as_object_mut() {
+        stats.remove("stats");
+        stats.remove("files");
+    }
+    let mut writer = tdata::TdataWriter::create(output, manifest)?;
+    let mut seen = std::collections::HashSet::new();
+    for (r, p) in readers.iter().zip(parts) {
+        let prompts = std::fs::read_to_string(r.root().join("prompts.jsonl"))?;
+        for line in prompts.lines().filter(|l| !l.trim().is_empty()) {
+            writer.append_prompt(&serde_json::from_str(line)?)?;
+        }
+        for sample in r.stream(tdata::TdataSelector::parse(&format!("{}:all", r.root().display()))?.include_rejected())? {
+            let s = sample?;
+            anyhow::ensure!(seen.insert(s.record.rid.clone()), "teacher-data merge: record {} appears twice ({p})", s.record.rid);
+            writer.append_record(s.record, &s.tokens)?;
+        }
+    }
+    let stats = writer.stats();
+    writer.finalize()?;
+    println!("teacher-data merge: {output}: {} records ({} usable) from {} parts", stats.records, stats.usable, parts.len());
+    Ok(())
 }
 
 /// Resolve the two inputs needed to materialize a calibration set.  This is
@@ -6237,14 +6639,28 @@ fn teacher_data_greedy_sampler(seed: u64) -> SamplerConfig {
 /// fail-closed rather than written as estimated data.  The hot `Pipeline`
 /// remains alive for the whole job; only the request state and deterministic
 /// sampler stream are reset between records.
-fn cmd_teacher_data_generate(
+/// `~3 h 05 min` / `~12 min` / `~40 s`: a remaining-time estimate.
+pub(crate) fn fmt_eta(secs: f64) -> String {
+    let s = secs.max(0.0).round() as u64;
+    if s >= 3600 {
+        format!("{} h {:02} min", s / 3600, (s % 3600) / 60)
+    } else if s >= 90 {
+        format!("{} min", (s + 30) / 60)
+    } else {
+        format!("{s} s")
+    }
+}
+
+pub(crate) fn cmd_teacher_data_generate(
     teacher_path: &str,
     prompts_path: &str,
     output_path: &str,
     options: TeacherDataGenerateOptions,
 ) -> anyhow::Result<()> {
     teacher_data::require_topk_disabled(options.topk)?;
-    teacher_data::require_direct_response_mode(options.no_think)?;
+    if let Some(api) = teacher_api::ApiTeacher::parse(teacher_path, &options.api)? {
+        return teacher_data_generate_api(&api, teacher_path, prompts_path, output_path, &options);
+    }
     if options.raw {
         anyhow::bail!(
             "teacher-data generate: --raw is not available in the direct-answer v1 path; \
@@ -6262,10 +6678,17 @@ fn cmd_teacher_data_generate(
             "teacher-data generate: output {output_path:?} must end in .tdata to make the immutable dataset boundary explicit"
         );
     }
-    if std::path::Path::new(output_path).exists() {
-        anyhow::bail!(
-            "teacher-data generate: output {output_path:?} already exists; this initial command intentionally has no --resume, so choose a new .tdata directory"
-        );
+    // An existing directory is either finished (refuse) or an interrupted
+    // run of this same job (continue it below).
+    let resuming = std::path::Path::new(output_path).exists();
+    if resuming {
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(std::path::Path::new(output_path).join("manifest.json"))
+                .map_err(|e| anyhow::anyhow!("teacher-data generate: {output_path} exists but has no readable manifest: {e}"))?,
+        )?;
+        if manifest.get("complete").and_then(|v| v.as_bool()) == Some(true) {
+            anyhow::bail!("teacher-data generate: {output_path:?} is already finalized; choose a new .tdata directory");
+        }
     }
     let ratios = parse_teacher_data_split(&options.split)?;
 
@@ -6286,9 +6709,19 @@ fn cmd_teacher_data_generate(
                 .unwrap_or_default()
         );
     }
-    let splits =
+    let mut splits =
         teacher_data::assign_stratified_splits(&loaded.prompts, ratios, options.split_seed)?;
     debug_assert_eq!(splits.len(), loaded.prompts.len());
+    // A shard keeps its prompts with the splits they got among all prompts.
+    if let Some((i, n)) = options.shard {
+        let keep: Vec<bool> = loaded.prompts.iter().map(|p| shard_of(&p.id, n) == i).collect();
+        let mut k = keep.iter();
+        loaded.prompts.retain(|_| *k.next().unwrap());
+        let mut k = keep.iter();
+        splits.retain(|_| *k.next().unwrap());
+        anyhow::ensure!(!loaded.prompts.is_empty(), "teacher-data generate: shard {i}/{n} holds no prompts");
+        eprintln!("teacher-data: shard {i}/{n}: {} prompts", loaded.prompts.len());
+    }
 
     // The append-only writer cannot safely recover a prompt ledger row that
     // exceeds its bounded JSONL reader.  Validate every row before opening a
@@ -6332,6 +6765,7 @@ fn cmd_teacher_data_generate(
     // sibling shards) after the all-tensor verification above.  `dir_hash`
     // remains useful for legacy/base identity, but is only the primary shard.
     let teacher_trunk_hash = model.trunk_hash();
+    let sampling = teacher_data_sampling(&options.sampling, &model)?;
     let mut pipeline = Pipeline::from_model(&model, teacher_data_greedy_sampler(options.seed))?;
     if options.disable_mtp {
         // MTP is an optional speculative accelerator, not part of the
@@ -6354,7 +6788,7 @@ fn cmd_teacher_data_generate(
     let rendered_prompts = loaded
         .prompts
         .iter()
-        .map(|prompt| teacher_data::render_prompt(&pipeline.tokenizer, prompt, false, true))
+        .map(|prompt| teacher_data::render_prompt(&pipeline.tokenizer, prompt, false, options.no_think))
         .collect::<anyhow::Result<Vec<_>>>()?;
     let tokenizer_vocab = model.vocab.as_deref().ok_or_else(|| {
         anyhow::anyhow!(
@@ -6398,16 +6832,9 @@ fn cmd_teacher_data_generate(
         },
         "template": {
             "mode": "carried",
-            "thinking": "off",
+            "thinking": if options.no_think { "off" } else { "on" },
         },
-        "sampling": {
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "top_k": 0,
-            "min_p": 0.0,
-            "repetition_penalty": 1.0,
-            "presence_penalty": 0.0,
-        },
+        "sampling": sampling,
         "seed": options.seed,
         "max_tokens": options.max_tokens,
         "topk": {"k": 0, "positions": "none"},
@@ -6427,24 +6854,75 @@ fn cmd_teacher_data_generate(
             "ratios": [ratios.train, ratios.val, ratios.test],
         },
         "generation": {
-            "mode": "direct-answer",
+            "mode": if options.no_think { "direct-answer" } else { "think" },
             "samples": options.samples,
             "keep_truncated": options.keep_truncated,
             "speculative_mtp": if speculative_mtp { "enabled" } else { "disabled" },
             "mtp_control": if options.disable_mtp { "disabled-by-cli" } else { "engine-default" },
             "topk": "disabled-until-raw-logit-capture",
-            "resume": "not-exposed-in-v1-generator",
+            "resume": "same-command",
+            "loop_stop": "distinct-5gram<0.05 over the last 512 pieces",
         },
+        "shard": options.shard.map(|(i, n)| serde_json::json!({"index": i, "count": n})),
         "input": {
             "format": "jsonl-v1",
             "minimum_visible_prompt_chars": teacher_data::DEFAULT_MIN_PROMPT_CHARS,
             "limit": options.limit,
         },
     });
-    let mut writer = tdata::TdataWriter::create(output_path, manifest)?;
-    for (prompt, &split) in loaded.prompts.iter().zip(&splits) {
-        writer.append_prompt(&teacher_data::canonical_prompt_json(prompt, split))?;
-    }
+    // The `</think>` id splits a reasoning model's records exactly.
+    let think_end = if options.no_think {
+        None
+    } else {
+        Some(teacher_data::think_end_id(&pipeline.tokenizer).ok_or_else(|| {
+            anyhow::anyhow!(
+                "teacher-data generate: the teacher's vocabulary has no single `</think>` token, so a reasoning span cannot be bounded exactly; use --no-think"
+            )
+        })?)
+    };
+    let mut done_rids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut writer = if resuming {
+        let w = tdata::TdataWriter::resume(output_path)?;
+        // Continue only the same job: every field that shapes a record must match.
+        let old = w.manifest();
+        let mut diff = Vec::new();
+        for ptr in [
+            "/teacher/directory_hash",
+            "/tokenizer/vocab_sha256",
+            "/template/thinking",
+            "/seed",
+            "/max_tokens",
+            "/prompts/sha256",
+            "/split",
+            "/sampling",
+            "/generation/samples",
+            "/generation/keep_truncated",
+        ] {
+            if old.pointer(ptr) != manifest.pointer(ptr) {
+                diff.push(format!("{ptr}: {} → {}", old.pointer(ptr).unwrap_or(&serde_json::Value::Null), manifest.pointer(ptr).unwrap_or(&serde_json::Value::Null)));
+            }
+        }
+        if !diff.is_empty() {
+            anyhow::bail!(
+                "teacher-data generate: {output_path} is an interrupted run of a different job ({}); use a new directory",
+                diff.join("; ")
+            );
+        }
+        let records = std::fs::read_to_string(std::path::Path::new(output_path).join("records.jsonl"))?;
+        for line in records.lines().filter(|l| !l.trim().is_empty()) {
+            if let Some(rid) = serde_json::from_str::<serde_json::Value>(line).ok().and_then(|v| v.get("rid").and_then(|r| r.as_str()).map(str::to_owned)) {
+                done_rids.insert(rid);
+            }
+        }
+        eprintln!("teacher-data: continuing {output_path}: {} record(s) already committed", done_rids.len());
+        w
+    } else {
+        let mut w = tdata::TdataWriter::create(output_path, manifest)?;
+        for (prompt, &split) in loaded.prompts.iter().zip(&splits) {
+            w.append_prompt(&teacher_data::canonical_prompt_json(prompt, split))?;
+        }
+        w
+    };
 
     eprintln!(
         "teacher-data: {} accepted prompts → {planned_records} record(s); teacher={} ({}, {:?}); one hot pipeline; MTP={}",
@@ -6457,6 +6935,9 @@ fn cmd_teacher_data_generate(
     let job_started = std::time::Instant::now();
     let mut generated_tokens = 0_u64;
     let mut record_number = 0_u64;
+    // records generated by this run (a resumed run skips the done ones):
+    // the rate behind the "left" estimate
+    let mut fresh = 0_u64;
     for ((prompt, &split), rendered) in loaded.prompts.iter().zip(&splits).zip(&rendered_prompts) {
         // Rendering was preflighted before creating output.  It neither
         // depends on the seed nor mutates KV, and the immutable ids are
@@ -6464,12 +6945,36 @@ fn cmd_teacher_data_generate(
         let per_samples = prompt.samples.unwrap_or(options.samples);
         let per_max_tokens = prompt.max_tokens.unwrap_or(options.max_tokens);
         for sample in 0..per_samples {
+            if done_rids.contains(&teacher_data::record_id(&prompt.id, sample)) {
+                record_number += 1;
+                continue;
+            }
             let record_seed = teacher_data::record_seed(options.seed, &prompt.id, sample);
             pipeline.reset_session();
-            pipeline.set_sampler_config(teacher_data_greedy_sampler(record_seed));
+            pipeline.set_sampler_config(sampler_from(&sampling, record_seed));
             let started = std::time::Instant::now();
+            let looped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let guard_flag = looped.clone();
+            let mut guard = teacher_data::LoopGuard::new(0.05);
+            // a live line while one long answer is generated (a reasoning
+            // answer runs for minutes): tokens so far and their rate
+            let (live_n, live_t0) = (record_number + 1, std::time::Instant::now());
+            let mut live = (0_u64, std::time::Instant::now());
+            let on_token: cortiq_engine::pipeline::TokenCallback = Box::new(move |piece: &str| {
+                live.0 += 1;
+                if live.1.elapsed().as_secs_f64() >= 5.0 {
+                    live.1 = std::time::Instant::now();
+                    let el = live_t0.elapsed().as_secs_f64();
+                    eprint!("\r  record {live_n}/{planned_records}: {} tokens · {:.1} tok/s   ", live.0, live.0 as f64 / el.max(1e-9));
+                }
+                let go = guard.feed(piece);
+                if !go {
+                    guard_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                go
+            });
             let result = pipeline
-                .generate_from_ids(&rendered.token_ids, per_max_tokens, None, None)
+                .generate_from_ids(&rendered.token_ids, per_max_tokens, None, Some(on_token))
                 .map_err(|err| {
                     anyhow::anyhow!(
                         "teacher-data generate: prompt {} (source line {}, sample {}): {err}",
@@ -6487,14 +6992,38 @@ fn cmd_teacher_data_generate(
                     result.token_ids.len(),
                 );
             }
+            let (response, visible) = match think_end {
+                Some(end) => {
+                    let (think_n, answer_n) = teacher_data::split_think_ids(&result.token_ids, end);
+                    let think_text = pipeline.tokenizer.decode(&result.token_ids[..think_n]);
+                    let answer_text = pipeline.tokenizer.decode(&result.token_ids[think_n..]);
+                    let visible = answer_text.clone();
+                    (
+                        teacher_data::ResponseParts::segmented(
+                            Some(think_text),
+                            answer_text,
+                            think_n as u32,
+                            answer_n as u32,
+                        ),
+                        visible,
+                    )
+                }
+                None => {
+                    let visible = result.text.clone();
+                    (teacher_data::ResponseParts::direct(result.text.clone(), result.token_ids.len())?, visible)
+                }
+            };
+            let engine_finish = if looped.load(std::sync::atomic::Ordering::Relaxed) {
+                "loop"
+            } else {
+                result.finish_reason.as_str()
+            };
             let (finish, quality) = teacher_data::final_record_quality(
-                &result.finish_reason,
-                &result.text,
+                engine_finish,
+                &visible,
                 &result.token_ids,
                 options.keep_truncated,
             );
-            let response =
-                teacher_data::ResponseParts::direct(result.text, result.token_ids.len())?;
             let prepared =
                 teacher_data::build_canonical_record(teacher_data::CanonicalRecordInput {
                     prompt,
@@ -6514,11 +7043,13 @@ fn cmd_teacher_data_generate(
             let mtp_accepted = result.mtp_accepted;
             writer.append_record(prepared.record, &prepared.tokens)?;
             record_number += 1;
+            fresh += 1;
+            let left_secs = job_started.elapsed().as_secs_f64() / fresh as f64 * planned_records.saturating_sub(record_number) as f64;
             generated_tokens = generated_tokens.checked_add(answer_tokens).ok_or_else(|| {
                 anyhow::anyhow!("teacher-data generate: generated token counter overflows u64")
             })?;
             eprintln!(
-                "teacher-data: [{record_number}/{planned_records}] {}#{} split={} finish={} usable={} answer={} tok {:.2} tok/s{}",
+                "\rteacher-data: [{record_number}/{planned_records}] {}#{} split={} finish={} usable={} answer={} tok {:.2} tok/s{} · ~{} left",
                 prompt.id,
                 sample,
                 split.as_str(),
@@ -6531,6 +7062,7 @@ fn cmd_teacher_data_generate(
                 } else {
                     String::new()
                 },
+                fmt_eta(left_secs),
             );
         }
     }
@@ -6631,15 +7163,15 @@ async fn cmd_serve(
     if let Some(n) = replicas {
         let have = cortiq_engine::gpu::device_count();
         if n < 2 {
-            anyhow::bail!("--gpus {n}: реплики имеют смысл от 2 карт");
+            anyhow::bail!("--gpus {n}: replicas need at least 2 cards");
         }
         if have < n {
             anyhow::bail!(
-                "--gpus {n}, а карт видно {have} (см. `cortiq gpu`) —                  просить больше реплик, чем устройств, нечестно"
+                "--gpus {n}, but {have} cards are visible (see `cortiq gpu`) —                  asking for more replicas than devices is not honest"
             );
         }
         if peer.is_some() {
-            anyhow::bail!("--gpus и --peer — разные режимы: реплики против сплита слоёв");
+            anyhow::bail!("--gpus and --peer are different modes: replicas versus a layer split");
         }
         // Replicas need the model to fit ONE card. When it does not, the
         // honest answer is the layer split, not a refusal and not N
@@ -6653,8 +7185,8 @@ async fn cmd_serve(
             devices.clear();
             split_devices = Some((0..n).collect());
             println!(
-                "    Сплит по картам: модель {:.1} ГБ не влезает в бюджет одной ({:.1} ГБ) — \
-                 слои режутся на {n} устройств (реплики требуют полной копии на карту)",
+                "    Split across cards: the {:.1} GB model does not fit one card's budget ({:.1} GB) — \
+                 the layers are cut across {n} devices (replicas need a full copy per card)",
                 weights as f64 / 1e9,
                 budget as f64 / 1e9,
             );
@@ -6676,7 +7208,7 @@ async fn cmd_serve(
             slots = n * per_gpu;
             devices = (0..slots).map(|i| i % n).collect();
             println!(
-                "    Реплики: {n} карт × полная модель, {slots} слот(ов) —                  {per_gpu} на карту"
+                "    Replicas: {n} cards × the full model, {slots} slot(s) —                  {per_gpu} per card"
             );
         }
     }
@@ -7011,6 +7543,47 @@ fn cmd_fcd(
             .map_err(|e| anyhow::anyhow!("sidecar tokenizer: {e}"))?
     };
 
+    // Teacher data: whole records, loss on the generated tokens, windows
+    // inside records; the val split is the held-out set.
+    if corpus.contains(".tdata") {
+        use crate::compress::data::{Data, LossOn, Stream};
+        use crate::tdata::TdataSplit;
+        let data = Data::load(corpus)?;
+        data.check_tokenizer(&model, "model")?;
+        let eos = model.header.tokenizer_config.as_ref().and_then(|t| t.eos_token_ids.first().copied()).unwrap_or(0);
+        let tr = Stream::build(data.split(TdataSplit::Train), LossOn::Generated, eos, seq + 1);
+        let va = Stream::build(data.split(TdataSplit::Val), LossOn::Generated, eos, seq + 1);
+        println!("corpus (teacher data): train {} scored tokens, val {}", tr.scored, va.scored);
+        let hp = FcdHyper { steps, lr, kl_w: kl, eval_every, bs, seq, seed: 0, polish_only };
+        let out_path = out
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(format!("{model_path}.fcd.cmf")));
+        let tmodel = match teacher {
+            Some(p) => Some(std::sync::Arc::new(cortiq_core::CmfModel::open_sharded(p)?)),
+            None => None,
+        };
+        let report = cortiq_engine::fcd::run_polish_stream(
+            &model,
+            tmodel.as_ref(),
+            &cfg,
+            &hp,
+            cortiq_engine::fcd::FcdStream { ids: &tr.ids, weight: Some(&tr.weight), starts: Some(&tr.starts) },
+            cortiq_engine::fcd::FcdStream { ids: &va.ids, weight: Some(&va.weight), starts: Some(&va.starts) },
+            &out_path,
+            None,
+            None,
+        )
+        .map_err(|e| anyhow::anyhow!("fcd polish: {e}"))?;
+        println!(
+            "fcd: val ppl teacher {:.3} · start {:.3} → final {:.3} (best step {}) → {}",
+            report.teacher_ppl,
+            report.ppl_start,
+            report.ppl_final,
+            report.best_step,
+            out_path.display()
+        );
+        return Ok(());
+    }
     let cap = |s: String, n: usize| -> String {
         if s.len() > n {
             let mut end = n;
@@ -8363,10 +8936,10 @@ async fn cmd_run(
         // space — no worker process, no socket, no serialization.
         let have = cortiq_engine::gpu::device_count();
         if n < 2 {
-            anyhow::bail!("--gpus {n}: нужно ≥ 2 карт (пин одной — CMF_GPU_ADAPTER)");
+            anyhow::bail!("--gpus {n}: needs ≥ 2 cards (pin a single one with CMF_GPU_ADAPTER)");
         }
         if have < n {
-            anyhow::bail!("--gpus {n}, а карт видно {have} (см. `cortiq gpu`)");
+            anyhow::bail!("--gpus {n}, but {have} cards are visible (see `cortiq gpu`)");
         }
         let devs: Vec<usize> = (0..n).collect();
         pipeline
@@ -8375,7 +8948,7 @@ async fn cmd_run(
         if let Some(plan) = pipeline.gpu_plan() {
             let seg = plan
                 .iter()
-                .map(|(d, a, b)| format!("карта {d}: слои {a}..={b}"))
+                .map(|(d, a, b)| format!("card {d}: layers {a}..={b}"))
                 .collect::<Vec<_>>()
                 .join(" · ");
             println!("gpus: {seg}");
@@ -8942,7 +9515,7 @@ impl Drop for LocalGpuWorker {
 fn spawn_local_gpu_worker(model: &str, n: usize) -> anyhow::Result<LocalGpuWorker> {
     if n != 2 {
         anyhow::bail!(
-            "--gpus {n}: пока поддержаны ровно 2 GPU (координатор + локальный воркер);              для N карт — цепочка `cortiq worker` + --peer"
+            "--gpus {n}: exactly 2 GPUs are supported for now (coordinator + local worker);              for N cards chain `cortiq worker` + --peer"
         );
     }
     // The coordinator takes card 0 unless already pinned — with two
@@ -8966,24 +9539,24 @@ fn spawn_local_gpu_worker(model: &str, n: usize) -> anyhow::Result<LocalGpuWorke
         .env("CMF_GPU_ADAPTER", worker_pin)
         .stdout(std::process::Stdio::null())
         .spawn()
-        .map_err(|e| anyhow::anyhow!("не удалось запустить локальный воркер: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("could not start the local worker: {e}"))?;
     let mut w = LocalGpuWorker { child, addr, token };
     eprintln!(
-        "gpus: координатор adapter {coord_pin}, воркер adapter {worker_pin} — {}",
+        "gpus: coordinator adapter {coord_pin}, worker adapter {worker_pin} — {}",
         w.addr
     );
     // Readiness = the listener answers. The worker binds before serving,
     // so this bounds model-load time, not just process start.
     for _ in 0..1800 {
         if let Some(st) = w.child.try_wait()? {
-            anyhow::bail!("локальный воркер умер при старте ({st}); его stderr выше");
+            anyhow::bail!("the local worker died at startup ({st}); its stderr is above");
         }
         if std::net::TcpStream::connect(&w.addr).is_ok() {
             return Ok(w);
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    anyhow::bail!("локальный воркер не поднялся за 180 с")
+    anyhow::bail!("the local worker did not come up within 180 s")
 }
 
 #[derive(Clone, Copy, Default)]
@@ -10745,14 +11318,14 @@ fn cmd_bench_bw(json: bool, model: &str) -> anyhow::Result<()> {
             storage_gbs.unwrap_or(0.0)
         );
     } else {
-        println!("копия в RAM: {host_gbs:.1} ГБ/с (потолок CPU-плеча)");
+        println!("copy into RAM: {host_gbs:.1} GB/s (the ceiling of the CPU arm)");
         match pcie_gbs {
-            Some(v) => println!("заливка в VRAM: {v:.1} ГБ/с (потолок fetch-плеча)"),
-            None => println!("заливка в VRAM: устройства нет"),
+            Some(v) => println!("upload into VRAM: {v:.1} GB/s (the ceiling of the fetch arm)"),
+            None => println!("upload into VRAM: no device"),
         }
         match storage_gbs {
-            Some(v) => println!("чтение хранилища: {v:.1} ГБ/с (источник холодных байтов)"),
-            None => println!("чтение хранилища: файл мал для замера"),
+            Some(v) => println!("storage read: {v:.1} GB/s (the source of cold bytes)"),
+            None => println!("storage read: the file is too small to measure"),
         }
     }
     Ok(())
@@ -10869,10 +11442,10 @@ async fn cmd_bench(
     if let Some(n) = gpus {
         let have = cortiq_engine::gpu::device_count();
         if n < 2 {
-            anyhow::bail!("--gpus {n}: нужно ≥ 2 карт");
+            anyhow::bail!("--gpus {n}: needs ≥ 2 cards");
         }
         if have < n {
-            anyhow::bail!("--gpus {n}, а карт видно {have}");
+            anyhow::bail!("--gpus {n}, but {have} cards are visible");
         }
         let devs: Vec<usize> = (0..n).collect();
         pipeline
@@ -10910,12 +11483,12 @@ async fn cmd_bench(
         let nl = pipeline.num_layers;
         let split = peer_split.unwrap_or(nl / 2);
         if split >= nl {
-            anyhow::bail!("--peer-split {split}: модель держит {nl} слоёв");
+            anyhow::bail!("--peer-split {split}: the model has {nl} layers");
         }
         let dtype = match net_dtype {
             "f32" => cortiq_net::WireDtype::F32,
             "f16" => cortiq_net::WireDtype::F16,
-            other => anyhow::bail!("--net-dtype {other}: f32 или f16"),
+            other => anyhow::bail!("--net-dtype {other}: f32 or f16"),
         };
         let spec = cortiq_net::SessionSpec {
             skill: None,
@@ -11035,12 +11608,12 @@ async fn cmd_bench(
         // re-upload disqualifies the number LOUDLY.
         if graph_miss > 0 {
             anyhow::bail!(
-                "BENCH INVALID: локальный сегмент отказал графу на {graph_miss} токенах —                  это CPU-число, не GPU (CMF_GPU_DEBUG=1 покажет причину)"
+                "BENCH INVALID: the local segment declined the graph on {graph_miss} tokens —                  this is a CPU number, not a GPU one (CMF_GPU_DEBUG=1 shows why)"
             );
         }
         if upload_delta > 64 * 1024 * 1024 {
             anyhow::bail!(
-                "BENCH INVALID: {upload_delta} байт весов доехало в steady-окне —                  вытеснение/перезаливка, поднимите CMF_GPU_VRAM_MB"
+                "BENCH INVALID: {upload_delta} bytes of weights arrived inside the steady window —                  eviction/re-upload, raise CMF_GPU_VRAM_MB"
             );
         }
         return Ok(());

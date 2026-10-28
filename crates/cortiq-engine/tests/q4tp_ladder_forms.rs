@@ -45,7 +45,7 @@ fn the_two_ladder_forms_agree() {
                 if d > worst {
                     worst = d;
                     worst_row = format!(
-                        "{} строка {r} ступень {c}: {t:e} против {closed:e}, lo={lo} шаг={st}",
+                        "{} row {r} rung {c}: {t:e} versus {closed:e}, lo={lo} step={st}",
                         e.name
                     );
                 }
@@ -56,7 +56,7 @@ fn the_two_ladder_forms_agree() {
             break;
         }
     }
-    println!("худшее относительное расхождение лестниц: {worst:.3e}");
+    println!("worst relative divergence of the ladders: {worst:.3e}");
     println!("  {worst_row}");
 
     // And the other half of the question, which needs no device at all: does
@@ -89,7 +89,7 @@ fn the_two_ladder_forms_agree() {
         let num: f32 = plain.iter().zip(&mv).map(|(a, b)| (a - b) * (a - b)).sum();
         let den: f32 = plain.iter().map(|a| a * a).sum::<f32>().max(1e-20);
         println!(
-            "{}: [{rows}x{cols}] матвек↔деквант {:.3e}",
+            "{}: [{rows}x{cols}] matvec↔dequant {:.3e}",
             e.name,
             (num / den).sqrt()
         );

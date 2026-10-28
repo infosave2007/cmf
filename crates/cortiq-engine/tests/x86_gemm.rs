@@ -496,7 +496,7 @@ fn q4t_blocked_vs_per_row() {
     // order costs — and the test says "blocked != per-row", which is not what
     // went wrong. Refuse to answer a question the environment has changed.
     if std::env::var("CMF_GPU").is_ok_and(|v| v != "0" && v != "off") {
-        eprintln!("CMF_GPU задан — сравнение CPU↔CPU невозможно, пропуск");
+        eprintln!("CMF_GPU is set — a CPU↔CPU comparison is impossible, skipped");
         return;
     }
     let (rows, cols, b) = (4864usize, 896usize, 256usize);

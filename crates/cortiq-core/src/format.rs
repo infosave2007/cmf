@@ -1944,7 +1944,12 @@ fn zeros(n: usize) -> Vec<u8> {
 fn sync_parent_dir(path: &Path) -> Result<(), CmfError> {
     #[cfg(unix)]
     {
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        // A bare relative name has the EMPTY parent (`Path::parent` of
+        // "x.cmf" is ""), which `open` refuses: that is the current directory.
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
         File::open(parent)?.sync_all()?;
     }
     #[cfg(not(unix))]

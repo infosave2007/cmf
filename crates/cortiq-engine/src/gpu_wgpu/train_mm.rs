@@ -1104,18 +1104,30 @@ pub fn sumsq(c: &Ctx, a: &wgpu::Buffer, n: usize) -> Option<f64> {
     Some(train_ops::download(c, &out, 64)?.iter().map(|&x| x as f64).sum())
 }
 
+/// Partial sums of squares of `a[..n]` into `out[0..64]` (one per workgroup).
+pub fn sumsq_part<'a>(c: &'a Ctx, a: &'a wgpu::Buffer, n: usize, out: &'a wgpu::Buffer) -> Option<Disp<'a>> {
+    let md = module(c)?;
+    Some(Disp { pipe: &md.p["sumsq"], uni: vec![64, n as u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], bufs: vec![(7, a), (9, out)], grid: (64, 1, 1) })
+}
+
 /// `out[m][n] = act[m][k] · plane[n][k]ᵀ · oscale` on the matrix units.
 #[allow(clippy::too_many_arguments)]
 pub fn mm(c: &Ctx, plane: &wgpu::Buffer, act: &wgpu::Buffer, out: &wgpu::Buffer, m: usize, n: usize, k: usize, oscale: f32) -> Option<zi::MmCall> {
-    let g = zi::default_cfg(Epi::F32);
+    let g = zi::train_cfg(Epi::F32);
     let a = zi::MmArgs { m: m as u32, n: n as u32, k: k as u32, ldo: n as u32, ocol: 0, arow: 0, oscale, conv: [0; 3] };
     zi::mm_call(c, g, &a, plane, act, out)
 }
 
 /// Whether this device runs the trainer's matrix-unit GEMMs (cooperative
-/// matrices, f16, 32-wide subgroups); without them every `mm` declines.
+/// matrices — NVIDIA's 16×16 or Apple's 8×8 — f16, 32-wide subgroups);
+/// without them every `mm` declines.
 pub fn matrix_units() -> bool {
-    zi::zctx().is_some()
+    zi::tctx().is_some()
+}
+
+/// Side of this device's cooperative fragments (16 NVIDIA, 8 Apple).
+pub fn frag_side() -> u32 {
+    zi::train_cfg(Epi::F32).frag
 }
 
 /// [`mm`] with the plane given as a sign bitmap of `words` u32 per row,
@@ -1128,7 +1140,7 @@ pub fn mm_bits(c: &Ctx, bits: &wgpu::Buffer, words: usize, trans: bool, act: &wg
     if std::env::var("CMF_MM_BITS").as_deref() == Ok("0") {
         return None;
     }
-    let g = zi::MmCfg { bits: if trans { 2 } else { 1 }, ..zi::default_cfg(Epi::F32) };
+    let g = zi::train_cfg_bits(Epi::F32, if trans { 2 } else { 1 });
     let a = zi::MmArgs { m: m as u32, n: n as u32, k: k as u32, ldo: n as u32, ocol: 0, arow: 0, oscale, conv: [words as u32, 0, 0] };
     zi::mm_call(c, g, &a, bits, act, out)
 }
@@ -1136,7 +1148,7 @@ pub fn mm_bits(c: &Ctx, bits: &wgpu::Buffer, words: usize, trans: bool, act: &wg
 /// [`mm`] into columns `ocol..ocol+n` of an output with row stride `ldo`.
 #[allow(clippy::too_many_arguments)]
 pub fn mm_cols(c: &Ctx, plane: &wgpu::Buffer, act: &wgpu::Buffer, out: &wgpu::Buffer, m: usize, n: usize, k: usize, ldo: usize, ocol: usize, oscale: f32) -> Option<zi::MmCall> {
-    let g = zi::default_cfg(Epi::F32);
+    let g = zi::train_cfg(Epi::F32);
     let a = zi::MmArgs { m: m as u32, n: n as u32, k: k as u32, ldo: ldo as u32, ocol: ocol as u32, arow: 0, oscale, conv: [0; 3] };
     zi::mm_call(c, g, &a, plane, act, out)
 }
@@ -1147,6 +1159,36 @@ pub fn mm_cols(c: &Ctx, plane: &wgpu::Buffer, act: &wgpu::Buffer, out: &wgpu::Bu
 #[allow(clippy::too_many_arguments)]
 pub fn plane_linear(c: &Ctx, plane: &wgpu::Buffer, x: &wgpu::Buffer, act16: &wgpu::Buffer, y: &wgpu::Buffer, ntok: usize, n: usize, k: usize, scale: f32) -> Option<()> {
     let ops = vec![Op::D(cvt(c, x, None, act16, ntok, k, scale)?), Op::M(mm(c, plane, act16, y, ntok, n, k, 1.0 / scale)?)];
+    run(c, &ops);
+    Some(())
+}
+
+/// `dw[m][k] = dy[ntok][m]ᵀ · x[ntok][k]` (overwritten): both operands
+/// staged transposed in f16 (`xt`, `dyt`: `[rows][ceil32(ntok)]`; dy at the
+/// gradient scale), the token axis as the GEMM's K. `k` a multiple of 128.
+#[allow(clippy::too_many_arguments)]
+pub fn weight_grad(c: &Ctx, x: &wgpu::Buffer, dy: &wgpu::Buffer, xt: &wgpu::Buffer, dyt: &wgpu::Buffer, dw: &wgpu::Buffer, ntok: usize, m: usize, k: usize, gscale: f32) -> Option<()> {
+    let kp = ntok.div_ceil(32) * 32;
+    let ops = vec![
+        Op::D(cvt_t(c, x, None, xt, ntok, k, 1.0)?),
+        Op::D(cvt_t(c, dy, None, dyt, ntok, m, gscale)?),
+        Op::M(mm(c, xt, dyt, dw, m, k, kp, 1.0 / gscale)?),
+    ];
+    run(c, &ops);
+    Some(())
+}
+
+/// `acc[k][k] += x[..ntok][k]ᵀ · x` (the input Gram of a linear): `x`
+/// staged transposed in f16 (`xt`, rows past `ntok` zero), the product into
+/// `tmp`, then added. `k` a multiple of 128.
+#[allow(clippy::too_many_arguments)]
+pub fn gram_acc(c: &Ctx, x: &wgpu::Buffer, xt: &wgpu::Buffer, acc: &wgpu::Buffer, tmp: &wgpu::Buffer, ntok: usize, k: usize) -> Option<()> {
+    let kp = ntok.div_ceil(32) * 32;
+    let ops = vec![
+        Op::D(cvt_t(c, x, None, xt, ntok, k, 1.0)?),
+        Op::M(mm(c, xt, xt, tmp, k, k, kp, 1.0)?),
+        Op::D(train_ops::elt(c, "add", k * k, acc, tmp, Some(acc), None, None, None)?),
+    ];
     run(c, &ops);
     Some(())
 }
@@ -1536,6 +1578,55 @@ mod tests {
         let mut out: Vec<u16> = w.iter().flat_map(|&x| [x as u16, (x >> 16) as u16]).collect();
         out.truncate(n);
         out
+    }
+
+    /// Throughput of the trainer GEMM on this device for the shapes of a
+    /// Qwen3.5-0.8B step (4096 tokens): forward, input gradient, weight
+    /// gradient. `CMF_MM_BENCH_TILES="bm,bn,bk,wm,wn;…"` sweeps the 8×8
+    /// (Metal) tiles through `CMF_ZI_TILE8`; one line per tile and shape.
+    #[test]
+    #[ignore]
+    fn mm_rate() {
+        let Some(c) = train_ops::dev() else { return };
+        if !matrix_units() {
+            eprintln!("no matrix units");
+            return;
+        }
+        let tiles: Vec<String> = std::env::var("CMF_MM_BENCH_TILES").map(|v| v.split(';').map(str::to_string).collect()).unwrap_or_else(|_| vec![String::new()]);
+        // (m rows, n plane rows, k)
+        let shapes = [(4096usize, 3584usize, 1024usize), (4096, 1024, 3584), (3584, 1024, 4096), (4096, 6144, 1024)];
+        for t in &tiles {
+            if !t.is_empty() {
+                // SAFETY: single-threaded test body.
+                unsafe { std::env::set_var("CMF_ZI_TILE8", t) };
+            }
+            let g = zi::train_cfg(Epi::F32);
+            for &(m, n, k) in &shapes {
+                let plane = f16_buf(c, n * k);
+                let act = f16_buf(c, m * k);
+                let out = train_ops::zeros(c, m * n);
+                let Some(call) = mm(c, &plane, &act, &out, m, n, k, 1.0) else {
+                    eprintln!("tile {:?}: {m}x{n}x{k} declined", (g.bm, g.bn, g.bk, g.wm, g.wn));
+                    continue;
+                };
+                let reps = 20;
+                run(c, &[Op::M(call)]);
+                let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+                let t0 = std::time::Instant::now();
+                for _ in 0..reps {
+                    run(c, &[Op::M(mm(c, &plane, &act, &out, m, n, k, 1.0).unwrap())]);
+                }
+                let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+                let sec = t0.elapsed().as_secs_f64() / reps as f64;
+                eprintln!(
+                    "tile {:?} frag {}: {m}x{n}x{k} {:.2} ms, {:.2} TFLOPS",
+                    (g.bm, g.bn, g.bk, g.wm, g.wn),
+                    g.frag,
+                    sec * 1e3,
+                    2.0 * (m * n * k) as f64 / sec / 1e12
+                );
+            }
+        }
     }
 
     /// `cvt_t` is the transpose of `cvt`, bit for bit in f16, padded rows

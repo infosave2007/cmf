@@ -10407,7 +10407,7 @@ pub fn run_convert_multi_excluding(
                 .collect();
             if !active.iter().any(|&v| v) {
                 eprintln!(
-                    "  [stream {}/{}] {sname} — все выходы уже в файле, пропуск",
+                    "  [stream {}/{}] {sname} — every output is already in the file, skipped",
                     si + 1,
                     ns
                 );
@@ -10524,7 +10524,7 @@ pub fn run_convert_multi_excluding(
                 .map(|(i, _)| !completed[i] && !done_shards[i].contains(&file_name))
                 .collect();
             if !active.iter().any(|&v| v) {
-                eprintln!("  [{file_name}] уже в файле, пропуск");
+                eprintln!("  [{file_name}] already in the file, skipped");
                 done += file_tensor_count;
                 progress(done as f32 / total as f32);
                 if consume_source_shards {
@@ -11285,10 +11285,10 @@ pub(crate) mod tests {
         let plain = rel(&encode_q2tp(&w, rows, cols));
         unsafe { std::env::set_var("CMF_Q2TP_SEARCH", "1") };
         let searched = rel(&encode_q2tp(&w, rows, cols));
-        println!("q2tp относительная ошибка: absmax {plain:.4} → подбор {searched:.4}");
+        println!("q2tp relative error: absmax {plain:.4} → search {searched:.4}");
         assert!(
             searched < plain,
-            "подбор ступени не улучшил: {searched:.4} против {plain:.4}"
+            "the rung search did not improve: {searched:.4} versus {plain:.4}"
         );
     }
 
@@ -11317,8 +11317,8 @@ pub(crate) mod tests {
         let plain = rel(&encode_q4tp(&w, rows, cols));
         unsafe { std::env::set_var("CMF_Q2TP_SEARCH", "1") };
         let searched = rel(&encode_q4tp(&w, rows, cols));
-        println!("q4tp относительная ошибка: absmax {plain:.4} → подбор {searched:.4}");
-        assert!(searched <= plain, "подбор ухудшил 4 бита");
+        println!("q4tp relative error: absmax {plain:.4} → search {searched:.4}");
+        assert!(searched <= plain, "the search made 4 bits worse");
     }
 
     /// The row encoders were made parallel because a 300B MoE otherwise

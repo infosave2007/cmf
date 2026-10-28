@@ -24,7 +24,7 @@ fn first_divergent_stage_needs_cmf_gpu() {
             cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());
             return;
         }
-        Some(false) => panic!("wgpu запрошен, но контекст не поднялся"),
+        Some(false) => panic!("wgpu was requested but the context did not come up"),
         Some(true) => {}
     }
     let dir = std::env::var("CMF_TOY_DIR").unwrap_or_else(|_| {
@@ -32,7 +32,7 @@ fn first_divergent_stage_needs_cmf_gpu() {
     });
     let path = std::path::Path::new(&dir).join("q4.cmf");
     if !path.exists() {
-        eprintln!("стендов нет — пропуск");
+        eprintln!("no stands — skipped");
         return;
     }
     let model = Arc::new(cortiq_core::CmfModel::open_sharded(path.to_str().unwrap()).unwrap());
@@ -105,7 +105,7 @@ fn first_divergent_stage_needs_cmf_gpu() {
             &mut lg_all,
             &mut walked,
         )
-        .expect("verify отказал");
+        .expect("verify declined");
         assert!(cortiq_engine::dsv4::dsv4_spec_finish(
             g,
             layers,
@@ -156,15 +156,15 @@ fn first_divergent_stage_needs_cmf_gpu() {
                 mx = mx.max(d);
             }
         }
-        println!("{name}: {nd}/{n} различий, max {mx:e}");
+        println!("{name}: {nd}/{n} differences, max {mx:e}");
     };
     // The walk's seeds for this token overwrite tag 45/4 before its frame
     // runs, so x2/qn here are the NEXT layer's; compare loosely and read the
     // trend, not the letter.
-    cmp("qn(вход q)", &w_qn, &b_qn);
-    cmp("q после rope", &w_q, &b_q);
+    cmp("qn(q input)", &w_qn, &b_qn);
+    cmp("q after rope", &w_q, &b_q);
     cmp("attn", &w_attn, &b_attn);
     cmp("mid(o_lora)", &w_mid, &b_mid);
     cmp("ao(wo_b)", &w_ao, &b_ao);
-    cmp("x2(следующий вход)", &w_x2, &b_x2);
+    cmp("x2(next input)", &w_x2, &b_x2);
 }
