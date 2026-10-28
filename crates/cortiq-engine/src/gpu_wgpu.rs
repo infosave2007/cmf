@@ -33,6 +33,8 @@ pub(crate) mod qwen4;
 pub mod host_mem;
 /// Row-blocked decode kernels for the generic q4tp MoE graph block.
 pub(crate) mod moe_r4;
+/// Block-diffusion preview kernels of the batched graph (Clover).
+pub(crate) mod clover;
 /// q8_2f MoE experts on the token graph (decode) and batch graph (prefill).
 pub(crate) mod moe_q82;
 /// Token-axis batch kernels of the dense GDN hybrids (gated attention).
@@ -19393,6 +19395,8 @@ pub struct Ctx {
     qwen4_pipes: std::sync::OnceLock<Option<qwen4::Pipes>>,
     /// The generic MoE block's row-blocked decode pair, compiled on first use.
     moe_r4_pipes: std::sync::OnceLock<Option<moe_r4::Pipes>>,
+    /// Block-diffusion preview kernels (`clover`), compiled on first use.
+    clover_pipes: std::sync::OnceLock<Option<clover::Pipes>>,
     /// Token-axis batch kernels of the dense hybrids (`dense_batch`).
     dense_batch_pipes: std::sync::OnceLock<Option<dense_batch::Pipes>>,
     /// Gemma-4 batch kernels (`gemma_batch`).
@@ -19480,6 +19484,10 @@ pub struct Ctx {
     /// the rest honestly fall back to CPU — ngl-style offload without an
     /// explicit layer list, and no OOM.
     vram_budget: u64,
+    /// Big buffers get dedicated allocations of their own size (device
+    /// created with `MemoryHints::MemoryUsage`): the logical weight bytes
+    /// are the physical ones, no block-rounding headroom needed.
+    exact_alloc: bool,
     /// Bytes currently resident in `weight_bufs`.
     resident: std::sync::atomic::AtomicU64,
     /// Pooled per-op scratch (grow-only): xs upload, y output, uniform
@@ -20629,13 +20637,27 @@ pub fn resident_bytes() -> u64 {
 /// of at least 64 GiB take a flat reserve instead — 12 GiB covers the KV and
 /// upload-staging allocations the payload sum deliberately omits, and is
 /// still several times the measured slack.
-fn graph_live_budget_from_totals(vram_budget: u64, total: u64, q8: u64, packed_moe: u64) -> u64 {
+fn graph_live_budget_from_totals(
+    vram_budget: u64,
+    total: u64,
+    q8: u64,
+    packed_moe: u64,
+    exact_alloc: bool,
+) -> u64 {
     const GIB: u64 = 1 << 30;
     // Fixed KV/context/staging allocations that `total` does not model.
     const LARGE_CARD_RESERVE: u64 = 12 * GIB;
     if q8 > total / 2 || packed_moe > total / 2 {
         if vram_budget >= 64 * GIB {
             return vram_budget.saturating_sub(LARGE_CARD_RESERVE);
+        }
+        // The proportional ceiling below priced the allocator's block
+        // rounding (128-256 MiB blocks, one per >128 MiB plane — the
+        // "packed-to-physical slope"). With dedicated allocations the
+        // stack costs its own bytes and the device budget's reserve
+        // already holds KV, scratch and pipelines.
+        if exact_alloc {
+            return vram_budget;
         }
         // 5/8 matched the packed-to-physical slope but left less than one
         // GiB for the fixed context/pipeline allocations on an A40. 9/16
@@ -20670,8 +20692,9 @@ fn graph_live_budget_with_override(
     q8: u64,
     packed_moe: u64,
     override_mb: Option<&str>,
+    exact_alloc: bool,
 ) -> u64 {
-    let proven = graph_live_budget_from_totals(vram_budget, total, q8, packed_moe);
+    let proven = graph_live_budget_from_totals(vram_budget, total, q8, packed_moe, exact_alloc);
     graph_live_override_bytes(vram_budget, override_mb)
         .map(|ceiling| ceiling.min(proven))
         .unwrap_or(proven)
@@ -20702,7 +20725,14 @@ fn graph_live_weight_budget(c: &Ctx, model: &Arc<CmfModel>) -> u64 {
         }
     }
     let override_mb = std::env::var("CMF_GRAPH_LIVE_MB").ok();
-    graph_live_budget_with_override(c.vram_budget, total, q8, packed_moe, override_mb.as_deref())
+    graph_live_budget_with_override(
+        c.vram_budget,
+        total,
+        q8,
+        packed_moe,
+        override_mb.as_deref(),
+        c.exact_alloc,
+    )
 }
 
 /// Automatic prefix for ordinary per-op layer walks (most importantly the
@@ -21071,6 +21101,15 @@ fn init(dev: usize) -> Result<Ctx, String> {
                 && c.cr_type == wgpu::CooperativeScalarType::F32
         });
     COOP8_OK.store(want_coop8, std::sync::atomic::Ordering::Relaxed);
+    // Exact-size placement of the big buffers. wgpu's default hint
+    // ("Performance") sub-allocates device memory in 128-256 MiB blocks: a
+    // 143 MiB packed expert plane takes a block of its own and strands the
+    // remaining 113 MiB, so a 35B-A3B q4tp stack (18.7 GB of weights) held
+    // 31.8 GB of a 32 GB card. "MemoryUsage" sub-allocates in 8-64 MiB
+    // blocks and gives every larger buffer a dedicated allocation of its
+    // own size: 18.8 GB, same speed (82 / 86 ms a 32-row pass on an RTX
+    // 5090). `CMF_WGPU_MEMORY=performance` restores the large blocks.
+    let exact_alloc = std::env::var("CMF_WGPU_MEMORY").as_deref() != Ok("performance");
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("cortiq-wgpu"),
         required_limits: limits.clone(),
@@ -21107,6 +21146,11 @@ fn init(dev: usize) -> Result<Ctx, String> {
             unsafe { wgpu::ExperimentalFeatures::enabled() }
         } else {
             wgpu::ExperimentalFeatures::disabled()
+        },
+        memory_hints: if exact_alloc {
+            wgpu::MemoryHints::MemoryUsage
+        } else {
+            wgpu::MemoryHints::Performance
         },
         ..Default::default()
     }))
@@ -22354,6 +22398,8 @@ fn init(dev: usize) -> Result<Ctx, String> {
         dsv4_global_s16_lazy: std::sync::OnceLock::new(),
         qwen4_pipes: std::sync::OnceLock::new(),
         moe_r4_pipes: std::sync::OnceLock::new(),
+        exact_alloc,
+        clover_pipes: std::sync::OnceLock::new(),
         dense_batch_pipes: std::sync::OnceLock::new(),
         g4_batch_pipes: std::sync::OnceLock::new(),
         g4_dec_pipe: std::sync::OnceLock::new(),
@@ -32756,6 +32802,35 @@ pub fn forward_batch_graph_at(
         bgraph_refused("Gemma-4 batch kernels unavailable (CMF_G4_BATCH=0 or rejected)");
         return batch_outcome(o1_started || state_started, false);
     }
+    // Block-diffusion preview (Clover): logits of every row through the
+    // spec tail, no device state advanced, plain exact-KV layers only.
+    let preview = crate::gpu::block_preview();
+    let clover_p = match preview {
+        Some(_) => {
+            let pipes = clover::pipes(c);
+            let shapes_ok = layers.iter().all(|l| match &l.attn {
+                crate::gpu::GraphAttn::Full { geom, .. } => geom.is_none(),
+                crate::gpu::GraphAttn::Gdn { preview, dk, dv, .. } => {
+                    preview.is_some() && clover::fits(*dk, *dv, k)
+                }
+                _ => false,
+            });
+            // A preview ends in the head (`spec`) or hands a device
+            // prefix's boundary rows to the host tail (`layers_run`).
+            if pipes.is_none()
+                || !shapes_ok
+                || spec.is_some() == layers_run.is_some()
+                || o1.iter().any(Option::is_some)
+                || g4_model
+                || k >= 256
+            {
+                bgraph_refused("block preview: unsupported stack or no preview kernels");
+                return batch_outcome(o1_started || state_started, false);
+            }
+            pipes
+        }
+        None => None,
+    };
     // Unlike the decode graph this function has no host-tail handoff: every
     // layer must coexist in one command buffer. Refuse before the first
     // upload when that live set cannot fit. Relying on the LRU here is
@@ -33004,14 +33079,12 @@ pub fn forward_batch_graph_at(
                 if gw.data.len() < rows * cols {
                     return None;
                 }
-                let b = c.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("bg-f32w"),
-                    size: (rows * cols * 4) as u64,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                c.queue
-                    .write_buffer(&b, 0, bytemuck::cast_slice(&gw.data[..rows * cols]));
+                // Parked like the norm weights (`const_buf`): an f32 router
+                // or gate is the same bytes every call, and minting and
+                // filling a fresh buffer per call was 8 ms of encode on a
+                // 40-layer MoE (one 2 MB router a layer) — every verify
+                // round and every block-diffusion preview paid it.
+                let b = const_buf(c, bytemuck::cast_slice(&gw.data[..rows * cols]));
                 Some(GMat {
                     buf: b,
                     rs: None,
@@ -33908,7 +33981,8 @@ pub fn forward_batch_graph_at(
     // a prompt chunk of ≤ 16 rows — the tail of every prompt, or a short
     // prompt whole — keeps f32 activations so the batched prefill differs
     // from the per-position walk in accumulation order only.
-    let i8_rows = spec.is_some() && verify_i8_on();
+    let i8_rows = spec.is_some() && preview.is_none() && verify_i8_on();
+    let q82mm_p = g4p.or_else(|| preview.and_then(|_| gemma_batch::pipes(c)));
     let ematb = |enc: &mut wgpu::CommandEncoder,
                  m: &GMat,
                  xs: &wgpu::Buffer,
@@ -33919,11 +33993,17 @@ pub fn forward_batch_graph_at(
             0 => encode_q8_mm(c, enc, &m.buf, m.rs.as_ref().unwrap(), xs, y, rows, cols, k),
             10 => encode_q1g_mm(c, enc, &m.buf, xs, y, rows, cols, k),
             5 => encode_q4_tile_mm(c, enc, &c.q4t_mm, &m.buf, xs, y, rows, cols, k),
-            // Gemma-4's prompt chunks: the register-blocked int8 GEMM (each
-            // weight word read once per 64 batch rows, exact f32 sums in
-            // tile order). Every other model keeps the eight-row arm below.
+            // Gemma-4's prompt chunks and block previews: the register-blocked
+            // int8 GEMM (each weight word read once per 64 batch rows, exact
+            // f32 sums in tile order). Every other model keeps the eight-row
+            // arm below, bit for bit the decode kernel; a preview has no
+            // decode twin to match and reads the weights a quarter as often.
+            // In a preview only wide matrices take it: one 64-row tile a
+            // workgroup leaves a 2048-row projection 32 workgroups (the
+            // GDN out_proj measured 3.4 → 7.5 ms a pass on an RTX 5090).
             7 if k > 16
-                && g4p.is_some_and(|gp| {
+                && (g4p.is_some() || rows >= 8192)
+                && q82mm_p.is_some_and(|gp| {
                     gemma_batch::encode_q82_mm(c, enc, gp, &m.buf, xs, y, rows, cols, k)
                 }) => {}
             // q8_2f: eight batch rows per weight read, each output the
@@ -34421,7 +34501,196 @@ pub fn forward_batch_graph_at(
                     lnkv * ldv,
                     hidden,
                 );
-                if let (Some(gp), Some((qall, _)), Some(g), None) =
+                let preview_bt = dense_batch::attn(c).filter(|_| {
+                    preview.is_some()
+                        && c.attend_gpart.is_some()
+                        && nh % nkv == 0
+                        && nh / nkv <= 8
+                        && hd <= 256
+                        && hd % 4 == 0
+                        && pos_end <= cap
+                });
+                if let Some(p) = preview_bt {
+                    // Block preview through the token-axis kernels: RoPE and
+                    // the mirror append of every row, then every row attends
+                    // all pos_end rows (`n_all`) — the block is bidirectional.
+                    let (kbuf, vbuf) = kvbufs[li].as_ref().unwrap();
+                    let gate_flag = if *output_gate { 1u32 } else { 0 };
+                    let rope_words = rope_uniform_words(
+                        nh,
+                        nkv,
+                        hd,
+                        rd,
+                        positions[0],
+                        flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm) | gate_flag,
+                        eps,
+                        0,
+                        1.0,
+                    );
+                    let (qall, gall, pacc, pml, sub, nc) = bt_bufs.get_or_insert_with(|| {
+                        let nc = pos_end.div_ceil(dense_batch::BT_CK);
+                        let per_tok = nh * nc * hd * 4;
+                        let sub = ((64usize << 20) / per_tok.max(1)).clamp(1, k);
+                        (
+                            rwc(k * nh * hd),
+                            rwc(k * nh * hd),
+                            rwc(sub * nh * nc * hd),
+                            rwc(sub * nh * nc * 2),
+                            sub,
+                            nc,
+                        )
+                    });
+                    // Short contexts take the one-workgroup-a-head twin, as
+                    // the causal batch does below ATTEND_SPLIT_MIN.
+                    let t_dec = if c.attend_dec && pos_end <= ATTEND_SPLIT_MIN { k } else { 0 };
+                    state_started = true;
+                    dense_batch::encode_attn_bt(
+                        c, &mut enc, p, rope_words, &qraw_b, &kb_b, &vb_b, qall, gall, &qnw,
+                        &knw, &invf_b, kbuf, vbuf, pacc, pml, &attn_bb, nh, nkv, hd, cap,
+                        positions[0], 0, t_dec, k, *sub, *nc, attn_scale, pos_end,
+                    );
+                    if *output_gate {
+                        let gm_u = unif(&[(k * nh * hd) as u32, 0, 0, 0]);
+                        let mut pass = begin_pass(&mut enc);
+                        pass.set_pipeline(&c.gate_mul);
+                        pass.set_bind_group(0, &bg(&c.layout_gate_mul, &[gall, &attn_bb, &gm_u]), &[]);
+                        pass.dispatch_workgroups(((k * nh * hd) as u32).div_ceil(256), 1, 1);
+                    }
+                } else if preview.is_some() {
+                    // Block preview, row by row: RoPE and the mirror append
+                    // of EVERY row first, then each row attends all pos_end
+                    // rows. The rope pass runs again in the attend loop to
+                    // rebuild the row's q in the one-row scratch (K is not
+                    // appended twice).
+                    let (kbuf, vbuf) = kvbufs[li].as_ref().unwrap();
+                    let gate_flag = if *output_gate { 1u32 } else { 0 };
+                    let rope_u = |i: usize| {
+                        uniform_rope(
+                            c,
+                            rope_uniform_words(
+                                nh,
+                                nkv,
+                                hd,
+                                rd,
+                                positions[i],
+                                flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm) | gate_flag,
+                                eps,
+                                i,
+                                1.0,
+                            ),
+                        )
+                    };
+                    let bg_rope = |u: &wgpu::Buffer| {
+                        bg(
+                            &c.layout_attn_rope,
+                            &[&qraw_b, &kb_b, &qout_s, &gout_s, &qnw, &knw, &invf_b, u],
+                        )
+                    };
+                    let mut pass = begin_pass(&mut enc);
+                    for i in 0..k {
+                        let p = positions[i];
+                        let kv_u = uniform_u32x4(
+                            c,
+                            [nkv as u32, hd as u32, cap as u32, (p | (i << 20)) as u32],
+                        );
+                        pass.set_pipeline(&c.attn_rope);
+                        pass.set_bind_group(0, &bg_rope(&rope_u(i)), &[]);
+                        pass.dispatch_workgroups((nh + nkv) as u32, 1, 1);
+                        pass.set_pipeline(&c.kv_append);
+                        state_started = true;
+                        pass.set_bind_group(
+                            0,
+                            &bg(&c.layout_kv, &[&kb_b, &vb_b, kbuf, vbuf, &kv_u]),
+                            &[],
+                        );
+                        pass.dispatch_workgroups(((nkv * hd) as u32).div_ceil(256), 1, 1);
+                    }
+                    let n_ctx = pos_end;
+                    let hpk = nh / nkv;
+                    let split_ok = n_ctx > ATTEND_SPLIT_MIN
+                        && c.attend_gpart.is_some()
+                        && hpk <= 8
+                        && hd <= 256
+                        && hd % 4 == 0
+                        && nh % nkv == 0;
+                    let at_u = unif(&[
+                        nh as u32,
+                        hpk as u32,
+                        hd as u32,
+                        cap as u32,
+                        n_ctx as u32,
+                        attn_scale.to_bits(),
+                        0,
+                        0,
+                    ]);
+                    let nc = cap.div_ceil(ATTEND_GCK);
+                    let ap_u = unif(&[
+                        nh as u32,
+                        hpk as u32,
+                        hd as u32,
+                        cap as u32,
+                        n_ctx as u32,
+                        ATTEND_GCK as u32,
+                        nc as u32,
+                        attn_scale.to_bits(),
+                    ]);
+                    for i in 0..k {
+                        pass.set_pipeline(&c.attn_rope);
+                        pass.set_bind_group(0, &bg_rope(&rope_u(i)), &[]);
+                        pass.dispatch_workgroups((nh + nkv) as u32, 1, 1);
+                        if split_ok {
+                            let bg_part = bg(
+                                c.layout_attend_gpart.as_ref().unwrap(),
+                                &[&qout_s, kbuf, vbuf, &pacc_s, &pml_s, &ap_u],
+                            );
+                            let bg_merge = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: None,
+                                layout: &c.layout_attend_merge,
+                                entries: &[
+                                    bind_buf(3, &pacc_s),
+                                    bind_buf(4, &pml_s),
+                                    bind_buf(5, &ap_u),
+                                    bind_buf(6, &attn_s),
+                                ],
+                            });
+                            pass.set_pipeline(c.attend_gpart.as_ref().unwrap());
+                            pass.set_bind_group(0, &bg_part, &[]);
+                            pass.dispatch_workgroups(nkv as u32, n_ctx.div_ceil(ATTEND_GCK) as u32, 1);
+                            pass.set_pipeline(&c.attend_merge);
+                            pass.set_bind_group(0, &bg_merge, &[]);
+                            pass.dispatch_workgroups(nh as u32, 1, 1);
+                        } else if c.attend_dec && hd <= 256 {
+                            let dec_l = c.gqa_attend_dec.get_bind_group_layout(0);
+                            pass.set_pipeline(&c.gqa_attend_dec);
+                            pass.set_bind_group(
+                                0,
+                                &bg(&dec_l, &[&qout_s, kbuf, vbuf, &attn_s, &at_u]),
+                                &[],
+                            );
+                            pass.dispatch_workgroups(nh as u32, 1, 1);
+                        } else {
+                            let (ap, al) = attend_pipes(c, hd);
+                            pass.set_pipeline(ap);
+                            pass.set_bind_group(
+                                0,
+                                &bg(al, &[&qout_s, kbuf, vbuf, &attn_s, &at_u]),
+                                &[],
+                            );
+                            pass.dispatch_workgroups(nh as u32, 1, 1);
+                        }
+                        if *output_gate {
+                            let gm_u = unif(&[(nh * hd) as u32, 0, 0, 0]);
+                            pass.set_pipeline(&c.gate_mul);
+                            pass.set_bind_group(
+                                0,
+                                &bg(&c.layout_gate_mul, &[&gout_s, &attn_s, &gm_u]),
+                                &[],
+                            );
+                            pass.dispatch_workgroups(((nh * hd) as u32).div_ceil(256), 1, 1);
+                        }
+                        encode_blit_p(&mut pass, c, &attn_s, &attn_bb, nh * hd, 0, i * nh * hd, None);
+                    }
+                } else if let (Some(gp), Some((qall, _)), Some(g), None) =
                     (g4p, g4_bufs.as_ref(), geom.filter(|g| g.v_norm), o1_here)
                 {
                     // Gemma-4: Q/K norm + RoPE and the V norm of every row,
@@ -35105,7 +35374,7 @@ pub fn forward_batch_graph_at(
                         dense_batch::encode_attn_bt(
                             c, &mut enc, p, rope_words, &qraw_b, &kb_b, &vb_b, qall, gall, &qnw,
                             &knw, &invf_b, kbuf, vbuf, pacc, pml, &attn_bb, nh, nkv, hd, cap,
-                            positions[0], t_from, t_split, k, *sub, *nc, attn_scale,
+                            positions[0], t_from, t_split, k, *sub, *nc, attn_scale, 0,
                         );
                         if *output_gate {
                             // The loop's gate_mul, over rows t_from..k at once
@@ -35156,6 +35425,7 @@ pub fn forward_batch_graph_at(
                     a_log,
                     dt_bias,
                     norm,
+                    preview: gpre,
                     ..
                 },
             ) => {
@@ -35164,7 +35434,10 @@ pub fn forward_batch_graph_at(
                 // Speculative rounds: a snapshot slot per position, taken
                 // right after this position's state advance. The buffer
                 // lives per (kv_id, layer) and regrows if k does.
-                let snap = if spec.is_some() && std::env::var("CMF_SPEC_NOSNAP").is_err() {
+                let snap = if spec.is_some()
+                    && preview.is_none()
+                    && std::env::var("CMF_SPEC_NOSNAP").is_err()
+                {
                     let ring_sz = (cdim * kk.saturating_sub(1) * 4) as u64;
                     let s_sz = (nv * dk * dv * 4) as u64;
                     let mut m = c.gdn_snap.lock().unwrap();
@@ -35256,7 +35529,39 @@ pub fn forward_batch_graph_at(
                     }
                 }
                 bts!(enc, 7);
-                {
+                if let (Some(cp), Some(pw), Some(_)) = (clover_p, gpre.as_ref(), preview) {
+                    // Block preview: the committed (ring, S) are read only.
+                    clover::encode_gdn_preview(
+                        c,
+                        &mut enc,
+                        cp,
+                        &clover::GdnDims {
+                            nv: *nv,
+                            nk: *nk,
+                            dk: *dk,
+                            dv: *dv,
+                            kk: *kk,
+                            cdim: *cdim,
+                            kb: k,
+                            eps,
+                        },
+                        &qkv_b,
+                        &z_b,
+                        &a_bb,
+                        &taps,
+                        &stor(bytemuck::cast_slice(pw.conv_right)),
+                        &alog,
+                        &dtb,
+                        &gnorm,
+                        &stor(bytemuck::cast_slice(pw.logit_scale)),
+                        &stor(bytemuck::cast_slice(pw.history_bias)),
+                        &stor(bytemuck::cast_slice(pw.history_c)),
+                        ring,
+                        s,
+                        &cq_s,
+                        &gdo_b,
+                    );
+                } else {
                     // The position recurrence lives INSIDE two k-looped
                     // kernels: one dispatch of conv (columns independent —
                     // no barriers at all), one of step (heads independent),
@@ -35616,6 +35921,11 @@ pub fn forward_batch_graph_at(
                 } else {
                     ematb(&mut enc, router, &n1, mlogit, *n_exp, hidden);
                 }
+                if let (Some(cp), Some(crate::gpu::BlockPreview { coreset_top_p: Some(tp) })) =
+                    (clover_p, preview)
+                {
+                    clover::encode_coreset(c, &mut enc, cp, mlogit, *n_exp, k, *top_k, tp);
+                }
                 let bg_sel = bg(
                     &c.layout_moe_sel_b,
                     &[mlogit, &n1, msel, mwt, &sel_u, &sgate.buf, &bias_buf],
@@ -35811,6 +36121,16 @@ pub fn forward_batch_graph_at(
                         );
                         pass.dispatch_workgroups((*n_exp as u32).min(MAX_WG), k as u32, 1);
                     }
+                    if let (Some(cp), Some(crate::gpu::BlockPreview { coreset_top_p: Some(tp) })) =
+                        (clover_p, preview)
+                    {
+                        clover::encode_coreset(c, &mut enc, cp, mlogit, *n_exp, k, *top_k, tp);
+                    }
+                    // GPTQ calibration (`quantize-moe`): this layer's MoE
+                    // input and router logits, before any coreset mask.
+                    if preview.is_none() && clover::moe_capturing(layer_base + li) {
+                        clover::moe_capture_rows(c, &mut enc, layer_base + li, k, &n1, mlogit, hidden, *n_exp);
+                    }
                     let bg_sel = bg(
                         &c.layout_moe_sel_b,
                         &[mlogit, &n1, msel, mwt, &sel_u, &sgate.buf, &bias_buf],
@@ -35903,12 +36223,22 @@ pub fn forward_batch_graph_at(
                         pass.set_pipeline(&pg.group);
                         pass.set_bind_group(0, &bg_gr, &[]);
                         pass.dispatch_workgroups(1, 1, 1);
-                        pass.set_pipeline(&pg.gu);
-                        pass.set_bind_group(0, &bg_ggu, &[]);
-                        pass.dispatch_workgroups((*mi as u32).div_ceil(64), buckets as u32, tz);
-                        pass.set_pipeline(&pg.dn);
-                        pass.set_bind_group(0, &bg_gdn, &[]);
-                        pass.dispatch_workgroups((hidden as u32).div_ceil(64), buckets as u32, tz);
+                        // A block preview's expert buckets are a few tokens
+                        // deep: its kernels spread a row over the lanes and
+                        // run only the non-empty tiles (`clover::encode_moe`).
+                        if let (Some(cp), Some(_)) = (clover_p, preview) {
+                            clover::encode_moe(
+                                c, &mut pass, cp, gate_all, up_all, down_all, &n1, &goff, &gent,
+                                mact, &ypart, &gu_u, &dn_u, buckets, n_ent, *mi, hidden,
+                            );
+                        } else {
+                            pass.set_pipeline(&pg.gu);
+                            pass.set_bind_group(0, &bg_ggu, &[]);
+                            pass.dispatch_workgroups((*mi as u32).div_ceil(64), buckets as u32, tz);
+                            pass.set_pipeline(&pg.dn);
+                            pass.set_bind_group(0, &bg_gdn, &[]);
+                            pass.dispatch_workgroups((hidden as u32).div_ceil(64), buckets as u32, tz);
+                        }
                         pass.set_pipeline(&pg.sum);
                         pass.set_bind_group(0, &bg_gs, &[]);
                         pass.dispatch_workgroups(((k * hidden) as u32).div_ceil(256), 1, 1);
@@ -35922,6 +36252,10 @@ pub fn forward_batch_graph_at(
                     }
                     drop(pass);
                     continue_ffn = false;
+                }
+                if continue_ffn && preview.is_some() {
+                    bgraph_refused("block preview: MoE layout without the batched router arm");
+                    return batch_outcome(o1_started || state_started, false);
                 }
                 if continue_ffn {
                     for i in 0..k {
@@ -36056,6 +36390,20 @@ pub fn forward_batch_graph_at(
             return batch_outcome(o1_started || state_started, false);
         };
         ematb(&mut enc, &lm, &n1b_p, &lbuf, sp.lm_rows, hidden);
+        // Block preview, greedy: the pick on the device, 8 bytes a row back.
+        let pick_buf = match (sp.pick.as_ref(), clover_p) {
+            (Some((pk, _)), Some(cp)) => {
+                let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("clover-pick-out"),
+                    size: (k * 8) as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                });
+                clover::encode_pick(c, &mut enc, cp, pk, &lbuf, sp.lm_rows, k, &b);
+                Some(b)
+            }
+            _ => None,
+        };
         bts!(enc, 5);
         batch_kernel_ts_resolve(c, &mut enc);
         if bts_on && bts_lbl.len() > 1 {
@@ -36066,13 +36414,24 @@ pub fn forward_batch_graph_at(
                 enc.copy_buffer_to_buffer(resolve, 0, tstage, 0, bts_lbl.len() as u64 * 8);
             }
         }
-        sp.logits_out.resize(k * sp.lm_rows, 0.0);
-        readback2(
-            c,
-            enc,
-            (&h_buf, &mut h[..k * hidden]),
-            (&lbuf, &mut sp.logits_out[..]),
-        )
+        match (pick_buf, sp.pick.as_mut()) {
+            (Some(pb), Some((_, picks))) => {
+                let mut raw = vec![0f32; 2 * k];
+                let ok = readback2(c, enc, (&h_buf, &mut h[..k * hidden]), (&pb, &mut raw[..]));
+                picks.clear();
+                picks.extend(raw.chunks_exact(2).map(|w| (w[0].to_bits(), w[1])));
+                ok
+            }
+            _ => {
+                sp.logits_out.resize(k * sp.lm_rows, 0.0);
+                readback2(
+                    c,
+                    enc,
+                    (&h_buf, &mut h[..k * hidden]),
+                    (&lbuf, &mut sp.logits_out[..]),
+                )
+            }
+        }
     } else {
         batch_kernel_ts_resolve(c, &mut enc);
         if bts_on && bts_lbl.len() > 1 {
@@ -36160,7 +36519,9 @@ pub fn forward_batch_graph_at(
     if ok {
         batch_kernel_ts_report(c, k);
     }
-    if ok {
+    // A preview's K/V rows past the synced count are scratch: the next
+    // commit overwrites them, and no cursor moves.
+    if ok && preview.is_none() {
         let mut kvm = c.attn_kv.lock().unwrap();
         for li in 0..layers.len() {
             if let Some(m) = kvm.get_mut(&(kv_id, layer_base + li)) {
@@ -48900,21 +49261,21 @@ mod tests {
         let guarded = budget * 9 / 16;
         // Q8_2F keeps its existing safety margin.
         assert_eq!(
-            graph_live_budget_from_totals(budget, 18 << 30, 10 << 30, 0),
+            graph_live_budget_from_totals(budget, 18 << 30, 10 << 30, 0, false),
             guarded
         );
         // A q4tp MoE-dominated stack gets the same physical-allocation
         // safety margin; an ordinary dense q4tp stack does not.
         assert_eq!(
-            graph_live_budget_from_totals(budget, 18 << 30, 1 << 30, 16 << 30),
+            graph_live_budget_from_totals(budget, 18 << 30, 1 << 30, 16 << 30, false),
             guarded
         );
         assert_eq!(
-            graph_live_budget_from_totals(budget, 18 << 30, 1 << 30, 0),
+            graph_live_budget_from_totals(budget, 18 << 30, 1 << 30, 0, false),
             budget
         );
         assert_eq!(
-            graph_live_budget_from_totals(budget, 18 << 30, 1 << 30, 8 << 30),
+            graph_live_budget_from_totals(budget, 18 << 30, 1 << 30, 8 << 30, false),
             budget
         );
 
@@ -48934,7 +49295,7 @@ mod tests {
             "model.layers.0.self_attn.q_proj.weight"
         ));
         assert_eq!(
-            graph_live_budget_from_totals(budget, 48 << 30, 10 << 30, 38 << 30),
+            graph_live_budget_from_totals(budget, 48 << 30, 10 << 30, 38 << 30, false),
             guarded
         );
 
@@ -48942,20 +49303,34 @@ mod tests {
         // 9/16 of 96 GiB would strand 42 GiB. Dense stacks are unaffected.
         let big = 96u64 << 30;
         assert_eq!(
-            graph_live_budget_from_totals(big, 200 << 30, 1 << 30, 160 << 30),
+            graph_live_budget_from_totals(big, 200 << 30, 1 << 30, 160 << 30, false),
             big - (12 << 30)
         );
         assert_eq!(
-            graph_live_budget_from_totals(big, 200 << 30, 150 << 30, 0),
+            graph_live_budget_from_totals(big, 200 << 30, 150 << 30, 0, false),
             big - (12 << 30)
         );
         assert_eq!(
-            graph_live_budget_from_totals(big, 200 << 30, 1 << 30, 0),
+            graph_live_budget_from_totals(big, 200 << 30, 1 << 30, 0, false),
             big
+        );
+        // Dedicated allocations: the stack costs its own bytes below the
+        // large-card cutoff; the large-card reserve stays as it was.
+        assert_eq!(
+            graph_live_budget_from_totals(budget, 18 << 30, 1 << 30, 16 << 30, true),
+            budget
+        );
+        assert_eq!(
+            graph_live_budget_from_totals(budget, 18 << 30, 10 << 30, 0, true),
+            budget
+        );
+        assert_eq!(
+            graph_live_budget_from_totals(big, 200 << 30, 1 << 30, 160 << 30, true),
+            big - (12 << 30)
         );
         // The flat reserve never underflows a budget just above the cutoff.
         assert_eq!(
-            graph_live_budget_from_totals(64 << 30, 200 << 30, 1 << 30, 160 << 30),
+            graph_live_budget_from_totals(64 << 30, 200 << 30, 1 << 30, 160 << 30, false),
             52 << 30
         );
     }
@@ -48973,7 +49348,7 @@ mod tests {
             Some(13_438 * MIB)
         );
         assert_eq!(
-            graph_live_budget_with_override(budget, 18 << 30, 1 << 30, 16 << 30, Some("13438")),
+            graph_live_budget_with_override(budget, 18 << 30, 1 << 30, 16 << 30, Some("13438"), false),
             guarded
         );
         assert_eq!(
@@ -48981,7 +49356,7 @@ mod tests {
             Some(budget)
         );
         assert_eq!(
-            graph_live_budget_with_override(budget, 18 << 30, 1 << 30, 16 << 30, Some("999999")),
+            graph_live_budget_with_override(budget, 18 << 30, 1 << 30, 16 << 30, Some("999999"), false),
             guarded
         );
         assert_eq!(graph_live_override_bytes(0, Some("1")), None);
@@ -48997,7 +49372,7 @@ mod tests {
         ] {
             assert_eq!(graph_live_override_bytes(budget, raw), None, "{raw:?}");
             assert_eq!(
-                graph_live_budget_with_override(budget, 18 << 30, 1 << 30, 16 << 30, raw),
+                graph_live_budget_with_override(budget, 18 << 30, 1 << 30, 16 << 30, raw, false),
                 guarded,
                 "{raw:?}"
             );
