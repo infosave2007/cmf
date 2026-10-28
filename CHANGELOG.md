@@ -83,8 +83,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   GDN 5.5× faster, GEMM tile 64×64×32 at 3.0 TFLOPS instead of 1.7); every
   gradient check passes on Metal (mask, norm, dense heal), the GEMM, attention,
   GDN and sign kernels match their references. The NVG device encoder and
-  the device GPTQ kernels (`nvg_dev`, `gptq_dev`) take the same context, so
-  `convert --quant blr` encodes on the Mac's GPU without `CMF_GPU=wgpu`. On
+  the device GPTQ kernels (`nvg_dev`, `gptq_dev`) take the same context
+  (their tests pass on Metal); `quantize-moe`, whose capture accumulates
+  through the runtime's wgpu path, still needs `CMF_GPU=wgpu` on a Mac. On
   unified memory the heal depth is sized from 60 % of the host's memory (the
   runtime's 8 GB default trained 7 of the 0.8B's 24 layers). Qwen3.5-0.8B
   `compress --ffn 0.75 --heal-epochs 1` end to end on an M4: S1 154 s, S3 72 s,
