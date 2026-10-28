@@ -23,7 +23,7 @@
 //! A pivot that is not positive (or NaN) raises λ ×10 and refactors, as the
 //! host does.
 
-use super::{Ctx, ctx, submit};
+use super::{Ctx, submit, trainer_ctx as ctx};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 

@@ -582,8 +582,8 @@ fn s2_plan(run: &Run) -> Result<()> {
             let total: usize = p.layers.iter().map(|l| l.keep).sum();
             let keep_frac = total as f64 / widths.iter().sum::<usize>() as f64;
             let data = Data::load(&a.data)?;
-            let model = open(&path_of(&s0, "f16").or_else(|| path_of(&s0, "q8")).unwrap())?;
-            let logits = super::dtgma::learn(run, &data, &model, keep_frac)?;
+            let model_path = path_of(&s0, "f16").or_else(|| path_of(&s0, "q8")).unwrap();
+            let logits = super::dtgma::learn(run, &data, &model_path, keep_frac)?;
             ensure!(logits.len() == nl && logits.iter().zip(&widths).all(|(l, &w)| l.len() == w), "DTG-MA logits do not match the FFN widths");
             let floor: Vec<usize> = widths.iter().zip(&protect).map(|(&w, &pr)| if pr { w } else { ((w as f64 * a.min_width) as usize).div_ceil(a.align.max(1)) * a.align.max(1) }).collect();
             let keeps = super::dtgma::keeps_from(&logits, &widths, total, a.align, &floor);
@@ -992,7 +992,14 @@ fn s4_heal_device(run: &Run, data: &Data, student: &CmfModel, student_path: &Pat
         / nl as f64;
     let trained = if ffn_only { ffn_w.min(layer_w) } else { layer_w };
     let per_layer = 20.0 * trained + 4.0 * (layer_w - trained);
-    let budget = cortiq_engine::gpu_wgpu::dsv4_vram_budget().unwrap_or(8 << 30) as f64;
+    // the trainer's device: its own budget, or on unified memory (Apple
+    // Silicon) 60 % of the host's — the runtime's budget was 8 GB there,
+    // which trained 7 of the 0.8B's 24 layers
+    let budget = match cortiq_engine::gpu_wgpu::trainer_vram_budget() {
+        Some(b) if b != u64::MAX => b as f64,
+        Some(_) => mem_budget() as f64 * 0.6,
+        None => (8u64 << 30) as f64,
+    };
     let room = budget - head - 6e9;
     let train_from = heal_train_from(&a.heal_layers, nl, per_layer, room.max(per_layer))?;
     let need = per_layer * (nl - train_from) as f64;

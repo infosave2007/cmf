@@ -37,8 +37,16 @@ const LDS: u32 = BK + 8;
 /// 3: K ≥ the M tile's start).
 const VARIANTS: [(&str, bool, bool, u32); 3] = [("att_mm_s", true, true, 1), ("att_mm_o", true, false, 2), ("att_mm_d", false, false, 3)];
 
+/// Side of the cooperative fragments: NVIDIA's 16×16, or Apple's 8×8
+/// simdgroup matrices on Metal (each subgroup still owns a 32×32 block).
+fn frag() -> u32 {
+    tm::frag_side()
+}
+
 fn src() -> String {
     use std::fmt::Write;
+    let fr = frag();
+    let nf = 32 / fr;
     let mut s = String::new();
     let _ = writeln!(s, "enable f16;\nenable wgpu_cooperative_matrix;\ndiagnostic(off, derivative_uniformity);");
     let _ = writeln!(
@@ -81,13 +89,14 @@ fn {name}(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index
         if causal == 1 {
             let _ = writeln!(s, "    if (n0 > m0 + {}u) {{ return; }}", BM - 1);
         }
+        for i in 0..nf {
+            for j in 0..nf {
+                let _ = writeln!(s, "    var c{i}{j}: coop_mat{fr}x{fr}<f32, C>;");
+            }
+        }
         let _ = writeln!(
             s,
-            "    var c00: coop_mat16x16<f32, C>;
-    var c01: coop_mat16x16<f32, C>;
-    var c10: coop_mat16x16<f32, C>;
-    var c11: coop_mat16x16<f32, C>;
-    for (var ch = 0u; ch < p.nchunk; ch = ch + 1u) {{
+            "    for (var ch = 0u; ch < p.nchunk; ch = ch + 1u) {{
         let aoff = zb * p.a_sb + (zh / p.a_hdiv) * p.a_sh + ch * p.a_ck;
         let boff = zb * p.b_sb + (zh / p.b_hdiv) * p.b_sh + ch * p.b_ck;"
         );
@@ -160,21 +169,21 @@ fn {name}(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index
             );
         }
         let _ = writeln!(s, "            workgroupBarrier();");
-        for kk in 0..BK / 16 {
-            let _ = writeln!(
-                s,
-                "            {{
-                let a0 = coopLoadT<coop_mat16x16<f16, A>>(&sa[(wy * 32u) * {LDS}u + {ko}u], {LDS}u);
-                let a1 = coopLoadT<coop_mat16x16<f16, A>>(&sa[(wy * 32u + 16u) * {LDS}u + {ko}u], {LDS}u);
-                let b0 = coopLoad<coop_mat16x16<f16, B>>(&sb[(wx * 32u) * {LDS}u + {ko}u], {LDS}u);
-                let b1 = coopLoad<coop_mat16x16<f16, B>>(&sb[(wx * 32u + 16u) * {LDS}u + {ko}u], {LDS}u);
-                c00 = coopMultiplyAdd(a0, b0, c00);
-                c01 = coopMultiplyAdd(a0, b1, c01);
-                c10 = coopMultiplyAdd(a1, b0, c10);
-                c11 = coopMultiplyAdd(a1, b1, c11);
-            }}",
-                ko = kk * 16
-            );
+        for kk in 0..BK / fr {
+            let ko = kk * fr;
+            let _ = writeln!(s, "            {{");
+            for i in 0..nf {
+                let _ = writeln!(s, "                let a{i} = coopLoadT<coop_mat{fr}x{fr}<f16, A>>(&sa[(wy * 32u + {}u) * {LDS}u + {ko}u], {LDS}u);", i * fr);
+            }
+            for j in 0..nf {
+                let _ = writeln!(s, "                let b{j} = coopLoad<coop_mat{fr}x{fr}<f16, B>>(&sb[(wx * 32u + {}u) * {LDS}u + {ko}u], {LDS}u);", j * fr);
+            }
+            for i in 0..nf {
+                for j in 0..nf {
+                    let _ = writeln!(s, "                c{i}{j} = coopMultiplyAdd(a{i}, b{j}, c{i}{j});");
+                }
+            }
+            let _ = writeln!(s, "            }}");
         }
         let _ = writeln!(
             s,
@@ -185,13 +194,30 @@ fn {name}(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index
     let osc = p.oscale;
     let coff = zb * p.c_sb + (zh / p.c_hdiv) * p.c_sh;
     let orow = m0 + wy * 32u;
-    let ocol = n0 + wx * 32u;
-    {{ let oi = coff + orow * ldc + ocol; let cv = c00 * osc; coopStoreT(cv, &CO[oi], ldc); }}
-    {{ let oi = coff + orow * ldc + ocol + 16u; let cv = c01 * osc; coopStoreT(cv, &CO[oi], ldc); }}
-    {{ let oi = coff + (orow + 16u) * ldc + ocol; let cv = c10 * osc; coopStoreT(cv, &CO[oi], ldc); }}
-    {{ let oi = coff + (orow + 16u) * ldc + ocol + 16u; let cv = c11 * osc; coopStoreT(cv, &CO[oi], ldc); }}
-}}"
+    let ocol = n0 + wx * 32u;"
         );
+        for i in 0..nf {
+            for j in 0..nf {
+                if fr == 16 {
+                    let _ = writeln!(s, "    {{ let oi = coff + (orow + {}u) * ldc + ocol + {}u; let cv = c{i}{j} * osc; coopStoreT(cv, &CO[oi], ldc); }}", i * fr, j * fr);
+                } else {
+                    let _ = writeln!(s, "    {{ let oi = coff + (orow + {}u) * ldc + ocol + {}u; coopStoreT(c{i}{j}, &CO[oi], ldc); }}", i * fr, j * fr);
+                }
+            }
+        }
+        if fr != 16 {
+            // Metal's simdgroup matrices take no scalar product: the lanes
+            // rescale the subgroup's 32×32 block after the store
+            let _ = writeln!(
+                s,
+                "    if (osc != 1.0) {{
+        storageBarrier();
+        let lane = tid - sg * 32u;
+        for (var e = lane; e < 1024u; e = e + 32u) {{ let oi = coff + (orow + e / 32u) * ldc + ocol + e % 32u; CO[oi] = CO[oi] * osc; }}
+    }}"
+            );
+        }
+        let _ = writeln!(s, "}}");
     }
     // Row kernels: one subgroup (32 lanes) per score row r = z·T + i,
     // eight rows per workgroup; columns j = lane + 32e (j ≤ i live), zeros
@@ -279,10 +305,11 @@ static PIPES: OnceLock<Option<Pipes>> = OnceLock::new();
 fn pipes(c: &Ctx) -> Option<&'static Pipes> {
     PIPES
         .get_or_init(|| {
+            // Apple's SIMD groups are 32 wide; wgpu reports Metal's range as 4..64
+            let sg32 = (c.adapter_info.subgroup_min_size == 32 && c.adapter_info.subgroup_max_size == 32) || c.adapter_info.backend == wgpu::Backend::Metal;
             if !tm::matrix_units()
                 || !c.device.features().contains(wgpu::Features::SUBGROUP)
-                || c.adapter_info.subgroup_min_size != 32
-                || c.adapter_info.subgroup_max_size != 32
+                || !sg32
                 || std::env::var("CMF_ATT_TC").as_deref() == Ok("0")
             {
                 return None;

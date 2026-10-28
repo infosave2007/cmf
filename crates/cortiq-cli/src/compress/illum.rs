@@ -306,6 +306,7 @@ pub struct Folded {
 
 /// Output error `tr(W_P (Σ_PP − Πᵀ Σ_SP − Σ_PS Π + Πᵀ Σ_SS Π) W_Pᵀ)` of the
 /// read-out `A = W_P·Πᵀ` on the Gram `sig`, with D = W_P.
+#[cfg(test)]
 fn out_err(sig: &[f64], n: usize, s: &[usize], p: &[usize], d: &[f32], a: Option<&[f32]>, h: usize, threads: usize) -> f64 {
     let spp = block(sig, n, p, p);
     let x1 = gemm(d, &spp, h, p.len(), p.len(), threads);
@@ -318,6 +319,44 @@ fn out_err(sig: &[f64], n: usize, s: &[usize], p: &[usize], d: &[f32], a: Option
     let x3 = gemm(a, &sss, h, s.len(), s.len(), threads);
     let e_ss = dot(&x3, a);
     e_pp - 2.0 * e_sp + e_ss
+}
+
+/// `Σ_ij a_ij·b_ij` over two equal f32 matrices, in f64.
+fn frob(a: &[f32], b: &[f32]) -> f64 {
+    dot(a, b)
+}
+
+/// `Aᵀ` of a row-major `a[r×c]`.
+fn transpose32(a: &[f32], r: usize, c: usize) -> Vec<f32> {
+    let mut t = vec![0f32; r * c];
+    for i in 0..r {
+        for j in 0..c {
+            t[j * r + i] = a[i * c + j];
+        }
+    }
+    t
+}
+
+/// [`out_err`] of the refit `A = W_P·Πᵀ` through the dropped columns' own
+/// Gram `G = W_Pᵀ·W_P` (p×p, once per layer):
+/// `‖W_P − A‖²_Σ = ⟨G, Σ_PP − 2·Πᵀ·Σ_SP + Πᵀ·Σ_SS·Π⟩` — k²p + 2kp² flops
+/// instead of the h(k² + kp + p²) + hkp of forming A and its residual
+/// (`pi` is Π `[k×p]` in f32, `pit` its transpose).
+#[allow(clippy::too_many_arguments)]
+fn out_err_pi(sig: &[f64], n: usize, s: &[usize], p: &[usize], g: &[f32], pi: &[f32], pit: &[f32], threads: usize) -> f64 {
+    let (kk, pp) = (s.len(), p.len());
+    let e_pp = frob(g, &block(sig, n, p, p));
+    let ssp = block(sig, n, s, p);
+    let x = gemm(pit, &ssp, pp, kk, pp, threads); // Πᵀ·Σ_SP
+    let y = gemm(&block(sig, n, s, s), pi, kk, kk, pp, threads); // Σ_SS·Π
+    let z = gemm(pit, &y, pp, kk, pp, threads); // Πᵀ·Σ_SS·Π
+    e_pp - 2.0 * frob(g, &x) + frob(g, &z)
+}
+
+/// `CMF_FOLD_PROF=1`: per-layer fold timers.
+fn fold_prof() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_FOLD_PROF").as_deref() == Ok("1"))
 }
 
 /// Fold one layer to the first `k` neurons of `ord`.
@@ -348,13 +387,27 @@ pub fn fold_layer(
     }
     let d = columns(wdown, h, n, &drop_);
     let (kk, pp) = (keep.len(), drop_.len());
-    let full_energy = |sig: &[f64]| -> f64 {
-        let s = block(sig, n, &(0..n).collect::<Vec<_>>(), &(0..n).collect::<Vec<_>>());
-        let x = gemm(wdown, &s, h, n, n, threads);
-        dot(&x, wdown).max(1e-300)
+    let t0 = std::time::Instant::now();
+    let mut tm: Vec<(&str, f64)> = Vec::new();
+    let mut t = std::time::Instant::now();
+    let mut lap = |name: &'static str, t: &mut std::time::Instant| {
+        tm.push((name, t.elapsed().as_secs_f64()));
+        *t = std::time::Instant::now();
     };
+    // the output energy ‖W‖²_Σ = ⟨WᵀW, Σ⟩: one n×n product for both splits
+    let wt = transpose32(wdown, h, n);
+    let wtw = gemm(&wt, wdown, n, h, n, threads);
+    drop(wt);
+    let all: Vec<usize> = (0..n).collect();
+    let full_energy = |sig: &[f64]| -> f64 { frob(&wtw, &block(sig, n, &all, &all)).max(1e-300) };
     let e_tr_tot = full_energy(train);
     let e_va_tot = val.map(full_energy);
+    drop(wtw);
+    // the dropped columns' Gram: every error below is an inner product with it
+    let dt = transpose32(&d, h, pp);
+    let g = gemm(&dt, &d, pp, h, pp, threads);
+    drop(dt);
+    lap("energy", &mut t);
     let scoring = val.unwrap_or(train);
     let scoring_tot = e_va_tot.unwrap_or(e_tr_tot);
 
@@ -373,41 +426,57 @@ pub fn fold_layer(
     }
     let mean_diag = (0..kk).map(|i| sss[i * kk + i]).sum::<f64>() / kk as f64;
 
-    let cut_err = out_err(scoring, n, &keep, &drop_, &d, None, h, threads) / scoring_tot;
-    let mut best: (f64, Option<f64>, Option<Vec<f32>>) = (if allow_cut { cut_err } else { f64::INFINITY }, None, None);
+    let cut_err = frob(&g, &block(scoring, n, &drop_, &drop_)) / scoring_tot;
+    // (error, ridge, Π, Πᵀ) of the best candidate
+    type Cand = (f64, Option<f64>, Option<(Vec<f32>, Vec<f32>)>);
+    let mut best: Cand = (if allow_cut { cut_err } else { f64::INFINITY }, None, None);
     for &rho in ridges {
         let mut l = sss.clone();
         for i in 0..kk {
             l[i * kk + i] += rho * mean_diag.max(1e-30);
         }
-        if !chol(&mut l, kk, threads) {
+        let ok = chol(&mut l, kk, threads);
+        lap("chol", &mut t);
+        if !ok {
             continue;
         }
         let mut pi = ssp.clone(); // becomes Π [k×p]
         chol_solve(&l, kk, &mut pi, pp, threads);
-        let pit: Vec<f32> = {
-            // Πᵀ [p×k]
-            let mut t = vec![0f32; pp * kk];
-            for i in 0..kk {
-                for j in 0..pp {
-                    t[j * kk + i] = pi[i * pp + j] as f32;
-                }
-            }
-            t
-        };
-        let a = gemm(&d, &pit, h, pp, kk, threads); // W_P·Πᵀ [h×k]
-        let e = out_err(scoring, n, &keep, &drop_, &d, Some(&a), h, threads) / scoring_tot;
+        drop(l);
+        lap("solve", &mut t);
+        let pi32: Vec<f32> = pi.iter().map(|&v| v as f32).collect();
+        let pit = transpose32(&pi32, kk, pp);
+        let e = out_err_pi(scoring, n, &keep, &drop_, &g, &pi32, &pit, threads) / scoring_tot;
+        lap("err", &mut t);
         if e < best.0 {
-            best = (e, Some(rho), Some(a));
+            best = (e, Some(rho), Some((pi32, pit)));
         }
     }
-    let (val_err, ridge, a) = best;
+    let (val_err, ridge, pis) = best;
     ensure!(val_err.is_finite(), "layer {layer}: no refit was positive definite and the plain cut is disallowed");
-    let down: Vec<f32> = match &a {
-        Some(a) => ws.iter().zip(a).map(|(&x, &y)| x + y).collect(),
-        None => ws,
+    let (down, train_err) = match &pis {
+        Some((pi32, pit)) => {
+            let a = gemm(&d, pit, h, pp, kk, threads); // W_P·Πᵀ [h×k]
+            let down = ws.iter().zip(&a).map(|(&x, &y)| x + y).collect();
+            (down, out_err_pi(train, n, &keep, &drop_, &g, pi32, pit, threads) / e_tr_tot)
+        }
+        None => (ws, frob(&g, &block(train, n, &drop_, &drop_)) / e_tr_tot),
     };
-    let train_err = out_err(train, n, &keep, &drop_, &d, a.as_deref(), h, threads) / e_tr_tot;
+    lap("apply", &mut t);
+    if fold_prof() {
+        let mut agg: Vec<(&str, f64)> = Vec::new();
+        for (name, sec) in &tm {
+            match agg.iter_mut().find(|(n, _)| n == name) {
+                Some(e) => e.1 += sec,
+                None => agg.push((name, *sec)),
+            }
+        }
+        eprintln!(
+            "  fold L{layer} {n}→{k}: {:.2}s ({})",
+            t0.elapsed().as_secs_f64(),
+            agg.iter().map(|(n, s)| format!("{n} {s:.2}")).collect::<Vec<_>>().join(", ")
+        );
+    }
     let info = FoldInfo {
         layer,
         width: n,
@@ -456,6 +525,29 @@ mod tests {
         }
         let w: Vec<f32> = (0..h * n).map(|_| lcg(&mut s)).collect();
         (sig, w)
+    }
+
+    /// The Gram-of-dropped-columns error equals the explicit residual of
+    /// the refit (`out_err` with A = W_P·Πᵀ formed).
+    #[test]
+    fn refit_error_through_the_dropped_gram() {
+        let (n, h) = (40, 12);
+        let (sig, w) = fixture(n, h, 600);
+        let keep: Vec<usize> = (0..n).filter(|j| j % 3 != 0).collect();
+        let drop_: Vec<usize> = (0..n).filter(|j| j % 3 == 0).collect();
+        let (kk, pp) = (keep.len(), drop_.len());
+        let d = columns(&w, h, n, &drop_);
+        let mut s = 7u64;
+        let pi: Vec<f32> = (0..kk * pp).map(|_| lcg(&mut s)).collect();
+        let pit = transpose32(&pi, kk, pp);
+        let a = gemm(&d, &pit, h, pp, kk, 2);
+        let old = out_err(&sig, n, &keep, &drop_, &d, Some(&a), h, 2);
+        let g = gemm(&transpose32(&d, h, pp), &d, pp, h, pp, 2);
+        let new = out_err_pi(&sig, n, &keep, &drop_, &g, &pi, &pit, 2);
+        assert!((old - new).abs() <= 1e-4 * old.abs().max(1e-9), "{old} vs {new}");
+        let cut_old = out_err(&sig, n, &keep, &drop_, &d, None, h, 2);
+        let cut_new = frob(&g, &block(&sig, n, &drop_, &drop_));
+        assert!((cut_old - cut_new).abs() <= 1e-4 * cut_old.abs(), "{cut_old} vs {cut_new}");
     }
 
     #[test]

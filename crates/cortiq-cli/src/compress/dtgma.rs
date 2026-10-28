@@ -1,16 +1,19 @@
 //! Width by DTG-MA (Patent 2): instead of ranking neurons once by their
 //! illumination, a mask σ(m) over every FFN neuron is TRAINED with the task's
-//! LM loss through the whole model under a growing L1 pressure
-//! (`cortiq_engine::skillbake`, the engine of `cortiq skill bake`, Phase A
-//! only). The trained logits then decide how many neurons each layer keeps
-//! and which ones; the fold (refit) and the heal run on that selection as
-//! they do on the illumination's.
+//! LM loss through the whole model under a growing L1 pressure. On an NVIDIA
+//! card the gates sit in the device trainer (`heal_gpu::learn_masks`, the
+//! nvg-train kernels); elsewhere `cortiq_engine::skillbake` (the engine of
+//! `cortiq skill bake`, Phase A only) trains them on the host. The trained
+//! logits then decide how many neurons each layer keeps and which ones; the
+//! fold (refit) and the heal run on that selection as they do on the
+//! illumination's.
 
 use super::data::{Data, LossOn, Stream};
 use super::Run;
 use crate::tdata::TdataSplit;
 use anyhow::Result;
 use cortiq_core::CmfModel;
+use std::path::Path;
 use std::sync::Arc;
 
 /// Tokens per mask-training chunk.
@@ -18,8 +21,44 @@ const CHUNK: usize = 1024;
 /// Held-out chunks the bake checkpoints on.
 const HELD: usize = 24;
 
+/// A tuning knob of the device mask training (`CMF_DTGMA_<NAME>`).
+fn knob<T: std::str::FromStr>(name: &str, default: T) -> T {
+    std::env::var(format!("CMF_DTGMA_{name}")).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
 /// Trained mask logits per layer (higher = more needed by the task).
-pub fn learn(run: &Run, data: &Data, model: &Arc<CmfModel>, keep_frac: f64) -> Result<Vec<Vec<f32>>> {
+pub fn learn(run: &Run, data: &Data, model_path: &Path, keep_frac: f64) -> Result<Vec<Vec<f32>>> {
+    let model = super::stages::open(model_path)?;
+    #[cfg(feature = "gpu")]
+    if run.a.heal_device != "cpu" {
+        match super::heal_gpu::usable(&model) {
+            Ok(()) => {
+                let cfg = super::heal_gpu::MaskCfg {
+                    window: run.a.heal_window,
+                    batch: 2,
+                    keep_frac,
+                    lr: knob("LR", 0.1),
+                    l1_init: knob("L1", 0.01),
+                    l1_step: knob("L1_STEP", 0.005),
+                    l1_grow: knob("L1_GROW", 1.5),
+                    eval_every: knob("EVAL", 25),
+                    max_steps: knob("MAX_STEPS", 3000),
+                    mask_init: knob("INIT", 2.0),
+                    tau: 0.5,
+                    settle: knob("SETTLE", 0),
+                };
+                let on = LossOn::parse(&run.a.loss_on)?;
+                return Ok(super::heal_gpu::learn_masks(data, on, model_path, &cfg, &|l| run.log(l))?.logits);
+            }
+            Err(e) if run.a.heal_device == "gpu" => anyhow::bail!("--heal-device gpu: {e}"),
+            Err(e) => run.log(&format!("S2: DTG-MA on the host ({e})")),
+        }
+    }
+    learn_host(run, data, &model, keep_frac)
+}
+
+/// [`learn`] through `skillbake` Phase A on the host.
+fn learn_host(run: &Run, data: &Data, model: &Arc<CmfModel>, keep_frac: f64) -> Result<Vec<Vec<f32>>> {
     let pad = model.header.tokenizer_config.as_ref().and_then(|t| t.eos_token_ids.first().copied()).unwrap_or(0);
     let on = LossOn::All;
     let cut = |s: &Stream| -> Vec<Vec<u32>> { s.ids.chunks(CHUNK).filter(|c| c.len() == CHUNK).map(<[u32]>::to_vec).collect() };

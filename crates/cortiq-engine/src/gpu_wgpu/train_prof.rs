@@ -190,13 +190,13 @@ fn ts(c: &Ctx) -> Option<&'static Ts> {
 }
 
 fn drains() -> bool {
-    mode() == 2 || super::ctx().is_some_and(|c| ts(c).is_none())
+    mode() == 2 || super::trainer_ctx().is_some_and(|c| ts(c).is_none())
 }
 
 /// Attribute host time since the last switch to the phase on top.
 fn switch(s: &mut State) {
     if drains()
-        && let Some(c) = super::ctx()
+        && let Some(c) = super::trainer_ctx()
     {
         let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
     }
@@ -377,7 +377,7 @@ pub fn step_end() {
     if !on() {
         return;
     }
-    let Some(c) = super::ctx() else { return };
+    let Some(c) = super::trainer_ctx() else { return };
     {
         let mut s = state().lock().unwrap();
         switch(&mut s);

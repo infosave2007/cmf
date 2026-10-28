@@ -118,8 +118,10 @@ pub struct CompressArgs {
     /// Refit of the read-out: auto (chosen per layer on the val split), on, off
     #[arg(long, default_value = "auto")]
     pub refit: String,
-    /// Relative ridges tried by the refit (comma-separated)
-    #[arg(long, default_value = "0.003,0.01,0.03,0.1")]
+    /// Relative ridges tried by the refit (comma-separated). Over 1130
+    /// folded layers 0.1 won 86 %, 0.03 10 %, 0.01 3 %, 0.003 never — the
+    /// grid sits around the winner and spends no factorization on 0.003
+    #[arg(long, default_value = "0.03,0.1,0.3")]
     pub ridge: String,
     /// Illumination window (tokens); longer records are cut with half overlap
     #[arg(long, default_value_t = 2048)]
@@ -361,11 +363,20 @@ impl Run {
                 "prompts": self.prompts.as_deref().map(|p| prompts_identity(p, a)),
             }),
             1 => json!({ "data": data_identity(&a.data), "window": a.window, "illum_tokens": a.illum_tokens, "curves": 2 }),
-            2 => json!({
-                "ffn": a.ffn, "size": a.size, "ratio": a.ratio, "allocate": a.allocate,
-                "protect": [a.protect_first, a.protect_last], "min_width": a.min_width, "align": a.align,
-                "select": a.select,
-            }),
+            2 => {
+                let mut k = json!({
+                    "ffn": a.ffn, "size": a.size, "ratio": a.ratio, "allocate": a.allocate,
+                    "protect": [a.protect_first, a.protect_last], "min_width": a.min_width, "align": a.align,
+                    "select": a.select,
+                });
+                // the mask trainer and its knobs (an importance plan has none)
+                if a.select == "dtgma" {
+                    let mut knobs: Vec<String> = std::env::vars().filter(|(n, _)| n.starts_with("CMF_DTGMA_")).map(|(n, v)| format!("{n}={v}")).collect();
+                    knobs.sort();
+                    k["dtgma"] = json!({ "v": 2, "device": a.heal_device, "window": a.heal_window, "loss_on": a.loss_on, "knobs": knobs });
+                }
+                k
+            }
             3 => json!({ "refit": a.refit, "ridge": a.ridge }),
             4 => json!({
                 "gate": "relative-v2",

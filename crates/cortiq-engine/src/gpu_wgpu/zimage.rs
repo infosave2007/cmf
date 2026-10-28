@@ -719,6 +719,57 @@ static ZP: OnceLock<ZPipes> = OnceLock::new();
 /// cooperative matrices with the 16×16×16 f16→f32 shape (the parent's
 /// init checked the shape before raising `COOP_OK`), f16 in shaders, and
 /// 32-wide subgroups (the epilogues index lanes as `tid − 32·sg`).
+/// The trainer's GEMM device: [`zctx`]'s NVIDIA-shaped matrix units, or
+/// Apple's 8×8 simdgroup matrices on Metal (32-wide SIMD groups, which wgpu
+/// reports as a 4..64 range there). Its context may be one the runtime
+/// does not use ([`super::trainer_ctx`]: wgpu on macOS beside native Metal).
+pub(super) fn tctx() -> Option<&'static Ctx> {
+    if let Some(c) = zctx() {
+        return Some(c);
+    }
+    let c = super::trainer_ctx()?;
+    let f = c.device.features();
+    (super::coop8_active()
+        && f.contains(wgpu::Features::SHADER_F16)
+        && f.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+        && f.contains(wgpu::Features::SUBGROUP)
+        && c.adapter_info.backend == wgpu::Backend::Metal)
+        .then_some(c)
+}
+
+/// The trainer's GEMM tiles for this device: [`default_cfg`] on 16×16
+/// matrix units; on Apple's 8×8 a 64×64×32 tile over 2×2 SIMD groups (each
+/// a 32×32 block of 8×8 accumulators: 3.0 TFLOPS on an M4 at the 0.8B
+/// shapes, against 1.7 for 32×64 blocks and 0.8 for 64×64 — the register
+/// file, not the loads, bounds the block), `CMF_ZI_TILE8=bm,bn,bk,wm,wn`
+/// overriding it.
+pub fn train_cfg(epi: Epi) -> MmCfg {
+    if zctx().is_some() {
+        return default_cfg(epi);
+    }
+    if let Ok(s) = std::env::var("CMF_ZI_TILE8") {
+        let v: Vec<u32> = s.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+        if v.len() == 5 {
+            let c = MmCfg { frag: 8, ..MmCfg::new(v[0], v[1], v[2], v[3], v[4], epi) };
+            if c.valid() {
+                return c;
+            }
+        }
+    }
+    MmCfg { frag: 8, ..MmCfg::new(64, 64, 32, 2, 2, epi) }
+}
+
+/// [`train_cfg`] for a sign-bitmap plane ([`MmCfg::bits`]): the bitmap's
+/// words must spread evenly over the threads, which a 64-wide N tile of 128
+/// threads does not — Apple's 8×8 takes 64×128 there.
+pub fn train_cfg_bits(epi: Epi, bits: u32) -> MmCfg {
+    let g = MmCfg { bits, ..train_cfg(epi) };
+    if g.valid() {
+        return g;
+    }
+    MmCfg { bits, frag: 8, ..MmCfg::new(64, 128, 32, 2, 2, epi) }
+}
+
 pub(super) fn zctx() -> Option<&'static Ctx> {
     let c = super::ctx()?;
     if !super::coop_matrix_active() {
@@ -863,21 +914,35 @@ pub struct MmCfg {
     /// 2 = bits `[K][words]` (bit n%32 of word n/32 = element (n, k)).
     /// `words` per bitmap row in `MmArgs::conv[0]`. The nvg-train blr GEMMs.
     pub bits: u32,
+    /// Side of one cooperative fragment: 16 (NVIDIA's 16×16×16 f16) or 8
+    /// (Apple's 8×8×8 simdgroup matrices on Metal). The 8-wide kernel is
+    /// the trainer's GEMM only: f32 epilogue, single-buffered staging,
+    /// f16 or sign-bit planes.
+    pub frag: u32,
 }
 
 impl MmCfg {
     pub const fn new(bm: u32, bn: u32, bk: u32, wm: u32, wn: u32, epi: Epi) -> Self {
-        Self { bm, bn, bk, wm, wn, epi, direct: false, acc16_probe: false, stages: 1, conv: 0, acc16: 0, bits: 0 }
+        Self { bm, bn, bk, wm, wn, epi, direct: false, acc16_probe: false, stages: 1, conv: 0, acc16: 0, bits: 0, frag: 16 }
     }
     pub fn valid(&self) -> bool {
         let nt = self.wm * self.wn * 32;
         let (tm, tn) = (self.bm / self.wm.max(1), self.bn / self.wn.max(1));
         let vpr = self.bk / 4;
-        nt > 0
+        let f = self.frag;
+        (f == 16
+            || (f == 8
+                && self.epi == Epi::F32
+                && !self.direct
+                && !self.acc16_probe
+                && self.stages == 1
+                && self.conv == 0
+                && self.acc16 == 0))
+            && nt > 0
             && nt <= 1024
-            && self.bk % 16 == 0
-            && tm % 16 == 0
-            && tn % 16 == 0
+            && self.bk % f == 0
+            && tm % f == 0
+            && tn % f == 0
             && tm * self.wm == self.bm
             && tn * self.wn == self.bn
             && (self.bm * vpr) % nt == 0
@@ -928,7 +993,7 @@ impl MmCfg {
             } else {
                 String::new()
             }
-        )
+        ) + if self.frag == 16 { "" } else { "_f8" }
     }
     /// Workgroup-shared bytes this variant declares.
     pub fn shared_bytes(&self) -> u32 {
@@ -969,8 +1034,9 @@ pub fn mm_src(g: MmCfg) -> String {
     let nt = nw * 32;
     let tm = g.bm / g.wm;
     let tn = g.bn / g.wn;
-    let fm = tm / 16;
-    let fnn = tn / 16;
+    let fr = g.frag;
+    let fm = tm / fr;
+    let fnn = tn / fr;
     let lds = g.bk + 8;
     let vpr = g.bk / 4;
     let la = g.bm * vpr / nt;
@@ -1054,7 +1120,7 @@ pub fn mm_src(g: MmCfg) -> String {
     let _ = writeln!(s, "  let wy = sg / {}u; let wx = sg % {}u;", g.wn, g.wn);
     for i in 0..fm {
         for j in 0..fnn {
-            let _ = writeln!(s, "  var c{i}_{j}: coop_mat16x16<{}, C>;", if g.acc16_probe { "f16" } else { "f32" });
+            let _ = writeln!(s, "  var c{i}_{j}: coop_mat{fr}x{fr}<{}, C>;", if g.acc16_probe { "f16" } else { "f32" });
             if g.acc16 != 0 {
                 let _ = writeln!(s, "  var h{i}_{j}: coop_mat16x16<f16, C>;");
             }
@@ -1199,22 +1265,22 @@ pub fn mm_src(g: MmCfg) -> String {
                 }
             }
             let _ = writeln!(s, "    }}");
-            for kk in 0..g.bk / 16 {
+            for kk in 0..g.bk / fr {
                 let _ = writeln!(s, "    {{");
                 for j in 0..fnn {
                     let _ = writeln!(
                         s,
-                        "      let b{j} = coopLoad<coop_mat16x16<f16, B>>(&sb[(wx * {tn}u + {}u) * {lds}u + {}u], {lds}u);",
-                        j * 16,
-                        kk * 16
+                        "      let b{j} = coopLoad<coop_mat{fr}x{fr}<f16, B>>(&sb[(wx * {tn}u + {}u) * {lds}u + {}u], {lds}u);",
+                        j * fr,
+                        kk * fr
                     );
                 }
                 for i in 0..fm {
                     let _ = writeln!(
                         s,
-                        "      let a{i} = coopLoadT<coop_mat16x16<f16, A>>(&sa[(wy * {tm}u + {}u) * {lds}u + {}u], {lds}u);",
-                        i * 16,
-                        kk * 16
+                        "      let a{i} = coopLoadT<coop_mat{fr}x{fr}<f16, A>>(&sa[(wy * {tm}u + {}u) * {lds}u + {}u], {lds}u);",
+                        i * fr,
+                        kk * fr
                     );
                     for j in 0..fnn {
                         let acc = if g.acc16 != 0 { "h" } else { "c" };
@@ -1250,15 +1316,31 @@ pub fn mm_src(g: MmCfg) -> String {
             // SwiGLU hidden stored ×2⁻ᵏ): one scalar multiply per fragment.
             let _ = writeln!(s, "  let ocol = p.ocol + n0 + wx * {tn}u;");
             let _ = writeln!(s, "  let osc = p.oscale;");
-            for i in 0..fm {
-                for j in 0..fnn {
-                    let _ = writeln!(
-                        s,
-                        "  {{ let oi = (orow + {}u) * ldo + ocol + {}u; let cv = c{i}_{j} * osc; coopStoreT(cv, &outp[oi], ldo); }}",
-                        i * 16,
-                        j * 16
-                    );
+            if fr == 16 {
+                for i in 0..fm {
+                    for j in 0..fnn {
+                        let _ = writeln!(
+                            s,
+                            "  {{ let oi = (orow + {}u) * ldo + ocol + {}u; let cv = c{i}_{j} * osc; coopStoreT(cv, &outp[oi], ldo); }}",
+                            i * fr,
+                            j * fr
+                        );
+                    }
                 }
+            } else {
+                // Metal's simdgroup matrices take no scalar product: store
+                // raw, then every lane rescales its share of the subgroup's
+                // tm×tn block (osc is uniform, so is the branch)
+                for i in 0..fm {
+                    for j in 0..fnn {
+                        let _ = writeln!(s, "  {{ let oi = (orow + {}u) * ldo + ocol + {}u; coopStoreT(c{i}_{j}, &outp[oi], ldo); }}", i * fr, j * fr);
+                    }
+                }
+                let _ = writeln!(s, "  if (osc != 1.0) {{");
+                let _ = writeln!(s, "    storageBarrier();");
+                let _ = writeln!(s, "    let lane = tid - sg * 32u;");
+                let _ = writeln!(s, "    for (var e = lane; e < {}u; e = e + 32u) {{ let oi = (orow + e / {tn}u) * ldo + ocol + e % {tn}u; outp[oi] = outp[oi] * osc; }}", tm * tn);
+                let _ = writeln!(s, "  }}");
             }
         }
         Epi::F16 => {
