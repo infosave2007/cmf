@@ -2177,6 +2177,110 @@ pub fn qwen_attention_batch(
     out
 }
 
+/// Block-diffusion preview (Clover): every row of the block attends the
+/// whole committed prefix AND every row of the block, itself and the
+/// rows after it included — the denoiser is bidirectional inside the
+/// block. The block's rows are appended for the attend and dropped again,
+/// so the cache leaves exactly as it came: the preview never commits.
+/// Projections, the output gate, qk-norm and RoPE are those of
+/// `qwen_attention_batch`; only the visibility differs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qwen_attention_preview(
+    normed_all: &[f32],
+    b: usize,
+    wq: &QTensor,
+    wk: &QTensor,
+    wv: &QTensor,
+    wo: &QTensor,
+    cache: &mut LayerKvCache,
+    cfg: &QwenAttnCfg,
+) -> Vec<f32> {
+    let (nh, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
+    let heads_per_kv = nh / nkv;
+    let qrows = wq.rows();
+    assert_eq!(cfg.v_head_dim, hd, "block preview: V heads narrower than Q/K");
+    assert!(cfg.softplus_gate.is_none() && cache.o1.is_none() && cache.sinks.is_none());
+    let mut q_all = take_buf(b * qrows);
+    let mut k_all = take_buf(b * nkv * hd);
+    let mut v_all = take_buf(b * nkv * hd);
+    wq.matmat(normed_all, b, &mut q_all, cfg.pool);
+    wk.matmat(normed_all, b, &mut k_all, cfg.pool);
+    wv.matmat(normed_all, b, &mut v_all, cfg.pool);
+    let mut q_rope = take_buf(b * nh * hd);
+    let mut gates = if cfg.output_gate { take_buf(b * nh * hd) } else { Vec::new() };
+    for bi in 0..b {
+        let q_raw = &q_all[bi * qrows..(bi + 1) * qrows];
+        let q = &mut q_rope[bi * nh * hd..(bi + 1) * nh * hd];
+        if cfg.output_gate {
+            // Per-head [q(hd); gate(hd)], as in `qwen_attention_batch`.
+            for h in 0..nh {
+                q[h * hd..(h + 1) * hd].copy_from_slice(&q_raw[2 * h * hd..(2 * h + 1) * hd]);
+                gates[(bi * nh + h) * hd..(bi * nh + h + 1) * hd]
+                    .copy_from_slice(&q_raw[(2 * h + 1) * hd..(2 * h + 2) * hd]);
+            }
+        } else {
+            q.copy_from_slice(&q_raw[..nh * hd]);
+        }
+        let kv = bi * nkv * hd..(bi + 1) * nkv * hd;
+        if let Some((bq, bk, bv)) = cfg.bias {
+            for (x, bb) in q.iter_mut().zip(bq) {
+                *x += bb;
+            }
+            for (x, bb) in k_all[kv.clone()].iter_mut().zip(bk) {
+                *x += bb;
+            }
+            for (x, bb) in v_all[kv.clone()].iter_mut().zip(bv) {
+                *x += bb;
+            }
+        }
+        qk_norm_and_rope(cfg, q, &mut k_all[kv.clone()], nh, nkv, hd, cfg.position + bi);
+        cache.append(&k_all[kv.clone()], &v_all[kv], &[]);
+    }
+    // Every row sees every stored row: the attend of a decode step taken
+    // after the whole block was appended.
+    let stored = cache.seq_len;
+    let mut ao_all = take_buf(b * nh * hd);
+    {
+        let ao_p = crate::pool::SendMut::new(ao_all.as_mut_ptr());
+        let (qr, cache_ref) = (&q_rope, &*cache);
+        let run = |b0: usize, b1: usize| {
+            let mut imp = take_buf(stored);
+            for bi in b0..b1 {
+                // SAFETY: row bi owns ao[bi·nh·hd..(bi+1)·nh·hd].
+                let ao = unsafe { std::slice::from_raw_parts_mut(ao_p.at(bi * nh * hd), nh * hd) };
+                attend_all_heads_upto(
+                    &qr[bi * nh * hd..(bi + 1) * nh * hd],
+                    cache_ref,
+                    nh,
+                    heads_per_kv,
+                    hd,
+                    cfg.scale,
+                    None,
+                    cfg.softcap,
+                    usize::MAX,
+                    ao,
+                    &mut imp,
+                );
+            }
+            recycle_buf(&mut imp);
+        };
+        match cfg.pool {
+            Some(p) if b > 1 => p.run_rows(b, &run),
+            _ => run(0, b),
+        }
+    }
+    cache.truncate_last(b);
+    if cfg.output_gate {
+        apply_gate(&mut ao_all, &gates);
+    }
+    let mut out = take_buf(b * cfg.hidden_size);
+    wo.matmat(&ao_all, b, &mut out, cfg.pool);
+    for buf in [&mut q_all, &mut k_all, &mut v_all, &mut q_rope, &mut gates, &mut ao_all] {
+        recycle_buf(buf);
+    }
+    out
+}
+
 /// Dense GQA attention for one DECODE position on a SEALED O(1) layer:
 /// projection / qk-norm / partial RoPE / output gate are identical to
 /// `qwen_attention`, but the KV cache is replaced by per-KV-group

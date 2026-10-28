@@ -1,0 +1,107 @@
+# Block-diffusion models: Clover-35B-A3B-Preview
+
+[DiffuSpace Clover-35B-A3B-Preview](https://huggingface.co/Diffuspace/Clover-35B-A3B-Preview)
+is a diffusion language model on the Qwen3.6-35B-A3B backbone (40 layers:
+30 Gated DeltaNet + 10 gated full attention, 256 experts top-8 with a shared
+expert, ~3B active parameters). It writes its answer in 32-token blocks:
+each block starts as mask tokens and is resolved by repeated *denoising
+passes* over the whole block; a resolved block is committed causally and the
+next one starts.
+
+## Convert
+
+```bash
+cortiq convert --model Diffuspace/Clover-35B-A3B-Preview --quant q4tp \
+  --sampling temperature=0,top_p=1,top_k=0,min_p=0,repetition_penalty=1 \
+  --output clover-35b-a3b-preview-q4tp.cmf
+```
+
+`model_type: clover_moe` converts as the `qwen3_5_moe_text` trunk plus a
+`block_diffusion` record in the header, which sets the required feature bit
+15 (`BLOCK_DIFFUSION`) — a reader without block-diffusion support refuses the
+file instead of decoding it causally. The record holds:
+
+| field | source | Clover |
+|---|---|---|
+| `algorithm`, `block_size`, `threshold` | `denoising_config`, `block_size` | `low_confidence`, 32, 0.95 |
+| `mask_token_id` | `config.json` | 151669 (`<\|mask\|>`) |
+| `coreset_enabled`, `coreset_top_p` | `moe_block_coreset_*` | true, 0.9 |
+| presence / frequency / repetition | `generation_config.json` | 0.9 / 0 / 1.05 |
+| stop-id ramp | `dllm_length_penalty*` | +10 from response token 8192 over 8192 |
+| `</think>` ramp | `dllm_think_end_*` | +10 from 4096 over 4096 |
+| `stop_token_ids` | EOS ∪ `stop_token_ids` ∪ pad | 248044, 248046 |
+
+The preview tensors (`linear_attn.conv_right_weight`, `bd_softmax_logit_scale`,
+`bd_softmax_history_bias`, `bd_softmax_history_c`) are stored in f32.
+
+Higher precision at the same size: GPTQ the experts with `quantize-moe`
+(Qwen3.5/3.6-MoE capture on the batched graph, original safetensors as the
+full-precision source):
+
+```bash
+cortiq quantize-moe clover-35b-a3b-preview-q4tp.cmf --hf Diffuspace/Clover-35B-A3B-Preview \
+  --calib wiki.train.txt=0.4 --calib chat.txt=0.4 --calib code.txt=0.2 \
+  --tokens 262144 --codec q4tp --output clover-35b-a3b-preview-q4tp-v2.cmf
+```
+
+## Generation
+
+`cortiq run` / `cortiq serve` take the block-diffusion path for such a file.
+
+* **Preview** (one denoising pass, the committed state read only): full
+  attention sees the prefix and every row of the block; a GDN layer runs the
+  release's block operator — causal conv taps over [conv state | block] plus
+  right taps over the next three rows of the block, then per value head a
+  softmax over the block's l2-normalized keys (logits scaled per head, no β)
+  and a history slot whose value is the clean state's read-out decayed by
+  the row's gate; the MoE keeps, for the whole block, the smallest set of
+  experts holding 90% of the block's routed probability (on Clover ~15 of
+  256 experts a layer) and every row routes inside it.
+* **LowConfidence**: after each pass every masked row whose greedy token has
+  probability above the threshold is fixed — at least the single most
+  confident one — until the block is resolved. Presence, frequency and
+  repetition penalties count committed response tokens only.
+* **Commit**: the resolved block through the ordinary causal prefill.
+
+Knobs: `CMF_CLOVER_THRESHOLD` (lower fixes more rows a pass: faster, less
+careful), `CMF_CLOVER_BLOCK` (a divisor of 32), `CMF_CLOVER_GRAPH=0` (host
+path), `CMF_CLOVER_DEVICE_PICK=0` (logits back to the host),
+`CMF_CLOVER_DUMP=PATH` (first-pass top-10 per row, for parity checks with
+`scripts/clover/clover_ref.py` / `clover_cmp.py`). Temperature sampling works
+(`--temperature`, `--top-k`, `--top-p`); the confidence is always the T=1
+probability, as in the release.
+
+`cortiq run` prints the denoising statistics after the answer: blocks,
+passes, tokens per pass, the rate after the prompt and the time of a pass.
+
+## Device paths
+
+* **Vulkan / DX12 (wgpu)**: the prompt, every preview and every commit are one
+  batched-graph submission each. Preview kernels: `gpu_wgpu/clover.rs` (GDN
+  preview conv and mixer, two-phase coreset, the expert tile list for the
+  grouped MoE kernels, the penalties and greedy pick). A stack that does not
+  fit the card runs its leading layers on it and the rest on the host
+  (`device layers` in the statistics).
+* **Apple silicon**: the request runs on the CPU (per-op Metal calls of a
+  32-row block measured 10× slower, and the Metal chunk graph does not cover
+  the GDN hybrid).
+* **CPU**: the host path everywhere.
+
+## Measured (cortiq 0.8.40-dev)
+
+RTX 5090 (32 GB), whole stack and head on the card, 18.8 GB of VRAM. A pass
+is one 32-row denoising forward: 34–36 ms. Tokens per second after the
+prompt, q4tp:
+
+| text | threshold 0.95 (default) | 0.9 | 0.8 |
+|---|---:|---:|---:|
+| prose (0.9–1.1 tokens a pass) | 26 | 22–27 | 25–30 |
+| code (3.7–6.6 tokens a pass) | 80–95 | 94–110 | 124–150 |
+
+Apple M4 (24 GB), CPU: a pass 1.13 s, code ~3 tok/s.
+
+Parity with the PyTorch release (bf16, transformers 5.21, CPU) on three chat
+prompts: identical prompt ids; first-pass top-1 agreement q8_2f 32/32 · 30/32,
+q4tp 31 · 32 · 30 /32, q4tp-v2 31 · 32 · 30 /32 — the disagreements are
+near-ties. wikitext-2 perplexity of the causal path (12 × 512): q8_2f 15.86,
+q4tp 18.22, q4tp-v2 16.80.

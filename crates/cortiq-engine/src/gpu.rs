@@ -1710,6 +1710,9 @@ pub enum GraphAttn<'a> {
         /// fallback): a zero-initialized device state at decode is exactly
         /// the "coherent but contextless" garble.
         cpu_state: &'a [f32],
+        /// Block-diffusion preview weights (Clover); `None` on every
+        /// causal model. Read only under `enter_block_preview`.
+        preview: Option<GdnPreviewW<'a>>,
     },
     /// LFM2 gated short convolution: a fused (B, C, x) projection, a
     /// depthwise causal conv over a (kernel−1)-deep per-channel ring,
@@ -2046,6 +2049,31 @@ pub struct SpecTail<'a> {
     pub lm_rows: usize,
     pub final_norm: &'a [f32],
     pub logits_out: &'a mut Vec<f32>,
+    /// Block preview, greedy: penalize and pick on the device — each row's
+    /// argmax and its softmax probability land in the Vec (row order), and
+    /// `logits_out` stays empty.
+    pub pick: Option<(PreviewPick<'a>, &'a mut Vec<(u32, f32)>)>,
+}
+
+/// The response penalties of a block-diffusion pass, as the host applies
+/// them (`pipeline::clover::Penalties::apply`): per committed-token counts
+/// the frequency, presence and repetition terms, the stop-id and
+/// `</think>` ramps at row position `len0 + r + 1`, and `forbid` (mask,
+/// suppressed ids) at −∞.
+pub struct PreviewPick<'a> {
+    pub vocab: usize,
+    pub counts: &'a [u32],
+    pub stop: &'a [u32],
+    pub forbid: &'a [u32],
+    pub think_end: Option<u32>,
+    pub close_open: bool,
+    pub len0: usize,
+    pub frequency: f32,
+    pub presence: f32,
+    pub repetition: f32,
+    /// (strength, start, window) of the stop-id and `</think>` ramps.
+    pub length_ramp: (f32, f32, f32),
+    pub think_ramp: (f32, f32, f32),
 }
 
 /// Batched prefill: k contiguous positions through the whole graph in one submit
@@ -2611,6 +2639,50 @@ pub fn abs_max_or_inf(xs: &[f32]) -> f32 {
         return f32::INFINITY;
     }
     acc.iter().fold(m, |m, &a| m.max(a))
+}
+
+/// One GDN layer's block-preview weights (`linear_core::GdnPreviewWeights`).
+#[derive(Clone, Copy)]
+pub struct GdnPreviewW<'a> {
+    /// [cdim · (kk−1)], flattened [c][distance−1].
+    pub conv_right: &'a [f32],
+    pub logit_scale: &'a [f32],
+    pub history_bias: &'a [f32],
+    pub history_c: &'a [f32],
+}
+
+/// A block-diffusion preview through the batched graph (Clover): every
+/// row attends the whole block, GDN layers run the preview operator, the
+/// MoE routes inside the block's expert coreset, and nothing the graph
+/// reads is advanced — the KV rows it writes past the synced count are
+/// overwritten by the next commit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockPreview {
+    /// `Some(top_p)`: restrict routing to the block coreset.
+    pub coreset_top_p: Option<f32>,
+}
+
+thread_local! {
+    static BLOCK_PREVIEW: Cell<Option<BlockPreview>> = const { Cell::new(None) };
+}
+
+/// Restores the previous mode on drop.
+pub struct BlockPreviewGuard(Option<BlockPreview>);
+
+impl Drop for BlockPreviewGuard {
+    fn drop(&mut self) {
+        BLOCK_PREVIEW.with(|c| c.set(self.0));
+    }
+}
+
+/// Run the batched graph calls of this thread as block previews.
+pub fn enter_block_preview(p: BlockPreview) -> BlockPreviewGuard {
+    BlockPreviewGuard(BLOCK_PREVIEW.with(|c| c.replace(Some(p))))
+}
+
+/// The preview mode `enter_block_preview` set on this thread, if any.
+pub fn block_preview() -> Option<BlockPreview> {
+    BLOCK_PREVIEW.with(|c| c.get())
 }
 
 /// The decode graph's device K/V mirror a prefill chunk of one layer also
