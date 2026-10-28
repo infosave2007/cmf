@@ -51,6 +51,24 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Block-diffusion models (0.8.40)
+
+[Clover-35B-A3B-Preview](https://huggingface.co/infosave/Clover-35B-A3B-Preview-cmf)
+writes its answer in 32-token blocks, resolving several tokens a pass by
+denoising instead of one token a step:
+
+```sh
+hf download infosave/Clover-35B-A3B-Preview-cmf clover-35b-a3b-preview-q4tp-v2.cmf --local-dir .
+cortiq run clover-35b-a3b-preview-q4tp-v2.cmf --prompt "Write a Python function that merges two sorted lists." --no-think
+```
+
+On Vulkan every denoising pass is one GPU submission (34 ms for a 32-token
+block on an RTX 5090: ~26 tok/s on prose, 80–95 on code at the release's
+threshold). Converting, the generation controls and the measurements:
+[docs/CLOVER.md](docs/CLOVER.md). The same release cuts the VRAM of every
+MoE graph on Vulkan: a 35B-A3B q4tp stack takes 18.8 GB instead of 31.8 GB,
+and the published Qwen3.6-35B-A3B decodes at 156 tok/s on a 32 GB card.
+
 ## Task compression in one command (0.8.39)
 
 Turn a general model into a specialist for your prompts:
