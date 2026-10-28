@@ -10,7 +10,7 @@ use cortiq_core::format::TensorSpec;
 use cortiq_core::{CmfHeader, CmfModel, LayerType, ModelArch, NormStyle, QuantType, TensorDtype};
 use cortiq_engine::Pipeline;
 use cortiq_engine::SamplerConfig;
-use cortiq_engine::fcd::{FcdHyper, FcdModel, TrainState, run_polish};
+use cortiq_engine::fcd::{FcdHyper, FcdModel, FcdStream, TrainState, run_polish, run_polish_stream};
 use cortiq_engine::nystrom::O1Cfg;
 use std::sync::Arc;
 
@@ -489,6 +489,62 @@ fn training_smoke_loss_decreases_and_output_loads() {
         logits.iter().all(|v| v.is_finite()),
         "finite logits from the polished file"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The record-stream polish (`compress` S4): answer-only weights, windows
+/// inside records, the frozen layer below the trainable one served from the
+/// cache. The frozen layer must stay byte-identical, the loss must fall, and
+/// the restored state can never be worse on val than the untrained one.
+#[test]
+fn record_stream_polish_trains_only_the_tail() {
+    let dir = std::env::temp_dir().join(format!("fcd_records_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = write_tiny_model(&dir);
+    let model = Arc::new(CmfModel::open(&path).unwrap());
+    // records: 6-token prompt (weight 0) + answer (weight 1), varied lengths
+    let build = |n: usize, salt: u64| {
+        let (mut ids, mut w, mut starts) = (Vec::new(), Vec::new(), Vec::new());
+        for r in 0..n {
+            starts.push(ids.len());
+            let len = 10 + (r * 7) % 20;
+            for (i, t) in rand_ids(len, salt + r as u64).into_iter().enumerate() {
+                ids.push(t);
+                w.push(if i >= 6 { 1.0f32 } else { 0.0 });
+            }
+        }
+        ids.extend(std::iter::repeat_n(0u32, SEQ + 1));
+        w.extend(std::iter::repeat_n(0f32, SEQ + 1));
+        (ids, w, starts)
+    };
+    let (tr, trw, trs) = build(40, 100);
+    let (va, vaw, vas) = build(8, 900);
+    let hp = FcdHyper { steps: 40, lr: 1e-3, kl_w: 0.7, eval_every: 10, bs: 2, seq: SEQ, seed: 0, polish_only: true };
+    let o1 = O1Cfg::from_spec("deep1", None, None, None, None).unwrap();
+    let out = dir.join("tiny_records.cmf");
+    let rep = run_polish_stream(
+        &model,
+        None,
+        &o1,
+        &hp,
+        FcdStream { ids: &tr, weight: Some(&trw), starts: Some(&trs) },
+        FcdStream { ids: &va, weight: Some(&vaw), starts: Some(&vas) },
+        &out,
+        None,
+        None,
+    )
+    .expect("record polish");
+    assert_eq!(rep.converted, vec![1]);
+    assert_eq!(rep.losses.len(), 40);
+    let total = |(ce, kl): &(f64, f64)| 0.3 * ce + 0.7 * kl;
+    let first: f64 = rep.losses[..10].iter().map(total).sum::<f64>() / 10.0;
+    let last: f64 = rep.losses[30..].iter().map(total).sum::<f64>() / 10.0;
+    assert!(last < first, "loss must fall ({first:.4} → {last:.4})");
+    assert!(rep.ppl_final <= rep.ppl_start + 1e-9, "restore-best keeps val no worse: {} → {}", rep.ppl_start, rep.ppl_final);
+    let polished = CmfModel::open(&out).unwrap();
+    for name in ["model.layers.0.mlp.gate_proj.weight", "model.layers.0.mlp.down_proj.weight"] {
+        assert_eq!(model.tensor_bytes(name).unwrap(), polished.tensor_bytes(name).unwrap(), "{name} is frozen");
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 

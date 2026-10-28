@@ -2669,15 +2669,15 @@ impl Pipeline {
                 }
                 let r = crate::pin::pin_tensors(model, &names);
                 tracing::info!(
-                    "закреплено {:.1} ГБ ({} тензоров, горячих экспертов {kept_experts},                      покрытие {cover}); лимит {}",
+                    "pinned {:.1} GB ({} tensors, hot experts {kept_experts},                      coverage {cover}); limit {}",
                     r.bytes as f64 / 1e9,
                     r.tensors,
                     r.limit
-                        .map(|l| format!("{:.1} ГБ", l as f64 / 1e9))
-                        .unwrap_or_else(|| "неизвестен".into())
+                        .map(|l| format!("{:.1} GB", l as f64 / 1e9))
+                        .unwrap_or_else(|| "unknown".into())
                 );
                 if r.skipped > 0 {
-                    tracing::warn!("не закреплено тензоров: {}", r.skipped);
+                    tracing::warn!("tensors left unpinned: {}", r.skipped);
                 }
             }
             let st = crate::dsv4::Dsv4State::new(arch.num_layers);
