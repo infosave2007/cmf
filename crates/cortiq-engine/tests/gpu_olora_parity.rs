@@ -53,19 +53,19 @@ fn device_o_lora_a_matches_the_cpu() {
             let mut gpu = vec![0.0f32; rows];
             if !cortiq_engine::gpu_wgpu::o_lora_a_for_test(&model, idx, &attn, rows, lora, &mut gpu)
             {
-                eprintln!("устройство отказалось от {} — пропуск", e.name);
+                eprintln!("the device declined {} — skipped", e.name);
                 continue;
             }
             let num: f32 = cpu.iter().zip(&gpu).map(|(a, b)| (a - b) * (a - b)).sum();
             let den: f32 = cpu.iter().map(|a| a * a).sum::<f32>().max(1e-20);
             let rel = (num / den).sqrt();
-            println!("{}: [{rows}x{cols}] групп {groups}: {rel:.3e}", e.name);
-            assert!(rel < 5e-3, "{} при {groups} группах: {rel:.3e}", e.name);
+            println!("{}: [{rows}x{cols}] {groups} groups: {rel:.3e}", e.name);
+            assert!(rel < 5e-3, "{} with {groups} groups: {rel:.3e}", e.name);
             checked += 1;
         }
         if checked >= 24 {
             break;
         }
     }
-    println!("сверено: {checked}");
+    println!("checked: {checked}");
 }

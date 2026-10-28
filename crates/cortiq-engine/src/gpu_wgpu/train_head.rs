@@ -51,11 +51,24 @@ fn kl_rows(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index
     }
     let lse = mx + log(red[0]);
     workgroupBarrier();
+    // weighted rows (f1 = 1): the teacher row sums to the row's weight ws,
+    // the student term is scaled by it (ws = 0: no loss, no gradient)
+    var wsum = 0.0;
+    for (var q = t; q < p.k; q = q + 256u) { wsum = wsum + TP[row * p.k + q]; }
+    red[t] = wsum;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {
+        if (t < s) { red[t] = red[t] + red[t + s]; }
+        workgroupBarrier();
+    }
+    var ws = 1.0;
+    if (p.f1 > 0.5) { ws = red[0]; }
+    workgroupBarrier();
     // loss over the teacher's support (read the logits before overwriting)
     var lp = 0.0;
     for (var q = t; q < p.k; q = q + 256u) {
         let pt = TP[row * p.k + q];
-        if (pt > 0.0) { lp = lp + pt * (log(pt) - (LG[base + TID[row * p.k + q]] - lse)); }
+        if (pt > 0.0) { lp = lp + pt * (log(pt / ws) - (LG[base + TID[row * p.k + q]] - lse)); }
     }
     red[t] = lp;
     workgroupBarrier();
@@ -65,7 +78,7 @@ fn kl_rows(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index
     }
     if (t == 0u) { LOSS[row] = red[0]; }
     workgroupBarrier();
-    for (var j = t; j < p.v; j = j + 256u) { LG[base + j] = exp(LG[base + j] - lse) * p.coef; }
+    for (var j = t; j < p.v; j = j + 256u) { LG[base + j] = exp(LG[base + j] - lse) * (p.coef * ws); }
     workgroupBarrier();
     for (var q = t; q < p.k; q = q + 256u) {
         let id = TID[row * p.k + q];
@@ -195,10 +208,16 @@ pub fn topk(c: &Ctx, head: &Head, s: &HeadScratch, x: &wgpu::Buffer, ntok: usize
 /// `coef · (p_S − p_T)`.
 #[allow(clippy::too_many_arguments)]
 pub fn kl_rows<'a>(c: &'a Ctx, logits: &'a wgpu::Buffer, tid: &'a wgpu::Buffer, tp: &'a wgpu::Buffer, loss: &'a wgpu::Buffer, ntok: usize, v: usize, k: usize, coef: f32) -> Option<Disp<'a>> {
+    kl_rows_w(c, logits, tid, tp, loss, ntok, v, k, coef, false)
+}
+
+/// [`kl_rows`]; `weighted`: each teacher row sums to its token's weight.
+#[allow(clippy::too_many_arguments)]
+pub fn kl_rows_w<'a>(c: &'a Ctx, logits: &'a wgpu::Buffer, tid: &'a wgpu::Buffer, tp: &'a wgpu::Buffer, loss: &'a wgpu::Buffer, ntok: usize, v: usize, k: usize, coef: f32, weighted: bool) -> Option<Disp<'a>> {
     let m = module(c)?;
     Some(Disp {
         pipe: &m.p["kl_rows"],
-        uni: vec![ntok as u32, v as u32, k as u32, 0, coef.to_bits(), 0, 0, 0],
+        uni: vec![ntok as u32, v as u32, k as u32, 0, coef.to_bits(), if weighted { 1f32.to_bits() } else { 0 }, 0, 0],
         bufs: vec![(1, logits), (2, tid), (3, tp), (4, loss)],
         grid: train_ops::wg_fold(ntok),
     })
@@ -312,6 +331,27 @@ pub fn head_kl(
     total: usize,
     gscale: f32,
 ) -> Option<()> {
+    head_kl_w(c, head, s, x, tid, tp, k, dx, loss, ntok, total as f32, gscale, false)
+}
+
+/// [`head_kl`] with the normalizer `total` as a weight sum and, with
+/// `weighted`, rows whose teacher probabilities sum to the token's weight.
+#[allow(clippy::too_many_arguments)]
+pub fn head_kl_w(
+    c: &Ctx,
+    head: &Head,
+    s: &HeadScratch,
+    x: &wgpu::Buffer,
+    tid: &wgpu::Buffer,
+    tp: &wgpu::Buffer,
+    k: usize,
+    dx: &wgpu::Buffer,
+    loss: &wgpu::Buffer,
+    ntok: usize,
+    total: f32,
+    gscale: f32,
+    weighted: bool,
+) -> Option<()> {
     let (v, hs) = (head.v, head.hs);
     let ch = s.chunk;
     let mut r0 = 0;
@@ -334,9 +374,11 @@ pub fn head_kl(
         for (si, &(off, vs)) in head.cuts.iter().enumerate() {
             ops.push(Op::M(train_mm::mm_cols(c, &head.w[si], &s.act, &s.logits, rows, vs, hs, v, off, 1.0)?));
         }
-        ops.push(Op::D(kl_rows(c, &s.logits, tidc, tpc, lossc, rows, v, k, gscale / total as f32)?));
-        // dh = Σ_slices dlogits[:, slice] · W[slice]
-        for (si, &(off, vs)) in head.cuts.iter().enumerate() {
+        ops.push(Op::D(kl_rows_w(c, &s.logits, tidc, tpc, lossc, rows, v, k, gscale / total, weighted)?));
+        // dh = Σ_slices dlogits[:, slice] · W[slice] (a forward-only head
+        // has no transposed planes: the loss alone)
+        let bwd = !head.wt.is_empty();
+        for (si, &(off, vs)) in head.cuts.iter().enumerate().filter(|_| bwd) {
             ops.push(Op::D(train_mm::cvt_cols(c, &s.logits, &s.act, rows, vs, v, off, 1.0)?));
             let dst = if si == 0 { &s.dact } else { &s.dpart };
             ops.push(Op::M(train_mm::mm(c, &head.wt[si], &s.act, dst, rows, hs, vs, 1.0 / gscale)?));
@@ -352,7 +394,9 @@ pub fn head_kl(
         train_mm::run(c, &ops);
         let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("head_out") });
         let mut mk = super::train_prof::enc_begin(c, &mut enc);
-        enc.copy_buffer_to_buffer(&s.dact, 0, dx, (r0 * hs * 4) as u64, (rows * hs * 4) as u64);
+        if bwd {
+            enc.copy_buffer_to_buffer(&s.dact, 0, dx, (r0 * hs * 4) as u64, (rows * hs * 4) as u64);
+        }
         enc.copy_buffer_to_buffer(lossc, 0, loss, (r0 * 4) as u64, (rows * 4) as u64);
         super::train_prof::enc_mark(c, &mut enc, &mut mk, "copy");
         super::submit(c, enc.finish());

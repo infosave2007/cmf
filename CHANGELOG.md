@@ -5,6 +5,103 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- Every runtime message is in English (`cortiq gpu`, the DeepSeek-V4/DSpark
+  device paths, multi-GPU flags, memory pinning, profiling lines and the GPU
+  parity tests printed partly in Russian).
+
+### Added
+- `cortiq compress SOURCE DATA.tdata OUTPUT.cmf [QUANT] --ffn F|--size N|--ratio R`
+  — task-specific compression by teacher data, as one resumable command
+  (docs/COMPRESS.ru.md). Seven stages, each in its own process and cached in
+  `OUTPUT.work/` under a key of its inputs: S0 source → f16 + q8_2f copies
+  and a tokenizer check of the data; S1 illumination — the Gram of every
+  `down_proj` input on the teacher's answers (train and val apart) and, from
+  one Cholesky per layer, the read-out error left after the refit for every
+  width; S2 per-layer widths from those curves (protected edge layers,
+  128-aligned) or uniform; S3 the closed-form fold `W_down' = W_S + W_P·Πᵀ`
+  with the ridge — and the refit itself — chosen on the val split;
+  S4 KD healing against the uncompressed source on the teacher's generated
+  tokens; S5 GPTQ (q4tp/q2tp) calibrated on the same records, k/v at q8_2f,
+  or the converter's codec; S6 held-out (test) NLL, greedy generation
+  (loops, length against the teacher, self-stops), quality gates, `report.md`
+  and `provenance.compress`. `--plan-only` prints the arithmetic plan.
+- `cortiq compress SOURCE PROMPTS.jsonl OUTPUT --ratio R`: one command from a
+  prompt list to a task-compressed model. The source (or `--teacher`) answers
+  the prompts in S0 (cached, resumable, live token counter and an ETA per answer);
+  `--ratio` is the output's size as a fraction of the source in the same
+  codec; the output keeps the source's codec (quantization stays a separate
+  step). Every stage prints its number, purpose, live counters and a
+  remaining-time estimate; the report states the size against the source in
+  the same codec. A short prompt list whose categories are too small for the
+  stratified split now still gets val/test prompts.
+- API teachers: `teacher-data generate openrouter:MODEL|openai:MODEL|api:MODEL
+  PROMPTS OUT.tdata --tokenizer STUDENT.cmf` (and `compress --teacher …`) asks
+  any OpenAI-compatible `/chat/completions` — OpenRouter, OpenAI, vLLM,
+  SGLang, llama.cpp, Ollama, `cortiq serve` — instead of running a large
+  teacher locally. `--api-base`, `--api-extra JSON`, `--api-concurrency`; the
+  key comes from the environment only. Answers are cached as they arrive
+  (a rerun requests only the missing ones), reasoning from
+  `reasoning`/`reasoning_content`/`<think>` is placed before `</think>` as
+  the student's template continues it, a reply cut inside its reasoning
+  stays a truncated record without a closing tag or end token, a field the
+  server refuses is dropped once with a message, a bad key or model stops
+  the run at once. On OpenRouter the cheapest provider with 8/16-bit weights
+  is the default (−30 % per token on Qwen3.8-27B; fp4 providers excluded);
+  the provider of each answer is recorded. Qwen3.8-27B, 160 coding prompts,
+  no reasoning, 32 in flight: 419k tokens in 2 min. Imported API answers cut
+  by the token cap no longer get an end token.
+- `compress --compare MODEL.cmf` (repeatable) scores other models on the same
+  test records — another compression, a quant-only file, the same task with
+  another teacher — as extra report rows; the gates stay on the output. An
+  f16 output (the healed f16 file itself) is scored through its q8_2f copy:
+  the f16 runtime path took 30+ minutes on the CPU for a 0.8B model.
+- MoE models compress with the same command: S1 counts the router's choices
+  on the task's answers, S2 picks the routing-mass cover that meets the size,
+  S3 keeps only those experts (`moe-defrag`). LFM2.5-8B-A1B, 80 coding
+  prompts: `--ratio 0.9` → 7.62B params, test NLL 0.280 → 0.289.
+- `--select dtgma`: neuron selection by a DTG-MA mask (Patent 2) trained with
+  the task's LM loss under L1 pressure (`skillbake` Phase A), instead of the
+  one-pass illumination ranking; the fold and the heal follow unchanged.
+- Device heal: `--heal-loss mix=A|kd|ce` (default mix=0.5: 0.8B test NLL
+  after the heal 0.281 vs 0.303 KD-only, 0.292 CE-only), `--heal-schedule
+  flat|genesis` (the notebook's progressive unfreeze; flat stays default),
+  `--heal-params ffn` by default, rate falling with the trained depth,
+  frozen-prefix activations cached on the host for deep models.
+- `compress` on NVIDIA (Vulkan matrix units) runs its heavy stages on the
+  nvg-train kernels: S4 heals the tail layers' dense weights in full on the
+  card (f32 masters + Adam, frozen prefix without a backward, weighted KL to
+  the source's top-64 on the scored tokens) — 99 s instead of 6308 s on the
+  CPU for Qwen3.5-0.8B; S1/S3 accumulate the `down_proj` input Grams on the
+  card (13k tok/s instead of ~220 through the runtime hook); S6 scores the
+  test NLL with the trainer's forward (matches the runtime within 2e-4,
+  10 s instead of 230 s). `--heal-device auto|gpu|cpu`, `--heal-params all|ffn`,
+  `--heal-window`, `--heal-topk`; `--heal-layers auto` sizes the trained tail
+  to the device budget.
+- `cortiq teacher-data generate`: reasoning models think by default and the
+  `</think>` token splits each record exactly; an interrupted run is
+  continued by the same command; a generation collapsing into repetition is
+  stopped early (distinct 5-grams of the last 512 pieces < 5 %); `--shard I/N`.
+- `cortiq teacher-data import CACHE OUT.tdata --tokenizer MODEL.cmf` turns a
+  `[prompt, rendered ChatML]` cache (the DTG-MA notebooks') or JSONL
+  `prompt`/`response` rows into teacher data; `teacher-data merge` joins shards.
+- `.tdata` as a calibration corpus: `quantize-gptq --calib DATA.tdata[:split][=SHARE]`
+  (windows inside records) and `fcd --corpus DATA.tdata` (loss on generated
+  tokens, record-bounded windows, val split held out).
+- FCD record streams (`fcd::FcdStream`, `run_polish_stream`): per-token loss
+  weights, fixed windows inside records; the teacher's hidden states and the
+  student's frozen prefix are computed once per window by the runtime (the
+  teacher is never held as an f32 replica), each step runs and
+  differentiates only the trainable tail.
+
+### Changed
+- The host Gram accumulation of the GPTQ capture runs as Accelerate GEMMs on
+  Apple/aarch64 (the register kernel used about one core of an M4).
+- FCD: the vocabulary-wide CE/KL rows run on all cores; chunks with nothing
+  scored are skipped.
+
 ## [0.8.38] — 2026-10-27
 
 ### Added

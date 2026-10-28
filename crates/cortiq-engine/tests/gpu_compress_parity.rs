@@ -34,7 +34,7 @@ fn device_kv_pool_matches_the_cpu_needs_cmf_gpu() {
             cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());
             return;
         }
-        Some(false) => panic!("wgpu запрошен, но контекст не поднялся"),
+        Some(false) => panic!("wgpu was requested but the context did not come up"),
         Some(true) => {}
     }
     let (ratio, d) = (4usize, 128usize);
@@ -55,11 +55,11 @@ fn device_kv_pool_matches_the_cpu_needs_cmf_gpu() {
         if !cortiq_engine::gpu_wgpu::kv_pool_for_test(
             pk, ps, &cur_kv, &cur_sc, None, ratio, d, true, &mut gpu,
         ) {
-            panic!("устройство не поднялось — тест не проверил ничего");
+            panic!("the device did not come up — the test checked nothing");
         }
         let r = rel(&cpu, &gpu);
-        println!("перекрытие, prev={have_prev}: {r:.3e}");
-        assert!(r < 1e-5, "перекрытие prev={have_prev}: {r:.3e}");
+        println!("overlap, prev={have_prev}: {r:.3e}");
+        assert!(r < 1e-5, "overlap prev={have_prev}: {r:.3e}");
     }
 
     // The plain compressor: a wide window and the APE bias folded in.
@@ -82,8 +82,8 @@ fn device_kv_pool_matches_the_cpu_needs_cmf_gpu() {
         &mut gpu,
     ));
     let r = rel(&cpu, &gpu);
-    println!("плоский компрессор с APE: {r:.3e}");
-    assert!(r < 1e-5, "плоский компрессор: {r:.3e}");
+    println!("flat compressor with APE: {r:.3e}");
+    assert!(r < 1e-5, "flat compressor: {r:.3e}");
 }
 
 #[test]
@@ -97,7 +97,7 @@ fn device_index_scores_match_the_cpu_needs_cmf_gpu() {
             cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());
             return;
         }
-        Some(false) => panic!("wgpu запрошен, но контекст не поднялся"),
+        Some(false) => panic!("wgpu was requested but the context did not come up"),
         Some(true) => {}
     }
     let (nh, hd, n_pos) = (16usize, 64usize, 200usize);
@@ -114,14 +114,14 @@ fn device_index_scores_match_the_cpu_needs_cmf_gpu() {
     let mut gpu = vec![0.0f32; n_pos];
     if !cortiq_engine::gpu_wgpu::index_scores_for_test(&q, &kv, &hw, nh, hd, n_pos, limit, &mut gpu)
     {
-        panic!("устройство не поднялось — тест не проверил ничего");
+        panic!("the device did not come up — the test checked nothing");
     }
     for t in limit..n_pos {
-        assert!(gpu[t] < -1e30, "позиция {t} за пределом не замаскирована");
+        assert!(gpu[t] < -1e30, "position {t} past the limit is not masked");
     }
     let r = rel(&cpu[..limit], &gpu[..limit]);
-    println!("индексатор ({limit} из {n_pos} позиций): {r:.3e}");
-    assert!(r < 1e-5, "индексатор: {r:.3e}");
+    println!("indexer ({limit} of {n_pos} positions): {r:.3e}");
+    assert!(r < 1e-5, "indexer: {r:.3e}");
 }
 
 #[test]
@@ -135,7 +135,7 @@ fn device_top_k_matches_the_cpu_needs_cmf_gpu() {
             cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());
             return;
         }
-        Some(false) => panic!("wgpu запрошен, но контекст не поднялся"),
+        Some(false) => panic!("wgpu was requested but the context did not come up"),
         Some(true) => {}
     }
     for (n, k) in [(200usize, 64usize), (700, 512), (40, 512)] {
@@ -151,15 +151,15 @@ fn device_top_k_matches_the_cpu_needs_cmf_gpu() {
         cortiq_engine::dsv4::top_k_positions(&sc, k, &mut cpu);
         let mut gpu = Vec::new();
         if !cortiq_engine::gpu_wgpu::top_k_for_test(&sc, k, &mut gpu) {
-            panic!("устройство не поднялось — тест не проверил ничего");
+            panic!("the device did not come up — the test checked nothing");
         }
         let cpu32: Vec<u32> = cpu.iter().map(|&x| x as u32).collect();
         println!(
-            "top-k n={n} k={k}: выбрано {} против {}",
+            "top-k n={n} k={k}: selected {} versus {}",
             gpu.len(),
             cpu.len()
         );
-        assert_eq!(cpu32, gpu, "top-k разошлись при n={n} k={k}");
+        assert_eq!(cpu32, gpu, "top-k diverged at n={n} k={k}");
     }
 }
 
@@ -178,7 +178,7 @@ fn device_compressor_state_matches_the_cpu_needs_cmf_gpu() {
             cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());
             return;
         }
-        Some(false) => panic!("wgpu запрошен, но контекст не поднялся"),
+        Some(false) => panic!("wgpu was requested but the context did not come up"),
         Some(true) => {}
     }
     // Both shapes the release uses: the overlapping ratio-4 compressor and
@@ -273,12 +273,12 @@ fn device_compressor_state_matches_the_cpu_needs_cmf_gpu() {
                 kv_id,
                 &mut got,
             )
-            .expect("кадр компрессора отказал");
+            .expect("the compressor frame declined");
 
             assert_eq!(
                 folded,
                 cpu.is_some(),
-                "перекрытие={overlap} поз={pos}: окно закрылось не там"
+                "overlap={overlap} pos={pos}: the window closed in the wrong place"
             );
             if let Some(want) = cpu {
                 let r = rel(&want, &got);
@@ -287,9 +287,9 @@ fn device_compressor_state_matches_the_cpu_needs_cmf_gpu() {
                 // counted `ape` was told apart from a bad fold: a kernel
                 // fault would not have grown monotonically across folds.
                 if std::env::var("CMF_COMP_SURVEY").is_ok() {
-                    eprintln!("СВОДКА перекрытие={overlap} поз={pos}: {r:.3e}");
+                    eprintln!("SUMMARY overlap={overlap} pos={pos}: {r:.3e}");
                 } else {
-                    assert!(r < 1e-5, "перекрытие={overlap} поз={pos}: {r:.3e}");
+                    assert!(r < 1e-5, "overlap={overlap} pos={pos}: {r:.3e}");
                 }
             }
         }
@@ -308,7 +308,7 @@ fn device_index_list_matches_the_host_mapping_needs_cmf_gpu() {
             cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());
             return;
         }
-        Some(false) => panic!("wgpu запрошен, но контекст не поднялся"),
+        Some(false) => panic!("wgpu was requested but the context did not come up"),
         Some(true) => {}
     }
     let window = 128usize;
@@ -325,7 +325,7 @@ fn device_index_list_matches_the_host_mapping_needs_cmf_gpu() {
         let mut got = Vec::new();
         assert!(
             cortiq_engine::gpu_wgpu::dsv4_idx_build_for_test(&pick, win_len, window, &mut got),
-            "сборщик списка отказал"
+            "the list builder declined"
         );
         assert_eq!(want, got, "win_len={win_len} picks={pick:?}");
     }
@@ -344,7 +344,7 @@ fn device_window_append_matches_the_cpu_needs_cmf_gpu() {
             cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());
             return;
         }
-        Some(false) => panic!("wgpu запрошен, но контекст не поднялся"),
+        Some(false) => panic!("wgpu was requested but the context did not come up"),
         Some(true) => {}
     }
     let (hd, window, rd, eps) = (32usize, 6usize, 8usize, 1e-6f32);
@@ -377,16 +377,16 @@ fn device_window_append_matches_the_cpu_needs_cmf_gpu() {
             cortiq_engine::gpu_wgpu::dsv4_window_place_for_test(
                 &raw, &kv_norm, &inv_freq, &seed, hd, window, filled, rd, eps, pos, &mut got,
             ),
-            "запись окна отказала"
+            "the window write declined"
         );
         let r = rel(&host, &got[..host.len()]);
         if r >= 1e-5 {
             for b in 0..host.len() / hd {
                 let rb = rel(&host[b * hd..(b + 1) * hd], &got[b * hd..(b + 1) * hd]);
                 let z = got[b * hd..(b + 1) * hd].iter().all(|v| *v == 0.0);
-                eprintln!("  поз={pos} блок {b}: rel={rb:.3e} нули={z}");
+                eprintln!("  pos={pos} block {b}: rel={rb:.3e} zeros={z}");
             }
         }
-        assert!(r < 1e-5, "поз={pos} заполнено={filled}: {r:.3e}");
+        assert!(r < 1e-5, "pos={pos} filled={filled}: {r:.3e}");
     }
 }

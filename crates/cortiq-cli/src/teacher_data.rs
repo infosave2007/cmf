@@ -55,6 +55,122 @@ pub fn require_direct_response_mode(no_think: bool) -> Result<()> {
     Ok(())
 }
 
+/// The id of the token that closes a reasoning block (`</think>`) when the
+/// vocabulary has it as one special token — the exact boundary marker.
+pub fn think_end_id(tokenizer: &Tokenizer) -> Option<u32> {
+    let ids = tokenizer.encode("</think>");
+    (ids.len() == 1).then(|| ids[0])
+}
+
+/// Exact reasoning / answer split of generated ids: everything through the
+/// first `</think>` id is reasoning, the rest is the answer. Without one the
+/// whole generation is an unfinished thought (answer empty).
+pub fn split_think_ids(ids: &[u32], end: u32) -> (usize, usize) {
+    match ids.iter().position(|&t| t == end) {
+        Some(i) => (i + 1, ids.len() - i - 1),
+        None => (ids.len(), 0),
+    }
+}
+
+/// Online repetition detector for a running generation: every 64 emitted
+/// pieces it measures the distinct 5-grams of the last 512, and trips once
+/// at least 256 pieces are in and fewer than `min_distinct` of them are new
+/// (a healthy text keeps far above 30 %, a collapsed one sits at 0–5 %).
+pub struct LoopGuard {
+    pieces: Vec<u64>,
+    min_distinct: f32,
+}
+
+impl LoopGuard {
+    pub fn new(min_distinct: f32) -> Self {
+        Self { pieces: Vec::new(), min_distinct }
+    }
+
+    /// Feed one decoded piece; false = stop the generation.
+    pub fn feed(&mut self, piece: &str) -> bool {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        piece.hash(&mut h);
+        self.pieces.push(h.finish());
+        let n = self.pieces.len();
+        if n < 256 || n % 64 != 0 {
+            return true;
+        }
+        let tail = &self.pieces[n.saturating_sub(512)..];
+        let grams: HashSet<[u64; 5]> = tail.windows(5).map(|w| [w[0], w[1], w[2], w[3], w[4]]).collect();
+        (grams.len() as f32 / (tail.len() - 4) as f32) >= self.min_distinct
+    }
+}
+
+/// One answered conversation from a foreign answer cache (`teacher-data
+/// import`): the prompt as messages, the exact prefix text the answer
+/// followed when the cache kept it (ChatML caches), and the answer text with
+/// its reasoning.
+pub struct ImportedRow {
+    pub prompt: TeacherPrompt,
+    pub prefix_text: Option<String>,
+    pub response_text: String,
+}
+
+/// Split a rendered ChatML conversation into messages, the prefix up to and
+/// including the last `<|im_start|>assistant\n`, and the answer after it.
+pub fn parse_chatml(rendered: &str) -> Option<(Vec<TdataMessage>, String, String)> {
+    const START: &str = "<|im_start|>";
+    const END: &str = "<|im_end|>";
+    let marker = format!("{START}assistant\n");
+    let cut = rendered.rfind(&marker)? + marker.len();
+    let (prefix, answer) = rendered.split_at(cut);
+    let mut messages = Vec::new();
+    for block in prefix[..cut - marker.len()].split(START).skip(1) {
+        let (role, rest) = block.split_once('\n')?;
+        let content = rest.split(END).next().unwrap_or("").trim_end_matches('\n');
+        messages.push(TdataMessage { role: role.trim().to_string(), content: Value::String(content.to_string()) });
+    }
+    if messages.is_empty() {
+        return None;
+    }
+    let answer = answer.trim_end().trim_end_matches(END).to_string();
+    Some((messages, prefix.to_string(), answer))
+}
+
+/// Read a foreign answer cache: a `.json` array of `[prompt, rendered ChatML]`
+/// pairs (the DTG-MA notebooks' cache) or JSONL rows with `prompt` or
+/// `messages` and `response` (optional `id`, `category`).
+pub fn parse_import_source(path: &Path) -> Result<Vec<ImportedRow>> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut out = Vec::new();
+    let mut make = |obj: Value, line: usize, prefix: Option<String>, response: String| -> Result<()> {
+        let prompt = parse_prompt_value(obj, line)?;
+        out.push(ImportedRow { prompt, prefix_text: prefix, response_text: response });
+        Ok(())
+    };
+    if path.extension().and_then(|e| e.to_str()) == Some("json") {
+        let v: Value = serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let arr = v.as_array().context("expected a JSON array of [prompt, rendered] pairs")?;
+        for (i, item) in arr.iter().enumerate() {
+            let pair = item.as_array().filter(|p| p.len() == 2).with_context(|| format!("item {i}: expected [prompt, rendered]"))?;
+            let rendered = pair[1].as_str().with_context(|| format!("item {i}: rendered text is not a string"))?;
+            let Some((messages, prefix, answer)) = parse_chatml(rendered) else {
+                anyhow::bail!("item {i}: not a ChatML conversation with an assistant turn");
+            };
+            let msgs: Vec<Value> = messages.iter().map(|m| json!({"role": m.role, "content": m.content})).collect();
+            make(json!({ "messages": msgs }), i + 1, Some(prefix), answer)?;
+        }
+    } else {
+        for (i, line) in text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
+            let mut v: Value = serde_json::from_str(line).with_context(|| format!("line {}", i + 1))?;
+            let obj = v.as_object_mut().with_context(|| format!("line {}: expected an object", i + 1))?;
+            let response = obj
+                .remove("response")
+                .or_else(|| obj.remove("answer"))
+                .and_then(|r| r.as_str().map(str::to_owned))
+                .with_context(|| format!("line {}: no `response` string", i + 1))?;
+            make(v, i + 1, None, response)?;
+        }
+    }
+    Ok(out)
+}
+
 /// Options that affect input validation only.  They never rewrite a retained
 /// prompt, which is important because a `.tdata` token prefix must remain
 /// reproducible from its stored structured messages.
@@ -547,7 +663,11 @@ pub fn split_key(split_seed: u64, prompt_id: &str) -> [u8; 32] {
 
 /// Assign a stratified split in the exact input order.  Each category is
 /// independently ordered by [`split_key`]; categories with fewer than three
-/// prompts deliberately remain train-only, as specified for v1.
+/// prompts remain train-only, as specified for v1 — unless that leaves the
+/// whole set without a val or a test prompt (a short prompt list, where
+/// every category's share rounds to zero): then the prompts are split as
+/// one stratum, at least one val and one test, so a held-out evaluation
+/// exists.
 ///
 /// The caller writes the returned split into both `prompts.jsonl` and every
 /// sample record, rather than recalculating it in consumers.
@@ -586,6 +706,23 @@ pub fn assign_stratified_splits(
         }
         for &index in &members[test..test + val] {
             out[index] = TdataSplit::Val;
+        }
+    }
+    let has = |s: TdataSplit| out.contains(&s);
+    if ratios.val > 0 && ratios.test > 0 && !(has(TdataSplit::Val) && has(TdataSplit::Test)) {
+        let mut pool: Vec<usize> = (0..prompts.len()).collect();
+        out.iter_mut().for_each(|s| *s = TdataSplit::Train);
+        if pool.len() >= 3 {
+            pool.sort_unstable_by_key(|&index| split_key(split_seed, &prompts[index].id));
+            let n = pool.len();
+            let test = rounded_share(n, ratios.test, ratios.total()).max(1);
+            let val = rounded_share(n, ratios.val, ratios.total()).max(1).min(n - test - 1);
+            for &index in &pool[..test] {
+                out[index] = TdataSplit::Test;
+            }
+            for &index in &pool[test..test + val] {
+                out[index] = TdataSplit::Val;
+            }
         }
     }
     Ok(out)
@@ -831,7 +968,10 @@ pub fn tail_has_low_distinct_5gram(ids: &[u32]) -> bool {
 /// A visually empty decoded answer is always an unusable `empty` record even
 /// when the model happened to emit an EOS/other special token first.
 pub fn normalize_finish_reason(engine_finish: &str, visible_content: &str) -> String {
-    if visible_content.trim().is_empty() {
+    // A generation cut by --max-tokens inside its reasoning has no answer
+    // yet; it is a truncated record (kept with --keep-truncated: its
+    // reasoning is real teacher text), not an empty one.
+    if visible_content.trim().is_empty() && !matches!(engine_finish, "max_tokens" | "length") {
         return "empty".to_owned();
     }
     match engine_finish {
@@ -1221,6 +1361,17 @@ mod tests {
     }
 
     #[test]
+    fn one_off_categories_still_get_val_and_test() {
+        let rows: Vec<String> = (0..12)
+            .map(|i| format!("{{\"id\":\"p{i}\",\"category\":\"c{i}\",\"prompt\":\"Prompt p{i} has enough characters.\"}}"))
+            .collect();
+        let loaded = parse(&rows.join("\n"));
+        let s = assign_stratified_splits(&loaded.prompts, SplitRatios::new(80, 10, 10).unwrap(), 42).unwrap();
+        assert!(s.contains(&TdataSplit::Val) && s.contains(&TdataSplit::Test));
+        assert!(s.iter().filter(|&&x| x == TdataSplit::Train).count() >= 8);
+    }
+
+    #[test]
     fn split_is_category_stratified_and_input_order_independent() {
         let loaded = parse(
             r#"{"id":"a0","category":"a","prompt":"Prompt a0 has enough characters."}
@@ -1290,6 +1441,7 @@ mod tests {
     fn finish_and_final_tail_quality_are_conservative() {
         assert_eq!(normalize_finish_reason("max_tokens", "answer"), "length");
         assert_eq!(normalize_finish_reason("stop", "   "), "empty");
+        assert_eq!(normalize_finish_reason("max_tokens", ""), "length");
         assert!(!RecordQuality::from_finish("cancelled", false).usable);
         assert!(!RecordQuality::from_finish("unreviewed-finish", false).usable);
 
@@ -1353,6 +1505,42 @@ mod tests {
         assert_eq!(json["gen"]["seed"], record.record.generation["seed"]);
         assert!(json["gen"].get("ms").is_none());
         assert!(json.get("topk").is_none());
+    }
+
+    #[test]
+    fn think_split_is_exact_at_the_first_close_token() {
+        assert_eq!(split_think_ids(&[1, 2, 99, 5, 6, 7], 99), (3, 3));
+        assert_eq!(split_think_ids(&[1, 2, 3], 99), (3, 0), "no </think>: an unfinished thought");
+        assert_eq!(split_think_ids(&[99, 4], 99), (1, 1));
+    }
+
+    #[test]
+    fn loop_guard_trips_on_repetition_only() {
+        let mut g = LoopGuard::new(0.05);
+        let healthy: Vec<String> = (0..2000).map(|i| format!("w{}", (i * 7919) % 1543)).collect();
+        assert!(healthy.iter().all(|p| g.feed(p)), "varied text must never be stopped");
+        let mut g = LoopGuard::new(0.05);
+        let mut stopped = false;
+        for i in 0..2000 {
+            if !g.feed(["a", "b", "c"][i % 3]) {
+                stopped = true;
+                assert!(i >= 255, "stopped before 256 pieces");
+                break;
+            }
+        }
+        assert!(stopped, "a 3-token cycle must be stopped");
+    }
+
+    #[test]
+    fn chatml_cache_rows_split_into_messages_prefix_and_answer() {
+        let r = "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nAdd 2 and 2.<|im_end|>\n<|im_start|>assistant\n<think>\nsum\n</think>\n\n4<|im_end|>\n";
+        let (msgs, prefix, answer) = parse_chatml(r).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[1].content, Value::String("Add 2 and 2.".into()));
+        assert!(prefix.ends_with("<|im_start|>assistant\n"));
+        assert_eq!(answer, "<think>\nsum\n</think>\n\n4");
+        assert!(parse_chatml("no chat here").is_none());
     }
 
     #[test]

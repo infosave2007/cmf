@@ -47,6 +47,7 @@ axum = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 memmap2 = { workspace = true }
 # Minimal blocking HTTP client (rustls) so `cortiq convert` can pull a model

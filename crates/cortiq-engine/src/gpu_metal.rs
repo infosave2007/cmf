@@ -19325,7 +19325,7 @@ impl TokenGraph {
                 if n % 20 == 0 {
                     let ms = |i: usize| BUSY_US[i].load(Ordering::Relaxed) as f64 / n as f64 / 1e3;
                     eprintln!(
-                        "gpuprof: gdn-run {:.1} | attn {:.1} | прочее {:.1} ms/ток | span {:.1} ms/ток ({n} синков)",
+                        "gpuprof: gdn-run {:.1} | attn {:.1} | other {:.1} ms/tok | span {:.1} ms/tok ({n} syncs)",
                         ms(2),
                         ms(3),
                         ms(0) + ms(1),
