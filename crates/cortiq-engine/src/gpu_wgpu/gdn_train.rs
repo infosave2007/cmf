@@ -19,7 +19,7 @@
 //! `rep = nv/nk` v-heads of a k-head: each v-head writes its dq̂/dk̂ rows, a
 //! separate pass sums them and applies the l2-norm backward.
 
-use super::{Ctx, ctx, submit};
+use super::{Ctx, submit, trainer_ctx as ctx};
 use std::sync::OnceLock;
 
 const HEAD: &str = r#"
@@ -996,9 +996,10 @@ fn pipes(c: &Ctx) -> Option<&'static Pipes> {
             }
             // The subgroup kernels assume 32-wide subgroups (lane bits = rows
             // and columns of the state block); elsewhere the per-head kernels run.
+            // Apple's SIMD groups are 32 wide (wgpu reports Metal's range as 4..64)
             let sg = c.device.features().contains(wgpu::Features::SUBGROUP)
-                && c.adapter_info.subgroup_min_size == 32
-                && c.adapter_info.subgroup_max_size == 32
+                && ((c.adapter_info.subgroup_min_size == 32 && c.adapter_info.subgroup_max_size == 32)
+                    || c.adapter_info.backend == wgpu::Backend::Metal)
                 && std::env::var("CMF_GDN_SG").as_deref() != Ok("0")
                 && build(c, &pl, "gdn_train_sg", &format!("{HEAD}{SRC2}{}", rec_src(ckpt_interval())), &ENTRIES2, &mut p);
             for (ep, pipe) in &p {

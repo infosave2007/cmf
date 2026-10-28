@@ -1281,6 +1281,13 @@ enum Commands {
         /// The device jobs of the re-encode.
         #[arg(long, default_value = "3")]
         budget_jobs: usize,
+        /// DTG-MA before the metric: train a gate on every MLP neuron with
+        /// the same distillation loss, keep this fraction of the neurons (the
+        /// ones the gates rank highest, 128-aligned per layer, ≥ 25 % of each
+        /// layer), cut the rest out of the binary low-rank tensors, then
+        /// train the metric of what is left (NVG → DTG-MA)
+        #[arg(long, value_name = "F")]
+        mask_keep: Option<f64>,
     },
     /// One tensor through the NVG `blr` encoder with a per-stage profile, on
     /// the CPU reference path and/or the device path, from Grams captured
@@ -4296,6 +4303,7 @@ async fn main() -> anyhow::Result<()> {
             budget_fit_tokens,
             budget_sel_tokens,
             budget_jobs,
+            mask_keep,
         } => {
             let signs = if train_signs {
                 let opt = cortiq_engine::gpu_wgpu::train_sign::SignOpt::parse(&sign_opt).ok_or_else(|| anyhow::anyhow!("--sign-opt: fact | fact-mom | ref"))?;
@@ -4344,6 +4352,7 @@ async fn main() -> anyhow::Result<()> {
                 budget_fit_tokens,
                 budget_sel_tokens,
                 budget_jobs,
+                mask_keep,
             })
         }
         #[cfg(not(feature = "gpu"))]

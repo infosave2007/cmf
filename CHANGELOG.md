@@ -63,8 +63,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   S3 keeps only those experts (`moe-defrag`). LFM2.5-8B-A1B, 80 coding
   prompts: `--ratio 0.9` → 7.62B params, test NLL 0.280 → 0.289.
 - `--select dtgma`: neuron selection by a DTG-MA mask (Patent 2) trained with
-  the task's LM loss under L1 pressure (`skillbake` Phase A), instead of the
-  one-pass illumination ranking; the fold and the heal follow unchanged.
+  the task's LM loss under L1 pressure, instead of the one-pass illumination
+  ranking; the fold and the heal follow unchanged. On NVIDIA the gates live
+  in the device trainer (a gate σ(m) between every SwiGLU and its
+  `down_proj`, two fused kernels, the gate gradient by a column reduction,
+  Adam on the logits on the host): 0.37 s/step instead of 16.7 s through
+  `skillbake` on the host, the whole mask in ~3 min on Qwen3.5-0.8B. The L1
+  pressure grows ×1.5 per evaluation until the target sparsity (a linear
+  rise stalled at 15 %), the first held-out checkpoint at the target is
+  kept. 0.8B at 75 % FFN: fold 0.339 vs 0.364 by illumination, healed 0.282
+  vs 0.281; at `--ratio 0.9`: fold 0.372 vs 0.394, healed 0.310 vs 0.305;
+  2B at 75 % FFN: fold 0.320 vs 0.320, healed 0.261 vs 0.255 — the
+  illumination stays the default.
+  `CMF_DTGMA_{LR,L1,L1_STEP,L1_GROW,EVAL,MAX_STEPS,INIT,SETTLE}` tune it.
+- The device trainer (compress S1/S2/S4/S6, `nvg-train`, the NVG device
+  encoder) runs on Apple Silicon: a wgpu Metal context of the trainer's own
+  beside the runtime's native Metal (`CMF_TRAIN_GPU=0` keeps it off), the
+  GEMM generator and the matrix-unit attention with 8×8 fragments (Apple's
+  simdgroup matrices; Metal takes no scalar×matrix, so the output scale is
+  applied after the store), the subgroup GDN and sign kernels enabled on
+  Metal's 32-wide SIMD groups (wgpu reports 4..64 there). Qwen3.5-0.8B heal
+  step on an M4: 47 s with the f32 fallbacks → 12.2 s (attention 23.5 → 2.9 s,
+  GDN 5.5× faster, GEMM tile 64×64×32 at 3.0 TFLOPS instead of 1.7); every
+  gradient check passes on Metal (mask, norm, dense heal), the GEMM, attention,
+  GDN and sign kernels match their references. The NVG device encoder and
+  the device GPTQ kernels (`nvg_dev`, `gptq_dev`) take the same context, so
+  `convert --quant blr` encodes on the Mac's GPU without `CMF_GPU=wgpu`. On
+  unified memory the heal depth is sized from 60 % of the host's memory (the
+  runtime's 8 GB default trained 7 of the 0.8B's 24 layers). Qwen3.5-0.8B
+  `compress --ffn 0.75 --heal-epochs 1` end to end on an M4: S1 154 s, S3 72 s,
+  S4 7 s/step, test NLL source 0.1891 / fold 0.3642 (5090: 0.1891 / 0.3643).
+- `nvg-train --mask-keep F`: DTG-MA on an NVG (binary low-rank) model — the
+  gates trained with the run's distillation loss, the closed MLP neurons cut
+  out of the binary low-rank tensors without re-encoding (rows of gate/up,
+  columns of down), then the metric trained on what is left.
 - Device heal: `--heal-loss mix=A|kd|ce` (default mix=0.5: 0.8B test NLL
   after the heal 0.281 vs 0.303 KD-only, 0.292 CE-only), `--heal-schedule
   flat|genesis` (the notebook's progressive unfreeze; flat stays default),
