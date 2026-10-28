@@ -31,6 +31,7 @@ fn arch() -> ModelArch {
         mtp: None,
         moe: None,
         qwen4_exp: None,
+        block_diffusion: None,
         deepseek_v41: None,
         linear_core: None,
         head_clusters: None,

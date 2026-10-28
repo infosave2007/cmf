@@ -988,6 +988,186 @@ pub fn gdn_forward_batch(
     out
 }
 
+/// The block-diffusion (Clover) preview weights of one GDN layer.
+pub struct GdnPreviewWeights {
+    /// [c_dim · (kk−1)] — right taps, flattened [c][distance−1]: tap d
+    /// reads the block row d positions AFTER the output row.
+    pub conv_right: Vec<f32>,
+    /// [nv] — per-head scale of the unscaled q̂·k̂ block logits.
+    pub logit_scale: Vec<f32>,
+    /// [nv] — the history slot's logit at a full 32-row block…
+    pub history_bias: Vec<f32>,
+    /// [nv] — …and its slope in ln(valid rows / 32).
+    pub history_c: Vec<f32>,
+}
+
+/// Clover's preview of a GDN layer over one block, the committed state
+/// read-only (`bd_gdn_conv1d` + `bd_gdn_local_memory` of the release):
+///
+/// * conv: the causal taps over [ring | block] plus right taps over the
+///   next kk−1 rows OF THE BLOCK, then SiLU;
+/// * mixer: per value head a softmax over the block's keys (logits
+///   (q̂·k̂)·logit_scale, no β) and one history slot whose value is the
+///   clean state's readout (q̂/√dk)·S decayed by this row's g — no write;
+/// * the gated RMSNorm and out_proj of the causal path.
+///
+/// Every row of the block is valid (a preview always runs whole blocks).
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_preview_batch(
+    xs: &[f32],
+    b: usize,
+    w: &GdnWeights,
+    pw: &GdnPreviewWeights,
+    cfg: &GdnCfg,
+    state: &[f32],
+    pool: Option<&Pool>,
+) -> Vec<f32> {
+    let (nv, nk, dk, dv, kk) = (
+        cfg.num_v_heads,
+        cfg.num_k_heads,
+        cfg.key_head_dim,
+        cfg.value_head_dim,
+        cfg.conv_kernel,
+    );
+    let (c_dim, vd) = (cfg.conv_dim(), nv * dv);
+    let (kd, rep) = (nk * dk, nv / nk);
+    let mut qkv = vec![0.0f32; b * c_dim];
+    w.in_proj_qkv.matmat(xs, b, &mut qkv, pool);
+    let mut z = vec![0.0f32; b * vd];
+    w.in_proj_z.matmat(xs, b, &mut z, pool);
+    let mut a = vec![0.0f32; b * nv];
+    w.in_proj_a.matmat(xs, b, &mut a, pool);
+
+    // A fresh layer (no committed position yet) reads a zero state.
+    let zeros;
+    let state = if state.len() == cfg.state_len() {
+        state
+    } else {
+        zeros = vec![0f32; cfg.state_len()];
+        &zeros
+    };
+    let (ring, s_all) = state.split_at((kk - 1) * c_dim);
+
+    // conv: out[t] = Σ_j in[t + j]·taps[j] over in = [ring | block] (tap
+    // kk−1 is row t itself) + Σ_d block[t + d]·right[d − 1], then SiLU.
+    // Channels are independent: the pool takes channel ranges.
+    let mut cq = vec![0.0f32; b * c_dim];
+    let cq_ptr = SendMutF32(cq.as_mut_ptr());
+    let qkv_r = &qkv;
+    let conv = |c0: usize, c1: usize| {
+        let cq_ptr = cq_ptr;
+        for c in c0..c1 {
+            let taps = &w.conv1d[c * kk..(c + 1) * kk];
+            for t in 0..b {
+                let mut acc = 0f64;
+                for (j, &tap) in taps.iter().enumerate() {
+                    let i = t + j; // index into [ring | block]
+                    let x = if i < kk - 1 {
+                        ring[i * c_dim + c]
+                    } else {
+                        qkv_r[(i - (kk - 1)) * c_dim + c]
+                    };
+                    acc += x as f64 * tap as f64;
+                }
+                for d in 1..kk.min(b - t) {
+                    acc += qkv_r[(t + d) * c_dim + c] as f64
+                        * pw.conv_right[c * (kk - 1) + d - 1] as f64;
+                }
+                // SAFETY: channel c is written by this worker only.
+                unsafe { *cq_ptr.0.add(t * c_dim + c) = silu(acc) as f32 };
+            }
+        }
+    };
+    match pool {
+        Some(p) => p.run_rows(c_dim, &conv),
+        None => conv(0, c_dim),
+    }
+
+    // l2-normalized q̂, k̂ per row and key head (the readout adds 1/√dk).
+    let mut qn = vec![0.0f32; b * kd];
+    let mut kn = vec![0.0f32; b * kd];
+    for t in 0..b {
+        for ko in 0..nk {
+            for (dst, off) in [(&mut qn, 0), (&mut kn, kd)] {
+                let src = &cq[t * c_dim + off + ko * dk..t * c_dim + off + (ko + 1) * dk];
+                let ss: f64 = src.iter().map(|&x| x as f64 * x as f64).sum();
+                let inv = (1.0 / (ss + 1e-6).sqrt()) as f32;
+                for d in 0..dk {
+                    dst[t * kd + ko * dk + d] = src[d] * inv;
+                }
+            }
+        }
+    }
+    // The history slot's logit: valid rows = b, against the trained 32.
+    let len_log = (b as f64 / 32.0).ln();
+    let q_scale = 1.0 / (dk as f64).sqrt();
+
+    let mut of = vec![0.0f32; b * vd];
+    let of_ptr = SendMutF32(of.as_mut_ptr());
+    let (cq, qn, kn, z, a) = (&cq, &qn, &kn, &z, &a);
+    let heads = |h0: usize, h1: usize| {
+        let of_ptr = of_ptr;
+        let mut logits = vec![0f64; b + 1];
+        let mut o = vec![0f64; dv];
+        for h in h0..h1 {
+            let ko = h / rep;
+            let s = &s_all[h * dk * dv..(h + 1) * dk * dv];
+            let hist_logit = pw.history_bias[h] as f64 + pw.history_c[h] as f64 * len_log;
+            let scale = pw.logit_scale[h] as f64;
+            for t in 0..b {
+                let q = &qn[t * kd + ko * dk..t * kd + (ko + 1) * dk];
+                for (sx, lg) in logits[..b].iter_mut().enumerate() {
+                    let k = &kn[sx * kd + ko * dk..sx * kd + (ko + 1) * dk];
+                    let dot: f64 = q.iter().zip(k).map(|(&x, &y)| x as f64 * y as f64).sum();
+                    *lg = dot * scale;
+                }
+                logits[b] = hist_logit;
+                let mx = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let mut sum = 0f64;
+                for lg in logits.iter_mut() {
+                    *lg = (*lg - mx).exp();
+                    sum += *lg;
+                }
+                // History value: (q̂/√dk)ᵀS, decayed by this row's gate.
+                let g = -(w.a_log[h] as f64).exp() * softplus(a[t * nv + h] as f64 + w.dt_bias[h] as f64);
+                let w_hist = logits[b] / sum * g.exp() * q_scale;
+                o.fill(0.0);
+                for di in 0..dk {
+                    let qd = q[di] as f64 * w_hist;
+                    let row = &s[di * dv..(di + 1) * dv];
+                    for dj in 0..dv {
+                        o[dj] += qd * row[dj] as f64;
+                    }
+                }
+                for sx in 0..b {
+                    let ws = logits[sx] / sum;
+                    let v = &cq[sx * c_dim + 2 * kd + h * dv..sx * c_dim + 2 * kd + (h + 1) * dv];
+                    for dj in 0..dv {
+                        o[dj] += ws * v[dj] as f64;
+                    }
+                }
+                // Gated RMSNorm per head, as in `gdn_step`.
+                let ss: f64 = o.iter().map(|&v| v * v).sum();
+                let inv = 1.0 / (ss / dv as f64 + cfg.rms_eps).sqrt();
+                // SAFETY: head h of row t is written by this worker only.
+                let oh = unsafe { std::slice::from_raw_parts_mut(of_ptr.0.add(t * vd + h * dv), dv) };
+                for dj in 0..dv {
+                    let zz = z[t * vd + h * dv + dj] as f64;
+                    let gate = if cfg.output_gate_sigmoid { sigmoid(zz) } else { silu(zz) };
+                    oh[dj] = (o[dj] * inv * w.norm[dj] as f64 * gate) as f32;
+                }
+            }
+        }
+    };
+    match pool {
+        Some(p) => p.run_rows(nv, &heads),
+        None => heads(0, nv),
+    }
+    let mut out = vec![0.0f32; b * cfg.hidden_size];
+    w.out_proj.matmat(&of, b, &mut out, pool);
+    out
+}
+
 /// Aggregate host-side GDN costs for the bounded warm-decode profile.
 pub fn perf_report() {
     if !perf_enabled() {
