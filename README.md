@@ -51,6 +51,25 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Task compression in one command (0.8.39)
+
+Turn a general model into a specialist for your prompts:
+
+```sh
+cortiq compress model.cmf prompts.jsonl model-task.cmf --ratio 0.9
+```
+
+The teacher answers the prompts (the model itself, another `.cmf`, or any
+OpenAI-compatible API: `--teacher openrouter:qwen/qwen3.8-27b`, `openai:MODEL`,
+`api:MODEL --api-base URL`); the FFN neurons the task does not use leave the
+model (by activation illumination, or by a trained DTG-MA mask with
+`--select dtgma`), their contribution is refit into the kept ones in closed
+form, and the model is healed on the answers; held-out answers score it and
+gate the output. MoE models drop the experts the task does not route to. The
+output keeps the source's codec — quantize it separately. The device stages run
+on NVIDIA (Vulkan) and on Apple Silicon (Metal). See the
+[compress guide](docs/COMPRESS.ru.md).
+
 ## Prompt-calibrated MTP draft compaction (0.8.38)
 
 For a CMF that already carries a supported dense MTP draft, create a smaller

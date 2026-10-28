@@ -5,29 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Changed
-- Every runtime message is in English (`cortiq gpu`, the DeepSeek-V4/DSpark
-  device paths, multi-GPU flags, memory pinning, profiling lines and the GPU
-  parity tests printed partly in Russian).
+## [0.8.39] — 2026-10-28
 
 ### Added
-- `cortiq compress SOURCE DATA.tdata OUTPUT.cmf [QUANT] --ffn F|--size N|--ratio R`
+- `cortiq compress SOURCE DATA OUTPUT.cmf --ratio R` (or `--ffn F` / `--size N`)
   — task-specific compression by teacher data, as one resumable command
   (docs/COMPRESS.ru.md). Seven stages, each in its own process and cached in
-  `OUTPUT.work/` under a key of its inputs: S0 source → f16 + q8_2f copies
-  and a tokenizer check of the data; S1 illumination — the Gram of every
-  `down_proj` input on the teacher's answers (train and val apart) and, from
-  one Cholesky per layer, the read-out error left after the refit for every
-  width; S2 per-layer widths from those curves (protected edge layers,
-  128-aligned) or uniform; S3 the closed-form fold `W_down' = W_S + W_P·Πᵀ`
-  with the ridge — and the refit itself — chosen on the val split;
-  S4 KD healing against the uncompressed source on the teacher's generated
-  tokens; S5 GPTQ (q4tp/q2tp) calibrated on the same records, k/v at q8_2f,
-  or the converter's codec; S6 held-out (test) NLL, greedy generation
-  (loops, length against the teacher, self-stops), quality gates, `report.md`
-  and `provenance.compress`. `--plan-only` prints the arithmetic plan.
+  `OUTPUT.work/` under a key of its inputs: S0 source → f16 + q8_2f copies,
+  the teacher's answers when DATA is a prompt list, a tokenizer check;
+  S1 illumination — the Gram of every `down_proj` input on the teacher's
+  answers (train and val apart) and the read-out error left after the refit
+  for every width; S2 per-layer widths (uniform by default, 128-aligned) and
+  the neurons, by illumination or `--select dtgma`; S3 the closed-form fold
+  `W_down' = W_S + W_P·Πᵀ` with the ridge — and the refit itself — chosen on
+  the val split; S4 healing against the uncompressed source on the teacher's
+  generated tokens (`0.5·CE + 0.5·KL` by default); S5 the output codec — the
+  source's own by default, GPTQ (q4tp/q2tp) on the same records only when a
+  QUANT is given; S6 held-out (test) NLL, greedy generation (loops, length
+  against the teacher, self-stops), quality gates, `report.md` and
+  `provenance.compress`. `--plan-only` prints the plan.
 - `cortiq compress SOURCE PROMPTS.jsonl OUTPUT --ratio R`: one command from a
   prompt list to a task-compressed model. The source (or `--teacher`) answers
   the prompts in S0 (cached, resumable, live token counter and an ETA per answer);
@@ -129,10 +125,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   differentiates only the trainable tail.
 
 ### Changed
+- Every runtime message is in English (`cortiq gpu`, the DeepSeek-V4/DSpark
+  device paths, multi-GPU flags, memory pinning, profiling lines and the GPU
+  parity tests printed partly in Russian).
 - The host Gram accumulation of the GPTQ capture runs as Accelerate GEMMs on
   Apple/aarch64 (the register kernel used about one core of an M4).
 - FCD: the vocabulary-wide CE/KL rows run on all cores; chunks with nothing
   scored are skipped.
+- The compress fold scores each refit candidate through the dropped
+  columns' Gram (`⟨G, Σ_PP − 2ΠᵀΣ_SP + ΠᵀΣ_SSΠ⟩`, no h×k product formed) and
+  tries the ridges `0.03,0.1,0.3` (over 1130 folded layers 0.1 won 86 %,
+  0.003 never); `CMF_FOLD_PROF=1` prints the per-layer timers.
 
 ## [0.8.38] — 2026-10-27
 
