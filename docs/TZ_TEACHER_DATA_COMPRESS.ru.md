@@ -4,15 +4,17 @@
 «данные учителя → засветка нейронов → свёртка NVG → лечение → квантизация»
 внутри движка CMF.
 
-> **Статус для релиза 0.8.38.** В релиз вошли text-only E1 v1
-> (`cortiq teacher-data generate` и `teacher-data inspect`) и безопасная
-> compaction существующего dense MTP-draft через `cortiq mtp-compact` /
-> короткую форму `cortiq compact SOURCE.cmf PROMPTS.jsonl OUTPUT.cmf`. Это ТЗ
-> всё ещё описывает последующие исследовательские стадии, в том числе ещё не
-> выпущенную общую команду `cortiq compress`; его нельзя читать как справку по
-> доступным флагам.
-> Практическая инструкция для выпущенного пути:
-> [`TEACHER_DATA.ru.md`](TEACHER_DATA.ru.md).
+> **Статус реализации (ветка `compress`).** Конвейер работает:
+> `cortiq compress SOURCE DATA OUTPUT [QUANT]` проходит S0–S6 (подготовка →
+> засветка → план → свёртка с refit по val → KD-лечение → GPTQ на данных →
+> оценка на test с воротами), кэширует стадии и продолжается после
+> прерывания. `teacher-data generate` умеет рассуждение (`</think>`),
+> продолжение, онлайн-останов зацикливания и `--shard`; добавлены
+> `teacher-data import` и `merge`; `.tdata` принимают `quantize-gptq --calib` и
+> `fcd --corpus`. Инструкция: [`COMPRESS.ru.md`](COMPRESS.ru.md). Не сделано
+> (этапы 2–3 §13): GPU-тренер лечения для моделей больше ~2B (сейчас лечение
+> на CPU), свёртка голов внимания и GDN, глубина, MoE, top-k учителя в
+> `.tdata`, escort auto.
 
 | | |
 |---|---|

@@ -532,9 +532,10 @@ fn sign_upd_mom2(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation
 
 /// The subgroup module (`sign_upd_mom2`), where 32-wide subgroups exist.
 fn module_sg(c: &Ctx) -> Option<&'static train_ops::Mod> {
+    // Apple's SIMD groups are 32 wide (wgpu reports Metal's range as 4..64)
+    let sg32 = (c.adapter_info.subgroup_min_size == 32 && c.adapter_info.subgroup_max_size == 32) || c.adapter_info.backend == wgpu::Backend::Metal;
     if !c.device.features().contains(wgpu::Features::SUBGROUP)
-        || c.adapter_info.subgroup_min_size != 32
-        || c.adapter_info.subgroup_max_size != 32
+        || !sg32
         || std::env::var("CMF_SIGN_SG").as_deref() == Ok("0")
     {
         return None;

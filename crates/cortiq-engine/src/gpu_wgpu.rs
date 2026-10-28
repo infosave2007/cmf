@@ -20472,10 +20472,30 @@ fn ctx() -> Option<&'static Ctx> {
     ctx_for(crate::gpu::current_device())
 }
 
+/// The trainer's context (`train_ops::dev`): the runtime's when wgpu is
+/// selected; on macOS, where the runtime runs on native Metal, a wgpu
+/// Metal context of the trainer's own (the nvg-train / compress device
+/// kernels, Apple's 8×8 simdgroup matrices) — `CMF_TRAIN_GPU=0` keeps the
+/// trainer off it. The runtime never sees this context: `ctx()` still
+/// answers None while wgpu is not selected.
+pub fn trainer_ctx() -> Option<&'static Ctx> {
+    if selected() {
+        return ctx();
+    }
+    if !cfg!(target_os = "macos") || matches!(std::env::var("CMF_TRAIN_GPU").as_deref(), Ok("0") | Ok("off")) {
+        return None;
+    }
+    ctx_built(crate::gpu::current_device())
+}
+
 fn ctx_for(dev: usize) -> Option<&'static Ctx> {
     if !selected() {
         return None;
     }
+    ctx_built(dev)
+}
+
+fn ctx_built(dev: usize) -> Option<&'static Ctx> {
     let map = CTXS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut g = map.lock().unwrap();
     if let Some(slot) = g.get(&dev) {
@@ -20508,7 +20528,7 @@ fn ctx_for(dev: usize) -> Option<&'static Ctx> {
             if std::env::var("CMF_GPU_DEBUG").is_ok()
                 || std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok()
             {
-                eprintln!("wgpu init не удался (устройство {dev}) — откат на CPU: {e}");
+                eprintln!("wgpu init failed (device {dev}) — falling back to the CPU: {e}");
             }
             None
         }
@@ -20572,6 +20592,13 @@ fn existing_ctx() -> Option<&'static Ctx> {
 /// and a layer split.
 pub fn device_vram_budget() -> u64 {
     ctx().map(|c| c.vram_budget).unwrap_or(0)
+}
+
+/// The trainer device's memory budget ([`trainer_ctx`]): bytes, or
+/// `u64::MAX` on unified memory (Apple Silicon — the host's memory is the
+/// device's); None without a trainer device.
+pub fn trainer_vram_budget() -> Option<u64> {
+    trainer_ctx().map(|c| c.vram_budget)
 }
 
 /// Logical bytes currently held by the weight-residency arena on the active
@@ -21029,6 +21056,21 @@ fn init(dev: usize) -> Result<Ctx, String> {
         | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING;
     let want_bind_arrays = adapter.features().contains(bind_array_features);
     COOP_OK.store(want_coop, std::sync::atomic::Ordering::Relaxed);
+    // Apple GPUs (Metal) expose 8×8×8 simdgroup matrices instead: the
+    // trainer's GEMM has an 8-wide variant; every 16×16 kernel stays off.
+    let want_coop8 = !want_coop
+        && adapter_info.backend == wgpu::Backend::Metal
+        && adapter.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+        && adapter.features().contains(wgpu::Features::SHADER_F16)
+        && coop_env.as_deref() != Some("0")
+        && adapter.cooperative_matrix_properties().iter().any(|c| {
+            c.m_size == 8
+                && c.n_size == 8
+                && c.k_size == 8
+                && c.ab_type == wgpu::CooperativeScalarType::F16
+                && c.cr_type == wgpu::CooperativeScalarType::F32
+        });
+    COOP8_OK.store(want_coop8, std::sync::atomic::Ordering::Relaxed);
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("cortiq-wgpu"),
         required_limits: limits.clone(),
@@ -21040,7 +21082,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
             wgpu::Features::SUBGROUP
         } else {
             wgpu::Features::empty()
-        } | if want_coop {
+        } | if want_coop || want_coop8 {
             wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX
         } else {
             wgpu::Features::empty()
@@ -21061,7 +21103,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         // without it `request_device` fails outright rather than dropping
         // the feature — which is how asking for cooperative matrices took
         // the whole device down and every op with it.
-        experimental_features: if want_coop {
+        experimental_features: if want_coop || want_coop8 {
             unsafe { wgpu::ExperimentalFeatures::enabled() }
         } else {
             wgpu::ExperimentalFeatures::disabled()
@@ -21509,7 +21551,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
     let ts_period = queue.get_timestamp_period();
     if std::env::var("CMF_TS_DEBUG").is_ok() {
         eprintln!(
-            "[ts] базовый={have_basic} точный={have_fine} набор={} период={ts_period}",
+            "[ts] basic={have_basic} fine={have_fine} set={} period={ts_period}",
             ts_query.is_some()
         );
     }
@@ -25333,7 +25375,7 @@ pub fn moe_expert_bufs_requant_gu(
         _ => return None,
     };
     tracing::info!(
-        "DSpark: реквант q4tp→q2tp {} экспертов за {:.1} с ({} МБ на карте)",
+        "DSpark: requantized q4tp→q2tp {} experts in {:.1} s ({} MB on the card)",
         experts.len(),
         t0.elapsed().as_secs_f64(),
         total / (1024 * 1024),
@@ -44640,9 +44682,9 @@ fn note_slot_write(c: &Ctx, kind: &str, key: (u8, u64, usize)) {
     *n += 1;
     assert!(
         *n == 1,
-        "{kind}-слот {key:?} записан {n} раз до одной отправки — \
-         последняя запись достанется ВСЕМ проходам, которые его читают \
-         (столкновение тегов или два слоя на один ключ)",
+        "{kind} slot {key:?} written {n} times before one submit — \
+         the last write reaches EVERY pass that reads it \
+         (a tag collision or two layers on one key)",
     );
 }
 
@@ -46199,9 +46241,16 @@ fn gemm_nn_coop(@builtin(workgroup_id) wid: vec3<u32>,
 /// pick its pipeline, and by the shader-module builder to decide whether
 /// the tensor-core source can be compiled at all.
 static COOP_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Apple's 8×8×8 f16→f32 cooperative matrices (Metal), where 16×16 is absent.
+static COOP8_OK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn coop_matrix_active() -> bool {
     COOP_OK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 8×8 cooperative matrices only (the trainer's Metal GEMM, `zimage::tctx`).
+pub fn coop8_active() -> bool {
+    COOP8_OK.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[inline]
@@ -57492,13 +57541,13 @@ fn dsv4_layer_frame_enc(
     macro_rules! no {
         ($($t:tt)*) => {{
             if std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok() {
-                eprintln!("кадр слоя отклонён: {}", format_args!($($t)*));
+                eprintln!("layer frame declined: {}", format_args!($($t)*));
             }
             return None;
         }};
     }
     let Some(c) = ctx() else {
-        no!("нет контекста wgpu")
+        no!("no wgpu context")
     };
     let _op = c.op_gate.enter();
     // Keys are per (layer, token); the cache lookup below stays per layer.
@@ -57510,10 +57559,10 @@ fn dsv4_layer_frame_enc(
     if qn.is_some_and(|v| v.len() < a.q_lora)
         || (prep.is_none() && (idxs.is_empty() || idxs.len() > 1024))
     {
-        no!("формы: idx {}", idxs.len());
+        no!("shapes: idx {}", idxs.len());
     }
     if w.hc_ffn_fn.len() < mix_hc * hc * dim || w.router.len() < m.hidden {
-        no!("гипер-связи или роутер не той формы");
+        no!("hyper-connections or router of the wrong shape");
     }
 
     // ── weights ──
@@ -57527,13 +57576,13 @@ fn dsv4_layer_frame_enc(
         w.next_wq_a.unwrap_or(w.attn.wq_a),
     ] {
         let Some(e) = model.tensors.get(idx) else {
-            no!("тензора {idx} нет");
+            no!("tensor {idx} missing");
         };
         if e.dtype != cortiq_core::TensorDtype::Q4TiledP {
-            no!("{} не q4tp", e.name);
+            no!("{} is not q4tp", e.name);
         }
         let (Some(abs), plen) = (model.entry_abs_offset(e), e.nbytes as usize) else {
-            no!("{} без смещения", e.name);
+            no!("{} has no offset", e.name);
         };
         let Some(b) = weight_buffer_l(
             c,
@@ -57541,7 +57590,7 @@ fn dsv4_layer_frame_enc(
             &bytes[abs..abs + plen],
             layer_of_name(&model.tensors[idx].name),
         ) else {
-            no!("{} не влез в VRAM", e.name);
+            no!("{} does not fit in VRAM", e.name);
         };
         wb.push(b);
     }
@@ -57556,7 +57605,7 @@ fn dsv4_layer_frame_enc(
             m.gu_q2,
             false,
         ) else {
-            no!("эксперты не влезли в VRAM");
+            no!("the experts do not fit in VRAM");
         };
         Some(v)
     } else {
@@ -57572,7 +57621,7 @@ fn dsv4_layer_frame_enc(
         let map = c.dsv4_kv.lock().unwrap();
         match map.get(&(kv_id, li)) {
             Some((b, _)) => b.clone(),
-            None => no!("кеш ({kv_id}, {li}) не заведён"),
+            None => no!("cache ({kv_id}, {li}) not set up"),
         }
     };
     // The hyper-connection state lives on the card for the whole token; the
@@ -57594,7 +57643,7 @@ fn dsv4_layer_frame_enc(
     // width and the remap stays a dummy.
     let n_route = w.moe.remap.map_or(n_exp, |r| r.len().max(n_exp));
     if w.router.len() < m.hidden * n_route {
-        no!("роутер короче {} × {}", n_route, m.hidden);
+        no!("router shorter than {} × {}", n_route, m.hidden);
     }
     let router = const_buf(c, bytemuck::cast_slice(&w.router[..m.hidden * n_route]));
     let next_nw = const_buf(c, bytemuck::cast_slice(&w.next_norm[..dim]));
@@ -57692,10 +57741,10 @@ fn dsv4_layer_frame_enc(
                 model, p, kv_id, li, &x2, &qnb, &cache, &ixb, a.hd, p.window, dim, a.rd, a.eps, pos,
                 inv_freq, enc,
             ) else {
-                no!("подготовка слоя не собралась");
+                no!("layer preparation failed to build");
             };
             if n == 0 || n > 1024 {
-                no!("список позиций длиной {n}");
+                no!("position list of length {n}");
             }
             n
         }
@@ -58644,7 +58693,7 @@ fn dsv4_chain_batch_bt(
                         .map(|(i, e)| format!("{} {:.2}({})", BT_TS_NAMES[i], e.0 / n_lis, e.1))
                         .collect();
                     eprintln!(
-                        "[bt-ts] на слой ({} слоёв): {}",
+                        "[bt-ts] per layer ({} layers): {}",
                         bt_ts_lis().len(),
                         line.join(" | ")
                     );
@@ -60051,7 +60100,7 @@ pub fn dsv4_spec_replay(
         }};
     }
     let Some(c) = ctx() else {
-        rfail!("нет контекста")
+        rfail!("no context")
     };
     let _op = c.op_gate.enter();
     let retain = frame_buf_t(c, BT_RETAIN, 0, layers.len() * batch * dim * 4, false);
@@ -60087,7 +60136,7 @@ pub fn dsv4_spec_replay(
                 let map = c.dsv4_kv.lock().unwrap();
                 match map.get(&(kv_id, *li)) {
                     Some((b, _)) => b.clone(),
-                    None => rfail!("нет кеша слоя {li}"),
+                    None => rfail!("no cache for layer {li}"),
                 }
             };
             if let Some((cw, cg)) = &p.comp {
@@ -60122,7 +60171,7 @@ pub fn dsv4_spec_replay(
                 let n_ix = p.n_ix + advanced(ig.ratio);
                 let off = p.ix_dst_off + (n_ix - p.n_ix) * ew;
                 let Some(ixkv) = dsv4_index_cache(kv_id, *li, ixg.idim * (n_ix + 2)) else {
-                    rfail!("ix-кеш слоя {li}");
+                    rfail!("ix cache of layer {li}");
                 };
                 if dsv4_compressor_frame(
                     model,
@@ -60165,7 +60214,7 @@ pub fn dsv4_spec_replay(
                 )
                 .is_none()
             {
-                rfail!("окно слоя {li} токена {t}");
+                rfail!("window of layer {li} token {t}");
             }
         }
     }
@@ -60258,13 +60307,13 @@ fn dsv4_layer_frame_bt_enc(
     macro_rules! no {
         ($($t:tt)*) => {{
             if std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok() {
-                eprintln!("пакетный кадр слоя отклонён: {}", format_args!($($t)*));
+                eprintln!("batched layer frame declined: {}", format_args!($($t)*));
             }
             return None;
         }};
     }
     let Some(c) = ctx() else {
-        no!("нет контекста wgpu")
+        no!("no wgpu context")
     };
     let _op = c.op_gate.enter();
     let a = g.attn;
@@ -60272,7 +60321,7 @@ fn dsv4_layer_frame_bt_enc(
     let (hc, dim) = (g.hc, a.dim);
     let mix_hc = (2 + hc) * hc;
     if preps.len() != batch {
-        no!("подготовок {} на пакет {batch}", preps.len());
+        no!("{} preparations for a batch of {batch}", preps.len());
     }
     // The bind-group key: the layer, salted by the batch width so a 3-wide
     // chunk never reuses a 5-wide chunk's groups (their buffers differ by
@@ -60290,13 +60339,13 @@ fn dsv4_layer_frame_bt_enc(
         w.next_wq_a.unwrap_or(w.attn.wq_a),
     ] {
         let Some(e) = model.tensors.get(idx) else {
-            no!("тензора {idx} нет");
+            no!("tensor {idx} missing");
         };
         if e.dtype != cortiq_core::TensorDtype::Q4TiledP {
-            no!("{} не q4tp", e.name);
+            no!("{} is not q4tp", e.name);
         }
         let (Some(abs), plen) = (model.entry_abs_offset(e), e.nbytes as usize) else {
-            no!("{} без смещения", e.name);
+            no!("{} has no offset", e.name);
         };
         let Some(b) = weight_buffer_l(
             c,
@@ -60304,7 +60353,7 @@ fn dsv4_layer_frame_bt_enc(
             &bytes[abs..abs + plen],
             layer_of_name(&model.tensors[idx].name),
         ) else {
-            no!("{} не влез в VRAM", e.name);
+            no!("{} does not fit in VRAM", e.name);
         };
         wb.push(b);
     }
@@ -60318,13 +60367,13 @@ fn dsv4_layer_frame_bt_enc(
         m.gu_q2,
         false,
     ) else {
-        no!("эксперты не влезли в VRAM");
+        no!("the experts do not fit in VRAM");
     };
     let cache = {
         let map = c.dsv4_kv.lock().unwrap();
         match map.get(&(kv_id, li)) {
             Some((b, _)) => b.clone(),
-            None => no!("кеш ({kv_id}, {li}) не заведён"),
+            None => no!("cache ({kv_id}, {li}) not set up"),
         }
     };
 
@@ -60338,7 +60387,7 @@ fn dsv4_layer_frame_bt_enc(
     let n_pack = w.moe.experts.len().saturating_sub(1);
     let n_route = w.moe.remap.map_or(n_pack, |r| r.len().max(n_pack));
     if w.router.len() < m.hidden * n_route {
-        no!("роутер короче {} × {}", n_route, m.hidden);
+        no!("router shorter than {} × {}", n_route, m.hidden);
     }
     let router = const_buf(c, bytemuck::cast_slice(&w.router[..m.hidden * n_route]));
     let next_nw = const_buf(c, bytemuck::cast_slice(&w.next_norm[..dim]));
@@ -60394,10 +60443,10 @@ fn dsv4_layer_frame_bt_enc(
         let map = c.dsv4_kv.lock().unwrap();
         let cap = match map.get(&(kv_id, li)) {
             Some((_, cap)) => *cap,
-            None => no!("кеш ({kv_id}, {li}) не заведён"),
+            None => no!("cache ({kv_id}, {li}) not set up"),
         };
         let Some(e) = model.tensors.get(p0.wkv) else {
-            no!("wkv без записи");
+            no!("wkv without an entry");
         };
         (cap, e.shape[0])
     };
@@ -60416,7 +60465,7 @@ fn dsv4_layer_frame_bt_enc(
         );
         let comp_top = p0.window * a.hd + (p0.n_comp + batch.div_ceil(4).max(1) + 2) * ew_c.max(1);
         if srow0 * a.hd < comp_top {
-            no!("нет места под staging: srow0 {srow0}, comp_top {comp_top}");
+            no!("no room for staging: srow0 {srow0}, comp_top {comp_top}");
         }
     }
 
@@ -60431,7 +60480,7 @@ fn dsv4_layer_frame_bt_enc(
     mark(1);
     // q for the whole batch — touches no cache.
     if !encode_q4tp_mv4_b(c, enc, &wb[1], &qn_bt, &q_bt, a.nh * a.hd, a.q_lora, batch) {
-        no!("q-проекция пакетом не закодировалась");
+        no!("batched q projection failed to encode");
     }
 
     // Compressor streams: the two projections batch over the tokens (they
@@ -60445,7 +60494,7 @@ fn dsv4_layer_frame_bt_enc(
     }
     if let Some((iw, ig, _, ixg0)) = &p0.ix {
         if dsv4_index_cache(kv_id, li, ixg0.idim * (p0.n_ix + batch + 2)).is_none() {
-            no!("ix-кеш слоя {li}");
+            no!("ix cache of layer {li}");
         }
         comp_jobs.push((1, iw.clone(), *ig));
     }
@@ -60468,18 +60517,18 @@ fn dsv4_layer_frame_bt_enc(
             );
             for (wi, out) in [(cw.wkv, &ckv_bt), (cw.wgate, &csc_bt)] {
                 let Some(e) = model.tensors.get(wi) else {
-                    no!("компрессор без тензора")
+                    no!("compressor without a tensor")
                 };
                 let (Some(abs), plen) = (model.entry_abs_offset(e), e.nbytes as usize) else {
-                    no!("компрессор без смещения");
+                    no!("compressor without an offset");
                 };
                 let Some(wbuf) =
                     weight_buffer(c, (model.uid() as usize, wi), &bytes[abs..abs + plen])
                 else {
-                    no!("компрессор не влез");
+                    no!("compressor does not fit");
                 };
                 if !encode_q4tp_mv4_b(c, enc, &wbuf, &x2_bt, out, cg.width, cg.hidden, batch) {
-                    no!("проекция компрессора пакетом");
+                    no!("batched compressor projection");
                 }
             }
             let dst = if *kind == 0 {
@@ -60488,7 +60537,7 @@ fn dsv4_layer_frame_bt_enc(
                 let m2 = c.dsv4_ixkv.lock().unwrap();
                 match m2.get(&(kv_id, li)) {
                     Some((b, _)) => b.clone(),
-                    None => no!("ix-кеш ({kv_id},{li}) не заведён"),
+                    None => no!("ix cache ({kv_id},{li}) not set up"),
                 }
             };
             // Fold-free tokens append in ONE dispatch per segment (their
@@ -60701,17 +60750,17 @@ fn dsv4_layer_frame_bt_enc(
     let kvnorm = frame_buf_t(c, BT_DSPARK_KV, 21, batch * kvw * 4, false);
     if !dsv4_skip("win") {
         let Some(e) = model.tensors.get(p0.wkv) else {
-            no!("wkv без записи");
+            no!("wkv without an entry");
         };
         let (Some(abs), plen) = (model.entry_abs_offset(e), e.nbytes as usize) else {
-            no!("wkv без смещения");
+            no!("wkv without an offset");
         };
         let Some(wkv_w) = weight_buffer(c, (model.uid() as usize, p0.wkv), &bytes[abs..abs + plen])
         else {
-            no!("wkv не влез");
+            no!("wkv does not fit");
         };
         if !encode_q4tp_mv4_b(c, enc, &wkv_w, &x2_bt, &kvfull, kvw, dim, batch) {
-            no!("wkv пакетом не закодировался");
+            no!("batched wkv failed to encode");
         }
         let knw = const_buf(c, bytemuck::cast_slice(&p0.kv_norm[..kvw]));
         let mut pass = begin_pass(enc);
@@ -60813,7 +60862,7 @@ fn dsv4_layer_frame_bt_enc(
         metas_ix[t * 4 + 3] = k_t as u32;
         ms[t] = (old_vis + staged_n + k_t) as u32;
         if ms[t] > 1024 {
-            no!("список токена {t} длиной {}", ms[t]);
+            no!("token {t} list of length {}", ms[t]);
         }
     }
     c.queue
@@ -60829,10 +60878,10 @@ fn dsv4_layer_frame_bt_enc(
         let mut ixb = Vec::with_capacity(2);
         for &idx in &[ixw.wq_b, ixw.weights_proj] {
             let Some(e) = model.tensors.get(idx) else {
-                no!("индексер без тензора")
+                no!("indexer without a tensor")
             };
             let (Some(abs), plen) = (model.entry_abs_offset(e), e.nbytes as usize) else {
-                no!("индексер без смещения");
+                no!("indexer without an offset");
             };
             let Some(b) = weight_buffer_l(
                 c,
@@ -60840,7 +60889,7 @@ fn dsv4_layer_frame_bt_enc(
                 &bytes[abs..abs + plen],
                 layer_of_name(&model.tensors[idx].name),
             ) else {
-                no!("индексер не влез");
+                no!("indexer does not fit");
             };
             ixb.push(b);
         }
@@ -60848,7 +60897,7 @@ fn dsv4_layer_frame_bt_enc(
             let m2 = c.dsv4_ixkv.lock().unwrap();
             match m2.get(&(kv_id, li)) {
                 Some((b, _)) => b.clone(),
-                None => no!("ix-кеш ({kv_id},{li}) не заведён"),
+                None => no!("ix cache ({kv_id},{li}) not set up"),
             }
         };
         let qi_bt = frame_buf_t(c, BT_DSPARK_KV, 22, batch * ixg.ih * ixg.idim * 4, false);
@@ -60866,10 +60915,10 @@ fn dsv4_layer_frame_bt_enc(
             ixg.q_lora,
             batch,
         ) {
-            no!("индексер q пакетом");
+            no!("batched indexer q");
         }
         if !encode_q4tp_mv4_b(c, enc, &ixb[1], &x2_bt, &hw_bt, ixg.ih, ixg.hidden, batch) {
-            no!("индексер веса пакетом");
+            no!("batched indexer weights");
         }
         mark(5);
         let sc_factor = (ixg.idim as f32).powf(-0.5) * (ixg.ih as f32).powf(-0.5);
@@ -61092,7 +61141,7 @@ fn dsv4_layer_frame_bt_enc(
             batch,
         )
     {
-        no!("wo_b пакетом не закодировался");
+        no!("batched wo_b failed to encode");
     }
 
     mark(8);
@@ -61129,10 +61178,10 @@ fn dsv4_layer_frame_bt_enc(
         let mut rows = vec![0u32; batch * m.top_k];
         for (t, r) in forced_rows.unwrap().iter().enumerate() {
             let Some(r) = r else {
-                no!("хэш-слой без строки токена {t}");
+                no!("hash layer without a row for token {t}");
             };
             if r.len() < m.top_k {
-                no!("хэш-строка токена {t} короче top_k");
+                no!("hash row of token {t} shorter than top_k");
             }
             for (i, &e) in r[..m.top_k].iter().enumerate() {
                 rows[t * m.top_k + i] = e as u32;
@@ -61546,7 +61595,7 @@ fn dsv4_layer_frame_bt_enc(
     mark(9);
     if w.hc_next_fn.is_some() && !dsv4_skip("nextq") {
         if !encode_q4tp_mv4_b(c, enc, &wb[4], &x2_bt, &qr_bt, a.q_lora, dim, batch) {
-            no!("next-q пакетом не закодировался");
+            no!("batched next-q failed to encode");
         }
         // One row-per-workgroup dispatch for every token's LoRA norm: the
         // per-token walk tree cost five dependent links; round-off class.
@@ -69417,7 +69466,7 @@ fn ts_pair(c: &Ctx, which: usize) -> Option<wgpu::ComputePassTimestampWrites<'_>
 pub fn dispatch_bench() -> Vec<String> {
     let mut out = Vec::new();
     let Some(c) = ctx() else {
-        out.push("нет устройства".into());
+        out.push("no device".into());
         return out;
     };
     let _op = c.op_gate.enter();
@@ -69444,8 +69493,8 @@ pub fn dispatch_bench() -> Vec<String> {
         })
         .collect();
     for (name, stride) in [
-        ("зависимые (один буфер)", 0usize),
-        ("независимые (8 буферов)", 1),
+        ("dependent (one buffer)", 0usize),
+        ("independent (8 buffers)", 1),
     ] {
         // Warm, then time.
         for round in 0..2 {
@@ -69466,7 +69515,7 @@ pub fn dispatch_bench() -> Vec<String> {
             let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
             if round == 1 {
                 let us = t0.elapsed().as_secs_f64() * 1e6 / N as f64;
-                out.push(format!("{name}: {us:.2} мкс на диспатч"));
+                out.push(format!("{name}: {us:.2} µs per dispatch"));
             }
         }
     }
@@ -70963,14 +71012,14 @@ pub fn dsv4_cache_write(kv_id: u64, li: usize, off: usize, data: &[f32], cap: us
     let dbg = std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok();
     let Some(c) = ctx() else {
         if dbg {
-            eprintln!("кеш dsv4: нет контекста wgpu");
+            eprintln!("dsv4 cache: no wgpu context");
         }
         return false;
     };
     let _op = c.op_gate.enter();
     if off + data.len() > cap {
         if dbg {
-            eprintln!("кеш dsv4: {off}+{} не влезает в {cap}", data.len());
+            eprintln!("dsv4 cache: {off}+{} does not fit in {cap}", data.len());
         }
         return false;
     }
@@ -70978,7 +71027,7 @@ pub fn dsv4_cache_write(kv_id: u64, li: usize, off: usize, data: &[f32], cap: us
     // silently refusing at it reads as "no device" from the caller's side.
     if (cap * 4) as u64 > c.device.limits().max_storage_buffer_binding_size {
         tracing::warn!(
-            "кеш dsv4: {} МБ превышает предел одного буфера {} МБ — слой остаётся на CPU",
+            "dsv4 cache: {} MB exceeds the single-buffer limit of {} MB — the layer stays on the CPU",
             cap * 4 / (1 << 20),
             c.device.limits().max_storage_buffer_binding_size / (1 << 20)
         );
@@ -71300,15 +71349,15 @@ pub fn dsv4_attn_frame(
     // an evening of guessing which guard had fired.
     macro_rules! no {
         ($($t:tt)*) => {{
-            tracing::debug!("кадр dsv4 отклонён: {}", format_args!($($t)*));
+            tracing::debug!("dsv4 frame declined: {}", format_args!($($t)*));
             if std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok() {
-                eprintln!("кадр dsv4 отклонён: {}", format_args!($($t)*));
+                eprintln!("dsv4 frame declined: {}", format_args!($($t)*));
             }
             return false;
         }};
     }
     let Some(c) = ctx() else {
-        no!("нет контекста wgpu")
+        no!("no wgpu context")
     };
     let _op = c.op_gate.enter();
     // `hidden` is only read when the frame has to build the LoRA vector
@@ -71327,7 +71376,7 @@ pub fn dsv4_attn_frame(
         || (g.o_fp8 && (g.nh * g.hd / g.o_groups.max(1)) % 32 != 0)
     {
         no!(
-            "формы: hidden {} dim {} out {} sink {} nh {} q_norm {} q_lora {} idx {} freq {} rd {}",
+            "shapes: hidden {} dim {} out {} sink {} nh {} q_norm {} q_lora {} idx {} freq {} rd {}",
             hidden.len(),
             g.dim,
             out.len(),
@@ -71343,7 +71392,7 @@ pub fn dsv4_attn_frame(
     // Declined before anything is encoded: the caller's host tail then
     // quantizes instead.
     if g.o_fp8 && fp8_act::pipe(c).is_none() {
-        no!("act_quant(o) недоступен на этом устройстве");
+        no!("act_quant(o) is unavailable on this device");
     }
     let bytes = model.primary_bytes();
     // Every weight q4tp, or the frame declines: a mixed layer would need the
@@ -71351,17 +71400,17 @@ pub fn dsv4_attn_frame(
     let mut wb = Vec::with_capacity(4);
     for &idx in &[w.wq_a, w.wq_b, w.wo_a, w.wo_b] {
         let Some(e) = model.tensors.get(idx) else {
-            no!("тензора {idx} нет в каталоге");
+            no!("tensor {idx} missing from the catalog");
         };
         if e.dtype != cortiq_core::TensorDtype::Q4TiledP || e.shape.len() != 2 {
-            no!("{} не q4tp ({:?}, {:?})", e.name, e.dtype, e.shape);
+            no!("{} is not q4tp ({:?}, {:?})", e.name, e.dtype, e.shape);
         }
         let Some(abs) = model.entry_abs_offset(e) else {
-            no!("{} без абсолютного смещения", e.name);
+            no!("{} has no absolute offset", e.name);
         };
         let plen = e.nbytes as usize;
         if abs + plen > bytes.len() {
-            no!("{} выходит за файл", e.name);
+            no!("{} runs past the end of the file", e.name);
         }
         let Some(b) = weight_buffer_l(
             c,
@@ -71369,7 +71418,7 @@ pub fn dsv4_attn_frame(
             &bytes[abs..abs + plen],
             layer_of_name(&model.tensors[idx].name),
         ) else {
-            no!("{} не поместился в бюджет VRAM", e.name);
+            no!("{} does not fit in the VRAM budget", e.name);
         };
         wb.push(b);
     }
@@ -71377,13 +71426,13 @@ pub fn dsv4_attn_frame(
         let map = c.dsv4_kv.lock().unwrap();
         match map.get(&(kv_id, li)) {
             Some((b, _)) => b.clone(),
-            None => no!("кеш ({kv_id}, {li}) не заведён"),
+            None => no!("cache ({kv_id}, {li}) not set up"),
         }
     };
 
     if let Some(v) = qn_in {
         if v.len() < g.q_lora {
-            no!("готовый qn короче q_lora: {} < {}", v.len(), g.q_lora);
+            no!("prepared qn shorter than q_lora: {} < {}", v.len(), g.q_lora);
         }
     }
     // Constants (q_norm, sink, inv_freq) go through the const cache keyed on
@@ -71630,7 +71679,7 @@ pub fn dsv4_attn_frame(
         return true;
     }
     if out.len() < n {
-        no!("отвод {tap} нуждается в {n} значениях, дано {}", out.len());
+        no!("tap {tap} needs {n} values, got {}", out.len());
     }
     let mut sc = c.scratch.lock().unwrap();
     let stage = Scratch::ensure(
@@ -71792,9 +71841,9 @@ pub fn minicpm_tail_prepared_frame(
 ) -> bool {
     macro_rules! no {
         ($($t:tt)*) => {{
-            tracing::debug!("MiniCPM подготовленный MoE-кадр отклонён: {}", format_args!($($t)*));
+            tracing::debug!("MiniCPM prepared MoE frame declined: {}", format_args!($($t)*));
             if std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok() {
-                eprintln!("MiniCPM подготовленный MoE-кадр отклонён: {}", format_args!($($t)*));
+                eprintln!("MiniCPM prepared MoE frame declined: {}", format_args!($($t)*));
             }
             return false;
         }};
@@ -71802,7 +71851,7 @@ pub fn minicpm_tail_prepared_frame(
 
     let t_all = std::time::Instant::now();
     let Some(c) = ctx() else {
-        no!("нет контекста wgpu")
+        no!("no wgpu context")
     };
     let _op = c.op_gate.enter();
     let slots = selected_slots.len();
@@ -71832,7 +71881,7 @@ pub fn minicpm_tail_prepared_frame(
             .any(|(i, slot)| selected_slots[..i].contains(slot))
     {
         no!(
-            "несовместимые prepared shapes: slots={slots} weights={} top_k={} hidden={} inter={}",
+            "incompatible prepared shapes: slots={slots} weights={} top_k={} hidden={} inter={}",
             selected_weights.len(),
             g.top_k,
             g.hidden,
@@ -71847,7 +71896,7 @@ pub fn minicpm_tail_prepared_frame(
         .get(&global.pool_uid)
         .cloned()
     else {
-        no!("глобальный пул модели не найден")
+        no!("model-wide pool not found")
     };
     // The bank's codec has to be exactly the geometry's: a q4tp frame must
     // not address a q2tp bank (or the mxfp4 one, whose gu_q2 is also false
@@ -71859,17 +71908,17 @@ pub fn minicpm_tail_prepared_frame(
             .iter()
             .any(|&slot| slot as usize >= global_bufs.capacity)
     {
-        no!("глобальный пул не соответствует prepared кадру (gu_q2 mismatch)")
+        no!("the model-wide pool does not match the prepared frame (gu_q2 mismatch)")
     }
 
     let Some(mact_bytes) = slots
         .checked_mul(g.inter)
         .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
     else {
-        no!("переполнение prepared activation buffer")
+        no!("prepared activation buffer overflow")
     };
     let Some((p_gu, p_dn)) = dsv4_global_moe_pipelines(c, g.gu_q2, global_bufs.segments) else {
-        no!("глобальный pipeline недоступен")
+        no!("the model-wide pipeline is unavailable")
     };
     // Gate/up stride follows the bank codec (q2tp lanes pack differently
     // from q4tp tiles); down is q4tp in both checked profiles.
@@ -71886,7 +71935,7 @@ pub fn minicpm_tail_prepared_frame(
         stride16(g.inter, g.hidden, g.gu_q2),
         stride16(g.hidden, g.inter, false),
     ) else {
-        no!("prepared stride не вычислен")
+        no!("prepared stride not computed")
     };
 
     // These tags are dedicated to the synchronous MiniCPM tail.  Frame
@@ -72088,26 +72137,26 @@ pub fn dsv4_moe_frame(
 ) -> bool {
     macro_rules! no {
         ($($t:tt)*) => {{
-            tracing::debug!("кадр MoE отклонён: {}", format_args!($($t)*));
+            tracing::debug!("MoE frame declined: {}", format_args!($($t)*));
             if std::env::var("CMF_DSV4_FRAME_DEBUG").is_ok() {
-                eprintln!("кадр MoE отклонён: {}", format_args!($($t)*));
+                eprintln!("MoE frame declined: {}", format_args!($($t)*));
             }
             return false;
         }};
     }
     let t_all = std::time::Instant::now();
     let Some(c) = ctx() else {
-        no!("нет контекста wgpu")
+        no!("no wgpu context")
     };
     let _op = c.op_gate.enter();
     let global_bufs = w
         .global
         .and_then(|gl| c.dsv4_global_moe.lock().unwrap().get(&gl.pool_uid).cloned());
     if w.global.is_some() && global_bufs.is_none() {
-        no!("глобальный пул модели не найден")
+        no!("model-wide pool not found")
     }
     if global_bufs.as_ref().is_some_and(|b| b.gu_q2 != g.gu_q2) {
-        no!("dtype глобального пула не совпадает с gate/up")
+        no!("the model-wide pool dtype differs from gate/up")
     }
     let n_pack = global_bufs
         .as_ref()
@@ -72137,7 +72186,7 @@ pub fn dsv4_moe_frame(
         || g.inter % 32 != 0
     {
         no!(
-            "формы: упаковано {n_pack} логитов {} top_k {} hidden {} inter {}",
+            "shapes: packed {n_pack} logits {} top_k {} hidden {} inter {}",
             w.logits.len(),
             g.top_k,
             g.hidden,
@@ -72148,7 +72197,7 @@ pub fn dsv4_moe_frame(
     let local_bufs = if global_bufs.is_none() {
         let Some(v) = moe_expert_bufs(c, model, w.experts, g.inter, g.hidden, true, g.gu_q2, false)
         else {
-            no!("эксперты не поместились в бюджет VRAM");
+            no!("the experts do not fit in the VRAM budget");
         };
         Some(v)
     } else {
@@ -72231,7 +72280,7 @@ pub fn dsv4_moe_frame(
         | (w.global.map_or(n_pack as u32, |gl| gl.shared_slot) << 8);
     if std::env::var("CMF_DSV4_MOE_CHECK").is_ok() {
         eprintln!(
-            "[маршрут] n_all={n_all} n_pack={n_pack} subset={subset} flags={rflags} \
+            "[route] n_all={n_all} n_pack={n_pack} subset={subset} flags={rflags} \
              remap[0..12]={:?}",
             w.remap.map(|r| &r[..12.min(r.len())])
         );
@@ -72654,7 +72703,7 @@ pub fn dsv4_moe_frame(
                     )
                 })
                 .collect();
-            eprintln!("[победители карты] {picks:?}");
+            eprintln!("[card winners] {picks:?}");
         }
         ok = true;
     }
@@ -72734,7 +72783,7 @@ static TS_LAST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new
 /// for the readback. Labels index `BT_TS_NAMES`.
 static BT_TS_STAGE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 const BT_TS_NAMES: [&str; 16] = [
-    "", "q", "comp", "окно", "ix-mv", "ix-score", "attend", "olora", "glue1", "nextq", "commit",
+    "", "q", "comp", "window", "ix-mv", "ix-score", "attend", "olora", "glue1", "nextq", "commit",
     "route", "gu", "dn", "glue2", "wo_b",
 ];
 
@@ -73459,7 +73508,7 @@ pub fn adapter_report() -> Vec<String> {
                 let i = a.get_info();
                 let l = a.limits();
                 format!(
-                    "[{n}] {:?} | {} | {:?} | буфер до {:.1} ГБ | рабочая группа {}",
+                    "[{n}] {:?} | {} | {:?} | buffer up to {:.1} GB | workgroup {}",
                     i.backend,
                     i.name,
                     i.device_type,
@@ -73469,11 +73518,11 @@ pub fn adapter_report() -> Vec<String> {
             })
             .collect();
     if out.is_empty() {
-        out.push("адаптеров не найдено".into());
+        out.push("no adapters found".into());
     }
     match first {
-        Some(name) => out.push(format!("выбран: {name}")),
-        None => out.push("выбрать не удалось".into()),
+        Some(name) => out.push(format!("selected: {name}")),
+        None => out.push("could not select one".into()),
     }
     out
 }

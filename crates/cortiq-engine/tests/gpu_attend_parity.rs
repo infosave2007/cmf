@@ -14,7 +14,7 @@ fn device_sparse_attend_matches_the_cpu_needs_cmf_gpu() {
             cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());
             return;
         }
-        Some(false) => panic!("wgpu запрошен, но контекст не поднялся"),
+        Some(false) => panic!("wgpu was requested but the context did not come up"),
         Some(true) => {}
     }
     let (nh, hd, npos) = (4usize, 64usize, 37usize);
@@ -50,11 +50,11 @@ fn device_sparse_attend_matches_the_cpu_needs_cmf_gpu() {
     if !cortiq_engine::gpu_wgpu::sparse_attend_for_test(
         &q, &kv, &idxs, &sink, scale, nh, hd, &mut got,
     ) {
-        panic!("устройство не поднялось — тест не проверил ничего");
+        panic!("the device did not come up — the test checked nothing");
     }
     let num: f32 = got.iter().zip(&want).map(|(a, b)| (a - b) * (a - b)).sum();
     let den: f32 = want.iter().map(|a| a * a).sum::<f32>().max(1e-20);
     let rel = (num / den).sqrt();
-    println!("разрежённое внимание: {rel:.3e}");
-    assert!(rel < 1e-5, "устройство разошлось с CPU: {rel:.3e}");
+    println!("sparse attention: {rel:.3e}");
+    assert!(rel < 1e-5, "the device diverged from the CPU: {rel:.3e}");
 }

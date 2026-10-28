@@ -58,7 +58,7 @@ fn device_q4tp_matvec_matches_the_cpu() {
 
         let mut gpu = vec![0.0f32; rows];
         if !cortiq_engine::gpu_wgpu::q4tp_matvec_for_test(&model, idx, &xs, rows, cols, &mut gpu) {
-            eprintln!("устройство отказалось от {} — пропуск", e.name);
+            eprintln!("the device declined {} — skipped", e.name);
             continue;
         }
         let num: f32 = cpu.iter().zip(&gpu).map(|(a, b)| (a - b) * (a - b)).sum();
@@ -67,7 +67,7 @@ fn device_q4tp_matvec_matches_the_cpu() {
         let pnum: f32 = plain.iter().zip(&gpu).map(|(a, b)| (a - b) * (a - b)).sum();
         let pgpu = (pnum / dden).sqrt();
         println!(
-            "{}: [{rows}x{cols}] gpu↔matvec {rel:.3e}  деквант↔matvec {dq:.3e}  деквант↔gpu {pgpu:.3e}",
+            "{}: [{rows}x{cols}] gpu↔matvec {rel:.3e}  dequant↔matvec {dq:.3e}  dequant↔gpu {pgpu:.3e}",
             e.name
         );
         if std::env::var("CMF_Q4TP_SHOW").is_ok() {
@@ -76,7 +76,7 @@ fn device_q4tp_matvec_matches_the_cpu() {
             // want opposite fixes, and the norm alone tells them apart badly.
             for r in 0..4.min(rows) {
                 println!(
-                    "    строка {r}: cpu {:+.6e}  gpu {:+.6e}  отношение {:.6}",
+                    "    row {r}: cpu {:+.6e}  gpu {:+.6e}  ratio {:.6}",
                     cpu[r],
                     gpu[r],
                     gpu[r] / cpu[r]
@@ -88,7 +88,7 @@ fn device_q4tp_matvec_matches_the_cpu() {
         // orders of magnitude bigger, so this still catches what matters.
         assert!(
             rel < 5e-3,
-            "{}: устройство разошлось с CPU на {rel:.3e}",
+            "{}: the device diverged from the CPU by {rel:.3e}",
             e.name
         );
         checked += 1;
@@ -96,5 +96,5 @@ fn device_q4tp_matvec_matches_the_cpu() {
             break;
         }
     }
-    println!("сверено тензоров: {checked}");
+    println!("tensors checked: {checked}");
 }

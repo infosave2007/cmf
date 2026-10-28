@@ -147,20 +147,40 @@ impl Param {
 }
 
 /// A linear layer: binary low-rank (trainable metric), a frozen f16 plane
-/// (teacher), or a small dense f32 matrix (frozen).
+/// (teacher), a small dense f32 matrix (frozen), or a dense matrix trained
+/// in full (healing: f32 master weights with Adam state, the f16 plane and
+/// its transpose refreshed after every step).
 pub enum Lin {
     Blr { blr: Blr, role: &'static str, params: Vec<[Param; 3]> },
     Plane { w: wgpu::Buffer, wt: Option<wgpu::Buffer>, m: usize, k: usize },
     Dense { w: wgpu::Buffer, m: usize, k: usize },
+    Train { p: Param, pl: wgpu::Buffer, plt: wgpu::Buffer, m: usize, k: usize },
+    /// Not on the device: a layer outside the net's range (a healed tail
+    /// fed from cached prefix activations, or a prefix net).
+    Absent { m: usize },
 }
 
 impl Lin {
-    fn m(&self) -> usize {
+    /// Output rows.
+    pub fn m(&self) -> usize {
         match self {
             Lin::Blr { blr, .. } => blr.m,
-            Lin::Plane { m, .. } | Lin::Dense { m, .. } => *m,
+            Lin::Plane { m, .. } | Lin::Dense { m, .. } | Lin::Train { m, .. } | Lin::Absent { m } => *m,
         }
     }
+}
+
+/// Which weights a healing run trains (`Net::load_heal`): every layer from
+/// `train_from` up — its dense linears in full (all of them, or only the
+/// MLP's with `ffn_only`) and its norm gains; the layers below are frozen
+/// and the backward stops at `train_from`.
+#[derive(Clone, Copy, Debug)]
+pub struct HealCfg {
+    pub train_from: usize,
+    pub ffn_only: bool,
+    /// The frozen layers stay off the device: each step starts from their
+    /// output, computed once by a [`Net::load_prefix`] net (`step_wh`).
+    pub prefix_cached: bool,
 }
 
 pub enum Mix {
@@ -175,6 +195,18 @@ pub struct Layer {
     pub gate: Lin,
     pub up: Lin,
     pub down: Lin,
+    /// DTG-MA: a gate on the MLP's intermediate ([`Net::enable_masks`]).
+    pub mask: Option<MaskGate>,
+}
+
+/// A gate per MLP neuron between the SwiGLU and `down_proj`: `h·s` with
+/// `s` set by the caller (σ(m) of the mask logits while training, 0/1 for
+/// the hard mask), and `Σ_tokens dL/d(h·s)·h` — the gradient with respect
+/// to `s` — accumulated on the card.
+pub struct MaskGate {
+    pub s: wgpu::Buffer,
+    pub g: wgpu::Buffer,
+    pub w: usize,
 }
 
 /// Every parameter laid end to end, for the optimizer: one dispatch for all
@@ -198,6 +230,16 @@ struct OptCat {
 
 pub struct Net {
     pub geom: Geom,
+    /// Lowest layer with trainable weights (0 unless healing a tail).
+    pub train_from: usize,
+    /// The layers on the device (`first..end`); the forward starts at
+    /// `first` from given activations when it is not 0 and stops at `end`.
+    pub first: usize,
+    pub end: usize,
+    /// Lowest layer the backward currently reaches (≥ `train_from`): a
+    /// progressive unfreeze widens it epoch by epoch; layers below get no
+    /// gradient, so Adam leaves them untouched.
+    pub active_from: std::sync::atomic::AtomicUsize,
     pub layers: Vec<Layer>,
     pub final_norm: Param,
     pub head: Head,
@@ -206,6 +248,8 @@ pub struct Net {
     /// Sign matrices with training state (ids 0..n_sign_mats).
     pub n_sign_mats: u32,
     opt: std::sync::OnceLock<OptCat>,
+    /// Partial sums of squares of the dense trained weights' gradients.
+    dense_opt: std::sync::OnceLock<wgpu::Buffer>,
 }
 
 fn deq(m: &CmfModel, name: &str) -> Result<(Vec<f32>, Vec<usize>), String> {
@@ -318,12 +362,28 @@ fn load_blr(c: Ctx, bytes: &[u8], role: &'static str, sign: Option<&SignInit>, n
 
 #[allow(clippy::too_many_arguments)]
 fn load_lin(c: Ctx, m: &CmfModel, name: &str, role: &'static str, as_plane: bool, bwd: bool, sign: Option<&SignInit>, next_id: &mut u32) -> Result<Lin, String> {
+    load_lin_t(c, m, name, role, as_plane, bwd, sign, next_id, false)
+}
+
+/// [`load_lin`]; `train`: a dense tensor becomes [`Lin::Train`] when its
+/// shape suits the weight-gradient GEMM (rows and columns multiples of 128),
+/// else it stays frozen.
+#[allow(clippy::too_many_arguments)]
+fn load_lin_t(c: Ctx, m: &CmfModel, name: &str, role: &'static str, as_plane: bool, bwd: bool, sign: Option<&SignInit>, next_id: &mut u32, train: bool) -> Result<Lin, String> {
     let e = m.tensor(name).ok_or_else(|| format!("missing tensor {name}"))?;
     if e.dtype as u8 == 19 {
         return load_blr(c, m.entry_bytes(e), role, sign, next_id);
     }
     let (v, shape) = deq(m, name)?;
     let (rows, cols) = (shape[0], shape[1]);
+    if train && rows % 128 == 0 && cols % 128 == 0 {
+        let pl = f16_plane(c, &v);
+        let plt = f16_plane(c, &transpose(&v, rows, cols));
+        return Ok(Lin::Train { p: Param::new(c, &v, None), pl, plt, m: rows, k: cols });
+    }
+    if train {
+        eprintln!("  note: {name} ({rows}×{cols}) stays frozen: the weight-gradient GEMM takes multiples of 128");
+    }
     if as_plane && rows % 128 == 0 && cols % 32 == 0 {
         let wt = bwd.then(|| f16_plane(c, &transpose(&v, rows, cols)));
         Ok(Lin::Plane { w: f16_plane(c, &v), wt, m: rows, k: cols })
@@ -338,19 +398,62 @@ impl Net {
     /// tensors always load as such).
     /// `sign`: give every binary low-rank path sign latents (sign training).
     pub fn load(c: Ctx, model: &CmfModel, plane: bool, bwd: bool, sign: Option<&SignInit>) -> Result<Self, String> {
-        let geom = Geom::from_model(model)?;
+        Self::load_with(c, model, plane, bwd, sign, None, None)
+    }
+
+    /// Layers `0..upto` only, forward planes: the frozen prefix of a heal,
+    /// whose output ([`prefix_hidden`]) feeds a `prefix_cached` student.
+    pub fn load_prefix(c: Ctx, model: &CmfModel, upto: usize) -> Result<Self, String> {
+        Self::load_with(c, model, true, false, None, None, Some(0..upto))
+    }
+
+    /// A student for healing: dense linears of the layers `heal.train_from..`
+    /// trained in full, everything below frozen without backward planes.
+    pub fn load_heal(c: Ctx, model: &CmfModel, heal: HealCfg) -> Result<Self, String> {
+        let nl = model.arch().num_layers;
+        let range = heal.prefix_cached.then(|| heal.train_from.min(nl)..nl);
+        Self::load_with(c, model, true, true, None, Some(heal), range)
+    }
+
+    fn load_with(c: Ctx, model: &CmfModel, plane: bool, bwd: bool, sign: Option<&SignInit>, heal: Option<HealCfg>, range: Option<std::ops::Range<usize>>) -> Result<Self, String> {
+        let mut geom = Geom::from_model(model)?;
+        let train_from = heal.map_or(0, |h| h.train_from.min(geom.nl));
+        let range = range.unwrap_or(0..geom.nl);
+        let absent = |name: &str| -> Result<Lin, String> {
+            let e = model.tensor(name).ok_or_else(|| format!("missing tensor {name}"))?;
+            Ok(Lin::Absent { m: e.shape[0] })
+        };
         let norm = |name: &str| -> Result<Param, String> { Ok(Param::new(c, &deq(model, name)?.0, None)) };
         let mut layers = Vec::with_capacity(geom.nl);
         let mut next_id = 0u32;
         for li in 0..geom.nl {
             let p = format!("model.layers.{li}.");
-            let mut lin = |n: &str, role: &'static str| load_lin(c, model, &format!("{p}{n}"), role, plane, bwd, sign, &mut next_id);
+            // frozen layers below the trained tail run no backward
+            let bwd = bwd && li >= train_from;
+            let (t_mix, t_ffn) = match heal {
+                Some(h) if li >= train_from => (!h.ffn_only, true),
+                _ => (false, false),
+            };
+            let here = range.contains(&li);
+            let mut lin = |n: &str, role: &'static str| {
+                if !here {
+                    return absent(&format!("{p}{n}"));
+                }
+                let t = if role.starts_with("mlp.") { t_ffn } else { t_mix };
+                load_lin_t(c, model, &format!("{p}{n}"), role, plane, bwd, sign, &mut next_id, t)
+            };
+            let small = |n: &str| -> Result<Lin, String> {
+                if !here {
+                    return absent(&format!("{p}{n}"));
+                }
+                load_lin(c, model, &format!("{p}{n}"), "gdn.ab", false, bwd, None, &mut 0)
+            };
             let mix = if geom.gdn_layer[li] {
                 Mix::Gdn {
                     qkv: lin("linear_attn.in_proj_qkv.weight", "gdn.qkv")?,
                     z: lin("linear_attn.in_proj_z.weight", "gdn.z")?,
-                    a: load_lin(c, model, &format!("{p}linear_attn.in_proj_a.weight"), "gdn.a", false, bwd, None, &mut 0)?,
-                    b: load_lin(c, model, &format!("{p}linear_attn.in_proj_b.weight"), "gdn.b", false, bwd, None, &mut 0)?,
+                    a: small("linear_attn.in_proj_a.weight")?,
+                    b: small("linear_attn.in_proj_b.weight")?,
                     out: lin("linear_attn.out_proj.weight", "gdn.out")?,
                     a_log: deq(model, &format!("{p}linear_attn.A_log"))?.0,
                     dt_bias: deq(model, &format!("{p}linear_attn.dt_bias"))?.0,
@@ -374,6 +477,7 @@ impl Net {
                 gate: lin("mlp.gate_proj.weight", "mlp.gate")?,
                 up: lin("mlp.up_proj.weight", "mlp.up")?,
                 down: lin("mlp.down_proj.weight", "mlp.down")?,
+                mask: None,
             });
             // Every upload is a queue write staged until the next submission;
             // a 27B teacher's ~49 GB of f16 planes would otherwise sit in
@@ -381,6 +485,8 @@ impl Net {
             c.queue.submit(std::iter::empty());
             let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
         }
+        // per-layer MLP widths (a pruned model): the workspace takes the widest
+        geom.inter = layers.iter().map(|l| l.gate.m()).max().unwrap_or(geom.inter);
         let final_norm = norm("model.norm.weight")?;
         let (emb, eshape) = deq(model, "model.embed_tokens.weight")?;
         let head_w = if model.tensor("lm_head.weight").is_some() { deq(model, "lm_head.weight")?.0 } else { emb.clone() };
@@ -389,7 +495,20 @@ impl Net {
         // vocabulary slices keep each plane within one storage binding.
         let head = Head::new(c, &head_w, v, hs, bwd, None);
         let embed = emb.iter().map(|&f| f32_to_f16(f)).collect();
-        Ok(Net { geom, layers, final_norm, head, embed, n_sign_mats: next_id, opt: std::sync::OnceLock::new() })
+        Ok(Net {
+            geom,
+            train_from,
+            first: range.start,
+            end: range.end,
+            active_from: std::sync::atomic::AtomicUsize::new(train_from),
+            layers,
+            final_norm,
+            head,
+            embed,
+            n_sign_mats: next_id,
+            opt: std::sync::OnceLock::new(),
+            dense_opt: std::sync::OnceLock::new(),
+        })
     }
 
     /// Every binary low-rank linear with its tensor name, in a fixed order
@@ -437,7 +556,7 @@ impl Net {
             }
         }
         let mut v: Vec<&Param> = vec![&self.final_norm];
-        for l in &self.layers {
+        for l in &self.layers[self.train_from..] {
             v.push(&l.ln1);
             v.push(&l.ln2);
             match &l.mix {
@@ -460,6 +579,67 @@ impl Net {
             push_lin(&l.down, &mut v);
         }
         v
+    }
+
+    /// DTG-MA: put a gate (all open) on every on-device layer's MLP
+    /// intermediate. The backward must reach the layers (a net loaded with
+    /// `bwd`); the weights stay as they are.
+    pub fn enable_masks(&mut self, c: Ctx) {
+        for ly in &mut self.layers[self.first..self.end] {
+            let w = ly.gate.m();
+            ly.mask = Some(MaskGate { s: to::upload(c, &vec![1.0; w]), g: to::zeros(c, w), w });
+        }
+    }
+
+    /// Set every gate (`s[l]` for layer `first + l`, its MLP width long).
+    pub fn set_masks(&self, c: Ctx, s: &[Vec<f32>]) -> Option<()> {
+        for (ly, v) in self.layers[self.first..self.end].iter().zip(s) {
+            let mg = ly.mask.as_ref()?;
+            if v.len() != mg.w {
+                return None;
+            }
+            c.queue.write_buffer(&mg.s, 0, bytemuck::cast_slice(v));
+        }
+        Some(())
+    }
+
+    /// The gates' accumulated gradients `dL/ds`, read and cleared.
+    pub fn mask_grads(&self, c: Ctx) -> Option<Vec<Vec<f32>>> {
+        let mut out = Vec::new();
+        for ly in &self.layers[self.first..self.end] {
+            let mg = ly.mask.as_ref()?;
+            out.push(to::download(c, &mg.g, mg.w)?);
+            zero(c, &mg.g, mg.w);
+        }
+        Some(out)
+    }
+
+    /// Every linear trained in full ([`Lin::Train`]) with its tensor name.
+    pub fn dense_lins(&self) -> Vec<(String, &Lin)> {
+        let mut v: Vec<(String, &Lin)> = Vec::new();
+        for (li, ly) in self.layers.iter().enumerate() {
+            let mut list: Vec<(&str, &Lin)> = match &ly.mix {
+                Mix::Gdn { qkv, z, out, .. } => vec![("linear_attn.in_proj_qkv.weight", qkv), ("linear_attn.in_proj_z.weight", z), ("linear_attn.out_proj.weight", out)],
+                Mix::Attn { q, k, v: vv, o, .. } => vec![("self_attn.q_proj.weight", q), ("self_attn.k_proj.weight", k), ("self_attn.v_proj.weight", vv), ("self_attn.o_proj.weight", o)],
+            };
+            list.extend([("mlp.gate_proj.weight", &ly.gate), ("mlp.up_proj.weight", &ly.up), ("mlp.down_proj.weight", &ly.down)]);
+            for (n, l) in list {
+                if matches!(l, Lin::Train { .. }) {
+                    v.push((format!("model.layers.{li}.{n}"), l));
+                }
+            }
+        }
+        v
+    }
+
+    /// The parameters of [`Net::dense_lins`], in that order.
+    pub fn dense_params(&self) -> Vec<&Param> {
+        self.dense_lins().into_iter().filter_map(|(_, l)| if let Lin::Train { p, .. } = l { Some(p) } else { None }).collect()
+    }
+
+    /// Entries trained: the parameters plus the dense weights.
+    pub fn trained_entries(&self) -> usize {
+        self.params().iter().map(|p| p.n).sum::<usize>() + self.dense_params().iter().map(|p| p.n).sum::<usize>()
     }
 }
 
@@ -493,6 +673,10 @@ pub struct Work {
     /// `stage_small` columns.
     stage: Vec<wgpu::Buffer>,
     stage_small: usize,
+    /// Transposed f16 staging of a trained linear's input and output
+    /// gradient (`[rows][tokens]`), the operands of its weight gradient.
+    xt16: Option<wgpu::Buffer>,
+    dyt16: Option<wgpu::Buffer>,
 }
 
 impl Work {
@@ -635,6 +819,16 @@ impl Work {
                 [wide, wide, g.hs, g.hs].iter().map(|&n| tm::f16_buf(c, pr * n.max(1))).collect()
             },
             stage_small: g.hs,
+            xt16: {
+                let kp = ntok.div_ceil(32) * 32;
+                let mx = net.dense_lins().iter().map(|(_, l)| if let Lin::Train { k, .. } = l { tm::pad_rows(*k) } else { 0 }).max().unwrap_or(0);
+                (mx > 0).then(|| tm::f16_buf(c, mx * kp))
+            },
+            dyt16: {
+                let kp = ntok.div_ceil(32) * 32;
+                let mx = net.dense_lins().iter().map(|(_, l)| if let Lin::Train { m, .. } = l { tm::pad_rows(*m) } else { 0 }).max().unwrap_or(0);
+                (mx > 0).then(|| tm::f16_buf(c, mx * kp))
+            },
         }
     }
     fn get(&self, n: &str) -> &wgpu::Buffer {
@@ -653,7 +847,7 @@ fn lin_fwd(c: Ctx, w: &Work, lin: &Lin, x: &wgpu::Buffer, y: &wgpu::Buffer, acc:
             }
             tm::blr_forward(c, blr, &w.blr[role], x, y, ntok)
         }
-        Lin::Plane { w: pl, m, k, .. } => {
+        Lin::Plane { w: pl, m, k, .. } | Lin::Train { pl, m, k, .. } => {
             if acc {
                 return None;
             }
@@ -663,6 +857,7 @@ fn lin_fwd(c: Ctx, w: &Work, lin: &Lin, x: &wgpu::Buffer, y: &wgpu::Buffer, acc:
             tm::run(c, &[Op::D(tm::dense_fwd(c, x, dw, y, ntok, *k, *m, acc)?)]);
             Some(())
         }
+        Lin::Absent { .. } => None,
     }
 }
 
@@ -758,6 +953,17 @@ fn lin_bwd(c: Ctx, w: &Work, lin: &Lin, x: &wgpu::Buffer, dy: &wgpu::Buffer, dx:
             tm::run(c, &[Op::D(tm::dense_bwd(c, dy, dw, dx, ntok, *k, *m)?)]);
             Some(())
         }
+        Lin::Train { p, plt, m, k, .. } => {
+            let target = if acc { w.get("tmp_h") } else { dx };
+            tm::plane_linear(c, plt, dy, &w.act16, target, ntok, *k, *m, gscale)?;
+            if acc {
+                tm::run(c, &[Op::D(to::elt(c, "add", ntok * k, dx, target, Some(dx), None, None, None)?)]);
+            }
+            // dW[m][k] = dyᵀ·x over the tokens: both staged transposed in
+            // f16 (dy at the gradient scale), the token axis as the GEMM's K
+            tm::weight_grad(c, x, dy, w.xt16.as_ref()?, w.dyt16.as_ref()?, &p.g, ntok, *m, *k, gscale)
+        }
+        Lin::Absent { .. } => None,
     }
 }
 
@@ -850,7 +1056,11 @@ fn layer_fwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, y: &wgpu::
         to::rms_fwd(c, w.get("x2"), &ly.ln2.w, w.get("n2"), w.get("inv2"), n, g.hs, g.eps, g.gemma)?,
     ]);
     lin_fwd_shared(c, w, &[(&ly.gate, w.get("gg")), (&ly.up, w.get("uu"))], w.get("n2"))?;
-    to::run(c, &[to::elt(c, "swiglu_fwd", n * g.inter, w.get("gg"), w.get("uu"), Some(w.get("hh")), None, None, None)?]);
+    let act = match &ly.mask {
+        Some(mg) => to::swiglu_cols(c, n * mg.w, w.get("gg"), w.get("uu"), w.get("hh"), &mg.s, mg.w)?,
+        None => to::elt(c, "swiglu_fwd", n * ly.gate.m(), w.get("gg"), w.get("uu"), Some(w.get("hh")), None, None, None)?,
+    };
+    to::run(c, &[act]);
     lin_fwd_shared(c, w, &[(&ly.down, w.get("mix"))], w.get("hh"))?;
     to::run(c, &[to::elt(c, "add", n * g.hs, w.get("x2"), w.get("mix"), Some(y), None, None, None)?]);
     Some(())
@@ -865,7 +1075,20 @@ fn layer_bwd(c: Ctx, net: &Net, w: &Work, l: usize, x: &wgpu::Buffer, dy: &wgpu:
     let n = w.ntok;
     // MLP: y = x2 + down(swiglu(gate(n2), up(n2)))
     lin_bwd(c, w, &ly.down, w.get("hh"), dy, w.get("dhh"), false, gs, sg)?;
-    to::run(c, &[to::elt(c, "swiglu_bwd", n * g.inter, w.get("gg"), w.get("uu"), None, Some(w.get("dhh")), Some(w.get("dgg")), Some(w.get("duu")))?]);
+    match &ly.mask {
+        Some(mg) => {
+            // the gate's gradient Σ_tokens dhh·h, h the ungated SwiGLU
+            // (recomputed into dgg, which the SwiGLU backward then overwrites)
+            let [p1, p2] = tm::colsum(c, w.get("dhh"), tm::ColTerm::Prod(w.get("dgg")), &mg.g, n, mg.w, true)?;
+            to::run(c, &[
+                to::elt(c, "swiglu_fwd", n * mg.w, w.get("gg"), w.get("uu"), Some(w.get("dgg")), None, None, None)?,
+                p1,
+                p2,
+                to::swiglu_cols_bwd(c, n * mg.w, w.get("gg"), w.get("uu"), &mg.s, w.get("dhh"), w.get("dgg"), w.get("duu"), mg.w)?,
+            ]);
+        }
+        None => to::run(c, &[to::elt(c, "swiglu_bwd", n * ly.gate.m(), w.get("gg"), w.get("uu"), None, Some(w.get("dhh")), Some(w.get("dgg")), Some(w.get("duu")))?]),
+    }
     lin_bwd(c, w, &ly.gate, w.get("n2"), w.get("dgg"), w.get("dn2"), false, gs, sg)?;
     lin_bwd(c, w, &ly.up, w.get("n2"), w.get("duu"), w.get("dn2"), true, gs, sg)?;
     let [dw1, dw2] = to::rms_dw(c, w.get("x2"), w.get("inv2"), w.get("dn2"), &ly.ln2.g, n, g.hs)?;
@@ -987,14 +1210,55 @@ fn embed(c: Ctx, net: &Net, w: &Work, ids: &[u32]) {
 /// Forward of all layers from the embedded `ids` (checkpoints filled);
 /// returns the final-normed hidden in `w.b["n1"]`.
 fn forward(c: Ctx, net: &Net, w: &Work, ids: &[u32]) -> Option<()> {
-    embed(c, net, w, ids);
-    for l in 0..net.geom.nl {
+    forward_in(c, net, w, ids, None)
+}
+
+/// [`forward`] over the net's layers: from the embedding, or — for a net
+/// starting past layer 0 — from `h0` (`[ntok][hs]`, the prefix's output);
+/// the final norm only when the net runs to the last layer.
+fn forward_in(c: Ctx, net: &Net, w: &Work, ids: &[u32], h0: Option<&[f32]>) -> Option<()> {
+    if net.first == 0 {
+        embed(c, net, w, ids);
+    } else {
+        let h = h0?;
+        if h.len() != w.ntok * net.geom.hs {
+            return None;
+        }
+        c.queue.write_buffer(&w.ckpt[net.first], 0, bytemuck::cast_slice(h));
+    }
+    for l in net.first..net.end {
         let _p = prof::phase(if net.geom.gdn_layer[l] { "fwd.gdn" } else { "fwd.attn" });
         layer_fwd(c, net, w, l, &w.ckpt[l], &w.ckpt[l + 1], false)?;
     }
     let g = &net.geom;
+    if net.end < g.nl {
+        return Some(());
+    }
     let _p = prof::phase("fwd.final_norm");
     to::run(c, &[to::rms_fwd(c, &w.ckpt[g.nl], &net.final_norm.w, w.get("n1"), w.get("invf"), w.ntok, g.hs, g.eps, g.gemma)?]);
+    Some(())
+}
+
+/// The output of a [`Net::load_prefix`] net for `ids` (`[ntok][hs]`).
+pub fn prefix_hidden(c: Ctx, net: &Net, w: &Work, ids: &[u32]) -> Option<Vec<f32>> {
+    forward_in(c, net, w, ids, None)?;
+    to::download(c, &w.ckpt[net.end], w.ntok * net.geom.hs)
+}
+
+/// Forward of `ids` (`[nb·t]`, the first `ntok` real: padding rows after
+/// them contribute nothing) up to the last layer of `grams`, adding each
+/// listed layer's MLP down-projection input Gram `Σ_t h_t·h_tᵀ` into its
+/// f32 `[w][w]` accumulator (`xt`: f16 staging of `[pad_rows(w)][ceil32(nb·t)]`,
+/// `tmp`: f32 `[w][w]` for the widest layer).
+pub fn capture_grams(c: Ctx, net: &Net, w: &Work, ids: &[u32], ntok: usize, grams: &[(usize, &wgpu::Buffer)], xt: &wgpu::Buffer, tmp: &wgpu::Buffer) -> Option<()> {
+    let upto = grams.iter().map(|g| g.0).max()?;
+    embed(c, net, w, ids);
+    for l in 0..=upto {
+        layer_fwd(c, net, w, l, &w.ckpt[l], &w.ckpt[l + 1], false)?;
+        if let Some((_, acc)) = grams.iter().find(|g| g.0 == l) {
+            tm::gram_acc(c, w.get("hh"), xt, acc, tmp, ntok, net.layers[l].gate.m())?;
+        }
+    }
     Some(())
 }
 
@@ -1027,6 +1291,20 @@ pub struct StepStats {
 /// non-finite loss then skips the backward (no sign update runs).
 #[allow(clippy::too_many_arguments)]
 pub fn step(c: Ctx, net: &Net, w: &Work, ids: &[u32], tid: &[u32], tp: &[f32], k: usize, gscale: f32, sign: Option<&SignStepCfg>) -> Option<StepStats> {
+    step_w(c, net, w, ids, tid, tp, k, gscale, sign, None)
+}
+
+/// [`step`] with per-token weights carried by the teacher rows: `total` =
+/// Some(Σ weights) means a row's teacher probabilities sum to its weight
+/// (0 = the row is not scored) and the loss is Σ_rows w·KL / total.
+#[allow(clippy::too_many_arguments)]
+pub fn step_w(c: Ctx, net: &Net, w: &Work, ids: &[u32], tid: &[u32], tp: &[f32], k: usize, gscale: f32, sign: Option<&SignStepCfg>, total: Option<f64>) -> Option<StepStats> {
+    step_wh(c, net, w, ids, None, tid, tp, k, gscale, sign, total)
+}
+
+/// [`step_w`] for a net that starts past layer 0: `h0` is its input.
+#[allow(clippy::too_many_arguments)]
+pub fn step_wh(c: Ctx, net: &Net, w: &Work, ids: &[u32], h0: Option<&[f32]>, tid: &[u32], tp: &[f32], k: usize, gscale: f32, sign: Option<&SignStepCfg>, total: Option<f64>) -> Option<StepStats> {
     let g = &net.geom;
     let n = w.ntok;
     prof::step_begin();
@@ -1035,14 +1313,15 @@ pub fn step(c: Ctx, net: &Net, w: &Work, ids: &[u32], tid: &[u32], tp: &[f32], k
         let _p = prof::phase("counters");
         ts::reset_counters(c, sc);
     }
-    forward(c, net, w, ids)?;
+    forward_in(c, net, w, ids, h0)?;
     let ph = prof::phase("head");
     let btid = to::zeros(c, n * k);
     prof::count(prof::Cnt::Write, 1);
     prof::count(prof::Cnt::WriteBytes, (tid.len() * 4) as u64);
     c.queue.write_buffer(&btid, 0, bytemuck::cast_slice(tid));
     let btp = to::upload(c, tp);
-    th::head_kl(c, &net.head, &w.head, w.get("n1"), &btid, &btp, k, w.get("dn1"), w.get("loss"), n, n, gscale)?;
+    let norm = total.map_or(n as f64, |t| t.max(1e-9));
+    th::head_kl_w(c, &net.head, &w.head, w.get("n1"), &btid, &btp, k, w.get("dn1"), w.get("loss"), n, norm as f32, gscale, total.is_some())?;
     // The backward is queued without reading the loss back (that drain left
     // the card idle): with sign training the card itself turns every
     // sign-state write off when a loss is not finite, which is what skipping
@@ -1060,7 +1339,8 @@ pub fn step(c: Ctx, net: &Net, w: &Work, ids: &[u32], tid: &[u32], tp: &[f32], k
     drop(ph);
     let mut cur = da;
     let mut nxt = db;
-    for l in (0..g.nl).rev() {
+    let lowest = net.train_from.max(net.active_from.load(std::sync::atomic::Ordering::Relaxed));
+    for l in (lowest..g.nl).rev() {
         let gdn = g.gdn_layer[l];
         let ph = prof::phase(if gdn { "recomp.gdn" } else { "recomp.attn" });
         layer_fwd(c, net, w, l, &w.ckpt[l], w.get("x"), true)?;
@@ -1081,7 +1361,7 @@ pub fn step(c: Ctx, net: &Net, w: &Work, ids: &[u32], tid: &[u32], tp: &[f32], k
         st.saturated = cnt[ts::CNT_SATURATED] as u64;
         st.clamped = cnt[ts::CNT_CLAMPED] as u64;
     }
-    st.loss = to::download(c, w.get("loss"), n)?.iter().map(|&x| x as f64).sum::<f64>() / n as f64;
+    st.loss = to::download(c, w.get("loss"), n)?.iter().map(|&x| x as f64).sum::<f64>() / norm;
     st.finite = st.loss.is_finite();
     if sign.is_some() && !st.finite {
         // the sign updates were skipped on the card: report the step as one
@@ -1214,7 +1494,33 @@ pub fn grad_norm(c: Ctx, net: &Net) -> Option<f64> {
     for i in 0..ps.len() {
         s += part[64 * i..64 * (i + 1)].iter().map(|&x| x as f64).sum::<f64>();
     }
-    Some(s.sqrt())
+    Some((s + dense_sumsq(c, net)?).sqrt())
+}
+
+/// Σ g² over the dense trained weights (0 without any): 64 partial sums per
+/// weight, one read-back for all of them.
+fn dense_sumsq(c: Ctx, net: &Net) -> Option<f64> {
+    let dp = net.dense_params();
+    if dp.is_empty() {
+        return Some(0.0);
+    }
+    let part = net.dense_opt.get_or_init(|| to::zeros(c, 64 * dp.len()));
+    let slot = to::zeros(c, 64);
+    let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("dense_norm") });
+    for (i, p) in dp.iter().enumerate() {
+        tm::record(c, &mut enc, &[Op::D(tm::sumsq_part(c, &p.g, p.n, &slot)?)]);
+        enc.copy_buffer_to_buffer(&slot, 0, part, (i * 64 * 4) as u64, 64 * 4);
+    }
+    crate::gpu_wgpu::submit_pub(c, enc.finish());
+    Some(to::download(c, part, 64 * dp.len())?.iter().map(|&x| x as f64).sum())
+}
+
+/// Refresh a trained linear's f16 plane and its transpose from the f32 weights.
+fn refresh_planes(c: Ctx, lin: &Lin) -> Option<()> {
+    if let Lin::Train { p, pl, plt, m, k } = lin {
+        tm::run(c, &[Op::D(tm::cvt(c, &p.w, None, pl, *m, *k, 1.0)?), Op::D(tm::cvt_t(c, &p.w, None, plt, *m, *k, 1.0)?)]);
+    }
+    Some(())
 }
 
 /// Clear every gradient (a skipped step).
@@ -1223,7 +1529,7 @@ pub fn zero_grads(c: Ctx, net: &Net) {
     if let Some(oc) = net.opt.get() {
         oc.g_fresh.store(false, std::sync::atomic::Ordering::Relaxed);
     }
-    for p in net.params() {
+    for p in net.params().into_iter().chain(net.dense_params()) {
         zero(c, &p.g, p.n);
     }
 }
@@ -1232,6 +1538,13 @@ pub fn zero_grads(c: Ctx, net: &Net) {
 /// multiplied by `gmul` (clipping); clears the grads.
 #[allow(clippy::too_many_arguments)]
 pub fn adam(c: Ctx, net: &Net, lr: f32, step_no: u32, b1: f32, b2: f32, eps: f32, gmul: f32) -> Option<()> {
+    adam_scaled(c, net, lr, step_no, b1, b2, eps, gmul, None)
+}
+
+/// [`adam`] with the dense trained weights' rate scaled per layer
+/// (`layer_scale(l)`, e.g. a decay away from the lowest active layer).
+#[allow(clippy::too_many_arguments)]
+pub fn adam_scaled(c: Ctx, net: &Net, lr: f32, step_no: u32, b1: f32, b2: f32, eps: f32, gmul: f32, layer_scale: Option<&dyn Fn(usize) -> f32>) -> Option<()> {
     let _p = prof::phase("opt.adam");
     let oc = opt_cat(c, net);
     let ps = net.params();
@@ -1258,6 +1571,17 @@ pub fn adam(c: Ctx, net: &Net, lr: f32, step_no: u32, b1: f32, b2: f32, eps: f32
     }
     prof::enc_mark(c, &mut enc, &mut mk, "copy");
     crate::gpu_wgpu::submit_pub(c, enc.finish());
+    // dense trained weights: plain Adam each, then their f16 planes
+    for (name, lin) in net.dense_lins() {
+        let Lin::Train { p, .. } = lin else { continue };
+        let scale = match layer_scale {
+            Some(f) => name.strip_prefix("model.layers.").and_then(|t| t.split('.').next()).and_then(|v| v.parse().ok()).map_or(1.0, f),
+            None => 1.0,
+        };
+        tm::run(c, &[Op::D(tm::adam(c, &p.w, &p.g, &p.m1, &p.m2, None, p.n, lr * scale, step_no, b1, b2, eps, gmul, 0.0)?)]);
+        refresh_planes(c, lin)?;
+        zero(c, &p.g, p.n);
+    }
     Some(())
 }
 
@@ -1284,20 +1608,23 @@ fn bitmaps(net: &Net) -> Vec<(&wgpu::Buffer, usize)> {
 
 /// `with_bits`: also copy the sign bitmaps (sign training).
 pub fn snapshot(c: Ctx, net: &Net, with_bits: bool) -> Option<Snap> {
-    let params = net.params().iter().map(|p| to::download(c, &p.w, p.n)).collect::<Option<Vec<_>>>()?;
+    let params = net.params().into_iter().chain(net.dense_params()).map(|p| to::download(c, &p.w, p.n)).collect::<Option<Vec<_>>>()?;
     let bits = if with_bits { bitmaps(net).iter().map(|(b, n)| to::download_u32(c, b, *n)).collect::<Option<Vec<_>>>()? } else { Vec::new() };
     Some(Snap { params, bits })
 }
 
 /// Restore a [`snapshot`].
 pub fn restore(c: Ctx, net: &Net, snap: &Snap) {
-    for (p, v) in net.params().iter().zip(&snap.params) {
+    for (p, v) in net.params().into_iter().chain(net.dense_params()).zip(&snap.params) {
         c.queue.write_buffer(&p.w, 0, bytemuck::cast_slice(v));
     }
     for ((b, _), v) in bitmaps(net).iter().zip(&snap.bits) {
         c.queue.write_buffer(b, 0, bytemuck::cast_slice(v));
     }
     c.queue.submit(std::iter::empty());
+    for (_, lin) in net.dense_lins() {
+        refresh_planes(c, lin);
+    }
 }
 
 /// Copy the trained metric and the sign bits of every binary low-rank tensor
@@ -1326,6 +1653,17 @@ pub fn export(c: Ctx, net: &Net, model: &CmfModel) -> Result<Vec<(String, Vec<u8
             norm(format!("{p}self_attn.q_norm.weight"), qn)?;
             norm(format!("{p}self_attn.k_norm.weight"), kn)?;
         }
+    }
+    for (name, lin) in net.dense_lins() {
+        let Lin::Train { p, .. } = lin else { continue };
+        let v = to::download(c, &p.w, p.n).ok_or("download")?;
+        let e = model.tensor(&name).ok_or_else(|| format!("missing {name}"))?;
+        let bytes = match e.dtype as u8 {
+            1 => to_bytes_f16(&v),
+            0 => v.iter().flat_map(|f| f.to_le_bytes()).collect(),
+            other => return Err(format!("{name}: dtype {other} not writable (heal an f16 or f32 student)")),
+        };
+        out.push((name, bytes));
     }
     for (name, lin) in net.blr_lins() {
         let Lin::Blr { blr, params, .. } = lin else { continue };
@@ -1400,7 +1738,7 @@ fn v_bits_to_file(bv: &[u32], n: usize, r: usize, wpr: usize, out: &mut [u8]) {
 /// latents, moments, factored statistics and starting bits.
 fn state_bufs(net: &Net) -> Vec<(&wgpu::Buffer, usize)> {
     let mut v = Vec::new();
-    for p in net.params() {
+    for p in net.params().into_iter().chain(net.dense_params()) {
         v.push((&p.w, p.n));
         v.push((&p.m1, p.n));
         v.push((&p.m2, p.n));
@@ -1497,6 +1835,9 @@ pub fn load_state(c: Ctx, net: &Net, path: &std::path::Path) -> Result<(), Strin
     })?;
     c.queue.submit(std::iter::empty());
     let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+    for (_, lin) in net.dense_lins() {
+        refresh_planes(c, lin).ok_or("plane refresh")?;
+    }
     Ok(())
 }
 
@@ -1524,13 +1865,25 @@ pub fn load_snap(like: &Snap, path: &std::path::Path) -> Result<Snap, String> {
 
 /// Mean KL of `ids` against the teacher top-k (forward only).
 pub fn loss_only(c: Ctx, net: &Net, w: &Work, ids: &[u32], tid: &[u32], tp: &[f32], k: usize) -> Option<f64> {
+    Some(loss_sum(c, net, w, ids, tid, tp, k, false)? / w.ntok as f64)
+}
+
+/// Σ_rows of the (weighted, see [`step_w`]) KL of `ids` (forward only).
+#[allow(clippy::too_many_arguments)]
+pub fn loss_sum(c: Ctx, net: &Net, w: &Work, ids: &[u32], tid: &[u32], tp: &[f32], k: usize, weighted: bool) -> Option<f64> {
+    loss_sum_h(c, net, w, ids, None, tid, tp, k, weighted)
+}
+
+/// [`loss_sum`] for a net that starts past layer 0 (`h0` its input).
+#[allow(clippy::too_many_arguments)]
+pub fn loss_sum_h(c: Ctx, net: &Net, w: &Work, ids: &[u32], h0: Option<&[f32]>, tid: &[u32], tp: &[f32], k: usize, weighted: bool) -> Option<f64> {
     let n = w.ntok;
-    forward(c, net, w, ids)?;
+    forward_in(c, net, w, ids, h0)?;
     let btid = to::zeros(c, n * k);
     c.queue.write_buffer(&btid, 0, bytemuck::cast_slice(tid));
     let btp = to::upload(c, tp);
-    th::head_kl(c, &net.head, &w.head, w.get("n1"), &btid, &btp, k, w.get("dn1"), w.get("loss"), n, n, 1024.0)?;
-    Some(to::download(c, w.get("loss"), n)?.iter().map(|&x| x as f64).sum::<f64>() / n as f64)
+    th::head_kl_w(c, &net.head, &w.head, w.get("n1"), &btid, &btp, k, w.get("dn1"), w.get("loss"), n, n as f32, 1024.0, weighted)?;
+    Some(to::download(c, w.get("loss"), n)?.iter().map(|&x| x as f64).sum::<f64>())
 }
 
 #[cfg(test)]
@@ -1585,6 +1938,208 @@ mod tests {
                 eprintln!("{name}[{j}]: analytic {:.5e}  fd(2%) {:.5e}  fd(8%) {:.5e}", grad[j], fds[0], fds[1]);
             }
         }
+    }
+
+    /// Healing a tail: the analytic gradient of the trained dense weights
+    /// (every trained linear of the last two layers, rows half weighted out)
+    /// against the central difference of the weighted loss along that
+    /// gradient: d/dε L(W + ε·ĝ) = |g|. The student is the teacher with its
+    /// last MLP down projection scaled by 1.05 (`CMF_TRAIN_TEST_MODEL`).
+    #[test]
+    #[ignore]
+    fn heal_dense_gradient_check() {
+        let Ok(path) = std::env::var("CMF_TRAIN_TEST_MODEL") else { return };
+        let Some(c) = to::dev() else { return };
+        let model = CmfModel::open_sharded(&path).expect("model");
+        let teacher = Net::load(c, &model, true, false, None).expect("teacher");
+        let nl = teacher.geom.nl;
+        let student = Net::load_heal(c, &model, HealCfg { train_from: nl - 2, ffn_only: false, prefix_cached: false }).expect("student");
+        assert!(student.dense_lins().len() >= 6, "trained linears: {}", student.dense_lins().len());
+        let (nb, t, k) = (2usize, 64usize, 32usize);
+        let w = Work::new(c, &student, nb, t);
+        let tw = Work::new(c, &teacher, nb, t);
+        let vocab = teacher.geom.vocab as u64;
+        let ids: Vec<u32> = (0..(nb * t) as u64).map(|i| ((i * 7919 + 13) % vocab.min(30000)) as u32).collect();
+        let (tid, mut tp) = teacher_topk(c, &teacher, &tw, &ids, k).expect("topk");
+        drop(teacher);
+        // every other row unscored
+        let mut total = 0f64;
+        for r in 0..nb * t {
+            let wt: f32 = if r % 2 == 0 { 1.0 } else { 0.0 };
+            total += wt as f64;
+            for q in 0..k {
+                tp[r * k + q] *= wt;
+            }
+        }
+        let Lin::Train { p: down, .. } = &student.layers[nl - 1].down else { panic!("down not trained") };
+        let wd = to::download(c, &down.w, down.n).unwrap();
+        let pert: Vec<f32> = wd.iter().map(|v| v * 1.05).collect();
+        c.queue.write_buffer(&down.w, 0, bytemuck::cast_slice(&pert));
+        refresh_planes(c, &student.layers[nl - 1].down).unwrap();
+        zero_grads(c, &student);
+        let st = step_w(c, &student, &w, &ids, &tid, &tp, k, 1024.0, None, Some(total)).expect("step");
+        let dp = student.dense_params();
+        let g: Vec<Vec<f32>> = dp.iter().map(|p| to::download(c, &p.g, p.n).unwrap()).collect();
+        let w0: Vec<Vec<f32>> = dp.iter().map(|p| to::download(c, &p.w, p.n).unwrap()).collect();
+        let gfull = g.iter().flatten().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+        // the direction: the 4096 largest gradient entries (a step spread
+        // over every weight would sit below the f16 planes' resolution)
+        let mut mags: Vec<f32> = g.iter().flatten().map(|x| x.abs()).collect();
+        let cut = mags.len() - 4096;
+        let thr = *mags.select_nth_unstable_by(cut, |a, b| a.partial_cmp(b).unwrap()).1;
+        let g: Vec<Vec<f32>> = g.iter().map(|v| v.iter().map(|&x| if x.abs() >= thr { x } else { 0.0 }).collect()).collect();
+        let gn = g.iter().flatten().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+        eprintln!("loss {:.6}, |g| {gfull:.5e} (top-4096 part {gn:.5e}), {} trained tensors", st.loss, dp.len());
+        let lw = |net: &Net| loss_sum(c, net, &w, &ids, &tid, &tp, k, true).unwrap() / total;
+        let set = |eps: f64| {
+            for ((p, w0), g) in dp.iter().zip(&w0).zip(&g) {
+                let v: Vec<f32> = w0.iter().zip(g).map(|(&a, &b)| (a as f64 + eps * b as f64 / gn) as f32).collect();
+                c.queue.write_buffer(&p.w, 0, bytemuck::cast_slice(&v));
+            }
+            c.queue.submit(std::iter::empty());
+            for (_, lin) in student.dense_lins() {
+                refresh_planes(c, lin).unwrap();
+            }
+        };
+        // the same step with the frozen prefix cached: same loss, same gradients
+        {
+            let pnet = Net::load_prefix(c, &model, nl - 2).expect("prefix net");
+            let pw = Work::new(c, &pnet, nb, t);
+            let h0 = prefix_hidden(c, &pnet, &pw, &ids).expect("prefix");
+            drop((pw, pnet));
+            let cached = Net::load_heal(c, &model, HealCfg { train_from: nl - 2, ffn_only: false, prefix_cached: true }).expect("cached student");
+            let Lin::Train { p: cd, .. } = &cached.layers[nl - 1].down else { panic!("down not trained") };
+            c.queue.write_buffer(&cd.w, 0, bytemuck::cast_slice(&pert));
+            refresh_planes(c, &cached.layers[nl - 1].down).unwrap();
+            let cw = Work::new(c, &cached, nb, t);
+            let sc = step_wh(c, &cached, &cw, &ids, Some(&h0), &tid, &tp, k, 1024.0, None, Some(total)).expect("cached step");
+            let gc: Vec<f32> = cached.dense_params().iter().flat_map(|p| to::download(c, &p.g, p.n).unwrap()).collect();
+            let g0: Vec<f32> = dp.iter().flat_map(|p| to::download(c, &p.g, p.n).unwrap()).collect();
+            let dmax = g0.iter().zip(&gc).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let gm = g0.iter().fold(0f32, |a, x| a.max(x.abs()));
+            eprintln!("prefix-cached step: loss {:.6} vs {:.6}, max |Δg| {dmax:.3e} of max |g| {gm:.3e}", sc.loss, st.loss);
+            assert!((sc.loss - st.loss).abs() < 1e-4 * st.loss.abs().max(1e-3));
+            assert!(dmax <= 1e-3 * gm);
+        }
+        let base = lw(&student);
+        eprintln!("weighted loss: step {:.6} vs forward {:.6}", st.loss, base);
+        assert!((st.loss - base).abs() < 1e-3 * base.abs().max(1e-3));
+        let mut ok = false;
+        for eps in [0.01f64, 0.03, 0.1] {
+            set(eps);
+            let lp = lw(&student);
+            set(-eps);
+            let lm = lw(&student);
+            let fd = (lp - lm) / (2.0 * eps);
+            eprintln!("eps {eps}: fd {fd:.5e} vs |g| {gn:.5e} (ratio {:.3})", fd / gn);
+            ok |= (fd / gn - 1.0).abs() < 0.1;
+        }
+        set(0.0);
+        assert!(ok, "directional derivative does not match the gradient norm");
+    }
+
+    /// DTG-MA gates: with every gate open the net is the plain one (same
+    /// loss to the bit); the analytic gradient of a gate value against a
+    /// central difference of the loss, for the largest-gradient gates of the
+    /// first and the last layer, the gates set to a spread of values
+    /// (`CMF_TRAIN_TEST_MODEL`).
+    #[test]
+    #[ignore]
+    fn mask_gradient_check() {
+        let Ok(path) = std::env::var("CMF_TRAIN_TEST_MODEL") else { return };
+        let Some(c) = to::dev() else { return };
+        let model = CmfModel::open_sharded(&path).expect("model");
+        let teacher = Net::load(c, &model, true, false, None).expect("teacher");
+        let (nb, t, k) = (2usize, 64usize, 32usize);
+        let tw = Work::new(c, &teacher, nb, t);
+        let vocab = teacher.geom.vocab as u64;
+        let ids: Vec<u32> = (0..(nb * t) as u64).map(|i| ((i * 7919 + 13) % vocab.min(30000)) as u32).collect();
+        let (tid, tp) = teacher_topk(c, &teacher, &tw, &ids, k).expect("topk");
+        let plain = loss_only(c, &teacher, &tw, &ids, &tid, &tp, k).unwrap();
+        drop((tw, teacher));
+        let mut student = Net::load(c, &model, true, true, None).expect("student");
+        student.enable_masks(c);
+        let w = Work::new(c, &student, nb, t);
+        let open = loss_only(c, &student, &w, &ids, &tid, &tp, k).unwrap();
+        eprintln!("loss: plain {plain:.8}, every gate open {open:.8}");
+        assert_eq!(plain, open, "open gates must leave the net unchanged");
+        let nl = student.geom.nl;
+        let mut s: Vec<Vec<f32>> = student.layers.iter().enumerate().map(|(l, ly)| (0..ly.gate.m()).map(|j| 0.4 + 0.6 * (((j * 37 + l * 11) % 101) as f32 / 100.0)).collect()).collect();
+        student.set_masks(c, &s).unwrap();
+        zero_grads(c, &student);
+        let st = step(c, &student, &w, &ids, &tid, &tp, k, 1024.0, None).expect("step");
+        let g = student.mask_grads(c).unwrap();
+        eprintln!("loss with gates {:.6}", st.loss);
+        let mut worst = 0f64;
+        for l in [0, nl - 1] {
+            let mut order: Vec<usize> = (0..g[l].len()).collect();
+            order.sort_by(|&a, &b| g[l][b].abs().partial_cmp(&g[l][a].abs()).unwrap());
+            for &j in order.iter().take(4) {
+                // two step sizes: through all the layers above, the f16
+                // forward's rounding swamps a small one (the layer-0 norm
+                // gains of `net_gradient_check` behave alike)
+                let base = s[l][j];
+                let mut fds = Vec::new();
+                for eps in [0.02f32, 0.08] {
+                    s[l][j] = base + eps;
+                    student.set_masks(c, &s).unwrap();
+                    let lp = loss_only(c, &student, &w, &ids, &tid, &tp, k).unwrap();
+                    s[l][j] = base - eps;
+                    student.set_masks(c, &s).unwrap();
+                    let lm = loss_only(c, &student, &w, &ids, &tid, &tp, k).unwrap();
+                    fds.push((lp - lm) / (2.0 * eps as f64));
+                }
+                s[l][j] = base;
+                let r = fds.iter().map(|fd| (fd / g[l][j] as f64 - 1.0).abs()).fold(f64::MAX, f64::min);
+                // the last layer's difference is clean (≤ 2 %); through all
+                // the layers above the first one it scatters around the
+                // gradient by the f16 forward's rounding: the two step sizes
+                // must bracket it (15 % slack)
+                let (lo, hi) = (fds[0].min(fds[1]), fds[0].max(fds[1]));
+                let a = g[l][j] as f64;
+                let ok = if l + 1 == nl { r < 0.02 } else { r < 0.15 || (a >= lo - 0.15 * a.abs() && a <= hi + 0.15 * a.abs()) };
+                worst = worst.max(if ok { 0.0 } else { r });
+                eprintln!("L{l} gate {j}: analytic {:.5e}  fd(0.02) {:.5e}  fd(0.08) {:.5e}  (rel {r:.3}){}", g[l][j], fds[0], fds[1], if ok { "" } else { "  ✗" });
+            }
+        }
+        student.set_masks(c, &s).unwrap();
+        assert!(worst == 0.0, "gate gradient off by {worst:.3}");
+    }
+
+    /// Where a healing step's time goes on this device: the teacher pass
+    /// and six steps of a full-depth MLP heal of `CMF_TRAIN_TEST_MODEL` at
+    /// the compress shape (2 windows × 2048 tokens), host-timed, then the
+    /// profiler's table (run with `CMF_NVG_PROF=2` or `1`).
+    #[test]
+    #[ignore]
+    fn heal_step_profile() {
+        let Ok(path) = std::env::var("CMF_TRAIN_TEST_MODEL") else { return };
+        let Some(c) = to::dev() else { return };
+        let model = CmfModel::open_sharded(&path).expect("model");
+        let (nb, t, k) = (2usize, 2048usize, 65usize);
+        let vocab = model.arch().vocab_size as u64;
+        let ids: Vec<u32> = (0..(nb * t) as u64).map(|i| ((i * 7919 + 13) % vocab.min(30000)) as u32).collect();
+        let (tid, tp) = {
+            let teacher = Net::load(c, &model, true, false, None).expect("teacher");
+            let tw = Work::new(c, &teacher, nb, t);
+            let _ = teacher_topk(c, &teacher, &tw, &ids, k).expect("warm");
+            let t0 = std::time::Instant::now();
+            let r = teacher_topk(c, &teacher, &tw, &ids, k).expect("topk");
+            eprintln!("teacher pass: {:.2} s for {} tokens ({:.0} tok/s)", t0.elapsed().as_secs_f64(), nb * t, (nb * t) as f64 / t0.elapsed().as_secs_f64());
+            r
+        };
+        let student = Net::load_heal(c, &model, HealCfg { train_from: 0, ffn_only: true, prefix_cached: false }).expect("student");
+        let w = Work::new(c, &student, nb, t);
+        for i in 0..6 {
+            let t0 = std::time::Instant::now();
+            let st = step_w(c, &student, &w, &ids, &tid, &tp, k, 1024.0, None, None).expect("step");
+            prof::step_end();
+            let ts = t0.elapsed().as_secs_f64();
+            adam(c, &student, 1e-6, i + 1, 0.9, 0.999, 1e-8, 1.0).expect("adam");
+            let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+            eprintln!("step {i}: loss {:.4}, fwd+bwd {:.2} s, with adam {:.2} s", st.loss, ts, t0.elapsed().as_secs_f64());
+        }
+        prof::report();
     }
 
     /// Teacher top-k on one small batch of the 0.8B check models

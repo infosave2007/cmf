@@ -9,7 +9,7 @@
 //! Layouts are row-major over tokens: activations `[n, d]`; q `[n, nh·hd]`,
 //! k/v `[n, nkv·hd]` with n = windows·T; attention never crosses windows.
 
-use super::{Ctx, ctx, submit};
+use super::{Ctx, submit};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -138,6 +138,29 @@ fn swiglu_bwd(@builtin(global_invocation_id) g: vec3<u32>) {
     let s = sigm(a);
     DA[i] = DC[i] * B[i] * s * (1.0 + a * (1.0 - s));
     DB[i] = DC[i] * a * s;
+}
+
+// C = silu(A)·B·S[i mod w], S in DC, w in pad2: a SwiGLU behind one gate
+// per column — the DTG-MA mask σ(m) on an MLP's intermediate.
+@compute @workgroup_size(256)
+fn swiglu_cols_fwd(@builtin(global_invocation_id) g: vec3<u32>) {
+    let i = idx(g);
+    if (i >= p.n) { return; }
+    let a = A[i];
+    C[i] = a * sigm(a) * B[i] * DC[i % p.pad2];
+}
+
+// swiglu_bwd of DC·S[i mod w] (S in C, w in pad2): the gradient through
+// the column gate into the SwiGLU's inputs.
+@compute @workgroup_size(256)
+fn swiglu_cols_bwd(@builtin(global_invocation_id) g: vec3<u32>) {
+    let i = idx(g);
+    if (i >= p.n) { return; }
+    let a = A[i];
+    let s = sigm(a);
+    let dc = DC[i] * C[i % p.pad2];
+    DA[i] = dc * B[i] * s * (1.0 + a * (1.0 - s));
+    DB[i] = dc * a * s;
 }
 
 // C = A·σ(B)   (attention output gate)
@@ -680,7 +703,7 @@ fn norm_mod(c: &Ctx) -> Option<&'static Mod> {
     module(c, "train_norm", NORM_SRC, &["rms_fwd", "rms_bwd", "rms_dw"])
 }
 fn elt_mod(c: &Ctx) -> Option<&'static Mod> {
-    module(c, "train_elt", ELT_SRC, &["swiglu_fwd", "swiglu_lim_fwd", "swiglu_lim_rows_fwd", "swiglu_bwd", "gate_fwd", "gate_bwd", "add"])
+    module(c, "train_elt", ELT_SRC, &["swiglu_fwd", "swiglu_lim_fwd", "swiglu_lim_rows_fwd", "swiglu_bwd", "swiglu_cols_fwd", "swiglu_cols_bwd", "gate_fwd", "gate_bwd", "add"])
 }
 fn qkr_mod(c: &Ctx) -> Option<&'static Mod> {
     module(c, "train_qkr", QKR_SRC, &["qkr_fwd", "qkr_bwd", "qkr_dw"])
@@ -817,6 +840,22 @@ pub fn swiglu_lim<'a>(c: &'a Ctx, n: usize, a: &'a wgpu::Buffer, b: &'a wgpu::Bu
 pub fn swiglu_lim_rows<'a>(c: &'a Ctx, n: usize, a: &'a wgpu::Buffer, b: &'a wgpu::Buffer, cc: &'a wgpu::Buffer, rw: &'a wgpu::Buffer, width: usize, limit: f32, scale: f32) -> Option<Disp<'a>> {
     let m = elt_mod(c)?;
     Some(Disp { pipe: &m.p["swiglu_lim_rows_fwd"], uni: vec![n as u32, limit.to_bits(), scale.to_bits(), width.max(1) as u32], bufs: vec![(1, a), (2, b), (3, cc), (4, rw)], grid: elt_fold(n) })
+}
+
+/// `C = silu(A)·B·s[col]` over `n` elements in rows of `width`: a SwiGLU
+/// behind a gate per column (DTG-MA's mask σ(m) on an MLP intermediate).
+#[allow(clippy::too_many_arguments)]
+pub fn swiglu_cols<'a>(c: &'a Ctx, n: usize, a: &'a wgpu::Buffer, b: &'a wgpu::Buffer, cc: &'a wgpu::Buffer, s: &'a wgpu::Buffer, width: usize) -> Option<Disp<'a>> {
+    let m = elt_mod(c)?;
+    Some(Disp { pipe: &m.p["swiglu_cols_fwd"], uni: vec![n as u32, 0, 0, width.max(1) as u32], bufs: vec![(1, a), (2, b), (3, cc), (4, s)], grid: elt_fold(n) })
+}
+
+/// Backward of [`swiglu_cols`]: `da`, `db` from `dc` (the gradient at the
+/// gated output) through the gate `s`.
+#[allow(clippy::too_many_arguments)]
+pub fn swiglu_cols_bwd<'a>(c: &'a Ctx, n: usize, a: &'a wgpu::Buffer, b: &'a wgpu::Buffer, s: &'a wgpu::Buffer, dc: &'a wgpu::Buffer, da: &'a wgpu::Buffer, db: &'a wgpu::Buffer, width: usize) -> Option<Disp<'a>> {
+    let m = elt_mod(c)?;
+    Some(Disp { pipe: &m.p["swiglu_cols_bwd"], uni: vec![n as u32, 0, 0, width.max(1) as u32], bufs: vec![(1, a), (2, b), (3, s), (4, dc), (5, da), (6, db)], grid: elt_fold(n) })
 }
 
 /// Geometry of a per-head norm + RoPE.
@@ -1046,9 +1085,10 @@ pub fn zeros_u32(c: &Ctx, n: usize) -> wgpu::Buffer {
     })
 }
 
-/// The device context, for callers outside `gpu_wgpu`.
+/// The trainer's device context, for callers outside `gpu_wgpu` (on macOS
+/// a wgpu context of its own beside the runtime's native Metal).
 pub fn dev() -> Option<&'static Ctx> {
-    ctx()
+    super::trainer_ctx()
 }
 
 #[cfg(test)]
@@ -1065,7 +1105,7 @@ mod tests {
         wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(), wgpu::naga::valid::Capabilities::all())
             .validate(&module)
             .expect("ELT_SRC must validate");
-        for e in ["swiglu_fwd", "swiglu_lim_fwd", "swiglu_bwd", "gate_fwd", "gate_bwd", "add"] {
+        for e in ["swiglu_fwd", "swiglu_lim_fwd", "swiglu_bwd", "swiglu_cols_fwd", "swiglu_cols_bwd", "gate_fwd", "gate_bwd", "add"] {
             assert!(module.entry_points.iter().any(|p| p.name == e), "entry {e}");
         }
     }
@@ -1127,6 +1167,17 @@ mod tests {
         rel("swiglu", &download(c, &bc, 4097).unwrap(), &want, 1e-6);
         let wda: Vec<f64> = (0..4097).map(|i| { let (a, s) = (a[i] as f64, sg(a[i] as f64)); dc[i] as f64 * b[i] as f64 * s * (1.0 + a * (1.0 - s)) }).collect();
         rel("swiglu da", &download(c, &bda, 4097).unwrap(), &wda, 1e-6);
+        // behind a column gate (rows of 17 → 241 rows, the last one short)
+        let w = 17usize;
+        let gs: Vec<f32> = (0..w).map(|j| 0.1 + 0.05 * j as f32).collect();
+        let (bs, bg, bga, bgb) = (upload(c, &gs), zeros(c, 4097), zeros(c, 4097), zeros(c, 4097));
+        run(c, &[swiglu_cols(c, 4097, &ba, &bb, &bg, &bs, w).unwrap(), swiglu_cols_bwd(c, 4097, &ba, &bb, &bs, &bdc, &bga, &bgb, w).unwrap()]);
+        let want: Vec<f64> = (0..4097).map(|i| a[i] as f64 * sg(a[i] as f64) * b[i] as f64 * gs[i % w] as f64).collect();
+        rel("swiglu cols", &download(c, &bg, 4097).unwrap(), &want, 1e-6);
+        let wga: Vec<f64> = (0..4097).map(|i| wda[i] * gs[i % w] as f64).collect();
+        rel("swiglu cols da", &download(c, &bga, 4097).unwrap(), &wga, 1e-6);
+        let wgb: Vec<f64> = (0..4097).map(|i| { let (a, s) = (a[i] as f64, sg(a[i] as f64)); dc[i] as f64 * gs[i % w] as f64 * a * s }).collect();
+        rel("swiglu cols db", &download(c, &bgb, 4097).unwrap(), &wgb, 1e-6);
         // the clamped, scaled form (DeepSeek swiglu_limit), limit inside the data range
         let (lim, s) = (1.5f32, 0.75f32);
         let bl = zeros(c, 4097);

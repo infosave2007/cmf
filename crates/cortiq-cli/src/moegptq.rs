@@ -207,7 +207,11 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
         eprintln!("quantize-moe: CMF_MOE_HOST=1 — Hessians, folds and sweeps run on the host (exact, much slower)");
         Engine::Host
     } else {
-        match to::dev() {
+        // The capture forward accumulates its Grams through the runtime's wgpu
+        // path (`gpu::gram_alloc`): the device engine needs the runtime on
+        // wgpu, not only a trainer device (on macOS the runtime runs native
+        // Metal unless CMF_GPU=wgpu)
+        match to::dev().filter(|_| cortiq_engine::gpu_wgpu::selected()) {
             // a capture-only run encodes nothing: the device runs the forward
             Some(c) if capture_only => Engine::Gpu(c),
             // the device grams and GEMMs run on the matrix units
@@ -218,7 +222,10 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
                 if std::env::var("CMF_COOP").as_deref() == Ok("0") { "; CMF_COOP=0 is set and turns them off: unset it" } else { "" }
             ),
             Some(c) => Engine::Gpu(c),
-            None => anyhow::bail!("quantize-moe: no wgpu GPU (set CMF_MOE_HOST=1 to run on the host)"),
+            None => anyhow::bail!(
+                "quantize-moe: no wgpu GPU (set CMF_MOE_HOST=1 to run on the host{})",
+                if cfg!(target_os = "macos") { "; on macOS CMF_GPU=wgpu puts the runtime on the GPU" } else { "" }
+            ),
         }
     };
     // q2tp in place releases each slot's slack by hole punching: probe the

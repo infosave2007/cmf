@@ -21,7 +21,7 @@ fn device_routing_matches_the_cpu_needs_cmf_gpu() {
             cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());
             return;
         }
-        Some(false) => panic!("wgpu запрошен, но контекст не поднялся"),
+        Some(false) => panic!("wgpu was requested but the context did not come up"),
         Some(true) => {}
     }
     let n = 256usize;
@@ -38,10 +38,10 @@ fn device_routing_matches_the_cpu_needs_cmf_gpu() {
     let forced: Vec<usize> = vec![3, 200, 17, 17, 99, 1, 255, 40];
 
     let cases: Vec<(&str, Option<&[f32]>, Option<&[bool]>, Option<&[usize]>)> = vec![
-        ("голые оценки", None, None, None),
-        ("со сдвигом", Some(&bias), None, None),
-        ("сдвиг и маска", Some(&bias), Some(&mask), None),
-        ("хеш-слой", None, None, Some(&forced)),
+        ("bare scores", None, None, None),
+        ("with a bias", Some(&bias), None, None),
+        ("bias and mask", Some(&bias), Some(&mask), None),
+        ("hash layer", None, None, Some(&forced)),
     ];
 
     for (name, b, m, f) in cases {
@@ -54,16 +54,16 @@ fn device_routing_matches_the_cpu_needs_cmf_gpu() {
         if !cortiq_engine::gpu_wgpu::moe_route_for_test(
             &scores, b, m, f, top_k, scale, false, &mut gi, &mut gw,
         ) {
-            panic!("устройство не поднялось — тест не проверил ничего");
+            panic!("the device did not come up — the test checked nothing");
         }
-        assert_eq!(ci, gi, "{name}: разные эксперты или порядок");
+        assert_eq!(ci, gi, "{name}: different experts or order");
         let d = cw
             .iter()
             .zip(&gw)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         println!("{name}: {ci:?}, max|Δw| = {d:.3e}");
-        assert!(d < 1e-6, "{name}: веса разошлись на {d:.3e}");
+        assert!(d < 1e-6, "{name}: the weights diverged by {d:.3e}");
     }
 
     // Every expert masked out: the CPU returns nothing rather than picking
@@ -94,8 +94,8 @@ fn device_routing_matches_the_cpu_needs_cmf_gpu() {
         &mut gi,
         &mut gw,
     ));
-    assert_eq!(ci, gi, "полностью закрытая маска");
-    println!("полностью закрытая маска: выбрано {}", gi.len());
+    assert_eq!(ci, gi, "fully closed mask");
+    println!("fully closed mask: selected {}", gi.len());
 
     // The msel/mwt shape the batched expert kernels take: every slot written,
     // the shared expert pinned last at weight 1, and a slot the router could
@@ -113,12 +113,12 @@ fn device_routing_matches_the_cpu_needs_cmf_gpu() {
         &mut gi,
         &mut gw,
     ));
-    assert_eq!(gi.len(), top_k + 1, "должно быть top_k+1 слотов");
-    assert_eq!(gi[top_k], n, "общий эксперт идёт последним");
-    assert_eq!(gw[top_k], 1.0, "общий эксперт весит единицу");
+    assert_eq!(gi.len(), top_k + 1, "there must be top_k+1 slots");
+    assert_eq!(gi[top_k], n, "the shared expert comes last");
+    assert_eq!(gw[top_k], 1.0, "the shared expert weighs one");
     assert!(
         gw[..top_k].iter().all(|&x| x == 0.0),
-        "незаполненные слоты обязаны весить ноль: {gw:?}"
+        "unfilled slots must weigh zero: {gw:?}"
     );
     // And with the router free to choose, the routed slots come back live.
     let mut gi = Vec::new();
@@ -146,9 +146,9 @@ fn device_routing_matches_the_cpu_needs_cmf_gpu() {
         &mut ci,
         &mut cw,
     );
-    assert_eq!(&gi[..top_k], &ci[..], "слоты маршрутизации разошлись");
+    assert_eq!(&gi[..top_k], &ci[..], "the routing slots diverged");
     assert_eq!(gi[top_k], n);
-    println!("формат msel/mwt: {gi:?}");
+    println!("msel/mwt format: {gi:?}");
 }
 
 #[test]
@@ -158,7 +158,7 @@ fn qwen_selected_softmax_route_matches_cpu_needs_cmf_gpu() {
             cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());
             return;
         }
-        Some(false) => panic!("wgpu запрошен, но контекст не поднялся"),
+        Some(false) => panic!("wgpu was requested but the context did not come up"),
         Some(true) => {}
     }
 
@@ -183,12 +183,12 @@ fn qwen_selected_softmax_route_matches_cpu_needs_cmf_gpu() {
     let z: f32 = order.iter().map(|&i| (logits[i] - max).exp()).sum();
     let expected: Vec<f32> = order.iter().map(|&i| (logits[i] - max).exp() / z).collect();
 
-    assert_eq!(gi, order, "Qwen выбрал другие эксперты");
+    assert_eq!(gi, order, "Qwen picked different experts");
     let d = expected
         .iter()
         .zip(&gw)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
     println!("Qwen selected-softmax: {gi:?}, {gw:?}, max|Δw|={d:.3e}");
-    assert!(d < 1e-6, "Qwen-веса разошлись на {d:.3e}");
+    assert!(d < 1e-6, "the Qwen weights diverged by {d:.3e}");
 }

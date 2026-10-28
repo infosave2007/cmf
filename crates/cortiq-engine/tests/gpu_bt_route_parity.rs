@@ -13,7 +13,7 @@ fn batched_routing_matches_the_single_router_needs_cmf_gpu() {
             cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());
             return;
         }
-        Some(false) => panic!("wgpu запрошен, но контекст не поднялся"),
+        Some(false) => panic!("wgpu was requested but the context did not come up"),
         Some(true) => {}
     }
     let n = 16usize;
@@ -39,7 +39,7 @@ fn batched_routing_matches_the_single_router_needs_cmf_gpu() {
                 &mut bi,
                 &mut bw,
             ),
-            "пакетный роутер не запустился"
+            "the batched router did not run"
         );
         for t in 0..b {
             let mut si = Vec::new();
@@ -59,12 +59,12 @@ fn batched_routing_matches_the_single_router_needs_cmf_gpu() {
             assert_eq!(
                 &bi[t * slots..(t + 1) * slots],
                 &si[..],
-                "токен {t} (bias={use_bias}): другие эксперты"
+                "token {t} (bias={use_bias}): different experts"
             );
             for (j, (a, e)) in bw[t * slots..(t + 1) * slots].iter().zip(&sw).enumerate() {
                 assert!(
                     (a - e).abs() <= 1e-6 * e.abs().max(1.0),
-                    "токен {t} слот {j} (bias={use_bias}): вес {a} против {e}"
+                    "token {t} slot {j} (bias={use_bias}): weight {a} versus {e}"
                 );
             }
         }
@@ -99,7 +99,7 @@ fn batched_routing_matches_the_single_router_needs_cmf_gpu() {
             &mut sw,
         ));
         let slots = top_k + 1;
-        assert_eq!(&bi[t * slots..(t + 1) * slots], &si[..], "forced токен {t}");
+        assert_eq!(&bi[t * slots..(t + 1) * slots], &si[..], "forced token {t}");
     }
-    println!("пакетный роутер совпал с одиночным на {b} токенах");
+    println!("the batched router matched the single one on {b} tokens");
 }

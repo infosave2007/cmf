@@ -42,11 +42,11 @@ fn rejected_verify_leaves_the_walk_intact_needs_cmf_gpu() {
             cortiq_engine::gpu_wgpu::skip_or_fail(module_path!());
             return;
         }
-        Some(false) => panic!("wgpu запрошен, но контекст не поднялся"),
+        Some(false) => panic!("wgpu was requested but the context did not come up"),
         Some(true) => {}
     }
     let Some(dir) = toy_dir() else {
-        eprintln!("стендов нет (CMF_TOY_DIR) — пропуск");
+        eprintln!("no stands (CMF_TOY_DIR) — skipped");
         return;
     };
     let path = std::path::Path::new(&dir).join("q4.cmf");
@@ -93,7 +93,7 @@ fn rejected_verify_leaves_the_walk_intact_needs_cmf_gpu() {
     for t in 0..warm {
         let a = step(&mut walk, ids[t]);
         let b = step(&mut spec, ids[t]);
-        assert_eq!(a, b, "прогрев разошёлся на токене {t}");
+        assert_eq!(a, b, "the warm-up diverged at token {t}");
     }
 
     let mut flips = 0usize;
@@ -131,7 +131,7 @@ fn rejected_verify_leaves_the_walk_intact_needs_cmf_gpu() {
                 &mut lg_all,
                 &mut walked,
             )
-            .unwrap_or_else(|| panic!("verify отказал на раунде {r} (pos {pos0})"));
+            .unwrap_or_else(|| panic!("verify declined at round {r} (pos {pos0})"));
             assert!(
                 cortiq_engine::dsv4::dsv4_spec_finish(
                     g,
@@ -144,9 +144,9 @@ fn rejected_verify_leaves_the_walk_intact_needs_cmf_gpu() {
                     &g.inv_freq_window.clone(),
                     None,
                 ),
-                "rollback отказал на раунде {r}"
+                "rollback declined at round {r}"
             );
-            assert_eq!(st.pos, pos0 + 1, "позиция после отката");
+            assert_eq!(st.pos, pos0 + 1, "position after the rollback");
             lg_all[..cfg.vocab].to_vec()
         };
         // Walk side: the same token, plainly. The verify's answer must match
@@ -177,7 +177,7 @@ fn rejected_verify_leaves_the_walk_intact_needs_cmf_gpu() {
             // round-off contract showing, not a transaction fault. Count it.
             flips += 1;
         }
-        assert!(mx < 2e-2, "дрейф логитов вырос до {mx:e} на раунде {r}");
+        assert!(mx < 2e-2, "the logit drift grew to {mx:e} at round {r}");
     }
 
     let probe = 3u32;
@@ -187,6 +187,6 @@ fn rejected_verify_leaves_the_walk_intact_needs_cmf_gpu() {
     for (x, y) in a.iter().zip(&b) {
         mx = mx.max((x - y).abs());
     }
-    assert!(mx < 2e-2, "финальный зонд: дрейф {mx:e}");
-    println!("транзакция держит walk на {rounds} откатах: дрейф ≤ {mx:e}, argmax-флипов {flips}");
+    assert!(mx < 2e-2, "final probe: drift {mx:e}");
+    println!("the transaction holds the walk over {rounds} rollbacks: drift ≤ {mx:e}, argmax flips {flips}");
 }

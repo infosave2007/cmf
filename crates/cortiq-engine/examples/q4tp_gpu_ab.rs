@@ -74,7 +74,7 @@ fn main() {
             }
         }
         println!(
-            "{:<48} {:>5} {}x{}  {:.3} мс  расхождение {:.1e}",
+            "{:<48} {:>5} {}x{}  {:.3} ms  divergence {:.1e}",
             e.name,
             if tp { "q4tp" } else { "q4t" },
             rows,
@@ -89,7 +89,7 @@ fn main() {
         }
     }
     if checked == 0 {
-        eprintln!("в модели нет подходящих тензоров");
+        eprintln!("the model has no suitable tensors");
     }
 
     // Sweep over every eligible tensor, one dispatch each — the pattern a
@@ -136,7 +136,7 @@ fn main() {
                 };
             }
             if !ok {
-                println!("GEMM отклонён устройством");
+                println!("GEMM declined by the device");
                 break;
             }
             best = best.min(t0.elapsed().as_secs_f64());
@@ -147,7 +147,7 @@ fn main() {
         }
         if best < f64::MAX {
             println!(
-                "GEMM b={b} по {} тензорам: {:.2} мс, {:.2} ГФЛОП/с",
+                "GEMM b={b} over {} tensors: {:.2} ms, {:.2} GFLOP/s",
                 big.len(),
                 best * 1e3,
                 gb / best / 1e9
@@ -155,17 +155,17 @@ fn main() {
         }
     }
 
-    for (serial, lbl) in [(false, "перекрытый"), (true, "сериализованный")]
+    for (serial, lbl) in [(false, "overlapped"), (true, "serialized")]
     {
         match cortiq_engine::gpu_metal::q4_matvec_sweep(&model, &all, serial) {
             Some(t) => println!(
-                "проход {lbl:<16} по {} тензорам: {:.2} мс, {:.2} ГБ, {:.1} ГБ/с",
+                "pass {lbl:<16} over {} tensors: {:.2} ms, {:.2} GB, {:.1} GB/s",
                 all.len(),
                 t * 1e3,
                 bytes as f64 / 1e9,
                 bytes as f64 / 1e9 / t
             ),
-            None => eprintln!("проход отклонён"),
+            None => eprintln!("pass declined"),
         }
     }
 }
