@@ -10820,6 +10820,240 @@ pub fn q4tp_mm_n8_batch(
     true
 }
 
+/// Kernel-time microbench (tests) of the q8_2f decode matvec: every tensor
+/// in `idxs` (one projection kind across the layers, so no tensor is warm
+/// in the system cache) dispatched once per rep, all reps in ONE command
+/// buffer timed on the GPU clock. `kernel` names a built-in pipeline
+/// (`q8f_matvec`, `q8f_matvec_r4`) or, with `src`, an entry point
+/// compiled from that MSL source (kernel iteration without an engine
+/// rebuild). Binding contract of `q8f_matvec`; the grid is
+/// ceil(rows / (sgs·rows_per_sg)) threadgroups of `sgs` simdgroups.
+/// Returns GPU ms per rep and the last tensor's output row.
+pub fn q8f_kernel_bench(
+    model: &Arc<CmfModel>,
+    idxs: &[usize],
+    kernel: &str,
+    src: Option<&str>,
+    rows_per_sg: usize,
+    sgs: usize,
+    reps: usize,
+) -> Option<(f64, Vec<f32>)> {
+    let c = ctx()?;
+    let (fbuf, _safe) = file_buffer(c, model)?;
+    let pso = match (kernel, src) {
+        ("q8f_matvec", None) => c.q8f.clone(),
+        ("q8f_matvec_r4", None) => c.q8f_r4.clone(),
+        (name, Some(src)) => {
+            let lib = c
+                ._device
+                .new_library_with_source(src, &metal::CompileOptions::new())
+                .map_err(|e| eprintln!("MSL compile: {e}"))
+                .ok()?;
+            let f = lib.get_function(name, None).ok()?;
+            c._device.new_compute_pipeline_state_with_function(&f).ok()?
+        }
+        _ => return None,
+    };
+    let shared = MTLResourceOptions::StorageModeShared;
+    let f32_buf = |v: &[f32]| {
+        c._device.new_buffer_with_data(
+            v.as_ptr() as *const std::ffi::c_void,
+            (v.len() * 4) as u64,
+            shared,
+        )
+    };
+    struct T {
+        abs: usize,
+        rows: usize,
+        cols: usize,
+        rs: Buffer,
+        col: Buffer,
+    }
+    let mut ts = Vec::new();
+    for &idx in idxs {
+        let e = &model.tensors[idx];
+        if e.dtype != cortiq_core::TensorDtype::Q8_2f {
+            return None;
+        }
+        let (rows, cols) = (e.shape[0], e.shape[1]);
+        let bytes = model.entry_bytes(e);
+        let h = |o: usize| f16_to_f32(u16::from_le_bytes([bytes[o], bytes[o + 1]]));
+        let q = rows * cols;
+        let rs: Vec<f32> = (0..rows).map(|r| h(q + 2 * r)).collect();
+        let col: Vec<f32> = (0..cols).map(|i| h(q + 2 * rows + 2 * i)).collect();
+        ts.push(T {
+            abs: model.entry_abs_offset(e)?,
+            rows,
+            cols,
+            rs: f32_buf(&rs),
+            col: f32_buf(&col),
+        });
+    }
+    let max_cols = ts.iter().map(|t| t.cols).max()?;
+    let max_rows = ts.iter().map(|t| t.rows).max()?;
+    let xs: Vec<f32> = (0..max_cols)
+        .map(|i| ((i % 97) as f32 - 48.0) / 48.0)
+        .collect();
+    let xs_buf = f32_buf(&xs);
+    let y_buf = c._device.new_buffer((max_rows * 4) as u64, shared);
+    let cmd = c.queue.new_command_buffer();
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pso);
+        for _ in 0..reps {
+            for t in &ts {
+                fbuf.bind(enc, 0, t.abs);
+                enc.set_buffer(1, Some(&xs_buf), 0);
+                enc.set_buffer(2, Some(&t.rs), 0);
+                enc.set_buffer(3, Some(&y_buf), 0);
+                enc.set_buffer(4, Some(&t.col), 0);
+                let w = [(t.cols / 4) as u32, t.rows as u32];
+                enc.set_bytes(5, 4, &w[0] as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(6, 4, &w[1] as *const u32 as *const std::ffi::c_void);
+                let n_tg = (t.rows as u64).div_ceil((sgs * rows_per_sg) as u64);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(n_tg, 1, 1),
+                    MTLSize::new(sgs as u64 * 32, 1, 1),
+                );
+            }
+        }
+        enc.end_encoding();
+    }
+    submit_and_wait(c, cmd, &[&y_buf]);
+    let rows = ts.last()?.rows;
+    let mut y = vec![0f32; rows];
+    unsafe {
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, y.as_mut_ptr(), rows);
+    }
+    Some((cmd_gpu_ms(cmd) / reps as f64, y))
+}
+
+/// `q8f_kernel_bench`'s prefill twin: the q8 GEMM `y[b, rows] = rs ·
+/// q · xs[b, cols]` over every tensor in `idxs` (their q8 payload and row
+/// scales; the q8_2f field is the caller's staging, not the GEMM's).
+/// `kernel` `q8_mul_mm` is the built-in, shape-specialized pipeline; with
+/// `src` an entry point of that MSL with the `q8_mul_mm` ABI, specialized
+/// through the same function constants (0 cols, 1 rows). The grid is
+/// (ceil(b / tile_b), ceil(rows / tile_rows)) threadgroups of `threads`.
+/// Returns GPU ms per rep and the last tensor's `y` (b × rows).
+#[allow(clippy::too_many_arguments)]
+pub fn q8_mm_kernel_bench(
+    model: &Arc<CmfModel>,
+    idxs: &[usize],
+    kernel: &str,
+    src: Option<&str>,
+    b: usize,
+    tile_rows: usize,
+    tile_b: usize,
+    threads: usize,
+    reps: usize,
+) -> Option<(f64, Vec<f32>)> {
+    let c = ctx()?;
+    let (fbuf, _safe) = file_buffer(c, model)?;
+    let lib = match src {
+        Some(src) => Some(
+            c._device
+                .new_library_with_source(src, &metal::CompileOptions::new())
+                .map_err(|e| eprintln!("MSL compile: {e}"))
+                .ok()?,
+        ),
+        None if kernel == "q8_mul_mm" => None,
+        None => return None,
+    };
+    let shared = MTLResourceOptions::StorageModeShared;
+    struct T {
+        abs: usize,
+        rows: usize,
+        cols: usize,
+        rs: Buffer,
+        pso: ComputePipelineState,
+    }
+    let mut ts = Vec::new();
+    for &idx in idxs {
+        let e = &model.tensors[idx];
+        if e.dtype != cortiq_core::TensorDtype::Q8_2f && e.dtype != cortiq_core::TensorDtype::Q8Row
+        {
+            return None;
+        }
+        let (rows, cols) = (e.shape[0], e.shape[1]);
+        let bytes = model.entry_bytes(e);
+        let q = rows * cols;
+        let rs: Vec<f32> = (0..rows)
+            .map(|r| f16_to_f32(u16::from_le_bytes([bytes[q + 2 * r], bytes[q + 2 * r + 1]])))
+            .collect();
+        let pso = match &lib {
+            None => mm_pipeline(c, rows, cols, 0),
+            Some(lib) => {
+                let fcv = metal::FunctionConstantValues::new();
+                let (cu, ru) = (cols as u32, rows as u32);
+                fcv.set_constant_value_at_index(
+                    &cu as *const u32 as *const std::ffi::c_void,
+                    metal::MTLDataType::UInt,
+                    0,
+                );
+                fcv.set_constant_value_at_index(
+                    &ru as *const u32 as *const std::ffi::c_void,
+                    metal::MTLDataType::UInt,
+                    1,
+                );
+                let f = lib.get_function(kernel, Some(fcv)).ok()?;
+                c._device.new_compute_pipeline_state_with_function(&f).ok()?
+            }
+        };
+        ts.push(T {
+            abs: model.entry_abs_offset(e)?,
+            rows,
+            cols,
+            rs: c._device.new_buffer_with_data(
+                rs.as_ptr() as *const std::ffi::c_void,
+                (rows * 4) as u64,
+                shared,
+            ),
+            pso,
+        });
+    }
+    let max_cols = ts.iter().map(|t| t.cols).max()?;
+    let max_rows = ts.iter().map(|t| t.rows).max()?;
+    let xs: Vec<f32> = (0..b * max_cols)
+        .map(|i| ((i % 97) as f32 - 48.0) / 48.0)
+        .collect();
+    let xs_buf = c._device.new_buffer_with_data(
+        xs.as_ptr() as *const std::ffi::c_void,
+        (xs.len() * 4) as u64,
+        shared,
+    );
+    let y_buf = c._device.new_buffer((b * max_rows * 4) as u64, shared);
+    let cmd = c.queue.new_command_buffer();
+    {
+        let enc = cmd.new_compute_command_encoder();
+        for _ in 0..reps {
+            for t in &ts {
+                enc.set_compute_pipeline_state(&t.pso);
+                fbuf.bind(enc, 0, t.abs);
+                enc.set_buffer(1, Some(&xs_buf), 0);
+                enc.set_buffer(2, Some(&t.rs), 0);
+                enc.set_buffer(3, Some(&y_buf), 0);
+                let w = [t.cols as u32, t.rows as u32, b as u32];
+                for (i, v) in w.iter().enumerate() {
+                    enc.set_bytes(4 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
+                }
+                enc.dispatch_thread_groups(
+                    MTLSize::new(b.div_ceil(tile_b) as u64, t.rows.div_ceil(tile_rows) as u64, 1),
+                    MTLSize::new(threads as u64, 1, 1),
+                );
+            }
+        }
+        enc.end_encoding();
+    }
+    submit_and_wait(c, cmd, &[&y_buf]);
+    let n = b * ts.last()?.rows;
+    let mut y = vec![0f32; n];
+    unsafe {
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, y.as_mut_ptr(), n);
+    }
+    Some((cmd_gpu_ms(cmd) / reps as f64, y))
+}
+
 /// Kernel-time microbench (tests): `reps` dispatches of one projection in
 /// ONE command buffer, so the per-submit cost drops out. `which`: 0 = the
 /// one-vector matvec (b must be 1), 1 = the batched matvec, 2 = the
@@ -11757,6 +11991,10 @@ pub struct ChunkLayer<'a> {
     /// q8_2f input fields of q, k, v, o (empty = plain q8_row / q4):
     /// the GEMM reads x·col (`col_scale_rows`), as the CPU's `prescale`.
     pub col: [&'a [f32]; 4],
+    /// q8_2f input fields of the dense gate, up and down (empty = none):
+    /// gate and up read n·col staged like q/k/v, down's field scales the
+    /// activation rows in place before its GEMM. Exact-GELU FFNs only.
+    pub ffn_col: [&'a [f32]; 3],
     /// A routed-experts FFN instead of gate/up/down (Mellum2.1): `gate`,
     /// `up`, `down` then carry the FIRST expert's trio for the shape checks.
     pub moe: Option<ChunkMoe<'a>>,
@@ -12279,6 +12517,21 @@ pub fn chunk_run_gpu(
                 None => return false,
             }
         }
+        // Dense q8_2f FFN fields: the exact-GELU branch alone stages them
+        // (the SiLU down GEMM fuses its activation into the X load), each
+        // as wide as the input it scales.
+        let ffn_in = [l.gate.2, l.up.2, l.down.2];
+        if l.ffn_col.iter().any(|f| !f.is_empty())
+            && (l.act != 1
+                || l.moe.is_some()
+                || l.g4.is_some()
+                || l.ffn_col
+                    .iter()
+                    .zip(ffn_in)
+                    .any(|(f, w)| !f.is_empty() && f.len() != w))
+        {
+            return false;
+        }
         // Gemma-4: q8_2f weights take the blob GEMM — its payload, row
         // scales and input field inside the mapping, K a multiple of 32.
         let mut q8f = [false; 7];
@@ -12526,14 +12779,22 @@ pub fn chunk_run_gpu(
     // q8_2f: x·col staged for the projection that reads it (serial
     // encoders order the reuse).
     let xpre = io_buf(c, 75_000_000_019 + b * hs.max(qw), b * hs.max(qw) * 4);
-    let col_scale = |enc: &metal::ComputeCommandEncoderRef, x: &Buffer, col: &[f32], n: usize| {
+    // y = x·col over b rows of n (elementwise, so y may be x).
+    let col_scale_into = |enc: &metal::ComputeCommandEncoderRef,
+                          x: &Buffer,
+                          col: &[f32],
+                          n: usize,
+                          y: &Buffer| {
         enc.set_compute_pipeline_state(&c.colscale);
         enc.set_buffer(0, Some(x), 0);
         enc.set_buffer(1, Some(&const_buf(c, col)), 0);
-        enc.set_buffer(2, Some(&xpre), 0);
+        enc.set_buffer(2, Some(y), 0);
         let n_u = n as u32;
         enc.set_bytes(3, 4, &n_u as *const u32 as *const std::ffi::c_void);
         enc.dispatch_threads(MTLSize::new(n as u64, b as u64, 1), MTLSize::new(256, 1, 1));
+    };
+    let col_scale = |enc: &metal::ComputeCommandEncoderRef, x: &Buffer, col: &[f32], n: usize| {
+        col_scale_into(enc, x, col, n, &xpre)
     };
     // Embedding source: validated up front; refusal keeps the CPU h.
     let embed_prep: Option<(usize, Buffer, Buffer)> = embed.and_then(|e| {
@@ -13048,32 +13309,29 @@ pub fn chunk_run_gpu(
         } else {
             {
                 let enc = cmd.new_compute_command_encoder();
-                enc_mul_mm(
-                    c,
-                    enc,
-                    &fbuf,
-                    prep.abs[4],
-                    &prep.rs[4],
-                    prep.kind[4],
-                    &n_b,
-                    &gb,
-                    b,
-                    l.gate.1,
-                    l.gate.2,
-                );
-                enc_mul_mm(
-                    c,
-                    enc,
-                    &fbuf,
-                    prep.abs[5],
-                    &prep.rs[5],
-                    prep.kind[5],
-                    &n_b,
-                    &ub,
-                    b,
-                    l.up.1,
-                    l.up.2,
-                );
+                // q8_2f: each of gate and up reads n·(its own field); the
+                // serial encoder orders the reuse of the staging rows.
+                for (i, t, y) in [(4usize, &l.gate, &gb), (5, &l.up, &ub)] {
+                    let x = if l.ffn_col[i - 4].is_empty() {
+                        &n_b
+                    } else {
+                        col_scale(enc, &n_b, l.ffn_col[i - 4], hs);
+                        &xpre
+                    };
+                    enc_mul_mm(
+                        c,
+                        enc,
+                        &fbuf,
+                        prep.abs[i],
+                        &prep.rs[i],
+                        prep.kind[i],
+                        x,
+                        y,
+                        b,
+                        t.1,
+                        t.2,
+                    );
+                }
                 enc.end_encoding();
             }
             cmd = prof.cut(c, cmd, "mm_gateup");
@@ -13093,6 +13351,11 @@ pub fn chunk_run_gpu(
                     MTLSize::new((b * inter) as u64, 1, 1),
                     MTLSize::new(256, 1, 1),
                 );
+                // q8_2f down: its input field over the activation rows, in
+                // place (the kernel's own field indexes one row only).
+                if !l.ffn_col[2].is_empty() {
+                    col_scale_into(enc, &gb, l.ffn_col[2], inter, &gb);
+                }
                 enc.end_encoding();
                 let enc = cmd.new_compute_command_encoder();
                 enc_mul_mm(

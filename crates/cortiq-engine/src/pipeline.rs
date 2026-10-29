@@ -11314,18 +11314,20 @@ impl Pipeline {
                 t.q8_2f_parts().map_or(&[][..], |(_, _, _, _, cf)| cf)
             }
             let col = [cf(wq), cf(wk), cf(wv), cf(wo)];
+            let ffn_col = [cf(gate_t), cf(up_t), cf(down_t)];
             // q8_2f projections ride the chunk graph on the MoE layers it
-            // was measured on (Mellum2.1); dense q8_2f stacks keep the host
-            // walk until they are measured too. That includes a q8_2f
-            // gate/up/down behind q4/q8_row attention: the chunk FFN has no
-            // x·col staging, so it would run those weights without their
-            // input field (0.8.14 refused every q8_2f weight here).
+            // was measured on (Mellum2.1) and on the dense exact-GELU FFN
+            // (Spark-X2.6-4B q8_2f on the M4: the gate/up inputs staged as
+            // x·col, the down field applied after the activation —
+            // `ChunkLayer::ffn_col`). A dense SiLU q8_2f stack keeps the host
+            // walk: its down GEMM fuses the activation into the X-tile load
+            // and has no input field (0.8.14 refused every q8_2f weight here).
             // Gemma-4 reads every q8_2f weight through the blob GEMM with its
             // own field (`ChunkGemma4`), so its dense q8_2f stack rides.
             if moe.is_none()
                 && !gemma4
-                && (col.iter().any(|c| !c.is_empty())
-                    || [gate_t, up_t, down_t].iter().any(|t| !cf(t).is_empty()))
+                && ffn_act != Act::Gelu
+                && (col.iter().any(|c| !c.is_empty()) || ffn_col.iter().any(|c| !c.is_empty()))
             {
                 break;
             }
@@ -11402,6 +11404,13 @@ impl Pipeline {
                     layer_scale: lw.layer_scale,
                 }),
                 col,
+                // The plain dense branch alone reads it: routed experts and
+                // Gemma-4 carry their own fields.
+                ffn_col: if moe.is_none() && !gemma4 {
+                    ffn_col
+                } else {
+                    [&[][..]; 3]
+                },
                 moe,
             });
         }
