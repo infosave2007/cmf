@@ -1,100 +1,95 @@
 # Spark-X2.6-4B q8_2f on Metal (Mac mini M4, 10-core GPU, 24 GB) — 2026-10-29
 
-Branch `spark26-metal` (worktree `~/dev/cmf-spark26`, from master 4a5b848f = 0.8.40).
-Model: `infosave/Spark-X2.6-4B-cmf` default file `spark-x2.6-4b-q8_2f.cmf`,
-4,135,951,050 B, sha256 e9331f8f…494f (matches the HF LFS oid), in `~/models/spark-x2.6/`.
-Binaries: `cortiq-base` (0.8.40 as is), `cortiq-chunk` (this branch).
+Branch `spark26-metal` (worktree `~/dev/cmf-spark26`, from master 4a5b848f = 0.8.40), 5 commits,
+not pushed. Model: `infosave/Spark-X2.6-4B-cmf` default file `spark-x2.6-4b-q8_2f.cmf`,
+4,135,951,050 B, sha256 e9331f8f…494f (= HF LFS oid), in `~/models/spark-x2.6/`.
 
-Shape: 36 layers (9 full + 27 sliding 512), hidden 2560, FFN 10240 (exact GELU),
-16 Q heads × 256, 4 KV heads, tied q8_2f head [131072 × 2560]. Per decode token the
-weights read are 36 × 105 MB + 336 MB head ≈ 4.12 GB.
+Shape: 36 layers (9 full + 27 sliding 512), hidden 2560, FFN 10240 (exact GELU), 16 Q heads × 256,
+4 KV heads, tied q8_2f head [131072 × 2560]. A decode token reads ≈ 4.12 GB of weights.
 
-## Measurement conditions (read before the numbers)
+## Measurement conditions
 
-- Another session ran a GPU compress A/B (`cmf-compress-runs/fold-dev-ab-20261029`,
-  `cortiq-fd compress`) and cargo builds from ~12:04 to ~12:55. Every number taken in
-  that window is contaminated (decode fell to 4.5 tok/s, GPU clock includes the other
-  job's work) and is NOT in the tables below except where marked.
-- Run-to-run drift of the M4 is large even on a quiet machine: the same GEMM process
-  gave 2.90 and 2.25 TFLOP/s back to back; decode `bench` gave 14.1 and 18.1 tok/s in
-  two runs of the same binary. Only interleaved arms (A,B,A,B) are compared.
-- The owner paused testing at ~13:00 (parallel task); the A/B below stopped after two
-  full pairs.
+- Run-to-run drift of the M4 is large: one GEMM process gave 2.90 and 2.25 TFLOP/s back to back;
+  one decode bench 14.1 and 18.1 tok/s. Only interleaved arms (A,B,A,B), in-process A/B
+  (`CMF_METAL_AB`) or ratios inside one profiled run are compared.
+- 12:04–12:55 another session's GPU compress A/B ran; those numbers are excluded.
+- From ~14:30 the GPU showed 36–80 % utilization with no model process running (desktop rendering:
+  WindowServer 45 % CPU, Comet and Claude renderers). Absolute numbers after that are lower
+  (e.g. prefill 4k 152 vs 261 tok/s in the morning) and are only used as ratios.
 
-## Before / after
+## Before / after (binaries: base = 0.8.40, new = branch head)
 
-`cortiq bench <file> --core --ignore-eos --ctx 1000 --tokens 32`, arms interleaved, quiet GPU:
+| what | base | new | how |
+|---|---:|---:|---|
+| prefill, 1000-token prompt | 117.8 / 112.2 tok/s | 215.9 / 197.4 tok/s | interleaved pairs, quiet GPU |
+| prefill, 41-token prompt | 91.2 / 85.7 / 99.0 | 203.0 / 202.2 / 204.1 | interleaved pairs, quiet GPU |
+| prefill, 20–30-token prompt (`run`) | 0.85–1.29 s | 0.16–0.20 s | same binary, `CMF_CHUNK_MIN_B=32` = old path |
+| chat turn 2 via `serve`, 2.3k history, 65 new tokens | 11.3 s (2323 tok) | 0.58 s (65 tok) | same binary, `CMF_KV_ROLLBACK=0` = old path |
+| chat turn 2 after a 700-token answer | 16.7 s (2975 tok) | 4.7 s (717 tok) | same |
+| `cortiq ppl --tokens 4096` wall (CMF_GPU=1) | 55 s | 19 s | back to back |
+| prefill 4000 / 8000 tokens (new only, quiet) | — | 261.3 / 214.7 tok/s | |
+| decode | unchanged | 16–19 tok/s short, 17.1 @4k, 15.6 @8k | no decode change kept |
 
-| pair | base prefill | chunk prefill | base decode | chunk decode |
-|---|---:|---:|---:|---:|
-| 1 | 117.8 | **215.9** | 17.6 | 18.2 |
-| 2 | 112.2 | **197.4** | 16.5 | 16.7 |
-| 3 | 87.5 | (stopped) | 13.8 | (stopped) |
+CPU path, same file: prefill 19.9 tok/s (41 tokens, a foreign build running), decode 9.3 tok/s
+then; on a quiet machine CPU decode reached 19.9 tok/s on a short prompt — decode is bandwidth-bound
+and the CPU and GPU share the same memory.
 
-Prefill ×1.76–1.83 per pair at 1000 tokens; decode unchanged (no decode code changed).
+Quality: `cortiq ppl` 4096 tokens wikitext-2 (BOS in front): CPU 10.717, base Metal 10.717,
+new Metal 10.716 (card: 10.71 on Vulkan). Greedy outputs identical new Metal vs base Metal on every
+prompt checked (96-token bakery prompt also = CPU; on the 24-token haiku the CPU differs from both
+Metal paths at token ~10 — a pre-existing Metal/CPU float difference). Chat turn 2 with rollback
+reuse = fresh prefill, character for character (48- and 700-token answers).
 
-CPU path, same file (`CMF_GPU=0`, a foreign rustc build was running, so understated):
-prefill 19.9 tok/s (41-token prompt), decode 9.3 tok/s.
+## What changed (kept)
 
-Not yet measured cleanly (pending the owner's go): the short-prompt (41 tokens) prefill
-pair, `cortiq ppl` CPU vs `CMF_GPU=1`, decode at depth with the split-K attend lever.
+1. **Dense q8_2f GELU stacks ride the Metal chunk prefill graph** (d3b48ecb). `chunk_run_gpu`
+   refused every dense q8_2f layer ("the chunk FFN has no x·col staging"), so the default file
+   prefilled on the host per-op walk. gate/up read `n·col` staged like q/k/v; down's field scales
+   the GELU rows in place before its GEMM (`ChunkLayer::ffn_col`). SiLU dense q8_2f stays on the
+   host walk (its down GEMM fuses SiLU and has no field).
+2. **Chat-turn KV reuse rolls back to the common prefix** (c821c8c8). Reuse was extension-only;
+   a chat app re-renders the previous answer through the template, so every turn re-prefilled the
+   whole history. `rollback_prefix_len` keeps the longest common prefix when every layer can drop
+   its rows exactly (host-owned f32 full attention, no recurrent/O(1)/bounded state, sliding tails
+   still holding the window); the sliding tail trim is anchored at the turn's prompt end
+   (`trim_window_anchored`) so a long answer stays droppable (costs ~216 KB per answer token in the
+   27 sliding layers until the next turn). `CMF_KV_ROLLBACK=0` restores the old behaviour.
+3. **Spark prompts of 8..31 tokens take the chunk graph** (9eaa95d4). The graph's 32-row floor
+   (from its first commit, measured on Qwen2.5-0.5B) sent short prompts to the host walk.
+   `Pipeline::chunk_min_rows` = 8 for spark2_5, 32 for every other model, `CMF_CHUNK_MIN_B`
+   overrides. Prompts ≤ 7 tokens keep their faster per-position path (47–102 ms).
+4. **Chunk attention P·V GEMM** (773b52a7): K steps of 32 with packed float4 loads instead of 16
+   with bounds-checked scalars; same 8x8 blocks in the same k order (ppl and greedy unchanged).
+   Deepest 4k chunk, normalized to the gate/up GEMM of the same run: P·V 0.54 → 0.40 (−27 %,
+   ~4.5 % of that chunk). End to end not resolvable under the desktop GPU load.
+5. Diagnostics: `q8f_kernel_bench` / `q8_mm_kernel_bench` + `tests/metal_q8f_bench.rs` (ignored);
+   test `swa_anchored_trim_keeps_the_rollback_window`.
 
-## What changed
+## Measured and rejected
 
-### 1. Dense q8_2f stacks ride the Metal chunk prefill graph (kept)
+- **Decode matvec** is at the roof: `q8f_matvec_r4` 85–91 GB/s per projection kind on a quiet GPU;
+  best variant (`q8f_mv_h4`, 8-byte loads) +1–4 % on most shapes, ~2 % weighted — inside drift.
+  Matvecs ≈ 47–48 ms of a 51–62 ms token → decode runs at ~85 % of weight streaming.
+- **Fused q8_2f decode** (gate|up|GELU one dispatch, O/down residual epilogues, bit-exact):
+  in-process A/B 0.992 (short) / 1.001 (1k) — barriers are not the cost. Reverted.
+- **Split-K GQA attend from 64 positions** (`CMF_METAL_AB=mcfr/mcfrb`): 1.001 @1k, 1.002 @4k.
+- **64×64 GEMM tile** (k2.metal, bit-identical): neutral to −10 % vs the built-in 64×32
+  `q8_mul_mm`, which runs 2.3–3.1 TFLOP/s at b=512.
+- **Scores GEMM vector loads** (mul_mm_f32nt): ratio unchanged (0.366 → 0.363). Reverted.
 
-Diagnosis: `CMF_PREFILL_PROF=1` showed Spark's prompt on the host per-op layer walk
-(`prefill-split … zi_mm GEMMs 0`), `CMF_CHUNK_PROF=1` printed nothing. Cause:
-`Pipeline::chunk_run_gpu` refused every dense q8_2f layer on purpose — "the chunk FFN
-has no x·col staging" — so the default (q8_2f) file never reached the one-submission
-chunk graph, while the attention projections already staged x·col there.
+## Where the time goes now
 
-Fix (`pipeline.rs` gate + `gpu_metal.rs` chunk FFN):
-- `ChunkLayer::ffn_col` carries the gate/up/down input fields.
-- gate and up each read `n·col` staged by `col_scale_rows` (as q/k/v already do);
-  down's field scales the GELU activation rows in place before the down GEMM
-  (`gelu_mul_pre`'s own field indexes one row only, so it cannot be reused for b rows).
-- Opened for the exact-GELU dense FFN only (what was measured). A dense SiLU q8_2f
-  stack keeps the host walk: its down GEMM fuses SiLU into the X-tile load and has no
-  input field. The Metal prep refuses a mismatched field width or a non-GELU layer.
-
-Check: greedy 96 tokens (`run --greedy --no-think`, 140-token prompt) identical for
-chunk Metal, base Metal and CPU. Chunk stage profile (one 512-row chunk, contended
-run, shares only): gate/up GEMM 36 %, down 23 %, QKV 13 %, O 7 %, attention 15 %,
-norms/RoPE/axpy 6 %.
-
-### 2. Kernel bench harness (kept, diagnostics only)
-
-`gpu_metal::q8f_kernel_bench` (decode matvec) and `gpu_metal::q8_mm_kernel_bench`
-(prefill GEMM): every tensor of one projection kind across the layers (no tensor warm
-in the system cache), all reps in one command buffer on the GPU clock, built-in
-pipelines or an entry point compiled from an MSL file at runtime (kernel iteration
-without an engine rebuild). Driver: `tests/metal_q8f_bench.rs` (ignored tests):
-
-    CMF_GPU=1 CMF_BENCH_MODEL=<file> cargo test --release -p cortiq-engine \
-      --test metal_q8f_bench -- --ignored --nocapture
-
-## Findings that closed levers (measured, not pursued)
-
-- **Decode matvec is at the bandwidth roof.** The four-row `q8f_matvec_r4` the Spark
-  plan already opens runs 88–98 GB/s per projection kind (kbench1.txt; contended run,
-  so a lower bound): q 92, k 78, o 88, gate 94, down 92, head 98 GB/s. All matvecs of a
-  token sum to ~44.5 ms; a quiet decode token is ~51 ms GPU at short context. Wide
-  16-byte-load variants (k1.metal, w1/w2/w4/w8/h2/h4) were within ±3 % of r4 on every
-  shape. Ceiling for this file on the M4 ≈ 23–24 tok/s; the base already reaches 18.
-- **64×64 GEMM tile** (k2.metal, bit-identical output): neutral to −10 % against the
-  built-in 64×32 `q8_mul_mm` on a quiet GPU (mmbench_clean1.txt). The built-in runs
-  2.3–3.1 TFLOP/s at b=512.
-- Decode GPU time grows ~2 ms per 100 positions (51 → 57 ms over 300 tokens): the
-  per-head `gqa_attend` (16 threadgroups, K/V re-read per Q head) serves every layer
-  under 512 positions, so all 27 sliding layers. The split-K GQA-shared kernel from 64
-  positions (`CMF_METAL_AB=mcfr/mcfrb`) read 1.03 (worse) but only under contention —
-  open, needs a quiet A/B at depth.
+- Prefill (deepest 4k chunk): weight GEMMs 64 % (at 2.3–3 TFLOP/s), attention 34 %
+  (scores ~1 TFLOP/s, P·V now ~1 TFLOP/s, softmax 4 %). Next lever for long prompts is a fused
+  flash-style causal attention (and scoring only the 512-row band on sliding layers, ~3 %).
+- Decode: weights 4.12 GB/token. For a ~2× faster decode on a MacBook the lever is the smaller
+  file (`spark-x2.6-4b-q4tp.cmf`, 2.16 GB, card ppl +10.9 %) — not measured here.
 
 ## Files here
 
-- `cortiq-base`, `cortiq-chunk` — the two arms.
-- `ab_prefill.sh` — interleaved bench A/B of two binaries.
-- `k1.metal` (matvec candidates), `k2.metal` (64×64 GEMM candidate) — rejected kernels.
-- `kbench1.txt`, `mmbench_clean1.txt`, `ab_chunk_ctx1000.txt` — raw outputs.
-- `out_*.txt`, `prompt1.txt` — the greedy comparison.
+- `cortiq-base` (0.8.40), `cortiq-chunk`, `cortiq-reuse`, `cortiq-minb`, `cortiq-attmm` — arms in order.
+- `ab_prefill.sh` (interleaved bench A/B), `chat2.sh` (two chat turns through `serve`).
+- `k1.metal` (matvec candidates), `k2.metal` (64×64 GEMM) — rejected kernels.
+- Raw outputs: `kbench1.txt`, `kbench_quiet.txt`, `mmbench_clean1.txt`, `ab_chunk_*.txt`,
+  `ab_attmm_*.txt`, `skip_ctx1000.txt`, `ppl_gpu.txt`, `serve*.log`, `r2*_*.json`, `out_*.txt`,
+  `short_*.txt`.
