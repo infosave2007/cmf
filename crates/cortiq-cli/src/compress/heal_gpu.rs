@@ -48,6 +48,11 @@ pub struct Cfg {
     pub batch: usize,
     pub topk: usize,
     pub eval_every: usize,
+    /// Evaluations without a new best before training stops (0 = never;
+    /// ignored under `genesis`)
+    pub patience: usize,
+    /// Val windows the held-out loss reads, evenly spread (0 = all)
+    pub val_windows: usize,
     pub clip: f64,
     /// Fraction of the steps the learning rate ramps up over.
     pub warm: f64,
@@ -126,7 +131,20 @@ pub fn heal(data: &Data, on: LossOn, student_path: &Path, teacher_path: &Path, o
     let mut tr: Vec<_> = data.split(TdataSplit::Train).collect();
     tr.sort_by_key(|r| fnv(&r.rid));
     let trw = windows(&Stream::build(tr.into_iter(), on, pad_id, 0), cfg.window, pad_id);
-    let vaw = windows(&Stream::build(data.split(TdataSplit::Val), on, pad_id, 0), cfg.window, pad_id);
+    let mut vaw = windows(&Stream::build(data.split(TdataSplit::Val), on, pad_id, 0), cfg.window, pad_id);
+    // the held-out loss only ranks the student's own checkpoints, always on
+    // the same windows: an evenly spread subset ranks them for a fraction of
+    // the cost (a check of all 98 windows of Qwen3.8 14B's val split cost
+    // as much as ~16 training steps, and the heal ran 31 of them)
+    let val_all = vaw.ids.len();
+    if cfg.val_windows > 0 && val_all > cfg.val_windows {
+        let pick: Vec<usize> = (0..cfg.val_windows).map(|i| i * val_all / cfg.val_windows).collect();
+        vaw = Windows {
+            ids: pick.iter().map(|&i| vaw.ids[i].clone()).collect(),
+            rows: pick.iter().map(|&i| vaw.rows[i].clone()).collect(),
+            next: pick.iter().map(|&i| vaw.next[i].clone()).collect(),
+        };
+    }
     let nb = cfg.batch;
     let n_train_b = trw.ids.len() / nb;
     let n_val_b = (vaw.ids.len() / nb).max(usize::from(!vaw.ids.is_empty()));
@@ -245,7 +263,7 @@ pub fn heal(data: &Data, on: LossOn, student_path: &Path, teacher_path: &Path, o
     let trained = snet.trained_entries();
     let total_steps = ((cfg.epochs * n_train_b as f64).ceil() as usize).max(1);
     log(&format!(
-        "S4 (device): layers {}..{} trained{} ({:.1} M weights), {} train windows + {} val of {} tokens, batch {nb}, top-{k}, {total_steps} steps, lr {}; teacher pass {:.0}s",
+        "S4 (device): layers {}..{} trained{} ({:.1} M weights), {} train windows + {} val (of {val_all}) of {} tokens, batch {nb}, top-{k}, {total_steps} steps, lr {}; teacher pass {:.0}s",
         cfg.train_from,
         snet.geom.nl - 1,
         if cfg.ffn_only { " (MLP only)" } else { "" },
@@ -343,6 +361,9 @@ pub fn heal(data: &Data, on: LossOn, student_path: &Path, teacher_path: &Path, o
                 eprintln!("\n  step {done}: held-out loss {e:.5} (best {:.5})", best.0.min(e));
                 if e < best.0 {
                     best = (e, nt::snapshot(c, &snet, false).context("snapshot")?, done);
+                } else if cfg.patience > 0 && !cfg.genesis && done - best.2 >= cfg.patience * cfg.eval_every && done < total_steps {
+                    eprintln!("  no new best in {} evaluations: stopping at step {done} of {total_steps}", cfg.patience);
+                    break 'outer;
                 }
             }
         }
@@ -407,6 +428,17 @@ pub struct MaskCfg {
     /// first was the best one in every run: the held-out loss grows with the
     /// pruning).
     pub settle: usize,
+    /// Gates on the layers from this one (0 = all): the layers below run once
+    /// per batch, their output cached on the host, and only the tail sits on
+    /// the device with its backward planes (a 27B's full backward does not
+    /// fit 96 GB).
+    pub train_from: usize,
+    /// Score checkpoints with the soft gates σ(m) — what a Soft-Fold bake
+    /// writes — instead of the hard mask σ > τ.
+    pub soft: bool,
+    /// Train batches used (0 = all): with a cached prefix each costs its
+    /// prefix pass and host memory.
+    pub max_batches: usize,
 }
 
 pub struct MaskReport {
@@ -429,7 +461,10 @@ pub fn learn_masks(data: &Data, on: LossOn, model_path: &Path, cfg: &MaskCfg, lo
     let trw = windows(&Stream::build(tr.into_iter(), on, pad_id, 0), cfg.window, pad_id);
     let vaw = windows(&Stream::build(data.split(TdataSplit::Val), on, pad_id, 0), cfg.window, pad_id);
     let nb = cfg.batch;
-    let n_train_b = trw.ids.len() / nb;
+    let mut n_train_b = trw.ids.len() / nb;
+    if cfg.max_batches > 0 {
+        n_train_b = n_train_b.min(cfg.max_batches);
+    }
     let n_val_b = (vaw.ids.len() / nb).max(usize::from(!vaw.ids.is_empty()));
     anyhow::ensure!(n_train_b > 0 && n_val_b > 0, "DTG-MA: {} train / {} val windows of {} tokens", trw.ids.len(), vaw.ids.len(), cfg.window);
     // a batch: ids and one-hot targets weighted by the row's score (the
@@ -445,22 +480,40 @@ pub fn learn_masks(data: &Data, on: LossOn, model_path: &Path, cfg: &MaskCfg, lo
         let tot = wt.iter().map(|&x| x as f64).sum();
         (ids, nx, wt, tot)
     };
-    let mut net = nt::Net::load(c, &model, true, true, None).map_err(|e| anyhow::anyhow!("DTG-MA: {e}"))?;
+    // the frozen prefix once per batch (train, then val), kept in f16
+    let nl = model.arch().num_layers;
+    let from = cfg.train_from.min(nl.saturating_sub(1));
+    let mut h0s: Vec<Vec<u16>> = Vec::new();
+    if from > 0 {
+        let tp = Instant::now();
+        let pnet = nt::Net::load_prefix(c, &model, from).map_err(|e| anyhow::anyhow!("DTG-MA prefix: {e}"))?;
+        let pw = nt::Work::new(c, &pnet, nb, cfg.window);
+        for b in 0..n_train_b + n_val_b {
+            let (ids, ..) = if b < n_train_b { batch(&trw, b) } else { batch(&vaw, b - n_train_b) };
+            let h = nt::prefix_hidden(c, &pnet, &pw, &ids).context("DTG-MA prefix pass failed")?;
+            h0s.push(h.iter().map(|&x| cortiq_core::quant::f32_to_f16(x)).collect());
+            eprint!("\r  prefix: batch {}/{}   ", b + 1, n_train_b + n_val_b);
+        }
+        eprintln!();
+        log(&format!("S2 (device): layers 0..{from} run once ({:.0}s, {:.1} GB of f16 activations on the host); the gates sit on {from}..{}", tp.elapsed().as_secs_f64(), h0s.iter().map(|h| h.len() * 2).sum::<usize>() as f64 / 1e9, nl - 1));
+    }
+    let h0 = |b: usize| -> Option<Vec<f32>> { (from > 0).then(|| h0s[b].iter().map(|&x| cortiq_core::quant::f16_to_f32(x)).collect()) };
+    let mut net = if from > 0 { nt::Net::load_tail(c, &model, from) } else { nt::Net::load(c, &model, true, true, None) }.map_err(|e| anyhow::anyhow!("DTG-MA: {e}"))?;
     net.enable_masks(c);
     let work = nt::Work::new(c, &net, nb, cfg.window);
     let val = |net: &nt::Net| -> Result<f64> {
         let (mut s, mut t) = (0.0, 0.0);
         for e in 0..n_val_b {
             let (ids, nx, wt, tot) = batch(&vaw, e);
-            s += nt::loss_sum(c, net, &work, &ids, &nx, &wt, 1, true).context("DTG-MA eval failed")?;
+            s += nt::loss_sum_h(c, net, &work, &ids, h0(n_train_b + e).as_deref(), &nx, &wt, 1, true).context("DTG-MA eval failed")?;
             t += tot;
         }
         Ok(s / t.max(1e-9))
     };
-    let intro = format!("{} train + {} val windows of {} tokens, batch {nb}", trw.ids.len(), vaw.ids.len(), cfg.window);
+    let intro = format!("{} train + {} val windows of {} tokens, batch {nb}", n_train_b * nb, vaw.ids.len(), cfg.window);
     let step = |b: usize, gs: f32| {
         let (ids, nx, wt, tot) = batch(&trw, b);
-        nt::step_w(c, &net, &work, &ids, &nx, &wt, 1, gs, None, Some(tot))
+        nt::step_wh(c, &net, &work, &ids, h0(b).as_deref(), &nx, &wt, 1, gs, None, Some(tot))
     };
     train_masks(c, &net, n_train_b, &step, &|| val(&net), cfg, log, "S2 (device)", &intro)
 }
@@ -481,7 +534,8 @@ pub fn train_masks(
     what: &str,
     intro: &str,
 ) -> Result<MaskReport> {
-    let widths: Vec<usize> = net.layers.iter().map(|l| l.gate.m()).collect();
+    // the gated layers only (`first..end`: a tail net leaves the prefix out)
+    let widths: Vec<usize> = net.layers[net.first..net.end].iter().map(|l| l.gate.m()).collect();
     let n_all: usize = widths.iter().sum();
     let target = (1.0 - cfg.keep_frac).clamp(0.0, 0.95);
     let sig = |x: f32| 1.0 / (1.0 + (-x).exp());
@@ -561,7 +615,12 @@ pub fn train_masks(
             eprint!("\r  mask step {done} · loss {:.4} · L1 {l1:.3} · {:.2} s/step   ", st.loss, secs / done as f64);
             if done % cfg.eval_every == 0 {
                 let (hs, alive) = hard(&logits);
-                net.set_masks(c, &hs).context("masks")?;
+                if cfg.soft {
+                    let soft: Vec<Vec<f32>> = logits.iter().map(|l| l.iter().map(|&x| sig(x)).collect()).collect();
+                    net.set_masks(c, &soft).context("masks")?;
+                } else {
+                    net.set_masks(c, &hs).context("masks")?;
+                }
                 let e = val()?;
                 let pruned = 1.0 - alive as f64 / n_all as f64;
                 if pruned < target {

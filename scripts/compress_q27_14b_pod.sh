@@ -77,7 +77,8 @@ check)
   ;;
 run)
   need_disk "${RUN_DISK_GB:-200}"
-  nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 5 > "$ROOT/gpu.csv" &
+  # appended: a resumed run keeps the earlier stages' samples
+  nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 5 >> "$ROOT/gpu.csv" &
   mon=$!
   log "run $POINT: heal ${HEAL_LOSS:-ce}, ${HEAL_EPOCHS} epochs, layers ${HEAL_LAYERS:-auto}"
   rc=0

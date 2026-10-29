@@ -595,12 +595,15 @@ impl Pipeline {
     /// independent FFN calibration. Layer `k` consumes
     /// `(hidden[j], ids[j + k + 1])`, exactly the convention used by
     /// `mimo_mtp_draft`; it does not read or aggregate the trunk FFN probe.
+    /// `trunk` holds the trunk's hidden rows for `ids[..len-1]`
+    /// ([`Pipeline::probe_trunk_rows`]).
     pub(crate) fn mimo_mtp_ffn_probe_teacher_forced(
         &mut self,
         st: &mut MimoMtp,
         ids: &[u32],
+        trunk: &[f32],
     ) -> Result<Vec<MtpFfnProbe>, String> {
-        self.mimo_mtp_ffn_probe_teacher_forced_chunked(st, ids, MTP_FFN_PROBE_CHUNK_ROWS)
+        self.mimo_mtp_ffn_probe_teacher_forced_chunked(st, ids, trunk, MTP_FFN_PROBE_CHUNK_ROWS)
     }
 
     /// Test-visible chunk-width variant. Production uses the fixed bounded
@@ -611,20 +614,29 @@ impl Pipeline {
         &mut self,
         st: &mut MimoMtp,
         ids: &[u32],
+        trunk: &[f32],
         chunk_rows: usize,
     ) -> Result<Vec<MtpFfnProbe>, String> {
-        self.mimo_mtp_ffn_probe_teacher_forced_chunked(st, ids, chunk_rows)
+        self.mimo_mtp_ffn_probe_teacher_forced_chunked(st, ids, trunk, chunk_rows)
     }
 
     fn mimo_mtp_ffn_probe_teacher_forced_chunked(
         &mut self,
         st: &mut MimoMtp,
         ids: &[u32],
+        trunk: &[f32],
         chunk_rows: usize,
     ) -> Result<Vec<MtpFfnProbe>, String> {
         let hs = self.hidden_size;
         if chunk_rows == 0 {
             return Err("MiMo MTP FFN probe: chunk width must be positive".into());
+        }
+        if trunk.len() != ids.len().saturating_sub(1) * hs {
+            return Err(format!(
+                "MiMo MTP FFN probe: {} trunk values for {} rows of width {hs}",
+                trunk.len(),
+                ids.len().saturating_sub(1)
+            ));
         }
         let post_norm_hidden = st.post_norm_hidden;
         let mut out = Vec::with_capacity(st.layers.len());
@@ -645,26 +657,12 @@ impl Pipeline {
         }
 
         // Layer zero needs trunk rows 0..ids.len()-1; deeper drafts need a
-        // prefix only. Advance the trunk exactly once in causal order, then
-        // feed each independent draft layer the usable part of that chunk.
+        // prefix only. Feed each independent draft layer the usable part of
+        // every chunk of the trunk rows.
         let trunk_rows = ids.len().saturating_sub(1);
         for chunk_start in (0..trunk_rows).step_by(chunk_rows) {
             let chunk_end = (chunk_start + chunk_rows).min(trunk_rows);
-            let rows = chunk_end - chunk_start;
-            let hidden_len = rows
-                .checked_mul(hs)
-                .ok_or_else(|| "MiMo MTP FFN probe: hidden chunk size overflows usize".to_string())?;
-            let mut hiddens = Vec::with_capacity(hidden_len);
-            for position in chunk_start..chunk_end {
-                let hidden = self.forward_layers(&self.embed_single(ids[position]), position, None);
-                if hidden.len() != hs {
-                    return Err(format!(
-                        "MiMo MTP FFN probe: trunk hidden width {} != {hs}",
-                        hidden.len()
-                    ));
-                }
-                hiddens.extend_from_slice(&hidden);
-            }
+            let hiddens = &trunk[chunk_start * hs..chunk_end * hs];
 
             for (layer_index, (m, probe)) in st.layers.iter_mut().zip(out.iter_mut()).enumerate() {
                 let layer_end = chunk_end.min(ids.len().saturating_sub(layer_index + 1));
