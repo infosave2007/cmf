@@ -7096,21 +7096,27 @@ kernel void q4tp_mul_mm(
             // them in the loop cost Lumina's DiT enough that the runtime probe
             // preferred the CPU GEMM outright — the "the GEMM's arithmetic
             // hides the chain" argument held for FFN shapes and not for this.
-            float scale = exp2(row_lo + (float)code * row_st);
+            // wboost is a power of two (or 1): folded into the scale it
+            // rounds exactly as the per-weight multiply did.
+            float scale = exp2(row_lo + (float)code * row_st) * wboost;
             device const uchar* nib = q + ((ulong)(r0 + lr0) * gpr + (ulong)g) * 16ul + 8u * il0;
             uint sy = (tiitg / 2u) / 8u;
             uint lx = (tiitg / 2u) % 8u;
             float wv[16];
+            // The 8 nibble bytes in one 8-byte load (the tile is 16-byte
+            // aligned, this half at +8·il0) — eight byte loads were the
+            // W-side cost; the same nibbles, the same products.
+            uint2 nb2 = *(device const uint2*)nib;
             for (uint i = 0; i < 8u; ++i) {
-                uint bb = nib[i];
+                uint bb = ((i < 4u ? nb2.x : nb2.y) >> (8u * (i & 3u))) & 0xFFu;
                 wv[2u * i]      = ((float)(bb & 0xFu) - 8.0f) * scale;
                 wv[2u * i + 1u] = ((float)(bb >> 4u) - 8.0f) * scale;
             }
             uint ib0 = 8u * (2u * il0) + sy;
             uint ib1 = 8u * (2u * il0 + 1u) + sy;
             for (uint i = 0; i < 8u; ++i) {
-                sa[64u * ib0 + 8u * i + lx] = (half)(wv[i] * wboost);
-                sa[64u * ib1 + 8u * i + lx] = (half)(wv[i + 8u] * wboost);
+                sa[64u * ib0 + 8u * i + lx] = (half)wv[i];
+                sa[64u * ib1 + 8u * i + lx] = (half)wv[i + 8u];
             }
         }
         // X: 8 consecutive floats → one 8x8-block row (identical to q8).
