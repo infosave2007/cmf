@@ -9292,7 +9292,35 @@ async fn cmd_run(
                         st.prompt_s,
                         st.device_layers
                     );
-                    if st.device_layers == 0 && st.passes > 0 {
+                    if st.metal_passes > 0 {
+                        let mp = |x: f64| 1e3 * x / st.metal_passes as f64;
+                        println!(
+                            "[Metal passes: {} · device {:.0} (executing {:.0}) · routing {:.1} · expert fills {:.1} ms/pass · expert cache {:.1}% hits]",
+                            st.metal_passes,
+                            mp(st.metal_gpu_s),
+                            mp(st.metal_exec_s),
+                            mp(st.metal_route_s),
+                            mp(st.metal_fill_s),
+                            100.0 * st.expert_hits as f64 / (st.expert_hits + st.expert_misses).max(1) as f64
+                        );
+                    }
+                    if st.metal_stage_s.iter().any(|&x| x > 0.0) {
+                        let mp = |x: f64| 1e3 * x / st.metal_passes.max(1) as f64;
+                        let s = st.metal_stage_s;
+                        println!(
+                            "[Metal stages: gdn {:.0} · attention {:.0} · norm+router {:.0} · experts: gather {:.0} gate|up {:.0} act {:.0} down {:.0} combine {:.0} · head {:.0} ms/pass]",
+                            mp(s[0]),
+                            mp(s[1]),
+                            mp(s[2]),
+                            mp(s[3]),
+                            mp(s[4]),
+                            mp(s[5]),
+                            mp(s[6]),
+                            mp(s[7]),
+                            mp(s[8])
+                        );
+                    }
+                    if st.device_layers == 0 && st.passes > st.metal_passes {
                         println!(
                             "[host passes: gdn {:.0} · attention {:.0} · moe {:.0} · head {:.0} ms/pass]",
                             per(st.gdn_s),

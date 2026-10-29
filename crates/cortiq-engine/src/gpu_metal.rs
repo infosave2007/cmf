@@ -43,6 +43,10 @@ pub mod moe_q8;
 #[doc(hidden)]
 pub mod gemma4;
 
+// Block-diffusion (Clover) passes and commits — child module, `gpu_metal/clover.rs`.
+#[doc(hidden)]
+pub mod clover;
+
 // Native Metal scratch buffers are process-wide (the command queue and
 // `Ctx::io_bufs` are shared by all pipelines).  A buffer is safe to reuse
 // only after the owning pipeline's command buffer has completed; two server

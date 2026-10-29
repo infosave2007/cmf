@@ -64,7 +64,8 @@ cortiq run clover-35b-a3b-preview-q4tp-v2.cmf --prompt "Write a Python function 
 
 On Vulkan every denoising pass is one GPU submission (34 ms for a 32-token
 block on an RTX 5090: ~26 tok/s on prose, 80–95 on code at the release's
-threshold). Converting, the generation controls and the measurements:
+threshold); on Apple silicon the passes run on Metal (Mac mini M4, 24 GB:
+3.2 tok/s on prose, 6.5–9 on code, 0.8.41). Converting, the generation controls and the measurements:
 [docs/CLOVER.md](docs/CLOVER.md). The same release cuts the VRAM of every
 MoE graph on Vulkan: a 35B-A3B q4tp stack takes 18.8 GB instead of 31.8 GB,
 and the published Qwen3.6-35B-A3B decodes at 156 tok/s on a 32 GB card.
