@@ -21218,6 +21218,20 @@ fn init(dev: usize) -> Result<Ctx, String> {
         label: Some("q8"),
         source: wgpu::ShaderSource::Wgsl(wgsl_main_source().into()),
     });
+    // Workgroup-memory zeroing is code naga injects at the top of every
+    // kernel. On a non-Apple GPU under Metal (the AMD / Intel GPUs of Intel
+    // Macs) it costs ~0.5-2 ms a dispatch: a Radeon Pro 560X decoded
+    // Spark-X2.6-4B q4tp at 1.1 tok/s with it and 9.9 without, and the
+    // zeroed run's greedy text even drifted from the CPU's while the plain
+    // one matches it to the byte. The main module's kernels write their
+    // workgroup arrays before reading them (the wgpu tests pass without the
+    // zeroing there), so those devices skip it. `CMF_WGPU_NOZERO=1|0` forces
+    // either way.
+    let zero_wg = match std::env::var("CMF_WGPU_NOZERO").as_deref() {
+        Ok("1") => false,
+        Ok("0") => true,
+        _ => !(info.backend == wgpu::Backend::Metal && !info.name.starts_with("Apple")),
+    };
     if let Some(e) = pollster::block_on(msc.pop()) {
         // The module's own diagnostic names the offending line; without
         // it every pipeline built from the module reports the same
@@ -21234,7 +21248,10 @@ fn init(dev: usize) -> Result<Ctx, String> {
             layout: None, // auto: layout is inferred from the shader
             module: &module,
             entry_point: Some(ep),
-            compilation_options: Default::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                zero_initialize_workgroup_memory: zero_wg,
+                ..Default::default()
+            },
             cache: pcache.as_ref(),
         })
     };
@@ -55055,6 +55072,170 @@ fn main() {
     /// of 16 rows on 170 SMs) and split-K is the medicine; if both sit at
     /// the same fraction of the bus, the kernel is. `cargo test --release
     /// --features gpu -- --ignored wgpu_q4tp_matvec_shape_bandwidth --nocapture`.
+    /// Decode q4tp matvec variants on the device (one-vector, the token
+    /// graph's call): synthetic weights uploaded device-local through a staged
+    /// write, every Spark-X2.6 decode shape, `q4tp_matvec16w` as the reference.
+    /// Candidates come from `CMF_MV_WGSL` (WGSL appended to the main module;
+    /// its leading `enable` lines go first) named by `CMF_MV_KERNELS`
+    /// (`entry:rows_per_workgroup`, comma-separated), same bindings as the
+    /// reference. One pass of `CMF_MM_REPS` dispatches per shape, wall clock.
+    /// `cargo test --release --features gpu -- --ignored wgpu_q4tp_mv_variants --nocapture`.
+    #[test]
+    #[ignore]
+    fn wgpu_q4tp_mv_variants() {
+        use std::time::Instant;
+        unsafe { std::env::set_var("CMF_GPU", "wgpu") };
+        let Some(c) = ctx() else {
+            eprintln!("no wgpu adapter — skipping");
+            return;
+        };
+        let _op = c.op_gate.enter();
+        let reps = env_usize("CMF_MM_REPS", 50);
+        let zero = std::env::var("CMF_WGPU_NOZERO").as_deref() != Ok("1");
+        let mut arms: Vec<(String, wgpu::ComputePipeline, u32)> =
+            vec![("q4tp_matvec16w".into(), c.q4tp_mv16w.clone(), 16)];
+        if let (Ok(path), Ok(list)) = (std::env::var("CMF_MV_WGSL"), std::env::var("CMF_MV_KERNELS")) {
+            let extra = std::fs::read_to_string(path).expect("read CMF_MV_WGSL");
+            let (head, body): (Vec<&str>, Vec<&str>) =
+                extra.lines().partition(|l| l.trim_start().starts_with("enable "));
+            let src = format!("{}\n{}\n{}", head.join("\n"), wgsl_main_source(), body.join("\n"));
+            let scope = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let module = c.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("mv-variants"),
+                source: wgpu::ShaderSource::Wgsl(src.into()),
+            });
+            if let Some(e) = pollster::block_on(scope.pop()) {
+                panic!("variant module: {e}");
+            }
+            for spec in list.split(',') {
+                let (name, rpw) = spec.split_once(':').expect("entry:rows_per_wg");
+                let pipe = c.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(name),
+                    layout: None,
+                    module: &module,
+                    entry_point: Some(name),
+                    compilation_options: wgpu::PipelineCompilationOptions {
+                        zero_initialize_workgroup_memory: zero,
+                        ..Default::default()
+                    },
+                    cache: None,
+                });
+                arms.push((name.to_string(), pipe, rpw.parse().expect("rows per workgroup")));
+            }
+        }
+        let shapes: Vec<(usize, usize)> = std::env::var("CMF_MV_SHAPES")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|p| {
+                        let (r, k) = p.trim().split_once('x')?;
+                        Some((r.parse().ok()?, k.parse().ok()?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                vec![(4096, 2560), (1024, 2560), (2560, 4096), (10240, 2560), (2560, 10240), (131072, 2560)]
+            });
+        for (rows, cols) in shapes {
+            let gpr = cols / 32;
+            let total = cortiq_core::quant::expected_nbytes(cortiq_core::TensorDtype::Q4TiledP, &[rows, cols])
+                .unwrap();
+            let mut wb: Vec<u8> = (0..total.next_multiple_of(4)).map(|i| (i * 37 % 251) as u8).collect();
+            let po = rows * gpr * 16;
+            let (lo, st) = (
+                cortiq_core::quant::f32_to_f16(-6.0).to_le_bytes(),
+                cortiq_core::quant::f32_to_f16(0.05).to_le_bytes(),
+            );
+            for r in 0..rows {
+                wb[po + 4 * r..po + 4 * r + 2].copy_from_slice(&lo);
+                wb[po + 4 * r + 2..po + 4 * r + 4].copy_from_slice(&st);
+            }
+            let wbuf = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("mv-variants-w"),
+                size: wb.len() as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            c.queue.write_buffer(&wbuf, 0, &wb);
+            let xs: Vec<f32> = (0..cols).map(|i| ((i % 97) as f32 - 48.0) / 480.0).collect();
+            let xbuf = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&xs),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let ybuf = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (rows * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let rb = c.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (rows * 4) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let p_buf = q4tp_mv_params(c, gpr, rows, 1);
+            let mut reference: Option<Vec<f32>> = None;
+            for (name, pipe, rpw) in &arms {
+                let layout = pipe.get_bind_group_layout(0);
+                let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &layout,
+                    entries: &[
+                        bind_buf(0, &wbuf),
+                        bind_buf(2, &ybuf),
+                        bind_buf(3, &p_buf),
+                        bind_buf(4, &wbuf),
+                        bind_buf(5, &xbuf),
+                    ],
+                });
+                let groups = (rows as u32).div_ceil(*rpw);
+                let run = |n: usize| {
+                    let mut enc = c
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                    {
+                        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+                        pass.set_pipeline(pipe);
+                        pass.set_bind_group(0, &bind, &[]);
+                        for _ in 0..n {
+                            pass.dispatch_workgroups(groups, 1, 1);
+                        }
+                    }
+                    let t = Instant::now();
+                    c.queue.submit([enc.finish()]);
+                    let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+                    t.elapsed().as_secs_f64()
+                };
+                run(2);
+                let secs = (0..3).map(|_| run(reps)).fold(f64::MAX, f64::min);
+                let us = secs * 1e6 / reps as f64;
+                let mut enc = c.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                enc.copy_buffer_to_buffer(&ybuf, 0, &rb, 0, (rows * 4) as u64);
+                c.queue.submit([enc.finish()]);
+                rb.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+                let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+                let y: Vec<f32> = bytemuck::cast_slice(&rb.slice(..).get_mapped_range().expect("map")).to_vec();
+                rb.unmap();
+                let err = match &reference {
+                    None => {
+                        reference = Some(y);
+                        0.0
+                    }
+                    Some(r) => {
+                        let sc = r.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-12);
+                        r.iter().zip(&y).fold(0f32, |m, (a, b)| m.max((a - b).abs())) / sc
+                    }
+                };
+                println!(
+                    "MV {name:22} {rows:6}x{cols:<5} {us:8.1} us/dispatch {:6.1} GB/s  rel err {err:.1e}",
+                    total as f64 / us / 1e3
+                );
+            }
+        }
+    }
+
     #[test]
     #[ignore]
     fn wgpu_q4tp_matvec_shape_bandwidth() {
