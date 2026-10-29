@@ -391,7 +391,7 @@ fn build_perop(c: &Ctx) -> Option<Pipes> {
                 layout: None,
                 module: &module,
                 entry_point: Some(entry),
-                compilation_options: Default::default(),
+                compilation_options: crate::gpu_wgpu::pco(),
                 cache: c.pipeline_cache.as_ref(),
             })
     };
@@ -487,7 +487,7 @@ fn build_global(c: &Ctx, segments: usize) -> Option<GlobalPipes> {
                 layout: Some(l),
                 module: &module,
                 entry_point: Some(entry),
-                compilation_options: Default::default(),
+                compilation_options: crate::gpu_wgpu::pco(),
                 cache: c.pipeline_cache.as_ref(),
             })
     };
