@@ -5,6 +5,34 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- GPTQ calibration (`quantize-gptq`, `compress` S5) runs on the trainer's
+  forward of the f16 input when the runtime is on wgpu: every linear's input
+  Gram is folded per window into the same device accumulators, one forward a
+  window. Through the runtime each prefill step paid a round trip per
+  projection — Qwen3.8 14B on an RTX PRO 6000 took 10–20 s a 2048-token
+  window at 6–9 % GPU; on Qwen3.5-0.8B the trainer takes 0.16 s a window
+  against 1.0 s, with the same q4tp ppl (2.388 vs 2.387). A trainer pass that
+  cannot run (memory, an unsupported model) falls back to the runtime hook;
+  `CMF_GPTQ_CALIB=runtime` keeps it.
+- `compress` S6 scores every test record on the device: the window is sized
+  by the card (the attention's score blocks and the GDN tape's buffers must
+  fit one storage binding — 4608 tokens for Qwen3.8's 24 heads), records are
+  bucketed by length, and a longer record is scored on its first window
+  (`CMF_COMPRESS_EVAL_LONG=runtime` scores it whole on the runtime). Records
+  past 4096 tokens went to the runtime's ~200 tok/s: 63 % of the 27B's test
+  tokens, 40+ min of S6, now 7 min.
+- `compress` S1 writes the kept Grams on a second thread (155 GB on a 27B;
+  written inline they left the device idle about half of S1), S3 reads them
+  one layer ahead and writes the f16 fold and its q8_2f copy side by side.
+- Trainer loads (illumination, teacher, heal student, GPTQ calibration)
+  convert and transpose the weights over all threads
+  (`quant::dequant_tensor_par`): a single loop spent minutes on a 27B.
+  Bit-identical to the serial path (tests), and the 0.8B illumination and
+  fold reproduce the reference run bit for bit.
+
 ## [0.8.44] — 2026-10-29
 
 ### Fixed

@@ -617,24 +617,73 @@ pub fn test_nll(path: &Path, recs: &[&super::data::Rec], on: LossOn) -> Result<(
     let pad_id = model.header.tokenizer_config.as_ref().and_then(|t| t.eos_token_ids.first().copied()).unwrap_or(0);
     let net = nt::Net::load(c, &model, true, false, None).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
     anyhow::ensure!(!recs.is_empty(), "no records");
-    let t = recs.iter().map(|r| r.ids.len()).max().unwrap_or(1).div_ceil(128) * 128;
-    let w = nt::Work::new(c, &net, 1, t);
+    // records by length in 512-token buckets (the alignment of
+    // `device_nll_max`, so no bucket outgrows it), one workspace per bucket:
+    // a 300-token record no longer pays the forward of the longest one
+    let mut by: Vec<&super::data::Rec> = recs.to_vec();
+    by.sort_by_key(|r| r.ids.len());
     let (mut sum, mut cnt) = (0f64, 0usize);
-    for r in recs {
-        let first = on.first_target(r).max(1);
-        let mut ids = r.ids.clone();
-        ids.resize(t, pad_id);
-        let (mut tid, mut tp) = (vec![0u32; t], vec![0f32; t]);
-        for j in 0..r.ids.len().saturating_sub(1) {
-            tid[j] = r.ids[j + 1];
-            if j + 1 >= first {
-                tp[j] = 1.0;
-                cnt += 1;
+    let mut i = 0;
+    while i < by.len() {
+        let t = by[i].ids.len().max(1).div_ceil(512) * 512;
+        let w = nt::Work::new(c, &net, 1, t);
+        while i < by.len() && by[i].ids.len() <= t {
+            let r = by[i];
+            let first = on.first_target(r).max(1);
+            let mut ids = r.ids.clone();
+            ids.resize(t, pad_id);
+            let (mut tid, mut tp) = (vec![0u32; t], vec![0f32; t]);
+            for j in 0..r.ids.len().saturating_sub(1) {
+                tid[j] = r.ids[j + 1];
+                if j + 1 >= first {
+                    tp[j] = 1.0;
+                    cnt += 1;
+                }
             }
+            sum += nt::loss_sum(c, &net, &w, &ids, &tid, &tp, 1, true).with_context(|| format!("{}: forward failed", r.rid))?;
+            i += 1;
         }
-        sum += nt::loss_sum(c, &net, &w, &ids, &tid, &tp, 1, true).with_context(|| format!("{}: forward failed", r.rid))?;
     }
     Ok((sum, cnt))
+}
+
+/// The longest record [`test_nll`] scores on the device: the trainer's
+/// attention keeps its heads' t×t f32 score blocks in one buffer, which must
+/// fit one storage binding (24 heads: t ≤ 4729 under 2 GiB) and the memory
+/// beside the f16 weights; a GDN tape's per-window buffers must fit a binding
+/// too.
+pub fn device_nll_max(model: &CmfModel) -> usize {
+    let heads = model.arch().num_attention_heads.max(1) as f64;
+    let weights: u64 = model
+        .tensors
+        .iter()
+        .filter(|e| !e.name.ends_with("embed_tokens.weight") && !e.name.contains(".mtp."))
+        .map(|e| 2 * e.shape.iter().product::<usize>() as u64)
+        .sum();
+    let budget = match cortiq_engine::gpu_wgpu::trainer_vram_budget() {
+        Some(b) if b != u64::MAX => b,
+        Some(_) => (super::stages::mem_budget() as f64 * 0.6) as u64,
+        None => 8 << 30,
+    };
+    let room = budget.saturating_sub(weights + (4u64 << 30)) as f64;
+    let mut t = (room / (2.0 * heads * 4.0)).sqrt() as usize;
+    // a GDN tape binds per-window buffers that grow with t: its state
+    // checkpoints (nv·(t/cs + 1)·16384 floats) and the backward's block
+    // partials (t·nv·4·258); each must fit one storage binding
+    let nv = model.arch().linear_num_value_heads.unwrap_or(0);
+    if let Some(bytes) = cortiq_engine::gpu_wgpu::trainer_max_binding() {
+        t = t.min(((bytes as f64 / 4.0) / heads).sqrt() as usize);
+    }
+    if nv > 0
+        && let Some(bytes) = cortiq_engine::gpu_wgpu::trainer_max_binding()
+    {
+        let lim = bytes as usize / 4;
+        let cs = std::env::var("CMF_GDN_CS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&v| v >= 2).unwrap_or(8);
+        let ck = (lim / (nv * 16384)).saturating_sub(1) * cs;
+        let dqk = lim / (nv * 4 * 258);
+        t = t.min(ck).min(dqk);
+    }
+    (t / 512 * 512).clamp(512, 32768)
 }
 
 /// Illumination on the device: the trainer's forward of the f16 source,
@@ -748,7 +797,16 @@ impl DevCapture {
             self.resume[set] = Some((part[part.len() - 1] + 1, next));
             for (&l, acc) in part.iter().zip(&accs) {
                 let n = width(&self.net, l);
-                let h: Vec<f64> = cortiq_engine::gpu_wgpu::train_ops::download(c, acc, n * n).context("Gram read-back")?.into_iter().map(f64::from).collect();
+                let g = cortiq_engine::gpu_wgpu::train_ops::download(c, acc, n * n).context("Gram read-back")?;
+                // f32 → f64 over all threads (n² = 303 M at 27B: a serial loop was ~0.5 s a Gram)
+                let mut h = vec![0f64; n * n];
+                let per = h.len().div_ceil(super::stages::cpu_budget().max(1)).max(1);
+                std::thread::scope(|s| {
+                    for (d, src) in h.chunks_mut(per).zip(g.chunks(per)) {
+                        s.spawn(move || d.iter_mut().zip(src).for_each(|(o, &x)| *o = f64::from(x)));
+                    }
+                });
+                drop(g);
                 let sumsq: Vec<f64> = (0..n).map(|j| h[j * n + j]).collect();
                 anyhow::ensure!(sumsq.iter().any(|&v| v > 0.0), "{label}: layer {l}: captured energy is all zero");
                 out.insert(l, cortiq_engine::gptq_capture::HessianAcc { cols: n, h, sumsq, count: total });

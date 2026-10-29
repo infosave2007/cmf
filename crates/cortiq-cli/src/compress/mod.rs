@@ -210,6 +210,16 @@ pub struct CompressArgs {
     /// Per-tensor codec override, PATTERN=QUANT (as `convert --tensor-quant`)
     #[arg(long = "tensor-quant", value_name = "PATTERN=QUANT")]
     pub tensor_quant: Vec<String>,
+    /// MTP draft, when the source carries one: calibrated through the
+    /// finished model on the task's train records, its FFN kept at this
+    /// fraction (`cortiq mtp-compact`); `off` keeps the source's draft as it
+    /// is. The draft predicts from the trunk's last hidden state, which the
+    /// fold and the heal changed.
+    #[arg(long, default_value = "0.9")]
+    pub mtp_keep: String,
+    /// Train records the draft calibration reads (it runs the model on the CPU)
+    #[arg(long, default_value_t = 48)]
+    pub mtp_records: usize,
 
     /// Test prompts generated from in the evaluation
     #[arg(long, default_value_t = 16)]
@@ -399,6 +409,7 @@ impl Run {
                 "o1": "off",
                 "quant": crate::convert::quant_name(self.quant), "calib_tokens": self.calib_tokens,
                 "calib_window": a.calib_window, "escort": a.escort, "tensor_quant": a.tensor_quant,
+                "mtp": [a.mtp_keep.clone(), a.mtp_records.to_string()],
                 "data": data_identity(&a.data),
             }),
             6 => json!({
