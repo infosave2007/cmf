@@ -19,7 +19,7 @@ use metal::{Buffer, ComputeCommandEncoderRef, ComputePipelineState, MTLSize};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
-const QMSL: &str = include_str!("moe_q8_msl.metal");
+pub(super) const QMSL: &str = include_str!("moe_q8_msl.metal");
 
 pub(super) struct Pipes {
     jobs: ComputePipelineState,
