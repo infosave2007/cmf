@@ -83,7 +83,7 @@ fn ensure_distinct_bake_paths(
     Ok(())
 }
 
-fn quant_of(d: TensorDtype) -> Option<Quant> {
+pub(crate) fn quant_of(d: TensorDtype) -> Option<Quant> {
     Some(match d {
         TensorDtype::Q8Row => Quant::Q8Row,
         TensorDtype::Q8_2f => Quant::Q8_2f,

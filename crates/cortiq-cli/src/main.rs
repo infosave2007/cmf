@@ -858,6 +858,88 @@ enum Commands {
         #[arg(long)]
         output: String,
     },
+    /// Bake a task's skill into a model before compressing it (DTG-MA,
+    /// Patent 2): soft gates on the FFN neurons of the deep layers trained
+    /// with the task's LM loss at a small constant L1 (the held-out best),
+    /// folded into down_proj; the width is kept (on the trainer's GPU)
+    DtgmaBake {
+        /// The model, f16/f32 (compress S0's src-f16.cmf of an HF checkpoint)
+        model: String,
+        /// The task's teacher data (.tdata: train and val splits)
+        data: String,
+        #[arg(long)]
+        output: String,
+        /// Gates on the layers from this one; the ones below run once, cached
+        /// (default: the deeper half)
+        #[arg(long)]
+        from_layer: Option<usize>,
+        #[arg(long, default_value_t = 300)]
+        steps: usize,
+        #[arg(long, default_value_t = 50)]
+        eval_every: usize,
+        #[arg(long, default_value_t = 0.1)]
+        lr: f64,
+        /// The constant L1 pull on the gates (a regulariser, not a target)
+        #[arg(long, default_value_t = 0.003)]
+        l1: f64,
+        /// Initial gate logit (σ(4) = 0.98)
+        #[arg(long, default_value_t = 4.0)]
+        init: f32,
+        #[arg(long, default_value_t = 2048)]
+        window: usize,
+        #[arg(long, default_value_t = 2)]
+        batch: usize,
+        /// Train batches cached and used (0 = all)
+        #[arg(long, default_value_t = 0)]
+        max_batches: usize,
+        /// Loss tokens: answer | generated | all
+        #[arg(long, default_value = "generated")]
+        loss_on: String,
+    },
+    /// Train a compressed model's MTP draft on its own trunk: the trunk's
+    /// hidden rows and next-token top-k once on the trainer, then the
+    /// draft's block (a one-layer model from its own input) learns the
+    /// trunk's distribution one position ahead — the token its verify
+    /// accepts (KL, best held-out checkpoint)
+    MtpHeal {
+        /// The compressed model whose draft is trained
+        model: String,
+        /// The draft's starting weights in a higher precision (the source
+        /// before compress, e.g. its f16 copy); default: the model's own
+        #[arg(long)]
+        init: Option<String>,
+        /// Records to train on: a .tdata (its train split; every tenth
+        /// window is held out)
+        #[arg(long)]
+        data: String,
+        /// Chain steps trained: step 1 reads the trunk's hidden row, step j
+        /// the draft's own step j − 1 output (the runtime drafts 3–5 deep)
+        #[arg(long, default_value_t = 3)]
+        chain: usize,
+        /// Steps between rebuilds of the chain's inputs from the current weights
+        #[arg(long, default_value_t = 150)]
+        refresh: usize,
+        #[arg(long, default_value_t = 393216)]
+        tokens: usize,
+        #[arg(long, default_value_t = 2048)]
+        window: usize,
+        #[arg(long, default_value_t = 3.0)]
+        epochs: f64,
+        #[arg(long, default_value_t = 2e-5)]
+        lr: f64,
+        /// The trunk's distribution kept per position
+        #[arg(long, default_value_t = 64)]
+        topk: usize,
+        #[arg(long, default_value_t = 2)]
+        batch: usize,
+        #[arg(long, default_value_t = 25)]
+        eval_every: usize,
+        /// Evaluations without a new best before training stops (0 = never)
+        #[arg(long, default_value_t = 6)]
+        patience: usize,
+        #[arg(long)]
+        output: String,
+    },
     /// Calibrate and physically compact a dense MTP draft FFN without
     /// rewriting the trunk. Statistics are teacher-forced through the
     /// actual draft stack; `--output` is always a new runnable main CMF.
@@ -4264,6 +4346,46 @@ async fn main() -> anyhow::Result<()> {
         }
         #[cfg(not(feature = "gpu"))]
         Commands::QuantizeMoe { .. } => Err(anyhow::anyhow!("quantize-moe needs a build with the gpu feature")),
+        #[cfg(feature = "gpu")]
+        Commands::MtpHeal { model, init, data, chain, refresh, tokens, window, epochs, lr, topk, batch, eval_every, patience, output } => {
+            let cfg = compress::mtp_heal::Cfg { chain, refresh, tokens, window, epochs, lr, topk, batch, eval_every, patience };
+            let r = compress::mtp_heal::heal(
+                std::path::Path::new(&model),
+                init.as_deref().map(std::path::Path::new),
+                &data,
+                &cfg,
+                std::path::Path::new(&output),
+                compress::stages::cpu_budget(),
+            )?;
+            println!(
+                "mtp heal: held-out KL to the trunk {:.5} → {:.5} (best step {} of {}); wrote {output}",
+                r.loss_start, r.loss_best, r.best_step, r.steps
+            );
+            Ok(())
+        }
+        #[cfg(not(feature = "gpu"))]
+        Commands::MtpHeal { .. } => Err(anyhow::anyhow!("mtp-heal needs a build with the gpu feature")),
+        #[cfg(feature = "gpu")]
+        Commands::DtgmaBake { model, data, output, from_layer, steps, eval_every, lr, l1, init, window, batch, max_batches, loss_on } => {
+            let nl = cortiq_core::CmfModel::open_sharded(&model)?.arch().num_layers;
+            let cfg = compress::dtgma_bake::Cfg { from: from_layer.unwrap_or(nl / 2), steps, eval_every, lr, l1, init, window, batch, max_batches };
+            let r = compress::dtgma_bake::bake(
+                std::path::Path::new(&model),
+                &data,
+                &loss_on,
+                &cfg,
+                std::path::Path::new(&output),
+                compress::stages::cpu_budget(),
+                &|l| println!("{l}"),
+            )?;
+            println!(
+                "dtgma bake: held-out loss {:.4} → {:.4} (best step {} of {}); wrote {output}",
+                r.nll_open, r.nll_best, r.step, r.steps
+            );
+            Ok(())
+        }
+        #[cfg(not(feature = "gpu"))]
+        Commands::DtgmaBake { .. } => Err(anyhow::anyhow!("dtgma-bake needs a build with the gpu feature")),
         #[cfg(feature = "gpu")]
         Commands::NvgTrain {
             student,
@@ -9275,6 +9397,14 @@ async fn cmd_run(
                         r.tokens_generated as f64 / secs.max(1e-9),
                         r.finish_reason
                     ),
+                }
+                if r.mtp_drafted > 0 {
+                    println!(
+                        "[MTP draft: {} of {} accepted ({:.0}%)]",
+                        r.mtp_accepted,
+                        r.mtp_drafted,
+                        100.0 * r.mtp_accepted as f64 / r.mtp_drafted as f64
+                    );
                 }
                 if pipeline.is_block_diffusion() {
                     let st = pipeline.clover_stats();

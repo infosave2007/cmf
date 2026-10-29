@@ -91,8 +91,13 @@ fn evaluate(run: &Run, label: &str, path: &PathBuf, data: &Data, on: LossOn) -> 
     let mut gens = Vec::new();
     let (mut gen_tok, mut gen_s) = (0usize, 0f64);
     let (mut mtp_drafted, mut mtp_accepted) = (0usize, 0usize);
-    let n_gen = test.len().min(run.a.eval_prompts);
-    for (gi, r) in test.iter().take(run.a.eval_prompts).enumerate() {
+    // one generation per distinct prompt: the teacher answered each prompt
+    // twice, and two greedy runs of one prompt are one sample counted twice
+    // (16 generations were 8 prompts)
+    let mut seen = std::collections::HashSet::new();
+    let gen_recs: Vec<_> = test.iter().filter(|r| seen.insert(&r.ids[..r.prompt])).take(run.a.eval_prompts).collect();
+    let n_gen = gen_recs.len();
+    for (gi, r) in gen_recs.into_iter().enumerate() {
         let prompt = &r.ids[..r.prompt];
         let t = std::time::Instant::now();
         if gi > 0 {
@@ -135,6 +140,12 @@ fn evaluate(run: &Run, label: &str, path: &PathBuf, data: &Data, on: LossOn) -> 
         }
         None => None,
     };
+    // the runtime keeps a model's uploaded weights in the device cache after
+    // its pipeline is gone: the 27B source and its fold held 41 GB there and
+    // the next candidate's trainer pass ran out of memory
+    drop(pipe);
+    #[cfg(feature = "gpu")]
+    cortiq_engine::gpu_wgpu::release_model_buffers(&m);
     let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     Ok(json!({
         "label": label, "path": path, "bytes": bytes, "params": m.total_param_count(),
@@ -189,7 +200,7 @@ pub fn s6_eval(run: &Run) -> Result<()> {
         cands.push((format!("vs {}", c.trim_end_matches(".cmf")), p));
     }
     run.log(&format!(
-        "S6: {} test records, {} generation prompts; intermediate stages are scored on their q8_2f copies",
+        "S6: {} test records, up to {} generation prompts (distinct ones); intermediate stages are scored on their q8_2f copies",
         data.count(TdataSplit::Test).0,
         a.eval_prompts.min(data.count(TdataSplit::Test).0)
     ));
@@ -279,7 +290,7 @@ fn eval_key(run: &Run, p: &std::path::Path) -> String {
         "size": m.map(|m| m.len()), "mtime": mt.map(|d| d.as_nanos() as u64),
         "data": crate::knowledge::sha256_hex(&manifest), "spec": run.a.data,
         "loss_on": run.a.loss_on, "prompts": run.a.eval_prompts, "gen": run.a.eval_gen_tokens,
-        "general": run.a.general_eval, "v": 3, "o1": "off",
+        "general": run.a.general_eval, "v": 4, "o1": "off",
     });
     crate::knowledge::sha256_hex(k.to_string().as_bytes())[..16].to_string()
 }

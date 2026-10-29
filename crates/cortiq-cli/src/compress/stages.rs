@@ -1107,11 +1107,14 @@ fn s4_heal_device(run: &Run, data: &Data, student: &CmfModel, student_path: &Pat
         "ffn" => true,
         o => anyhow::bail!("--heal-params {o:?}: all | ffn"),
     };
-    // Device memory while training: the head's planes both ways, ~6 GB of
+    // Device memory while training: the head's planes both ways, ~13 GB of
     // workspace and logits, and per trained layer its f16 planes both ways
-    // plus f32 weights, gradient and two moments (20 B/weight of what it
-    // trains, 4 B/weight of its frozen rest). The frozen prefix runs once
-    // beforehand (its activations cached on the host), so it takes no room.
+    // plus f32 weights, gradient, two moments and the backward's scratch
+    // (25 B/weight of what it trains, 4 B/weight of its frozen rest —
+    // measured: Qwen3.8 14B, 36 MLP-trained layers peaked at 96.6 GB of an
+    // RTX PRO 6000's 102.6; at 20 B and 6 GB the estimate admitted 47
+    // layers, which ran out). The frozen prefix runs once beforehand (its
+    // activations cached on the host), so it takes no room.
     let (total, _) = params_of(student);
     let arch = student.arch();
     let head = 2.0 * 2.0 * (arch.vocab_size * arch.hidden_size) as f64;
@@ -1124,7 +1127,7 @@ fn s4_heal_device(run: &Run, data: &Data, student: &CmfModel, student_path: &Pat
         .sum::<f64>()
         / nl as f64;
     let trained = if ffn_only { ffn_w.min(layer_w) } else { layer_w };
-    let per_layer = 20.0 * trained + 4.0 * (layer_w - trained);
+    let per_layer = 25.0 * trained + 4.0 * (layer_w - trained);
     // the trainer's device: its own budget, or on unified memory (Apple
     // Silicon) 60 % of the host's — the runtime's budget was 8 GB there,
     // which trained 7 of the 0.8B's 24 layers
@@ -1133,7 +1136,7 @@ fn s4_heal_device(run: &Run, data: &Data, student: &CmfModel, student_path: &Pat
         Some(_) => mem_budget() as f64 * 0.6,
         None => (8u64 << 30) as f64,
     };
-    let room = budget - head - 6e9;
+    let room = budget - head - 13e9;
     let train_from = heal_train_from(&a.heal_layers, nl, per_layer, room.max(per_layer))?;
     let need = per_layer * (nl - train_from) as f64;
     anyhow::ensure!(
@@ -1168,6 +1171,8 @@ fn s4_heal_device(run: &Run, data: &Data, student: &CmfModel, student_path: &Pat
         batch: a.bs,
         topk: a.heal_topk,
         eval_every: a.eval_every,
+        patience: a.heal_patience,
+        val_windows: a.heal_val_windows,
         clip: 1.0,
         warm: std::env::var("CMF_HEAL_WARM").ok().and_then(|v| v.parse().ok()).unwrap_or(0.1),
         genesis: match a.heal_schedule.as_str() {
@@ -1309,6 +1314,54 @@ fn s5_quant(run: &Run) -> Result<()> {
         crate::mtpcompact::cmd_mtp_compact(out.to_str().unwrap(), &format!("{root}:train"), tmp.to_str().unwrap(), keep, None, a.mtp_records, 2048)?;
         std::fs::rename(&tmp, &out)?;
         run.log(&format!("S5: MTP draft compacted ({:.0}s)", t0.elapsed().as_secs_f64()));
+    }
+    // the MTP draft trained on the finished trunk over its chain
+    let heal_mtp = match a.mtp_heal.as_str() {
+        "off" => false,
+        "on" => true,
+        "auto" => {
+            #[cfg(feature = "gpu")]
+            let ok = super::heal_gpu::usable(&*open(&out)?).is_ok();
+            #[cfg(not(feature = "gpu"))]
+            let ok = false;
+            ok
+        }
+        o => anyhow::bail!("--mtp-heal {o:?}: auto | on | off"),
+    };
+    let canonical = open(&out)?.tensor("model.mtp.eh_proj.weight").is_some();
+    if heal_mtp && canonical && run.structural {
+        #[cfg(feature = "gpu")]
+        {
+            let t0 = std::time::Instant::now();
+            let root = a.data.rfind(".tdata").map(|i| &a.data[..i + 6]).unwrap_or(&a.data);
+            let tmp = run.stage_dir(5).join("out-mtpheal.cmf");
+            let init = path_of(&s0, "f16");
+            run.log(&format!("S5: MTP draft trained on the finished trunk (3-step chain, {} epochs)", a.mtp_heal_epochs));
+            let cfg = super::mtp_heal::Cfg {
+                chain: 3,
+                refresh: 150,
+                tokens: 393216,
+                window: 2048,
+                epochs: a.mtp_heal_epochs,
+                lr: 2e-5,
+                topk: 64,
+                batch: 2,
+                eval_every: 25,
+                patience: 6,
+            };
+            let r = super::mtp_heal::heal(&out, init.as_deref(), root, &cfg, &tmp, run.threads)?;
+            std::fs::rename(&tmp, &out)?;
+            run.log(&format!(
+                "S5: MTP draft — held-out KL to the trunk {:.4} → {:.4} (best step {} of {}, {:.0}s)",
+                r.loss_start,
+                r.loss_best,
+                r.best_step,
+                r.steps,
+                t0.elapsed().as_secs_f64()
+            ));
+        }
+        #[cfg(not(feature = "gpu"))]
+        anyhow::bail!("--mtp-heal on needs a build with the gpu feature");
     }
     let bytes = std::fs::metadata(&out)?.len();
     run.log(&format!("S5: {} ({:.2} GB)", out.display(), bytes as f64 / 1e9));

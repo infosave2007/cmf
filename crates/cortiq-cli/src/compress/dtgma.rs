@@ -46,6 +46,9 @@ pub fn learn(run: &Run, data: &Data, model_path: &Path, keep_frac: f64) -> Resul
                     mask_init: knob("INIT", 2.0),
                     tau: 0.5,
                     settle: knob("SETTLE", 0),
+                    train_from: 0,
+                    soft: false,
+                    max_batches: 0,
                 };
                 let on = LossOn::parse(&run.a.loss_on)?;
                 return Ok(super::heal_gpu::learn_masks(data, on, model_path, &cfg, &|l| run.log(l))?.logits);

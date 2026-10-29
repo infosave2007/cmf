@@ -1023,6 +1023,9 @@ pub struct MtpModule {
 /// before the draft layer's down projection. `observed_positions` is the
 /// number of teacher-forced rows that contributed to both arrays.
 ///
+/// Rows of FFN input the canonical draft probe measures in one batch.
+const MTP_PROBE_FFN_ROWS: usize = 128;
+
 /// [`Pipeline::probe_mtp_ffn`] returns one of these for each actual draft
 /// layer.  It intentionally has a separate type/API from
 /// [`Pipeline::probe_ffn_mass`] so a compactor cannot accidentally substitute
@@ -9407,9 +9410,11 @@ impl Pipeline {
     /// cache must be retained.
     pub fn probe_mtp_ffn(&mut self, ids: &[u32]) -> Result<Vec<MtpFfnProbe>, String> {
         self.reset_mtp_probe_state();
-        // CPU scope avoids backend-dependent device math; this guard also
-        // suppresses gate/oracle sparsity experiments for the duration so the
-        // statistics and admission replay always execute the full dense FFN.
+        // The trunk runs as one prefill (the device graph where there is
+        // one); the draft replays on the host under a CPU scope, where its
+        // FFN input can be measured. This guard also suppresses gate/oracle
+        // sparsity experiments for the duration so the statistics and
+        // admission replay always execute the full dense FFN.
         let _exact_calibration = ExactMtpCalibrationGuard::enter();
         let result = if ids.len() < 2 {
             Err("MTP FFN probe needs at least two token ids".into())
@@ -9427,9 +9432,12 @@ impl Pipeline {
                 .mimo_mtp
                 .take()
                 .expect("checked MiMo MTP before detaching it");
-            let result = crate::gpu::cpu_scope(|| {
-                self.mimo_mtp_ffn_probe_teacher_forced(&mut st, ids)
-            });
+            let result = match self.probe_trunk_rows(ids) {
+                Ok(trunk) => crate::gpu::cpu_scope(|| {
+                    self.mimo_mtp_ffn_probe_teacher_forced(&mut st, ids, &trunk)
+                }),
+                Err(e) => Err(e),
+            };
             // The owner is detached during the replay, so the common trunk
             // reset cannot clear its KVs. Restore it even on an error.
             st.reset();
@@ -9440,7 +9448,12 @@ impl Pipeline {
                 .mtp
                 .take()
                 .expect("checked canonical MTP before detaching it");
-            let result = crate::gpu::cpu_scope(|| self.mtp_ffn_probe_teacher_forced(&mut mtp, ids));
+            let result = match self.probe_trunk_rows(ids) {
+                Ok(trunk) => crate::gpu::cpu_scope(|| {
+                    self.mtp_ffn_probe_teacher_forced(&mut mtp, ids, &trunk)
+                }),
+                Err(e) => Err(e),
+            };
             mtp.kv.clear();
             self.mtp = Some(mtp);
             result
@@ -9465,58 +9478,86 @@ impl Pipeline {
         self.mtp_graph_mode = None;
     }
 
-    /// Canonical one-layer MTP teacher-forced replay. Its cache advances for
-    /// every row so later attention inputs match a real draft warm-up rather
-    /// than a collection of independent one-token measurements. The trunk is
-    /// advanced row-by-row here instead of first materializing every hidden
-    /// state, so canonical calibration remains O(hidden) transient RAM.
+    /// The trunk's last hidden row (before the final norm) at every
+    /// position a teacher-forced draft probe reads (`ids[..len-1]`), from
+    /// the whole-stack prefill — the device graph where there is one. One
+    /// position at a time through `forward_layers` on the host this was the
+    /// probe's whole cost: a 14B's 96k calibration tokens ran for hours.
+    pub(crate) fn probe_trunk_rows(&mut self, ids: &[u32]) -> Result<Vec<f32>, String> {
+        if ids.len() < 2 {
+            return Err("MTP FFN probe needs at least two token ids".into());
+        }
+        let rows = self.final_hidden_rows(&ids[..ids.len() - 1])?;
+        self.clear_sequence_state();
+        Ok(rows)
+    }
+
+    /// Canonical one-layer MTP teacher-forced replay over the trunk rows
+    /// of [`Self::probe_trunk_rows`]. Its cache advances for every row so
+    /// later attention inputs match a real draft warm-up rather than a
+    /// collection of independent one-token measurements. The FFN inputs are
+    /// measured in batches: nothing after the FFN feeds a later row.
     fn mtp_ffn_probe_teacher_forced(
         &mut self,
         mtp: &mut MtpModule,
         ids: &[u32],
+        trunk: &[f32],
     ) -> Result<Vec<MtpFfnProbe>, String> {
         let FfnKind::Dense(dense) = &mtp.layer.ffn else {
             return Err("MTP FFN probe: canonical draft FFN is not dense".into());
         };
-        let mut mass = vec![0.0f64; dense.gate_proj.rows()];
-        let mut squared_mass = vec![0.0f64; dense.gate_proj.rows()];
-        for position in 0..ids.len() - 1 {
-            let hidden = self.forward_layers(&self.embed_single(ids[position]), position, None);
-            if hidden.len() != self.hidden_size {
-                return Err(format!(
-                    "MTP FFN probe: trunk hidden width {} != {}",
-                    hidden.len(),
-                    self.hidden_size
-                ));
-            }
-            self.mtp_probe_step_ffn(
+        let inter = dense.gate_proj.rows();
+        let (hs, n) = (self.hidden_size, ids.len() - 1);
+        if trunk.len() != n * hs {
+            return Err(format!(
+                "MTP FFN probe: {} trunk values for {n} rows of width {hs}",
+                trunk.len()
+            ));
+        }
+        let mut mass = vec![0.0f64; inter];
+        let mut squared_mass = vec![0.0f64; inter];
+        let mut inputs = Vec::with_capacity(MTP_PROBE_FFN_ROWS.min(n) * hs);
+        for position in 0..n {
+            self.mtp_probe_ffn_input(
                 mtp,
-                &hidden,
+                &trunk[position * hs..(position + 1) * hs],
                 ids[position + 1],
                 position,
-                &mut mass,
-                &mut squared_mass,
             )?;
+            inputs.extend_from_slice(&self.ws.p1[..hs]);
+            if inputs.len() == MTP_PROBE_FFN_ROWS * hs || position + 1 == n {
+                let FfnKind::Dense(dense) = &mtp.layer.ffn else {
+                    unreachable!("checked dense above");
+                };
+                accumulate_dense_ffn_activation_mass(
+                    dense,
+                    &inputs,
+                    inputs.len() / hs,
+                    self.pool.as_deref(),
+                    &mut mass,
+                    &mut squared_mass,
+                )?;
+                inputs.clear();
+            }
         }
         Ok(vec![MtpFfnProbe {
             mass,
             squared_mass,
-            observed_positions: ids.len() - 1,
+            observed_positions: n,
         }])
     }
 
-    /// CPU-only MTP block replay with a measurement between post-attention
-    /// norm and down projection. The ordinary `mtp_step_hl` device path
-    /// keeps these values resident and therefore cannot truthfully provide a
-    /// per-neuron calibration statistic.
-    fn mtp_probe_step_ffn(
+    /// CPU-only MTP block replay up to the FFN's input (the post-attention
+    /// norm, left in `ws.p1`), where the probe measures. The ordinary
+    /// `mtp_step_hl` device path keeps these values resident and therefore
+    /// cannot truthfully provide a per-neuron calibration statistic. The
+    /// FFN arm itself is not run: its output feeds only this row's logits.
+    fn mtp_probe_ffn_input(
         &mut self,
         mtp: &mut MtpModule,
         hidden: &[f32],
         next_token: u32,
         position: usize,
-        mass: &mut [f64],
-        squared_mass: &mut [f64],
     ) -> Result<(), String> {
         let e = self.embed_single(next_token);
         let mut cat = vec![0.0f32; 2 * self.hidden_size];
@@ -9576,23 +9617,6 @@ impl Pipeline {
             self.norm_style,
             &mut self.ws.p1,
         );
-        let FfnKind::Dense(dense) = &lw.ffn else {
-            return Err("MTP FFN probe: draft FFN is not dense".into());
-        };
-        accumulate_dense_ffn_activation_mass(
-            dense,
-            &self.ws.p1,
-            1,
-            self.pool.as_deref(),
-            mass,
-            squared_mass,
-        )?;
-        // Execute the same residual FFN arm as normal draft replay; the
-        // final logits are not needed for teacher-forced statistics.
-        let ffn = ffn_forward(&lw.ffn, &self.ws.p1, self.pool.as_deref(), None);
-        for (dst, src) in x.iter_mut().zip(ffn) {
-            *dst += src;
-        }
         Ok(())
     }
 
@@ -23134,7 +23158,8 @@ mod tests {
             let mut st = p.mimo_mtp.take().expect("synthetic MiMo draft");
             let _exact = ExactMtpCalibrationGuard::enter();
             let got = crate::gpu::cpu_scope(|| {
-                p.mimo_mtp_ffn_probe_teacher_forced_with_chunk_rows(&mut st, ids, rows)
+                let trunk = p.probe_trunk_rows(ids)?;
+                p.mimo_mtp_ffn_probe_teacher_forced_with_chunk_rows(&mut st, ids, &trunk, rows)
             })
             .expect("teacher-forced MiMo probe");
             st.reset();

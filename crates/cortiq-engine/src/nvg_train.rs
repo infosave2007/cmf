@@ -430,6 +430,15 @@ impl Net {
         Self::load_with(c, model, true, false, None, None, Some(0..upto))
     }
 
+    /// Layers `from..` frozen with backward planes, the head on: a net whose
+    /// gradient reaches its MLP gates from a cached prefix output (`step_wh`)
+    /// — DTG-MA on the deep layers of a model whose full backward would not
+    /// fit the card.
+    pub fn load_tail(c: Ctx, model: &CmfModel, from: usize) -> Result<Self, String> {
+        let nl = model.arch().num_layers;
+        Self::load_with(c, model, true, true, None, None, Some(from.min(nl)..nl))
+    }
+
     /// A student for healing: dense linears of the layers `heal.train_from..`
     /// trained in full, everything below frozen without backward planes.
     pub fn load_heal(c: Ctx, model: &CmfModel, heal: HealCfg) -> Result<Self, String> {
@@ -1236,18 +1245,20 @@ fn forward(c: Ctx, net: &Net, w: &Work, ids: &[u32]) -> Option<()> {
     forward_in(c, net, w, ids, None)
 }
 
-/// [`forward`] over the net's layers: from the embedding, or — for a net
-/// starting past layer 0 — from `h0` (`[ntok][hs]`, the prefix's output);
+/// [`forward`] over the net's layers: from `h0` (`[ntok][hs]`) when given
+/// — the prefix's output for a net starting past layer 0, or a draft
+/// head's own block input for a one-layer net — else from the embedding;
 /// the final norm only when the net runs to the last layer.
 fn forward_in(c: Ctx, net: &Net, w: &Work, ids: &[u32], h0: Option<&[f32]>) -> Option<()> {
-    if net.first == 0 {
-        embed(c, net, w, ids);
-    } else {
-        let h = h0?;
-        if h.len() != w.ntok * net.geom.hs {
-            return None;
+    match h0 {
+        Some(h) => {
+            if h.len() != w.ntok * net.geom.hs {
+                return None;
+            }
+            c.queue.write_buffer(&w.ckpt[net.first], 0, bytemuck::cast_slice(h));
         }
-        c.queue.write_buffer(&w.ckpt[net.first], 0, bytemuck::cast_slice(h));
+        None if net.first == 0 => embed(c, net, w, ids),
+        None => return None,
     }
     for l in net.first..net.end {
         let _p = prof::phase(if net.geom.gdn_layer[l] { "fwd.gdn" } else { "fwd.attn" });
@@ -1260,6 +1271,14 @@ fn forward_in(c: Ctx, net: &Net, w: &Work, ids: &[u32], h0: Option<&[f32]>) -> O
     let _p = prof::phase("fwd.final_norm");
     to::run(c, &[to::rms_fwd(c, &w.ckpt[g.nl], &net.final_norm.w, w.get("n1"), w.get("invf"), w.ntok, g.hs, g.eps, g.gemma)?]);
     Some(())
+}
+
+/// The last layer's output (before the final norm) of a net started from
+/// `h0` (or the embedding): a chained draft block's own hidden, the input
+/// of its next step.
+pub fn hidden_out(c: Ctx, net: &Net, w: &Work, ids: &[u32], h0: Option<&[f32]>) -> Option<Vec<f32>> {
+    forward_in(c, net, w, ids, h0)?;
+    to::download(c, &w.ckpt[net.end], w.ntok * net.geom.hs)
 }
 
 /// The output of a [`Net::load_prefix`] net for `ids` (`[ntok][hs]`).
@@ -1359,6 +1378,16 @@ pub fn teacher_topk(c: Ctx, net: &Net, w: &Work, ids: &[u32], k: usize) -> Optio
     th::topk(c, &net.head, &w.head, w.get("n1"), w.ntok, k)
 }
 
+/// [`teacher_topk`] and the last layer's hidden rows (before the final
+/// norm) from the same forward: what a draft head trained on its trunk's
+/// own predictions reads and imitates.
+pub fn teacher_topk_hidden(c: Ctx, net: &Net, w: &Work, ids: &[u32], k: usize) -> Option<(Vec<u32>, Vec<f32>, Vec<f32>)> {
+    forward(c, net, w, ids)?;
+    let h = to::download(c, &w.ckpt[net.end], w.ntok * net.geom.hs)?;
+    let (i, p) = th::topk(c, &net.head, &w.head, w.get("n1"), w.ntok, k)?;
+    Some((i, p, h))
+}
+
 /// Statistics of one training step.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StepStats {
@@ -1430,7 +1459,8 @@ pub fn step_wh(c: Ctx, net: &Net, w: &Work, ids: &[u32], h0: Option<&[f32]>, tid
     drop(ph);
     let mut cur = da;
     let mut nxt = db;
-    let lowest = net.train_from.max(net.active_from.load(std::sync::atomic::Ordering::Relaxed));
+    // a tail net (`Net::load_tail`) holds nothing below `first` to recompute
+    let lowest = net.train_from.max(net.first).max(net.active_from.load(std::sync::atomic::Ordering::Relaxed));
     for l in (lowest..g.nl).rev() {
         let gdn = g.gdn_layer[l];
         let ph = prof::phase(if gdn { "recomp.gdn" } else { "recomp.attn" });
