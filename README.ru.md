@@ -51,7 +51,7 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
-## Spark-X2.6 на Apple silicon (0.8.43)
+## Spark-X2.6 на Mac (0.8.43–0.8.44)
 
 [Spark-X2.6-4B](https://huggingface.co/infosave/Spark-X2.6-4B-cmf) на Mac mini
 M4 (24 ГБ): файл по умолчанию q8_2f обрабатывает промпт в 1000 токенов на ~205
@@ -59,6 +59,11 @@ M4 (24 ГБ): файл по умолчанию q8_2f обрабатывает п
 `cortiq serve` считает только то, что изменилось с прошлого хода (история 2.3k
 токенов: 0.6 с вместо 11 с). Замеры и отвергнутые варианты —
 [docs/SPARK26_METAL.md](docs/SPARK26_METAL.md).
+
+Intel-мак с Radeon Pro запускает ту же модель на своей видеокарте через
+wgpu: `CMF_GPU=wgpu cortiq run ...` (нативному Metal-пути нужна общая память,
+и там он уходит на CPU). Spark-X2.6-4B q4tp на Radeon Pro 560X генерирует
+~16 ток/с против ~10 на i9 того же мака (0.8.44).
 
 ## Диффузионные модели по блокам (0.8.40)
 
