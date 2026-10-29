@@ -5,6 +5,34 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.41] — 2026-10-29
+
+### Added
+- Block-diffusion models on Apple silicon: the denoising passes, the block
+  commits and the prompt of a Clover request run on native Metal
+  (`gpu_metal::clover`) instead of the CPU. A pass is one command buffer per
+  layer with the block's expert coreset and every row's routing taken on the
+  host between the router and the experts (the CPU path's own functions);
+  every tensor but the routed experts is bound through no-copy views of the
+  file mapping and the routed experts' views are kept in an LRU bounded in
+  bytes (`CMF_CLOVER_METAL_CACHE_MB`, 6 GB), so a 19 GB file runs on a
+  24 GB Mac without a second copy of the weights. New kernels: the GDN
+  preview conv and mixer and the preview attend (`clover_msl.metal`); the
+  commits reuse the rows graph's causal GDN kernels and write the states and
+  K/V rows back to the host. Mac mini M4 (24 GB), q4tp-v2: a pass 0.3–0.5 s
+  (CPU 1.13 s), prose 3.2 tok/s (0.8), code 6.5–9 tok/s (2.9), the prompt
+  ~57 tok/s (19). `cortiq ppl` with `CMF_GPU=1` scores a Clover file through
+  the same causal path (README text, 1024 tokens: 12.407 against the CPU's
+  12.446). `CMF_CLOVER_METAL=0` keeps a request on the CPU,
+  `CMF_CLOVER_METAL_PROF=1` books the device time per stage,
+  `CMF_CLOVER_METAL_CHECK=1` compares a Metal prompt commit with the CPU's
+  layer by layer.
+
+### Changed
+- The block coreset takes each row's top-k by selection instead of a full
+  sort of the experts (the same set; the host routing of a Metal pass
+  20 → 12 ms).
+
 ## [0.8.40] — 2026-10-29
 
 ### Added
