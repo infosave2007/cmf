@@ -82,12 +82,32 @@ passes, tokens per pass, the rate after the prompt and the time of a pass.
   grouped MoE kernels, the penalties and greedy pick). A stack that does not
   fit the card runs its leading layers on it and the rest on the host
   (`device layers` in the statistics).
-* **Apple silicon**: the request runs on the CPU (per-op Metal calls of a
-  32-row block measured 10× slower, and the Metal chunk graph does not cover
-  the GDN hybrid).
+* **Apple silicon (Metal)**: `gpu_metal/clover.rs`. The general Metal graphs
+  cannot take the model (the rows graph has no MoE arm, and binding the
+  19 GB mapping exceeds the M4's 17.8 GB working set), so a pass is one
+  command buffer per layer: the mixer, the post norm and the router, ONE
+  wait, the block coreset and every row's top-k on the host with the CPU
+  path's own functions, then the expert panels with the next mixer. Every
+  tensor but the routed experts is bound through a no-copy view of its
+  page-rounded span; a routed expert gets its views when routed, kept in an
+  LRU bounded in bytes (`CMF_CLOVER_METAL_CACHE_MB`, 6 GB) — nothing is
+  copied, the page cache is the only copy (owned copies doubled the
+  footprint and paged the file in from disk every pass: 1.3 s against
+  0.37 s). Kernels: `clover_msl.metal` (preview conv, preview mixer with
+  the block's keys staged in threadgroup memory, preview attend over the
+  prefix and the whole block), `moe_q8`'s blob GEMM with half X tiles for
+  the q8_2f projections and the head (`CMF_CLOVER_Q8=f32` for f32 tiles),
+  `q4tp_mul_mm_n8` for the expert panels (8 rows a dispatch beat the 32-row
+  tile GEMM and 16/32-row variants). The prompt and the block commits run
+  the causal step on the same executor (the rows graph's GDN kernels, the
+  delta rule writing S, chunks of 128 rows) and hand the states and K/V rows
+  back to the host owners; `cortiq ppl` with `CMF_GPU=1` scores through it.
+  `CMF_CLOVER_METAL=0` keeps a request on the CPU; `CMF_CLOVER_METAL_PROF=1`
+  books the device time per stage; `CMF_CLOVER_METAL_CHECK=1` commits the
+  prompt on both and compares every layer.
 * **CPU**: the host path everywhere.
 
-## Measured (cortiq 0.8.40-dev)
+## Measured (cortiq 0.8.40 / 0.8.41)
 
 RTX 5090 (32 GB), whole stack and head on the card, 18.8 GB of VRAM. A pass
 is one 32-row denoising forward: 34–36 ms. Tokens per second after the
@@ -98,7 +118,21 @@ prompt, q4tp:
 | prose (0.9–1.1 tokens a pass) | 26 | 22–27 | 25–30 |
 | code (3.7–6.6 tokens a pass) | 80–95 | 94–110 | 124–150 |
 
-Apple M4 (24 GB), CPU: a pass 1.13 s, code ~3 tok/s.
+Apple M4 (24 GB, 10-core GPU), Metal, q4tp-v2: a pass 0.3 s on prose, 0.4–0.5 s
+on code (more experts a block, some read from the SSD); a 32-row block
+commit 0.35–0.75 s; the prompt ~57 tok/s. Tokens per second after the
+prompt:
+
+| text | threshold 0.95 (default) | 0.8 |
+|---|---:|---:|
+| prose | 3.2 | 3.7 |
+| code | 6.5–9 | 9.7 |
+
+The CPU path on the same Mac: a pass 1.13 s, prose 0.8, code 2.9 tok/s.
+Device time of a prose pass (`CMF_CLOVER_METAL_PROF=1`): GDN mixers ~45 %
+(the q8_2f projections ~1.4 ms a layer), expert panels ~40 %, attention and
+the head the rest; 40 host round trips (routing ~12 ms a pass). Commit-path
+perplexity (README, 1024 tokens): Metal 12.407, CPU 12.446.
 
 Parity with the PyTorch release (bf16, transformers 5.21, CPU) on three chat
 prompts: identical prompt ids; first-pass top-1 agreement q8_2f 32/32 · 30/32,

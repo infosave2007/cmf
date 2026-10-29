@@ -24,7 +24,9 @@
 //!
 //! On wgpu the prompt, every pass and every commit are one batched-graph
 //! submission each (`gpu::BlockPreview`, kernels in `gpu_wgpu::clover`),
-//! the greedy pick included; elsewhere the request runs on the host CPU.
+//! the greedy pick included. On Apple silicon the passes run on the native
+//! Metal executor (`gpu_metal::clover`) and the prompt and commits on the
+//! CPU; elsewhere the request runs on the host CPU.
 //! docs/CLOVER.md has the format record and the measurements.
 
 use super::{dense_ffn_batch, moe_ffn_batch, AttnKind, FfnKind, GenerateResult, MoeFfn, Pipeline, PrefillIn, TokenCallback};
@@ -63,7 +65,48 @@ pub struct CloverStats {
     pub device_layers: usize,
     /// Host time choosing the tokens of every pass (penalties, pick).
     pub pick_s: f64,
+    /// Passes on the native Metal executor (`gpu_metal::clover`): its waits
+    /// on the device, the host routing between layers and the expert-slot
+    /// fills, seconds; the expert cache's hits and misses.
+    pub metal_passes: usize,
+    pub metal_gpu_s: f64,
+    pub metal_exec_s: f64,
+    pub metal_route_s: f64,
+    pub metal_fill_s: f64,
+    pub expert_hits: u64,
+    pub expert_misses: u64,
+    /// `CMF_CLOVER_METAL_PROF=1`: device seconds per stage (see
+    /// `gpu_metal::clover::PreviewStats::stage_s`).
+    pub metal_stage_s: [f64; 9],
 }
+
+/// What a pass on the Metal executor does (`clover_metal_pass`).
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, PartialEq)]
+enum MetalMode {
+    /// A denoising pass: logits, nothing advanced.
+    Preview,
+    /// A causal commit: the state advances, no logits.
+    Commit,
+    /// A causal commit with the logits of every row (perplexity).
+    Score,
+}
+
+/// Rows a causal pass on the Metal executor takes at once (the prompt,
+/// perplexity): `CMF_CLOVER_METAL_CHUNK`, 128.
+#[cfg(target_os = "macos")]
+fn metal_chunk() -> usize {
+    std::env::var("CMF_CLOVER_METAL_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&c| (1..=256).contains(&c))
+        .unwrap_or(128)
+}
+
+/// Block-diffusion requests started in this process: with the committed
+/// length, the Metal executor's key for the state it has uploaded.
+#[cfg(target_os = "macos")]
+static REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl Clover {
     /// Layer `li`'s preview weights for the batched device graph.
@@ -133,16 +176,26 @@ fn coreset(m: &MoeFfn, xs: &[f32], b: usize, top_p: f32, pool: Option<&Pool>) ->
     let ne = m.experts.len();
     let mut logits = vec![0.0f32; b * ne];
     m.router.matmat(xs, b, &mut logits, pool);
+    coreset_from_logits(m, &logits, top_p)
+}
+
+/// `coreset` over router logits already computed, `[rows × experts]`.
+fn coreset_from_logits(m: &MoeFfn, logits: &[f32], top_p: f32) -> Vec<bool> {
+    let ne = m.experts.len();
     let mut totals = vec![0f64; ne];
     let mut ids: Vec<usize> = Vec::with_capacity(ne);
+    let k = m.top_k.min(ne);
     for row in logits.chunks_exact(ne) {
         let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
         let sum: f64 = row.iter().map(|&l| (l as f64 - mx).exp()).sum();
         ids.clear();
         ids.extend(0..ne);
-        // Descending, lower index first on ties (a stable argsort).
-        ids.sort_by(|&x, &y| row[y].partial_cmp(&row[x]).unwrap().then(x.cmp(&y)));
-        for &e in &ids[..m.top_k.min(ne)] {
+        // The top-k set — descending, lower index first on ties (a stable
+        // argsort's prefix); its order inside does not matter.
+        if k > 0 && k < ne {
+            ids.select_nth_unstable_by(k - 1, |&x, &y| row[y].partial_cmp(&row[x]).unwrap().then(x.cmp(&y)));
+        }
+        for &e in &ids[..k] {
             totals[e] += (row[e] as f64 - mx).exp() / sum;
         }
     }
@@ -435,6 +488,385 @@ impl Pipeline {
         }
         self.clover_preview_layers(clover, &mut h, 0, pos, stats)?;
         Ok(self.clover_head(&h, stats))
+    }
+
+    /// A pass off the wgpu graph: the Metal executor while it holds, the
+    /// host walk otherwise. A Metal failure sends the rest of the request
+    /// to the host — the executor never touches the host's state.
+    fn clover_preview_off_graph(
+        &mut self,
+        clover: &Clover,
+        block: &[u32],
+        pos: usize,
+        metal: &mut bool,
+        req: u64,
+        stats: &mut CloverStats,
+    ) -> Result<Vec<f32>, String> {
+        #[cfg(target_os = "macos")]
+        if *metal {
+            match self.clover_metal_pass(clover, block, pos, req, MetalMode::Preview, stats) {
+                Ok(logits) => return Ok(logits),
+                Err(e) => {
+                    tracing::warn!("{e} — the passes go to the CPU");
+                    *metal = false;
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (metal, req);
+        self.clover_preview(clover, block, pos, stats)
+    }
+
+    /// Teacher-forced NLL of `ids` (targets from `start`) on the Metal
+    /// executor's causal path — the path every Clover commit takes on Apple
+    /// silicon, scored in chunks of 128 rows. None = the executor is off or
+    /// declined before scoring anything.
+    #[cfg(target_os = "macos")]
+    pub(super) fn clover_metal_nll(&mut self, ids: &[u32], start: usize) -> Option<Result<(f64, usize), String>> {
+        let clover = self.clover.clone()?;
+        if std::env::var("CMF_CLOVER_METAL").as_deref() == Ok("0") || crate::gpu_metal::clover::ready().is_err() {
+            return None;
+        }
+        self.clear_sequence_state();
+        let req = REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let v = self.vocab_size;
+        let (mut nll, mut cnt) = (0f64, 0usize);
+        let mut stats = CloverStats::default();
+        let chunk = metal_chunk();
+        for (ci, part) in ids.chunks(chunk).enumerate() {
+            let p0 = ci * chunk;
+            let logits = match self.clover_metal_pass(&clover, part, p0, req, MetalMode::Score, &mut stats) {
+                Ok(l) => l,
+                Err(e) if ci == 0 => {
+                    tracing::warn!("{e} — scoring on the CPU");
+                    self.clear_sequence_state();
+                    return None;
+                }
+                Err(e) => return Some(Err(e)),
+            };
+            for (r, row) in logits.chunks_exact(v).enumerate() {
+                let t = p0 + r + 1;
+                if t >= ids.len() || t < start.max(1) {
+                    continue;
+                }
+                let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64;
+                let lse = mx + row.iter().map(|&l| (l as f64 - mx).exp()).sum::<f64>().ln();
+                nll += lse - row[ids[t] as usize] as f64;
+                cnt += 1;
+            }
+        }
+        Some(Ok((nll, cnt)))
+    }
+
+    /// `CMF_CLOVER_METAL_CHECK=1` (diagnostic): the prompt just committed on
+    /// the Metal executor is committed again on the CPU, and every layer's
+    /// state (conv ring, S) or first K head is compared, the CPU's kept.
+    #[cfg(target_os = "macos")]
+    fn clover_metal_check(&mut self, ids: &[u32]) {
+        let snap: Vec<(Vec<f32>, Vec<f32>)> = self
+            .kv_cache
+            .layers
+            .iter()
+            .map(|l| (l.linear_state.clone(), if l.num_kv_heads > 0 { l.head_keys(0).to_vec() } else { Vec::new() }))
+            .collect();
+        self.clear_sequence_state();
+        self.clover_commit(ids, 0);
+        let Some(gc) = self.gdn_cfg else { return };
+        let ring = (gc.conv_kernel - 1) * gc.conv_dim();
+        let md = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        let mx = |a: &[f32]| a.iter().map(|x| x.abs()).fold(0f32, f32::max);
+        for (li, (l, (st, k0))) in self.kv_cache.layers.iter().zip(&snap).enumerate() {
+            if l.linear_state.len() == st.len() && st.len() > ring {
+                let ((cr, cs), (mr, ms)) = (l.linear_state.split_at(ring), st.split_at(ring));
+                eprintln!(
+                    "metal check layer {li}: ring |d| {:.3e} (max {:.3e}) · S |d| {:.3e} (max {:.3e})",
+                    md(cr, mr),
+                    mx(cr),
+                    md(cs, ms),
+                    mx(cs)
+                );
+            } else if !k0.is_empty() {
+                let ck = l.head_keys(0);
+                eprintln!("metal check layer {li}: K head 0 |d| {:.3e} (max {:.3e})", md(ck, k0), mx(ck));
+            }
+        }
+    }
+
+    /// A commit off the wgpu graph: the Metal executor while it holds, the
+    /// CPU otherwise. A Metal failure hands the rest of the request to the
+    /// CPU, which resumes after the last chunk the host already holds.
+    fn clover_commit_any(&mut self, clover: &Clover, ids: &[u32], pos: usize, metal: &mut bool, req: u64) {
+        #[cfg(target_os = "macos")]
+        if *metal {
+            match self.clover_metal_commit(clover, ids, pos, req) {
+                Ok(()) if pos == 0 && std::env::var("CMF_CLOVER_METAL_CHECK").is_ok_and(|v| v == "1") => {
+                    self.clover_metal_check(ids);
+                    return;
+                }
+                Ok(()) => return,
+                Err(e) => {
+                    tracing::warn!("{e} — the rest of the request runs on the CPU");
+                    *metal = false;
+                    let done = self.kv_cache.seq_len().saturating_sub(pos).min(ids.len());
+                    self.clover_commit(&ids[done..], pos + done);
+                    return;
+                }
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (clover, metal, req);
+        self.clover_commit(ids, pos);
+    }
+
+    /// Whether this request's passes go to the native Metal executor
+    /// (`CMF_CLOVER_METAL=0` keeps them on the CPU).
+    #[cfg(target_os = "macos")]
+    fn clover_metal_ready(&self) -> bool {
+        if std::env::var("CMF_CLOVER_METAL").as_deref() == Ok("0") {
+            return false;
+        }
+        match crate::gpu_metal::clover::ready() {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("{e} — the passes go to the CPU");
+                false
+            }
+        }
+    }
+
+    /// The Metal executor's description of every layer (`gpu_metal::clover`):
+    /// tensor indices, host slices, the committed state; plus each layer's
+    /// MoE (for the host routing) and the experts' width.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::type_complexity)]
+    fn clover_metal_layers<'a>(
+        &'a self,
+        clover: &'a Clover,
+        inv: &'a [std::sync::Arc<Vec<f32>>],
+    ) -> Result<(Vec<crate::gpu_metal::clover::Layer<'a>>, Vec<&'a MoeFfn>, usize), String> {
+        use crate::gpu_metal::clover as cm;
+        use crate::qtensor::QTensor;
+        let q8 = |t: &QTensor, what: &str| {
+            t.q8_2f_parts().map(|p| p.0).ok_or_else(|| format!("clover metal: {what} is not q8_2f"))
+        };
+        let q4 = |t: &QTensor| t.q4tp_parts().map(|p| p.0).ok_or_else(|| "clover metal: an expert is not q4tp".to_string());
+        fn f32p<'t>(t: &'t QTensor, what: &str) -> Result<&'t [f32], String> {
+            t.f32_parts().map(|p| p.0).ok_or_else(|| format!("clover metal: {what} is not f32 on the host"))
+        }
+        let nl = self.num_layers;
+        let mut moes: Vec<&MoeFfn> = Vec::with_capacity(nl);
+        let mut layers = Vec::with_capacity(nl);
+        let mut inter = 0usize;
+        for li in 0..nl {
+            let lw = &self.weights.layers[self.phys_layer(li)];
+            if lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some() {
+                return Err(format!("clover metal: layer {li} has sandwich norms"));
+            }
+            let mixer = match &lw.attn {
+                AttnKind::LinearGdn(w) => {
+                    let pw = clover.gdn[li].as_ref().ok_or("block diffusion: GDN layer without preview weights")?;
+                    cm::Mixer::Gdn(cm::GdnLayer {
+                        qkv: q8(&w.in_proj_qkv, "in_proj_qkv")?,
+                        z: q8(&w.in_proj_z, "in_proj_z")?,
+                        out: q8(&w.out_proj, "out_proj")?,
+                        a: f32p(&w.in_proj_a, "in_proj_a")?,
+                        bproj: f32p(&w.in_proj_b, "in_proj_b")?,
+                        conv1d: &w.conv1d,
+                        a_log: &w.a_log,
+                        dt_bias: &w.dt_bias,
+                        norm: &w.norm,
+                        conv_right: &pw.conv_right,
+                        logit_scale: &pw.logit_scale,
+                        history_bias: &pw.history_bias,
+                        history_c: &pw.history_c,
+                        state: &self.kv_cache.layers[li].linear_state,
+                    })
+                }
+                AttnKind::Full { wq, wk, wv, wo, q_norm, k_norm, output_gate, softplus_gate: None, bias: None } => {
+                    let cache = &self.kv_cache.layers[li];
+                    let (nkv, hd, rd) = self.layer_geom(li);
+                    if cache.o1.is_some() || cache.sinks.is_some() || self.layer_v_dim(li) != hd || self.qk_norm_after_rope {
+                        return Err(format!("clover metal: attention layer {li} is not plain full context"));
+                    }
+                    cm::Mixer::Attn(cm::AttnLayer {
+                        wq: q8(wq, "q_proj")?,
+                        wk: q8(wk, "k_proj")?,
+                        wv: q8(wv, "v_proj")?,
+                        wo: q8(wo, "o_proj")?,
+                        q_norm: q_norm.as_deref(),
+                        k_norm: k_norm.as_deref(),
+                        output_gate: *output_gate,
+                        nh: self.layer_num_heads(li),
+                        nkv,
+                        hd,
+                        rd,
+                        scale: self.attn_scale,
+                        rope_scale: self.layer_rope_scale(li),
+                        inv_freq: &inv[li],
+                        k: (0..nkv).map(|g| cache.head_keys(g)).collect(),
+                        v: (0..nkv).map(|g| cache.head_values(g)).collect(),
+                    })
+                }
+                _ => return Err(format!("clover metal: layer {li} mixer has no device path")),
+            };
+            let FfnKind::Moe(m) = &lw.ffn else {
+                return Err(format!("clover metal: layer {li} is not a MoE layer"));
+            };
+            let Some((se, Some(sg))) = &m.shared else {
+                return Err("clover metal: the MoE has no gated shared expert".into());
+            };
+            if m.resonance.is_some() || m.experts.iter().chain(std::iter::once(se)).any(|e| e.act != super::Act::Silu || !e.segs.is_empty()) {
+                return Err(format!("clover metal: layer {li} experts are not plain SwiGLU"));
+            }
+            inter = m.experts[0].gate_proj.rows();
+            if se.gate_proj.rows() != inter || m.experts.iter().any(|e| e.gate_proj.rows() != inter) {
+                return Err("clover metal: experts of unequal width".into());
+            }
+            let experts = m
+                .experts
+                .iter()
+                .map(|e| Ok((q4(&e.gate_proj)?, q4(&e.up_proj)?, q4(&e.down_proj)?)))
+                .collect::<Result<Vec<_>, String>>()?;
+            layers.push(cm::Layer {
+                input_norm: &lw.input_norm,
+                post_norm: &lw.post_norm,
+                mixer,
+                moe: cm::MoeLayer {
+                    router: f32p(&m.router, "the router")?,
+                    sgate: f32p(sg, "the shared expert gate")?,
+                    experts,
+                    shared: (q4(&se.gate_proj)?, q4(&se.up_proj)?, q4(&se.down_proj)?),
+                },
+            });
+            moes.push(m);
+        }
+        Ok((layers, moes, inter))
+    }
+
+    /// One pass (`causal` false: a preview of the block, logits
+    /// `[block × vocab]`) or commit (`causal`: the rows advance the device
+    /// state, then the host owners) on the native Metal executor, rows
+    /// `ids` at `pos` of request `req`. Err = a layer the executor does not
+    /// cover or a device failure; a preview never touches the host.
+    #[cfg(target_os = "macos")]
+    fn clover_metal_pass(
+        &mut self,
+        clover: &Clover,
+        ids: &[u32],
+        pos: usize,
+        req: u64,
+        mode: MetalMode,
+        stats: &mut CloverStats,
+    ) -> Result<Vec<f32>, String> {
+        let causal = mode != MetalMode::Preview;
+        use crate::gpu_metal::clover as cm;
+        let (hs, b) = (self.hidden_size, ids.len());
+        let gc = self.gdn_cfg.ok_or("clover metal: no GDN geometry")?;
+        let mut h = Vec::with_capacity(b * hs);
+        for &id in ids {
+            h.extend_from_slice(&self.embed_single(id));
+        }
+        let mut logits = Vec::new();
+        let mut ps = cm::PreviewStats::default();
+        {
+            let inv: Vec<std::sync::Arc<Vec<f32>>> = (0..self.num_layers).map(|li| self.layer_inv_freq(li)).collect();
+            let (layers, moes, inter) = self.clover_metal_layers(clover, &inv)?;
+            let model = self.weights.lm_head.graph_weight().ok_or("clover metal: the head is not mapped")?.0;
+            let pass = cm::Pass {
+                model,
+                layers,
+                final_norm: &self.weights.final_norm,
+                lm_head: self.weights.lm_head.q8_2f_parts().ok_or("clover metal: the head is not q8_2f")?.0,
+                lm_rows: self.weights.lm_head.rows(),
+                hidden: hs,
+                inter,
+                eps: self.rms_eps as f32,
+                gemma: self.norm_style == cortiq_core::types::NormStyle::Gemma,
+                gdn: cm::GdnGeom {
+                    nv: gc.num_v_heads,
+                    nk: gc.num_k_heads,
+                    dk: gc.key_head_dim,
+                    dv: gc.value_head_dim,
+                    kk: gc.conv_kernel,
+                    eps: gc.rms_eps as f32,
+                    gate_sigmoid: gc.output_gate_sigmoid,
+                },
+                epoch: (req, pos),
+            };
+            // The routing of the CPU path, on the device's router logits: a
+            // preview inside the block's expert coreset, a commit plain.
+            let top_p = (!causal && clover.cfg.coreset_enabled).then_some(clover.cfg.coreset_top_p);
+            let mut route = |li: usize, logits: &[f32], rows: usize| -> Option<Vec<Vec<(usize, f32)>>> {
+                let m = moes[li];
+                let ne = m.experts.len();
+                let allowed = top_p.map(|p| coreset_from_logits(m, logits, p));
+                Some(
+                    (0..rows)
+                        .map(|r| {
+                            let (idx, p, wsum) = super::moe_route(&logits[r * ne..(r + 1) * ne], m, allowed.as_deref());
+                            idx.iter().map(|&e| (e, p[e] / wsum)).collect()
+                        })
+                        .collect(),
+                )
+            };
+            match mode {
+                MetalMode::Commit => cm::commit(&pass, &h, b, pos, &mut route, &mut ps)?,
+                MetalMode::Score => cm::commit_scored(&pass, &h, b, pos, &mut route, &mut logits, &mut ps)?,
+                MetalMode::Preview => cm::preview(&pass, &h, b, pos, &mut route, &mut logits, &mut ps)?,
+            }
+            if !logits.is_empty() {
+                let (rows, v) = (pass.lm_rows, self.vocab_size);
+                if rows != v {
+                    let mut out = vec![f32::NEG_INFINITY; b * v];
+                    for (src, dst) in logits.chunks_exact(rows).zip(out.chunks_exact_mut(v)) {
+                        let n = rows.min(v);
+                        dst[..n].copy_from_slice(&src[..n]);
+                    }
+                    logits = out;
+                }
+            }
+        }
+        if causal {
+            let layers = &mut self.kv_cache.layers;
+            cm::commit_results(&mut |li, part| match part {
+                cm::CommitPart::State(st) => {
+                    let ls = &mut layers[li].linear_state;
+                    ls.clear();
+                    ls.extend_from_slice(st);
+                }
+                cm::CommitPart::Kv(k, v) => {
+                    let row = k.len() / b;
+                    for r in 0..b {
+                        layers[li].append(&k[r * row..(r + 1) * row], &v[r * row..(r + 1) * row], &[]);
+                    }
+                }
+            })?;
+        } else {
+            stats.metal_passes += 1;
+            stats.metal_gpu_s += ps.gpu_s;
+            stats.metal_exec_s += ps.exec_s;
+            stats.metal_route_s += ps.route_s;
+            stats.metal_fill_s += ps.fill_s;
+            stats.expert_hits += ps.hits;
+            stats.expert_misses += ps.misses;
+            for (t, x) in stats.metal_stage_s.iter_mut().zip(ps.stage_s) {
+                *t += x;
+            }
+        }
+        Ok(logits)
+    }
+
+    /// Commit `ids` at `pos` on the Metal executor in chunks of up to 128
+    /// rows (the prompt, a resolved block). Err leaves the host state at the
+    /// last whole chunk; the caller restarts the request on the CPU.
+    #[cfg(target_os = "macos")]
+    fn clover_metal_commit(&mut self, clover: &Clover, ids: &[u32], pos: usize, req: u64) -> Result<(), String> {
+        let mut stats = CloverStats::default();
+        let chunk = metal_chunk();
+        for (i, part) in ids.chunks(chunk).enumerate() {
+            self.clover_metal_pass(clover, part, pos + i * chunk, req, MetalMode::Commit, &mut stats)?;
+        }
+        Ok(())
     }
 
     /// Layers `from..` of a preview on the host, rows `h` in place.
@@ -733,6 +1165,15 @@ impl Pipeline {
         // 10.7 against 2.0 s — Metal kept the 19 GB of weights resident
         // where the CPU touches only the pages a pass reads).
         let _cpu = (!graph).then(crate::gpu::enter_cpu_scope);
+        // Apple silicon: the passes on the native Metal executor instead.
+        #[cfg(target_os = "macos")]
+        let mut metal = !graph && self.clover_metal_ready();
+        #[cfg(not(target_os = "macos"))]
+        let mut metal = false;
+        #[cfg(target_os = "macos")]
+        let req = REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        #[cfg(not(target_os = "macos"))]
+        let req = 0u64;
         let preview_mode = crate::gpu::BlockPreview {
             coreset_top_p: cfg.coreset_enabled.then_some(cfg.coreset_top_p),
         };
@@ -756,7 +1197,7 @@ impl Pipeline {
             graph = false;
         }
         if !graph {
-            self.clover_commit(&input_ids[reuse..], reuse);
+            self.clover_commit_any(clover, &input_ids[reuse..], reuse, &mut metal, req);
         }
         stats.prompt_s = t0.elapsed().as_secs_f64();
         let mut committed: Vec<u32> = input_ids.to_vec();
@@ -843,7 +1284,7 @@ impl Pipeline {
                     None if graph => {
                         return Err("block diffusion: device graph declined a preview mid-sequence".into());
                     }
-                    None => PassOut::Logits(self.clover_preview(clover, &block, pos, &mut stats)?),
+                    None => PassOut::Logits(self.clover_preview_off_graph(clover, &block, pos, &mut metal, req, &mut stats)?),
                 };
                 stats.preview_s += t.elapsed().as_secs_f64();
                 if let (0, PassOut::Logits(l)) = (stats.passes + passes, &out) {
@@ -908,7 +1349,7 @@ impl Pipeline {
                     return Err("block diffusion: device graph declined a commit mid-sequence".into());
                 }
             } else {
-                self.clover_commit(new, pos);
+                self.clover_commit_any(clover, new, pos, &mut metal, req);
             }
             stats.commit_s += t.elapsed().as_secs_f64();
             committed.extend_from_slice(new);
