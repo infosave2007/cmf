@@ -463,7 +463,7 @@ fn build_attn(c: &Ctx) -> Option<AttnBt> {
                 layout: None,
                 module: &module,
                 entry_point: Some(ep),
-                compilation_options: Default::default(),
+                compilation_options: crate::gpu_wgpu::pco(),
                 cache: c.pipeline_cache.as_ref(),
             })
     };
@@ -517,7 +517,7 @@ fn build_mm_r(c: &Ctx) -> Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>
             layout: None,
             module: &module,
             entry_point: Some(entry),
-            compilation_options: Default::default(),
+            compilation_options: crate::gpu_wgpu::pco(),
             cache: c.pipeline_cache.as_ref(),
         });
     if let Some(e) = pollster::block_on(scope.pop()) {

@@ -835,7 +835,7 @@ pub(super) fn pipeline(c: &Ctx, key: &str, src: &str, entry: &str) -> Option<Arc
         layout: None,
         module: &m,
         entry_point: Some(entry),
-        compilation_options: Default::default(),
+        compilation_options: crate::gpu_wgpu::pco(),
         cache: c.pipeline_cache.as_ref(),
     });
     if let Some(e) = pollster::block_on(sc.pop()) {
