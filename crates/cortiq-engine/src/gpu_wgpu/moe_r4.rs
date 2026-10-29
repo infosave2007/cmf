@@ -991,7 +991,7 @@ fn build_exact_sg(c: &Ctx) -> Option<ExactSg> {
                 layout: None,
                 module: &module,
                 entry_point: Some(ep),
-                compilation_options: Default::default(),
+                compilation_options: crate::gpu_wgpu::pco(),
                 cache: c.pipeline_cache.as_ref(),
             })
     };
@@ -1038,7 +1038,7 @@ fn build_q82sg(c: &Ctx) -> Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)
             layout: None,
             module: &module,
             entry_point: Some("q82_sg"),
-            compilation_options: Default::default(),
+            compilation_options: crate::gpu_wgpu::pco(),
             cache: c.pipeline_cache.as_ref(),
         });
     if let Some(e) = pollster::block_on(scope.pop()) {
@@ -1120,7 +1120,7 @@ fn build_sg(c: &Ctx) -> Option<Sg> {
                 layout: None,
                 module: &module,
                 entry_point: Some(ep),
-                compilation_options: Default::default(),
+                compilation_options: crate::gpu_wgpu::pco(),
                 cache: c.pipeline_cache.as_ref(),
             })
     };
@@ -1329,7 +1329,7 @@ fn build_mv3(c: &Ctx) -> Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)> 
             layout: None,
             module: &module,
             entry_point: Some("q82_mv3"),
-            compilation_options: Default::default(),
+            compilation_options: crate::gpu_wgpu::pco(),
             cache: c.pipeline_cache.as_ref(),
         });
     if let Some(e) = pollster::block_on(scope.pop()) {
@@ -1361,7 +1361,7 @@ fn build_prefill(c: &Ctx) -> Option<Prefill> {
                 layout: None,
                 module: &module,
                 entry_point: Some(ep),
-                compilation_options: Default::default(),
+                compilation_options: crate::gpu_wgpu::pco(),
                 cache: c.pipeline_cache.as_ref(),
             })
     };
@@ -1395,7 +1395,7 @@ fn build(c: &Ctx) -> Option<Pipes> {
                 layout: None,
                 module: &module,
                 entry_point: Some(ep),
-                compilation_options: Default::default(),
+                compilation_options: crate::gpu_wgpu::pco(),
                 cache: c.pipeline_cache.as_ref(),
             })
     };

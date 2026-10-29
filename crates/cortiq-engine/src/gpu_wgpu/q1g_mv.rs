@@ -119,7 +119,7 @@ pub(crate) fn module_error(c: &Ctx) -> Option<String> {
             layout: None,
             module: &module,
             entry_point: Some("q1g_mv_sg"),
-            compilation_options: Default::default(),
+            compilation_options: crate::gpu_wgpu::pco(),
             cache: None,
         });
     pollster::block_on(scope.pop()).map(|e| format!("{e:?}"))
@@ -169,7 +169,7 @@ fn build(c: &Ctx) -> Option<Q1gSg> {
             layout: None,
             module: &module,
             entry_point: Some("q1g_mv_sg"),
-            compilation_options: Default::default(),
+            compilation_options: crate::gpu_wgpu::pco(),
             cache: c.pipeline_cache.as_ref(),
         });
     if let Some(e) = pollster::block_on(scope.pop()) {

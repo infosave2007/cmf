@@ -807,7 +807,7 @@ fn compile_pipe(c: &Ctx, label: &str, src: &str, ep: &str) -> Option<wgpu::Compu
                 layout: None,
                 module: &m,
                 entry_point: Some(ep),
-                compilation_options: Default::default(),
+                compilation_options: crate::gpu_wgpu::pco(),
                 cache: c.pipeline_cache.as_ref(),
             });
         if let Some(e) = pollster::block_on(scope.pop()) {
@@ -1220,7 +1220,7 @@ fn build_pipes(c: &Ctx) -> BlrPipes {
                 layout: None,
                 module: &m,
                 entry_point: Some(ep),
-                compilation_options: Default::default(),
+                compilation_options: crate::gpu_wgpu::pco(),
                 cache: None,
             })
     };
