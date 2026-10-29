@@ -51,6 +51,24 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Диффузионные модели по блокам (0.8.40)
+
+[Clover-35B-A3B-Preview](https://huggingface.co/infosave/Clover-35B-A3B-Preview-cmf)
+пишет ответ блоками по 32 токена и раскрывает по нескольку токенов за проход
+денойзинга, а не по одному за шаг:
+
+```sh
+hf download infosave/Clover-35B-A3B-Preview-cmf clover-35b-a3b-preview-q4tp-v2.cmf --local-dir .
+cortiq run clover-35b-a3b-preview-q4tp-v2.cmf --prompt "Объясни, как работает хеш-таблица." --no-think
+```
+
+На Vulkan каждый проход денойзинга — одна отправка на GPU (34 мс на блок из
+32 токенов на RTX 5090: ~26 ток/с на прозе, 80–95 на коде при пороге из
+релиза модели). Конвертация, параметры генерации и замеры —
+[docs/CLOVER.md](docs/CLOVER.md). В этом же релизе графы всех MoE-моделей на
+Vulkan занимают меньше видеопамяти: стек 35B-A3B q4tp — 18.8 ГБ вместо 31.8 ГБ,
+а опубликованная Qwen3.6-35B-A3B декодирует 156 ток/с на карте 32 ГБ.
+
 ## Сжатие модели под задачу одной командой (0.8.39)
 
 Общая модель превращается в специалиста под ваши промпты:
