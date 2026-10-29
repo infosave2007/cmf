@@ -321,7 +321,7 @@ fn pipes(c: &Ctx, segs: usize) -> Option<Arc<Pipes>> {
                 layout: Some(&layout),
                 module: m,
                 entry_point: Some(entry),
-                compilation_options: Default::default(),
+                compilation_options: crate::gpu_wgpu::pco(),
                 cache: c.pipeline_cache.as_ref(),
             })
         };
