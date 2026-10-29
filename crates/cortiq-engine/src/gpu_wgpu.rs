@@ -20611,6 +20611,11 @@ pub fn trainer_vram_budget() -> Option<u64> {
     trainer_ctx().map(|c| c.vram_budget)
 }
 
+/// The trainer device's largest storage buffer binding, in bytes.
+pub fn trainer_max_binding() -> Option<u64> {
+    trainer_ctx().map(|c| c.device.limits().max_storage_buffer_binding_size as u64)
+}
+
 /// Logical bytes currently held by the weight-residency arena on the active
 /// adapter.  A sequence's KV/O(1) buffers are intentionally excluded; callers
 /// report those through the pipeline and `o1_device_stats`.

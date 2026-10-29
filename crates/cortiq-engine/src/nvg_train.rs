@@ -26,7 +26,7 @@ use crate::gpu_wgpu::train_mm::{self as tm, Blr, BlrPath, BlrScratch, Op};
 use crate::gpu_wgpu::train_sign::{self as ts, SignCtx, SignInit, SignScratch, SignStepCfg};
 use crate::gpu_wgpu::train_attn::{self as ta, AttScratch};
 use crate::gpu_wgpu::train_ops::{self as to, AttnGeom, QkrGeom};
-use cortiq_core::quant::{dequant_tensor, f16_to_f32, f32_to_f16};
+use cortiq_core::quant::{dequant_tensor_par, f16_to_f32, f32_to_f16};
 use cortiq_core::{CmfModel, LayerType, NormStyle};
 use std::collections::HashMap;
 
@@ -252,19 +252,28 @@ pub struct Net {
     dense_opt: std::sync::OnceLock<wgpu::Buffer>,
 }
 
+/// Host threads for a load's element conversions (the cgroup quota, not
+/// the host's cores).
+fn load_threads() -> usize {
+    crate::pool::Pool::effective_threads().max(1)
+}
+
 fn deq(m: &CmfModel, name: &str) -> Result<(Vec<f32>, Vec<usize>), String> {
     let e = m.tensor(name).ok_or_else(|| format!("missing tensor {name}"))?;
     let n: usize = e.shape.iter().product();
     let mut v = vec![0f32; n];
-    dequant_tensor(e, m.entry_bytes(e), &mut v).map_err(|x| format!("{name}: {x}"))?;
+    dequant_tensor_par(e, m.entry_bytes(e), &mut v, load_threads()).map_err(|x| format!("{name}: {x}"))?;
     Ok((v, e.shape.clone()))
 }
 
 fn f16_plane(c: Ctx, v: &[f32]) -> wgpu::Buffer {
-    let mut h: Vec<u16> = v.iter().map(|&f| f32_to_f16(f)).collect();
-    if h.len() % 2 == 1 {
-        h.push(0);
-    }
+    let mut h = vec![0u16; v.len() + v.len() % 2];
+    let per = v.len().div_ceil(load_threads()).max(1 << 16);
+    std::thread::scope(|s| {
+        for (d, src) in h.chunks_mut(per).zip(v.chunks(per)) {
+            s.spawn(move || d.iter_mut().zip(src).for_each(|(o, &f)| *o = f32_to_f16(f)));
+        }
+    });
     let b = tm::f16_buf(c, h.len());
     c.queue.write_buffer(&b, 0, bytemuck::cast_slice(&h));
     b
@@ -272,11 +281,25 @@ fn f16_plane(c: Ctx, v: &[f32]) -> wgpu::Buffer {
 
 fn transpose(v: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let mut t = vec![0f32; v.len()];
-    for r in 0..rows {
-        for k in 0..cols {
-            t[k * rows + r] = v[r * cols + k];
-        }
+    if rows == 0 || cols == 0 {
+        return t;
     }
+    // output rows (input columns) in bands, one band per thread
+    let band = cols.div_ceil(load_threads()).max(1);
+    std::thread::scope(|s| {
+        for (bi, out) in t.chunks_mut(band * rows).enumerate() {
+            let k0 = bi * band;
+            s.spawn(move || {
+                let kn = out.len() / rows;
+                for r in 0..rows {
+                    let src = &v[r * cols + k0..r * cols + k0 + kn];
+                    for (j, &x) in src.iter().enumerate() {
+                        out[j * rows + r] = x;
+                    }
+                }
+            });
+        }
+    });
     t
 }
 
@@ -1262,6 +1285,33 @@ pub fn capture_grams(c: Ctx, net: &Net, w: &Work, ids: &[u32], ntok: usize, gram
     Some(())
 }
 
+/// The inputs of a layer's linears, as [`forward_linear_inputs`] hands them
+/// over: role, device buffer (`[t][cols]` f32, the first `ntok` rows real),
+/// columns. Roles: `in` (q/k/v, or GDN qkv/z/a/b), `mixout` (o_proj or GDN
+/// out_proj), `mlp` (gate/up), `down`.
+pub type LinearInputs<'a> = [(&'static str, &'a wgpu::Buffer, usize); 4];
+
+/// The forward of layers `0..upto` from the embedded `ids`, `hook` called
+/// right after each layer with its linears' inputs (still in the workspace
+/// then) — what a calibration folds into its Hessians, one forward per
+/// window. `hook` returning false stops the forward (`None`).
+pub fn forward_linear_inputs(c: Ctx, net: &Net, w: &Work, ids: &[u32], upto: usize, hook: &mut dyn FnMut(usize, &LinearInputs) -> bool) -> Option<()> {
+    let g = &net.geom;
+    if net.first != 0 {
+        return None;
+    }
+    embed(c, net, w, ids);
+    for l in 0..upto.min(net.end) {
+        layer_fwd(c, net, w, l, &w.ckpt[l], &w.ckpt[l + 1], false)?;
+        let mixout = if g.gdn_layer[l] { (w.get("gout"), g.vd()) } else { (w.get("og"), g.nh * g.hd) };
+        let ins: LinearInputs = [("in", w.get("n1"), g.hs), ("mixout", mixout.0, mixout.1), ("mlp", w.get("n2"), g.hs), ("down", w.get("hh"), net.layers[l].gate.m())];
+        if !hook(l, &ins) {
+            return None;
+        }
+    }
+    Some(())
+}
+
 /// [`capture_grams`] over layers `start..` only: from the embedded `ids`
 /// when `start` is 0, else from `x0` (`[t][hs]` f32, the residual input of
 /// layer `start` as a previous range returned it). With `keep`, returns the
@@ -1930,6 +1980,21 @@ pub fn loss_sum_h(c: Ctx, net: &Net, w: &Work, ids: &[u32], h0: Option<&[f32]>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The banded threaded transpose equals the plain double loop.
+    #[test]
+    fn transpose_matches_serial() {
+        for (rows, cols) in [(1, 1), (3, 1000), (129, 77), (512, 384)] {
+            let v: Vec<f32> = (0..rows * cols).map(|i| i as f32).collect();
+            let mut want = vec![0f32; v.len()];
+            for r in 0..rows {
+                for k in 0..cols {
+                    want[k * rows + r] = v[r * cols + k];
+                }
+            }
+            assert_eq!(transpose(&v, rows, cols), want, "{rows}x{cols}");
+        }
+    }
 
     /// End-to-end gradient check through every layer's backward: the
     /// analytic gradient of an RMSNorm gain of layer 0 (and of the final
