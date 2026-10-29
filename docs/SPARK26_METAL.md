@@ -1,4 +1,4 @@
-# Spark-X2.6-4B q8_2f on Metal (Mac mini M4, 10-core GPU, 24 GB) — 2026-10-29
+# Spark-X2.6-4B (q8_2f and q4tp) on Metal (Mac mini M4, 10-core GPU, 24 GB) — 2026-10-29
 
 Branch `spark26-metal` (worktree `~/dev/cmf-spark26`, from master 4a5b848f = 0.8.40), 5 commits,
 not pushed. Model: `infosave/Spark-X2.6-4B-cmf` default file `spark-x2.6-4b-q8_2f.cmf`,
@@ -93,3 +93,71 @@ reuse = fresh prefill, character for character (48- and 700-token answers).
 - Raw outputs: `kbench1.txt`, `kbench_quiet.txt`, `mmbench_clean1.txt`, `ab_chunk_*.txt`,
   `ab_attmm_*.txt`, `skip_ctx1000.txt`, `ppl_gpu.txt`, `serve*.log`, `r2*_*.json`, `out_*.txt`,
   `short_*.txt`.
+
+
+## Part 2 (15:15–16:40): q4tp file + decode attention + q4tp GEMM
+
+File `spark-x2.6-4b-q4tp.cmf`, 2,161,419,978 B, sha256 76fcaafe…937d (= HF LFS oid). A decode token
+reads ≈ 2.14 GB (36 × 54.7 MB + 175 MB q4tp tied head), roof ≈ 40 tok/s at ~88 GB/s.
+Conditions: the desktop kept the GPU at 32–42 % (and a foreign `cortiq compress` at 100 % for
+~15 min, excluded); a foreign cargo build ran. Absolute numbers are depressed and noisy; the kept
+changes were decided by in-process A/B or by ratios inside one process.
+
+### Stage attribution (new tool: `CMF_METAL_AB=mcfr/mcfrx` + `CMF_METAL_SKIP=<letters>`)
+
+The arm with `x` drops the named stages, tokens alternate, so the pair ratio is the stage cost on a
+drifting machine. q4tp decode, GPU ms per token, short context (before the attend change):
+gate/up 11.3 · down 6.4 · **attend 6.4** · QKV 4.2 · O 3.0 · head 1.9 · RoPE 0.3 · norms 0.3.
+Attend vs depth: 6.4 ms (40–240 positions), 9.6 (≈500), 10.2 (≈1100), 12.7 (≈3100).
+
+### 6. Decode attend: split-K from the second position, 32-row blocks (2a35bcf7, kept)
+
+The Spark plan used the per-head `gqa_attend` up to 64 positions and the split-K kernel in
+128-position blocks past that: few long dependent chains for a latency-bound walk. Standalone
+(`attend_kernel_bench`, 16 Q / 4 KV heads, width 256): 150 positions per-head 106 µs vs split-K/32
+30 µs; 512: split-K/128 247 µs → /32 53 µs; 1000: 194 → 145 µs. `set_attend_blk(1, 32)` for Spark.
+
+| in-process A/B, GPU time per token | short | depth 1000 |
+|---|---:|---:|
+| q4tp | 0.862 | 0.882 |
+| q8_2f | 0.905 | 0.924 |
+
+Greedy output identical to the previous binary on 6 prompts (both files, 96 tokens); q4tp ppl
+11.765 before and after.
+
+### 7. q4tp prefill GEMM loads (649d0498, kept)
+
+`q4tp_mul_mm` ran 0.86 of the q8 GEMM rate (layer-0 gate and down, b = 512, alternating rounds in
+one process, `metal_gemm_q8_vs_q4tp`). One 8-byte nibble load instead of eight byte loads and the
+activation boost folded into the group scale (a power of two — the same products): gate 0.885,
+down 0.93 of q8. ppl 11.765 and greedy output unchanged.
+
+### q4tp quality
+
+`ppl --tokens 4096`: Metal 11.765 (base = branch), CPU 11.758 (card: 11.88 on Vulkan, other text
+protocol). Greedy: Metal paths identical to each other; the CPU agrees on 2 of 3 prompts.
+
+### Final interleaved runs (desktop GPU load ~41 %)
+
+| file | ctx | base prefill | new prefill | base decode | new decode |
+|---|---|---:|---:|---:|---:|
+| q4tp | 41 tok | 197.9 / 176.9 | 176.1 / 176.5 | 27.3 / 27.5 | 30.0 / 29.7 |
+| q4tp | 1000 | 182.7 / 182.1 | 182.4 / 178.8 | 24.5 / 24.6 | 24.1 / 24.9 |
+| q4tp | 4000 | 182.8 | 172.3 | 21.1 | 22.2 |
+| q8_2f | 41 tok | 104.1 / 81.0 | 164.7 / 152.2 | 15.1 / 14.6 | 16.2 / 16.4 |
+| q8_2f | 1000 | 99.4 / 102.7 | 168.4 / 166.7 | 13.9 / 14.2 | 14.4 / 14.0 |
+| q8_2f | 4000 | 90.6 | 171.7 | 14.5 | 14.1 |
+
+(On a quiet GPU in the morning the same q4tp binary decoded 32 tok/s short; process-to-process
+noise here is ±10 %, below the in-process A/B resolution.)
+
+### Measured and rejected in part 2
+
+- q4tp matvec with 2/4/8 rows per simdgroup (k3.metal): within noise of `q4tp_matvec_m` on every
+  shape once the GPU is warm (the first-kind 43 GB/s was a clock ramp-up artefact).
+- Fused flash attention for the chunk prefill: not built — hd 256 leaves 8 query rows per
+  simdgroup in registers, K/V reuse caps it near 1.6 TFLOP/s; ~10 % of a 4k prompt for a large
+  kernel. Listed as the next step for long prompts.
+
+Files added: `k3.metal`, `q4_skipab*.txt`, `attk_ab.txt`, `ppl_q4tp.txt`, `final_ab.txt`,
+binaries `cortiq-attdef` (attend change) and `cortiq-q4mm` (= branch head).
