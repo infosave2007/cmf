@@ -12436,7 +12436,9 @@ pub fn chunk_run_gpu(
         return false;
     }
     let wide_ok = |hd: usize| hd <= 256 || (g4p.is_some() && gemma4::w16_on() && hd <= 512);
-    if b < 32
+    // 8 rows: the shortest chunk measured and checked (Spark-X2.6-4B q8_2f);
+    // the pipeline's own floor (`Pipeline::chunk_min_rows`) is the policy.
+    if b < 8
         || hd % 4 != 0
         || !wide_ok(hd)
         || first.rd < 2
