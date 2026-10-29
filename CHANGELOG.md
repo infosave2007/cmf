@@ -5,6 +5,48 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.43] — 2026-10-29
+
+### Changed
+- Metal: dense q8_2f stacks with an exact-GELU FFN (Spark-X2.5/X2.6) prefill
+  on the one-submission chunk graph — the graph refused every dense q8_2f
+  layer, so the default Spark file walked its layers on the host. gate/up read
+  their x·col staged, down's field scales the activation rows. Spark-X2.6-4B
+  q8_2f on a Mac mini M4: 1000-token prompt ~115 → ~205 tok/s, 41 tokens
+  ~92 → ~203 tok/s; `cortiq ppl` 10.717 → 10.716.
+- Cross-turn KV reuse keeps the longest common prefix when a turn diverges
+  from the cached history (a chat app re-renders the previous answer through
+  the template, so the history never extended token for token and every turn
+  re-prefilled the whole conversation). Exact for host-owned f32 full
+  attention with no recurrent, O(1) or bounded state; sliding tails keep the
+  rows a rollback to the turn's prompt still reads. `cortiq serve`, Spark
+  q8_2f, a 2.3k-token history: turn 2 prefill 11.3 s → 0.58 s, output identical
+  to a fresh prefill. `CMF_KV_ROLLBACK=0` keeps extension-only reuse.
+- Spark prompts of 8–31 tokens take the Metal chunk graph (its floor was 32
+  rows for every model; others keep 32, `CMF_CHUNK_MIN_B` overrides):
+  0.85–1.3 s → 0.16–0.20 s.
+- Spark decode attends through the GQA-shared split-K kernel from the second
+  position in 32-position blocks (per-head kernel up to 64 positions, 128-row
+  blocks past that before): GPU time per token 0.86× (short) / 0.88× (depth
+  1000) on q4tp, 0.91× / 0.92× on q8_2f; greedy output unchanged.
+  `CMF_GQA_BLKSZ` sets the block.
+- Chunk attention P·V GEMM steps K by 32 with 16-byte loads (−27 % of that
+  stage at depth 4k); the q4tp prefill GEMM loads its nibbles in one 8-byte
+  read (0.86 → 0.89–0.93 of the q8 GEMM rate). Both bit-exact.
+
+### Added
+- In-process stage attribution for the Metal decode: `CMF_METAL_AB` letter `x`
+  drops the `CMF_METAL_SKIP` stages in one arm (new letters `g`, `d` for the
+  dense FFN), so a stage's cost is a pair ratio on a drifting machine; letter
+  `k` A/Bs the small-block attend.
+- Kernel benches (ignored tests, `tests/metal_q8f_bench.rs`): q8_2f and q4tp
+  decode matvecs and the q8 GEMM per projection kind over every layer (built-in
+  or MSL compiled at runtime), decode attend by depth, q8 vs q4tp GEMM rate.
+
+### Documentation
+- `docs/SPARK26_METAL.md`: the Spark-X2.6 Metal measurements, kept and
+  rejected changes.
+
 ## [0.8.42] — 2026-10-29
 
 ### Changed

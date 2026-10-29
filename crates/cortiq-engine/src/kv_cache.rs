@@ -439,6 +439,21 @@ impl LayerKvCache {
     /// q8 layer whose per-channel field is not frozen yet: the freeze
     /// reads every stored row, so dropping one before it would change it.
     pub fn trim_window(&mut self, w: usize, slack: usize, align: usize) -> usize {
+        self.trim_window_anchored(w, slack, align, usize::MAX)
+    }
+
+    /// `trim_window` that also keeps every row a rollback to `anchor −
+    /// slack` or later still reads (the cut never passes `anchor − w −
+    /// slack`). The pipeline anchors at the current turn's prompt end, so
+    /// the next chat turn can drop the whole answer however long it ran
+    /// (`Pipeline::rollback_prefix_len`); `usize::MAX` is the plain trim.
+    pub fn trim_window_anchored(
+        &mut self,
+        w: usize,
+        slack: usize,
+        align: usize,
+        anchor: usize,
+    ) -> usize {
         if self.o1.is_some() || self.bounded.is_some() || w == 0 {
             return 0;
         }
@@ -453,7 +468,10 @@ impl LayerKvCache {
             return 0;
         }
         let align = align.max(1);
-        let keep_from = self.pos_len().saturating_sub(w + slack);
+        let keep_from = self
+            .pos_len()
+            .saturating_sub(w + slack)
+            .min(anchor.saturating_sub(w + slack));
         let new_base = keep_from / align * align;
         if new_base <= self.base {
             return 0;
@@ -2943,6 +2961,45 @@ mod tests {
         assert!(trims > 5, "only {trims} trims in 100 positions");
         assert_eq!(t.tail_window(), Some(w));
         assert_eq!(full.tail_window(), None);
+    }
+
+    /// A tail trimmed under a turn anchor keeps every row the window at the
+    /// anchor reads, however long the answer runs past it; rolling the whole
+    /// answer back leaves exactly the untrimmed rows there, and the anchor
+    /// moved on lets the plain trim drain them again.
+    #[test]
+    fn swa_anchored_trim_keeps_the_rollback_window() {
+        let (nkv, hd, w, slack, align) = (1usize, 4usize, 6usize, 2usize, 4usize);
+        let alive = [true];
+        let mut full = LayerKvCache::new(nkv, hd);
+        full.mode = KvMode::F32;
+        let mut t = full.clone();
+        let anchor = 40usize;
+        for p in 0..100 {
+            let (k, v) = (swa_row(p, nkv * hd, 1), swa_row(p, nkv * hd, 2));
+            full.append(&k, &v, &alive);
+            t.append(&k, &v, &alive);
+            t.trim_window_anchored(w, slack, align, anchor);
+            assert!(
+                t.base() + w <= anchor - slack + 1,
+                "base {} at {p}",
+                t.base()
+            );
+        }
+        let back = anchor - slack;
+        t.truncate_last(t.pos_len() - back);
+        full.truncate_last(full.pos_len() - back);
+        assert_eq!(t.pos_len(), back);
+        let b = t.base();
+        assert!(t.seq_len >= w - 1);
+        assert_eq!(t.head_keys(0), &full.head_keys(0)[b * hd..]);
+        assert_eq!(t.head_values(0), &full.head_values(0)[b * hd..]);
+        for p in back..back + 3 * w {
+            let (k, v) = (swa_row(p, nkv * hd, 1), swa_row(p, nkv * hd, 2));
+            t.append(&k, &v, &alive);
+            t.trim_window_anchored(w, slack, align, usize::MAX);
+        }
+        assert!(t.seq_len <= 2 * w);
     }
 
     /// Two caches fed the same rows, one trimmed: every windowed attend

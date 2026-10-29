@@ -51,6 +51,15 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Spark-X2.6 on Apple silicon (0.8.43)
+
+[Spark-X2.6-4B](https://huggingface.co/infosave/Spark-X2.6-4B-cmf) on a Mac
+mini M4 (24 GB): the default q8_2f file prefills a 1000-token prompt at ~205
+tok/s and decodes at 16–19 tok/s; the q4tp file decodes at ~30 tok/s. A chat
+turn through `cortiq serve` prefills only what changed since the previous
+turn (2.3k-token history: 0.6 s instead of 11 s). Measurements and the
+rejected levers: [docs/SPARK26_METAL.md](docs/SPARK26_METAL.md).
+
 ## Block-diffusion models (0.8.40)
 
 [Clover-35B-A3B-Preview](https://huggingface.co/infosave/Clover-35B-A3B-Preview-cmf)
