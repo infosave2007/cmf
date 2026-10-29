@@ -898,18 +898,22 @@ kernel void mul_mm_f32nn(
     // stays a buffer param.
     uint rows = is_function_constant_defined(FC_ROWS) ? FC_ROWS : rows_b;
     threadgroup char shmem[8192];
-    threadgroup half* sa = (threadgroup half*)shmem;      // V tile [16k × 64d] packed
-    threadgroup half* sb = (threadgroup half*)(shmem + 4096); // P tile [32m × 16k]
-    const uint NK = 16u;
+    threadgroup half* sa = (threadgroup half*)shmem;      // V tile [32k × 64d] packed
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096); // P tile [32m × 32k]
+    // K steps of 32 with 16-byte loads (the q8 GEMM's operating point);
+    // the 8x8 blocks are fed to the MMAs in the same k order as 16-wide
+    // steps would, so the sums are the same.
+    const uint NK = 32u;
     uint r0 = tg.y * 64u;   // d tile
     uint r1 = tg.x * 32u;   // m tile
     uint nr1 = min(nb - r1, 32u);
     uint lr1 = min(tiitg / 4u, nr1 - 1u);
-    // V tile loader coords: 128 threads cover 16×64 halfs, 8 per thread.
-    // Thread t loads row kv = t/8, col span 8*(t%8).
-    uint vk = tiitg / 8u;       // 0..15 k-row in tile
-    uint vd = 8u * (tiitg % 8u); // 0..56 d-col start
-    uint iyp = 4u * (tiitg % 4u); // P: 4 floats per thread per row
+    // V tile loader: 128 threads cover 32×64, 16 per thread: k-row
+    // vk = t/4, d span 16·(t%4). P: 8 floats per thread per row.
+    uint vk = tiitg / 4u;
+    uint vd = 16u * (tiitg % 4u);
+    uint iyp = 8u * (tiitg % 4u);
+    bool dfull = r0 + 64u <= rows;
     simdgroup_half8x8 ma[4];
     simdgroup_half8x8 mb[2];
     simdgroup_float8x8 mc[8];
@@ -918,51 +922,55 @@ kernel void mul_mm_f32nn(
     }
     for (uint k0 = 0; k0 < kdim; k0 += NK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        // V tile: [k][d] 8x8-block packed: block ib = 8*(d_blk) + k_blk?
-        // Keep the SAME packing convention as sa in the nt kernel:
-        // ma fragment i covers d-range [8i, 8i+8) of the sg's 32-wide
-        // strip; blocks indexed ib = 8*dblk + kblk over [64d × 16k]…
-        // simpler: store [d][k] transposed so the fragment layout matches
-        // the nt kernel exactly (ma loads want [k][d(row-major 8x8)] via
-        // transpose=false on [d][k]? — no: multiply(mb[m,k], ma[k,d])
-        // needs ma fragment [k][d]. Store blocks as [k][d]:
-        // ib = 8*sxd + syk with row=k%8, col=d%8.
+        bool kfull = k0 + NK <= kdim;
+        // V blocks k-major (ib = 8·kblk + dblk), [k][d] inside — the nt
+        // kernel's sa convention (lsma += 8·64 per k block).
         {
-            uint dblk = vd / 8u;        // 0..7
-            uint kblk = vk / 8u;        // 0..1
-            // Block index MUST be k-major (ib = 8·kblk + dblk): the
-            // compute loop advances k with lsma += 8·64 and picks the
-            // d-half with 4·64·(sgitg%2) — same convention as sa in nt.
-            uint ib = 8u * kblk + dblk;
+            uint kblk = vk / 8u;
             uint krow = vk % 8u;
-            threadgroup half* dst = sa + 64u * ib + 8u * krow;
+            uint db = vd / 8u;
+            threadgroup half* d0 = sa + 64u * (8u * kblk + db) + 8u * krow;
+            threadgroup half* d1 = sa + 64u * (8u * kblk + db + 1u) + 8u * krow;
             device const float* vr = vw + (ulong)(k0 + vk) * rows + r0 + vd;
-            bool kok = k0 + vk < kdim;
-            for (uint i = 0; i < 8u; ++i) {
-                bool ok = kok && r0 + vd + i < rows;
-                dst[i] = ok ? (half)vr[i] : (half)0.0f;
+            if (kfull && dfull) {
+                device const packed_float4* v4 = (device const packed_float4*)vr;
+                float4 a = float4(v4[0]), b = float4(v4[1]);
+                float4 e = float4(v4[2]), f = float4(v4[3]);
+                d0[0] = (half)a.x; d0[1] = (half)a.y; d0[2] = (half)a.z; d0[3] = (half)a.w;
+                d0[4] = (half)b.x; d0[5] = (half)b.y; d0[6] = (half)b.z; d0[7] = (half)b.w;
+                d1[0] = (half)e.x; d1[1] = (half)e.y; d1[2] = (half)e.z; d1[3] = (half)e.w;
+                d1[4] = (half)f.x; d1[5] = (half)f.y; d1[6] = (half)f.z; d1[7] = (half)f.w;
+            } else {
+                bool kok = k0 + vk < kdim;
+                for (uint i = 0; i < 8u; ++i) {
+                    d0[i] = kok && r0 + vd + i < rows ? (half)vr[i] : (half)0.0f;
+                    d1[i] = kok && r0 + vd + 8u + i < rows ? (half)vr[8u + i] : (half)0.0f;
+                }
             }
         }
-        // P tile [32m × 16k]: blocks ib = 4*kblk… same as sb in nt:
-        // thread t: row m = t/4, 4 floats at 4*(t%4).
+        // P blocks ib = 4·kblk + mblk (the nt kernel's sb convention).
         {
-            uint kb4 = iyp;
-            uint sx = kb4 / 8u;         // which 8-k block half? kb4 in {0,4,8,12}
-            uint off = kb4 % 8u;
+            uint sx = tiitg % 4u;
             uint sy = (tiitg / 4u) / 8u;
             uint ly = (tiitg / 4u) % 8u;
-            uint ib = 4u * sx + sy;
-            device const float* pr = xs + (ulong)(r1 + lr1) * kdim + k0 + kb4;
-            threadgroup half* dst = sb + 64u * ib + 8u * ly + off;
-            for (uint i = 0; i < 4u; ++i) {
-                dst[i] = k0 + kb4 + i < kdim ? (half)pr[i] : (half)0.0f;
+            threadgroup half* dst = sb + 64u * (4u * sx + sy) + 8u * ly;
+            device const float* pr = xs + (ulong)(r1 + lr1) * kdim + k0 + iyp;
+            if (kfull) {
+                device const packed_float4* p4 = (device const packed_float4*)pr;
+                float4 a = float4(p4[0]), b = float4(p4[1]);
+                dst[0] = (half)a.x; dst[1] = (half)a.y; dst[2] = (half)a.z; dst[3] = (half)a.w;
+                dst[4] = (half)b.x; dst[5] = (half)b.y; dst[6] = (half)b.z; dst[7] = (half)b.w;
+            } else {
+                for (uint i = 0; i < 8u; ++i) {
+                    dst[i] = k0 + iyp + i < kdim ? (half)pr[i] : (half)0.0f;
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         threadgroup const half* lsma = sa + 4u * 64u * (sgitg % 2u);
         threadgroup const half* lsmb = sb + 2u * 64u * (sgitg / 2u);
         #pragma clang loop unroll(full)
-        for (short ik = 0; ik < 2; ++ik) {
+        for (short ik = 0; ik < 4; ++ik) {
             simdgroup_barrier(mem_flags::mem_none);
             #pragma clang loop unroll(full)
             for (short i = 0; i < 4; ++i) {
@@ -2599,6 +2607,7 @@ kernel void gqa_attend_blk(
     constant uint& nb   [[buffer(9)]],
     constant uint& nblk [[buffer(10)]],
     constant float& scale [[buffer(11)]],
+    constant uint& bsz  [[buffer(12)]],   // positions per block
     uint3 tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
@@ -2607,8 +2616,8 @@ kernel void gqa_attend_blk(
     if (kh * hpk + sg >= nh || e >= nb || j >= nblk) return;
     uint h = kh * hpk + sg;
     uint n = s0 + e + 1u;
-    uint p0 = j * 128u;
-    uint p1 = min(p0 + 128u, n);
+    uint p0 = j * bsz;
+    uint p1 = min(p0 + bsz, n);
     uint nt = (hd + 31u) / 32u;
     device float* out = part + (((ulong)e * nh + h) * nblk + j) * (hd + 2u);
     if (p0 >= n) {
@@ -7087,21 +7096,27 @@ kernel void q4tp_mul_mm(
             // them in the loop cost Lumina's DiT enough that the runtime probe
             // preferred the CPU GEMM outright — the "the GEMM's arithmetic
             // hides the chain" argument held for FFN shapes and not for this.
-            float scale = exp2(row_lo + (float)code * row_st);
+            // wboost is a power of two (or 1): folded into the scale it
+            // rounds exactly as the per-weight multiply did.
+            float scale = exp2(row_lo + (float)code * row_st) * wboost;
             device const uchar* nib = q + ((ulong)(r0 + lr0) * gpr + (ulong)g) * 16ul + 8u * il0;
             uint sy = (tiitg / 2u) / 8u;
             uint lx = (tiitg / 2u) % 8u;
             float wv[16];
+            // The 8 nibble bytes in one 8-byte load (the tile is 16-byte
+            // aligned, this half at +8·il0) — eight byte loads were the
+            // W-side cost; the same nibbles, the same products.
+            uint2 nb2 = *(device const uint2*)nib;
             for (uint i = 0; i < 8u; ++i) {
-                uint bb = nib[i];
+                uint bb = ((i < 4u ? nb2.x : nb2.y) >> (8u * (i & 3u))) & 0xFFu;
                 wv[2u * i]      = ((float)(bb & 0xFu) - 8.0f) * scale;
                 wv[2u * i + 1u] = ((float)(bb >> 4u) - 8.0f) * scale;
             }
             uint ib0 = 8u * (2u * il0) + sy;
             uint ib1 = 8u * (2u * il0 + 1u) + sy;
             for (uint i = 0; i < 8u; ++i) {
-                sa[64u * ib0 + 8u * i + lx] = (half)(wv[i] * wboost);
-                sa[64u * ib1 + 8u * i + lx] = (half)(wv[i + 8u] * wboost);
+                sa[64u * ib0 + 8u * i + lx] = (half)wv[i];
+                sa[64u * ib1 + 8u * i + lx] = (half)wv[i + 8u];
             }
         }
         // X: 8 consecutive floats → one 8x8-block row (identical to q8).
@@ -10230,32 +10245,32 @@ fn encode_q4t_matvec(
 thread_local! {
     /// Dense decode levers for the encodes on this thread: `DENSE_MV` |
     /// `DENSE_FUSE`. Scoped by `MvFastGuard`.
-    static MV_FAST: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static MV_FAST: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
 }
 
 /// Lever bits of the plain dense decode (`MvFastGuard`, `dense_ab_arm`).
-pub const DENSE_MV: u8 = 1;
+pub const DENSE_MV: u16 = 1;
 /// Concurrent layer encoder (`TokenGraph::set_dense_concurrent`).
-pub const DENSE_CONC: u8 = 2;
+pub const DENSE_CONC: u16 = 2;
 /// Fused epilogues: h += O·ao, gate|up|SiLU in one pass, h += Down·act.
-pub const DENSE_FUSE: u8 = 4;
+pub const DENSE_FUSE: u16 = 4;
 /// q8_2f projections take the four-row `q8f_matvec_r4` (same per-row
 /// accumulation order as `q8f_matvec`, x·col read once per four rows).
 /// Opened per plan (Spark-X2.5); `CMF_Q8_R4=1` forces it everywhere,
 /// `=0` closes it.
-pub const DENSE_Q8R4: u8 = 8;
+pub const DENSE_Q8R4: u16 = 8;
 /// MoE decode (Mellum2.1): the routed experts' gate|up|SiLU in one
 /// masked-nibble jobs pass (`q4tp_moe_gu_m`). `CMF_METAL_MOEFAST=0` closes
 /// all three MoE levers.
-pub const MOE_GU: u8 = 16;
+pub const MOE_GU: u16 = 16;
 /// MoE decode: down + weighted mix + residual in one pass (`q4tp_moe_down_m`).
-pub const MOE_DN: u8 = 32;
+pub const MOE_DN: u16 = 32;
 /// MoE decode: the top-k select over one simdgroup (`moe_topk_select_sg`,
 /// bit-identical to the single-thread kernel).
-pub const MOE_SEL: u8 = 64;
+pub const MOE_SEL: u16 = 64;
 /// Device attend of a MoE plan: the GQA-shared split-K kernel from 64
 /// positions on (`set_attend_blk_from`) instead of the default 512.
-pub const ATT_BLK: u8 = 128;
+pub const ATT_BLK: u16 = 128;
 
 /// The levers a MoE decode plan opens by default. Measured on Mellum2.1
 /// q4tp, M4, in-process `CMF_METAL_AB` arms (pair medians, wall per token):
@@ -10264,9 +10279,17 @@ pub const ATT_BLK: u8 = 128;
 /// `off`). Measured neutral and left off: fused down+mix (0.986-0.997),
 /// the concurrent encoder (0.990), fused RoPE+append (1.000), split-K
 /// attend from 64 positions (0.992 short, 1.005 at depth 1500).
-pub const MOE_PLAN_BITS: u8 = DENSE_Q8R4 | MOE_SEL | MOE_GU;
+/// In-process cost attribution (`CMF_METAL_AB` letter x): the arm with
+/// this bit drops the `CMF_METAL_SKIP` stages, the other keeps them — the
+/// pair ratio is the stage's cost on a drifting machine. Output garbage.
+pub const SKIP_AB: u16 = 256;
+/// Decode attend through the split-K kernel from the second position on,
+/// in 32-position blocks (`CMF_METAL_AB` letter k).
+pub const ATT_SMALL: u16 = 512;
 
-fn moe_bit(b: u8) -> bool {
+pub const MOE_PLAN_BITS: u16 = DENSE_Q8R4 | MOE_SEL | MOE_GU;
+
+fn moe_bit(b: u16) -> bool {
     MV_FAST.with(|f| f.get() & b != 0)
 }
 
@@ -10298,7 +10321,7 @@ fn fuse_on() -> bool {
 /// `CMF_METAL_FUSE=0` close the respective levers everywhere (rollback
 /// switches). Restores the previous value on drop.
 pub struct MvFastGuard {
-    prev: u8,
+    prev: u16,
 }
 
 impl MvFastGuard {
@@ -10308,14 +10331,14 @@ impl MvFastGuard {
     }
 
     /// Raw bits for the in-process A/B (no env gating).
-    pub fn set_raw(bits: u8) -> MvFastGuard {
+    pub fn set_raw(bits: u16) -> MvFastGuard {
         let prev = MV_FAST.with(|f| f.replace(bits));
         MvFastGuard { prev }
     }
 
     /// `DENSE_MV` / `DENSE_FUSE` / `DENSE_Q8R4` bits (others ignored).
-    pub fn set_bits(bits: u8) -> MvFastGuard {
-        static ENV: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    pub fn set_bits(bits: u16) -> MvFastGuard {
+        static ENV: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
         let allowed = *ENV.get_or_init(|| {
             let off = |k: &str| std::env::var(k).as_deref() == Ok("0");
             let mut a = DENSE_MV | DENSE_FUSE | DENSE_Q8R4 | MOE_GU | MOE_DN | MOE_SEL | ATT_BLK;
@@ -10351,18 +10374,18 @@ impl Drop for MvFastGuard {
 /// timed per arm, so a drifting or shared GPU loads both arms alike.
 /// Returns this token's lever bits and its arm index, or None when the
 /// A/B is off. Diagnostics only: the rollback env switches do not apply.
-pub fn dense_ab_arm() -> Option<(u8, usize)> {
-    static CFG: std::sync::OnceLock<Option<[u8; 2]>> = std::sync::OnceLock::new();
+pub fn dense_ab_arm() -> Option<(u16, usize)> {
+    static CFG: std::sync::OnceLock<Option<[u16; 2]>> = std::sync::OnceLock::new();
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let cfg = CFG.get_or_init(|| {
         let v = std::env::var("CMF_METAL_AB").ok()?;
-        let side = |s: &str| -> Option<u8> {
+        let side = |s: &str| -> Option<u16> {
             match s {
                 "off" => return Some(0),
                 "all" => return Some(DENSE_MV | DENSE_CONC | DENSE_FUSE),
                 _ => {}
             }
-            let mut b = 0u8;
+            let mut b = 0u16;
             for ch in s.chars() {
                 b |= match ch {
                     'm' => DENSE_MV,
@@ -10373,6 +10396,8 @@ pub fn dense_ab_arm() -> Option<(u8, usize)> {
                     'd' => MOE_DN,
                     's' => MOE_SEL,
                     'b' => ATT_BLK,
+                    'x' => SKIP_AB,
+                    'k' => ATT_SMALL,
                     _ => return None,
                 };
             }
@@ -10818,6 +10843,407 @@ pub fn q4tp_mm_n8_batch(
         std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), b * rows);
     }
     true
+}
+
+/// Kernel-time microbench (tests) of the q8_2f decode matvec: every tensor
+/// in `idxs` (one projection kind across the layers, so no tensor is warm
+/// in the system cache) dispatched once per rep, all reps in ONE command
+/// buffer timed on the GPU clock. `kernel` names a built-in pipeline
+/// (`q8f_matvec`, `q8f_matvec_r4`) or, with `src`, an entry point
+/// compiled from that MSL source (kernel iteration without an engine
+/// rebuild). Binding contract of `q8f_matvec`; the grid is
+/// ceil(rows / (sgs·rows_per_sg)) threadgroups of `sgs` simdgroups.
+/// Returns GPU ms per rep and the last tensor's output row.
+pub fn q8f_kernel_bench(
+    model: &Arc<CmfModel>,
+    idxs: &[usize],
+    kernel: &str,
+    src: Option<&str>,
+    rows_per_sg: usize,
+    sgs: usize,
+    reps: usize,
+) -> Option<(f64, Vec<f32>)> {
+    let c = ctx()?;
+    let (fbuf, _safe) = file_buffer(c, model)?;
+    let pso = match (kernel, src) {
+        ("q8f_matvec", None) => c.q8f.clone(),
+        ("q8f_matvec_r4", None) => c.q8f_r4.clone(),
+        (name, Some(src)) => {
+            let lib = c
+                ._device
+                .new_library_with_source(src, &metal::CompileOptions::new())
+                .map_err(|e| eprintln!("MSL compile: {e}"))
+                .ok()?;
+            let f = lib.get_function(name, None).ok()?;
+            c._device.new_compute_pipeline_state_with_function(&f).ok()?
+        }
+        _ => return None,
+    };
+    let shared = MTLResourceOptions::StorageModeShared;
+    let f32_buf = |v: &[f32]| {
+        c._device.new_buffer_with_data(
+            v.as_ptr() as *const std::ffi::c_void,
+            (v.len() * 4) as u64,
+            shared,
+        )
+    };
+    struct T {
+        abs: usize,
+        rows: usize,
+        cols: usize,
+        rs: Buffer,
+        col: Buffer,
+    }
+    let mut ts = Vec::new();
+    for &idx in idxs {
+        let e = &model.tensors[idx];
+        if e.dtype != cortiq_core::TensorDtype::Q8_2f {
+            return None;
+        }
+        let (rows, cols) = (e.shape[0], e.shape[1]);
+        let bytes = model.entry_bytes(e);
+        let h = |o: usize| f16_to_f32(u16::from_le_bytes([bytes[o], bytes[o + 1]]));
+        let q = rows * cols;
+        let rs: Vec<f32> = (0..rows).map(|r| h(q + 2 * r)).collect();
+        let col: Vec<f32> = (0..cols).map(|i| h(q + 2 * rows + 2 * i)).collect();
+        ts.push(T {
+            abs: model.entry_abs_offset(e)?,
+            rows,
+            cols,
+            rs: f32_buf(&rs),
+            col: f32_buf(&col),
+        });
+    }
+    let max_cols = ts.iter().map(|t| t.cols).max()?;
+    let max_rows = ts.iter().map(|t| t.rows).max()?;
+    let xs: Vec<f32> = (0..max_cols)
+        .map(|i| ((i % 97) as f32 - 48.0) / 48.0)
+        .collect();
+    let xs_buf = f32_buf(&xs);
+    let y_buf = c._device.new_buffer((max_rows * 4) as u64, shared);
+    let cmd = c.queue.new_command_buffer();
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pso);
+        for _ in 0..reps {
+            for t in &ts {
+                fbuf.bind(enc, 0, t.abs);
+                enc.set_buffer(1, Some(&xs_buf), 0);
+                enc.set_buffer(2, Some(&t.rs), 0);
+                enc.set_buffer(3, Some(&y_buf), 0);
+                enc.set_buffer(4, Some(&t.col), 0);
+                let w = [(t.cols / 4) as u32, t.rows as u32];
+                enc.set_bytes(5, 4, &w[0] as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(6, 4, &w[1] as *const u32 as *const std::ffi::c_void);
+                let n_tg = (t.rows as u64).div_ceil((sgs * rows_per_sg) as u64);
+                enc.dispatch_thread_groups(
+                    MTLSize::new(n_tg, 1, 1),
+                    MTLSize::new(sgs as u64 * 32, 1, 1),
+                );
+            }
+        }
+        enc.end_encoding();
+    }
+    submit_and_wait(c, cmd, &[&y_buf]);
+    let rows = ts.last()?.rows;
+    let mut y = vec![0f32; rows];
+    unsafe {
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, y.as_mut_ptr(), rows);
+    }
+    Some((cmd_gpu_ms(cmd) / reps as f64, y))
+}
+
+/// `q8f_kernel_bench` for the q4tp decode matvec (`q4tp_matvec_m` ABI: 0 q,
+/// 1 x, 2 y, 3 gpr, 4 rows, 5 addy = 0). With `up`, each tensor of `idxs`
+/// pairs with the same-index up tensor for the fused gate|up ABI (5 = the up
+/// weight): `q4tp_matvec_m_gu` / `_gelu`. `kernel` names a built-in
+/// (`q4tp_matvec_m`, `q4tp_matvec_m_gu_gelu`) or, with `src`, an entry point
+/// of that MSL. Grid: ceil(rows / (sgs·rows_per_sg)) threadgroups of `sgs`
+/// simdgroups. Returns GPU ms per rep and the last tensor's output.
+#[allow(clippy::too_many_arguments)]
+pub fn q4tp_mv_kernel_bench(
+    model: &Arc<CmfModel>,
+    idxs: &[usize],
+    up: Option<&[usize]>,
+    kernel: &str,
+    src: Option<&str>,
+    rows_per_sg: usize,
+    sgs: usize,
+    reps: usize,
+) -> Option<(f64, Vec<f32>)> {
+    let c = ctx()?;
+    let (fbuf, _safe) = file_buffer(c, model)?;
+    let pso = match (kernel, src) {
+        ("q4tp_matvec_m", None) => c.q4tp_m.clone(),
+        ("q4tp_matvec_m_gu_gelu", None) => c.q4tp_mgu_gelu.clone(),
+        (name, Some(src)) => {
+            let lib = c
+                ._device
+                .new_library_with_source(src, &metal::CompileOptions::new())
+                .map_err(|e| eprintln!("MSL compile: {e}"))
+                .ok()?;
+            let f = lib.get_function(name, None).ok()?;
+            c._device.new_compute_pipeline_state_with_function(&f).ok()?
+        }
+        _ => return None,
+    };
+    let shared = MTLResourceOptions::StorageModeShared;
+    let mut ts = Vec::new();
+    for (i, &idx) in idxs.iter().enumerate() {
+        let e = &model.tensors[idx];
+        if e.dtype != cortiq_core::TensorDtype::Q4TiledP {
+            return None;
+        }
+        let u = match up {
+            Some(u) => Some(model.entry_abs_offset(&model.tensors[*u.get(i)?])?),
+            None => None,
+        };
+        ts.push((model.entry_abs_offset(e)?, e.shape[0], e.shape[1], u));
+    }
+    let max_cols = ts.iter().map(|t| t.2).max()?;
+    let max_rows = ts.iter().map(|t| t.1).max()?;
+    let xs: Vec<f32> = (0..max_cols)
+        .map(|i| ((i % 97) as f32 - 48.0) / 480.0)
+        .collect();
+    let xs_buf = c._device.new_buffer_with_data(
+        xs.as_ptr() as *const std::ffi::c_void,
+        (xs.len() * 4) as u64,
+        shared,
+    );
+    let y_buf = c._device.new_buffer((max_rows * 4) as u64, shared);
+    let cmd = c.queue.new_command_buffer();
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pso);
+        for _ in 0..reps {
+            for &(abs, rows, cols, u) in &ts {
+                fbuf.bind(enc, 0, abs);
+                enc.set_buffer(1, Some(&xs_buf), 0);
+                enc.set_buffer(2, Some(&y_buf), 0);
+                let w = [(cols / GROUP_SIZE) as u32, rows as u32, 0u32];
+                enc.set_bytes(3, 4, &w[0] as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(4, 4, &w[1] as *const u32 as *const std::ffi::c_void);
+                match u {
+                    Some(ua) => fbuf.bind(enc, 5, ua),
+                    None => enc.set_bytes(5, 4, &w[2] as *const u32 as *const std::ffi::c_void),
+                }
+                enc.dispatch_thread_groups(
+                    MTLSize::new(rows.div_ceil(sgs * rows_per_sg) as u64, 1, 1),
+                    MTLSize::new(sgs as u64 * 32, 1, 1),
+                );
+            }
+        }
+        enc.end_encoding();
+    }
+    submit_and_wait(c, cmd, &[&y_buf]);
+    let rows = ts.last()?.1;
+    let mut y = vec![0f32; rows];
+    unsafe {
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, y.as_mut_ptr(), rows);
+    }
+    Some((cmd_gpu_ms(cmd) / reps as f64, y))
+}
+
+/// Decode attend microbench (tests): one token's grouped attend over `n`
+/// synthetic positions of an `[nkv][cap][hd]` mirror, `reps` dispatches in
+/// one command buffer on the GPU clock. `which` 0: the per-head
+/// `gqa_attend` with the decode graph's simdgroup rule; 1: the split-K
+/// `gqa_attend_blk` + `gqa_combine`. Returns GPU µs per dispatch.
+pub fn attend_kernel_bench(
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    n: usize,
+    which: u32,
+    reps: usize,
+) -> Option<f64> {
+    let c = ctx()?;
+    let cap = n.next_power_of_two().max(1024);
+    let shared = MTLResourceOptions::StorageModeShared;
+    let fill = |len: usize, seed: u32| -> Buffer {
+        let v: Vec<f32> = (0..len)
+            .map(|i| (((i as u32).wrapping_mul(2654435761).wrapping_add(seed) >> 8) % 2001) as f32 / 1000.0 - 1.0)
+            .collect();
+        c._device
+            .new_buffer_with_data(v.as_ptr() as *const std::ffi::c_void, (len * 4) as u64, shared)
+    };
+    let q = fill(nh * hd, 1);
+    let k = fill(nkv * cap * hd, 2);
+    let v = fill(nkv * cap * hd, 3);
+    let ao = c._device.new_buffer((nh * hd * 4) as u64, shared);
+    let imp = c._device.new_buffer((cap * 4) as u64, shared);
+    let sink = const_buf(c, &NO_ATTN_SINK);
+    let scale = 1.0f32 / (hd as f32).sqrt();
+    let cmd = c.queue.new_command_buffer();
+    {
+        let enc = cmd.new_compute_command_encoder();
+        for _ in 0..reps {
+            if which == 0 {
+                let cap_sgs = (c.gqat.max_total_threads_per_threadgroup() as usize / 32)
+                    .clamp(1, gqa_split_max());
+                let sgs = n.div_ceil(32).clamp(1, cap_sgs);
+                let tg_threads = 32 * sgs;
+                disp_tg(
+                    enc,
+                    &c.gqat,
+                    &[(&q, 0), (&k, 0), (&v, 0), (&ao, 0), (&imp, 0), (&sink, 0)],
+                    &[nh as u32, (nh / nkv) as u32, hd as u32, cap as u32, n as u32, 0],
+                    &[scale],
+                    ((nh * tg_threads) as u64, tg_threads as u64),
+                    ((sgs * hd + 2 * sgs) * 4) as u64,
+                );
+            } else {
+                encode_gqa_attend_blk_with(
+                    c,
+                    enc,
+                    &c.gqablk,
+                    gqa_blk_size(),
+                    &q,
+                    &k,
+                    &v,
+                    0,
+                    &ao,
+                    nh,
+                    nkv,
+                    hd,
+                    cap,
+                    n - 1,
+                    1,
+                    scale,
+                    false,
+                );
+            }
+        }
+        enc.end_encoding();
+    }
+    submit_and_wait(c, cmd, &[&ao]);
+    Some(cmd_gpu_ms(cmd) * 1e3 / reps as f64)
+}
+
+/// `q8f_kernel_bench`'s prefill twin: the q8 GEMM `y[b, rows] = rs ·
+/// q · xs[b, cols]` over every tensor in `idxs` (their q8 payload and row
+/// scales; the q8_2f field is the caller's staging, not the GEMM's).
+/// `kernel` `q8_mul_mm` is the built-in, shape-specialized pipeline; with
+/// `src` an entry point of that MSL with the `q8_mul_mm` ABI, specialized
+/// through the same function constants (0 cols, 1 rows). The grid is
+/// (ceil(b / tile_b), ceil(rows / tile_rows)) threadgroups of `threads`.
+/// Returns GPU ms per rep and the last tensor's `y` (b × rows).
+#[allow(clippy::too_many_arguments)]
+pub fn q8_mm_kernel_bench(
+    model: &Arc<CmfModel>,
+    idxs: &[usize],
+    kernel: &str,
+    src: Option<&str>,
+    b: usize,
+    tile_rows: usize,
+    tile_b: usize,
+    threads: usize,
+    reps: usize,
+) -> Option<(f64, Vec<f32>)> {
+    let c = ctx()?;
+    let (fbuf, _safe) = file_buffer(c, model)?;
+    let lib = match src {
+        Some(src) => Some(
+            c._device
+                .new_library_with_source(src, &metal::CompileOptions::new())
+                .map_err(|e| eprintln!("MSL compile: {e}"))
+                .ok()?,
+        ),
+        None if kernel == "q8_mul_mm" => None,
+        None => return None,
+    };
+    let shared = MTLResourceOptions::StorageModeShared;
+    struct T {
+        abs: usize,
+        rows: usize,
+        cols: usize,
+        rs: Buffer,
+        pso: ComputePipelineState,
+    }
+    let mut ts = Vec::new();
+    for &idx in idxs {
+        let e = &model.tensors[idx];
+        if e.dtype != cortiq_core::TensorDtype::Q8_2f && e.dtype != cortiq_core::TensorDtype::Q8Row
+        {
+            return None;
+        }
+        let (rows, cols) = (e.shape[0], e.shape[1]);
+        let bytes = model.entry_bytes(e);
+        let q = rows * cols;
+        let rs: Vec<f32> = (0..rows)
+            .map(|r| f16_to_f32(u16::from_le_bytes([bytes[q + 2 * r], bytes[q + 2 * r + 1]])))
+            .collect();
+        let pso = match &lib {
+            None => mm_pipeline(c, rows, cols, 0),
+            Some(lib) => {
+                let fcv = metal::FunctionConstantValues::new();
+                let (cu, ru) = (cols as u32, rows as u32);
+                fcv.set_constant_value_at_index(
+                    &cu as *const u32 as *const std::ffi::c_void,
+                    metal::MTLDataType::UInt,
+                    0,
+                );
+                fcv.set_constant_value_at_index(
+                    &ru as *const u32 as *const std::ffi::c_void,
+                    metal::MTLDataType::UInt,
+                    1,
+                );
+                let f = lib.get_function(kernel, Some(fcv)).ok()?;
+                c._device.new_compute_pipeline_state_with_function(&f).ok()?
+            }
+        };
+        ts.push(T {
+            abs: model.entry_abs_offset(e)?,
+            rows,
+            cols,
+            rs: c._device.new_buffer_with_data(
+                rs.as_ptr() as *const std::ffi::c_void,
+                (rows * 4) as u64,
+                shared,
+            ),
+            pso,
+        });
+    }
+    let max_cols = ts.iter().map(|t| t.cols).max()?;
+    let max_rows = ts.iter().map(|t| t.rows).max()?;
+    let xs: Vec<f32> = (0..b * max_cols)
+        .map(|i| ((i % 97) as f32 - 48.0) / 48.0)
+        .collect();
+    let xs_buf = c._device.new_buffer_with_data(
+        xs.as_ptr() as *const std::ffi::c_void,
+        (xs.len() * 4) as u64,
+        shared,
+    );
+    let y_buf = c._device.new_buffer((b * max_rows * 4) as u64, shared);
+    let cmd = c.queue.new_command_buffer();
+    {
+        let enc = cmd.new_compute_command_encoder();
+        for _ in 0..reps {
+            for t in &ts {
+                enc.set_compute_pipeline_state(&t.pso);
+                fbuf.bind(enc, 0, t.abs);
+                enc.set_buffer(1, Some(&xs_buf), 0);
+                enc.set_buffer(2, Some(&t.rs), 0);
+                enc.set_buffer(3, Some(&y_buf), 0);
+                let w = [t.cols as u32, t.rows as u32, b as u32];
+                for (i, v) in w.iter().enumerate() {
+                    enc.set_bytes(4 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
+                }
+                enc.dispatch_thread_groups(
+                    MTLSize::new(b.div_ceil(tile_b) as u64, t.rows.div_ceil(tile_rows) as u64, 1),
+                    MTLSize::new(threads as u64, 1, 1),
+                );
+            }
+        }
+        enc.end_encoding();
+    }
+    submit_and_wait(c, cmd, &[&y_buf]);
+    let n = b * ts.last()?.rows;
+    let mut y = vec![0f32; n];
+    unsafe {
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, y.as_mut_ptr(), n);
+    }
+    Some((cmd_gpu_ms(cmd) / reps as f64, y))
 }
 
 /// Kernel-time microbench (tests): `reps` dispatches of one projection in
@@ -11757,6 +12183,10 @@ pub struct ChunkLayer<'a> {
     /// q8_2f input fields of q, k, v, o (empty = plain q8_row / q4):
     /// the GEMM reads x·col (`col_scale_rows`), as the CPU's `prescale`.
     pub col: [&'a [f32]; 4],
+    /// q8_2f input fields of the dense gate, up and down (empty = none):
+    /// gate and up read n·col staged like q/k/v, down's field scales the
+    /// activation rows in place before its GEMM. Exact-GELU FFNs only.
+    pub ffn_col: [&'a [f32]; 3],
     /// A routed-experts FFN instead of gate/up/down (Mellum2.1): `gate`,
     /// `up`, `down` then carry the FIRST expert's trio for the shape checks.
     pub moe: Option<ChunkMoe<'a>>,
@@ -12198,7 +12628,9 @@ pub fn chunk_run_gpu(
         return false;
     }
     let wide_ok = |hd: usize| hd <= 256 || (g4p.is_some() && gemma4::w16_on() && hd <= 512);
-    if b < 32
+    // 8 rows: the shortest chunk measured and checked (Spark-X2.6-4B q8_2f);
+    // the pipeline's own floor (`Pipeline::chunk_min_rows`) is the policy.
+    if b < 8
         || hd % 4 != 0
         || !wide_ok(hd)
         || first.rd < 2
@@ -12278,6 +12710,21 @@ pub fn chunk_run_gpu(
                 Some(a) => *slot = a,
                 None => return false,
             }
+        }
+        // Dense q8_2f FFN fields: the exact-GELU branch alone stages them
+        // (the SiLU down GEMM fuses its activation into the X load), each
+        // as wide as the input it scales.
+        let ffn_in = [l.gate.2, l.up.2, l.down.2];
+        if l.ffn_col.iter().any(|f| !f.is_empty())
+            && (l.act != 1
+                || l.moe.is_some()
+                || l.g4.is_some()
+                || l.ffn_col
+                    .iter()
+                    .zip(ffn_in)
+                    .any(|(f, w)| !f.is_empty() && f.len() != w))
+        {
+            return false;
         }
         // Gemma-4: q8_2f weights take the blob GEMM — its payload, row
         // scales and input field inside the mapping, K a multiple of 32.
@@ -12526,14 +12973,22 @@ pub fn chunk_run_gpu(
     // q8_2f: x·col staged for the projection that reads it (serial
     // encoders order the reuse).
     let xpre = io_buf(c, 75_000_000_019 + b * hs.max(qw), b * hs.max(qw) * 4);
-    let col_scale = |enc: &metal::ComputeCommandEncoderRef, x: &Buffer, col: &[f32], n: usize| {
+    // y = x·col over b rows of n (elementwise, so y may be x).
+    let col_scale_into = |enc: &metal::ComputeCommandEncoderRef,
+                          x: &Buffer,
+                          col: &[f32],
+                          n: usize,
+                          y: &Buffer| {
         enc.set_compute_pipeline_state(&c.colscale);
         enc.set_buffer(0, Some(x), 0);
         enc.set_buffer(1, Some(&const_buf(c, col)), 0);
-        enc.set_buffer(2, Some(&xpre), 0);
+        enc.set_buffer(2, Some(y), 0);
         let n_u = n as u32;
         enc.set_bytes(3, 4, &n_u as *const u32 as *const std::ffi::c_void);
         enc.dispatch_threads(MTLSize::new(n as u64, b as u64, 1), MTLSize::new(256, 1, 1));
+    };
+    let col_scale = |enc: &metal::ComputeCommandEncoderRef, x: &Buffer, col: &[f32], n: usize| {
+        col_scale_into(enc, x, col, n, &xpre)
     };
     // Embedding source: validated up front; refusal keeps the CPU h.
     let embed_prep: Option<(usize, Buffer, Buffer)> = embed.and_then(|e| {
@@ -13048,32 +13503,29 @@ pub fn chunk_run_gpu(
         } else {
             {
                 let enc = cmd.new_compute_command_encoder();
-                enc_mul_mm(
-                    c,
-                    enc,
-                    &fbuf,
-                    prep.abs[4],
-                    &prep.rs[4],
-                    prep.kind[4],
-                    &n_b,
-                    &gb,
-                    b,
-                    l.gate.1,
-                    l.gate.2,
-                );
-                enc_mul_mm(
-                    c,
-                    enc,
-                    &fbuf,
-                    prep.abs[5],
-                    &prep.rs[5],
-                    prep.kind[5],
-                    &n_b,
-                    &ub,
-                    b,
-                    l.up.1,
-                    l.up.2,
-                );
+                // q8_2f: each of gate and up reads n·(its own field); the
+                // serial encoder orders the reuse of the staging rows.
+                for (i, t, y) in [(4usize, &l.gate, &gb), (5, &l.up, &ub)] {
+                    let x = if l.ffn_col[i - 4].is_empty() {
+                        &n_b
+                    } else {
+                        col_scale(enc, &n_b, l.ffn_col[i - 4], hs);
+                        &xpre
+                    };
+                    enc_mul_mm(
+                        c,
+                        enc,
+                        &fbuf,
+                        prep.abs[i],
+                        &prep.rs[i],
+                        prep.kind[i],
+                        x,
+                        y,
+                        b,
+                        t.1,
+                        t.2,
+                    );
+                }
                 enc.end_encoding();
             }
             cmd = prof.cut(c, cmd, "mm_gateup");
@@ -13093,6 +13545,11 @@ pub fn chunk_run_gpu(
                     MTLSize::new((b * inter) as u64, 1, 1),
                     MTLSize::new(256, 1, 1),
                 );
+                // q8_2f down: its input field over the activation rows, in
+                // place (the kernel's own field indexes one row only).
+                if !l.ffn_col[2].is_empty() {
+                    col_scale_into(enc, &gb, l.ffn_col[2], inter, &gb);
+                }
                 enc.end_encoding();
                 let enc = cmd.new_compute_command_encoder();
                 enc_mul_mm(
@@ -18614,6 +19071,9 @@ pub struct TokenGraph {
     /// GQA-shared split-K kernel (`set_attend_blk_from`); None = the
     /// process default `gqa_blk_threshold()`.
     blk_from: Option<usize>,
+    /// The plan's positions per split-K block (`set_attend_blk`); None =
+    /// `gqa_blk_size()`.
+    blk_size: Option<usize>,
 }
 
 impl TokenGraph {
@@ -18707,6 +19167,7 @@ impl TokenGraph {
             ids_b: None,
             conc: false,
             blk_from: None,
+            blk_size: None,
             in_conc: std::cell::Cell::new(false),
         })
     }
@@ -18725,6 +19186,13 @@ impl TokenGraph {
     /// pass). An explicit `CMF_GQA_BLK` still wins.
     pub fn set_attend_blk_from(&mut self, n: usize) {
         self.blk_from = Some(n);
+    }
+
+    /// `set_attend_blk_from` plus the positions per split-K block; an
+    /// explicit `CMF_GQA_BLKSZ` still wins.
+    pub fn set_attend_blk(&mut self, from: usize, size: usize) {
+        self.blk_from = Some(from);
+        self.blk_size = Some(size);
     }
 
     /// `set_dense_concurrent` without the env gate (the in-process A/B).
@@ -20403,7 +20871,9 @@ impl TokenGraph {
             let skip_a = decode_skip('a');
             let n_pos = n_all - first;
             let (kv_off, imp_off) = ((first * p.hd * 4) as u64, (first * 4) as u64);
+            let att_small = moe_bit(ATT_SMALL);
             let thr = match self.blk_from {
+                _ if att_small => 1,
                 Some(n) if std::env::var("CMF_GQA_BLK").is_err() => n,
                 _ if moe_bit(ATT_BLK) && std::env::var("CMF_GQA_BLK").is_err() => 64,
                 _ => gqa_blk_threshold(),
@@ -20425,6 +20895,12 @@ impl TokenGraph {
                             &g4.unwrap().gqablk16
                         } else {
                             &self.c.gqablk
+                        },
+                        match self.blk_size {
+                            _ if std::env::var("CMF_GQA_BLKSZ").is_ok() => gqa_blk_size(),
+                            _ if att_small => 32,
+                            Some(n) => n,
+                            None => gqa_blk_size(),
                         },
                         &qr_b,
                         &k_mb,
@@ -20617,7 +21093,9 @@ impl TokenGraph {
             && matches!(au.1, ProjKind::Q4tp)
             && gate.1 == up.1
             && gate.2 == up.2;
-        if gu_fused && act == 2 {
+        if decode_skip('g') {
+            // cost attribution (`CMF_METAL_SKIP=g`): no gate/up
+        } else if gu_fused && act == 2 {
             note_weight_bytes(&ProjKind::Q4tp, 2 * gate.1, gate.2 / GROUP_SIZE);
             gemma4::enc_mgu_gelut(
                 g4.expect("gemma4 kernels (attn_ok)"),
@@ -20710,6 +21188,9 @@ impl TokenGraph {
             && act == 0
             && matches!(ad.1, ProjKind::Q4t)
             && inter % 4 == 0;
+        if down_fused && decode_skip('d') {
+            return;
+        }
         if down_fused {
             // h += Down·act in the epilogue: no axpy pass.
             encode_q4tp_matvec_m_add(
@@ -22010,9 +22491,15 @@ const VBUF_BASE: usize = 60_000_000_000;
 /// projection, r router, s top-k select, g gate/up(+SiLU), d down(+mix),
 /// h lm_head.
 fn decode_skip(what: char) -> bool {
-    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    V.get_or_init(|| std::env::var("CMF_METAL_SKIP").unwrap_or_default())
-        .contains(what)
+    static V: std::sync::OnceLock<(String, bool)> = std::sync::OnceLock::new();
+    let (v, ab) = V.get_or_init(|| {
+        (
+            std::env::var("CMF_METAL_SKIP").unwrap_or_default(),
+            std::env::var("CMF_METAL_AB").is_ok_and(|a| a.contains('x')),
+        )
+    });
+    // Under an `x` A/B only the arm carrying `SKIP_AB` drops the stage.
+    v.contains(what) && (!*ab || moe_bit(SKIP_AB))
 }
 
 fn verify_skip(what: char) -> bool {
@@ -23368,7 +23855,23 @@ fn encode_gqa_attend_blk(
         return false;
     }
     encode_gqa_attend_blk_with(
-        c, enc, &c.gqablk, q, k_mb, v_mb, kv_off, ao, nh, nkv, hd, cap, stored, nb, scale, conc,
+        c,
+        enc,
+        &c.gqablk,
+        gqa_blk_size(),
+        q,
+        k_mb,
+        v_mb,
+        kv_off,
+        ao,
+        nh,
+        nkv,
+        hd,
+        cap,
+        stored,
+        nb,
+        scale,
+        conc,
     )
 }
 
@@ -23380,6 +23883,8 @@ fn encode_gqa_attend_blk_with(
     c: &Ctx,
     enc: &metal::ComputeCommandEncoderRef,
     pso: &ComputePipelineState,
+    // Positions per block (the main kernel; Gemma-4's twin is fixed at 128).
+    bs: usize,
     q: &Buffer,
     k_mb: &Buffer,
     v_mb: &Buffer,
@@ -23399,7 +23904,8 @@ fn encode_gqa_attend_blk_with(
         return false;
     }
     let n_max = stored + nb;
-    let nblk = n_max.div_ceil(128);
+    let bs = if std::ptr::eq(pso, &c.gqablk) { bs } else { 128 };
+    let nblk = n_max.div_ceil(bs);
     let part = io_buf(
         c,
         48_000_000_131 + nb * nh * nblk * (hd + 2),
@@ -23423,6 +23929,8 @@ fn encode_gqa_attend_blk_with(
         enc.set_bytes(4 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
     }
     enc.set_bytes(11, 4, &scale as *const f32 as *const std::ffi::c_void);
+    let bs_u = bs as u32;
+    enc.set_bytes(12, 4, &bs_u as *const u32 as *const std::ffi::c_void);
     enc.dispatch_thread_groups(
         MTLSize::new(nkv as u64, nblk as u64, nb as u64),
         MTLSize::new((hpk * 32) as u64, 1, 1),
@@ -23470,6 +23978,19 @@ fn encode_head_gate(
         MTLSize::new((nh as u64).div_ceil(sgs), rows as u64, 1),
         MTLSize::new(sgs * 32, 1, 1),
     );
+}
+
+/// Positions per block of the split-K attend (`CMF_GQA_BLKSZ`, default
+/// 128, a multiple of 4 in 16..=512).
+fn gqa_blk_size() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CMF_GQA_BLKSZ")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| (v / 4 * 4).clamp(16, 512))
+            .unwrap_or(128)
+    })
 }
 
 /// Positions past which the attend goes GQA-shared/split-K
