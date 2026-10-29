@@ -38,7 +38,7 @@ hf download infosave/Clover-35B-A3B-Preview-cmf clover-35b-a3b-preview-q4tp-v2.c
 cortiq run clover-35b-a3b-preview-q4tp-v2.cmf --prompt "Write a Python function that merges two sorted lists." --no-think --max-tokens 512
 ```
 
-Use cortiq 0.8.40 or later (block diffusion); prebuilt binaries for Linux,
+Use cortiq 0.8.41 or later (block diffusion, Metal); prebuilt binaries for Linux,
 macOS and Windows are on the [releases page](https://github.com/infosave2007/cmf/releases).
 Without `--no-think` the model reasons in a `<think>` block first, so give it
 `--max-tokens` in the thousands.
@@ -64,17 +64,18 @@ PyTorch implementation (bf16), three chat prompts × 32 rows (two for
 A *pass* is one denoising forward over the 32-row block. LowConfidence fixes
 every row above the threshold after each pass (the release default 0.95), so
 predictable text resolves several tokens a pass and free prose about one.
-Tokens per second after the prompt, `q4tp-v2`, cortiq 0.8.40:
+Tokens per second after the prompt, `q4tp-v2`, cortiq 0.8.41:
 
 | hardware | backend | pass | prose | code |
 |---|---|---:|---:|---:|
 | RTX 5090 (32 GB) | Vulkan | 34 ms | 26 tok/s | 80–95 tok/s |
-| Mac mini M4 (24 GB) | CPU, 10 cores | 1.1 s | 0.8 tok/s | 3 tok/s |
+| Mac mini M4 (24 GB) | Metal | 0.3–0.5 s | 3.2 tok/s | 6.5–9 tok/s |
 
 On the RTX 5090 the whole model and its head run on the card (18.8 GB). A
 lower threshold trades care for speed: `CMF_CLOVER_THRESHOLD=0.8` measured
-prose 25–30 and code 124–150 tok/s. `cortiq run` prints the passes, tokens
-per pass and the rate after every answer.
+prose 25–30 and code 124–150 tok/s on the 5090, 3.7 and 9.7 tok/s on the M4.
+`cortiq run` prints the passes, tokens per pass and the rate after every
+answer.
 
 ## Usage
 
@@ -114,7 +115,10 @@ and the rest on the CPU (a 16 GB budget held 30 of 40 layers). `cortiq gpu`
 lists the adapters; on headless Linux install `libvulkan1 libglvnd0 libegl1
 libgl1 libglx0` and set `XDG_RUNTIME_DIR=/tmp`.
 
-**Apple silicon.** Runs on the CPU; a 24 GB Mac holds the `q4tp` files.
+**Apple silicon.** The passes, block commits and the prompt run on Metal; the
+weights stay in the file's mapping (the experts a block uses are bound as
+they are routed), so a 24 GB Mac runs the `q4tp` files. The prompt reads at
+~57 tok/s on an M4.
 
 **CPU only.** `CMF_GPU=0`.
 
@@ -162,22 +166,23 @@ hf download infosave/Clover-35B-A3B-Preview-cmf clover-35b-a3b-preview-q4tp-v2.c
 cortiq run clover-35b-a3b-preview-q4tp-v2.cmf --prompt "Объясни, как работает хеш-таблица." --no-think --max-tokens 512
 ```
 
-Нужен cortiq 0.8.40 или новее. Файл по умолчанию — `q4tp-v2` (эксперты 4 бита
+Нужен cortiq 0.8.41 или новее. Файл по умолчанию — `q4tp-v2` (эксперты 4 бита
 с GPTQ, 19.36 ГБ, wiki ppl 16.80); `q4tp` — простая конвертация (18.22),
 `q8_2f` — почти без потерь (35 ГБ, 15.86). На RTX 5090 проход по блоку
 занимает 34 мс, модель целиком на карте (18.8 ГБ): проза ~26 ток/с, код
 80–95 ток/с при пороге 0.95; `CMF_CLOVER_THRESHOLD=0.8` ускоряет до 25–30 и
-124–150 ток/с. На Mac mini M4 (24 ГБ) модель работает на CPU (~3 ток/с на
-коде). `cortiq serve` даёт OpenAI-совместимый API с потоковой выдачей.
+124–150 ток/с. На Mac mini M4 (24 ГБ) проходы, коммиты блоков и промпт идут
+на Metal: проза 3.2 ток/с, код 6.5–9 ток/с. `cortiq serve` даёт OpenAI-совместимый API с потоковой выдачей.
 
 ## 中文说明
 
 Clover-35B-A3B-Preview 是 DiffuSpace 基于 Qwen3.6-35B-A3B 的扩散语言模型（35B
 参数，每个 token 约 3B 激活）。模型以 32 个 token 为一块生成：每块从掩码开始，
-经多次去噪一次确定多个 token。本仓库提供可由 Rust 推理引擎 `cortiq`（0.8.40 及以上）
+经多次去噪一次确定多个 token。本仓库提供可由 Rust 推理引擎 `cortiq`（0.8.41 及以上）
 加载的 CMF 文件；默认文件为 `q4tp-v2`（专家 4 位 GPTQ，19.36 GB）。RTX 5090 上
 每次去噪 34 ms，整模型驻留显存（18.8 GB）：阈值 0.95 时文本约 26 token/s，
-代码 80–95 token/s。
+代码 80–95 token/s。Mac mini M4（24 GB）走 Metal：文本 3.2 token/s，代码
+6.5–9 token/s。
 
 ```bash
 hf download infosave/Clover-35B-A3B-Preview-cmf clover-35b-a3b-preview-q4tp-v2.cmf --local-dir .
