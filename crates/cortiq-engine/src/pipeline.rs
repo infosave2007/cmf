@@ -9655,6 +9655,14 @@ impl Pipeline {
         task_mask: Option<&TaskMask>,
     ) -> Result<(f64, usize), String> {
         self.nll_begin()?;
+        // Block diffusion on Apple silicon: the Metal executor's causal path.
+        #[cfg(target_os = "macos")]
+        if task_mask.is_none() && self.is_block_diffusion() {
+            if let Some(r) = self.clover_metal_nll(ids, start) {
+                self.nll_end();
+                return r;
+            }
+        }
         let result: Result<(f64, usize), String> = (|| {
             let mut nll = 0f64;
             let mut cnt = 0usize;
