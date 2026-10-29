@@ -3020,7 +3020,11 @@ impl Pipeline {
             // of once per head plus the importance re-read — at depth 1000
             // on the M4, 59.5 tok/s against 50.0 with the per-head kernel
             // up to the default 512 (every sliding layer sits at <= 512).
-            graph.set_attend_blk_from(64);
+            // From the second position on and in 32-position blocks (more
+            // threadgroups in flight for a latency-bound walk): Spark-X2.6
+            // q4tp decode 0.86x the GPU time short and 0.88x at depth 1000,
+            // q8_2f 0.91x / 0.92x (in-process A/B, M4).
+            graph.set_attend_blk(1, 32);
         }
         let gcfg = self.gdn_cfg.map(|cfg| GdnGpuCfg {
             nv: cfg.num_v_heads,
