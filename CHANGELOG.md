@@ -5,6 +5,31 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.44] — 2026-10-29
+
+### Fixed
+- wgpu on the AMD / Intel GPUs of Intel Macs (Metal): naga's workgroup-memory
+  zeroing, injected at the top of every kernel, cost 0.5–2 ms a dispatch there
+  (an empty kernel takes 7 µs). Every pipeline now takes its compile options
+  from one rule (`gpu_wgpu::pco`): Metal on a non-Apple GPU skips the zeroing,
+  every other device keeps it; `CMF_WGPU_NOZERO=1|0` forces either way. The
+  kernels write their workgroup arrays before reading them: the zeroed and the
+  plain run write the same greedy text, the wgpu inference tests pass without
+  it, and ppl matches the CPU. Spark-X2.6-4B q4tp on a Radeon Pro 560X
+  (MacBook Pro 2019): decode 1.1 → 13.6 tok/s, prompt 10.9 → 19.2 tok/s.
+
+### Changed
+- AMD GPUs under Metal decode q4tp through wave64 matvecs (`gpu_wgpu::amd_mv`):
+  masked-nibble dequant, shuffle reductions, no ladder table or barrier —
+  sixteen rows a wave from 8192 rows, four below; the pair and fused gate+up
+  kernels stand down there. Radeon Pro 560X: GPU time 64 → 55 ms a token,
+  decode 13.9 → 15.9 tok/s (the i9 CPU of the same Mac: ~10). Not the CPU's
+  add order (|Δ|/max ≈ 2e-6). `CMF_AMD_MV=0` keeps the previous kernels.
+
+### Added
+- `wgpu_q4tp_mv_variants` (ignored test): q4tp decode matvec candidates from
+  a WGSL file against `q4tp_matvec16w` on device-local weights, per shape.
+
 ## [0.8.43] — 2026-10-29
 
 ### Changed
