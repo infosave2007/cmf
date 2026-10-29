@@ -20,6 +20,8 @@ pub mod data;
 pub mod dtgma;
 pub mod eval;
 #[cfg(feature = "gpu")]
+pub mod fold_dev;
+#[cfg(feature = "gpu")]
 pub mod heal_gpu;
 pub mod illum;
 pub mod moe;
@@ -132,6 +134,12 @@ pub struct CompressArgs {
     /// costs forward passes. 0 = every record
     #[arg(long)]
     pub illum_tokens: Option<usize>,
+    /// Keep S1's Grams on disk for the fold (f32, 8·n² bytes per layer —
+    /// 155 GB on a 27B): auto = when they take under half the free disk;
+    /// on = always; off = the fold captures them again. Kept Grams let
+    /// several targets fold from one illumination.
+    #[arg(long, default_value = "auto")]
+    pub keep_grams: String,
 
     /// Healing: none | fcd (default from the recipe)
     #[arg(long)]
@@ -313,7 +321,9 @@ impl Run {
         };
         let heal_epochs = a.heal_epochs.unwrap_or(if recipe == "full" { 3.0 } else { 2.0 });
         let threads = a.threads.unwrap_or_else(stages::cpu_budget);
-        let work = PathBuf::from(a.work_dir.clone().unwrap_or_else(|| format!("{}.work", a.output)));
+        // absolute: stage records store paths, and a later run (another
+        // size sharing S0/S1, another cwd) must find them
+        let work = std::path::absolute(PathBuf::from(a.work_dir.clone().unwrap_or_else(|| format!("{}.work", a.output))))?;
         let calib_tokens = a.calib_tokens.or(if recipe == "fast" { Some(32768) } else { None });
         // prompts in: S0 answers them with the source; every later stage
         // reads that teacher data

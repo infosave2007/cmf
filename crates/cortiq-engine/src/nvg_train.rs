@@ -1262,6 +1262,47 @@ pub fn capture_grams(c: Ctx, net: &Net, w: &Work, ids: &[u32], ntok: usize, gram
     Some(())
 }
 
+/// [`capture_grams`] over layers `start..` only: from the embedded `ids`
+/// when `start` is 0, else from `x0` (`[t][hs]` f32, the residual input of
+/// layer `start` as a previous range returned it). With `keep`, returns the
+/// residual input of the layer after the last captured one — where the next
+/// range resumes, so a model captured in several passes runs each layer once.
+#[allow(clippy::too_many_arguments)]
+pub fn capture_grams_range(
+    c: Ctx,
+    net: &Net,
+    w: &Work,
+    ids: &[u32],
+    ntok: usize,
+    start: usize,
+    x0: Option<&[f32]>,
+    grams: &[(usize, &wgpu::Buffer)],
+    xt: &wgpu::Buffer,
+    tmp: &wgpu::Buffer,
+    keep: bool,
+) -> Option<Option<Vec<f32>>> {
+    let upto = grams.iter().map(|g| g.0).max()?;
+    if start == 0 {
+        embed(c, net, w, ids);
+    } else {
+        let x = x0?;
+        if x.len() != w.t * net.geom.hs {
+            return None;
+        }
+        c.queue.write_buffer(&w.ckpt[start], 0, bytemuck::cast_slice(x));
+    }
+    for l in start..=upto {
+        layer_fwd(c, net, w, l, &w.ckpt[l], &w.ckpt[l + 1], false)?;
+        if let Some((_, acc)) = grams.iter().find(|g| g.0 == l) {
+            tm::gram_acc(c, w.get("hh"), xt, acc, tmp, ntok, net.layers[l].gate.m())?;
+        }
+    }
+    if !keep {
+        return Some(None);
+    }
+    to::download(c, &w.ckpt[upto + 1], w.t * net.geom.hs).map(Some)
+}
+
 /// Teacher top-k for `ids` (`[nb·t]`): ids and renormalized probabilities.
 pub fn teacher_topk(c: Ctx, net: &Net, w: &Work, ids: &[u32], k: usize) -> Option<(Vec<u32>, Vec<f32>)> {
     forward(c, net, w, ids)?;
