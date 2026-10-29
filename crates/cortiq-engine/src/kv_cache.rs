@@ -439,6 +439,21 @@ impl LayerKvCache {
     /// q8 layer whose per-channel field is not frozen yet: the freeze
     /// reads every stored row, so dropping one before it would change it.
     pub fn trim_window(&mut self, w: usize, slack: usize, align: usize) -> usize {
+        self.trim_window_anchored(w, slack, align, usize::MAX)
+    }
+
+    /// `trim_window` that also keeps every row a rollback to `anchor −
+    /// slack` or later still reads (the cut never passes `anchor − w −
+    /// slack`). The pipeline anchors at the current turn's prompt end, so
+    /// the next chat turn can drop the whole answer however long it ran
+    /// (`Pipeline::rollback_prefix_len`); `usize::MAX` is the plain trim.
+    pub fn trim_window_anchored(
+        &mut self,
+        w: usize,
+        slack: usize,
+        align: usize,
+        anchor: usize,
+    ) -> usize {
         if self.o1.is_some() || self.bounded.is_some() || w == 0 {
             return 0;
         }
@@ -453,7 +468,10 @@ impl LayerKvCache {
             return 0;
         }
         let align = align.max(1);
-        let keep_from = self.pos_len().saturating_sub(w + slack);
+        let keep_from = self
+            .pos_len()
+            .saturating_sub(w + slack)
+            .min(anchor.saturating_sub(w + slack));
         let new_base = keep_from / align * align;
         if new_base <= self.base {
             return 0;
