@@ -640,11 +640,21 @@ pub fn test_nll(path: &Path, recs: &[&super::data::Rec], on: LossOn) -> Result<(
 /// Illumination on the device: the trainer's forward of the f16 source,
 /// the MLP down-projection input Grams accumulated on the matrix units —
 /// the same `HessianAcc` the runtime's capture hook returns.
+///
+/// Grams that do not fit beside the weights take several passes; each pass
+/// resumes from the residual stream where the previous one stopped (kept on
+/// the host per window set), so every layer runs once per set — 27B at
+/// n = 17408 needs 1.2 GB per Gram and passes of ~25 layers on a 96 GB card.
 pub struct DevCapture {
     net: nt::Net,
     work: nt::Work,
     t: usize,
     pad_id: u32,
+    /// Device bytes of the f16 weights (planes and head).
+    weights: u64,
+    /// Per window set (train, val): the layer the next pass may start at
+    /// and each window's residual input of it.
+    resume: [Option<(usize, Vec<Vec<f32>>)>; 2],
 }
 
 impl DevCapture {
@@ -652,32 +662,47 @@ impl DevCapture {
         let c = cortiq_engine::gpu_wgpu::train_ops::dev().context("no wgpu GPU")?;
         let model = CmfModel::open_sharded(path)?;
         let pad_id = model.header.tokenizer_config.as_ref().and_then(|t| t.eos_token_ids.first().copied()).unwrap_or(0);
+        // f16 on the device: everything but the token embedding (host rows)
+        let weights: u64 = model
+            .tensors
+            .iter()
+            .filter(|e| !e.name.ends_with("embed_tokens.weight") && !e.name.contains(".mtp."))
+            .map(|e| 2 * e.shape.iter().product::<usize>() as u64)
+            .sum();
         let net = nt::Net::load(c, &model, true, false, None).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
         let t = window.div_ceil(128) * 128;
         let work = nt::Work::new(c, &net, 1, t);
-        Ok(Self { net, work, t, pad_id })
+        Ok(Self { net, work, t, pad_id, weights, resume: [None, None] })
     }
 
-    /// Grams of `layers` over `windows` (each its own context from position 0).
-    pub fn capture(&self, windows: &[Vec<u32>], layers: &[usize], label: &str) -> Result<std::collections::BTreeMap<usize, cortiq_engine::gptq_capture::HessianAcc>> {
+    /// Grams of `layers` over `windows` (each its own context from position
+    /// 0); `set` names the window set (0 train, 1 val) whose resume point a
+    /// later call for higher layers continues from.
+    pub fn capture(&mut self, set: usize, windows: &[Vec<u32>], layers: &[usize], label: &str) -> Result<std::collections::BTreeMap<usize, cortiq_engine::gptq_capture::HessianAcc>> {
         let c = cortiq_engine::gpu_wgpu::train_ops::dev().context("no wgpu GPU")?;
         let to = cortiq_engine::gpu_wgpu::train_ops::zeros;
-        let width = |l: usize| self.net.layers[l].gate.m();
-        let wmax = layers.iter().map(|&l| width(l)).max().unwrap_or(0);
+        let width = |net: &nt::Net, l: usize| net.layers[l].gate.m();
+        let wmax = layers.iter().map(|&l| width(&self.net, l)).max().unwrap_or(0);
         let kp = self.t.div_ceil(32) * 32;
         let xt = cortiq_engine::gpu_wgpu::train_mm::f16_buf(c, cortiq_engine::gpu_wgpu::train_mm::pad_rows(wmax) * kp);
         let tmp = to(c, wmax * wmax);
-        // accumulators within half the free weight budget; more layers take more passes
+        // accumulators in what the weights, the step's work buffers (~2 GB
+        // at 27B, window 2048) and a margin leave of the card
         let room = match cortiq_engine::gpu_wgpu::trainer_vram_budget() {
-            Some(b) if b != u64::MAX => b as usize / 2,
+            Some(b) if b != u64::MAX => {
+                let fixed = self.weights + 4 * (wmax * wmax) as u64 + (3u64 << 30);
+                (b.saturating_sub(fixed) as usize).max(4 * wmax * wmax)
+            }
             // unified memory: the host's budget is the device's
             Some(_) => (super::stages::mem_budget() as f64 * 0.3) as usize,
             None => 4 << 30,
         };
+        // CMF_ILLUM_ROOM_MB caps the accumulators (forces passes; tests the resume)
+        let room = std::env::var("CMF_ILLUM_ROOM_MB").ok().and_then(|v| v.parse::<usize>().ok()).map_or(room, |mb| room.min(mb << 20));
         let mut parts: Vec<Vec<usize>> = vec![Vec::new()];
         let mut used = 0usize;
         for &l in layers {
-            let b = 4 * width(l) * width(l);
+            let b = 4 * width(&self.net, l) * width(&self.net, l);
             if used + b > room && !parts.last().unwrap().is_empty() {
                 parts.push(Vec::new());
                 used = 0;
@@ -688,27 +713,41 @@ impl DevCapture {
         let total: usize = windows.iter().map(Vec::len).sum();
         let mut out = std::collections::BTreeMap::new();
         for part in &parts {
-            let accs: Vec<cortiq_engine::wgpu::Buffer> = part.iter().map(|&l| to(c, width(l) * width(l))).collect();
+            let first = part[0];
+            // resume where this set's last pass stopped, when that is at or below this part
+            let from = match self.resume[set].take() {
+                Some((at, xs)) if at <= first && xs.len() == windows.len() => Some((at, xs)),
+                _ => None,
+            };
+            let start = from.as_ref().map_or(0, |f| f.0);
+            let accs: Vec<cortiq_engine::wgpu::Buffer> = part.iter().map(|&l| to(c, width(&self.net, l) * width(&self.net, l))).collect();
             let grams: Vec<(usize, &cortiq_engine::wgpu::Buffer)> = part.iter().copied().zip(accs.iter()).collect();
             let t0 = Instant::now();
             let mut done = 0usize;
+            let mut next: Vec<Vec<f32>> = Vec::with_capacity(windows.len());
             for (i, w) in windows.iter().enumerate() {
                 anyhow::ensure!(w.len() <= self.t, "{label}: window {i} has {} tokens > {}", w.len(), self.t);
                 let mut ids = w.clone();
                 ids.resize(self.t, self.pad_id);
-                nt::capture_grams(c, &self.net, &self.work, &ids, w.len(), &grams, &xt, &tmp).with_context(|| format!("{label}: window {i}: device forward failed"))?;
+                let x0 = from.as_ref().map(|f| f.1[i].as_slice());
+                let h = nt::capture_grams_range(c, &self.net, &self.work, &ids, w.len(), start, x0, &grams, &xt, &tmp, true)
+                    .with_context(|| format!("{label}: window {i}: device forward failed"))?;
+                next.push(h.unwrap_or_default());
                 done += w.len();
                 if i % 16 == 15 || i + 1 == windows.len() {
                     let rate = done as f64 / t0.elapsed().as_secs_f64().max(1e-9);
                     eprint!(
-                        "\r  {label} (device): {done}/{total} tokens · {rate:.0} tok/s · ~{} left   ",
+                        "\r  {label} (device, layers {start}..={}): {done}/{total} tokens · {rate:.0} tok/s · ~{} left   ",
+                        part[part.len() - 1],
                         crate::fmt_eta((total - done) as f64 / rate.max(1e-9))
                     );
                 }
             }
             eprintln!();
+            drop(from);
+            self.resume[set] = Some((part[part.len() - 1] + 1, next));
             for (&l, acc) in part.iter().zip(&accs) {
-                let n = width(l);
+                let n = width(&self.net, l);
                 let h: Vec<f64> = cortiq_engine::gpu_wgpu::train_ops::download(c, acc, n * n).context("Gram read-back")?.into_iter().map(f64::from).collect();
                 let sumsq: Vec<f64> = (0..n).map(|j| h[j * n + j]).collect();
                 anyhow::ensure!(sumsq.iter().any(|&v| v > 0.0), "{label}: layer {l}: captured energy is all zero");
