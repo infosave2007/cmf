@@ -418,6 +418,10 @@ pub struct Pipeline {
     /// rollback to it still reads (`LayerKvCache::trim_window_anchored`),
     /// so the next chat turn can drop this turn's answer.
     swa_trim_anchor: usize,
+    /// Fewest prompt rows the Metal chunk prefill graph takes; a shorter
+    /// chunk walks the layers on the host. 32 since the graph landed
+    /// (measured on Qwen2.5-0.5B); Spark-X2.5/X2.6 take 8 (`loader`).
+    pub chunk_min_rows: usize,
     /// Explicit local/global schedule for architectures that cannot be
     /// represented by Gemma's every-Nth-global convention.
     pub sliding_layers: Option<Vec<bool>>,
@@ -3779,6 +3783,7 @@ impl Pipeline {
             swa: None,
             swa_trim: None,
             swa_trim_anchor: usize::MAX,
+            chunk_min_rows: 32,
             sliding_layers: None,
             no_rope_layers: None,
             anchor_core: None,
@@ -11247,7 +11252,7 @@ impl Pipeline {
             || std::env::var("CMF_GPU_CHUNK")
                 .map(|v| v == "0")
                 .unwrap_or(false)
-            || b < 32
+            || b < self.chunk_min_rows
             // Sliding windows with per-layer RoPE ride the chunk graph
             // (`metal_graph_swa`: causal_softmax_win, per-layer tables).
             || (self.swa.is_some() && !self.metal_graph_swa() && !gemma4)
