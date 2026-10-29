@@ -42,6 +42,7 @@ pub(crate) mod dense_batch;
 /// Gemma-4 on the batch graph (prompt ingest) and its q8_2f prompt GEMM.
 pub(crate) mod gemma_batch;
 /// Warp-per-row q4tp decode matvecs (bit-identical to the 16nl rows).
+pub(crate) mod amd_mv;
 pub(crate) mod dense_mv;
 /// GPTQ calibration Hessians accumulated on the device (`H += XᵀX`).
 pub(crate) mod gram;
@@ -19407,6 +19408,7 @@ pub struct Ctx {
     g4_sandwich_pipe: std::sync::OnceLock<Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>>,
     /// Warp-per-row q4tp decode matvecs (`dense_mv`).
     dense_mv_pipes: std::sync::OnceLock<Option<dense_mv::MvSg>>,
+    amd_mv_pipes: std::sync::OnceLock<Option<amd_mv::AmdMv>>,
     /// Subgroup q1g decode matvec (`q1g_mv`).
     q1g_sg_pipes: std::sync::OnceLock<Option<q1g_mv::Q1gSg>>,
     /// mxfp4 per-op kernels and the S8/S16 global-bank kernels (`mxfp4`).
@@ -22419,6 +22421,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         g4_dec_pipe: std::sync::OnceLock::new(),
         g4_sandwich_pipe: std::sync::OnceLock::new(),
         dense_mv_pipes: std::sync::OnceLock::new(),
+        amd_mv_pipes: std::sync::OnceLock::new(),
         q1g_sg_pipes: std::sync::OnceLock::new(),
         mxfp4_pipes: std::sync::OnceLock::new(),
         mxfp4_global_s8: std::sync::OnceLock::new(),
@@ -28792,6 +28795,12 @@ pub fn forward_token_graph(
                     // runs, for a like-for-like A/B: on the RTX 5090 pod
                     // q4t (8-row pairs) decoded 7% FASTER than q4tp (quad
                     // 16-row) on Qwen3.8-27B despite 7.5% fewer bytes.
+                    // AMD under Metal: the wave64 kernels (`amd_mv`).
+                    if c.q4tp_mv16w_probe.is_none()
+                        && let Some(t) = amd_mv::prep(c, &m.buf, xs, y, rows, cols)
+                    {
+                        return Some(t);
+                    }
                     // Warp-per-row twin of 16nl (same rows to the bit).
                     if c.use_mv_nl
                         && c.q4tp_mv16w_probe.is_none()
@@ -28910,6 +28919,10 @@ pub fn forward_token_graph(
                  cols: usize|
      -> Option<(&wgpu::ComputePipeline, wgpu::BindGroup, u32)> {
         if !c.use_mv_x2 || !c.use_mv4 || a.kind != 6 || b.kind != 6 || cols % 32 != 0 {
+            return None;
+        }
+        // AMD under Metal: two `amd_mv` singles beat the pair kernel.
+        if amd_mv::active(c) {
             return None;
         }
         let gpr = cols / 32;
@@ -31054,6 +31067,7 @@ pub fn forward_token_graph(
                         };
                         let gu_ok = c.use_mv_gu
                             && c.use_mv4
+                            && !amd_mv::active(c)
                             // The dense fused GU shaders only implement
                             // SiLU/GELU variants. Route M3 through the
                             // explicit `silu_mul_pre` kernel below so its
@@ -48490,6 +48504,16 @@ fn encode_q4tp_mv4_b_with(
         // row blocks alone — the same grid, and the same sixteen rows a
         // workgroup, that the one-vector kernel runs.
         pass.dispatch_workgroups(mv_grid((rows as u32).div_ceil(16)), 1, 1);
+        return true;
+    }
+    // AMD under Metal: one vector takes the wave64 kernels (`amd_mv`).
+    if batch == 1
+        && let Some((pipe, bind, wg)) = amd_mv::prep(c, weight, xs, y, rows, cols)
+    {
+        let mut pass = begin_pass(enc);
+        pass.set_pipeline(pipe);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(wg, 1, 1);
         return true;
     }
     // Narrow shapes (one group per lane in the 8-row kernel) go 16-rows.
