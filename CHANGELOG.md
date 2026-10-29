@@ -5,6 +5,48 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.40] — 2026-10-29
+
+### Added
+- Block-diffusion language models (DiffuSpace Clover-35B-A3B-Preview,
+  `clover_moe`): `cortiq convert` writes the Qwen3.6-MoE trunk plus a
+  `block_diffusion` record (LowConfidence over 32-token blocks, threshold,
+  mask id, the block expert coreset, and the vendor's response-only presence /
+  frequency / repetition penalties and stop / `</think>` ramps), carried with
+  the new required feature bit 15 `BLOCK_DIFFUSION`; older readers refuse the
+  file. `run` and `serve` generate by denoising previews: bidirectional
+  attention inside the block, the GDN preview operator (right conv taps and a
+  block softmax with a history slot read from the clean state) and the MoE
+  restricted to the block's expert coreset, each resolved block committed
+  causally. On wgpu the prompt, every preview and every commit run as one
+  batched-graph submission each — preview kernels, a two-phase coreset, the
+  grouped expert kernels over a tile list (indirect dispatch), and the
+  penalties and greedy pick on the device; a stack that does not fit runs its
+  leading layers on the card and the rest on the host. `CMF_CLOVER_THRESHOLD`
+  and `CMF_CLOVER_BLOCK` override the release's generate controls.
+  `cortiq info` prints the record. RTX 5090: a 32-row pass in 34–36 ms
+  (whole stack and head on the card, 18.8 GB); prose ~26 tok/s at the
+  vendor's 0.95 threshold, code ~80–125 tok/s by threshold. Checked against
+  the PyTorch release (`scripts/clover/`): identical prompt ids, first-pass
+  top-1 agreement 30–32 of 32 rows per prompt.
+- `quantize-moe` handles Qwen3.5/3.6-MoE stacks (Clover included): MoE input
+  rows and router logits captured on the batched graph, experts GPTQ'd from
+  the original safetensors. Clover q4tp-v2 (262k calibration tokens):
+  wikitext-2 ppl 18.22 → 16.80 at the same size (q8_2f 15.86).
+
+### Changed
+- wgpu devices are created with `MemoryHints::MemoryUsage`: buffers above
+  64 MiB get dedicated allocations of their own size instead of a 128–256 MiB
+  block each (a 143 MiB packed expert plane stranded 113 MiB). A 35B-A3B q4tp
+  stack takes 18.8 GB instead of 31.8 GB of an RTX 5090, at the same speed,
+  and the packed-MoE graph budget no longer needs its 9/16 margin (kept for
+  `CMF_WGPU_MEMORY=performance`): the published Qwen3.6-35B-A3B q4tp runs its
+  whole token graph on a 32 GB card — decode 108.8 → 155.9 tok/s, prompt
+  65.7 → 400.8 tok/s.
+- The batched graph parks f32 router and gate weights in the constant-buffer
+  cache instead of uploading them every call (8 ms of encode per call on a
+  40-layer MoE).
+
 ## [0.8.39] — 2026-10-28
 
 ### Added

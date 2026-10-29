@@ -125,6 +125,14 @@ pub mod features {
     /// Numbered `1 << 13` since 0.8.1 (unreleased embryo-o1 builds: `1 << 8`,
     /// which released readers know as [`PRISM_AFFINE`]).
     pub const GENOME: u32 = 1 << 13;
+    /// Bit 14 is reserved for `ORGANISM_V1` (docs/CMF_ORGANISM_V1_SPEC_RU.md).
+    ///
+    /// The file is a BLOCK-DIFFUSION language model (`arch.block_diffusion`,
+    /// Clover): it generates by denoising blocks of mask tokens, never one
+    /// token at a time. A reader that predates the bit would load the
+    /// Qwen3.6-MoE trunk and decode it autoregressively — fluent-looking
+    /// garbage — so it must refuse instead. Derived from content.
+    pub const BLOCK_DIFFUSION: u32 = 1 << 15;
 
     /// Features this reader implements today.
     pub const SUPPORTED: u32 = TENSOR_DIR
@@ -138,7 +146,8 @@ pub mod features {
         | ROUTER_V2
         | DECISION
         | BOUNDED_STATE
-        | GENOME;
+        | GENOME
+        | BLOCK_DIFFUSION;
 }
 
 /// Arch-name prefix of every decision profile (`cortiq-decision-ph-v1`,
@@ -804,6 +813,16 @@ impl CmfModel {
                     "absent"
                 },
                 if bounded_bit { "set" } else { "clear" }
+            )));
+        }
+
+        let diffusion_declared = header.arch.block_diffusion.is_some();
+        let diffusion_bit = env.required_features & features::BLOCK_DIFFUSION != 0;
+        if diffusion_declared != diffusion_bit {
+            return Err(CmfError::Parse(format!(
+                "block_diffusion record ({}) and BLOCK_DIFFUSION feature bit ({}) disagree",
+                if diffusion_declared { "present" } else { "absent" },
+                if diffusion_bit { "set" } else { "clear" }
             )));
         }
 
@@ -1925,6 +1944,10 @@ pub fn derive_required_features(
     // exactly; the bit makes readers that cannot refuse.
     if header.arch.anchor_core.is_some() {
         f |= features::BOUNDED_STATE;
+    }
+    // A block-diffusion model must never be decoded token by token.
+    if header.arch.block_diffusion.is_some() {
+        f |= features::BLOCK_DIFFUSION;
     }
     f | crate::knowledge::knowledge_bits(header)
 }

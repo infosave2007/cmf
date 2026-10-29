@@ -191,6 +191,10 @@ pub(crate) enum Engine<'a> {
 enum Family {
     Qwen4,
     Dsv41,
+    /// An ordinary MoE stack (Qwen3.5/3.6-MoE, Clover): the experts in the
+    /// trunk's own FFN slots, captured on the batched device graph; the
+    /// source layout is Flash-Next's (`mlp.experts.gate_up_proj` / `down_proj`).
+    Qwen35,
 }
 
 pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
@@ -269,8 +273,13 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
         Family::Dsv41
     } else if p.qwen4_expert_dirs(0).is_some() {
         Family::Qwen4
+    } else if (0..nl).all(|li| p.moe_expert_dirs(li).is_some()) {
+        Family::Qwen35
     } else {
-        anyhow::bail!("quantize-moe: {} is neither a qwen4_exp (Flash-Next-class) nor a deepseek_v41 model", o.calib_model);
+        anyhow::bail!(
+            "quantize-moe: {} is neither a qwen4_exp (Flash-Next-class), a deepseek_v41 nor an all-MoE Qwen3.5/3.6 stack",
+            o.calib_model
+        );
     };
     // expert directory triples per layer, top-k, swiglu limit
     let mut layer_dirs: Vec<Vec<(usize, usize, usize)>> = Vec::with_capacity(nl);
@@ -283,6 +292,15 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
                 shared_dirs.push(s);
             }
             (qwen4_top_k(&arch), 0.0f32, 0usize)
+        }
+        Family::Qwen35 => {
+            for li in 0..nl {
+                let (d, s) = p.moe_expert_dirs(li).ok_or_else(|| anyhow::anyhow!("layer {li}: no experts"))?;
+                layer_dirs.push(d);
+                shared_dirs.push(s);
+            }
+            let top_k = arch.moe.as_ref().map(|m| m.top_k).ok_or_else(|| anyhow::anyhow!("no MoE config in the header"))?;
+            (top_k, 0.0f32, 0usize)
         }
         Family::Dsv41 => {
             let cfg = &p.dsv41.as_ref().expect("dsv41").2;
@@ -323,7 +341,7 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     // starts with BOS as every request does (not mid-text at position 0)
     let bos = match family {
         Family::Dsv41 => Some(p.tokenizer.bos_token_id.unwrap_or(0)),
-        Family::Qwen4 => None,
+        Family::Qwen4 | Family::Qwen35 => None,
     };
     let mut windows: Vec<Vec<u32>> = Vec::new();
     for (src, &n) in srcs.iter().zip(&budgets) {
@@ -396,7 +414,7 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
     let shard_names = |li: usize| -> anyhow::Result<Vec<String>> {
         let mut names = Vec::new();
         match family {
-            Family::Qwen4 => {
+            Family::Qwen4 | Family::Qwen35 => {
                 if patch.is_none() {
                     names.extend(QWEN4_ROUTED.iter().map(|p| qwen4_src_name(&source, li, p)).collect::<anyhow::Result<Vec<_>>>()?);
                 }
@@ -564,6 +582,12 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
                                 qwen4_layer_rows(&r, hidden, ne, top_k, &mut rows[k]);
                             }
                         }
+                        Family::Qwen35 => {
+                            let cap = p.moe_capture(w, lo, hi).map_err(|e| anyhow::anyhow!("capture: {e}"))?;
+                            for (k, r) in cap.into_iter().enumerate() {
+                                qwen4_layer_rows(&r, hidden, ne, top_k, &mut rows[k]);
+                            }
+                        }
                         Family::Dsv41 => {
                             let cap = p.dsv41_moe_capture(w, lo, hi).map_err(|e| anyhow::anyhow!("capture: {e}"))?;
                             for (k, ((x, pk), w)) in cap.x.into_iter().zip(cap.picks).zip(cap.w).enumerate() {
@@ -644,7 +668,7 @@ pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
             let t_fetch = tf.elapsed().as_secs_f64();
             let get = |part: Part, e: usize| -> anyhow::Result<ExpertW> {
                 match family {
-                    Family::Qwen4 => qwen4_expert(&source, &src, li, part, e, hidden, inter, inter_s),
+                    Family::Qwen4 | Family::Qwen35 => qwen4_expert(&source, &src, li, part, e, hidden, inter, inter_s),
                     Family::Dsv41 => dsv41_expert(&src, li, part, e, hidden, if matches!(part, Part::Shared) { inter_s } else { inter }, fp8_block),
                 }
             };

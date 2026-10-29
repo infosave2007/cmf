@@ -454,6 +454,93 @@ pub struct Qwen4ExpConfig {
     pub seed: u64,
 }
 
+/// Block-diffusion text generation (Clover, `clover_moe`): the model does not
+/// predict the next token; it fills a block of `block_size` mask tokens over a
+/// causal clean prefix, a few positions per denoising step (LowConfidence:
+/// every masked position whose top-1 probability exceeds `threshold`, or the
+/// single most confident one), then replays the resolved block causally into
+/// the prefix state. During a block preview the GDN layers run their
+/// bidirectional block operator (right convolution + softmax local memory
+/// over the read-only clean state), full attention is bidirectional inside the
+/// block, and each MoE layer routes only among the experts covering
+/// `coreset_top_p` of the block's aggregated top-k routing mass.
+///
+/// The generation defaults are the vendor's `generation_config.json`
+/// controls; they are part of the model's intended behaviour, not tuning.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BlockDiffusionConfig {
+    /// Decoding algorithm; "low_confidence" is the only one defined.
+    pub algorithm: String,
+    pub block_size: usize,
+    pub mask_token_id: u32,
+    /// LowConfidence transfer threshold on the top-1 probability.
+    pub threshold: f32,
+    /// Block-level expert subset (`moe_block_coreset_*`).
+    pub coreset_enabled: bool,
+    pub coreset_top_p: f32,
+    /// Response-only penalties (committed response history, not the prompt).
+    #[serde(default)]
+    pub presence_penalty: f32,
+    #[serde(default)]
+    pub frequency_penalty: f32,
+    #[serde(default = "one_f32")]
+    pub repetition_penalty: f32,
+    /// Gradual bias toward the stop tokens: 0 at `length_penalty_start`
+    /// response tokens, `length_penalty` after `length_penalty_window` more.
+    #[serde(default)]
+    pub length_penalty: f32,
+    #[serde(default)]
+    pub length_penalty_start: usize,
+    #[serde(default = "one_usize")]
+    pub length_penalty_window: usize,
+    /// The same ramp toward `think_end_token_id` until it is visible.
+    #[serde(default)]
+    pub think_end_bias: f32,
+    #[serde(default)]
+    pub think_end_start: usize,
+    #[serde(default = "one_usize")]
+    pub think_end_window: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub think_end_token_id: Option<u32>,
+    /// Extra stop ids beside the EOS ids (`stop_token_ids`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop_token_ids: Vec<u32>,
+}
+
+impl Default for BlockDiffusionConfig {
+    /// LowConfidence over 32-row blocks at 0.95, no coreset, neutral
+    /// penalties; the mask id is the file's and has no meaningful default.
+    fn default() -> Self {
+        Self {
+            algorithm: "low_confidence".into(),
+            block_size: 32,
+            mask_token_id: 0,
+            threshold: 0.95,
+            coreset_enabled: false,
+            coreset_top_p: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            repetition_penalty: 1.0,
+            length_penalty: 0.0,
+            length_penalty_start: 0,
+            length_penalty_window: 1,
+            think_end_bias: 0.0,
+            think_end_start: 0,
+            think_end_window: 1,
+            think_end_token_id: None,
+            stop_token_ids: Vec::new(),
+        }
+    }
+}
+
+fn one_f32() -> f32 {
+    1.0
+}
+
+fn one_usize() -> usize {
+    1
+}
+
 /// Model architecture descriptor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelArch {
@@ -579,6 +666,11 @@ pub struct ModelArch {
     /// Qwen3.8-Flash-Next exact text stack (None for all other families).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qwen4_exp: Option<Qwen4ExpConfig>,
+    /// Block-diffusion generation (Clover). Mandatory iff the
+    /// `BLOCK_DIFFUSION` feature bit is set: a reader that ignored it would
+    /// run the model as a next-token predictor, which it is not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_diffusion: Option<BlockDiffusionConfig>,
     /// DeepSeek-V4.1 source configuration, preserved verbatim for the
     /// multimodal/Engram runtime. The engine must read the nested
     /// `text_config`, `vision_config`, and `quantization_config` values from

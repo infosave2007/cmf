@@ -28,7 +28,7 @@ pub use knowledge::{
 };
 pub use mask::{MaskCatalog, MaskDiff, MaskPriority, Quality, TaskMask};
 pub use types::{
-    AnchorCoreConfig, ExecutionMode, FarFieldConfig, G3nConfig, LayerStats,
+    AnchorCoreConfig, BlockDiffusionConfig, ExecutionMode, FarFieldConfig, G3nConfig, LayerStats,
     LayerType, LinearCoreConfig, MlaConfig, ModelArch, MoeConfig, MtpConfig, NormStyle,
     PerformanceMetrics, PrismHadamardConfig, QuantType, Qwen4ExpConfig, SimdType, TensorDtype,
 };

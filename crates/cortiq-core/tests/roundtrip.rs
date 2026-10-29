@@ -36,6 +36,7 @@ fn tiny_arch() -> ModelArch {
         mtp: None,
         moe: None,
         qwen4_exp: None,
+        block_diffusion: None,
         deepseek_v41: None,
         anchor_core: None,
         linear_core: None,
@@ -132,6 +133,72 @@ fn linear_core_metadata_is_validated_and_identity_is_canonical() {
         phase_delta_layers: Some(vec![1]),
     });
     assert!(arch.validate_linear_core_metadata().is_err());
+}
+
+/// Block diffusion (Clover) changes how the file generates, so the record
+/// travels with `BLOCK_DIFFUSION` (bit 15): a reader without it refuses the
+/// file instead of decoding it causally, and record and bit must agree.
+#[test]
+fn block_diffusion_record_travels_with_its_feature_bit() {
+    use cortiq_core::format::features;
+    use cortiq_core::BlockDiffusionConfig;
+
+    let bd = BlockDiffusionConfig {
+        mask_token_id: 151_669,
+        coreset_enabled: true,
+        coreset_top_p: 0.9,
+        presence_penalty: 0.9,
+        repetition_penalty: 1.05,
+        length_penalty: 10.0,
+        length_penalty_start: 8192,
+        length_penalty_window: 8192,
+        think_end_bias: 10.0,
+        think_end_start: 4096,
+        think_end_window: 4096,
+        think_end_token_id: Some(248_069),
+        stop_token_ids: vec![248_044, 248_046],
+        ..BlockDiffusionConfig::default()
+    };
+    let dir = tempdir();
+    let path = dir.join("clover.cmf");
+    let mut header = tiny_header();
+    header.arch.block_diffusion = Some(bd.clone());
+    let arch = header.arch.clone();
+    let embed: Vec<f32> = (0..arch.vocab_size * arch.hidden_size)
+        .map(|i| (i as f32 * 0.07).cos())
+        .collect();
+    let tensors = vec![TensorSpec {
+        name: "model.embed_tokens.weight".into(),
+        dtype: TensorDtype::F32,
+        shape: vec![arch.vocab_size, arch.hidden_size],
+        data: embed.iter().flat_map(|v| v.to_le_bytes()).collect(),
+    }];
+    CmfModel::write(&path, &header, &tensors, None, None).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    let required = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+    assert_eq!(features::BLOCK_DIFFUSION, 1 << 15);
+    assert_ne!(required & features::BLOCK_DIFFUSION, 0, "BLOCK_DIFFUSION bit not set");
+    assert_eq!(CmfModel::open(&path).unwrap().arch().block_diffusion, Some(bd));
+    // A reader that predates the bit refuses the file.
+    let without = features::SUPPORTED & !features::BLOCK_DIFFUSION;
+    match cortiq_core::format::check_required_features(required, without) {
+        Err(CmfError::UnsupportedFeature(u)) => assert_eq!(u, features::BLOCK_DIFFUSION),
+        other => panic!("a reader without BLOCK_DIFFUSION must refuse, got {other:?}"),
+    }
+    // Record without the bit → refuse.
+    let mut cleared = bytes.clone();
+    cleared[12..16].copy_from_slice(&(required & !features::BLOCK_DIFFUSION).to_le_bytes());
+    let p2 = dir.join("clover-nobit.cmf");
+    std::fs::write(&p2, &cleared).unwrap();
+    assert!(matches!(CmfModel::open(&p2), Err(CmfError::Parse(_))));
+    // Bit on a plain file → refuse.
+    let p3 = dir.join("plain-diffusion-bit.cmf");
+    write_tiny_file(&p3);
+    let mut plain = std::fs::read(&p3).unwrap();
+    let r = u32::from_le_bytes(plain[12..16].try_into().unwrap());
+    plain[12..16].copy_from_slice(&(r | features::BLOCK_DIFFUSION).to_le_bytes());
+    std::fs::write(&p3, &plain).unwrap();
+    assert!(matches!(CmfModel::open(&p3), Err(CmfError::Parse(_))));
 }
 
 /// The bounded anchor is an operator record, not a hint: it must be

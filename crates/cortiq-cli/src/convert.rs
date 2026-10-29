@@ -22,7 +22,7 @@ use cortiq_core::quant::{
     q4tp_code_stride, q4tp_put_code,
 };
 use cortiq_core::types::{
-    LayerType, LinearCoreConfig, ModelArch, MoeConfig, NormStyle, PrismAffineConfig,
+    BlockDiffusionConfig, LayerType, LinearCoreConfig, ModelArch, MoeConfig, NormStyle, PrismAffineConfig,
     PrismHadamardConfig, QuantType, Qwen4ExpConfig, TensorDtype, YarnConfig,
 };
 use std::collections::{HashMap, HashSet};
@@ -813,6 +813,12 @@ fn force_f32(name: &str) -> bool {
         || name.ends_with(".mlp.expert_bias_vl")
         || name.ends_with(".ffn.gate.bias")
         || name.ends_with(".ffn.gate.bias_vl")
+        // Clover's block-preview GDN taps and per-head softmax scalars:
+        // a few KiB per layer, kept exact.
+        || name.ends_with(".linear_attn.conv_right_weight")
+        || name.ends_with(".linear_attn.bd_softmax_logit_scale")
+        || name.ends_with(".linear_attn.bd_softmax_history_bias")
+        || name.ends_with(".linear_attn.bd_softmax_history_c")
 }
 
 /// DeepSeek-V4.1's vision tower and aligner are small relative to the text
@@ -6717,6 +6723,7 @@ fn build_minimax_m3_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch
             router_resonance: false,
         }),
         qwen4_exp: None,
+        block_diffusion: None,
         deepseek_v41: None,
         linear_core: None,
         anchor_core: None,
@@ -6740,6 +6747,41 @@ fn build_minimax_m3_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch
 }
 
 fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
+    // Clover (`clover_moe`): the Qwen3.6-35B-A3B trunk, decoded by block
+    // diffusion. The trunk converts exactly as `qwen3_5_moe_text` — the same
+    // tensors, plus each GDN layer's right convolution and softmax controls,
+    // which pass through by name — and the block record carries the decoding.
+    if config.get("model_type").and_then(|v| v.as_str()) == Some("clover_moe") {
+        let mut synthetic = config.clone();
+        synthetic["model_type"] = serde_json::json!("qwen3_5_moe_text");
+        let mut arch = build_arch(&synthetic)?;
+        let dc = config.get("denoising_config").cloned().unwrap_or(serde_json::Value::Null);
+        let algorithm = dc.get("algorithm").and_then(|v| v.as_str()).unwrap_or("low_confidence");
+        anyhow::ensure!(algorithm == "low_confidence", "clover_moe: denoising algorithm {algorithm:?} is not supported (low_confidence)");
+        let block_size = cfg_usize(config, "block_size").ok_or_else(|| anyhow::anyhow!("clover_moe: no block_size"))?;
+        let mask_token_id = cfg_usize(config, "mask_token_id").ok_or_else(|| anyhow::anyhow!("clover_moe: no mask_token_id"))? as u32;
+        anyhow::ensure!(block_size > 0 && block_size <= 256, "clover_moe: block_size {block_size}");
+        arch.block_diffusion = Some(BlockDiffusionConfig {
+            algorithm: algorithm.to_string(),
+            block_size,
+            mask_token_id,
+            threshold: dc.get("threshold").and_then(|v| v.as_f64()).unwrap_or(0.95) as f32,
+            coreset_enabled: config.get("moe_block_coreset_enabled").and_then(|v| v.as_bool()).unwrap_or(false),
+            coreset_top_p: config.get("moe_block_coreset_top_p").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            repetition_penalty: 1.0,
+            length_penalty: 0.0,
+            length_penalty_start: 0,
+            length_penalty_window: 1,
+            think_end_bias: 0.0,
+            think_end_start: 0,
+            think_end_window: 1,
+            think_end_token_id: None,
+            stop_token_ids: Vec::new(),
+        });
+        return Ok(arch);
+    }
     // Whisper is encoder/decoder, so use its encoder dimensions for the
     // generic inspection fields and retain the full original config below.
     if config.get("model_type").and_then(|v| v.as_str()) == Some("whisper") {
@@ -7504,6 +7546,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
             split_ngram_parts: cfg_usize(tc, "split_ngram_parts").unwrap_or(128),
             seed: cfg_usize(tc, "seed").unwrap_or(1234) as u64,
         }),
+        block_diffusion: None,
         // Keep the complete original HF object, including the text/vision
         // sub-configs and quantization policy. V4.1 runtime initialization
         // consumes this verbatim for multimodal and Engram geometry.
@@ -7738,6 +7781,46 @@ fn load_prism_hadamard(
     };
     cfg.validate().map_err(|e| anyhow::anyhow!(e))?;
     Ok(Some(cfg))
+}
+
+/// The vendor's block-generation controls (`generation_config.json`):
+/// response-only presence/frequency/repetition penalties and the gradual
+/// length and thinking-end ramps. Absent keys keep the neutral values.
+fn apply_block_generation_controls(
+    bd: &mut BlockDiffusionConfig,
+    cfg: &serde_json::Value,
+    config: &serde_json::Value,
+) {
+    let f = |k: &str, d: f32| cfg.get(k).and_then(|v| v.as_f64()).map_or(d, |x| x as f32);
+    let u = |k: &str, d: usize| cfg.get(k).and_then(|v| v.as_u64()).map_or(d, |x| x as usize);
+    bd.presence_penalty = f("presence_penalty", 0.0);
+    bd.frequency_penalty = f("frequency_penalty", 0.0);
+    bd.repetition_penalty = f("repetition_penalty", 1.0);
+    bd.length_penalty = f("dllm_length_penalty", 0.0);
+    bd.length_penalty_start = u("dllm_length_penalty_start", 8192);
+    bd.length_penalty_window = u("dllm_length_penalty_window", 8192).max(1);
+    bd.think_end_bias = f("dllm_think_end_bias", 0.0);
+    bd.think_end_start = u("dllm_think_end_start", 4096);
+    bd.think_end_window = u("dllm_think_end_window", 4096).max(1);
+    bd.think_end_token_id = cfg.get("dllm_think_end_token_id").and_then(|v| v.as_u64()).map(|x| x as u32);
+    // The length ramp biases every stop id: the vendor passes EOS ∪
+    // `stop_token_ids` ∪ pad to its penalty state.
+    let mut stop: Vec<u32> = cfg
+        .get("stop_token_ids")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect())
+        .unwrap_or_default();
+    stop.extend(eos_ids(cfg, config));
+    stop.extend(
+        [cfg.get("pad_token_id"), config.get("pad_token_id")]
+            .into_iter()
+            .flatten()
+            .find_map(|v| v.as_u64())
+            .map(|x| x as u32),
+    );
+    stop.sort_unstable();
+    stop.dedup();
+    bd.stop_token_ids = stop;
 }
 
 /// Collect eos ids from generation_config.json / config.json (int or array).
@@ -10600,6 +10683,9 @@ pub fn run_convert_multi_excluding(
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or(serde_json::Value::Null);
+    if let Some(bd) = arch.block_diffusion.as_mut() {
+        apply_block_generation_controls(bd, &gen_cfg, &config);
+    }
     // Sidecar `chat_template.jinja` first, then the tokenizer_config field;
     // ignore an empty/blank file so we correctly fall through to the config.
     let chat_template = minimax_m3_template.or_else(|| {

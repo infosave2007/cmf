@@ -166,11 +166,14 @@ fn kv_append_bt(@builtin(global_invocation_id) gid: vec3<u32>) {
 // ── GQA-shared split attend with a token axis: `gqa_attend_gpart` for token
 // t = t0 + wid.z of the batch (context n = pos0 + t + 1), its queries at row
 // t of the batched Q, its partials at slot ((wid.z·nh + h)·nc + ch).
+// `n_all` != 0: every token sees that many rows (a block-diffusion
+// preview is bidirectional inside its block); 0 = causal, pos0 + t + 1.
 struct AtP {
     nh: u32, hpk: u32, hd: u32, cap: u32,
     pos0: u32, ck: u32, nc: u32, scale: f32,
-    k: u32, t0: u32, _a: u32, _b: u32,
+    k: u32, t0: u32, _a: u32, n_all: u32,
 };
+fn at_ctx(t: u32) -> u32 { return select(ap_p.pos0 + t + 1u, ap_p.n_all, ap_p.n_all != 0u); }
 @group(0) @binding(13) var<storage, read>       ap_q  : array<vec4<f32>>;
 @group(0) @binding(14) var<storage, read>       ap_k  : array<vec4<f32>>;
 @group(0) @binding(15) var<storage, read>       ap_v  : array<vec4<f32>>;
@@ -195,7 +198,7 @@ fn gqa_attend_gpart_bt(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_inv
     let nkv = ap_p.nh / hpk;
     if (g >= nkv || tl >= ap_p.k) { return; }
     let t = ap_p.t0 + tl;
-    let n = ap_p.pos0 + t + 1u;
+    let n = at_ctx(t);
     let hd = ap_p.hd;
     let hd4 = hd / 4u;
     let p0 = ch * AG_CK;
@@ -324,7 +327,7 @@ fn gqa_attend_dec_bt(@builtin(workgroup_id) wid: vec3<u32>,
     let t = ap_p.t0 + tl;
     let hd = ap_p.hd;
     let hd4 = hd / 4u;
-    let n = ap_p.pos0 + t + 1u;
+    let n = at_ctx(t);
     let kbase = (h / ap_p.hpk) * ap_p.cap * hd4;
     let qbase = (t * ap_p.nh + h) * hd4;
     let scale = ap_p.scale;
@@ -397,7 +400,7 @@ fn gqa_attend_merge_bt(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_inv
     let lane = lid.x;
     if (h >= ap_p.nh || tl >= ap_p.k) { return; }
     let t = ap_p.t0 + tl;
-    let n = ap_p.pos0 + t + 1u;
+    let n = at_ctx(t);
     let hd = ap_p.hd;
     let nc = (n + ap_p.ck - 1u) / ap_p.ck;
     let hb = (tl * ap_p.nh + h) * ap_p.nc;
@@ -612,6 +615,8 @@ pub(crate) fn encode_attn_bt(
     sub: usize,
     nc: usize,
     scale: f32,
+    // Rows every token attends (block preview); 0 = causal.
+    n_all: usize,
 ) {
     let run = k - t_from;
     if run == 0 {
@@ -688,7 +693,7 @@ pub(crate) fn encode_attn_bt(
                     kk as u32,
                     t_from as u32,
                     0,
-                    0,
+                    n_all as u32,
                 ]),
                 usage: wgpu::BufferUsages::UNIFORM,
             });
@@ -705,7 +710,7 @@ pub(crate) fn encode_attn_bt(
     let mut t0 = t_dec.max(t_from);
     while t0 < k {
         let kk = sub.min(k - t0);
-        let n_last = pos0 + t0 + kk;
+        let n_last = if n_all > 0 { n_all } else { pos0 + t0 + kk };
         let at_u = c
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -722,7 +727,7 @@ pub(crate) fn encode_attn_bt(
                     kk as u32,
                     t0 as u32,
                     u32::from(tfast),
-                    0,
+                    n_all as u32,
                 ]),
                 usage: wgpu::BufferUsages::UNIFORM,
             });
