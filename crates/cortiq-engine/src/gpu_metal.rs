@@ -2607,6 +2607,7 @@ kernel void gqa_attend_blk(
     constant uint& nb   [[buffer(9)]],
     constant uint& nblk [[buffer(10)]],
     constant float& scale [[buffer(11)]],
+    constant uint& bsz  [[buffer(12)]],   // positions per block
     uint3 tg [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]])
@@ -2615,8 +2616,8 @@ kernel void gqa_attend_blk(
     if (kh * hpk + sg >= nh || e >= nb || j >= nblk) return;
     uint h = kh * hpk + sg;
     uint n = s0 + e + 1u;
-    uint p0 = j * 128u;
-    uint p1 = min(p0 + 128u, n);
+    uint p0 = j * bsz;
+    uint p1 = min(p0 + bsz, n);
     uint nt = (hd + 31u) / 32u;
     device float* out = part + (((ulong)e * nh + h) * nblk + j) * (hd + 2u);
     if (p0 >= n) {
@@ -10238,32 +10239,32 @@ fn encode_q4t_matvec(
 thread_local! {
     /// Dense decode levers for the encodes on this thread: `DENSE_MV` |
     /// `DENSE_FUSE`. Scoped by `MvFastGuard`.
-    static MV_FAST: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static MV_FAST: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
 }
 
 /// Lever bits of the plain dense decode (`MvFastGuard`, `dense_ab_arm`).
-pub const DENSE_MV: u8 = 1;
+pub const DENSE_MV: u16 = 1;
 /// Concurrent layer encoder (`TokenGraph::set_dense_concurrent`).
-pub const DENSE_CONC: u8 = 2;
+pub const DENSE_CONC: u16 = 2;
 /// Fused epilogues: h += O·ao, gate|up|SiLU in one pass, h += Down·act.
-pub const DENSE_FUSE: u8 = 4;
+pub const DENSE_FUSE: u16 = 4;
 /// q8_2f projections take the four-row `q8f_matvec_r4` (same per-row
 /// accumulation order as `q8f_matvec`, x·col read once per four rows).
 /// Opened per plan (Spark-X2.5); `CMF_Q8_R4=1` forces it everywhere,
 /// `=0` closes it.
-pub const DENSE_Q8R4: u8 = 8;
+pub const DENSE_Q8R4: u16 = 8;
 /// MoE decode (Mellum2.1): the routed experts' gate|up|SiLU in one
 /// masked-nibble jobs pass (`q4tp_moe_gu_m`). `CMF_METAL_MOEFAST=0` closes
 /// all three MoE levers.
-pub const MOE_GU: u8 = 16;
+pub const MOE_GU: u16 = 16;
 /// MoE decode: down + weighted mix + residual in one pass (`q4tp_moe_down_m`).
-pub const MOE_DN: u8 = 32;
+pub const MOE_DN: u16 = 32;
 /// MoE decode: the top-k select over one simdgroup (`moe_topk_select_sg`,
 /// bit-identical to the single-thread kernel).
-pub const MOE_SEL: u8 = 64;
+pub const MOE_SEL: u16 = 64;
 /// Device attend of a MoE plan: the GQA-shared split-K kernel from 64
 /// positions on (`set_attend_blk_from`) instead of the default 512.
-pub const ATT_BLK: u8 = 128;
+pub const ATT_BLK: u16 = 128;
 
 /// The levers a MoE decode plan opens by default. Measured on Mellum2.1
 /// q4tp, M4, in-process `CMF_METAL_AB` arms (pair medians, wall per token):
@@ -10272,9 +10273,17 @@ pub const ATT_BLK: u8 = 128;
 /// `off`). Measured neutral and left off: fused down+mix (0.986-0.997),
 /// the concurrent encoder (0.990), fused RoPE+append (1.000), split-K
 /// attend from 64 positions (0.992 short, 1.005 at depth 1500).
-pub const MOE_PLAN_BITS: u8 = DENSE_Q8R4 | MOE_SEL | MOE_GU;
+/// In-process cost attribution (`CMF_METAL_AB` letter x): the arm with
+/// this bit drops the `CMF_METAL_SKIP` stages, the other keeps them — the
+/// pair ratio is the stage's cost on a drifting machine. Output garbage.
+pub const SKIP_AB: u16 = 256;
+/// Decode attend through the split-K kernel from the second position on,
+/// in 32-position blocks (`CMF_METAL_AB` letter k).
+pub const ATT_SMALL: u16 = 512;
 
-fn moe_bit(b: u8) -> bool {
+pub const MOE_PLAN_BITS: u16 = DENSE_Q8R4 | MOE_SEL | MOE_GU;
+
+fn moe_bit(b: u16) -> bool {
     MV_FAST.with(|f| f.get() & b != 0)
 }
 
@@ -10306,7 +10315,7 @@ fn fuse_on() -> bool {
 /// `CMF_METAL_FUSE=0` close the respective levers everywhere (rollback
 /// switches). Restores the previous value on drop.
 pub struct MvFastGuard {
-    prev: u8,
+    prev: u16,
 }
 
 impl MvFastGuard {
@@ -10316,14 +10325,14 @@ impl MvFastGuard {
     }
 
     /// Raw bits for the in-process A/B (no env gating).
-    pub fn set_raw(bits: u8) -> MvFastGuard {
+    pub fn set_raw(bits: u16) -> MvFastGuard {
         let prev = MV_FAST.with(|f| f.replace(bits));
         MvFastGuard { prev }
     }
 
     /// `DENSE_MV` / `DENSE_FUSE` / `DENSE_Q8R4` bits (others ignored).
-    pub fn set_bits(bits: u8) -> MvFastGuard {
-        static ENV: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    pub fn set_bits(bits: u16) -> MvFastGuard {
+        static ENV: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
         let allowed = *ENV.get_or_init(|| {
             let off = |k: &str| std::env::var(k).as_deref() == Ok("0");
             let mut a = DENSE_MV | DENSE_FUSE | DENSE_Q8R4 | MOE_GU | MOE_DN | MOE_SEL | ATT_BLK;
@@ -10359,18 +10368,18 @@ impl Drop for MvFastGuard {
 /// timed per arm, so a drifting or shared GPU loads both arms alike.
 /// Returns this token's lever bits and its arm index, or None when the
 /// A/B is off. Diagnostics only: the rollback env switches do not apply.
-pub fn dense_ab_arm() -> Option<(u8, usize)> {
-    static CFG: std::sync::OnceLock<Option<[u8; 2]>> = std::sync::OnceLock::new();
+pub fn dense_ab_arm() -> Option<(u16, usize)> {
+    static CFG: std::sync::OnceLock<Option<[u16; 2]>> = std::sync::OnceLock::new();
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let cfg = CFG.get_or_init(|| {
         let v = std::env::var("CMF_METAL_AB").ok()?;
-        let side = |s: &str| -> Option<u8> {
+        let side = |s: &str| -> Option<u16> {
             match s {
                 "off" => return Some(0),
                 "all" => return Some(DENSE_MV | DENSE_CONC | DENSE_FUSE),
                 _ => {}
             }
-            let mut b = 0u8;
+            let mut b = 0u16;
             for ch in s.chars() {
                 b |= match ch {
                     'm' => DENSE_MV,
@@ -10381,6 +10390,8 @@ pub fn dense_ab_arm() -> Option<(u8, usize)> {
                     'd' => MOE_DN,
                     's' => MOE_SEL,
                     'b' => ATT_BLK,
+                    'x' => SKIP_AB,
+                    'k' => ATT_SMALL,
                     _ => return None,
                 };
             }
@@ -10934,6 +10945,173 @@ pub fn q8f_kernel_bench(
         std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, y.as_mut_ptr(), rows);
     }
     Some((cmd_gpu_ms(cmd) / reps as f64, y))
+}
+
+/// `q8f_kernel_bench` for the q4tp decode matvec (`q4tp_matvec_m` ABI: 0 q,
+/// 1 x, 2 y, 3 gpr, 4 rows, 5 addy = 0). With `up`, each tensor of `idxs`
+/// pairs with the same-index up tensor for the fused gate|up ABI (5 = the up
+/// weight): `q4tp_matvec_m_gu` / `_gelu`. `kernel` names a built-in
+/// (`q4tp_matvec_m`, `q4tp_matvec_m_gu_gelu`) or, with `src`, an entry point
+/// of that MSL. Grid: ceil(rows / (sgs·rows_per_sg)) threadgroups of `sgs`
+/// simdgroups. Returns GPU ms per rep and the last tensor's output.
+#[allow(clippy::too_many_arguments)]
+pub fn q4tp_mv_kernel_bench(
+    model: &Arc<CmfModel>,
+    idxs: &[usize],
+    up: Option<&[usize]>,
+    kernel: &str,
+    src: Option<&str>,
+    rows_per_sg: usize,
+    sgs: usize,
+    reps: usize,
+) -> Option<(f64, Vec<f32>)> {
+    let c = ctx()?;
+    let (fbuf, _safe) = file_buffer(c, model)?;
+    let pso = match (kernel, src) {
+        ("q4tp_matvec_m", None) => c.q4tp_m.clone(),
+        ("q4tp_matvec_m_gu_gelu", None) => c.q4tp_mgu_gelu.clone(),
+        (name, Some(src)) => {
+            let lib = c
+                ._device
+                .new_library_with_source(src, &metal::CompileOptions::new())
+                .map_err(|e| eprintln!("MSL compile: {e}"))
+                .ok()?;
+            let f = lib.get_function(name, None).ok()?;
+            c._device.new_compute_pipeline_state_with_function(&f).ok()?
+        }
+        _ => return None,
+    };
+    let shared = MTLResourceOptions::StorageModeShared;
+    let mut ts = Vec::new();
+    for (i, &idx) in idxs.iter().enumerate() {
+        let e = &model.tensors[idx];
+        if e.dtype != cortiq_core::TensorDtype::Q4TiledP {
+            return None;
+        }
+        let u = match up {
+            Some(u) => Some(model.entry_abs_offset(&model.tensors[*u.get(i)?])?),
+            None => None,
+        };
+        ts.push((model.entry_abs_offset(e)?, e.shape[0], e.shape[1], u));
+    }
+    let max_cols = ts.iter().map(|t| t.2).max()?;
+    let max_rows = ts.iter().map(|t| t.1).max()?;
+    let xs: Vec<f32> = (0..max_cols)
+        .map(|i| ((i % 97) as f32 - 48.0) / 480.0)
+        .collect();
+    let xs_buf = c._device.new_buffer_with_data(
+        xs.as_ptr() as *const std::ffi::c_void,
+        (xs.len() * 4) as u64,
+        shared,
+    );
+    let y_buf = c._device.new_buffer((max_rows * 4) as u64, shared);
+    let cmd = c.queue.new_command_buffer();
+    {
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pso);
+        for _ in 0..reps {
+            for &(abs, rows, cols, u) in &ts {
+                fbuf.bind(enc, 0, abs);
+                enc.set_buffer(1, Some(&xs_buf), 0);
+                enc.set_buffer(2, Some(&y_buf), 0);
+                let w = [(cols / GROUP_SIZE) as u32, rows as u32, 0u32];
+                enc.set_bytes(3, 4, &w[0] as *const u32 as *const std::ffi::c_void);
+                enc.set_bytes(4, 4, &w[1] as *const u32 as *const std::ffi::c_void);
+                match u {
+                    Some(ua) => fbuf.bind(enc, 5, ua),
+                    None => enc.set_bytes(5, 4, &w[2] as *const u32 as *const std::ffi::c_void),
+                }
+                enc.dispatch_thread_groups(
+                    MTLSize::new(rows.div_ceil(sgs * rows_per_sg) as u64, 1, 1),
+                    MTLSize::new(sgs as u64 * 32, 1, 1),
+                );
+            }
+        }
+        enc.end_encoding();
+    }
+    submit_and_wait(c, cmd, &[&y_buf]);
+    let rows = ts.last()?.1;
+    let mut y = vec![0f32; rows];
+    unsafe {
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, y.as_mut_ptr(), rows);
+    }
+    Some((cmd_gpu_ms(cmd) / reps as f64, y))
+}
+
+/// Decode attend microbench (tests): one token's grouped attend over `n`
+/// synthetic positions of an `[nkv][cap][hd]` mirror, `reps` dispatches in
+/// one command buffer on the GPU clock. `which` 0: the per-head
+/// `gqa_attend` with the decode graph's simdgroup rule; 1: the split-K
+/// `gqa_attend_blk` + `gqa_combine`. Returns GPU µs per dispatch.
+pub fn attend_kernel_bench(
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    n: usize,
+    which: u32,
+    reps: usize,
+) -> Option<f64> {
+    let c = ctx()?;
+    let cap = n.next_power_of_two().max(1024);
+    let shared = MTLResourceOptions::StorageModeShared;
+    let fill = |len: usize, seed: u32| -> Buffer {
+        let v: Vec<f32> = (0..len)
+            .map(|i| (((i as u32).wrapping_mul(2654435761).wrapping_add(seed) >> 8) % 2001) as f32 / 1000.0 - 1.0)
+            .collect();
+        c._device
+            .new_buffer_with_data(v.as_ptr() as *const std::ffi::c_void, (len * 4) as u64, shared)
+    };
+    let q = fill(nh * hd, 1);
+    let k = fill(nkv * cap * hd, 2);
+    let v = fill(nkv * cap * hd, 3);
+    let ao = c._device.new_buffer((nh * hd * 4) as u64, shared);
+    let imp = c._device.new_buffer((cap * 4) as u64, shared);
+    let sink = const_buf(c, &NO_ATTN_SINK);
+    let scale = 1.0f32 / (hd as f32).sqrt();
+    let cmd = c.queue.new_command_buffer();
+    {
+        let enc = cmd.new_compute_command_encoder();
+        for _ in 0..reps {
+            if which == 0 {
+                let cap_sgs = (c.gqat.max_total_threads_per_threadgroup() as usize / 32)
+                    .clamp(1, gqa_split_max());
+                let sgs = n.div_ceil(32).clamp(1, cap_sgs);
+                let tg_threads = 32 * sgs;
+                disp_tg(
+                    enc,
+                    &c.gqat,
+                    &[(&q, 0), (&k, 0), (&v, 0), (&ao, 0), (&imp, 0), (&sink, 0)],
+                    &[nh as u32, (nh / nkv) as u32, hd as u32, cap as u32, n as u32, 0],
+                    &[scale],
+                    ((nh * tg_threads) as u64, tg_threads as u64),
+                    ((sgs * hd + 2 * sgs) * 4) as u64,
+                );
+            } else {
+                encode_gqa_attend_blk_with(
+                    c,
+                    enc,
+                    &c.gqablk,
+                    gqa_blk_size(),
+                    &q,
+                    &k,
+                    &v,
+                    0,
+                    &ao,
+                    nh,
+                    nkv,
+                    hd,
+                    cap,
+                    n - 1,
+                    1,
+                    scale,
+                    false,
+                );
+            }
+        }
+        enc.end_encoding();
+    }
+    submit_and_wait(c, cmd, &[&ao]);
+    Some(cmd_gpu_ms(cmd) * 1e3 / reps as f64)
 }
 
 /// `q8f_kernel_bench`'s prefill twin: the q8 GEMM `y[b, rows] = rs ·
@@ -18887,6 +19065,9 @@ pub struct TokenGraph {
     /// GQA-shared split-K kernel (`set_attend_blk_from`); None = the
     /// process default `gqa_blk_threshold()`.
     blk_from: Option<usize>,
+    /// The plan's positions per split-K block (`set_attend_blk`); None =
+    /// `gqa_blk_size()`.
+    blk_size: Option<usize>,
 }
 
 impl TokenGraph {
@@ -18980,6 +19161,7 @@ impl TokenGraph {
             ids_b: None,
             conc: false,
             blk_from: None,
+            blk_size: None,
             in_conc: std::cell::Cell::new(false),
         })
     }
@@ -18998,6 +19180,13 @@ impl TokenGraph {
     /// pass). An explicit `CMF_GQA_BLK` still wins.
     pub fn set_attend_blk_from(&mut self, n: usize) {
         self.blk_from = Some(n);
+    }
+
+    /// `set_attend_blk_from` plus the positions per split-K block; an
+    /// explicit `CMF_GQA_BLKSZ` still wins.
+    pub fn set_attend_blk(&mut self, from: usize, size: usize) {
+        self.blk_from = Some(from);
+        self.blk_size = Some(size);
     }
 
     /// `set_dense_concurrent` without the env gate (the in-process A/B).
@@ -20676,7 +20865,9 @@ impl TokenGraph {
             let skip_a = decode_skip('a');
             let n_pos = n_all - first;
             let (kv_off, imp_off) = ((first * p.hd * 4) as u64, (first * 4) as u64);
+            let att_small = moe_bit(ATT_SMALL);
             let thr = match self.blk_from {
+                _ if att_small => 1,
                 Some(n) if std::env::var("CMF_GQA_BLK").is_err() => n,
                 _ if moe_bit(ATT_BLK) && std::env::var("CMF_GQA_BLK").is_err() => 64,
                 _ => gqa_blk_threshold(),
@@ -20698,6 +20889,12 @@ impl TokenGraph {
                             &g4.unwrap().gqablk16
                         } else {
                             &self.c.gqablk
+                        },
+                        match self.blk_size {
+                            _ if std::env::var("CMF_GQA_BLKSZ").is_ok() => gqa_blk_size(),
+                            _ if att_small => 32,
+                            Some(n) => n,
+                            None => gqa_blk_size(),
                         },
                         &qr_b,
                         &k_mb,
@@ -20890,7 +21087,9 @@ impl TokenGraph {
             && matches!(au.1, ProjKind::Q4tp)
             && gate.1 == up.1
             && gate.2 == up.2;
-        if gu_fused && act == 2 {
+        if decode_skip('g') {
+            // cost attribution (`CMF_METAL_SKIP=g`): no gate/up
+        } else if gu_fused && act == 2 {
             note_weight_bytes(&ProjKind::Q4tp, 2 * gate.1, gate.2 / GROUP_SIZE);
             gemma4::enc_mgu_gelut(
                 g4.expect("gemma4 kernels (attn_ok)"),
@@ -20983,6 +21182,9 @@ impl TokenGraph {
             && act == 0
             && matches!(ad.1, ProjKind::Q4t)
             && inter % 4 == 0;
+        if down_fused && decode_skip('d') {
+            return;
+        }
         if down_fused {
             // h += Down·act in the epilogue: no axpy pass.
             encode_q4tp_matvec_m_add(
@@ -22283,9 +22485,15 @@ const VBUF_BASE: usize = 60_000_000_000;
 /// projection, r router, s top-k select, g gate/up(+SiLU), d down(+mix),
 /// h lm_head.
 fn decode_skip(what: char) -> bool {
-    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    V.get_or_init(|| std::env::var("CMF_METAL_SKIP").unwrap_or_default())
-        .contains(what)
+    static V: std::sync::OnceLock<(String, bool)> = std::sync::OnceLock::new();
+    let (v, ab) = V.get_or_init(|| {
+        (
+            std::env::var("CMF_METAL_SKIP").unwrap_or_default(),
+            std::env::var("CMF_METAL_AB").is_ok_and(|a| a.contains('x')),
+        )
+    });
+    // Under an `x` A/B only the arm carrying `SKIP_AB` drops the stage.
+    v.contains(what) && (!*ab || moe_bit(SKIP_AB))
 }
 
 fn verify_skip(what: char) -> bool {
@@ -23641,7 +23849,23 @@ fn encode_gqa_attend_blk(
         return false;
     }
     encode_gqa_attend_blk_with(
-        c, enc, &c.gqablk, q, k_mb, v_mb, kv_off, ao, nh, nkv, hd, cap, stored, nb, scale, conc,
+        c,
+        enc,
+        &c.gqablk,
+        gqa_blk_size(),
+        q,
+        k_mb,
+        v_mb,
+        kv_off,
+        ao,
+        nh,
+        nkv,
+        hd,
+        cap,
+        stored,
+        nb,
+        scale,
+        conc,
     )
 }
 
@@ -23653,6 +23877,8 @@ fn encode_gqa_attend_blk_with(
     c: &Ctx,
     enc: &metal::ComputeCommandEncoderRef,
     pso: &ComputePipelineState,
+    // Positions per block (the main kernel; Gemma-4's twin is fixed at 128).
+    bs: usize,
     q: &Buffer,
     k_mb: &Buffer,
     v_mb: &Buffer,
@@ -23672,7 +23898,8 @@ fn encode_gqa_attend_blk_with(
         return false;
     }
     let n_max = stored + nb;
-    let nblk = n_max.div_ceil(128);
+    let bs = if std::ptr::eq(pso, &c.gqablk) { bs } else { 128 };
+    let nblk = n_max.div_ceil(bs);
     let part = io_buf(
         c,
         48_000_000_131 + nb * nh * nblk * (hd + 2),
@@ -23696,6 +23923,8 @@ fn encode_gqa_attend_blk_with(
         enc.set_bytes(4 + i as u64, 4, v as *const u32 as *const std::ffi::c_void);
     }
     enc.set_bytes(11, 4, &scale as *const f32 as *const std::ffi::c_void);
+    let bs_u = bs as u32;
+    enc.set_bytes(12, 4, &bs_u as *const u32 as *const std::ffi::c_void);
     enc.dispatch_thread_groups(
         MTLSize::new(nkv as u64, nblk as u64, nb as u64),
         MTLSize::new((hpk * 32) as u64, 1, 1),
@@ -23743,6 +23972,19 @@ fn encode_head_gate(
         MTLSize::new((nh as u64).div_ceil(sgs), rows as u64, 1),
         MTLSize::new(sgs * 32, 1, 1),
     );
+}
+
+/// Positions per block of the split-K attend (`CMF_GQA_BLKSZ`, default
+/// 128, a multiple of 4 in 16..=512).
+fn gqa_blk_size() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("CMF_GQA_BLKSZ")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| (v / 4 * 4).clamp(16, 512))
+            .unwrap_or(128)
+    })
 }
 
 /// Positions past which the attend goes GQA-shared/split-K

@@ -189,3 +189,131 @@ fn metal_q8_mul_mm_cost_by_kind() {
         }
     }
 }
+
+/// The q4tp decode matvec per projection kind (`q4tp_matvec_m`) and the
+/// fused gate|up|GELU pair, over every layer. `CMF_Q8F_MSL` +
+/// `CMF_Q4MV_KERNELS` (`name:rows_per_sg:sgs`, comma-separated; a name
+/// containing `_gu` takes the gate|up pair) add candidates, checked against
+/// the built-in of their kind.
+#[test]
+#[ignore]
+fn metal_q4tp_matvec_cost_by_kind() {
+    let Ok(path) = std::env::var("CMF_BENCH_MODEL") else {
+        eprintln!("CMF_BENCH_MODEL not set — skipping");
+        return;
+    };
+    let model = Arc::new(CmfModel::open_sharded(&path).expect("open"));
+    let src = std::env::var("CMF_Q8F_MSL")
+        .ok()
+        .map(|p| std::fs::read_to_string(p).expect("read MSL"));
+    let mut extra: Vec<(String, usize, usize)> = Vec::new();
+    if let (Some(_), Ok(list)) = (src.as_deref(), std::env::var("CMF_Q4MV_KERNELS")) {
+        for spec in list.split(',') {
+            let p: Vec<&str> = spec.split(':').collect();
+            extra.push((p[0].into(), p[1].parse().unwrap(), p[2].parse().unwrap()));
+        }
+    }
+    let reps: usize = std::env::var("CMF_Q8F_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let layers = (0..)
+        .take_while(|l| {
+            model
+                .tensor_index(&format!("model.layers.{l}.mlp.gate_proj.weight"))
+                .is_some()
+        })
+        .count();
+    let set = |k: &str| -> Vec<usize> {
+        (0..layers)
+            .map(|l| {
+                model
+                    .tensor_index(&format!("model.layers.{l}.{k}.weight"))
+                    .expect("tensor")
+            })
+            .collect()
+    };
+    let mut kinds: Vec<(String, Vec<usize>, Option<Vec<usize>>)> = [
+        "self_attn.q_proj",
+        "self_attn.k_proj",
+        "self_attn.o_proj",
+        "mlp.down_proj",
+    ]
+    .iter()
+    .map(|k| (k.to_string(), set(k), None))
+    .collect();
+    kinds.push(("gate|up".into(), set("mlp.gate_proj"), Some(set("mlp.up_proj"))));
+    if let Some(h) = model.tensor_index("model.embed_tokens.weight") {
+        kinds.push(("head".into(), vec![h], None));
+    }
+    for (kind, idxs, up) in &kinds {
+        let mut bytes: f64 = idxs.iter().map(|&i| model.tensors[i].nbytes as f64).sum();
+        if let Some(u) = up {
+            bytes += u.iter().map(|&i| model.tensors[i].nbytes as f64).sum::<f64>();
+        }
+        let builtin = if up.is_some() {
+            "q4tp_matvec_m_gu_gelu"
+        } else {
+            "q4tp_matvec_m"
+        };
+        let mut arms: Vec<(String, Option<&str>, usize, usize)> = vec![(builtin.into(), None, 4, 4)];
+        for (n, r, s) in &extra {
+            if n.contains("_gu") == up.is_some() {
+                arms.push((n.clone(), src.as_deref(), *r, *s));
+            }
+        }
+        let mut reference: Option<Vec<f32>> = None;
+        for (name, src, rps, sgs) in &arms {
+            let run = |reps| {
+                cortiq_engine::gpu_metal::q4tp_mv_kernel_bench(
+                    &model,
+                    idxs,
+                    up.as_deref(),
+                    name,
+                    *src,
+                    *rps,
+                    *sgs,
+                    reps,
+                )
+            };
+            let _ = run(1);
+            let Some((ms, y)) = run(reps) else {
+                println!("KERNEL {name} {kind}: unavailable");
+                continue;
+            };
+            let err = match &reference {
+                None => {
+                    reference = Some(y);
+                    0.0
+                }
+                Some(r) => {
+                    let scale = r.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+                    r.iter().zip(&y).fold(0f32, |m, (a, b)| m.max((a - b).abs())) / scale
+                }
+            };
+            println!(
+                "KERNEL {name:24} {kind:17} {ms:7.3} ms/pass {:6.1} GB/s  rel err {err:.2e}",
+                bytes / ms / 1e6
+            );
+        }
+    }
+}
+
+/// The decode attend kernels alone on synthetic K/V (Spark-X2.6 geometry:
+/// 16 Q heads, 4 KV heads, width 256), GPU µs per dispatch by depth.
+#[test]
+#[ignore]
+fn metal_decode_attend_cost_by_depth() {
+    let ns: Vec<usize> = std::env::var("CMF_ATT_NS")
+        .ok()
+        .map(|v| v.split(',').map(|x| x.parse().unwrap()).collect())
+        .unwrap_or_else(|| vec![64, 150, 512, 1000, 3000]);
+    for n in ns {
+        for (which, label) in [(0u32, "per-head"), (1, "split-K")] {
+            let _ = cortiq_engine::gpu_metal::attend_kernel_bench(16, 4, 256, n, which, 4);
+            if let Some(us) = cortiq_engine::gpu_metal::attend_kernel_bench(16, 4, 256, n, which, 64) {
+                println!("ATTEND {label:9} n={n:5} {us:8.1} us/dispatch");
+            }
+        }
+    }
+}
