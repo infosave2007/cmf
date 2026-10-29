@@ -21221,17 +21221,17 @@ fn init(dev: usize) -> Result<Ctx, String> {
     // Workgroup-memory zeroing is code naga injects at the top of every
     // kernel. On a non-Apple GPU under Metal (the AMD / Intel GPUs of Intel
     // Macs) it costs ~0.5-2 ms a dispatch: a Radeon Pro 560X decoded
-    // Spark-X2.6-4B q4tp at 1.1 tok/s with it and 9.9 without, and the
-    // zeroed run's greedy text even drifted from the CPU's while the plain
-    // one matches it to the byte. The main module's kernels write their
-    // workgroup arrays before reading them (the wgpu tests pass without the
-    // zeroing there), so those devices skip it. `CMF_WGPU_NOZERO=1|0` forces
-    // either way.
+    // Spark-X2.6-4B q4tp at 1.1 tok/s with it and 13.6 without (prefill
+    // 10.9 -> 19.2). The kernels write their workgroup arrays before reading
+    // them: with and without the zeroing that card writes the same greedy
+    // text, and the wgpu tests pass without it. Those devices skip it for
+    // every pipeline (`pco`); `CMF_WGPU_NOZERO=1|0` forces either way.
     let zero_wg = match std::env::var("CMF_WGPU_NOZERO").as_deref() {
         Ok("1") => false,
         Ok("0") => true,
         _ => !(info.backend == wgpu::Backend::Metal && !info.name.starts_with("Apple")),
     };
+    ZERO_WG.store(zero_wg, std::sync::atomic::Ordering::Relaxed);
     if let Some(e) = pollster::block_on(msc.pop()) {
         // The module's own diagnostic names the offending line; without
         // it every pipeline built from the module reports the same
@@ -21248,10 +21248,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
             layout: None, // auto: layout is inferred from the shader
             module: &module,
             entry_point: Some(ep),
-            compilation_options: wgpu::PipelineCompilationOptions {
-                zero_initialize_workgroup_memory: zero_wg,
-                ..Default::default()
-            },
+            compilation_options: pco(),
             cache: pcache.as_ref(),
         })
     };
@@ -21280,7 +21277,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         entry_point: Some("q1_matvec"),
         compilation_options: wgpu::PipelineCompilationOptions {
             constants: &q1_constants,
-            ..Default::default()
+            ..pco()
         },
         cache: pcache.as_ref(),
     });
@@ -21292,7 +21289,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         entry_point: Some("q1g_matvec"),
         compilation_options: wgpu::PipelineCompilationOptions {
             constants: &q1_constants,
-            ..Default::default()
+            ..pco()
         },
         cache: pcache.as_ref(),
     });
@@ -21403,7 +21400,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
                 layout: None,
                 module: &m,
                 entry_point: Some("q4tp_mm_coop"),
-                compilation_options: Default::default(),
+                compilation_options: pco(),
                 cache: pcache.as_ref(),
             });
             if let Some(e) = pollster::block_on(sc.pop()) {
@@ -21440,7 +21437,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
             layout: None,
             module: &m,
             entry_point: Some(entry),
-            compilation_options: Default::default(),
+            compilation_options: pco(),
             cache: pcache.as_ref(),
         });
         if let Some(e) = pollster::block_on(sc.pop()) {
@@ -21519,7 +21516,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
             layout: None,
             module: &m,
             entry_point: Some(entry),
-            compilation_options: Default::default(),
+            compilation_options: pco(),
             cache: pcache.as_ref(),
         });
         if let Some(e) = pollster::block_on(sc.pop()) {
@@ -21546,7 +21543,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
             layout: None,
             module: &m,
             entry_point: Some(entry),
-            compilation_options: Default::default(),
+            compilation_options: pco(),
             cache: pcache.as_ref(),
         })
     };
@@ -21670,7 +21667,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
             layout: None,
             module: &m,
             entry_point: Some("matvec_pair_v4"),
-            compilation_options: Default::default(),
+            compilation_options: pco(),
             cache: pcache.as_ref(),
         })
     });
@@ -21700,7 +21697,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
                 entry_point: Some("q4tp_matvec4_bk8"),
                 compilation_options: wgpu::PipelineCompilationOptions {
                     constants: &cs,
-                    ..Default::default()
+                    ..pco()
                 },
                 cache: pcache.as_ref(),
             })
@@ -21719,7 +21716,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
                         entry_point: Some("q4tp_matvec4_bk8s"),
                         compilation_options: wgpu::PipelineCompilationOptions {
                             constants: &cs,
-                            ..Default::default()
+                            ..pco()
                         },
                         cache: pcache.as_ref(),
                     })
@@ -21737,7 +21734,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
                 entry_point: Some("q4tp_matvec4_bk8h"),
                 compilation_options: wgpu::PipelineCompilationOptions {
                     constants: &cs,
-                    ..Default::default()
+                    ..pco()
                 },
                 cache: pcache.as_ref(),
             })
@@ -21806,7 +21803,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
                     layout: None,
                     module: &m,
                     entry_point: Some("q2tp_matvec16w_sg"),
-                    compilation_options: Default::default(),
+                    compilation_options: pco(),
                     cache: pcache.as_ref(),
                 });
                 if let Some(e) = pollster::block_on(sc.pop()) {
@@ -21939,7 +21936,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
             layout: None,
             module: &split_module,
             entry_point: Some(ep),
-            compilation_options: Default::default(),
+            compilation_options: pco(),
             cache: pcache.as_ref(),
         })
     };
@@ -21975,7 +21972,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
                     layout: None,
                     module: &m,
                     entry_point: Some(ep),
-                    compilation_options: Default::default(),
+                    compilation_options: pco(),
                     cache: pcache.as_ref(),
                 })
             };
@@ -22072,7 +22069,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
                 let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some("q82-short"), layout: None, module: &module,
                     entry_point: Some("q8_2f_matvec_b"),
-                    compilation_options: Default::default(), cache: pcache.as_ref(),
+                    compilation_options: pco(), cache: pcache.as_ref(),
                 });
                 let layout = pipe.get_bind_group_layout(0);
                 q82_short.push((pipe, layout));
@@ -22126,7 +22123,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
                 layout: None,
                 module: &m,
                 entry_point: Some("moe_select_sg"),
-                compilation_options: Default::default(),
+                compilation_options: pco(),
                 cache: pcache.as_ref(),
             }),
         )
@@ -22755,7 +22752,7 @@ fn build_global_moe_pipelines(
             }),
             module: &gm,
             entry_point: Some(entry),
-            compilation_options: Default::default(),
+            compilation_options: pco(),
             cache: pcache,
         })
     };
@@ -36779,7 +36776,7 @@ fn embryo_runtime_init(c: &Ctx) -> bool {
                     layout: Some(&pl),
                     module: &module,
                     entry_point: Some(entry),
-                    compilation_options: Default::default(),
+                    compilation_options: pco(),
                     cache: None,
                 })
         };
@@ -36811,7 +36808,7 @@ fn embryo_runtime_init(c: &Ctx) -> bool {
                     layout: Some(&pl),
                     module: &module,
                     entry_point: Some(entry),
-                    compilation_options: Default::default(),
+                    compilation_options: pco(),
                     cache: None,
                 })
         };
@@ -39714,7 +39711,7 @@ fn prefill_pipe(c: &Ctx, key: &str, src: &str, entry: &str) -> Option<Arc<wgpu::
         layout: None,
         module: &m,
         entry_point: Some(entry),
-        compilation_options: Default::default(),
+        compilation_options: pco(),
         cache: c.pipeline_cache.as_ref(),
     });
     if let Some(e) = pollster::block_on(sc.pop()) {
@@ -46615,6 +46612,18 @@ fn gemm_nn_coop(@builtin(workgroup_id) wid: vec3<u32>,
 }
 "#;
 
+/// Whether this device's pipelines zero workgroup memory (set once at init,
+/// see `zero_wg` there). Every pipeline takes its options from `pco()`.
+static ZERO_WG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// This device's pipeline compilation options (`ZERO_WG`).
+pub(crate) fn pco() -> wgpu::PipelineCompilationOptions<'static> {
+    wgpu::PipelineCompilationOptions {
+        zero_initialize_workgroup_memory: ZERO_WG.load(std::sync::atomic::Ordering::Relaxed),
+        ..Default::default()
+    }
+}
+
 /// Did the device come up with cooperative matrices? Read by the GEMM to
 /// pick its pipeline, and by the shader-module builder to decide whether
 /// the tensor-core source can be compiled at all.
@@ -52429,7 +52438,7 @@ fn main(@builtin(local_invocation_index) tid: u32,
                 layout: None,
                 module: &m,
                 entry_point: Some("main"),
-                compilation_options: Default::default(),
+                compilation_options: pco(),
                 cache: c.pipeline_cache.as_ref(),
             });
         // What the driver actually gives a 128-thread workgroup: the GEMM
@@ -52467,7 +52476,7 @@ fn main(@builtin(local_invocation_index) tid: u32,
                         layout: None,
                         module: &pm,
                         entry_point: Some("main"),
-                        compilation_options: Default::default(),
+                        compilation_options: pco(),
                         cache: c.pipeline_cache.as_ref(),
                     });
                 let ob2 = c.device.create_buffer(&wgpu::BufferDescriptor {
@@ -55116,7 +55125,7 @@ fn main() {
                     entry_point: Some(name),
                     compilation_options: wgpu::PipelineCompilationOptions {
                         zero_initialize_workgroup_memory: zero,
-                        ..Default::default()
+                        ..pco()
                     },
                     cache: None,
                 });

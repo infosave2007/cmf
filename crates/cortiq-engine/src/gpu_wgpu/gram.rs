@@ -122,7 +122,7 @@ fn pipe(c: &Ctx) -> Option<&'static wgpu::ComputePipeline> {
             layout: None,
             module: &m,
             entry_point: Some("gram_upper"),
-            compilation_options: Default::default(),
+            compilation_options: crate::gpu_wgpu::pco(),
             cache: None,
         });
         if let Some(e) = pollster::block_on(sc.pop()) {

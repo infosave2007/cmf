@@ -1346,7 +1346,7 @@ fn module_pipes(c: &Ctx, label: &str, src: &str, entries: &[&str]) -> Option<Vec
                     layout: None,
                     module: &module,
                     entry_point: Some(ep),
-                    compilation_options: Default::default(),
+                    compilation_options: crate::gpu_wgpu::pco(),
                     cache: c.pipeline_cache.as_ref(),
                 })
         })

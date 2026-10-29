@@ -142,7 +142,7 @@ fn build(c: &Ctx) -> Option<Pipe> {
             layout: None,
             module: &module,
             entry_point: Some("fp8_act_quant32"),
-            compilation_options: Default::default(),
+            compilation_options: crate::gpu_wgpu::pco(),
             cache: c.pipeline_cache.as_ref(),
         });
     if let Some(e) = pollster::block_on(scope.pop()) {

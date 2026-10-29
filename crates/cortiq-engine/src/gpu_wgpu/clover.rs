@@ -593,7 +593,7 @@ fn build(c: &Ctx) -> Option<Pipes> {
                 layout: None,
                 module: &module,
                 entry_point: Some(entry),
-                compilation_options: Default::default(),
+                compilation_options: crate::gpu_wgpu::pco(),
                 cache: c.pipeline_cache.as_ref(),
             })
     };
@@ -610,7 +610,7 @@ fn build(c: &Ctx) -> Option<Pipes> {
         layout: None,
         module: &pick_module,
         entry_point: Some("bdp_pick"),
-        compilation_options: Default::default(),
+        compilation_options: crate::gpu_wgpu::pco(),
         cache: c.pipeline_cache.as_ref(),
     });
     let cap_module = c.device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -622,7 +622,7 @@ fn build(c: &Ctx) -> Option<Pipes> {
         layout: None,
         module: &cap_module,
         entry_point: Some("bdp_cap_rows"),
-        compilation_options: Default::default(),
+        compilation_options: crate::gpu_wgpu::pco(),
         cache: c.pipeline_cache.as_ref(),
     });
     let grouped = c.device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -636,7 +636,7 @@ fn build(c: &Ctx) -> Option<Pipes> {
                 layout: None,
                 module: &grouped,
                 entry_point: Some(entry),
-                compilation_options: Default::default(),
+                compilation_options: crate::gpu_wgpu::pco(),
                 cache: c.pipeline_cache.as_ref(),
             })
     };
@@ -647,7 +647,7 @@ fn build(c: &Ctx) -> Option<Pipes> {
                 layout: None,
                 module: &moe_module,
                 entry_point: Some(entry),
-                compilation_options: Default::default(),
+                compilation_options: crate::gpu_wgpu::pco(),
                 cache: c.pipeline_cache.as_ref(),
             })
     };
