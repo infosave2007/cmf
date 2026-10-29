@@ -7,7 +7,6 @@
 use crate::convert::{Quant, effective_quant, keeps_float, quantize_2d};
 use anyhow::{Result, anyhow};
 use cortiq_core::format::{CmfHeader, CmfModel, CmfStreamWriter, TensorEntry};
-use cortiq_core::quant::dequant_tensor;
 use cortiq_core::types::TensorDtype;
 use std::path::Path;
 
@@ -28,7 +27,7 @@ pub enum Encoding {
 
 pub fn tensor_f32(model: &CmfModel, e: &TensorEntry) -> Result<Vec<f32>> {
     let mut v = vec![0f32; e.n_elems()];
-    dequant_tensor(e, model.entry_bytes(e), &mut v)
+    cortiq_core::quant::dequant_tensor_par(e, model.entry_bytes(e), &mut v, super::stages::cpu_budget())
         .map_err(|err| anyhow!("dequantizing {}: {err}", e.name))?;
     Ok(v)
 }
