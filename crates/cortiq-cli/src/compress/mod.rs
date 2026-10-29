@@ -18,6 +18,8 @@
 pub mod cmfio;
 pub mod data;
 pub mod dtgma;
+#[cfg(feature = "gpu")]
+pub mod dtgma_bake;
 pub mod eval;
 #[cfg(feature = "gpu")]
 pub mod fold_dev;
@@ -25,6 +27,8 @@ pub mod fold_dev;
 pub mod heal_gpu;
 pub mod illum;
 pub mod moe;
+#[cfg(feature = "gpu")]
+pub mod mtp_heal;
 pub mod plan;
 pub mod stages;
 
@@ -168,6 +172,17 @@ pub struct CompressArgs {
     pub bs: usize,
     #[arg(long, default_value_t = 25)]
     pub eval_every: usize,
+    /// The device heal stops once the held-out loss has not improved for
+    /// this many evaluations (0 = run every epoch; the genesis schedule
+    /// always runs them all, its widening raises the loss epoch by epoch).
+    /// Measured: Qwen3.8 14B, CE, 2 epochs — best at the first epoch's end,
+    /// the second never beat it
+    #[arg(long, default_value_t = 6)]
+    pub heal_patience: usize,
+    /// Val windows the device heal's held-out loss reads, evenly spread over
+    /// the split (0 = all): it only ranks the student's checkpoints
+    #[arg(long, default_value_t = 32)]
+    pub heal_val_windows: usize,
     /// Where the heal trains: auto (the device when it has the trainer's
     /// matrix-unit GEMMs — NVIDIA Vulkan — else the CPU) | gpu | cpu
     #[arg(long, default_value = "auto")]
@@ -212,14 +227,26 @@ pub struct CompressArgs {
     pub tensor_quant: Vec<String>,
     /// MTP draft, when the source carries one: calibrated through the
     /// finished model on the task's train records, its FFN kept at this
-    /// fraction (`cortiq mtp-compact`); `off` keeps the source's draft as it
-    /// is. The draft predicts from the trunk's last hidden state, which the
-    /// fold and the heal changed.
-    #[arg(long, default_value = "0.9")]
+    /// fraction (`cortiq mtp-compact`); `off` (the default) keeps the
+    /// source's draft as it is. Measured on Qwen3.8 27B → 14B: the draft
+    /// accepts 54 % either way and the decode speed does not move — the
+    /// fold and the heal changed the hidden state it predicts from, which a
+    /// prune does not undo — while the stage costs ~17 min on the pod.
+    #[arg(long, default_value = "off")]
     pub mtp_keep: String,
     /// Train records the draft calibration reads (it runs the model on the CPU)
     #[arg(long, default_value_t = 48)]
     pub mtp_records: usize,
+    /// MTP draft trained on the finished trunk (`cortiq mtp-heal`, a 3-step
+    /// chain): auto = when the source carries a draft and the device trainer
+    /// runs; on | off. Qwen3.8 27B → 14B: the source's draft accepted 54 %
+    /// on the compressed trunk and speculation stopped paying; trained, 87 %
+    /// at depth 2 and 89 against 77 tok/s plain (`CMF_GRAPH_SPEC_K=2`)
+    #[arg(long, default_value = "auto")]
+    pub mtp_heal: String,
+    /// Epochs of the draft's training
+    #[arg(long, default_value_t = 2.0)]
+    pub mtp_heal_epochs: f64,
 
     /// Test prompts generated from in the evaluation
     #[arg(long, default_value_t = 16)]
@@ -404,12 +431,14 @@ impl Run {
                 "kd": a.kd, "seq": a.seq, "bs": a.bs, "eval_every": a.eval_every, "loss_on": a.loss_on,
                 "data": data_identity(&a.data), "device": a.heal_device, "heal_window": a.heal_window,
                 "heal_topk": a.heal_topk, "heal_params": a.heal_params, "heal_loss": a.heal_loss, "heal_schedule": a.heal_schedule,
+                "heal_patience": a.heal_patience, "heal_val_windows": a.heal_val_windows,
             }),
             5 => json!({
                 "o1": "off",
                 "quant": crate::convert::quant_name(self.quant), "calib_tokens": self.calib_tokens,
                 "calib_window": a.calib_window, "escort": a.escort, "tensor_quant": a.tensor_quant,
                 "mtp": [a.mtp_keep.clone(), a.mtp_records.to_string()],
+                "mtp_heal": [a.mtp_heal.clone(), a.mtp_heal_epochs.to_string()],
                 "data": data_identity(&a.data),
             }),
             6 => json!({

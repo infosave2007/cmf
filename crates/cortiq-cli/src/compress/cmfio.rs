@@ -23,6 +23,9 @@ pub enum Encoding {
     /// converter's per-tensor policy for this profile; norms and the
     /// names the converter keeps in float are copied.
     Profile(Quant),
+    /// Copy every tensor that is not replaced; a replacement is encoded in
+    /// its source tensor's codec (a one-tensor edit of a finished file).
+    Keep,
 }
 
 pub fn tensor_f32(model: &CmfModel, e: &TensorEntry) -> Result<Vec<f32>> {
@@ -66,7 +69,7 @@ pub fn rewrite(
     let encode_one = |e: &TensorEntry| -> Result<Out> {
         let rep = replace(&e.name)?;
         let reencode = match enc {
-            Encoding::KeepF16 => false,
+            Encoding::KeepF16 | Encoding::Keep => false,
             Encoding::Profile(_) => {
                 e.shape.len() == 2 && !keeps_float(&e.name) && (is_float(e.dtype) || rep.is_some())
             }
@@ -99,7 +102,17 @@ pub fn rewrite(
                 let (dt, bytes) = quantize_2d(codec, &vals, shape[0], shape[1]);
                 Ok(Out::Encoded(dt, shape, bytes))
             }
-            (None, Encoding::KeepF16) => Ok(Out::Copy),
+            (Some((shape, vals)), Encoding::Keep) => {
+                let codec = crate::tube::quant_of(e.dtype);
+                let (dt, bytes) = match (shape.len(), codec) {
+                    (2, Some(q)) => quantize_2d(q, &vals, shape[0], shape[1]),
+                    (2, None) => anyhow::bail!("{}: no encoder for its codec {:?}", e.name, e.dtype),
+                    _ if e.dtype == TensorDtype::F16 => quantize_2d(Quant::F16, &vals, 1, vals.len()),
+                    _ => (TensorDtype::F32, vals.iter().flat_map(|v| v.to_le_bytes()).collect()),
+                };
+                Ok(Out::Encoded(dt, shape, bytes))
+            }
+            (None, Encoding::KeepF16 | Encoding::Keep) => Ok(Out::Copy),
         }
     };
     // Encode a batch of tensors in parallel, push them in directory order.
@@ -323,6 +336,62 @@ mod tests {
             off = vo + r * n / 8;
         }
         (m, n, w)
+    }
+
+    /// `Encoding::Keep`: a replaced 2-D tensor is written in its source's
+    /// codec (q8_2f stays q8_2f), a replaced 1-D one in f16 when it was f16,
+    /// and every other tensor is copied byte for byte.
+    #[test]
+    fn keep_encoding_rewrites_only_the_replacements() {
+        let dir = std::env::temp_dir().join(format!("cmfio-keep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (src, out) = (dir.join("src.cmf"), dir.join("out.cmf"));
+        let header: CmfHeader = serde_json::from_value(serde_json::json!({
+            "format": "cmf", "version": 2, "quant_type": "F32",
+            "arch": {
+                "arch_name": "tiny-test", "hidden_size": 32, "intermediate_size": 64, "num_layers": 1,
+                "num_attention_heads": 2, "num_kv_heads": 1, "head_dim": 16, "vocab_size": 10,
+                "layer_types": ["FullAttention"], "rms_norm_eps": 1e-6, "max_position_embeddings": 64
+            }
+        }))
+        .unwrap();
+        let w: Vec<f32> = (0..64 * 32).map(|i| ((i * 37 % 101) as f32 - 50.0) / 64.0).collect();
+        let (dt, wq) = quantize_2d(Quant::Q8_2f, &w, 64, 32);
+        let norm: Vec<u8> = (0..32).flat_map(|i| cortiq_core::quant::f32_to_f16(1.0 + i as f32 / 64.0).to_le_bytes()).collect();
+        let other: Vec<u8> = (0..32u16).flat_map(|i| cortiq_core::quant::f32_to_f16(i as f32).to_le_bytes()).collect();
+        let mut wr = CmfStreamWriter::new(&src, CmfStreamWriter::head_reserve_for(3, 32)).unwrap();
+        wr.push("model.layers.0.mlp.down_proj.weight", dt, &[64, 32], &wq).unwrap();
+        wr.push("model.mtp.hnorm.weight", TensorDtype::F16, &[32], &norm).unwrap();
+        wr.push("model.norm.weight", TensorDtype::F16, &[32], &other).unwrap();
+        wr.finish(&header, None, None).unwrap();
+        let m = CmfModel::open_sharded(&src).unwrap();
+        let w2: Vec<f32> = w.iter().map(|x| -x).collect();
+        rewrite(
+            &m,
+            &out,
+            Encoding::Keep,
+            &|name| {
+                Ok(match name {
+                    "model.layers.0.mlp.down_proj.weight" => Some((vec![64, 32], w2.clone())),
+                    "model.mtp.hnorm.weight" => Some((vec![32], vec![1.0; 32])),
+                    _ => None,
+                })
+            },
+            &|_| {},
+            1,
+        )
+        .unwrap();
+        let o = CmfModel::open_sharded(&out).unwrap();
+        let e = o.tensor("model.layers.0.mlp.down_proj.weight").unwrap();
+        assert_eq!(e.dtype, TensorDtype::Q8_2f, "the replacement keeps its source's codec");
+        let back = tensor_f32(&o, e).unwrap();
+        assert!(back.iter().zip(&w2).all(|(a, b)| (a - b).abs() < 0.02), "the replaced values were written");
+        let h = o.tensor("model.mtp.hnorm.weight").unwrap();
+        assert_eq!(h.dtype, TensorDtype::F16);
+        assert!(tensor_f32(&o, h).unwrap().iter().all(|&x| x == 1.0));
+        let n = o.tensor("model.norm.weight").unwrap();
+        assert_eq!(o.entry_bytes(n), m.entry_bytes(m.tensor("model.norm.weight").unwrap()), "untouched tensors are copied");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -378,6 +378,9 @@ fn mask_and_cut(
         mask_init: knob("INIT", 2.0) as f32,
         tau: 0.5,
         settle: knob("SETTLE", 0.0) as usize,
+        train_from: 0,
+        soft: false,
+        max_batches: 0,
     };
     let intro = format!("{n_train_b} train + {n_eval_b} held-out batches of {}×{} tokens, KL to the teacher's top-{k}", o.batch, o.window);
     let rep = heal_gpu::train_masks(c, &mnet, n_train_b, &step, &val, &cfg, &|l| eprintln!("{l}"), "nvg-train", &intro)?;
