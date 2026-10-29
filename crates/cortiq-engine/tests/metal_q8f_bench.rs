@@ -26,7 +26,12 @@ fn metal_q8f_matvec_cost_by_kind() {
     if let (Some(src), Ok(list)) = (src.as_deref(), std::env::var("CMF_Q8F_KERNELS")) {
         for spec in list.split(',') {
             let p: Vec<&str> = spec.split(':').collect();
-            arms.push((p[0].into(), Some(src), p[1].parse().unwrap(), p[2].parse().unwrap()));
+            arms.push((
+                p[0].into(),
+                Some(src),
+                p[1].parse().unwrap(),
+                p[2].parse().unwrap(),
+            ));
         }
     }
     let reps: usize = std::env::var("CMF_Q8F_REPS")
@@ -69,7 +74,11 @@ fn metal_q8f_matvec_cost_by_kind() {
     for (kind, idxs) in &sets {
         let misaligned = idxs
             .iter()
-            .filter(|&&i| model.entry_abs_offset(&model.tensors[i]).is_none_or(|a| a % 16 != 0))
+            .filter(|&&i| {
+                model
+                    .entry_abs_offset(&model.tensors[i])
+                    .is_none_or(|a| a % 16 != 0)
+            })
             .count();
         if misaligned > 0 {
             println!("{kind}: {misaligned} tensors not 16-byte aligned");
@@ -78,10 +87,11 @@ fn metal_q8f_matvec_cost_by_kind() {
         let mut reference: Option<Vec<f32>> = None;
         for (name, src, rps, sgs) in &arms {
             // One warm-up pass, then the timed reps.
-            let _ = cortiq_engine::gpu_metal::q8f_kernel_bench(&model, idxs, name, *src, *rps, *sgs, 1);
-            let Some((ms, y)) =
-                cortiq_engine::gpu_metal::q8f_kernel_bench(&model, idxs, name, *src, *rps, *sgs, reps)
-            else {
+            let _ =
+                cortiq_engine::gpu_metal::q8f_kernel_bench(&model, idxs, name, *src, *rps, *sgs, 1);
+            let Some((ms, y)) = cortiq_engine::gpu_metal::q8f_kernel_bench(
+                &model, idxs, name, *src, *rps, *sgs, reps,
+            ) else {
                 println!("KERNEL {name} {kind}: unavailable");
                 continue;
             };
@@ -92,7 +102,10 @@ fn metal_q8f_matvec_cost_by_kind() {
                 }
                 Some(r) => {
                     let scale = r.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
-                    r.iter().zip(&y).fold(0f32, |m, (a, b)| m.max((a - b).abs())) / scale
+                    r.iter()
+                        .zip(&y)
+                        .fold(0f32, |m, (a, b)| m.max((a - b).abs()))
+                        / scale
                 }
             };
             println!(
@@ -178,7 +191,10 @@ fn metal_q8_mul_mm_cost_by_kind() {
                 }
                 Some(r) => {
                     let scale = r.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
-                    r.iter().zip(&y).fold(0f32, |m, (a, b)| m.max((a - b).abs())) / scale
+                    r.iter()
+                        .zip(&y)
+                        .fold(0f32, |m, (a, b)| m.max((a - b).abs()))
+                        / scale
                 }
             };
             println!(
@@ -242,21 +258,29 @@ fn metal_q4tp_matvec_cost_by_kind() {
     .iter()
     .map(|k| (k.to_string(), set(k), None))
     .collect();
-    kinds.push(("gate|up".into(), set("mlp.gate_proj"), Some(set("mlp.up_proj"))));
+    kinds.push((
+        "gate|up".into(),
+        set("mlp.gate_proj"),
+        Some(set("mlp.up_proj")),
+    ));
     if let Some(h) = model.tensor_index("model.embed_tokens.weight") {
         kinds.push(("head".into(), vec![h], None));
     }
     for (kind, idxs, up) in &kinds {
         let mut bytes: f64 = idxs.iter().map(|&i| model.tensors[i].nbytes as f64).sum();
         if let Some(u) = up {
-            bytes += u.iter().map(|&i| model.tensors[i].nbytes as f64).sum::<f64>();
+            bytes += u
+                .iter()
+                .map(|&i| model.tensors[i].nbytes as f64)
+                .sum::<f64>();
         }
         let builtin = if up.is_some() {
             "q4tp_matvec_m_gu_gelu"
         } else {
             "q4tp_matvec_m"
         };
-        let mut arms: Vec<(String, Option<&str>, usize, usize)> = vec![(builtin.into(), None, 4, 4)];
+        let mut arms: Vec<(String, Option<&str>, usize, usize)> =
+            vec![(builtin.into(), None, 4, 4)];
         for (n, r, s) in &extra {
             if n.contains("_gu") == up.is_some() {
                 arms.push((n.clone(), src.as_deref(), *r, *s));
@@ -288,7 +312,10 @@ fn metal_q4tp_matvec_cost_by_kind() {
                 }
                 Some(r) => {
                     let scale = r.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
-                    r.iter().zip(&y).fold(0f32, |m, (a, b)| m.max((a - b).abs())) / scale
+                    r.iter()
+                        .zip(&y)
+                        .fold(0f32, |m, (a, b)| m.max((a - b).abs()))
+                        / scale
                 }
             };
             println!(
@@ -311,7 +338,9 @@ fn metal_decode_attend_cost_by_depth() {
     for n in ns {
         for (which, label) in [(0u32, "per-head"), (1, "split-K")] {
             let _ = cortiq_engine::gpu_metal::attend_kernel_bench(16, 4, 256, n, which, 4);
-            if let Some(us) = cortiq_engine::gpu_metal::attend_kernel_bench(16, 4, 256, n, which, 64) {
+            if let Some(us) =
+                cortiq_engine::gpu_metal::attend_kernel_bench(16, 4, 256, n, which, 64)
+            {
                 println!("ATTEND {label:9} n={n:5} {us:8.1} us/dispatch");
             }
         }
@@ -324,13 +353,19 @@ fn metal_decode_attend_cost_by_depth() {
 #[test]
 #[ignore]
 fn metal_gemm_q8_vs_q4tp() {
-    let (Ok(p8), Ok(p4)) = (std::env::var("CMF_BENCH_MODEL"), std::env::var("CMF_BENCH_MODEL2")) else {
+    let (Ok(p8), Ok(p4)) = (
+        std::env::var("CMF_BENCH_MODEL"),
+        std::env::var("CMF_BENCH_MODEL2"),
+    ) else {
         eprintln!("CMF_BENCH_MODEL / CMF_BENCH_MODEL2 not set — skipping");
         return;
     };
     let m8 = Arc::new(CmfModel::open_sharded(&p8).expect("open q8"));
     let m4 = Arc::new(CmfModel::open_sharded(&p4).expect("open q4tp"));
-    let b: usize = std::env::var("CMF_Q8MM_B").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
+    let b: usize = std::env::var("CMF_Q8MM_B")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(512);
     for kind in ["mlp.gate_proj", "mlp.down_proj"] {
         let name = format!("model.layers.0.{kind}.weight");
         let i8 = m8.tensor_index(&name).unwrap();
@@ -339,7 +374,15 @@ fn metal_gemm_q8_vs_q4tp() {
         let flop = 2.0 * (rows * cols * b) as f64;
         for round in 0..6 {
             let (ms8, _) = cortiq_engine::gpu_metal::q8_mm_kernel_bench(
-                &m8, &[i8], "q8_mul_mm", None, b, 64, 32, 128, 8,
+                &m8,
+                &[i8],
+                "q8_mul_mm",
+                None,
+                b,
+                64,
+                32,
+                128,
+                8,
             )
             .unwrap();
             let ms4 =
