@@ -317,3 +317,38 @@ fn metal_decode_attend_cost_by_depth() {
         }
     }
 }
+
+/// Prefill GEMM rate of q8 (`CMF_BENCH_MODEL`, q8_2f file) against q4tp
+/// (`CMF_BENCH_MODEL2`, same model in q4tp) on the layer-0 gate, b rows,
+/// alternating rounds in one process (a drifting GPU loads both alike).
+#[test]
+#[ignore]
+fn metal_gemm_q8_vs_q4tp() {
+    let (Ok(p8), Ok(p4)) = (std::env::var("CMF_BENCH_MODEL"), std::env::var("CMF_BENCH_MODEL2")) else {
+        eprintln!("CMF_BENCH_MODEL / CMF_BENCH_MODEL2 not set — skipping");
+        return;
+    };
+    let m8 = Arc::new(CmfModel::open_sharded(&p8).expect("open q8"));
+    let m4 = Arc::new(CmfModel::open_sharded(&p4).expect("open q4tp"));
+    let b: usize = std::env::var("CMF_Q8MM_B").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
+    for kind in ["mlp.gate_proj", "mlp.down_proj"] {
+        let name = format!("model.layers.0.{kind}.weight");
+        let i8 = m8.tensor_index(&name).unwrap();
+        let i4 = m4.tensor_index(&name).unwrap();
+        let (rows, cols) = (m4.tensors[i4].shape[0], m4.tensors[i4].shape[1]);
+        let flop = 2.0 * (rows * cols * b) as f64;
+        for round in 0..6 {
+            let (ms8, _) = cortiq_engine::gpu_metal::q8_mm_kernel_bench(
+                &m8, &[i8], "q8_mul_mm", None, b, 64, 32, 128, 8,
+            )
+            .unwrap();
+            let ms4 =
+                cortiq_engine::gpu_metal::q4tp_kernel_bench(&m4, i4, b, rows, cols, 2, 8).unwrap();
+            println!(
+                "GEMM {kind:14} b={b} r{round}: q8 {:.2} TFLOP/s | q4tp {:.2} TFLOP/s",
+                flop / ms8 / 1e9,
+                flop / ms4 / 1e9
+            );
+        }
+    }
+}
