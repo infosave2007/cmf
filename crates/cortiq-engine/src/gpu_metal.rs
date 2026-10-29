@@ -898,18 +898,22 @@ kernel void mul_mm_f32nn(
     // stays a buffer param.
     uint rows = is_function_constant_defined(FC_ROWS) ? FC_ROWS : rows_b;
     threadgroup char shmem[8192];
-    threadgroup half* sa = (threadgroup half*)shmem;      // V tile [16k × 64d] packed
-    threadgroup half* sb = (threadgroup half*)(shmem + 4096); // P tile [32m × 16k]
-    const uint NK = 16u;
+    threadgroup half* sa = (threadgroup half*)shmem;      // V tile [32k × 64d] packed
+    threadgroup half* sb = (threadgroup half*)(shmem + 4096); // P tile [32m × 32k]
+    // K steps of 32 with 16-byte loads (the q8 GEMM's operating point);
+    // the 8x8 blocks are fed to the MMAs in the same k order as 16-wide
+    // steps would, so the sums are the same.
+    const uint NK = 32u;
     uint r0 = tg.y * 64u;   // d tile
     uint r1 = tg.x * 32u;   // m tile
     uint nr1 = min(nb - r1, 32u);
     uint lr1 = min(tiitg / 4u, nr1 - 1u);
-    // V tile loader coords: 128 threads cover 16×64 halfs, 8 per thread.
-    // Thread t loads row kv = t/8, col span 8*(t%8).
-    uint vk = tiitg / 8u;       // 0..15 k-row in tile
-    uint vd = 8u * (tiitg % 8u); // 0..56 d-col start
-    uint iyp = 4u * (tiitg % 4u); // P: 4 floats per thread per row
+    // V tile loader: 128 threads cover 32×64, 16 per thread: k-row
+    // vk = t/4, d span 16·(t%4). P: 8 floats per thread per row.
+    uint vk = tiitg / 4u;
+    uint vd = 16u * (tiitg % 4u);
+    uint iyp = 8u * (tiitg % 4u);
+    bool dfull = r0 + 64u <= rows;
     simdgroup_half8x8 ma[4];
     simdgroup_half8x8 mb[2];
     simdgroup_float8x8 mc[8];
@@ -918,51 +922,55 @@ kernel void mul_mm_f32nn(
     }
     for (uint k0 = 0; k0 < kdim; k0 += NK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        // V tile: [k][d] 8x8-block packed: block ib = 8*(d_blk) + k_blk?
-        // Keep the SAME packing convention as sa in the nt kernel:
-        // ma fragment i covers d-range [8i, 8i+8) of the sg's 32-wide
-        // strip; blocks indexed ib = 8*dblk + kblk over [64d × 16k]…
-        // simpler: store [d][k] transposed so the fragment layout matches
-        // the nt kernel exactly (ma loads want [k][d(row-major 8x8)] via
-        // transpose=false on [d][k]? — no: multiply(mb[m,k], ma[k,d])
-        // needs ma fragment [k][d]. Store blocks as [k][d]:
-        // ib = 8*sxd + syk with row=k%8, col=d%8.
+        bool kfull = k0 + NK <= kdim;
+        // V blocks k-major (ib = 8·kblk + dblk), [k][d] inside — the nt
+        // kernel's sa convention (lsma += 8·64 per k block).
         {
-            uint dblk = vd / 8u;        // 0..7
-            uint kblk = vk / 8u;        // 0..1
-            // Block index MUST be k-major (ib = 8·kblk + dblk): the
-            // compute loop advances k with lsma += 8·64 and picks the
-            // d-half with 4·64·(sgitg%2) — same convention as sa in nt.
-            uint ib = 8u * kblk + dblk;
+            uint kblk = vk / 8u;
             uint krow = vk % 8u;
-            threadgroup half* dst = sa + 64u * ib + 8u * krow;
+            uint db = vd / 8u;
+            threadgroup half* d0 = sa + 64u * (8u * kblk + db) + 8u * krow;
+            threadgroup half* d1 = sa + 64u * (8u * kblk + db + 1u) + 8u * krow;
             device const float* vr = vw + (ulong)(k0 + vk) * rows + r0 + vd;
-            bool kok = k0 + vk < kdim;
-            for (uint i = 0; i < 8u; ++i) {
-                bool ok = kok && r0 + vd + i < rows;
-                dst[i] = ok ? (half)vr[i] : (half)0.0f;
+            if (kfull && dfull) {
+                device const packed_float4* v4 = (device const packed_float4*)vr;
+                float4 a = float4(v4[0]), b = float4(v4[1]);
+                float4 e = float4(v4[2]), f = float4(v4[3]);
+                d0[0] = (half)a.x; d0[1] = (half)a.y; d0[2] = (half)a.z; d0[3] = (half)a.w;
+                d0[4] = (half)b.x; d0[5] = (half)b.y; d0[6] = (half)b.z; d0[7] = (half)b.w;
+                d1[0] = (half)e.x; d1[1] = (half)e.y; d1[2] = (half)e.z; d1[3] = (half)e.w;
+                d1[4] = (half)f.x; d1[5] = (half)f.y; d1[6] = (half)f.z; d1[7] = (half)f.w;
+            } else {
+                bool kok = k0 + vk < kdim;
+                for (uint i = 0; i < 8u; ++i) {
+                    d0[i] = kok && r0 + vd + i < rows ? (half)vr[i] : (half)0.0f;
+                    d1[i] = kok && r0 + vd + 8u + i < rows ? (half)vr[8u + i] : (half)0.0f;
+                }
             }
         }
-        // P tile [32m × 16k]: blocks ib = 4*kblk… same as sb in nt:
-        // thread t: row m = t/4, 4 floats at 4*(t%4).
+        // P blocks ib = 4·kblk + mblk (the nt kernel's sb convention).
         {
-            uint kb4 = iyp;
-            uint sx = kb4 / 8u;         // which 8-k block half? kb4 in {0,4,8,12}
-            uint off = kb4 % 8u;
+            uint sx = tiitg % 4u;
             uint sy = (tiitg / 4u) / 8u;
             uint ly = (tiitg / 4u) % 8u;
-            uint ib = 4u * sx + sy;
-            device const float* pr = xs + (ulong)(r1 + lr1) * kdim + k0 + kb4;
-            threadgroup half* dst = sb + 64u * ib + 8u * ly + off;
-            for (uint i = 0; i < 4u; ++i) {
-                dst[i] = k0 + kb4 + i < kdim ? (half)pr[i] : (half)0.0f;
+            threadgroup half* dst = sb + 64u * (4u * sx + sy) + 8u * ly;
+            device const float* pr = xs + (ulong)(r1 + lr1) * kdim + k0 + iyp;
+            if (kfull) {
+                device const packed_float4* p4 = (device const packed_float4*)pr;
+                float4 a = float4(p4[0]), b = float4(p4[1]);
+                dst[0] = (half)a.x; dst[1] = (half)a.y; dst[2] = (half)a.z; dst[3] = (half)a.w;
+                dst[4] = (half)b.x; dst[5] = (half)b.y; dst[6] = (half)b.z; dst[7] = (half)b.w;
+            } else {
+                for (uint i = 0; i < 8u; ++i) {
+                    dst[i] = k0 + iyp + i < kdim ? (half)pr[i] : (half)0.0f;
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         threadgroup const half* lsma = sa + 4u * 64u * (sgitg % 2u);
         threadgroup const half* lsmb = sb + 2u * 64u * (sgitg / 2u);
         #pragma clang loop unroll(full)
-        for (short ik = 0; ik < 2; ++ik) {
+        for (short ik = 0; ik < 4; ++ik) {
             simdgroup_barrier(mem_flags::mem_none);
             #pragma clang loop unroll(full)
             for (short i = 0; i < 4; ++i) {
