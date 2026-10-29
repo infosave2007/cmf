@@ -9328,7 +9328,7 @@ pub fn capture_begin(lo: usize, hi: usize, hidden: usize, ne: usize) -> bool {
         layout: None,
         module: &m,
         entry_point: Some("cap_rows"),
-        compilation_options: Default::default(),
+        compilation_options: crate::gpu_wgpu::pco(),
         cache: None,
     });
     let width = hidden + ne;

@@ -2206,7 +2206,7 @@ fn eig_pipes(c: &Ctx) -> Option<&'static EigPipes> {
                 layout: Some(&pl),
                 module: &m,
                 entry_point: Some(ep),
-                compilation_options: Default::default(),
+                compilation_options: crate::gpu_wgpu::pco(),
                 cache: None,
             });
             if let Some(e) = pollster::block_on(sc.pop()) {
