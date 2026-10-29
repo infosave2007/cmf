@@ -414,6 +414,10 @@ pub struct Pipeline {
     /// layers). Set at load for Spark-X2.5 only (`CMF_SWA_TRIM=0` turns
     /// it off); None keeps every row, as every other model always has.
     pub swa_trim: Option<(usize, usize)>,
+    /// Prompt end of the current turn: the tail trim keeps every row a
+    /// rollback to it still reads (`LayerKvCache::trim_window_anchored`),
+    /// so the next chat turn can drop this turn's answer.
+    swa_trim_anchor: usize,
     /// Explicit local/global schedule for architectures that cannot be
     /// represented by Gemma's every-Nth-global convention.
     pub sliding_layers: Option<Vec<bool>>,
@@ -3774,6 +3778,7 @@ impl Pipeline {
             attn_scale: 1.0 / (head_dim as f32).sqrt(),
             swa: None,
             swa_trim: None,
+            swa_trim_anchor: usize::MAX,
             sliding_layers: None,
             no_rope_layers: None,
             anchor_core: None,
@@ -4052,6 +4057,8 @@ impl Pipeline {
             let h = &self.kv_history;
             if !h.is_empty() && h.len() < input_ids.len() && input_ids[..h.len()] == h[..] {
                 (h.len(), self.kv_history_device)
+            } else if !h.is_empty() && !self.kv_history_device {
+                (self.rollback_prefix_len(input_ids), false)
             } else {
                 (0, false)
             }
@@ -4066,6 +4073,51 @@ impl Pipeline {
                 self.device_sequence_position()
             );
             return 0;
+        }
+        n
+    }
+
+    /// Positions a turn whose ids DIVERGE from the consumed prefix keeps:
+    /// their longest common prefix, when every layer can drop its rows past
+    /// it exactly — full attention whose f32 rows the host owns (no wgpu
+    /// mirror ahead of the host, no recurrent, O(1) or bounded state) and
+    /// every trimmed sliding tail still holding the window the query at the
+    /// cut reads. A chat app re-renders the previous answer through the
+    /// template (a thinking model's history drops its `<think>` block), so a
+    /// conversation almost never extends token for token: extension-only
+    /// reuse re-prefilled the whole history every turn. One id at least is
+    /// left to prefill. `CMF_KV_ROLLBACK=0` keeps extension-only reuse.
+    fn rollback_prefix_len(&self, input_ids: &[u32]) -> usize {
+        if std::env::var("CMF_KV_ROLLBACK").as_deref() == Ok("0")
+            || self.device_sequence_position().is_some()
+        {
+            return 0;
+        }
+        let h = &self.kv_history;
+        let lcp = h.iter().zip(input_ids).take_while(|(a, b)| a == b).count();
+        let n = lcp.min(input_ids.len().saturating_sub(1));
+        if n == 0 || self.kv_cache.layers.len() < self.num_layers {
+            return 0;
+        }
+        let kv_id = self.graph_kv_id;
+        for li in 0..self.num_layers {
+            let l = &self.kv_cache.layers[li];
+            let tail_ok = l.base() == 0
+                || self
+                    .layer_window(li)
+                    .is_some_and(|w| l.base() + w <= n + 1);
+            if !matches!(self.weights.layers[self.phys_layer(li)].attn, AttnKind::Full { .. })
+                || l.o1.is_some()
+                || l.bounded.is_some()
+                || !l.linear_state.is_empty()
+                || l.mode != crate::kv_cache::KvMode::F32
+                || l.pos_len() != h.len()
+                || !tail_ok
+                || crate::gpu::graph_kv_stored(kv_id, li).is_some()
+                || crate::gpu::graph_state_resident(kv_id, li)
+            {
+                return 0;
+            }
         }
         n
     }
@@ -4632,6 +4684,23 @@ impl Pipeline {
         if reuse_from > 0 && !self.prepare_kv_reuse(reuse_from) {
             reuse_from = 0;
         }
+        // A diverging turn (`rollback_prefix_len`): drop every row past the
+        // common prefix, so the tail prefill appends at `reuse_from`.
+        if reuse_from > 0 && !self.bounded_native() && reuse_from < self.kv_history.len() {
+            for l in &mut self.kv_cache.layers {
+                let d = l.pos_len() - reuse_from;
+                l.truncate_last(d);
+            }
+            if std::env::var("CMF_PREFILL_PROF").is_ok() {
+                eprintln!(
+                    "kv-reuse: rolled back {} answer position(s) to the common prefix",
+                    self.kv_history.len() - reuse_from
+                );
+            }
+            self.kv_history.truncate(reuse_from);
+            self.graph_logits = None;
+        }
+        self.swa_trim_anchor = input_ids.len();
         self.last_prefill_tokens = input_ids.len() - reuse_from;
         let bounded_native = self.bounded_native();
         if reuse_from == 0 {
@@ -11529,7 +11598,7 @@ impl Pipeline {
         }
         for li in 0..self.num_layers.min(self.kv_cache.layers.len()) {
             if let Some(w) = self.layer_window(li) {
-                self.kv_cache.layers[li].trim_window(w, slack, align);
+                self.kv_cache.layers[li].trim_window_anchored(w, slack, align, self.swa_trim_anchor);
             }
         }
     }
