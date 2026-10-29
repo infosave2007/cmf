@@ -51,6 +51,15 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Spark-X2.6 на Apple silicon (0.8.43)
+
+[Spark-X2.6-4B](https://huggingface.co/infosave/Spark-X2.6-4B-cmf) на Mac mini
+M4 (24 ГБ): файл по умолчанию q8_2f обрабатывает промпт в 1000 токенов на ~205
+ток/с и генерирует 16–19 ток/с; файл q4tp генерирует ~30 ток/с. Ход чата через
+`cortiq serve` считает только то, что изменилось с прошлого хода (история 2.3k
+токенов: 0.6 с вместо 11 с). Замеры и отвергнутые варианты —
+[docs/SPARK26_METAL.md](docs/SPARK26_METAL.md).
+
 ## Диффузионные модели по блокам (0.8.40)
 
 [Clover-35B-A3B-Preview](https://huggingface.co/infosave/Clover-35B-A3B-Preview-cmf)
