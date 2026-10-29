@@ -531,6 +531,27 @@ fn permute_rows(@builtin(global_invocation_id) g: vec3<u32>) {
     if (p.u6 == 0u) { C[t] = A[U[j] * p.u1 + c]; } else { C[U[j] * p.u1 + c] = A[t]; }
 }
 
+// C[u5 + i*u4 + j] = (A[ra*u2 + cb] + (ra == cb) * f0) * R[i] * S[j]: ra = U[u7 + i]
+// with u6 & 1 (else i), cb = U[u8 + j] with u6 & 2 (else j); u6 & 4 row scale,
+// u6 & 8 column scale. u0 rows, u1 cols.
+@compute @workgroup_size(256)
+fn gather(@builtin(global_invocation_id) g: vec3<u32>) {
+    let t = idx(g);
+    if (t >= p.u0 * p.u1) { return; }
+    let i = t / p.u1;
+    let j = t % p.u1;
+    let fl = p.u6;
+    var ra = i;
+    var cb = j;
+    if ((fl & 1u) != 0u) { ra = U[p.u7 + i]; }
+    if ((fl & 2u) != 0u) { cb = U[p.u8 + j]; }
+    var v = A[ra * p.u2 + cb];
+    if (ra == cb) { v = v + p.f0; }
+    if ((fl & 4u) != 0u) { v = v * R[i]; }
+    if ((fl & 8u) != 0u) { v = v * S[j]; }
+    C[p.u5 + i * p.u4 + j] = v;
+}
+
 // C (cols x rows) = A (rows x cols) transposed; 32x32 tiles. u0 rows, u1 cols.
 @compute @workgroup_size(256)
 fn transpose(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
@@ -610,7 +631,7 @@ fn elt(c: &Ctx) -> Option<&'static Mod> {
         ELT_SRC,
         &[
             "scale_rc", "rowdot", "rownorm", "colsum_part", "frob_part", "diag", "equil", "make_uc", "permute_rows", "transpose",
-            "trsv_diag", "trsv_upd",
+            "trsv_diag", "trsv_upd", "gather",
         ],
     )
 }
@@ -815,6 +836,46 @@ pub fn permute_rows(a: &DMat, c: &DMat, perm: &wgpu::Buffer, scatter: bool) {
         uni: uni(&[a.r as u32, a.c as u32, 0, 0, 0, 0, scatter as u32], &[]),
         bufs: vec![(1, &a.buf), (5, &c.buf), (7, perm)],
         grid: elt_fold(a.r * a.c),
+    };
+    train_ops::run(cx, &[dp]);
+}
+
+/// Index sets of [`gather`]: one u32 buffer, rows read from `idx[ro..]`
+/// and columns from `idx[co..]` (an absent offset = the identity).
+pub struct Pick<'a> {
+    pub idx: &'a wgpu::Buffer,
+    pub ro: Option<usize>,
+    pub co: Option<usize>,
+}
+
+/// `C[oc + i·ldc + j] = (A[ra·lda + cb] + [ra = cb]·diag)·R[i]·S[j]` over a
+/// `rows × cols` output, `ra`/`cb` taken through `pick` (a sub-block of a
+/// Gram by index sets, or chosen columns of a weight), the row / column
+/// scalings when given.
+#[allow(clippy::too_many_arguments)]
+pub fn gather(rows: usize, cols: usize, a: (&DMat, usize), pick: Option<&Pick>, diag: f32, r: Option<&DMat>, s: Option<&DMat>, c: (&DMat, usize, usize)) {
+    if rows == 0 || cols == 0 {
+        return;
+    }
+    let cx = dev();
+    let md = elt(cx).expect("nvg elt pipelines");
+    let d = dummy(cx);
+    let (ro, co) = pick.map_or((None, None), |p| (p.ro, p.co));
+    let flags = ro.is_some() as u32 | ((co.is_some() as u32) << 1) | ((r.is_some() as u32) << 2) | ((s.is_some() as u32) << 3);
+    let dp = Disp {
+        pipe: &md.p["gather"],
+        uni: uni(
+            &[rows as u32, cols as u32, a.1 as u32, 0, c.2 as u32, c.1 as u32, flags, ro.unwrap_or(0) as u32, co.unwrap_or(0) as u32],
+            &[diag],
+        ),
+        bufs: vec![
+            (1, &a.0.buf),
+            (3, r.map(|x| &x.buf).unwrap_or(d)),
+            (4, s.map(|x| &x.buf).unwrap_or(d)),
+            (5, &c.0.buf),
+            (7, pick.map(|p| p.idx).unwrap_or(d)),
+        ],
+        grid: elt_fold(rows * cols),
     };
     train_ops::run(cx, &[dp]);
 }
@@ -1195,7 +1256,7 @@ fn li(i: u32, j: u32) -> u32 { return i * (i + 1u) / 2u + j; }
 
 // Factor the bs x bs (bs = min(128, n - k0)) diagonal block of C (n = u0,
 // k0 = u1) in workgroup memory (packed lower triangle): L11 back into C
-// (lower), then L11^-1 in place (dtrtri order, right to left) into O
+// (lower), then L11^-1 in place (dtrtri order, right to left) into O at u2
 // (128 x 128, dense, zero above). A pivot that is not positive sets FLAG.
 @compute @workgroup_size(256)
 fn chol_blk(@builtin(local_invocation_index) t: u32) {
@@ -1251,7 +1312,7 @@ fn chol_blk(@builtin(local_invocation_index) t: u32) {
         let j = e % 128u;
         var v = 0.0;
         if (i < bs && j <= i) { v = lt[li(i, j)]; }
-        O[e] = v;
+        O[p.u2 + e] = v;
     }
 }
 "#;
@@ -1266,27 +1327,51 @@ fn chol_mod(c: &Ctx) -> Option<&'static Mod> {
 /// only) through the f32 GEMM. One submission; `Some(false)` when a pivot
 /// failed. The strict upper triangle is left undefined.
 pub fn chol_blocked(a: &DMat) -> Option<bool> {
+    chol_blocked_inv(a, None)
+}
+
+/// Floats of the per-block inverses [`chol_blocked_inv`] keeps for an `n×n`
+/// factor: one dense 128×128 block (zero above its diagonal) per 128 rows.
+pub fn chol_inv_len(n: usize) -> usize {
+    n.div_ceil(128) * 128 * 128
+}
+
+/// [`chol_blocked`] that also leaves `L_bb⁻¹` of every diagonal block in
+/// `inv` (block b at `b·128²`, [`chol_inv_len`] floats) — what a blocked
+/// triangular solve multiplies by.
+pub fn chol_blocked_inv(a: &DMat, inv: Option<&DMat>) -> Option<bool> {
     let n = a.r;
     let cx = dev();
     let md = chol_mod(cx)?;
     let flag = DMat::zeros(1, 4);
-    let linv = DMat::zeros(128, 128);
+    let own;
+    let linv = match inv {
+        Some(m) => {
+            assert!(m.len() >= chol_inv_len(n), "chol_blocked_inv: inverse storage too small");
+            m
+        }
+        None => {
+            own = DMat::zeros(128, 128);
+            &own
+        }
+    };
     let panel = DMat::zeros(n.saturating_sub(128).max(1), 128);
     let mut ds: Vec<Disp> = Vec::new();
     let mut k0 = 0;
     while k0 < n {
         let bs = 128.min(n - k0);
         let k1 = k0 + bs;
+        let io = if inv.is_some() { (k0 / 128) * 128 * 128 } else { 0 };
         ds.push(Disp {
             pipe: &md.p["chol_blk"],
-            uni: uni(&[n as u32, k0 as u32], &[]),
+            uni: uni(&[n as u32, k0 as u32, io as u32], &[]),
             bufs: vec![(5, &a.buf), (6, &linv.buf), (9, &flag.buf)],
             grid: (1, 1, 1),
         });
         if k1 < n {
             let rest = n - k1;
             // panel = A21 · L11⁻ᵀ
-            ds.push(gemm_disp(cx, rest, bs, bs, 1.0, V { m: a, off: k1 * n + k0, ld: n, t: false }, V { m: &linv, off: 0, ld: 128, t: true }, 0.0, &panel, 0, 128, None, false));
+            ds.push(gemm_disp(cx, rest, bs, bs, 1.0, V { m: a, off: k1 * n + k0, ld: n, t: false }, V { m: linv, off: io, ld: 128, t: true }, 0.0, &panel, 0, 128, None, false));
             // A21 ← panel
             let el = elt(cx)?;
             ds.push(Disp {
