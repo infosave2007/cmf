@@ -2980,7 +2980,11 @@ mod tests {
             full.append(&k, &v, &alive);
             t.append(&k, &v, &alive);
             t.trim_window_anchored(w, slack, align, anchor);
-            assert!(t.base() + w <= anchor - slack + 1, "base {} at {p}", t.base());
+            assert!(
+                t.base() + w <= anchor - slack + 1,
+                "base {} at {p}",
+                t.base()
+            );
         }
         let back = anchor - slack;
         t.truncate_last(t.pos_len() - back);
