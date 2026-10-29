@@ -86,8 +86,10 @@ model (by activation illumination, or by a trained DTG-MA mask with
 form, and the model is healed on the answers; held-out answers score it and
 gate the output. MoE models drop the experts the task does not route to. The
 output keeps the source's codec — quantize it separately. The device stages run
-on NVIDIA (Vulkan) and on Apple Silicon (Metal). See the
-[compress guide](docs/COMPRESS.ru.md).
+on NVIDIA (Vulkan) and on Apple Silicon (Metal) — since 0.8.42 the fold itself
+too: one Qwen3.8-27B layer folds in 12 s on a Mac mini M4 instead of ~11 min
+on its CPU, and with `--keep-grams` several target sizes fold from one
+illumination. See the [compress guide](docs/COMPRESS.ru.md).
 
 ## Prompt-calibrated MTP draft compaction (0.8.38)
 
