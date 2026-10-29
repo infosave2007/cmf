@@ -5,6 +5,43 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.42] — 2026-10-29
+
+### Changed
+- `cortiq compress`: the S3 fold and the S1 refit curves run on the trainer's
+  GPU (Vulkan, Metal) in f32 — Jacobi-equilibrated blocked Cholesky, block
+  triangular solves as GEMMs, the read-out update solved for h right-hand
+  sides instead of p, every error a trace. Same widths, ridges and errors as
+  the f64 host fold on Qwen3.5-0.8B (all 24 layers; S3 21 s instead of 121 s);
+  one Qwen3.8-27B layer (n 17408 → 4352) takes 12 s on a Mac mini M4 instead
+  of ~11 min on its CPU. `CMF_FOLD_ON=host` keeps the host.
+- The device illumination sizes its Gram accumulators by what the f16
+  weights leave of the card (it took half the budget regardless — a 27B on
+  96 GB would not have fit), and a capture split into passes resumes from the
+  residual stream where the previous pass stopped: every layer runs once
+  (Grams and curves bit-identical to one pass).
+- The work directory is made absolute: stage records store paths, and a run
+  sharing S0/S1 from another directory could not find them.
+
+### Added
+- `--keep-grams auto|on|off`: S1's Grams stay on disk whenever they take
+  under half the free space (the fixed 16 GB cap made a 27B illuminate twice),
+  so several targets fold from one illumination.
+- `scripts/compress_q27_14b_pod.sh` (check / gate / heal / clean: fold-only
+  points from one illumination, then heal and q4tp of the chosen one),
+  `scripts/pod_setup_q27.sh`, `scripts/pack_q27_pod.sh` — Qwen3.8-27B → 14B
+  for code on one RTX PRO 6000, dry-run end to end on Qwen3.5-0.8B.
+- `nvg_dev::gather` (index-set sub-blocks with ridge and scalings),
+  `nvg_dev::chol_blocked_inv` (the per-block inverses a blocked solve
+  multiplies by), `nvg_train::capture_grams_range`.
+
+### Documentation
+- `docs/COMPRESS.ru.md`: the device fold and its timings, large-model
+  illumination, `--keep-grams`, and the API-teacher tokenizer rule — a sibling
+  of the same family is not enough (Qwen3.8-27B has 7 added tokens more than
+  Qwen3.5-0.8B); a tokenizer carrier CMF stands in for a model not on the
+  machine.
+
 ## [0.8.41] — 2026-10-29
 
 ### Added
