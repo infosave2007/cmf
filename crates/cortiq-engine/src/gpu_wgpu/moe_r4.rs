@@ -348,7 +348,7 @@ pub(crate) fn bucket_count(n_exp: usize, has_shared: bool) -> Option<usize> {
     (n_exp > 0 && buckets <= MOEG_MAX_BUCKETS).then_some(buckets)
 }
 
-fn moeg_wgsl() -> String {
+pub(crate) fn moeg_wgsl() -> String {
     let mut gu_init = String::new();
     let mut gu_body = String::new();
     let mut gu_out = String::new();

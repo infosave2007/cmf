@@ -13,6 +13,8 @@ use crate::inference;
 /// child module so it runs on the pipeline's own helpers.
 #[path = "mimo_mtp.rs"]
 pub mod mimo_mtp;
+#[path = "clover.rs"]
+pub mod clover;
 use crate::kv_cache::KvCache;
 use crate::linear_core::{
     GdnCfg, GdnWeights, ShortConvCfg, ShortConvWeights, VmfPhaseCfg, VmfPhaseWeights, gdn_forward,
@@ -213,6 +215,10 @@ pub struct Pipeline {
     dsv41_prefill: Option<(Vec<Option<Vec<f32>>>, Vec<bool>)>,
     /// Qwen3.8-Flash-Next owns four residual streams plus QSA/PLE state;
     /// the generic single-residual layer loop cannot represent it.
+    /// Block-diffusion generation (Clover): preview weights and the
+    /// decoding controls; `None` on every causal model.
+    pub(crate) clover: Option<std::sync::Arc<clover::Clover>>,
+    clover_stats: clover::CloverStats,
     pub qwen4_exp: Option<
         Box<(
             crate::qwen4_exp::Globals,
@@ -3705,6 +3711,8 @@ impl Pipeline {
             dsv41_vision: None,
             dsv41_prefill: None,
             qwen4_exp: None,
+            clover: None,
+            clover_stats: clover::CloverStats::default(),
             dsv4_mtp: Vec::new(),
             dspark: None,
             dspark_pending: Vec::new(),
@@ -4588,6 +4596,14 @@ impl Pipeline {
         // narrowed file whose one segment is always on carries exactly
         // such a mask — drop it here rather than pay 5x for a no-op.
         let task_mask = self.drop_open_mask(task_mask);
+        // A block-diffusion model generates whole blocks by denoising
+        // previews, never one causal token at a time.
+        if self.clover.is_some() {
+            if prompt_rows.is_some() || task_mask.is_some() {
+                return Err("block-diffusion generation takes token prompts without task masks".into());
+            }
+            return self.clover_generate(input_ids, max_tokens, on_token);
+        }
 
         // Cross-turn KV reuse: a chat app resends the whole history
         // every turn; when the new ids strictly EXTEND what the cache
@@ -7825,6 +7841,7 @@ impl Pipeline {
                     lm_rows,
                     final_norm: &final_norm,
                     logits_out: &mut logits,
+                    pick: None,
                 }),
             )
         };
@@ -7838,6 +7855,7 @@ impl Pipeline {
                 lm_rows,
                 final_norm: &final_norm,
                 logits_out: &mut logits,
+                pick: None,
             }),
         );
         match verify_outcome {
@@ -9219,6 +9237,71 @@ impl Pipeline {
             &self.inv_freq,
             self.pool.as_deref(),
         )
+    }
+
+    /// GPTQ calibration capture of an ordinary MoE stack (Qwen3.5/3.6
+    /// MoE, Clover): `ids` from position 0 through the batched device graph
+    /// in prefill-sized chunks, the MoE input rows and router logits of
+    /// layers `lo..hi` copied out after routing. Returns per layer
+    /// `[ids.len()][hidden + n_experts]`; the sequence state is left fresh.
+    #[cfg(feature = "gpu")]
+    pub fn moe_capture(&mut self, ids: &[u32], lo: usize, hi: usize) -> Result<Vec<Vec<f32>>, String> {
+        use crate::gpu_wgpu::clover as cap;
+        let (hs, hi) = (self.hidden_size, hi.min(self.num_layers));
+        let ne = (lo..hi)
+            .find_map(|li| match &self.weights.layers[self.phys_layer(li)].ffn {
+                FfnKind::Moe(m) => Some(m.experts.len()),
+                _ => None,
+            })
+            .ok_or("no MoE layer in the capture range")?;
+        let chunk = self.prefill_chunk().max(1);
+        self.clear_sequence_state();
+        if !cap::moe_capture_begin(lo, hi, chunk, hs, ne) {
+            return Err("capture unavailable (no wgpu device)".into());
+        }
+        let mut out: Vec<Vec<f32>> = (lo..hi).map(|_| Vec::with_capacity(ids.len() * (hs + ne))).collect();
+        let res = (|| {
+            for (ci, part) in ids.chunks(chunk).enumerate() {
+                let mut hiddens = Vec::with_capacity(part.len() * hs);
+                for &id in part {
+                    hiddens.extend_from_slice(&self.embed_single(id));
+                }
+                let positions: Vec<usize> = (ci * chunk..ci * chunk + part.len()).collect();
+                match self.try_batch_graph_wgpu(&mut hiddens, &positions, part.len(), None) {
+                    crate::gpu::BatchGraphOutcome::Completed => {}
+                    _ => return Err("the batched graph declined the calibration forward (VRAM budget?)".to_string()),
+                }
+                let (rows, written) = cap::moe_capture_read(part.len()).ok_or("capture readback")?;
+                if written < hi - lo {
+                    return Err(format!("{written} of {} captured layers ran through the device MoE arm", hi - lo));
+                }
+                for (o, r) in out.iter_mut().zip(rows) {
+                    o.extend_from_slice(&r);
+                }
+            }
+            Ok(())
+        })();
+        cap::moe_capture_end();
+        self.clear_sequence_state();
+        res.map(|_| out)
+    }
+
+    /// Expert directory triples (gate, up, down) of an ordinary MoE layer,
+    /// routed and shared.
+    pub fn moe_expert_dirs(
+        &self,
+        li: usize,
+    ) -> Option<(Vec<(usize, usize, usize)>, Option<(usize, usize, usize)>)> {
+        let FfnKind::Moe(m) = &self.weights.layers.get(self.phys_layer(li))?.ffn else {
+            return None;
+        };
+        let dirs = |d: &DenseFfn| Some((d.gate_proj.model_idx()?, d.up_proj.model_idx()?, d.down_proj.model_idx()?));
+        let routed = m.experts.iter().map(dirs).collect::<Option<Vec<_>>>()?;
+        let shared = match &m.shared {
+            Some((se, _)) => Some(dirs(se)?),
+            None => None,
+        };
+        Some((routed, shared))
     }
 
     /// Expert directory triples of a `qwen4_exp` layer (routed, shared).
@@ -13318,6 +13401,7 @@ impl Pipeline {
                         dv: cfg.value_head_dim,
                         kk: cfg.conv_kernel,
                         cpu_state: &self.kv_cache.layers[self.phys_layer(li)].linear_state,
+                        preview: None,
                     }
                 }
                 AttnKind::ShortConv(w) => {
@@ -15285,6 +15369,7 @@ impl Pipeline {
                             dv: cfg.value_head_dim,
                             kk: cfg.conv_kernel,
                             cpu_state: &self.kv_cache.layers[self.phys_layer(li)].linear_state,
+                            preview: self.clover.as_ref().and_then(|c| c.graph_preview(li)),
                         }
                     }
                     _ => return None,

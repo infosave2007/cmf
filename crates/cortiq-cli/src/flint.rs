@@ -590,6 +590,7 @@ mod tests {
                     router_resonance: false,
                 }),
                 qwen4_exp: None,
+                block_diffusion: None,
                 deepseek_v41: None,
                 linear_core: None,
                 anchor_core: None,

@@ -1103,8 +1103,9 @@ enum Commands {
         #[arg(long)]
         q4tp_debias: bool,
     },
-    /// GPTQ for the experts of a Flash-Next-class MoE (qwen4_exp) or of
-    /// DeepSeek-V4.1 (deepseek_v41), routed and shared: `--codec q2tp`
+    /// GPTQ for the experts of a Flash-Next-class MoE (qwen4_exp), of
+    /// DeepSeek-V4.1 (deepseek_v41) or of a Qwen3.5/3.6-MoE stack (Clover
+    /// included), routed and shared: `--codec q2tp`
     /// (gate/up q2tp, down q4tp) or `q4tp`, on the GPU; the calibration file
     /// (a q4tp CMF of the model) supplies the activations and every
     /// non-expert tensor, the original safetensors checkpoint the
@@ -9251,6 +9252,15 @@ async fn cmd_run(
                     .unwrap()
                     .map(|t| t.duration_since(started).as_secs_f64());
                 match first {
+                    // Whole blocks arrive at once: the per-token decode
+                    // rate of a causal model has no meaning here.
+                    Some(ttft) if pipeline.is_block_diffusion() => println!(
+                        "\n[{} tokens · first block {:.1} s · overall {:.1} tok/s, finish: {}]",
+                        r.tokens_generated,
+                        ttft,
+                        r.tokens_generated as f64 / secs.max(1e-9),
+                        r.finish_reason
+                    ),
                     Some(ttft) if r.tokens_generated >= 2 => println!(
                         "\n[{} tokens · first token {:.1} s · decode {:.1} tok/s · overall {:.1} tok/s, finish: {}]",
                         r.tokens_generated,
@@ -9265,6 +9275,32 @@ async fn cmd_run(
                         r.tokens_generated as f64 / secs.max(1e-9),
                         r.finish_reason
                     ),
+                }
+                if pipeline.is_block_diffusion() {
+                    let st = pipeline.clover_stats();
+                    let per = |x: f64| 1e3 * x / st.passes.max(1) as f64;
+                    println!(
+                        "[block diffusion: {} blocks · {} passes · {:.2} tokens/pass · {:.1} tok/s after the prompt · \
+                         pass {:.0} ms + pick {:.1} ms · block commits {:.2} s · prompt {:.1} s · device layers {}]",
+                        st.blocks,
+                        st.passes,
+                        r.tokens_generated as f64 / st.passes.max(1) as f64,
+                        st.denoise_tok_s(r.tokens_generated),
+                        per(st.preview_s),
+                        per(st.pick_s),
+                        st.commit_s,
+                        st.prompt_s,
+                        st.device_layers
+                    );
+                    if st.device_layers == 0 && st.passes > 0 {
+                        println!(
+                            "[host passes: gdn {:.0} · attention {:.0} · moe {:.0} · head {:.0} ms/pass]",
+                            per(st.gdn_s),
+                            per(st.attn_s),
+                            per(st.moe_s),
+                            per(st.head_s)
+                        );
+                    }
                 }
                 #[cfg(feature = "gpu")]
                 cortiq_engine::dsv4::profile_report();
@@ -10058,6 +10094,33 @@ async fn cmd_info(model_path: &str, tensors: Option<&str>) -> anyhow::Result<()>
             (None, _) => "—".to_string(),
         }
     );
+    if let Some(bd) = &arch.block_diffusion {
+        println!(
+            "  Diffusion:   {} over {}-token blocks · threshold {} · mask id {} · expert coreset {}",
+            bd.algorithm,
+            bd.block_size,
+            bd.threshold,
+            bd.mask_token_id,
+            if bd.coreset_enabled {
+                format!("top-p {}", bd.coreset_top_p)
+            } else {
+                "off".to_string()
+            }
+        );
+        println!(
+            "               response penalties: presence {} · frequency {} · repetition {} · \
+             stop ramp {} from {} over {} · </think> ramp {} from {} over {}",
+            bd.presence_penalty,
+            bd.frequency_penalty,
+            bd.repetition_penalty,
+            bd.length_penalty,
+            bd.length_penalty_start,
+            bd.length_penalty_window,
+            bd.think_end_bias,
+            bd.think_end_start,
+            bd.think_end_window
+        );
+    }
     println!("  Sparse idx:  {} entries", model.sparse_index.len());
     // The bounded anchor is an operator record, not a hint: print it as
     // the file states it, and the per-sequence state it fixes.

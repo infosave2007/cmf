@@ -2278,6 +2278,10 @@ impl Pipeline {
         pipeline.vmf_cfg = vmf_cfg;
         pipeline.gdn_cfg = gdn_cfg;
         pipeline.kda_cfg = kda_cfg;
+        if arch.block_diffusion.is_some() {
+            let c = crate::pipeline::clover::load(model, &arch, gdn_cfg.as_ref(), ov)?;
+            pipeline.clover = Some(std::sync::Arc::new(c));
+        }
         if arch.qwen4_exp.is_some() {
             let (globals, layers, cfg, state) = crate::qwen4_exp::load(model, &arch)?;
             pipeline.qwen4_exp = Some(Box::new((globals, layers, cfg, state)));

@@ -48,6 +48,7 @@ fn arch(kv_heads_per_layer: Option<Vec<usize>>, v_head_dim: Option<usize>) -> Mo
         mtp: None,
         moe: None,
         qwen4_exp: None,
+        block_diffusion: None,
         deepseek_v41: None,
         linear_core: None,
         head_clusters: None,
