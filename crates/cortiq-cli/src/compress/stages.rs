@@ -304,9 +304,13 @@ fn save_gram(p: &Path, g: &[f64]) -> Result<()> {
 }
 
 fn load_gram(p: &Path, n: usize) -> Result<Vec<f64>> {
+    Ok(load_gram_f32(p, n)?.into_iter().map(f64::from).collect())
+}
+
+fn load_gram_f32(p: &Path, n: usize) -> Result<Vec<f32>> {
     let b = std::fs::read(p)?;
     ensure!(b.len() == n * n * 4, "{}: {} bytes, expected {}", p.display(), b.len(), n * n * 4);
-    Ok(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64).collect())
+    Ok(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
 }
 
 fn write_u32s(p: &Path, rows: &[Vec<usize>]) -> Result<()> {
@@ -387,7 +391,7 @@ impl Calib {
         match &mut self.cap {
             Capturer::Runtime(p) => illum::capture(p, w, layers, label),
             #[cfg(feature = "gpu")]
-            Capturer::Device(d) => d.capture(w, layers, label),
+            Capturer::Device(d) => d.capture(val as usize, w, layers, label),
         }
     }
 }
@@ -453,7 +457,12 @@ fn s1_illuminate(run: &Run) -> Result<()> {
     let nl = widths.len();
     let chunk = chunk_layers(&widths);
     let gram_bytes: u64 = widths.iter().map(|&w| 4 * w as u64 * w as u64 * 2).sum();
-    let keep_grams = gram_bytes <= 16 << 30 && gram_bytes * 3 < disk_free(&run.work);
+    let keep_grams = match run.a.keep_grams.as_str() {
+        "on" => true,
+        "off" => false,
+        "auto" => gram_bytes * 2 < disk_free(&run.work),
+        o => bail!("--keep-grams {o:?}: auto, on or off"),
+    };
     run.log(&format!(
         "S1: {nl} layers, {chunk} per capture pass; Grams {:.1} GB {}",
         gram_bytes as f64 / 1e9,
@@ -468,7 +477,7 @@ fn s1_illuminate(run: &Run) -> Result<()> {
             let w = cmfio::tensor_f32(&wsrc, wsrc.tensor(&illum::down_name(l)).unwrap())?;
             let imp = illum::importance(&w, hidden, n, &acc.sumsq, acc.count);
             let ord = illum::order(&imp);
-            curves[l] = illum::refit_curve(&acc.h, n, &w, hidden, &ord, run.threads)?;
+            curves[l] = refit_curve(&acc.h, n, &w, hidden, &ord, run.threads)?;
             energy[l] = acc.sumsq.iter().map(|s| (s / acc.count.max(1) as f64).sqrt()).sum();
             orders[l] = ord;
             if keep_grams {
@@ -507,6 +516,67 @@ fn s1_illuminate(run: &Run) -> Result<()> {
             "train_tokens": cal.tokens.0, "val_tokens": cal.tokens.1,
         }),
     )
+}
+
+/// S1/S3 numerics on the device when its kernels are up (`CMF_FOLD_ON=host`
+/// keeps the host reference).
+fn fold_on_device() -> bool {
+    #[cfg(feature = "gpu")]
+    return super::fold_dev::available();
+    #[cfg(not(feature = "gpu"))]
+    false
+}
+
+fn refit_curve(g: &[f64], n: usize, w: &[f32], h: usize, ord: &[usize], threads: usize) -> Result<Vec<f64>> {
+    #[cfg(feature = "gpu")]
+    if fold_on_device() {
+        use super::fold_dev as fd;
+        let diag: Vec<f64> = (0..n).map(|i| g[i * n + i]).collect();
+        let wd = cortiq_engine::gpu_wgpu::nvg_dev::DMat::from_f32(h, n, w);
+        return fd::refit_curve(&fd::upload_gram(g, n), &diag, n, &wd, h, ord);
+    }
+    illum::refit_curve(g, n, w, h, ord, threads)
+}
+
+/// A layer's Gram for the fold: read back from the capture, or kept on disk
+/// by S1 (f32; the device path uploads it without the f64 round trip).
+enum GramSrc {
+    Host(Vec<f64>),
+    File(PathBuf),
+}
+
+impl GramSrc {
+    fn host(self, n: usize) -> Result<Vec<f64>> {
+        match self {
+            GramSrc::Host(v) => Ok(v),
+            GramSrc::File(p) => load_gram(&p, n),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fold_layer(l: usize, tr: GramSrc, va: GramSrc, n: usize, w: &[f32], h: usize, ord: &[usize], k: usize, ridges: &[f64], allow_cut: bool, threads: usize) -> Result<illum::Folded> {
+    #[cfg(feature = "gpu")]
+    if fold_on_device() {
+        use super::fold_dev as fd;
+        let up = |g: GramSrc| -> Result<(cortiq_engine::gpu_wgpu::nvg_dev::DMat, Vec<f64>)> {
+            Ok(match g {
+                GramSrc::Host(v) => {
+                    let d = (0..n).map(|i| v[i * n + i]).collect();
+                    (fd::upload_gram(&v, n), d)
+                }
+                GramSrc::File(p) => {
+                    let v = load_gram_f32(&p, n)?;
+                    let d = (0..n).map(|i| v[i * n + i] as f64).collect();
+                    (fd::upload_gram_f32(&v, n), d)
+                }
+            })
+        };
+        let (dtr, diag) = up(tr)?;
+        let (dva, _) = up(va)?;
+        return fd::fold_layer(l, &dtr, &diag, Some(&dva), n, w, h, ord, k, ridges, allow_cut);
+    }
+    illum::fold_layer(l, &tr.host(n)?, Some(&va.host(n)?), n, w, h, ord, k, ridges, allow_cut, threads)
 }
 
 fn disk_free(p: &Path) -> u64 {
@@ -739,26 +809,29 @@ fn s3_fold(run: &Run) -> Result<()> {
     let mut repl: HashMap<String, Replacement> = HashMap::new();
     let mut infos: Vec<illum::FoldInfo> = Vec::new();
     let chunk = chunk_layers(&widths).max(1);
+    if fold_on_device() {
+        run.log("  fold numerics on the device (f32, equilibrated Cholesky)");
+    }
     for part in todo.chunks(chunk) {
-        let (mut tr, mut va): (BTreeMap<usize, Vec<f64>>, BTreeMap<usize, Vec<f64>>) = (BTreeMap::new(), BTreeMap::new());
+        let (mut tr, mut va): (BTreeMap<usize, GramSrc>, BTreeMap<usize, GramSrc>) = (BTreeMap::new(), BTreeMap::new());
         if let Some(c) = cal.as_mut() {
             let label = format!("L{}-{}", part[0], part[part.len() - 1]);
             for (l, acc) in c.capture(false, part, &format!("train {label}"))? {
-                tr.insert(l, acc.h);
+                tr.insert(l, GramSrc::Host(acc.h));
             }
             for (l, acc) in c.capture(true, part, &format!("val {label}"))? {
-                va.insert(l, acc.h);
+                va.insert(l, GramSrc::Host(acc.h));
             }
         } else {
             for &l in part {
-                tr.insert(l, load_gram(&gram_path(run, l, "train"), widths[l])?);
-                va.insert(l, load_gram(&gram_path(run, l, "val"), widths[l])?);
+                tr.insert(l, GramSrc::File(gram_path(run, l, "train")));
+                va.insert(l, GramSrc::File(gram_path(run, l, "val")));
             }
         }
         for &l in part {
             let n = widths[l];
             let w = cmfio::tensor_f32(&wsrc, wsrc.tensor(&illum::down_name(l)).unwrap())?;
-            let f = illum::fold_layer(l, &tr[&l], Some(&va[&l]), n, &w, hidden, &orders[l], keeps[l], &ridges, allow_cut, run.threads)?;
+            let f = fold_layer(l, tr.remove(&l).unwrap(), va.remove(&l).unwrap(), n, &w, hidden, &orders[l], keeps[l], &ridges, allow_cut, run.threads)?;
             let p = format!("model.layers.{l}.mlp.");
             for name in ["gate_proj", "up_proj"] {
                 let e = wsrc.tensor(&format!("{p}{name}.weight")).with_context(|| format!("layer {l}: {p}{name}.weight"))?;
