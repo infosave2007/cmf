@@ -24,9 +24,22 @@
 //!   encoder, the Sortformer diarization model, the two norms that join them
 //!   and the projector; the ASR front end's mel filter bank and window
 //!   (`perception.preprocessor.featurizer.{fb,window}`).
-//! * Left out: the word-timestamp CTC head (`ctc_timestamp.*`), the
-//!   diarization model's duplicate front end, its unused two-speaker-cache
-//!   head (`hidden_to_spks`) and the empty `_extra_state` entries.
+//! * Word timestamps: the CTC head under `ctc_timestamp.` — the transposed
+//!   conv as `upsample.weight` `[factor·d, d]` (rows `(tap, out)`), the
+//!   2-layer transformer under `transformer.` (the ASR encoder's names) and
+//!   the classifier as `head.weight` `[classes, d]`; matrices bf16 (the
+//!   reference's dtype), norms and biases f32. Its SentencePiece vocabulary
+//!   (`alignment_tokenizer/tokenizer.json`) and `word_timestamp_config` ride
+//!   in the provenance.
+//! * Left out: the diarization model's duplicate front end, its unused
+//!   two-speaker-cache head (`hidden_to_spks`) and the empty `_extra_state`
+//!   entries.
+//!
+//! `CMF_NEMO_EXPERT_HOT=<json>` (a list per MoE layer of its experts, most
+//! used first) adds `expert_hot`: the order a device bank that holds only
+//! some experts fills in. `CMF_NEMO_BASE=<file.cmf>` repacks an existing
+//! file instead of quantizing again: its tensors are copied, the timestamp
+//! head and the provenance additions come from the checkpoint.
 //!
 //! ## Profiles (`--quant`)
 //!
@@ -142,6 +155,145 @@ fn exact_dtype(src: &str) -> anyhow::Result<TensorDtype> {
     })
 }
 
+/// f32 → bf16, round to nearest even (as `torch.Tensor.to(torch.bfloat16)`).
+fn bf16_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter()
+        .flat_map(|x| {
+            let b = x.to_bits();
+            let r = if x.is_nan() {
+                (b >> 16) as u16 | 0x40
+            } else {
+                (b.wrapping_add(0x7fff + ((b >> 16) & 1)) >> 16) as u16
+            };
+            r.to_le_bytes()
+        })
+        .collect()
+}
+
+/// A packed tensor of the word timestamp head: (name, dtype, shape, bytes).
+type Packed = (String, TensorDtype, Vec<usize>, Vec<u8>);
+
+/// The packed form of a `ctc_timestamp.decoder.*` source tensor; None for
+/// the scalars the config already carries.
+fn ts_tensor(name: &str, dtype: &str, shape: &[usize], raw: &[u8]) -> anyhow::Result<Option<Packed>> {
+    let Some(rest) = name.strip_prefix("ctc_timestamp.decoder.") else {
+        return Ok(None);
+    };
+    let f32_bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    Ok(match rest {
+        "upsample.weight" => {
+            // ConvTranspose1d [in, out, k] → GEMM rows (tap, out) [k·out, in]
+            anyhow::ensure!(shape.len() == 3, "{name}: shape {shape:?}");
+            let (ci, co, k) = (shape[0], shape[1], shape[2]);
+            let v = to_f32(dtype, raw)?;
+            let mut t = vec![0f32; v.len()];
+            for c in 0..ci {
+                for o in 0..co {
+                    for j in 0..k {
+                        t[(j * co + o) * ci + c] = v[(c * co + o) * k + j];
+                    }
+                }
+            }
+            Some(("ctc_timestamp.upsample.weight".into(), TensorDtype::Bf16, vec![k * co, ci], bf16_bytes(&t)))
+        }
+        "decoder_layers.0.weight" => {
+            // conv1d k=1 [classes, d, 1] → [classes, d]
+            anyhow::ensure!(shape.len() == 3 && shape[2] == 1, "{name}: shape {shape:?}");
+            let v = to_f32(dtype, raw)?;
+            Some(("ctc_timestamp.head.weight".into(), TensorDtype::Bf16, vec![shape[0], shape[1]], bf16_bytes(&v)))
+        }
+        "upsample.bias" | "decoder_layers.0.bias" => {
+            let n = if rest.starts_with("upsample") {
+                "ctc_timestamp.upsample.bias"
+            } else {
+                "ctc_timestamp.head.bias"
+            };
+            Some((n.into(), TensorDtype::F32, shape.to_vec(), f32_bytes(&to_f32(dtype, raw)?)))
+        }
+        r if r.starts_with("transformer.") => {
+            let v = to_f32(dtype, raw)?;
+            let n = format!("ctc_timestamp.{r}");
+            if shape.len() == 2 {
+                Some((n, TensorDtype::Bf16, shape.to_vec(), bf16_bytes(&v)))
+            } else {
+                Some((n, TensorDtype::F32, shape.to_vec(), f32_bytes(&v)))
+            }
+        }
+        _ => None,
+    })
+}
+
+/// The provenance additions of the word timestamp head and the expert
+/// order: `word_timestamp_config`, `alignment_tokenizer`, `expert_hot`.
+fn ts_provenance(dir: &Path, config: &serde_json::Value, nt: &mut serde_json::Map<String, serde_json::Value>) -> anyhow::Result<()> {
+    if let Some(c) = config.get("word_timestamp_config") {
+        nt.insert("word_timestamp_config".into(), c.clone());
+        let tok = std::fs::read_to_string(dir.join("alignment_tokenizer/tokenizer.json"))
+            .map_err(|e| anyhow::anyhow!("{}: alignment_tokenizer/tokenizer.json: {e}", dir.display()))?;
+        nt.insert("alignment_tokenizer".into(), serde_json::Value::String(tok));
+    }
+    if let Ok(p) = std::env::var("CMF_NEMO_EXPERT_HOT") {
+        let hot: serde_json::Value = serde_json::from_slice(&std::fs::read(&p)?)
+            .map_err(|e| anyhow::anyhow!("{p}: {e}"))?;
+        anyhow::ensure!(hot.is_array(), "{p}: expected a list per MoE layer");
+        nt.insert("expert_hot".into(), hot);
+    }
+    Ok(())
+}
+
+/// Repack `base` with the timestamp head and provenance additions of the
+/// checkpoint in `dir`; every tensor of `base` is copied as it is.
+fn augment(dir: &Path, config: &serde_json::Value, base: &Path, output: &str) -> anyhow::Result<()> {
+    let t0 = std::time::Instant::now();
+    let m = cortiq_core::CmfModel::open(base)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", base.display()))?;
+    anyhow::ensure!(
+        m.header.arch.arch_name == ARCH_NAME,
+        "{}: not a Nemotron 3.5 Transcribe CMF",
+        base.display()
+    );
+    let st = open_safetensors(&dir.join("model.safetensors"))?;
+    let mut ts = Vec::new();
+    for t in &st.tensors {
+        if let Some(p) = ts_tensor(&t.name, &t.dtype, &t.shape, st.bytes(t))? {
+            ts.push(p);
+        }
+    }
+    let gap = CmfStreamWriter::head_reserve_for(m.tensors.len() + ts.len(), 64);
+    let tmp = format!("{output}.part");
+    let mut w =
+        CmfStreamWriter::new(&tmp, gap).map_err(|e| anyhow::anyhow!("create {tmp}: {e}"))?;
+    for e in m.tensors.iter().filter(|e| !e.name.starts_with("ctc_timestamp.")) {
+        w.push(&e.name, e.dtype, &e.shape, m.entry_bytes(e))
+            .map_err(|er| anyhow::anyhow!("write {}: {er}", e.name))?;
+    }
+    for (n, dt, sh, b) in &ts {
+        w.push(n, *dt, sh, b)
+            .map_err(|e| anyhow::anyhow!("write {n}: {e}"))?;
+    }
+    let mut header = m.header.clone();
+    header.section_hashes = None;
+    let prov = header
+        .provenance
+        .as_mut()
+        .and_then(|p| p.get_mut("nemotron_transcribe"))
+        .and_then(|v| v.as_object_mut())
+        .ok_or_else(|| anyhow::anyhow!("{}: no nemotron_transcribe provenance", base.display()))?;
+    ts_provenance(dir, config, prov)?;
+    let count = w.tensor_count();
+    w.finish(&header, None, m.vocab.as_deref())
+        .map_err(|e| anyhow::anyhow!("finish {tmp}: {e}"))?;
+    std::fs::rename(&tmp, output)?;
+    eprintln!(
+        "{output}: {count} tensors ({} timestamp head) from {}, {:.2} GB in {:.0}s",
+        ts.len(),
+        base.display(),
+        std::fs::metadata(output)?.len() as f64 / 1e9,
+        t0.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 /// Canonical name of a source tensor; None = not packed.
 fn canon(raw: &str) -> Option<String> {
     if raw.ends_with("._extra_state")
@@ -197,6 +349,9 @@ pub fn convert(dir: &Path, quant: &str, output: &str) -> anyhow::Result<()> {
         "{}: not a Nemotron 3.5 Transcribe checkpoint",
         dir.display()
     );
+    if let Ok(base) = std::env::var("CMF_NEMO_BASE") {
+        return augment(dir, &config, Path::new(&base), output);
+    }
     let llm = read_json(dir, "llm_backbone/config.json")
         .or_else(|| config.get("llm_config").cloned())
         .ok_or_else(|| anyhow::anyhow!("nemotron_transcribe: no llm_backbone/config.json"))?;
@@ -278,6 +433,13 @@ pub fn convert(dir: &Path, quant: &str, output: &str) -> anyhow::Result<()> {
     let mut emitted = 0usize;
     for &ti in &order {
         let m = &st.tensors[ti];
+        if let Some((n, dt, sh, b)) = ts_tensor(&m.name, &m.dtype, &m.shape, st.bytes(m))? {
+            note("timestamps", sh.iter().product(), b.len());
+            w.push(&n, dt, &sh, &b)
+                .map_err(|e| anyhow::anyhow!("write {n}: {e}"))?;
+            emitted += 1;
+            continue;
+        }
         let Some(name) = canon(&m.name) else { continue };
         let raw = st.bytes(m);
         // Packed expert banks: (experts, in, out) → per-expert [out, in].
@@ -418,7 +580,7 @@ pub fn convert(dir: &Path, quant: &str, output: &str) -> anyhow::Result<()> {
         },
     }))?;
     let _ = n_attn;
-    let provenance = serde_json::json!({
+    let mut provenance = serde_json::json!({
         "source": dir.display().to_string(),
         "base_model": "nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B",
         "quant": profile_name(profile),
@@ -435,6 +597,9 @@ pub fn convert(dir: &Path, quant: &str, output: &str) -> anyhow::Result<()> {
             "eos_token": tokenizer_config.get("eos_token").cloned(),
         },
     });
+    if let Some(nt) = provenance["nemotron_transcribe"].as_object_mut() {
+        ts_provenance(dir, &config, nt)?;
+    }
     let header = CmfHeader {
         format: "cmf".into(),
         version: cortiq_core::CMF_VERSION,
@@ -498,6 +663,14 @@ mod tests {
         );
         assert_eq!(canon("llm.model.layers.5.mixer.q_proj._extra_state"), None);
         assert_eq!(canon("ctc_timestamp.decoder.upsample.weight"), None);
+        assert_eq!(
+            ts_tensor("ctc_timestamp.decoder.residual_scale", "F32", &[], &[0; 4]).unwrap(),
+            None
+        );
+        let up = ts_tensor("ctc_timestamp.decoder.upsample.weight", "F32", &[2, 3, 2], &[0; 48])
+            .unwrap()
+            .unwrap();
+        assert_eq!((up.0.as_str(), up.2.clone()), ("ctc_timestamp.upsample.weight", vec![6, 2]));
         assert_eq!(
             canon("perception.encoder.diarization_model.sortformer_modules.hidden_to_spks.weight"),
             None

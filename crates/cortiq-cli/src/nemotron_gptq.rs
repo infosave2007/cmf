@@ -62,7 +62,7 @@ fn capture(cm: &Arc<CmfModel>, o: &MoeOpts, dir: &Path) -> anyhow::Result<()> {
     for (i, f) in files.iter().enumerate() {
         let samples = cortiq_engine::nemotron_asr::read_audio(f).map_err(anyhow::Error::msg)?;
         let out = tr
-            .transcribe(&samples, None, 1024, pool.as_deref(), |_| {})
+            .transcribe(&samples, None, 1024, false, pool.as_deref(), |_| {})
             .map_err(anyhow::Error::msg)?;
         tokens += out.prompt_tokens + out.ids.len();
         eprintln!(

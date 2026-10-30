@@ -693,9 +693,12 @@ mod shader_tests {
     /// (naga) without a device.
     #[test]
     fn nemotron_shaders_validate() {
+        let frame = super::super::nemotron::nemo_wgsl();
+        let verify = super::super::nemotron_verify::ver_wgsl();
         for (name, src) in [
             ("nemotron-audio", super::AE_WGSL),
-            ("nemotron-frame", super::super::nemotron::NEMO_WGSL),
+            ("nemotron-frame", frame.as_str()),
+            ("nemotron-verify", verify.as_str()),
             ("nemotron-prefill", super::super::nemotron_prefill::PB_WGSL),
         ] {
             let module = wgpu::naga::front::wgsl::parse_str(src)

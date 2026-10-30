@@ -35,6 +35,7 @@ pub mod nemotron;
 pub mod nemotron_audio;
 /// Batched prefill kernels of the Nemotron-H frame.
 pub(crate) mod nemotron_prefill;
+pub(crate) mod nemotron_verify;
 /// System-memory buffers the card copies from (Vulkan).
 pub mod host_mem;
 /// Row-blocked decode kernels for the generic q4tp MoE graph block.

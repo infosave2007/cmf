@@ -687,6 +687,10 @@ enum Commands {
         /// Nemotron: print timings and token counts to stderr
         #[arg(long)]
         stats: bool,
+        /// Nemotron: also print every word's start and end (seconds) and,
+        /// in a speaker-tagged transcript, its speaker
+        #[arg(long)]
+        timestamps: bool,
     },
     /// Package a Gradium Phonon Q8 checkpoint as a self-contained CMF file.
     #[cfg(feature = "phonon")]
@@ -4094,10 +4098,18 @@ async fn main() -> anyhow::Result<()> {
             max_new_tokens,
             prompt,
             stats,
+            timestamps,
         } => {
             let model = Arc::new(CmfModel::open(&model)?);
             if model.header.arch.arch_name == cortiq_engine::nemotron_asr::ARCH_NAME {
-                return transcribe::run_nemotron(&model, &audio, prompt.as_deref(), max_new_tokens.unwrap_or(16384), stats);
+                return transcribe::run_nemotron(
+                    &model,
+                    &audio,
+                    prompt.as_deref(),
+                    max_new_tokens.unwrap_or(16384),
+                    stats,
+                    timestamps,
+                );
             }
             anyhow::ensure!(audio.len() == 1, "Whisper transcribes one file per call");
             let text = transcribe::run(&model, &audio[0], &language, &task, max_new_tokens.unwrap_or(440))?;

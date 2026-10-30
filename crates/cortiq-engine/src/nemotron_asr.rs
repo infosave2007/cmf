@@ -31,6 +31,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+pub mod words;
+
 pub const ARCH_NAME: &str = "nemotron3_5_transcribe";
 
 const SR: usize = 16_000;
@@ -251,6 +253,53 @@ impl Encoder {
             }
         }
         Ok(enc)
+    }
+
+    /// A tower without the stacking projection (the timestamp head's
+    /// transformer: its input comes from the transposed conv), host only.
+    fn load_tower(m: &CmfModel, p: &str, heads: usize, rot_frac: f64) -> Result<Self, String> {
+        let embed_norm = Ln::load(m, &format!("{p}.embed_norm"))?;
+        let d = embed_norm.w.len();
+        let hd = d / heads;
+        let mut layers = Vec::new();
+        for i in 0.. {
+            let l = format!("{p}.layers.{i}");
+            if m.tensor(&format!("{l}.norm1.weight")).is_none() {
+                break;
+            }
+            let qk = m.tensor(&format!("{l}.attn.q_norm.weight")).is_some();
+            layers.push(EncLayer {
+                n1: Ln::load(m, &format!("{l}.norm1"))?,
+                qkv: Lin::load(m, &format!("{l}.attn.w_qkv"), false)?,
+                qn: if qk { Some(Ln::load(m, &format!("{l}.attn.q_norm"))?) } else { None },
+                kn: if qk { Some(Ln::load(m, &format!("{l}.attn.k_norm"))?) } else { None },
+                out: Lin::load(m, &format!("{l}.attn.out_proj"), true)?,
+                n2: Ln::load(m, &format!("{l}.norm2"))?,
+                fc1: Lin::load(m, &format!("{l}.ffn.net.0"), true)?,
+                fc2: Lin::load(m, &format!("{l}.ffn.net.3"), true)?,
+            });
+        }
+        if layers.is_empty() {
+            return Err(format!("{p}: no layers"));
+        }
+        Ok(Self {
+            proj: Lin {
+                w: Vec::new(),
+                b: None,
+                out: d,
+                inp: 0,
+            },
+            embed_norm,
+            final_norm: Ln::load(m, &format!("{p}.final_norm"))?,
+            layers,
+            d,
+            heads,
+            hd,
+            rot: (hd as f64 * rot_frac) as usize,
+            stack: 1,
+            #[cfg(feature = "gpu")]
+            dev: None,
+        })
     }
 
     /// Stacked frames `[n·stack · n_mel]` → encoder states `[n · d]`.
@@ -1058,6 +1107,8 @@ fn round_bf16(x: f32) -> f32 {
 pub struct Transcriber {
     pub audio: Audio,
     pub llm: NemotronH,
+    /// The word timestamp head, when the file carries it.
+    pub words: Option<words::WordTimes>,
     pub tok: Tokenizer,
     pub audio_token: u32,
     pub eos: Vec<u32>,
@@ -1074,6 +1125,9 @@ pub struct Transcript {
     pub encode_s: f64,
     pub prefill_s: f64,
     pub decode_s: f64,
+    /// Word times, when asked for (seconds spent on them in `words_s`).
+    pub words: Option<Result<Vec<words::WordTime>, String>>,
+    pub words_s: f64,
 }
 
 impl Transcriber {
@@ -1090,8 +1144,21 @@ impl Transcriber {
             .as_ref()
             .and_then(|p| p.get("nemotron_transcribe"))
             .ok_or("CMF is missing the nemotron_transcribe provenance")?;
-        let llm = NemotronH::load(model, &prov["llm_config"])?;
+        let mut llm = NemotronH::load(model, &prov["llm_config"])?;
+        // the most used experts of each MoE layer first (a partial device
+        // bank is filled in this order)
+        if let Some(h) = prov.get("expert_hot").and_then(|v| v.as_array()) {
+            llm.hot = h
+                .iter()
+                .map(|l| {
+                    l.as_array()
+                        .map(|a| a.iter().filter_map(|e| e.as_u64()).map(|e| e as usize).collect())
+                        .unwrap_or_default()
+                })
+                .collect();
+        }
         let audio = Audio::load(model, &prov["audio_config"])?;
+        let words = words::WordTimes::load(model, prov)?;
         let vocab = model
             .vocab
             .as_deref()
@@ -1130,6 +1197,7 @@ impl Transcriber {
             audio_token,
             eos,
             default_prompt,
+            words,
         })
     }
 
@@ -1180,6 +1248,7 @@ impl Transcriber {
         samples: &[f32],
         prompt: Option<&str>,
         max_new_tokens: usize,
+        timestamps: bool,
         pool: Option<&Pool>,
         mut on_token: impl FnMut(&str),
     ) -> Result<Transcript, String> {
@@ -1189,63 +1258,105 @@ impl Transcriber {
         let ids = self.prompt_ids(prompt.unwrap_or(&self.default_prompt), a.tokens, false);
         let rows = self.input_rows(&ids, &a.embeds)?;
         // Greedy decode. On a wgpu device the decoder runs in the resident
-        // frame: `FRAME_STEPS` tokens ride one submit and only their ids come
-        // back. The prompt is prefilled through the frame position by
-        // position (`CMF_NEMO_PREFILL=frame`) or on the host / per-op
-        // batched kernels (`host`, default) and its state handed over.
-        const FRAME_STEPS: usize = 16;
-        let frame_prefill = std::env::var("CMF_NEMO_PREFILL").as_deref() == Ok("frame");
+        // frame: the prompt is prefilled there (batched passes), then
+        // batches of greedy tokens ride one submit each and only their ids
+        // come back. `CMF_NEMO_PREFILL=host` prefills on the host and hands
+        // the state over; without a frame the host decodes.
+        let host_prefill = std::env::var("CMF_NEMO_PREFILL").as_deref() == Ok("host");
         let t1 = Instant::now();
-        let mut st = self.llm.new_state();
-        let mut ready = std::collections::VecDeque::new();
-        let mut on_device = false;
-        if frame_prefill && max_new_tokens > 1 {
-            if let Some(first) = self.llm.frame_prefill(&rows, 1) {
-                ready.extend(first);
-                on_device = true;
-            }
-        }
-        if !on_device {
+        let hd = self.llm.g.hidden;
+        let n = rows.len() / hd;
+        let mut dev_from: Option<Vec<f32>> = None;
+        let mut host: Option<(super::nemotron_h::State, u32)> = None;
+        if !host_prefill && max_new_tokens > 0 && self.llm.frame_prefill(&rows[..(n - 1) * hd], Some(&rows[(n - 1) * hd..]), pool) {
+            dev_from = Some(rows[(n - 1) * hd..].to_vec());
+        } else {
+            let mut st = self.llm.new_state();
             let logits = self.llm.forward(&mut st, &rows, pool);
-            ready.push_back(argmax(&logits[..self.llm.g.vocab.min(logits.len())]));
-            on_device = max_new_tokens > 1 && self.llm.frame_seed(&st);
+            let first = argmax(&logits[..self.llm.g.vocab.min(logits.len())]);
+            if max_new_tokens > 1 && self.llm.frame_seed(&st) {
+                let mut r = vec![0.0f32; hd];
+                self.llm.embed_row(first, &mut r);
+                dev_from = Some(r);
+            }
+            host = Some((st, first));
         }
         let prefill_s = t1.elapsed().as_secs_f64();
         let t2 = Instant::now();
         let mut out = Vec::new();
-        let hd = self.llm.g.hidden;
-        let mut row = vec![0.0f32; hd];
         let mut printed = 0usize;
-        while let Some(tok) = ready.pop_front() {
+        let emit = |tok: u32,
+                    out: &mut Vec<u32>,
+                    printed: &mut usize,
+                    on_token: &mut dyn FnMut(&str)|
+         -> bool {
             if self.eos.contains(&tok) || out.len() >= max_new_tokens {
-                break;
+                return false;
             }
             out.push(tok);
-            let text = self.tok.decode(&out);
-            if text.len() > printed && text.is_char_boundary(printed) {
-                on_token(&text[printed..]);
-                printed = text.len();
+            let text = self.tok.decode(out);
+            if text.len() > *printed && text.is_char_boundary(*printed) {
+                on_token(&text[*printed..]);
+                *printed = text.len();
             }
-            if !ready.is_empty() || out.len() >= max_new_tokens {
-                continue;
-            }
-            // every ready token but the last was already consumed on the device
-            self.llm.embed_row(tok, &mut row);
-            if on_device {
-                let k = (max_new_tokens - out.len()).min(FRAME_STEPS);
-                ready.extend(
-                    self.llm
-                        .frame_greedy(&row, k)
-                        .ok_or("device decode frame failed")?,
-                );
-            } else {
-                let logits = self.llm.forward(&mut st, &row, pool);
-                ready.push_back(argmax(&logits[..self.llm.g.vocab.min(logits.len())]));
+            true
+        };
+        let mut go = true;
+        if let Some((_, first)) = &host {
+            go = emit(*first, &mut out, &mut printed, &mut on_token);
+        }
+        if go {
+            if let Some(row) = dev_from {
+                let budget = max_new_tokens - out.len();
+                self.llm.frame_decode(&row, budget, pool, |ids| {
+                    ids.iter()
+                        .all(|&t| emit(t, &mut out, &mut printed, &mut on_token))
+                })?;
+            } else if let Some((mut st, first)) = host {
+                let mut row = vec![0.0f32; hd];
+                let mut tok = first;
+                loop {
+                    self.llm.embed_row(tok, &mut row);
+                    let logits = self.llm.forward(&mut st, &row, pool);
+                    tok = argmax(&logits[..self.llm.g.vocab.min(logits.len())]);
+                    if !emit(tok, &mut out, &mut printed, &mut on_token) {
+                        break;
+                    }
+                }
             }
         }
         let decode_s = t2.elapsed().as_secs_f64();
+        if std::env::var("CMF_NEMO_MTP_PROBE").as_deref() == Ok("1") && out.len() > 4 {
+            self.mtp_probe(&rows, &ids, &out, pool);
+        }
+        let text = self.tok.decode(&out).trim().to_string();
+        let t3 = Instant::now();
+        let words = match (&self.words, timestamps) {
+            (Some(w), true) => {
+                let stack = self.audio.asr.stack;
+                let t_enc = a.frames / stack;
+                let valid: Vec<bool> = (0..t_enc).map(|t| t * stack < a.valid_frames).collect();
+                let logits = w.logits(&a.asr_hidden, t_enc, &valid, &self.audio.chunks(t_enc), pool);
+                // parity tooling: the head's logits as raw f32 `[frames · classes]`
+                if let Ok(dir) = std::env::var("CMF_NEMO_WORDS_DUMP") {
+                    let b: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::fs::write(Path::new(&dir).join(format!("logits-{}.f32", a.tokens)), b);
+                }
+                let ns = self.audio.spk.n_spk;
+                Some(w.align(
+                    &text,
+                    &logits,
+                    a.tokens,
+                    a.valid_frames,
+                    Some((&a.speaker_logits[..], ns)),
+                ))
+            }
+            _ => None,
+        };
+        let words_s = t3.elapsed().as_secs_f64();
         Ok(Transcript {
-            text: self.tok.decode(&out).trim().to_string(),
+            text,
             prompt_tokens: ids.len(),
             audio_tokens: a.tokens,
             ids: out,
@@ -1253,11 +1364,94 @@ impl Transcriber {
             encode_s,
             prefill_s,
             decode_s,
+            words,
+            words_s,
         })
     }
 }
 
 impl Transcriber {
+    /// `CMF_NEMO_MTP_PROBE=1`: teacher-forced acceptance of the draft
+    /// module on this transcript, for every reading of its inputs (the
+    /// hidden state before or after the final norm, the concatenation
+    /// order), depths 1 and 2.
+    fn mtp_probe(&self, rows: &[f32], ids: &[u32], gen_ids: &[u32], pool: Option<&Pool>) {
+        let llm = &self.llm;
+        if llm.mtp.is_none() {
+            eprintln!("mtp probe: no draft module in this file");
+            return;
+        }
+        let hd = llm.g.hidden;
+        let mut all = rows.to_vec();
+        let mut r = vec![0.0f32; hd];
+        for &t in gen_ids {
+            llm.embed_row(t, &mut r);
+            all.extend_from_slice(&r);
+        }
+        let toks: Vec<u32> = ids.iter().chain(gen_ids).copied().collect();
+        let n = toks.len();
+        let np = ids.len();
+        let mut st = llm.new_state();
+        let h = llm.forward_h(&mut st, &all, pool);
+        let mut hn = vec![0.0f32; h.len()];
+        for (s, d) in h.chunks_exact(hd).zip(hn.chunks_exact_mut(hd)) {
+            super::nemotron_h::rms_norm(s, &llm.final_norm, llm.g.eps, d);
+        }
+        // the main head on the generated span, as a sanity check
+        let main = llm.head_argmax(&hn[(np - 1) * hd..(n - 1) * hd], pool);
+        let ok = main.iter().zip(&toks[np..]).filter(|(a, b)| a == b).count();
+        eprintln!("mtp probe: main head {ok}/{} of the transcript", main.len());
+        for (name, src, h_first) in [
+            ("pre-norm h, [e|h]", &h, false),
+            ("post-norm h, [e|h]", &hn, false),
+            ("pre-norm h, [h|e]", &h, true),
+            ("post-norm h, [h|e]", &hn, true),
+        ] {
+            let mut kv = (Vec::new(), Vec::new());
+            let Some(o1) = llm.mtp_forward(&mut kv, 0, &src[..(n - 1) * hd], &all[hd..], h_first, pool)
+            else {
+                return;
+            };
+            // depth 1 at t predicts toks[t + 2]: t over the generated span
+            let a1 = llm.head_argmax(&o1[(np - 1) * hd..(n - 2) * hd], pool);
+            let ok1 = a1.iter().zip(&toks[np + 1..]).filter(|(a, b)| a == b).count();
+            let mut kv2 = (Vec::new(), Vec::new());
+            let o2 = llm
+                .mtp_forward(&mut kv2, 0, &o1[..(n - 2) * hd], &all[2 * hd..], h_first, pool)
+                .unwrap_or_default();
+            let a2 = llm.head_argmax(&o2[(np - 1) * hd..(n - 3) * hd], pool);
+            let ok2 = a2.iter().zip(&toks[np + 2..]).filter(|(a, b)| a == b).count();
+            eprintln!(
+                "mtp probe {name}: depth 1 {ok1}/{} ({:.1}%), depth 2 {ok2}/{} ({:.1}%)",
+                a1.len(),
+                100.0 * ok1 as f64 / a1.len().max(1) as f64,
+                a2.len(),
+                100.0 * ok2 as f64 / a2.len().max(1) as f64
+            );
+            // the same reading with the draft's attention over the generated
+            // span only, and over the position itself only
+            let span = (n - 2) - (np - 1);
+            let mut kv = (Vec::new(), Vec::new());
+            let o = llm
+                .mtp_forward(&mut kv, 0, &src[(np - 1) * hd..(n - 2) * hd], &all[np * hd..(n - 1) * hd], h_first, pool)
+                .unwrap_or_default();
+            let a = llm.head_argmax(&o, pool);
+            let ok_g = a.iter().zip(&toks[np + 1..]).filter(|(a, b)| a == b).count();
+            let mut ok_s = 0;
+            for t in 0..span {
+                let p = np - 1 + t;
+                let mut kv = (Vec::new(), Vec::new());
+                let o = llm
+                    .mtp_forward(&mut kv, 0, &src[p * hd..(p + 1) * hd], &all[(p + 1) * hd..(p + 2) * hd], h_first, pool)
+                    .unwrap_or_default();
+                ok_s += (llm.head_argmax(&o, pool)[0] == toks[p + 2]) as usize;
+            }
+            eprintln!(
+                "mtp probe {name}: depth 1 with generated-span history {ok_g}/{span}, without history {ok_s}/{span}"
+            );
+        }
+    }
+
     /// Parity dump against the reference: writes the audio-module tensors,
     /// the prompt ids and the teacher-forced logits of `forced` (the
     /// reference transcript ids) into `dir` as raw little-endian f32 / u32

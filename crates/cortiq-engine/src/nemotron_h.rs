@@ -158,6 +158,22 @@ pub struct MoeW {
     pub sh_down: QTensor,
 }
 
+/// The multi-token-prediction module: `mtp.layers.0` (the fusion of the
+/// next token's embedding with a hidden state, then an attention block) and
+/// `mtp.layers.1` (a MoE block and the output norm); one set of weights for
+/// every draft depth, the language model's head on top.
+pub struct Mtp {
+    pub enorm: Vec<f32>,
+    pub hnorm: Vec<f32>,
+    /// `[hidden, 2·hidden]` over `[enorm(embed) | hnorm(hidden)]`
+    pub eh: QTensor,
+    pub n_attn: Vec<f32>,
+    pub attn: AttnW,
+    pub n_moe: Vec<f32>,
+    pub moe: MoeW,
+    pub fnorm: Vec<f32>,
+}
+
 /// MoE inputs captured for GPTQ calibration, per block index (empty for
 /// non-MoE blocks): the normed rows `[n · hidden]` and each row's `top_k`
 /// routed experts.
@@ -189,6 +205,11 @@ pub struct NemotronH {
     pub n_mamba: usize,
     pub n_attn: usize,
     model: Option<Arc<CmfModel>>,
+    /// Per MoE block, its experts most used first (a partial device bank is
+    /// filled in this order); empty when the file does not say.
+    pub hot: Vec<Vec<usize>>,
+    /// The draft module, when the file carries it.
+    pub mtp: Option<Mtp>,
     /// GPTQ calibration: per block, the MoE input rows and routed experts.
     capture: std::sync::Mutex<Option<MoeCapture>>,
     /// The device decode frame (wgpu), built on first use; `Err` once refused.
@@ -282,6 +303,7 @@ impl NemotronH {
             };
             blocks.push(Block { norm, mixer, slot });
         }
+        let mtp = Self::load_mtp(m, &g)?;
         Ok(Self {
             embed: q("model.embed_tokens.weight")?,
             lm_head: q("lm_head.weight")?,
@@ -290,11 +312,154 @@ impl NemotronH {
             blocks,
             n_mamba,
             n_attn,
+            mtp,
             model: Some(m.clone()),
+            hot: Vec::new(),
             capture: std::sync::Mutex::new(None),
             #[cfg(feature = "gpu")]
             frame: std::sync::Mutex::new(None),
         })
+    }
+
+    fn load_mtp(m: &Arc<CmfModel>, g: &Geom) -> Result<Option<Mtp>, String> {
+        let p0 = "mtp.layers.0";
+        let p1 = "mtp.layers.1";
+        if m.tensor(&format!("{p0}.eh_proj.weight")).is_none() {
+            return Ok(None);
+        }
+        let q = |n: &str| QTensor::from_model(m, n);
+        let mut up = Vec::with_capacity(g.n_exp);
+        let mut down = Vec::with_capacity(g.n_exp);
+        for e in 0..g.n_exp {
+            up.push(q(&format!("{p1}.mlp.experts.{e}.up_proj.weight"))?);
+            down.push(q(&format!("{p1}.mlp.experts.{e}.down_proj.weight"))?);
+        }
+        Ok(Some(Mtp {
+            enorm: tensor_f32(m, &format!("{p0}.enorm.weight"))?,
+            hnorm: tensor_f32(m, &format!("{p0}.hnorm.weight"))?,
+            eh: q(&format!("{p0}.eh_proj.weight"))?,
+            n_attn: tensor_f32(m, &format!("{p0}.norm.weight"))?,
+            attn: AttnW {
+                q: q(&format!("{p0}.mixer.q_proj.weight"))?,
+                k: q(&format!("{p0}.mixer.k_proj.weight"))?,
+                v: q(&format!("{p0}.mixer.v_proj.weight"))?,
+                o: q(&format!("{p0}.mixer.o_proj.weight"))?,
+            },
+            n_moe: tensor_f32(m, &format!("{p1}.norm.weight"))?,
+            moe: MoeW {
+                router: QTensor::from_f32(tensor_f32(m, &format!("{p1}.mlp.gate.weight"))?, g.n_exp, g.hidden),
+                bias: tensor_f32(m, &format!("{p1}.mlp.gate.e_score_correction_bias"))?,
+                up,
+                down,
+                sh_up: q(&format!("{p1}.mlp.shared_experts.up_proj.weight"))?,
+                sh_down: q(&format!("{p1}.mlp.shared_experts.down_proj.weight"))?,
+            },
+            fnorm: tensor_f32(m, &format!("{p1}.final_layernorm.weight"))?,
+        }))
+    }
+
+    /// The residual stream after the last block for every row of `rows`
+    /// (before the final norm), advancing `st`.
+    pub fn forward_h(&self, st: &mut State, rows: &[f32], pool: Option<&Pool>) -> Vec<f32> {
+        let hd = self.g.hidden;
+        let n = rows.len() / hd;
+        let mut h = rows.to_vec();
+        let mut xn = vec![0.0f32; n * hd];
+        for (bi, b) in self.blocks.iter().enumerate() {
+            for (src, dst) in h.chunks_exact(hd).zip(xn.chunks_exact_mut(hd)) {
+                rms_norm(src, &b.norm, self.g.eps, dst);
+            }
+            let out = match &b.mixer {
+                Mixer::Mamba(w) => {
+                    self.mamba(w, &mut st.conv[b.slot], &mut st.ssm[b.slot], &xn, n, pool)
+                }
+                Mixer::Attn(w) => self.attention(
+                    w,
+                    &mut st.kc[b.slot],
+                    &mut st.vc[b.slot],
+                    st.pos,
+                    &xn,
+                    n,
+                    pool,
+                ),
+                Mixer::Moe(w) => self.moe(bi, w, &xn, n, pool),
+            };
+            for (a, o) in h.iter_mut().zip(&out) {
+                *a += o;
+            }
+        }
+        st.pos += n;
+        h
+    }
+
+    /// One draft depth over `n` positions from `pos`: `hidden` (the state
+    /// the depth reads, `[n · hidden]`) fused with `next` (the input rows of
+    /// the following positions: token embeddings, or the audio embeddings
+    /// inside the prompt); the depth's KV rows extend `kv`. Returns the
+    /// depth's output states `[n · hidden]` (after its output norm).
+    pub fn mtp_forward(
+        &self,
+        kv: &mut (Vec<f32>, Vec<f32>),
+        pos: usize,
+        hidden: &[f32],
+        next: &[f32],
+        h_first: bool,
+        pool: Option<&Pool>,
+    ) -> Option<Vec<f32>> {
+        let w = self.mtp.as_ref()?;
+        let hd = self.g.hidden;
+        let n = next.len() / hd;
+        let mut cat = vec![0.0f32; n * 2 * hd];
+        let mut tmp = vec![0.0f32; hd];
+        for t in 0..n {
+            let (a, b) = cat[t * 2 * hd..(t + 1) * 2 * hd].split_at_mut(hd);
+            let (de, dh) = if h_first { (b, a) } else { (a, b) };
+            rms_norm(&next[t * hd..(t + 1) * hd], &w.enorm, self.g.eps, de);
+            tmp.copy_from_slice(&hidden[t * hd..(t + 1) * hd]);
+            rms_norm(&tmp, &w.hnorm, self.g.eps, dh);
+        }
+        let mut x = vec![0.0f32; n * hd];
+        project(&w.eh, &cat, n, &mut x, pool);
+        let mut xn = vec![0.0f32; n * hd];
+        for (src, dst) in x.chunks_exact(hd).zip(xn.chunks_exact_mut(hd)) {
+            rms_norm(src, &w.n_attn, self.g.eps, dst);
+        }
+        let a = self.attention(&w.attn, &mut kv.0, &mut kv.1, pos, &xn, n, pool);
+        for (v, o) in x.iter_mut().zip(&a) {
+            *v += o;
+        }
+        for (src, dst) in x.chunks_exact(hd).zip(xn.chunks_exact_mut(hd)) {
+            rms_norm(src, &w.n_moe, self.g.eps, dst);
+        }
+        let m = self.moe(usize::MAX, &w.moe, &xn, n, pool);
+        for (v, o) in x.iter_mut().zip(&m) {
+            *v += o;
+        }
+        let mut out = vec![0.0f32; n * hd];
+        for (src, dst) in x.chunks_exact(hd).zip(out.chunks_exact_mut(hd)) {
+            rms_norm(src, &w.fnorm, self.g.eps, dst);
+        }
+        Some(out)
+    }
+
+    /// Argmax of the head over `n` normed rows.
+    pub fn head_argmax(&self, xn: &[f32], pool: Option<&Pool>) -> Vec<u32> {
+        let hd = self.g.hidden;
+        let n = xn.len() / hd;
+        let v = self.lm_head.rows();
+        let mut out = Vec::with_capacity(n);
+        let mut logits = vec![0.0f32; v];
+        for t in 0..n {
+            self.lm_head.matvec(&xn[t * hd..(t + 1) * hd], &mut logits, pool);
+            let mut best = 0usize;
+            for (i, &l) in logits.iter().enumerate() {
+                if l > logits[best] {
+                    best = i;
+                }
+            }
+            out.push(best as u32);
+        }
+        out
     }
 
     pub fn new_state(&self) -> State {
@@ -581,6 +746,7 @@ impl NemotronH {
         let mut lists: Vec<Vec<(usize, f32)>> = vec![Vec::new(); g.n_exp];
         let mut sel = Vec::with_capacity(g.top_k);
         let mut cap = self.capture.lock().unwrap();
+        let mut cap = cap.as_mut().filter(|_| bi != usize::MAX);
         if let Some(c) = cap.as_mut() {
             c.x[bi].extend_from_slice(xn);
         }
@@ -641,9 +807,11 @@ impl NemotronH {
 impl NemotronH {
     /// KV capacity of the device frame.
     const FRAME_CAP: usize = 65536;
+    /// Greedy tokens per frame submit.
+    const FRAME_STEPS: usize = 16;
 
     fn frame_desc(&self) -> Option<crate::gpu_wgpu::nemotron::NemoDesc<'_>> {
-        use crate::gpu_wgpu::nemotron::{NemoBlockDesc, NemoDesc};
+        use crate::gpu_wgpu::nemotron::{ExpertCodec, NemoBlockDesc, NemoDesc};
         let m = self.model.as_ref()?;
         let raw = |q: &QTensor, want: TensorDtype| -> Option<&[u8]> {
             let idx = q.model_idx()?;
@@ -651,8 +819,8 @@ impl NemotronH {
             (e.dtype == want).then(|| m.entry_bytes(e))
         };
         let q8 = |q: &QTensor| raw(q, TensorDtype::Q8_2f);
-        let q4 = |q: &QTensor| raw(q, TensorDtype::Q4TiledP);
         let mut blocks = Vec::with_capacity(self.blocks.len());
+        let mut moe = 0usize;
         for b in &self.blocks {
             blocks.push(match &b.mixer {
                 Mixer::Mamba(w) => NemoBlockDesc::Mamba {
@@ -671,15 +839,37 @@ impl NemotronH {
                     v: q8(&w.v)?,
                     o: q8(&w.o)?,
                 },
-                Mixer::Moe(w) => NemoBlockDesc::Moe {
-                    norm: &b.norm,
-                    router: w.router.as_f32()?,
-                    bias: &w.bias,
-                    up: w.up.iter().map(q4).collect::<Option<Vec<_>>>()?,
-                    down: w.down.iter().map(q4).collect::<Option<Vec<_>>>()?,
-                    sh_up: q8(&w.sh_up)?,
-                    sh_down: q8(&w.sh_down)?,
-                },
+                Mixer::Moe(w) => {
+                    fn bank<'m>(
+                        m: &'m CmfModel,
+                        v: &[QTensor],
+                        want: TensorDtype,
+                    ) -> Option<Vec<&'m [u8]>> {
+                        v.iter()
+                            .map(|q| {
+                                let e = &m.tensors[q.model_idx()?];
+                                (e.dtype == want).then(|| m.entry_bytes(e))
+                            })
+                            .collect()
+                    }
+                    let (q4t, q8t) = (TensorDtype::Q4TiledP, TensorDtype::Q8_2f);
+                    let (codec, up, down) = match (bank(m, &w.up, q4t), bank(m, &w.down, q4t)) {
+                        (Some(u), Some(d)) => (ExpertCodec::Q4tp, u, d),
+                        _ => (ExpertCodec::Q8, bank(m, &w.up, q8t)?, bank(m, &w.down, q8t)?),
+                    };
+                    moe += 1;
+                    NemoBlockDesc::Moe {
+                        norm: &b.norm,
+                        router: w.router.as_f32()?,
+                        bias: &w.bias,
+                        codec,
+                        up,
+                        down,
+                        hot: self.hot.get(moe - 1).cloned(),
+                        sh_up: q8(&w.sh_up)?,
+                        sh_down: q8(&w.sh_down)?,
+                    }
+                }
             });
         }
         let g = &self.g;
@@ -705,6 +895,52 @@ impl NemotronH {
             lm_head: q8(&self.lm_head)?,
             final_norm: &self.final_norm,
             cap: Self::FRAME_CAP,
+            model: Some(m.clone()),
+            // the audio towers share the card
+            reserve: 2_000_000_000,
+            mtp: self.mtp_desc(),
+        })
+    }
+
+    /// The draft layer for the frame (speculation; `CMF_NEMO_MTP=0` turns
+    /// it off): used when every expert fits the card.
+    fn mtp_desc(&self) -> Option<crate::gpu_wgpu::nemotron::NemoMtpDesc<'_>> {
+        if std::env::var("CMF_NEMO_MTP").as_deref() == Ok("0") {
+            return None;
+        }
+        let w = self.mtp.as_ref()?;
+        let m = self.model.as_ref()?;
+        fn raw<'m>(m: &'m CmfModel, q: &QTensor, want: TensorDtype) -> Option<&'m [u8]> {
+            let e = &m.tensors[q.model_idx()?];
+            (e.dtype == want).then(|| m.entry_bytes(e))
+        }
+        let q8 = TensorDtype::Q8_2f;
+        let codec = match self.blocks.iter().find_map(|b| match &b.mixer {
+            Mixer::Moe(w) => Some(&w.up[0]),
+            _ => None,
+        }) {
+            Some(q) if raw(m, q, TensorDtype::Q4TiledP).is_some() => TensorDtype::Q4TiledP,
+            _ => q8,
+        };
+        let bank = |v: &[QTensor]| v.iter().map(|q| raw(m, q, codec)).collect::<Option<Vec<_>>>();
+        Some(crate::gpu_wgpu::nemotron::NemoMtpDesc {
+            enorm: &w.enorm,
+            hnorm: &w.hnorm,
+            eh: raw(m, &w.eh, q8)?,
+            h_first: std::env::var("CMF_NEMO_MTP_HFIRST").as_deref() == Ok("1"),
+            n_attn: &w.n_attn,
+            q: raw(m, &w.attn.q, q8)?,
+            k: raw(m, &w.attn.k, q8)?,
+            v: raw(m, &w.attn.v, q8)?,
+            o: raw(m, &w.attn.o, q8)?,
+            n_moe: &w.n_moe,
+            router: w.moe.router.as_f32()?,
+            bias: &w.moe.bias,
+            up: bank(&w.moe.up)?,
+            down: bank(&w.moe.down)?,
+            sh_up: raw(m, &w.moe.sh_up, q8)?,
+            sh_down: raw(m, &w.moe.sh_down, q8)?,
+            fnorm: &w.fnorm,
         })
     }
 
@@ -719,7 +955,7 @@ impl NemotronH {
             // Unified memory: the frame COPIES the decoder into device
             // buffers next to the mapped file; a host without room for both
             // swaps (measured: 24 GB M4, 2.4 against 9-15 tok/s per-op).
-            if !crate::gpu::discrete() {
+            if !crate::gpu::discrete() && std::env::var("CMF_NEMO_EXPERT_GB").is_err() {
                 let need = self
                     .model
                     .as_ref()
@@ -751,6 +987,12 @@ impl NemotronH {
                 ),
             }
             *slot = Some(built.ok_or(()));
+            if let Some(Ok(f)) = slot.as_mut()
+                && f.has_mtp()
+                && !f.prepare_verify()
+            {
+                tracing::info!("nemotron frame: no two-position verify pass, drafts off");
+            }
         }
         match slot.as_mut() {
             Some(Ok(f)) => f.seed(&st.conv, &st.ssm, &st.kc, &st.vc, st.pos),
@@ -758,37 +1000,255 @@ impl NemotronH {
         }
     }
 
-    /// Prefill through the device frame from an empty state: every row but
-    /// the last is fed, the last one starts `steps` greedy tokens.
-    pub fn frame_prefill(&self, rows: &[f32], steps: usize) -> Option<Vec<u32>> {
+    /// Prefill `rows` through the device frame from an empty state. False:
+    /// the frame is absent or cannot prefill (the caller prefills on the
+    /// host and seeds).
+    pub fn frame_prefill(&self, rows: &[f32], next: Option<&[f32]>, pool: Option<&Pool>) -> bool {
         let hd = self.g.hidden;
-        let n = rows.len() / hd;
-        if n == 0 || !self.frame_seed(&self.new_state()) {
-            return None;
+        if !self.frame_seed(&self.new_state()) {
+            return false;
+        }
+        if rows.is_empty() {
+            return true;
         }
         let mut slot = self.frame.lock().unwrap();
         let Some(Ok(f)) = slot.as_mut() else {
-            return None;
+            return false;
         };
-        // batched passes when the device takes them, position by position otherwise
+        debug_assert_eq!(rows.len() % hd, 0);
+        // batched passes when the device takes them, position by position
+        // otherwise; a partial expert bank's misses are completed here
         let batched = std::env::var("CMF_NEMO_BATCH").as_deref() != Ok("0");
-        if n > 1
-            && !(batched && f.feed_batched(&rows[..(n - 1) * hd]))
-            && !f.feed(&rows[..(n - 1) * hd])
-        {
-            return None;
-        }
-        f.greedy(&rows[(n - 1) * hd..], steps)
+        let mut host = |moe: usize, e: usize, x: &[f32], n: usize| self.complete_rows(moe, e, x, n, pool);
+        let draft = f.has_mtp();
+        (batched && f.feed_batched(rows, Some(&mut host), draft, next)) || f.feed(rows)
     }
 
-    /// `steps` greedy tokens on the device after `row`; None on a device
-    /// failure (the host state is then stale: the caller must stop).
-    pub fn frame_greedy(&self, row: &[f32], steps: usize) -> Option<Vec<u32>> {
+    /// Greedy tokens on the device after `row` (the next input embedding)
+    /// until `keep(ids)` returns false or `max` ids are out. Full expert
+    /// banks keep two batches in flight; misses of a partial bank are
+    /// completed here on the CPU.
+    pub fn frame_decode(
+        &self,
+        row: &[f32],
+        max: usize,
+        pool: Option<&Pool>,
+        mut keep: impl FnMut(&[u32]) -> bool,
+    ) -> Result<(), String> {
         let mut slot = self.frame.lock().unwrap();
-        match slot.as_mut() {
-            Some(Ok(f)) => f.greedy(row, steps),
-            _ => None,
+        let Some(Ok(f)) = slot.as_mut() else {
+            return Err("no device decode frame".into());
+        };
+        let fail = || "device decode frame failed".to_string();
+        let mut left = max;
+        if left == 0 {
+            return Ok(());
         }
+        if f.full() && f.has_mtp() && f.verify_ready() {
+            return self.decode_mtp(f, row, max, &mut keep);
+        }
+        if f.full() {
+            let k = left.min(Self::FRAME_STEPS);
+            if !f.greedy_start(Some(row), k) {
+                return Err(fail());
+            }
+            left -= k;
+            loop {
+                if left > 0 {
+                    let k = left.min(Self::FRAME_STEPS);
+                    if f.greedy_start(None, k) {
+                        left -= k;
+                    }
+                }
+                let ids = f.greedy_finish().ok_or_else(fail)?;
+                if !keep(&ids) {
+                    f.greedy_drain();
+                    return Ok(());
+                }
+                if left == 0 && f.in_flight() == 0 {
+                    return Ok(());
+                }
+            }
+        }
+        // a partial bank: one MoE layer per submit, misses completed here
+        let mut first = Some(row);
+        let mut host_s = 0.0f64;
+        let mut complete = |moe: usize, xn: &[f32], picks: &[(usize, f32)], missing: &[usize]| {
+            let t = std::time::Instant::now();
+            let o = self.complete(moe, xn, picks, missing, pool);
+            host_s += t.elapsed().as_secs_f64();
+            o
+        };
+        while left > 0 {
+            let ids = f.greedy_seg(first.take(), 1, &mut complete).ok_or_else(fail)?;
+            left -= 1;
+            if !keep(&ids) {
+                break;
+            }
+        }
+        if std::env::var("CMF_NEMO_PROF").as_deref() == Ok("1") {
+            eprintln!("nemotron frame: {:.1} ms completing missing experts on the host", host_s * 1e3);
+        }
+        if std::env::var("CMF_NEMO_PROF").as_deref() == Ok("1") {
+            if let Some((miss, adm)) = f.arena_stats() {
+                eprintln!("nemotron frame: {miss} expert misses completed on the host, {adm} admitted");
+            }
+        }
+        Ok(())
+    }
+
+    /// Speculative greedy decode with the draft layer: each round verifies
+    /// the next token and one draft in a batched pass, keeps the draft when
+    /// the model agrees (two tokens for the pass) or rolls the state back
+    /// to the token, then extends the draft layer over the kept positions
+    /// and drafts again. Greedy-exact: every emitted id is the main model's
+    /// argmax.
+    fn decode_mtp(
+        &self,
+        f: &mut crate::gpu_wgpu::nemotron::NemoFrame,
+        row: &[f32],
+        max: usize,
+        keep: &mut dyn FnMut(&[u32]) -> bool,
+    ) -> Result<(), String> {
+        let hd = self.g.hidden;
+        let fail = || "device decode frame failed".to_string();
+        let pre = std::env::var("CMF_NEMO_MTP_PRE").as_deref() == Ok("1");
+        let prof = std::env::var("CMF_NEMO_PROF").as_deref() == Ok("1");
+        let emb = |t: u32| {
+            let mut r = vec![0.0f32; hd];
+            self.embed_row(t, &mut r);
+            r
+        };
+        // the hidden row the draft layer reads: the residual before or after the final norm
+        let pick = |hn: &[f32], hr: &[f32], i: usize| -> Vec<f32> {
+            let src = if pre { hr } else { hn };
+            src[i * hd..(i + 1) * hd].to_vec()
+        };
+        let p0 = f.pos;
+        let (y0, h0) = f.step_hidden(row).ok_or_else(fail)?;
+        let mut out = 1usize;
+        if !keep(&[y0]) || out >= max {
+            return Ok(());
+        }
+        let mut tok = y0;
+        let mut tok_e = emb(tok);
+        let (mut t_ver, mut t_mtp) = (0.0f64, 0.0f64);
+        let t = std::time::Instant::now();
+        let mut draft = f.mtp_steps(&[(&h0, &tok_e, p0)], true).ok_or_else(fail)?;
+        t_mtp += t.elapsed().as_secs_f64();
+        let (mut rounds, mut kept) = (0usize, 0usize);
+        while out < max {
+            let p = f.pos;
+            let d_e = emb(draft);
+            let mut rows = tok_e.clone();
+            rows.extend_from_slice(&d_e);
+            let t = std::time::Instant::now();
+            let (y, hn) = f.verify2(&rows).ok_or_else(fail)?;
+            t_ver += t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let hr = &hn;
+            rounds += 1;
+            if y[0] == draft {
+                f.accept2(2);
+                kept += 1;
+                let take = (max - out).min(2);
+                out += take;
+                if !keep(&y[..take]) || out >= max {
+                    break;
+                }
+                let (h0, h1) = (pick(&hn, &hr, 0), pick(&hn, &hr, 1));
+                tok = y[1];
+                tok_e = emb(tok);
+                draft = f
+                    .mtp_steps(&[(&h0, &d_e, p), (&h1, &tok_e, p + 1)], true)
+                    .ok_or_else(fail)?;
+                t_mtp += t.elapsed().as_secs_f64();
+            } else {
+                f.accept2(1);
+                out += 1;
+                if !keep(&y[..1]) || out >= max {
+                    break;
+                }
+                let h0 = pick(&hn, &hr, 0);
+                tok = y[0];
+                tok_e = emb(tok);
+                draft = f.mtp_steps(&[(&h0, &tok_e, p)], true).ok_or_else(fail)?;
+                t_mtp += t.elapsed().as_secs_f64();
+            }
+        }
+        if prof {
+            eprintln!(
+                "nemotron draft: {kept}/{rounds} drafts kept ({:.1}%), {:.2} tokens per pass, verify {:.2} ms, draft {:.2} ms per round",
+                100.0 * kept as f64 / rounds.max(1) as f64,
+                out as f64 / (rounds + 1) as f64,
+                t_ver * 1e3 / rounds.max(1) as f64,
+                t_mtp * 1e3 / (rounds + 1) as f64
+            );
+        }
+        Ok(())
+    }
+
+    /// Expert `e` of MoE block `moe` over `n` normed rows:
+    /// `down(relu²(up(x)))`, unweighted, `[n · hidden]`.
+    fn complete_rows(&self, moe: usize, e: usize, x: &[f32], n: usize, pool: Option<&Pool>) -> Vec<f32> {
+        let g = &self.g;
+        let Some(w) = self
+            .blocks
+            .iter()
+            .filter_map(|b| match &b.mixer {
+                Mixer::Moe(w) => Some(w),
+                _ => None,
+            })
+            .nth(moe)
+        else {
+            return Vec::new();
+        };
+        let mut mid = vec![0.0f32; n * g.moe_inter];
+        project(&w.up[e], x, n, &mut mid, pool);
+        for v in mid.iter_mut() {
+            *v = relu2(*v);
+        }
+        let mut y = vec![0.0f32; n * g.hidden];
+        project(&w.down[e], &mid, n, &mut y, pool);
+        y
+    }
+
+    /// The outputs of routed experts the device bank does not hold, for
+    /// one row: `down(relu²(up(xn)))`, unweighted.
+    fn complete(
+        &self,
+        moe: usize,
+        xn: &[f32],
+        picks: &[(usize, f32)],
+        missing: &[usize],
+        pool: Option<&Pool>,
+    ) -> Vec<Vec<f32>> {
+        let g = &self.g;
+        let Some(w) = self
+            .blocks
+            .iter()
+            .filter_map(|b| match &b.mixer {
+                Mixer::Moe(w) => Some(w),
+                _ => None,
+            })
+            .nth(moe)
+        else {
+            return Vec::new();
+        };
+        missing
+            .iter()
+            .map(|&i| {
+                let e = picks[i].0;
+                let mut mid = vec![0.0f32; g.moe_inter];
+                project(&w.up[e], xn, 1, &mut mid, pool);
+                for v in mid.iter_mut() {
+                    *v = relu2(*v);
+                }
+                let mut y = vec![0.0f32; g.hidden];
+                project(&w.down[e], &mid, 1, &mut y, pool);
+                y
+            })
+            .collect()
     }
 }
 
@@ -797,11 +1257,17 @@ impl NemotronH {
     pub fn frame_seed(&self, _st: &State) -> bool {
         false
     }
-    pub fn frame_greedy(&self, _row: &[f32], _steps: usize) -> Option<Vec<u32>> {
-        None
+    pub fn frame_prefill(&self, _rows: &[f32], _next: Option<&[f32]>, _pool: Option<&Pool>) -> bool {
+        false
     }
-    pub fn frame_prefill(&self, _rows: &[f32], _steps: usize) -> Option<Vec<u32>> {
-        None
+    pub fn frame_decode(
+        &self,
+        _row: &[f32],
+        _max: usize,
+        _pool: Option<&Pool>,
+        _keep: impl FnMut(&[u32]) -> bool,
+    ) -> Result<(), String> {
+        Err("no device decode frame".into())
     }
 }
 
@@ -962,6 +1428,8 @@ mod tests {
             n_mamba: 1,
             n_attn: 1,
             model: None,
+            hot: Vec::new(),
+            mtp: None,
             capture: std::sync::Mutex::new(None),
             #[cfg(feature = "gpu")]
             frame: std::sync::Mutex::new(None),
