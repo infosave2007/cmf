@@ -13234,7 +13234,11 @@ fn o1_far(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index
     let h = rr / of_p.m;
     let i = rr % of_p.m;
     let len = of_meta[g * 4u];
-    if (len < of_p.w) { return; }
+    // Per-group window (meta slot 3; 0 = the layer's); of_p.w is the ring
+    // STRIDE, the widest group's window.
+    let gw = of_meta[g * 4u + 3u];
+    let wg = select(of_p.w, gw, gw != 0u);
+    if (len < wg) { return; }
     let slot = of_meta[g * 4u + 1u];
     let d = of_p.d;
     let qb = ((g * of_p.hpg + h) * of_p.m + i) * d;
@@ -13298,8 +13302,10 @@ fn o1_push(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_inde
     let g = wid.x;
     let len = op_meta[g * 4u];
     let head = op_meta[g * 4u + 1u];
+    let gw = op_meta[g * 4u + 3u];
+    let wg = select(op_p.w, gw, gw != 0u);
     var slot = len;
-    if (len == op_p.w) { slot = head; }
+    if (len == wg) { slot = head; }
     let d = op_p.d;
     var t = lid;
     loop {
@@ -13320,8 +13326,8 @@ fn o1_push(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_inde
     }
     workgroupBarrier();
     if (lid == 0u) {
-        if (len == op_p.w) {
-            op_meta[g * 4u + 1u] = (head + 1u) % op_p.w;
+        if (len == wg) {
+            op_meta[g * 4u + 1u] = (head + 1u) % wg;
             op_meta[g * 4u + 2u] = op_meta[g * 4u + 2u] + 1u;
         } else {
             op_meta[g * 4u] = len + 1u;
@@ -47588,7 +47594,6 @@ fn o1_views_valid(
         && views.iter().all(|v| {
             o1_view_valid(v, nh, nkv, hd)
                 && v.m_eff == first.m_eff
-                && v.w == first.w
                 && v.sink_len == first.sink_len
                 && v.d == first.d
                 && v.dv == first.dv
@@ -47660,7 +47665,10 @@ fn o1_ensure(
     }
     tracing::info!("o1_ensure: UPLOADING layer {li} (epoch {epoch})");
     let g0 = views.first()?;
-    let (gcnt, hcnt, m, w, ns) = (views.len(), g0.heads.len(), g0.m_eff, g0.w, g0.sink_len);
+    // Groups may widen their own window (`nystrom::wide_window`): the ring
+    // stride is the widest one, each group's width rides in meta slot 3.
+    let w = views.iter().map(|v| v.w).max()?;
+    let (gcnt, hcnt, m, ns) = (views.len(), g0.heads.len(), g0.m_eff, g0.sink_len);
     // Landmark threads park at lane 200+ in the attend kernel.
     //
     // A refusal here silently costs the whole token its graph — 6.4
@@ -47680,12 +47688,11 @@ fn o1_ensure(
         return None;
     }
     for v in views {
-        if v.m_eff != m || v.w != w || v.sink_len != ns || v.heads.len() != hcnt {
+        if v.m_eff != m || v.sink_len != ns || v.heads.len() != hcnt {
             graph_refused("o1 groups disagree on geometry");
             tracing::warn!(
-                "o1_ensure L{li}: group m_eff {} w {} sink {} heads {} vs first {m}/{w}/{ns}/{hcnt}",
+                "o1_ensure L{li}: group m_eff {} sink {} heads {} vs first {m}/{ns}/{hcnt}",
                 v.m_eff,
-                v.w,
                 v.sink_len,
                 v.heads.len()
             );
@@ -47707,8 +47714,14 @@ fn o1_ensure(
     let (mut rk, mut rv, mut sk, mut sv, mut kt) = (vec![], vec![], vec![], vec![], vec![]);
     let (mut qt, mut mu, mut mz, mut th) = (vec![], vec![], vec![], vec![]);
     for v in views {
-        meta.extend_from_slice(&[v.win_len as u32, v.win_head as u32, v.far_len as u32, 0]);
-        // Ring buffers are cap-sized already (cap = w in skeleton mode).
+        meta.extend_from_slice(&[
+            v.win_len as u32,
+            v.win_head as u32,
+            v.far_len as u32,
+            v.w as u32,
+        ]);
+        // Ring buffers are cap-sized (cap = the group's w in skeleton mode);
+        // pad each to the layer stride.
         rk.extend_from_slice(v.win_k);
         rk.resize(rk.len() + (w * d - v.win_k.len().min(w * d)), 0.0);
         rv.extend_from_slice(v.win_v);
@@ -51153,15 +51166,23 @@ mod tests {
         let _op = c.op_gate.enter();
         // Production geometry (Qwen3.6): the small-dim version passed while
         // the real model garbled, so the test runs BOTH.
-        for (d, dv, m, w, sink, hpg, t) in [
-            (8usize, 8usize, 4usize, 8usize, 2usize, 2usize, 40usize),
-            (256, 256, 32, 128, 4, 8, 430),
+        // `w2` is the second group's window (`NystromState::with_window`):
+        // a widened group shares the layer's ring stride (the widest window)
+        // but wraps and evicts at its own width.
+        for (d, dv, m, w, sink, hpg, t, w2) in [
+            (8usize, 8usize, 4usize, 8usize, 2usize, 2usize, 40usize, 8usize),
+            (256, 256, 32, 128, 4, 8, 430, 128),
+            // Wide second group, ring full and evicting at 24.
+            (8, 8, 4, 8, 2, 2, 40, 24),
+            // Wide second group whose prompt still fits its ring (far empty)
+            // next to a narrow group with a far field.
+            (256, 256, 32, 128, 4, 8, 430, 512),
             // Exercise the extended near grid with a real >256 score count
             // while keeping the fixture small enough for a unit test.  The
             // production-sized d=256 case above still guards the normal
             // upload/layout geometry; this case specifically catches stale
             // one-lane indexing and the landmark-lane collision at w2048.
-            (8, 8, 4, 2048, 4, 2, 2064),
+            (8, 8, 4, 2048, 4, 2, 2064, 2048),
         ] {
             let jit = |a: usize, b: usize| ((a * 37 + b * 13 + 3) % 83) as f32 / 83.0 - 0.5;
             let ks: Vec<f32> = (0..t * d).map(|i| jit(i, 1)).collect();
@@ -51176,7 +51197,7 @@ mod tests {
             // TWO groups — the production model has nkv=2, and the group
             // concatenation in the upload plus every g-offset in the kernels
             // is exactly what a single-group test cannot catch.
-            let mut st2 = crate::nystrom::NystromState::new_group(m, w, sink, hpg);
+            let mut st2 = crate::nystrom::NystromState::new_group(m, w, sink, hpg).with_window(w2);
             let qs2_own: Vec<Vec<f32>> = (0..hpg)
                 .map(|h| (0..t * d).map(|i| jit(i, 23 + h)).collect())
                 .collect();
@@ -51250,7 +51271,7 @@ mod tests {
                 [
                     hpg as u32,
                     mv as u32,
-                    w as u32,
+                    w.max(w2) as u32,
                     (sink as u32) | (u32::from(rect_fm) << 8),
                     d as u32,
                     dv as u32,
@@ -51322,24 +51343,34 @@ mod tests {
                 let mut near_k = Vec::with_capacity(gcnt);
                 let mut near_v = Vec::with_capacity(gcnt);
                 for (g, view) in views.iter().enumerate() {
-                    let post_len = if view.win_len == w {
-                        w
+                    let vw = view.w;
+                    let post_len = if view.win_len == vw {
+                        vw
                     } else {
                         view.win_len + 1
                     };
-                    let post_head = if view.win_len == w {
-                        (view.win_head + 1) % w
+                    let post_head = if view.win_len == vw {
+                        (view.win_head + 1) % vw
                     } else {
                         view.win_head
                     };
-                    empty_meta.extend_from_slice(&[post_len as u32, post_head as u32, 0, 0]);
-                    let slot = if view.win_len == w {
+                    empty_meta.extend_from_slice(&[
+                        post_len as u32,
+                        post_head as u32,
+                        0,
+                        vw as u32,
+                    ]);
+                    let slot = if view.win_len == vw {
                         view.win_head
                     } else {
                         view.win_len
                     };
+                    // The device ring is padded to the layer stride.
+                    let stride = w.max(w2);
                     let mut rk = view.win_k.to_vec();
                     let mut rv = view.win_v.to_vec();
+                    rk.resize(stride * d, 0.0);
+                    rv.resize(stride * dv, 0.0);
                     rk[slot * d..(slot + 1) * d].copy_from_slice(&k_new[g * d..(g + 1) * d]);
                     rv[slot * dv..(slot + 1) * dv].copy_from_slice(&v_new[g * dv..(g + 1) * dv]);
                     near_k.push((rk, post_len));
@@ -51419,7 +51450,7 @@ mod tests {
                     .fold(0.0f32, f32::max);
                 assert!(
                     md_empty < 1e-3,
-                    "wgpu o1 far-empty ≠ exact near (d={d} m={m} w={w} hpg={hpg}): max|Δ| = {md_empty}"
+                    "wgpu o1 far-empty ≠ exact near (d={d} m={m} w={w}/{w2} hpg={hpg}): max|Δ| = {md_empty}"
                 );
             }
             c.o1m.lock().unwrap().remove(&(u64::MAX, usize::MAX));
@@ -51438,7 +51469,7 @@ mod tests {
                 .fold(0.0f32, f32::max);
             assert!(
                 md < 1e-3,
-                "wgpu o1 step ≠ CPU (d={d} m={m} w={w} hpg={hpg}): max|Δ| = {md}"
+                "wgpu o1 step ≠ CPU (d={d} m={m} w={w}/{w2} hpg={hpg}): max|Δ| = {md}"
             );
         }
     }

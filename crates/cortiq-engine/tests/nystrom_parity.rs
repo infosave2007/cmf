@@ -581,3 +581,49 @@ fn o1c_file_round_trip_and_geometry_check() {
         "file skeleton differs"
     );
 }
+
+/// A widened group (`with_window`) whose window covers the whole stream
+/// is exact attention — and it still seals in skeleton mode at the
+/// layer's (narrow) boundary, so the device keeps every group of the
+/// layer. The retrieval lever rests on both halves.
+#[test]
+fn wide_window_group_is_exact_attention() {
+    let (d, dv, m, w, sink, t, p) = (
+        16usize, 16usize, 8usize, 16usize, 4usize, 200usize, 120usize,
+    );
+    let mut rng = Lcg(31337);
+    let k: Vec<Vec<f32>> = (0..t)
+        .map(|_| rng.vec(d).iter().map(|x| x * 2.0).collect())
+        .collect();
+    let v: Vec<Vec<f32>> = (0..t).map(|_| rng.vec(dv)).collect();
+    let q: Vec<Vec<f32>> = (0..t)
+        .map(|_| rng.vec(d).iter().map(|x| x * 2.0).collect())
+        .collect();
+    let fl = |rows: &[Vec<f32>]| -> Vec<f32> { rows[..p].iter().flatten().copied().collect() };
+    let mut st = NystromState::new(m, w, sink).with_window(256);
+    st.prefill(&fl(&q), &fl(&k), &fl(&v), p, d, dv);
+    assert!(
+        !st.device_view().exact_only,
+        "a wide group must seal in skeleton mode"
+    );
+    assert_eq!(st.device_view().w, 256);
+    let mut out = vec![0.0f32; dv];
+    for i in p..t {
+        st.step(&q[i], &k[i], &v[i], &mut out);
+        let want = softmax_row(&q[i], &k, &v, i, dv);
+        let worst = out
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 1e-5,
+            "pos {i}: wide group drifted from softmax by {worst}"
+        );
+    }
+    assert_eq!(
+        st.far_len(0),
+        0,
+        "nothing may leave a window that covers the stream"
+    );
+}

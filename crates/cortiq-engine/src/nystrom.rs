@@ -254,6 +254,34 @@ impl O1Calib {
     }
 }
 
+/// `CMF_O1_WIDE="layer:group,..."` — KV groups whose exact window widens
+/// to `CMF_O1_WIDE_W` keys (default 2048, the device's sink + window cap
+/// with the default 4 sinks). Copying heads lose a key the moment it
+/// leaves the window; a wide window keeps recall exact out to its width
+/// while the state stays O(1). Returns the width for (layer, group).
+pub fn wide_window(layer: u32, group: usize) -> Option<usize> {
+    static CFG: std::sync::OnceLock<(Vec<(u32, usize)>, usize)> = std::sync::OnceLock::new();
+    let (set, w) = CFG.get_or_init(|| {
+        let set = std::env::var("CMF_O1_WIDE")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .filter_map(|p| {
+                        let (l, g) = p.trim().split_once(':')?;
+                        Some((l.parse().ok()?, g.parse().ok()?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let w = std::env::var("CMF_O1_WIDE_W")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2048);
+        (set, w)
+    });
+    set.contains(&(layer, group)).then_some(*w)
+}
+
 /// Landmark budget a calibration file may carry — the device mirror's
 /// limit, so a calibrated seal stays graph-portable.
 const O1_MAX_CALIB_M: usize = 32;
@@ -333,6 +361,11 @@ struct NystromGroup {
     m: usize,
     /// Exact-window width in keys.
     w: usize,
+    /// The window the layer was configured with. A widened group
+    /// (`with_window`) still decides exact-only against it, so it seals at
+    /// the same boundary as its narrow neighbours — the device needs every
+    /// group of a layer in skeleton mode.
+    base_w: usize,
     /// Permanent exact sink keys at positions 0..sink (spec §5b).
     sink: usize,
     d: usize,
@@ -544,6 +577,7 @@ impl NystromState {
             group: NystromGroup {
                 m,
                 w,
+                base_w: w,
                 sink,
                 d: 0,
                 dv: 0,
@@ -567,6 +601,15 @@ impl NystromState {
             heads: (0..q_heads).map(|_| NystromHead::new()).collect(),
             calib: None,
         }
+    }
+
+    /// Widen this group's exact window to `w` keys (builder). The
+    /// retrieval lever: a copying head reads every key of the last `w`
+    /// exactly, while the group's state stays a fixed-size ring.
+    pub fn with_window(mut self, w: usize) -> Self {
+        assert!(w >= 1, "window must hold at least one key");
+        self.group.w = w;
+        self
     }
 
     /// Seal against a calibrated skeleton (builder; see `O1Calib`).
@@ -850,7 +893,7 @@ impl NystromGroup {
         // (w + sink + slack + 1), so a converted prompt never enters the
         // exact-only state. Direct Nystrom users retain the historical
         // exact-only behavior for short prefills.
-        self.exact_only = o1_deferred_boundary(self.w, self.sink)
+        self.exact_only = o1_deferred_boundary(self.base_w, self.sink)
             .map(|boundary| t < boundary)
             .unwrap_or(true);
         if self.exact_only {
