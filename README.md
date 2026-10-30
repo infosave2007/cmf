@@ -123,7 +123,7 @@ The source is used as the teacher and the command creates or reuses
 `task-model.tdata`, writes an auditable plan, and verifies the runnable output.
 It is physical MTP-draft compaction, not general fine-tuning: trunk weights and
 greedy output remain verifier-controlled. See the [MTP compaction guide](docs/MTP_COMPACTION.ru.md)
-for JSONL input, safety gates, and Metal/Vulkan validation.
+(in Russian) for JSONL input, safety gates, and Metal/Vulkan validation.
 
 ## Tencent Hy-MT2 (HunYuan)
 
@@ -286,7 +286,7 @@ precision while large matrix blocks use a compact codec.
 | `q1g` | trained binary with the native 128-weight scale group (1.125 bpw); a lossless `requant --quant q1g` of such a `q1` file |
 
 See [Q1T/PTQ](docs/Q1T_PTQ.md) for the experimental low-bit path and the
-[quantization coverage matrix](docs/QUANT_COVERAGE.ru.md) for codec support by
+[quantization coverage matrix](docs/QUANT_COVERAGE.ru.md) (in Russian) for codec support by
 execution path.
 
 The `q2tp_affine` profile is an explicit Prism/Bonsai operator, not a
@@ -335,16 +335,16 @@ fails.
   [method article](docs/research/TASK_COMPRESSION_ARTICLE.md) and the
   [Qwen3.8-27B → 14B run](docs/research/QWEN38_27B_TASK_COMPRESSION.md).
 - [GPU kernel recipes](docs/GPU_KERNEL_RECIPES.md) — backend measurements.
-- [Multi-GPU execution](docs/MULTI_GPU.md) and [mobile split](docs/MOBILE_SPLIT.ru.md).
+- [Multi-GPU execution](docs/MULTI_GPU.md) and [mobile split](docs/MOBILE_SPLIT.ru.md) (in Russian).
 - [FCD restoration](docs/RUST_FCD.md) and [low-bit PTQ](docs/Q1T_PTQ.md).
-- [MTP FFN compaction](docs/MTP_COMPACTION.ru.md) — независимая калибровка и
-  физическое уменьшение MTP-draft FFN.
+- [MTP FFN compaction](docs/MTP_COMPACTION.ru.md) — independent calibration and
+  physical shrinking of the MTP draft's FFN (in Russian).
 - [Qwen Image Edit](docs/QWEN_IMAGE.md) — one-file native image editing and
   standalone component staging.
 - [Model cards and conversion notes](docs/hf/README.md).
 - [Cortiq Spectra](docs/SPECTRA.ru.md) — deterministic CPU streaming colorization
   for dual-energy X-ray captures, scanner profiles, refusal masks, and measured
-  limits (Russian).
+  limits (in Russian).
 
 ## Build from source
 
