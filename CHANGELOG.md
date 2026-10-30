@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- d1 decision models (Liquid AI's System One on LFM3): `cortiq system-one`
+  and `POST /v1/system_one` take a state (text, JSON or none), pictures, on
+  d1-Omni audio clips, and named questions, and answer from one forward pass
+  with no generated tokens (`d1.rs`, `d1_parse.rs`). The `set` packing of d1
+  (a state read both ways by the full-attention layers, each question reading
+  the state and itself; sliding layers and short convolutions causal), every
+  question type — `noul`, `choice` (one or several), `score`, `text` /
+  `number` / `date` read from the state with their spans, estimates on a
+  grid, `box` / `boxes` — and the release's calibration, which the converter
+  keeps in the file (`provenance.d1`). The whole pass, the vocabulary head
+  over the answer slots included, runs in one device submission
+  (`gpu_metal::lfm_set`, `gpu_wgpu::lfm_set`: the batch GEMMs, the short
+  convolution walked over the positions, the set-mask attention with an
+  online softmax, the per-head gate): on an NVIDIA A40 one question answers
+  in ~45 ms (q4tp) where the per-op path took 143 ms, a 228-token request in
+  ~100 ms (655); on an Apple M4 in 79 ms (185). Against Transformers float32
+  every answer of the test battery (19 questions, a picture included) is the
+  same; probabilities differ by at most 0.014 (q8_2f).
+- LFM3-Audio and LFM3-Omni speech (`lfm3_audio.rs`, `lfm3_speech.rs`).
+  Input: Liquid's log-mel features, the stride-8 convolutional downsampler,
+  the 17-layer LFM2 encoder (attention causal within 32 tokens) and the
+  projector, f32 on the host — the rows match Transformers to 4e-6 and the
+  test transcripts word for word (`cortiq run --audio`, `input_audio` parts
+  in `/v1/chat/completions`). Output: `cortiq run --speech-out FILE.wav`
+  generates speech frames — the depth decoder reveals the 12 codebooks in
+  three MaskGIT passes, the frame's codebook embeddings feed the next step —
+  and LiquidCodec's decoder (FSQ codes, an eight-layer LFM3, inverse STFT)
+  writes 24 kHz audio; `--speech-mode mixed` is Liquid's interleaved voice
+  chat. With greedy codes in a fixed order an f16 file reproduces
+  Transformers' frames exactly. The converter bundles the codec
+  (`audio_tokenizer/model.safetensors`) into the file as `codec.*` and keeps
+  the speech sampling the release recommends. LFM3-Omni takes pictures,
+  video and speech in one prompt. `cortiq run --system` sets the system
+  message (the speech tasks read it).
+- The Metal token graph takes LFM2/LFM3 short-convolution layers
+  (`sconv_step`, the ring in the host layout) and plain-weight sandwich
+  norms: LFM3-1.7B on an M4 decodes 84 tok/s (q4tp, was 61) and reads a
+  1k-token prompt at 560 tok/s (315); the decode-path perplexity equals the
+  CPU's.
+
+### Changed
+- The host GEMM splits the output columns across the pool when a call has
+  128 rows or fewer; such calls ran on one thread on Linux (a speech frame's
+  depth decoder, a short clip's audio encoder).
+
 ## [0.8.49] — 2026-10-30
 
 ### Added
