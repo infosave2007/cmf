@@ -395,8 +395,31 @@ fn resolve(c: &Ctx, model: &Arc<CmfModel>, w: SetW) -> Option<Proj> {
 fn mm(c: &Ctx, enc: &mut wgpu::CommandEncoder, w: &Proj, xs: &wgpu::Buffer, y: &wgpu::Buffer, k: usize) {
     let (rows, cols) = (w.rows, w.cols);
     match &w.w {
+        // The batch graph's arms by batch size: the batched matvec for a
+        // few rows (the head over one or two answer slots), the four-row
+        // one to 16, the tile GEMMs beyond.
         W::Q4(b) => {
-            if !(k > 16 && dense_batch::encode_q4tp_mm_r(c, enc, b, xs, y, rows, cols, k)) {
+            if k <= 4 && cols / 32 <= 64 && c.use_mv4 {
+                let p_buf = q4tp_mv_params(c, cols / 32, rows, k);
+                let layout = c.q4tp_mv_k.get_bind_group_layout(0);
+                let bind = c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &layout,
+                    entries: &[
+                        bind_buf(0, b),
+                        bind_buf(2, y),
+                        bind_buf(3, &p_buf),
+                        bind_buf(4, b),
+                        bind_buf(5, xs),
+                    ],
+                });
+                let mut pass = begin_pass(enc);
+                pass.set_pipeline(&c.q4tp_mv_k);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.dispatch_workgroups((rows as u32).div_ceil(8).min(MAX_WG), 1, 1);
+            } else if k <= 16 && c.use_mv4 {
+                let _ = encode_q4tp_mv4_b_with(c, enc, b, xs, y, rows, cols, k, false);
+            } else if !(k > 16 && dense_batch::encode_q4tp_mm_r(c, enc, b, xs, y, rows, cols, k)) {
                 encode_q4_tile_mm(c, enc, &c.q4tp_mm, b, xs, y, rows, cols, k);
             }
         }
