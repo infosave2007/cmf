@@ -27,6 +27,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   check runs in `cortiq tube-bake`; two bold cells of the coverage matrix
   rendered as literal asterisks.
 
+## [0.8.47] — 2026-10-30
+
+### Added
+- NVIDIA Nemotron 3.5 Transcribe 30B-A4B. `cortiq convert` packs the NeMo
+  checkpoint into one CMF (audio towers, Nemotron-H decoder, MTP layers, the
+  word-timestamp head and both tokenizers; `--quant q8_2f | q4tp | q2tp`);
+  `cortiq quantize-moe` GPTQ-encodes its relu² experts; `CMF_NEMO_BASE=<cmf>`
+  repacks an existing file without quantizing again. `cortiq transcribe` runs
+  the whole pipeline in Rust — log-mel, ASR encoder, Sortformer diarization
+  with the offline speaker cache, decoder — with `--prompt`, `--timestamps`
+  and `--stats`, several files per model load. Parity with Transformers: ASR
+  encoder relative error 5e-7 – 7e-6, speaker activities identical, next-token
+  argmax 96–100 %. WER 2.09 % (q8_2f) / 2.26 % (q4tp) on 73 LibriSpeech
+  clips, q4tp 1.44 % on test-clean.
+- Nemotron wgpu decode frame: the whole token in one pass of fused kernels
+  (norms folded into the projections, residual adds into epilogues, router
+  top-k into the expert kernel), the prompt 64 positions per pass, the audio
+  towers on the device. Speculative decoding with the model's MTP layer
+  (two-position verify pass, Mamba-state rollback): 96 % of drafts kept,
+  output identical to greedy. RTX 3090, q4tp: a 29.4 s recording in 1.82 s
+  (RTF 0.062). `CMF_NEMO_MTP=0` turns speculation off.
+- Partial expert banks: when the routed experts do not fit the card, each MoE
+  layer keeps its most used experts on the device and the CPU computes the
+  rest from the mapped file; experts that keep being picked move onto the
+  card (`CMF_NEMO_EXPERT_GB` sets the budget). The q8_2f file runs on a 24 GB
+  card at RTF 0.19–0.25 (CPU only: 0.83).
+- Word timestamps (`--timestamps`): the CTC timestamp head and the reference
+  aligner (CTC forced alignment, speaker matching, diarization snapping); word
+  times identical to Transformers.
+
 ## [0.8.46] — 2026-10-30
 
 ### Fixed
