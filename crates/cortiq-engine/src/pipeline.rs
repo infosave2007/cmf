@@ -31,6 +31,29 @@ use cortiq_core::types::NormStyle;
 pub static GLOBAL_USE_GPU: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// One MoE layer's expert bank as the resident token graph reads it: the
+/// `(gate, up, down)` tensor indices in routing order (the in-bank shared
+/// expert last), the layer's uniform layout flags and activation, and the
+/// file that holds them. A pure function of the layer's weights — walking
+/// 257 experts × 3 matrices per layer per token was ~2 ms of host time a
+/// token on a 40-layer 256-expert stack, so the walk runs once a layer.
+#[derive(Clone)]
+struct GraphMoeBank {
+    experts: Vec<(usize, usize, usize)>,
+    q4tp: Option<bool>,
+    gu_q2: Option<bool>,
+    q82: Option<bool>,
+    act: Option<crate::gpu::GraphAct>,
+    model: Option<std::sync::Arc<cortiq_core::CmfModel>>,
+}
+
+/// Identity of the weights a `GraphMoeBank` was built from: the physical
+/// layer, the expert table's storage and length, the in-bank shared expert,
+/// and the first and last expert tensors' (file, index) — so a table
+/// rebuilt at a reused address (a skill, a grown expert) cannot alias an
+/// old entry.
+type GraphMoeKey = (usize, usize, usize, usize, usize, usize, usize);
+
 // MTP compaction statistics must describe the dense draft that will be
 // serialized, not an ambient serving experiment such as gate/oracle top-k.
 // A thread-local nesting counter keeps the guard local to calibration and
@@ -171,6 +194,9 @@ pub struct Pipeline {
     /// generation API can return an error instead of reporting a successful
     /// `finish_reason: cancelled` result.
     graph_failed: std::sync::atomic::AtomicBool,
+    /// Resident-graph MoE expert banks, built once per layer
+    /// (`GraphMoeBank`). `CMF_GRAPH_MOE_BANK=0` rebuilds them every token.
+    graph_moe_banks: std::sync::Mutex<std::collections::HashMap<GraphMoeKey, GraphMoeBank>>,
     /// Token ids currently materialized in the KV cache (the forwarded
     /// prompt + all generated tokens except the last, which is sampled
     /// but not yet forwarded). Lets the next generate call prefill only
@@ -1130,6 +1156,13 @@ pub(crate) fn spec_time_level() -> u8 {
         Ok(v) => v.trim().parse::<u8>().map(|n| n.max(1)).unwrap_or(1),
         Err(_) => 0,
     })
+}
+
+/// `GraphMoeBank` reuse across tokens (`CMF_GRAPH_MOE_BANK=0` rebuilds
+/// every layer's bank on every token, the route before the cache).
+fn graph_moe_bank_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_GRAPH_MOE_BANK").as_deref() != Ok("0"))
 }
 
 /// Decide whether the batched speculative verifier is admitted by the
@@ -3744,6 +3777,7 @@ impl Pipeline {
             logit_multiplier: None,
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             graph_failed: std::sync::atomic::AtomicBool::new(false),
+            graph_moe_banks: std::sync::Mutex::new(std::collections::HashMap::new()),
             kv_history: Vec::new(),
             kv_history_device: false,
             short_conv_cfg: None,
@@ -4200,8 +4234,9 @@ impl Pipeline {
         }
         #[cfg(not(target_os = "macos"))]
         if self.graph_prefill_preferred() && !self.o1_active() {
-            // MoE stacks keep the 32 their expert-grouped prefill was
-            // measured at; 128 is measured on the dense hybrids only.
+            // 128 is measured on the dense hybrids; MoE stacks other than
+            // the two expert codecs below keep the 32 their expert-grouped
+            // prefill was measured at.
             let moe = self
                 .weights
                 .layers
@@ -4217,8 +4252,20 @@ impl Pipeline {
                     matches!(&lw.ffn, FfnKind::Moe(m)
                         if m.experts.first().is_some_and(|e| e.gate_proj.mapped_q8_2f().is_some()))
                 });
+            // q4tp experts: the grouped GEMM reads every routed expert once
+            // per chunk, and 32 rows (256 entries over 256 experts, about
+            // one row each) re-read nearly the whole expert set every 32
+            // tokens. Apex-35B q4tp on an A40, 4096-token prompt, MTP off:
+            // 295 tok/s at 32 rows, 357 at 64, 385 at 128, 401 at 256,
+            // 396 at 512.
+            let q4tp_moe = self.weights.layers.iter().any(|lw| {
+                matches!(&lw.ffn, FfnKind::Moe(m)
+                    if m.experts.first().is_some_and(|e| e.gate_proj.mapped_q4tp().is_some()))
+            });
             return if q82 {
                 128
+            } else if q4tp_moe {
+                256
             } else if moe {
                 32
             } else {
@@ -4844,7 +4891,19 @@ impl Pipeline {
                 }
             }
         }
-        let spec_default_ok = dense_n == 0 || dense_q4tp * 10 >= dense_n * 9;
+        // …and only where the MTP block itself runs on the graph. A MoE
+        // draft block (Qwen3.6-35B-A3B, Apex-35B: 256 experts in the MTP
+        // layer) fails `mtp_graph_ok`, so it drafts — and warms its cache
+        // over the whole prompt — op by op on the host. Apex-35B q4tp on an
+        // A40 + Xeon Gold 6342: greedy 51.8 against 65.6 tok/s plain (300
+        // tokens, 57 % accepted), and 2.5 ms per prompt position (a
+        // 4096-token ingest 171 against 295 tok/s); the published
+        // Qwen3.6-35B-A3B 79.7 against 86.6. `CMF_GRAPH_SPEC=1` opts in.
+        #[cfg(feature = "gpu")]
+        let mtp_on_graph = self.mtp.as_ref().is_none_or(|m| self.mtp_graph_ok(m));
+        #[cfg(not(feature = "gpu"))]
+        let mtp_on_graph = true;
+        let spec_default_ok = (dense_n == 0 || dense_q4tp * 10 >= dense_n * 9) && mtp_on_graph;
         // Penalties break the draft head's agreement with the trunk (a
         // 1.1 repetition penalty measured 2 of 16 accepted): not by
         // default there either — off Metal that rule is untouched, and
@@ -13301,7 +13360,34 @@ impl Pipeline {
                         );
                         return None;
                     }
+                    let in_bank_shared = shared.filter(|_| has_shared).map(|(se, _)| se);
+                    let edge = |t: &QTensor| {
+                        t.graph_weight()
+                            .or_else(|| t.graph_weight_descriptor())
+                            .map(|(mm, i, _, _)| (std::sync::Arc::as_ptr(mm) as usize, i))
+                    };
+                    let bank_key: Option<GraphMoeKey> = match (
+                        m.experts.first().and_then(|e| edge(&e.gate_proj)),
+                        m.experts.last().and_then(|e| edge(&e.down_proj)),
+                    ) {
+                        (Some((fm, fi)), Some((_, di))) if graph_moe_bank_on() => Some((
+                            self.phys_layer(li),
+                            m.experts.as_ptr() as usize,
+                            m.experts.len(),
+                            in_bank_shared.map_or(0, |se| std::ptr::from_ref(se) as usize),
+                            fm,
+                            fi,
+                            di,
+                        )),
+                        _ => None,
+                    };
+                    let cached =
+                        bank_key.and_then(|k| self.graph_moe_banks.lock().unwrap().get(&k).cloned());
+                    let bank = if let Some(b) = cached {
+                        b
+                    } else {
                     let mut experts = Vec::with_capacity(m.experts.len() + 1);
+                    let mut bank_model: Option<std::sync::Arc<cortiq_core::CmfModel>> = None;
                     // q4t or q4tp, but not both in one layer — the kernels
                     // are picked per layer, not per expert.
                     let mut q4tp: Option<bool> = None;
@@ -13314,11 +13400,7 @@ impl Pipeline {
                     // Bind an activation only when every routed (and in-bank
                     // shared) expert owns the same exact WGPU contract.
                     let mut moe_act = None;
-                    for e in m
-                        .experts
-                        .iter()
-                        .chain(shared.filter(|_| has_shared).map(|(se, _)| se).into_iter())
-                    {
+                    for e in m.experts.iter().chain(in_bank_shared.into_iter()) {
                         let Some(e_act) = e.act.wgpu_graph_act() else {
                             return None;
                         };
@@ -13416,13 +13498,29 @@ impl Pipeline {
                             );
                             return None;
                         }
-                        model.get_or_insert_with(|| mm.clone());
+                        bank_model.get_or_insert_with(|| mm.clone());
                         experts.push((gi, ui, di));
+                    }
+                    let b = GraphMoeBank {
+                        experts,
+                        q4tp,
+                        gu_q2,
+                        q82,
+                        act: moe_act,
+                        model: bank_model,
+                    };
+                    if let Some(k) = bank_key {
+                        self.graph_moe_banks.lock().unwrap().insert(k, b.clone());
+                    }
+                    b
+                    };
+                    if let Some(mm) = &bank.model {
+                        model.get_or_insert_with(|| mm.clone());
                     }
                     crate::gpu::GraphFfn::Moe {
                         router,
                         shared_gate: sgate,
-                        experts,
+                        experts: bank.experts,
                         n_exp: m.experts.len(),
                         // CMF_TOPK_PROBE: timing probe only — output is WRONG.
                         // Fewer experts shrink the MoE arithmetic while the
@@ -13435,11 +13533,11 @@ impl Pipeline {
                             .filter(|k| *k > 0 && *k <= m.top_k)
                             .unwrap_or(m.top_k),
                         inter,
-                        act: moe_act?,
+                        act: bank.act?,
                         norm_topk: m.norm_topk_prob,
-                        q4tp: q4tp?,
-                        gu_q2: gu_q2.unwrap_or(false),
-                        q82: q82.unwrap_or(false),
+                        q4tp: bank.q4tp?,
+                        gu_q2: bank.gu_q2.unwrap_or(false),
+                        q82: bank.q82.unwrap_or(false),
                         sigmoid: m.router_sigmoid,
                         sigmoid_denom_eps: m.sigmoid_denom_eps,
                         bias: m.expert_bias.as_deref(),

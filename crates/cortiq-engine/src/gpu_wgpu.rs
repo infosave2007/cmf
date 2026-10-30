@@ -26716,15 +26716,44 @@ fn graph_layer_payload_bytes(
                 add(&shared.up)?;
                 add(&shared.down)?;
             }
-            for &(g, u, d) in experts {
-                for idx in [g, u, d] {
-                    if tensor_seen.insert(idx) {
-                        total = total.checked_add(model.tensors.get(idx)?.nbytes as u64)?;
-                    }
-                }
+            // Expert tensors are their own: none of them is an attention,
+            // router or shared-gate tensor counted above.
+            total = total.checked_add(moe_experts_payload_bytes(model, experts)?)?;
+        }
+    }
+    Some(total)
+}
+
+/// Bytes of one MoE layer's expert tensors, each counted once — memoized
+/// per (file, table): the table is fixed for a loaded model, and hashing
+/// its 768 indices into a fresh set on every token was a large part of
+/// the token graph's host setup on a 40-layer, 256-expert stack.
+fn moe_experts_payload_bytes(
+    model: &Arc<CmfModel>,
+    experts: &[(usize, usize, usize)],
+) -> Option<u64> {
+    type Key = (u64, usize, usize);
+    static MEMO: OnceLock<Mutex<HashMap<Key, u64>>> = OnceLock::new();
+    // A fold over every index, not just the ends: two tables of one file
+    // cannot share a key unless they hold the same tensors.
+    let fold = experts.iter().fold(0usize, |h, &(g, u, d)| {
+        (h.rotate_left(7) ^ g).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ u ^ d.rotate_left(29)
+    });
+    let key = (model.uid(), experts.len(), fold);
+    let memo = MEMO.get_or_init(Default::default);
+    if let Some(&b) = memo.lock().unwrap().get(&key) {
+        return Some(b);
+    }
+    let mut seen = std::collections::HashSet::<usize>::new();
+    let mut total = 0u64;
+    for &(g, u, d) in experts {
+        for idx in [g, u, d] {
+            if seen.insert(idx) {
+                total = total.checked_add(model.tensors.get(idx)?.nbytes as u64)?;
             }
         }
     }
+    memo.lock().unwrap().insert(key, total);
     Some(total)
 }
 
@@ -27512,12 +27541,16 @@ pub fn forward_token_graph(
                     prefix = true;
                     break;
                 }
-                if experts.iter().flat_map(|&(g, u, d)| [g, u, d]).any(|idx| {
-                    model
-                        .tensors
-                        .get(idx)
-                        .is_some_and(|e| crate::prism::is_forward_weight(model, &e.name))
-                }) {
+                // A file without a Prism contract has no forward weights:
+                // skip the per-token walk over every expert tensor.
+                if crate::prism::has_contract(model)
+                    && experts.iter().flat_map(|&(g, u, d)| [g, u, d]).any(|idx| {
+                        model
+                            .tensors
+                            .get(idx)
+                            .is_some_and(|e| crate::prism::is_forward_weight(model, &e.name))
+                    })
+                {
                     graph_decline("Prism MoE experts require an unimplemented resident transform");
                     return token_graph_outcome(o1_started || state_started, false);
                 }
