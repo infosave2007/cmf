@@ -427,6 +427,57 @@ fn gemm_nt_cpu(
         return;
     }
     let nb = n.div_ceil(GEMM_BLOCK);
+    // Few rows (a depth decoder's 12 codebook slots, a short clip's 55
+    // encoder rows): one row block would leave every worker but one idle,
+    // so the columns are split instead — each worker owns whole output
+    // columns of every row.
+    if let Some(p) = pool.filter(|_| nb == 1 && m >= 64 && n * k * m >= 1 << 16) {
+        const CHUNK: usize = 16;
+        let nchunks = m.div_ceil(CHUNK);
+        let yp = SendMut(y.as_mut_ptr());
+        p.run(&|widx, nw| {
+            let yp = &yp;
+            for c in (widx..nchunks).step_by(nw) {
+                let (c0, c1) = (c * CHUNK, ((c + 1) * CHUNK).min(m));
+                let mut o = c0;
+                #[cfg(target_arch = "x86_64")]
+                if gemm_avx512() {
+                    while o + 4 <= c1 {
+                        let mut i = 0;
+                        while i + 4 <= n {
+                            // SAFETY: the ISA is checked above; the 4x4
+                            // block stays inside x, w and this worker's
+                            // columns of y.
+                            let acc = unsafe { gemm_block4x4_avx512(x, w, i, o, k) };
+                            for (di, ai) in acc.iter().enumerate() {
+                                for (dj, v) in ai.iter().enumerate() {
+                                    unsafe { *yp.0.add((i + di) * m + o + dj) = *v };
+                                }
+                            }
+                            i += 4;
+                        }
+                        for i in i..n {
+                            let xr = &x[i * k..(i + 1) * k];
+                            for dj in 0..4 {
+                                let wr = &w[(o + dj) * k..(o + dj + 1) * k];
+                                // SAFETY: column o + dj belongs to this worker.
+                                unsafe { *yp.0.add(i * m + o + dj) = crate::attention::dot_f32(xr, wr) };
+                            }
+                        }
+                        o += 4;
+                    }
+                }
+                for o in o..c1 {
+                    let wr = &w[o * k..(o + 1) * k];
+                    for i in 0..n {
+                        // SAFETY: column o belongs to this worker.
+                        unsafe { *yp.0.add(i * m + o) = crate::attention::dot_f32(&x[i * k..(i + 1) * k], wr) };
+                    }
+                }
+            }
+        });
+        return;
+    }
     let block = |r0: usize, r1: usize, y: &mut [f32]| {
         // Four rows by four columns at a time, in vector registers: one
         // dot product per output spends two loads on one multiply and

@@ -1483,6 +1483,11 @@ enum Commands {
         /// "Perform TTS in American English using a female voice.".
         #[arg(long, value_name = "WAV")]
         speech_out: Option<std::path::PathBuf>,
+        /// With --speech-out: `audio` (speech only, the TTS turn) or `mixed`
+        /// (Liquid's interleaved text and speech; system message "Respond
+        /// with interleaved text and audio.").
+        #[arg(long, default_value = "audio", value_parser = ["audio", "mixed"])]
+        speech_mode: String,
         /// Explicit MiMo multimodal companion (otherwise discovered beside text).
         #[arg(long)]
         mm: Option<std::path::PathBuf>,
@@ -4682,6 +4687,7 @@ async fn main() -> anyhow::Result<()> {
             audios,
             system,
             speech_out,
+            speech_mode,
             mm,
             image_max_pixels,
             reasoning_effort,
@@ -4733,7 +4739,7 @@ async fn main() -> anyhow::Result<()> {
                 &videos,
                 &audios,
                 system.as_deref(),
-                speech_out.as_deref(),
+                speech_out.as_deref().map(|p| (p, speech_mode.as_str())),
                 &cortiq_engine::mimo_ingress::MediaOptions { companion: mm, image_max_pixels, video_fps },
                 reasoning_effort.as_deref(),
                 max_tokens,
@@ -8816,7 +8822,7 @@ async fn cmd_run(
     videos: &[String],
     audios: &[String],
     system: Option<&str>,
-    speech_out: Option<&std::path::Path>,
+    speech_out: Option<(&std::path::Path, &str)>,
     media_options: &cortiq_engine::mimo_ingress::MediaOptions,
     reasoning_effort: Option<&str>,
     max_tokens: usize,
@@ -9736,12 +9742,13 @@ async fn cmd_run(
             .or_else(|| lfm3_inputs.as_ref().and_then(|p| p.rows.as_deref()));
         // LFM3-Audio speech answer: the assistant turn opens with
         // <|audio_start|>, frames until the end-of-audio frame, the codec.
-        if let Some(path) = speech_out {
+        if let Some((path, speech_mode)) = speech_out {
             use cortiq_engine::lfm3_speech as sp;
             anyhow::ensure!(sp::can_speak(&model),
                 "--speech-out requires an LFM3-Audio file with its depth decoder and codec");
-            let start = pipeline.tokenizer.token_to_id("<|audio_start|>")
-                .ok_or_else(|| anyhow::anyhow!("the tokenizer has no <|audio_start|>"))?;
+            let marker = if speech_mode == "mixed" { "<|mixed_start|>" } else { "<|audio_start|>" };
+            let start = pipeline.tokenizer.token_to_id(marker)
+                .ok_or_else(|| anyhow::anyhow!("the tokenizer has no {marker}"))?;
             let mut sids = ids.clone();
             let mut srows = media_rows.map(<[f32]>::to_vec);
             if sids.last() != Some(&start) {
@@ -9763,8 +9770,12 @@ async fn cmd_run(
                     .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1)))
                 .map_err(anyhow::Error::msg)?;
             let t_gen = t0.elapsed().as_secs_f64();
+            let t_codec = std::time::Instant::now();
             let codec = sp::Codec::from_model(&model, pool).map_err(anyhow::Error::msg)?;
             let wave = codec.decode(&out.frames);
+            if std::env::var_os("CMF_LFM3_SPEECH_PROF").is_some() {
+                eprintln!("speech: codec (load + decode) {:.0} ms", t_codec.elapsed().as_secs_f64() * 1e3);
+            }
             sp::write_wav(path, &wave, 24_000)?;
             if let Ok(dump) = std::env::var("CMF_LFM3_CODES_DUMP") {
                 let flat: Vec<u32> = out.frames.iter().flatten().copied().collect();

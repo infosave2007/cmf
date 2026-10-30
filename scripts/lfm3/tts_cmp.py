@@ -34,6 +34,13 @@ def main():
             return
         got = np.array(json.load(open(codes)), dtype=np.int64).reshape(-1, 12).T
         audio, _ = sf.read(wav)
+        # Intelligibility: the speech back through the model's own ASR.
+        asr = subprocess.run(
+            [cortiq, "run", model, "--system", "Perform ASR in English.", "--audio", wav, "--prompt", "",
+             "--greedy", "--max-tokens", "64"],
+            capture_output=True, text=True, env={**os.environ, "XDG_RUNTIME_DIR": "/tmp"})
+        heard = [l for l in asr.stdout.splitlines() if l.strip() and not l.startswith(("Loading", "sampling", "Ready", "Prompt", "["))]
+        print("ASR of the speech:", repr(" ".join(heard).strip()))
     ref_audio, _ = sf.read(os.path.join(ref_dir, "tts.wav"))
     n = min(got.shape[1], want.shape[1])
     same = (got[:, :n] == want[:, :n])

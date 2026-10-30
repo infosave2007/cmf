@@ -372,15 +372,27 @@ impl DepthDecoder {
         })
     }
 
-    /// Logits `[12][2017]` of every codebook given the language model's
-    /// final-normed hidden state, the frame's known codes and which are
-    /// still hidden.
-    fn logits(&self, h: &[f32], codes: &[u32; N_CODEBOOKS], masked: &[bool; N_CODEBOOKS]) -> Vec<f32> {
+    /// The frame's slots before any code: the language model's
+    /// final-normed hidden state through `depth_linear`, `[12][d]`.
+    fn slots(&self, h: &[f32]) -> Vec<f32> {
+        let mut x = vec![0f32; N_CODEBOOKS * self.d];
+        self.linear.0.matmat(h, 1, &mut x, self.pool.as_deref());
+        add_bias(&mut x, &self.linear.1);
+        x
+    }
+
+    /// Logits `[2017]` of the codebooks `want` (in that order) given the
+    /// frame's slots, its known codes and which are still hidden.
+    fn logits(
+        &self,
+        slots: &[f32],
+        codes: &[u32; N_CODEBOOKS],
+        masked: &[bool; N_CODEBOOKS],
+        want: &[usize],
+    ) -> Vec<f32> {
         let pool = self.pool.as_deref();
         let d = self.d;
-        let mut x = vec![0f32; N_CODEBOOKS * d];
-        self.linear.0.matmat(h, 1, &mut x, pool);
-        add_bias(&mut x, &self.linear.1);
+        let mut x = slots.to_vec();
         for i in 0..N_CODEBOOKS {
             let add = if masked[i] {
                 &self.mask[..]
@@ -392,14 +404,13 @@ impl DepthDecoder {
             }
         }
         self.stack.forward(&mut x, pool);
-        let mut out = vec![0f32; N_CODEBOOKS * CODEBOOK_SIZE];
+        let mut out = vec![0f32; want.len() * CODEBOOK_SIZE];
         let mut normed = vec![0f32; d];
-        for i in 0..N_CODEBOOKS {
+        for (r, &i) in want.iter().enumerate() {
             rms(&x[i * d..(i + 1) * d], &self.emb_norm[i * d..(i + 1) * d], 1e-5, &mut normed);
             let table = &self.emb[i * CODEBOOK_SIZE * d..(i + 1) * CODEBOOK_SIZE * d];
-            for (c, o) in out[i * CODEBOOK_SIZE..(i + 1) * CODEBOOK_SIZE].iter_mut().enumerate() {
-                *o = table[c * d..(c + 1) * d].iter().zip(&normed).map(|(a, b)| a * b).sum();
-            }
+            let row = &mut out[r * CODEBOOK_SIZE..(r + 1) * CODEBOOK_SIZE];
+            crate::fcd_ops::gemm_nt_host(&normed, table, row, 1, d, CODEBOOK_SIZE, pool);
         }
         out
     }
@@ -424,11 +435,13 @@ impl DepthDecoder {
         let mut codes = [0u32; N_CODEBOOKS];
         let mut masked = [true; N_CODEBOOKS];
         let hist = &history[history.len().saturating_sub(s.repetition_window)..];
+        let slots = self.slots(h);
         let mut at = 0;
         for step in MASKGIT {
-            let logits = self.logits(h, &codes, &masked);
-            for &cb in &order[at..at + step] {
-                let mut row = logits[cb * CODEBOOK_SIZE..(cb + 1) * CODEBOOK_SIZE].to_vec();
+            let pick = &order[at..at + step];
+            let logits = self.logits(&slots, &codes, &masked, pick);
+            for (r, &cb) in pick.iter().enumerate() {
+                let mut row = logits[r * CODEBOOK_SIZE..(r + 1) * CODEBOOK_SIZE].to_vec();
                 if s.repetition_penalty != 1.0 {
                     let mut seen = vec![false; CODEBOOK_SIZE];
                     for f in hist {
@@ -622,9 +635,11 @@ pub fn can_speak(model: &CmfModel) -> bool {
     has_tensor(model, "depth_decoder.depth_linear.weight") && has_tensor(model, "codec.decoder.lin.weight")
 }
 
-/// Generate after a prompt that ends with `<|audio_start|>`: speech frames
-/// until the end-of-audio frame, then text (greedy) until the turn ends,
-/// at most `max_steps` steps in all.
+/// Generate after a prompt that ends with `<|audio_start|>` (speech, then
+/// text until the turn ends) or `<|mixed_start|>` (Liquid's interleaved
+/// turn: six text tokens, twelve speech frames, … until `<|text_end|>`,
+/// then speech until the end-of-audio frame), at most `max_steps` steps.
+/// Text is greedy; speech is sampled with `s`.
 pub fn speak(
     pipeline: &mut Pipeline,
     depth: &DepthDecoder,
@@ -634,21 +649,38 @@ pub fn speak(
     s: &AudioSampling,
     seed: u64,
 ) -> Result<SpeechOut, String> {
-    let audio_start = pipeline
-        .tokenizer
-        .token_to_id("<|audio_start|>")
-        .ok_or("tokenizer lacks <|audio_start|>")?;
-    let im_end = pipeline.tokenizer.token_to_id("<|im_end|>");
+    const N_TEXT: usize = 6;
+    const N_AUDIO: usize = 12;
+    let id = |t: &str| pipeline.tokenizer.token_to_id(t);
+    let audio_start = id("<|audio_start|>").ok_or("tokenizer lacks <|audio_start|>")?;
+    let (mixed_start, text_end, im_end) = (id("<|mixed_start|>"), id("<|text_end|>"), id("<|im_end|>"));
+    #[derive(PartialEq, Clone, Copy)]
+    enum Mode {
+        Text,
+        Audio,
+        Mixed,
+    }
+    let mut mode = match ids.last() {
+        Some(&t) if t == audio_start => Mode::Audio,
+        Some(&t) if Some(t) == mixed_start => Mode::Mixed,
+        _ => Mode::Text,
+    };
+    let (mut slots_left, mut speaking, mut text_done) = (N_TEXT, false, false);
     let mut rng = SplitMix64::new(seed);
     let mut h = pipeline.speech_prefill(ids, rows)?;
     let mut pos = ids.len();
-    let mut speaking = ids.last() == Some(&audio_start);
     let mut out = SpeechOut { frames: Vec::new(), text_ids: Vec::new() };
+    // CMF_LFM3_SPEECH_PROF: where a turn's time goes.
+    let prof = std::env::var_os("CMF_LFM3_SPEECH_PROF").is_some();
+    let (mut t_depth, mut t_lm, mut t_head) = (0f64, 0f64, 0f64);
     for _ in 0..max_steps {
-        let row = if speaking {
+        let interleaving = mode == Mode::Mixed;
+        let t0 = std::time::Instant::now();
+        let row = if mode == Mode::Audio || (interleaving && speaking) {
             let codes = depth.sample_frame(&h, s, &out.frames, &mut rng);
+            t_depth += t0.elapsed().as_secs_f64();
             if codes.contains(&AUDIO_EOS) {
-                speaking = false;
+                mode = Mode::Text;
                 depth.frame_row(&[AUDIO_EOS; N_CODEBOOKS])
             } else {
                 out.frames.push(codes);
@@ -656,18 +688,47 @@ pub fn speak(
             }
         } else {
             let logits = pipeline.speech_logits(&h);
+            t_head += t0.elapsed().as_secs_f64();
             let t = sample(&logits, 0.0, 0, &mut rng);
-            if Some(t) == im_end || pipeline.tokenizer.is_eos(t) {
+            if Some(t) == text_end {
+                if !interleaving {
+                    break;
+                }
+                // The text of the interleaved turn is over; its speech runs on.
+                text_done = true;
+                speaking = true;
+            } else if Some(t) == im_end || pipeline.tokenizer.is_eos(t) {
                 break;
+            } else if !interleaving && t == audio_start {
+                mode = Mode::Audio;
+            } else if !interleaving && Some(t) == mixed_start {
+                mode = Mode::Mixed;
+                (slots_left, speaking, text_done) = (N_TEXT, false, false);
             }
             out.text_ids.push(t);
-            if t == audio_start {
-                speaking = true;
-            }
             pipeline.embed_id(t)
         };
+        if interleaving && !text_done {
+            slots_left -= 1;
+            if slots_left == 0 {
+                speaking = !speaking;
+                slots_left = if speaking { N_AUDIO } else { N_TEXT };
+            }
+        }
+        let t1 = std::time::Instant::now();
         h = pipeline.speech_step(&row, pos);
+        t_lm += t1.elapsed().as_secs_f64();
         pos += 1;
+    }
+    if prof {
+        eprintln!(
+            "speech: {} frames, {} text tokens | depth decoder {:.0} ms, language model {:.0} ms, text head {:.0} ms",
+            out.frames.len(),
+            out.text_ids.len(),
+            t_depth * 1e3,
+            t_lm * 1e3,
+            t_head * 1e3
+        );
     }
     Ok(out)
 }
