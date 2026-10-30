@@ -103,7 +103,12 @@ output keeps the source's codec — quantize it separately. The device stages ru
 on NVIDIA (Vulkan) and on Apple Silicon (Metal) — since 0.8.42 the fold itself
 too: one Qwen3.8-27B layer folds in 12 s on a Mac mini M4 instead of ~11 min
 on its CPU, and with `--keep-grams` several target sizes fold from one
-illumination. See the [compress guide](docs/COMPRESS.ru.md).
+illumination. See the [compress guide](docs/COMPRESS.md); the method and its
+measurements are in the [task-compression article](docs/research/TASK_COMPRESSION_ARTICLE.md),
+and a full run on a large model in
+[Qwen3.8-27B → 14B, step by step](docs/research/QWEN38_27B_TASK_COMPRESSION.md)
+(the resulting model, its prompts and teacher dataset:
+[infosave/Qwen3.8-27B-Code-14B-Experimental-cmf](https://huggingface.co/infosave/Qwen3.8-27B-Code-14B-Experimental-cmf)).
 
 ## Prompt-calibrated MTP draft compaction (0.8.38)
 
@@ -326,6 +331,9 @@ fails.
 - [CMF v2 specification](docs/CMF_V2_SPEC.md) — normative file layout.
 - [Format comparison](docs/COMPARISON.md) — criteria and evidence.
 - [Skills](docs/SKILLS.md) — masks, overlays and routing workflows.
+- [Task compression](docs/COMPRESS.md) — the `cortiq compress` guide; the
+  [method article](docs/research/TASK_COMPRESSION_ARTICLE.md) and the
+  [Qwen3.8-27B → 14B run](docs/research/QWEN38_27B_TASK_COMPRESSION.md).
 - [GPU kernel recipes](docs/GPU_KERNEL_RECIPES.md) — backend measurements.
 - [Multi-GPU execution](docs/MULTI_GPU.md) and [mobile split](docs/MOBILE_SPLIT.ru.md).
 - [FCD restoration](docs/RUST_FCD.md) and [low-bit PTQ](docs/Q1T_PTQ.md).

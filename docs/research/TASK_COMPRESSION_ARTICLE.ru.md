@@ -1,5 +1,7 @@
 # Сжатие языковой модели под задачу: засветка, осмотическая свёртка, лечение, маски DTG-MA и порядок NVG ↔ DTG-MA
 
+*Языки: [English](TASK_COMPRESSION_ARTICLE.md) · **Русский** · [中文](TASK_COMPRESSION_ARTICLE.zh.md)*
+
 *Олег Юревич Кириченко. Реализация и измерения — движок cortiq, формат CMF (ветка `compress`), 27–28 октября 2026 г.*
 
 ## Аннотация
@@ -314,6 +316,9 @@ cortiq nvg-train nvg.cmf --teacher q08-q8_2f.cmf --calib task.txt --tokens 26214
 # сравнение нескольких моделей на тех же test-записях
 cortiq compress Qwen3.5-0.8B.cmf task.tdata run.cmf --ffn 0.75 --compare nvg-dtgma.cmf --compare other.cmf
 ```
+
+Продолжение на большой модели — сжатие Qwen3.8-27B до 14B на одной RTX PRO 6000:
+[QWEN38_27B_TASK_COMPRESSION.ru.md](QWEN38_27B_TASK_COMPRESSION.ru.md).
 
 ## Литература и источники
 
