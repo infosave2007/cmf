@@ -114,6 +114,30 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Liquid AI LFM3 speech, Omni and d1 (0.8.50)
+
+[LFM3-Audio-2B](https://huggingface.co/infosave/LFM3-Audio-2B-cmf) transcribes
+and speaks (19 TTS languages, interleaved voice chat),
+[LFM3-Omni-2B](https://huggingface.co/infosave/LFM3-Omni-2B-cmf) adds pictures
+and video, and the decision models
+[d1-2B](https://huggingface.co/infosave/d1-2B-cmf) and
+[d1-Omni-2B](https://huggingface.co/infosave/d1-Omni-2B-cmf) answer named
+questions about a state from one forward pass:
+
+```sh
+cortiq run lfm3-audio-2b-q8_2f.cmf --system "Perform ASR in English." --audio clip.wav --prompt ""
+cortiq run lfm3-audio-2b-q8_2f.cmf --system "Perform TTS in American English using a female voice." \
+  --prompt "Hello! How are you today?" --speech-out hello.wav
+cortiq system-one d1-2b-q8_2f.cmf --state "I was charged twice and my parcel never arrived." \
+  --questions '{"refund": {"type": "noul", "instructions": "Is this a refund request?"}}'
+```
+
+Transcripts match Transformers word for word and an f16 file reproduces its
+speech frames exactly; the codec travels inside the file. d1's whole pass runs
+in one GPU submission: one question in ~45 ms on an NVIDIA A40 and 79 ms on an
+Apple M4. On Apple silicon the Metal token graph now takes LFM3's short
+convolutions: LFM3-1.7B q4tp decodes 84 tok/s on an M4 (was 61).
+
 ## Liquid AI LFM3 (0.8.49)
 
 [LFM3-1.7B](https://huggingface.co/infosave/LFM3-1.7B-cmf), Liquid AI's

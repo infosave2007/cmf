@@ -114,6 +114,30 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Речь LFM3, Omni и d1 (0.8.50)
+
+[LFM3-Audio-2B](https://huggingface.co/infosave/LFM3-Audio-2B-cmf) распознаёт и
+синтезирует речь (19 языков, голосовой чат с текстом и речью вперемешку),
+[LFM3-Omni-2B](https://huggingface.co/infosave/LFM3-Omni-2B-cmf) добавляет
+изображения и видео, а модели решений
+[d1-2B](https://huggingface.co/infosave/d1-2B-cmf) и
+[d1-Omni-2B](https://huggingface.co/infosave/d1-Omni-2B-cmf) отвечают на
+именованные вопросы о состоянии за один прямой проход:
+
+```sh
+cortiq run lfm3-audio-2b-q8_2f.cmf --system "Perform ASR in English." --audio clip.wav --prompt ""
+cortiq run lfm3-audio-2b-q8_2f.cmf --system "Perform TTS in American English using a female voice." \
+  --prompt "Hello! How are you today?" --speech-out hello.wav
+cortiq system-one d1-2b-q8_2f.cmf --state "Мне дважды списали деньги, посылка не пришла." \
+  --questions '{"refund": {"type": "noul", "instructions": "Это запрос на возврат?"}}'
+```
+
+Распознавание совпадает с Transformers дословно, файл f16 воспроизводит кадры
+речи точно; кодек лежит внутри файла. Весь проход d1 идёт одной отправкой на
+GPU: один вопрос — около 45 мс на NVIDIA A40 и 79 мс на Apple M4. На Apple
+silicon граф токена Metal теперь берёт короткие свёртки LFM3: LFM3-1.7B q4tp
+генерирует на M4 84 ток/с (было 61).
+
 ## Liquid AI LFM3 (0.8.49)
 
 [LFM3-1.7B](https://huggingface.co/infosave/LFM3-1.7B-cmf) — трёхгибридная

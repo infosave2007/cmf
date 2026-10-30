@@ -104,6 +104,27 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## LFM3 语音、Omni 与 d1（0.8.50）
+
+[LFM3-Audio-2B](https://huggingface.co/infosave/LFM3-Audio-2B-cmf) 支持语音识别与
+合成（19 种语言，文本与语音交错的语音对话），[LFM3-Omni-2B](https://huggingface.co/infosave/LFM3-Omni-2B-cmf)
+另支持图像和视频；决策模型 [d1-2B](https://huggingface.co/infosave/d1-2B-cmf) 与
+[d1-Omni-2B](https://huggingface.co/infosave/d1-Omni-2B-cmf) 一次前向即可回答关于某个状态的
+具名问题：
+
+```sh
+cortiq run lfm3-audio-2b-q8_2f.cmf --system "Perform ASR in English." --audio clip.wav --prompt ""
+cortiq run lfm3-audio-2b-q8_2f.cmf --system "Perform TTS in Chinese using a female voice." \
+  --prompt "你好，今天天气很好。" --speech-out hello.wav
+cortiq system-one d1-2b-q8_2f.cmf --state "我被重复扣款，包裹也没到。" \
+  --questions '{"refund": {"type": "noul", "instructions": "这是退款请求吗？"}}'
+```
+
+识别结果与 Transformers 逐字一致，f16 文件可完全复现其语音帧；编解码器包含在文件内。
+d1 的整个前向在一次 GPU 提交中完成：NVIDIA A40 上单个问题约 45 ms，Apple M4 上 79 ms。
+在 Apple silicon 上，Metal token 图现已支持 LFM3 的短卷积：LFM3-1.7B q4tp 在 M4 上
+生成 84 token/s（此前 61）。
+
 ## Liquid AI LFM3（0.8.49）
 
 [LFM3-1.7B](https://huggingface.co/infosave/LFM3-1.7B-cmf) 是 Liquid AI 面向本地
