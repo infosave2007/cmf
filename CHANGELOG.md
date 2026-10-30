@@ -26,6 +26,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   positions (perplexity 13.186 against 13.186, top-1 100 %, mean |ΔNLL|
   0.0000), and greedy chat continuations are text-identical. The wgpu
   whole-token graph takes the model.
+- LFM3-VL (`lfm3_vl`): Liquid's vision encoder — a patchifier, then 14
+  pre-norm layers alternating a gated depthwise 3×3 convolution over the
+  frame's patch grid with bidirectional GQA (Q/K norms, axial RoPE) — and its
+  LayerNorm + 2×2-merge + GELU projector on the LFM3 text model
+  (`lfm3_vl.rs`). Images and video (`cortiq run --image/--video`, image and
+  video parts in `/v1/chat/completions`) go through the processor's own
+  preprocessing: `smart_resize` to multiples of 32, torchvision's uint8
+  antialiased bicubic, 2 frames per vision step, video sampled at 2 fps under
+  one all-frames pixel budget, `<T seconds>` before every step. The encoder
+  and projector are stored 16-bit in every profile and run as exact f32
+  operands of the host GEMM: through the device GEMMs a few rows of a
+  4320-patch image drifted to a cosine of 0.97 against Transformers float32
+  (q8_2f weights: 0.61), on the host every row stays above 0.9999. On PNG
+  images and a 4-frame clip the patches match Transformers to 1.2e-7.
+  [infosave/LFM3-VL-2B-cmf](https://huggingface.co/infosave/LFM3-VL-2B-cmf),
+  card `docs/hf/LFM3-VL-2B-cmf.md`, reference scripts `scripts/lfm3/lfm3_vl_ref.py`,
+  `lfm3_vl_video_ref.py`, `vl_cmp.py`.
 - LFM3-1.7B and LFM3-1.7B-Base in CMF (`q8_2f`, `q4tp`) on Hugging Face:
   [infosave/LFM3-1.7B-cmf](https://huggingface.co/infosave/LFM3-1.7B-cmf),
   [infosave/LFM3-1.7B-Base-cmf](https://huggingface.co/infosave/LFM3-1.7B-Base-cmf),

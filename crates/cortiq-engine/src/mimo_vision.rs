@@ -373,7 +373,7 @@ impl VisualInput {
 
 /// Patchify `frames` (each planar CHW at `hb × wb`, count a multiple of T)
 /// exactly as `view(gt,T,C,gh/m,m,P,gw/m,m,P).permute(0,3,6,4,7,2,1,5,8)`.
-fn patchify(
+pub(crate) fn patchify(
     frames: &[&[f32]],
     hb: usize,
     wb: usize,

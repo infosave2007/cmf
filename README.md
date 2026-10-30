@@ -118,12 +118,15 @@ cortiq verify model.cmf
 
 [LFM3-1.7B](https://huggingface.co/infosave/LFM3-1.7B-cmf), Liquid AI's
 tri-hybrid model for local agents and tool calling (short convolutions, full
-and sliding-window attention, 262k context), and its pre-trained
-[Base](https://huggingface.co/infosave/LFM3-1.7B-Base-cmf):
+and sliding-window attention, 262k context), its pre-trained
+[Base](https://huggingface.co/infosave/LFM3-1.7B-Base-cmf) and the
+vision-language [LFM3-VL-2B](https://huggingface.co/infosave/LFM3-VL-2B-cmf)
+(images and video):
 
 ```sh
 hf download infosave/LFM3-1.7B-cmf lfm3-1.7b-q8_2f.cmf --local-dir .
 cortiq run lfm3-1.7b-q8_2f.cmf --prompt "Write a Python function that merges two sorted lists." --max-tokens 2048
+cortiq run lfm3-vl-2b-q8_2f.cmf --image photo.jpg --prompt "Describe this image." --max-tokens 1024
 ```
 
 The conversion matches Transformers float32 position for position. On an

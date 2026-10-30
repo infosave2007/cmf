@@ -1223,6 +1223,18 @@ async fn chat_completions(
     // server's generic `thinking=false` -> `reasoning_effort=low` convention
     // into that template.
     let template_thinking = if minimax_m3 { None } else { req.thinking() };
+    // An LFM3-VL file with image parts in the request: the messages as JSON,
+    // content parts intact (the text path below flattens them).
+    let lfm3_vl_messages = if cortiq_engine::lfm3_vl::has_vision(state.runtime.model()) {
+        let messages: Vec<_> = req.messages.iter().map(message_to_json).collect();
+        match cortiq_engine::lfm3_vl::has_media(&messages) {
+            Ok(true) => Some(messages),
+            Ok(false) => None,
+            Err(e) => return error_response(StatusCode::BAD_REQUEST, e),
+        }
+    } else {
+        None
+    };
     // Chat template → prompt ids (uses real special tokens).
     let (prompt_ids, prompt_ingress) = if let Some(source) =
         state.runtime.model().arch().deepseek_v41.as_ref()
@@ -1286,6 +1298,30 @@ async fn chat_completions(
             }
         };
         (ids, None)
+    } else if let Some(messages) = lfm3_vl_messages {
+        // LFM3-VL with images: run the tower before the stream opens, so a
+        // bad image is an HTTP 400. Text-only requests take the path below.
+        if state.remote.is_some() || req.cortiq.as_ref().is_some_and(|c| c.class_tokens.is_some()) {
+            return error_response(StatusCode::BAD_REQUEST, "LFM3-VL images cannot use a network split or cortiq.class_tokens");
+        }
+        let slot = state.slots.acquire().await;
+        let tools = req.effective_tools().map(|t| t.to_vec());
+        let thinking = template_thinking;
+        let prepared = tokio::task::spawn_blocking(move || {
+            cortiq_engine::gpu::set_current_device(slot.device);
+            cortiq_engine::lfm3_vl::prepare_for_pipeline(&slot.pipe, &messages,
+                tools.as_deref(), thinking, &Default::default())
+        }).await;
+        let prepared = match prepared {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => return error_response(StatusCode::BAD_REQUEST, e),
+            Err(e) => {
+                tracing::error!("LFM3-VL image preparation failed: {e}");
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "LFM3-VL image preparation failed");
+            }
+        };
+        mimo_rows = prepared.rows;
+        (prepared.token_ids, None)
     } else {
         let prompt_ids = {
             let mut msgs: Vec<serde_json::Value> = if minimax_m3 {

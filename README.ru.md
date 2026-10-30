@@ -118,12 +118,15 @@ cortiq verify model.cmf
 
 [LFM3-1.7B](https://huggingface.co/infosave/LFM3-1.7B-cmf) — трёхгибридная
 модель Liquid AI для локальных агентов и вызова инструментов (короткие свёртки,
-полное внимание и внимание со скользящим окном, контекст 262k) — и её
-предобученная [Base](https://huggingface.co/infosave/LFM3-1.7B-Base-cmf):
+полное внимание и внимание со скользящим окном, контекст 262k), её
+предобученная [Base](https://huggingface.co/infosave/LFM3-1.7B-Base-cmf) и
+визуально-языковая [LFM3-VL-2B](https://huggingface.co/infosave/LFM3-VL-2B-cmf)
+(изображения и видео):
 
 ```sh
 hf download infosave/LFM3-1.7B-cmf lfm3-1.7b-q8_2f.cmf --local-dir .
 cortiq run lfm3-1.7b-q8_2f.cmf --prompt "Напиши функцию на Python, которая сливает два отсортированных списка." --max-tokens 2048
+cortiq run lfm3-vl-2b-q8_2f.cmf --image photo.jpg --prompt "Опиши это изображение." --max-tokens 1024
 ```
 
 Конвертация совпадает с Transformers float32 по каждой позиции. На NVIDIA A40
