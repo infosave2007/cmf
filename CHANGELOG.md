@@ -5,6 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.46] — 2026-10-30
+
+### Fixed
+- Native Metal: the rows graph (speculative verify, batched prefill) takes
+  q8_row / q8_2f projections. `compress` keeps the full-attention K/V of a
+  q4tp file at q8_2f, and the graph declined such a file whole ("a layer
+  failed preflight"), so a Mac never speculated on it. The b-row q8_2f GEMM
+  runs the token graph's matvec reduction on every row (a test holds it to
+  the matvec bit for bit). Qwen3.8-27B-Code-14B q4tp on an M4 Air 24 GB,
+  greedy, 384 tokens: `CMF_GRAPH_SPEC=1 CMF_GRAPH_SPEC_K=2` decodes 15.6–17.4
+  against 11.3–11.6 tok/s plain, 87 % of drafts accepted, the text identical
+  to plain; the prompt now prefills on the graph too (first token 0.9–1.1 s
+  against 3.7–4.1 s, warm page cache). On native Metal
+  speculation still needs the explicit `CMF_GRAPH_SPEC=1`; the adaptive depth
+  (k=7) keeps 13.2 tok/s at 46 % accepted, so pin `CMF_GRAPH_SPEC_K=2`.
+
 ## [0.8.45] — 2026-10-30
 
 ### Changed
