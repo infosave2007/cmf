@@ -7,7 +7,7 @@
 //! (d1's `attention.Sees`). A child module of `pipeline` so it runs on the
 //! layer geometry the decode paths use; it touches no cache.
 
-use super::{AttnKind, FfnKind, Pipeline, dense_ffn_batch};
+use super::{Act, AttnKind, FfnKind, Pipeline, dense_ffn_batch};
 use crate::inference;
 use crate::linear_core::short_conv_forward_batch;
 use crate::qtensor::QTensor;
@@ -43,6 +43,9 @@ impl Pipeline {
         let t = rows.len() / hs;
         if t == 0 || rows.len() != t * hs || mask.group.len() != t || mask.state > t {
             return Err("masked forward: rows, groups and state length disagree".into());
+        }
+        if let Some(out) = self.forward_masked_device(rows, t, mask) {
+            return Ok(out);
         }
         let pool = self.pool.as_deref();
         let (eps, style) = (self.rms_eps, self.norm_style);
@@ -115,6 +118,122 @@ impl Pipeline {
         }
         rms_rows(&h, &self.weights.final_norm, eps, style, &mut normed);
         Ok(normed)
+    }
+
+    /// The same forward on the device in one submission
+    /// (`gpu::lfm_set_forward`), or None: a stack or weight outside its
+    /// kernels, no device, or `CMF_D1_DEVICE=0`.
+    fn forward_masked_device(&self, rows: &[f32], t: usize, mask: &SetMask) -> Option<Vec<f32>> {
+        use crate::gpu::{SetDims, SetLayer, SetMixer};
+        if std::env::var("CMF_D1_DEVICE").as_deref() == Ok("0") || !crate::gpu::enabled_here() {
+            return None;
+        }
+        let mapped = |q: &QTensor| match q {
+            QTensor::Mapped { model, .. } => Some(model.clone()),
+            _ => None,
+        };
+        let model = self.weights.layers.first().and_then(|lw| match &lw.ffn {
+            FfnKind::Dense(d) => mapped(&d.gate_proj),
+            _ => None,
+        })?;
+        let part = |q: &QTensor| -> Option<(usize, usize, usize)> {
+            match q {
+                QTensor::Mapped { model: m, idx, .. } if std::sync::Arc::ptr_eq(m, &model) => {
+                    Some((*idx, q.rows(), q.cols()))
+                }
+                _ => None,
+            }
+        };
+        let hd = self.head_dim;
+        let invs: Vec<_> = (0..self.num_layers).map(|li| self.layer_inv_freq(li)).collect();
+        let mut layers = Vec::with_capacity(self.num_layers);
+        for li in 0..self.num_layers {
+            let lw = &self.weights.layers[self.phys_layer(li)];
+            let FfnKind::Dense(f) = &lw.ffn else {
+                return None;
+            };
+            if f.act != Act::Silu || !f.segs.is_empty() {
+                return None;
+            }
+            let mixer = match &lw.attn {
+                AttnKind::ShortConv(w) => SetMixer::Conv {
+                    in_proj: part(&w.in_proj)?,
+                    out_proj: part(&w.out_proj)?,
+                    taps: &w.conv,
+                    kernel: self.short_conv_cfg?.kernel,
+                },
+                AttnKind::Full {
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    q_norm,
+                    k_norm,
+                    output_gate: false,
+                    softplus_gate,
+                    bias: None,
+                } => {
+                    let (nkv, lhd, rd) = self.layer_geom(li);
+                    if lhd != hd || self.layer_num_heads(li) != self.num_heads {
+                        return None;
+                    }
+                    let head_gate = match softplus_gate {
+                        None => None,
+                        Some((g, true)) if self.proj_gate_sigmoid => {
+                            let (data, r, c) = g.f32_parts()?;
+                            (r == self.num_heads && c == self.hidden_size).then_some(data)?;
+                            Some(data)
+                        }
+                        Some(_) => return None,
+                    };
+                    SetMixer::Attn {
+                        wq: part(wq)?,
+                        wk: part(wk)?,
+                        wv: part(wv)?,
+                        wo: part(wo)?,
+                        q_norm: q_norm.as_deref(),
+                        k_norm: k_norm.as_deref(),
+                        head_gate,
+                        inv_freq: invs[li].as_slice(),
+                        rd,
+                        nkv,
+                        window: self.layer_window(li),
+                    }
+                }
+                _ => return None,
+            };
+            layers.push(SetLayer {
+                input_norm: &lw.input_norm,
+                post_norm: &lw.post_norm,
+                mixer,
+                attn_out_norm: lw.attn_out_norm.as_deref(),
+                ffn_out_norm: lw.ffn_out_norm.as_deref(),
+                gate: part(&f.gate_proj)?,
+                up: part(&f.up_proj)?,
+                down: part(&f.down_proj)?,
+            });
+        }
+        if self.qk_norm_after_rope || self.layer_rope_scale(0) != 1.0 {
+            return None;
+        }
+        let dims = SetDims {
+            hidden: self.hidden_size,
+            nh: self.num_heads,
+            hd,
+            eps: self.rms_eps as f32,
+            gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
+            scale: self.attn_scale,
+        };
+        crate::gpu::lfm_set_forward(
+            &model,
+            &layers,
+            &dims,
+            &self.weights.final_norm,
+            rows,
+            t,
+            mask.state,
+            mask.group,
+        )
     }
 
     /// One full or sliding attention layer over the packed row: Q/K/V, the

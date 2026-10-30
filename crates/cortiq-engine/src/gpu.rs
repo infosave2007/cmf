@@ -4183,6 +4183,84 @@ pub fn q4t_matmat(
     }
 }
 
+// ── d1's one-pass `set` forward (`pipeline_masked`) ──────────────────────
+// One LFM3 stack over a whole packed row on the device: the backends'
+// `lfm_set` modules encode every layer in one submission.
+
+/// A projection of the packed row: the tensor's directory index, rows and
+/// columns (`[rows, cols]`, applied as x·Wᵀ).
+pub type SetW = (usize, usize, usize);
+
+pub enum SetMixer<'a> {
+    Conv {
+        in_proj: SetW,
+        out_proj: SetW,
+        /// `[hidden][kernel]`, tap `kernel-1` on the current position.
+        taps: &'a [f32],
+        kernel: usize,
+    },
+    Attn {
+        wq: SetW,
+        wk: SetW,
+        wv: SetW,
+        wo: SetW,
+        q_norm: Option<&'a [f32]>,
+        k_norm: Option<&'a [f32]>,
+        /// The per-head sigmoid gate's f32 rows `[nh × hidden]`.
+        head_gate: Option<&'a [f32]>,
+        inv_freq: &'a [f32],
+        rd: usize,
+        nkv: usize,
+        /// Sliding window (causal); None: d1's `set` mask.
+        window: Option<usize>,
+    },
+}
+
+pub struct SetLayer<'a> {
+    pub input_norm: &'a [f32],
+    pub post_norm: &'a [f32],
+    pub mixer: SetMixer<'a>,
+    pub attn_out_norm: Option<&'a [f32]>,
+    pub ffn_out_norm: Option<&'a [f32]>,
+    /// The SiLU FFN's gate, up and down.
+    pub gate: SetW,
+    pub up: SetW,
+    pub down: SetW,
+}
+
+pub struct SetDims {
+    pub hidden: usize,
+    pub nh: usize,
+    pub hd: usize,
+    pub eps: f32,
+    pub gemma: bool,
+    pub scale: f32,
+}
+
+/// d1's `set` forward on the device: the final-normed hidden rows `[t,
+/// hidden]` of the embedding rows `rows`, or None when the backend or a
+/// weight is outside the kernels (the host path answers).
+#[allow(clippy::too_many_arguments, unused_variables)]
+pub fn lfm_set_forward(
+    model: &Arc<CmfModel>,
+    layers: &[SetLayer],
+    dims: &SetDims,
+    final_norm: &[f32],
+    rows: &[f32],
+    t: usize,
+    state: usize,
+    group: &[i32],
+) -> Option<Vec<f32>> {
+    #[allow(unreachable_patterns)]
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::lfm_set::forward(
+            model, layers, dims, final_norm, rows, t, state, group,
+        ),
+        _ => None,
+    }
+}
+
 /// Whole-block token-graph types re-exported from the Metal backend.
 #[cfg(target_os = "macos")]
 pub use crate::gpu_metal::{

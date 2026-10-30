@@ -43,6 +43,11 @@ pub mod moe_q8;
 #[doc(hidden)]
 pub mod gemma4;
 
+// d1's one-pass `set` forward over an LFM3 stack — child module,
+// `gpu_metal/lfm_set.rs`.
+#[doc(hidden)]
+pub mod lfm_set;
+
 // Block-diffusion (Clover) passes and commits — child module, `gpu_metal/clover.rs`.
 #[doc(hidden)]
 pub mod clover;
