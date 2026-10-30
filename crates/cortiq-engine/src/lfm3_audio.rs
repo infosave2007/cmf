@@ -647,13 +647,17 @@ pub fn prepare(
 ) -> Result<crate::lfm3_vl::PreparedVlPrompt, String> {
     let (messages, sources) = normalize(messages);
     let tok = &pipeline.tokenizer;
-    if sources.is_empty() {
-        let ids = tok.try_apply_chat_template_json(&messages, tools, thinking)?;
-        return Ok(crate::lfm3_vl::PreparedVlPrompt { token_ids: ids, rows: None });
-    }
-    let text = tok
+    let mut text = tok
         .render_chat_json(&messages, tools, thinking)
         .ok_or("LFM3-Audio: the chat template failed to render")?;
+    // LFM3-Audio's template has no thinking switch; Liquid's direct answer
+    // is the assistant turn prefilled with an empty think block.
+    if thinking == Some(false) && text.ends_with("<|im_start|>assistant\n") {
+        text.push_str("<think></think>");
+    }
+    if sources.is_empty() {
+        return Ok(crate::lfm3_vl::PreparedVlPrompt { token_ids: tok.with_bos(tok.encode(&text)), rows: None });
+    }
     let enc = Lfm3AudioEncoder::from_model(model, crate::pool::Pool::from_env())?;
     if enc.text_hidden != pipeline.hidden_size {
         return Err("LFM3-Audio: projector width differs from the text model".into());
