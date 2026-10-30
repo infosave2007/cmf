@@ -1584,7 +1584,12 @@ impl Pipeline {
             && self.dsv41.is_none()
             && self.qwen4_exp.is_none()
             && self.weights.layers.iter().all(|lw| {
-                matches!(lw.attn, AttnKind::Full { .. }) && matches!(lw.ffn, FfnKind::Dense(_))
+                // LFM2/LFM3's short-conv mixer is two projection GEMMs and
+                // an elementwise conv: the host-driven chunk walk starves
+                // the card the same way (LFM3-1.7B q8_2f on an A40, 2048
+                // positions: 137 tok/s at 48, 460-640 at 512).
+                matches!(lw.attn, AttnKind::Full { .. } | AttnKind::ShortConv(_))
+                    && matches!(lw.ffn, FfnKind::Dense(_))
             });
         let gpu_on = crate::gpu::enabled();
         ChunkStackFacts {
@@ -1671,8 +1676,9 @@ fn prefill_chunk_rule(env: Option<usize>, host: ChunkHost, dense_on_discrete: bo
 /// What the chunk rule needs to know about a loaded stack.
 #[derive(Clone, Copy, Debug, Default)]
 struct ChunkStackFacts {
-    /// Every layer is `AttnKind::Full` + `FfnKind::Dense`, and no
-    /// architecture-owned stack (g3n, DeepSeek-V4/V4.1, qwen4-exp) is set.
+    /// Every layer is `AttnKind::Full` or `AttnKind::ShortConv` +
+    /// `FfnKind::Dense`, and no architecture-owned stack (g3n,
+    /// DeepSeek-V4/V4.1, qwen4-exp) is set.
     plain_dense: bool,
     /// The active GPU backend is a discrete card.
     discrete: bool,
@@ -10894,7 +10900,7 @@ impl Pipeline {
                             &mut normed[bi * hs..(bi + 1) * hs],
                         );
                     }
-                    let attn = short_conv_forward_batch(
+                    let mut attn = short_conv_forward_batch(
                         &normed,
                         b,
                         w,
@@ -10902,6 +10908,20 @@ impl Pipeline {
                         &mut self.kv_cache.layers[li].linear_state,
                         pool.as_deref(),
                     );
+                    // LFM3 sandwich: the mixer output is normalized before
+                    // the residual, as on the decode path.
+                    if let Some(wn) = &lw.attn_out_norm {
+                        for bi in 0..b {
+                            inference::rms_norm_into(
+                                &attn[bi * hs..(bi + 1) * hs],
+                                wn,
+                                eps,
+                                norm_style,
+                                &mut normed[bi * hs..(bi + 1) * hs],
+                            );
+                        }
+                        attn.copy_from_slice(&normed);
+                    }
                     for (dst, &a) in h.iter_mut().zip(&attn) {
                         *dst += a;
                     }
@@ -12010,13 +12030,16 @@ impl Pipeline {
         if self.attention_heads_per_layer.is_some() {
             return Some("per-layer Q head counts with per-layer geometry");
         }
-        // Sandwich norms are measured on Gemma-4 only (the humanizer port,
-        // against HF transformers); Gemma-2/3 keep the per-op path until
-        // they are measured the same way.
+        // Sandwich norms are measured on Gemma-4 (the humanizer port) and
+        // LFM3, both with plain x̂·w weights, against HF transformers;
+        // Gemma-2/3's (1+w) norms keep the per-op path until they are
+        // measured the same way, and a layer scale stays Gemma-4's.
         let gemma4 = self.global_attn.is_some() || self.attn_v_norm;
+        let plain_norms = self.norm_style == cortiq_core::NormStyle::Qwen;
         if !gemma4
             && self.weights.layers.iter().any(|lw| {
-                lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some()
+                lw.layer_scale.is_some()
+                    || (!plain_norms && (lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some()))
             })
         {
             return Some("sandwich norms / layer scale with per-layer geometry");

@@ -2151,6 +2151,25 @@ impl Pipeline {
                 }
             }
         }
+        // The same proportional RoPE on full-attention layers that keep the
+        // model's head geometry (LFM3): the whole head rotates (header
+        // factor 1.0) with the full-head frequency progression, and the
+        // frequencies past `factor·head_dim/2` are zero (identity pairs).
+        if let (Some(prf), None) = (arch.global_partial_rotary_factor, arch.global_head_dim) {
+            if arch.yarn.is_some() || pipeline.rotary_dim != arch.head_dim {
+                return Err(CmfError::Parse(format!(
+                    "global_partial_rotary_factor {prf} needs partial_rotary_factor 1.0 and no \
+                     YaRN profile (rotary width {} of head {})",
+                    pipeline.rotary_dim, arch.head_dim
+                )));
+            }
+            let mut f = crate::attention::rope_inv_freq(arch.head_dim, arch.rope_theta as f32);
+            let ra = (((prf * arch.head_dim as f32) as usize) / 2).min(f.len());
+            for slot in f.iter_mut().skip(ra) {
+                *slot = 0.0;
+            }
+            pipeline.inv_freq = std::sync::Arc::new(f);
+        }
         // MLA (DeepSeek-V2): the expand-to-MHA cache holds nh heads of
         // rope+nope dims; rotary covers the rope prefix.
         if let Some(mla) = arch.mla.as_ref() {
@@ -2260,7 +2279,9 @@ impl Pipeline {
         }
         pipeline.attn_v_norm = arch.attn_v_norm;
         pipeline.qk_norm_after_rope = arch.qk_norm_after_rope;
-        pipeline.proj_gate_sigmoid = arch.arch_name == "spark2_5";
+        // One sigmoid gate per head from its own projection: Spark-X2.5's
+        // `g_proj`, LFM3's `gate_proj` (renamed at convert time).
+        pipeline.proj_gate_sigmoid = arch.arch_name == "spark2_5" || arch.arch_name == "lfm3";
         pipeline.final_softcap = arch.final_logit_softcapping.map(|c| c as f32);
         // Cortiq Embryo hierarchical head: cluster matrix → two-level log-probs.
         if let Some(ncl) = arch.head_clusters {
