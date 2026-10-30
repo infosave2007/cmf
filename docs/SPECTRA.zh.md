@@ -85,8 +85,7 @@ cargo run --release -p cortiq-spectra -- \
 
 参数：
 
-- `--input-dir`——输入 TIFF 的目录（默认值是编译进二进制文件的开发者采集数据
-  路径）；
+- `--input-dir DIR`——输入 TIFF 的目录，必填（没有默认值）；
 - `--chunk-rows N`——正的分块大小，默认 `64`；
 - `--out-dir DIR`——结果目录，默认 `artifacts/spectra/chunk-N`。
 

@@ -27,6 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   check runs in `cortiq tube-bake`; two bold cells of the coverage matrix
   rendered as literal asterisks.
 
+### Fixed
+- `cortiq peers --help` describes discovery as it works: the seeker
+  broadcasts a small query to UDP 9910, re-sent about every 900 ms while it
+  waits, and each worker answers by unicast (`CMF_NET_BEACON=0` keeps a
+  worker silent). It used to say that a worker announces itself every two
+  seconds.
+- `cortiq-spectra --help` is in English, and `--input-dir` is required: it
+  used to default to a developer's local capture path. The three
+  `docs/SPECTRA.*` editions say so.
+
 ## [0.8.47] — 2026-10-30
 
 ### Added
