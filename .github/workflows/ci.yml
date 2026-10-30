@@ -58,6 +58,20 @@ jobs:
       # the runner: compile only).
       - run: cargo check --locked -p cortiq-embryo --features vulkan --all-targets
 
+  commit-authors:
+    name: commit authors
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # GitHub lists commit authors and Co-authored-by names as contributors;
+      # commits from AI agent identities must not reach master.
+      - run: scripts/check_commit_authors.sh "$BASE" "$HEAD"
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+
   msrv:
     name: CLI MSRV (Rust 1.88)
     runs-on: ubuntu-latest
