@@ -716,6 +716,26 @@ impl NemotronH {
         }
         let mut slot = self.frame.lock().unwrap();
         if slot.is_none() {
+            // Unified memory: the frame COPIES the decoder into device
+            // buffers next to the mapped file; a host without room for both
+            // swaps (measured: 24 GB M4, 2.4 against 9-15 tok/s per-op).
+            if !crate::gpu::discrete() {
+                let need = self
+                    .model
+                    .as_ref()
+                    .and_then(|m| std::fs::metadata(&m.path).ok())
+                    .map_or(0, |md| md.len());
+                let total = crate::fcd::physical_total_bytes().unwrap_or(u64::MAX);
+                if need.saturating_mul(2) > total {
+                    tracing::info!(
+                        "nemotron frame: not built on unified memory ({:.1} GB model, {:.1} GB RAM)",
+                        need as f64 / 1e9,
+                        total as f64 / 1e9
+                    );
+                    *slot = Some(Err(()));
+                    return false;
+                }
+            }
             let t0 = std::time::Instant::now();
             let built = self
                 .frame_desc()
