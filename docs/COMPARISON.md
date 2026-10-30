@@ -8,70 +8,167 @@ engine formats it is most often weighed against:
 - **safetensors** — Hugging Face's zero-copy tensor container.
 - **ONNX** — the cross-framework graph + weights interchange format.
 - **PyTorch `.pt` / `.pth`** — pickled state dicts / checkpoints.
+- **MLX** — Apple's MLX layout: safetensors shards plus `config.json` with
+  group-wise quantization.
+- **EXL3** — the ExLlamaV3 quantization format (a QTIP-style trellis codec):
+  safetensors plus a quantization config, CUDA only.
 - **GGML (legacy)** — the pre-GGUF `ggml` file format.
 - **TensorRT engines** — NVIDIA's serialized, hardware-specific plan files.
 
 A recurring caveat: these are not all the same *kind* of thing. GGUF,
 safetensors, ONNX, `.pt`, and GGML are primarily **storage/interchange
 formats**; TensorRT engines are a **compiled runtime artifact**; CMF is
-a storage format that also ships a reference CPU runtime. The table
+a storage format that also ships a reference CPU and GPU runtime. The table
 compares them on the axes people actually ask about, but read the prose
 for the shape each one is really meant for.
 
 ## Score out of 100
 
-Eight criteria, each scored 0–100 per format, then weighted. The weights are
-our choice and they are printed so you can change them: the ranking is a
-function of what *you* need, not a property of the formats.
+Nine criteria, each scored 0–100 per format and then weighted. The weights are
+ours and printed, so you can recompute the totals for your own needs.
 
-| criterion | weight | CMF | GGUF | safetensors | ONNX | PyTorch | GGML | TensorRT |
+What is scored:
+
+- The score covers the file format and its reference runtime.
+- Ecosystem size (how many models are already published, how many third-party
+  tools exist) is not a property of the file, so it is not scored.
+- GGML is superseded by GGUF, and a TensorRT engine is compiled for one GPU and
+  one TensorRT version, so neither is a distributable model file. Both stay in
+  the feature table below.
+
+| criterion | weight | CMF | GGUF | safetensors | ONNX | MLX | EXL3 | PyTorch `.pt` |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Self-contained file (weights + tokenizer + chat template) | 15 | **100** | **100** | 40 | 50 | 30 | 60 | 70 |
-| Integrity & load safety | 10 | **100** | 20 | 60 | 30 | 0 | 20 | 40 |
-| Quantization in the format | 15 | 95 | 95 | 0 | 50 | 30 | 80 | 85 |
-| Runs without an ML framework | 10 | **100** | **100** | 20 | 60 | 0 | **100** | 30 |
-| Hardware reach of the reference runtime | 10 | 80 | **100** | 50 | 85 | 80 | 60 | 30 |
-| Zero-copy mmap load | 10 | **100** | **100** | **100** | 50 | 40 | 90 | 30 |
-| Many specialists from one base | 10 | **100** | 50 | 40 | 10 | 50 | 20 | 40 |
-| Ecosystem, tooling, model availability | 20 | 15 | **100** | **100** | 85 | 95 | 25 | 60 |
-| **Weighted total** | **100** | **80** | **86** | 53 | 56 | 45 | 55 | 52 |
-| *the same without the ecosystem row* | | **97** | 83 | 41 | 48 | 33 | 63 | 50 |
-
-**GGUF wins on the total, and it should.** Twenty of the hundred points are
-ecosystem, and there CMF scores 15 against GGUF's 100: one author, a first
-public release in July 2026, a few dozen published models against thousands.
-That is the honest state of it.
-
-**On the properties of the container itself, CMF leads 97 to 83.** Drop the
-ecosystem row and what remains is per-tensor integrity hashing that no other
-single-file format has, skills that live inside the file under the same hash
-chain, and a quantization ladder that reaches ternary and variable-bit.
-
-Both numbers are true. Pick the one that matches your problem: if you need a
-model to run tonight on hardware someone else has already tested, that is
-GGUF. If you need one auditable file that carries N specialists and proves its
-own integrity, that is what CMF is for.
+| **Quantization range**: encodings the format itself defines, from 16 bits to below 1 bit | 15 | **100** | 90 | 30 | 50 | 60 | 70 | 25 |
+| **Mixed codecs in one file**: any codec on any tensor, re-quantization in place | 10 | **100** | 90 | 50 | 60 | 70 | 75 | 30 |
+| **Empty weights take no space**: pruned neurons and experts are not stored, every layer keeps its own width | 15 | **100** | 45 | 30 | 60 | 25 | 25 | 30 |
+| **Flexibility, many tasks on one base**: task masks, skills and expert routing inside one file | 15 | **100** | 40 | 35 | 20 | 30 | 20 | 35 |
+| **Self-contained file**: tokenizer, chat template, multi-component pipelines | 10 | **100** | 80 | 30 | 45 | 30 | 25 | 25 |
+| **Integrity and authenticity**: content hashes, verification, signature | 10 | **100** | 30 | 55 | 35 | 50 | 50 | 10 |
+| **Zero-copy, lazy loading**: mmap, the GPU reads the mapped file, experts on demand | 10 | **100** | 90 | 85 | 40 | 80 | 60 | 40 |
+| **Safe evolution**: an old reader refuses what it cannot run | 5 | **100** | 70 | 60 | 85 | 50 | 40 | 40 |
+| **Standalone runtime**: no Python or ML framework, CPU and GPU | 10 | 90 | **100** | 30 | 70 | 50 | 15 | 0 |
+| **Weighted total** | **100** | **99** | 69 | 42 | 49 | 48 | 42 | 26 |
 
 ### How the scores were assigned
 
-- **Self-contained** — 100 requires weights, tokenizer and chat template in
-  one file with no sidecars. ONNX and PyTorch routinely spill weights to
-  external data; safetensors carries tensors only.
-- **Integrity & load safety** — CMF's 100 is the mandatory per-tensor and
-  per-section `hash64` plus `cortiq verify`. safetensors gets 60 for being
-  parse-safe (no pickle execution) without content hashing. PyTorch gets 0:
-  `.pt` is pickle, and loading one can execute arbitrary code.
-- **Quantization** — CMF and GGUF are level at 95: different ladders, both
-  broad and both mixable per tensor. Neither is 100 because both keep adding.
-- **Hardware reach** — GGUF's 100 is CUDA, ROCm, Metal, Vulkan, SYCL and CPU.
-  CMF's 80 is CPU everywhere plus native Metal and wgpu (Vulkan / DX12); there
-  is no CUDA-specific path.
-- **Many specialists** — CMF's 100 is skills stored inside the file, addressed
-  from the same directory, costing zero RAM when unused. GGUF's 50 is external
-  LoRA applied at load. PyTorch's 50 is the PEFT ecosystem, which is large but
-  is not a property of the container.
-- **Ecosystem** — model availability, third-party tools, how likely it is that
-  your problem is already solved by someone else.
+**Quantization range** (encodings the format itself defines):
+
+| format | score | reason |
+|---|---:|---|
+| CMF | 100 | 17 encodings, listed below. It is the only format here with a variable-bit codec, and the only one that goes below 1 bit/weight. |
+| GGUF | 90 | A broad ladder: Q8_0 down to IQ1_S, ternary TQ1_0/TQ2_0, and MXFP4. Every type has a fixed width, and none goes below 1.5 bits/weight. |
+| EXL3 | 70 | Any average bitrate, but from one trellis codec family. |
+| MLX | 60 | Group-wise affine 2–8 bit, plus MXFP4/NVFP4 modes. |
+| ONNX | 50 | int8, int4 and float8 types, and QDQ operators. |
+| safetensors | 30 | Stores plain dtypes only. GPTQ, AWQ and bitsandbytes layouts are conventions read from `config.json`, not part of the format. |
+| PyTorch | 25 | `qint8`, `quint8` and `quint4x2` tensors. |
+
+CMF's 17 encodings:
+
+- Float: f32, f16, bf16.
+- 8-bit: `q8_row`, `q8_2f`.
+- 4-bit: `q4_block`, `q4t`, `q4tp`, `mxfp4`.
+- Variable 3–8 bit: `vbit`, `vbit_ro`.
+- 2-bit: `q2tp`.
+- Ternary: `q1t`.
+- Binary: `q1`, `q1g`, `q1s`.
+- Below 1 bit/weight: `blr`.
+
+**Mixed codecs in one file:**
+
+| format | score | reason |
+|---|---:|---|
+| CMF | 100 | Each tensor has its own dtype. `--tensor-quant PATTERN=CODEC` sets it at conversion, and `cortiq requant` changes it in an existing file. |
+| GGUF | 90 | Per-tensor types, chosen at quantization time with `llama-quantize --tensor-type`. |
+| EXL3 | 75 | The quantizer allocates bits per layer. |
+| MLX | 70 | Per-layer bits through quantization predicates. |
+| ONNX | 60 | Quantization per graph node. |
+| safetensors | 50 | Per-tensor dtypes, but by convention one quantization config per model. |
+| PyTorch | 30 | Per-tensor dtypes inside the pickle. |
+
+**Empty weights take no space:**
+
+| format | score | reason |
+|---|---:|---|
+| CMF | 100 | Pruned FFN neurons and MoE experts are neither stored nor computed. Each layer keeps its own width and expert count, because the directory is the only authority on shapes (spec §11). Unused experts and skills are never paged in. |
+| ONNX | 60 | The graph carries exact shapes, so a pruned network can be represented. There are no task masks and no per-task subset. |
+| GGUF | 45 | Per-layer FFN and expert sizes exist as metadata arrays, but only for architectures llama.cpp hard-codes (the DeciLM/Nemotron-NAS class). Everything else uses one global size. |
+| safetensors | 30 | Any shape can be stored, but model code reads one `intermediate_size` from `config.json`. |
+| PyTorch | 30 | Same as safetensors. |
+| MLX | 25 | Same, with no per-layer override in the config. |
+| EXL3 | 25 | Same as MLX. |
+
+**Flexibility, many tasks on one base:**
+
+| format | score | reason |
+|---|---:|---|
+| CMF | 100 | Task masks cost 1 bit per neuron, head, layer and expert. Skills are full-shape replacement tensors in the same file and cost no memory until used. A skill can also ship as a standalone file bound to its base by hash. |
+| GGUF | 40 | LoRA adapters and control vectors, as separate files. |
+| safetensors | 35 | PEFT adapters, as separate files. |
+| PyTorch | 35 | PEFT adapters, as separate files. |
+| MLX | 30 | LoRA adapters, as separate files. |
+| ONNX | 20 | No task or adapter structure in the file. Where adapters exist, they are a runtime feature. |
+| EXL3 | 20 | Same as ONNX. |
+
+**Self-contained file:**
+
+| format | score | reason |
+|---|---:|---|
+| CMF | 100 | Weights, tokenizer and chat template are in one file. So are multi-component pipelines: image editing (transformer, text encoder, VAE, scheduler), video and speech. |
+| GGUF | 80 | Weights, tokenizer and chat template are in one file. Vision and audio encoders ship as a second `mmproj` file. |
+| ONNX | 45 | Graph and weights in one file, but models over 2 GB spill weights into external data files. The tokenizer is included only through onnxruntime-extensions. |
+| safetensors | 30 | Weights only. Config, tokenizer and chat template are sidecar files. |
+| MLX | 30 | Same as safetensors. |
+| EXL3 | 25 | Weights only, plus a quantization config sidecar. |
+| PyTorch | 25 | Weights only, and loading needs the model class. |
+
+**Integrity and authenticity:**
+
+| format | score | reason |
+|---|---:|---|
+| CMF | 100 | Mandatory `hash64` for every tensor and section. Header and directory hashes sit in the envelope. `cortiq verify` checks the whole chain. `cortiq sign` adds an optional Ed25519 signature. |
+| safetensors | 55 | The JSON header is bounded and nothing executes on load. There are no content hashes. |
+| MLX | 50 | Built on safetensors. |
+| EXL3 | 50 | Built on safetensors. |
+| ONNX | 35 | Protobuf, with no content hashes. |
+| GGUF | 30 | Magic and version only. Nothing in the format detects corruption. |
+| PyTorch | 10 | Pickle. `weights_only=True` narrows what loading can execute, but nothing checks the content. |
+
+**Zero-copy, lazy loading:**
+
+| format | score | reason |
+|---|---:|---|
+| CMF | 100 | The weight blob is page-aligned and tensors are 64-byte aligned, all memory-mapped. On Apple silicon the GPU reads the mapping without a copy. MoE experts are paged in, and cached on the GPU, when the router picks them. |
+| GGUF | 90 | Memory-mapped aligned tensors, zero-copy on Apple silicon. |
+| safetensors | 85 | Memory-mapped, with per-tensor lazy reads. |
+| MLX | 80 | Lazy safetensors loading into unified memory. |
+| EXL3 | 60 | Weights are loaded into CUDA memory. |
+| ONNX | 40 | The protobuf is parsed. |
+| PyTorch | 40 | A zip archive, with an optional `mmap=True`. |
+
+**Safe evolution:**
+
+| format | score | reason |
+|---|---:|---|
+| CMF | 100 | Every capability that changes execution has a required-feature bit. A reader refuses unknown bits, and checks "bit ⇔ content" both ways. |
+| ONNX | 85 | Per-operator opset versioning. |
+| GGUF | 70 | A versioned file with open key-value metadata. Unknown tensor types fail to load, but meaning added through new keys is invisible to an old reader. |
+| safetensors | 60 | Minimal and stable, but quantization semantics live outside the file. |
+| MLX | 50 | Semantics live in code and sidecar configs. |
+| EXL3 | 40 | Same as MLX. |
+| PyTorch | 40 | Same as MLX. |
+
+**Standalone runtime:**
+
+| format | score | reason |
+|---|---:|---|
+| GGUF | 100 | llama.cpp is C/C++ and runs on CPU, CUDA, ROCm, Metal, Vulkan and SYCL. |
+| CMF | 90 | Rust, with no Python. Runs on CPU, Metal, Vulkan and DX12, plus an independent stdlib + numpy Python reader. There is no CUDA- or ROCm-specific path. |
+| ONNX | 70 | ONNX Runtime: C++, with many execution providers, but an ML runtime of its own. |
+| MLX | 50 | The MLX framework, Apple silicon first. |
+| safetensors | 30 | A framework is needed to interpret the model. |
+| EXL3 | 15 | Python, PyTorch and CUDA. |
+| PyTorch | 0 | PyTorch itself. |
 
 ## Feature table
 
