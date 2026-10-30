@@ -48,7 +48,11 @@ impl Pipeline {
         let (eps, style) = (self.rms_eps, self.norm_style);
         let mut h = rows.to_vec();
         let mut normed = vec![0f32; t * hs];
+        // CMF_D1_DEBUG: wall time per stage (conv mixers, attention, FFNs).
+        let prof = std::env::var_os("CMF_D1_DEBUG").is_some();
+        let mut spent = [0f64; 3];
         for li in 0..self.num_layers {
+            let t_mix = std::time::Instant::now();
             let lw = &self.weights.layers[self.phys_layer(li)];
             rms_rows(&h, &lw.input_norm, eps, style, &mut normed);
             let mut mixed = match &lw.attn {
@@ -77,6 +81,9 @@ impl Pipeline {
                 }
                 _ => return Err(format!("layer {li}: the masked forward runs LFM3 layers only")),
             };
+            let stage = usize::from(!matches!(lw.attn, AttnKind::ShortConv(_)));
+            spent[stage] += t_mix.elapsed().as_secs_f64();
+            let t_ffn = std::time::Instant::now();
             if let Some(w) = &lw.attn_out_norm {
                 let raw = mixed.clone();
                 rms_rows(&raw, w, eps, style, &mut mixed);
@@ -96,6 +103,15 @@ impl Pipeline {
             for (a, b) in h.iter_mut().zip(&ffn) {
                 *a += *b;
             }
+            spent[2] += t_ffn.elapsed().as_secs_f64();
+        }
+        if prof {
+            eprintln!(
+                "d1: masked forward {t} rows: conv {:.0} ms, attention {:.0} ms, FFN {:.0} ms",
+                spent[0] * 1e3,
+                spent[1] * 1e3,
+                spent[2] * 1e3
+            );
         }
         rms_rows(&h, &self.weights.final_norm, eps, style, &mut normed);
         Ok(normed)
