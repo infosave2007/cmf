@@ -51,6 +51,24 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Apex-35B-V1.0 and faster Qwen3.5-MoE graphs (0.8.48)
+
+[Apex-35B-V1.0](https://huggingface.co/infosave/Apex-35B-V1.0-cmf), an agentic
+fine-tune of Qwen3.6-35B-A3B with tool calling and dynamic thinking:
+
+```sh
+hf download infosave/Apex-35B-V1.0-cmf apex-35b-v1.0-q4tp-v2.cmf --local-dir .
+cortiq run apex-35b-v1.0-q4tp-v2.cmf --prompt "Write a Python function that merges two sorted lists." --max-tokens 4096
+```
+
+On an NVIDIA A40 the 4-bit file decodes at 80 tok/s and reads a 4096-token
+prompt at ~390 tok/s (first token in 10.5 s). The same release speeds up every
+Qwen3.5/3.6-MoE stack on Vulkan: the prompt of a q4tp MoE is read in 256-row
+chunks, speculation stays off where the MoE draft block would run on the host,
+and the token graph builds each layer's expert bank once instead of every
+token (Apex q4tp-v2: decode 52.9 → 80.3 tok/s, 4096-token prompt 172 → 390
+tok/s against 0.8.45).
+
 ## Spark-X2.6 on a Mac (0.8.43–0.8.44)
 
 [Spark-X2.6-4B](https://huggingface.co/infosave/Spark-X2.6-4B-cmf) on a Mac
