@@ -435,7 +435,7 @@ pub fn prepare_video(
     })
 }
 
-fn load_vec(model: &CmfModel, name: &str, len: usize) -> Result<Vec<f32>, String> {
+pub(crate) fn load_vec(model: &CmfModel, name: &str, len: usize) -> Result<Vec<f32>, String> {
     let v = crate::dit::cmf_f32(model, name)?;
     if v.len() != len {
         return Err(format!("tensor '{name}' has {} values, expected {len}", v.len()));
@@ -448,20 +448,20 @@ fn load_vec(model: &CmfModel, name: &str, len: usize) -> Result<Vec<f32>, String
 /// tf32-class operands) a few rows of a 4320-patch image drift to a cosine
 /// of 0.97 against Transformers float32, on the host every row stays above
 /// 0.99999.
-struct Dense {
+pub(crate) struct Dense {
     w: Vec<f32>,
-    rows: usize,
-    cols: usize,
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
 }
 
 impl Dense {
     /// `y[n, rows] = x[n, cols] · Wᵀ`.
-    fn matmat(&self, x: &[f32], n: usize, y: &mut [f32], pool: Option<&Pool>) {
+    pub(crate) fn matmat(&self, x: &[f32], n: usize, y: &mut [f32], pool: Option<&Pool>) {
         crate::fcd_ops::gemm_nt_host(x, &self.w, y, n, self.cols, self.rows, pool);
     }
 }
 
-fn load_proj(model: &Arc<CmfModel>, name: &str, rows: usize, cols: usize) -> Result<Dense, String> {
+pub(crate) fn load_proj(model: &Arc<CmfModel>, name: &str, rows: usize, cols: usize) -> Result<Dense, String> {
     let w = crate::dit::cmf_f32(model, name)?;
     if w.len() != rows * cols {
         return Err(format!(
@@ -514,7 +514,7 @@ pub struct Lfm3VlTower {
     gpu_attention: bool,
 }
 
-fn rms_rows(x: &[f32], w: &[f32], eps: f64, out: &mut [f32], pool: Option<&Pool>) {
+pub(crate) fn rms_rows(x: &[f32], w: &[f32], eps: f64, out: &mut [f32], pool: Option<&Pool>) {
     let d = w.len();
     let rows = x.len() / d;
     let dst = crate::pool::SendMut::new(out.as_mut_ptr());
@@ -536,7 +536,7 @@ fn rms_rows(x: &[f32], w: &[f32], eps: f64, out: &mut [f32], pool: Option<&Pool>
 }
 
 /// `erf` by the Numerical Recipes rational form (1.2e-7 relative).
-fn erf(x: f64) -> f64 {
+pub(crate) fn erf(x: f64) -> f64 {
     let z = x.abs();
     let t = 1.0 / (1.0 + 0.5 * z);
     let ans = t
@@ -553,7 +553,7 @@ fn erf(x: f64) -> f64 {
     if x >= 0.0 { 1.0 - ans } else { ans - 1.0 }
 }
 
-fn add_bias(x: &mut [f32], b: &[f32]) {
+pub(crate) fn add_bias(x: &mut [f32], b: &[f32]) {
     for row in x.chunks_exact_mut(b.len()) {
         for (v, &bb) in row.iter_mut().zip(b) {
             *v += bb;

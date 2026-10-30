@@ -38,6 +38,7 @@ pub use wgpu;
 pub mod imagegen;
 pub mod inference;
 pub mod kv_cache;
+pub mod lfm3_audio;
 pub mod lfm3_vl;
 pub mod linear_core;
 pub mod loader;

@@ -1230,6 +1230,12 @@ async fn chat_completions(
         let think_tokens = state.tokenizer.encode("<think>");
         sampler_config.suppress_tokens.extend(think_tokens);
     }
+    // A speech model answers in text here: no speech or mixed turn.
+    if cortiq_engine::lfm3_audio::has_audio(state.runtime.model()) {
+        sampler_config
+            .suppress_tokens
+            .extend(cortiq_engine::lfm3_audio::text_only_suppress(&state.tokenizer));
+    }
 
     // Router v2 routes a chat on its LAST user message; the lane generates
     // in the tokenizer's chat frame (its template, or the ChatML fallback).
@@ -1300,6 +1306,13 @@ async fn chat_completions(
             Ok(false) => None,
             Err(e) => return error_response(StatusCode::BAD_REQUEST, e),
         }
+    } else {
+        None
+    };
+    // An LFM3-Audio file with audio parts (`input_audio`, `audio`).
+    let lfm3_audio_messages = if cortiq_engine::lfm3_audio::has_audio(state.runtime.model()) {
+        let messages: Vec<_> = req.messages.iter().map(message_to_json).collect();
+        cortiq_engine::lfm3_audio::has_audio_parts(&messages).then_some(messages)
     } else {
         None
     };
@@ -1386,6 +1399,29 @@ async fn chat_completions(
             Err(e) => {
                 tracing::error!("LFM3-VL image preparation failed: {e}");
                 return error_response(StatusCode::INTERNAL_SERVER_ERROR, "LFM3-VL image preparation failed");
+            }
+        };
+        mimo_rows = prepared.rows;
+        (prepared.token_ids, None)
+    } else if let Some(messages) = lfm3_audio_messages {
+        // LFM3-Audio clips: the encoder runs before the stream opens, so a
+        // bad clip is an HTTP 400.
+        if state.remote.is_some() || req.cortiq.as_ref().is_some_and(|c| c.class_tokens.is_some()) {
+            return error_response(StatusCode::BAD_REQUEST, "LFM3-Audio clips cannot use a network split or cortiq.class_tokens");
+        }
+        let slot = state.slots.acquire().await;
+        let tools = req.effective_tools().map(|t| t.to_vec());
+        let thinking = template_thinking;
+        let prepared = tokio::task::spawn_blocking(move || {
+            cortiq_engine::gpu::set_current_device(slot.device);
+            cortiq_engine::lfm3_audio::prepare_for_pipeline(&slot.pipe, &messages, tools.as_deref(), thinking)
+        }).await;
+        let prepared = match prepared {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => return error_response(StatusCode::BAD_REQUEST, e),
+            Err(e) => {
+                tracing::error!("LFM3-Audio clip preparation failed: {e}");
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "LFM3-Audio clip preparation failed");
             }
         };
         mimo_rows = prepared.rows;

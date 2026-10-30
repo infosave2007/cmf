@@ -1470,9 +1470,14 @@ enum Commands {
         /// Frame rate of a frame directory (MiMo, LFM3-VL video).
         #[arg(long)]
         video_fps: Option<f64>,
-        /// MiMo WAV file, data URL, or HTTP(S) URL; repeat for multiple clips.
+        /// MiMo or LFM3-Audio clip: WAV (other formats through ffmpeg),
+        /// data URL, or HTTP(S) URL; repeat for multiple clips.
         #[arg(long = "audio")]
         audios: Vec<String>,
+        /// System message of the chat prompt (LFM3-Audio tasks read it:
+        /// "Perform ASR in English.").
+        #[arg(long)]
+        system: Option<String>,
         /// Explicit MiMo multimodal companion (otherwise discovered beside text).
         #[arg(long)]
         mm: Option<std::path::PathBuf>,
@@ -4670,6 +4675,7 @@ async fn main() -> anyhow::Result<()> {
             videos,
             video_fps,
             audios,
+            system,
             mm,
             image_max_pixels,
             reasoning_effort,
@@ -4720,6 +4726,7 @@ async fn main() -> anyhow::Result<()> {
                 &images,
                 &videos,
                 &audios,
+                system.as_deref(),
                 &cortiq_engine::mimo_ingress::MediaOptions { companion: mm, image_max_pixels, video_fps },
                 reasoning_effort.as_deref(),
                 max_tokens,
@@ -8801,6 +8808,7 @@ async fn cmd_run(
     images: &[String],
     videos: &[String],
     audios: &[String],
+    system: Option<&str>,
     media_options: &cortiq_engine::mimo_ingress::MediaOptions,
     reasoning_effort: Option<&str>,
     max_tokens: usize,
@@ -9099,13 +9107,25 @@ async fn cmd_run(
     let mimo_media = is_mimo && (!images.is_empty() || !videos.is_empty() || !audios.is_empty());
     let lfm3_vl = cortiq_engine::lfm3_vl::has_vision(&model);
     let lfm3_media = lfm3_vl && (!images.is_empty() || !videos.is_empty());
+    let lfm3_audio = cortiq_engine::lfm3_audio::has_audio(&model);
+    let lfm3_audio_media = lfm3_audio && !audios.is_empty();
+    // A text answer from a speech model: no speech or mixed turn.
+    if lfm3_audio {
+        let ids = cortiq_engine::lfm3_audio::text_only_suppress(&pipeline.tokenizer);
+        pipeline.sampler_config.suppress_tokens.extend(ids);
+    }
     anyhow::ensure!(is_dsv41 || reasoning_effort.is_none(), "--reasoning-effort requires DeepSeek-V4.1");
     anyhow::ensure!(is_dsv41 || is_mimo || lfm3_media || images.is_empty(),
         "--image requires DeepSeek-V4.1, MiMo or an LFM3-VL file");
-    anyhow::ensure!(is_mimo || (audios.is_empty() && media_options.companion.is_none()
+    anyhow::ensure!(is_mimo || ((audios.is_empty() || lfm3_audio) && media_options.companion.is_none()
         && ((videos.is_empty() && media_options.video_fps.is_none() && media_options.image_max_pixels.is_none())
             || lfm3_vl)),
-        "--video/--audio/--mm and MiMo processing options require MiMo (--video and its options: or LFM3-VL)");
+        "--video/--audio/--mm and MiMo processing options require MiMo (--video and its options: or LFM3-VL; --audio: or LFM3-Audio)");
+    anyhow::ensure!(!(lfm3_audio_media && lfm3_media),
+        "LFM3 pictures and speech in one prompt are not supported yet");
+    anyhow::ensure!(!lfm3_audio_media || (!raw && state.is_none() && peer.is_none() && gpus.is_none()
+        && std::env::var_os("CMF_PROMPT_IDS").is_none()),
+        "LFM3-Audio clips require a fresh local chat prompt (no --raw/--state/--peer/--gpus/CMF_PROMPT_IDS)");
     anyhow::ensure!(!lfm3_media || (!raw && state.is_none() && peer.is_none() && gpus.is_none()
         && std::env::var_os("CMF_PROMPT_IDS").is_none()),
         "LFM3-VL images require a fresh local chat prompt (no --raw/--state/--peer/--gpus/CMF_PROMPT_IDS)");
@@ -9607,7 +9627,10 @@ async fn cmd_run(
             None => p.to_string(),
         };
         let p = p_text.as_str();
-        let history = vec![("user".to_string(), p.to_string())];
+        let mut history = vec![("user".to_string(), p.to_string())];
+        if let Some(sys) = system {
+            history.insert(0, ("system".to_string(), sys.to_string()));
+        }
         let vl_inputs = is_dsv41
             .then(|| {
                 prepare_dsv41_cli_prompt(&model, &pipeline, p, images, no_think, reasoning_effort)
@@ -9629,14 +9652,35 @@ async fn cmd_run(
                 .collect();
             content.extend(videos.iter().map(|path| serde_json::json!({"type":"video", "video":{"path":path}})));
             content.push(serde_json::json!({"type":"text", "text":p}));
+            let mut messages: Vec<serde_json::Value> = system
+                .map(|s| serde_json::json!({"role":"system", "content":s}))
+                .into_iter()
+                .collect();
+            messages.push(serde_json::json!({"role":"user", "content":content}));
             Some(cortiq_engine::lfm3_vl::prepare(&model, &pipeline,
-                &[serde_json::json!({"role":"user", "content":content})], None, thinking,
+                &messages, None, thinking,
                 &cortiq_engine::lfm3_vl::VlOptions {
                     image_max_pixels: media_options.image_max_pixels,
                     video_fps: media_options.video_fps,
                 })
                 .map_err(anyhow::Error::msg)?)
         } else { None };
+        // LFM3-Audio: the clips, then the text (none when empty).
+        let lfm3_inputs = if lfm3_audio_media {
+            let mut content: Vec<serde_json::Value> = audios.iter()
+                .map(|path| serde_json::json!({"type":"audio", "audio":path}))
+                .collect();
+            if !p.trim().is_empty() {
+                content.push(serde_json::json!({"type":"text", "text":p}));
+            }
+            let mut messages: Vec<serde_json::Value> = system
+                .map(|s| serde_json::json!({"role":"system", "content":s}))
+                .into_iter()
+                .collect();
+            messages.push(serde_json::json!({"role":"user", "content":content}));
+            Some(cortiq_engine::lfm3_audio::prepare(&model, &pipeline, &messages, None, thinking)
+                .map_err(anyhow::Error::msg)?)
+        } else { lfm3_inputs };
         let mut ids = vl_inputs
             .as_ref()
             .map(|inputs| inputs.token_ids.clone())

@@ -764,15 +764,53 @@ fn spark25_canon(raw: &str) -> Option<String> {
 /// LFM3-VL (`lfm3_vl`) wraps the same text model as `model.language_model`;
 /// its vision tower and projector keep their source names minus the
 /// `model.` wrapper (`vision_tower.*`, `multi_modal_projector.*`), which
-/// is where `lfm3_vl` reads them.
+/// is where `lfm3_vl` reads them. LFM3-Omni's speech parts do the same
+/// (`audio_encoder.*`, `audio_projector.*`, `depth_decoder.*`,
+/// `codebook_embedding.weight`, read by `lfm3_audio`); LFM3-Audio's own
+/// layout (`lfm.model.*`, `encoder.*`, `mlp.model.N.*`, `depthformer.*`,
+/// `depth_*`) lands on the same names.
 fn lfm3_canon(name: &str) -> Option<String> {
     if let Some(rest) = name.strip_prefix("model.language_model.") {
         return lfm3_canon(&format!("model.{rest}"));
     }
+    if let Some(rest) = name.strip_prefix("lfm.model.") {
+        return lfm3_canon(&format!("model.{rest}"));
+    }
     if let Some(rest) = name.strip_prefix("model.") {
-        if rest.starts_with("vision_tower.") || rest.starts_with("multi_modal_projector.") {
+        if rest.starts_with("vision_tower.")
+            || rest.starts_with("multi_modal_projector.")
+            || rest.starts_with("audio_encoder.")
+            || rest.starts_with("audio_projector.")
+            || rest.starts_with("depth_decoder.")
+            || rest == "codebook_embedding.weight"
+        {
             return Some(rest.to_string());
         }
+    }
+    if let Some(rest) = name.strip_prefix("encoder.downsample.") {
+        return Some(format!("audio_encoder.downsample.{rest}"));
+    }
+    if let Some(rest) = name.strip_prefix("encoder.lfm.lfm.") {
+        return Some(format!("audio_encoder.lfm.{rest}"));
+    }
+    if let Some(rest) = name.strip_prefix("mlp.model.") {
+        let (i, tail) = rest.split_once('.')?;
+        let part = match i {
+            "0" => "layer_norm",
+            "1" => "linear_1",
+            "3" => "linear_2",
+            _ => return None,
+        };
+        return Some(format!("audio_projector.{part}.{tail}"));
+    }
+    if let Some(rest) = name.strip_prefix("depthformer.") {
+        return Some(format!("depth_decoder.{rest}"));
+    }
+    if name.starts_with("depth_linear.") || name.starts_with("depth_embeddings.") || name == "mask_embedding" {
+        return Some(format!("depth_decoder.{name}"));
+    }
+    if name == "codebook_embedding.weight" {
+        return Some(name.to_string());
     }
     if name == "model.embedding_norm.weight" {
         return Some("model.norm.weight".to_string());
@@ -880,7 +918,16 @@ fn force_dsv41_vision_f16(arch: &ModelArch, name: &str, shape: &[usize]) -> bool
 /// 0.958) and 0.993 through the device GEMM (worst 0.61).
 fn lfm3_vision(arch: &ModelArch, name: &str) -> bool {
     arch.arch_name == "lfm3"
-        && (name.starts_with("vision_tower.") || name.starts_with("multi_modal_projector."))
+        && [
+            "vision_tower.",
+            "multi_modal_projector.",
+            "audio_encoder.",
+            "audio_projector.",
+            "depth_decoder.",
+            "codebook_embedding.",
+        ]
+        .iter()
+        .any(|p| name.starts_with(p))
 }
 
 /// M3's router starts as an F32 source plane and its top-4 choice is
@@ -6869,8 +6916,16 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     {
         return build_minimax_m3_arch(config);
     }
-    // Vision/multimodal configs nest the text model under "text_config".
-    let tc = config.get("text_config").unwrap_or(config);
+    // Vision/multimodal configs nest the text model under "text_config";
+    // LFM3-Audio's own layout under "lfm".
+    let tc = config
+        .get("text_config")
+        .or_else(|| {
+            (config.get("model_type").and_then(|v| v.as_str()) == Some("lfm3_audio"))
+                .then(|| config.get("lfm"))
+                .flatten()
+        })
+        .unwrap_or(config);
     let model_type = config
         .get("model_type")
         .and_then(|v| v.as_str())
@@ -7522,6 +7577,8 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         // Gemma ties embeddings by default and its configs omit the key.
         tie_word_embeddings: config
             .get("tie_word_embeddings")
+            // LFM3-Audio states it on the nested text model only.
+            .or_else(|| tc.get("tie_word_embeddings").filter(|_| is_lfm3))
             .and_then(|v| v.as_bool())
             // MiniCPM3 ships no lm_head tensor — the head is the embedding.
             .unwrap_or(is_gemma || is_minicpm3),
@@ -10900,6 +10957,30 @@ pub fn run_convert_multi_excluding(
             "lfm3_vl: processor_config.json is missing — the image preprocessing lives there"
         );
         p["lfm3_vl"] = serde_json::json!({"config": config.clone(), "processor": processor});
+        p
+    } else {
+        provenance
+    };
+    // LFM3-Audio / LFM3-Omni: the checkpoint config (its speech encoder)
+    // and the feature extractor's settings (`lfm3_audio::Lfm3AudioConfig`).
+    let provenance = if arch.arch_name == "lfm3"
+        && (config.get("audio_encoder_config").is_some() || config.get("encoder").is_some())
+    {
+        let mut p = provenance;
+        let read = |f: &str| -> serde_json::Value {
+            fs::read(dir.join(f))
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or(serde_json::Value::Null)
+        };
+        let features = match read("preprocessor_config.json") {
+            serde_json::Value::Null => read("processor_config.json")
+                .get("feature_extractor")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            v => v,
+        };
+        p["lfm3_audio"] = serde_json::json!({"config": config.clone(), "features": features});
         p
     } else {
         provenance
