@@ -902,8 +902,8 @@ impl NemotronH {
         })
     }
 
-    /// The draft layer for the frame (speculation; `CMF_NEMO_MTP=0` turns
-    /// it off): used when every expert fits the card.
+    /// The draft layer for the frame (speculation; `CMF_NEMO_MTP=0` turns it
+    /// off): used when every expert fits the card.
     fn mtp_desc(&self) -> Option<crate::gpu_wgpu::nemotron::NemoMtpDesc<'_>> {
         if std::env::var("CMF_NEMO_MTP").as_deref() == Ok("0") {
             return None;
