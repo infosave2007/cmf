@@ -3549,6 +3549,31 @@ kernel void gdn_ring_shift(
     ring[(kk - 2u) * c_dim + i] = qkv[i];
 }
 
+// LFM2/LFM3 gated short-conv decode step: bcx = [B | C | x] (3h), taps
+// [h·k] channel-major, the ring in the HOST layout ([channel][k-1], slot 0
+// newest — kv_cache.linear_state as is). One thread per channel:
+// y = C · (tap[k-1]·B·x + Σ tap[k-2-s]·ring[s]), then the shift.
+kernel void sconv_step(
+    device const float* bcx  [[buffer(0)]],
+    device float*       ring [[buffer(1)]],
+    device const float* taps [[buffer(2)]],
+    device float*       y    [[buffer(3)]],
+    constant uint&      h    [[buffer(4)]],
+    constant uint&      k    [[buffer(5)]],
+    uint ch [[thread_position_in_grid]])
+{
+    if (ch >= h) return;
+    uint rl = k - 1u;
+    float bx = bcx[ch] * bcx[2u * h + ch];
+    device const float* t = taps + (ulong)ch * k;
+    device float* r = ring + (ulong)ch * rl;
+    float acc = t[k - 1u] * bx;
+    for (uint s = 0; s < rl; ++s) acc += t[k - 2u - s] * r[s];
+    y[ch] = bcx[h + ch] * acc;
+    for (uint j = rl; j > 1u; --j) r[j - 1u] = r[j - 2u];
+    if (rl > 0u) r[0] = bx;
+}
+
 // Per-head decay g and write strength beta.
 kernel void gdn_gates(
     device const float* a       [[buffer(0)]],
@@ -8423,6 +8448,8 @@ struct Ctx {
     f16mv: ComputePipelineState,
     conv: ComputePipelineState,
     ring: ComputePipelineState,
+    /// `sconv_step`: the LFM2/LFM3 short-conv mixer (`encode_sconv_run`).
+    sconv: ComputePipelineState,
     gates: ComputePipelineState,
     qkn: ComputePipelineState,
     stateup: ComputePipelineState,
@@ -8712,6 +8739,7 @@ fn init() -> Result<Ctx, String> {
     let f16mv = pso("f32_matvec")?;
     let conv = pso("gdn_conv")?;
     let ring = pso("gdn_ring_shift")?;
+    let sconv = pso("sconv_step")?;
     let gates = pso("gdn_gates")?;
     let qkn = pso("gdn_qk_norms")?;
     let stateup = pso("gdn_state_update")?;
@@ -8846,6 +8874,7 @@ fn init() -> Result<Ctx, String> {
         f16mv,
         conv,
         ring,
+        sconv,
         gates,
         qkn,
         stateup,
@@ -18628,6 +18657,21 @@ pub fn matvec_batch(model: &Arc<CmfModel>, jobs: &[BatchJob], outs: &mut [&mut [
     true
 }
 
+/// One LFM2/LFM3 short-conv layer for the token graph: the fused
+/// (B, C, x) projection, the depthwise taps `[hidden·kernel]`, the output
+/// projection, and LFM3's plain sandwich norms (mixer and FFN outputs
+/// RMS-normed before their residual adds).
+pub struct SconvGpuLayer<'a> {
+    pub attn_norm: &'a [f32],
+    pub post_norm: &'a [f32],
+    pub in_proj: (usize, usize, usize),
+    pub taps: &'a [f32],
+    pub out: (usize, usize, usize),
+    pub attn_out_norm: Option<&'a [f32]>,
+    pub ffn_out_norm: Option<&'a [f32]>,
+    pub ffn: MetalFfn<'a>,
+}
+
 /// One GDN layer's worth of tensors/vectors for the whole-block GPU
 /// path. Matvec tensors are (directory idx, rows, cols) of q1 weights.
 pub struct GdnGpuLayer<'a> {
@@ -19807,6 +19851,28 @@ impl TokenGraph {
             .iter()
             .all(|t| self.proj_abs(*t).is_some())
             && self.ffn_ok(&l.ffn)
+    }
+
+    /// Pre-flight check for a short-conv layer of conv width `kernel`.
+    pub fn sconv_ok(&self, l: &SconvGpuLayer, kernel: usize) -> bool {
+        let h = self.dims.hidden;
+        if kernel < 1
+            || l.in_proj.1 != 3 * h
+            || l.in_proj.2 != h
+            || l.out.1 != h
+            || l.out.2 != h
+            || l.taps.len() != h * kernel
+        {
+            return false;
+        }
+        // The FFN-output norm rides the Gemma-4 library's tail kernel,
+        // which the MoE FFNs do not take.
+        if l.ffn_out_norm.is_some()
+            && (!matches!(l.ffn, MetalFfn::Dense { .. }) || gemma4::pipes(self.c).is_none())
+        {
+            return false;
+        }
+        [l.in_proj, l.out].iter().all(|t| self.proj_abs(*t).is_some()) && self.ffn_ok(&l.ffn)
     }
 
     /// Pre-flight check for a full-attention layer.
@@ -22308,6 +22374,133 @@ impl TokenGraph {
             }
         }
 
+        enc.end_encoding();
+        for ((sb, st), w) in st_bs.iter().zip(states).zip(wrapped) {
+            self.dirty.push((sb.clone(), if w { 0 } else { st.len() }));
+        }
+        true
+    }
+
+    /// A run of LFM2/LFM3 short-conv layers in one serial encoder: norm,
+    /// in_proj, the conv step (ring advanced on the device), out_proj, the
+    /// optional mixer-output norm, then the shared post-norm + FFN tail.
+    /// `states` are the layers' host rings (`[hidden][kernel-1]`), read
+    /// back by `read_states` after the next sync, as for a GDN run.
+    pub fn encode_sconv_run(
+        &mut self,
+        layers: &[SconvGpuLayer],
+        states: &[&[f32]],
+        kernel: usize,
+    ) -> bool {
+        WCAT.store(4, std::sync::atomic::Ordering::Relaxed);
+        let h = self.dims.hidden;
+        let ring_len = (kernel - 1) * h;
+        if layers.is_empty() || layers.len() != states.len() {
+            return false;
+        }
+        let mut abss: Vec<[(usize, ProjKind); 2]> = Vec::with_capacity(layers.len());
+        for (l, st) in layers.iter().zip(states) {
+            if !self.sconv_ok(l, kernel) || st.len() != ring_len {
+                return false;
+            }
+            abss.push([self.proj_abs(l.in_proj).unwrap(), self.proj_abs(l.out).unwrap()]);
+        }
+        let c = self.c;
+        let bcx_b = io_buf(c, 37_000_000_239 + 3 * h, 3 * h * 4);
+        let y_b = io_buf(c, 38_000_000_241 + h, h * 4);
+        let mut st_bs: Vec<Buffer> = Vec::with_capacity(layers.len());
+        let mut wrapped: Vec<bool> = Vec::with_capacity(layers.len());
+        for (i, st) in states.iter().enumerate() {
+            if let Some(b) = host_state_buffer(c, st.as_ptr(), st.len()) {
+                st_bs.push(b);
+                wrapped.push(true);
+            } else {
+                let sb = io_buf(
+                    c,
+                    39_000_000_251 + (self.st_next + i) * 613 + ring_len,
+                    ring_len.max(1) * 4,
+                );
+                unsafe {
+                    std::ptr::copy_nonoverlapping(st.as_ptr(), sb.contents() as *mut f32, st.len());
+                }
+                st_bs.push(sb);
+                wrapped.push(false);
+            }
+        }
+        self.st_next += layers.len();
+
+        let cmd = self.ensure_cmd();
+        let fbuf = self.fbuf.clone();
+        let (h_b, n_b, d_b) = (self.h_b.clone(), self.n_b.clone(), self.d_b.clone());
+        let enc = cmd.new_compute_command_encoder();
+        let (h_u, k_u) = (h as u32, kernel as u32);
+        for (l, (a2, sb)) in layers.iter().zip(abss.iter().zip(&st_bs)) {
+            disp(
+                enc,
+                &c.rmsn,
+                &[(&h_b, 0), (&const_buf(c, l.attn_norm), 0), (&n_b, 0)],
+                &[h_u, self.dims.gemma as u32],
+                &[self.dims.eps],
+                (256, 256),
+            );
+            encode_proj(
+                c,
+                enc,
+                &fbuf,
+                a2[0].0,
+                &a2[0].1,
+                &n_b,
+                &bcx_b,
+                l.in_proj.1,
+                l.in_proj.2 / GROUP_SIZE,
+            );
+            enc.set_compute_pipeline_state(&c.sconv);
+            enc.set_buffer(0, Some(&bcx_b), 0);
+            enc.set_buffer(1, Some(sb), 0);
+            enc.set_buffer(2, Some(&const_buf(c, l.taps)), 0);
+            enc.set_buffer(3, Some(&y_b), 0);
+            enc.set_bytes(4, 4, &h_u as *const u32 as *const std::ffi::c_void);
+            enc.set_bytes(5, 4, &k_u as *const u32 as *const std::ffi::c_void);
+            enc.dispatch_threads(MTLSize::new(h as u64, 1, 1), MTLSize::new(256, 1, 1));
+            encode_proj(
+                c,
+                enc,
+                &fbuf,
+                a2[1].0,
+                &a2[1].1,
+                &y_b,
+                &d_b,
+                l.out.1,
+                l.out.2 / GROUP_SIZE,
+            );
+            // LFM3 sandwich: out_proj·y is RMS-normed in place before its
+            // add (`rmsnorm_k` reads each element before it writes it).
+            if let Some(w) = l.attn_out_norm {
+                disp(
+                    enc,
+                    &c.rmsn,
+                    &[(&d_b, 0), (&const_buf(c, w), 0), (&d_b, 0)],
+                    &[h_u, self.dims.gemma as u32],
+                    &[self.dims.eps],
+                    (256, 256),
+                );
+            }
+            match &l.ffn {
+                MetalFfn::Dense {
+                    gate,
+                    up,
+                    down,
+                    act,
+                } => {
+                    let tail = l.ffn_out_norm.map(|w| (Some(w), 1.0));
+                    self.encode_post_ffn(enc, l.post_norm, *gate, *up, *down, *act, Some(&d_b), tail);
+                }
+                MetalFfn::Moe(m) => self.encode_post_moe_ffn(enc, l.post_norm, m, Some(&d_b)),
+                MetalFfn::FlintMoe(m) => {
+                    self.encode_post_flint_moe_ffn(enc, l.post_norm, m, Some(&d_b))
+                }
+            }
+        }
         enc.end_encoding();
         for ((sb, st), w) in st_bs.iter().zip(states).zip(wrapped) {
             self.dirty.push((sb.clone(), if w { 0 } else { st.len() }));

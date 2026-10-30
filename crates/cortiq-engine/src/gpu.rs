@@ -4187,7 +4187,8 @@ pub fn q4t_matmat(
 #[cfg(target_os = "macos")]
 pub use crate::gpu_metal::{
     AttnDeviceParams, AttnGpuLayer, GdnGpuCfg, GdnGpuLayer, GpuFlintMoe, GpuMoe, GraphDims,
-    MetalFfn, O1AttnParams, TokenGraph, kv_mirror_drop, kv_mirror_read_last, kv_mirror_take_imp,
+    MetalFfn, O1AttnParams, SconvGpuLayer, TokenGraph, kv_mirror_drop, kv_mirror_read_last,
+    kv_mirror_take_imp,
 };
 
 /// A BLOCK of consecutive q1 GDN layers in one submission (Metal only).
