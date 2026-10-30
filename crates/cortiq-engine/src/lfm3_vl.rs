@@ -986,6 +986,9 @@ fn normalize(messages: &[Value]) -> Result<(Vec<Value>, Vec<Item>), String> {
                 }
                 items.push(Item::Video(rec));
                 *part = json!({"type": "video"});
+            } else if matches!(typ, "audio" | "input_audio" | "audio_url") {
+                // Speech: LFM3-Omni's prepare collects it (`lfm3_audio`);
+                // a vision-only file refuses it there.
             } else if typ != "text" && part.get("text").is_none() {
                 return Err(format!(
                     "LFM3-VL: unsupported content part '{typ}' (text, images and video only)"
@@ -1042,9 +1045,19 @@ pub fn prepare(
     thinking: Option<bool>,
     options: &VlOptions,
 ) -> Result<PreparedVlPrompt, String> {
-    let (messages, items) = normalize(messages)?;
+    // LFM3-Omni: its speech clips first (each part becomes {"type":"audio"}).
+    let speech = crate::lfm3_audio::has_audio(model);
+    if !speech && crate::lfm3_audio::has_audio_parts(messages) {
+        return Err("this LFM3 file takes no audio (LFM3-Omni and LFM3-Audio do)".into());
+    }
+    let (messages, clips) = if speech {
+        crate::lfm3_audio::normalize(messages)
+    } else {
+        (messages.to_vec(), Vec::new())
+    };
+    let (messages, items) = normalize(&messages)?;
     let tok = &pipeline.tokenizer;
-    if items.is_empty() {
+    if items.is_empty() && clips.is_empty() {
         let ids = tok.try_apply_chat_template_json(&messages, tools, thinking)?;
         return Ok(PreparedVlPrompt { token_ids: ids, rows: None });
     }
@@ -1053,6 +1066,13 @@ pub fn prepare(
         .ok_or("LFM3-VL: the chat template failed to render")?;
     let tower = Lfm3VlTower::from_model(model, crate::pool::Pool::from_env())?;
     let cfg = &tower.cfg;
+    let audio_enc = if clips.is_empty() {
+        None
+    } else {
+        Some(crate::lfm3_audio::Lfm3AudioEncoder::from_model(model, crate::pool::Pool::from_env())?)
+    };
+    let audio_id = tok.token_to_id("<|audio|>");
+    let mut clips = clips.into_iter();
     if cfg.text_hidden != pipeline.hidden_size {
         return Err("LFM3-VL: projector width differs from the text model".into());
     }
@@ -1074,6 +1094,20 @@ pub fn prepare(
     loop {
         let next_img = rest.find("<|image|>");
         let next_vid = rest.find("<|video|>");
+        let next_aud = audio_enc.as_ref().and_then(|_| rest.find("<|audio|>"));
+        // A speech clip (LFM3-Omni) before the next picture or video.
+        if let Some(a) = next_aud.filter(|&a| next_img.is_none_or(|i| a < i) && next_vid.is_none_or(|v| a < v)) {
+            let enc = audio_enc.as_ref().expect("checked above");
+            expanded.push_str(&rest[..a]);
+            rest = &rest[a + "<|audio|>".len()..];
+            let src = clips.next().ok_or("LFM3: more <|audio|> placeholders than clips")?;
+            let rows = enc.rows(&crate::egemma2_audio::load_audio_source(&src)?)?;
+            for _ in 0..rows.len() / enc.text_hidden {
+                expanded.push_str("<|audio|>");
+            }
+            media_rows.extend(rows);
+            continue;
+        }
         let (at, video) = match (next_img, next_vid) {
             (None, None) => break,
             (Some(i), None) => (i, false),
@@ -1142,7 +1176,7 @@ pub fn prepare(
         k += 1;
     }
     expanded.push_str(rest);
-    if images.next().is_some() || videos.next().is_some() {
+    if images.next().is_some() || videos.next().is_some() || clips.next().is_some() {
         return Err("LFM3-VL: the template rendered fewer placeholders than media".into());
     }
     let ids = tok.with_bos(tok.encode(&expanded));
@@ -1151,7 +1185,7 @@ pub fn prepare(
     let mut rows = Vec::with_capacity(ids.len() * h);
     let mut at = 0usize;
     for &id in &ids {
-        if id == image_id || id == video_id {
+        if id == image_id || id == video_id || (Some(id) == audio_id && audio_enc.is_some()) {
             let row = media_rows
                 .get(at..at + h)
                 .ok_or("LFM3-VL: placeholder and media row counts differ")?;

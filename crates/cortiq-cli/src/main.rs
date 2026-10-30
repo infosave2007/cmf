@@ -9114,9 +9114,10 @@ async fn cmd_run(
     let is_mimo = model.arch().arch_name == "mimo_v2";
     let mimo_media = is_mimo && (!images.is_empty() || !videos.is_empty() || !audios.is_empty());
     let lfm3_vl = cortiq_engine::lfm3_vl::has_vision(&model);
-    let lfm3_media = lfm3_vl && (!images.is_empty() || !videos.is_empty());
     let lfm3_audio = cortiq_engine::lfm3_audio::has_audio(&model);
-    let lfm3_audio_media = lfm3_audio && !audios.is_empty();
+    // LFM3-Omni (vision + speech) takes every medium through the VL path.
+    let lfm3_media = lfm3_vl && (!images.is_empty() || !videos.is_empty() || (lfm3_audio && !audios.is_empty()));
+    let lfm3_audio_media = lfm3_audio && !lfm3_vl && !audios.is_empty();
     // A text answer from a speech model: no speech or mixed turn.
     if lfm3_audio {
         let ids = cortiq_engine::lfm3_audio::text_only_suppress(&pipeline.tokenizer);
@@ -9129,8 +9130,6 @@ async fn cmd_run(
         && ((videos.is_empty() && media_options.video_fps.is_none() && media_options.image_max_pixels.is_none())
             || lfm3_vl)),
         "--video/--audio/--mm and MiMo processing options require MiMo (--video and its options: or LFM3-VL; --audio: or LFM3-Audio)");
-    anyhow::ensure!(!(lfm3_audio_media && lfm3_media),
-        "LFM3 pictures and speech in one prompt are not supported yet");
     anyhow::ensure!(!lfm3_audio_media || (!raw && state.is_none() && peer.is_none() && gpus.is_none()
         && std::env::var_os("CMF_PROMPT_IDS").is_none()),
         "LFM3-Audio clips require a fresh local chat prompt (no --raw/--state/--peer/--gpus/CMF_PROMPT_IDS)");
@@ -9659,7 +9658,12 @@ async fn cmd_run(
                 .map(|path| serde_json::json!({"type":"image_url", "image_url":{"url":path}}))
                 .collect();
             content.extend(videos.iter().map(|path| serde_json::json!({"type":"video", "video":{"path":path}})));
-            content.push(serde_json::json!({"type":"text", "text":p}));
+            if lfm3_audio {
+                content.extend(audios.iter().map(|path| serde_json::json!({"type":"audio", "audio":path})));
+            }
+            if !p.trim().is_empty() {
+                content.push(serde_json::json!({"type":"text", "text":p}));
+            }
             let mut messages: Vec<serde_json::Value> = system
                 .map(|s| serde_json::json!({"role":"system", "content":s}))
                 .into_iter()

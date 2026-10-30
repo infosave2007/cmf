@@ -598,7 +598,7 @@ impl Lfm3AudioEncoder {
 
 /// Replace every audio part of `messages` with `{"type": "audio"}` (the
 /// template renders `<|audio|>`) and collect the sources in order.
-fn normalize(messages: &[Value]) -> (Vec<Value>, Vec<Value>) {
+pub(crate) fn normalize(messages: &[Value]) -> (Vec<Value>, Vec<Value>) {
     let mut messages = messages.to_vec();
     let mut sources = Vec::new();
     for message in &mut messages {
