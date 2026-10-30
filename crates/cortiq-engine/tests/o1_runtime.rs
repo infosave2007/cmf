@@ -372,6 +372,43 @@ fn o1_batched_span_handoffs_to_serial_span() {
     assert!(p.kv_cache.layers.iter().all(|l| l.head_keys(0).is_empty()));
 }
 
+/// The bounded prompt prefix stops exactly on the deferred boundary, so its
+/// last chunk holds exact rows only: it must run the exact pipeline's
+/// batched path — hidden rows equal to an exact prefill of the same tokens —
+/// and every O(1) layer must still be sealed when it returns. Walking that
+/// chunk row by row put the Qwen3.8-27B's last prefix rows through another
+/// projection route than the rest of the prefix and flipped its O(1) greedy
+/// text against a batch-graph prefix of the same tokens.
+#[test]
+fn o1_prefix_chunk_ending_on_boundary_matches_exact_prefill() {
+    // w 32 + sink 2 + slack 8 + 1: a 43-row chunk, wide enough for the
+    // batched attend.
+    const B: usize = 43;
+    let ids: Vec<u32> = (0..B as u32).map(|i| (i * 7 + 3) % 260).collect();
+    let mut exact = create_test_pipeline(8, 16, 2, 1, 4, 2, 260);
+    let last = exact.num_layers - 1;
+    let want = exact.prefill_span_ids(&ids, 0, last, None).unwrap();
+
+    let mut p = create_test_pipeline(8, 16, 2, 1, 4, 2, 260);
+    p.set_o1(o1(O1Layers::All, 4, 32, 2));
+    p.o1_begin_with_prefix(Some(B));
+    let got = p.prefill_span_ids(&ids, 0, last, None).unwrap();
+    assert_eq!(
+        got, want,
+        "boundary chunk rows must be the exact batched rows"
+    );
+    for (li, layer) in p.kv_cache.layers.iter().enumerate() {
+        assert!(
+            layer.o1_sealed(),
+            "layer {li} must seal after the boundary chunk"
+        );
+        assert!(
+            layer.k_heads().iter().all(Vec::is_empty),
+            "layer {li} kept exact KV"
+        );
+    }
+}
+
 /// A conversion failure raised inside a batched span is an error at the
 /// public boundary, never successful boundary hiddens. Reset/reuse then
 /// clears the terminal latch and permits a fresh bounded request.
