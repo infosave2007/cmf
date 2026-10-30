@@ -11,7 +11,7 @@
 //! request asks for them; `CMF_D1_DEVICE=0` keeps the host path.
 
 use super::{Ctx, GROUP_SIZE, MmKind, ctx, enc_mul_mm, file_buffer, io_buf_grow, moe_q8};
-use crate::gpu::{SetDims, SetLayer, SetMixer, SetW};
+use crate::gpu::{SetDims, SetHead, SetLayer, SetMixer, SetW};
 use cortiq_core::{CmfModel, TensorDtype};
 use metal::{Buffer, ComputeCommandEncoderRef, ComputePipelineState, MTLSize};
 use std::ffi::c_void;
@@ -27,6 +27,7 @@ struct Pipes {
     attn: ComputePipelineState,
     head_gate: ComputePipelineState,
     silu_mul: ComputePipelineState,
+    gather: ComputePipelineState,
 }
 
 static PIPES: OnceLock<Result<Pipes, String>> = OnceLock::new();
@@ -55,6 +56,7 @@ fn pipes(c: &Ctx) -> Option<&'static Pipes> {
             attn: pso("ls_attn")?,
             head_gate: pso("ls_head_gate")?,
             silu_mul: pso("ls_silu_mul")?,
+            gather: pso("ls_gather_rows")?,
         })
     });
     match r {
@@ -115,8 +117,9 @@ fn resolve(model: &CmfModel, safe_len: usize, w: SetW, q8_ok: bool) -> Option<Pr
 
 /// The final-normed hidden rows `[t, hidden]` of `rows` (embedding rows
 /// `[t, hidden]`) under d1's mask (`state` leading rows, `group[r]` the
-/// question of every later row), or None when the stack or a weight is
-/// outside these kernels (the caller keeps the host path).
+/// question of every later row) and, with `head`, the logits of its rows;
+/// None when the stack or a weight is outside these kernels (the caller
+/// keeps the host path).
 #[allow(clippy::too_many_arguments)]
 pub fn forward(
     model: &Arc<CmfModel>,
@@ -127,7 +130,8 @@ pub fn forward(
     t: usize,
     state: usize,
     group: &[i32],
-) -> Option<Vec<f32>> {
+    head: Option<&SetHead>,
+) -> Option<(Vec<f32>, Vec<f32>)> {
     let c = ctx()?;
     let p = pipes(c)?;
     let hs = d.hidden;
@@ -219,6 +223,20 @@ pub fn forward(
         };
         preps.push(Prep { mix, ffn });
     }
+    // The head over the answer slots: at least eight rows (the GEMM's
+    // floor), the first slot repeated.
+    let head = match head {
+        Some(hd) if !hd.rows.is_empty() => {
+            let w = res(hd.w)?;
+            if w.cols != hs || hd.rows.iter().any(|&r| r >= t) || hd.rows.len().max(8) > t {
+                return None;
+            }
+            let mut idx: Vec<u32> = hd.rows.iter().map(|&r| r as u32).collect();
+            idx.resize(idx.len().max(8), idx[0]);
+            Some((w, idx, hd.rows.len()))
+        }
+        _ => None,
+    };
     let kv_max = layers
         .iter()
         .map(|l| match l.mixer {
@@ -275,7 +293,7 @@ pub fn forward(
         set_u32(enc, 6, w.is_some() as u32);
         rows_tg(enc);
     };
-    let mm = |w: &Proj, xs: &Buffer, y: &Buffer| {
+    let mm_b = |w: &Proj, xs: &Buffer, y: &Buffer, t: usize| {
         if w.q8 {
             moe_q8::enc_mm_rows(
                 q8p.expect("checked in resolve"),
@@ -295,6 +313,7 @@ pub fn forward(
             enc_mul_mm(c, enc, &fbuf, w.abs, &dummy, MmKind::Q4tp, xs, y, t, w.rows, w.cols);
         }
     };
+    let mm = |w: &Proj, xs: &Buffer, y: &Buffer| mm_b(w, xs, y, t);
     for (l, pr) in layers.iter().zip(&preps) {
         rms(&h_b, l.input_norm, &n_b);
         match &l.mixer {
@@ -388,6 +407,23 @@ pub fn forward(
         norm_add(&d_b, l.ffn_out_norm);
     }
     rms(&h_b, final_norm, &n_b);
+    let logits_b = head.as_ref().map(|(w, idx, _)| {
+        let nb = idx.len();
+        let ib = c._device.new_buffer_with_data(
+            idx.as_ptr() as *const c_void,
+            (nb * 4) as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        enc.set_compute_pipeline_state(&p.gather);
+        enc.set_buffer(0, Some(&n_b), 0);
+        enc.set_buffer(1, Some(&ib), 0);
+        enc.set_buffer(2, Some(&d_b), 0);
+        set_u32(enc, 3, hs as u32);
+        enc.dispatch_threads(MTLSize::new(hs as u64, nb as u64, 1), MTLSize::new(256, 1, 1));
+        let lb = buf(91_000_000_037, nb * w.rows);
+        mm_b(w, &d_b, &lb, nb);
+        lb
+    });
     enc.end_encoding();
     cmd.commit();
     cmd.wait_until_completed();
@@ -400,5 +436,13 @@ pub fn forward(
     unsafe {
         std::ptr::copy_nonoverlapping(n_b.contents() as *const f32, out.as_mut_ptr(), t * hs);
     }
-    Some(out)
+    let mut logits = Vec::new();
+    if let (Some((w, _, n)), Some(lb)) = (&head, &logits_b) {
+        logits = vec![0f32; n * w.rows];
+        // SAFETY: as above; the head wrote at least n·vocab floats.
+        unsafe {
+            std::ptr::copy_nonoverlapping(lb.contents() as *const f32, logits.as_mut_ptr(), logits.len());
+        }
+    }
+    Some((out, logits))
 }

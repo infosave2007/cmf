@@ -11,7 +11,7 @@
 //! `CMF_D1_DEVICE=0` keeps the host path.
 
 use super::*;
-use crate::gpu::{SetDims, SetLayer, SetMixer, SetW};
+use crate::gpu::{SetDims, SetHead, SetLayer, SetMixer, SetW};
 
 const LS_WGSL: &str = r#"
 // h += rms(d)·w per row (the sandwich norm before the residual add), or
@@ -258,6 +258,19 @@ fn ls_head_gate(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation
     loop { if (d >= hg_p.hd) { break; } hg_ao[ab + d] = hg_ao[ab + d] * gate; d = d + 256u; }
 }
 
+// dst[r] = src[idx[r]] for rows of n floats (the head's answer slots).
+struct GaP { n: u32, pa: u32, pb: u32, pc: u32 };
+@group(0) @binding(0) var<storage, read>       ga_src: array<f32>;
+@group(0) @binding(1) var<storage, read>       ga_idx: array<u32>;
+@group(0) @binding(2) var<storage, read_write> ga_dst: array<f32>;
+@group(0) @binding(3) var<uniform>             ga_p:   GaP;
+@compute @workgroup_size(256)
+fn ls_gather_rows(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let n = ga_p.n;
+    if (gid.x >= n) { return; }
+    ga_dst[gid.y * n + gid.x] = ga_src[ga_idx[gid.y] * n + gid.x];
+}
+
 // a = silu(g)·u over n elements, grid-stride.
 struct SmP { n: u32, stride: u32, pa: u32, pb: u32 };
 @group(0) @binding(0) var<storage, read>       sm_g: array<f32>;
@@ -288,6 +301,7 @@ struct Pipes {
     attn: Pipe,
     head_gate: Pipe,
     silu_mul: Pipe,
+    gather: Pipe,
 }
 
 static PIPES: std::sync::OnceLock<Option<Pipes>> = std::sync::OnceLock::new();
@@ -321,6 +335,7 @@ fn pipes(c: &Ctx) -> Option<&'static Pipes> {
                 attn: pipe("ls_attn"),
                 head_gate: pipe("ls_head_gate"),
                 silu_mul: pipe("ls_silu_mul"),
+                gather: pipe("ls_gather_rows"),
             };
             if let Some(e) = pollster::block_on(scope.pop()) {
                 tracing::warn!("cmf-d1-set module rejected ({e}): d1 keeps the host path");
@@ -425,8 +440,9 @@ fn scratch(c: &Ctx, role: u8, bytes: usize, usage: wgpu::BufferUsages) -> wgpu::
     b
 }
 
-/// The final-normed hidden rows `[t, hidden]` of `rows` under d1's mask,
-/// or None when the stack or a weight is outside these kernels.
+/// The final-normed hidden rows `[t, hidden]` of `rows` under d1's mask
+/// and, with `head`, the logits of its rows; None when the stack or a
+/// weight is outside these kernels.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn forward(
     model: &Arc<CmfModel>,
@@ -437,7 +453,8 @@ pub(crate) fn forward(
     t: usize,
     state: usize,
     group: &[i32],
-) -> Option<Vec<f32>> {
+    head: Option<&SetHead>,
+) -> Option<(Vec<f32>, Vec<f32>)> {
     let c = ctx()?;
     let p = pipes(c)?;
     let hs = d.hidden;
@@ -535,6 +552,16 @@ pub(crate) fn forward(
         preps.push(Prep { mix, ffn });
     }
     let wide = wide.max(inter_max);
+    let head = match head {
+        Some(hd) if !hd.rows.is_empty() => {
+            let w = resolve(c, model, hd.w)?;
+            if w.cols != hs || hd.rows.iter().any(|&r| r >= t) || hd.rows.len() > t {
+                return None;
+            }
+            Some((w, hd.rows.iter().map(|&r| r as u32).collect::<Vec<u32>>()))
+        }
+        _ => None,
+    };
 
     use wgpu::BufferUsages as U;
     let st = U::STORAGE | U::COPY_DST | U::COPY_SRC;
@@ -680,5 +707,26 @@ pub(crate) fn forward(
     }
     rms(&mut enc, &h_b, final_norm, &n_b);
     let mut out = vec![0f32; t * hs];
-    readback(c, enc, &n_b, &staging, (t * hs * 4) as u64, &mut out).then_some(out)
+    let Some((w, idx)) = &head else {
+        return readback(c, enc, &n_b, &staging, (t * hs * 4) as u64, &mut out)
+            .then_some((out, Vec::new()));
+    };
+    let nb = idx.len();
+    let ib = c.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("d1-set-idx"),
+        contents: bytemuck::cast_slice(idx),
+        usage: U::STORAGE,
+    });
+    let u = unif(&[hs as u32, 0, 0, 0]);
+    go(
+        &mut enc,
+        &p.gather.p,
+        &bg(&p.gather.l, &[&n_b, &ib, &d_b, &u]),
+        (hs as u32).div_ceil(256),
+        nb as u32,
+    );
+    let lb = scratch(c, 11, nb * w.rows * 4, st);
+    mm(c, &mut enc, w, &d_b, &lb, nb);
+    let mut logits = vec![0f32; nb * w.rows];
+    readback2(c, enc, (&n_b, &mut out), (&lb, &mut logits)).then_some((out, logits))
 }

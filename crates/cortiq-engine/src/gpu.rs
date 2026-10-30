@@ -4237,9 +4237,17 @@ pub struct SetDims {
     pub scale: f32,
 }
 
+/// The vocabulary head over chosen rows of the set forward: the head's
+/// projection and the row indices (d1's answer slots).
+pub struct SetHead<'a> {
+    pub w: SetW,
+    pub rows: &'a [usize],
+}
+
 /// d1's `set` forward on the device: the final-normed hidden rows `[t,
-/// hidden]` of the embedding rows `rows`, or None when the backend or a
-/// weight is outside the kernels (the host path answers).
+/// hidden]` of the embedding rows `rows` and, with `head`, the logits
+/// `[head.rows, vocab]` of its rows (empty without), or None when the
+/// backend or a weight is outside the kernels (the host path answers).
 #[allow(clippy::too_many_arguments, unused_variables)]
 pub fn lfm_set_forward(
     model: &Arc<CmfModel>,
@@ -4250,16 +4258,17 @@ pub fn lfm_set_forward(
     t: usize,
     state: usize,
     group: &[i32],
-) -> Option<Vec<f32>> {
+    head: Option<&SetHead>,
+) -> Option<(Vec<f32>, Vec<f32>)> {
     #[allow(unreachable_patterns)]
     match backend() {
         #[cfg(target_os = "macos")]
         Backend::Metal => crate::gpu_metal::lfm_set::forward(
-            model, layers, dims, final_norm, rows, t, state, group,
+            model, layers, dims, final_norm, rows, t, state, group, head,
         ),
         #[cfg(feature = "gpu")]
         Backend::Wgpu => crate::gpu_wgpu::lfm_set::forward(
-            model, layers, dims, final_norm, rows, t, state, group,
+            model, layers, dims, final_norm, rows, t, state, group, head,
         ),
         _ => None,
     }

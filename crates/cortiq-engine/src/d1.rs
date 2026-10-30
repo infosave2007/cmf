@@ -1329,12 +1329,8 @@ impl D1 {
             if at != media_rows.len() {
                 return Err("picture placeholders and rows differ".into());
             }
-            let t_fwd = std::time::Instant::now();
-            let hidden = pipeline.forward_masked(&rows, &SetMask { state: state_len, group: &group })?;
-            if std::env::var_os("CMF_D1_DEBUG").is_some() {
-                eprintln!("d1: forward {} tokens in {:.0} ms", ids.len(), t_fwd.elapsed().as_secs_f64() * 1e3);
-            }
-            // Every code slot of the group through the head in one GEMM.
+            // Every code slot of the group through the head in one GEMM,
+            // on the device with the forward where it runs.
             let mut code_at: Vec<usize> = Vec::new();
             for (j, k) in (k0..k1).enumerate() {
                 if !matches!(questions[k].1, Question::Read { .. }) {
@@ -1343,12 +1339,18 @@ impl D1 {
             }
             code_at.sort_unstable();
             code_at.dedup();
-            let mut picked = Vec::with_capacity(code_at.len() * h);
-            for &at in &code_at {
-                picked.extend_from_slice(&hidden[at * h..(at + 1) * h]);
+            let t_fwd = std::time::Instant::now();
+            let (hidden, logz_all) =
+                pipeline.forward_masked_head(&rows, &SetMask { state: state_len, group: &group }, &code_at)?;
+            if std::env::var_os("CMF_D1_DEBUG").is_some() {
+                eprintln!(
+                    "d1: forward {} tokens + head over {} slots in {:.0} ms",
+                    ids.len(),
+                    code_at.len(),
+                    t_fwd.elapsed().as_secs_f64() * 1e3
+                );
             }
             let vocab = pipeline.vocab_size;
-            let logz_all = if code_at.is_empty() { Vec::new() } else { pipeline.log_probs_rows(&picked, code_at.len()) };
             let logz_of = |pos: usize| {
                 let r = code_at.binary_search(&pos).expect("code slot");
                 &logz_all[r * vocab..(r + 1) * vocab]

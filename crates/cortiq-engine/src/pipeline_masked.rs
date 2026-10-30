@@ -38,15 +38,45 @@ impl Pipeline {
     /// The final-normed hidden state of every position of `rows` (prompt
     /// embedding rows `[T, hidden]`) under d1's `mask`. Only plain LFM3
     /// stacks (short convolution, full / sliding GQA, dense FFN) qualify.
-    pub(crate) fn forward_masked(&self, rows: &[f32], mask: &SetMask) -> Result<Vec<f32>, String> {
+    /// With them, the log-probabilities over the vocabulary at the rows
+    /// `head_rows` (`[head_rows, vocab]`): on the device in the same
+    /// submission where it runs, else through [`Self::log_probs_rows`].
+    pub(crate) fn forward_masked_head(
+        &self,
+        rows: &[f32],
+        mask: &SetMask,
+        head_rows: &[usize],
+    ) -> Result<(Vec<f32>, Vec<f32>), String> {
         let hs = self.hidden_size;
         let t = rows.len() / hs;
         if t == 0 || rows.len() != t * hs || mask.group.len() != t || mask.state > t {
             return Err("masked forward: rows, groups and state length disagree".into());
         }
-        if let Some(out) = self.forward_masked_device(rows, t, mask) {
-            return Ok(out);
+        if let Some((hidden, mut logits)) = self.forward_masked_device(rows, t, mask, head_rows) {
+            let v = self.vocab_size;
+            if head_rows.is_empty() {
+                return Ok((hidden, Vec::new()));
+            }
+            if logits.len() >= head_rows.len() * v {
+                logits.truncate(head_rows.len() * v);
+                self.log_softmax_rows(&mut logits);
+                return Ok((hidden, logits));
+            }
+            let picked: Vec<f32> = head_rows.iter().flat_map(|&r| hidden[r * hs..(r + 1) * hs].to_vec()).collect();
+            let lp = self.log_probs_rows(&picked, head_rows.len());
+            return Ok((hidden, lp));
         }
+        let hidden = self.forward_masked_host(rows, t, mask)?;
+        if head_rows.is_empty() {
+            return Ok((hidden, Vec::new()));
+        }
+        let picked: Vec<f32> = head_rows.iter().flat_map(|&r| hidden[r * hs..(r + 1) * hs].to_vec()).collect();
+        let lp = self.log_probs_rows(&picked, head_rows.len());
+        Ok((hidden, lp))
+    }
+
+    fn forward_masked_host(&self, rows: &[f32], t: usize, mask: &SetMask) -> Result<Vec<f32>, String> {
+        let hs = self.hidden_size;
         let pool = self.pool.as_deref();
         let (eps, style) = (self.rms_eps, self.norm_style);
         let mut h = rows.to_vec();
@@ -123,8 +153,14 @@ impl Pipeline {
     /// The same forward on the device in one submission
     /// (`gpu::lfm_set_forward`), or None: a stack or weight outside its
     /// kernels, no device, or `CMF_D1_DEVICE=0`.
-    fn forward_masked_device(&self, rows: &[f32], t: usize, mask: &SetMask) -> Option<Vec<f32>> {
-        use crate::gpu::{SetDims, SetLayer, SetMixer};
+    fn forward_masked_device(
+        &self,
+        rows: &[f32],
+        t: usize,
+        mask: &SetMask,
+        head_rows: &[usize],
+    ) -> Option<(Vec<f32>, Vec<f32>)> {
+        use crate::gpu::{SetDims, SetHead, SetLayer, SetMixer};
         if std::env::var("CMF_D1_DEVICE").as_deref() == Ok("0") || !crate::gpu::enabled_here() {
             return None;
         }
@@ -224,6 +260,11 @@ impl Pipeline {
             gemma: self.norm_style == cortiq_core::NormStyle::Gemma,
             scale: self.attn_scale,
         };
+        // The head rides along when it is a mapped projection of the file
+        // as wide as the vocabulary.
+        let head = part(&self.weights.lm_head)
+            .filter(|w| w.1 == self.vocab_size && !head_rows.is_empty())
+            .map(|w| SetHead { w, rows: head_rows });
         crate::gpu::lfm_set_forward(
             &model,
             &layers,
@@ -233,6 +274,7 @@ impl Pipeline {
             t,
             mask.state,
             mask.group,
+            head.as_ref(),
         )
     }
 
@@ -371,13 +413,29 @@ impl Pipeline {
         } else {
             self.weights.lm_head.matmat(hidden, n, &mut logits, self.pool.as_deref());
         }
-        for row in logits.chunks_exact_mut(v) {
-            let mx = row.iter().fold(f32::NEG_INFINITY, |m, &x| m.max(x));
-            let lse = mx as f64 + row.iter().map(|&x| ((x - mx) as f64).exp()).sum::<f64>().ln();
-            for x in row.iter_mut() {
-                *x = (*x as f64 - lse) as f32;
-            }
-        }
+        self.log_softmax_rows(&mut logits);
         logits
+    }
+
+    /// Log-softmax of every vocabulary row of `logits`, rows in parallel.
+    fn log_softmax_rows(&self, logits: &mut [f32]) {
+        let v = self.vocab_size;
+        let n = logits.len() / v;
+        let dst = crate::pool::SendMut::new(logits.as_mut_ptr());
+        let f = |lo: usize, hi: usize| {
+            for r in lo..hi {
+                // SAFETY: disjoint rows per worker.
+                let row = unsafe { std::slice::from_raw_parts_mut(dst.at(r * v), v) };
+                let mx = row.iter().fold(f32::NEG_INFINITY, |m, &x| m.max(x));
+                let lse = mx as f64 + row.iter().map(|&x| ((x - mx) as f64).exp()).sum::<f64>().ln();
+                for x in row.iter_mut() {
+                    *x = (*x as f64 - lse) as f32;
+                }
+            }
+        };
+        match self.pool.as_deref() {
+            Some(p) => p.run_rows(n, &f),
+            None => f(0, n),
+        }
     }
 }

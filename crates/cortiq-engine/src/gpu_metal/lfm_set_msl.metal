@@ -281,3 +281,15 @@ kernel void ls_silu_mul(
     float x = g[i];
     a[i] = x / (1.0f + exp(-x)) * u[i];
 }
+
+// dst[r] = src[idx[r]] for rows of n floats (the head's answer slots).
+kernel void ls_gather_rows(
+    device const float* src [[buffer(0)]],
+    device const uint*  idx [[buffer(1)]],
+    device float*       dst [[buffer(2)]],
+    constant uint& n        [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= n) return;
+    dst[(ulong)gid.y * n + gid.x] = src[(ulong)idx[gid.y] * n + gid.x];
+}
