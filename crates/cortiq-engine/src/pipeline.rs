@@ -18,6 +18,8 @@ pub mod clover;
 /// d1's non-causal forward over a packed state and question set.
 #[path = "pipeline_masked.rs"]
 pub mod masked;
+#[path = "pipeline_speech.rs"]
+pub mod speech;
 use crate::kv_cache::KvCache;
 use crate::linear_core::{
     GdnCfg, GdnWeights, ShortConvCfg, ShortConvWeights, VmfPhaseCfg, VmfPhaseWeights, gdn_forward,

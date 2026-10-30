@@ -809,7 +809,7 @@ fn lfm3_canon(name: &str) -> Option<String> {
     if name.starts_with("depth_linear.") || name.starts_with("depth_embeddings.") || name == "mask_embedding" {
         return Some(format!("depth_decoder.{name}"));
     }
-    if name == "codebook_embedding.weight" {
+    if name == "codebook_embedding.weight" || name.starts_with("codec.") {
         return Some(name.to_string());
     }
     if name == "model.embedding_norm.weight" {
@@ -925,6 +925,7 @@ fn lfm3_vision(arch: &ModelArch, name: &str) -> bool {
             "audio_projector.",
             "depth_decoder.",
             "codebook_embedding.",
+            "codec.",
         ]
         .iter()
         .any(|p| name.starts_with(p))
@@ -4707,6 +4708,34 @@ fn apply_source_shard_priority(stream_shards: &mut Vec<String>) -> anyhow::Resul
 /// a prior successful checkpoint can still contribute to progress and head
 /// sizing.
 fn source_shard_counts(dir: &Path) -> anyhow::Result<Vec<(String, usize)>> {
+    let mut shards = source_shard_counts_main(dir)?;
+    let codec = dir.join("audio_tokenizer").join("model.safetensors");
+    if codec.exists() {
+        shards.push((CODEC_SHARD.to_string(), safetensors_tensor_count(&codec)?));
+    }
+    Ok(shards)
+}
+
+/// The shard name of LFM3-Audio's bundled codec
+/// (`audio_tokenizer/model.safetensors`), whose tensors join a conversion
+/// as `codec.*`.
+const CODEC_SHARD: &str = "audio_tokenizer.safetensors";
+
+/// The codec shard of an LFM3-Audio / LFM3-Omni checkpoint, renamed.
+fn open_codec_shard(dir: &Path) -> anyhow::Result<Option<SafeTensors>> {
+    let path = dir.join("audio_tokenizer").join("model.safetensors");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut st = open_safetensors(&path)?;
+    for t in &mut st.tensors {
+        t.name = format!("codec.{}", t.name);
+    }
+    st.name = CODEC_SHARD.to_string();
+    Ok(Some(st))
+}
+
+fn source_shard_counts_main(dir: &Path) -> anyhow::Result<Vec<(String, usize)>> {
     let single = dir.join("model.safetensors");
     if single.exists() {
         return Ok(vec![(
@@ -4759,6 +4788,17 @@ fn safetensors_tensor_count(path: &Path) -> anyhow::Result<usize> {
 /// complete by every output manifest; an unmarked missing shard remains a
 /// hard error in `open_safetensors`.
 pub(crate) fn open_model_filtered(
+    dir: &Path,
+    completed_shards: &std::collections::HashSet<String>,
+) -> anyhow::Result<Vec<SafeTensors>> {
+    let mut shards = open_model_filtered_main(dir, completed_shards)?;
+    if !completed_shards.contains(CODEC_SHARD) {
+        shards.extend(open_codec_shard(dir)?);
+    }
+    Ok(shards)
+}
+
+fn open_model_filtered_main(
     dir: &Path,
     completed_shards: &std::collections::HashSet<String>,
 ) -> anyhow::Result<Vec<SafeTensors>> {
@@ -8453,6 +8493,8 @@ fn hf_download_opts_at_revision(
         ("processor_config.json", false),
         // d1 decision models: the release's calibration.
         ("calibration.json", false),
+        // LFM3-Audio's speech feature extractor.
+        ("preprocessor_config.json", false),
         // Newer HF checkpoints (LFM2, Qwen3, …) ship the chat template as a
         // sidecar `chat_template.jinja` instead of embedding it in
         // tokenizer_config.json — without it `run` falls back to a generic
@@ -8467,6 +8509,29 @@ fn hf_download_opts_at_revision(
             required,
             threads,
         )?;
+    }
+    // LFM3-Audio / LFM3-Omni: the speech codec (LiquidCodec) in its own
+    // subfolder, read into the file as `codec.*`.
+    let speech = fs::read(dir.join("config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|c| c.get("model_type").and_then(|v| v.as_str()).map(String::from))
+        .is_some_and(|t| t == "lfm3_audio" || t == "lfm3_omni");
+    if speech {
+        fs::create_dir_all(dir.join("audio_tokenizer"))?;
+        for (f, w) in [("config.json", false), ("model.safetensors", true)] {
+            if w && !weights {
+                continue;
+            }
+            fetch(
+                &agent,
+                &format!("{base}/audio_tokenizer/{f}"),
+                &dir.join("audio_tokenizer").join(f),
+                token,
+                false,
+                threads,
+            )?;
+        }
     }
     let idx = dir.join("model.safetensors.index.json");
     if fetch(
@@ -10980,7 +11045,11 @@ pub fn run_convert_multi_excluding(
                 .unwrap_or(serde_json::Value::Null),
             v => v,
         };
-        p["lfm3_audio"] = serde_json::json!({"config": config.clone(), "features": features});
+        let codec = fs::read(dir.join("audio_tokenizer").join("config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .unwrap_or(serde_json::Value::Null);
+        p["lfm3_audio"] = serde_json::json!({"config": config.clone(), "features": features, "codec": codec});
         p
     } else {
         provenance

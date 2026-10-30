@@ -1478,6 +1478,11 @@ enum Commands {
         /// "Perform ASR in English.").
         #[arg(long)]
         system: Option<String>,
+        /// LFM3-Audio: answer in speech and write it here (24 kHz WAV);
+        /// the TTS system message picks the language and voice:
+        /// "Perform TTS in American English using a female voice.".
+        #[arg(long, value_name = "WAV")]
+        speech_out: Option<std::path::PathBuf>,
         /// Explicit MiMo multimodal companion (otherwise discovered beside text).
         #[arg(long)]
         mm: Option<std::path::PathBuf>,
@@ -4676,6 +4681,7 @@ async fn main() -> anyhow::Result<()> {
             video_fps,
             audios,
             system,
+            speech_out,
             mm,
             image_max_pixels,
             reasoning_effort,
@@ -4727,6 +4733,7 @@ async fn main() -> anyhow::Result<()> {
                 &videos,
                 &audios,
                 system.as_deref(),
+                speech_out.as_deref(),
                 &cortiq_engine::mimo_ingress::MediaOptions { companion: mm, image_max_pixels, video_fps },
                 reasoning_effort.as_deref(),
                 max_tokens,
@@ -8809,6 +8816,7 @@ async fn cmd_run(
     videos: &[String],
     audios: &[String],
     system: Option<&str>,
+    speech_out: Option<&std::path::Path>,
     media_options: &cortiq_engine::mimo_ingress::MediaOptions,
     reasoning_effort: Option<&str>,
     max_tokens: usize,
@@ -9722,6 +9730,50 @@ async fn cmd_run(
         }
         let media_rows = mimo_inputs.as_ref().and_then(|p| p.rows.as_deref())
             .or_else(|| lfm3_inputs.as_ref().and_then(|p| p.rows.as_deref()));
+        // LFM3-Audio speech answer: the assistant turn opens with
+        // <|audio_start|>, frames until the end-of-audio frame, the codec.
+        if let Some(path) = speech_out {
+            use cortiq_engine::lfm3_speech as sp;
+            anyhow::ensure!(sp::can_speak(&model),
+                "--speech-out requires an LFM3-Audio file with its depth decoder and codec");
+            let start = pipeline.tokenizer.token_to_id("<|audio_start|>")
+                .ok_or_else(|| anyhow::anyhow!("the tokenizer has no <|audio_start|>"))?;
+            let mut sids = ids.clone();
+            let mut srows = media_rows.map(<[f32]>::to_vec);
+            if sids.last() != Some(&start) {
+                sids.push(start);
+                if let Some(r) = srows.as_mut() {
+                    r.extend(pipeline.embed_id(start));
+                }
+            }
+            let pool = cortiq_engine::pool::Pool::from_env();
+            let depth = sp::DepthDecoder::from_model(&model, pool.clone()).map_err(anyhow::Error::msg)?;
+            let sampling = sp::AudioSampling {
+                temperature: if greedy { 0.0 } else { 1.0 },
+                fixed_order: std::env::var("CMF_LFM3_MASKGIT_FIXED").as_deref() == Ok("1"),
+                ..Default::default()
+            };
+            let t0 = std::time::Instant::now();
+            let out = sp::speak(&mut pipeline, &depth, &sids, srows.as_deref(), max_tokens, &sampling,
+                seed.unwrap_or_else(|| std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1)))
+                .map_err(anyhow::Error::msg)?;
+            let t_gen = t0.elapsed().as_secs_f64();
+            let codec = sp::Codec::from_model(&model, pool).map_err(anyhow::Error::msg)?;
+            let wave = codec.decode(&out.frames);
+            sp::write_wav(path, &wave, 24_000)?;
+            if let Ok(dump) = std::env::var("CMF_LFM3_CODES_DUMP") {
+                let flat: Vec<u32> = out.frames.iter().flatten().copied().collect();
+                std::fs::write(&dump, serde_json::to_vec(&flat)?)?;
+            }
+            let text = pipeline.tokenizer.decode(&out.text_ids);
+            if !text.trim().is_empty() {
+                println!("{}", text.trim());
+            }
+            eprintln!("[{} frames · {:.2} s of speech · generated in {:.1} s · {}]",
+                out.frames.len(), wave.len() as f64 / 24_000.0, t_gen, path.display());
+            return Ok(());
+        }
         generate_and_print(&mut pipeline, &ids, vl_inputs.as_ref(), media_rows)?;
     } else {
         println!("\nType your message (Ctrl+C to exit):\n");
