@@ -46,6 +46,8 @@ pub(crate) mod clover;
 pub(crate) mod moe_q82;
 /// Token-axis batch kernels of the dense GDN hybrids (gated attention).
 pub(crate) mod dense_batch;
+/// Sealed O(1) layers on the batch graph: the whole prompt chunk at once.
+pub(crate) mod o1_batch;
 /// Gemma-4 on the batch graph (prompt ingest) and its q8_2f prompt GEMM.
 pub(crate) mod gemma_batch;
 /// Warp-per-row q4tp decode matvecs (bit-identical to the 16nl rows).
@@ -19413,6 +19415,8 @@ pub struct Ctx {
     clover_pipes: std::sync::OnceLock<Option<clover::Pipes>>,
     /// Token-axis batch kernels of the dense hybrids (`dense_batch`).
     dense_batch_pipes: std::sync::OnceLock<Option<dense_batch::Pipes>>,
+    /// Batched O(1) prompt-chunk kernels (`o1_batch`).
+    o1_batch_pipes: std::sync::OnceLock<Option<o1_batch::Pipes>>,
     /// Gemma-4 batch kernels (`gemma_batch`).
     g4_batch_pipes: std::sync::OnceLock<Option<gemma_batch::Pipes>>,
     /// Gemma-4's GQA-shared decode attend (`gemma_batch::dec_pipe`).
@@ -22435,6 +22439,7 @@ fn init(dev: usize) -> Result<Ctx, String> {
         exact_alloc,
         clover_pipes: std::sync::OnceLock::new(),
         dense_batch_pipes: std::sync::OnceLock::new(),
+        o1_batch_pipes: std::sync::OnceLock::new(),
         g4_batch_pipes: std::sync::OnceLock::new(),
         g4_dec_pipe: std::sync::OnceLock::new(),
         g4_sandwich_pipe: std::sync::OnceLock::new(),
@@ -33571,6 +33576,22 @@ pub fn forward_batch_graph_at(
             }
         }
     }
+    // A captured query trace (`o1_qcap_begin`) is copied out of the plain
+    // gated-attention arm only: decline before anything is dispatched when a
+    // requested layer would take another one.
+    if let Some(want) = o1_qcap_layers() {
+        for gl in want {
+            let Some(li) = gl.checked_sub(layer_base).filter(|&li| li < layers.len()) else {
+                continue;
+            };
+            let plain = matches!(&layers[li].attn, crate::gpu::GraphAttn::Full { geom: None, .. })
+                && o1.get(li).is_none_or(Option::is_none);
+            if !plain || spec.is_some() || preview.is_some() {
+                bgraph_refused("o1 query capture needs the plain attention arm");
+                return batch_outcome(o1_started || state_started, false);
+            }
+        }
+    }
     // O(1) admission is all-or-nothing. Validate every sealed view and every
     // layer pairing before creating the persistent batch scratch or touching a
     // device mirror. A partial set would otherwise make a later CPU fallback
@@ -34816,9 +34837,11 @@ pub fn forward_batch_graph_at(
                     bts!(enc, 5);
                 } else if let Some(views) = o1_here {
                     // Sealed O(1) attention uses the same rotated Q/K/V
-                    // projections as the exact path, then runs the existing
-                    // far/push/attend kernels for each batch row in causal
-                    // order. `goff` is the row's KV-group offset in kb_b/vb_b.
+                    // projections as the exact path, then takes the whole
+                    // chunk through `o1_batch` — or, as the fallback, the
+                    // token graph's far/push/attend kernels for each batch
+                    // row in causal order. `goff` is the row's KV-group
+                    // offset in kb_b/vb_b.
                     let (
                         dmeta,
                         drk,
@@ -34865,90 +34888,179 @@ pub fn forward_batch_graph_at(
                         .first()
                         .and_then(|v| v.heads.first())
                         .is_some_and(|h| h.rect_fm);
-                    let mut pass = begin_pass(&mut enc);
-                    for i in 0..k {
-                        let p = positions[i];
-                        let rope_u = uniform_rope(
+                    // The whole chunk at once (`o1_batch`): token-axis rope,
+                    // then five dispatches per 64-row sub-chunk instead of
+                    // six per row. The loop below is the fallback.
+                    let o1b = o1_batch::pipes(c).zip(dense_batch::attn(c)).filter(|_| {
+                        let v0 = &views[0];
+                        v0.d == hd
+                            && v0.dv == hd
+                            && hd <= 256
+                            && gg == nkv
+                            && gg * hh_ == nh
+                            && mm <= 32
+                            && o1_batch::min_window(views) >= o1_batch::OB_K
+                            && positions.windows(2).all(|w| w[1] == w[0] + 1)
+                    });
+                    if let Some((ob, rp)) = o1b {
+                        let geom = o1_batch::Geom {
+                            g: gg,
+                            hpg: hh_,
+                            m: mm,
+                            w: ww,
+                            ns: nns,
+                            rect_fm,
+                            d: hd,
+                            dv: hd,
+                            scale: sc,
+                        };
+                        let qall = rwc(k * nh * hd);
+                        let gall = rwc(k * nh * hd);
+                        let o1s = rwc(geom.scratch_len());
+                        let rope_u = unif(&rope_uniform_words(
+                            nh,
+                            nkv,
+                            hd,
+                            rd,
+                            positions[0],
+                            flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm)
+                                | if *output_gate { 1 } else { 0 },
+                            eps,
+                            0,
+                            1.0,
+                        ));
+                        let bg_rope = bind_pairs(
                             c,
-                            rope_uniform_words(
-                                nh,
-                                nkv,
-                                hd,
-                                rd,
-                                p,
-                                flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm)
-                                    | if *output_gate { 1 } else { 0 },
-                                eps,
-                                i,
-                                1.0,
-                            ),
-                        );
-                        let o1_u = uniform_u32x8(
-                            c,
-                            [
-                                hh_ as u32,
-                                mm as u32,
-                                ww as u32,
-                                (nns as u32) | (u32::from(rect_fm) << 8),
-                                hd as u32,
-                                hd as u32,
-                                sc.to_bits(),
-                                (i * nh * hd) as u32,
-                            ],
-                        );
-                        let bg_rope = bg(
-                            &c.layout_attn_rope,
+                            &rp.rope_l,
                             &[
-                                &qraw_b, &kb_b, &qout_s, &gout_s, &qnw, &knw, &invf_b, &rope_u,
+                                (0, &qraw_b),
+                                (1, &kb_b),
+                                (2, &qall),
+                                (3, &gall),
+                                (4, &qnw),
+                                (5, &knw),
+                                (6, &invf_b),
+                                (7, &rope_u),
                             ],
                         );
-                        let bg_far = bg(
-                            &c.layout_o1_far,
-                            &[&dmeta, &drk, &drv, &dqt, &dmz, &dth, &o1_u],
+                        {
+                            let mut pass = begin_pass(&mut enc);
+                            pass.set_pipeline(&rp.rope);
+                            pass.set_bind_group(0, &bg_rope, &[]);
+                            pass.dispatch_workgroups((nh + nkv) as u32, k as u32, 1);
+                        }
+                        let st = o1_batch::State {
+                            meta: &dmeta,
+                            ring_k: &drk,
+                            ring_v: &drv,
+                            sink_k: &dsk,
+                            sink_v: &dsv,
+                            k_tilde: &dkt,
+                            qt: &dqt,
+                            mu: &dmu,
+                            mz: &dmz,
+                            that: &dth,
+                        };
+                        o1_batch::encode(
+                            c, &mut enc, ob, &st, geom, &qall, &kb_b, &vb_b, &o1s, &attn_bb, k,
                         );
-                        let bg_push = bg(
-                            &c.layout_o1_push,
-                            &[&dmeta, &kb_b, &vb_b, &drk, &drv, &o1_u],
-                        );
-                        let bg_att = bg(
-                            &c.layout_o1_attend,
-                            &[
-                                &dmeta, &qout_s, &drk, &drv, &dsk, &dsv, &dkt, &dmu, &dmz, &dth,
-                                &attn_s, &o1_u,
-                            ],
-                        );
-                        pass.set_pipeline(&c.attn_rope);
-                        pass.set_bind_group(0, &bg_rope, &[]);
-                        pass.dispatch_workgroups((nh + nkv) as u32, 1, 1);
-                        pass.set_pipeline(&c.o1_far);
-                        pass.set_bind_group(0, &bg_far, &[]);
-                        pass.dispatch_workgroups((gg * hh_ * mm) as u32, 1, 1);
-                        pass.set_pipeline(&c.o1_push);
-                        pass.set_bind_group(0, &bg_push, &[]);
-                        pass.dispatch_workgroups(gg as u32, 1, 1);
-                        pass.set_pipeline(&c.o1_attend);
-                        pass.set_bind_group(0, &bg_att, &[]);
-                        pass.dispatch_workgroups((gg * hh_) as u32, 1, 1);
                         if *output_gate {
-                            let gm_u = unif(&[(nh * hd) as u32, 0, 0, 0]);
+                            let gm_u = unif(&[(k * nh * hd) as u32, 0, 0, 0]);
+                            let mut pass = begin_pass(&mut enc);
                             pass.set_pipeline(&c.gate_mul);
                             pass.set_bind_group(
                                 0,
-                                &bg(&c.layout_gate_mul, &[&gout_s, &attn_s, &gm_u]),
+                                &bg(&c.layout_gate_mul, &[&gall, &attn_bb, &gm_u]),
                                 &[],
                             );
-                            pass.dispatch_workgroups(((nh * hd) as u32).div_ceil(256), 1, 1);
+                            pass.dispatch_workgroups(((k * nh * hd) as u32).div_ceil(256), 1, 1);
                         }
-                        encode_blit_p(
-                            &mut pass,
-                            c,
-                            &attn_s,
-                            &attn_bb,
-                            nh * hd,
-                            0,
-                            i * nh * hd,
-                            None,
-                        );
+                    } else {
+                        let mut pass = begin_pass(&mut enc);
+                        for i in 0..k {
+                            let p = positions[i];
+                            let rope_u = uniform_rope(
+                                c,
+                                rope_uniform_words(
+                                    nh,
+                                    nkv,
+                                    hd,
+                                    rd,
+                                    p,
+                                    flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm)
+                                        | if *output_gate { 1 } else { 0 },
+                                    eps,
+                                    i,
+                                    1.0,
+                                ),
+                            );
+                            let o1_u = uniform_u32x8(
+                                c,
+                                [
+                                    hh_ as u32,
+                                    mm as u32,
+                                    ww as u32,
+                                    (nns as u32) | (u32::from(rect_fm) << 8),
+                                    hd as u32,
+                                    hd as u32,
+                                    sc.to_bits(),
+                                    (i * nh * hd) as u32,
+                                ],
+                            );
+                            let bg_rope = bg(
+                                &c.layout_attn_rope,
+                                &[
+                                    &qraw_b, &kb_b, &qout_s, &gout_s, &qnw, &knw, &invf_b, &rope_u,
+                                ],
+                            );
+                            let bg_far = bg(
+                                &c.layout_o1_far,
+                                &[&dmeta, &drk, &drv, &dqt, &dmz, &dth, &o1_u],
+                            );
+                            let bg_push = bg(
+                                &c.layout_o1_push,
+                                &[&dmeta, &kb_b, &vb_b, &drk, &drv, &o1_u],
+                            );
+                            let bg_att = bg(
+                                &c.layout_o1_attend,
+                                &[
+                                    &dmeta, &qout_s, &drk, &drv, &dsk, &dsv, &dkt, &dmu, &dmz, &dth,
+                                    &attn_s, &o1_u,
+                                ],
+                            );
+                            pass.set_pipeline(&c.attn_rope);
+                            pass.set_bind_group(0, &bg_rope, &[]);
+                            pass.dispatch_workgroups((nh + nkv) as u32, 1, 1);
+                            pass.set_pipeline(&c.o1_far);
+                            pass.set_bind_group(0, &bg_far, &[]);
+                            pass.dispatch_workgroups((gg * hh_ * mm) as u32, 1, 1);
+                            pass.set_pipeline(&c.o1_push);
+                            pass.set_bind_group(0, &bg_push, &[]);
+                            pass.dispatch_workgroups(gg as u32, 1, 1);
+                            pass.set_pipeline(&c.o1_attend);
+                            pass.set_bind_group(0, &bg_att, &[]);
+                            pass.dispatch_workgroups((gg * hh_) as u32, 1, 1);
+                            if *output_gate {
+                                let gm_u = unif(&[(nh * hd) as u32, 0, 0, 0]);
+                                pass.set_pipeline(&c.gate_mul);
+                                pass.set_bind_group(
+                                    0,
+                                    &bg(&c.layout_gate_mul, &[&gout_s, &attn_s, &gm_u]),
+                                    &[],
+                                );
+                                pass.dispatch_workgroups(((nh * hd) as u32).div_ceil(256), 1, 1);
+                            }
+                            encode_blit_p(
+                                &mut pass,
+                                c,
+                                &attn_s,
+                                &attn_bb,
+                                nh * hd,
+                                0,
+                                i * nh * hd,
+                                None,
+                            );
+                        }
                     }
                 } else if let Some((g, xb)) = geom.and_then(|g| {
                     let hpk = nh / g.nkv.max(1);
@@ -35247,6 +35359,9 @@ pub fn forward_batch_graph_at(
                     // (`dense_batch`, bit-identical per token), the first
                     // positions keep the loop below. `CMF_ATTN_BT=0`: all
                     // positions through the loop.
+                    // The O(1) seal's query trace (`o1_qcap_begin`): this
+                    // layer's rotated rows, copied out as attention reads them.
+                    let qcap = o1_qcap_buffer(c, layer_base + li, k * nh * hd);
                     let bt = dense_batch::attn(c).filter(|_| {
                         c.attend_gpart.is_some()
                             && nh % nkv == 0
@@ -35321,6 +35436,9 @@ pub fn forward_batch_graph_at(
                             &[],
                         );
                         pass.dispatch_workgroups((nh + nkv) as u32, 1, 1);
+                        if let Some(cb) = &qcap {
+                            encode_blit_p(&mut pass, c, &qout_s, cb, nh * hd, 0, i * nh * hd, None);
+                        }
                         pass.set_pipeline(&c.kv_append);
                         // The first Full-attention K/V append is the
                         // persistent-state admission boundary.  A failed
@@ -35455,6 +35573,17 @@ pub fn forward_batch_graph_at(
                             &knw, &invf_b, kbuf, vbuf, pacc, pml, &attn_bb, nh, nkv, hd, cap,
                             positions[0], t_from, t_split, k, *sub, *nc, attn_scale, 0,
                         );
+                        if let Some(cb) = &qcap {
+                            let off = (t_from * nh * hd * 4) as u64;
+                            flush_pass(&enc);
+                            enc.copy_buffer_to_buffer(
+                                qall,
+                                off,
+                                cb,
+                                off,
+                                ((k - t_from) * nh * hd * 4) as u64,
+                            );
+                        }
                         if *output_gate {
                             // The loop's gate_mul, over rows t_from..k at once
                             // (the same element-wise product).
@@ -47627,6 +47756,99 @@ struct O1Dev {
     w: usize,
     ns: usize,
     scale: f32,
+}
+
+/// Query trace of the O(1) layers for a prefix that runs on the batch graph
+/// (`o1_qcap_begin` … `o1_qcap_take`). The seal needs every prefix
+/// position's rotated Q, which the exact attention consumes and drops; the
+/// graph copies it out for the requested layers as it goes.
+struct O1QCap {
+    /// Graph layer indices (`layer_base + li`) to capture.
+    layers: Vec<usize>,
+    /// (layer, floats, buffer `[rows][nh][hd]`), in batch-call order.
+    bufs: Vec<(usize, usize, wgpu::Buffer)>,
+}
+
+thread_local! {
+    static O1_QCAP: std::cell::RefCell<Option<O1QCap>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Start capturing the rotated queries of `layers` in the batch graph calls
+/// this thread makes until `o1_qcap_take`.
+pub fn o1_qcap_begin(layers: &[usize]) {
+    O1_QCAP.with(|q| {
+        *q.borrow_mut() = Some(O1QCap {
+            layers: layers.to_vec(),
+            bufs: Vec::new(),
+        })
+    });
+}
+
+fn o1_qcap_layers() -> Option<Vec<usize>> {
+    O1_QCAP.with(|q| q.borrow().as_ref().map(|q| q.layers.clone()))
+}
+
+/// A fresh capture buffer for `layer` when it is being captured.
+fn o1_qcap_buffer(c: &Ctx, layer: usize, floats: usize) -> Option<wgpu::Buffer> {
+    O1_QCAP.with(|q| {
+        let mut q = q.borrow_mut();
+        let q = q.as_mut().filter(|q| q.layers.contains(&layer))?;
+        let b = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("o1-qcap"),
+            size: (floats.max(1) * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        q.bufs.push((layer, floats, b.clone()));
+        Some(b)
+    })
+}
+
+/// End the capture and read it back: per captured layer, every call's rows
+/// concatenated in order. None when no capture was armed or the readback
+/// failed; an armed capture is always cleared.
+pub fn o1_qcap_take() -> Option<Vec<(usize, Vec<f32>)>> {
+    let cap = O1_QCAP.with(|q| q.borrow_mut().take())?;
+    let c = ctx()?;
+    let _op = c.op_gate.enter();
+    let total: usize = cap.bufs.iter().map(|(_, n, _)| n).sum();
+    let mut flat = vec![0f32; total];
+    if total > 0 {
+        let staging = c.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("o1-qcap-stage"),
+            size: (total * 4) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = c
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("o1-qcap") });
+        let mut off = 0u64;
+        for (_, n, b) in &cap.bufs {
+            enc.copy_buffer_to_buffer(b, 0, &staging, off, (*n * 4) as u64);
+            off += (*n * 4) as u64;
+        }
+        submit(c, finish_enc(enc));
+        let (tx, rx) = std::sync::mpsc::channel();
+        staging.map_async(wgpu::MapMode::Read, .., move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = c.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv().ok()?.ok()?;
+        flat.copy_from_slice(bytemuck::cast_slice(&staging.get_mapped_range(..).ok()?));
+        staging.unmap();
+    }
+    let mut out: Vec<(usize, Vec<f32>)> = cap.layers.iter().map(|&l| (l, Vec::new())).collect();
+    let mut off = 0usize;
+    for (layer, n, _) in &cap.bufs {
+        if let Some((_, rows)) = out.iter_mut().find(|(l, _)| l == layer) {
+            rows.extend_from_slice(&flat[off..off + n]);
+        }
+        off += n;
+    }
+    Some(out)
 }
 
 /// Return the number of O(1) device mirrors currently owned by `kv_id` and

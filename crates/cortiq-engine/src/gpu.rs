@@ -2272,6 +2272,28 @@ pub fn graph_state_resident(_kv_id: u64, _layer: usize) -> bool {
     false
 }
 
+/// Capture the rotated queries of `layers` in this thread's batch-graph
+/// calls (the O(1) seal's trace for a prefix run on the device). False when
+/// there is no wgpu batch graph to capture from.
+pub fn o1_qcap_begin(_layers: &[usize]) -> bool {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        crate::gpu_wgpu::o1_qcap_begin(_layers);
+        return true;
+    }
+    false
+}
+
+/// End the capture: per layer, the rows of every call since
+/// `o1_qcap_begin`, position-major `[rows × nh × hd]`.
+pub fn o1_qcap_take() -> Option<Vec<(usize, Vec<f32>)>> {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::o1_qcap_take();
+    }
+    None
+}
+
 /// Copy rows back from the wgpu token graph's K/V mirrors in one submit:
 /// for each `(layer, from, to)` the K and V rows `[from..to)`, position-major
 /// (`[(to − from) × nkv × hd]` each).
