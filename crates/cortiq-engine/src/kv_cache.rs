@@ -543,6 +543,23 @@ impl LayerKvCache {
         }
     }
 
+    /// The rotated-query trace collected so far (`[rows × num_heads ×
+    /// head_dim]`), while collecting.
+    pub(crate) fn o1_q_trace(&self) -> Option<&[f32]> {
+        match &self.o1 {
+            Some(O1State::Collecting { q_buf, .. }) => Some(q_buf),
+            _ => None,
+        }
+    }
+
+    /// Move a collecting layer's deferred boundary (the seal diagnostics
+    /// collect past it, then seal at the row count they choose).
+    pub(crate) fn o1_set_boundary(&mut self, at: usize) {
+        if let Some(O1State::Collecting { seal_at, .. }) = &mut self.o1 {
+            *seal_at = Some(at);
+        }
+    }
+
     pub fn o1_sealed(&self) -> bool {
         matches!(self.o1, Some(O1State::Sealed { .. }))
     }

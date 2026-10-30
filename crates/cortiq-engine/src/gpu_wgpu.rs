@@ -38170,6 +38170,43 @@ pub fn graph_state_resident(kv_id: u64, layer: usize) -> bool {
     ctx().is_some_and(|c| c.gdn_state.lock().unwrap().contains_key(&(kv_id, layer)))
 }
 
+/// One layer's resident recurrent state read back in the host
+/// `linear_state` layout: the conv ring, then S. None when the graph holds
+/// no state for the layer.
+pub fn graph_gdn_state_read(kv_id: u64, layer: usize) -> Option<Vec<f32>> {
+    let c = ctx()?;
+    let _op = c.op_gate.enter();
+    let (ring, s) = {
+        let states = c.gdn_state.lock().unwrap();
+        let (r, s) = states.get(&(kv_id, layer))?;
+        (r.clone(), s.clone())
+    };
+    let (rn, sn) = (ring.size(), s.size());
+    let stage = c.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("gdn-state-pull"),
+        size: rn + sn,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut enc = c
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("gdn-state-pull"),
+        });
+    flush_pass(&enc);
+    enc.copy_buffer_to_buffer(&ring, 0, &stage, 0, rn);
+    enc.copy_buffer_to_buffer(&s, 0, &stage, rn, sn);
+    submit(c, finish_enc(enc));
+    let slice = stage.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    c.device.poll(wgpu::PollType::wait_indefinitely()).ok()?;
+    let data = slice.get_mapped_range().ok()?;
+    let out = bytemuck::cast_slice::<u8, f32>(&data).to_vec();
+    drop(data);
+    stage.unmap();
+    Some(out)
+}
+
 /// Read rows back from several exact-attention mirrors in ONE submit: for
 /// each `(layer, from, to)` the K and V rows `[from..to)`, position-major
 /// (`[(to − from) × nkv × hd]` each) — the layout `LayerKvCache::append`
