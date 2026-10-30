@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- English and Chinese editions of the task-compression documentation: the
+  `cortiq compress` guide (`docs/COMPRESS.md`, `docs/COMPRESS.zh.md`) and both
+  research articles (`docs/research/TASK_COMPRESSION_ARTICLE.*`,
+  `docs/research/QWEN38_27B_TASK_COMPRESSION.*`), with language switchers in
+  all three editions. The Qwen3.8-27B → 14B article gains the 0.8.46 Mac
+  speculation numbers, the re-scored quality gates on 16 distinct prompts and
+  links to the published model's prompts and teacher dataset; the guide gains
+  the `QUANT` argument and the 0.8.45 healing and MTP flags. The English and
+  Chinese READMEs link the English and Chinese editions.
+
 ## [0.8.46] — 2026-10-30
 
 ### Fixed

@@ -104,7 +104,12 @@ DTG-MA (`--select dtgma`). Их вклад переносится в остав�
 и на Apple Silicon (Metal), с 0.8.42 — и сама свёртка: слой Qwen3.8-27B
 сворачивается за 12 с на Mac mini M4 вместо ~11 мин на его CPU, а с
 `--keep-grams` несколько целевых размеров сворачиваются из одной засветки.
-Подробности — в [руководстве](docs/COMPRESS.ru.md).
+Подробности — в [руководстве](docs/COMPRESS.ru.md); метод и замеры — в
+[статье о сжатии под задачу](docs/research/TASK_COMPRESSION_ARTICLE.ru.md),
+полный прогон на большой модели — в
+[Qwen3.8-27B → 14B шаг за шагом](docs/research/QWEN38_27B_TASK_COMPRESSION.ru.md)
+(готовая модель, её промпты и датасет учителя:
+[infosave/Qwen3.8-27B-Code-14B-Experimental-cmf](https://huggingface.co/infosave/Qwen3.8-27B-Code-14B-Experimental-cmf)).
 
 ## Компактация MTP draft по своим промптам (0.8.38)
 
@@ -302,6 +307,9 @@ Kimi Linear, MiniCPM и несколько MoE/video-семейств. Огра�
 - [Спецификация CMF v2](docs/CMF_V2_SPEC.ru.md) — нормативная раскладка файла.
 - [Сравнение форматов](docs/COMPARISON.ru.md) — критерии и источники измерений.
 - [Навыки](docs/SKILLS.ru.md) — маски, накладки и маршрутизация.
+- [Сжатие под задачу](docs/COMPRESS.ru.md) — руководство по `cortiq compress`;
+  [статья о методе](docs/research/TASK_COMPRESSION_ARTICLE.ru.md) и
+  [прогон Qwen3.8-27B → 14B](docs/research/QWEN38_27B_TASK_COMPRESSION.ru.md).
 - [GPU-рецепты](docs/GPU_KERNEL_RECIPES.md) — измерения бэкендов.
 - [Несколько GPU](docs/MULTI_GPU.md) и [разделение на мобильном](docs/MOBILE_SPLIT.ru.md).
 - [FCD-восстановление](docs/RUST_FCD.md) и [низкоразрядный PTQ](docs/Q1T_PTQ.md).

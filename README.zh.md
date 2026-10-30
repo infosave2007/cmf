@@ -47,6 +47,27 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## 一条命令按任务压缩模型（0.8.39）
+
+把通用模型变成针对你的提示的专用模型：
+
+```sh
+cortiq compress model.cmf prompts.jsonl model-task.cmf --ratio 0.9
+```
+
+教师模型回答提示（模型本身、另一个 `.cmf`，或任何 OpenAI 兼容 API：
+`--teacher openrouter:qwen/qwen3.8-27b`、`openai:MODEL`、
+`api:MODEL --api-base URL`）；任务不使用的 FFN 神经元被移除（按激活照明，或用
+`--select dtgma` 训练 DTG-MA 掩码），其贡献以闭式解重拟合进保留的神经元，然后
+模型在这些回答上修复；留出回答对结果评分，并由质量门槛决定是否写出文件。MoE
+模型会移除任务不会路由到的专家。输出保持源模型的编码格式，量化是单独的一步
+（也可以把 `q4tp` 等编码格式作为第四个参数）。GPU 阶段在 NVIDIA（Vulkan）和
+Apple Silicon（Metal）上运行。详见[压缩指南](docs/COMPRESS.zh.md)；方法与测量见
+[面向任务压缩的文章](docs/research/TASK_COMPRESSION_ARTICLE.zh.md)，大模型上的
+完整运行见[Qwen3.8-27B → 14B 逐步记录](docs/research/QWEN38_27B_TASK_COMPRESSION.zh.md)
+（得到的模型及其提示和教师数据集：
+[infosave/Qwen3.8-27B-Code-14B-Experimental-cmf](https://huggingface.co/infosave/Qwen3.8-27B-Code-14B-Experimental-cmf)）。
+
 ## 原生 Qwen Image 编辑
 
 0.6.8 提供 Qwen-Image-Edit-2509 的原生 Rust 流程。默认发布形态是一个
@@ -119,7 +140,7 @@ CLI 还提供 `info`、`bench`、`ppl`、`serve`、`skill`、`moe-mask`、`moe-d
 | `q1`、`q1t`、`q1s` | 训练二值或实验性的三值/PTQ 路径 |
 
 实验性低比特路径见 [Q1T/PTQ](docs/Q1T_PTQ.md)，编码支持矩阵见
-[量化覆盖表](docs/QUANT_COVERAGE.ru.md)。
+[量化覆盖表](docs/QUANT_COVERAGE.ru.md)（俄文）。
 
 ## 运行时能力
 
@@ -153,8 +174,11 @@ CLI 还提供 `info`、`bench`、`ppl`、`serve`、`skill`、`moe-mask`、`moe-d
 - [CMF v2 规范](docs/CMF_V2_SPEC.zh.md) — 文件布局规范。
 - [格式对比](docs/COMPARISON.zh.md) — 评分标准与证据。
 - [技能](docs/SKILLS.zh.md) — 掩码、覆盖层和路由流程。
+- [按任务压缩](docs/COMPRESS.zh.md) — `cortiq compress` 指南；
+  [方法文章](docs/research/TASK_COMPRESSION_ARTICLE.zh.md)与
+  [Qwen3.8-27B → 14B 运行记录](docs/research/QWEN38_27B_TASK_COMPRESSION.zh.md)。
 - [GPU 内核配方](docs/GPU_KERNEL_RECIPES.md) — 后端测量。
-- [多 GPU](docs/MULTI_GPU.md) 与[移动端切分](docs/MOBILE_SPLIT.ru.md)。
+- [多 GPU](docs/MULTI_GPU.md) 与[移动端切分](docs/MOBILE_SPLIT.ru.md)（俄文）。
 - [FCD 恢复](docs/RUST_FCD.md) 与[低比特 PTQ](docs/Q1T_PTQ.md)。
 - [Qwen Image 编辑](docs/QWEN_IMAGE.md) — 单文件运行和独立组件暂存。
 - [模型卡片和转换说明](docs/hf/README.md)。
