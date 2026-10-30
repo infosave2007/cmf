@@ -17,6 +17,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   links to the published model's prompts and teacher dataset; the guide gains
   the `QUANT` argument and the 0.8.45 healing and MTP flags. The English and
   Chinese READMEs link the English and Chinese editions.
+- English and Chinese editions of the last four Russian-only documents the
+  READMEs link: MTP draft compaction (`docs/MTP_COMPACTION.*`), the
+  quantization coverage matrix (`docs/QUANT_COVERAGE.*`), the phone network
+  split (`docs/MOBILE_SPLIT.*`) and Cortiq Spectra (`docs/SPECTRA.*`), with
+  language switchers in all three editions. The English and Chinese READMEs
+  (and `docs/hf/FORMATS.md`) link the new editions without "in Russian" marks.
+  Fixed in every edition: the wire protocol is version 7, not 5; the MTP plan
+  check runs in `cortiq tube-bake`; two bold cells of the coverage matrix
+  rendered as literal asterisks.
 
 ## [0.8.46] — 2026-10-30
 
