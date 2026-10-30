@@ -65,9 +65,10 @@ cortiq system-one d1-2b-q8_2f.cmf \
 ```
 
 ```json
-{"answers": {"refund": {"type": "noul", "noul": 0.9999},
-             "team": {"type": "choice", "choice": "billing", "confidence": 0.87, "probabilities": {...}}},
- "usage": {"input_tokens": 123, "output_tokens": 0}}
+{"answers": {"refund": {"type": "noul", "noul": 0.9972},
+             "team": {"type": "choice", "choice": "billing", "confidence": 0.7028,
+                      "probabilities": {"billing": 0.7028, "shipping": 0.2477, "technical": 0.0495}}},
+ "usage": {"input_tokens": 88, "output_tokens": 0}}
 ```
 
 Use cortiq 0.8.50 or later; prebuilt binaries for Linux, macOS and Windows are
@@ -96,8 +97,8 @@ One request at a time through `cortiq serve`, after the first call:
 
 | hardware | file | 1 question (43 tokens) | 3 questions (123 tokens) | 5 questions over a ~200-token state |
 |---|---|---:|---:|---:|
-| NVIDIA A40 (Vulkan) | `q4tp` | 40 ms | 66 ms | 100–115 ms |
-| NVIDIA A40 (Vulkan) | `q8_2f` | 68 ms | 74 ms | 115–127 ms |
+| NVIDIA A40 (Vulkan) | `q4tp` | 45 ms | 64 ms | 100–115 ms |
+| NVIDIA A40 (Vulkan) | `q8_2f` | 56–75 ms | 70 ms | 102–128 ms |
 | Apple M4 (Metal) | `q4tp` | 85 ms | 160 ms | 255–310 ms |
 
 The whole forward pass — every layer over the packed state and questions,
@@ -207,7 +208,7 @@ cortiq system-one d1-2b-q8_2f.cmf --state "Мне дважды списали д
 состояния), `number` с `range` (оценка с интервалом), `box`/`boxes` (рамки на
 изображении). Весь проход — слои над упакованным состоянием и вопросами и
 голова словаря над слотами ответов — идёт одной отправкой на GPU: на NVIDIA A40
-один вопрос отвечается за 40 мс (`q4tp`), на Apple M4 (Metal) — за 85 мс.
+один вопрос отвечается за 45 мс (`q4tp`), на Apple M4 (Metal) — за 85 мс.
 `cortiq serve` отдаёт `POST /v1/system_one` (`state`, `questions`, `media`).
 Видео и пакетные запросы пока не поддерживаются. Файлы — изменённая форма d1-2B
 от Liquid AI по LFM Open License v1.0 (копия — [LICENSE](LICENSE));
@@ -234,7 +235,7 @@ cortiq system-one d1-2b-q8_2f.cmf --state "我被重复扣款，包裹也没到�
 | `d1-2b-q4tp.cmf` | 4 位 | 1.31 GB | 19/19（一个估计值差 2 档） | 内存最小 |
 
 整个前向（打包后的状态与问题经过所有层，再在答案位置上计算词表头）在一次 GPU
-提交中完成：NVIDIA A40 上单个问题 40 ms（`q4tp`），Apple M4（Metal）上 85 ms。
+提交中完成：NVIDIA A40 上单个问题 45 ms（`q4tp`），Apple M4（Metal）上 85 ms。
 `cortiq serve` 提供 `POST /v1/system_one`。暂不支持视频与批量请求。这些文件是
 Liquid AI d1-2B 的修改形式，仍受 LFM Open License v1.0 约束（副本见
 [LICENSE](LICENSE)）；年收入 1000 万美元及以上的实体进行商业使用不在许可范围内。
