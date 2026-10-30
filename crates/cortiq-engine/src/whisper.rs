@@ -880,6 +880,12 @@ fn heads_to_rows(x: &[f32], n: usize, heads: usize, hd: usize) -> Vec<f32> {
 }
 
 fn read_wav(path: &Path) -> Result<(Vec<f32>, usize), String> {
+    read_wav_samples(path, true)
+}
+
+/// Mono samples and the sample rate of a PCM / IEEE-float WAV file;
+/// `clamp` limits every channel sample to [-1, 1] before the downmix.
+pub(crate) fn read_wav_samples(path: &Path, clamp: bool) -> Result<(Vec<f32>, usize), String> {
     let b = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if b.len() < 44 || &b[..4] != b"RIFF" || &b[8..12] != b"WAVE" {
         return Err("input must be RIFF/WAVE".into());
@@ -935,17 +941,19 @@ fn read_wav(path: &Path) -> Result<(Vec<f32>, usize), String> {
                 (3, 64) => f64::from_le_bytes(x.try_into().unwrap()) as f32,
                 _ => 0.0,
             };
-            sum += if v.is_finite() {
+            sum += if !v.is_finite() {
+                0.0
+            } else if clamp {
                 v.clamp(-1.0, 1.0) as f64
             } else {
-                0.0
+                v as f64
             };
         }
         out.push((sum / ch as f64) as f32);
     }
     Ok((out, rate))
 }
-fn resample_sinc(x: &[f32], from: usize, to: usize) -> Vec<f32> {
+pub(crate) fn resample_sinc(x: &[f32], from: usize, to: usize) -> Vec<f32> {
     if from == to {
         return x.to_vec();
     }

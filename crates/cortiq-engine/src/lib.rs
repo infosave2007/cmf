@@ -95,6 +95,10 @@ pub mod tokenizer;
 pub mod vae;
 pub mod vae3d;
 pub mod videogen;
+/// NVIDIA Nemotron 3.5 Transcribe: audio perception + transcription loop.
+pub mod nemotron_asr;
+/// Nemotron-H hybrid Mamba-2 / attention / MoE decoder.
+pub mod nemotron_h;
 /// Native Whisper encoder/decoder inference over CMF checkpoints.
 pub mod whisper;
 pub mod zimage;

@@ -1143,7 +1143,7 @@ fn build_sg(c: &Ctx) -> Option<Sg> {
 /// three matrices of one input per dispatch (Q/K/V); one for O and the head.
 /// Same products as `q8_2f_matvec4` (x·colscale, then the int8 dot), a
 /// different summation order. cols <= 4096, cols % 16 == 0.
-fn q82sg_wgsl() -> String {
+pub(crate) fn q82sg_wgsl() -> String {
     let mut body = String::new();
     for m in ["a", "b", "c"] {
         body.push_str(&Q82SG_FN_T.replace("{M}", m));

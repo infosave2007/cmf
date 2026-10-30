@@ -8,6 +8,7 @@ mod convert;
 mod decision;
 mod dialog;
 mod egemma2pack;
+mod nemotron_pack;
 mod embed;
 mod flint;
 mod flint_hybrid;
@@ -17,6 +18,8 @@ mod gptq;
 mod nvgtrain;
 #[cfg(feature = "gpu")]
 mod moegptq;
+#[cfg(feature = "gpu")]
+mod nemotron_gptq;
 mod growth;
 mod http_range;
 mod imagepack;
@@ -658,21 +661,32 @@ enum Commands {
         #[arg(long)]
         interleave: bool,
     },
-    /// Transcribe audio with a Whisper CMF checkpoint (WAV, PCM or float).
+    /// Transcribe audio with a Whisper or Nemotron 3.5 Transcribe CMF
+    /// checkpoint (WAV, PCM or float).
     Transcribe {
-        /// Path to a Whisper .cmf model
+        /// Path to a Whisper or Nemotron 3.5 Transcribe .cmf model
         model: String,
-        /// Path to input WAV audio
-        audio: String,
+        /// Input WAV audio (Nemotron: several files are transcribed in one
+        /// load, one `<file>: <text>` line each)
+        #[arg(required = true, num_args = 1..)]
+        audio: Vec<String>,
         /// Whisper language code, e.g. en, ru, de (default: en)
         #[arg(long, default_value = "en")]
         language: String,
-        /// transcribe | translate
+        /// transcribe | translate (Whisper)
         #[arg(long, default_value = "transcribe")]
         task: String,
-        /// Maximum generated text tokens per 30-second segment
-        #[arg(long, default_value_t = 440)]
-        max_new_tokens: usize,
+        /// Maximum generated text tokens (Whisper: per 30-second segment,
+        /// default 440; Nemotron: per recording, default 16384)
+        #[arg(long)]
+        max_new_tokens: Option<usize>,
+        /// Nemotron: the user instruction sent with the audio (default: the
+        /// model's verbatim transcription prompt)
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Nemotron: print timings and token counts to stderr
+        #[arg(long)]
+        stats: bool,
     },
     /// Package a Gradium Phonon Q8 checkpoint as a self-contained CMF file.
     #[cfg(feature = "phonon")]
@@ -4078,9 +4092,15 @@ async fn main() -> anyhow::Result<()> {
             language,
             task,
             max_new_tokens,
+            prompt,
+            stats,
         } => {
             let model = Arc::new(CmfModel::open(&model)?);
-            let text = transcribe::run(&model, &audio, &language, &task, max_new_tokens)?;
+            if model.header.arch.arch_name == cortiq_engine::nemotron_asr::ARCH_NAME {
+                return transcribe::run_nemotron(&model, &audio, prompt.as_deref(), max_new_tokens.unwrap_or(16384), stats);
+            }
+            anyhow::ensure!(audio.len() == 1, "Whisper transcribes one file per call");
+            let text = transcribe::run(&model, &audio[0], &language, &task, max_new_tokens.unwrap_or(440))?;
             println!("{text}");
             Ok(())
         }
