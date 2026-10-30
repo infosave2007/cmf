@@ -1253,6 +1253,7 @@ impl Tokenizer {
         reasoning_effort: Option<&str>,
     ) -> Result<String, minijinja::Error> {
         let mut env = crate::chat_template::environment();
+        self.add_special_globals(&mut env);
         let tpl_src = strip_generation_tags(tpl);
         env.add_template("chat", &tpl_src)?;
         let msgs: Vec<minijinja::Value> = messages
@@ -1372,6 +1373,7 @@ impl Tokenizer {
         enable_thinking: Option<bool>,
     ) -> Result<String, minijinja::Error> {
         let mut env = crate::chat_template::environment();
+        self.add_special_globals(&mut env);
         let tpl_src = strip_generation_tags(tpl);
         env.add_template("chat", &tpl_src)?;
         let msgs: Vec<minijinja::Value> = messages
@@ -1397,6 +1399,23 @@ impl Tokenizer {
             })?,
         };
         Ok(close_direct_think(rendered, enable_thinking))
+    }
+
+    /// The BOS text Transformers hands every chat template as `bos_token`.
+    /// LFM2/LFM3 templates open with `{{- bos_token -}}` while their
+    /// tokenizers add no BOS of their own, so an undefined variable dropped
+    /// the BOS from every chat prompt. A tokenizer that also prepends BOS
+    /// (`add_bos`) sees it already in place (`with_bos`), so nothing doubles.
+    fn add_special_globals(&self, env: &mut minijinja::Environment<'_>) {
+        let bos = self.bos_token_id.and_then(|id| {
+            self.added
+                .iter()
+                .find(|(_, i)| *i == id)
+                .map(|(text, _)| text.clone())
+        });
+        if let Some(text) = bos {
+            env.add_global("bos_token", text);
+        }
     }
 
     /// Hardcoded Qwen ChatML (pre-§6.1 files).
@@ -2010,6 +2029,25 @@ mod tests {
         let ids2 = tok.encode("he<|eot|>he");
         assert_eq!(ids2, vec![8, 10, 8]);
         assert_eq!(tok.decode(&ids2), "hehe");
+    }
+
+    /// LFM2/LFM3 templates open with `{{- bos_token -}}` and their tokenizers
+    /// add no BOS themselves: the template must see the BOS text, as under
+    /// transformers' `apply_chat_template`, and a tokenizer that also
+    /// prepends BOS must not get two.
+    #[test]
+    fn chat_template_sees_bos_token_once() {
+        let mut tok = Tokenizer::from_json(&mini_json()).unwrap();
+        tok.bos_token_id = Some(10);
+        tok.chat_template = Some(
+            "{{- bos_token -}}{%- for m in messages -%}{{ m.content }}{%- endfor -%}".to_string(),
+        );
+        let messages = vec![("user".to_string(), "he".to_string())];
+        assert_eq!(tok.apply_chat_template(&messages), vec![10, 8]);
+        let json = vec![serde_json::json!({"role": "user", "content": "he"})];
+        assert_eq!(tok.apply_chat_template_json(&json, None, None), vec![10, 8]);
+        tok.add_bos = true;
+        assert_eq!(tok.apply_chat_template(&messages), vec![10, 8]);
     }
 
     #[test]

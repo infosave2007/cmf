@@ -2151,6 +2151,25 @@ impl Pipeline {
                 }
             }
         }
+        // The same proportional RoPE on full-attention layers that keep the
+        // model's head geometry (LFM3): the whole head rotates (header
+        // factor 1.0) with the full-head frequency progression, and the
+        // frequencies past `factor·head_dim/2` are zero (identity pairs).
+        if let (Some(prf), None) = (arch.global_partial_rotary_factor, arch.global_head_dim) {
+            if arch.yarn.is_some() || pipeline.rotary_dim != arch.head_dim {
+                return Err(CmfError::Parse(format!(
+                    "global_partial_rotary_factor {prf} needs partial_rotary_factor 1.0 and no \
+                     YaRN profile (rotary width {} of head {})",
+                    pipeline.rotary_dim, arch.head_dim
+                )));
+            }
+            let mut f = crate::attention::rope_inv_freq(arch.head_dim, arch.rope_theta as f32);
+            let ra = (((prf * arch.head_dim as f32) as usize) / 2).min(f.len());
+            for slot in f.iter_mut().skip(ra) {
+                *slot = 0.0;
+            }
+            pipeline.inv_freq = std::sync::Arc::new(f);
+        }
         // MLA (DeepSeek-V2): the expand-to-MHA cache holds nh heads of
         // rope+nope dims; rotary covers the rope prefix.
         if let Some(mla) = arch.mla.as_ref() {
@@ -2260,7 +2279,9 @@ impl Pipeline {
         }
         pipeline.attn_v_norm = arch.attn_v_norm;
         pipeline.qk_norm_after_rope = arch.qk_norm_after_rope;
-        pipeline.proj_gate_sigmoid = arch.arch_name == "spark2_5";
+        // One sigmoid gate per head from its own projection: Spark-X2.5's
+        // `g_proj`, LFM3's `gate_proj` (renamed at convert time).
+        pipeline.proj_gate_sigmoid = arch.arch_name == "spark2_5" || arch.arch_name == "lfm3";
         pipeline.final_softcap = arch.final_logit_softcapping.map(|c| c as f32);
         // Cortiq Embryo hierarchical head: cluster matrix → two-level log-probs.
         if let Some(ncl) = arch.head_clusters {
@@ -2702,15 +2723,16 @@ impl Pipeline {
         if arch.arch_name == "mimo_v2" {
             pipeline.mimo_mtp = crate::pipeline::mimo_mtp::load_for(model, &arch)?;
         }
-        // Spark-X2.5's sliding layers (27 of the 4B's 36, window 512) keep
-        // only the rows their window can still read: 64 rows of rollback
-        // slack, the cut on a 64-row grid so the Metal chunk GEMMs keep
-        // their K-tile partition (see `LayerKvCache::trim_window`). Other
-        // windowed architectures keep every row until one is measured.
+        // Spark-X2.5's sliding layers (27 of the 4B's 36, window 512) and
+        // LFM3's (5 of 11 attention layers, window 256) keep only the rows
+        // their window can still read: 64 rows of rollback slack, the cut
+        // on a 64-row grid so the Metal chunk GEMMs keep their K-tile
+        // partition (see `LayerKvCache::trim_window`). Other windowed
+        // architectures keep every row until one is measured.
         // Off with a speculation head (its verify paths read row counts as
         // positions) and under CMF_ATTN_DUMP (the dump header assumes row
         // = position). CMF_SWA_TRIM=0 turns it off for an A/B.
-        pipeline.swa_trim = (arch.arch_name == "spark2_5"
+        pipeline.swa_trim = (matches!(arch.arch_name.as_str(), "spark2_5" | "lfm3")
             && pipeline.swa.is_some()
             && pipeline.mtp.is_none()
             && pipeline.mimo_mtp.is_none()
