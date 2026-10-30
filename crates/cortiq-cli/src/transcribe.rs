@@ -27,6 +27,7 @@ pub fn run_nemotron(
     prompt: Option<&str>,
     max_new_tokens: usize,
     stats: bool,
+    timestamps: bool,
 ) -> Result<()> {
     use std::io::Write;
     let t0 = std::time::Instant::now();
@@ -37,6 +38,10 @@ pub fn run_nemotron(
     }
     let pool = cortiq_engine::pool::Pool::from_env();
     let many = audio.len() > 1;
+    anyhow::ensure!(
+        !timestamps || tr.words.is_some(),
+        "this file has no word timestamp head (repack it with cortiq 0.8.45 or later)"
+    );
     for path in audio {
         let samples = cortiq_engine::nemotron_asr::read_audio(std::path::Path::new(path))
             .map_err(anyhow::Error::msg)
@@ -65,7 +70,7 @@ pub fn run_nemotron(
         }
         let mut first = true;
         let out = tr
-            .transcribe(&samples, prompt, max_new_tokens, pool.as_deref(), |piece| {
+            .transcribe(&samples, prompt, max_new_tokens, timestamps, pool.as_deref(), |piece| {
                 let piece = if first { piece.trim_start() } else { piece };
                 first = false;
                 let _ = stdout.write_all(piece.as_bytes());
@@ -74,10 +79,24 @@ pub fn run_nemotron(
             .map_err(anyhow::Error::msg)
             .with_context(|| format!("transcribing {path}"))?;
         println!();
+        match &out.words {
+            Some(Ok(words)) => {
+                for w in words {
+                    match w.speaker {
+                        Some(s) if out.text.contains("<spk:") => {
+                            println!("  {:9.3} {:9.3}  spk:{s}  {}", w.start, w.end, w.word)
+                        }
+                        _ => println!("  {:9.3} {:9.3}  {}", w.start, w.end, w.word),
+                    }
+                }
+            }
+            Some(Err(e)) => eprintln!("{path}: word timestamps failed: {e}"),
+            None => {}
+        }
         if stats {
             let n_gen = out.ids.len();
             eprintln!(
-                "{path}: audio {:.2}s | audio encoder {:.2}s | prefill {} tokens ({} audio) {:.2}s = {:.0} tok/s | decode {} tokens {:.2}s = {:.1} tok/s | real-time factor {:.3}",
+                "{path}: audio {:.2}s | audio encoder {:.2}s | prefill {} tokens ({} audio) {:.2}s = {:.0} tok/s | decode {} tokens {:.2}s = {:.1} tok/s{} | real-time factor {:.3}",
                 out.audio_s,
                 out.encode_s,
                 out.prompt_tokens,
@@ -87,7 +106,8 @@ pub fn run_nemotron(
                 n_gen,
                 out.decode_s,
                 n_gen as f64 / out.decode_s.max(1e-9),
-                (out.encode_s + out.prefill_s + out.decode_s) / out.audio_s.max(1e-9),
+                if out.words.is_some() { format!(" | word timestamps {:.2}s", out.words_s) } else { String::new() },
+                (out.encode_s + out.prefill_s + out.decode_s + out.words_s) / out.audio_s.max(1e-9),
             );
         }
     }
