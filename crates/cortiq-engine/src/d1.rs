@@ -1194,11 +1194,13 @@ fn box_json(b: &[f64; 4]) -> Value {
 // ─────────────────────────────── API ───────────────────────────────
 
 /// One request: a state (string, any JSON, or null with media alone), named
-/// questions, and image sources (path, URL or `data:`).
+/// questions, image sources (path, URL or `data:`) and, on d1-Omni, audio
+/// clips (path, URL, `data:` or `{"data": base64}`), pictures first.
 pub struct Request {
     pub state: Value,
     pub questions: Map<String, Value>,
     pub images: Vec<Value>,
+    pub audios: Vec<Value>,
 }
 
 /// A d1 engine over a loaded pipeline.
@@ -1244,7 +1246,7 @@ impl D1 {
         if questions.is_empty() {
             return Err("no questions".into());
         }
-        if req.state.is_null() && req.images.is_empty() {
+        if req.state.is_null() && req.images.is_empty() && req.audios.is_empty() {
             return Err("a request needs a state, media, or both".into());
         }
         let boxes = questions.iter().any(|(_, q)| matches!(q, Question::Box { .. } | Question::Boxes { .. }));
@@ -1269,6 +1271,22 @@ impl D1 {
                 markup.push_str("<|vision_start|>");
                 markup.push_str(&"<|image|>".repeat(input.tokens()));
                 markup.push_str("<|vision_end|>");
+            }
+        }
+        // Audio clips (d1-Omni): the speech encoder's rows, one <|audio|>
+        // per encoder token inside the template's vision markers.
+        if !req.audios.is_empty() {
+            let model = pipeline.model.as_ref().ok_or("d1 media need a file-backed pipeline")?;
+            if !crate::lfm3_audio::has_audio(model) {
+                return Err("this d1 file takes no audio (d1-Omni does)".into());
+            }
+            let enc = crate::lfm3_audio::Lfm3AudioEncoder::from_model(model, crate::pool::Pool::from_env())?;
+            for src in &req.audios {
+                let rows = enc.rows(&crate::egemma2_audio::load_audio_source(src)?)?;
+                markup.push_str("<|vision_start|>");
+                markup.push_str(&"<|audio|>".repeat(rows.len() / enc.text_hidden));
+                markup.push_str("<|vision_end|>");
+                media_rows.extend(rows);
             }
         }
         let bos = pipeline
@@ -1316,10 +1334,11 @@ impl D1 {
             // Prompt rows: the embedding, the tower's rows at the pictures.
             let h = pipeline.hidden_size;
             let image_id = p.t.single("<|image|>").ok_or("tokenizer lacks <|image|>")?;
+            let audio_id = p.t.single("<|audio|>");
             let mut rows = Vec::with_capacity(ids.len() * h);
             let mut at = 0usize;
             for &id in &ids {
-                if id == image_id && !media_rows.is_empty() {
+                if (id == image_id || Some(id) == audio_id) && !media_rows.is_empty() {
                     rows.extend_from_slice(media_rows.get(at..at + h).ok_or("picture rows run short")?);
                     at += h;
                 } else {

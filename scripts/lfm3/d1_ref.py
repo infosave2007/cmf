@@ -3,7 +3,8 @@ System One code (trust_remote_code) over a battery of states and questions of
 every type, in float32 (bf16 weights upcast) unless `bf16` is asked. Writes
 the requests and the full answers (probabilities included) as JSON.
 
-usage: python3 -I d1_ref.py MODEL_DIR {f32|bf16} OUT.json [IMAGE]
+usage: python3 -I d1_ref.py MODEL_DIR {f32|bf16} OUT.json [IMAGE] [AUDIO.wav]
+(d1-Omni: an AUDIO clip adds a spoken-request battery)
 """
 
 import json
@@ -42,6 +43,13 @@ JSON_Q = {
     "sentiment": {"type": "score", "instructions": "How satisfied is the customer?",
                   "criteria": ["very unhappy", "unhappy", "neutral", "happy", "very happy"]},
 }
+AUDIO_Q = {
+    "booking": {"type": "noul", "instructions": "Is the speaker making a reservation?"},
+    "people": {"type": "number", "instructions": "For how many people?", "range": [0, 10], "step": 1},
+    "kind": {"type": "choice", "instructions": "What is the request about?",
+             "criteria": {"restaurant": "A table or a meal", "travel": "Flights or hotels",
+                          "support": "A product problem"}},
+}
 IMAGE_Q = {
     "cats": {"type": "number", "instructions": "How many cats are there?", "range": [0, 10], "step": 1},
     "remote": {"type": "box", "instructions": "Where is the remote control on the left?"},
@@ -55,6 +63,7 @@ IMAGE_Q = {
 def main():
     model_dir, dtype, out = sys.argv[1], sys.argv[2], sys.argv[3]
     image = sys.argv[4] if len(sys.argv) > 4 else None
+    audio = sys.argv[5] if len(sys.argv) > 5 else None
     torch.set_grad_enabled(False)
     model = AutoModel.from_pretrained(model_dir, trust_remote_code=True,
                                       dtype={"bf16": torch.bfloat16, "f32": torch.float32}[dtype]).to("cuda:0")
@@ -62,11 +71,15 @@ def main():
     if image:
         from PIL import Image
         requests.append((None, IMAGE_Q, [Image.open(image).convert("RGB")]))
+    if audio:
+        requests.append((None, AUDIO_Q, [{"type": "audio", "path": audio}]))
     records = []
     for state, qs, media in requests:
         res = model.system_one(state, qs, media=media)
         print(json.dumps(res["answers"], ensure_ascii=False)[:600], flush=True)
-        records.append({"state": state, "questions": qs, "image": image if media else None, "result": res})
+        is_audio = bool(media) and isinstance(media[0], dict)
+        records.append({"state": state, "questions": qs, "image": image if media and not is_audio else None,
+                        "audio": audio if is_audio else None, "result": res})
     with open(out, "w") as f:
         json.dump(records, f, ensure_ascii=False, indent=1)
 

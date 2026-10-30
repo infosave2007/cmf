@@ -40,13 +40,16 @@ def main():
                 args += ["--state", "@" + spath]
             if rec.get("image"):
                 args += ["--image", rec["image"]]
+            if rec.get("audio"):
+                args += ["--audio", rec["audio"]]
             out = subprocess.run(args, capture_output=True, text=True, env={**os.environ, "XDG_RUNTIME_DIR": "/tmp"})
         if out.returncode:
             print("FAILED:", out.stderr[-1500:])
             continue
         got = json.loads(out.stdout)["answers"]
         want = rec["result"]["answers"]
-        print(f"## state {str(rec['state'])[:50]!r} image={bool(rec.get('image'))}  ({out.stderr.strip().splitlines()[-1]})")
+        print(f"## state {str(rec['state'])[:50]!r} image={bool(rec.get('image'))} audio={bool(rec.get('audio'))}"
+              f"  ({out.stderr.strip().splitlines()[-1]})")
         for name, a in want.items():
             g = got.get(name)
             diffs, same = [], True

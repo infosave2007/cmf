@@ -416,6 +416,9 @@ enum Commands {
         /// Picture path, data URL or HTTP(S) URL (repeatable)
         #[arg(long = "image")]
         images: Vec<String>,
+        /// d1-Omni audio clip: WAV path, data URL or HTTP(S) URL (repeatable)
+        #[arg(long = "audio")]
+        audios: Vec<String>,
     },
     /// Decide with a decision file: one text (-p) or a JSONL batch (--input);
     /// locally, and with --oracle MODEL (the key in OPENROUTER_API_KEY) an
@@ -3843,8 +3846,8 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Commands::Decide(args) => decision::run_decide(&args),
-        Commands::SystemOne { model, state, questions, images } => {
-            run_system_one(&model, state.as_deref(), &questions, &images)
+        Commands::SystemOne { model, state, questions, images, audios } => {
+            run_system_one(&model, state.as_deref(), &questions, &images, &audios)
         }
         Commands::Decision { cmd } => decision::run_decision(&cmd),
         Commands::Convert {
@@ -12486,7 +12489,13 @@ fn arg_or_file(v: &str) -> anyhow::Result<(String, bool)> {
     }
 }
 
-fn run_system_one(model: &str, state: Option<&str>, questions: &str, images: &[String]) -> anyhow::Result<()> {
+fn run_system_one(
+    model: &str,
+    state: Option<&str>,
+    questions: &str,
+    images: &[String],
+    audios: &[String],
+) -> anyhow::Result<()> {
     let cmf = Arc::new(CmfModel::open(model)?);
     anyhow::ensure!(
         cortiq_engine::d1::is_d1(&cmf),
@@ -12508,6 +12517,7 @@ fn run_system_one(model: &str, state: Option<&str>, questions: &str, images: &[S
         state,
         questions,
         images: images.iter().map(|p| serde_json::json!({"url": p})).collect(),
+        audios: audios.iter().map(|p| serde_json::json!(p)).collect(),
     };
     let t0 = std::time::Instant::now();
     let out = d1.system_one(&pipeline, &req).map_err(anyhow::Error::msg)?;

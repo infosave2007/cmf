@@ -44,7 +44,7 @@ fn system_one_media(item: &serde_json::Value) -> Result<serde_json::Value, Strin
     }
     let kind = item.get("type").and_then(|v| v.as_str()).unwrap_or("image");
     if kind != "image" && kind != "image_url" {
-        return Err(format!("media of type {kind:?} are not supported by this model (pictures only)"));
+        return Err(format!("media of type {kind:?} are not supported (pictures and audio clips)"));
     }
     let src = item
         .get("image_url")
@@ -72,8 +72,14 @@ async fn system_one(State(state): State<Arc<AppState>>, Json(body): Json<serde_j
     let Some(questions) = body.get("questions").and_then(|v| v.as_object()).cloned() else {
         return error_response(StatusCode::BAD_REQUEST, "\"questions\" is an object of named questions");
     };
-    let mut images = Vec::new();
+    let (mut images, mut audios) = (Vec::new(), Vec::new());
     for item in body.get("media").and_then(|v| v.as_array()).into_iter().flatten() {
+        let kind = item.get("type").and_then(|v| v.as_str()).unwrap_or("image");
+        if matches!(kind, "audio" | "input_audio" | "audio_url") {
+            let src = item.get("input_audio").or_else(|| item.get("audio_url")).or_else(|| item.get("audio"));
+            audios.push(src.cloned().unwrap_or_else(|| item.clone()));
+            continue;
+        }
         match system_one_media(item) {
             Ok(v) => images.push(v),
             Err(e) => return error_response(StatusCode::BAD_REQUEST, e),
@@ -83,6 +89,7 @@ async fn system_one(State(state): State<Arc<AppState>>, Json(body): Json<serde_j
         state: body.get("state").cloned().unwrap_or(serde_json::Value::Null),
         questions,
         images,
+        audios,
     };
     let slot = state.slots.acquire().await;
     let out = tokio::task::spawn_blocking(move || {
