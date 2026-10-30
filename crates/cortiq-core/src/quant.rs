@@ -957,6 +957,34 @@ pub fn validate_payload(dtype: TensorDtype, shape: &[usize], bytes: &[u8]) -> Re
 }
 
 /// Dequantize any supported tensor into f32.
+/// [`dequant_tensor`] over `threads` for the element-wise dtypes (f32, f16,
+/// bf16): a trainer load converts every weight of a model, 27 G elements on
+/// Qwen3.8-27B, which a single loop spent minutes on. Other dtypes take the
+/// serial path. Bit-identical to it.
+pub fn dequant_tensor_par(entry: &TensorEntry, bytes: &[u8], dst: &mut [f32], threads: usize) -> Result<(), String> {
+    let width = match entry.dtype {
+        TensorDtype::F32 => 4,
+        TensorDtype::F16 | TensorDtype::Bf16 => 2,
+        _ => return dequant_tensor(entry, bytes, dst),
+    };
+    let n: usize = entry.shape.iter().product();
+    if dst.len() != n || bytes.len() < n * width {
+        return dequant_tensor(entry, bytes, dst);
+    }
+    let per = n.div_ceil(threads.max(1)).max(1 << 16);
+    let dtype = entry.dtype;
+    std::thread::scope(|s| {
+        for (d, b) in dst.chunks_mut(per).zip(bytes[..n * width].chunks(per * width)) {
+            s.spawn(move || match dtype {
+                TensorDtype::F32 => d.iter_mut().zip(b.chunks_exact(4)).for_each(|(o, c)| *o = f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+                TensorDtype::F16 => d.iter_mut().zip(b.chunks_exact(2)).for_each(|(o, c)| *o = f16_to_f32(u16::from_le_bytes([c[0], c[1]]))),
+                _ => d.iter_mut().zip(b.chunks_exact(2)).for_each(|(o, c)| *o = bf16_to_f32(u16::from_le_bytes([c[0], c[1]]))),
+            });
+        }
+    });
+    Ok(())
+}
+
 pub fn dequant_tensor(entry: &TensorEntry, bytes: &[u8], dst: &mut [f32]) -> Result<(), String> {
     let n: usize = entry.shape.iter().product();
     if dst.len() != n {
@@ -1116,6 +1144,27 @@ pub fn bytes_per_weight(dtype: TensorDtype) -> f32 {
 #[cfg(test)]
 mod f16_tests {
     use super::{GROUP_SIZE, f16_to_f32, f32_to_f16, validate_payload};
+
+    /// The threaded element-wise dequant equals the serial one bit for bit.
+    #[test]
+    fn dequant_tensor_par_matches_serial() {
+        use crate::format::TensorEntry;
+        use crate::types::TensorDtype;
+        let n = 300_017usize;
+        let vals: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.37).sin() * 1e3).collect();
+        for dtype in [TensorDtype::F32, TensorDtype::F16, TensorDtype::Bf16] {
+            let bytes: Vec<u8> = match dtype {
+                TensorDtype::F32 => vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                TensorDtype::F16 => vals.iter().flat_map(|&v| f32_to_f16(v).to_le_bytes()).collect(),
+                _ => vals.iter().flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes()).collect(),
+            };
+            let e = TensorEntry { name: "t".into(), dtype, shape: vec![n], off: 0, nbytes: bytes.len() as u64, hash: 0, shard: 0 };
+            let (mut a, mut b) = (vec![0f32; n], vec![0f32; n]);
+            super::dequant_tensor(&e, &bytes, &mut a).unwrap();
+            super::dequant_tensor_par(&e, &bytes, &mut b, 7).unwrap();
+            assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "{dtype:?}");
+        }
+    }
 
     #[test]
     fn f16_subnormals_decode_correctly() {

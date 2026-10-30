@@ -2,6 +2,8 @@
 # Qwen3.8-27B -> 14B for coding with `cortiq compress`, on one RTX PRO 6000 (96 GB) pod.
 #
 #   check   environment: GPU, Vulkan, cgroup RAM/CPU, local disk
+#   run     the whole chain for $POINT in one command (S0–S6: illumination, fold, heal,
+#           q4tp, evaluation), GPU utilisation sampled every 5 s into gpu.csv
 #   gate    S0+S1 once, then fold WITHOUT heal at every size in $SIZES (S2, S3, S6 each);
 #           one illumination serves them all (Grams kept on disk)
 #   heal    heal + evaluate the chosen size ($POINT), then q4tp
@@ -54,7 +56,7 @@ compress() { # size extra...
   local t0=$SECONDS rc
   set +e
   "$BIN" compress "$HF" "$DATA" "$ROOT/$name.cmf" --size "$size" --work-dir "$w" \
-    --min-width 0.2 --keep-grams on ${ILLUM_TOKENS:+--illum-tokens "$ILLUM_TOKENS"} "$@" > "$ROOT/$name.log" 2>&1
+    --min-width 0.2 ${ILLUM_TOKENS:+--illum-tokens "$ILLUM_TOKENS"} "$@" > "$ROOT/$name.log" 2>&1
   rc=$?
   set -e
   grep -E "^S[0-6]:|PASS|FAIL|rror" "$ROOT/$name.log" | tail -12 | tee -a "$J"
@@ -73,9 +75,23 @@ check)
   ls "$HF" | head -5
   ls "$DATA"
   ;;
+run)
+  need_disk "${RUN_DISK_GB:-200}"
+  # appended: a resumed run keeps the earlier stages' samples
+  nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 5 >> "$ROOT/gpu.csv" &
+  mon=$!
+  log "run $POINT: heal ${HEAL_LOSS:-ce}, ${HEAL_EPOCHS} epochs, layers ${HEAL_LAYERS:-auto}"
+  rc=0
+  compress "$POINT" q4tp --keep-grams off --heal fcd --heal-loss "${HEAL_LOSS:-ce}" --heal-epochs "$HEAL_EPOCHS" \
+    --heal-layers "${HEAL_LAYERS:-auto}" --write-on-fail || rc=$?
+  kill $mon 2> /dev/null || true
+  grep -E "^\[S[0-9]\.[a-z]+\] (done|cached)" "$ROOT/p$POINT.work/JOURNAL.md" | tee -a "$J"
+  sed -n '/^| /p' "$ROOT/p$POINT.work/S6.eval/report.md" | tee -a "$J"
+  exit $rc
+  ;;
 gate)
   need_disk "$DISK_GB"
-  for s in "${sizes[@]}"; do compress "$s" --heal none; done
+  for s in "${sizes[@]}"; do compress "$s" --keep-grams on --heal none; done
   for s in "${sizes[@]}"; do
     sed -n '/^| /p' "$ROOT/p$s.work/S6.eval/report.md" | head -6 | sed "s/^/p$s: /" | tee -a "$J"
   done
@@ -84,8 +100,8 @@ gate)
 heal)
   need_disk "${HEAL_DISK_GB:-60}"
   # the files stay even when a gate fails (*.rejected.cmf): they are what gets analysed
-  compress "$POINT" --heal fcd --heal-epochs "$HEAL_EPOCHS" --write-on-fail
-  compress "$POINT" q4tp --heal fcd --heal-epochs "$HEAL_EPOCHS" --write-on-fail
+  compress "$POINT" --keep-grams on --heal fcd --heal-epochs "$HEAL_EPOCHS" --write-on-fail
+  compress "$POINT" q4tp --keep-grams on --heal fcd --heal-epochs "$HEAL_EPOCHS" --write-on-fail
   ;;
 clean)
   rm -rf "$ROOT/$base.work/S1.illuminate/grams"
@@ -94,5 +110,5 @@ clean)
   done
   df -h "$ROOT"
   ;;
-*) echo "phase: check | gate | heal | clean"; exit 2 ;;
+*) echo "phase: check | run | gate | heal | clean"; exit 2 ;;
 esac

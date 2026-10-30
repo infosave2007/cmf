@@ -975,22 +975,155 @@ pub(crate) fn parse_q2tp_rule_override(spec: &str) -> anyhow::Result<(String, Q2
 /// The calibration forward: one pipeline on the calibration model and the
 /// token windows of every source, run once per layer chunk.
 struct CalibRun {
-    pipe: cortiq_engine::Pipeline,
+    /// The runtime with its capture hook, unless the trainer forward runs it
+    /// (then built only if the trainer's pass cannot run).
+    pipe: Option<cortiq_engine::Pipeline>,
+    cal_path: String,
+    #[cfg(feature = "gpu")]
+    trainer: Option<TrainerCalib>,
     windows: Vec<Vec<u32>>,
     /// (file, share, tokens actually read) per source, for the provenance.
     used: Vec<(String, f64, usize)>,
 }
 
+/// GPTQ calibration on the trainer's forward of the f16 input: every
+/// linear's input Gram folded per window into the device accumulators the
+/// runtime hook fills, one forward a window. Through the runtime each prefill
+/// step pays a round trip per projection: Qwen3.8 14B on an RTX PRO 6000 took
+/// 10–20 s a 2048-token window at 6–9 % GPU. Taken when the runtime is on
+/// wgpu (the trainer shares its device), the Hessians accumulate there, the
+/// sources are teacher data and the trainer loads the model;
+/// `CMF_GPTQ_CALIB=runtime` keeps the runtime hook.
+#[cfg(feature = "gpu")]
+struct TrainerCalib {
+    model: cortiq_core::format::CmfModel,
+    net: cortiq_engine::nvg_train::Net,
+    work: cortiq_engine::nvg_train::Work,
+    t: usize,
+    pad: u32,
+}
+
+#[cfg(feature = "gpu")]
+impl TrainerCalib {
+    fn try_new(o: &GptqTiledOpts) -> Option<Self> {
+        use cortiq_engine::nvg_train as nt;
+        if std::env::var("CMF_GPTQ_CALIB").as_deref() == Ok("runtime")
+            || !cortiq_engine::gptq_capture::device_on()
+            || !cortiq_engine::gpu_wgpu::selected()
+            || !o.calib.iter().all(|s| is_tdata_spec(&s.path))
+        {
+            return None;
+        }
+        let c = cortiq_engine::gpu_wgpu::train_ops::dev()?;
+        let model = cortiq_core::format::CmfModel::open_sharded(o.input).ok()?;
+        let pad = model.header.tokenizer_config.as_ref().and_then(|t| t.eos_token_ids.first().copied()).unwrap_or(0);
+        let net = match nt::Net::load(c, &model, true, false, None) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("  calibration: the trainer does not take this model ({e}) — the runtime hook runs it");
+                return None;
+            }
+        };
+        let t = o.window.max(2).div_ceil(128) * 128;
+        let work = nt::Work::new(c, &net, 1, t);
+        Some(Self { model, net, work, t, pad })
+    }
+
+    fn capture(&self, windows: &[Vec<u32>], names: &std::collections::HashSet<String>, upto: usize, lazy: bool, t0: std::time::Instant) -> anyhow::Result<cortiq_engine::gptq_capture::Captured> {
+        use cortiq_engine::gptq_capture::{Captured, HessianAcc};
+        use std::collections::HashMap;
+        let c = cortiq_engine::gpu_wgpu::train_ops::dev().ok_or_else(|| anyhow::anyhow!("calibration: no wgpu GPU"))?;
+        // the tensors each input of a layer feeds (q/k/v and gate/up share theirs)
+        const ROLES: [(&str, &[&str]); 4] = [
+            (
+                "in",
+                &[
+                    "linear_attn.in_proj_qkv.weight",
+                    "linear_attn.in_proj_z.weight",
+                    "linear_attn.in_proj_a.weight",
+                    "linear_attn.in_proj_b.weight",
+                    "self_attn.q_proj.weight",
+                    "self_attn.k_proj.weight",
+                    "self_attn.v_proj.weight",
+                ],
+            ),
+            ("mixout", &["linear_attn.out_proj.weight", "self_attn.o_proj.weight"]),
+            ("mlp", &["mlp.gate_proj.weight", "mlp.up_proj.weight"]),
+            ("down", &["mlp.down_proj.weight"]),
+        ];
+        // (layer, role) → (owner, aliases, device Hessian, columns)
+        let mut slots: HashMap<(usize, &str), (String, Vec<String>, u64, usize)> = HashMap::new();
+        for l in 0..upto.min(self.net.geom.nl) {
+            for (role, tensors) in ROLES {
+                let present: Vec<String> = tensors.iter().map(|t| format!("model.layers.{l}.{t}")).filter(|n| names.contains(n)).collect();
+                let Some(owner) = present.first().cloned() else { continue };
+                let cols = self.model.tensor(&owner).map(|e| e.shape[1]).unwrap_or(0);
+                let id = cortiq_engine::gpu::gram_alloc(cols).ok_or_else(|| anyhow::anyhow!("calibration: no device Hessian for {owner} ({cols} columns)"))?;
+                slots.insert((l, role), (owner, present[1..].to_vec(), id, cols));
+            }
+        }
+        let (n_win, total) = (windows.len(), windows.iter().map(Vec::len).sum::<usize>());
+        let t_pass = std::time::Instant::now();
+        for (k, win) in windows.iter().enumerate() {
+            let mut ids = win.clone();
+            ids.resize(self.t, self.pad);
+            let ntok = win.len();
+            let mut bad: Option<String> = None;
+            let done = cortiq_engine::nvg_train::forward_linear_inputs(c, &self.net, &self.work, &ids, upto, &mut |l, ins| {
+                for &(role, buf, cols) in ins {
+                    let Some((owner, _, id, want)) = slots.get(&(l, role)) else { continue };
+                    if *want != cols {
+                        bad = Some(format!("{owner}: the input has {cols} columns, the tensor {want}"));
+                        return false;
+                    }
+                    if !cortiq_engine::gpu::gram_add_dev(*id, buf, ntok) {
+                        bad = Some(format!("{owner}: the device Hessian update failed"));
+                        return false;
+                    }
+                }
+                true
+            });
+            anyhow::ensure!(done.is_some(), "calibration window {k}: trainer forward failed{}", bad.map(|b| format!(" ({b})")).unwrap_or_default());
+            eprint!(
+                "\r  window {}/{n_win} (trainer)  {:.2}s/window  {:.0}s   ",
+                k + 1,
+                t_pass.elapsed().as_secs_f64() / (k + 1) as f64,
+                t0.elapsed().as_secs_f64()
+            );
+        }
+        eprintln!();
+        let (mut hess, mut alias, mut device) = (HashMap::new(), Vec::new(), HashMap::new());
+        for (_, (owner, aliases, id, cols)) in slots {
+            alias.extend(aliases.into_iter().map(|a| (a, owner.clone())));
+            let mut acc = HessianAcc { cols, h: Vec::new(), sumsq: Vec::new(), count: total };
+            if lazy {
+                device.insert(owner.clone(), id);
+            } else {
+                let h = cortiq_engine::gpu::gram_take(id).ok_or_else(|| anyhow::anyhow!("calibration: {owner}: the device Hessian read-back failed"))?;
+                acc.sumsq = (0..cols).map(|i| h[i * cols + i]).collect();
+                acc.h = h;
+            }
+            hess.insert(owner, acc);
+        }
+        Ok(Captured { hess, alias, broken: Vec::new(), device })
+    }
+}
+
 impl CalibRun {
     fn new(o: &GptqTiledOpts) -> anyhow::Result<Self> {
-        use cortiq_core::format::CmfModel;
-        use cortiq_engine::{Pipeline, SamplerConfig};
-        let cal_path = o.calib_model.unwrap_or(o.input);
-        eprintln!("calibration model {cal_path} …");
-        let cmodel = std::sync::Arc::new(CmfModel::open_sharded(cal_path)?);
-        let mut pipe = Pipeline::from_model(&cmodel, SamplerConfig::default())
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        pipe.set_confidence(false);
+        #[cfg(feature = "gpu")]
+        let trainer = TrainerCalib::try_new(o);
+        #[cfg(feature = "gpu")]
+        let on_trainer = trainer.is_some();
+        #[cfg(not(feature = "gpu"))]
+        let on_trainer = false;
+        let cal_path = o.calib_model.unwrap_or(o.input).to_string();
+        let pipe = if on_trainer {
+            eprintln!("calibration forward: the trainer on {} (f16 on the card, one forward a window)", o.input);
+            None
+        } else {
+            Some(Self::runtime(&cal_path)?)
+        };
         let window = o.window.max(2);
         let budgets = split_calib_budget(&o.calib, o.tokens.max(2));
         let (mut windows, mut used) = (Vec::new(), Vec::new());
@@ -1005,6 +1138,7 @@ impl CalibRun {
                 windows.extend(wins);
                 continue;
             }
+            let pipe = pipe.as_ref().expect("text calibration sources keep the runtime");
             let ids = calib_source_tokens(&src.path, want, &|t| pipe.tokenizer.encode(t))?;
             if ids.len() < want {
                 eprintln!("  note: {} holds only {} of its {want} tokens", src.path, ids.len());
@@ -1018,7 +1152,24 @@ impl CalibRun {
             "calibrating Hessians on {n} tokens ({} windows of ≤{window}) …",
             windows.len()
         );
-        Ok(Self { pipe, windows, used })
+        Ok(Self {
+            pipe,
+            cal_path,
+            #[cfg(feature = "gpu")]
+            trainer,
+            windows,
+            used,
+        })
+    }
+
+    fn runtime(cal_path: &str) -> anyhow::Result<cortiq_engine::Pipeline> {
+        use cortiq_core::format::CmfModel;
+        use cortiq_engine::{Pipeline, SamplerConfig};
+        eprintln!("calibration model {cal_path} …");
+        let cmodel = std::sync::Arc::new(CmfModel::open_sharded(cal_path)?);
+        let mut pipe = Pipeline::from_model(&cmodel, SamplerConfig::default()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        pipe.set_confidence(false);
+        Ok(pipe)
     }
 
     /// One forward over every window, layers `0..upto` only, with only
@@ -1030,6 +1181,22 @@ impl CalibRun {
         lazy: bool,
         t0: std::time::Instant,
     ) -> anyhow::Result<cortiq_engine::gptq_capture::Captured> {
+        #[cfg(feature = "gpu")]
+        if let Some(tc) = &self.trainer {
+            match tc.capture(&self.windows, &names, upto, lazy, t0) {
+                Ok(cap) => return Ok(cap),
+                Err(e) => {
+                    // its Hessians and weights leave the card before the runtime loads
+                    eprintln!("  calibration on the trainer failed ({e}) — the runtime hook runs it");
+                    cortiq_engine::gpu::gram_clear();
+                    self.trainer = None;
+                }
+            }
+        }
+        if self.pipe.is_none() {
+            self.pipe = Some(Self::runtime(&self.cal_path)?);
+        }
+        let pipe = self.pipe.as_mut().unwrap();
         cortiq_engine::gptq_capture::begin_filtered(true, move |n| names.contains(n));
         // Positions per batched prefill step: the per-op device GEMMs of a
         // GPU calibration pay one round trip per projection per step.
@@ -1040,7 +1207,7 @@ impl CalibRun {
         let n_win = self.windows.len();
         let t_pass = std::time::Instant::now();
         for (k, win) in self.windows.iter().enumerate() {
-            if let Err(e) = self.pipe.calib_forward(win, upto, chunk) {
+            if let Err(e) = pipe.calib_forward(win, upto, chunk) {
                 let _ = cortiq_engine::gptq_capture::end_shared();
                 anyhow::bail!("calibration window {k}: {e}");
             }
