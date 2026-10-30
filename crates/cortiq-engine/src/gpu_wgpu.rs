@@ -48,6 +48,8 @@ pub(crate) mod moe_q82;
 pub(crate) mod dense_batch;
 /// Gemma-4 on the batch graph (prompt ingest) and its q8_2f prompt GEMM.
 pub(crate) mod gemma_batch;
+/// d1's one-pass `set` forward over an LFM3 stack.
+pub(crate) mod lfm_set;
 /// Warp-per-row q4tp decode matvecs (bit-identical to the 16nl rows).
 pub(crate) mod amd_mv;
 pub(crate) mod dense_mv;

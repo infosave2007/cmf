@@ -4257,6 +4257,10 @@ pub fn lfm_set_forward(
         Backend::Metal => crate::gpu_metal::lfm_set::forward(
             model, layers, dims, final_norm, rows, t, state, group,
         ),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::lfm_set::forward(
+            model, layers, dims, final_norm, rows, t, state, group,
+        ),
         _ => None,
     }
 }
