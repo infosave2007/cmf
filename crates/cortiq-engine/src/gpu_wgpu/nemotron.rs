@@ -524,11 +524,17 @@ fn pipes(c: &Ctx) -> Option<&'static Pipes> {
 }
 
 fn build_pipes(c: &Ctx) -> Option<Pipes> {
-    if !c.device.features().contains(wgpu::Features::SUBGROUP)
-        || c.adapter_info.subgroup_min_size != 32
-        || c.adapter_info.subgroup_max_size != 32
-    {
-        tracing::warn!("nemotron frame: needs 32-lane subgroups");
+    // The kernels split a workgroup into 32-lane subgroups. Apple GPUs run
+    // compute in 32-wide SIMD groups, while wgpu's Metal backend reports a
+    // range around it, so Metal admits the range; elsewhere it must be 32.
+    let (lo, hi) = (
+        c.adapter_info.subgroup_min_size,
+        c.adapter_info.subgroup_max_size,
+    );
+    let sg32 = (lo == 32 && hi == 32)
+        || (c.adapter_info.backend == wgpu::Backend::Metal && lo <= 32 && hi >= 32);
+    if !c.device.features().contains(wgpu::Features::SUBGROUP) || !sg32 {
+        tracing::warn!("nemotron frame: needs 32-lane subgroups (adapter reports {lo}..{hi})");
         return None;
     }
     let scope = c.device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -712,6 +718,8 @@ struct Scratch {
     bi: wgpu::Buffer,
     ids: wgpu::Buffer,
     dummy: wgpu::Buffer,
+    /// never-written output slot of the unused q82 matrices
+    dummy_y: wgpu::Buffer,
     stage: wgpu::Buffer,
 }
 
@@ -810,8 +818,6 @@ impl NemoFrame {
             tracing::warn!("nemotron frame: geometry outside the kernels");
             return None;
         }
-        let q82 = moe_r4::pipes(c)?;
-        q82.q82sg.as_ref()?;
         let p = pipes(c)?;
         // Uploads go straight from the mmap through `write_buffer`, flushed
         // every ~1 GB so the staging copies never pile up for the whole
@@ -966,6 +972,7 @@ impl NemoFrame {
             bi: zeros("nm-bi", blocks_ax),
             ids: zeros("nm-ids", STAGE_IDS),
             dummy: zeros("nm-dummy", 4),
+            dummy_y: zeros("nm-dummy-y", 4),
             stage: c.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("nm-stage"),
                 size: (d.vocab.max(STAGE_IDS) * 4) as u64,
@@ -1126,7 +1133,6 @@ impl NemoFrame {
         mats: &[(&wgpu::Buffer, &wgpu::Buffer, usize)],
         act: u32,
     ) -> Op {
-        let ps = moe_r4::pipes(self.c).expect("q82 pipes");
         let pipe: &'static wgpu::ComputePipeline = &self.p.q82;
         let rows_max = mats.iter().map(|m| m.2).max().unwrap_or(0);
         let rpw: usize = if rows_max >= 32768 { 4 } else { 2 };
@@ -1143,7 +1149,7 @@ impl NemoFrame {
             0,
         ]);
         let w = |i: usize| mats.get(i).map_or(mats[0].0, |m| m.0);
-        let y = |i: usize| mats.get(i).map_or(&ps.dummy_y, |m| m.1);
+        let y = |i: usize| mats.get(i).map_or(&self.s.dummy_y, |m| m.1);
         let bg = self.bind(pipe, &[w(0), w(1), w(2), x, y(0), y(1), y(2)], &u);
         let groups: usize = (0..3).map(|i| r(i).div_ceil(per)).sum();
         Op::Fixed {
