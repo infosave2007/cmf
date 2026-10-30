@@ -11,6 +11,69 @@ framework runtime.
 [![docs.rs](https://img.shields.io/docsrs/cortiq-core)](https://docs.rs/cortiq-core)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
+## CMF against other formats
+
+The table scores the file format and its reference runtime out of 100. Each
+criterion gets 0–100 and a weight. The weights are ours and printed, so you can
+recompute the totals for your own needs. Ecosystem size (how many models are
+already published, how many third-party tools exist) is not a property of the
+file, so it is not scored.
+
+| criterion | weight | CMF | GGUF | safetensors | ONNX | MLX | EXL3 | PyTorch `.pt` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **Quantization range**: encodings the format itself defines, from 16 bits to below 1 bit | 15 | **100** | 90 | 30 | 50 | 60 | 70 | 25 |
+| **Mixed codecs in one file**: any codec on any tensor, re-quantization in place | 10 | **100** | 90 | 50 | 60 | 70 | 75 | 30 |
+| **Empty weights take no space**: pruned neurons and experts are not stored, every layer keeps its own width | 15 | **100** | 45 | 30 | 60 | 25 | 25 | 30 |
+| **Flexibility, many tasks on one base**: task masks, skills and expert routing inside one file | 15 | **100** | 40 | 35 | 20 | 30 | 20 | 35 |
+| **Self-contained file**: tokenizer, chat template, multi-component pipelines | 10 | **100** | 80 | 30 | 45 | 30 | 25 | 25 |
+| **Integrity and authenticity**: content hashes, verification, signature | 10 | **100** | 30 | 55 | 35 | 50 | 50 | 10 |
+| **Zero-copy, lazy loading**: mmap, the GPU reads the mapped file, experts on demand | 10 | **100** | 90 | 85 | 40 | 80 | 60 | 40 |
+| **Safe evolution**: an old reader refuses what it cannot run | 5 | **100** | 70 | 60 | 85 | 50 | 40 | 40 |
+| **Standalone runtime**: no Python or ML framework, CPU and GPU | 10 | 90 | **100** | 30 | 70 | 50 | 15 | 0 |
+| **Weighted total** | **100** | **99** | 69 | 42 | 49 | 48 | 42 | 26 |
+
+The evidence behind the CMF column:
+
+- **17 weight encodings in one directory.**
+  - Float: f32, f16, bf16.
+  - 8-bit: `q8_row`, and `q8_2f` with row and column scales.
+  - 4-bit: `q4_block`, `q4t`, `q4tp` (predicted scales, 4.17 bits/weight), and `mxfp4` (re-packs OCP MXFP4 checkpoints without loss).
+  - Variable 3–8 bits: `vbit` and `vbit_ro`.
+  - 2-bit: `q2tp`.
+  - Ternary: `q1t`.
+  - Binary: `q1`, `q1g` (1.125 bits/weight), and `q1s` (binary plus outliers).
+  - Below 1 bit/weight: binary low-rank `blr`.
+- **Any encoding on any tensor.** Every directory entry carries its own dtype.
+  `--tensor-quant PATTERN=CODEC` picks codecs at conversion. `cortiq requant`
+  changes them in an existing file without going back to the source checkpoint.
+- **Empty weights take no space.** A pruned FFN neuron or MoE expert is neither
+  stored nor computed. Each layer keeps its own width and its own expert count,
+  because the reader takes sizes from tensor shapes, not from one global number
+  ([spec §11](docs/CMF_V2_SPEC.md)). Experts and skills the current task does
+  not use are never read from disk.
+- **Many tasks on one base.**
+  - A task mask costs 1 bit per FFN neuron, attention head, layer and expert.
+  - Skills are replacement tensors in the same file and take memory only when used.
+  - A skill can also ship as a separate small file, bound to its base by hash.
+- **One file, pipelines included.** The tokenizer and chat template are stored
+  in the file. Image-editing models (transformer, text encoder, VAE and
+  scheduler), video models and speech models are single files too.
+- **Integrity.** Every tensor and every section has a hash. `cortiq verify`
+  checks the whole chain, and an optional Ed25519 signature comes from
+  `cortiq sign`. A damaged file refuses to open instead of producing garbage.
+- **Loading.**
+  - Weights are page-aligned and tensors 64-byte aligned, and the file is memory-mapped.
+  - On Apple silicon the GPU reads tensors straight from the mapping, with no copy.
+  - MoE experts are paged in when the router picks them.
+- **Safe evolution.** Every new capability gets a required-feature bit. A reader
+  that does not know a bit refuses the file instead of guessing.
+- **Runtime.** Written in Rust with no Python, it runs on CPU, Metal and
+  Vulkan/DX12. A separate Python reader (stdlib + numpy) is also provided.
+  `cortiq import-gguf` converts GGUF files directly. CMF scores 90 rather than
+  100 in the last row because llama.cpp also has CUDA, ROCm and SYCL back ends.
+
+The criteria, and the reasoning behind every other format's score, are in
+[docs/COMPARISON.md](docs/COMPARISON.md).
 
 ## Decisions on Metal and Vulkan
 
