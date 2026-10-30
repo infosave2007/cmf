@@ -8794,6 +8794,27 @@ pub fn run_convert_multi_excluding(
         progress(1.0);
         return Ok(());
     }
+    // Nemotron 3.5 Transcribe: NeMo key layout, audio towers + Nemotron-H.
+    if let Some(dir) = Some(Path::new(model)).filter(|d| {
+        fs::read(d.join("config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .is_some_and(|c| crate::nemotron_pack::detect(&c))
+    }) {
+        anyhow::ensure!(
+            defrag.is_none()
+                && o1_hint.is_none()
+                && !resume
+                && towers == MimoTowers::TextOnly
+                && exclusion.is_empty(),
+            "nemotron_transcribe: --defrag, --o1, --resume, --mimo-towers and --exclude-tensors do not apply"
+        );
+        for (q, path) in outputs {
+            crate::nemotron_pack::convert(dir, q, path)?;
+        }
+        progress(1.0);
+        return Ok(());
+    }
     for (i, (_, path)) in outputs.iter().enumerate() {
         anyhow::ensure!(!path.trim().is_empty(), "output path {} is empty", i + 1);
         anyhow::ensure!(

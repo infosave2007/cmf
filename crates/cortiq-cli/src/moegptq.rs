@@ -198,6 +198,9 @@ enum Family {
 }
 
 pub fn run(o: &MoeOpts) -> anyhow::Result<()> {
+    if CmfModel::open(o.calib_model).is_ok_and(|m| m.header.arch.arch_name == cortiq_engine::nemotron_asr::ARCH_NAME) {
+        return crate::nemotron_gptq::run(o);
+    }
     let t0 = Instant::now();
     let codec = Codec::parse(o.codec)?;
     anyhow::ensure!(!(o.in_place && !o.output.is_empty()), "--output and --in-place are exclusive (--in-place writes into the calibration file)");
