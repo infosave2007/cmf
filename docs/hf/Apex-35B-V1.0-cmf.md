@@ -146,7 +146,8 @@ substring) picks one. On headless Linux install
 The model supports 262,144 tokens; the KV cache holds 32,768 by default.
 `CMF_MAX_SEQ=262144` raises it. The ten attention layers keep about 40 KB of
 KV per token (1.3 GB at 32k, 10.5 GB at 262k); the Gated DeltaNet layers keep
-a fixed state.
+a fixed state. At a 65,536-token prompt (`CMF_MAX_SEQ=131072`, A40,
+`q4tp-v2`) the prompt reads at 254 tok/s and decoding runs at 28 tok/s.
 
 ## Verify the download
 
