@@ -202,6 +202,27 @@ Metal/wgpu; `CMF_GPU=0` принудительно включает CPU. По у
 полный контекст 30 секунд; экспериментальный `CMF_WHISPER_TRIM_ENCODER=1`
 может повлиять на качество распознавания.
 
+### Nemotron 3.5 Transcribe (0.8.47)
+
+`cortiq-cli` 0.8.47 целиком на Rust исполняет [NVIDIA Nemotron 3.5 Transcribe
+30B-A4B](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B):
+мел-фронтенд, ASR-энкодер, диаризацию Sortformer с кэшем спикеров, декодер
+Mamba-2/внимание/MoE и пословные таймкоды. Готовые файлы — на
+[Hugging Face](https://huggingface.co/infosave/Nemotron-3.5-Transcribe-30B-A4B-cmf):
+
+```sh
+cortiq transcribe nemotron-3.5-transcribe-30b-a4b-q4tp.cmf встреча.wav
+cortiq transcribe nemotron-3.5-transcribe-30b-a4b-q4tp.cmf встреча.wav --timestamps
+cortiq transcribe nemotron-3.5-transcribe-30b-a4b-q4tp.cmf a.wav b.wav --stats
+```
+
+`--prompt` принимает инструкции модели (чистый текст, метки спикеров `<spk:N>`,
+перевод). На GPU декодер работает резидентным кадром со спекулятивным декодом
+слоем MTP; карта, на которую не помещаются все эксперты, держит самых
+используемых, остальных считает CPU (`CMF_NEMO_EXPERT_GB` задаёт бюджет).
+`cortiq convert --model <каталог чекпоинта>` упаковывает чекпоинт NeMo
+(`--quant q8_2f | q4tp | q2tp`).
+
 ### Многоязычный TTS Phonon 40M (0.8.36)
 
 Команды `phonon-pack` и `tts` добавляются в **cortiq-cli 0.8.36**. В уже

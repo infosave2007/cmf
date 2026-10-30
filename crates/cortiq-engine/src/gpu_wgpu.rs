@@ -29,6 +29,13 @@ pub(crate) mod qi21_vae;
 pub mod mimo_bank;
 /// Qwen3.8-Flash-Next device-resident token path.
 pub(crate) mod qwen4;
+/// Nemotron-H (Nemotron 3.5 Transcribe) device-resident decode frame.
+pub mod nemotron;
+/// Nemotron 3.5 Transcribe audio towers on the device.
+pub mod nemotron_audio;
+/// Batched prefill kernels of the Nemotron-H frame.
+pub(crate) mod nemotron_prefill;
+pub(crate) mod nemotron_verify;
 /// System-memory buffers the card copies from (Vulkan).
 pub mod host_mem;
 /// Row-blocked decode kernels for the generic q4tp MoE graph block.
