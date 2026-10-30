@@ -92,6 +92,10 @@ for text:
 
 A 640×480 image is 300 language tokens, 1296×864 is 1080; the encoder runs on
 the CPU in float32 (the attention on the GPU), which is what keeps it exact.
+
+Apple M4 (Metal), cortiq 0.8.50: `q4tp` decodes 82 tok/s; the vision encoder
+takes 0.46 s for a 640×480 image and 1.6 s for 1296×864 (Accelerate GEMMs,
+Metal attention).
 `--image-max-pixels N` caps the resolution before patching (fewer tokens, a
 faster encoder).
 
@@ -137,8 +141,7 @@ included.
 **NVIDIA / AMD / Intel (Vulkan, DX12).** Both files fit any card with 2 GB of
 free memory; on headless Linux install
 `libvulkan1 libglvnd0 libegl1 libgl1 libglx0` and set `XDG_RUNTIME_DIR=/tmp`.
-**CPU only:** `CMF_GPU=0`. Apple silicon has not been measured with this model
-yet.
+**Apple silicon:** the Metal backend is the default. **CPU only:** `CMF_GPU=0`.
 
 ## Verify the download
 
@@ -199,8 +202,8 @@ cortiq run lfm3-vl-2b-q8_2f.cmf --image photo.jpg --prompt "Опиши это и
 изображение 640×480 (300 токенов) за 3 с. `--image` можно повторять;
 `cortiq serve` принимает изображения в формате OpenAI (`image_url`: URL, `data:`
 или локальный путь). Видео: `--video` (файл Y4M или каталог кадров с
-`--video-fps`), 2 кадра в секунду, как у процессора Liquid. Apple silicon с этой
-моделью пока не измерялся. Файлы — изменённая форма LFM3-VL-2B от Liquid AI по
+`--video-fps`), 2 кадра в секунду, как у процессора Liquid. На Apple M4 (Metal,
+cortiq 0.8.50) `q4tp` генерирует 82 ток/с, энкодер обрабатывает 640×480 за 0.46 с. Файлы — изменённая форма LFM3-VL-2B от Liquid AI по
 LFM Open License v1.0 (копия — [LICENSE](LICENSE)); коммерческое использование
 организацией с годовой выручкой от 10 млн долларов США лицензией не покрывается.
 
@@ -226,6 +229,7 @@ cortiq run lfm3-vl-2b-q8_2f.cmf --image photo.jpg --prompt "描述这张图片�
 的向量与 Transformers 一致（每行余弦相似度高于 0.9999）。NVIDIA A40（Vulkan）上
 `q8_2f` 生成 167 token/s，640×480 图像（300 个 token）编码约 3 s。`cortiq serve`
 支持 OpenAI 格式的图像输入；视频用 `--video`（Y4M 文件或帧目录加 `--video-fps`），
-按每秒 2 帧采样。Apple silicon 尚未测量。这些文件是
+按每秒 2 帧采样。Apple M4（Metal，cortiq 0.8.50）上 `q4tp` 生成 82 token/s，
+640×480 图像编码 0.46 s。这些文件是
 Liquid AI LFM3-VL-2B 的修改形式，仍受 LFM Open License v1.0 约束（副本见
 [LICENSE](LICENSE)）；年收入 1000 万美元及以上的实体进行商业使用不在许可范围内。
