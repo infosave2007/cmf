@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.49] — 2026-10-30
+
+### Added
+- Liquid AI LFM3 (`lfm3`, `Lfm3ForCausalLM`): LFM2's gated short convolution
+  (now 7 taps wide) beside full and sliding-window (256) attention layers,
+  RoPE per layer type, Q/K norms, a sigmoid output gate per head and sandwich
+  norms. The converter maps the names onto the canonical layout — the four
+  norms onto the loader's sandwich path, `self_attn.gate_proj` onto the
+  per-head `g_proj` gate Spark-X2.5 already uses — and refuses a scaled RoPE
+  profile, `use_sandwich_norm: false` and a conv bias. The full layers'
+  partial rotary keeps the frequency progression of the whole head and zeroes
+  the tail (`θ^(-2i/128)` for the first 32 of 64 frequencies, `rotate_half`
+  pairing dims i and i+64), which is Gemma-4's proportional table:
+  `global_partial_rotary_factor` now also applies without a `global_head_dim`,
+  the head rotating whole with the zero-tail table. An f16 conversion of
+  LFM3-1.7B matches Transformers float32 on the CPU over 4096 wikitext-2
+  positions (perplexity 13.186 against 13.186, top-1 100 %, mean |ΔNLL|
+  0.0000), and greedy chat continuations are text-identical. The wgpu
+  whole-token graph takes the model.
+- LFM3-1.7B and LFM3-1.7B-Base in CMF (`q8_2f`, `q4tp`) on Hugging Face:
+  [infosave/LFM3-1.7B-cmf](https://huggingface.co/infosave/LFM3-1.7B-cmf),
+  [infosave/LFM3-1.7B-Base-cmf](https://huggingface.co/infosave/LFM3-1.7B-Base-cmf),
+  card sources `docs/hf/LFM3-1.7B-cmf.md`, `docs/hf/LFM3-1.7B-Base-cmf.md`.
+  `scripts/lfm3/` holds the Transformers reference, the per-position
+  comparison, chat parity, the tool-call test and the pod benchmarks. Against
+  the bf16 checkpoint in float32 over the same wikitext-2 tokens: LFM3-1.7B
+  q8_2f 13.14 (top-1 97.7 %), q4tp 15.15 (80.4 %), original 13.10; the Base
+  q8_2f 9.556 (98.6 %), q4tp 9.984 (87.4 %), original 9.556. A40 (Vulkan):
+  q8_2f decodes at 166 tok/s and reads a 4096-token prompt at 623 tok/s, q4tp
+  231 and 574.
+
+### Changed
+- The wgpu decode graph admits sandwich norms with plain x̂·w weights (LFM3);
+  Gemma-2/3's (1+w) norms and a layer scale stay Gemma-4's.
+- A dense stack whose mixers are full attention or the short convolution
+  (LFM2, LFM3) reads the prompt on a discrete card in 512-position chunks, as
+  a plain dense stack already did, instead of 48: the host-driven chunk walk
+  submits every GEMM separately and left the card idle. LFM3-1.7B on an A40, a
+  4096-token prompt, three interleaved runs: q8_2f 150 → 618 tok/s, q4tp 427 →
+  603 tok/s.
+- LFM3's 5 sliding-window layers keep only the rows their 256-token window can
+  still read (the trim Spark-X2.5 has had since 0.8.12): KV at 16k 739 → 410 MB;
+  perplexity and greedy output on a 3.5k-token prompt identical with
+  `CMF_SWA_TRIM=0`, speed unchanged.
+
+### Fixed
+- Chat templates now see `bos_token`, as under Transformers'
+  `apply_chat_template`. LFM2, LFM2.5 and LFM3 templates open with
+  `{{- bos_token -}}` while their tokenizers add no BOS of their own, so every
+  chat prompt of those models was rendered without it (LFM3-1.7B: 21 ids
+  against Transformers' 22, and a different first answer token). A tokenizer
+  that prepends BOS itself still gets one.
+- The CPU prompt path skipped the post-mixer norm of short-convolution layers
+  (the batched arm; decode applied it). No LFM2 file carries one.
+
 ## [0.8.48] — 2026-10-30
 
 ### Changed

@@ -104,6 +104,21 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Liquid AI LFM3（0.8.49）
+
+[LFM3-1.7B](https://huggingface.co/infosave/LFM3-1.7B-cmf) 是 Liquid AI 面向本地
+智能体与工具调用的三混合模型（短卷积、全注意力与滑动窗口注意力，262k 上下文），
+另提供其预训练 [Base](https://huggingface.co/infosave/LFM3-1.7B-Base-cmf)：
+
+```sh
+hf download infosave/LFM3-1.7B-cmf lfm3-1.7b-q8_2f.cmf --local-dir .
+cortiq run lfm3-1.7b-q8_2f.cmf --prompt "写一个合并两个有序列表的 Python 函数。" --max-tokens 2048
+```
+
+转换结果与 Transformers float32 逐位置一致。在 NVIDIA A40 上，8 位文件生成
+166 token/s，4 位文件 231 token/s；4096 token 提示词读取约 600 token/s。同一版本
+还向对话模板传入 `bos_token`，此前 LFM2/LFM2.5/LFM3 的提示词缺少它。
+
 ## Apex-35B-V1.0 与更快的 Qwen3.5-MoE 图（0.8.48）
 
 [Apex-35B-V1.0](https://huggingface.co/infosave/Apex-35B-V1.0-cmf) 是基于

@@ -114,6 +114,23 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Liquid AI LFM3 (0.8.49)
+
+[LFM3-1.7B](https://huggingface.co/infosave/LFM3-1.7B-cmf), Liquid AI's
+tri-hybrid model for local agents and tool calling (short convolutions, full
+and sliding-window attention, 262k context), and its pre-trained
+[Base](https://huggingface.co/infosave/LFM3-1.7B-Base-cmf):
+
+```sh
+hf download infosave/LFM3-1.7B-cmf lfm3-1.7b-q8_2f.cmf --local-dir .
+cortiq run lfm3-1.7b-q8_2f.cmf --prompt "Write a Python function that merges two sorted lists." --max-tokens 2048
+```
+
+The conversion matches Transformers float32 position for position. On an
+NVIDIA A40 the 8-bit file decodes at 166 tok/s and the 4-bit one at 231 tok/s;
+a 4096-token prompt reads at ~600 tok/s. The same release passes `bos_token` to
+chat templates, which LFM2/LFM2.5/LFM3 prompts were missing.
+
 ## Apex-35B-V1.0 and faster Qwen3.5-MoE graphs (0.8.48)
 
 [Apex-35B-V1.0](https://huggingface.co/infosave/Apex-35B-V1.0-cmf), an agentic

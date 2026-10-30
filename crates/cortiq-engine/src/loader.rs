@@ -2723,15 +2723,16 @@ impl Pipeline {
         if arch.arch_name == "mimo_v2" {
             pipeline.mimo_mtp = crate::pipeline::mimo_mtp::load_for(model, &arch)?;
         }
-        // Spark-X2.5's sliding layers (27 of the 4B's 36, window 512) keep
-        // only the rows their window can still read: 64 rows of rollback
-        // slack, the cut on a 64-row grid so the Metal chunk GEMMs keep
-        // their K-tile partition (see `LayerKvCache::trim_window`). Other
-        // windowed architectures keep every row until one is measured.
+        // Spark-X2.5's sliding layers (27 of the 4B's 36, window 512) and
+        // LFM3's (5 of 11 attention layers, window 256) keep only the rows
+        // their window can still read: 64 rows of rollback slack, the cut
+        // on a 64-row grid so the Metal chunk GEMMs keep their K-tile
+        // partition (see `LayerKvCache::trim_window`). Other windowed
+        // architectures keep every row until one is measured.
         // Off with a speculation head (its verify paths read row counts as
         // positions) and under CMF_ATTN_DUMP (the dump header assumes row
         // = position). CMF_SWA_TRIM=0 turns it off for an A/B.
-        pipeline.swa_trim = (arch.arch_name == "spark2_5"
+        pipeline.swa_trim = (matches!(arch.arch_name.as_str(), "spark2_5" | "lfm3")
             && pipeline.swa.is_some()
             && pipeline.mtp.is_none()
             && pipeline.mimo_mtp.is_none()
