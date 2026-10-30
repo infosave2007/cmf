@@ -1,5 +1,7 @@
 # Независимая компактация FFN у MTP-драфта
 
+*Языки: [English](MTP_COMPACTION.md) · **Русский** · [中文](MTP_COMPACTION.zh.md)*
+
 `cortiq mtp-compact` уменьшает **только** dense-FFN слои MTP-драфта. Основной
 backbone не переупаковывается: в плане явно записано `trunk.mode = preserve`.
 Это позволяет отдельно подобрать размер draft-слоёв и затем измерить, окупает
@@ -197,7 +199,7 @@ sum_teacher_forced((activation(gate, up))^2) * down_proj_column_l2_squared
 отдельные directory hash и merged `trunk_hash` main/draft, order каналов и
 долю сохранённой энергии — храните его рядом с артефактом.
 `trunk_hash` покрывает все merged shard tensor entries и их payload hashes.
-При `mtp.mode=compact` `tube bake` сверяет обязательный
+При `mtp.mode=compact` `cortiq tube-bake` сверяет обязательный
 `source_draft_directory_hash` и, в новых plan, `source_draft_trunk_hash` с
 входным draft; калиброванный plan нельзя случайно применить к другому
 same-shape sidecar или подменённому позднему shard.
@@ -472,7 +474,7 @@ CMF_MTP_PAIR=1` для source и candidate против их собственн�
 первом несовпадении оставьте переменную выключенной. Этот эксперимент не
 заменяет Metal qualification ниже.
 
-У GDN-гибридов host pair дополнительно требует `CMF_MTP=1`, потому что его
+У GDN-гибридов host pair дополнительно требует явного `CMF_MTP=1`, потому что его
 рекуррентная часть не параллелится и по умолчанию исключена из этого
 эксперимента; это не рекомендуемый speed preset.
 

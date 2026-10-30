@@ -140,7 +140,7 @@ CLI 还提供 `info`、`bench`、`ppl`、`serve`、`skill`、`moe-mask`、`moe-d
 | `q1`、`q1t`、`q1s` | 训练二值或实验性的三值/PTQ 路径 |
 
 实验性低比特路径见 [Q1T/PTQ](docs/Q1T_PTQ.md)，编码支持矩阵见
-[量化覆盖表](docs/QUANT_COVERAGE.ru.md)（俄文）。
+[量化覆盖表](docs/QUANT_COVERAGE.zh.md)。
 
 ## 运行时能力
 
@@ -178,12 +178,14 @@ CLI 还提供 `info`、`bench`、`ppl`、`serve`、`skill`、`moe-mask`、`moe-d
   [方法文章](docs/research/TASK_COMPRESSION_ARTICLE.zh.md)与
   [Qwen3.8-27B → 14B 运行记录](docs/research/QWEN38_27B_TASK_COMPRESSION.zh.md)。
 - [GPU 内核配方](docs/GPU_KERNEL_RECIPES.md) — 后端测量。
-- [多 GPU](docs/MULTI_GPU.md) 与[移动端切分](docs/MOBILE_SPLIT.ru.md)（俄文）。
+- [多 GPU](docs/MULTI_GPU.md) 与[移动端切分](docs/MOBILE_SPLIT.zh.md)。
 - [FCD 恢复](docs/RUST_FCD.md) 与[低比特 PTQ](docs/Q1T_PTQ.md)。
+- [MTP FFN 压缩](docs/MTP_COMPACTION.zh.md) — MTP 草稿 FFN 的独立校准与物理
+  缩小。
 - [Qwen Image 编辑](docs/QWEN_IMAGE.md) — 单文件运行和独立组件暂存。
 - [模型卡片和转换说明](docs/hf/README.md)。
-- [Cortiq Spectra](docs/SPECTRA.ru.md) — 双能 X 射线的确定性 CPU 流式着色、
-  扫描仪配置、拒绝掩码与测量限制（俄文）。
+- [Cortiq Spectra](docs/SPECTRA.zh.md) — 双能 X 射线的确定性 CPU 流式着色、
+  扫描仪配置、拒绝掩码与测量限制。
 
 ## 从源码构建
 
