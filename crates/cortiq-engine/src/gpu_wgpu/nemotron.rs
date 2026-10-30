@@ -1187,6 +1187,9 @@ enum Op {
 const MISS: u32 = u32::MAX;
 /// Positions of one verify pass (the token + its drafts).
 pub const VR_MAX: usize = 4;
+/// Draft-layer plan ops that produce a position's K/V (the two fusion
+/// halves and q/k/v): all a history position needs.
+const MTP_KV_END: usize = 3;
 const STAGE_IDS: usize = 64;
 const META_WORDS: usize = 8;
 
@@ -2407,7 +2410,9 @@ impl NemoFrame {
             c.queue.write_buffer(&m.e, 0, bytemuck::cast_slice(e));
             self.write_meta(pos, None);
             let last = i + 1 == steps.len();
-            let end = if last && draft { self.mtp_plan.len() } else { self.mtp_head_at };
+            // only the drafting step needs the layer's output; the others
+            // just extend the draft KV
+            let end = if last && draft { self.mtp_plan.len() } else { MTP_KV_END };
             let mut enc = c
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("nm-mtp") });
@@ -4047,7 +4052,8 @@ impl NemoFrame {
                 label: Some("nm-mtp-history"),
                 timestamp_writes: None,
             });
-            self.encode_mtp_ops(&mut pass, 0, self.mtp_head_at, p as usize);
+            // a history position only feeds the draft KV: fusion + q/k/v
+            self.encode_mtp_ops(&mut pass, 0, MTP_KV_END, p as usize);
         }
     }
 
