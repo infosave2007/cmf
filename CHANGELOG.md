@@ -5,6 +5,101 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.45] — 2026-10-30
+
+### Changed
+- GPTQ calibration (`quantize-gptq`, `compress` S5) runs on the trainer's
+  forward of the f16 input when the runtime is on wgpu: every linear's input
+  Gram is folded per window into the same device accumulators, one forward a
+  window. Through the runtime each prefill step paid a round trip per
+  projection — Qwen3.8 14B on an RTX PRO 6000 took 10–20 s a 2048-token
+  window at 6–9 % GPU; on Qwen3.5-0.8B the trainer takes 0.16 s a window
+  against 1.0 s, with the same q4tp ppl (2.388 vs 2.387). A trainer pass that
+  cannot run (memory, an unsupported model) falls back to the runtime hook;
+  `CMF_GPTQ_CALIB=runtime` keeps it.
+- `compress` S6 scores every test record on the device: the window is sized
+  by the card (the attention's score blocks and the GDN tape's buffers must
+  fit one storage binding — 4608 tokens for Qwen3.8's 24 heads), records are
+  bucketed by length, and a longer record is scored on its first window
+  (`CMF_COMPRESS_EVAL_LONG=runtime` scores it whole on the runtime). Records
+  past 4096 tokens went to the runtime's ~200 tok/s: 63 % of the 27B's test
+  tokens, 40+ min of S6, now 7 min.
+- `compress` S1 writes the kept Grams on a second thread (155 GB on a 27B;
+  written inline they left the device idle about half of S1), S3 reads them
+  one layer ahead and writes the f16 fold and its q8_2f copy side by side.
+- Trainer loads (illumination, teacher, heal student, GPTQ calibration)
+  convert and transpose the weights over all threads
+  (`quant::dequant_tensor_par`): a single loop spent minutes on a 27B.
+  Bit-identical to the serial path (tests), and the 0.8B illumination and
+  fold reproduce the reference run bit for bit. Device matrices upload their
+  f64 sources the same way.
+
+### Added
+- `cortiq mtp-heal`: an MTP draft trained on its own compressed trunk. The
+  trunk runs once on the trainer (its hidden rows and next-token top-k per
+  window); the draft's block learns, as a one-layer model from its own input
+  `eh_proj·[enorm(e); hnorm(h)]`, the trunk's distribution one position ahead
+  (KL, best held-out checkpoint, written back into `model.mtp.*`). The round
+  chains the draft — every step after the first reads the block's own
+  output — so every step of the chain is trained (`--chain`, default 3; the
+  later steps' inputs are rebuilt from the current weights every
+  `--refresh` steps). Qwen3.8 27B → 14B on an RTX PRO 6000: the source's
+  draft accepted 54 % on the compressed trunk and speculation did not pay
+  (78 against 77 tok/s plain); trained 38 min, the chain's KL 1.20 → 0.44,
+  87 % accepted at depth 2 and 89 against 77 tok/s (`CMF_GRAPH_SPEC_K=2`;
+  the adaptive depth climbs to 3–5 and keeps 82). A ridge map of the draft's
+  input onto the source's hidden rows and a least-squares refit of its
+  read-out cut their errors and moved nothing (56/48, 48/52 %).
+- `compress --mtp-heal auto|on|off` (default auto: a canonical draft and the
+  device trainer): S5 runs that training on the finished file, initialised
+  from the source's f16 draft (`--mtp-heal-epochs`, default 2).
+- `cortiq dtgma-bake`: a task's skill baked into a model with DTG-MA
+  (Patent 2) — soft gates on the FFN neurons of the deep layers, trained
+  with the task's LM loss at a small constant L1 (the held-out best, no
+  sparsity target) and folded into `down_proj`; the width is kept. The
+  device mask trainer takes a gated tail (`--from-layer`) with the layers
+  below run once and cached on the host (a 27B's full backward, f16 planes
+  both ways, does not fit 96 GB) and scores the soft gates. Qwen3.8-27B,
+  layers 32–63, 300 steps (25 min): held-out 0.279 → 0.266, test NLL 0.117
+  → 0.110. Baked before `compress`, the gain does not survive the fold and
+  the heal: 14B final 0.398 against 0.396 (Qwen3.5-0.8B: 0.649 against
+  0.646).
+- `compress --heal-patience N` (default 6): the device heal stops once the
+  held-out loss has not improved for N evaluations. Qwen3.8 14B, CE, 2 epochs:
+  the best checkpoint was the first epoch's last, the second (12 min on the
+  pod) never beat it. The genesis schedule still runs every epoch.
+- `compress --heal-val-windows N` (default 32, 0 = all): the device heal's
+  held-out loss reads N evenly spread val windows. It only ranks the
+  student's checkpoints on fixed windows; on Qwen3.8 14B the 31 checks over
+  all 98 windows cost about a third of the heal. Qwen3.5-0.8B, 3 epochs: 4
+  of its 11 val windows picked the same checkpoint (step 75) as all 11, and
+  the final file scored the same test NLL (0.5001).
+- `compress --mtp-keep F` (default off; `--mtp-records`): S5 calibrates the
+  MTP draft through the finished model on the task's train records and
+  compacts its FFN. On Qwen3.8 27B → 14B the draft accepts 54 % with or
+  without it and the decode speed is the same, so it stays opt-in. S6
+  reports the draft's acceptance, and `cortiq run` prints it under the speed
+  line.
+- `mtp-compact` runs the trunk as one prefill a chunk (on the device where
+  there is one) instead of one position at a time on the host, and measures
+  the draft FFN's inputs in batches without running the FFN arm: 100 against
+  57 tok/s on the 14B (the draft's own row-by-row replay on the host is the
+  rest); the kept channels match the host path's to 99.94 % (the device's
+  arithmetic in the trunk reorders near-ties).
+
+### Fixed
+- `compress --heal-layers auto` sized the trained tail at 20 B a trained
+  weight plus 6 GB of workspace and admitted 47 layers of a Qwen3.8 14B on an
+  RTX PRO 6000, which ran out of memory; 36 layers peak at 96.6 GB there. It
+  now takes 25 B and 13 GB, which admits those 36.
+- `compress` S6 generates from distinct test prompts: with two teacher
+  answers a prompt, its 16 greedy generations were 8 prompts counted twice
+  (a looping prompt counted as 2/16).
+- `compress` S6 frees each candidate's runtime weights before the next one:
+  the device cache kept them after the pipeline was dropped, and with the
+  27B source and its fold resident (41 GB) the healed model's scoring ran
+  out of memory.
+
 ## [0.8.44] — 2026-10-29
 
 ### Fixed

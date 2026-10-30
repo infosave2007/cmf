@@ -47,17 +47,32 @@ fn evaluate(run: &Run, label: &str, path: &PathBuf, data: &Data, on: LossOn) -> 
     // ~200 tok/s there), else through the runtime
     let t0 = std::time::Instant::now();
     let (mut nll, mut cnt, mut how) = (0f64, 0usize, "runtime");
-    // records past DEVICE_NLL_MAX tokens go through the runtime: the
-    // trainer's attention holds a window² score block per head
+    // records past what the card's attention scratch holds go through the
+    // runtime (`device_nll_max`: the trainer keeps a window² block per head)
     let mut rest: Vec<_> = test.clone();
     #[cfg(feature = "gpu")]
     if nll_on_device(&m) {
-        let (short, long): (Vec<_>, Vec<_>) = test.iter().copied().partition(|r| r.ids.len() <= DEVICE_NLL_MAX);
+        let max = super::heal_gpu::device_nll_max(&m);
+        let (mut short, long): (Vec<_>, Vec<_>) = test.iter().copied().partition(|r| r.ids.len() <= max);
+        // a record past the device window is scored on its first `max`
+        // tokens there (the same cut for every candidate): through the
+        // runtime a 27B scores ~200 tok/s, and its 8k-token answers were 63 %
+        // of the test tokens. CMF_COMPRESS_EVAL_LONG=runtime scores them whole.
+        let whole = std::env::var("CMF_COMPRESS_EVAL_LONG").as_deref() == Ok("runtime");
+        let cut: Vec<super::data::Rec> = if whole {
+            Vec::new()
+        } else {
+            long.iter().filter(|r| on.first_target(r) + 1 < max).map(|r| super::data::Rec { ids: r.ids[..max].to_vec(), ..(*r).clone() }).collect()
+        };
+        if !cut.is_empty() {
+            eprintln!("  {label}: {} records past {max} tokens are scored on their first {max} (CMF_COMPRESS_EVAL_LONG=runtime: whole, on the runtime)", cut.len());
+        }
+        short.extend(cut.iter());
         if !short.is_empty() {
             (nll, cnt) = super::heal_gpu::test_nll(path, &short, on)?;
-            how = if long.is_empty() { "device" } else { "device + runtime" };
+            how = if whole && !long.is_empty() { "device + runtime" } else if cut.is_empty() { "device" } else { "device, long records cut" };
         }
-        rest = long;
+        rest = if whole { long } else { Vec::new() };
     }
     let mut pipe = Pipeline::from_model(&m, greedy()).map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
     pipe.set_confidence(false);
@@ -75,8 +90,14 @@ fn evaluate(run: &Run, label: &str, path: &PathBuf, data: &Data, on: LossOn) -> 
     let cap = run.a.eval_gen_tokens;
     let mut gens = Vec::new();
     let (mut gen_tok, mut gen_s) = (0usize, 0f64);
-    let n_gen = test.len().min(run.a.eval_prompts);
-    for (gi, r) in test.iter().take(run.a.eval_prompts).enumerate() {
+    let (mut mtp_drafted, mut mtp_accepted) = (0usize, 0usize);
+    // one generation per distinct prompt: the teacher answered each prompt
+    // twice, and two greedy runs of one prompt are one sample counted twice
+    // (16 generations were 8 prompts)
+    let mut seen = std::collections::HashSet::new();
+    let gen_recs: Vec<_> = test.iter().filter(|r| seen.insert(&r.ids[..r.prompt])).take(run.a.eval_prompts).collect();
+    let n_gen = gen_recs.len();
+    for (gi, r) in gen_recs.into_iter().enumerate() {
         let prompt = &r.ids[..r.prompt];
         let t = std::time::Instant::now();
         if gi > 0 {
@@ -89,6 +110,8 @@ fn evaluate(run: &Run, label: &str, path: &PathBuf, data: &Data, on: LossOn) -> 
         let g = pipe.generate_from_ids(prompt, cap, None, None).map_err(|e| anyhow::anyhow!("{label}: {}: {e}", r.rid))?;
         gen_s += t.elapsed().as_secs_f64();
         gen_tok += g.tokens_generated;
+        mtp_drafted += g.mtp_drafted;
+        mtp_accepted += g.mtp_accepted;
         let ids = &g.token_ids[g.token_ids.len().saturating_sub(g.tokens_generated)..];
         let d5 = crate::teacher_data::tail_distinct_5gram(ids);
         let teacher_len = r.generated().min(cap).max(1);
@@ -117,6 +140,12 @@ fn evaluate(run: &Run, label: &str, path: &PathBuf, data: &Data, on: LossOn) -> 
         }
         None => None,
     };
+    // the runtime keeps a model's uploaded weights in the device cache after
+    // its pipeline is gone: the 27B source and its fold held 41 GB there and
+    // the next candidate's trainer pass ran out of memory
+    drop(pipe);
+    #[cfg(feature = "gpu")]
+    cortiq_engine::gpu_wgpu::release_model_buffers(&m);
     let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     Ok(json!({
         "label": label, "path": path, "bytes": bytes, "params": m.total_param_count(),
@@ -124,15 +153,12 @@ fn evaluate(run: &Run, label: &str, path: &PathBuf, data: &Data, on: LossOn) -> 
         "gen": {
             "prompts": gens.len(), "loops": loops, "stops": stops,
             "median_len_ratio": median(ratios), "tok_s": gen_tok as f64 / gen_s.max(1e-9),
+            "mtp_drafted": mtp_drafted, "mtp_accepted": mtp_accepted,
         },
         "general_ppl": general,
         "samples": gens,
     }))
 }
-
-/// Longest record scored on the device (longer ones: the runtime).
-#[cfg(feature = "gpu")]
-const DEVICE_NLL_MAX: usize = 4096;
 
 /// `--eval-nll`: auto = on the device's trainer kernels when usable.
 #[cfg(feature = "gpu")]
@@ -145,6 +171,7 @@ fn nll_on_device(m: &CmfModel) -> bool {
 
 pub fn s6_eval(run: &Run) -> Result<()> {
     let a = &run.a;
+
     let data = Data::load(&a.data)?;
     let on = LossOn::parse(&a.loss_on)?;
     let path = |i: usize, k: &str| -> Option<PathBuf> {
@@ -173,7 +200,7 @@ pub fn s6_eval(run: &Run) -> Result<()> {
         cands.push((format!("vs {}", c.trim_end_matches(".cmf")), p));
     }
     run.log(&format!(
-        "S6: {} test records, {} generation prompts; intermediate stages are scored on their q8_2f copies",
+        "S6: {} test records, up to {} generation prompts (distinct ones); intermediate stages are scored on their q8_2f copies",
         data.count(TdataSplit::Test).0,
         a.eval_prompts.min(data.count(TdataSplit::Test).0)
     ));
@@ -232,6 +259,7 @@ pub fn s6_eval(run: &Run) -> Result<()> {
                 "label": r["label"], "bytes": r["bytes"], "params": r["params"], "nll": r["nll"], "ppl": r["ppl"],
                 "loops": r["gen"]["loops"], "stops": r["gen"]["stops"], "prompts": r["gen"]["prompts"],
                 "median_len_ratio": r["gen"]["median_len_ratio"], "tok_s": r["gen"]["tok_s"],
+                "mtp_drafted": r["gen"]["mtp_drafted"], "mtp_accepted": r["gen"]["mtp_accepted"],
                 "general_ppl": r["general_ppl"],
             })
         })
@@ -262,7 +290,7 @@ fn eval_key(run: &Run, p: &std::path::Path) -> String {
         "size": m.map(|m| m.len()), "mtime": mt.map(|d| d.as_nanos() as u64),
         "data": crate::knowledge::sha256_hex(&manifest), "spec": run.a.data,
         "loss_on": run.a.loss_on, "prompts": run.a.eval_prompts, "gen": run.a.eval_gen_tokens,
-        "general": run.a.general_eval, "v": 3, "o1": "off",
+        "general": run.a.general_eval, "v": 4, "o1": "off",
     });
     crate::knowledge::sha256_hex(k.to_string().as_bytes())[..16].to_string()
 }
@@ -276,10 +304,12 @@ fn report_md(run: &Run, summary: &[Value], gates: &Value, pass: bool) -> String 
         crate::convert::quant_name(run.quant),
         run.a.recipe
     );
-    s += "| model | size GB | params | test NLL | ppl | loops | stops | len/teacher | tok/s | general ppl |\n|---|---|---|---|---|---|---|---|---|---|\n";
+    s += "| model | size GB | params | test NLL | ppl | loops | stops | len/teacher | tok/s | MTP accepted | general ppl |\n|---|---|---|---|---|---|---|---|---|---|---|\n";
     for r in summary {
+        let (md, ma) = (r["mtp_drafted"].as_u64().unwrap_or(0), r["mtp_accepted"].as_u64().unwrap_or(0));
+        let mtp = if md > 0 { format!("{:.0} % of {md}", ma as f64 * 100.0 / md as f64) } else { "—".to_string() };
         s += &format!(
-            "| {} | {:.3} | {:.3}B | {:.4} | {:.3} | {}/{} | {}/{} | {:.2} | {:.1} | {} |\n",
+            "| {} | {:.3} | {:.3}B | {:.4} | {:.3} | {}/{} | {}/{} | {:.2} | {:.1} | {mtp} | {} |\n",
             r["label"].as_str().unwrap_or(""),
             r["bytes"].as_f64().unwrap_or(0.0) / 1e9,
             r["params"].as_f64().unwrap_or(0.0) / 1e9,

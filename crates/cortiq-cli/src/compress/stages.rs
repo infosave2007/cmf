@@ -296,21 +296,40 @@ fn gram_path(run: &Run, layer: usize, split: &str) -> PathBuf {
     run.stage_dir(1).join("grams").join(format!("L{layer}.{split}.f32"))
 }
 
-fn save_gram(p: &Path, g: &[f64]) -> Result<()> {
+/// Gram files are f32 little-endian, 4·n² bytes (1.2 GB at n = 17408): the
+/// conversions run over all threads, the element loop alone was seconds.
+fn save_gram(p: &Path, g: &[f64], threads: usize) -> Result<()> {
     std::fs::create_dir_all(p.parent().unwrap())?;
-    let bytes: Vec<u8> = g.iter().flat_map(|&v| (v as f32).to_le_bytes()).collect();
+    let mut bytes = vec![0u8; g.len() * 4];
+    let per = g.len().div_ceil(threads.max(1)).max(1);
+    std::thread::scope(|s| {
+        for (src, dst) in g.chunks(per).zip(bytes.chunks_mut(per * 4)) {
+            s.spawn(move || {
+                for (v, d) in src.iter().zip(dst.chunks_exact_mut(4)) {
+                    d.copy_from_slice(&(*v as f32).to_le_bytes());
+                }
+            });
+        }
+    });
     std::fs::write(p, bytes)?;
     Ok(())
 }
 
-fn load_gram(p: &Path, n: usize) -> Result<Vec<f64>> {
-    Ok(load_gram_f32(p, n)?.into_iter().map(f64::from).collect())
-}
-
-fn load_gram_f32(p: &Path, n: usize) -> Result<Vec<f32>> {
+fn load_gram_f32(p: &Path, n: usize, threads: usize) -> Result<Vec<f32>> {
     let b = std::fs::read(p)?;
     ensure!(b.len() == n * n * 4, "{}: {} bytes, expected {}", p.display(), b.len(), n * n * 4);
-    Ok(b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+    let mut out = vec![0f32; n * n];
+    let per = out.len().div_ceil(threads.max(1)).max(1);
+    std::thread::scope(|s| {
+        for (dst, src) in out.chunks_mut(per).zip(b.chunks(per * 4)) {
+            s.spawn(move || {
+                for (d, c) in dst.iter_mut().zip(src.chunks_exact(4)) {
+                    *d = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                }
+            });
+        }
+    });
+    Ok(out)
 }
 
 fn write_u32s(p: &Path, rows: &[Vec<usize>]) -> Result<()> {
@@ -470,29 +489,43 @@ fn s1_illuminate(run: &Run) -> Result<()> {
     ));
     let (mut curves, mut orders, mut energy) = (vec![Vec::new(); nl], vec![Vec::new(); nl], vec![0f64; nl]);
     let layers: Vec<usize> = (0..nl).collect();
-    for part in layers.chunks(chunk) {
-        let tr = cal.capture(false, part, &format!("train L{}-{}", part[0], part[part.len() - 1]))?;
-        for (&l, acc) in &tr {
-            let n = widths[l];
-            let w = cmfio::tensor_f32(&wsrc, wsrc.tensor(&illum::down_name(l)).unwrap())?;
-            let imp = illum::importance(&w, hidden, n, &acc.sumsq, acc.count);
-            let ord = illum::order(&imp);
-            curves[l] = refit_curve(&acc.h, n, &w, hidden, &ord, run.threads)?;
-            energy[l] = acc.sumsq.iter().map(|s| (s / acc.count.max(1) as f64).sqrt()).sum();
-            orders[l] = ord;
+    // Kept Grams go to disk on a second thread (two in flight): 155 GB on a
+    // 27B, which written inline left the device idle about half of S1.
+    std::thread::scope(|sc| -> Result<()> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(PathBuf, Vec<f64>)>(2);
+        let threads = run.threads;
+        let writer = sc.spawn(move || -> Result<()> {
+            for (p, g) in rx {
+                save_gram(&p, &g, threads)?;
+            }
+            Ok(())
+        });
+        let send = |p: PathBuf, g: Vec<f64>| -> Result<()> { tx.send((p, g)).map_err(|_| anyhow::anyhow!("S1: the Gram writer stopped")) };
+        for part in layers.chunks(chunk) {
+            let tr = cal.capture(false, part, &format!("train L{}-{}", part[0], part[part.len() - 1]))?;
+            for (l, acc) in tr {
+                let n = widths[l];
+                let w = cmfio::tensor_f32(&wsrc, wsrc.tensor(&illum::down_name(l)).unwrap())?;
+                let imp = illum::importance(&w, hidden, n, &acc.sumsq, acc.count);
+                let ord = illum::order(&imp);
+                curves[l] = refit_curve(&acc.h, n, &w, hidden, &ord, run.threads)?;
+                energy[l] = acc.sumsq.iter().map(|s| (s / acc.count.max(1) as f64).sqrt()).sum();
+                orders[l] = ord;
+                if keep_grams {
+                    send(gram_path(run, l, "train"), acc.h)?;
+                }
+            }
             if keep_grams {
-                save_gram(&gram_path(run, l, "train"), &acc.h)?;
+                let va = cal.capture(true, part, &format!("val L{}-{}", part[0], part[part.len() - 1]))?;
+                for (l, acc) in va {
+                    send(gram_path(run, l, "val"), acc.h)?;
+                }
             }
+            eprintln!("  layers {}..={} illuminated", part[0], part[part.len() - 1]);
         }
-        drop(tr);
-        if keep_grams {
-            let va = cal.capture(true, part, &format!("val L{}-{}", part[0], part[part.len() - 1]))?;
-            for (&l, acc) in &va {
-                save_gram(&gram_path(run, l, "val"), &acc.h)?;
-            }
-        }
-        eprintln!("  layers {}..={} illuminated", part[0], part[part.len() - 1]);
-    }
+        drop(tx);
+        writer.join().map_err(|_| anyhow::anyhow!("S1: the Gram writer panicked"))?
+    })?;
     let dir = run.stage_dir(1);
     std::fs::create_dir_all(&dir)?;
     write_f64s(&dir.join("curves.bin"), &curves)?;
@@ -539,17 +572,18 @@ fn refit_curve(g: &[f64], n: usize, w: &[f32], h: usize, ord: &[usize], threads:
 }
 
 /// A layer's Gram for the fold: read back from the capture, or kept on disk
-/// by S1 (f32; the device path uploads it without the f64 round trip).
+/// by S1 and read ahead (f32; the device path uploads it without the f64
+/// round trip).
 enum GramSrc {
     Host(Vec<f64>),
-    File(PathBuf),
+    F32(Vec<f32>),
 }
 
 impl GramSrc {
-    fn host(self, n: usize) -> Result<Vec<f64>> {
+    fn host(self) -> Vec<f64> {
         match self {
-            GramSrc::Host(v) => Ok(v),
-            GramSrc::File(p) => load_gram(&p, n),
+            GramSrc::Host(v) => v,
+            GramSrc::F32(v) => v.into_iter().map(f64::from).collect(),
         }
     }
 }
@@ -565,8 +599,7 @@ fn fold_layer(l: usize, tr: GramSrc, va: GramSrc, n: usize, w: &[f32], h: usize,
                     let d = (0..n).map(|i| v[i * n + i]).collect();
                     (fd::upload_gram(&v, n), d)
                 }
-                GramSrc::File(p) => {
-                    let v = load_gram_f32(&p, n)?;
+                GramSrc::F32(v) => {
                     let d = (0..n).map(|i| v[i * n + i] as f64).collect();
                     (fd::upload_gram_f32(&v, n), d)
                 }
@@ -576,7 +609,7 @@ fn fold_layer(l: usize, tr: GramSrc, va: GramSrc, n: usize, w: &[f32], h: usize,
         let (dva, _) = up(va)?;
         return fd::fold_layer(l, &dtr, &diag, Some(&dva), n, w, h, ord, k, ridges, allow_cut);
     }
-    illum::fold_layer(l, &tr.host(n)?, Some(&va.host(n)?), n, w, h, ord, k, ridges, allow_cut, threads)
+    illum::fold_layer(l, &tr.host(), Some(&va.host()), n, w, h, ord, k, ridges, allow_cut, threads)
 }
 
 fn disk_free(p: &Path) -> u64 {
@@ -812,6 +845,24 @@ fn s3_fold(run: &Run) -> Result<()> {
     if fold_on_device() {
         run.log("  fold numerics on the device (f32, equilibrated Cholesky)");
     }
+    // Kept Grams (2.4 GB a layer at n = 17408) are read one layer ahead on a
+    // second thread, so the read overlaps the previous layer's fold: read
+    // inline it was most of a 27B layer's ~12 s, with the device idle.
+    std::thread::scope(|sc| -> Result<()> {
+    let ahead = cal.is_none().then(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(GramSrc, GramSrc)>>(1);
+        let (todo, widths, threads) = (&todo, &widths, run.threads);
+        sc.spawn(move || {
+            for &l in todo {
+                let (n, p) = (widths[l], |s: &str| gram_path(run, l, s));
+                let r = load_gram_f32(&p("train"), n, threads).and_then(|t| Ok((GramSrc::F32(t), GramSrc::F32(load_gram_f32(&p("val"), n, threads)?))));
+                if tx.send(r).is_err() {
+                    break;
+                }
+            }
+        });
+        rx
+    });
     for part in todo.chunks(chunk) {
         let (mut tr, mut va): (BTreeMap<usize, GramSrc>, BTreeMap<usize, GramSrc>) = (BTreeMap::new(), BTreeMap::new());
         if let Some(c) = cal.as_mut() {
@@ -822,16 +873,15 @@ fn s3_fold(run: &Run) -> Result<()> {
             for (l, acc) in c.capture(true, part, &format!("val {label}"))? {
                 va.insert(l, GramSrc::Host(acc.h));
             }
-        } else {
-            for &l in part {
-                tr.insert(l, GramSrc::File(gram_path(run, l, "train")));
-                va.insert(l, GramSrc::File(gram_path(run, l, "val")));
-            }
         }
         for &l in part {
             let n = widths[l];
+            let (gt, gv) = match &ahead {
+                Some(rx) => rx.recv().map_err(|_| anyhow::anyhow!("S3: the Gram reader stopped"))??,
+                None => (tr.remove(&l).unwrap(), va.remove(&l).unwrap()),
+            };
             let w = cmfio::tensor_f32(&wsrc, wsrc.tensor(&illum::down_name(l)).unwrap())?;
-            let f = fold_layer(l, tr.remove(&l).unwrap(), va.remove(&l).unwrap(), n, &w, hidden, &orders[l], keeps[l], &ridges, allow_cut, run.threads)?;
+            let f = fold_layer(l, gt, gv, n, &w, hidden, &orders[l], keeps[l], &ridges, allow_cut, run.threads)?;
             let p = format!("model.layers.{l}.mlp.");
             for name in ["gate_proj", "up_proj"] {
                 let e = wsrc.tensor(&format!("{p}{name}.weight")).with_context(|| format!("layer {l}: {p}{name}.weight"))?;
@@ -858,6 +908,8 @@ fn s3_fold(run: &Run) -> Result<()> {
             infos.push(f.info);
         }
     }
+    Ok(())
+    })?;
     let refit_n = infos.iter().filter(|i| i.ridge.is_some()).count();
     let mean = |f: &dyn Fn(&illum::FoldInfo) -> f64| infos.iter().map(f).sum::<f64>() / infos.len().max(1) as f64;
     run.log(&format!(
@@ -892,11 +944,19 @@ fn s3_fold(run: &Run) -> Result<()> {
     let f16_out = dir.join("fold-f16.cmf");
     let q8_out = dir.join("fold-q8_2f.cmf");
     let lookup = |name: &str| -> Result<Option<Replacement>> { Ok(repl.get(name).cloned()) };
-    let b1 = cmfio::rewrite(&wsrc, &f16_out, Encoding::KeepF16, &lookup, &edit, run.threads)?;
-    let b2 = cmfio::rewrite(&wsrc, &q8_out, Encoding::Profile(Quant::Q8_2f), &lookup, &|h| {
-        edit(h);
-        set_quant_type(h, Quant::Q8_2f);
-    }, run.threads)?;
+    // the f16 file is disk-bound and its q8_2f copy encode-bound: written side
+    // by side, S3's tail is the longer of the two instead of their sum
+    let (b1, b2) = std::thread::scope(|s| {
+        let q8 = s.spawn(|| {
+            cmfio::rewrite(&wsrc, &q8_out, Encoding::Profile(Quant::Q8_2f), &lookup, &|h| {
+                edit(h);
+                set_quant_type(h, Quant::Q8_2f);
+            }, run.threads)
+        });
+        let b1 = cmfio::rewrite(&wsrc, &f16_out, Encoding::KeepF16, &lookup, &edit, run.threads);
+        (b1, q8.join().map_err(|_| anyhow::anyhow!("S3: the q8_2f writer panicked")).and_then(|r| r))
+    });
+    let (b1, b2) = (b1?, b2?);
     run.log(&format!("S3: wrote {} ({:.2} GB) and its q8_2f copy ({:.2} GB)", f16_out.display(), b1 as f64 / 1e9, b2 as f64 / 1e9));
     run.mark_done(3, json!({ "f16": f16_out, "q8": q8_out, "layers": infos }))
 }
@@ -1047,11 +1107,14 @@ fn s4_heal_device(run: &Run, data: &Data, student: &CmfModel, student_path: &Pat
         "ffn" => true,
         o => anyhow::bail!("--heal-params {o:?}: all | ffn"),
     };
-    // Device memory while training: the head's planes both ways, ~6 GB of
+    // Device memory while training: the head's planes both ways, ~13 GB of
     // workspace and logits, and per trained layer its f16 planes both ways
-    // plus f32 weights, gradient and two moments (20 B/weight of what it
-    // trains, 4 B/weight of its frozen rest). The frozen prefix runs once
-    // beforehand (its activations cached on the host), so it takes no room.
+    // plus f32 weights, gradient, two moments and the backward's scratch
+    // (25 B/weight of what it trains, 4 B/weight of its frozen rest —
+    // measured: Qwen3.8 14B, 36 MLP-trained layers peaked at 96.6 GB of an
+    // RTX PRO 6000's 102.6; at 20 B and 6 GB the estimate admitted 47
+    // layers, which ran out). The frozen prefix runs once beforehand (its
+    // activations cached on the host), so it takes no room.
     let (total, _) = params_of(student);
     let arch = student.arch();
     let head = 2.0 * 2.0 * (arch.vocab_size * arch.hidden_size) as f64;
@@ -1064,7 +1127,7 @@ fn s4_heal_device(run: &Run, data: &Data, student: &CmfModel, student_path: &Pat
         .sum::<f64>()
         / nl as f64;
     let trained = if ffn_only { ffn_w.min(layer_w) } else { layer_w };
-    let per_layer = 20.0 * trained + 4.0 * (layer_w - trained);
+    let per_layer = 25.0 * trained + 4.0 * (layer_w - trained);
     // the trainer's device: its own budget, or on unified memory (Apple
     // Silicon) 60 % of the host's — the runtime's budget was 8 GB there,
     // which trained 7 of the 0.8B's 24 layers
@@ -1073,7 +1136,7 @@ fn s4_heal_device(run: &Run, data: &Data, student: &CmfModel, student_path: &Pat
         Some(_) => mem_budget() as f64 * 0.6,
         None => (8u64 << 30) as f64,
     };
-    let room = budget - head - 6e9;
+    let room = budget - head - 13e9;
     let train_from = heal_train_from(&a.heal_layers, nl, per_layer, room.max(per_layer))?;
     let need = per_layer * (nl - train_from) as f64;
     anyhow::ensure!(
@@ -1108,6 +1171,8 @@ fn s4_heal_device(run: &Run, data: &Data, student: &CmfModel, student_path: &Pat
         batch: a.bs,
         topk: a.heal_topk,
         eval_every: a.eval_every,
+        patience: a.heal_patience,
+        val_windows: a.heal_val_windows,
         clip: 1.0,
         warm: std::env::var("CMF_HEAL_WARM").ok().and_then(|v| v.parse().ok()).unwrap_or(0.1),
         genesis: match a.heal_schedule.as_str() {
@@ -1233,6 +1298,70 @@ fn s5_quant(run: &Run) -> Result<()> {
             let m = open(&input)?;
             cmfio::rewrite(&m, &out, Encoding::Profile(q), &|_| Ok(None), &|h| set_quant_type(h, q), run.threads)?;
         }
+    }
+    // the MTP draft, calibrated through the finished trunk (the fold and the
+    // heal moved the hidden state it predicts from) and its FFN compacted
+    let mtp = match a.mtp_keep.as_str() {
+        "off" => None,
+        k => Some(k.parse::<f64>().ok().filter(|v| *v > 0.0 && *v <= 1.0).with_context(|| format!("--mtp-keep {k:?}: a fraction in (0, 1] or off"))?),
+    };
+    let has_mtp = open(&out)?.tensors.iter().any(|e| e.name.starts_with("model.mtp."));
+    if let (Some(keep), true, true) = (mtp, has_mtp, run.structural) {
+        let t0 = std::time::Instant::now();
+        let root = a.data.rfind(".tdata").map(|i| &a.data[..i + 6]).unwrap_or(&a.data);
+        let tmp = run.stage_dir(5).join("out-mtp.cmf");
+        run.log(&format!("S5: MTP draft calibrated through the finished model on {} train records, FFN kept at {keep}", a.mtp_records));
+        crate::mtpcompact::cmd_mtp_compact(out.to_str().unwrap(), &format!("{root}:train"), tmp.to_str().unwrap(), keep, None, a.mtp_records, 2048)?;
+        std::fs::rename(&tmp, &out)?;
+        run.log(&format!("S5: MTP draft compacted ({:.0}s)", t0.elapsed().as_secs_f64()));
+    }
+    // the MTP draft trained on the finished trunk over its chain
+    let heal_mtp = match a.mtp_heal.as_str() {
+        "off" => false,
+        "on" => true,
+        "auto" => {
+            #[cfg(feature = "gpu")]
+            let ok = super::heal_gpu::usable(&*open(&out)?).is_ok();
+            #[cfg(not(feature = "gpu"))]
+            let ok = false;
+            ok
+        }
+        o => anyhow::bail!("--mtp-heal {o:?}: auto | on | off"),
+    };
+    let canonical = open(&out)?.tensor("model.mtp.eh_proj.weight").is_some();
+    if heal_mtp && canonical && run.structural {
+        #[cfg(feature = "gpu")]
+        {
+            let t0 = std::time::Instant::now();
+            let root = a.data.rfind(".tdata").map(|i| &a.data[..i + 6]).unwrap_or(&a.data);
+            let tmp = run.stage_dir(5).join("out-mtpheal.cmf");
+            let init = path_of(&s0, "f16");
+            run.log(&format!("S5: MTP draft trained on the finished trunk (3-step chain, {} epochs)", a.mtp_heal_epochs));
+            let cfg = super::mtp_heal::Cfg {
+                chain: 3,
+                refresh: 150,
+                tokens: 393216,
+                window: 2048,
+                epochs: a.mtp_heal_epochs,
+                lr: 2e-5,
+                topk: 64,
+                batch: 2,
+                eval_every: 25,
+                patience: 6,
+            };
+            let r = super::mtp_heal::heal(&out, init.as_deref(), root, &cfg, &tmp, run.threads)?;
+            std::fs::rename(&tmp, &out)?;
+            run.log(&format!(
+                "S5: MTP draft — held-out KL to the trunk {:.4} → {:.4} (best step {} of {}, {:.0}s)",
+                r.loss_start,
+                r.loss_best,
+                r.best_step,
+                r.steps,
+                t0.elapsed().as_secs_f64()
+            ));
+        }
+        #[cfg(not(feature = "gpu"))]
+        anyhow::bail!("--mtp-heal on needs a build with the gpu feature");
     }
     let bytes = std::fs::metadata(&out)?.len();
     run.log(&format!("S5: {} ({:.2} GB)", out.display(), bytes as f64 / 1e9));

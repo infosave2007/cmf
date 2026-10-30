@@ -57,13 +57,11 @@ impl DMat {
         m
     }
     pub fn from_f64(r: usize, c: usize, v: &[f64]) -> DMat {
-        let f: Vec<f32> = v.iter().map(|&x| x as f32).collect();
-        DMat::from_f32(r, c, &f)
+        DMat::from_f32(r, c, &to_f32_par(v))
     }
     pub fn write_f64(&self, v: &[f64]) {
         assert!(v.len() <= self.r * self.c);
-        let f: Vec<f32> = v.iter().map(|&x| x as f32).collect();
-        dev().queue.write_buffer(&self.buf, 0, bytemuck::cast_slice(&f));
+        dev().queue.write_buffer(&self.buf, 0, bytemuck::cast_slice(&to_f32_par(v)));
     }
     pub fn len(&self) -> usize {
         self.r * self.c
@@ -83,6 +81,19 @@ impl DMat {
         copy(self, &o);
         o
     }
+}
+
+/// f64 → f32 over all threads: a Gram at n = 17408 is 303 M elements, which a
+/// serial loop turned into seconds per upload.
+fn to_f32_par(v: &[f64]) -> Vec<f32> {
+    let mut f = vec![0f32; v.len()];
+    let per = v.len().div_ceil(crate::pool::Pool::effective_threads().max(1)).max(1 << 16);
+    std::thread::scope(|s| {
+        for (d, src) in f.chunks_mut(per).zip(v.chunks(per)) {
+            s.spawn(move || d.iter_mut().zip(src).for_each(|(o, &x)| *o = x as f32));
+        }
+    });
+    f
 }
 
 /// Read `n` floats back, waiting for this copy's own submission only (other
