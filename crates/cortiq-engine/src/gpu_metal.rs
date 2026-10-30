@@ -304,6 +304,52 @@ kernel void q8_matmat(
     if (lane == 0) y[(ulong)bi * rows + row] = total * rs[row];
 }
 
+// q8_2f twin of q8_matmat for the rows graph (speculative verify, batched
+// prefill): the input-channel field is applied while x is read. Every
+// (row, position) runs q8f_matvec's lane split and accumulation order, so
+// a batched row equals the whole-token graph's projection of that input.
+kernel void q8f_matmat(
+    device const char4*  q     [[buffer(0)]],
+    device const float4* xs    [[buffer(1)]],
+    device const float*  rs    [[buffer(2)]],
+    device float*        y     [[buffer(3)]],
+    device const float4* col   [[buffer(4)]],
+    constant uint&       cols4 [[buffer(5)]],
+    constant uint&       rows  [[buffer(6)]],
+    constant uint&       nb    [[buffer(7)]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint2 tg  [[threadgroup_position_in_grid]],
+    uint sgs  [[simdgroups_per_threadgroup]])
+{
+    uint row = tg.x * sgs + sg;
+    uint bi = tg.y;
+    if (row >= rows || bi >= nb) return;
+    ulong base = (ulong)row * cols4;
+    device const float4* x = xs + (ulong)bi * cols4;
+    float4 acc = float4(0.0f);
+    uint i = lane;
+    for (; i + 96 < cols4; i += 128) {
+        char4 q0 = q[base + i];
+        char4 q1 = q[base + i + 32];
+        char4 q2 = q[base + i + 64];
+        char4 q3 = q[base + i + 96];
+        float4 x0 = x[i] * col[i];
+        float4 x1 = x[i + 32] * col[i + 32];
+        float4 x2 = x[i + 64] * col[i + 64];
+        float4 x3 = x[i + 96] * col[i + 96];
+        acc.x += dot(float4(q0), x0);
+        acc.y += dot(float4(q1), x1);
+        acc.z += dot(float4(q2), x2);
+        acc.w += dot(float4(q3), x3);
+    }
+    for (; i < cols4; i += 32) {
+        acc.x += dot(float4(q[base + i]), x[i] * col[i]);
+    }
+    float total = simd_sum(acc.x + acc.y + acc.z + acc.w);
+    if (lane == 0) y[(ulong)bi * rows + row] = total * rs[row];
+}
+
 // True GEMM tile kernel for the prefill batch — the ggml mul_mm layout
 // ported to our q8_row format (per-row f32 scale folded in at the W
 // load; |w·s| well inside half range, mul_mm precision class). C-tile
@@ -8273,6 +8319,8 @@ struct Ctx {
     q8f: ComputePipelineState,
     q8f_r4: ComputePipelineState,
     q8mm: ComputePipelineState,
+    /// q8_2f twin of `q8mm` (column field applied on read).
+    q8fmm: ComputePipelineState,
     q8mmm: ComputePipelineState,
     q1: ComputePipelineState,
     q1h: ComputePipelineState,
@@ -8562,6 +8610,7 @@ fn init() -> Result<Ctx, String> {
     let q8f = pso("q8f_matvec")?;
     let q8f_r4 = pso("q8f_matvec_r4")?;
     let q8mm = pso("q8_matmat")?;
+    let q8fmm = pso("q8f_matmat")?;
     // Functions referencing function constants must be fetched through
     // the constantValues API even for the generic (all-optional-unset)
     // variant.
@@ -8727,6 +8776,7 @@ fn init() -> Result<Ctx, String> {
         q8f,
         q8f_r4,
         q8mm,
+        q8fmm,
         q8mmm,
         q1,
         q1h,
@@ -9894,6 +9944,80 @@ fn q8_matvec_range_field(
 
     unsafe {
         std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), rows);
+    }
+    true
+}
+
+/// The rows graph's b-row q8_2f GEMM (`encode_q8_matmat`) as one submit,
+/// for parity use: `xs` is `b` activation vectors end to end, `out`
+/// receives `b·rows`. Each row must equal `q8_2f_matvec` of its vector.
+#[allow(clippy::too_many_arguments)]
+pub fn q8_2f_matmat(
+    model: &Arc<CmfModel>,
+    idx: usize,
+    row_scale: &[f32],
+    col_field: &[f32],
+    xs: &[f32],
+    b: usize,
+    rows: usize,
+    cols: usize,
+    out: &mut [f32],
+) -> bool {
+    let Some(c) = ctx() else { return false };
+    if b == 0
+        || cols % 4 != 0
+        || row_scale.len() != rows
+        || col_field.len() != cols
+        || xs.len() < b * cols
+        || out.len() < b * rows
+    {
+        return false;
+    }
+    let entry = &model.tensors[idx];
+    let Some(abs) = model.entry_abs_offset(entry) else {
+        return false;
+    };
+    let _bytes = model.primary_bytes();
+    let Some((fbuf, safe_len)) = file_buffer(c, model) else {
+        return false;
+    };
+    if abs + rows * cols > safe_len {
+        return false;
+    }
+    // Fresh buffers: the pointer-keyed caches must not hand a parity call
+    // a stale copy of another slice that happened to share an address.
+    let fresh = |data: &[f32]| -> Buffer {
+        c._device.new_buffer_with_data(
+            data.as_ptr() as *const std::ffi::c_void,
+            (data.len() * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+    };
+    let rs_buf = fresh(row_scale);
+    let col_buf = fresh(col_field);
+    let xs_buf = fresh(&xs[..b * cols]);
+    let y_buf = c
+        ._device
+        .new_buffer((b * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+    let cmd = c.queue.new_command_buffer();
+    let enc = cmd.new_compute_command_encoder();
+    encode_q8_matmat(
+        c,
+        enc,
+        &fbuf,
+        abs,
+        &rs_buf,
+        Some(&col_buf),
+        &xs_buf,
+        &y_buf,
+        rows,
+        cols,
+        b,
+    );
+    enc.end_encoding();
+    submit_and_wait(c, cmd, &[&y_buf]);
+    unsafe {
+        std::ptr::copy_nonoverlapping(y_buf.contents() as *const f32, out.as_mut_ptr(), b * rows);
     }
     true
 }
@@ -11560,6 +11684,49 @@ fn encode_q8_matvec(
     let sgs = 8u64;
     let n_tg = (rows as u64).div_ceil(sgs * if r4 { 4 } else { 1 });
     enc.dispatch_thread_groups(MTLSize::new(n_tg, 1, 1), MTLSize::new(sgs * 32, 1, 1));
+}
+
+/// Encode the b-row q8_row / q8_2f GEMM: `xs` is `[nb][cols]` f32, `y`
+/// `[nb][rows]`. One simdgroup per (row, position), each running the
+/// one-row matvec's reduction (`q8_matvec` / `q8f_matvec`).
+#[allow(clippy::too_many_arguments)]
+fn encode_q8_matmat(
+    c: &Ctx,
+    enc: &metal::ComputeCommandEncoderRef,
+    fbuf: &WeightArena,
+    abs: usize,
+    rs_buf: &Buffer,
+    col_buf: Option<&Buffer>,
+    xs: &Buffer,
+    y: &Buffer,
+    rows: usize,
+    cols: usize,
+    nb: usize,
+) {
+    enc.set_compute_pipeline_state(if col_buf.is_some() { &c.q8fmm } else { &c.q8mm });
+    fbuf.bind(enc, 0, abs);
+    enc.set_buffer(1, Some(xs), 0);
+    enc.set_buffer(2, Some(rs_buf), 0);
+    enc.set_buffer(3, Some(y), 0);
+    let base = if let Some(col) = col_buf {
+        enc.set_buffer(4, Some(col), 0);
+        5
+    } else {
+        4
+    };
+    let (cols4, rows_u, nb_u) = ((cols / 4) as u32, rows as u32, nb as u32);
+    enc.set_bytes(base, 4, &cols4 as *const u32 as *const std::ffi::c_void);
+    enc.set_bytes(
+        base + 1,
+        4,
+        &rows_u as *const u32 as *const std::ffi::c_void,
+    );
+    enc.set_bytes(base + 2, 4, &nb_u as *const u32 as *const std::ffi::c_void);
+    let sgs = 8u64;
+    enc.dispatch_thread_groups(
+        MTLSize::new((rows as u64).div_ceil(sgs), nb as u64, 1),
+        MTLSize::new(sgs * 32, 1, 1),
+    );
 }
 
 /// Encode the q1t sparse-overlay add onto `y` (base already there). Reads the
@@ -22817,12 +22984,16 @@ impl VerifyGraph {
     /// A projection the b-row matrix GEMM can take. Q4TP keeps its existing
     /// path; descriptor-validated Q2TP is admitted for ordinary and Prism
     /// batches. Both simdgroup kernels handle row/batch tails explicitly.
+    /// q8_row / q8_2f (the escort K/V that `compress` keeps beside q4tp)
+    /// take the f32 row-streaming GEMM, the token graph's q8 matvec per row.
     fn batch_abs(&self, t: (usize, usize, usize)) -> Option<(usize, ProjKind)> {
         if t.2 % 64 != 0 {
             return None;
         }
         match self.tg.proj_abs(t) {
-            Some((abs, kind @ (ProjKind::Q4tp | ProjKind::Q2tp { .. }))) => Some((abs, kind)),
+            Some((abs, kind @ (ProjKind::Q4tp | ProjKind::Q2tp { .. } | ProjKind::Q8 { .. }))) => {
+                Some((abs, kind))
+            }
             _ => None,
         }
     }
@@ -23005,6 +23176,26 @@ impl VerifyGraph {
                     self.b,
                     1.0,
                     *center,
+                );
+            }
+            ProjKind::Q8 {
+                row_scale,
+                col_field,
+            } => {
+                // f32 activations end to end: the half pre-scale `xsc`
+                // has nothing to guard here.
+                encode_q8_matmat(
+                    self.tg.c,
+                    enc,
+                    &self.tg.fbuf,
+                    abs,
+                    row_scale,
+                    col_field.as_ref(),
+                    xs,
+                    y,
+                    t.1,
+                    t.2,
+                    self.b,
                 );
             }
             _ => unreachable!("VerifyGraph::batch_abs admitted an unsupported projection"),
