@@ -1626,12 +1626,14 @@ enum Commands {
         #[arg(long)]
         token: Option<String>,
     },
-    /// List `cortiq worker`s shouting on this network. A worker listening
-    /// beyond loopback announces itself every two seconds; this waits and
-    /// prints what answered, with the address to hand to `--peer`. The
-    /// beacon carries identity and geometry, never the token.
+    /// List the `cortiq worker`s on this network. This broadcasts a small
+    /// query to UDP 9910, re-sent about every 900 ms while it waits; each
+    /// worker listening beyond loopback answers by unicast, and this prints
+    /// what answered, with the address to hand to `--peer`. The answer
+    /// carries identity and geometry, never the token. A worker started
+    /// with `CMF_NET_BEACON=0` does not answer.
     Peers {
-        /// Seconds to listen (a beacon repeats every 2)
+        /// Seconds to wait for answers (the query is re-sent about every 0.9 s)
         #[arg(long, default_value_t = 3.0)]
         wait: f64,
         /// Only workers holding THIS model — the dir_hash must match or

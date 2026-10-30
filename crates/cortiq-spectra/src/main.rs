@@ -16,13 +16,14 @@ use std::time::Instant;
     about = "Streaming colorization of dual-energy X-ray images"
 )]
 struct Args {
-    /// Папка с data_*.tif, gain_*.tif, offset_*.tif и reference/
-    #[arg(long, default_value = "/Users/oleg/Downloads/ОлегЗадача")]
+    /// Directory with data_*.tif, gain_*.tif, offset_*.tif and, optionally,
+    /// reference/
+    #[arg(long)]
     input_dir: PathBuf,
-    /// Кадр потока в строках
+    /// Rows per stream chunk
     #[arg(long, default_value_t = 64)]
     chunk_rows: usize,
-    /// Каталог артефактов (по умолчанию artifacts/spectra/chunk-N)
+    /// Output directory (default: artifacts/spectra/chunk-N)
     #[arg(long)]
     out_dir: Option<PathBuf>,
 }

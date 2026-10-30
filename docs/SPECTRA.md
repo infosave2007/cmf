@@ -94,8 +94,8 @@ cargo run --release -p cortiq-spectra -- \
 
 Flags:
 
-- `--input-dir` — the directory of input TIFFs (the default is the developer's
-  capture path baked into the binary);
+- `--input-dir DIR` — the directory of input TIFFs, required (there is no
+  default);
 - `--chunk-rows N` — a positive chunk size, default `64`;
 - `--out-dir DIR` — the output directory, default
   `artifacts/spectra/chunk-N`.
