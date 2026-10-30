@@ -47,6 +47,22 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Apex-35B-V1.0 与更快的 Qwen3.5-MoE 图（0.8.48）
+
+[Apex-35B-V1.0](https://huggingface.co/infosave/Apex-35B-V1.0-cmf) 是基于
+Qwen3.6-35B-A3B 的智能体微调模型，支持工具调用与按需思考：
+
+```sh
+hf download infosave/Apex-35B-V1.0-cmf apex-35b-v1.0-q4tp-v2.cmf --local-dir .
+cortiq run apex-35b-v1.0-q4tp-v2.cmf --prompt "写一个合并两个有序列表的 Python 函数。" --max-tokens 4096
+```
+
+在 NVIDIA A40 上，4 位文件生成 80 token/s，读取 4096 token 提示词约 390 token/s
+（首 token 10.5 s）。同一版本加速了 Vulkan 上所有 Qwen3.5/3.6-MoE：q4tp MoE 的
+提示词按 256 行分块读取；当 MoE 草稿块只能在 CPU 上运行时默认关闭推测解码；
+token 图每层专家库只构建一次（Apex q4tp-v2 相比 0.8.45：生成 52.9 → 80.3 token/s，
+4096 token 提示词 172 → 390 token/s）。
+
 ## 一条命令按任务压缩模型（0.8.39）
 
 把通用模型变成针对你的提示的专用模型：

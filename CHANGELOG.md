@@ -7,7 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.48] — 2026-10-30
+
+### Changed
+- MoE stacks with q4tp experts read the prompt on the wgpu batch graph in
+  256-row chunks instead of 32. The expert-grouped GEMM reads every routed
+  expert once per chunk, and 32 rows (256 entries over 256 experts) re-read
+  nearly the whole expert set every 32 tokens. Apex-35B q4tp-v2 on an A40, MTP
+  off: a 4096-token prompt 295 → 401 tok/s (64 rows: 357, 128: 385, 512: 396),
+  16k 278 → 363; +1 GB of VRAM at 16k. Other MoE codecs keep 32, q8_2f keeps
+  128; `CMF_BATCH_K` still overrides.
+- Speculation is off by default on the wgpu graph when the MTP block cannot
+  run on it — a MoE draft block, as in every Qwen3.5/3.6-MoE (`mtp_graph_ok`
+  admits a dense one only). Such a block drafts, and warms its cache over the
+  whole prompt, op by op on the host: Apex-35B greedy decoded 51.8 against
+  65.6 tok/s plain and paid 2.5 ms per prompt position (a 4096-token prompt
+  171 against 295 tok/s); the published Qwen3.6-35B-A3B 79.7 against 86.6.
+  `CMF_GRAPH_SPEC=1` still opts in. Sampled generation was unaffected (it
+  did not speculate).
+- The decode token graph no longer re-walks every MoE expert on every token.
+  The pipeline builds each layer's expert bank once — tensor indices, layout
+  flags, activation — keyed by the layer and the identity of its expert
+  weights (`CMF_GRAPH_MOE_BANK=0` rebuilds it per token); the graph memoizes
+  the experts' payload bytes per (file, table) instead of hashing all 768
+  indices of a layer into a fresh set, and skips the Prism walk over the
+  experts for a file without a Prism contract. Host setup was ~2.3 ms of a
+  14.6 ms token on a 40-layer, 256-expert stack (Xeon Gold 6342) while the
+  GPU waited: Apex-35B q4tp-v2 decode 67.4 → 80.0 tok/s.
+
+Together on Apex-35B-V1.0 (A40 48 GB, no env, against the 0.8.45 release
+binary; 0.8.46 and 0.8.47 do not touch this path):
+q4tp-v2 decode 52.9 → 80.3 tok/s, a 4096-token prompt 171.8 → 389.7 tok/s
+(first token 23.9 → 10.5 s), decode at 4k 46.8 → 73.3; q8_2f decode 50.0 →
+78.2, a 4096-token prompt 40.8 → 84.1. The published Qwen3.6-35B-A3B q4tp on
+the same card: decode 78.8 → 101.5 tok/s, a 4096-token prompt 173.1 → 649.4
+tok/s (first token 23.7 → 6.3 s). Greedy output on a 3.2k-token prompt is
+byte-identical to the previous code for all three files and wikitext-2
+perplexity is unchanged (25.833 / 25.724 / 5.586).
+
 ### Added
+- Apex-35B-V1.0 (Apex Intelligence's agentic fine-tune of Qwen3.6-35B-A3B) in
+  CMF: `q4tp-v2` (GPTQ experts, default), `q4tp` and `q8_2f` files on
+  [Hugging Face](https://huggingface.co/infosave/Apex-35B-V1.0-cmf), card
+  source `docs/hf/Apex-35B-V1.0-cmf.md`. `scripts/apex/` holds the pod
+  scripts: conversion and GPTQ, the PyTorch reference perplexity, the
+  per-position comparison, chat parity, a tool-call smoke test and the
+  benchmarks. Against the bf16 checkpoint in PyTorch over the same tokens,
+  held-out chat: q8_2f top-1 97.7 %, mean |ΔNLL| 0.070; q4tp-v2 95.2 %, 0.138.
 - English and Chinese editions of the task-compression documentation: the
   `cortiq compress` guide (`docs/COMPRESS.md`, `docs/COMPRESS.zh.md`) and both
   research articles (`docs/research/TASK_COMPRESSION_ARTICLE.*`,
