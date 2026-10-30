@@ -9759,11 +9759,11 @@ async fn cmd_run(
             }
             let pool = cortiq_engine::pool::Pool::from_env();
             let depth = sp::DepthDecoder::from_model(&model, pool.clone()).map_err(anyhow::Error::msg)?;
-            let sampling = sp::AudioSampling {
-                temperature: if greedy { 0.0 } else { 1.0 },
-                fixed_order: std::env::var("CMF_LFM3_MASKGIT_FIXED").as_deref() == Ok("1"),
-                ..Default::default()
-            };
+            let mut sampling = sp::AudioSampling::from_model(&model);
+            if greedy {
+                sampling.temperature = 0.0;
+            }
+            sampling.fixed_order = std::env::var("CMF_LFM3_MASKGIT_FIXED").as_deref() == Ok("1");
             let t0 = std::time::Instant::now();
             let out = sp::speak(&mut pipeline, &depth, &sids, srows.as_deref(), max_tokens, &sampling,
                 seed.unwrap_or_else(|| std::time::SystemTime::now()

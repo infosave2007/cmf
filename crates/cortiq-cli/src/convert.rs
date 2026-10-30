@@ -11049,7 +11049,14 @@ pub fn run_convert_multi_excluding(
             .ok()
             .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
             .unwrap_or(serde_json::Value::Null);
-        p["lfm3_audio"] = serde_json::json!({"config": config.clone(), "features": features, "codec": codec});
+        // The speech sampling the release recommends (`audio_*`).
+        let generation = read("generation_config.json");
+        p["lfm3_audio"] = serde_json::json!({
+            "config": config.clone(),
+            "features": features,
+            "codec": codec,
+            "generation": generation,
+        });
         p
     } else {
         provenance

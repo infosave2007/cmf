@@ -315,6 +315,38 @@ impl Default for AudioSampling {
     }
 }
 
+impl AudioSampling {
+    /// The release's own `audio_*` settings (its generation config, kept by
+    /// the converter in `provenance.lfm3_audio.generation`): LFM3-Omni
+    /// samples at 0.4 with a 1.2 penalty over 64 frames and no top-k.
+    pub fn from_model(model: &CmfModel) -> Self {
+        let mut s = Self::default();
+        let g = model
+            .header
+            .provenance
+            .as_ref()
+            .and_then(|p| p.get("lfm3_audio"))
+            .and_then(|a| a.get("generation"));
+        if let Some(g) = g {
+            if let Some(t) = g.get("audio_temperature").and_then(|v| v.as_f64()) {
+                s.temperature = t as f32;
+            }
+            match g.get("audio_top_k") {
+                Some(v) if v.is_null() => s.top_k = 0,
+                Some(v) => s.top_k = v.as_u64().map_or(s.top_k, |k| k as usize),
+                None => {}
+            }
+            if let Some(r) = g.get("audio_repetition_penalty").and_then(|v| v.as_f64()) {
+                s.repetition_penalty = r as f32;
+            }
+            if let Some(w) = g.get("audio_repetition_window").and_then(|v| v.as_u64()) {
+                s.repetition_window = w as usize;
+            }
+        }
+        s
+    }
+}
+
 /// The depth decoder and the language model's speech-frame embedding.
 pub struct DepthDecoder {
     linear: (Dense, Vec<f32>),
