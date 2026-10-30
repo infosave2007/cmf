@@ -122,6 +122,6 @@ before the first kernel runs.
   Where a number was not measured, the card says so.
 - The full dtype × execution-path matrix — which format is fast on which
   backend, and where the honest gaps are — is
-  [`docs/QUANT_COVERAGE.ru.md`](https://github.com/infosave2007/cmf/blob/master/docs/QUANT_COVERAGE.ru.md).
+  [`docs/QUANT_COVERAGE.md`](https://github.com/infosave2007/cmf/blob/master/docs/QUANT_COVERAGE.md).
 - The normative layout of every dtype is §3.2 of
   [`CMF_V2_SPEC.md`](https://github.com/infosave2007/cmf/blob/master/docs/CMF_V2_SPEC.md).
