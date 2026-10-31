@@ -15,6 +15,9 @@ use crate::inference;
 pub mod mimo_mtp;
 #[path = "clover.rs"]
 pub mod clover;
+/// d1's non-causal forward over a packed state and question set.
+#[path = "pipeline_masked.rs"]
+pub mod masked;
 use crate::kv_cache::KvCache;
 use crate::linear_core::{
     GdnCfg, GdnWeights, ShortConvCfg, ShortConvWeights, VmfPhaseCfg, VmfPhaseWeights, gdn_forward,

@@ -8394,6 +8394,8 @@ fn hf_download_opts_at_revision(
         // Vision-language checkpoints (LFM3-VL) keep the image/video
         // preprocessing here.
         ("processor_config.json", false),
+        // d1 decision models: the release's calibration.
+        ("calibration.json", false),
         // Newer HF checkpoints (LFM2, Qwen3, …) ship the chat template as a
         // sidecar `chat_template.jinja` instead of embedding it in
         // tokenizer_config.json — without it `run` falls back to a generic
@@ -10898,6 +10900,29 @@ pub fn run_convert_multi_excluding(
             "lfm3_vl: processor_config.json is missing — the image preprocessing lives there"
         );
         p["lfm3_vl"] = serde_json::json!({"config": config.clone(), "processor": processor});
+        p
+    } else {
+        provenance
+    };
+    // d1 decision models (Liquid AI's System One on LFM3): the serving
+    // switches (`d1_*`) and the release's calibration, which every answer
+    // goes through.
+    let provenance = if arch.arch_name == "lfm3"
+        && config.as_object().is_some_and(|o| o.keys().any(|k| k.starts_with("d1_")))
+    {
+        let mut p = provenance;
+        let calibration: serde_json::Value = fs::read(dir.join("calibration.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .ok_or_else(|| anyhow::anyhow!("d1: calibration.json is missing beside the checkpoint"))?;
+        let d1: serde_json::Map<String, serde_json::Value> = config
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(k, _)| k.starts_with("d1_"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        p["d1"] = serde_json::json!({"config": d1, "calibration": calibration});
         p
     } else {
         provenance

@@ -400,6 +400,23 @@ enum Commands {
         #[arg(long)]
         lookup_mode: Option<String>,
     },
+    /// d1 decision models (Liquid AI's System One on LFM3): named questions
+    /// over a state and its pictures, answered from one forward pass as
+    /// calibrated distributions; prints `{"answers": ..., "usage": ...}`
+    SystemOne {
+        /// Path to a d1 .cmf file
+        model: String,
+        /// The state: text, or `@file` (a `.json` file is read as JSON)
+        #[arg(long)]
+        state: Option<String>,
+        /// Named questions as JSON: `{"refund": {"type": "noul",
+        /// "instructions": "Is this a refund request?"}}`, or `@file`
+        #[arg(long)]
+        questions: String,
+        /// Picture path, data URL or HTTP(S) URL (repeatable)
+        #[arg(long = "image")]
+        images: Vec<String>,
+    },
     /// Decide with a decision file: one text (-p) or a JSONL batch (--input);
     /// locally, and with --oracle MODEL (the key in OPENROUTER_API_KEY) an
     /// OpenRouter model answers only what the local model cannot decide
@@ -3811,6 +3828,9 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Commands::Decide(args) => decision::run_decide(&args),
+        Commands::SystemOne { model, state, questions, images } => {
+            run_system_one(&model, state.as_deref(), &questions, &images)
+        }
         Commands::Decision { cmd } => decision::run_decision(&cmd),
         Commands::Convert {
             model,
@@ -12344,6 +12364,44 @@ async fn cmd_bench(
         );
     }
     println!("  Finish:  {}", result.finish_reason);
+    Ok(())
+}
+
+/// `@file` → its contents, else the argument itself.
+fn arg_or_file(v: &str) -> anyhow::Result<(String, bool)> {
+    match v.strip_prefix('@') {
+        Some(path) => Ok((std::fs::read_to_string(path)?, path.ends_with(".json"))),
+        None => Ok((v.to_string(), false)),
+    }
+}
+
+fn run_system_one(model: &str, state: Option<&str>, questions: &str, images: &[String]) -> anyhow::Result<()> {
+    let cmf = Arc::new(CmfModel::open(model)?);
+    anyhow::ensure!(
+        cortiq_engine::d1::is_d1(&cmf),
+        "{model} is not a d1 decision model (no provenance.d1)"
+    );
+    let pipeline = Pipeline::from_model(&cmf, SamplerConfig::default())?;
+    let d1 = cortiq_engine::d1::D1::from_model(&cmf).map_err(anyhow::Error::msg)?;
+    let state = match state {
+        None => serde_json::Value::Null,
+        Some(s) => {
+            let (text, json_file) = arg_or_file(s)?;
+            if json_file { serde_json::from_str(&text)? } else { serde_json::Value::String(text) }
+        }
+    };
+    let (q, _) = arg_or_file(questions)?;
+    let questions: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&q)
+        .map_err(|e| anyhow::anyhow!("--questions must be a JSON object of named questions: {e}"))?;
+    let req = cortiq_engine::d1::Request {
+        state,
+        questions,
+        images: images.iter().map(|p| serde_json::json!({"url": p})).collect(),
+    };
+    let t0 = std::time::Instant::now();
+    let out = d1.system_one(&pipeline, &req).map_err(anyhow::Error::msg)?;
+    println!("{}", serde_json::to_string_pretty(&out)?);
+    eprintln!("system-one: {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
     Ok(())
 }
 

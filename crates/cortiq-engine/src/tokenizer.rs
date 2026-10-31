@@ -1055,6 +1055,46 @@ impl Tokenizer {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
+    /// The raw bytes token `id` stands for (an added token: its content), so
+    /// a caller can map an encoded text's tokens back to its characters.
+    pub fn token_bytes(&self, id: u32) -> Vec<u8> {
+        let idx = id as usize;
+        let Some(tok) = self.id_to_token.get(idx) else {
+            return Vec::new();
+        };
+        if self.added_ids.contains(&id) {
+            return tok.as_bytes().to_vec();
+        }
+        if tok.starts_with("<0x") && tok.ends_with('>') && tok.len() == 6 {
+            if let Ok(b) = u8::from_str_radix(&tok[3..5], 16) {
+                return vec![b];
+            }
+        }
+        if self.metaspace {
+            return tok.replace('\u{2581}', " ").into_bytes();
+        }
+        let mut bytes = Vec::new();
+        for ch in tok.chars() {
+            match self.char_to_byte.get(&ch) {
+                Some(&b) => bytes.push(b),
+                None => {
+                    let mut buf = [0u8; 4];
+                    bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                }
+            }
+        }
+        bytes
+    }
+
+    /// The text of every special added token (what `decode` skips).
+    pub fn special_texts(&self) -> Vec<String> {
+        self.added
+            .iter()
+            .filter(|(_, id)| self.special_ids.contains(id))
+            .map(|(text, _)| text.clone())
+            .collect()
+    }
+
     /// Decode one vocabulary entry for Engram's compressed token map while
     /// retaining special tokens.
     pub fn decode_token_for_hash(&self, id: u32) -> String {
