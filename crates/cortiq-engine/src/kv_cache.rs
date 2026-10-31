@@ -543,6 +543,23 @@ impl LayerKvCache {
         }
     }
 
+    /// The rotated-query trace collected so far (`[rows × num_heads ×
+    /// head_dim]`), while collecting.
+    pub(crate) fn o1_q_trace(&self) -> Option<&[f32]> {
+        match &self.o1 {
+            Some(O1State::Collecting { q_buf, .. }) => Some(q_buf),
+            _ => None,
+        }
+    }
+
+    /// Move a collecting layer's deferred boundary (the seal diagnostics
+    /// collect past it, then seal at the row count they choose).
+    pub(crate) fn o1_set_boundary(&mut self, at: usize) {
+        if let Some(O1State::Collecting { seal_at, .. }) = &mut self.o1 {
+            *seal_at = Some(at);
+        }
+    }
+
     pub fn o1_sealed(&self) -> bool {
         matches!(self.o1, Some(O1State::Sealed { .. }))
     }
@@ -559,7 +576,13 @@ impl LayerKvCache {
     /// Whether a batch of `count` exact rows would cross the deferred
     /// boundary. This lets batched/pair callers split before row B rather
     /// than appending exact KV past the point where conversion is required.
+    /// A batch that ends exactly on the boundary crosses nothing: all its
+    /// rows are exact, and the caller seals after it. `CMF_O1_WALK_BOUNDARY=1`
+    /// walks such a batch row by row as before.
     pub(crate) fn o1_boundary_crossed_by(&self, count: usize) -> bool {
+        static WALK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let walk =
+            *WALK.get_or_init(|| std::env::var("CMF_O1_WALK_BOUNDARY").as_deref() == Ok("1"));
         let Some(target) = self.o1_pending_boundary() else {
             return false;
         };
@@ -567,7 +590,7 @@ impl LayerKvCache {
             || self
                 .seq_len
                 .checked_add(count)
-                .map_or(true, |next| next >= target)
+                .map_or(true, |next| next > target || (walk && next == target))
     }
 
     pub(crate) fn take_o1_transition(&mut self) -> bool {
@@ -2498,6 +2521,34 @@ mod tests {
         cache.evict(4);
         assert_eq!(cache.seq_len(), 4);
         assert_eq!(cache.layers[0].head_len(0), 4);
+    }
+
+    /// A batch that ends exactly on the deferred boundary holds only exact
+    /// rows and must stay on the batched path; only a batch that would
+    /// append a row past the boundary is split. (Walking the boundary chunk
+    /// row by row sent the 27B's last prefix rows down another projection
+    /// route than every other prefix row and flipped its O(1) generation.)
+    #[test]
+    fn o1_batch_ending_on_boundary_does_not_cross_it() {
+        const B: usize = 19;
+        let mut layer = KvCache::new(1, 1, 4, 64).layers.remove(0);
+        layer.mode = KvMode::F32;
+        layer.o1_begin_with_boundary(4, 8, 2, crate::nystrom::O1Rect::Aggregate, Some(B));
+        for _ in 0..B - 3 {
+            layer.o1_push_q(&[0.1; 8]);
+            layer.append(&[0.2; 4], &[0.3; 4], &[]);
+        }
+        assert!(!layer.o1_boundary_crossed_by(1));
+        assert!(
+            !layer.o1_boundary_crossed_by(3),
+            "ends on B: exact rows only"
+        );
+        assert!(layer.o1_boundary_crossed_by(4), "row B+1 must not be exact");
+        for _ in 0..3 {
+            layer.o1_push_q(&[0.1; 8]);
+            layer.append(&[0.2; 4], &[0.3; 4], &[]);
+        }
+        assert!(layer.o1_boundary_crossed_by(1), "at B every row is past it");
     }
 
     #[test]

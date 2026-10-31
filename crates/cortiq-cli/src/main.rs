@@ -1442,14 +1442,15 @@ enum Commands {
         /// Single prompt (non-interactive)
         #[arg(short, long)]
         prompt: Option<String>,
-        /// Image path, data URL, or HTTP(S) URL for a V4.1 or MiMo prompt.
-        /// Repeat the flag to place images after the text in prompt order.
+        /// Image path, data URL, or HTTP(S) URL for a V4.1, MiMo or LFM3-VL
+        /// prompt. Repeat the flag for several images (MiMo and V4.1 place
+        /// them after the text, LFM3-VL before it).
         #[arg(long = "image")]
         images: Vec<String>,
-        /// MiMo video: local Y4M file or directory of image frames.
+        /// MiMo or LFM3-VL video: local Y4M file or directory of image frames.
         #[arg(long = "video")]
         videos: Vec<String>,
-        /// Frame-directory sampling rate (MiMo video).
+        /// Frame rate of a frame directory (MiMo, LFM3-VL video).
         #[arg(long)]
         video_fps: Option<f64>,
         /// MiMo WAV file, data URL, or HTTP(S) URL; repeat for multiple clips.
@@ -1458,7 +1459,8 @@ enum Commands {
         /// Explicit MiMo multimodal companion (otherwise discovered beside text).
         #[arg(long)]
         mm: Option<std::path::PathBuf>,
-        /// Maximum pixels per MiMo image/video frame before patchification.
+        /// Maximum pixels per MiMo or LFM3-VL image (video frame) before
+        /// patchification.
         #[arg(long)]
         image_max_pixels: Option<usize>,
         /// V4.1 reasoning budget: 1..=100 or low/high/max.
@@ -7905,6 +7907,34 @@ fn cmd_ppl(
         std::fs::write(&p, s.join(" "))?;
     }
 
+    // CMF_PREFILL_PARITY=split[,k]: the host prefill, the batch graph and a
+    // host prefix continued on the graph over the same tokens (diagnostic).
+    if let Ok(spec) = std::env::var("CMF_PREFILL_PARITY") {
+        let mut it = spec.split(',').map(|s| s.trim().parse::<usize>().ok());
+        let split = it
+            .next()
+            .flatten()
+            .ok_or_else(|| anyhow::anyhow!("CMF_PREFILL_PARITY=split[,k]"))?;
+        let k = it.next().flatten().unwrap_or(64);
+        let report = pipeline
+            .prefill_parity_probe(&ids, split, k)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        println!("{report}");
+        return Ok(());
+    }
+    // CMF_PREFILL_PARITY_O1=k with --o1: the O(1) seal from a host prefix
+    // against seals from a batch-graph prefix (diagnostic).
+    if let Ok(k) = std::env::var("CMF_PREFILL_PARITY_O1") {
+        let cfg = o1
+            .cfg()?
+            .ok_or_else(|| anyhow::anyhow!("CMF_PREFILL_PARITY_O1 needs --o1"))?;
+        let k = k.trim().parse::<usize>().unwrap_or(64);
+        let report = pipeline
+            .o1_seal_parity_probe(&ids, cfg, o1_prefill.unwrap_or(256), k)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        println!("{report}");
+        return Ok(());
+    }
     if let Some(offsets) = windowed {
         return ppl_windows(
             &mut pipeline,
@@ -9075,10 +9105,18 @@ async fn cmd_run(
     let is_dsv41 = model.arch().arch_name == "deepseek_v41";
     let is_mimo = model.arch().arch_name == "mimo_v2";
     let mimo_media = is_mimo && (!images.is_empty() || !videos.is_empty() || !audios.is_empty());
+    let lfm3_vl = cortiq_engine::lfm3_vl::has_vision(&model);
+    let lfm3_media = lfm3_vl && (!images.is_empty() || !videos.is_empty());
     anyhow::ensure!(is_dsv41 || reasoning_effort.is_none(), "--reasoning-effort requires DeepSeek-V4.1");
-    anyhow::ensure!(is_dsv41 || is_mimo || images.is_empty(), "--image requires DeepSeek-V4.1 or MiMo");
-    anyhow::ensure!(is_mimo || (videos.is_empty() && audios.is_empty() && media_options.companion.is_none()
-        && media_options.video_fps.is_none() && media_options.image_max_pixels.is_none()), "--video/--audio/--mm and MiMo processing options require MiMo");
+    anyhow::ensure!(is_dsv41 || is_mimo || lfm3_media || images.is_empty(),
+        "--image requires DeepSeek-V4.1, MiMo or an LFM3-VL file");
+    anyhow::ensure!(is_mimo || (audios.is_empty() && media_options.companion.is_none()
+        && ((videos.is_empty() && media_options.video_fps.is_none() && media_options.image_max_pixels.is_none())
+            || lfm3_vl)),
+        "--video/--audio/--mm and MiMo processing options require MiMo (--video and its options: or LFM3-VL)");
+    anyhow::ensure!(!lfm3_media || (!raw && state.is_none() && peer.is_none() && gpus.is_none()
+        && std::env::var_os("CMF_PROMPT_IDS").is_none()),
+        "LFM3-VL images require a fresh local chat prompt (no --raw/--state/--peer/--gpus/CMF_PROMPT_IDS)");
     anyhow::ensure!((images.is_empty() && videos.is_empty() && audios.is_empty()) || prompt.is_some(),
         "media input requires --prompt so media order is unambiguous");
     anyhow::ensure!(!mimo_media || (!raw && state.is_none() && peer.is_none() && gpus.is_none()
@@ -9592,10 +9630,26 @@ async fn cmd_run(
                 &[serde_json::json!({"role":"user", "content":content})], None, thinking, media_options)
                 .map_err(anyhow::Error::msg)?)
         } else { None };
+        // LFM3-VL: images, then videos, then the text, as in Liquid's examples.
+        let lfm3_inputs = if lfm3_media {
+            let mut content: Vec<serde_json::Value> = images.iter()
+                .map(|path| serde_json::json!({"type":"image_url", "image_url":{"url":path}}))
+                .collect();
+            content.extend(videos.iter().map(|path| serde_json::json!({"type":"video", "video":{"path":path}})));
+            content.push(serde_json::json!({"type":"text", "text":p}));
+            Some(cortiq_engine::lfm3_vl::prepare(&model, &pipeline,
+                &[serde_json::json!({"role":"user", "content":content})], None, thinking,
+                &cortiq_engine::lfm3_vl::VlOptions {
+                    image_max_pixels: media_options.image_max_pixels,
+                    video_fps: media_options.video_fps,
+                })
+                .map_err(anyhow::Error::msg)?)
+        } else { None };
         let mut ids = vl_inputs
             .as_ref()
             .map(|inputs| inputs.token_ids.clone())
             .or_else(|| mimo_inputs.as_ref().map(|inputs| inputs.token_ids.clone()))
+            .or_else(|| lfm3_inputs.as_ref().map(|inputs| inputs.token_ids.clone()))
             .unwrap_or_else(|| build_ids(&pipeline, &history, p));
         // CMF_PROMPT_IDS=<file>: feed exactly these token ids (a JSON array,
         // or ids separated by commas/whitespace) instead of the tokenized
@@ -9630,7 +9684,9 @@ async fn cmd_run(
                 .collect();
             eprintln!("head {}\ntail {}", head.join(" "), tail.join(" "));
         }
-        generate_and_print(&mut pipeline, &ids, vl_inputs.as_ref(), mimo_inputs.as_ref().and_then(|p| p.rows.as_deref()))?;
+        let media_rows = mimo_inputs.as_ref().and_then(|p| p.rows.as_deref())
+            .or_else(|| lfm3_inputs.as_ref().and_then(|p| p.rows.as_deref()));
+        generate_and_print(&mut pipeline, &ids, vl_inputs.as_ref(), media_rows)?;
     } else {
         println!("\nType your message (Ctrl+C to exit):\n");
         let stdin = std::io::stdin();

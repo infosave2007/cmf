@@ -620,7 +620,11 @@ pub struct ModelArch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_global_kv_heads: Option<usize>,
     /// …and a proportional partial rotary: the first `factor·head_dim`
-    /// dims rotate, the rest ride at angle 0 (identity).
+    /// dims rotate, the rest ride at angle 0 (identity). Without
+    /// `global_head_dim` (LFM3) it applies to the full-attention layers at
+    /// the model's own head width: the whole head rotates
+    /// (`partial_rotary_factor` 1.0) with the full-head frequency
+    /// progression, and the frequencies past `factor·head_dim/2` are zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub global_partial_rotary_factor: Option<f32>,
     /// Final-logit soft-capping: logits = C·tanh(logits/C) (Gemma-4).

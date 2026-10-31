@@ -2294,6 +2294,16 @@ pub fn o1_qcap_take() -> Option<Vec<(usize, Vec<f32>)>> {
     None
 }
 
+/// One GDN layer's recurrent state as the wgpu graph holds it, in the host
+/// `linear_state` layout ([conv ring | S]).
+pub fn graph_gdn_state_read(_kv_id: u64, _layer: usize) -> Option<Vec<f32>> {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::graph_gdn_state_read(_kv_id, _layer);
+    }
+    None
+}
+
 /// Copy rows back from the wgpu token graph's K/V mirrors in one submit:
 /// for each `(layer, from, to)` the K and V rows `[from..to)`, position-major
 /// (`[(to − from) × nkv × hd]` each).

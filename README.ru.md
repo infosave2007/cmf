@@ -114,6 +114,26 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Liquid AI LFM3 (0.8.49)
+
+[LFM3-1.7B](https://huggingface.co/infosave/LFM3-1.7B-cmf) — трёхгибридная
+модель Liquid AI для локальных агентов и вызова инструментов (короткие свёртки,
+полное внимание и внимание со скользящим окном, контекст 262k), её
+предобученная [Base](https://huggingface.co/infosave/LFM3-1.7B-Base-cmf) и
+визуально-языковая [LFM3-VL-2B](https://huggingface.co/infosave/LFM3-VL-2B-cmf)
+(изображения и видео):
+
+```sh
+hf download infosave/LFM3-1.7B-cmf lfm3-1.7b-q8_2f.cmf --local-dir .
+cortiq run lfm3-1.7b-q8_2f.cmf --prompt "Напиши функцию на Python, которая сливает два отсортированных списка." --max-tokens 2048
+cortiq run lfm3-vl-2b-q8_2f.cmf --image photo.jpg --prompt "Опиши это изображение." --max-tokens 1024
+```
+
+Конвертация совпадает с Transformers float32 по каждой позиции. На NVIDIA A40
+8-битный файл генерирует 166 ток/с, 4-битный — 231 ток/с; промпт в 4096 токенов
+читается со скоростью ~600 ток/с. Тот же релиз передаёт шаблонам чата
+`bos_token`, которого не хватало промптам LFM2/LFM2.5/LFM3.
+
 ## Apex-35B-V1.0 и ускорение графов Qwen3.5-MoE (0.8.48)
 
 [Apex-35B-V1.0](https://huggingface.co/infosave/Apex-35B-V1.0-cmf) — агентное

@@ -705,6 +705,9 @@ fn canon_name_for_arch(arch: &ModelArch, raw: &str, towers: MimoTowers) -> Optio
     if arch.arch_name == "spark2_5" {
         return spark25_canon(raw);
     }
+    if arch.arch_name == "lfm3" {
+        return lfm3_canon(raw);
+    }
     if arch.arch_name.eq_ignore_ascii_case("whisper")
         && (raw.starts_with("model.encoder.") || raw.starts_with("model.decoder."))
     {
@@ -745,6 +748,42 @@ fn spark25_canon(raw: &str) -> Option<String> {
         raw.replace(".self_attn.q_k_v_proj.", ".self_attn.qkv_proj.")
             .replace(".self_attn.out_proj.", ".self_attn.o_proj."),
     )
+}
+
+/// LFM3 (`lfm3`) onto the canonical layout. The LFM2 names, except that
+/// every layer carries sandwich norms, so the four norms take the Gemma
+/// spellings the loader's sandwich path reads (by the presence of
+/// `pre_feedforward_layernorm`):
+///
+///   operator_norm → input_layernorm
+///   post_operator_norm → post_attention_layernorm (mixer output)
+///   ffn_norm → pre_feedforward_layernorm
+///   post_ffn_norm → post_feedforward_layernorm (FFN output)
+///   self_attn.gate_proj (one sigmoid gate per head) → self_attn.g_proj
+///
+/// LFM3-VL (`lfm3_vl`) wraps the same text model as `model.language_model`;
+/// its vision tower and projector keep their source names minus the
+/// `model.` wrapper (`vision_tower.*`, `multi_modal_projector.*`), which
+/// is where `lfm3_vl` reads them.
+fn lfm3_canon(name: &str) -> Option<String> {
+    if let Some(rest) = name.strip_prefix("model.language_model.") {
+        return lfm3_canon(&format!("model.{rest}"));
+    }
+    if let Some(rest) = name.strip_prefix("model.") {
+        if rest.starts_with("vision_tower.") || rest.starts_with("multi_modal_projector.") {
+            return Some(rest.to_string());
+        }
+    }
+    if name == "model.embedding_norm.weight" {
+        return Some("model.norm.weight".to_string());
+    }
+    let n = name
+        .replace(".post_operator_norm.", ".post_attention_layernorm.")
+        .replace(".post_ffn_norm.", ".post_feedforward_layernorm.")
+        .replace(".operator_norm.", ".input_layernorm.")
+        .replace(".ffn_norm.", ".pre_feedforward_layernorm.")
+        .replace(".self_attn.gate_proj.", ".self_attn.g_proj.");
+    Some(lfm2_canon(&n))
 }
 
 /// Map LFM2 / LFM2-MoE vendor tensor names onto CMF's canonical (Qwen2)
@@ -828,10 +867,20 @@ fn force_f32(name: &str) -> bool {
 /// unrelated tensors, and existing F32 controls are checked first by the
 /// emitter below.
 fn force_dsv41_vision_f16(arch: &ModelArch, name: &str, shape: &[usize]) -> bool {
-    arch.deepseek_v41.is_some()
+    (arch.deepseek_v41.is_some()
         && shape.len() == 2
         && name.ends_with(".weight")
-        && (name.starts_with("vision.") || name.starts_with("aligner."))
+        && (name.starts_with("vision.") || name.starts_with("aligner.")))
+        || lfm3_vision(arch, name)
+}
+
+/// LFM3-VL's vision tower and projector stay f16 in every profile: against
+/// Transformers float32 on one image, the f16 tower's rows have a mean
+/// cosine of 0.999995 (worst 0.99984), q8_2f 0.9977 on the CPU (worst
+/// 0.958) and 0.993 through the device GEMM (worst 0.61).
+fn lfm3_vision(arch: &ModelArch, name: &str) -> bool {
+    arch.arch_name == "lfm3"
+        && (name.starts_with("vision_tower.") || name.starts_with("multi_modal_projector."))
 }
 
 /// M3's router starts as an F32 source plane and its top-4 choice is
@@ -6975,6 +7024,10 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     // Spark-X2.5 nests its two profiles the same way.
     let is_laguna_config =
         model_type.eq_ignore_ascii_case("laguna") || model_type.eq_ignore_ascii_case("spark2_5");
+    // LFM3 keys its profiles the same way (full θ 1e6 with a zero-tail
+    // partial rotary, sliding θ 1e4 rotating the whole head).
+    let is_lfm3 = model_type.eq_ignore_ascii_case("lfm3") || tc_model_type.eq_ignore_ascii_case("lfm3");
+    let is_laguna_config = is_laguna_config || is_lfm3;
     let is_mellum_config = model_type.eq_ignore_ascii_case("mellum");
     let is_dual_rope_config = is_laguna_config || is_mellum_config;
     let rope = if is_dual_rope_config {
@@ -7432,7 +7485,9 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         }
     }
     let mut arch = ModelArch {
-        arch_name: model_type.clone(),
+        // LFM3-VL's text model is plain LFM3; its vision tower rides along
+        // under `vision_tower.*` with the checkpoint config in provenance.
+        arch_name: if is_lfm3 { "lfm3".to_string() } else { model_type.clone() },
         hidden_size: hidden,
         intermediate_size: cfg_usize(tc, "intermediate_size")
             .or_else(|| {
@@ -7589,6 +7644,7 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         sliding_window: cfg_usize(tc, "sliding_window").filter(|_| {
             is_laguna
                 || mt == "spark2_5"
+                || is_lfm3
                 || is_mellum_config
                 || is_gemma2
                 || is_gemma3n
@@ -7653,6 +7709,37 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         kv_heads_per_layer: None,
         v_head_dim: None,
     };
+    if is_lfm3 {
+        // LFM3's partial rotary keeps the frequency progression of the FULL
+        // head (θ^(-2i/head_dim)) and zeroes the tail instead of narrowing
+        // the rotated width — rotate_half still pairs dim i with
+        // i + head_dim/2. That is Gemma-4's proportional table: the header
+        // rotates the whole head and `global_partial_rotary_factor` zeroes
+        // the tail of the full-attention layers; the sliding layers rotate
+        // the whole head with their own base.
+        for (kind, profile) in [("full_attention", rope), ("sliding_attention", local_rope)] {
+            let ty = profile
+                .and_then(|r| r.get("rope_type").or_else(|| r.get("type")))
+                .and_then(|v| v.as_str())
+                .unwrap_or("default");
+            anyhow::ensure!(
+                ty == "default",
+                "lfm3: rope_type {ty:?} on {kind} layers is not supported (only \"default\")"
+            );
+        }
+        anyhow::ensure!(
+            tc.get("use_sandwich_norm").and_then(|v| v.as_bool()).unwrap_or(false),
+            "lfm3: use_sandwich_norm=false is not supported (every published LFM3 sets it)"
+        );
+        anyhow::ensure!(
+            !tc.get("conv_bias").and_then(|v| v.as_bool()).unwrap_or(false),
+            "lfm3: conv_bias=true is not supported"
+        );
+        let zero_tail = arch.partial_rotary_factor;
+        arch.partial_rotary_factor = 1.0;
+        arch.global_partial_rotary_factor = (zero_tail < 1.0).then_some(zero_tail);
+        arch.local_partial_rotary_factor = Some(local_prf.unwrap_or(1.0));
+    }
     if let Some(g) = mimo {
         // MiMo-V2: an explicit per-layer full/sliding schedule (the loader's
         // explicit_sliding path: window on the tagged layers, their own
@@ -8304,6 +8391,9 @@ fn hf_download_opts_at_revision(
         ("tiktoken.model", false),
         ("tokenizer_config.json", false),
         ("generation_config.json", false),
+        // Vision-language checkpoints (LFM3-VL) keep the image/video
+        // preprocessing here.
+        ("processor_config.json", false),
         // Newer HF checkpoints (LFM2, Qwen3, …) ship the chat template as a
         // sidecar `chat_template.jinja` instead of embedding it in
         // tokenizer_config.json — without it `run` falls back to a generic
@@ -10794,6 +10884,23 @@ pub fn run_convert_multi_excluding(
             "source_model": model,
             "weight_quant": requested_quant,
         }),
+    };
+    // LFM3-VL: the checkpoint and processor configs the vision path reads
+    // (`lfm3_vl::Lfm3VlConfig`).
+    let provenance = if config.get("vision_config").is_some() && arch.arch_name == "lfm3" {
+        let mut p = provenance;
+        let processor: serde_json::Value = fs::read(dir.join("processor_config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or(serde_json::Value::Null);
+        anyhow::ensure!(
+            !processor.is_null(),
+            "lfm3_vl: processor_config.json is missing — the image preprocessing lives there"
+        );
+        p["lfm3_vl"] = serde_json::json!({"config": config.clone(), "processor": processor});
+        p
+    } else {
+        provenance
     };
     let provenance = if arch.arch_name == "whisper" {
         let mut p = provenance;
@@ -13428,6 +13535,80 @@ pub(crate) mod tests {
         // whatever the state buffer happened to hold.
         assert_eq!(arch.linear_conv_kernel_dim, Some(3));
         assert!(arch.moe.is_none(), "the dense build has no experts");
+    }
+
+    /// LFM3: a third mixer (sliding attention), per-type RoPE with a
+    /// zero-tail partial rotary on the full layers, width-7 conv, sandwich
+    /// norms and a per-head sigmoid gate — all of it has to land in the
+    /// header and the canonical names, or the file decodes plausibly wrong.
+    #[test]
+    fn lfm3_header_and_names() {
+        let cfg: serde_json::Value = serde_json::from_str(
+            r#"{
+            "model_type": "lfm3", "architectures": ["Lfm3ForCausalLM"],
+            "hidden_size": 2048, "num_hidden_layers": 4, "head_dim": 128,
+            "num_attention_heads": 16, "num_key_value_heads": 4,
+            "intermediate_size": 7680, "vocab_size": 128000,
+            "norm_eps": 1e-5, "conv_L_cache": 7, "conv_bias": false,
+            "layer_types": ["conv","full_attention","conv","sliding_attention"],
+            "rope_parameters": {
+                "full_attention": {"partial_rotary_factor": 0.5, "rope_theta": 1000000.0, "rope_type": "default"},
+                "sliding_attention": {"rope_theta": 10000, "rope_type": "default"}
+            },
+            "sliding_window": 256, "use_sandwich_norm": true,
+            "max_position_embeddings": 262144, "tie_word_embeddings": true
+        }"#,
+        )
+        .unwrap();
+        let arch = build_arch(&cfg).unwrap();
+        use cortiq_core::LayerType as L;
+        assert!(matches!(
+            arch.layer_types.as_slice(),
+            [L::ShortConv, L::FullAttention, L::ShortConv, L::SlidingAttention]
+        ));
+        assert_eq!(arch.linear_conv_kernel_dim, Some(7));
+        assert_eq!(arch.sliding_window, Some(256));
+        assert_eq!(arch.rope_theta, 1_000_000.0);
+        assert_eq!(arch.rope_local_base_freq, Some(10_000.0));
+        // The zero tail rides `global_partial_rotary_factor` over a fully
+        // rotated head; the sliding layers rotate the whole head.
+        assert_eq!(arch.partial_rotary_factor, 1.0);
+        assert_eq!(arch.global_partial_rotary_factor, Some(0.5));
+        assert_eq!(arch.local_partial_rotary_factor, Some(1.0));
+        assert!(arch.global_head_dim.is_none());
+        assert_eq!(arch.norm_style, NormStyle::Qwen);
+        assert_eq!(arch.rms_norm_eps, 1e-5);
+
+        let c = |s: &str| canon_name_for_arch(&arch, s, MimoTowers::TextOnly).unwrap();
+        for (src, dst) in [
+            ("model.embedding_norm.weight", "model.norm.weight"),
+            ("model.layers.0.operator_norm.weight", "model.layers.0.input_layernorm.weight"),
+            ("model.layers.0.post_operator_norm.weight", "model.layers.0.post_attention_layernorm.weight"),
+            ("model.layers.0.ffn_norm.weight", "model.layers.0.pre_feedforward_layernorm.weight"),
+            ("model.layers.0.post_ffn_norm.weight", "model.layers.0.post_feedforward_layernorm.weight"),
+            ("model.layers.0.conv.conv.weight", "model.layers.0.short_conv.conv.weight"),
+            ("model.layers.0.conv.in_proj.weight", "model.layers.0.short_conv.in_proj.weight"),
+            ("model.layers.0.feed_forward.w1.weight", "model.layers.0.mlp.gate_proj.weight"),
+            ("model.layers.0.feed_forward.w3.weight", "model.layers.0.mlp.up_proj.weight"),
+            ("model.layers.0.feed_forward.w2.weight", "model.layers.0.mlp.down_proj.weight"),
+            ("model.layers.1.self_attn.gate_proj.weight", "model.layers.1.self_attn.g_proj.weight"),
+            ("model.layers.1.self_attn.q_norm.weight", "model.layers.1.self_attn.q_norm.weight"),
+            ("model.layers.1.self_attn.o_proj.weight", "model.layers.1.self_attn.o_proj.weight"),
+            // LFM3-VL: the text model under `model.language_model`, the
+            // tower and projector under their own names.
+            ("model.language_model.embedding_norm.weight", "model.norm.weight"),
+            ("model.language_model.layers.0.operator_norm.weight", "model.layers.0.input_layernorm.weight"),
+            ("model.vision_tower.layers.0.conv.in_proj.weight", "vision_tower.layers.0.conv.in_proj.weight"),
+            ("model.multi_modal_projector.linear_1.weight", "multi_modal_projector.linear_1.weight"),
+        ] {
+            assert_eq!(c(src), dst, "{src}");
+        }
+        assert!(lfm3_vision(&arch, "vision_tower.patchifier.weight"));
+        assert!(!lfm3_vision(&arch, "model.layers.0.mlp.up_proj.weight"));
+
+        let mut bad = cfg.clone();
+        bad["rope_parameters"]["full_attention"]["rope_type"] = serde_json::json!("yarn");
+        assert!(build_arch(&bad).is_err(), "a scaled profile must be refused");
     }
 
     /// The 8B-A1B build is the same mixer schedule with a routed FFN.
