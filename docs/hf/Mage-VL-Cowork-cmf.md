@@ -80,9 +80,11 @@ A 2206×1048 screenshot is 9108 patches and 2277 language tokens; the vision
 encoder takes 4.8 s for it on the A40 (GEMMs and attention on the GPU). A
 running `cortiq serve` answers a 512×512 image in 1.7 s to the first token.
 
-Apple M4 (Metal): `q4tp` decodes 36 tok/s and reads a 2k-token prompt at
-295 tok/s; the vision encoder takes 0.69 s for 512×512 and 10.8 s for the
-2206×1048 screenshot.
+Apple M4 (Metal): `q8_2f` decodes 17.4 tok/s and reads a 2k-token prompt at
+147 tok/s (its greedy image description is word for word the Transformers
+one), `q4tp` 36 and 295 tok/s — on a Mac with 16–24 GB the 4-bit file is the
+practical choice. The vision encoder takes 0.69 s for 512×512 and 10.8 s for
+the 2206×1048 screenshot.
 
 ## Usage
 
@@ -173,7 +175,7 @@ cortiq run mage-vl-cowork-q8_2f.cmf --image screenshot.png --prompt "Task: open 
 1.000000 на CPU), 48 жадных токенов описания изображения у `q8_2f` — тоже.
 На NVIDIA A40 (Vulkan) `q8_2f` генерирует 66.8 ток/с, `q4tp` — 90.2; скриншот
 2206×1048 (2277 токенов) энкодер обрабатывает за 4.8 с. На Apple M4 (Metal)
-`q4tp` генерирует 36 ток/с. Агенту нужен системный промпт и схема
+`q8_2f` генерирует 17.4 ток/с, `q4tp` — 36 (на Mac с 16–24 ГБ удобнее `q4tp`). Агенту нужен системный промпт и схема
 инструментов релиза (`MAGE_HYBRID_SYSTEM_PROMPT` в
 [исходной карточке](https://huggingface.co/microsoft/Mage-VL-Cowork)) через
 `--system` или сервер; координаты — в сетке 0–999. `cortiq serve` принимает
@@ -204,7 +206,7 @@ cortiq run mage-vl-cowork-q8_2f.cmf --image screenshot.png --prompt "Task: open 
 视觉编码器与融合层以 16 位存储、按 float32 计算：交给语言模型的特征与 Transformers
 float32 一致（CPU 上余弦 1.000000），`q8_2f` 的 48 个贪心解码 token 也与原模型一致。
 NVIDIA A40（Vulkan）上 `q8_2f` 生成 66.8 tok/s，`q4tp` 90.2 tok/s；2206×1048 截图
-（2277 个 token）编码耗时 4.8 s。Apple M4（Metal）上 `q4tp` 生成 36 tok/s。智能体用法需
+（2277 个 token）编码耗时 4.8 s。Apple M4（Metal）上 `q8_2f` 生成 17.4 tok/s，`q4tp` 36 tok/s（16–24 GB 内存的 Mac 建议用 `q4tp`）。智能体用法需
 通过 `--system` 或服务端传入发布方的系统提示与工具定义（见
 [原始模型卡](https://huggingface.co/microsoft/Mage-VL-Cowork) 中的
 `MAGE_HYBRID_SYSTEM_PROMPT`），坐标为 0–999 网格。`cortiq serve` 接受 OpenAI 格式的
