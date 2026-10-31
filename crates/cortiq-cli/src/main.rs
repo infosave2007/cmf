@@ -7907,6 +7907,34 @@ fn cmd_ppl(
         std::fs::write(&p, s.join(" "))?;
     }
 
+    // CMF_PREFILL_PARITY=split[,k]: the host prefill, the batch graph and a
+    // host prefix continued on the graph over the same tokens (diagnostic).
+    if let Ok(spec) = std::env::var("CMF_PREFILL_PARITY") {
+        let mut it = spec.split(',').map(|s| s.trim().parse::<usize>().ok());
+        let split = it
+            .next()
+            .flatten()
+            .ok_or_else(|| anyhow::anyhow!("CMF_PREFILL_PARITY=split[,k]"))?;
+        let k = it.next().flatten().unwrap_or(64);
+        let report = pipeline
+            .prefill_parity_probe(&ids, split, k)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        println!("{report}");
+        return Ok(());
+    }
+    // CMF_PREFILL_PARITY_O1=k with --o1: the O(1) seal from a host prefix
+    // against seals from a batch-graph prefix (diagnostic).
+    if let Ok(k) = std::env::var("CMF_PREFILL_PARITY_O1") {
+        let cfg = o1
+            .cfg()?
+            .ok_or_else(|| anyhow::anyhow!("CMF_PREFILL_PARITY_O1 needs --o1"))?;
+        let k = k.trim().parse::<usize>().unwrap_or(64);
+        let report = pipeline
+            .o1_seal_parity_probe(&ids, cfg, o1_prefill.unwrap_or(256), k)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        println!("{report}");
+        return Ok(());
+    }
     if let Some(offsets) = windowed {
         return ppl_windows(
             &mut pipeline,

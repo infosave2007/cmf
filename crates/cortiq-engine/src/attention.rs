@@ -2174,6 +2174,17 @@ pub fn qwen_attention_batch(
     if let Some(mut values) = projected_all.take() {
         recycle_buf(&mut values);
     }
+    // A chunk that ends exactly on the deferred barrier holds only exact
+    // rows: it ran batched, and the layer converts here, as the row path
+    // does after its boundary row.
+    if cache
+        .o1_pending_boundary()
+        .is_some_and(|target| cache.seq_len >= target)
+    {
+        if let Err(err) = cache.o1_seal_checked(nh) {
+            cache.o1_abort(err);
+        }
+    }
     out
 }
 
@@ -2347,7 +2358,12 @@ pub fn qwen_attention_pair(
     // Preserve causal ordering across a deferred boundary. The ordinary
     // pair kernel is exact-only and would append both rows before a seal;
     // sequential dispatch lets row B convert and row B+1 use Nyström.
-    if cache.o1_sealed() || cache.o1_boundary_crossed_by(2) {
+    if cache.o1_sealed()
+        || cache.o1_boundary_crossed_by(2)
+        || cache
+            .o1_pending_boundary()
+            .is_some_and(|target| cache.seq_len + 2 == target)
+    {
         let mut cfg1 = *cfg;
         cfg1.position = cfg.position;
         let mut cfg2 = *cfg;

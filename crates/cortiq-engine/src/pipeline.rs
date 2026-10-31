@@ -1518,6 +1518,20 @@ fn prefill_batched() -> bool {
 /// optional native-Metal fused head. A hidden-state graph remains a valid
 /// quality route on Vulkan/Wgpu; only native Metal requires graph logits.
 #[inline]
+/// ‖a − b‖ / ‖b‖ (infinite when the lengths differ).
+fn rel_l2(a: &[f32], b: &[f32]) -> f64 {
+    if a.len() != b.len() {
+        return f64::INFINITY;
+    }
+    let (mut d, mut r) = (0f64, 0f64);
+    for (&x, &y) in a.iter().zip(b) {
+        let e = (x - y) as f64;
+        d += e * e;
+        r += y as f64 * y as f64;
+    }
+    (d / r.max(1e-30)).sqrt()
+}
+
 fn nll_graph_policy(unmasked: bool, prefer_graph: bool, native_metal: bool) -> (bool, bool) {
     let graph_quality = unmasked && prefer_graph;
     let fused_head_quality = graph_quality && native_metal;
@@ -9813,6 +9827,702 @@ impl Pipeline {
 
     pub fn nll_ids_from(&mut self, ids: &[u32], start: usize) -> Result<(f64, usize), String> {
         self.nll_ids_inner(ids, start, None)
+    }
+
+    /// Diagnostic (`CMF_PREFILL_PARITY=split[,k]` on `cortiq ppl`): the same
+    /// tokens through three ingests, each from a clean sequence — H the host
+    /// chunked prefill, G the wgpu batch graph in k-row chunks, M the host
+    /// prefill up to `split` and the batch graph after it, seeded from the
+    /// host state — and where they part: NLL and top-1 per 256-position bin
+    /// from each arm's post-stack rows, every GDN layer's recurrent state
+    /// (the host `linear_state` against the graph's) at `split` and at the
+    /// end, and every exact-attention layer's K/V rows.
+    pub fn prefill_parity_probe(
+        &mut self,
+        ids: &[u32],
+        split: usize,
+        bk: usize,
+    ) -> Result<String, String> {
+        use std::fmt::Write as _;
+        let (n, hs) = (ids.len(), self.hidden_size);
+        if split == 0 || split >= n || bk == 0 || !self.can_prefill_batched() {
+            return Err(format!(
+                "prefill parity: needs 0 < split < {n} tokens, k > 0 and a batched host prefill"
+            ));
+        }
+        // 1 = GDN, 2 = exact attention, 0 = anything else (not compared).
+        let kinds: Vec<u8> = (0..self.num_layers)
+            .map(|li| match &self.weights.layers[self.phys_layer(li)].attn {
+                AttnKind::LinearGdn(_) => 1,
+                AttnKind::Full { .. } => 2,
+                _ => 0,
+            })
+            .collect();
+        let kv_id = self.graph_kv_id;
+        let host_chunk = self.prefill_chunk().max(1);
+        let host_states = |p: &Self| -> Vec<Vec<f32>> {
+            (0..p.num_layers)
+                .map(|li| {
+                    if kinds[li] == 1 {
+                        p.kv_cache.layers[li].linear_state.clone()
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect()
+        };
+        let graph_states = |_p: &Self| -> Vec<Vec<f32>> {
+            (0..kinds.len())
+                .map(|li| {
+                    if kinds[li] == 1 {
+                        crate::gpu::graph_gdn_state_read(kv_id, li).unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect()
+        };
+        // Position-major K/V rows [0, n) of every exact-attention layer.
+        let host_kv = |p: &Self| -> Vec<(Vec<f32>, Vec<f32>)> {
+            (0..p.num_layers)
+                .map(|li| {
+                    let c = &p.kv_cache.layers[li];
+                    if kinds[li] != 2
+                        || c.mode != crate::kv_cache::KvMode::F32
+                        || c.base() != 0
+                        || c.seq_len != n
+                    {
+                        return (Vec::new(), Vec::new());
+                    }
+                    let (nkv, hd) = (c.num_kv_heads, c.head_dim);
+                    let (mut k, mut v) = (vec![0f32; n * nkv * hd], vec![0f32; n * nkv * hd]);
+                    for (h, (kh, vh)) in c.k_heads().iter().zip(c.v_heads()).enumerate() {
+                        for pos in 0..n {
+                            let d = (pos * nkv + h) * hd;
+                            k[d..d + hd].copy_from_slice(&kh[pos * hd..(pos + 1) * hd]);
+                            v[d..d + hd].copy_from_slice(&vh[pos * hd..(pos + 1) * hd]);
+                        }
+                    }
+                    (k, v)
+                })
+                .collect()
+        };
+        let graph_kv = |p: &Self| -> Vec<(Vec<f32>, Vec<f32>)> {
+            (0..p.num_layers)
+                .map(|li| {
+                    let c = &p.kv_cache.layers[li];
+                    if kinds[li] != 2 {
+                        return (Vec::new(), Vec::new());
+                    }
+                    crate::gpu::graph_kv_read_rows(kv_id, &[(li, 0, n)], c.num_kv_heads, c.head_dim)
+                        .and_then(|mut v| v.pop())
+                        .unwrap_or_default()
+                })
+                .collect()
+        };
+        let host_walk = |p: &mut Self,
+                         from: usize,
+                         to: usize,
+                         rows: &mut [f32],
+                         at_split: &mut Option<Vec<Vec<f32>>>| {
+            let mut pos = from;
+            while pos < to {
+                let mut end = (pos + host_chunk).min(to);
+                if pos < split && end > split {
+                    end = split;
+                }
+                let hb = p.prefill_batch(&ids[pos..end], pos);
+                rows[pos * hs..end * hs].copy_from_slice(&hb[..(end - pos) * hs]);
+                pos = end;
+                if pos == split {
+                    *at_split = Some(host_states(p));
+                }
+            }
+        };
+        let graph_walk = |p: &mut Self,
+                          from: usize,
+                          to: usize,
+                          rows: &mut [f32],
+                          at_split: &mut Option<Vec<Vec<f32>>>|
+         -> Result<(), String> {
+            let mut pos = from;
+            while pos < to {
+                let mut end = (pos + bk).min(to);
+                if pos < split && end > split {
+                    end = split;
+                }
+                let k = end - pos;
+                let mut hid = vec![0f32; k * hs];
+                for (j, &id) in ids[pos..end].iter().enumerate() {
+                    hid[j * hs..(j + 1) * hs].copy_from_slice(&p.embed_single(id));
+                }
+                let positions: Vec<usize> = (pos..end).collect();
+                let outcome = p.try_batch_graph_wgpu(&mut hid, &positions, k, None);
+                if outcome != crate::gpu::BatchGraphOutcome::Completed {
+                    return Err(format!(
+                        "prefill parity: batch graph {outcome:?} at position {pos}"
+                    ));
+                }
+                rows[pos * hs..end * hs].copy_from_slice(&hid);
+                pos = end;
+                if pos == split {
+                    *at_split = Some(graph_states(p));
+                }
+            }
+            Ok(())
+        };
+        let score = |p: &Self, rows: &[f32], from: usize| p.parity_score(ids, rows, from);
+
+        let t = std::time::Instant::now();
+        self.clear_sequence_state();
+        let (mut hh, mut h_split) = (vec![0f32; n * hs], None);
+        host_walk(self, 0, n, &mut hh, &mut h_split);
+        let (h_end, h_kv) = (host_states(self), host_kv(self));
+        let t_h = t.elapsed().as_secs_f64();
+
+        let t = std::time::Instant::now();
+        self.clear_sequence_state();
+        let (mut hg, mut g_split) = (vec![0f32; n * hs], None);
+        let g_run = graph_walk(self, 0, n, &mut hg, &mut g_split);
+        let (g_end, g_kv) = (graph_states(self), graph_kv(self));
+        let t_g = t.elapsed().as_secs_f64();
+
+        let t = std::time::Instant::now();
+        self.clear_sequence_state();
+        let (mut hm, mut m_split) = (vec![0f32; n * hs], None);
+        host_walk(self, 0, split, &mut hm, &mut m_split);
+        let m_run = graph_walk(self, split, n, &mut hm, &mut None);
+        let (m_end, m_kv) = (graph_states(self), graph_kv(self));
+        let t_m = t.elapsed().as_secs_f64();
+        self.clear_sequence_state();
+        g_run?;
+        m_run?;
+
+        let (sh, sg, sm) = (
+            score(self, &hh, 0),
+            score(self, &hg, 0),
+            score(self, &hm, split),
+        );
+        let mut r = String::new();
+        let _ = writeln!(
+            r,
+            "prefill parity: {n} tokens, split {split}, host chunk {host_chunk}, graph k {bk} \
+             (host {t_h:.1} s, graph {t_g:.1} s, host+graph {t_m:.1} s)"
+        );
+        let _ = writeln!(
+            r,
+            "  bin          | NLL host  graph  h+g   | top1 host=graph h+g=graph | hidden rel host:graph h+g:graph"
+        );
+        let bin = 256usize;
+        let mut b0 = 0;
+        while b0 + 1 < n {
+            let b1 = (b0 + bin).min(n - 1);
+            let mean = |s: &[(f64, usize)], off: usize| -> Option<f64> {
+                let v: Vec<f64> = (b0.max(off)..b1).map(|p| s[p - off].0).collect();
+                (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
+            };
+            let agree = |a: &[(f64, usize)], ao: usize, b: &[(f64, usize)], bo: usize| {
+                let ps: Vec<usize> = (b0.max(ao).max(bo)..b1).collect();
+                if ps.is_empty() {
+                    return None;
+                }
+                let same = ps.iter().filter(|&&p| a[p - ao].1 == b[p - bo].1).count();
+                Some(100.0 * same as f64 / ps.len() as f64)
+            };
+            let hid_rel = |a: &[f32], from: usize| -> Option<f64> {
+                (b0.max(from)..b1)
+                    .map(|p| rel_l2(&a[p * hs..(p + 1) * hs], &hg[p * hs..(p + 1) * hs]))
+                    .reduce(f64::max)
+            };
+            let f =
+                |v: Option<f64>, prec: usize| v.map_or("-".to_string(), |x| format!("{x:.prec$}"));
+            let e = |v: Option<f64>| v.map_or("-".to_string(), |x| format!("{x:.1e}"));
+            let _ = writeln!(
+                r,
+                "  {b0:5}..{b1:<5} | {:>8} {:>6} {:>6} | {:>14} {:>9} | {:>16} {:>9}",
+                f(mean(&sh, 0), 3),
+                f(mean(&sg, 0), 3),
+                f(mean(&sm, split), 3),
+                f(agree(&sh, 0, &sg, 0), 1),
+                f(agree(&sm, split, &sg, 0), 1),
+                e(hid_rel(&hh, 0)),
+                e(hid_rel(&hm, split)),
+            );
+            b0 = b1;
+        }
+        // Recurrent state, layer by layer: [conv ring | S] split at the ring.
+        let ring_len = self
+            .gdn_cfg
+            .map(|c| c.conv_dim() * c.conv_kernel.saturating_sub(1))
+            .unwrap_or(0);
+        let state_line = |r: &mut String, label: &str, a: &[Vec<f32>], b: &[Vec<f32>]| {
+            let _ = write!(r, "  GDN {label} (ring/S rel):");
+            let mut first = None;
+            for li in (0..kinds.len()).filter(|&li| kinds[li] == 1) {
+                let (x, y) = (&a[li], &b[li]);
+                if x.len() != y.len() || x.len() <= ring_len {
+                    let _ = write!(r, " L{li} len {}/{}", x.len(), y.len());
+                    continue;
+                }
+                let (rr, rs) = (
+                    rel_l2(&x[..ring_len], &y[..ring_len]),
+                    rel_l2(&x[ring_len..], &y[ring_len..]),
+                );
+                if first.is_none() && rr.max(rs) > 1e-2 {
+                    first = Some(li);
+                }
+                let _ = write!(r, " L{li} {rr:.0e}/{rs:.0e}");
+            }
+            let _ = writeln!(
+                r,
+                "\n    first GDN layer past 1e-2: {}",
+                first.map_or("none".to_string(), |l| l.to_string())
+            );
+        };
+        match (&h_split, &g_split) {
+            (Some(a), Some(b)) => state_line(&mut r, "host vs graph at split", a, b),
+            _ => {
+                let _ = writeln!(r, "  GDN at split: not captured");
+            }
+        }
+        if let (Some(a), Some(b)) = (&m_split, &h_split) {
+            state_line(&mut r, "h+g host part vs host at split", a, b);
+        }
+        state_line(&mut r, "host vs graph at end", &h_end, &g_end);
+        state_line(&mut r, "h+g vs graph at end", &m_end, &g_end);
+        // Exact-attention K/V: the worst 256-row bin per layer and the first
+        // bin past 1e-2.
+        let kv_line = |r: &mut String, label: &str, a: &[(Vec<f32>, Vec<f32>)], from: usize| {
+            let _ = writeln!(r, "  K/V {label} (worst bin K/V rel, first bin past 1e-2):");
+            for li in (0..kinds.len()).filter(|&li| kinds[li] == 2) {
+                let ((ak, av), (gk, gv)) = (&a[li], &g_kv[li]);
+                if ak.len() != gk.len() || ak.is_empty() {
+                    let _ = writeln!(r, "    L{li}: rows {}/{}", ak.len(), gk.len());
+                    continue;
+                }
+                let row = ak.len() / n;
+                let (mut wk, mut wv, mut first) = (0f64, 0f64, None);
+                let mut b0 = from;
+                while b0 < n {
+                    let b1 = (b0 + bin).min(n);
+                    let (s0, s1) = (b0 * row, b1 * row);
+                    let (rk, rv) = (
+                        rel_l2(&ak[s0..s1], &gk[s0..s1]),
+                        rel_l2(&av[s0..s1], &gv[s0..s1]),
+                    );
+                    (wk, wv) = (wk.max(rk), wv.max(rv));
+                    if first.is_none() && rk.max(rv) > 1e-2 {
+                        first = Some(b0);
+                    }
+                    b0 = b1;
+                }
+                let _ = writeln!(
+                    r,
+                    "    L{li}: {wk:.1e}/{wv:.1e} first {}",
+                    first.map_or("none".to_string(), |p| p.to_string())
+                );
+            }
+        };
+        kv_line(&mut r, "host vs graph", &h_kv, 0);
+        kv_line(&mut r, "h+g vs graph", &m_kv, 0);
+        Ok(r)
+    }
+
+    /// (nll, top-1 id) of every position in [from, len − 1) from post-stack
+    /// rows (`rows` indexed by absolute position), through the scorer's
+    /// final norm and head.
+    fn parity_score(&self, ids: &[u32], rows: &[f32], from: usize) -> Vec<(f64, usize)> {
+        let (n, hs) = (ids.len(), self.hidden_size);
+        let vrows = self.weights.lm_head.rows();
+        let vs = self.vocab_size.min(vrows);
+        let mut out = Vec::with_capacity(n.saturating_sub(from + 1));
+        let mut pos = from;
+        while pos + 1 < n {
+            let end = (pos + 32).min(n - 1);
+            let sb = end - pos;
+            let mut normed = vec![0f32; sb * hs];
+            for j in 0..sb {
+                let r = inference::rms_norm(
+                    &rows[(pos + j) * hs..(pos + j + 1) * hs],
+                    &self.weights.final_norm,
+                    self.rms_eps,
+                    self.norm_style,
+                );
+                normed[j * hs..(j + 1) * hs].copy_from_slice(&r);
+            }
+            let mut logits = vec![0f32; sb * vrows];
+            self.weights
+                .lm_head
+                .matmat(&normed, sb, &mut logits, self.pool.as_deref());
+            for j in 0..sb {
+                let lg = &mut logits[j * vrows..j * vrows + vs];
+                if let Some(mu) = self.logit_multiplier {
+                    lg.iter_mut().for_each(|v| *v *= mu);
+                }
+                if let Some(c) = self.final_softcap {
+                    softcap_in_place(lg, c, self.pool.as_deref());
+                }
+                let (mut max, mut top) = (f32::NEG_INFINITY, 0usize);
+                for (i, &v) in lg.iter().enumerate() {
+                    if v > max {
+                        (max, top) = (v, i);
+                    }
+                }
+                let lse = lg
+                    .iter()
+                    .map(|&v| ((v - max) as f64).exp())
+                    .sum::<f64>()
+                    .ln()
+                    + max as f64;
+                out.push((lse - lg[ids[pos + j + 1] as usize] as f64, top));
+            }
+            pos = end;
+        }
+        out
+    }
+
+    /// Diagnostic (`CMF_PREFILL_PARITY_O1=k` on `cortiq ppl --o1 …
+    /// --o1-prefill P`): how much the O(1) seal depends on where its exact
+    /// prefix ran. Every arm continues on the batch graph from the boundary
+    /// in k-row chunks:
+    /// - OH: prefix on the host chunked prefill; seal from the host's
+    ///   queries and K/V; recurrent state seeded from the host.
+    /// - OG: prefix on the batch graph (recurrent state stays on the
+    ///   device); seal from OH's host queries and host K/V.
+    /// - OD: prefix on the batch graph; seal from OH's queries and the
+    ///   graph's own K/V rows (read back).
+    ///
+    /// OH vs OG isolates the recurrent-state hand-off, OG vs OD the seal's
+    /// response to the host/graph K/V difference. X is the exact graph.
+    pub fn o1_seal_parity_probe(
+        &mut self,
+        ids: &[u32],
+        cfg: crate::nystrom::O1Cfg,
+        requested: usize,
+        bk: usize,
+    ) -> Result<String, String> {
+        use std::fmt::Write as _;
+        let (n, hs) = (ids.len(), self.hidden_size);
+        self.set_o1(Some(cfg));
+        let split = self
+            .o1_effective_boundary(requested)
+            .ok_or("o1 parity: no O(1) configuration")?;
+        if split + 1 >= n || bk == 0 || !self.can_prefill_batched() {
+            return Err(format!(
+                "o1 parity: needs the boundary {split} inside {n} tokens, k > 0 and a batched host prefill"
+            ));
+        }
+        let o1_layers: Vec<usize> = (0..self.num_layers)
+            .filter(|&li| self.o1_flags.get(li).copied().unwrap_or(false))
+            .collect();
+        let graph_rows = |p: &mut Self, from: usize, to: usize, rows: &mut [f32]| {
+            let mut pos = from;
+            while pos < to {
+                let end = (pos + bk).min(to);
+                let k = end - pos;
+                let mut hid = vec![0f32; k * hs];
+                for (j, &id) in ids[pos..end].iter().enumerate() {
+                    hid[j * hs..(j + 1) * hs].copy_from_slice(&p.embed_single(id));
+                }
+                let positions: Vec<usize> = (pos..end).collect();
+                let outcome = p.try_batch_graph_wgpu(&mut hid, &positions, k, None);
+                if outcome != crate::gpu::BatchGraphOutcome::Completed {
+                    return Err(format!(
+                        "o1 parity: batch graph {outcome:?} at position {pos}"
+                    ));
+                }
+                rows[pos * hs..end * hs].copy_from_slice(&hid);
+                pos = end;
+            }
+            Ok(())
+        };
+        // Seal every O(1) layer from the given rows; `trace` = (q, k, v) per
+        // O(1) layer, position-major.
+        let seal_from = |p: &mut Self, trace: &[(Vec<f32>, Vec<f32>, Vec<f32>)]| {
+            for (&li, (q, k, v)) in o1_layers.iter().zip(trace) {
+                let c = &mut p.kv_cache.layers[li];
+                let (row, qrow) = (k.len() / split, q.len() / split);
+                for pos in 0..split {
+                    c.append(
+                        &k[pos * row..(pos + 1) * row],
+                        &v[pos * row..(pos + 1) * row],
+                        &[],
+                    );
+                    c.o1_push_q(&q[pos * qrow..(pos + 1) * qrow]);
+                }
+            }
+            p.o1_seal_checked()
+        };
+        // Greedy continuation (`CMF_PARITY_GREEDY` tokens, default 40) from
+        // the last prompt row, one batch-graph row per step.
+        let steps: usize = std::env::var("CMF_PARITY_GREEDY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(40);
+        // `CMF_PARITY_DECODE=token`: the steps through `decode_step_logits`
+        // (the token graph generation decodes on) instead of the batch graph.
+        let token_decode = std::env::var("CMF_PARITY_DECODE").as_deref() == Ok("token");
+        let greedy = |p: &mut Self, rows: &[f32]| -> Result<Vec<u32>, String> {
+            let argmax = |lg: &[f32], vs: usize| {
+                (0..vs.min(lg.len())).fold(0, |b, i| if lg[i] > lg[b] { i } else { b }) as u32
+            };
+            let normed = inference::rms_norm(
+                &rows[(n - 1) * hs..n * hs],
+                &p.weights.final_norm,
+                p.rms_eps,
+                p.norm_style,
+            );
+            let mut out = vec![argmax(&p.lm_head_forward(&normed), p.vocab_size)];
+            for s in 1..steps {
+                let (tok, at) = (out[s - 1], n + s - 1);
+                let lg = if token_decode {
+                    p.decode_step_logits(tok, at)
+                } else {
+                    let mut hid = p.embed_single(tok);
+                    let outcome = p.try_batch_graph_wgpu(&mut hid, &[at], 1, None);
+                    if outcome != crate::gpu::BatchGraphOutcome::Completed {
+                        return Err(format!("o1 parity: greedy step {s} {outcome:?}"));
+                    }
+                    let normed =
+                        inference::rms_norm(&hid, &p.weights.final_norm, p.rms_eps, p.norm_style);
+                    p.lm_head_forward(&normed)
+                };
+                out.push(argmax(&lg, p.vocab_size));
+            }
+            Ok(out)
+        };
+
+        // OW first, in a fresh process as `run` starts: the host prefix
+        // exactly as generation runs it — boundary at `split`, the
+        // pipeline's prefill chunk, the layers sealing after the chunk that
+        // reaches the boundary (`CMF_O1_WALK_BOUNDARY=1`: that chunk walks
+        // its rows one at a time, each layer sealing after the boundary row).
+        self.clear_sequence_state();
+        self.o1_begin_with_prefix(Some(requested));
+        let walk_chunk = self.prefill_chunk().max(1);
+        let walk_from = (split - 1) / walk_chunk * walk_chunk;
+        let mut ow = vec![0f32; n * hs];
+        let mut pos = 0;
+        while pos < split {
+            let end = (pos + walk_chunk).min(split);
+            let hb = self.prefill_batch(&ids[pos..end], pos);
+            ow[pos * hs..end * hs].copy_from_slice(&hb[..(end - pos) * hs]);
+            pos = end;
+        }
+        self.o1_seal_checked()?;
+        let ow_run = graph_rows(self, split, n, &mut ow);
+        let ow_text = ow_run.clone().and_then(|_| greedy(self, &ow));
+
+        // OH. Collect one row past the boundary's natural barrier so the
+        // host walk does not seal inside the last chunk, copy the trace,
+        // then seal at `split` exactly.
+        let t = std::time::Instant::now();
+        self.clear_sequence_state();
+        self.o1_begin_with_prefix(Some(split + 1));
+        let mut oh = vec![0f32; n * hs];
+        let mut pos = 0;
+        while pos < split {
+            let end = (pos + 128).min(split);
+            let hb = self.prefill_batch(&ids[pos..end], pos);
+            oh[pos * hs..end * hs].copy_from_slice(&hb[..(end - pos) * hs]);
+            pos = end;
+        }
+        let mut host = Vec::with_capacity(o1_layers.len());
+        for &li in &o1_layers {
+            let c = &self.kv_cache.layers[li];
+            let q = c
+                .o1_q_trace()
+                .ok_or("o1 parity: host walk sealed early")?
+                .to_vec();
+            let (nkv, hd) = (c.num_kv_heads, c.head_dim);
+            let (mut k, mut v) = (vec![0f32; split * nkv * hd], vec![0f32; split * nkv * hd]);
+            for (h, (kh, vh)) in c.k_heads().iter().zip(c.v_heads()).enumerate() {
+                for p in 0..split {
+                    let d = (p * nkv + h) * hd;
+                    k[d..d + hd].copy_from_slice(&kh[p * hd..(p + 1) * hd]);
+                    v[d..d + hd].copy_from_slice(&vh[p * hd..(p + 1) * hd]);
+                }
+            }
+            host.push((q, k, v));
+        }
+        for &li in &o1_layers {
+            self.kv_cache.layers[li].o1_set_boundary(split);
+        }
+        self.o1_seal_checked()?;
+        let oh_run = graph_rows(self, split, n, &mut oh);
+        let t_oh = t.elapsed().as_secs_f64();
+        let oh_text = oh_run.clone().and_then(|_| greedy(self, &oh));
+
+        // OG: graph prefix, host seal inputs. `CMF_PARITY_PERTURB=eps`
+        // scales every host K/V value by (1 ± eps), signs from a fixed
+        // xorshift stream: the seal's sensitivity to rounding-size noise.
+        self.clear_sequence_state();
+        self.o1_begin_with_prefix(Some(requested));
+        let mut og = vec![0f32; n * hs];
+        graph_rows(self, 0, split, &mut og)?;
+        let perturb: f32 = std::env::var("CMF_PARITY_PERTURB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0);
+        if perturb > 0.0 {
+            let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+            let noisy: Vec<_> = host
+                .iter()
+                .map(|(q, k, v)| {
+                    let mut jitter = |x: &f32| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        x * if seed & 1 == 0 {
+                            1.0 + perturb
+                        } else {
+                            1.0 - perturb
+                        }
+                    };
+                    let k: Vec<f32> = k.iter().map(&mut jitter).collect();
+                    let v: Vec<f32> = v.iter().map(&mut jitter).collect();
+                    (q.clone(), k, v)
+                })
+                .collect();
+            seal_from(self, &noisy)?;
+        } else {
+            seal_from(self, &host)?;
+        }
+        let og_run = graph_rows(self, split, n, &mut og);
+        let og_text = og_run.clone().and_then(|_| greedy(self, &og));
+
+        // OD: graph prefix, the graph's own K/V with the host queries.
+        self.clear_sequence_state();
+        self.o1_begin_with_prefix(Some(requested));
+        let mut od = vec![0f32; n * hs];
+        graph_rows(self, 0, split, &mut od)?;
+        let mut dev = Vec::with_capacity(o1_layers.len());
+        let mut kv_rel = Vec::with_capacity(o1_layers.len());
+        for (&li, (q, hk, hv)) in o1_layers.iter().zip(&host) {
+            let c = &self.kv_cache.layers[li];
+            let (k, v) = crate::gpu::graph_kv_read_rows(
+                self.graph_kv_id,
+                &[(li, 0, split)],
+                c.num_kv_heads,
+                c.head_dim,
+            )
+            .and_then(|mut rows| rows.pop())
+            .ok_or_else(|| format!("o1 parity: no graph K/V rows for layer {li}"))?;
+            kv_rel.push((li, rel_l2(hk, &k), rel_l2(hv, &v)));
+            dev.push((q.clone(), k, v));
+        }
+        seal_from(self, &dev)?;
+        let od_run = graph_rows(self, split, n, &mut od);
+        let od_text = od_run.clone().and_then(|_| greedy(self, &od));
+
+        // X: exact batch graph.
+        self.clear_sequence_state();
+        self.set_o1(None);
+        let mut xx = vec![0f32; n * hs];
+        let x_run = graph_rows(self, 0, n, &mut xx);
+        let x_text = x_run.clone().and_then(|_| greedy(self, &xx));
+        self.clear_sequence_state();
+        oh_run?;
+        ow_run?;
+        og_run?;
+        od_run?;
+        x_run?;
+
+        let sx = self.parity_score(ids, &xx, split);
+        let arms = [
+            ("OH", self.parity_score(ids, &oh, split)),
+            ("OG", self.parity_score(ids, &og, split)),
+            ("OD", self.parity_score(ids, &od, split)),
+            ("OW", self.parity_score(ids, &ow, split)),
+        ];
+        let mut r = String::new();
+        let _ = writeln!(
+            r,
+            "o1 seal parity: {n} tokens, boundary {split}, graph k {bk} (OH {t_oh:.1} s), \
+             OW chunk {walk_chunk}, boundary chunk {walk_from}..{split}"
+        );
+        let _ = write!(r, "  seal K/V rel host vs graph:");
+        for (li, rk, rv) in &kv_rel {
+            let _ = write!(r, " L{li} {rk:.0e}/{rv:.0e}");
+        }
+        // Post-stack prefix rows against the exact graph: the batched rows,
+        // then the rows OW walks one at a time.
+        let worst = |a: &[f32], p0: usize, p1: usize| {
+            (p0..p1)
+                .map(|p| rel_l2(&a[p * hs..(p + 1) * hs], &xx[p * hs..(p + 1) * hs]))
+                .fold(0f64, f64::max)
+        };
+        let _ = writeln!(
+            r,
+            "\n  prefix rows rel vs exact graph, [0,{walk_from}) / [{walk_from},{split}): \
+             OH {:.1e} / {:.1e}, OW {:.1e} / {:.1e}",
+            worst(&oh, 0, walk_from),
+            worst(&oh, walk_from, split),
+            worst(&ow, 0, walk_from),
+            worst(&ow, walk_from, split),
+        );
+        let _ = writeln!(
+            r,
+            "  bin          | NLL exact    OH     OG     OD     OW | top1=exact  OH    OG    OD    OW"
+        );
+        let mean = |s: &[(f64, usize)], b0: usize, b1: usize| {
+            (b0..b1).map(|p| s[p - split].0).sum::<f64>() / (b1 - b0).max(1) as f64
+        };
+        let agree = |s: &[(f64, usize)], b0: usize, b1: usize| {
+            let same = (b0..b1)
+                .filter(|&p| s[p - split].1 == sx[p - split].1)
+                .count();
+            100.0 * same as f64 / (b1 - b0).max(1) as f64
+        };
+        let mut b0 = split;
+        let mut total = [0f64; 5];
+        while b0 + 1 < n {
+            let b1 = ((b0 / 256 + 1) * 256).min(n - 1);
+            let _ = writeln!(
+                r,
+                "  {b0:5}..{b1:<5} | {:>9.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} | {:>12.1} {:>5.1} {:>5.1} {:>5.1}",
+                mean(&sx, b0, b1),
+                mean(&arms[0].1, b0, b1),
+                mean(&arms[1].1, b0, b1),
+                mean(&arms[2].1, b0, b1),
+                mean(&arms[3].1, b0, b1),
+                agree(&arms[0].1, b0, b1),
+                agree(&arms[1].1, b0, b1),
+                agree(&arms[2].1, b0, b1),
+                agree(&arms[3].1, b0, b1),
+            );
+            b0 = b1;
+        }
+        for (i, s) in std::iter::once(&sx)
+            .chain(arms.iter().map(|a| &a.1))
+            .enumerate()
+        {
+            total[i] = s.iter().map(|x| x.0).sum::<f64>() / s.len().max(1) as f64;
+        }
+        let _ = writeln!(
+            r,
+            "  all          | {:>9.3} {:>6.3} {:>6.3} {:>6.3} {:>6.3} | ppl ratio vs exact OH ×{:.3} OG ×{:.3} OD ×{:.3} OW ×{:.3}",
+            total[0],
+            total[1],
+            total[2],
+            total[3],
+            total[4],
+            (total[1] - total[0]).exp(),
+            (total[2] - total[0]).exp(),
+            (total[3] - total[0]).exp(),
+            (total[4] - total[0]).exp(),
+        );
+        for (name, text) in [
+            ("X ", x_text),
+            ("OH", oh_text),
+            ("OG", og_text),
+            ("OD", od_text),
+            ("OW", ow_text),
+        ] {
+            let s = text.map_or_else(|e| e, |t| self.tokenizer.decode(&t));
+            let _ = writeln!(r, "  greedy {name}: {:?}", s);
+        }
+        Ok(r)
     }
 
     fn nll_ids_inner(
