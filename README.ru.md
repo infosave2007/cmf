@@ -114,6 +114,26 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## SenseNova-Loop, Mage-VL-Cowork и Primal VAE (0.8.51)
+
+[SenseNova-Loop-9B-Preview](https://huggingface.co/infosave/SenseNova-Loop-9B-Preview-cmf)
+выполняет блок из 24 слоёв декодера дважды с общими весами, внутри петли — два
+остаточных потока mHC; [Mage-VL-Cowork](https://huggingface.co/infosave/Mage-VL-Cowork-cmf) —
+агент Microsoft на 4 млрд для работы с компьютером по скриншотам в исходном
+разрешении; [Primal VAE](https://huggingface.co/infosave/primal_vae-cmf) —
+автоэнкодер изображений Ostris (1–2 канала, сжатие 2×):
+
+```sh
+cortiq run sensenova-loop-9b-q4tp.cmf --image photo.jpg --prompt "Опиши это изображение." --no-think
+cortiq run mage-vl-cowork-q8_2f.cmf --image screen.png --prompt "Task: open the Downloads folder."
+cortiq vae --model primal_vae_2x2.cmf --mode roundtrip --input photo.png --output recon.png
+```
+
+Жадный текст и строки энкодеров совпадают с Transformers float32. Обе
+визуальные башни считаются на GPU (Vulkan и Metal), петля и mHC — внутри
+токен-графов wgpu и Metal; VAE кодирует или декодирует 1024×1024 одной
+отправкой на GPU (0.40 / 0.29 с на NVIDIA A40).
+
 ## Речь LFM3, Omni и d1 (0.8.50)
 
 [LFM3-Audio-2B](https://huggingface.co/infosave/LFM3-Audio-2B-cmf) распознаёт и

@@ -57,6 +57,9 @@ pub(crate) mod amd_mv;
 pub(crate) mod dense_mv;
 /// GPTQ calibration Hessians accumulated on the device (`H += XᵀX`).
 pub(crate) mod gram;
+pub(crate) mod mhc;
+pub(crate) mod vit;
+pub(crate) mod primal_vae;
 /// GPTQ fold operator and q4tp row sweep on the device.
 pub(crate) mod gptq_dev;
 /// Binary low-rank (`blr`) per-op kernels: two ±1 stages, decode and batched.
@@ -29424,6 +29427,21 @@ pub fn forward_token_graph(
                 0
             };
             let pnw = stor(bytemuck::cast_slice(l.post_norm));
+            // SenseNova-Loop mHC: route the streams into the hidden and
+            // norm that branch (the previous tail's `n1` normed the plain
+            // hidden).
+            if let Some(m) = l.mhc {
+                let Some(mp) = mhc::pipes(c) else {
+                    graph_decline("mHC kernels unavailable");
+                    return token_graph_outcome(o1_started || state_started, false);
+                };
+                let (mr, mk) = mhc::bufs(c, hidden);
+                let u = unif(&mhc::params(hidden, m.enter, false, m.iters, m.pre_scale));
+                let (w, b) = (stor(bytemuck::cast_slice(m.attn_w)), stor(bytemuck::cast_slice(m.attn_b)));
+                go(&mut enc, &mp.route, &mhc::route_bg(c, mp, [&h_buf, &mr, &w, &b, &mk, &u]), 1);
+                let inw = stor(bytemuck::cast_slice(l.input_norm));
+                go(&mut enc, &c.rmsnorm, &bg(&c.layout_rmsnorm, &[&h_buf, &inw, &n1, &rms_u]), 1);
+            }
             // ── token mixing (attention or GDN) → ob ──
             match (&lw.attn, &l.attn) {
                 (
@@ -30752,7 +30770,18 @@ pub fn forward_token_graph(
                 }
                 _ => &ob,
             };
-            if !skip_norm && !sw_mix_done {
+            if let Some(m) = l.mhc {
+                // mHC: fold the mixer output into the streams, route the
+                // FFN's branch, norm it.
+                let mp = mhc::pipes(c).expect("checked at the layer start");
+                let (mr, mk) = mhc::bufs(c, hidden);
+                let um = unif(&mhc::params(hidden, false, false, m.iters, m.pre_scale));
+                go(&mut enc, &mp.merge, &mhc::merge_bg(c, mp, [&h_buf, &mr, mix_out, &mk, &um]), (hidden as u32).div_ceil(256));
+                let uf = unif(&mhc::params(hidden, false, false, m.iters, m.pre_scale));
+                let (w, b) = (stor(bytemuck::cast_slice(m.ffn_w)), stor(bytemuck::cast_slice(m.ffn_b)));
+                go(&mut enc, &mp.route, &mhc::route_bg(c, mp, [&h_buf, &mr, &w, &b, &mk, &uf]), 1);
+                go(&mut enc, &c.rmsnorm, &bg(&c.layout_rmsnorm, &[&h_buf, &pnw, &n1, &rms_u]), 1);
+            } else if !skip_norm && !sw_mix_done {
                 let nbg = bgc(
                     23,
                     li,
@@ -30784,8 +30813,11 @@ pub fn forward_token_graph(
                     ..
                 }
             );
-            let simple_tail =
-                fuse_tail && !loop_norm_at.contains(&li) && !sandwich_tail && !has_detached_shared;
+            let simple_tail = fuse_tail
+                && !loop_norm_at.contains(&li)
+                && !sandwich_tail
+                && !has_detached_shared
+                && l.mhc.is_none();
             let mut ffn_post: Option<(&wgpu::ComputePipeline, wgpu::BindGroup, u32)> = None;
             let mut tail_done = false;
             if simple_tail {
@@ -32206,6 +32238,17 @@ pub fn forward_token_graph(
             ts!(enc, 2, lkind);
             if tail_done {
                 // already emitted at the end of the FFN pass
+            } else if let Some(m) = l.mhc {
+                // mHC: fold the FFN output in (the range's last layer hands
+                // the streams' mean on), then the next layer's input norm.
+                let mp = mhc::pipes(c).expect("checked at the layer start");
+                let (mr, mk) = mhc::bufs(c, hidden);
+                let um = unif(&mhc::params(hidden, false, m.leave, m.iters, m.pre_scale));
+                go(&mut enc, &mp.merge, &mhc::merge_bg(c, mp, [&h_buf, &mr, &ob, &mk, &um]), (hidden as u32).div_ceil(256));
+                if li + 1 < layers.len() {
+                    let inw_next = stor(bytemuck::cast_slice(layers[li + 1].input_norm));
+                    go(&mut enc, &c.rmsnorm, &bg(&c.layout_rmsnorm, &[&h_buf, &inw_next, &n1, &rms_u]), 1);
+                }
             } else if sandwich_tail {
                 // Gemma: ob2 = rms(ob)·ffn_out_norm, then h = (h + ob2)·scale
                 // and n1 = rms(h)·next input norm in one add_rmsnorm (the
@@ -32840,6 +32883,32 @@ pub fn forward_token_graph(
 /// sequence position of batch row i (contiguous causal run starting at
 /// `positions[0]`); `h` is [k·hidden] in/out.
 #[allow(clippy::too_many_arguments)]
+thread_local! {
+    /// Interleaved-MRoPE angles of the rows of the NEXT batch graph call on
+    /// this thread (SenseNova-Loop image prompts): `[k][64]` f32, row `i`'s
+    /// absolute angle of rotary frequency `j` at `[i·64 + j]` (a row padded
+    /// to the 256-byte binding alignment). The full-attention rows then take
+    /// the per-row loop with these angles in place of `pos · inv_freq`.
+    static BATCH_MROPE: std::cell::RefCell<Option<Vec<f32>>> = const { std::cell::RefCell::new(None) };
+}
+
+thread_local! {
+    /// Prompt chunks of the next batch graph calls on this thread take the
+    /// register-blocked q8_2f GEMM (exact f32 sums in tile order) instead of
+    /// the 8-row matvec that is bit for bit the decode kernel.
+    static BATCH_Q82_MM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Opt this thread's batch graph prompt chunks into the q8_2f GEMM.
+pub fn set_batch_q82_mm(on: bool) {
+    BATCH_Q82_MM.with(|f| f.set(on));
+}
+
+/// Arm (`Some`) or clear the MRoPE angles of the next batch graph call.
+pub fn set_batch_mrope(angles: Option<Vec<f32>>) {
+    BATCH_MROPE.with(|m| *m.borrow_mut() = angles);
+}
+
 pub fn forward_batch_graph_at(
     model: &Arc<CmfModel>,
     kv_id: u64,
@@ -34125,7 +34194,16 @@ pub fn forward_batch_graph_at(
     // prompt whole — keeps f32 activations so the batched prefill differs
     // from the per-position walk in accumulation order only.
     let i8_rows = spec.is_some() && preview.is_none() && verify_i8_on();
-    let q82mm_p = g4p.or_else(|| preview.and_then(|_| gemma_batch::pipes(c)));
+    // The register-blocked q8_2f GEMM: Gemma-4, block previews, and the
+    // prompt chunks (wider than 16 rows) of a stack that asked for it
+    // (`set_batch_q82_mm`: SenseNova-Loop, 3.5× its 8-row matvec prefill;
+    // `CMF_Q82_MM=0` keeps the matvec).
+    let q82_prompt = preview.is_none()
+        && spec.is_none()
+        && k > 16
+        && BATCH_Q82_MM.with(|f| f.get())
+        && std::env::var("CMF_Q82_MM").as_deref() != Ok("0");
+    let q82mm_p = g4p.or_else(|| (preview.is_some() || q82_prompt).then(|| gemma_batch::pipes(c)).flatten());
     let ematb = |enc: &mut wgpu::CommandEncoder,
                  m: &GMat,
                  xs: &wgpu::Buffer,
@@ -34145,7 +34223,7 @@ pub fn forward_batch_graph_at(
             // workgroup leaves a 2048-row projection 32 workgroups (the
             // GDN out_proj measured 3.4 → 7.5 ms a pass on an RTX 5090).
             7 if k > 16
-                && (g4p.is_some() || rows >= 8192)
+                && (g4p.is_some() || rows >= 8192 || q82_prompt)
                 && q82mm_p.is_some_and(|gp| {
                     gemma_batch::encode_q82_mm(c, enc, gp, &m.buf, xs, y, rows, cols, k)
                 }) => {}
@@ -34600,6 +34678,20 @@ pub fn forward_batch_graph_at(
         }
         let lw = &lws[li];
         let pnw = stor(bytemuck::cast_slice(l.post_norm));
+        // SenseNova-Loop mHC over the k rows: route every row's streams
+        // into its hidden, norm the branches.
+        if let Some(m) = l.mhc {
+            let Some(mp) = mhc::pipes(c) else {
+                bgraph_refused("mHC kernels unavailable");
+                return batch_outcome(o1_started || state_started, false);
+            };
+            let (mr, mk) = mhc::bufs_k(c, hidden, k);
+            let u = unif(&mhc::params_k(hidden, k, m.enter, false, m.iters, m.pre_scale));
+            let (w, b) = (stor(bytemuck::cast_slice(m.attn_w)), stor(bytemuck::cast_slice(m.attn_b)));
+            go(&mut enc, &mp.route, &mhc::route_bg(c, mp, [&h_buf, &mr, &w, &b, &mk, &u]), k as u32);
+            let inw = stor(bytemuck::cast_slice(l.input_norm));
+            go(&mut enc, &c.rmsnorm_b, &bg(&c.layout_rmsnorm_b, &[&h_buf, &inw, &n1, &rms_u]), k as u32);
+        }
         match (&lw.attn, &l.attn) {
             (
                 LAttn::Full {
@@ -35413,6 +35505,13 @@ pub fn forward_batch_graph_at(
                             && hd % 4 == 0
                             && pos_end <= cap
                     });
+                    // MRoPE rows (`BATCH_MROPE`): every row through the loop
+                    // below, each rotating by its own angle table.
+                    let mrope_tab = BATCH_MROPE.with(|m| {
+                        m.borrow().as_ref().filter(|t| t.len() >= k * 64 && rd / 2 <= 64).map(|t| {
+                            stor(bytemuck::cast_slice(&t[..k * 64]))
+                        })
+                    });
                     let t_split = if bt.is_some() {
                         ATTEND_SPLIT_MIN.saturating_sub(positions[0]).min(k)
                     } else {
@@ -35446,7 +35545,8 @@ pub fn forward_batch_graph_at(
                                 nkv,
                                 hd,
                                 rd,
-                                p,
+                                // MRoPE: angle = 1 · table[j]
+                                if mrope_tab.is_some() { 1 } else { p },
                                 flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm) | gate_flag,
                                 eps,
                                 i,
@@ -35468,16 +35568,29 @@ pub fn forward_batch_graph_at(
                             0,
                         ]);
                         pass.set_pipeline(&c.attn_rope);
-                        pass.set_bind_group(
-                            0,
-                            &bg(
+                        let bg_r = match &mrope_tab {
+                            Some(tab) => c.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: None,
+                                layout: &c.layout_attn_rope,
+                                entries: &[
+                                    bind_buf(0, &qraw_b),
+                                    bind_buf(1, &kb_b),
+                                    bind_buf(2, &qout_s),
+                                    bind_buf(3, &gout_s),
+                                    bind_buf(4, &qnw),
+                                    bind_buf(5, &knw),
+                                    bind_buf_off(6, tab, (i * 256) as u64, 256),
+                                    bind_buf(7, &rope_u),
+                                ],
+                            }),
+                            None => bg(
                                 &c.layout_attn_rope,
                                 &[
                                     &qraw_b, &kb_b, &qout_s, &gout_s, &qnw, &knw, &invf_b, &rope_u,
                                 ],
                             ),
-                            &[],
-                        );
+                        };
+                        pass.set_bind_group(0, &bg_r, &[]);
                         pass.dispatch_workgroups((nh + nkv) as u32, 1, 1);
                         if let Some(cb) = &qcap {
                             encode_blit_p(&mut pass, c, &qout_s, cb, nh * hd, 0, i * nh * hd, None);
@@ -35587,13 +35700,16 @@ pub fn forward_batch_graph_at(
                     drop(pass);
                     if let Some(p) = bt.filter(|_| t_from < k) {
                         let gate_flag = if *output_gate { 1u32 } else { 0 };
+                        // MRoPE rows: the kernel reads each row's angles
+                        // from the table bound in place of `invf` (flag 128).
+                        let mrope_flag = if mrope_tab.is_some() { 128u32 } else { 0 };
                         let rope_words = rope_uniform_words(
                             nh,
                             nkv,
                             hd,
                             rd,
                             positions[0],
-                            flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm) | gate_flag,
+                            flags(q_norm.is_some(), k_norm.is_some(), *late_qk_norm) | gate_flag | mrope_flag,
                             eps,
                             0,
                             1.0,
@@ -35613,7 +35729,7 @@ pub fn forward_batch_graph_at(
                         });
                         dense_batch::encode_attn_bt(
                             c, &mut enc, p, rope_words, &qraw_b, &kb_b, &vb_b, qall, gall, &qnw,
-                            &knw, &invf_b, kbuf, vbuf, pacc, pml, &attn_bb, nh, nkv, hd, cap,
+                            &knw, mrope_tab.as_ref().unwrap_or(&invf_b), kbuf, vbuf, pacc, pml, &attn_bb, nh, nkv, hd, cap,
                             positions[0], t_from, t_split, k, *sub, *nc, attn_scale, 0,
                         );
                         if let Some(cb) = &qcap {
@@ -36049,12 +36165,25 @@ pub fn forward_batch_graph_at(
             }
             _ => &ob,
         };
-        go(
-            &mut enc,
-            &c.add_rmsnorm_b,
-            &bg(&c.layout_add_rmsnorm_b, &[&h_buf, mix_out, &pnw, &n1, &rms_u]),
-            k as u32,
-        );
+        if let Some(m) = l.mhc {
+            // mHC: fold the mixer outputs into the streams, route the FFN
+            // branches, norm them.
+            let mp = mhc::pipes(c).expect("checked at the layer start");
+            let (mr, mk) = mhc::bufs_k(c, hidden, k);
+            let um = unif(&mhc::params_k(hidden, k, false, false, m.iters, m.pre_scale));
+            go(&mut enc, &mp.merge, &mhc::merge_bg(c, mp, [&h_buf, &mr, mix_out, &mk, &um]), ((k * hidden) as u32).div_ceil(256));
+            let uf = unif(&mhc::params_k(hidden, k, false, false, m.iters, m.pre_scale));
+            let (w, b) = (stor(bytemuck::cast_slice(m.ffn_w)), stor(bytemuck::cast_slice(m.ffn_b)));
+            go(&mut enc, &mp.route, &mhc::route_bg(c, mp, [&h_buf, &mr, &w, &b, &mk, &uf]), k as u32);
+            go(&mut enc, &c.rmsnorm_b, &bg(&c.layout_rmsnorm_b, &[&h_buf, &pnw, &n1, &rms_u]), k as u32);
+        } else {
+            go(
+                &mut enc,
+                &c.add_rmsnorm_b,
+                &bg(&c.layout_add_rmsnorm_b, &[&h_buf, mix_out, &pnw, &n1, &rms_u]),
+                k as u32,
+            );
+        }
         match &lw.ffn {
             // add_rmsnorm_b above has already added the attention residual
             // into h_buf. A singleton graph must not add ob a second time.
@@ -36575,6 +36704,17 @@ pub fn forward_batch_graph_at(
                 l.layer_scale,
                 k,
             );
+        } else if let Some(m) = l.mhc {
+            // mHC: fold the FFN outputs in (the range's last layer hands the
+            // streams' mean on), then the next layer's input norm.
+            let mp = mhc::pipes(c).expect("checked at the layer start");
+            let (mr, mk) = mhc::bufs_k(c, hidden, k);
+            let um = unif(&mhc::params_k(hidden, k, false, m.leave, m.iters, m.pre_scale));
+            go(&mut enc, &mp.merge, &mhc::merge_bg(c, mp, [&h_buf, &mr, &ob, &mk, &um]), ((k * hidden) as u32).div_ceil(256));
+            if li + 1 < layers.len() {
+                let inw_next = stor(bytemuck::cast_slice(layers[li + 1].input_norm));
+                go(&mut enc, &c.rmsnorm_b, &bg(&c.layout_rmsnorm_b, &[&h_buf, &inw_next, &n1, &rms_u]), k as u32);
+            }
         } else if li + 1 < layers.len() {
             let inw_next = stor(bytemuck::cast_slice(layers[li + 1].input_norm));
             go(

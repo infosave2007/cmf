@@ -141,6 +141,18 @@ pub struct Pipeline {
     pub physical_layers: usize,
     /// Looped Transformer: apply final norm after each loop iteration.
     pub loop_final_norm: bool,
+    /// SenseNova-Loop: virtual → physical layer order (None: `v %
+    /// physical_layers`, the whole-stack loop of Nanbeige).
+    pub layer_map: Option<Vec<usize>>,
+    /// SenseNova-Loop: the mHC routers (`sensenova::Mhc`).
+    pub mhc: Option<Box<crate::sensenova::Mhc>>,
+    /// The decode token's mHC streams, `[streams · hidden]`.
+    mhc_r: Vec<f32>,
+    /// Interleaved-MRoPE sections and the prompt rows' (t, h, w) positions
+    /// for the prefill of an image prompt (SenseNova-Loop); cleared when
+    /// the prefill ends.
+    pub mrope_sections: Option<[usize; 3]>,
+    pub prompt_mrope: Option<Vec<[i64; 3]>>,
     pub vocab_size: usize,
     pub rms_eps: f64,
     pub rope_base: f32,
@@ -2134,7 +2146,50 @@ impl Pipeline {
     /// virtual layer 23 maps back to physical layer 1 (23 % 22 = 1).
     #[inline]
     pub fn phys_layer(&self, virtual_idx: usize) -> usize {
-        virtual_idx % self.physical_layers
+        match &self.layer_map {
+            Some(m) => m[virtual_idx],
+            None => virtual_idx % self.physical_layers,
+        }
+    }
+
+    /// Mage-VL (`llava_onevision2`) prompt ingest through the batched wgpu
+    /// graph (`CMF_GRAPH_PREFILL=0` keeps the chunked host prefill).
+    fn onevision2_prefill(&self) -> bool {
+        self.model.as_ref().is_some_and(|m| m.header.arch.arch_name == "llava_onevision2")
+            && std::env::var("CMF_GRAPH_PREFILL").as_deref() != Ok("0")
+    }
+
+    /// SenseNova-Loop: whether virtual layer `li` runs inside the mHC
+    /// streams (the device graphs decline such layers).
+    #[inline]
+    pub fn mhc_layer(&self, li: usize) -> bool {
+        self.mhc.as_ref().is_some_and(|m| m.on(self.phys_layer(li)))
+    }
+
+    /// mHC before a sub-layer of the decode token: route its streams into
+    /// `h` (entering the range copies `h` into every stream first).
+    fn mhc_pre(&mut self, li: usize, ffn: bool, h: &mut [f32]) -> crate::sensenova::MhcCoef {
+        let p = self.phys_layer(li);
+        let m = self.mhc.as_deref().expect("mhc layer");
+        let n = m.s.streams * m.dim;
+        if self.mhc_r.len() != n {
+            self.mhc_r.resize(n, 0.0);
+        }
+        if !ffn && m.enters(p) {
+            m.enter(&mut self.mhc_r, h);
+        }
+        m.route(p, ffn, &self.mhc_r, h)
+    }
+
+    /// mHC after a sub-layer: fold its output `y` into the streams; after
+    /// the range's last FFN, `h` becomes the streams' mean.
+    fn mhc_post(&mut self, li: usize, ffn: bool, y: &[f32], c: &crate::sensenova::MhcCoef, h: &mut [f32]) {
+        let p = self.phys_layer(li);
+        let m = self.mhc.as_deref().expect("mhc layer");
+        m.merge(&mut self.mhc_r, y, c);
+        if ffn && m.leaves(p) {
+            m.leave(&self.mhc_r, h);
+        }
     }
 
     /// True when `virtual_idx` is the last layer of a loop iteration
@@ -2382,6 +2437,10 @@ impl Pipeline {
             .layers
             .iter()
             .any(|lw| matches!(&lw.attn, AttnKind::LinearGdn(_)))
+            // Mage-VL: its screenshot prompts (~2k rows) go through the
+            // batched graph, 4× the chunked host ingest on an A40 (2048
+            // tokens: 806 tok/s at 128 rows, 893 at 256, against 196).
+            || self.onevision2_prefill()
         {
             return true;
         }
@@ -2573,6 +2632,18 @@ impl Pipeline {
         let block_diag = std::env::var("CMF_GRAPH_DBG").is_ok();
         let mut scan = start;
         while scan < limit {
+            // SenseNova-Loop: MRoPE prompt rows rotate on the host; an mHC
+            // layer rides the graph when its kernels compiled (two streams,
+            // dense FFN, device attend — checked below).
+            if self.prompt_mrope.is_some()
+                || (self.mhc_layer(scan)
+                    && (!crate::gpu_metal::mhc::available()
+                        || std::env::var("CMF_MHC_GRAPH").as_deref() == Ok("0")
+                        || self.mhc.as_ref().is_some_and(|m| m.s.streams != 2 || m.s.fixed_identity)
+                        || !matches!(self.weights.layers[self.phys_layer(scan)].ffn, FfnKind::Dense(_))))
+            {
+                break;
+            }
             let lw = &self.weights.layers[self.phys_layer(scan)];
             let ffn = match &lw.ffn {
                 FfnKind::Dense(d) if d.segs.is_empty() => {
@@ -2654,6 +2725,7 @@ impl Pipeline {
                         model_ref.get_or_insert_with(|| model.clone());
                     }
                     let gl = GdnGpuLayer {
+                        mhc: crate::sensenova::graph_mhc(self.mhc.as_deref(), self.phys_layer(scan)),
                         attn_norm: &lw.input_norm,
                         post_norm: &lw.post_norm,
                         qkv,
@@ -2773,8 +2845,14 @@ impl Pipeline {
                         && pk.1 == nkv_g * hd_g
                         && pv.1 == nkv_g * hd_g
                         && po.2 == self.num_heads * hd_g;
+                    // An mHC layer needs the device attend (the CPU-attend
+                    // sandwich has no stream hand-off).
+                    if !full_gpu && self.mhc_layer(scan) {
+                        break;
+                    }
                     plan.push(Item::Attn {
                         l: AttnGpuLayer {
+                            mhc: crate::sensenova::graph_mhc(self.mhc.as_deref(), self.phys_layer(scan)),
                             attn_norm: &lw.input_norm,
                             post_norm: &lw.post_norm,
                             wq: pq,
@@ -2801,6 +2879,20 @@ impl Pipeline {
                 _ => break,
             }
             scan += 1;
+        }
+        // SenseNova-Loop: the mHC streams live on the device only inside one
+        // graph, so a graph may neither enter a range midway nor stop
+        // inside one (the host walks such a stretch with its own streams).
+        if let Some(m) = self.mhc.as_deref() {
+            let inside = |li: usize| m.on(self.phys_layer(li));
+            let starts_mid = inside(start) && !m.enters(self.phys_layer(start));
+            let stops_mid = scan > start && inside(scan - 1) && !m.leaves(self.phys_layer(scan - 1));
+            if starts_mid || stops_mid {
+                if std::env::var("CMF_GRAPH_DBG").is_ok() {
+                    eprintln!("q1-graph: [{start}, {scan}) would split an mHC range — host path");
+                }
+                return start;
+            }
         }
         let Some(model) = model_ref else {
             if std::env::var("CMF_GRAPH_DBG").is_ok() {
@@ -3524,6 +3616,7 @@ impl Pipeline {
                         raw
                     });
                     let cfg = QwenAttnCfg {
+                        mrope: None,
                         num_heads: nh,
                         num_kv_heads: nkv,
                         head_dim: hd,
@@ -3850,6 +3943,11 @@ impl Pipeline {
             num_layers,
             physical_layers,
             loop_final_norm,
+            layer_map: None,
+            mhc: None,
+            mhc_r: Vec::new(),
+            mrope_sections: None,
+            prompt_mrope: None,
             vocab_size,
             rms_eps,
             rope_base,
@@ -4394,7 +4492,7 @@ impl Pipeline {
             });
             return if q82 {
                 128
-            } else if q4tp_moe {
+            } else if q4tp_moe || self.onevision2_prefill() {
                 256
             } else if moe {
                 32
@@ -4733,6 +4831,7 @@ impl Pipeline {
 
     fn attn_cfg(&self, position: usize) -> QwenAttnCfg<'_> {
         QwenAttnCfg {
+            mrope: None,
             num_heads: self.num_heads,
             num_kv_heads: self.num_kv_heads,
             head_dim: self.head_dim,
@@ -5365,7 +5464,8 @@ impl Pipeline {
         let batch_k = self.generation_batch_k();
         if let Some(rows) = prompt_rows {
             let hs = self.hidden_size;
-            let chunk = self.prefill_chunk().max(1);
+            // The batched graph's row count when the prompt rides it.
+            let chunk = if batch_k > 0 { batch_k } else { self.prefill_chunk().max(1) };
             while pos < input_ids.len() && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 let end = (pos + chunk).min(input_ids.len());
                 let hb = match self.prefill_input_rows(
@@ -5375,6 +5475,7 @@ impl Pipeline {
                 ) {
                     Ok(hb) => hb,
                     Err(err) => {
+                        self.prompt_mrope = None;
                         self.finish_generation(&mut mtp, &mut router, true);
                         return Err(err);
                     }
@@ -5386,6 +5487,9 @@ impl Pipeline {
                 pos = end;
             }
         }
+        // The prompt's MRoPE rows are in the cache; decode positions are
+        // plain (`sensenova::mrope_positions` shifted them so).
+        self.prompt_mrope = None;
         // DeepSeek-V4 owns a separate hyper-connection stack. Route it
         // before the generic prefill choices: those correctly reject an
         // empty `weights.layers`, but their final per-position fallback used
@@ -7526,6 +7630,7 @@ impl Pipeline {
             )
         };
         let layer = crate::gpu::GraphLayer {
+            mhc: None,
             input_norm: &lw.input_norm,
             attn: crate::gpu::GraphAttn::Full {
                 wq: gw(wq)?,
@@ -7702,6 +7807,7 @@ impl Pipeline {
             return crate::gpu::BatchGraphOutcome::Declined;
         };
         let layer = crate::gpu::GraphLayer {
+            mhc: None,
             input_norm: &lw.input_norm,
             attn: crate::gpu::GraphAttn::Full {
                 wq: gwq,
@@ -9084,6 +9190,7 @@ impl Pipeline {
                     let inv_freq_l = self.layer_inv_freq(li);
                     let (nkv_l, hd_l, rd_l) = self.layer_geom(li);
                     let cfg = QwenAttnCfg {
+                        mrope: None,
                         num_heads: self.layer_num_heads(li),
                         num_kv_heads: nkv_l,
                         head_dim: hd_l,
@@ -11578,6 +11685,9 @@ impl Pipeline {
             && !self.o1_active()
             && bk > 1
             && (self.batch_prefix_prefill()
+                // An embedded prompt (vision rows) on the graph route takes
+                // the batched graph like an id prompt does.
+                || (matches!(input, PrefillIn::Hidden(_)) && self.generation_batch_k() > 0)
                 || (self.verify_exact_moe
                     && crate::gpu::enabled_here()
                     && crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Decode)))
@@ -11703,6 +11813,8 @@ impl Pipeline {
 
         #[cfg(target_os = "macos")]
         let mut chunk_skip_until = 0usize;
+        // SenseNova-Loop: the chunk rows' mHC streams.
+        let mut mhc_rs: Vec<f32> = Vec::new();
         for li in from..upto_excl {
             let _capacity_tail = automatic_gpu_prefix
                 .filter(|&prefix| {
@@ -11774,6 +11886,25 @@ impl Pipeline {
             }
             #[cfg(feature = "gpu")]
             self.pull_lagging_host_kv(li, li + 1, start_pos);
+            // SenseNova-Loop mHC: every row's streams route into `h`; the
+            // attention below adds onto that branch, so its output is the
+            // difference from the copy kept here.
+            let mhc_attn = self.mhc_layer(li).then(|| {
+                let m = self.mhc.as_deref().expect("mhc layer");
+                let p = self.phys_layer(li);
+                let n = m.s.streams * hs;
+                mhc_rs.resize(b * n, 0.0);
+                let coefs: Vec<_> = (0..b)
+                    .map(|bi| {
+                        let r = &mut mhc_rs[bi * n..(bi + 1) * n];
+                        if m.enters(p) {
+                            m.enter(r, &h[bi * hs..(bi + 1) * hs]);
+                        }
+                        m.route(p, false, r, &mut h[bi * hs..(bi + 1) * hs])
+                    })
+                    .collect();
+                (h.clone(), coefs)
+            });
             let lw = &self.weights.layers[self.phys_layer(li)];
             let t_attn = std::time::Instant::now();
             // ── attention ──
@@ -11926,6 +12057,7 @@ impl Pipeline {
                     let inv_freq_l = self.layer_inv_freq(li);
                     let (nkv_l, hd_l, rd_l) = self.layer_geom(li);
                     let cfg = QwenAttnCfg {
+                        mrope: self.prompt_mrope.as_deref().zip(self.mrope_sections).map(|(pos, sections)| attention::MropeView { base: 0, pos, sections }),
                         num_heads: self.layer_num_heads(li),
                         num_kv_heads: nkv_l,
                         head_dim: hd_l,
@@ -12056,6 +12188,24 @@ impl Pipeline {
                 }
             }
 
+            // mHC: fold the attention output into the streams, route the
+            // FFN's branch.
+            let mhc_ffn = mhc_attn.map(|(branch, coefs)| {
+                let m = self.mhc.as_deref().expect("mhc layer");
+                let p = self.phys_layer(li);
+                let n = m.s.streams * hs;
+                let mut y = vec![0f32; hs];
+                (0..b)
+                    .map(|bi| {
+                        for (e, v) in y.iter_mut().enumerate() {
+                            *v = h[bi * hs + e] - branch[bi * hs + e];
+                        }
+                        let r = &mut mhc_rs[bi * n..(bi + 1) * n];
+                        m.merge(r, &y, &coefs[bi]);
+                        m.route(p, true, r, &mut h[bi * hs..(bi + 1) * hs])
+                    })
+                    .collect::<Vec<_>>()
+            });
             // ── FFN batched ──
             let lw = &self.weights.layers[self.phys_layer(li)];
             let mut post = vec![0.0f32; b * hs];
@@ -12131,8 +12281,23 @@ impl Pipeline {
                 }
                 ffn.copy_from_slice(&post);
             }
-            for (dst, &f) in h.iter_mut().zip(&ffn) {
-                *dst += f;
+            if let Some(coefs) = mhc_ffn {
+                // mHC: fold the FFN output in; the range's last layer hands
+                // the streams' mean on as the hidden.
+                let m = self.mhc.as_deref().expect("mhc layer");
+                let p = self.phys_layer(li);
+                let n = m.s.streams * hs;
+                for bi in 0..b {
+                    let r = &mut mhc_rs[bi * n..(bi + 1) * n];
+                    m.merge(r, &ffn[bi * hs..(bi + 1) * hs], &coefs[bi]);
+                    if m.leaves(p) {
+                        m.leave(r, &mut h[bi * hs..(bi + 1) * hs]);
+                    }
+                }
+            } else {
+                for (dst, &f) in h.iter_mut().zip(&ffn) {
+                    *dst += f;
+                }
             }
             if let Some(sc) = lw.layer_scale {
                 for v in h.iter_mut() {
@@ -12304,6 +12469,8 @@ impl Pipeline {
                 .map(|v| v == "0")
                 .unwrap_or(false)
             || b < self.chunk_min_rows
+            // MRoPE rows rotate on the host (`attention::MropeView`).
+            || self.prompt_mrope.is_some()
             // Sliding windows with per-layer RoPE ride the chunk graph
             // (`metal_graph_swa`: causal_softmax_win, per-layer tables).
             || (self.swa.is_some() && !self.metal_graph_swa() && !gemma4)
@@ -12351,6 +12518,9 @@ impl Pipeline {
         let mut layers: Vec<crate::gpu_metal::ChunkLayer> = Vec::new();
         let mut stored_at: Vec<usize> = Vec::new();
         for li in li0..run_end {
+            if self.mhc_layer(li) {
+                break;
+            }
             let lw = &self.weights.layers[self.phys_layer(li)];
             if (lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some() || lw.layer_scale.is_some())
                 && !gemma4
@@ -13344,6 +13514,7 @@ impl Pipeline {
                 return Out::Declined;
             };
             let layer = crate::gpu::GraphLayer {
+                mhc: None,
                 input_norm: &lw.input_norm,
                 post_norm: &lw.post_norm,
                 attn_out_norm: None,
@@ -14091,6 +14262,19 @@ impl Pipeline {
         from: usize,
         upto_excl: usize,
     ) -> Option<Result<Vec<f32>, ()>> {
+        // SenseNova-Loop: MRoPE prompt rows rotate on the host; the graph's
+        // mHC kernels take two streams only, and a graph must not enter an
+        // mHC range midway (its streams would be the host's).
+        if self.prompt_mrope.is_some()
+            || self.mhc.as_deref().is_some_and(|m| {
+                from < self.num_layers && m.on(self.phys_layer(from)) && !m.enters(self.phys_layer(from))
+            })
+            || self.mhc.as_ref().is_some_and(|m| m.s.streams != 2 || m.s.fixed_identity)
+            || std::env::var("CMF_MHC_GRAPH").as_deref() == Ok("0")
+                && (from..upto_excl.min(self.num_layers)).any(|li| self.mhc_layer(li))
+        {
+            return None;
+        }
         // The bank has already reserved its VRAM. Never build a second
         // all-expert arena across bank-owned layers (including bursts).
         let upto_excl = match self.mimo_moe.graph_prefix_end() {
@@ -14606,6 +14790,7 @@ impl Pipeline {
                 _ => return None,
             };
             layers.push(crate::gpu::GraphLayer {
+                mhc: crate::sensenova::graph_mhc(self.mhc.as_deref(), self.phys_layer(li)),
                 input_norm: &lw.input_norm,
                 attn,
                 post_norm: &lw.post_norm,
@@ -14832,6 +15017,7 @@ impl Pipeline {
                         model_ref.get_or_insert_with(|| model.clone());
                     }
                     let gl = GdnGpuLayer {
+                        mhc: None,
                         attn_norm: &lw.input_norm,
                         post_norm: &lw.post_norm,
                         qkv,
@@ -14881,6 +15067,7 @@ impl Pipeline {
                     }
                     plan.push(MetalRowsItem::Attn {
                         l: AttnGpuLayer {
+                            mhc: None,
                             attn_norm: &lw.input_norm,
                             post_norm: &lw.post_norm,
                             wq: pq,
@@ -15203,6 +15390,8 @@ impl Pipeline {
     ) -> crate::gpu::BatchGraphOutcome {
         let _t0 = std::time::Instant::now();
         if positions.len() != b
+            || self.mhc.is_some()
+            || self.prompt_mrope.is_some()
             || positions.windows(2).any(|w| w[1] != w[0] + 1)
             || hiddens.len() != b * self.hidden_size
         {
@@ -15537,6 +15726,7 @@ impl Pipeline {
         };
         spec_stamp("w.new");
         let l = AttnGpuLayer {
+            mhc: None,
             attn_norm: &m.layer.input_norm,
             post_norm: &m.layer.post_norm,
             wq: pq,
@@ -15814,6 +16004,7 @@ impl Pipeline {
         }
         spec_stamp("d.in");
         let l = AttnGpuLayer {
+            mhc: None,
             attn_norm: &m.layer.input_norm,
             post_norm: &m.layer.post_norm,
             wq: pq,
@@ -16064,6 +16255,7 @@ impl Pipeline {
             return Err(false);
         }
         let l = AttnGpuLayer {
+            mhc: None,
             attn_norm: &m.layer.input_norm,
             post_norm: &m.layer.post_norm,
             wq: pq,
@@ -16230,6 +16422,15 @@ impl Pipeline {
         spec: Option<crate::gpu::SpecTail<'_>>,
         layers_run: Option<&mut usize>,
     ) -> crate::gpu::BatchGraphOutcome {
+        // SenseNova-Loop: the mHC kernels take two streams (the
+        // CMF_MHC_GRAPH=0 knob keeps the host); MRoPE prompt rows ride the
+        // per-row attention loop with their own angle tables.
+        if self.mhc.as_ref().is_some_and(|m| {
+                m.s.streams != 2 || m.s.fixed_identity || std::env::var("CMF_MHC_GRAPH").as_deref() == Ok("0")
+            })
+        {
+            return crate::gpu::BatchGraphOutcome::Declined;
+        }
         let graph_end = match self.mimo_moe.graph_prefix_end() {
             Some(end) if end < self.num_layers => {
                 if layers_run.is_none() || spec.is_some() || end == 0 {
@@ -16562,6 +16763,7 @@ impl Pipeline {
                 // every other model hands the graph none, as before.
                 let g4 = self.global_attn.is_some() || self.attn_v_norm;
                 layers.push(crate::gpu::GraphLayer {
+                    mhc: crate::sensenova::graph_mhc(self.mhc.as_deref(), self.phys_layer(li)),
                     input_norm: &lw.input_norm,
                     attn,
                     post_norm: &lw.post_norm,
@@ -16590,6 +16792,30 @@ impl Pipeline {
         if std::env::var("CMF_GRAPH_SPEC_TIME").is_ok() {
             eprintln!("batch-build: {:.1} ms", _tb.elapsed().as_secs_f64() * 1e3);
         }
+        // SenseNova-Loop and Mage-VL: their q8_2f prompt chunks take the
+        // batched int8 GEMM.
+        #[cfg(feature = "gpu")]
+        crate::gpu_wgpu::set_batch_q82_mm(self.mhc.is_some() || self.onevision2_prefill());
+        // SenseNova-Loop image prompt: each row's absolute MRoPE angles.
+        #[cfg(feature = "gpu")]
+        let _mrope = self.prompt_mrope.as_deref().zip(self.mrope_sections).map(|(pos, sections)| {
+            let half = rd / 2;
+            let mut tab = vec![0f32; k * 64];
+            for (i, &p) in positions.iter().enumerate() {
+                for j in 0..half.min(64) {
+                    let a = pos.get(p).map_or(p as f32, |q| q[crate::sensenova::mrope_axis(j, sections)] as f32);
+                    tab[i * 64 + j] = a * self.inv_freq[j];
+                }
+            }
+            crate::gpu_wgpu::set_batch_mrope(Some(tab));
+            struct Clear;
+            impl Drop for Clear {
+                fn drop(&mut self) {
+                    crate::gpu_wgpu::set_batch_mrope(None);
+                }
+            }
+            Clear
+        });
         crate::gpu::forward_batch_graph(
             &model,
             self.graph_kv_id,
@@ -18448,6 +18674,9 @@ impl Pipeline {
             }
             #[cfg(feature = "gpu")]
             self.pull_lagging_host_kv(li, li + 1, position);
+            // SenseNova-Loop mHC: the attention reads the routed branch of
+            // the streams.
+            let mhc_attn = self.mhc_layer(li).then(|| self.mhc_pre(li, false, &mut h));
             let lw = &self.weights.layers[self.phys_layer(li)];
             if let Ok(tp) = std::env::var("CMF_TRACE_POS") {
                 if tp.parse::<usize>().ok() == Some(position) {
@@ -18568,6 +18797,7 @@ impl Pipeline {
                     let inv_freq_l = self.layer_inv_freq(li);
                     let (nkv_l, hd_l, rd_l) = self.layer_geom(li);
                     let cfg = QwenAttnCfg {
+                        mrope: None,
                         num_heads: self.layer_num_heads(li),
                         num_kv_heads: nkv_l,
                         head_dim: hd_l,
@@ -18715,6 +18945,7 @@ impl Pipeline {
                             let inv_freq_l = self.layer_inv_freq(li);
                             let (nkv_l, hd_l, rd_l) = self.layer_geom(li);
                             let cfg = QwenAttnCfg {
+                                mrope: self.prompt_mrope.as_deref().zip(self.mrope_sections).map(|(pos, sections)| attention::MropeView { base: 0, pos, sections }),
                                 num_heads: self.layer_num_heads(li),
                                 num_kv_heads: nkv_l,
                                 head_dim: hd_l,
@@ -18762,17 +18993,32 @@ impl Pipeline {
                 Some(w) => inference::rms_norm(&attn_out, w, self.rms_eps, self.norm_style),
                 None => attn_out,
             };
+            let mhc_ffn = match mhc_attn {
+                Some(c) => {
+                    // mHC: fold the attention output in, route the FFN's
+                    // branch, and norm that.
+                    self.mhc_post(li, false, &attn_out, &c, &mut h);
+                    let cf = self.mhc_pre(li, true, &mut h);
+                    let lw = &self.weights.layers[self.phys_layer(li)];
+                    inference::rms_norm_into(&h, &lw.post_norm, self.rms_eps, self.norm_style, &mut self.ws.p1);
+                    Some(cf)
+                }
+                None => {
+                    let lw = &self.weights.layers[self.phys_layer(li)];
+                    let prof = crate::cpuprof::time(crate::cpuprof::Slot::Norms);
+                    inference::add_rmsnorm_fused_into(
+                        &mut h,
+                        &attn_out,
+                        &lw.post_norm,
+                        self.rms_eps,
+                        self.norm_style,
+                        &mut self.ws.p1,
+                    );
+                    drop(prof);
+                    None
+                }
+            };
             let lw = &self.weights.layers[self.phys_layer(li)];
-            let prof = crate::cpuprof::time(crate::cpuprof::Slot::Norms);
-            inference::add_rmsnorm_fused_into(
-                &mut h,
-                &attn_out,
-                &lw.post_norm,
-                self.rms_eps,
-                self.norm_style,
-                &mut self.ws.p1,
-            );
-            drop(prof);
             let mut attn_out = attn_out;
             attention::recycle_buf(&mut attn_out);
             let post_normed = &self.ws.p1;
@@ -18904,8 +19150,13 @@ impl Pipeline {
                 Some(w) => inference::rms_norm(&ffn_out, w, self.rms_eps, self.norm_style),
                 None => ffn_out,
             };
-            for (i, &f) in ffn_out.iter().enumerate() {
-                h[i] += f;
+            match mhc_ffn {
+                Some(c) => self.mhc_post(li, true, &ffn_out, &c, &mut h),
+                None => {
+                    for (i, &f) in ffn_out.iter().enumerate() {
+                        h[i] += f;
+                    }
+                }
             }
             let mut ffn_out = ffn_out;
             attention::recycle_buf(&mut ffn_out);

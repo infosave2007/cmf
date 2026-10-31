@@ -911,6 +911,7 @@ impl Pipeline {
                         return Err("block diffusion: projected attention gates are not supported".into());
                     }
                     let cfg = QwenAttnCfg {
+                        mrope: None,
                         num_heads: nh_l,
                         num_kv_heads: nkv_l,
                         head_dim: hd_l,

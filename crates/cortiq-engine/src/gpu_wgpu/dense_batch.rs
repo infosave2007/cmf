@@ -32,6 +32,12 @@ struct RqP {
 @group(0) @binding(7) var<uniform>             rq_p    : RqP;
 var<workgroup> rq_red: array<f32, 32>;
 var<workgroup> rq_head: array<f32, 256>;
+// flags & 128: `rq_invf` holds each batch row's absolute angles (64 per
+// row, MRoPE image prompts) instead of the inverse frequencies.
+fn rq_ang(ri: u32, pos: u32, tok: u32) -> f32 {
+    if ((rq_p.flags & 128u) != 0u) { return rq_invf[tok * 64u + ri]; }
+    return f32(pos) * rq_invf[ri];
+}
 @compute @workgroup_size(32)
 fn attn_rope_qkn_bt(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let head = wid.x;
@@ -78,7 +84,7 @@ fn attn_rope_qkn_bt(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invoca
         var ri0 = lane;
         loop {
             if (ri0 >= hlf) { break; }
-            let angle0 = f32(pos) * rq_invf[ri0];
+            let angle0 = rq_ang(ri0, pos, tok);
             let cc0 = cos(angle0);
             let sf0 = sin(angle0);
             let y0 = rq_head[ri0];
@@ -115,7 +121,7 @@ fn attn_rope_qkn_bt(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invoca
         var ri = lane;
         loop {
             if (ri >= hlf) { break; }
-            let angle = f32(pos) * rq_invf[ri];
+            let angle = rq_ang(ri, pos, tok);
             let cc = cos(angle);
             let sfac = sin(angle);
             let x0 = rq_head[ri];
