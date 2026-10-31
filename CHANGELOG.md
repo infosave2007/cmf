@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `import-gguf` on Spark-X2.5/2.6 GGUFs (llama.cpp arch `spark2_5`): the
+  file imported and then failed to load with `self_attn.q_proj.weight not
+  found` (#73). The fused `attn_qkv` is split into q/k/v and `attn_gate`
+  becomes the head-wise `self_attn.g_proj` (kept f16). The header takes the
+  sliding/full layer schedule, the 512-token window, both RoPE profiles and
+  exact GELU from the GGUF, matching `cortiq convert`. The tokenizer keeps
+  Spark's pre-tokenizer chain (digit runs of 1–3, CJK, words) instead of
+  plain GPT-2 ByteLevel. A fused attention layout the importer does not know
+  now fails at import instead of writing a file that cannot load. Checked on
+  XHToken/Spark-X2.6-1.7B-GGUF Q8_0 → `--quant q4t`: correct answers in
+  English and Chinese, 72 tok/s decode on an Apple M4.
+
 ## [0.8.50] — 2026-10-31
 
 ### Added

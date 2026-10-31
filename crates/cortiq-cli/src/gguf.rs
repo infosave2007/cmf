@@ -39,6 +39,9 @@ const T_U64: u32 = 10;
 const T_I64: u32 = 11;
 const T_F64: u32 = 12;
 
+/// llama.cpp's arch name for Spark-X2.5/2.6 (== the HF model_type).
+const SPARK2_5: &str = "spark2_5";
+
 // ggml tensor dtypes (ggml.h enum ids). All of these are dequantized natively.
 const GGML_F32: u32 = 0;
 const GGML_F16: u32 = 1;
@@ -893,6 +896,38 @@ fn dequant_iq4_xs(raw: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
+/// Split a fused `self_attn.qkv_proj.weight` (`q + 2·kv` rows) into the
+/// canonical q/k/v projections — a pure row slice, no value changes.
+fn split_qkv(
+    name: &str,
+    shape: &[usize],
+    vals: &[f32],
+    q: usize,
+    kv: usize,
+) -> anyhow::Result<Vec<(String, Vec<usize>, Vec<f32>)>> {
+    anyhow::ensure!(
+        shape.len() == 2,
+        "fused '{name}': expected 2-D, got {shape:?}"
+    );
+    let (rows, cols) = (shape[0], shape[1]);
+    anyhow::ensure!(
+        q + 2 * kv == rows,
+        "'{name}': {rows} rows != q({q}) + 2·kv({kv})"
+    );
+    Ok(
+        [("q_proj", 0, q), ("k_proj", q, kv), ("v_proj", q + kv, kv)]
+            .into_iter()
+            .map(|(part, r0, nr)| {
+                (
+                    name.replace("qkv_proj", part),
+                    vec![nr, cols],
+                    vals[r0 * cols..(r0 + nr) * cols].to_vec(),
+                )
+            })
+            .collect(),
+    )
+}
+
 /// ggml tensor name → HF name (`None` = skip, e.g. rope freqs).
 fn map_name(arch: &str, g: &str) -> Option<String> {
     // Gemma-4 (llama.cpp arch name == HF model_type) names its globals
@@ -933,6 +968,16 @@ fn map_name(arch: &str, g: &str) -> Option<String> {
             "proj.weight" => "per_layer_projection.weight",
             "post_norm.weight" => "post_per_layer_input_norm.weight",
             "layer_output_scale.weight" => "layer_scalar",
+            other => map_suffix(other)?,
+        }
+    } else if arch == SPARK2_5 {
+        // Spark-X2.5/2.6: llama.cpp keeps the fused Q/K/V of
+        // `q_k_v_proj` (split into q/k/v at import) and spells the
+        // head-wise sigmoid gate `attn_gate` — the generic table would
+        // send both to the GDN names.
+        match suffix {
+            "attn_qkv.weight" => "self_attn.qkv_proj.weight",
+            "attn_gate.weight" => "self_attn.g_proj.weight",
             other => map_suffix(other)?,
         }
     } else {
@@ -1015,6 +1060,7 @@ fn arch_from_md(
     // llama.cpp spells Tencent's dense family `hunyuan-dense`; the engine
     // keys the RoPE-then-norm attention order on the HF model_type.
     let is_hunyuan_dense = arch == "hunyuan-dense";
+    let is_spark = arch == SPARK2_5;
     // Gemma-4 went back to plain x̂·w (Gemma3nRMSNorm lineage) — only
     // gemma-2/3 keep the zero-centered x̂·(1+w) style.
     let norm_style = if (arch.contains("gemma") && !is_gemma4) || is_q35 {
@@ -1069,6 +1115,27 @@ fn arch_from_md(
             anyhow::bail!("{arch}: irregular full/sliding layer schedule not supported");
         }
         g4_period = Some(p);
+        pat.iter()
+            .map(|&s| {
+                if s != 0 {
+                    LayerType::SlidingAttention
+                } else {
+                    LayerType::FullAttention
+                }
+            })
+            .collect()
+    } else if is_spark {
+        // Spark: an explicit per-layer schedule (true = sliding), the
+        // same layer_types the safetensors converter reads from config.
+        let Some(Val::IntArr(pat)) = g("attention.sliding_window_pattern") else {
+            anyhow::bail!("{arch}: missing attention.sliding_window_pattern");
+        };
+        if pat.len() != n_layers {
+            anyhow::bail!(
+                "{arch}: attention.sliding_window_pattern has {} entries, expected {n_layers}",
+                pat.len()
+            );
+        }
         pat.iter()
             .map(|&s| {
                 if s != 0 {
@@ -1225,6 +1292,9 @@ fn arch_from_md(
         hidden_act: if is_gemma4 {
             // config.hidden_activation = gelu_pytorch_tanh.
             "gelu_tanh".into()
+        } else if is_spark {
+            // config.hidden_act = gelu, the exact erf form.
+            "gelu".into()
         } else {
             "silu".into()
         },
@@ -1233,7 +1303,7 @@ fn arch_from_md(
         embed_multiplier: if is_gemma4 { (hidden as f32).sqrt() } else { 1.0 },
         // Gemma-4 attends with scale 1.0 (q-norm carries it).
         query_pre_attn_scalar: if is_gemma4 { Some(1.0) } else { None },
-        sliding_window: if is_gemma2 || is_gemma4 {
+        sliding_window: if is_gemma2 || is_gemma4 || is_spark {
             gu("attention.sliding_window")
         } else {
             None
@@ -1245,8 +1315,18 @@ fn arch_from_md(
         } else {
             None
         },
-        rope_local_base_freq: if is_gemma4 { gf("rope.freq_base_swa") } else { None },
-        local_partial_rotary_factor: None,
+        rope_local_base_freq: if is_gemma4 || is_spark {
+            gf("rope.freq_base_swa")
+        } else {
+            None
+        },
+        // Spark's sliding layers carry their own rotary width (the full
+        // layers' rides `rope.dimension_count` above).
+        local_partial_rotary_factor: if is_spark && head_dim > 0 {
+            gu("rope.dimension_count_swa").map(|rd| rd as f32 / head_dim as f32)
+        } else {
+            None
+        },
         global_head_dim: if is_gemma4 {
             gu("attention.key_length").filter(|&v| v > 0)
         } else {
@@ -1318,11 +1398,34 @@ fn tokenizer(md: &BTreeMap<String, Val>) -> (Option<Vec<u8>>, TokenizerBundle) {
             })
         })
         .collect();
+    let byte_level = serde_json::json!({
+        "type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": true
+    });
+    // Spark-X2.5/2.6 split digits in runs of 1–3, isolate CJK and then
+    // words before the byte-level step: the vendor tokenizer.json chain,
+    // which plain GPT-2 ByteLevel would tokenize differently.
+    let pre_tokenizer = match md.get("tokenizer.ggml.pre").and_then(Val::as_str) {
+        Some(SPARK2_5) => serde_json::json!({
+            "type": "Sequence",
+            "pretokenizers": [
+                { "type": "Split", "pattern": { "Regex": "\\p{N}{1,3}" },
+                  "behavior": "Isolated", "invert": false },
+                { "type": "Split", "pattern": { "Regex": "[一-龥぀-ゟ゠-ヿ]+" },
+                  "behavior": "Isolated", "invert": false },
+                { "type": "Split", "pattern": { "Regex":
+                    "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+|[\r\n]|\\s+(?!\\S)|\\s+" },
+                  "behavior": "Isolated", "invert": false },
+                { "type": "Digits", "individual_digits": true },
+                { "type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": false }
+            ]
+        }),
+        _ => byte_level,
+    };
     let tj = serde_json::json!({
         "version": "1.0",
         "added_tokens": added,
         "normalizer": null,
-        "pre_tokenizer": { "type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": true },
+        "pre_tokenizer": pre_tokenizer,
         "post_processor": null,
         "decoder": { "type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true },
         "model": {
@@ -2117,6 +2220,19 @@ pub fn run_import_gguf(
         let Some(name) = map_name(&arch.arch_name, &t.name) else {
             continue;
         };
+        // The generic table sends attn_qkv/attn_gate to the GDN names; on
+        // any other arch that is a fused attention layout the importer does
+        // not know, and the file would fail at load with a missing q_proj.
+        if !is_q35 && name.contains(".linear_attn.") {
+            anyhow::bail!(
+                "GGUF '{}' ({}) stores a fused attention tensor '{}' that the native GGUF \
+                 importer does not map for this architecture. Convert the model's safetensors \
+                 repo with `cortiq convert` instead.",
+                path.display(),
+                arch.arch_name,
+                t.name
+            );
+        }
         let numel: usize = t.dims.iter().map(|&d| d as usize).product();
         let ty = resolve_type(&g, t.ggml_type);
         let nb = nbytes(ty, numel)?;
@@ -2197,72 +2313,91 @@ pub fn run_import_gguf(
             }
         }
 
-        // Precision-critical small tensors ride as raw f32: the GDN a/b
-        // projections, the depthwise conv taps and the MoE routers (a
-        // bit-flip there is costly — same policy as the safetensors
-        // converter).
-        let keep_f32 = (is_q35
-            && (name.ends_with("mlp.gate.weight")
-                || name.contains("linear_attn.in_proj_a")
-                || name.contains("linear_attn.in_proj_b")
-                || name.contains("conv1d")
-                || name.ends_with("shared_expert_gate.weight")))
-            || name.ends_with("layer_scalar");
-        // The shared-expert sigmoid gate is a 1-output Linear — the
-        // engine loads it as a matrix, so carry it as [1, hidden].
-        let shape = if name.ends_with("shared_expert_gate.weight") && shape.len() == 1 {
-            vec![1, shape[0]]
+        // Spark's fused Q/K/V: a pure row split into the canonical q/k/v
+        // the loader reads (the safetensors converter does the same).
+        let parts = if name.ends_with("self_attn.qkv_proj.weight") {
+            split_qkv(
+                &name,
+                &shape,
+                &vals,
+                n_heads * arch.head_dim,
+                n_kv * arch.head_dim,
+            )?
         } else {
-            shape
+            vec![(name, shape, vals)]
         };
-        let two_d = shape.len() == 2 && numel >= 32 && !keep_f32;
-        let (dt, data) = if two_d && ty == GGML_Q1_0 && shape[1] % 128 == 0 {
-            // Q1_0 source: carry the values over exactly into the `q1` base
-            // (the per-128 source scale becomes four per-32 groups with the
-            // same scale, so no weight changes).
-            (TensorDtype::Q1, encode_q1_exact(&vals, shape[0], shape[1]))
-        } else if two_d && ty == GGML_Q1_0 {
-            // A row that is not a multiple of the source's 128-element block
-            // cannot be re-packed into the per-32 `q1` base without changing a
-            // weight: fall back to the requested profile and say so.
-            eprintln!(
-                "  note: '{}' is Q1_0 with a row of {} elements (not a multiple of 128) — the \
-                 1-bit values are kept, but the tensor is re-encoded into the requested profile",
-                name, shape[1]
-            );
-            (convert::quantize_2d(quant, &vals, shape[0], shape[1]))
-        } else if two_d && ty == GGML_STQ1_0_LEGACY {
-            // Sparse-ternary source: re-encode exactly as q1t, whatever the
-            // requested profile — requantizing trained ternary weights can
-            // only lose.
-            (
-                TensorDtype::Q1T,
-                convert::encode_q1t_exact(&vals, shape[0], shape[1])?,
-            )
-        } else if two_d {
-            // A ternary profile on a NON-ternary tensor (the token table of
-            // a STQ1_0 file) would be post-training quantization, never the
-            // intent of `--quant q1t` on such a file — keep it at q8_2f.
-            let q = if quant == Quant::Q1t {
-                Quant::Q8_2f
+        for (name, shape, vals) in parts {
+            let numel = vals.len();
+            // Precision-critical small tensors ride as raw f32: the GDN a/b
+            // projections, the depthwise conv taps and the MoE routers (a
+            // bit-flip there is costly — same policy as the safetensors
+            // converter).
+            let keep_f32 = (is_q35
+                && (name.ends_with("mlp.gate.weight")
+                    || name.contains("linear_attn.in_proj_a")
+                    || name.contains("linear_attn.in_proj_b")
+                    || name.contains("conv1d")
+                    || name.ends_with("shared_expert_gate.weight")))
+                || name.ends_with("layer_scalar");
+            // The shared-expert sigmoid gate is a 1-output Linear — the
+            // engine loads it as a matrix, so carry it as [1, hidden].
+            let shape = if name.ends_with("shared_expert_gate.weight") && shape.len() == 1 {
+                vec![1, shape[0]]
             } else {
-                quant
+                shape
             };
-            convert::quantize_2d(q, &vals, shape[0], shape[1])
-        } else if keep_f32 {
-            (
-                TensorDtype::F32,
-                vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
-            )
-        } else {
-            (TensorDtype::F16, convert::encode_f16(&vals))
-        };
-        tensors.push(TensorSpec {
-            name,
-            dtype: dt,
-            shape,
-            data,
-        });
+            // Spark's head-wise sigmoid gate stays float (f16), as in
+            // `cortiq convert`.
+            let keep_f16 = name.ends_with("self_attn.g_proj.weight");
+            let two_d = shape.len() == 2 && numel >= 32 && !keep_f32 && !keep_f16;
+            let (dt, data) = if two_d && ty == GGML_Q1_0 && shape[1] % 128 == 0 {
+                // Q1_0 source: carry the values over exactly into the `q1` base
+                // (the per-128 source scale becomes four per-32 groups with the
+                // same scale, so no weight changes).
+                (TensorDtype::Q1, encode_q1_exact(&vals, shape[0], shape[1]))
+            } else if two_d && ty == GGML_Q1_0 {
+                // A row that is not a multiple of the source's 128-element block
+                // cannot be re-packed into the per-32 `q1` base without changing a
+                // weight: fall back to the requested profile and say so.
+                eprintln!(
+                    "  note: '{}' is Q1_0 with a row of {} elements (not a multiple of 128) — the \
+                     1-bit values are kept, but the tensor is re-encoded into the requested profile",
+                    name, shape[1]
+                );
+                (convert::quantize_2d(quant, &vals, shape[0], shape[1]))
+            } else if two_d && ty == GGML_STQ1_0_LEGACY {
+                // Sparse-ternary source: re-encode exactly as q1t, whatever the
+                // requested profile — requantizing trained ternary weights can
+                // only lose.
+                (
+                    TensorDtype::Q1T,
+                    convert::encode_q1t_exact(&vals, shape[0], shape[1])?,
+                )
+            } else if two_d {
+                // A ternary profile on a NON-ternary tensor (the token table of
+                // a STQ1_0 file) would be post-training quantization, never the
+                // intent of `--quant q1t` on such a file — keep it at q8_2f.
+                let q = if quant == Quant::Q1t {
+                    Quant::Q8_2f
+                } else {
+                    quant
+                };
+                convert::quantize_2d(q, &vals, shape[0], shape[1])
+            } else if keep_f32 {
+                (
+                    TensorDtype::F32,
+                    vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                )
+            } else {
+                (TensorDtype::F16, convert::encode_f16(&vals))
+            };
+            tensors.push(TensorSpec {
+                name,
+                dtype: dt,
+                shape,
+                data,
+            });
+        }
     }
 
     let (vocab, bundle) = tokenizer(&g.md);
@@ -3304,5 +3439,317 @@ mod stq1_0_tests {
         let mut back = vec![0f32; 512];
         cortiq_core::quant::dequant_q1t(&enc, 2, 256, &mut back);
         assert_eq!(back, y);
+    }
+}
+
+#[cfg(test)]
+mod spark_tests {
+    use super::*;
+
+    const HIDDEN: usize = 64;
+    const HEADS: usize = 4;
+    const KV: usize = 2;
+    const HEAD_DIM: usize = 16;
+    const FF: usize = 128;
+    const VOCAB: usize = 32;
+
+    fn put_gstr(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+
+    enum Kv {
+        U32(u32),
+        F32(f32),
+        Str(&'static str),
+        Bools(Vec<bool>),
+        Strs(Vec<String>),
+    }
+
+    /// A two-layer Spark GGUF as llama.cpp's `Spark2_5Model` writes it:
+    /// fused `attn_qkv`, head-wise `attn_gate`, an explicit bool sliding
+    /// schedule and the two rope profiles. F32 payloads with distinct
+    /// values, so a row-split mistake shows up as a value mismatch.
+    fn spark_gguf() -> (Vec<u8>, Vec<f32>, Vec<f32>) {
+        let arch = |k: &str| format!("{SPARK2_5}.{k}");
+        let md: Vec<(String, Kv)> = vec![
+            ("general.architecture".into(), Kv::Str(SPARK2_5)),
+            (arch("block_count"), Kv::U32(2)),
+            (arch("context_length"), Kv::U32(4096)),
+            (arch("embedding_length"), Kv::U32(HIDDEN as u32)),
+            (arch("feed_forward_length"), Kv::U32(FF as u32)),
+            (arch("attention.head_count"), Kv::U32(HEADS as u32)),
+            (arch("attention.head_count_kv"), Kv::U32(KV as u32)),
+            (arch("attention.key_length"), Kv::U32(HEAD_DIM as u32)),
+            (arch("attention.value_length"), Kv::U32(HEAD_DIM as u32)),
+            (arch("attention.layer_norm_rms_epsilon"), Kv::F32(1e-6)),
+            (arch("attention.sliding_window"), Kv::U32(512)),
+            (
+                arch("attention.sliding_window_pattern"),
+                Kv::Bools(vec![true, false]),
+            ),
+            (arch("rope.freq_base"), Kv::F32(5_000_000.0)),
+            (arch("rope.freq_base_swa"), Kv::F32(10_000.0)),
+            (arch("rope.dimension_count"), Kv::U32((HEAD_DIM / 4) as u32)),
+            (arch("rope.dimension_count_swa"), Kv::U32(HEAD_DIM as u32)),
+            ("tokenizer.ggml.model".into(), Kv::Str("gpt2")),
+            ("tokenizer.ggml.pre".into(), Kv::Str(SPARK2_5)),
+            (
+                "tokenizer.ggml.tokens".into(),
+                Kv::Strs((0..VOCAB).map(|i| format!("t{i}")).collect()),
+            ),
+        ];
+        let f32s = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i * 31 + seed * 17) % 97) as f32 * 0.01 - 0.48)
+                .collect()
+        };
+        let qkv_rows = (HEADS + 2 * KV) * HEAD_DIM;
+        let qkv0 = f32s(qkv_rows * HIDDEN, 3);
+        let gate0 = f32s(HEADS * HIDDEN, 5);
+        // ggml dims are [ne0 = input, ne1 = output].
+        let mut defs: Vec<(String, Vec<u64>, Vec<f32>)> = vec![
+            (
+                "token_embd.weight".into(),
+                vec![HIDDEN as u64, VOCAB as u64],
+                f32s(HIDDEN * VOCAB, 1),
+            ),
+            (
+                "output_norm.weight".into(),
+                vec![HIDDEN as u64],
+                vec![1.0; HIDDEN],
+            ),
+        ];
+        for l in 0..2 {
+            let b = |s: &str| format!("blk.{l}.{s}");
+            let (qkv, gate) = if l == 0 {
+                (qkv0.clone(), gate0.clone())
+            } else {
+                (f32s(qkv_rows * HIDDEN, 7), f32s(HEADS * HIDDEN, 9))
+            };
+            defs.extend([
+                (
+                    b("attn_norm.weight"),
+                    vec![HIDDEN as u64],
+                    vec![1.0; HIDDEN],
+                ),
+                (
+                    b("attn_qkv.weight"),
+                    vec![HIDDEN as u64, qkv_rows as u64],
+                    qkv,
+                ),
+                (
+                    b("attn_gate.weight"),
+                    vec![HIDDEN as u64, HEADS as u64],
+                    gate,
+                ),
+                (
+                    b("attn_output.weight"),
+                    vec![(HEADS * HEAD_DIM) as u64, HIDDEN as u64],
+                    f32s(HEADS * HEAD_DIM * HIDDEN, 11),
+                ),
+                (b("ffn_norm.weight"), vec![HIDDEN as u64], vec![1.0; HIDDEN]),
+                (
+                    b("ffn_gate.weight"),
+                    vec![HIDDEN as u64, FF as u64],
+                    f32s(HIDDEN * FF, 13),
+                ),
+                (
+                    b("ffn_up.weight"),
+                    vec![HIDDEN as u64, FF as u64],
+                    f32s(HIDDEN * FF, 15),
+                ),
+                (
+                    b("ffn_down.weight"),
+                    vec![FF as u64, HIDDEN as u64],
+                    f32s(FF * HIDDEN, 17),
+                ),
+            ]);
+        }
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"GGUF");
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&(defs.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(md.len() as u64).to_le_bytes());
+        for (key, v) in &md {
+            put_gstr(&mut out, key);
+            match v {
+                Kv::U32(x) => {
+                    out.extend_from_slice(&T_U32.to_le_bytes());
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+                Kv::F32(x) => {
+                    out.extend_from_slice(&T_F32.to_le_bytes());
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+                Kv::Str(s) => {
+                    out.extend_from_slice(&T_STR.to_le_bytes());
+                    put_gstr(&mut out, s);
+                }
+                Kv::Bools(a) => {
+                    out.extend_from_slice(&T_ARR.to_le_bytes());
+                    out.extend_from_slice(&T_BOOL.to_le_bytes());
+                    out.extend_from_slice(&(a.len() as u64).to_le_bytes());
+                    out.extend(a.iter().map(|&b| b as u8));
+                }
+                Kv::Strs(a) => {
+                    out.extend_from_slice(&T_ARR.to_le_bytes());
+                    out.extend_from_slice(&T_STR.to_le_bytes());
+                    out.extend_from_slice(&(a.len() as u64).to_le_bytes());
+                    for s in a {
+                        put_gstr(&mut out, s);
+                    }
+                }
+            }
+        }
+        let mut rel = 0usize;
+        let mut offsets = Vec::with_capacity(defs.len());
+        for (name, dims, data) in &defs {
+            rel = align_up(rel, 32);
+            offsets.push(rel);
+            put_gstr(&mut out, name);
+            out.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+            for &d in dims {
+                out.extend_from_slice(&d.to_le_bytes());
+            }
+            out.extend_from_slice(&GGML_F32.to_le_bytes());
+            out.extend_from_slice(&(rel as u64).to_le_bytes());
+            rel += data.len() * 4;
+        }
+        let data_start = align_up(out.len(), 32);
+        out.resize(data_start, 0);
+        for ((_, _, data), &offset) in defs.iter().zip(&offsets) {
+            out.resize(data_start + offset, 0);
+            out.extend(data.iter().flat_map(|v| v.to_le_bytes()));
+        }
+        (out, qkv0, gate0)
+    }
+
+    fn f16_vals(model: &cortiq_core::CmfModel, name: &str) -> Vec<f32> {
+        let t = model.tensor(name).unwrap();
+        assert_eq!(t.dtype, TensorDtype::F16, "{name}");
+        model
+            .entry_bytes(t)
+            .chunks_exact(2)
+            .map(|b| f16_to_f32(u16::from_le_bytes([b[0], b[1]])))
+            .collect()
+    }
+
+    /// GitHub #73: a Spark GGUF imported "successfully" and then failed to
+    /// load with `self_attn.q_proj.weight not found` — the fused attention
+    /// went to the GDN names and every layer was declared full attention.
+    #[test]
+    fn spark_gguf_imports_loads_and_runs() {
+        let (gguf, qkv0, gate0) = spark_gguf();
+        let id = format!(
+            "cortiq-spark-gguf-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let src = std::env::temp_dir().join(format!("{id}.gguf"));
+        let dst = std::env::temp_dir().join(format!("{id}.cmf"));
+        std::fs::write(&src, &gguf).unwrap();
+        run_import_gguf(
+            src.to_str().unwrap(),
+            "f16",
+            dst.to_str().unwrap(),
+            None,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        let model = std::sync::Arc::new(cortiq_core::CmfModel::open(&dst).unwrap());
+        assert!(
+            model.verify().is_empty(),
+            "CMF verify: {:?}",
+            model.verify()
+        );
+
+        // The header the safetensors converter writes for Spark-X2.6.
+        let a = model.arch();
+        assert_eq!(a.arch_name, SPARK2_5);
+        assert_eq!(
+            a.layer_types,
+            vec![LayerType::SlidingAttention, LayerType::FullAttention]
+        );
+        assert_eq!(a.sliding_window, Some(512));
+        assert_eq!(a.sliding_window_pattern, None);
+        assert_eq!(a.rope_theta, 5_000_000.0);
+        assert_eq!(a.rope_local_base_freq, Some(10_000.0));
+        assert_eq!(a.partial_rotary_factor, 0.25);
+        assert_eq!(a.local_partial_rotary_factor, Some(1.0));
+        assert_eq!(a.hidden_act, "gelu");
+        assert_eq!(a.norm_style, NormStyle::Qwen);
+        assert!(a.tie_word_embeddings);
+        assert!(a.linear_core.is_none());
+
+        // q/k/v are row slices of the fused tensor, values unchanged.
+        let (q, kv) = (HEADS * HEAD_DIM, KV * HEAD_DIM);
+        for (part, r0, nr) in [("q_proj", 0, q), ("k_proj", q, kv), ("v_proj", q + kv, kv)] {
+            let name = format!("model.layers.0.self_attn.{part}.weight");
+            assert_eq!(model.tensor(&name).unwrap().shape, vec![nr, HIDDEN]);
+            let got = f16_vals(&model, &name);
+            let want = &qkv0[r0 * HIDDEN..(r0 + nr) * HIDDEN];
+            assert!(
+                got.iter().zip(want).all(|(g, w)| (g - w).abs() <= 1e-3),
+                "{name} is not rows {r0}..{} of attn_qkv",
+                r0 + nr
+            );
+        }
+        let gate = f16_vals(&model, "model.layers.0.self_attn.g_proj.weight");
+        assert_eq!(
+            model
+                .tensor("model.layers.0.self_attn.g_proj.weight")
+                .unwrap()
+                .shape,
+            vec![HEADS, HIDDEN]
+        );
+        assert!(gate.iter().zip(&gate0).all(|(g, w)| (g - w).abs() <= 1e-3));
+        assert!(model
+            .tensors
+            .iter()
+            .all(|t| !t.name.contains("linear_attn")));
+
+        let mut pipeline = cortiq_engine::Pipeline::from_model(
+            &model,
+            cortiq_engine::sampler::SamplerConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(pipeline.sliding_layers, Some(vec![true, false]));
+        assert_eq!(pipeline.rope_base, 5_000_000.0);
+        assert_eq!(pipeline.rotary_dim, HEAD_DIM / 4);
+        assert_eq!(pipeline.rotary_dim_local, Some(HEAD_DIM));
+        let logits = pipeline.forward_ids(&[0, 1, 2], None).unwrap();
+        assert_eq!(logits.len(), VOCAB);
+        assert!(logits.iter().all(|v| v.is_finite()));
+
+        drop(pipeline);
+        drop(model);
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+    }
+
+    /// The reconstructed tokenizer carries Spark's pre-tokenizer chain
+    /// (digits 1–3, CJK runs, words), not plain GPT-2 ByteLevel.
+    #[test]
+    fn spark_gguf_tokenizer_keeps_the_vendor_pre_tokenizer() {
+        let (gguf, _, _) = spark_gguf();
+        let id = format!("cortiq-spark-tok-{}", std::process::id());
+        let src = std::env::temp_dir().join(format!("{id}.gguf"));
+        std::fs::write(&src, &gguf).unwrap();
+        let g = parse(&src).unwrap();
+        let (tj, _) = tokenizer(&g.md);
+        let tj: serde_json::Value = serde_json::from_slice(&tj.unwrap()).unwrap();
+        let pre = &tj["pre_tokenizer"];
+        assert_eq!(pre["type"], "Sequence");
+        let stages = pre["pretokenizers"].as_array().unwrap();
+        assert_eq!(stages[0]["pattern"]["Regex"], "\\p{N}{1,3}");
+        assert_eq!(stages[1]["pattern"]["Regex"], "[一-龥぀-ゟ゠-ヿ]+");
+        assert_eq!(stages.last().unwrap()["type"], "ByteLevel");
+        let _ = std::fs::remove_file(&src);
     }
 }
