@@ -772,7 +772,8 @@ mod tests {
         assert_eq!(num_frames(400, &c), 1);
         assert_eq!(num_frames(401, &c), 2);
         assert_eq!(num_frames(560, &c), 2);
-        assert_eq!(num_frames(70_080, &c), 436);
+        // 69,680 past the first window is 435.5 hops: padded to 436.
+        assert_eq!(num_frames(70_080, &c), 437);
     }
 
     /// Slaney filters integrate to the band's normalized area: the first

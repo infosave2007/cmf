@@ -1258,7 +1258,12 @@ mod tests {
         let (m, items) = normalize(&video).unwrap();
         assert_eq!(items, vec![Item::Video(json!({"path": "frames", "fps": 8.0}))]);
         assert_eq!(m[0]["content"][0], json!({"type": "video"}));
+        // Speech parts pass through (LFM3-Omni's prepare collects them; a
+        // vision-only file refuses them there); other kinds are refused.
         let audio = vec![json!({"role": "user", "content": [{"type": "input_audio", "input_audio": {}}]})];
-        assert!(normalize(&audio).is_err());
+        let (_, items) = normalize(&audio).unwrap();
+        assert!(items.is_empty());
+        let other = vec![json!({"role": "user", "content": [{"type": "file", "file": {}}]})];
+        assert!(normalize(&other).is_err());
     }
 }
