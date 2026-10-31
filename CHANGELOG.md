@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.50] — 2026-10-31
+
 ### Added
 - d1 decision models (Liquid AI's System One on LFM3): `cortiq system-one`
   and `POST /v1/system_one` take a state (text, JSON or none), pictures, on
