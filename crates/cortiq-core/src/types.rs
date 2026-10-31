@@ -1003,6 +1003,13 @@ pub struct AnchorCoreConfig {
     /// window); informational for readers, normative for the trainer.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub train_windows: Vec<usize>,
+    /// "swa_sink_v2" only: the exact window of every KV group (one entry
+    /// per KV head, each in `1..=window`, the widest equal to `window`).
+    /// The ring keeps `window` keys for every group; group `g` attends to
+    /// the last `group_windows[g]` of them. A wide group is the operator's
+    /// exact retrieval span, the narrow ones stay local. Empty for v1.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_windows: Vec<usize>,
     /// Optional far field (landmark skeleton). `None` = the operator is
     /// exactly sink ∪ window. Declared but not implemented by this reader
     /// yet: validation accepts only `None`.
@@ -1021,16 +1028,25 @@ pub struct FarFieldConfig {
 }
 
 impl AnchorCoreConfig {
-    /// Kinds this reader executes.
-    pub const KINDS: &'static [&'static str] = &["swa_sink_v1"];
-    /// Hard ceiling on `sink + window`: the shared scratch of the GPU
-    /// bounded-attend kernels holds 160 score lanes.
-    pub const MAX_SINK_PLUS_WINDOW: usize = 160;
+    /// Kinds this reader executes. "swa_sink_v2" = v1 with a window per
+    /// KV group (`group_windows`); a v1 reader must refuse it, since
+    /// running every group at `window` is another function.
+    pub const KINDS: &'static [&'static str] = &["swa_sink_v1", "swa_sink_v2"];
+    /// Hard ceiling on `sink + window`. The GPU attend walks the keys in
+    /// tiles with an online softmax, so the ceiling only bounds the state a
+    /// header may declare (ring `2·kvh·window·hd` f32 per anchor layer).
+    pub const MAX_SINK_PLUS_WINDOW: usize = 65_536;
 
     /// f32 elements of ring state per layer for the given KV geometry
     /// (keys + values; sink vectors are weights, not state).
     pub fn ring_state_elems(&self, num_kv_heads: usize, head_dim: usize) -> usize {
         2 * num_kv_heads * self.window * head_dim
+    }
+
+    /// Exact window of KV group `g`: `group_windows[g]` for v2, `window`
+    /// for v1.
+    pub fn group_window(&self, g: usize) -> usize {
+        self.group_windows.get(g).copied().unwrap_or(self.window)
     }
 }
 
@@ -1102,6 +1118,29 @@ impl ModelArch {
                 ac.window
             ));
         }
+        if ac.kind == "swa_sink_v2" {
+            if ac.group_windows.len() != self.num_kv_heads {
+                return Err(format!(
+                    "anchor_core.group_windows has {} entries, expected one per KV head ({})",
+                    ac.group_windows.len(),
+                    self.num_kv_heads
+                ));
+            }
+            if let Some(w) = ac.group_windows.iter().find(|&&w| w == 0 || w > ac.window) {
+                return Err(format!(
+                    "anchor_core.group_windows entry {w} is outside 1..={}",
+                    ac.window
+                ));
+            }
+            if ac.group_windows.iter().max() != Some(&ac.window) {
+                return Err("anchor_core.window must equal the widest group window".into());
+            }
+        } else if !ac.group_windows.is_empty() {
+            return Err(format!(
+                "anchor_core.group_windows requires kind swa_sink_v2, not '{}'",
+                ac.kind
+            ));
+        }
         if let Some(far) = ac.far.as_ref() {
             if !(4..=32).contains(&far.m) {
                 return Err(format!("anchor_core.far.m = {} outside 4..=32", far.m));
@@ -1127,7 +1166,7 @@ impl ModelArch {
     /// header carries none).
     pub fn anchor_core_identity(&self) -> Option<serde_json::Value> {
         let ac = self.anchor_core.as_ref()?;
-        Some(serde_json::json!({
+        let mut id = serde_json::json!({
             "kind": ac.kind,
             "window": ac.window,
             "sink": ac.sink,
@@ -1136,7 +1175,12 @@ impl ModelArch {
             "far": ac.far.as_ref().map(|f| serde_json::json!({"m": f.m, "rect": f.rect})),
             "num_kv_heads": self.num_kv_heads,
             "head_dim": self.head_dim,
-        }))
+        });
+        // v1 identities (and so v1 wire hashes) stay exactly as they were
+        if !ac.group_windows.is_empty() {
+            id["group_windows"] = serde_json::json!(ac.group_windows);
+        }
+        Some(id)
     }
 
     /// Validate the serialized linear-core contract without looking at any

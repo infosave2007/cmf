@@ -411,7 +411,7 @@ pub fn prepare(
     let mut dropped_long = 0usize;
     for c in accepted {
         let Some((tokens, targets, truncated)) =
-            encode_record(&bpe, &c.context, &c.answer, seq, &mut cache)?
+            encode_record(&bpe, &c.context, &c.answer, seq, false, &mut cache)?
         else {
             dropped_long += 1;
             continue;
@@ -654,11 +654,18 @@ fn push_text(bpe: &Bpe, text: &str, cache: &mut HashMap<String, Vec<u32>>, out: 
     bpe.encode(text, cache, out);
 }
 
+/// `open_truncated`: an answer longer than the window keeps its prompt (up
+/// to half the window, cut from the front) and is cut at the window end
+/// WITHOUT the end markers — the cut is not where the answer stops, so it
+/// must not teach a stop there. Without it (the OASST/herbs recipe) the
+/// answer keeps `seq − 3` tokens plus the end markers and the prompt keeps
+/// whatever room is left.
 fn encode_record(
     bpe: &Bpe,
     context: &[(String, String)],
     answer: &str,
     seq: usize,
+    open_truncated: bool,
     cache: &mut HashMap<String, Vec<u32>>,
 ) -> anyhow::Result<Option<(Vec<u16>, Vec<u16>, bool)>> {
     let im_start = special(bpe, "<|im_start|>")?;
@@ -684,17 +691,37 @@ fn encode_record(
     let mut answer_tokens = Vec::new();
     push_text(bpe, answer, cache, &mut answer_tokens);
     let mut truncated = false;
-    // Reserve one causal prefix token and the two explicit end markers.
-    let max_answer_text = seq.saturating_sub(3);
-    if answer_tokens.len() > max_answer_text {
-        answer_tokens.truncate(max_answer_text);
-        truncated = true;
+    if open_truncated {
+        if prefix.len() > seq / 2 {
+            let start = prefix.len() - seq / 2;
+            prefix = prefix[start..].to_vec();
+        }
+        // seq + 1 tokens in all: the prompt, then the answer with its end
+        // markers when they fit, else the answer up to the window end.
+        let room = seq + 1 - prefix.len();
+        if answer_tokens.len() + 2 > room {
+            answer_tokens.truncate(room);
+            truncated = true;
+        } else {
+            answer_tokens.push(im_end);
+            answer_tokens.push(eot);
+        }
+        if answer_tokens.is_empty() {
+            return Ok(None);
+        }
+    } else {
+        // Reserve one causal prefix token and the two explicit end markers.
+        let max_answer_text = seq.saturating_sub(3);
+        if answer_tokens.len() > max_answer_text {
+            answer_tokens.truncate(max_answer_text);
+            truncated = true;
+        }
+        if answer_tokens.is_empty() {
+            return Ok(None);
+        }
+        answer_tokens.push(im_end);
+        answer_tokens.push(eot);
     }
-    if answer_tokens.is_empty() {
-        return Ok(None);
-    }
-    answer_tokens.push(im_end);
-    answer_tokens.push(eot);
     let keep_prefix = (seq + 1).saturating_sub(answer_tokens.len()).max(1);
     if prefix.len() > keep_prefix {
         let start = prefix.len() - keep_prefix;
@@ -917,6 +944,7 @@ pub fn prepare_messages(
     final_out: &Path,
     manifest_out: &Path,
     group_field: Option<&str>,
+    open_truncated: bool,
 ) -> anyhow::Result<()> {
     ensure!(seq >= 64, "SFT sequence must be at least 64 tokens");
     struct Rec {
@@ -1053,7 +1081,7 @@ pub fn prepare_messages(
     let mut dropped_long = 0usize;
     for c in accepted {
         let Some((tokens, targets, truncated)) =
-            encode_record(&bpe, &c.context, &c.answer, seq, &mut cache)?
+            encode_record(&bpe, &c.context, &c.answer, seq, open_truncated, &mut cache)?
         else {
             dropped_long += 1;
             continue;

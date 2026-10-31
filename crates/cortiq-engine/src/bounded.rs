@@ -40,7 +40,11 @@ pub struct BoundedWeights {
     /// Trained sink values `[kvh][sink][hd]`.
     pub sink_v: Vec<f32>,
     pub sink: usize,
+    /// Ring capacity: the widest group window.
     pub window: usize,
+    /// `swa_sink_v2`: the exact window of every KV group (`[kvh]`, each
+    /// `≤ window`); empty = every group attends to the whole `window` (v1).
+    pub group_windows: Vec<usize>,
 }
 
 /// Relative-rotation table: `cos/sin[Δ][i] = cos/sin(Δ · inv_freq[i])`
@@ -264,6 +268,7 @@ impl BoundedState {
         sink_k: &[f32],
         sink_v: &[f32],
         sink: usize,
+        group_windows: &[usize],
         rope: &BoundedRope,
         scale: f32,
         out: &mut [f32],
@@ -276,8 +281,11 @@ impl BoundedState {
         debug_assert_eq!(out.len(), nh * hd);
         debug_assert_eq!(sink_k.len(), kvh * sink * hd);
         debug_assert_eq!(rope.window, w);
+        debug_assert!(group_windows.is_empty() || group_windows.len() == kvh);
         let m = self.len();
         let n = sink + m;
+        // keys group g attends to: its own window of the ring (v2), or all
+        let mg = |g: usize| group_windows.get(g).map_or(m, |&gw| gw.min(m));
         let head = self.head();
         thread_local! {
             static SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>)> =
@@ -304,18 +312,25 @@ impl BoundedState {
             for d in 0..m {
                 let slot = (head + w - 1 - d) % w;
                 for h in 0..nh {
+                    if d >= mg(h / hpk) {
+                        continue;
+                    }
                     rope.rotate(d, &q[h * hd..(h + 1) * hd], &mut qrot[h * hd..(h + 1) * hd]);
                 }
                 for h in 0..nh {
                     let g = h / hpk;
+                    if d >= mg(g) {
+                        continue;
+                    }
                     let kr = &self.ring_k[(g * w + slot) * hd..(g * w + slot + 1) * hd];
                     scores[h * n + sink + d] =
                         crate::attention::dot_f32(&qrot[h * hd..(h + 1) * hd], kr) * scale;
                 }
             }
-            // One softmax per head over sinks ∪ window (attention_head order).
+            // One softmax per head over sinks ∪ its group's window
+            // (attention_head order).
             for h in 0..nh {
-                let sc = &mut scores[h * n..(h + 1) * n];
+                let sc = &mut scores[h * n..h * n + sink + mg(h / hpk)];
                 let max = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let mut sum = 0.0f32;
                 for v in sc.iter_mut() {
@@ -339,7 +354,7 @@ impl BoundedState {
                         crate::attention::axpy_f32(oh, vr, p[s]);
                     }
                 }
-                for d in 0..m {
+                for d in 0..mg(g) {
                     let slot = (head + w - 1 - d) % w;
                     let vr = &self.ring_v[(g * w + slot) * hd..(g * w + slot + 1) * hd];
                     let pw = p[sink + d];

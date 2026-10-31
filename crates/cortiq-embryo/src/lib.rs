@@ -19,7 +19,7 @@ pub mod cli;
 pub mod corpus;
 pub mod data;
 pub mod export;
-#[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+#[cfg(any(target_os = "macos", feature = "vulkan"))]
 pub mod gdn_wy;
 #[cfg(any(target_os = "macos", feature = "vulkan"))]
 pub mod growth;

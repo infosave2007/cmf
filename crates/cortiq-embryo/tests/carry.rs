@@ -239,6 +239,115 @@ fn two_carried_windows_match_one_pass() {
     }
 }
 
+/// `swa_sink_v2` with a wide KV group wider than the training window
+/// (group 1: 100 keys, T = 64, carried tail 128 > T): four carried windows ≡
+/// one pass of 4T, and a stream that restarts at window 2 ≡ a fresh one
+/// pass of its last two windows — the tail spans two windows, so its
+/// shift and the per-stream count of carried keys both matter.
+#[test]
+fn wide_group_tail_longer_than_window_matches_one_pass() {
+    let Some(_) = ctx() else { return };
+    let mut cfg = tiny_carry_cfg(true);
+    // 64-wide GDN heads: the Metal trainer runs them in the WY form, so the
+    // carried S_0 of the chunked path is covered too
+    cfg.gdn_dk = 64;
+    cfg.gdn_dv = 64;
+    cfg.anchor_q_heads = 4;
+    cfg.anchor_kv_heads = 2;
+    cfg.anchor_wide_window = 100;
+    cfg.anchor_wide_groups = vec![1];
+    let (b, t, nw) = (2usize, 64usize, 4usize);
+    let lay = Layout::new(&cfg);
+    let p0 = init_params(&cfg, &lay, 43);
+    let tokens = tokens_for(&cfg, 4301, b * nw * t);
+    let targets = tokens_for(&cfg, 4302, b * nw * t);
+    let one = EmbryoGpu::new_eval_dropless(cfg.clone(), b, nw * t, &p0).expect("one-pass model");
+    one.desc_updates.set(false);
+    let _ = one.eval_loss(&tokens, &targets);
+    let per_one = one.per_position_loss();
+    // stream 1 restarted at window 2: its reference is a fresh pass of windows 2..4
+    let tail = |x: &[u32]| x[nw * t + 2 * t..2 * nw * t].to_vec();
+    let fresh = EmbryoGpu::new_eval_dropless(cfg.clone(), 1, 2 * t, &p0).expect("fresh model");
+    fresh.desc_updates.set(false);
+    let _ = fresh.eval_loss(&tail(&tokens), &tail(&targets));
+    let per_fresh = fresh.per_position_loss();
+    let mut two = EmbryoGpu::new_carry(cfg.clone(), b, t, &p0, true).expect("carried model");
+    two.desc_updates.set(false);
+    assert_eq!(two.carry_pad(), 128);
+    let split = |x: &[u32], w: usize| -> Vec<u32> {
+        (0..b).flat_map(|bi| x[bi * nw * t + w * t..bi * nw * t + (w + 1) * t].to_vec()).collect()
+    };
+    let (mut worst0, mut worst1) = (0.0f64, 0.0f64);
+    for w in 0..nw {
+        two.carry_begin(&[w == 0, w == 0 || w == 2]);
+        let _ = two.eval_loss(&split(&tokens, w), &split(&targets, w));
+        let per = two.per_position_loss();
+        two.carry_commit();
+        for i in 0..t {
+            let a = per_one[w * t + i] as f64;
+            worst0 = worst0.max((a - per[i] as f64).abs() / a.abs().max(1e-6));
+            let r = if w < 2 { per_one[nw * t + w * t + i] } else { per_fresh[(w - 2) * t + i] } as f64;
+            worst1 = worst1.max((r - per[t + i] as f64).abs() / r.abs().max(1e-6));
+        }
+    }
+    eprintln!(
+        "wide group (W 100 > T 64, tail 128): stream 0 carried ×4 vs one pass rel {worst0:.2e}; \
+         stream 1 (restart at window 2) rel {worst1:.2e}"
+    );
+    assert!(worst0 <= 2e-5, "carried stream differs from the one pass: {worst0:e}");
+    assert!(worst1 <= 2e-5, "restarted stream sees keys of its previous stream: {worst1:e}");
+}
+
+/// Band tile skipping of the anchor GEMMs (Metal `GemmBand`) is exact: two
+/// carried training steps (a 16-key group and a 100-key group, T = 128 so
+/// whole 64-tiles fall outside the band) give bit-identical losses, gradient
+/// norms and gradients with and without it.
+#[test]
+fn anchor_band_skipping_is_bit_exact() {
+    let Some(_) = ctx() else { return };
+    let mut cfg = tiny_carry_cfg(true);
+    cfg.gdn_dk = 64;
+    cfg.gdn_dv = 64;
+    cfg.anchor_q_heads = 4;
+    cfg.anchor_kv_heads = 2;
+    cfg.anchor_wide_window = 100;
+    cfg.anchor_wide_groups = vec![1];
+    let (b, t) = (2usize, 128usize);
+    let p0 = init_params(&cfg, &Layout::new(&cfg), 47);
+    let tokens = tokens_for(&cfg, 4701, b * 2 * t);
+    let targets = tokens_for(&cfg, 4702, b * 2 * t);
+    let split = |x: &[u32], w: usize| -> Vec<u32> {
+        (0..b).flat_map(|bi| x[bi * 2 * t + w * t..bi * 2 * t + (w + 1) * t].to_vec()).collect()
+    };
+    let run = |off: bool| -> (Vec<f32>, Vec<f32>) {
+        cortiq_embryo::model::ANCHOR_BAND_OFF.store(off, std::sync::atomic::Ordering::Relaxed);
+        let mut g = EmbryoGpu::new_carry(cfg.clone(), b, t, &p0, true).expect("carried model");
+        g.desc_updates.set(false);
+        let mut scalars = Vec::new();
+        for w in 0..2 {
+            g.carry_begin(&[w == 0, w == 0]);
+            let (loss, gnorm, _) = g.train_step(&split(&tokens, w), &split(&targets, w), 0.0, 0.0, 1e9);
+            g.carry_commit();
+            scalars.extend([loss, gnorm]);
+        }
+        (scalars, g.g.to_vec())
+    };
+    let (s_full, g_full) = run(true);
+    let (s_band, g_band) = run(false);
+    cortiq_embryo::model::ANCHOR_BAND_OFF.store(false, std::sync::atomic::Ordering::Relaxed);
+    eprintln!("band on/off: loss+|g| {s_band:?} vs {s_full:?}");
+    assert_eq!(s_band, s_full, "losses / grad norms differ with band skipping");
+    // the embedding gradient is a scatter-add with float atomics: run to run
+    // it differs in the last bits even with the band off — every other
+    // gradient must be bit-identical
+    let lay = Layout::new(&cfg);
+    let embed = lay.embed..lay.embed + cfg.vocab * cfg.hidden;
+    let diff = (0..g_full.len())
+        .filter(|i| !embed.contains(i) && g_band[*i].to_bits() != g_full[*i].to_bits())
+        .count();
+    assert_eq!(diff, 0, "{diff} non-embedding gradient entries differ with band skipping");
+}
+
 /// Whole-graph FD on a window that starts from a carried (non-zero) state:
 /// the analytic backward against central differences (f32 forward, the
 /// precedent bar of tests/model_gradcheck.rs).

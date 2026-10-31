@@ -43,6 +43,23 @@ pub struct Ctx {
     gdn_scan_fwd: ComputePipelineState,
     gdn_scan_bwd: ComputePipelineState,
     gdn_scan_fold: ComputePipelineState,
+    /// GDN chunked WY/UT form (gdn_wy.rs), ports of WGSL ops 64-78
+    wy_zero_s0: ComputePipelineState,
+    wy_scal: ComputePipelineState,
+    wy_norm: ComputePipelineState,
+    wy_mask: ComputePipelineState,
+    wy_ut: ComputePipelineState,
+    wy_sscale: ComputePipelineState,
+    wy_u: ComputePipelineState,
+    wy_du: ComputePipelineState,
+    wy_dstate: ComputePipelineState,
+    wy_dgend: ComputePipelineState,
+    wy_dgend_fold: ComputePipelineState,
+    wy_mask_bwd_red: ComputePipelineState,
+    wy_mask_bwd: ComputePipelineState,
+    wy_dlg: ComputePipelineState,
+    wy_dscal: ComputePipelineState,
+    wy_dnorm: ComputePipelineState,
     silu_fwd: ComputePipelineState,
     silu_bwd: ComputePipelineState,
     rms_fwd: ComputePipelineState,
@@ -185,6 +202,22 @@ fn init() -> Result<Ctx, String> {
         gdn_scan_fwd: pso("gdn_scan_fwd_f32")?,
         gdn_scan_bwd: pso("gdn_scan_bwd_f32")?,
         gdn_scan_fold: pso("gdn_scan_fold_f32")?,
+        wy_zero_s0: pso("gdn_wy_zero_s0_f32")?,
+        wy_scal: pso("gdn_wy_scal_f32")?,
+        wy_norm: pso("gdn_wy_norm_f32")?,
+        wy_mask: pso("gdn_wy_mask_f32")?,
+        wy_ut: pso("gdn_wy_ut_f32")?,
+        wy_sscale: pso("gdn_wy_sscale_f32")?,
+        wy_u: pso("gdn_wy_u_f32")?,
+        wy_du: pso("gdn_wy_du_f32")?,
+        wy_dstate: pso("gdn_wy_dstate_f32")?,
+        wy_dgend: pso("gdn_wy_dgend_f32")?,
+        wy_dgend_fold: pso("gdn_wy_dgend_fold_f32")?,
+        wy_mask_bwd_red: pso("gdn_wy_mask_bwd_red_f32")?,
+        wy_mask_bwd: pso("gdn_wy_mask_bwd_f32")?,
+        wy_dlg: pso("gdn_wy_dlg_f32")?,
+        wy_dscal: pso("gdn_wy_dscal_f32")?,
+        wy_dnorm: pso("gdn_wy_dnorm_f32")?,
         silu_fwd: pso("silu_fwd_f32")?,
         silu_bwd: pso("silu_bwd_f32")?,
         rms_fwd: pso("rmsnorm_fwd_f32")?,
@@ -480,6 +513,68 @@ impl<'a> Cmd<'a> {
         causal: bool,
         dynamic: &GemmDyn<'_>,
     ) {
+        self.gemm_inner(
+            ta, tb, m, n, k, alpha, a, a_off, lda, b, b_off, ldb, beta, cbuf, c_off, ldc, batch,
+            causal, dynamic, None,
+        );
+    }
+
+    /// `gemm_ex` with the bounded anchor's band hint (see [`GemmBand`]):
+    /// tiles the band rules out are not computed. Exact — the hint may only
+    /// skip zeros of an operand (P, dS off the band) or outputs the band
+    /// softmax overwrites.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_band(
+        &self,
+        ta: Op,
+        tb: Op,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: &GBuf,
+        a_off: usize,
+        lda: usize,
+        b: &GBuf,
+        b_off: usize,
+        ldb: usize,
+        beta: f32,
+        cbuf: &GBuf,
+        c_off: usize,
+        ldc: usize,
+        batch: &GemmBatch,
+        band: Option<&GemmBand>,
+    ) {
+        self.gemm_inner(
+            ta, tb, m, n, k, alpha, a, a_off, lda, b, b_off, ldb, beta, cbuf, c_off, ldc, batch,
+            false, &GemmDyn::none(), band,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_inner(
+        &self,
+        ta: Op,
+        tb: Op,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: &GBuf,
+        a_off: usize,
+        lda: usize,
+        b: &GBuf,
+        b_off: usize,
+        ldb: usize,
+        beta: f32,
+        cbuf: &GBuf,
+        c_off: usize,
+        ldc: usize,
+        batch: &GemmBatch,
+        causal: bool,
+        dynamic: &GemmDyn<'_>,
+        band: Option<&GemmBand>,
+    ) {
         assert!(
             m % 64 == 0 && n % 64 == 0 && k % 32 == 0,
             "gemm tile alignment: m={m} n={n} k={k}"
@@ -532,8 +627,15 @@ impl<'a> Cmd<'a> {
             nb_c: u32,
             mask: u32,
             kdyn: u32,
+            band: u32,
+            lo: i32,
+            hi: i32,
+            lo_w: i32,
+            hi_w: i32,
+            wide_mask: u32,
         }
         let cv = |s: [usize; 3]| [s[0] as u64, s[1] as u64, s[2] as u64];
+        let bd = band.copied().unwrap_or_default();
         let args = Args {
             sa: cv(batch.sa),
             sb: cv(batch.sb),
@@ -550,6 +652,12 @@ impl<'a> Cmd<'a> {
             nb_c: nc as u32,
             mask: causal as u32,
             kdyn: dynamic.kcount.is_some() as u32,
+            band: bd.mode as u32,
+            lo: bd.lo,
+            hi: bd.hi,
+            lo_w: bd.lo_w,
+            hi_w: bd.hi_w,
+            wide_mask: bd.wide_mask,
         };
         let idx = (ta == Op::T) as usize * 2 + (tb == Op::T) as usize;
         let e = &self.enc;
@@ -1825,6 +1933,109 @@ impl<'a> Cmd<'a> {
         );
     }
 
+    // ---- GDN chunked WY/UT form (gdn_wy.rs): the Vulkan `gdn_wy_*` API on
+    // the Metal ports of WGSL ops 64-78 (slot k = buffer(k), words P[k]) ----
+    fn wy_p(d: &GdnScanDims) -> [u32; 16] {
+        let mut p = [0u32; 16];
+        p[1] = d.b as u32;
+        p[2] = d.t as u32;
+        p[3] = d.nv as u32;
+        p[4] = d.dk as u32;
+        p[5] = d.dv as u32;
+        p[6] = d.c_dim as u32;
+        p[7] = d.ab_ld as u32;
+        p[8] = (d.t / 64) as u32;
+        p
+    }
+    fn wy_run(&self, pso: &ComputePipelineState, bufs: &[&GBuf], p: [u32; 16], n: usize) {
+        let e = &self.enc;
+        e.set_compute_pipeline_state(pso);
+        for (k, b) in bufs.iter().enumerate() {
+            e.set_buffer(k as u64, Some(&b.buf), 0);
+        }
+        e.set_bytes(12, 64, p.as_ptr() as *const c_void);
+        self.grid1(n, 256);
+    }
+    /// zero checkpoint slot 0 of every (b, h): states[(bh·slots)·ss ..]
+    pub fn gdn_wy_zero_s0(&self, states: &GBuf, nb: usize, slots: usize, ss: usize) {
+        let mut p = [0u32; 16];
+        p[1] = nb as u32;
+        p[2] = slots as u32;
+        p[3] = ss as u32;
+        self.wy_run(&self.c.wy_zero_s0, &[states], p, nb * ss)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_wy_scal(&self, d: &GdnScanDims, a_pre: &GBuf, b_pre: &GBuf, p: &GBuf, alog_off: usize, dt_off: usize, lg: &GBuf, gam: &GBuf, bet: &GBuf, rho: &GBuf, beta_one: bool) {
+        let mut pp = Self::wy_p(d);
+        pp[9] = alog_off as u32;
+        pp[10] = dt_off as u32;
+        pp[11] = beta_one as u32;
+        self.wy_run(&self.c.wy_scal, &[a_pre, b_pre, p, lg, gam, bet, rho], pp, d.b * d.nv * (d.t / 64))
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_wy_norm(&self, d: &GdnScanDims, qkv_cv: &GBuf, gam: &GBuf, qn: &GBuf, kn: &GBuf, qg: &GBuf, kg: &GBuf, vcm: &GBuf) {
+        self.wy_run(&self.c.wy_norm, &[qkv_cv, gam, qn, kn, qg, kg, vcm], Self::wy_p(d), d.rows() * d.nv)
+    }
+    pub fn gdn_wy_mask(&self, d: &GdnScanDims, kk: &GBuf, qk: &GBuf, lg: &GBuf, bet: &GBuf, lmat: &GBuf) {
+        self.wy_run(&self.c.wy_mask, &[kk, qk, lg, bet, lmat], Self::wy_p(d), d.b * d.nv * (d.t / 64) * 4096)
+    }
+    pub fn gdn_wy_ut(&self, d: &GdnScanDims, lmat: &GBuf, tmat: &GBuf) {
+        self.wy_run(&self.c.wy_ut, &[lmat, tmat], Self::wy_p(d), d.b * d.nv * (d.t / 64) * 64)
+    }
+    pub fn gdn_wy_sscale(&self, d: &GdnScanDims, states: &GBuf, gam: &GBuf, c: usize) {
+        let mut pp = Self::wy_p(d);
+        pp[12] = c as u32;
+        self.wy_run(&self.c.wy_sscale, &[states, gam], pp, d.b * d.nv * d.state())
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_wy_u(&self, d: &GdnScanDims, epm: &GBuf, bet: &GBuf, rho: &GBuf, um: &GBuf, utm: &GBuf, c: usize) {
+        let mut pp = Self::wy_p(d);
+        pp[12] = c as u32;
+        self.wy_run(&self.c.wy_u, &[epm, bet, rho, um, utm], pp, d.b * d.nv * 64 * d.dv)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_wy_du(&self, d: &GdnScanDims, du: &GBuf, dut: &GBuf, um: &GBuf, epm: &GBuf, bet: &GBuf, rho: &GBuf, dep: &GBuf, drho: &GBuf, dbet: &GBuf, c: usize) {
+        let mut pp = Self::wy_p(d);
+        pp[12] = c as u32;
+        self.wy_run(&self.c.wy_du, &[du, dut, um, epm, bet, rho, dep, drho, dbet], pp, d.b * d.nv * 64)
+    }
+    pub fn gdn_wy_dstate(&self, d: &GdnScanDims, dsn: &GBuf, dlive: &GBuf, gam: &GBuf, c: usize) {
+        let mut pp = Self::wy_p(d);
+        pp[12] = c as u32;
+        self.wy_run(&self.c.wy_dstate, &[dsn, dlive, gam], pp, d.b * d.nv * d.state())
+    }
+    /// dgend = Σ dS_{c+1}·S_c per (b, h): 64 fixed-chunk partials into
+    /// `part` [NB·64], then an in-order fold (deterministic, parallel).
+    pub fn gdn_wy_dgend(&self, d: &GdnScanDims, dlive: &GBuf, states: &GBuf, dgend: &GBuf, part: &GBuf, c: usize) {
+        let mut pp = Self::wy_p(d);
+        pp[12] = c as u32;
+        self.wy_run(&self.c.wy_dgend, &[dlive, states, dgend, part], pp, d.b * d.nv * 64);
+        self.wy_run(&self.c.wy_dgend_fold, &[part, dgend], pp, d.b * d.nv)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_wy_mask_bwd_red(&self, d: &GdnScanDims, dp: &GBuf, qk: &GBuf, dl: &GBuf, lmat: &GBuf, kk: &GBuf, lg: &GBuf, bet: &GBuf, dlgm: &GBuf, dbet: &GBuf) {
+        self.wy_run(&self.c.wy_mask_bwd_red, &[dp, qk, dl, lmat, kk, lg, bet, dlgm, dbet], Self::wy_p(d), d.b * d.nv * (d.t / 64) * 64)
+    }
+    pub fn gdn_wy_mask_bwd(&self, d: &GdnScanDims, dp: &GBuf, dl: &GBuf, lg: &GBuf, bet: &GBuf) {
+        self.wy_run(&self.c.wy_mask_bwd, &[dp, dl, lg, bet], Self::wy_p(d), d.b * d.nv * (d.t / 64) * 4096)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_wy_dlg(&self, d: &GdnScanDims, dqn: &GBuf, dkn: &GBuf, dqg: &GBuf, dkg: &GBuf, qn: &GBuf, kn: &GBuf, drho: &GBuf, dlgm: &GBuf, dgend: &GBuf, rho: &GBuf, gam: &GBuf, dla: &GBuf) {
+        self.wy_run(&self.c.wy_dlg, &[dqn, dkn, dqg, dkg, qn, kn, drho, dlgm, dgend, rho, gam, dla], Self::wy_p(d), d.b * d.nv * (d.t / 64))
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_wy_dscal(&self, d: &GdnScanDims, dla: &GBuf, a_pre: &GBuf, p: &GBuf, alog_off: usize, dt_off: usize, dbet: &GBuf, bet: &GBuf, da: &GBuf, db: &GBuf, part: &GBuf, beta_one: bool) {
+        let mut pp = Self::wy_p(d);
+        pp[9] = alog_off as u32;
+        pp[10] = dt_off as u32;
+        pp[11] = beta_one as u32;
+        self.wy_run(&self.c.wy_dscal, &[dla, a_pre, p, dbet, bet, da, db, part], pp, d.b * d.nv)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_wy_dnorm(&self, d: &GdnScanDims, dqn: &GBuf, dkn: &GBuf, dqg: &GBuf, dkg: &GBuf, qkv_cv: &GBuf, gam: &GBuf, dcv: &GBuf) {
+        self.wy_run(&self.c.wy_dnorm, &[dqn, dkn, dqg, dkg, qkv_cv, gam, dcv], Self::wy_p(d), d.rows() * d.nv)
+    }
+
     /// g[galog_off + h] += Σ_b part[(b·nv+h)·2]; g[gdt_off + h] += Σ_b part[..+1].
     pub fn gdn_scan_fold(&self, part: &GBuf, b: usize, nv: usize, g: &GBuf, galog_off: usize, gdt_off: usize) {
         assert!(part.len >= b * nv * 2 && g.len >= galog_off + nv && g.len >= gdt_off + nv);
@@ -2604,6 +2815,12 @@ impl<'a> Cmd<'a> {
         );
     }
 
+    /// `scatter_add_rows` named for unique indices (the Vulkan backend has a
+    /// faster kernel for them; on Metal the two are the same).
+    pub fn scatter_add_rows_unique(&self, dst: &GBuf, idx: &GBuf, src: &GBuf, rows: usize, d: usize) {
+        self.scatter_add_rows(dst, idx, src, rows, d)
+    }
+
     /// dst[idx[i],:] += src[i,:] (idx < 0 skipped; unique indices).
     pub fn scatter_add_rows(&self, dst: &GBuf, idx: &GBuf, src: &GBuf, rows: usize, d: usize) {
         assert!(idx.len >= rows && src.len >= rows * d);
@@ -2690,9 +2907,39 @@ impl<'a> Cmd<'a> {
         bps: usize,
         cmask: Option<&GBuf>,
     ) {
+        self.banded_softmax_groups(
+            s, off, t, ld, sink, sink_pad, window, blocks, carry_pad, bps, cmask, 0, 0, 1,
+        )
+    }
+
+    /// `banded_softmax_carry` with a band per KV group (`swa_sink_v2`):
+    /// block `z` is head `z % bps` of its sequence, in KV group
+    /// `(z % bps) / group`; a group whose bit is set in `wide_mask` keeps
+    /// `wide_window` keys instead of `window`. A nonzero `cmask` entry is the
+    /// number of carried keys (counted from the newest) that belong to the
+    /// sequence's stream. `wide_mask = 0` is `banded_softmax_carry` exactly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn banded_softmax_groups(
+        &self,
+        s: &GBuf,
+        off: usize,
+        t: usize,
+        ld: usize,
+        sink: usize,
+        sink_pad: usize,
+        window: usize,
+        blocks: usize,
+        carry_pad: usize,
+        bps: usize,
+        cmask: Option<&GBuf>,
+        wide_window: usize,
+        wide_mask: u32,
+        group: usize,
+    ) {
         assert!(ld == sink_pad + carry_pad + t && sink <= sink_pad);
         assert!(s.len >= off + blocks * t * ld);
         assert!(carry_pad == 0 || cmask.is_some_and(|m| m.len * bps >= blocks));
+        assert!(group >= 1 && (wide_mask == 0 || wide_window > 0));
         #[repr(C)]
         struct Args {
             t: u32,
@@ -2702,6 +2949,9 @@ impl<'a> Cmd<'a> {
             window: u32,
             carry_pad: u32,
             bps: u32,
+            wide_window: u32,
+            wide_mask: u32,
+            group: u32,
         }
         let a = Args {
             t: t as u32,
@@ -2711,6 +2961,9 @@ impl<'a> Cmd<'a> {
             window: window as u32,
             carry_pad: carry_pad as u32,
             bps: bps.max(1) as u32,
+            wide_window: wide_window as u32,
+            wide_mask,
+            group: group as u32,
         };
         let e = &self.enc;
         e.set_compute_pipeline_state(&self.c.causal_softmax);
@@ -3693,6 +3946,22 @@ pub fn hk_pow_table(decay: &[f32], nh: usize, nph: usize) -> Vec<f32> {
         }
     }
     t
+}
+
+
+/// Band hint of the bounded anchor for [`Cmd::gemm_band`] (local GEMM
+/// indices; KV groups set in `wide_mask` — the batch `h` index — use the
+/// `_w` pair). `mode`: 1 = C[i,j] is needed only for j − i ∈ [lo, hi];
+/// 2 = reduction index k of row i only for k − i ∈ [lo, hi];
+/// 3 = only for i − k ∈ [lo, hi].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GemmBand {
+    pub mode: u8,
+    pub lo: i32,
+    pub hi: i32,
+    pub lo_w: i32,
+    pub hi_w: i32,
+    pub wide_mask: u32,
 }
 
 /// Batch decomposition of a GEMM grid's z axis: z = (b·nh + h)·nc + c,

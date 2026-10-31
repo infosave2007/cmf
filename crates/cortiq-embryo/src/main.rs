@@ -98,6 +98,12 @@ enum Sub {
         /// group, tree_id, title; inferred from Latin binomials when absent)
         #[arg(long)]
         group_field: Option<String>,
+        /// messages format: an answer longer than the window keeps its prompt
+        /// (up to seq/2) and is cut at the window end without end markers
+        /// (default: the OASST recipe — the answer keeps seq − 3 tokens and
+        /// ends with <|im_end|><|endoftext|>, the prompt gets what is left)
+        #[arg(long)]
+        open_truncated: bool,
     },
     /// Prepare a fresh raw-LM replay shard from bounded native token prefixes.
     RawReplay {
@@ -127,6 +133,20 @@ enum Sub {
         /// Genome status at birth (with --genome-id).
         #[arg(long, requires = "genome_id", value_parser = ["pre_chat", "candidate", "sealed"])]
         genome_status: Option<String>,
+    },
+    /// Rebuild a trainer checkpoint from an Embryo .cmf export (config from
+    /// its provenance, exact trunk weights, expert descriptors; no
+    /// optimizer moments). Fails unless the checkpoint re-exports to the
+    /// file's trunk tensors byte for byte. Also writes the file's
+    /// tokenizer.json beside it.
+    ImportCmf {
+        #[arg(long)]
+        cmf: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        /// where to write the file's tokenizer.json (default: <out>.tokenizer.json)
+        #[arg(long)]
+        tokenizer_out: Option<PathBuf>,
     },
     /// Dump held-out documents of a corpus file as text (for `cortiq ppl`).
     SampleText {
@@ -635,8 +655,10 @@ enum Sub {
         #[arg(long, default_value_t = 10)]
         stats_every: usize,
     },
-    /// Native Vulkan response-only SFT with a fixed 20% raw-LM replay mix.
-    #[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+    /// Native response-only SFT with a fixed 20% raw-LM replay mix (Vulkan
+    /// on Linux, Metal on macOS; `sft` is the same command).
+    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    #[command(alias = "sft")]
     VulkanSft {
         #[arg(long)]
         ckpt: PathBuf,
@@ -685,6 +707,11 @@ enum Sub {
         sampler_skip: usize,
         #[arg(long)]
         dropless: bool,
+        /// Start AdamW from zero moments (a checkpoint without them, e.g.
+        /// from `import-cmf`): the optimizer step restarts at 0 so the bias
+        /// correction is exact, and --steps / the stage caps count from 0.
+        #[arg(long)]
+        fresh_moments: bool,
     },
     /// Synthetic recall probe (MQAR/NIAH-lite) through the trainer forward:
     /// K key→value pairs, real-text filler, one key repeated at distance D.
@@ -727,6 +754,21 @@ enum Sub {
         /// (no carry) and print the per-window NLL next to the carried ones
         #[arg(long, default_value_t = 0)]
         one_pass: usize,
+    },
+    /// Prefix perplexity of a text file on the GPU: one stream of `seq`
+    /// windows with the state carried across them (Metal / Vulkan), ppl of
+    /// the first N tokens for every N in --report, for each checkpoint.
+    PplStream {
+        #[arg(long, required = true, num_args = 1..)]
+        ckpt: Vec<PathBuf>,
+        #[arg(long)]
+        text: PathBuf,
+        #[arg(long)]
+        tokenizer: PathBuf,
+        #[arg(long, default_value_t = 1024)]
+        seq: usize,
+        #[arg(long, value_delimiter = ',', default_value = "1024,4096,16384,32768,65536")]
+        report: Vec<usize>,
     },
     /// Birth: train from scratch (or resume) on a token shard.
     Birth {
@@ -810,6 +852,12 @@ enum Sub {
         /// SWAX stochastic training windows sampled per step, e.g. `64,128`
         #[arg(long, value_name = "W,W", value_delimiter = ',')]
         anchor_train_windows: Option<Vec<usize>>,
+        /// wide exact window (`swa_sink_v2`) of the KV groups in
+        /// --anchor-wide-groups; semantic config, also on --resume
+        #[arg(long)]
+        anchor_wide_window: Option<usize>,
+        #[arg(long, value_name = "G,G", value_delimiter = ',')]
+        anchor_wide_groups: Option<Vec<usize>>,
         /// explicit zero-based anchor schedule, e.g. `3,7` (default: every
         /// --anchor-every-th layer)
         #[arg(long, value_name = "LAYER,LAYER", value_delimiter = ',')]
@@ -912,6 +960,37 @@ fn main() {
             max_tokens,
         } => {
             cortiq_embryo::corpus::shard(&tokenizer, &inputs, &out, max_tokens);
+        }
+        Sub::ImportCmf {
+            cmf,
+            out,
+            tokenizer_out,
+        } => {
+            assert!(!out.exists(), "refusing to overwrite checkpoint {}", out.display());
+            let (ck, tok, foreign) = match cortiq_embryo::export::import_cmf(&cmf) {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!("import-cmf: {e:#}");
+                    std::process::exit(1);
+                }
+            };
+            let extras: Vec<(&str, &[f32])> =
+                ck.extras.iter().map(|(n, x)| (n.as_str(), x.as_slice())).collect();
+            cortiq_embryo::train::save_checkpoint(&out, &ck.cfg, ck.step, &ck.params, None, None, &extras)
+                .expect("save checkpoint");
+            let tok_path = tokenizer_out.unwrap_or_else(|| out.with_extension("tokenizer.json"));
+            std::fs::write(&tok_path, &tok).expect("write tokenizer.json");
+            println!(
+                "import-cmf: {} → {} (step {}, {} params, extras {:?}; {} non-trunk tensors left out; \
+                 re-export byte-identical), tokenizer → {}",
+                cmf.display(),
+                out.display(),
+                ck.step,
+                ck.params.len(),
+                ck.extras.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+                foreign,
+                tok_path.display()
+            );
         }
         Sub::Export {
             ckpt,
@@ -1646,7 +1725,12 @@ fn main() {
             seq,
             format,
             group_field,
+            open_truncated,
         } => {
+            assert!(
+                !open_truncated || format == "messages",
+                "--open-truncated applies to --format messages"
+            );
             match format.as_str() {
                 "oasst" => cortiq_embryo::sft::prepare(
                     &input,
@@ -1667,6 +1751,7 @@ fn main() {
                     &final_out,
                     &manifest_out,
                     group_field.as_deref(),
+                    open_truncated,
                 )
                 .expect("prepare response-only SFT corpus from messages JSONL"),
                 other => {
@@ -1706,6 +1791,27 @@ fn main() {
                 let _ = (reps, no_verify);
                 eprintln!("bench needs Metal (macOS)");
                 std::process::exit(1);
+            }
+        }
+        Sub::PplStream {
+            ckpt,
+            text,
+            tokenizer,
+            seq,
+            report,
+        } => {
+            #[cfg(any(target_os = "macos", feature = "vulkan"))]
+            cortiq_embryo::cli::ppl_stream(cortiq_embryo::cli::PplStreamArgs {
+                ckpts: ckpt,
+                text,
+                tokenizer,
+                seq,
+                report,
+            });
+            #[cfg(not(any(target_os = "macos", feature = "vulkan")))]
+            {
+                let _ = (ckpt, text, tokenizer, seq, report);
+                panic!("ppl-stream needs the Metal or Vulkan trainer backend");
             }
         }
         Sub::CarryProfile {
@@ -2027,7 +2133,7 @@ fn main() {
                 out.display()
             );
         }
-        #[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+        #[cfg(any(target_os = "macos", feature = "vulkan"))]
         Sub::VulkanSft {
             ckpt,
             shard,
@@ -2048,6 +2154,7 @@ fn main() {
             seed,
             sampler_skip,
             dropless,
+            fresh_moments,
         } => {
             use cortiq_embryo::model::EmbryoGpu;
             use cortiq_embryo::sft::{SftSampler, SftShard};
@@ -2065,12 +2172,14 @@ fn main() {
             assert!(batch >= 5 && batch % 5 == 0, "SFT batch must be a multiple of 5");
             assert!(seq % 64 == 0, "Vulkan SFT requires --seq multiple of 64");
             let ck = load_checkpoint(&ckpt).expect("load checkpoint");
-            assert!(steps > ck.step as usize, "SFT --steps must advance the checkpoint");
+            // optimizer step the stage starts from (0 with fresh moments)
+            let base = if fresh_moments { 0 } else { ck.step as usize };
+            assert!(steps > base, "SFT --steps must advance the checkpoint");
             assert!(
-                steps <= ck.step as usize + 500,
+                steps <= base + 500,
                 "SFT pilot is capped at 500 steps beyond the input checkpoint"
             );
-            if steps > ck.step as usize + 100 {
+            if steps > base + 100 {
                 assert!(
                     allow_extended,
                     "SFT extension beyond the initial 100 steps requires --allow-extended"
@@ -2105,14 +2214,20 @@ fn main() {
                 EmbryoGpu::new(ck.cfg.clone(), batch, seq, &ck.params)
             }
             .expect("native Vulkan adapter/context");
-            if let (Some(m), Some(v)) = (&ck.m, &ck.v) {
+            if fresh_moments {
+                // zero moments as allocated; the bias correction counts from 0
+                gpu.step = 0;
+            } else if let (Some(m), Some(v)) = (&ck.m, &ck.v) {
                 assert_eq!(m.len(), lay.total, "checkpoint m/layout arena mismatch");
                 assert_eq!(v.len(), lay.total, "checkpoint v/layout arena mismatch");
                 gpu.m.write_from(m);
                 gpu.v.write_from(v);
                 gpu.step = ck.step;
             } else {
-                panic!("response-only SFT requires the full checkpoint AdamW moments");
+                panic!(
+                    "response-only SFT requires the full checkpoint AdamW moments \
+                     (--fresh-moments starts them from zero)"
+                );
             }
             gpu.set_desc(&ck.extras);
             gpu.desc_updates.set(false);
@@ -2160,7 +2275,7 @@ fn main() {
             );
             let mut tok = Vec::new();
             let mut tgt = Vec::new();
-            for _ in 0..(steps - ck.step as usize) {
+            for _ in 0..(steps - base) {
                 sampler.batch(&train_sft, &replay_shard, &mut tok, &mut tgt);
                 let (loss, gnorm, ms) = gpu.train_step(&tok, &tgt, lr, wd, clip);
                 assert!(
@@ -2270,6 +2385,8 @@ fn main() {
             anchor_window,
             anchor_sink,
             anchor_train_windows,
+            anchor_wide_window,
+            anchor_wide_groups,
             anchor_layers,
             mixer,
             gdn_heads,
@@ -2319,6 +2436,8 @@ fn main() {
                 anchor_window,
                 anchor_sink,
                 anchor_train_windows,
+                anchor_wide_window,
+                anchor_wide_groups,
                 anchor_layers,
                 mixer,
                 gdn_heads,

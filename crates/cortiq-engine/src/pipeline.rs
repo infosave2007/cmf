@@ -4087,11 +4087,14 @@ impl Pipeline {
         for li in 0..self.num_layers {
             let pl = self.phys_layer(li);
             if let AttnKind::Bounded(w) = &self.weights.layers[pl].attn {
-                if w.window != cfg.window || w.sink != cfg.sink {
+                if w.window != cfg.window
+                    || w.sink != cfg.sink
+                    || w.group_windows != cfg.group_windows
+                {
                     return Err(format!(
-                        "layer {li}: bounded weights (window {} sink {}) disagree with \
-                         anchor_core (window {} sink {})",
-                        w.window, w.sink, cfg.window, cfg.sink
+                        "layer {li}: bounded weights (window {} sink {} groups {:?}) disagree \
+                         with anchor_core (window {} sink {} groups {:?})",
+                        w.window, w.sink, w.group_windows, cfg.window, cfg.sink, cfg.group_windows
                     ));
                 }
                 self.kv_cache.layers[li].install_bounded(cfg.window);
@@ -17434,16 +17437,17 @@ impl Pipeline {
                     full_seen = true;
                 }
                 AttnKind::Bounded(w) => {
-                    // The resident bounded attend scores S + W lanes in one
-                    // 256-lane chunk; the format caps S + W at 160.
+                    // The resident bounded attend walks S + W keys in
+                    // 256-lane tiles (online softmax), any window the format
+                    // allows; per-group windows come from header word 22.
                     let Some(ac) = self.anchor_core.as_ref() else {
                         return false;
                     };
                     if self.bounded_rope.is_none()
                         || w.window != ac.window
                         || w.sink != ac.sink
+                        || w.group_windows != ac.group_windows
                         || w.window == 0
-                        || w.window + w.sink > 256
                         || w.sink_k.len() != self.num_kv_heads * w.sink * self.head_dim
                         || w.sink_v.len() != self.num_kv_heads * w.sink * self.head_dim
                         || w.wq.as_f32().is_none()
@@ -17749,6 +17753,15 @@ impl Pipeline {
                     let off = pack.put(&rope.cos);
                     let _ = pack.put(&rope.sin);
                     off
+                }
+                None => UMAX,
+            };
+            // swa_sink_v2: one window per KV group (f32 in the pack; exact
+            // for any window the format allows); UMAX = every group `W`.
+            meta[22] = match bounded.as_ref().filter(|ac| !ac.group_windows.is_empty()) {
+                Some(ac) => {
+                    let gw: Vec<f32> = ac.group_windows.iter().map(|&w| w as f32).collect();
+                    pack.put(&gw)
                 }
                 None => UMAX,
             };

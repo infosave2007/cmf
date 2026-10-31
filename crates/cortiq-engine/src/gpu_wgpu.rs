@@ -1890,7 +1890,11 @@ fn embryo_chunk_bounded_attend(@builtin(local_invocation_id) lidv: vec3<u32>,
     let half = md[16u] / 2u;
     let tab = md[21u];
     let pp = p.position + tpos;
-    let m = min(pp + 1u, w);
+    // swa_sink_v2: the group's own window of the ring (md[22] = offset of
+    // the per-KV-group windows as f32 in the weights pack, UMAX for v1)
+    var wg = w;
+    if (md[22u] != UMAX) { wg = u32(weights[md[22u] + kh]); }
+    let m = min(pp + 1u, wg);
     let n = sink + m;
     let scale = inverseSqrt(f32(hd));
     let base = md[r + 26u];
@@ -1899,105 +1903,124 @@ fn embryo_chunk_bounded_attend(@builtin(local_invocation_id) lidv: vec3<u32>,
     let sv = md[r + 28u];
     let t = lidv.x;
     let qb = CP_Q + tpos * 1024u + hq * hd;
-    var sc = -3.402823e+38;
-    if (t < n) {
-        var dot = 0.0;
-        if (t < sink) {
-            let krow = sk + (kh * sink + t) * hd;
-            var j = 0u;
-            loop {
-                if (j >= hd) { break; }
-                dot = dot + scratch[qb + j] * weights[krow + j];
-                j = j + 1u;
-            }
-        } else {
-            let delta = t - sink;
-            let jpos = pp - delta;
-            var krow = 0u;
-            var from_chunk = false;
-            if (jpos >= p.position) {
-                krow = CP_K + (jpos - p.position) * 1024u + kh * hd;
-                from_chunk = true;
-            } else {
-                krow = base + (kh * w + (jpos % w)) * hd;
-            }
-            var i = 0u;
-            loop {
-                if (i >= half) { break; }
-                let co = weights[tab + delta * half + i];
-                let si = weights[tab + w * half + delta * half + i];
-                let q0 = scratch[qb + i];
-                let q1 = scratch[qb + i + half];
-                var k0 = 0.0;
-                var k1 = 0.0;
-                if (from_chunk) {
-                    k0 = scratch[krow + i];
-                    k1 = scratch[krow + i + half];
-                } else {
-                    k0 = kv[krow + i];
-                    k1 = kv[krow + i + half];
+    // Keys in tiles of 256 with an online softmax: any window fits, and a
+    // single tile (n ≤ 256) is the one-pass arithmetic exactly (the running
+    // max starts below every score, so the first rescale multiplies zeros).
+    var m_run = -3.402823e+38;
+    var l_run = 0.0;
+    var acc = 0.0;
+    var t0 = 0u;
+    loop {
+        if (t0 >= n) { break; }
+        let u0 = t0 + t;
+        var sc = -3.402823e+38;
+        if (u0 < n) {
+            var dot = 0.0;
+            if (u0 < sink) {
+                let krow = sk + (kh * sink + u0) * hd;
+                var j = 0u;
+                loop {
+                    if (j >= hd) { break; }
+                    dot = dot + scratch[qb + j] * weights[krow + j];
+                    j = j + 1u;
                 }
-                dot = dot + (q0 * co - q1 * si) * k0 + (q0 * si + q1 * co) * k1;
-                i = i + 1u;
-            }
-            var j = 2u * half;
-            loop {
-                if (j >= hd) { break; }
-                var kj = 0.0;
-                if (from_chunk) { kj = scratch[krow + j]; } else { kj = kv[krow + j]; }
-                dot = dot + scratch[qb + j] * kj;
-                j = j + 1u;
-            }
-        }
-        sc = dot * scale;
-    }
-    anchor_sc[t] = sc;
-    anchor_red[t] = sc;
-    workgroupBarrier();
-    var stride = 128u;
-    loop {
-        if (stride == 0u) { break; }
-        if (t < stride) {
-            anchor_red[t] = max(anchor_red[t], anchor_red[t + stride]);
-        }
-        workgroupBarrier();
-        stride = stride >> 1u;
-    }
-    let mx = anchor_red[0];
-    workgroupBarrier();
-    let wgt = select(0.0, exp(sc - mx), t < n);
-    anchor_sc[t] = wgt;
-    anchor_red[t] = wgt;
-    workgroupBarrier();
-    stride = 128u;
-    loop {
-        if (stride == 0u) { break; }
-        if (t < stride) {
-            anchor_red[t] = anchor_red[t] + anchor_red[t + stride];
-        }
-        workgroupBarrier();
-        stride = stride >> 1u;
-    }
-    let l = anchor_red[0];
-    workgroupBarrier();
-    if (dd < hd) {
-        var acc = 0.0;
-        var u = 0u;
-        loop {
-            if (u >= n) { break; }
-            if (u < sink) {
-                acc = acc + anchor_sc[u] * weights[sv + (kh * sink + u) * hd + dd];
             } else {
-                let jpos = pp - (u - sink);
+                let delta = u0 - sink;
+                let jpos = pp - delta;
+                var krow = 0u;
+                var from_chunk = false;
                 if (jpos >= p.position) {
-                    acc = acc + anchor_sc[u] * scratch[CP_V + (jpos - p.position) * 1024u + kh * hd + dd];
+                    krow = CP_K + (jpos - p.position) * 1024u + kh * hd;
+                    from_chunk = true;
                 } else {
-                    acc = acc + anchor_sc[u] * kv[base + ring + (kh * w + (jpos % w)) * hd + dd];
+                    krow = base + (kh * w + (jpos % w)) * hd;
+                }
+                var i = 0u;
+                loop {
+                    if (i >= half) { break; }
+                    let co = weights[tab + delta * half + i];
+                    let si = weights[tab + w * half + delta * half + i];
+                    let q0 = scratch[qb + i];
+                    let q1 = scratch[qb + i + half];
+                    var k0 = 0.0;
+                    var k1 = 0.0;
+                    if (from_chunk) {
+                        k0 = scratch[krow + i];
+                        k1 = scratch[krow + i + half];
+                    } else {
+                        k0 = kv[krow + i];
+                        k1 = kv[krow + i + half];
+                    }
+                    dot = dot + (q0 * co - q1 * si) * k0 + (q0 * si + q1 * co) * k1;
+                    i = i + 1u;
+                }
+                var j = 2u * half;
+                loop {
+                    if (j >= hd) { break; }
+                    var kj = 0.0;
+                    if (from_chunk) { kj = scratch[krow + j]; } else { kj = kv[krow + j]; }
+                    dot = dot + scratch[qb + j] * kj;
+                    j = j + 1u;
                 }
             }
-            u = u + 1u;
+            sc = dot * scale;
         }
-        scratch[CP_ATT + tpos * 1024u + hq * hd + dd] = acc / max(l, 1e-20);
+        anchor_sc[t] = sc;
+        anchor_red[t] = sc;
+        workgroupBarrier();
+        var stride = 128u;
+        loop {
+            if (stride == 0u) { break; }
+            if (t < stride) {
+                anchor_red[t] = max(anchor_red[t], anchor_red[t + stride]);
+            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        let mx = max(m_run, anchor_red[0]);
+        workgroupBarrier();
+        let wgt = select(0.0, exp(sc - mx), u0 < n);
+        anchor_sc[t] = wgt;
+        anchor_red[t] = wgt;
+        workgroupBarrier();
+        stride = 128u;
+        loop {
+            if (stride == 0u) { break; }
+            if (t < stride) {
+                anchor_red[t] = anchor_red[t] + anchor_red[t + stride];
+            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        let corr = exp(m_run - mx);
+        l_run = l_run * corr + anchor_red[0];
+        if (dd < hd) {
+            var part = 0.0;
+            let cnt = min(256u, n - t0);
+            var v = 0u;
+            loop {
+                if (v >= cnt) { break; }
+                let u = t0 + v;
+                if (u < sink) {
+                    part = part + anchor_sc[v] * weights[sv + (kh * sink + u) * hd + dd];
+                } else {
+                    let jpos = pp - (u - sink);
+                    if (jpos >= p.position) {
+                        part = part + anchor_sc[v] * scratch[CP_V + (jpos - p.position) * 1024u + kh * hd + dd];
+                    } else {
+                        part = part + anchor_sc[v] * kv[base + ring + (kh * w + (jpos % w)) * hd + dd];
+                    }
+                }
+                v = v + 1u;
+            }
+            acc = acc * corr + part;
+        }
+        m_run = mx;
+        workgroupBarrier();
+        t0 = t0 + 256u;
+    }
+    if (dd < hd) {
+        scratch[CP_ATT + tpos * 1024u + hq * hd + dd] = acc / max(l_run, 1e-20);
     }
 }
 
@@ -3262,6 +3285,24 @@ fn dsv4_global_moe_shader_source(segments: usize) -> Option<String> {
             .then_some(src)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod embryo_core_shader_tests {
+    /// The resident Embryo module (tiled online-softmax bounded attend,
+    /// per-KV-group windows from header word 22) parses and validates
+    /// without a device — the only check of the WGSL a Mac can run.
+    #[test]
+    fn embryo_core_shader_validates() {
+        let module = wgpu::naga::front::wgsl::parse_str(super::EMBRYO_CORE_SRC)
+            .expect("embryo core WGSL must parse");
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("embryo core WGSL must validate");
     }
 }
 

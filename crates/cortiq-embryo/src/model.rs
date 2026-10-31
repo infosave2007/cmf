@@ -111,6 +111,16 @@ pub struct EmbryoCfg {
     /// the fixed `anchor_window`. Entries must lie in `1..=anchor_window`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub anchor_train_windows: Vec<usize>,
+    /// Wide exact window (`swa_sink_v2`) of the KV groups listed in
+    /// `anchor_wide_groups`, in every anchor layer: those groups attend to
+    /// the last `anchor_wide_window` keys (fixed, no SWAX draw), the others
+    /// keep `anchor_window`. 0 = v1 (every group `anchor_window`). No new
+    /// parameters: only the band of the wide groups' heads changes.
+    #[serde(default, skip_serializing_if = "usize_is_zero")]
+    pub anchor_wide_window: usize,
+    /// KV-group indices (`< anchor_kv_heads`) with the wide window.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub anchor_wide_groups: Vec<usize>,
     /// Explicit zero-based anchor schedule. `None` = the legacy cadence
     /// `(l + 1) % anchor_every == 0`. Serialized so a checkpoint cannot
     /// silently change which layers are anchors on resume.
@@ -191,11 +201,11 @@ pub const GDN_MAX_DIM: usize = 128;
 /// causal/band block starts at column `SINK_PAD`. With `anchor_sink == 0`
 /// the rows are `[T]` wide exactly as in the legacy layout.
 pub const SINK_PAD: usize = 64;
-/// Format ceiling on `sink + window` (the runtime's bounded-attend scratch):
+/// Format ceiling on `sink + window` (the state a header may declare):
 /// the value of `cortiq_core::types::AnchorCoreConfig::MAX_SINK_PLUS_WINDOW`
 /// (spelled out so the trainer crate also builds against a core without
 /// the bounded types; `tests/anchor_bounded.rs` pins the two together).
-pub const MAX_SINK_PLUS_WINDOW: usize = 160;
+pub const MAX_SINK_PLUS_WINDOW: usize = 65_536;
 
 impl EmbryoCfg {
     pub fn embryo0() -> Self {
@@ -232,6 +242,8 @@ impl EmbryoCfg {
             anchor_window: 0,
             anchor_sink: 0,
             anchor_train_windows: Vec::new(),
+            anchor_wide_window: 0,
+            anchor_wide_groups: Vec::new(),
             anchor_layers: None,
             mixer: Mixer::HybridK,
             gdn_heads: 4,
@@ -276,6 +288,8 @@ impl EmbryoCfg {
             anchor_window: 0,
             anchor_sink: 0,
             anchor_train_windows: Vec::new(),
+            anchor_wide_window: 0,
+            anchor_wide_groups: Vec::new(),
             anchor_layers: None,
             mixer: Mixer::HybridK,
             gdn_heads: 4,
@@ -427,6 +441,37 @@ impl EmbryoCfg {
         self.sink_pad() + t
     }
 
+    /// The widest served window of any KV group (the ring capacity a
+    /// runtime keeps; `anchor_window` without wide groups).
+    pub fn anchor_max_window(&self) -> usize {
+        self.anchor_window.max(self.anchor_wide_window)
+    }
+
+    /// Bitmask of the KV groups with the wide window (0 = v1).
+    pub fn anchor_wide_mask(&self) -> u32 {
+        if self.anchor_wide_window == 0 {
+            return 0;
+        }
+        self.anchor_wide_groups.iter().fold(0u32, |m, &g| m | (1u32 << g))
+    }
+
+    /// Served window of every KV group (`swa_sink_v2` `group_windows`);
+    /// empty for v1.
+    pub fn anchor_group_windows(&self) -> Vec<usize> {
+        if self.anchor_wide_window == 0 {
+            return Vec::new();
+        }
+        (0..self.anchor_kv_heads)
+            .map(|g| {
+                if self.anchor_wide_groups.contains(&g) {
+                    self.anchor_wide_window
+                } else {
+                    self.anchor_window
+                }
+            })
+            .collect()
+    }
+
     /// The training window of optimizer step `step`: a deterministic draw
     /// from `anchor_train_windows` (splitmix over the step index, so a
     /// resumed birth replays the same schedule), or the fixed window.
@@ -467,14 +512,37 @@ impl EmbryoCfg {
             if !self.anchor_train_windows.is_empty() {
                 return Err("anchor_train_windows requires anchor_window > 0".into());
             }
+            if self.anchor_wide_window > 0 || !self.anchor_wide_groups.is_empty() {
+                return Err("anchor_wide_window requires the bounded anchor (anchor_window > 0)".into());
+            }
             return Ok(());
         }
-        if self.anchor_sink + self.anchor_window > MAX_SINK_PLUS_WINDOW {
+        if self.anchor_sink + self.anchor_max_window() > MAX_SINK_PLUS_WINDOW {
             return Err(format!(
-                "anchor sink + window = {} exceeds the kernel ceiling {}",
-                self.anchor_sink + self.anchor_window,
+                "anchor sink + window = {} exceeds the format ceiling {}",
+                self.anchor_sink + self.anchor_max_window(),
                 MAX_SINK_PLUS_WINDOW
             ));
+        }
+        if self.anchor_wide_window > 0 || !self.anchor_wide_groups.is_empty() {
+            if self.anchor_wide_window <= self.anchor_window {
+                return Err(format!(
+                    "anchor_wide_window {} must exceed anchor_window {}",
+                    self.anchor_wide_window, self.anchor_window
+                ));
+            }
+            if self.anchor_wide_groups.is_empty() || self.anchor_wide_groups.len() > 32 {
+                return Err("anchor_wide_window needs 1..=32 anchor_wide_groups".into());
+            }
+            let mut seen = std::collections::HashSet::new();
+            for &g in &self.anchor_wide_groups {
+                if g >= self.anchor_kv_heads || g >= 32 || !seen.insert(g) {
+                    return Err(format!(
+                        "anchor_wide_groups entry {g} is out of range for {} KV groups or repeated",
+                        self.anchor_kv_heads
+                    ));
+                }
+            }
         }
         if self.anchor_sink > SINK_PAD {
             return Err(format!(
@@ -1238,8 +1306,8 @@ pub use gpu::*;
 mod gpu {
     use super::*;
     use crate::metal::{
-        ctx, hk_pow_table, Cmd, Ctx, GBuf, GdnScanDims, GemmBatch, GemmDyn, HkDims, HkGrads,
-        HkScratch, HkWork, Op, RouteDims,
+        ctx, hk_pow_table, Cmd, Ctx, GBuf, GdnScanDims, GemmBand, GemmBatch, GemmDyn, HkDims,
+        HkGrads, HkScratch, HkWork, Op, RouteDims,
     };
     use crate::ops::hk_decay_grid;
 
@@ -1499,11 +1567,18 @@ mod gpu {
     /// so every relative angle is exact). Everything is detached: no
     /// gradient crosses a window boundary.
     pub struct CarryState {
-        /// carried-anchor columns (anchor_window rounded up to 64; 0 = none)
+        /// carried-anchor columns (widest anchor window rounded up to 64;
+        /// 0 = none)
         pub cp: usize,
-        /// [B] u32: 1 = the sequence continues (its carried inputs are valid)
+        /// [B] u32: 0 = the sequence starts a fresh stream; otherwise the
+        /// number of carried anchor keys (from the end of the tail) that
+        /// belong to its stream — `cp` once the stream has filled the tail,
+        /// fewer while a tail longer than the window still holds keys of the
+        /// stream before the reset
         pub mask: GBuf,
         pub mask_host: Vec<bool>,
+        /// [B] carried keys of each stream the next window will see
+        pub valid: Vec<usize>,
         /// [B] zeros: the mask of every pass outside `carry_begin`/`commit`
         /// (evaluation windows never see carried keys)
         pub mask_zero: GBuf,
@@ -1602,11 +1677,11 @@ mod gpu {
         /// backwards encoded in between read the carried inputs and write the
         /// next window's tails.
         pub carry_active: std::cell::Cell<bool>,
-        /// GDN mixer on Vulkan: the chunked WY/UT form (`gdn_wy.rs`) replaces
+        /// GDN mixer (Vulkan and Metal): the chunked WY/UT form (`gdn_wy.rs`) replaces
         /// the token scan (`CMF_GDN_WY=0` selects the scan for A/B): the
         /// shared backward scratch plus one kept-intermediates arena per
         /// GDN layer (indexed by layer; None for anchors).
-        #[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+        #[cfg(any(target_os = "macos", feature = "vulkan"))]
         pub gdn_wy: Option<(crate::gdn_wy::GdnWyScratch, Vec<Option<crate::gdn_wy::GdnWyKeep>>)>,
     }
 
@@ -1707,9 +1782,10 @@ mod gpu {
             // Exact ordinary GDN keeps one 64×64 state snapshot per token for
             // the reverse causal scan (the legacy HK lane remains chunked).
             let gdn_nst = b * (t + 1) * 64 * 64;
-            // carried anchor keys: the served window rounded up to a tile
+            // carried anchor keys: the widest served window rounded up to a
+            // tile (it may exceed T: the tail then spans several windows)
             let cp = if carry && cfg.anchor_bounded() {
-                cfg.anchor_window.div_ceil(64) * 64
+                cfg.anchor_max_window().div_ceil(64) * 64
             } else {
                 0
             };
@@ -2121,6 +2197,7 @@ mod gpu {
                     cp,
                     mask: GBuf::from_u32(c, &vec![0u32; b]),
                     mask_host: vec![false; b],
+                    valid: vec![0; b],
                     mask_zero: GBuf::from_u32(c, &vec![0u32; b]),
                     conv,
                     tails,
@@ -2178,9 +2255,12 @@ mod gpu {
                 anchor_window_t: std::cell::Cell::new(cfg.anchor_window),
                 anchor_fixed_window: std::cell::Cell::new(false),
                 gdn_s0_from_ckpt: std::cell::Cell::new(false),
-                #[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+                #[cfg(any(target_os = "macos", feature = "vulkan"))]
                 gdn_wy: if cfg.is_gdn_mixer()
                     && std::env::var("CMF_GDN_WY").ok().as_deref() != Some("0")
+                    // the Metal tile GEMM needs dk, dv in multiples of 64
+                    // (smaller test geometries keep the token scan)
+                    && (!cfg!(target_os = "macos") || (cfg.gdn_dk % 64 == 0 && cfg.gdn_dv % 64 == 0))
                 {
                     let d = GdnScanDims {
                         b,
@@ -3811,7 +3891,25 @@ mod gpu {
             for (m, r) in cs.mask_host.iter_mut().zip(reset) {
                 *m = !*r;
             }
-            let mask: Vec<u32> = cs.mask_host.iter().map(|&m| m as u32).collect();
+            // carried keys of the stream: all cp once its windows fill the
+            // tail (always so when cp ≤ T), fewer right after a reset when
+            // the tail spans several windows
+            let (t, cp) = (self.t, cs.cp);
+            let mask: Vec<u32> = (0..b)
+                .map(|i| {
+                    // nonzero whenever the stream continues: the same mask
+                    // gates the recurrent S_0 and conv carries
+                    let used = if reset[i] {
+                        0
+                    } else if cp <= t {
+                        cp.max(1)
+                    } else {
+                        cs.valid[i].min(cp).max(1)
+                    };
+                    cs.valid[i] = if reset[i] { t } else { used + t };
+                    if reset[i] { 0 } else { used as u32 }
+                })
+                .collect();
             unsafe {
                 std::ptr::copy_nonoverlapping(mask.as_ptr(), cs.mask.buf.contents() as *mut u32, b);
             }
@@ -3907,12 +4005,43 @@ mod gpu {
             self.carry_active.set(false);
         }
 
-        /// Copy the last `rows` rows of every sequence of `src` [B·T, w]
-        /// into `dst` [B, rows, w] (the next window's carried history).
-        fn carry_tail_copy(&self, cmd: &Cmd, src: &GBuf, dst: &GBuf, rows: usize, w: usize) {
+        /// The next window's carried history `dst` [B, rows, w]: the last
+        /// `rows` rows of every sequence of `src` [B·T, w]; when `rows > T`
+        /// (a window wider than the training window) the newest `rows − T`
+        /// rows of the current tail `cur` [B, rows, w] come first.
+        fn carry_tail_copy(&self, cmd: &Cmd, src: &GBuf, cur: &GBuf, dst: &GBuf, rows: usize, w: usize) {
+            let t = self.t;
             for bi in 0..self.b {
-                cmd.copy(src, (bi * self.t + self.t - rows) * w, dst, bi * rows * w, rows * w);
+                if rows <= t {
+                    cmd.copy(src, (bi * t + t - rows) * w, dst, bi * rows * w, rows * w);
+                } else {
+                    let keep = rows - t;
+                    cmd.copy(cur, (bi * rows + t) * w, dst, bi * rows * w, keep * w);
+                    cmd.copy(src, bi * t * w, dst, (bi * rows + keep) * w, t * w);
+                }
             }
+        }
+
+        /// Band hints of the anchor GEMMs for a pass with served/training
+        /// window `window` (None: legacy full-causal, or `CMF_ANCHOR_BAND=0`):
+        /// (window block, carried block) as [`GemmBand`] with `mode` 0 — the
+        /// caller sets the mode per GEMM. Window block: key j of query i is in
+        /// the band iff j − i ∈ [−(w−1), 0]; carried block (column c =
+        /// position c − cp): c − i ≥ cp − w + 1. The wide KV groups use their
+        /// own window. A superset of every P / dS support, so exact.
+        fn anchor_bands(&self, window: usize) -> Option<(GemmBand, GemmBand)> {
+            let cfg = &self.cfg;
+            if !cfg.anchor_bounded() || window == 0 || !anchor_band_on() {
+                return None;
+            }
+            let ww = if cfg.anchor_wide_window > 0 { cfg.anchor_wide_window } else { window };
+            let (w, ww, cp) = (window as i32, ww as i32, self.carry_pad() as i32);
+            let far = i32::MAX / 4;
+            let wide_mask = cfg.anchor_wide_mask();
+            Some((
+                GemmBand { mode: 0, lo: -(w - 1), hi: 0, lo_w: -(ww - 1), hi_w: 0, wide_mask },
+                GemmBand { mode: 0, lo: cp - w + 1, hi: far, lo_w: cp - ww + 1, hi_w: far, wide_mask },
+            ))
         }
 
         pub fn anchor_window_for(&self, train: bool) -> usize {
@@ -3990,12 +4119,11 @@ mod gpu {
             let tails = self.carry.as_ref().and_then(|cs| cs.tails[layer].as_ref());
             if let Some((kc, vc, kn, vn, krot)) = tails {
                 if self.carry_active.get() {
-                    self.carry_tail_copy(cmd, k, kn, cp, kd);
-                    self.carry_tail_copy(cmd, v, vn, cp, kd);
+                    self.carry_tail_copy(cmd, k, kc, kn, cp, kd);
+                    self.carry_tail_copy(cmd, v, vc, vn, cp, kd);
                 }
                 cmd.copy(kc, 0, krot, 0, b * cp * kd);
                 cmd.rope_at(krot, 0, b * cp, cp, kvh, hd, cfg.rope_base, false, 0);
-                let _ = vc;
             }
             cmd.rope_at(q, 0, m, t, qh, hd, cfg.rope_base, false, cp);
             cmd.rope_at(k, 0, m, t, kvh, hd, cfg.rope_base, false, cp);
@@ -4036,15 +4164,19 @@ mod gpu {
                     false,
                 );
             }
+            let bands = self.anchor_bands(window);
+            let band = |which: usize, mode: u8| {
+                bands.map(|(w, c)| GemmBand { mode, ..if which == 0 { w } else { c } })
+            };
             if let Some((_, _, _, _, krot)) = tails {
                 // carried block: Q_rot·K_tail_rotᵀ·scale at column offset sp
-                cmd.gemm_ex(
+                cmd.gemm_band(
                     Op::N, Op::T, t, cp, hd, scale, q, 0, qd, krot, 0, kd, 0.0, p, sp, ld,
-                    &bt(sq, sct, spb), false,
+                    &bt(sq, sct, spb), band(1, 1).as_ref(),
                 );
             }
             // S = Q_i·K_gᵀ·scale (all heads, all sequences) at column offset sp + cp
-            cmd.gemm_ex(
+            cmd.gemm_band(
                 Op::N,
                 Op::T,
                 t,
@@ -4062,7 +4194,7 @@ mod gpu {
                 sp + cp,
                 ld,
                 &bt(sq, skv, spb),
-                false,
+                band(0, 1).as_ref(),
             );
             // diagnostics: CMF_ANCHOR_STAGE=1|2|3 stops the forward after the
             // scores / the softmax / P·V (anchor_core_probe reads the buffers)
@@ -4074,16 +4206,17 @@ mod gpu {
                 return;
             }
             // outside a carried pass (evaluation windows) the carried block is
-            // masked for every sequence
-            cmd.banded_softmax_carry(
+            // masked for every sequence; wide KV groups keep their own band
+            cmd.banded_softmax_groups(
                 p, 0, t, ld, sk, sp, window, b * qh, cp, qh,
                 self.carry.as_ref().map(|cs| if self.carry_active.get() { &cs.mask } else { &cs.mask_zero }),
+                cfg.anchor_wide_window, cfg.anchor_wide_mask(), group,
             );
             if stage == 2 {
                 return;
             }
             // O_i = P·V_g (+ P_sink·sink_v) (+ P_carried·V_tail)
-            cmd.gemm_ex(
+            cmd.gemm_band(
                 Op::N,
                 Op::N,
                 t,
@@ -4101,15 +4234,15 @@ mod gpu {
                 0,
                 qd,
                 &bt(spb, skv, sq),
-                false,
+                band(0, 2).as_ref(),
             );
             if stage == 3 {
                 return;
             }
             if let Some((_, vc, _, _, _)) = tails {
-                cmd.gemm_ex(
+                cmd.gemm_band(
                     Op::N, Op::N, t, hd, cp, 1.0, p, sp, ld, vc, 0, kd, 1.0, o, 0, qd,
-                    &bt(spb, sct, sq), false,
+                    &bt(spb, sct, sq), band(1, 2).as_ref(),
                 );
             }
             if sk > 0 {
@@ -4198,6 +4331,11 @@ mod gpu {
             let sh = [qh * t * hd, group * t * hd, t * hd]; // head-major [B][qh][T][hd]
             let ssk = [0, SINK_PAD * hd, 0];
             let sps = [qh * SINK_PAD * hd, group * SINK_PAD * hd, SINK_PAD * hd];
+            // the backward of a training pass: the window its forward drew
+            let bands = self.anchor_bands(self.anchor_window_t.get());
+            let band = |which: usize, mode: u8| {
+                bands.map(|(w, c)| GemmBand { mode, ..if which == 0 { w } else { c } })
+            };
             for &(b0, nb) in &ranges {
                 let bt = |sa: [usize; 3], sb: [usize; 3], sc: [usize; 3]| GemmBatch {
                     nb,
@@ -4213,7 +4351,7 @@ mod gpu {
                 let h_off = b0 * qh * t * hd;
                 let tail_off = b0 * cp * kd;
                 // dP_win = dO_i·V_gᵀ → dp[:, sp+cp..]
-                cmd.gemm_ex(
+                cmd.gemm_band(
                     Op::N,
                     Op::T,
                     t,
@@ -4231,13 +4369,13 @@ mod gpu {
                     p_off + sp + cp,
                     ld,
                     &bt(sq, skv, spb),
-                    false,
+                    band(0, 1).as_ref(),
                 );
                 if let Some((_, vc, _, _, _)) = tails {
                     // dP_carried = dO_i·V_tailᵀ → dp[:, sp..sp+cp]
-                    cmd.gemm_ex(
+                    cmd.gemm_band(
                         Op::N, Op::T, t, cp, hd, 1.0, &s.dbig, q_off, qd, vc, tail_off, kd, 0.0,
-                        &s.dp, p_off + sp, ld, &bt(sq, sct, spb), false,
+                        &s.dp, p_off + sp, ld, &bt(sq, sct, spb), band(1, 1).as_ref(),
                     );
                 }
                 if sk > 0 {
@@ -4286,7 +4424,7 @@ mod gpu {
                     cmd.sink_grad_accum(&s.dsv_part, &self.g, sink_v, nb, kvh, group, sk, hd, 1.0);
                 }
                 // dV_i(partial) = P_winᵀ·dO_i
-                cmd.gemm_ex(
+                cmd.gemm_band(
                     Op::T,
                     Op::N,
                     t,
@@ -4304,12 +4442,12 @@ mod gpu {
                     h_off,
                     hd,
                     &bt(spb, sq, sh),
-                    false,
+                    band(0, 3).as_ref(),
                 );
                 // dS = P⊙(dP − rowsum) over the whole [T, LD] row (P = 0 off band)
                 cmd.softmax_bwd_blocks_ld(p, p_off, &s.dp, p_off, t, ld, nb * qh);
                 // dQ_i = dS_win·K_g·scale (+ dS_carried·K_tail_rot·scale)
-                cmd.gemm_ex(
+                cmd.gemm_band(
                     Op::N,
                     Op::N,
                     t,
@@ -4327,16 +4465,16 @@ mod gpu {
                     q_off,
                     qd,
                     &bt(spb, skv, sq),
-                    false,
+                    band(0, 2).as_ref(),
                 );
                 if let Some((_, _, _, _, krot)) = tails {
-                    cmd.gemm_ex(
+                    cmd.gemm_band(
                         Op::N, Op::N, t, hd, cp, scale, &s.dp, p_off + sp, ld, krot, tail_off, kd,
-                        1.0, dq, q_off, qd, &bt(spb, sct, sq), false,
+                        1.0, dq, q_off, qd, &bt(spb, sct, sq), band(1, 2).as_ref(),
                     );
                 }
                 // dK_i(partial) = dS_winᵀ·Q_i·scale
-                cmd.gemm_ex(
+                cmd.gemm_band(
                     Op::T,
                     Op::N,
                     t,
@@ -4354,7 +4492,7 @@ mod gpu {
                     h_off,
                     hd,
                     &bt(spb, sq, sh),
-                    false,
+                    band(0, 3).as_ref(),
                 );
             }
             cmd.group_sum_heads(&s.dkh, &s.dk, b, t, qh, kvh, hd);
@@ -4626,7 +4764,7 @@ mod gpu {
                             b, t, h, cfg.conv_k,
                         );
                         if let (true, Some((_, next, k, w))) = (active, chist) {
-                            self.carry_tail_copy(cmd, x1, next, k - 1, *w);
+                            self.carry_tail_copy(cmd, x1, next, next, k - 1, *w);
                         }
                         x1c
                     } else {
@@ -4978,7 +5116,7 @@ mod gpu {
                 b, t, c_dim, GDN_CONV_K,
             );
             if let (true, Some((_, next, k, w))) = (active, chist) {
-                self.carry_tail_copy(cmd, qkv, next, k - 1, *w);
+                self.carry_tail_copy(cmd, qkv, next, next, k - 1, *w);
             }
             cmd.silu_fwd(&s.gdn_pre, qkv_cv, m * c_dim);
             let d = GdnScanDims {
@@ -4990,12 +5128,12 @@ mod gpu {
                 c_dim,
                 ab_ld: GDN_AB_PAD,
             };
-            #[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+            #[cfg(any(target_os = "macos", feature = "vulkan"))]
             let wy = self.gdn_wy.as_ref().and_then(|(_, keep)| keep[l].as_ref());
-            #[cfg(not(all(feature = "vulkan", not(target_os = "macos"))))]
+            #[cfg(not(any(target_os = "macos", feature = "vulkan")))]
             let wy: Option<&()> = None;
             match wy {
-                #[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+                #[cfg(any(target_os = "macos", feature = "vulkan"))]
                 Some(w) => crate::gdn_wy::wy_fwd(
                     cmd,
                     &d,
@@ -5117,15 +5255,15 @@ mod gpu {
                 c_dim,
                 ab_ld: GDN_AB_PAD,
             };
-            #[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+            #[cfg(any(target_os = "macos", feature = "vulkan"))]
             let wy = self
                 .gdn_wy
                 .as_ref()
                 .and_then(|(x, keep)| keep[l].as_ref().map(|w| (w, x)));
-            #[cfg(not(all(feature = "vulkan", not(target_os = "macos"))))]
+            #[cfg(not(any(target_os = "macos", feature = "vulkan")))]
             let wy: Option<&()> = None;
             match wy {
-                #[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+                #[cfg(any(target_os = "macos", feature = "vulkan"))]
                 Some((w, x)) => crate::gdn_wy::wy_bwd(
                     cmd,
                     &d,
@@ -6511,7 +6649,8 @@ mod gpu {
                         );
                     }
                 }
-                cmd.scatter_add_rows(dx, &self.head_idx, &self.dhg, rows_total, h);
+                // head_idx is a permutation of the token rows (−1 padding)
+                cmd.scatter_add_rows_unique(dx, &self.head_idx, &self.dhg, rows_total, h);
             }
         }
 
@@ -7548,6 +7687,16 @@ fn head_table_enabled() -> bool {
 /// startup, or [`ANCHOR_BWD_BATCH`] at runtime for in-process A/B). The
 /// gradients agree to ≤ 3e-7 rel (identical without sinks).
 pub static ANCHOR_BWD_BATCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Band tile skipping in the bounded anchor's GEMMs (`GemmBand`; Metal
+/// only — the WGSL GEMM computes the full tiles). Exact, on by default;
+/// `CMF_ANCHOR_BAND=0` at startup or [`ANCHOR_BAND_OFF`] for in-process A/B.
+pub static ANCHOR_BAND_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn anchor_band_on() -> bool {
+    static ENV_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let env_off = *ENV_OFF.get_or_init(|| std::env::var("CMF_ANCHOR_BAND").ok().as_deref() == Some("0"));
+    !(env_off || ANCHOR_BAND_OFF.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 fn anchor_bwd_seq() -> bool {
     static ENV_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let env_on = *ENV_ON

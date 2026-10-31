@@ -38,7 +38,9 @@ Stochastic training window (SWAX): each training step samples
 `anchor_core.window` (128). The last ~10% of a birth uses the served window.
 
 Defaults for Embryo-O1 variant A: `W = 128`, `S = 4`, `train_windows = [64, 128]`.
-Constraint: `S + W ≤ 160` (GPU scratch), enforced by the format validator.
+Constraint: `S + W ≤ 65 536` (the state a header may declare; the GPU attend walks
+the keys in 256-wide tiles with an online softmax), enforced by the format
+validator. Before 0.8.51 the ceiling was 160 (one 256-lane scratch).
 
 ## 2. Trainer (`crates/cortiq-embryo`) — what changes
 
@@ -124,3 +126,32 @@ Constraint: `S + W ≤ 160` (GPU scratch), enforced by the format validator.
   Embryo file reproduces).
 - Trainer ⇔ runtime parity on an exported tiny genome: `max|Δ logp| ≤ 5e-5`
   over 512 + 32 tokens (precedent `tests/runtime_parity.rs`).
+
+## 5. `swa_sink_v2`: a window per KV group
+
+Same operator, one exact window per KV group: `anchor_core.kind = "swa_sink_v2"`,
+`group_windows[g]` (one entry per KV head, each `1..=window`, the widest equal to
+`window`). The ring keeps `window` keys for every group (state
+`2·kvh·window·hd` f32, unchanged formula); the heads of group `g` attend to
+sinks ∪ the last `min(len, group_windows[g])` keys. A wide group is the exact
+retrieval span (passkey / copy at distance ≤ its window); the narrow groups stay
+local. No new tensors. v1 readers refuse the kind.
+
+Trainer: `EmbryoCfg.anchor_wide_window` + `anchor_wide_groups` (serde-skipped
+when unset, so v1 configs serialize byte-identically); `birth
+--anchor-wide-window W --anchor-wide-groups g,...` (also on `--resume`: no arena
+change). The band softmax takes `(wide_window, wide_mask, group)` (Metal
+`causal_softmax_rows_f32`, WGSL op 19 p[10..12]). With `--carry` the carried
+tail is the widest window rounded to 64 keys and may exceed T: the next tail is
+the newest `cp − T` rows of the current tail followed by the window, and the
+carry mask word of a sequence is the count of carried keys that belong to its
+stream (`cp` once the stream filled the tail), so a stream that restarts never
+sees the previous stream's keys.
+
+Gates (`tests/carry.rs wide_group_tail_longer_than_window_matches_one_pass`,
+`tests/runtime_parity.rs runtime_matches_wide_group_anchor_trainer_logprobs`):
+four carried windows ≡ one pass of 4T with a 100-key group over T = 64 (rel
+1.2e-7, also for a stream restarted mid-way); the exported v2 genome runs
+through the CPU runtime with the trainer's log-probs; `import-cmf` gives the
+checkpoint back exactly.
+

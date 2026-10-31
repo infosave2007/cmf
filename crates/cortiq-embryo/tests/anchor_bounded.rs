@@ -568,8 +568,10 @@ fn export_round_trip_and_legacy_bytes() {
         assert_eq!(q.dtype, dtype);
         eprintln!("bounded {dtype:?}: {} tensors, anchor_core {:?}", model.tensors.len(), ac);
     }
-    // refusals: sink + window > 160, sinks without a window, windows outside 1..=W
-    for (w, s, tw) in [(157usize, 4usize, vec![]), (0, 4, vec![]), (16, 4, vec![32]), (16, 4, vec![0])] {
+    // refusals: sink + window over the format ceiling, sinks without a
+    // window, windows outside 1..=W
+    let over = cortiq_embryo::model::MAX_SINK_PLUS_WINDOW - 3;
+    for (w, s, tw) in [(over, 4usize, vec![]), (0, 4, vec![]), (16, 4, vec![32]), (16, 4, vec![0])] {
         let mut bad = EmbryoCfg::tiny();
         bad.anchor_window = w;
         bad.anchor_sink = s;
