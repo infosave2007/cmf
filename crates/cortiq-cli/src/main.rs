@@ -23,6 +23,8 @@ mod nemotron_gptq;
 mod growth;
 mod http_range;
 mod imagepack;
+mod primalvaepack;
+mod vaecmd;
 mod knowledge;
 mod lookup;
 mod ltxcmd;
@@ -2645,6 +2647,25 @@ enum Commands {
     /// SAM2-style FPN + CLIP text tower + DETR detector (concept/point/box
     /// prompts, mask head) + the video tracker, with the vendor configs and
     /// tokenizer embedded.
+    /// Run a standalone autoencoder CMF (Primal VAE, `cortiq convert` of
+    /// ostris/primal_vae): encode an image to its latent (.npy), decode a
+    /// latent to an image, or round-trip an image and print the PSNR.
+    /// The whole forward runs on the GPU (Metal / Vulkan) when one is
+    /// available.
+    Vae {
+        /// The VAE CMF
+        #[arg(long)]
+        model: String,
+        /// encode | decode | roundtrip
+        #[arg(long, default_value = "roundtrip")]
+        mode: String,
+        /// An image (encode, roundtrip) or a [1, C, h, w] latent .npy (decode)
+        #[arg(long)]
+        input: String,
+        /// A latent .npy (encode) or a .png (decode, roundtrip)
+        #[arg(long)]
+        output: String,
+    },
     Sam3Pack {
         /// Export directory: detector.safetensors (+ tracker.safetensors),
         /// config.json, detector_config.json, processor_config.json,
@@ -3886,6 +3907,10 @@ async fn main() -> anyhow::Result<()> {
             // anonymous multi-hundred-GB streamed conversion runs into the
             // Hub's rate limit, and a token on the command line shows in ps.
             let hf_token = hf_token.or_else(convert::hf_token_from_env);
+            // A Primal VAE checkpoint packs as a standalone autoencoder.
+            if primalvaepack::is_primal_vae_source(&model) {
+                return primalvaepack::pack(&model, quant.as_deref(), &output);
+            }
             if quant
                 .as_deref()
                 .is_some_and(|q| q.eq_ignore_ascii_case("blr"))
@@ -5305,6 +5330,7 @@ async fn main() -> anyhow::Result<()> {
                 )
             }
         }
+        Commands::Vae { model, mode, input, output } => vaecmd::run(&model, &mode, &input, &output),
         Commands::Sam3Pack { src, quant, out } => sam3pack::pack(&src, &quant, &out),
         Commands::Segment {
             model,
@@ -9155,17 +9181,26 @@ async fn cmd_run(
     // LFM3-Omni (vision + speech) takes every medium through the VL path.
     let lfm3_media = lfm3_vl && (!images.is_empty() || !videos.is_empty() || (lfm3_audio && !audios.is_empty()));
     let lfm3_audio_media = lfm3_audio && !lfm3_vl && !audios.is_empty();
+    // Mage-VL (`llava_onevision2`): images through the OneVision tower.
+    let ov2_media = cortiq_engine::onevision2::has_vision(&model) && !images.is_empty();
+    // SenseNova-Loop: images through the Qwen3-VL tower, MRoPE rows.
+    let sn_media = cortiq_engine::sensenova::has_vision(&model) && !images.is_empty();
+    let ov2_media_or_sn = ov2_media || sn_media;
     // A text answer from a speech model: no speech or mixed turn.
     if lfm3_audio {
         let ids = cortiq_engine::lfm3_audio::text_only_suppress(&pipeline.tokenizer);
         pipeline.sampler_config.suppress_tokens.extend(ids);
     }
     anyhow::ensure!(is_dsv41 || reasoning_effort.is_none(), "--reasoning-effort requires DeepSeek-V4.1");
-    anyhow::ensure!(is_dsv41 || is_mimo || lfm3_media || images.is_empty(),
-        "--image requires DeepSeek-V4.1, MiMo or an LFM3-VL file");
+    anyhow::ensure!(is_dsv41 || is_mimo || lfm3_media || ov2_media_or_sn || images.is_empty(),
+        "--image requires DeepSeek-V4.1, MiMo, an LFM3-VL, Mage-VL or SenseNova-Loop file");
+    anyhow::ensure!(!ov2_media_or_sn || (!raw && state.is_none() && peer.is_none() && gpus.is_none()
+        && std::env::var_os("CMF_PROMPT_IDS").is_none()),
+        "Mage-VL images require a fresh local chat prompt (no --raw/--state/--peer/--gpus/CMF_PROMPT_IDS)");
     anyhow::ensure!(is_mimo || ((audios.is_empty() || lfm3_audio) && media_options.companion.is_none()
         && ((videos.is_empty() && media_options.video_fps.is_none() && media_options.image_max_pixels.is_none())
-            || lfm3_vl)),
+            || lfm3_vl
+            || (ov2_media_or_sn && videos.is_empty() && media_options.video_fps.is_none()))),
         "--video/--audio/--mm and MiMo processing options require MiMo (--video and its options: or LFM3-VL; --audio: or LFM3-Audio)");
     anyhow::ensure!(!lfm3_audio_media || (!raw && state.is_none() && peer.is_none() && gpus.is_none()
         && std::env::var_os("CMF_PROMPT_IDS").is_none()),
@@ -9730,9 +9765,42 @@ async fn cmd_run(
             Some(cortiq_engine::lfm3_audio::prepare(&model, &pipeline, &messages, None, thinking)
                 .map_err(anyhow::Error::msg)?)
         } else { lfm3_inputs };
+        // Mage-VL: the images, then the text, as in the model card.
+        let ov2_inputs = if ov2_media {
+            let mut content: Vec<serde_json::Value> = images.iter()
+                .map(|path| serde_json::json!({"type":"image_url", "image_url":{"url":path}}))
+                .collect();
+            content.push(serde_json::json!({"type":"text", "text":p}));
+            let mut messages: Vec<serde_json::Value> = system
+                .map(|s| serde_json::json!({"role":"system", "content":s}))
+                .into_iter()
+                .collect();
+            messages.push(serde_json::json!({"role":"user", "content":content}));
+            Some(cortiq_engine::onevision2::prepare(&model, &pipeline, &messages, None, thinking,
+                media_options.image_max_pixels)
+                .map_err(anyhow::Error::msg)?)
+        } else { None };
+        let sn_inputs = if sn_media {
+            let mut content: Vec<serde_json::Value> = images.iter()
+                .map(|path| serde_json::json!({"type":"image_url", "image_url":{"url":path}}))
+                .collect();
+            content.push(serde_json::json!({"type":"text", "text":p}));
+            let mut messages: Vec<serde_json::Value> = system
+                .map(|s| serde_json::json!({"role":"system", "content":s}))
+                .into_iter()
+                .collect();
+            messages.push(serde_json::json!({"role":"user", "content":content}));
+            let prepared = cortiq_engine::sensenova::prepare(&model, &pipeline, &messages, None, thinking,
+                media_options.image_max_pixels)
+                .map_err(anyhow::Error::msg)?;
+            pipeline.prompt_mrope = prepared.mrope.clone();
+            Some(prepared)
+        } else { None };
         let mut ids = vl_inputs
             .as_ref()
             .map(|inputs| inputs.token_ids.clone())
+            .or_else(|| ov2_inputs.as_ref().map(|inputs| inputs.token_ids.clone()))
+            .or_else(|| sn_inputs.as_ref().map(|inputs| inputs.token_ids.clone()))
             .or_else(|| mimo_inputs.as_ref().map(|inputs| inputs.token_ids.clone()))
             .or_else(|| lfm3_inputs.as_ref().map(|inputs| inputs.token_ids.clone()))
             .unwrap_or_else(|| build_ids(&pipeline, &history, p));
@@ -9770,7 +9838,9 @@ async fn cmd_run(
             eprintln!("head {}\ntail {}", head.join(" "), tail.join(" "));
         }
         let media_rows = mimo_inputs.as_ref().and_then(|p| p.rows.as_deref())
-            .or_else(|| lfm3_inputs.as_ref().and_then(|p| p.rows.as_deref()));
+            .or_else(|| lfm3_inputs.as_ref().and_then(|p| p.rows.as_deref()))
+            .or_else(|| ov2_inputs.as_ref().and_then(|p| p.rows.as_deref()))
+            .or_else(|| sn_inputs.as_ref().and_then(|p| p.rows.as_deref()));
         // LFM3-Audio speech answer: the assistant turn opens with
         // <|audio_start|>, frames until the end-of-audio frame, the codec.
         if let Some((path, speech_mode)) = speech_out {

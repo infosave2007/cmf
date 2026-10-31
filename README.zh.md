@@ -104,6 +104,24 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## SenseNova-Loop、Mage-VL-Cowork 与 Primal VAE（0.8.51）
+
+[SenseNova-Loop-9B-Preview](https://huggingface.co/infosave/SenseNova-Loop-9B-Preview-cmf)
+以共享权重把 24 层解码器块执行两次，循环段内使用两条 mHC 残差流；
+[Mage-VL-Cowork](https://huggingface.co/infosave/Mage-VL-Cowork-cmf) 是 Microsoft 的 40 亿参数
+电脑操作智能体，按原生分辨率读取截图；[Primal VAE](https://huggingface.co/infosave/primal_vae-cmf)
+是 Ostris 的 1–2 通道 2× 图像自编码器：
+
+```sh
+cortiq run sensenova-loop-9b-q4tp.cmf --image photo.jpg --prompt "描述这张图片。" --no-think
+cortiq run mage-vl-cowork-q8_2f.cmf --image screen.png --prompt "Task: open the Downloads folder."
+cortiq vae --model primal_vae_2x2.cmf --mode roundtrip --input photo.png --output recon.png
+```
+
+贪心文本与视觉特征与 Transformers float32 一致。两个视觉编码器都在 GPU 上运行
+（Vulkan 与 Metal），循环与 mHC 在 wgpu 和 Metal 的 token 图内执行；VAE 一次 GPU 提交即可
+完成 1024×1024 的编码或解码（NVIDIA A40 上 0.40 / 0.29 s）。
+
 ## LFM3 语音、Omni 与 d1（0.8.50）
 
 [LFM3-Audio-2B](https://huggingface.co/infosave/LFM3-Audio-2B-cmf) 支持语音识别与

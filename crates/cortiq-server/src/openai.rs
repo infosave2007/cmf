@@ -553,6 +553,8 @@ async fn run_generation(
     prompt_ids: Vec<u32>,
     vl_inputs: Option<dsv41_vision::PreparedVlInputs>,
     mimo_rows: Option<Vec<f32>>,
+    // SenseNova-Loop image prompt: the rows' MRoPE positions.
+    mrope: Option<Vec<[i64; 3]>>,
     max_tokens: usize,
     mask: Option<TaskMask>,
     sampler_config: SamplerConfig,
@@ -651,7 +653,10 @@ async fn run_generation(
             None => match vl_inputs.as_ref() {
                 Some(inputs) => p.generate_from_vl(inputs, max_tokens, mask.as_ref(), on_token),
                 None => match mimo_rows.as_deref() {
-                    Some(rows) => p.generate_from_embeds(&prompt_ids, rows, max_tokens, mask.as_ref(), on_token),
+                    Some(rows) => {
+                        p.prompt_mrope = mrope.clone();
+                        p.generate_from_embeds(&prompt_ids, rows, max_tokens, mask.as_ref(), on_token)
+                    }
                     None => p.generate_from_ids(&prompt_ids, max_tokens, mask.as_ref(), on_token),
                 },
             },
@@ -1299,6 +1304,7 @@ async fn chat_completions(
     }
 
     let mut mimo_rows = None;
+    let mut sn_mrope: Option<Vec<[i64; 3]>> = None;
     // MiniMax's native template deliberately has adaptive thinking and only
     // consumes the explicit `reasoning_effort` variable.  Do not smuggle the
     // server's generic `thinking=false` -> `reasoning_effort=low` convention
@@ -1309,6 +1315,28 @@ async fn chat_completions(
     let lfm3_vl_messages = if cortiq_engine::lfm3_vl::has_vision(state.runtime.model()) {
         let messages: Vec<_> = req.messages.iter().map(message_to_json).collect();
         match cortiq_engine::lfm3_vl::has_media(&messages) {
+            Ok(true) => Some(messages),
+            Ok(false) => None,
+            Err(e) => return error_response(StatusCode::BAD_REQUEST, e),
+        }
+    } else {
+        None
+    };
+    // A SenseNova-Loop file with image parts in the request.
+    let sn_messages = if cortiq_engine::sensenova::has_vision(state.runtime.model()) {
+        let messages: Vec<_> = req.messages.iter().map(message_to_json).collect();
+        match cortiq_engine::sensenova::has_media(&messages) {
+            Ok(true) => Some(messages),
+            Ok(false) => None,
+            Err(e) => return error_response(StatusCode::BAD_REQUEST, e),
+        }
+    } else {
+        None
+    };
+    // A Mage-VL file with image parts in the request.
+    let ov2_messages = if cortiq_engine::onevision2::has_vision(state.runtime.model()) {
+        let messages: Vec<_> = req.messages.iter().map(message_to_json).collect();
+        match cortiq_engine::onevision2::has_media(&messages) {
             Ok(true) => Some(messages),
             Ok(false) => None,
             Err(e) => return error_response(StatusCode::BAD_REQUEST, e),
@@ -1406,6 +1434,54 @@ async fn chat_completions(
             Err(e) => {
                 tracing::error!("LFM3-VL image preparation failed: {e}");
                 return error_response(StatusCode::INTERNAL_SERVER_ERROR, "LFM3-VL image preparation failed");
+            }
+        };
+        mimo_rows = prepared.rows;
+        (prepared.token_ids, None)
+    } else if let Some(messages) = sn_messages {
+        // SenseNova-Loop with images: the tower runs before the stream
+        // opens, so a bad image is an HTTP 400.
+        if state.remote.is_some() || req.cortiq.as_ref().is_some_and(|c| c.class_tokens.is_some()) {
+            return error_response(StatusCode::BAD_REQUEST, "SenseNova-Loop images cannot use a network split or cortiq.class_tokens");
+        }
+        let slot = state.slots.acquire().await;
+        let tools = req.effective_tools().map(|t| t.to_vec());
+        let thinking = template_thinking;
+        let prepared = tokio::task::spawn_blocking(move || {
+            cortiq_engine::gpu::set_current_device(slot.device);
+            cortiq_engine::sensenova::prepare_for_pipeline(&slot.pipe, &messages, tools.as_deref(), thinking, None)
+        }).await;
+        let prepared = match prepared {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => return error_response(StatusCode::BAD_REQUEST, e),
+            Err(e) => {
+                tracing::error!("SenseNova-Loop image preparation failed: {e}");
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "SenseNova-Loop image preparation failed");
+            }
+        };
+        mimo_rows = prepared.rows;
+        sn_mrope = prepared.mrope;
+        (prepared.token_ids, None)
+    } else if let Some(messages) = ov2_messages {
+        // Mage-VL with images: the tower runs before the stream opens, so a
+        // bad image is an HTTP 400. Text-only requests take the path below.
+        if state.remote.is_some() || req.cortiq.as_ref().is_some_and(|c| c.class_tokens.is_some()) {
+            return error_response(StatusCode::BAD_REQUEST, "Mage-VL images cannot use a network split or cortiq.class_tokens");
+        }
+        let slot = state.slots.acquire().await;
+        let tools = req.effective_tools().map(|t| t.to_vec());
+        let thinking = template_thinking;
+        let prepared = tokio::task::spawn_blocking(move || {
+            cortiq_engine::gpu::set_current_device(slot.device);
+            cortiq_engine::onevision2::prepare_for_pipeline(&slot.pipe, &messages,
+                tools.as_deref(), thinking, None)
+        }).await;
+        let prepared = match prepared {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => return error_response(StatusCode::BAD_REQUEST, e),
+            Err(e) => {
+                tracing::error!("Mage-VL image preparation failed: {e}");
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "Mage-VL image preparation failed");
             }
         };
         mimo_rows = prepared.rows;
@@ -1812,6 +1888,7 @@ async fn chat_completions(
                 prompt_ids,
                 vl_inputs,
                 mimo_rows,
+                sn_mrope,
                 max_tokens,
                 request_mask,
                 sampler_config,
@@ -1984,6 +2061,7 @@ async fn chat_completions(
             prompt_ids,
             vl_inputs,
             mimo_rows,
+            sn_mrope,
             max_tokens,
             request_mask,
             sampler_config,
@@ -2339,6 +2417,7 @@ async fn completions(
     let (result, elapsed_ms, decision) = match run_generation(
         state.clone(),
         prompt_ids,
+        None,
         None,
         None,
         effective_max_tokens(&state, req.max_completion_tokens.or(req.max_tokens)) as usize,

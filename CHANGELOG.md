@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.51] — 2026-10-31
+
+### Added
+- SenseNova-Loop-9B-Preview (`sensenova_loop`, `sensenova.rs`): the loop plan
+  from the release config (layers 4–27 run twice, each pass with its own KV
+  and GDN state, 56 layer executions from 32 layers), mHC with two residual
+  streams inside the loop (sigmoid pre/post gates, a 20-step log-space
+  Sinkhorn mix, float32 routers), interleaved MRoPE for image positions and
+  the Qwen3-VL-style vision tower (`qwen3vis`, 5-D patch embedding). mHC runs
+  in the wgpu token and batch graphs (`gpu_wgpu/mhc.rs`) and in the Metal
+  token graph (`gpu_metal/mhc.rs`); MRoPE angle tables ride the wgpu batch
+  graph. Greedy text and an image description match Transformers float32
+  (q8_2f).
+- Mage-VL-Cowork (`llava_onevision2`, `onevision2.rs`): the OneVision vision
+  encoder (3-axis RoPE, LayerNorm with bias, exact GELU, the patch merger)
+  over Qwen2-VL-processed screenshots, on Qwen3-4B. The encoder runs resident
+  on wgpu (`gpu_wgpu/vit.rs`: LayerNorm, GEMMs, RoPE and attention in one
+  submission per image) and on Metal through `gpu::vision_gemm_nt`; tower rows
+  match Transformers float32 (cosine 1.000000 on the CPU). `cortiq run
+  --image` and `/v1/chat/completions` image parts for both models.
+- Primal VAE (`primal_vae.rs`, `cortiq vae --mode encode|decode|roundtrip`):
+  the conv U-Net from its tensor shapes, executed as one device plan on wgpu
+  and Metal (`gpu_wgpu/primal_vae.rs`, `gpu_metal/primal_vae.rs`) or on the
+  host; `cortiq convert` packs the checkpoint (`primalvaepack.rs`). PSNR equals
+  the PyTorch float32 reference; 1024×1024 encode / decode 0.40 / 0.29 s on an
+  NVIDIA A40, 1.27 / 1.23 s on an Apple M4.
+- Batched q8_2f GEMM in the wgpu batch graph (`q8_2f_mm_r2`) for mHC and
+  embedded-prompt prefills.
+
 ## [0.8.50] — 2026-10-31
 
 ### Added

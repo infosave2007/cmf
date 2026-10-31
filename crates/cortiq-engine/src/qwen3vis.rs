@@ -79,6 +79,10 @@ pub struct VisionTower {
     pub patch_size: usize,
     pub temporal_patch: usize,
     pub merge: usize,
+    /// GEMMs on the device (`gpu::vision_gemm_nt`, f32 matrices) and the
+    /// attention on `gpu::dit_attention` — SenseNova-Loop's tower
+    /// ([`VisionTower::from_cmf_device`]); MiniMax-H3 keeps the host path.
+    device: bool,
 }
 
 fn layer_norm(x: &[f32], w: &[f32], b: &[f32], dst: &mut [f32]) {
@@ -255,7 +259,15 @@ impl VisionTower {
             .collect::<Result<Vec<_>, _>>()?;
         let hidden = u("hidden_size", 1152);
         Ok(Self {
-            patch: Proj::from_model(model, "vis.patch_embed.weight")?,
+            // The conv kernel may be stored as its source 5-D
+            // `[hidden, in, t, p, p]`: a linear over the flattened patch.
+            patch: match Proj::from_model(model, "vis.patch_embed.weight") {
+                Ok(p) => p,
+                Err(_) => Proj::f32(f("vis.patch_embed.weight")?, {
+                    let t = model.tensor("vis.patch_embed.weight").ok_or("vis.patch_embed.weight")?;
+                    t.shape.iter().skip(1).product()
+                }),
+            },
             patch_b: f("vis.patch_embed.bias")?,
             pos: f("vis.pos_embed.weight")?,
             blocks,
@@ -270,7 +282,44 @@ impl VisionTower {
             patch_size: u("patch_size", 16),
             temporal_patch: u("temporal_patch_size", 2),
             merge: u("spatial_merge_size", 2),
+            device: false,
         })
+    }
+
+    /// The tower with f32 matrices for the device GEMM and the device
+    /// attention (each falls back to the host when refused).
+    pub fn from_cmf_device(model: &Arc<CmfModel>) -> Result<Self, String> {
+        let mut t = Self::from_cmf(model)?;
+        let f32p = |name: &str, p: &Proj| -> Result<Proj, String> {
+            Ok(match p {
+                Proj::F32 { .. } => Proj::f32(crate::dit::cmf_f32(model, name)?, p.cols()),
+                Proj::Q(_) => Proj::f32(crate::dit::cmf_f32(model, name)?, p.cols()),
+            })
+        };
+        t.patch = f32p("vis.patch_embed.weight", &t.patch)?;
+        for (i, b) in t.blocks.iter_mut().enumerate() {
+            let p = format!("vis.blocks.{i}");
+            b.qkv = f32p(&format!("{p}.attn.qkv.weight"), &b.qkv)?;
+            b.proj = f32p(&format!("{p}.attn.proj.weight"), &b.proj)?;
+            b.fc1 = f32p(&format!("{p}.mlp.linear_fc1.weight"), &b.fc1)?;
+            b.fc2 = f32p(&format!("{p}.mlp.linear_fc2.weight"), &b.fc2)?;
+        }
+        t.merger.fc1 = f32p("vis.merger.linear_fc1.weight", &t.merger.fc1)?;
+        t.merger.fc2 = f32p("vis.merger.linear_fc2.weight", &t.merger.fc2)?;
+        t.device = true;
+        Ok(t)
+    }
+
+    /// `y = x · Wᵀ` on the device GEMM when this tower runs there.
+    fn mm(&self, p: &Proj, x: &[f32], n: usize, out: &mut [f32], pool: Option<&Pool>) {
+        if self.device && crate::gpu::enabled_here() {
+            if let Proj::F32 { w, rows, cols } = p {
+                if crate::gpu::vision_gemm_nt(x, w, out, n, *cols, *rows) {
+                    return;
+                }
+            }
+        }
+        p.matmat(x, n, out, pool);
     }
 
     /// Bilinear read of the 48×48 grid at `h`×`w`, then reordered into
@@ -361,6 +410,46 @@ impl VisionTower {
         let half = hd / 2;
         let scale = 1.0 / (hd as f32).sqrt();
         let pool = self.pool.as_deref();
+        if self.device && n >= 64 && crate::gpu::enabled_here() {
+            // Head-major planes, q and k rotated (unscaled), for the device:
+            // one sin/cos per (patch, angle), the heads across the pool.
+            let mut cs = vec![(0f32, 0f32); n * half];
+            for (i, a) in angles[..n * half].iter().enumerate() {
+                cs[i] = a.sin_cos();
+            }
+            let (mut qa, mut ka, mut va) = (vec![0f32; nh * n * hd], vec![0f32; nh * n * hd], vec![0f32; nh * n * hd]);
+            let (qp, kp, vp) = (SendPtr(qa.as_mut_ptr()), SendPtr(ka.as_mut_ptr()), SendPtr(va.as_mut_ptr()));
+            let fill = |lo: usize, hi: usize| {
+                for h in lo..hi {
+                    // SAFETY: each worker owns whole head planes.
+                    let (q, k, v) = unsafe { (qp.row(h * n * hd, n * hd), kp.row(h * n * hd, n * hd), vp.row(h * n * hd, n * hd)) };
+                    for p in 0..n {
+                        let base = p * 3 * inner;
+                        let (qs, ks, vs) = (
+                            &qkv[base + h * hd..base + (h + 1) * hd],
+                            &qkv[base + inner + h * hd..base + inner + (h + 1) * hd],
+                            &qkv[base + 2 * inner + h * hd..base + 2 * inner + (h + 1) * hd],
+                        );
+                        let o = p * hd;
+                        for j in 0..half {
+                            let (s, c) = cs[p * half + j];
+                            q[o + j] = qs[j] * c - qs[j + half] * s;
+                            q[o + j + half] = qs[j] * s + qs[j + half] * c;
+                            k[o + j] = ks[j] * c - ks[j + half] * s;
+                            k[o + j + half] = ks[j] * s + ks[j + half] * c;
+                        }
+                        v[o..o + hd].copy_from_slice(vs);
+                    }
+                }
+            };
+            match pool {
+                Some(p) => p.run_rows(nh, &fill),
+                None => fill(0, nh),
+            }
+            if crate::gpu::dit_attention(&qa, &ka, &va, nh, nh, n, hd, scale, out) {
+                return;
+            }
+        }
         let mut qh = vec![0f32; n * hd];
         let mut kh = vec![0f32; n * hd];
         let mut vt = vec![0f32; hd * n];
@@ -416,12 +505,16 @@ impl VisionTower {
         let n = h * w;
         let hd = self.hidden;
         let pool = self.pool.as_deref();
+        let prof = std::env::var_os("CMF_SN_PROF").is_some();
+        let t0 = std::time::Instant::now();
         let mut x = vec![0f32; n * hd];
-        self.patch.matmat(patches, n, &mut x, pool);
+        self.mm(&self.patch, patches, n, &mut x, pool);
         let pos = self.positions(h, w);
-        for (i, v) in x.iter_mut().enumerate() {
-            *v += self.patch_b[i % hd] + pos[i];
-        }
+        par_rows(&mut x, hd, pool, |p, row| {
+            for (i, v) in row.iter_mut().enumerate() {
+                *v += self.patch_b[i] + pos[p * hd + i];
+            }
+        });
         let angles = self.rope_angles(h, w);
 
         let inner = self.heads * self.head_dim;
@@ -433,44 +526,148 @@ impl VisionTower {
         let mut ff = vec![0f32; n * inter];
         let merge_dim = hd * self.merge * self.merge;
         let mut deep = Vec::new();
-        for (li, blk) in self.blocks.iter().enumerate() {
-            for (o, s) in xn.chunks_exact_mut(hd).zip(x.chunks_exact(hd)) {
-                layer_norm(s, &blk.n1_w, &blk.n1_b, o);
+        let (mut t_mm, mut t_att) = (0f64, 0f64);
+        // The device tower: the whole encoder stack resident when the
+        // backend takes it (f32 matrices, no deepstack taps).
+        let resident = self.device && self.deepstack_at.is_empty() && crate::gpu::enabled_here() && {
+            let f32w = |p: &'_ Proj| -> Option<*const Vec<f32>> {
+                match p {
+                    Proj::F32 { w, .. } => Some(w as *const Vec<f32>),
+                    Proj::Q(_) => None,
+                }
+            };
+            let half = self.head_dim / 2;
+            let mut cos = vec![0f32; n * self.head_dim];
+            let mut sin = vec![0f32; n * self.head_dim];
+            for p in 0..n {
+                for j in 0..self.head_dim {
+                    let (s, c) = angles[p * half + j % half].sin_cos();
+                    cos[p * self.head_dim + j] = c;
+                    sin[p * self.head_dim + j] = s;
+                }
             }
-            blk.qkv.matmat(&xn, n, &mut qkv, pool);
-            for r in qkv.chunks_exact_mut(3 * inner) {
+            let layers: Option<Vec<crate::gpu::VitLayer>> = self
+                .blocks
+                .iter()
+                .map(|b| {
+                    // SAFETY: the pointers come from `b`, alive for this call.
+                    let (q, pr, f1, f2) = unsafe {
+                        (&*f32w(&b.qkv)?, &*f32w(&b.proj)?, &*f32w(&b.fc1)?, &*f32w(&b.fc2)?)
+                    };
+                    Some(crate::gpu::VitLayer {
+                        ln1_w: &b.n1_w,
+                        ln1_b: &b.n1_b,
+                        qkv: q,
+                        qkv_b: &b.qkv_b,
+                        proj: pr,
+                        proj_b: &b.proj_b,
+                        ln2_w: &b.n2_w,
+                        ln2_b: &b.n2_b,
+                        fc1: f1,
+                        fc1_b: &b.fc1_b,
+                        fc2: f2,
+                        fc2_b: &b.fc2_b,
+                    })
+                })
+                .collect();
+            match layers {
+                Some(layers) => {
+                    let args = crate::gpu::VitArgs {
+                        key: self as *const Self as u64,
+                        layers,
+                        n,
+                        d: hd,
+                        heads: self.heads,
+                        head_dim: self.head_dim,
+                        inter,
+                        eps: EPS,
+                        gelu_tanh: true,
+                        rope_halves: true,
+                        cos: &cos,
+                        sin: &sin,
+                        prof,
+                    };
+                    crate::gpu::vit_encode(&args, &mut x)
+                }
+                None => false,
+            }
+        };
+        for (li, blk) in self.blocks.iter().enumerate().filter(|_| !resident) {
+            norm_rows(&x, &blk.n1_w, &blk.n1_b, &mut xn, hd, pool);
+            let tm = std::time::Instant::now();
+            self.mm(&blk.qkv, &xn, n, &mut qkv, pool);
+            t_mm += tm.elapsed().as_secs_f64();
+            par_rows(&mut qkv, 3 * inner, pool, |_, r| {
                 for (v, &b) in r.iter_mut().zip(&blk.qkv_b) {
                     *v += b;
                 }
-            }
+            });
+            let ta = std::time::Instant::now();
             self.attention(&qkv, n, &angles, &mut attn);
-            blk.proj.matmat(&attn, n, &mut proj, pool);
-            for (p, r) in proj.chunks_exact(hd).enumerate() {
-                for (i, &v) in r.iter().enumerate() {
-                    x[p * hd + i] += v + blk.proj_b[i];
-                }
-            }
-            for (o, s) in xn.chunks_exact_mut(hd).zip(x.chunks_exact(hd)) {
-                layer_norm(s, &blk.n2_w, &blk.n2_b, o);
-            }
-            blk.fc1.matmat(&xn, n, &mut ff, pool);
-            for r in ff.chunks_exact_mut(inter) {
+            t_att += ta.elapsed().as_secs_f64();
+            let tm = std::time::Instant::now();
+            self.mm(&blk.proj, &attn, n, &mut proj, pool);
+            t_mm += tm.elapsed().as_secs_f64();
+            add_rows(&mut x, &proj, &blk.proj_b, hd, pool);
+            norm_rows(&x, &blk.n2_w, &blk.n2_b, &mut xn, hd, pool);
+            let tm = std::time::Instant::now();
+            self.mm(&blk.fc1, &xn, n, &mut ff, pool);
+            t_mm += tm.elapsed().as_secs_f64();
+            par_rows(&mut ff, inter, pool, |_, r| {
                 for (v, &b) in r.iter_mut().zip(&blk.fc1_b) {
                     *v = gelu_tanh(*v + b);
                 }
-            }
-            blk.fc2.matmat(&ff, n, &mut proj, pool);
-            for (p, r) in proj.chunks_exact(hd).enumerate() {
-                for (i, &v) in r.iter().enumerate() {
-                    x[p * hd + i] += v + blk.fc2_b[i];
-                }
-            }
+            });
+            let tm = std::time::Instant::now();
+            self.mm(&blk.fc2, &ff, n, &mut proj, pool);
+            t_mm += tm.elapsed().as_secs_f64();
+            add_rows(&mut x, &proj, &blk.fc2_b, hd, pool);
             if let Some(k) = self.deepstack_at.iter().position(|&d| d == li) {
                 deep.push(self.deepstack[k].apply(&x, n, hd, merge_dim, pool));
             }
         }
-        (self.merger.apply(&x, n, hd, merge_dim, pool), deep)
+        let out = self.merger.apply(&x, n, hd, merge_dim, pool);
+        if prof {
+            eprintln!(
+                "qwen3vis: {n} patches, tower {:.3} s (gemm {:.3} s, attention {:.3} s)",
+                t0.elapsed().as_secs_f64(),
+                t_mm,
+                t_att
+            );
+        }
+        (out, deep)
     }
+
+}
+
+/// `f(row_index, row)` over the `width`-wide rows of `x`, across the pool.
+fn par_rows(x: &mut [f32], width: usize, pool: Option<&Pool>, f: impl Fn(usize, &mut [f32]) + Sync) {
+    let rows = x.len() / width;
+    let sp = SendPtr(x.as_mut_ptr());
+    let run = |lo: usize, hi: usize| {
+        for r in lo..hi {
+            // SAFETY: workers own disjoint rows.
+            f(r, unsafe { sp.row(r * width, width) });
+        }
+    };
+    match pool {
+        Some(p) => p.run_rows(rows, &run),
+        None => run(0, rows),
+    }
+}
+
+/// LayerNorm of every `width`-wide row of `x` into `out`.
+fn norm_rows(x: &[f32], w: &[f32], b: &[f32], out: &mut [f32], width: usize, pool: Option<&Pool>) {
+    par_rows(out, width, pool, |r, o| layer_norm(&x[r * width..(r + 1) * width], w, b, o));
+}
+
+/// `x += y + bias` row by row.
+fn add_rows(x: &mut [f32], y: &[f32], bias: &[f32], width: usize, pool: Option<&Pool>) {
+    par_rows(x, width, pool, |r, row| {
+        for (i, v) in row.iter_mut().enumerate() {
+            *v += y[r * width + i] + bias[i];
+        }
+    });
 }
 
 /// An RGB image in [0, 1], `[3, h, w]` → the flattened patches the tower

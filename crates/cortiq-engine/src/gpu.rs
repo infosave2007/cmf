@@ -1143,6 +1143,17 @@ enum Backend {
     Wgpu,
 }
 
+/// The selected backend's name for reports: "metal", "wgpu" or "cpu".
+pub fn backend_name() -> String {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => "metal".into(),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => "wgpu".into(),
+        Backend::None => "cpu".into(),
+    }
+}
+
 fn backend() -> Backend {
     #[cfg(feature = "gpu")]
     if crate::gpu_wgpu::selected() {
@@ -1800,7 +1811,27 @@ impl GraphAct {
 }
 
 /// Per-layer weights for the whole-token wgpu graph.
+/// SenseNova-Loop mHC of one graph layer (two streams, `sensenova::Mhc`):
+/// the attention and FFN routers (`[8, 2·hidden]` f32 and their biases),
+/// whether this layer opens the range (copies the hidden into both
+/// streams) or closes it (hands the streams' mean on), the Sinkhorn
+/// iterations and the branch scale.
+#[derive(Clone, Copy)]
+pub struct GraphMhc<'a> {
+    pub attn_w: &'a [f32],
+    pub attn_b: &'a [f32],
+    pub ffn_w: &'a [f32],
+    pub ffn_b: &'a [f32],
+    pub enter: bool,
+    pub leave: bool,
+    pub iters: usize,
+    pub pre_scale: f32,
+}
+
 pub struct GraphLayer<'a> {
+    /// SenseNova-Loop mHC streams around both sub-layers (None: plain
+    /// residual).
+    pub mhc: Option<GraphMhc<'a>>,
     pub input_norm: &'a [f32],
     pub attn: GraphAttn<'a>,
     pub post_norm: &'a [f32],
@@ -3710,6 +3741,98 @@ pub fn gemm_nt_f32_transient(
     match backend() {
         #[cfg(all(feature = "gpu", not(target_os = "macos")))]
         Backend::Wgpu => crate::gpu_wgpu::gemm_nt_f32_transient(x, w, y, n, k, m),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// One pre-norm ViT block's f32 weights for [`vit_encode`]: LayerNorm 1,
+/// fused qkv `[3d, d]`, proj `[d, d]`, LayerNorm 2, fc1 `[inter, d]`, fc2
+/// `[d, inter]`, each with its bias.
+pub struct VitLayer<'a> {
+    pub ln1_w: &'a [f32],
+    pub ln1_b: &'a [f32],
+    pub qkv: &'a [f32],
+    pub qkv_b: &'a [f32],
+    pub proj: &'a [f32],
+    pub proj_b: &'a [f32],
+    pub ln2_w: &'a [f32],
+    pub ln2_b: &'a [f32],
+    pub fc1: &'a [f32],
+    pub fc1_b: &'a [f32],
+    pub fc2: &'a [f32],
+    pub fc2_b: &'a [f32],
+}
+
+/// A vision tower's encoder stack for [`vit_encode`]. `cos`/`sin` are
+/// `[n, head_dim]` per lane; `rope_halves` pairs lane j with j ± hd/2
+/// (Qwen-VL), else with its neighbour (OneVision's interleaved form).
+/// `key` identifies the tower for the device weight cache.
+pub struct VitArgs<'a> {
+    pub key: u64,
+    pub layers: Vec<VitLayer<'a>>,
+    pub n: usize,
+    pub d: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub inter: usize,
+    pub eps: f64,
+    pub gelu_tanh: bool,
+    pub rope_halves: bool,
+    pub cos: &'a [f32],
+    pub sin: &'a [f32],
+    pub prof: bool,
+}
+
+/// The encoder layers of a vision tower resident on the device, `x`
+/// (`[n, d]`) in place. `false` = refused; the caller runs its per-op
+/// path. wgpu only for now; `CMF_VIT_RESIDENT=0` declines.
+#[allow(unused_variables)]
+pub fn vit_encode(a: &VitArgs, x: &mut [f32]) -> bool {
+    if std::env::var("CMF_VIT_RESIDENT").as_deref() == Ok("0") {
+        return false;
+    }
+    match backend() {
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::vit::encode(a, x),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// A Primal VAE encode or decode (`primal_vae::PvPlan`) resident on the
+/// device: one upload, one command buffer, one readback. `false` =
+/// refused; the caller runs the host steps.
+pub fn primal_vae_run(
+    key: u64,
+    weights: &crate::primal_vae::PvWeights,
+    plan: &crate::primal_vae::PvPlan,
+    input: &[f32],
+    out: &mut [f32],
+) -> bool {
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::primal_vae::run(key, weights, plan, input, out),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::primal_vae::run(key, weights, plan, input, out),
+        #[allow(unreachable_patterns)]
+        _ => false,
+    }
+}
+
+/// A vision tower's f32 NT GEMM, `y[n×m] = x[n×k] · wᵀ[m×k]`, on the
+/// device: the encoders' f32 `eg_mm_nt` on Metal (Accelerate's sum order),
+/// `gemm_nt_f32` on wgpu. `false` = refused (no device, a small job), the
+/// caller runs the host GEMM.
+pub fn vision_gemm_nt(x: &[f32], w: &[f32], y: &mut [f32], n: usize, k: usize, m: usize) -> bool {
+    if n * k * m < (1 << 22) {
+        return false;
+    }
+    match backend() {
+        #[cfg(target_os = "macos")]
+        Backend::Metal => crate::gpu_metal::egemma2::gemm_nt(x, w, y, n, k, m),
+        #[cfg(feature = "gpu")]
+        Backend::Wgpu => crate::gpu_wgpu::gemm_nt_f32(x, w, y, n, k, m),
         #[allow(unreachable_patterns)]
         _ => false,
     }

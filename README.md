@@ -114,6 +114,26 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## SenseNova-Loop, Mage-VL-Cowork and Primal VAE (0.8.51)
+
+[SenseNova-Loop-9B-Preview](https://huggingface.co/infosave/SenseNova-Loop-9B-Preview-cmf)
+runs a block of 24 decoder layers twice with shared weights and two mHC residual
+streams inside the loop; [Mage-VL-Cowork](https://huggingface.co/infosave/Mage-VL-Cowork-cmf)
+is Microsoft's 4B computer-use agent over native-resolution screenshots;
+[Primal VAE](https://huggingface.co/infosave/primal_vae-cmf) is Ostris's
+1–2-channel 2× image autoencoder:
+
+```sh
+cortiq run sensenova-loop-9b-q4tp.cmf --image photo.jpg --prompt "Describe this image." --no-think
+cortiq run mage-vl-cowork-q8_2f.cmf --image screen.png --prompt "Task: open the Downloads folder."
+cortiq vae --model primal_vae_2x2.cmf --mode roundtrip --input photo.png --output recon.png
+```
+
+Greedy text and the vision rows match Transformers float32. Both vision towers
+run on the GPU (Vulkan and Metal); the loop and mHC run inside the wgpu and
+Metal token graphs; the VAE encodes or decodes a 1024×1024 image in one GPU
+submission (0.40 / 0.29 s on an NVIDIA A40).
+
 ## Liquid AI LFM3 speech, Omni and d1 (0.8.50)
 
 [LFM3-Audio-2B](https://huggingface.co/infosave/LFM3-Audio-2B-cmf) transcribes

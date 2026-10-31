@@ -2042,7 +2042,14 @@ impl Pipeline {
         let max_seq_len = arch.max_position_embeddings.min(cap);
 
         // Looped Transformer: total virtual layers = physical × num_loops.
-        let total_layers = arch.num_layers * arch.num_loops;
+        // SenseNova-Loop: [0, s) + [s, e) × count + [e, n), one virtual
+        // layer (and cache) per visit.
+        let sensenova = crate::sensenova::settings(model).map_err(CmfError::Parse)?;
+        let layer_map = sensenova
+            .map(|(span, _)| crate::sensenova::execution_plan(arch.num_layers, span));
+        let total_layers = layer_map
+            .as_ref()
+            .map_or(arch.num_layers * arch.num_loops, Vec::len);
 
         let mut pipeline = Pipeline::new(
             tokenizer,
@@ -2067,6 +2074,26 @@ impl Pipeline {
             max_seq_len,
             sampler_config,
         );
+        if let Some((_, mhc)) = sensenova {
+            pipeline.layer_map = layer_map;
+            if let Some(ms) = mhc {
+                pipeline.mhc = Some(Box::new(
+                    crate::sensenova::Mhc::from_model(model, ms, arch.num_layers, arch.hidden_size)
+                        .map_err(CmfError::Parse)?,
+                ));
+            }
+            pipeline.mrope_sections = model
+                .header
+                .provenance
+                .as_ref()
+                .and_then(|p| p.pointer("/sensenova_loop/config/text_config/rope_parameters/mrope_section"))
+                .and_then(|v| v.as_array())
+                .filter(|a| a.len() == 3)
+                .map(|a| {
+                    let g = |i: usize| a[i].as_u64().unwrap_or(0) as usize;
+                    [g(0), g(1), g(2)]
+                });
+        }
         let rotary = ((arch.head_dim as f32 * arch.partial_rotary_factor) as usize).max(2);
         pipeline.set_rotary(rotary, arch.rope_theta as f32);
         pipeline.attention_heads_per_layer = arch.attention_heads_per_layer.clone();
