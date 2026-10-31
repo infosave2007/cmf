@@ -134,6 +134,27 @@ enum Sub {
         #[arg(long, requires = "genome_id", value_parser = ["pre_chat", "candidate", "sealed"])]
         genome_status: Option<String>,
     },
+    /// Grow the trunk without changing what it computes: a wider hidden
+    /// size and FFN, optionally twice the layers (a zero-output copy of
+    /// every anchor-terminated block). The checkpoint has no optimizer
+    /// moments; `birth --resume` starts them fresh.
+    GrowTrunk {
+        #[arg(long)]
+        ckpt: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        /// new hidden size (multiple of 64, >= the current one)
+        #[arg(long)]
+        hidden: usize,
+        /// new FFN/expert width (multiple of 64, >= the current one)
+        #[arg(long)]
+        inter: usize,
+        #[arg(long)]
+        double_depth: bool,
+        /// seed of the noise in the new input columns and FFN rows
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+    },
     /// Rebuild a trainer checkpoint from an Embryo .cmf export (config from
     /// its provenance, exact trunk weights, expert descriptors; no
     /// optimizer moments). Fails unless the checkpoint re-exports to the
@@ -970,6 +991,58 @@ fn main() {
             max_tokens,
         } => {
             cortiq_embryo::corpus::shard(&tokenizer, &inputs, &out, max_tokens);
+        }
+        Sub::GrowTrunk {
+            ckpt,
+            out,
+            hidden,
+            inter,
+            double_depth,
+            seed,
+        } => {
+            assert!(!out.exists(), "refusing to overwrite checkpoint {}", out.display());
+            let ck = cortiq_embryo::train::load_checkpoint(&ckpt).expect("load checkpoint");
+            let spec = cortiq_embryo::trunk::TrunkGrowth {
+                hidden,
+                inter,
+                double_depth,
+                seed,
+            };
+            let grown = match cortiq_embryo::trunk::grow_trunk(&ck, &spec) {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!("{e:#}");
+                    std::process::exit(1);
+                }
+            };
+            let extras: Vec<(&str, &[f32])> =
+                grown.extras.iter().map(|(n, x)| (n.as_str(), x.as_slice())).collect();
+            cortiq_embryo::train::save_checkpoint(&out, &grown.cfg, grown.step, &grown.params, None, None, &extras)
+                .expect("save checkpoint");
+            let ((t0, a0), (t1, a1)) = (ck.cfg.params(), grown.cfg.params());
+            println!(
+                "grow-trunk: {} → {}: hidden {} → {}, inter {} → {}, layers {} → {} (anchors {:?}); \
+                 params {:.1} M → {:.1} M (active {:.1} M → {:.1} M)",
+                ckpt.display(),
+                out.display(),
+                ck.cfg.hidden,
+                grown.cfg.hidden,
+                ck.cfg.inter,
+                grown.cfg.inter,
+                ck.cfg.layers,
+                grown.cfg.layers,
+                grown.cfg.anchor_layers.as_deref().unwrap_or(&[]),
+                t0 as f64 / 1e6,
+                t1 as f64 / 1e6,
+                a0 as f64 / 1e6,
+                a1 as f64 / 1e6
+            );
+            if hidden > 1024 || inter > 1024 {
+                println!(
+                    "grow-trunk: note: the resident GPU runtime serves hidden and inter up to 1024; \
+                     an export of this genome runs on the CPU path"
+                );
+            }
         }
         Sub::ImportCmf {
             cmf,

@@ -43,6 +43,7 @@ pub mod skill;
 pub mod sleep;
 pub mod tokenizer;
 pub mod train;
+pub mod trunk;
 #[cfg(all(feature = "vulkan", target_os = "macos"))]
 #[path = "vulkan.rs"]
 mod vulkan_validation;
