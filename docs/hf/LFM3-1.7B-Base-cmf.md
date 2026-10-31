@@ -91,13 +91,16 @@ LFM3-1.7B (an f16 conversion matched float32 position for position).
 
 Resident weights: 1.73 GB (`q8_2f`), 0.90 GB (`q4tp`).
 
+Apple M4 (Metal), cortiq 0.8.50: `q4tp` decodes 84 tok/s (82 at a depth of
+1k) and reads a 1k-token prompt at 565 tok/s; every layer of a token runs in one
+Metal command buffer.
+
 ## Hardware and context
 
 **NVIDIA / AMD / Intel (Vulkan, DX12).** Both files fit any card with 2 GB of
 free memory; on headless Linux install
 `libvulkan1 libglvnd0 libegl1 libgl1 libglx0` and set `XDG_RUNTIME_DIR=/tmp`.
-**CPU only:** `CMF_GPU=0`. Apple silicon has not been measured with this model
-yet.
+**Apple silicon:** the Metal backend is the default. **CPU only:** `CMF_GPU=0`.
 
 The model supports 262,144 tokens; the KV cache holds 32,768 by default and
 `CMF_MAX_SEQ=262144` raises it. KV grows by about 25 KB per token (the
@@ -161,8 +164,8 @@ cortiq run lfm3-1.7b-base-q8_2f.cmf --prompt "Какая столица Фран
 
 Нужен cortiq 0.8.49 или новее. На NVIDIA A40 (Vulkan) `q8_2f` генерирует 166 ток/с
 и читает промпт 4k со скоростью 657 ток/с, `q4tp` — 228 и 622 ток/с. Контекст до
-262 144 токенов: `CMF_MAX_SEQ=262144`. Apple silicon с этой моделью пока не
-измерялся. Файлы — изменённая форма LFM3-1.7B-Base от Liquid AI (конвертация в CMF
+262 144 токенов: `CMF_MAX_SEQ=262144`. На Apple M4 (Metal, cortiq 0.8.50)
+`q4tp` генерирует 84 ток/с. Файлы — изменённая форма LFM3-1.7B-Base от Liquid AI (конвертация в CMF
 и квантование cortiq) по LFM Open License v1.0 (копия — [LICENSE](LICENSE));
 коммерческое использование организацией с годовой выручкой от 10 млн долларов США
 лицензией не покрывается.
@@ -189,7 +192,7 @@ cortiq run lfm3-1.7b-base-q8_2f.cmf --prompt "你好" --max-tokens 512
 | bf16 原模型（Transformers） | — | 3.46 GB | 9.556 | — | — |
 
 NVIDIA A40（Vulkan）上 `q8_2f` 生成 166 token/s、4k 提示词 657 token/s，`q4tp`
-为 228 与 622 token/s。Apple silicon 尚未针对该模型测量。这些文件是 Liquid AI
+为 228 与 622 token/s；Apple M4（Metal，cortiq 0.8.50）上 `q4tp` 生成 84 token/s。这些文件是 Liquid AI
 LFM3-1.7B-Base 的修改形式（由 cortiq 转换为 CMF 并量化），仍受 LFM Open License
 v1.0 约束（副本见 [LICENSE](LICENSE)）；年收入 1000 万美元及以上的实体进行商业
 使用不在许可范围内。

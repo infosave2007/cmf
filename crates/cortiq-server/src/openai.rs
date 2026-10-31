@@ -30,6 +30,81 @@ pub fn routes() -> Router<Arc<AppState>> {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
+        .route("/v1/system_one", post(system_one))
+}
+
+// ─── d1 System One ─────────────────────────────────────────
+
+/// One media item of a System One request as a source record: a string (a
+/// path, URL or `data:` URL), `{"type": "image", "url" | "path" | "image": ..}`
+/// or the OpenAI `{"type": "image_url", "image_url": {"url": ..}}`.
+fn system_one_media(item: &serde_json::Value) -> Result<serde_json::Value, String> {
+    if let Some(s) = item.as_str() {
+        return Ok(serde_json::json!({"url": s}));
+    }
+    let kind = item.get("type").and_then(|v| v.as_str()).unwrap_or("image");
+    if kind != "image" && kind != "image_url" {
+        return Err(format!("media of type {kind:?} are not supported (pictures and audio clips)"));
+    }
+    let src = item
+        .get("image_url")
+        .and_then(|v| v.get("url").or(Some(v)))
+        .or_else(|| item.get("url"))
+        .or_else(|| item.get("path"))
+        .or_else(|| item.get("image"))
+        .and_then(|v| v.as_str())
+        .ok_or("a picture needs a url, path or image field")?;
+    Ok(serde_json::json!({"url": src}))
+}
+
+/// d1 decision models (Liquid's System One API): `{"state": text | JSON |
+/// null, "questions": {name: question}, "media": [picture, ...]}` →
+/// `{"answers": {name: answer}, "usage": {...}}`, one forward pass.
+async fn system_one(State(state): State<Arc<AppState>>, Json(body): Json<serde_json::Value>) -> Response {
+    let model = state.runtime.model();
+    if !cortiq_engine::d1::is_d1(model) {
+        return error_response(StatusCode::BAD_REQUEST, "this model is not a d1 decision model");
+    }
+    let d1 = match cortiq_engine::d1::D1::from_model(model) {
+        Ok(d) => d,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let Some(questions) = body.get("questions").and_then(|v| v.as_object()).cloned() else {
+        return error_response(StatusCode::BAD_REQUEST, "\"questions\" is an object of named questions");
+    };
+    let (mut images, mut audios) = (Vec::new(), Vec::new());
+    for item in body.get("media").and_then(|v| v.as_array()).into_iter().flatten() {
+        let kind = item.get("type").and_then(|v| v.as_str()).unwrap_or("image");
+        if matches!(kind, "audio" | "input_audio" | "audio_url") {
+            let src = item.get("input_audio").or_else(|| item.get("audio_url")).or_else(|| item.get("audio"));
+            audios.push(src.cloned().unwrap_or_else(|| item.clone()));
+            continue;
+        }
+        match system_one_media(item) {
+            Ok(v) => images.push(v),
+            Err(e) => return error_response(StatusCode::BAD_REQUEST, e),
+        }
+    }
+    let req = cortiq_engine::d1::Request {
+        state: body.get("state").cloned().unwrap_or(serde_json::Value::Null),
+        questions,
+        images,
+        audios,
+    };
+    let slot = state.slots.acquire().await;
+    let out = tokio::task::spawn_blocking(move || {
+        cortiq_engine::gpu::set_current_device(slot.device);
+        d1.system_one(&slot.pipe, &req)
+    })
+    .await;
+    match out {
+        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e),
+        Err(e) => {
+            tracing::error!("system_one failed: {e}");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "system_one failed")
+        }
+    }
 }
 
 // ─── Models ──────────────────────────────────────────────
@@ -1162,6 +1237,12 @@ async fn chat_completions(
         let think_tokens = state.tokenizer.encode("<think>");
         sampler_config.suppress_tokens.extend(think_tokens);
     }
+    // A speech model answers in text here: no speech or mixed turn.
+    if cortiq_engine::lfm3_audio::has_audio(state.runtime.model()) {
+        sampler_config
+            .suppress_tokens
+            .extend(cortiq_engine::lfm3_audio::text_only_suppress(&state.tokenizer));
+    }
 
     // Router v2 routes a chat on its LAST user message; the lane generates
     // in the tokenizer's chat frame (its template, or the ChatML fallback).
@@ -1232,6 +1313,13 @@ async fn chat_completions(
             Ok(false) => None,
             Err(e) => return error_response(StatusCode::BAD_REQUEST, e),
         }
+    } else {
+        None
+    };
+    // An LFM3-Audio file with audio parts (`input_audio`, `audio`).
+    let lfm3_audio_messages = if cortiq_engine::lfm3_audio::has_audio(state.runtime.model()) {
+        let messages: Vec<_> = req.messages.iter().map(message_to_json).collect();
+        cortiq_engine::lfm3_audio::has_audio_parts(&messages).then_some(messages)
     } else {
         None
     };
@@ -1318,6 +1406,29 @@ async fn chat_completions(
             Err(e) => {
                 tracing::error!("LFM3-VL image preparation failed: {e}");
                 return error_response(StatusCode::INTERNAL_SERVER_ERROR, "LFM3-VL image preparation failed");
+            }
+        };
+        mimo_rows = prepared.rows;
+        (prepared.token_ids, None)
+    } else if let Some(messages) = lfm3_audio_messages {
+        // LFM3-Audio clips: the encoder runs before the stream opens, so a
+        // bad clip is an HTTP 400.
+        if state.remote.is_some() || req.cortiq.as_ref().is_some_and(|c| c.class_tokens.is_some()) {
+            return error_response(StatusCode::BAD_REQUEST, "LFM3-Audio clips cannot use a network split or cortiq.class_tokens");
+        }
+        let slot = state.slots.acquire().await;
+        let tools = req.effective_tools().map(|t| t.to_vec());
+        let thinking = template_thinking;
+        let prepared = tokio::task::spawn_blocking(move || {
+            cortiq_engine::gpu::set_current_device(slot.device);
+            cortiq_engine::lfm3_audio::prepare_for_pipeline(&slot.pipe, &messages, tools.as_deref(), thinking)
+        }).await;
+        let prepared = match prepared {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => return error_response(StatusCode::BAD_REQUEST, e),
+            Err(e) => {
+                tracing::error!("LFM3-Audio clip preparation failed: {e}");
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, "LFM3-Audio clip preparation failed");
             }
         };
         mimo_rows = prepared.rows;

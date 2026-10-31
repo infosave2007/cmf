@@ -764,15 +764,53 @@ fn spark25_canon(raw: &str) -> Option<String> {
 /// LFM3-VL (`lfm3_vl`) wraps the same text model as `model.language_model`;
 /// its vision tower and projector keep their source names minus the
 /// `model.` wrapper (`vision_tower.*`, `multi_modal_projector.*`), which
-/// is where `lfm3_vl` reads them.
+/// is where `lfm3_vl` reads them. LFM3-Omni's speech parts do the same
+/// (`audio_encoder.*`, `audio_projector.*`, `depth_decoder.*`,
+/// `codebook_embedding.weight`, read by `lfm3_audio`); LFM3-Audio's own
+/// layout (`lfm.model.*`, `encoder.*`, `mlp.model.N.*`, `depthformer.*`,
+/// `depth_*`) lands on the same names.
 fn lfm3_canon(name: &str) -> Option<String> {
     if let Some(rest) = name.strip_prefix("model.language_model.") {
         return lfm3_canon(&format!("model.{rest}"));
     }
+    if let Some(rest) = name.strip_prefix("lfm.model.") {
+        return lfm3_canon(&format!("model.{rest}"));
+    }
     if let Some(rest) = name.strip_prefix("model.") {
-        if rest.starts_with("vision_tower.") || rest.starts_with("multi_modal_projector.") {
+        if rest.starts_with("vision_tower.")
+            || rest.starts_with("multi_modal_projector.")
+            || rest.starts_with("audio_encoder.")
+            || rest.starts_with("audio_projector.")
+            || rest.starts_with("depth_decoder.")
+            || rest == "codebook_embedding.weight"
+        {
             return Some(rest.to_string());
         }
+    }
+    if let Some(rest) = name.strip_prefix("encoder.downsample.") {
+        return Some(format!("audio_encoder.downsample.{rest}"));
+    }
+    if let Some(rest) = name.strip_prefix("encoder.lfm.lfm.") {
+        return Some(format!("audio_encoder.lfm.{rest}"));
+    }
+    if let Some(rest) = name.strip_prefix("mlp.model.") {
+        let (i, tail) = rest.split_once('.')?;
+        let part = match i {
+            "0" => "layer_norm",
+            "1" => "linear_1",
+            "3" => "linear_2",
+            _ => return None,
+        };
+        return Some(format!("audio_projector.{part}.{tail}"));
+    }
+    if let Some(rest) = name.strip_prefix("depthformer.") {
+        return Some(format!("depth_decoder.{rest}"));
+    }
+    if name.starts_with("depth_linear.") || name.starts_with("depth_embeddings.") || name == "mask_embedding" {
+        return Some(format!("depth_decoder.{name}"));
+    }
+    if name == "codebook_embedding.weight" || name.starts_with("codec.") {
+        return Some(name.to_string());
     }
     if name == "model.embedding_norm.weight" {
         return Some("model.norm.weight".to_string());
@@ -880,7 +918,17 @@ fn force_dsv41_vision_f16(arch: &ModelArch, name: &str, shape: &[usize]) -> bool
 /// 0.958) and 0.993 through the device GEMM (worst 0.61).
 fn lfm3_vision(arch: &ModelArch, name: &str) -> bool {
     arch.arch_name == "lfm3"
-        && (name.starts_with("vision_tower.") || name.starts_with("multi_modal_projector."))
+        && [
+            "vision_tower.",
+            "multi_modal_projector.",
+            "audio_encoder.",
+            "audio_projector.",
+            "depth_decoder.",
+            "codebook_embedding.",
+            "codec.",
+        ]
+        .iter()
+        .any(|p| name.starts_with(p))
 }
 
 /// M3's router starts as an F32 source plane and its top-4 choice is
@@ -4660,6 +4708,45 @@ fn apply_source_shard_priority(stream_shards: &mut Vec<String>) -> anyhow::Resul
 /// a prior successful checkpoint can still contribute to progress and head
 /// sizing.
 fn source_shard_counts(dir: &Path) -> anyhow::Result<Vec<(String, usize)>> {
+    let mut shards = source_shard_counts_main(dir)?;
+    let codec = dir.join("audio_tokenizer").join("model.safetensors");
+    if has_lfm3_codec(dir) && codec.exists() {
+        shards.push((CODEC_SHARD.to_string(), safetensors_tensor_count(&codec)?));
+    }
+    Ok(shards)
+}
+
+/// LFM3-Audio and LFM3-Omni ship their speech codec (LiquidCodec) in
+/// `audio_tokenizer/`; other families (MiMo) keep an unrelated tokenizer
+/// there, which never joins the file this way.
+fn has_lfm3_codec(dir: &Path) -> bool {
+    fs::read(dir.join("config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|c| c.get("model_type").and_then(|v| v.as_str()).map(String::from))
+        .is_some_and(|t| t == "lfm3_audio" || t == "lfm3_omni")
+}
+
+/// The shard name of LFM3-Audio's bundled codec
+/// (`audio_tokenizer/model.safetensors`), whose tensors join a conversion
+/// as `codec.*`.
+const CODEC_SHARD: &str = "audio_tokenizer.safetensors";
+
+/// The codec shard of an LFM3-Audio / LFM3-Omni checkpoint, renamed.
+fn open_codec_shard(dir: &Path) -> anyhow::Result<Option<SafeTensors>> {
+    let path = dir.join("audio_tokenizer").join("model.safetensors");
+    if !has_lfm3_codec(dir) || !path.exists() {
+        return Ok(None);
+    }
+    let mut st = open_safetensors(&path)?;
+    for t in &mut st.tensors {
+        t.name = format!("codec.{}", t.name);
+    }
+    st.name = CODEC_SHARD.to_string();
+    Ok(Some(st))
+}
+
+fn source_shard_counts_main(dir: &Path) -> anyhow::Result<Vec<(String, usize)>> {
     let single = dir.join("model.safetensors");
     if single.exists() {
         return Ok(vec![(
@@ -4712,6 +4799,17 @@ fn safetensors_tensor_count(path: &Path) -> anyhow::Result<usize> {
 /// complete by every output manifest; an unmarked missing shard remains a
 /// hard error in `open_safetensors`.
 pub(crate) fn open_model_filtered(
+    dir: &Path,
+    completed_shards: &std::collections::HashSet<String>,
+) -> anyhow::Result<Vec<SafeTensors>> {
+    let mut shards = open_model_filtered_main(dir, completed_shards)?;
+    if !completed_shards.contains(CODEC_SHARD) {
+        shards.extend(open_codec_shard(dir)?);
+    }
+    Ok(shards)
+}
+
+fn open_model_filtered_main(
     dir: &Path,
     completed_shards: &std::collections::HashSet<String>,
 ) -> anyhow::Result<Vec<SafeTensors>> {
@@ -6869,8 +6967,16 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
     {
         return build_minimax_m3_arch(config);
     }
-    // Vision/multimodal configs nest the text model under "text_config".
-    let tc = config.get("text_config").unwrap_or(config);
+    // Vision/multimodal configs nest the text model under "text_config";
+    // LFM3-Audio's own layout under "lfm".
+    let tc = config
+        .get("text_config")
+        .or_else(|| {
+            (config.get("model_type").and_then(|v| v.as_str()) == Some("lfm3_audio"))
+                .then(|| config.get("lfm"))
+                .flatten()
+        })
+        .unwrap_or(config);
     let model_type = config
         .get("model_type")
         .and_then(|v| v.as_str())
@@ -7522,6 +7628,8 @@ fn build_arch(config: &serde_json::Value) -> anyhow::Result<ModelArch> {
         // Gemma ties embeddings by default and its configs omit the key.
         tie_word_embeddings: config
             .get("tie_word_embeddings")
+            // LFM3-Audio states it on the nested text model only.
+            .or_else(|| tc.get("tie_word_embeddings").filter(|_| is_lfm3))
             .and_then(|v| v.as_bool())
             // MiniCPM3 ships no lm_head tensor — the head is the embedding.
             .unwrap_or(is_gemma || is_minicpm3),
@@ -8394,6 +8502,10 @@ fn hf_download_opts_at_revision(
         // Vision-language checkpoints (LFM3-VL) keep the image/video
         // preprocessing here.
         ("processor_config.json", false),
+        // d1 decision models: the release's calibration.
+        ("calibration.json", false),
+        // LFM3-Audio's speech feature extractor.
+        ("preprocessor_config.json", false),
         // Newer HF checkpoints (LFM2, Qwen3, …) ship the chat template as a
         // sidecar `chat_template.jinja` instead of embedding it in
         // tokenizer_config.json — without it `run` falls back to a generic
@@ -8408,6 +8520,24 @@ fn hf_download_opts_at_revision(
             required,
             threads,
         )?;
+    }
+    // LFM3-Audio / LFM3-Omni: the speech codec (LiquidCodec) in its own
+    // subfolder, read into the file as `codec.*`.
+    if has_lfm3_codec(&dir) {
+        fs::create_dir_all(dir.join("audio_tokenizer"))?;
+        for (f, w) in [("config.json", false), ("model.safetensors", true)] {
+            if w && !weights {
+                continue;
+            }
+            fetch(
+                &agent,
+                &format!("{base}/audio_tokenizer/{f}"),
+                &dir.join("audio_tokenizer").join(f),
+                token,
+                false,
+                threads,
+            )?;
+        }
     }
     let idx = dir.join("model.safetensors.index.json");
     if fetch(
@@ -10898,6 +11028,64 @@ pub fn run_convert_multi_excluding(
             "lfm3_vl: processor_config.json is missing — the image preprocessing lives there"
         );
         p["lfm3_vl"] = serde_json::json!({"config": config.clone(), "processor": processor});
+        p
+    } else {
+        provenance
+    };
+    // LFM3-Audio / LFM3-Omni: the checkpoint config (its speech encoder)
+    // and the feature extractor's settings (`lfm3_audio::Lfm3AudioConfig`).
+    let provenance = if arch.arch_name == "lfm3"
+        && (config.get("audio_encoder_config").is_some() || config.get("encoder").is_some())
+    {
+        let mut p = provenance;
+        let read = |f: &str| -> serde_json::Value {
+            fs::read(dir.join(f))
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or(serde_json::Value::Null)
+        };
+        let features = match read("preprocessor_config.json") {
+            serde_json::Value::Null => read("processor_config.json")
+                .get("feature_extractor")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            v => v,
+        };
+        let codec = fs::read(dir.join("audio_tokenizer").join("config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .unwrap_or(serde_json::Value::Null);
+        // The speech sampling the release recommends (`audio_*`).
+        let generation = read("generation_config.json");
+        p["lfm3_audio"] = serde_json::json!({
+            "config": config.clone(),
+            "features": features,
+            "codec": codec,
+            "generation": generation,
+        });
+        p
+    } else {
+        provenance
+    };
+    // d1 decision models (Liquid AI's System One on LFM3): the serving
+    // switches (`d1_*`) and the release's calibration, which every answer
+    // goes through.
+    let provenance = if arch.arch_name == "lfm3"
+        && config.as_object().is_some_and(|o| o.keys().any(|k| k.starts_with("d1_")))
+    {
+        let mut p = provenance;
+        let calibration: serde_json::Value = fs::read(dir.join("calibration.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .ok_or_else(|| anyhow::anyhow!("d1: calibration.json is missing beside the checkpoint"))?;
+        let d1: serde_json::Map<String, serde_json::Value> = config
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(k, _)| k.starts_with("d1_"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        p["d1"] = serde_json::json!({"config": d1, "calibration": calibration});
         p
     } else {
         provenance

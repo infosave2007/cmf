@@ -15,6 +15,11 @@ use crate::inference;
 pub mod mimo_mtp;
 #[path = "clover.rs"]
 pub mod clover;
+/// d1's non-causal forward over a packed state and question set.
+#[path = "pipeline_masked.rs"]
+pub mod masked;
+#[path = "pipeline_speech.rs"]
+pub mod speech;
 use crate::kv_cache::KvCache;
 use crate::linear_core::{
     GdnCfg, GdnWeights, ShortConvCfg, ShortConvWeights, VmfPhaseCfg, VmfPhaseWeights, gdn_forward,
@@ -2406,7 +2411,9 @@ impl Pipeline {
         h: &mut [f32],
     ) -> usize {
         let _mt0 = std::time::Instant::now(); // CMF_METAL_HOSTPROF
-        use crate::gpu::{AttnGpuLayer, GdnGpuCfg, GdnGpuLayer, GraphDims, MetalFfn, TokenGraph};
+        use crate::gpu::{
+            AttnGpuLayer, GdnGpuCfg, GdnGpuLayer, GraphDims, MetalFfn, SconvGpuLayer, TokenGraph,
+        };
         const MOE_WORKING_SET_REASON: &str =
             "model weights exceed Metal working set for native MoE graph";
         // A prior admission check rejected this pipeline. Avoid rebuilding the
@@ -2462,6 +2469,10 @@ impl Pipeline {
         let graph_attn_reason = self.graph_attn_decline_reason();
         let native_sink_attend = graph_attn_reason == Some("learned attention sinks")
             && (swa_graph || (self.swa.is_none() && self.sliding_layers.is_none()));
+        // Plain-weight (x̂·w) sandwich norms (LFM3) take the generic norm
+        // kernels, as on the wgpu graph; Gemma-2/3's (1+w) norms and the
+        // layer scalar stay Gemma-4's.
+        let plain_norms = self.norm_style == cortiq_core::NormStyle::Qwen;
         if (self.swa.is_some() && !swa_graph)
             || (self.global_attn.is_some() && !gemma4)
             || self.attention_heads_per_layer.is_some()
@@ -2470,9 +2481,8 @@ impl Pipeline {
             // learned sink is admitted only through native_sink_attend.
             || (graph_attn_reason.is_some() && !swa_graph && !native_sink_attend)
             || self.weights.layers.iter().any(|lw| {
-                ((lw.attn_out_norm.is_some()
-                    || lw.ffn_out_norm.is_some()
-                    || lw.layer_scale.is_some())
+                ((lw.layer_scale.is_some()
+                    || (!plain_norms && (lw.attn_out_norm.is_some() || lw.ffn_out_norm.is_some())))
                     && !gemma4)
                     || matches!(&lw.ffn, FfnKind::Dense(d)
                         if !(matches!(d.act, Act::Silu | Act::Gelu)
@@ -2509,6 +2519,11 @@ impl Pipeline {
         enum Item<'a> {
             Gdn {
                 run: Vec<GdnGpuLayer<'a>>,
+                first: usize,
+            },
+            /// A run of LFM2/LFM3 short-conv layers (conv ring on device).
+            Sconv {
+                run: Vec<SconvGpuLayer<'a>>,
                 first: usize,
             },
             Attn {
@@ -2660,6 +2675,36 @@ impl Pipeline {
                         }),
                     }
                 }
+                AttnKind::ShortConv(w) if self.short_conv_cfg.is_some() => {
+                    let (Some(inp), Some(out)) =
+                        (w.in_proj.metal_graph_parts(), w.out_proj.metal_graph_parts())
+                    else {
+                        if block_diag {
+                            eprintln!("block-graph: L{scan} short-conv parts refused");
+                        }
+                        break;
+                    };
+                    if let QTensor::Mapped { model, .. } = &w.in_proj {
+                        model_ref.get_or_insert_with(|| model.clone());
+                    }
+                    let sl = SconvGpuLayer {
+                        attn_norm: &lw.input_norm,
+                        post_norm: &lw.post_norm,
+                        in_proj: inp,
+                        taps: &w.conv,
+                        out,
+                        attn_out_norm: lw.attn_out_norm.as_deref(),
+                        ffn_out_norm: lw.ffn_out_norm.as_deref(),
+                        ffn,
+                    };
+                    match plan.last_mut() {
+                        Some(Item::Sconv { run, .. }) => run.push(sl),
+                        _ => plan.push(Item::Sconv {
+                            run: vec![sl],
+                            first: scan,
+                        }),
+                    }
+                }
                 AttnKind::Full {
                     wq,
                     wk,
@@ -2779,10 +2824,14 @@ impl Pipeline {
             Item::Gdn { run, .. } => run
                 .iter()
                 .any(|l| matches!(l.ffn, MetalFfn::Moe(_) | MetalFfn::FlintMoe(_))),
+            Item::Sconv { run, .. } => run
+                .iter()
+                .any(|l| matches!(l.ffn, MetalFfn::Moe(_) | MetalFfn::FlintMoe(_))),
             Item::Attn { l, .. } => matches!(l.ffn, MetalFfn::Moe(_) | MetalFfn::FlintMoe(_)),
         });
         let has_flint_moe = plan.iter().any(|it| match it {
             Item::Gdn { run, .. } => run.iter().any(|l| matches!(l.ffn, MetalFfn::FlintMoe(_))),
+            Item::Sconv { run, .. } => run.iter().any(|l| matches!(l.ffn, MetalFfn::FlintMoe(_))),
             Item::Attn { l, .. } => matches!(l.ffn, MetalFfn::FlintMoe(_)),
         });
         let metal_working_set = crate::gpu_metal::working_set_bytes();
@@ -2859,6 +2908,9 @@ impl Pipeline {
             let mut gdn_prefix: Option<(usize, usize)> = None;
             'items: for (i, item) in plan.iter().enumerate() {
                 match item {
+                    // Short-conv runs are not paged (no oversized
+                    // short-conv MoE has been measured): the page ends.
+                    Item::Sconv { .. } => break,
                     Item::Attn { li, .. } => {
                         let Some(span) = add_layer_span(selected_span, *li) else {
                             break;
@@ -2947,7 +2999,9 @@ impl Pipeline {
                 if let Some((item, take)) = gdn_prefix {
                     match &mut plan[item] {
                         Item::Gdn { run, .. } => run.truncate(take),
-                        Item::Attn { .. } => unreachable!("only a GDN run is splittable"),
+                        Item::Sconv { .. } | Item::Attn { .. } => {
+                            unreachable!("only a GDN run is splittable")
+                        }
                     }
                 }
                 let (page_lo, page_hi) = selected_span.expect("selected page span");
@@ -3108,6 +3162,9 @@ impl Pipeline {
                         Item::Gdn { first, run } => {
                             eprintln!("plan: Gdn first={first} len={}", run.len())
                         }
+                        Item::Sconv { first, run } => {
+                            eprintln!("plan: Sconv first={first} len={}", run.len())
+                        }
                         Item::Attn { li, full_gpu, .. } => {
                             eprintln!("plan: Attn li={li} full_gpu={full_gpu}")
                         }
@@ -3121,6 +3178,9 @@ impl Pipeline {
                     .as_ref()
                     .map(|gc| run.iter().all(|l| graph.gdn_ok(l, gc)))
                     .unwrap_or(false),
+                Item::Sconv { run, .. } => self
+                    .short_conv_cfg
+                    .is_some_and(|sc| run.iter().all(|l| graph.sconv_ok(l, sc.kernel))),
                 Item::Attn { l, .. } => graph.attn_ok(l),
             };
             if !ok {
@@ -3130,6 +3190,9 @@ impl Pipeline {
                         valid,
                         match item {
                             Item::Gdn { run, first } => format!("GDN run L{first}+{}", run.len()),
+                            Item::Sconv { run, first } => {
+                                format!("short-conv run L{first}+{}", run.len())
+                            }
                             Item::Attn { li, .. } => format!("Attn L{li}"),
                         }
                     );
@@ -3139,6 +3202,7 @@ impl Pipeline {
             valid += 1;
             end += match item {
                 Item::Gdn { run, .. } => run.len(),
+                Item::Sconv { run, .. } => run.len(),
                 Item::Attn { .. } => 1,
             };
         }
@@ -3184,6 +3248,18 @@ impl Pipeline {
                         _ => false,
                     }
             }
+            // A short-conv run encodes serially in its own encoder: its
+            // one-pass projections take the same matvec levers.
+            Item::Sconv { run, .. } => run.iter().all(|l| {
+                one_pass(l.in_proj)
+                    && one_pass(l.out)
+                    && match l.ffn {
+                        MetalFfn::Dense { gate, up, down, .. } => {
+                            one_pass(gate) && one_pass(up) && one_pass(down)
+                        }
+                        _ => false,
+                    }
+            }),
             Item::Gdn { .. } => false,
         });
         // MoE decode with every layer device-attended (Mellum2.1): the
@@ -3198,7 +3274,7 @@ impl Pipeline {
                         && self.kv_cache.layers[*li].o1.is_none()
                         && matches!(l.ffn, MetalFfn::Moe(_) | MetalFfn::FlintMoe(_))
                 }
-                Item::Gdn { .. } => false,
+                Item::Gdn { .. } | Item::Sconv { .. } => false,
             });
         let ab = crate::gpu_metal::dense_ab_arm().filter(|_| dense_fast || moe_plan);
         if block_diag {
@@ -3259,13 +3335,13 @@ impl Pipeline {
         for item in &plan {
             let _xt0 = std::time::Instant::now();
             let _xkind: u32 = match item {
-                Item::Gdn { .. } => 2,
+                Item::Gdn { .. } | Item::Sconv { .. } => 2,
                 Item::Attn { .. } => 3,
             };
             // Looped Transformer: insert on-device norm at loop boundaries.
             if self.loop_final_norm {
                 let item_start = match item {
-                    Item::Gdn { first, .. } => *first,
+                    Item::Gdn { first, .. } | Item::Sconv { first, .. } => *first,
                     Item::Attn { li, .. } => *li,
                 };
                 if item_start > start && self.is_loop_end(item_start - 1) {
@@ -3294,6 +3370,25 @@ impl Pipeline {
                     graph.commit_kind = 2;
                     graph.commit();
                     crate::gpu::stageprof(0, _ig.elapsed());
+                    pending.push((*first, run.len()));
+                }
+                Item::Sconv { run, first } => {
+                    let sc = self.short_conv_cfg.expect("validated short-conv run");
+                    for l in &mut self.kv_cache.layers[*first..*first + run.len()] {
+                        if l.linear_state.len() != sc.state_len() {
+                            l.linear_state = vec![0f32; sc.state_len()];
+                        }
+                    }
+                    let ro: Vec<&[f32]> = self.kv_cache.layers[*first..*first + run.len()]
+                        .iter()
+                        .map(|l| l.linear_state.as_slice())
+                        .collect();
+                    if !graph.encode_sconv_run(run, &ro, sc.kernel) {
+                        tracing::error!("q1 graph: short-conv run refused after validation");
+                        return start;
+                    }
+                    graph.commit_kind = 2;
+                    graph.commit();
                     pending.push((*first, run.len()));
                 }
                 Item::Attn {

@@ -435,7 +435,7 @@ pub fn prepare_video(
     })
 }
 
-fn load_vec(model: &CmfModel, name: &str, len: usize) -> Result<Vec<f32>, String> {
+pub(crate) fn load_vec(model: &CmfModel, name: &str, len: usize) -> Result<Vec<f32>, String> {
     let v = crate::dit::cmf_f32(model, name)?;
     if v.len() != len {
         return Err(format!("tensor '{name}' has {} values, expected {len}", v.len()));
@@ -448,20 +448,20 @@ fn load_vec(model: &CmfModel, name: &str, len: usize) -> Result<Vec<f32>, String
 /// tf32-class operands) a few rows of a 4320-patch image drift to a cosine
 /// of 0.97 against Transformers float32, on the host every row stays above
 /// 0.99999.
-struct Dense {
+pub(crate) struct Dense {
     w: Vec<f32>,
-    rows: usize,
-    cols: usize,
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
 }
 
 impl Dense {
     /// `y[n, rows] = x[n, cols] · Wᵀ`.
-    fn matmat(&self, x: &[f32], n: usize, y: &mut [f32], pool: Option<&Pool>) {
+    pub(crate) fn matmat(&self, x: &[f32], n: usize, y: &mut [f32], pool: Option<&Pool>) {
         crate::fcd_ops::gemm_nt_host(x, &self.w, y, n, self.cols, self.rows, pool);
     }
 }
 
-fn load_proj(model: &Arc<CmfModel>, name: &str, rows: usize, cols: usize) -> Result<Dense, String> {
+pub(crate) fn load_proj(model: &Arc<CmfModel>, name: &str, rows: usize, cols: usize) -> Result<Dense, String> {
     let w = crate::dit::cmf_f32(model, name)?;
     if w.len() != rows * cols {
         return Err(format!(
@@ -514,7 +514,7 @@ pub struct Lfm3VlTower {
     gpu_attention: bool,
 }
 
-fn rms_rows(x: &[f32], w: &[f32], eps: f64, out: &mut [f32], pool: Option<&Pool>) {
+pub(crate) fn rms_rows(x: &[f32], w: &[f32], eps: f64, out: &mut [f32], pool: Option<&Pool>) {
     let d = w.len();
     let rows = x.len() / d;
     let dst = crate::pool::SendMut::new(out.as_mut_ptr());
@@ -536,7 +536,7 @@ fn rms_rows(x: &[f32], w: &[f32], eps: f64, out: &mut [f32], pool: Option<&Pool>
 }
 
 /// `erf` by the Numerical Recipes rational form (1.2e-7 relative).
-fn erf(x: f64) -> f64 {
+pub(crate) fn erf(x: f64) -> f64 {
     let z = x.abs();
     let t = 1.0 / (1.0 + 0.5 * z);
     let ans = t
@@ -553,7 +553,7 @@ fn erf(x: f64) -> f64 {
     if x >= 0.0 { 1.0 - ans } else { ans - 1.0 }
 }
 
-fn add_bias(x: &mut [f32], b: &[f32]) {
+pub(crate) fn add_bias(x: &mut [f32], b: &[f32]) {
     for row in x.chunks_exact_mut(b.len()) {
         for (v, &bb) in row.iter_mut().zip(b) {
             *v += bb;
@@ -986,6 +986,9 @@ fn normalize(messages: &[Value]) -> Result<(Vec<Value>, Vec<Item>), String> {
                 }
                 items.push(Item::Video(rec));
                 *part = json!({"type": "video"});
+            } else if matches!(typ, "audio" | "input_audio" | "audio_url") {
+                // Speech: LFM3-Omni's prepare collects it (`lfm3_audio`);
+                // a vision-only file refuses it there.
             } else if typ != "text" && part.get("text").is_none() {
                 return Err(format!(
                     "LFM3-VL: unsupported content part '{typ}' (text, images and video only)"
@@ -1042,9 +1045,19 @@ pub fn prepare(
     thinking: Option<bool>,
     options: &VlOptions,
 ) -> Result<PreparedVlPrompt, String> {
-    let (messages, items) = normalize(messages)?;
+    // LFM3-Omni: its speech clips first (each part becomes {"type":"audio"}).
+    let speech = crate::lfm3_audio::has_audio(model);
+    if !speech && crate::lfm3_audio::has_audio_parts(messages) {
+        return Err("this LFM3 file takes no audio (LFM3-Omni and LFM3-Audio do)".into());
+    }
+    let (messages, clips) = if speech {
+        crate::lfm3_audio::normalize(messages)
+    } else {
+        (messages.to_vec(), Vec::new())
+    };
+    let (messages, items) = normalize(&messages)?;
     let tok = &pipeline.tokenizer;
-    if items.is_empty() {
+    if items.is_empty() && clips.is_empty() {
         let ids = tok.try_apply_chat_template_json(&messages, tools, thinking)?;
         return Ok(PreparedVlPrompt { token_ids: ids, rows: None });
     }
@@ -1053,6 +1066,13 @@ pub fn prepare(
         .ok_or("LFM3-VL: the chat template failed to render")?;
     let tower = Lfm3VlTower::from_model(model, crate::pool::Pool::from_env())?;
     let cfg = &tower.cfg;
+    let audio_enc = if clips.is_empty() {
+        None
+    } else {
+        Some(crate::lfm3_audio::Lfm3AudioEncoder::from_model(model, crate::pool::Pool::from_env())?)
+    };
+    let audio_id = tok.token_to_id("<|audio|>");
+    let mut clips = clips.into_iter();
     if cfg.text_hidden != pipeline.hidden_size {
         return Err("LFM3-VL: projector width differs from the text model".into());
     }
@@ -1074,6 +1094,20 @@ pub fn prepare(
     loop {
         let next_img = rest.find("<|image|>");
         let next_vid = rest.find("<|video|>");
+        let next_aud = audio_enc.as_ref().and_then(|_| rest.find("<|audio|>"));
+        // A speech clip (LFM3-Omni) before the next picture or video.
+        if let Some(a) = next_aud.filter(|&a| next_img.is_none_or(|i| a < i) && next_vid.is_none_or(|v| a < v)) {
+            let enc = audio_enc.as_ref().expect("checked above");
+            expanded.push_str(&rest[..a]);
+            rest = &rest[a + "<|audio|>".len()..];
+            let src = clips.next().ok_or("LFM3: more <|audio|> placeholders than clips")?;
+            let rows = enc.rows(&crate::egemma2_audio::load_audio_source(&src)?)?;
+            for _ in 0..rows.len() / enc.text_hidden {
+                expanded.push_str("<|audio|>");
+            }
+            media_rows.extend(rows);
+            continue;
+        }
         let (at, video) = match (next_img, next_vid) {
             (None, None) => break,
             (Some(i), None) => (i, false),
@@ -1142,7 +1176,7 @@ pub fn prepare(
         k += 1;
     }
     expanded.push_str(rest);
-    if images.next().is_some() || videos.next().is_some() {
+    if images.next().is_some() || videos.next().is_some() || clips.next().is_some() {
         return Err("LFM3-VL: the template rendered fewer placeholders than media".into());
     }
     let ids = tok.with_bos(tok.encode(&expanded));
@@ -1151,7 +1185,7 @@ pub fn prepare(
     let mut rows = Vec::with_capacity(ids.len() * h);
     let mut at = 0usize;
     for &id in &ids {
-        if id == image_id || id == video_id {
+        if id == image_id || id == video_id || (Some(id) == audio_id && audio_enc.is_some()) {
             let row = media_rows
                 .get(at..at + h)
                 .ok_or("LFM3-VL: placeholder and media row counts differ")?;
@@ -1224,7 +1258,12 @@ mod tests {
         let (m, items) = normalize(&video).unwrap();
         assert_eq!(items, vec![Item::Video(json!({"path": "frames", "fps": 8.0}))]);
         assert_eq!(m[0]["content"][0], json!({"type": "video"}));
+        // Speech parts pass through (LFM3-Omni's prepare collects them; a
+        // vision-only file refuses them there); other kinds are refused.
         let audio = vec![json!({"role": "user", "content": [{"type": "input_audio", "input_audio": {}}]})];
-        assert!(normalize(&audio).is_err());
+        let (_, items) = normalize(&audio).unwrap();
+        assert!(items.is_empty());
+        let other = vec![json!({"role": "user", "content": [{"type": "file", "file": {}}]})];
+        assert!(normalize(&other).is_err());
     }
 }

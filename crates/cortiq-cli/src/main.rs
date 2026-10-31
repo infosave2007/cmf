@@ -400,6 +400,26 @@ enum Commands {
         #[arg(long)]
         lookup_mode: Option<String>,
     },
+    /// d1 decision models (Liquid AI's System One on LFM3): named questions
+    /// over a state and its pictures, answered from one forward pass as
+    /// calibrated distributions; prints `{"answers": ..., "usage": ...}`
+    SystemOne {
+        /// Path to a d1 .cmf file
+        model: String,
+        /// The state: text, or `@file` (a `.json` file is read as JSON)
+        #[arg(long)]
+        state: Option<String>,
+        /// Named questions as JSON: `{"refund": {"type": "noul",
+        /// "instructions": "Is this a refund request?"}}`, or `@file`
+        #[arg(long)]
+        questions: String,
+        /// Picture path, data URL or HTTP(S) URL (repeatable)
+        #[arg(long = "image")]
+        images: Vec<String>,
+        /// d1-Omni audio clip: WAV path, data URL or HTTP(S) URL (repeatable)
+        #[arg(long = "audio")]
+        audios: Vec<String>,
+    },
     /// Decide with a decision file: one text (-p) or a JSONL batch (--input);
     /// locally, and with --oracle MODEL (the key in OPENROUTER_API_KEY) an
     /// OpenRouter model answers only what the local model cannot decide
@@ -1453,9 +1473,24 @@ enum Commands {
         /// Frame rate of a frame directory (MiMo, LFM3-VL video).
         #[arg(long)]
         video_fps: Option<f64>,
-        /// MiMo WAV file, data URL, or HTTP(S) URL; repeat for multiple clips.
+        /// MiMo or LFM3-Audio clip: WAV (other formats through ffmpeg),
+        /// data URL, or HTTP(S) URL; repeat for multiple clips.
         #[arg(long = "audio")]
         audios: Vec<String>,
+        /// System message of the chat prompt (LFM3-Audio tasks read it:
+        /// "Perform ASR in English.").
+        #[arg(long)]
+        system: Option<String>,
+        /// LFM3-Audio: answer in speech and write it here (24 kHz WAV);
+        /// the TTS system message picks the language and voice:
+        /// "Perform TTS in American English using a female voice.".
+        #[arg(long, value_name = "WAV")]
+        speech_out: Option<std::path::PathBuf>,
+        /// With --speech-out: `audio` (speech only, the TTS turn) or `mixed`
+        /// (Liquid's interleaved text and speech; system message "Respond
+        /// with interleaved text and audio.").
+        #[arg(long, default_value = "audio", value_parser = ["audio", "mixed"])]
+        speech_mode: String,
         /// Explicit MiMo multimodal companion (otherwise discovered beside text).
         #[arg(long)]
         mm: Option<std::path::PathBuf>,
@@ -3811,6 +3846,9 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Commands::Decide(args) => decision::run_decide(&args),
+        Commands::SystemOne { model, state, questions, images, audios } => {
+            run_system_one(&model, state.as_deref(), &questions, &images, &audios)
+        }
         Commands::Decision { cmd } => decision::run_decision(&cmd),
         Commands::Convert {
             model,
@@ -4650,6 +4688,9 @@ async fn main() -> anyhow::Result<()> {
             videos,
             video_fps,
             audios,
+            system,
+            speech_out,
+            speech_mode,
             mm,
             image_max_pixels,
             reasoning_effort,
@@ -4700,6 +4741,8 @@ async fn main() -> anyhow::Result<()> {
                 &images,
                 &videos,
                 &audios,
+                system.as_deref(),
+                speech_out.as_deref().map(|p| (p, speech_mode.as_str())),
                 &cortiq_engine::mimo_ingress::MediaOptions { companion: mm, image_max_pixels, video_fps },
                 reasoning_effort.as_deref(),
                 max_tokens,
@@ -8809,6 +8852,8 @@ async fn cmd_run(
     images: &[String],
     videos: &[String],
     audios: &[String],
+    system: Option<&str>,
+    speech_out: Option<(&std::path::Path, &str)>,
     media_options: &cortiq_engine::mimo_ingress::MediaOptions,
     reasoning_effort: Option<&str>,
     max_tokens: usize,
@@ -9106,14 +9151,25 @@ async fn cmd_run(
     let is_mimo = model.arch().arch_name == "mimo_v2";
     let mimo_media = is_mimo && (!images.is_empty() || !videos.is_empty() || !audios.is_empty());
     let lfm3_vl = cortiq_engine::lfm3_vl::has_vision(&model);
-    let lfm3_media = lfm3_vl && (!images.is_empty() || !videos.is_empty());
+    let lfm3_audio = cortiq_engine::lfm3_audio::has_audio(&model);
+    // LFM3-Omni (vision + speech) takes every medium through the VL path.
+    let lfm3_media = lfm3_vl && (!images.is_empty() || !videos.is_empty() || (lfm3_audio && !audios.is_empty()));
+    let lfm3_audio_media = lfm3_audio && !lfm3_vl && !audios.is_empty();
+    // A text answer from a speech model: no speech or mixed turn.
+    if lfm3_audio {
+        let ids = cortiq_engine::lfm3_audio::text_only_suppress(&pipeline.tokenizer);
+        pipeline.sampler_config.suppress_tokens.extend(ids);
+    }
     anyhow::ensure!(is_dsv41 || reasoning_effort.is_none(), "--reasoning-effort requires DeepSeek-V4.1");
     anyhow::ensure!(is_dsv41 || is_mimo || lfm3_media || images.is_empty(),
         "--image requires DeepSeek-V4.1, MiMo or an LFM3-VL file");
-    anyhow::ensure!(is_mimo || (audios.is_empty() && media_options.companion.is_none()
+    anyhow::ensure!(is_mimo || ((audios.is_empty() || lfm3_audio) && media_options.companion.is_none()
         && ((videos.is_empty() && media_options.video_fps.is_none() && media_options.image_max_pixels.is_none())
             || lfm3_vl)),
-        "--video/--audio/--mm and MiMo processing options require MiMo (--video and its options: or LFM3-VL)");
+        "--video/--audio/--mm and MiMo processing options require MiMo (--video and its options: or LFM3-VL; --audio: or LFM3-Audio)");
+    anyhow::ensure!(!lfm3_audio_media || (!raw && state.is_none() && peer.is_none() && gpus.is_none()
+        && std::env::var_os("CMF_PROMPT_IDS").is_none()),
+        "LFM3-Audio clips require a fresh local chat prompt (no --raw/--state/--peer/--gpus/CMF_PROMPT_IDS)");
     anyhow::ensure!(!lfm3_media || (!raw && state.is_none() && peer.is_none() && gpus.is_none()
         && std::env::var_os("CMF_PROMPT_IDS").is_none()),
         "LFM3-VL images require a fresh local chat prompt (no --raw/--state/--peer/--gpus/CMF_PROMPT_IDS)");
@@ -9615,7 +9671,10 @@ async fn cmd_run(
             None => p.to_string(),
         };
         let p = p_text.as_str();
-        let history = vec![("user".to_string(), p.to_string())];
+        let mut history = vec![("user".to_string(), p.to_string())];
+        if let Some(sys) = system {
+            history.insert(0, ("system".to_string(), sys.to_string()));
+        }
         let vl_inputs = is_dsv41
             .then(|| {
                 prepare_dsv41_cli_prompt(&model, &pipeline, p, images, no_think, reasoning_effort)
@@ -9636,15 +9695,41 @@ async fn cmd_run(
                 .map(|path| serde_json::json!({"type":"image_url", "image_url":{"url":path}}))
                 .collect();
             content.extend(videos.iter().map(|path| serde_json::json!({"type":"video", "video":{"path":path}})));
-            content.push(serde_json::json!({"type":"text", "text":p}));
+            if lfm3_audio {
+                content.extend(audios.iter().map(|path| serde_json::json!({"type":"audio", "audio":path})));
+            }
+            if !p.trim().is_empty() {
+                content.push(serde_json::json!({"type":"text", "text":p}));
+            }
+            let mut messages: Vec<serde_json::Value> = system
+                .map(|s| serde_json::json!({"role":"system", "content":s}))
+                .into_iter()
+                .collect();
+            messages.push(serde_json::json!({"role":"user", "content":content}));
             Some(cortiq_engine::lfm3_vl::prepare(&model, &pipeline,
-                &[serde_json::json!({"role":"user", "content":content})], None, thinking,
+                &messages, None, thinking,
                 &cortiq_engine::lfm3_vl::VlOptions {
                     image_max_pixels: media_options.image_max_pixels,
                     video_fps: media_options.video_fps,
                 })
                 .map_err(anyhow::Error::msg)?)
         } else { None };
+        // LFM3-Audio: the clips, then the text (none when empty).
+        let lfm3_inputs = if lfm3_audio_media {
+            let mut content: Vec<serde_json::Value> = audios.iter()
+                .map(|path| serde_json::json!({"type":"audio", "audio":path}))
+                .collect();
+            if !p.trim().is_empty() {
+                content.push(serde_json::json!({"type":"text", "text":p}));
+            }
+            let mut messages: Vec<serde_json::Value> = system
+                .map(|s| serde_json::json!({"role":"system", "content":s}))
+                .into_iter()
+                .collect();
+            messages.push(serde_json::json!({"role":"user", "content":content}));
+            Some(cortiq_engine::lfm3_audio::prepare(&model, &pipeline, &messages, None, thinking)
+                .map_err(anyhow::Error::msg)?)
+        } else { lfm3_inputs };
         let mut ids = vl_inputs
             .as_ref()
             .map(|inputs| inputs.token_ids.clone())
@@ -9686,6 +9771,55 @@ async fn cmd_run(
         }
         let media_rows = mimo_inputs.as_ref().and_then(|p| p.rows.as_deref())
             .or_else(|| lfm3_inputs.as_ref().and_then(|p| p.rows.as_deref()));
+        // LFM3-Audio speech answer: the assistant turn opens with
+        // <|audio_start|>, frames until the end-of-audio frame, the codec.
+        if let Some((path, speech_mode)) = speech_out {
+            use cortiq_engine::lfm3_speech as sp;
+            anyhow::ensure!(sp::can_speak(&model),
+                "--speech-out requires an LFM3-Audio file with its depth decoder and codec");
+            let marker = if speech_mode == "mixed" { "<|mixed_start|>" } else { "<|audio_start|>" };
+            let start = pipeline.tokenizer.token_to_id(marker)
+                .ok_or_else(|| anyhow::anyhow!("the tokenizer has no {marker}"))?;
+            let mut sids = ids.clone();
+            let mut srows = media_rows.map(<[f32]>::to_vec);
+            if sids.last() != Some(&start) {
+                sids.push(start);
+                if let Some(r) = srows.as_mut() {
+                    r.extend(pipeline.embed_id(start));
+                }
+            }
+            let pool = cortiq_engine::pool::Pool::from_env();
+            let depth = sp::DepthDecoder::from_model(&model, pool.clone()).map_err(anyhow::Error::msg)?;
+            let mut sampling = sp::AudioSampling::from_model(&model);
+            if greedy {
+                sampling.temperature = 0.0;
+            }
+            sampling.fixed_order = std::env::var("CMF_LFM3_MASKGIT_FIXED").as_deref() == Ok("1");
+            let t0 = std::time::Instant::now();
+            let out = sp::speak(&mut pipeline, &depth, &sids, srows.as_deref(), max_tokens, &sampling,
+                seed.unwrap_or_else(|| std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1)))
+                .map_err(anyhow::Error::msg)?;
+            let t_gen = t0.elapsed().as_secs_f64();
+            let t_codec = std::time::Instant::now();
+            let codec = sp::Codec::from_model(&model, pool).map_err(anyhow::Error::msg)?;
+            let wave = codec.decode(&out.frames);
+            if std::env::var_os("CMF_LFM3_SPEECH_PROF").is_some() {
+                eprintln!("speech: codec (load + decode) {:.0} ms", t_codec.elapsed().as_secs_f64() * 1e3);
+            }
+            sp::write_wav(path, &wave, 24_000)?;
+            if let Ok(dump) = std::env::var("CMF_LFM3_CODES_DUMP") {
+                let flat: Vec<u32> = out.frames.iter().flatten().copied().collect();
+                std::fs::write(&dump, serde_json::to_vec(&flat)?)?;
+            }
+            let text = pipeline.tokenizer.decode(&out.text_ids);
+            if !text.trim().is_empty() {
+                println!("{}", text.trim());
+            }
+            eprintln!("[{} frames · {:.2} s of speech · generated in {:.1} s · {}]",
+                out.frames.len(), wave.len() as f64 / 24_000.0, t_gen, path.display());
+            return Ok(());
+        }
         generate_and_print(&mut pipeline, &ids, vl_inputs.as_ref(), media_rows)?;
     } else {
         println!("\nType your message (Ctrl+C to exit):\n");
@@ -12372,6 +12506,51 @@ async fn cmd_bench(
         );
     }
     println!("  Finish:  {}", result.finish_reason);
+    Ok(())
+}
+
+/// `@file` → its contents, else the argument itself.
+fn arg_or_file(v: &str) -> anyhow::Result<(String, bool)> {
+    match v.strip_prefix('@') {
+        Some(path) => Ok((std::fs::read_to_string(path)?, path.ends_with(".json"))),
+        None => Ok((v.to_string(), false)),
+    }
+}
+
+fn run_system_one(
+    model: &str,
+    state: Option<&str>,
+    questions: &str,
+    images: &[String],
+    audios: &[String],
+) -> anyhow::Result<()> {
+    let cmf = Arc::new(CmfModel::open(model)?);
+    anyhow::ensure!(
+        cortiq_engine::d1::is_d1(&cmf),
+        "{model} is not a d1 decision model (no provenance.d1)"
+    );
+    let pipeline = Pipeline::from_model(&cmf, SamplerConfig::default())?;
+    let d1 = cortiq_engine::d1::D1::from_model(&cmf).map_err(anyhow::Error::msg)?;
+    let state = match state {
+        None => serde_json::Value::Null,
+        Some(s) => {
+            let (text, json_file) = arg_or_file(s)?;
+            if json_file { serde_json::from_str(&text)? } else { serde_json::Value::String(text) }
+        }
+    };
+    let (q, _) = arg_or_file(questions)?;
+    let questions: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&q)
+        .map_err(|e| anyhow::anyhow!("--questions must be a JSON object of named questions: {e}"))?;
+    let req = cortiq_engine::d1::Request {
+        state,
+        questions,
+        images: images.iter().map(|p| serde_json::json!({"url": p})).collect(),
+        audios: audios.iter().map(|p| serde_json::json!(p)).collect(),
+    };
+    let t0 = std::time::Instant::now();
+    let out = d1.system_one(&pipeline, &req).map_err(anyhow::Error::msg)?;
+    println!("{}", serde_json::to_string_pretty(&out)?);
+    eprintln!("system-one: {:.0} ms", t0.elapsed().as_secs_f64() * 1e3);
     Ok(())
 }
 

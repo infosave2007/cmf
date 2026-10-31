@@ -95,6 +95,17 @@ Transformers float32 position for position on the CPU (perplexity 13.186 against
 Resident weights: 1.73 GB (`q8_2f`), 0.90 GB (`q4tp`). Every layer of a
 token runs in one GPU submission.
 
+Apple M4 (10-core GPU, Metal), cortiq 0.8.50, same bench:
+
+| file | decode, tok/s | decode at 1k | 1k-token prompt, tok/s |
+|---|---:|---:|---:|
+| `q8_2f` | 48.5 | — | 388 |
+| `q4tp` | 84 | 82 | 560 |
+
+On Apple silicon every layer of a token runs in one Metal command buffer
+(the short convolutions included); the decode-path perplexity equals the
+CPU's.
+
 ## Usage
 
 ```bash
@@ -145,8 +156,8 @@ name substring) picks one. On headless Linux install
 
 **CPU only.** `CMF_GPU=0`.
 
-The numbers above are measured on NVIDIA through Vulkan; Apple silicon has not
-been measured with this model yet.
+**Apple silicon.** The native Metal backend is the default (cortiq 0.8.50 or
+later for the whole-token graph).
 
 ## Long context
 
@@ -243,7 +254,7 @@ OpenAI-совместимый API с вызовом инструментов (`m
 на обоих файлах, с рассуждением и без). Контекст до 262 144 токенов:
 `CMF_MAX_SEQ=262144` (по умолчанию 32 768); KV растёт примерно на 25 КБ на
 токен (812 МБ при 32k), скользящие слои хранят только последние 256 позиций.
-Apple silicon с этой моделью пока не измерялся.
+На Apple M4 (Metal, cortiq 0.8.50) `q4tp` генерирует 84 ток/с, `q8_2f` — 48.5.
 
 Файлы — изменённая форма LFM3-1.7B от Liquid AI (конвертация в CMF и
 квантование cortiq) и распространяются по LFM Open License v1.0 (копия —
@@ -276,8 +287,8 @@ f16 转换在 CPU 上与 Transformers float32 逐位置一致（ppl 13.186 对 1
 623 token/s，`q4tp` 生成 231 token/s、4k 提示词 574 token/s。默认采样为 Liquid
 推荐的 temperature 0.1、top-k 50、repetition penalty 1.1。`cortiq serve` 提供
 OpenAI 兼容接口与工具调用。`CMF_MAX_SEQ=262144` 可开启完整 262,144 token 上下文
-（默认 32,768）；KV 每 token 约 25 KB（32k 时 812 MB）。Apple silicon 尚未针对
-该模型测量。
+（默认 32,768）；KV 每 token 约 25 KB（32k 时 812 MB）。Apple M4（Metal，
+cortiq 0.8.50）上 `q4tp` 生成 84 token/s，`q8_2f` 48.5 token/s。
 
 这些文件是 Liquid AI LFM3-1.7B 的修改形式（由 cortiq 转换为 CMF 并量化），仍受
 LFM Open License v1.0 约束（副本见 [LICENSE](LICENSE)）；其中，年收入 1000 万美元
