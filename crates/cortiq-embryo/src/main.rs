@@ -908,6 +908,16 @@ enum Sub {
         /// end-of-text token id: a window containing it ends the stream
         #[arg(long)]
         carry_eot: Option<u32>,
+        /// with --carry: expected synthetic retrieval tasks (key→value pairs,
+        /// span copies) planted per row window; 0 = off
+        #[arg(long, default_value_t = 0.0)]
+        retrieval_rate: f64,
+        /// distance range of a retrieval task, `MIN,MAX` (log-uniform)
+        #[arg(long, value_name = "MIN,MAX", value_delimiter = ',', default_value = "128,2048")]
+        retrieval_dists: Vec<usize>,
+        /// at most this many key→value pairs in one retrieval task
+        #[arg(long, default_value_t = 4)]
+        retrieval_pairs: usize,
         /// with --resume: warmup+cosine over THIS run's steps (relative to
         /// the resume step) instead of the absolute step
         #[arg(long)]
@@ -2402,6 +2412,9 @@ fn main() {
             carry,
             carry_reset_every,
             carry_eot,
+            retrieval_rate,
+            retrieval_dists,
+            retrieval_pairs,
             lr_restart,
             dropless,
             val_extra,
@@ -2453,6 +2466,12 @@ fn main() {
                 carry,
                 carry_reset_every,
                 carry_eot,
+                retrieval_rate,
+                retrieval_dists: match retrieval_dists[..] {
+                    [lo, hi] => (lo, hi),
+                    _ => panic!("--retrieval-dists takes MIN,MAX"),
+                },
+                retrieval_pairs,
                 lr_restart,
                 dropless,
                 val_extra,
@@ -2501,6 +2520,9 @@ fn main() {
                     carry,
                     carry_reset_every,
                     carry_eot,
+                    retrieval_rate,
+                    retrieval_dists,
+                    retrieval_pairs,
                     lr_restart,
                     dropless,
                     val_extra,

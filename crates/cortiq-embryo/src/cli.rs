@@ -511,6 +511,13 @@ pub struct BirthArgs {
     pub carry_reset_every: usize,
     /// end-of-text id: a window containing it ends the row's stream
     pub carry_eot: Option<u32>,
+    /// expected synthetic retrieval tasks per row window (0 = off; needs
+    /// `carry`), see [`crate::train::Retrieval`]
+    pub retrieval_rate: f64,
+    /// log-uniform task distance range (min, max) in tokens
+    pub retrieval_dists: (usize, usize),
+    /// at most this many key→value pairs in one pairs task
+    pub retrieval_pairs: usize,
     /// on `--resume`: run the warmup+cosine schedule over the steps of THIS
     /// run (step − resume step over steps − resume step) instead of the
     /// absolute step (a recovery/continuation with its own schedule)
@@ -857,14 +864,33 @@ pub fn birth(a: BirthArgs) {
         );
     }
     let mut sampler = Sampler::new(a.batch, a.seq, a.seed.wrapping_add(step0 as u64));
+    assert!(
+        a.retrieval_rate == 0.0 || a.carry,
+        "--retrieval-rate plants tasks into carried streams: add --carry"
+    );
     let mut stream = a.carry.then(|| {
-        crate::train::StreamSampler::new(
+        let st = crate::train::StreamSampler::new(
             a.batch,
             a.seq,
             a.seed.wrapping_add(step0 as u64),
             a.carry_reset_every,
             a.carry_eot,
-        )
+        );
+        if a.retrieval_rate > 0.0 {
+            println!(
+                "retrieval: {} tasks per row window, distance {}..{} (log-uniform), pairs <= {}",
+                a.retrieval_rate, a.retrieval_dists.0, a.retrieval_dists.1, a.retrieval_pairs
+            );
+            st.with_retrieval(crate::train::Retrieval {
+                rate: a.retrieval_rate,
+                dmin: a.retrieval_dists.0,
+                dmax: a.retrieval_dists.1,
+                max_pairs: a.retrieval_pairs,
+                vocab: cfg.vocab,
+            })
+        } else {
+            st
+        }
     });
     let mut carry_acc = a.carry.then(|| CarryAcc::new(cfg.layers));
     let mut last_reset: Vec<bool> = vec![true; a.batch];
@@ -1039,6 +1065,9 @@ pub fn birth(a: BirthArgs) {
         if tick % a.eval_every == 0 || step + 1 == a.steps {
             let vl = eval(&gpu, &mut tokens, &mut targets);
             println!("  val loss {vl:.4}  ppl {:.2}{}", vl.exp(), eval_extra(&gpu, &mut tokens, &mut targets));
+            if let Some(st) = stream.as_ref().filter(|_| a.retrieval_rate > 0.0) {
+                println!("  retrieval: {} tasks planted, {} scored targets", st.planted.0, st.planted.1);
+            }
             let rc = gpu.routing_counts();
             if !rc.is_empty() {
                 let cap = gpu.moe_cap;
