@@ -4710,10 +4710,21 @@ fn apply_source_shard_priority(stream_shards: &mut Vec<String>) -> anyhow::Resul
 fn source_shard_counts(dir: &Path) -> anyhow::Result<Vec<(String, usize)>> {
     let mut shards = source_shard_counts_main(dir)?;
     let codec = dir.join("audio_tokenizer").join("model.safetensors");
-    if codec.exists() {
+    if has_lfm3_codec(dir) && codec.exists() {
         shards.push((CODEC_SHARD.to_string(), safetensors_tensor_count(&codec)?));
     }
     Ok(shards)
+}
+
+/// LFM3-Audio and LFM3-Omni ship their speech codec (LiquidCodec) in
+/// `audio_tokenizer/`; other families (MiMo) keep an unrelated tokenizer
+/// there, which never joins the file this way.
+fn has_lfm3_codec(dir: &Path) -> bool {
+    fs::read(dir.join("config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|c| c.get("model_type").and_then(|v| v.as_str()).map(String::from))
+        .is_some_and(|t| t == "lfm3_audio" || t == "lfm3_omni")
 }
 
 /// The shard name of LFM3-Audio's bundled codec
@@ -4724,7 +4735,7 @@ const CODEC_SHARD: &str = "audio_tokenizer.safetensors";
 /// The codec shard of an LFM3-Audio / LFM3-Omni checkpoint, renamed.
 fn open_codec_shard(dir: &Path) -> anyhow::Result<Option<SafeTensors>> {
     let path = dir.join("audio_tokenizer").join("model.safetensors");
-    if !path.exists() {
+    if !has_lfm3_codec(dir) || !path.exists() {
         return Ok(None);
     }
     let mut st = open_safetensors(&path)?;
@@ -8512,12 +8523,7 @@ fn hf_download_opts_at_revision(
     }
     // LFM3-Audio / LFM3-Omni: the speech codec (LiquidCodec) in its own
     // subfolder, read into the file as `codec.*`.
-    let speech = fs::read(dir.join("config.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .and_then(|c| c.get("model_type").and_then(|v| v.as_str()).map(String::from))
-        .is_some_and(|t| t == "lfm3_audio" || t == "lfm3_omni");
-    if speech {
+    if has_lfm3_codec(&dir) {
         fs::create_dir_all(dir.join("audio_tokenizer"))?;
         for (f, w) in [("config.json", false), ("model.safetensors", true)] {
             if w && !weights {
