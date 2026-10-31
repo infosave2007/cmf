@@ -1,4 +1,4 @@
-//! GDN chunked WY/UT form (Vulkan only) — the f64 witness the plan demands
+//! GDN chunked WY/UT form (Vulkan and Metal) — the f64 witness the plan demands
 //! BEFORE any use: the production tile (B8/T1024, nv 4, dk = dv = 128) with
 //! S_0 ≠ 0 against the f64 token reference (`ops::gdn_scan_ref_*`) on O,
 //! the chunk-boundary states, dQ/dK/dV (through the q/k norms), dβ (db),
@@ -6,7 +6,7 @@
 //! token-scan kernels (every checkpoint state), and a small tile. The
 //! per-layer scan-vs-WY timings are printed (they are only meaningful on an
 //! idle GPU).
-#![cfg(all(feature = "vulkan", not(target_os = "macos")))]
+#![cfg(any(target_os = "macos", feature = "vulkan"))]
 
 use cortiq_embryo::gdn_wy::{GdnWyKeep, GdnWyScratch, wy_bwd, wy_fwd};
 use cortiq_embryo::metal::{Cmd, GBuf, GdnScanDims, ctx};
@@ -267,11 +267,14 @@ fn witness(b: usize, t: usize, nv: usize, dk: usize, dv: usize, tol: f64) {
 /// The production tile of the plan's gate (dthk 1.40 / dv 2.68 / beta 1.11
 /// rel broke the previous WY here): ≤ 5e-3 rel on everything.
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "requires an Apple Silicon Metal device")]
 fn wy_production_tile_matches_f64_and_scan() {
     witness(8, 1024, 4, 128, 128, 5e-3);
 }
 
-/// Small tile (two chunks, sub-tile head dims → the 16×16 GEMM path).
+/// Small tile (two chunks, sub-tile head dims → the 16×16 GEMM path; the
+/// Metal tile GEMM has no such path — the trainer keeps the scan there).
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn wy_small_tile_matches_f64_and_scan() {
     witness(2, 128, 2, 32, 32, 5e-3);
@@ -281,6 +284,7 @@ fn wy_small_tile_matches_f64_and_scan() {
 /// step-bench exposed — one shared intermediates arena handed layer 0's
 /// backward layer 1's tables): WY vs scan gradients of every tensor.
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "requires an Apple Silicon Metal device")]
 fn wy_two_gdn_layers_match_scan_gradients() {
     use cortiq_embryo::model::{EmbryoCfg, EmbryoGpu, Layout, Mixer, init_params};
     let Some(_) = ctx() else { return };
@@ -289,8 +293,10 @@ fn wy_two_gdn_layers_match_scan_gradients() {
     cfg.anchor_every = 3; // layers 0, 1 = GDN, layer 2 = anchor
     cfg.mixer = Mixer::Gdn;
     cfg.gdn_heads = 2;
-    cfg.gdn_dk = 32;
-    cfg.gdn_dv = 32;
+    // the Metal tile GEMM (and so the trainer's Metal WY path) needs 64-multiples
+    let hd = if cfg!(target_os = "macos") { 64 } else { 32 };
+    cfg.gdn_dk = hd;
+    cfg.gdn_dv = hd;
     cfg.experts = 4;
     let (b, t) = (2usize, 128usize);
     let m = b * t;

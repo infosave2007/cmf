@@ -1853,6 +1853,7 @@ impl Pipeline {
                 sink_v: sink("sink_v")?,
                 sink: ac.sink,
                 window: ac.window,
+                group_windows: ac.group_windows.clone(),
             })))
         };
 

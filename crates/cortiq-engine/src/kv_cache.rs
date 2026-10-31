@@ -342,7 +342,7 @@ impl LayerKvCache {
             .as_mut()
             .expect("bounded_step on a layer without an installed ring");
         st.insert(k, v);
-        st.attend(q, num_heads, &w.sink_k, &w.sink_v, w.sink, rope, scale, out);
+        st.attend(q, num_heads, &w.sink_k, &w.sink_v, w.sink, &w.group_windows, rope, scale, out);
         // Honest context depth for the memory/seq report — nothing is
         // stored per position.
         self.seq_len += 1;

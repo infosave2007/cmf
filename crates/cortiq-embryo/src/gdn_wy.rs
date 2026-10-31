@@ -1,4 +1,4 @@
-//! GDN mixer, chunked WY/UT form (plan S7, level 2 — Vulkan only): the same
+//! GDN mixer, chunked WY/UT form (plan S7, level 2 — Vulkan and Metal): the same
 //! operator as the token scan (`gdn_scan_fwd/bwd`), computed per 64-token
 //! chunk in GEMM form so the sequential part is one small GEMM chain per
 //! chunk instead of one state pass per token.
@@ -18,7 +18,7 @@
 //! gradient is assembled from the mask/scale terms and a reverse cumsum
 //! inside the chunk. Witness: `tests/vulkan_gdn_wy.rs` (production tile,
 //! ≤ 5e-3 rel against the f64 token reference `ops::gdn_scan_ref_*`).
-#![cfg(all(feature = "vulkan", not(target_os = "macos")))]
+#![cfg(any(target_os = "macos", feature = "vulkan"))]
 
 use crate::metal::{Cmd, Ctx, GBuf, GdnScanDims, GemmBatch, Op};
 
@@ -66,6 +66,7 @@ pub struct GdnWyScratch {
     pub dbet: GBuf,  // [NB, T]
     pub dlgm: GBuf,  // [NB, T] mask contribution to d lg
     pub dgend: GBuf, // [NB, nch] Σ dS_{c+1}·S_c
+    pub dgend_part: GBuf, // [NB, 64] fixed-chunk partials of one chunk's dgend
     pub dla: GBuf,   // [NB, T] d log α
 }
 
@@ -123,6 +124,7 @@ impl GdnWyScratch {
             dbet: z(nb * d.t),
             dlgm: z(nb * d.t),
             dgend: z(nb * nch),
+            dgend_part: z(nb * 64),
             dla: z(nb * d.t),
         }
     }
@@ -339,7 +341,7 @@ pub fn wy_bwd(
             false,
         );
         // dγ_end partial = Σ dS_{c+1}·S_c ; dS_c += γ_end dS_{c+1}
-        cmd.gdn_wy_dgend(d, dlive, states, &x.dgend, c);
+        cmd.gdn_wy_dgend(d, dlive, states, &x.dgend, &x.dgend_part, c);
         cmd.gdn_wy_dstate(d, &x.dsn, dlive, &w.gam, c);
         // dK̂_c (from S_{c+1}) = Ũ_c dS_{c+1}ᵀ   (first write of the chunk rows)
         cmd.gemm_ex(

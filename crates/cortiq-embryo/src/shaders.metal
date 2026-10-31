@@ -1057,6 +1057,15 @@ struct GemmArgs {
     uint nb_h, nb_c;   // z = (b·nb_h + h)·nb_c + c
     uint mask;         // 1: causal — C[i,j] = 0 for j > i (global indices)
     uint kdyn;         // 1: K = min(round64(kcount[z]), K) — dynamic reduction length
+    // Band hint of the bounded anchor (exact: everything skipped is a zero
+    // of the operand). 0 = none; 1 = C[i,j] needed only for j − i ∈ [lo, hi]
+    // (a tile wholly outside is written as zeros); 2 = the reduction index
+    // k of row i is needed only for k − i ∈ [lo, hi]; 3 = only for
+    // i − k ∈ [lo, hi]. KV groups whose bit is set in wide_mask (h index of
+    // the batch) use [lo_w, hi_w].
+    uint band;
+    int lo, hi, lo_w, hi_w;
+    uint wide_mask;
 };
 
 #define BM 64u
@@ -1075,6 +1084,7 @@ kernel void gemm_f32(
     uint  sgid [[simdgroup_index_in_threadgroup]])
 {
     uint Kdim = g.K;
+    uint kbeg = 0u;
     {
         uint z = tgid.z;
         if (g.kdyn == 1u) { Kdim = min(((kcount[z] + 63u) / 64u) * 64u, g.K); }
@@ -1085,6 +1095,21 @@ kernel void gemm_f32(
         A += bb * g.sa_b + hb * g.sa_h + cb * g.sa_c;
         B += bb * g.sb_b + hb * g.sb_h + cb * g.sb_c;
         C += bb * g.sc_b + hb * g.sc_h + cb * g.sc_c;
+        if (g.band != 0u) {
+            const bool wide = ((g.wide_mask >> hb) & 1u) != 0u;
+            const long lo = wide ? g.lo_w : g.lo, hi = wide ? g.hi_w : g.hi;
+            const long im0 = (long)(tgid.y * BM), in0 = (long)(tgid.x * BN);
+            if (g.band == 1u) {
+                if (in0 + 63 - im0 < lo || in0 - (im0 + 63) > hi) Kdim = 0u;
+            } else {
+                const long k0 = (g.band == 2u) ? im0 + lo : im0 - hi;
+                const long k1 = (g.band == 2u) ? im0 + 63 + hi : im0 + 63 - lo;
+                const long kb = max(k0, 0l) / (long)BK * (long)BK;
+                const long ke = min((k1 + (long)BK) / (long)BK * (long)BK, (long)Kdim);
+                kbeg = (uint)min(kb, (long)Kdim);
+                Kdim = (uint)max(ke, (long)kbeg);
+            }
+        }
     }
     // One 16 KB arena: sA = [BM][BK] (m-major, k contiguous),
     // sB = [BK][BN] (k-major, n contiguous). After the K loop the same
@@ -1107,7 +1132,7 @@ kernel void gemm_f32(
         }
     }
 
-    for (uint k0 = 0; k0 < Kdim; k0 += BK) {
+    for (uint k0 = kbeg; k0 < Kdim; k0 += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // ---- A tile: BM×BK = 2048 floats, 512 float4, 4 per thread ----
         if (!TA) {
@@ -2568,6 +2593,9 @@ struct SoftmaxArgs {
     uint window;    // band width in keys incl. the current one (0 = full)
     uint carry_pad; // columns of the carried-key block (keys of the previous window, positions −carry_pad..−1)
     uint bps;       // blocks per sequence (the carry mask is per sequence)
+    uint wide_window; // band of the wide KV groups (swa_sink_v2)
+    uint wide_mask;   // bit g set = KV group g uses wide_window (0 = every group `window`)
+    uint group;       // heads per KV group (block % bps = head)
 };
 
 // Row `row` (query position carry_pad + row of the joint sequence) keeps
@@ -2592,13 +2620,17 @@ kernel void causal_softmax_rows_f32(
     uint cb = a.sink_pad + a.carry_pad;   // column of the causal block
     // valid columns: [0, sink) ∪ [clo, cb) (carried, if valid) ∪ [lo, jmax)
     uint jmax = cb + row + 1u;
+    uint win = a.window;
+    if (((a.wide_mask >> ((tgp.y % a.bps) / a.group)) & 1u) != 0u) win = a.wide_window;
     uint lo = cb;
-    if (a.window > 0u && row + 1u > a.window) lo = cb + row + 1u - a.window;
+    if (win > 0u && row + 1u > win) lo = cb + row + 1u - win;
     uint clo = cb;   // empty carried range by default
-    if (a.carry_pad > 0u && cmask[tgp.y / a.bps] != 0u) {
-        uint back = (a.window > 0u) ? a.window - 1u : a.carry_pad;   // carried keys within the band
+    uint cvalid = (a.carry_pad > 0u) ? cmask[tgp.y / a.bps] : 0u;   // carried keys of this stream
+    if (cvalid != 0u) {
+        uint back = (win > 0u) ? win - 1u : a.carry_pad;   // carried keys within the band
         clo = (back >= a.carry_pad + row + 1u) ? a.sink_pad : cb - (back - row);
         if (back < row + 1u) clo = cb;
+        clo = max(clo, cb - min(cvalid, a.carry_pad));
     }
     float mx = -INFINITY;
     for (uint j = clo + tid; j < cb; j += 256u) mx = max(mx, r[j]);
@@ -3699,4 +3731,305 @@ kernel void conv1d_dw_f32(
         }
     }
     dw[gid] += s;
+}
+
+// ---------------------------------------------------------------------
+// GDN mixer, chunked WY/UT form (gdn_wy.rs): line-for-line ports of the
+// WGSL ops 64-78 of vulkan.rs (same buffers in the same slots a..l =
+// buffer(0..11), the same parameter words P[k] = U(k)), one thread per
+// element of the WGSL `z` grid. Common words: P1=B P2=T P3=nv P4=dk P5=dv
+// P6=c_dim P7=ab_ld P8=nch; P12=chunk; P9/P10 = A_log / dt_bias offsets in
+// the parameter arena, P11 = β ≡ 1.
+// ---------------------------------------------------------------------
+
+inline float wy_softplus(float x) { return (x > 20.0f) ? x : log(1.0f + exp(x)); }
+
+// op 78: zero checkpoint slot 0 of every (b,h). P1=nb P2=slots P3=ss
+kernel void gdn_wy_zero_s0_f32(device float* a [[buffer(0)]], constant uint* P [[buffer(12)]],
+                               uint z [[thread_position_in_grid]]) {
+    if (z >= P[1] * P[3]) return;
+    const uint bh = z / P[3], ee = z % P[3];
+    a[(bh * P[2]) * P[3] + ee] = 0.0f;
+}
+
+// op 64: per-(b,h,chunk) lg (cumulative log α), γ, β, ρ = γ_end/γ_j
+kernel void gdn_wy_scal_f32(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]],
+                            device const float* c [[buffer(2)]], device float* d [[buffer(3)]],
+                            device float* e [[buffer(4)]], device float* f [[buffer(5)]],
+                            device float* g [[buffer(6)]], constant uint* P [[buffer(12)]],
+                            uint z [[thread_position_in_grid]]) {
+    const uint nch = P[8];
+    if (z >= P[1] * P[3] * nch) return;
+    const uint bh = z / nch, cc = z % nch, bb = bh / P[3], hh = bh % P[3], T = P[2], ld = P[7];
+    const float ea = exp(c[P[9] + hh]), dt = c[P[10] + hh];
+    float acc = 0.0f;
+    for (uint ii = 0u; ii < 64u; ++ii) {
+        const uint t = cc * 64u + ii, row = bb * T + t;
+        const float sp = wy_softplus(a[row * ld + hh] + dt);
+        acc = acc - ea * sp;
+        d[bh * T + t] = acc;
+        e[bh * T + t] = exp(acc);
+        f[bh * T + t] = (P[11] == 1u) ? 1.0f : 1.0f / (1.0f + exp(-b[row * ld + hh]));
+    }
+    const float lend = acc;
+    for (uint ii = 0u; ii < 64u; ++ii) {
+        const uint t = cc * 64u + ii;
+        g[bh * T + t] = exp(lend - d[bh * T + t]);
+    }
+}
+
+// op 65: per-(row,head) q̂, k̂ (q̂ /√dk), γq̂, γk̂, V chunk-major
+kernel void gdn_wy_norm_f32(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]],
+                            device float* c [[buffer(2)]], device float* d [[buffer(3)]],
+                            device float* e [[buffer(4)]], device float* f [[buffer(5)]],
+                            device float* g [[buffer(6)]], constant uint* P [[buffer(12)]],
+                            uint z [[thread_position_in_grid]]) {
+    const uint nv = P[3];
+    if (z >= P[1] * P[2] * nv) return;
+    const uint row = z / nv, hh = z % nv, T = P[2], dk = P[4], dv = P[5], cd = P[6], nch = P[8];
+    const uint bb = row / T, t = row % T, bh = bb * nv + hh;
+    const float gm = b[bh * T + t];
+    float qn2 = 0.0f, kn2 = 0.0f;
+    for (uint ii = 0u; ii < dk; ++ii) {
+        const float qv = a[row * cd + hh * dk + ii], kv = a[row * cd + nv * dk + hh * dk + ii];
+        qn2 = qn2 + qv * qv;
+        kn2 = kn2 + kv * kv;
+    }
+    const float iq = rsqrt(qn2 + 1.0e-6f) * rsqrt((float)dk), ik = rsqrt(kn2 + 1.0e-6f);
+    for (uint ii = 0u; ii < dk; ++ii) {
+        const uint o = row * nv * dk + hh * dk + ii;
+        const float qv = a[row * cd + hh * dk + ii] * iq, kv = a[row * cd + nv * dk + hh * dk + ii] * ik;
+        c[o] = qv; d[o] = kv; e[o] = gm * qv; f[o] = gm * kv;
+    }
+    const uint cc = t / 64u, il = t % 64u;
+    for (uint vv = 0u; vv < dv; ++vv) g[((bh * nch + cc) * 64u + il) * dv + vv] = a[row * cd + 2u * nv * dk + hh * dv + vv];
+}
+
+// op 66: masks. a=kk(raw) b=qk(in→P out) c=lg d=bet e=lmat(out)
+kernel void gdn_wy_mask_f32(device const float* a [[buffer(0)]], device float* b [[buffer(1)]],
+                            device const float* c [[buffer(2)]], device const float* d [[buffer(3)]],
+                            device float* e [[buffer(4)]], constant uint* P [[buffer(12)]],
+                            uint z [[thread_position_in_grid]]) {
+    const uint nch = P[8], T = P[2];
+    if (z >= P[1] * P[3] * nch * 4096u) return;
+    const uint bhc = z / 4096u, ee = z % 4096u, ii = ee / 64u, jj = ee % 64u, bh = bhc / nch, cc = bhc % nch;
+    const uint ti = bh * T + cc * 64u + ii, tj = bh * T + cc * 64u + jj;
+    const float G = (ii >= jj) ? exp(c[ti] - c[tj]) : 0.0f;
+    e[z] = (ii > jj) ? a[z] * G * d[tj] : 0.0f;
+    b[z] = (ii >= jj) ? b[z] * G : 0.0f;
+}
+
+// op 67: T = (I+L)^{-1} by forward substitution, one thread per (chunk, column)
+kernel void gdn_wy_ut_f32(device const float* a [[buffer(0)]], device float* b [[buffer(1)]],
+                          constant uint* P [[buffer(12)]], uint z [[thread_position_in_grid]]) {
+    const uint nch = P[8];
+    if (z >= P[1] * P[3] * nch * 64u) return;
+    const uint bhc = z / 64u, col = z % 64u, base = bhc * 4096u;
+    for (uint ii = 0u; ii < 64u; ++ii) {
+        float s = (ii == col) ? 1.0f : 0.0f;
+        for (uint jj = 0u; jj < ii; ++jj) s = s - a[base + ii * 64u + jj] * b[base + jj * 64u + col];
+        b[base + ii * 64u + col] = s;
+    }
+}
+
+// op 68: S_{c+1} := γ_end·S_c
+kernel void gdn_wy_sscale_f32(device float* a [[buffer(0)]], device const float* b [[buffer(1)]],
+                              constant uint* P [[buffer(12)]], uint z [[thread_position_in_grid]]) {
+    const uint ss = P[4] * P[5], T = P[2], nch = P[8], cc = P[12];
+    if (z >= P[1] * P[3] * ss) return;
+    const uint bh = z / ss, ee = z % ss;
+    const float gend = b[bh * T + cc * 64u + 63u];
+    a[(bh * (nch + 1u) + cc + 1u) * ss + ee] = gend * a[(bh * (nch + 1u) + cc) * ss + ee];
+}
+
+// op 69: U = β E', Ũ = ρ U for chunk c
+kernel void gdn_wy_u_f32(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]],
+                         device const float* c [[buffer(2)]], device float* d [[buffer(3)]],
+                         device float* e [[buffer(4)]], constant uint* P [[buffer(12)]],
+                         uint z [[thread_position_in_grid]]) {
+    const uint dv = P[5], T = P[2], nch = P[8], cc = P[12];
+    if (z >= P[1] * P[3] * 64u * dv) return;
+    const uint bh = z / (64u * dv), r = z % (64u * dv), ii = r / dv, vv = r % dv, t = cc * 64u + ii;
+    const uint idx = ((bh * nch + cc) * 64u + ii) * dv + vv;
+    const float u = b[bh * T + t] * a[idx];
+    d[idx] = u;
+    e[idx] = c[bh * T + t] * u;
+}
+
+// op 70: dU += ρ dŨ; dρ, dβ; dE' = β dU
+kernel void gdn_wy_du_f32(device float* a [[buffer(0)]], device const float* b [[buffer(1)]],
+                          device const float* c [[buffer(2)]], device const float* d [[buffer(3)]],
+                          device const float* e [[buffer(4)]], device const float* f [[buffer(5)]],
+                          device float* g [[buffer(6)]], device float* h [[buffer(7)]],
+                          device float* i [[buffer(8)]], constant uint* P [[buffer(12)]],
+                          uint z [[thread_position_in_grid]]) {
+    const uint dv = P[5], T = P[2], nch = P[8], cc = P[12];
+    if (z >= P[1] * P[3] * 64u) return;
+    const uint bh = z / 64u, ii = z % 64u, t = cc * 64u + ii;
+    const uint base = ((bh * nch + cc) * 64u + ii) * dv, dub = (bh * 64u + ii) * dv;
+    const float rh = f[bh * T + t], be = e[bh * T + t];
+    float dr = 0.0f, dbv = 0.0f;
+    for (uint vv = 0u; vv < dv; ++vv) {
+        const float dutv = b[dub + vv];
+        const float duv = a[dub + vv] + rh * dutv;
+        a[dub + vv] = duv;
+        dr = dr + dutv * c[base + vv];
+        dbv = dbv + duv * d[base + vv];
+        g[dub + vv] = be * duv;
+    }
+    h[bh * T + t] = dr;
+    i[bh * T + t] = dbv;
+}
+
+// op 71: dS_c += γ_end dS_{c+1}
+kernel void gdn_wy_dstate_f32(device float* a [[buffer(0)]], device const float* b [[buffer(1)]],
+                              device const float* c [[buffer(2)]], constant uint* P [[buffer(12)]],
+                              uint z [[thread_position_in_grid]]) {
+    const uint ss = P[4] * P[5], T = P[2], cc = P[12];
+    if (z >= P[1] * P[3] * ss) return;
+    const uint bh = z / ss;
+    a[z] = a[z] + c[bh * T + cc * 64u + 63u] * b[z];
+}
+
+// op 72: dgend partials, 64 per (b,h) in fixed chunks; op 80 folds them in order
+kernel void gdn_wy_dgend_f32(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]],
+                             device float* d [[buffer(3)]], constant uint* P [[buffer(12)]],
+                             uint z [[thread_position_in_grid]]) {
+    const uint ss = P[4] * P[5], nch = P[8], cc = P[12];
+    if (z >= P[1] * P[3] * 64u) return;
+    const uint bh = z / 64u, pi = z % 64u, ch = (ss + 63u) / 64u, lo = pi * ch, hi = min(lo + ch, ss);
+    float s = 0.0f;
+    for (uint ee = lo; ee < hi; ++ee) s = s + a[bh * ss + ee] * b[(bh * (nch + 1u) + cc) * ss + ee];
+    d[z] = s;
+}
+
+kernel void gdn_wy_dgend_fold_f32(device const float* a [[buffer(0)]], device float* b [[buffer(1)]],
+                                  constant uint* P [[buffer(12)]], uint z [[thread_position_in_grid]]) {
+    const uint nch = P[8], cc = P[12];
+    if (z >= P[1] * P[3]) return;
+    float s = 0.0f;
+    for (uint i = 0u; i < 64u; ++i) s = s + a[z * 64u + i];
+    b[z * nch + cc] = s;
+}
+
+// op 73: mask backward reductions per (chunk, i)
+kernel void gdn_wy_mask_bwd_red_f32(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]],
+                                    device const float* c [[buffer(2)]], device const float* d [[buffer(3)]],
+                                    device const float* e [[buffer(4)]], device const float* f [[buffer(5)]],
+                                    device const float* g [[buffer(6)]], device float* h [[buffer(7)]],
+                                    device float* i [[buffer(8)]], constant uint* P [[buffer(12)]],
+                                    uint z [[thread_position_in_grid]]) {
+    const uint nch = P[8], T = P[2];
+    if (z >= P[1] * P[3] * nch * 64u) return;
+    const uint bhc = z / 64u, ii = z % 64u, bh = bhc / nch, cc = bhc % nch, base = bhc * 4096u;
+    const uint ti = bh * T + cc * 64u + ii;
+    float rs = 0.0f;
+    for (uint jj = 0u; jj <= ii; ++jj) { const uint q = base + ii * 64u + jj; rs = rs + a[q] * b[q] + c[q] * d[q]; }
+    float cs = 0.0f, dbv = 0.0f;
+    for (uint kk0 = ii; kk0 < 64u; ++kk0) {
+        const uint q = base + kk0 * 64u + ii;
+        cs = cs + a[q] * b[q] + c[q] * d[q];
+        if (kk0 > ii) { const uint tk = bh * T + cc * 64u + kk0; dbv = dbv + c[q] * e[q] * exp(f[tk] - f[ti]); }
+    }
+    (void)g;
+    h[ti] = rs - cs;
+    i[ti] = i[ti] + dbv;
+}
+
+// op 74: dP := dP⊙Γ (lower incl), dL := dL⊙Γ·β_j (strict lower)
+kernel void gdn_wy_mask_bwd_f32(device float* a [[buffer(0)]], device float* b [[buffer(1)]],
+                                device const float* c [[buffer(2)]], device const float* d [[buffer(3)]],
+                                constant uint* P [[buffer(12)]], uint z [[thread_position_in_grid]]) {
+    const uint nch = P[8], T = P[2];
+    if (z >= P[1] * P[3] * nch * 4096u) return;
+    const uint bhc = z / 4096u, ee = z % 4096u, ii = ee / 64u, jj = ee % 64u, bh = bhc / nch, cc = bhc % nch;
+    const uint ti = bh * T + cc * 64u + ii, tj = bh * T + cc * 64u + jj;
+    const float G = (ii >= jj) ? exp(c[ti] - c[tj]) : 0.0f;
+    a[z] = (ii >= jj) ? a[z] * G : 0.0f;
+    b[z] = (ii > jj) ? b[z] * G * d[tj] : 0.0f;
+}
+
+// op 75: per-(b,h,chunk) decay gradient + reverse cumsum into dla
+kernel void gdn_wy_dlg_f32(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]],
+                           device const float* c [[buffer(2)]], device const float* d [[buffer(3)]],
+                           device const float* e [[buffer(4)]], device const float* f [[buffer(5)]],
+                           device const float* g [[buffer(6)]], device const float* h [[buffer(7)]],
+                           device const float* i [[buffer(8)]], device const float* j [[buffer(9)]],
+                           device const float* k [[buffer(10)]], device float* l [[buffer(11)]],
+                           constant uint* P [[buffer(12)]], uint z [[thread_position_in_grid]]) {
+    const uint nch = P[8], T = P[2], nv = P[3], dk = P[4];
+    if (z >= P[1] * nv * nch) return;
+    const uint bh = z / nch, cc = z % nch, bb = bh / nv, hh = bh % nv;
+    float srho = 0.0f;
+    for (uint ii = 0u; ii < 64u; ++ii) { const uint t = bh * T + cc * 64u + ii; srho = srho + g[t] * j[t]; }
+    float acc = 0.0f;
+    for (uint ir = 64u; ir > 0u; --ir) {
+        const uint ii = ir - 1u, t = cc * 64u + ii, tt = bh * T + t, row = bb * T + t;
+        float gq = 0.0f, gk = 0.0f;
+        for (uint dd = 0u; dd < dk; ++dd) {
+            const uint o = row * nv * dk + hh * dk + dd;
+            gq = gq + c[o] * e[o];
+            gk = gk + d[o] * f[o];
+        }
+        float dlg = k[tt] * (gq + gk) + h[tt] - g[tt] * j[tt];
+        if (ii == 63u) dlg = dlg + srho + k[tt] * i[bh * nch + cc];
+        acc = acc + dlg;
+        l[tt] = acc;
+    }
+    (void)a; (void)b;
+}
+
+// op 76: per-(b,h): da, db and the (A_log, dt_bias) partials
+kernel void gdn_wy_dscal_f32(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]],
+                             device const float* c [[buffer(2)]], device const float* d [[buffer(3)]],
+                             device const float* e [[buffer(4)]], device float* f [[buffer(5)]],
+                             device float* g [[buffer(6)]], device float* h [[buffer(7)]],
+                             constant uint* P [[buffer(12)]], uint z [[thread_position_in_grid]]) {
+    const uint nv = P[3], T = P[2], ld = P[7];
+    if (z >= P[1] * nv) return;
+    const uint bh = z, bb = bh / nv, hh = bh % nv;
+    const float ea = exp(c[P[9] + hh]), dt = c[P[10] + hh];
+    float pa = 0.0f, pd = 0.0f;
+    for (uint t = 0u; t < T; ++t) {
+        const uint row = bb * T + t;
+        const float aa = b[row * ld + hh] + dt;
+        const float sp = wy_softplus(aa), sg = 1.0f / (1.0f + exp(-aa));
+        const float dl = a[bh * T + t], d_a = dl * (-ea * sg);
+        f[row * ld + hh] = d_a;
+        pa = pa + dl * (-ea * sp);
+        pd = pd + d_a;
+        const float be = e[bh * T + t];
+        g[row * ld + hh] = (P[11] == 1u) ? 0.0f : d[bh * T + t] * be * (1.0f - be);
+    }
+    h[bh * 2u] = pa;
+    h[bh * 2u + 1u] = pd;
+}
+
+// op 77: q/k norm backward into the q/k columns of dcv
+kernel void gdn_wy_dnorm_f32(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]],
+                             device const float* c [[buffer(2)]], device const float* d [[buffer(3)]],
+                             device const float* e [[buffer(4)]], device const float* f [[buffer(5)]],
+                             device float* g [[buffer(6)]], constant uint* P [[buffer(12)]],
+                             uint z [[thread_position_in_grid]]) {
+    const uint nv = P[3];
+    if (z >= P[1] * P[2] * nv) return;
+    const uint row = z / nv, hh = z % nv, T = P[2], dk = P[4], cd = P[6], bb = row / T, t = row % T;
+    const float gm = f[(bb * nv + hh) * T + t];
+    float qn2 = 0.0f, kn2 = 0.0f, dq = 0.0f, dkd = 0.0f;
+    for (uint ii = 0u; ii < dk; ++ii) {
+        const uint o = row * nv * dk + hh * dk + ii;
+        const float qv = e[row * cd + hh * dk + ii], kv = e[row * cd + nv * dk + hh * dk + ii];
+        qn2 = qn2 + qv * qv;
+        kn2 = kn2 + kv * kv;
+        dq = dq + (a[o] + gm * c[o]) * qv;
+        dkd = dkd + (b[o] + gm * d[o]) * kv;
+    }
+    const float iq = rsqrt(qn2 + 1.0e-6f) * rsqrt((float)dk), ik = rsqrt(kn2 + 1.0e-6f);
+    for (uint ii = 0u; ii < dk; ++ii) {
+        const uint o = row * nv * dk + hh * dk + ii;
+        const float qv = e[row * cd + hh * dk + ii], kv = e[row * cd + nv * dk + hh * dk + ii];
+        const float dQ = a[o] + gm * c[o], dK = b[o] + gm * d[o];
+        g[row * cd + hh * dk + ii] = iq * dQ - qv * iq * iq * iq * (float)dk * dq;
+        g[row * cd + nv * dk + hh * dk + ii] = ik * dK - kv * ik * ik * ik * dkd;
+    }
 }

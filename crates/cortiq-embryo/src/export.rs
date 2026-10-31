@@ -190,6 +190,13 @@ pub fn arch_json(cfg: &EmbryoCfg) -> serde_json::Value {
         if !cfg.anchor_train_windows.is_empty() {
             ac["train_windows"] = serde_json::json!(cfg.anchor_train_windows);
         }
+        // wide KV groups: v2, ring = the widest window, one window per group
+        let groups = cfg.anchor_group_windows();
+        if !groups.is_empty() {
+            ac["kind"] = serde_json::json!("swa_sink_v2");
+            ac["window"] = serde_json::json!(cfg.anchor_max_window());
+            ac["group_windows"] = serde_json::json!(groups);
+        }
         j["anchor_core"] = ac;
     }
     j
@@ -400,6 +407,125 @@ pub fn build_export_sources(
     export_dtype: TensorDtype,
     genome: Option<&ExportGenome>,
 ) -> anyhow::Result<(CmfHeader, Vec<TensorSpec>, Vec<F16Source>)> {
+    build_export_all(ck, tokenizer_json, export_dtype, genome).map(|(h, t, f16, _)| (h, t, f16))
+}
+
+/// Rebuild a trainer checkpoint from an Embryo export: the config comes from
+/// `provenance.trainer_cfg`, every arena tensor is copied back to the slice
+/// the export read it from, and the expert descriptors return to the
+/// `desc.*` extras. Records appended after the export (skills, lookup) are
+/// not part of the trunk and are left out. The result is checked by
+/// exporting it again: every trunk tensor must come back byte for byte, so
+/// the checkpoint IS the exported trunk (no optimizer moments).
+/// Returns the checkpoint, the file's tokenizer.json and the number of
+/// file tensors that are not part of the trunk.
+pub fn import_cmf(path: &Path) -> anyhow::Result<(Checkpoint, Vec<u8>, usize)> {
+    let m = CmfModel::open(path)?;
+    let prov = m
+        .header
+        .provenance
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("{}: no provenance record", path.display()))?;
+    anyhow::ensure!(
+        prov["producer"] == "cortiq-embryo",
+        "{}: not an Embryo export (producer {})",
+        path.display(),
+        prov["producer"]
+    );
+    let cfg: EmbryoCfg = serde_json::from_value(prov["trainer_cfg"].clone())?;
+    let step = prov["step"].as_u64().unwrap_or(0) as u32;
+    let dtype = match prov["export_dtype"].as_str() {
+        Some("f16") => TensorDtype::F16,
+        _ => TensorDtype::F32,
+    };
+    let tok = m
+        .vocab
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("{}: no tokenizer in the VOCAB section", path.display()))?;
+    let lay = Layout::new(&cfg);
+    let (l, ne, h) = (cfg.layers, cfg.experts, cfg.hidden);
+    let k = crate::model::MOE_K;
+    let mut ck = Checkpoint {
+        cfg,
+        step,
+        params: vec![0.0; lay.total],
+        m: None,
+        v: None,
+        extras: vec![
+            ("desc.mu".into(), vec![0.0; l * ne * h]),
+            ("desc.u".into(), vec![0.0; l * ne * k * h]),
+            ("desc.bias".into(), vec![0.0; l * ne]),
+        ],
+    };
+    let read = |name: &str, n: usize| -> anyhow::Result<Vec<f32>> {
+        let e = m
+            .tensor(name)
+            .ok_or_else(|| anyhow::anyhow!("{}: missing trunk tensor {name}", path.display()))?;
+        let b = m.tensor_bytes(name)?;
+        let x: Vec<f32> = match e.dtype {
+            TensorDtype::F32 => b
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+            TensorDtype::F16 => b
+                .chunks_exact(2)
+                .map(|c| cortiq_core::quant::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect(),
+            d => anyhow::bail!("{name}: dtype {d:?} is not an Embryo export dtype"),
+        };
+        anyhow::ensure!(x.len() == n, "{name}: {} elements, expected {n}", x.len());
+        Ok(x)
+    };
+    // where every tensor comes from, from an export of the zero arena
+    let (_, specs, _, sources) = build_export_all(&ck, &tok, TensorDtype::F32, None)?;
+    anyhow::ensure!(
+        specs.len() == sources.len() && specs.iter().zip(&sources).all(|(s, r)| s.name == r.name),
+        "export source map out of step with the tensor list"
+    );
+    for (s, src) in specs.iter().zip(&sources) {
+        if let Some(off) = src.arena_offset {
+            ck.params[off..off + src.len].copy_from_slice(&read(&s.name, src.len)?);
+            continue;
+        }
+        // model.layers.{l}.mlp.experts.{e}.desc.{mu|u|bias}
+        let Some((pre, field)) = s.name.rsplit_once(".desc.") else {
+            continue; // derived from the config (hybrid_k A_log, κ bias): checked below
+        };
+        let mut it = pre.split('.');
+        let li: usize = it.nth(2).and_then(|x| x.parse().ok()).unwrap_or(usize::MAX);
+        let e: usize = it.nth(2).and_then(|x| x.parse().ok()).unwrap_or(usize::MAX);
+        anyhow::ensure!(li < l && e < ne, "{}: unexpected descriptor name", s.name);
+        let (slot, base, n) = match field {
+            "mu" => (0, (li * ne + e) * h, h),
+            "u" => (1, (li * ne + e) * k * h, k * h),
+            "bias" => (2, li * ne + e, 1),
+            _ => anyhow::bail!("{}: unexpected descriptor field", s.name),
+        };
+        ck.extras[slot].1[base..base + n].copy_from_slice(&read(&s.name, n)?);
+    }
+    if m.tensor("model.layers.0.mlp.experts.0.desc.u").is_none() {
+        ck.extras.retain(|(n, _)| n != "desc.u");
+    }
+    let (_, again, _, _) = build_export_all(&ck, &tok, dtype, None)?;
+    for s in &again {
+        anyhow::ensure!(
+            m.tensor_bytes(&s.name)? == s.data.as_slice(),
+            "{}: the re-export differs from the file — the import is not exact",
+            s.name
+        );
+    }
+    let foreign = m.tensors.len() - again.len();
+    Ok((ck, tok, foreign))
+}
+
+/// [`build_export_sources`] plus the arena source of EVERY tensor (f32 and
+/// f16 alike), in tensor order — the map [`import_cmf`] inverts.
+fn build_export_all(
+    ck: &Checkpoint,
+    tokenizer_json: &[u8],
+    export_dtype: TensorDtype,
+    genome: Option<&ExportGenome>,
+) -> anyhow::Result<(CmfHeader, Vec<TensorSpec>, Vec<F16Source>, Vec<F16Source>)> {
     anyhow::ensure!(
         matches!(export_dtype, TensorDtype::F32 | TensorDtype::F16),
         "Embryo export dtype must be f32 or f16"
@@ -417,16 +543,22 @@ pub fn build_export_sources(
     let h = cfg.hidden;
     let sl = |off: usize, n: usize| &p[off..off + n];
     let mut t: Vec<TensorSpec> = Vec::new();
-    let spec_f32 = |name: &str, shape: &[usize], data: &[f32]| spec(name, shape, data, TensorDtype::F32);
+    let all_sources = std::cell::RefCell::new(Vec::<F16Source>::new());
+    let source = |name: &str, data: &[f32]| F16Source {
+        name: name.to_string(),
+        arena_offset: arena_offset(p, data),
+        len: data.len(),
+    };
+    let spec_f32 = |name: &str, shape: &[usize], data: &[f32]| {
+        all_sources.borrow_mut().push(source(name, data));
+        spec(name, shape, data, TensorDtype::F32)
+    };
     let f16_sources = std::cell::RefCell::new(Vec::<F16Source>::new());
     let spec = |name: &str, shape: &[usize], data: &[f32]| {
         let s = spec(name, shape, data, export_dtype);
+        all_sources.borrow_mut().push(source(name, data));
         if s.dtype == TensorDtype::F16 {
-            f16_sources.borrow_mut().push(F16Source {
-                name: name.to_string(),
-                arena_offset: arena_offset(p, data),
-                len: data.len(),
-            });
+            f16_sources.borrow_mut().push(source(name, data));
         }
         s
     };
@@ -804,5 +936,5 @@ pub fn build_export_sources(
             }),
         )];
     }
-    Ok((header, t, f16_sources.into_inner()))
+    Ok((header, t, f16_sources.into_inner(), all_sources.into_inner()))
 }

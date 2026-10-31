@@ -300,6 +300,7 @@ fn fixture(tag: &str) -> Option<Fixture> {
         &sft[2],
         &dir.join("manifest.json"),
         None,
+        false,
     )
     .expect("prepare SFT shards");
     // raw-LM shards (train / dev disjoint halves of a text)

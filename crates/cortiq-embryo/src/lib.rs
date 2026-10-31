@@ -19,7 +19,7 @@ pub mod cli;
 pub mod corpus;
 pub mod data;
 pub mod export;
-#[cfg(all(feature = "vulkan", not(target_os = "macos")))]
+#[cfg(any(target_os = "macos", feature = "vulkan"))]
 pub mod gdn_wy;
 #[cfg(any(target_os = "macos", feature = "vulkan"))]
 pub mod growth;
@@ -43,6 +43,7 @@ pub mod skill;
 pub mod sleep;
 pub mod tokenizer;
 pub mod train;
+pub mod trunk;
 #[cfg(all(feature = "vulkan", target_os = "macos"))]
 #[path = "vulkan.rs"]
 mod vulkan_validation;

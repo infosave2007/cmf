@@ -44,6 +44,47 @@ fn runtime_matches_gdn_mixer_trainer_logprobs() {
     run_runtime_matches_trainer_logprobs(cfg);
 }
 
+/// `swa_sink_v2`: KV group 1 attends to the last 48 keys while group 0
+/// keeps 16 — the runtime's per-group attend must reproduce the trainer's
+/// per-group band (positions 17..63 see the difference), and the export
+/// must come back through `import_cmf` exactly.
+#[test]
+fn runtime_matches_wide_group_anchor_trainer_logprobs() {
+    let Some(_) = cortiq_embryo::metal::ctx() else {
+        return;
+    };
+    let mut cfg = EmbryoCfg::tiny();
+    cfg.experts = 4;
+    cfg.mixer = Mixer::Gdn;
+    cfg.gdn_heads = 2;
+    cfg.gdn_dk = 32;
+    cfg.gdn_dv = 32;
+    cfg.anchor_window = 16;
+    cfg.anchor_sink = 2;
+    cfg.anchor_q_heads = 4;
+    cfg.anchor_kv_heads = 2;
+    cfg.anchor_wide_window = 48;
+    cfg.anchor_wide_groups = vec![1];
+    // the wide band must change the function, or the parity below is vacuous
+    let (b, t) = (1usize, 64usize);
+    let p = init_params(&cfg, &Layout::new(&cfg), 5);
+    let tokens: Vec<u32> = lcg_vec(21, t)
+        .iter()
+        .map(|x| ((x * 0.5 + 0.5) * cfg.vocab as f32) as u32 % cfg.vocab as u32)
+        .collect();
+    let narrow = EmbryoCfg { anchor_wide_window: 0, anchor_wide_groups: Vec::new(), ..cfg.clone() };
+    // dropless: expert capacity must not couple early tokens to late ones
+    let xw = EmbryoGpu::new_eval_dropless(cfg.clone(), b, t, &p).expect("gpu").forward_hidden(&tokens);
+    let xn = EmbryoGpu::new_eval_dropless(narrow, b, t, &p).expect("gpu").forward_hidden(&tokens);
+    let h = cfg.hidden;
+    let d_early = (0..16 * h).map(|i| (xw[i] - xn[i]).abs()).fold(0.0f32, f32::max);
+    let d_late = (40 * h..t * h).map(|i| (xw[i] - xn[i]).abs()).fold(0.0f32, f32::max);
+    eprintln!("wide vs narrow hidden: positions < 16 max|Δ| {d_early:.2e}, positions ≥ 40 {d_late:.2e}");
+    assert!(d_early == 0.0, "inside the narrow window the bands coincide: {d_early:e}");
+    assert!(d_late > 1e-4, "the wide group changes nothing: {d_late:e}");
+    run_runtime_matches_trainer_logprobs(cfg);
+}
+
 fn run_runtime_matches_trainer_logprobs(cfg: EmbryoCfg) {
     let Some(_) = cortiq_embryo::metal::ctx() else {
         return;
@@ -130,6 +171,22 @@ fn run_runtime_matches_trainer_logprobs(cfg: EmbryoCfg) {
         let path = dir.join(format!("tiny-{profile}.cmf"));
         cortiq_embryo::export::export_with_dtype(&ck, tok_json.as_bytes(), &path, dtype)
             .expect("export");
+        if cfg.is_gdn_mixer() {
+            // every GDN-genome parameter is exported: the import is the
+            // checkpoint again (f16: the served, rounded trunk)
+            let (back, tok_back, foreign) =
+                cortiq_embryo::export::import_cmf(&path).expect("import_cmf");
+            let served = cortiq_embryo::export::served_params(&ck, tok_json.as_bytes(), dtype)
+                .expect("served params");
+            assert_eq!(foreign, 0);
+            assert_eq!(tok_back, tok_json.as_bytes());
+            assert_eq!(back.cfg.anchor_wide_window, cfg.anchor_wide_window);
+            assert!(back.params == served, "{profile}: imported arena differs");
+            for (name, x) in &ck.extras {
+                let got = back.extras.iter().find(|(n, _)| n == name).map(|(_, y)| y);
+                assert_eq!(got, Some(x), "{profile}: descriptor {name}");
+            }
+        }
         // runtime
         let model =
             std::sync::Arc::new(cortiq_core::format::CmfModel::open(&path).expect("open cmf"));

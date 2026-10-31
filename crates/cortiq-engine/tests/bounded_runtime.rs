@@ -145,6 +145,7 @@ fn arch(g: Geom, bounded: bool) -> ModelArch {
             rope: "relative_in_window".into(),
             sink_scores: "nope".into(),
             train_windows: vec![g.window / 2, g.window],
+            group_windows: Vec::new(),
             far: None,
         }),
         linear_core: Some(cortiq_core::types::LinearCoreConfig {
@@ -520,7 +521,7 @@ fn operator_matches_f64_reference() {
             let v = synth_f32(nkv * hd, 3000 + t as u64, 3.0);
             st.insert(&k, &v);
             let mut out = vec![0f32; nh * hd];
-            st.attend(&q, nh, &sink_k, &sink_v, sink, &rope, 1.0 / (hd as f32).sqrt(), &mut out);
+            st.attend(&q, nh, &sink_k, &sink_v, sink, &[], &rope, 1.0 / (hd as f32).sqrt(), &mut out);
             keys.push(k);
             vals.push(v);
             let reference = f64_reference(

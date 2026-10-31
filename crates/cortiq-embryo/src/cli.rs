@@ -404,8 +404,10 @@ pub fn step_bench(batch: usize, seq: usize, steps: usize, tiny: bool, cfg_json: 
         for (name, ms) in gpu.profile_step() {
             println!("{name:<28} {ms:>8.1} ms");
         }
-        for (name, ms) in gpu.profile_hk_layer(0) {
-            println!("{name:<44} {ms:>8.1} ms");
+        if !cfg.is_gdn_mixer() && !cfg.is_anchor(0) {
+            for (name, ms) in gpu.profile_hk_layer(0) {
+                println!("{name:<44} {ms:>8.1} ms");
+            }
         }
     }
     let flop_per_tok = 6.0 * lay.total as f64;
@@ -470,6 +472,11 @@ pub struct BirthArgs {
     /// (each ≤ the served window); the last 10% of the steps use the served
     /// window
     pub anchor_train_windows: Option<Vec<usize>>,
+    /// `swa_sink_v2`: wide exact window of the KV groups in
+    /// `anchor_wide_groups` (semantic config, no new parameters; applies to
+    /// a fresh birth and on `--resume` alike)
+    pub anchor_wide_window: Option<usize>,
+    pub anchor_wide_groups: Option<Vec<usize>>,
     /// explicit zero-based anchor schedule, e.g. `3,7` (default: every
     /// `--anchor-every`-th layer); on `--resume` it must name the
     /// checkpoint's anchors exactly (the arena layout follows it)
@@ -504,6 +511,13 @@ pub struct BirthArgs {
     pub carry_reset_every: usize,
     /// end-of-text id: a window containing it ends the row's stream
     pub carry_eot: Option<u32>,
+    /// expected synthetic retrieval tasks per row window (0 = off; needs
+    /// `carry`), see [`crate::train::Retrieval`]
+    pub retrieval_rate: f64,
+    /// log-uniform task distance range (min, max) in tokens
+    pub retrieval_dists: (usize, usize),
+    /// at most this many key→value pairs in one pairs task
+    pub retrieval_pairs: usize,
     /// on `--resume`: run the warmup+cosine schedule over the steps of THIS
     /// run (step − resume step over steps − resume step) instead of the
     /// absolute step (a recovery/continuation with its own schedule)
@@ -636,6 +650,22 @@ pub fn birth(a: BirthArgs) {
         if let Some(margin) = a.router_top2_margin {
             cfg.router_top2_margin = Some(margin);
         }
+    }
+    if let Some(w) = a.anchor_wide_window {
+        cfg.anchor_wide_window = w;
+    }
+    if let Some(g) = &a.anchor_wide_groups {
+        cfg.anchor_wide_groups = g.clone();
+    }
+    if a.anchor_wide_window.is_some() || a.anchor_wide_groups.is_some() {
+        cfg.validate_anchor();
+        println!(
+            "anchor wide groups {:?}: window {} (others {}), carried tail {} keys",
+            cfg.anchor_wide_groups,
+            cfg.anchor_wide_window,
+            cfg.anchor_window,
+            cfg.anchor_max_window().div_ceil(64) * 64
+        );
     }
     if let Some(v) = a.vocab {
         cfg.vocab = v;
@@ -805,6 +835,16 @@ pub fn birth(a: BirthArgs) {
             if gpu.carry_pad() > 0 { format!("{} columns", gpu.carry_pad()) } else { "no (legacy full-causal anchor)".into() }
         );
     }
+    // a resumed checkpoint without AdamW moments (e.g. from `import-cmf`):
+    // zero moments with the checkpoint's step would switch the bias
+    // correction off (early updates several × lr), so the optimizer restarts
+    // at step 0 and --steps counts from there
+    let step0 = if a.resume.is_some() && m0.is_none() {
+        println!("resume without optimizer moments: the optimizer restarts at step 0 (was {step0})");
+        0
+    } else {
+        step0
+    };
     if let (Some(m), Some(v)) = (m0, v0) {
         gpu.m.write_from(&m);
         gpu.v.write_from(&v);
@@ -824,14 +864,33 @@ pub fn birth(a: BirthArgs) {
         );
     }
     let mut sampler = Sampler::new(a.batch, a.seq, a.seed.wrapping_add(step0 as u64));
+    assert!(
+        a.retrieval_rate == 0.0 || a.carry,
+        "--retrieval-rate plants tasks into carried streams: add --carry"
+    );
     let mut stream = a.carry.then(|| {
-        crate::train::StreamSampler::new(
+        let st = crate::train::StreamSampler::new(
             a.batch,
             a.seq,
             a.seed.wrapping_add(step0 as u64),
             a.carry_reset_every,
             a.carry_eot,
-        )
+        );
+        if a.retrieval_rate > 0.0 {
+            println!(
+                "retrieval: {} tasks per row window, distance {}..{} (log-uniform), pairs <= {}",
+                a.retrieval_rate, a.retrieval_dists.0, a.retrieval_dists.1, a.retrieval_pairs
+            );
+            st.with_retrieval(crate::train::Retrieval {
+                rate: a.retrieval_rate,
+                dmin: a.retrieval_dists.0,
+                dmax: a.retrieval_dists.1,
+                max_pairs: a.retrieval_pairs,
+                vocab: cfg.vocab,
+            })
+        } else {
+            st
+        }
     });
     let mut carry_acc = a.carry.then(|| CarryAcc::new(cfg.layers));
     let mut last_reset: Vec<bool> = vec![true; a.batch];
@@ -1006,6 +1065,9 @@ pub fn birth(a: BirthArgs) {
         if tick % a.eval_every == 0 || step + 1 == a.steps {
             let vl = eval(&gpu, &mut tokens, &mut targets);
             println!("  val loss {vl:.4}  ppl {:.2}{}", vl.exp(), eval_extra(&gpu, &mut tokens, &mut targets));
+            if let Some(st) = stream.as_ref().filter(|_| a.retrieval_rate > 0.0) {
+                println!("  retrieval: {} tasks planted, {} scored targets", st.planted.0, st.planted.1);
+            }
             let rc = gpu.routing_counts();
             if !rc.is_empty() {
                 let cap = gpu.moe_cap;
@@ -1066,6 +1128,80 @@ pub struct CarryProfileArgs {
     /// long forward (T = one_pass·seq, no carry) and print its per-window
     /// NLL next to the carried numbers (carry ≡ one pass witness)
     pub one_pass: usize,
+}
+
+pub struct PplStreamArgs {
+    pub ckpts: Vec<PathBuf>,
+    pub text: PathBuf,
+    pub tokenizer: PathBuf,
+    pub seq: usize,
+    pub report: Vec<usize>,
+}
+
+/// Prefix perplexity of one text on the GPU (Metal / Vulkan trainer
+/// forward): the text runs as ONE stream of `seq`-token windows with the
+/// recurrent state, conv history and anchor keys carried across windows —
+/// the bounded operator exactly as the runtime streams it — and the ppl of
+/// the first N predicted tokens is printed for every N in `report` (the
+/// `cortiq ppl --tokens N` metric).
+pub fn ppl_stream(a: PplStreamArgs) {
+    let bpe = crate::tokenizer::Bpe::load(&a.tokenizer).expect("load tokenizer");
+    let text = std::fs::read_to_string(&a.text).expect("read text");
+    let mut ids = Vec::new();
+    bpe.encode(&text, &mut std::collections::HashMap::new(), &mut ids);
+    let longest = *a.report.iter().max().expect("--report lengths");
+    let wins = longest.div_ceil(a.seq);
+    assert!(
+        ids.len() > wins * a.seq,
+        "{} has {} tokens, {} windows of {} need {}",
+        a.text.display(),
+        ids.len(),
+        wins,
+        a.seq,
+        wins * a.seq + 1
+    );
+    println!(
+        "ppl-stream: {} ({} tokens), windows of {}, one carried stream, report {:?}",
+        a.text.display(),
+        ids.len(),
+        a.seq,
+        a.report
+    );
+    for path in &a.ckpts {
+        let ck = load_checkpoint(path).expect("load checkpoint");
+        let mut gpu = EmbryoGpu::new_carry(ck.cfg.clone(), 1, a.seq, &ck.params, true).expect(NO_DEVICE);
+        gpu.set_desc(&ck.extras);
+        gpu.desc_updates.set(false);
+        let t0 = Instant::now();
+        let mut nll: Vec<f64> = Vec::with_capacity(wins * a.seq);
+        for w in 0..wins {
+            let tk = &ids[w * a.seq..(w + 1) * a.seq];
+            let tg = &ids[w * a.seq + 1..(w + 1) * a.seq + 1];
+            gpu.carry_begin(&[w == 0]);
+            let _ = gpu.eval_loss(tk, tg);
+            nll.extend(gpu.per_position_loss().iter().map(|x| *x as f64));
+            gpu.carry_commit();
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        let cols: Vec<String> = a
+            .report
+            .iter()
+            .map(|&n| {
+                let n = n.min(nll.len());
+                format!("@{}: {:.3}", n, (nll[..n].iter().sum::<f64>() / n as f64).exp())
+            })
+            .collect();
+        println!(
+            "{}: {}  [{:.1} s, {:.0} tok/s, anchor window {} wide {} carried {}]",
+            path.display(),
+            cols.join("  "),
+            secs,
+            nll.len() as f64 / secs,
+            ck.cfg.anchor_window,
+            ck.cfg.anchor_wide_window,
+            gpu.carry_pad()
+        );
+    }
 }
 
 pub fn carry_profile(a: CarryProfileArgs) {

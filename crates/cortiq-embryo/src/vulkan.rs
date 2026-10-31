@@ -63,8 +63,22 @@ struct CtxInner {
     pipelines: Mutex<HashMap<u32, Arc<wgpu::ComputePipeline>>>,
     /// The register-tiled 64×64×32 GEMM (`gemm64` entry point): 256 lanes,
     /// a 4×4 accumulator micro-tile per lane, 16 KB of shared A/B tiles.
-    /// Selected by `CMF_VULKAN_GEMM64=1` for tile-aligned GEMMs.
+    /// On by default for tile-aligned GEMMs (`CMF_VULKAN_GEMM64=0` = off).
     pipeline64: Arc<wgpu::ComputePipeline>,
+    /// The register-blocked 128×128×16 GEMM (`gemm128`, entry id 4): 8×8
+    /// outputs per lane; on by default for M, N % 128, K % 16
+    /// (`CMF_VULKAN_GEMM128=0` falls back to `gemm64` / the tile path).
+    pipeline128: Arc<wgpu::ComputePipeline>,
+    gemm128: bool,
+    /// RMSNorm backward entries (ids 5 = per-row dx, 6 = per-column dW).
+    pipeline_rms_dx: Arc<wgpu::ComputePipeline>,
+    pipeline_rms_dw: Arc<wgpu::ComputePipeline>,
+    /// WY norm / dnorm entries (ids 7, 8; one 128-lane group per row·head).
+    pipeline_wy_norm: Arc<wgpu::ComputePipeline>,
+    pipeline_wy_dnorm: Arc<wgpu::ComputePipeline>,
+    /// Row softmax entries (ids 9 = band + sink forward, 10 = backward).
+    pipeline_softmax_rows: Arc<wgpu::ComputePipeline>,
+    pipeline_softmax_bwd_rows: Arc<wgpu::ComputePipeline>,
     /// GDN mixer token scan entries (one 128-lane workgroup per (b, head)).
     pipeline_gdn_fwd: Arc<wgpu::ComputePipeline>,
     pipeline_gdn_bwd: Arc<wgpu::ComputePipeline>,
@@ -77,6 +91,9 @@ struct CtxInner {
     layout: wgpu::BindGroupLayout,
     dummy: wgpu::Buffer,
     adapter_name: String,
+    /// Split-K partial buffers lent to one `Cmd` at a time (returned on
+    /// commit), so concurrent command streams never share one.
+    splitk_pool: Mutex<Vec<(wgpu::Buffer, usize)>>,
 }
 pub struct Ctx {
     inner: Arc<CtxInner>,
@@ -206,9 +223,19 @@ fn init() -> Result<Ctx, String> {
     };
     let pipeline_gdn_fwd = entry_pipeline("gdn_fwd");
     let pipeline_gdn_bwd = entry_pipeline("gdn_bwd");
+    let pipeline128 = entry_pipeline("gemm128");
+    let pipeline_rms_dx = entry_pipeline("rms_bwd_dx");
+    let pipeline_rms_dw = entry_pipeline("rms_dw");
+    let pipeline_wy_norm = entry_pipeline("wy_norm_rows");
+    let pipeline_wy_dnorm = entry_pipeline("wy_dnorm_rows");
+    let pipeline_softmax_rows = entry_pipeline("band_softmax_rows");
+    let pipeline_softmax_bwd_rows = entry_pipeline("softmax_bwd_rows");
+    let gemm128 = std::env::var("CMF_VULKAN_GEMM128")
+        .map(|v| v != "0")
+        .unwrap_or(true);
     let gemm64 = std::env::var("CMF_VULKAN_GEMM64")
         .map(|v| v != "0")
-        .unwrap_or(false);
+        .unwrap_or(true);
     let dummy = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("embryo-dummy"),
         size: 4,
@@ -265,6 +292,14 @@ fn init() -> Result<Ctx, String> {
             pipeline_layout: Arc::new(pipeline_layout),
             pipelines: Mutex::new(HashMap::new()),
             pipeline64: Arc::new(pipeline64),
+            pipeline128: Arc::new(pipeline128),
+            gemm128,
+            pipeline_rms_dx: Arc::new(pipeline_rms_dx),
+            pipeline_rms_dw: Arc::new(pipeline_rms_dw),
+            pipeline_wy_norm: Arc::new(pipeline_wy_norm),
+            pipeline_wy_dnorm: Arc::new(pipeline_wy_dnorm),
+            pipeline_softmax_rows: Arc::new(pipeline_softmax_rows),
+            pipeline_softmax_bwd_rows: Arc::new(pipeline_softmax_bwd_rows),
             pipeline_gdn_fwd: Arc::new(pipeline_gdn_fwd),
             pipeline_gdn_bwd: Arc::new(pipeline_gdn_bwd),
             gemm64,
@@ -276,6 +311,7 @@ fn init() -> Result<Ctx, String> {
             layout,
             dummy,
             adapter_name: info.name,
+            splitk_pool: Mutex::new(Vec::new()),
         }),
     })
 }
@@ -563,6 +599,8 @@ pub struct Cmd<'a> {
     /// hybrid_k forward scans recorded while set start from checkpoint slot
     /// 0 (state carried across windows) instead of S = 0 (op 29 p[9]).
     hk_carry: std::cell::Cell<bool>,
+    /// The split-K partial buffer this stream borrowed from the pool.
+    splitk: RefCell<Option<(wgpu::Buffer, usize)>>,
 }
 
 impl<'a> Cmd<'a> {
@@ -571,6 +609,7 @@ impl<'a> Cmd<'a> {
             c,
             ops: RefCell::new(Vec::new()),
             hk_carry: std::cell::Cell::new(false),
+            splitk: RefCell::new(None),
         }
     }
     /// Same contract as the Metal `Cmd::set_hk_carry`.
@@ -759,6 +798,7 @@ impl<'a> Cmd<'a> {
             false,
             &GemmDyn::none(),
             Some((table, toff, rows_bound_k)),
+            None,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -787,6 +827,7 @@ impl<'a> Cmd<'a> {
         self.gemm_dyn_table(
             ta, tb, m, n, k, alpha, a, a_off, lda, b, b_off, ldb, beta, c, c_off, ldc, batch,
             causal, dynamic, None,
+            None,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -812,6 +853,7 @@ impl<'a> Cmd<'a> {
         causal: bool,
         dynamic: &GemmDyn<'_>,
         table: GemmTable<'_>,
+        band: Option<&GemmBand>,
     ) {
         let mut p = vec![0; PARAM_WORDS];
         p[1] = (m * n * batch.nb.max(1) * batch.nh.max(1) * batch.nc.max(1)) as u32;
@@ -869,20 +911,70 @@ impl<'a> Cmd<'a> {
         let tile_n = n.div_ceil(16);
         let batches = batch.nb.max(1) * batch.nh.max(1) * batch.nc.max(1);
         let tile_groups = tile_m.saturating_mul(tile_n).saturating_mul(batches);
-        // Register-tiled 64×64×32 entry for tile-aligned, non-dynamic GEMMs
-        // (same ascending-k summation per output as the other paths).
-        if self.c.inner.gemm64
-            && m % 64 == 0
-            && n % 64 == 0
-            && k % 32 == 0
-            && k > 0
-            && dynamic.kcount.is_none()
-            && dynamic.indirect.is_none()
-            && table.is_none()
-        {
+        // Register-blocked entries for aligned, non-table GEMMs (dynamic K /
+        // row bounds included): 128×128×16 when it fills the GPU, else the
+        // 64×64×32 tile (4× more workgroups for the small-output weight
+        // gradients); band hints apply to the 128 entry.
+        let mut dyn_slot: Option<&GBuf> = None;
+        if let Some((kb, _)) = dynamic.kcount {
+            dyn_slot = Some(kb);
+        } else if let Some((ib, _)) = dynamic.indirect {
+            dyn_slot = Some(ib);
+        }
+        let ok128 = self.c.inner.gemm128 && m % 128 == 0 && n % 128 == 0 && k % 16 == 0 && k > 0 && table.is_none();
+        let ok64 = self.c.inner.gemm64 && m % 64 == 0 && n % 64 == 0 && k % 32 == 0 && k > 0 && table.is_none();
+        let tiles128 = (m / 128) * (n / 128) * batches;
+        if ok128 && (tiles128 >= GEMM128_MIN_TILES || !ok64 || band.is_some()) {
+            if let Some(bd) = band {
+                p[38] = bd.mode as u32;
+                p[39] = bd.lo as u32;
+                p[40] = bd.hi as u32;
+                p[41] = bd.lo_w as u32;
+                p[42] = bd.hi_w as u32;
+                p[43] = bd.wide_mask;
+            }
+            p[PARAM_WORDS - 2] = 4;
+            let mut slots = vec![(a, 0), (b, 1), (c, 2)];
+            if let Some(db) = dyn_slot {
+                slots.push((db, 3));
+            }
+            self.rec(OP_GEMM, &slots, p, tiles128 * 256);
+            return;
+        }
+        if ok64 {
             let groups = (m / 64) * (n / 64) * batches;
+            // split-K for long reductions into few output tiles (the weight
+            // gradients): slices of ≥ 256 k until the GPU has ~4 tiles per SM;
+            // partials fold in slice order (deterministic)
+            // only for A-transposed GEMMs (weight gradients: the reduction runs
+            // over the tokens, the output has no batch rows), so a token
+            // row's result never depends on the batch shape
+            let split = if ta == Op::T && batches == 1 && dynamic.indirect.is_none() && k >= 1024 && groups < GEMM_SPLIT_TILES {
+                let want = GEMM_SPLIT_TILES.div_ceil(groups).min(k / 256).max(1);
+                let kslice = k.div_ceil(want).div_ceil(32) * 32;
+                k.div_ceil(kslice).max(1)
+            } else {
+                1
+            };
             p[PARAM_WORDS - 2] = 1;
-            self.rec(OP_GEMM, &[(a, 0), (b, 1), (c, 2)], p, groups * 256);
+            let mut slots = vec![(a, 0), (b, 1), (c, 2)];
+            if let Some(db) = dyn_slot {
+                slots.push((db, 3));
+            }
+            if split > 1 {
+                let kslice = k.div_ceil(split).div_ceil(32) * 32;
+                p[44] = split as u32;
+                p[45] = kslice as u32;
+                let part = self.splitk_scratch(split * m * n);
+                slots.push((&part, 4));
+                let mut fold = p.clone();
+                fold[PARAM_WORDS - 2] = 0;
+                fold[1] = (m * n) as u32;
+                self.rec(OP_GEMM, &slots, p, groups * split * 256);
+                self.rec(OP_SPLITK_FOLD, &[(c, 2), (&part, 4)], fold, m * n);
+                return;
+            }
+            self.rec(OP_GEMM, &slots, p, groups * 256);
             return;
         }
         let use_tile = self.c.inner.tile_gemm && tile_groups > 0;
@@ -1062,12 +1154,14 @@ impl<'a> Cmd<'a> {
         p[3] = woff as u32;
         p[4] = dwoff as u32;
         p[5] = beta.to_bits();
-        self.rec(
-            OP_RMS_BWD,
-            &[(x, 0), (w, 1), (dy, 2), (inv, 3), (dx, 4), (dw, 5)],
-            p,
-            rows * d.max(256),
-        );
+        // dW first (one workgroup per column, entry 6), then dx (one
+        // workgroup per row, entry 5): dW reads dy/x before anything is written
+        let slots = [(x, 0), (w, 1), (dy, 2), (inv, 3), (dx, 4), (dw, 5)];
+        let mut pdw = p.clone();
+        pdw[PARAM_WORDS - 2] = 6;
+        self.rec(OP_RMS_BWD, &slots, pdw, d * 256);
+        p[PARAM_WORDS - 2] = 5;
+        self.rec(OP_RMS_BWD, &slots, p, rows * 256);
     }
     pub fn swiglu_fwd(&self, g: &GBuf, u: &GBuf, h: &GBuf, n: usize) {
         self.rec(
@@ -1371,6 +1465,34 @@ impl<'a> Cmd<'a> {
     ) {
         self.banded_softmax_carry(s, off, t, ld, sink, sink_pad, window, blocks, 0, 1, None)
     }
+    /// Same contract as the Metal `gemm_band` (the hint reaches `gemm128`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_band(
+        &self,
+        ta: Op,
+        tb: Op,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f32,
+        a: &GBuf,
+        a_off: usize,
+        lda: usize,
+        b: &GBuf,
+        b_off: usize,
+        ldb: usize,
+        beta: f32,
+        cbuf: &GBuf,
+        c_off: usize,
+        ldc: usize,
+        batch: &GemmBatch,
+        band: Option<&GemmBand>,
+    ) {
+        self.gemm_dyn_table(
+            ta, tb, m, n, k, alpha, a, a_off, lda, b, b_off, ldb, beta, cbuf, c_off, ldc, batch,
+            false, &GemmDyn::none(), None, band,
+        )
+    }
     /// Same contract as the Metal `banded_softmax_carry`.
     #[allow(clippy::too_many_arguments)]
     pub fn banded_softmax_carry(
@@ -1387,8 +1509,33 @@ impl<'a> Cmd<'a> {
         bps: usize,
         cmask: Option<&GBuf>,
     ) {
+        self.banded_softmax_groups(
+            s, off, t, ld, sink, sink_pad, window, blocks, carry_pad, bps, cmask, 0, 0, 1,
+        )
+    }
+    /// Same contract as the Metal `banded_softmax_groups` (p[10] = wide
+    /// window, p[11] = wide KV-group mask, p[12] = heads per KV group).
+    #[allow(clippy::too_many_arguments)]
+    pub fn banded_softmax_groups(
+        &self,
+        s: &GBuf,
+        off: usize,
+        t: usize,
+        ld: usize,
+        sink: usize,
+        sink_pad: usize,
+        window: usize,
+        blocks: usize,
+        carry_pad: usize,
+        bps: usize,
+        cmask: Option<&GBuf>,
+        wide_window: usize,
+        wide_mask: u32,
+        group: usize,
+    ) {
         assert!(ld == sink_pad + carry_pad + t && sink <= sink_pad);
         assert!(carry_pad == 0 || cmask.is_some_and(|m| m.len * bps >= blocks));
+        assert!(group >= 1 && (wide_mask == 0 || wide_window > 0));
         let mut p = vec![0; PARAM_WORDS];
         p[1] = t as u32;
         p[2] = blocks as u32;
@@ -1399,11 +1546,16 @@ impl<'a> Cmd<'a> {
         p[7] = window as u32;
         p[8] = carry_pad as u32;
         p[9] = bps.max(1) as u32;
+        p[10] = wide_window as u32;
+        p[11] = wide_mask;
+        p[12] = group as u32;
         let mut slots = vec![(s, 0)];
         if let Some(m) = cmask {
             slots.push((m, 1));
         }
-        self.rec(OP_CAUSAL, &slots, p, blocks * t)
+        // one 256-lane workgroup per row (entry 9)
+        p[PARAM_WORDS - 2] = 9;
+        self.rec(OP_CAUSAL, &slots, p, blocks * t * 256)
     }
     pub fn softmax_bwd(&self, pb: &GBuf, poff: usize, dp: &GBuf, dpoff: usize, t: usize) {
         self.softmax_bwd_blocks(pb, poff, dp, dpoff, t, 1)
@@ -1438,7 +1590,9 @@ impl<'a> Cmd<'a> {
         p[3] = poff as u32;
         p[4] = dpoff as u32;
         p[5] = ld as u32;
-        self.rec(OP_SOFTMAX_BWD, &[(pb, 0), (dp, 1)], p, blocks * t)
+        // one 256-lane workgroup per row (entry 10)
+        p[PARAM_WORDS - 2] = 10;
+        self.rec(OP_SOFTMAX_BWD, &[(pb, 0), (dp, 1)], p, blocks * t * 256)
     }
     /// Bounded-anchor sink gradient fold (mirror of Metal `sink_grad_accum`):
     /// `dst[off + (g·S + s)·hd + d] += alpha · Σ_{b<nb} Σ_{j<group}
@@ -1493,6 +1647,21 @@ impl<'a> Cmd<'a> {
             // and silently do no work.
             vec![0, rows as u32, 0, d as u32, (dst.len / d) as u32],
             dst.len,
+        )
+    }
+    /// `scatter_add_rows` for UNIQUE row indices (a permutation with −1
+    /// padding, e.g. the head's cluster grouping): one invocation per source
+    /// element instead of one scan over all sources per destination word.
+    pub fn scatter_add_rows_unique(&self, dst: &GBuf, idx: &GBuf, src: &GBuf, rows: usize, d: usize) {
+        assert!(
+            d > 0 && dst.len % d == 0 && idx.len >= rows && src.len >= rows * d,
+            "scatter destination must be row-major"
+        );
+        self.rec(
+            OP_SCATTER_UNIQUE,
+            &[(dst, 0), (idx, 1), (src, 2)],
+            vec![0, rows as u32, 0, d as u32],
+            rows * d,
         )
     }
     pub fn group_sum_heads(
@@ -3105,8 +3274,15 @@ impl<'a> Cmd<'a> {
     }
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_wy_norm(&self, d: &GdnScanDims, qkv_cv: &GBuf, gam: &GBuf, qn: &GBuf, kn: &GBuf, qg: &GBuf, kg: &GBuf, vcm: &GBuf) {
-        let pp = Self::wy_p(d);
-        self.rec(OP_WY_NORM, &[(qkv_cv, 0), (gam, 1), (qn, 2), (kn, 3), (qg, 4), (kg, 5), (vcm, 6)], pp, d.rows() * d.nv)
+        let mut pp = Self::wy_p(d);
+        let slots = [(qkv_cv, 0), (gam, 1), (qn, 2), (kn, 3), (qg, 4), (kg, 5), (vcm, 6)];
+        if d.dk <= 128 && d.dv <= 128 {
+            // one 128-lane workgroup per (row, head)
+            pp[PARAM_WORDS - 2] = 7;
+            self.rec(OP_WY_NORM, &slots, pp, d.rows() * d.nv * 256)
+        } else {
+            self.rec(OP_WY_NORM, &slots, pp, d.rows() * d.nv)
+        }
     }
     pub fn gdn_wy_mask(&self, d: &GdnScanDims, kk: &GBuf, qk: &GBuf, lg: &GBuf, bet: &GBuf, lmat: &GBuf) {
         let pp = Self::wy_p(d);
@@ -3138,10 +3314,13 @@ impl<'a> Cmd<'a> {
         pp[12] = c as u32;
         self.rec(OP_WY_DSTATE, &[(dsn, 0), (dlive, 1), (gam, 2)], pp, d.b * d.nv * d.state())
     }
-    pub fn gdn_wy_dgend(&self, d: &GdnScanDims, dlive: &GBuf, states: &GBuf, dgend: &GBuf, c: usize) {
+    /// dgend = Σ dS_{c+1}·S_c per (b, h): 64 fixed-chunk partials into
+    /// `part` [NB·64], then an in-order fold (deterministic, parallel).
+    pub fn gdn_wy_dgend(&self, d: &GdnScanDims, dlive: &GBuf, states: &GBuf, dgend: &GBuf, part: &GBuf, c: usize) {
         let mut pp = Self::wy_p(d);
         pp[12] = c as u32;
-        self.rec(OP_WY_DGEND, &[(dlive, 0), (states, 1), (dgend, 2)], pp, d.b * d.nv)
+        self.rec(OP_WY_DGEND, &[(dlive, 0), (states, 1), (part, 3)], pp.clone(), d.b * d.nv * 64);
+        self.rec(OP_WY_DGEND_FOLD, &[(part, 0), (dgend, 1)], pp, d.b * d.nv)
     }
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_wy_mask_bwd_red(&self, d: &GdnScanDims, dp: &GBuf, qk: &GBuf, dl: &GBuf, lmat: &GBuf, kk: &GBuf, lg: &GBuf, bet: &GBuf, dlgm: &GBuf, dbet: &GBuf) {
@@ -3167,11 +3346,58 @@ impl<'a> Cmd<'a> {
     }
     #[allow(clippy::too_many_arguments)]
     pub fn gdn_wy_dnorm(&self, d: &GdnScanDims, dqn: &GBuf, dkn: &GBuf, dqg: &GBuf, dkg: &GBuf, qkv_cv: &GBuf, gam: &GBuf, dcv: &GBuf) {
-        let pp = Self::wy_p(d);
-        self.rec(OP_WY_DNORM, &[(dqn, 0), (dkn, 1), (dqg, 2), (dkg, 3), (qkv_cv, 4), (gam, 5), (dcv, 6)], pp, d.rows() * d.nv)
+        let mut pp = Self::wy_p(d);
+        let slots = [(dqn, 0), (dkn, 1), (dqg, 2), (dkg, 3), (qkv_cv, 4), (gam, 5), (dcv, 6)];
+        if d.dk <= 128 {
+            pp[PARAM_WORDS - 2] = 8;
+            self.rec(OP_WY_DNORM, &slots, pp, d.rows() * d.nv * 256)
+        } else {
+            self.rec(OP_WY_DNORM, &slots, pp, d.rows() * d.nv)
+        }
+    }
+
+    /// The split-K partial buffer of this stream (≥ `n` floats): borrowed
+    /// from the context pool on first use, kept until `commit`.
+    fn splitk_scratch(&self, n: usize) -> GBuf {
+        let mut mine = self.splitk.borrow_mut();
+        if !matches!(*mine, Some((_, len)) if len >= n) {
+            let mut pool = self.c.inner.splitk_pool.lock().unwrap();
+            if let Some(b) = mine.take() {
+                pool.push(b);
+            }
+            *mine = match pool.iter().position(|(_, len)| *len >= n) {
+                Some(i) => Some(pool.swap_remove(i)),
+                None => {
+                    let len = n.max(1 << 22);
+                    let raw = self.c.inner.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("embryo-splitk"),
+                        size: (len * 4) as u64,
+                        usage: wgpu::BufferUsages::STORAGE
+                            | wgpu::BufferUsages::COPY_DST
+                            | wgpu::BufferUsages::COPY_SRC,
+                        mapped_at_creation: false,
+                    });
+                    Some((raw, len))
+                }
+            };
+        }
+        let (raw, len) = mine.as_ref().unwrap();
+        // device-only scratch: no host mirror (never uploaded or read back)
+        GBuf {
+            buf: DeviceBuf(Arc::new(BufInner {
+                raw: raw.clone(),
+                len: *len,
+                host: UnsafeCell::new(Vec::new()),
+                host_dirty: std::sync::atomic::AtomicBool::new(false),
+                gpu_dirty: std::sync::atomic::AtomicBool::new(false),
+                ctx: Arc::clone(&self.c.inner),
+            })),
+            len: *len,
+        }
     }
 
     pub fn commit(self) -> f64 {
+        let splitk = self.splitk.borrow_mut().take();
         let ops = self.ops.into_inner();
         for op in &ops {
             for s in &op.slots {
@@ -3207,6 +3433,13 @@ impl<'a> Cmd<'a> {
                     1 => self.c.inner.pipeline64.clone(),
                     2 => self.c.inner.pipeline_gdn_fwd.clone(),
                     3 => self.c.inner.pipeline_gdn_bwd.clone(),
+                    4 => self.c.inner.pipeline128.clone(),
+                    5 => self.c.inner.pipeline_rms_dx.clone(),
+                    6 => self.c.inner.pipeline_rms_dw.clone(),
+                    7 => self.c.inner.pipeline_wy_norm.clone(),
+                    8 => self.c.inner.pipeline_wy_dnorm.clone(),
+                    9 => self.c.inner.pipeline_softmax_rows.clone(),
+                    10 => self.c.inner.pipeline_softmax_bwd_rows.clone(),
                     _ => self.c.inner.pipeline_for(op.params[0]),
                 };
                 let timestamp_writes =
@@ -3244,6 +3477,13 @@ impl<'a> Cmd<'a> {
                     1 => self.c.inner.pipeline64.clone(),
                     2 => self.c.inner.pipeline_gdn_fwd.clone(),
                     3 => self.c.inner.pipeline_gdn_bwd.clone(),
+                    4 => self.c.inner.pipeline128.clone(),
+                    5 => self.c.inner.pipeline_rms_dx.clone(),
+                    6 => self.c.inner.pipeline_rms_dw.clone(),
+                    7 => self.c.inner.pipeline_wy_norm.clone(),
+                    8 => self.c.inner.pipeline_wy_dnorm.clone(),
+                    9 => self.c.inner.pipeline_softmax_rows.clone(),
+                    10 => self.c.inner.pipeline_softmax_bwd_rows.clone(),
                     _ => self.c.inner.pipeline_for(op.params[0]),
                 };
                 pass.set_pipeline(&pipeline);
@@ -3295,17 +3535,32 @@ impl<'a> Cmd<'a> {
                         .expect("timestamp readback");
                     let raw: &[u64] = bytemuck::cast_slice(&mapped);
                     let mut totals = HashMap::<u32, (f64, usize)>::new();
+                    // GEMMs also by (entry, transposes, M, N, K, batches)
+                    let mut gemms = HashMap::<[u32; 7], (f64, usize)>::new();
                     for (i, op) in ops.iter().take(n).enumerate() {
                         let ticks = raw[2 * i + 1].saturating_sub(raw[2 * i]);
                         let ms = ticks as f64 * ts.period_ns as f64 / 1.0e6;
                         let e = totals.entry(op.params[0]).or_insert((0.0, 0));
                         e.0 += ms;
                         e.1 += 1;
+                        if op.params[0] == OP_GEMM {
+                            let p = &op.params;
+                            let key = [op.entry, p[5] * 2 + p[6], p[2], p[3], p[4], p[15] * p[16] * p[17], p[31]];
+                            let g = gemms.entry(key).or_insert((0.0, 0));
+                            g.0 += ms;
+                            g.1 += 1;
+                        }
                     }
                     let mut rows: Vec<_> = totals.into_iter().collect();
                     rows.sort_unstable_by_key(|(op, _)| *op);
                     for (op, (ms, count)) in rows {
                         eprintln!("vulkan op-ts op={op} count={count} gpu_ms={ms:.3}");
+                    }
+                    for (k, (ms, count)) in gemms {
+                        eprintln!(
+                            "vulkan gemm-ts entry={} t={} m={} n={} k={} batches={} tile={} count={count} gpu_ms={ms:.3}",
+                            k[0], k[1], k[2], k[3], k[4], k[5], k[6]
+                        );
                     }
                     drop(mapped);
                     ts.stage.unmap();
@@ -3313,6 +3568,9 @@ impl<'a> Cmd<'a> {
                     eprintln!("cortiq-embryo: Vulkan timestamp map failed");
                 }
             }
+        }
+        if let Some(b) = splitk {
+            self.c.inner.splitk_pool.lock().unwrap().push(b);
         }
         t.elapsed().as_secs_f64() * 1000.0
     }
@@ -3325,6 +3583,20 @@ use wgpu::util::DeviceExt;
 pub enum Op {
     N,
     T,
+}
+
+/// Band hint of the bounded anchor (same contract as the Metal
+/// `GemmBand`): honoured by the `gemm128` entry (tile skip / k range);
+/// the other GEMM paths compute the full tiles, which is the same result —
+/// the hint only ever names zeros or overwritten outputs.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GemmBand {
+    pub mode: u8,
+    pub lo: i32,
+    pub hi: i32,
+    pub lo_w: i32,
+    pub hi_w: i32,
+    pub wide_mask: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3481,6 +3753,11 @@ pub struct RouteDims {
 // Operation numbers shared with the WGSL switch.
 const OP_NOOP: u32 = 0;
 const OP_GEMM: u32 = 1;
+/// `gemm128` below this many output tiles (all batches) leaves the GPU's
+/// SMs idle; such GEMMs take the 64×64 entry instead.
+const GEMM128_MIN_TILES: usize = 160;
+/// Output tiles (64×64) a split-K GEMM aims for (~4 per SM on an 84-SM part).
+const GEMM_SPLIT_TILES: usize = 336;
 const OP_AXPBY: u32 = 2;
 const OP_ADAMW: u32 = 3;
 const OP_SUMSQ: u32 = 4;
@@ -3562,6 +3839,9 @@ const OP_WY_DSCAL: u32 = 76;
 const OP_WY_DNORM: u32 = 77;
 const OP_WY_ZERO_S0: u32 = 78;
 const OP_BLOCK_COPY: u32 = 79;
+const OP_WY_DGEND_FOLD: u32 = 80;
+const OP_SPLITK_FOLD: u32 = 81;
+const OP_SCATTER_UNIQUE: u32 = 82;
 
 /// WGSL source.  Input/output storage buffers all use u32 words so a single
 /// bind layout can serve f32 and token/index operations without host copies.
@@ -4067,34 +4347,260 @@ fn gdn_bwd(@builtin(local_invocation_id) lidv: vec3<u32>, @builtin(workgroup_id)
  if(tid==0u){l[tg*2u]=WF(p_alog);l[tg*2u+1u]=WF(p_dt);}
 }
 
+// Register-blocked 128×128×16 SGEMM (`gemm128` entry, entry id 4): 256 lanes,
+// 8×8 outputs per lane in 16 vec4 accumulators (rows ty·4+i and 64+ty·4+i,
+// columns tx·4+j and 64+tx·4+j); the A and B tiles are staged k-major as
+// vec4 rows so every lane reads its 4+4 rows / columns as two 128-bit loads
+// (no bank conflicts). Same parameters as op 1 (p[2..27]); used for
+// tile-aligned, non-dynamic GEMMs (M, N % 128, K % 16). f32 FMA, ascending k.
+var<workgroup> g128_a: array<vec4<f32>,512>;
+var<workgroup> g128_b: array<vec4<f32>,512>;
+fn g128_store(oc: u32, ldc: u32, rr: u32, cc: u32, v: vec4<f32>, al: f32, be: f32, mrows: u32) {
+ if(rr>=mrows){ if(be==0.0){for(var j=0u;j<4u;j=j+1u){c[oc+rr*ldc+cc+j]=0u;}} return; }
+ for(var j=0u;j<4u;j=j+1u){
+   let ix=oc+rr*ldc+cc+j;
+   var outv=al*v[j];
+   if(be!=0.0){outv=fma(be,CF(ix),outv);}
+   if(U(27u)==1u && cc+j>rr){outv=0.0;}
+   c[ix]=WF(outv);
+ }
+}
+@compute @workgroup_size(256)
+fn gemm128(@builtin(local_invocation_id) lidv: vec3<u32>, @builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+ let lid=lidv.x; let group=wg.x+wg.y*nwg.x;
+ let m0=U(2u);let n0=U(3u);let k0=U(4u);let ta=U(5u);let tb=U(6u);let lda=U(7u);let ldb=U(8u);let ldc=U(9u);let ao=U(10u);let bo=U(11u);let co=U(12u);let al=F(13u);let be=F(14u);let nb=U(15u);let nh=U(16u);let nc=U(17u);
+ let tiles_n=n0/128u; let tiles_m=m0/128u; let per_batch=tiles_n*tiles_m;
+ let batch_id=group/per_batch; if(batch_id>=nb*nh*nc){return;}
+ let tile=group%per_batch; let tm=tile/tiles_n; let tn=tile%tiles_n;
+ let bc=batch_id%nc;let bh=batch_id/nc;let ch=bh%nh;let cb=bh/nh;
+ let oa=ao+cb*U(18u)+ch*U(19u)+bc*U(20u);let ob=bo+cb*U(21u)+ch*U(22u)+bc*U(23u);let oc=co+cb*U(24u)+ch*U(25u)+bc*U(26u);
+ let r0=tm*128u; let c0=tn*128u; let ty=lid/16u; let tx=lid%16u;
+ // dynamic shapes (the op-1 contract): p[28] K = min(round64(kcount[z]), K);
+ // p[30] rows ≥ y·64 of the indirect record are zero (and not computed)
+ var kdyn=k0; var mrows=m0;
+ if(U(28u)==1u){kdyn=min(((DU(U(29u)+batch_id)+63u)/64u)*64u,k0);}
+ if(U(30u)==1u){mrows=min(m0,DU(U(29u)+1u)*64u);}
+ // band hint of the bounded anchor (p[38] mode, p[39..42] lo,hi,lo_w,hi_w as i32, p[43] wide mask)
+ var kbeg=0u; var kend=kdyn;
+ if(r0>=mrows){kend=0u;}
+ let bmode=U(38u);
+ if(bmode!=0u){
+   let wide=((U(43u)>>ch)&1u)!=0u;
+   var lo=bitcast<i32>(U(39u)); var hi=bitcast<i32>(U(40u));
+   if(wide){lo=bitcast<i32>(U(41u)); hi=bitcast<i32>(U(42u));}
+   let im0=i32(r0); let in0=i32(c0);
+   if(bmode==1u){ if(in0+127-im0<lo || in0-(im0+127)>hi){kend=0u;} }
+   else {
+     var ka=0; var kz=0;
+     if(bmode==2u){ka=im0+lo; kz=im0+127+min(hi,1<<28);} else {ka=im0-min(hi,1<<28); kz=im0+127-lo;}
+     let kb=max(ka,0)/16*16;
+     let ke=min((kz+16)/16*16, i32(kend));
+     kbeg=u32(min(kb,i32(kend)));
+     kend=u32(max(ke,i32(kbeg)));
+   }
+ }
+ var c00=vec4<f32>(0.0);var c01=vec4<f32>(0.0);var c10=vec4<f32>(0.0);var c11=vec4<f32>(0.0);var c20=vec4<f32>(0.0);var c21=vec4<f32>(0.0);var c30=vec4<f32>(0.0);var c31=vec4<f32>(0.0);var c40=vec4<f32>(0.0);var c41=vec4<f32>(0.0);var c50=vec4<f32>(0.0);var c51=vec4<f32>(0.0);var c60=vec4<f32>(0.0);var c61=vec4<f32>(0.0);var c70=vec4<f32>(0.0);var c71=vec4<f32>(0.0);
+ for(var kb=kbeg;kb<kend;kb=kb+16u){
+   // A tile → g128_a[k][m] (k-major)
+   if(ta==0u){
+     let m=lid/2u; let kh=(lid%2u)*8u; let base=oa+(r0+m)*lda+kb+kh;
+     for(var q=0u;q<8u;q=q+1u){ g128_a[(kh+q)*32u+m/4u][m%4u]=AF(base+q); }
+   } else {
+     let kk=lid/16u; let mc=(lid%16u)*8u; let base=oa+(kb+kk)*lda+r0+mc;
+     g128_a[kk*32u+mc/4u]=vec4<f32>(AF(base),AF(base+1u),AF(base+2u),AF(base+3u));
+     g128_a[kk*32u+mc/4u+1u]=vec4<f32>(AF(base+4u),AF(base+5u),AF(base+6u),AF(base+7u));
+   }
+   // B tile → g128_b[k][n]
+   if(tb==0u){
+     let kk=lid/16u; let nc8=(lid%16u)*8u; let base=ob+(kb+kk)*ldb+c0+nc8;
+     g128_b[kk*32u+nc8/4u]=vec4<f32>(BF(base),BF(base+1u),BF(base+2u),BF(base+3u));
+     g128_b[kk*32u+nc8/4u+1u]=vec4<f32>(BF(base+4u),BF(base+5u),BF(base+6u),BF(base+7u));
+   } else {
+     let n=lid/2u; let kh=(lid%2u)*8u; let base=ob+(c0+n)*ldb+kb+kh;
+     for(var q=0u;q<8u;q=q+1u){ g128_b[(kh+q)*32u+n/4u][n%4u]=BF(base+q); }
+   }
+   workgroupBarrier();
+   for(var k=0u;k<16u;k=k+1u){
+     let a0=g128_a[k*32u+ty]; let a1=g128_a[k*32u+16u+ty];
+     let b0=g128_b[k*32u+tx]; let b1=g128_b[k*32u+16u+tx];
+     c00=fma(vec4<f32>(a0.x),b0,c00);c01=fma(vec4<f32>(a0.x),b1,c01);c10=fma(vec4<f32>(a0.y),b0,c10);c11=fma(vec4<f32>(a0.y),b1,c11);c20=fma(vec4<f32>(a0.z),b0,c20);c21=fma(vec4<f32>(a0.z),b1,c21);c30=fma(vec4<f32>(a0.w),b0,c30);c31=fma(vec4<f32>(a0.w),b1,c31);c40=fma(vec4<f32>(a1.x),b0,c40);c41=fma(vec4<f32>(a1.x),b1,c41);c50=fma(vec4<f32>(a1.y),b0,c50);c51=fma(vec4<f32>(a1.y),b1,c51);c60=fma(vec4<f32>(a1.z),b0,c60);c61=fma(vec4<f32>(a1.z),b1,c61);c70=fma(vec4<f32>(a1.w),b0,c70);c71=fma(vec4<f32>(a1.w),b1,c71);
+   }
+   workgroupBarrier();
+ }
+ g128_store(oc,ldc,r0+(ty*4u+0u),c0+(tx*4u),c00,al,be,mrows);g128_store(oc,ldc,r0+(ty*4u+0u),c0+(64u+tx*4u),c01,al,be,mrows);g128_store(oc,ldc,r0+(ty*4u+1u),c0+(tx*4u),c10,al,be,mrows);g128_store(oc,ldc,r0+(ty*4u+1u),c0+(64u+tx*4u),c11,al,be,mrows);g128_store(oc,ldc,r0+(ty*4u+2u),c0+(tx*4u),c20,al,be,mrows);g128_store(oc,ldc,r0+(ty*4u+2u),c0+(64u+tx*4u),c21,al,be,mrows);g128_store(oc,ldc,r0+(ty*4u+3u),c0+(tx*4u),c30,al,be,mrows);g128_store(oc,ldc,r0+(ty*4u+3u),c0+(64u+tx*4u),c31,al,be,mrows);g128_store(oc,ldc,r0+(64u+ty*4u+0u),c0+(tx*4u),c40,al,be,mrows);g128_store(oc,ldc,r0+(64u+ty*4u+0u),c0+(64u+tx*4u),c41,al,be,mrows);g128_store(oc,ldc,r0+(64u+ty*4u+1u),c0+(tx*4u),c50,al,be,mrows);g128_store(oc,ldc,r0+(64u+ty*4u+1u),c0+(64u+tx*4u),c51,al,be,mrows);g128_store(oc,ldc,r0+(64u+ty*4u+2u),c0+(tx*4u),c60,al,be,mrows);g128_store(oc,ldc,r0+(64u+ty*4u+2u),c0+(64u+tx*4u),c61,al,be,mrows);g128_store(oc,ldc,r0+(64u+ty*4u+3u),c0+(tx*4u),c70,al,be,mrows);g128_store(oc,ldc,r0+(64u+ty*4u+3u),c0+(64u+tx*4u),c71,al,be,mrows);
+}
+
+// RMSNorm backward as two workgroup-reduction entries (entry ids 5, 6; the
+// op-6 parameter contract): `rms_bwd_dx` = one workgroup per row (the row
+// dot Σ dy·w·x once, tree-reduced), `rms_dw` = one workgroup per column
+// (Σ_rows dy·x·inv, rows strided over the lanes, tree-reduced, added to dW).
+var<workgroup> rms_red: array<f32,256>;
+fn rms_tree(lid: u32) -> f32 {
+ workgroupBarrier();
+ for(var st=128u;st>0u;st=st>>1u){ if(lid<st){rms_red[lid]=rms_red[lid]+rms_red[lid+st];} workgroupBarrier(); }
+ return rms_red[0];
+}
+@compute @workgroup_size(256)
+fn rms_bwd_dx(@builtin(local_invocation_id) lidv: vec3<u32>, @builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+ let lid=lidv.x; let row=wg.x+wg.y*nwg.x; let rows=U(1u); let dd=U(2u);
+ if(row>=rows){return;}
+ var part=0.0;
+ for(var j=lid;j<dd;j=j+256u){part=part+CF(row*dd+j)*BF(U(3u)+j)*AF(row*dd+j);}
+ rms_red[lid]=part;
+ let dot=rms_tree(lid);
+ let inv=DF(row); let c0=inv*inv*inv*dot/f32(dd);
+ for(var j=lid;j<dd;j=j+256u){
+   let q=row*dd+j; let val=inv*CF(q)*BF(U(3u)+j)-c0*AF(q); let old=EF(q);
+   e[q]=WF(select(val,old*F(5u)+val,F(5u)!=0.0));
+ }
+}
+@compute @workgroup_size(256)
+fn rms_dw(@builtin(local_invocation_id) lidv: vec3<u32>, @builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+ let lid=lidv.x; let col=wg.x+wg.y*nwg.x; let rows=U(1u); let dd=U(2u);
+ if(col>=dd){return;}
+ var sw=0.0;
+ for(var r=lid;r<rows;r=r+256u){sw=sw+CF(r*dd+col)*AF(r*dd+col)*DF(r);}
+ rms_red[lid]=sw;
+ let tot=rms_tree(lid);
+ if(lid==0u){f[U(4u)+col]=WF(FF(U(4u)+col)+tot);}
+}
+
+// WY q/k normalisation forward (`wy_norm_rows`, entry 7) and backward
+// (`wy_dnorm_rows`, entry 8): the op-65 / op-77 contracts with one 128-lane
+// workgroup per (row, head) — lanes over dk/dv (coalesced), the norms and
+// dot products tree-reduced in shared memory (deterministic order).
+var<workgroup> wyr: array<f32,512>;
+fn wy_tree4(lid: u32) {
+ workgroupBarrier();
+ for(var st=64u;st>0u;st=st>>1u){
+   if(lid<st){ for(var q=0u;q<4u;q=q+1u){ wyr[q*128u+lid]=wyr[q*128u+lid]+wyr[q*128u+lid+st]; } }
+   workgroupBarrier();
+ }
+}
+@compute @workgroup_size(128)
+fn wy_norm_rows(@builtin(local_invocation_id) lidv: vec3<u32>, @builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+ let lid=lidv.x; let z=wg.x+wg.y*nwg.x; let nv=U(3u);
+ if(z>=U(1u)*U(2u)*nv){return;}
+ let row=z/nv;let hh=z%nv;let T=U(2u);let dk=U(4u);let dv=U(5u);let cd=U(6u);let nch=U(8u);
+ let bb=row/T;let t=row%T;let bh=bb*nv+hh;let gm=BF(bh*T+t);
+ var qv=0.0; var kv=0.0;
+ if(lid<dk){qv=AF(row*cd+hh*dk+lid); kv=AF(row*cd+nv*dk+hh*dk+lid);}
+ wyr[lid]=qv*qv; wyr[128u+lid]=kv*kv; wyr[256u+lid]=0.0; wyr[384u+lid]=0.0;
+ wy_tree4(lid);
+ let iq=inverseSqrt(wyr[0]+1.0e-6)*inverseSqrt(f32(dk)); let ik=inverseSqrt(wyr[128]+1.0e-6);
+ if(lid<dk){let o=row*nv*dk+hh*dk+lid;let qn=qv*iq;let kn=kv*ik;c[o]=WF(qn);d[o]=WF(kn);e[o]=WF(gm*qn);f[o]=WF(gm*kn);}
+ let cc=t/64u;let il=t%64u;
+ if(lid<dv){g[((bh*nch+cc)*64u+il)*dv+lid]=a[row*cd+2u*nv*dk+hh*dv+lid];}
+}
+@compute @workgroup_size(128)
+fn wy_dnorm_rows(@builtin(local_invocation_id) lidv: vec3<u32>, @builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+ let lid=lidv.x; let z=wg.x+wg.y*nwg.x; let nv=U(3u);
+ if(z>=U(1u)*U(2u)*nv){return;}
+ let row=z/nv;let hh=z%nv;let T=U(2u);let dk=U(4u);let cd=U(6u);let bb=row/T;let t=row%T;let gm=FF((bb*nv+hh)*T+t);
+ var qv=0.0; var kv=0.0; var dQ=0.0; var dK=0.0;
+ if(lid<dk){
+   let o=row*nv*dk+hh*dk+lid;
+   qv=EF(row*cd+hh*dk+lid); kv=EF(row*cd+nv*dk+hh*dk+lid);
+   dQ=AF(o)+gm*CF(o); dK=BF(o)+gm*DF(o);
+ }
+ wyr[lid]=qv*qv; wyr[128u+lid]=kv*kv; wyr[256u+lid]=dQ*qv; wyr[384u+lid]=dK*kv;
+ wy_tree4(lid);
+ let iq=inverseSqrt(wyr[0]+1.0e-6)*inverseSqrt(f32(dk)); let ik=inverseSqrt(wyr[128]+1.0e-6);
+ let dq=wyr[256]; let dkd=wyr[384];
+ if(lid<dk){
+   g[row*cd+hh*dk+lid]=WF(iq*dQ-qv*iq*iq*iq*f32(dk)*dq);
+   g[row*cd+nv*dk+hh*dk+lid]=WF(ik*dK-kv*ik*ik*ik*dkd);
+ }
+}
+
+// Band + sink softmax (`band_softmax_rows`, entry 9) and softmax backward
+// (`softmax_bwd_rows`, entry 10): the op-19 / op-20 contracts with one
+// 256-lane workgroup per row — lanes over the columns, max / sum / dot
+// tree-reduced in shared memory.
+var<workgroup> smx: array<f32,256>;
+fn smx_max(lid: u32) -> f32 {
+ workgroupBarrier();
+ for(var st=128u;st>0u;st=st>>1u){ if(lid<st){smx[lid]=max(smx[lid],smx[lid+st]);} workgroupBarrier(); }
+ let r=smx[0]; workgroupBarrier(); return r;
+}
+fn smx_sum(lid: u32) -> f32 {
+ workgroupBarrier();
+ for(var st=128u;st>0u;st=st>>1u){ if(lid<st){smx[lid]=smx[lid]+smx[lid+st];} workgroupBarrier(); }
+ let r=smx[0]; workgroupBarrier(); return r;
+}
+@compute @workgroup_size(256)
+fn band_softmax_rows(@builtin(local_invocation_id) lidv: vec3<u32>, @builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+ let lid=lidv.x; let zrow=wg.x+wg.y*nwg.x;
+ if(zrow>=U(1u)*U(2u)){return;}
+ let t=U(1u);let ld=U(4u);let sk=U(5u);let sp=U(6u);let cp=U(8u);let bps=max(U(9u),1u);let block=zrow/t;let row=zrow%t;
+ var w=U(7u);if(((U(11u)>>((block%bps)/max(U(12u),1u)))&1u)!=0u){w=U(10u);}
+ let base=U(3u)+block*t*ld+row*ld;let cb=sp+cp;let jmax=cb+row+1u;var lo=cb;if(w>0u && row+1u>w){lo=cb+row+1u-w;}
+ var clo=cb;var cvalid=0u;if(cp>0u){cvalid=BU(block/bps);}if(cvalid!=0u){var back=cp;if(w>0u){back=w-1u;}if(back>row){let span=back-row;if(span>=cp){clo=sp;}else{clo=cb-span;}}clo=max(clo,cb-min(cvalid,cp));}
+ var mx=-3.4e38;
+ for(var q=lid;q<ld;q=q+256u){ if((q<sk)||(q>=clo && q<cb)||(q>=lo && q<jmax)){mx=max(mx,AF(base+q));} }
+ smx[lid]=mx; let gmx=smx_max(lid);
+ var den=0.0;
+ for(var q=lid;q<ld;q=q+256u){ if((q<sk)||(q>=clo && q<cb)||(q>=lo && q<jmax)){den=den+safe_exp(AF(base+q)-gmx);} }
+ smx[lid]=den; let gden=smx_sum(lid);
+ for(var q=lid;q<ld;q=q+256u){
+   let ok=(q<sk)||(q>=clo && q<cb)||(q>=lo && q<jmax);
+   a[base+q]=WF(select(0.0,safe_exp(AF(base+q)-gmx)/gden,ok));
+ }
+}
+@compute @workgroup_size(256)
+fn softmax_bwd_rows(@builtin(local_invocation_id) lidv: vec3<u32>, @builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+ let lid=lidv.x; let zrow=wg.x+wg.y*nwg.x;
+ if(zrow>=U(1u)*U(2u)){return;}
+ let t=U(1u);let ld=U(5u);let block=zrow/t;let row=zrow%t;let pb=U(3u)+block*t*ld+row*ld;let db=U(4u)+block*t*ld+row*ld;
+ var dot=0.0;
+ for(var q=lid;q<ld;q=q+256u){dot=dot+AF(pb+q)*BF(db+q);}
+ smx[lid]=dot; let gdot=smx_sum(lid);
+ for(var q=lid;q<ld;q=q+256u){b[db+q]=WF(AF(pb+q)*(BF(db+q)-gdot));}
+}
+
 @compute @workgroup_size(256)
 fn gemm64(@builtin(local_invocation_id) lidv: vec3<u32>, @builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
  let lid=lidv.x; let group=wg.x+wg.y*nwg.x;
  let m0=U(2u);let n0=U(3u);let k0=U(4u);let ta=U(5u);let tb=U(6u);let lda=U(7u);let ldb=U(8u);let ldc=U(9u);let ao=U(10u);let bo=U(11u);let co=U(12u);let al=F(13u);let be=F(14u);let nb=U(15u);let nh=U(16u);let nc=U(17u);
  let tiles_n=n0/64u; let tiles_m=m0/64u; let per_batch=tiles_n*tiles_m;
- let batch_id=group/per_batch; if(batch_id>=nb*nh*nc){return;}
- let tile=group%per_batch; let tm=tile/tiles_n; let tn=tile%tiles_n;
+ // split-K (p[44] slices of p[45] k each, one batch): partial tiles go to
+ // slot e [slice][M][N] and op 81 folds them in slice order
+ let nsplit=max(U(44u),1u); let ntiles=per_batch*nb*nh*nc;
+ let slice=group/ntiles; if(slice>=nsplit){return;}
+ let batch_id=(group%ntiles)/per_batch;
+ let tile=(group%ntiles)%per_batch; let tm=tile/tiles_n; let tn=tile%tiles_n;
  let bc=batch_id%nc;let bh=batch_id/nc;let ch=bh%nh;let cb=bh/nh;
  let oa=ao+cb*U(18u)+ch*U(19u)+bc*U(20u);let ob=bo+cb*U(21u)+ch*U(22u)+bc*U(23u);let oc=co+cb*U(24u)+ch*U(25u)+bc*U(26u);
  let r0=tm*64u; let c0=tn*64u; let ty=lid/16u; let tx=lid%16u;
+ var kend=k0; var mrows=m0;
+ if(U(28u)==1u){kend=min(((DU(U(29u)+batch_id)+63u)/64u)*64u,k0);}
+ if(U(30u)==1u){mrows=min(m0,DU(U(29u)+1u)*64u);}
+ if(r0>=mrows){kend=0u;}
+ var kbeg=0u;
+ if(nsplit>1u){kbeg=slice*U(45u); kend=min(kend,kbeg+U(45u));}
  var acc:array<f32,16>; for(var i=0u;i<16u;i=i+1u){acc[i]=0.0;}
- for(var kb=0u;kb<k0;kb=kb+32u){
+ for(var kb=kbeg;kb<kend;kb=kb+32u){
    for(var i=0u;i<8u;i=i+1u){let idx=lid+i*256u;let row=idx/32u;let kk=idx%32u;let gr=r0+row;let gk=kb+kk;let ia=select(oa+gr*lda+gk,oa+gk*lda+gr,ta==1u);g64_a[row*32u+kk]=AF(ia);}
    for(var i=0u;i<8u;i=i+1u){let idx=lid+i*256u;let kk=idx/64u;let col=idx%64u;let gk=kb+kk;let gc=c0+col;let ib=select(ob+gk*ldb+gc,ob+gc*ldb+gk,tb==1u);g64_b[kk*64u+col]=BF(ib);}
    workgroupBarrier();
    for(var kk=0u;kk<32u;kk=kk+1u){
      let a0=g64_a[(ty*4u)*32u+kk];let a1=g64_a[(ty*4u+1u)*32u+kk];let a2=g64_a[(ty*4u+2u)*32u+kk];let a3=g64_a[(ty*4u+3u)*32u+kk];
      let b0=g64_b[kk*64u+tx*4u];let b1=g64_b[kk*64u+tx*4u+1u];let b2=g64_b[kk*64u+tx*4u+2u];let b3=g64_b[kk*64u+tx*4u+3u];
-     acc[0]=acc[0]+a0*b0;acc[1]=acc[1]+a0*b1;acc[2]=acc[2]+a0*b2;acc[3]=acc[3]+a0*b3;
-     acc[4]=acc[4]+a1*b0;acc[5]=acc[5]+a1*b1;acc[6]=acc[6]+a1*b2;acc[7]=acc[7]+a1*b3;
-     acc[8]=acc[8]+a2*b0;acc[9]=acc[9]+a2*b1;acc[10]=acc[10]+a2*b2;acc[11]=acc[11]+a2*b3;
-     acc[12]=acc[12]+a3*b0;acc[13]=acc[13]+a3*b1;acc[14]=acc[14]+a3*b2;acc[15]=acc[15]+a3*b3;
+     // explicit fma: the same per-k rounding as gemm128 (a row's result is
+     // independent of which entry the batch shape selects)
+     acc[0]=fma(a0,b0,acc[0]);acc[1]=fma(a0,b1,acc[1]);acc[2]=fma(a0,b2,acc[2]);acc[3]=fma(a0,b3,acc[3]);
+     acc[4]=fma(a1,b0,acc[4]);acc[5]=fma(a1,b1,acc[5]);acc[6]=fma(a1,b2,acc[6]);acc[7]=fma(a1,b3,acc[7]);
+     acc[8]=fma(a2,b0,acc[8]);acc[9]=fma(a2,b1,acc[9]);acc[10]=fma(a2,b2,acc[10]);acc[11]=fma(a2,b3,acc[11]);
+     acc[12]=fma(a3,b0,acc[12]);acc[13]=fma(a3,b1,acc[13]);acc[14]=fma(a3,b2,acc[14]);acc[15]=fma(a3,b3,acc[15]);
    }
    workgroupBarrier();
  }
  for(var i=0u;i<4u;i=i+1u){for(var j=0u;j<4u;j=j+1u){
    let rr=r0+ty*4u+i; let cc=c0+tx*4u+j; let ix=oc+rr*ldc+cc;
-   var outv=al*acc[i*4u+j]+be*CF(ix);
+   if(nsplit>1u){ e[(slice*m0+rr)*n0+cc]=WF(acc[i*4u+j]); continue; }
+   if(rr>=mrows){ if(be==0.0){c[ix]=0u;} continue; }
+   var outv=al*acc[i*4u+j];
+   if(be!=0.0){outv=fma(be,CF(ix),outv);}
    if(U(27u)==1u && cc>rr){outv=0.0;}
    c[ix]=WF(outv);
  }}
@@ -4217,8 +4723,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
    h[bh*T+t]=WF(dr);i[bh*T+t]=WF(dbv);return;}
  // op 71: dS_c += γ_end dS_{c+1}. a=dsn b=dlive c=gam
  if(op==71u){let ss=U(4u)*U(5u);let T=U(2u);let cc=U(12u);if(z>=U(1u)*U(3u)*ss){return;}let bh=z/ss;a[z]=WF(AF(z)+CF(bh*T+cc*64u+63u)*BF(z));return;}
- // op 72: dgend[bh,c] = Σ dS_{c+1}·S_c. a=dlive b=states c=dgend
- if(op==72u){let ss=U(4u)*U(5u);let nch=U(8u);let cc=U(12u);if(z>=U(1u)*U(3u)){return;}let bh=z;var s=0.0;for(var ee=0u;ee<ss;ee=ee+1u){s=s+AF(bh*ss+ee)*BF((bh*(nch+1u)+cc)*ss+ee);}c[bh*nch+cc]=WF(s);return;}
+ // op 72: dgend partials, 64 per (b,h) in fixed chunks: d[bh·64+i] = Σ_{ee∈chunk i} dS_{c+1}·S_c. a=dlive b=states d=part
+ if(op==72u){let ss=U(4u)*U(5u);let nch=U(8u);let cc=U(12u);if(z>=U(1u)*U(3u)*64u){return;}let bh=z/64u;let pi=z%64u;let ch=(ss+63u)/64u;let lo=pi*ch;let hi=min(lo+ch,ss);var s=0.0;for(var ee=lo;ee<hi;ee=ee+1u){s=s+AF(bh*ss+ee)*BF((bh*(nch+1u)+cc)*ss+ee);}d[z]=WF(s);return;}
+ // op 82: scatter-add with UNIQUE row indices (the head's cluster permutation; the Metal
+ // scatter_add_rows contract): one invocation per (source row, column), idx < 0 skipped. a=dst b=idx c=src
+ if(op==82u){let d0=U(3u);if(z>=U(1u)*d0){return;}let row=z/d0;let col=z%d0;let ix=bitcast<i32>(b[row]);if(ix<0){return;}let o=u32(ix)*d0+col;a[o]=WF(AF(o)+CF(z));return;}
+ // op 81: split-K fold of the gemm64 partials (slot e [S][M][N]) into C with alpha/beta/causal (op-1 params, p[44] = S)
+ if(op==81u){let mm=U(2u);let nn=U(3u);if(z>=mm*nn){return;}let rr=z/nn;let cc=z%nn;var sm=0.0;for(var i=0u;i<U(44u);i=i+1u){sm=sm+EF(i*mm*nn+z);}let ix=U(12u)+rr*U(9u)+cc;var outv=F(13u)*sm;if(F(14u)!=0.0){outv=fma(F(14u),CF(ix),outv);}if(U(27u)==1u && cc>rr){outv=0.0;}c[ix]=WF(outv);return;}
+ // op 80: dgend[bh,c] = Σ_i part[bh·64+i] in index order. a=part b=dgend
+ if(op==80u){let nch=U(8u);let cc=U(12u);if(z>=U(1u)*U(3u)){return;}var s=0.0;for(var i=0u;i<64u;i=i+1u){s=s+AF(z*64u+i);}b[z*nch+cc]=WF(s);return;}
  // op 73: mask backward reductions per (chunk,i): dlgm_i = Σ_j t1(i,j) − Σ_k t1(k,i), dβ_i += Σ_{k>i} dL_ki A_ki. a=dp b=P c=dl d=L e=kk f=lg g=bet h=dlgm i=dbet
  if(op==73u){let nch=U(8u);let T=U(2u);if(z>=U(1u)*U(3u)*nch*64u){return;}let bhc=z/64u;let ii=z%64u;let bh=bhc/nch;let cc=bhc%nch;let base=bhc*4096u;let ti=bh*T+cc*64u+ii;
    var rs=0.0;for(var jj=0u;jj<=ii;jj=jj+1u){let q=base+ii*64u+jj;rs=rs+AF(q)*BF(q)+CF(q)*DF(q);}
@@ -4272,8 +4785,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
  // = (t,0,0,0) visits exactly the legacy columns in the legacy order.
  // op 19: band + sink softmax; p[8] = carry_pad (columns [sp, sp+cp) = keys of the previous window,
  // valid for a sequence when its u32 in slot b is set; p[9] = blocks per sequence). cp = 0 → legacy order.
- if(op==19u){let zrow=z;if(zrow>=U(1u)*U(2u)){return;}let t=U(1u);let ld=U(4u);let sk=U(5u);let sp=U(6u);let w=U(7u);let cp=U(8u);let bps=max(U(9u),1u);let block=zrow/t;let row=zrow%t;let base=U(3u)+block*t*ld+row*ld;let cb=sp+cp;let jmax=cb+row+1u;var lo=cb;if(w>0u && row+1u>w){lo=cb+row+1u-w;}
-   var clo=cb;if(cp>0u && BU(block/bps)!=0u){var back=cp;if(w>0u){back=w-1u;}if(back>row){let span=back-row;if(span>=cp){clo=sp;}else{clo=cb-span;}}}
+ // p[10] = wide window, p[11] = bit g → KV group g uses it, p[12] = heads per KV group (swa_sink_v2);
+ // a nonzero carry-mask word is the count of carried keys (newest first) that belong to the stream.
+ if(op==19u){let zrow=z;if(zrow>=U(1u)*U(2u)){return;}let t=U(1u);let ld=U(4u);let sk=U(5u);let sp=U(6u);let cp=U(8u);let bps=max(U(9u),1u);let block=zrow/t;let row=zrow%t;var w=U(7u);if(((U(11u)>>((block%bps)/max(U(12u),1u)))&1u)!=0u){w=U(10u);}let base=U(3u)+block*t*ld+row*ld;let cb=sp+cp;let jmax=cb+row+1u;var lo=cb;if(w>0u && row+1u>w){lo=cb+row+1u-w;}
+   var clo=cb;var cvalid=0u;if(cp>0u){cvalid=BU(block/bps);}if(cvalid!=0u){var back=cp;if(w>0u){back=w-1u;}if(back>row){let span=back-row;if(span>=cp){clo=sp;}else{clo=cb-span;}}clo=max(clo,cb-min(cvalid,cp));}
    var mx=-3.4e38;for(var q=clo;q<cb;q=q+1u){mx=max(mx,AF(base+q));}for(var q=0u;q<jmax;q=q+1u){if(q<sk || q>=lo){mx=max(mx,AF(base+q));}}
    var den=0.0;for(var q=clo;q<cb;q=q+1u){den=den+safe_exp(AF(base+q)-mx);}for(var q=0u;q<jmax;q=q+1u){if(q<sk || q>=lo){den=den+safe_exp(AF(base+q)-mx);}}
    for(var q=0u;q<ld;q=q+1u){let ok=(q<sk)||(q>=clo && q<cb)||(q>=lo && q<jmax);a[base+q]=WF(select(0.0,safe_exp(AF(base+q)-mx)/den,ok));}return;}
@@ -4567,7 +5082,14 @@ mod tests {
         let v = GBuf::from_slice(c, &vec![0.1; rows * d.nh * d.dv]);
         let kap = GBuf::from_slice(c, &vec![0.7; rows * d.nh]);
         let pow = GBuf::from_slice(c, &hk_pow_table(&vec![0.97; d.nh * p2], d.nh, d.nph));
-        let states = GBuf::zeros(c, d.nh * 2 * p2 * d.dv);
+        // one checkpoint per chunk boundary: ceil(T/64) + 1 slots (T = 130
+        // → 4); two slots let the forward write slots 2..3 out of bounds
+        let nch = d.t.div_ceil(64);
+        let states = GBuf::zeros(c, d.b * d.nh * (nch + 1) * p2 * d.dv);
+        // `kv` must not alias `v`: every forward writes kv = κ·v in place,
+        // which with `kv: &v` shrank v by κ on each loss evaluation and the
+        // finite difference compared two different models
+        let kv = GBuf::zeros(c, rows * d.nh * d.dv);
         let out = GBuf::zeros(c, rows * d.nh * d.dv);
         let chunk = GBuf::zeros(c, d.nh * 65 * p2 * d.dv);
         let partial = GBuf::zeros(c, d.nh * (d.dv.div_ceil(32)) * d.t * (1 + 2 * d.nph));
@@ -4580,7 +5102,7 @@ mod tests {
             pow_off: 0,
             phq: &phq,
             phk: &phk,
-            kv: &v,
+            kv: &kv,
             states: &states,
             out: &out,
             phase_chunk: Some(&chunk),
@@ -4631,6 +5153,7 @@ mod tests {
         let mut minus = thq_host.clone();
         minus[5] -= eps;
         let numeric = (loss(&plus) - loss(&minus)) / (2.0 * eps);
+        eprintln!("phase-delta dθq[5]: analytic={analytic} numeric={numeric}");
         assert!(
             (analytic - numeric).abs() < 2e-2,
             "analytic={analytic} numeric={numeric}"

@@ -83,7 +83,7 @@ blob（对齐到 4096）** → 掩码 → 词表 → 稀疏索引。读取器必
 | 9   | `SKILLS_V2`    | 注册表中含 v2 技能记录（`skills[i].kind`，§9.5）：每条记录都对照其绑定的基因组和目录进行检查；未知或保留的 `kind` 被拒绝 |
 | 10  | `ROUTER_V2`    | 文件声明 v2 路由策略（`header.router`，§9.4）：只有已声明的 `backbone_gated` 策略可以自动路由，默认执行主干。会回退到按技能 argmin 的读取器必须拒绝 |
 | 11  | `DECISION`     | 非生成式决策档案（`cortiq-decision`：编码器、哈希约定、共振技能；元数据位于张量 `decision.manifest`）。由决策运行时执行（`cortiq decide`、`cortiq serve`），绝不由语言流水线执行。写入器根据 `arch_name` 前缀 `cortiq-decision-` 推导该位；位与前缀不一致时读取器拒绝 |
-| 12  | `BOUNDED_STATE` | 文件携带原生有界注意力算子（`LayerType::BoundedAttention` + `arch.anchor_core`）：每层状态是由头部推导出的固定大小记录。读取器必须以环形缓冲 + 训练得到的 sink 向量执行锚点，不得用增长 KV 上的掩码替代；`CMF_O1_*`/`--o1` 不适用。当且仅当存在 `anchor_core` 记录时置位；不一致时拒绝 |
+| 12  | `BOUNDED_STATE` | 文件携带原生有界注意力算子（`LayerType::BoundedAttention` + `arch.anchor_core`）：每层状态是由头部推导出的固定大小记录。读取器必须以环形缓冲 + 训练得到的 sink 向量执行锚点，不得用增长 KV 上的掩码替代；`CMF_O1_*`/`--o1` 不适用。`anchor_core.kind` 为 `swa_sink_v1`（单一窗口）或 `swa_sink_v2`（`group_windows`：每个 KV 组一个窗口，最大者等于环形缓冲 `window`；见 docs/EMBRYO_BOUNDED_ANCHOR.md §5）。当且仅当存在 `anchor_core` 记录时置位；不一致时拒绝 |
 | 13  | `GENOME`       | 文件携带冻结基因组（`header.genome`，§9.2）：读取器根据目录、`arch`、词表、`tokenizer_config` 以及掩码/索引区段重新计算 `trunk_hash`，不一致即拒绝——主干不能在没有新基因组的情况下改变 |
 
 位 7–13 **由写入器根据内容推导**（`CmfModel::write`、`write_ref`、流式

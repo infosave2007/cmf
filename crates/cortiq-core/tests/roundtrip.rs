@@ -218,6 +218,7 @@ fn bounded_anchor_contract_validates_and_travels_with_its_feature_bit() {
         rope: "relative_in_window".into(),
         sink_scores: "nope".into(),
         train_windows: vec![64, 128],
+        group_windows: Vec::new(),
         far: None,
     };
 
@@ -240,7 +241,33 @@ fn bounded_anchor_contract_validates_and_travels_with_its_feature_bit() {
     let cases: Vec<(&str, Box<dyn Fn(&mut AnchorCoreConfig)>)> = vec![
         ("kind", Box::new(|a| a.kind = "nystrom_v9".into())),
         ("window 0", Box::new(|a| a.window = 0)),
-        ("sink+window 161", Box::new(|a| a.window = 157)),
+        ("sink+window over the ceiling", Box::new(|a| a.window = 65_533)),
+        ("v1 with group windows", Box::new(|a| a.group_windows = vec![128, 128])),
+        (
+            "v2 without group windows",
+            Box::new(|a| a.kind = "swa_sink_v2".into()),
+        ),
+        (
+            "v2 group windows length",
+            Box::new(|a| {
+                a.kind = "swa_sink_v2".into();
+                a.group_windows = vec![128, 128]; // the test arch has one KV head
+            }),
+        ),
+        (
+            "v2 group window > window",
+            Box::new(|a| {
+                a.kind = "swa_sink_v2".into();
+                a.group_windows = vec![256];
+            }),
+        ),
+        (
+            "v2 widest group != window",
+            Box::new(|a| {
+                a.kind = "swa_sink_v2".into();
+                a.group_windows = vec![64];
+            }),
+        ),
         ("rope", Box::new(|a| a.rope = "absolute".into())),
         ("sink_scores", Box::new(|a| a.sink_scores = "rope".into())),
         ("train_windows 0", Box::new(|a| a.train_windows = vec![0])),
@@ -264,6 +291,21 @@ fn bounded_anchor_contract_validates_and_travels_with_its_feature_bit() {
             }),
         ),
     ];
+    // swa_sink_v2: a window per KV group, the widest = the ring
+    let mut v2 = arch.clone();
+    v2.num_kv_heads = 2;
+    {
+        let ac = v2.anchor_core.as_mut().unwrap();
+        ac.kind = "swa_sink_v2".into();
+        ac.window = 2048;
+        ac.group_windows = vec![128, 2048];
+    }
+    v2.validate_operator_metadata().expect("swa_sink_v2 validates");
+    assert_eq!(v2.anchor_core.as_ref().unwrap().group_window(0), 128);
+    assert_eq!(v2.anchor_core.as_ref().unwrap().group_window(1), 2048);
+    let id2 = v2.linear_core_identity().unwrap();
+    assert_eq!(id2["anchor_core"]["group_windows"], serde_json::json!([128, 2048]));
+    assert!(id["anchor_core"].get("group_windows").is_none(), "v1 identity unchanged");
     for (name, mutate) in cases {
         let mut bad = arch.clone();
         mutate(bad.anchor_core.as_mut().unwrap());

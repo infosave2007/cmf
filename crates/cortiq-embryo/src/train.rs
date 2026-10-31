@@ -118,6 +118,34 @@ pub struct StreamSampler {
     pub reset_every: usize,
     pub eot: Option<u32>,
     single: Option<Mix>,
+    retrieval: Option<Retrieval>,
+    /// per row: planted tokens by absolute stream position → (token, learn)
+    plants: Vec<std::collections::BTreeMap<usize, (u32, bool)>>,
+    /// retrieval tasks planted and their scored target tokens so far
+    pub planted: (usize, usize),
+}
+
+/// Synthetic retrieval tasks planted into the carried stream (`birth
+/// --retrieval-rate`): the long-range recall the plain text rarely asks
+/// for at a known distance. Two kinds, chosen evenly per task:
+/// - pairs (MQAR): `K` random (key, value) tokens from the upper 3/4 of the
+///   vocabulary are written into the text; `D` tokens after them one key
+///   reappears and its value is the target;
+/// - span: a real 8–32-token span of the stream reappears `D` tokens after
+///   its end; the first 2 tokens are the cue, the rest are the target.
+///
+/// `D` is log-uniform in `[dmin, dmax]` and may land in a later window, so
+/// the carried state is the only way across. Targets that predict a random
+/// token (a planted key or value, the query key, the cue) are ignored
+/// (`u32::MAX`); the rest of the text keeps its ordinary targets.
+#[derive(Clone, Debug)]
+pub struct Retrieval {
+    /// expected tasks per row window
+    pub rate: f64,
+    pub dmin: usize,
+    pub dmax: usize,
+    pub max_pairs: usize,
+    pub vocab: usize,
 }
 
 impl StreamSampler {
@@ -132,7 +160,19 @@ impl StreamSampler {
             reset_every,
             eot,
             single: None,
+            retrieval: None,
+            plants: vec![Default::default(); b],
+            planted: (0, 0),
         }
+    }
+    /// Plant synthetic retrieval tasks into the streams (see [`Retrieval`]).
+    pub fn with_retrieval(mut self, r: Retrieval) -> StreamSampler {
+        assert!(
+            r.dmin >= 1 && r.dmin <= r.dmax && r.max_pairs >= 1 && self.t > 2 * r.max_pairs.max(16),
+            "retrieval: needs 1 <= dmin <= dmax, pairs >= 1 and a window longer than a task"
+        );
+        self.retrieval = Some(r);
+        self
     }
     fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -140,6 +180,69 @@ impl StreamSampler {
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)
+    }
+    fn unit(&mut self) -> f64 {
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+    /// New tasks for `row`, whose window starts at `pos` of `src`. A task
+    /// that would touch a position some earlier task already owns is
+    /// dropped, so every planted token has one meaning. Position `pos`
+    /// itself is never written: the previous window already served it as
+    /// its last target.
+    fn plant(&mut self, row: usize, src: &[u16], pos: usize) {
+        let Some(r) = self.retrieval.clone() else {
+            return;
+        };
+        let t = self.t;
+        let n = r.rate.floor() as usize + (self.unit() < r.rate.fract()) as usize;
+        let (lo, span) = ((r.vocab / 4) as u64, (r.vocab - r.vocab / 4).max(1) as u64);
+        for _ in 0..n {
+            let d = ((r.dmin as f64).ln() + self.unit() * ((r.dmax as f64).ln() - (r.dmin as f64).ln()))
+                .exp()
+                .round() as usize;
+            let mut add: Vec<(usize, u32, bool)> = Vec::new();
+            let scored;
+            if self.next_u64() % 2 == 0 {
+                let k = 1 + (self.next_u64() % r.max_pairs as u64) as usize;
+                let p = pos + 1 + (self.next_u64() % (t - 2 * k - 1) as u64) as usize;
+                let mut keys: Vec<u32> = Vec::with_capacity(k);
+                while keys.len() < k {
+                    let c = (lo + self.next_u64() % span) as u32;
+                    if !keys.contains(&c) {
+                        keys.push(c);
+                    }
+                }
+                let vals: Vec<u32> = (0..k).map(|_| (lo + self.next_u64() % span) as u32).collect();
+                for i in 0..k {
+                    add.push((p + 2 * i, keys[i], false));
+                    add.push((p + 2 * i + 1, vals[i], false));
+                }
+                let j = (self.next_u64() % k as u64) as usize;
+                let q = p + 2 * k + d;
+                add.push((q, keys[j], false));
+                add.push((q + 1, vals[j], true));
+                scored = 1;
+            } else {
+                let l = 8 + (self.next_u64() % 25) as usize;
+                let p = pos + 1 + (self.next_u64() % (t - l - 1) as u64) as usize;
+                let q = p + l + d;
+                // the source stays as it is, but no later task may write
+                // over it: it is owned like any planted token
+                for i in 0..l {
+                    add.push((p + i, src[p + i] as u32, true));
+                    add.push((q + i, src[p + i] as u32, i >= 2));
+                }
+                scored = l - 2;
+            }
+            if add.iter().any(|(ap, _, _)| self.plants[row].contains_key(ap)) {
+                continue;
+            }
+            self.planted.0 += 1;
+            self.planted.1 += scored;
+            for (ap, tok, learn) in add {
+                self.plants[row].insert(ap, (tok, learn));
+            }
+        }
     }
     /// Next window of every row; returns `reset[b]` (true = fresh stream).
     pub fn batch_mix(&mut self, mix: &Mix, tokens: &mut Vec<u32>, targets: &mut Vec<u32>) -> Vec<bool> {
@@ -173,12 +276,27 @@ impl StreamSampler {
                 self.cursors[row] = Some((si, start));
                 self.windows[row] = 0;
                 self.pending_reset[row] = false;
+                self.plants[row].clear();
                 reset[row] = true;
             }
             let (si, pos) = self.cursors[row].unwrap();
             let w = &mix.shards[si].tokens[pos..pos + self.t + 1];
-            tokens.extend(w[..self.t].iter().map(|x| *x as u32));
-            targets.extend(w[1..].iter().map(|x| *x as u32));
+            if self.retrieval.is_some() {
+                self.plant(row, &mix.shards[si].tokens, pos);
+                let mut win: Vec<u32> = w.iter().map(|x| *x as u32).collect();
+                let mut learn = vec![true; self.t + 1];
+                for (&ap, &(tok, l)) in self.plants[row].range(pos..=pos + self.t) {
+                    win[ap - pos] = tok;
+                    learn[ap - pos] = l;
+                }
+                tokens.extend_from_slice(&win[..self.t]);
+                targets.extend((1..=self.t).map(|i| if learn[i] { win[i] } else { u32::MAX }));
+                // position pos+t opens the next window: keep it
+                self.plants[row] = self.plants[row].split_off(&(pos + self.t));
+            } else {
+                tokens.extend(w[..self.t].iter().map(|x| *x as u32));
+                targets.extend(w[1..].iter().map(|x| *x as u32));
+            }
             if let Some(e) = self.eot {
                 if w[..self.t].iter().any(|&x| x as u32 == e) {
                     self.pending_reset[row] = true;
