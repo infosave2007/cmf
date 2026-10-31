@@ -155,6 +155,172 @@ fn far_only() -> bool {
     *ON.get_or_init(|| std::env::var("CMF_O1_FARONLY").as_deref() == Ok("1"))
 }
 
+/// Control arm (`CMF_O1_NOFAR=1`): read sinks + window only and drop
+/// the far field — StreamingLLM under the same seal. The yardstick the
+/// skeleton has to beat: a far estimate that scores worse than no far
+/// estimate injects wrong mass rather than missing it.
+fn no_far() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("CMF_O1_NOFAR").as_deref() == Ok("1"))
+}
+
+/// Calibrated skeleton for ONE GQA group (`CMF_O1_CALIB=dir`): landmarks
+/// fixed from a calibration corpus instead of segment means of the
+/// prompt, and optionally a least-squares mixing matrix per Q head in
+/// place of pinv(exp(Q̃K̃ᵀ/√d)). Written by `scripts/o1_calib_fit.py`
+/// from `CMF_O1_CAPTURE` dumps; a layer or group without a file seals
+/// the ordinary way.
+///
+/// File `L{layer}_g{group}.o1c`, little-endian: u32 m, d, q_heads,
+/// has_mu, then f32 K̃ `[m][d]`, Q̃ `[q_heads][m][d]`, and when has_mu
+/// M `[q_heads][m][m]` (row a, column b — the runtime's `mu` layout).
+#[derive(Clone, Debug)]
+pub struct O1Calib {
+    m: usize,
+    k_tilde: Vec<f32>,
+    q_tilde: Vec<Vec<f32>>,
+    mu: Option<Vec<Vec<f32>>>,
+}
+
+impl O1Calib {
+    /// The calibration of (layer, group), or None when `CMF_O1_CALIB` is
+    /// unset or holds no file for it. A file whose geometry disagrees
+    /// with the layer is refused loudly rather than half-applied.
+    pub fn load(layer: u32, group: usize, d: usize, q_heads: usize) -> Option<Self> {
+        let dir = std::env::var("CMF_O1_CALIB").ok()?;
+        let path = std::path::Path::new(&dir).join(format!("L{layer}_g{group}.o1c"));
+        if !path.exists() {
+            return None;
+        }
+        match Self::read(&path, d, q_heads) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::error!(
+                    "o1 calib {}: {e} — layer seals uncalibrated",
+                    path.display()
+                );
+                None
+            }
+        }
+    }
+
+    /// Parse one `.o1c` file for a group of `q_heads` heads of width `d`.
+    pub fn read(path: &std::path::Path, d: usize, q_heads: usize) -> Result<Self, String> {
+        let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+        let u = |i: usize| -> Result<usize, String> {
+            let b = bytes.get(i * 4..i * 4 + 4).ok_or("truncated header")?;
+            Ok(u32::from_le_bytes(b.try_into().unwrap()) as usize)
+        };
+        let (m, fd, fh, has_mu) = (u(0)?, u(1)?, u(2)?, u(3)? != 0);
+        let want = m * d + q_heads * m * d + if has_mu { q_heads * m * m } else { 0 };
+        if fd != d
+            || fh != q_heads
+            || !(4..=O1_MAX_CALIB_M).contains(&m)
+            || bytes.len() != 16 + want * 4
+        {
+            return Err(format!(
+                "geometry m={m} d={fd} heads={fh} ({} bytes) does not fit d={d} heads={q_heads}",
+                bytes.len()
+            ));
+        }
+        let f: Vec<f32> = bytes[16..]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let (kt, rest) = f.split_at(m * d);
+        let (qt, mu) = rest.split_at(q_heads * m * d);
+        Ok(Self::from_parts(
+            m,
+            kt.to_vec(),
+            qt.chunks_exact(m * d).map(<[f32]>::to_vec).collect(),
+            has_mu.then(|| mu.chunks_exact(m * m).map(<[f32]>::to_vec).collect()),
+        ))
+    }
+
+    /// m landmarks: K̃ `[m][d]`, one Q̃ `[m][d]` per head, optionally one
+    /// M `[m][m]` per head.
+    pub fn from_parts(
+        m: usize,
+        k_tilde: Vec<f32>,
+        q_tilde: Vec<Vec<f32>>,
+        mu: Option<Vec<Vec<f32>>>,
+    ) -> Self {
+        O1Calib {
+            m,
+            k_tilde,
+            q_tilde,
+            mu,
+        }
+    }
+}
+
+/// `CMF_O1_WIDE="layer:group,..."` — KV groups whose exact window widens
+/// to `CMF_O1_WIDE_W` keys (default 2048, the device's sink + window cap
+/// with the default 4 sinks). Copying heads lose a key the moment it
+/// leaves the window; a wide window keeps recall exact out to its width
+/// while the state stays O(1). Returns the width for (layer, group).
+pub fn wide_window(layer: u32, group: usize) -> Option<usize> {
+    static CFG: std::sync::OnceLock<(Vec<(u32, usize)>, usize)> = std::sync::OnceLock::new();
+    let (set, w) = CFG.get_or_init(|| {
+        let set = std::env::var("CMF_O1_WIDE")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .filter_map(|p| {
+                        let (l, g) = p.trim().split_once(':')?;
+                        Some((l.parse().ok()?, g.parse().ok()?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let w = std::env::var("CMF_O1_WIDE_W")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2048);
+        (set, w)
+    });
+    set.contains(&(layer, group)).then_some(*w)
+}
+
+/// Landmark budget a calibration file may carry — the device mirror's
+/// limit, so a calibrated seal stays graph-portable.
+const O1_MAX_CALIB_M: usize = 32;
+
+/// `CMF_O1_CAPTURE=dir`: every seal writes each group's prompt queries,
+/// keys and values — the calibration corpus `scripts/o1_calib_fit.py`
+/// reads. File `L{layer}_g{group}_{n}.f32`: u32 t, d, q_heads, then f32
+/// Q `[q_heads][t][d]`, K `[t][d]`, V `[t][d]` (post-RoPE, as the seal
+/// sees them).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn capture_seal(
+    layer: u32,
+    group: usize,
+    t: usize,
+    d: usize,
+    q_heads: usize,
+    qs: &[f32],
+    ks: &[f32],
+    vs: &[f32],
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let Ok(dir) = std::env::var("CMF_O1_CAPTURE") else {
+        return;
+    };
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let path = std::path::Path::new(&dir).join(format!("L{layer}_g{group}_{n:05}.f32"));
+    let mut out = Vec::with_capacity(12 + (qs.len() + ks.len() + vs.len()) * 4);
+    for x in [t, d, q_heads] {
+        out.extend_from_slice(&(x as u32).to_le_bytes());
+    }
+    for x in qs.iter().chain(ks).chain(vs) {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    if let Err(e) = std::fs::write(&path, out) {
+        tracing::error!("o1 capture {}: {e}", path.display());
+    }
+}
+
 /// Streaming Nyström attention state for ONE GQA group.
 ///
 /// State splits along the GQA grain, because the operator does:
@@ -183,6 +349,8 @@ fn far_only() -> bool {
 pub struct NystromState {
     group: NystromGroup,
     heads: Vec<NystromHead>,
+    /// Consumed by the seal (`with_calib`); None = segment means + pinv.
+    calib: Option<O1Calib>,
 }
 
 /// The part of the state a GQA group shares: everything derived from
@@ -193,6 +361,11 @@ struct NystromGroup {
     m: usize,
     /// Exact-window width in keys.
     w: usize,
+    /// The window the layer was configured with. A widened group
+    /// (`with_window`) still decides exact-only against it, so it seals at
+    /// the same boundary as its narrow neighbours — the device needs every
+    /// group of a layer in skeleton mode.
+    base_w: usize,
     /// Permanent exact sink keys at positions 0..sink (spec §5b).
     sink: usize,
     d: usize,
@@ -404,6 +577,7 @@ impl NystromState {
             group: NystromGroup {
                 m,
                 w,
+                base_w: w,
                 sink,
                 d: 0,
                 dv: 0,
@@ -425,7 +599,23 @@ impl NystromState {
                 since_reseal: 0,
             },
             heads: (0..q_heads).map(|_| NystromHead::new()).collect(),
+            calib: None,
         }
+    }
+
+    /// Widen this group's exact window to `w` keys (builder). The
+    /// retrieval lever: a copying head reads every key of the last `w`
+    /// exactly, while the group's state stays a fixed-size ring.
+    pub fn with_window(mut self, w: usize) -> Self {
+        assert!(w >= 1, "window must hold at least one key");
+        self.group.w = w;
+        self
+    }
+
+    /// Seal against a calibrated skeleton (builder; see `O1Calib`).
+    pub fn with_calib(mut self, calib: Option<O1Calib>) -> Self {
+        self.calib = calib.filter(|c| c.q_tilde.len() == self.heads.len());
+        self
     }
 
     /// Select the skeleton rectifier for every head of the group
@@ -478,7 +668,8 @@ impl NystromState {
         assert_eq!(ks.len(), t * d);
         assert_eq!(vs.len(), t * dv);
 
-        let Some(k_tilde64) = self.group.prefill_shared(ks, vs, t, d, dv) else {
+        let calib = self.calib.take();
+        let Some(k_tilde64) = self.group.prefill_shared(ks, vs, t, d, dv, calib.as_ref()) else {
             // exact-only: no skeleton, no far field — nothing per head
             // beyond the score scratch.
             for h in &mut self.heads {
@@ -486,8 +677,11 @@ impl NystromState {
             }
             return;
         };
-        for (h, q) in self.heads.iter_mut().zip(qs) {
-            h.seal(&self.group, q, t, &k_tilde64);
+        for (hi, (h, q)) in self.heads.iter_mut().zip(qs).enumerate() {
+            let fixed = calib
+                .as_ref()
+                .map(|c| (&c.q_tilde[hi][..], c.mu.as_ref().map(|m| &m[hi][..])));
+            h.seal(&self.group, q, t, &k_tilde64, fixed);
         }
         // Replay the post-sink prompt ONCE for the group: each key
         // enters the shared window, evicting the (j-w)-th into every
@@ -687,6 +881,7 @@ impl NystromGroup {
         t: usize,
         d: usize,
         dv: usize,
+        calib: Option<&O1Calib>,
     ) -> Option<Vec<f64>> {
         self.d = d;
         self.dv = dv;
@@ -698,7 +893,7 @@ impl NystromGroup {
         // (w + sink + slack + 1), so a converted prompt never enters the
         // exact-only state. Direct Nystrom users retain the historical
         // exact-only behavior for short prefills.
-        self.exact_only = o1_deferred_boundary(self.w, self.sink)
+        self.exact_only = o1_deferred_boundary(self.base_w, self.sink)
             .map(|boundary| t < boundary)
             .unwrap_or(true);
         if self.exact_only {
@@ -734,6 +929,15 @@ impl NystromGroup {
         self.sink_len = self.sink; // skeleton mode guarantees t > sink
         self.sink_k = ks[..self.sink * d].to_vec();
         self.sink_v = vs[..self.sink * dv].to_vec();
+        self.win_k = vec![0.0; self.w * d];
+        self.win_v = vec![0.0; self.w * dv];
+
+        if let Some(c) = calib {
+            // Calibrated: the landmarks do not depend on this prompt.
+            self.m_eff = c.m;
+            self.k_tilde = c.k_tilde.clone();
+            return Some(c.k_tilde.iter().map(|&x| x as f64).collect());
+        }
 
         // Landmarks: contiguous segment means of the prompt.  The
         // integer split (i·t)/m matches the reference probe; the clamp
@@ -764,9 +968,6 @@ impl NystromGroup {
         self.m_eff = m_eff;
         let k_tilde64 = seg_means(ks, t, d, m_eff);
         self.k_tilde = k_tilde64.iter().map(|&x| x as f32).collect();
-
-        self.win_k = vec![0.0; self.w * d];
-        self.win_v = vec![0.0; self.w * dv];
         Some(k_tilde64)
     }
 
@@ -808,27 +1009,42 @@ impl NystromHead {
     }
 
     /// Freeze this head's query landmarks and mixing matrix against the
-    /// group's (already frozen) key landmarks.
-    fn seal(&mut self, g: &NystromGroup, qs: &[f32], t: usize, k_tilde64: &[f64]) {
+    /// group's (already frozen) key landmarks. `fixed` = calibrated Q̃
+    /// and, when the calibration carries one, its fitted M.
+    fn seal(
+        &mut self,
+        g: &NystromGroup,
+        qs: &[f32],
+        t: usize,
+        k_tilde64: &[f64],
+        fixed: Option<(&[f32], Option<&[f32]>)>,
+    ) {
         let (d, dv, m_eff) = (g.d, g.dv, g.m_eff);
         self.far_len = 0;
-        let q_tilde64 = seg_means(qs, t, d, m_eff);
+        let q_tilde64 = match fixed {
+            Some((qt, _)) => qt.iter().map(|&x| x as f64).collect(),
+            None => seg_means(qs, t, d, m_eff),
+        };
         self.q_tilde = q_tilde64.iter().map(|&x| x as f32).collect();
 
-        // Au and its regularized pseudo-inverse in f64 — one-off m×m
-        // work at prefill only; the hot path stays f32.
-        let mut au = vec![0.0f64; m_eff * m_eff];
-        for i in 0..m_eff {
-            for j in 0..m_eff {
-                let mut s = 0.0f64;
-                for c in 0..d {
-                    s += q_tilde64[i * d + c] * k_tilde64[j * d + c];
+        if let Some((_, Some(mu))) = fixed {
+            self.mu = mu.to_vec();
+        } else {
+            // Au and its regularized pseudo-inverse in f64 — one-off m×m
+            // work at prefill only; the hot path stays f32.
+            let mut au = vec![0.0f64; m_eff * m_eff];
+            for i in 0..m_eff {
+                for j in 0..m_eff {
+                    let mut s = 0.0f64;
+                    for c in 0..d {
+                        s += q_tilde64[i * d + c] * k_tilde64[j * d + c];
+                    }
+                    au[i * m_eff + j] = (s * g.scale as f64).exp();
                 }
-                au[i * m_eff + j] = (s * g.scale as f64).exp();
             }
+            let mu64 = ridge_pinv(&au, m_eff);
+            self.mu = mu64.iter().map(|&x| x as f32).collect();
         }
-        let mu64 = ridge_pinv(&au, m_eff);
-        self.mu = mu64.iter().map(|&x| x as f32).collect();
 
         self.t_hat = vec![0.0; m_eff * dv];
         self.z_hat = vec![0.0; m_eff];
@@ -875,7 +1091,7 @@ impl NystromHead {
         let mut far_den = 0.0f32;
         let mut c_all = c;
         let mut have_far = false;
-        if self.far_len > 0 {
+        if self.far_len > 0 && !no_far() {
             // Per-token row shift f over landmark scores.
             let mut f = f32::NEG_INFINITY;
             for a in 0..g.m_eff {

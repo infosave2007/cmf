@@ -2272,6 +2272,28 @@ pub fn graph_state_resident(_kv_id: u64, _layer: usize) -> bool {
     false
 }
 
+/// Capture the rotated queries of `layers` in this thread's batch-graph
+/// calls (the O(1) seal's trace for a prefix run on the device). False when
+/// there is no wgpu batch graph to capture from.
+pub fn o1_qcap_begin(_layers: &[usize]) -> bool {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        crate::gpu_wgpu::o1_qcap_begin(_layers);
+        return true;
+    }
+    false
+}
+
+/// End the capture: per layer, the rows of every call since
+/// `o1_qcap_begin`, position-major `[rows × nh × hd]`.
+pub fn o1_qcap_take() -> Option<Vec<(usize, Vec<f32>)>> {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::o1_qcap_take();
+    }
+    None
+}
+
 /// One GDN layer's recurrent state as the wgpu graph holds it, in the host
 /// `linear_state` layout ([conv ring | S]).
 pub fn graph_gdn_state_read(_kv_id: u64, _layer: usize) -> Option<Vec<f32>> {

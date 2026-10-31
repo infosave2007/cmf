@@ -4347,6 +4347,18 @@ impl Pipeline {
         if self.g4_batch_prefill() {
             return 128;
         }
+        // The sealed O(1) suffix of a bounded prompt (`CMF_O1_PREFILL`) on
+        // the device route rides the batch graph, whose O(1) kernels take
+        // the chunk in 64-row sub-chunks (`o1_batch`); 128 as the exact
+        // prompt below. Without it the suffix went one position at a time.
+        #[cfg(not(target_os = "macos"))]
+        if self.o1_active()
+            && std::env::var("CMF_O1_GPU").as_deref() == Ok("1")
+            && crate::gpu::enabled_here()
+            && crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Prefill)
+        {
+            return 128;
+        }
         #[cfg(not(target_os = "macos"))]
         if self.graph_prefill_preferred() && !self.o1_active() {
             // 128 is measured on the dense hybrids; MoE stacks other than
@@ -4573,6 +4585,95 @@ impl Pipeline {
         if let Err(err) = self.o1_seal_checked() {
             self.o1_fail(err);
         }
+    }
+
+    /// Run a bounded O(1) prefix (`ids`, positions 0..) through the batch
+    /// graph instead of the host prefill: the same exact attention, with the
+    /// O(1) layers' rotated queries captured on the device and their K/V rows
+    /// read back from the mirror, so each layer's collector holds what the
+    /// host walk would have given its seal. The recurrent and exact layers'
+    /// state stays on the device for the sealed suffix batches.
+    /// `Ok(None)`: declined before any device state moved — the caller runs
+    /// the host prefill. `Ok(Some(h))`: the last prefix row's hidden.
+    fn o1_prefix_on_graph(
+        &mut self,
+        ids: &[u32],
+        chunk: usize,
+    ) -> Result<Option<Vec<f32>>, String> {
+        let o1_layers: Vec<usize> = (0..self.num_layers)
+            .filter(|&li| self.o1_flags.get(li).copied().unwrap_or(false))
+            .collect();
+        let Some(&first) = o1_layers.first() else {
+            return Ok(None);
+        };
+        let (nkv, hd) = {
+            let c = &self.kv_cache.layers[first];
+            (c.num_kv_heads, c.head_dim)
+        };
+        let nh = self.num_heads;
+        if chunk == 0
+            || o1_layers.iter().any(|&li| {
+                let c = &self.kv_cache.layers[li];
+                self.layer_num_heads(li) != nh
+                    || (c.num_kv_heads, c.head_dim) != (nkv, hd)
+                    || c.seq_len != 0
+                    || c.o1_pending_boundary().is_none()
+            })
+            || !crate::gpu::o1_qcap_begin(&o1_layers)
+        {
+            return Ok(None);
+        }
+        let hs = self.hidden_size;
+        let n = ids.len();
+        let mut last = vec![0f32; hs];
+        let mut pos = 0;
+        while pos < n {
+            let end = (pos + chunk).min(n);
+            let bk = end - pos;
+            let mut hiddens = vec![0f32; bk * hs];
+            for (j, &id) in ids[pos..end].iter().enumerate() {
+                hiddens[j * hs..(j + 1) * hs].copy_from_slice(&self.embed_single(id));
+            }
+            let positions: Vec<usize> = (pos..end).collect();
+            match self.try_batch_graph_wgpu(&mut hiddens, &positions, bk, None) {
+                crate::gpu::BatchGraphOutcome::Completed => {
+                    last.copy_from_slice(&hiddens[(bk - 1) * hs..]);
+                    pos = end;
+                }
+                crate::gpu::BatchGraphOutcome::Declined if pos == 0 => {
+                    let _ = crate::gpu::o1_qcap_take();
+                    return Ok(None);
+                }
+                _ => {
+                    let _ = crate::gpu::o1_qcap_take();
+                    return Err("O(1) prefix batch graph stopped after admission".into());
+                }
+            }
+        }
+        let q = crate::gpu::o1_qcap_take().ok_or("O(1) prefix: query readback failed")?;
+        let pulls: Vec<(usize, usize, usize)> = o1_layers.iter().map(|&li| (li, 0, n)).collect();
+        let kv = crate::gpu::graph_kv_read_rows(self.graph_kv_id, &pulls, nkv, hd)
+            .ok_or("O(1) prefix: K/V readback failed")?;
+        let (row, qrow) = (nkv * hd, nh * hd);
+        for ((li, qs), (k, v)) in q.into_iter().zip(kv) {
+            if k.len() != n * row || v.len() != n * row || qs.len() != n * qrow {
+                return Err(format!(
+                    "O(1) prefix: layer {li} read back {}/{}/{} values, expected {}/{}/{}",
+                    k.len(),
+                    v.len(),
+                    qs.len(),
+                    n * row,
+                    n * row,
+                    n * qrow
+                ));
+            }
+            let cache = &mut self.kv_cache.layers[li];
+            for p in 0..n {
+                cache.append(&k[p * row..(p + 1) * row], &v[p * row..(p + 1) * row], &[]);
+                cache.o1_push_q(&qs[p * qrow..(p + 1) * qrow]);
+            }
+        }
+        Ok(Some(last))
     }
 
     /// Enable/disable the structured per-token telemetry trace (B4).
@@ -5411,9 +5512,44 @@ impl Pipeline {
             .map(|boundary| boundary.min(input_ids.len()));
         let mut o1_sealed = false;
         if let Some(limit) = o1_prefill_limit {
+            // On the device route the prefix takes the batch graph and its
+            // sealed suffix the O(1) batches after it (`o1_prefix_on_graph`):
+            // the host walk read it at 16 tok/s on Qwen3.8-27B / A40, 33 s
+            // of a 72 s TTFT at 4k. Only when a suffix follows — a prompt
+            // inside the boundary stays exact on the host as before.
+            // `CMF_O1_PREFIX_GPU=0` keeps the host prefill.
+            if pos == 0
+                && limit < input_ids.len()
+                && batch_k > 0
+                && task_mask.is_none()
+                && mtp.is_none()
+                && !dyn_prefill
+                && std::env::var("CMF_O1_GPU").as_deref() == Ok("1")
+                && std::env::var("CMF_O1_PREFIX_GPU").as_deref() != Ok("0")
+                && (0..self.num_layers).all(|li| self.phys_layer(li) == li)
+            {
+                let t_px = std::time::Instant::now();
+                match self.o1_prefix_on_graph(&input_ids[..limit], batch_k) {
+                    Ok(Some(last)) => {
+                        hidden.copy_from_slice(&last);
+                        pos = limit;
+                        if std::env::var("CMF_PREFILL_PROF").is_ok() {
+                            eprintln!(
+                                "o1 prefix on the batch graph: {limit} rows in {:.1} ms",
+                                t_px.elapsed().as_secs_f64() * 1e3
+                            );
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        self.finish_generation(&mut mtp, &mut router, true);
+                        return Err(err);
+                    }
+                }
+            }
             // Reuse the exact batched prefix machinery when available; it
             // records the same per-position Q trace as the full prefill.
-            if self.can_prefill_batched() && limit > 2 {
+            if pos < limit && self.can_prefill_batched() && limit > 2 {
                 let chunk = self.prefill_chunk();
                 let hs = self.hidden_size;
                 while pos < limit && !self.cancel.load(std::sync::atomic::Ordering::Relaxed) {

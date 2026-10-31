@@ -746,7 +746,22 @@ impl LayerKvCache {
             let qs: Vec<&[f32]> = (0..hpk)
                 .map(|hh| &qh[hh * t * hd..(hh + 1) * t * hd])
                 .collect();
-            let mut st = crate::nystrom::NystromState::new_group(m, w, sink, hpk).with_rect(rect);
+            crate::nystrom::capture_seal(
+                self.wire_layer,
+                g,
+                t,
+                hd,
+                hpk,
+                &qh,
+                &self.k[g],
+                &self.v[g],
+            );
+            let calib = crate::nystrom::O1Calib::load(self.wire_layer, g, hd, hpk);
+            let wg = crate::nystrom::wide_window(self.wire_layer, g).unwrap_or(w);
+            let mut st = crate::nystrom::NystromState::new_group(m, w, sink, hpk)
+                .with_window(wg)
+                .with_rect(rect)
+                .with_calib(calib);
             st.prefill_group(&qs, &self.k[g], &self.v[g], t, hd, hd);
             groups.push(st);
         }

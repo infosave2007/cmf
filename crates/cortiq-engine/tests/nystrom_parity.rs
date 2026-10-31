@@ -12,7 +12,7 @@
 //! from the matrix math and are gated on end-to-end ppl instead
 //! (`fm_rect_is_nonnegative_far_mass` below covers its contract).
 
-use cortiq_engine::nystrom::{NystromState, O1Rect};
+use cortiq_engine::nystrom::{NystromState, O1Calib, O1Rect};
 
 fn rows(v: &serde_json::Value) -> Vec<Vec<f32>> {
     v.as_array()
@@ -424,4 +424,206 @@ fn extended_window_ring_wrap_preserves_rows() {
             oldest + logical
         );
     }
+}
+
+/// Prompt, GQA group and the skeleton an uncalibrated seal derives from
+/// it — the fixture of the calibration tests below.
+struct CalibCase {
+    d: usize,
+    m: usize,
+    w: usize,
+    sink: usize,
+    p: usize,
+    hpk: usize,
+    q: Vec<Vec<Vec<f32>>>,
+    k: Vec<Vec<f32>>,
+    v: Vec<Vec<f32>>,
+}
+
+impl CalibCase {
+    fn new() -> Self {
+        let (d, m, w, sink, t, p, hpk) =
+            (16usize, 8usize, 16usize, 4usize, 220usize, 120usize, 2usize);
+        let mut rng = Lcg(777);
+        let k = (0..t)
+            .map(|_| rng.vec(d).iter().map(|x| x * 2.0).collect())
+            .collect();
+        let v = (0..t).map(|_| rng.vec(d)).collect();
+        let q = (0..hpk)
+            .map(|_| {
+                (0..t)
+                    .map(|_| rng.vec(d).iter().map(|x| x * 2.0).collect())
+                    .collect()
+            })
+            .collect();
+        CalibCase {
+            d,
+            m,
+            w,
+            sink,
+            p,
+            hpk,
+            q,
+            k,
+            v,
+        }
+    }
+
+    fn sealed(&self, calib: Option<O1Calib>) -> NystromState {
+        let fl =
+            |rows: &[Vec<f32>]| -> Vec<f32> { rows[..self.p].iter().flatten().copied().collect() };
+        let qs: Vec<Vec<f32>> = self.q.iter().map(|qh| fl(qh)).collect();
+        let qrefs: Vec<&[f32]> = qs.iter().map(|x| x.as_slice()).collect();
+        let mut st = NystromState::new_group(self.m, self.w, self.sink, self.hpk)
+            .with_rect(O1Rect::Aggregate)
+            .with_calib(calib);
+        st.prefill_group(&qrefs, &fl(&self.k), &fl(&self.v), self.p, self.d, self.d);
+        st
+    }
+
+    /// The skeleton `st` sealed with, as a calibration.
+    fn skeleton(st: &NystromState, with_mu: bool) -> O1Calib {
+        let v = st.device_view();
+        O1Calib::from_parts(
+            v.m_eff,
+            v.k_tilde.to_vec(),
+            v.heads.iter().map(|h| h.q_tilde.to_vec()).collect(),
+            with_mu.then(|| v.heads.iter().map(|h| h.mu.to_vec()).collect()),
+        )
+    }
+
+    /// Decode the rest of the stream; every head's output per position.
+    fn decode(&self, st: &mut NystromState) -> Vec<f32> {
+        let mut out = Vec::new();
+        let mut row = vec![0.0f32; self.hpk * self.d];
+        for i in self.p..self.k.len() {
+            let q_all: Vec<f32> = (0..self.hpk)
+                .flat_map(|h| self.q[h][i].iter().copied())
+                .collect();
+            st.step_group(&q_all, &self.k[i], &self.v[i], &mut row);
+            out.extend_from_slice(&row);
+        }
+        out
+    }
+}
+
+/// `CMF_O1_CALIB` swaps only the skeleton: handing a seal back the very
+/// landmarks and M an uncalibrated seal derived from the prompt must
+/// reproduce its decode bit for bit — window, sinks and far
+/// accumulation are the same code either way.
+#[test]
+fn calibrated_seal_with_the_prompt_skeleton_is_bit_identical() {
+    let case = CalibCase::new();
+    let mut plain = case.sealed(None);
+    let mut calib = case.sealed(Some(CalibCase::skeleton(&plain, true)));
+    let (a, b) = (case.decode(&mut plain), case.decode(&mut calib));
+    assert!(a.iter().any(|x| *x != 0.0), "decode produced nothing");
+    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+        assert_eq!(
+            x.to_bits(),
+            y.to_bits(),
+            "output {i}: plain {x} vs calibrated {y}"
+        );
+    }
+}
+
+/// Without a fitted M the calibrated seal inverts its landmarks itself;
+/// with the prompt's (f32-rounded) landmarks that lands next to the
+/// uncalibrated seal, which inverts the f64 segment means.
+#[test]
+fn calibrated_landmarks_without_mu_rebuild_pinv() {
+    let case = CalibCase::new();
+    let mut plain = case.sealed(None);
+    let mut calib = case.sealed(Some(CalibCase::skeleton(&plain, false)));
+    let (a, b) = (case.decode(&mut plain), case.decode(&mut calib));
+    let worst = a
+        .iter()
+        .zip(&b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    assert!(worst < 1e-2, "rebuilt pinv drifted by {worst}");
+}
+
+/// The `.o1c` file `scripts/o1_calib_fit.py` writes reads back into the
+/// same skeleton, and a file for another geometry is refused.
+#[test]
+fn o1c_file_round_trip_and_geometry_check() {
+    let case = CalibCase::new();
+    let mut plain = case.sealed(None);
+    let v = plain.device_view();
+    let mut bytes = Vec::new();
+    for x in [v.m_eff, case.d, case.hpk, 1] {
+        bytes.extend_from_slice(&(x as u32).to_le_bytes());
+    }
+    let floats = v
+        .k_tilde
+        .iter()
+        .chain(v.heads.iter().flat_map(|h| h.q_tilde.iter()))
+        .chain(v.heads.iter().flat_map(|h| h.mu.iter()));
+    for x in floats {
+        bytes.extend_from_slice(&x.to_le_bytes());
+    }
+    let path = std::env::temp_dir().join(format!("o1c_round_trip_{}.o1c", std::process::id()));
+    std::fs::write(&path, &bytes).unwrap();
+    let read = O1Calib::read(&path, case.d, case.hpk);
+    let wrong = O1Calib::read(&path, case.d * 2, case.hpk);
+    std::fs::remove_file(&path).ok();
+    assert!(
+        wrong.is_err(),
+        "a file for d={} must not load at d={}",
+        case.d,
+        case.d * 2
+    );
+    let mut calib = case.sealed(Some(read.unwrap()));
+    let (a, b) = (case.decode(&mut plain), case.decode(&mut calib));
+    assert!(
+        a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+        "file skeleton differs"
+    );
+}
+
+/// A widened group (`with_window`) whose window covers the whole stream
+/// is exact attention — and it still seals in skeleton mode at the
+/// layer's (narrow) boundary, so the device keeps every group of the
+/// layer. The retrieval lever rests on both halves.
+#[test]
+fn wide_window_group_is_exact_attention() {
+    let (d, dv, m, w, sink, t, p) = (
+        16usize, 16usize, 8usize, 16usize, 4usize, 200usize, 120usize,
+    );
+    let mut rng = Lcg(31337);
+    let k: Vec<Vec<f32>> = (0..t)
+        .map(|_| rng.vec(d).iter().map(|x| x * 2.0).collect())
+        .collect();
+    let v: Vec<Vec<f32>> = (0..t).map(|_| rng.vec(dv)).collect();
+    let q: Vec<Vec<f32>> = (0..t)
+        .map(|_| rng.vec(d).iter().map(|x| x * 2.0).collect())
+        .collect();
+    let fl = |rows: &[Vec<f32>]| -> Vec<f32> { rows[..p].iter().flatten().copied().collect() };
+    let mut st = NystromState::new(m, w, sink).with_window(256);
+    st.prefill(&fl(&q), &fl(&k), &fl(&v), p, d, dv);
+    assert!(
+        !st.device_view().exact_only,
+        "a wide group must seal in skeleton mode"
+    );
+    assert_eq!(st.device_view().w, 256);
+    let mut out = vec![0.0f32; dv];
+    for i in p..t {
+        st.step(&q[i], &k[i], &v[i], &mut out);
+        let want = softmax_row(&q[i], &k, &v, i, dv);
+        let worst = out
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 1e-5,
+            "pos {i}: wide group drifted from softmax by {worst}"
+        );
+    }
+    assert_eq!(
+        st.far_len(0),
+        0,
+        "nothing may leave a window that covers the stream"
+    );
 }
