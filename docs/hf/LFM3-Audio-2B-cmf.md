@@ -100,12 +100,13 @@ Against the bf16 checkpoint run in float32 by Transformers:
 | task | NVIDIA A40 (Vulkan) | Apple M4 (Metal) |
 |---|---:|---:|
 | speech synthesis, 7.0 s of speech | 5.6 s | 3.2 s |
-| text decode | 231 tok/s | 82 tok/s |
-| transcription of a 4.4 s clip (incl. loading) | — | 1.5 s |
+| text decode (`cortiq bench --core`) | 204 tok/s (`q8_2f`: 172) | 79 tok/s |
+| transcription of a 4.4 s clip, loading included | — | 1.5 s |
 
 A speech frame is one step of the language model (on the GPU) plus three passes
-of the depth decoder (on the CPU); the codec decodes the frames at the end
-(0.1–0.6 s for 7 s of speech).
+of the depth decoder (on the CPU, 16–23 ms a frame); the codec decodes the
+frames at the end (0.1 s on the M4, 0.6 s on the A40 host's CPU for 7 s of
+speech).
 
 ## Usage
 
@@ -162,8 +163,8 @@ cortiq verify lfm3-audio-2b-q8_2f.cmf
 
 | file | sha256 |
 |---|---|
-| `lfm3-audio-2b-q8_2f.cmf` | `SHA_Q8` |
-| `lfm3-audio-2b-q4tp.cmf` | `SHA_Q4` |
+| `lfm3-audio-2b-q8_2f.cmf` | `2b9ac37d52ac256f64028af86b07583badb86a995a32d0eb9194a536f74b207e` |
+| `lfm3-audio-2b-q4tp.cmf` | `23a8d85061adcc830c87c1cc7e8eb2b00a388a558c334087575e446a7219b37f` |
 
 ## Reproduce
 

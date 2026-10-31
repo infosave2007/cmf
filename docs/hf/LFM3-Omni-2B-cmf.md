@@ -94,7 +94,17 @@ codec are stored 16-bit in both files and run in float32.
 
 ## Performance
 
-PERF
+`cortiq run`, cortiq 0.8.50:
+
+| task | NVIDIA A40 (Vulkan) | Apple M4 (Metal), `q4tp` |
+|---|---:|---:|
+| speech synthesis, ~7 s of speech | 6.1 s (`q4tp`), 6.8 s (`q8_2f`) | 3.4 s |
+| one-sentence description of a 640×480 photo, loading included | — | 1.7 s |
+| text decode | — | 79 tok/s |
+| spoken question about a photo, answered in text and 21.5 s of speech | — | 11.1 s |
+
+The language model runs on the GPU; the vision and audio encoders, the depth
+decoder (16–27 ms a speech frame) and the codec run in float32 on the CPU.
 
 ## Usage
 
@@ -129,7 +139,10 @@ sha256sum -c lfm3-omni-2b-q8_2f.cmf.sha256
 cortiq verify lfm3-omni-2b-q8_2f.cmf
 ```
 
-SHA_TABLE
+| file | sha256 |
+|---|---|
+| `lfm3-omni-2b-q8_2f.cmf` | `c70058f725cc9eec3428c104482c805562613e4611b2a474d9ce291b66e01a37` |
+| `lfm3-omni-2b-q4tp.cmf` | `b2051c39fb95b79653dd12ff2e2afedbc6c3d3077e0bf0c2157fa3d087675a82` |
 
 ## Reproduce
 
