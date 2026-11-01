@@ -114,6 +114,15 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Clover-35B-A3B-Preview decodes causally (0.8.52)
+
+The block-diffusion model now takes its ordinary causal path by default, with
+the release's response penalties: `q4tp-v2` runs at 120 tok/s on an RTX 5090
+on both prose and code, 53 on a 16 GB budget, 13–18 on a Mac mini M4 (24 GB;
+the prompt on Metal at ~170 tok/s, the rows on the CPU). `CMF_CLOVER_MODE=denoise`
+keeps LowConfidence block denoising and `CMF_CLOVER_MODE=draft` adds the
+vendor's self-speculation; the three are compared in [docs/CLOVER.md](docs/CLOVER.md).
+
 ## SenseNova-Loop, Mage-VL-Cowork and Primal VAE (0.8.51)
 
 [SenseNova-Loop-9B-Preview](https://huggingface.co/infosave/SenseNova-Loop-9B-Preview-cmf)
@@ -221,10 +230,10 @@ hf download infosave/Clover-35B-A3B-Preview-cmf clover-35b-a3b-preview-q4tp-v2.c
 cortiq run clover-35b-a3b-preview-q4tp-v2.cmf --prompt "Write a Python function that merges two sorted lists." --no-think
 ```
 
-On Vulkan every denoising pass is one GPU submission (34 ms for a 32-token
-block on an RTX 5090: ~26 tok/s on prose, 80–95 on code at the release's
-threshold); on Apple silicon the passes run on Metal (Mac mini M4, 24 GB:
-3.2 tok/s on prose, 6.5–9 on code, 0.8.41). Converting, the generation controls and the measurements:
+With `CMF_CLOVER_MODE=denoise`, every denoising pass on Vulkan is one GPU
+submission (34 ms for a 32-token block on an RTX 5090: ~26 tok/s on prose,
+80–95 on code at the release's threshold) and on Apple silicon the passes run
+on Metal (Mac mini M4, 24 GB: 3.2 tok/s on prose, 6.5–9 on code). Converting, the generation controls and the measurements:
 [docs/CLOVER.md](docs/CLOVER.md). The same release cuts the VRAM of every
 MoE graph on Vulkan: a 35B-A3B q4tp stack takes 18.8 GB instead of 31.8 GB,
 and the published Qwen3.6-35B-A3B decodes at 156 tok/s on a 32 GB card.

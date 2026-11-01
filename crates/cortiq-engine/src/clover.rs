@@ -22,6 +22,10 @@
 //! ramps bias the stop tokens and `</think>` late in long answers — the
 //! vendor's semantics, `sampling_clover_moe.py`.
 //!
+//! The default is neither: `CMF_CLOVER_MODE=ar` is the trunk's ordinary
+//! causal decode with the release's response processing, the fastest on every
+//! machine measured (docs/CLOVER.md).
+//!
 //! Self-speculation (`CMF_CLOVER_MODE=draft`, the release's `draft-self`):
 //! one preview of `[pending, mask…]` proposes a block, the causal path
 //! verifies it in one batched forward, and the accepted prefix plus one
@@ -280,13 +284,13 @@ enum CloverMode {
 /// The default is the causal decode wherever it was measured against the
 /// other two: RTX 5090 8 ms a token against a 90 ms self-speculative round
 /// (3.4 tokens on prose, 10 on code) and a 35 ms denoising pass (1.1, 2.6);
-/// a 16 GB budget 53 tok/s against 5.6–14; the CPU 11–14 against 0.7–1.3.
+/// a 16 GB budget 53 tok/s against 5.6–14; the CPU 11–14 against 0.7–1.3;
+/// an M4 18 against 3.2–9.
 fn clover_mode() -> CloverMode {
     match std::env::var("CMF_CLOVER_MODE").as_deref() {
         Ok("denoise") => CloverMode::Denoise,
         Ok("draft") => CloverMode::DraftSelf,
         Ok("ar") => CloverMode::Causal,
-        _ if cfg!(target_os = "macos") => CloverMode::Denoise,
         _ => CloverMode::Causal,
     }
 }
@@ -928,7 +932,8 @@ impl Pipeline {
                     }
                 }
             })?;
-        } else {
+        }
+        if mode != MetalMode::Commit {
             stats.metal_passes += 1;
             stats.metal_gpu_s += ps.gpu_s;
             stats.metal_exec_s += ps.exec_s;
@@ -1198,6 +1203,17 @@ impl Pipeline {
         (id as u32, conf(id))
     }
 
+    /// The causal rows of a round with their logits: the host's walk (one
+    /// row; `host`), or the device graph's verify. Ok(None) = declined,
+    /// nothing moved.
+    fn clover_round_forward(&mut self, ids: &[u32], pos: usize, host: bool) -> Result<Option<Vec<f32>>, String> {
+        if host {
+            let hidden = self.forward_layers(&self.embed_single(ids[0]), pos, None);
+            return Ok(Some(self.logits_from_hidden(&hidden)));
+        }
+        self.clover_verify_pass(ids, pos)
+    }
+
     /// A self-speculative verify: `ids` at `pos` through the causal batched
     /// graph, the penalty-free logits of every row back. The state advances
     /// over all of them, with a GDN snapshot per row for
@@ -1280,6 +1296,12 @@ impl Pipeline {
     /// the causal verify scores them, the accepted prefix plus a token from
     /// the first rejected row go out. Ok(None) = the graph cannot run this
     /// (a stack that does not fit whole); the caller denoises instead.
+    ///
+    /// `metal_req`: the same rounds one row wide, which is the causal decode
+    /// with the release's response processing — the prompt on the Metal
+    /// executor (168 tok/s on an M4 against the CPU's 66), the rows on the
+    /// CPU (55 ms against the executor's 160: 40 round trips a token, and the
+    /// token graph cannot bind 19 GB on a 24 GB Mac, `Insufficient Memory`).
     fn clover_draft_self(
         &mut self,
         clover: &Clover,
@@ -1287,29 +1309,54 @@ impl Pipeline {
         input_ids: &[u32],
         max_tokens: usize,
         on_token: &mut Option<TokenCallback>,
+        metal_req: Option<u64>,
     ) -> Result<Option<GenerateResult>, String> {
         let (vocab, mask) = (self.vocab_size, cfg.mask_token_id);
-        let width = std::env::var("CMF_CLOVER_DRAFT")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&w| w >= 2 && cfg.block_size % w == 0)
-            .unwrap_or(16.min(cfg.block_size));
+        let width = if metal_req.is_some() {
+            1
+        } else {
+            std::env::var("CMF_CLOVER_DRAFT")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&w| w >= 2 && cfg.block_size % w == 0)
+                .unwrap_or(16.min(cfg.block_size))
+        };
         let rule = AcceptRule::from_env();
         let n = input_ids.len();
         if n == 0 {
             return Ok(None);
         }
         let mut stats = CloverStats::default();
-        self.clear_sequence_state();
-        self.last_prefill_tokens = n;
+        // Cross-turn reuse where the host owns the state: a prompt that
+        // extends the committed sequence commits its tail only.
+        let mut reuse = if metal_req.is_none() || std::env::var("CMF_KV_REUSE").is_ok_and(|v| v == "0") {
+            0
+        } else {
+            self.cached_prefix_len(input_ids).min(n - 1)
+        };
+        if reuse > 0 && !self.prepare_kv_reuse(reuse) {
+            reuse = 0;
+        }
+        if reuse == 0 {
+            self.clear_sequence_state();
+        }
+        self.last_prefill_tokens = n - reuse;
         // The prompt but its last token, then that token as the first verify:
         // its row samples the first output token.
         let t0 = std::time::Instant::now();
-        if n > 1 && !self.clover_graph_prompt(clover, &input_ids[..n - 1], &mut stats)? {
+        #[cfg(target_os = "macos")]
+        if let Some(req) = metal_req {
+            if let Err(e) = self.clover_metal_commit(clover, &input_ids[reuse..n - 1], reuse, req) {
+                tracing::warn!("{e} — denoising on the CPU");
+                self.clear_sequence_state();
+                return Ok(None);
+            }
+        }
+        if metal_req.is_none() && n > 1 && !self.clover_graph_prompt(clover, &input_ids[..n - 1], &mut stats)? {
             self.clear_sequence_state();
             return Ok(None);
         }
-        let Some(mut first) = self.clover_verify_pass(&input_ids[n - 1..], n - 1)? else {
+        let Some(mut first) = self.clover_round_forward(&input_ids[n - 1..], n - 1, metal_req.is_some())? else {
             self.clear_sequence_state();
             return Ok(None);
         };
@@ -1425,7 +1472,7 @@ impl Pipeline {
                 stats.pick_s += t.elapsed().as_secs_f64();
             }
             let t = std::time::Instant::now();
-            let Some(mut logits) = self.clover_verify_pass(&cand, pos)? else {
+            let Some(mut logits) = self.clover_round_forward(&cand, pos, metal_req.is_some())? else {
                 return Err("self-speculation: device graph declined a verify mid-sequence".into());
             };
             stats.verify_s += t.elapsed().as_secs_f64();
@@ -1450,7 +1497,9 @@ impl Pipeline {
             let (bonus, c) = self.clover_pick(&logits[r * vocab..(r + 1) * vocab]);
             kept.push((bonus, c));
             stats.pick_s += t.elapsed().as_secs_f64();
-            self.clover_keep_verified(pos, r + 1, w)?;
+            if metal_req.is_none() {
+                self.clover_keep_verified(pos, r + 1, w)?;
+            }
             committed.extend_from_slice(&cand[..=r]);
             stats.rounds += 1;
             stats.drafted += w - 1;
@@ -1461,7 +1510,7 @@ impl Pipeline {
         if finish == "cancelled" {
             self.clear_history();
         } else {
-            self.record_consumed_prefix(&committed, 0);
+            self.record_consumed_prefix(&committed, reuse);
         }
         stats.device_layers = self.num_layers;
         self.clover_stats = stats;
@@ -1492,6 +1541,11 @@ impl Pipeline {
     /// Whether this request takes the ordinary causal decode.
     pub(super) fn clover_causal_request(&mut self) -> bool {
         if self.clover.is_none() || clover_mode() != CloverMode::Causal {
+            return false;
+        }
+        // Apple silicon: the prompt on the executor (`clover_generate`).
+        #[cfg(target_os = "macos")]
+        if self.clover_metal_ready() {
             return false;
         }
         self.clover_stats = CloverStats::default();
@@ -1578,7 +1632,7 @@ impl Pipeline {
         // submission each; the host walk otherwise.
         let mut graph = self.clover_graph_ready();
         if graph && clover_mode() == CloverMode::DraftSelf {
-            if let Some(r) = self.clover_draft_self(clover, cfg, input_ids, max_tokens, on_token)? {
+            if let Some(r) = self.clover_draft_self(clover, cfg, input_ids, max_tokens, on_token, None)? {
                 return Ok(r);
             }
             // Nothing committed and the state clear: denoise instead.
@@ -1599,6 +1653,13 @@ impl Pipeline {
         let req = REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         #[cfg(not(target_os = "macos"))]
         let req = 0u64;
+        // The causal decode on Apple silicon: the prompt on the executor.
+        #[cfg(target_os = "macos")]
+        if metal && clover_mode() == CloverMode::Causal {
+            if let Some(r) = self.clover_draft_self(clover, cfg, input_ids, max_tokens, on_token, Some(req))? {
+                return Ok(r);
+            }
+        }
         let preview_mode = crate::gpu::BlockPreview {
             coreset_top_p: cfg.coreset_enabled.then_some(cfg.coreset_top_p),
         };

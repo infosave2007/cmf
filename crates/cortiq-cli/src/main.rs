@@ -9572,7 +9572,7 @@ async fn cmd_run(
                 if pipeline.is_block_diffusion() {
                     let st = pipeline.clover_stats();
                     let per = |x: f64| 1e3 * x / st.passes.max(1) as f64;
-                    if st.rounds > 0 {
+                    if st.drafted > 0 {
                         let rd = |x: f64| 1e3 * x / st.rounds as f64;
                         println!(
                             "[self-speculation: {} rounds · {} of {} drafts accepted ({:.0}%) · {:.2} tokens/round · {:.1} tok/s after the prompt · \
@@ -9588,7 +9588,7 @@ async fn cmd_run(
                             rd(st.pick_s),
                             st.prompt_s
                         );
-                    } else if st.passes > 0 {
+                    } else if st.blocks > 0 {
                     println!(
                         "[block diffusion: {} blocks · {} passes · {:.2} tokens/pass · {:.1} tok/s after the prompt · \
                          pass {:.0} ms + pick {:.1} ms · block commits {:.2} s · prompt {:.1} s · device layers {}]",
