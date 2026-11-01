@@ -114,6 +114,15 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Clover-35B-A3B-Preview декодирует каузально (0.8.52)
+
+Блочная диффузионная модель теперь по умолчанию идёт обычным каузальным путём
+со штрафами из релиза: `q4tp-v2` даёт 120 ток/с на RTX 5090 и на прозе, и на
+коде, 53 при бюджете 16 ГБ, 13–18 на Mac mini M4 (24 ГБ; промпт на Metal,
+~170 ток/с, строки на CPU). `CMF_CLOVER_MODE=denoise` оставляет блочный денойзинг
+LowConfidence, а `CMF_CLOVER_MODE=draft` включает самоспекуляцию вендора; все три
+сравниваются в [docs/CLOVER.md](docs/CLOVER.md).
+
 ## SenseNova-Loop, Mage-VL-Cowork и Primal VAE (0.8.51)
 
 [SenseNova-Loop-9B-Preview](https://huggingface.co/infosave/SenseNova-Loop-9B-Preview-cmf)
@@ -221,10 +230,10 @@ hf download infosave/Clover-35B-A3B-Preview-cmf clover-35b-a3b-preview-q4tp-v2.c
 cortiq run clover-35b-a3b-preview-q4tp-v2.cmf --prompt "Объясни, как работает хеш-таблица." --no-think
 ```
 
-На Vulkan каждый проход денойзинга — одна отправка на GPU (34 мс на блок из
+С `CMF_CLOVER_MODE=denoise` на Vulkan каждый проход денойзинга — одна отправка на GPU (34 мс на блок из
 32 токенов на RTX 5090: ~26 ток/с на прозе, 80–95 на коде при пороге из
 релиза модели); на Apple silicon проходы идут на Metal (Mac mini M4, 24 ГБ:
-3.2 ток/с на прозе, 6.5–9 на коде, 0.8.41). Конвертация, параметры генерации и замеры —
+3.2 ток/с на прозе, 6.5–9 на коде). Конвертация, параметры генерации и замеры —
 [docs/CLOVER.md](docs/CLOVER.md). В этом же релизе графы всех MoE-моделей на
 Vulkan занимают меньше видеопамяти: стек 35B-A3B q4tp — 18.8 ГБ вместо 31.8 ГБ,
 а опубликованная Qwen3.6-35B-A3B декодирует 156 ток/с на карте 32 ГБ.

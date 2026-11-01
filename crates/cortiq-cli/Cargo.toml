@@ -36,7 +36,7 @@ cortiq-core = { path = "../cortiq-core", version = "0.8.24" }
 # `phonon` is first introduced by this release.  Pin the published CLI to the
 # matching engine so `cargo install cortiq-cli` cannot resolve an older engine
 # which lacks that feature.
-cortiq-engine = { path = "../cortiq-engine", version = "=0.8.51" }
+cortiq-engine = { path = "../cortiq-engine", version = "=0.8.52" }
 cortiq-net = { path = "../cortiq-net", version = "0.8.24" }
 cortiq-server = { path = "../cortiq-server", version = "0.8.24" }
 # `cortiq decide` / `cortiq decision …` and the decision branch of serve.

@@ -262,6 +262,8 @@ pub struct Pipeline {
     /// decoding controls; `None` on every causal model.
     pub(crate) clover: Option<std::sync::Arc<clover::Clover>>,
     clover_stats: clover::CloverStats,
+    /// The causal decode's response penalties (`clover_causal_logits`).
+    clover_pen: clover::Penalties,
     pub qwen4_exp: Option<
         Box<(
             crate::qwen4_exp::Globals,
@@ -3974,6 +3976,7 @@ impl Pipeline {
             qwen4_exp: None,
             clover: None,
             clover_stats: clover::CloverStats::default(),
+            clover_pen: Default::default(),
             dsv4_mtp: Vec::new(),
             dspark: None,
             dspark_pending: Vec::new(),
@@ -5026,8 +5029,8 @@ impl Pipeline {
         // such a mask — drop it here rather than pay 5x for a no-op.
         let task_mask = self.drop_open_mask(task_mask);
         // A block-diffusion model generates whole blocks by denoising
-        // previews, never one causal token at a time.
-        if self.clover.is_some() {
+        // previews, unless the request asks for the causal decode.
+        if self.clover.is_some() && !self.clover_causal_request() {
             if prompt_rows.is_some() || task_mask.is_some() {
                 return Err("block-diffusion generation takes token prompts without task masks".into());
             }
@@ -5423,6 +5426,9 @@ impl Pipeline {
         }
 
         let mut all_ids = input_ids.to_vec();
+        // A block-diffusion model's response penalties count the response
+        // only (`CloverPenaltyState`), never the prompt.
+        let penalty_from = if self.clover.is_some() { input_ids.len() } else { 0 };
         let mut generated = 0usize;
         let mut finish_reason = "max_tokens".to_string();
         let mut drafted = 0usize;
@@ -6422,6 +6428,7 @@ impl Pipeline {
                     }
                 }
             }
+            self.clover_causal_logits(&mut logits, generated, &all_ids[penalty_from..]);
             let t_next = match forced.or_else(|| forced_ids_at(generated)) {
                 Some(c) => c,
                 None => {
@@ -6429,7 +6436,7 @@ impl Pipeline {
                     sampler::sample_with_scratch_pool(
                         &logits,
                         &self.sampler_config,
-                        self.sampler_config.penalty_past(&all_ids, bounded_native),
+                        self.sampler_config.penalty_past(&all_ids[penalty_from..], bounded_native),
                         &mut self.rng,
                         &mut self.sampler_scratch,
                         self.pool.as_deref(),

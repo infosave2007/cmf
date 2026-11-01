@@ -104,6 +104,14 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
+## Clover-35B-A3B-Preview 默认因果解码（0.8.52）
+
+这款块扩散模型现在默认走普通因果路径，并使用发布版的响应惩罚：`q4tp-v2` 在
+RTX 5090 上的文本和代码都是 120 token/s，16 GB 预算下 53，Mac mini M4（24 GB；
+提示走 Metal，约 170 token/s，逐行走 CPU）13–18。`CMF_CLOVER_MODE=denoise` 保留
+LowConfidence 块去噪，`CMF_CLOVER_MODE=draft` 启用厂商的自推测；三者的对比见
+[docs/CLOVER.md](docs/CLOVER.md)。
+
 ## SenseNova-Loop、Mage-VL-Cowork 与 Primal VAE（0.8.51）
 
 [SenseNova-Loop-9B-Preview](https://huggingface.co/infosave/SenseNova-Loop-9B-Preview-cmf)

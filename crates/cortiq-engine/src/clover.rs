@@ -22,6 +22,15 @@
 //! ramps bias the stop tokens and `</think>` late in long answers — the
 //! vendor's semantics, `sampling_clover_moe.py`.
 //!
+//! The default is neither: `CMF_CLOVER_MODE=ar` is the trunk's ordinary
+//! causal decode with the release's response processing, the fastest on every
+//! machine measured (docs/CLOVER.md).
+//!
+//! Self-speculation (`CMF_CLOVER_MODE=draft`, the release's `draft-self`):
+//! one preview of `[pending, mask…]` proposes a block, the causal path
+//! verifies it in one batched forward, and the accepted prefix plus one
+//! boundary token go out; the state rewinds to what was accepted.
+//!
 //! On wgpu the prompt, every pass and every commit are one batched-graph
 //! submission each (`gpu::BlockPreview`, kernels in `gpu_wgpu::clover`),
 //! the greedy pick included. On Apple silicon the passes run on the native
@@ -65,6 +74,12 @@ pub struct CloverStats {
     pub device_layers: usize,
     /// Host time choosing the tokens of every pass (penalties, pick).
     pub pick_s: f64,
+    /// Self-speculative rounds, their drafts and the accepted ones, and the
+    /// causal verifies' time (0 = the request denoised).
+    pub rounds: usize,
+    pub drafted: usize,
+    pub accepted: usize,
+    pub verify_s: f64,
     /// Passes on the native Metal executor (`gpu_metal::clover`): its waits
     /// on the device, the host routing between layers and the expert-slot
     /// fills, seconds; the expert cache's hits and misses.
@@ -255,6 +270,81 @@ fn greedy_pick(row: &[f32]) -> (u32, f32) {
     (id as u32, (1.0 / sum) as f32)
 }
 
+/// How a block-diffusion request generates (`CMF_CLOVER_MODE`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum CloverMode {
+    /// LowConfidence denoising, the release's `generate`.
+    Denoise,
+    /// Previews draft, the causal path verifies (`draft-self`).
+    DraftSelf,
+    /// The ordinary causal decode.
+    Causal,
+}
+
+/// The default is the causal decode wherever it was measured against the
+/// other two: RTX 5090 8 ms a token against a 90 ms self-speculative round
+/// (3.4 tokens on prose, 10 on code) and a 35 ms denoising pass (1.1, 2.6);
+/// a 16 GB budget 53 tok/s against 5.6–14; the CPU 11–14 against 0.7–1.3;
+/// an M4 18 against 3.2–9.
+fn clover_mode() -> CloverMode {
+    match std::env::var("CMF_CLOVER_MODE").as_deref() {
+        Ok("denoise") => CloverMode::Denoise,
+        Ok("draft") => CloverMode::DraftSelf,
+        Ok("ar") => CloverMode::Causal,
+        _ => CloverMode::Causal,
+    }
+}
+
+/// Which drafts a verify keeps (`clover_correct_drafts`).
+#[derive(Clone, Copy)]
+struct AcceptRule {
+    /// Only drafts equal to the penalized row's argmax.
+    exact: bool,
+    ratio: f32,
+    delta: f32,
+}
+
+impl AcceptRule {
+    /// `CMF_CLOVER_ACCEPT=exact`, `CMF_CLOVER_ACCEPT_RATIO`,
+    /// `CMF_CLOVER_ACCEPT_DELTA`; the defaults are the vendor's llama.cpp
+    /// settings (0.9, 0.6).
+    fn from_env() -> Self {
+        let num = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        Self {
+            exact: std::env::var("CMF_CLOVER_ACCEPT").as_deref() == Ok("exact"),
+            ratio: num("CMF_CLOVER_ACCEPT_RATIO", 0.9),
+            delta: num("CMF_CLOVER_ACCEPT_DELTA", 0.6),
+        }
+    }
+
+    /// Whether the verify row `logits` (penalized) keeps the draft `cand`,
+    /// and the draft's probability: `p ≥ min(ratio, delta·e^(-H))`, p > 0.
+    fn accepts(&self, row: &[f32], cand: u32) -> (bool, f32) {
+        let (mut mx, mut arg) = (f32::NEG_INFINITY, 0usize);
+        for (i, &l) in row.iter().enumerate() {
+            if l > mx {
+                (mx, arg) = (l, i);
+            }
+        }
+        let (mut z, mut w) = (0f64, 0f64);
+        for &l in row {
+            if l > f32::NEG_INFINITY {
+                let d = (l - mx) as f64;
+                let e = d.exp();
+                z += e;
+                w += e * d;
+            }
+        }
+        let p = (((row[cand as usize] - mx) as f64).exp() / z) as f32;
+        if self.exact {
+            return (arg == cand as usize, p);
+        }
+        // H = ln z − Σ pᵢ·(lᵢ − max): no per-element log.
+        let h = (z.ln() - w / z) as f32;
+        (p >= self.ratio.min(self.delta * (-h).exp()) && p > 0.0, p)
+    }
+}
+
 /// What a denoising pass hands the token choice.
 enum PassOut {
     /// `[block × vocab]` logits, chosen on the host.
@@ -264,7 +354,8 @@ enum PassOut {
 }
 
 /// Response-only penalty state of one request (`CloverPenaltyState`).
-struct Penalties {
+#[derive(Default)]
+pub(super) struct Penalties {
     counts: Vec<u32>,
     seen: Vec<u32>,
     length: usize,
@@ -313,7 +404,7 @@ impl CloverStats {
     /// Generation rate after the prompt: tokens over the passes, the token
     /// picks and the block commits.
     pub fn denoise_tok_s(&self, tokens: usize) -> f64 {
-        tokens as f64 / (self.preview_s + self.pick_s + self.commit_s).max(1e-9)
+        tokens as f64 / (self.preview_s + self.pick_s + self.commit_s + self.verify_s).max(1e-9)
     }
 }
 
@@ -841,7 +932,8 @@ impl Pipeline {
                     }
                 }
             })?;
-        } else {
+        }
+        if mode != MetalMode::Commit {
             stats.metal_passes += 1;
             stats.metal_gpu_s += ps.gpu_s;
             stats.metal_exec_s += ps.exec_s;
@@ -1111,6 +1203,385 @@ impl Pipeline {
         (id as u32, conf(id))
     }
 
+    /// The causal rows of a round with their logits: the host's walk (one
+    /// row; `host`), or the device graph's verify. Ok(None) = declined,
+    /// nothing moved.
+    fn clover_round_forward(&mut self, ids: &[u32], pos: usize, host: bool) -> Result<Option<Vec<f32>>, String> {
+        if host {
+            let hidden = self.forward_layers(&self.embed_single(ids[0]), pos, None);
+            return Ok(Some(self.logits_from_hidden(&hidden)));
+        }
+        self.clover_verify_pass(ids, pos)
+    }
+
+    /// A self-speculative verify: `ids` at `pos` through the causal batched
+    /// graph, the penalty-free logits of every row back. The state advances
+    /// over all of them, with a GDN snapshot per row for
+    /// `clover_keep_verified`. Ok(None) = declined, nothing moved.
+    fn clover_verify_pass(&mut self, ids: &[u32], pos: usize) -> Result<Option<Vec<f32>>, String> {
+        let (hs, k) = (self.hidden_size, ids.len());
+        let (_, idx, kind, row_scale) = self
+            .weights
+            .lm_head
+            .graph_weight()
+            .ok_or("self-speculation: the head has no device layout")?;
+        let lm = crate::gpu::GraphW {
+            idx,
+            kind,
+            row_scale,
+            data: &[],
+            prism: crate::gpu::GraphPrismOp::None,
+            affine: false,
+        };
+        let final_norm = self.weights.final_norm.clone();
+        let lm_rows = self.weights.lm_head.rows();
+        let mut h = Vec::with_capacity(k * hs);
+        for &id in ids {
+            h.extend_from_slice(&self.embed_single(id));
+        }
+        let positions: Vec<usize> = (pos..pos + k).collect();
+        let mut logits = Vec::new();
+        let outcome = self.try_batch_graph_wgpu(
+            &mut h,
+            &positions,
+            k,
+            Some(crate::gpu::SpecTail {
+                lm,
+                lm_rows,
+                final_norm: &final_norm,
+                logits_out: &mut logits,
+                pick: None,
+            }),
+        );
+        match outcome {
+            crate::gpu::BatchGraphOutcome::Completed => {}
+            crate::gpu::BatchGraphOutcome::Declined => return Ok(None),
+            crate::gpu::BatchGraphOutcome::Failed => {
+                return Err("self-speculation: device graph failed after admission".into());
+            }
+        }
+        let v = self.vocab_size;
+        if lm_rows != v {
+            let mut out = vec![f32::NEG_INFINITY; k * v];
+            for (src, dst) in logits.chunks_exact(lm_rows).zip(out.chunks_exact_mut(v)) {
+                let n = lm_rows.min(v);
+                dst[..n].copy_from_slice(&src[..n]);
+            }
+            logits = out;
+        }
+        Ok(Some(logits))
+    }
+
+    /// After a verify of `rows` rows at `pos`: keep the first `keep`, the
+    /// GDN states and the KV mirrors back to them.
+    #[cfg(feature = "gpu")]
+    fn clover_keep_verified(&self, pos: usize, keep: usize, rows: usize) -> Result<(), String> {
+        let gdn = self.graph_gdn_layer_count();
+        if keep < rows && gdn > 0 && !crate::gpu::gdn_spec_restore(self.graph_kv_id, keep - 1, pos, gdn) {
+            return Err("self-speculation: GDN restore failed".into());
+        }
+        if !self.rewind_trunk_graph_mirrors(pos + keep) {
+            return Err("self-speculation: KV rewind failed".into());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    fn clover_keep_verified(&self, _pos: usize, _keep: usize, _rows: usize) -> Result<(), String> {
+        Err("self-speculation needs the device graph".into())
+    }
+
+    /// Self-speculative decoding on the device graph (`CloverWorker`): the
+    /// pending token and masks through one preview propose the next rows,
+    /// the causal verify scores them, the accepted prefix plus a token from
+    /// the first rejected row go out. Ok(None) = the graph cannot run this
+    /// (a stack that does not fit whole); the caller denoises instead.
+    ///
+    /// `metal_req`: the same rounds one row wide, which is the causal decode
+    /// with the release's response processing — the prompt on the Metal
+    /// executor (168 tok/s on an M4 against the CPU's 66), the rows on the
+    /// CPU (55 ms against the executor's 160: 40 round trips a token, and the
+    /// token graph cannot bind 19 GB on a 24 GB Mac, `Insufficient Memory`).
+    fn clover_draft_self(
+        &mut self,
+        clover: &Clover,
+        cfg: &BlockDiffusionConfig,
+        input_ids: &[u32],
+        max_tokens: usize,
+        on_token: &mut Option<TokenCallback>,
+        metal_req: Option<u64>,
+    ) -> Result<Option<GenerateResult>, String> {
+        let (vocab, mask) = (self.vocab_size, cfg.mask_token_id);
+        let width = if metal_req.is_some() {
+            1
+        } else {
+            std::env::var("CMF_CLOVER_DRAFT")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&w| w >= 2 && cfg.block_size % w == 0)
+                .unwrap_or(16.min(cfg.block_size))
+        };
+        let rule = AcceptRule::from_env();
+        let n = input_ids.len();
+        if n == 0 {
+            return Ok(None);
+        }
+        let mut stats = CloverStats::default();
+        // Cross-turn reuse where the host owns the state: a prompt that
+        // extends the committed sequence commits its tail only.
+        let mut reuse = if metal_req.is_none() || std::env::var("CMF_KV_REUSE").is_ok_and(|v| v == "0") {
+            0
+        } else {
+            self.cached_prefix_len(input_ids).min(n - 1)
+        };
+        if reuse > 0 && !self.prepare_kv_reuse(reuse) {
+            reuse = 0;
+        }
+        if reuse == 0 {
+            self.clear_sequence_state();
+        }
+        self.last_prefill_tokens = n - reuse;
+        // The prompt but its last token, then that token as the first verify:
+        // its row samples the first output token.
+        let t0 = std::time::Instant::now();
+        #[cfg(target_os = "macos")]
+        if let Some(req) = metal_req {
+            if let Err(e) = self.clover_metal_commit(clover, &input_ids[reuse..n - 1], reuse, req) {
+                tracing::warn!("{e} — denoising on the CPU");
+                self.clear_sequence_state();
+                return Ok(None);
+            }
+        }
+        if metal_req.is_none() && n > 1 && !self.clover_graph_prompt(clover, &input_ids[..n - 1], &mut stats)? {
+            self.clear_sequence_state();
+            return Ok(None);
+        }
+        let Some(mut first) = self.clover_round_forward(&input_ids[n - 1..], n - 1, metal_req.is_some())? else {
+            self.clear_sequence_state();
+            return Ok(None);
+        };
+        stats.prompt_s = t0.elapsed().as_secs_f64();
+        let stop = self.clover_stop_ids(cfg);
+        let is_stop = |t: u32| stop.binary_search(&t).is_ok();
+        let suppress: Vec<u32> = self.sampler_config.suppress_tokens.clone();
+        let forbid: Vec<u32> = std::iter::once(mask).chain(suppress.iter().copied()).collect();
+        let device_pick = std::env::var_os("CMF_CLOVER_DUMP").is_none()
+            && std::env::var("CMF_CLOVER_DEVICE_PICK").as_deref() != Ok("0");
+        let preview_mode = crate::gpu::BlockPreview {
+            coreset_top_p: cfg.coreset_enabled.then_some(cfg.coreset_top_p),
+        };
+        let mut pen = Penalties { counts: vec![0; vocab], seen: Vec::new(), length: 0 };
+        let prepare = |row: &mut [f32], row_pos: usize, pen: &Penalties, close_open: bool| {
+            row[mask as usize] = f32::NEG_INFINITY;
+            for &s in &suppress {
+                if let Some(l) = row.get_mut(s as usize) {
+                    *l = f32::NEG_INFINITY;
+                }
+            }
+            pen.apply(cfg, row, row_pos, &stop, close_open);
+        };
+        let open = |pen: &Penalties| {
+            cfg.think_end_token_id.is_some_and(|c| pen.counts.get(c as usize).is_none_or(|&n| n == 0))
+        };
+        let mut committed = input_ids.to_vec();
+        let mut out: Vec<u32> = Vec::new();
+        let mut confidence: Vec<f32> = Vec::new();
+        let mut finish = "length".to_string();
+        prepare(&mut first[..vocab], 1, &pen, open(&pen));
+        let (mut pending, conf) = self.clover_pick(&first[..vocab]);
+        // The next tokens to hand out, in order; false ends the request.
+        let mut emit = |me: &Self, ids: &[(u32, f32)], pen: &mut Penalties, finish: &mut String, out: &mut Vec<u32>| {
+            for &(id, c) in ids {
+                out.push(id);
+                confidence.push(c);
+                pen.commit(&[id]);
+                if is_stop(id) && !me.ignore_eos {
+                    *finish = "stop".into();
+                    return false;
+                }
+                if let Some(cb) = on_token.as_mut() {
+                    if !cb(&me.tokenizer.decode_token(id)) {
+                        *finish = "cancelled".into();
+                        return false;
+                    }
+                }
+            }
+            true
+        };
+        let mut going = max_tokens > 0 && emit(self, &[(pending, conf)], &mut pen, &mut finish, &mut out);
+        let mut whole = true;
+        while going && out.len() < max_tokens {
+            if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                finish = "cancelled".into();
+                break;
+            }
+            // Accepted drafts and the boundary token are `keep` new tokens,
+            // so the round never commits past `max_tokens`.
+            let room = max_tokens - out.len();
+            let mut w = width;
+            while w > room {
+                w /= 2;
+            }
+            let w = w.max(1);
+            let pos = committed.len();
+            let mut cand = vec![mask; w];
+            cand[0] = pending;
+            if w > 1 {
+                let t = std::time::Instant::now();
+                let pick_spec = device_pick.then(|| crate::gpu::PreviewPick {
+                    vocab,
+                    counts: &pen.counts,
+                    stop: &stop,
+                    forbid: &forbid,
+                    think_end: cfg.think_end_token_id,
+                    close_open: open(&pen),
+                    // Row 0 is the pending token, row r the response position
+                    // `length + r` (`pen` already counts the pending one).
+                    len0: pen.length - 1,
+                    frequency: cfg.frequency_penalty,
+                    presence: cfg.presence_penalty,
+                    repetition: cfg.repetition_penalty,
+                    length_ramp: (cfg.length_penalty, cfg.length_penalty_start as f32, cfg.length_penalty_window as f32),
+                    think_ramp: (cfg.think_end_bias, cfg.think_end_start as f32, cfg.think_end_window as f32),
+                });
+                let Some(pass) = self.clover_graph_pass(clover, &cand, pos, Some(preview_mode), pick_spec, &mut whole, &mut stats)? else {
+                    return Err("self-speculation: device graph declined a preview".into());
+                };
+                if !whole {
+                    // Only the prefix of the stack fits: no verify graph.
+                    self.clear_sequence_state();
+                    return Ok(None);
+                }
+                stats.preview_s += t.elapsed().as_secs_f64();
+                stats.passes += 1;
+                let t = std::time::Instant::now();
+                match pass {
+                    PassOut::Picks(p) => {
+                        for r in 1..w {
+                            cand[r] = p[r].0;
+                        }
+                    }
+                    PassOut::Logits(mut l) => {
+                        for r in 1..w {
+                            let row = &mut l[r * vocab..(r + 1) * vocab];
+                            prepare(row, pen.length + r, &pen, open(&pen));
+                            cand[r] = greedy_pick(row).0;
+                        }
+                    }
+                }
+                stats.pick_s += t.elapsed().as_secs_f64();
+            }
+            let t = std::time::Instant::now();
+            let Some(mut logits) = self.clover_round_forward(&cand, pos, metal_req.is_some())? else {
+                return Err("self-speculation: device graph declined a verify mid-sequence".into());
+            };
+            stats.verify_s += t.elapsed().as_secs_f64();
+            // logits[j] verifies cand[j + 1]; the first row that rejects (or
+            // the last) gives the boundary token.
+            let t = std::time::Instant::now();
+            let close_open = open(&pen);
+            let mut kept: Vec<(u32, f32)> = Vec::with_capacity(w);
+            for j in 0..w {
+                let row = &mut logits[j * vocab..(j + 1) * vocab];
+                prepare(row, pen.length + j + 1, &pen, close_open);
+                if j + 1 == w {
+                    break;
+                }
+                let (ok, p) = rule.accepts(row, cand[j + 1]);
+                if !ok {
+                    break;
+                }
+                kept.push((cand[j + 1], p));
+            }
+            let r = kept.len();
+            let (bonus, c) = self.clover_pick(&logits[r * vocab..(r + 1) * vocab]);
+            kept.push((bonus, c));
+            stats.pick_s += t.elapsed().as_secs_f64();
+            if metal_req.is_none() {
+                self.clover_keep_verified(pos, r + 1, w)?;
+            }
+            committed.extend_from_slice(&cand[..=r]);
+            stats.rounds += 1;
+            stats.drafted += w - 1;
+            stats.accepted += r;
+            pending = bonus;
+            going = emit(self, &kept, &mut pen, &mut finish, &mut out);
+        }
+        if finish == "cancelled" {
+            self.clear_history();
+        } else {
+            self.record_consumed_prefix(&committed, reuse);
+        }
+        stats.device_layers = self.num_layers;
+        self.clover_stats = stats;
+        Ok(Some(GenerateResult {
+            text: self.tokenizer.decode(&out),
+            token_ids: out.clone(),
+            prompt_tokens: n,
+            tokens_generated: out.len(),
+            finish_reason: finish,
+            mtp_drafted: 0,
+            mtp_accepted: 0,
+            token_confidence: confidence,
+            traces: Vec::new(),
+        }))
+    }
+
+    /// The ids that end an answer: the record's, the file's EOS ids.
+    fn clover_stop_ids(&self, cfg: &BlockDiffusionConfig) -> Vec<u32> {
+        let mut stop: Vec<u32> = cfg.stop_token_ids.clone();
+        let tk = &self.tokenizer;
+        stop.extend(tk.eos_token_id.into_iter().chain(tk.im_end_id).chain(tk.extra_eos.iter().copied()));
+        stop.retain(|&t| (t as usize) < self.vocab_size);
+        stop.sort_unstable();
+        stop.dedup();
+        stop
+    }
+
+    /// Whether this request takes the ordinary causal decode.
+    pub(super) fn clover_causal_request(&mut self) -> bool {
+        if self.clover.is_none() || clover_mode() != CloverMode::Causal {
+            return false;
+        }
+        // Apple silicon: the prompt on the executor (`clover_generate`).
+        #[cfg(target_os = "macos")]
+        if self.clover_metal_ready() {
+            return false;
+        }
+        self.clover_stats = CloverStats::default();
+        true
+    }
+
+    /// The causal decode's share of the release's response processing, on
+    /// the row in place: the mask token never comes out, then the response
+    /// penalties and the two ramps, the same `Penalties::apply` a preview
+    /// row takes. Only the ids seen so far change, so the sampler's greedy
+    /// is a plain argmax instead of a penalized pass over the 248k vocab
+    /// (RTX 5090: 1 ms of an 8 ms token). `response` = the ids generated so far.
+    pub(super) fn clover_causal_logits(&mut self, logits: &mut [f32], generated: usize, response: &[u32]) {
+        let Some(clover) = self.clover.clone() else {
+            return;
+        };
+        let (cfg, v) = (&clover.cfg, self.vocab_size);
+        if logits.len() < v {
+            return;
+        }
+        logits[cfg.mask_token_id as usize] = f32::NEG_INFINITY;
+        if generated == 0 || self.clover_pen.counts.len() != v {
+            self.clover_pen = Penalties { counts: vec![0; v], seen: Vec::new(), length: 0 };
+        }
+        let done = self.clover_pen.length;
+        self.clover_pen.commit(&response[done..]);
+        let close_open = cfg.think_end_token_id.is_some_and(|c| self.clover_pen.counts[c as usize] == 0);
+        // The stop ids matter only past the length ramp's start.
+        let stop = if cfg.length_penalty != 0.0 && generated >= cfg.length_penalty_start {
+            self.clover_stop_ids(cfg)
+        } else {
+            Vec::new()
+        };
+        self.clover_pen.apply(cfg, logits, generated + 1, &stop, close_open);
+    }
+
     /// Block LowConfidence generation (the `generate` of the release).
     pub(super) fn clover_generate(
         &mut self,
@@ -1160,6 +1631,13 @@ impl Pipeline {
         // Device graph: the prompt, every preview and every commit in one
         // submission each; the host walk otherwise.
         let mut graph = self.clover_graph_ready();
+        if graph && clover_mode() == CloverMode::DraftSelf {
+            if let Some(r) = self.clover_draft_self(clover, cfg, input_ids, max_tokens, on_token, None)? {
+                return Ok(r);
+            }
+            // Nothing committed and the state clear: denoise instead.
+            graph = self.clover_graph_ready();
+        }
         // Without the batched graph the whole request keeps to the CPU: the
         // per-op device path of a 32-row block lost to it everywhere it was
         // measured (Apple M4, 24 GB: passes 1.43 against 1.25 s, the prompt
@@ -1175,6 +1653,13 @@ impl Pipeline {
         let req = REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         #[cfg(not(target_os = "macos"))]
         let req = 0u64;
+        // The causal decode on Apple silicon: the prompt on the executor.
+        #[cfg(target_os = "macos")]
+        if metal && clover_mode() == CloverMode::Causal {
+            if let Some(r) = self.clover_draft_self(clover, cfg, input_ids, max_tokens, on_token, Some(req))? {
+                return Ok(r);
+            }
+        }
         let preview_mode = crate::gpu::BlockPreview {
             coreset_top_p: cfg.coreset_enabled.then_some(cfg.coreset_top_p),
         };
@@ -1204,12 +1689,7 @@ impl Pipeline {
         let mut committed: Vec<u32> = input_ids.to_vec();
 
         // The length ramp's stop ids; the file's EOS ids end the answer too.
-        let mut stop: Vec<u32> = cfg.stop_token_ids.clone();
-        let tk = &self.tokenizer;
-        stop.extend(tk.eos_token_id.into_iter().chain(tk.im_end_id).chain(tk.extra_eos.iter().copied()));
-        stop.retain(|&t| (t as usize) < vocab);
-        stop.sort_unstable();
-        stop.dedup();
+        let stop = self.clover_stop_ids(cfg);
         let is_stop = |t: u32| stop.binary_search(&t).is_ok();
         let suppress: Vec<u32> = self.sampler_config.suppress_tokens.clone();
         let forbid: Vec<u32> = std::iter::once(mask).chain(suppress.iter().copied()).collect();
@@ -1405,6 +1885,25 @@ mod tests {
         assert_eq!(pick(0.8), vec![true, false, true, false]);
         assert_eq!(pick(0.9), vec![true, true, true, false]);
         assert_eq!(pick(0.0), vec![true, false, false, false]);
+    }
+
+    /// `clover_correct_drafts` by hand: probabilities .7 / .2 / .1 / 0, so
+    /// H = 0.8018 and the threshold min(.9, .6·e^-H) = 0.2692.
+    #[test]
+    fn accept_rule_follows_the_vendor_threshold() {
+        let row = [0.7f32.ln(), 0.2f32.ln(), 0.1f32.ln(), f32::NEG_INFINITY];
+        let rule = AcceptRule { exact: false, ratio: 0.9, delta: 0.6 };
+        let (ok, p) = rule.accepts(&row, 0);
+        assert!(ok);
+        assert!((p - 0.7).abs() < 1e-5);
+        assert!(!rule.accepts(&row, 1).0);
+        // A blocked token never passes, however low the threshold.
+        let open = AcceptRule { exact: false, ratio: 0.0, delta: 0.0 };
+        assert!(!open.accepts(&row, 3).0);
+        assert!(open.accepts(&row, 2).0);
+        let exact = AcceptRule { exact: true, ratio: 0.9, delta: 0.6 };
+        assert!(exact.accepts(&row, 0).0);
+        assert!(!exact.accepts(&row, 1).0);
     }
 
     #[test]

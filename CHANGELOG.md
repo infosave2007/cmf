@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.52] — 2026-11-01
+
+### Changed
+- Block-diffusion models decode causally by default (`CMF_CLOVER_MODE=ar`):
+  Clover-35B-A3B-Preview `q4tp-v2` on an RTX 5090 goes from 26 to 120 tok/s on
+  prose and from 80–95 to 121 on code, a 16 GB budget from 5.6–14 to 53, the
+  CPU from 0.7–1.3 to 11–14, with the release's response-only penalties, the
+  stop and `</think>` ramps and cross-turn KV reuse. On an Apple M4 (24 GB)
+  the prompt runs on the Metal executor (~170 tok/s against 57) and the rows
+  on the CPU: 13–18 tok/s against 3.2 on prose and 6.5–9 on code.
+  `CMF_CLOVER_MODE=denoise` keeps the release's LowConfidence generation.
+
+### Added
+- Self-speculative decoding for block-diffusion models on the wgpu graph
+  (`CMF_CLOVER_MODE=draft`, the vendor's `draft-self`): a preview proposes a
+  block, the causal path verifies it and the state rewinds to the accepted
+  prefix; `CMF_CLOVER_DRAFT`, `CMF_CLOVER_ACCEPT`, `CMF_CLOVER_ACCEPT_RATIO`,
+  `CMF_CLOVER_ACCEPT_DELTA`.
+
 ## [0.8.51] — 2026-10-31
 
 ### Added

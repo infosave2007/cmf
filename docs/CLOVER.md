@@ -46,7 +46,25 @@ cortiq quantize-moe clover-35b-a3b-preview-q4tp.cmf --hf Diffuspace/Clover-35B-A
 
 ## Generation
 
-`cortiq run` / `cortiq serve` take the block-diffusion path for such a file.
+A Clover file holds one model with two read paths: the causal trunk and the
+block preview. `CMF_CLOVER_MODE` picks how a request uses them:
+
+| mode | how | when |
+|---|---|---|
+| `ar` | the ordinary causal decode, with the release's response penalties and ramps | the default; the fastest everywhere it was measured. On Apple silicon the prompt runs on the Metal executor and the rows on the CPU |
+| `draft` | self-speculation, the vendor's `draft-self`: one preview of `[pending token, masks]` proposes a block, one causal forward verifies it, the accepted prefix plus one token go out and the state rewinds to them | wgpu whole-stack graph only |
+| `denoise` | LowConfidence block denoising, the release's `generate` | the original algorithm |
+
+Self-speculation knobs: `CMF_CLOVER_DRAFT` (rows of a round, a divisor of 32,
+default 16), `CMF_CLOVER_ACCEPT=exact` (keep only drafts equal to the verify's
+penalized argmax, the causal decode's text), `CMF_CLOVER_ACCEPT_RATIO` and
+`CMF_CLOVER_ACCEPT_DELTA` (the threshold rule `p ≥ min(ratio, delta·e^-H)`,
+defaults 0.9 and 0.6 as in the vendor's llama.cpp example).
+
+In every mode the penalties count response tokens only and the mask token
+never comes out.
+
+The rest of this section describes the denoising path:
 
 * **Preview** (one denoising pass, the committed state read only): full
   attention sees the prefix and every row of the block; a GDN layer runs the
@@ -82,7 +100,11 @@ passes, tokens per pass, the rate after the prompt and the time of a pass.
   grouped MoE kernels, the penalties and greedy pick). A stack that does not
   fit the card runs its leading layers on it and the rest on the host
   (`device layers` in the statistics).
-* **Apple silicon (Metal)**: `gpu_metal/clover.rs`. The general Metal graphs
+* **Apple silicon (Metal)**: `gpu_metal/clover.rs` takes the prompt and, in
+  `denoise`, the passes and commits; the causal rows run on the CPU (below).
+  `CMF_CLOVER_METAL=0` leaves the request to the general paths, whose token
+  graph takes the model where the file fits Metal's working set (not measured
+  here). The general Metal graphs
   cannot take the model (the rows graph has no MoE arm, and binding the
   19 GB mapping exceeds the M4's 17.8 GB working set), so a pass is one
   command buffer per layer: the mixer, the post norm and the router, ONE
@@ -107,7 +129,45 @@ passes, tokens per pass, the rate after the prompt and the time of a pass.
   prompt on both and compares every layer.
 * **CPU**: the host path everywhere.
 
-## Measured (cortiq 0.8.40 / 0.8.41)
+## Measured: the three modes (cortiq 0.8.52)
+
+RTX 5090 (32 GB), Vulkan, `q4tp-v2`, tokens per second after the prompt over
+512 tokens:
+
+| mode | prose | code | cost |
+|---|---:|---:|---|
+| `ar` | 120 | 121 | 8.3 ms a token (5.2 ms on the device) |
+| `draft`, 4 rows | 61 | 78 | 46–51 ms a round, 2.8 / 3.9 tokens |
+| `draft`, 8 rows | 54 | 99 | 65–74 ms a round, 3.5 / 7.3 tokens |
+| `draft`, 16 rows | 42 | 104 | 80–98 ms a round, 3.4 / 10.1 tokens |
+| `draft`, 32 rows | 20 | 94 | 106–147 ms a round, 2.9 / 10 tokens |
+| `denoise` | 18–26 | 63–95 | 35–59 ms a pass, 1.1 / 2.6 tokens |
+
+The causal decode wins because the card reads one row in 8 ms, while a
+self-speculative round costs a whole preview plus a verify: it would need ten
+accepted tokens a round just to draw level, and free text gives three. A
+denoising pass fixes about one token on prose. `bench --core` puts the causal
+decode at 144 tok/s near the start of the context; a 2048-token prompt reads
+at 1143 tok/s and decode there runs at 116.
+
+Smaller budgets (`CMF_GPU_VRAM_MB`), causal against denoise, prose and code:
+16 GB 54 / 53 against 5.6 / 14.3; 12 GB 29 / 29. The CPU (15 Xeon cores):
+13.8 / 10.9 against 0.7 / 1.3. `q8_2f` on the 32 GB card, whose stack does
+not fit: 49 / 46, a 2048-token prompt at 60.
+
+The causal text equals `draft` with `CMF_CLOVER_ACCEPT=exact` byte for byte on
+the prose prompt. The code prompt splits after about eight tokens: the verify
+runs int8 activations, so a near-tie can resolve differently.
+
+Apple M4 (24 GB, 10-core GPU), `q4tp-v2`: 13–18 tok/s on prose and 14–18 on
+code, against 3.2 and 6.5–9 for `denoise`; a 2048-token prompt in 11.8 s
+(~170 tok/s, the CPU alone 66), decode there 16.2. Why the rows stay on the
+CPU: a row takes 55 ms there and 160 ms on the executor (40 host round trips a
+token), and the token graph cannot take the file: 19.4 GB against a 17.8 GB
+working set ends in `Insufficient Memory`, and the MoE pager's items do not
+fit a page in this file's layout.
+
+## Measured: denoising (cortiq 0.8.40 / 0.8.41)
 
 RTX 5090 (32 GB), whole stack and head on the card, 18.8 GB of VRAM. A pass
 is one 32-row denoising forward: 34–36 ms. Tokens per second after the
