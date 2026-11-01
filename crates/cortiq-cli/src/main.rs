@@ -9539,7 +9539,7 @@ async fn cmd_run(
                 match first {
                     // Whole blocks arrive at once: the per-token decode
                     // rate of a causal model has no meaning here.
-                    Some(ttft) if pipeline.is_block_diffusion() => println!(
+                    Some(ttft) if pipeline.is_block_diffusion() && pipeline.clover_stats().blocks > 0 => println!(
                         "\n[{} tokens · first block {:.1} s · overall {:.1} tok/s, finish: {}]",
                         r.tokens_generated,
                         ttft,
@@ -9572,6 +9572,23 @@ async fn cmd_run(
                 if pipeline.is_block_diffusion() {
                     let st = pipeline.clover_stats();
                     let per = |x: f64| 1e3 * x / st.passes.max(1) as f64;
+                    if st.rounds > 0 {
+                        let rd = |x: f64| 1e3 * x / st.rounds as f64;
+                        println!(
+                            "[self-speculation: {} rounds · {} of {} drafts accepted ({:.0}%) · {:.2} tokens/round · {:.1} tok/s after the prompt · \
+                             preview {:.0} ms + verify {:.0} ms + accept {:.1} ms a round · prompt {:.1} s]",
+                            st.rounds,
+                            st.accepted,
+                            st.drafted,
+                            100.0 * st.accepted as f64 / st.drafted.max(1) as f64,
+                            r.tokens_generated as f64 / st.rounds as f64,
+                            st.denoise_tok_s(r.tokens_generated),
+                            rd(st.preview_s),
+                            rd(st.verify_s),
+                            rd(st.pick_s),
+                            st.prompt_s
+                        );
+                    } else if st.passes > 0 {
                     println!(
                         "[block diffusion: {} blocks · {} passes · {:.2} tokens/pass · {:.1} tok/s after the prompt · \
                          pass {:.0} ms + pick {:.1} ms · block commits {:.2} s · prompt {:.1} s · device layers {}]",
@@ -9585,6 +9602,7 @@ async fn cmd_run(
                         st.prompt_s,
                         st.device_layers
                     );
+                    }
                     if st.metal_passes > 0 {
                         let mp = |x: f64| 1e3 * x / st.metal_passes as f64;
                         println!(
