@@ -41,7 +41,7 @@ hf download infosave/Unlimited-OCR-2-cmf unlimited-ocr-2-q8_2f.cmf --local-dir .
 cortiq run unlimited-ocr-2-q8_2f.cmf --image page1.png --image page2.png --prompt "Multi page parsing." --max-tokens 8192
 ```
 
-Use cortiq 0.8.53 or later; prebuilt binaries for Linux, macOS and Windows are
+Use cortiq 0.8.54 or later; prebuilt binaries for Linux, macOS and Windows are
 on the [releases page](https://github.com/infosave2007/cmf/releases).
 
 Pass the pages in order with one `--image` each. One image is tiled (up to 16
@@ -81,8 +81,9 @@ bf16 build where it leaves float32.
 
 Decode speed holds over a document: 316 tok/s at 24 pages on the card, 137 tok/s
 on the M4 with `q4tp`. A tiled page reaches its first token in 1.2 s on the card once
-the weights are loaded (the first request adds about 4 s), in 4.9 s on the M4. On a 10-core Xeon quota with
-`CMF_GPU=0` the decoder runs at 67 tok/s and the encoder takes 16 s for a 1024×1024 view.
+the weights are loaded (the first request adds about 4 s), in 4.9 s on the M4. On a
+10-core Xeon quota with `CMF_GPU=0` the decoder runs at 67 tok/s and the encoder takes
+16 s for a 1024×1024 view.
 
 ## Server
 
@@ -131,7 +132,7 @@ hf download infosave/Unlimited-OCR-2-cmf unlimited-ocr-2-q8_2f.cmf --local-dir .
 cortiq run unlimited-ocr-2-q8_2f.cmf --image page1.png --image page2.png --prompt "Multi page parsing." --max-tokens 8192
 ```
 
-Нужен cortiq 0.8.53 или новее. Страницы передаются по порядку, по одному `--image` на
+Нужен cortiq 0.8.54 или новее. Страницы передаются по порядку, по одному `--image` на
 каждую. Одно изображение режется на тайлы, несколько идут только общим видом 1024×1024. В
 ответе один `<PAGE>` на страницу и разметка блоков с координатами в сетке 0–999.
 
@@ -155,7 +156,7 @@ hf download infosave/Unlimited-OCR-2-cmf unlimited-ocr-2-q8_2f.cmf --local-dir .
 cortiq run unlimited-ocr-2-q8_2f.cmf --image page1.png --image page2.png --prompt "Multi page parsing." --max-tokens 8192
 ```
 
-需要 cortiq 0.8.53 及以上。按顺序传入各页，每页一个 `--image`。单张图片会切块，多张图片只用
+需要 cortiq 0.8.54 及以上。按顺序传入各页，每页一个 `--image`。单张图片会切块，多张图片只用
 1024×1024 的全局视图。输出每页一个 `<PAGE>`，并标注各区块，坐标范围 0–999。
 
 RTX PRO 4500 上的速度：解码 323 tok/s（`q8_2f`）和 319 tok/s（`q4tp`），编码器每块 0.10 秒、

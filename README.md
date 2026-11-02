@@ -114,7 +114,7 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
-## Unlimited-OCR-2 and MiniCPM-OCR-1.0 (0.8.53)
+## Unlimited-OCR-2 and MiniCPM-OCR-1.0 (0.8.54)
 
 Two OCR models. [Unlimited-OCR-2](https://huggingface.co/infosave/Unlimited-OCR-2-cmf)
 parses a whole document in one pass: its attention reads at most 512 tokens per

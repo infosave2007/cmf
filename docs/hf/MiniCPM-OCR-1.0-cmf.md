@@ -39,7 +39,7 @@ hf download infosave/MiniCPM-OCR-1.0-cmf minicpm-ocr-1.0-q8_2f.cmf --local-dir .
 cortiq run minicpm-ocr-1.0-q8_2f.cmf --image page.png --prompt "Text Recognition:" --max-tokens 2048
 ```
 
-Use cortiq 0.8.53 or later; prebuilt binaries for Linux, macOS and Windows are
+Use cortiq 0.8.54 or later; prebuilt binaries for Linux, macOS and Windows are
 on the [releases page](https://github.com/infosave2007/cmf/releases). `--image`
 takes a path, a data URL or an HTTP(S) URL.
 
@@ -128,7 +128,7 @@ hf download infosave/MiniCPM-OCR-1.0-cmf minicpm-ocr-1.0-q8_2f.cmf --local-dir .
 cortiq run minicpm-ocr-1.0-q8_2f.cmf --image page.png --prompt "Text Recognition:" --max-tokens 2048
 ```
 
-Нужен cortiq 0.8.53 или новее. Подсказки: `Text Recognition:`, `Table Recognition:`,
+Нужен cortiq 0.8.54 или новее. Подсказки: `Text Recognition:`, `Table Recognition:`,
 `Formula Recognition:`, `Seal Recognition:`, `Chart to Table:`. Детектор разметки
 и порядок чтения из SDK вендора в файлы не входят: здесь шаг распознавания.
 
@@ -152,7 +152,7 @@ hf download infosave/MiniCPM-OCR-1.0-cmf minicpm-ocr-1.0-q8_2f.cmf --local-dir .
 cortiq run minicpm-ocr-1.0-q8_2f.cmf --image page.png --prompt "Text Recognition:" --max-tokens 2048
 ```
 
-需要 cortiq 0.8.53 及以上。提示词：`Text Recognition:`、`Table Recognition:`、
+需要 cortiq 0.8.54 及以上。提示词：`Text Recognition:`、`Table Recognition:`、
 `Formula Recognition:`、`Seal Recognition:`、`Chart to Table:`。上游 SDK 的版面检测和
 阅读顺序不包含在内，这些文件负责识别这一步。
 

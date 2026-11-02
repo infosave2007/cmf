@@ -104,7 +104,7 @@ cortiq import-gguf model.gguf --output model.cmf
 cortiq verify model.cmf
 ```
 
-## Unlimited-OCR-2 与 MiniCPM-OCR-1.0（0.8.53）
+## Unlimited-OCR-2 与 MiniCPM-OCR-1.0（0.8.54）
 
 两款 OCR 模型。[Unlimited-OCR-2](https://huggingface.co/infosave/Unlimited-OCR-2-cmf)
 一次解析整份文档：无论文档多长，注意力每步最多读取 512 个 token。RTX PRO 4500 在 24 页上

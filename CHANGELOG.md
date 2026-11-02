@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.8.53] — 2026-11-02
+## [0.8.54] — 2026-11-02
 
 ### Added
 - Unlimited-OCR-2 (`unlimited-ocr`, `uocr.rs`): multi-page document parsing. The
