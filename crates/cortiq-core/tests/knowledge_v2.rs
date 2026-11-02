@@ -304,6 +304,9 @@ fn policy(layer: usize) -> RouterPolicy {
             layer,
             pool: "span_mean".into(),
             norm: "unit".into(),
+            key_alpha: None,
+            followup_alpha: None,
+            followup_margin: None,
             prefix_ids: vec![1, 5],
             suffix_ids: vec![2, 1, 6],
         },
@@ -311,6 +314,8 @@ fn policy(layer: usize) -> RouterPolicy {
         margin: 0.05,
         skills_hash: "0000000000000000".into(),
         measured: None,
+        followup: None,
+        keyless: None,
     }
 }
 

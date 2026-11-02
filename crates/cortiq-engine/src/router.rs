@@ -696,6 +696,150 @@ pub fn route_request_with(
     route_request_ids(model, backbone, &q_ids, opts)
 }
 
+/// [`route_request_with`] for every router policy: under `key_span` the φ
+/// is pooled over the table key the message names, and a message without
+/// a key runs the backbone with no forward at all.
+pub fn route_request_keyed(
+    model: &std::sync::Arc<CmfModel>,
+    backbone: &mut Pipeline,
+    user_text: &str,
+    opts: RouteOptions,
+) -> RouteDecision {
+    match &model.header.router {
+        Some(p) if p.phi.pool == cortiq_core::knowledge::phi_pool::KEY_SPAN => {
+            let holders = crate::lookup::key_holders(model, user_text);
+            let no_key = RouteDecision::forced(RouteTarget::Backbone, "no table key in the message");
+            if holders.is_empty() {
+                return route_keyless(model, backbone, p, user_text, no_key);
+            }
+            let d = match crate::lookup::key_span_phi(model, backbone, &p.phi, user_text) {
+                Some(phi) => route_policy_candidates(&model.header, &phi, opts, &holders),
+                None => no_key,
+            };
+            // A word of a table in a question no record answers: the same decision
+            if d.target == RouteTarget::Backbone {
+                return route_keyless(model, backbone, p, user_text, d);
+            }
+            d
+        }
+        _ => route_request_with(model, backbone, user_text, opts),
+    }
+}
+
+/// [`route_request_keyed`] with conversation memory: `turns` = the user
+/// messages, the last one first. A last message without a table key, after a
+/// turn that named one, is decided on the follow-up φ at its own margin.
+pub fn route_turns_keyed(
+    model: &std::sync::Arc<CmfModel>,
+    backbone: &mut Pipeline,
+    turns: &[&str],
+    opts: RouteOptions,
+) -> RouteDecision {
+    let last = turns.first().copied().unwrap_or("");
+    let Some(p) = model.header.router.as_ref().filter(|p| {
+        p.phi.pool == cortiq_core::knowledge::phi_pool::KEY_SPAN && p.phi.followup_alpha.is_some()
+    }) else {
+        return route_request_keyed(model, backbone, last, opts);
+    };
+    if turns.len() < 2 || crate::lookup::message_names_key(model, last) {
+        return route_request_keyed(model, backbone, last, opts);
+    }
+    let d = match crate::lookup::followup_phi(model, backbone, &p.phi, last, &turns[1..]) {
+        Some((phi, holders)) => {
+            if let (Some(f), Some(m)) = (p.followup.as_ref(), p.phi.followup_margin) {
+                route_followup(&model.header, f, m, &phi, &holders, opts)
+            } else {
+                let mut header = model.header.clone();
+                if let (Some(r), Some(m)) = (header.router.as_mut(), p.phi.followup_margin) {
+                    r.margin = m;
+                }
+                route_policy_candidates(&header, &phi, opts, &holders)
+            }
+        }
+        None => RouteDecision::forced(RouteTarget::Backbone, "no table key in the conversation"),
+    };
+    if d.target == RouteTarget::Backbone {
+        return route_keyless(model, backbone, p, last, d);
+    }
+    d
+}
+
+/// Longest message the keyless decision looks at, in tokens: a question for
+/// a fact is short, and the probe runs before the answer.
+const KEYLESS_MAX_TOKENS: usize = 160;
+
+/// A message no record took and no follow-up: the whole-message φ against
+/// the two topologies of [`cortiq_core::knowledge::KeylessPolicy`]. `otherwise`
+/// is the decision when it does not ask for a fact.
+fn route_keyless(
+    model: &std::sync::Arc<CmfModel>,
+    backbone: &mut Pipeline,
+    p: &RouterPolicy,
+    user_text: &str,
+    otherwise: RouteDecision,
+) -> RouteDecision {
+    let Some(k) = p.keyless.as_ref() else {
+        return otherwise;
+    };
+    let q = backbone.tokenizer.encode_plain(user_text);
+    if q.is_empty() || q.len() > KEYLESS_MAX_TOKENS {
+        return otherwise;
+    }
+    let (ids, span) = phi_span_ids(&p.phi, &q);
+    let hidden = backbone.hidden_size;
+    let rows = backbone.probe_hidden_rows(&ids, p.phi.layer);
+    let phi = pool_key_span(&rows, hidden, span, (0, 0), 1.0);
+    let (Some(fact), Some(chat)) = (
+        descriptor_row(&k.record, &k.fact, &phi, hidden),
+        descriptor_row(BACKBONE_CLASS_ID, &k.chat, &phi, hidden),
+    ) else {
+        return otherwise;
+    };
+    let (e_fact, e_chat) = (fact.1 / fact.4.max(1e-12), chat.1 / chat.4.max(1e-12));
+    if !(e_fact + k.margin < e_chat) {
+        return otherwise;
+    }
+    RouteDecision {
+        target: RouteTarget::Skill(k.record.clone()),
+        routing: decide(&[chat, fact], None, 1.0),
+        reason: format!("asks for a fact outside the records: E {e_fact:.4} + {:.4} < E_chat {e_chat:.4}", k.margin),
+    }
+}
+
+/// The follow-up decision on its own topologies: the nearest of the records
+/// that hold the earlier key, against unrelated messages in the same form.
+fn route_followup(
+    header: &CmfHeader,
+    f: &cortiq_core::knowledge::FollowupTopologies,
+    margin: f32,
+    phi: &[f32],
+    holders: &[String],
+    opts: RouteOptions,
+) -> RouteDecision {
+    let hidden = header.arch.hidden_size;
+    let phi = unit_copy(phi);
+    let base = descriptor_row(BACKBONE_CLASS_ID, &f.base, &phi, hidden);
+    let skills: Vec<ErrorRow> = holders
+        .iter()
+        .filter(|id| header.skills.iter().any(|s| s.id == **id && is_routable(s, opts)))
+        .filter_map(|id| descriptor_row(id, f.skills.get(id)?, &phi, hidden))
+        .collect();
+    let mut rows: Vec<ErrorRow> = base.iter().cloned().collect();
+    rows.extend(skills.iter().cloned());
+    let routing = decide(&rows, None, 1.0);
+    let backbone = |routing: Routing, reason: String| RouteDecision { target: RouteTarget::Backbone, routing, reason };
+    let (Some(base), Some(best)) = (base, skills.iter().min_by(|a, b| a.1.total_cmp(&b.1))) else {
+        return backbone(routing, "no follow-up topology for the records holding the key".into());
+    };
+    let (e_base, e_skill) = (base.1 / base.4.max(1e-12), best.1 / best.4.max(1e-12));
+    if !(e_skill + margin < e_base) {
+        let reason = format!("follow-up margin not beaten: E_skill {e_skill:.4} + {margin:.4} ≥ E_base {e_base:.4}");
+        return backbone(routing, reason);
+    }
+    let reason = format!("follow-up on '{}': E {e_skill:.4} + {margin:.4} < E_base {e_base:.4}", best.0);
+    RouteDecision { target: RouteTarget::Skill(best.0.clone()), routing, reason }
+}
+
 /// [`route_request_with`] on an already encoded user text.
 pub fn route_request_ids(
     model: &CmfModel,
@@ -704,6 +848,12 @@ pub fn route_request_ids(
     opts: RouteOptions,
 ) -> RouteDecision {
     match &model.header.router {
+        Some(policy) if policy.phi.pool == cortiq_core::knowledge::phi_pool::KEY_SPAN => {
+            RouteDecision::forced(
+                RouteTarget::Backbone,
+                "router.phi.pool key_span needs the message text (route_request_keyed)",
+            )
+        }
         Some(policy) => {
             let (ids, span) = phi_span_ids(&policy.phi, q_ids);
             let phi = backbone.probe_phi_span(&ids, policy.phi.layer, span);
@@ -850,6 +1000,31 @@ pub fn pool_span_unit(hiddens: &[f32], hidden: usize, span: std::ops::Range<usiz
         phi.iter_mut().for_each(|x| *x /= n);
     }
     phi
+}
+
+/// `key_span` pool: `hiddens` = n × `hidden`, `span` = the user text in the
+/// canonical input, `window` = the key tokens inside the user text.
+pub fn pool_key_span(
+    hiddens: &[f32],
+    hidden: usize,
+    span: std::ops::Range<usize>,
+    window: (usize, usize),
+    alpha: f32,
+) -> Vec<f32> {
+    let unit_mean = |rows: &mut dyn Iterator<Item = usize>| -> Vec<f32> {
+        let mut p = vec![0f32; hidden];
+        for r in rows {
+            for (a, x) in p.iter_mut().zip(&hiddens[r * hidden..(r + 1) * hidden]) {
+                *a += x;
+            }
+        }
+        unit_copy(&p)
+    };
+    let (ka, kb) = (span.start + window.0, span.start + window.1);
+    let key = unit_mean(&mut (ka..kb));
+    let rest = unit_mean(&mut (span.start..ka).chain(kb..span.end));
+    let mix: Vec<f32> = key.iter().zip(&rest).map(|(k, r)| k + alpha * r).collect();
+    unit_copy(&mix)
 }
 
 // ───────────────────────── descriptor fitting ─────────────────────────
@@ -1047,6 +1222,9 @@ pub fn cmf_im_v1_phi_spec(tok: &crate::tokenizer::Tokenizer, layer: usize) -> Re
         layer,
         pool: "span_mean".into(),
         norm: "unit".into(),
+        key_alpha: None,
+        followup_alpha: None,
+        followup_margin: None,
         prefix_ids: tok.encode(IM_USER),
         suffix_ids: tok.encode(IM_ASSISTANT),
     })
@@ -1269,6 +1447,46 @@ pub fn route_policy_with(header: &CmfHeader, phi: &[f32], opts: RouteOptions) ->
         header.router.as_ref(),
         skills_hash(header),
     )
+}
+
+/// [`route_policy_with`] with only `candidates` among the skill rows: a
+/// table that does not hold the key the message names cannot answer it.
+pub fn route_policy_candidates(
+    header: &CmfHeader,
+    phi: &[f32],
+    opts: RouteOptions,
+    candidates: &[String],
+) -> RouteDecision {
+    let (base, mut skills) = policy_rows(header, phi);
+    skills.retain(|r| candidates.iter().any(|c| *c == r.0));
+    let routable = |id: &str| {
+        header
+            .skills
+            .iter()
+            .find(|s| s.id == id)
+            .is_some_and(|s| is_routable(s, opts))
+    };
+    let d = decide_backbone_gated_with(
+        base.as_ref(),
+        &skills,
+        &routable,
+        header.routing.as_ref(),
+        header.router.as_ref(),
+        skills_hash(header),
+    );
+    // A record's own stricter margin
+    let margin = d
+        .skill()
+        .and_then(|id| header.skills.iter().find(|s| s.id == id))
+        .and_then(|s| s.lookup.as_ref())
+        .and_then(|l| l.route_margin);
+    if let (Some(m), Some(eb), Some(es)) = (margin, d.e_base(), d.e_skill()) {
+        if !(es + m < eb) {
+            let reason = format!("record margin not beaten: E_skill {es:.4} + {m:.4} ≥ E_base {eb:.4}");
+            return RouteDecision { target: RouteTarget::Backbone, routing: d.routing, reason };
+        }
+    }
+    d
 }
 
 /// Upper end of the two-sided Clopper–Pearson (exact binomial) interval
@@ -1541,6 +1759,18 @@ mod tests {
     const HID: usize = 16;
 
     #[test]
+    fn pool_key_span_mixes_the_key_and_the_rest_as_unit_vectors() {
+        // hidden 2, 4 positions, user text = positions 1..4, key = its first token
+        let rows = [9.0, 9.0, 3.0, 0.0, 0.0, 5.0, 0.0, 5.0];
+        let phi = pool_key_span(&rows, 2, 1..4, (0, 1), 0.5);
+        let n = (1.0f32 + 0.25).sqrt();
+        assert!((phi[0] - 1.0 / n).abs() < 1e-6 && (phi[1] - 0.5 / n).abs() < 1e-6, "{phi:?}");
+        // a message that is only the key: the key alone
+        let phi = pool_key_span(&rows[..4], 2, 1..2, (0, 1), 0.5);
+        assert!((phi[0] - 1.0).abs() < 1e-6 && phi[1].abs() < 1e-6, "{phi:?}");
+    }
+
+    #[test]
     fn holdout_count_is_a_fifth_at_least_one_and_leaves_train_samples() {
         for (n, want) in [(1, 1), (2, 1), (3, 1), (5, 1), (6, 1), (10, 2), (50, 10), (4000, 800)] {
             assert_eq!(holdout_count(n), want, "n = {n}");
@@ -1700,6 +1930,9 @@ mod tests {
                 layer: 2,
                 pool: "span_mean".into(),
                 norm: "unit".into(),
+                key_alpha: None,
+                followup_alpha: None,
+                followup_margin: None,
                 prefix_ids: vec![1, 7, 8],
                 suffix_ids: vec![2, 1, 9],
             },
@@ -1707,6 +1940,8 @@ mod tests {
             margin: 0.05,
             skills_hash: "0".into(),
             measured: None,
+            followup: None,
+            keyless: None,
         }
     }
 

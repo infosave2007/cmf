@@ -36,6 +36,9 @@ pub struct EmbryoGraphModel {
     pub anchor_kv_heads: usize,
     pub anchor_head_dim: usize,
     pub rotary_dim: usize,
+    /// The frequencies of the rotary pairs: the wide path rotates by the absolute
+    /// position and the host writes those angles per token.
+    pub rope_freq: Vec<f32>,
     pub max_seq: usize,
     pub cluster_count: usize,
     pub cluster_size: usize,
@@ -47,6 +50,12 @@ pub struct EmbryoGraphModel {
     pub weights: Vec<f32>,
     pub meta: Vec<u32>,
     pub lm_head: Vec<f32>,
+    /// The wide token path: matrices and head in the file's f16 or q8_2f, read
+    /// by `gpu_wgpu/embryo_wide.wgsl`. `weights` then holds only the small tensors.
+    pub wide: bool,
+    pub wide_q8: bool,
+    pub mats: Vec<u8>,
+    pub lm_head_packed: Vec<u8>,
     pub clusters: Vec<f32>,
     pub final_norm: Vec<f32>,
     pub inv_freq: Vec<f32>,
@@ -2007,6 +2016,16 @@ pub fn forward_token_graph(
             TokenGraphOutcome::Declined
         }
     }
+}
+
+/// Is the f16 token path of the resident graph there on this device?
+pub fn embryo_wide_ready(q8: bool) -> bool {
+    #[cfg(feature = "gpu")]
+    if backend() == Backend::Wgpu {
+        return crate::gpu_wgpu::embryo_wide_ready(q8);
+    }
+    let _ = q8;
+    false
 }
 
 /// Whole-token resident graph for the Embryo working model.  Unlike the

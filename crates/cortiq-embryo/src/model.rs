@@ -8225,6 +8225,22 @@ impl EmbryoGpu {
         out
     }
 
+    /// [`Self::hidden_after_layer`] for several layers out of one forward up to
+    /// `top`: a host copy of the residual stream after each of `layers`.
+    pub fn hidden_after_layers(&self, tokens: &[u32], top: usize, layers: &[usize]) -> Vec<Vec<f32>> {
+        let _ = self.hidden_after_layer(tokens, top);
+        let m = self.b * self.t * self.cfg.hidden;
+        layers
+            .iter()
+            .map(|&l| {
+                let x: &GBuf = if l + 1 < self.cfg.layers { self.x_in(l + 1) } else { &self.x_out };
+                let mut v = x.to_vec();
+                v.truncate(m);
+                v
+            })
+            .collect()
+    }
+
     /// Span-mean φ (router v2, `pool = "span_mean"`): one prompt per batch
     /// row, right-padded to T; row r's φ is the mean of the hidden AFTER
     /// `phi_layer` over the positions `spans[r]` (the user-text tokens of

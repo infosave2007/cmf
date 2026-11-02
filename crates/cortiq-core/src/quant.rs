@@ -125,6 +125,53 @@ pub fn dequant_q8_2f(bytes: &[u8], out_dim: usize, in_dim: usize, dst: &mut [f32
     }
 }
 
+/// Smallest positive f16 scale the q8 family stores.
+const F16_SCALE_TINY: f32 = 6.103_515_6e-5;
+
+/// Encode a full `q8_2f` tensor, the inverse layout of [`dequant_q8_2f`]: the
+/// column field is the RMS over rows, the row scale fits the largest value,
+/// codes stay within ±127. Same bytes as the converter's parallel encoder.
+pub fn encode_q8_2f(vals: &[f32], out_dim: usize, in_dim: usize) -> Vec<u8> {
+    debug_assert_eq!(vals.len(), out_dim * in_dim);
+    const CBLK: usize = 256;
+    let mut totals = vec![0f64; in_dim];
+    for block in vals.chunks(CBLK * in_dim.max(1)) {
+        let mut acc = vec![0f64; in_dim];
+        for row in block.chunks(in_dim.max(1)) {
+            for (a, &v) in acc.iter_mut().zip(row) {
+                *a += v as f64 * v as f64;
+            }
+        }
+        for (t, a) in totals.iter_mut().zip(&acc) {
+            *t += *a;
+        }
+    }
+    let round_tiny = |x: f32| f16_to_f32(f32_to_f16(x)).max(F16_SCALE_TINY);
+    let col: Vec<f32> = totals
+        .iter()
+        .map(|&t| round_tiny((t / out_dim as f64).sqrt().max(1e-12) as f32))
+        .collect();
+    let mut out = vec![0u8; out_dim * in_dim];
+    let mut scales = Vec::with_capacity(out_dim * 2);
+    for o in 0..out_dim {
+        let src = &vals[o * in_dim..(o + 1) * in_dim];
+        let mut absmax = 0f32;
+        for (v, c) in src.iter().zip(&col) {
+            absmax = absmax.max((v / c).abs());
+        }
+        let scale = round_tiny(absmax.max(1e-12) / 127.0);
+        for ((d, v), c) in out[o * in_dim..(o + 1) * in_dim].iter_mut().zip(src).zip(&col) {
+            *d = ((v / c) / scale).round_ties_even().clamp(-127.0, 127.0) as i8 as u8;
+        }
+        scales.extend_from_slice(&f32_to_f16(scale).to_le_bytes());
+    }
+    out.extend_from_slice(&scales);
+    for &c in &col {
+        out.extend_from_slice(&f32_to_f16(c).to_le_bytes());
+    }
+    out
+}
+
 /// Dequantize a full `q4_block` tensor into `dst` (`dst.len()` = real
 /// element count; the trailing pad group elements are discarded).
 pub fn dequant_q4_block(bytes: &[u8], dst: &mut [f32]) {

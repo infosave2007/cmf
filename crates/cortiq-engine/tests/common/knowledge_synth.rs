@@ -65,6 +65,9 @@ pub fn phi_spec() -> PhiSpec {
         layer: 0,
         pool: "span_mean".into(),
         norm: "unit".into(),
+        key_alpha: None,
+        followup_alpha: None,
+        followup_margin: None,
         prefix_ids: vec![1, 2, 3],
         suffix_ids: vec![4, 5, 6],
     }
@@ -289,6 +292,8 @@ pub fn write_knowledge_pair(dir: &Path, g: &SynthGeom, status: &str) -> Knowledg
         margin: 0.05,
         skills_hash: "0000000000000000".into(),
         measured: None,
+        followup: None,
+        keyless: None,
     };
     drop(model);
     CmfModel::append_skill(&f1, record, &tensors, Some(policy), None, None).expect("append skill");
@@ -489,6 +494,9 @@ pub fn lookup_record_tensors(
         langs: LOOKUP_LANGS.iter().map(|s| s.to_string()).collect(),
         fields: vec!["family".into(), "uses".into(), "safety".into()],
         policy: None,
+        route_margin: None,
+        min_key_share: None,
+        keyless: None,
     };
     let slot_refs: Vec<&str> = slots.iter().map(String::as_str).collect();
     let tensors = cortiq_core::lookup_tensors(id, &info, &keys, &slot_refs).expect("lookup tensors");
@@ -548,6 +556,8 @@ pub fn write_lookup_pair(dir: &Path, g: &SynthGeom, status: &str) -> KnowledgeFi
         margin: 0.05,
         skills_hash: "0000000000000000".into(),
         measured: None,
+        followup: None,
+        keyless: None,
     };
     drop(model);
     CmfModel::append_skill(&f1, record, &tensors, Some(policy), None, None)

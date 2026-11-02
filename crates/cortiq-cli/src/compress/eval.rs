@@ -27,6 +27,7 @@ fn greedy() -> SamplerConfig {
         seed: Some(1),
         suppress_tokens: Vec::new(),
         penalty_window: 0,
+        loop_stop: false,
     }
 }
 

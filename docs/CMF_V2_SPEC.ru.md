@@ -898,9 +898,32 @@ API: `cortiq_core::trunk_hash(header, tensors, vocab)` (файл без масо
 Хелперы: `router::phi_span_ids(phi, q_ids) -> (ids, span)`,
 `router::pool_span_unit(hiddens, hidden, span)`.
 
+Пул `key_span` (для записей `lookup`), `key_alpha` — вес остального
+сообщения. Движок находит ключ таблицы в сообщении и окно его токенов в
+`encode(q)`; φ = unit(unit(среднее по окну) + `key_alpha`·unit(среднее по
+остальным токенам q)). Кандидаты решения — только записи, в таблице которых
+есть этот ключ; сообщение без ключа идёт в основную сеть без прогона φ.
+Необязательные `followup_alpha`, `followup_margin`: сообщение без ключа после
+реплики с ключом решается на φ = unit(unit(окно ключа прежней реплики) +
+`followup_alpha`·unit(среднее по сообщению)) со своим порогом, кандидаты —
+записи, у карточки которых есть поля. Хелперы: `router::pool_key_span`,
+`lookup::key_span_phi`, `lookup::followup_phi`, `router::route_turns_keyed`.
+
+Необязательный `router.followup` `{base, skills: {id: descriptor}}`: свои
+изолированные подпространства этой формы φ (посторонние сообщения с ключом
+перед ними и уточняющие вопросы о записи); решение берёт `followup_margin`,
+калибровка первой реплики к нему не относится.
+
+Необязательный `router.keyless` `{record, fact, chat, margin}`: сообщение без
+ключа, не ставшее уточнением, решается на φ всего сообщения (до 160 токенов):
+`E_fact + margin < E_chat` отправляет его в запись `record`, у которой
+`lookup.keyless = true`, и ответ — карточка строки 0 этой записи. Иначе
+запрос идёт в основную сеть. Дескрипторы обоих полей подчиняются тем же
+проверкам, что и `base`. Старые читатели игнорируют оба поля.
+
 Инварианты (проверяет `open()`): `version == 2`, `policy ==
 "backbone_gated"`, `granularity == "request"`, `pool/norm ==
-span_mean/unit`, `phi.layer < num_layers`; `base.metric == "mse_unit"`,
+span_mean|key_span/unit`, `phi.layer < num_layers`; `base.metric == "mse_unit"`,
 `base.phi_layer == phi.layer`; у каждой v2-записи с `selection`
 `metric == "mse_unit"`, `phi_layer == phi.layer` и `phi.layer <
 min(layers)` (φ не зависит от активного навыка); `margin` конечен и ≥ 0;

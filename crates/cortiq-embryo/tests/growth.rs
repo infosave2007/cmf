@@ -214,6 +214,7 @@ fn fixture(tag: &str) -> Option<Fixture> {
         Some(&cortiq_embryo::export::ExportGenome {
             id: "embryo-o1-fam-a-tiny".into(),
             status: "pre_chat".into(),
+            chat_template: None,
         }),
     )
     .unwrap();
@@ -1088,6 +1089,7 @@ fn f16_genome_grows_on_the_served_trunk() {
         Some(&cortiq_embryo::export::ExportGenome {
             id: "embryo-o1-fam-a-tiny-f16".into(),
             status: "pre_chat".into(),
+            chat_template: None,
         }),
     )
     .unwrap();
@@ -1228,7 +1230,7 @@ fn export_never_overwrites_a_genome_file() {
         f.tok_json.as_bytes(),
         &f.base,
         cortiq_core::TensorDtype::F16,
-        Some(&cortiq_embryo::export::ExportGenome { id: "x".into(), status: "pre_chat".into() }),
+        Some(&cortiq_embryo::export::ExportGenome { id: "x".into(), status: "pre_chat".into(), chat_template: None }),
     )
     .err()
     .unwrap()
@@ -1773,6 +1775,7 @@ fn bias_mode_source_writes_the_source_bias() {
         Some(&cortiq_embryo::export::ExportGenome {
             id: "embryo-o1-fam-a-tiny-b".into(),
             status: "pre_chat".into(),
+            chat_template: None,
         }),
     )
     .unwrap();

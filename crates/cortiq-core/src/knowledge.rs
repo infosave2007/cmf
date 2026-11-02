@@ -684,7 +684,7 @@ pub const LOOKUP_MAX_NGRAM: usize = 4;
 /// hashed keys. The table itself is the four tensors of [`lookup_leaf`];
 /// a lookup record has no `overrides`, no `experts`, no `layers` and the
 /// transparent [`lookup_state_effect`] — it never touches the network.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LookupInfo {
     /// `E ≥ 1` cards.
     pub entries: usize,
@@ -706,6 +706,19 @@ pub struct LookupInfo {
     /// Additive: files written before 26.09.2026 carry no field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<String>,
+    /// This record must beat the backbone by this much in unit error, when
+    /// stricter than `router.margin` (a broad table next to a narrow one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_margin: Option<f32>,
+    /// `key_span` router: the key must make up at least this share of the
+    /// words of the message, or the record is no candidate (small talk: "hello"
+    /// alone is a greeting, "hello, write me a story" is a task).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_key_share: Option<f32>,
+    /// The record answers without a key: the card of entry 0, for whatever
+    /// message the router sends to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyless: Option<bool>,
 }
 
 /// Values of `LookupInfo.policy` (spec §9.5.2).
@@ -1176,6 +1189,32 @@ impl SkillRecord {
 
 // ───────────────────────── router policy v2 ─────────────────────────
 
+/// The decision on a message that names no key and is no follow-up, on the
+/// whole-message φ: does it ask for a specific fact? A small network has no
+/// facts, so such a message goes to `record` (a keyless card) and not to it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeylessPolicy {
+    /// The lookup record that answers ([`LookupInfo::keyless`]).
+    pub record: String,
+    /// Questions for a specific fact.
+    pub fact: SelectionDescriptor,
+    /// Ordinary chat: tasks, advice, talk.
+    pub chat: SelectionDescriptor,
+    /// `fact` must beat `chat` by this much in unit error.
+    pub margin: f32,
+}
+
+/// Isolated topologies of the follow-up decision: a message without a key
+/// after a turn with one has φ = unit(unit(key tokens) +
+/// followup_alpha·unit(message)), a form the first-turn topologies never saw.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FollowupTopologies {
+    /// An unrelated message in the context of a key.
+    pub base: SelectionDescriptor,
+    /// A question about the key, per record id.
+    pub skills: std::collections::BTreeMap<String, SelectionDescriptor>,
+}
+
 /// `header.router` (bit `ROUTER_V2`): the per-request backbone-gated
 /// policy. The backbone is the default; a skill runs only when the
 /// calibrated decision says so (`cortiq-engine` `router::decide_backbone_gated`).
@@ -1202,6 +1241,20 @@ pub struct RouterPolicy {
     /// n_general, general_sha256, in_sha256}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub measured: Option<serde_json::Value>,
+    /// Topologies of the follow-up decision; without them it runs on the
+    /// first-turn topologies at `phi.followup_margin`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followup: Option<FollowupTopologies>,
+    /// The decision on a keyless message; without it such a message runs the
+    /// backbone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyless: Option<KeylessPolicy>,
+}
+
+/// `router.phi.pool` values.
+pub mod phi_pool {
+    pub const SPAN_MEAN: &str = "span_mean";
+    pub const KEY_SPAN: &str = "key_span";
 }
 
 /// Canonical φ(q) of a user message q: `ids = prefix_ids ++ encode(q) ++
@@ -1211,10 +1264,22 @@ pub struct RouterPolicy {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PhiSpec {
     pub layer: usize,
-    /// `"span_mean"`.
+    /// `"span_mean"`, or `"key_span"`: unit(unit(mean over the tokens of the
+    /// table key the message names) + key_alpha·unit(mean over the rest of
+    /// the user text)) — a message without a key has no φ and runs the backbone.
     pub pool: String,
     /// `"unit"`.
     pub norm: String,
+    /// Weight of the rest of the message in the `key_span` pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_alpha: Option<f32>,
+    /// `key_span` follow-up (a message without a key after a turn with one):
+    /// φ = unit(unit(key tokens of the earlier turn) + followup_alpha·unit(the message)).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followup_alpha: Option<f32>,
+    /// Margin of the follow-up decision (its own operating point).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followup_margin: Option<f32>,
     #[serde(default)]
     pub prefix_ids: Vec<u32>,
     #[serde(default)]
@@ -2179,9 +2244,9 @@ fn validate_router(header: &CmfHeader, r: &RouterPolicy) -> Result<(), CmfError>
             r.granularity
         )));
     }
-    if r.phi.pool != "span_mean" || r.phi.norm != "unit" {
+    if (r.phi.pool != phi_pool::SPAN_MEAN && r.phi.pool != phi_pool::KEY_SPAN) || r.phi.norm != "unit" {
         return Err(perr(format!(
-            "router.phi pool/norm '{}'/'{}' (known: span_mean/unit)",
+            "router.phi pool/norm '{}'/'{}' (known: span_mean|key_span/unit)",
             r.phi.pool, r.phi.norm
         )));
     }
@@ -2219,6 +2284,16 @@ fn validate_router(header: &CmfHeader, r: &RouterPolicy) -> Result<(), CmfError>
         Ok(())
     };
     check_desc("router.base", &r.base)?;
+    if let Some(f) = &r.followup {
+        check_desc("router.followup.base", &f.base)?;
+        for (id, d) in &f.skills {
+            check_desc(&format!("router.followup '{id}'"), d)?;
+        }
+    }
+    if let Some(k) = &r.keyless {
+        check_desc("router.keyless.fact", &k.fact)?;
+        check_desc("router.keyless.chat", &k.chat)?;
+    }
     for s in header.skills.iter().filter(|s| s.is_v2()) {
         if let Some(sel) = &s.selection {
             check_desc(&format!("skill '{}'", s.id), sel)?;
