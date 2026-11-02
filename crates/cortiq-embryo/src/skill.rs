@@ -729,6 +729,9 @@ pub fn phi_spec(bpe: &Bpe, layer: usize) -> anyhow::Result<PhiSpec> {
         layer,
         pool: "span_mean".into(),
         norm: "unit".into(),
+        key_alpha: None,
+        followup_alpha: None,
+        followup_margin: None,
         prefix_ids,
         suffix_ids,
     })
@@ -1009,6 +1012,235 @@ pub fn probe_prompts(
     }
     drop(gpu);
     Ok((out, skipped))
+}
+
+/// Research dump for the router experiments: the hidden rows after each of
+/// `layers` at EVERY position of the canonical φ input of every prompt, in one
+/// GPU forward per batch. `<out>.L{l}.f32` holds the rows in prompt order,
+/// `<out>.jsonl` the row offset, the q span and the key window of each prompt.
+pub fn phi_rows(
+    ck_path: &Path,
+    cmf: &Path,
+    id: &str,
+    prompts: &Path,
+    layers: &[usize],
+    out: &Path,
+    budget: usize,
+    max_len: usize,
+    only_keyed: bool,
+    keys_only: bool,
+) -> anyhow::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let ck = crate::train::load_checkpoint(ck_path)?;
+    let model = std::sync::Arc::new(CmfModel::open(cmf)?);
+    let table = cortiq_engine::lookup::LookupTable::open(&model, id).map_err(anyhow::Error::msg)?;
+    let tok = runtime_tokenizer(model.vocab.as_ref().ok_or_else(|| anyhow::anyhow!("no VOCAB section"))?)?;
+    let spec = cortiq_engine::router::cmf_im_v1_phi_spec(&tok, layers[0])
+        .map_err(anyhow::Error::msg)?;
+    let pad = tok.encode("<|im_end|>")[0];
+    let mut texts = read_prompts(prompts)?;
+    let h = ck.cfg.hidden;
+    let frame = spec.prefix_ids.len() + spec.suffix_ids.len();
+    let t0 = Instant::now();
+    if only_keyed {
+        // general prompts naming a table key: the hard negatives of the router
+        let keyed: Vec<serde_json::Value> = texts
+            .iter()
+            .filter(|p| table.find_key(p).is_some())
+            .map(|p| serde_json::json!({ "prompt": p }))
+            .collect();
+        eprintln!("phi-rows: {} of {} prompts name a key", keyed.len(), texts.len());
+        let path = format!("{}.keyed.jsonl", out.display());
+        std::fs::write(&path, keyed.iter().map(|v| format!("{v}\n")).collect::<String>())?;
+        texts = keyed.iter().map(|v| v["prompt"].as_str().unwrap().to_string()).collect();
+    }
+    let q: Vec<Vec<u32>> = texts
+        .iter()
+        .map(|p| {
+            let mut ids = tok.encode_plain(p);
+            ids.truncate(max_len - frame);
+            ids
+        })
+        .collect();
+    let mut offset = Vec::with_capacity(q.len() + 1);
+    offset.push(0usize);
+    for ids in &q {
+        offset.push(offset.last().unwrap() + frame + ids.len());
+    }
+    let total = *offset.last().unwrap();
+    let mut files = Vec::new();
+    for l in layers.iter().filter(|_| !keys_only) {
+        let f = std::fs::File::create(format!("{}.L{l}.f32", out.display()))?;
+        f.set_len((total * h * 4) as u64)?;
+        files.push(f);
+    }
+    let mut meta = std::io::BufWriter::new(std::fs::File::create(format!("{}.jsonl", out.display()))?);
+    for (i, (text, ids)) in texts.iter().zip(&q).enumerate() {
+        let hit = table.find_key(text);
+        let window = hit.as_ref().and_then(|k| cortiq_engine::lookup::key_token_window(&tok, ids, &k.key));
+        writeln!(
+            meta,
+            "{}",
+            serde_json::json!({
+                "i": i,
+                "row": offset[i],
+                "n": frame + ids.len(),
+                "span": [spec.prefix_ids.len(), spec.prefix_ids.len() + ids.len()],
+                "key": hit.as_ref().map(|k| k.key.clone()),
+                "words": hit.as_ref().map(|k| k.words),
+                "entry": hit.as_ref().map(|k| k.entry),
+                "window": window,
+            })
+        )?;
+    }
+    meta.flush()?;
+    if keys_only {
+        println!("phi-rows: {} prompts, keys only", q.len());
+        return Ok(());
+    }
+    // Batches of equal window length: shortest prompts first, one GPU instance per length.
+    let mut order: Vec<usize> = (0..q.len()).collect();
+    order.sort_by_key(|&i| q[i].len());
+    let top = *layers.iter().max().unwrap();
+    let mut i = 0;
+    let mut done = 0usize;
+    while i < order.len() {
+        let t = (frame + q[order[i]].len()).div_ceil(64).max(1) * 64;
+        let mut e = i;
+        while e < order.len() && frame + q[order[e]].len() <= t {
+            e += 1;
+        }
+        let rows = (budget / t).max(1);
+        let gpu = EmbryoGpu::new_eval_dropless(ck.cfg.clone(), rows, t, &ck.params)
+            .ok_or_else(|| anyhow::anyhow!("no GPU device (Metal / Vulkan)"))?;
+        gpu.set_desc(&ck.extras);
+        gpu.desc_updates.set(false);
+        gpu.anchor_fixed_window.set(true);
+        let mut tokens = vec![pad; rows * t];
+        for chunk in order[i..e].chunks(rows) {
+            tokens.fill(pad);
+            let mut n = vec![0usize; chunk.len()];
+            for (r, &k) in chunk.iter().enumerate() {
+                let (ids, _) = phi_span_ids(&spec, &q[k]);
+                tokens[r * t..r * t + ids.len()].copy_from_slice(&ids);
+                n[r] = ids.len();
+            }
+            let xs = gpu.hidden_after_layers(&tokens, top, layers);
+            for (f, x) in files.iter_mut().zip(&xs) {
+                for (r, &k) in chunk.iter().enumerate() {
+                    let row = &x[r * t * h..(r * t + n[r]) * h];
+                    let bytes = unsafe { std::slice::from_raw_parts(row.as_ptr() as *const u8, row.len() * 4) };
+                    f.seek(SeekFrom::Start((offset[k] * h * 4) as u64))?;
+                    f.write_all(bytes)?;
+                }
+            }
+            done += chunk.len();
+        }
+        eprintln!("phi-rows: T {t} rows {rows}: {done}/{} prompts, {:.1} s", q.len(), t0.elapsed().as_secs_f64());
+        i = e;
+    }
+    println!(
+        "phi-rows: {} prompts, {total} positions, layers {layers:?}, {:.1} s ({:.0} positions/s)",
+        q.len(),
+        t0.elapsed().as_secs_f64(),
+        total as f64 / t0.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// `key_span` φ of every prompt naming a table key, in GPU batches, on the
+/// served trunk of `cmf`: `<out>.phi.f32` (N × hidden, what `cortiq route-fit
+/// --skill-phi/--general-phi` reads) and `<out>.prompts.jsonl` in the same order.
+pub fn phi_pool(
+    ck_path: &Path,
+    cmf: &Path,
+    prompts: &Path,
+    layer: usize,
+    alpha: f32,
+    out: &Path,
+    budget: usize,
+    max_len: usize,
+    whole_message: bool,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut ck = crate::train::load_checkpoint(ck_path)?;
+    let model = std::sync::Arc::new(CmfModel::open(cmf)?);
+    let vocab = model.vocab.clone().ok_or_else(|| anyhow::anyhow!("no VOCAB section"))?;
+    match model.header.genome.as_ref().map(|g| g.encoding.as_str()) {
+        Some("f16") => ck.params = crate::export::served_params(&ck, &vocab, TensorDtype::F16)?,
+        Some("q8_2f") => ck.params = crate::export::served_params(&ck, &vocab, TensorDtype::Q8_2f)?,
+        _ => {}
+    }
+    let tables = cortiq_engine::lookup::LookupTables::new(model.clone());
+    let tok = runtime_tokenizer(&vocab)?;
+    let spec = cortiq_engine::router::cmf_im_v1_phi_spec(&tok, layer).map_err(anyhow::Error::msg)?;
+    let pad = tok.encode("<|im_end|>")[0];
+    let frame = spec.prefix_ids.len() + spec.suffix_ids.len();
+    let h = ck.cfg.hidden;
+    let t0 = Instant::now();
+    // (text, ids, key window); longer prompts are skipped
+    let mut kept: Vec<(String, Vec<u32>, (usize, usize))> = Vec::new();
+    for text in read_prompts(prompts)? {
+        let ids = tok.encode_plain(&text);
+        if frame + ids.len() > max_len {
+            continue;
+        }
+        if whole_message {
+            kept.push((text, ids, (0, 0)));
+            continue;
+        }
+        let Some(hit) = tables.find_key_any(&text) else { continue };
+        if let Some(w) = cortiq_engine::lookup::key_token_window(&tok, &ids, &hit.key) {
+            kept.push((text, ids, w));
+        }
+    }
+    let mut order: Vec<usize> = (0..kept.len()).collect();
+    order.sort_by_key(|&i| kept[i].1.len());
+    let mut phis = vec![0f32; kept.len() * h];
+    let mut i = 0;
+    while i < order.len() {
+        let t = (frame + kept[order[i]].1.len()).div_ceil(64).max(1) * 64;
+        let mut e = i;
+        while e < order.len() && frame + kept[order[e]].1.len() <= t {
+            e += 1;
+        }
+        let rows = (budget / t).max(1);
+        let gpu = EmbryoGpu::new_eval_dropless(ck.cfg.clone(), rows, t, &ck.params)
+            .ok_or_else(|| anyhow::anyhow!("no GPU device (Metal / Vulkan)"))?;
+        gpu.set_desc(&ck.extras);
+        gpu.desc_updates.set(false);
+        gpu.anchor_fixed_window.set(true);
+        let mut tokens = vec![pad; rows * t];
+        for chunk in order[i..e].chunks(rows) {
+            tokens.fill(pad);
+            for (r, &k) in chunk.iter().enumerate() {
+                let (ids, _) = phi_span_ids(&spec, &kept[k].1);
+                tokens[r * t..r * t + ids.len()].copy_from_slice(&ids);
+            }
+            let x = gpu.hidden_after_layer(&tokens, layer);
+            for (r, &k) in chunk.iter().enumerate() {
+                let (ids, span) = phi_span_ids(&spec, &kept[k].1);
+                let phi = cortiq_engine::router::pool_key_span(
+                    &x[r * t * h..(r * t + ids.len()) * h],
+                    h,
+                    span,
+                    kept[k].2,
+                    if whole_message { 1.0 } else { alpha },
+                );
+                phis[k * h..(k + 1) * h].copy_from_slice(&phi);
+            }
+        }
+        i = e;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(phis.as_ptr() as *const u8, phis.len() * 4) };
+    std::fs::write(format!("{}.phi.f32", out.display()), bytes)?;
+    let mut f = std::io::BufWriter::new(std::fs::File::create(format!("{}.prompts.jsonl", out.display()))?);
+    for (text, _, _) in &kept {
+        writeln!(f, "{}", serde_json::json!({ "prompt": text }))?;
+    }
+    f.flush()?;
+    println!("phi-pool: {} prompts name a key, layer {layer}, α {alpha}, {:.1} s", kept.len(), t0.elapsed().as_secs_f64());
+    Ok(())
 }
 
 /// `prefix ++ q ++ suffix` and the q span — the runtime's own function, so
@@ -2219,6 +2451,8 @@ pub fn bake_v2(
         margin,
         skills_hash: String::new(),
         measured: None,
+        followup: None,
+        keyless: None,
     };
     let mut hdr = base.header.clone();
     hdr.skills.push(record.clone());

@@ -442,6 +442,8 @@ pub struct Pipeline {
     /// Packed Embryo graph model, built lazily on the first eligible
     /// resident call so other architectures pay no packing cost.
     embryo_graph: Option<std::sync::Arc<crate::gpu::EmbryoGraphModel>>,
+    /// The wide token path refused this file: a matrix is not exactly f16.
+    embryo_wide_refused: bool,
     /// This pipeline's token graph refused for a STRUCTURAL reason (its
     /// own weights / layer kinds): not retried. Per pipeline, never
     /// process-wide: a skill lane whose pack does not build must not flip
@@ -2228,6 +2230,15 @@ impl Pipeline {
     /// prompt: 85 tok/s chunked vs 14 through the graph).
     #[cfg(target_os = "macos")]
     fn graph_prefill_preferred(&self) -> bool {
+        // The resident Embryo graph owns the phase state and the anchor KV on
+        // the device: the prompt must seed them there (wgpu over Metal).
+        if crate::gpu::enabled_here()
+            && crate::gpu::wgpu_graph_on(crate::gpu::GraphPhase::Decode)
+            && matches!(std::env::var("CMF_EMBRYO_RESIDENT").as_deref(), Ok("1") | Ok("parallel"))
+            && self.embryo_resident_eligible()
+        {
+            return true;
+        }
         let graph_force = crate::gpu::q1_force() || crate::gpu::q2tp_gpu_opt_in();
         if !crate::gpu::enabled_here()
             || !graph_force
@@ -4087,6 +4098,7 @@ impl Pipeline {
             graph_head_required: false,
             graph_logits: None,
             embryo_graph: None,
+            embryo_wide_refused: false,
             graph_refused: std::sync::atomic::AtomicBool::new(false),
             graph_kv_id: {
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -6317,6 +6329,13 @@ impl Pipeline {
                             go = false;
                         }
                     }
+                    if go
+                        && self.sampler_config.loop_stop
+                        && crate::sampler::tail_repeats(&all_ids[all_ids.len() - generated..])
+                    {
+                        finish_reason = "loop".to_string();
+                        go = false;
+                    }
                     go
                 }
             }};
@@ -7144,6 +7163,14 @@ impl Pipeline {
         let output_ids = &all_ids[input_ids.len()..];
         confidence.truncate(output_ids.len()); // guard against any overshoot
         traces.truncate(output_ids.len());
+        // The loop monitor stopped the answer: it says the repeated block once.
+        let output_ids = match finish_reason.as_str() {
+            "loop" => {
+                let excess = crate::sampler::tail_repeat_excess(output_ids).unwrap_or(0);
+                &output_ids[..output_ids.len() - excess]
+            }
+            _ => output_ids,
+        };
         Ok(GenerateResult {
             text: self.tokenizer.decode(output_ids),
             token_ids: output_ids.to_vec(),
@@ -11605,6 +11632,21 @@ impl Pipeline {
         }
         self.clear_sequence_state();
         acc
+    }
+
+    /// Every position's hidden AFTER `layer` (n × hidden, not normalized): the
+    /// walk of [`Self::probe_phi_span`] without the pooling, for `phi-dump`.
+    pub fn probe_hidden_rows(&mut self, ids: &[u32], layer: usize) -> Vec<f32> {
+        #[cfg(target_os = "macos")]
+        crate::gpu_metal::set_io_namespace(self.graph_kv_id);
+        self.clear_sequence_state();
+        let mut rows = Vec::with_capacity(ids.len() * self.hidden_size);
+        for (pos, &id) in ids.iter().enumerate() {
+            let h = self.forward_layers_upto(&self.embed_single(id), pos, None, Some(layer));
+            rows.extend_from_slice(&h);
+        }
+        self.clear_sequence_state();
+        rows
     }
 
     /// Router-v2 φ probe (spec §9.4, `phi.pool = "span_mean"`): the hidden
@@ -17653,6 +17695,9 @@ impl Pipeline {
     }
 
     fn embryo_resident_eligible(&self) -> bool {
+        fn served(t: &QTensor) -> bool {
+            t.as_f32().is_some() || t.q8_2f_codes().is_some()
+        }
         // One mixer family per file: vmf_phase (kind 0/1) or
         // gated_delta_net (kind 4); the anchors are full (2) or bounded (3).
         if (self.vmf_cfg.is_none() && self.gdn_cfg.is_none())
@@ -17708,18 +17753,19 @@ impl Pipeline {
         {
             return false;
         }
-        // The resident shader is deliberately an f32 profile.  Dequantizing
-        // a Q4/Q8 tensor into the packed buffer would silently change the
-        // operator relative to the CPU quantized path, so quantized CMFs
-        // retain the exact ordinary executor instead of claiming parity.
-        // Measured consequence (RTX PRO 4000, S4 bounded export requantized
+        // The resident shaders read f32 or f16 values, or q8_2f codes through
+        // the same formula as the CPU path. Other quantized files keep the
+        // ordinary executor: dequantizing a Q4 tensor into the packed buffer
+        // would silently change the operator relative to the CPU quantized
+        // path. Measured consequence (RTX PRO 4000, S4 bounded export requantized
         // with `cortiq requant --quant q4tp-quantize`): `eligible=false`,
         // the generic wgpu whole-token graph refuses too, and the per-op
-        // path decodes at ~73 tok/s against ~200 tok/s on the CPU q4tp
-        // path — a q4tp Embryo-O1 file is a CPU artifact today; the
-        // resident graph serves the f32 export.
-        if self.weights.lm_head.as_f32().is_none()
-            || self.weights.embed_tokens.as_f32().is_none()
+        // path decodes at ~73 tok/s against ~200 tok/s on the CPU q4tp path.
+        if self.weights.lm_head.q8_2f_codes().is_some() && !self.embryo_wide_candidate(true) {
+            return false;
+        }
+        if !served(&self.weights.lm_head)
+            || !served(&self.weights.embed_tokens)
             || self.weights.lm_head.rows() < self.vocab_size
             || self.weights.lm_head.cols() != self.hidden_size
             || self.weights.embed_tokens.rows() < self.vocab_size
@@ -17776,23 +17822,23 @@ impl Pipeline {
                     let (nv, dv, kk) = (g.num_v_heads, g.value_head_dim, g.conv_kernel);
                     if w.in_proj_qkv.rows() != g.conv_dim()
                         || w.in_proj_qkv.cols() != self.hidden_size
-                        || w.in_proj_qkv.as_f32().is_none()
+                        || !served(&w.in_proj_qkv)
                         || w.in_proj_z.rows() != nv * dv
                         || w.in_proj_z.cols() != self.hidden_size
-                        || w.in_proj_z.as_f32().is_none()
+                        || !served(&w.in_proj_z)
                         || w.in_proj_a.rows() != nv
                         || w.in_proj_a.cols() != self.hidden_size
-                        || w.in_proj_a.as_f32().is_none()
+                        || !served(&w.in_proj_a)
                         || w.in_proj_b.rows() != nv
                         || w.in_proj_b.cols() != self.hidden_size
-                        || w.in_proj_b.as_f32().is_none()
+                        || !served(&w.in_proj_b)
                         || w.conv1d.len() != g.conv_dim() * kk
                         || w.a_log.len() != nv
                         || w.dt_bias.len() != nv
                         || w.norm.len() != dv
                         || w.out_proj.rows() != self.hidden_size
                         || w.out_proj.cols() != nv * dv
-                        || w.out_proj.as_f32().is_none()
+                        || !served(&w.out_proj)
                     {
                         return false;
                     }
@@ -17803,16 +17849,16 @@ impl Pipeline {
                     };
                     if w.thq.rows() != cfg.num_heads * cfg.nphase
                         || w.thq.cols() != self.hidden_size
-                        || w.thq.as_f32().is_none()
+                        || !served(&w.thq)
                         || w.thk.rows() != cfg.num_heads * cfg.nphase
                         || w.thk.cols() != self.hidden_size
-                        || w.thk.as_f32().is_none()
+                        || !served(&w.thk)
                         || w.v_proj.rows() != cfg.num_heads * cfg.value_head_dim
                         || w.v_proj.cols() != self.hidden_size
-                        || w.v_proj.as_f32().is_none()
+                        || !served(&w.v_proj)
                         || w.out_proj.rows() != self.hidden_size
                         || w.out_proj.cols() != cfg.num_heads * cfg.value_head_dim
-                        || w.out_proj.as_f32().is_none()
+                        || !served(&w.out_proj)
                         || w.decay.len() != cfg.num_heads * 2 * cfg.nphase
                     {
                         return false;
@@ -17820,7 +17866,7 @@ impl Pipeline {
                     if let Some((kg, kb)) = &w.k_gate {
                         if kg.rows() != cfg.num_heads
                             || kg.cols() != self.hidden_size
-                            || kg.as_f32().is_none()
+                            || !served(&kg)
                             || kb.len() != cfg.num_heads
                         {
                             return false;
@@ -17849,10 +17895,10 @@ impl Pipeline {
                         || *output_gate
                         || softplus_gate.is_some()
                         || bias.is_some()
-                        || wq.as_f32().is_none()
-                        || wk.as_f32().is_none()
-                        || wv.as_f32().is_none()
-                        || wo.as_f32().is_none()
+                        || !served(&wq)
+                        || !served(&wk)
+                        || !served(&wv)
+                        || !served(&wo)
                         || wq.rows() != self.num_heads * self.head_dim
                         || wk.rows() != self.num_kv_heads * self.head_dim
                         || wv.rows() != self.num_kv_heads * self.head_dim
@@ -17880,10 +17926,10 @@ impl Pipeline {
                         || w.window == 0
                         || w.sink_k.len() != self.num_kv_heads * w.sink * self.head_dim
                         || w.sink_v.len() != self.num_kv_heads * w.sink * self.head_dim
-                        || w.wq.as_f32().is_none()
-                        || w.wk.as_f32().is_none()
-                        || w.wv.as_f32().is_none()
-                        || w.wo.as_f32().is_none()
+                        || !served(&w.wq)
+                        || !served(&w.wk)
+                        || !served(&w.wv)
+                        || !served(&w.wo)
                         || w.wq.rows() != self.num_heads * self.head_dim
                         || w.wk.rows() != self.num_kv_heads * self.head_dim
                         || w.wv.rows() != self.num_kv_heads * self.head_dim
@@ -17902,9 +17948,9 @@ impl Pipeline {
                 FfnKind::Dense(d) => {
                     if d.act != Act::Silu
                         || !d.segs.is_empty()
-                        || d.gate_proj.as_f32().is_none()
-                        || d.up_proj.as_f32().is_none()
-                        || d.down_proj.as_f32().is_none()
+                        || !served(&d.gate_proj)
+                        || !served(&d.up_proj)
+                        || !served(&d.down_proj)
                         || d.gate_proj.rows() != self.intermediate_size
                         || d.gate_proj.cols() != self.hidden_size
                         || d.up_proj.rows() != self.intermediate_size
@@ -17946,9 +17992,9 @@ impl Pipeline {
                     if gate.is_some() || shared.act != Act::Silu || !shared.segs.is_empty() {
                         return false;
                     }
-                    if shared.gate_proj.as_f32().is_none()
-                        || shared.up_proj.as_f32().is_none()
-                        || shared.down_proj.as_f32().is_none()
+                    if !served(&shared.gate_proj)
+                        || !served(&shared.up_proj)
+                        || !served(&shared.down_proj)
                         || shared.gate_proj.rows() != self.intermediate_size
                         || shared.gate_proj.cols() != self.hidden_size
                         || shared.up_proj.rows() != self.intermediate_size
@@ -17961,9 +18007,9 @@ impl Pipeline {
                     for e in &m.experts {
                         if e.act != Act::Silu
                             || !e.segs.is_empty()
-                            || e.gate_proj.as_f32().is_none()
-                            || e.up_proj.as_f32().is_none()
-                            || e.down_proj.as_f32().is_none()
+                            || !served(&e.gate_proj)
+                            || !served(&e.up_proj)
+                            || !served(&e.down_proj)
                             || e.gate_proj.rows() != self.intermediate_size
                             || e.gate_proj.cols() != self.hidden_size
                             || e.up_proj.rows() != self.intermediate_size
@@ -18073,6 +18119,62 @@ impl Pipeline {
         last
     }
 
+    /// Can this file run the wide token path? GDN mixers, bounded anchors, and
+    /// rows and columns that fit the kernels' four-row, eight-column grid.
+    fn embryo_wide_candidate(&self, q8: bool) -> bool {
+        if self.embryo_wide_refused
+            || std::env::var("CMF_EMBRYO_WIDE").as_deref() == Ok("0")
+            || !crate::gpu::embryo_wide_ready(q8)
+        {
+            return false;
+        }
+        let Some(g) = self.gdn_cfg else {
+            return false;
+        };
+        let (hidden, inter, hd) = (self.hidden_size, self.intermediate_size, self.head_dim);
+        let (nv, nk, dk, dv) = (g.num_v_heads, g.num_k_heads, g.key_head_dim, g.value_head_dim);
+        let (q, kv) = (self.num_heads, self.num_kv_heads);
+        // A q8_2f row is read 16 codes at a time, an f16 row 8 values at a time.
+        let step = if q8 { 16 } else { 8 };
+        let geometry = hidden % step == 0
+            && hidden <= 1024
+            && inter % step == 0
+            && inter <= 1024
+            && self.vocab_size % 4 == 0
+            && self.head_clusters.as_ref().is_some_and(|c| {
+                let nc = c.len() / hidden.max(1);
+                // A workgroup holds a cluster's rows.
+                nc > 0 && nc <= 256 && self.vocab_size % nc == 0 && self.vocab_size / nc <= 256
+            })
+            && dk % 4 == 0
+            && dv % 4 == 0
+            && (nv * dv) % step == 0
+            && nv * dv <= 1024
+            && nv <= 508
+            && nk > 0
+            && nv % nk == 0
+            && g.conv_dim() % 4 == 0
+            && g.conv_dim() <= 2048
+            && hd % 4 == 0
+            && (q * hd) % step == 0
+            && q * hd <= 1024
+            && kv > 0
+            && q % kv == 0
+            && (kv * hd) % 4 == 0
+            && (self.rotary_dim / 2) % 4 == 0;
+        if !geometry {
+            return false;
+        }
+        self.weights.layers.iter().all(|lw| {
+            matches!(lw.attn, AttnKind::Bounded(_) | AttnKind::LinearGdn(_))
+                && match &lw.ffn {
+                    FfnKind::Moe(m) => m.resonance.as_ref().is_some_and(|r| m.experts.len() * (r.k + 1) <= 256) && m.shared.is_some(),
+                    FfnKind::Dense(_) => true,
+                    FfnKind::DenseMoe(_) => false,
+                }
+        })
+    }
+
     fn ensure_embryo_graph(&mut self) -> Option<std::sync::Arc<crate::gpu::EmbryoGraphModel>> {
         if self.embryo_graph.is_none() && self.embryo_resident_eligible() {
             const UMAX: u32 = u32::MAX;
@@ -18080,14 +18182,54 @@ impl Pipeline {
             const REC: usize = 64;
             struct Pack {
                 data: Vec<f32>,
+                /// The wide token path: matrices in their packed form in `mats`.
+                wide: bool,
+                q8: bool,
+                mats: Vec<u8>,
+                /// q8_2f: (codes, row scales, column field) of each matrix; its
+                /// word in the layer record is its index in the meta after the layers.
+                table: Vec<u32>,
+                table_base: u32,
+                refused: bool,
             }
             impl Pack {
                 fn put(&mut self, x: &[f32]) -> u32 {
                     if x.is_empty() {
                         return u32::MAX;
                     }
+                    // The wide kernels read the small tensors as vec4
+                    if self.wide {
+                        self.data.resize(self.data.len().next_multiple_of(4), 0.0);
+                    }
                     let off = self.data.len();
                     self.data.extend_from_slice(x);
+                    off as u32
+                }
+                /// A matrix a token reads in full.
+                fn mat(&mut self, t: &QTensor) -> u32 {
+                    if !self.wide {
+                        return self.put(&Pipeline::embryo_qtensor_f32(t));
+                    }
+                    if self.q8 {
+                        let Some((q, rows, cols)) = t.q8_2f_codes() else {
+                            self.refused = true;
+                            return 0;
+                        };
+                        self.mats.resize(self.mats.len().next_multiple_of(16), 0);
+                        let off = self.mats.len() as u32;
+                        self.mats.extend_from_slice(&q[..t.rows() * t.cols()]);
+                        let (rs, cs) = (self.put(rows), self.put(cols));
+                        let e = self.table_base + self.table.len() as u32;
+                        self.table.extend_from_slice(&[off, rs, cs]);
+                        return e;
+                    }
+                    self.mats.resize(self.mats.len().next_multiple_of(16), 0);
+                    let off = self.mats.len() / 2;
+                    for v in Pipeline::embryo_qtensor_f32(t) {
+                        let h = cortiq_core::quant::f32_to_f16(v);
+                        self.refused |= cortiq_core::quant::f16_to_f32(h).to_bits() != v.to_bits();
+                        self.mats.extend_from_slice(&h.to_le_bytes());
+                    }
                     off as u32
                 }
             }
@@ -18096,7 +18238,18 @@ impl Pipeline {
             // file has exactly one linear core, so at most one is live.
             let vmf = self.vmf_cfg;
             let gdn = self.gdn_cfg;
-            let mut pack = Pack { data: Vec::new() };
+            // A file of q8_2f matrices or of matrices exact in f16 runs the wide path.
+            let q8 = self.weights.lm_head.q8_2f_codes().is_some();
+            let wide = self.embryo_wide_candidate(q8);
+            let mut pack = Pack {
+                data: Vec::new(),
+                wide,
+                q8,
+                mats: Vec::new(),
+                table: Vec::new(),
+                table_base: (HEADER + self.num_layers * REC) as u32,
+                refused: false,
+            };
             let mut meta = vec![0u32; HEADER];
             meta[0] = self.hidden_size as u32;
             meta[1] = self.intermediate_size as u32;
@@ -18177,7 +18330,12 @@ impl Pipeline {
             meta[15] = kv_stride as u32;
             meta[18] = anchor_window as u32;
             meta[20] = anchor_sink as u32;
+            // Scores, weights and the key list of each head fit the wide scratch plane.
+            pack.refused |= pack.wide
+                && 3 * self.num_heads * (anchor_window + anchor_sink + 3) + 256 > 65_536;
             meta[21] = match &self.bounded_rope {
+                // The wide path rotates by the absolute position: no table.
+                _ if pack.wide => UMAX,
                 Some(rope) => {
                     // [W][half] cos then [W][half] sin, one contiguous table.
                     let off = pack.put(&rope.cos);
@@ -18232,26 +18390,26 @@ impl Pipeline {
                     AttnKind::LinearGdn(w) => {
                         // Layer record words 56..63 + 29, as the resident
                         // kernels read them (gpu_wgpu.rs `embryo_core_gdn_*`).
-                        meta[base + 56] = pack.put(&Self::embryo_qtensor_f32(&w.in_proj_qkv));
-                        meta[base + 57] = pack.put(&Self::embryo_qtensor_f32(&w.in_proj_z));
-                        meta[base + 58] = pack.put(&Self::embryo_qtensor_f32(&w.in_proj_a));
-                        meta[base + 59] = pack.put(&Self::embryo_qtensor_f32(&w.in_proj_b));
+                        meta[base + 56] = pack.mat(&w.in_proj_qkv);
+                        meta[base + 57] = pack.mat(&w.in_proj_z);
+                        meta[base + 58] = pack.mat(&w.in_proj_a);
+                        meta[base + 59] = pack.mat(&w.in_proj_b);
                         meta[base + 60] = pack.put(&w.conv1d);
                         meta[base + 61] = pack.put(&w.a_log);
                         meta[base + 62] = pack.put(&w.dt_bias);
                         meta[base + 63] = pack.put(&w.norm);
-                        meta[base + 29] = pack.put(&Self::embryo_qtensor_f32(&w.out_proj));
+                        meta[base + 29] = pack.mat(&w.out_proj);
                         meta[base + 24] = 0;
                     }
                     AttnKind::Linear(w) => {
-                        meta[base + 3] = pack.put(&Self::embryo_qtensor_f32(&w.thq));
-                        meta[base + 4] = pack.put(&Self::embryo_qtensor_f32(&w.thk));
-                        meta[base + 5] = pack.put(&Self::embryo_qtensor_f32(&w.v_proj));
-                        meta[base + 6] = pack.put(&Self::embryo_qtensor_f32(&w.out_proj));
+                        meta[base + 3] = pack.mat(&w.thq);
+                        meta[base + 4] = pack.mat(&w.thk);
+                        meta[base + 5] = pack.mat(&w.v_proj);
+                        meta[base + 6] = pack.mat(&w.out_proj);
                         let decay: Vec<f32> = w.decay.iter().map(|&x| x as f32).collect();
                         meta[base + 7] = pack.put(&decay);
                         if let Some((kg, kb)) = &w.k_gate {
-                            meta[base + 8] = pack.put(&Self::embryo_qtensor_f32(kg));
+                            meta[base + 8] = pack.mat(&kg);
                             meta[base + 9] = pack.put(kb);
                         }
                         if let Some(conv) = &w.conv {
@@ -18263,17 +18421,17 @@ impl Pipeline {
                     }
                     AttnKind::Full { wq, wk, wv, wo, .. } => {
                         full_seen = true;
-                        meta[base + 11] = pack.put(&Self::embryo_qtensor_f32(wq));
-                        meta[base + 12] = pack.put(&Self::embryo_qtensor_f32(wk));
-                        meta[base + 13] = pack.put(&Self::embryo_qtensor_f32(wv));
-                        meta[base + 14] = pack.put(&Self::embryo_qtensor_f32(wo));
+                        meta[base + 11] = pack.mat(&wq);
+                        meta[base + 12] = pack.mat(&wk);
+                        meta[base + 13] = pack.mat(&wv);
+                        meta[base + 14] = pack.mat(&wo);
                         meta[base + 26] = (li * kv_stride) as u32;
                     }
                     AttnKind::Bounded(w) => {
-                        meta[base + 11] = pack.put(&Self::embryo_qtensor_f32(&w.wq));
-                        meta[base + 12] = pack.put(&Self::embryo_qtensor_f32(&w.wk));
-                        meta[base + 13] = pack.put(&Self::embryo_qtensor_f32(&w.wv));
-                        meta[base + 14] = pack.put(&Self::embryo_qtensor_f32(&w.wo));
+                        meta[base + 11] = pack.mat(&w.wq);
+                        meta[base + 12] = pack.mat(&w.wk);
+                        meta[base + 13] = pack.mat(&w.wv);
+                        meta[base + 14] = pack.mat(&w.wo);
                         // Ring slot of this anchor (anchors only, packed).
                         meta[base + 26] = (bounded_seen * kv_stride) as u32;
                         meta[base + 27] = pack.put(&w.sink_k);
@@ -18286,9 +18444,9 @@ impl Pipeline {
                     FfnKind::Dense(d) => {
                         meta[base + 15] = 0;
                         meta[base + 16] = 0;
-                        meta[base + 21] = pack.put(&Self::embryo_qtensor_f32(&d.gate_proj));
-                        meta[base + 22] = pack.put(&Self::embryo_qtensor_f32(&d.up_proj));
-                        meta[base + 23] = pack.put(&Self::embryo_qtensor_f32(&d.down_proj));
+                        meta[base + 21] = pack.mat(&d.gate_proj);
+                        meta[base + 22] = pack.mat(&d.up_proj);
+                        meta[base + 23] = pack.mat(&d.down_proj);
                     }
                     FfnKind::Moe(m) => {
                         let r = m.resonance.as_ref().unwrap();
@@ -18310,16 +18468,16 @@ impl Pipeline {
                         let mut shell = r.effective_shell(m.experts.len());
                         shell.push(f32::NEG_INFINITY);
                         meta[base + 30] = pack.put(&shell);
-                        meta[base + 21] = pack.put(&Self::embryo_qtensor_f32(&shared.gate_proj));
-                        meta[base + 22] = pack.put(&Self::embryo_qtensor_f32(&shared.up_proj));
-                        meta[base + 23] = pack.put(&Self::embryo_qtensor_f32(&shared.down_proj));
+                        meta[base + 21] = pack.mat(&shared.gate_proj);
+                        meta[base + 22] = pack.mat(&shared.up_proj);
+                        meta[base + 23] = pack.mat(&shared.down_proj);
                         for (e, ex) in m.experts.iter().enumerate() {
                             meta[base + 32 + e * 3] =
-                                pack.put(&Self::embryo_qtensor_f32(&ex.gate_proj));
+                                pack.mat(&ex.gate_proj);
                             meta[base + 33 + e * 3] =
-                                pack.put(&Self::embryo_qtensor_f32(&ex.up_proj));
+                                pack.mat(&ex.up_proj);
                             meta[base + 34 + e * 3] =
-                                pack.put(&Self::embryo_qtensor_f32(&ex.down_proj));
+                                pack.mat(&ex.down_proj);
                         }
                     }
                     FfnKind::DenseMoe(_) => return None,
@@ -18327,6 +18485,30 @@ impl Pipeline {
             }
             if !full_seen && self.num_layers == 0 {
                 return None;
+            }
+            let mut lm_head = Vec::new();
+            let mut lm_head_packed = Vec::new();
+            if wide && q8 {
+                let parts = self.weights.lm_head.q8_2f_codes();
+                if let Some((q, rows, cols)) = parts {
+                    lm_head_packed = q[..self.weights.lm_head.rows() * self.weights.lm_head.cols()].to_vec();
+                    let (rs, cs) = (pack.put(rows), pack.put(cols));
+                    meta[30] = pack.table_base + pack.table.len() as u32;
+                    pack.table.extend_from_slice(&[0, rs, cs]);
+                }
+                meta.extend_from_slice(&pack.table);
+            } else if wide {
+                for v in Self::embryo_qtensor_f32(&self.weights.lm_head) {
+                    let h = cortiq_core::quant::f32_to_f16(v);
+                    pack.refused |= cortiq_core::quant::f16_to_f32(h).to_bits() != v.to_bits();
+                    lm_head_packed.extend_from_slice(&h.to_le_bytes());
+                }
+            } else {
+                lm_head = Self::embryo_qtensor_f32(&self.weights.lm_head);
+            }
+            if pack.refused {
+                self.embryo_wide_refused = true;
+                return self.ensure_embryo_graph();
             }
             let id = {
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -18345,6 +18527,7 @@ impl Pipeline {
                 anchor_kv_heads: self.num_kv_heads,
                 anchor_head_dim: self.head_dim,
                 rotary_dim: self.rotary_dim,
+                rope_freq: if wide { self.inv_freq[..self.rotary_dim / 2].to_vec() } else { Vec::new() },
                 max_seq: self.kv_cache.max_seq_len,
                 cluster_count,
                 cluster_size: self.vocab_size / cluster_count,
@@ -18355,7 +18538,11 @@ impl Pipeline {
                 phase_mass: vmf.map(|c| c.phase_mass).unwrap_or(0.0),
                 weights: pack.data,
                 meta,
-                lm_head: Self::embryo_qtensor_f32(&self.weights.lm_head),
+                lm_head,
+                wide,
+                wide_q8: wide && q8,
+                mats: pack.mats,
+                lm_head_packed,
                 clusters: clusters.as_ref().clone(),
                 final_norm: self.weights.final_norm.clone(),
                 inv_freq: self.inv_freq.as_ref().clone(),

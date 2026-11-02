@@ -350,6 +350,9 @@ fn empty_slot_falls_back_to_another_language_or_misses() {
         langs: vec!["ru".into(), "en".into()],
         fields: vec!["family".into()],
         policy: None,
+        route_margin: None,
+        min_key_share: None,
+        keyless: None,
     };
     let tensors = lookup_tensors("half", &info, &keys, &slots).unwrap();
     let m = CmfModel::open(&f2).unwrap();

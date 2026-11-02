@@ -116,6 +116,19 @@ cortiq run unlimited-ocr-2-q8_2f.cmf --image page1.png --image page2.png --promp
 cortiq run minicpm-ocr-1.0-q8_2f.cmf --image page.png --prompt "Text Recognition:" --max-tokens 2048
 ```
 
+## Embryo-56M：采用自有架构的小模型（0.8.53）
+
+[Embryo-56M](https://huggingface.co/infosave/Embryo-56M-cmf) 有 5600 万参数，在一台笔记本的 GPU 上从零诞生并训练，没有使用他人权重：门控 delta 混合层加两个有界锚点，任意上下文长度下状态均为 10.1 MB，q8_2f 文件 91 MB。事实问题由重建误差路由器选择记录并逐字回答，也能处理追问，没有对应记录的事实问题会如实拒答。记录之外它只是一个很小的模型：语法正确，回答简短，常常没有实质内容。
+
+| tok/s | 解码 | 2000 token 之后 | 预填充 |
+|---|---|---|---|
+| Apple M4 GPU | 650 | 535 | 820 |
+| Apple M4 CPU | 470 | 379 | 430 |
+| RTX 2000 Ada | 925 | 796 | 1230 |
+| EPYC 7443P | 612 | 405 | 233 |
+
+组装方式和各项检查的含义见 [docs/EMBRYO_CHAT.zh.md](docs/EMBRYO_CHAT.zh.md)。
+
 ## Clover-35B-A3B-Preview 默认因果解码（0.8.52）
 
 这款块扩散模型现在默认走普通因果路径，并使用发布版的响应惩罚：`q4tp-v2` 在

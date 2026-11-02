@@ -173,6 +173,7 @@ fn greedy_config() -> SamplerConfig {
         // early; this is only the deterministic regression sampler.
         suppress_tokens: vec![32760],
         penalty_window: 0,
+        loop_stop: false,
     }
 }
 

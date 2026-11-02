@@ -1644,6 +1644,18 @@ async fn chat_completions(
                     );
                 }
             }
+            if let Some(n) = cortiq_engine::sampler::file_history_turns(state.runtime.model().header.provenance.as_ref()) {
+                let start = cortiq_engine::sampler::last_turns_start(
+                    msgs.iter().map(|m| m["role"].as_str().unwrap_or("")).collect::<Vec<_>>().into_iter(),
+                    n,
+                );
+                let mut i = 0;
+                msgs.retain(|m| {
+                    let keep = i >= start || m["role"] == "system";
+                    i += 1;
+                    keep
+                });
+            }
             match req.effective_tools() {
                 // With tools a failed render is an ERROR: the ChatML
                 // fallback has no place for them, and the model would

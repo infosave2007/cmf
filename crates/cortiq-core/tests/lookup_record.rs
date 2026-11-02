@@ -275,6 +275,9 @@ fn info() -> LookupInfo {
         langs: LANGS.iter().map(|s| s.to_string()).collect(),
         fields: FIELDS.iter().map(|s| s.to_string()).collect(),
         policy: None,
+        route_margin: None,
+        min_key_share: None,
+        keyless: None,
     }
 }
 

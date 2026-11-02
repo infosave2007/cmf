@@ -43,6 +43,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `vision_gemm_nt` on Metal refuses a k off the kernel's grid of 32. SigLIP's
   588-wide patch embedding read past each row, last row into unwritten memory.
 
+## [0.8.53] — 2026-11-02
+
+### Added
+- Embryo-56M runs as a chat model with its records: `router.phi.pool = key_span`
+  (the reconstruction router measures φ over the tokens of the name the question
+  is about plus the rest of the message), follow-up topologies of its own
+  (`cortiq route-fit-followup`), a keyless record that refuses a factual question
+  the file cannot answer (`lookup-build --keyless`, `cortiq route-fit-keyless`),
+  `cortiq tail-trim` for the header copies that fits leave behind, and a serve
+  warm-up. Build recipe and gates: `docs/EMBRYO_CHAT.md`, `scripts/embryo/`.
+- The trainer exports q8_2f (`export --dtype q8_2f`), writes the served weights
+  back as a checkpoint (`served-ckpt`), and `phi-pool --whole-message` makes the
+  φ of follow-ups and of the keyless record.
+
+### Changed
+- Wide resident path for Embryo files on wgpu, f16 and q8_2f matrices in the
+  form they have in the file. q8_2f on an Apple M4: 650 tok/s, 535 after a
+  2000-token prompt, prefill 820. On an RTX 2000 Ada: 925 tok/s, 796, prefill
+  1230. The f32 path gave 290 tok/s on the same M4. Logits stay within 4e-5 of
+  the CPU, past the window too.
+- An Embryo file keeps float activations on the CPU, next to Flint: its router is
+  fitted on the exact φ, which the 8-bit activations move by 4e-3. `CMF_SDOT=1`
+  turns them back on.
+- The per-token confidence of the sampler no longer runs `exp` over the whole
+  vocabulary: 130 µs a token at 32k entries, on every model.
+
+### Fixed
+- `cortiq-embryo` builds without a GPU feature on Linux and with `vulkan`.
+
 ## [0.8.52] — 2026-11-01
 
 ### Changed

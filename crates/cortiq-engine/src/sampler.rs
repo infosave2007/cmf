@@ -113,6 +113,29 @@ pub struct SamplerConfig {
     /// [`BOUNDED_PENALTY_WINDOW`] there when this is 0.
     #[serde(default)]
     pub penalty_window: usize,
+    /// Stop the answer when its tail starts repeating itself
+    /// ([`tail_repeats`], finish reason `loop`): the loop monitor of a small
+    /// model, switched on by `sampling.loop_stop` in the file.
+    #[serde(default)]
+    pub loop_stop: bool,
+}
+
+/// Does `ids` end in a repeated block? Periods 4..=11 need three copies,
+/// periods 12..=64 two: a phrase said twice in a row at that length is a loop,
+/// not rhetoric.
+pub fn tail_repeats(ids: &[u32]) -> bool {
+    tail_repeat_excess(ids).is_some()
+}
+
+/// How many tail tokens repeat what came before them, when [`tail_repeats`]:
+/// the answer without them says the block once.
+pub fn tail_repeat_excess(ids: &[u32]) -> Option<usize> {
+    let n = ids.len();
+    (4..=64usize).find_map(|p| {
+        let copies = if p < 12 { 3 } else { 2 };
+        (n >= p * copies && (1..copies).all(|c| ids[n - p..] == ids[n - (c + 1) * p..n - c * p]))
+            .then_some(p * (copies - 1))
+    })
 }
 
 /// Penalty window a bounded-state model falls back to when
@@ -152,6 +175,7 @@ impl Default for SamplerConfig {
             seed: None,
             suppress_tokens: Vec::new(),
             penalty_window: 0,
+            loop_stop: false,
         }
     }
 }
@@ -159,7 +183,7 @@ impl Default for SamplerConfig {
 /// Keys a file may carry in `header.provenance.sampling`
 /// (`cortiq convert --sampling`). `max_tokens` is the completion budget a
 /// request gets when it names none (`run -n`, the server's `max_tokens`).
-pub const FILE_SAMPLING_KEYS: [&str; 7] = [
+pub const FILE_SAMPLING_KEYS: [&str; 9] = [
     "temperature",
     "top_p",
     "top_k",
@@ -167,7 +191,34 @@ pub const FILE_SAMPLING_KEYS: [&str; 7] = [
     "repetition_penalty",
     "presence_penalty",
     "max_tokens",
+    "loop_stop",
+    "history_turns",
 ];
+
+/// How many of the last user turns the network sees (`sampling.history_turns`):
+/// a small model copies its earlier answers instead of using them.
+pub fn file_history_turns(provenance: Option<&serde_json::Value>) -> Option<usize> {
+    provenance
+        .and_then(|p| p.get("sampling"))
+        .and_then(|s| s.get("history_turns"))
+        .and_then(|v| v.as_f64())
+        .filter(|&n| n >= 1.0)
+        .map(|n| n as usize)
+}
+
+/// Where the last `n` user turns start in a message list (by role).
+pub fn last_turns_start<'a>(roles: impl DoubleEndedIterator<Item = &'a str> + ExactSizeIterator, n: usize) -> usize {
+    let mut seen = 0;
+    for (i, r) in roles.enumerate().rev() {
+        if r == "user" {
+            seen += 1;
+            if seen == n {
+                return i;
+            }
+        }
+    }
+    0
+}
 
 /// The file's default completion budget (`header.provenance.sampling.
 /// max_tokens`), when it carries one.
@@ -210,6 +261,9 @@ impl SamplerConfig {
         }
         if let Some(v) = f("presence_penalty") {
             c.presence_penalty = v as f32;
+        }
+        if let Some(v) = f("loop_stop") {
+            c.loop_stop = v != 0.0;
         }
         c
     }
@@ -260,6 +314,9 @@ pub fn sample_with_scratch(
 /// divisions stay sequential in index order, and top-k's threshold is
 /// the k-th largest VALUE — the same number `select_nth` returned. The
 /// sampled token is bit-identical to the serial chain for the same seed.
+/// Largest vocabulary sampled on the calling thread alone.
+const SAMPLER_SERIAL_MAX: usize = 1 << 16;
+
 pub fn sample_with_scratch_pool(
     logits: &[f32],
     config: &SamplerConfig,
@@ -268,6 +325,8 @@ pub fn sample_with_scratch_pool(
     scratch: &mut SamplerScratch,
     pool: Option<&crate::pool::Pool>,
 ) -> u32 {
+    // Waking the workers costs more than these passes over a small vocabulary.
+    let pool = if logits.len() <= SAMPLER_SERIAL_MAX { None } else { pool };
     if config.temperature < 1e-6
         && config.repetition_penalty == 1.0
         && config.presence_penalty == 0.0
@@ -771,10 +830,15 @@ fn par_sum_exp(
     t: f32,
     parts: &mut Vec<f32>,
 ) -> f32 {
+    // A term below e^-40 cannot move a sum that holds the largest term, whose
+    // value is 1, and most of a vocabulary is there: no call to `exp` for them.
+    let floor = lmax - 40.0 * t;
     let term = |s: usize, e: usize| -> f32 {
         let mut acc = 0.0f32;
         for &l in &src[s..e] {
-            acc += ((l - lmax) / t).exp();
+            if l >= floor {
+                acc += ((l - lmax) / t).exp();
+            }
         }
         acc
     };
@@ -1159,20 +1223,15 @@ pub fn top1_prob_pool(
     id: u32,
     temp: f32,
 ) -> f32 {
+    let pool = if logits.len() <= SAMPLER_SERIAL_MAX { None } else { pool };
     let t = if temp > 1e-3 { temp } else { 1.0 };
     let max = par_max(pool, logits, f32::NEG_INFINITY);
-    let mut e = std::mem::take(&mut scratch.topk);
-    e.clear();
-    e.extend_from_slice(logits);
-    par_map(pool, &mut e, &move |v| ((v - max) / t).exp());
-    let sum: f32 = e.iter().sum();
-    let out = if sum > 0.0 {
+    let sum = par_sum_exp(pool, logits, max, t, &mut scratch.sum_parts);
+    if sum > 0.0 {
         (((logits[id as usize] - max) / t).exp()) / sum
     } else {
         0.0
-    };
-    scratch.topk = e;
-    out
+    }
 }
 
 fn apply_repetition_penalty(
@@ -1972,5 +2031,29 @@ mod tests {
         };
         assert_eq!(run(7), run(7), "same seed must reproduce");
         assert_ne!(run(7), run(8), "different seed must differ");
+    }
+}
+
+#[cfg(test)]
+mod loop_monitor_tests {
+    use super::tail_repeats;
+
+    #[test]
+    fn tail_repeats_needs_three_short_or_two_long_copies() {
+        let short = [1u32, 2, 3, 4];
+        let mut ids: Vec<u32> = short.iter().chain(&short).copied().collect();
+        assert!(!tail_repeats(&ids), "two copies of a short block are rhetoric");
+        ids.extend_from_slice(&short);
+        assert!(tail_repeats(&ids));
+        let long: Vec<u32> = (0..12).collect();
+        let twice: Vec<u32> = long.iter().chain(&long).copied().collect();
+        assert!(tail_repeats(&twice));
+        let varied: Vec<u32> = (0..200).collect();
+        assert!(!tail_repeats(&varied));
+        assert_eq!(super::tail_repeat_excess(&twice), Some(12));
+        let roles = ["system", "user", "assistant", "user", "assistant", "user"];
+        assert_eq!(super::last_turns_start(roles.iter().copied(), 1), 5);
+        assert_eq!(super::last_turns_start(roles.iter().copied(), 2), 3);
+        assert_eq!(super::last_turns_start(roles.iter().copied(), 9), 0);
     }
 }

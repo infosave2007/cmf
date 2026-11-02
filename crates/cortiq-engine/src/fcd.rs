@@ -3350,6 +3350,7 @@ pub fn run_polish_stream(
                 seed: Some(0),
                 suppress_tokens: Vec::new(),
                 penalty_window: 0,
+                loop_stop: false,
             };
             let mut pipe = Pipeline::from_model(model, greedy)
                 .map_err(|e| format!("gen-gate pipeline: {e}"))?;
@@ -3652,6 +3653,7 @@ fn polish_records(
                 seed: Some(0),
                 suppress_tokens: Vec::new(),
                 penalty_window: 0,
+                loop_stop: false,
             };
             let mut pipe = Pipeline::from_model(model, greedy).map_err(|e| format!("gen-gate pipeline: {e}"))?;
             if !hp.polish_only {
