@@ -42,6 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - `vision_gemm_nt` on Metal refuses a k off the kernel's grid of 32. SigLIP's
   588-wide patch embedding read past each row, last row into unwritten memory.
+- The decision server installs its signal listeners before it binds the port: a
+  SIGTERM right after the first response could kill it without the ledger flush.
 
 ## [0.8.53] — 2026-11-02
 
